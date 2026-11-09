@@ -1,5 +1,5 @@
 // tests/ds4_iq1_bench.cpp - the CPU lane's IQ1_S rows (src/ds4/ds4_iq_cpu.cpp) timed as cpu_experts_iq runs them: a
-// DeepSeek-V4.1-Flash expert (gate / up 2048 rows of 4096, down 4096 rows of 2048, all IQ1_S) in jobs of 64 rows, 1 to
+// DeepSeek-V4.1-Flash expert (gate / up 2304 rows of 5120, down 5120 rows of 2304, all IQ1_S) in jobs of 64 rows, 1 to
 // 4 tokens, on one thread and on a pool of N; every form's results checked against ggml-cpu's dot bit for bit first.
 // No GPU, no model (random blocks: any bit pattern is a valid IQ1_S block).
 //
@@ -90,14 +90,14 @@ struct Expert {
     std::vector<uint8_t> gate, up, down;
 };
 
-constexpr int E = 4096, FF = 2048, RB = 64;
+constexpr int E = 5120, FF = 2304, RB = 64;   // (DeepSeek-V4.1-Flash's geometry: it was 4096 x 2048)
 
 // one expert's rows for nt tokens: gate / up jobs (64 rows of each), then the down's - the pool's two phases
 void expert(const Fn& fn, const Expert& x, const void* const* xa, const void* const* ha, int nt, std::vector<float>& yg,
             std::vector<float>& yu, std::vector<float>& yd, Pool* pool) {
     const size_t gr = ggml_row_size(GGML_TYPE_IQ1_S, E), dr = ggml_row_size(GGML_TYPE_IQ1_S, FF);
     std::function<void(int)> fg = [&](int j) {
-        float *go[8], *uo[8];
+        float *go[9], *uo[9];
         for (int t = 0; t < nt; ++t) {
             go[t] = yg.data() + (size_t) t * FF + j * RB;
             uo[t] = yu.data() + (size_t) t * FF + j * RB;
@@ -106,7 +106,7 @@ void expert(const Fn& fn, const Expert& x, const void* const* xa, const void* co
         fn(x.up.data(), gr, E, xa, nt, uo, j * RB, j * RB + RB);
     };
     std::function<void(int)> fd = [&](int j) {
-        float* o[8];
+        float* o[9];
         for (int t = 0; t < nt; ++t) o[t] = yd.data() + (size_t) t * E + j * RB;
         fn(x.down.data(), dr, FF, ha, nt, o, j * RB, j * RB + RB);
     };
@@ -154,7 +154,7 @@ int main(int argc, char** argv) {
     }
     const auto* q8 = ggml_get_type_traits_cpu(GGML_TYPE_Q8_K);
     const size_t xb = ggml_row_size(GGML_TYPE_Q8_K, E), hb = ggml_row_size(GGML_TYPE_Q8_K, FF);
-    constexpr int MT = 5;
+    constexpr int MT = 9;
     std::vector<uint8_t> xq(xb * MT), hq(hb * MT);
     std::vector<const void*> xa(MT), ha(MT);
     {
@@ -171,7 +171,7 @@ int main(int argc, char** argv) {
     }
     std::vector<float> yg((size_t) MT * FF), yu((size_t) MT * FF), yd((size_t) MT * E);
 
-    // bit-exactness: every form against ggml's dot, 1-5 tokens, every row of two experts
+    // bit-exactness: every form against ggml's dot, 1-5 and 9 tokens, every row of two experts
     FILE* dump = std::getenv("DS4_IQ1_BENCH_DUMP") ? std::fopen(std::getenv("DS4_IQ1_BENCH_DUMP"), "wb") : nullptr;
     bool all_ok = true;
     for (int nt = 1; nt <= MT; ++nt)
@@ -199,7 +199,7 @@ int main(int argc, char** argv) {
             }
         }
     if (dump != nullptr) std::fclose(dump);
-    std::printf("bit-exact vs ggml-cpu's dot (1-5 tokens, %d experts, all rows): %s\n", std::min(nex, 2),
+    std::printf("bit-exact vs ggml-cpu's dot (1-5 and 9 tokens, %d experts, all rows): %s\n", std::min(nex, 2),
                 all_ok ? "OK" : "FAILED");
 
     bool pass1 = false;
@@ -211,13 +211,13 @@ int main(int argc, char** argv) {
         std::printf("\n%d thread%s, %d experts cycled, us per expert (median of 7 rounds of %d)\n", threads,
                     threads > 1 ? "s" : "", nex, reps);
         std::printf("%-16s", "form");
-        for (int nt : {1, 2, 4}) std::printf("  nt=%d   ", nt);
+        for (int nt : {1, 2, 4, 8}) std::printf("  nt=%d   ", nt);
         std::printf("\n");
         for (size_t fi = 0; fi < forms.size(); ++fi) {
             const Form& f = forms[fi];
             if (!((fmask >> fi) & 1)) continue;
             std::printf("%-16s", f.name);
-            for (int nt : {1, 2, 4}) {
+            for (int nt : {1, 2, 4, 8}) {
                 const int r = threads == 1 ? std::max(4, reps / 4) : reps;
                 std::vector<double> t;
                 for (int round = 0; round < 7; ++round) {

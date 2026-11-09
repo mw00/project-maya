@@ -102,8 +102,9 @@ int check(int E, int FF, int nt, int r0g, int r1g, int r0d, int r1d, float limit
 int main() {
     ggml_cpu_init();
     const char* e = std::getenv("DS4_IQ1_PDEP");
-    std::printf("ds4_iq1_rows_test: DS4_IQ1_PDEP=%s, own IQ1_S rows %s\n", e != nullptr ? e : "(unset)",
-                gg::iq_cpu_own_rows(GGML_TYPE_IQ1_S) ? "on" : "off");
+    std::printf("ds4_iq1_rows_test: DS4_IQ1_PDEP=%s, own IQ1_S rows %s (gate/up fused pass %s)\n",
+                e != nullptr ? e : "(unset)", gg::iq_cpu_own_rows(GGML_TYPE_IQ1_S) ? "on" : "off",
+                gg::iq_cpu_own_gu_fused() ? "on" : "off");
     const bool want_own = e != nullptr && std::atoi(e) == 0;
 #if defined(__x86_64__) || defined(_M_X64)
     if (want_own && !gg::iq_cpu_own_rows(GGML_TYPE_IQ1_S)) {

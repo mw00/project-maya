@@ -396,6 +396,107 @@ IQ_AVX2 void iq_rows_avx2(const uint8_t* w, size_t rb, int nb, const block_q8_K*
     }
 }
 
+// IQ2_XXS's gate and up row of the same index in one pass (DS4_IQ1_FGU, iq_cpu_gate_up's own-rows
+// branch): the pair pass as iq1s_gu_rows_avx2's - each matrix keeps its own chunk build (tab4 of
+// iq2xxs_grid, or the g_ct2x one-step form g_ct16 selects at startup, with sgn7t / the pair sums and the
+// chunk scale), its tokens' int32 lanes and its floats; the activations are loaded once (q8, +32) for
+// both matrices' products, and their (q8 + 128) form computed once for both when g_ct16 is on.
+template <int NT, bool CT>
+IQ_AVX2 void iq2x_gu_rows_avx2(const uint8_t* w, const uint8_t* w2, size_t rb, int nb,
+                               const block_q8_K* const* y, float* const* outA, float* const* outB,
+                               int r0, int r1) {
+    const __m256i k80 = _mm256_set1_epi8((char) 0x80);
+    constexpr float K = 0.125f;
+    constexpr size_t BB = sizeof(block_iq2_xxs);
+    for (int r = r0; r < r1; ++r) {
+        const uint8_t* row = w + (size_t) r * rb;
+        const uint8_t* row2 = w2 + (size_t) r * rb;
+        __m256 accfA[NT], accfB[NT];
+        for (int t = 0; t < NT; ++t) {
+            accfA[t] = _mm256_setzero_ps();
+            accfB[t] = _mm256_setzero_ps();
+        }
+        for (int i = 0; i < nb; ++i) {
+            const uint8_t* blk = row + (size_t) i * BB;
+            const uint8_t* blk2 = row2 + (size_t) i * BB;
+            __m256i sumiA[NT], sumiB[NT];
+            for (int t = 0; t < NT; ++t) {
+                sumiA[t] = _mm256_setzero_si256();
+                sumiB[t] = _mm256_setzero_si256();
+            }
+            uint16_t dh;
+            std::memcpy(&dh, blk, 2);
+            uint16_t dh2;
+            std::memcpy(&dh2, blk2, 2);
+            for (int ib = 0; ib < QK_K / 32; ib += 2) {
+                const uint8_t* q = blk + 2 + 8 * ib;
+                const uint8_t* q2 = blk2 + 2 + 8 * ib;
+                const uint32_t a0 = u32(q), a1 = u32(q + 4), b0 = u32(q + 8), b1 = u32(q + 12);
+                const uint32_t c0 = u32(q2), c1u = u32(q2 + 4), d0 = u32(q2 + 8), d1u = u32(q2 + 12);
+                __m256i ga1, ga2, sa1, sa2, ca1, ca2, gb1, gb2, sb1, sb2, cb1, cb2;
+                if constexpr (CT) {
+                    ga1 = tab4(g_ct2x, (a0 & 255u) << 7 | (a1 & 127u), ((a0 >> 8) & 255u) << 7 | ((a1 >> 7) & 127u),
+                               ((a0 >> 16) & 255u) << 7 | ((a1 >> 14) & 127u), (a0 >> 24) << 7 | ((a1 >> 21) & 127u));
+                    ga2 = tab4(g_ct2x, (b0 & 255u) << 7 | (b1 & 127u), ((b0 >> 8) & 255u) << 7 | ((b1 >> 7) & 127u),
+                               ((b0 >> 16) & 255u) << 7 | ((b1 >> 14) & 127u), (b0 >> 24) << 7 | ((b1 >> 21) & 127u));
+                    sa1 = _mm256_maddubs_epi16(k80, ga1);
+                    sa2 = _mm256_maddubs_epi16(k80, ga2);
+                    gb1 = tab4(g_ct2x, (c0 & 255u) << 7 | (c1u & 127u), ((c0 >> 8) & 255u) << 7 | ((c1u >> 7) & 127u),
+                               ((c0 >> 16) & 255u) << 7 | ((c1u >> 14) & 127u), (c0 >> 24) << 7 | ((c1u >> 21) & 127u));
+                    gb2 = tab4(g_ct2x, (d0 & 255u) << 7 | (d1u & 127u), ((d0 >> 8) & 255u) << 7 | ((d1u >> 7) & 127u),
+                               ((d0 >> 16) & 255u) << 7 | ((d1u >> 14) & 127u), (d0 >> 24) << 7 | ((d1u >> 21) & 127u));
+                    sb1 = _mm256_maddubs_epi16(k80, gb1);
+                    sb2 = _mm256_maddubs_epi16(k80, gb2);
+                } else {
+                    ga1 = tab4(iq2xxs_grid, a0 & 255u, (a0 >> 8) & 255u, (a0 >> 16) & 255u, a0 >> 24);
+                    ga2 = tab4(iq2xxs_grid, b0 & 255u, (b0 >> 8) & 255u, (b0 >> 16) & 255u, b0 >> 24);
+                    sa1 = sgn7t(a1);
+                    sa2 = sgn7t(b1);
+                    gb1 = tab4(iq2xxs_grid, c0 & 255u, (c0 >> 8) & 255u, (c0 >> 16) & 255u, c0 >> 24);
+                    gb2 = tab4(iq2xxs_grid, d0 & 255u, (d0 >> 8) & 255u, (d0 >> 16) & 255u, d0 >> 24);
+                    sb1 = sgn7t(c1u);
+                    sb2 = sgn7t(d1u);
+                }
+                ca1 = _mm256_set1_epi16((short) (2 * (a1 >> 28) + 1));
+                ca2 = _mm256_set1_epi16((short) (2 * (b1 >> 28) + 1));
+                cb1 = _mm256_set1_epi16((short) (2 * (c1u >> 28) + 1));
+                cb2 = _mm256_set1_epi16((short) (2 * (d1u >> 28) + 1));
+                for (int t = 0; t < NT; ++t) {
+                    const int8_t* q8 = y[t][i].qs + 32 * ib;
+                    if constexpr (CT) {
+                        const __m256i u1 = _mm256_xor_si256(_mm256_loadu_si256((const __m256i*) q8), k80);
+                        const __m256i u2 = _mm256_xor_si256(_mm256_loadu_si256((const __m256i*) (q8 + 32)), k80);
+                        sumiA[t] = _mm256_add_epi32(sumiA[t], _mm256_add_epi32(
+                                        _mm256_madd_epi16(_mm256_sub_epi16(_mm256_maddubs_epi16(u1, ga1), sa1), ca1),
+                                        _mm256_madd_epi16(_mm256_sub_epi16(_mm256_maddubs_epi16(u2, ga2), sa2), ca2)));
+                        sumiB[t] = _mm256_add_epi32(sumiB[t], _mm256_add_epi32(
+                                        _mm256_madd_epi16(_mm256_sub_epi16(_mm256_maddubs_epi16(u1, gb1), sb1), cb1),
+                                        _mm256_madd_epi16(_mm256_sub_epi16(_mm256_maddubs_epi16(u2, gb2), sb2), cb2)));
+                    } else {
+                        const __m256i l1 = _mm256_loadu_si256((const __m256i*) q8);
+                        const __m256i l2 = _mm256_loadu_si256((const __m256i*) (q8 + 32));
+                        sumiA[t] = _mm256_add_epi32(sumiA[t], _mm256_add_epi32(
+                                        _mm256_madd_epi16(_mm256_maddubs_epi16(ga1, _mm256_sign_epi8(l1, sa1)), ca1),
+                                        _mm256_madd_epi16(_mm256_maddubs_epi16(ga2, _mm256_sign_epi8(l2, sa2)), ca2)));
+                        sumiB[t] = _mm256_add_epi32(sumiB[t], _mm256_add_epi32(
+                                        _mm256_madd_epi16(_mm256_maddubs_epi16(gb1, _mm256_sign_epi8(l1, sb1)), cb1),
+                                        _mm256_madd_epi16(_mm256_maddubs_epi16(gb2, _mm256_sign_epi8(l2, sb2)), cb2)));
+                    }
+                }
+            }
+            const float dx = h2f(dh), dx2 = h2f(dh2);
+            for (int t = 0; t < NT; ++t) {
+                accfA[t] = _mm256_fmadd_ps(_mm256_set1_ps(dx * y[t][i].d), _mm256_cvtepi32_ps(sumiA[t]), accfA[t]);
+                accfB[t] = _mm256_fmadd_ps(_mm256_set1_ps(dx2 * y[t][i].d), _mm256_cvtepi32_ps(sumiB[t]), accfB[t]);
+            }
+        }
+        for (int t = 0; t < NT; ++t) {
+            outA[t][r - r0] = K * hsum_ggml(accfA[t]);
+            outB[t][r - r0] = K * hsum_ggml(accfB[t]);
+        }
+    }
+}
+
 // IQ1_S's two scalar float steps as the compiler built ggml-cpu's: accum1 += d * sumi1 (bit 0) and hsum_float_8 +
 // IQ1S_DELTA * accum1 (bit 1) each one FMA when set (gcc contracts them, MSVC does not) - own() keeps the form whose
 // rows own_check finds equal to ggml's, bit for bit
@@ -420,7 +521,15 @@ inline float mul_exact(float a, float b) {   // a * b rounded on its own (never 
 #define IQ_F16C IQ_AVX2
 #endif
 
-template <int NT>
+// the grid lookups of a 32-weight chunk (DS4_IQ1_V2 tries the other two on this CPU; the table entries are the same
+// 64-bit words, so the sums are the same integers either way):
+//   0  ggml's shape: 4 scalar table loads carried into lanes by vpinsrq / vinserti128 (Broadwell: the one shuffle
+//      port runs them all),
+//   1  four memory-broadcast loads (vmovddup, no register broadcast) put together by dword vpblendd (p015, cheap),
+//   2  one vpgatherqq a 4-entry chunk (Broadwell's gather is decent; it was slower on Zen 3, not measured there)
+constexpr int IQ1_GF_MAX = 2;
+
+template <int NT, int GF>
 IQ_F16C void iq1s_rows_avx2(const uint8_t* w, size_t rb, int nb, const block_q8_K* const* y, float* const* out, int r0,
                             int r1) {
     const bool fa = (g_iq1_fma & 1) != 0, ff = (g_iq1_fma & 2) != 0;
@@ -497,8 +606,17 @@ IQ_F16C void iq1s_rows_avx2(const uint8_t* w, size_t rb, int nb, const block_q8_
 #pragma GCC unroll 4
                 for (int ib = 0; ib < QK_K / 32; ib += 2) {   // a pair of 32-value chunks: decoded once
                     const uint16_t* p = ix + 32 * k + 4 * ib;
-                    const __m256i g1 = _mm256_set_epi64x(iq1s_grid[p[3]], iq1s_grid[p[2]], iq1s_grid[p[1]], iq1s_grid[p[0]]);
-                    const __m256i g2 = _mm256_set_epi64x(iq1s_grid[p[7]], iq1s_grid[p[6]], iq1s_grid[p[5]], iq1s_grid[p[4]]);
+                    __m256i g1, g2;
+                    if constexpr (GF == 2) {   // Broadwell's vpgatherqq: one entry a lane, no shuffle-port work
+                        g1 = _mm256_i32gather_epi64((const long long*) iq1s_grid, _mm_cvtepu16_epi32(_mm_loadu_si128((const __m128i*) p)), 8);
+                        g2 = _mm256_i32gather_epi64((const long long*) iq1s_grid, _mm_cvtepu16_epi32(_mm_loadu_si128((const __m128i*) (p + 4))), 8);
+                    } else if constexpr (GF == 1) {   // the entries by broadcast loads + dword blends (tab4: no p5)
+                        g1 = tab4(iq1s_grid, p[0], p[1], p[2], p[3]);
+                        g2 = tab4(iq1s_grid, p[4], p[5], p[6], p[7]);
+                    } else {
+                        g1 = _mm256_set_epi64x(iq1s_grid[p[3]], iq1s_grid[p[2]], iq1s_grid[p[1]], iq1s_grid[p[0]]);
+                        g2 = _mm256_set_epi64x(iq1s_grid[p[7]], iq1s_grid[p[6]], iq1s_grid[p[5]], iq1s_grid[p[4]]);
+                    }
                     const __m256i a1 = _mm256_sign_epi8(g1, g1), a2 = _mm256_sign_epi8(g2, g2);   // (mul_add_epi8)
                     const __m256i Lh = ib < 4 ? L0 : L1;
                     const __m256i c1 = (ib & 2) ? _mm256_shuffle_epi32(Lh, 0xAA) : _mm256_shuffle_epi32(Lh, 0x00);
@@ -520,6 +638,175 @@ IQ_F16C void iq1s_rows_avx2(const uint8_t* w, size_t rb, int nb, const block_q8_
         }
         for (int t = 0; t < NT; ++t)
             out[t][r - r0] = ff ? std::fma(IQ1S_DELTA, acc1[t], hsum_ggml(accf[t])) : hsum_ggml(accf[t]) + mul_exact(IQ1S_DELTA, acc1[t]);
+    }
+}
+
+// IQ1_S's gate and up row of the same index in one pass (DS4_IQ1_FGU, default on; the engine's
+// iq_cpu_gate_up takes it when its own rows are on): the two matrices' grid / scale decodes keep their
+// own rows' buffers (x for the gate's, x2 for the up's) and their own accumulators (accfA/B, acc1A/B),
+// so per matrix this is iq1s_rows_avx2's sum in its order bit for bit; the tokens' activations are
+// loaded once a chunk pair and feed both matrices' products (the one load either matrix would have
+// made twice across the two passes), and the segment decode (the bsums sums, the 11-bit indices, the
+// F16 scales) happens once a row pair instead of twice.  GF: the grid fetch form, as above.
+template <int NT, int GF>
+IQ_F16C void iq1s_gu_rows_avx2(const uint8_t* w, const uint8_t* w2, size_t rb, int nb,
+                               const block_q8_K* const* y, float* const* outA, float* const* outB,
+                               int r0, int r1) {
+    const bool fa = (g_iq1_fma & 1) != 0, ff = (g_iq1_fma & 2) != 0;
+    const __m256i ca = _mm256_setr_epi8(0, 1, 0, 1, 0, 1, 0, 1, 2, 3, 2, 3, 2, 3, 2, 3, 4, 5, 4, 5, 4, 5, 4, 5, 6, 7, 6, 7, 6, 7, 6, 7);
+    const __m256i cb = _mm256_add_epi8(ca, _mm256_set1_epi8(8));
+    const __m256i mul = _mm256_setr_epi16(512, 64, 8, 1, 512, 64, 8, 1, 512, 64, 8, 1, 512, 64, 8, 1);
+    const __m256i m0e = _mm256_set1_epi16(0x0E00), k14 = _mm256_set1_epi16(14), k1 = _mm256_set1_epi16(1);
+    constexpr int S = 16;
+    thread_local std::vector<int16_t> pbuf;
+    pbuf.resize((size_t) 8 * NT * nb);
+    int16_t* P = pbuf.data();
+    for (int t = 0; t < NT; ++t)
+        for (int i = 0; i < nb; ++i)
+            _mm_storeu_si128((__m128i*) (P + 8 * (t * nb + i)), _mm_hadd_epi16(_mm_loadu_si128((const __m128i*) y[t][i].bsums),
+                                                                              _mm_loadu_si128((const __m128i*) (y[t][i].bsums + 8))));
+    for (int r = r0; r < r1; ++r) {
+        const block_iq1_s* x = (const block_iq1_s*) (w + (size_t) r * rb);
+        const block_iq1_s* x2 = (const block_iq1_s*) (w2 + (size_t) r * rb);
+        __m256 accfA[NT], accfB[NT];
+        float acc1A[NT], acc1B[NT];
+        for (int t = 0; t < NT; ++t) {
+            accfA[t] = _mm256_setzero_ps();
+            acc1A[t] = 0.0f;
+            accfB[t] = _mm256_setzero_ps();
+            acc1B[t] = 0.0f;
+        }
+        alignas(32) uint16_t ixA[S * 32], ixB[S * 32];
+        alignas(32) int32_t s1A[NT][S], s1B[NT][S];
+        alignas(32) float dxsA[S], dxsB[S];
+        alignas(16) uint16_t dhA[S], dhB[S];
+        for (int i0 = 0; i0 < nb; i0 += S) {
+            const int ns = nb - i0 < S ? nb - i0 : S;
+            for (int k = 0; k < S; ++k) {
+                dhA[k] = k < ns ? x[i0 + k].d : 0;
+                dhB[k] = k < ns ? x2[i0 + k].d : 0;
+            }
+            _mm256_store_ps(dxsA, _mm256_cvtph_ps(_mm_load_si128((const __m128i*) dhA)));
+            _mm256_store_ps(dxsA + 8, _mm256_cvtph_ps(_mm_load_si128((const __m128i*) (dhA + 8))));
+            _mm256_store_ps(dxsB, _mm256_cvtph_ps(_mm_load_si128((const __m128i*) dhB)));
+            _mm256_store_ps(dxsB + 8, _mm256_cvtph_ps(_mm_load_si128((const __m128i*) (dhB + 8))));
+            for (int k0 = 0; k0 < ns; k0 += 8) {
+                __m256i mA[NT][4], mB[NT][4];
+                for (int p = 0; p < 4; ++p) {
+                    const int ka = std::min(i0 + k0 + 2 * p, nb - 1), kb = std::min(i0 + k0 + 2 * p + 1, nb - 1);
+                    const __m256i qa = _mm256_inserti128_si256(_mm256_castsi128_si256(_mm_loadu_si128((const __m128i*) x[ka].qh)),
+                                                               _mm_loadu_si128((const __m128i*) x[kb].qh), 1);
+                    const __m256i qb = _mm256_inserti128_si256(_mm256_castsi128_si256(_mm_loadu_si128((const __m128i*) x2[ka].qh)),
+                                                               _mm_loadu_si128((const __m128i*) x2[kb].qh), 1);
+                    const __m256i lsa = _mm256_or_si256(_mm256_and_si256(_mm256_srli_epi16(qa, 11), k14), k1);
+                    const __m256i lsb = _mm256_or_si256(_mm256_and_si256(_mm256_srli_epi16(qb, 11), k14), k1);
+                    const __m256i sla = _mm256_sign_epi16(lsa, _mm256_or_si256(qa, k1));
+                    const __m256i slb = _mm256_sign_epi16(lsb, _mm256_or_si256(qb, k1));
+                    for (int t = 0; t < NT; ++t) {
+                        const __m256i pt = _mm256_inserti128_si256(_mm256_castsi128_si256(_mm_loadu_si128((const __m128i*) (P + 8 * (t * nb + ka)))),
+                                                                   _mm_loadu_si128((const __m128i*) (P + 8 * (t * nb + kb))), 1);
+                        mA[t][p] = _mm256_madd_epi16(sla, pt);
+                        mB[t][p] = _mm256_madd_epi16(slb, pt);
+                    }
+                }
+                for (int t = 0; t < NT; ++t) {
+                    _mm256_store_si256((__m256i*) (s1A[t] + k0),
+                                       _mm256_permutevar8x32_epi32(_mm256_hadd_epi32(_mm256_hadd_epi32(mA[t][0], mA[t][1]), _mm256_hadd_epi32(mA[t][2], mA[t][3])),
+                                                                   _mm256_setr_epi32(0, 4, 1, 5, 2, 6, 3, 7)));
+                    _mm256_store_si256((__m256i*) (s1B[t] + k0),
+                                       _mm256_permutevar8x32_epi32(_mm256_hadd_epi32(_mm256_hadd_epi32(mB[t][0], mB[t][1]), _mm256_hadd_epi32(mB[t][2], mB[t][3])),
+                                                                   _mm256_setr_epi32(0, 4, 1, 5, 2, 6, 3, 7)));
+                }
+            }
+            for (int k = 0; k < ns; ++k) {
+                const block_iq1_s& ba = x[i0 + k];
+                const block_iq1_s& bb = x2[i0 + k];
+                const __m256i ha = _mm256_broadcastsi128_si256(_mm_loadu_si128((const __m128i*) ba.qh));
+                const __m256i hb = _mm256_broadcastsi128_si256(_mm_loadu_si128((const __m128i*) bb.qh));
+                _mm256_store_si256((__m256i*) (ixA + 32 * k),
+                                   _mm256_or_si256(_mm256_cvtepu8_epi16(_mm_loadu_si128((const __m128i*) ba.qs)),
+                                                   _mm256_srli_epi16(_mm256_and_si256(_mm256_mullo_epi16(_mm256_shuffle_epi8(ha, ca), mul), m0e), 1)));
+                _mm256_store_si256((__m256i*) (ixA + 32 * k + 16),
+                                   _mm256_or_si256(_mm256_cvtepu8_epi16(_mm_loadu_si128((const __m128i*) (ba.qs + 16))),
+                                                   _mm256_srli_epi16(_mm256_and_si256(_mm256_mullo_epi16(_mm256_shuffle_epi8(ha, cb), mul), m0e), 1)));
+                _mm256_store_si256((__m256i*) (ixB + 32 * k),
+                                   _mm256_or_si256(_mm256_cvtepu8_epi16(_mm_loadu_si128((const __m128i*) bb.qs)),
+                                                   _mm256_srli_epi16(_mm256_and_si256(_mm256_mullo_epi16(_mm256_shuffle_epi8(hb, ca), mul), m0e), 1)));
+                _mm256_store_si256((__m256i*) (ixB + 32 * k + 16),
+                                   _mm256_or_si256(_mm256_cvtepu8_epi16(_mm_loadu_si128((const __m128i*) (bb.qs + 16))),
+                                                   _mm256_srli_epi16(_mm256_and_si256(_mm256_mullo_epi16(_mm256_shuffle_epi8(hb, cb), mul), m0e), 1)));
+            }
+            for (int k = 0; k < ns; ++k) {
+                const int i = i0 + k;
+                const __m256i q2a = _mm256_cvtepu16_epi32(_mm_loadu_si128((const __m128i*) x[i].qh));
+                const __m256i q2b = _mm256_cvtepu16_epi32(_mm_loadu_si128((const __m128i*) x2[i].qh));
+                const __m256i lsa = _mm256_or_si256(_mm256_and_si256(_mm256_srli_epi32(q2a, 11), _mm256_set1_epi32(14)), _mm256_set1_epi32(1));
+                const __m256i lsb = _mm256_or_si256(_mm256_and_si256(_mm256_srli_epi32(q2b, 11), _mm256_set1_epi32(14)), _mm256_set1_epi32(1));
+                const __m256i lsdA = _mm256_or_si256(lsa, _mm256_slli_epi32(lsa, 16));
+                const __m256i lsdB = _mm256_or_si256(lsb, _mm256_slli_epi32(lsb, 16));
+                const __m256i L0A = _mm256_permute2x128_si256(lsdA, lsdA, 0x00), L1A = _mm256_permute2x128_si256(lsdA, lsdA, 0x11);
+                const __m256i L0B = _mm256_permute2x128_si256(lsdB, lsdB, 0x00), L1B = _mm256_permute2x128_si256(lsdB, lsdB, 0x11);
+                __m256i sumiA[NT], sumiB[NT];
+                for (int t = 0; t < NT; ++t) {
+                    sumiA[t] = _mm256_setzero_si256();
+                    sumiB[t] = _mm256_setzero_si256();
+                }
+#pragma GCC unroll 4
+                for (int ib = 0; ib < QK_K / 32; ib += 2) {
+                    const uint16_t* pa = ixA + 32 * k + 4 * ib;
+                    const uint16_t* pb = ixB + 32 * k + 4 * ib;
+                    __m256i g1A, g2A, g1B, g2B;
+                    if constexpr (GF == 2) {
+                        g1A = _mm256_i32gather_epi64((const long long*) iq1s_grid, _mm_cvtepu16_epi32(_mm_loadu_si128((const __m128i*) pa)), 8);
+                        g2A = _mm256_i32gather_epi64((const long long*) iq1s_grid, _mm_cvtepu16_epi32(_mm_loadu_si128((const __m128i*) (pa + 4))), 8);
+                        g1B = _mm256_i32gather_epi64((const long long*) iq1s_grid, _mm_cvtepu16_epi32(_mm_loadu_si128((const __m128i*) pb)), 8);
+                        g2B = _mm256_i32gather_epi64((const long long*) iq1s_grid, _mm_cvtepu16_epi32(_mm_loadu_si128((const __m128i*) (pb + 4))), 8);
+                    } else if constexpr (GF == 1) {
+                        g1A = tab4(iq1s_grid, pa[0], pa[1], pa[2], pa[3]);
+                        g2A = tab4(iq1s_grid, pa[4], pa[5], pa[6], pa[7]);
+                        g1B = tab4(iq1s_grid, pb[0], pb[1], pb[2], pb[3]);
+                        g2B = tab4(iq1s_grid, pb[4], pb[5], pb[6], pb[7]);
+                    } else {
+                        g1A = _mm256_set_epi64x(iq1s_grid[pa[3]], iq1s_grid[pa[2]], iq1s_grid[pa[1]], iq1s_grid[pa[0]]);
+                        g2A = _mm256_set_epi64x(iq1s_grid[pa[7]], iq1s_grid[pa[6]], iq1s_grid[pa[5]], iq1s_grid[pa[4]]);
+                        g1B = _mm256_set_epi64x(iq1s_grid[pb[3]], iq1s_grid[pb[2]], iq1s_grid[pb[1]], iq1s_grid[pb[0]]);
+                        g2B = _mm256_set_epi64x(iq1s_grid[pb[7]], iq1s_grid[pb[6]], iq1s_grid[pb[5]], iq1s_grid[pb[4]]);
+                    }
+                    const __m256i a1A = _mm256_sign_epi8(g1A, g1A), a2A = _mm256_sign_epi8(g2A, g2A);
+                    const __m256i a1B = _mm256_sign_epi8(g1B, g1B), a2B = _mm256_sign_epi8(g2B, g2B);
+                    const __m256i LhA = ib < 4 ? L0A : L1A, LhB = ib < 4 ? L0B : L1B;
+                    const __m256i c1A = (ib & 2) ? _mm256_shuffle_epi32(LhA, 0xAA) : _mm256_shuffle_epi32(LhA, 0x00);
+                    const __m256i c2A = (ib & 2) ? _mm256_shuffle_epi32(LhA, 0xFF) : _mm256_shuffle_epi32(LhA, 0x55);
+                    const __m256i c1B = (ib & 2) ? _mm256_shuffle_epi32(LhB, 0xAA) : _mm256_shuffle_epi32(LhB, 0x00);
+                    const __m256i c2B = (ib & 2) ? _mm256_shuffle_epi32(LhB, 0xFF) : _mm256_shuffle_epi32(LhB, 0x55);
+                    for (int t = 0; t < NT; ++t) {
+                        const int8_t* q8 = y[t][i].qs + 32 * ib;
+                        const __m256i l1 = _mm256_loadu_si256((const __m256i*) q8);
+                        const __m256i l2 = _mm256_loadu_si256((const __m256i*) (q8 + 32));
+                        const __m256i d1A = _mm256_maddubs_epi16(a1A, _mm256_sign_epi8(l1, g1A));
+                        const __m256i d2A = _mm256_maddubs_epi16(a2A, _mm256_sign_epi8(l2, g2A));
+                        const __m256i d1B = _mm256_maddubs_epi16(a1B, _mm256_sign_epi8(l1, g1B));
+                        const __m256i d2B = _mm256_maddubs_epi16(a2B, _mm256_sign_epi8(l2, g2B));
+                        sumiA[t] = _mm256_add_epi32(sumiA[t], _mm256_add_epi32(_mm256_madd_epi16(d1A, c1A), _mm256_madd_epi16(d2A, c2A)));
+                        sumiB[t] = _mm256_add_epi32(sumiB[t], _mm256_add_epi32(_mm256_madd_epi16(d1B, c1B), _mm256_madd_epi16(d2B, c2B)));
+                    }
+                }
+                const float dxA = dxsA[k], dxB = dxsB[k];
+                for (int t = 0; t < NT; ++t) {
+                    const float dA = y[t][i].d * dxA, dB = y[t][i].d * dxB;
+                    accfA[t] = _mm256_fmadd_ps(_mm256_set1_ps(dA), _mm256_cvtepi32_ps(sumiA[t]), accfA[t]);
+                    acc1A[t] = fa ? std::fma(dA, (float) s1A[t][k], acc1A[t]) : acc1A[t] + mul_exact(dA, (float) s1A[t][k]);
+                    accfB[t] = _mm256_fmadd_ps(_mm256_set1_ps(dB), _mm256_cvtepi32_ps(sumiB[t]), accfB[t]);
+                    acc1B[t] = fa ? std::fma(dB, (float) s1B[t][k], acc1B[t]) : acc1B[t] + mul_exact(dB, (float) s1B[t][k]);
+                }
+            }
+        }
+        for (int t = 0; t < NT; ++t) {
+            outA[t][r - r0] = ff ? std::fma(IQ1S_DELTA, acc1A[t], hsum_ggml(accfA[t]))
+                                 : hsum_ggml(accfA[t]) + mul_exact(IQ1S_DELTA, acc1A[t]);
+            outB[t][r - r0] = ff ? std::fma(IQ1S_DELTA, acc1B[t], hsum_ggml(accfB[t]))
+                                 : hsum_ggml(accfB[t]) + mul_exact(IQ1S_DELTA, acc1B[t]);
+        }
     }
 }
 
@@ -790,21 +1077,136 @@ void iq_rows_n(const uint8_t* w, size_t rb, int n, const void* const* act, int n
     }
 }
 
+// the grid-fetch form and the 5..8-token pass of IQ1_S's rows (DS4_IQ1_V2: 1 the broadcast+blend fetches, 2 the gathers,
+// 4/5 also the tokens in one pass - they stream the weights once, not twice).  Unset: the original form, 4 tokens a
+// pass.  The values are the same bits whatever the fetch (the same 64-bit grid words) and whatever a pass holds (each
+// token's own FMA chain over the blocks is untouched); only the speed changes
+static int iq1_v2_mode() {
+    static const int v = [] {
+        const char* e = std::getenv("DS4_IQ1_V2");
+        return e == nullptr ? 0 : std::atoi(e);
+    }();
+    return v;
+}
+
+// the row pair (gate r, up r) in one pass when the own rows are on: DS4_IQ1_FGU (0 or unset takes the
+// two own_rows passes - the fused pass measured slower per row at this CPU in the campaign's A/B, and no
+// e2e win; 1 takes the fused pass, bit for bit the same outputs).  The two passes' outputs are this
+// form's bit for bit (the rows tests compare both)
+bool own_gu_fused(int type) {
+    static const bool v = [] {
+        const char* e = std::getenv("DS4_IQ1_FGU");
+        return e != nullptr && std::atoi(e) != 0;
+    }();
+    return v && (type == GGML_TYPE_IQ1_S || type == GGML_TYPE_IQ2_XXS);
+}
+
+bool own_gu_rows(int type, const uint8_t* w, const uint8_t* w2, size_t rb, int n, const void* const* act, int nt,
+                 float* const* outA, float* const* outB, int r0, int r1) {
+#if defined(IQ_X86)
+    if (type == GGML_TYPE_IQ1_S && own_gu_fused(type)) {   // (the fused pass; else the two own_rows passes)
+        const int nb = n / QK_K;
+        for (int t0 = 0; t0 < nt; t0 += 4) {   // (the same 4-token passes as iq1s_rows_n)
+            const block_q8_K* y[4];
+            float* oA[4], *oB[4];
+            const int c = nt - t0 < 4 ? nt - t0 : 4;
+            for (int t = 0; t < c; ++t) {
+                y[t] = (const block_q8_K*) act[t0 + t];
+                oA[t] = outA[t0 + t];
+                oB[t] = outB[t0 + t];
+            }
+            switch (c) {
+                case 1: iq1s_gu_rows_avx2<1, 0>(w, w2, rb, nb, y, oA, oB, r0, r1); break;
+                case 2: iq1s_gu_rows_avx2<2, 0>(w, w2, rb, nb, y, oA, oB, r0, r1); break;
+                case 3: iq1s_gu_rows_avx2<3, 0>(w, w2, rb, nb, y, oA, oB, r0, r1); break;
+                default: iq1s_gu_rows_avx2<4, 0>(w, w2, rb, nb, y, oA, oB, r0, r1); break;
+            }
+        }
+        return true;
+    }
+    if (type == GGML_TYPE_IQ2_XXS && own_gu_fused(type)) {
+        const int nb = n / QK_K;
+        const int pass = 4;
+        for (int t0 = 0; t0 < nt; t0 += pass) {
+            const block_q8_K* y[4];
+            float* oA[4], *oB[4];
+            const int c = nt - t0 < pass ? nt - t0 : pass;
+            for (int t = 0; t < c; ++t) {
+                y[t] = (const block_q8_K*) act[t0 + t];
+                oA[t] = outA[t0 + t];
+                oB[t] = outB[t0 + t];
+            }
+            if (g_ct16) {   // (the one-table form, as iq_rows_avx2's ct branch - the same values)
+                switch (c) {
+                    case 1: iq2x_gu_rows_avx2<1, true>(w, w2, rb, nb, y, oA, oB, r0, r1); break;
+                    case 2: iq2x_gu_rows_avx2<2, true>(w, w2, rb, nb, y, oA, oB, r0, r1); break;
+                    case 3: iq2x_gu_rows_avx2<3, true>(w, w2, rb, nb, y, oA, oB, r0, r1); break;
+                    default: iq2x_gu_rows_avx2<4, true>(w, w2, rb, nb, y, oA, oB, r0, r1); break;
+                }
+            } else {
+                switch (c) {
+                    case 1: iq2x_gu_rows_avx2<1, false>(w, w2, rb, nb, y, oA, oB, r0, r1); break;
+                    case 2: iq2x_gu_rows_avx2<2, false>(w, w2, rb, nb, y, oA, oB, r0, r1); break;
+                    case 3: iq2x_gu_rows_avx2<3, false>(w, w2, rb, nb, y, oA, oB, r0, r1); break;
+                    default: iq2x_gu_rows_avx2<4, false>(w, w2, rb, nb, y, oA, oB, r0, r1); break;
+                }
+            }
+        }
+        return true;
+    }
+#endif
+    (void) type, (void) w, (void) w2, (void) rb, (void) n, (void) act, (void) nt, (void) outA, (void) outB;
+    (void) r0, (void) r1;
+    return false;
+}
+
 void iq1s_rows_n(const uint8_t* w, size_t rb, int n, const void* const* act, int nt, float* const* out, int r0, int r1) {
     const int nb = n / QK_K;
-    for (int t0 = 0; t0 < nt; t0 += 4) {   // (4 tokens a pass, as iq_rows_n: their accumulators stay in registers)
-        const block_q8_K* y[4];
-        float* o[4];
-        const int c = nt - t0 < 4 ? nt - t0 : 4;
+    const int v2 = iq1_v2_mode();
+    const int gf = v2 == 1 || v2 >= 4 ? 1 : v2 == 2 || v2 == 5 ? 2 : 0;
+    const int pass = v2 >= 4 ? 8 : 4;   // (5..8 tokens in the same pass: the weights stream once)
+    for (int t0 = 0; t0 < nt; t0 += pass) {
+        const block_q8_K* y[8];
+        float* o[8];
+        const int c = nt - t0 < pass ? nt - t0 : pass;
         for (int t = 0; t < c; ++t) {
             y[t] = (const block_q8_K*) act[t0 + t];
             o[t] = out[t0 + t];
         }
-        switch (c) {
-            case 1: iq1s_rows_avx2<1>(w, rb, nb, y, o, r0, r1); break;
-            case 2: iq1s_rows_avx2<2>(w, rb, nb, y, o, r0, r1); break;
-            case 3: iq1s_rows_avx2<3>(w, rb, nb, y, o, r0, r1); break;
-            default: iq1s_rows_avx2<4>(w, rb, nb, y, o, r0, r1); break;
+        // (the grid fetch and the pass length are compiled forms: one call a case's shapes, by GF then NT)
+        if (gf == 1) {
+            switch (c) {
+                case 1: iq1s_rows_avx2<1, 1>(w, rb, nb, y, o, r0, r1); break;
+                case 2: iq1s_rows_avx2<2, 1>(w, rb, nb, y, o, r0, r1); break;
+                case 3: iq1s_rows_avx2<3, 1>(w, rb, nb, y, o, r0, r1); break;
+                case 4: iq1s_rows_avx2<4, 1>(w, rb, nb, y, o, r0, r1); break;
+                case 5: iq1s_rows_avx2<5, 1>(w, rb, nb, y, o, r0, r1); break;
+                case 6: iq1s_rows_avx2<6, 1>(w, rb, nb, y, o, r0, r1); break;
+                case 7: iq1s_rows_avx2<7, 1>(w, rb, nb, y, o, r0, r1); break;
+                default: iq1s_rows_avx2<8, 1>(w, rb, nb, y, o, r0, r1); break;
+            }
+        } else if (gf == 2) {
+            switch (c) {
+                case 1: iq1s_rows_avx2<1, 2>(w, rb, nb, y, o, r0, r1); break;
+                case 2: iq1s_rows_avx2<2, 2>(w, rb, nb, y, o, r0, r1); break;
+                case 3: iq1s_rows_avx2<3, 2>(w, rb, nb, y, o, r0, r1); break;
+                case 4: iq1s_rows_avx2<4, 2>(w, rb, nb, y, o, r0, r1); break;
+                case 5: iq1s_rows_avx2<5, 2>(w, rb, nb, y, o, r0, r1); break;
+                case 6: iq1s_rows_avx2<6, 2>(w, rb, nb, y, o, r0, r1); break;
+                case 7: iq1s_rows_avx2<7, 2>(w, rb, nb, y, o, r0, r1); break;
+                default: iq1s_rows_avx2<8, 2>(w, rb, nb, y, o, r0, r1); break;
+            }
+        } else {
+            switch (c) {
+                case 1: iq1s_rows_avx2<1, 0>(w, rb, nb, y, o, r0, r1); break;
+                case 2: iq1s_rows_avx2<2, 0>(w, rb, nb, y, o, r0, r1); break;
+                case 3: iq1s_rows_avx2<3, 0>(w, rb, nb, y, o, r0, r1); break;
+                case 4: iq1s_rows_avx2<4, 0>(w, rb, nb, y, o, r0, r1); break;
+                case 5: iq1s_rows_avx2<5, 0>(w, rb, nb, y, o, r0, r1); break;
+                case 6: iq1s_rows_avx2<6, 0>(w, rb, nb, y, o, r0, r1); break;
+                case 7: iq1s_rows_avx2<7, 0>(w, rb, nb, y, o, r0, r1); break;
+                default: iq1s_rows_avx2<8, 0>(w, rb, nb, y, o, r0, r1); break;
+            }
         }
     }
 }
@@ -1109,8 +1511,10 @@ void iq_cpu_gate_up(const IqCpu& f, const uint8_t* gate, const uint8_t* up, cons
             go[(size_t) t] = buf.data() + (size_t) t * nr;
             uo[(size_t) t] = buf.data() + (size_t) (nt + t) * nr;
         }
-        own_rows(f.tg, gate, f.gu_row, f.n_embd, act, nt, go.data(), r0, r1);
-        own_rows(f.tg, up, f.gu_row, f.n_embd, act, nt, uo.data(), r0, r1);
+        if (!own_gu_rows(f.tg, gate, up, f.gu_row, f.n_embd, act, nt, go.data(), uo.data(), r0, r1)) {
+            own_rows(f.tg, gate, f.gu_row, f.n_embd, act, nt, go.data(), r0, r1);
+            own_rows(f.tg, up, f.gu_row, f.n_embd, act, nt, uo.data(), r0, r1);
+        }
         for (int t = 0; t < nt; ++t)
             for (int r = 0; r < nr; ++r) {
                 float g = go[(size_t) t][r], u = uo[(size_t) t][r];
@@ -1143,6 +1547,24 @@ int iq_cpu_act_type(int type) {
     return kc::native_fmt(type, type, 256, 256, n, err) ? n.gu_act : -1;
 }
 
+bool iq_cpu_act_q8k(int type) {
+#if defined(STRATA_NATIVE_EXPERTS)
+    return type == GGML_TYPE_Q8_K;
+#else
+    (void) type;
+    return false;
+#endif
+}
+
+size_t iq_cpu_act_block_bytes(int type) {
+#if defined(STRATA_NATIVE_EXPERTS)
+    return type == GGML_TYPE_Q8_K ? ggml_row_size(GGML_TYPE_Q8_K, QK_K) : 0;
+#else
+    (void) type;
+    return 0;
+#endif
+}
+
 void iq_cpu_rows(int type, const uint8_t* w, size_t rb, int k, const void* const* act, int nt, float* const* out, int r0,
                  int r1) {
     IqCpu f;   // (a "down" of k inputs: its rows are what iq_cpu_down reads)
@@ -1153,6 +1575,7 @@ void iq_cpu_rows(int type, const uint8_t* w, size_t rb, int k, const void* const
 }
 
 bool iq_cpu_own_rows(int type) { return own(type); }
+bool iq_cpu_own_gu_fused() { return own_gu_fused(GGML_TYPE_IQ1_S); }
 void iq_cpu_iq1s_rows(bool on) { g_iq1_on.store(on, std::memory_order_relaxed); }
 
 bool dense_requant(const uint8_t* q8, int n, int k, int type, std::vector<uint8_t>& out, std::string& err) {

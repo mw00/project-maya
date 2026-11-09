@@ -42,6 +42,12 @@ void iq_cpu_down(const IqCpu& f, const uint8_t* down, const void* const* hq, int
 int iq_cpu_act_type(int type);
 void iq_cpu_rows(int type, const uint8_t* w, size_t rb, int k, const void* const* act, int nt, float* const* out, int r0,
                  int r1);
+/// Whether the activation type is ggml's Q8_K: a block of 256 values quantized on its own (an F32 scale, the int8s
+/// and their pair sums), so a row's blocks quantize to the same bytes separately as the whole row does - the CPU
+/// flow's cpu_experts_iq takes its block-per-block form to fold the row quantize into the jobs that write it.
+bool iq_cpu_act_q8k(int type);
+/// An activation of `type`: the bytes one 256-value block takes when iq_cpu_act_q8k(type) (292 for Q8_K) - 0 else.
+size_t iq_cpu_act_block_bytes(int type);
 /// The CPU lane's MXFP4 rows in the device's arithmetic (ds4_gguf.cu's mx_dot): the activations rounded to int8 per 32
 /// values as the device rounds them (q8_round's q and scale), each block's products summed exactly in integers, then
 /// times (weight scale x activation scale) into F32 sums - the same numbers as the device up to the order of the
@@ -75,6 +81,8 @@ const char* mx_tier_name(int t);
 /// without VBMI - ds4_iq512_kern.inc, DS4_IQ512: ggml-cpu's numbers bit for bit, checked against its dot on first use;
 /// DS4_IQ_OWN=0 turns them off) rather than ggml's / the GLM lane's.
 bool iq_cpu_own_rows(int type);
+/// Whether gate and up compute one row pair in one pass (DS4_IQ1_FGU, iq_cpu_gate_up's own-rows branch).
+bool iq_cpu_own_gu_fused();
 /// Load-time preparation of the same guarded one/multi CPU row selection/parity checks.
 void iq_cpu_prepare_rows(int type);
 /// IQ1_S's own multi-token rows (the same bits as ggml-cpu's dot): allowed by default; the engine turns them off where
