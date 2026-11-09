@@ -1,3 +1,5 @@
+#include "ds4_grammar.hpp"
+#include "ds4_grammar_path.hpp"
 // src/ds4/ds4_main.cpp - maya-ds4: DeepSeek-V4.1-Flash on Maya.
 //
 //   maya-ds4 --pack <model>/maya-ds4 --ids 0,128803,... --n 16          greedy tokens after the ids
@@ -67,6 +69,8 @@
 #include <iterator>
 #include <map>
 #include <memory>
+#include <numeric>
+#include <sstream>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -536,6 +540,9 @@ struct Req {
     long long tail = -1;
     // logprobs=<k> (0 .. 20; the server's OpenAI logprobs / top_logprobs): after each T line an LP line - the token's
     // logprob and its row's k most likely (ds4_logprobs.hpp); -1: none, the request exactly as without
+    std::string grammar_path, grammar_after, grammar_prefix, grammar_hex;
+    bool has_grammar_hex = false;
+    std::shared_ptr<Grammar> grammar;
     int logprobs = -1;
     // logit_bias=<id>:<bias>,... (OpenAI's logit_bias; the server's ignore_eos bans the end tokens with -100): added to
     // the logits of every pick of the answer (Model::set_logit_bias); none: the picks exactly as without
@@ -643,7 +650,11 @@ bool parse_gen(const std::string& line, Req& r, bool geni) {
             break;
         }
         const std::string k = tok.substr(0, eq), v = tok.substr(eq + 1);
-        if (k == "temperature") r.temperature = std::strtof(v.c_str(), nullptr);
+        if (k == "grammar") r.grammar_path = v;
+        else if (k == "grammar_hex") { r.grammar_hex = v; r.has_grammar_hex = true; }
+        else if (k == "grammar_after") r.grammar_after = v;
+        else if (k == "grammar_prefix") r.grammar_prefix = v;
+        else if (k == "temperature") r.temperature = std::strtof(v.c_str(), nullptr);
         else if (k == "top_p") r.top_p = std::strtof(v.c_str(), nullptr);
         else if (k == "top_k") r.top_k = std::atoi(v.c_str());
         else if (k == "min_p") r.min_p = std::strtof(v.c_str(), nullptr);
@@ -738,6 +749,55 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
     for (const std::string& l : m.info_lines()) std::printf("%s\n", l.c_str());
     std::printf("INFO logprobs=%d\n", strata::ds4::kTopLogprobs);   // (GEN logprobs=<k>: LP lines, k at most this)
     std::printf("INFO logit_bias=1\n");   // (GEN logit_bias=<id>:<bias>,...: added to the logits of every pick)
+#ifdef MAYA_DS4_GRAMMAR
+    std::printf("INFO grammar=1 grammar_replay=1 grammar_hex=1\n");
+#endif
+    std::unique_ptr<GrammarVocabulary> grammar_vocab;
+    const auto prepare_grammar = [&](Req & r) {
+        try {
+            if (r.has_grammar_hex) {
+                if (!r.grammar_path.empty()) throw std::runtime_error("grammar and grammar_hex are mutually exclusive");
+                r.grammar_path = ds4_decode_grammar_path(r.grammar_hex);
+            }
+            if (r.grammar_path.empty() && r.grammar_after.empty() && r.grammar_prefix.empty()) return true;
+            if (r.grammar_path.empty()) throw std::runtime_error("grammar replay/after requires grammar");
+            const auto id_of = [&](const std::string & text) {
+                if (text.empty() || text.find_first_not_of("0123456789") != std::string::npos)
+                    throw std::runtime_error("invalid grammar token id");
+                const auto id = std::stoull(text);
+                if (id >= (unsigned) m.vocab()) throw std::runtime_error("grammar token out of vocabulary");
+                return (int) id;
+            };
+            if (!grammar_vocab) grammar_vocab = std::make_unique<GrammarVocabulary>(pack);
+            r.grammar = std::make_shared<Grammar>();
+            grammar_vocab->prepare(*r.grammar, r.grammar_path, r.grammar_after.empty() ? -1 : id_of(r.grammar_after),
+                                    eos.empty() ? 1 : eos.front());
+            if (r.grammar->vocab_size() != m.vocab()) throw std::runtime_error("grammar vocabulary size mismatch");
+            if (!r.grammar_prefix.empty()) {
+                if (r.grammar_prefix.back() == ',') throw std::runtime_error("invalid grammar_prefix");
+                std::istringstream replay(r.grammar_prefix); std::string token; size_t count = 0;
+                while (std::getline(replay, token, ',')) {
+                    const int id = id_of(token); float value = 0;
+                    if (++count > (size_t) m.max_context()) throw std::runtime_error("grammar_prefix exceeds context");
+                    if (id >= r.grammar->vocab_size()) throw std::runtime_error("grammar token out of vocabulary");
+                    r.grammar->mask(&value, &id, 1);
+                    if (!std::isfinite(value) || std::find(eos.begin(), eos.end(), id) != eos.end())
+                        throw std::runtime_error("grammar_prefix violates grammar");
+                    r.grammar->accept(id);
+                }
+            }
+            std::vector<float> values((size_t) r.grammar->vocab_size(), 0);
+            std::vector<int> ids(values.size()); std::iota(ids.begin(), ids.end(), 0);
+            r.grammar->mask(values.data(), ids.data(), (int) ids.size());
+            if (std::none_of(values.begin(), values.end(), [](float x) { return std::isfinite(x); }))
+                throw std::runtime_error("grammar has no valid token");
+            return true;
+        } catch (const std::exception & error) {
+            if (r.rid >= 0) std::printf("ERR %lld grammar: %s\n", r.rid, error.what());
+            else std::printf("ERR grammar: %s\n", error.what());
+            std::fflush(stdout); return false;
+        }
+    };
     if (m.seq_count() > 1)   // (--parallel: n conversations at once, GEN rid=<id>)
         std::printf("READY %lld stop multi=%d\n", (long long) m.max_context(), m.seq_count());
     else
@@ -1814,6 +1874,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             std::fflush(stdout);
             continue;
         }
+        if (!prepare_grammar(r)) continue;
         const double tr_parsed = now_ms();
         m.begin_request();   // (DISK_SKIP_AUTO: between requests only)
         if (round_log().f != nullptr) round_log().tag = "r" + std::to_string(++log_req);   // (DS4_ROUND_LOG)
@@ -1843,6 +1904,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         m.set_penalties(r.pen_n < 0 ? INT_MAX : r.pen_n,
                         std::isfinite(r.pen_repeat) && r.pen_repeat > 0.0f ? r.pen_repeat : 1.0f,
                         std::isfinite(r.pen_freq) ? r.pen_freq : 0.0f, std::isfinite(r.pen_present) ? r.pen_present : 0.0f);
+        m.set_grammar(r.grammar.get());
         m.set_logit_bias(r.bias);
         m.set_logprobs(r.logprobs);   // (logprobs=<k>: each token's row, kept as its token is: tok_lp, got_lp)
         int tok = m.sample(r.temperature, r.top_p, r.top_k, r.min_p, r.seed, counter++);
@@ -1862,7 +1924,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         };
         // (#363: the budget was the GLM engine's only - DeepSeek reasoned past it to max_tokens.  A round never runs
         //  past the budget, and the round at it is a plain step whose next token, not fed yet, becomes think_end)
-        bool in_think = r.think_budget > 0 && r.think_end >= 0;
+        bool in_think = !r.grammar && r.think_budget > 0 && r.think_end >= 0;
         for (;;) {
             if (in.stop.load()) {
                 finish = "cancel";
@@ -1870,9 +1932,10 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             }
             if (tok < 0) {   // (a sample's CUDA error, printed by the sampler: no T -1 to the client)
                 std::fprintf(stderr, "ds4: the sample failed\n");
-                finish = "cancel";
+                finish = tok == -2 ? "grammar" : "cancel";
                 break;
             }
+            if (r.grammar) r.grammar->accept(tok);
             std::printf("T %d\n", tok);
             if (tr_first == 0) tr_first = now_ms();
             if (r.logprobs >= 0) lp_out(-1, tok, tok_lp);
@@ -1904,7 +1967,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                            r.min_p, r.seed, counter, got,
                            off, acc, err, r.cum, r.lookup == 0 ? nullptr : lk, dc)) {
                     std::fprintf(stderr, "ds4: %s\n", err.c_str());
-                    finish = "cancel";
+                    finish = err.rfind("grammar:", 0) == 0 ? "grammar" : "cancel";
                     break;
                 }
                 d_off += off;
@@ -1922,6 +1985,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                 got_lp.pop_back();
             }
         }
+        m.set_grammar(nullptr);
         m.set_logprobs(-1);
         if (dump_f != nullptr) std::fflush(dump_f);
         // (a stop within accepted drafts leaves the state past it: the next prompt shares less with it, and goes back to
@@ -2063,6 +2127,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                             std::isfinite(r.pen_repeat) && r.pen_repeat > 0.0f ? r.pen_repeat : 1.0f,
                             std::isfinite(r.pen_freq) ? r.pen_freq : 0.0f,
                             std::isfinite(r.pen_present) ? r.pen_present : 0.0f);
+            m.set_grammar(r.grammar.get());
             m.set_logit_bias(r.bias);
         };
         // a request's next token: the thinking budget closes its reasoning (as one conversation's round at the budget)
@@ -2112,7 +2177,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             a.t1 = now_ms();
             a.sd = m.stats();
             a.limit = a.r.max_new > 0 ? a.r.max_new : m.max_context() - (long long) a.r.ids.size();
-            a.in_think = a.r.think_budget > 0 && a.r.think_end >= 0;
+            a.in_think = !a.r.grammar && a.r.think_budget > 0 && a.r.think_end >= 0;
             penalties(a.r);
             m.set_logprobs(a.r.logprobs);
             a.tok = m.sample(a.r.temperature, a.r.top_p, a.r.top_k, a.r.min_p, a.r.seed, a.counter++);
@@ -2160,6 +2225,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                 std::fflush(stdout);
                 return;
             }
+            if (!prepare_grammar(r)) return;
             // the conversation: the idle one the prompt reuses the most of (its whole state continued, else a
             // checkpoint it can go back to), else an empty one, else the least recently used
             int best = -1;
@@ -2258,10 +2324,11 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                     }
                     if (a.tok < 0) {   // (a sample's CUDA error, printed by the sampler: no T -1 to the client)
                         std::fprintf(stderr, "ds4: the sample failed\n");
-                        a.finish = "cancel";
+                        a.finish = a.tok == -2 ? "grammar" : "cancel";
                         a.done = true;
                         break;
                     }
+                    if (a.r.grammar) a.r.grammar->accept(a.tok);
                     std::printf("T %lld %d\n", a.r.rid, a.tok);
                     if (a.r.logprobs >= 0) lp_out(a.r.rid, a.tok, a.tok_lp);
                     beat();
@@ -2319,7 +2386,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                 if (!round(m, a.tok, room, try_spec, a.r.conf >= 0 ? a.r.conf : conf_min, a.r.temperature, a.r.top_p,
                            a.r.top_k, a.r.min_p, a.r.seed, a.counter, a.got, off, acc, err, a.r.cum, L, dc)) {
                     std::fprintf(stderr, "ds4: %s\n", err.c_str());
-                    a.finish = "cancel";
+                    a.finish = err.rfind("grammar:", 0) == 0 ? "grammar" : "cancel";
                     a.done = true;
                 } else {
                     a.d_off += off;
@@ -2489,6 +2556,11 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                             int acc = 0, next = -1;
                             if (!m.verify_multi(i, d, a.r.temperature, a.r.top_p, a.r.top_k, a.r.min_p, a.r.seed,
                                                 a.counter, acc, next, err)) {
+                                if (err.rfind("grammar:", 0) == 0) {
+                                    a.finish = "grammar"; a.done = true;
+                                    stepped = i == nn - 1;
+                                    continue;
+                                }
                                 cancel_all();
                                 break;
                             }
