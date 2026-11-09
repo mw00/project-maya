@@ -16,6 +16,16 @@ server settings under `MAYA_GLM_RESPONSES_*`, with defaults and units in
 [Responses settings](RESPONSES.md#settings-and-metrics). They can be set in the same
 config `env` block; response storage and background work remain request opt-ins.
 
+**GPU monitoring.** `MAYA_GLM_NVML=0` disables this server's NVIDIA NVML reader before it makes any driver calls
+(default `1`; the earlier name `STRATA_GLM_NVML` also works). It can be set in the config's `env` block. Use it
+to isolate monitoring when investigating a driver hang or a GPU disconnect. The Monitor tab still reads the CPU,
+RAM and disk; NVIDIA temperature, utilization, power, PCIe and per-process VRAM readings are unavailable. The
+server's GPU-busy stall hint is also unavailable, and model reloads use the existing five-second fallback wait
+for GPU memory release. Engine logs and inference timings remain available. This does not disable monitoring in
+other applications and does not repair a driver or hardware fault. NVIDIA's
+[580.196.07 notes](https://docs.nvidia.com/datacenter/tesla/tesla-release-notes-580-196-07/index.html) describe a
+related extended-PCI monitoring fix; a subprocess can isolate a reader crash, but cannot contain a GPU disconnect.
+
 The engine sizes itself: it splits the layers across the GPUs it is given (up to 16; with more than two, each GPU
 takes layers in proportion to its free VRAM), fills each GPU's free VRAM with experts, sizes its RAM tier from the
 free RAM, and measures the CPU against the PCIe link at start to decide how many RAM experts the CPU computes itself.
@@ -50,6 +60,7 @@ These settings change what the engine chooses (put them in the config with `--en
 
 | Setting | Default | |
 | --- | --- | --- |
+| `MAYA_GLM_NVML` | `1` | Set `0` to stop this server from calling NVIDIA NVML while diagnosing driver faults. CPU/RAM/disk monitoring remains; GPU readings, the GPU-busy stall hint and NVML-based release checks are unavailable. See **GPU monitoring** above. |
 | `MAYA_GLM_EXPERT_HELPER` | unset (off) | Experimental native-GGUF expert helper: the visible GPU index (`1`, not a Boolean). GPU 0 keeps the trunk and MTP; the helper owns a complementary expert cache, with heat-coordinated replacement and GPU quantization/reduction. Alone: `MAYA_GLM_SPLIT=0`, without `--layer-split`. Beside a layer split (`MAYA_GLM_SPLIT=auto` or boundaries): the helper's device is left out of the split and each part owns its own share of the helper over its own layers - two cards and a Ryzen AI Max APU as the unified-memory helper; `MAYA_GLM_DEVS` may name the split's devices (never the helper's). Unset this variable to disable. UMA helpers alias the pinned RAM tier; discrete helpers use their VRAM. See [AMD helper setup and scope](AMD_MAYA.md#experimental-expert-helper) |
 | `MAYA_GLM_HELPER_EXL3` | unset (off) | `1`: an EXL3 pack's experts may use `MAYA_GLM_EXPERT_HELPER` too (opt-in; without it an EXL3 pack refuses the helper, as before). The helper owns experts of the mul1 (`cb 2`) layers only, those the CPU lane's EXL3 kernel takes; the other layers' (and the MTP layer's) stay with the trunk's PCIe fetch, one `glm helper: layer N's EXL3 experts stay off` line each. It runs the same decode kernels as the trunk on its own GPU (`MAYA_GLM_EXL3_DECODE<n>`); a Pascal helper (sm_61/62: GTX 10, P4000, P40) takes `legacy-f32` unless `MAYA_GLM_EXL3_DECODE<n>` or `MAYA_GLM_EXL3_DECODE` names its kernels (a `glm helper: CUDA<n> (sm_61) decodes its EXL3 experts with ...` line). `MAYA_GLM_HELPER_CHECK` checks it against the part's GPU |
 | `MAYA_GLM_HELPER_OVERLAP` | unset (off) | `1`: in a decode route with experts for both the expert helper (`MAYA_GLM_EXPERT_HELPER`) and the CPU lane, the helper's call is queued first and the CPU lane computes its experts while the helper's GPU works, instead of after it; then the host waits for the helper and adds the two parts as before - the same bits (one add per value of the same two numbers). Off: the helper's call finishes before the CPU lane starts, as before. At the end a `glm helper overlap:` line gives the routes that had both, the CPU lane's time beside the helper, the time then spent waiting for it and (with `MAYA_GLM_PROF`) the time saved; `glm helper prof` adds the time between a split call's two halves |
