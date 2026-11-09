@@ -17031,6 +17031,9 @@ struct Model::Impl {
             dp.seq[il] = ++seq_issued;
             layer_of[dp.seq[il] % kRing].store(il, std::memory_order_release);
         }
+        // (DS4_HELPER_DRAFT: the blocks' requests to the helper's thread, as draft_'s - a window of NR rows, as the
+        //  trunk's multi window of T rows is)
+        if (helper_n > 0 && dp.async) helper_window(NR, dp, g.nl, g.nl + g.n_mtp);
         int cur = d_dev;   // the device the blocks' rows are on
         std::vector<char> handed(devs.size(), 0);   // (DS4_DECODE_TRIM 8: a device's one block hand-off region)
         const size_t nh = (size_t) NR * H * D * 4, np = (size_t) NR * 8 * 4;
