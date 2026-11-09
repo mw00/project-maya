@@ -194,6 +194,35 @@ class CheckpointTests(unittest.TestCase):
 
 
 class HttpTests(unittest.TestCase):
+    def test_sleep_wake_require_server_api_key(self):
+        tok = ByteTokenizer()
+        svc = Service(MockEngine(tok, "ok", max_context=1024), tok,
+                      ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        svc.api_key = "checkpoint-http-test-key"
+        server = serve(svc, port=0)
+        try:
+            for path in ("/sleep", "/sleep?wait=1", "/wake", "/wake/"):
+                for headers, expected in (({}, 401), ({"Authorization": "Bearer wrong"}, 401),
+                        ({"x-api-key": "wrong"}, 401),
+                        ({"Authorization": "Bearer " + svc.api_key}, 200),
+                        ({"x-api-key": svc.api_key}, 200)):
+                    with self.subTest(path=path, headers=headers), \
+                            patch.object(svc, "sleep", return_value={"status": "asleep"}) as sleep, \
+                            patch.object(svc, "wake", return_value={"status": "awake"}) as wake:
+                        request = urllib.request.Request(
+                            f"http://127.0.0.1:{server.server_address[1]}" + path,
+                            data=b"{}", headers=headers, method="POST")
+                        try:
+                            with urllib.request.urlopen(request, timeout=5) as response:
+                                status = response.status
+                        except urllib.error.HTTPError as error:
+                            status = error.code
+                            error.close()
+                        self.assertEqual(status, expected)
+                        self.assertEqual(sleep.call_count + wake.call_count, int(expected == 200))
+        finally:
+            server.shutdown(); server.server_close()
+
     def test_sleep_wake_health_and_busy_http(self):
         tok = ByteTokenizer()
         svc = Service(MockEngine(tok, "ok", max_context=1024), tok,
