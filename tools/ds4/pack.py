@@ -87,7 +87,7 @@ def type_ordered(st: SafeTensors) -> str | None:
         if sigs is not None and len(sigs) == 1 and apart is not None:
             return ("%s%d: its pieces are not together in their file (the shards' tensors ordered by type, not expert "
                     "by expert?) - rewrite those shards with each expert's tensors back to back (the same tensors, "
-                    "only their order changes)" % (P, apart))
+                    "only their order changes): python tools/ds4/reorder.py --model <model folder>" % (P, apart))
     return None
 
 

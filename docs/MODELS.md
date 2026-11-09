@@ -98,7 +98,9 @@ results. See [the prompt format notes](deepseek-prompt-format.md) for API detail
   is read as it is. Engram tables a quant stored in its own INT4 layout (`U8` + `embed.scale`, as in the quants derived
   from Diffbot's mixed 3 bpw) are not read: the tables are DeepSeek's own and the quant leaves them unchanged, so put
   DeepSeek's FP8 shards 47 / 48 of deepseek-ai/DeepSeek-V4.1-Flash-1017 in their place. Shards that write their
-  tensors grouped by type instead of expert by expert stop the pack with that reason: rewrite them in expert order.
+  tensors grouped by type instead of expert by expert stop the pack with that reason: rewrite them in expert order
+  in place with `tools/ds4/reorder.py --model <model folder>` - the same tensors and bytes, each tensor's SHA-256
+  checked ([type-ordered shards, and Diffbot's 3 bpw](ds4-exl3-packs.md)).
 
 ### DeepSeek's options
 
