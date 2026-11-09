@@ -9,6 +9,7 @@
 #include "mmq.cuh"
 #include "quantize.cuh"
 
+#include <atomic>   // glm-dsa B15.2: the refused products' count
 #include <cstdio>
 #include <cstdlib>
 
@@ -159,8 +160,24 @@ void dispatch(ggml_backend_cuda_context& ctx, const mmq_args& a, cudaStream_t s)
 
 }  // namespace
 
+// glm-dsa B15.2: MMQ finds expert e at w + e * (expert_bytes / type size) WHOLE blocks (stride_channel_x), so a
+// stride that is not a whole number of blocks would be truncated and every expert after the first parsed off its
+// block boundaries.  stride_refused() refuses such a product without a launch and counts it (launch_errors(): the
+// GLM prompt path fails on it).  Every Maya caller's stride is whole blocks, so this never fires on Flash.
+static std::atomic<int> g_refused{0};
+int launch_errors() { return g_refused.load(std::memory_order_relaxed); }
+static bool stride_refused(const Product& p) {
+    const ggml_type t = (ggml_type) p.type;
+    if (!supported(p.type) || p.expert_bytes % ggml_type_size(t) == 0) return false;
+    if (g_refused.fetch_add(1, std::memory_order_relaxed) < 8)
+        std::fprintf(stderr, "prefill mmq: type %d: expert stride %zu B is not whole %zu-B blocks (refused)\n", (int) t,
+                     p.expert_bytes, ggml_type_size(t));
+    return true;
+}
+
 void Context::run(const Product& p, void* stream) {
     if (p.n <= 0 || p.max_rows <= 0) return;
+    if (stride_refused(p)) return;   // glm-dsa B15.2
     const ggml_type t = (ggml_type) p.type;
     const int64_t qk = ggml_blck_size(t), bpr = p.w_cols / qk;
     const mmq_args a = {(const char*) p.w, t, (const int*) p.xq, p.ids, p.bounds, p.dst, nullptr,
@@ -188,6 +205,7 @@ bool glu_supported(int t, int64_t n_ff) {
 void Context::run_glu(const Product& p, float limit, void* stream) {
 #if defined(STRATA_MMQ_GLU)
     if (p.n <= 0 || p.max_rows <= 0) return;
+    if (stride_refused(p)) return;   // glm-dsa B15.2
     const ggml_type t = (ggml_type) p.type;
     const int64_t qk = ggml_blck_size(t), bpr = p.w_cols / qk, n_ff = p.w_rows / 2;
     // x the up rows, x_gate the gate rows of each expert's matrix; the output has n_ff rows

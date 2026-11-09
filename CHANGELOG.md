@@ -4,6 +4,24 @@ Every release is on GitHub (Releases) with these notes; every published change m
 page's Settings › About and updates (About > Update before the redesign; from v1.0.18), or `git pull`, then `./setup.sh` (Windows: `START-MAYA.bat`) - it recompiles
 only what changed and starts; the model is not downloaded again.
 
+## v1.1.57 - 2026-11-09
+
+GLM-5.3 (744B) joins Maya: Z.ai's full GLM-5.3 on Maya's GLM engine, with a new look for the project and fixes.
+
+- **GLM-5.3 (744B):** Z.ai's [GLM-5.3](https://huggingface.co/zai-org/GLM-5.3) (744 B parameters, about 40 B active per token) runs on the same engine, server and dashboard as GLM-5.3-Flash. It is shown as "GLM-5.3 (744B) · UD-IQ2_M".
+  - **The files:** unsloth's [UD-IQ2_M GGUF](https://huggingface.co/unsloth/GLM-5.3-GGUF) (238.6 GB), pinned and checked shard by shard: `./maya.sh --setup --model GLM-5.3-UD-IQ2_M` (Windows: `START-MAYA.bat --setup --model GLM-5.3-UD-IQ2_M`), or `--gguf-dir <folder>` for the GGUF files you already have. The dashboard's model list offers it too.
+  - **Where it runs:** NVIDIA from the Tesla V100 on (CUDA, Linux and Windows) and AMD (HIP, the Strix and Gorgon Halo included). Not on Mac or on Pascal cards. About 256 GB of VRAM and RAM together keeps every expert in memory; with less, the rest is read from the SSD while it answers (keep it on an NVMe SSD).
+  - **Text only** (the model has no vision tower; a picture gets a clear message), **up to 1M context** - the setup offers the contexts that fit your GPUs.
+  - **Its own defaults** from the model card: temperature 1.0, top-p 0.95, thinking at Max with a 32K-token thinking budget (a request that asks for Max itself may think longer when the context has room), Low and High and thinking off too; Z.ai's own chat template.
+  - Everything GLM-5.3-Flash has: drafting with the model's own MTP block, the expert tiers and the CPU lane, speed calibration, tool calls, reasoning in every API (OpenAI, Responses, Anthropic and Maya's model API), the loop guard. Details: [docs/GLM53.md](docs/GLM53.md).
+- **A new look (#881):** the new Maya logo in the README, the web page's tab and home-screen icons and the sidebar; issue forms, a docs index and SECURITY.md.
+- **Which model fits your PC:** [docs/MEMORY.md](docs/MEMORY.md) gives each model's recommended memory, VRAM and RAM together, with examples.
+- **Fixes:**
+  - Server: a SIGTERM or Ctrl+C right as the server was waiting could hang it for good; it now stops.
+  - Maya's model API (/api/chat, /api/generate): `"think": false` now turns thinking off (it stayed on for every model).
+  - DeepSeek: a video sent in a request now gets a clear 400 ("reads pictures, not videos") instead of an encoder error, or being dropped beside a picture.
+  - Setup: the line under the logo names the model being set up (it said GLM-5.3-Flash whichever model was picked).
+
 ## v1.1.56 - 2026-11-06
 
 Attach any file in the chat - PDFs, Word, Excel, PowerPoint and more - with every model, and community pull requests: fixes, and opt-in speed-ups for AMD and multi-GPU PCs.

@@ -2,7 +2,7 @@
 // streamed (and taken back up from the server after a reload or a dropped connection), stopping, editing, regenerating,
 // attachments, the context meter and the Markdown export.
 import {SPRITE, api, coarse, ctxfmt, db, download, fmt, headers, store, uid} from "./lib.js";
-import {P, PENALTIES, S, confirmDialog, defaultSystem, emit, levelFor, modelId, promptDialog, toast} from "./state.js";
+import {P, PENALTIES, S, confirmDialog, defaultSystem, emit, levelFor, modelId, prefsKey, promptDialog, toast} from "./state.js";
 import {mcpOn} from "./server.js";
 
 // ------------------------------------------------------------------ the chats' list
@@ -32,10 +32,22 @@ export function setThinking(level) {
   const c = S.current;
   c.thinking = level;
   c.thinkingFor = modelId();
+  c.thinkingPicked = true;                        // (its user's own pick, not the default it started at: levelPicked)
   if (c.messages.length) persist(c);
   emit();
   updateCtxMeter();
 }
+// the level a chat sends (thinkingOf) is its user's own pick - the speedometer's, or the Settings level they chose
+// (kept with their own chat settings) - not the model's own level it was only left at
+export const levelPicked = (c = S.current) => {
+  const level = thinkingOf(c);
+  return !!(c && c.thinkingPicked && c.thinking === level) ||
+    (level === P.thinking && (store.get(prefsKey(), {}) || {}).thinking != null);
+};
+// GLM-5.3 (while the server offers it a long thinking budget, /health's thinking_budget_max): a chat whose level its
+// user did not pick - the server keeps that budget for a Max asked for itself (the owner, 2026-11-07), so the request
+// says so (strata_level_default).  Every other model: never - its requests are as they were.
+export const levelLeftAtDefault = (c = S.current) => !!(S.health && S.health.thinking_budget_max) && !levelPicked(c);
 
 const slim = (c) => ({...c, messages: c.messages.map((m) => ({...m, images: (m.images || []).map((i) => ({name: i.name}))}))});
 export async function persist(c = S.current) {
@@ -402,6 +414,7 @@ export async function answer(resumeJob = null) {
     // the server keeps the answer running if this connection drops (a phone's screen sleeping mid-answer, or a reload):
     // the page reconnects to it by id and carries on from the last chunk it read (strata_resume)
     body.strata_resume = true;
+    if (levelLeftAtDefault(chat)) body.strata_level_default = true;   // (GLM-5.3: not its user's own Max)
   }
   let firstAt = null, thinkStart = null, usage = null, pending = false, lastPaint = 0, jobId = resumeJob, nRecv = 0, finished = false;
   let ended = false;                               // a repaint queued while streaming must not land after the end
@@ -624,6 +637,8 @@ function asDataUrl(f, kind) {
 export function addFiles(files) {
   for (const f of files) {
     if (f.type.startsWith("image/")) {
+      // (a model with no vision tower at all - GLM-5.3, the server's text_only - has no setting that turns images on)
+      if (!S.health.images && S.health.text_only) { toast("warn", "Text only", `${f.name}: this model reads text only - it has no vision tower to read pictures.`); continue; }
       if (!S.health.images) { toast("warn", "Images are off", "This model runs without images: Models › Engine settings turns them on when it can."); continue; }
       if (f.size > 20e6) { toast("warn", "Picture too large", `${f.name} is over 20 MB.`); continue; }
       asDataUrl(f, "image");
@@ -632,6 +647,7 @@ export function addFiles(files) {
     if (f.type.startsWith("video/")) {
       if (!S.health.videos) {
         toast("warn", "Videos are not read here", S.health.images ? `${f.name}: this model reads pictures, not videos.`
+          : S.health.text_only ? `${f.name}: this model reads text only - it has no vision tower.`
           : `${f.name}: this model runs without images or videos (Models › Engine settings turns images on when it can).`);
         continue;
       }

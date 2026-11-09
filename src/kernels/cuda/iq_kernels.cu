@@ -427,6 +427,7 @@ template<> struct Fmt<13> { static constexpr int qk = 256, ipb = 16, step = 2;  
     __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) { return vec_dot_q5_K_q8_1(v, y, kbx, iqs); } };
 template<> struct Fmt<42> { static constexpr int qk = 64, ipb = 2, step = 1;
     __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) { return vec_dot_q2_0_q8_1(v, y, kbx, iqs); } };
+#include "iq_kquant.cuh"   // glm-dsa B3.5: Fmt<10> .. Fmt<14>, the K-quants (Q2_K .. Q6_K) for native_expert_grouped
 
 __device__ __forceinline__ float warp_sum(float v) {
 #pragma unroll
@@ -606,7 +607,7 @@ __global__ void quantize_q8_1_kernel(const float* __restrict__ x, block_q8_1* __
         amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
         sum += __shfl_xor_sync(0xffffffffu, sum, o);
     }
-    const float d = fminf(amax / 127.0f, 65504.0f);   // finite in FP16 (Strata #1448); below that nothing changes
+    const float d = fminf(amax / 127.0f, 65504.0f);   // finite in FP16 (upstream #1448); below that nothing changes
     const int8_t q = amax == 0.0f ? 0 : fmaxf(-127.0f, fminf(127.0f, roundf(xi / d)));
     const long long ib = i / 32, iqs = i % 32;
     y[ib].qs[iqs] = q;
@@ -948,6 +949,7 @@ size_t iq_row_bytes(int t, int64_t n) noexcept {
         case 29: return (size_t) (n / 256) * sizeof(block_iq1_m);
         case 19: return (size_t) (n / 256) * sizeof(block_iq1_s);
         case 23: return (size_t) (n / 256) * sizeof(block_iq4_xs);
+        case 10: return (size_t) (n / 256) * sizeof(block_q2_K);   // glm-dsa B3.5: native_expert_layout's Q2_K rows
         case 11: return (size_t) (n / 256) * sizeof(block_q3_K);
         case 42: return (size_t) (n / 64) * sizeof(block_q2_0);
         default: return 0;
@@ -1042,11 +1044,18 @@ size_t native_expert_scratch_bytes(int64_t cap, int64_t n_ff) {
     return 3 * ((f + 255) & ~(size_t) 255) + (((size_t) cap * (size_t) (n_ff / 32) * sizeof(block_q8_1) + 255) & ~(size_t) 255);
 }
 
-void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long* grp_ptr, const int32_t* grp_start,
+bool native_expert_grouped(const NativeExpertLayout& L, const unsigned long long* grp_ptr, const int32_t* grp_start,
                            const int32_t* n_groups, const int32_t* ent_dst, const int32_t* ent_tok, int64_t cap_groups,
                            int64_t cap_entries, const void* x_q8_1, void* scratch, float* out, void* stream,
                            float swiglu_limit) {
-    if (cap_groups <= 0 || cap_entries <= 0) return;
+    // glm-dsa B3.5: a type with no kernel below (the two switches' cases) is refused before any launch and reported by
+    // the caller; it stopped the process (std::exit) when the K-quants were missing
+    const auto has_kernel = [](int t) { return (t >= 10 && t <= 14) || (t >= 16 && t <= 23) || t == 29 || t == 42; };
+    if (!has_kernel(L.gu_type) || !(has_kernel(L.d_type) || L.d_type == 6)) {   // (down: Maya v1.1.55 Q5_0 too)
+        std::fprintf(stderr, "native_expert_grouped: no kernel for gate/up type %d, down type %d\n", L.gu_type, L.d_type);
+        return false;
+    }
+    if (cap_groups <= 0 || cap_entries <= 0) return true;
     cudaStream_t s = (cudaStream_t) stream;
     const size_t f = (size_t) cap_entries * (size_t) L.n_ff * sizeof(float), fa = (f + 255) & ~(size_t) 255;
     float* gate = (float*) scratch;
@@ -1065,8 +1074,13 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
         case 29: native_gu_kernel<29><<<ggu, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
         case 19: native_gu_kernel<19><<<ggu, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
         case 42: native_gu_kernel<42><<<ggu, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
+        case 10: native_gu_kernel<10><<<ggu, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
+        case 11: native_gu_kernel<11><<<ggu, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
+        case 12: native_gu_kernel<12><<<ggu, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
         case 13: native_gu_kernel<13><<<ggu, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
-        default: std::fprintf(stderr, "native_expert_grouped: gate/up type %d\n", L.gu_type); std::exit(1);
+        case 14: native_gu_kernel<14><<<ggu, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
+        case 20: native_gu_kernel<20><<<ggu, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
+        default: std::fprintf(stderr, "native_expert_grouped: gate/up type %d\n", L.gu_type); return false;
     }
     check("native_expert_grouped/gu");
     const long long nh = (long long) cap_entries * L.n_ff;
@@ -1074,14 +1088,26 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
     quantize_q8_1_kernel<<<(unsigned) ((nh + 255) / 256), 256, 0, s>>>(h, hq, nh);
     const dim3 gd((unsigned) ((L.n_embd + 7) / 8), (unsigned) cap_groups);
     switch (L.d_type) {
+        case 6: native_down_kernel<6><<<gd, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;
         case 18: native_down_kernel<18><<<gd, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;
         case 20: native_down_kernel<20><<<gd, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;
         case 23: native_down_kernel<23><<<gd, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;
         case 42: native_down_kernel<42><<<gd, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;
-        case 6: native_down_kernel<6><<<gd, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;
-        default: std::fprintf(stderr, "native_expert_grouped: down type %d\n", L.d_type); std::exit(1);
+        case 10: native_down_kernel<10><<<gd, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;
+        case 11: native_down_kernel<11><<<gd, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;
+        case 12: native_down_kernel<12><<<gd, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;
+        case 13: native_down_kernel<13><<<gd, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;
+        case 14: native_down_kernel<14><<<gd, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;
+        case 16: native_down_kernel<16><<<gd, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;
+        case 17: native_down_kernel<17><<<gd, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;
+        case 19: native_down_kernel<19><<<gd, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;
+        case 21: native_down_kernel<21><<<gd, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;
+        case 22: native_down_kernel<22><<<gd, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;
+        case 29: native_down_kernel<29><<<gd, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;
+        default: std::fprintf(stderr, "native_expert_grouped: down type %d\n", L.d_type); return false;
     }
     check("native_expert_grouped/down");
+    return true;   // glm-dsa B3.5: launched
 }
 }  // namespace strata::kernels
 

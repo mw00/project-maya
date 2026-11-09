@@ -53,8 +53,21 @@ constexpr int kMaxMvNt = 16;
 /// for activation t alone, and each weight row is read from memory once for all of them (more than 8 activations: once
 /// for each group of 8, EXL3 weights once for all).
 bool mv_nt(const MvJob* jobs, int n, int nt, cudaStream_t s);
-/// Whether mv() serves this weight type.
+/// Whether mv() serves this weight type (the Flash / DFlash2 list, Maya v1.1.55).
 bool mv_supported(int type);
+/// glm-dsa B10.7: mv_supported plus the extra glm-dsa dense types (glmd_mv_ext.cuh).
+bool mv_supported_ext(int type);
+/// glm-dsa L1-4: mv() for the glm-dsa decode's GEMVs - the one-column Q5_K / Q8_0 / Q4_K / Q6_K / BF16 / F32 jobs of a
+/// batch in one launch (one row a warp when K-quants are among them, else two), every output bit for bit mv()'s
+/// (glmd_mv_ext.cuh); a batch of K-quants only, and the other jobs, through mv().  The types a device-tuned one-column
+/// kernel of mv() serves always stay with mv() (cc 6.0: the P100 Q6_K kernel; STRATA_GLMD_MV_NW2=1: the K-quants), and a
+/// HIP build takes Q4_K / Q5_K / Q8_0 only (the RDNA kernel's Q6_K / BF16; F32 not bit for bit there).
+/// cfg kMvDsaAuto: the device's default - on where it was measured faster (NVIDIA cc >= 7.0: V100, glmd_dec_bench), mv()
+/// alone elsewhere (AMD: gfx1151 within 0-3%, bandwidth-bound; Pascal: not measured); kMvDsaOn: on any device;
+/// kMvDsaOff: mv() alone (A/Bs); 1-3, 5: fixed shapes on any device, for glmd_dec_bench (1: one launch of every job it
+/// takes, 2: 4-row warps, 3: a launch a type, 5: one-row warps).
+constexpr int kMvDsaOff = -1, kMvDsaAuto = 0, kMvDsaOn = 4;
+bool mv_dsa(const MvJob* jobs, int n, cudaStream_t s, int cfg = kMvDsaAuto);
 /// The calling thread's launches of mv(), moe_gate_up() and moe_down() read `flag` (a device int) first and do nothing
 /// while it is non-zero - a pipelined window's tokens after a wrong draft (skip_gate sets it from the host's word);
 /// nullptr (the default): no check.
@@ -307,13 +320,24 @@ struct MoeDev {
     int mt_T = 1;
     unsigned int mt_xq_s = 0, mt_hq_s = 0, mt_sh_hq_s = 0, mt_out_s = 0, mt_cpu_s = 0;
 };
+/// The widest residual the host-mapped routing structs below carry (glm5-next 4096, glm-dsa 6144).
+constexpr int kMaxEmbd = 8192;
+/// moe_route's hard limits: n_embd <= kMaxEmbd (the request's x), k <= 8 (the plan arrays), n_expert <= 512 (its
+/// shared score tables).  nullptr when a geometry fits, else why not (fast_setup and moe_route refuse it).
+inline const char* moe_limits_error(int n_embd, int k, int n_expert) {
+    if (n_embd <= 0 || n_embd > kMaxEmbd) return "n_embd outside 1..kMaxEmbd (8192, the routing ring's width)";
+    if (k < 1 || k > 8) return "experts per token outside 1..8";
+    if (n_expert < 1 || n_expert > 512) return "n_expert outside 1..512";
+    return nullptr;
+}
 /// The CPU LANE's answer: the weighted sum of the RAM-tier experts the host computed for route `seq`.
 struct CpuAnswer {
     volatile unsigned int seq;
     unsigned int pad[3];
-    float part[4096];
+    float part[kMaxEmbd];
 };
-constexpr int kRingSize = 64;
+/// Ring entries: a non-waiting route can be lapped; 256 covers a 76-route glm-dsa token (B2.5)
+constexpr int kRingSize = 256;
 /// LOOKAHEAD: a route may also carry the top-k of the next (up to) kAhead layers' routers applied to its FFN input.
 constexpr int kAhead = 4;
 /// One routing request, written by the device into host-mapped memory.
@@ -340,7 +364,7 @@ struct MoeRequest {
     int win_n;                   // a batched verify window's tokens (0: not one): their CPU lanes may run at once
     int win_rows;                // ... a batched rows step's group instead (STRATA_GLM_GROUP_EXPERTS): win the row,
     int pad_;                    //     win_n the rows; their CPU lanes merged on this part's own pool
-    float x[4096];               // the FFN input, written only when cpu_mask != 0
+    float x[kMaxEmbd];           // the FFN input, written only when cpu_mask != 0
 };
 /// The host's answer to a request with misses.
 struct MoeResponse {
@@ -358,8 +382,12 @@ struct MoeResponse {
     int upd_key[64];
     unsigned long long upd_val[64];
     int cpu;                          // 1: cpu_part (host-mapped, below) holds the missed experts' weighted sum
-    float cpu_part[4096];
+    float cpu_part[kMaxEmbd];
 };
+/// moe_route's weight normalisation (norm_w on): w_i = p_i / D * w_scale over the k selected sigmoid scores.
+/// kRouteNormClamp: D = max(sum, 2^-14) (Maya, llama.cpp's ggml_clamp); kRouteNormHf: D = sum + 1e-20 (HF
+/// GLM-5.3 / DeepSeek-V3, glm-dsa glm-dsa B5.1).  The two differ only when sum < 6.1e-5 (all k sigmoids tiny).
+constexpr int kRouteNormClamp = 0, kRouteNormHf = 1;
 /// Router (sigmoid + bias, stable top-k, normalised weights - router_sigmoid's arithmetic), the plan
 /// lookup in `tab`, the request publish, and the shared expert's swiglu + q8_1.
 void moe_route(const float* logits, const float* bias, int n_expert, int k, float w_scale, bool norm_w,
@@ -369,7 +397,7 @@ void moe_route(const float* logits, const float* bias, int n_expert, int k, floa
                const float* const* ahead_bias = nullptr, int n_ahead = 0, int skip_from = 8,
                unsigned long long cpu_plan = 0, int promote_min = 0, int pf_rank = 0, int near_n = 0, int win = 0,
                unsigned int* scr_used = nullptr, int win_n = 0, int disk_skip_from = 8, float disk_skip_w = 0.0f,
-               float miss_skip_w = 0.0f, int win_rows = 0, bool resident_ok = true);
+               float miss_skip_w = 0.0f, int win_rows = 0, bool resident_ok = true, int norm_mode = kRouteNormClamp);
 /// A verify window's MoE layer with each distinct expert computed ONCE: the T tokens were routed one after another into
 /// their own plan arrays (moe_route with win = t and a scr_used word, so no two of them land in one scratch slot - the
 /// word's bit 31 says one did), then moe_win_experts groups the entries by expert slot, reads each expert's gate/up and
@@ -459,10 +487,12 @@ bool rows_experts(int gu_type, int d_type, const uint8_t* base, size_t stride, s
 /// tab[keys[i]] = vals[i] for i < n (the expert-table edits the host queues between tokens).
 void tab_update(unsigned long long* tab, const int* keys, const unsigned long long* vals, int n, cudaStream_t s);
 
-/// The NextN block's input: cat = [rms(emb) * enorm, rms(h) * hnorm] (2 n values) as q8_1.  n <= 4096.
+/// The NextN block's input: cat = [rms(emb) * enorm, rms(h) * hnorm] (2 n values) as q8_1.  n <= kMaxEmbd, a
+/// multiple of 32 (else refused: an error is counted).
 void mtp_in(const float* emb, const float* h, const float* enorm, const float* hnorm, float eps, int n, void* cat_q8_1,
             cudaStream_t s);
-/// h += add (add may be null), then x = rms(h) * w and its q8_1 (a plain pre-norm residual step).  n <= 4096.
+/// h += add (add may be null), then x = rms(h) * w and its q8_1 (a plain pre-norm residual step).  n <= kMaxEmbd, a
+/// multiple of 32 (else refused: an error is counted).
 void rms_q8(float* h, const float* add, const float* w, float eps, int n, float* x, void* xq, cudaStream_t s);
 
 /// A chained draft's embedding: out = row *tok (a device int) of token_embd on the device (n_rows rows of type 14 =

@@ -1,0 +1,55 @@
+{
+ "id": "chinese_04",
+ "group": "chinese",
+ "api": "openai",
+ "request": {
+  "messages": [
+   {
+    "role": "user",
+    "content": "给 zhang.wei@example.com 发一封邮件，主题是“周报”，内容写“本周进度正常，详见附件”。"
+   }
+  ],
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "send_email",
+     "description": "Send an e-mail.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "to": {
+        "type": "string"
+       },
+       "subject": {
+        "type": "string"
+       },
+       "body": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "to",
+       "subject",
+       "body"
+      ]
+     }
+    }
+   }
+  ]
+ },
+ "expect": {
+  "calls": [
+   {
+    "name": "send_email",
+    "args": {
+     "to": "zhang.wei@example.com"
+    }
+   }
+  ],
+  "min_calls": 1,
+  "max_calls": 3,
+  "no_call": false,
+  "cjk_args": true
+ }
+}

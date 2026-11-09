@@ -41,11 +41,18 @@ MODEL_DEFAULTS = {
     # CYBER-FROST-3.8-PS: Blackfrost-AI/CYBER-FROST-3.8-BF16 generation_config.json and card - temperature 1.0, top_p
     # 0.95, top_k 20; thinking on, its template's default effort xhigh
     "qwen": ({"temperature": 1.0, "top_p": 0.95, "top_k": 20}, "xhigh"),
+    # GLM-5.3 (744B, glm-dsa: model_key "glm53", serve/glm_dsa_product.py): zai-org/GLM-5.3's
+    # generation_config.json and card - temperature 1.0, top_p 0.95 (no top-k, min-p or penalties); reasoning_effort
+    # low / high / max, max its default.  Its own entry, so that no quant of it takes GLM-5.3-Flash's tuned values
+    # (QUANT_SAMPLING / QUANT_THINK_BUDGET are keyed by this key, not by the family both share)
+    "glm53": ({"temperature": 1.0, "top_p": 0.95}, "max"),
 }
+GLM53 = "glm53"
 
 
 # A quant with its own sampling (the owner validated it on that quant, 2026-11-02): GLM-5.3-Flash Maya-XS - temperature
-# 0.7, top_p 0.95, min_p 0.05, no penalties.  Every other quant keeps its model's (MODEL_DEFAULTS).
+# 0.7, top_p 0.95, min_p 0.05, no penalties.  Every other quant keeps its model's (MODEL_DEFAULTS).  Keyed by
+# (model_key, tier): a GLM-5.3 (744B) quant of the same tier is ("glm53", ...), never GLM-5.3-Flash's.
 QUANT_SAMPLING = {("glm", "Maya-XS"): {"temperature": 0.7, "top_p": 0.95, "min_p": 0.05},
                   # Qwen3.8-Flash-Next itself (unsloth's UD-IQ2_XS, by its installer "quant"): Qwen/Qwen3.8-Flash-Next's
                   # card, thinking mode - temperature 1.0, top_p 0.95, top_k 20, min_p 0
@@ -53,17 +60,48 @@ QUANT_SAMPLING = {("glm", "Maya-XS"): {"temperature": 0.7, "top_p": 0.95, "min_p
 
 
 def model_defaults(cfg: dict) -> tuple:
-    """(sampling, reasoning_effort): a config's model's own defaults (MODEL_DEFAULTS by its family, the quant's own
-    sampling where it has one: QUANT_SAMPLING), copies."""
+    """(sampling, reasoning_effort): a config's model's own defaults (MODEL_DEFAULTS by its model: model_key, the
+    quant's own sampling where it has one: QUANT_SAMPLING), copies."""
+    key = model_key(cfg)
+    sampling, effort = MODEL_DEFAULTS.get(key, MODEL_DEFAULTS["glm"])
+    return dict(QUANT_SAMPLING.get((key, tier_of(cfg)), sampling)), effort
+
+
+_g53 = None
+
+
+def is_glm53(cfg: dict) -> bool:
+    """Whether `cfg` runs GLM-5.3 (744B, glm-dsa) rather than GLM-5.3-Flash: its pack's header says so
+    (serve/glm_dsa_product.py's config_is_glm_dsa).  Read where it is asked: a config without a glm-dsa pack - every
+    config but GLM-5.3's - is answered as before."""
+    global _g53
+    if not isinstance(cfg, dict) or "--glm-pack" not in [str(a) for a in (cfg.get("args") or [])[:-1]]:
+        return False
+    if _g53 is None:
+        try:
+            from serve import glm_dsa_product as g53
+        except ImportError:                            # (tools/ alone on the path: the module by its file)
+            import importlib.util
+            spec = importlib.util.spec_from_file_location(
+                "maya_glm_dsa_product", Path(__file__).resolve().parents[1] / "serve" / "glm_dsa_product.py")
+            g53 = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(g53)
+        _g53 = g53
+    return _g53.config_is_glm_dsa(cfg)
+
+
+def model_key(cfg: dict) -> str:
+    """The model a config runs, as MODEL_DEFAULTS, QUANT_SAMPLING and QUANT_THINK_BUDGET are keyed: its family
+    (family_of), and "glm53" for GLM-5.3 (744B), which shares the "glm" family (engine, server, setup) with
+    GLM-5.3-Flash but not its defaults."""
     fam = family_of(cfg)
-    sampling, effort = MODEL_DEFAULTS.get(fam, MODEL_DEFAULTS["glm"])
-    return dict(QUANT_SAMPLING.get((fam, tier_of(cfg)), sampling)), effort
+    return GLM53 if fam == "glm" and is_glm53(cfg) else fam
 
 
 # The thinking budget (the config's "thinking_budget": tokens, 0 = no limit; the reasoning ends there and the answer
 # starts).  GLM-5.3-Flash Maya-XS thinks past 32K on a plain three.js prompt and never answers; 8192 gave complete,
 # valid answers fastest.  Only the quants listed here get another default (the owner, 2026-11-02: Maya-XS only); every
-# other quant and model keeps 32768.  Keyed by (family, tier): a quant's catalog entry in QUANTS (and maya.MODELS)
+# other quant and model keeps 32768.  Keyed by (model_key, tier): a quant's catalog entry in QUANTS (and maya.MODELS)
 # carries the tier, so adding the GLM Maya-XS entry there is all it needs to pick this up.
 OLD_THINK_BUDGET = 32768
 GLM_THINK_BUDGET = 8192
@@ -81,8 +119,9 @@ THINK_BUDGET_MIN, THINK_BUDGET_MAX = 256, 262144
 
 
 def default_thinking_budget(cfg: dict) -> int:
-    """The thinking budget a config without one runs with: its quant's (QUANT_THINK_BUDGET), else 32768."""
-    return QUANT_THINK_BUDGET.get((family_of(cfg), tier_of(cfg)), OLD_THINK_BUDGET)
+    """The thinking budget a config without one runs with: its quant's (QUANT_THINK_BUDGET, by model_key), else
+    32768."""
+    return QUANT_THINK_BUDGET.get((model_key(cfg), tier_of(cfg)), OLD_THINK_BUDGET)
 
 
 def thinking_budget_for(cfg: dict) -> int | None:
@@ -94,6 +133,26 @@ def thinking_budget_for(cfg: dict) -> int | None:
         return None
     value = cfg.get("thinking_budget")
     return new if value is None or value == OLD_THINK_BUDGET else None
+
+
+# GLM-5.3 (744B), a request that asks for Max itself (the owner, 2026-11-07: "normal use stays quick, people who ask
+# for max effort get the long budget"): its budget stays the default 32768 (what the config and the dashboard's field
+# say, and what a request left at its default level, Max, gets), and a request that names Max may think up to 65536
+# tokens - as far as its room allows (serve/server.py THINK_LONG_RESERVE) - while the budget is that default (its
+# card's evaluations ran with 64K and more new tokens).  A budget the user set - the dashboard's field
+# (installer.thinking_budget_set) or any other value in the config - applies at every level, Max included.  GLM-5.3
+# only: the server gives it to a glm-dsa pack (main, Service.think_budget_max); every other model has one budget.
+GLM53_MAX_THINK_BUDGET = 65536
+
+
+def thinking_budget_is_default(cfg: dict) -> bool:
+    """Whether `cfg` runs its model's default thinking budget: none set, or exactly the default
+    (default_thinking_budget), and not marked as the user's own (installer.thinking_budget_set: the dashboard's
+    field)."""
+    if (cfg.get("installer") or {}).get("thinking_budget_set"):
+        return False
+    value = cfg.get("thinking_budget")
+    return value is None or value == default_thinking_budget(cfg)
 
 
 def check_thinking_budget(value) -> int:
@@ -250,8 +309,21 @@ def exl3_bits(cfg: dict) -> str | None:
 
 
 def config_label(cfg: dict) -> str | None:
-    """What a config runs, as users see it ("GLM-5.3 · Maya-S24"), or None for a config the setup did not write."""
+    """What a config runs, as users see it ("GLM-5.3 · Maya-S24"; GLM-5.3 itself: "GLM-5.3 (744B) · UD-IQ2_M"), or
+    None for a config the setup did not write."""
     if not isinstance(cfg.get("installer"), dict):
         return None
+    if is_glm53(cfg):
+        what = glm53_quant(config_key(cfg))
+        return _g53.LABEL + (SEP + what if what else "")
     fam, bits = family_of(cfg), exl3_bits(cfg)
     return SHOWN.get(fam, fam) + SEP + bits if bits else shown(fam, config_key(cfg))
+
+
+def glm53_quant(key) -> str | None:
+    """A GLM-5.3 (744B) config's files as shown after its name: the setup's quant name less the model's own
+    ("GLM-5.3-UD-IQ2_M" -> "UD-IQ2_M"); None when the config names none."""
+    if not key:
+        return None
+    key = str(key)
+    return key[len("GLM-5.3-"):] if key.lower().startswith("glm-5.3-") and len(key) > len("GLM-5.3-") else key

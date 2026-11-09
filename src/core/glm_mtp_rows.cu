@@ -34,6 +34,7 @@
 #include "glm_rows_state.hpp"
 
 #include "strata/core/mtp_rows.hpp"
+#include "strata/core/glm_maya_sync.hpp"   // glm-dsa: glm_rows_ok (these rows are Flash kernels)
 #include "strata/kernels/sampler.hpp"
 
 #include "ggml.h"
@@ -122,6 +123,7 @@ size_t Glm5Model::mtpw_kin_offset(int il) const {
 
 bool Glm5Model::mtpw_alloc(std::string& err) {
     if (mtpw_ != nullptr || multi_mtp_setting() <= 0 || seq_.empty()) return true;
+    if (!glm_rows_ok(g_.arch)) return true;   // glm-dsa: the conversations draft one after the other (no MTP rows)
     const Glm5Geometry& g = g_;
     auto* M = new MtpRows();
     mtpw_ = M;
@@ -264,6 +266,7 @@ void Glm5Model::mtpw_destroy() {
 
 bool Glm5Model::mtpw_ok() const {
     if (multi_mtp_setting() <= 0 || seq_.empty()) return false;
+    if (!glm_rows_ok(g_.arch)) return false;   // glm-dsa: no MTP rows (mtpw_alloc made none)
     const Glm5Model* last = this;
     for (const Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
         if (m->fast_ == nullptr || m->mtpw_ == nullptr || m->rows_ == nullptr) return false;

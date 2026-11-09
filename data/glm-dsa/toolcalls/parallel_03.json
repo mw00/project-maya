@@ -1,0 +1,58 @@
+{
+ "id": "parallel_03",
+ "group": "parallel",
+ "api": "openai",
+ "request": {
+  "messages": [
+   {
+    "role": "user",
+    "content": "Get the prices of AAPL, MSFT and GOOG."
+   }
+  ],
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "get_stock_price",
+     "description": "Latest price of a stock ticker.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "ticker": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "ticker"
+      ]
+     }
+    }
+   }
+  ]
+ },
+ "expect": {
+  "calls": [
+   {
+    "name": "get_stock_price",
+    "args": {
+     "ticker": "AAPL"
+    }
+   },
+   {
+    "name": "get_stock_price",
+    "args": {
+     "ticker": "MSFT"
+    }
+   },
+   {
+    "name": "get_stock_price",
+    "args": {
+     "ticker": "GOOG"
+    }
+   }
+  ],
+  "min_calls": 2,
+  "max_calls": 5,
+  "no_call": false
+ }
+}

@@ -109,6 +109,11 @@ void check(const char* what) {
         g_errors.fetch_add(1, std::memory_order_relaxed);
     }
 }
+// a shape a kernel cannot take: refused before the launch and counted like a failed launch (B2.2)
+void refused(const char* what, int n) {
+    std::fprintf(stderr, "glm_batch %s: shape %d unsupported (refused)\n", what, n);
+    g_errors.fetch_add(1, std::memory_order_relaxed);
+}
 unsigned nblk(int64_t n, int b = 256) { return (unsigned) ((n + b - 1) / b); }
 
 // ---------------------------------------------------------------- conversions
@@ -1924,17 +1929,19 @@ int mla_wmma2_arch() {
 #endif
 
 // ---------------------------------------------------------------- the NextN block's caches over a prompt
+// NV values a thread: 16 (n_embd <= 4096, glm5-next) or 32 (up to kMaxEmbd 8192); the same sums for n_embd <= 4096
 // h[t] = rms(mean_s R[t][s]) * w (the final hidden state the draft block reads; head_prep's arithmetic)
+template<int NV>
 __global__ void __launch_bounds__(256) head_rows_kernel(const float* __restrict__ R, const float* __restrict__ w,
                                                         float eps, int E, float* __restrict__ h) {
     __shared__ float sred[32];
     const int t = blockIdx.x, tid = threadIdx.x;
     const float* Rt = R + (size_t) t * 4 * E;
-    float v[16];
+    float v[NV];
     float ss = 0.0f;
     const int per = E / (int) blockDim.x;
 #pragma unroll
-    for (int i = 0; i < 16; ++i) {
+    for (int i = 0; i < NV; ++i) {
         if (i >= per) break;
         const int e = tid + i * (int) blockDim.x;
         float acc = 0.0f;
@@ -1946,24 +1953,25 @@ __global__ void __launch_bounds__(256) head_rows_kernel(const float* __restrict_
     ss = block_sum(ss, sred);
     const float inv = rsqrtf(ss / (float) E + eps);
 #pragma unroll
-    for (int i = 0; i < 16; ++i) {
+    for (int i = 0; i < NV; ++i) {
         if (i >= per) break;
         const int e = tid + i * (int) blockDim.x;
         h[(size_t) t * E + e] = v[i] * inv * w[e];
     }
 }
 // out16[t] = [rms(emb[t]) * enorm, rms(h[t]) * hnorm] (FP16, 2E per row)
+template<int NV>
 __global__ void __launch_bounds__(256) mtp_in_rows_kernel(const float* __restrict__ emb, const float* __restrict__ h,
                                                           const float* __restrict__ enorm,
                                                           const float* __restrict__ hnorm, float eps, int E,
                                                           __half* __restrict__ out) {
     __shared__ float sred[32];
     const int t = blockIdx.x, tid = threadIdx.x;
-    float a[16], b[16];
+    float a[NV], b[NV];
     float sa = 0.0f, sb = 0.0f;
     const int per = E / (int) blockDim.x;
 #pragma unroll
-    for (int i = 0; i < 16; ++i) {
+    for (int i = 0; i < NV; ++i) {
         if (i >= per) break;
         const int e = tid + i * (int) blockDim.x;
         a[i] = emb[(size_t) t * E + e];
@@ -1975,7 +1983,7 @@ __global__ void __launch_bounds__(256) mtp_in_rows_kernel(const float* __restric
     sb = block_sum(sb, sred);
     const float ia = rsqrtf(sa / (float) E + eps), ib = rsqrtf(sb / (float) E + eps);
 #pragma unroll
-    for (int i = 0; i < 16; ++i) {
+    for (int i = 0; i < NV; ++i) {
         if (i >= per) break;
         const int e = tid + i * (int) blockDim.x;
         out[(size_t) t * 2 * E + e] = __float2half(a[i] * ia * enorm[e]);
@@ -1983,15 +1991,16 @@ __global__ void __launch_bounds__(256) mtp_in_rows_kernel(const float* __restric
     }
 }
 // x[t] = rms(in[t]) * w, F32 and FP16
+template<int NV>
 __global__ void __launch_bounds__(256) rms_rows_kernel(const float* __restrict__ in, const float* __restrict__ w, float eps,
                                                        int E, float* __restrict__ x, __half* __restrict__ x16) {
     __shared__ float sred[32];
     const int t = blockIdx.x, tid = threadIdx.x;
-    float v[16];
+    float v[NV];
     float ss = 0.0f;
     const int per = E / (int) blockDim.x;
 #pragma unroll
-    for (int i = 0; i < 16; ++i) {
+    for (int i = 0; i < NV; ++i) {
         if (i >= per) break;
         const int e = tid + i * (int) blockDim.x;
         v[i] = in[(size_t) t * E + e];
@@ -2000,7 +2009,7 @@ __global__ void __launch_bounds__(256) rms_rows_kernel(const float* __restrict__
     ss = block_sum(ss, sred);
     const float inv = rsqrtf(ss / (float) E + eps);
 #pragma unroll
-    for (int i = 0; i < 16; ++i) {
+    for (int i = 0; i < NV; ++i) {
         if (i >= per) break;
         const int e = tid + i * (int) blockDim.x;
         const float xv = v[i] * inv * w[e];
@@ -2241,6 +2250,7 @@ void hc_finish(const HcFinishArgs& a, cudaStream_t s) {
     if (a.T <= 0) return;
     if (a.n_embd > 16 * 256 || a.n_embd % 256 != 0) {
         std::fprintf(stderr, "glm_batch hc_finish: n_embd %d unsupported\n", a.n_embd);
+        g_errors.fetch_add(1, std::memory_order_relaxed);
         return;
     }
     hc_finish_kernel<<<a.T, 256, 0, s>>>(a);
@@ -2262,7 +2272,10 @@ void kda_conv(const float* const proj[3], const float* const conv_w[3], const fl
         case 5: kda_conv_kernel<5><<<grid, 256, 0, s>>>(p, w, conv_state, o, T, d_inner); break;
         case 6: kda_conv_kernel<6><<<grid, 256, 0, s>>>(p, w, conv_state, o, T, d_inner); break;
         case 7: kda_conv_kernel<7><<<grid, 256, 0, s>>>(p, w, conv_state, o, T, d_inner); break;
-        default: std::fprintf(stderr, "glm batch: kda_conv: d_conv %d unsupported (1..8)\n", d_conv); break;
+        default:
+            std::fprintf(stderr, "glm batch: kda_conv: d_conv %d unsupported (1..8)\n", d_conv);
+            g_errors.fetch_add(1, std::memory_order_relaxed);
+            break;
     }
     check("kda_conv");
 }
@@ -2492,6 +2505,7 @@ void mla_attn(const float* q_abs, const uint16_t* lat, const int* cells, const i
     if (T <= 0) return;
     if (kv_lora != 512 || n_head % MB_HG != 0) {
         std::fprintf(stderr, "glm_batch mla_attn: kv_lora %d / n_head %d unsupported\n", kv_lora, n_head);
+        g_errors.fetch_add(1, std::memory_order_relaxed);
         return;
     }
     const dim3 grid((unsigned) T, (unsigned) (n_head / MB_HG));
@@ -2619,6 +2633,7 @@ void mla_attn_f16q(const uint16_t* q16, const uint16_t* lat, const int* cells, c
     if (T <= 0) return;
     if (kv_lora != 512 || n_head % HW_HG != 0) {
         std::fprintf(stderr, "glm_batch mla_attn_f16q: kv_lora %d / n_head %d unsupported\n", kv_lora, n_head);
+        g_errors.fetch_add(1, std::memory_order_relaxed);
         return;
     }
     // kHwSmem is below the 64 KiB a workgroup may take without opting in
@@ -2636,6 +2651,7 @@ void mla_attn_wmma2(const float* q_abs, const uint16_t* lat, const int* cells, c
     if (T <= 0) return;
     if (kv_lora != 512 || n_head % 16 != 0) {
         std::fprintf(stderr, "glm_batch mla_attn_wmma2: kv_lora %d / n_head %d unsupported\n", kv_lora, n_head);
+        g_errors.fetch_add(1, std::memory_order_relaxed);
         return;
     }
     const dim3 grid((unsigned) T, (unsigned) (n_head / 16));
@@ -2644,22 +2660,35 @@ void mla_attn_wmma2(const float* q_abs, const uint16_t* lat, const int* cells, c
 }
 #endif
 
+// the row norms take n_embd a multiple of 256 up to 32 x 256 = 8192 (kMaxEmbd); anything else is refused and counted
+bool rows_shape_ok(const char* what, int n_embd) {
+    if (n_embd > 0 && n_embd <= 32 * 256 && n_embd % 256 == 0) return true;
+    refused(what, n_embd);
+    return false;
+}
+
 void head_rows(const float* R, const float* w, float eps, int T, int n_embd, float* h, cudaStream_t s) {
     if (T <= 0) return;
-    head_rows_kernel<<<T, 256, 0, s>>>(R, w, eps, n_embd, h);
+    if (!rows_shape_ok("head_rows", n_embd)) return;
+    if (n_embd <= 16 * 256) head_rows_kernel<16><<<T, 256, 0, s>>>(R, w, eps, n_embd, h);
+    else head_rows_kernel<32><<<T, 256, 0, s>>>(R, w, eps, n_embd, h);
     check("head_rows");
 }
 
 void mtp_in_rows(const float* emb, const float* h, const float* enorm, const float* hnorm, float eps, int T, int n_embd,
                  void* out16, cudaStream_t s) {
     if (T <= 0) return;
-    mtp_in_rows_kernel<<<T, 256, 0, s>>>(emb, h, enorm, hnorm, eps, n_embd, (__half*) out16);
+    if (!rows_shape_ok("mtp_in_rows", n_embd)) return;
+    if (n_embd <= 16 * 256) mtp_in_rows_kernel<16><<<T, 256, 0, s>>>(emb, h, enorm, hnorm, eps, n_embd, (__half*) out16);
+    else mtp_in_rows_kernel<32><<<T, 256, 0, s>>>(emb, h, enorm, hnorm, eps, n_embd, (__half*) out16);
     check("mtp_in_rows");
 }
 
 void rms_rows(const float* in, const float* w, float eps, int T, int n_embd, float* x, void* x16, cudaStream_t s) {
     if (T <= 0) return;
-    rms_rows_kernel<<<T, 256, 0, s>>>(in, w, eps, n_embd, x, (__half*) x16);
+    if (!rows_shape_ok("rms_rows", n_embd)) return;
+    if (n_embd <= 16 * 256) rms_rows_kernel<16><<<T, 256, 0, s>>>(in, w, eps, n_embd, x, (__half*) x16);
+    else rms_rows_kernel<32><<<T, 256, 0, s>>>(in, w, eps, n_embd, x, (__half*) x16);
     check("rms_rows");
 }
 

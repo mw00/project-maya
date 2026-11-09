@@ -15,7 +15,8 @@
 namespace strata::kernels::cpu {
 
 /// Bytes of the largest quantized activation any native layer uses.  qwen4exp: 2560 values as
-/// Q8_K (10 x 292 = 2604); glm5-next: 4096 values as Q8_K (16 x 260 = 4164).
+/// Q8_K (10 x 292 = 2604); glm5-next: 4096 values as Q8_K (16 x 260 = 4164); glm-dsa: 6144 values as Q8_K
+/// (24 x 292 = 7008, fits; 8192 would need 9344 and native_fmt refuses it).
 inline constexpr size_t kNativeActBytes = 8192;
 /// Bytes of the largest quantized down activation.  qwen4exp: 640 values as Q8_0/Q8_K (1024);
 /// glm5-next: 2048 values as Q8_K (8 x 260 = 2084).

@@ -39,6 +39,17 @@ inline constexpr int kKvResolveBlock = 1024;
 /// 16 bytes, and the map must have at least kKvResolveBlock slots (the caller checks both once, at load).
 void glm_kv_resolve(const KvStreamMap& m, const uint8_t* host, uint8_t* slots, int row_bytes, int page,
                     const int* cells, int n_sel, int* slot_cells, cudaStream_t s);
+/// L1-6 (glm-dsa): glm_kv_resolve with the live cell count on the device (n_sel_dev, capped at n_sel: the cells past
+/// it are not read), for a selection whose count only the device knows (a captured decode graph).
+void glm_kv_resolve_dev(const KvStreamMap& m, const uint8_t* host, uint8_t* slots, int row_bytes, int page,
+                        const int* cells, int n_sel, const int* n_sel_dev, int* slot_cells, cudaStream_t s);
+/// L1-6 (glm-dsa): `bytes` (a multiple of 16, both pointers 16-byte aligned) from a device-mapped host copy into VRAM
+/// by a kernel (zero-copy loads): unlike a cudaMemcpyAsync it does not queue behind the expert copies on the copy engine
+void glm_kv_pull(uint8_t* dst, const uint8_t* src_mapped, size_t bytes, cudaStream_t s);
+/// L1-6 (glm-dsa): the blocks the last resolve of map m missed, copied from a SECOND cache's host copy into that cache's
+/// slots (glm-dsa keeps k_pe apart from the latent: one map, one page table, two copies)
+void glm_kv_copy_misses(const KvStreamMap& m, const uint8_t* host, uint8_t* slots, int row_bytes, int page,
+                        cudaStream_t s);
 
 /// glm_kv_resolve of several rows in one launch (STRATA_GLM_ROWS_SMALL), each row its own sequence's map, host copy,
 /// slots, selection and slot cells - no two rows may share a map; a row of n_sel <= 0 does nothing.  Each row's map,

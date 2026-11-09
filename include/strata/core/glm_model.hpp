@@ -20,7 +20,9 @@
 #pragma once
 
 #include "strata/artifact/gguf_reader.hpp"
+#include "strata/core/glm_arch.hpp"
 #include "strata/core/glm_dflash.hpp"
+#include "strata/core/glm_state_layout.hpp"   // glm-dsa B4.1
 #include "strata/kernels/cpu/native_expert.hpp"
 #include "strata/kernels/exl3.hpp"
 #include "strata/kernels/sampler.hpp"
@@ -63,7 +65,7 @@ struct WSlot {
 /// Every number the runner's kernels depend on, parsed from the GGUF's glm5-next.* metadata with
 /// the released GLM-5.3-Flash values as defaults (mirrors ref/glm.py::Glm5Config - the Python and
 /// C++ readers must agree key for key, which glm_model_test checks against the dumps).
-struct Glm5Geometry {
+struct Glm5Geometry : GlmArchExt<Glm5Geometry> {   // glm-dsa: arch + glm-dsa fields (glm_arch.hpp)
     int n_embd = 4096, n_layers = 45, n_head = 64, n_vocab = 154880;
     int nextn = 0;                     // NextN/MTP layers counted INSIDE block_count (unsloth
                                        // ships 46 with nextn 1); tensors of blk.{n_layers}+ are
@@ -179,6 +181,7 @@ public:
     /// from the lane's own cost in decode when that is >15% off (at most three times; STRATA_GLM_CPU_RETIME=0: never)
     void lane_retime();
     bool set_pcie_share(double share);
+    bool set_pcie_share_head(double share);   // glm-dsa request knobs: the speculative head's parts only (glm_req_knobs.cpp)
     int cpu_lane_threads() const;
     int cpu_lane_threads_max() const;
     bool set_cpu_lane_threads(int n);
@@ -221,6 +224,12 @@ public:
     /// position; false (+ err) when that slot holds none.  ~150 MB a checkpoint for GLM-5.3-Flash's 34 KDA layers.
     bool ckpt_save(int slot, std::string& err);
     bool ckpt_restore(int slot, std::string& err);
+    /// glm-dsa L1-2: whether the state at an earlier position is just the cache rows before it (glm-dsa: no KDA
+    /// states, no open indexer pool), so a checkpoint can be kept for a position the prompt already read past:
+    /// ckpt_save_at(slot, at) with at <= the current position (at < 0: ckpt_save's own).  The driver then reads
+    /// through a checkpoint mark in one prompt-path call - a split's pipeline does not drain there.
+    bool ckpt_positional() const;
+    bool ckpt_save_at(int slot, int64_t at, std::string& err);
     /// The snapshot (the previous prompt's state, before its last token) copied into checkpoint `slot` on a side
     /// thread, while the next prompt runs: the snapshot stays intact until that prompt's snapshot_save, which waits
     /// for the copy (as every checkpoint call does).  A turn that starts within 512 tokens of the snapshot gets no
@@ -237,6 +246,12 @@ public:
     /// state and the snapshot; false + err on a mismatch or a truncated buffer.
     uint64_t slot_save(std::vector<uint8_t>& data, std::string& err);
     bool slot_load(const std::vector<uint8_t>& data, int64_t n_pos, std::string& err);
+    bool slot_load_prefix(const std::string& path, int64_t n_file, int64_t n_use, std::string& err);   // glm-dsa B14.14
+    std::string pcache_identity() const;   // glm-dsa B14.14 (src/core/glm_prompt_cache_model.cu)
+    GlmStateFingerprint state_fp() const; uint32_t mtp_block_id() const; glmmtp::CarrierStats mtp_carrier_stats() const;   // glm-dsa B15.3
+    void mtp_carry_note(int64_t p, const float* h, cudaStream_t s); const float* mtp_carry_row(int64_t p, const float* fallback, cudaStream_t s);   // glm-dsa B15.3
+    void mtp_carry_reset(); void mtp_carry_snapshot(bool restore); void mtp_carry_forget();   // glm-dsa B15.3 (src/core/glm_mtp_state_model.cu)
+    bool mtp_slot_put(std::ostream& f, std::string& err); void mtp_slot_get(std::istream& f, int64_t n, bool whole);   // glm-dsa B15.3
     /// Runs the engine's sampler on the last forward's logits and returns the picked token id
     /// (-1 + err on failure).  Handles the device bookkeeping: with a split the logits (and the
     /// sampler buffer) live on the tail half's device, where peer reads are not available.
@@ -324,6 +339,9 @@ private:
 
     // per-layer state offsets, in floats into state_ (-1: the layer has no such state)
     std::vector<int64_t> kda_S_, kda_conv_, dsa_lat_, dsa_ik_, dsa_ig_, dsa_pool_;
+    GlmStateLayout lay_;   // glm-dsa B4.1: the descriptor the vectors above are copied from (glm-dsa: + dsa_kpe)
+    bool state_carve(int64_t ctx, GlmStateMode mode, int ik_ring, int mtp_il, std::string& err,
+                     int64_t lat_rows = -1);   // glm-dsa B4.1
 
 public:
     // ---- per-weight serving slots (strata::core::WSlot below): F32 pointers for the
@@ -397,6 +415,23 @@ public:
                 std::lock_guard<std::mutex> lk(mu);
                 pinned[(size_t) part] = true;
                 while (pin_turn < (int) pinned.size() && pinned[(size_t) pin_turn]) ++pin_turn;
+            }
+            cv.notify_all();
+        }
+        // glm-dsa B8.1 (warm): the warm-up's turn - with STRATA_GLM_WARM_SEQ the parts read the disk one at a time,
+        // in part order (glmwarm::Turn in fast_warm; load_pack_split passes it again for a part that never warmed)
+        std::vector<bool> warmed;
+        int warm_turn = 0;
+        void wait_warm(int part) {
+            std::unique_lock<std::mutex> lk(mu);
+            cv.wait(lk, [&] { return warm_turn >= part; });
+        }
+        void pass_warm(int part) {
+            {
+                std::lock_guard<std::mutex> lk(mu);
+                warmed.resize(passed.size(), false);
+                warmed[(size_t) part] = true;
+                while (warm_turn < (int) warmed.size() && warmed[(size_t) warm_turn]) ++warm_turn;
             }
             cv.notify_all();
         }
@@ -479,9 +514,9 @@ public:
     uint8_t* pool_ = nullptr;                              // the compute device's arena
     size_t pool_bytes_ = 0, slot_bytes_ = 0;               // slot_bytes_ = the LARGEST class (staging sizes)
     int pool_nclasses_ = 0;
-    size_t class_off_[8] = {};                             // byte offset of each class's sub-arena
-    int64_t class_base_[8] = {}, class_slots_[8] = {};     // global slot-id range per class
-    size_t class_stride_[8] = {};                          // bytes per slot of that class
+    std::vector<size_t> class_off_;                        // byte offset of each class's sub-arena
+    std::vector<int64_t> class_base_, class_slots_;        // global slot-id range per class
+    std::vector<size_t> class_stride_;                     // bytes per slot of that class (glm-dsa B3.7: any count)
     std::vector<int> layer_class_;                         // absolute layer -> class
     std::vector<int32_t> pool_slot_of_;                    // layer*n_expert+expert -> GLOBAL slot, -1 absent
     std::vector<int64_t> pool_key_of_;                     // global slot -> key, -1 free
@@ -585,6 +620,14 @@ public:
     };
     bool fast_moe_experts(int il, const MoeIo& io, bool pred, int n_ah, const float* const* ah_bias, bool& pf_pending,
                           std::string& err, bool rows = false);   // rows: a batched step's row (STRATA_GLM_SKIP_EMPTY)
+    // glm-dsa: glm-dsa binder + arena (src/core/glm_dsa_fast.cu), plain residual layers (glm_residual.cu)
+    void fast_bind_dsa(int il, std::string& missing);
+    bool fast_dsa_arena(std::string& err);
+    bool fast_layers_plain(int64_t p, bool hop_in, std::string& err);
+    bool fast_dsa_glm(int il, int64_t p, std::string& err);   // the glm-dsa mixer (glm_dsa_mixer.cu)
+    // L1-6: layer il's glmdsa::MixerCache (cache), KV-streamed or not (kctx: the resolve context it points at)
+    void dsa_mixer_cache(int il, void* cache, void* kctx, int* slot_cells, void* stream) const;
+    bool prefill_tokens_dsa(const std::vector<int32_t>& tokens, int32_t next_token, std::string& err);
     // ... its route (moe_route with the token path's settings) into md's plan, the shared expert's h to sh_hq; win /
     // win_n / win_rows: a grouped batched step's row and rows (glm_rows.cu)
     void fast_moe_route(int il, const MoeIo& io, const strata::kernels::glmf::MoeDev& md, void* sh_hq, bool pred,
@@ -689,6 +732,8 @@ public:
         int block_bytes = 0;     // one page of latent rows: what a miss reads
     };
     KvStreamStats kv_stream_stats() const;
+    const GlmStateLayout& state_layout() const { return lay_; }   // glm-dsa B4.1: this part's state arena layout
+    int dsa_n_sel_last() const;   // glm-dsa B4.6: cells the last glm-dsa full layer attended (-1: no glm-dsa mixer)
     /// Images (the vision path): rows of n_embd floats that stand in for the token embeddings at these absolute
     /// positions - the prompt's <|image|> tokens, in order; an empty call clears them.  Read wherever a token is
     /// embedded (the prompt path - the NextN block's cache fill included - and the token path).
@@ -740,9 +785,10 @@ public:
     /// own hidden state feeding the next step), one verify window (window()) checks [last token, drafts...], the
     /// target's samples accept the drafts while they match (window_commit keeps them), and the NextN block's cache takes
     /// the kept rows with the trunk's hidden states.  The same tokens the token-at-a-time loop gives for the same
-    /// samples.  On by default on the Strix / Gorgon Halo APUs (gfx115x, mtp_decode_default); STRATA_GLM_MTP_DECODE=1
-    /// elsewhere, =0 off.  mtp_ready(): this model was set up for it.
-    static bool mtp_decode_wanted(int dev, int n_parts);
+    /// samples.  On by default on the Strix / Gorgon Halo APUs (gfx115x, mtp_decode_default) - not for a glm-dsa model
+    /// (dsa), which takes it only with STRATA_GLM_MTP_DECODE=1; =1 elsewhere, =0 off.  mtp_ready(): this model was set
+    /// up for it.
+    static bool mtp_decode_wanted(int dev, int n_parts, bool dsa);
     bool mtp_ready() const;
     bool decode_mtp(strata::kernels::SamplerParams& sp, int64_t max_new, const std::function<bool(int)>& emit,
                     int64_t& produced, std::string& err);
@@ -779,6 +825,13 @@ private:
     bool mtp_cache_rows(int64_t p0, int n, const float* h, const int32_t* next, std::string& err, bool sync = true,
                         float* emb_rows_h = nullptr);
 public:
+    // glm-dsa B11.2 (speed, glm_fast_path.cu): spec_tail in two halves around the draft (STRATA_GLM_SPEC_DRAFT_EARLY),
+    // hop_to_next in two halves, and a tail part's STRATA_GLM_SPEC_PROF device span
+    bool spec_tail_front(Glm5Model* head, int64_t p, std::string& err);
+    bool spec_tail_back(Glm5Model* head, int64_t p, std::string& err);
+    void spec_hop_out(bool prof);
+    bool spec_hop_in(Glm5Model* A, int64_t p, bool prof, std::string& err);
+    void spec_dev_take();
     // ---- several conversations at once (src/core/glm_multi.cu, STRATA_GLM_SEQS=<n>): each part keeps n sequence
     // states (the state arena: residual, KDA states, DSA caches; the position, the snapshot) and binds one at a time -
     // every path that reads `state_` (the token path, the prompt path, snapshots, slots) then works on the bound one.
@@ -793,6 +846,7 @@ public:
         uint64_t bytes = 0;
         int ik_ring = 0;
         std::vector<int64_t> kda_S, kda_conv, dsa_lat, dsa_ik, dsa_ig, dsa_pool;
+        GlmStateLayout lay;   // glm-dsa B4.1
         float *snap = nullptr, *snap_pool = nullptr, *kda_bak = nullptr;
         int last_tok = -1;
         std::vector<int64_t> img_pos;
@@ -916,6 +970,9 @@ public:
     bool win_alloc(int tmax, std::string& err);            // this part's window buffers, for up to tmax tokens
     void win_free();
     bool fast_window_layers(int64_t p0, int T, std::string& err);   // T rows through this part's layers
+    bool fast_window_layers_plain(int64_t p0, int T, std::string& err);   // glm-dsa L1-4 (glm_residual.cu)
+    bool fast_dsa_glm_window(int il, int64_t p0, int t0, int n, const float* x, const void* xq, size_t xq_s,
+                             float* mixer, std::string& err);   // glm-dsa L1-4 (glm_dsa_mixer.cu)
     bool fast_dsa_window(int il, int64_t p0, int t0, int T, std::string& err);
     bool fast_moe_window(int il, int t0, int T, int part, int gid, std::string& err);
     /// The verify WINDOW: `tokens[0..T)` at positions position()..+T-1 (the last accepted token and T-1 drafts) through
@@ -1049,6 +1106,7 @@ public:
     /// left; no logits.  false with `err` empty when the fast path has no prompt path (feed them to forward()).
     bool prefill(const std::vector<int32_t>& tokens, std::string& err, int32_t next_token = -1);
     bool prefill_run(const std::vector<int32_t>& tokens, std::string& err);   // prefill() between lend and return
+    bool prefill_stream_early(int64_t p0, int T, int chunk, bool pipelined, std::string& err);   // glm-dsa B9.9
     int prefill_chunk() const;                             // tokens per chunk (0: no prompt path)
     /// Called (from any thread) when a chunk has gone through every layer: (positions done, total); false cancels
     /// the prompt (prefill then returns false with err "cancelled" and the sequence must be reset).
@@ -1088,6 +1146,10 @@ private:
     int64_t sc_score = 0, sc_cells = 0, sc_attn = 0, sc_gate = 0, sc_up = 0, sc_h = 0, sc_dn = 0;
     int64_t sc_moe = 0, sc_sh = 0, sc_ffn = 0, sc_mixer = 0, sc_head = 0, sc_logits = 0;
     int64_t sc_ids = 0, sc_rw = 0;
+    // glm-dsa B3.5: the glm-dsa F32 reference forward (src/core/glm_dsa_ref.cu): its state, set up at load
+    std::shared_ptr<void> dsa_ref_;
+    bool dsa_ref_setup(std::string& err);
+    bool step_layers_dsa(int64_t p, std::string& err);
 };
 
 /// What a part with these layer kinds lends the prompt path for a chunk of T tokens, its prestage buffer aside

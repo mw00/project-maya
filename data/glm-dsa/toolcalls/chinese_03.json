@@ -1,0 +1,48 @@
+{
+ "id": "chinese_03",
+ "group": "chinese",
+ "api": "openai",
+ "request": {
+  "messages": [
+   {
+    "role": "user",
+    "content": "搜索一下“量子计算最新进展”。"
+   }
+  ],
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "search_web",
+     "description": "Search the web and return the top results.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "query": {
+        "type": "string"
+       },
+       "max_results": {
+        "type": "integer"
+       }
+      },
+      "required": [
+       "query"
+      ]
+     }
+    }
+   }
+  ]
+ },
+ "expect": {
+  "calls": [
+   {
+    "name": "search_web",
+    "args": {}
+   }
+  ],
+  "min_calls": 1,
+  "max_calls": 3,
+  "no_call": false,
+  "cjk_args": true
+ }
+}

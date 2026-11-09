@@ -1,0 +1,69 @@
+{
+ "id": "single_09",
+ "group": "single",
+ "api": "openai",
+ "request": {
+  "messages": [
+   {
+    "role": "user",
+    "content": "Translate 'the invoice is overdue' into German."
+   }
+  ],
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "translate",
+     "description": "Translate text into a target language.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "text": {
+        "type": "string"
+       },
+       "target_language": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "text",
+       "target_language"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "search_web",
+     "description": "Search the web and return the top results.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "query": {
+        "type": "string"
+       },
+       "max_results": {
+        "type": "integer"
+       }
+      },
+      "required": [
+       "query"
+      ]
+     }
+    }
+   }
+  ]
+ },
+ "expect": {
+  "calls": [
+   {
+    "name": "translate",
+    "args": {}
+   }
+  ],
+  "min_calls": 1,
+  "max_calls": 3,
+  "no_call": false
+ }
+}

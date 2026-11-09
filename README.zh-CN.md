@@ -52,6 +52,7 @@ git clone https://github.com/mw00/project-maya.git && cd project-maya
 | | Maya-M · `glm-maya-m` | 116 GB | 更大的内存池；针对工具调用和前端代码做了校准 |
 | | Maya-M-Derisked · `glm-maya-m-derisked` | 116 GB | 经 [Blackfrost_AI](https://x.com/Blackfrost_AI) 修改权重、减少一刀切拒绝的 Maya-M；实验性 |
 | | Maya-L · `glm-maya-l` | 156.3 GB | 最大的内存池；最接近原版 |
+| **[GLM-5.3](https://huggingface.co/zai-org/GLM-5.3)**<br><sub>zai-org · [自有许可证](https://huggingface.co/zai-org/GLM-5.3) · 744 B，激活 40 B · 最高 1M 上下文 · 仅文本</sub> | UD-IQ2_M (unsloth) · `GLM-5.3-UD-IQ2_M` | 238.6 GB | 最大的内存池；NVIDIA (V100 及更新) 和 AMD ([详情](docs/GLM53.md)) |
 | **[DeepSeek-V4.1-Flash-1017](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017)**<br><sub>DeepSeek · MIT · 748 B</sub> | **Maya-S** (默认) · `deepseek-maya-s` | 340 GB | 任意内存大小：显存和内存放不下的部分从固态硬盘读取 |
 | | Maya-XS (v2) · `deepseek-maya-xs` | 277 GB | 整个模型装进 128 GB 电脑的内存 (Engram 表留在固态硬盘上)；v2 比 v1 更接近原版约 12%，写作速度快约 20% - 再次运行安装程序会提示更新 |
 | **[MiniMax-M3.1-Flash](https://huggingface.co/MiniMaxAI/MiniMax-M3.1-Flash)**<br><sub>MiniMax · [MiniMax Community License](LICENSE.minimax-m31) · 428 B，激活 23 B · 最高 1M 上下文</sub> | Maya-XS · `minimax-maya-xs` | 93 GB | 整个模型装进 128 GB 电脑的内存 |

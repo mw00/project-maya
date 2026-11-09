@@ -57,7 +57,9 @@ function saidDeleted(x) {
                   folder: null, users: x.drafter_users || []};
 }
 
-const titleOf = (m) => `${modelName(m.model)} ${m.quant}`;
+// (m.shown: the server's own name for a model whose API id does not say it all - GLM-5.3 (744B); others: from the id)
+const shownOf = (m) => m.shown || modelName(m.model);
+const titleOf = (m) => `${shownOf(m)} ${m.quant}`;
 const DRAFTS = {mtp: "MTP", dflash2: "DFlash2", dspark: "DSpark", none: "off"};
 const size = (b) => (b >= 1e8 ? `${fmt(b / 1e9, b < 1e10 ? 1 : 0)} GB` : null);
 const setUpOn = (w) => {
@@ -324,11 +326,15 @@ function contextRow(m, d, ch, cost, keys = [], extra = null) {
 function fieldsOf(m, d) {
   const s = m.settings, ch = (...ks) => ks.some((k) => !same(d[k], s[k])), glm = m.family === "glm";
   const per = Math.max(1, Number(d.parallel) || 1);   // (several answers at once: a cache each)
-  const context = contextRow(m, d, ch, !glm ? {} : d.kv_streaming
-    ? {win: Number(d.kv_resident) || 32768, whole: true, ram: GLM_KV_BYTES * per} : {vram: GLM_KV_BYTES * per},
+  // (a model the server sends its own cache size for - GLM-5.3 (744B): m.kv_bytes; m.choices.kv_streaming false: its
+  //  engine keeps the whole cache in VRAM)
+  const kvb = m.kv_bytes || GLM_KV_BYTES, streams = d.kv_streaming && m.choices.kv_streaming !== false;
+  const context = contextRow(m, d, ch, !glm ? {} : streams
+    ? {win: Number(d.kv_resident) || 32768, whole: true, ram: kvb * per} : {vram: kvb * per},
     ["kv_streaming", "kv_resident", "parallel"]);
   const images = html`<${Row} label="Images" flag=${glm ? "vision" : "--vision"} changed=${ch("images")}
     hint=${m.choices.images ? "Reads images in chats. Off leaves its memory to the experts."
+      : m.choices.text_only ? `${shownOf(m)} reads text only: the model has no vision tower.`
       : glm && m.backend === "hip" ? "The setup does not build GLM's image encoder for AMD GPUs (HIP) yet: this model reads text only."
       : glm ? "This model was set up without its image encoder: the setup adds it." : "This pack has no vision tower."}>
     <${Switch} label="Images" on=${d.images} disabled=${!m.choices.images && !d.images} onChange=${(v) => setDraft({images: v})}/><//>`;
@@ -353,10 +359,12 @@ function fieldsOf(m, d) {
     return [
       {label: "Model", rows: [context,
         html`<${Row} label="Answers at once" flag="--parallel" changed=${ch("parallel")}
-          hint="Up to 8. Each extra conversation keeps its own context in VRAM, which the expert cache gives up.">
+          hint=${"Up to 8. Each extra conversation keeps its own context in VRAM, which the expert cache gives up." +
+            (m.choices.batched === false ? ` On ${shownOf(m)} they are answered one after another for now.` : "")}>
           <${Stepper} label="Answers at once" value=${d.parallel} min=${1} max=${8} on=${(v) => setDraft({parallel: v})}/><//>`,
         html`<${Row} label="Drafting" flag="--dflash" changed=${ch("draft")}
           hint=${dflash ? "MTP is built into the model. DFlash2 is a separate drafter, often faster for one answer at a time."
+            : m.choices.dflash2 === false ? `MTP is built into the model: ${shownOf(m)} drafts with it (DFlash2's drafter is made for GLM-5.3-Flash).`
             : "MTP is built into the model. DFlash2 needs its drafter: the setup's --draft dflash2 downloads it (0.7 GB)."}
           warn=${d.draft === "dflash2" && d.parallel > 1 ? `DFlash2 drafts for one answer at a time: with ${d.parallel} at once the engine drafts with MTP.` : null}>
           <${Seg} label="Drafting" value=${d.draft} options=${[{id: "mtp", label: "MTP"}, ...(dflash ? [{id: "dflash2", label: "DFlash2"}] : [])]}
@@ -370,12 +378,13 @@ function fieldsOf(m, d) {
         html`<${Row} label="Prompt chunk" flag="--prefill" changed=${ch("prefill")}
           hint="Auto takes the largest chunk the expert pool can lend, up to 8,192 tokens."
           below=${pf.below} warn=${whole(d.prefill) ? null : "A whole number, or Auto."}>${pf.ctl}<//>`,
+        m.choices.kv_streaming === false ? null :      // (GLM-5.3 (744B): not served by its engine yet)
         html`<${Row} label="KV streaming" flag="--kv-streaming" changed=${ch("kv_streaming", "kv_resident")}
           hint="The attention cache lives in RAM, 12 KB a token, with a window of it in VRAM. Off: all of it in VRAM."
           below=${d.kv_streaming ? html`<div class="mdl-sub"><span>Positions each layer keeps in VRAM (--kv-resident)</span>
             <${Num} label="Positions each layer keeps in VRAM" value=${d.kv_resident} ph="32768" unit="tokens" on=${(v) => setDraft({kv_resident: v})}/></div>` : null}
           warn=${whole(d.kv_resident) ? null : "A whole number, or empty for 32,768."}>
-          <${Switch} label="KV streaming" on=${d.kv_streaming} onChange=${(v) => setDraft({kv_streaming: v})}/><//>`]},
+          <${Switch} label="KV streaming" on=${d.kv_streaming} onChange=${(v) => setDraft({kv_streaming: v})}/><//>`].filter(Boolean)},
     ];
   }
   const dspark = m.choices.draft.includes("dspark");
@@ -835,7 +844,7 @@ function Sheet() {
   return html`<div class="dialog-scrim mdl-sheet-scrim" onPointerDown=${(e) => { if (e.target === e.currentTarget) closeSheet(); }}>
     <div ref=${box} class="dialog mdl-sheet" role="dialog" aria-modal="true" aria-labelledby="mdl-sheet-title" onKeyDown=${keys}>
       <div class="dialog__head mdl-sheet__head"><${ModelLogo} model=${m.model} size=${40}/>
-        <span class="mdl-sheet__name"><h2 id="mdl-sheet-title">${modelName(m.model)}</h2><span class="mdl-badge">${m.quant}</span></span>
+        <span class="mdl-sheet__name"><h2 id="mdl-sheet-title">${shownOf(m)}</h2><span class="mdl-badge">${m.quant}</span></span>
         ${pill}<button type="button" class="icon-btn dialog__close" aria-label="Close" onClick=${closeSheet}><${Icon} name="close"/></button></div>
       <div class="mdl-tabs mdl-sheet__tabs" role="tablist" aria-label=${`${titleOf(m)}`} onKeyDown=${tabKeys}>
         ${tabs.map((t) => html`<button type="button" role="tab" id=${`mdl-sheet-t-${t.id}`} aria-controls="mdl-sheet-p" aria-selected=${String(t.id === s.tab)}
@@ -963,13 +972,13 @@ function Card({m}) {
   const stopping = m.running && r && r.why === "switch", restarting = m.running && r && r.why === "settings";
   const loading = r && r.why === "switch" && r.file === m.file;
   const chips = [["Context", ctxfmt(s.context)], ["Draft", DRAFTS[s.draft] || s.draft], ["GPUs", s.gpus.join(", ") || "–"],
-                 ["Images", s.images ? "on" : "off"], ...(s.parallel > 1 ? [["At once", String(s.parallel)]] : [])];
+                 ["Images", s.images ? "on" : m.choices.text_only ? "text only" : "off"], ...(s.parallel > 1 ? [["At once", String(s.parallel)]] : [])];
   const about = [m.backend === "hip" ? "HIP" : "CUDA", size(m.size), setUpOn(m.written)].filter(Boolean).join(" · ");
   const why = deleteBlock(m);
   return html`<section class=${`card mdl-card${m.running ? " is-running" : ""}${loading ? " is-loading" : ""}`} aria-label=${titleOf(m)}>
     <div class="mdl-card__head">
       <${ModelLogo} model=${m.model} size=${44}/>
-      <span class="mdl-card__name"><span><b>${modelName(m.model)}</b><span class="mdl-badge">${m.quant}</span></span>
+      <span class="mdl-card__name"><span><b>${shownOf(m)}</b><span class="mdl-badge">${m.quant}</span></span>
         <span class="mdl-card__about">${about}</span></span>
       ${m.running ? html`<span class=${`pill pill--${stopping ? "warn" : restarting || MS.loadBusy ? "info" : MS.data.loaded ? "accent" : "warn"}`} role="status">
           <i class=${`status__dot${stopping || restarting || MS.loadBusy ? " is-pulse" : ""}`}></i>${stopping ? "Stopping…" : restarting ? "Restarting…"

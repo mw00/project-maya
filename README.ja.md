@@ -54,6 +54,7 @@ Maya の量子化はすべて、モデル名のあとに階層 (XS、S、M、L�
 | | Maya-M · `glm-maya-m` | 116 GB | より大きなメモリ; ツール呼び出しとフロントエンドのコード向けにキャリブレーション |
 | | Maya-M-Derisked · `glm-maya-m-derisked` | 116 GB | [Blackfrost_AI](https://x.com/Blackfrost_AI) による重み編集で、一律の拒否を減らした Maya-M; 実験的 |
 | | Maya-L · `glm-maya-l` | 156.3 GB | 最大クラスのメモリ; 元のモデルに最も近い |
+| **[GLM-5.3](https://huggingface.co/zai-org/GLM-5.3)**<br><sub>zai-org · [独自ライセンス](https://huggingface.co/zai-org/GLM-5.3) · 744 B、アクティブ 40 B · 最大 1M コンテキスト · テキストのみ</sub> | UD-IQ2_M (unsloth) · `GLM-5.3-UD-IQ2_M` | 238.6 GB | 最大クラスのメモリ; NVIDIA (V100 以降) と AMD ([詳細](docs/GLM53.md)) |
 | **[DeepSeek-V4.1-Flash-1017](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017)**<br><sub>DeepSeek · MIT · 748 B</sub> | **Maya-S** (デフォルト) · `deepseek-maya-s` | 340 GB | メモリ量を問わず: VRAM と RAM に収まらない分は SSD から読み込む |
 | | Maya-XS (v2) · `deepseek-maya-xs` | 277 GB | 128 GB の PC のメモリにモデル全体を載せる (Engram テーブルは SSD に置く); v2 は v1 より元のモデルに約 12% 近く、書き出しが約 20% 速い - セットアップを再実行すると更新を案内します |
 | **[MiniMax-M3.1-Flash](https://huggingface.co/MiniMaxAI/MiniMax-M3.1-Flash)**<br><sub>MiniMax · [MiniMax Community License](LICENSE.minimax-m31) · 428 B、アクティブ 23 B · 最大 1M コンテキスト</sub> | Maya-XS · `minimax-maya-xs` | 93 GB | 128 GB の PC のメモリにモデル全体を載せる |

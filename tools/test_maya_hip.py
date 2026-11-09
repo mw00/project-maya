@@ -191,6 +191,28 @@ class HipSetupTests(unittest.TestCase):
                               self.root / "pack", "test", 8192, self.root / "data", None)
         self.assertEqual(maya.read_json(p)["env"]["STRATA_HIPBLASLT_TUNING"], "/selected/table.txt")
 
+    def test_glm53_tuning_table_only_on_a_glm_dsa_pack(self):
+        # GLM-5.3 (glm-dsa) prompt shapes have their own rows (<arch>-glm53-hipblaslt-<version>.txt), after the GLM
+        # tables; a GLM-5.3-Flash pack's config never names that file
+        tables = self.root / "tools/hip"
+        tables.mkdir(parents=True)
+        (tables / "gfx1100-glm-hipblaslt-100202.txt").write_text("STRATA_HIPBLASLT_TUNING_V1 gfx1100 100202\n")
+        (tables / "gfx1100-glm53-hipblaslt-100202.txt").write_text("STRATA_HIPBLASLT_TUNING_V1 gfx1100 100202\n")
+        pc = maya.check_pc(self.a)
+        flash = maya.write_config(self.a, pc, {"lib_dirs": [str(self.rocm / "lib")]},
+                                  self.root / "pack", "test", 8192, self.root / "data", None)
+        self.assertEqual(maya.read_json(flash)["env"]["STRATA_HIPBLASLT_TUNING"].split(os.pathsep),
+                         [str(tables / "gfx1100-glm-hipblaslt-100202.txt")])
+        pack53 = self.root / "pack53"
+        pack53.mkdir()
+        (pack53 / "index.txt").write_text("# strata pack index v3\n# glm-dsa: trunk 78, dense lead 3, experts 256, "
+                                          "mtp 1, indexer full 21\n")
+        g53 = maya.write_config(self.a, pc, {"lib_dirs": [str(self.rocm / "lib")]},
+                                pack53, "test53", 8192, self.root / "data", None)
+        self.assertEqual(maya.read_json(g53)["env"]["STRATA_HIPBLASLT_TUNING"].split(os.pathsep),
+                         [str(tables / "gfx1100-glm-hipblaslt-100202.txt"),
+                          str(tables / "gfx1100-glm53-hipblaslt-100202.txt")])
+
     def test_rocm_devel_links_repaired(self):
         # #574: rocm-sdk init skipped the device-library links whose unnormalized target passed 260 characters
         site = self.root / "site"
@@ -272,6 +294,21 @@ class HipSetupTests(unittest.TestCase):
                 self.assertNotIn("STRATA_GLM_POOL_GB", env)
                 self.assertNotIn("STRATA_GLM_RAM_GB", env)
                 self.assertNotIn("STRATA_GLM_PREFILL_CHUNK", env)
+
+    def test_glm53_on_a_windows_apu_keeps_8_gb_of_ram_headroom(self):
+        # GLM-5.3 (glm-dsa) on a Windows APU: 8 GB of headroom (the engine caps the tier by Windows' shared GPU memory);
+        # GLM-5.3-Flash there and GLM-5.3 on Linux keep 16
+        self.gpus.append({"index": 3, "arch": "gfx1151", "vendor": "amd", "name": "Radeon 8065S", "vram_gb": 160})
+        self.a.gpu = 3
+        pack53 = self.root / "pack53"
+        pack53.mkdir()
+        (pack53 / "index.txt").write_text("# strata pack index v3\n# glm-dsa: trunk 78, dense lead 3, experts 256, "
+                                          "mtp 1, indexer full 21\n")
+        pc = maya.check_pc(self.a)
+        for win, pack, want in ((True, pack53, "8"), (True, self.root / "pack", "16"), (False, pack53, "16")):
+            with self.subTest(win=win, pack=pack.name), patch.object(maya, "WIN", win):
+                p = maya.write_config(self.a, pc, {}, pack, "test", 8192, self.root / "data", None)
+                self.assertEqual(maya.read_json(p)["env"]["STRATA_GLM_RAM_HEADROOM_GB"], want)
 
     def test_strix_halo_explicit_settings_win(self):
         self.gpus.append({"index": 3, "arch": "gfx1151", "vendor": "amd",

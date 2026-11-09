@@ -406,6 +406,8 @@ int trunk_skip_from(int il);
 }  // namespace glmfast
 
 namespace gf = strata::kernels::glmf;
+namespace glmdsa { struct GlmDsaFast; }   // glm-dsa B2.4: src/core/glm_dsa_fast.hpp
+namespace glmtier { struct TierState; }   // glm-dsa B8.2-B8.4: src/core/glm_tier_numa.hpp
 
 struct Glm5Model::FastState {
     bool unified_memory = false;   // set for integrated devices on Linux (HIP APUs, CUDA's GB10 / Grace); Windows keeps the discrete policy
@@ -535,6 +537,7 @@ struct Glm5Model::FastState {
         const uint16_t *idx_k = nullptr, *idx_gate = nullptr, *idx_q_b = nullptr, *idx_proj = nullptr;
         const uint16_t *k_b = nullptr, *v_b = nullptr;
         const uint16_t* router = nullptr;
+        const void* router_w = nullptr; int router_type = gf::kTypeBF16;   // glm-dsa B2.4: the router jobs' slot
         const float* router_bias = nullptr;
         WSlot sh_gate, sh_up, sh_down;
         WSlot ffn_gate, ffn_up, ffn_down;
@@ -546,6 +549,8 @@ struct Glm5Model::FastState {
         WSlot idx_q_b_x;
     };
     std::vector<Layer> L;
+    std::shared_ptr<glmdsa::GlmDsaFast> dsa;   // glm-dsa B2.4: glm-dsa weights + arena (null on glm5-next)
+    std::shared_ptr<glmtier::TierState> tier;   // glm-dsa B8.2-B8.4: segmented / node-split RAM tier (null: Maya's)
     // ---- the VRAM tier: per-layer partitions.  A slot is FREE, RESIDENT (in tab), a SPARE (handed to the
     //      device, which may fill it during a token and mark it resident itself) or DRAINING (its old expert
     //      is being demoted to the RAM tier by a D2H; it becomes free when that copy lands).
@@ -656,6 +661,11 @@ struct Glm5Model::FastState {
         }
         size_t n_parts() const { return per_part > 0 ? parts.size() : (base != nullptr ? 1 : 0); }
         uint8_t* part(size_t i) const { return per_part > 0 ? parts[i] : base; }
+        size_t split_d = 0;   // glm-dsa B8.4: a node-split class's half 1 of slot s is at ptr(s) + split_d (0: unsplit)
+        // glm-dsa B8.2: slot s (split: its half 0).  Maya's slot(): pinned in pieces (per_part) the slot is not at
+        // base + s * stride (v1.1.55 #417), and the promotion copy below reads it through here on every model
+        uint8_t* ptr(int s) const { return slot((size_t) s); }
+        size_t slot_bytes() const { return split_d != 0 ? 2 * stride : stride; }   // glm-dsa B8.4: a slot's pinned bytes
         std::vector<int> key;   // slot -> il * n_expert + e, -1 none
         std::vector<uint64_t> tick;   // the route clock when a route last used it (or it arrived): eviction's recency
         std::vector<char> st;   // kRFree / kRHold / kRRelease (promoted: free at the boundary) /
@@ -671,6 +681,7 @@ struct Glm5Model::FastState {
     std::vector<uint8_t> left;
     uint64_t diag_disk[8] = {}, diag_lend_evict = 0, diag_drop = 0, diag_ram_evict = 0, diag_lend = 0, diag_lend_park = 0, diag_b = 0;
     uint64_t diag_resident_skip = 0;   // RAM-resident mode: spare refills skipped (no free RAM slot, no drop)
+    std::atomic<uint64_t> ring_laps{0};   // B2.5: times the service thread found the device a whole ring ahead
     uint64_t diag_dup = 0, diag_adopt = 0;   // the boundary's clean-up: duplicate RAM copies freed, lost ones adopted
     size_t ram_bytes = 0;
     size_t all_bytes = 0;   // the bytes of every routed expert of this part's layers (the Monitor's tiers)
@@ -970,6 +981,8 @@ struct Glm5Model::KvStream {
     int64_t n_blocks = 0;  // pages of the context
     std::vector<uint8_t*> host;                          // per layer: the host copy (device-mapped), null: not a DSA layer
     std::vector<strata::kernels::KvStreamMap> map;       // per layer
+    int kpe_row_bytes = 0;                               // L1-6 glm-dsa: k_pe's FP16 row (0: no k_pe copy, Flash)
+    std::vector<uint8_t*> kpe_host;                      // L1-6 glm-dsa: per layer k_pe's host copy (empty on Flash)
     uint8_t* host_arena = nullptr;                       // pinned: every layer's host copy
     void* map_arena = nullptr;                           // device: every layer's map
     uint64_t host_bytes = 0;
@@ -980,6 +993,18 @@ struct Glm5Model::KvStream {
 // streamed layer's VRAM slots): where dsa_prep writes a position's latent row - the identity cache, or the host copy and
 // its block's VRAM slot - and which cells the attention reads - the selection resolved into slot rows, or itself
 inline bool kv_streamed(const Glm5Model::KvStream* K, int il) { return K != nullptr && K->host[(size_t) il] != nullptr; }
+// L1-6 glm-dsa: where a state run at arena offset `off` (GlmStateLayout::slot_runs) lives - a streamed layer's latent /
+// k_pe run in its host copy (position order), anything else in the arena
+inline float* dsa_run_ptr(const GlmStateLayout& lay, const Glm5Model::KvStream* K, float* state, int64_t off) {
+    if (K != nullptr && lay.glm_dsa())
+        for (int il : lay.dsa_layers()) {
+            if (!kv_streamed(K, il)) continue;
+            if (off == lay.dsa_lat[(size_t) il]) return (float*) K->host[(size_t) il];
+            if (!K->kpe_host.empty() && lay.has_kpe(il) && off == lay.dsa_kpe[(size_t) il])
+                return (float*) K->kpe_host[(size_t) il];
+        }
+    return state + off;
+}
 inline void kv_prep_targets(const Glm5Model::KvStream* K, int il, uint16_t* lat, gf::DsaPrepArgs& d) {
     if (!kv_streamed(K, il)) {
         d.lat = lat;

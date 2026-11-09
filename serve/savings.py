@@ -37,6 +37,9 @@ REFERENCES = [
     {"match": r"deepseek[-_.]?v?4\.1[-_.]?flash|deepseek[-_.]flash", "api": "DeepSeek",
      "input": 0.15, "cached": 0.003, "output": 0.60, "peak": 2.0},
     {"match": r"glm[-_.]?5\.3[-_.]?flash", "api": "Z.ai", "input": 0.15, "cached": 0.03, "output": 0.50},
+    # GLM-5.3 (744B, glm-dsa): Z.ai's own, https://docs.z.ai/guides/overview/pricing (read 2026-11-07; its cached
+    # input storage "limited-time free").  Its API name only ("glm-5.3", "zai-org/GLM-5.3"): never a Flash or FlashX
+    {"match": r"^(?:[\w.-]+/)?glm[-_.]?5\.3$", "api": "Z.ai", "input": 1.40, "cached": 0.26, "output": 4.40},
     # MiniMax's own, flat (no context tiers or peak hours for the Flash model):
     # https://platform.minimax.io/docs/pricing/overview (read 2026-10-27)
     {"match": r"minimax[-_.]?m3\.1[-_.]?flash", "api": "MiniMax", "input": 0.15, "cached": 0.015, "output": 0.60},

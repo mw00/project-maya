@@ -87,6 +87,8 @@ import calibrate_ds4_tp as CAL4  # noqa: E402  DeepSeek's: --tp and the CPU thre
 import calibrate_draft as CD  # noqa: E402  the speed calibration: DFlash2 or the MTP block on this PC
 import calibrate_ds4 as CDS  # noqa: E402  DeepSeek's: the DSpark drafter or none, on this PC
 import calibrate_mm3_prefill as CPF  # noqa: E402  MiniMax's: how this PC reads prompts fastest (chunk, GEMMs)
+from serve import glm_dsa_product as G53  # noqa: E402  GLM-5.3 (744B, glm-dsa)
+from strata import maya_sync  # noqa: E402  (tools/strata/) a glm-dsa pack's expert profile and drafting
 
 WIN = S.WIN
 ME = "START-MAYA.bat" if WIN else "./maya.sh"      # how this is started, for the messages
@@ -538,6 +540,34 @@ MODELS = {
 # an install's update and a config that names them work as before; the list shows one only on a PC that has it set up
 # (its default there: a setup again, --yes included, keeps the model).
 MODELS_BY_HAND = ("EXL3-sc_4.10bpw",)
+# GLM-5.3 (744B, glm-dsa) downloads, in MODELS' form: offered on every backend but Metal, and kept out of MODELS itself - its list, --model's help and the dashboard's catalog stay GLM-5.3-Flash's
+# (glm_downloads() adds them).  The owner's pick "for now" (2026-11-06): unsloth's UD-IQ2_M, pinned to the revision
+# checked - each shard's size and sha256 from the Hugging Face API, equal to the sha256 of the copies on two PCs.
+G53_MODELS = {
+    "GLM-5.3-UD-IQ2_M": {
+        "about": "Z.ai's GLM-5.3 (744B, 40B active a token) in unsloth's UD-IQ2_M GGUF (its dynamic 2-bit quant), "
+                 "text only, drafting with its own NextN block",
+        "repo": "unsloth/GLM-5.3-GGUF", "revision": "346b3591c7f28d1a23716f97a065ecf12ec14771", "folder": "UD-IQ2_M",
+        "file": "GLM-5.3-UD-IQ2_M-{i:05d}-of-{n:05d}.gguf", "shards": 6, "download_gb": 238.6,
+        "bytes": {"GLM-5.3-UD-IQ2_M-00001-of-00006.gguf": 9428677,
+                  "GLM-5.3-UD-IQ2_M-00002-of-00006.gguf": 49223976800,
+                  "GLM-5.3-UD-IQ2_M-00003-of-00006.gguf": 49143176640,
+                  "GLM-5.3-UD-IQ2_M-00004-of-00006.gguf": 49143176640,
+                  "GLM-5.3-UD-IQ2_M-00005-of-00006.gguf": 49143176640,
+                  "GLM-5.3-UD-IQ2_M-00006-of-00006.gguf": 41914650304},
+        "sha256": {
+            "GLM-5.3-UD-IQ2_M-00001-of-00006.gguf": "88ec1b9e924bbfe2f5e210bcedb5146aefca41567cdc021c344b253cb733b21d",
+            "GLM-5.3-UD-IQ2_M-00002-of-00006.gguf": "fc036c1c96f30d0b8fa334339cd1f9c68b1a3ab7fbc9440ee92df2a65b2a5e11",
+            "GLM-5.3-UD-IQ2_M-00003-of-00006.gguf": "684b069f8e7a6b28ba04dc2a4d63757db4270bdad95ac931cd013394c638b4da",
+            "GLM-5.3-UD-IQ2_M-00004-of-00006.gguf": "10c735d4af5d923adff14edb9bfbef63e5dce6187720c5db08a45f630638eccb",
+            "GLM-5.3-UD-IQ2_M-00005-of-00006.gguf": "69ee92423d65605f3b7b07744492d42fd85c0fd898127cb23a44f213823f4cff",
+            "GLM-5.3-UD-IQ2_M-00006-of-00006.gguf": "b8f96f7183eba431e047c52adab9091b3e465819c83c8c42ed94697b63507708"}},
+}
+
+
+def glm_downloads() -> dict:
+    """The GLM downloads the setup takes: MODELS and G53_MODELS."""
+    return {**MODELS, **G53_MODELS}
 # The DFlash2 drafter the setup offers instead of drafting with the model's MTP block (--dflash): a small block drafter
 # made for GLM-5.3-Flash (any of the quants above), pinned to the revision it was measured with and verified.
 DFLASH = {"repo": "Anbeeld/GLM-5.3-Flash-DFlash2-GGUF", "revision": "f3569acb7f9cee95e66d24442d75536eb00ab842",
@@ -724,6 +754,13 @@ def exe_for_target(target: str) -> Path:
     fresh on every call since select_build_backend() reassigns EXE/DS4_EXE once the backend (cuda/hip) is known."""
     return {"maya": EXE, "maya-ds4": DS4_EXE, "maya-mm3": MM3_EXE}[target]
 GLM_ARCHS = ("glm5-next", "glm5next")             # llama.cpp's spelling and unsloth's
+
+
+def glm_archs() -> tuple:
+    """The GGUF architectures the GLM setup takes: GLM-5.3-Flash's, and GLM-5.3's (glm-dsa, 744B, same engine)."""
+    return GLM_ARCHS + (G53.ARCH,)
+
+
 # the expert profile setup passes to every GLM config (tools/make_profile.py --glm):
 # its ranking of every (layer, expert) pair decides each layer's VRAM slots and which experts start there
 PROFILE = ROOT / "data" / "expert-profile-glm.bin"
@@ -1674,7 +1711,7 @@ def download_dir(models: Path, quant: str) -> Path:
     """A download's folder: <models folder>/<quant> (--models-dir).  Files already there are used where they are:
     in that folder, in <models folder>/glm-5.3-flash-<quant> (an earlier version's downloads), or straight in the
     models folder - under their names on Hugging Face or an earlier one."""
-    m = MODELS[quant]
+    m = glm_downloads()[quant]
     d = models / quant
     for c in (d, models / f"glm-5.3-flash-{quant}".lower(), models):
         for names in [shard_names(m)] + old_names(m):
@@ -1725,6 +1762,14 @@ def config_family(cfg: dict) -> str:
 
 # each model's name on the setup's screen, under its logo (Qwen's: the model, whichever of its files - never its id)
 FAMILY_TITLE = {**Q.MODEL, "qwen": "Qwen-3.8-Flash-Next"}
+
+
+def setup_title(cfg: dict) -> str:
+    """The setup screen's header name for a config: its family's, except a glm-dsa config (family "glm"), which
+    is GLM-5.3's own name, not GLM-5.3-Flash."""
+    if G53.config_is_glm_dsa(cfg):
+        return G53.SHOWN
+    return FAMILY_TITLE.get(config_family(cfg), "")
 
 
 # the models whose engine answers several requests at once (--parallel): GLM-5.3-Flash's, DeepSeek-V4.1-Flash's
@@ -1806,9 +1851,13 @@ def choose_model(a, models: Path, inst: dict) -> tuple:
     if a.model:
         if metal and is_exl3(a.model):
             fail(f"{a.model} runs on NVIDIA GPUs only", f"a GGUF quant runs on Metal: {ME} --setup --model {next(iter(MODELS))}")
+        if metal and a.model in G53_MODELS:            # (GLM-5.3: before its download, not after it)
+            fail(f"{G53.SHOWN} runs on NVIDIA and AMD GPUs (not on Metal yet)", f"{ME} --setup picks another model")
         return "download", a.model
     opts = [q for q in MODELS if (q not in MODELS_BY_HAND or q == inst.get("quant"))
             and not (metal and is_exl3(q))]   # (a chosen-by-hand download: only where it is installed; Metal: GGUFs)
+    # GLM-5.3 (744B): its downloads after GLM-5.3-Flash's - not on Metal
+    g53 = [q for q in G53_MODELS if q in glm_downloads()] if not metal else []
     # cards of 24 GB or less: Maya-S24 (its 4-bit attention leaves ~1.5 GB more of the card for experts - decode about
     # 14% faster there), else Maya-S
     try:
@@ -1816,7 +1865,7 @@ def choose_model(a, models: Path, inst: dict) -> tuple:
     except Exception:  # noqa: BLE001 - no NVIDIA tools (AMD): no card-based recommendation
         cards = []
     rec = "Maya-S24" if cards and all(g["vram_gb"] <= 24.5 for g in cards) and "Maya-S24" in MODELS else opts[0]
-    default = inst["quant"] if inst.get("quant") in MODELS else rec
+    default = inst["quant"] if inst.get("quant") in MODELS or inst.get("quant") in g53 else rec
     rows = []
     for q in opts:
         m, d = MODELS[q], download_dir(models, q)
@@ -1825,9 +1874,100 @@ def choose_model(a, models: Path, inst: dict) -> tuple:
                                                  f"download {m['download_gb']:.1f} GB from Hugging Face"),
                      ("recommended for cards of 24 GB or less" if q == "Maya-S24" else "recommended") if q == rec
                      else None, m["about"]))
+    for q in g53:                                      # GLM-5.3 (744B, glm-dsa): its downloads (hidden)
+        m, d = G53_MODELS[q], download_dir(models, q)
+        have = all(p.exists() for p in local_shards(m, d))
+        rows.append((f"{G53.LABEL} · {Q.glm53_quant(q)}, text only: " +
+                     (f"downloaded, in {d}" if have else f"download {m['download_gb']:.1f} GB from Hugging Face"), None,
+                     f"{m['about']}; {g53_memory_note()}"))
+    rows.append((f"{G53.SHOWN} (744B, text only): GGUF files you already have", None,   # GLM-5.3 (744B, glm-dsa)
+                 "Z.ai's GLM-5.3 on the same engine; set up from its GGUF folder with --gguf-dir <folder>"))
     pick = choose("Which GLM-5.3-Flash?", ["The model to download (GLM-5.3-Flash GGUF files you already have: "
-                                           "--gguf-dir <file or folder>):"], rows, opts.index(default), a.yes)
-    return "download", opts[pick]
+                                           "--gguf-dir <file or folder>):"], rows, (opts + g53).index(default), a.yes)
+    if pick >= len(opts) + len(g53):
+        fail(f"{G53.SHOWN} is set up from its GGUF files", f"{ME} --setup --gguf-dir <the folder of its .gguf files>")
+    return "download", (opts + g53)[pick]
+
+
+def g53_choice(choice: tuple | None) -> bool:
+    """choose_model's answer is GLM-5.3 (744B, glm-dsa), known before its files are read: one of its downloads, or
+    GGUF files whose header says glm-dsa."""
+    if not choice:
+        return False
+    if choice[0] == "download":
+        return choice[1] in G53_MODELS
+    return choice[0] == "local" and Path(choice[1]).suffix == ".gguf" and gguf_head(Path(choice[1]))[0] == G53.ARCH
+
+
+def g53_contexts(pc: dict, parallel: int = 1, kv_bytes: int | None = None, reserve_mib: int | None = None) -> list:
+    """The contexts the setup offers for GLM-5.3 (744B).  Its engine keeps the whole cache in VRAM for now
+    (G53.KV_STREAMING False), so on discrete GPUs only the contexts whose cache - one a conversation (`parallel`: the
+    config's --parallel), `kv_bytes` a position (G53.KV_BYTES: the INT8 latent) - with the dense weights and on each
+    GPU its working memory and the VRAM the engine leaves free (`reserve_mib`, G53.RESERVE_MIB: CUDA's default) leaves
+    a tenth of the VRAM to the experts (G53's estimates): a larger one would not start.  g53_cache_plan reads the three
+    from what the setup writes.  An APU that shares its RAM (hip_unified_memory: its VRAM figure is no limit), a PC
+    whose VRAM does not read, and KV streaming once it is served: every one.  The smallest is always offered."""
+    gpus = pc.get("gpus") or []
+    vram = sum(g.get("vram_gb") or 0 for g in gpus)
+    if G53.KV_STREAMING or not gpus or not vram or any(hip_unified_memory(g) for g in gpus):
+        return list(CONTEXTS)
+    reserve = G53.RESERVE_MIB if reserve_mib is None else reserve_mib
+    room = 0.9 * vram - G53.DENSE_GB - (G53.GPU_WORK_GB + reserve / 1024) * len(gpus)
+    fit = [c for c in CONTEXTS if max(1, parallel) * c * (kv_bytes or G53.KV_BYTES) / 2**30 <= room]
+    if len(fit) < len(CONTEXTS):
+        (ok if fit else warn)(
+            f"{G53.SHOWN} keeps its whole attention cache in VRAM for now: " +
+            (f"up to a {context_label(fit[-1])} context on these GPUs ({vram:.0f} GB of VRAM" +
+             (f", {parallel} answers at once" if parallel > 1 else "") + ")" if fit else
+             f"its dense weights and the smallest context need more VRAM than these GPUs have ({vram:.0f} GB) - "
+             "it may not start"))
+    return fit or CONTEXTS[:1]
+
+
+def g53_cache_plan(a, pc: dict, choice: tuple) -> dict:
+    """g53_contexts' "parallel", "kv_bytes" and "reserve_mib" as the GLM-5.3 config this setup writes will have them
+    (write_config): --parallel given now, else the one its config before has (keep_args keeps it - the Models page
+    sets it there), else 1; the cache's formats an --env given now asks for (MAYA_GLM_KV_INT8=0: an FP16 latent,
+    MAYA_GLM_IDX_FP16=1: FP16 index keys); the reserve: --vram-reserve-mib given now or kept (it wins over the
+    environment in the engine), else an --env MAYA_GLM_RESERVE_MB, else the HIP setup's (hip_reserve_mib), else
+    CUDA's default."""
+    quant = choice[1] if choice[0] == "download" else quant_of(Path(choice[1]))
+    old = read_json(glm_config_path(pc, quant)).get("args") or []
+    env = parse_env(getattr(a, "env", None) or [])
+
+    def num(v):
+        try:
+            return int(v)
+        except (TypeError, ValueError):
+            return None
+    given = getattr(a, "vram_reserve_mib", None)
+    reserve = num(given if given is not None else flag_value(old, "--vram-reserve-mib"))
+    if reserve is None:
+        reserve = num(N.lookup(env, "MAYA_GLM_RESERVE_MB"))
+    if reserve is None:
+        reserve = hip_reserve_mib(pc.get("gpus") or []) if pc.get("backend") == "hip" else G53.RESERVE_MIB
+    return {"parallel": max(1, num(getattr(a, "parallel", None) or flag_value(old, "--parallel")) or 1),
+            "kv_bytes": G53.kv_bytes_of(G53.GEOMETRY, str(N.lookup(env, "MAYA_GLM_KV_INT8", "1")).strip() != "0",
+                                        str(N.lookup(env, "MAYA_GLM_IDX_FP16", "")).strip() == "1"),
+            "reserve_mib": max(0, reserve)}
+
+
+def g53_memory_gb(pc: dict) -> float | None:
+    """VRAM (the GPUs check_pc chose) and RAM together, GB; None when it does not read."""
+    try:
+        return sum(g.get("vram_gb") or 0 for g in pc.get("gpus") or []) + mem_gb()[0]
+    except Exception:  # noqa: BLE001 - no figure for this PC
+        return None
+
+
+def g53_memory_note(pc: dict | None = None) -> str:
+    """GLM-5.3's memory guidance, neutral (no speeds): from about G53.MEMORY_GB of VRAM and RAM together every expert
+    stays in memory, with less the engine reads the rest from the SSD while it answers - with this PC's figure when
+    `pc` (check_pc's) is given and reads."""
+    have = g53_memory_gb(pc) if pc else None
+    here = f" (this PC: {have:.0f} GB)" if have else ""
+    return (f"every expert stays in memory from about {G53.MEMORY_GB} GB of VRAM and RAM together{here}; with less, "
+            "the engine reads the rest from the SSD while it answers (keep the model on an NVMe SSD)")
 
 
 # ------------------------------------------------------------------------------------------------ 3. tools
@@ -2328,7 +2468,7 @@ def glm_files(d: Path) -> list:
         if m and int(m.group(1)) != 1:
             continue
         arch, n = gguf_head(f)
-        if arch in GLM_ARCHS and (n > 0 or m):
+        if arch in glm_archs() and (n > 0 or m):
             found.append(f)
     return found
 
@@ -2339,7 +2479,7 @@ def local_first(p: Path) -> tuple:
     if p.is_file():
         first = shard_set(p)[0]
         arch = gguf_head(first)[0] if first.exists() else ""
-        if first.exists() and arch not in GLM_ARCHS:
+        if first.exists() and arch not in glm_archs():
             return None, f"{first.name} is " + (f"a {arch!r} model, not GLM-5.3-Flash ({GLM_ARCHS[0]})" if arch else
                                                 "not a GGUF file")
         return first, None
@@ -2388,6 +2528,10 @@ def quant_of(first: Path) -> str:
         if first.name in [names[0] for names in [shard_names(mm)] + old_names(mm)]:
             return q
     m = re.match(r"GLM-5\.3-Flash-(.+?)(-\d{5}-of-\d{5})?\.gguf$", first.name, re.I)
+    if m is None:                                      # GLM-5.3 (glm-dsa): "GLM-5.3-UD-IQ2_M", its own config name
+        d = re.match(r"(GLM-5\.3-(?!Flash-).+?)(-\d{5}-of-\d{5})?\.gguf$", first.name, re.I)
+        if d and gguf_head(first)[0] == G53.ARCH:
+            return d.group(1)
     return m.group(1) if m else first.parent.name
 
 
@@ -2703,7 +2847,7 @@ def linked_downloads(m: dict, d: Path, missing: list) -> dict:
 def offer_download(a, quant: str, d: Path, shards: list, m: dict | None = None) -> bool:
     """Shows what would be downloaded - the source, the size, the exact commands - and downloads only after a yes
     (or --download-model).  False: nothing was downloaded."""
-    m = m or MODELS[quant]
+    m = m or glm_downloads()[quant]
     missing = [s for s in shards if file_incomplete(m, s)]
     urls = {s: file_url(m, hf_name(m, s)) for s in shards}
     on_disk = sum(s.stat().st_size for s in shards if s.exists()) / 1e9
@@ -2793,8 +2937,8 @@ def offer_download(a, quant: str, d: Path, shards: list, m: dict | None = None) 
 
 def model_step(a, models: Path, choice: tuple):
     """(model folder, shards, quant name), or None when the files are not there and were not downloaded."""
-    step(5, "the model (GLM-5.3-Flash)")
     kind, what = choice
+    step(5, f"the model ({G53.SHOWN if kind == 'download' and what in G53_MODELS else 'GLM-5.3-Flash'})")
     if kind == "exl3":                                 # an EXL3 folder of your own (--model-dir): complete by its own index
         d, quant = what, what.name
         shards = exl3_folder_files(d, ("config.json", "tokenizer.json", "tokenizer_config.json"))
@@ -2805,11 +2949,11 @@ def model_step(a, models: Path, choice: tuple):
             why = incomplete(s)
             if why:
                 fail(f"{s.name}: {why}", f"finish copying or downloading it, then run {ME} again")
-        if quant not in MODELS:
+        if quant not in glm_downloads():
             warn(f"{quant}: experimental - only {', '.join(MODELS)} has been measured with Maya (README.md)")
     else:
         quant = what
-        m = MODELS[quant]
+        m = glm_downloads()[quant]
         d = download_dir(models, quant)
         shards = local_shards(m, d)
         if any(file_incomplete(m, s) for s in shards) and not offer_download(a, quant, d, shards):
@@ -2823,7 +2967,7 @@ def model_step(a, models: Path, choice: tuple):
     else:
         from gguf_reader import GGUFFile
         arch = str(GGUFFile(shards[0]).metadata.get("general.architecture", ""))
-        if arch not in GLM_ARCHS:
+        if arch not in glm_archs():
             fail(f"{shards[0].name} is a {arch!r} model, not GLM-5.3-Flash (glm5-next)")
     gb = sum(s.stat().st_size for s in shards) / 1e9
     ok(f"{quant}: {len(shards)} file(s), {gb:.1f} GB in {d}")
@@ -2831,6 +2975,14 @@ def model_step(a, models: Path, choice: tuple):
         warn(f"{d} is on a spinning hard disk: expect slow answers (the engine reads experts from it) - an NVMe SSD "
              "is strongly recommended")
     return d, shards, quant
+
+
+def kind_is_glm_dsa(choice: tuple, shards: list) -> bool:
+    """The model set up is GLM-5.3 (glm-dsa): GGUF files of your own, or one of its downloads (G53_MODELS)."""
+    if choice and choice[0] == "download" and choice[1] not in G53_MODELS:
+        return False                                   # (GLM-5.3-Flash's downloads: no header read)
+    return bool(choice and choice[0] in ("local", "download") and shards and shards[0].suffix == ".gguf"
+                and gguf_head(shards[0])[0] == G53.ARCH)
 
 
 def drafter_step(models: Path) -> Path:
@@ -2915,7 +3067,7 @@ def pack_index_files(pack: Path) -> list | None:
 def check_sha256(shards: list, quant: str | None) -> None:
     """The files a pack is built from (or Metal reads): a Maya download's against its published sha256 (once a file - a
     download is checked as it lands), so a file still being written or damaged stops here, not as garbage answers (#155)."""
-    m = MODELS.get(quant or "") or {}
+    m = glm_downloads().get(quant or "") or {}
     for s in shards:
         want = (m.get("sha256") or {}).get(hf_name(m, s)) if m else None
         if want and not sha256_checked(s, want):
@@ -2995,6 +3147,8 @@ def base_template(pack: Path) -> None:
     """A GLM pack whose GGUF carried no chat template gets GLM-5's: the server would take its generic one otherwise (a
     GGUF with a template of its own keeps it)."""
     base = ROOT / "serve" / "glm5_chat_template.jinja"
+    if G53.pack_is_glm_dsa(pack):                      # GLM-5.3: Z.ai's own template, never Flash's (image slots)
+        base = G53.TEMPLATE
     if not (pack / "tokenizer" / "chat_template.jinja").is_file() and base.is_file():
         put_template(pack, base.read_bytes())
         ok("chat template: GLM-5's (the GGUF carries none)")
@@ -3310,20 +3464,41 @@ def glm_sampling(choice: tuple | None, quant: str) -> dict:
     return dict(Q.QUANT_SAMPLING.get(("glm", Q.tier("glm", quant)), SAMPLING))   # (Maya-XS: its own)
 
 
+def g53_defaults(choice: tuple | None, quant: str) -> tuple:
+    """(sampling, reasoning_effort) of a GLM-5.3 (744B) config: its own (maya_quants' "glm53" - zai-org/GLM-5.3's card)
+    for a listed download, a quant of its own where QUANT_SAMPLING names one; GGUF files not listed: the sampling they
+    carry (unsloth's: the card's), else its own - never GLM-5.3-Flash's tuned quant values."""
+    sampling, effort = Q.MODEL_DEFAULTS[Q.GLM53]
+    if choice and choice[0] == "local" and quant not in G53_MODELS:
+        return gguf_sampling(choice[1], sampling), effort
+    return dict(Q.QUANT_SAMPLING.get((Q.GLM53, Q.tier("glm", quant)), sampling)), effort
+
+
+def glm_config_path(pc: dict, quant: str) -> Path:
+    """The config write_config writes for `quant` on this PC's backend (and keeps settings from, when it is there)."""
+    return ROOT / f"maya-{quant.lower()}{({'hip': '-hip', 'metal': '-metal'}.get(pc.get('backend'), ''))}.json"
+
+
 def write_config(a, pc, meta, pack: Path, quant: str, ctx: int, models: Path, vision: dict | None,
                  choice: tuple | None = None, dflash: Path | None = None, gguf: Path | None = None) -> Path:
     step(8, "the configuration and the start script")
     port = a.port or 8080
     metal = pc.get("backend") == "metal"
+    # GLM-5.3 (744B, glm-dsa): its own name and defaults; KV streaming only once its engine serves it - until then
+    # --kv-streaming off, so that every context the setup offers starts (G53.KV_STREAMING)
+    dsa = G53.pack_is_glm_dsa(pack)
+    sampling, effort = g53_defaults(choice, quant) if dsa else (glm_sampling(choice, quant), EFFORT)
     # --expert-cache auto: the expert pool takes the VRAM left free less the reserve (--vram-reserve-mib, 700 MiB) and
     # is checked again once written; a number set by hand caps it at that many experts (a setup again keeps it)
     # --prefill auto (as Strata's setup writes it): the engine picks its prompt chunk - the largest its expert pool
     # can lend, up to 8192; a number (`32768`) sets the chunk itself
     cfg = {"exe": str(EXE), "args": ["--glm-pack", str(pack), "--max-context", str(ctx), "--expert-cache", "auto",
-                                     "--prefill", "auto", "--kv-streaming", KV_STREAMING],
+                                     "--prefill", "auto", "--kv-streaming",
+                                     "off" if dsa and not G53.KV_STREAMING else KV_STREAMING],
            "cwd": str(ROOT),
-           "tokenizer": str(pack / "tokenizer"), "model_name": MODEL_NAME, "gpu": [g["index"] for g in pc["gpus"]],
-           "sampling": glm_sampling(choice, quant), "reasoning_effort": EFFORT,
+           "tokenizer": str(pack / "tokenizer"),
+           "model_name": G53.MODEL_NAME if dsa else MODEL_NAME, "gpu": [g["index"] for g in pc["gpus"]],
+           "sampling": sampling, "reasoning_effort": effort,
            "lib_dirs": meta.get("lib_dirs") or [], "port": port}
     if MODELS.get(quant, {}).get("kv") and not metal:   # a quant with its own KV format (GLM Maya-XS: int8)
         cfg["args"] += ["--kv", MODELS[quant]["kv"]]
@@ -3350,6 +3525,11 @@ def write_config(a, pc, meta, pack: Path, quant: str, ctx: int, models: Path, vi
             if len(gpus) > 1:
                 # Pin the first part's RAM tier before the APU measures the shared memory left.
                 hip_env["STRATA_GLM_PARALLEL_LOAD"] = "0"
+            if WIN and G53.pack_is_glm_dsa(pack):
+                # GLM-5.3 on a Windows APU: the engine already holds its RAM tier within Windows' shared GPU memory
+                # (glm_fast_path's apu_shared_room cap), so 8 GB of headroom is enough - a Radeon 8065S (32 GB of
+                # system RAM) gets a 10.4 GB tier instead of ~3 GB, decode +10% with the same tokens, 7.8 GB still free
+                hip_env["STRATA_GLM_RAM_HEADROOM_GB"] = "8"
             total_ram, _ = mem_gb()
             if WIN:     # Windows counts the GPU's carve-out apart from its RAM, and its desktop runs on that GPU
                 total_ram += sum(g.get("vram_gb", 0) for g in gpus)
@@ -3363,18 +3543,21 @@ def write_config(a, pc, meta, pack: Path, quant: str, ctx: int, models: Path, vi
         # version that number their solutions differently); the engine takes, per shape, the first one its build
         # accepts, so each version's own file comes first.
         tables = []
+        # GLM-5.3 (glm-dsa) also takes its own prompt shapes' rows (<arch>-glm53-hipblaslt-<version>.txt: N / K of 6144,
+        # which no GLM-5.3-Flash projection has) - a Flash config's tables stay what they were
+        families = ("glm", "glm53") if G53.pack_is_glm_dsa(pack) else ("glm",)
         for arch in dict.fromkeys(g.get("arch", "") for g in gpus):
-            found = sorted((ROOT / "tools" / "hip").glob(f"{arch}-glm-hipblaslt-*.txt"),
-                           key=lambda p: (p.stem.split("-")[3], p.stem))
-            tables.extend(str(path) for path in found)
+            for fam in families:
+                found = sorted((ROOT / "tools" / "hip").glob(f"{arch}-{fam}-hipblaslt-*.txt"),
+                               key=lambda p: (p.stem.split("-")[3], p.stem))
+                tables.extend(str(path) for path in found)
         if tables:
             # the OS's path-list separator: a ':' would also split a Windows drive letter (C:\...)
             hip_env["STRATA_HIPBLASLT_TUNING"] = os.pathsep.join(tables)
         env = {**hip_env, **env}
     if env:
         cfg["env"] = env
-    suffix = {"hip": "-hip", "metal": "-metal"}.get(pc.get("backend"), "")
-    cfg_path = ROOT / f"maya-{quant.lower()}{suffix}.json"
+    cfg_path = glm_config_path(pc, quant)
     old_cfg = read_json(cfg_path)
     # the server's own settings from the config before (the address it listens on, its API key, ...): kept, as the
     # DeepSeek, MiniMax and Qwen setups keep them - a GLM setup run again dropped them; --host / --api-key given now win
@@ -3389,14 +3572,19 @@ def write_config(a, pc, meta, pack: Path, quant: str, ctx: int, models: Path, vi
         cfg["vision"] = vision
     cfg["log"] = str(cfg_path.with_suffix(".log"))
     local = choice[1] if choice and choice[0] == "local" else None   # (choose_model's answer)
-    if PROFILE.exists() and profile_fits(pack):
+    if dsa:                                            # GLM-5.3: the pack's own profile, else its shipped one, if it fits
+        if (prof := maya_sync.profile_for(pack, PROFILE, G53.PROFILE)) is not None:
+            cfg["args"] += ["--expert-profile", str(prof)]
+    elif PROFILE.exists() and profile_fits(pack):
         cfg["args"] += ["--expert-profile", str(PROFILE)]
     if cfg_path.exists():
         old = old_cfg.get("args") or []
+        # (GLM-5.3 without KV streaming: an older config's --kv-streaming on / --kv-resident is not kept - with them a
+        #  context above the window does not start)
+        kv_kept = () if dsa and not G53.KV_STREAMING else ("--kv-streaming", "--kv-resident")
         kept = keep_args(old, cfg["args"],
                          ("--expert-cache", "--vram-reserve-mib", "--vram-reserve-later-mib", "--prefill",
-                          "--parallel", "--expert-profile-save", "--expert-profile-save-every", "--kv-streaming",
-                          "--kv-resident"))
+                          "--parallel", "--expert-profile-save", "--expert-profile-save-every") + kv_kept)
         kept += keep_profile(old, cfg["args"])
         if kept:
             ok("kept from the config before: " + ", ".join(kept))
@@ -3405,7 +3593,8 @@ def write_config(a, pc, meta, pack: Path, quant: str, ctx: int, models: Path, vi
     if getattr(a, "vram_reserve_mib", None) is not None and not metal:   # given now: written, and a later setup keeps it
         set_arg(cfg["args"], "--vram-reserve-mib", a.vram_reserve_mib)
         ok(f"VRAM kept free beside the expert pool: {a.vram_reserve_mib} MiB (--vram-reserve-mib)")
-    for line in prefill_tips(cfg["args"], mem_gb()[0], len(pc["gpus"])):
+    # (GLM-5.3-Flash's measurements: not said for GLM-5.3, whose prompt chunks are not measured that way yet)
+    for line in ([] if dsa else prefill_tips(cfg["args"], mem_gb()[0], len(pc["gpus"]))):
         ok(line)
     gguf_dir = local.parent if local else Path(a.gguf_dir).expanduser().resolve() if a.gguf_dir else None
     cfg["installer"] = {"models_dir": str(models), "quant": quant, "gguf": str(local) if local else None,
@@ -3540,6 +3729,11 @@ def add_profile(cfg: dict) -> bool:
             or "--expert-profile" in args or not PROFILE.exists()):
         return False
     pack = flag_value(args, "--glm-pack")              # (a Metal config has no pack: --gguf names the model file)
+    if pack is not None and G53.pack_is_glm_dsa(pack):   # GLM-5.3: its own profile only (never Flash's)
+        if (prof := maya_sync.profile_for(Path(pack), PROFILE, G53.PROFILE)) is None:
+            return False
+        args += ["--expert-profile", str(prof)]
+        return True
     if pack is not None and not profile_fits(pack):
         return False
     args += ["--expert-profile", str(PROFILE)]
@@ -3772,8 +3966,12 @@ def calibrate_config(cfg_path: Path) -> bool:
         return False
     say()
     say("  Tuning Maya for this PC: the output speed is measured with a few splits of the work between the CPU and")
-    say("  the PCIe link, and with fewer and more CPU threads. It takes about 10-15 minutes (the model loads first);")
-    say("  the PC is busy meanwhile.")
+    if G53.config_is_glm_dsa(cfg):                     # (GLM-5.3, 744B: a longer load, slower answers)
+        say(f"  the PCIe link, and with fewer and more CPU threads. On {G53.SHOWN} it takes about {G53.CALIBRATE_MINUTES}")
+        say("  minutes (the model loads first); the PC is busy meanwhile.")
+    else:
+        say("  the PCIe link, and with fewer and more CPU threads. It takes about 10-15 minutes (the model loads first);")
+        say("  the PC is busy meanwhile.")
     log = cfg.get("log")
     since = os.path.getsize(log) if log and os.path.isfile(log) else 0
     try:
@@ -4364,7 +4562,7 @@ def stop_signals() -> None:
 def serve_on_screen(cfg_path: Path, a) -> int:
     """Maya's server on the setup's screen (setup.UI): its exit code; one it did not choose stops there, with the
     last line its engine logged in this start (mostly the reason: "strata generate: pack: out of memory")."""
-    S.model_named(FAMILY_TITLE.get(config_family(read_json(cfg_path)), ""))
+    S.model_named(setup_title(read_json(cfg_path)))
     cmd, env, info = server_command(cfg_path, a)
     log = Path(info["log"]) if info.get("log") else None
     seen = log.stat().st_size if log is not None and log.is_file() else 0
@@ -4845,11 +5043,17 @@ def set_up(a, prev: dict) -> Path | None:
               Path(inst["models_dir"]) if inst.get("models_dir") else
               Path(inst["data_dir"]) / "models" if inst.get("data_dir") else ROOT.parent / "Maya-data" / "models")
     choice = choose_model(a, models, inst)
-    if choice[0] == "download":
+    if choice[0] == "download" and choice[1] in G53_MODELS:   # (GLM-5.3: "GLM-5.3 (744B) · UD-IQ2_M")
+        ok(f"model: {G53.LABEL} · {Q.glm53_quant(choice[1])}, in {download_dir(models, choice[1])}")
+    elif choice[0] == "download":
         ok(f"model: {Q.shown('glm', choice[1])}, in {download_dir(models, choice[1])}")
     else:
         ok(f"model: {choice[1]} (yours)")
-    ctx = choose_context(a, prev_ctx, recommended=recommended_context(choice, pc))
+    if g53_choice(choice):                             # GLM-5.3 (744B): the contexts its cache fits on these GPUs
+        contexts = g53_contexts(pc, **g53_cache_plan(a, pc, choice))   # (as the config will run: write_config's)
+        ctx = choose_context(a, prev_ctx, contexts, DEFAULT_CONTEXT if DEFAULT_CONTEXT in contexts else contexts[-1])
+    else:
+        ctx = choose_context(a, prev_ctx, recommended=recommended_context(choice, pc))
     ok(f"context: {ctx} tokens")
     draft = choose_draft(a, pc, inst)
     ok("drafting: " + ("a DFlash2 drafter (downloaded with the model)" if draft == "dflash2" else "the MTP block"))
@@ -4859,9 +5063,22 @@ def set_up(a, prev: dict) -> Path | None:
     if got is None:
         return None
     d, shards, quant = got
+    dsa = kind_is_glm_dsa(choice, shards)              # GLM-5.3 (glm-dsa): text only, NextN drafting
+    if dsa and metal:
+        fail(f"{G53.SHOWN} runs on NVIDIA and AMD GPUs (not on Metal yet)", f"{ME} --setup picks another model")
+    if dsa:
+        S.model_named(G53.SHOWN)                       # (the header: GLM-5.3, not GLM-5.3-Flash)
+        draft = maya_sync.draft_for(draft, G53.ARCH, warn)
+        have = g53_memory_gb(pc)                       # (neutral memory guidance, no speeds)
+        (ok if have is not None and have >= G53.MEMORY_GB else warn)(f"{G53.SHOWN}: {g53_memory_note(pc)}")
     dflash = drafter_step(models) if draft == "dflash2" else None
     pack = metal_tokenizer_step(a, d, shards, quant) if metal else pack_step(a, d, shards, llama, quant)       # 6
-    vision = vision_step(a, pc, meta, llama, d, quant)  # 7
+    if dsa:
+        step(7, "images (the vision encoder)")
+        ok(f"{G53.SHOWN}: text only (the model has no vision tower)")
+        vision = None
+    else:
+        vision = vision_step(a, pc, meta, llama, d, quant)  # 7
     cfg_path = write_config(a, pc, meta, pack, quant, ctx, models, vision, choice, dflash, shards[0] if metal else None)   # 8
     if dflash is not None and metal:                   # (the speed calibration is CUDA's: on a Mac the choice is yours)
         ok("DFlash2 drafts on this Mac, not measured against the MTP block (both are exact): "
@@ -4884,7 +5101,8 @@ def set_up(a, prev: dict) -> Path | None:
         warn("--calibrate does not apply to Metal: there is no CPU lane to tune")
     if (a.calibrate and not metal) or (offer and ask(
             "Tune Maya for this PC now? It measures the split of the work between the CPU and the PCIe link and the "
-            "CPU threads (about 10-15 minutes; later: ./maya.sh --calibrate)", ["y", "n"], "y", a.yes) == "y"):
+            f"CPU threads (about {G53.CALIBRATE_MINUTES if dsa else '10-15'} minutes; later: ./maya.sh --calibrate)",
+            ["y", "n"], "y", a.yes) == "y"):
         if S.UI is not None:                           # (the screen lists the tuning as a step of its own)
             S.UI.step(9, "tuning Maya for this PC")
         tuned = calibrate_config(cfg_path)
@@ -6969,7 +7187,7 @@ def model_option(a) -> str | None:
         a.mm3_quant = Q.MM3_QUANT_ALIASES.get(a.mm3_quant, a.mm3_quant)
     if not a.model:
         return None
-    hit = Q.resolve(a.model, list(MODELS))
+    hit = Q.resolve(a.model, list(glm_downloads()))   # (GLM-5.3's downloads included)
     if hit is None:
         return (f"--model {a.model}: not a model Maya knows - one of " + ", ".join(i for _, _, _, i in Q.QUANTS) +
                 f", {DS4}, {MM3}, cyber-frost = {QWEN_SHOWN}, or a GLM-5.3-Flash download: " + ", ".join(MODELS))

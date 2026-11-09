@@ -74,6 +74,11 @@ private:
     void* ctx_ = nullptr;
 };
 
+/// glm-dsa B15.2: products Context::run refused without a launch since the process started (the first 8 are also
+/// printed): an expert_bytes that is not a whole number of the type's blocks.  The GLM prompt path (glm_prefill.cu
+/// prefill_run) fails when it is not 0; prefill.cpp's strides are whole blocks by construction (matrix_bytes).
+int launch_errors();
+
 /// A GGUF-native expert (gate at `gate`, up at `up`, down at `down`, each its GGUF rows) into a group buffer's
 /// slot: gate rows then up rows at `gu_dst`, down at `d_dst`.
 void gather_native(const void* gate, const void* up, size_t gu_half_bytes, const void* down, size_t d_bytes,

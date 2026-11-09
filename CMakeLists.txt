@@ -1747,6 +1747,10 @@ if(STRATA_BUILD_TESTS)
   # split's order, put - host code only, no GPU
   add_executable(ds4_store_test tests/ds4_store_test.cpp)
   target_include_directories(ds4_store_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/ds4)
+  if(WIN32)
+    # (ds4_os.hpp's Windows half includes strata/platform/commit.hpp)
+    target_include_directories(ds4_store_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  endif()
   target_link_libraries(ds4_store_test PRIVATE strata_warnings Threads::Threads)
   add_test(NAME ds4_store_test COMMAND ds4_store_test ${CMAKE_CURRENT_BINARY_DIR})
   set_tests_properties(ds4_store_test PROPERTIES TIMEOUT 120)
@@ -1759,3 +1763,6 @@ if(STRATA_BUILD_TESTS)
     add_subdirectory(tests)
   endif()
 endif()
+
+# the glm-dsa (GLM-5.3) sources and tests, kept in their own file
+include(cmake/glm_dsa.cmake OPTIONAL)

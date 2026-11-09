@@ -12,9 +12,12 @@
 // through the convolution and the recurrence alone.  The DSA caches take all T positions; a rejected one is
 // rewritten when its position is processed again, before any query reads it (a pooled indexer key is built from the
 // cached keys when its pool's last position is processed, and queries read only completed pools).
+#include "glm_dsa_fast.hpp"   // glm-dsa L1-4: the mixer's window rows
 #include "glm_fast_state.hpp"
+#include "glm_residual.hpp"   // glm-dsa L1-4: the plain residual's embed / head for a window's rows
 #include "strata/core/glm_model.hpp"
 #include "strata/kernels/exl3.hpp"
+#include "strata/core/glm_req_knobs.hpp"   // glm-dsa request knobs
 #include "strata/kernels/glm_fast.hpp"
 
 #include "ggml.h"
@@ -336,6 +339,8 @@ bool Glm5Model::win_alloc(int tmax, std::string& err) {
         }
         W.uid_h.assign(nu, -1);
     }
+    // glm-dsa L1-4: the mixer's own row buffers for a window, with the window's (before the expert pool is sized)
+    if (g.arch == GlmArch::GlmDsa && F->dsa && !glmdsa::win_rows_begin(*F->dsa, 0, 1, kWinMax, F->cs, err)) return false;
     W.tmax = tmax;
     return true;
 }
@@ -581,6 +586,10 @@ bool Glm5Model::fast_moe_window(int il, int t0, int T, int part, int gid, std::s
         const void* xq0 = (const uint8_t*) W.xq + (size_t) t0 * W.xq_s;
         j[0] = {Ly.router, nullptr, W.x + (size_t) t0 * E, W.rlog + (size_t) t0 * g.n_expert, nullptr, 1.0f, gf::kTypeBF16, E,
                 g.n_expert};
+        if (g.arch == GlmArch::GlmDsa) {   // glm-dsa L1-4: the router the token path reads (F32 / BF16, router_type)
+            j[0].w = Ly.router_w;
+            j[0].type = Ly.router_type;
+        }
         const float* x0 = W.x + (size_t) t0 * E;
         j[1] = {Ly.sh_gate.q, xq0, x0, W.sh_g + (size_t) t0 * FFs, nullptr, 1.0f, Ly.sh_gate.type, E, FFs};
         j[2] = {Ly.sh_up.q, xq0, x0, W.sh_u + (size_t) t0 * FFs, nullptr, 1.0f, Ly.sh_up.type, E, FFs};
@@ -615,10 +624,11 @@ bool Glm5Model::fast_moe_window(int il, int t0, int T, int part, int gid, std::s
     const bool lane = (F->cpu_plan != 0ull || F->helper.device() >= 0) && F->cpu_fmt[(size_t) il].n_ff > 0;
     // STRATA_GLM_TRUNK_KEEP / _MAP: a window token leaves out the same experts the token path would (8: none)
     const int keep = il == mtp_il_ ? 8 : glmfast::trunk_skip_from(il);
-    static const int promote_min = [] {
+    static const int promote_min_start = [] {
         const char* v = getenv("STRATA_GLM_PROMOTE_MIN");
         return v ? std::max(0, std::atoi(v)) : 0;
     }();
+    const int promote_min = glmknob::get(glmknob::PromoteMin, promote_min_start);   // glm-dsa request knobs: GEN promote_min=
     const float* ah_bias[gf::kAhead] = {nullptr, nullptr, nullptr, nullptr};
     // the batched window's routes on two window lanes (both sockets' pools answer it, win_lane): every RAM-tier expert
     // to the CPU - the calibrated plan priced one pool against PCIe, and a merged layer has two (a 3090's 2.1 ms PCIe
@@ -677,7 +687,8 @@ bool Glm5Model::fast_moe_window(int il, int t0, int T, int part, int gid, std::s
                           g.norm_w != 0, il, W.x + (size_t) t * E, E, mt, W.sh_g + (size_t) t * FFs,
                           W.sh_u + (size_t) t * FFs, g.swiglu_shexp, FFs, (uint8_t*) W.sh_hq + (size_t) t * W.sh_hq_s, s,
                           nullptr, nullptr, 0, nullptr, ah_bias, 0, keep, lane ? win_plan : 0ull, promote_min, 0, 0, t,
-                          scr, t0 + T);
+                          scr, t0 + T, 8, 0.0f, 0.0f, 0, true,
+                          g.arch == GlmArch::GlmDsa ? gf::kRouteNormHf : gf::kRouteNormClamp);   // glm-dsa L1-4 (B5.1)
             ++F->expected;
             // (every expert in VRAM: the wait and the fetch are no-ops - fast_moe's all_resident, 2 launches a token)
             if (!F->all_resident) {
@@ -832,7 +843,8 @@ bool Glm5Model::fast_moe_window(int il, int t0, int T, int part, int gid, std::s
         gf::moe_route(W.rlog + (size_t) t * g.n_expert, Ly.router_bias, g.n_expert, g.n_exp_used, g.w_scale,
                       g.norm_w != 0, il, x, E, md, W.sh_g + (size_t) t * FFs, W.sh_u + (size_t) t * FFs,
                       g.swiglu_shexp, FFs, F->sh_hq, s, nullptr, nullptr, 0, nullptr, ah_bias, 0, keep,
-                      lane ? F->cpu_plan : 0ull, promote_min);
+                      lane ? F->cpu_plan : 0ull, promote_min, 0, 0, 0, nullptr, 0, 8, 0.0f, 0.0f, 0, true,
+                      g.arch == GlmArch::GlmDsa ? gf::kRouteNormHf : gf::kRouteNormClamp);   // glm-dsa L1-4 (B5.1)
         ++F->expected;
         if (!F->all_resident) {
             gf::moe_wait(md, E, s);
@@ -863,6 +875,7 @@ bool Glm5Model::fast_moe_window(int il, int t0, int T, int part, int gid, std::s
 }
 
 bool Glm5Model::fast_window_layers(int64_t p0, int T, std::string& err) {
+    if (!g_.mhc()) return fast_window_layers_plain(p0, T, err);   // glm-dsa L1-4: plain residual (glm_residual.cu)
     FastState* F = fast_;
     auto& W = F->win;
     const Glm5Geometry& g = g_;
@@ -1101,7 +1114,10 @@ bool Glm5Model::window(const int32_t* tokens, int T, int32_t* out, std::string& 
         }
         cudaMemcpyAsync(W.emb, W.emb_h, (size_t) T * E * sizeof(float), cudaMemcpyHostToDevice, F->cs);
         for (int t = 0; t < T; ++t)
-            gf::embed_streams(W.emb + (size_t) t * E, W.R[0] + (size_t) t * hcE, E, F->cs);
+            if (g.mhc())
+                gf::embed_streams(W.emb + (size_t) t * E, W.R[0] + (size_t) t * hcE, E, F->cs);
+            else   // glm-dsa L1-4: the plain residual's row
+                glmres::res_embed(g, W.emb + (size_t) t * E, W.R[0] + (size_t) t * hcE, F->cs);
     }
     if (!fast_window_layers(p0, T, err)) return false;
     // each later part: the rows cross over through the previous part's pinned buffer (or direct peer copies when enabled)
@@ -1132,8 +1148,12 @@ bool Glm5Model::window(const int32_t* tokens, int T, int32_t* out, std::string& 
     auto& WT = FT->win;
     cudaSetDevice(tail->dev_);
     for (int t = 0; t < T; ++t)
-        gf::head_prep(WT.R[WT.out] + (size_t) t * hcE, tail->w_.at("output_norm.weight"), g.norm_eps, E,
-                      WT.head_x + (size_t) t * E, (uint8_t*) WT.head_xq + (size_t) t * WT.xq_s, FT->cs);
+        if (g.mhc())
+            gf::head_prep(WT.R[WT.out] + (size_t) t * hcE, tail->w_.at("output_norm.weight"), g.norm_eps, E,
+                          WT.head_x + (size_t) t * E, (uint8_t*) WT.head_xq + (size_t) t * WT.xq_s, FT->cs);
+        else   // glm-dsa L1-4: the plain residual's head (the token path's res_head)
+            glmres::res_head(g, WT.R[WT.out] + (size_t) t * hcE, tail->w_.at("output_norm.weight"),
+                             WT.head_x + (size_t) t * E, (uint8_t*) WT.head_xq + (size_t) t * WT.xq_s, FT->cs);
     const WSlot& ow = tail->ws_map_.at("output.weight");
     gf::MvJob o = {ow.q, WT.head_xq, WT.head_x, WT.logits, nullptr, 1.0f, ow.type, E, g.n_vocab};
     if (ow.type == 0) o.w = ow.f32;

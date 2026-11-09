@@ -1,0 +1,79 @@
+{
+ "id": "nested_08",
+ "group": "nested",
+ "api": "openai",
+ "request": {
+  "messages": [
+   {
+    "role": "user",
+    "content": "Only enable email notifications; leave everything else alone."
+   }
+  ],
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "update_settings",
+     "description": "Update application settings; only the given keys change.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "settings": {
+        "type": "object",
+        "properties": {
+         "theme": {
+          "type": "string",
+          "enum": [
+           "light",
+           "dark",
+           "system"
+          ]
+         },
+         "font_size": {
+          "type": "integer"
+         },
+         "notifications": {
+          "type": "object",
+          "properties": {
+           "email": {
+            "type": "boolean"
+           },
+           "push": {
+            "type": "boolean"
+           },
+           "quiet_hours": {
+            "type": "object",
+            "properties": {
+             "start": {
+              "type": "string"
+             },
+             "end": {
+              "type": "string"
+             }
+            }
+           }
+          }
+         }
+        }
+       }
+      },
+      "required": [
+       "settings"
+      ]
+     }
+    }
+   }
+  ]
+ },
+ "expect": {
+  "calls": [
+   {
+    "name": "update_settings",
+    "args": {}
+   }
+  ],
+  "min_calls": 1,
+  "max_calls": 3,
+  "no_call": false
+ }
+}

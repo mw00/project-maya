@@ -5,6 +5,7 @@ special about it. Back to the [README](../README.md).
 
 - [How the quants are named](#how-the-quants-are-named)
 - [GLM-5.3-Flash](#glm-53-flash)
+- [GLM-5.3 (744B)](#glm-53-744b)
 - [DeepSeek-V4.1-Flash-1017](#deepseek-v41-flash-1017)
 - [MiniMax-M3.1-Flash](#minimax-m31-flash)
 - [Community quants of GLM-5.3-Flash](#community-quants-of-glm-53-flash)
@@ -59,6 +60,18 @@ On AMD, GLM-5.3-Flash reads pictures too: setup builds its image encoder for the
   it gains depends on the PC: on one GPU that reads much of the model from RAM it is often slower. So a
   [speed calibration](SETTINGS.md#the-speed-calibration) measures it on your PC and keeps it only where it is faster.
   The drafter's license is non-commercial (CC BY-NC-ND 4.0).
+
+## GLM-5.3 (744B)
+
+**[GLM-5.3](https://huggingface.co/zai-org/GLM-5.3)** (zai-org; 744 B parameters, about 40 B active per token) runs on the same engine as
+GLM-5.3-Flash, with its own sparse-attention indexer. Text only, up to 1M context (the setup offers what fits).
+
+| Model | Setup id | Size | Made for |
+| --- | --- | ---: | --- |
+| **GLM-5.3 (744B) · UD-IQ2_M** ([unsloth's GGUF](https://huggingface.co/unsloth/GLM-5.3-GGUF)) | `GLM-5.3-UD-IQ2_M` | 238.6 GB | the biggest memory pools (~256 GB of VRAM and RAM together keeps every expert in memory) |
+
+NVIDIA from the V100 on (CUDA, Linux and Windows) and AMD (HIP, the Strix and Gorgon Halo included); not on Mac.
+Everything about it - setup, context, defaults, APIs: [GLM53.md](GLM53.md).
 
 ## DeepSeek-V4.1-Flash-1017
 

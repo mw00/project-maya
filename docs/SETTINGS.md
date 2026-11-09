@@ -432,7 +432,7 @@ Two config settings shape the thinking, and only one of them counts tokens:
 
 | Setting | What it is |
 |---|---|
-| `"thinking_budget"` | the cap on the thinking, in tokens (32768 by default; 8192 for GLM-5.3-Flash Maya-XS; 0 = none). Past it the server closes the thinking at the next sentence or line end and the answer starts. Settings > Chat defaults > Thinking budget changes it without a restart |
+| `"thinking_budget"` | the cap on the thinking, in tokens (32768 by default; 8192 for GLM-5.3-Flash Maya-XS; 0 = none). Past it the server closes the thinking at the next sentence or line end and the answer starts. Settings > Chat defaults > Thinking budget changes it without a restart. GLM-5.3 (744B): a request that asks for Max itself gets up to 65536, as far as its room keeps 32768 for the answer, while the budget is the default (none set, or 32768); another value, or any value saved on the dashboard, applies at every level |
 | `"reasoning_effort"` | the thinking level a request gets when it names none: a word (`none`, `auto`, `low`, `medium`, `high`, `xhigh`, `max`). DeepSeek-V4.1 also takes a number from 1 to 100 (`42` or `"42"`), its own effort level: it is written into the prompt as a hint to the model, not a token cap |
 
 A `reasoning_effort` the model does not take (a number above 100 for DeepSeek, any number for the other models) stops
@@ -2180,6 +2180,46 @@ Engine options, in the config's `"args"`:
 |---|---|---|
 | `MAYA_EXPERT_RAM_GB` | unset (what the RAM allows) | caps the experts' RAM tier, in GB (the dashboard's Models page: Experts in RAM) |
 | `MAYA_EXPERT_STAGERS` | Linux: the reads at once the model's drive serves fastest (2, 4, 8 or 16, measured in ~1 s at the first start on a drive and kept in `~/.config/project-maya/drive-reads.txt`; `MAYA_EXPERT_DRIVE_PROBE=0` skips the measurement); otherwise a quarter of the CPU threads, 2 to 8 | the threads that read a layer's experts from the file while the CPU prepares the layer (their reads overlap); `0`: read one by one when the CPU needs them |
+
+## GLM-5.3 (744B)
+
+GLM-5.3 ([the model's page](GLM53.md)) runs on the same engine as GLM-5.3-Flash, so the GLM settings above apply to it
+too (the expert tiers, the CPU lane, `MAYA_GLM_SPLIT`, `MAYA_GLM_PREFETCH_*`, `MAYA_GLM_ROW_HALVES`, the thinking
+budget, ...). Its thinking budget is 32768 tokens by default - also at Max, its default level - and up to 65536 for a
+request that asks for Max itself (its own `reasoning_effort` / `output_config.effort` / `thinking`, or a Max picked in
+the web chat), as far as its `max_tokens` or the context left keeps 32768 tokens for the answer, while the budget is
+that default; a budget the user set (the dashboard's field, or another `"thinking_budget"` in the config) applies at
+every level ([the model's page](GLM53.md#its-defaults)). Its own:
+
+| Setting | Default | What it does |
+|---|---|---|
+| `MAYA_GLM_KV_INT8` | on (1) | its latent cache in INT8: 64,352 bytes a token; `0` (or `--kv fp16`): FP16, 102,272 bytes a token |
+| `MAYA_GLM_IDX_FP16` | off | `1`: the indexer's keys in FP16 instead of F32 (58,720 bytes a token with the INT8 latent); the indexer picks from FP16 scores, so the answers can differ |
+| `MAYA_GLM_DSA_GRAPHS` | off | `1`: a token's attention steps run as GPU graphs (fewer launches a token). A request can turn them off for itself (`"graphs": false`, below) |
+| `MAYA_GLM_LANE_ROW4` | off | `1`: the CPU lane computes four rows of an expert's matrix at once (x86-64 CPUs with AVX2, FMA and F16C; other CPUs ignore it), with the same results bit for bit; a request can switch it (`lane_row4`) |
+| `MAYA_GLM_NGRAM_DRAFT` | off | `1`: where the conversation repeats itself (edits, quoted code, tool-call arguments), the tokens that followed the earlier occurrence are drafted instead of the MTP block's (`MAYA_GLM_NGRAM_MIN`, default 3: the shortest match that drafts; `MAYA_GLM_NGRAM_MAX`, default 4, at most 8: the longest draft); the model checks every drafted token, as it checks the MTP block's |
+| `MAYA_GLM_PROMPT_CACHE_DIR` | unset (off) | a folder on a fast SSD: the conversation the engine holds is saved there before another one takes its place, and a later prompt that starts with a saved conversation goes on from it instead of reading that part again. `MAYA_GLM_PROMPT_CACHE_GB` caps the folder (64), `MAYA_GLM_PROMPT_CACHE_MIN` (512 tokens) is the shortest one kept, `MAYA_GLM_PROMPT_CACHE_MAX` (64) the number kept. The kept-conversation slots are off while it is on |
+| `MAYA_GLM_SPLIT_CARDS` | unset | `"<free GiB>:<GB/s>[:<name>],..."`, one entry for each GPU the engine is given: the layer split is planned for those cards instead of the ones it finds - to see the split another set of cards would get (`MAYA_GLM_SPLIT_LOG=1` prints every placement it weighed) |
+
+**A request's own engine settings.** A request to GLM-5.3 can set these in its `"strata_tune"` object (beside
+`pcie_frac`, `cpu_threads`, `read_chunks` and `spec`); the engine applies them from the request's first token and puts
+every one the request leaves out back to how it started, so a request without them runs exactly as the engine
+started. A value out of range, or of the wrong type, is dropped.
+
+| Key | Values | The start setting it overrides |
+|---|---|---|
+| `promote_min` | 0..65535 | `MAYA_GLM_PROMOTE_MIN` |
+| `prefetch_n` | 0..2 | `MAYA_GLM_PREFETCH_N` (above 0 the decode graphs stay off) |
+| `prefetch_at` | `route`, `fetch`, `cpu` | `MAYA_GLM_PREFETCH_AT` |
+| `prefetch_rank` | 0..64 | `MAYA_GLM_PREFETCH_RANK` (0: any rank) |
+| `prefetch_blocks` | 0..1024 | `MAYA_GLM_PREFETCH_BLOCKS` (0: half the GPU's SMs) |
+| `mtp_keep` | 0..8 | `MAYA_GLM_MTP_KEEP` |
+| `cpu_split` | 0..64 | `MAYA_GLM_CPU_SPLIT` (0: about 48 pieces in all) |
+| `vram_evict` | `lfu`, `lru` | `MAYA_GLM_VRAM_EVICT` |
+| `ngram` | true / false | `MAYA_GLM_NGRAM_DRAFT` |
+| `lane_row4` | true / false | `MAYA_GLM_LANE_ROW4` |
+| `graphs` | true / false | false: this request decodes without the attention's CUDA graphs |
+| `pcie_frac_head` | 0..1 | the CPU lane's share for the parts of a draft's verification head (the rest keep `pcie_frac`) |
 
 ## HIP EXL3 single-row matrix jobs
 

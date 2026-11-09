@@ -77,7 +77,9 @@ size_t native_expert_scratch_bytes(int64_t cap_entries, int64_t n_ff);
 /// [grp_start[g], grp_start[g+1]) read token ent_tok[e]'s q8_1 activation (n_embd/32 blocks per token in x_q8_1)
 /// and write row ent_dst[e] of `out` (n_embd floats).  Counts are read on the device.  swiglu_limit
 /// = +infinity (default) keeps the plain unclamped silu*up; a finite limit is GLM's clamped swiglu.
-void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long* grp_ptr, const int32_t* grp_start,
+/// glm-dsa B3.5: false (a line on stderr, nothing launched) when L.gu_type or L.d_type has no kernel - the i-quants,
+/// Q2_0 and the K-quants Q2_K .. Q6_K have one in both roles; the caller reports it.
+bool native_expert_grouped(const NativeExpertLayout& L, const unsigned long long* grp_ptr, const int32_t* grp_start,
                            const int32_t* n_groups, const int32_t* ent_dst, const int32_t* ent_tok, int64_t cap_groups,
                            int64_t cap_entries, const void* x_q8_1, void* scratch, float* out, void* stream,
                            float swiglu_limit = std::numeric_limits<float>::infinity());

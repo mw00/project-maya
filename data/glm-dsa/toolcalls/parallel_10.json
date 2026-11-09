@@ -1,0 +1,59 @@
+{
+ "id": "parallel_10",
+ "group": "parallel",
+ "api": "anthropic",
+ "request": {
+  "messages": [
+   {
+    "role": "user",
+    "content": "Weather in Madrid and in Porto?"
+   }
+  ],
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "get_weather",
+     "description": "Current weather for a city.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string"
+       },
+       "unit": {
+        "type": "string",
+        "enum": [
+         "celsius",
+         "fahrenheit"
+        ]
+       }
+      },
+      "required": [
+       "city"
+      ]
+     }
+    }
+   }
+  ]
+ },
+ "expect": {
+  "calls": [
+   {
+    "name": "get_weather",
+    "args": {
+     "city": "Madrid"
+    }
+   },
+   {
+    "name": "get_weather",
+    "args": {
+     "city": "Porto"
+    }
+   }
+  ],
+  "min_calls": 2,
+  "max_calls": 4,
+  "no_call": false
+ }
+}

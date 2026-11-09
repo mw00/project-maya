@@ -1,0 +1,52 @@
+{
+ "id": "parallel_05",
+ "group": "parallel",
+ "api": "openai",
+ "request": {
+  "messages": [
+   {
+    "role": "user",
+    "content": "Read both README.md and CHANGELOG.md."
+   }
+  ],
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "read_file",
+     "description": "Read a text file from the user's project.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "path": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "path"
+      ]
+     }
+    }
+   }
+  ]
+ },
+ "expect": {
+  "calls": [
+   {
+    "name": "read_file",
+    "args": {
+     "path": "README.md"
+    }
+   },
+   {
+    "name": "read_file",
+    "args": {
+     "path": "CHANGELOG.md"
+    }
+   }
+  ],
+  "min_calls": 2,
+  "max_calls": 4,
+  "no_call": false
+ }
+}

@@ -1,0 +1,31 @@
+def fibonacci(n: int) -> int:
+    """Return the n-th Fibonacci number."""
+    a, b = 0, 1
+    for _ in range(n):
+        a, b = b, a + b
+    return a
+
+if __name__ == "__main__":
+    print([fibonacci(i) for i in range(10)])  # [0, 1, 1, 2, 3, 5, 8, 13, 21, 34]
+#include <cstdio>
+template <typename T> static inline T clamp(T x, T lo, T hi) { return x < lo ? lo : (x > hi ? hi : x); }
+__global__ void scale(float* __restrict__ y, const float* __restrict__ x, float a, int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) y[i] = a * x[i];
+}
+int main(int argc, char** argv) { std::printf("%d args\n", argc); return argc > 1 ? 0 : 1; }
+{"model": "glm-5.3", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 256, "temperature": 0.0}
+SELECT name, COUNT(*) AS n FROM experts WHERE layer BETWEEN 3 AND 78 GROUP BY name HAVING n > 8 ORDER BY n DESC;
+for d in /sys/bus/pci/devices/*; do [ "$(cat $d/vendor)" = 0x10de ] && echo "$d $(cat $d/numa_node)"; done
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=70-real && cmake --build build -j 2
+key: value
+list:
+  - one
+  - "two"
+regex: ^blk\.([3-9]|1[0-2])\.ffn_(up|down|gate)_exps$
+const f = async (x) => { await fetch(`/api/${x}?q=${encodeURIComponent("a b")}`); };
+fn main() { let v: Vec<u64> = (0..10).map(|x| x * x).collect(); println!("{:?}", v); }
+<div class="row"><span id="x">&lt;tag&gt; &amp; &quot;quotes&quot;</span></div>
+x = y if y is not None else 0x7fff_ffff; z = 0b1010 ^ 0o17 | ~1 << 3 >> 1 & 255
+		indented with tabs; mixed    spaces	and tabs
+    return std::max<size_t>(1, n) / 2;   // trailing comment

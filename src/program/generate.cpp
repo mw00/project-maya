@@ -56,6 +56,9 @@
 #include "strata/core/prefill_pieces.hpp"
 #include "strata/core/prefill_gaps.hpp"
 #include "strata/core/vram_mark.hpp"
+#include "strata/core/glm_ngram_draft.hpp"   // glm-dsa B14.13
+#include "strata/core/glm_prompt_cache.hpp"   // glm-dsa B14.14
+#include "strata/core/glm_req_knobs.hpp"   // glm-dsa request knobs
 #include "strata/program/logits_selection.hpp"
 #include "strata/program/conv_cache.hpp"
 #include "strata/spec/draft_policy.hpp"
@@ -1369,6 +1372,7 @@ static int glm_pack_generate(const Options& o) {
     bool snap_in_slot = false;   // the model's snapshot is one of the slots, unchanged since
     const auto env_num = [](const char* k, double d) { const char* v = getenv(k); return v ? std::atof(v) : d; };
     int slot_max = model.fast() && getenv("STRATA_GLM_NO_REUSE") == nullptr ? (int) env_num("STRATA_GLM_SLOTS", 4) : 0;
+    if (slot_max > 0 && strata::core::glmpc::engine_on(model)) slot_max = 0;   // glm-dsa B14.14: the prompt cache replaces the slots
     const size_t slot_min = (size_t) std::max(1.0, env_num("STRATA_GLM_SLOT_MIN", 1024));
     const uint64_t slot_budget = (uint64_t) (env_num("STRATA_GLM_SLOT_GB", 16) * 1073741824.0);
     // slots in RAM: the conversation's state is parked in a host buffer instead of a file.  The cap moves to RAM too
@@ -1770,8 +1774,11 @@ static int glm_pack_generate(const Options& o) {
         slot_put(" (its system prompt, for other chats that start with it)");
         if (snap_in_slot && !slots.empty() && slots.back().tokens.size() == p) slots.back().prefix = true;
     };
-    // the state now (after prompt[0, p)) into a free or the least recently used checkpoint
-    const auto ckpt_keep = [&](const std::vector<int32_t>& prompt, size_t p, bool from_snapshot = false) {
+    // the state now (after prompt[0, p)) into a free or the least recently used checkpoint (at_pos: the state after
+    // prompt[0, p) for a p the read went past - glm-dsa's positional state, Glm5Model::ckpt_save_at; glm-dsa has no
+    // snapshot buffers to copy either, so a from_snapshot checkpoint there is the position p too)
+    const auto ckpt_keep = [&](const std::vector<int32_t>& prompt, size_t p, bool from_snapshot = false,
+                               bool at_pos = false) {
         if ((int) ckpts.size() < ckpt_max) ckpts.emplace_back();
         size_t c = 0;
         for (size_t i = 0; i < ckpts.size(); ++i) {
@@ -1781,7 +1788,10 @@ static int glm_pack_generate(const Options& o) {
         std::string e;
         ckpts[c].tokens.clear();
         const int slot = ckpt_base + (int) c;   // (several conversations: this context's own slots)
-        if (!(from_snapshot ? model.ckpt_save_snapshot(slot, e) : model.ckpt_save(slot, e))) {
+        const bool positional = at_pos || (from_snapshot && model.ckpt_positional());
+        if (!(positional      ? model.ckpt_save_at(slot, (int64_t) p, e)
+              : from_snapshot ? model.ckpt_save_snapshot(slot, e)
+                              : model.ckpt_save(slot, e))) {
             std::fprintf(stderr, "glm checkpoints: not kept at %zu (%s)\n", p, e.c_str());
             return;
         }
@@ -1880,6 +1890,9 @@ static int glm_pack_generate(const Options& o) {
                 ckpts[(size_t) ck].tokens.clear();
             }
         }
+        // glm-dsa B14.14: the conversation in the model goes to the NVMe prompt cache before this prompt overwrites it
+        // (no-op unless STRATA_GLM_PROMPT_CACHE_DIR on a glm-dsa model; the slots are off then)
+        if (reuse == 0) strata::core::glmpc::engine_put(model, snap_tokens, snap_img_hash == kNoImages);
         if (reuse == 0 && slot_max > 0) {
             slot_put("");              // the conversation in the model, before this prompt overwrites it
             reuse = slot_take(prompt);
@@ -1894,6 +1907,7 @@ static int glm_pack_generate(const Options& o) {
                 reuse = back;
             }
         }
+        if (reuse == 0) reuse = strata::core::glmpc::engine_take(model, prompt, cur_img_pos.empty(), snap_tokens, snap_img_hash, snap_in_slot, kNoImages);   // glm-dsa B14.14
         if (reuse == 0) model.reset();
         ckpt_drop_past(reuse);   // this prompt writes the state from `reuse` on (all of it after a reset)
         // THE TURN'S START: a prompt that goes on from the snapshot and opens its last turn (<|user|> / <|observation|>)
@@ -1971,6 +1985,22 @@ static int glm_pack_generate(const Options& o) {
             if (ckpt_max <= 0 && slot_max > 0 && prefix_cut_on && cur_img_pos.empty())
                 strata::core::add_mark(marks, strata::core::prefix_cut(prompt.data(), prompt.size(), reuse, slot_min,
                                                                         154827), reuse);
+            // glm-dsa L1-2: a checkpoint there is a position (Glm5Model::ckpt_positional: the caches' rows before it,
+            // no state to copy), so its marks do not end a prompt-path call - the call reads through them and each
+            // is kept once the read is past it (ckpt_save_at), so a split's parts pipeline the whole read (a 32K
+            // prompt: one call of four chunks, not two calls of two, each filling and draining the pipeline).  The
+            // system prompt's end still ends its call with the slots on (slot_prefix saves the state there).
+            std::vector<size_t> later;   // those marks, ascending
+            if (ckpt_max > 0 && model.ckpt_positional()) {
+                std::vector<size_t> cut;
+                for (const size_t p : marks) (slot_max > 0 && p == sys_end ? cut : later).push_back(p);
+                marks.swap(cut);
+            }
+            size_t li = 0;   // the next of them to keep
+            std::atomic<size_t> read_to{reuse};   // every part has read the prompt up to here (progress callback)
+            const auto keep_later = [&](size_t upto) {
+                for (; li < later.size() && later[li] <= upto; ++li) ckpt_keep(prompt, later[li], false, true);
+            };
             size_t at = reuse;   // the next token the prompt path reads
             bool pok = true, between_failed = false;
             // one call to the next checkpoint mark (or the prompt's last token) - with STRATA_GLM_PREFILL_INTERLEAVE and
@@ -2006,6 +2036,7 @@ static int glm_pack_generate(const Options& o) {
                 const size_t base = at - reuse;
                 model.prefill_progress = [&](int64_t done, int64_t total) {
                     (void) total;
+                    read_to.store(reuse + base + (size_t) done, std::memory_order_relaxed);
                     pp_line(base + (size_t) done);
                     return !read_stopped();
                 };
@@ -2016,6 +2047,8 @@ static int glm_pack_generate(const Options& o) {
                 if (!pok && gap_failed) between_failed = true;   // (a decode gap inside the call failed)
                 if (pok) {
                     at = end;
+                    read_to.store(at, std::memory_order_relaxed);
+                    keep_later(at);
                     if (end == seg_end && mi < marks.size()) {
                         if (ckpt_max > 0) ckpt_keep(prompt, end);   // (no checkpoints: the mark is a prefix cut's only)
                         if (end == sys_end) slot_prefix(prompt, end);
@@ -2064,14 +2097,25 @@ static int glm_pack_generate(const Options& o) {
                 // agent that gave up waiting and sends the same prompt again - goes on from there instead of reading
                 // it all again, and a conversation that runs in between sets it aside in a slot.  The DSA rows before
                 // the checkpoint were written by calls that ended; the cancelled call wrote only past it.
+                // glm-dsa (positional checkpoints, `later`): its marks do not end a call, so the cancelled call itself
+                // went past them - `at` is still its start.  Every part has written the cache rows before read_to (the
+                // progress callback: a pipeline's last part after its stream sync, the sequential path once the chunk
+                // is queued on every part's stream, which ckpt_save_at / ckpt_restore synchronize), so the marks up
+                // to there are kept now and the longest checkpoint up to there is restored - as when each mark ended a
+                // call (a 32K prompt cancelled at 24,000 tokens: its retry goes on from 16,384, not from token 0).
                 // STRATA_GLM_KEEP_CANCELLED=0: the state is dropped, as before.
                 static const bool keep_cancelled = env_num("STRATA_GLM_KEEP_CANCELLED", 1) != 0;
+                const size_t reached = later.empty() ? at : std::max(at, read_to.load(std::memory_order_relaxed));
                 size_t kept = 0;
                 if (keep_cancelled && ckpt_max > 0 && cur_img_pos.empty()) {
+                    // (the marks in (at, reached]: each is longer than any checkpoint the read started from, so the
+                    // restore below takes the last of them and ckpt_drop_past keeps them all)
+                    keep_later(reached);
                     int best = -1;
                     for (int c = 0; c < (int) ckpts.size(); ++c) {
                         const auto& t = ckpts[(size_t) c].tokens;
-                        if (!t.empty() && t.size() <= at && (best < 0 || t.size() > ckpts[(size_t) best].tokens.size()) &&
+                        if (!t.empty() && t.size() <= reached &&
+                            (best < 0 || t.size() > ckpts[(size_t) best].tokens.size()) &&
                             std::equal(t.begin(), t.end(), prompt.begin()))
                             best = c;
                     }
@@ -2393,6 +2437,7 @@ static int glm_pack_generate(const Options& o) {
             int spec_win = 0;
             if (const char* e = getenv("STRATA_GLM_SPEC_WIN")) spec_win = std::atoi(e) != 0;
             const bool piped = spec_win != 0;
+            strata::core::glmng::set_history(&model, prompt);   // glm-dsa B14.13 (no-op unless STRATA_GLM_NGRAM_DRAFT)
             const bool done_ok = piped ? model.decode_spec_pipe(sp, max_new, on_token, n_spec, err)
                                        : model.decode_spec(sp, max_new, on_token, n_spec, err);
             if (!done_ok) {
@@ -3315,6 +3360,7 @@ static int glm_pack_generate(const Options& o) {
             int32_t last = -1, forced_unused = -1;
             bool interrupted = false;
             int64_t n_spec = 0;
+            strata::core::glmng::set_history(&model, g.prompt, g.emitted);   // glm-dsa B14.13
             const bool ok = model.decode_spec(g.sp, g.max_new - g.produced, [&](int tok) {
                 forced_unused = -1;   // a force handed over is consumed by the token that comes next
                 last = tok;
@@ -4364,6 +4410,7 @@ static int glm_pack_generate(const Options& o) {
             std::string bias_err;
             int pen_n = 0;
             float pen_repeat = 1.0f, pen_freq = 0.0f, pen_present = 0.0f;
+            strata::core::glmknob::Request req_knobs;   // glm-dsa request knobs: this request's engine knobs
             std::string tok2, ids, emb_path;
             while (ss >> tok2) {
                 const size_t eq = tok2.find('=');
@@ -4394,6 +4441,7 @@ static int glm_pack_generate(const Options& o) {
                 else if (k == "spec_min_p") { req_spec_min_p = std::atof(v.c_str()); }
                 else if (k == "spec_n_min") { req_spec_n_min = std::atoi(v.c_str()); }
                 else if (k == "spec_cum") { req_spec_cum = std::atof(v.c_str()); }
+                else if (req_knobs.take(k, v)) {}   // glm-dsa request knobs: promote_min= .. pcie_frac_head= (glm_req_knobs.hpp)
                 else if (k == "logit_bias") {   // <id>:<bias>,... - -100 or below bans the token
                     for (size_t at = 0; at < v.size() && bias_err.empty();) {
                         size_t end = v.find(',', at);
@@ -4462,6 +4510,7 @@ static int glm_pack_generate(const Options& o) {
             model.set_cpu_lane_threads(req_threads > 0 ? req_threads : 0);
             model.set_read_chunks(req_chunks > 0 ? req_chunks : 0);
             model.set_miss_skip(req_msw, req_msf);
+            strata::core::glmknob::apply(model, req_knobs);   // glm-dsa request knobs: after set_pcie_share (pcie_frac_head)
             std::vector<int64_t> toks;
             std::string e;
             if (max_new <= 0 || ids.empty() || !parse_i64_list(ids.c_str(), toks, e)) {
@@ -4541,6 +4590,11 @@ static int glm_pack_generate(const Options& o) {
                 gen_finish(*gp);
             }
         gen_sweep();
+        if (strata::core::glmpc::engine_on(model))   // glm-dsa B14.14: every conversation to the prompt cache
+            for (int c = 0; c < (int) ctxs.size(); ++c) {
+                bind_ctx(c);
+                strata::core::glmpc::engine_put(model, snap_tokens, snap_img_hash == kNoImages);
+            }
         if (slot_keep && !slot_ram)
             for (int c = 0; c < (int) ctxs.size(); ++c) {
                 bind_ctx(c);
@@ -4548,6 +4602,7 @@ static int glm_pack_generate(const Options& o) {
             }
         return 0;
     }
+    strata::core::glmpc::engine_put(model, snap_tokens, snap_img_hash == kNoImages);   // glm-dsa B14.14
     if (slot_keep && !slot_ram) slot_put(" on shutdown");
     save_profile("quit");   // #477
     strata::core::Glm5Model::set_routing_dump("", err);   // --dump-routing: the trace closed whole
@@ -4850,9 +4905,13 @@ int main(int argc, char** argv) {
     // mistake worth saying out loud.
     // --kv-streaming on|off: on streams with --kv-resident's window (32768 when it gives none), off keeps every cell in
     // VRAM whatever --kv-resident says
+    bool kv_auto = false;   // `on` with no window of the user's: glm-dsa streams only when its cache does not fit (36)
     if (!o.kv_streaming.empty()) {
         if (o.kv_streaming == "on") {
-            if (o.kv_resident <= 0) o.kv_resident = 32768;
+            if (o.kv_resident <= 0) {
+                o.kv_resident = 32768;
+                kv_auto = true;
+            }
         } else if (o.kv_streaming == "off") {
             o.kv_resident = 0;
         } else {
@@ -4871,8 +4930,12 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "maya generate: --kv-resident must be 0 or more\n");
             return 2;
         }
-        if (o.kv_resident > 0 && std::getenv("STRATA_GLM_KV_RESIDENT") == nullptr)
+        const bool kv_env = std::getenv("STRATA_GLM_KV_RESIDENT") != nullptr;
+        if (o.kv_resident > 0 && !kv_env)
             set_env("STRATA_GLM_KV_RESIDENT", std::to_string(o.kv_resident).c_str());
+        // OWNER-DECISIONS 36: the setup's `on` lets a glm-dsa model keep its whole cache in VRAM when it fits there
+        // (decided at load from the measured VRAM; Flash streams as before)
+        if (kv_auto && !kv_env && std::getenv("STRATA_GLM_KV_AUTO") == nullptr) set_env("STRATA_GLM_KV_AUTO", "1");
         if (o.kv_streaming == "off") set_env("STRATA_GLM_KV_RESIDENT", "0");   // (off whatever the environment says)
         // the expert pool's size, set in the config's args (the engine reads them as STRATA_GLM_EXPERT_CACHE,
         // STRATA_GLM_RESERVE_MB and STRATA_GLM_RESERVE_LATER_MB; given here, they win over the environment):

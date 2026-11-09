@@ -21,3 +21,5 @@ third_party/ggml/*.patch -text
 serve/fixtures/deepseek_v41/** -text
 # ... and MiniMax-M3.1-Flash's own chat template (serve/test_minimax_frontend.py checks its sha256)
 serve/fixtures/minimax_m31/chat_template.jinja -text
+# GLM-5.3's data (the official chat template's sha256, the hashed corpora, the float fixtures): byte for byte
+data/glm-dsa/** -text

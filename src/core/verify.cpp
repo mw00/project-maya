@@ -695,19 +695,23 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         float* hit_out = hit_out_ + (size_t) tb * K * N;
         const auto& lay = strata::kernels::cpu::expert_layout();
         // plan v0.3 P6: the VRAM groups now; the PCIe groups once the copy engine has landed them in staging
-        auto grouped = [&](const unsigned long long* gp, const int32_t* gs, const int32_t* gn) {
+        auto grouped = [&](const unsigned long long* gp, const int32_t* gs, const int32_t* gn) -> bool {
             if (lay.native) {
                 // the layer's GGUF formats (i-quant gate/up, Q2_0 / IQ4_NL down)
                 const auto& f = lay.fmt[(size_t) l];
                 const NativeExpertLayout L = native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff);
-                native_expert_grouped(L, gp, gs, gn, p_dst, p_tok, cap, cap,
-                                      nat_xq_ + (size_t) tb * (N / 32) * 36, hit_scratch_, hit_out, cs);
+                return native_expert_grouped(L, gp, gs, gn, p_dst, p_tok, cap, cap,   // glm-dsa B3.5: false, no std::exit
+                                             nat_xq_ + (size_t) tb * (N / 32) * 36, hit_scratch_, hit_out, cs);
             } else {
                 moe_grouped_s2(gp, gs, gn, p_dst, p_tok, cap, cap, hit_xq_ + (size_t) tb * (N / 32) * 34,
                                hit_xs_ + (size_t) tb * (N / 32), hit_scratch_, hit_out, cs);
             }
+            return true;   // glm-dsa B3.5: launched
         };
-        grouped(p_ptr, p_start, p_counts);
+        if (!grouped(p_ptr, p_start, p_counts)) {   // (the PCIe call below has the same types: it cannot fail then)
+            err = "verify layer " + std::to_string(l) + ": no device kernel for its expert types";
+            return false;
+        }
         stamp(l, 20, grp);
         if (device_plan_) wait_flag_ge_or(m_flagB_, ring, skip_ + grp, cs);
         else wait_flag_ge(m_flagB_, ring, cs);                 // the PCIe share is in staging (DMA) or mapped

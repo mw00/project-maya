@@ -22,8 +22,13 @@
 // Where it runs: one GPU that holds the routed experts (a verify row costs its experts in full where they stream from
 // RAM) - by default the Strix / Gorgon Halo APUs (gfx115x), whose memory holds the whole model; STRATA_GLM_MTP_DECODE=1
 // asks for it elsewhere, =0 turns it off.  Not with several conversations at once (--parallel) or a DFlash drafter.
+// A glm-dsa model (GLM-5.3) takes it only when STRATA_GLM_MTP_DECODE=1 asks, on every device: its experts outgrow a
+// Halo's memory too (the 239 GB UD-IQ2_M streams ~a third of them from RAM / the NVMe on a 192 GB Radeon 8065S), and
+// there a verify window reads the union of its rows' experts: on the 8065S a 4-row round read 5x a token's experts
+// from the disk and the decode ran at x0.62 of the token path with 3 drafts (SUN-NOTES S7b), as on one V100 (L1-4).
 //
 // The NextN cache's entry p pairs h_p with the token at p + 1 (the prompt path writes them so).
+#include "glm_dsa_fast.hpp"   // glm-dsa L1-4: the block's cache rows through its mixer
 #include "glm_fast_state.hpp"
 #include "strata/core/glm_model.hpp"
 #include "strata/kernels/glm_fast.hpp"
@@ -75,15 +80,16 @@ bool mtp_chain_wanted() {
 }
 }  // namespace
 
-// load_pack / fast_setup: whether this model decodes with the MTP block on one GPU (see the top of this file)
-bool Glm5Model::mtp_decode_wanted(int dev, int n_parts) {
+// load_pack / fast_setup: whether this model decodes with the MTP block on one GPU (see the top of this file); dsa: a
+// glm-dsa model, which takes it only when STRATA_GLM_MTP_DECODE asks
+bool Glm5Model::mtp_decode_wanted(int dev, int n_parts, bool dsa) {
     if (strata::platform::env_switch("STRATA_GLM_NO_SPEC") || strata::platform::env_switch("STRATA_GLM_NO_MTP") ||
         mtp_draft_cap() <= 0)
         return false;
     if (const char* q = getenv("STRATA_GLM_SEQS"); q != nullptr && std::atoi(q) > 1) return false;   // (--parallel)
     if (const char* d = getenv("STRATA_GLM_DFLASH"); d != nullptr && d[0] != '\0') return false;
     if (const char* e = getenv("STRATA_GLM_MTP_DECODE")) return std::atoi(e) != 0 && n_parts == 1;
-    if (n_parts != 1) return false;
+    if (n_parts != 1 || dsa) return false;
 #if defined(STRATA_USE_HIP)
     // the Strix / Gorgon Halo APUs (gfx1150 / gfx1151 / gfx1152): their memory holds every expert
     hipDeviceProp_t prop{};
@@ -389,17 +395,43 @@ bool Glm5Model::mtp_cache_rows(int64_t p0, int n, const float* h, const int32_t*
     for (int i = 0; i < n; ++i)
         gf::mtp_in(C.emb + (size_t) i * E, h + (size_t) i * E, Ly.enorm, Ly.hnorm, g.norm_eps, g.n_embd,
                    (uint8_t*) C.catq + (size_t) i * q8_bytes(2 * E), s);
-    gf::MvJob eh = {Ly.eh.q, C.catq, nullptr, C.hid, nullptr, 1.0f, Ly.eh.type, (int) (2 * E), g.n_embd};
-    eh.ncol = n;
-    eh.xq_cstride = (int64_t) q8_bytes(2 * E);
-    eh.y_cstride = E;
-    if (!gf::mv(&eh, 1, s)) {
-        err = "glm mtp: eh_proj rows";
-        return false;
+    if (g.arch == GlmArch::GlmDsa) {
+        // glm-dsa L1-4: eh_proj row by row as fast_mtp runs it (glmdsa::mv: a BF16 / F32 eh_proj reads its input
+        // dequantized, one column)
+        for (int i = 0; i < n; ++i) {
+            gf::MvJob eh = {Ly.eh.q, (const uint8_t*) C.catq + (size_t) i * q8_bytes(2 * E), nullptr,
+                            C.hid + (size_t) i * E, nullptr, 1.0f, Ly.eh.type, (int) (2 * E), g.n_embd};
+            if (!glmdsa::mv(F->dsa.get(), &eh, 1, s)) {
+                err = "glm mtp: eh_proj rows";
+                return false;
+            }
+        }
+    } else {
+        gf::MvJob eh = {Ly.eh.q, C.catq, nullptr, C.hid, nullptr, 1.0f, Ly.eh.type, (int) (2 * E), g.n_embd};
+        eh.ncol = n;
+        eh.xq_cstride = (int64_t) q8_bytes(2 * E);
+        eh.y_cstride = E;
+        if (!gf::mv(&eh, 1, s)) {
+            err = "glm mtp: eh_proj rows";
+            return false;
+        }
     }
     for (int i = 0; i < n; ++i)
         gf::rms_q8(C.hid + (size_t) i * E, nullptr, Ly.attn_norm, g.norm_eps, g.n_embd, C.x + (size_t) i * E,
                    (uint8_t*) C.xq + (size_t) i * q8_bytes(E), s);
+    if (g.arch == GlmArch::GlmDsa) {
+        // glm-dsa L1-4: the block's own mixer over the rows writes its latent / k_pe / index-key caches at p0 .. (its
+        // attention output, into C.hid, is not used)
+        if (!glmdsa::win_rows_begin(*F->dsa, p0, n, kWinMax, s, err) ||
+            !fast_dsa_glm_window(mtp_il_, p0, 0, n, C.x, C.xq, q8_bytes(E), C.hid, err))
+            return false;
+        const cudaError_t e = cudaGetLastError();
+        if (e != cudaSuccess) {
+            err = std::string("glm mtp cache: ") + cudaGetErrorString(e);
+            return false;
+        }
+        return true;
+    }
     gf::MvJob j[3];
     j[0] = {Ly.kv_a.q, C.xq, C.x, C.kv_raw, nullptr, 1.0f, Ly.kv_a.type, g.n_embd, g.kv_lora};
     j[1] = {Ly.idx_k, nullptr, C.x, C.ik_raw, nullptr, 1.0f, gf::kTypeBF16, g.n_embd, g.idx_key};
@@ -587,6 +619,9 @@ bool Glm5Model::decode_mtp(strata::kernels::SamplerParams& sp, int64_t max_new, 
     }();
     int64_t n_out = 0, n_full = 0, n_drafting = 0;
     const bool chain = F->mtp_emb != nullptr && mtp_chain_wanted();
+    // glm-dsa L1-4: the NextN block reads its hidden-state input from the sequence's carrier (B15.3), which the trunk's
+    // head notes; a round's later draft steps and the round after a window note it themselves
+    const bool dsa_chain = g.arch == GlmArch::GlmDsa;
     const auto note = [&](int tok) {
         const bool outside = !mtp_vin_.empty() && tok >= 0 && tok < (int) mtp_vin_.size() && !mtp_vin_[(size_t) tok];
         n_out += outside ? 1 : 0;
@@ -623,7 +658,11 @@ bool Glm5Model::decode_mtp(strata::kernels::SamplerParams& sp, int64_t max_new, 
             if (chain) {
                 // the chain: every step queued at once, each step's argmax the next one's token on the device; the
                 // host reads the n drafts back once
-                for (int i = 0; i < n && ok; ++i) ok = fast_mtp(p0 - 1 + i, i == 0 ? y : -1, err, i, sub, false);
+                for (int i = 0; i < n && ok; ++i) {
+                    // glm-dsa L1-4: a later step's carrier is the step before's output (head_x), as Flash reads it
+                    if (i > 0 && dsa_chain) mtp_carry_note(p0 - 1 + i, F->head_x, F->cs);
+                    ok = fast_mtp(p0 - 1 + i, i == 0 ? y : -1, err, i, sub, false);
+                }
                 if (ok) {
                     cudaMemcpyAsync(F->mtp_tok_h, F->mtp_tok, (size_t) n * sizeof(int), cudaMemcpyDeviceToHost, F->cs);
                     cudaEventRecord(F->ev_mtp, F->cs);
@@ -636,6 +675,7 @@ bool Glm5Model::decode_mtp(strata::kernels::SamplerParams& sp, int64_t max_new, 
             } else {
                 int32_t tok = y;
                 for (int i = 0; i < n; ++i) {
+                    if (i > 0 && dsa_chain) mtp_carry_note(p0 - 1 + i, F->head_x, F->cs);   // (glm-dsa L1-4, above)
                     if (!fast_mtp(p0 - 1 + i, tok, err, i, sub) ||
                         !glmfast::wait_event(F->ev_mtp, "glm mtp draft", err) || !F->route_ok(err)) {
                         ok = false;
@@ -721,6 +761,7 @@ bool Glm5Model::decode_mtp(strata::kernels::SamplerParams& sp, int64_t max_new, 
             cudaMemcpyAsync(F->head_x, rows_hx + (size_t) (keep - 1) * E, (size_t) E * sizeof(float),
                             cudaMemcpyDeviceToDevice, F->cs);
             mtp_hx_pos_ = p0 + keep - 1;
+            if (dsa_chain) mtp_carry_note(mtp_hx_pos_, F->head_x, F->cs);   // glm-dsa L1-4: the next draft's carrier
             ph[2] += ms_since(t2);
             ++n_ph;
         }
@@ -868,8 +909,11 @@ bool Glm5Model::decode_spec_pipe(strata::kernels::SamplerParams& sp, int64_t max
             if (n > 0) {
                 cudaSetDevice(TL->dev_);
                 if (chain) {
-                    for (int i = 0; i < n && ok; ++i)
+                    for (int i = 0; i < n && ok; ++i) {
+                        // glm-dsa L1-4: a later step's carrier is the step before's output (decode_mtp's rule)
+                        if (i > 0 && g.arch == GlmArch::GlmDsa) TL->mtp_carry_note(N - 1 + i, FT->head_x, FT->cs);
                         ok = TL->fast_mtp(N - 1 + i, i == 0 ? y : -1, err, i, true, false);
+                    }
                     if (ok) {
                         cudaMemcpyAsync(FT->mtp_tok_h, FT->mtp_tok, (size_t) n * sizeof(int), cudaMemcpyDeviceToHost,
                                         FT->cs);
@@ -885,6 +929,7 @@ bool Glm5Model::decode_spec_pipe(strata::kernels::SamplerParams& sp, int64_t max
                 } else {
                     int32_t tok = y;
                     for (int i = 0; i < n && ok; ++i) {
+                        if (i > 0 && g.arch == GlmArch::GlmDsa) TL->mtp_carry_note(N - 1 + i, FT->head_x, FT->cs);
                         if (!TL->fast_mtp(N - 1 + i, tok, err, i, true) ||
                             !glmfast::wait_event(FT->ev_mtp, "glm spec pipe draft", err) ||
                             !TL->fast_->route_ok(err)) {
@@ -996,6 +1041,7 @@ bool Glm5Model::decode_spec_pipe(strata::kernels::SamplerParams& sp, int64_t max
         cudaMemcpyAsync(FT->head_x, rows_hx + (size_t) (keep - 1) * g.n_embd, (size_t) g.n_embd * sizeof(float),
                         cudaMemcpyDeviceToDevice, FT->cs);
         TL->mtp_hx_pos_ = N + keep - 1;
+        if (g.arch == GlmArch::GlmDsa) TL->mtp_carry_note(TL->mtp_hx_pos_, FT->head_x, FT->cs);   // (glm-dsa L1-4)
         if (trace) std::fprintf(stderr, "glm spec pipe2: p0 %lld keep %d acc %d (%d rows)\n", (long long) N, keep, acc, T);
         // the adaptive length's bookkeeping (decode_mtp's; the round's wall time is the length's next measurement)
         {

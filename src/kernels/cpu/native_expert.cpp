@@ -7,6 +7,7 @@
 #include "strata/kernels/cpu/iq_avx512_one.hpp"
 #include "strata/kernels/cpu/iq_avx2.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
+#include "strata/kernels/cpu/glm_lane_row4.hpp"   // glm-dsa B14.9: STRATA_GLM_LANE_ROW4 lane hooks
 
 #include "ggml.h"
 #include "ggml-cpu.h"
@@ -309,6 +310,7 @@ void native_gu_rows_split(const NativeFmt& f, const uint8_t* gate_base, const ui
             return;
         }
     }
+    if (nt == 1 && lane_row4_gu(f, gate_base, up_base, act[0], ff[0], r0, r1, swiglu_limit)) return;   // glm-dsa: STRATA_GLM_LANE_ROW4
     const ggml_vec_dot_t dot = traits(f.gu_type)->vec_dot;
     for (int r = r0; r < r1; ++r) {
         const uint8_t* gr = gate_base + (size_t) r * f.gu_row;
@@ -337,6 +339,7 @@ void native_down_rows_split(const NativeFmt& f, const uint8_t* down_base, const 
             return;
         }
     }
+    if (nt == 1 && lane_row4_down(f, down_base, hq[0], out[0], r0, r1)) return;   // glm-dsa B14.9: STRATA_GLM_LANE_ROW4
     const ggml_vec_dot_t dot = traits(f.d_type)->vec_dot;
     const int n = (int) f.n_ff;
     for (int r = r0; r < r1; ++r) {

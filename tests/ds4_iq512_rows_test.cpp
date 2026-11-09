@@ -28,6 +28,10 @@
 #include <cstdlib>
 #include <cstring>
 #include <random>
+#if (defined(__x86_64__) || defined(_M_X64)) && defined(_MSC_VER) && defined(__clang__)
+#include <immintrin.h>
+#include <intrin.h>
+#endif
 #include <string>
 #include <vector>
 
@@ -193,7 +197,21 @@ void bench(int type, int nt, RowsFn fn = nullptr, const char* name = nullptr) {
 
 // AVX-512 F / BW / VL / DQ and BMI2 with the OS saving the state (the rows' own check: ds4_iq_cpu.cpp's iq_isa)
 bool cpu_x512() {
-#if (defined(__x86_64__) || defined(_M_X64)) && (defined(__GNUC__) || defined(__clang__))
+#if (defined(__x86_64__) || defined(_M_X64)) && defined(_MSC_VER) && defined(__clang__)
+    // clang for Windows (the HIP build): CPUID and XGETBV with iq_isa's x512 bits, because clang's __builtin_cpu_* need
+    // compiler-rt's __cpu_model, which an MSVC-style link does not bring.  MSVC keeps the #else below, as before.
+    int r[4];
+    __cpuidex(r, 0, 0);
+    if (r[0] < 7) return false;
+    __cpuidex(r, 1, 0);
+    const unsigned c = (unsigned) r[2];
+    if (!((c >> 12) & 1u) || !((c >> 27) & 1u) || !((c >> 28) & 1u)) return false;   // FMA, OSXSAVE, AVX
+    if ((_xgetbv(0) & 0xE6) != 0xE6) return false;   // the OS saves the YMM and ZMM state
+    __cpuidex(r, 7, 0);
+    const unsigned b = (unsigned) r[1];
+    return ((b >> 5) & 1u) && ((b >> 16) & 1u) && ((b >> 17) & 1u) && ((b >> 30) & 1u) && ((b >> 31) & 1u) &&
+           ((b >> 8) & 1u);   // AVX2; AVX-512 F, DQ, BW, VL; BMI2
+#elif (defined(__x86_64__) || defined(_M_X64)) && (defined(__GNUC__) || defined(__clang__))
     __builtin_cpu_init();
     return __builtin_cpu_supports("avx512f") && __builtin_cpu_supports("avx512bw") && __builtin_cpu_supports("avx512vl") &&
            __builtin_cpu_supports("avx512dq") && __builtin_cpu_supports("bmi2");

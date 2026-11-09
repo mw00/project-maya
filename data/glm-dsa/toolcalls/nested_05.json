@@ -1,0 +1,77 @@
+{
+ "id": "nested_05",
+ "group": "nested",
+ "api": "openai",
+ "request": {
+  "messages": [
+   {
+    "role": "user",
+    "content": "Plot a bar chart titled 'Revenue' with two series: 2025 = 10, 12, 15 and 2026 = 11, 14, 19."
+   }
+  ],
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "plot_chart",
+     "description": "Draw a chart from data series.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "kind": {
+        "type": "string",
+        "enum": [
+         "line",
+         "bar",
+         "pie"
+        ]
+       },
+       "title": {
+        "type": "string"
+       },
+       "series": {
+        "type": "array",
+        "items": {
+         "type": "object",
+         "properties": {
+          "label": {
+           "type": "string"
+          },
+          "values": {
+           "type": "array",
+           "items": {
+            "type": "number"
+           }
+          }
+         },
+         "required": [
+          "label",
+          "values"
+         ]
+        }
+       }
+      },
+      "required": [
+       "kind",
+       "series"
+      ]
+     }
+    }
+   }
+  ]
+ },
+ "expect": {
+  "calls": [
+   {
+    "name": "plot_chart",
+    "args": {
+     "kind": "bar",
+     "title": "Revenue"
+    }
+   }
+  ],
+  "min_calls": 1,
+  "max_calls": 3,
+  "no_call": false
+ }
+}

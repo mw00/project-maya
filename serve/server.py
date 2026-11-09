@@ -71,6 +71,8 @@ from serve.response_config import ENV_KEYS as RESPONSE_ENV_KEYS, limits_from_env
 from serve.response_jobs import BackgroundJobs, JobError  # noqa: E402
 from serve.response_store import StoreBusy  # noqa: E402
 from serve.update import RESTART_EXIT, Updater  # noqa: E402
+from serve import glm_dsa_product, glm_dsa_tune  # noqa: E402  (GLM-5.3, glm-dsa: the pack test, its release gate, its knobs)
+from serve.glm_dsa_template import reads_images  # noqa: E402
 import maya_names  # noqa: E402  (tools/) the settings' names users see (MAYA_*) and the older ones the code reads
 import maya_quants  # noqa: E402  (tools/) the quants' names users see (the model first: "GLM-5.3 · Maya-S")
 
@@ -405,6 +407,11 @@ THINK_TINY_LIMIT = 1024
 # tokens later, for reasoning with no boundary at all - at most half the room the request's max_tokens leaves after
 # the budget, so the answer keeps the rest.
 THINK_GRACE = 512
+# GLM-5.3's long budget for a request that asks for Max itself (Service.think_budget_max; the owner, 2026-11-07) goes
+# only as far as the request's room allows - its max_tokens, or the context left - while this much of it stays for the
+# answer (the room the default budget leaves at a 64K context), and never below the budget every other level gets: a
+# Max answer never thinks until the limit where the default budget would have left room to answer.
+THINK_LONG_RESERVE = 32768
 # A model that writes the server's own markers inside its thinking (it quotes them while it works on them) ends the
 # engine there: the engine stops at its end-of-sequence token, the server at its stop markers - and the agent dies
 # mid-thinking.  Inside the thinking such a marker is the model's text, not the turn's end: the server skips it, and
@@ -1199,6 +1206,7 @@ class StrataEngine:
             sn = tune.get("spec_n_min")   # ... drafts it keeps whatever their confidence
             if isinstance(sn, int) and not isinstance(sn, bool) and 0 <= sn <= 15:
                 tune_keys += f" spec_n_min={sn}"
+            tune_keys += glm_dsa_tune.engine_keys(tune)   # GLM-5.3's engine knobs (nothing without them)
         bias = sampling.get("logit_bias")      # {id: bias}, checked by the handler (logit_bias_of)
         bias_key = (" logit_bias=" + ",".join(f"{int(i)}:{float(b):g}" for i, b in sorted(bias.items()))
                     if isinstance(bias, dict) and bias else "")
@@ -2391,6 +2399,11 @@ class Service:
         # the thinking budget (run config `thinking_budget`, tokens; 0 = none): a reasoning block that reaches it is
         # closed with the template's </think> and the answer follows - GLM at High can plan for 14k+ tokens
         self.think_budget = 0
+        # GLM-5.3 (glm-dsa), a request that asks for Max itself (the owner, 2026-11-07): up to this budget in
+        # think_budget's place (run(): as far as its room allows, THINK_LONG_RESERVE) while think_budget is the default
+        # (main sets it: maya_quants.GLM53_MAX_THINK_BUDGET); a budget the user sets on the dashboard clears it.  0 = the
+        # same budget at every level (every other model)
+        self.think_budget_max = 0
         # (MiniMax-M3.1 closes its reasoning with </mm:think>; its vocabulary may hold a plain "</think>" too)
         end = _special_ids("</mm:think>") if getattr(template, "minimax", False) else _special_ids("</think>")
         self.think_end_id = end[0] if end else None
@@ -2499,17 +2512,22 @@ class Service:
         if "max_tokens" in s and not req.get("max_tokens") and not req.get("max_completion_tokens"):
             req["max_tokens"] = s["max_tokens"]
         effort = s.get("reasoning_effort")
+        filled = False
         if effort:
             if api == "openai":
                 ctk = req.get("chat_template_kwargs") if isinstance(req.get("chat_template_kwargs"), dict) else {}
                 if not req.get("reasoning_effort") and not req.get("reasoning") and \
                         "enable_thinking" not in ctk and "reasoning_effort" not in ctk:
                     req["reasoning_effort"] = effort
+                    filled = True
             elif not req.get("thinking") and not req.get("output_config"):
                 if effort == "none":
                     req["thinking"] = {"type": "disabled"}
                 else:
                     req["output_config"] = {"effort": effort}
+                filled = True
+        if filled and getattr(getattr(self, "template", None), "glm_dsa", False):
+            req["_level_shared"] = True     # (GLM-5.3: the shared level is not the request's own ask - asked_max)
         return req
 
     def close_for_restart(self):
@@ -2705,10 +2723,29 @@ class Service:
         except (OSError, ValueError) as e:
             print(f"[maya] could not save the new context in {self.config_path}: {e}", flush=True)
 
+    def text_only(self) -> str | None:
+        """GLM-5.3 (glm-dsa) has no vision tower at all: its name for the words of the attachments and the page ("...
+        reads text only"); None for every other model (images there are a setup's or a setting's choice)."""
+        tpl = getattr(self, "template", None)
+        if getattr(self, "vision", None) is None and getattr(tpl, "glm_dsa", False) and not reads_images(tpl.source):
+            return glm_dsa_product.LABEL
+        return None
+
     def think_budget_info(self) -> dict:
-        """The dashboard's Thinking budget: tokens (0 = no limit), whether this model has a think block at all."""
+        """The dashboard's Thinking budget: tokens (0 = no limit), whether this model has a think block at all; and
+        GLM-5.3's for a request that asks for Max itself while the budget is the default ("max_level":
+        think_budget_max, the most it gets - absent for every other model)."""
+        top = getattr(self, "think_budget_max", 0)
         return {"budget": int(self.think_budget or 0), "supported": self.think_end_id is not None,
-                "saved": bool(self.config_path)}
+                "saved": bool(self.config_path), **({"max_level": top} if top else {})}
+
+    @staticmethod
+    def asked_max(sampling) -> bool:
+        """GLM-5.3: the request asked for Max itself (the owner, 2026-11-07: its long thinking budget is for that ask
+        only) - its own level (prepare: _think_max), not the shared Chat settings' (with_shared: _level_shared) nor a
+        level the web chat was only left at (its strata_level_default).  The run config's level never sets _think_max."""
+        s = sampling or {}
+        return s.get("_think_max") is True and not s.get("_level_shared") and s.get("strata_level_default") is not True
 
     def set_think_budget(self, value) -> dict:
         """The dashboard's Thinking budget: 0 or 256..262144 tokens.  It applies from the next request (think_budget is
@@ -2718,6 +2755,7 @@ class Service:
             raise ValueError("this model has no thinking budget")
         n = maya_quants.check_thinking_budget(value)
         self.think_budget = n
+        self.think_budget_max = 0                   # (the user's own budget: every level, GLM-5.3's Max too)
         saved = False
         if self.config_path:
             p = Path(self.config_path)
@@ -3406,9 +3444,15 @@ class Service:
         kwargs = {k: v for k, v in kwargs.items() if k != "_force_tool"}
         if force is not None and tools:
             kwargs["enable_thinking"] = False
+        own_level = kwargs.get("reasoning_effort")  # (the request's own level, before the run config's below)
         if self.default_effort and "reasoning_effort" not in kwargs and "enable_thinking" not in kwargs:
             kwargs = {**kwargs, **(deepseek_effort_kwargs(self.default_effort) if getattr(self.template, "deepseek", False)
                                   else effort_kwargs(self.default_effort))}   # the run config's thinking level
+        if getattr(self.template, "glm_dsa", False):
+            # GLM-5.3: the request asks for Max itself - its own level, not the run config's and not "auto" (the model's
+            # default) - and its prompt is rendered at Max: run() may give it the long budget (think_budget_max,
+            # asked_max).  It goes to run() with the request, as _think_resume does
+            given["_think_max"] = True if own_level == "max" and self.template.think_level(kwargs) == "max" else None
         prefill = ""
         if force is not None and tools:
             # GLM's form opens with the tool's name, Qwen's with <function=NAME>, DeepSeek's DSML with its calls block
@@ -3428,6 +3472,11 @@ class Service:
         ids = self._as_written(self.render_ids(messages, tools, kwargs, prefill))   # (Qwen3.x: the model's own ids)
         self.embeddings.path = None
         media = media_of(messages)
+        if media and self.text_only() and not media_of([m for m in messages if m.get("role") != "tool"]):
+            # GLM-5.3 (glm-dsa, text only): pictures in tool results alone (an agent read an image file, a tool took a
+            # screenshot) - its template already wrote its own note in their place ("You are unable to process this
+            # image ..."), so the agent's turn goes on instead of failing every retry; a user's picture is the 400 below
+            media = []
         images = (deepseek_images(messages) if getattr(self.template, "deepseek", False)
                   else [src for kind, src in media if kind == "image"])
         if isinstance(self.vision, ENGINE_VISION) and any(kind == "video" for kind, _ in media):
@@ -3449,6 +3498,10 @@ class Service:
             self.embeddings.path = self.vision.write(self.vision.dir / f"req-{uuid.uuid4().hex[:12]}.dsi", pics,
                                                      starts)
         elif media:
+            if self.vision is None and getattr(self.template, "glm_dsa", False) and not reads_images(self.template.source):
+                # GLM-5.3 (glm-dsa) has no vision tower: say so plainly - there is no encoder to choose
+                raise ValueError(f"{self.model} reads text only, so it cannot read images: send the request without "
+                                 "the image parts (describe the picture in text instead)")
             if self.vision is None:
                 raise ValueError("this server was started without the vision encoder (run setup again and choose "
                                  "'vision'), so it cannot read images or videos")
@@ -3549,7 +3602,7 @@ class Service:
     def chat_prompt(self, req: dict):
         """A chat request's template messages, tools and kwargs as prepare() gets them (the run config's thinking
         level included), for measuring its prompt without running it."""
-        messages, tools, kw = openai_to_messages(req, deepseek=getattr(self.template, "deepseek", False))
+        messages, tools, kw = openai_to_messages(req, deepseek=getattr(self.template, "deepseek", False), glm_dsa=getattr(self.template, "glm_dsa", False))
         kw = {k: v for k, v in kw.items() if k != "_force_tool"}
         if req.get("strata_mcp") is True and self.mcp is not None:
             own = {t.get("name") for t in tools or []}
@@ -4127,7 +4180,8 @@ class Service:
                                 stream_tools=True, dsml=getattr(self.template, "deepseek", False),
                                 token_only_end=getattr(self.template, "deepseek", False) and self.think_end_id is not None,
                                 minimax=getattr(self.template, "minimax", False),
-                                strict_tools=responses, single_tool=single_tool)
+                                strict_tools=responses, single_tool=single_tool,
+                                unions=getattr(self.template, "glm_dsa", False))
         parser = new_parser()
         # calls the loop guard blocks in this answer (prepare, _block_suffixes): {(name, args): (ToolRepeat, ids)}.
         # While there are any, the answer's calls are held back (`pending`) until it ends; one that ends it alone
@@ -4229,6 +4283,13 @@ class Service:
                 # max_tokens=4096 used to cut the thinking to ~3K tokens and close it while the model was still
                 # reasoning. The forced </think> also consumes one token of max_new, so account for it.
                 think_budget = self.think_budget
+                # GLM-5.3, a request that asks for Max itself (asked_max) while the budget is the default: the long
+                # budget (think_budget_max, 65536; the owner, 2026-11-07) as far as its room allows - max_new (its
+                # max_tokens, or the context left) keeps THINK_LONG_RESERVE for the answer - and never below the
+                # budget every level gets; the limits below apply to it alike
+                top = getattr(self, "think_budget_max", 0)
+                if top > think_budget > 0 and max_new and self.asked_max(sampling):
+                    think_budget = min(top, max(think_budget, int(max_new) - THINK_LONG_RESERVE))
                 soft = None                             # (the budget closed at a sentence's or line's end: _sliced)
                 if budgeted and max_new and int(max_new) <= THINK_TINY_LIMIT:
                     reserve_floor = max(0, int(os.environ.get("STRATA_GLM_THINK_RESERVE", "1024") or 1024))
@@ -4720,6 +4781,7 @@ def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new,
         ids, thinking, max_new = svc.prepare(messages, tools, kw, max_req, guard=svc._loop_guard_on(sampling))
         sampling["_blocked"] = kw.get("_blocked")
         sampling["_think_resume"] = kw.get("_think_resume")
+        sampling["_think_max"] = kw.get("_think_max")          # (GLM-5.3: Max's long budget, Service.asked_max)
     yield "done", {**done, "completion_tokens": total, "prompt_tokens": len(ids)}
 
 
@@ -5520,12 +5582,13 @@ def make_handler(svc: Service):
             oreq = svc.with_shared(oreq, "openai")
             oreq["_api"] = "openai"
             svc.check_request(oreq)
-            messages, tools, kw = openai_to_messages(oreq, deepseek=getattr(svc.template, "deepseek", False))
+            messages, tools, kw = openai_to_messages(oreq, deepseek=getattr(svc.template, "deepseek", False), glm_dsa=getattr(svc.template, "glm_dsa", False))
             max_new = int(oreq.get("max_tokens") or 0)
             ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, guard=svc._loop_guard_on(oreq))
             if kw.get("_prefill"):
                 oreq = {**oreq, "_prefill": kw["_prefill"]}
-            oreq = {**oreq, "_blocked": kw.get("_blocked"), "_think_resume": kw.get("_think_resume")}
+            oreq = {**oreq, "_blocked": kw.get("_blocked"), "_think_resume": kw.get("_think_resume"),
+                    "_think_max": kw.get("_think_max")}         # (GLM-5.3: Max's long budget, Service.asked_max)
             cancel = threading.Event()
             watch_client(self, cancel)
             chunks = openai_chunks(svc, oreq, ids, thinking, tools, max_new, cancel)
@@ -5853,7 +5916,14 @@ def make_handler(svc: Service):
                                  "version": MAYA_VERSION, "mcp_tools": bool(svc.mcp), "unloaded": svc.unloaded,
                                  # the web chat sends past answers' thinking back (a Qwen3.x template keeps it): the
                                  # history then reads as the model wrote it, and the next turn goes on from there
-                                 "history_thinking": bool(getattr(svc.template, "keeps_thinking", False))})
+                                 "history_thinking": bool(getattr(svc.template, "keeps_thinking", False)),
+                                 # GLM-5.3 (glm-dsa) alone: no vision tower at all - the page's attachments say so
+                                 # (not "images are off": no setting turns them on)
+                                 **({"text_only": True} if svc.text_only() else {}),
+                                 # GLM-5.3 alone, while its budget is the default: the most a Max its user picks may
+                                 # think (the page then marks a level left at the default: strata_level_default)
+                                 **({"thinking_budget_max": svc.think_budget_max}
+                                    if getattr(svc, "think_budget_max", 0) else {})})
             elif path == "/api/context":
                 # the dashboard's Context size: the range, the measured cost of the current size, a reload's state
                 if self._authorized():
@@ -6077,7 +6147,8 @@ def make_handler(svc: Service):
                     # scanned PDF's pages as pictures, before anything reads the messages (serve/attach.py)
                     attach.expand_request(req, {"/v1/responses": "responses", "/v1/messages": "anthropic"}.get(
                         path, "openai"), want_images=svc.vision is not None,
-                        text_limit=text_file_limit(svc.engine.max_context))
+                        text_limit=text_file_limit(svc.engine.max_context),
+                        **({"text_only": svc.text_only()} if svc.text_only() else {}))   # (GLM-5.3's words)
                 if path == "/v1/chat/completions":
                     self._openai(req)
                 elif path == "/v1/responses":
@@ -6260,7 +6331,8 @@ def make_handler(svc: Service):
             # the same text-file cap health advertises (the page's own limit), and the same images flag: a model
             # without vision gets a clear error instead of pictures its request would drop
             self._json(200, attach.extract(name, raw, want_images=svc.vision is not None,
-                                           text_limit=text_file_limit(svc.engine.max_context)))
+                                           text_limit=text_file_limit(svc.engine.max_context),
+                                           **({"text_only": svc.text_only()} if svc.text_only() else {})))
 
         def _sse(self):
             # token frames are small and flushed as they come; Nagle would otherwise hold one
@@ -6336,7 +6408,7 @@ def make_handler(svc: Service):
         def _response_work(self, req, sampling, history, validation, owner, cancel, response_id=None, persist=True):
             sampling = dict(sampling)
             # Shared thinking defaults must be resolved by the same normalizer as request values.
-            messages, tools, kw = openai_to_messages(sampling)
+            messages, tools, kw = openai_to_messages(sampling, glm_dsa=getattr(svc.template, "glm_dsa", False))
             max_new = int(sampling.get("max_completion_tokens") or sampling.get("max_tokens") or 0)
             events = None
             svc.embeddings.path = None
@@ -6349,6 +6421,7 @@ def make_handler(svc: Service):
                     sampling["_prefill"] = kw["_prefill"]
                 sampling["_blocked"] = kw.get("_blocked")
                 sampling["_think_resume"] = kw.get("_think_resume")
+                sampling["_think_max"] = kw.get("_think_max")          # (GLM-5.3: Max's long budget, Service.asked_max)
                 effective = {**svc.sampling_defaults, **svc.shared, **sampling}
                 config = {**req, **{k: effective[k] for k in ("temperature", "top_p") if k in effective}}
                 run = svc.run(ids, thinking, tools, max_new, sampling, cancel)
@@ -6368,7 +6441,7 @@ def make_handler(svc: Service):
             req = svc.with_shared(req, "openai")
             req["_api"] = "web" if req.get("strata_resume") is True else "openai"   # the Monitor's request table
             svc.check_request(req)                             # a bad sampling field or logit_bias: a 400, now
-            messages, tools, kw = openai_to_messages(req, deepseek=getattr(svc.template, "deepseek", False))
+            messages, tools, kw = openai_to_messages(req, deepseek=getattr(svc.template, "deepseek", False), glm_dsa=getattr(svc.template, "glm_dsa", False))
             max_req = max_new = int(req.get("max_completion_tokens") or req.get("max_tokens") or 0)   # 0/-1: the rest
             use_mcp = req.get("strata_mcp") is True and svc.mcp is not None      # the web app's opt-in (serve/mcp.py)
             own = {t.get("name") for t in tools or []}
@@ -6386,6 +6459,7 @@ def make_handler(svc: Service):
                 req = {**req, "_prefill": kw["_prefill"]}
             req = {**req, "_blocked": kw.get("_blocked")}      # calls the loop guard blocks (Service.prepare)
             req = {**req, "_think_resume": kw.get("_think_resume")}
+            req = {**req, "_think_max": kw.get("_think_max")}          # (GLM-5.3: Max's long budget, Service.asked_max)
             _debug_req("openai", req, messages, tools, max_new, thinking, len(ids))
             cancel = threading.Event()
             if not (req.get("stream") and req.get("strata_resume") is True):   # (the web app's runs on, by design)
@@ -6475,13 +6549,14 @@ def make_handler(svc: Service):
             req = svc.with_shared(req, "anthropic")
             req["_api"] = "anthropic"
             svc.check_request(req)                             # a bad sampling field: a 400, now
-            messages, tools, kw = anthropic_to_messages(req, deepseek=getattr(svc.template, "deepseek", False))
+            messages, tools, kw = anthropic_to_messages(req, deepseek=getattr(svc.template, "deepseek", False), glm_dsa=getattr(svc.template, "glm_dsa", False))
             max_new = int(req.get("max_tokens") or 0)                  # 0/-1: the rest of the context
             ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, guard=svc._loop_guard_on(req))
             if kw.get("_prefill"):                             # a required tool call starts the answer
                 req = {**req, "_prefill": kw["_prefill"]}
             req = {**req, "_blocked": kw.get("_blocked")}      # calls the loop guard blocks (Service.prepare)
             req = {**req, "_think_resume": kw.get("_think_resume")}
+            req = {**req, "_think_max": kw.get("_think_max")}          # (GLM-5.3: Max's long budget, Service.asked_max)
             _debug_req("anthropic", req, messages, tools, max_new, thinking, len(ids))
             cancel = threading.Event()
             watch_client(self, cancel)
@@ -6661,6 +6736,8 @@ def chat_template_path(tpath) -> Path:
     tpl = Path(tpath) / "chat_template.jinja"
     tpl = tpl if tpl.exists() else ROOT / "serve/chat_template.jinja"
     glm5 = ROOT / "serve/glm5_chat_template.jinja"
+    if glm_dsa_product.pack_is_glm_dsa(Path(tpath).parent):   # GLM-5.3 (glm-dsa): its own template, never Flash's
+        return tpl if tpl.exists() and tpl.parent == Path(tpath) else glm_dsa_product.TEMPLATE
     if glm5.exists() and os.environ.get("MAYA_PACK_TEMPLATE") != "1" and tpl != glm5:
         head = tpl.read_text(encoding="utf-8", errors="replace")
         if head.startswith("[gMASK]<sop>") and "reasoning_effort in ['low', 'high']" in head:
@@ -6681,6 +6758,16 @@ def checked_config_effort(cfg: dict, template, maya: bool) -> dict:
         except ValueError as e:
             raise SystemExit(f"[maya] config reasoning_effort: {e}")
     return cfg
+
+
+def think_budget_at_max(template, cfg: dict, budget: int) -> int:
+    """GLM-5.3 (glm-dsa, its template's flag): the most a request that asks for Max itself may think while `budget` is
+    the run config's default (maya_quants.GLM53_MAX_THINK_BUDGET: 65536; the owner, 2026-11-07) - the server's
+    Service.think_budget_max (run: as far as the request's room allows).  0 (the same budget at every level) for a
+    budget the user set, for no budget, and for every other model."""
+    if getattr(template, "glm_dsa", False) and budget > 0 and maya_quants.thinking_budget_is_default(cfg):
+        return maya_quants.GLM53_MAX_THINK_BUDGET
+    return 0
 
 
 def sampling_defaults_from_config(cfg: dict) -> dict:
@@ -6971,7 +7058,10 @@ def main() -> int:
     # 137 -> 6 ms a render), so the server uses the copy shipped here (serve/glm5_chat_template.jinja) for a GLM-5
     # pack.  MAYA_PACK_TEMPLATE=1 keeps the pack's own.  Read before the load: it tells the model's family, by which
     # the config's reasoning_effort is checked here, not after the minutes of loading (#807)
-    template = ChatTemplate(chat_template_path(tpath))
+    glm_dsa = glm_dsa_product.config_is_glm_dsa(cfg) or glm_dsa_product.pack_is_glm_dsa(tpath.parent)
+    template = ChatTemplate(chat_template_path(tpath), glm_dsa=glm_dsa)
+    if glm_dsa:
+        print(f"[maya] GLM-5.3 (glm-dsa), text only; chat template: {template.dialect.describe()}", flush=True)
     cfg = checked_config_effort(cfg, template, a.engine == "maya")
     if a.engine == "maya":
         if not cfg:
@@ -7074,8 +7164,13 @@ def main() -> int:
     svc.think_budget = int(cfg["thinking_budget"] if cfg.get("thinking_budget") is not None else
                            maya_quants.default_thinking_budget(cfg) if a.engine == "maya" else 32768)         if svc.think_end_id is not None else 0
     svc.idle_unload_s = max(0.0, a.idle_unload if a.idle_unload is not None else float(cfg.get("idle_unload_s") or 0))
+    # GLM-5.3 (glm-dsa): a request that asks for Max itself may think up to 65536 tokens while the budget is the
+    # default (the owner, 2026-11-07); a budget the user set applies at every level (Service.think_budget_max)
+    svc.think_budget_max = think_budget_at_max(svc.template, cfg, svc.think_budget)
     if svc.think_budget:
-        print(f"[maya] thinking budget: {svc.think_budget} tokens (then the answer)", flush=True)
+        at_max = f", up to {svc.think_budget_max} when a request asks for Max" \
+            if svc.think_budget_max > svc.think_budget else ""
+        print(f"[maya] thinking budget: {svc.think_budget} tokens{at_max} (then the answer)", flush=True)
     svc.model_management = model_management_setting(cfg)   # ("model_management": true: llama.cpp's load/unload/sse)
     if svc.model_management:
         print("[maya] model management: on (/models/load, /models/unload, /models/sse)", flush=True)

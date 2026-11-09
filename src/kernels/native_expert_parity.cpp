@@ -42,7 +42,7 @@ int main(int argc, char** argv) {
     for (int i = 2; i < argc; ++i) layers.push_back(std::atoi(argv[i]));
     if (layers.empty()) layers = {0, 1, 2, 3, 20, 47};
     const int NT = 3, E = 7;
-    const int64_t H = 2560, FF = 640;
+    int64_t H = 2560, FF = 640;   // glm-dsa B13.1: set per layer from the gate tensor below
     int failures = 0;
     cudaStream_t s;
     cudaStreamCreate(&s);
@@ -53,6 +53,7 @@ int main(int argc, char** argv) {
             for (int r = 0; r < 3; ++r)
                 if (ti.name == "blk." + std::to_string(l) + ".ffn_" + roles[r] + "_exps.weight") t[r] = &ti;
         if (!t[0] || !t[1] || !t[2]) { std::printf("layer %d: no expert tensors\n", l); ++failures; continue; }
+        H = (int64_t) t[0]->shape[0], FF = (int64_t) t[0]->shape[1];   // glm-dsa B13.1: the file's geometry
         cpu::NativeFmt f;
         std::string err;
         if (!cpu::native_fmt((int) t[0]->type, (int) t[2]->type, H, FF, f, err)) {
@@ -243,9 +244,12 @@ int main(int argc, char** argv) {
             cudaMemcpy(ddst, idx, NT * 4, cudaMemcpyHostToDevice);
             cudaMemcpy(dtok, idx, NT * 4, cudaMemcpyHostToDevice);
             strata::kernels::quantize_q8_1_rows((const float*) dx, NT, H, dxq, s);
-            strata::kernels::native_expert_grouped(L, dptr, dstart, dn, ddst, dtok, 1, NT, dxq, dscr, dout, s);
+            // glm-dsa B13.1: a type pair with no kernel fails this layer (NaN: not finite below) and the run goes on
+            const bool ran =
+                strata::kernels::native_expert_grouped(L, dptr, dstart, dn, ddst, dtok, 1, NT, dxq, dscr, dout, s);
             cudaStreamSynchronize(s);
-            cudaMemcpy(got_g.data(), dout, got_g.size() * 4, cudaMemcpyDeviceToHost);
+            if (ran) cudaMemcpy(got_g.data(), dout, got_g.size() * 4, cudaMemcpyDeviceToHost);
+            else got_g.assign(got_g.size(), NAN);
             cudaFree(dblob); cudaFree(dx); cudaFree(dxq); cudaFree(dscr); cudaFree(dout); cudaFree(dptr);
             cudaFree(dstart); cudaFree(dn); cudaFree(ddst); cudaFree(dtok);
         }

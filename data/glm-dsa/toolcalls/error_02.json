@@ -1,0 +1,74 @@
+{
+ "id": "error_02",
+ "group": "error_reply",
+ "api": "openai",
+ "request": {
+  "messages": [
+   {
+    "role": "user",
+    "content": "Convert 50 USD to XYZ."
+   },
+   {
+    "role": "assistant",
+    "content": "",
+    "tool_calls": [
+     {
+      "id": "call_2",
+      "type": "function",
+      "function": {
+       "name": "convert_currency",
+       "arguments": "{\"amount\": 50, \"from\": \"USD\", \"to\": \"XYZ\"}"
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "tool_call_id": "call_2",
+    "content": "{\"error\": \"unsupported currency: XYZ\"}"
+   }
+  ],
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "convert_currency",
+     "description": "Convert an amount of money between two ISO 4217 currencies.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "amount": {
+        "type": "number"
+       },
+       "from": {
+        "type": "string"
+       },
+       "to": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "amount",
+       "from",
+       "to"
+      ]
+     }
+    }
+   }
+  ]
+ },
+ "expect": {
+  "calls": [],
+  "min_calls": 0,
+  "max_calls": 2,
+  "no_call": false,
+  "must_not_repeat": {
+   "name": "convert_currency",
+   "args": {
+    "amount": 50,
+    "from": "USD",
+    "to": "XYZ"
+   }
+  }
+ }
+}

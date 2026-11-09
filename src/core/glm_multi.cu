@@ -12,6 +12,7 @@
 // different sequences at the same time: the first card on sequence C while the last one is on A.  The host only waits
 // for the oldest sequence's token (multi_take), and issues that sequence's next one right away.
 #include "glm_fast_state.hpp"
+#include "glm_residual.hpp"   // glm-dsa B2.3 (W6 fix)
 
 #include <cstdio>
 #include <cstdlib>
@@ -42,6 +43,7 @@ void Glm5Model::seq_bind(int s) {
     std::swap(o.dsa_ig, dsa_ig_);
     std::swap(o.dsa_pool, dsa_pool_);
     o.kv = kv_;   // (KV streaming: the bound sequence's stream lives in kv_, its SeqCtx holds none)
+    std::swap(o.lay, lay_);   // glm-dsa B4.1
     SeqCtx& n = seq_[(size_t) s];
     state_ = n.state;
     pos_ = n.pos;
@@ -65,6 +67,7 @@ void Glm5Model::seq_bind(int s) {
     std::swap(n.dsa_pool, dsa_pool_);
     kv_ = n.kv;
     n.kv = nullptr;
+    std::swap(n.lay, lay_);   // glm-dsa B4.1
     cur_seq_ = s;
 }
 
@@ -75,41 +78,30 @@ void Glm5Model::seq_bind_all(int s) {
 // load_pack's state layout (fast path) for a context of ctx tokens: the residual pair, then the NextN block's DSA
 // caches, then this part's layers - the offsets into c's vectors, the bytes returned
 uint64_t Glm5Model::seq_layout(int64_t ctx, SeqCtx& c) const {
+    // glm-dsa B4.1: the layout descriptor (glm_state_carve) - Flash's offsets are the ones this function computed by
+    // hand in v1.1.55 (residual pair, NextN block, then the part's layers; FP16 / INT8 latents; the 8192 + 64 ring;
+    // KV streaming's kv_resident_cells rows), glm-dsa's its own; the sequence keeps the layout (seq_bind swaps it)
     const Glm5Geometry& g = g_;
-    const int64_t hc_dim = (int64_t) g.hc * g.n_embd;
-    const int64_t max_pools = ctx / g.idx_kpool;
-    int64_t floats = 2 * hc_dim;
-    // (KV streaming: the arena holds the VRAM slots of kv_resident_cells positions, as load_pack lays it out)
     const int64_t kv_cells = kv_resident_cells(g.idx_kpool, ctx);
     const int64_t lat_rows = kv_cells > 0 ? kv_cells : ctx;
-    const int64_t lat_floats = lat_q8_ ? (int64_t) gf::lat8_rec_bytes(g.kv_lora) / 4 * lat_rows
-                                       : (int64_t) g.kv_lora * lat_rows / 2;
-    for (auto* v : {&c.kda_S, &c.kda_conv, &c.dsa_lat, &c.dsa_ik, &c.dsa_ig, &c.dsa_pool})
-        v->assign((size_t) g.n_layers + 1, 0);
-    c.ik_ring = (int) std::min<int64_t>(ctx, 8192 + 64);
-    const auto dsa = [&](int il) {
-        c.dsa_lat[(size_t) il] = floats;
-        floats += lat_floats;
-        c.dsa_ik[(size_t) il] = floats;
-        floats += (int64_t) g.idx_key * c.ik_ring;
-        c.dsa_ig[(size_t) il] = floats;
-        floats += (int64_t) g.idx_key * c.ik_ring;
-        c.dsa_pool[(size_t) il] = floats;
-        floats += (int64_t) g.idx_key * max_pools;
-    };
-    if (mtp_il_ >= 0) dsa(mtp_il_);
-    for (int il = l0_; il < l1_; ++il) {
-        if (g.is_recr(il)) {
-            c.kda_S[(size_t) il] = floats;
-            floats += (int64_t) g.d_inner() * g.kda_head_dim;
-            c.kda_conv[(size_t) il] = floats;
-            floats += (int64_t) 3 * g.d_inner() * (g.d_conv - 1);
-        } else {
-            dsa(il);
-        }
+    GlmStateLayout L;
+    std::string err;
+    if (!glm_state_carve(g, l0_, l1_, mtp_il_, ctx, lat_q8_ ? GlmStateMode::Int8 : GlmStateMode::Fp16,
+                         glm_state_fast_ik_ring(ctx), L, err, lat_rows)) {
+        std::fprintf(stderr, "glm multi: %s\n", err.c_str());
+        c.bytes = 0;
+        return 0;
     }
+    c.kda_S = L.kda_S;
+    c.kda_conv = L.kda_conv;
+    c.dsa_lat = L.dsa_lat;
+    c.dsa_ik = L.dsa_ik;
+    c.dsa_ig = L.dsa_ig;
+    c.dsa_pool = L.dsa_pool;
+    c.ik_ring = L.ik_ring;
     c.max_ctx = ctx;
-    c.bytes = (uint64_t) floats * sizeof(float);
+    c.bytes = L.bytes;
+    c.lay = std::move(L);
     return c.bytes;
 }
 
@@ -180,7 +172,7 @@ bool Glm5Model::seq_alloc_arenas(std::string& err) {
     // several conversations drafting at once (STRATA_GLM_MULTI_MTP): their windows' buffers, before the pool too
     if (multi_mtp_setting() > 0 && !mtpw_alloc(err)) return false;
     // one GPU decodes the sequences together; opt-in split rows need the same activations on every part, before its pool
-    if (n_parts_ == 1 || split_rows_setting() > 0) return rows_alloc(err);
+    if ((n_parts_ == 1 || split_rows_setting() > 0) && glm_rows_ok(g_.arch)) return rows_alloc(err);   // glm-dsa takes the pipelined path
     return true;
 }
 
@@ -194,7 +186,7 @@ bool Glm5Model::seq_pipe_ready(std::string& err) {
         cudaSetDevice(m->dev_);
         for (auto& c : m->seq_) {
             if (c.hop_h != nullptr) continue;
-            if (cudaHostAlloc((void**) &c.hop_h, (size_t) g.hc * g.n_embd * sizeof(float), cudaHostAllocPortable) !=
+            if (cudaHostAlloc((void**) &c.hop_h, glmres::res_hop_bytes(g), cudaHostAllocPortable) !=
                     cudaSuccess ||
                 cudaHostAlloc((void**) &c.emb_h, (size_t) g.n_embd * sizeof(float), cudaHostAllocPortable) !=
                     cudaSuccess ||
@@ -237,10 +229,10 @@ bool Glm5Model::multi_issue(int s, int32_t token, const strata::kernels::Sampler
     if (const float* img = image_row(p)) std::memcpy(c.emb_h, img, (size_t) g.n_embd * sizeof(float));
     cudaSetDevice(dev_);
     cudaMemcpyAsync(F->emb, c.emb_h, (size_t) g.n_embd * sizeof(float), cudaMemcpyHostToDevice, F->cs);
-    gf::embed_streams(F->emb, state_, g.n_embd, F->cs);
+    glmres::res_embed(g, F->emb, state_, F->cs);   // glm-dsa B2.3 (mHC: gf::embed_streams)
     if (!fast_layers(p, false, err)) return false;
     Glm5Model* tail = this;
-    const size_t hop = (size_t) g.hc * g.n_embd * sizeof(float);
+    const size_t hop = glmres::res_hop_bytes(g);   // glm-dsa B2.3
     for (Glm5Model* B = split_next_.get(); B != nullptr; B = B->split_next_.get()) {
         SeqCtx& ca = tail->seq_[(size_t) s];
         cudaSetDevice(tail->dev_);
@@ -256,8 +248,8 @@ bool Glm5Model::multi_issue(int s, int32_t token, const strata::kernels::Sampler
     FastState* FT = tail->fast_;
     SeqCtx& ct = tail->seq_[(size_t) s];
     cudaSetDevice(tail->dev_);
-    gf::head_prep(tail->state_, tail->w_.at("output_norm.weight"), g.norm_eps, g.n_embd, FT->head_x, FT->head_xq,
-                  FT->cs);
+    glmres::res_head(g, tail->state_, tail->w_.at("output_norm.weight"), FT->head_x, FT->head_xq, FT->cs);   // glm-dsa B2.3
+    tail->mtp_carry_note(p, FT->head_x, FT->cs);   // glm-dsa B15.3: the NextN carrier of this sequence
     const WSlot& ow = tail->ws_map_.at("output.weight");
     gf::MvJob o = {ow.q, FT->head_xq, FT->head_x, tail->sc_ + tail->sc_logits, nullptr, 1.0f, ow.type, g.n_embd,
                    g.n_vocab};

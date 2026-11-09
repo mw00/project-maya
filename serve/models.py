@@ -27,6 +27,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 import maya_names  # noqa: E402  (tools/) a setting under either of its names
 import maya_quants  # noqa: E402  (tools/) the quants' names users see, and each config's family
+from serve import glm_dsa_product as G53  # noqa: E402  GLM-5.3 (744B, glm-dsa): what its engine serves today
 
 SWITCH_FILE = ".maya-switch.json"           # the server's note to maya.py: start this config next (a switch)
 DELETE_FILE = ".maya-delete.json"           # ... and to the next server: delete this config (it was the one running)
@@ -255,6 +256,11 @@ def choices(cfg: dict) -> dict:
     if family(cfg) == "qwen":                          # (images: the setup's maya-vision entry, on or kept off)
         return {"draft": ["mtp", "none"] if qwen_mtp(cfg) is not None else ["none"],
                 "images": bool(cfg.get("vision") or cfg.get("vision_off"))}
+    if G53.config_is_glm_dsa(cfg):
+        # GLM-5.3 (744B): text only (no vision tower), its NextN block drafts (DFlash2's drafter is GLM-5.3-Flash's),
+        # and what its engine serves today - KV streaming, answers at once decoded together (glm_dsa_product)
+        return {"draft": ["mtp"], "images": False, "text_only": True, "dflash2": False,
+                "kv_streaming": G53.KV_STREAMING, "batched": G53.BATCHED_ROWS}
     f = dflash_file(cfg)
     return {"draft": ["mtp", "dflash2"] if f is not None else ["mtp"],
             "images": bool(cfg.get("vision") or cfg.get("vision_off"))}
@@ -302,7 +308,22 @@ def settings_of(cfg: dict) -> dict:
                parallel=_int(flag(args, "--parallel"), 1), draft="dflash2" if flag(args, "--dflash") else "mtp",
                expert_cache=None if ec == "auto" else _int(ec), prefill=None if pf == "auto" else _int(pf),
                kv_streaming=glm_streams(cfg), kv_resident=_int(flag(args, "--kv-resident")))
+    if not G53.KV_STREAMING and G53.config_is_glm_dsa(cfg):   # (GLM-5.3: its whole cache in VRAM - apply() writes it)
+        out.update(kv_streaming=False, kv_resident=None)
     return out
+
+
+def glm53_kv_bytes(cfg: dict) -> int | None:
+    """A GLM-5.3 (glm-dsa) config's cache bytes a context token (glm_dsa_product.kv_bytes_per_token) with the formats
+    its engine runs: the INT8 latent unless --kv fp16 or MAYA_GLM_KV_INT8=0 says FP16 (the environment wins, as in the
+    engine), the index keys FP32 unless MAYA_GLM_IDX_FP16=1.  None for any other config."""
+    if not G53.config_is_glm_dsa(cfg):
+        return None
+    env = {str(k): str(v) for k, v in (cfg.get("env") or {}).items()}
+    int8 = maya_names.lookup(env, "MAYA_GLM_KV_INT8")
+    int8 = int8.strip() != "0" if int8 is not None else flag(cfg.get("args") or [], "--kv") in (None, "int8")
+    return G53.kv_bytes_per_token(G53.config_pack(cfg), int8,
+                                  str(maya_names.lookup(env, "MAYA_GLM_IDX_FP16", "")).strip() == "1")
 
 
 def glm_streams(cfg: dict) -> bool:
@@ -503,15 +524,19 @@ def apply(cfg: dict, settings: dict) -> dict:
         conf = _dec(s, "dspark_conf", 0, 1, "Draft confidence")
         args = set_flag(args, "--dspark-conf", f"{conf:g}") if conf is not None else drop_flag(args, "--dspark-conf")
     else:
+        dsa = G53.config_is_glm_dsa(cfg)                # GLM-5.3 (744B): what its engine takes (choices)
         par = _num(s, "parallel", 1, 8, "Answers at once", none_ok=False)
         args = set_flag(args, "--parallel", par) if par > 1 or "--parallel" in args else args
         if s.get("draft") not in can["draft"]:
-            raise ValueError("Drafting: the DFlash2 drafter is not on this PC (the setup's --draft dflash2 downloads "
+            raise ValueError("Drafting: GLM-5.3 drafts with its own MTP (NextN) block" if dsa else
+                             "Drafting: the DFlash2 drafter is not on this PC (the setup's --draft dflash2 downloads "
                              "it)" if s.get("draft") == "dflash2" else "Drafting: MTP or DFlash2")
         if s["draft"] == "dflash2":
             args = set_flag(args, "--dflash", dflash_file(cfg))
         else:
             args = drop_flag(args, "--dflash")
+        if dsa and s.get("images"):
+            raise ValueError("Images: GLM-5.3 reads text only (the model has no vision tower)")
         if s.get("images") and not out.get("vision"):
             if not out.get("vision_off"):
                 raise ValueError("Images: this model was set up without its image encoder (the setup adds it)")
@@ -528,11 +553,21 @@ def apply(cfg: dict, settings: dict) -> dict:
         pf = _num(s, "prefill", 64, 65536, "Prompt chunk")
         if pf is not None or "--prefill" in args:
             args = set_flag(args, "--prefill", "auto" if pf is None else pf)
-        if "--kv-streaming" in args or bool(s.get("kv_streaming")) != glm_streams(cfg):
-            args = set_flag(args, "--kv-streaming", "on" if s.get("kv_streaming") else "off")
-        kr = _num(s, "kv_resident", 1024, 1048576, "Positions kept in VRAM")
-        args = set_flag(args, "--kv-resident", kr) if kr is not None and s.get("kv_streaming") else \
-            drop_flag(args, "--kv-resident")
+        if dsa and not G53.KV_STREAMING:
+            # GLM-5.3: the engine keeps its whole cache in VRAM for now (a window below the context does not start) -
+            # asked for, a clear no; a config with it (an older setup's "on", a window) gets it off, so every context
+            # starts
+            if settings.get("kv_streaming") or (_int(settings.get("kv_resident"), 0) or 0) > 0:
+                raise ValueError("KV streaming: not served on GLM-5.3 yet - its whole attention cache stays in VRAM")
+            if "--kv-streaming" in args or glm_streams(cfg):
+                args = set_flag(args, "--kv-streaming", "off")
+            args = drop_flag(args, "--kv-resident")
+        else:
+            if "--kv-streaming" in args or bool(s.get("kv_streaming")) != glm_streams(cfg):
+                args = set_flag(args, "--kv-streaming", "on" if s.get("kv_streaming") else "off")
+            kr = _num(s, "kv_resident", 1024, 1048576, "Positions kept in VRAM")
+            args = set_flag(args, "--kv-resident", kr) if kr is not None and s.get("kv_streaming") else \
+                drop_flag(args, "--kv-resident")
     out["args"] = args
     return out
 
@@ -598,6 +633,8 @@ def quant_label(cfg: dict, path: Path) -> str:
     """The files a config runs, as shown after the model's name ("Maya-XS", "UD-Q8_K_XL", "EXL3 3.5 bpw" - the setup's
     names, maya_quants); else its installer key, or the config's own name for one the setup did not write."""
     fam, key = family(cfg), maya_quants.config_key(cfg)
+    if maya_quants.is_glm53(cfg):                      # (GLM-5.3, 744B: "UD-IQ2_M" after its own name)
+        return str(maya_quants.glm53_quant(key) or path.stem.removeprefix("maya-").removesuffix("-hip"))
     what = maya_quants.tier(fam, key) or maya_quants.OTHERS.get((fam, key)) or OTHER_QUANTS.get((fam, str(key).lower()))
     what = maya_quants.exl3_bits(cfg) or what          # (an EXL3 quant set up by hand: its folder's bits, maya_quants)
     return str(what or key or path.stem.removeprefix("maya-").removesuffix("-hip"))
@@ -628,7 +665,10 @@ def describe(path: Path, running: str | None) -> dict:
     cur = shown_settings(cfg)
     setup = dict(inst.get("as_set_up") or cur)
     setup["env"] = shown_env(setup.get("env"))
-    return {"file": path.name, "path": str(path), "model": cfg.get("model_name") or "", "family": family(cfg),
+    # GLM-5.3 (744B): its name on screen beside the quant, and its cache's bytes a context token for the Context size's
+    # line (the page's GLM_KV_BYTES is GLM-5.3-Flash's) - keys only its configs have
+    own = {"shown": G53.LABEL, "kv_bytes": glm53_kv_bytes(cfg)} if G53.config_is_glm_dsa(cfg) else {}
+    return {**own, "file": path.name, "path": str(path), "model": cfg.get("model_name") or "", "family": family(cfg),
             "quant": quant_label(cfg, path), "backend": cfg.get("backend") or "cuda", "written": inst.get("written"),
             "used": used, "running": running is not None and str(path.resolve()) == str(Path(running).resolve()),
             "port": cfg.get("port"), "script": script, "folder": str(pack.parent) if pack else None,
@@ -794,11 +834,19 @@ def turbo_on(cfg: dict) -> bool:
     return isinstance(cfg.get("turbo"), dict)
 
 
+def turbo_hidden(cfg: dict) -> bool:
+    """Turbo is not offered for GLM-5.3 (744B, glm-dsa) until its own values are measured on it (the owner,
+    2026-11-06): TURBO_ENV's GLM values were tuned on GLM-5.3-Flash's 45 layers."""
+    return G53.config_is_glm_dsa(cfg)
+
+
 def turbo_info(cfg: dict) -> dict:
     """What the page needs: whether Turbo is on, and what switching it on would change (before -> after)."""
     cur = settings_of(cfg)
     if turbo_on(cfg):
         return {"on": True, "family": family(cfg), "since": cfg["turbo"].get("since"), "plan": {}}
+    if turbo_hidden(cfg):                              # (the page shows no Turbo button)
+        return {"on": False, "family": family(cfg), "plan": {}, "env": {}, "hidden": True}
     patch = turbo_patch(cfg)
     return {"on": False, "family": family(cfg),
             "plan": {k: {"from": cur.get(k), "to": v} for k, v in patch.items() if k != "env"},
@@ -813,6 +861,8 @@ def turbo_enable(path: Path) -> dict:
         raise ValueError(f"{Path(path).name}: not a config Maya can read")
     if turbo_on(cfg):
         raise ValueError("Turbo is already on")
+    if turbo_hidden(cfg):
+        raise ValueError("Turbo is not offered for GLM-5.3 yet: its settings are measured on GLM-5.3-Flash")
     cur, patch = settings_of(cfg), turbo_patch(cfg)
     new = apply(cfg, patch)
     new["turbo"] = {"since": time.strftime("%Y-%m-%d %H:%M:%S"),

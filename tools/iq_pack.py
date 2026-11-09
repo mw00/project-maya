@@ -98,6 +98,7 @@ GLM5NEXT_NATIVE_OK = (
     "token_embd.weight", "output.weight",
 )
 ARCHITECTURES = ("qwen4exp", "glm5-next", "glm5next")   # unsloth spells it without the hyphen
+ARCHITECTURES += ("glm-dsa",)   # glm-dsa: GLM-5.3 744B, packed by tools/strata/glm_dsa_pack.py (B1.6)
 
 
 def needs_bf16(name: str, type_name: str, arch: str = "qwen4exp") -> bool:
@@ -377,6 +378,8 @@ def main() -> int:
     if arch not in ARCHITECTURES:
         print("general.architecture is %r; the packer knows %s" % (arch, " and ".join(ARCHITECTURES)))
         return 1
+    if arch == "glm-dsa":   # glm-dsa (B1.6): the per-arch lists, upcasts and the MTP block live in tools/strata/
+        sys.path.insert(0, str(HERE / "strata")); import glm_dsa_pack; return glm_dsa_pack.pack(a, src, out)  # noqa: E401,E702
     if arch in ("glm5-next", "glm5next"):
         # two spellings in the wild: llama.cpp's canonical "glm5-next" (llama-arch.cpp L156) and
         # unsloth's "glm5next" - the KV PREFIX follows the same spelling, so it is read per file

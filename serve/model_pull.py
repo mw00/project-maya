@@ -18,6 +18,7 @@ sys.path.insert(0, str(ROOT / "tools"))
 import maya_quants as Q  # noqa: E402  (tools/) the quants the setup offers
 
 from serve import models  # noqa: E402
+from serve import glm_dsa_product as G53  # noqa: E402  GLM-5.3 (744B, glm-dsa)
 
 # the setup's progress line: "12.3 / 96.5 GB (13%) · 40 MB/s · 4 files at once"
 PROGRESS = re.compile(r"([\d.]+) / ([\d.]+) GB(?: \((\d+)%\))?(?: · ([\d.]+) MB/s)?")
@@ -117,7 +118,27 @@ def catalog(root: Path, glm_sizes: dict | None = None, cfg: dict | None = None, 
         out.append({"id": ident, "family": fam, "name": _other_name(fam, key), "group": "other", "by": by,
                     "note": _note(fam, key, backend), "installed": (fam, key) in have,
                     "size_gb": sizes.get(key) if fam == "glm" else extra.get(ident)})
+    # GLM-5.3 (744B, glm-dsa): its downloads (maya.G53_MODELS) - NVIDIA from V100 on and AMD, not
+    # on Metal; the id is the setup's --model name in lower case (Puller.start lowers what it is given)
+    if backend != "metal" and (backend == "hip" or not ccs or max(ccs) >= G53_MIN_CC):
+        for key, m in _g53_downloads().items():
+            out.append({"id": key.lower(), "family": "glm", "name": G53.LABEL + Q.SEP + Q.glm53_quant(key),
+                        "group": "other", "by": m["repo"].split("/")[0], "note": "text only",
+                        "installed": ("glm", key) in have, "size_gb": m.get("download_gb")})
     return out
+
+
+G53_MIN_CC = 70                                      # (GLM-5.3's kernels: V100 on - the owner's scope, 2026-11-07)
+
+
+def _g53_downloads() -> dict:
+    """GLM-5.3's downloads (maya.G53_MODELS)."""
+    try:
+        sys.path.insert(0, str(ROOT))
+        import maya                                    # (the setup's own table; nothing runs on import)
+        return dict(maya.G53_MODELS)
+    except Exception:  # noqa: BLE001 - a catalog entry is a nicety
+        return {}
 
 
 _other_gb: dict = {}

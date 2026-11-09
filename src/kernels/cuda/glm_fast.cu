@@ -12,6 +12,8 @@
 #include "strata/kernels/glm_expert_bench.hpp"
 #include <cstring>
 #endif
+#include "strata/kernels/glmd_random_route.hpp"   // glm-dsa B15.7
+#include "strata/core/glm_req_knobs.hpp"   // glm-dsa request knobs
 
 #if !defined(STRATA_USE_HIP)
 #include <cuda_bf16.h>
@@ -29,6 +31,7 @@
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>   // glm-dsa: std::memcpy for glmd_mv_dots.cuh's host path (included below, inside the namespace)
 #include <string>
 
 #if defined(STRATA_USE_HIP)
@@ -162,7 +165,7 @@ __device__ __forceinline__ float block_max(float v, float* sh) {
 __device__ __forceinline__ void q8_1_store_warp(float v, block_q8_1* dst, int lane) {
     const float amax = warp_max(fabsf(v));
     const float sum = warp_sum(v);
-    // the scale and the sum stay finite in FP16 (Strata #1448: an activation past ~8.3M overflowed the scale to inf,
+    // the scale and the sum stay finite in FP16 (upstream #1448: an activation past ~8.3M overflowed the scale to inf,
     // and the dot products to NaN); below that nothing changes
     const float d = fminf(amax / 127.0f, 65504.0f);
     const int8_t q = amax == 0.0f ? 0 : (int8_t) fmaxf(-127.0f, fminf(127.0f, roundf(v / d)));
@@ -2140,6 +2143,7 @@ __global__ void __launch_bounds__(256) mvc_kernel_bf16(const STRATA_GRID_CONSTAN
             if (lane == 0) J.y[c * J.y_cstride + row] = mv_out(J.alpha, v, J.bias ? J.bias[row] : 0.0f);
         }
 }
+#include "glmd_mv_ext.cuh"   // glm-dsa B10.6/B10.7: more mv types and the sm_70 GEMV variants (ext_mv)
 
 #if defined(STRATA_USE_HIP)
 // ---------------------------------------------------------------- the dense GEMV on RDNA3 (gfx11)
@@ -3945,8 +3949,16 @@ struct RouteArgs {
                                 // whose share of the route's weights is below this is left out (0: none) ...
     int res_k;                  // ... STRATA_GLM_RESIDENT_TOPK: only the res_k heaviest of the route's experts run
                                 // (0: all); the top-1 always runs, the kept weights are renormalised when the model's are
+    int norm_mode;              // glm-dsa B5.1: kRouteNormClamp (Maya, llama.cpp) or kRouteNormHf (glm-dsa, + 1e-20)
+    unsigned long long rand_seed = 0;   // glm-dsa B15.7: STRATA_GLM_RANDOM_ROUTING's seed (0: the router's own ids)
 };
 
+// kExt: the glm-dsa additions to the route - the HF weight normalisation (norm_mode, B5.1) and the bench mode's random
+// ids (rand_seed, B15.7) - are compiled into their own instance only.  moe_route launches kExt = false for Maya's
+// route (the clamp normalisation, no bench seed: GLM-5.3-Flash), which is v1.1.56's kernel line for line: in the one
+// shared kernel the extra branch and its local arrays moved the whole kernel's register allocation and schedule
+// (nvcc 12.4, sm_70: 72 registers / 64 B of stack -> 64 / 176 B).  Same arithmetic either way.
+template <bool kExt>
 __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const STRATA_GRID_CONSTANT RouteArgs a) {
     const int tid = threadIdx.x, lane = tid & 31;
     const long long rp_t0 = clock64();
@@ -4002,6 +4014,7 @@ __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const STRATA_G
     if (a.rank_sel) topk_rank(s_sel, E, a.k, s_ids, a.near_n, s_near);
     else if (E <= 512) topk_warp(s_sel, E, a.k, s_ids);
     else topk_argmax(s_sel, E, a.k, s_ids, s_bv, s_bi);
+    if (kExt && a.rand_seed != 0ull && tid == 0) glmd::random_route_apply(a.rand_seed, (uint32_t) a.layer, *a.d.seq, E, a.k, s_ids, s_p);   // glm-dsa B15.7
     ROUTE_MARK(1);   // the top k
     if (tid == 0)
         for (int i = 0; i < a.k; ++i)
@@ -4162,7 +4175,7 @@ __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const STRATA_G
         const float pv = tid < a.k ? s_p[s_ids[tid]] : 0.0f;
         double sum = 0.0;
         for (int i = 0; i < a.k; ++i) sum += (double) __shfl_sync(0xffffffffu, pv, i);
-        inv_w = (float) (a.norm_w ? 1.0 / fmax(sum, 6.103515625e-5) : 1.0);
+        inv_w = (float) (!a.norm_w ? 1.0 : kExt && a.norm_mode == kRouteNormHf ? 1.0 / (sum + 1e-20) : 1.0 / fmax(sum, 6.103515625e-5))   /* glm-dsa B5.1 */;
         if (lane_plan) {
             const float msw = skipped ? 0.0f : a.miss_skip_w;
             const bool light = msw > 0.0f && (float) ((double) pv * inv_w) < msw;
@@ -4187,7 +4200,7 @@ __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const STRATA_G
         if (!a.fast) {
             double sum = 0.0;
             for (int i = 0; i < a.k; ++i) sum += (double) s_p[s_ids[i]];
-            inv = (float) (a.norm_w ? 1.0 / fmax(sum, 6.103515625e-5) : 1.0);
+            inv = (float) (!a.norm_w ? 1.0 : kExt && a.norm_mode == kRouteNormHf ? 1.0 / (sum + 1e-20) : 1.0 / fmax(sum, 6.103515625e-5))   /* glm-dsa B5.1 */;
         }
         unsigned int mask = 0, fetch = 0, promo = 0, cpu = 0, skip = 0;
         // RESIDENT_SKIP_W / _TOPK: the experts the token goes without, wherever they live (not for a token past a wrong
@@ -4208,7 +4221,7 @@ __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const STRATA_G
                 if (out) drop |= 1u << i;
                 else kept += (double) v;
             }
-            if (a.norm_w && drop != 0u) inv = (float) (1.0 / fmax(kept, 6.103515625e-5));
+            if (a.norm_w && drop != 0u) inv = (float) (kExt && a.norm_mode == kRouteNormHf ? 1.0 / (kept + 1e-20) : 1.0 / fmax(kept, 6.103515625e-5));
         }
         unsigned long long* rtab = a.d.tab + a.d.n_keys;
         unsigned long long* spares = a.d.tab + 2 * (size_t) a.d.n_keys + (size_t) a.layer * kSpares;
@@ -4472,7 +4485,7 @@ __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const STRATA_G
         __threadfence_system();
         rq->seq = s_seq;
 #if defined(__HIPCC__)
-        // The CPU polls this signal without a stream query. As in Strata #697,
+        // The CPU polls this signal without a stream query. As in upstream #697,
         // publish the signal itself after publishing the request payload.
         __threadfence_system();
 #endif
@@ -5275,16 +5288,18 @@ __global__ void embed_tok_kernel(const void* __restrict__ table, int type, int n
     out[e] = __half2float(b->d) * (float) sc[is + 2 * quarter] * (float) (int8_t) (q - 32);
 }
 
-// cat = [rms(emb) * enorm, rms(h) * hnorm] as q8_1 (eh_proj's input); n_embd <= 4096, one block of 1024
+// cat = [rms(emb) * enorm, rms(h) * hnorm] as q8_1 (eh_proj's input); NV 4: n_embd <= 4096 (glm5-next), NV 8: up to
+// kMaxEmbd (glm-dsa); one block of 1024, the same sums for n <= 4096 either way
+template <int NV>
 __global__ void __launch_bounds__(1024) mtp_in_kernel(const float* __restrict__ emb, const float* __restrict__ h,
                                                       const float* __restrict__ enorm, const float* __restrict__ hnorm,
                                                       float eps, int n, block_q8_1* __restrict__ catq) {
     __shared__ float sred[32];
     const int tid = threadIdx.x, lane = tid & 31;
-    float a[4], b[4];
+    float a[NV], b[NV];
     float sa = 0.0f, sb = 0.0f;
 #pragma unroll
-    for (int i = 0; i < 4; ++i) {
+    for (int i = 0; i < NV; ++i) {
         const int e = tid + 1024 * i;
         a[i] = e < n ? emb[e] : 0.0f;
         b[i] = e < n ? h[e] : 0.0f;
@@ -5295,23 +5310,24 @@ __global__ void __launch_bounds__(1024) mtp_in_kernel(const float* __restrict__ 
     sb = block_sum(sb, sred);
     const float ia = rsqrtf(sa / (float) n + eps), ib = rsqrtf(sb / (float) n + eps);
 #pragma unroll
-    for (int i = 0; i < 4; ++i) {
+    for (int i = 0; i < NV; ++i) {
         const int e = tid + 1024 * i;
         if (e >= n) break;
         q8_1_store_warp(a[i] * ia * enorm[e], catq + e / 32, lane);
         q8_1_store_warp(b[i] * ib * hnorm[e], catq + (n + e) / 32, lane);
     }
 }
-// h += add (when given), then x = rms(h) * w and its q8_1; n_embd <= 4096, one block of 1024
+// h += add (when given), then x = rms(h) * w and its q8_1; n_embd <= 1024 NV, one block of 1024
+template<int NV>
 __global__ void __launch_bounds__(1024) rms_q8_kernel(float* __restrict__ h, const float* __restrict__ add,
                                                       const float* __restrict__ w, float eps, int n,
                                                       float* __restrict__ x, block_q8_1* __restrict__ xq) {
     __shared__ float sred[32];
     const int tid = threadIdx.x, lane = tid & 31;
-    float v[4];
+    float v[NV];
     float ss = 0.0f;
 #pragma unroll
-    for (int i = 0; i < 4; ++i) {
+    for (int i = 0; i < NV; ++i) {
         const int e = tid + 1024 * i;
         float t = e < n ? h[e] : 0.0f;
         if (add != nullptr && e < n) {
@@ -5324,7 +5340,7 @@ __global__ void __launch_bounds__(1024) rms_q8_kernel(float* __restrict__ h, con
     ss = block_sum(ss, sred);
     const float inv = rsqrtf(ss / (float) n + eps);
 #pragma unroll
-    for (int i = 0; i < 4; ++i) {
+    for (int i = 0; i < NV; ++i) {
         const int e = tid + 1024 * i;
         if (e >= n) break;
         const float xv = v[i] * inv * w[e];
@@ -5404,7 +5420,7 @@ int mv_type_ok(int t) {
         case kTypeF32: case kTypeBF16: case 12: case 13: case 14: case 8: case 16: case 18: case 19: case 23: case 10: case 11:
         case 17: case 22: case 21: case 29: return 1;
         case exl3::kTypeEXL3: return 1;   // forwarded to the EXL3 kernels (mv below)
-        default: return 0;
+        default: return ext_mv_type_ok(t);   // glm-dsa B10.7
     }
 }
 
@@ -5417,10 +5433,20 @@ void launch_check(const char* what) {
         g_launch_errors.fetch_add(1, std::memory_order_relaxed);
     }
 }
+// a shape a kernel cannot take (B2.2): refused before the launch and counted like a failed launch, so the forward
+// that asked for it fails instead of computing on stale buffers
+void shape_refused(const char* what, int n) {
+    std::fprintf(stderr, "glm_fast %s: shape %d unsupported (refused)\n", what, n);
+    g_launch_errors.fetch_add(1, std::memory_order_relaxed);
+}
 
 }  // namespace
 
-bool mv_supported(int type) { return mv_type_ok(type) != 0; }
+// Maya's list (v1.1.55): what the Flash setup and the DFlash2 drafter accept.  mv() itself serves the glm-dsa extra
+// types too (mv_type_ok's default), which only glm-dsa binds (mv_supported_ext).
+bool mv_supported(int type) { return mv_type_ok(type) != 0 && ext_mv_type_ok(type) == 0; }
+bool mv_supported_ext(int type) { return mv_type_ok(type) != 0; }   // glm-dsa B10.7: + Q4_0/Q4_1/Q5_0/Q5_1/IQ4_NL/F16
+bool mv_dsa(const MvJob* jobs, int n, cudaStream_t s, int cfg) { return ext_mv_dsa(jobs, n, s, cfg); }   // glm-dsa L1-4
 
 bool moe_supported(int type) {   // moe_gate_up's and moe_down's instantiations
     return type == 8 || type == 10 || type == 11 || type == 12 || type == 13 || type == 14 || type == 16 || type == 17 ||
@@ -5447,7 +5473,7 @@ size_t row_bytes(int type, int64_t n_in) {
         case 22: return (size_t) (n_in / 256) * sizeof(block_iq2_s);
         case 21: return (size_t) (n_in / 256) * sizeof(block_iq3_s);
         case 29: return (size_t) (n_in / 256) * sizeof(block_iq1_m);
-        default: return 0;
+        default: return ext_row_bytes(type, n_in);   // glm-dsa B10.7
     }
 }
 
@@ -5641,11 +5667,13 @@ bool mv(const MvJob* jobs, int n, cudaStream_t s) {
             return false;
         }
     if (!mv_inputs_ok(jobs, n, "mv")) return false;
+    if (!ext_mv_shape_ok(jobs, n, 1)) return false;   // glm-dsa B10.7: the new types take one column only
     // the jobs of the common dense types go to a kernel compiled for their type (one launch per type present), the
     // rest to the generic one; the jobs are independent, so their order does not matter
     static const bool typed = getenv("STRATA_GLM_MV_GENERIC") == nullptr;
     constexpr int kTyped[] = {14, 8, 12, 13};
     bool done[kMaxMvJobs] = {};
+    ext_mv(jobs, n, done, s);   // glm-dsa B10.6/B10.7: the jobs glmd_mv_ext.cuh serves
     // EXL3 weights (w: an exl3::Mat): their own kernels, F32 input when the job has it, else the q8_1 - a job of
     // several columns (a verify window's tokens) as one EXL3 job a column
     if (!exl3_jobs(jobs, n, 0, done, s)) return false;
@@ -5903,6 +5931,7 @@ bool mv_nt(const MvJob* jobs, int n, int nt, cudaStream_t s) {
             return false;
         }
     if (!mv_inputs_ok(jobs, n, "mv_nt")) return false;
+    if (!ext_mv_shape_ok(jobs, n, nt)) return false;   // glm-dsa B10.7: the new types take one activation only
     static const bool typed = getenv("STRATA_GLM_MV_GENERIC") == nullptr;
     bool done[kMaxMvJobs] = {};
     if (!exl3_jobs(jobs, n, nt, done, s)) return false;   // (EXL3: one EXL3 job an activation)
@@ -6038,6 +6067,10 @@ void hc(const HcArgs& a, cudaStream_t s) {
         launch_check("hc2");
         return;
     }
+    if (a.n_embd > 4096) {   // hc_kernel's s_mixed[4096] (mHC only: glm-dsa has no hyper-connections)
+        shape_refused("hc", a.n_embd);
+        return;
+    }
     const int blocks = 4 * a.n_embd / HC_CHUNK;
     hc_kernel<<<blocks, HC_THREADS, 0, s>>>(a);
     launch_check("hc");
@@ -6050,6 +6083,10 @@ void hc_post(const float* block_out, const float* R_old, const float* post, cons
 }
 
 void head_prep(const float* R, const float* norm_w, float eps, int n_embd, float* x, void* xq, cudaStream_t s) {
+    if (n_embd <= 0 || n_embd > 4096 || n_embd % 32 != 0) {   // sm[4096]: the mHC head only (glm5-next)
+        shape_refused("head_prep", n_embd);
+        return;
+    }
     head_prep_kernel<<<1, 1024, 0, s>>>(R, norm_w, eps, n_embd, x, (block_q8_1*) xq);
     launch_check("head_prep");
 }
@@ -6069,6 +6106,7 @@ void kda_rec(const float* q, const float* k, const float* v, const float* g1, co
              cudaStream_t s) {
     if (head_dim != 128) {
         std::fprintf(stderr, "glm_fast kda_rec: head_dim %d (the kernel is built for 128)\n", head_dim);
+        g_launch_errors.fetch_add(1, std::memory_order_relaxed);
         return;
     }
     kda_rec_kernel<<<n_head, 256, 0, s>>>(q, k, v, g1, beta_raw, state, g2, norm_w, eps, n_head,
@@ -6602,7 +6640,12 @@ void moe_route(const float* logits, const float* bias, int n_expert, int k, floa
                int max_prefetch, const float* ahead_logits, const float* const* ahead_bias, int n_ahead,
                int skip_from, unsigned long long cpu_plan, int promote_min, int pf_rank, int near_n, int win,
                unsigned int* scr_used, int win_n, int disk_skip_from, float disk_skip_w, float miss_skip_w,
-               int win_rows, bool resident_ok) {
+               int win_rows, bool resident_ok, int norm_mode) {
+    if (const char* why = moe_limits_error(n_embd, k, n_expert)) {   // glm-dsa: fail closed, never past x[kMaxEmbd]
+        std::fprintf(stderr, "glm_fast moe_route: n_embd %d, k %d, n_expert %d refused: %s\n", n_embd, k, n_expert, why);
+        g_launch_errors.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
     RouteArgs a{logits, bias, n_expert, k, w_scale, norm_w ? 1 : 0, layer, x, n_embd, d,
                 sh_gate, sh_up, sh_limit, n_ff_sh, (block_q8_1*) sh_hq, pred_logits, pred_bias, max_prefetch,
                 ahead_logits, {}, 0, skip_from, d.cpu_seq != nullptr ? cpu_plan : 0ull, promote_min,
@@ -6613,6 +6656,8 @@ void moe_route(const float* logits, const float* bias, int n_expert, int k, floa
         return v ? std::max(0.0f, (float) std::atof(v)) : 0.0f;
     }();
     a.affinity = affinity;
+    a.norm_mode = norm_mode;   // glm-dsa B5.1
+    a.rand_seed = glmd::random_routing_seed();   // glm-dsa B15.7 (0 unless STRATA_GLM_RANDOM_ROUTING=1)
     // STRATA_GLM_RESIDENT_SKIP_W / STRATA_GLM_RESIDENT_TOPK (changes the answers; Turbo): read once; 0 = off
     static const float res_w = [] {
         const char* v = getenv("STRATA_GLM_RESIDENT_SKIP_W");
@@ -6669,11 +6714,17 @@ void moe_route(const float* logits, const float* bias, int n_expert, int k, floa
         for (int i = 0; i < a.n_ahead; ++i) a.ahead_bias[i] = ahead_bias[i];
     }
     const int blocks = 1 + (n_ff_sh + ROUTE_THREADS - 1) / ROUTE_THREADS;
-    moe_route_kernel<<<blocks, ROUTE_THREADS, 0, s>>>(a);
+    // the glm-dsa instance only for what needs it (the HF normalisation, a bench seed); Maya's route: v1.1.56's kernel
+    if (a.norm_mode != kRouteNormClamp || a.rand_seed != 0ull) moe_route_kernel<true><<<blocks, ROUTE_THREADS, 0, s>>>(a);
+    else moe_route_kernel<false><<<blocks, ROUTE_THREADS, 0, s>>>(a);
     launch_check("moe_route");
 }
 
 void moe_wait(const MoeDev& d, int n_embd, cudaStream_t s) {
+    if (n_embd <= 0 || n_embd > kMaxEmbd) {
+        shape_refused("moe_wait", n_embd);
+        return;
+    }
     moe_wait_kernel<<<1, 256, 0, s>>>(d, n_embd);
     launch_check("moe_wait");
 }
@@ -6686,6 +6737,10 @@ void moe_cpu_wait_streams(const MoeDev& d, int n_embd, const float* post, float*
 
 void moe_cpu_wait(const MoeDev& d, int n_embd, float* out, cudaStream_t s) {
     if (d.cpu_seq == nullptr) return;
+    if (n_embd <= 0 || n_embd > kMaxEmbd) {
+        shape_refused("moe_cpu_wait", n_embd);
+        return;
+    }
     moe_cpu_wait_kernel<<<1, 256, 0, s>>>(d, n_embd, out);
     launch_check("moe_cpu_wait");
 }
@@ -6700,10 +6755,12 @@ void moe_prefetch(const MoeDev& d, size_t blob_bytes, cudaStream_t s) {
     }
     // half the SMs: it runs beside the main stream's kernels.  STRATA_GLM_PREFETCH_BLOCKS=<n>: n blocks instead - a
     // PCIe pull needs few SMs to keep the link busy, and every SM it holds is one the main stream's kernels wait for
-    static const int blocks_env = [] {
+    static const int blocks_start = [] {   // glm-dsa request knobs: the start value
         const char* v = getenv("STRATA_GLM_PREFETCH_BLOCKS");
         return v != nullptr ? std::max(1, std::atoi(v)) : 0;
     }();
+    const int blocks_env = strata::core::glmknob::get(strata::core::glmknob::PrefetchBlocks,
+                                                      blocks_start);   // glm-dsa request knobs: GEN prefetch_blocks=
     moe_prefetch_kernel<<<blocks_env > 0 ? blocks_env : std::max(1, sms / 2), 256, 0, s>>>(d, (blob_bytes + 15) / 16);
     launch_check("moe_prefetch");
 }
@@ -6868,6 +6925,7 @@ void moe_gate_up(int gu_type, const MoeDev& d_in, int k, int n_embd, int n_ff, f
     }
 #endif
     const bool sh = sh_down != nullptr && sh_out != nullptr;
+    if (sh && !ext_shared_down_ok(sh_type)) return;   // glm-dsa B10.7: a type the fused shared down cannot dot
     const dim3 grid((unsigned) (n_ff / GU_ROWS), (unsigned) (k + (sh ? 1 : 0)));
     const auto* X = (const block_q8_1*) xq;
     auto* H = (block_q8_1*) hq;
@@ -6883,7 +6941,10 @@ void moe_gate_up(int gu_type, const MoeDev& d_in, int k, int n_embd, int n_ff, f
         GLMF_GU(16) GLMF_GU(18) GLMF_GU(19) GLMF_GU(23) GLMF_GU(10) GLMF_GU(11) GLMF_GU(17) GLMF_GU(22) GLMF_GU(21) GLMF_GU(29)
         GLMF_GU(12) GLMF_GU(13) GLMF_GU(14) GLMF_GU(8)
 #undef GLMF_GU
-        default: std::fprintf(stderr, "glm_fast moe_gate_up: type %d unsupported\n", gu_type); return;
+        default:
+            std::fprintf(stderr, "glm_fast moe_gate_up: type %d unsupported\n", gu_type);
+            g_launch_errors.fetch_add(1, std::memory_order_relaxed);
+            return;
     }
     launch_check("moe_gate_up");
 }
@@ -6989,7 +7050,10 @@ void moe_down(int d_type, const MoeDev& d_in, int k, int n_embd, int n_ff, size_
         GLMF_DN(16) GLMF_DN(18) GLMF_DN(19) GLMF_DN(23) GLMF_DN(10) GLMF_DN(11) GLMF_DN(17) GLMF_DN(22) GLMF_DN(21) GLMF_DN(29)
         GLMF_DN(12) GLMF_DN(13) GLMF_DN(14) GLMF_DN(8)
 #undef GLMF_DN
-        default: std::fprintf(stderr, "glm_fast moe_down: type %d unsupported\n", d_type); return;
+        default:
+            std::fprintf(stderr, "glm_fast moe_down: type %d unsupported\n", d_type);
+            g_launch_errors.fetch_add(1, std::memory_order_relaxed);
+            return;
     }
     launch_check("moe_down");
 }
@@ -7284,12 +7348,22 @@ void tab_update(unsigned long long* tab, const int* keys, const unsigned long lo
 
 void mtp_in(const float* emb, const float* h, const float* enorm, const float* hnorm, float eps, int n, void* cat_q8_1,
             cudaStream_t s) {
-    mtp_in_kernel<<<1, 1024, 0, s>>>(emb, h, enorm, hnorm, eps, n, (block_q8_1*) cat_q8_1);
+    if (n <= 0 || n > kMaxEmbd || n % 32 != 0) {
+        shape_refused("mtp_in", n);
+        return;
+    }
+    if (n <= 4096) mtp_in_kernel<4><<<1, 1024, 0, s>>>(emb, h, enorm, hnorm, eps, n, (block_q8_1*) cat_q8_1);
+    else mtp_in_kernel<8><<<1, 1024, 0, s>>>(emb, h, enorm, hnorm, eps, n, (block_q8_1*) cat_q8_1);
     launch_check("mtp_in");
 }
 
 void rms_q8(float* h, const float* add, const float* w, float eps, int n, float* x, void* xq, cudaStream_t s) {
-    rms_q8_kernel<<<1, 1024, 0, s>>>(h, add, w, eps, n, x, (block_q8_1*) xq);
+    if (n <= 0 || n > kMaxEmbd || n % 32 != 0) {
+        shape_refused("rms_q8", n);
+        return;
+    }
+    if (n <= 4096) rms_q8_kernel<4><<<1, 1024, 0, s>>>(h, add, w, eps, n, x, (block_q8_1*) xq);
+    else rms_q8_kernel<8><<<1, 1024, 0, s>>>(h, add, w, eps, n, x, (block_q8_1*) xq);
     launch_check("rms_q8");
 }
 

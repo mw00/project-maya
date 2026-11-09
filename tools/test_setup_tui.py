@@ -159,6 +159,15 @@ class ModelName(unittest.TestCase):
         self.assertEqual(maya.FAMILY_TITLE["qwen"], "Qwen-3.8-Flash-Next")
         self.assertNotIn(maya.QWEN, maya.FAMILY_TITLE.values())
 
+    def test_a_glm_dsa_config_is_named_glm53(self):
+        cfg = {"args": ["--glm-pack", "x"]}
+        with patch.object(maya.G53, "config_is_glm_dsa", return_value=True), \
+                patch.object(maya, "config_family", return_value="glm"):
+            self.assertEqual(maya.setup_title(cfg), "GLM-5.3")
+        with patch.object(maya.G53, "config_is_glm_dsa", return_value=False), \
+                patch.object(maya, "config_family", return_value="glm"):
+            self.assertEqual(maya.setup_title(cfg), maya.FAMILY_TITLE["glm"])
+
     def test_the_bridge_hands_the_name_to_the_screen_and_nothing_to_the_log(self):
         with tempfile.TemporaryDirectory() as d:
             b = Bridge(Path(d) / "setup.log")

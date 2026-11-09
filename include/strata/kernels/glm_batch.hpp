@@ -123,7 +123,8 @@ void head_rows(const float* R, const float* w, float eps, int T, int n_embd, flo
 /// out16[t] = [rms(emb[t]) * enorm, rms(h[t]) * hnorm] in FP16 (eh_proj's input, 2 n_embd per row).
 void mtp_in_rows(const float* emb, const float* h, const float* enorm, const float* hnorm, float eps, int T, int n_embd,
                  void* out16, cudaStream_t s);
-/// x[t] = rms(in[t]) * w as F32 and FP16.  n_embd <= 4096, a multiple of 256.
+/// x[t] = rms(in[t]) * w as F32 and FP16.  n_embd <= 8192 (kMaxEmbd), a multiple of 256 (head_rows and mtp_in_rows
+/// too); any other width is refused and counted in launch_errors.
 void rms_rows(const float* in, const float* w, float eps, int T, int n_embd, float* x, void* x16, cudaStream_t s);
 
 /// The router per token (router_sigmoid's arithmetic: sigmoid, bias selection, stable top-k, normalised weights).

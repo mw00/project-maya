@@ -131,7 +131,7 @@ function ThinkBudget() {
   const bad = budgetError(text), changed = text.trim() !== String(tb.budget);
   return html`<div class="set-block">
     <label class="field"><span class="field__label">Thinking budget</span>
-      <span class="set-row__sub">Tokens, 0 = no limit. Thinking stops at this many tokens and the answer starts.${tb.saved ? "" : " Not saved: this server runs without a config."}</span>
+      <span class="set-row__sub">Tokens, 0 = no limit. Thinking stops at this many tokens and the answer starts.${(tb.max_level ? ` A Max you pick yourself (in a chat, or as Thinking above) may think longer, up to ${fmt(tb.max_level)}, while this is the default; a number saved here applies at every level.` : "") + (tb.saved ? "" : " Not saved: this server runs without a config.")}</span>
       <span class="set-row__ctl"><input id="set-think-budget" class="input input--num" inputmode="numeric" value=${text}
         aria-invalid=${changed && bad ? "true" : "false"} aria-label="Thinking budget in tokens"
         onInput=${(e) => setText(e.target.value.replace(/\D/g, ""))}
