@@ -680,7 +680,7 @@ def request_budget_of(value) -> int | None:
     if value == 0 or lo <= value <= hi:
         return value
     near = lo if value < lo else hi
-    print(f"[maya] a request's thinking_budget {str(raw)[:40]!r} is outside 0 or {lo}..{hi}: {near} used", flush=True)
+    print(f"[maya] a request's thinking_budget {repr(raw)[:40]} is outside 0 or {lo}..{hi}: {near} used", flush=True)
     return near
 
 
