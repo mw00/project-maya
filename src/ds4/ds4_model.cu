@@ -12,6 +12,7 @@
 // and after the last layer logits = head(rmsnorm(sum_s pre[s] h[s])).
 #include "ds4_model.hpp"
 #include "ds4_borrow.hpp"
+#include "ds4_cache_swap.hpp"
 #include "ds4_cpu_exl3.hpp"
 #include "ds4_ablate.hpp"
 #include "ds4_engram_io.hpp"
@@ -1764,6 +1765,7 @@ struct Model::Impl {
     struct Swap {
         int layer = 0, in = -1, out = -1;
         int ram = -1;   // (copy_mode, `in` held in RAM) the spare slot `out` is copied into from VRAM
+        bool ready = true;   // failed GGUF copies are retired without publishing the spare
         unsigned win = 0;   // (win_now at the tick that queued it)
     };
     static constexpr int kMaxSwaps = 8;
@@ -11517,7 +11519,7 @@ struct Model::Impl {
             }
             Layer& l = L[(size_t) sw.layer];
             if (l.lay.fmt == gg::kFmtMXFP4) {   // in: from the file; out: nothing to keep (the file has it)
-                swap_in_mx(l, sw, B);
+                sw.ready = swap_in_mx(l, sw, B);
                 std::lock_guard<std::mutex> lk(sw_mu);
                 sw_ready.push_back(sw);
                 continue;
@@ -12014,29 +12016,31 @@ struct Model::Impl {
         store->unpin(s);
         return true;
     }
-    void swap_in_mx(Layer& l, Swap& sw, SwapBufs& B) {
+    bool swap_in_mx(Layer& l, Swap& sw, SwapBufs& B) {
         uint8_t *sw_a = B.a, *sw_b = B.b, *sw_h = B.h;   // (this thread's)
         const std::vector<cudaStream_t>& copy_st = B.st;
         // (a copy holds its slot till this swap's switch; an in-place one the RAM store holds: from its slot)
-        bool ok = copy_mode && !l.ram.empty() && l.ram[(size_t) sw.in] >= 0
-                      ? read_mx(l, sw.in, sw_a)
-                      : store_blob(l, sw.in, sw_a) || read_mx_file(l, sw.in, sw_a);
-        for (int m = 0; m < l.nm && ok; ++m) {
+        const bool prepared = prepare_cache_swap(l.nm, [&] {
+            return copy_mode && !l.ram.empty() && l.ram[(size_t) sw.in] >= 0
+                       ? read_mx(l, sw.in, sw_a)
+                       : store_blob(l, sw.in, sw_a) || read_mx_file(l, sw.in, sw_a);
+        }, [&](int m) {
             const Layer& x = member(l, m);
-            cudaSetDevice(devs[(size_t) x.dev].id);
+            if (cudaSetDevice(devs[(size_t) x.dev].id) != cudaSuccess) return false;
             cudaStream_t cs = copy_st[(size_t) x.dev];
             if (l.nm > 1) blob_to_half(l, sw_a, m, sw_h);
-            ok = cudaMemcpyAsync(sat(l, x, l.spare_vram, unit(x)), l.nm > 1 ? sw_h : sw_a, unit(x),
-                                 cudaMemcpyHostToDevice, cs) == cudaSuccess &&
-                 cudaStreamSynchronize(cs) == cudaSuccess;
-        }
+            return cudaMemcpyAsync(sat(l, x, l.spare_vram, unit(x)), l.nm > 1 ? sw_h : sw_a, unit(x),
+                                   cudaMemcpyHostToDevice, cs) == cudaSuccess &&
+                   cudaStreamSynchronize(cs) == cudaSuccess;
+        });
+        bool ok = prepared;
         if (sw.ram >= 0) {   // `out` from its VRAM slot (each member its part) into the spare RAM slot
             bool got = ok;
             for (int m = 0; m < l.nm && got; ++m) {
                 const Layer& x = member(l, m);
-                cudaSetDevice(devs[(size_t) x.dev].id);
+                got = cudaSetDevice(devs[(size_t) x.dev].id) == cudaSuccess;
                 cudaStream_t cs = copy_st[(size_t) x.dev];
-                got = cudaMemcpyAsync(l.nm > 1 ? sw_h : sw_b, sat(l, x, l.slot[(size_t) sw.out], unit(x)),
+                got = got && cudaMemcpyAsync(l.nm > 1 ? sw_h : sw_b, sat(l, x, l.slot[(size_t) sw.out], unit(x)),
                                       unit(x), cudaMemcpyDeviceToHost, cs) == cudaSuccess &&
                       cudaStreamSynchronize(cs) == cudaSuccess;
                 if (got && l.nm > 1) half_to_blob(l, sw_h, m, sw_b);
@@ -12050,9 +12054,9 @@ struct Model::Impl {
             bool got = true;
             for (int m = 0; m < l.nm && got; ++m) {
                 const Layer& x = member(l, m);
-                cudaSetDevice(devs[(size_t) x.dev].id);
+                got = cudaSetDevice(devs[(size_t) x.dev].id) == cudaSuccess;
                 cudaStream_t cs = copy_st[(size_t) x.dev];
-                got = cudaMemcpyAsync(l.nm > 1 ? sw_h : sw_b, sat(l, x, l.slot[(size_t) sw.out], unit(x)), unit(x),
+                got = got && cudaMemcpyAsync(l.nm > 1 ? sw_h : sw_b, sat(l, x, l.slot[(size_t) sw.out], unit(x)), unit(x),
                                       cudaMemcpyDeviceToHost, cs) == cudaSuccess &&
                       cudaStreamSynchronize(cs) == cudaSuccess;
                 if (got && l.nm > 1) half_to_blob(l, sw_h, m, sw_b);
@@ -12065,10 +12069,10 @@ struct Model::Impl {
             std::vector<uint8_t> dev(l.blob), h(l.blob), file(l.blob);   // (h: the widest member's part fits)
             for (int m = 0; m < l.nm && ok; ++m) {
                 const Layer& x = member(l, m);
-                cudaSetDevice(devs[(size_t) x.dev].id);
-                cudaMemcpy(l.nm > 1 ? h.data() : dev.data(), sat(l, x, l.spare_vram, unit(x)), unit(x),
-                           cudaMemcpyDeviceToHost);
-                if (l.nm > 1) half_to_blob(l, h.data(), m, dev.data());
+                ok = cudaSetDevice(devs[(size_t) x.dev].id) == cudaSuccess;
+                if (ok) ok = cudaMemcpy(l.nm > 1 ? h.data() : dev.data(), sat(l, x, l.spare_vram, unit(x)), unit(x),
+                                        cudaMemcpyDeviceToHost) == cudaSuccess;
+                if (ok && l.nm > 1) half_to_blob(l, h.data(), m, dev.data());
             }
             ok = ok && read_mx_file(l, sw.in, file.data());
             for (int r = 0; r < 3 && ok; ++r)
@@ -12082,9 +12086,11 @@ struct Model::Impl {
             }
             std::fprintf(stderr, "ds4 cache: layer %d expert %d in, %d out%s: %s\n", l.il, sw.in, sw.out,
                          sw.ram >= 0 ? " (into RAM)" : "", ok && ok_out ? "matches the model file" : "MISMATCH");
+            ok = ok && ok_out;
         } else if (!ok) {
             std::fprintf(stderr, "ds4 cache: layer %d expert %d: the move into VRAM failed\n", l.il, sw.in);
         }
+        return ok;
     }
 
     // a tick's table entries start empty, and go to the devices in tick_flush (the recent slots' and the swaps')
@@ -12210,6 +12216,11 @@ struct Model::Impl {
         }
         for (const Swap& sw : ready) {
             Layer& l = L[(size_t) sw.layer];
+            if (discard_failed_cache_swap(sw.ready, l.swap_pending, l.sw_in, sw_inflight)) {
+                std::fprintf(stderr, "ds4 cache: layer %d expert %d: failed move discarded; active experts unchanged\n",
+                             l.il, sw.in);
+                continue;
+            }
             const int old_slot = l.slot[(size_t) sw.out];
             const std::array<uint8_t*, 4> old_parts = l.hh[(size_t) sw.in];
             if (copy_mode) {   // (`out` takes the RAM place `in` leaves: through the spare, which `in`'s slot becomes)
