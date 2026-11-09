@@ -37,9 +37,18 @@ DSpark: the DeepSeek engine decodes `mul1`; the 3 bpw repo's own drafter is `mcg
 open), so the model runs with `--dspark none`. To keep drafting, pair it with the `mul1` drafter of an EXL3 pack that
 has one: LibertAIDAI's 2.9 bpw shards `model-00042-of-00043.safetensors` / `model-00043-of-00043.safetensors` hold
 only the `mtp.*` tensors - leave the 3 bpw drafter shards (44-46) out, put the 2.9's beside the rest, and give the
-folder a `model.safetensors.index.json` whose `weight_map` lists the files that are there (the pack reads the file list
-from its values; the keys are not read). The pack then reads the main model from the 3 bpw shards and the drafter from
-the 2.9's.
+folder a `model.safetensors.index.json` whose `weight_map` lists the files that are there (the pack reads the file
+list from its values; the keys are not read):
+
+    python - <<'EOF'
+    import json, pathlib
+    m = pathlib.Path("<model folder>")
+    files = sorted(p.name for p in m.glob("*.safetensors"))
+    wm = {str(i): f for i, f in enumerate(files)}
+    (m / "model.safetensors.index.json").write_text(json.dumps({"weight_map": wm}))
+    EOF
+
+The pack then reads the main model from the 3 bpw shards and the drafter from the 2.9's.
 
 Measured, two RTX 3060 12 GB + two RTX 5060 8 GB, `DS4_SPLIT=6,6,7,21`, `--prefill-chunk 8384`: the mixed pack read
 an 111,072-token prompt in 126.0 s (881.5 tok/s, the long-prompt skip on) and decoded at 9.36 tok/s over 785 tokens
