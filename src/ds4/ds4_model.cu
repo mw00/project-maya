@@ -8761,8 +8761,8 @@ struct Model::Impl {
                          d >= 0 ? (d ? ", DS4_LAND=1" : ", DS4_LAND=0") : "");
     }
     // after the PCIe lane's timing (lane_setup): the one-GPU path on by default stays on only if some layer streams
-    // CPU-lane experts; else v1.1.27's path for the run - the copies' pins given back (the VRAM it placed experts
-    // around stays as placed until the next start, which the times file then starts on v1.1.27's path)
+    // CPU-lane experts; else v1.1.27's path for the run - decode-only pins given back (pins also used by prompt DMA
+    // stay registered). The VRAM placement stays until the next start, which starts on v1.1.27's path.
     void one_gpu_plan() {
         if (!one_auto) return;
         bool streams = false;
@@ -8780,14 +8780,19 @@ struct Model::Impl {
         if (env_tri("DS4_LAND") < 0) ln_land = false;
         gg::iq_cpu_iq1s_rows(false);
         double gb = 0;
-        if (ln_zc && env_tri("DS4_STREAM_ZC") < 0) {   // (nothing pulls them: the RAM unlocked again)
-            for (size_t c = 0; c < zc_chunk.size() && c < ram_chunks.size(); ++c)
-                if (zc_chunk[c]) {
-                    cudaHostUnregister(ram_chunks[c]);
-                    zc_chunk[c] = 0;
-                    gb += (double) ram_chunk_bytes[c] / 1e9;
-                }
-            cudaGetLastError();
+        if (ln_zc && env_tri("DS4_STREAM_ZC") < 0) {
+            // cp_pin may share these registrations with decode's zero-copy lane. Disabling that lane must not
+            // unpin the prompt path's direct-DMA sources while cp_dma remains true. zc_chunk keeps ownership for
+            // destruction; only the decode slots are disabled here when the prompt path still needs the pins.
+            if (!cp_dma) {
+                for (size_t c = 0; c < zc_chunk.size() && c < ram_chunks.size(); ++c)
+                    if (zc_chunk[c]) {
+                        cudaHostUnregister(ram_chunks[c]);
+                        zc_chunk[c] = 0;
+                        gb += (double) ram_chunk_bytes[c] / 1e9;
+                    }
+                cudaGetLastError();
+            }
             std::fill(zc_slot.begin(), zc_slot.end(), 0);
             ln_zc = false;
         }
