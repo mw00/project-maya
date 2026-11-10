@@ -898,6 +898,33 @@ class ToolBlock(unittest.TestCase):
         svc, eng, kw, calls, text, done = self.answer("Done.", call_text(other), rounds=(NMCLI, GREP))
         self.assertEqual((calls, len(eng.prompts), text), ([], 1, "Done."))
 
+    def test_an_answer_to_the_user_ends_the_turn(self):
+        # #921: a chat of short acknowledgements, tools offered and none called - "Affirmative. Loud and clear." to
+        # "can you hear me" was kept going (every sentence of it said before), 3 times at most, and the continuation
+        # was joined to it without a space ("clear.I am still here")
+        from serve.frontend import openai_to_messages
+        other = "grep -n on_bytes host/bellhost/bridge.py"
+        ack = "Acknowledged. Standing by for the next command."
+        req = agent(user="all tests pass")
+        for _ in range(3):
+            req["messages"] += [{"role": "assistant", "content": ack}, {"role": "user", "content": "do you mean standing by"}]
+        msgs, tools, kw = openai_to_messages(req)
+        self.assertTrue(LG.echoes(msgs))                                # the conversation repeats itself ...
+        self.assertTrue(LG.answers_user(msgs))                          # ... and the model answers the user
+        self.assertFalse(LG.answers_user(openai_to_messages(agent(NMCLI))[0]))   # (a tool result: it works on)
+        eng = ScriptEngine(Tok(), ack, call_text(other))
+        svc = Server().service(eng)
+        ids, thinking, max_new = svc.prepare(msgs, tools, kw, 2000)
+        events = [x for k, x in svc.run(ids, thinking, tools, max_new, {"_blocked": kw.get("_blocked")},
+                                        threading.Event()) if k == "event"]
+        self.assertEqual("".join(e.text for e in events if e.kind == "content"), ack)   # the model's own stop ends it
+        self.assertEqual((len(eng.prompts), svc.metrics()["loop_guard"]["kept_going"]), (1, 0))
+        # after a tool result the rule stands, and the continuation starts a new paragraph in the client's text
+        talk = "OK \u2014 the loop guard is right. Stop repeating identical greps. Break out: use what I have."
+        svc, eng, kw, calls, text, done = self.answer(talk, "Next I read bridge.py itself.", rounds=(NMCLI,) * 4)
+        self.assertEqual((calls, len(eng.prompts), done["finish"]), ([], 2, "stop"))
+        self.assertEqual(text, talk + "\n\nNext I read bridge.py itself.")
+
     def test_what_is_not_blocked(self):
         # four runs: notes only, the call goes out
         self.assertEqual(self.answer(call_text(NMCLI[0]), rounds=(NMCLI,) * 4)[3], [NMCLI[0]])
