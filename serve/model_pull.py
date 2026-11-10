@@ -64,7 +64,7 @@ def _note(fam: str, key: str, backend: str) -> str:
 
 
 def _other_name(fam: str, key: str) -> str:
-    if fam == "glm":                                   # ("EXL3-3.05bpw" -> "GLM-5.3 · EXL3 3.05 bpw")
+    if fam == "glm":                                   # ("EXL3-3.05bpw" -> "GLM-5.3-Flash · EXL3 3.05 bpw")
         m = re.match(r"EXL3-([\d.]+)bpw$", key)
         return Q.SHOWN["glm"] + Q.SEP + (f"EXL3 {m.group(1)} bpw" if m else key)
     return Q.shown(fam, key)
@@ -119,11 +119,14 @@ def catalog(root: Path, glm_sizes: dict | None = None, cfg: dict | None = None, 
                     "note": _note(fam, key, backend), "installed": (fam, key) in have,
                     "size_gb": sizes.get(key) if fam == "glm" else extra.get(ident)})
     # GLM-5.3 (744B, glm-dsa): its downloads (maya.G53_MODELS) - NVIDIA from V100 on and AMD, not
-    # on Metal; the id is the setup's --model name in lower case (Puller.start lowers what it is given)
+    # on Metal; the id is the setup's --model name in lower case (Puller.start lowers what it is given); Maya's own
+    # quant of it ("maya": GLM-5.3-Maya-XS) among Maya's, the others by their makers
     if backend != "metal" and (backend == "hip" or not ccs or max(ccs) >= G53_MIN_CC):
         for key, m in _g53_downloads().items():
+            own = bool(m.get("maya"))
             out.append({"id": key.lower(), "family": "glm", "name": G53.LABEL + Q.SEP + Q.glm53_quant(key),
-                        "group": "other", "by": m["repo"].split("/")[0], "note": "text only",
+                        "group": "maya" if own else "other", "by": "Maya" if own else m["repo"].split("/")[0],
+                        "note": "text only",
                         "installed": ("glm", key) in have, "size_gb": m.get("download_gb")})
     return out
 

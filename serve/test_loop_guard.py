@@ -898,6 +898,23 @@ class ToolBlock(unittest.TestCase):
         svc, eng, kw, calls, text, done = self.answer("Done.", call_text(other), rounds=(NMCLI, GREP))
         self.assertEqual((calls, len(eng.prompts), text), ([], 1, "Done."))
 
+    def test_an_anthropic_tool_result_is_not_an_answer_to_the_user(self):
+        # #925's rule over Anthropic requests: a user turn of tool_result blocks (text beside them or not) is a tool
+        # result - as tool messages then a user message, or (DeepSeek) one user message with content_blocks
+        from serve.frontend import anthropic_to_messages
+        call = {"role": "assistant", "content": [{"type": "tool_use", "id": "t1", "name": "lookup", "input": {}}]}
+        result = {"type": "tool_result", "tool_use_id": "t1", "content": "found it"}
+        for turn in ([result], [result, {"type": "text", "text": "<reminder>keep going</reminder>"}]):
+            req = {"messages": [{"role": "user", "content": "find it"}, call, {"role": "user", "content": turn}]}
+            for deepseek in (False, True):
+                with self.subTest(turn=len(turn), deepseek=deepseek):
+                    self.assertFalse(LG.answers_user(anthropic_to_messages(req, deepseek=deepseek)[0]))
+        req = {"messages": [{"role": "user", "content": "find it"}, call, {"role": "user", "content": [result]},
+                            {"role": "assistant", "content": "Found it."}, {"role": "user", "content": "thanks"}]}
+        for deepseek in (False, True):
+            self.assertTrue(LG.answers_user(anthropic_to_messages(req, deepseek=deepseek)[0]))
+        self.assertFalse(LG.answers_user([]))
+
     def test_an_answer_to_the_user_ends_the_turn(self):
         # #921: a chat of short acknowledgements, tools offered and none called - "Affirmative. Loud and clear." to
         # "can you hear me" was kept going (every sentence of it said before), 3 times at most, and the continuation

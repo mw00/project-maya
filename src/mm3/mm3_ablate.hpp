@@ -22,21 +22,22 @@
 namespace mm3::ablate {
 
 /// The direction of `path` (r unit length, `dim` values); `scale` 0: 1; `layer` 0: the file's only direction.N.
-/// `what` describes the pick for the start-up log.
+/// `what` describes the pick for the start-up log; `engine` names the program in the messages (maya's GLM engine
+/// loads the same files through this function).
 inline bool load(const std::string& path, int layer, int dim, float& scale, std::vector<float>& r, std::string& what,
-                 std::string& err) {
+                 std::string& err, const char* engine = "maya-mm3") {
     try {
         strata::GgufFile g(path);
         const strata::MetaValue* type = g.get("general.type");
         if (type != nullptr && type->s == "adapter") {
-            err = path + ": an abliteration adapter (maya-ds4's: DeepSeek's tensors) - maya-mm3 takes a control vector "
-                         "(llama-cvector-generator's direction.N)";
+            err = path + ": an abliteration adapter (maya-ds4's: DeepSeek's tensors) - " + engine +
+                  " takes a control vector (llama-cvector-generator's direction.N)";
             return false;
         }
         const strata::MetaValue* arch = g.get("general.architecture");
         if (arch == nullptr || arch->s != "controlvector") {
             err = path + ": not a control vector (general.architecture " + (arch ? "\"" + arch->s + "\"" : "missing") +
-                  ") - maya-mm3 takes llama-cvector-generator's direction.N";
+                  ") - " + std::string(engine) + " takes llama-cvector-generator's direction.N";
             return false;
         }
         // (GgufFile takes general.alignment as given - 0 as its default, 32 - and one that is not a power of two -

@@ -245,8 +245,69 @@ def mm3_pack_has(cfg: dict, key: str) -> bool:
         return False
 
 
+# ------------------------------------------------------------------ refusal ablation (an optional direction file)
+# The engines that project a direction out per request (GEN ablate=1; loaded with --ablate FILE --ablate-default off):
+# maya-ds4, maya-mm3 and the `maya` engine's GLM models (GLM-5.3-Flash, GLM-5.3; not on the Mac engine).  Qwen
+# (CYBER-FROST) has none; without a direction file the dashboard shows no switch.
+ABLATE_FAMILIES = ("deepseek", "minimax", "glm")
+# a model repo's direction file (phase 2: fitted and shipped by us): <Model>-refusal-direction.gguf - a control vector
+# GGUF (general.architecture "controlvector", direction.1 F32 [n_embd]) with maya.ablate.scale / .fit_layer / .model
+# / .fitted_on / .version metadata; the setup downloads it with the model and records it as cfg["ablate"]["file"]
+ABLATE_SUFFIX = "-refusal-direction.gguf"
+
+
+def ablate_file(cfg: dict) -> Path | None:
+    """The config's direction file (cfg["ablate"]["file"], else an --ablate FILE in its args) when it is on disk."""
+    a = cfg.get("ablate") if isinstance(cfg.get("ablate"), dict) else {}
+    f = a.get("file") or flag(cfg.get("args") or [], "--ablate")
+    p = Path(str(f)).expanduser() if f else None
+    return p if p is not None and p.is_file() else None
+
+
+def ablate_choice(cfg: dict) -> dict:
+    """{"available": bool, "why": the reason when not} - the Models page's and the Chat's switch (hidden without)."""
+    fam = family(cfg)
+    if fam not in ABLATE_FAMILIES or (fam == "glm" and cfg.get("backend") == "metal"):
+        return {"available": False, "why": "not available for this model"}
+    if ablate_file(cfg) is None:
+        return {"available": False, "why": "no refusal direction file for this model (its repo ships none yet)"}
+    if fam == "minimax" and (_int(flag(cfg.get("args") or [], "--tp"), 0) or 0) > 0:
+        return {"available": False, "why": "not with the tensor-parallel split (Tensor parallel: 0 offers it)"}
+    return {"available": True, "why": ""}
+
+
+def ablate_default(cfg: dict) -> bool:
+    """The Models page's default for requests that leave `ablate` out: cfg["ablate"]["default"] (off unless set), or
+    the config's sampling.ablate."""
+    a = cfg.get("ablate") if isinstance(cfg.get("ablate"), dict) else {}
+    return a.get("default") is True or (cfg.get("sampling") or {}).get("ablate") is True
+
+
+def ablate_args(cfg: dict, args: list) -> list:
+    """args with the direction loaded, off by default (--ablate FILE --ablate-default off), where it can be; without
+    a direction file (or on an engine without the projection) none of the three flags - the command as before."""
+    for f in ("--ablate", "--ablate-default", "--ablate-layer", "--ablate-scale"):
+        args = drop_flag(args, f)
+    p = ablate_file(cfg)
+    if p is None or family(cfg) not in ABLATE_FAMILIES or (family(cfg) == "glm" and cfg.get("backend") == "metal"):
+        return args
+    a = cfg.get("ablate") if isinstance(cfg.get("ablate"), dict) else {}
+    args = set_flag(args, "--ablate", str(p))
+    args = set_flag(args, "--ablate-default", "off")
+    if a.get("scale") is not None:   # (the file's own maya.ablate.scale otherwise)
+        args = set_flag(args, "--ablate-scale", a["scale"])
+    return args
+
+
 def choices(cfg: dict) -> dict:
-    """What this config can be set to beyond what it is: a drafter and an image encoder that exist on this PC."""
+    """What this config can be set to beyond what it is: a drafter and an image encoder that exist on this PC, and the
+    refusal-ablation switch (ablate_choice)."""
+    out = _choices(cfg)
+    out["ablate"] = ablate_choice(cfg)
+    return out
+
+
+def _choices(cfg: dict) -> dict:
     if family(cfg) == "minimax":
         return {"draft": ["dspark", "none"] if mm3_pack_has(cfg, "dspark.num_hidden_layers") else ["none"],
                 "images": mm3_pack_has(cfg, "vision.hidden_size")}
@@ -270,7 +331,9 @@ def choices(cfg: dict) -> dict:
 def settings_of(cfg: dict) -> dict:
     args = cfg.get("args") or []
     env = {str(k): str(v) for k, v in (cfg.get("env") or {}).items()}
-    out = {"context": _int(flag(args, "--max-context"), 32768), "gpus": gpus_of(cfg), "env": env}
+    out = {"context": _int(flag(args, "--max-context"), 32768), "gpus": gpus_of(cfg), "env": env,
+           # (refusal ablation: the default for requests that leave `ablate` out - ablate_default)
+           "ablate": ablate_default(cfg)}
     if family(cfg) == "minimax":                       # (maya-mm3's own defaults where the config names none)
         vision, kvs = flag(args, "--vision"), flag(args, "--kv-streaming")
         out.update(images=vision == "on" or (vision is None and mm3_pack_has(cfg, "vision.hidden_size")),
@@ -371,13 +434,26 @@ def apply(cfg: dict, settings: dict) -> dict:
         raise ValueError("the settings must be a JSON object")
     fam = family(cfg)
     ds4 = fam == "deepseek"
-    known = {"minimax": MM3_KEYS, "deepseek": DS4_KEYS, "qwen": QWEN_KEYS}.get(fam, GLM_KEYS)
+    known = {"minimax": MM3_KEYS, "deepseek": DS4_KEYS, "qwen": QWEN_KEYS}.get(fam, GLM_KEYS) + ("ablate",)
     unknown = sorted(set(settings) - set(known))
     if unknown:
         raise ValueError(f"not a setting of this model: {', '.join(unknown)}")
     s = {**settings_of(cfg), **settings}
     can = choices(cfg)
     out = copy.deepcopy(cfg)
+    # refusal ablation's default (cfg["ablate"]["default"]: requests without `ablate` take it; not an engine setting -
+    # no restart, the direction stays loaded and each request asks); on only where the switch is (ablate_choice)
+    if not isinstance(s.get("ablate"), bool):
+        raise ValueError("Refusal ablation: on or off")
+    if s["ablate"] and settings.get("ablate") is True and not can["ablate"]["available"]:
+        raise ValueError("Refusal ablation: " + can["ablate"]["why"])
+    if isinstance(out.get("ablate"), dict):
+        if s["ablate"]:
+            out["ablate"]["default"] = True
+        else:
+            out["ablate"].pop("default", None)
+    if not s["ablate"] and isinstance(out.get("sampling"), dict):
+        out["sampling"].pop("ablate", None)
     args = [str(a) for a in out.get("args") or []]
     args = set_flag(args, "--max-context", _num(s, "context", 1024, 1048576, "Context size", none_ok=False))
 
@@ -568,6 +644,8 @@ def apply(cfg: dict, settings: dict) -> dict:
             kr = _num(s, "kv_resident", 1024, 1048576, "Positions kept in VRAM")
             args = set_flag(args, "--kv-resident", kr) if kr is not None and s.get("kv_streaming") else \
                 drop_flag(args, "--kv-resident")
+    if isinstance(out.get("ablate"), dict):   # (a direction the setup recorded: loaded, off by default)
+        args = ablate_args(out, args)
     out["args"] = args
     return out
 

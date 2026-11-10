@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import pathlib
 import struct
 import sys
@@ -36,6 +37,57 @@ from st import SafeTensors  # noqa: E402
 
 TEMPLATE = HERE / "chat_template.jinja"   # (a model repo without its own chat_template.jinja)
 MUL1 = 0x83DCD12D                          # the engine's mul1 codebook multiplier
+TOWER = ("vision.", "aligner.")            # the vision tower's and its aligner's tensors
+MARKS = ("image_start", "image_newline", "image_end")   # the picture span's marker rows (BF16 too)
+SHARD1 = "model-00001-of-00048.safetensors"   # DeepSeek's checkpoint: shard 1 holds only the tower, in BF16
+
+
+def flat_patch(name: str, shape: tuple) -> tuple:
+    """The patch embedding as the engine reads it, [hidden][3 * patch * patch] - a [hidden][3][p][p] copy is the same
+    bytes in the same order."""
+    if name == "vision.patch_embed.proj.weight" and len(shape) > 2:
+        return (shape[0], int(np.prod(shape[1:])))
+    return tuple(shape)
+
+
+def vision_bf16(st, model: pathlib.Path, vdir: pathlib.Path | None) -> str | None:
+    """The engine reads the vision tower in BF16 only: a quant that ships its own copy in another type (turboderp's
+    EXL3 quants: F16) had its tensors count as missing and pictures off (#886).  Those tensors are taken from a BF16
+    copy instead: DeepSeek's shard 1 in the model's folder (SafeTensors keeps a name's later copies in .dup), else
+    vision_pack.py's folder (vdir: its vision.bin / vision.json, as a GGUF install makes).  The line to print: what was
+    taken from where, or why pictures stay off.  None: the tower is BF16 already, or there is none."""
+    bad = [k for k in st.t if (k.startswith(TOWER) or k in MARKS) and st.t[k][1] != "BF16"]
+    if not bad:
+        return None
+    kinds = ", ".join(sorted({st.t[k][1] for k in bad}))
+    src = set()
+    for k in bad:
+        e = next((e for e in st.dup.get(k, ()) if e[1] == "BF16"), None)
+        if e is not None:
+            fn, dt, shape, off, nb = e
+            st.t[k] = (fn, dt, flat_patch(k, shape), off, nb)
+            src.add(fn)
+    left = [k for k in bad if st.t[k][1] != "BF16"]
+    if left and vdir is not None and (vdir / "vision.json").is_file() and (vdir / "vision.bin").is_file():
+        have = {e[0]: e for e in json.loads((vdir / "vision.json").read_text())["tensors"]}
+        try:
+            rel = os.path.relpath(vdir / "vision.bin", model).replace(os.sep, "/")
+        except ValueError:     # (Windows: another drive)
+            rel = None
+        if rel is not None and " " not in rel and all(k in have and have[k][1] == "BF16" for k in left):
+            if rel not in st.files:
+                st.files.append(rel)
+            for k in left:
+                _, dt, off, nb, shape = have[k]
+                st.t[k] = (rel, dt, flat_patch(k, tuple(shape)), off, nb)
+            src.add(rel)
+            left = []
+    if not left:
+        return "  the vision tower: %d tensors in BF16 from %s (the quant's own copy is %s, which the engine does not " \
+               "read)" % (len(bad), ", ".join(sorted(src)), kinds)
+    return "  WARNING - the vision tower is %s here and the engine reads it in BF16 only: pictures stay off.  Put shard " \
+           "1 of DeepSeek's checkpoint (deepseek-ai/DeepSeek-V4.1-Flash-1017, %s, 0.97 GB: the tower in BF16) in %s " \
+           "and run this again" % (kinds, SHARD1, model)
 
 
 def need(st: SafeTensors, t: dict) -> list[str]:
@@ -197,6 +249,8 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--model", required=True)
     ap.add_argument("--out", help="default: <model>/maya-ds4")
+    ap.add_argument("--vision", help="vision_pack.py's folder, the BF16 vision tower for a quant whose own is not BF16 "
+                                     "and without DeepSeek's shard 1 beside it (default: <model>/../vision)")
     a = ap.parse_args()
     model = pathlib.Path(a.model).expanduser().resolve()
     out = pathlib.Path(a.out).expanduser() if a.out else model / "maya-ds4"
@@ -222,6 +276,7 @@ def main() -> int:
     elif any(v[1] == "F8_E4M3" and not k.startswith("vision.") and ".engram.embed." not in k and
              not (k.endswith(".weight") and k[:-len("weight")] + "trellis" in st.t) for k, v in st.t.items()):
         raise SystemExit("%s keeps dense weights in FP8: python tools/ds4/fp8_dense.py --model %s first" % (model, model))
+    vis = vision_bf16(st, model, pathlib.Path(a.vision).expanduser().resolve() if a.vision else model.parent / "vision")
     miss = need(st, t)
     if miss:
         raise SystemExit("missing tensors:\n  " + "\n  ".join(miss[:20]))
@@ -260,6 +315,8 @@ def main() -> int:
     print("%s: %d tensors in %d files, Engram %d layers x %d hash columns -> %s" %
           (model.name, len(st.t), len(st.files), nl, cols, out))
     print("  chat template: %s%s" % (tpl, "" if tpl.parent == model else " (the repo has none)"))
+    if vis:
+        print(vis)
     if nk is not None:
         print("  exl3_k_map.json: every one of %d EXL3 matrices' K agrees" % nk)
     return 0

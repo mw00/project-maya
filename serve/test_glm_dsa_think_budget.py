@@ -577,7 +577,7 @@ class WebChat(unittest.TestCase):
 
     def test_the_request_says_so(self):
         g53 = {"model": "glm-5.3", "model_label": "GLM-5.3 (744B)", "thinking_budget_max": AT_MAX}
-        flash = {"model": "glm-5.3-flash", "model_label": "GLM-5.3 · Maya-S24"}
+        flash = {"model": "glm-5.3-flash", "model_label": "GLM-5.3-Flash · Maya-S24"}
         left = self.run_page(g53, CHATS_SEND_JS)
         self.assertEqual(len(left), 1)
         self.assertEqual((left[0]["reasoning_effort"], left[0]["strata_level_default"]), ("max", True))
@@ -599,7 +599,7 @@ class WebChat(unittest.TestCase):
         self.assertEqual(out["settings_max"], {"level": "max", "picked": True, "left": False})  # (Settings' own Max)
 
     def test_every_other_model_and_a_users_own_budget_never(self):
-        for health in ({"model": "glm-5.3-flash", "model_label": "GLM-5.3 · Maya-S24"},
+        for health in ({"model": "glm-5.3-flash", "model_label": "GLM-5.3-Flash · Maya-S24"},
                        {"model": "glm-5.3", "model_label": "GLM-5.3 (744B)"}):    # (no long budget: the user's own)
             out = self.run_page(health)
             self.assertEqual({k: v["left"] for k, v in out.items()}, {k: False for k in out}, health)

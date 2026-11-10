@@ -209,8 +209,15 @@ class GlmDsaLists(unittest.TestCase):
     def test_classification(self):
         P = glm_dsa_pack.plan_tensor
         for n in ("attn_k_b", "attn_v_b", "indexer.attn_k", "indexer.attn_q_b", "indexer.proj"):
-            self.assertEqual(P("blk.7.%s.weight" % n, "Q8_0"), ("convert", "BF16"), n)
+            self.assertEqual(P("blk.7.%s.weight" % n, "Q8_0", headwise=False), ("convert", "BF16"), n)
             self.assertEqual(P("blk.7.%s.weight" % n, "BF16"), ("copy", "BF16"), n)
+        # Q8_0 W_kb / W_vb stay native by default (headwise MLA GEMVs); the other BF16-list tensors convert as before
+        with patch.dict("os.environ", {"STRATA_PACK_NATIVE32": ""}):
+            for n in ("attn_k_b", "attn_v_b"):
+                self.assertEqual(P("blk.7.%s.weight" % n, "Q8_0"), ("native", "Q8_0"), n)
+            self.assertEqual(P("blk.7.indexer.attn_k.weight", "Q8_0"), ("convert", "BF16"))
+        with patch.dict("os.environ", {"STRATA_PACK_NATIVE32": "0"}):
+            self.assertEqual(P("blk.7.attn_k_b.weight", "Q8_0"), ("convert", "BF16"))
         for n in ("attn_norm.weight", "ffn_norm.weight", "attn_q_a_norm.weight", "attn_kv_a_norm.weight",
                   "indexer.k_norm.weight", "indexer.k_norm.bias", "nextn.enorm.weight", "nextn.hnorm.weight",
                   "nextn.shared_head_norm.weight"):
@@ -330,7 +337,7 @@ class GlmDsaPack(unittest.TestCase):
         self.assertFalse(any(n.endswith("_exps.weight") for n in rows))
         self.assertEqual(rows["blk.4.nextn.eh_proj.weight"][2], "0")        # Q8_0: served natively
         self.assertEqual(rows["blk.3.ffn_gate_inp.weight"][2], "2")         # router F32 (G23)
-        self.assertEqual(rows["blk.0.attn_k_b.weight"][2], "4")             # Q8_0 k_b -> BF16
+        self.assertEqual(rows["blk.0.attn_k_b.weight"][2], "0")             # Q8_0 k_b: native (headwise)
         self.assertEqual(rows["blk.0.attn_k_b.weight"][7:9], [str(NOPE * KVL), str(NHEAD)])
         self.assertEqual(rows["blk.0.indexer.proj.weight"][2], "4")         # F32 -> BF16 (the BF16 list)
         self.assertEqual(rows["blk.0.indexer.attn_q_b.weight"][2], "4")     # BF16 as stored

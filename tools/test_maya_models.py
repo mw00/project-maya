@@ -26,8 +26,8 @@ class ModelChoice(unittest.TestCase):
     def test_new_setup_offers_the_maya_quants(self):
         kind, quant, text = self.choose({})
         self.assertEqual((kind, quant), ("download", "Maya-S-v2-IQ2_XXS"))
-        for q in ("GLM-5.3 · Maya-S:", "GLM-5.3 · Maya-S24:", "GLM-5.3 · Maya-M:", "GLM-5.3 · Maya-M-Derisked:",
-                  "GLM-5.3 · Maya-L:"):   # (the model first, the tier: maya_quants)
+        for q in ("GLM-5.3-Flash · Maya-S:", "GLM-5.3-Flash · Maya-S24:", "GLM-5.3-Flash · Maya-M:", "GLM-5.3-Flash · Maya-M-Derisked:",
+                  "GLM-5.3-Flash · Maya-L:"):   # (the model first, the tier: maya_quants)
             self.assertIn(q, text)
 
     def test_maya_m_derisked_downloads_from_its_own_repo_with_mayas_vision_files(self):
@@ -61,11 +61,11 @@ class ModelChoice(unittest.TestCase):
         self.assertIn("EXL3-sc_4.10bpw", maya.MODELS)
         kind, quant, text = self.choose({})
         self.assertNotIn("sc_4.10", text)
-        self.assertIn("GLM-5.3 · EXL3-4.05bpw: download", text)                # (the other EXL3 quants are still listed)
-        self.assertIn("GLM-5.3 · EXL3-3.05bpw: download", text)
+        self.assertIn("GLM-5.3-Flash · EXL3-4.05bpw: download", text)                # (the other EXL3 quants are still listed)
+        self.assertIn("GLM-5.3-Flash · EXL3-3.05bpw: download", text)
         kind, quant, text = self.choose({"quant": "EXL3-sc_4.10bpw"})
         self.assertEqual((kind, quant), ("download", "EXL3-sc_4.10bpw"))
-        self.assertIn("GLM-5.3 · EXL3-sc_4.10bpw: download 167.8 GB from Hugging Face", text)
+        self.assertIn("GLM-5.3-Flash · EXL3-sc_4.10bpw: download 167.8 GB from Hugging Face", text)
         self.assertNotIn("EXL3-sc_4.10bpw: download 167.8 GB from Hugging Face   (experimental)", text)   # (v1.1.53)
         args = SimpleNamespace(gguf_dir=None, model="EXL3-sc_4.10bpw", yes=True)   # (by hand: no question at all)
         self.assertEqual(maya.choose_model(args, Path("/m"), {}), ("download", "EXL3-sc_4.10bpw"))

@@ -1,7 +1,9 @@
 // tests/glm_dsa/glmd_mmq_ids_test.cu - B9.8 / B14.2 on a V100: MMQ with expert bounds and ids (one launch over a
 // group of experts, the prompt path's call) equals one launch per expert, and both match a host reference that does
 // MMQ's arithmetic (rel L2 < 1e-4), per type the prompt path uses, at 80 SMs' stream-k shapes (rows per expert 1..300,
-// 8 experts, n_embd 6144 -> 2 x 2048 and 2048 -> 6144).
+// 8 experts, n_embd 6144 -> 2 x 2048 and 2048 -> 6144).  With whole tiles (mmq::set_whole_tiles, the GLM prompt
+// path's setting) the grouped launch equals the per-expert ones BIT FOR BIT on CUDA: the same prompt read with other
+// experts resident gives the same numbers.
 // The reference rounds the activations to q8_1 in the layout MMQ picks for the type (for Q2_K, Q4_K, Q5_K and IQ1_S
 // fp16 scales and fp16 sums of the unquantized values, which their vec dots take for the weights' constant term) and
 // takes the weights as MMQ's tiles hold them (fp16 products for Q2_K and IQ1_S). The first V100 run's reference
@@ -390,6 +392,36 @@ void run_type(int type, int N, int K) {
     std::vector<float> y1(ref.size()), y2(ref.size());
     cudaMemcpy(y1.data(), d_y1, y1.size() * 4, cudaMemcpyDeviceToHost);
     cudaMemcpy(y2.data(), d_y2, y2.size() * 4, cudaMemcpyDeviceToHost);
+    // whole tiles (mmq::set_whole_tiles, the GLM prompt path's setting): an expert's rows get the same bits whatever
+    // else its launch holds - grouped == per-expert bit for bit.  Without it stream-k splits k by the launch's tile
+    // count (the count of differing values is printed; NVIDIA's configs split, AMD's RDNA ones tile anyway).
+    size_t split_diff = 0, whole_diff = 0;
+    for (size_t i = 0; i < y1.size(); ++i) split_diff += std::memcmp(&y1[i], &y2[i], 4) != 0;
+    const bool was = mmq::set_whole_tiles(true);
+    ctx.run(p, nullptr);
+    for (int e = 0; e < n_exp; ++e) {
+        mmq::Product q = p;
+        q.w = (const uint8_t*) d_w + e * ebytes;
+        q.n = 1;
+        q.bounds = d_b + e;
+        q.max_rows = bounds[e + 1] - bounds[e];
+        q.dst = d_y2;
+        ctx.run(q, nullptr);
+    }
+    cudaDeviceSynchronize();
+    mmq::set_whole_tiles(was);
+    std::vector<float> y3(ref.size()), y4(ref.size());
+    cudaMemcpy(y3.data(), d_y1, y3.size() * 4, cudaMemcpyDeviceToHost);
+    cudaMemcpy(y4.data(), d_y2, y4.size() * 4, cudaMemcpyDeviceToHost);
+    for (size_t i = 0; i < y3.size(); ++i) whole_diff += std::memcmp(&y3[i], &y4[i], 4) != 0;
+#if defined(STRATA_USE_HIP)
+    const bool whole_ok = true;   // (HIP: no switch - reported only)
+#else
+    const bool whole_ok = whole_diff == 0;
+#endif
+    std::printf("type %2d [%d x %d]: values that differ grouped vs per-expert: stream-k %zu, whole tiles %zu  %s\n", type,
+                N, K, split_diff, whole_diff, whole_ok ? "ok" : "FAIL");
+    g_fail += !whole_ok;
     const double e_ids = rel_l2(y1, y2), e_ref = rel_l2(y1, ref);
     bool finite = true;
     for (float v : y1) finite = finite && std::isfinite(v);

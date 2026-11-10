@@ -47,7 +47,7 @@ void row4_dot(int ggml_type, int n, const uint8_t* const w[4], const void* q8, f
 /// (r1 - r0) % 4 rows left over through ggml-cpu's vec_dot.  Requires row4_supported(type).
 void row4_rows(int ggml_type, int n, const uint8_t* w, size_t row_bytes, const void* q8, float* out, int r0, int r1);
 
-/// STRATA_GLM_LANE_ROW4=1 turns the lane hooks on (default off).  lane_row4_override(-1) = follow the env,
+/// STRATA_GLM_LANE_ROW4=0 turns the lane hooks off (default on).  lane_row4_override(-1) = follow the env,
 /// 0 = off, 1 = on (tests and the bench compare both in one process); it leaves lane_row4_set's type mask as it is.
 bool lane_row4_on();
 void lane_row4_override(int mode) noexcept;

@@ -661,8 +661,20 @@ def answers_user(messages: list[dict]) -> bool:
     never kept going (stops_short): the user asked and the model answered, however short, and a sentence said again
     across user turns is the user asking the same kind of thing again, not a loop.  (#921: in a chat of
     acknowledgements with tools offered and none called, "Affirmative. Loud and clear." to "can you hear me" was
-    kept going, and the model answered the server's note where the user had asked nothing.)"""
-    return bool(messages) and messages[-1].get("role") == "user"
+    kept going, and the model answered the server's note where the user had asked nothing.)  A turn since the last
+    answer that carries a tool result is a tool result, with text beside it or not: an Anthropic client's user turn
+    of tool_result blocks and text arrives as tool messages then a user message (DeepSeek's: one user message whose
+    content_blocks hold the tool_result blocks)."""
+    if not messages or messages[-1].get("role") != "user":
+        return False
+    for m in reversed(messages):
+        if m.get("role") == "assistant":
+            break
+        blocks = m.get("content_blocks")
+        if m.get("role") == "tool" or (isinstance(blocks, list) and any(
+                isinstance(b, dict) and b.get("type") == "tool_result" for b in blocks)):
+            return False
+    return True
 
 
 def stops_short(text: str, seen: set[str] = frozenset()) -> bool:

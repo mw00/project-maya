@@ -1854,7 +1854,8 @@ __global__ void __launch_bounds__(MMA_W * 32) mvc_mma_q4_K(const STRATA_GRID_CON
 // up: a padding column re-reads the last one and is not stored).  Each lane visits its k steps in row_dot's order with
 // the same arithmetic, so a (row, column) sum is the single-column kernel's.
 constexpr int MVC_R = 4;   // rows a warp - 2 for Q8_0 / Q4_K from 8 columns (four rows of those ran out of registers:
-                           // 8 columns took 2.7x the time of 4; with two, 1.6-1.8x), Q6_K keeps four (two: slower)
+                           // 8 columns took 2.7x the time of 4; with two, 1.6-1.8x), Q6_K keeps four (two: slower);
+                           // Q5_K (DecW<13>: Q4_K's registers plus the fifth bit) takes Q4_K's rows
 constexpr int mvc_rows(int type, int nc) { return nc >= 8 && type != 14 ? 2 : MVC_R; }
 
 template<int T, int NC, int R = mvc_rows(T, NC)>
@@ -5748,7 +5749,9 @@ bool mv(const MvJob* jobs, int n, cudaStream_t s) {
     if (tiled) {
         // Q8_0 on the tensor cores only when asked (STRATA_GLM_MV_MMA=1; it is not bit for bit the single column's)
         const bool mma = mma_ok();
-        for (const int T : {8, 12, 14, (int) kTypeBF16}) {
+        // Q5_K (13) too: DecW<13> (glmd_mv_ext.cuh, included above) is dot_q5_K split in two, bit for bit, so each
+        // (row, column) sum stays the column kernel's - GLM-5.3's attn_output / q_a / shared gate+up / dense gate+up
+        for (const int T : {8, 12, 13, 14, (int) kTypeBF16}) {
             MvBatch b{};
             b.skip = g_skip;
             int acc = 0, m = 0, nc = 1;
@@ -5772,6 +5775,8 @@ bool mv(const MvJob* jobs, int n, cudaStream_t s) {
                 mvc_launch<8>(b, acc, nc, s);
             else if (T == 12)
                 mvc_launch<12>(b, acc, nc, s);
+            else if (T == 13)
+                mvc_launch<13>(b, acc, nc, s);
             else if (T == 14)
                 mvc_launch<14>(b, acc, nc, s);
             else

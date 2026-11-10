@@ -788,6 +788,25 @@ class RequestChecks(unittest.TestCase):
             svc.check_request({"logit_bias": {"65": 1}})
         svc.check_request({"logit_bias": {}})      # none asked for: fine anywhere
 
+    def test_ablate(self):
+        """`ablate` (Maya's refusal ablation, one name on every API): true / false; true needs an engine with a
+        direction loaded (INFO ablate=1); the GEN key goes only when on, so a line without it is the line as before."""
+        tok = ByteTokenizer()
+        svc = Service(MockEngine(tok, "x", max_context=CTX), tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        svc.check_request({"ablate": False})       # off: fine anywhere
+        with self.assertRaises(ValueError):
+            svc.check_request({"ablate": True})    # no direction loaded: refused, not ignored
+        with self.assertRaises(ValueError):
+            svc.check_request({"ablate": "yes"})
+        svc.engine.info = {**svc.engine.info, "ablate": 1}
+        svc.check_request({"ablate": True})
+        self.assertEqual(svc.ablate_state(), {"available": True, "default": False, "why": ""})
+        self.assertIn("ablate=1", StrataEngine.sampling_keys({"temperature": 0, "ablate": True}).split())
+        self.assertIn("ablate=1", StrataEngine.sampling_keys({"temperature": 0.7, "ablate": True}).split())
+        for s in ({"temperature": 0}, {"temperature": 0, "ablate": False}, {"temperature": 0.7, "ablate": False}):
+            self.assertEqual(StrataEngine.sampling_keys(s), StrataEngine.sampling_keys(
+                {k: v for k, v in s.items() if k != "ablate"}))
+
     def test_ignore_eos(self):
         """ignore_eos bans every token that ends an answer through the logit bias (a client's other biases kept), needs
         max_tokens and an engine that applies biases, and takes only true or false."""

@@ -1,6 +1,6 @@
 # The models
 
-Maya runs three models, each on an engine built for it. This page has each one's files, what they need and what is
+Maya runs four models, each on an engine built for it. This page has each one's files, what they need and what is
 special about it. Back to the [README](../README.md).
 
 - [How the quants are named](#how-the-quants-are-named)
@@ -13,7 +13,7 @@ special about it. Back to the [README](../README.md).
 ## How the quants are named
 
 Every Maya quant is named after its model first, then its tier - XS, S, M or L, by how many bits its experts keep - so
-"GLM-5.3 · Maya-S" and "MiniMax M3.1 · Maya-S" never get mixed up. The setup asks which one to download; to pick one
+"GLM-5.3-Flash · Maya-S" and "MiniMax M3.1 · Maya-S" never get mixed up. The setup asks which one to download; to pick one
 yourself, give its setup id: `./setup.sh --model glm-maya-s24`. The names used before (`--model Maya-S24`,
 `--ds4-quant maya-xs`, ...) keep working.
 
@@ -27,12 +27,12 @@ the model's MTP block, which drafts tokens ahead.
 
 | Model | Setup id | Size | Made for | Against the FP8 model |
 | --- | --- | ---: | --- | --- |
-| **GLM-5.3 · Maya-S** (default) | `glm-maya-s` | 96.5 GB | PCs with a smaller memory pool (RAM and VRAM together) | 97.9% of its zero-shot accuracy; the same next token 83% of the time |
-| **GLM-5.3 · Maya-S24** | `glm-maya-s24` | 94.7 GB | cards of 24 GB or less: 4-bit attention leaves ~1.5 GB more of the card for experts, decode +14% | 97.7%; 83% |
-| **GLM-5.3 · Maya-XS** | `glm-maya-xs` | 73.4 GB | PCs with 64 GB of RAM and a 24 GB card, at 128K context (int8 KV cache, thinking budget 8192) | - |
-| **GLM-5.3 · Maya-M** | `glm-maya-m` | 116 GB | a bigger memory pool; more bits where they count, calibrated toward tool calls and front-end code | 97.9%; 86% |
-| **GLM-5.3 · Maya-M-Derisked** | `glm-maya-m-derisked` | 116 GB | Maya-M with a weight edit by [Blackfrost_AI](https://x.com/Blackfrost_AI) that reduces blanket refusals ([its repo](https://huggingface.co/peasantsmith/GLM-5.3-Flash-Maya-M-Derisked-IQ2_S-GGUF)); experimental | not measured yet |
-| **GLM-5.3 · Maya-L** | `glm-maya-l` | 156.3 GB | the biggest memory pools | **99.2%**; 90% |
+| **GLM-5.3-Flash · Maya-S** (default) | `glm-maya-s` | 96.5 GB | PCs with a smaller memory pool (RAM and VRAM together) | 97.9% of its zero-shot accuracy; the same next token 83% of the time |
+| **GLM-5.3-Flash · Maya-S24** | `glm-maya-s24` | 94.7 GB | cards of 24 GB or less: 4-bit attention leaves ~1.5 GB more of the card for experts, decode +14% | 97.7%; 83% |
+| **GLM-5.3-Flash · Maya-XS** | `glm-maya-xs` | 73.4 GB | PCs with 64 GB of RAM and a 24 GB card, at 128K context (int8 KV cache, thinking budget 8192) | - |
+| **GLM-5.3-Flash · Maya-M** | `glm-maya-m` | 116 GB | a bigger memory pool; more bits where they count, calibrated toward tool calls and front-end code | 97.9%; 86% |
+| **GLM-5.3-Flash · Maya-M-Derisked** | `glm-maya-m-derisked` | 116 GB | Maya-M with a weight edit by [Blackfrost_AI](https://x.com/Blackfrost_AI) that reduces blanket refusals ([its repo](https://huggingface.co/peasantsmith/GLM-5.3-Flash-Maya-M-Derisked-IQ2_S-GGUF)); experimental | not measured yet |
+| **GLM-5.3-Flash · Maya-L** | `glm-maya-l` | 156.3 GB | the biggest memory pools | **99.2%**; 90% |
 
 The setup recommends one for your PC. How they're made and measured: [MAYA-S](../bench/results/MAYA-S.md),
 [MAYA-S24](../bench/results/MAYA-S24.md), [MAYA-M](../bench/results/MAYA-M.md), [MAYA-L](../bench/results/MAYA-L.md). On
@@ -68,7 +68,8 @@ GLM-5.3-Flash, with its own sparse-attention indexer. Text only, up to 1M contex
 
 | Model | Setup id | Size | Made for |
 | --- | --- | ---: | --- |
-| **GLM-5.3 (744B) · UD-IQ2_M** ([unsloth's GGUF](https://huggingface.co/unsloth/GLM-5.3-GGUF)) | `GLM-5.3-UD-IQ2_M` | 238.6 GB | the biggest memory pools (~256 GB of VRAM and RAM together keeps every expert in memory) |
+| **GLM-5.3 (744B) · Maya-XS** ([Maya's own GGUF](https://huggingface.co/peasantsmith/GLM-5.3-Maya-GGUF)) | `glm-5.3-maya-xs` | 170.0 GB | smaller memory pools (~192 GB of VRAM and RAM together keeps every expert in memory); as close to the original as unsloth's UD-IQ1_S at 78% of its size |
+| **GLM-5.3 (744B) · UD-IQ2_M** ([unsloth's GGUF](https://huggingface.co/unsloth/GLM-5.3-GGUF)) | `GLM-5.3-UD-IQ2_M` | 238.6 GB | the biggest memory pools (~256 GB of VRAM and RAM together keeps every expert in memory); closer to the original |
 
 NVIDIA from the V100 on (CUDA, Linux and Windows) and AMD (HIP, the Strix and Gorgon Halo included); not on Mac.
 Everything about it - setup, context, defaults, APIs: [GLM53.md](GLM53.md).

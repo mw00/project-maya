@@ -4,6 +4,7 @@
 //
 //   glm_mv_nt_test           the parity checks (ctest; with STRATA_GLM_MV_GENERIC=1 too: the generic kernel only)
 //   glm_mv_nt_test --bench   the time of one Q6_K 4096 x 12288 GEMV (the dense FFN's gate) for 1..8 activations
+//   glm_mv_nt_test --bench-cols <type>   one n-column mv() (the tiled kernels) at 6144 x 6144, 1..16 columns
 #include "strata/kernels/glm_fast.hpp"
 
 #include "ggml.h"
@@ -216,12 +217,55 @@ int bench(cudaStream_t s) {
     }
     return 0;
 }
+
+// --bench-cols <type>: one mv() of an n-column job (a verify window's rows, the tiled kernels) against n one-column
+// mv() calls, 6144 x 6144 (GLM-5.3's hidden size), for 1 / 2 / 4 / 8 / 16 columns
+int bench_cols(int type, cudaStream_t s) {
+    std::mt19937 rng(7);
+    const int n_in = 6144, n_out = 6144;
+    const Weights w = make_weights(type, n_in, n_out, rng);
+    const Acts x = make_acts(n_in, rng, s);
+    float* y = nullptr;
+    check(cudaMalloc(&y, (size_t) gf::kMaxMvCols * n_out * sizeof(float)), "outputs");
+    const Job j{w, x, 1.0f, nullptr};
+    cudaEvent_t a, b;
+    check(cudaEventCreate(&a), "event");
+    check(cudaEventCreate(&b), "event");
+    std::printf("type %d %d x %d (%.1f MB), one mv() of n columns:\n", type, n_in, n_out,
+                (double) gf::row_bytes(type, n_in) * n_out / 1e6);
+    double one = 0;
+    for (const int nt : {1, 2, 4, 8, 16}) {
+        gf::MvJob m = mv_job(j, 0, y);
+        m.ncol = nt;
+        m.xq_cstride = (int64_t) (n_in / 32) * kQ8;
+        m.xf_cstride = n_in;
+        m.y_cstride = n_out;
+        for (int i = 0; i < 5; ++i) gf::mv(&m, 1, s);
+        constexpr int kCalls = 50;
+        check(cudaEventRecord(a, s), "record");
+        for (int i = 0; i < kCalls; ++i) gf::mv(&m, 1, s);
+        check(cudaEventRecord(b, s), "record");
+        check(cudaEventSynchronize(b), "sync");
+        float ms = 0;
+        check(cudaEventElapsedTime(&ms, a, b), "elapsed");
+        const double us = 1000.0 * ms / kCalls;
+        if (nt == 1) one = us;
+        std::printf("  %2d column%s: %8.1f us  (%.2f of one column's time)\n", nt, nt == 1 ? " " : "s", us, us / one);
+    }
+    check(cudaGetLastError(), "the timed launches");
+    if (gf::launch_errors() > 0) {
+        std::fprintf(stderr, "glm_mv_nt_test: %d launch(es) failed: the times above are not real\n", gf::launch_errors());
+        return 1;
+    }
+    return 0;
+}
 }  // namespace
 
 int main(int argc, char** argv) {
     cudaStream_t s;
     check(cudaStreamCreate(&s), "stream");
     if (argc > 1 && std::strcmp(argv[1], "--bench") == 0) return bench(s);
+    if (argc > 2 && std::strcmp(argv[1], "--bench-cols") == 0) return bench_cols(std::atoi(argv[2]), s);
     std::mt19937 rng(1234);
     // every type mv() serves: F32, BF16 (the pack's small and big float rows), the K-quants and Q8_0 (typed kernels),
     // the rest (the generic kernel).  Two row counts: a tail of 4 rows past the last full block of 8, and one block.

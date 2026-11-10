@@ -26,6 +26,8 @@
 #include <string>
 #include <vector>
 
+#include "glm_test_env.hpp"   // setenv / unsetenv (the pack switch below)
+
 #ifndef STRATA_SOURCE_DIR
 #define STRATA_SOURCE_DIR "."
 #endif
@@ -158,7 +160,14 @@ inline fs::path pack(const fs::path& gguf, std::string& why) {
     }
     std::error_code ec;
     fs::remove_all(out, ec);
-    if (!run(python() + " " + q(src_dir() / "tools" / "iq_pack.py") + " --gguf " + q(gguf) + " --out " + q(out), log)) {
+    // the fixtures' pack keeps W_kb / W_vb in BF16 as the tests were written against (STRATA_PACK_NATIVE32=0); the
+    // pack's default (native Q8_0) is the --native32 pack of glm_dsa_prefill_decode_test
+    setenv("STRATA_PACK_NATIVE32", "0", 1);
+    const bool packed = run(python() + " " + q(src_dir() / "tools" / "iq_pack.py") + " --gguf " + q(gguf) + " --out " +
+                                q(out),
+                            log);
+    unsetenv("STRATA_PACK_NATIVE32");
+    if (!packed) {
         why = "tools/iq_pack.py on " + gguf.filename().string() + " failed (see " + log.string() + ")";
         return {};
     }

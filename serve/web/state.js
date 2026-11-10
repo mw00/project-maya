@@ -233,7 +233,7 @@ export function savePrefs(patch) {
   store.set(key, {...(store.get(key, {}) || {}), ...patch, prefs_v: 3});
   emit();
 }
-// the model running: its id and its files (the label: "GLM-5.3 · Maya-L") - another one is a model switch
+// the model running: its id and its files (the label: "GLM-5.3-Flash · Maya-L") - another one is a model switch
 export const modelId = () => `${S.health.model || ""}|${S.health.model_label || ""}`;
 // a model switch (the Models page's, or another model found when the page loads - a setup that changed it): the
 // user's sampling choices and level do not carry over - each model starts at its own standard parameters (the owner,

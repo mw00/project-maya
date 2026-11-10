@@ -670,6 +670,7 @@ bool Glm5Model::step_layers_dsa(int64_t p, std::string& err) {
         cb_dev(N("kqv_out"), R.attn, (int64_t) H * VH);
         if (!mv(P + "attn_output.weight", R.attn, R.mix, (int64_t) H * VH, E)) return false;
         cb_dev(N("attn_out"), R.mix, E);
+        ablate(R.mix, 1, nullptr);   // (--ablate: the write loses the direction)
         add(Rs, R.mix, E);
         cb_dev(N("ffn_inp"), Rs, E);
 
@@ -732,6 +733,7 @@ bool Glm5Model::step_layers_dsa(int64_t p, std::string& err) {
             add(R.ffn, R.sh, E);
         }
         cb_dev(N("ffn_out"), R.ffn, E);
+        ablate(R.ffn, 1, nullptr);
         add(Rs, R.ffn, E);
         cb_dev(N("l_out"), Rs, E);
         if (!cuda_ok(cudaGetLastError(), ("layer " + L).c_str(), err)) return false;

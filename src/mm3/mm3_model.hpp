@@ -72,6 +72,9 @@ struct Options {
     std::string ablate;
     int ablate_layer = 0;
     float ablate_scale = 0.0f;
+    // whether a sequence projects it out until set_ablate() says otherwise (--ablate-default on|off; the server loads
+    // the direction with off and turns it on per request, GEN ablate=1)
+    bool ablate_default = true;
     bool verbose = false;
 };
 
@@ -128,6 +131,13 @@ public:
     /// --parallel (Options::seqs): the sequences, and the one forward / forward_cands read and write (0 at the load).
     int seqs() const;
     void bind(int s);
+    /// --ablate per sequence: ablate_loaded() whether a direction is loaded; set_ablate(on) whether the bound
+    /// sequence's forwards project it out from here (forward_rows' rows each by their own sequence's); ablating() as set
+    /// (at load: Options::ablate_default).  A sequence's cache was read with one setting: the serve loop starts it
+    /// over when a request asks for the other.  No direction: no-ops, false.
+    bool ablate_loaded() const;
+    void set_ablate(bool on);
+    bool ablating() const;
     /// One token of each of R conversations together (R <= 16, distinct sequences): ids[r] at position pos[r] of
     /// sequence seq[r], whose cache holds its positions before it; logits_out [R][vocab].  Each row is the same bits as
     /// that token's forward alone: the dense matrices on the token kernels' several columns, the routed experts on the

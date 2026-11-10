@@ -14,6 +14,7 @@
 #include "ds4_borrow.hpp"
 #include "ds4_cpu_exl3.hpp"
 #include "ds4_ablate.hpp"
+#include "../core/ablate_capture.hpp"   // (MAYA_ABLATE_CAPTURE: the direction fitting's read-out)
 #include "ds4_engram_io.hpp"
 #include "ds4_draft_placement.hpp"
 
@@ -1092,6 +1093,10 @@ struct Model::Impl {
     std::vector<float> abl_dir;
     float abl_scale = 0.0f;
     std::string abl_what;
+    // ... per conversation whether its passes project it out (set_ablate; [0] alone without --parallel), and the
+    // conversation seq_point pointed the layers at last (a pass of one conversation goes by its setting)
+    std::vector<uint8_t> abl_on;
+    int sq_pt = 0;
     Pack pk;
     Geo g;
     std::vector<Dev> devs;
@@ -2494,10 +2499,28 @@ struct Model::Impl {
     }
     static Layer& member(Layer& l, int m) { return m == 0 ? l : l.mates[(size_t) m - 1]; }
     // abliteration: the T rows of y (a write about to enter hc_post, all-reduced already) lose their component along
-    // the direction - what the rank-1 LoRA does to attn_output_b / ffn_down_shexp / ffn_down_exps
-    void ablate(const Dev& d, float* y, int T, cudaStream_t s) const {
-        if (d.abl_r != nullptr) project_out(y, d.abl_r, abl_scale, g.dim, T, s);
+    // the direction - what the rank-1 LoRA does to attn_output_b / ffn_down_shexp / ffn_down_exps.  Only the rows whose
+    // conversation asks (set_ablate): a pass of one conversation by its setting, a multi pass's rows (wp.nrow) each by
+    // their own - a run of rows of one setting at a time; the kernel is a block a row, so a row comes out the same
+    // whatever else the launch holds, and a row left out is not touched
+    void ablate(const Dev& d, float* y, int T, const WinPlan& wp, cudaStream_t s) const {
+        if (d.abl_r == nullptr || abl_on.empty()) return;
+        if (wp.nrow <= 0 || wp.nrow != T) {
+            if (!abl_on[(size_t) abl_seq()]) return;
+            if (strata::ablcap::on()) return strata::ablcap::put(y, T, g.dim, s);   // (a fitting run: read out)
+            project_out(y, d.abl_r, abl_scale, g.dim, T, s);
+            return;
+        }
+        for (int t = 0; t < T;) {
+            const bool on = abl_row(wp.rseq[t]);
+            int u = t + 1;
+            while (u < T && abl_row(wp.rseq[u]) == on) ++u;
+            if (on) project_out(y + (size_t) t * g.dim, d.abl_r, abl_scale, g.dim, u - t, s);
+            t = u;
+        }
     }
+    int abl_seq() const { return sqs.empty() || sq_pt < 0 || sq_pt >= (int) abl_on.size() ? 0 : sq_pt; }
+    bool abl_row(int seq) const { return seq >= 0 && seq < (int) abl_on.size() && abl_on[(size_t) seq] != 0; }
     static const Layer& member(const Layer& l, int m) { return m == 0 ? l : l.mates[(size_t) m - 1]; }
     // bytes of a VRAM slot of l's experts (a member's part of each, in a group)
     static size_t unit(const Layer& l) { return l.nm > 1 ? l.hblob : l.blob; }
@@ -3627,6 +3650,7 @@ struct Model::Impl {
                 CK(cudaSetDevice(d.id));
                 CK(cudaMemcpy(d.abl_r, abl_dir.data(), abl_dir.size() * sizeof(float), cudaMemcpyHostToDevice));
             }
+            abl_on.assign((size_t) std::max(1, o.seqs), o.ablate_default ? 1 : 0);
         }
         // (MAYA_DS4_Q8_BATCH / _SHARE: their lines now, at load; MAYA_DS4_Q8_CHECK=1: the batched rounding with sharing
         //  checked on every device first)
@@ -8745,6 +8769,11 @@ struct Model::Impl {
                 one = false;
                 why = "off (v1.1.27's path: this GPU's PCIe lane streamed nothing at an earlier start - lane-times.txt "
                       "in the pack; delete it to measure again)";
+            } else if (std::getenv("DS4_STREAM_FORCE") == nullptr && !lf.empty() &&
+                       pcie::cal_get(lf, lane_dev_key(0) + " | one") == "off") {
+                one = false;   // (#920: one_gpu_plan's verdict at an earlier start - see there)
+                why = "off (v1.1.27's path: at an earlier start this GPU's CPU lane was faster for every expert in RAM - "
+                      "lane-times.txt in the pack; delete it to measure again)";
             }
         }
 #endif
@@ -8763,12 +8792,47 @@ struct Model::Impl {
     // after the PCIe lane's timing (lane_setup): the one-GPU path on by default stays on only if some layer streams
     // CPU-lane experts; else v1.1.27's path for the run - the copies' pins given back (the VRAM it placed experts
     // around stays as placed until the next start, which the times file then starts on v1.1.27's path)
+    //
+    // #920: "streams" counted a split of picks read from the disk too (two disk reads shared between the lanes always
+    // pay on paper), so a PC whose CPU lane is far faster than its link for experts in RAM kept the path for the few
+    // cold picks: the 32 recent slots a layer (~1300 experts' VRAM on one 72 GB card) went to landings while the
+    // CPU lane took those experts (more of them read from the disk then), and decode fell from ~48 to ~30 tokens/s
+    // (an RTX PRO 5000 over a 7.2 GB/s link beside a Ryzen AI Max+ 395: an expert 0.11-0.19 ms on the CPU lane, 1.9-2.4
+    // streamed - 0 of every pick count streamed from RAM).  The whole-step check compares the split with the CPU lane
+    // inside this path's placement, so it cannot see that VRAM.  Now, where the RAM copies hold most of the CPU lane
+    // (cold picks a minority), the path stays on only if the lane's timing streams some pick count all in RAM - the case
+    // it was measured on (#476, #567); else it ends here and the times file starts the next one on v1.1.27's path
+    // (no recent slots), while the lane itself still splits cold picks as before.  Experts read in place for the most
+    // part (no copies, or under half copied): as before.  DS4_STREAM_ONE_WARM=0: as before (A/B tests)
+    bool one_keep(bool streams) const {   // (pcie::one_gpu_keep with this load's numbers)
+        static const bool on = [] {
+            const char* v = std::getenv("DS4_STREAM_ONE_WARM");
+            return v == nullptr || v[0] == '\0' || std::atoi(v) != 0;
+        }();
+        if (!on || !copy_mode || !streams) return streams;
+        long long nh = 0;
+        for (const Layer& l : L) nh += l.n_exp - l.n_vram;
+        return pcie::one_gpu_keep(streams, lane_streams_warm(), ram_held, nh);
+    }
+    bool lane_streams_warm() const {   // some class of a streaming layer streams some pick count all in RAM
+        for (int c : ln_layer) {
+            if (c < 0 || (size_t) c >= ln_cls.size()) continue;
+            const LaneCls& C = ln_cls[(size_t) c];
+            if ((size_t) C.dev >= ln_dev.size() || C.il < 0 || (size_t) C.il >= L.size()) return true;   // (unknown: kept)
+            if (pcie::streams_any(C.cost, ln_dev[(size_t) C.dev].slots, L[(size_t) C.il].k_exp, false) &&
+                C.ab[0].verdict >= 0)
+                return true;
+        }
+        return false;
+    }
     void one_gpu_plan() {
         if (!one_auto) return;
         bool streams = false;
         for (int c : ln_layer) streams = streams || c >= 0;
         const bool hold = lane_env() != nullptr && std::atoi(lane_env()) == 2;   // (DS4_STREAM=2, tests: as it was)
-        if (streams || hold || std::getenv("DS4_STREAM_FORCE") != nullptr) {
+        const bool forced = std::getenv("DS4_STREAM_FORCE") != nullptr;
+        const bool cold_only = streams && !hold && !forced && !one_keep(streams);
+        if ((streams && !cold_only) || hold || forced) {
             if (pk.gguf)
                 std::fprintf(stderr, "ds4: the one-GPU decode path: on - the PCIe lane streams CPU-lane experts from "
                                      "RAM on this GPU\n");
@@ -8781,17 +8845,25 @@ struct Model::Impl {
         gg::iq_cpu_iq1s_rows(false);
         double gb = 0;
         if (ln_zc && env_tri("DS4_STREAM_ZC") < 0) {   // (nothing pulls them: the RAM unlocked again)
-            for (size_t c = 0; c < zc_chunk.size() && c < ram_chunks.size(); ++c)
-                if (zc_chunk[c]) {
-                    cudaHostUnregister(ram_chunks[c]);
-                    zc_chunk[c] = 0;
-                    gb += (double) ram_chunk_bytes[c] / 1e9;
-                }
-            cudaGetLastError();
+            if (!cp_dma) {   // (#920: pins the prompt path DMAs from stay, as on v1.1.27's path)
+                for (size_t c = 0; c < zc_chunk.size() && c < ram_chunks.size(); ++c)
+                    if (zc_chunk[c]) {
+                        cudaHostUnregister(ram_chunks[c]);
+                        zc_chunk[c] = 0;
+                        gb += (double) ram_chunk_bytes[c] / 1e9;
+                    }
+                cudaGetLastError();
+            }
             std::fill(zc_slot.begin(), zc_slot.end(), 0);
             ln_zc = false;
         }
-        if (pk.gguf)
+        if (cold_only && ln_force.empty() && !ln_zc_all_live) lane_put(lane_dev_key(0) + " | one", "off");
+        if (pk.gguf && cold_only)
+            std::fprintf(stderr, "ds4: the one-GPU decode path: off - this GPU's CPU lane is faster for every expert in "
+                                 "RAM (the PCIe lane splits only picks read from the disk, without it); v1.1.27's path%s - "
+                                 "the next start places its experts without the recent slots\n",
+                         gb > 0 ? " (the copies' pins given back)" : "");
+        else if (pk.gguf)
             std::fprintf(stderr, "ds4: the one-GPU decode path: off - the PCIe lane's plan streams nothing on this GPU "
                                  "(its CPU lane is as fast or there is no lane); v1.1.27's path%s\n",
                          gb > 0 ? " (the copies' pins given back)" : "");
@@ -9639,6 +9711,7 @@ struct Model::Impl {
     // the layers' and sources' buffers: conversation s's (mtp_only: the drafter's blocks' rings alone)
     void seq_point(int s, bool mtp_only = false) {
         const SeqState& q = sqs[(size_t) s];
+        sq_pt = s;   // (abliteration: a pass of one conversation goes by this one's setting)
         for (size_t i = mtp_only ? (size_t) g.nl : 0; i < L.size(); ++i)
             for (int m = 0; m < L[i].nm; ++m) {
                 Layer& l = member(L[i], m);
@@ -10294,13 +10367,21 @@ struct Model::Impl {
         }
         const double t0 = now_ms();
         Dev& d = devs[0];
-        auto read = [this](const std::string& n, std::vector<int64_t>& shape, void* dst) {
+        std::string not_bf16;   // (a quant's own copy of the tower in another type - turboderp's EXL3: F16, #886)
+        auto read = [this, &not_bf16](const std::string& n, std::vector<int64_t>& shape, void* dst) {
             const Tensor* t = pk.get(n);
+            if (t != nullptr && t->dtype != "BF16" && not_bf16.empty()) not_bf16 = n + " is " + t->dtype;
             if (t == nullptr || t->dtype != "BF16") return false;
             shape = t->shape;
             return dst == nullptr || pk.read(*t, dst);
         };
-        if (!vt.load(vg, d.id, read, err)) return false;
+        if (!vt.load(vg, d.id, read, err)) {
+            if (!not_bf16.empty())
+                err = "vision: " + not_bf16 + ", and the tower is read in BF16 only - put shard 1 of DeepSeek's "
+                      "checkpoint (model-00001-of-00048.safetensors) in the model's folder and run tools/ds4/pack.py "
+                      "again: it takes the BF16 tower from there";
+            return false;
+        }
         img_tok = tok;
         // a picture's room: lent on demand (place_experts says by whom) where the prompt runs in chunks; prompts in
         // windows have no buffers to lend it, so the room is the tower's own then - taken here, before the split
@@ -15389,7 +15470,7 @@ struct Model::Impl {
         double ms[2] = {0, 0};
         int n[2] = {0, 0};
         int flip = 0, wins = 0, good = 0, bad = 0;
-        int verdict = 0;           // 1: streaming measured faster, -1: not (this kind streams nothing), 0: measuring
+        int verdict = 0;           // 1: it keeps streaming (not measured slower), -1: slower (this kind streams nothing), 0: measuring
     };
     struct LaneCls {               // a format class (its experts' types and blob size) on one GPU
         std::string fmt;           // "IQ2_XXS/IQ2_XXS/IQ3_XXS 10633216 B"
@@ -15877,8 +15958,9 @@ struct Model::Impl {
     }
 
     // decode's check that streaming pays (LaneAB): a window's mean time with the split against the CPU lane alone;
-    // the first window only warms up; 3% faster twice in a row: on, else twice not: off (this kind of request streams
-    // nothing from then on); undecided after 8 windows: off.  The times file keeps the verdict for the next start
+    // the first window only warms up; 3% slower twice in a row: off (this kind of request streams nothing from then
+    // on), twice not slower - faster or a tie: it keeps streaming, as it does when still undecided after 9 windows
+    // (pcie::ab_window, #697).  The times file keeps the verdict for the next start
     void lane_ab(LaneCls& C, int kind, bool split, double ms) {
         LaneAB& A = C.ab[kind];
         if (A.verdict != 0 || !(ms >= 0.0)) return;
@@ -15888,21 +15970,14 @@ struct Model::Impl {
         const double m0 = A.ms[0] / A.n[0], m1 = A.ms[1] / A.n[1], gain = 1.0 - m1 / m0;
         A.ms[0] = A.ms[1] = 0;
         A.n[0] = A.n[1] = 0;
-        if (++A.wins == 1) return;
-        if (gain >= 0.03) {
-            A.bad = 0;
-            if (++A.good >= 2) A.verdict = 1;
-        } else {
-            A.good = 0;
-            if (++A.bad >= 2) A.verdict = -1;
-        }
-        if (A.verdict == 0 && A.wins >= 9) A.verdict = -1;
+        A.verdict = pcie::ab_window(A.wins, A.good, A.bad, gain);   // (a tie keeps streaming: #697)
         if (A.verdict == 0) return;
         std::fprintf(stderr, "ds4: PCIe lane: CUDA%d %s: decode measured the split against the CPU lane alone on "
                              "requests with %s: %.2f against %.2f ms (%+.1f%%) -> %s\n",
                      devs[(size_t) C.dev].id, C.fmt.c_str(), kind == 0 ? "every expert in RAM" : "experts from the disk",
                      m1, m0, -100.0 * gain,
-                     A.verdict > 0 ? "it streams them" : "it no longer streams them (kept for the next start)");
+                     A.verdict > 0 ? (gain >= 0.03 ? "it streams them" : "it keeps streaming them (not slower)")
+                                   : "it no longer streams them (kept for the next start)");
         lane_put(C.key, lane_vals(C));
         bool off = true;   // (every class of its GPU off: the next start takes no slots there)
         for (const LaneCls& K : ln_cls)
@@ -15914,13 +15989,14 @@ struct Model::Impl {
     // token as a whole got slower (2x 4090, a 7900 XTX, an RTX PRO 6000: 10-30%): the streamed experts' trips through
     // the host memory slow the rest of the step, which no layer's own timing sees.  Steps take turns in runs of 8 -
     // streaming allowed, or none (decoded tokens: the lane serves T == 1 steps only) - and their time a token decides with lane_ab's rule over windows of 64 tokens of each:
-    // 3% faster twice in a row: streaming stays (lane_ab decides the rest); twice not, or undecided after 9 windows:
-    // none from then on, and the times file keeps it for the next start.  DS4_STREAM_TOKEN_AB=0: off (A/B tests)
+    // 3% slower twice in a row: none from then on, and the times file keeps it for the next start; twice not slower
+    // (faster or a tie), or undecided after 9 windows: streaming stays (lane_ab decides the rest) - a tie is not written
+    // as off (pcie::ab_window, #697).  DS4_STREAM_TOKEN_AB=0: off (A/B tests)
     struct TokAB {
         double ms[2] = {0, 0};
         int64_t n[2] = {0, 0};
         int arm = 0, left = 0, wins = 0, good = 0, bad = 0;
-        int verdict = 0;           // 1: streaming measured faster, -1: not (none from then on), 0: measuring
+        int verdict = 0;           // 1: it keeps streaming (not measured slower), -1: slower (none from then on), 0: measuring
     };
     TokAB tok_ab;
     std::atomic<bool> tok_ab_off{false};   // this step: the split takes no experts (the check's CPU-lane-only turn;
@@ -15960,19 +16036,12 @@ struct Model::Impl {
         const double m0 = A.ms[0] / (double) A.n[0], m1 = A.ms[1] / (double) A.n[1], gain = 1.0 - m1 / m0;
         A.ms[0] = A.ms[1] = 0;
         A.n[0] = A.n[1] = 0;
-        if (++A.wins == 1) return;   // (the first window warms up)
-        if (gain >= 0.03) {
-            A.bad = 0;
-            if (++A.good >= 2) A.verdict = 1;
-        } else {
-            A.good = 0;
-            if (++A.bad >= 2) A.verdict = -1;
-        }
-        if (A.verdict == 0 && A.wins >= 9) A.verdict = -1;
+        A.verdict = pcie::ab_window(A.wins, A.good, A.bad, gain);   // (the first window warms up; a tie keeps it: #697)
         if (A.verdict == 0) return;
         std::fprintf(stderr, "ds4: PCIe lane: decode measured whole steps with the split against the CPU lane alone: "
                              "%.2f against %.2f ms a token (%+.1f%%) -> %s\n", m1, m0, -100.0 * gain,
-                     A.verdict > 0 ? "it streams" : "it no longer streams (kept for the next start)");
+                     A.verdict > 0 ? (gain >= 0.03 ? "it streams" : "it keeps streaming (not slower)")
+                                   : "it no longer streams (kept for the next start)");
         if (A.verdict < 0) {
             tok_ab_off = true;
             std::vector<int> seen;
@@ -18024,7 +18093,7 @@ struct Model::Impl {
             CK(cudaStreamWaitEvent(s, c.ar_done, 0));
         } else if (nm > 1)
             chunk_allreduce(d, c, ab, mi, T * D, s);
-        ablate(d, c.acc, T, s);
+        ablate(d, c.acc, T, wp, s);
         hc_post_inplace(c.acc, c.h, c.a_post, c.a_comb, D, H, T, s);
         prof_mark(d, 1);
         kick(s);   // (the attention submitted while the host queues the routing)
@@ -18118,7 +18187,7 @@ struct Model::Impl {
                 if (flow_ar_dma && nm > 2) chunk_allreduce(d, c, ab, mi, T * D, s);
                 else allreduce(c.acc, T * D, ab, mi, ++c.arb_seq, d.xcnt, s);
             }
-            ablate(d, c.acc, T, s);
+            ablate(d, c.acc, T, wp, s);
             hc_post_inplace(c.acc, c.h, c.f_post, c.f_comb, D, H, T, s);
             CK(cudaMemcpyAsync(c.pre, c.f_pre, (size_t) T * 8 * 4, cudaMemcpyDeviceToDevice, s));
             prof_mark(d, 3);
@@ -18155,7 +18224,7 @@ struct Model::Impl {
         if (!run_vram(d, c, L0, l, l, b.data(), v_done, L0.pv_n, T, err)) return false;
         if (xsum) moe_x_finish(c.acc, c.acc64, (size_t) T * D, s);
         if (nm > 1) chunk_allreduce(d, c, ab, mi, T * D, s);
-        ablate(d, c.acc, T, s);
+        ablate(d, c.acc, T, wp, s);
         hc_post_inplace(c.acc, c.h, c.f_post, c.f_comb, D, H, T, s);
         if (acc_dump != nullptr) {
             std::vector<float> av((size_t) T * (size_t) D);
@@ -21648,7 +21717,7 @@ struct Model::Impl {
         } else CK(cudaMemsetAsync(d.ao, 0, (size_t) T * D * sizeof(*d.ao), s));   // (no heads: nothing to add)
         if (nm > 1) allreduce(d.ao, T * D, ag, mi, ++d.ar_seq, d.xcnt, s);
         if (hs) CK(cudaStreamWaitEvent(s, d.hc_done, 0));
-        ablate(d, d.ao, T, s);
+        ablate(d, d.ao, T, wp, s);
         hc_post(d.ao, d.h, d.a_post, d.a_comb, D, H, T, d.h2, s);
         std::swap(d.h, d.h2);
         if (dump_l != nullptr && mi == 0) dump_layer(d, d.h, 1000 + l.il, p0, T);   // (DS4_DUMP_L: after the attention)
@@ -21849,7 +21918,7 @@ struct Model::Impl {
             if (mi == 0 && l.mtp) st.draft_experts += (int64_t) T * l.k_exp;
             if (nm > 1) allreduce(d.moe_out, T * D, ag, mi, ++d.ar_seq, d.xcnt, s);
             if (hs) CK(cudaStreamWaitEvent(s, d.hc_done, 0));
-            ablate(d, d.moe_out, T, s);
+            ablate(d, d.moe_out, T, wp, s);
             hc_post(d.moe_out, d.h, d.f_post, d.f_comb, D, H, T, d.h2, s);
             std::swap(d.h, d.h2);
             if (acc_dump != nullptr) {
@@ -21983,7 +22052,7 @@ struct Model::Impl {
         }
         combine(d.ed, ents.empty() ? nullptr : d.cpu_part, d.sh_out, cm, T, D, d.moe_out, s);
         if (hs) CK(cudaStreamWaitEvent(s, d.hc_done, 0));
-        ablate(d, d.moe_out, T, s);
+        ablate(d, d.moe_out, T, wp, s);
         hc_post(d.moe_out, d.h, d.f_post, d.f_comb, D, H, T, d.h2, s);
         std::swap(d.h, d.h2);
         if (acc_dump != nullptr) {
@@ -22740,6 +22809,13 @@ bool Model::has_drafter() const { return p_->g.n_mtp > 0; }
 const std::vector<int32_t>& Model::tokens() const { return p_->toks; }
 int Model::seq_count() const { return p_->seq_count(); }
 void Model::seq_bind(int s) { p_->seq_bind(s); }
+bool Model::ablate_loaded() const { return !p_->abl_on.empty(); }
+void Model::set_ablate(bool on) {
+    if (!p_->abl_on.empty()) p_->abl_on[(size_t) (p_->sqs.empty() ? 0 : p_->sq_bound)] = on ? 1 : 0;
+}
+bool Model::ablating() const {
+    return !p_->abl_on.empty() && p_->abl_on[(size_t) (p_->sqs.empty() ? 0 : p_->sq_bound)] != 0;
+}
 int Model::seq_bound() const { return p_->sq_bound; }
 int64_t Model::seq_pos(int s) const { return p_->seq_pos(s); }
 const std::vector<int32_t>& Model::seq_tokens(int s) const { return p_->seq_tokens(s); }

@@ -60,6 +60,21 @@ def calibrate(other_tok_s, dflash_tok_s, **kw):
 
 
 class Measure(unittest.TestCase):
+    def test_the_mixed_probe_answers_the_mixed_requests(self):
+        asked = []
+
+        def mixed_requests(cfg, doc_tokens=CD.DOC_TOKENS, mixed=False):
+            asked.append(mixed)
+            return [5], [[i] for i in range(len(CD.MIXED))], 0
+        eng = FakeEngine(10.0)
+        with patch.object(CD, "requests", mixed_requests):
+            res = CD.run(BASE, BASE, say=lambda *a: None, start_engine=lambda c: eng,
+                         size={"mixed": True, "tokens": 512, "answer": 128, "warm": 32})
+        self.assertEqual(asked, [True])
+        self.assertEqual(res["other"]["answers"], len(CD.MIXED))       # one answer of each kind
+        self.assertEqual([r[0] for r in eng.requests[1:len(CD.MIXED) + 1]], [(i,) for i in range(len(CD.MIXED))])
+        self.assertTrue(any(t for _, t in CD.MIXED) and not all(t for _, t in CD.MIXED))   # thinking and answers
+
     def test_dflash2_is_kept_only_when_clearly_faster(self):
         res, _ = calibrate(20.0, 25.0)
         self.assertEqual(res["keep"], "dflash2")

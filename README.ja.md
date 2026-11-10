@@ -4,10 +4,11 @@
 
 <h1 align="center">Project Maya</h1>
 
-<p align="center"><b>GLM-5.3-Flash (321 B)、DeepSeek-V4.1-Flash-1017 (748 B)、MiniMax-M3.1-Flash (428 B) を自分の GPU で</b><br>
+<p align="center"><b>GLM-5.3 (744 B)、GLM-5.3-Flash (321 B)、DeepSeek-V4.1-Flash-1017 (748 B)、MiniMax-M3.1-Flash (428 B) を自分の GPU で</b><br>
 プライベートで高速 · NVIDIA GPU 1 枚から最大 16 枚まで · AMD と Windows · チャット、画像、OpenAI / Anthropic 互換 API · 複数リクエストの同時処理</p>
 
 <p align="center">
+<a href="https://huggingface.co/peasantsmith/GLM-5.3-Maya-GGUF"><img src="https://raw.githubusercontent.com/mw00/project-maya/badges/glm53.svg" alt="GLM-5.3 Maya downloads"></a>
 <a href="https://huggingface.co/peasantsmith/GLM-5.3-Flash-Maya-GGUF"><img src="https://raw.githubusercontent.com/mw00/project-maya/badges/glm.svg" alt="GLM-5.3-Flash Maya downloads"></a>
 <a href="https://huggingface.co/peasantsmith/GLM-5.3-Flash-Maya-M-Derisked-IQ2_S-GGUF"><img src="https://raw.githubusercontent.com/mw00/project-maya/badges/glm-m-derisked.svg" alt="GLM-5.3-Flash Maya-M-Derisked downloads"></a>
 <a href="https://huggingface.co/peasantsmith/DeepSeek-V4.1-Flash-1017-Maya-GGUF"><img src="https://raw.githubusercontent.com/mw00/project-maya/badges/deepseek.svg" alt="DeepSeek-V4.1-Flash Maya downloads"></a>
@@ -20,8 +21,8 @@
 <a href="https://buymeacoffee.com/peasantsmith"><img src="https://img.shields.io/badge/Buy_me_a_coffee-FFDD00?logo=buymeacoffee&logoColor=black&style=for-the-badge" alt="Buy Me A Coffee" height="32"></a><br>
 <sub>Project Maya は無料です。お使いの PC で快適に動くなら、スポンサーになっていただくと、テスト用ハードウェアと開発の費用になります。</sub></p>
 
-この規模のモデルは、普通ならデータセンターが必要です。Maya は、すでにお持ちのハードウェアでその 3 つを動かします。
-**GLM-5.3-Flash**、**DeepSeek-V4.1-Flash-1017**、**MiniMax-M3.1-Flash** です。モデルごとに専用のエンジンがあります。会話でよく使われるエキスパートを
+この規模のモデルは、普通ならデータセンターが必要です。Maya は、すでにお持ちのハードウェアでその 4 つを動かします。
+**GLM-5.3**、**GLM-5.3-Flash**、**DeepSeek-V4.1-Flash-1017**、**MiniMax-M3.1-Flash** です。モデルごとに専用のエンジンがあります。会話でよく使われるエキスパートを
 GPU に、次に使われるものを RAM に、残りを NVMe SSD に置き、チャットの進行に合わせて入れ替えます。GPU、CPU、RAM、SSD を測定して自動でチューニングします。
 データがお使いのマシンの外に出ることはありません。
 
@@ -54,7 +55,8 @@ Maya の量子化はすべて、モデル名のあとに階層 (XS、S、M、L�
 | | Maya-M · `glm-maya-m` | 116 GB | より大きなメモリ; ツール呼び出しとフロントエンドのコード向けにキャリブレーション |
 | | Maya-M-Derisked · `glm-maya-m-derisked` | 116 GB | [Blackfrost_AI](https://x.com/Blackfrost_AI) による重み編集で、一律の拒否を減らした Maya-M; 実験的 |
 | | Maya-L · `glm-maya-l` | 156.3 GB | 最大クラスのメモリ; 元のモデルに最も近い |
-| **[GLM-5.3](https://huggingface.co/zai-org/GLM-5.3)**<br><sub>zai-org · [独自ライセンス](https://huggingface.co/zai-org/GLM-5.3) · 744 B、アクティブ 40 B · 最大 1M コンテキスト · テキストのみ</sub> | UD-IQ2_M (unsloth) · `GLM-5.3-UD-IQ2_M` | 238.6 GB | 最大クラスのメモリ; NVIDIA (V100 以降) と AMD ([詳細](docs/GLM53.md)) |
+| **[GLM-5.3](https://huggingface.co/zai-org/GLM-5.3)**<br><sub>zai-org · [独自ライセンス](https://huggingface.co/zai-org/GLM-5.3) · 744 B、アクティブ 40 B · 最大 1M コンテキスト · テキストのみ</sub> | **Maya-XS** · `glm-5.3-maya-xs` | 170.0 GB | 192 GB のメモリ (VRAM と RAM の合計) にモデル全体が収まる; NVIDIA (V100 以降) と AMD ([詳細](docs/GLM53.md)) |
+| | UD-IQ2_M (unsloth) · `GLM-5.3-UD-IQ2_M` | 238.6 GB | 最大クラスのメモリ; オリジナルにより近い |
 | **[DeepSeek-V4.1-Flash-1017](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017)**<br><sub>DeepSeek · MIT · 748 B</sub> | **Maya-S** (デフォルト) · `deepseek-maya-s` | 340 GB | メモリ量を問わず: VRAM と RAM に収まらない分は SSD から読み込む |
 | | Maya-XS (v2) · `deepseek-maya-xs` | 277 GB | 128 GB の PC のメモリにモデル全体を載せる (Engram テーブルは SSD に置く); v2 は v1 より元のモデルに約 12% 近く、書き出しが約 20% 速い - セットアップを再実行すると更新を案内します |
 | **[MiniMax-M3.1-Flash](https://huggingface.co/MiniMaxAI/MiniMax-M3.1-Flash)**<br><sub>MiniMax · [MiniMax Community License](LICENSE.minimax-m31) · 428 B、アクティブ 23 B · 最大 1M コンテキスト</sub> | Maya-XS · `minimax-maya-xs` | 93 GB | 128 GB の PC のメモリにモデル全体を載せる |
@@ -68,7 +70,7 @@ Maya の量子化はすべて、モデル名のあとに階層 (XS、S、M、L�
 
 Maya の量子化は、各モデルの公開された重みから作られ、元のモデルと比較して測定されています。
 
-- **GLM-5.3 · Maya の量子化**は FP8 モデルのゼロショット精度の 97.7-99.2% を保ち、次トークンを 83-90% の確率で一致させます (Maya-L: 99.2%、90%)。作り方と測定方法: [MAYA-S](bench/results/MAYA-S.md)、[MAYA-S24](bench/results/MAYA-S24.md)、[MAYA-M](bench/results/MAYA-M.md)、[MAYA-L](bench/results/MAYA-L.md)。
+- **GLM-5.3-Flash · Maya の量子化**は FP8 モデルのゼロショット精度の 97.7-99.2% を保ち、次トークンを 83-90% の確率で一致させます (Maya-L: 99.2%、90%)。作り方と測定方法: [MAYA-S](bench/results/MAYA-S.md)、[MAYA-S24](bench/results/MAYA-S24.md)、[MAYA-M](bench/results/MAYA-M.md)、[MAYA-L](bench/results/MAYA-L.md)。
 - **DeepSeek V4.1 · Maya-S** は元のモデルと同じ次トークンを 92.6% の確率で選びます。
 - **MiniMax M3.1 · Maya-S** は 87.6% です (カテゴリ平均)。
 
@@ -219,7 +221,7 @@ Maya の量子化は、各モデルの公開された重みから作られ、元
 | --- | --- |
 | **GPU** | NVIDIA、compute capability 7.0 以上 (V100、RTX 20 以降): 1 枚、またはモデルを分け合う最大 16 枚。VRAM が多いほど速くなります。Pascal (Tesla P40 / P100、GTX 10) は実験的で、まだ検証されていません。**AMD:** RX 7900 XT / XTX、Radeon AI PRO R9700 / RX 9070、Strix Halo と Gorgon Halo (Radeon 8060S / 8065S); RX 6800 / 6900 と Radeon PRO V620 / W6800 はまだ検証されていません; GLM-5.3-Flash と DeepSeek-V4.1-Flash-1017 は AMD でも画像を読めます - [docs/AMD_MAYA.md](docs/AMD_MAYA.md) |
 | **RAM** | 32 GB で動きます。RAM が多いほど多くのエキスパートを近くに置け、速くなります |
-| **ディスク** | モデルが入る空きのある**高速な NVMe SSD** (GLM-5.3 · Maya-XS で約 75 GB、GLM-5.3 · Maya-S で約 100 GB、GLM-5.3 · Maya-L で約 160 GB、DeepSeek V4.1 · Maya-S で約 350 GB、その unsloth の Q8 GGUF で約 470 GB、MiniMax M3.1 · Maya-XS で約 95 GB、MiniMax-M3.1-Flash の EXL3 量子化で約 200 GB) と、画像エンコーダー (1.1 GB)。ハードディスクは不可 |
+| **ディスク** | モデルが入る空きのある**高速な NVMe SSD** (GLM-5.3-Flash · Maya-XS で約 75 GB、GLM-5.3-Flash · Maya-S で約 100 GB、GLM-5.3-Flash · Maya-L で約 160 GB、DeepSeek V4.1 · Maya-S で約 350 GB、その unsloth の Q8 GGUF で約 470 GB、MiniMax M3.1 · Maya-XS で約 95 GB、MiniMax-M3.1-Flash の EXL3 量子化で約 200 GB) と、画像エンコーダー (1.1 GB)。ハードディスクは不可 |
 | **システム** | Linux (x86-64; AVX2 対応 CPU が最適)、NVIDIA ドライバー、CUDA 12.x (CUDA 13 は RTX 20 以降で動作し、V100 と Pascal では動作しません)、g++、Python 3.10+。Windows 10/11: [docs/WINDOWS.md](docs/WINDOWS.md)。WSL2 は不可。AMD: ROCm 7 |
 
 セットアップがこれらをすべて確認し、足りないものには正確なコマンドを表示します。システム全体には何もインストールしません。

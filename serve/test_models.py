@@ -85,7 +85,7 @@ class Settings(unittest.TestCase):
 
     def test_glm_read(self):
         s = M.settings_of(M.read(glm_cfg(self.d)))
-        self.assertEqual(s, {"context": 131072, "gpus": [0, 1], "env": {"MAYA_GLM_RAM_HEADROOM_GB": "4"},
+        self.assertEqual(s, {"context": 131072, "gpus": [0, 1], "env": {"MAYA_GLM_RAM_HEADROOM_GB": "4"}, "ablate": False,
                              "images": True, "reserve_mib": None, "parallel": 1, "draft": "mtp", "expert_cache": None,
                              "prefill": None, "kv_streaming": True, "kv_resident": None})
 
@@ -233,12 +233,12 @@ class Settings(unittest.TestCase):
         cfg = M.read(mm3_cfg(self.d))
         self.assertEqual(M.family(cfg), "minimax")
         self.assertEqual(M.family({"exe": "/b/maya-mm3", "args": ["--pack", "/p"]}), "minimax")   # (no installer)
-        self.assertEqual(M.settings_of(cfg), {"context": 65536, "gpus": list(range(9)), "env": {}, "images": True,
+        self.assertEqual(M.settings_of(cfg), {"context": 65536, "gpus": list(range(9)), "env": {}, "ablate": False, "images": True,
                                               "parallel": 1, "draft": "none", "tp": 4, "kv_cache": "int8",
                                               "kv_streaming": True, "kv_resident": None, "cpu_threads": None,
                                               "reserve_gb": None, "prefill_chunk": None, "cache_gb": None,
                                               "dspark_conf": None})
-        self.assertEqual(M.choices(cfg), {"draft": ["dspark", "none"], "images": True})
+        self.assertEqual({k: v for k, v in M.choices(cfg).items() if k != "ablate"}, {"draft": ["dspark", "none"], "images": True})
         new = M.apply(cfg, {"context": 262144, "draft": "dspark", "images": False, "tp": 2, "kv_cache": "fp8",
                             "kv_resident": 65536, "cpu_threads": 24})
         a = new["args"]
@@ -263,7 +263,8 @@ class Settings(unittest.TestCase):
         self.assertEqual((M.flag(off, "--kv-streaming"), "--kv-resident" in off, "--kv-cache" in off), ("off", False, False))
         # a pack without the drafter or the tower: neither offered
         bare = M.read(mm3_cfg(self.d, "maya-mm3-b.json", drafter=False, vision=False))
-        self.assertEqual(M.choices(bare), {"draft": ["none"], "images": False})
+        self.assertEqual(M.choices(bare)["ablate"]["available"], False)
+        self.assertEqual({k: v for k, v in M.choices(bare).items() if k != "ablate"}, {"draft": ["none"], "images": False})
         with self.assertRaisesRegex(ValueError, "no DSpark drafter"):
             M.apply(bare, {"draft": "dspark"})
         self.assertEqual(M.quant_label(cfg, Path("maya-mm3.json")), "EXL3 3.5 bpw")
@@ -887,6 +888,72 @@ class DeletePage(Served):
         self.assertFalse(Path(item["path"]).exists())
         s, _ = self.req("POST", "/api/models/leftovers", {"path": item["path"]})
         self.assertEqual(s, 400)
+
+
+class Ablate(unittest.TestCase):
+    """Refusal ablation on the Models page: the switch only with a direction file on an engine that projects it, the
+    default kept beside the engine's arguments (no restart), the direction loaded off by default."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.d = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def with_direction(self, p: Path) -> dict:
+        f = self.d / ("DeepSeek-V4.1-Flash" + M.ABLATE_SUFFIX)
+        f.write_bytes(b"GGUF")
+        cfg = M.read(p)
+        cfg["ablate"] = {"file": str(f), "model": "DeepSeek-V4.1-Flash", "fitted_on": "Maya-S"}
+        cfg["args"] = M.ablate_args(cfg, cfg["args"])
+        return cfg
+
+    def test_no_direction_no_switch(self):
+        cfg = M.read(ds4_cfg(self.d))
+        self.assertFalse(M.choices(cfg)["ablate"]["available"])
+        self.assertIn("no refusal direction", M.choices(cfg)["ablate"]["why"])
+        self.assertFalse(M.settings_of(cfg)["ablate"])
+        with self.assertRaises(ValueError):
+            M.apply(cfg, {"ablate": True})
+        self.assertEqual(M.apply(cfg, {"ablate": False})["args"], cfg["args"])   # (the command as before)
+        self.assertNotIn("--ablate", M.ablate_args(cfg, list(cfg["args"])))
+
+    def test_direction_loaded_off_and_default_switch(self):
+        cfg = self.with_direction(ds4_cfg(self.d))
+        self.assertEqual(M.flag(cfg["args"], "--ablate-default"), "off")
+        self.assertTrue(M.choices(cfg)["ablate"]["available"])
+        on = M.apply(cfg, {"ablate": True})
+        self.assertTrue(on["ablate"]["default"])
+        self.assertTrue(M.settings_of(on)["ablate"])
+        self.assertEqual(on["args"], cfg["args"])          # (an engine setting it is not: no restart)
+        self.assertNotIn("sampling", on)                   # (the model's own sampling defaults stay its own)
+        off = M.apply(on, {"ablate": False})
+        self.assertFalse(M.settings_of(off)["ablate"])
+
+    def test_glm_loads_it(self):
+        cfg = M.read(glm_cfg(self.d))
+        f = self.d / "x.gguf"
+        f.write_bytes(b"GGUF")
+        cfg["ablate"] = {"file": str(f)}
+        self.assertTrue(M.choices(cfg)["ablate"]["available"])
+        args = M.ablate_args(cfg, list(cfg["args"]))
+        self.assertEqual(M.flag(args, "--ablate"), str(f))
+        self.assertEqual(M.flag(args, "--ablate-default"), "off")
+        cfg["backend"] = "metal"   # (the Mac engine has no projection)
+        self.assertFalse(M.choices(cfg)["ablate"]["available"])
+        self.assertEqual(M.choices(cfg)["ablate"]["why"], "not available for this model")
+        self.assertNotIn("--ablate", M.ablate_args(cfg, list(cfg["args"])))
+
+    def test_qwen_greyed_out(self):
+        cfg = M.read(glm_cfg(self.d))
+        cfg["installer"]["family"] = "qwen"   # (CYBER-FROST: the `maya` engine without the projection)
+        f = self.d / "x.gguf"
+        f.write_bytes(b"GGUF")
+        cfg["ablate"] = {"file": str(f)}
+        self.assertFalse(M.choices(cfg)["ablate"]["available"])
+        self.assertEqual(M.choices(cfg)["ablate"]["why"], "not available for this model")
+        self.assertNotIn("--ablate", M.ablate_args(cfg, list(cfg["args"])))
 
 
 if __name__ == "__main__":

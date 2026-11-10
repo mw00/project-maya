@@ -213,7 +213,7 @@ class Setup(unittest.TestCase):
         hip = {"backend": "hip", "gpus": [{"index": 0, "name": "Radeon RX 7900 XTX", "arch": "gfx1100",
                                            "vram_gb": 24}]}
         plan = maya.g53_cache_plan(self.a, cuda, g53)
-        self.assertEqual(plan, {"parallel": 1, "kv_bytes": 64352, "reserve_mib": 700})
+        self.assertEqual(plan, {"parallel": 1, "kv_bytes": 64352, "reserve_mib": 700, "dense_gb": 14.5})
         self.assertEqual(maya.G53.kv_bytes_of(maya.G53.GEOMETRY), maya.G53.KV_BYTES)
         with Quiet():
             self.assertEqual(maya.g53_contexts(cuda, **plan), [8192, 32768, 65536])
@@ -234,6 +234,24 @@ class Setup(unittest.TestCase):
         p = self.root / "maya-glm-5.3-ud-iq2_m.json"                            # (CUDA's config: kept from it)
         p.write_text(json.dumps({"args": ["--glm-pack", str(self.dsa), "--vram-reserve-mib", "1500"]}))
         self.assertEqual(maya.g53_cache_plan(self.a, cuda, g53)["reserve_mib"], 1500)
+
+    def test_maya_xs_counts_its_own_dense_weights(self):
+        """GLM-5.3-Maya-XS's dense weights (17 GB, UD-IQ2_M's 14.5) leave its cache less of a 24 GB card: 32K, not
+        64K; its local files (--gguf-dir) count the same."""
+        cuda = {"backend": "cuda", "gpus": [{"index": 0, "name": "RTX 4090", "vram_gb": 24}]}
+        xs = ("download", "GLM-5.3-Maya-XS")
+        plan = maya.g53_cache_plan(self.a, cuda, xs)
+        self.assertEqual(plan["dense_gb"], 17.0)
+        self.assertEqual(maya.g53_figures("GLM-5.3-Maya-XS"), (176, 17.0))
+        self.assertEqual(maya.g53_figures("GLM-5.3-UD-IQ2_M"), (maya.G53.MEMORY_GB, maya.G53.DENSE_GB))
+        self.assertEqual(maya.g53_figures("GLM-5.3-Mine"), (maya.G53.MEMORY_GB, maya.G53.DENSE_GB))
+        with Quiet():
+            self.assertEqual(maya.g53_contexts(cuda, **plan), [8192, 32768])
+            self.assertEqual(maya.g53_contexts({"gpus": [{"index": 0, "vram_gb": 32}] * 3}, **plan), maya.CONTEXTS)
+        with tempfile.TemporaryDirectory() as t:
+            first = write_split(Path(t), "GLM-5.3-Maya-XS")[0]
+            self.assertEqual(maya.quant_of(first), "GLM-5.3-Maya-XS")
+            self.assertEqual(maya.g53_cache_plan(self.a, cuda, ("local", first))["dense_gb"], 17.0)
 
     def test_calibration_estimate(self):
         for pack, want in ((self.dsa, "On GLM-5.3 it takes about 30-60"), (self.flash, "It takes about 10-15 minutes")):
@@ -264,11 +282,40 @@ class Download(unittest.TestCase):
                          "UD-IQ2_M/GLM-5.3-UD-IQ2_M-00002-of-00006.gguf")
         self.assertNotIn("GLM-5.3-UD-IQ2_M", maya.MODELS)                           # (Flash's list stays Flash's)
 
+    def test_the_maya_xs_entry(self):
+        """GLM-5.3-Maya-XS: Maya's own repo (one per model, folder Maya-XS), 4 shards pinned with their sizes and
+        sha256, its own memory figures; first in the list, and never one of GLM-5.3-Flash's quants."""
+        self.assertEqual(list(maya.G53_MODELS)[0], "GLM-5.3-Maya-XS")
+        m = maya.G53_MODELS["GLM-5.3-Maya-XS"]
+        names = maya.shard_names(m)
+        self.assertEqual(names, [f"GLM-5.3-Maya-XS-{i:05d}-of-00004.gguf" for i in range(1, 5)])
+        self.assertEqual(set(m["sha256"]), set(names))
+        self.assertEqual(set(m["bytes"]), set(names))
+        self.assertTrue(all(re.fullmatch(r"[0-9a-f]{64}", v) for v in m["sha256"].values()))
+        self.assertEqual(m["sha256"][names[0]], "3c9b12e7d36c675e961185cd947841f650745abcb746b4c5042c2e97212cf75c")
+        self.assertRegex(m["revision"], r"^[0-9a-f]{40}$")                         # (pinned, not "main")
+        self.assertEqual(sum(m["bytes"].values()), 169990267456)
+        self.assertAlmostEqual(m["download_gb"], sum(m["bytes"].values()) / 1e9, delta=0.05)
+        self.assertEqual(maya.file_url(m, names[3]),
+                         "https://huggingface.co/peasantsmith/GLM-5.3-Maya-GGUF/resolve/"
+                         "2fb34fe0d9398f33782b6ece7dca1bb798f8b168/Maya-XS/GLM-5.3-Maya-XS-00004-of-00004.gguf")
+        self.assertGreater(m["memory_gb"], m["download_gb"])
+        self.assertLess(m["memory_gb"], maya.G53.MEMORY_GB)
+        self.assertTrue(m["maya"])
+        self.assertNotIn("GLM-5.3-Maya-XS", maya.MODELS)
+        self.assertIsNone(maya.Q.tier("glm", "GLM-5.3-Maya-XS"))                  # (never Flash Maya-XS's sampling)
+        self.assertEqual(maya.Q.glm53_quant("GLM-5.3-Maya-XS"), "Maya-XS")
+        self.assertEqual(maya.download_dir(Path("/m"), "GLM-5.3-Maya-XS"), Path("/m") / "GLM-5.3-Maya-XS")
+
     def test_offered(self):
         self.assertIn("GLM-5.3-UD-IQ2_M", maya.glm_downloads())
         a = SimpleNamespace(model="glm-5.3-ud-iq2_m", mm3_quant=None)
         self.assertIsNone(maya.model_option(a))
         self.assertEqual(a.model, "GLM-5.3-UD-IQ2_M")
+        a = SimpleNamespace(model="glm-5.3-maya-xs", mm3_quant=None)              # (its setup id, any case)
+        self.assertIsNone(maya.model_option(a))
+        self.assertEqual(a.model, "GLM-5.3-Maya-XS")
+        self.assertTrue(maya.g53_choice(("download", "GLM-5.3-Maya-XS")))
         self.assertTrue(maya.g53_choice(("download", "GLM-5.3-UD-IQ2_M")))
         self.assertFalse(maya.g53_choice(("download", "Maya-M")))
 
@@ -290,12 +337,15 @@ class Download(unittest.TestCase):
         got, on, default = self.rows()
         rows = on[:len(flash)]                                                      # (Flash's rows first)
         self.assertFalse(any("744B" in r[0] for r in rows))
-        self.assertEqual(on[len(rows)][0], "GLM-5.3 (744B) · UD-IQ2_M, text only: download 238.6 GB from Hugging Face")
-        self.assertIn("every expert stays in memory from about 245 GB of VRAM and RAM together", on[len(rows)][2])
-        self.assertIn("GGUF files you already have", on[len(rows) + 1][0])
+        self.assertEqual(on[len(rows)][0], "GLM-5.3 (744B) · Maya-XS, text only: download 170.0 GB from Hugging Face")
+        self.assertIn("every expert stays in memory from about 176 GB of VRAM and RAM together", on[len(rows)][2])
+        self.assertEqual(on[len(rows) + 1][0],
+                         "GLM-5.3 (744B) · UD-IQ2_M, text only: download 238.6 GB from Hugging Face")
+        self.assertIn("every expert stays in memory from about 245 GB of VRAM and RAM together", on[len(rows) + 1][2])
+        self.assertIn("GGUF files you already have", on[len(rows) + 2][0])
         self.assertEqual((got, default), (("download", flash[0]), 0))
         _, metal, _ = self.rows("metal")
-        self.assertFalse(any("UD-IQ2_M" in r[0] for r in metal))                    # (not on Metal)
+        self.assertFalse(any("UD-IQ2_M" in r[0] or "Maya-XS," in r[0] for r in metal))   # (not on Metal)
 
     def test_metal_refused_before_the_download(self):
         a = SimpleNamespace(backend="metal", model_dir=None, gguf_dir=None, model="GLM-5.3-UD-IQ2_M", yes=True)
@@ -320,6 +370,7 @@ class Download(unittest.TestCase):
         self.assertIn("about 245 GB of VRAM and RAM together (this PC: 279 GB)", note)
         self.assertNotIn("tok/s", note)
         self.assertNotIn("this PC", maya.g53_memory_note())
+        self.assertIn("about 176 GB of VRAM and RAM together", maya.g53_memory_note(quant="GLM-5.3-Maya-XS"))
 
 
 if __name__ == "__main__":

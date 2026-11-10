@@ -215,6 +215,62 @@ void test_tuner() {
     gs::tuner_reset();
 }
 
+// S3: "no drafting" as the tuner's candidate 0 (STRATA_GLM_SPEC_TUNE_PLAIN=1; ctest runs this file with and without)
+void test_tuner_plain() {
+    std::printf("[head tuner: no drafting as a candidate]\n");
+    gs::HeadTuner t;
+    t.n = 3;
+    t.window = 100;
+    t.feed(0, 100, 100 * 5.0);
+    check(t.tokens[0] == 0 && t.ms_per_token(0) > 1e29, "plain off: head 0 is never fed nor measured");
+    t.plain = true;
+    check(t.pick(3, 2) == 2, "plain on, nothing measured: the priced head first");
+    t.feed(2, 100, 100 * 20.0);
+    t.feed(1, 100, 100 * 25.0);
+    check(t.pick(3, 2) == 0, "every head measured: no drafting next");
+    t.feed(0, 100, 100 * 19.8);
+    check(t.pick(3, 2) == 2, "no drafting within 2% of the best head (19.8 vs 20 ms): drafting stays");
+    t.feed(0, 100, 100 * 15.0);
+    check(near(t.ms_per_token(0), 17.4) && t.pick(3, 2) == 0, "no drafting 13% faster: it is kept (0)");
+    t.feed(2, 1000, 1000 * 10.0);
+    check(t.pick(3, 2) == 2, "cumulative: drafting again when its average drops below");
+    gs::HeadTuner u;
+    u.n = 3;
+    u.window = 100;
+    check(u.pick(3, 1) == 1 && !u.plain, "a default tuner: no plain candidate");
+    // the process path: tune_plain_turn only after the split's first speculative decode set the tuner up
+    gs::tuner_reset();
+    gs::spec_clear_prices();
+    const int w = gs::spec_tune_window();
+    check(!gs::tune_plain_turn(3, nullptr), "no tuner for 3 parts yet: drafting first");
+    check(!gs::tune_plain_turn(2, nullptr), "two parts: never");
+    if (!gs::spec_tune_plain()) {
+        gs::tune_begin();
+        (void) gs::spec_head_parts(3, nullptr, true);
+        gs::tune_end(w);
+        gs::tune_begin();
+        (void) gs::spec_head_parts(3, nullptr, true);
+        gs::tune_end(w);
+        check(!gs::tune_plain_turn(3, nullptr) && !gs::tuner_state().plain, "STRATA_GLM_SPEC_TUNE_PLAIN unset: never plain");
+        gs::tuner_reset();
+        return;
+    }
+    gs::tune_begin();
+    check(gs::spec_head_parts(3, nullptr, true) == 1, "first decode: head 1 (n / 2)");
+    gs::tune_end(w);
+    check(!gs::tune_plain_turn(3, nullptr), "head 2 is not measured yet: no plain turn");
+    gs::tune_begin();
+    check(gs::spec_head_parts(3, nullptr, true) == 2, "then head 2");
+    gs::tune_end(w);
+    check(!gs::tune_plain_turn(3, "1"), "a pinned head: no plain turn");
+    check(gs::tune_plain_turn(3, "auto"), "both heads measured: the plain turn");
+    gs::tune_end(w);
+    const gs::HeadTuner st = gs::tuner_state();
+    check(st.plain && st.tokens[0] == w && st.tokens[1] == w && st.tokens[2] == w, "the plain turn fed head 0");
+    check(gs::spec_head_parts(3, nullptr, true) >= 1, "spec_head_parts never returns 0");
+    gs::tuner_reset();
+}
+
 void test_accept() {
     std::printf("[acceptance]\n");
     gs::AcceptStats s;
@@ -311,6 +367,7 @@ int main() {
     test_price_redo();
     test_head_rule();
     test_tuner();
+    test_tuner_plain();
     test_accept();
     test_rows();
     std::printf("%s (%d failure%s)\n", g_fail ? "FAILED" : "PASSED", g_fail, g_fail == 1 ? "" : "s");

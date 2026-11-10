@@ -20,7 +20,7 @@ FAMILIES = ("glm", "deepseek", "minimax", "qwen")
 # ("qwen": CYBER-FROST-3.8-PS, the Qwen3.8-Flash-Next fine-tune - qwen4exp, on the `maya` engine's own Qwen path)
 MODEL = {"glm": "GLM-5.3-Flash", "deepseek": "DeepSeek-V4.1-Flash-1017", "minimax": "MiniMax-M3.1-Flash",
          "qwen": "CYBER-FROST-3.8-PS"}
-SHOWN = {"glm": "GLM-5.3", "deepseek": "DeepSeek V4.1", "minimax": "MiniMax M3.1",
+SHOWN = {"glm": "GLM-5.3-Flash", "deepseek": "DeepSeek V4.1", "minimax": "MiniMax M3.1",
          "qwen": "Qwen-3.8-Flash-Next (CYBER-FROST)"}   # the model's name on screen (the chat header: serve/web/lib.js's
                                                          # modelName(id, true), "Qwen-3.8-Flash-Next"); its ids stay
 SEP = " · "
@@ -309,7 +309,7 @@ def exl3_bits(cfg: dict) -> str | None:
 
 
 def config_label(cfg: dict) -> str | None:
-    """What a config runs, as users see it ("GLM-5.3 · Maya-S24"; GLM-5.3 itself: "GLM-5.3 (744B) · UD-IQ2_M"), or
+    """What a config runs, as users see it ("GLM-5.3-Flash · Maya-S24"; GLM-5.3 itself: "GLM-5.3 (744B) · UD-IQ2_M"), or
     None for a config the setup did not write."""
     if not isinstance(cfg.get("installer"), dict):
         return None

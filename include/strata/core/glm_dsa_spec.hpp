@@ -105,15 +105,28 @@ int spec_head_parts(int n_parts, const char* env, bool dsa);
 struct HeadTuner {
     int n = 0;                          ///< the split's parts (a new n resets)
     int window = 128;
-    std::array<double, 8> ms{};         ///< by head
+    std::array<double, 8> ms{};         ///< by head (index 0: no drafting, when `plain`)
     std::array<int64_t, 8> tokens{};
     bool settled_logged = false;
-    /// The head for the next decode (stable until feed): the first candidate (base, then 1 .. n-1) short of the
-    /// window, else the fastest measured.
+    /// "no drafting" (the token-by-token decode, the same tokens) is a candidate too, as head 0: measured after the
+    /// heads, kept only when it is faster than the fastest head by kPlainMargin (drafting stays the default when the
+    /// two are within the noise).  STRATA_GLM_SPEC_TUNE_PLAIN=1 (off by default until measured on the GPUs).
+    bool plain = false;
+    static constexpr double kPlainMargin = 0.02;
+    /// The head for the next decode (stable until feed): the first candidate (base, then 1 .. n-1, then 0 when
+    /// `plain`) short of the window, else the fastest measured.  0 = decode token by token.
     int pick(int n_parts, int base) const;
     void feed(int head, int64_t n_tokens, double wall_ms);
     double ms_per_token(int head) const;
 };
+/// STRATA_GLM_SPEC_TUNE_PLAIN (default off; read once): the tuner also measures the token-by-token decode.
+bool spec_tune_plain();
+/// The tuner's no-drafting turn (glm-dsa, n_parts >= 3, STRATA_GLM_SPEC_HEAD unset / "auto", the tuner and
+/// spec_tune_plain on, after the split's first speculative decode): true when the next decode should go token by token
+/// (the plain candidate is short of its window, or measured fastest) - its clock then runs as tune_begin's, and
+/// tune_end(produced) after the plain loop feeds it as head 0.  false: decode_spec as before.  head_env:
+/// STRATA_GLM_SPEC_HEAD (nullptr = unset).
+bool tune_plain_turn(int n_parts, const char* head_env);
 /// The window from STRATA_GLM_SPEC_TUNE (0: the tuner is off).
 int spec_tune_window();
 /// B15.7: true when the random-routing bench mode is on (STRATA_GLM_RANDOM_ROUTING=1): Glm5Model::spec_ready() then

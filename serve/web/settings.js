@@ -12,7 +12,7 @@ import {DEFAULTS, LEVELS, P, PENALTIES, PRESETS, S, confirmDialog, copyText, emi
 import {usd} from "./sidebar.js";
 import {GLM_KV_BYTES, confirmContext, confirmPort, ctxEstimate, ctxHint, ctxStops, fetchReport, loadCtxInfo, loadMcp, loadPortInfo, loadShared,
         budgetError, loadThinkBudget, saveThinkBudget, loadTime, loadUpdate, saveShared, startUpdate, syncShared} from "./server.js";
-import {chatInstructions, clearBrowser, estimateTokens, updateCtxMeter} from "./chats.js";
+import {ablateOf, chatInstructions, clearBrowser, estimateTokens, setAblate, updateCtxMeter} from "./chats.js";
 import {codeBlock, onCodeClick} from "./md.js";
 import {openModelSheet} from "./models.js";
 import {TurboButton} from "./turbo.js";
@@ -196,6 +196,9 @@ function ChatDefaults() {
           onInput=${(e) => set({seed: e.target.value.replace(/\D/g, "")})}/></label>
     </div>
     <${ThinkBudget}/>
+    ${(S.health.ablate || {}).available && html`<${Row} label="Refusal ablation (this chat)"
+        sub="Projects the model's refusal direction out of its answers. Off by default; the model's own default is on the Models page.">
+      <${Switch} label="Refusal ablation (this chat)" on=${ablateOf() === true} onChange=${setAblate}/><//>`}
     <div class="set-block set-block--pens"><span class="set-row__sub">Penalties: none by default (no model has any as a standard). Set one to discourage repeats.</span>
     <div class="set-pair set-pair--3">
       ${[["repetition_penalty", "Repetition", "1.0 off, e.g. 1.1"], ["frequency_penalty", "Frequency", "0 off, e.g. 0.3"],

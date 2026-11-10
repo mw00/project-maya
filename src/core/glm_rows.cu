@@ -308,6 +308,9 @@ bool Glm5Model::rows_layers(RowSeq* rw, int n, std::string& err) {
     // (kda_layers is built for head_dim 128, as the window commit's replay: else the KDA one row at a time)
     const bool kda_batch = batch && !dup && g.kda_head_dim == 128;
     gf::HcArgs hb[gf::kMaxMvNt];
+    // --ablate: each row's writes by its own conversation's setting (the runs of rows that project, a launch a run)
+    int abl_seqs[gf::kMaxMvNt];
+    for (int i = 0; i < n && i < gf::kMaxMvNt; ++i) abl_seqs[i] = rw[i].seq;
     for (int il = l0_; il < l1_; ++il) {
         const auto& Ly = F->L[(size_t) il];
         gf::HcArgs h;
@@ -341,6 +344,7 @@ bool Glm5Model::rows_layers(RowSeq* rw, int n, std::string& err) {
         h.w_scale = Ly.hc_attn_scale;
         h.w_base = Ly.hc_attn_base;
         h.norm_w = Ly.attn_norm;
+        if (il != l0_) ablate_runs(S->ffn, abl_seqs, n, s);
         for (int i = 0; i < n; ++i) {
             hc_row(i, il == l0_ ? nullptr : rows(S->ffn, E, i));
             if (il != l0_) std::swap(rw[i].Rc, rw[i].Ro);
@@ -429,6 +433,7 @@ bool Glm5Model::rows_layers(RowSeq* rw, int n, std::string& err) {
         h.w_scale = Ly.hc_ffn_scale;
         h.w_base = Ly.hc_ffn_base;
         h.norm_w = Ly.ffn_norm;
+        ablate_runs(S->mixer, abl_seqs, n, s);
         for (int i = 0; i < n; ++i) {
             hc_row(i, rows(S->mixer, E, i));
             std::swap(rw[i].Rc, rw[i].Ro);
@@ -451,6 +456,7 @@ bool Glm5Model::rows_layers(RowSeq* rw, int n, std::string& err) {
         }
     }
     // the last layer's write half, per row; the residual back at the arena's start (the token path's convention)
+    ablate_runs(S->ffn, abl_seqs, n, s);
     for (int i = 0; i < n; ++i) {
         gf::hc_post(rows(S->ffn, E, i), rw[i].Rc, rows(S->post, 8, i), rows(S->comb, 16, i), E, rw[i].Ro, s);
         if (rw[i].Ro != rw[i].res)

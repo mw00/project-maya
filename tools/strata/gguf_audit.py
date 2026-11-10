@@ -68,6 +68,9 @@ UPCAST_BF16 = {F16, 2, 3, 6, 7, 20}
 # strata_mmq template instances in CMakeLists.txt (read from the file when found, see mmq_types())
 MMQ_FALLBACK = {"q2_0", "iq2_xxs", "iq2_xs", "iq2_s", "iq3_xxs", "iq3_s", "iq4_nl", "iq4_xs", "q8_0", "iq1_s",
                 "q2_k", "q3_k", "q4_k", "q5_k", "q6_k"}
+# routed types without an MMQ instance that the prompt path multiplies in FP16 instead (dequantized by llama.cpp's
+# convert.cu, cuBLAS / hipBLAS; src/core/glm_prefill.cu expert_f16): only those matrices, the prompt stays batched
+F16_EXPERT = {"IQ1_M", "Q4_0", "Q4_1", "Q5_0", "Q5_1"}
 
 # section 3.2 A2: glm-dsa geometry (key suffix after "glm-dsa.")
 GEOMETRY = [
@@ -586,7 +589,7 @@ class Audit:
                 c.fail("blk.%d gate %s != up %s (iq_pack requires equal gate/up types)" % (i, g["gate"].tname, g["up"].tname))
         c.info("types (tensor count): " + ", ".join("%s %d" % kv for kv in sorted(hist.items())))
         if "IQ1_M" in hist:
-            c.info("IQ1_M experts decode, but have no MMQ instance (see A5)")
+            c.info("IQ1_M experts decode; the prompt path multiplies them in FP16 (no MMQ instance, see A5)")
         return c
 
     def a5(self) -> Check:
@@ -598,8 +601,12 @@ class Audit:
                 if t is not None and t.type not in mmq:
                     bad.setdefault(t.tname, []).append(i)
         for tn, layers in sorted(bad.items()):
-            c.fail("%s on %d layers (e.g. blk.%d) has no strata_mmq instance: whole prompt token by token"
-                   % (tn, len(set(layers)), layers[0]))
+            if tn in F16_EXPERT:
+                c.warn("%s on %d layers (e.g. blk.%d) has no strata_mmq instance: those matrices take the FP16 "
+                       "products (slower than MMQ), the prompt stays batched" % (tn, len(set(layers)), layers[0]))
+            else:
+                c.fail("%s on %d layers (e.g. blk.%d) has no strata_mmq instance: whole prompt token by token"
+                       % (tn, len(set(layers)), layers[0]))
         c.info("strata_mmq types: " + ", ".join(sorted(type_name(x) for x in mmq)))
         return c
 

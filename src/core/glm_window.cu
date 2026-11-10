@@ -903,6 +903,9 @@ bool Glm5Model::fast_window_layers(int64_t p0, int T, std::string& err) {
     };
     const auto hc_rows = [&](int il, bool attn, int rc, int t0, int n) {
         const auto& Ly = F->L[(size_t) il];
+        // (--ablate: the window's rows are the bound conversation's - their writes lose the direction first)
+        if (!attn) ablate(W.mixer + (size_t) t0 * E, n, s);
+        else if (il != l0_) ablate(W.ffn + (size_t) t0 * E, n, s);
         for (int t = t0; t < t0 + n; ++t) {
             gf::HcArgs h;
             h.block_out = attn ? (il == l0_ ? nullptr : W.ffn + (size_t) t * E) : W.mixer + (size_t) t * E;
@@ -1028,6 +1031,7 @@ bool Glm5Model::fast_window_layers(int64_t p0, int T, std::string& err) {
     }
     // the last layer's write half: R (in the other buffer) = post x ffn + comb . R
     const int rc = rc_in[(size_t) (l1_ - l0_)];
+    ablate(W.ffn, T, s);
     for (int t = 0; t < T; ++t)
         gf::hc_post(W.ffn + (size_t) t * E, W.R[rc] + (size_t) t * hcE, W.post + (size_t) t * 8,
                     W.comb + (size_t) t * 16, E, W.R[rc ^ 1] + (size_t) t * hcE, s);

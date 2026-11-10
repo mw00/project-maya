@@ -165,7 +165,7 @@ bool lane_row4_on() {
     const int o = g_override.load(std::memory_order_relaxed);
     if (o >= 0) return o != 0;
     static const bool env = [] {
-        return strata::glmenv::env_flag("STRATA_GLM_LANE_ROW4", false);
+        return strata::glmenv::env_flag("STRATA_GLM_LANE_ROW4", true);   // (default on: bit-identical, faster)
     }();
     return env;
 }

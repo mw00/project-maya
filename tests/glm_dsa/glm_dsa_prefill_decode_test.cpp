@@ -217,10 +217,13 @@ bool run_model(const fs::path& pack, bool batched, const std::vector<int32_t>& p
 
 int main(int argc, char** argv) {
     const bool native32 = argc > 1 && std::string(argv[1]) == "--native32";
+    // --iq1m: PFIQ1M, a geometry the batched prompt path covers (PACK9's 4 heads run it token by token) with IQ1_M
+    // experts in gate/up, in down and in both - the matrices MMQ has no instance for take the FP16 expert products
+    const bool iq1m = argc > 1 && std::string(argv[1]) == "--iq1m";
     std::printf("glm_dsa_prefill_decode_test: the batched prompt vs the token path, then decode%s\n",
-                native32 ? " (native Q8_0 W_kb / W_vb pack)" : "");
+                native32 ? " (native Q8_0 W_kb / W_vb pack)" : iq1m ? " (IQ1_M experts, the batched geometry)" : "");
     std::string why, err;
-    const fs::path gguf = glmfx::synth("PACK9", why);
+    const fs::path gguf = glmfx::synth(iq1m ? "PFIQ1M" : "PACK9", why);
     fs::path pack = gguf.empty() ? fs::path() : (native32 ? pack_native32(gguf, why) : glmfx::pack(gguf, why));
     if (pack.empty()) {
         return glmfx::fixture_missing("glm_dsa_prefill_decode_test", why);
@@ -240,8 +243,10 @@ int main(int argc, char** argv) {
     setenv("STRATA_GLM_SPLIT", "0", 1);
     setenv("STRATA_GLM_MTP", "1", 1);
     setenv("STRATA_GLM_PREFILL_MIN", "1", 1);
+    // (PFIQ1M's pool holds every expert, so it lends the prompt path nothing by itself: a fixed 512 MB, two chunks)
+    if (iq1m) setenv("STRATA_GLM_PREFILL_MB", "512", 0);
     for (const char* v : {"STRATA_GLM_IDX_FP16", "STRATA_GLMD_FUSED_MLA", "STRATA_GLMD_IDX_WMMA", "STRATA_GLMD_TOPK_MB",
-                          "STRATA_GLM_DSA_GRAPHS"})
+                          "STRATA_GLM_DSA_GRAPHS", "STRATA_GLM_PREFILL_F16_ROWS"})
         if (const char* x = getenv(v)) std::printf("  (%s=%s)\n", v, x);
     // a prompt past top_k: the decode selects among keys the prompt path wrote
     const int L = std::min<int>((int) kCtx - kDecode - 8, g.idx_top_k + 64);
@@ -318,6 +323,12 @@ int main(int argc, char** argv) {
     check(max_rel < 0.15 && top1 * 10 >= (int) A.logits.size() * 9, buf);
     std::snprintf(buf, sizeof buf, "NextN drafts agree %d / %zu", drafts, A.drafts.size());
     check(drafts * 10 >= (int) A.drafts.size() * 8, buf);
+    if (iq1m) {   // the token path again would give the same logits bit for bit (prefill_tokens_dsa's fallback)
+        const double e = rel_l2(B.logits[0], A.logits[0]);
+        std::snprintf(buf, sizeof buf, "the batched prompt path ran (logits after the prompt differ from the token "
+                                       "path's: rel L2 %.2e > 0)", e);
+        check(e > 0, buf);
+    }
     if (g_fail) {
         std::printf("glm_dsa_prefill_decode_test: %d FAILED\n", g_fail);
         return 1;

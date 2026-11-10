@@ -323,6 +323,20 @@ function contextRow(m, d, ch, cost, keys = [], extra = null) {
       hint=${ctxHint(n, {live: m.running && !ch(...keys), now, ...cost})} onChange=${(v) => setDraft({context: v})}/>`}/>`;
 }
 
+// refusal ablation's default for this model (requests that leave `ablate` out; each chat and app can still choose):
+// on the first tab, only where the model has a direction file and an engine for it (or a default left on from
+// earlier, so it can be switched off) - no switch otherwise
+function withAblate(tabs, m, d) {
+  const c = (m.choices && m.choices.ablate) || {available: false, why: "this Maya has no refusal ablation"};
+  if (!c.available && !d.ablate && !(m.settings && m.settings.ablate)) return tabs;
+  const row = html`<${Row} label="Refusal ablation" flag="--ablate" changed=${!same(d.ablate, m.settings.ablate)}
+    hint=${c.available ? "The default for chats and apps that do not choose: projects the model's refusal direction out of its answers. Takes effect at once, no restart."
+      : `Not available: ${c.why}.`}>
+    <${Switch} label="Refusal ablation" on=${!!d.ablate} disabled=${!c.available && !d.ablate}
+      onChange=${(v) => setDraft({ablate: v})}/><//>`;
+  return tabs.length ? [{...tabs[0], rows: [...tabs[0].rows, row]}, ...tabs.slice(1)] : tabs;
+}
+
 function fieldsOf(m, d) {
   const s = m.settings, ch = (...ks) => ks.some((k) => !same(d[k], s[k])), glm = m.family === "glm";
   const per = Math.max(1, Number(d.parallel) || 1);   // (several answers at once: a cache each)
@@ -562,7 +576,7 @@ function Editor({m}) {
   if (!d) return null;
   const rows = d.envRows || Object.entries(d.env || {});
   const setEnv = (r) => setDraft({envRows: r});
-  const tabs = [...fieldsOf(m, d), {label: "Advanced", adv: true}];
+  const tabs = [...withAblate(fieldsOf(m, d), m, d), {label: "Advanced", adv: true}];
   const tab = Math.min(MS.tab, tabs.length - 1);
   const sent = toSend(d);
   const keys = Object.keys(s);

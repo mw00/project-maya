@@ -28,6 +28,23 @@ export const thinkingOf = (c = S.current) => {
   if (f && !f.startsWith("|") && S.health.model && f !== modelId()) return P.thinking;
   return levelFor(c.thinking) || P.thinking;
 };
+// refusal ablation (the model's direction projected out, GEN ablate=1): the chat's own switch where the running model
+// has a direction loaded (/health's ablate.available), else the model's default (the Models page's); a chat's pick is
+// for the model it was made under (as its thinking level: it does not carry over to another model)
+export const ablateOf = (c = S.current) => {
+  const a = S.health.ablate || {};
+  if (!a.available) return null;                 // (no direction: the request leaves `ablate` out)
+  if (c && typeof c.ablate === "boolean" && c.ablateFor === modelId()) return c.ablate;
+  return !!a.default;
+};
+export function setAblate(on) {
+  const c = S.current;
+  if (!c) return;
+  c.ablate = !!on;
+  c.ablateFor = modelId();
+  if (c.messages.length) persist(c);
+  emit();
+}
 export function setThinking(level) {
   const c = S.current;
   c.thinking = level;
@@ -410,6 +427,8 @@ export async function answer(resumeJob = null) {
     for (const k of PENALTIES) if (P[k] !== "" && P[k] != null && Number.isFinite(+P[k])) body[k] = +P[k];
     if (P.seed) body.seed = +P.seed;
     if (P.max) body.max_tokens = +P.max;
+    const abl = ablateOf(chat);                    // (only with a direction loaded: else the body as before)
+    if (abl !== null) body.ablate = abl;
     if (mcpOn()) body.strata_mcp = true;           // this server may run MCP tools for it
     // the server keeps the answer running if this connection drops (a phone's screen sleeping mid-answer, or a reload):
     // the page reconnects to it by id and carries on from the last chunk it read (strata_resume)

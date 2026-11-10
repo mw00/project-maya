@@ -113,27 +113,38 @@ def tensor_class(name: str) -> str:
 
 
 # B10.7 (glm-dsa): the engine's mv() reads the 32-value block types (glmd_mv_ext.cuh) and the headwise MLA GEMVs read
-# native Q8_0 W_kb / W_vb (glmd::headwise).  Behind STRATA_PACK_NATIVE32=1 the pack stops upcasting them: the
-# UPCAST_TYPES of the mv tensors and Q8_0 attn_k_b / attn_v_b stay native.  Default off until the hardware parity
-# run (BUILD-PLAN B10.7: greedy 64 tokens identical or KLD < 1e-4 vs the BF16-upcast build); the binder must use
-# glmdsa::pick_headwise for attn_k_b / attn_v_b before a native32 pack is loaded.
+# native Q8_0 W_kb / W_vb (glmd::headwise).  Q8_0 attn_k_b / attn_v_b stay native by default: the GGUF's own weights,
+# where the BF16 copy rounded every one of them (and ~1 GB less to read a token); STRATA_PACK_NATIVE32=0 upcasts them
+# as before.  STRATA_PACK_NATIVE32=1 also keeps the UPCAST_TYPES of the mv tensors native (opt-in, not validated as a
+# default).  The binder serves either through glmdsa::pick_headwise.
 HEADWISE = ("attn_k_b.weight", "attn_v_b.weight")
 HEADWISE_NATIVE_TYPES = ("Q8_0",)
 
 
 def native32_enabled() -> bool:
-    return os.environ.get("STRATA_PACK_NATIVE32", "0") not in ("", "0")
+    """The mv tensors' 32-value block types native: STRATA_PACK_NATIVE32=1 only."""
+    return os.environ.get("STRATA_PACK_NATIVE32", "") not in ("", "0")
 
 
-def plan_tensor(name: str, type_name: str, native32: bool | None = None) -> tuple[str, str]:
+def headwise_native_enabled() -> bool:
+    """Q8_0 W_kb / W_vb native: the default; STRATA_PACK_NATIVE32=0 upcasts them to BF16."""
+    return os.environ.get("STRATA_PACK_NATIVE32", "").strip() != "0"
+
+
+def plan_tensor(name: str, type_name: str, native32: bool | None = None,
+                headwise: bool | None = None) -> tuple[str, str]:
     """(what, target) for a non-routed tensor: what = 'native' (served from the GGUF), 'copy' (dense.bin as
     stored), 'convert' (dequantized into dense.bin) or 'refuse'; target = the dense type (BF16/F32) or a reason.
-    native32 (default: STRATA_PACK_NATIVE32) keeps the B10.7 types native instead of upcasting them."""
+    native32 (default: STRATA_PACK_NATIVE32=1) keeps the mv tensors' B10.7 types native instead of upcasting them;
+    headwise (default: on unless STRATA_PACK_NATIVE32=0; an explicit native32 decides it too) keeps Q8_0 W_kb / W_vb
+    native."""
+    if headwise is None:
+        headwise = native32 if native32 is not None else headwise_native_enabled()
     if native32 is None:
         native32 = native32_enabled()
     cls = tensor_class(name)
     float_kind = {"BF16": "BF16", "F32": "F32"}
-    if cls == "bf16" and native32 and name.endswith(HEADWISE) and type_name in HEADWISE_NATIVE_TYPES:
+    if cls == "bf16" and headwise and name.endswith(HEADWISE) and type_name in HEADWISE_NATIVE_TYPES:
         return "native", type_name
     if cls == "native" and native32 and type_name in UPCAST_TYPES and type_name not in float_kind:
         return "native", type_name

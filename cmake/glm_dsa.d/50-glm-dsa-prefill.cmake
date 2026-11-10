@@ -65,4 +65,14 @@ if(STRATA_BUILD_TESTS AND (STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP) AND TARGET s
   endif()
   add_test(NAME glmd_mmq_ids_test COMMAND glmd_mmq_ids_test)
   set_tests_properties(glmd_mmq_ids_test PROPERTIES LABELS gpu SKIP_RETURN_CODE 77 TIMEOUT 900)
+  # GPU: the FP16 expert products of the types MMQ has no instance for (IQ1_M; Q4_0 / Q4_1 / Q5_0 / Q5_1): the
+  # route, to_f16 == FP16(ggml's to_float) bit for bit, and cuBLAS's product at GLM-5.3's expert shapes
+  add_executable(glmd_f16_experts_test tests/glm_dsa/glmd_f16_experts_test.cu)
+  target_include_directories(glmd_f16_experts_test PRIVATE ${_strata_gpu_include_directories})
+  target_link_libraries(glmd_f16_experts_test PRIVATE strata_mmq ggml-base ${_strata_gpu_blas_target})
+  if(STRATA_ENABLE_HIP)
+    target_link_libraries(glmd_f16_experts_test PRIVATE ${_strata_gpu_runtime_target})
+  endif()
+  add_test(NAME glmd_f16_experts_test COMMAND glmd_f16_experts_test)
+  set_tests_properties(glmd_f16_experts_test PROPERTIES LABELS gpu SKIP_RETURN_CODE 77 TIMEOUT 600)
 endif()

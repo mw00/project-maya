@@ -183,4 +183,30 @@ inline bool ram_class_plan(uint64_t budget, const std::vector<size_t>& stride,
     return true;
 }
 
+// The room a RAM tier keeps pinnable above it under a pinning cap (Windows).  `cap`: the bytes pinned under the cap
+// plus what more pinned when it was measured (before that: what the tier holds so far).  512 MB by default - the
+// driver's own buffers for a pageable copy (#105); on NVIDIA more held experts back that the disk then served (#129).
+// A discrete AMD card under Windows (HIP) failed its start with the tier 512 MB under the cap ("the warmed expert
+// tables did not upload (unspecified launch failure)") and started with it a few GB under, lower for a model with
+// larger experts (#924): there the room is a tenth of the cap, so it follows the cap measured with this model's own
+// buffers in place.  `room_mb` >= 0 (STRATA_GLM_PIN_ROOM_MB) sets it.  Rounded up to whole 256 MB (pin_room's probes).
+inline int64_t pin_cap_room(bool discrete_amd_windows, int64_t cap, int64_t room_mb) {
+    static constexpr int64_t kStep = int64_t{256} << 20, kRoom = int64_t{512} << 20;
+    const auto up = [](int64_t b) { return (b + kStep - 1) & ~(kStep - 1); };
+    if (room_mb >= 0) return up(std::min<int64_t>(room_mb, int64_t{1} << 30) << 20);
+    if (!discrete_amd_windows) return kRoom;
+    return std::max(kRoom, up(std::max<int64_t>(0, cap) / 10));
+}
+
+// The shared GPU memory a Windows APU's RAM tier leaves free above it and what is pinned after it (glm_fast_path's
+// apu_shared_room): an eighth of Windows' shared GPU memory limit, 1 to 4 GB, in whole 256 MB.  With the prompt
+// path's buffers in place (a GLM-5.3 quant the batched prompt path now covers) a Radeon 8065S (15.84 GB limit) failed
+// its start with the tier 0.96 GB under the limit - the same "warmed expert tables did not upload (unspecified launch
+// failure)" as #924's discrete card - and started with it 1.71 GB under; 1 GB was enough while those buffers were not
+// there.  That limit keeps 2 GB; the buffers do not grow with the limit, hence the 4 GB ceiling.
+inline int64_t apu_shared_margin(int64_t limit) {
+    static constexpr int64_t kStep = int64_t{256} << 20, kMin = int64_t{1} << 30, kMax = int64_t{4} << 30;
+    return std::min(kMax, std::max(kMin, (std::max<int64_t>(0, limit) / 8 + kStep - 1) & ~(kStep - 1)));
+}
+
 }  // namespace strata::core::glmfast

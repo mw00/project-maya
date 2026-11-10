@@ -299,9 +299,10 @@ class AuditTest(unittest.TestCase):
         self.assertOnly(self.build(f), {"A3": "WARN", "A11": "WARN"})
 
     # ---------------------------------------------------------------- A4, A5, A13
-    def test_a4_iq1_m_experts_fail_a5_only(self):
+    def test_a4_iq1_m_experts_warn_a5_only(self):
+        # (no MMQ instance: the prompt path multiplies those matrices in FP16 and stays batched - a warning, not a fail)
         a = self.build(self.mut_types(lambda n: n.endswith(("gate_exps.weight", "up_exps.weight")), T["IQ1_M"]))
-        self.assertOnly(a, {"A5": "FAIL", "A11": "WARN"})
+        self.assertOnly(a, {"A5": "WARN", "A11": "WARN"})
 
     def test_a4_iq4_nl_experts_fail(self):
         a = self.build(self.mut_types(lambda n: n == "blk.10.ffn_down_exps.weight", T["IQ4_NL"]))

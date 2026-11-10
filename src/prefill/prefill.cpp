@@ -56,6 +56,8 @@ void gather_native(const void*, const void*, size_t, const void*, size_t, void*,
 void gather_strata_q2(const uint8_t*, void*, void*, void*) {}
 void swiglu(const float*, float*, int64_t, int64_t, bool, void*) {}
 void iota(int32_t*, int64_t, void*) {}
+bool set_whole_tiles(bool) { return false; }
+bool whole_tiles() { return false; }
 }  // namespace strata::prefill::mmq
 #endif
 

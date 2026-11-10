@@ -298,6 +298,7 @@ bool parse_gen(const std::string& line, Req& r) {
         else if (k == "spec") r.spec = std::atoi(v.c_str()) != 0;
         else if (k == "dspark_conf" || k == "spec_min_p") r.conf = std::strtof(v.c_str(), nullptr);
         else if (k == "rid") r.rid = std::atoi(v.c_str());
+        else if (k == "ablate") r.ablate = std::atoi(v.c_str()) != 0;
         // (keys this engine does not use are taken and ignored)
     }
     return !r.ids.empty();
@@ -320,6 +321,8 @@ void serve_header(mm3::Model& m, bool spec_on, const std::string& kv_fmt) {
                  st0.resident, st0.experts, st0.pinned_gb);
     for (const std::string& l : m.info_lines()) std::fprintf(stderr, "maya-mm3: %s\n", l.c_str());
     for (const std::string& l : m.vram_lines()) std::fprintf(stderr, "maya-mm3: %s\n", l.c_str());
+    if (m.ablate_loaded())   // (--ablate: GEN ablate=0|1 turns its projection off / on for the request)
+        std::printf("INFO ablate=1 ablate_default=%d\n", m.ablating() ? 1 : 0);
     if (!m.vision()) std::printf("INFO vision=off\n");   // (no tower: the server answers text only)
     if (const mm3::VisionGeo* vg = m.vision())   // (serve/mm3_vision.py's Geometry.from_info)
         std::printf("INFO vision=mm3 image_token=%d image_start=%d image_end=%d vision_patch=%d vision_merge=%d "
@@ -330,6 +333,7 @@ void serve_header(mm3::Model& m, bool spec_on, const std::string& kv_fmt) {
 int serve(mm3::Model& m, const std::vector<int>& eos, int chunk, bool spec_on, float conf_floor, float draft_cost,
           const std::string& kv_fmt, const std::string& profile_out) {
     serve_header(m, spec_on, kv_fmt);
+    const bool abl_default = m.ablating();   // (a GEN without ablate=: as the engine started)
     std::printf("READY %d stop\n", m.max_ctx());
     std::fflush(stdout);
     std::fprintf(stderr, "maya mm3 serve: GEN <max_new> [keys] <ids>; GENI <max_new> [keys] <file> <ids>; STOP, QUIT\n");
@@ -390,6 +394,10 @@ int serve(mm3::Model& m, const std::vector<int>& eos, int chunk, bool spec_on, f
             if (x.start < (long long) from &&
                 std::none_of(held.begin(), held.end(), [&](const Held& q) { return x.start == q.start && x.hash == q.hash; }))
                 from = (size_t) x.start;
+        // abliteration: a cache read with the projection on shares nothing with a request that has it off (and back)
+        const bool abl = m.ablate_loaded() && (r.ablate >= 0 ? r.ablate != 0 : abl_default);
+        if (m.ablate_loaded() && abl != m.ablating()) from = 0;
+        m.set_ablate(abl);
         state.resize(from);
         held.clear();
         std::vector<mm3::Model::Image> rows;
@@ -673,6 +681,7 @@ int serve_multi(mm3::Model& m, const std::vector<int>& eos, int chunk, const std
                 const std::string& profile_out) {
     const int N = m.seqs();
     serve_header(m, false, kv_fmt);
+    const bool abl_default = m.ablating();   // (a GEN without ablate=: as the engine started)
     std::printf("READY %d stop multi=%d\n", m.max_ctx(), N);
     std::fflush(stdout);
     std::fprintf(stderr, "maya mm3 serve: %d conversations at once (--parallel); GEN <max_new> [keys] rid=<id> <ids>; "
@@ -689,6 +698,7 @@ int serve_multi(mm3::Model& m, const std::vector<int>& eos, int chunk, const std
     struct Seq {
         std::vector<int> state;   // the tokens in its cache, positions 0 ..
         std::vector<Held> held;   // the pictures in its cache
+        bool abl = false;         // its cache read with the --ablate projection (set by each request it takes)
         bool busy = false;
         unsigned long long used = 0;
     };
@@ -948,6 +958,7 @@ int serve_multi(mm3::Model& m, const std::vector<int>& eos, int chunk, const std
         // the sequence: idle, the longest shared start (the last token always read again: its logits are this
         // request's first; a picture before it in either must be in both, at the same place), else least recently
         // used - a short shared start never takes a longer conversation's cache while one drops nothing (pick_slot)
+        const bool abl = m.ablate_loaded() && (r.ablate >= 0 ? r.ablate != 0 : abl_default);
         std::vector<mm3::SlotView> views((size_t) N);
         for (int s = 0; s < N; ++s) {
             const Seq& S = seqs[(size_t) s];
@@ -957,6 +968,7 @@ int serve_multi(mm3::Model& m, const std::vector<int>& eos, int chunk, const std
             if (S.busy) continue;
             size_t from = 0;
             while (from < S.state.size() && from + 1 < r.ids.size() && S.state[from] == r.ids[from]) ++from;
+            if (S.abl != abl) from = 0;   // (abliteration: the other setting's cache shares nothing)
             for (const Held& q : S.held)
                 if (q.start < (long long) from && std::none_of(pics.begin(), pics.end(), [&](const Pic& x) {
                         return x.start == q.start && x.hash == q.hash;
@@ -989,6 +1001,9 @@ int serve_multi(mm3::Model& m, const std::vector<int>& eos, int chunk, const std
         const std::vector<int>& ids = g.r.ids;
         S.state.resize(bfrom);
         S.held.clear();
+        S.abl = abl;
+        m.bind(best);
+        m.set_ablate(abl);
         std::vector<mm3::Model::Image> rows;
         if (!(pics.empty() && std::find(ids.begin(), ids.end(), m.vision() ? m.vision()->image_token : -1) ==
                                   ids.end()) &&
@@ -1534,7 +1549,8 @@ int usage() {
                  "                [--prefill-gemm blas|hipblaslt|auto] [--prefill-tune FILE] [--no-prefill-tune]\n"
                  "                [--calibrate-prefill OUT.json [--ids @prompt]] [--calibrate-decode OUT.json] [--verbose]\n"
                  "                [--serve [--parallel N (1-8: conversations at once)]] [--parallel N --rows-check G]\n"
-                 "                [--ablate DIRECTION.gguf [--ablate-layer N] [--ablate-scale F]]\n"
+                 "                [--ablate DIRECTION.gguf [--ablate-layer N] [--ablate-scale F]\n"
+                 "                 [--ablate-default on|off]]   (--serve: GEN ablate=0|1 per request)\n"
                  "       maya-mm3 --pack DIR --encode-image FILE.rgb --size WxH --dump-image OUT [--gpus N]\n");
     return 2;
 }
@@ -1684,6 +1700,14 @@ int main(int argc, char** argv) {
         }
         else if (a == "--ablate-layer") o.ablate_layer = (int) num(1, 4096, true);
         else if (a == "--ablate-scale") o.ablate_scale = (float) num(1e-6, 1e6, false);
+        else if (a == "--ablate-default") {   // on (as before: every forward) | off (loaded; GEN ablate=1 turns it on)
+            const std::string v = val();
+            if (v != "on" && v != "off" && v != "1" && v != "0") {
+                std::fprintf(stderr, "--ablate-default: on or off\n");
+                std::exit(2);
+            }
+            o.ablate_default = v == "on" || v == "1";
+        }
         else if (a == "--verbose") o.verbose = true;
         else return usage();
     }

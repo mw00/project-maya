@@ -24,6 +24,9 @@ if(STRATA_BUILD_TESTS)
     target_link_libraries(glm_dsa_spec_test PRIVATE ${_strata_gpu_runtime_target})
   endif()
   add_test(NAME glm_dsa_spec_test COMMAND glm_dsa_spec_test)
+  # ... and with the head tuner's no-drafting candidate on (S3)
+  add_test(NAME glm_dsa_spec_test_plain COMMAND glm_dsa_spec_test)
+  set_tests_properties(glm_dsa_spec_test_plain PROPERTIES ENVIRONMENT "STRATA_GLM_SPEC_TUNE_PLAIN=1")
 
   # CPU: a rejected draft on the mixer twins - only row p written, the redo bit-identical, no stale selection.
   add_executable(glm_dsa_spec_rollback_test tests/glm_dsa/glm_dsa_spec_rollback_test.cpp src/core/glm_dsa_cpu_ref.cpp

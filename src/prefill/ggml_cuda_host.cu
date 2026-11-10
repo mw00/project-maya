@@ -2,6 +2,7 @@
 // and quantize code reference, for the MMQ kernels compiled into strata_mmq without the rest of ggml-cuda.cu.
 #include "common.cuh"
 #include "strata/prefill/failure.hpp"
+#include "strata/prefill/moe_mmq.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -61,7 +62,8 @@ int ggml_cuda_parse_amd_id(const char* device_name) {
 }  // namespace
 #endif
 
-const ggml_cuda_device_info & ggml_cuda_info() {
+namespace {
+ggml_cuda_device_info & cuda_info_mut() {
     static ggml_cuda_device_info info = [] {
         ggml_cuda_device_info in = {};
         int n = 0;
@@ -101,6 +103,39 @@ const ggml_cuda_device_info & ggml_cuda_info() {
     }();
     return info;
 }
+int g_nsm[GGML_CUDA_MAX_DEVICES] = {};   // (the devices' SM counts while whole tiles hold nsm at 1)
+bool g_whole = false;
+std::mutex g_whole_mu;
+}  // namespace
+
+const ggml_cuda_device_info & ggml_cuda_info() { return cuda_info_mut(); }
+
+// Whole tiles through the one input of mmq.cuh's launch that decides the split: with nsm 1 its tile efficiency is
+// 100 %, and on NVIDIA it then launches one block a tile (gridDim = ntiles: every block's k range is one whole tile,
+// no fixup) - upstream's own mode for launches that tile well.  (HIP's rule launches nsm blocks whatever the
+// efficiency, so nsm stays there: AMD's RDNA configs tile without stream-k anyway.)  Set before the products run.
+namespace strata::prefill::mmq {
+bool set_whole_tiles(bool on) {
+    std::lock_guard<std::mutex> lk(g_whole_mu);
+    const bool old = g_whole;
+#if !defined(GGML_USE_HIP)
+    auto & in = cuda_info_mut();
+    if (on != g_whole)
+        for (int id = 0; id < in.device_count; ++id) {
+            if (on) g_nsm[id] = in.devices[id].nsm;
+            in.devices[id].nsm = on ? 1 : g_nsm[id];
+        }
+    g_whole = on;
+#else
+    (void) on;
+#endif
+    return old;
+}
+bool whole_tiles() {
+    std::lock_guard<std::mutex> lk(g_whole_mu);
+    return g_whole;
+}
+}  // namespace strata::prefill::mmq
 
 namespace {
 // The prompt path's MMQ scratch, where the pool has no business taking VRAM: the part of the borrowed region

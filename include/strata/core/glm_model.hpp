@@ -757,6 +757,11 @@ public:
     bool spec_ready() const;
     bool decode_spec(strata::kernels::SamplerParams& sp, int64_t max_new, const std::function<bool(int)>& emit,
                      int64_t& produced, std::string& err);
+    /// GLM-5.3 on 3+ GPUs (the head tuner, glm_dsa_spec.hpp): true when this decode is the tuner's no-drafting turn -
+    /// the caller decodes token by token instead of decode_spec (the same tokens) and ends it with spec_plain_end.
+    bool spec_plain_turn();
+    void spec_plain_end(int64_t produced);
+    bool spec_plain_live_ = false;
     uint64_t spec_steps_ = 0, spec_hits_ = 0;              // speculative positions, accepted
     double spec_t_[4] = {0, 0, 0, 0};                      // STRATA_GLM_SPEC_PROF host phases of spec_head/tail
     int64_t spec_n_ = 0;
@@ -875,6 +880,26 @@ public:
         return seq_.empty() || s == cur_seq_ ? pos_ : seq_[(size_t) s].pos;
     }
     bool seq_pipe_ready(std::string& err);                 // the pipeline buffers (once)
+    /// Refusal ablation (--ablate, src/core/glm_ablate.hpp): ablate_load (after the load) reads the control vector and
+    /// puts a copy on every part, each conversation projecting it out (`on`) or not; set_ablate_seq / set_ablate (the
+    /// bound one) switch a conversation on every part - its state was read with one setting, so the serve loop starts
+    /// it over when a request asks for the other.  ablate() / ablate_runs(): the rows y (T x n_embd) of the bound
+    /// conversation / row i of conversation seqs[i] lose the direction - no launch where none asks.
+    bool ablate_load(const std::string& path, int layer, float scale, bool on, std::string& err);
+    bool ablate_loaded() const { return !abl_on_.empty(); }
+    const std::string& ablate_what() const { return abl_what_; }
+    void set_ablate_seq(int sq, bool on);
+    void set_ablate(bool on) { set_ablate_seq(cur_seq_, on); }
+    bool ablating() const { return abl_seq_on(cur_seq_); }
+    bool abl_seq_on(int sq) const {
+        return abl_r_ != nullptr && sq >= 0 && sq < (int) abl_on_.size() && abl_on_[(size_t) sq] != 0;
+    }
+    void ablate(float* y, int T, cudaStream_t s) const;
+    void ablate_runs(float* y, const int* seqs, int n, cudaStream_t s) const;
+    float* abl_r_ = nullptr;          // this part's copy of the direction (unit, n_embd) - null: no --ablate
+    float abl_scale_ = 0.0f;
+    std::vector<uint8_t> abl_on_;     // per conversation (seq_count()): projects or not
+    std::string abl_what_;            // the start-up line
     /// The pipelined decode: `token` of sequence s at its next position through every part and the head, sampled with
     /// `sp` (greedy when sp.greedy) on the tail's stream - nothing is waited for.  multi_take(s) waits for that token.
     bool multi_issue(int s, int32_t token, const strata::kernels::SamplerParams& sp, std::string& err);

@@ -25,6 +25,8 @@ Presets (geometry in PRESETS below):
           types on the 256-wide tensors, attn_k_b/attn_v_b in a 32-block type (--kb-type: Q8_0
           default, Q4_0, Q5_0, IQ4_NL, F16, BF16), router and norms F32.
   PACK9   PACK with 10 MoE layers whose (gate/up, down) expert types form 9 size classes (B3.7).
+  PFIQ1M  a geometry the batched prompt path covers (16 heads, 2 x n_ff_exp < n_embd) with IQ1_M experts
+          in gate/up, in down and in both, beside MMQ types: the prompt path's FP16 expert products.
 
 Determinism: every tensor is drawn from its own PCG64 stream seeded by (seed, crc32(name)), turned
 into values with IEEE-exact arithmetic only (no libm), quantized with deterministic code, and
@@ -135,6 +137,13 @@ PRESETS: dict[str, dict] = {
         expert_classes=[("IQ2_XXS", "Q2_K"), ("IQ2_S", "IQ3_XXS"), ("IQ2_XS", "Q3_K"),
                         ("IQ1_S", "IQ2_XXS"), ("Q2_K", "Q4_K"), ("IQ3_XXS", "IQ3_S"),
                         ("Q3_K", "Q5_K"), ("IQ3_S", "Q6_K"), ("IQ4_XS", "IQ4_XS")]),
+    "PFIQ1M": dict(   # (n_embd 768 > 2 x n_ff_exp: the down's outputs overlap later h rows, as at 6144 / 2048)
+        n_layer=4, nextn=1, n_embd=768, n_vocab=1024, n_head=16, q_lora=256, kv_lora=512, rope=64,
+        qk_nope=192, v_head=256, idx_heads=8, idx_dim=128, top_k=2048, n_expert=16, n_used=8,
+        n_ff_exp=256, n_ff=512, dense_lead=1, ctx=1048576, write_types=True, idx_on_shared=False,
+        hot_rows=0, hot_gain=1.0, idx_k_gain=1.0, arrays79=False, types=COMMUNITY_TYPES,
+        # 3 MoE layers + MTP (the MTP block repeats the first class)
+        expert_classes=[("IQ1_M", "IQ2_XXS"), ("IQ1_S", "IQ1_M"), ("IQ1_M", "IQ1_M")]),
 }
 LARGE_PRESETS = ("BIG", "WIDE")
 KB_TYPES = ("Q8_0", "Q4_0", "Q5_0", "Q4_1", "Q5_1", "IQ4_NL", "F16", "BF16", "F32")
@@ -191,6 +200,7 @@ _RANDOM_LAYOUT: dict[str, tuple[tuple[int, ...], float]] = {
     "Q2_K": ((80, 82), 1.5), "Q3_K": ((108,), 0.0), "Q4_K": ((0, 2), 7.5), "Q5_K": ((0, 2), 15.5),
     "Q6_K": ((208,), 0.0), "IQ2_XXS": ((0,), 0.0), "IQ2_XS": ((0,), 0.0), "IQ2_S": ((0,), 0.0),
     "IQ3_XXS": ((0,), 0.0), "IQ3_S": ((0,), 0.0), "IQ1_S": ((0,), 0.0), "IQ4_XS": ((0,), 0.0),
+    "IQ1_M": ((), 0.0),   # (its f16 scale is the top nibbles of the 4 scale words, bytes 48..55: random_blocks)
 }
 FLOAT_QUANT = ("Q8_0", "Q4_0", "Q4_1", "Q5_0", "Q5_1", "BF16")
 
@@ -213,6 +223,13 @@ def random_blocks(st: Streams, name: str, type_name: str, n_values: int, rms: fl
     data = st.bytes_(name, nb * bsz).reshape(nb, bsz)
 
     def set_scales(d: float) -> None:
+        if type_name == "IQ1_M":
+            h = int(np.array([d], dtype=np.float16).view(np.uint16)[0])
+            sc = np.ascontiguousarray(data[:, 48:56]).view("<u2").copy()
+            for k in range(4):
+                sc[:, k] = (sc[:, k] & 0x0FFF) | (((h >> (4 * k)) & 0xF) << 12)
+            data[:, 48:56] = sc.view(np.uint8).reshape(nb, 8)
+            return
         vals = [d, d * ratio] if len(offs) == 2 else [d]
         for off, v in zip(offs, vals):
             data[:, off:off + 2] = np.array([v], dtype=np.float16).view(np.uint8)

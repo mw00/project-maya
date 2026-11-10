@@ -4,10 +4,11 @@
 
 <h1 align="center">Project Maya</h1>
 
-<p align="center"><b>在你自己的 GPU 上运行 GLM-5.3-Flash (321 B)、DeepSeek-V4.1-Flash-1017 (748 B) 和 MiniMax-M3.1-Flash (428 B)</b><br>
+<p align="center"><b>在你自己的 GPU 上运行 GLM-5.3 (744 B)、GLM-5.3-Flash (321 B)、DeepSeek-V4.1-Flash-1017 (748 B) 和 MiniMax-M3.1-Flash (428 B)</b><br>
 私密且快速 · 1 块到最多 16 块 NVIDIA GPU · 支持 AMD 和 Windows · 聊天、图片、兼容 OpenAI 和 Anthropic 的 API · 同时处理多个请求</p>
 
 <p align="center">
+<a href="https://huggingface.co/peasantsmith/GLM-5.3-Maya-GGUF"><img src="https://raw.githubusercontent.com/mw00/project-maya/badges/glm53.svg" alt="GLM-5.3 Maya downloads"></a>
 <a href="https://huggingface.co/peasantsmith/GLM-5.3-Flash-Maya-GGUF"><img src="https://raw.githubusercontent.com/mw00/project-maya/badges/glm.svg" alt="GLM-5.3-Flash Maya downloads"></a>
 <a href="https://huggingface.co/peasantsmith/GLM-5.3-Flash-Maya-M-Derisked-IQ2_S-GGUF"><img src="https://raw.githubusercontent.com/mw00/project-maya/badges/glm-m-derisked.svg" alt="GLM-5.3-Flash Maya-M-Derisked downloads"></a>
 <a href="https://huggingface.co/peasantsmith/DeepSeek-V4.1-Flash-1017-Maya-GGUF"><img src="https://raw.githubusercontent.com/mw00/project-maya/badges/deepseek.svg" alt="DeepSeek-V4.1-Flash Maya downloads"></a>
@@ -20,8 +21,8 @@
 <a href="https://buymeacoffee.com/peasantsmith"><img src="https://img.shields.io/badge/Buy_me_a_coffee-FFDD00?logo=buymeacoffee&logoColor=black&style=for-the-badge" alt="Buy Me A Coffee" height="32"></a><br>
 <sub>Project Maya 是免费的。如果它在你的电脑上运行良好，欢迎赞助，用于购买测试硬件和支持开发。</sub></p>
 
-这么大的模型通常需要数据中心。Maya 让你用手头现有的硬件运行其中三个：
-**GLM-5.3-Flash**、**DeepSeek-V4.1-Flash-1017** 和 **MiniMax-M3.1-Flash**。每个模型都有专门为它打造的引擎。引擎把你的对话最常用的专家 (experts) 放在 GPU 上，接下来会用到的放在内存里，其余的放在 NVMe 固态硬盘上，并随着聊天不断调整。它会测量你的 GPU、CPU、内存和固态硬盘并自动调优。数据不会离开你的机器。
+这么大的模型通常需要数据中心。Maya 让你用手头现有的硬件运行其中四个：
+**GLM-5.3**、**GLM-5.3-Flash**、**DeepSeek-V4.1-Flash-1017** 和 **MiniMax-M3.1-Flash**。每个模型都有专门为它打造的引擎。引擎把你的对话最常用的专家 (experts) 放在 GPU 上，接下来会用到的放在内存里，其余的放在 NVMe 固态硬盘上，并随着聊天不断调整。它会测量你的 GPU、CPU、内存和固态硬盘并自动调优。数据不会离开你的机器。
 
 - **快：** 两块 RTX 5090 加一块 RTX 4090 最高 149 tokens/s，两块 H100 为 124，四块 RTX 4090 为 118，一块 RTX PRO 6000 为 81，单块 RTX 5090 也能达到 30 以上。[真实用户的实测数据](#how-fast-is-it)。
 - **接近原版：** Maya 自己的 GLM-5.3-Flash 量化版本保留了 FP8 模型零样本准确率的 97.7-99.2%；DeepSeek V4.1 · Maya-S 与原版选择相同下一个 token 的概率为 92.6%，MiniMax M3.1 · Maya-S 为 87.6% (各类别平均值)。
@@ -52,7 +53,8 @@ git clone https://github.com/mw00/project-maya.git && cd project-maya
 | | Maya-M · `glm-maya-m` | 116 GB | 更大的内存池；针对工具调用和前端代码做了校准 |
 | | Maya-M-Derisked · `glm-maya-m-derisked` | 116 GB | 经 [Blackfrost_AI](https://x.com/Blackfrost_AI) 修改权重、减少一刀切拒绝的 Maya-M；实验性 |
 | | Maya-L · `glm-maya-l` | 156.3 GB | 最大的内存池；最接近原版 |
-| **[GLM-5.3](https://huggingface.co/zai-org/GLM-5.3)**<br><sub>zai-org · [自有许可证](https://huggingface.co/zai-org/GLM-5.3) · 744 B，激活 40 B · 最高 1M 上下文 · 仅文本</sub> | UD-IQ2_M (unsloth) · `GLM-5.3-UD-IQ2_M` | 238.6 GB | 最大的内存池；NVIDIA (V100 及更新) 和 AMD ([详情](docs/GLM53.md)) |
+| **[GLM-5.3](https://huggingface.co/zai-org/GLM-5.3)**<br><sub>zai-org · [自有许可证](https://huggingface.co/zai-org/GLM-5.3) · 744 B，激活 40 B · 最高 1M 上下文 · 仅文本</sub> | **Maya-XS** · `glm-5.3-maya-xs` | 170.0 GB | 192 GB 内存池 (VRAM 与 RAM 合计) 即可容纳整个模型；NVIDIA (V100 及更新) 和 AMD ([详情](docs/GLM53.md)) |
+| | UD-IQ2_M (unsloth) · `GLM-5.3-UD-IQ2_M` | 238.6 GB | 最大的内存池；更接近原始模型 |
 | **[DeepSeek-V4.1-Flash-1017](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017)**<br><sub>DeepSeek · MIT · 748 B</sub> | **Maya-S** (默认) · `deepseek-maya-s` | 340 GB | 任意内存大小：显存和内存放不下的部分从固态硬盘读取 |
 | | Maya-XS (v2) · `deepseek-maya-xs` | 277 GB | 整个模型装进 128 GB 电脑的内存 (Engram 表留在固态硬盘上)；v2 比 v1 更接近原版约 12%，写作速度快约 20% - 再次运行安装程序会提示更新 |
 | **[MiniMax-M3.1-Flash](https://huggingface.co/MiniMaxAI/MiniMax-M3.1-Flash)**<br><sub>MiniMax · [MiniMax Community License](LICENSE.minimax-m31) · 428 B，激活 23 B · 最高 1M 上下文</sub> | Maya-XS · `minimax-maya-xs` | 93 GB | 整个模型装进 128 GB 电脑的内存 |
@@ -66,7 +68,7 @@ git clone https://github.com/mw00/project-maya.git && cd project-maya
 
 Maya 的量化版本由各模型公开发布的权重制作，并与原版对比测量：
 
-- **GLM-5.3 · Maya 量化**保留了 FP8 模型零样本准确率的 97.7-99.2%，下一个 token 与原版一致的比例为 83-90% (Maya-L：99.2%，90%)。制作与测量方法：[MAYA-S](bench/results/MAYA-S.md)、[MAYA-S24](bench/results/MAYA-S24.md)、[MAYA-M](bench/results/MAYA-M.md)、[MAYA-L](bench/results/MAYA-L.md)。
+- **GLM-5.3-Flash · Maya 量化**保留了 FP8 模型零样本准确率的 97.7-99.2%，下一个 token 与原版一致的比例为 83-90% (Maya-L：99.2%，90%)。制作与测量方法：[MAYA-S](bench/results/MAYA-S.md)、[MAYA-S24](bench/results/MAYA-S24.md)、[MAYA-M](bench/results/MAYA-M.md)、[MAYA-L](bench/results/MAYA-L.md)。
 - **DeepSeek V4.1 · Maya-S** 与原版选择相同下一个 token 的概率为 92.6%。
 - **MiniMax M3.1 · Maya-S** 为 87.6% (各类别平均值)。
 
@@ -217,7 +219,7 @@ Maya 的量化版本由各模型公开发布的权重制作，并与原版对比
 | --- | --- |
 | **GPU** | NVIDIA，计算能力 7.0 或更高 (V100、RTX 20 及更新)：1 块，或最多 16 块共同承载模型。显存越大越快。Pascal (Tesla P40 / P100、GTX 10) 为实验性，尚未验证。**AMD：** RX 7900 XT / XTX、Radeon AI PRO R9700 / RX 9070、Strix Halo 和 Gorgon Halo (Radeon 8060S / 8065S)；RX 6800 / 6900 和 Radeon PRO V620 / W6800 尚未验证；GLM-5.3-Flash 和 DeepSeek-V4.1-Flash-1017 在 AMD 上也能读取图片 - [docs/AMD_MAYA.md](docs/AMD_MAYA.md) |
 | **内存** | 32 GB 即可运行。内存越多，能让更多专家就近存放，速度也越快 |
-| **磁盘** | **一块高速 NVMe 固态硬盘**，空间足够放下模型 (GLM-5.3 · Maya-XS 约 75 GB、GLM-5.3 · Maya-S 约 100 GB、GLM-5.3 · Maya-L 约 160 GB、DeepSeek V4.1 · Maya-S 约 350 GB、其 unsloth Q8 GGUF 约 470 GB、MiniMax M3.1 · Maya-XS 约 95 GB、MiniMax-M3.1-Flash 的 EXL3 量化约 200 GB)，外加它的图片编码器 (1.1 GB)。不能用机械硬盘 |
+| **磁盘** | **一块高速 NVMe 固态硬盘**，空间足够放下模型 (GLM-5.3-Flash · Maya-XS 约 75 GB、GLM-5.3-Flash · Maya-S 约 100 GB、GLM-5.3-Flash · Maya-L 约 160 GB、DeepSeek V4.1 · Maya-S 约 350 GB、其 unsloth Q8 GGUF 约 470 GB、MiniMax M3.1 · Maya-XS 约 95 GB、MiniMax-M3.1-Flash 的 EXL3 量化约 200 GB)，外加它的图片编码器 (1.1 GB)。不能用机械硬盘 |
 | **系统** | Linux (x86-64；最好带 AVX2 的 CPU)、NVIDIA 驱动、CUDA 12.x (CUDA 13 适用于 RTX 20 及更新，不适用于 V100 或 Pascal)、g++、Python 3.10+。Windows 10/11：[docs/WINDOWS.md](docs/WINDOWS.md)。不支持 WSL2。AMD：ROCm 7 |
 
 安装程序会检查以上所有项目，对缺少的内容打印出确切的命令，并且不会在系统范围内安装任何东西。
