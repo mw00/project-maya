@@ -9,6 +9,7 @@
 // misses from the SSD), and the slot ids are the next graph's input.  Everything a graph hands to the next one
 // lives in the carry tensors (glm_metal_impl.hpp); everything a token hands to the next lives in LayerState.
 #include "glm_metal_impl.hpp"
+#include "slot_metal.hpp"
 
 #include "ggml-alloc.h"
 
@@ -950,6 +951,29 @@ bool GlmMetal::snapshot_restore() {
 }
 
 int64_t GlmMetal::snapshot_position() const { return p_->snap_pos; }
+
+uint64_t GlmMetal::slot_snapshot_size() const {
+    std::vector<SlotBlock> blocks;
+    uint64_t bytes = 0;
+    return slot_metal_blocks(*p_, p_->snap_pos, false, blocks) && slot_state_size(blocks, bytes) ? bytes : 0;
+}
+bool GlmMetal::slot_snapshot_save(const std::string& path, uint64_t bytes) {
+    std::vector<SlotBlock> blocks;
+    return slot_metal_blocks(*p_, p_->snap_pos, false, blocks) &&
+           slot_state_save(path.c_str(), (uint64_t)p_->snap_pos, blocks, bytes);
+}
+bool GlmMetal::slot_snapshot_load(const std::string& path, int64_t pos, uint64_t budget) {
+    reset();  // also initializes the latent null cell
+    std::vector<SlotBlock> blocks;
+    if (!slot_metal_blocks(*p_, pos, true, blocks) || !slot_state_load(path.c_str(), (uint64_t)pos, blocks, budget)) {
+        reset();
+        return false;
+    }
+    p_->snap_pos = pos;
+    p_->hx_snap = pos - 1;
+    return snapshot_restore();
+}
+
 
 size_t GlmMetal::grow_pool() {
     Impl& m = *p_;
