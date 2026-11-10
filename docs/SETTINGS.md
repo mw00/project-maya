@@ -1796,6 +1796,28 @@ until it is measured.
 | `MAYA_DS4_UMA_FREE` | off | `1`: an integrated NVIDIA GPU on Linux places by MemAvailable less `MAYA_DS4_UMA_HEADROOM_GIB` when that is larger than the driver's free memory |
 | `MAYA_DS4_UMA_HEADROOM_GIB` | 6 | with `MAYA_DS4_UMA_FREE=1`: the RAM left to the rest of the system (GiB) |
 
+## DeepSeek: the Engram row cache
+
+DeepSeek-V4.1's Engram layers look up rows by the n-grams before each position: for DeepSeek-V4.1-Flash-1017, 48 rows
+of 264 bytes a token, at hashed offsets of tables 203 GB large. The row cache keeps the rows read, and a hit reads
+nothing. The load sizes it at 256 MB at most: about a million rows, the rows of ~20K tokens, so a long prompt's rows
+have left it before an answer that quotes the prompt, or the same text in another conversation, asks for them again.
+Once the experts are placed it is sized again: a quarter of the RAM left beyond the margin (`DS4_RAM_MARGIN_GB`), each
+row with its index (~56 bytes), at most 16 GiB of rows. It fills as rows are read; only the index's buckets (8 bytes a
+row, up to 64M rows) take their RAM at the start, so that the index never rehashes under the cache's lock as it fills.
+The start log says what it chose (`ds4: Engram row cache: up to ... rows`). Where the CPU lane's experts are read in
+place (`--mmap-experts on`, or `auto` short of RAM) the page cache is their tier, and tables locked in RAM
+(`DS4_ENGRAM_RAM`) are read by copies already: both keep the load's size. The rows are the files' bytes either way:
+only how many reads a token skips changes.
+
+Eight RTX 3090, EXL3 2.9 bpw with `--tp 2` and the CPU lane's experts copied into RAM, 160 GB, the tables on ZFS: 63M
+rows. Reading an 80K-token text again in a new conversation, the cache answered 94-95% of the rows instead of 29-34%,
+and the prompt ran 4-8% faster; decode did not change beyond noise (#926).
+
+| Setting | Default | |
+| --- | --- | --- |
+| `DS4_ENGRAM_CACHE_MB` | sized once the experts are placed (above); where the load's size is kept, 256 MB at most | its size instead, in MB of the rows' payload (the index takes ~20% more); `0` = off |
+
 ## DeepSeek: Engram prompt read-ahead
 
 On one GPU with a nonzero `DS4_ENGRAM_CACHE_MB`, `DS4_ENGRAM_PREFETCH=1` reads a prompt's Engram rows into the ordinary

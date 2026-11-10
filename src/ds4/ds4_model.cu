@@ -1475,6 +1475,28 @@ struct Model::Impl {
         }();
         return m;
     }
+    // the Engram row cache sized again once the experts are placed (copied into RAM, pinned), unless DS4_ENGRAM_CACHE_MB
+    // set it: a quarter of the RAM left beyond the margin, each row with its index, at most 16 GiB of rows
+    // (eg_cache_default_rows). The load's size - at most 256 MB, about a million rows, the rows of ~20K tokens of
+    // DeepSeek-V4.1 text - stays where the CPU lane's experts are read in place (the page cache is their tier) and where
+    // the tables are locked in RAM (DS4_ENGRAM_RAM: their reads are copies already). The rows are the files' bytes
+    // either way: only how many reads a token skips changes (#926)
+    void eg_cache_size() {
+        if (pk.eg_layers <= 0 || eg_cache_fixed || eg_io.ram_only() || (file_experts && !copy_mode)) return;
+        const size_t row = eg_cache.row_bytes(), was = eg_cache.capacity();
+        const uint64_t room = ram_room(), margin = ram_margin();
+        const size_t rows = eg_cache_default_rows(room, margin, row, was);
+        if (rows <= was) return;
+        {
+            std::lock_guard<std::mutex> lk(eg_cache_mu);
+            eg_cache.grow(rows);
+        }
+        std::fprintf(stderr, "ds4: Engram row cache: up to %zu rows, %.1f GB of rows (%.1f GB with its index; was %zu "
+                             "rows) - by the %.1f GB of RAM the placed experts leave beyond the %.1f GB margin: a "
+                             "quarter, at most %.0f GiB of rows (DS4_ENGRAM_CACHE_MB sets it)\n",
+                     rows, (double) rows * row / 1e9, (double) rows * (row + kEgRowIndexBytes) / 1e9, was,
+                     (double) (room - margin) / 1e9, (double) margin / 1e9, (double) (kEgCacheDefaultMax >> 30));
+    }
     static constexpr uint64_t kAutoCopyRoom = 8ull << 30;   // --mmap-experts auto copies only with this much more spare
                                                             // (the Engram rows' page cache, other programs)
     uint8_t* file_part(const Layer& l, int e) const {
@@ -1488,6 +1510,7 @@ struct Model::Impl {
     // an Engram layer: asked for when the window's tokens are known, collected right before that layer)
     EgReader eg_io;
     EgRowCache eg_cache;
+    bool eg_cache_fixed = false;   // (DS4_ENGRAM_CACHE_MB set its size: eg_cache_size() leaves it)
     struct EgPrefetch;
     EgPrefetch* eg_pf = nullptr;
     std::mutex eg_cache_mu;
@@ -4586,9 +4609,13 @@ struct Model::Impl {
             int nth = hw == 0 ? 16 : (int) std::min(64u, std::max(16u, hw * 2));
 #endif
             if (const char* e = std::getenv("DS4_ENGRAM_THREADS")) nth = std::max(1, std::atoi(e));
+            // (the load's size; eg_cache_size() sizes it again once the experts are placed)
             const uint64_t avail = ram_room();
             uint64_t mb = avail == ~uint64_t{0} ? 64 : std::min<uint64_t>(256, std::max<uint64_t>(16, (avail >> 20) / 64));
-            if (const char* e = std::getenv("DS4_ENGRAM_CACHE_MB")) mb = std::strtoull(e, nullptr, 10);
+            if (const char* e = std::getenv("DS4_ENGRAM_CACHE_MB")) {
+                mb = std::strtoull(e, nullptr, 10);
+                eg_cache_fixed = true;
+            }
             eg_cache.init((size_t) ((mb << 20) / row), row);
             std::vector<std::string> paths;
             for (const std::string& fn : pk.files) paths.push_back(pk.model_dir + "/" + fn);
@@ -5023,6 +5050,7 @@ struct Model::Impl {
             calibrate_paths();
         lane_setup();
         one_gpu_plan();   // (#496: the one-GPU path kept only where something streams)
+        eg_cache_size();
         if (o.verbose) std::fprintf(stderr, "ds4: loaded in %.1f s\n%s", (now_ms() - t0) / 1000.0, describe().c_str());
         reset();
         blas_warm_start();

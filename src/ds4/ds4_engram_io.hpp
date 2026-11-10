@@ -15,6 +15,7 @@
 #include "ds4_os.hpp"
 
 #include <algorithm>
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cerrno>
@@ -48,6 +49,18 @@ public:
         cap_ = cap;
         bytes_ = bytes;
         map_.reserve(std::min<size_t>(cap, 1u << 20));
+    }
+    /// A larger capacity, the rows held so far kept (a smaller one changes nothing). The index's buckets and the slots'
+    /// keys and clock bits are reserved for it up front, up to kReserveMax rows, so that filling it never rehashes the
+    /// index nor moves the slots under the cache's lock (a rehash at 18M rows took 0.66 s on an EPYC 7532). The buckets
+    /// take their 8 bytes a row at once; the keys' and bits' pages are touched only as the rows come.
+    void grow(size_t cap) {
+        if (cap <= cap_) return;
+        cap_ = cap;
+        const size_t n = std::min(cap, kReserveMax);
+        map_.reserve(n);
+        keys_.reserve(n);
+        ref_.reserve(n);
     }
     size_t capacity() const { return cap_; }
     size_t size() const { return keys_.size(); }
@@ -87,6 +100,7 @@ public:
 
 private:
     static constexpr uint32_t kBlock = 4096;
+    static constexpr size_t kReserveMax = size_t{1} << 26;   // (64M rows: an index of 512 MB of buckets)
     uint8_t* at(uint32_t s) { return blocks_[s / kBlock].get() + (size_t) (s % kBlock) * bytes_; }
     size_t cap_ = 0, bytes_ = 0;
     uint32_t hand_ = 0;
@@ -95,6 +109,21 @@ private:
     std::vector<uint8_t> ref_;
     std::vector<std::unique_ptr<uint8_t[]>> blocks_;
 };
+
+/// The bytes a cached row takes beside its payload: its key (8), its clock bit (1), and its node and bucket in the
+/// index (~40 with glibc's allocator), rounded up.
+constexpr size_t kEgRowIndexBytes = 56;
+/// The row cache's default at most: 16 GiB of rows (about 65M of DeepSeek-V4.1-Flash-1017's 264-byte rows).
+constexpr uint64_t kEgCacheDefaultMax = uint64_t{16} << 30;
+
+/// The row cache's capacity in rows by default, once the experts are placed: a quarter of the RAM left beyond the
+/// margin (`room` - `margin`), each row with its index, at most kEgCacheDefaultMax of rows and at least `floor` rows (the
+/// load's size). An unknown RAM (`room` all ones) or none beyond the margin: `floor`.
+inline size_t eg_cache_default_rows(uint64_t room, uint64_t margin, size_t row, size_t floor) {
+    if (row == 0 || room == ~uint64_t{0} || room <= margin) return floor;
+    const uint64_t share = (room - margin) / 4 / (row + kEgRowIndexBytes), most = kEgCacheDefaultMax / row;
+    return (size_t) std::max<uint64_t>(floor, std::min(share, most));
+}
 
 /// One row to fetch: its codes to dst, its scales to scales.  mx8: n bytes at off of a file, [scale, 32 codes] blocks
 /// (a GGUF's MXFP8 row); else n code bytes at off and n2 scale bytes at off2 of file2 (two reads; n2 0: none - a
