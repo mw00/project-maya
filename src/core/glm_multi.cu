@@ -418,12 +418,12 @@ uint64_t Glm5Model::seq_layout(int64_t ctx, SeqCtx& c) const {
     // hand in v1.1.55 (residual pair, NextN block, then the part's layers; FP16 / INT8 latents; the 8192 + 64 ring;
     // KV streaming's kv_resident_cells rows), glm-dsa's its own; the sequence keeps the layout (seq_bind swaps it)
     const Glm5Geometry& g = g_;
-    const int64_t kv_cells = kv_resident_cells(g.idx_kpool, ctx);
+    const int64_t kv_cells = fast_mode_ ? kv_resident_cells(g.idx_kpool, ctx) : 0;   // the load's choice: the slow path's latents cover max_ctx
     const int64_t lat_rows = kv_cells > 0 ? kv_cells : ctx;
     GlmStateLayout L;
     std::string err;
-    if (!glm_state_carve(g, l0_, l1_, mtp_il_, ctx, lat_q8_ ? GlmStateMode::Int8 : GlmStateMode::Fp16,
-                         glm_state_fast_ik_ring(ctx), L, err, lat_rows)) {
+    if (!glm_state_carve(g, l0_, l1_, mtp_il_, ctx, lat_q8_ ? GlmStateMode::Int8 : fast_mode_ ? GlmStateMode::Fp16 : GlmStateMode::SlowF32,
+                         fast_mode_ ? glm_state_fast_ik_ring(ctx) : (int) ctx, L, err, lat_rows)) {   // mirror the load's mode pick, or the guard's recompute diverges in the slow legs
         std::fprintf(stderr, "glm multi: %s\n", err.c_str());
         c.bytes = 0;
         return 0;
