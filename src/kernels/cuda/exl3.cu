@@ -130,6 +130,14 @@ __device__ __forceinline__ __half2 u2h(uint32_t u) { return *reinterpret_cast<__
 __device__ __forceinline__ uint32_t fsh(uint32_t lo, uint32_t hi, int s) {
     return (uint32_t) ((((uint64_t) hi << 32) | (uint64_t) lo) >> s);
 }
+// the same for 0 <= s < 32: on AMD one funnel shift, v_alignbit_b32 at full rate (RDNA 3's 64-bit shift is half rate)
+__device__ __forceinline__ uint32_t fsh32(uint32_t lo, uint32_t hi, int s) {
+#if defined(STRATA_USE_HIP)
+    return __builtin_amdgcn_alignbit(hi, lo, (uint32_t) s);
+#else
+    return fsh(lo, hi, s);
+#endif
+}
 
 // Step p's state is the 16-bit window ending at bit S(p) of the tile's MSB-first bit stream (w: its 4 K2 words, K2 =
 // 2 K), wrapping around the tile: S(p) = (p + 1) K for an integer K, floor((p + 1) K2 / 2) for exllamav3 1.6's
@@ -145,7 +153,7 @@ __device__ __forceinline__ void decode_states(const uint32_t (&s)[8], uint32_t (
 }
 // K = 4: the lane's steps end in its own word b (word lane), the first three reach into a (word lane - 1)
 __device__ __forceinline__ void states4(uint32_t a, uint32_t b, uint32_t (&s)[8]) {
-    const uint32_t x = fsh(b, a, 20);
+    const uint32_t x = fsh32(b, a, 20);
     s[0] = x >> 8;
     s[1] = x >> 4;
     s[2] = x;
@@ -162,8 +170,11 @@ __device__ __forceinline__ void states_group(const uint32_t* w, int p, uint32_t*
     const int b0 = (p + 257) * K - 16, b2 = b0 + (G - 1) * K + 16;
     const int i0 = b0 >> 5, i2 = (b2 - 1) >> 5, s2 = ((i2 + 1) << 5) - b2;
     const uint32_t a = w[i0 % NW], b = w[i2 % NW];
+    // (a : b) >> (s2 + j K): (a : b) >> s2 once (s2 < 32: its low word t, its high word h), then shifts of (h : t) by
+    // j K < 32 - funnel shifts under 32 only, the same words
+    const uint32_t t = fsh32(b, a, s2), h = a >> s2;
 #pragma unroll
-    for (int j = 0; j < G; ++j) s[G - 1 - j] = fsh(b, a, s2 + j * K);
+    for (int j = 0; j < G; ++j) s[G - 1 - j] = j == 0 ? t : fsh32(t, h, j * K);
 }
 // an integer K
 template <int K, int cb>
@@ -176,7 +187,7 @@ __device__ __forceinline__ void frag8_int(const uint32_t* w, int lane, uint32_t 
         // the 8 windows overlap in one 32-bit window: steps p + j end 8 - 1 - j K bits apart
         constexpr int NW = 8 * K, per = 32 / (8 * K);   // lanes per word
         const int i1 = lane / per, i0 = (i1 + NW - 1) % NW;
-        const uint32_t b = fsh(w[i1], w[i0], (per - 1 - lane % per) * 8 * K);
+        const uint32_t b = fsh32(w[i1], w[i0], (per - 1 - lane % per) * 8 * K);
 #pragma unroll
         for (int j = 0; j < 8; ++j) s[j] = b >> ((7 - j) * K);
     } else if constexpr (K == 3) {
@@ -185,7 +196,7 @@ __device__ __forceinline__ void frag8_int(const uint32_t* w, int lane, uint32_t 
         const int b1 = (p + 257) * 3, b0 = b1 - 16, b2 = b1 + 21;
         const int i0 = b0 >> 5, i2 = (b2 - 1) >> 5, s2 = ((i2 + 1) << 5) - b2;
         const uint32_t a = w[i0 % NW], b = w[i2 % NW];
-        const uint32_t hi = fsh(b, a, s2), lo = fsh(b, a, s2 + 12);
+        const uint32_t hi = fsh32(b, a, s2), lo = fsh32(hi, a >> s2, 12);   // (s2 < 32; lo: (a : b) >> (s2 + 12))
 #pragma unroll
         for (int j = 0; j < 4; ++j) {
             s[7 - j] = hi >> (3 * j);
@@ -212,7 +223,7 @@ __device__ __forceinline__ void frag8_half(const uint32_t* w, int lane, uint32_t
     for (int g = 0; g < 2; ++g) {
         const int e = e7 - (1 - g) * 2 * K2;
         const int hi = (e - 1) >> 5, lo = (e - span) >> 5, sh = ((hi + 1) << 5) - e;
-        const uint32_t x = fsh(w[hi % NW], w[lo % NW], sh);   // the window ending at e in the low bits
+        const uint32_t x = fsh32(w[hi % NW], w[lo % NW], sh);   // the window ending at e in the low bits (sh < 32)
         s[4 * g + 3] = x;
         s[4 * g + 2] = x >> (KA + 1);
         s[4 * g + 1] = x >> (2 * KA + 1);
@@ -399,7 +410,7 @@ __device__ __forceinline__ void slice_frags(const uint32_t (&w)[Words<K2>::R], u
         const uint32_t b0 = __builtin_amdgcn_permlane16(v, v, 0x221100FFu, 0x66554433u, false, false);
         const uint32_t b1 = __builtin_amdgcn_permlanex16(v, v, 0xAA998877u, 0xEEDDCCBBu, false, false);
         const bool row1 = lane >= 16;
-        const uint32_t b = fsh(row1 ? a1 : a0, row1 ? b1 : b0, (1 - (lane & 1)) * 16);
+        const uint32_t b = fsh32(row1 ? a1 : a0, row1 ? b1 : b0, (1 - (lane & 1)) * 16);
         uint32_t s[8];
 #pragma unroll
         for (int j = 0; j < 8; ++j) s[j] = b >> ((7 - j) * 2);
@@ -419,7 +430,7 @@ __device__ __forceinline__ void slice_frags(const uint32_t (&w)[Words<K2>::R], u
             const int hi = (e - 1) >> 5, lo = (e - span) >> 5, sh = ((hi + 1) << 5) - e;
             const uint32_t whi = (uint32_t) __builtin_amdgcn_ds_bpermute((hi % NW) << 2, v);
             const uint32_t wlo = (uint32_t) __builtin_amdgcn_ds_bpermute((lo % NW) << 2, v);
-            const uint32_t x = fsh(whi, wlo, sh);
+            const uint32_t x = fsh32(whi, wlo, sh);   // (sh < 32)
             s[4 * g + 3] = x;
             s[4 * g + 2] = x >> (KA + 1);
             s[4 * g + 1] = x >> (2 * KA + 1);
