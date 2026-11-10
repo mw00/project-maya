@@ -1894,6 +1894,11 @@ def choose_model(a, models: Path, inst: dict) -> tuple:
         cards = [g for g in S.gpus() if g.get("vram_gb")]
     except Exception:  # noqa: BLE001 - no NVIDIA tools (AMD): no card-based recommendation
         cards = []
+    if not cards:   # AMD: the same recommendation, from the cards ROCm or Windows lists
+        try:
+            cards = [g for g in S.amd_gpus() if g.get("vram_gb")]
+        except Exception:  # noqa: BLE001 - no card-based recommendation
+            cards = []
     rec = "Maya-S24" if cards and all(g["vram_gb"] <= 24.5 for g in cards) and "Maya-S24" in MODELS else opts[0]
     default = inst["quant"] if inst.get("quant") in MODELS or inst.get("quant") in g53 else rec
     rows = []
@@ -3736,7 +3741,7 @@ def write_config(a, pc, meta, pack: Path, quant: str, ctx: int, models: Path, vi
                 total_ram += sum(g.get("vram_gb", 0) for g in gpus)
             hip_env.update({"STRATA_GLM_PREFILL_SUB": "1024",
                             "STRATA_GLM_PREFILL_MB": "6144" if total_ram >= 96 else "4096"})
-        elif min(g.get("vram_gb", 0) for g in gpus) >= 20:
+        elif min(g.get("vram_gb", 0) for g in gpus) >= 19.5:   # (an RX 7900 XT reports 19.98)
             hip_env.update({"STRATA_GLM_PREFILL_SUB": "1024", "STRATA_GLM_PREFILL_MB": "4096"})
         # Pass every available version per architecture: the engine's existing header guard selects the
         # table matching each card and its installed hipBLASLt, or keeps plain hipBLAS when none matches.
