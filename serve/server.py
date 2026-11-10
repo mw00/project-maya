@@ -1395,7 +1395,11 @@ class StrataEngine:
                     raise ValueError(line[4:].strip())
         finally:
             if not done:                                  # the consumer stopped early: stop the engine, drain to DONE
-                if self.can_stop:
+                if self.can_pause and os.environ.get("STRATA_CANCEL_STOP") != "1":
+                    # a cancelled / disconnected request: PAUSE keep, so the engine keeps the conversation (the prompt's
+                    # state set aside for the next turn) instead of STOP dropping it and the next prompt re-reading all
+                    self.pause(keep=True)
+                elif self.can_stop:
                     try:
                         self.proc.stdin.write("STOP\n")
                         self.proc.stdin.flush()
@@ -1592,11 +1596,14 @@ class StrataEngine:
                     raise ValueError(line.split(None, 2)[2].strip() if len(f) > 2 else "engine error")
         finally:
             if not done:                                  # the consumer stopped early: stop this request, drain it
-                try:
-                    self.proc.stdin.write(f"STOP {rid}\n")
-                    self.proc.stdin.flush()
-                except OSError:
-                    pass
+                if self.can_pause and os.environ.get("STRATA_CANCEL_STOP") != "1":
+                    self.pause(keep=True)
+                else:
+                    try:
+                        self.proc.stdin.write(f"STOP {rid}\n")
+                        self.proc.stdin.flush()
+                    except OSError:
+                        pass
                 # The drain is bounded: an engine that does not honour the STOP (or whose DONE for this rid was
                 # already dropped) left this loop waiting for a line that never came, holding the request's place in
                 # the FIFO for ever.  Past DRAIN_S: say so, drop the route, and let the next request run.
