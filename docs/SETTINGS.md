@@ -2255,3 +2255,12 @@ untested and refused unless this is set when the setup or `--check` runs (in the
 | Variable | Default | What it does |
 |---|---|---|
 | `MAYA_HIP_ALLOW_ROCM6` | unset (ROCm 6 refused) | `1`: the setup goes on with a ROCm 6.x, with a warning (untested: the build or the engine may fail); the build then takes hipBLAS 2's `HIPBLAS_V2` API and leaves out `hipblasSetWorkspace`, which hipBLAS 2 does not have |
+
+### Metal conversation slots
+
+The Metal backend can optionally keep conversation snapshots on disk. Set
+`MAYA_METAL_SLOTS` to a positive maximum slot count and `MAYA_METAL_SLOT_DIR`
+to a private writable directory to enable it (disabled by default). Snapshot
+files can contain conversation data. `MAYA_METAL_SLOT_MIN` sets the minimum
+prompt length (default 1024 tokens); `MAYA_METAL_SLOT_GB` sets the total disk
+budget (default 16 GB). DFlash does not support these snapshots.

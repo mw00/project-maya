@@ -5,7 +5,7 @@
 #include <unistd.h>
 using namespace maya::metal;
 int main() {
-    char path[] = "/Volumes/NVM/AI_Agent_Runtime/tmp/glm-slot-state-XXXXXX";
+    char path[] = "/tmp/glm-slot-state-XXXXXX";
     int fd = mkstemp(path); assert(fd >= 0); close(fd);
     std::vector<unsigned char> a(1100000, 17), b{1,2,3}, dst(a.size(), 0), dst2(3, 0);
     auto block = [](auto& src, auto& out) -> SlotBlock {

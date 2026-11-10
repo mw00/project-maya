@@ -111,7 +111,9 @@ int main() {
 #ifdef TEST_METAL_SLOTS
     setenv("MAYA_METAL_SLOTS", "2", 1);
     setenv("MAYA_METAL_SLOT_MIN", "1", 1);
-    setenv("MAYA_METAL_SLOT_DIR", "/Volumes/NVM/AI_Agent_Runtime/tmp/maya-test-slots", 1);
+    char slot_dir[] = "/tmp/maya-test-slots-XXXXXX";
+    assert(mkdtemp(slot_dir));
+    setenv("MAYA_METAL_SLOT_DIR", slot_dir, 1);
     model.reset();
     Server multi{model, {}, {}};
     Tokens alpha{10,11,12,A,T}, beta{20,21,22,A,T};

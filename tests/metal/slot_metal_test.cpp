@@ -17,7 +17,7 @@ int main() {
     std::vector<maya::metal::SlotBlock> blocks;
     assert(maya::metal::slot_metal_blocks(m, 5, false, blocks));
     assert(blocks.size()==6 && blocks[2].bytes==20 && blocks[3].bytes==10 && blocks[4].bytes==4);
-    char path[]="/Volumes/NVM/AI_Agent_Runtime/tmp/glm-metal-state-XXXXXX"; int fd=mkstemp(path); assert(fd>=0); close(fd);
+    char path[]="/tmp/glm-metal-state-XXXXXX"; int fd=mkstemp(path); assert(fd>=0); close(fd);
     assert(maya::metal::slot_state_save(path,5,blocks,10000));
     for (auto* x : {&cs,&ss,&lat,&ikg,&pooled}) std::fill(x->data.begin(),x->data.end(),0);
     m.hid_snap.assign(2,0);

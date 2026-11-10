@@ -4,7 +4,7 @@
 #include <unistd.h>
 using namespace maya::metal;
 int main() {
-    char dir[] = "/Volumes/NVM/AI_Agent_Runtime/tmp/slot-index-XXXXXXXX";
+    char dir[] = "/tmp/slot-index-XXXXXXXX";
     assert(mkdtemp(dir));
     {
         SlotIndex slots(dir, 2, 6);
