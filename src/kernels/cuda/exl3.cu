@@ -467,9 +467,10 @@ constexpr int kMinBlocksMv = 2;
 #else
 #define EXL3_BOUNDS(n) __launch_bounds__(kThreads, n)
 #endif
-// HIP: the decode kernels' block_gemv (moe_*, win_*) inlined into the kernel.  Left to the compiler it can stay a call
-// - it did in v1.1.52 - and a call's arguments arrive in vector registers, so the block's activation count reads as
-// per-lane and every `cc < nc` of the token loop is a branch on the lane mask.  The same arithmetic, the same bits.
+// HIP: the decode kernels' block_gemv (moe_*, win_*, and mv_kernel's for the dense matrices) inlined into the kernel.
+// Left to the compiler it can stay a call - it did in v1.1.52, and mv_kernel's still was in v1.1.57 - and a call's
+// arguments arrive in vector registers, so the block's activation count reads as per-lane and every `cc < nc` of the
+// token loop is a branch on the lane mask.  The same arithmetic, the same bits.
 #if defined(STRATA_USE_HIP)
 #define EXL3_DECODE_INLINE [[clang::always_inline]]
 #else
@@ -669,7 +670,7 @@ __global__ void EXL3_BOUNDS(kMinBlocksMv<K2>) mv_kernel(const KBatch b) {
         if (J.xf != nullptr) x.f = J.xf + warp * J.xf_cs;
         else x.q = (const Q81*) ((const uint8_t*) J.xq + warp * J.xq_cs);
     }
-    block_gemv<K2, cb>(J.tr, J.ld, g * 8, k0, k1, x, J.suh, nc, sm);
+    EXL3_DECODE_INLINE block_gemv<K2, cb>(J.tr, J.ld, g * 8, k0, k1, x, J.suh, nc, sm);
     const float* bias = J.bias != nullptr ? J.bias + g * kCols : nullptr;
     if (J.S == 1) {
         if (warp < nc)
