@@ -906,6 +906,31 @@ below that prompts run in windows of 16. The log says which.
 | `MAYA_DS4_DRAFT_SPREAD` | on | with `MAYA_DS4_DRAFT_DEV` unset, a tensor-parallel drafter group and the experts not all fitting the GPUs: the DSpark blocks spread over the group's members, the lead the fewest (3 blocks on a pair: 0,1,1) - on the lead alone they take its room while the other members' goes unused (3x V100, EXL3 2.9 bpw: 2K / 8K / 32K prompts +4 / +2 / +3% on top of the spec head, decode the same; with the spec head and the fast-link ring +13 / +13 / +11% over neither). Placement only, but the experts in VRAM set the order of their sums (an EXL3 pack, or GGUF without `MAYA_DS4_LANE_PARITY=1`), so the answers can move slightly, the quality the same (KLD within noise). Elsewhere (one GPU, layer splits, every expert fitting) nothing changes (the log's `DSpark blocks spread` line says where it runs). `0`: all on the lead, as before |
 | `MAYA_DS4_SETTLE_MS` | 0 (off) | after a chunked prompt, the expert cache learns from the prompt's picks (as it does from windows) and moves the hottest of them into VRAM in rounds of its usual swap rule, for at most this many ms, so the decode that follows finds them on the card; the first answer token comes that much later. Placement only, as the cache's own moves (opt-in until measured) |
 
+## DeepSeek: a short prompt's light experts on the CPU (`MAYA_DS4_PREFILL_CPU`, opt-in)
+
+A short prompt (an agent's turn of a few hundred to a few thousand tokens) routes to nearly every expert in RAM, most of
+them for one to three of its tokens, and the chunked pass streams each of them whole over PCIe - on PCIe 3.0 about
+1 ms an expert. With `MAYA_DS4_PREFILL_CPU=1`, after each layer's routing the experts not already copied early are
+taken fewest tokens first for the CPU lane while its estimated time stays under the stream's for the rest; the CPU
+computes them while the GPU streams and computes the others, and their outputs are added after the layer's streamed
+and VRAM experts (as `MAYA_GLM_PREFILL_CPU` does for GLM). Those experts' sums are then the CPU's, not the GPU's, so the
+last bits of the answer can move as they do between the chunked pass and windows of 16. Prompt chunks of more than
+`MAYA_DS4_PREFILL_CPU_MAX_T` tokens, tensor-parallel layers and the helper are unchanged. `DS4_PREFILL_STATS=1` adds
+a line a prompt and GPU: `DS4_PREFILL_CPU gpu= layers= experts= rows= cpu_ms= wait_ms= lane_busy=`.
+
+Two Xeon E5-2697 v2 (Ivy Bridge, AVX without AVX2, DDR3-1600) + 2x RTX 3090 on PCIe 3.0 x16, Maya-S, layer split,
+a fresh engine per run with the same expert profile: fresh prompts of 326 / 602 / 1,638 tokens 7.6 / 9.0 / 11.5 ->
+4.3 / 5.2 / 8.1 s, an agent's turn of 500-700 new tokens on a 20K start 8.9-9.7 -> 5.4-6.0 s, 3,100-3,200 new tokens
+12.7-12.9 -> 9.9-10.0 s; with `DS4_FLOW_COPY_DMA=1` and `MAYA_DS4_PREFILL_CPU_EXPERT_MS=1.2` 3.2 / 3.9 / 6.6 s and
+4.1-4.9 s. Decode the same; a 20K start (chunks of 8,192) unchanged.
+
+| Setting | Default | |
+| --- | --- | --- |
+| `MAYA_DS4_PREFILL_CPU` | off (0) | `1`: a prompt chunk's least-picked RAM experts on the CPU lane while the GPU streams the rest (the last bits can move) |
+| `MAYA_DS4_PREFILL_CPU_MAX_T` | 4096 | the largest chunk, in tokens, that gets a CPU share |
+| `MAYA_DS4_PREFILL_CPU_ROW_MS` | 0.49 | the CPU lane's time for one token of one expert it plans with, ms (measured on the box above) |
+| `MAYA_DS4_PREFILL_CPU_EXPERT_MS` | 0.9 | the stream's time for one expert it plans with, ms: higher gives the CPU more. 0.9 measured best there through the staging, 1.2 with `DS4_FLOW_COPY_DMA=1` (0.3 / 0.5 / 1.5 / 2.0 slower) |
+
 ## DeepSeek: long prompts on a layer split (`DS4_SPLIT`, several GPUs)
 
 With the layers split across GPUs (one GPU a group) a prompt runs as a relay: a chunk goes through the first GPU's
