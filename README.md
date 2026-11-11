@@ -261,6 +261,8 @@ slowest while the caches fill with what you use.
 - **From another device:** `./maya.sh --setup --host 0.0.0.0 --api-key <secret>`. Always set a key.
 - **Tuning:** `./maya.sh --calibrate` tunes the engine to your hardware in 10-15 minutes. Every setting:
   [docs/SETTINGS.md](docs/SETTINGS.md).
+  Linux GLM shared-pool users can optionally [generate a CPU list for an explicitly chosen thread count](docs/GLM_CPU_AFFINITY.md);
+  this leaves automatic sizing as the default and requires a comparison on your own machine.
 - <a name="deepseek-engram-prompt-read-ahead"></a><a name="deepseek-conversations-kept"></a><a name="deepseek-loading-the-experts"></a>**Each model's own options** - GLM-5.3-Flash's several requests at once (`--parallel`), long contexts and DFlash2
   drafter; DeepSeek's kept conversations, expert loading and Engram read-ahead; MiniMax's thinking levels:
   [docs/MODELS.md](docs/MODELS.md).

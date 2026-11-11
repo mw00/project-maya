@@ -3637,6 +3637,10 @@ bool Glm5Model::fast_cpu_lane_setup(std::string& err) {
     if (glmtier::lane_pools(*F, g, n_parts_, part_, own_count, lv != nullptr, threads, gpu_numa_node(dev_), dev_)) {
         // glm-dsa B8.3 / B8.4: a pinned pool per socket (STRATA_GLM_CPU_SHARED=socket) or the node-split pools
     } else if (shared) {
+        // Only this explicit global shared pool may exceed the old manual limit.
+        // Per-device, socket and node-split pools above keep their existing sizing.
+        if (lv != nullptr)
+            threads = glmaff::manual_shared_threads(std::atoi(lv), glmaff::mask_cpus_raw());
         F->cpu_pool = shared_cpu_pool(threads);
     } else {
         // STRATA_GLM_CPU_LANE_MAX=N, more than the lane's count: the pool holds N threads and starts with the lane's

@@ -12,6 +12,20 @@
 int main() {
     namespace aff = strata::core::glmaff;
     int fail = 0;
+    // Explicit shared-pool requests are choices, never defaults or presets.
+    // Known masks bound the choice; an unknown mask retains the old limit.
+    struct Case { int requested, available, expected; };
+    const Case cases[] = {{144, 160, 144}, {144, 80, 80}, {128, 160, 128},
+                          {7, 160, 7}, {80, 0, 64}, {80, -1, 64}, {32, 0, 32},
+                          {64, 2, 2}, {0, 160, 0}, {-1, 160, 0}};
+    for (const auto& c : cases) {
+        const int got = aff::manual_shared_threads(c.requested, c.available);
+        if (got != c.expected) {
+            std::printf("FAIL manual shared count: request %d, available %d, got %d, expected %d\n",
+                        c.requested, c.available, got, c.expected);
+            ++fail;
+        }
+    }
 #if defined(__linux__)
     cpu_set_t orig;
     CPU_ZERO(&orig);
@@ -44,6 +58,10 @@ int main() {
             std::printf("FAIL mask_cpus() %d != %d\n", got, want);
             ++fail;
         }
+        if (aff::manual_shared_threads(144, aff::mask_cpus_raw()) != want) {
+            std::printf("FAIL manual shared count exceeds narrowed affinity\n");
+            ++fail;
+        }
     }
     sched_setaffinity(0, sizeof orig, &orig);
     if (aff::mask_cpus() != n0) {
@@ -52,6 +70,7 @@ int main() {
     }
 #else
     if (aff::mask_cpus() < 1) ++fail;
+    if (aff::manual_shared_threads(144, aff::mask_cpus_raw()) != 64) ++fail;
 #endif
     std::printf("%s (%d failures)\n", fail ? "FAILED" : "PASSED", fail);
     return fail ? 1 : 0;
