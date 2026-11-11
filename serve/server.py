@@ -853,6 +853,7 @@ class StrataEngine:
 
     gpu_busy = None   # () -> bool: the engine's GPUs are working (the service's telemetry); kept across restarts
     multi = 0         # READY ... multi=<n> (set per start; the class default for engines built without __init__)
+    can_pause = False # default for lightweight test engines constructed without __init__
 
     def __init__(self, exe: str, args: list[str], cwd: str | None = None, log: str | None = None,
                  env: dict | None = None):
