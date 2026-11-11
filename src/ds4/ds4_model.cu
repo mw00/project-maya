@@ -783,6 +783,8 @@ struct Chunk {
                                                        // columns where it landed, DMA'd as one run (flow_copy)
         int64_t after = -1;                            // (layer-major) the items up to this one read first
         int sto = -1;                                  // (the RAM store) its slot, pinned while copied out of it
+        int cps = -1;                                  // (DS4_FLOW_COPY_DMA, NH parts) its copy's slot: each matrix's
+                                                       // rows DMA'd from the NUMA part holding them (flow_copy_parts)
         std::atomic<int> left{0};                      // parts still being read
         std::atomic<bool> bad{false};
     };
@@ -6236,6 +6238,19 @@ struct Model::Impl {
         }
         return cudaMemcpyAsync(dst + lay.trellis[2], src[2], mx_part_bytes(l, 2), cudaMemcpyHostToDevice, s) == cudaSuccess;
     }
+    // (DS4_FLOW_COPY_DMA, NH parts) copy slot s of layer l (alone on its device) into a ring slot: each matrix's rows
+    // from the part holding them, side by side - ram_to_blob's layout, the one flow_copy's whole matrices land in
+    bool flow_copy_parts(const Layer& l, int s, uint8_t* dst, cudaStream_t cs) const {
+        for (int r = 0; r < 3; ++r) {
+            const size_t nb = (size_t) (mx_n(r) / NH) * mx_row_b(l, r);
+            for (int X = 0; X < NH; ++X)
+                if (cudaMemcpyAsync(dst + l.lay.trellis[r] + (size_t) X * nb,
+                                    ram_part[(size_t) s][(size_t) X] + cp_lay[(size_t) l.il][(size_t) r], nb,
+                                    cudaMemcpyHostToDevice, cs) != cudaSuccess)
+                    return false;
+        }
+        return true;
+    }
     // the device's member index in L0's group (0 alone)
     int flow_mi(const Chunk& c, const Layer& L0) const {
         for (int m = 0; m < L0.nm; ++m)
@@ -6263,6 +6278,17 @@ struct Model::Impl {
         if (in_ram && copy_mode && cp_dma && copy_dma && NH == 1) {
             const uint8_t* p = ram_part[(size_t) l.ram[(size_t) e]][0];
             for (int r = 0; r < 3; ++r) it.src[r] = p + cp_lay[(size_t) l.il][(size_t) r] + mx_read_off(l, mi, r);
+            ++c.it_ram;
+            return;
+        }
+        // (the same where the copies are split across the CPU sockets' memory, NH parts, a layer alone on its device:
+        // each matrix's rows DMA'd from the part holding them, six copies an expert, as copy_streamed lays them out -
+        // through staging every byte crossed the RAM three times, the readers' memcpy the prompt's limit; two Xeon
+        // E5-2697 v2 (DDR3-1600, 2 parts) + 2x RTX 3090 on PCIe 3.0 x16, Maya-S, layer split: fresh prompts of 326 /
+        // 602 / 1,638 tokens 7.6 / 9.0 / 11.5 -> 6.7 / 7.5 / 9.8 s, an agent's turn of 500-700 new tokens 8.9-9.7 ->
+        // 7.5-8.3 s; the same bytes; DS4_FLOW_COPY_DMA=1)
+        if (in_ram && copy_mode && cp_dma && copy_dma && NH > 1 && l.nm == 1) {
+            it.cps = l.ram[(size_t) e];
             ++c.it_ram;
             return;
         }
@@ -6580,7 +6606,8 @@ struct Model::Impl {
                 ++c.chk_n;
             }
             // (staging holds the member's gate / up rows only - a read's and, since #377, a copy's)
-            if (!flow_copy(l, it.mi, it.src, false, c.ring + r * c.ring_stride, c.down, c.cs, it.dpart)) {
+            if (it.cps >= 0 ? !flow_copy_parts(l, it.cps, c.ring + r * c.ring_stride, c.cs)
+                            : !flow_copy(l, it.mi, it.src, false, c.ring + r * c.ring_stride, c.down, c.cs, it.dpart)) {
                 const cudaError_t e = cudaGetLastError();   // (none: the uneven split's member without its down scratch)
                 err = "the flow's copy of layer " + std::to_string(it.il) + " expert " + std::to_string(it.e) + ": " +
                       (e != cudaSuccess ? cudaGetErrorString(e) : "no down scratch for the uneven split's member");
