@@ -5869,6 +5869,14 @@ struct Model::Impl {
         std::vector<int> routed_bounds;
         size_t skipped = 0, copied = 0;
         size_t pooled = 0;   // (DS4_FLOW_HELPER: EXL3 experts staged out of the helper's pool)
+        // (DS4_FLOW_STATS) the copied experts by how many of the chunk's rows (token picks) each serves: 1, 2, 3-4,
+        // 5-8, 9-16, 17-32, 33-64, 65+ - how much of the link a light expert takes for little work
+        size_t rows_hist[8] = {};
+        static int rows_bucket(int n) {
+            int b = 0;
+            while (b < 7 && n > (1 << b)) ++b;
+            return b;
+        }
     };
     // in place (file_experts): the batches' file regions read ahead of their copies - POSIX_FADV_WILLNEED, the kernel
     // reading them in the background in large requests, where the copies alone fault the pages in a few at a time -
@@ -6087,6 +6095,10 @@ struct Model::Impl {
             for (int i = 0; i < bt.n; ++i) {
                 if (!picked(i)) { ++S.skipped; continue; }
                 if (skip_unpicked) ++S.copied;
+                if (skip_unpicked && bt.il == S.routed_layer && bt.k == S.routed_chunk) {   // (DS4_FLOW_STATS)
+                    const size_t v = (size_t) l0.pv_n + bt.j0 + i;
+                    ++S.rows_hist[Streamer::rows_bucket(S.routed_bounds[v + 1] - S.routed_bounds[v])];
+                }
                 uint8_t* dst = c.ring + ((size_t) half * (c.ring_n / P) + i) * c.ring_stride;
                 if (!copy_streamed(l0, mi, l0.host_list[(size_t) (bt.j0 + i)], sb != nullptr ? sb + (size_t) i * c.stage_stride
                                                                                              : nullptr,
@@ -18945,6 +18957,11 @@ struct Model::Impl {
                                  "of the helper's pool%s\n",
                          devs[(size_t) di].id, S.copied, S.skipped, S.pooled,
                          flow_check_now && S.pooled > 0 ? " (DS4_FLOW_HELPER_CHECK: each compared with the files)" : "");
+        if (!c.flow && S.copied > 0 && std::getenv("DS4_FLOW_STATS") != nullptr)
+            std::fprintf(stderr, "ds4 prompt batches, CUDA%d: copied experts by rows each: 1:%zu 2:%zu 3-4:%zu 5-8:%zu "
+                                 "9-16:%zu 17-32:%zu 33-64:%zu 65+:%zu\n",
+                         devs[(size_t) di].id, S.rows_hist[0], S.rows_hist[1], S.rows_hist[2], S.rows_hist[3],
+                         S.rows_hist[4], S.rows_hist[5], S.rows_hist[6], S.rows_hist[7]);
         return true;
     }
 
