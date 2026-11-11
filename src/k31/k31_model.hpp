@@ -181,6 +181,9 @@ public:
     /// KDA layer's conv and recurrent state; a geometry header), and back: a sequence restored from it continues as the
     /// saved one would (the same bits in every cache).  load_state replaces the sequence; a state from another geometry,
     /// or longer than n_ctx, is refused with err (the sequence is then reset).
+    /// The experts resident now, per MoE layer, as JSON: its card, matrix types and bytes, RAM tier size class, the
+    /// static VRAM slots, the RAM tier's ready slots and the dynamic VRAM pool's (expert ids; the tier's change as it runs).
+    std::string residency() const;
     bool save_state(std::vector<uint8_t>& out, std::string& err);
     bool load_state(const std::vector<uint8_t>& in, std::string& err);
     /// Runs `tokens` as the continuation of the sequence.  logits (optional): the call's last R rows [R][n_vocab],

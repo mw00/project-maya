@@ -561,6 +561,7 @@ int bench(const std::string& file, k31::EpsPreset eps, const k31::ModelOptions& 
 //                                         before F; the CAR counts: the call that made the step's logits, 0s for
 //                                         step 0), then D <n> -1 ... for the logits after the last id with q <id:logprob
 //                                         ...> for the query ids, then E forced <n> <seconds>
+//   RESIDENCY path                     the experts resident now per MoE layer, as JSON (VRAM slots, RAM tier, classes)
 //   SAVE target key                    the sequence's state (caches + the last logits) under a key (e.g. a hash of
 //                                      its ids, the caller's) -> OK SAVE <n_past> <bytes> <seconds>.  target @NAME:
 //                                      held in this process; else a file path, written mode 0600
@@ -719,6 +720,14 @@ int gen_loop(const std::string& file, k31::EpsPreset eps, const k31::ModelOption
             std::printf("E %s %d %.3f\n", why, n, std::chrono::duration<double>(clk::now() - a).count());
             stats();
             prof("G");
+        } else if (cmd == "RESIDENCY") {   // RESIDENCY path: the resident experts per layer now (Model::residency)
+            std::string path;
+            if (!(in >> path)) { fail("RESIDENCY path"); continue; }
+            std::ofstream f(path);
+            const std::string j = m.residency();
+            f << j;
+            if (!f.good()) { fail("RESIDENCY: cannot write " + path); continue; }
+            std::printf("OK RESIDENCY %zu\n", j.size());
         } else if (cmd == "SAVE" || cmd == "LOAD") {
             std::string target, key;
             if (!(in >> target >> key)) { fail(cmd + " target key"); continue; }

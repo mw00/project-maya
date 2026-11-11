@@ -2560,6 +2560,53 @@ void Model::reset() {
 namespace {
 constexpr char kSnapMagic[8] = {'K', '3', '1', 'S', 'N', 'A', 'P', '1'};
 }
+std::string Model::residency() const {
+    const Impl& m = *p_;
+    auto tname = [](int t) { return std::string(t == 0 ? "F32" : iq::name(t)); };
+    const int NL = m.g.n_layers;
+    std::vector<std::vector<int>> ram((size_t) NL), dyn((size_t) NL);
+    if (m.tier)
+        for (size_t s = 0; s < m.tier->n_slots(); ++s) {
+            const auto& sl = const_cast<k31::RamTier&>(*m.tier).slot((int) s);
+            if (sl.layer >= 0 && sl.layer < NL && sl.state.load() == k31::RamTier::kReady) ram[(size_t) sl.layer].push_back(sl.expert);
+        }
+    for (const auto& v : m.vpools)
+        for (const auto& x : v.s)
+            if (x.layer >= 0 && x.layer < NL && x.state != 0) dyn[(size_t) x.layer].push_back(x.expert);
+    auto ids = [](std::vector<int> v) {
+        std::sort(v.begin(), v.end());
+        std::string o = "[";
+        for (size_t i = 0; i < v.size(); ++i) o += (i ? "," : "") + std::to_string(v[i]);
+        return o + "]";
+    };
+    std::string o = "{\"n_ctx\": " + std::to_string(m.opt.n_ctx) + ", \"ram_tier_classes\": [";
+    if (m.tier)
+        for (int c = 0; c < m.tier->n_classes(); ++c)
+            o += (c ? ", " : "") + std::string("{\"class\": ") + std::to_string(c) + ", \"slot_bytes\": " +
+                 std::to_string(m.tier->slot_bytes(c)) + ", \"slots\": " + std::to_string(m.tier->n_slots(c)) + "}";
+    o += "],\n \"layers\": [";
+    bool first = true;
+    for (int il = 0; il < NL; ++il) {
+        const auto& W = m.lx[(size_t) il];
+        if (!W[0]) continue;
+        std::vector<int> vr;
+        for (size_t e = 0; e < W[0]->p.size(); ++e) {
+            const uint8_t* q = W[0]->p[e];
+            const uint8_t* b = (const uint8_t*) W[0]->vram;
+            if (b && q >= b && q < b + W[0]->p.size() * W[0]->ebytes && !W[0]->h[e]) vr.push_back((int) e);
+        }
+        const int cls = il < (int) m.tier_cls.size() ? m.tier_cls[(size_t) il] : -1;
+        o += std::string(first ? "\n" : ",\n") + "  {\"layer\": " + std::to_string(il) + ", \"card\": " + std::to_string(m.dev_of(il)) +
+             ", \"types\": [\"" + tname(W[0]->type) + "\", \"" + tname(W[1]->type) + "\", \"" + tname(W[2]->type) + "\"], \"bytes\": [" +
+             std::to_string(W[0]->ebytes) + ", " + std::to_string(W[1]->ebytes) + ", " + std::to_string(W[2]->ebytes) + "], \"class\": " +
+             std::to_string(cls) + ", \"n_vram\": " + std::to_string(vr.size()) + ", \"n_ram\": " + std::to_string(ram[(size_t) il].size()) +
+             ", \"n_vram_dyn\": " + std::to_string(dyn[(size_t) il].size()) + ", \"vram\": " + ids(vr) + ", \"ram\": " +
+             ids(ram[(size_t) il]) + ", \"vram_dyn\": " + ids(dyn[(size_t) il]) + "}";
+        first = false;
+    }
+    return o + "\n]}\n";
+}
+
 bool Model::save_state(std::vector<uint8_t>& out, std::string& err) {
     Impl& m = *p_;
     const auto& g = m.g;
