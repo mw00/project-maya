@@ -430,6 +430,14 @@ as in llama.cpp, so the model goes on with what it would write next instead of s
 fixed answer length. It needs `max_tokens`, and an engine that applies token biases - GLM's and DeepSeek's (which take
 a request's own `logit_bias` as well); MiniMax's does not, so there it is refused.
 
+## Server configuration
+
+These settings are top-level fields in the run configuration, not environment variables.
+
+| Setting | Default | What it is |
+|---|---|---|
+| `"deep_sleep"` | `"off"` | Opt in with `"checkpoint"` or `"auto"` (currently an alias for checkpoint) to allow the sleep endpoints to checkpoint a CUDA engine on Linux when its driver supports the required API. External vision helpers are unsupported. See [CUDA checkpoint sleep](CHECKPOINT_SLEEP.md) for behavior and limitations. |
+
 ## The thinking level and the thinking budget
 
 Two config settings shape the thinking, and only one of them counts tokens:
