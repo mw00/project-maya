@@ -6,9 +6,9 @@
 // ref/glm_dsa.py --mode hf --mtp --mtp-out on the 12 reference tokens ((i * 37 + 11) % 1024).
 //
 // Both paths run the 12 tokens with GLM_CB_DIR seam dumps (the same llama.cpp cb names on both paths):
-//   slow   STRATA_GLM_SLOW=1 load_pack -> step_layers_dsa (src/core/glm_dsa_ref.cu), F32 activations and caches;
+//   slow   MAYA_GLM_SLOW=1 load_pack -> step_layers_dsa (src/core/glm_dsa_ref.cu), F32 activations and caches;
 //   fast   load_pack -> fast_layers_plain + fast_dsa_glm (src/core/glm_dsa_mixer.cu), q8_1 activations, FP16 latents,
-//          with the NextN block (STRATA_GLM_MTP=1 on one part) drafting after every token.
+//          with the NextN block (MAYA_GLM_MTP=1 on one part) drafting after every token.
 // Gates (per seam, mean rel L2 over the positions; the fast path quantizes its activations to q8_1 as llama.cpp
 // does, which the oracle README measures at a mean KL of 1e-3..5e-3 on this preset):
 //   full + dense  (layer 0, 1)   attn_out, ffn_out, l_out  < 5e-2
@@ -74,19 +74,19 @@ struct Run {
 
 bool run(bool slow, const fs::path& pack, const fs::path& cb, const std::vector<int32_t>& tokens, int n_layers, Run& r) {
     if (slow)
-        setenv("STRATA_GLM_SLOW", "1", 1);
+        setenv("MAYA_GLM_SLOW", "1", 1);
     else
-        unsetenv("STRATA_GLM_SLOW");
+        unsetenv("MAYA_GLM_SLOW");
     strata::core::Glm5Model m;
     const bool ok = m.load_pack(pack.string(), kCtx, r.err);
-    unsetenv("STRATA_GLM_SLOW");
+    unsetenv("MAYA_GLM_SLOW");
     if (!ok) return false;
     if (slow == m.fast()) {
-        r.err = slow ? "STRATA_GLM_SLOW=1 still loaded the fast path" : "the fast path did not load";
+        r.err = slow ? "MAYA_GLM_SLOW=1 still loaded the fast path" : "the fast path did not load";
         return false;
     }
     if (!slow && !m.has_mtp()) {
-        r.err = "the fast path loaded without the NextN block (STRATA_GLM_MTP=1)";
+        r.err = "the fast path loaded without the NextN block (MAYA_GLM_MTP=1)";
         return false;
     }
     std::vector<float> lg;
@@ -126,11 +126,11 @@ int main() {
         return 1;
     }
     {   // the pack passes the glm-dsa loader's shape checks (no GPU work)
-        setenv("STRATA_GLM_CHECK_ONLY", "1", 1);
+        setenv("MAYA_GLM_CHECK_ONLY", "1", 1);
         strata::core::Glm5Model m;
         std::string e;
         m.load_pack(pack.string(), kCtx, e);
-        unsetenv("STRATA_GLM_CHECK_ONLY");
+        unsetenv("MAYA_GLM_CHECK_ONLY");
         check(e.find("check-only load") != std::string::npos, "PACK passes the loader's shape checks: " + e);
     }
     int n_dev = 0;
@@ -141,9 +141,9 @@ int main() {
     const fs::path cb = dir / "layer_parity_cb";
     fs::create_directories(cb);
     setenv("GLM_CB_DIR", cb.string().c_str(), 1);   // (read once per translation unit: set before any model work)
-    setenv("STRATA_GLM_MTP", "1", 1);       // the NextN block on a single part
-    unsetenv("STRATA_GLM_DSA_DENSE");
-    unsetenv("STRATA_GLMD_KQ_SCALE");
+    setenv("MAYA_GLM_MTP", "1", 1);       // the NextN block on a single part
+    unsetenv("MAYA_GLM_DSA_DENSE");
+    unsetenv("MAYA_GLMD_KQ_SCALE");
 
     Run slow, fast;
     if (!run(true, pack, cb, tokens, n_layers, slow)) {

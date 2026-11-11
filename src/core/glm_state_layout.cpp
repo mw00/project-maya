@@ -161,7 +161,7 @@ bool glm_state_carve(const Glm5Geometry& g, int l0, int l1, int mtp_il, int64_t 
     }
     if (dsa && mode != GlmStateMode::SlowF32 && glm_state_idx_hadamard()) {   // B14.11: rotated index keys
         if (g.idx_key < 2 || g.idx_key > 512 || (g.idx_key & (g.idx_key - 1)) != 0) {
-            err = "glm state layout: STRATA_GLM_IDX_HADAMARD needs idx_key a power of two <= 512 (have " +
+            err = "glm state layout: MAYA_GLM_IDX_HADAMARD needs idx_key a power of two <= 512 (have " +
                   std::to_string(g.idx_key) + ")";
             return false;
         }
@@ -237,11 +237,11 @@ bool glm_state_carve(const Glm5Geometry& g, int l0, int l1, int mtp_il, int64_t 
 }
 
 bool glm_state_idx_fp16() {
-    return strata::glmenv::env_flag("STRATA_GLM_IDX_FP16", false);
+    return strata::glmenv::env_flag("MAYA_GLM_IDX_FP16", false);
 }
 
 bool glm_state_idx_hadamard() {
-    return strata::glmenv::env_flag("STRATA_GLM_IDX_HADAMARD", false);
+    return strata::glmenv::env_flag("MAYA_GLM_IDX_HADAMARD", false);
 }
 
 GlmStateFingerprint glm_state_fingerprint(const Glm5Geometry& g, const GlmStateLayout& lay) {

@@ -174,11 +174,11 @@ class ExtractTest(unittest.TestCase):
 
     def test_engine_reader_parses_it(self):
         # the engine's own GGUF reader (strata-gguf, src/artifact/gguf_reader.cpp: the GgufFile the engine opens
-        # STRATA_GLM_MTP_GGUF with); ctest passes its path in STRATA_GGUF_BIN
+        # MAYA_GLM_MTP_GGUF with); ctest passes its path in MAYA_GGUF_BIN
         import os
-        exe = os.environ.get("STRATA_GGUF_BIN", "")
+        exe = os.environ.get("MAYA_GGUF_BIN", "")
         if not exe or not pathlib.Path(exe).exists():
-            self.skipTest("STRATA_GGUF_BIN (the strata-gguf binary) not set")
+            self.skipTest("MAYA_GGUF_BIN (the strata-gguf binary) not set")
         out = D / "mtp_engine.gguf"
         rc, so, se = run(str(self.whole), "-o", str(out))
         self.assertEqual(rc, 0, so + se)
@@ -190,7 +190,7 @@ class ExtractTest(unittest.TestCase):
     def test_cli_help(self):
         r = subprocess.run([sys.executable, str(HERE / "extract_mtp_block.py"), "--help"], capture_output=True, text=True)
         self.assertEqual(r.returncode, 0)
-        self.assertIn("STRATA_GLM_MTP_GGUF", r.stdout)
+        self.assertIn("MAYA_GLM_MTP_GGUF", r.stdout)
 
 
 if __name__ == "__main__":

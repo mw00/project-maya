@@ -251,8 +251,8 @@ int main(int argc, char** argv) {
     bool selftest = false;
     bool check_fixtures = false;
     std::string pack = "pack/full";
-    // --gguf, else $STRATA_PLE_GGUF, else the development layout (run from the engine root)
-    std::string gguf = std::getenv("STRATA_PLE_GGUF") ? std::getenv("STRATA_PLE_GGUF")
+    // --gguf, else $MAYA_PLE_GGUF, else the development layout (run from the engine root)
+    std::string gguf = std::getenv("MAYA_PLE_GGUF") ? std::getenv("MAYA_PLE_GGUF")
                                                       : "../../Q2_0/Qwen3.8-Flash-Next-Q2_0-00002-of-00002.gguf";
     std::string in_bin = "bench/micro/ple_in.bin", out_bin = "bench/micro/ple_out.bin";
     for (int i = 1; i < argc; ++i) {

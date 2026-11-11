@@ -1,6 +1,6 @@
 // tests/glm_dsa/glm_pool_classes_test.cpp - glm-dsa B3.7 (CPU): the slow-path expert pool's size classes.
 //
-//   * STRATA_GLM_POOL_CLASSES parsing (unset, 0, garbage, negative -> no cap);
+//   * MAYA_GLM_POOL_CLASSES parsing (unset, 0, garbage, negative -> no cap);
 //   * the merge of 9 classes (the PACK9 shape: 10 MoE layers, the 10th in class 0, plus the NextN layer) to 8, 2 and
 //     1 class: layers keep their class below the cap, the folded ones land in the last kept class, its stride is the
 //     largest folded stride, the demand counters are summed, every slot still holds its layer's blob;
@@ -65,8 +65,8 @@ int main() {
     std::printf("glm_pool_classes_test: the slow-path expert pool size classes (B3.7)\n");
     check(glm_pool_class_cap(nullptr) == 0 && glm_pool_class_cap("") == 0 && glm_pool_class_cap("0") == 0 &&
               glm_pool_class_cap("x") == 0 && glm_pool_class_cap("-3") == 0 && glm_pool_class_cap("8x") == 0,
-          "STRATA_GLM_POOL_CLASSES: unset / 0 / garbage / negative mean no cap");
-    check(glm_pool_class_cap("8") == 8 && glm_pool_class_cap("1") == 1, "STRATA_GLM_POOL_CLASSES=8 / 1 parse");
+          "MAYA_GLM_POOL_CLASSES: unset / 0 / garbage / negative mean no cap");
+    check(glm_pool_class_cap("8") == 8 && glm_pool_class_cap("1") == 1, "MAYA_GLM_POOL_CLASSES=8 / 1 parse");
     check(glm_pool_classes_last() == -1, "glm_pool_classes_last() is -1 before any pool");
 
     {   // no cap, cap >= n: unchanged

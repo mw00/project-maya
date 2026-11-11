@@ -7,25 +7,25 @@
 //   prep          glmd::dsa_prep_rows: qr (+FP16), latent / k_pe / index keys at p0 + t
 //   queries       q = W_q_b qr (64 x 256), iq = W_idx_q_b qr (32 x 128), roped at p0 + t (dsa_rope_q_rows)
 //   selection     full layers, once the sub-batch sees more than 2048 keys: index_score_tile_wmma over 16K-key blocks
-//                 (FP16 queries / keys on tensor cores, F32 sums; STRATA_GLMD_IDX_WMMA=0 or a device without its 80 KB
+//                 (FP16 queries / keys on tensor cores, F32 sums; MAYA_GLMD_IDX_WMMA=0 or a device without its 80 KB
 //                 of opt-in shared memory: index_score_tile_keys, F32) merged into per-row running sets
 //                 (topk_merge_tile), the final tile writing the chunk's selection rows `sel` (kept in io.keep), which
 //                 the shared layers after it read as they are (A-96).  On a 7.7K prompt the two scorers' selections
 //                 share 99.97% of their cells (mean of 63 layer sub-batches; the worst row 99.71%).
-//                 STRATA_GLMD_IDX_CHECK=1 prints that agreement per layer and sub-batch (a debug aid)
-//   q_abs         W_kb_h^T q_nope per head: FP16 strided-batched GEMM (B9.7; STRATA_GLMD_PF_F16=0: F32)
-//   attention     glmd::mla_prompt_h64 (a block per row and 64 heads; STRATA_GLMD_PF_H64=0: mla_prompt_wmma, a block
-//                 per row and 16 heads, B9.5; STRATA_GLMD_PF_WMMA=0 or no opt-in: mla_prompt_f32), the walk by
+//                 MAYA_GLMD_IDX_CHECK=1 prints that agreement per layer and sub-batch (a debug aid)
+//   q_abs         W_kb_h^T q_nope per head: FP16 strided-batched GEMM (B9.7; MAYA_GLMD_PF_F16=0: F32)
+//   attention     glmd::mla_prompt_h64 (a block per row and 64 heads; MAYA_GLMD_PF_H64=0: mla_prompt_wmma, a block
+//                 per row and 16 heads, B9.5; MAYA_GLMD_PF_WMMA=0 or no opt-in: mla_prompt_f32), the walk by
 //                 glmd::attn_walk (B14.12: dense below 2049 keys, dense-masked below ratio x 2048, else gather; the
 //                 ratio is 1 for the 64-head kernel - it gathers from 2049 keys on -, 4 for CUDA's 16-head ones).
-//                 HIP: mla_prompt_rdna on gfx11 / gfx12 (B9.5's arithmetic on RDNA WMMA; STRATA_GLMD_PF_RDNA=0: off),
-//                 else mla_prompt_f32 - both gather from 2049 keys on (ratio 1; STRATA_GLMD_GATHER_RATIO overrides)
+//                 HIP: mla_prompt_rdna on gfx11 / gfx12 (B9.5's arithmetic on RDNA WMMA; MAYA_GLMD_PF_RDNA=0: off),
+//                 else mla_prompt_f32 - both gather from 2049 keys on (ratio 1; MAYA_GLMD_GATHER_RATIO overrides)
 //   out           W_vb ctx per head (FP16 strided-batched), then attn_output into the mixer rows
 // The scale is glmd::attn_scale(qk_head) (1/16 for GLM-5.3), never Flash's 1/sqrt(qk_nope).
 // glm-dsa wave 5: the caches are the decode mixer's, byte for byte in layout - latent / k_pe / index keys at the state
 // layout's offsets, cell s = position s, the index keys in the layout's dtype (GlmStateLayout::ik_bytes: F32, or FP16
-// with STRATA_GLM_IDX_FP16, B10.8) for both the write (dsa_prep_rows) and the score (index_score_tile_keys); a native
-// Q8_0 W_kb / W_vb (B10.7, STRATA_PACK_NATIVE32 packs) is dequantized to FP16 for the absorbed products.
+// with MAYA_GLM_IDX_FP16, B10.8) for both the write (dsa_prep_rows) and the score (index_score_tile_keys); a native
+// Q8_0 W_kb / W_vb (B10.7, MAYA_PACK_NATIVE32 packs) is dequantized to FP16 for the absorbed products.
 #include "strata/core/glm_env.hpp"
 #include "glm_prefill_dsa.hpp"
 #include "strata/kernels/kv_stream.hpp"
@@ -367,7 +367,7 @@ void upload_rope(const Io& io, const Keep& k) {
 #endif
 }
 
-// STRATA_GLMD_IDX_CHECK=1 (a debug aid): the other scorer's selection of the same sub-batch (F32 vs WMMA), compared on
+// MAYA_GLMD_IDX_CHECK=1 (a debug aid): the other scorer's selection of the same sub-batch (F32 vs WMMA), compared on
 // the host with the one the layer uses - the per-row overlap of the 2,048-cell sets, one line per layer and sub-batch.
 // The layer goes on with its own selection.
 template <typename Select>
@@ -534,15 +534,15 @@ bool dsa_layer(const Io& io, int il, std::string& err) {
         err = "glm-dsa prefill: layer " + std::to_string(il) + " lacks its k_pe or index-key cache";
         return false;
     }
-    static const bool f16_env = env_on("STRATA_GLMD_PF_F16", true);
+    static const bool f16_env = env_on("MAYA_GLMD_PF_F16", true);
     // a native Q8_0 W_kb / W_vb has no F32 path here: its products always run on the FP16 dequant
     const bool f16_products = f16_env || L.k_b.type == glmdsa::kTypeQ8_0 || L.v_b.type == glmdsa::kTypeQ8_0;
-    static const bool want_wmma = env_on("STRATA_GLMD_PF_WMMA", true);
-    static const bool want_h64 = env_on("STRATA_GLMD_PF_H64", true);   // 0: the (row, 16 heads) WMMA kernel
+    static const bool want_wmma = env_on("MAYA_GLMD_PF_WMMA", true);
+    static const bool want_h64 = env_on("MAYA_GLMD_PF_H64", true);   // 0: the (row, 16 heads) WMMA kernel
     const bool wmma = want_wmma && KV == 512 && (R == 0 || R == 64) && glmd::mla_prompt_wmma_ok();
-    // the indexer's score tiles on tensor cores (FP16 queries / keys, F32 sums; STRATA_GLMD_IDX_WMMA=0: the F32 scorer)
-    static const bool want_idx_tc = env_on("STRATA_GLMD_IDX_WMMA", true);
-    static const bool idx_check = env_on("STRATA_GLMD_IDX_CHECK", false);
+    // the indexer's score tiles on tensor cores (FP16 queries / keys, F32 sums; MAYA_GLMD_IDX_WMMA=0: the F32 scorer)
+    static const bool want_idx_tc = env_on("MAYA_GLMD_IDX_WMMA", true);
+    static const bool idx_check = env_on("MAYA_GLMD_IDX_CHECK", false);
     const bool idx_tc_ok = full && ((uintptr_t) ik_cache & 15u) == 0 && glmd::index_score_wmma_fits(ik_f16, IH, ID);
     const bool idx_tc = want_idx_tc && idx_tc_ok;
     // whether the 64-head kernel takes this layer (shape, the caches' alignment, the device): it sets the crossover

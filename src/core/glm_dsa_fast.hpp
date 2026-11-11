@@ -117,7 +117,7 @@ bool shexp_down_apart(GlmDsaFast* ext, const WSlot& sh_down, const void* sh_hq, 
 /// Glm5Model::fast_dsa_arena after the arena and every layer are bound.
 bool mixer_setup(GlmDsaFast& X, const Glm5Geometry& g, int64_t max_ctx, std::string& err);
 
-/// B10.1 / B14.4: the per-part decode graph of the glm-dsa layer loop (STRATA_GLM_DSA_GRAPHS=1; glm_dsa_mixer.cu, a
+/// B10.1 / B14.4: the per-part decode graph of the glm-dsa layer loop (MAYA_GLM_DSA_GRAPHS=1; glm_dsa_mixer.cu, a
 /// no-op stub without CUDA).  Per token, fast_layers_plain calls graph_prepare; when pg.on it runs its layer loop as
 /// graph_run's body (captured the first time and whenever pg.key changes, replayed otherwise), else directly.
 struct PartGraph {
@@ -125,7 +125,7 @@ struct PartGraph {
     glmd::GraphKey key;            // part / bounds / CPU-lane plan / fixed addresses / kernel bits / regime / capacity
     uint64_t requests = 0;         // the CPU-lane requests one pass of the body posts (one per MoE layer)
 };
-/// Decide for the token at p: on only with STRATA_GLM_DSA_GRAPHS=1, host_off null (the caller's host-side conditions:
+/// Decide for the token at p: on only with MAYA_GLM_DSA_GRAPHS=1, host_off null (the caller's host-side conditions:
 /// no profiling, dumps, expert prefetch or lookahead; else it names the one that keeps graphs off, logged once per
 /// part and counted, see host_off_reason) and without the dense switch.  When on, it writes the part's glmd::DevPos
 /// for p (one launch on s, outside any capture) and fills the key from the dispatch policy and the bound layout.
@@ -137,12 +137,12 @@ bool graph_prepare(GlmDsaFast& X, const GlmStateLayout& lay, int l0, int l1, int
 /// fast_layers_plain's host-side conditions for a decode graph: null when the body is pure device work, else the
 /// switch that keeps graphs off (the first of: profiling, GLM_CB_DIR dumps, expert prefetch, lookahead, GLM_DUMP_H,
 /// and a request that asks for none: GEN graphs=0, glm_req_knobs.hpp).  max_pf is the request's prefetch count
-/// (GEN prefetch_n=, else STRATA_GLM_PREFETCH_N), so a prefetch request runs eagerly while a plain one replays.
+/// (GEN prefetch_n=, else MAYA_GLM_PREFETCH_N), so a prefetch request runs eagerly while a plain one replays.
 inline const char* host_off_reason(bool prof_on, bool dumps, int max_pf, int n_ahead, bool dump_h,
                                    bool request_off = false) {
-    return prof_on ? "profiling (STRATA_GLM_PROF)" : dumps ? "GLM_CB_DIR dumps" :
-           max_pf > 0 ? "expert prefetch (STRATA_GLM_PREFETCH_N > 0, or the request's GEN prefetch_n=)" :
-           n_ahead > 0 ? "lookahead (STRATA_GLM_AHEAD > 0)" :
+    return prof_on ? "profiling (MAYA_GLM_PROF)" : dumps ? "GLM_CB_DIR dumps" :
+           max_pf > 0 ? "expert prefetch (MAYA_GLM_PREFETCH_N > 0, or the request's GEN prefetch_n=)" :
+           n_ahead > 0 ? "lookahead (MAYA_GLM_AHEAD > 0)" :
            dump_h ? "GLM_DUMP_H" : request_off ? "the request (GEN graphs=0)" : nullptr;
 }
 /// Capture or replay the body (every layer of the part at p) on s; expected advances by pg.requests either way.

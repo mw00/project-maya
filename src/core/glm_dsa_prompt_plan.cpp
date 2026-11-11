@@ -44,8 +44,8 @@ void sub_sizes(const PromptDims& d, PromptTiling& t) {
 
 PromptTiling prompt_tiling(const PromptDims& d, size_t budget) {
     PromptTiling t;
-    t.key_block = (int) std::clamp<long long>(env_ll("STRATA_GLMD_KEY_BLOCK", 16384), 256, 1 << 20) / 256 * 256;
-    t.q_sub = (int) std::clamp<long long>(env_ll("STRATA_GLMD_Q_SUB", 2048), 16, 8192);
+    t.key_block = (int) std::clamp<long long>(env_ll("MAYA_GLMD_KEY_BLOCK", 16384), 256, 1 << 20) / 256 * 256;
+    t.q_sub = (int) std::clamp<long long>(env_ll("MAYA_GLMD_Q_SUB", 2048), 16, 8192);
     t.q_sub = (int) std::min<int64_t>(t.q_sub, std::max<int64_t>(1, d.T));
     sub_sizes(d, t);
     while (budget > 0 && t.sub_bytes > budget && t.q_sub > 64) {
@@ -64,7 +64,7 @@ PromptTiling prompt_tiling(const PromptDims& d, size_t budget) {
 }
 
 double gather_ratio(double dflt) {
-    const char* v = std::getenv("STRATA_GLMD_GATHER_RATIO");
+    const char* v = std::getenv("MAYA_GLMD_GATHER_RATIO");
     if (v != nullptr && v[0]) {
         const double r = std::atof(v);
         if (r >= 1.0) return r;
@@ -79,7 +79,7 @@ AttnWalk attn_walk(int64_t n_kv, int top_k, double ratio) {
 }
 
 int upload_rows_min(const LaneLink& l) {
-    const long long env = env_ll("STRATA_GLM_UPLOAD_MIN_ROWS", -1);
+    const long long env = env_ll("MAYA_GLM_UPLOAD_MIN_ROWS", -1);
     if (env >= 0) return (int) env;
     // upload: bytes / link once.  lane: per row, the expert's bytes stream through the lane once per row block of
     // kLaneRows rows (the kernels block rows) plus the row compute.  rows* solves upload = lane.
@@ -94,7 +94,7 @@ int upload_rows_min(const LaneLink& l) {
 bool upload_expert(int rows, const LaneLink& l) { return rows >= upload_rows_min(l); }
 
 int upload_rows_min_measured(double upload_ms, double lane_expert_ms, double lane_row_ms) {
-    const long long env = env_ll("STRATA_GLM_UPLOAD_MIN_ROWS", -1);
+    const long long env = env_ll("MAYA_GLM_UPLOAD_MIN_ROWS", -1);
     if (env >= 0) return (int) env;
     if (!(upload_ms > lane_expert_ms) || !(lane_row_ms > 0.0)) return 0;
     return std::max(1, (int) std::ceil((upload_ms - lane_expert_ms) / lane_row_ms));

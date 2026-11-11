@@ -4,6 +4,21 @@ Every release is on GitHub (Releases) with these notes; every published change m
 page's Settings › About and updates (About > Update before the redesign; from v1.0.18), or `git pull`, then `./setup.sh` (Windows: `START-MAYA.bat`) - it recompiles
 only what changed and starts; the model is not downloaded again.
 
+## v1.1.59 - 2026-11-11
+
+Refusal ablation for DeepSeek, MiniMax and GLM-5.3-Flash, Turbo for GLM-5.3 (744B), a setup that recommends the quant and context your PC's memory holds, and fixes.
+
+- **The setup recommends the quant your PC holds:** every model's list (GLM-5.3-Flash, GLM-5.3 (744B), DeepSeek and MiniMax) now recommends the largest quant, no larger than the model's usual pick, whose files plus the default context's cache fit in your VRAM and RAM together (with 6 GB left for the system), so no expert has to be read from the SSD while it answers. When less than a fifth of it would be in GPU memory, the next smaller one is recommended; when none fits, the smallest. An AMD Ryzen AI Max APU (Strix / Gorgon Halo) and a Mac count their shared memory once. Every quant stays in the list, and ids, names and downloads are unchanged. For GLM-5.3 (744B) the recommendation is at most GLM-5.3-Maya-XS; the larger quants stay listed.
+- **GLM-5.3 (744B) on unified-memory APUs: a context that keeps the whole model in memory:** on an AMD Ryzen AI Max APU the setup recommends the largest context whose cache still leaves room for all of the model in memory, and says so in one line. A longer context, given with `--context` or chosen by an earlier setup, is kept, with a warning that some experts are then read from the SSD.
+- **Turbo for GLM-5.3 (744B):** the Turbo button is now offered for GLM-5.3 too, with its own setting: when a token's experts are chosen, the ones already in VRAM are preferred (`MAYA_GLM_ROUTE_AFFINITY=0.2`), and the context is set to 32K. With GLM-5.3-Maya-XS, part of it outside VRAM, this decoded about 22-25% faster than without it on our test PC. Like every Turbo setting it changes the answers; it stays off until you switch it on, and switching it off restores your settings exactly. GLM-5.3-Flash's Turbo is unchanged.
+- **Dashboard: "Saved" for chat defaults:** Settings > Chat defaults shows a small "Saved" tick beside its title after every change.
+- **Refusal ablation for DeepSeek-V4.1-Flash, MiniMax-M3.1-Flash and GLM-5.3-Flash:** Maya's own direction files are now in each model's repo; the setup downloads the model's file and the Models page shows its switch. It is off until you switch it on (the Models page, or a request's `"ablate"`), and with it off the answers are the same as before. On our held-out test prompts the share of refused requests went from 98% to 1% (DeepSeek), 100% to 7% (MiniMax) and 100% to 4% (GLM-5.3-Flash), with no more refusals of ordinary requests than without it. Fitting your own direction with `tools/ablate_fit.py` now works on MiniMax (it stopped with an error before) and gives a usable direction on GLM-5.3.
+- **Fixes:**
+  - GLM-5.3 (744B) and GLM-5.3-Flash keep their own chat defaults on the dashboard: changing one no longer changes the other. GLM-5.3 starts once from the values you saved before.
+  - `--parallel` with fair slices (`MAYA_FAIR_SLICE_S`): one waiting request now pauses one running answer instead of every running answer, so the others keep going (thanks to @HTsulfuric, #883).
+  - DeepSeek with `DS4_LENT_RAM_GB`: a failed copy into the RAM copies no longer makes every request fail with HTTP 400; the copies turn themselves off and prompts run as they do without the setting, with the same answers (#884).
+  - DeepSeek on NVIDIA tensor-parallel pairs: `MAYA_DS4_HIP_PEER_AR=auto` / `1` reaches the direct GPU-to-GPU prompt all-reduce again, as in v1.1.54 (since v1.1.55 it was skipped whenever `MAYA_DS4_AR2` was not set); `auto` compares the transports at startup as before. The answers are the same.
+
 ## v1.1.58 - 2026-11-10
 
 GLM-5.3-Maya-XS, Maya's own quant of GLM-5.3 (744B) at 170 GB, faster GLM-5.3 decode and drafting, DeepSeek's one-GPU decode back to speed (#920), and fixes.

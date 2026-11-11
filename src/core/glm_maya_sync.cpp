@@ -17,7 +17,7 @@ bool glm_exl3_ok(GlmArch a, std::string& err) {
 bool glm_dflash_ok(GlmArch a, std::string& err) {
     if (a != GlmArch::GlmDsa) return true;
     err = "glm dflash: the DFlash2 drafter is made for GLM-5.3-Flash (its hidden-state taps and vocabulary); GLM-5.3 "
-          "744B (glm-dsa) drafts with its NextN block - unset STRATA_GLM_DFLASH / --dflash";
+          "744B (glm-dsa) drafts with its NextN block - unset MAYA_GLM_DFLASH / --dflash";
     return false;
 }
 

@@ -1,4 +1,4 @@
-// split_groups (STRATA_GLM_EVEN_GROUPS): the old rule's groups of k unchanged; the even rule's two groups at least,
+// split_groups (MAYA_GLM_EVEN_GROUPS): the old rule's groups of k unchanged; the even rule's two groups at least,
 // near-equal sizes of k at most, and in steady state - only the group that came back is ready - that group again,
 // not cut smaller.  CPU only.
 #include "strata/core/split_groups.hpp"

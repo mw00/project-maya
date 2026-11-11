@@ -1,4 +1,4 @@
-// prefix_cut (STRATA_GLM_PREFIX_CUT): where a prompt's read ends a call to keep its system prompt's state - the first
+// prefix_cut (MAYA_GLM_PREFIX_CUT): where a prompt's read ends a call to keep its system prompt's state - the first
 // user turn, only where both calls reach the prompt path's minimum and the read does not start at or near it - the
 // marks it goes into (sorted, spaced, the existing ones win), and kept slots told apart by their tokens.  With the
 // marks, a read covers every token once, in order, and one call ends at the system prompt's end.  CPU only.

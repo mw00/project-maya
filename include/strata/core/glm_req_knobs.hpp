@@ -9,28 +9,28 @@
 // pcie_frac does: Glm5Model::set_pcie_share(-1)).
 //
 //   GEN key          start value                              a request's values
-//   promote_min      STRATA_GLM_PROMOTE_MIN                   0..65535 (0 / 1: keep any fetched expert a spare fits)
-//   prefetch_n       STRATA_GLM_PREFETCH_N                    0..2 (kSpares - 1); above 0 the decode graphs stay off
-//   prefetch_at      STRATA_GLM_PREFETCH_AT                   route | fetch | cpu
-//   prefetch_rank    STRATA_GLM_PREFETCH_RANK                 0..64 (0: any rank of the prediction)
-//   prefetch_blocks  STRATA_GLM_PREFETCH_BLOCKS               0..1024 (0: half the SMs)
-//   mtp_keep         STRATA_GLM_MTP_KEEP (or _MTP_MISS)       0..8
-//   cpu_split        STRATA_GLM_CPU_SPLIT                     0..64 (0: about 48 pieces in all)
-//   vram_evict       STRATA_GLM_VRAM_EVICT                    lfu | lru
-//   ngram            STRATA_GLM_NGRAM_DRAFT                   0 | 1
-//   lane_row4        STRATA_GLM_LANE_ROW4                     0 | 1 (kernels::cpu::lane_row4_override; -1 the switch)
-//   graphs           (STRATA_GLM_DSA_GRAPHS as started)       0: this request decodes eagerly (glmdsa::host_off_reason)
+//   promote_min      MAYA_GLM_PROMOTE_MIN                   0..65535 (0 / 1: keep any fetched expert a spare fits)
+//   prefetch_n       MAYA_GLM_PREFETCH_N                    0..2 (kSpares - 1); above 0 the decode graphs stay off
+//   prefetch_at      MAYA_GLM_PREFETCH_AT                   route | fetch | cpu
+//   prefetch_rank    MAYA_GLM_PREFETCH_RANK                 0..64 (0: any rank of the prediction)
+//   prefetch_blocks  MAYA_GLM_PREFETCH_BLOCKS               0..1024 (0: half the SMs)
+//   mtp_keep         MAYA_GLM_MTP_KEEP (or _MTP_MISS)       0..8
+//   cpu_split        MAYA_GLM_CPU_SPLIT                     0..64 (0: about 48 pieces in all)
+//   vram_evict       MAYA_GLM_VRAM_EVICT                    lfu | lru
+//   ngram            MAYA_GLM_NGRAM_DRAFT                   0 | 1
+//   lane_row4        MAYA_GLM_LANE_ROW4                     0 | 1 (kernels::cpu::lane_row4_override; -1 the switch)
+//   graphs           (MAYA_GLM_DSA_GRAPHS as started)       0: this request decodes eagerly (glmdsa::host_off_reason)
 //   pcie_frac_head   pcie_frac, else the start plan           0..1: the head parts' CPU-lane share (Glm5Model::
 //                                                             set_pcie_share_head; the other parts keep pcie_frac)
 //
 // promote_min is an argument of the route kernel, so a captured graph holds it: a change bumps the glm-dsa decode
-// graphs' generation (apply), and Flash's KDA layer graphs (STRATA_GLM_KDA_GRAPH, keyed without one) stay off while a
+// graphs' generation (apply), and Flash's KDA layer graphs (MAYA_GLM_KDA_GRAPH, keyed without one) stay off while a
 // request names it.  The other knobs reach no captured graph: prefetch_n > 0 keeps both kinds off (prefetch_at /
 // _rank / _blocks act only then), and the rest act outside them (the boundary, the CPU lane, the NextN draft's route,
 // the n-gram drafts).
 //
 // The values are process-wide relaxed atomics (every part of a split reads the same one), set between requests; with
-// several conversations at once (STRATA_GLM_SEQS) a GEN line sets them for every running request, as pcie_frac does.
+// several conversations at once (MAYA_GLM_SEQS) a GEN line sets them for every running request, as pcie_frac does.
 // The store and the parser are header-only (the readers live in strata_engine, strata_kernels' moe_prefetch and the
 // n-gram draft's CPU tests); apply() is in src/core/glm_req_knobs.cpp.
 #pragma once

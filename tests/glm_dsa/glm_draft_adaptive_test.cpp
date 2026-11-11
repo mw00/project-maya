@@ -1,5 +1,5 @@
 // tests/glm_dsa/glm_draft_adaptive_test.cpp - glm-dsa B15.9 (CPU): the adaptive draft depth controller
-// (include/strata/core/glm_draft_adaptive.hpp) and its use in NgramSession (STRATA_GLM_DRAFT_ADAPTIVE).
+// (include/strata/core/glm_draft_adaptive.hpp) and its use in NgramSession (MAYA_GLM_DRAFT_ADAPTIVE).
 //   1. AdaptiveDepth: the climb thresholds (2, 4, the 3 -> 4 barrier of 10), the drop pressure max(5d, 20), floor and
 //      cap, no pressure at the floor, reset;
 //   2. ProposalTracker: full accept, first-miss resolution, one round at a time;
@@ -7,7 +7,7 @@
 //      (random tokens with short accidental repeats), adaptive vs fixed depths 1 / 4 / 8: the adaptive depth reaches
 //      the cap on code (>= 90% of fixed-8's accepted tokens) and stays shallow on prose (far fewer rejected verify
 //      rows than fixed-8); the numbers are printed;
-//   4. NgramSession: off -> depth() is STRATA_GLM_NGRAM_MAX and nothing is tracked; on -> the proposals are cut to
+//   4. NgramSession: off -> depth() is MAYA_GLM_NGRAM_MAX and nothing is tracked; on -> the proposals are cut to
 //      depth(), the depth climbs on a repetitive conversation, a floor of 2 starts at 2, and it resets per session.
 #include "strata/core/glm_draft_adaptive.hpp"
 #include "strata/core/glm_ngram_draft.hpp"
@@ -165,14 +165,14 @@ void test_rounds() {
 
 void test_session() {
     std::printf("[4. NgramSession]\n");
-    setenv("STRATA_GLM_NGRAM_DRAFT", "1", 1);
-    setenv("STRATA_GLM_NGRAM_MAX", "8", 1);
-    unsetenv("STRATA_GLM_DRAFT_ADAPTIVE");
+    setenv("MAYA_GLM_NGRAM_DRAFT", "1", 1);
+    setenv("MAYA_GLM_NGRAM_MAX", "8", 1);
+    unsetenv("MAYA_GLM_DRAFT_ADAPTIVE");
     std::vector<int32_t> block;
     for (int i = 0; i < 40; ++i) block.push_back(100 + (i * 7) % 61);
     {
         NgramSession s(nullptr);
-        check(!s.adaptive_on() && s.depth() == 8, "off: depth() is STRATA_GLM_NGRAM_MAX");
+        check(!s.adaptive_on() && s.depth() == 8, "off: depth() is MAYA_GLM_NGRAM_MAX");
         for (int rep = 0; rep < 3; ++rep)
             for (int32_t t : block) {
                 s.pick(-1);
@@ -180,7 +180,7 @@ void test_session() {
             }
         check(s.tracked_drafted() == 0, "off: nothing tracked");
     }
-    setenv("STRATA_GLM_DRAFT_ADAPTIVE", "1", 1);
+    setenv("MAYA_GLM_DRAFT_ADAPTIVE", "1", 1);
     int climbed = 0;
     {
         NgramSession s(nullptr);
@@ -201,14 +201,14 @@ void test_session() {
         NgramSession s(nullptr);
         check(s.depth() == 1, "a new session (generation) starts again at the floor");
     }
-    setenv("STRATA_GLM_DRAFT_ADAPTIVE", "2", 1);
+    setenv("MAYA_GLM_DRAFT_ADAPTIVE", "2", 1);
     {
         NgramSession s(nullptr);
-        check(s.depth() == 2, "STRATA_GLM_DRAFT_ADAPTIVE=2: floor and start 2");
+        check(s.depth() == 2, "MAYA_GLM_DRAFT_ADAPTIVE=2: floor and start 2");
     }
-    unsetenv("STRATA_GLM_DRAFT_ADAPTIVE");
-    unsetenv("STRATA_GLM_NGRAM_DRAFT");
-    unsetenv("STRATA_GLM_NGRAM_MAX");
+    unsetenv("MAYA_GLM_DRAFT_ADAPTIVE");
+    unsetenv("MAYA_GLM_NGRAM_DRAFT");
+    unsetenv("MAYA_GLM_NGRAM_MAX");
 }
 
 }  // namespace

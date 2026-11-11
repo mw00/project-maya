@@ -6,16 +6,16 @@ engine_keys() returns to the GEN line.  The engine applies them from the request
 request leaves out back to the value it started with (include/strata/core/glm_req_knobs.hpp), so a request without
 them runs exactly as the engine started.  A value outside a key's range, or of the wrong type, is dropped here.
 
-    promote_min      0..65535        STRATA_GLM_PROMOTE_MIN: keep a fetched expert only when its aged count clears it
-    prefetch_n       0..2            STRATA_GLM_PREFETCH_N: predicted next-layer experts copied ahead (> 0: no graphs)
-    prefetch_at      route|fetch|cpu STRATA_GLM_PREFETCH_AT: when that copy starts
-    prefetch_rank    0..64           STRATA_GLM_PREFETCH_RANK: only the prediction's first ranks (0: any)
-    prefetch_blocks  0..1024         STRATA_GLM_PREFETCH_BLOCKS: the copy's thread blocks (0: half the SMs)
-    mtp_keep         0..8            STRATA_GLM_MTP_KEEP: the NextN draft fetches its missing experts among its n best
-    cpu_split        0..64           STRATA_GLM_CPU_SPLIT: CPU-lane pieces a thread (0: about 48 in all)
-    vram_evict       lfu|lru         STRATA_GLM_VRAM_EVICT
-    ngram            on/off          STRATA_GLM_NGRAM_DRAFT (true / false, or 1 / 0)
-    lane_row4        on/off          STRATA_GLM_LANE_ROW4
+    promote_min      0..65535        MAYA_GLM_PROMOTE_MIN: keep a fetched expert only when its aged count clears it
+    prefetch_n       0..2            MAYA_GLM_PREFETCH_N: predicted next-layer experts copied ahead (> 0: no graphs)
+    prefetch_at      route|fetch|cpu MAYA_GLM_PREFETCH_AT: when that copy starts
+    prefetch_rank    0..64           MAYA_GLM_PREFETCH_RANK: only the prediction's first ranks (0: any)
+    prefetch_blocks  0..1024         MAYA_GLM_PREFETCH_BLOCKS: the copy's thread blocks (0: half the SMs)
+    mtp_keep         0..8            MAYA_GLM_MTP_KEEP: the NextN draft fetches its missing experts among its n best
+    cpu_split        0..64           MAYA_GLM_CPU_SPLIT: CPU-lane pieces a thread (0: about 48 in all)
+    vram_evict       lfu|lru         MAYA_GLM_VRAM_EVICT
+    ngram            on/off          MAYA_GLM_NGRAM_DRAFT (true / false, or 1 / 0)
+    lane_row4        on/off          MAYA_GLM_LANE_ROW4
     graphs           on/off          off: this request decodes without the glm-dsa decode graphs (on: as started)
     pcie_frac_head   0..1            the speculative head's parts' CPU-lane share (the tail keeps pcie_frac)
 

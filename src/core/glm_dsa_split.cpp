@@ -2,7 +2,7 @@
 // (include/strata/core/glm_dsa_split.hpp).  No CUDA, no I/O: tests/glm_dsa/glm_dsa_split_test.cpp runs them on the CPU.
 #include "strata/core/glm_dsa_split.hpp"
 #include "strata/core/glm_state_layout.hpp"
-#include "glm_tier_plan.hpp"   // lane_pool_mode: the runtime's STRATA_GLM_CPU_SHARED rule
+#include "glm_tier_plan.hpp"   // lane_pool_mode: the runtime's MAYA_GLM_CPU_SHARED rule
 
 #include <algorithm>
 #include <cstdlib>
@@ -33,7 +33,7 @@ int64_t glm_dsa_state_row_bytes(const Glm5Geometry& g, int layer, bool int8, boo
         row = (int64_t) g.kv_lora + g.kv_lora / 16 + 2 * (int64_t) g.qk_rope;
     else
         row = 2 * (int64_t) (g.kv_lora + g.qk_rope);
-    // index keys on full-indexer layers only: F32, or FP16 on the fast path with STRATA_GLM_IDX_FP16 (B10.8)
+    // index keys on full-indexer layers only: F32, or FP16 on the fast path with MAYA_GLM_IDX_FP16 (B10.8)
     if (g.idx_full(layer)) row += (!f32_latent && glm_state_idx_fp16() ? 2 : 4) * (int64_t) g.idx_key;
     return row;
 }

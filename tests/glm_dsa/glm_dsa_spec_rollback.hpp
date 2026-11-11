@@ -16,7 +16,7 @@
 //   * stale selection: after a draft run WITHOUT the rollback, a shared layer run at the same position accepts the
 //     rejected run's selection (and its output differs from A's at some position: the hazard is real); WITH the
 //     rollback it is refused, so a redo can only proceed through its full layer's fresh selection.
-// schedule<Be> (glm-dsa B11.2, STRATA_GLM_SPEC_DRAFT_EARLY): decode_spec's step order on a head part, a two-part tail
+// schedule<Be> (glm-dsa B11.2, MAYA_GLM_SPEC_DRAFT_EARLY): decode_spec's step order on a head part, a two-part tail
 // group and the NextN block on the tail's last part, each part its own harness (its own caches and selection state,
 // as each part has its own arena), today's order and the draft-early one, against the token-at-a-time run.
 // The caller defines `void check(bool, const std::string&)` before including this header.
@@ -142,14 +142,14 @@ void suite(const char* name, const mixfx::MixerDims& dims, int T, int lat_q8) {
 // s is rejected, else with the real ones):
 //   Order::Today  the draft at s-1, the head's verdict at s (rejected: rollback + redo), part 1, part 2, the head at s+1;
 //   Order::Early  the verdict, part 1, the draft at s-1, part 2, the head at s+1 (decode_spec with
-//                 STRATA_GLM_SPEC_DRAFT_EARLY=1: spec_tail_front, the draft, spec_tail_back);
+//                 MAYA_GLM_SPEC_DRAFT_EARLY=1: spec_tail_front, the draft, spec_tail_back);
 //   Order::Wrong  the verdict, part 1, part 2, the draft at s-1 - part 2 notes s before the draft read s-1 (the order
 //                 spec_tail_back must not take; the control).
 enum class Order { Today, Early, Wrong };
 
 inline const char* order_name(Order o) {
     return o == Order::Today   ? "today's order (the draft first)"
-           : o == Order::Early ? "STRATA_GLM_SPEC_DRAFT_EARLY's order (the draft after part 1)"
+           : o == Order::Early ? "MAYA_GLM_SPEC_DRAFT_EARLY's order (the draft after part 1)"
                                : "the wrong order (part 2 notes s before the draft reads s-1)";
 }
 

@@ -1,6 +1,6 @@
 // src/core/glm_dsa_graphs.hpp - glm-dsa B10.1: the per-part decode graph cache of the glm-dsa fast path.
 //
-// A captured graph per part (all of its layers) and per state arena - one per sequence with STRATA_GLM_SEQS /
+// A captured graph per part (all of its layers) and per state arena - one per sequence with MAYA_GLM_SEQS /
 // --parallel, up to set_per_part() a part (glmd::GraphIndex) - keyed by glmd::GraphKey (include/strata/kernels/glmd_graph.hpp:
 // the B14.4 rules every captured kernel follows).  The same request accounting as Maya's glmfast::LayerGraphs
 // (src/core/glm_layer_graphs.hpp): the body runs once at capture and does its own accounting (the MoE CPU-lane
@@ -67,7 +67,7 @@ public:
         ++captures;
         return true;
     }
-    /// Graphs kept per part: the sequence count (STRATA_GLM_SEQS / --parallel), so each sequence's state keeps its own.
+    /// Graphs kept per part: the sequence count (MAYA_GLM_SEQS / --parallel), so each sequence's state keeps its own.
     void set_per_part(int n) { idx_.set_per_part(n); }
     /// Kernel / memcpy nodes of a part's most recently used graph (the launches a replay saves), 0 when none.
     size_t nodes(int part) const {

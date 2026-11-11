@@ -18,5 +18,5 @@ if(TARGET strata_engine)
   # B15.7: the random-routing bench mode's isolation (spec decode off, kept states marked)
   add_test(NAME glm_env_test_random_routing COMMAND glm_env_test --random-routing)
   set_tests_properties(glm_env_test_random_routing PROPERTIES TIMEOUT 60
-                       ENVIRONMENT "STRATA_GLM_RANDOM_ROUTING=1;STRATA_GLM_RANDOM_ROUTING_SEED=7")
+                       ENVIRONMENT "MAYA_GLM_RANDOM_ROUTING=1;MAYA_GLM_RANDOM_ROUTING_SEED=7")
 endif()

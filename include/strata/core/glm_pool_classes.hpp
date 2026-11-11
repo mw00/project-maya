@@ -8,7 +8,7 @@
 // every class past the cap into the last kept one (its stride the largest of the folded classes), so the same weights
 // can run with 9, 8 or 1 classes and must give the same logits (tests/glm_dsa/glm_dsa_pack9_slow_test.cpp).
 //
-// Environment: STRATA_GLM_POOL_CLASSES=<n> caps the class count (0 or unset: no cap; 1: Maya's uniform slots).
+// Environment: MAYA_GLM_POOL_CLASSES=<n> caps the class count (0 or unset: no cap; 1: Maya's uniform slots).
 // Plain C++ (no CUDA), on every backend.
 #pragma once
 
@@ -17,7 +17,7 @@
 
 namespace strata::core {
 
-/// STRATA_GLM_POOL_CLASSES as a cap (0 = none); a negative or unparsable value is 0.
+/// MAYA_GLM_POOL_CLASSES as a cap (0 = none); a negative or unparsable value is 0.
 int glm_pool_class_cap(const char* env_value);
 
 /// Folds classes [cap-1, n) into class cap-1 when n > cap > 0.  layer_class maps a layer to its class (-1 = no MoE

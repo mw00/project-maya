@@ -62,7 +62,7 @@ __global__ __launch_bounds__(64,1) void score_kernel(
     if(row0>full)return;
     const int lane=threadIdx.x,warp=threadIdx.y;
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
-    // Turing (STRATA_EXPERIMENTAL_SM75, a layer-split stage): no tf32 mma.  The same scores with FP32 FMAs, one row
+    // Turing (MAYA_EXPERIMENTAL_SM75, a layer-split stage): no tf32 mma.  The same scores with FP32 FMAs, one row
     // per thread of the first warp - rounded differently from the tensor-core path (FP32 instead of TF32 inputs).
     if(warp!=0)return;
     const int row=row0+lane;

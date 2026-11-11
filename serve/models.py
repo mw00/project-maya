@@ -865,6 +865,12 @@ TURBO_CONTEXT_FAMILIES = ("glm", "minimax")         # ... DeepSeek's context is 
 # of its 8 (33.2 -> 38.8; 3 gave a page with a duplicate import and slower drafts).
 TURBO_ENV = {"glm": {"MAYA_GLM_MISS_SKIP_W": "0.16", "MAYA_GLM_MISS_SKIP_FROM": "23", "MAYA_GLM_RESIDENT_TOPK": "4"},
              "deepseek": {"MAYA_DS4_RAM_SKIP_W": "0.14", "MAYA_DS4_DSPARK_CUM": "0.3", "MAYA_DS4_RESIDENT_TOPK": "3"}}
+# GLM-5.3 (744B, glm-dsa) has its own: TURBO_ENV's GLM values were tuned on GLM-5.3-Flash's 45 layers.  Measured on
+# GLM-5.3 Maya-XS (greedy, 512 tokens): MAYA_GLM_ROUTE_AFFINITY (added to a VRAM-resident expert's selection score, so
+# more of a token's experts are ones VRAM holds) at 0.2 decodes 22-25% faster, KL 0.20 against the exact route, the loop
+# test and a 20K-token document question as without it; 0.5 and up drifted into echoing the prompt, and
+# MAYA_GLM_RESIDENT_TOPK 6 to 4 broke the code answers (not used).
+TURBO_ENV_G53 = {"MAYA_GLM_ROUTE_AFFINITY": "0.2"}
 # the drafter that goes fastest where the pack has it: DSpark (DeepSeek, MiniMax), MTP (Qwen).  GLM keeps the drafter the
 # setup measured for this PC (MTP or DFlash2: which is faster depends on the GPUs).
 TURBO_DRAFT = {"deepseek": "dspark", "minimax": "dspark", "qwen": "mtp"}
@@ -900,7 +906,7 @@ def turbo_patch(cfg: dict) -> dict:
         patch["dspark_conf"] = TURBO_DSPARK_CONF
     if fam == "deepseek" and cur.get("prompt_lookup") is False:
         patch["prompt_lookup"] = True
-    env = TURBO_ENV.get(fam)
+    env = TURBO_ENV_G53 if G53.config_is_glm_dsa(cfg) else TURBO_ENV.get(fam)
     if env and turbo_smallest_quant(cfg):              # (no expert cap on the 1-2 bit quants: see TURBO_NO_TOPK)
         env = {k: v for k, v in env.items() if not k.endswith("_RESIDENT_TOPK")}
     if env and any(cur["env"].get(k) != v for k, v in env.items()):
@@ -912,19 +918,11 @@ def turbo_on(cfg: dict) -> bool:
     return isinstance(cfg.get("turbo"), dict)
 
 
-def turbo_hidden(cfg: dict) -> bool:
-    """Turbo is not offered for GLM-5.3 (744B, glm-dsa) until its own values are measured on it (the owner,
-    2026-11-06): TURBO_ENV's GLM values were tuned on GLM-5.3-Flash's 45 layers."""
-    return G53.config_is_glm_dsa(cfg)
-
-
 def turbo_info(cfg: dict) -> dict:
     """What the page needs: whether Turbo is on, and what switching it on would change (before -> after)."""
     cur = settings_of(cfg)
     if turbo_on(cfg):
         return {"on": True, "family": family(cfg), "since": cfg["turbo"].get("since"), "plan": {}}
-    if turbo_hidden(cfg):                              # (the page shows no Turbo button)
-        return {"on": False, "family": family(cfg), "plan": {}, "env": {}, "hidden": True}
     patch = turbo_patch(cfg)
     return {"on": False, "family": family(cfg),
             "plan": {k: {"from": cur.get(k), "to": v} for k, v in patch.items() if k != "env"},
@@ -939,8 +937,6 @@ def turbo_enable(path: Path) -> dict:
         raise ValueError(f"{Path(path).name}: not a config Maya can read")
     if turbo_on(cfg):
         raise ValueError("Turbo is already on")
-    if turbo_hidden(cfg):
-        raise ValueError("Turbo is not offered for GLM-5.3 yet: its settings are measured on GLM-5.3-Flash")
     cur, patch = settings_of(cfg), turbo_patch(cfg)
     new = apply(cfg, patch)
     new["turbo"] = {"since": time.strftime("%Y-%m-%d %H:%M:%S"),

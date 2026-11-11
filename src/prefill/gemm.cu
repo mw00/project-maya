@@ -85,7 +85,7 @@ struct HipLtState {
     std::set<std::tuple<strata::prefill::hipblaslt::InputType, int, int, int, int>> fallback_shapes;
 
     ~HipLtState() {
-        if (std::getenv("STRATA_HIPBLASLT_VERBOSE")) {
+        if (std::getenv("MAYA_HIPBLASLT_VERBOSE")) {
             std::fprintf(stderr, "prefill gemm: hipBLASLt summary launches=%llu fallbacks=%llu unique_fallback_shapes=%zu\n",
                          (unsigned long long) lt_launches, (unsigned long long) fallbacks, fallback_shapes.size());
             for (const auto& shape : fallback_shapes) {
@@ -130,7 +130,7 @@ struct HipLtDescriptors {
 };
 
 std::unique_ptr<HipLtState> create_hipblaslt_state(void* workspace, size_t workspace_bytes) {
-    const char* path = std::getenv("STRATA_HIPBLASLT_TUNING");
+    const char* path = std::getenv("MAYA_HIPBLASLT_TUNING");
     if (!path || !*path) return nullptr;
 
     auto state = std::make_unique<HipLtState>();
@@ -196,7 +196,7 @@ HipLtCachedAlgo resolve_hipblaslt_algo(HipLtState& state, strata::prefill::hipbl
     if (cached != state.cache.end()) return cached->second;
 
     HipLtCachedAlgo resolved;
-    const bool verbose = std::getenv("STRATA_HIPBLASLT_VERBOSE") != nullptr;
+    const bool verbose = std::getenv("MAYA_HIPBLASLT_VERBOSE") != nullptr;
     HipLtDescriptors desc;
     bool desc_ready = false, any_row = false;
     // Once per shape (the result is cached): the first table, in the given order, whose row for this shape names a
@@ -282,7 +282,7 @@ bool try_hipblaslt(void* opaque_state, strata::prefill::hipblaslt::InputType typ
     if (resolved.workspace_bytes > state->workspace_bytes) {
         ++state->fallbacks;
         state->fallback_shapes.emplace(type, (int) t, (int) n, (int) k, (int) ldy);
-        if (std::getenv("STRATA_HIPBLASLT_VERBOSE")) {
+        if (std::getenv("MAYA_HIPBLASLT_VERBOSE")) {
             std::fprintf(stderr, "prefill gemm: Lt fallback; solution needs %zu workspace bytes, have %zu\n",
                          resolved.workspace_bytes, state->workspace_bytes);
         }

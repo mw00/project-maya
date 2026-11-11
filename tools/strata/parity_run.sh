@@ -9,7 +9,7 @@
 #   tools/strata/parity_run.sh ... --dry-run                                 # print every command, run nothing
 #
 # Corpus (--corpus, default data/glm-dsa/parity): <case>.tokens (the prompt and the reference greedy continuation,
-# token ids), <case>.ctx (the STRATA_GLM_SCORE context: the prompt length; positions ctx .. n-2 are scored) and
+# token ids), <case>.ctx (the MAYA_GLM_SCORE context: the prompt length; positions ctx .. n-2 are scored) and
 # cases.txt with one "<case> short|long" line per case (short: <= 2,048 + 256 tokens; long: 8,192 + 256).  B7.4a runs
 # the short cases only.  The same <case>.topk the refs stage writes is what tools/strata/volta3_gate.sh reads.
 #
@@ -17,9 +17,9 @@
 #   refs     llama.cpp logits of every case: R_cpu (--ngl 0) and R_cuda (--ngl 999 --ot exps=CPU, --ubatch 512); M2-alt
 #            also R_cuda of the pin build (--llama-pin-dump).  <out>/ref/<case>.{cpu,cuda,pin}.bin, and <case>.topk
 #            (top-64 + rest, tools/strata/llama_to_score_ref.py) from the primary reference.
-#   engine   the engine's log-softmax rows (STRATA_GLM_SCORE_DUMP) under strict numerics: STRATA_GLM_IDX_LN_EPS=0 (the
-#            indexer LayerNorm eps llama.cpp uses), STRATA_GLM_IDX_FP16=0 (F32 index keys).  B7.4a: the slow path
-#            (STRATA_GLM_SLOW=1 STRATA_GLM_SPLIT=26,54 STRATA_GLM_NO_PREFILL=1).  M2: the fast path strict, the fast
+#   engine   the engine's log-softmax rows (MAYA_GLM_SCORE_DUMP) under strict numerics: MAYA_GLM_IDX_LN_EPS=0 (the
+#            indexer LayerNorm eps llama.cpp uses), MAYA_GLM_IDX_FP16=0 (F32 index keys).  B7.4a: the slow path
+#            (MAYA_GLM_SLOW=1 MAYA_GLM_SPLIT=26,54 MAYA_GLM_NO_PREFILL=1).  M2: the fast path strict, the fast
 #            path with the production eps (criterion g), and slow + fast on the first 512 positions of each short
 #            case (criterion d).
 #   compare  tools/strata/parity_compare.py compare for every pair: floor F (R_cpu vs R_cuda; M2-alt: R_cuda vs the
@@ -29,7 +29,7 @@
 #            llama.cpp LLM_CB_DIR on the prefix that ends there -> tools/strata/seam_bisect.py bisect
 #   longctx  B7.6 / M2 (f) on the long cases: the top-2048 selections appended per token on layers --overlap-layers
 #            (engine GLM_CB_APPEND=1 GLM_CB_ONLY, llama LLM_CB_APPEND=1 LLM_CB_ONLY) -> seam_bisect.py overlap; and
-#            the engine's F32 vs FP16 index keys (STRATA_GLM_IDX_FP16=1) the same way (docs/strata/volta3/long-context.md)
+#            the engine's F32 vs FP16 index keys (MAYA_GLM_IDX_FP16=1) the same way (docs/strata/volta3/long-context.md)
 #
 # Options: --model GGUF (first shard), --pack DIR, --strata build/strata, --llama-dump build/llm_logits_dump,
 # --llama-pin-dump PATH (M2-alt), --corpus DIR, --out DIR (default bench/results/strata/parity/<gate>-<date>),
@@ -156,15 +156,15 @@ if stage refs; then
 fi
 
 # ---------------------------------------------------------------- engine
-STRICT=(STRATA_GLM_IDX_LN_EPS=0 STRATA_GLM_IDX_FP16=0 STRATA_GLM_USAGE=0)
-SLOW=(STRATA_GLM_SLOW=1 STRATA_GLM_SPLIT=$SPLIT STRATA_GLM_NO_PREFILL=1)
+STRICT=(MAYA_GLM_IDX_LN_EPS=0 MAYA_GLM_IDX_FP16=0 MAYA_GLM_USAGE=0)
+SLOW=(MAYA_GLM_SLOW=1 MAYA_GLM_SPLIT=$SPLIT MAYA_GLM_NO_PREFILL=1)
 FASTP=()
-[ "$PREFILL" = 1 ] && FASTP=(STRATA_GLM_SCORE_PREFILL=1)
+[ "$PREFILL" = 1 ] && FASTP=(MAYA_GLM_SCORE_PREFILL=1)
 engine() {   # engine <tag> <case> <tokens file> <context> <env...>
   local tag=$1 c=$2 tf=$3 ctx=$4; shift 4
   log "engine $tag $c (context $ctx)"
   # shellcheck disable=SC2086
-  renv "$OUT/log/eng-$tag-$c.txt" "$@" STRATA_GLM_SCORE="$ctx" STRATA_GLM_SCORE_DUMP="$OUT/eng/$c.$tag.lsm" -- \
+  renv "$OUT/log/eng-$tag-$c.txt" "$@" MAYA_GLM_SCORE="$ctx" MAYA_GLM_SCORE_DUMP="$OUT/eng/$c.$tag.lsm" -- \
     "$STRATA" --glm-pack "$PACK" --tokens-file "$tf" --max-context "$MAXCTX" $ENGINE_ARGS \
     || log "engine $tag $c FAILED (see $OUT/log/eng-$tag-$c.txt)"
   [ "$DRY" = 1 ] || grep -m1 '^SCORE' "$OUT/log/eng-$tag-$c.txt" | sed "s/^/[$tag $c] /" | tee -a "$OUT/run.log"
@@ -179,11 +179,11 @@ if stage engine; then
       continue
     fi
     engine fast "$c" "$tf" "$ctx" "${STRICT[@]}" "${FASTP[@]}"
-    engine prod "$c" "$tf" "$ctx" STRATA_GLM_IDX_FP16=0 STRATA_GLM_USAGE=0 "${FASTP[@]}"
+    engine prod "$c" "$tf" "$ctx" MAYA_GLM_IDX_FP16=0 MAYA_GLM_USAGE=0 "${FASTP[@]}"
     if [ "${KIND[$i]}" = short ]; then   # criterion (d): positions 0 .. SF-1, both paths token by token
       prefix "$tf" $((SF + 1)) "$OUT/eng/$c.sf.tokens"
       engine sfslow "$c" "$OUT/eng/$c.sf.tokens" 0 "${STRICT[@]}" "${SLOW[@]}"
-      engine sffast "$c" "$OUT/eng/$c.sf.tokens" 0 "${STRICT[@]}" STRATA_GLM_NO_PREFILL=1
+      engine sffast "$c" "$OUT/eng/$c.sf.tokens" 0 "${STRICT[@]}" MAYA_GLM_NO_PREFILL=1
     fi
   done
 fi
@@ -240,12 +240,12 @@ if stage longctx && [ "$GATE" != B7.4a ]; then
     for side in eng eng16 llama; do rm -rf "$OUT/sel/$c.$side"; mkdir -p "$OUT/sel/$c.$side"; done
     log "longctx $c: selections on layers $OVL, token path"
     # shellcheck disable=SC2086
-    renv "$OUT/log/sel-$c-eng.txt" "${STRICT[@]}" STRATA_GLM_NO_PREFILL=1 STRATA_GLM_DSA_GRAPHS=0 GLM_CB_DIR="$OUT/sel/$c.eng" \
-      GLM_CB_APPEND=1 GLM_CB_ONLY="$only" STRATA_GLM_SCORE=$((n - 1)) -- \
+    renv "$OUT/log/sel-$c-eng.txt" "${STRICT[@]}" MAYA_GLM_NO_PREFILL=1 MAYA_GLM_DSA_GRAPHS=0 GLM_CB_DIR="$OUT/sel/$c.eng" \
+      GLM_CB_APPEND=1 GLM_CB_ONLY="$only" MAYA_GLM_SCORE=$((n - 1)) -- \
       "$STRATA" --glm-pack "$PACK" --tokens-file "$tf" --max-context "$MAXCTX" $ENGINE_ARGS || log "longctx $c: engine FAILED"
     # shellcheck disable=SC2086
-    renv "$OUT/log/sel-$c-eng16.txt" STRATA_GLM_IDX_LN_EPS=0 STRATA_GLM_IDX_FP16=1 STRATA_GLM_USAGE=0 STRATA_GLM_NO_PREFILL=1 \
-      STRATA_GLM_DSA_GRAPHS=0 GLM_CB_DIR="$OUT/sel/$c.eng16" GLM_CB_APPEND=1 GLM_CB_ONLY="$only" STRATA_GLM_SCORE=$((n - 1)) -- \
+    renv "$OUT/log/sel-$c-eng16.txt" MAYA_GLM_IDX_LN_EPS=0 MAYA_GLM_IDX_FP16=1 MAYA_GLM_USAGE=0 MAYA_GLM_NO_PREFILL=1 \
+      MAYA_GLM_DSA_GRAPHS=0 GLM_CB_DIR="$OUT/sel/$c.eng16" GLM_CB_APPEND=1 GLM_CB_ONLY="$only" MAYA_GLM_SCORE=$((n - 1)) -- \
       "$STRATA" --glm-pack "$PACK" --tokens-file "$tf" --max-context "$MAXCTX" $ENGINE_ARGS || log "longctx $c: engine FP16 FAILED"
     renv "$OUT/log/sel-$c-llama.txt" LLM_CB_DIR="$OUT/sel/$c.llama" LLM_CB_APPEND=1 LLM_CB_PAD="$TOPK" LLM_CB_ONLY="$only" -- \
       "$LLAMA" --ngl 999 --ot exps=CPU --ubatch 512 --ctx $((n + 8)) "$MODEL" "$OUT/sel/$c.llama.bin" "@$tf" \
@@ -330,11 +330,11 @@ EOF
     rm -rf "$OUT/bisect" && mkdir -p "$OUT/bisect/eng" "$OUT/bisect/llama"
     prefix "$CORPUS/$c.tokens" $((p + 2)) "$OUT/bisect/tokens"
     prefix "$CORPUS/$c.tokens" $((p + 1)) "$OUT/bisect/tokens_llama"
-    benv=("${STRICT[@]}" STRATA_GLM_NO_PREFILL=1 STRATA_GLM_DSA_GRAPHS=0)
+    benv=("${STRICT[@]}" MAYA_GLM_NO_PREFILL=1 MAYA_GLM_DSA_GRAPHS=0)
     [ "$GATE" = B7.4a ] && benv+=("${SLOW[@]}")
     # the engine forwards tokens 0 .. p (scores none): its seam files hold position p
     # shellcheck disable=SC2086
-    renv "$OUT/log/bisect-eng.txt" "${benv[@]}" GLM_CB_DIR="$OUT/bisect/eng" STRATA_GLM_SCORE=$((p + 1)) -- \
+    renv "$OUT/log/bisect-eng.txt" "${benv[@]}" GLM_CB_DIR="$OUT/bisect/eng" MAYA_GLM_SCORE=$((p + 1)) -- \
       "$STRATA" --glm-pack "$PACK" --tokens-file "$OUT/bisect/tokens" --max-context "$MAXCTX" $ENGINE_ARGS
     # llama.cpp: one decode call over the whole prefix, so its seam files hold positions 0 .. p
     ng=999; [ "$PRIMARY" = cpu ] && ng=0

@@ -8,21 +8,21 @@
 # B and P are build folders with maya.exe / maya-ds4.exe: B a release build (v1.1.56), P this tree's (default
 # build-hip, else build).  -LibDir (default $env:HIP_PATH\bin) goes first on PATH for the HIP runtime.  Results go to
 # -Out (default %TEMP%\glm53-gpu-<date>); every check prints PASS / FAIL, the last line is the summary (exit 1 on a FAIL).
-# flash-ab: STRATA_GLM_SCORE log-softmax dumps over the token file (-Ctx + 256 ids at most; a Flash-vocab document)
+# flash-ab: MAYA_GLM_SCORE log-softmax dumps over the token file (-Ctx + 256 ids at most; a Flash-vocab document)
 #   and -MaxNew greedy tokens after its first -Ctx ids, in the order base, port, base, port, ... (-Runs rounds).  Every
 #   run must equal the first byte for byte: the dumps, and the greedy runs' whole output (Answer: the INFO / VRAM lines'
 #   expert tiers and memory layout, the tokens, the DONE line's counts, finish and drafting counters), masked only where
 #   it follows the clock or the memory free at load (the DONE line's wall-clock fields, the VRAM lines' free= and
-#   window=).  The greedy runs fix the MTP draft length (STRATA_GLM_MTP_ADAPT=0) so that the drafting counters repeat.
+#   window=).  The greedy runs fix the MTP draft length (MAYA_GLM_MTP_ADAPT=0) so that the drafting counters repeat.
 #   A run that exits non-zero, prints ERR or ends without a DONE line counting its tokens is a FAIL by itself.
-#   -Lane off (default): STRATA_GLM_CPU_LANE=0 STRATA_GLM_PREFILL_CPU=0.  -Lane default: the machine's own defaults
+#   -Lane off (default): MAYA_GLM_CPU_LANE=0 MAYA_GLM_PREFILL_CPU=0.  -Lane default: the machine's own defaults
 #   (e.g. the one-GPU MTP decode on gfx115x, its draft length fixed as above).  Where the CPU lane takes experts its plan
 #   comes from timings measured at load, so base vs base may differ there (GPU day 1): a FAIL with base != base is the
 #   lane's noise, not the port's.
 # ds4-ab: maya-ds4 greedy tokens (--n -Ds4N, the whole prompt in one window) after the -Ds4Ids prompt (comma-separated
 #   ids, e.g. serve/ds41_encoding.py's prompt through the model's tokenizer.json), then the prompt's logits
 #   (--dump-logits, the CLI's 16-token windows).  --profile-readonly and private copies of the pack's lt-picks.txt
-#   (STRATA_DS4_LT_STORE) and lane-times.txt (DS4_LANE_CAL) leave the pack unwritten and give every run the same
+#   (MAYA_DS4_LT_STORE) and lane-times.txt (DS4_LANE_CAL) leave the pack unwritten and give every run the same
 #   prompt GEMMs; a first run of each build (not compared) fills those copies for this prompt's shapes and that build.
 #   A model larger than the VRAM keeps the rest of its experts on the CPU lane, whose arithmetic is not the GPU's: then
 #   (1) the VRAM expert cache moves experts as their background reads land, so which ones the GPU holds at a token is
@@ -146,29 +146,29 @@ function FlashAb {
     ($ids[0..($Ctx - 1)] -join ',') | Set-Content -NoNewline -Encoding ascii "$Out\flash.prompt"
     $lanes = if ($Lane -eq 'both') { @('default', 'off') } else { @($Lane) }
     foreach ($ln in $lanes) {
-        if ($ln -eq 'off') { $env:STRATA_GLM_CPU_LANE = '0'; $env:STRATA_GLM_PREFILL_CPU = '0' }
+        if ($ln -eq 'off') { $env:MAYA_GLM_CPU_LANE = '0'; $env:MAYA_GLM_PREFILL_CPU = '0' }
         foreach ($run in $order) {
             $side = $run.Split('.')[0]
             $f = "$Out\flash.$ln.$run"
             Remove-Item "$f.score", "$f.tokens" -ErrorAction SilentlyContinue   # (an earlier run's, in a reused -Out)
-            $env:STRATA_GLM_SCORE = "$Ctx"; $env:STRATA_GLM_SCORE_DUMP = "$f.score"
+            $env:MAYA_GLM_SCORE = "$Ctx"; $env:MAYA_GLM_SCORE_DUMP = "$f.score"
             $x = Run "$($bin[$side])\maya.exe" @('--glm-pack', $FlashPack, '--tokens-file', "$Out\flash.tokens") "$f.score.out" "$f.score.log"
-            Remove-Item Env:STRATA_GLM_SCORE, Env:STRATA_GLM_SCORE_DUMP
+            Remove-Item Env:MAYA_GLM_SCORE, Env:MAYA_GLM_SCORE_DUMP
             if ($x.rc -ne 0) { $script:bad["$f.score"] = "exit code $($x.rc)" }
             Note "flash $ln $run score: rc $($x.rc), $($x.min) min; $(Last "$f.score.out" '^SCORE')$(Last "$f.score.log" '^SCORE')"
             # the greedy run with the MTP draft length fixed (the cap, every round): the adaptive length (glm_mtp.cu
             # mtp_choose; the one-GPU MTP decode, on by default on the Halo APUs) follows measured round times, and
             # with it the DONE line's drafts and the decode's expert lookups - with it fixed they repeat and are compared
-            $env:STRATA_GLM_MTP_ADAPT = '0'
+            $env:MAYA_GLM_MTP_ADAPT = '0'
             $x = Run "$($bin[$side])\maya.exe" @('--glm-pack', $FlashPack, '--tokens-file', "$Out\flash.prompt", '--greedy', '--max-new', "$MaxNew") "$f.gen" "$f.gen.log"
-            Remove-Item Env:STRATA_GLM_MTP_ADAPT
+            Remove-Item Env:MAYA_GLM_MTP_ADAPT
             $why = GenProblem "$f.gen" $x.rc
             if ($why) { $script:bad["$f.tokens"] = $why }
             if ((Test-Path "$f.gen") -and (Get-Item "$f.gen").Length -gt 0) { Answer "$f.gen" | Set-Content -Encoding ascii "$f.tokens" }
             $done = Last "$f.gen" '^DONE '
             Note "flash $ln $run greedy: rc $($x.rc), $($x.min) min; $(@(Select-String -Path "$f.gen" -Pattern '^T ').Count) tokens; $done$(if ($why) { " - FAILED: $why" }); $(Last "$f.gen.log" '^glm stat: decode')"
         }
-        Remove-Item Env:STRATA_GLM_CPU_LANE, Env:STRATA_GLM_PREFILL_CPU -ErrorAction SilentlyContinue
+        Remove-Item Env:MAYA_GLM_CPU_LANE, Env:MAYA_GLM_PREFILL_CPU -ErrorAction SilentlyContinue
         Agree "flash-ab lane=$ln`: score dumps ($((Get-Item "$Out\flash.$ln.base.1.score" -ErrorAction SilentlyContinue).Length) B)" @($order | ForEach-Object { "$Out\flash.$ln.$_.score" })
         Agree "flash-ab lane=$ln`: $MaxNew greedy tokens with the memory layout and the DONE counts" @($order | ForEach-Object { "$Out\flash.$ln.$_.tokens" })
     }
@@ -209,7 +209,7 @@ function Ds4Ab {
     if (-not (Test-Path $lt)) { if (Test-Path "$Ds4Pack\lt-picks.txt") { Copy-Item "$Ds4Pack\lt-picks.txt" $lt } else { New-Item -ItemType File $lt | Out-Null } }
     $cal = "$Out\$Tag.lane-times.txt"
     if (-not (Test-Path $cal) -and (Test-Path "$Ds4Pack\lane-times.txt")) { Copy-Item "$Ds4Pack\lane-times.txt" $cal }
-    $env:STRATA_DS4_LT_STORE = $lt
+    $env:MAYA_DS4_LT_STORE = $lt
     $env:DS4_LANE_CAL = $cal
     $common = @('--pack', $Ds4Pack) + @($Ds4Args -split '\s+' | Where-Object { $_ }) + @('--profile-readonly', '--ids', "@$Ds4Ids")
     foreach ($run in @('base.warm', 'port.warm') + $order) {
@@ -231,7 +231,7 @@ function Ds4Ab {
             Note "$Tag $run logits: rc $($x.rc), $($x.min) min; placement $(Placement "$f.dump.log"); $(Last "$f.dump.log" '^prompt: \d+ tokens')"
         }
     }
-    Remove-Item Env:STRATA_DS4_LT_STORE, Env:DS4_LANE_CAL
+    Remove-Item Env:MAYA_DS4_LT_STORE, Env:DS4_LANE_CAL
     AgreeByPlacement "ds4-ab $Tag`: $Ds4N greedy tokens" $order 'tokens' 'log'
     if (-not $NoDump) {
         AgreeByPlacement "ds4-ab $Tag`: the prompt's logits ($((Get-Item "$Out\$Tag.base.1.f32" -ErrorAction SilentlyContinue).Length) B)" $order 'f32' 'dump.log'

@@ -16,14 +16,14 @@ namespace strata::core::glmheat {
 
 bool heat_on() {
     static const bool on = [] {
-        return strata::glmenv::env_flag("STRATA_GLM_HEAT_EVICT", false);
+        return strata::glmenv::env_flag("MAYA_GLM_HEAT_EVICT", false);
     }();
     return on;
 }
 
 double heat_margin() {
     static const double m = [] {
-        const char* v = std::getenv("STRATA_GLM_HEAT_MARGIN");
+        const char* v = std::getenv("MAYA_GLM_HEAT_MARGIN");
         const double x = v != nullptr ? std::atof(v) : 0.0;
         return x > 0.0 ? x : kMarginDefault;
     }();

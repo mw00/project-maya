@@ -179,15 +179,15 @@ struct CachingPool : ggml_cuda_pool {
     void * alloc(size_t size, size_t * actual_size) override {
         std::lock_guard<std::mutex> lk(mu);
         const size_t cls = size_class(size);
-        // A test hook: STRATA_MMQ_POOL_FAIL=<n> makes the first n allocations here fail, so the engine's recovery can be
+        // A test hook: MAYA_MMQ_POOL_FAIL=<n> makes the first n allocations here fail, so the engine's recovery can be
         // checked (the request must end with an error and the engine must live).
         static std::atomic<int> fail_left = [] {
-            const char* v = std::getenv("STRATA_MMQ_POOL_FAIL");
+            const char* v = std::getenv("MAYA_MMQ_POOL_FAIL");
             return std::atomic<int>(v ? std::atoi(v) : 0);
         }();
         if (fail_left.load() > 0 && fail_left.fetch_sub(1) > 0) {
             std::fprintf(stderr, "ggml-cuda (strata mmq): CUDA%d wanted %.1f MB of scratch and cannot have it "
-                                 "(STRATA_MMQ_POOL_FAIL)\n", dev, (double) cls / 1048576.0);
+                                 "(MAYA_MMQ_POOL_FAIL)\n", dev, (double) cls / 1048576.0);
             strata::prefill::fail("prefill mmq: the scratch pool wanted " +
                                   std::to_string((unsigned long long) (cls >> 20)) + " MB and could not have it: "
                                   "out of memory");

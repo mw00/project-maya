@@ -28,7 +28,7 @@
 // every backend (cuBLAS / hipBLAS GemmEx, the absorbed MLA's strided-batched products, hipBLASLt), so the exposure is
 // every device's.
 //
-// Switch: STRATA_GLM_F16_GUARD = auto (default: on, on every device - NVIDIA or AMD), 1 (on), 0 (off: no amax pass,
+// Switch: MAYA_GLM_F16_GUARD = auto (default: on, on every device - NVIDIA or AMD), 1 (on), 0 (off: no amax pass,
 // no epilogue; the Maya path exactly).
 #pragma once
 
@@ -64,7 +64,7 @@ GLMD_GUARD_HD inline float swiglu_value(float gate, float up, float limit) {
     return (g / (1.0f + expf(-g))) * u;
 }
 
-/// -1 auto, 0 off, 1 on: STRATA_GLM_F16_GUARD, read on every call (host only).
+/// -1 auto, 0 off, 1 on: MAYA_GLM_F16_GUARD, read on every call (host only).
 int f16_guard_mode();
 
 // ---- GPU (src/kernels/cuda/glmd_guards.cu, CUDA and HIP; no-ops with the switch off) -----------------------------

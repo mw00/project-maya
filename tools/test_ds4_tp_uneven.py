@@ -83,7 +83,7 @@ class TpUneven(unittest.TestCase):
     def test_the_settings_are_documented_and_read_both_ways(self):
         src = (ROOT / "src/ds4/ds4_model.cu").read_text()
         for name in ("TP_GGUF_UNEVEN", "TP_CHECK"):
-            self.assertIn(f'std::getenv("STRATA_DS4_{name}")', src)
+            self.assertIn(f'std::getenv("MAYA_DS4_{name}")', src)
             self.assertIn(f'std::getenv("DS4_{name}")', src)
             self.assertIn(f"`MAYA_DS4_{name}`", (ROOT / "docs/SETTINGS.md").read_text())
 

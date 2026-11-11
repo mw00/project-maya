@@ -5,7 +5,7 @@
 // the fixture of tests/glm_dsa/glm_dsa_mixer_fixture.hpp and compared per (layer, position) with
 //   * the B3.4 reference layer (F32 caches, the reference forward's selection policy):
 //       correct FP16 latents rel L2 < 5e-3 and the top-k sets equal; INT8 latents < 3e-2; the dense switch
-//       (STRATA_GLM_DSA_DENSE) vs a reference attending every cell < 5e-3;
+//       (MAYA_GLM_DSA_DENSE) vs a reference attending every cell < 5e-3;
 //   * the CPU twins running the same orchestration in lockstep: rel L2 < 1e-3 (the device and the twins agree, so the
 //     CPU test glm_dsa_mixer_cpu_test speaks for the kernels);
 //   * the named wrong readings (NEOX pairing, q_pe rope at offset 0, indexer LayerNorm eps 0, shared layers run as

@@ -84,7 +84,7 @@ int host_alloc_node(void** p, size_t bytes, int dev, bool dsa) {
     *p = nullptr;
     const auto plain = [&]() { return (int) cudaHostAlloc(p, bytes, cudaHostAllocDefault); };
     if (!dsa || bytes == 0) return plain();
-    const int node = staging_node(gpu_node(dev), n_nodes(), getenv("STRATA_GLM_STAGE_NUMA"));
+    const int node = staging_node(gpu_node(dev), n_nodes(), getenv("MAYA_GLM_STAGE_NUMA"));
     if (node < 0 || node >= 64) return plain();
 #ifdef __linux__
     const size_t huge = (size_t) 2 << 20;
@@ -144,7 +144,7 @@ void host_free_node(void* p) {
 bool share_ok(const glmtier::TierState* T, int il) {
     if (!glmtier::split_layer(T, il)) return true;
     static const bool on = [] {
-        return strata::glmenv::env_flag("STRATA_GLM_PREFILL_SPLIT_SHARE", true);
+        return strata::glmenv::env_flag("MAYA_GLM_PREFILL_SPLIT_SHARE", true);
     }();
     return on && T->lane[0] != nullptr && T->lane[1] != nullptr && il < (int) T->half.size() &&
            T->half[(size_t) il].n_ff > 0 && il < (int) T->L.size() && T->L[(size_t) il].blob > 0;

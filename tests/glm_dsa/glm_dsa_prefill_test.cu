@@ -455,8 +455,8 @@ int main() {
             std::printf("state carve: %s\n", err.c_str());
             return 1;
         }
-        if (c.ratio) setenv("STRATA_GLMD_GATHER_RATIO", c.ratio, 1);
-        else unsetenv("STRATA_GLMD_GATHER_RATIO");
+        if (c.ratio) setenv("MAYA_GLMD_GATHER_RATIO", c.ratio, 1);
+        else unsetenv("MAYA_GLMD_GATHER_RATIO");
         const auto x = randn((size_t) Tall * E, 1.0f);
         const Run b = batched(g, lay, dsa, x, c.chunks, blas);
         const Run t = token(lay, W, x, blas);

@@ -1,6 +1,6 @@
 // include/strata/kernels/glmd_forward.hpp - the host-side pieces of the glm-dsa F32 reference forward (B3.5).
 //
-// src/core/glm_dsa_ref.cu (Glm5Model::step_layers_dsa, the STRATA_GLM_SLOW path for glm-dsa) runs every layer with
+// src/core/glm_dsa_ref.cu (Glm5Model::step_layers_dsa, the MAYA_GLM_SLOW path for glm-dsa) runs every layer with
 // the glmd::ref_* kernels (glmd_ref.hpp).  What it decides on the host lives here, in plain C++ that the CPU test
 // (tests/glm_dsa/glm_dsa_ref_cpu_test.cpp) runs without a GPU:
 //

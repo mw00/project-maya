@@ -25,7 +25,7 @@
 //   gemm   gemm_rows at the trunk's shapes, padded strides, beta 0 and 1
 //   recon  reconstruct_inner / reconstruct_inner_rows (exact) and reconstruct_rows (F16, BF16) on column views
 //   blas   the prompt path's cuBLAS routes rebuilt as src/core/glm_prefill.cu has them: a heavy expert
-//          (x3_run_blas, both STRATA_GLM_EXL3_ROT values) with gate / up packed 2 n_ff wide at the end of the expert's
+//          (x3_run_blas, both MAYA_GLM_EXL3_ROT values) with gate / up packed 2 n_ff wide at the end of the expert's
 //          output rows - the layout glm-dsa needs (n_embd 6144 != 2 n_ff; GPU day 1's GGUF fix) - and the dense
 //          weights' slices (reconstruct_rows of 128-row views + one GEMM a slice)
 //   cpu    the CPU lane's band kernels at the experts' shapes: every tier this CPU has (scalar, AVX2, AVX2's 16-bit
@@ -381,7 +381,7 @@ void q8_1(const float* x, size_t n, uint8_t* q, float* deq) {
     }
 }
 
-// which kernels mv runs here: v1.1.8's (exl3_legacy.cu - NVIDIA before sm_80 by default, STRATA_GLM_EXL3_DECODE=
+// which kernels mv runs here: v1.1.8's (exl3_legacy.cu - NVIDIA before sm_80 by default, MAYA_GLM_EXL3_DECODE=
 // legacy) take a lone job's activations in runs of 4, exl3.cu's in runs of 8 (mv_cols of a one-piece matrix)
 void probe_family() {
     HostMat h = make_mat(256, 256, 4, 2);
@@ -1200,7 +1200,7 @@ void sec_set() {
     const char* kind = ex::prompt_wmma() ? "the matrix-core kernels (EXL3_WMMA=0: the portable ones)" : "the portable kernels";
 #else
     const char* kind = ex::mma_supported() ? "the sm_80+ tensor-core kernels"
-                       : ex::prompt_wmma() ? "sm_7x's WMMA kernels (STRATA_EXL3_WMMA=0: the portable ones)"
+                       : ex::prompt_wmma() ? "sm_7x's WMMA kernels (MAYA_EXL3_WMMA=0: the portable ones)"
                                            : "the portable kernels";
 #endif
     std::printf("set: the prompt path's expert sets (set_gate_up + set_down; %s)\n", kind);

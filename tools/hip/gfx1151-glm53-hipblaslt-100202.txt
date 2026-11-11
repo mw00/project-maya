@@ -1,7 +1,7 @@
 # solution IDs are scoped to this hipBLASLt version and device architecture
 # GLM-5.3 (glm-dsa) prompt shapes (S7, tune_hipblaslt on a Radeon 8065S): a row only where the solution beat
 # plain hipBLAS by 1.05x or more; maya.py passes this table to glm-dsa configs only
-STRATA_HIPBLASLT_TUNING_V1 gfx1151 100202
+MAYA_HIPBLASLT_TUNING_V1 gfx1151 100202
 f16 8192 6144 12288 32 7539
 f16 4096 6144 12288 32 7536
 f16 4096 12288 6144 32 7536

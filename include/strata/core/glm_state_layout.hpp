@@ -33,9 +33,9 @@
 namespace strata::core {
 
 enum class GlmStateMode : int {
-    SlowF32 = 0,   // the reference path (STRATA_GLM_SLOW, load()): F32 latent
+    SlowF32 = 0,   // the reference path (MAYA_GLM_SLOW, load()): F32 latent
     Fp16 = 1,      // the fast path: FP16 latent rows
-    Int8 = 2,      // the fast path with STRATA_GLM_KV_INT8: INT8 latent records (glm_fast.hpp lat8_rec_bytes)
+    Int8 = 2,      // the fast path with MAYA_GLM_KV_INT8: INT8 latent records (glm_fast.hpp lat8_rec_bytes)
 };
 
 struct GlmStateLayout {
@@ -56,7 +56,7 @@ struct GlmStateLayout {
     int64_t ik_pp = 0;          // one index key (idx_key)
     int ik_bytes = 4;           // bytes per index-key element: 4 (F32), 2 on the glm-dsa fast path with FP16 keys (B10.8)
     int ik_had = 0;             // 1: the index keys (and the queries scored against them) are Walsh-Hadamard rotated
-                                // (B14.11, STRATA_GLM_IDX_HADAMARD on the glm-dsa fast path; idx_key a power of two)
+                                // (B14.11, MAYA_GLM_IDX_HADAMARD on the glm-dsa fast path; idx_key a power of two)
     int64_t kda_s_floats = 0, kda_conv_floats = 0;   // one KDA layer's recurrent state and conv history
     int64_t residual_floats = 0;                     // the residual and its ping-pong at the arena's start
 
@@ -117,11 +117,11 @@ inline int glm_state_fast_ik_ring(int64_t max_ctx) { return (int) (max_ctx < 819
 /// This function leaves words 12 and 13 at 0: the NextN block lives on the chain's last part, so
 /// Glm5Model::state_fp() (src/core/glm_mtp_state_model.cu) fills them for the whole chain; slots and the prompt cache
 /// use that.
-/// B10.8: STRATA_GLM_IDX_FP16 set to a non-zero value (read on every call): the glm-dsa fast-path carve (FP16 /
+/// B10.8: MAYA_GLM_IDX_FP16 set to a non-zero value (read on every call): the glm-dsa fast-path carve (FP16 /
 /// INT8 modes) stores the index keys as FP16 (ik_pp = idx_key / 2, ik_bytes 2) and the split planner prices 2 B per
 /// element.  The slow F32 reference path keeps F32 keys.  The forward reads GlmStateLayout::ik_bytes, never the env.
 bool glm_state_idx_fp16();
-/// B14.11: STRATA_GLM_IDX_HADAMARD set to a non-zero value (read on every call): the glm-dsa fast-path carve (FP16 /
+/// B14.11: MAYA_GLM_IDX_HADAMARD set to a non-zero value (read on every call): the glm-dsa fast-path carve (FP16 /
 /// INT8 modes) marks the index keys rotated (GlmStateLayout::ik_had = 1).  dsa_prep / dsa_rope_q (token and prompt
 /// paths, the NextN block too) then rotate keys and queries, and the slot fingerprint carries kGlmFpIdxHad in its
 /// index-key word, so a slot (or a prompt-cache entry) written with one setting is refused by the other.  The slow F32
@@ -129,7 +129,7 @@ bool glm_state_idx_fp16();
 bool glm_state_idx_hadamard();
 /// The fingerprint bit (word 10, OR-ed into the index-key element bytes) of a rotated key cache.
 constexpr int32_t kGlmFpIdxHad = 0x100;
-/// The fingerprint bit (word 0, OR-ed into the format) of a glm-dsa state computed with STRATA_GLM_RANDOM_ROUTING=1
+/// The fingerprint bit (word 0, OR-ed into the format) of a glm-dsa state computed with MAYA_GLM_RANDOM_ROUTING=1
 /// (B15.7 bench mode): such slots and prompt-cache entries are refused by a normal load, and the reverse.
 constexpr int32_t kGlmFpRandomRoute = 0x10000;
 /// Word 0 of the fingerprint: its format, bumped on EVERY change of the fingerprint's words or of what a v3 slot holds,

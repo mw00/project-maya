@@ -399,9 +399,9 @@ int main() {
     std::printf("glm_dsa_loader_test\n");
     const fs::path dir = fs::temp_directory_path() / ("strata_glm_dsa_loader_" + std::to_string((long) getpid()));
     fs::create_directories(dir);
-    unsetenv("STRATA_GLM_IDX_LN_EPS");
-    unsetenv("STRATA_GLM_SPLIT");
-    setenv("STRATA_GLM_CHECK_ONLY", "1", 1);   // glm-dsa loads stop after the shape checks (no GPU work)
+    unsetenv("MAYA_GLM_IDX_LN_EPS");
+    unsetenv("MAYA_GLM_SPLIT");
+    setenv("MAYA_GLM_CHECK_ONLY", "1", 1);   // glm-dsa loads stop after the shape checks (no GPU work)
 
     // ---- 1. the reader keeps numeric/bool arrays whole (B1.1)
     std::printf("[B1.1 gguf arrays]\n");
@@ -499,13 +499,13 @@ int main() {
         check(ok && full == 78, "no indexer.types, context 202752 (GLM-5/5.1): every layer full");
         ok = parse(meta_file(dir, [](Writer& w) { w.erase("glm-dsa.vocab_size"); }), g, err);
         check(ok && g.n_vocab == 0, "no vocab_size: n_vocab left for token_embd (0)");
-        setenv("STRATA_GLM_IDX_LN_EPS", "0", 1);
+        setenv("MAYA_GLM_IDX_LN_EPS", "0", 1);
         ok = parse(meta_file(dir, [](Writer&) {}), g, err);
-        check(ok && g.idx_ln_eps == 0.0f, "STRATA_GLM_IDX_LN_EPS=0 (llama.cpp parity) overrides the eps");
-        setenv("STRATA_GLM_IDX_LN_EPS", "abc", 1);
+        check(ok && g.idx_ln_eps == 0.0f, "MAYA_GLM_IDX_LN_EPS=0 (llama.cpp parity) overrides the eps");
+        setenv("MAYA_GLM_IDX_LN_EPS", "abc", 1);
         ok = parse(meta_file(dir, [](Writer&) {}), g, err);
-        check(!ok && has(err, "STRATA_GLM_IDX_LN_EPS"), "STRATA_GLM_IDX_LN_EPS=abc refused");
-        unsetenv("STRATA_GLM_IDX_LN_EPS");
+        check(!ok && has(err, "MAYA_GLM_IDX_LN_EPS"), "MAYA_GLM_IDX_LN_EPS=abc refused");
+        unsetenv("MAYA_GLM_IDX_LN_EPS");
     }
 
     // ---- 3. refusals (B1.3)
@@ -700,28 +700,28 @@ int main() {
         const fs::path pack = write_pack(pdir, LayerOpts{});
         std::string err;
         {
-            setenv("STRATA_GLM_SPLIT", "26,54", 1);
+            setenv("MAYA_GLM_SPLIT", "26,54", 1);
             strata::core::Glm5Model m;
             m.load_pack_env(pack.string(), 4096, err);
             // (without GPUs Maya's glm_split_devices refuses the 3 parts after the bounds passed)
             check(!has(err, "1..44") && (has(err, "1..77") || has(err, "check-only load") || has(err, "devices")),
-                  "STRATA_GLM_SPLIT=26,54 is in range of the 78-layer pack (not Flash's 45)  [" + err.substr(0, 60) + "]");
+                  "MAYA_GLM_SPLIT=26,54 is in range of the 78-layer pack (not Flash's 45)  [" + err.substr(0, 60) + "]");
         }
         {
-            setenv("STRATA_GLM_SPLIT", "25,54", 1);
+            setenv("MAYA_GLM_SPLIT", "25,54", 1);
             strata::core::Glm5Model m;
             err.clear();
             m.load_pack_env(pack.string(), 4096, err);
             check(has(err, "layer 25") && has(err, "full-indexer"), "25 is a shared-indexer layer: refused as a boundary");
         }
         {
-            setenv("STRATA_GLM_SPLIT", "0", 1);
+            setenv("MAYA_GLM_SPLIT", "0", 1);
             strata::core::Glm5Model m;
             err.clear();
             m.load_pack_env(pack.string(), 4096, err);
-            check(has(err, "check-only load"), "STRATA_GLM_SPLIT=0: one part, refused at the forward gate");
+            check(has(err, "check-only load"), "MAYA_GLM_SPLIT=0: one part, refused at the forward gate");
         }
-        unsetenv("STRATA_GLM_SPLIT");
+        unsetenv("MAYA_GLM_SPLIT");
     }
 
     // ---- 6b. --layer-split auto on the 744B pack with simulated cards (B6.1 / B6.2; no GPU)
@@ -742,9 +742,9 @@ int main() {
             return s.empty() ? std::string("(none)") : s;
         };
         const auto search = [&](const char* cards, std::vector<int> devs) {
-            setenv("STRATA_GLM_SPLIT_CARDS", cards, 1);
+            setenv("MAYA_GLM_SPLIT_CARDS", cards, 1);
             const std::vector<int> b = strata::core::glm_split_search(pack.string(), 32768, devs);
-            unsetenv("STRATA_GLM_SPLIT_CARDS");
+            unsetenv("MAYA_GLM_SPLIT_CARDS");
             return b;
         };
         // the test PC: 3x V100-SXM2 32 GB (~31.5 GiB free, 898 GB/s); 217 GB of IQ2_XXS/IQ3_XXS experts, ~40% in VRAM

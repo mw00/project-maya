@@ -99,7 +99,7 @@ const float* Glm5Model::mtp_carry_row(int64_t p, const float* fallback, cudaStre
         cudaMemsetAsync(c->row, 0, (size_t) g_.n_embd * sizeof(float), s);
         std::lock_guard<std::mutex> lk(g_mu);
         PartCarriers& pc = g_reg[this];
-        if (had >= 0 && !pc.warned && getenv("STRATA_GLM_SPEC_LOG") != nullptr) {
+        if (had >= 0 && !pc.warned && getenv("MAYA_GLM_SPEC_LOG") != nullptr) {
             pc.warned = true;
             std::fprintf(stderr, "glm mtp: the draft at position %lld found the carrier of position %lld (sequence %d) "
                                  "- zeros instead (B15.3)\n", (long long) p, (long long) had, cur_seq_);
@@ -173,7 +173,7 @@ uint32_t Glm5Model::mtp_block_id() const {
     }
     std::string src = "own";
     if (t->mtp_src_ >= 0) {
-        const char* mg = getenv("STRATA_GLM_MTP_GGUF");
+        const char* mg = getenv("MAYA_GLM_MTP_GGUF");
         std::error_code ec;
         const std::filesystem::path fp(mg != nullptr ? mg : "");
         src = "gguf:" + fp.filename().string() + ":" + std::to_string((unsigned long long) std::filesystem::file_size(fp, ec));

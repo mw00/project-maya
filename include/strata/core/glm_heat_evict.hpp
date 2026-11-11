@@ -1,5 +1,5 @@
 // include/strata/core/glm_heat_evict.hpp - glm-dsa B15.8: heat-decay expert promotion / eviction for the VRAM tier,
-// behind STRATA_GLM_HEAT_EVICT=1 (default off: Maya's aged-count policy, unchanged).
+// behind MAYA_GLM_HEAT_EVICT=1 (default off: Maya's aged-count policy, unchanged).
 //
 // The policy (llama.cpp #30059 llama-moecache, #27861):
 //   * heat per (layer, expert): +1 a route, decayed by 0.90 per token (per forward pass, not per layer, so deep models
@@ -9,7 +9,7 @@
 //     instead of the coldest by count over the whole layer.  Hits are moved to the tail before the misses are planned:
 //     in the engine the route handler stamps P.tick before the boundary plans its moves, which is that order;
 //   * a swap (demote the victim, promote the hottest RAM-only expert) needs the candidate's heat to exceed the
-//     victim's by STRATA_GLM_HEAT_MARGIN (default 2.0 routes' worth): Maya's 2x + 4 count rule on a 0.90-decayed heat
+//     victim's by MAYA_GLM_HEAT_MARGIN (default 2.0 routes' worth): Maya's 2x + 4 count rule on a 0.90-decayed heat
 //     churned bg_n swaps every token in the simulator and lost 4 points on a stationary trace;
 //   * at most 2 swaps (demote + promote) per layer per token (#27861's insert cap), the global bg_n cap unchanged;
 //   * coalesced uploads: promotions sorted by (layer, VRAM slot) go in one copy when their VRAM slots and their RAM
@@ -38,9 +38,9 @@ constexpr int kVictims = 16;
 constexpr int kInsertCap = 2;
 constexpr double kMarginDefault = 2.0;
 
-/// STRATA_GLM_HEAT_EVICT set to a non-zero value (read once).
+/// MAYA_GLM_HEAT_EVICT set to a non-zero value (read once).
 bool heat_on();
-/// STRATA_GLM_HEAT_MARGIN (heat units, > 0; default 2.0, read once).
+/// MAYA_GLM_HEAT_MARGIN (heat units, > 0; default 2.0, read once).
 double heat_margin();
 
 /// Lazily decayed heat per key (il * n_expert + e).
@@ -150,8 +150,8 @@ Trace synth_trace(Drift d, int n_layers, int n_expert, int top_k, int64_t tokens
 enum class Policy { Maya, Heat };
 struct SimConfig {
     int slots = 96;            // VRAM slots per layer
-    int bg_n = 8;              // demotions a token (STRATA_GLM_PROMOTE)
-    int bg_fill = 24;          // promotions into free slots a token (STRATA_GLM_PROMOTE_FILL)
+    int bg_n = 8;              // demotions a token (MAYA_GLM_PROMOTE)
+    int bg_fill = 24;          // promotions into free slots a token (MAYA_GLM_PROMOTE_FILL)
     int64_t warmup = 1000;     // tokens before the hit rate counts
     int heat_rule = 1;         // Heat: 0 Maya's 2x + 4 rule on the x16 heat, 1 (the engine's) heat >= victim's +
                                // heat_margin, 2 the LRU-window heat victim with Maya's aged counts deciding the swap

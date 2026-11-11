@@ -104,7 +104,7 @@ int main() {
     assert(expert_pool_budget(false, 12 * G, 110 * G, 3 * G, 16 * G, experts) == 9 * G);
     assert(expert_pool_budget(false, G, 110 * G, 3 * G, 16 * G, experts) == 0);
     assert(minimal_ram_tier(true, true, false));
-    assert(!minimal_ram_tier(true, true, true));  // STRATA_GLM_RAM_GB / supplied budget wins
+    assert(!minimal_ram_tier(true, true, true));  // MAYA_GLM_RAM_GB / supplied budget wins
     assert(!minimal_ram_tier(true, false, false));
     assert(!minimal_ram_tier(false, true, false));
     // Warm every expert when it fits, and never evict residents to make spares.
@@ -135,9 +135,9 @@ int main() {
         using strata::core::glmfast::complete_pool_on;
         const auto set = [](const char* v) {
 #if defined(_WIN32)
-            _putenv_s("STRATA_GLM_COMPLETE_POOL", v ? v : "");
+            _putenv_s("MAYA_GLM_COMPLETE_POOL", v ? v : "");
 #else
-            if (v) setenv("STRATA_GLM_COMPLETE_POOL", v, 1); else unsetenv("STRATA_GLM_COMPLETE_POOL");
+            if (v) setenv("MAYA_GLM_COMPLETE_POOL", v, 1); else unsetenv("MAYA_GLM_COMPLETE_POOL");
 #endif
         };
         set(nullptr);

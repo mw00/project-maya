@@ -11,7 +11,7 @@
 //      torch.topk's stable order and glmd::ref_topk choose), a second scan the output offsets;
 //   3. each thread writes its winners in cell order.
 // O(6n) global reads per row (L2-resident at 128K x 4 B); the multi-block version for > 32K is B10.4, the bucket
-// (histogram) variant below (5 passes, B14.15, STRATA_GLMD_TOPK_HIST) writes the same cells.
+// (histogram) variant below (5 passes, B14.15, MAYA_GLMD_TOPK_HIST) writes the same cells.
 // glmd::twin::topk (src/core/glm_dsa_cpu_fast_twin.cpp) is the same algorithm on the host.
 #pragma once
 

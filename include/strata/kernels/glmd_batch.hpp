@@ -49,8 +49,8 @@ struct PromptDims {
     int q_lora = 2048, idx_heads = 32, idx_dim = 128, top_k = 2048, n_embd = 6144;
 };
 struct PromptTiling {
-    int key_block = 16384;     // keys per score tile (STRATA_GLMD_KEY_BLOCK)
-    int q_sub = 2048;          // queries per sub-batch: q_abs / ctx / score tile rows (STRATA_GLMD_Q_SUB)
+    int key_block = 16384;     // keys per score tile (MAYA_GLMD_KEY_BLOCK)
+    int q_sub = 2048;          // queries per sub-batch: q_abs / ctx / score tile rows (MAYA_GLMD_Q_SUB)
     int n_sub = 0;             // sub-batches of the chunk
     int n_tiles_max = 0;       // key tiles of the last sub-batch
     // per sub-batch scratch (bytes)
@@ -73,7 +73,7 @@ PromptTiling prompt_tiling(const PromptDims& d, size_t budget = 0);
 /// causal cell is selected), DenseMasked while n_kv < gather_ratio * top_k (walk every cell, skip unselected ones
 /// via a bit row), else Gather (walk the query's selected cell list).  All three give the same set of cells.
 enum class AttnWalk : int { Dense = 0, DenseMasked = 1, Gather = 2 };
-/// The ratio for the kernel that runs: dflt, or STRATA_GLMD_GATHER_RATIO (>= 1; 1 = always gather).  The 16-head
+/// The ratio for the kernel that runs: dflt, or MAYA_GLMD_GATHER_RATIO (>= 1; 1 = always gather).  The 16-head
 /// kernels take ik_llama.cpp's 4 (they gather at n_kv >= 4 x top_k); mla_prompt_h64 takes kH64GatherRatio.
 double gather_ratio(double dflt = 4.0);
 /// mla_prompt_h64 gathers from top_k + 1 keys on, on any device: both walks run the same 16-cell tile (the same work
@@ -87,7 +87,7 @@ AttnWalk attn_walk(int64_t n_kv, int top_k, double ratio);
 /// B14.7: whether a RAM-tier expert of a prompt chunk is uploaded over PCIe (true) or computed on the CPU lane.
 /// rows = the chunk rows routed to the expert (~T * 8 / 256 on average).  Upload costs bytes / link_bps once; the
 /// lane costs rows * bytes / lane_bps (it streams the expert's bytes per row block) plus the per-row compute.  The
-/// threshold in rows is upload_rows_min(); STRATA_GLM_UPLOAD_MIN_ROWS overrides it.
+/// threshold in rows is upload_rows_min(); MAYA_GLM_UPLOAD_MIN_ROWS overrides it.
 struct LaneLink {
     double link_bps = 10.0e9;     // measured host->device bandwidth of the part's link (B0.11)
     double lane_bps = 60.0e9;     // measured CPU-lane weight streaming bandwidth (both sockets' share)
@@ -100,7 +100,7 @@ bool upload_expert(int rows, const LaneLink& l);
 /// The same rule from the prompt path's own measurements (glm_prefill.cu's plan): upload_ms = one expert's PCIe copy,
 /// lane_expert_ms = the lane's fixed cost of an expert (its weights read once, about 2 x the one-token cost),
 /// lane_row_ms = the lane's cost per routed row.  rows* = ceil((upload_ms - lane_expert_ms) / lane_row_ms), at least 1
-/// (0 when the lane's fixed cost alone exceeds the upload: never forced).  STRATA_GLM_UPLOAD_MIN_ROWS overrides.
+/// (0 when the lane's fixed cost alone exceeds the upload: never forced).  MAYA_GLM_UPLOAD_MIN_ROWS overrides.
 int upload_rows_min_measured(double upload_ms, double lane_expert_ms, double lane_row_ms);
 
 /// B9.9: the per-part expert upload schedule of one prompt chunk.  Each part streams only its own layers'
@@ -161,7 +161,7 @@ bool index_score_tile_keys(const float* iq, const float* w, const void* keys, in
 /// The same scores on tensor cores: queries and keys rounded to FP16, products summed in F32 (WMMA), each head's dot
 /// relu'd and weighted in head order (a (query, head) row past 65504 is scaled by a power of two, its weight back;
 /// F32 keys saturate at +-65504).  idx_dim 128, idx_heads <= 64, 16-byte aligned iq / keys rows.  The glm-dsa prompt
-/// path's scorer where the device takes it (STRATA_GLMD_IDX_WMMA=0: the F32 one, which stays the reference).
+/// path's scorer where the device takes it (MAYA_GLMD_IDX_WMMA=0: the F32 one, which stays the reference).
 bool index_score_tile_wmma(const float* iq, const float* w, const void* keys, int key_f16, int idx_heads, int idx_dim,
                            int T, int64_t k0, int nk, float* score, int64_t ld, void* stream);
 /// Whether index_score_tile_wmma takes this shape on the current device (opt-in shared memory, checked once).
@@ -235,7 +235,7 @@ constexpr size_t kMlaH64Smem = 97088;
 /// HIP (S7): B9.5's arithmetic on RDNA 3 / 3.5 / 4's wave32 WMMA (gfx1100-1102, gfx1150-1151, gfx1200-1201) in ~27 KiB
 /// of LDS - a block per (16 heads, query row), Q in registers, 16-cell tiles, O in WMMA accumulators.  kv_lora 512,
 /// qk_rope in {0, 64}, n_head % 16 == 0, T <= 65535.  False (nothing launched; the caller runs mla_prompt_f32) for any
-/// other call, any other device, a CUDA build, or STRATA_GLMD_PF_RDNA=0.
+/// other call, any other device, a CUDA build, or MAYA_GLMD_PF_RDNA=0.
 bool mla_prompt_rdna(const MlaPrompt& a, void* stream);
 /// Whether the current device takes mla_prompt_rdna (cached per device; false on CUDA builds).
 bool mla_prompt_rdna_ok();

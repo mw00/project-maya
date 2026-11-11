@@ -610,9 +610,9 @@ __global__ void walk_kernel(const int* __restrict__ cand, const float* __restric
     }
 }
 
-// STRATA_GLM_DFLASH_DUMP=<dir> (debug): a draft's first layer, stage by stage, as <dir>/<name>.f32 (synchronous)
+// MAYA_GLM_DFLASH_DUMP=<dir> (debug): a draft's first layer, stage by stage, as <dir>/<name>.f32 (synchronous)
 void dump(const char* name, const float* dev, size_t n, cudaStream_t s) {
-    static const char* dir = getenv("STRATA_GLM_DFLASH_DUMP");
+    static const char* dir = getenv("MAYA_GLM_DFLASH_DUMP");
     if (dir == nullptr || !dir[0]) return;
     cudaStreamSynchronize(s);
     std::vector<float> b(n);
@@ -748,14 +748,14 @@ int GlmDflash::dev() const { return d_->dev; }
 // The drafter's stream at the device's highest priority: a round's drafts gate every draft token's entry into the
 // pipelined window, and at the round's start the head's card is still running the layer a cancelled token was in
 // (the skip takes effect at the next layer) - ~1.7 ms of such work shared the GPU with each draft and stretched it
-// from ~3.4 to 4-6 ms (EXL3-4.05bpw over 9 GPUs, nsys).  STRATA_GLM_DFLASH_PRIO=0: an ordinary stream (A/B)
+// from ~3.4 to 4-6 ms (EXL3-4.05bpw over 9 GPUs, nsys).  MAYA_GLM_DFLASH_PRIO=0: an ordinary stream (A/B)
 cudaStream_t GlmDflash::stream() {
     if (d_->ds == nullptr) {
         int cur = 0;
         cudaGetDevice(&cur);
         cudaSetDevice(d_->dev);
         static const bool prio = [] {
-            const char* v = getenv("STRATA_GLM_DFLASH_PRIO");
+            const char* v = getenv("MAYA_GLM_DFLASH_PRIO");
             return v == nullptr || std::atoi(v) != 0;
         }();
         int least = 0, greatest = 0;
@@ -863,10 +863,10 @@ bool GlmDflash::load(const std::string& path, int dev, std::string& err) {
         return false;
     }
     // the context a draft reads: the sliding window (every layer of these drafts slides); without one, the most
-    // recent STRATA_GLM_DFLASH_CTX positions (4096)
+    // recent MAYA_GLM_DFLASH_CTX positions (4096)
     if (m.window <= 0) {
         m.window = 4096;
-        if (const char* c = getenv("STRATA_GLM_DFLASH_CTX")) m.window = std::max(64, std::atoi(c));
+        if (const char* c = getenv("MAYA_GLM_DFLASH_CTX")) m.window = std::max(64, std::atoi(c));
     }
     m.ring = m.window + 2 * gf::kMaxMvCols;
     m.cdyn = 2 * m.taps * (m.E / m.group);
@@ -1144,9 +1144,9 @@ bool GlmDflash::inject(int64_t lo, int64_t hi, cudaStream_t s, std::string& err)
     const int KE = m.K * m.E, kvd = m.n_kv * kHeadDim;
     cudaSetDevice(m.dev);
     // on a stream of its own, after the drafter's: the next draft's first layer runs beside it, each layer's attention
-    // waiting for that layer's context rows (ev_kv).  STRATA_GLM_DFLASH_INJ_OVERLAP=0: on `s` (A/B)
+    // waiting for that layer's context rows (ev_kv).  MAYA_GLM_DFLASH_INJ_OVERLAP=0: on `s` (A/B)
     static const bool ovl = [] {
-        const char* v = getenv("STRATA_GLM_DFLASH_INJ_OVERLAP");
+        const char* v = getenv("MAYA_GLM_DFLASH_INJ_OVERLAP");
         return v == nullptr || std::atoi(v) != 0;
     }();
     if (ovl && m.is == nullptr) {
@@ -1269,10 +1269,10 @@ bool GlmDflash::draft_start(int32_t anchor, int64_t n_past, int n_max, float p_m
     const int64_t lo0 = std::max<int64_t>(0, n_past - m.window + 1);
     const int nk_max = (int) (n_past - lo0) + B;
     const size_t smem = (size_t) nk_max * sizeof(float);
-    // the split attention when a kv head's queries fit one block (STRATA_GLM_DFLASH_ATTN=0: attn_kernel, for A/B);
+    // the split attention when a kv head's queries fit one block (MAYA_GLM_DFLASH_ATTN=0: attn_kernel, for A/B);
     // the keys in splits of whole chunks, about kAttnSplits of them
     static const bool split_opt = [] {
-        const char* v = getenv("STRATA_GLM_DFLASH_ATTN");
+        const char* v = getenv("MAYA_GLM_DFLASH_ATTN");
         return v == nullptr || std::atoi(v) != 0;
     }();
     const bool split = split_opt && (m.n_head / m.n_kv) * B <= kAttnQ;
@@ -1370,7 +1370,7 @@ bool GlmDflash::draft_start(int32_t anchor, int64_t n_past, int n_max, float p_m
     // faster: the first drafts of a full block alternate the two and time the head with events (read after the
     // draft's own sync), the median of kHeadSamples each decides (a Q8_0 head at 7 columns: RTX 3090 2.3 against
     // 1.1 ms; RTX 5060 Ti 1.6 against 1.7, where dp4a already reads at the memory's speed).
-    // STRATA_GLM_DFLASH_HEAD_MMA=0/1 forces either
+    // MAYA_GLM_DFLASH_HEAD_MMA=0/1 forces either
     bool timed = false;
     if (n >= 5) {
         if (m.head_mma_w != jh.w) {   // a new head: decide again
@@ -1378,7 +1378,7 @@ bool GlmDflash::draft_start(int32_t anchor, int64_t n_past, int n_max, float p_m
             m.head_mma = -1;
             m.head_t[0].clear();
             m.head_t[1].clear();
-            const char* v = getenv("STRATA_GLM_DFLASH_HEAD_MMA");
+            const char* v = getenv("MAYA_GLM_DFLASH_HEAD_MMA");
             if (v != nullptr && v[0]) m.head_mma = std::atoi(v) != 0 ? 1 : 0;
         }
         if (m.head_mma < 0 && n == m.block - 1) {
@@ -1485,7 +1485,7 @@ bool GlmDflash::draft_finish(std::vector<int32_t>& out, std::string& err, std::v
 bool GlmDflash::split_head(const WSlot* lo, const WSlot* hi, int c0, int hdev, cudaStream_t hs, float* hx, float* hlg,
                            void* hcand, size_t cand_bytes, int rows, std::string& err) {
     Impl& m = *d_;
-    const char* v = getenv("STRATA_GLM_DFLASH_HEAD_SPLIT");
+    const char* v = getenv("MAYA_GLM_DFLASH_HEAD_SPLIT");
     if (lo == nullptr || hi == nullptr || hs == nullptr || hx == nullptr || hlg == nullptr || hcand == nullptr ||
         (v != nullptr && std::atoi(v) == 0))
         return true;
@@ -1627,7 +1627,7 @@ bool Glm5Model::dflash_bind(std::string& err) {
         return false;
     }
     // one drafter at a time: the NextN block's decode and its states would run beside the DFlash windows
-    // (load_pack_env sets STRATA_GLM_NO_MTP, so the block is never loaded with a DFlash drafter)
+    // (load_pack_env sets MAYA_GLM_NO_MTP, so the block is never loaded with a DFlash drafter)
     if (has_mtp()) {
         err = "glm dflash: the NextN (MTP) draft block is loaded too - DFlash replaces it (MAYA_GLM_NO_MTP=1)";
         return false;
@@ -1667,10 +1667,10 @@ bool Glm5Model::dflash_bind(std::string& err) {
         cudaSetDevice(dev_);
     }
     // a two-GPU split's batched window (dflash_pipelined): each part's window layer on both parts' CPU pools - the
-    // other part's pool idles while the window is on this one (STRATA_GLM_WIN_LANES=0: its own only)
+    // other part's pool idles while the window is on this one (MAYA_GLM_WIN_LANES=0: its own only)
     const bool win_pipe = dflash_pipelined(2);
     static const bool win_lanes = [] {
-        const char* v = getenv("STRATA_GLM_WIN_LANES");
+        const char* v = getenv("MAYA_GLM_WIN_LANES");
         return v == nullptr || std::atoi(v) != 0;
     }();
     Glm5Model* pb = split_next_.get();
@@ -1739,11 +1739,11 @@ bool Glm5Model::decode_dflash(strata::kernels::SamplerParams& sp, int64_t max_ne
     if (n_max < 0) n_max = D.block() - 1;   // the default: the drafter's whole block (see below for a split)
     n_max = std::max(1, std::min({n_max, D.block() - 1, kWinMax - 1}));
     const WSlot& head = tail->ws_map_.at("output.weight");
-    static const bool prof = getenv("STRATA_GLM_DFLASH_PROF") != nullptr;
-    // STRATA_GLM_DFLASH_TL=<file>: a line a pipelined round - ms from its anchor's start: drafts ready, drafts pushed,
+    static const bool prof = getenv("MAYA_GLM_DFLASH_PROF") != nullptr;
+    // MAYA_GLM_DFLASH_TL=<file>: a line a pipelined round - ms from its anchor's start: drafts ready, drafts pushed,
     // each pick (the tokens out of the last part), the commit done
     static FILE* tl = [] {
-        const char* f = getenv("STRATA_GLM_DFLASH_TL");
+        const char* f = getenv("MAYA_GLM_DFLASH_TL");
         return f != nullptr && f[0] ? std::fopen(f, "a") : nullptr;
     }();
     auto t_anchor = std::chrono::steady_clock::now();
@@ -1787,16 +1787,16 @@ bool Glm5Model::decode_dflash(strata::kernels::SamplerParams& sp, int64_t max_ne
     std::vector<int32_t> d;
     std::vector<int32_t> tok, out;
     std::vector<float> conf;
-    // STRATA_GLM_DFLASH_STATS=<file>: a line a round - how many drafts the window checked and kept, the draft's and
+    // MAYA_GLM_DFLASH_STATS=<file>: a line a round - how many drafts the window checked and kept, the draft's and
     // the window's ms, the round's CPU-lane experts and VRAM misses, the drafts' selector confidences (for choosing
-    // how many to draft).  STRATA_GLM_DFLASH_EXPLORE=1: every
+    // how many to draft).  MAYA_GLM_DFLASH_EXPLORE=1: every
     // round drafts the whole block but checks a random number of its drafts (1..n_max), so the stats cover every
     // window size; the tokens are the same either way
     static FILE* stats = [] {
-        const char* f = getenv("STRATA_GLM_DFLASH_STATS");
+        const char* f = getenv("MAYA_GLM_DFLASH_STATS");
         return f != nullptr && f[0] ? std::fopen(f, "a") : nullptr;
     }();
-    static const bool explore = getenv("STRATA_GLM_DFLASH_EXPLORE") != nullptr;
+    static const bool explore = getenv("MAYA_GLM_DFLASH_EXPLORE") != nullptr;
     // the pipelined window (its parts on consecutive tokens at once) or the batched one: dflash_pipelined
     const bool pipe = split_next_ != nullptr && dflash_pipelined(std::max(2, n_parts_));
     // the defaults (n_max / p_min < 0): on the pipelined window a draft after a wrong one costs little (its work is
@@ -1804,7 +1804,7 @@ bool Glm5Model::decode_dflash(strata::kernels::SamplerParams& sp, int64_t max_ne
     // a long context (53.8 against 43-52 tok/s at 0.3).  The batched window on two GPUs: a draft a round whatever its
     // confidence, then more while the product of the confidences stays at 0.9, up to kSplitDrafts - a window of two
     // costs 1.24 lone tokens there (81 against 65 ms), each more token ~28 ms; per-round stats with every window size
-    // (STRATA_GLM_DFLASH_EXPLORE, 3090 + 5060 Ti) put this at 23.4 tok/s against 21.05 for one draft a round.  One GPU:
+    // (MAYA_GLM_DFLASH_EXPLORE, 3090 + 5060 Ti) put this at 23.4 tok/s against 21.05 for one draft a round.  One GPU:
     // the 0.95 cut, no draft below it (a window of two costs 1.56 lone tokens: 97 against 62.5 ms; the same stats put
     // it within 1% of the best cut or product rule)
     const bool batched_split = split_next_ != nullptr && !pipe;
@@ -1812,12 +1812,12 @@ bool Glm5Model::decode_dflash(strata::kernels::SamplerParams& sp, int64_t max_ne
     if (n_max_req < 0 && batched_split) n_max = std::min(n_max, kSplitDrafts);
     if (p_min < 0.0f) p_min = pipe ? 0.5f : batched_split ? 0.0f : 0.95f;
     // at least n_min drafts whatever their confidence, and later drafts only while the product of the confidences
-    // stays at p_cum (STRATA_GLM_DFLASH_MIN / _CUM; the request's spec_n_min / spec_cum)
+    // stays at p_cum (MAYA_GLM_DFLASH_MIN / _CUM; the request's spec_n_min / spec_cum)
     if (n_min < 0)
-        n_min = getenv("STRATA_GLM_DFLASH_MIN") ? std::max(0, std::atoi(getenv("STRATA_GLM_DFLASH_MIN")))
+        n_min = getenv("MAYA_GLM_DFLASH_MIN") ? std::max(0, std::atoi(getenv("MAYA_GLM_DFLASH_MIN")))
                                                 : batched_split ? 1 : 0;
     if (p_cum < 0.0f)
-        p_cum = getenv("STRATA_GLM_DFLASH_CUM") ? (float) std::atof(getenv("STRATA_GLM_DFLASH_CUM"))
+        p_cum = getenv("MAYA_GLM_DFLASH_CUM") ? (float) std::atof(getenv("MAYA_GLM_DFLASH_CUM"))
                                                 : batched_split ? 0.9f : 0.0f;
     if (pipe) n_max = std::min(n_max, kPipeMax - 1);   // the pipelined window's slots
     // the last window's late tokens and the commit behind them done before the caller reads the state - on every
@@ -1839,10 +1839,10 @@ bool Glm5Model::decode_dflash(strata::kernels::SamplerParams& sp, int64_t max_ne
     } drain_on_exit{drain};
     // the pipelined window: the next round's injection and draft queued from a thread of their own as soon as the
     // round's last pick is in, beside the commit and the next anchor's begin here (their ~1.3 ms of launches were
-    // behind those, the drafter's GPU idle meanwhile).  STRATA_GLM_DFLASH_AHEAD=0: at the top of the round (A/B).
+    // behind those, the drafter's GPU idle meanwhile).  MAYA_GLM_DFLASH_AHEAD=0: at the top of the round (A/B).
     // (Declared after drain_on_exit: its job is done before the streams are drained.)
     static const bool ahead_on = [] {
-        const char* v = getenv("STRATA_GLM_DFLASH_AHEAD");
+        const char* v = getenv("MAYA_GLM_DFLASH_AHEAD");
         return v == nullptr || std::atoi(v) != 0;
     }();
     DraftAhead ahead;
@@ -2027,9 +2027,9 @@ bool Glm5Model::decode_dflash(strata::kernels::SamplerParams& sp, int64_t max_ne
             ahead_queued = true;
         }
         // (the pipelined window: the parts' commit enqueues not waited for - the next anchor's begin queues behind each
-        //  on its crew thread; STRATA_GLM_WIN_COMMIT_WAIT=1: waited for, A/B)
+        //  on its crew thread; MAYA_GLM_WIN_COMMIT_WAIT=1: waited for, A/B)
         static const bool commit_wait = [] {
-            const char* v = getenv("STRATA_GLM_WIN_COMMIT_WAIT");
+            const char* v = getenv("MAYA_GLM_WIN_COMMIT_WAIT");
             return v != nullptr && std::atoi(v) != 0;
         }();
         if (!window_commit(keep, err, !pipe || commit_wait || !more)) return false;

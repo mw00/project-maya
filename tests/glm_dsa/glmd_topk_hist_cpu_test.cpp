@@ -3,7 +3,7 @@
 // glmd::twin::topk_hist is the GPU kernel's algorithm (src/kernels/cuda/glmd_topk.cuh select_top_cells_hist: key
 // range, histogram, boundary-bucket sort or the radix fallback, the shared compaction).  Its output must be the radix
 // selector's exactly - the same cells in the same ascending order, -1 padding below top_k, ties to the lower cell -
-// so the decode policy can switch selectors (STRATA_GLMD_TOPK_HIST) without changing a single selection.  Checked
+// so the decode policy can switch selectors (MAYA_GLMD_TOPK_HIST) without changing a single selection.  Checked
 // against a sort oracle (std::stable_sort by score, descending, then by cell) and against glmd::twin::topk on:
 // random scores, many exact ties, all equal, two values, -inf and +-0, a heavy boundary bucket (the fallback), huge
 // dynamic range, n <= top_k (identity), per-row positions, n up to 131072; plus the policy's dispatch.
@@ -160,11 +160,11 @@ int main() {
     {
         glmd::DecodePolicy p;
         check(!p.topk_hist && !glmd::use_topk_hist(p, 100000, K), "default: off");
-        unsetenv("STRATA_GLMD_TOPK_HIST");
+        unsetenv("MAYA_GLMD_TOPK_HIST");
         check(!glmd::decode_policy_env().topk_hist, "env unset: off");
-        setenv("STRATA_GLMD_TOPK_HIST", "1", 1);
+        setenv("MAYA_GLMD_TOPK_HIST", "1", 1);
         glmd::DecodePolicy e = glmd::decode_policy_env();
-        check(e.topk_hist, "STRATA_GLMD_TOPK_HIST=1: on");
+        check(e.topk_hist, "MAYA_GLMD_TOPK_HIST=1: on");
         e.topk_mb = glmd::kSwitchOff;
         check(!glmd::use_topk_hist(e, K, K) && glmd::use_topk_hist(e, K + 1, K) && glmd::use_topk_hist(e, 100000, K),
               "selects only above top_k");
@@ -181,9 +181,9 @@ int main() {
         check((glmd::policy_bits(had, false, false, false) & glmd::kGkIdxHad) &&
                   !(glmd::policy_bits(off, false, false, false) & glmd::kGkIdxHad),
               "and the B14.11 rotation bit");
-        setenv("STRATA_GLMD_TOPK_HIST", "0", 1);
-        check(!glmd::decode_policy_env().topk_hist, "STRATA_GLMD_TOPK_HIST=0: off");
-        unsetenv("STRATA_GLMD_TOPK_HIST");
+        setenv("MAYA_GLMD_TOPK_HIST", "0", 1);
+        check(!glmd::decode_policy_env().topk_hist, "MAYA_GLMD_TOPK_HIST=0: off");
+        unsetenv("MAYA_GLMD_TOPK_HIST");
         // the twin dispatcher runs the bucket selector and returns the same cells
         std::vector<float> sc(12000);
         for (auto& v : sc) v = (float) (r.next() % 300);

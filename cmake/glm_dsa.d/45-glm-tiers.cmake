@@ -1,5 +1,5 @@
 # glm-dsa wave 4: the memory tiers (B8.2 segmented parallel pinning, B8.3 per-socket CPU-lane pools, B8.4 NUMA
-# node-split expert layout behind STRATA_GLM_NUMA_SPLIT=1, B8.7 THP knob and AnonHugePages report) and the B14.8 lane
+# node-split expert layout behind MAYA_GLM_NUMA_SPLIT=1, B8.7 THP knob and AnonHugePages report) and the B14.8 lane
 # parity cases.
 #
 # glm_tier_plan.cpp is the pure host arithmetic (segments, split layout and offsets, THP plans, pool modes);

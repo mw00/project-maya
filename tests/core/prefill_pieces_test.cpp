@@ -1,7 +1,7 @@
-// prefill_pieces (STRATA_GLM_PREFILL_INTERLEAVE) and prefill_gaps (STRATA_GLM_PREFILL_GAPS): the pieces a prompt is
+// prefill_pieces (MAYA_GLM_PREFILL_INTERLEAVE) and prefill_gaps (MAYA_GLM_PREFILL_GAPS): the pieces a prompt is
 // read in - every token once, in order, no piece but a whole segment shorter than the minimum - and the decode gaps of
 // a pipelined read - every part idle in a gap, every chunk read once in order by every part, no deadlock; prefill_chunks
-// (STRATA_GLM_PREFILL_MIN_CHUNKS): the chunks a call is cut into - as before when off, the floor's count when on.  CPU
+// (MAYA_GLM_PREFILL_MIN_CHUNKS): the chunks a call is cut into - as before when off, the floor's count when on.  CPU
 // only.
 #include "strata/core/prefill_chunks.hpp"
 #include "strata/core/prefill_gaps.hpp"
@@ -181,7 +181,7 @@ int main() {
             }
         expect(ok, "pipelined reads with gaps: every chunk in order, every part idle in a gap");
     }
-    // the chunks a call is cut into (STRATA_GLM_PREFILL_MIN_CHUNKS)
+    // the chunks a call is cut into (MAYA_GLM_PREFILL_MIN_CHUNKS)
     {
         using namespace strata::core;
         expect(prefill_min_chunks_parse(nullptr).n == 1 && prefill_min_chunks_parse("1").n == 1 &&

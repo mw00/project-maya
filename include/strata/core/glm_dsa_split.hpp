@@ -10,7 +10,7 @@
 //     GlmStateLayout::bytes_per_layer, and glm_dsa_split_test checks the two agree on every layer), the
 //     NextN block priced on the last part for any n >= 2, and a miss priced over the ONE shared CPU pool that a 3+ GPU
 //     split runs by default (the parts take turns on a token, so the pool's whole bandwidth serves each part's misses);
-//   * B6.3: with STRATA_GLM_CPU_SHARED=0, three parts on two NUMA nodes grouped by their GPU's node.
+//   * B6.3: with MAYA_GLM_CPU_SHARED=0, three parts on two NUMA nodes grouped by their GPU's node.
 //
 // Every rule leaves a Flash (glm5-next) geometry exactly as Maya has it.  Nothing here touches CUDA: the functions are
 // checked on the CPU by tests/glm_dsa/glm_dsa_split_test.cpp.
@@ -28,7 +28,7 @@ namespace strata::core {
 
 /// Bytes ONE position of layer `layer` keeps in the glm-dsa decode state:
 ///   * the latent row of every attention layer (the trunk's 78 and the NextN block): Maya's kv_lora record (FP16
-///     2 x 512 = 1024 B, or the INT8 record lat8_rec_bytes(512) = 544 B with STRATA_GLM_KV_INT8) plus a separate FP16
+///     2 x 512 = 1024 B, or the INT8 record lat8_rec_bytes(512) = 544 B with MAYA_GLM_KV_INT8) plus a separate FP16
 ///     k_pe of qk_rope (2 x 64 = 128 B) - 1152 B (INT8: 672 B, 16-B aligned); `f32_latent` (the slow reference path)
 ///     keeps the whole 576-float row in F32 (2304 B);
 ///   * the F32 index keys idx_key x 4 = 512 B on the full-indexer layers (Glm5Geometry::idx_full: 21 trunk layers + the
@@ -64,7 +64,7 @@ std::vector<int> glm_snap_bounds(const Glm5Geometry& g, const std::vector<int>& 
 
 /// `--layer-split auto`'s search (glm_model.cu glm_search_bounds) on the pack in `pack_dir` for the devices `devs`:
 /// the later parts' first layers, empty when it has no answer (then load_pack splits by free VRAM).  On a glm-dsa pack
-/// STRATA_GLM_SPLIT_CARDS="<free GiB>:<GB/s>[:<name>],..." (one entry per device) replaces the CUDA card query, so
+/// MAYA_GLM_SPLIT_CARDS="<free GiB>:<GB/s>[:<name>],..." (one entry per device) replaces the CUDA card query, so
 /// the plan can be checked without GPUs; Flash always asks CUDA.
 std::vector<int> glm_split_search(const std::string& pack_dir, int64_t max_ctx, const std::vector<int>& devs);
 
@@ -74,8 +74,8 @@ std::vector<int> glm_split_search(const std::string& pack_dir, int64_t max_ctx, 
 bool glm_split_prices_mtp(const Glm5Geometry& g, int n_parts);
 
 /// The CPU-lane pool each part runs its misses on, as the runtime builds them (glm_tier_numa.cu lane_pools, through
-/// the same glmtier::lane_pool_mode, without STRATA_GLM_CPU_LANE<dev> or a node-split tier): equal ids are one pool.
-/// STRATA_GLM_CPU_SHARED (`shared_env`, nullptr/empty = unset): one shared pool for 3+ parts by default or with 1 (all
+/// the same glmtier::lane_pool_mode, without MAYA_GLM_CPU_LANE<dev> or a node-split tier): equal ids are one pool.
+/// MAYA_GLM_CPU_SHARED (`shared_env`, nullptr/empty = unset): one shared pool for 3+ parts by default or with 1 (all
 /// 0), a pool per part for two by default or with 0 (i); on glm-dsa "socket" or "2" with 2+ NUMA nodes a pinned pool per
 /// node, the id being the part's node (its GPU's node from part_node when online, else nodes[i % nodes.size()]).
 /// Flash reads every value as Maya does ("2": shared).  nodes: the online NUMA nodes.
@@ -84,7 +84,7 @@ std::vector<int> glm_cpu_pool_ids(const Glm5Geometry& g, int n_parts, const char
 /// The number of distinct pools in glm_cpu_pool_ids' result.
 int glm_cpu_pool_count(const std::vector<int>& pool_ids);
 /// The engine's call (src/core/glm_tier_numa.cu: needs CUDA and sysfs): glm_cpu_pool_ids for the split on `devs`
-/// with STRATA_GLM_CPU_SHARED, the online NUMA nodes and each GPU's node.
+/// with MAYA_GLM_CPU_SHARED, the online NUMA nodes and each GPU's node.
 std::vector<int> glm_split_pool_ids(const Glm5Geometry& g, const std::vector<int>& devs);
 
 /// The bytes/s at which one part's misses (its routed experts outside VRAM) are computed by the CPU lane, the price

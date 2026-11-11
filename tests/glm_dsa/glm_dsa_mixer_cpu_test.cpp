@@ -9,7 +9,7 @@
 //   * correct, FP16 latents: max rel L2 < 5e-3, the top-k sets equal the reference's once p + 1 > top_k, and the
 //     recorded n_sel_last = min(p + 1, top_k) on every full layer;
 //   * correct, INT8 latents (Maya's record): max rel L2 < 3e-2;
-//   * the dense switch (STRATA_GLM_DSA_DENSE) against a reference attending every cell: max rel L2 < 5e-3, and it
+//   * the dense switch (MAYA_GLM_DSA_DENSE) against a reference attending every cell: max rel L2 < 5e-3, and it
 //     differs from the sparse reference once selection is active;
 //   * each named wrong reading (NEOX pairing, q_pe rope at offset 0, indexer LayerNorm eps 0, shared layers run as
 //     full, scale 1/sqrt(qk_nope)) must FAIL the correct gate by a wide margin;

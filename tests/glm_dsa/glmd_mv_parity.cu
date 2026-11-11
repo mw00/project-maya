@@ -1,7 +1,7 @@
 // tests/glm_dsa/glmd_mv_parity.cu - glm-dsa B10.6 / B10.7 (label gpu): gf::mv on the new 32-value block types and F16
 // against the host run of the same dots (glmd_mv_dots.cuh), and on the file's dominant types (Q8_0, Q2_K..Q6_K,
 // IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS) against ggml's dequantized rows dotted with the dequantized q8_1 activation in
-// double.  ctest runs it twice: as built (the default kernels) and with STRATA_GLMD_MV_NW2=1 STRATA_GLMD_MV_TYPED=1
+// double.  ctest runs it twice: as built (the default kernels) and with MAYA_GLMD_MV_NW2=1 MAYA_GLMD_MV_TYPED=1
 // (the B10.6 variants), with the same gates, and prints the time per GEMV (256 x 6144 rows).
 //   new types   GPU vs host twin (same algorithm): err / sum|.| < 1e-6
 //   others      GPU vs double reference:          err / sum|.| < 1e-5
@@ -76,9 +76,9 @@ int main() {
         std::printf("glmd_mv_parity: no CUDA device, skipped\n");
         return 77;
     }
-    const char* nw2 = std::getenv("STRATA_GLMD_MV_NW2");
-    const char* typed = std::getenv("STRATA_GLMD_MV_TYPED");
-    std::printf("glmd_mv_parity: STRATA_GLMD_MV_NW2=%s STRATA_GLMD_MV_TYPED=%s\n", nw2 ? nw2 : "-", typed ? typed : "-");
+    const char* nw2 = std::getenv("MAYA_GLMD_MV_NW2");
+    const char* typed = std::getenv("MAYA_GLMD_MV_TYPED");
+    std::printf("glmd_mv_parity: MAYA_GLMD_MV_NW2=%s MAYA_GLMD_MV_TYPED=%s\n", nw2 ? nw2 : "-", typed ? typed : "-");
     const int n_in = 6144, rows = 256;
     std::mt19937 rng(9);
     std::normal_distribution<float> nd(0.0f, 1.0f);

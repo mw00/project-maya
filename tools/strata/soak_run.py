@@ -35,6 +35,9 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sys as _sys   # (an older STRATA_X counts as MAYA_X: tools/maya_names.py makes it so on import)
+_sys.path.append(os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..')))
+import maya_names  # noqa: E402,F401
 import pathlib
 import random
 import re
@@ -571,7 +574,7 @@ def main(argv: list[str] | None = None) -> int:
     for name in ("toolcalls", "soak"):
         p = sub.add_parser(name)
         p.add_argument("--url", default="http://127.0.0.1:8090")
-        p.add_argument("--api-key", default=os.environ.get("STRATA_API_KEY"))
+        p.add_argument("--api-key", default=os.environ.get("MAYA_API_KEY"))
         p.add_argument("--toolcalls", default=str(TOOLCALLS))
         p.add_argument("--timeout", type=float, default=1800.0)
         p.add_argument("--report", help="JSON report")

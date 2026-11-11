@@ -15,7 +15,7 @@
 //  - all 65536 states: a K 8 matrix whose tiles hold every one of them, each state's byte sum read back through the
 //    kernels with one-hot activations (tiers 0, 1 and 4, and the rows with the switch off and on, 1, 3 and 8
 //    activations a call), against the scalar byte sum.
-// It prints the tier it ran on.  ctest runs it twice, the second time with STRATA_FORCE_AVX2=1, so an AVX-512 host's
+// It prints the tier it ran on.  ctest runs it twice, the second time with MAYA_FORCE_AVX2=1, so an AVX-512 host's
 // rows and GEMM take the AVX2 tier too (the band entries reach tier 4 on any AVX2 host).  On a CPU without AVX2 the
 // switch must report itself off and change nothing, and tier 4 must be refused.
 #include "strata/kernels/cpu/exl3_cpu.hpp"
@@ -433,7 +433,7 @@ int main() {
     const bool exact = tier >= 1;
     if (tier != 1)
         std::printf("  (the lane runs the %s tier here: the switch is a no-op for the rows, the GEMM and band_acc - "
-                    "STRATA_FORCE_AVX2=1 makes an AVX-512 host take AVX2)\n", tier_name(tier));
+                    "MAYA_FORCE_AVX2=1 makes an AVX-512 host take AVX2)\n", tier_name(tier));
     Tally tot[4];
     // (tier 4 expected wherever tier 1 runs)
     for (int k2 : {2, 3, 4, 5, 6, 7, 8, 10, 12, 14, 16}) test_random(k2, 512, 512, exact, t1, tot);

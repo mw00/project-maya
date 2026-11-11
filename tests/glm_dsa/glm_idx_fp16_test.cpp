@@ -1,7 +1,7 @@
 // tests/glm_dsa/glm_idx_fp16_test.cpp - glm-dsa B10.8 (CPU only): FP16 index keys in the state descriptor, the split
 // planner and the slot fingerprint, GLM-5.3 744B geometry.
-//   1. without STRATA_GLM_IDX_FP16: F32 keys (ik_pp 128 floats, ik_bytes 4, fingerprint 4; full layer row 1664 B);
-//   2. with STRATA_GLM_IDX_FP16=1: FP16 / INT8 carves store 64 floats (128 halves) per key, every region stays 16-byte
+//   1. without MAYA_GLM_IDX_FP16: F32 keys (ik_pp 128 floats, ik_bytes 4, fingerprint 4; full layer row 1664 B);
+//   2. with MAYA_GLM_IDX_FP16=1: FP16 / INT8 carves store 64 floats (128 halves) per key, every region stays 16-byte
 //      aligned, the 32K arena shrinks by exactly 22 x 256 x 32768 B (~0.18 GB, the plan's B10.8 figure), the
 //      planner prices 1152 + 256 B on full layers, the fingerprint records 2 bytes per element (a slot saved with
 //      F32 keys is refused by a FP16 build and back), slot runs cover n * 64 floats per full layer;
@@ -69,7 +69,7 @@ bool carve(const Glm5Geometry& g, GlmStateMode mode, int64_t ctx, GlmStateLayout
 int main() {
     const Glm5Geometry g = glm53();
     const int64_t ctx = 32768;
-    unsetenv("STRATA_GLM_IDX_FP16");
+    unsetenv("MAYA_GLM_IDX_FP16");
     GlmStateLayout F, F8, S;
     check(!strata::core::glm_state_idx_fp16(), "default: F32 index keys");
     check(carve(g, GlmStateMode::Fp16, ctx, F) && carve(g, GlmStateMode::Int8, ctx, F8) &&
@@ -80,9 +80,9 @@ int main() {
     const auto fp_f32 = strata::core::glm_state_fingerprint(g, F);
     check(fp_f32[10] == 4, "default fingerprint: 4 B per key element");
 
-    setenv("STRATA_GLM_IDX_FP16", "1", 1);
+    setenv("MAYA_GLM_IDX_FP16", "1", 1);
     GlmStateLayout H, H8, HS;
-    check(strata::core::glm_state_idx_fp16(), "STRATA_GLM_IDX_FP16=1 read");
+    check(strata::core::glm_state_idx_fp16(), "MAYA_GLM_IDX_FP16=1 read");
     check(carve(g, GlmStateMode::Fp16, ctx, H) && carve(g, GlmStateMode::Int8, ctx, H8) &&
               carve(g, GlmStateMode::SlowF32, ctx, HS),
           "FP16-key carves");
@@ -110,7 +110,7 @@ int main() {
     for (const auto& r : H.slot_runs(100)) runs &= r.second == 100 * H.lat_pp || r.second == 100 * H.kpe_pp ||
                                                   r.second == 100 * H.ik_pp;
     check(runs, "slot runs: n * ik_pp floats per index cache");
-    unsetenv("STRATA_GLM_IDX_FP16");
+    unsetenv("MAYA_GLM_IDX_FP16");
     std::printf("%s (%d failure%s)\n", g_fail ? "FAILED" : "PASSED", g_fail, g_fail == 1 ? "" : "s");
     return g_fail ? 1 : 0;
 }

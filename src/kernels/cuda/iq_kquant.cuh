@@ -1,5 +1,5 @@
 // src/kernels/cuda/iq_kquant.cuh - glm-dsa B3.5 / B5.3: the K-quant formats (Q2_K, Q3_K, Q4_K, Q5_K, Q6_K) for
-// iq_kernels.cu's native_expert_grouped, the slow path's (STRATA_GLM_SLOW) routed experts.  GLM-5.3 GGUFs keep
+// iq_kernels.cu's native_expert_grouped, the slow path's (MAYA_GLM_SLOW) routed experts.  GLM-5.3 GGUFs keep
 // experts in K-quants, and so do the PACK / PACK9 presets and tools/iq_fixture.py's 12-type fixture; the grouped
 // kernel knew only Maya's i-quant set and stopped the process on Q2_K (the test PC's first GPU run, 2026-10-17).
 //

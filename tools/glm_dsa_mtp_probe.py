@@ -29,9 +29,9 @@ Head-vs-trunk agreement (B11.3 / B15.4, llama.cpp #28351 examples/mtp-agree): te
 accepted under greedy decoding, independent of the text.  The trunk's greedy ids come from --oracle-trunk (the
 oracle's logits), --trunk-logits FILE[@FIRST] (float32 rows of n_vocab, row 0 = position FIRST, e.g. llama.cpp's
 logits dump or the engine's) or --trunk-ids a,b,c[@FIRST] (the engine's argmax series).  Reported for the oracle
-draft and for every --compare / --compare-ids draft (an IQ2 head vs a Q4_K head through STRATA_GLM_MTP_GGUF);
+draft and for every --compare / --compare-ids draft (an IQ2 head vs a Q4_K head through MAYA_GLM_MTP_GGUF);
 --min-agree X fails (exit 1) when a source agrees on fewer than X of the rows.  Upstream: Q4_0 0.718, bf16 0.724,
-IQ2_XS collapses; the M4 gate is 0.6 live first-position acceptance (the engine's STRATA_GLM_SPEC_LOG counters).
+IQ2_XS collapses; the M4 gate is 0.6 live first-position acceptance (the engine's MAYA_GLM_SPEC_LOG counters).
 """
 from __future__ import annotations
 

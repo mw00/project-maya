@@ -168,7 +168,7 @@ int seg_node(int k, int half, bool split, const std::vector<int>& nodes) {
 // ---------------------------------------------------------------- B8.7
 
 int thp_mode(const char* env) {
-    return strata::glmenv::switch_value("STRATA_GLM_THP", env, strata::glmenv::kAuto, true);
+    return strata::glmenv::switch_value("MAYA_GLM_THP", env, strata::glmenv::kAuto, true);
 }
 
 int64_t buddy_huge_free(const std::string& text) {
@@ -310,7 +310,7 @@ const char* lane_pool_name(LanePool m) {
 // ---------------------------------------------------------------- B8.4
 
 bool numa_split_requested(bool glm_dsa, const char* env) {
-    return glm_dsa && strata::glmenv::switch_value("STRATA_GLM_NUMA_SPLIT", env, strata::glmenv::kOff) == strata::glmenv::kOn;
+    return glm_dsa && strata::glmenv::switch_value("MAYA_GLM_NUMA_SPLIT", env, strata::glmenv::kOff) == strata::glmenv::kOn;
 }
 
 bool split_layout(size_t gu_row, size_t d_row, int64_t n_ff, int64_t n_embd, int64_t d_blck, size_t d_blck_bytes,

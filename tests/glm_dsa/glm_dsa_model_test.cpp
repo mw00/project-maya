@@ -1,7 +1,7 @@
 // tests/glm_dsa/glm_dsa_model_test.cpp - the glm-dsa reference forward vs the Python oracle (glm-dsa B3.6).
 //
 // SMALL and LONG synthetic glm-dsa GGUFs (B3.2, tools/glm_dsa_synth_gguf.py) run token by token through the
-// slow path (STRATA_GLM_SLOW=1: Glm5Model::load -> step_layers_dsa, src/core/glm_dsa_ref.cu), and every position's
+// slow path (MAYA_GLM_SLOW=1: Glm5Model::load -> step_layers_dsa, src/core/glm_dsa_ref.cu), and every position's
 // logits are compared with the oracle's (B3.1, ref/glm_dsa.py, numpy f64, HF semantics):
 //
 //   gate: KL(oracle || engine) p99 over the positions < 1e-4, plus the max abs logit error and the top-1 agreement
@@ -12,7 +12,7 @@
 // committed ones in data/glm-dsa/ (tests/glm_dsa/glm_dsa_fixtures.hpp):
 //   python3 tools/glm_dsa_synth_gguf.py --preset SMALL|LONG --out glm-dsa-<preset>.gguf  (sha256 vs data/glm-dsa/sha256.txt)
 //   SMALL, 48 tokens, HF semantics          vs data/glm-dsa/oracle-hf-small-48.f32 (ref/glm_dsa.py --mode hf)
-//   SMALL, 48 tokens, STRATA_GLM_IDX_LN_EPS=0 (llama.cpp parity) vs data/glm-dsa/llama-small-48.f32
+//   SMALL, 48 tokens, MAYA_GLM_IDX_LN_EPS=0 (llama.cpp parity) vs data/glm-dsa/llama-small-48.f32
 //   LONG, 2080 tokens, eps 0, rows 2048..2079 (top-2048 selection active) vs data/glm-dsa/llama-long-2080-tail32.f32
 // Token i of every reference is (i * 37 + 11) % n_vocab.  Before any GPU work the test reruns the oracle's CLI
 //   python3 ref/glm_dsa.py glm-dsa-small.gguf --tokens <48> --mode hf --logits-out X.f32 --mtp --mtp-out M.f32
@@ -55,13 +55,13 @@ Result run_case(const char* name, const fs::path& gguf, int n_tok, int row0, con
         return Result::Skip;
     }
     if (eps0)
-        setenv("STRATA_GLM_IDX_LN_EPS", "0", 1);   // read at load: the indexer LayerNorm as llama.cpp computes it
+        setenv("MAYA_GLM_IDX_LN_EPS", "0", 1);   // read at load: the indexer LayerNorm as llama.cpp computes it
     else
-        unsetenv("STRATA_GLM_IDX_LN_EPS");
+        unsetenv("MAYA_GLM_IDX_LN_EPS");
     strata::core::Glm5Model m;
     std::string err;
     const bool loaded = m.load(gguf.string(), (int64_t) n_tok + 8, err);
-    unsetenv("STRATA_GLM_IDX_LN_EPS");
+    unsetenv("MAYA_GLM_IDX_LN_EPS");
     if (!loaded) {
         std::printf("  %s: FAIL - load: %s\n", name, err.c_str());
         return Result::Fail;
@@ -127,7 +127,7 @@ int main() {
         std::printf("glm_dsa_model_test: no CUDA device - the engine cases skipped\n");
         return fail > 0 ? 1 : kSkip;
     }
-    setenv("STRATA_GLM_SLOW", "1", 1);   // the reference forward (glm_forward_available lets glm-dsa through)
+    setenv("MAYA_GLM_SLOW", "1", 1);   // the reference forward (glm_forward_available lets glm-dsa through)
     const fs::path data = glmfx::data_dir();
     count(run_case("SMALL hf, 48 tokens", small, 48, 0, data / "oracle-hf-small-48.f32", false));
     count(run_case("SMALL eps 0 vs llama.cpp, 48 tokens", small, 48, 0, data / "llama-small-48.f32", true));

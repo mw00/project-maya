@@ -9,7 +9,7 @@
 //   3. glmtier::read_split - a disk read into a split slot (fast_read_part's chunks) lands in both halves as scatter;
 //   5. (W6) socket_lane keeps the per-socket NodeLane for the load; set_lane_threads drives both node-split pools;
 //   4. glmtier::lane_pools' mode on this machine (one pool for one part; Maya's shared pool for 3 parts unless two
-//      NUMA nodes are online and STRATA_GLM_CPU_SHARED=socket) and its log line.
+//      NUMA nodes are online and MAYA_GLM_CPU_SHARED=socket) and its log line.
 #include "glm_tier_numa.hpp"
 
 #include "strata/core/glm_arch.hpp"
@@ -220,13 +220,13 @@ int main() {
     std::printf("B8.3 lane pool mode on this machine\n");
     {
         Glm5Model::FastState G;
-        unsetenv("STRATA_GLM_CPU_SHARED");
+        unsetenv("MAYA_GLM_CPU_SHARED");
         check(!gt::lane_pools(G, g, 1, 0, false, false, 4, -1, 0) && G.cpu_pool == nullptr,
               "one part: Maya makes its pool (mode One)");
         Glm5Model::FastState G3;
         check(!gt::lane_pools(G3, g, 3, 1, false, false, 4, -1, 0) && G3.cpu_pool == nullptr,
-              "3 parts, STRATA_GLM_CPU_SHARED unset: Maya's shared pool");
-        setenv("STRATA_GLM_CPU_SHARED", "socket", 1);
+              "3 parts, MAYA_GLM_CPU_SHARED unset: Maya's shared pool");
+        setenv("MAYA_GLM_CPU_SHARED", "socket", 1);
         Glm5Model::FastState GS;
         const bool socket = gt::lane_pools(GS, g, 3, 1, false, false, 4, -1, 0);
         std::string nodes;
@@ -242,8 +242,8 @@ int main() {
         }
         const bool two = nodes.find('-') != std::string::npos || nodes.find(',') != std::string::npos;
         check(socket == two && (!socket || (GS.cpu_pool != nullptr && GS.cpu_node >= 0)),
-              "STRATA_GLM_CPU_SHARED=socket: a pinned per-socket pool iff two NUMA nodes (online: " + nodes + ")");
-        unsetenv("STRATA_GLM_CPU_SHARED");
+              "MAYA_GLM_CPU_SHARED=socket: a pinned per-socket pool iff two NUMA nodes (online: " + nodes + ")");
+        unsetenv("MAYA_GLM_CPU_SHARED");
     }
 
     std::printf("W6 runtime fix (B8.3): the per-socket lane is kept for the load and shared by the node's parts\n");

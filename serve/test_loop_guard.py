@@ -365,7 +365,7 @@ class Settings(unittest.TestCase):
     def test_on_by_default_and_the_ways_to_turn_it_off(self):
         self.assertTrue(loop_guard_setting({}, {}))
         self.assertFalse(loop_guard_setting({}, {"MAYA_LOOP_GUARD": "0"}))
-        self.assertFalse(loop_guard_setting({}, {"STRATA_LOOP_GUARD": "off"}))
+        self.assertFalse(loop_guard_setting({}, {"MAYA_LOOP_GUARD": "off"}))
         self.assertFalse(loop_guard_setting({"loop_guard": False}, {}))
         self.assertFalse(loop_guard_setting({"loop_guard": "false"}, {}))
         self.assertTrue(loop_guard_setting({"loop_guard": True}, {}))

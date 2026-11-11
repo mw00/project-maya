@@ -83,10 +83,10 @@ class SharedHistory(unittest.TestCase):
         store.put("a", {"id": "r", "output": []}, [item(1)])
         with self.assertRaises(StoreBusy):
             store.get("a", "r")
-        with patch.dict(os.environ, {"STRATA_GLM_RESPONSES_OWNER_ENTRIES": "2"}):
+        with patch.dict(os.environ, {"MAYA_GLM_RESPONSES_OWNER_ENTRIES": "2"}):
             self.assertEqual(limits_from_env()["OWNER_ENTRIES"], 2)
         for value in ("0", "-1", "bad"):
-            with patch.dict(os.environ, {"STRATA_GLM_RESPONSES_CACHE_BYTES": value}), self.assertRaises(ValueError):
+            with patch.dict(os.environ, {"MAYA_GLM_RESPONSES_CACHE_BYTES": value}), self.assertRaises(ValueError):
                 limits_from_env()
 
     def test_maya_environment_aliases_take_precedence_at_startup(self):

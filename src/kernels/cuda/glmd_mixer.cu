@@ -183,7 +183,7 @@ bool decode_mla(const DecodePolicy& pol, const Mla2& a, void* stream) {
         return mla_fused(fused_args(a, pol.fused_split), stream);
 #endif
     if (pol.mla_dec) return mla2(a, stream);
-    Mla2 b = a;   // STRATA_GLMD_MLA_DEC=0: mla2's own attention kernels (L1-4)
+    Mla2 b = a;   // MAYA_GLMD_MLA_DEC=0: mla2's own attention kernels (L1-4)
     b.legacy_attn = 1;
     return mla2(b, stream);
 }

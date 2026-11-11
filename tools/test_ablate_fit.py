@@ -43,6 +43,13 @@ class Records(unittest.TestCase):
         with self.assertRaises(ValueError):   # (a wrong write count mixes the passes)
             AF.prompt_pass(recs, 3 * LAYERS)
 
+    def test_final_takes_the_last_block_whatever_its_rows(self):
+        rng = np.random.default_rng(1)
+        a, last = (rng.standard_normal((2 * LAYERS, DIM)).astype(np.float32) for _ in range(2))
+        recs = [(25, r) for r in a] + [(1, r) for r in last]   # (GLM: the prompt less its last token, then that token)
+        np.testing.assert_array_equal(AF.prompt_pass(recs, 2 * LAYERS, final=True), last)
+        np.testing.assert_array_equal(AF.prompt_pass(recs, 2 * LAYERS), a)
+
     def test_residuals_sum_two_writes_a_layer(self):
         w = np.ones((2 * LAYERS, DIM))
         r = AF.residuals(w)

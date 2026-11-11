@@ -213,7 +213,7 @@ static void test_mv_fallback(std::mt19937& rng) {
     sd.type = 14;
     CHECK(glmdsa::shexp_down_apart(&ext, sd, dxq, n_in, n_out, dy1, nullptr, apart) && !apart);
 
-    // B10.7: a Q4_1 shared down (an STRATA_PACK_NATIVE32 pack) runs apart, bit for bit the plain one-column gf::mv
+    // B10.7: a Q4_1 shared down (an MAYA_PACK_NATIVE32 pack) runs apart, bit for bit the plain one-column gf::mv
     // (ext_mv), also without an ext (glm5-next); the fused moe_gate_up dot would have read 0
     std::uniform_int_distribution<int> byte(0, 255);
     std::vector<uint8_t> w41((size_t) n_out * (n_in / 32) * 20);

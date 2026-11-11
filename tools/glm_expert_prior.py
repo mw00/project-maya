@@ -2,10 +2,10 @@
 
     python tools/glm_expert_prior.py [--n-expert N] <pack_dir> <trace|usage> [<trace|usage> ...]
 
-Each trace is the routing record `STRATA_GLM_TRACE=<file>` writes (one "layer expert" line per routed expert); a
-usage file is what the fast path saves after every request when `STRATA_GLM_USAGE=<file>` names one ("layer
+Each trace is the routing record `MAYA_GLM_TRACE=<file>` writes (one "layer expert" line per routed expert); a
+usage file is what the fast path saves after every request when `MAYA_GLM_USAGE=<file>` names one ("layer
 e:count e:count ...", the routes of every prompt and answer since it started) - a session over a corpus typical of the
-model's use, with STRATA_GLM_USAGE pointing at a fresh file, is a profile.
+model's use, with MAYA_GLM_USAGE pointing at a fresh file, is a profile.
 
 The expert count is the model's: --n-expert, else the "(n_expert N" of the pack's native_experts.txt header
 (tools/iq_pack.py writes it: 288 on GLM-5.x-Flash, 256 on GLM-5.3 744B), else the largest id seen + 1.  glm-dsa B8.5:
@@ -22,7 +22,7 @@ Writes into <pack_dir>:
   hit_curve.txt      the routing skew h(f): with each layer holding its most frequent ceil(f N) experts, the share of
                      all routed visits they serve (per-layer static top-k, every layer's visits pooled), for
                      f = 0.00 .. 1.00 in steps of 0.01 - "f h" lines after a "#" header.
-                     docs/strata/plan/model/model.py reads it (STRATA_HIT_CURVE=<file>, or the copy at
+                     docs/strata/plan/model/model.py reads it (MAYA_HIT_CURVE=<file>, or the copy at
                      docs/strata/plan/model/hit_curve_volta3.txt) in place of its Flash-calibrated CURVE.
 """
 from __future__ import annotations

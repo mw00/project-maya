@@ -64,7 +64,7 @@ if(STRATA_BUILD_TESTS AND (STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP) AND TARGET s
   add_test(NAME glmd_mv_parity COMMAND glmd_mv_parity)
   add_test(NAME glmd_mv_parity_sm70 COMMAND glmd_mv_parity)
   set_tests_properties(glmd_mv_parity glmd_mv_parity_sm70 PROPERTIES LABELS gpu SKIP_RETURN_CODE 77)
-  set_tests_properties(glmd_mv_parity_sm70 PROPERTIES ENVIRONMENT "STRATA_GLMD_MV_NW2=1;STRATA_GLMD_MV_TYPED=1")
+  set_tests_properties(glmd_mv_parity_sm70 PROPERTIES ENVIRONMENT "MAYA_GLMD_MV_NW2=1;MAYA_GLMD_MV_TYPED=1")
 endif()
 
 # B10.1 / B14.4: the decode graph key rules (CPU) and one captured part replayed over tokens (label gpu)

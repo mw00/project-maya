@@ -16,7 +16,7 @@ struct Geometry {
 };
 
 // Default on only on validated gfx1151 and gfx1100 with compiled WMMA bodies and covered types.
-// STRATA_GLM_PREFILL_FUSED=0 retains MMQ. Other devices always retain MMQ.
+// MAYA_GLM_PREFILL_FUSED=0 retains MMQ. Other devices always retain MMQ.
 bool available();
 bool supported(int gu_type, int down_type);
 size_t act_bytes(int64_t rows, int64_t cols);

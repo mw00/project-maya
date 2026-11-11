@@ -647,7 +647,7 @@ inline float dot1_iq3_xxs(const uint8_t* row, int nb, const block_q8_K* y) {
 // half's four grid rows by broadcast loads + blends (tab4) instead of set_epi64x's inserts, the sign vectors built in
 // registers (dot1_iq3_xxs' neg: the two formats share the 7-bit sign + parity scheme) instead of four keven_signs loads
 // and inserts a half.  The bytes, the integer lanes and the float steps are ggml's, so the result is its dot bit for bit
-// (pick_rows1 checks it).  STRATA_IQ_PF_ROWS=<n> (default 2, 0 off): prefetch the row n ahead while a row runs - a
+// (pick_rows1 checks it).  MAYA_IQ_PF_ROWS=<n> (default 2, 0 off): prefetch the row n ahead while a row runs - a
 // thread's run of rows is short (a lane call's ~100 rows), and the L2 streamer stops at every 4 KB page.
 template <int V>   // V: 0 grid by tab4 + signs in registers, 1 tab4 + ggml's sign table, 2 set_epi64x + registers
 inline float dot1_iq2_xxs(const uint8_t* row, int nb, const block_q8_K* y, const uint8_t* pf) {
@@ -773,10 +773,10 @@ void rows1(const uint8_t* w, size_t row_bytes, int n, const void* const* act, in
     const int nb = n / QK_K;
     if constexpr (TY == 16) {
         static const int pf_rows = [] {
-            const char* v = std::getenv("STRATA_IQ_PF_ROWS");
+            const char* v = std::getenv("MAYA_IQ_PF_ROWS");
             return v != nullptr ? std::max(0, std::atoi(v)) : 2;
         }();
-        static const int var = std::getenv("STRATA_IQ2_VAR") ? std::atoi(std::getenv("STRATA_IQ2_VAR")) : 1;
+        static const int var = std::getenv("MAYA_IQ2_VAR") ? std::atoi(std::getenv("MAYA_IQ2_VAR")) : 1;
         for (int r = r0; r < r1; ++r) {
             const uint8_t* row = w + (size_t) r * row_bytes;
             const uint8_t* pf = pf_rows > 0 && r + pf_rows < r1 ? row + (size_t) pf_rows * row_bytes : nullptr;
@@ -802,8 +802,8 @@ void rows1(const uint8_t* w, size_t row_bytes, int n, const void* const* act, in
 
 bool iq256_rows1_supported(int type) noexcept {
     // opt-in: on one core 1.05x ggml's dot, but in the 4-GPU decode with every core and SMT sibling busy no faster
-    // (4 streams, 10,21,33 split: 19.5-19.8 tok/s a stream with it, 20.2-20.8 with ggml's) - STRATA_IQ2XXS_1T=1 tries it
-    static const bool iq2xxs = std::getenv("STRATA_IQ2XXS_1T") != nullptr && std::atoi(std::getenv("STRATA_IQ2XXS_1T")) != 0;
+    // (4 streams, 10,21,33 split: 19.5-19.8 tok/s a stream with it, 20.2-20.8 with ggml's) - MAYA_IQ2XXS_1T=1 tries it
+    static const bool iq2xxs = std::getenv("MAYA_IQ2XXS_1T") != nullptr && std::atoi(std::getenv("MAYA_IQ2XXS_1T")) != 0;
     return type == 17 || type == 18 || type == 21 || type == 29 || (type == 16 && iq2xxs);
 }
 

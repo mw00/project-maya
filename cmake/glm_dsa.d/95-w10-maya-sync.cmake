@@ -33,7 +33,7 @@ if(STRATA_PYTHON3)
   set_tests_properties(strata_py_test_glm_dsa_profile PROPERTIES TIMEOUT 120)
   if(TARGET glm_maya_sync_test)
     set_property(TEST strata_py_test_glm_dsa_profile APPEND PROPERTY ENVIRONMENT
-                 "STRATA_MAYA_SYNC_BIN=$<TARGET_FILE:glm_maya_sync_test>")
+                 "MAYA_SYNC_BIN=$<TARGET_FILE:glm_maya_sync_test>")
   endif()
 endif()
 

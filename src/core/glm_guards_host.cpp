@@ -1,6 +1,6 @@
 // src/core/glm_guards_host.cpp - glm-dsa wave 9 (B15.1, B15.2, B15.6): the host halves of the guards, plain C++ (no
 // CUDA), in strata_engine on every backend and linked straight into the CPU tests.
-//   B15.1  STRATA_GLM_F16_GUARD and the CPU twins of the FP16 range guard (include/strata/kernels/glmd_f16_guard.hpp)
+//   B15.1  MAYA_GLM_F16_GUARD and the CPU twins of the FP16 range guard (include/strata/kernels/glmd_f16_guard.hpp)
 //   B15.2  the gap / tail ranges of the MMQ expert banks (include/strata/kernels/glmd_mmq_pad.hpp)
 //   B15.6  the process-wide CUDA-graph generation (include/strata/kernels/glmd_graph.hpp)
 #include "strata/core/glm_env.hpp"
@@ -25,7 +25,7 @@ namespace sk = strata::kernels;
 // ---- B15.1 ----------------------------------------------------------------------------------------------------------
 
 int f16_guard_mode() {
-    return strata::glmenv::env_switch("STRATA_GLM_F16_GUARD", strata::glmenv::kAuto, true);
+    return strata::glmenv::env_switch("MAYA_GLM_F16_GUARD", strata::glmenv::kAuto, true);
 }
 
 namespace guard_twin {

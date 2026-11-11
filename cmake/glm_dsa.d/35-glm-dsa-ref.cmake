@@ -1,4 +1,4 @@
-# B3.5 / B3.6: the glm-dsa F32 reference forward (Glm5Model::step_layers_dsa, the STRATA_GLM_SLOW path) and its tests.
+# B3.5 / B3.6: the glm-dsa F32 reference forward (Glm5Model::step_layers_dsa, the MAYA_GLM_SLOW path) and its tests.
 if(TARGET strata_engine)
   if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     target_sources(strata_engine PRIVATE src/core/glm_dsa_ref.cu src/core/glm_dsa_ref_host.cpp)

@@ -22,7 +22,7 @@ add_executable(glm_cb_dump_test tests/glm_dsa/glm_cb_dump_test.cpp)
 target_include_directories(glm_cb_dump_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/core)
 add_test(NAME glm_cb_dump_test COMMAND glm_cb_dump_test)
 
-# GPU: PACK9 (9 expert size classes) through STRATA_GLM_SLOW=1 with 9 / 8 / 1 classes and the bounce ring
+# GPU: PACK9 (9 expert size classes) through MAYA_GLM_SLOW=1 with 9 / 8 / 1 classes and the bounce ring
 if((STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP) AND TARGET strata_engine)
   add_executable(glm_dsa_pack9_slow_test tests/glm_dsa/glm_dsa_pack9_slow_test.cpp)
   target_include_directories(glm_dsa_pack9_slow_test PRIVATE ${_strata_gpu_include_directories})

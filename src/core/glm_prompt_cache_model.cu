@@ -11,7 +11,7 @@
 //   latent mode, k_pe / index-key dtype, the B14.11 rotation bit, latent row size), each part's layer range, the
 //   NextN block, and the pack's files (names and sizes, as Maya's kept slots check).
 //   B15.3: the entry file ends with slot_save's MTP1 carrier trailer; the fingerprint (state_fp) carries the NextN
-//   block's identity (STRATA_GLM_MTP_GGUF or the model's own, by tensor types) and the carrier bytes, so an entry
+//   block's identity (MAYA_GLM_MTP_GGUF or the model's own, by tensor types) and the carrier bytes, so an entry
 //   written with another draft block is refused.  A prefix restore (n_use < n_file) zeroes the carrier.
 //
 // Portable runtime calls only (cudaMemcpy, cudaSetDevice, cudaStreamSynchronize): a HIP build compiles this file

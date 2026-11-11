@@ -2010,7 +2010,7 @@ __global__ void __launch_bounds__(kThreads) set_mix_kernel(const KSetMix a, KMix
 // B 16 activations' slice from xb (col-major: an activation's inputs in a row), D stored col-major into out - the same
 // operands as gfx11's, the fragments loaded by the library instead of by hand (wt's pitch 12 words: wmma's ldm is a
 // multiple of 8 halves; the 8 rows a store takes stay on distinct banks).  wmma_now(): sm_7x unless
-// STRATA_EXL3_WMMA=0 (MAYA_EXL3_WMMA=0).
+// MAYA_EXL3_WMMA=0.
 constexpr int kXS = kCols + 8;   // an activation's pitch in xb (halves: 2-way LDS reads)
 #if defined(STRATA_USE_HIP)
 constexpr int kWtP = 9;          // wt's pitch, words a decoded output row (8 + 1: banks)
@@ -2549,14 +2549,14 @@ static bool hip_scalar_set(const SetArgs& a, const float* x, int ldx, const int*
                             float* y, int ldy, cudaStream_t s) {
     // Only the tested integer 3/4-bit mul1 layouts. Mixed and other layouts retain their original path.
     if constexpr ((K2 == 6 || K2 == 8) && cb == 2) {
-        const int mode = hip_scalar::mode(hip_scalar_env("STRATA_EXL3_HIP_SCALAR_ROWS",
+        const int mode = hip_scalar::mode(hip_scalar_env("MAYA_EXL3_HIP_SCALAR_ROWS",
             "MAYA_EXL3_HIP_SCALAR_ROWS", "EXL3_HIP_SCALAR_ROWS"));
         if (mode == 8 || !hip_scalar_device()) return false;
         int gu_min = 48, down_min = 128;
         if (mode == -1) {
-            gu_min = hip_scalar::cutoff(hip_scalar_env("STRATA_EXL3_HIP_SCALAR_GU_MIN_ROWS",
+            gu_min = hip_scalar::cutoff(hip_scalar_env("MAYA_EXL3_HIP_SCALAR_GU_MIN_ROWS",
                 "MAYA_EXL3_HIP_SCALAR_GU_MIN_ROWS", "EXL3_HIP_SCALAR_GU_MIN_ROWS"), gu_min);
-            down_min = hip_scalar::cutoff(hip_scalar_env("STRATA_EXL3_HIP_SCALAR_DOWN_MIN_ROWS",
+            down_min = hip_scalar::cutoff(hip_scalar_env("MAYA_EXL3_HIP_SCALAR_DOWN_MIN_ROWS",
                 "MAYA_EXL3_HIP_SCALAR_DOWN_MIN_ROWS", "EXL3_HIP_SCALAR_DOWN_MIN_ROWS"), down_min);
         }
         const int nr = hip_scalar::rows(mode, GU, a.max_rows, gu_min, down_min);
@@ -2773,14 +2773,14 @@ int sm_count() {
 
 // A device's decode kernels: 1 v1.1.8's (exl3_legacy.cu), 2 this file's, 3 v1.1.8's with the weights decoded in F32
 // (legacy_f32).  NVIDIA before sm_80 takes v1.1.8's, where this file's tiles run on the CUDA cores and were slower;
-// STRATA_GLM_EXL3_DECODE=legacy | new | legacy-f32 picks one on every GPU (A/B), STRATA_GLM_EXL3_DECODE<n> on CUDA<n>
+// MAYA_GLM_EXL3_DECODE=legacy | new | legacy-f32 picks one on every GPU (A/B), MAYA_GLM_EXL3_DECODE<n> on CUDA<n>
 // alone (its ordinal as this process sees it), over the first: a Pascal expert helper on legacy-f32 beside an RTX 20
 // trunk on legacy.  Neither set: the engine's default for the device (prefer_legacy_f32), else by its architecture.
 // legacy-f32 on sm_6x only: its kernels are built for Pascal alone (exl3_legacy.cu's EXL3_F32_KERNEL), so sm_70 and
 // newer take v1.1.8's FP16 decode for it, the same bits.  The token path and the verify windows take the same family
 // on a device, so a window stays bit for bit its token path.  Asked once per device.
 #if !defined(STRATA_USE_HIP)
-// a decode-kernel name (STRATA_GLM_EXL3_DECODE's values) -> its number; 0 for none of them (unset, empty, other)
+// a decode-kernel name (MAYA_GLM_EXL3_DECODE's values) -> its number; 0 for none of them (unset, empty, other)
 int decode_choice(const char* v) {
     return v == nullptr                         ? 0
            : std::strcmp(v, "legacy") == 0     ? 1
@@ -2788,10 +2788,10 @@ int decode_choice(const char* v) {
            : std::strcmp(v, "legacy-f32") == 0 ? 3
                                                : 0;
 }
-// an explicit choice for CUDA<dev>: STRATA_GLM_EXL3_DECODE<dev>, else STRATA_GLM_EXL3_DECODE (0: none)
+// an explicit choice for CUDA<dev>: MAYA_GLM_EXL3_DECODE<dev>, else MAYA_GLM_EXL3_DECODE (0: none)
 int decode_env(int dev) {
-    const int c = decode_choice(std::getenv(("STRATA_GLM_EXL3_DECODE" + std::to_string(dev)).c_str()));
-    return c != 0 ? c : decode_choice(std::getenv("STRATA_GLM_EXL3_DECODE"));
+    const int c = decode_choice(std::getenv(("MAYA_GLM_EXL3_DECODE" + std::to_string(dev)).c_str()));
+    return c != 0 ? c : decode_choice(std::getenv("MAYA_GLM_EXL3_DECODE"));
 }
 std::atomic<int> g_decode_cache[64];     // a device's kernels once asked (0: not asked)
 std::atomic<int> g_decode_default[64];   // the engine's default where no setting picks (0: by architecture)
@@ -3305,7 +3305,7 @@ static bool wmma_now() {
     return known[dev] == 2;
 #else
     // sm_7x: the Volta / Turing wmma kernels (sm_80 and later take the mma.m16n8k16 ones)
-    static const bool off = std::getenv("STRATA_EXL3_WMMA") != nullptr && std::atoi(std::getenv("STRATA_EXL3_WMMA")) == 0;
+    static const bool off = std::getenv("MAYA_EXL3_WMMA") != nullptr && std::atoi(std::getenv("MAYA_EXL3_WMMA")) == 0;
     static int known[64];
     int dev = 0;
     cudaGetDevice(&dev);

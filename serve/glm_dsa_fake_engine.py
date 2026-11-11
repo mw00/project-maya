@@ -16,7 +16,7 @@ Its answer is FAKE_ENGINE_IDS (comma-separated ids; default the bytes of "hello"
 FAKE_ENGINE_SCRIPT=<file> (a JSON list of answers, each a list of ids; read again at every GEN line): the k-th GEN
 line since the file last changed gets the k-th answer, the last one repeating - a test rewrites the file before each
 request (a tool call, then the answer after its result) and the engine keeps running.
-QUIT ends it with exit code 0; with STRATA_GLM_SLOT_KEEP=1 it first "keeps" the conversation it holds: it writes
+QUIT ends it with exit code 0; with MAYA_GLM_SLOT_KEEP=1 it first "keeps" the conversation it holds: it writes
 <FAKE_ENGINE_DIR>/kept-<pid>.json and says so in a NOTE line, as the real engine writes its slot file.
 FAKE_ENGINE_IGNORE_QUIT=1 makes it ignore QUIT (a hung engine: the server has to kill it).
 FAKE_ENGINE_GEN_LOG=<file> appends every GEN line it reads to <file> (the per-request knobs' forwarding test).
@@ -25,6 +25,9 @@ from __future__ import annotations
 
 import json
 import os
+import sys as _sys   # (an older STRATA_X counts as MAYA_X: tools/maya_names.py makes it so on import)
+_sys.path.append(os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), '../tools')))
+import maya_names  # noqa: E402,F401
 import queue
 import sys
 import threading
@@ -36,7 +39,7 @@ ram_gb = os.environ.get("FAKE_ENGINE_RAM_GB", "170.0")
 answer = [int(x) for x in os.environ.get("FAKE_ENGINE_IDS", ",".join(str(b) for b in b"hello")).split(",") if x]
 script = {"text": None, "turn": 0}               # FAKE_ENGINE_SCRIPT: the file's last text and the GEN lines since
 ignore_quit = os.environ.get("FAKE_ENGINE_IGNORE_QUIT") == "1"
-keep = os.environ.get("STRATA_GLM_SLOT_KEEP") == "1"
+keep = os.environ.get("MAYA_GLM_SLOT_KEEP") == "1"
 held: list[int] = []                              # the conversation in the "model": prompt + what it wrote
 controls: queue.Queue = queue.Queue()
 lines: queue.Queue = queue.Queue()

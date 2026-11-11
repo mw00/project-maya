@@ -20,19 +20,19 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"
-envd() { local v; v="$(printenv "$1" || true)"; echo "${v:-$2}"; }   # an env switch with its default
-IK_SRC_DEFAULT="$(envd "STRATA_IK_SRC" "$HOME/ik_llama.cpp")"
-IK_BUILD_DEFAULT="$(envd "STRATA_IK_BUILD" "$HOME/ik-build")"
-JOBS_DEFAULT="$(envd "STRATA_JOBS" 2)"
-PY="${STRATA_PYTHON:-python3}"
+envd() { local v; v="$(printenv "$1" || printenv "STRATA_${1#MAYA_}" || true)"; echo "${v:-$2}"; }   # an env switch with its default (MAYA_X first, the old STRATA_X after)
+IK_SRC_DEFAULT="$(envd "MAYA_IK_SRC" "$HOME/ik_llama.cpp")"
+IK_BUILD_DEFAULT="$(envd "MAYA_IK_BUILD" "$HOME/ik-build")"
+JOBS_DEFAULT="$(envd "MAYA_JOBS" 2)"
+PY="${MAYA_PYTHON:-${STRATA_PYTHON:-python3}}"
 
 usage() {
     cat <<'EOF'
 usage: tools/strata/ik_oracle.sh <command> [options]
 
   build [--src DIR] [--build DIR] [--cuda] [--copy] [--jobs N]
-        Configure and build ik_llama.cpp out of tree (default src $STRATA_IK_SRC or ~/ik_llama.cpp, build
-        $STRATA_IK_BUILD or ~/ik-build) with the flags for GLM-5.x DSA on the test PC:
+        Configure and build ik_llama.cpp out of tree (default src $MAYA_IK_SRC or ~/ik_llama.cpp, build
+        $MAYA_IK_BUILD or ~/ik-build) with the flags for GLM-5.x DSA on the test PC:
           CPU   -DGGML_NATIVE=OFF -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON -DGGML_AVX512=ON
                 (Skylake-SP: AVX-512 F/CD/BW/DQ/VL, no VNNI, no VBMI: GGML_AVX512_VNNI/VBMI stay OFF)
                 -DGGML_IQK_MUL_MAT=ON -DBUILD_SHARED_LIBS=OFF -DLLAMA_CURL=OFF -DLLAMA_BUILD_EXAMPLES=ON
@@ -74,14 +74,14 @@ Known ik_llama.cpp deviations for glm-dsa and how to neutralize them (research/i
 |----------------------------|--------------------------------------|-------------------------------|----------------------------------------------|
 | attention sink boost       | +1e20 on each sequence's first       | none                          | DSA_SINK=0 (this script's default; --sink    |
 |                            | present token, on by default         |                               | keeps it)                                    |
-| indexer LayerNorm eps      | 1e-5 (mirrors the RMS eps;           | HF 1e-6, mainline 0           | on the glm-dsa side: STRATA_GLM_IDX_LN_EPS=1e-5|
+| indexer LayerNorm eps      | 1e-5 (mirrors the RMS eps;           | HF 1e-6, mainline 0           | on the glm-dsa side: MAYA_GLM_IDX_LN_EPS=1e-5|
 |                            | llama-hparams.cpp:2106-2113)         |                               | (engine), ref/glm_dsa.py --idx-ln-eps 1e-5   |
 | full-indexer layer pattern | hard-coded il <= 1 or il % 4 == 2;   | GGUF attention.indexer.types  | compare only where they agree: check-pattern |
 |                            | GGUF indexer.types ignored           |                               | (GLM-5.3 real file: 21 full layers, agrees)  |
 | MLA K cache row            | [k_pe 64 | c_kv 512]                 | [c_kv 512 | k_pe 64]          | remap-kv on cache dumps / seam bisects       |
 | CUDA indexer scores        | cuBLAS COMPUTE_16F, f16 output       | f32                           | --ngl 0 (CPU), or expect near-tie set flips  |
 | indexer q / k Hadamard     | on (DSA_HADAMARD_DISABLE=1 off)      | glm-dsa off by default         | score-preserving; glm-dsa's B14.11            |
-|                            |                                      |                               | STRATA_GLM_IDX_HADAMARD=1 stores the same    |
+|                            |                                      |                               | MAYA_GLM_IDX_HADAMARD=1 stores the same    |
 |                            |                                      |                               | rotated FP16 keys; --hadamard-off for ik     |
 | Q8_K block layout          | extra float sum field                | none                          | never mix ik and mainline Q8_K buffers       |
 | published DSA vs dense PPL | measured before the RoPE fix 96472464| n/a                           | do not use as targets                        |
@@ -111,7 +111,7 @@ cmd_build() {
             *) die "build: unknown option $1" ;;
         esac
     done
-    [[ -f "$src/include/llama.h" ]] || die "no ik_llama.cpp source at $src (set --src or STRATA_IK_SRC)"
+    [[ -f "$src/include/llama.h" ]] || die "no ik_llama.cpp source at $src (set --src or MAYA_IK_SRC)"
     mkdir -p "$build"
     if [[ $copy == 1 ]]; then
         rsync -a --delete --exclude .git "$src/" "$build/src/"
@@ -187,7 +187,7 @@ cmd_logits() {
     env "${envs[@]}" "$bin" "$model" "$out" $ids
     cat <<EOF
 ik_oracle: compare with glm-dsa / the oracle under matching settings:
-  engine   STRATA_GLM_IDX_LN_EPS=1e-5$( [[ $dense == 1 ]] && echo ' STRATA_GLM_DSA_DENSE=1' )$( [[ $hoff == 0 ]] && echo ' (optional: STRATA_GLM_IDX_HADAMARD=1 stores the keys as ik does)' )
+  engine   MAYA_GLM_IDX_LN_EPS=1e-5$( [[ $dense == 1 ]] && echo ' MAYA_GLM_DSA_DENSE=1' )$( [[ $hoff == 0 ]] && echo ' (optional: MAYA_GLM_IDX_HADAMARD=1 stores the keys as ik does)' )
   oracle   python3 ref/glm_dsa.py $model --mode llama --idx-ln-eps 1e-5 --tokens <same> --logits-out ref.f32
   pattern  tools/strata/ik_oracle.sh check-pattern $model   (ik's numbers compare only when it agrees)
 EOF
@@ -308,7 +308,7 @@ sys.exit(0 if (b[:, :512] == a[:, 64:]).all() and (b[:, 512:] == a[:, :64]).all(
             echo "FAIL ik_dsa_logits.cpp against $src"; fail=1
         fi
     else
-        echo "skip the dumper's compile check (no ik_llama.cpp at $src; set STRATA_IK_SRC)"
+        echo "skip the dumper's compile check (no ik_llama.cpp at $src; set MAYA_IK_SRC)"
     fi
     [[ $fail == 0 ]] || exit 1
     [[ $checked -gt 0 ]] || exit 77

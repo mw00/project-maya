@@ -17,7 +17,7 @@ namespace strata::core::glmpfs {
 
 bool stream_on(bool dsa) {
     if (!dsa) return false;
-    return strata::glmenv::env_flag("STRATA_GLM_PREFILL_STREAM", true);
+    return strata::glmenv::env_flag("MAYA_GLM_PREFILL_STREAM", true);
 }
 
 bool split_prestage(bool dsa, int n_parts) { return n_parts > 1 && stream_on(dsa); }
@@ -42,11 +42,11 @@ int staging_node(int gpu_node, int n_nodes, const char* env) {
 bool prestage_skip(bool dsa, double pred_rows, double copy_ms, double ps_ms, double p_ms, double c_ms, double row_ms,
                    bool lane_ok) {
     if (!dsa || !lane_ok || !(c_ms > 0.0)) return false;
-    if (const char* v = getenv("STRATA_GLM_PREFILL_CPU"); v != nullptr && std::atoi(v) == 0) return false;
+    if (const char* v = getenv("MAYA_GLM_PREFILL_CPU"); v != nullptr && std::atoi(v) == 0) return false;
     const double up = copy_ms > 0.0 ? copy_ms : ps_ms > 0.0 ? ps_ms : p_ms;   // (the plan's p_ms)
     // the plan's test: lane_first(rows, p_ms, 2 x c_ms, row_ms) = rows < upload_rows_min_measured(...)
-    // the plan's row cost: STRATA_GLM_PREFILL_CPU_ROW_MS overrides the learned one there, so it does here
-    if (const char* v = getenv("STRATA_GLM_PREFILL_CPU_ROW_MS"); v != nullptr) row_ms = std::atof(v);
+    // the plan's row cost: MAYA_GLM_PREFILL_CPU_ROW_MS overrides the learned one there, so it does here
+    if (const char* v = getenv("MAYA_GLM_PREFILL_CPU_ROW_MS"); v != nullptr) row_ms = std::atof(v);
     const int rows_min = glmd::upload_rows_min_measured(up, 2.0 * c_ms, row_ms);
     return pred_rows < (double) rows_min;
 }

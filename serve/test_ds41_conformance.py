@@ -74,15 +74,15 @@ class Rendering(_CleanToolOrders):
 
     def render_with_setting(self, setting, messages, **options):
         """A render with MAYA_DS4_KEEP_THINKING as a shell or the config's env sets it (`None`: unset)."""
-        saved = os.environ.pop("STRATA_DS4_KEEP_THINKING", None)
+        saved = os.environ.pop("MAYA_DS4_KEEP_THINKING", None)
         try:
             if setting is not None:
-                os.environ["STRATA_DS4_KEEP_THINKING"] = setting
+                os.environ["MAYA_DS4_KEEP_THINKING"] = setting
             return self.render(messages, **options)
         finally:
-            os.environ.pop("STRATA_DS4_KEEP_THINKING", None)
+            os.environ.pop("MAYA_DS4_KEEP_THINKING", None)
             if saved is not None:
-                os.environ["STRATA_DS4_KEEP_THINKING"] = saved
+                os.environ["MAYA_DS4_KEEP_THINKING"] = saved
 
     def test_official_golden_fixtures_byte_for_byte(self):
         for number in range(1, 6):

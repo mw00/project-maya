@@ -4,8 +4,8 @@ pack (tools/strata/maya_sync.py, tools/strata/glm_dsa_profile.py, maya.py's hook
 
     python3 tools/strata/test_glm_dsa_profile.py
 
-With STRATA_MAYA_SYNC_BIN=<build>/glm_maya_sync_test (ctest sets it) the engine's own reader (read_expert_profile)
-reads the profile this tool writes, at the glm-dsa layout.
+With MAYA_SYNC_BIN=<build>/glm_maya_sync_test (ctest sets it) the engine's own reader (read_expert_profile)
+reads the profile this tool writes, at the glm-dsa layout (the older name STRATA_MAYA_SYNC_BIN still counts).
 """
 from __future__ import annotations
 
@@ -128,7 +128,7 @@ class ProfileToolTests(unittest.TestCase):
         lead_pos = [i for i, p in enumerate(ranked) if p[0] < LEAD]
         self.assertEqual(min(lead_pos), 79 * 256 - LEAD * 256, "the dense lead's pairs last")
         self.assertNotIn((90, 1), ranked, "a layer past the layout is dropped")
-        bin_ = os.environ.get("STRATA_MAYA_SYNC_BIN")
+        bin_ = os.environ.get("MAYA_SYNC_BIN") or os.environ.get("STRATA_MAYA_SYNC_BIN")
         if bin_:
             r = subprocess.run([bin_, str(out), "79", "256"], capture_output=True, text=True)
             self.assertEqual(r.returncode, 0, r.stderr + r.stdout)

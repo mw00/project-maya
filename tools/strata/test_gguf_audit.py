@@ -23,7 +23,7 @@ sys.path.insert(0, str(HERE.parent))
 import gguf_audit as ga  # noqa: E402
 
 try:
-    import _paths  # noqa: E402  (tools/_paths.py: STRATA_GGUF_PY, third_party/llama.cpp/gguf-py)
+    import _paths  # noqa: E402  (tools/_paths.py: MAYA_GGUF_PY, third_party/llama.cpp/gguf-py)
     with contextlib.suppress(SystemExit):
         _paths.add_gguf_py()
     import numpy as np
@@ -374,7 +374,7 @@ class AuditTest(unittest.TestCase):
         txt = "\n".join(a9.notes)
         self.assertIn("experts: IQ2_XXS 2.06 bpw, IQ3_XXS 3.06 bpw", txt)
         self.assertIn("nextn: Q8_0 8.50 bpw", txt)
-        self.assertIn("STRATA_GLM_MTP_GGUF", txt)
+        self.assertIn("MAYA_GLM_MTP_GGUF", txt)
         self.assertIn("extract_mtp_block.py", txt)
         # a Q4_K-or-better block (the remedy's donor) passes A9
         good = self.build(self.mut_types(lambda n: n.startswith("blk.78.") and n.endswith("_exps.weight"), T["Q4_K"]))

@@ -408,7 +408,7 @@ bool idx_wmma_enabled() {
 #if defined(STRATA_USE_HIP)
     return false;   // the WMMA scorer is a CUDA kernel: HIP builds score with the CUDA-core one
 #else
-    static const bool on = env_on("STRATA_GLMD_IDX_WMMA");
+    static const bool on = env_on("MAYA_GLMD_IDX_WMMA");
     return on;
 #endif
 }

@@ -19,7 +19,7 @@ way Maya is used, and only the sustained speed counts:
   - DFlash2 is kept only when it beats the other side by more than MIN_GAIN: a tie keeps the MTP block.
 
 The engine works on a copy of this PC's expert usage file (calibrate_glm.usage_copy), writes no learned expert profile
-or routing trace (calibrate_glm.without_writes) and keeps no conversations aside (STRATA_GLM_SLOTS=0): the
+or routing trace (calibrate_glm.without_writes) and keeps no conversations aside (MAYA_GLM_SLOTS=0): the
 calibration's answers neither lead the next start's warm-up nor take the place of this PC's kept conversations.
 
     python tools/calibrate_draft.py maya-<model>.json     # measure and print; ./maya.sh --speed-calibration applies it
@@ -174,7 +174,7 @@ def run(other: dict, dflash: dict, say=print, start_engine=None, other_label: st
     """Both sides measured, `other` (the config without DFlash2) first: {"other": {...}, "dflash2": {...},
     "keep": "dflash2" or "other", "gain": DFlash2's speed over the other's - 1}.  `start_engine(cfg)` returns a
     started engine (serve.server.StrataEngine, or a stand-in in tests); `draft_label` names the drafting side (GLM-5.3's
-    one-GPU drafting: the same two sides, its STRATA_GLM_MTP_DECODE off and on); `size` makes it a short probe
+    one-GPU drafting: the same two sides, its MAYA_GLM_MTP_DECODE off and on); `size` makes it a short probe
     ({"doc" or "mixed", "tokens", "answer", "warm"}: measure's; "mixed": the MIXED requests).  Raises when a side could
     not be measured."""
     if start_engine is None:
@@ -192,10 +192,10 @@ def run(other: dict, dflash: dict, say=print, start_engine=None, other_label: st
         for i, (key, cfg, label) in enumerate((("other", other, other_label), ("dflash2", dflash, draft_label))):
             if i == 1:
                 say(f"  (the first side took {(time.time() - t0) / 60.0:.0f} min: about as long again for {draft_label})")
-            # (no conversations kept aside: with STRATA_GLM_SLOT_KEEP the calibration's would push out this PC's own;
+            # (no conversations kept aside: with MAYA_GLM_SLOT_KEEP the calibration's would push out this PC's own;
             # and no learned expert profile or routing trace written: its answers are not this PC's use)
             c = {**cfg, "args": CAL.without_writes(list(cfg.get("args") or [])),
-                 "env": {**(cfg.get("env") or {}), **CAL.usage_copy(cfg, Path(tmp)), "STRATA_GLM_SLOTS": "0"}}
+                 "env": {**(cfg.get("env") or {}), **CAL.usage_copy(cfg, Path(tmp)), "MAYA_GLM_SLOTS": "0"}}
             res[key] = measure(c, label, warm, questions, n_doc, start_engine, say, f"[{i + 1}/2] ", size)
     for key in ("other", "dflash2"):
         if res[key]["tokens"] < (size or {}).get("tokens", MIN_TOKENS) // 2:

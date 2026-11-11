@@ -4,7 +4,7 @@
 //   1. pricing: hand-computed H / T / hit / miss / step for a 3-part split at head {0} and {0,1}; the shared CPU-lane
 //      pool term (head + tail lane work serialised); the priced choice follows the part costs (a slow last part
 //      picks head {0,1}, a slow part 0 picks head {0}, an even split prefers {0,1} at 80% acceptance); acceptance 1
-//      makes the step the slower group, 0 the sum (no gain); with STRATA_GLM_SPEC_DRAFT_EARLY's pricing a miss is the
+//      makes the step the slower group, 0 the sum (no gain); with MAYA_GLM_SPEC_DRAFT_EARLY's pricing a miss is the
 //      hit step plus the head's redo (2H once the head is slower; unchanged while H <= T), which turns the choice of
 //      a 10 / 10 / 11 split from {0,1} to {0};
 //   2. the head rule: Flash keeps Maya's n / 2 and atoi(env) (also for "auto"); glm-dsa takes the recorded price when
@@ -116,7 +116,7 @@ void test_price() {
 }
 
 void test_price_redo() {
-    std::printf("[pricing: a miss waits for the head's rejected speculation (STRATA_GLM_SPEC_DRAFT_EARLY)]\n");
+    std::printf("[pricing: a miss waits for the head's rejected speculation (MAYA_GLM_SPEC_DRAFT_EARLY)]\n");
     // parts 10 / 10 / 11, hop 0: head {0} is H 10 vs T 21, head {0,1} H 20 vs T 11
     std::vector<gs::PartCost> f = {{0, 10.0, 0.0, 0}, {1, 10.0, 0.0, 1}, {2, 11.0, 0.0, 2}};
     const gs::SpecPrice a0 = gs::spec_price(f, 1, 0.8, 0.0), a1 = gs::spec_price(f, 1, 0.8, 0.0, true);
@@ -137,16 +137,16 @@ void test_price_redo() {
           "a lane-bound shared pool: miss = hit 27 + H 20 = 47 (default T + H = 32, below the hit step)");
     // the switch reaches the split search's price (hop 0.05 there; spec_accept_assumed 0.8)
     gs::spec_clear_prices();
-    unsetenv("STRATA_GLM_SPEC_DRAFT_EARLY");
+    unsetenv("MAYA_GLM_SPEC_DRAFT_EARLY");
     const bool off = !gs::spec_draft_early();
     const int h0 = gs::spec_record_prices(f, false);
-    setenv("STRATA_GLM_SPEC_DRAFT_EARLY", "1", 1);
+    setenv("MAYA_GLM_SPEC_DRAFT_EARLY", "1", 1);
     const bool on = gs::spec_draft_early();
     const int h1 = gs::spec_record_prices(f, false);
-    unsetenv("STRATA_GLM_SPEC_DRAFT_EARLY");
+    unsetenv("MAYA_GLM_SPEC_DRAFT_EARLY");
     gs::spec_clear_prices();
     check(off && on && h0 == 2 && h1 == 1,
-          "STRATA_GLM_SPEC_DRAFT_EARLY unset: the priced head is {0,1}; =1: {0} (read at each call)");
+          "MAYA_GLM_SPEC_DRAFT_EARLY unset: the priced head is {0,1}; =1: {0} (read at each call)");
 }
 
 void test_head_rule() {
@@ -166,7 +166,7 @@ void test_head_rule() {
     check(gs::spec_head_parts(3, nullptr, true) == 2 && gs::spec_head_parts(3, "auto", true) == 2,
           "glm-dsa unset / auto: the priced head {0,1}");
     check(gs::spec_head_parts(3, "1", true) == 1 && gs::spec_head_parts(3, "2", true) == 2,
-          "glm-dsa STRATA_GLM_SPEC_HEAD=1 / 2: the A/B override");
+          "glm-dsa MAYA_GLM_SPEC_HEAD=1 / 2: the A/B override");
     check(gs::spec_head_parts(3, nullptr, false) == 1, "Flash ignores the glm-dsa price");
     gs::spec_clear_prices();
 }
@@ -210,12 +210,12 @@ void test_tuner() {
     const gs::HeadTuner st = gs::tuner_state();
     check(st.tokens[1] == w && st.tokens[2] == w, "both heads measured over the window");
     check(gs::spec_head_parts(3, "1", true) == 1 && gs::spec_head_parts(3, "2", true) == 2,
-          "STRATA_GLM_SPEC_HEAD=<n> pins a head over the tuner");
+          "MAYA_GLM_SPEC_HEAD=<n> pins a head over the tuner");
     check(gs::spec_head_parts(3, nullptr, false) == 1, "Flash never tunes");
     gs::tuner_reset();
 }
 
-// S3: "no drafting" as the tuner's candidate 0 (STRATA_GLM_SPEC_TUNE_PLAIN=1; ctest runs this file with and without)
+// S3: "no drafting" as the tuner's candidate 0 (MAYA_GLM_SPEC_TUNE_PLAIN=1; ctest runs this file with and without)
 void test_tuner_plain() {
     std::printf("[head tuner: no drafting as a candidate]\n");
     gs::HeadTuner t;
@@ -251,7 +251,7 @@ void test_tuner_plain() {
         gs::tune_begin();
         (void) gs::spec_head_parts(3, nullptr, true);
         gs::tune_end(w);
-        check(!gs::tune_plain_turn(3, nullptr) && !gs::tuner_state().plain, "STRATA_GLM_SPEC_TUNE_PLAIN unset: never plain");
+        check(!gs::tune_plain_turn(3, nullptr) && !gs::tuner_state().plain, "MAYA_GLM_SPEC_TUNE_PLAIN unset: never plain");
         gs::tuner_reset();
         return;
     }
@@ -311,7 +311,7 @@ void test_rows() {
                  {"head {[0,26)} FP16 keys", 0, 26, GlmStateMode::Fp16, true},
                  {"tail with NextN [54,78)+78", 54, 78, GlmStateMode::Fp16, false}};
     for (const Case& c : cases) {
-        if (c.fp16_keys) setenv("STRATA_GLM_IDX_FP16", "1", 1); else unsetenv("STRATA_GLM_IDX_FP16");
+        if (c.fp16_keys) setenv("MAYA_GLM_IDX_FP16", "1", 1); else unsetenv("MAYA_GLM_IDX_FP16");
         GlmStateLayout lay;
         std::string err;
         const int mtp = c.l1 == 78 ? 78 : -1;
@@ -357,7 +357,7 @@ void test_rows() {
             check(lay.lat_pp * 4 == 544, std::string(c.name) + ": an INT8 latent row is one 544 B record");
         check(gs::spec_rows(lay, -1).empty() && gs::spec_rows(lay, ctx).empty(), std::string(c.name) + ": outside the context: none");
     }
-    unsetenv("STRATA_GLM_IDX_FP16");
+    unsetenv("MAYA_GLM_IDX_FP16");
 }
 
 }  // namespace

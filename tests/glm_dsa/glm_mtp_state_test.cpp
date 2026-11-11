@@ -9,7 +9,7 @@
 //   2. reset at pos 0 (#28333): a prompt whose last row reaches the draft without a token-path note (the batched
 //      prompt path) drafts from zeros exactly like a fresh process, even when the previous request had the same
 //      length (the position check alone would accept its row); legacy differs;
-//   3. two interleaved sequences (STRATA_GLM_SEQS): each drafts from its own carrier; legacy differs;
+//   3. two interleaved sequences (MAYA_GLM_SEQS): each drafts from its own carrier; legacy differs;
 //   4. snapshot round trip: the first draft after snapshot_restore equals the one at the snapshot;
 //   5. the MTP1 trailer: round trip; truncated, wrong magic / width / block / position / checksum are refused and
 //      leave the state untouched; a slot written before B15.3 (no trailer) reads as Absent;
@@ -253,7 +253,7 @@ void test_reset_pos0() {
 }
 
 void test_two_sequences() {
-    std::printf("[3. two interleaved sequences (STRATA_GLM_SEQS)]\n");
+    std::printf("[3. two interleaved sequences (MAYA_GLM_SEQS)]\n");
     for (int legacy = 0; legacy < 2; ++legacy) {
         int ya = 0, yb = 0;
         int want_a = 0, want_b = 0;
@@ -416,7 +416,7 @@ void test_block_id() {
                    id = glmmtp::block_id(a, "gguf:mtp.gguf:123");
     check(ia == ib, "order-independent");
     check(ia != ic, "another tensor type, another id");
-    check(ia != id, "another source (STRATA_GLM_MTP_GGUF), another id");
+    check(ia != id, "another source (MAYA_GLM_MTP_GGUF), another id");
     check(ia != 0 && ia <= 0x7fffffffu && glmmtp::block_id({}, "") != 0, "never 0, 31 bits");
     check(glmmtp::fp_block_word(ia) == (int32_t) ia && glmmtp::fp_carrier_word(true, ia, 6144) == 24576 &&
               glmmtp::fp_carrier_word(true, 0, 6144) == 0 && glmmtp::fp_carrier_word(false, ia, 6144) == 0,

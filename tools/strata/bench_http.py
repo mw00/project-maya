@@ -14,7 +14,7 @@ Two APIs:
 * `--api openai` (glm-dsa/Maya `serve/server.py`, which returns the same `timings` names): the prompt goes as one
   user message with thinking off; it is cut to length with the pack tokenizer when `--tokenizer <pack>/tokenizer`
   is given, else by characters (calibrated on the warm-up's `usage.prompt_tokens`).  Start the engine with
-  `STRATA_GLM_NO_REUSE=1` for cold prefill numbers.  `--tune '<json object>'` sends it as every request's
+  `MAYA_GLM_NO_REUSE=1` for cold prefill numbers.  `--tune '<json object>'` sends it as every request's
   `strata_tune` (the engine knobs one request may set without a restart, serve/glm_dsa_tune.py), for example
   `--tune '{"cpu_threads": 36, "pcie_frac": 0.21}'` or `--tune '{"spec": 1}'` (the token-by-token decode).
 

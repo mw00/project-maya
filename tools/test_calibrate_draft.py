@@ -41,7 +41,7 @@ def fake_requests(cfg):
     return [7, 7, 7], [[i, i] for i in range(len(CD.QUESTIONS))], 8000
 
 
-BASE = {"args": ["--glm-pack", "pack", "--max-context", "32768"], "env": {"STRATA_GLM_USAGE": "0"},
+BASE = {"args": ["--glm-pack", "pack", "--max-context", "32768"], "env": {"MAYA_GLM_USAGE": "0"},
         "sampling": {"temperature": 1.0, "top_p": 0.95}}
 
 
@@ -115,8 +115,8 @@ class Measure(unittest.TestCase):
     def test_each_side_keeps_this_pcs_usage_untouched(self):
         _, eng = calibrate(20.0, 30.0)
         for side in ("other", "dflash2"):
-            self.assertEqual(eng[side + "_env"]["STRATA_GLM_USAGE"], "0")   # (usage_copy: "0" stays "0")
-            self.assertEqual(eng[side + "_env"]["STRATA_GLM_SLOTS"], "0")   # no conversations kept aside
+            self.assertEqual(eng[side + "_env"]["MAYA_GLM_USAGE"], "0")   # (usage_copy: "0" stays "0")
+            self.assertEqual(eng[side + "_env"]["MAYA_GLM_SLOTS"], "0")   # no conversations kept aside
 
     def test_no_learned_profile_or_trace_is_written(self):
         base = {**BASE, "args": BASE["args"] + ["--expert-profile", "p.bin", "--expert-profile-save", "learned.bin",

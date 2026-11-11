@@ -3,7 +3,7 @@
 // read their own); the L1-4 kernels against a double-precision reference (the gate) and against the kernels they
 // replace (time).  A HIP build runs it all but the fused attention (nvcuda::wmma, CUDA's): the GEMV part (mv_dsa
 // against gf::mv: the bits, and the time that picks the device's default) and the attention part (mla_dec against
-// mla2's own kernels where the device takes it - glmd_dec.cu's policy; STRATA_GLMD_MLA_DEC=1 forces it to measure an
+// mla2's own kernels where the device takes it - glmd_dec.cu's policy; MAYA_GLMD_MLA_DEC=1 forces it to measure an
 // AMD arch it is off on).
 //
 //   glmd_dec_bench [reps]      (default 40; exits 77 without a GPU)
@@ -260,7 +260,7 @@ int main(int argc, char** argv) {
     };
     // gf::mv (as before) against gf::mv_dsa (L1-4) in each shape: the outputs bit for bit, and the time.  auto = the
     // device's default (kMvDsaAuto: gf::mv alone where it is off), 1 = one launch of every job it takes, NR4 = 4-row
-    // warps, typed = a launch a type, on = kMvDsaOn (the default's shape on any device: STRATA_GLMD_MV_DSA=1)
+    // warps, typed = a launch a type, on = kMvDsaOn (the default's shape on any device: MAYA_GLMD_MV_DSA=1)
     static int s_cfg = 0;
     const Fn dsa = [](const gf::MvJob* j, int n, cudaStream_t st) { return gf::mv_dsa(j, n, st, s_cfg); };
     const int cfgs[] = {gf::kMvDsaAuto, 1, 2, 3, gf::kMvDsaOn, 5};
@@ -371,7 +371,7 @@ int main(int argc, char** argv) {
     // mla2 (k_b absorb, the attention over n_sel cells, v_b) - BF16 (pack) and Q8_0 (native) W_kb / W_vb
     std::printf("\nmla_dec on this device: %s\n",
                 glmd::mla_dec_ok(NH, KVL, 64) ? "yes (new = mla_dec)"
-                                              : "no (new = old: mla2's kernels; STRATA_GLMD_MLA_DEC=1 forces it)");
+                                              : "no (new = old: mla2's kernels; MAYA_GLMD_MLA_DEC=1 forces it)");
     {
         const int max_ctx = 4096;
         Mat kb16 = make_mat(gf::kTypeBF16, 192, NH * KVL, 99), vb16 = make_mat(gf::kTypeBF16, KVL, NH * VH, 98);
@@ -504,7 +504,7 @@ int main(int argc, char** argv) {
         CK(cudaFree(out2));
         CK(cudaFree(n_dev));
         CK(cudaFree(lat8));
-#if !defined(STRATA_USE_HIP)   // the fused attention (STRATA_GLMD_FUSED_MLA, off by default; nvcuda::wmma) for comparison
+#if !defined(STRATA_USE_HIP)   // the fused attention (MAYA_GLMD_FUSED_MLA, off by default; nvcuda::wmma) for comparison
         {
             const size_t fwb = glmd::mla_fused_work_bytes(NH, KVL, 64, max_ctx);
             void* fwork = nullptr;

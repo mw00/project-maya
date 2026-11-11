@@ -28,9 +28,9 @@ std::unordered_map<const void*, std::vector<int32_t>>& registry() {
 NgramConfig ngram_config_env() {
     NgramConfig c;
     // a request's GEN ngram= (the speed plan's knobs, glm_req_knobs.hpp) wins over the switch for that request
-    c.on = glmknob::get(glmknob::Ngram, strata::glmenv::env_flag("STRATA_GLM_NGRAM_DRAFT", false) ? 1 : 0) != 0;
-    c.n_max = env_int("STRATA_GLM_NGRAM_MAX", 4, 1, kMaxDraft);
-    c.min_match = env_int("STRATA_GLM_NGRAM_MIN", 3, 1, 16);
+    c.on = glmknob::get(glmknob::Ngram, strata::glmenv::env_flag("MAYA_GLM_NGRAM_DRAFT", false) ? 1 : 0) != 0;
+    c.n_max = env_int("MAYA_GLM_NGRAM_MAX", 4, 1, kMaxDraft);
+    c.min_match = env_int("MAYA_GLM_NGRAM_MIN", 3, 1, 16);
     c.max_match = std::max(c.max_match, c.min_match);
     return c;
 }

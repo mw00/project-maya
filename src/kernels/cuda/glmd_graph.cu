@@ -26,7 +26,7 @@ bool set_dev_pos(DevPos* dev, int p, int top_k, void* stream) {
 
 bool dsa_graphs_enabled() {
     static const bool on = [] {
-        return strata::glmenv::env_flag("STRATA_GLM_DSA_GRAPHS", false);
+        return strata::glmenv::env_flag("MAYA_GLM_DSA_GRAPHS", false);
     }();
     return on;
 }

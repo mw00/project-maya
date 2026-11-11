@@ -20,7 +20,7 @@
 // its architecture: on x86-64 the kernels, glm_lane_row4_avx2.cpp, run only after its CPUID check for AVX2 + FMA +
 // F16C).  The kernels are x86-64 only (the CMake option STRATA_GLM_LANE_ROW4_KERNELS, ON by default).  Without them -
 // aarch64 (DGX Spark / Grace), ppc64le (IBM AC922), or the option OFF - row4_supported() is false for every type,
-// row4_iq1s_form() is -1, lane_row4_on() is false whatever STRATA_GLM_LANE_ROW4 says, lane_row4_types() is 0 and both
+// row4_iq1s_form() is -1, lane_row4_on() is false whatever MAYA_GLM_LANE_ROW4 says, lane_row4_types() is 0 and both
 // hooks return false (row4_dot / row4_rows, which require row4_supported(), abort).
 #pragma once
 
@@ -47,7 +47,7 @@ void row4_dot(int ggml_type, int n, const uint8_t* const w[4], const void* q8, f
 /// (r1 - r0) % 4 rows left over through ggml-cpu's vec_dot.  Requires row4_supported(type).
 void row4_rows(int ggml_type, int n, const uint8_t* w, size_t row_bytes, const void* q8, float* out, int r0, int r1);
 
-/// STRATA_GLM_LANE_ROW4=0 turns the lane hooks off (default on).  lane_row4_override(-1) = follow the env,
+/// MAYA_GLM_LANE_ROW4=0 turns the lane hooks off (default on).  lane_row4_override(-1) = follow the env,
 /// 0 = off, 1 = on (tests and the bench compare both in one process); it leaves lane_row4_set's type mask as it is.
 bool lane_row4_on();
 void lane_row4_override(int mode) noexcept;
@@ -57,7 +57,7 @@ inline constexpr uint32_t kRow4AllTypes = 0xFFFFFFFFu;
 inline constexpr uint32_t row4_type_bit(int ggml_type) { return 1u << ggml_type; }
 
 /// Run-time switch for the engine's per-request knobs (an A/B without a restart; set it between requests: relaxed
-/// atomics, and every setting is bit-identical anyway): mode -1 = back to STRATA_GLM_LANE_ROW4, 0 = off, 1 = on, and
+/// atomics, and every setting is bit-identical anyway): mode -1 = back to MAYA_GLM_LANE_ROW4, 0 = off, 1 = on, and
 /// `types` = the ggml types the hooks may take (row4_type_bit; a type without a kernel stays on ggml's loop).
 /// lane_row4_set(-1) restores the start state; lane_row4_set(1, kRow4AllTypes & ~(row4_type_bit(19) |
 /// row4_type_bit(23))) is row4 without the IQ1_S / IQ4_XS kernels.  lane_row4_types() reads the mask back.

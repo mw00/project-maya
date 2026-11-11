@@ -262,11 +262,11 @@ struct DevCfg {
     bool on = false;
 };
 
-// The device's default (STRATA_GLMD_MLA_DEC unset or auto).  A CUDA build: wherever it fits (L1-4's default,
+// The device's default (MAYA_GLMD_MLA_DEC unset or auto).  A CUDA build: wherever it fits (L1-4's default,
 // unchanged).  A HIP build: only on the archs where it was measured faster than mla2's own kernels, in the bench and in
 // GLM-5.3's decode - gfx1151 (Radeon 8060S / 8065S, Strix / Gorgon Halo; SUN-NOTES S7b) - and mla2's kernels on every
 // other AMD arch until someone measures it there (it builds and fits on all of them: 55 KB of LDS a block).
-// STRATA_GLMD_MLA_DEC=1 takes it on any device it fits; =0 keeps mla2's kernels everywhere (decode_mla's legacy_attn).
+// MAYA_GLMD_MLA_DEC=1 takes it on any device it fits; =0 keeps mla2's kernels everywhere (decode_mla's legacy_attn).
 bool auto_device(int dev) {
 #if defined(STRATA_USE_HIP)
     hipDeviceProp_t prop{};
@@ -312,7 +312,7 @@ const DevCfg& dev_cfg() {
         }
         cudaGetLastError();
     }
-    const int sw = strata::glmenv::parse(std::getenv("STRATA_GLMD_MLA_DEC"));
+    const int sw = strata::glmenv::parse(std::getenv("MAYA_GLMD_MLA_DEC"));
     c.on = c.hpw > 0 && (sw == strata::glmenv::kOn || auto_device(dev));
     return c;
 }

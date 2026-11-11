@@ -222,13 +222,13 @@ void reconstruct_inner(const Mat& m, uint16_t* dst, cudaStream_t s);
 void rows_f16(const float* x, int ldx, const int* idx, int nrows, int ncols, uint16_t* out, cudaStream_t s);
 
 /// Whether the current device runs v1.1.8's decode kernels (NVIDIA before sm_80) with the weights decoded in F32
-/// instead of FP16: STRATA_GLM_EXL3_DECODE=legacy-f32 (every GPU) or STRATA_GLM_EXL3_DECODE<n>=legacy-f32 (CUDA<n>
+/// instead of FP16: MAYA_GLM_EXL3_DECODE=legacy-f32 (every GPU) or MAYA_GLM_EXL3_DECODE<n>=legacy-f32 (CUDA<n>
 /// alone, over the first) on an sm_6x GPU; never by default, except where the engine asks for it (prefer_legacy_f32).
 /// For Pascal, whose FP16 runs at 1/64 of its F32 rate; the same values bit for bit.  Those kernels are built for sm_6x
 /// only: sm_70 and newer take v1.1.8's FP16 decode under that setting (false there).
 bool legacy_f32();
 /// The engine's own default for CUDA<dev> (an EXL3 expert helper on Pascal): legacy-f32 where neither
-/// STRATA_GLM_EXL3_DECODE<dev> nor STRATA_GLM_EXL3_DECODE names the device's kernels.  The choice is made once a device,
+/// MAYA_GLM_EXL3_DECODE<dev> nor MAYA_GLM_EXL3_DECODE names the device's kernels.  The choice is made once a device,
 /// at its first EXL3 call: call this before it.  Returns whether CUDA<dev> now decodes so (false on HIP and on
 /// sm_70 and newer, where legacy-f32 is not built).
 bool prefer_legacy_f32(int dev);

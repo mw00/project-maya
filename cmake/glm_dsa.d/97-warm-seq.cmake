@@ -1,5 +1,5 @@
-# glm-dsa B8.1 (warm): the load-time expert warm-up in file order (STRATA_GLM_WARM_SEQ, on for glm-dsa) and the
-# digest of what it loaded (STRATA_GLM_WARM_SUM).
+# glm-dsa B8.1 (warm): the load-time expert warm-up in file order (MAYA_GLM_WARM_SEQ, on for glm-dsa) and the
+# digest of what it loaded (MAYA_GLM_WARM_SUM).
 #
 # glm_warm_seq.cpp is plain C++ (the switches, the file order, the run count, the counters); glm_warm_seq_model.cu the
 # engine side (the parts' turn on the disk, the digests).  Maya-owned glm_fast_path.cu calls both from fast_warm

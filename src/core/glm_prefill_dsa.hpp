@@ -71,7 +71,7 @@ struct Io {
                                            // the FP16 projections; null: cuBLAS / plain hipBLAS (every CUDA build)
 };
 
-/// The glm-dsa mixer sub-batch (mixer_sub returns min(T, this) for a glm-dsa part; STRATA_GLM_PREFILL_SUB wins).
+/// The glm-dsa mixer sub-batch (mixer_sub returns min(T, this) for a glm-dsa part; MAYA_GLM_PREFILL_SUB wins).
 constexpr int kSubBatch = 2048;
 
 /// False on HIP: the glm-dsa prompt kernels are CUDA-only, the prompt runs token by token there.

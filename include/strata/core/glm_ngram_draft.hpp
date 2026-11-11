@@ -1,8 +1,8 @@
 // include/strata/core/glm_ngram_draft.hpp - glm-dsa B14.13: n-gram (prompt-lookup / suffix-match) speculative drafts for
 // the glm-dsa pipelined speculative decode, with the NextN (MTP) block's draft as the fallback.
 //
-// STRATA_GLM_NGRAM_DRAFT=1 (default off).  When the conversation's current suffix (the prompt plus every confirmed
-// token) occurred earlier with at least STRATA_GLM_NGRAM_MIN tokens of agreement (default 3), the tokens that
+// MAYA_GLM_NGRAM_DRAFT=1 (default off).  When the conversation's current suffix (the prompt plus every confirmed
+// token) occurred earlier with at least MAYA_GLM_NGRAM_MIN tokens of agreement (default 3), the tokens that
 // followed that earlier occurrence are the draft; otherwise the MTP draft stands.  Edits, refactors, quoted code and
 // tool-call arguments repeat their input, so the earlier continuation is often exact (ik_llama.cpp measured 57 to 76%
 // acceptance with its ngram-mod drafts, docs/speculative.md; BUILD-PLAN B14.13).
@@ -11,7 +11,7 @@
 // a draft while the tail finishes q+1): the MTP block STILL runs every step - its call writes the NextN block's own
 // latent / k_pe / index-key rows, which later MTP drafts attend over, so skipping it would corrupt the fallback - and
 // NgramSession::pick() replaces its token by the n-gram's when the matcher has a match and the chooser prefers it.
-// The gain is therefore acceptance, not draft latency.  A proposal holds up to STRATA_GLM_NGRAM_MAX tokens (default 4,
+// The gain is therefore acceptance, not draft latency.  A proposal holds up to MAYA_GLM_NGRAM_MAX tokens (default 4,
 // capped at 8: a multi-token verify (B11.4) loads the union of the routed experts of every drafted position, so long
 // drafts cost RAM-tier reads); the depth-1 pipeline verifies its first token, last_proposal() keeps the rest for a
 // multi-token verify.
@@ -36,9 +36,9 @@ namespace strata::core::glmng {
 
 /// The switches (read on every call).
 struct NgramConfig {
-    bool on = false;      // STRATA_GLM_NGRAM_DRAFT
-    int n_max = 4;        // STRATA_GLM_NGRAM_MAX: proposal length, 1..kMaxDraft
-    int min_match = 3;    // STRATA_GLM_NGRAM_MIN: shortest suffix match that proposes, 1..16
+    bool on = false;      // MAYA_GLM_NGRAM_DRAFT
+    int n_max = 4;        // MAYA_GLM_NGRAM_MAX: proposal length, 1..kMaxDraft
+    int min_match = 3;    // MAYA_GLM_NGRAM_MIN: shortest suffix match that proposes, 1..16
     int max_match = 32;   // the backward extension stops here (the longest-match tie-break needs no more)
     int candidates = 16;  // most recent earlier occurrences examined per proposal
 };
@@ -97,7 +97,7 @@ struct DraftBook {
 };
 
 /// The engine side: one per decode_spec call (hooks in Glm5Model::decode_spec).  Inactive (every call a no-op that
-/// returns the MTP draft) unless STRATA_GLM_NGRAM_DRAFT=1.
+/// returns the MTP draft) unless MAYA_GLM_NGRAM_DRAFT=1.
 class NgramSession {
 public:
     /// Takes the history registered for `model` (set_history; the prompt of the request), if any.
@@ -119,9 +119,9 @@ public:
     int32_t mtp_draft(int32_t used) const { return mtp_.empty() ? used : mtp_.front(); }
     const DraftBook& book() const { return book_; }
     /// The whole last n-gram proposal (empty when MTP stood): the tokens a multi-token verify would check.  With
-    /// STRATA_GLM_DRAFT_ADAPTIVE at most depth() tokens (B15.9).
+    /// MAYA_GLM_DRAFT_ADAPTIVE at most depth() tokens (B15.9).
     const std::vector<int32_t>& last_proposal() const { return prop_; }
-    /// B15.9: the proposal length now (the adaptive controller's depth, else STRATA_GLM_NGRAM_MAX).
+    /// B15.9: the proposal length now (the adaptive controller's depth, else MAYA_GLM_NGRAM_MAX).
     int depth() const { return ad_floor_ > 0 ? ad_.depth() : m_.config().n_max; }
     const AdaptiveDepth& adaptive() const { return ad_; }
     bool adaptive_on() const { return ad_floor_ > 0; }
@@ -130,7 +130,7 @@ public:
     uint64_t tracked_accepted() const { return ad_acc_; }
 
 private:
-    int ad_floor_ = 0;          // B15.9: STRATA_GLM_DRAFT_ADAPTIVE (0 off)
+    int ad_floor_ = 0;          // B15.9: MAYA_GLM_DRAFT_ADAPTIVE (0 off)
     AdaptiveDepth ad_;
     ProposalTracker tr_;
     uint64_t ad_rows_ = 0, ad_acc_ = 0;

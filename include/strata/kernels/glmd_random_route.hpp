@@ -1,6 +1,6 @@
 // include/strata/kernels/glmd_random_route.hpp - glm-dsa B15.7: the random-routing bench mode.
 //
-// STRATA_GLM_RANDOM_ROUTING=1 replaces the k experts each decode route selects with k DISTINCT pseudo-random expert
+// MAYA_GLM_RANDOM_ROUTING=1 replaces the k experts each decode route selects with k DISTINCT pseudo-random expert
 // ids and keeps the router's weights (rank i keeps the weight the router gave its rank-i expert).  Every route then
 // misses the VRAM pool and the RAM tier as often as uniform routing does, independent of the prompt corpus: a
 // reproducible worst-case decode floor for the BUILD-PLAN section 7 budget, which separates kernel and tier
@@ -10,7 +10,7 @@
 // The ids are a partial Fisher-Yates shuffle of 0..E-1 (k steps, the swaps kept sparse: no E-sized array), driven by
 // splitmix64 of (seed, layer, route counter).  The route counter is the device's per-route sequence number
 // (MoeDev::seq: one route per token and layer, the NextN block's included), so a run is reproducible from the load
-// on; STRATA_GLM_RANDOM_ROUTING_SEED (default 1) picks another sequence.  The hook sits in glm_fast.cu
+// on; MAYA_GLM_RANDOM_ROUTING_SEED (default 1) picks another sequence.  The hook sits in glm_fast.cu
 // moe_route_kernel right after the selection, so the fetch, CPU-lane, promotion and prefetch logic all see the
 // random ids.  The prompt path keeps the real routing.
 #pragma once
@@ -77,14 +77,14 @@ GLMD_RR_HD inline void random_route_apply(uint64_t seed, uint32_t layer, uint64_
     }
 }
 
-/// 0 = off (the default); else the seed: STRATA_GLM_RANDOM_ROUTING=1, STRATA_GLM_RANDOM_ROUTING_SEED (default 1; a
+/// 0 = off (the default); else the seed: MAYA_GLM_RANDOM_ROUTING=1, MAYA_GLM_RANDOM_ROUTING_SEED (default 1; a
 /// seed of 0 is taken as 1).  Read once per process (host only).
 inline uint64_t random_routing_seed() {
     static const uint64_t seed = [] {
-        if (!strata::glmenv::env_flag("STRATA_GLM_RANDOM_ROUTING", false)) return (uint64_t) 0;
-        uint64_t x = (uint64_t) strata::glmenv::env_int("STRATA_GLM_RANDOM_ROUTING_SEED", 1);
+        if (!strata::glmenv::env_flag("MAYA_GLM_RANDOM_ROUTING", false)) return (uint64_t) 0;
+        uint64_t x = (uint64_t) strata::glmenv::env_int("MAYA_GLM_RANDOM_ROUTING_SEED", 1);
         if (x == 0) x = 1;
-        std::fprintf(stderr, "glm: STRATA_GLM_RANDOM_ROUTING=1 (seed %llu): BENCH MODE - every decode route takes random "
+        std::fprintf(stderr, "glm: MAYA_GLM_RANDOM_ROUTING=1 (seed %llu): BENCH MODE - every decode route takes random "
                              "experts, the output is meaningless; MTP drafting is off, kept slots and prompt-cache "
                              "entries are marked (a normal load refuses them); do not save an expert profile or a usage "
                              "file from this run\n", (unsigned long long) x);

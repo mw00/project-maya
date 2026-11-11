@@ -271,12 +271,12 @@ std::string per_position(const strata::ds4::Stats& s0, const strata::ds4::Stats&
 
 // The drafts' cut on the product of their confidences (DeepInfer's cumulative rule, GLM's spec_cum): a draft is
 // verified while the chance that it and every draft before it are kept stays at least this - a long window whose later
-// drafts are likely lost is not verified whole.  MAYA_DS4_DSPARK_CUM=F (STRATA_DS4_DSPARK_CUM), a request's dspark_cum
+// drafts are likely lost is not verified whole.  MAYA_DS4_DSPARK_CUM=F, a request's dspark_cum
 // key; 0: off, only the floor on each draft's own confidence (dspark_conf).  0.5 by default: a Radeon 8065S, Maya-S,
 // greedy over code / chat / a list, two runs: decode 12.04 -> 12.82 tok/s (+6.5%), the same tokens
 float dspark_cum_default() {
     static const float v = [] {
-        const char* e = std::getenv("STRATA_DS4_DSPARK_CUM");
+        const char* e = std::getenv("MAYA_DS4_DSPARK_CUM");
         return e != nullptr ? (float) std::atof(e) : 0.5f;
     }();
     return v;
@@ -342,9 +342,9 @@ RoundLog& round_log() {
     return r;
 }
 
-// a DS4_ setting as MAYA_DS4_* sets it (read as STRATA_DS4_*), else the DS4_* name itself (the model's ds4_env)
+// a DS4_ setting as MAYA_DS4_* sets it, else the DS4_* name itself (the model's ds4_env)
 const char* ds4_env(const char* name) {
-    const char* v = std::getenv((std::string("STRATA_") + name).c_str());
+    const char* v = std::getenv((std::string("MAYA_") + name).c_str());
     return v != nullptr ? v : std::getenv(name);
 }
 
@@ -713,8 +713,7 @@ std::atomic<uint64_t> g_beats{0};
 std::atomic<bool> g_busy{false};
 void beat() { g_beats.fetch_add(1, std::memory_order_relaxed); }
 void start_watchdog(const strata::ds4::Model& m) {
-    const char* v = std::getenv("STRATA_DS4_WATCHDOG_S");
-    if (v == nullptr) v = std::getenv("MAYA_DS4_WATCHDOG_S");
+    const char* v = std::getenv("MAYA_DS4_WATCHDOG_S");
     const int limit = v != nullptr ? std::atoi(v) : 600;
     if (limit <= 0) return;
     std::thread([&m, limit] {
@@ -819,13 +818,13 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
     // picture, or the same one elsewhere, shares no state past that place.
     const auto env_num = [](const char* k, double d) { const char* v = std::getenv(k); return v ? std::atof(v) : d; };
     const bool slot_keep =
-        std::getenv("STRATA_DS4_SLOT_KEEP") != nullptr && std::atoi(std::getenv("STRATA_DS4_SLOT_KEEP")) != 0;
-    int slot_max = slot_keep ? std::max(0, (int) env_num("STRATA_DS4_SLOT_CAP", 4)) : 0;
-    const size_t slot_min = (size_t) std::max(1.0, env_num("STRATA_DS4_SLOT_MIN", 1024));
-    const double slot_days = env_num("STRATA_DS4_SLOT_DAYS", 7);
-    const uint64_t slot_budget = (uint64_t) (env_num("STRATA_DS4_SLOT_GB", 16) * 1073741824.0);
+        std::getenv("MAYA_DS4_SLOT_KEEP") != nullptr && std::atoi(std::getenv("MAYA_DS4_SLOT_KEEP")) != 0;
+    int slot_max = slot_keep ? std::max(0, (int) env_num("MAYA_DS4_SLOT_CAP", 4)) : 0;
+    const size_t slot_min = (size_t) std::max(1.0, env_num("MAYA_DS4_SLOT_MIN", 1024));
+    const double slot_days = env_num("MAYA_DS4_SLOT_DAYS", 7);
+    const uint64_t slot_budget = (uint64_t) (env_num("MAYA_DS4_SLOT_GB", 16) * 1073741824.0);
     const uint64_t slot_ram_budget = [] {
-        const char* k = "STRATA_DS4_SLOT_RAM_GB", *v = std::getenv(k);
+        const char* k = "MAYA_DS4_SLOT_RAM_GB", *v = std::getenv(k);
         if (v == nullptr) return (uint64_t) 0;
         char* end = nullptr;
         const double gb = std::strtod(v, &end);
@@ -1170,9 +1169,9 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
     };
     std::vector<Prefix> prefixes;
     uint64_t prefix_clock = 0;
-    const int prefix_max = m.marks_cap() > 0 ? std::max(0, (int) env_num("STRATA_DS4_PREFIX_KEEP", 2)) : 0;
-    const uint64_t prefix_budget = (uint64_t) (std::max(0.0, env_num("STRATA_DS4_PREFIX_GB", 2)) * 1073741824.0);
-    const size_t prefix_min = (size_t) std::max(1.0, env_num("STRATA_DS4_PREFIX_MIN", 1024));
+    const int prefix_max = m.marks_cap() > 0 ? std::max(0, (int) env_num("MAYA_DS4_PREFIX_KEEP", 2)) : 0;
+    const uint64_t prefix_budget = (uint64_t) (std::max(0.0, env_num("MAYA_DS4_PREFIX_GB", 2)) * 1073741824.0);
+    const size_t prefix_min = (size_t) std::max(1.0, env_num("MAYA_DS4_PREFIX_MIN", 1024));
     // the longest kept start the prompt begins with, past `floor` tokens and short of its last token (none: -1)
     const auto prefix_find = [&](const std::vector<int>& prompt, const std::vector<Pic>& want, size_t floor) -> int {
         int best = -1;
@@ -1241,7 +1240,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         return true;
     };
     if (slot_max > 0) {
-        slot_dir = std::getenv("STRATA_DS4_SLOT_DIR") ? std::filesystem::path(std::getenv("STRATA_DS4_SLOT_DIR"))
+        slot_dir = std::getenv("MAYA_DS4_SLOT_DIR") ? std::filesystem::path(std::getenv("MAYA_DS4_SLOT_DIR"))
                                                       : std::filesystem::path(pack) / "slots";
         std::error_code ec;
         std::filesystem::create_directories(slot_dir, ec);
@@ -1415,7 +1414,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                           (double) (s.ahead_pf - s_dec.ahead_pf) / fed);
             out += b;
         }
-        if (s.skipped > s_dec.skipped) {   // (STRATA_DS4_DISK_SKIP_W: experts left out a token)
+        if (s.skipped > s_dec.skipped) {   // (MAYA_DS4_DISK_SKIP_W: experts left out a token)
             std::snprintf(b, sizeof b, " skipped=%.3f", (double) (s.skipped - s_dec.skipped) / fed);
             out += b;
         }
@@ -1964,15 +1963,15 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                                             : 0.0);
         if (d_off > 0) std::fprintf(stderr, "maya ds4 serve: drafts %lld of %lld kept; %s\n", d_acc, d_off,
                                     per_position(s_dec, s).c_str());
-        // (DS4_DRAFT_VRAM, read as STRATA_DS4_DRAFT_VRAM or DS4_DRAFT_VRAM: the cap's misses - this request's decode,
+        // (DS4_DRAFT_VRAM, read as MAYA_DS4_DRAFT_VRAM or DS4_DRAFT_VRAM: the cap's misses - this request's decode,
         //  the drafter's picks)
-        if (std::getenv("STRATA_DS4_DRAFT_VRAM") != nullptr || std::getenv("DS4_DRAFT_VRAM") != nullptr)
+        if (std::getenv("MAYA_DS4_DRAFT_VRAM") != nullptr || std::getenv("DS4_DRAFT_VRAM") != nullptr)
             std::fprintf(stderr, "maya ds4 serve: drafter experts: %lld picks, %lld of them on the CPU lane (this "
                                  "request's decode; DS4_DRAFT_VRAM)\n",
                          (long long) (s.draft_experts - s_dec.draft_experts),
                          (long long) (s.draft_cpu - s_dec.draft_cpu));
         if (s.hr_maps + s.hr_fails + s.hr_abandoned + s.hr_hits > 0 ||
-            std::getenv("STRATA_DS4_HELPER_RECENT") != nullptr || std::getenv("DS4_HELPER_RECENT") != nullptr)
+            std::getenv("MAYA_DS4_HELPER_RECENT") != nullptr || std::getenv("DS4_HELPER_RECENT") != nullptr)
             std::fprintf(stderr, "maya ds4 serve: helper recent slots: %lld picks served, %lld mapped, %lld let go, "
                                  "%lld fills not done, %lld left unmapped (this request)\n",
                          (long long) (s.hr_hits - s_dec.hr_hits), (long long) (s.hr_maps - s_dec.hr_maps),
@@ -4038,7 +4037,7 @@ int main(int argc, char** argv) {
     const long long io1 = io_read_bytes();
     if (io0 >= 0 && io1 >= 0)
         std::fprintf(stderr, "decode reads from the disk: %.1f MB a token\n", (double) (io1 - io0) / 1e6 / nt);
-    if (s.skipped > s0.skipped)   // STRATA_DS4_DISK_SKIP_W
+    if (s.skipped > s0.skipped)   // MAYA_DS4_DISK_SKIP_W
         std::fprintf(stderr, "decode left out %.1f experts a token not in RAM (%.1f%% of the routed)\n",
                      (double) (s.skipped - s0.skipped) / nt,
                      100.0 * (double) (s.skipped - s0.skipped) / std::max<double>(1.0, (double) (s.experts - s0.experts)));

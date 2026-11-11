@@ -131,7 +131,7 @@ paths instead.
 | `maya.py` | the ARM branch in `check_pc`, the GPU label, and `-DGGML_CPU_ARM_ARCH` passed to the engine and vision builds | the setup's checks and messages |
 | `tools/vision/CMakeLists.txt` | the same ggml arch handling | the image encoder builds for aarch64 too (verified: `build-vision/bin/maya-vision`) |
 | `src/kernels/cpu/expert_multi_test.cpp`, `src/platform/memory_test.cpp`, `tests/exl3_test.cu` | skip where the kernel or the lock limit is missing | a test that cannot run must say so instead of failing |
-| `serve/server.py` | `STRATA_HTTP_MAX_CONNECTIONS` (64) and `STRATA_HTTP_READ_TIMEOUT_S` (30 s) | a stuck client held a handler for ever; a stalled body is now a 408 and an over-limit request a 503 with `Retry-After: 1` |
+| `serve/server.py` | `MAYA_HTTP_MAX_CONNECTIONS` (64) and `MAYA_HTTP_READ_TIMEOUT_S` (30 s) | a stuck client held a handler for ever; a stalled body is now a 408 and an over-limit request a 503 with `Retry-After: 1` |
 | `serve/test_server.py` | tests for both limits | |
 | `serve-maya.sh` | **new**: the local entrypoint - start / stop / status / logs | and it *finds a server it did not start*, which the pid file alone did not |
 | `docs/SETTINGS.md` | the unified-memory paragraph, the headroom row, the two new server settings | |
@@ -174,7 +174,7 @@ lendable region and only printed a warning** - an out-of-bounds pointer.
 | `src/prefill/ggml_cuda_host.cu` | the scratch pool's `cudaMalloc` failure throws (with the bytes it wanted and the bytes free) instead of aborting |
 | `src/core/glm_prefill.cu` | `prefill_carve` returns false when the layout does not fit; `Glm5Model::prefill` reads the prompt again with a **smaller chunk** (down to 256 tokens) when it does not; `prefill_run` is guarded so the expert pool's tail is given back either way |
 | `src/program/generate.cpp` | `guarded()` catches a request's failure; `cuda_context_broken()` still ends the engine for a sticky CUDA error; the serve loops end the *request* (not the process) and lower the chunk for the requests that follow |
-| `src/prefill/prefill.cpp` | the same chunk-halving retry for the borrowed layout, with the `STRATA_PREALLOC_FAIL` test hook |
+| `src/prefill/prefill.cpp` | the same chunk-halving retry for the borrowed layout, with the `MAYA_PREALLOC_FAIL` test hook |
 | `serve/server.py`, `serve/test_server.py` | a memory failure is a **503** (the client can try again), a wrong request still a **400** |
 | `src/prefill/failure_test.cpp`, `tools/test_alloc_recovery.py` | **new tests**: the classification (no GPU), and both injected failures against the real engine - the request fails, the engine answers the next one |
 

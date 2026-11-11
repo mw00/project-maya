@@ -6,13 +6,13 @@
 //   B8.2  segmented pinning: a RAM class is one virtual range cut in segments of at most 16 GiB (a whole number of
 //         slots each), each mbind-ed and cudaHostRegister-ed on its own and in parallel per NUMA node.  A refused
 //         registration shrinks only the LAST segment (Maya's n*31/32 x4 then n*7/8 steps, applied to the class total).
-//   B8.3  the CPU lane's pool mode: Maya's shared / per-part A/B (STRATA_GLM_CPU_SHARED=1/0) plus per-socket
-//         (STRATA_GLM_CPU_SHARED=socket): one pinned pool per NUMA node, serving the parts whose GPU hangs off it.
-//   B8.4  the NUMA node-split expert layout (STRATA_GLM_NUMA_SPLIT=1, glm-dsa only, default off): a RAM-tier expert is
+//   B8.3  the CPU lane's pool mode: Maya's shared / per-part A/B (MAYA_GLM_CPU_SHARED=1/0) plus per-socket
+//         (MAYA_GLM_CPU_SHARED=socket): one pinned pool per NUMA node, serving the parts whose GPU hangs off it.
+//   B8.4  the NUMA node-split expert layout (MAYA_GLM_NUMA_SPLIT=1, glm-dsa only, default off): a RAM-tier expert is
 //         two halves, half 0 on node A and half 1 on node B.  Half h holds gate rows [h*H, (h+1)*H), up rows
 //         [h*H, (h+1)*H) and, for every down row, the inner columns [h*H, (h+1)*H) (H = n_ff / 2; 1024 at GLM-5.3,
 //         so a down half row is 4 of its 8 256-blocks).  Half 1 sits at half 0 + D, one constant per class.
-//   B8.7  THP: the knob (STRATA_GLM_THP), the free 2 MB block count from /proc/buddyinfo, and the AnonHugePages share
+//   B8.7  THP: the knob (MAYA_GLM_THP), the free 2 MB block count from /proc/buddyinfo, and the AnonHugePages share
 //         of the tier read back from /proc/self/smaps.
 #pragma once
 
@@ -38,7 +38,7 @@ namespace strata::core::glmtier {
 /// The default segment cap: 16 GiB (a cudaHostRegister of 120-140 GB in one call took minutes and stalls the others).
 constexpr size_t kSegCapDefault = (size_t) 16 << 30;
 
-/// The segment cap in bytes for this arch: STRATA_GLM_RAM_SEG_GB (0 = off: Maya's single allocation) or, unset,
+/// The segment cap in bytes for this arch: MAYA_GLM_RAM_SEG_GB (0 = off: Maya's single allocation) or, unset,
 /// 16 GiB on glm-dsa and off on glm5-next (Flash stays on Maya's path).
 size_t seg_cap_bytes(bool glm_dsa, const char* env);
 
@@ -73,11 +73,11 @@ int seg_node(int k, int half, bool split, const std::vector<int>& nodes);
 /// MemFree + Inactive(file) + SReclaimable (what a bound allocation can take without swapping or an OOM kill);
 /// -1 when MemFree was not found.
 int64_t node_mem_avail(const std::string& node_meminfo);
-/// The bytes kept free on every node a bound unit lands on (STRATA_GLM_NODE_RESERVE_GB, default 4 GiB: the OS, the
+/// The bytes kept free on every node a bound unit lands on (MAYA_GLM_NODE_RESERVE_GB, default 4 GiB: the OS, the
 /// server, the driver's pinned buffers and the B9.9 landing rings bound to the GPUs' node).
 int64_t node_reserve_bytes(const char* env);
 /// The most slots (<= n) of a class whose units are bound to nodes (MPOL_BIND: no fallback) that fit every node's
-/// budget: split, n x stride on each of nodes[0] / nodes[1]; else (STRATA_GLM_NUMA_SEG=bind) seg_plan(n, stride, cap)'s
+/// budget: split, n x stride on each of nodes[0] / nodes[1]; else (MAYA_GLM_NUMA_SEG=bind) seg_plan(n, stride, cap)'s
 /// segments round-robin over the nodes (seg_node).  budget[j] is nodes[j]'s free bytes less the reserve (< 0 = unknown:
 /// no limit).  0 when not one slot fits.
 int64_t node_fit_slots(int64_t n, size_t stride, size_t cap, bool split, const std::vector<int>& nodes,
@@ -92,7 +92,7 @@ inline bool budget_reset_due(int part) { return part == 0; }
 
 // ---------------------------------------------------------------- B8.7 huge pages
 
-/// STRATA_GLM_THP: 0 never madvise(MADV_HUGEPAGE), 1 always, unset/other: auto (Maya's rule: only while the free
+/// MAYA_GLM_THP: 0 never madvise(MADV_HUGEPAGE), 1 always, unset/other: auto (Maya's rule: only while the free
 /// 2 MB blocks cover the segment plus 1 GiB).  Returns 0 / 1 / -1 (auto).
 int thp_mode(const char* env);
 /// The free bytes in blocks of order >= 9 (2 MB on 4 KB pages) in a /proc/buddyinfo text; -1 when none parsed.
@@ -124,12 +124,12 @@ std::vector<std::pair<size_t, size_t>> fault_plan(size_t bytes, bool huge, int t
 
 enum class LanePool : int {
     One = 0,        ///< one GPU: one pool (Maya)
-    PerPart = 1,    ///< STRATA_GLM_CPU_SHARED=0 (or a 2-part split by default): one pool per part (Maya)
-    Shared = 2,     ///< STRATA_GLM_CPU_SHARED=1 (default with 3+ parts): one unpinned pool for every part (Maya)
-    Socket = 3,     ///< STRATA_GLM_CPU_SHARED=socket: one pinned pool per NUMA node, shared by that node's parts
-    NodeSplit = 4,  ///< STRATA_GLM_NUMA_SPLIT=1: one pinned pool per node, each computing its half of every expert
+    PerPart = 1,    ///< MAYA_GLM_CPU_SHARED=0 (or a 2-part split by default): one pool per part (Maya)
+    Shared = 2,     ///< MAYA_GLM_CPU_SHARED=1 (default with 3+ parts): one unpinned pool for every part (Maya)
+    Socket = 3,     ///< MAYA_GLM_CPU_SHARED=socket: one pinned pool per NUMA node, shared by that node's parts
+    NodeSplit = 4,  ///< MAYA_GLM_NUMA_SPLIT=1: one pinned pool per node, each computing its half of every expert
 };
-/// The mode a part's lane uses.  own_count: STRATA_GLM_CPU_LANE<dev> set (Maya: a pool of its own).  Maya's rules are
+/// The mode a part's lane uses.  own_count: MAYA_GLM_CPU_LANE<dev> set (Maya: a pool of its own).  Maya's rules are
 /// unchanged for unset / 0 / 1; on glm-dsa (`dsa`) "socket" (or "2") selects Socket; a node-split tier forces
 /// NodeSplit.  Flash (dsa false) keeps Maya's reading of every value: "2" is one shared pool (any non-zero number),
 /// "socket" a pool per part (atoi 0).  Inline: the split planner (glm_dsa_split.cpp glm_cpu_pool_ids) prices the same
@@ -147,7 +147,7 @@ inline LanePool lane_pool_mode(int n_parts, bool own_count, const char* shared_e
     return n_parts >= 3 ? LanePool::Shared : LanePool::PerPart;
 }
 const char* lane_pool_name(LanePool m);
-/// The default thread count of a node's pinned lane pool (Socket / NodeSplit, STRATA_GLM_NUMA_LANE_THREADS unset) from
+/// The default thread count of a node's pinned lane pool (Socket / NodeSplit, MAYA_GLM_NUMA_LANE_THREADS unset) from
 /// the node's usable CPUs: a thread per PHYSICAL core less 2 (Maya's lane is a thread per physical core, and it measured
 /// SMT oversubscription as a loss: 5900X 10 threads on 6 cores 10.88 tok/s, 6 threads 11.45); the cores left free hold
 /// the service, main and disk-reader threads.  test-PC node (20C/40T a node): 18.  Physical cores unknown (0): logical - 4, the
@@ -165,7 +165,7 @@ inline bool lane_pool_maya_shared(LanePool m) { return m == LanePool::Shared; }
 
 // ---------------------------------------------------------------- B8.4 node-split layout
 
-/// STRATA_GLM_NUMA_SPLIT: true only for "1"-like values; never on glm5-next.
+/// MAYA_GLM_NUMA_SPLIT: true only for "1"-like values; never on glm5-next.
 bool numa_split_requested(bool glm_dsa, const char* env);
 
 /// One layer's split geometry (bytes).  Unified blob: [gate n_ff x gu_row | up n_ff x gu_row | down n_embd x d_row].

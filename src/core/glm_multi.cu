@@ -1,4 +1,4 @@
-// src/core/glm_multi.cu - several conversations at once (STRATA_GLM_SEQS=<n>); see glm_model.hpp (SeqCtx).
+// src/core/glm_multi.cu - several conversations at once (MAYA_GLM_SEQS=<n>); see glm_model.hpp (SeqCtx).
 //
 // Every per-sequence thing a part keeps lives in its state arena (the residual, the KDA states and conv histories, the
 // DSA latent / indexer caches) plus a handful of members (the position, the snapshot, the image rows).  A part holds n
@@ -105,15 +105,15 @@ uint64_t Glm5Model::seq_layout(int64_t ctx, SeqCtx& c) const {
     return c.bytes;
 }
 
-// STRATA_GLM_SEQS=<n> (1..8): n - 1 more state arenas on this part, zeroed - each for STRATA_GLM_SEQ_CTX tokens
+// MAYA_GLM_SEQS=<n> (1..8): n - 1 more state arenas on this part, zeroed - each for MAYA_GLM_SEQ_CTX tokens
 // (default: the engine's context; at least 8320, at most the context).  Called by load_pack right after the first
 // arena, so the expert pool is sized from what is left.
 bool Glm5Model::seq_alloc_arenas(std::string& err) {
-    const char* v = getenv("STRATA_GLM_SEQS");
+    const char* v = getenv("MAYA_GLM_SEQS");
     const int n = v ? std::max(1, std::min(8, std::atoi(v))) : 1;
     if (n <= 1) return true;
     int64_t ctx = max_ctx_;
-    if (const char* c = getenv("STRATA_GLM_SEQ_CTX")) ctx = std::max<int64_t>(8320, std::min<int64_t>(max_ctx_, std::atoll(c)));
+    if (const char* c = getenv("MAYA_GLM_SEQ_CTX")) ctx = std::max<int64_t>(8320, std::min<int64_t>(max_ctx_, std::atoll(c)));
     cudaSetDevice(dev_);
     seq_.assign((size_t) n, SeqCtx{});
     // the first sequence's layout recomputed must be the one load_pack made, or the others' would be wrong
@@ -169,7 +169,7 @@ bool Glm5Model::seq_alloc_arenas(std::string& err) {
     std::fprintf(stderr, "glm multi: CUDA%d %d sequence states: the first for %lld tokens (%.2f GB), %d more for %lld "
                  "(%.2f GB in all, with every sequence's snapshot)\n", dev_, n, (long long) max_ctx_,
                  (double) state_bytes_ / 1e9, n - 1, (long long) ctx, (double) more / 1e9);
-    // several conversations drafting at once (STRATA_GLM_MULTI_MTP): their windows' buffers, before the pool too
+    // several conversations drafting at once (MAYA_GLM_MULTI_MTP): their windows' buffers, before the pool too
     if (multi_mtp_setting() > 0 && !mtpw_alloc(err)) return false;
     // one GPU decodes the sequences together; opt-in split rows need the same activations on every part, before its pool
     if ((n_parts_ == 1 || split_rows_setting() > 0) && glm_rows_ok(g_.arch)) return rows_alloc(err);   // glm-dsa takes the pipelined path

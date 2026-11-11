@@ -10,7 +10,7 @@
 
 namespace strata::core::glmfast {
 
-// The all-resident launch skip (STRATA_GLM_RESIDENT_SKIP; the complete pool was here too until v1.1.35): on by
+// The all-resident launch skip (MAYA_GLM_RESIDENT_SKIP; the complete pool was here too until v1.1.35): on by
 // default on AMD, where the Strix / Gorgon Halo APUs hold every expert (measured there); an NVIDIA build launches
 // every route's kernels unless the setting is 1.  The setting, when given, wins either way.
 inline bool on_by_default_on_amd(const char* env) {
@@ -21,13 +21,13 @@ inline bool on_by_default_on_amd(const char* env) {
     return false;
 #endif
 }
-// The complete pool (STRATA_GLM_COMPLETE_POOL): on by default on every GPU since v1.1.35 - it is taken only where
+// The complete pool (MAYA_GLM_COMPLETE_POOL): on by default on every GPU since v1.1.35 - it is taken only where
 // the budget holds every expert, the spares and the prompt path's tail (complete_pool_slots), so the capped pool
 // stays wherever it is needed.  NVIDIA kept the capped pool before, even where the budget held a complete one: a long
 // prompt's borrow then evicted ~270 residents a layer for good and the CPU lane ran the decode's misses (#474: 4x A100,
 // 33 tok/s instead of 83).  The setting, when given, wins either way (0: the capped pool, for A/B).
 inline bool complete_pool_on() {
-    if (const char* v = std::getenv("STRATA_GLM_COMPLETE_POOL")) return std::atoi(v) != 0;
+    if (const char* v = std::getenv("MAYA_GLM_COMPLETE_POOL")) return std::atoi(v) != 0;
     return true;
 }
 // ... and the other way round: on by default on NVIDIA, off on AMD unless the setting is 1
@@ -39,18 +39,18 @@ inline bool off_by_default_on_amd(const char* env) {
     return true;
 #endif
 }
-// STRATA_GLM_GROUP_EXPERTS=1: the batched rows' routed experts each run once for all the rows of a group (glm_rows.cu)
+// MAYA_GLM_GROUP_EXPERTS=1: the batched rows' routed experts each run once for all the rows of a group (glm_rows.cu)
 inline bool group_experts_on() {
     static const bool on = [] {
-        const char* v = std::getenv("STRATA_GLM_GROUP_EXPERTS");
+        const char* v = std::getenv("MAYA_GLM_GROUP_EXPERTS");
         return v != nullptr && std::atoi(v) != 0;
     }();
     return on;
 }
-// STRATA_GLM_SKIP_EMPTY=1: the batched rows leave out the launches their routes have no work for (glm_rows.cu)
+// MAYA_GLM_SKIP_EMPTY=1: the batched rows leave out the launches their routes have no work for (glm_rows.cu)
 inline bool skip_empty_on() {
     static const bool on = [] {
-        const char* v = std::getenv("STRATA_GLM_SKIP_EMPTY");
+        const char* v = std::getenv("MAYA_GLM_SKIP_EMPTY");
         return v != nullptr && std::atoi(v) != 0;
     }();
     return on;
@@ -189,7 +189,7 @@ inline bool ram_class_plan(uint64_t budget, const std::vector<size_t>& stride,
 // A discrete AMD card under Windows (HIP) failed its start with the tier 512 MB under the cap ("the warmed expert
 // tables did not upload (unspecified launch failure)") and started with it a few GB under, lower for a model with
 // larger experts (#924): there the room is a tenth of the cap, so it follows the cap measured with this model's own
-// buffers in place.  `room_mb` >= 0 (STRATA_GLM_PIN_ROOM_MB) sets it.  Rounded up to whole 256 MB (pin_room's probes).
+// buffers in place.  `room_mb` >= 0 (MAYA_GLM_PIN_ROOM_MB) sets it.  Rounded up to whole 256 MB (pin_room's probes).
 inline int64_t pin_cap_room(bool discrete_amd_windows, int64_t cap, int64_t room_mb) {
     static constexpr int64_t kStep = int64_t{256} << 20, kRoom = int64_t{512} << 20;
     const auto up = [](int64_t b) { return (b + kStep - 1) & ~(kStep - 1); };

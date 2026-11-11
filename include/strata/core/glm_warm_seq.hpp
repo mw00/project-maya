@@ -5,14 +5,14 @@
 // the experts in.  Maya streams them in slot order - each layer's VRAM slots, then the RAM tier round-robin over the
 // layers - 8 experts a batch whose 24 slices 8 threads read at once, and in a parallel split load every part does so
 // at the same time.  From a single hard disk that is a seek every slice: the test PC's USB disk gave 39 MB/s, 201 GB in
-// 89 min (bench/results/strata/volta3-bringup.md).  STRATA_GLM_WARM_SEQ (on by default for glm-dsa, off for Flash):
+// 89 min (bench/results/strata/volta3-bringup.md).  MAYA_GLM_WARM_SEQ (on by default for glm-dsa, off for Flash):
 //   * the jobs sorted by where each expert starts in the pack (shard, then offset: a layer's experts in id order);
 //   * each batch's slices read in file order, one after another, on the warming thread (about 3 contiguous runs a
 //     batch: gate, up and down of 8 neighbouring experts);
 //   * in a parallel split load the parts warm one after another, in part order (Glm5Model::SplitLoad's warm turn), so
 //     the disk sees one stream; the dense load, the RAM planning and the pinning stay parallel.
 // Only the order of the reads changes: every expert lands in the slot it had, through the same read (fast_warm's
-// per-slice reader).  STRATA_GLM_WARM_SUM=1 prints a digest of the slots and their bytes after each part's warm-up,
+// per-slice reader).  MAYA_GLM_WARM_SUM=1 prints a digest of the slots and their bytes after each part's warm-up,
 // and glm_dsa_pack_fast_test compares the two orders' digests.
 //
 // The order, the run count and the hash are plain C++ (tests/glm_dsa/glm_warm_seq_test.cpp checks them, no CUDA);
@@ -30,9 +30,9 @@ class Glm5Model;
 
 namespace glmwarm {
 
-/// STRATA_GLM_WARM_SEQ (read at each warm-up): the file-order warm-up, default on for glm-dsa, off for Flash.
+/// MAYA_GLM_WARM_SEQ (read at each warm-up): the file-order warm-up, default on for glm-dsa, off for Flash.
 bool seq_on(bool glm_dsa);
-/// STRATA_GLM_WARM_SUM (read at each warm-up, default off): print each part's warm digest.
+/// MAYA_GLM_WARM_SUM (read at each warm-up, default off): print each part's warm digest.
 bool sum_on();
 
 /// Where an expert (or one of its slices) starts in the pack: the shard, then the byte offset in it.
@@ -96,7 +96,7 @@ struct Digest {
 };
 /// One part right now (this instance's own tiers; parts 0 without the fast path).
 Digest part_digest(Glm5Model& m);
-/// fast_warm's STRATA_GLM_WARM_SUM line, "glm fast: CUDA<d> warm digest <hex>: ...", at the end of the part's warm-up
+/// fast_warm's MAYA_GLM_WARM_SUM line, "glm fast: CUDA<d> warm digest <hex>: ...", at the end of the part's warm-up
 /// (before anything else touches the tiers); the digest is kept for warm_digest().
 void print_digest(Glm5Model& m);
 /// Keeps a part's warm digest; warm_digest(): the ones kept since stats_reset(), folded in part order (a load's warm

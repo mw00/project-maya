@@ -22,7 +22,7 @@
 //      generation (graph_generation_bump / graph_generation_note), and the key carries it: a graph captured before
 //      a reallocation never replays over freed or re-carved memory, even when cudaMalloc hands back the same base
 //      address (llama.cpp #26771: ggml_cuda_pool_leg::invalidate_cuda_graphs on free / realloc).
-// STRATA_GLM_DSA_GRAPHS=1 enables the decode graphs (default off until validated on the test PC).
+// MAYA_GLM_DSA_GRAPHS=1 enables the decode graphs (default off until validated on the test PC).
 #pragma once
 
 #include <cstddef>
@@ -42,7 +42,7 @@ static_assert(sizeof(DevPos) == 16, "DevPos is one 16-byte store");
 
 /// One tiny launch (OUTSIDE any capture): *dev = {p, p + 1, min(p + 1, top_k), 0}.
 bool set_dev_pos(DevPos* dev, int p, int top_k, void* stream);
-/// STRATA_GLM_DSA_GRAPHS=1 (read once).
+/// MAYA_GLM_DSA_GRAPHS=1 (read once).
 bool dsa_graphs_enabled();
 
 /// Kernel-choice bits of a captured part.
@@ -111,7 +111,7 @@ struct GraphKey {
 };
 
 /// The decode-graph cache's bookkeeping (src/core/glm_dsa_graphs.hpp DsaGraphs; CUDA-free, so the CPU test runs the
-/// same code).  A slot per (part, state): with several sequences at once (STRATA_GLM_SEQS / --parallel) every sequence
+/// same code).  A slot per (part, state): with several sequences at once (MAYA_GLM_SEQS / --parallel) every sequence
 /// binds its own state arena (Glm5Model::seq_bind), so each keeps its own graph and a switch between sequences
 /// replays instead of re-capturing.  At most per_part slots per part (set_per_part: the sequence count), the least
 /// recently used dropped beyond that (an eviction).  A key that differs from its slot's - same part and state, but a

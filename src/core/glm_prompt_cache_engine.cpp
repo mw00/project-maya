@@ -19,15 +19,15 @@ namespace {
 
 std::mutex g_mu;
 
-// the model's store, opened on first use; null when the cache is off for this model.  STRATA_GLM_NO_REUSE turns it off
+// the model's store, opened on first use; null when the cache is off for this model.  MAYA_GLM_NO_REUSE turns it off
 // as it turns off Maya's snapshot reuse and slots (slot_max 0): a cold-prefill measurement must not restore anything.
 Store* store_of(Glm5Model& model) {
     static std::map<const Glm5Model*, std::unique_ptr<Store>> stores;
-    const char* dir = std::getenv("STRATA_GLM_PROMPT_CACHE_DIR");
+    const char* dir = std::getenv("MAYA_GLM_PROMPT_CACHE_DIR");
     if (dir == nullptr || dir[0] == '\0' || !model.fast() || model.geometry().arch != GlmArch::GlmDsa) return nullptr;
-    if (std::getenv("STRATA_GLM_NO_REUSE") != nullptr) {
+    if (std::getenv("MAYA_GLM_NO_REUSE") != nullptr) {
         static bool said = false;
-        if (!said) std::fprintf(stderr, "glm prompt cache: off (STRATA_GLM_NO_REUSE)\n");
+        if (!said) std::fprintf(stderr, "glm prompt cache: off (MAYA_GLM_NO_REUSE)\n");
         said = true;
         return nullptr;
     }

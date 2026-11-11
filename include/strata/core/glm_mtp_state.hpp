@@ -3,7 +3,7 @@
 // The draft block reads, for position p, the trunk's post-output-norm hidden h_p (the "carrier": llama.cpp's
 // pending_h / t_h_nextn) and the embedding of the token chosen for p + 1.  Maya's fast_mtp read it from the tail
 // part's shared scratch row (FastState::head_x), which belongs to whatever forward ran last on that card: another
-// sequence (STRATA_GLM_SEQS), an earlier request whose length happens to equal this one's, or nothing at all after a
+// sequence (MAYA_GLM_SEQS), an earlier request whose length happens to equal this one's, or nothing at all after a
 // slot restore.  llama.cpp hit the same three bugs: #28333 (zero pending_h when a sequence starts at pos 0), #30141
 // (save and restore it with the sequence state, magic MTP1) and #28473 (stop drafting at the output budget).
 //
@@ -16,7 +16,7 @@
 //       snapshot position's last row, n - 1); slot files and the B14.14 prompt-cache entries end with an MTP1
 //       trailer (write_trailer / read_trailer) holding it, and the slot fingerprint gains two words: the NextN
 //       block's identity (block_id over its tensors' names, types and source; a slot written with another draft
-//       block, e.g. STRATA_GLM_MTP_GGUF, is refused because its NextN cache rows came from other weights) and the
+//       block, e.g. MAYA_GLM_MTP_GGUF, is refused because its NextN cache rows came from other weights) and the
 //       carrier row bytes.  The NextN block's latent, k_pe and index-key runs were already in the slot
 //       (GlmStateLayout::slot_runs, NextN first).
 //   (c) draft_budget(n_max, remaining n_predict, remaining ctx): a verify row past the output budget or the context
@@ -85,7 +85,7 @@ struct HostCarrier {
 };
 
 /// The NextN block's identity: FNV-1a over (name, ggml type, bytes) of each of its tensors in name order and the
-/// source tag ("own" or the STRATA_GLM_MTP_GGUF file's basename and size), folded to 31 bits, never 0 (0 = no block).
+/// source tag ("own" or the MAYA_GLM_MTP_GGUF file's basename and size), folded to 31 bits, never 0 (0 = no block).
 struct BlockTensor {
     std::string name;
     int type = 0;

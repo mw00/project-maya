@@ -18,7 +18,7 @@ from serve.server import Detokenizer  # noqa: E402
 
 
 def find_tokenizer():
-    cands = [os.environ.get("STRATA_TOKENIZER", "")]
+    cands = [os.environ.get("MAYA_TOKENIZER", "")]
     cands += [str(p) for p in ROOT.glob("packs/*/tokenizer")] + [str(p) for p in ROOT.glob("pack/*/tokenizer")]
     cands += [r"C:\Users\AI-Server\Desktop\Strata\Public\Engine\pack\full\tokenizer"]
     for c in cands:

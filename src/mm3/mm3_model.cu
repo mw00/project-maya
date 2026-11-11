@@ -1712,7 +1712,8 @@ struct Model::Impl {
             }
             graph_on = (gv == nullptr || std::atoi(gv) != 0) && D.size() == 1 && nhf > 0 && nhf == nmoe &&
                        !o.verbose &&
-                       ::mm3::env("MM3_DUMP_HS") == nullptr;
+                       ::mm3::env("MM3_DUMP_HS") == nullptr &&
+                       !strata::ablcap::on();   // (a fitting run's read-out waits on the host: not in a capture)
             if (graph_on) info.push_back("decode: a token's and a verify window's forward replayed as a graph");
         }
         for (Dev& d : D) {

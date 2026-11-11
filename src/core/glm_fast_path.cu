@@ -1,6 +1,6 @@
 // src/core/glm_fast_path.cu - the glm5-next FAST decode path (Glm5Model members).
 //
-// The same model as Glm5Model::step_layers (the correctness-first reference, STRATA_GLM_SLOW=1), run
+// The same model as Glm5Model::step_layers (the correctness-first reference, MAYA_GLM_SLOW=1), run
 // as ~11 fused launches per layer (strata/kernels/glm_fast.hpp) on a private non-blocking stream per
 // device, with NO host synchronisation inside a token except where an expert is missing:
 //
@@ -136,10 +136,10 @@ static bool glm_pin_budget(int device, uint64_t& budget, uint64_t& usage) {
 // A Windows APU's room for more pinned buffers (strata/platform/gpu_shared.hpp): its shared GPU memory, less what all
 // its users hold of it now (the desktop's, this process's pinned buffers, its device memory past the carve-out), less
 // `later` (pinned after this measurement), less glmfast::apu_shared_margin (an eighth of the limit, at least 1 GB: the
-// runtime's own buffers, what is allocated after the tier, the counters' sampling).  -1: not an integrated GPU, the limit unknown, or STRATA_GLM_APU_SHARED_CHECK=0.  Counters that
+// runtime's own buffers, what is allocated after the tier, the counters' sampling).  -1: not an integrated GPU, the limit unknown, or MAYA_GLM_APU_SHARED_CHECK=0.  Counters that
 // cannot be read: half the limit, less `later`.  glm-dsa only (glm_fast_path's RAM tier).
 static int64_t apu_shared_room(int dev, int64_t later) {
-    if (const char* v = getenv("STRATA_GLM_APU_SHARED_CHECK"); v != nullptr && std::atoi(v) == 0) return -1;
+    if (const char* v = getenv("MAYA_GLM_APU_SHARED_CHECK"); v != nullptr && std::atoi(v) == 0) return -1;
     int integrated = 0;
     if (cudaDeviceGetAttribute(&integrated, cudaDevAttrIntegrated, dev) != cudaSuccess) {
         cudaGetLastError();
@@ -195,14 +195,14 @@ namespace strata::core {
 using glmfast::cpu_relax;
 using glmfast::Workers;
 
-// the spec path's head group is the parts [0, h) with h = half the split (STRATA_GLM_SPEC_HEAD=<parts> overrides), the
+// the spec path's head group is the parts [0, h) with h = half the split (MAYA_GLM_SPEC_HEAD=<parts> overrides), the
 // TAIL GROUP the rest.  fast_setup asks for h alone: it runs before the parts are linked (split_next_ is set after
 // every part has loaded), so it counts them instead of walking the chain.
 static int spec_head_parts(int n, bool dsa) {
-    // glm-dsa B11.2: the priced head ({GPU0} vs {GPU0,GPU1}) when STRATA_GLM_SPEC_HEAD is unset or "auto"
-    if (dsa) return std::max(1, std::min(n - 1, glmspec::spec_head_parts(n, getenv("STRATA_GLM_SPEC_HEAD"), true)));
+    // glm-dsa B11.2: the priced head ({GPU0} vs {GPU0,GPU1}) when MAYA_GLM_SPEC_HEAD is unset or "auto"
+    if (dsa) return std::max(1, std::min(n - 1, glmspec::spec_head_parts(n, getenv("MAYA_GLM_SPEC_HEAD"), true)));
     int h = n / 2;
-    if (const char* e = getenv("STRATA_GLM_SPEC_HEAD")) h = std::atoi(e);
+    if (const char* e = getenv("MAYA_GLM_SPEC_HEAD")) h = std::atoi(e);
     return std::max(1, std::min(n - 1, h));
 }
 
@@ -388,8 +388,8 @@ static int numa_node_cpus() {
 // on one node, 72.7 GB on the other, each expert on ONE of them), and the CPU lane reads every expert with all its
 // threads through that node's memory controllers only (2-socket Xeon, Q3_K experts, 44 threads: 216 us an expert
 // node-local, 152 us interleaved).  Mapped, so the device reads its host pointers as it does cudaHostAlloc's.
-// nullptr: one node, STRATA_GLM_NUMA=0, no host-pointer access for registered memory, or a failure.
-// STRATA_GLM_ROW_HALVES=1 (Part 8 Opt 09, ported): ROW halves - each RAM-tier slot keeps its layout ([gate | up | down],
+// nullptr: one node, MAYA_GLM_NUMA=0, no host-pointer access for registered memory, or a failure.
+// MAYA_GLM_ROW_HALVES=1 (Part 8 Opt 09, ported): ROW halves - each RAM-tier slot keeps its layout ([gate | up | down],
 // contiguous for the device, the warm-up and the prompt path) but its pages alternate nodes: gate rows [0, n_ff/2), up
 // rows [0, n_ff/2) and down rows [0, n_embd/2) on the first node, the other halves on the second.  The CPU lane then
 // reads each half with that node's threads (lane_experts) - no expert byte crosses QPI.  E5-2690 v4: 22 threads on
@@ -439,7 +439,7 @@ static int cpu_node_now() {
 
 static void* numa_pinned(size_t bytes, const RowLayout* rl = nullptr) {
 #ifdef __linux__
-    const char* v = getenv("STRATA_GLM_NUMA");
+    const char* v = getenv("MAYA_GLM_NUMA");
     const auto nodes = numa_nodes();
     if ((v != nullptr && std::atoi(v) == 0) || nodes.size() < 2) return nullptr;
     int dev = 0, ok = 0;
@@ -452,7 +452,7 @@ static void* numa_pinned(size_t bytes, const RowLayout* rl = nullptr) {
     if (p == MAP_FAILED) return nullptr;
     unsigned long mask[4] = {0, 0, 0, 0};
     for (int n : nodes) mask[n / 64] |= 1ul << (n % 64);
-    static const bool halves = getenv("STRATA_GLM_ROW_HALVES") != nullptr && std::atoi(getenv("STRATA_GLM_ROW_HALVES")) != 0;
+    static const bool halves = getenv("MAYA_GLM_ROW_HALVES") != nullptr && std::atoi(getenv("MAYA_GLM_ROW_HALVES")) != 0;
     if (halves && rl != nullptr) {
         // 4 KB pages (a 2 MB page would span both halves); each range preferred on its node: a full node spills
         const size_t pg = 4096, gh = rl->gu / 2, dh = (rl->blob - rl->doff) / 2;
@@ -635,11 +635,11 @@ static void numa_pinned_free(void* p, size_t bytes) {
 #endif
 }
 
-// The RAM tier's sizing pins through these: STRATA_GLM_PIN_CAP_MB=<MB> (tests) refuses what would take the bytes they
+// The RAM tier's sizing pins through these: MAYA_GLM_PIN_CAP_MB=<MB> (tests) refuses what would take the bytes they
 // hold past it - a Windows pinning cap where there is none.  (The parts of a split pin one after another.)
 static int64_t g_pin_held = 0;
 static cudaError_t pin_alloc(void** p, size_t bytes, unsigned flags) {
-    static const int64_t cap = getenv("STRATA_GLM_PIN_CAP_MB") ? std::atoll(getenv("STRATA_GLM_PIN_CAP_MB")) << 20 : -1;
+    static const int64_t cap = getenv("MAYA_GLM_PIN_CAP_MB") ? std::atoll(getenv("MAYA_GLM_PIN_CAP_MB")) << 20 : -1;
     if (cap >= 0 && g_pin_held + (int64_t) bytes > cap) return cudaErrorMemoryAllocation;
     const cudaError_t e = cudaHostAlloc(p, bytes, flags);
     if (e == cudaSuccess) g_pin_held += (int64_t) bytes;
@@ -826,12 +826,12 @@ bool Glm5Model::fast_setup(std::string& err) {
         err = std::string("glm fast: ") + why;   // B2.1: the routing ring's limits, refused up front
         return false;
     }
-    F->timing = getenv("STRATA_GLM_TIMING") != nullptr;
-    F->prof_on = getenv("STRATA_GLM_PROF") != nullptr;
-    if (F->prof_on) F->pskip = (uint64_t) std::max(0, std::atoi(getenv("STRATA_GLM_PROF")));
-    if (const char* pn = getenv("STRATA_GLM_PREFETCH_N")) {
+    F->timing = getenv("MAYA_GLM_TIMING") != nullptr;
+    F->prof_on = getenv("MAYA_GLM_PROF") != nullptr;
+    if (F->prof_on) F->pskip = (uint64_t) std::max(0, std::atoi(getenv("MAYA_GLM_PROF")));
+    if (const char* pn = getenv("MAYA_GLM_PREFETCH_N")) {
         F->max_pf = std::max(0, std::min(gf::kSpares - 1, std::atoi(pn)));
-        if (F->max_pf > 0 && getenv("STRATA_GLM_PF_CE") != nullptr && std::atoi(getenv("STRATA_GLM_PF_CE")) != 0) {
+        if (F->max_pf > 0 && getenv("MAYA_GLM_PF_CE") != nullptr && std::atoi(getenv("MAYA_GLM_PF_CE")) != 0) {
             int lo = 0, hi = 0;
             cudaDeviceGetStreamPriorityRange(&lo, &hi);
             if (cudaStreamCreateWithPriority(&F->pfce_stream, cudaStreamNonBlocking, hi) == cudaSuccess &&
@@ -848,9 +848,9 @@ bool Glm5Model::fast_setup(std::string& err) {
         }
         // said at start: the prefetch's settings are read once and nothing else shows them (#6)
         if (F->max_pf > 0) {
-            const char* at = getenv("STRATA_GLM_PREFETCH_AT");
-            const char* bl = getenv("STRATA_GLM_PREFETCH_BLOCKS");
-            const char* rk = getenv("STRATA_GLM_PREFETCH_RANK");
+            const char* at = getenv("MAYA_GLM_PREFETCH_AT");
+            const char* bl = getenv("MAYA_GLM_PREFETCH_BLOCKS");
+            const char* rk = getenv("MAYA_GLM_PREFETCH_RANK");
             std::fprintf(stderr, "glm fast: CUDA%d prefetch on: up to %d of the next layer's predicted experts a layer%s, "
                                  "the copy at %s, %s blocks, %s\n", dev_, F->max_pf,
                          std::atoi(pn) > F->max_pf ? " (MAYA_GLM_PREFETCH_N is at most 2)" : "",
@@ -859,11 +859,11 @@ bool Glm5Model::fast_setup(std::string& err) {
                          rk != nullptr ? (std::string("prediction ranks 1-") + rk).c_str() : "any prediction rank");
         }
     }
-    // RAM-resident mode (--glm-ram-resident / STRATA_GLM_RAM_RESIDENT=1): the RAM tier's per-class cap grows by
+    // RAM-resident mode (--glm-ram-resident / MAYA_GLM_RAM_RESIDENT=1): the RAM tier's per-class cap grows by
     // ram_slack slots per MoE layer so it holds EVERY expert VRAM does not; nothing is ever dropped to disk and the
     // start fails when the tier cannot hold them all - the disk is the pack's home, never a read source at runtime
-    F->ram_resident = getenv("STRATA_GLM_RAM_RESIDENT") != nullptr && std::atoi(getenv("STRATA_GLM_RAM_RESIDENT")) != 0;
-    if (const char* rs = getenv("STRATA_GLM_RAM_SLACK")) F->ram_slack = std::max(0, std::atoi(rs));
+    F->ram_resident = getenv("MAYA_GLM_RAM_RESIDENT") != nullptr && std::atoi(getenv("MAYA_GLM_RAM_RESIDENT")) != 0;
+    if (const char* rs = getenv("MAYA_GLM_RAM_SLACK")) F->ram_slack = std::max(0, std::atoi(rs));
     else if (F->ram_resident) F->ram_slack = 16;
     if (cudaStreamCreateWithFlags(&F->cs, cudaStreamNonBlocking) != cudaSuccess ||
         cudaStreamCreateWithFlags(&F->copy, cudaStreamNonBlocking) != cudaSuccess ||
@@ -1168,11 +1168,11 @@ bool Glm5Model::fast_setup(std::string& err) {
     size_t win_free0 = 0, win_total = 0;
     cudaMemGetInfo(&win_free0, &win_total);
     if (dflash_on_ && !win_reserve(err)) return false;
-    // the pipelined MTP decode over a split (STRATA_GLM_SPEC_WIN, decode_spec_pipe in glm_mtp.cu): every part gets
+    // the pipelined MTP decode over a split (MAYA_GLM_SPEC_WIN, decode_spec_pipe in glm_mtp.cu): every part gets
     // the verify window's buffers and its own recurrent-state backup (the window commits restore/replay per part),
     // and the NextN block's part also the cache rows' buffers and the draft head; all before the pool takes the card
     if (!dflash_on_ && g_.nextn > 0) {
-        const char* swe = getenv("STRATA_GLM_SPEC_WIN");
+        const char* swe = getenv("MAYA_GLM_SPEC_WIN");
         if (swe != nullptr && std::atoi(swe) != 0) {
             if (!win_reserve(err) || !spec_kda_reserve(err)) return false;
             if (mtp_il_ >= 0 && l1_ == g_.n_layers) {
@@ -1193,7 +1193,7 @@ bool Glm5Model::fast_setup(std::string& err) {
             std::fprintf(stderr, "glm mtp: CUDA%d %s - decoding token by token\n", dev_, werr.c_str());
         }
     }
-    // several conversations drafting with the NextN block (STRATA_GLM_MULTI_MTP, glm_mtp_rows.cu): the commit's replay
+    // several conversations drafting with the NextN block (MAYA_GLM_MULTI_MTP, glm_mtp_rows.cu): the commit's replay
     // scratch on every part; on the part with the block, its cache rows' buffers and the draft head's rows - the
     // drafts are fed from the host (no token_embd on the device) - before the pool too
     if (multi_mtp_setting() > 0 && !dflash_on_) {
@@ -1221,7 +1221,7 @@ bool Glm5Model::fast_setup(std::string& err) {
     // allocatable.  The head group is the parts [0, h) that kda_all walks; h comes from part_/n_parts_ because
     // split_next_ is linked only after every part has loaded.
     if (!dflash_on_ && g_.nextn > 0 && n_parts_ > 1 && part_ < spec_head_parts(n_parts_, g_.arch == GlmArch::GlmDsa) &&
-        !strata::platform::env_switch("STRATA_GLM_NO_MTP") && !strata::platform::env_switch("STRATA_GLM_NO_SPEC") &&
+        !strata::platform::env_switch("MAYA_GLM_NO_MTP") && !strata::platform::env_switch("MAYA_GLM_NO_SPEC") &&
         !spec_kda_reserve(err))
         return false;
     // ---- the expert pool: per-layer partitions (equal quota per layer within its size class)
@@ -1248,14 +1248,14 @@ bool Glm5Model::fast_setup(std::string& err) {
             for (int i = 0; i < 8; ++i) sp[i] = (unsigned long long) (F->scratch + (size_t) i * sstride);
             cudaMemcpy(F->md.scratch, sp, sizeof sp, cudaMemcpyHostToDevice);
         }
-        // STRATA_GLM_GROUP_EXPERTS (the batched rows' experts, each once for its group: glm_rows.cu): every row of a
+        // MAYA_GLM_GROUP_EXPERTS (the batched rows' experts, each once for its group: glm_rows.cu): every row of a
         // group routes before the group's experts run, so a row's fetched experts cannot share the 8 slots above (the
         // verify window redoes itself token by token when its tokens take one twice; a batched step cannot) - row i
         // has slots [8 i, 8 i + 8) of rows_scr, row 0 the ones above.  The rows' route state (plans, the CPU lane's
         // answer slots, the grouping) is the verify window's, its rows a window's tokens (win_alloc).  Both before the
         // pool takes the card.
         if (glmfast::group_experts_on() && rows_ != nullptr) {
-            // (STRATA_GLM_MULTI_MTP: a group's verify windows take more rows than it has conversations - the rows past
+            // (MAYA_GLM_MULTI_MTP: a group's verify windows take more rows than it has conversations - the rows past
             // the conversations' own name earlier rows' slots, and group only while every expert is in VRAM)
             const int mm = multi_mtp_setting() > 0 ? multi_mtp_cap() : 0;
             const int R = std::min(mm > 0 ? 8 : rows_max(), n_parts_ > 1 ? split_rows_setting() : seq_count());
@@ -1284,7 +1284,7 @@ bool Glm5Model::fast_setup(std::string& err) {
                 cpu_win_alloc(F, g, exl3_);   // the merged CPU lane's rows (win_cpu_merged)
                 F->rows_group = R;
                 F->rows_scr_rows = RT;
-                std::fprintf(stderr, "glm fast: CUDA%d grouped rows' experts (STRATA_GLM_GROUP_EXPERTS): up to %d rows, "
+                std::fprintf(stderr, "glm fast: CUDA%d grouped rows' experts (MAYA_GLM_GROUP_EXPERTS): up to %d rows, "
                              "%.0f MB of scratch slots and %.0f MB of route state\n", dev_, R, (double) extra / 1e6,
                              (double) (f0 > f1 ? f0 - f1 : 0) / 1e6);
             }
@@ -1343,7 +1343,7 @@ bool Glm5Model::fast_setup(std::string& err) {
             if (sc > 0) {
                 avail -= std::min(avail, sc);
                 std::fprintf(stderr, "glm fast: CUDA%d the prompt path's MMQ scratch pool keeps %.0f MB of the free VRAM "
-                                     "(STRATA_GLM_MMQ_RESERVE_MB): the expert pool is sized without it\n",
+                                     "(MAYA_GLM_MMQ_RESERVE_MB): the expert pool is sized without it\n",
                              dev_, (double) sc / 1048576.0);
             }
         }
@@ -1363,7 +1363,7 @@ bool Glm5Model::fast_setup(std::string& err) {
             }
             if (avail_kb > 0) avail_kb += (long long) (glmfast::zfs_arc_reclaimable() >> 10);
             double head_gb = 16.0;
-            if (const char* h = getenv("STRATA_GLM_RAM_HEADROOM_GB")) head_gb = std::max(0.0, std::atof(h));
+            if (const char* h = getenv("MAYA_GLM_RAM_HEADROOM_GB")) head_gb = std::max(0.0, std::atof(h));
             size_t expert_bytes = 0;
             for (int il = l0_; il < lt_; ++il) {
                 const auto& Ly = F->L[(size_t) il];
@@ -1379,11 +1379,11 @@ bool Glm5Model::fast_setup(std::string& err) {
             }
         }
 #endif
-        if (const char* cap = getenv("STRATA_GLM_POOL_GB"))
+        if (const char* cap = getenv("MAYA_GLM_POOL_GB"))
             avail = std::min(avail, (size_t) (std::atof(cap) * 1073741824.0));
-        // STRATA_GLM_VRAM_GB=<n>: behave like a card with n GB - the cap counts everything this process already
+        // MAYA_GLM_VRAM_GB=<n>: behave like a card with n GB - the cap counts everything this process already
         // holds on the device (context, dense weights, state, arenas), so the pool gets what such a card would have
-        if (const char* vc = getenv("STRATA_GLM_VRAM_GB")) {
+        if (const char* vc = getenv("MAYA_GLM_VRAM_GB")) {
             const size_t cap = (size_t) (std::atof(vc) * 1073741824.0);
             const size_t used = total_b - free_b;
             const size_t room = cap > used + reserve ? cap - used - reserve : 0;
@@ -1415,7 +1415,7 @@ bool Glm5Model::fast_setup(std::string& err) {
                   (pool_b_.fixed > 0 ? "a larger --expert-cache (" + std::to_string(pool_b_.fixed) + " now) or auto, "
                                      : std::string()) +
                   (pool_b_.reserve_given
-                       ? std::string(part_ > 0 && getenv("STRATA_GLM_RESERVE_LATER_MB") ? "a smaller --vram-reserve-later-mib ("
+                       ? std::string(part_ > 0 && getenv("MAYA_GLM_RESERVE_LATER_MB") ? "a smaller --vram-reserve-later-mib ("
                                                                                        : "a smaller --vram-reserve-mib (") +
                              std::to_string(reserve >> 20) + " now), "
                        : std::string()) +
@@ -1439,10 +1439,10 @@ bool Glm5Model::fast_setup(std::string& err) {
         // only the tail, the decode never misses, the RAM tier is staging only and the CPU lane has nothing to take.
         // Any device whose budget holds it (a discrete card too: the slots past the experts cost only budget nothing
         // else used); Linux's unified-memory budget is the experts' bytes exactly, so it keeps its own policy there.
-        // STRATA_GLM_COMPLETE_POOL=0: the capped pool (A/B); on by default on every GPU (complete_pool_on, #474).
+        // MAYA_GLM_COMPLETE_POOL=0: the capped pool (A/B); on by default on every GPU (complete_pool_on, #474).
         {
             int k_full = pf_ != nullptr ? tail_slots(prefill_borrow_bytes()) : 0;
-            if (const char* v = getenv("STRATA_GLM_VISION_LEND_MB"); v != nullptr && dev_ == 0)
+            if (const char* v = getenv("MAYA_GLM_VISION_LEND_MB"); v != nullptr && dev_ == 0)
                 k_full = std::max(k_full, tail_slots((size_t) std::max(0LL, std::atoll(v)) << 20));
             const int full = glmfast::complete_pool_on() && !F->unified_memory
                                  ? glmfast::complete_pool_slots(avail, stride_sum, g.n_expert, gf::kSpares, k_full)
@@ -1467,10 +1467,10 @@ bool Glm5Model::fast_setup(std::string& err) {
                 k_extra = 0;
             }
         }
-        // an on-demand vision encoder on the first GPU (the server sets STRATA_GLM_VISION_LEND_MB) borrows the same
+        // an on-demand vision encoder on the first GPU (the server sets MAYA_GLM_VISION_LEND_MB) borrows the same
         // tail while it encodes, so the tail there is the larger of the two needs
         vis_lend_ok_ = false;
-        if (const char* v = getenv("STRATA_GLM_VISION_LEND_MB"); v != nullptr && dev_ == 0) {
+        if (const char* v = getenv("MAYA_GLM_VISION_LEND_MB"); v != nullptr && dev_ == 0) {
             const size_t vb = (size_t) std::max(0LL, std::atoll(v)) << 20;
             if (vb > 0 && per - tail_slots(vb) >= g.n_exp_used + gf::kSpares + 8) {
                 k_extra = std::max(k_extra, tail_slots(vb));
@@ -1495,14 +1495,14 @@ bool Glm5Model::fast_setup(std::string& err) {
         // the slots PER LAYER: uniform, or - with the expert profile, else the pack's expert_counts.txt
         // (tools/glm_expert_prior.py) - by routing share: every layer gets a floor, then each further slot goes to the
         // layer whose next-most-routed expert serves the largest share of its lookups (early layers spread their
-        // routing wide and gain the most).  STRATA_GLM_UNIFORM_SLOTS=1 keeps the uniform split (A/B).
+        // routing wide and gain the most).  MAYA_GLM_UNIFORM_SLOTS=1 keeps the uniform split (A/B).
         std::vector<int> nsl((size_t) NL, 0);
         for (int il = l0_; il < lt_; ++il)
             if (F->L[(size_t) il].moe) nsl[(size_t) il] = per;
         // When the APU can hold every expert, keep exactly that many slots in each
         // layer rather than spending the capped budget on uneven partitions/spares
         // (a complete pool likewise: every layer already holds all of its experts).
-        if (getenv("STRATA_GLM_UNIFORM_SLOTS") == nullptr && !(F->unified_memory && per == g.n_expert) &&
+        if (getenv("MAYA_GLM_UNIFORM_SLOTS") == nullptr && !(F->unified_memory && per == g.n_expert) &&
             !F->complete) {
             std::vector<std::vector<double>> share((size_t) NL);
             // a profile's ranking as shares: each layer's experts in profile order, valued 1 / (1 + their rank in
@@ -1691,7 +1691,7 @@ bool Glm5Model::fast_setup(std::string& err) {
                      F->complete ? (" - complete: every expert, " + std::to_string(gf::kSpares) + " spares and " +
                                     std::to_string(k_extra) + " lendable slots a layer").c_str()
                                  : "");
-        if (getenv("STRATA_GLM_TIMING") != nullptr) {
+        if (getenv("MAYA_GLM_TIMING") != nullptr) {
             std::string sl;
             for (int il = l0_; il < lt_; ++il)
                 if (F->L[(size_t) il].moe) sl += std::to_string(il) + ":" + std::to_string(nsl[(size_t) il]) + " ";
@@ -1701,11 +1701,11 @@ bool Glm5Model::fast_setup(std::string& err) {
         // the model's clean page cache goes first (once): the experts are read with O_DIRECT, so it never serves the
         // engine, and on a 2-socket host it fills one node - MPOL_INTERLEAVE then falls back instead of reclaiming
         // (49 GB of the GGUF cached on node 1 left a 100 GB tier 78% on node 0: the CPU lane read one node's
-        // controllers, ~60 instead of ~92 GB/s).  Pages some process still maps stay.  STRATA_GLM_DROP_CACHE=0 keeps it.
+        // controllers, ~60 instead of ~92 GB/s).  Pages some process still maps stay.  MAYA_GLM_DROP_CACHE=0 keeps it.
 #ifdef __linux__   // (numa_nodes() is empty elsewhere; posix_fadvise is POSIX)
         {
             static std::atomic<bool> dropped{false};
-            const char* dc = getenv("STRATA_GLM_DROP_CACHE");
+            const char* dc = getenv("MAYA_GLM_DROP_CACHE");
             if ((dc == nullptr || std::atoi(dc) != 0) && numa_nodes().size() >= 2 && !dropped.exchange(true)) {
                 for (const Shard& sh : pack_shards_)
                     if (sh.fd >= 0) posix_fadvise(sh.fd, 0, 0, POSIX_FADV_DONTNEED);
@@ -1748,8 +1748,8 @@ bool Glm5Model::fast_setup(std::string& err) {
         int64_t budget = ram_budget_;
         // (a complete pool too: nothing is outside VRAM to hold - the 8065S's 32 GB of OS RAM keep ~0.6 GB more)
         const bool staging_only = glmfast::minimal_ram_tier(F->unified_memory || F->complete, nmin >= g.n_expert,
-                                                           ram_budget_ >= 0 || getenv("STRATA_GLM_RAM_GB") != nullptr);
-        const char* balanced_env = getenv("STRATA_GLM_RAM_BALANCED");
+                                                           ram_budget_ >= 0 || getenv("MAYA_GLM_RAM_GB") != nullptr);
+        const char* balanced_env = getenv("MAYA_GLM_RAM_BALANCED");
         const bool balanced_ram = glmfast::balanced_resident_ram(balanced_env && std::atoi(balanced_env) != 0,
                                                                   F->ram_resident, staging_only);
         if (balanced_ram && n_parts_ != 1) {
@@ -1764,7 +1764,7 @@ bool Glm5Model::fast_setup(std::string& err) {
         }
         // the whole machine's budget is measured ONCE (the first half's pinning would shrink what the second
         // half sees): MemAvailable minus headroom for the OS, the server and the page cache the disk reads go
-        // through; STRATA_GLM_RAM_GB pins it.  Each half takes its share of the MoE layers still unserved,
+        // through; MAYA_GLM_RAM_GB pins it.  Each half takes its share of the MoE layers still unserved,
         // and whatever a half cannot use (its experts already fit) passes on to the next half.
         // The later parts' prompt path pins after this measurement (their token rows and landing ring, and the rows a
         // middle part hands on), and that came out of the headroom: one part's staging fits in it (two GPUs: 2x V100,
@@ -1780,12 +1780,12 @@ bool Glm5Model::fast_setup(std::string& err) {
         const int64_t unseen_pf = (int64_t) std::max(0, later - 1) * (int64_t) pinned_pf.staging +
                                   (int64_t) std::max(0, later - 1) * (int64_t) pinned_pf.hop;
         double head_gb = F->unified_memory ? 16.0 : 6.0;
-        if (const char* h = getenv("STRATA_GLM_RAM_HEADROOM_GB")) head_gb = std::max(0.0, std::atof(h));
+        if (const char* h = getenv("MAYA_GLM_RAM_HEADROOM_GB")) head_gb = std::max(0.0, std::atof(h));
         const int64_t head_b = (int64_t) (head_gb * 1073741824.0);
-        const bool fixed_ram = getenv("STRATA_GLM_RAM_GB") != nullptr;
+        const bool fixed_ram = getenv("MAYA_GLM_RAM_GB") != nullptr;
         if (budget < 0) {
             if (total < 0) {
-                if (const char* rg = getenv("STRATA_GLM_RAM_GB")) {
+                if (const char* rg = getenv("MAYA_GLM_RAM_GB")) {
                     total = (int64_t) (std::atof(rg) * 1073741824.0);
                 } else {
                     int64_t avail_kb = 0;
@@ -1824,7 +1824,7 @@ bool Glm5Model::fast_setup(std::string& err) {
                 }
                 remaining = total;
                 remaining_layers =
-                    g.n_layers - g.dense_lead + (strata::platform::env_switch("STRATA_GLM_NO_MTP") ? 0 : g.nextn);
+                    g.n_layers - g.dense_lead + (strata::platform::env_switch("MAYA_GLM_NO_MTP") ? 0 : g.nextn);
             }
             // the last half takes everything left (one device: the NextN block, counted above, is not loaded)
             budget = l1_ >= g.n_layers ? remaining
@@ -1945,7 +1945,7 @@ bool Glm5Model::fast_setup(std::string& err) {
 #else
         const bool amd_room = false;
 #endif
-        static const int64_t room_mb = getenv("STRATA_GLM_PIN_ROOM_MB") ? std::atoll(getenv("STRATA_GLM_PIN_ROOM_MB")) : -1;
+        static const int64_t room_mb = getenv("MAYA_GLM_PIN_ROOM_MB") ? std::atoll(getenv("MAYA_GLM_PIN_ROOM_MB")) : -1;
         int64_t pin_left = -1, pin_cap = -1;
         const auto pin_keep = [&]() {
             return glmfast::pin_cap_room(amd_room, pin_cap >= 0 ? pin_cap : g_pin_held, room_mb);
@@ -1956,11 +1956,11 @@ bool Glm5Model::fast_setup(std::string& err) {
             const double f = (double) std::max<int64_t>(0, pin_left - pin_keep()) / (double) std::max<int64_t>(1, planned);
             return (int64_t) (f * (double) cls_n[c]);
         };
-        // a class pinned in pieces of at most STRATA_GLM_PIN_PIECE_MB (Windows: 1024 by default; 0: one block, as on
+        // a class pinned in pieces of at most MAYA_GLM_PIN_PIECE_MB (Windows: 1024 by default; 0: one block, as on
         // Linux): a block of many GB takes far more of Windows' per-process pinning budget than its size - 61 GB pin in
         // 1 GB pieces where the largest single block is ~21 GB - so a 2-GPU split's first part left its second 0 GB and
         // the start failed (#417)
-        static const int64_t piece_mb = getenv("STRATA_GLM_PIN_PIECE_MB") ? std::atoll(getenv("STRATA_GLM_PIN_PIECE_MB"))
+        static const int64_t piece_mb = getenv("MAYA_GLM_PIN_PIECE_MB") ? std::atoll(getenv("MAYA_GLM_PIN_PIECE_MB"))
 #ifdef _WIN32
                                                                           : 1024;
 #else
@@ -2127,28 +2127,28 @@ bool Glm5Model::fast_setup(std::string& err) {
         F->upd_gen.assign(F->upd_at.size(), 0u);
         // disk reads: three slices per expert in parallel, through the staging above when the RAM tier has no free slot
         F->workers.reset(new Workers(8));
-        // STRATA_GLM_DISK_SKIP_FROM=<n>: a trunk expert at route rank >= n that is in neither VRAM nor the RAM tier is
+        // MAYA_GLM_DISK_SKIP_FROM=<n>: a trunk expert at route rank >= n that is in neither VRAM nor the RAM tier is
         // left out of the token instead of read from the disk (an approximation: off by default).  Where the experts do
         // not fit in VRAM + RAM the disk reads are most of a token (a 3090 + 60 GB RAM beside one SATA SSD: ~13 reads,
         // 155 of 190 ms) and they fall on the low ranks (ranks 4-7 held 63% of them in a chat).
-        if (const char* v = getenv("STRATA_GLM_DISK_SKIP_FROM")) F->disk_skip_from = std::max(0, std::min(8, std::atoi(v)));
-        // STRATA_GLM_DISK_SKIP_W=<share>: also, at any rank, a disk-only expert whose share of the route's weights is
+        if (const char* v = getenv("MAYA_GLM_DISK_SKIP_FROM")) F->disk_skip_from = std::max(0, std::min(8, std::atoi(v)));
+        // MAYA_GLM_DISK_SKIP_W=<share>: also, at any rank, a disk-only expert whose share of the route's weights is
         // below this (the route's rank follows score + bias, the weight the score alone)
-        if (const char* v = getenv("STRATA_GLM_DISK_SKIP_W")) F->disk_skip_w = (float) std::max(0.0, std::atof(v));
-        // STRATA_GLM_MISS_SKIP_W=<share> (changes the answers): a routed expert NOT IN VRAM whose share of the route's
-        // weights is below this is left out (no PCIe fetch, no CPU work), on layers from STRATA_GLM_MISS_SKIP_FROM
+        if (const char* v = getenv("MAYA_GLM_DISK_SKIP_W")) F->disk_skip_w = (float) std::max(0.0, std::atof(v));
+        // MAYA_GLM_MISS_SKIP_W=<share> (changes the answers): a routed expert NOT IN VRAM whose share of the route's
+        // weights is below this is left out (no PCIe fetch, no CPU work), on layers from MAYA_GLM_MISS_SKIP_FROM
         // (default 0) on; a request's strata_tune miss_skip_w / miss_skip_from override both for it - TRUNK_KEEP's
         // idea by weight instead of rank.  GLM-5.3's late layers take it far better than its early ones (Maya-S24 on an
         // RTX 3090, layers 23+: 0.12 / 0.14 / 0.16 -> KL 0.037 / 0.052 / 0.075 against the full model, decode +7-13%)
-        if (const char* v = getenv("STRATA_GLM_MISS_SKIP_W")) F->miss_w = (float) std::max(0.0, std::min(1.0, std::atof(v)));
-        if (const char* v = getenv("STRATA_GLM_MISS_SKIP_FROM")) F->miss_from = std::max(0, std::atoi(v));
+        if (const char* v = getenv("MAYA_GLM_MISS_SKIP_W")) F->miss_w = (float) std::max(0.0, std::min(1.0, std::atof(v)));
+        if (const char* v = getenv("MAYA_GLM_MISS_SKIP_FROM")) F->miss_from = std::max(0, std::atoi(v));
         if (F->miss_w > 0.0f)
             std::fprintf(stderr, "glm fast: CUDA%d light misses left out: weight share < %.3f on layers %d+ (changes the "
                                  "answers)\n", dev_, F->miss_w, F->miss_from);
         // LOOKAHEAD: the predictions per layer, a load state per RAM slot, and the reader threads
-        if (const char* ah = getenv("STRATA_GLM_AHEAD")) F->n_ahead = std::max(0, std::min(gf::kAhead, std::atoi(ah)));
+        if (const char* ah = getenv("MAYA_GLM_AHEAD")) F->n_ahead = std::max(0, std::min(gf::kAhead, std::atoi(ah)));
         if (g.n_expert > 512) F->n_ahead = 0;
-        const char* ahr = getenv("STRATA_GLM_AHEAD_READ");
+        const char* ahr = getenv("MAYA_GLM_AHEAD_READ");
         F->ahead_read = F->n_ahead > 0 && (ahr == nullptr || std::atoi(ahr) != 0);
         std::array<std::array<short, 8>, gf::kAhead> none;
         for (auto& r : none) r.fill(-1);
@@ -2159,7 +2159,7 @@ bool Glm5Model::fast_setup(std::string& err) {
         }
         if (F->ahead_read)
             for (int i = 0; i < 2; ++i) F->ah_th.emplace_back([this] { fast_ahead_reader(); });
-        const char* wv = getenv("STRATA_GLM_WARM");
+        const char* wv = getenv("MAYA_GLM_WARM");
         if ((wv == nullptr || std::atoi(wv) != 0) && !fast_warm(err)) return false;
 #ifdef _WIN32
         // #56: which node the tier drew this start - visibility only, the engine cannot place it.  Only on a PC with two
@@ -2195,7 +2195,7 @@ bool Glm5Model::fast_setup(std::string& err) {
         }
 #endif
         // RAM-resident mode is all-or-nothing: after the warm, every expert must be in VRAM or the RAM tier -
-        // one that fits neither would be read from disk at runtime (STRATA_GLM_WARM=0 fills on demand: no check)
+        // one that fits neither would be read from disk at runtime (MAYA_GLM_WARM=0 fills on demand: no check)
         if (F->ram_resident && (wv == nullptr || std::atoi(wv) != 0)) {
             int uncovered = 0, total = 0;
             for (int il = l0_; il < lt_; ++il) {
@@ -2243,10 +2243,10 @@ bool Glm5Model::fast_setup_finish(std::string& err) {
     F->lane_pending = false;
     cudaSetDevice(dev_);
     if (!fast_cpu_lane_setup(err)) return false;   // keep the existing CPU pool/calibration for batched prefill
-    if (const char* h = getenv("STRATA_GLM_EXPERT_HELPER"); h != nullptr && h[0] != '\0')
+    if (const char* h = getenv("MAYA_GLM_EXPERT_HELPER"); h != nullptr && h[0] != '\0')
         if (!fast_helper_setup(err)) return false;
     F->svc = std::thread([this] { fast_service(); });
-    const std::vector<int> svc_cpus = cpu_list_env("STRATA_GLM_SVC_CPUS" + std::to_string(dev_));
+    const std::vector<int> svc_cpus = cpu_list_env("MAYA_GLM_SVC_CPUS" + std::to_string(dev_));
     glmfast::pin_thread(F->svc.native_handle(), svc_cpus.empty() ? F->cpu_pin : svc_cpus);   // (the CPU lane's last worker: on its pool's node)
     return true;
 }
@@ -2256,11 +2256,11 @@ bool Glm5Model::fast_helper_setup(std::string& err) {
     FastState* F = fast_;
     // the helper's device is its own: not this part's, nor any part's of a layer split (each part opens its own
     // helper there - an integrated one aliases this part's RAM tier - over its own layers [l0_, lt_))
-    const int device = std::atoi(getenv("STRATA_GLM_EXPERT_HELPER"));
+    const int device = std::atoi(getenv("MAYA_GLM_EXPERT_HELPER"));
     const bool a_part = device == dev_ || std::find(split_devs_.begin(), split_devs_.end(), device) != split_devs_.end();
-    // an EXL3 pack's experts only with STRATA_GLM_HELPER_EXL3=1 (opt-in, as DS4_HELPER_EXL3): the helper then owns the
+    // an EXL3 pack's experts only with MAYA_GLM_HELPER_EXL3=1 (opt-in, as DS4_HELPER_EXL3): the helper then owns the
     // mul1 (cb 2) layers' experts - those the CPU lane's kernel takes, whose answer the device adds (cpu_fmt below)
-    const char* hx = getenv("STRATA_GLM_HELPER_EXL3");
+    const char* hx = getenv("MAYA_GLM_HELPER_EXL3");
     const bool exl3_helper = exl3_ && hx != nullptr && std::strcmp(hx, "1") == 0;
     if (a_part || (exl3_ && !exl3_helper) || g_.n_embd > 4096 || g_.n_exp_used > 8) {
         err = "GLM expert helper: a device of its own (not a trunk GPU or a part of the split) and native GGUF experts "
@@ -2272,8 +2272,8 @@ bool Glm5Model::fast_helper_setup(std::string& err) {
         for (size_t i = 0; i < r.n_parts(); ++i) regions.push_back({r.part(i), r.part_slots(i) * r.stride});
     if (exl3_helper) {
         // a Pascal helper (sm_61 / 62: FP16 at 1/64 of its F32 rate) decodes with legacy-f32 - v1.1.8's kernels, the
-        // same bits, ~5.5x faster there (a P4000, 6 experts: 3.87 -> 0.69 ms) - unless STRATA_GLM_EXL3_DECODE<n> or
-        // STRATA_GLM_EXL3_DECODE names its kernels; the trunk GPUs keep their own choice
+        // same bits, ~5.5x faster there (a P4000, 6 experts: 3.87 -> 0.69 ms) - unless MAYA_GLM_EXL3_DECODE<n> or
+        // MAYA_GLM_EXL3_DECODE names its kernels; the trunk GPUs keep their own choice
         int major = 0, minor = 0;
         cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device);
         cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device);
@@ -2281,7 +2281,7 @@ bool Glm5Model::fast_helper_setup(std::string& err) {
             std::fprintf(stderr, "glm helper: CUDA%d (sm_%d%d) decodes its EXL3 experts with %s\n", device, major, minor,
                          strata::kernels::exl3::prefer_legacy_f32(device)
                              ? "legacy-f32 (v1.1.8's kernels, the weights decoded in FP32: the same bits)"
-                             : "the kernels STRATA_GLM_EXL3_DECODE names");
+                             : "the kernels MAYA_GLM_EXL3_DECODE names");
     }
     if (!F->helper.open(device, g_.n_embd, g_.n_ff_exp, regions, err, exl3_helper)) return false;
     // (an EXL3 layer's experts on the helper: mul1's, not the MTP layer's - the layers whose answer the device adds,
@@ -2365,9 +2365,9 @@ bool Glm5Model::fast_helper_setup(std::string& err) {
     }
     F->cpu_retime = false;
     F->cal_key.clear();   // the CPU's decode timing must not re-plan the GPU helper's lane
-    if (const char* ov = getenv("STRATA_GLM_HELPER_OVERLAP"); ov != nullptr && std::strcmp(ov, "1") == 0) {
+    if (const char* ov = getenv("MAYA_GLM_HELPER_OVERLAP"); ov != nullptr && std::strcmp(ov, "1") == 0) {
         F->helper_overlap = true;
-        std::fprintf(stderr, "glm helper: CUDA%d's experts run beside the CPU lane's in a route (STRATA_GLM_HELPER_OVERLAP)\n",
+        std::fprintf(stderr, "glm helper: CUDA%d's experts run beside the CPU lane's in a route (MAYA_GLM_HELPER_OVERLAP)\n",
                      device);
     }
     if (n_parts_ > 1)
@@ -2384,7 +2384,7 @@ bool Glm5Model::fast_helper_setup(std::string& err) {
     return true;
 }
 
-// STRATA_GLM_HELPER_CHECK=<n> (a load-time self-check, off by default): a SAMPLE of the expert helper's work for this
+// MAYA_GLM_HELPER_CHECK=<n> (a load-time self-check, off by default): a SAMPLE of the expert helper's work for this
 // part - of each MoE layer it serves ([l0_, lt_)), up to n of the experts it owns (spread over them, n <= 8; not every
 // owned expert): their RAM-tier bytes against the pack's own, then their weighted sum on a fixed input by the helper
 // and by this part's GPU with the same kernels from the pack's bytes.  It tests the helper's keys and mapping (a layer
@@ -2394,7 +2394,7 @@ bool Glm5Model::fast_helper_setup(std::string& err) {
 // holding helper experts and those checked (always equal).  The decode reads nothing the check touches.
 bool Glm5Model::fast_helper_check(std::string& err) {
     FastState* F = fast_;
-    const char* hc = getenv("STRATA_GLM_HELPER_CHECK");
+    const char* hc = getenv("MAYA_GLM_HELPER_CHECK");
     if (F == nullptr || hc == nullptr) return true;
     const int per_layer = std::max(0, std::min(8, std::atoi(hc)));
     if (per_layer == 0) return true;
@@ -2614,7 +2614,7 @@ struct X3Rows {
 };
 
 // a merged layer's CPU-lane rows (win_cpu_merged): each token's activation quant, each entry's h quant and rows - the
-// window lanes' (win_lanes_make) and the grouped batched rows' (STRATA_GLM_GROUP_EXPERTS, fast_setup)
+// window lanes' (win_lanes_make) and the grouped batched rows' (MAYA_GLM_GROUP_EXPERTS, fast_setup)
 void cpu_win_alloc(Glm5Model::FastState* F, const Glm5Geometry& g, bool exl3) {
     namespace kc = strata::kernels::cpu;
     constexpr int kWinMax = Glm5Model::kWinMax;
@@ -2793,12 +2793,12 @@ void x3_jobs(glmfast::Workers& pool, int n, int E, int FF, const GP& gu_prep, co
 // a route's CPU-lane experts on `pool` with the scratch rows act / hq / ff / dn / x3 (fast_cpu_experts: cpu_pool and
 // the lane's own rows; a verify window's lanes: their pools and rows) - each row's dot is one job's, so the answer is
 // the same bit for bit whatever the pool
-// STRATA_GLM_LANE_PROF=1: the CPU lane's calls timed by stage (activation quant, gate/up, h quant, down, sum), with
+// MAYA_GLM_LANE_PROF=1: the CPU lane's calls timed by stage (activation quant, gate/up, h quant, down, sum), with
 // their experts a call, printed every 4096 calls (all parts together)
 struct LaneProf {
     std::atomic<uint64_t> calls{0}, experts{0}, us[5] = {}, ne_hist[9] = {};
     static bool on() {
-        static const bool v = getenv("STRATA_GLM_LANE_PROF") != nullptr;
+        static const bool v = getenv("MAYA_GLM_LANE_PROF") != nullptr;
         return v;
     }
     void add(int ne, const std::chrono::steady_clock::time_point* t) {
@@ -2834,13 +2834,13 @@ void Glm5Model::lane_experts(glmfast::Workers& pool, uint8_t* act, uint8_t* hq, 
     // down rows likewise), the weighted sum after.  Each thread streams its share in one piece - 2-socket Xeon, 5
     // Q3_K experts from DRAM, 40 threads: 0.154 ms an expert vs 0.201 with 32/64-row jobs claimed in turn (the short
     // streams held the memory system to ~55 of the ~92 GB/s one socket reads; a pure read of the same jobs did too).
-    // The run is cut in contiguous pieces claimed in turn, about 48 in all (STRATA_GLM_CPU_SPLIT=<pieces a thread>
+    // The run is cut in contiguous pieces claimed in turn, about 48 in all (MAYA_GLM_CPU_SPLIT=<pieces a thread>
     // overrides): with few threads a thread the disk readers or the service thread delay no longer holds up the whole
     // call, with many each still streams its share in one piece.  1x V100, 6-core i5, Maya-S decode: one piece a thread
     // 14.3 tok/s (the lane 34 ms a token), 2: 15.7, 4: 16.8, 8: 17.1 (21 ms; v1.0.11's 64-row jobs 16.8); the 2-socket
     // Xeon above, 40 threads: one piece each
     static const int kSplitStart = [] {   // glm-dsa request knobs: the start value
-        const char* v = getenv("STRATA_GLM_CPU_SPLIT");
+        const char* v = getenv("MAYA_GLM_CPU_SPLIT");
         return v ? std::max(1, std::min(64, std::atoi(v))) : 0;
     }();
     const int kSplit = glmknob::get(glmknob::CpuSplit, kSplitStart);   // glm-dsa request knobs: GEN cpu_split=
@@ -2885,7 +2885,7 @@ void Glm5Model::lane_experts(glmfast::Workers& pool, uint8_t* act, uint8_t* hq, 
     mark(0);
     kc::native_quant_act(nf, x, act);
     mark(1);
-    // STRATA_GLM_ROW_HALVES' arenas (row_halves_of): the low half of each matrix's rows on node n0, the high half on n1.
+    // MAYA_GLM_ROW_HALVES' arenas (row_halves_of): the low half of each matrix's rows on node n0, the high half on n1.
     // Each phase's rows then go in two queues, one a node, and a thread takes its own node's jobs first, the other's
     // after - the rows and their arithmetic are the shared queue's below, so the answers are the same bit for bit
     const RowHalves* rh0 = ne <= 8 && n_ff % 2 == 0 && n_embd % 2 == 0 ? row_halves_of(blob[0]) : nullptr;
@@ -3034,7 +3034,7 @@ struct Glm5Model::FastState::WinLane {
 // 3.5x one, 40 threads of a Xeon 6152) - into the halves and the pieces, so no thread waits on the shared rows.
 // native_*_rows_split give every token exactly ggml's dot (the multi-token rows are checked bit for bit against it)
 // and each token's sum adds its own experts in its own order: every answer is fast_cpu_experts' for it alone, bit for
-// bit.  STRATA_GLM_WIN_CPU=0: a token a lane instead.
+// bit.  MAYA_GLM_WIN_CPU=0: a token a lane instead.
 // EXL3: the same with exl3_cpu_rows_acc_n, which decodes each tile row once for all the tokens of an expert (after
 // exllamav3's CPU kernel, which takes up to 4 token rows) - an extra token costs ~0.2 of one (K 3, one thread of a
 // Xeon 6152: 1 / 2 / 4 / 8 tokens 0.061 / 0.068 / 0.090 / 0.138 ms a band), so the second lane's socket adds its
@@ -3080,9 +3080,9 @@ void Glm5Model::win_cpu_merged(int il, int nb, const gf::MoeRequest* const* rq, 
     double load[2] = {0.0, 0.0};
     for (int u = 0; u < nu; ++u) order[u] = u;
     std::sort(order, order + nu, [&](int a, int b) { return cost(a) > cost(b); });
-    // (STRATA_GLM_WIN_X3_POOLS=1: an EXL3 layer on the first lane's pool alone - A/B)
+    // (MAYA_GLM_WIN_X3_POOLS=1: an EXL3 layer on the first lane's pool alone - A/B)
     static const int x3_pools = [] {
-        const char* v = getenv("STRATA_GLM_WIN_X3_POOLS");
+        const char* v = getenv("MAYA_GLM_WIN_X3_POOLS");
         return v != nullptr && std::atoi(v) == 1 ? 1 : 2;
     }();
     // a batched rows group (win_rows): every expert on this part's own pool - the other part's pool computes its group
@@ -3299,9 +3299,9 @@ void Glm5Model::fast_cpu_experts(int il, int ne, const uint8_t* const* blob, con
     const int n_ff = g.n_ff_exp, n_embd = g.n_embd;
     lane_experts(*F->cpu_pool, F->cpu_act.data(), F->cpu_hq.data(), F->cpu_ff.data(), F->cpu_dn.data(),
                  F->cpu_x3.data(), il, ne, blob, w, x, out);
-    // STRATA_GLM_CPU_LANE_VERIFY=1 (debug, slow): the same experts in double precision from ggml's dequantised rows;
+    // MAYA_GLM_CPU_LANE_VERIFY=1 (debug, slow): the same experts in double precision from ggml's dequantised rows;
     // the relative L2 distance of the lane's sum, accumulated and printed every 16 calls
-    static const bool verify = getenv("STRATA_GLM_CPU_LANE_VERIFY") != nullptr;
+    static const bool verify = getenv("MAYA_GLM_CPU_LANE_VERIFY") != nullptr;
     if (verify && !Ly.exl3) {
         static double e2 = 0, n2 = 0, worst = 0;
         static int calls = 0;
@@ -3344,9 +3344,9 @@ void Glm5Model::fast_cpu_experts(int il, int ne, const uint8_t* const* blob, con
 
 // The CPU lane's pool a split's parts share (fast_cpu_lane_setup): made by the first part, found by the later ones -
 // one model a process; a reload, or another count, makes a new one.  Concurrent (Workers): the parts' routes run at
-// once, a later part's jobs first (STRATA_GLM_CPU_CONCURRENT=0: one route at a time - A/B)
-// STRATA_GLM_POOL_CPUS=<cpu,cpu,...>: the shared pool's workers one to a CPU, in that order (unset: unpinned);
-// STRATA_GLM_SVC_CPUS<n>=<cpu,...>: CUDA<n>'s service thread (its routes' last worker) on those CPUs
+// once, a later part's jobs first (MAYA_GLM_CPU_CONCURRENT=0: one route at a time - A/B)
+// MAYA_GLM_POOL_CPUS=<cpu,cpu,...>: the shared pool's workers one to a CPU, in that order (unset: unpinned);
+// MAYA_GLM_SVC_CPUS<n>=<cpu,...>: CUDA<n>'s service thread (its routes' last worker) on those CPUs
 static std::vector<int> cpu_list_env(const std::string& name) {
     std::vector<int> v;
     const char* e = getenv(name.c_str());
@@ -3362,13 +3362,13 @@ static std::shared_ptr<glmfast::Workers> shared_cpu_pool(int threads) {
     static std::mutex mu;
     static std::weak_ptr<glmfast::Workers> held;
     static const bool concurrent = [] {
-        const char* v = getenv("STRATA_GLM_CPU_CONCURRENT");
+        const char* v = getenv("MAYA_GLM_CPU_CONCURRENT");
         return v == nullptr || std::atoi(v) != 0;
     }();
     std::lock_guard<std::mutex> lk(mu);
     std::shared_ptr<glmfast::Workers> p = held.lock();
     if (p == nullptr || p->size() != threads) {
-        const std::vector<int> cpus = cpu_list_env("STRATA_GLM_POOL_CPUS");
+        const std::vector<int> cpus = cpu_list_env("MAYA_GLM_POOL_CPUS");
         p = std::make_shared<glmfast::Workers>(threads - 1, 20000, cpus, concurrent, !cpus.empty());
         held = p;
     }
@@ -3412,7 +3412,7 @@ static int physical_cores() {
 #endif
 }
 
-// STRATA_GLM_CPU_CAL file: replace key's line with vals (empty: drop it)
+// MAYA_GLM_CPU_CAL file: replace key's line with vals (empty: drop it)
 static void cal_put(const std::string& file, const std::string& key, const std::string& vals) {
     std::string keep;
     if (FILE* cf = std::fopen(file.c_str(), "r")) {
@@ -3463,25 +3463,25 @@ static unsigned long long lane_plan(double c_ms, double p_ms, std::string* tab =
 }
 
 // The CPU LANE, on by default: one thread per physical core (split evenly across the parts of a layer split);
-// STRATA_GLM_CPU_LANE=<threads> sets the count, 0 turns it off; STRATA_GLM_CPU_LANE<n>=<threads> sets one GPU's own
+// MAYA_GLM_CPU_LANE=<threads> sets the count, 0 turns it off; MAYA_GLM_CPU_LANE<n>=<threads> sets one GPU's own
 // (CUDA<n>: a slow link wants more threads than a fast one).  Measures this machine once - one expert on the CPU
 // pool vs one over PCIe - and derives the split: of f RAM-tier experts in a route, the k the host computes so that
-// the slower of the two lanes finishes first (STRATA_GLM_CPU_PLAN=<digits for f = 0..8> overrides).  A CPU slower
+// the slower of the two lanes finishes first (MAYA_GLM_CPU_PLAN=<digits for f = 0..8> overrides).  A CPU slower
 // than the PCIe link at every f leaves the lane off.
 bool Glm5Model::fast_cpu_lane_setup(std::string& err) {
     FastState* F = fast_;
     const Glm5Geometry& g = g_;
-    const char* lv = getenv(("STRATA_GLM_CPU_LANE" + std::to_string(dev_)).c_str());
+    const char* lv = getenv(("MAYA_GLM_CPU_LANE" + std::to_string(dev_)).c_str());
     const bool own_count = lv != nullptr;   // this card's own count: a pool of its own
-    if (lv == nullptr) lv = getenv("STRATA_GLM_CPU_LANE");
+    if (lv == nullptr) lv = getenv("MAYA_GLM_CPU_LANE");
     // a split of 3+ GPUs runs its parts one after another - a decode token visits the cards in turn, and the pipelined
     // speculative decode, which runs two at once, is a two-part one - so ONE pool serves every part, sized as one
     // GPU's (Strata: one expert pool for the process).  A pool per part, cores / parts each, left most of the CPU idle -
     // and as idle workers spin 20 ms after a batch, more threads a part would have spun against the card at work.
     // Maya-L on 9 GPUs, 88 vCPUs, fresh prompts (95.8% VRAM hits): 9 threads a card 0.74 ms a RAM-tier expert, 25.7
     // tok/s; one pool of 40 0.32 ms, 30.7 tok/s; an 8K prompt, whose chunks take the pool in turn, 1265 -> 1466 tok/s.
-    // STRATA_GLM_CPU_SHARED=0: a pool per part (A/B); 1: one pool for a two-GPU split too.
-    const char* shv = getenv("STRATA_GLM_CPU_SHARED");
+    // MAYA_GLM_CPU_SHARED=0: a pool per part (A/B); 1: one pool for a two-GPU split too.
+    const char* shv = getenv("MAYA_GLM_CPU_SHARED");
     const bool shared = n_parts_ >= 2 && !own_count &&
                         (shv != nullptr && shv[0] != '\0' ? std::atoi(shv) != 0 : n_parts_ >= 3);
     int threads = 0;
@@ -3512,17 +3512,17 @@ bool Glm5Model::fast_cpu_lane_setup(std::string& err) {
             threads /= std::max(1, n_parts_);   // a two-part split's parts can run at once: one pool each
         if (threads < 2) threads = 0;   // one core is the service thread's
     }
-    // a split whose parts have a pool each (two GPUs, or STRATA_GLM_CPU_SHARED=0): each part's pool on CPUs of its own
+    // a split whose parts have a pool each (two GPUs, or MAYA_GLM_CPU_SHARED=0): each part's pool on CPUs of its own
     // (part_cpus: whole NUMA nodes while there are enough, runs of whole cores of a shared one otherwise), at most those
     // CPUs less the part's share of the 4 a node keeps free, like one GPU's - the shared pool is one GPU's, unpinned.  Unpinned, the parts' pools (half the vCPUs each) shared the cores: a part works while the other's idle
     // workers spin, and the 2-socket Xeon's 3090 + 5060 Ti split took 0.28 ms an expert where one GPU's pool took 0.15
     // (and with MTP drafting both parts run at once).  The RAM tier stays interleaved (one socket reading only its own
     // memory: 54 GB/s, interleaved 77).  By default only on a host with two NUMA nodes or more, where it measured
     // faster; on one node the unpinned pools sharing every core were (two V100s, one 14-core Xeon: 25.8 tok/s against
-    // 24.7 pinned).  STRATA_GLM_CPU_PIN=1 / 0 pins / unpins on any host.
+    // 24.7 pinned).  MAYA_GLM_CPU_PIN=1 / 0 pins / unpins on any host.
     std::vector<int> pin_cpus;
     int pin_node = -1;
-    const char* pin_env = getenv("STRATA_GLM_CPU_PIN");
+    const char* pin_env = getenv("MAYA_GLM_CPU_PIN");
     const bool pin = pin_env != nullptr && pin_env[0] ? std::atoi(pin_env) != 0 : numa_nodes().size() >= 2;
     if (n_parts_ >= 2 && !shared && threads > 0 && pin) {
         std::vector<int> gpu_node;
@@ -3540,11 +3540,11 @@ bool Glm5Model::fast_cpu_lane_setup(std::string& err) {
                                                       : std::max(2, (int) pin_cpus.size() - spare);
         }
     }
-    // STRATA_GLM_LANE_CPUS<n>=<cpu,...>: CUDA<n>'s own pool (a count of its own, STRATA_GLM_CPU_LANE<n>) on exactly
-    // these CPUs - e.g. cores of BOTH sockets, so that with STRATA_GLM_ROW_HALVES each pool's threads read their own
+    // MAYA_GLM_LANE_CPUS<n>=<cpu,...>: CUDA<n>'s own pool (a count of its own, MAYA_GLM_CPU_LANE<n>) on exactly
+    // these CPUs - e.g. cores of BOTH sockets, so that with MAYA_GLM_ROW_HALVES each pool's threads read their own
     // node's half of every expert while the split's pools run at once (several conversations: every part busy)
     if (own_count && threads > 0) {
-        const std::vector<int> mine = cpu_list_env("STRATA_GLM_LANE_CPUS" + std::to_string(dev_));
+        const std::vector<int> mine = cpu_list_env("MAYA_GLM_LANE_CPUS" + std::to_string(dev_));
         if (!mine.empty()) {
             pin_cpus = mine;
             pin_node = -1;
@@ -3575,7 +3575,7 @@ bool Glm5Model::fast_cpu_lane_setup(std::string& err) {
         if (il_cal < 0 && F->cpu_fmt[(size_t) il].n_ff > 0) il_cal = il;
     }
     if (il_cal < 0) return true;
-    if (const char* ck = getenv("STRATA_GLM_CPU_LANE_CHECK"))   // the check's layer (below)
+    if (const char* ck = getenv("MAYA_GLM_CPU_LANE_CHECK"))   // the check's layer (below)
         if (std::atoi(ck) > 0 && std::atoi(ck) < (int) F->cpu_fmt.size() && F->cpu_fmt[(size_t) std::atoi(ck)].n_ff > 0)
             il_cal = std::atoi(ck);
     // a calibration blob: a RAM-tier expert of that layer (the warm-up filled the tier; a class holds every layer of
@@ -3589,7 +3589,7 @@ bool Glm5Model::fast_cpu_lane_setup(std::string& err) {
             if (Rl.st[(size_t) s] == FastState::kRHold && Rl.key[(size_t) s] / g.n_expert == il) return true;
         return false;
     };
-    if (getenv("STRATA_GLM_CPU_LANE_CHECK") == nullptr && !held_of(il_cal))
+    if (getenv("MAYA_GLM_CPU_LANE_CHECK") == nullptr && !held_of(il_cal))
         for (int il = il_cal + 1; il < lt_; ++il)
             if (F->cpu_fmt[(size_t) il].n_ff > 0 && held_of(il)) {
                 il_cal = il;
@@ -3635,15 +3635,15 @@ bool Glm5Model::fast_cpu_lane_setup(std::string& err) {
         F->cpu_x3.assign(8 * X3Rows::floats(g.n_embd, g.n_ff_exp), 0.0f);
     // the service thread is the pool's last worker; idle workers spin 20 ms (a decode's routes come ~1 ms apart)
     if (glmtier::lane_pools(*F, g, n_parts_, part_, own_count, lv != nullptr, threads, gpu_numa_node(dev_), dev_)) {
-        // glm-dsa B8.3 / B8.4: a pinned pool per socket (STRATA_GLM_CPU_SHARED=socket) or the node-split pools
+        // glm-dsa B8.3 / B8.4: a pinned pool per socket (MAYA_GLM_CPU_SHARED=socket) or the node-split pools
     } else if (shared) {
         F->cpu_pool = shared_cpu_pool(threads);
     } else {
-        // STRATA_GLM_CPU_LANE_MAX=N, more than the lane's count: the pool holds N threads and starts with the lane's
+        // MAYA_GLM_CPU_LANE_MAX=N, more than the lane's count: the pool holds N threads and starts with the lane's
         // count active (the rest sleep), so a request's cpu_threads can try up to N without a restart - the setup's
         // calibration (tools/calibrate_glm.py) measures counts above the engine's own with it.  A KVM guest's 16
         // vCPUs, no SMT siblings: two thirds of them (10) 14.9 tok/s, 14 18.4 (Maya-L, one 3090 Ti, #177)
-        const char* mx = getenv("STRATA_GLM_CPU_LANE_MAX");
+        const char* mx = getenv("MAYA_GLM_CPU_LANE_MAX");
         const int pool_n = mx != nullptr ? std::max(threads, std::min(64, std::atoi(mx))) : threads;
         F->cpu_pool.reset(new glmfast::Workers(pool_n - 1, 20000, pin_cpus));
         if (pool_n > threads) {
@@ -3658,18 +3658,18 @@ bool Glm5Model::fast_cpu_lane_setup(std::string& err) {
     // (one token's experts across both sockets measured no faster); a window's tokens are separate answers, so the
     // second socket is free work for them: 2-socket Xeon 6152, Maya-L's IQ3_S/IQ4_XS experts, 40 threads a socket -
     // each socket's expert 0.26 ms alone and with the other busy, two activations a row 1.8x one (the dots, not DRAM,
-    // set the pace).  STRATA_GLM_WIN_LANES=0: one lane (A/B)
+    // set the pace).  MAYA_GLM_WIN_LANES=0: one lane (A/B)
     // (by default both pools unpinned, the one GPU's pool as without the lanes - a decode's lone token ran ~7% slower
-    // on the pool pinned to one node: 14.7 against 15.8 tok/s; STRATA_GLM_WIN_LANES=1: pinned)
+    // on the pool pinned to one node: 14.7 against 15.8 tok/s; MAYA_GLM_WIN_LANES=1: pinned)
     static const int win_lanes = [] {
-        const char* v = getenv("STRATA_GLM_WIN_LANES");
+        const char* v = getenv("MAYA_GLM_WIN_LANES");
         return v == nullptr ? 2 : std::atoi(v);
     }();
-    // one NUMA node of several L3 domains (a Ryzen's two CCDs): the lanes a domain each (STRATA_GLM_WIN_L3=0: one lane,
+    // one NUMA node of several L3 domains (a Ryzen's two CCDs): the lanes a domain each (MAYA_GLM_WIN_L3=0: one lane,
     // the calibrated plan).  V100 + 7950X, Maya-S24, --spec 3: one lane 21.5 / 20.1 / 25.0 tok/s, two 24.4 / 23.9 / 28.0
     // (plain 24.5 / 27.7 / 26.3) - the window's RAM-tier experts on the CPU instead of over PCIe
     static const bool win_l3 = [] {
-        const char* v = getenv("STRATA_GLM_WIN_L3");
+        const char* v = getenv("MAYA_GLM_WIN_L3");
         return v == nullptr || std::atoi(v) != 0;
     }();
     if (!shared && n_parts_ == 1 && dflash_on_ && win_lanes != 0) {
@@ -3703,8 +3703,8 @@ bool Glm5Model::fast_cpu_lane_setup(std::string& err) {
                                      "unpinned\n", dev_, F->cpu_pool->active(), tb);
         }
     }
-    // STRATA_GLM_CPU_CAL=<file>: reuse the timed values across starts, keyed by build, model, layer, card and pool
-    const char* calf = getenv("STRATA_GLM_CPU_CAL");
+    // MAYA_GLM_CPU_CAL=<file>: reuse the timed values across starts, keyed by build, model, layer, card and pool
+    const char* calf = getenv("MAYA_GLM_CPU_CAL");
     std::string cal_key;
     double c_ms = 0.0, p_ms = 0.0, ps_ms = 0.0;
     bool cached = false;
@@ -3819,9 +3819,9 @@ bool Glm5Model::fast_cpu_lane_setup(std::string& err) {
     // the split: k of f to the host minimises max(PCIe (f - k) p, lane overhead + k c) (lane_plan)
     unsigned long long plan = 0;
     std::string tab;
-    const char* pv = getenv("STRATA_GLM_CPU_PLAN");
-    // STRATA_GLM_PCIE_SHARE=<0..1> (setup's calibration): the share of a route's RAM-tier experts that go over PCIe
-    const char* sv = getenv("STRATA_GLM_PCIE_SHARE");
+    const char* pv = getenv("MAYA_GLM_CPU_PLAN");
+    // MAYA_GLM_PCIE_SHARE=<0..1> (setup's calibration): the share of a route's RAM-tier experts that go over PCIe
+    const char* sv = getenv("MAYA_GLM_PCIE_SHARE");
     const double share = sv != nullptr ? std::max(0.0, std::min(1.0, std::atof(sv))) : -1.0;
     if (pv == nullptr && share < 0.0) {
         plan = lane_plan(c_ms, p_ms, &tab);
@@ -3848,8 +3848,8 @@ bool Glm5Model::fast_cpu_lane_setup(std::string& err) {
     F->md.cpu_seq = F->cpu_seq_d;
     F->md.cpu_ans = dp;
     // the route counts that pick the coldest RAM-tier experts for the host, seeded with the tiers' LFU counts
-    // (STRATA_GLM_CPU_COLD=0: the last ones in route order instead)
-    const char* cv = getenv("STRATA_GLM_CPU_COLD");
+    // (MAYA_GLM_CPU_COLD=0: the last ones in route order instead)
+    const char* cv = getenv("MAYA_GLM_CPU_COLD");
     if ((cv == nullptr || std::atoi(cv) != 0) && F->cnt.size() == (size_t) F->n_keys) {
         if (cudaMalloc((void**) &F->dcnt_d, (size_t) F->n_keys * sizeof(unsigned int)) != cudaSuccess) {
             err = "glm fast: the CPU lane's route counts did not allocate";
@@ -3867,9 +3867,9 @@ bool Glm5Model::fast_cpu_lane_setup(std::string& err) {
                     (pin_node >= 0 ? " (NUMA node " + std::to_string(pin_node) + ")" : std::string())).c_str(),
                  c_ms, p_ms, tab.c_str());
     if (cached) std::fprintf(stderr, "glm fast: CUDA%d CPU lane: those times from %s (not timed)\n", dev_, calf);
-    // STRATA_GLM_CPU_LANE_CHECK=1: the calibration expert on one normalised input three ways - the device's decode
+    // MAYA_GLM_CPU_LANE_CHECK=1: the calibration expert on one normalised input three ways - the device's decode
     // kernels, the CPU lane, and a double-precision reference from ggml's dequantised rows - and their distances
-    if (getenv("STRATA_GLM_CPU_LANE_CHECK") != nullptr && F->L[(size_t) il_cal].exl3) {
+    if (getenv("MAYA_GLM_CPU_LANE_CHECK") != nullptr && F->L[(size_t) il_cal].exl3) {
         // EXL3: the device's kernels, the CPU lane, and the scalar reference (exl3_ref, double sums)
         namespace x3 = strata::kernels::exl3;
         const int E = g.n_embd, FFE = g.n_ff_exp;
@@ -3935,7 +3935,7 @@ bool Glm5Model::fast_cpu_lane_setup(std::string& err) {
                      Ly.xl.k2[1] / 2.0, Ly.xl.k2[2] / 2.0, std::sqrt(eg / nr), std::sqrt(ec / nr), std::sqrt(egc / nr));
         cudaFree(dx);
         cudaFree(dout);
-    } else if (getenv("STRATA_GLM_CPU_LANE_CHECK") != nullptr) {
+    } else if (getenv("MAYA_GLM_CPU_LANE_CHECK") != nullptr) {
         const int E = g.n_embd, FFE = g.n_ff_exp;
         const auto& Ly = F->L[(size_t) il_cal];
         const auto& nf = F->cpu_fmt[(size_t) il_cal];
@@ -4008,11 +4008,11 @@ bool Glm5Model::fast_cpu_lane_setup(std::string& err) {
 }
 
 // ---------------------------------------------------------------- the usage profile
-// Where this machine's expert usage is kept between sessions: only STRATA_GLM_USAGE=<file> (opt-in; unset or 0: none).
+// Where this machine's expert usage is kept between sessions: only MAYA_GLM_USAGE=<file> (opt-in; unset or 0: none).
 // As in Strata, a start goes by the expert profile and nothing else is learned across starts unless asked for
 // (--expert-profile-save).
 std::string glmfast::usage_file() {
-    const char* u = getenv("STRATA_GLM_USAGE");
+    const char* u = getenv("MAYA_GLM_USAGE");
     return u == nullptr || std::string(u) == "0" ? std::string() : std::string(u);
 }
 
@@ -4089,7 +4089,7 @@ bool Glm5Model::set_routing_dump(const std::string& path, std::string& err) {
 }
 
 // What the tiers learned, as a profile: every half's experts in VRAM now (a fetch in flight counts: it lands), the
-// routes this run counted (and the usage file's, when STRATA_GLM_USAGE keeps one), then the profile this run started
+// routes this run counted (and the usage file's, when MAYA_GLM_USAGE keeps one), then the profile this run started
 // from.
 bool Glm5Model::save_expert_profile(const std::string& path, std::string& err) {
     if (fast_ == nullptr) {
@@ -4120,12 +4120,12 @@ bool Glm5Model::save_expert_profile(const std::string& path, std::string& err) {
 // shards ONCE at load: each layer's experts in the expert profile's order (--expert-profile; without one the pack's
 // expert_prior.txt, written by tools/glm_expert_prior.py from routing traces; id order without either) fill its VRAM
 // slots - all but the spares - and the rest fill the RAM tier (a few slots per class stay free for disk reads).  The
-// first request then runs warm and the disk is touched again only for experts that fit nowhere.  STRATA_GLM_WARM=0
+// first request then runs warm and the disk is touched again only for experts that fit nowhere.  MAYA_GLM_WARM=0
 // skips it (the tiers fill on demand).
 bool Glm5Model::fast_warm(std::string& err) {
     FastState* F = fast_;
     const Glm5Geometry& g = g_;
-    // glm-dsa B8.1 (warm): STRATA_GLM_WARM_SEQ (glm-dsa default on) streams in file order on one thread, and a
+    // glm-dsa B8.1 (warm): MAYA_GLM_WARM_SEQ (glm-dsa default on) streams in file order on one thread, and a
     // parallel split's parts take turns at the disk (the wait is not timed)
     const bool seq = glmwarm::seq_on(g.arch == GlmArch::GlmDsa);
     glmwarm::Turn turn(*this, seq);
@@ -4147,7 +4147,7 @@ bool Glm5Model::fast_warm(std::string& err) {
                 if (e >= 0 && e < g.n_expert) order[(size_t) il].push_back(e);
         }
     }
-    // With a usage file (STRATA_GLM_USAGE, opt-in) THIS user's experts first: the usage of earlier sessions
+    // With a usage file (MAYA_GLM_USAGE, opt-in) THIS user's experts first: the usage of earlier sessions
     // (save_usage) leads each layer's order, ahead of the expert profile's, its counts become the long memory
     // again, and the LFU counts start from them scaled to at most 32 (enough to keep
     // the profile's experts against one-off routes, little enough that a new task takes over within ~100 tokens;
@@ -4167,7 +4167,7 @@ bool Glm5Model::fast_warm(std::string& err) {
         }
     }
     static const double profile_w = [] {
-        const char* v = getenv("STRATA_GLM_PROFILE_WEIGHT");
+        const char* v = getenv("MAYA_GLM_PROFILE_WEIGHT");
         return v != nullptr ? std::max(0.0, std::atof(v)) : 1.0;
     }();
     int n_blend = 0;
@@ -4382,7 +4382,7 @@ bool Glm5Model::fast_warm(std::string& err) {
     std::fprintf(stderr, "glm fast: CUDA%d tiers warm: %zu experts (%.1f GB) in %.0f s (%.1f MB/s; %s)\n", dev_,
                  jobs.size(), (double) total_bytes / 1e9, s, (double) total_bytes / 1e6 / std::max(1e-9, s),
                  how.c_str());
-    if (glmwarm::sum_on()) glmwarm::print_digest(*this);   // glm-dsa B8.1: STRATA_GLM_WARM_SUM
+    if (glmwarm::sum_on()) glmwarm::print_digest(*this);   // glm-dsa B8.1: MAYA_GLM_WARM_SUM
     return true;
 }
 
@@ -4414,16 +4414,16 @@ void Glm5Model::fast_destroy() {
                                  "two%s)\n", F->helper.device(), (unsigned long long) F->helper_ovl_routes.load(),
                          (double) F->helper_ovl_cpu_us.load() / 1000.0, (double) F->helper_ovl_wait_us.load() / 1000.0,
                          F->helper.profiling() ? std::to_string(F->helper_ovl_saved_us.load() / 1000).c_str() : "?",
-                         F->helper.profiling() ? ", the helper's by its GPU events" : ": STRATA_GLM_PROF times the helper");
+                         F->helper.profiling() ? ", the helper's by its GPU events" : ": MAYA_GLM_PROF times the helper");
         F->helper.close();
     }
     if (F->helper_owned_d) cudaFree(F->helper_owned_d);
     if (F->cpu_ans_h) cudaFreeHost(F->cpu_ans_h);
     if (F->cpu_seq_d) cudaFree(F->cpu_seq_d);
     if (F->dcnt_d) cudaFree(F->dcnt_d);
-    if (F->spec_live_h) cudaFreeHost(F->spec_live_h);   // (STRATA_GLM_SPEC_CANCEL)
+    if (F->spec_live_h) cudaFreeHost(F->spec_live_h);   // (MAYA_GLM_SPEC_CANCEL)
     if (F->spec_skip_d) cudaFree(F->spec_skip_d);
-    if (F->defer_post) cudaFree(F->defer_post);   // (STRATA_GLM_DEFER_CPU)
+    if (F->defer_post) cudaFree(F->defer_post);   // (MAYA_GLM_DEFER_CPU)
     if (F->timing && F->ah_routes > 0) {
         std::string ov;
         for (int d = 0; d < F->n_ahead; ++d)
@@ -4603,11 +4603,11 @@ void Glm5Model::lane_drift_check() {
 // (at most eight; the first one only warms up), when two in a row differ from the cost the split was planned with by
 // more than 15% the same way, the split is planned again from their mean (the PCIe side keeps its start-up timing: the
 // link is steady) - at most three times.  Only a split the timing
-// chose (not STRATA_GLM_CPU_PLAN / STRATA_GLM_PCIE_SHARE, setup's tuning), and only from windows run on that split (a
-// request's own pcie_frac is setup's calibration at work).  STRATA_GLM_CPU_RETIME=0 turns it off.
+// chose (not MAYA_GLM_CPU_PLAN / MAYA_GLM_PCIE_SHARE, setup's tuning), and only from windows run on that split (a
+// request's own pcie_frac is setup's calibration at work).  MAYA_GLM_CPU_RETIME=0 turns it off.
 void Glm5Model::lane_retime() {
     static const bool on = [] {
-        const char* v = getenv("STRATA_GLM_CPU_RETIME");
+        const char* v = getenv("MAYA_GLM_CPU_RETIME");
         return v == nullptr || std::atoi(v) != 0;
     }();
     if (!on) return;
@@ -4795,26 +4795,26 @@ void Glm5Model::fast_service() {
     // core per GPU at 100% while the server waited (2x V100: 200% CPU idle), a core a 6-core PC's prompt lane and the
     // system then lacked, and the server's stall watchdog could never see a stuck engine as idle.  A decode's routes
     // come ~1 ms apart (two GPUs: half a token between a card's routes), so it spins all through one.  After
-    // STRATA_GLM_SERVICE_IDLE_MS (200; 0 = spin always) without a route it polls every 0.1 ms (Windows' timer: 1 ms),
+    // MAYA_GLM_SERVICE_IDLE_MS (200; 0 = spin always) without a route it polls every 0.1 ms (Windows' timer: 1 ms),
     // after 10x that every 2 ms - the first route after a quiet spell is answered up to one sleep later.  After
-    // STRATA_GLM_SERVICE_DEEP_S (60; 0 = never) of quiet - a server nobody is talking to - it sleeps on the idle gate
-    // for STRATA_GLM_SERVICE_DEEP_MS (100) at a time, ~10 wakeups a second instead of 500 (a core's worth of timer
+    // MAYA_GLM_SERVICE_DEEP_S (60; 0 = never) of quiet - a server nobody is talking to - it sleeps on the idle gate
+    // for MAYA_GLM_SERVICE_DEEP_MS (100) at a time, ~10 wakeups a second instead of 500 (a core's worth of timer
     // interrupts a GPU on a quiet machine, issue #685); the thread that reads the engine's input pokes the gate at
     // each line, so the next request's first route finds the thread awake (strata/platform/idle_gate.hpp)
     static const int kIdleMs = [] {
-        const char* v = getenv("STRATA_GLM_SERVICE_IDLE_MS");
+        const char* v = getenv("MAYA_GLM_SERVICE_IDLE_MS");
         return v ? std::max(0, std::atoi(v)) : 200;
     }();
-    static const int kDeepS = strata::platform::idle_env("STRATA_GLM_SERVICE_DEEP_S", 60);
-    static const int kDeepMs = std::max(1, strata::platform::idle_env("STRATA_GLM_SERVICE_DEEP_MS", 100));
+    static const int kDeepS = strata::platform::idle_env("MAYA_GLM_SERVICE_DEEP_S", 60);
+    static const int kDeepMs = std::max(1, strata::platform::idle_env("MAYA_GLM_SERVICE_DEEP_MS", 100));
     strata::platform::IdleGate& gate = strata::platform::idle_gate();
     uint64_t gate_seen = 0;
     auto last_route = std::chrono::steady_clock::now();
     int idle = 0;                        // 0 spinning, 1 short sleeps, 2 long sleeps, 3 the idle gate
     // a batched verify window's layer with two window lanes: its routes held until the layer's last token routed,
-    // then answered together (win_cpu_merged; STRATA_GLM_WIN_CPU=0: each token to a lane as its route comes)
+    // then answered together (win_cpu_merged; MAYA_GLM_WIN_CPU=0: each token to a lane as its route comes)
     static const bool win_merge = [] {
-        const char* v = getenv("STRATA_GLM_WIN_CPU");
+        const char* v = getenv("MAYA_GLM_WIN_CPU");
         return v == nullptr || std::atoi(v) != 0;
     }();
     const gf::MoeRequest* w_rq[kWinMax];
@@ -4894,7 +4894,7 @@ void Glm5Model::fast_service() {
             last_route = std::chrono::steady_clock::now();
         }
         std::atomic_thread_fence(std::memory_order_acquire);
-        // STRATA_GLM_PF_CE: this route's prefetch copies first, on the copy engine, then its seq into the flag on the
+        // MAYA_GLM_PF_CE: this route's prefetch copies first, on the copy engine, then its seq into the flag on the
         // same stream (the flag lands after the experts; the next layer waits for it)
         if (F->pf_ce && rq->error == 0 && rq->pf_n > 0 && rq->layer + 1 < (int) F->layer_rc.size() &&
             F->layer_rc[(size_t) rq->layer + 1] >= 0) {
@@ -4915,7 +4915,7 @@ void Glm5Model::fast_service() {
             cudaMemcpyAsync(F->pf_flag_d, sv, sizeof(unsigned int), cudaMemcpyHostToDevice, F->pfce_stream);
         }
         // (the lanes are made at the CPU lane's setup, after this thread started; an EXL3 pack's merged rows with them)
-        // A batched rows step's group (STRATA_GLM_GROUP_EXPERTS, win_rows) is held the same way and merged on this part's
+        // A batched rows step's group (MAYA_GLM_GROUP_EXPERTS, win_rows) is held the same way and merged on this part's
         // own pool - the other part works on its own group meanwhile; not with a helper GPU (it answers per route)
         const bool held = win_merge && rq->win_n > 0 && F->cpu_ans_h != nullptr && !F->cpu_win.dn.empty() &&
                           (!exl3_ || !F->cpu_win.x3.empty()) &&
@@ -4944,10 +4944,10 @@ void Glm5Model::fast_service() {
             int ids[8];
             for (int i = 0; i < K; ++i) ids[i] = rq->ids[i];
             if (glmfast::route_dumping()) glmfast::route_dump(il, K, ids, rq->w);   // --dump-routing
-            // STRATA_GLM_ROUTE_LOG=<prefix>: "layer e0 .. e7 tier-mask" per route into <prefix>.<device> (cache studies)
+            // MAYA_GLM_ROUTE_LOG=<prefix>: "layer e0 .. e7 tier-mask" per route into <prefix>.<device> (cache studies)
             // - the tier masks are fetch, miss and cpu (bits over e0..e7), then " | n0 .. n15": the near misses, the
             //   route's next ranks after the top k, best first
-            static const char* rlog = getenv("STRATA_GLM_ROUTE_LOG");
+            static const char* rlog = getenv("MAYA_GLM_ROUTE_LOG");
             if (rlog != nullptr) {
                 static thread_local FILE* rf = std::fopen((std::string(rlog) + "." + std::to_string(dev_)).c_str(), "w");
                 if (rf != nullptr) {
@@ -5118,10 +5118,10 @@ void Glm5Model::fast_service() {
                     }
                 }
                 // each part in chunks across the workers: the O_DIRECT bounce copy of a whole part was ~0.4 ms of the
-                // wait (Mercury: 3.6 -> 3.1 ms a disk wait at 8 chunks; STRATA_GLM_READ_CHUNKS overrides - a Windows
+                // wait (Mercury: 3.6 -> 3.1 ms a disk wait at 8 chunks; MAYA_GLM_READ_CHUNKS overrides - a Windows
                 // laptop on an Intel RST RAID read 15% faster with 4, #67 - and setup's calibration tries 4 and 2)
                 static const int rch_env = [] {
-                    const char* v = getenv("STRATA_GLM_READ_CHUNKS");
+                    const char* v = getenv("MAYA_GLM_READ_CHUNKS");
                     return std::max(1, std::min(16, v ? std::atoi(v) : 8));
                 }();
                 const int rch = F->read_chunks > 0 ? F->read_chunks : rch_env;
@@ -5135,13 +5135,13 @@ void Glm5Model::fast_service() {
                                                 std::chrono::steady_clock::now() - tw).count(),
                                             std::memory_order_relaxed);
                 };
-                // STRATA_GLM_STREAM_FETCH (on; =0 off - zephel01/Abyss d626d96, mw00 #570): the answer goes out BEFORE
+                // MAYA_GLM_STREAM_FETCH (on; =0 off - zephel01/Abyss d626d96, mw00 #570): the answer goes out BEFORE
                 // the reads, each read job sets its chunk's bit of ready[] once the chunk is in the slot, and the
                 // device's fetch copies the chunks as they land - the PCIe pull runs behind the SSD read instead of
                 // after it.  The same bytes reach the same slots (the output is unchanged).  GGUF packs only (EXL3's
                 // chunks are laid out differently), and at most 10 chunks a part (32 bits a ready word).
                 static const bool stream_env = [] {
-                    const char* v = getenv("STRATA_GLM_STREAM_FETCH");
+                    const char* v = getenv("MAYA_GLM_STREAM_FETCH");
                     return v == nullptr || std::atoi(v) != 0;
                 }();
                 const bool stream = stream_env && nr > 0 && 3 * rch <= 32 && pack_layers_[(size_t) il].x_cb < 0;
@@ -5207,7 +5207,7 @@ void Glm5Model::fast_service() {
                 F->disk_us.fetch_add(us, std::memory_order_relaxed);
                 F->miss_us.fetch_add(us, std::memory_order_relaxed);
                 F->miss_layers.fetch_add(1, std::memory_order_relaxed);
-                static const bool trace = getenv("STRATA_GLM_SVC_TRACE") != nullptr;
+                static const bool trace = getenv("MAYA_GLM_SVC_TRACE") != nullptr;
                 if (trace)
                     std::fprintf(stderr, "svc CUDA%d seq %u layer %d disk %d %.2f ms\n", dev_, next, il, nm,
                                  (double) us / 1000.0);
@@ -5253,7 +5253,7 @@ void Glm5Model::fast_service() {
                 const auto& ly = F->L[(size_t) rq->layer];
                 std::fill_n(ans->part, g.n_embd, 0.0f);
                 if (F->helper_overlap) {
-                    // STRATA_GLM_HELPER_OVERLAP: the helper's call is queued first - its result copies straight into
+                    // MAYA_GLM_HELPER_OVERLAP: the helper's call is queued first - its result copies straight into
                     // ans->part (mapped pinned memory), which nothing else touches until the wait - then the CPU lane
                     // computes its experts into its own buffer, then the wait, then the one add per value the serial
                     // order makes too (helper + CPU lane: the same bits).  The wait comes before this route's answer is
@@ -5594,14 +5594,14 @@ bool Glm5Model::fast_boundary(std::string& err) {
     // the RAM tier's victim among its held experts: the least-used by the aged counts among those no route used in the
     // last `protect` routes (~64 tokens) - a newly hot expert keeps its place while its count catches up, instead of
     // going back to disk as the lowest count and being read again a moment later (real chats measured 7-11 disk reads
-    // a token that way); all of them recent: the least recently used.  STRATA_GLM_RAM_EVICT=lfu: the plain least-used
+    // a token that way); all of them recent: the least recently used.  MAYA_GLM_RAM_EVICT=lfu: the plain least-used
     // (the old rule), =lru: the least recently used.  -1: none held.
     static const int ram_policy = [] {
-        const char* v = getenv("STRATA_GLM_RAM_EVICT");
+        const char* v = getenv("MAYA_GLM_RAM_EVICT");
         return v == nullptr ? 0 : std::strcmp(v, "lfu") == 0 ? 1 : std::strcmp(v, "lru") == 0 ? 2 : 0;
     }();
     static const uint64_t protect_tok = [] {
-        const char* v = getenv("STRATA_GLM_RAM_PROTECT");
+        const char* v = getenv("MAYA_GLM_RAM_PROTECT");
         return (uint64_t) (v ? std::max(0, std::atoi(v)) : 64);
     }();
     const uint64_t protect = protect_tok * (uint64_t) (g.arch == GlmArch::GlmDsa ? g.n_moe_layers() : 42);   // glm-dsa B1.9 (Flash: Maya's x 42)
@@ -5627,7 +5627,7 @@ bool Glm5Model::fast_boundary(std::string& err) {
         return best >= 0 ? best : oldest;
     };
     static const bool tier_gc = [] {
-        const char* v = getenv("STRATA_GLM_TIER_GC");
+        const char* v = getenv("MAYA_GLM_TIER_GC");
         return v == nullptr || std::atoi(v) != 0;
     }();
     // (1)
@@ -5652,7 +5652,7 @@ bool Glm5Model::fast_boundary(std::string& err) {
                 R.st[(size_t) s] = FastState::kRHold;
                 upd(F->rtab_key(R.key[(size_t) s]), (unsigned long long) (R.slot((size_t) s)));
             } else if (R.st[(size_t) s] == FastState::kRHold && tier_gc) {
-                // exclusive tiers, kept (STRATA_GLM_TIER_GC=0: not): a held copy the tables lost (a route promoted or re-read the expert while its
+                // exclusive tiers, kept (MAYA_GLM_TIER_GC=0: not): a held copy the tables lost (a route promoted or re-read the expert while its
                 // demotion was still landing, which then held a second copy nothing points at) or of an expert VRAM
                 // holds is freed; one that is the expert's only copy is adopted back.  Such copies piled up to ~12%
                 // of the experts in no tier at all, the RAM tier full of duplicates (chats: ~5 disk reads a token)
@@ -5727,14 +5727,14 @@ bool Glm5Model::fast_boundary(std::string& err) {
                 glmfast::complete_pool(P.n_main, g.n_expert, gf::kSpares))
                 break;
             // the least recently used resident of this layer goes (the engine's own rule now).  It is kept
-            // STRATA_GLM_VRAM_EVICT=least (or 0): the least-used by the aged counts, recency breaking ties - route
+            // MAYA_GLM_VRAM_EVICT=least (or 0): the least-used by the aged counts, recency breaking ties - route
             // traces replayed through these rules (Maya-M, 3090 + 3060 split): the aged counts keep experts that
             // were frequent a while ago, the smaller half's pool most of all (VRAM hits 55.7 -> 65.2 %, off-card
             // experts a token 57.7 -> 45.4 on the 3060; 71.8 -> 64.6 on the 3090), while the recency won the decode
             // there (+2.6%) and on Maya-S over 3x V100-16GB with an NVMe tier (24.8 -> 26.1 tok/s, interleaved runs).
             // With several conversations at once (--parallel) the default stays the aged counts: they take turns, and
             // the most recent one's experts pushed out what all of them use, and decode slowed there
-            static const char* const ve = getenv("STRATA_GLM_VRAM_EVICT");
+            static const char* const ve = getenv("MAYA_GLM_VRAM_EVICT");
             const bool vram_lru = ve == nullptr ? seq_count() <= 1 : std::strcmp(ve, "lru") == 0;
             int v = -1;
             uint32_t bc = UINT32_MAX;
@@ -5810,7 +5810,7 @@ bool Glm5Model::fast_boundary(std::string& err) {
     }
     // (4) a few free RAM slots per class for the next token's disk reads (and its reads ahead); RAM-resident
     // mode plans no disk reads, so no residents are evicted to keep landing room either
-    static const char* kf = getenv("STRATA_GLM_RAM_FREE");
+    static const char* kf = getenv("MAYA_GLM_RAM_FREE");
     const int keep_free = F->ram_resident ? 0 : kf ? std::max(1, std::atoi(kf)) : F->ahead_read ? 12 : 4;
     for (auto& R : F->rc) {
         int nfree = 0;
@@ -5835,7 +5835,7 @@ bool Glm5Model::fast_boundary(std::string& err) {
     //     (b) Up to bg_n new moves: a layer's most used RAM-only expert is promoted into a free slot; with none free,
     //     the layer's least used resident is demoted when a RAM-only expert is used bg_ratio times as much (the slot
     //     takes the promotion at a later boundary).  Either way the expert stays live where it was until its copy
-    //     landed - no window in which a route would go to disk.  STRATA_GLM_PROMOTE=<moves a boundary>, 0: off.
+    //     landed - no window in which a route would go to disk.  MAYA_GLM_PROMOTE=<moves a boundary>, 0: off.
     {
         const int NE = g.n_expert;
         std::vector<FastState::BgMove> keep;
@@ -5879,16 +5879,16 @@ bool Glm5Model::fast_boundary(std::string& err) {
         }
         F->bg.swap(keep);
         static const int bg_n = [] {
-            const char* v = getenv("STRATA_GLM_PROMOTE");
+            const char* v = getenv("MAYA_GLM_PROMOTE");
             return v != nullptr ? std::max(0, std::atoi(v)) : 8;
         }();
         // (c) the REFILL: while layers have free VRAM slots - a prompt's lending ends with ~15 a layer free on a 24 GB
-        //     card - each such layer promotes its hottest RAM-only experts into them, up to STRATA_GLM_PROMOTE_FILL a
+        //     card - each such layer promotes its hottest RAM-only experts into them, up to MAYA_GLM_PROMOTE_FILL a
         //     boundary in all (24: about a token's worth of the x8 link's copies; the CPU lane loses nothing to the DMA,
         //     a 3090 beside 2x Xeon 6152: 65.5 vs 68.1 GB/s with 6.25 GB/s of H2D beside it) instead of one a layer and
         //     bg_n in all (~80 tokens to refill)
         static const int bg_fill = [] {
-            const char* v = getenv("STRATA_GLM_PROMOTE_FILL");
+            const char* v = getenv("MAYA_GLM_PROMOTE_FILL");
             return v != nullptr ? std::max(0, std::atoi(v)) : 24;
         }();
         // a pipelined window's boundary comes once for its tokens (not one a token): the budgets for them all
@@ -5900,10 +5900,10 @@ bool Glm5Model::fast_boundary(std::string& err) {
         bool lane_all = F->cpu_plan != 0ull;   // the CPU lane takes every RAM-tier expert of a route
         for (int f = 1; f <= g.n_exp_used && lane_all; ++f) lane_all = (int) ((F->cpu_plan >> (4 * f)) & 15ull) == f;
         // ... and so do a DFlash verify window's routes on two CPU lanes (glm_window.cu's all-CPU plan,
-        // STRATA_GLM_WIN_ALLCPU): no route promotes then, so the swaps below keep the VRAM tier following the
+        // MAYA_GLM_WIN_ALLCPU): no route promotes then, so the swaps below keep the VRAM tier following the
         // conversation (without them the hit rate falls while DFlash drafts)
         static const bool win_all_cpu = [] {
-            const char* v = getenv("STRATA_GLM_WIN_ALLCPU");
+            const char* v = getenv("MAYA_GLM_WIN_ALLCPU");
             return v == nullptr || std::atoi(v) != 0;
         }();
         if (!lane_all && win_all_cpu && dflash_on_ && F->cpu_plan != 0ull && F->win_lane[0] != nullptr &&
@@ -6008,8 +6008,8 @@ bool Glm5Model::fast_boundary(std::string& err) {
     flush();
     if (ok && !fast_helper_adapt(err)) return false;
     F->check_resident(l0_, lt_, g.n_expert);   // (the tables as the next token's routes find them)
-    static const bool diag = getenv("STRATA_GLM_TIER_DIAG") != nullptr;
-    static const int diag_every = getenv("STRATA_GLM_TIER_DIAG_EVERY") ? std::max(1, std::atoi(getenv("STRATA_GLM_TIER_DIAG_EVERY"))) : 64;
+    static const bool diag = getenv("MAYA_GLM_TIER_DIAG") != nullptr;
+    static const int diag_every = getenv("MAYA_GLM_TIER_DIAG_EVERY") ? std::max(1, std::atoi(getenv("MAYA_GLM_TIER_DIAG_EVERY"))) : 64;
     if (diag && ++F->diag_b % diag_every == 0)
         std::fprintf(stderr, "glm tier diag CUDA%d (%llu boundaries): VRAM drops %llu, RAM evictions %llu, lend drops %llu (to RAM %llu, evicting %llu), background promotions %llu / demotions %llu, resident skips %llu | "
                              "disk reads of: never held %llu, dropped from VRAM %llu, evicted from RAM %llu, lend-dropped %llu, lend-evicted %llu\n",
@@ -6149,32 +6149,32 @@ bool Glm5Model::fast_dsa(int il, int64_t p, std::string& err) {
 // ---- one MoE FFN: F->x / F->xq -> F->ffn (routes, tiers, routed + shared experts)
 // The NextN draft block leaves its experts that are not in VRAM out (no RAM pull, no disk wait): its draft only has
 // to be a good guess - every token is the trunk's own - and its misses sat on the tail's critical path.
-// STRATA_GLM_MTP_MISS=1 fetches them like the trunk; STRATA_GLM_MTP_KEEP=<n> fetches the missing ones among the
+// MAYA_GLM_MTP_MISS=1 fetches them like the trunk; MAYA_GLM_MTP_KEEP=<n> fetches the missing ones among the
 // route's n best-scored experts only (the route lists them in selection order) and leaves the rest out.  The default
 // keeps 2: never slower than skipping all and drafts better (2x V100: 82-83% accepted against 76-81%, decode 28.0-28.2
 // against 27.0-28.1 tok/s; RTX 3090 + 3060: 19.5 -> 20.6); KEEP=0 skips every missing one.
 static int mtp_skip_from() {
     static const int v = [] {
-        if (const char* k = getenv("STRATA_GLM_MTP_KEEP")) return std::max(0, std::min(8, std::atoi(k)));
-        return getenv("STRATA_GLM_MTP_MISS") != nullptr ? 8 : 2;
+        if (const char* k = getenv("MAYA_GLM_MTP_KEEP")) return std::max(0, std::min(8, std::atoi(k)));
+        return getenv("MAYA_GLM_MTP_MISS") != nullptr ? 8 : 2;
     }();
     return glmknob::get(glmknob::MtpKeep, v);   // glm-dsa request knobs: GEN mtp_keep=
 }
 
-// STRATA_GLM_TRUNK_KEEP=<n> (opt-in, changes the answers): the model's own routes leave their experts that are not in
+// MAYA_GLM_TRUNK_KEEP=<n> (opt-in, changes the answers): the model's own routes leave their experts that are not in
 // VRAM out from route rank n on, as the draft block does above - for a RAM-bound split that would rather be faster than
 // exact.  The lowest-ranked experts carry the least weight and are the coldest, so they are the ones most often off
-// the card.  STRATA_GLM_TRUNK_KEEP_MAP=<digits>: the same per layer, character il for layer il ('1'..'8'; any other
-// character, or a layer past the string's end, takes STRATA_GLM_TRUNK_KEEP) - GLM-5.3's early layers notice a left-out
+// the card.  MAYA_GLM_TRUNK_KEEP_MAP=<digits>: the same per layer, character il for layer il ('1'..'8'; any other
+// character, or a layer past the string's end, takes MAYA_GLM_TRUNK_KEEP) - GLM-5.3's early layers notice a left-out
 // expert far more than its late ones.  Unset (8): every expert is computed, as before.  The verify windows (DFlash, the
 // batched window) leave out the same ones, so a window's tokens are the token path's.
 int glmfast::trunk_skip_from(int il) {
     static const int v = [] {
-        const char* k = getenv("STRATA_GLM_TRUNK_KEEP");
+        const char* k = getenv("MAYA_GLM_TRUNK_KEEP");
         return k != nullptr ? std::max(1, std::min(8, std::atoi(k))) : 8;
     }();
     static const std::string map = [] {
-        const char* m = getenv("STRATA_GLM_TRUNK_KEEP_MAP");
+        const char* m = getenv("MAYA_GLM_TRUNK_KEEP_MAP");
         return std::string(m != nullptr ? m : "");
     }();
     if (il >= 0 && il < (int) map.size() && map[(size_t) il] >= '1' && map[(size_t) il] <= '8')
@@ -6195,7 +6195,7 @@ bool Glm5Model::fast_moe(int il, bool& pf_pending, std::string& err, bool cpu_wa
     j[2] = {Ly.sh_up.q, F->xq, F->x, F->sh_u, nullptr, 1.0f, Ly.sh_up.type, g.n_embd, FFs};
     // the next layer's router on THIS layer's FFN input: its experts, one layer early
     // (only with prefetch on: the prediction costs a router GEMV and a second top-k per layer; glm-dsa request knobs: GEN
-    // prefetch_n= for this request, else STRATA_GLM_PREFETCH_N's F->max_pf)
+    // prefetch_n= for this request, else MAYA_GLM_PREFETCH_N's F->max_pf)
     const bool pred = glmknob::get(glmknob::PrefetchN, F->max_pf) > 0 && il + 1 < l1_ && F->L[(size_t) il + 1].moe;
     if (pred)
         j[nj++] = {F->L[(size_t) il + 1].router_w, nullptr, F->x, F->plog, nullptr, 1.0f,
@@ -6225,22 +6225,22 @@ void Glm5Model::fast_moe_route(int il, const MoeIo& io, const gf::MoeDev& md, vo
     const Glm5Geometry& g = g_;
     const auto& Ly = F->L[(size_t) il];
     const int FFs = g.n_ff_exp * g.n_shared;
-    // STRATA_GLM_PROMOTE_MIN=<n>: a fetched expert is kept in VRAM only when its aged route count clears n.
+    // MAYA_GLM_PROMOTE_MIN=<n>: a fetched expert is kept in VRAM only when its aged route count clears n.
     // Unset or <= 1: the old rule (keep it whenever a spare is free).
     static const int promote_min_start = [] {   // glm-dsa request knobs: the start value
-        const char* v = getenv("STRATA_GLM_PROMOTE_MIN");
+        const char* v = getenv("MAYA_GLM_PROMOTE_MIN");
         return v ? std::max(0, std::atoi(v)) : 0;
     }();
-    // STRATA_GLM_PREFETCH_RANK=<n>: prefetch only the prediction's first n ranks (unset: any of its top k)
+    // MAYA_GLM_PREFETCH_RANK=<n>: prefetch only the prediction's first n ranks (unset: any of its top k)
     static const int pf_rank_start = [] {   // glm-dsa request knobs: the start value
-        const char* v = getenv("STRATA_GLM_PREFETCH_RANK");
+        const char* v = getenv("MAYA_GLM_PREFETCH_RANK");
         return v != nullptr ? std::max(1, std::atoi(v)) : 0;
     }();
     // glm-dsa request knobs: this request's GEN promote_min= / prefetch_rank= / prefetch_n=, else the start values
     const int promote_min = glmknob::get(glmknob::PromoteMin, promote_min_start);
     const int pf_rank = glmknob::get(glmknob::PrefetchRank, pf_rank_start);
     const int max_pf = pred ? glmknob::get(glmknob::PrefetchN, F->max_pf) : 0;
-    static const int near_n = getenv("STRATA_GLM_ROUTE_LOG") != nullptr ? 16 : 0;   // the route log's near misses
+    static const int near_n = getenv("MAYA_GLM_ROUTE_LOG") != nullptr ? 16 : 0;   // the route log's near misses
     gf::moe_route(io.rlog, Ly.router_bias, g.n_expert, g.n_exp_used, g.w_scale, g.norm_w != 0, il, io.x,
                   g.n_embd, md, io.sh_g, io.sh_u, g.swiglu_shexp, FFs, sh_hq, F->cs,
                   pred ? F->plog : nullptr, pred ? F->L[(size_t) il + 1].router_bias : nullptr,
@@ -6273,13 +6273,13 @@ bool Glm5Model::fast_moe_experts(int il, const MoeIo& io, bool pred, int n_ah, c
     fast_moe_route(il, io, md, F->sh_hq, pred, n_ah, ah_bias, lane);
     if (F->prof_on) F->mark("moe_route");
     ++F->expected;
-    // the side stream copies the next layer's predicted experts while this layer computes.  STRATA_GLM_PREFETCH_AT:
+    // the side stream copies the next layer's predicted experts while this layer computes.  MAYA_GLM_PREFETCH_AT:
     // when that copy starts - "route" (the default: at once, beside this layer's own PCIe fetch and CPU lane),
     // "fetch" (after this layer's own fetch: the link is free) or "cpu" (after this layer's CPU-lane answer: RAM is
     // free too; the copy then runs beside the next layer's attention).  The prefetch lists are double-buffered by
     // layer parity and the next layer waits for this copy before its experts run, so any of the three is safe.
     static const int pf_at_start = [] {   // glm-dsa request knobs: the start value
-        const char* v = getenv("STRATA_GLM_PREFETCH_AT");
+        const char* v = getenv("MAYA_GLM_PREFETCH_AT");
         return v == nullptr ? 0 : std::strcmp(v, "fetch") == 0 ? 1 : std::strcmp(v, "cpu") == 0 ? 2 : 0;
     }();
     const int pf_at = glmknob::get(glmknob::PrefetchAt, pf_at_start);   // glm-dsa request knobs: GEN prefetch_at=
@@ -6298,8 +6298,8 @@ bool Glm5Model::fast_moe_experts(int il, const MoeIo& io, bool pred, int n_ah, c
     // disk-only experts (rare once warm) park the device until the host has read them; everything not
     // in VRAM is then pulled over PCIe into its slot, and all 8 run from VRAM.  With every expert in VRAM
     // (all_resident) neither can happen and both launches are left out: an empty launch and its gap were
-    // ~2.5 ms of a 54 ms Maya-S token on the 8065S (moe_wait 1.8 + moe_fetch 0.7 in STRATA_GLM_PROF)
-    // STRATA_GLM_SKIP_EMPTY=1, a batched step's row (glm_rows.cu - the token path's launches are its graphs'): the
+    // ~2.5 ms of a 54 ms Maya-S token on the 8065S (moe_wait 1.8 + moe_fetch 0.7 in MAYA_GLM_PROF)
+    // MAYA_GLM_SKIP_EMPTY=1, a batched step's row (glm_rows.cu - the token path's launches are its graphs'): the
     // same per layer (FastState::layer_res: a layer whose every expert is in VRAM), and elsewhere the wait and the
     // fetch as one launch (gf::moe_wait_fetch): a batched step makes these launches once a row and layer, mostly empty
     const bool skip_empty = rows && glmfast::skip_empty_on();
@@ -6380,21 +6380,21 @@ bool Glm5Model::fast_layers(int64_t p, bool hop_in, std::string& err) {
     bool pf_pending = false;
     float* Rc = state_;
     float* Ro = state_ + (int64_t) g.hc * g.n_embd;
-    const char* graph_opt = getenv("STRATA_GLM_KDA_GRAPH");
+    const char* graph_opt = getenv("MAYA_GLM_KDA_GRAPH");
     const bool graphs = graph_opt && std::atoi(graph_opt) != 0 && (F->win.pipe_t < 8) && !F->spec_gate &&
                         !F->prof_on && !dumps && F->max_pf == 0 && F->n_ahead == 0 &&
                         getenv("GLM_DUMP_H") == nullptr && cap_d_ == nullptr;
     static const bool dsa_ffn_graphs = [] {
-        const char* v = getenv("STRATA_GLM_DSA_FFN_GRAPH");
+        const char* v = getenv("MAYA_GLM_DSA_FFN_GRAPH");
         return v == nullptr || std::atoi(v) != 0;
     }();
     F->kda_graph_on = graphs;
-    // STRATA_GLM_DEFER_CPU=1 (LOSSY, after lighttransport/Strata glm53f's expert deferral): a MoE layer's CPU-lane
+    // MAYA_GLM_DEFER_CPU=1 (LOSSY, after lighttransport/Strata glm53f's expert deferral): a MoE layer's CPU-lane
     // experts are added after the NEXT layer's mixer instead of before its read - the CPU's work overlaps that layer's
     // attention; that attention misses them (the streams get them before its FFN-side read; the last layer waits)
     // 1 = the first part of a split only (!hop_in, as before); 2 = every part: each part has its own CPU lane, MoeDev and
     // defer_post, and a part's last layer is never deferred (il + 1 < l1_ below), so nothing deferred crosses a hop
-    static const int defer_lvl = getenv("STRATA_GLM_DEFER_CPU") != nullptr ? std::atoi(getenv("STRATA_GLM_DEFER_CPU")) : 0;
+    static const int defer_lvl = getenv("MAYA_GLM_DEFER_CPU") != nullptr ? std::atoi(getenv("MAYA_GLM_DEFER_CPU")) : 0;
     // (--ablate: a deferred CPU answer would join the streams unprojected - the projecting conversation waits instead)
     const bool defer = defer_lvl != 0 && (defer_lvl >= 2 || !hop_in) && !graphs && F->cpu_plan != 0ull && !F->all_resident &&
                        !ablating();
@@ -6411,7 +6411,7 @@ bool Glm5Model::fast_layers(int64_t p, bool hop_in, std::string& err) {
         // flag a cancelled token may have left, and its other layers go without the gate (a host-memory read each)
         if (F->win.pipe_t >= 0 && F->win.from != nullptr && F->win.skip_d != nullptr && (F->win.pipe_t > 0 || il == l0_))
             gf::skip_gate(F->win.from, F->win.pipe_t, F->win.skip_d, s);
-        // the speculative pass of the two-half decode (STRATA_GLM_SPEC_CANCEL): was its draft found wrong meanwhile
+        // the speculative pass of the two-half decode (MAYA_GLM_SPEC_CANCEL): was its draft found wrong meanwhile
         if (F->spec_gate) gf::skip_gate(F->spec_live_h, 0, F->spec_skip_d, s);
         const auto body = [&]() -> bool {
         // ---- the attention-side read (fused with the previous FFN's write)
@@ -6724,7 +6724,7 @@ bool Glm5Model::fast_mtp(int64_t p, int32_t next_tok, std::string& err, int step
     const auto& Ly = F->L[(size_t) il];
     const int E = g.n_embd;
     static const bool full_head = [] {
-        const char* v = getenv("STRATA_GLM_MTP_FULL_HEAD");
+        const char* v = getenv("MAYA_GLM_MTP_FULL_HEAD");
         return v != nullptr && std::atoi(v) != 0;
     }();
     const bool sample_draft_on = mtp_sample_ != nullptr && F->spec_q != nullptr && step == 0;
@@ -6822,7 +6822,7 @@ int Glm5Model::fast_sample(strata::kernels::SamplerParams& sp, std::string& err)
     return F->tok_h[0];
 }
 
-// Speculative sampling's verify (decode_spec, STRATA_GLM_SPEC_SAMPLE=1): this half's logits and the draft its NextN
+// Speculative sampling's verify (decode_spec, MAYA_GLM_SPEC_SAMPLE=1): this half's logits and the draft its NextN
 // block drew (mtp_tok, the list it was drawn from in spec_q) -> the draft with probability min(1, p/q), else a draw from
 // max(0, p - q); distributed as fast_sample's draw.  Same stream, same read-back as fast_sample.
 int Glm5Model::fast_sample_verify(strata::kernels::SamplerParams& sp, std::string& err) {
@@ -6842,24 +6842,24 @@ int Glm5Model::fast_sample_verify(strata::kernels::SamplerParams& sp, std::strin
 // the bytes the expert pool may take from what is free.  The reserve: VRAM kept free beside the pool (the context's own
 // growth is already allocated in the state arena) for the driver, the sampler, kernel launches' local memory and what
 // is allocated after the pool (the verify windows' graphs), 700 MiB (1024 on a unified-memory APU), the config's
-// --vram-reserve-mib (STRATA_GLM_RESERVE_MB) - a split's later GPUs --vram-reserve-later-mib (STRATA_GLM_RESERVE_LATER_MB)
-// where it is set.  --expert-cache auto (the default) takes the rest; a number N (STRATA_GLM_EXPERT_CACHE) caps the
+// --vram-reserve-mib (MAYA_GLM_RESERVE_MB) - a split's later GPUs --vram-reserve-later-mib (MAYA_GLM_RESERVE_LATER_MB)
+// where it is set.  --expert-cache auto (the default) takes the rest; a number N (MAYA_GLM_EXPERT_CACHE) caps the
 // first GPU's pool at N of its largest expert slots (the later GPUs keep auto).  On a small card whose default reserve
 // would leave the pool short of its floor (floor_b: a route's experts and the spares in every layer), auto lowers the
 // reserve to what leaves exactly that, down to 300 MiB, and the start says so (`adapted`); a reserve set by hand is
 // kept.
-// STRATA_GLM_POOL_GB caps the pool; STRATA_GLM_VRAM_GB=<n> behaves like a card with n GB (the cap counts everything
+// MAYA_GLM_POOL_GB caps the pool; MAYA_GLM_VRAM_GB=<n> behaves like a card with n GB (the cap counts everything
 // this process already holds on the device, so the pool gets what such a card would have).  The prompt path and the
 // layer split search size from the same number, before the pool is carved (a discrete card's: fast_setup prices a
 // unified-memory APU's pool from its RAM).
 Glm5Model::PoolBudget Glm5Model::pool_budget(size_t free_b, size_t total_b, int part, size_t floor_b, size_t slot_b,
                                              bool unified) {
     PoolBudget b;
-    const char* later = part > 0 ? getenv("STRATA_GLM_RESERVE_LATER_MB") : nullptr;
-    const char* r = later != nullptr && later[0] ? later : getenv("STRATA_GLM_RESERVE_MB");
+    const char* later = part > 0 ? getenv("MAYA_GLM_RESERVE_LATER_MB") : nullptr;
+    const char* r = later != nullptr && later[0] ? later : getenv("MAYA_GLM_RESERVE_MB");
     b.reserve_given = r != nullptr && r[0];
     b.reserve = (size_t) (b.reserve_given ? std::max(0LL, std::atoll(r)) : unified ? 1024 : 700) << 20;
-    if (const char* ec = getenv("STRATA_GLM_EXPERT_CACHE"); ec != nullptr && part == 0)
+    if (const char* ec = getenv("MAYA_GLM_EXPERT_CACHE"); ec != nullptr && part == 0)
         b.fixed = std::max(0LL, std::atoll(ec));   // ("auto": 0)
     if (!unified)
         std::tie(b.reserve, b.adapted) =
@@ -6869,7 +6869,7 @@ Glm5Model::PoolBudget Glm5Model::pool_budget(size_t free_b, size_t total_b, int 
         // (the same number fast_setup logs, before its expert_bytes cap - the prompt path sizes against this too).
         const int64_t ram = avail_ram_now();
         double head_gb = 16.0;
-        if (const char* h = getenv("STRATA_GLM_RAM_HEADROOM_GB")) head_gb = std::max(0.0, std::atof(h));
+        if (const char* h = getenv("MAYA_GLM_RAM_HEADROOM_GB")) head_gb = std::max(0.0, std::atof(h));
         const size_t head = (size_t) (head_gb * 1073741824.0);
         if (ram > 0) {
             const size_t room = (size_t) ram > head ? (size_t) ram - head : 0;
@@ -6882,9 +6882,9 @@ Glm5Model::PoolBudget Glm5Model::pool_budget(size_t free_b, size_t total_b, int 
     }
     if (b.fixed > 0 && slot_b > 0) b.avail = std::min(b.avail, (size_t) b.fixed * slot_b);
 
-    if (const char* cap = getenv("STRATA_GLM_POOL_GB"))
+    if (const char* cap = getenv("MAYA_GLM_POOL_GB"))
         b.avail = std::min(b.avail, (size_t) (std::atof(cap) * 1073741824.0));
-    if (const char* vc = getenv("STRATA_GLM_VRAM_GB")) {
+    if (const char* vc = getenv("MAYA_GLM_VRAM_GB")) {
         const size_t cap = (size_t) (std::atof(vc) * 1073741824.0);
         const size_t used = total_b - free_b;
         b.avail = std::min(b.avail, cap > used + b.reserve ? cap - used - b.reserve : (size_t) 0);
@@ -6897,11 +6897,11 @@ Glm5Model::PoolBudget Glm5Model::pool_budget(size_t free_b, size_t total_b, int 
 // buffer of block_nums x J x I, tens of MB, and the ids tables of the MoE path).  Nothing sizes them today, so they
 // land on free VRAM - and at a 16,384-token chunk on the head card (56 slots/layer, 4.53 GB pool + 2.89 GB held, ~110
 // MB free) the first MoE product's allocation failed and ggml_cuda_error aborted the engine mid-prompt.  The number is
-// a worst case read off a chunk of that size (STRATA_GLM_MMQ_RESERVE_MB, see its log line): both fast_setup (the pool)
+// a worst case read off a chunk of that size (MAYA_GLM_MMQ_RESERVE_MB, see its log line): both fast_setup (the pool)
 // and prefill_setup (the lendable the chunk is chosen against) subtract it, so the pool it sizes is the pool it gets.
 size_t Glm5Model::mmq_scratch_reserve() {
     static const size_t r = [] {
-        const char* v = getenv("STRATA_GLM_MMQ_RESERVE_MB");
+        const char* v = getenv("MAYA_GLM_MMQ_RESERVE_MB");
         return v != nullptr ? (size_t) std::max(0LL, std::atoll(v)) << 20 : (size_t) 0;
     }();
     return r;
@@ -6922,15 +6922,15 @@ Glm5Model::PoolBudget Glm5Model::part_budget(size_t free_b, size_t total_b, size
 // nothing free 1 GiB each, later ones a quarter) and is checked again, at most six times.  A piece the driver refuses
 // (Windows also charges VRAM to the commit, RAM + page file) ends the budget at what it gave.  What was found short
 // stays in pool_short_, so the prompt path's chunk and the pool are sized from the same figure.  A fixed
-// --expert-cache N and a unified-memory APU (its budget is RAM's) are not checked.  STRATA_GLM_POOL_CHECK=0: off.
+// --expert-cache N and a unified-memory APU (its budget is RAM's) are not checked.  MAYA_GLM_POOL_CHECK=0: off.
 // Nor is a budget beyond all the pool can ever take (all_b: every expert of this part's layers with the spares and a
 // prompt's room): such a pool cannot fill the card, and writing the whole budget - a Windows APU's carve-out, a Radeon
 // 8065S's ~157 GB for Maya-S's ~106 - three times over took a start from ~60 to ~120 s.
 #if defined(STRATA_USE_HIP) && defined(_WIN32)
 // The dedicated video memory DXGI reports for the adapter with this HIP device's LUID (an APU: its carve-out), 0 when
-// unknown.  STRATA_GLM_APU_DEDICATED_GB=<n> sets it (a test: a smaller carve-out), =0 turns the cap below off.
+// unknown.  MAYA_GLM_APU_DEDICATED_GB=<n> sets it (a test: a smaller carve-out), =0 turns the cap below off.
 static size_t win_dedicated_bytes(int dev) {
-    if (const char* v = getenv("STRATA_GLM_APU_DEDICATED_GB")) return (size_t) (std::atof(v) * 1073741824.0);
+    if (const char* v = getenv("MAYA_GLM_APU_DEDICATED_GB")) return (size_t) (std::atof(v) * 1073741824.0);
     cudaDeviceProp prop{};
     if (cudaGetDeviceProperties(&prop, dev) != cudaSuccess) {
         cudaGetLastError();
@@ -6942,7 +6942,7 @@ static size_t win_dedicated_bytes(int dev) {
 
 void Glm5Model::pool_check(size_t floor_b, size_t slot_b, size_t all_b) {
     if (fast_ == nullptr || fast_->unified_memory) return;
-    if (const char* v = getenv("STRATA_GLM_POOL_CHECK"); v != nullptr && std::atoi(v) == 0) return;
+    if (const char* v = getenv("MAYA_GLM_POOL_CHECK"); v != nullptr && std::atoi(v) == 0) return;
     constexpr size_t kPiece = (size_t) 1 << 30;
     cudaSetDevice(dev_);
     // An APU's GPU memory (Windows sizes its carve-out like a card's) is not checked either: there the frees of a
@@ -6975,14 +6975,14 @@ void Glm5Model::pool_check(size_t floor_b, size_t slot_b, size_t all_b) {
         // the pool took the commit the other programs need, or the driver refused it and the start failed.  The pool
         // keeps within what may still be committed less max(8 GB, 10% of the RAM), never below its floor; the experts
         // that keeps off the GPU are said here and to the server (commit_capped: NOTE / INFO gpu_commit_capped_gb, as
-        // DeepSeek's), with the page file that keeps them on it.  STRATA_GLM_COMMIT_CAP_GB=<n> (a test): at most n GB
+        // DeepSeek's), with the page file that keeps them on it.  MAYA_GLM_COMMIT_CAP_GB=<n> (a test): at most n GB
         // more may be committed.
         MEMORYSTATUSEX ms{};
         ms.dwLength = sizeof ms;
         if (GlobalMemoryStatusEx(&ms)) {
             // (+ what a page file Windows manages may still grow by: commit_growth)
             size_t can = (size_t) ms.ullAvailPageFile + (size_t) strata::platform::commit_growth(ms.ullTotalPhys);
-            if (const char* v = getenv("STRATA_GLM_COMMIT_CAP_GB")) can = std::min(can, (size_t) (std::atof(v) * 1e9));
+            if (const char* v = getenv("MAYA_GLM_COMMIT_CAP_GB")) can = std::min(can, (size_t) (std::atof(v) * 1e9));
             const PoolBudget b2 = part_budget(free_b, total_b, floor_b, slot_b);   // (the dedicated cap's included)
             const auto cap = glmfast::commit_pool_cap(b2.avail, floor_b, all_b, can, (size_t) ms.ullTotalPhys);
             if (cap.first < b2.avail) {
@@ -7045,8 +7045,8 @@ void Glm5Model::pool_check(size_t floor_b, size_t slot_b, size_t all_b) {
         size_t fr = 0, tot = 0;
         cudaMemGetInfo(&fr, &tot);
         for (void* p : got) cudaFree(p);
-        // STRATA_GLM_POOL_CHECK_TEST_MB=N (a test): the free figure read before the budget ran N MiB high, as Windows'
-        if (const char* t = getenv("STRATA_GLM_POOL_CHECK_TEST_MB")) {
+        // MAYA_GLM_POOL_CHECK_TEST_MB=N (a test): the free figure read before the budget ran N MiB high, as Windows'
+        if (const char* t = getenv("MAYA_GLM_POOL_CHECK_TEST_MB")) {
             const size_t hi = (size_t) std::max(0LL, std::atoll(t)) << 20;
             fr = fr > hi ? fr - hi : 0;
         }
@@ -7085,13 +7085,13 @@ std::pair<size_t, size_t> Glm5Model::commit_capped() const {
 
 // The floor a lend leaves the pool: a layer keeps one route's experts and the device's spares, +2 for the token that
 // lands as the loan is taken back (Strata's number, the same in the prompt path's sizing, the lend and its refusal).
-// STRATA_GLM_PREFILL_KEEP=<slots> lowers it - the prompt path's buffers then take more of the pool and the chunk
+// MAYA_GLM_PREFILL_KEEP=<slots> lowers it - the prompt path's buffers then take more of the pool and the chunk
 // grows, at the resident cache's expense (the tail still serves decode between prompts); route + spares is the floor
 // the pool's own sizing needs (fast_setup's `need`), so a smaller number is clamped up, not obeyed.
 int Glm5Model::pool_keep(int n_exp_used) {
     const int floor_slots = n_exp_used + gf::kSpares;
     int keep = floor_slots + 2;
-    if (const char* v = getenv("STRATA_GLM_PREFILL_KEEP")) {
+    if (const char* v = getenv("MAYA_GLM_PREFILL_KEEP")) {
         const int want = std::atoi(v);
         if (want > 0) keep = std::max(floor_slots, want);
     }
@@ -7113,8 +7113,8 @@ int Glm5Model::mtp_draft(int32_t next_tok, std::string& err) {
     // between tokens: the draft block's routes go through the same tiers, so the boundary runs first
     if (!t->fast_boundary(err)) { cudaSetDevice(dev_); return -1; }
     // (the vocabulary everywhere but on a two-GPU split, whatever the answer's script: the prompt's cache fill and the
-    // tests read this draft, not a decode; STRATA_GLM_MTP_FULL_HEAD=1 still asks for the whole head)
-    static const bool full_head = strata::platform::env_switch("STRATA_GLM_MTP_FULL_HEAD");
+    // tests read this draft, not a decode; MAYA_GLM_MTP_FULL_HEAD=1 still asks for the whole head)
+    static const bool full_head = strata::platform::env_switch("MAYA_GLM_MTP_FULL_HEAD");
     if (!t->fast_mtp(t->pos_ - 1, next_tok, err, 0, t->n_parts_ != 2 && !full_head)) {
         cudaSetDevice(dev_);
         return -1;
@@ -7140,7 +7140,7 @@ int Glm5Model::mtp_draft(int32_t next_tok, std::string& err) {
 // position with the real token.  Only the head speculates - the tail, the NextN block and the sampler see confirmed
 // tokens only - so the output is exactly what the token-at-a-time decode would produce for the same samples.
 bool Glm5Model::spec_ready() const {
-    if (fast_ == nullptr || split_next_ == nullptr || strata::platform::env_switch("STRATA_GLM_NO_SPEC")) return false;
+    if (fast_ == nullptr || split_next_ == nullptr || strata::platform::env_switch("MAYA_GLM_NO_SPEC")) return false;
     if (glmspec::spec_bench_off()) return false;   // glm-dsa B15.7: no MTP drafts under random routing (bench mode)
     const Glm5Model* last = this;
     for (const Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
@@ -7154,7 +7154,7 @@ bool Glm5Model::spec_plain_turn() {
     if (g_.arch != GlmArch::GlmDsa || !spec_ready()) return false;
     int n = 0;
     for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) ++n;
-    if (!glmspec::tune_plain_turn(n, getenv("STRATA_GLM_SPEC_HEAD"))) return false;
+    if (!glmspec::tune_plain_turn(n, getenv("MAYA_GLM_SPEC_HEAD"))) return false;
     spec_plain_live_ = true;
     static bool said = false;
     if (!said) {
@@ -7262,7 +7262,7 @@ bool Glm5Model::spec_head(int64_t p, int32_t token, std::string& err) {
     FastState* F = fast_;
     const Glm5Geometry& g = g_;
     cudaSetDevice(dev_);
-    static const bool sprof = getenv("STRATA_GLM_SPEC_PROF") != nullptr;
+    static const bool sprof = getenv("MAYA_GLM_SPEC_PROF") != nullptr;
     auto t0 = std::chrono::steady_clock::now();
     const auto lap = [&](int i) {
         if (!sprof) return;
@@ -7275,7 +7275,7 @@ bool Glm5Model::spec_head(int64_t p, int32_t token, std::string& err) {
     // draft, CUDA0 finishes the redo q+2 ~8 ms before CUDA1 finishes q+2, so CUDA0 can start q+3 immediately in
     // parallel with CUDA1's q+2 pass using double-buffered hop slot hsl = spec_n_ & 1
     if (!glmfast::cuda_ok(cudaStreamSynchronize(F->cs), "glm spec head sync", err) || !F->route_ok(err)) return false;
-    // STRATA_GLM_SPEC_CANCEL: a speculative pass (decode_spec says so) reads the live word before every layer; it is
+    // MAYA_GLM_SPEC_CANCEL: a speculative pass (decode_spec says so) reads the live word before every layer; it is
     // set now, with the stream idle, so no earlier pass reads it any more.  Other passes (a redo, the confirmed token's)
     // have no gates and never skip.  A head group of one GPU only (decode_spec checks)
     const bool cancellable = F->spec_cancellable && hl == this && F->spec_live_h != nullptr && F->spec_skip_d != nullptr;
@@ -7368,7 +7368,7 @@ bool Glm5Model::spec_tail(Glm5Model* head, int64_t p, std::string& err) {
     FastState* F = fast_;
     const Glm5Geometry& g = g_;
     cudaSetDevice(dev_);
-    static const bool sprof = getenv("STRATA_GLM_SPEC_PROF") != nullptr;
+    static const bool sprof = getenv("MAYA_GLM_SPEC_PROF") != nullptr;
     auto t0 = std::chrono::steady_clock::now();
     const auto lap = [&](int i) {
         if (!sprof) return;
@@ -7472,8 +7472,8 @@ bool Glm5Model::spec_tail(Glm5Model* head, int64_t p, std::string& err) {
     return true;
 }
 
-// ---- glm-dsa B11.2 (speed): a tail part's device span (STRATA_GLM_SPEC_PROF) and spec_tail around the draft
-// (STRATA_GLM_SPEC_DRAFT_EARLY)
+// ---- glm-dsa B11.2 (speed): a tail part's device span (MAYA_GLM_SPEC_PROF) and spec_tail around the draft
+// (MAYA_GLM_SPEC_DRAFT_EARLY)
 //
 // SPEC_PROF: each tail part brackets its own work for a position with spec_ev_[0] (after its wait for the hop in,
 // so the time it waited for the parts before it is not counted) and spec_ev_[1] (after its hop out, or the argmax on
@@ -7516,7 +7516,7 @@ bool Glm5Model::spec_hop_in(Glm5Model* A, int64_t p, bool prof, std::string& err
     return fast_layers(p, true, err);
 }
 
-// STRATA_GLM_SPEC_DRAFT_EARLY: decode_spec's step queues the tail group's parts before its last (front), runs the
+// MAYA_GLM_SPEC_DRAFT_EARLY: decode_spec's step queues the tail group's parts before its last (front), runs the
 // NextN draft on the last part while they compute, then queues the last part (back).  Each part's stream gets what
 // spec_tail gives it, in the same order: the last part's stream runs the draft at q+1 (its carrier row still holds
 // q+1: back notes q+2 only after the draft read it) and only then its boundary and position q+2, as when the draft
@@ -7529,7 +7529,7 @@ bool Glm5Model::spec_tail_front(Glm5Model* head, int64_t p, std::string& err) {
     FastState* F = fast_;
     const Glm5Geometry& g = g_;
     cudaSetDevice(dev_);
-    static const bool sprof = getenv("STRATA_GLM_SPEC_PROF") != nullptr;
+    static const bool sprof = getenv("MAYA_GLM_SPEC_PROF") != nullptr;
     auto t0 = std::chrono::steady_clock::now();
     const auto lap = [&](int i) {
         if (!sprof) return;
@@ -7575,7 +7575,7 @@ bool Glm5Model::spec_tail_front(Glm5Model* head, int64_t p, std::string& err) {
 bool Glm5Model::spec_tail_back(Glm5Model* head, int64_t p, std::string& err) {
     if (!split_next_) return spec_tail(head, p, err);
     const Glm5Geometry& g = g_;
-    static const bool sprof = getenv("STRATA_GLM_SPEC_PROF") != nullptr;
+    static const bool sprof = getenv("MAYA_GLM_SPEC_PROF") != nullptr;
     Glm5Model* prev = this;
     while (prev->split_next_->split_next_) prev = prev->split_next_.get();
     Glm5Model* m = prev->split_next_.get();
@@ -7610,7 +7610,7 @@ bool Glm5Model::decode_spec(strata::kernels::SamplerParams& sp, int64_t max_new,
                             int64_t& produced, std::string& err) {
     produced = 0;
     glmspec::tune_begin();   // glm-dsa B11.2: the head A/B's clock
-    glmng::NgramSession ng(this);   // glm-dsa B14.13: n-gram drafts (STRATA_GLM_NGRAM_DRAFT), MTP the fallback
+    glmng::NgramSession ng(this);   // glm-dsa B14.13: n-gram drafts (MAYA_GLM_NGRAM_DRAFT), MTP the fallback
     if (!spec_ready()) {
         err = "glm spec: needs a split with the NextN block";
         return false;
@@ -7632,11 +7632,11 @@ bool Glm5Model::decode_spec(strata::kernels::SamplerParams& sp, int64_t max_new,
         }
     }
     cudaSetDevice(dev_);
-    // STRATA_GLM_SPEC_CANCEL=1 (opt-in): a wrong draft stops the head's speculative pass at its next layer (spec_head
+    // MAYA_GLM_SPEC_CANCEL=1 (opt-in): a wrong draft stops the head's speculative pass at its next layer (spec_head
     // arms a skip_gate before each of its layers) and the redo is enqueued at once, before the next draft - instead of
     // after the rest of a pass already known to be thrown away.  Only a head group of one GPU (two-GPU splits).
     static const bool cancel_env = [] {
-        const char* v = getenv("STRATA_GLM_SPEC_CANCEL");
+        const char* v = getenv("MAYA_GLM_SPEC_CANCEL");
         return v != nullptr && std::atoi(v) != 0;
     }();
     bool cancel = cancel_env && hl == this;
@@ -7680,13 +7680,13 @@ bool Glm5Model::decode_spec(strata::kernels::SamplerParams& sp, int64_t max_new,
         cudaSetDevice(dev_);
         return true;
     };
-    // STRATA_GLM_SPEC_SAMPLE=1 (opt-in): SPECULATIVE SAMPLING for sampled requests - the NextN block's draft is
+    // MAYA_GLM_SPEC_SAMPLE=1 (opt-in): SPECULATIVE SAMPLING for sampled requests - the NextN block's draft is
     // DRAWN from its own distribution q and the model's token is the draft with probability min(1, p/q), else a draw
     // from max(0, p - q): the tokens keep the plain draw's distribution exactly, and a draft stands sum(min(p, q)) of
     // the time instead of p(argmax q).  A fixed seed still gives the same answer - but not the plain draw's answer.
     // Greedy requests (and penalties, which this path does not take) keep the argmax draft and the exact match.
     static const bool spec_sample_env =
-        getenv("STRATA_GLM_SPEC_SAMPLE") != nullptr && std::atoi(getenv("STRATA_GLM_SPEC_SAMPLE")) != 0;
+        getenv("MAYA_GLM_SPEC_SAMPLE") != nullptr && std::atoi(getenv("MAYA_GLM_SPEC_SAMPLE")) != 0;
     const bool spec_sample = spec_sample_env && !sp.greedy && sp.temperature > 0.0f && sp.penalty_last_n <= 0;
     if (spec_sample && TL->fast_->spec_q == nullptr) {
         cudaSetDevice(TL->dev_);
@@ -7791,15 +7791,15 @@ bool Glm5Model::decode_spec(strata::kernels::SamplerParams& sp, int64_t max_new,
     if (cancel) fast_->spec_cancellable = true;   // q+2 with the draft: speculative
     if (!spec_head(q + 2, d, err)) return false;
     bool ok = true;
-    // glm-dsa B11.2 (speed): STRATA_GLM_SPEC_DRAFT_EARLY=1 takes the NextN draft off the tail's critical path - the
+    // glm-dsa B11.2 (speed): MAYA_GLM_SPEC_DRAFT_EARLY=1 takes the NextN draft off the tail's critical path - the
     // step settles the head's position first (stands, or restore + redo: that needs the tail's token only), queues the
     // tail group's parts before its last, runs the draft on the last part while they compute, then queues the last
     // part and the head's next position.  Off: the draft first, the tail group idle until it is done.  The tokens are
     // the same either way (every emitted token is the tail's, from confirmed tokens; each device's queue keeps its
     // order, spec_tail_front); read at each call
     const bool early = glmspec::spec_draft_early();
-    // STRATA_GLM_SPEC_PROF=1: host time per phase of a step (debug)
-    static const bool sprof = getenv("STRATA_GLM_SPEC_PROF") != nullptr;
+    // MAYA_GLM_SPEC_PROF=1: host time per phase of a step (debug)
+    static const bool sprof = getenv("MAYA_GLM_SPEC_PROF") != nullptr;
     double tp[6] = {0, 0, 0, 0, 0, 0};
     int64_t np = 0;
     auto tnow = std::chrono::steady_clock::now();
@@ -7817,9 +7817,9 @@ bool Glm5Model::decode_spec(strata::kernels::SamplerParams& sp, int64_t max_new,
 #endif
     };
     const auto lap = [&](int i) { lapn(i, (i + 1) % 6); };
-    // STRATA_GLM_NSYS=<from>,<to>: a profiler capture window over those steps (nsys --capture-range=cudaProfilerApi)
+    // MAYA_GLM_NSYS=<from>,<to>: a profiler capture window over those steps (nsys --capture-range=cudaProfilerApi)
     int64_t nsys_from = -1, nsys_to = -1;
-    if (const char* ns = getenv("STRATA_GLM_NSYS")) std::sscanf(ns, "%lld,%lld", (long long*) &nsys_from, (long long*) &nsys_to);
+    if (const char* ns = getenv("MAYA_GLM_NSYS")) std::sscanf(ns, "%lld,%lld", (long long*) &nsys_from, (long long*) &nsys_to);
 #if !defined(STRATA_USE_HIP)
     if (sprof) nvtxRangePushA("emit");
 #endif
@@ -7843,7 +7843,7 @@ bool Glm5Model::decode_spec(strata::kernels::SamplerParams& sp, int64_t max_new,
         ng.verdict(d, y2);
         int d2 = -1;
         if (v51) {
-            // two GPUs (#860): v1.1.51's round.  (STRATA_GLM_SPEC_CANCEL) a wrong draft: the head's speculative pass
+            // two GPUs (#860): v1.1.51's round.  (MAYA_GLM_SPEC_CANCEL) a wrong draft: the head's speculative pass
             // for q+2 stops at its next layer, its states are restored behind it and the redo goes in now
             if (cancel && wrong) {
                 *(volatile int*) fast_->spec_live_h = 0;
@@ -7873,7 +7873,7 @@ bool Glm5Model::decode_spec(strata::kernels::SamplerParams& sp, int64_t max_new,
         } else {
             // a wrong draft: the head's standing speculative pass for q+2 is redone with the true token.  This must
             // go BEFORE the tail's q+2 enqueue: the tail's pass snapshots the head's hop event as it is enqueued, so
-            // the redo's hop record has to be the one in place already.  (STRATA_GLM_SPEC_CANCEL: the head's
+            // the redo's hop record has to be the one in place already.  (MAYA_GLM_SPEC_CANCEL: the head's
             // speculative pass stops at its next layer, its states are restored behind it and the redo goes in now -
             // the head redoes q+2 while the tail drafts)
             if (wrong) {
@@ -8355,7 +8355,7 @@ uint64_t Glm5Model::slot_save(const std::string& path, std::string& err) {
     }
     cudaSetDevice(dev_);
     if (magic == kGlmSlotMagicV3 && !mtp_slot_put(f, err)) return 0;   // glm-dsa B15.3: the MTP1 carrier trailer
-    if (getenv("STRATA_GLM_SLOT_TIMING"))
+    if (getenv("MAYA_GLM_SLOT_TIMING"))
         std::fprintf(stderr, "glm slots: save %lld positions - sync %.0f ms, copy %.0f ms, write %.0f ms\n",
                      (long long) n, t_sync, t_copy, t_write);
     f.flush();
@@ -8566,7 +8566,7 @@ uint64_t Glm5Model::slot_save(std::vector<uint8_t>& data, std::string& err) {
         data.insert(data.end(), t.begin(), t.end());
         total += t.size();
     }
-    if (getenv("STRATA_GLM_SLOT_TIMING"))
+    if (getenv("MAYA_GLM_SLOT_TIMING"))
         std::fprintf(stderr, "glm slots: save %lld positions to RAM - sync %.0f ms, copy %.0f ms\n",
                      (long long) n, t_sync, t_copy);
     return total;

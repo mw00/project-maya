@@ -9,22 +9,22 @@
 //               (the CUDA-core token scorer)   the device); also every n <= top_k (it skips: the selection is the
 //                                              identity) and every shape the WMMA kernel refuses
 //               glmd::idx_score_wmma           n > top_k and the WMMA shape (idx_heads % 16 == 0, <= 32, idx_dim % 16,
-//               (B10.3, IdxScoreWmma)          <= 256) and STRATA_GLMD_IDX_WMMA: unset/"auto" -> n > 16384
+//               (B10.3, IdxScoreWmma)          <= 256) and MAYA_GLMD_IDX_WMMA: unset/"auto" -> n > 16384
 //                                              (kIdxWmmaMinDecode), 1 -> always, 0 -> never
 //   selector    glmd::topk                     the default (one block per row)
-//               glmd::topk_mb (B10.4)          n > top_k and STRATA_GLMD_TOPK_MB: unset/"auto" -> n > 32768
+//               glmd::topk_mb (B10.4)          n > top_k and MAYA_GLMD_TOPK_MB: unset/"auto" -> n > 32768
 //                                              (kTopkMbMin), 1 -> always, 0 -> never
-//               glmd::topk_hist (B14.15)       n > top_k, STRATA_GLMD_TOPK_HIST=1 (default off) and topk_mb not
+//               glmd::topk_hist (B14.15)       n > top_k, MAYA_GLMD_TOPK_HIST=1 (default off) and topk_mb not
 //                                              chosen: the bucket selector, the same cells as glmd::topk
 //   attention   glmd::mla2                     the default
-//               glmd::mla_fused (B10.2)        STRATA_GLMD_FUSED_MLA=1 and mla_fused_supported (kv_lora 512, <= 64
-//                                              heads, qk_rope 0 / 64); split count STRATA_GLMD_FUSED_SPLIT
+//               glmd::mla_fused (B10.2)        MAYA_GLMD_FUSED_MLA=1 and mla_fused_supported (kv_lora 512, <= 64
+//                                              heads, qk_rope 0 / 64); split count MAYA_GLMD_FUSED_SPLIT
 //   key dtype   F32 / FP16 (B10.8)             the STATE LAYOUT decides (GlmStateLayout::ik_bytes == 2, carved from
-//                                              STRATA_GLM_IDX_FP16): dsa_prep, both scorers, the prompt path and the
+//                                              MAYA_GLM_IDX_FP16): dsa_prep, both scorers, the prompt path and the
 //                                              slot fingerprint all read the same layout, never the env on their own
 //   W_kb / W_vb BF16 / native Q8_0 (B10.7)     the binder's pick (glmdsa::pick_headwise): Mla2 / FusedMla w_type
 //   key rotation off / Walsh-Hadamard (B14.11) the STATE LAYOUT decides (GlmStateLayout::ik_had, carved from
-//                                              STRATA_GLM_IDX_HADAMARD): dsa_prep and dsa_rope_q rotate keys and queries
+//                                              MAYA_GLM_IDX_HADAMARD): dsa_prep and dsa_rope_q rotate keys and queries
 //
 // The two indexer argument structs are reconciled here: the mixer always fills ONE glmd::IdxScore (the token
 // scorer's request: iq, keys + dtype, head weights, the device position, the cache capacity, the identity skip, the
@@ -38,7 +38,7 @@
 // straddles a kernel switch: within one regime every decision above is constant.
 //
 // Defaults (Flash glm5-next never reaches this code): the token scorer, single-block top-k and mla2 below 16K / 32K
-// cells, WMMA scorer and radix top-k above (auto), mla2 always unless STRATA_GLMD_FUSED_MLA=1.  A default-constructed
+// cells, WMMA scorer and radix top-k above (auto), mla2 always unless MAYA_GLMD_FUSED_MLA=1.  A default-constructed
 // DecodePolicy is all-off (the wave-4 behaviour: the CPU tests' baseline); decode_policy_env() is the engine's.
 #pragma once
 
@@ -70,13 +70,13 @@ static_assert((int) kSwitchAuto == (int) strata::glmenv::kAuto && (int) kSwitchO
                   (int) kSwitchOn == (int) strata::glmenv::kOn, "glmd switch values mirror glmenv's");
 
 struct DecodePolicy {
-    bool fused_mla = false;          // STRATA_GLMD_FUSED_MLA
-    bool mla_dec = true;             // STRATA_GLMD_MLA_DEC (L1-4, default on): mla2's attention through mla_dec
-    int fused_split = kFusedSplitDefault;   // STRATA_GLMD_FUSED_SPLIT (> 0)
-    int idx_wmma = kSwitchOff;       // STRATA_GLMD_IDX_WMMA (engine default auto)
-    int topk_mb = kSwitchOff;        // STRATA_GLMD_TOPK_MB (engine default auto)
+    bool fused_mla = false;          // MAYA_GLMD_FUSED_MLA
+    bool mla_dec = true;             // MAYA_GLMD_MLA_DEC (L1-4, default on): mla2's attention through mla_dec
+    int fused_split = kFusedSplitDefault;   // MAYA_GLMD_FUSED_SPLIT (> 0)
+    int idx_wmma = kSwitchOff;       // MAYA_GLMD_IDX_WMMA (engine default auto)
+    int topk_mb = kSwitchOff;        // MAYA_GLMD_TOPK_MB (engine default auto)
     bool idx_fp16 = false;           // the state layout's index-key dtype (GlmStateLayout::ik_bytes == 2)
-    bool topk_hist = false;          // STRATA_GLMD_TOPK_HIST (B14.15, default off)
+    bool topk_hist = false;          // MAYA_GLMD_TOPK_HIST (B14.15, default off)
     bool idx_had = false;            // the state layout's key rotation (GlmStateLayout::ik_had, B14.11)
 };
 
@@ -84,13 +84,13 @@ struct DecodePolicy {
 /// load).  idx_fp16 is NOT read here: the caller sets it from the state layout.
 inline DecodePolicy decode_policy_env() {
     DecodePolicy p;
-    p.fused_mla = strata::glmenv::env_flag("STRATA_GLMD_FUSED_MLA", false);
-    p.mla_dec = strata::glmenv::env_flag("STRATA_GLMD_MLA_DEC", true);
-    p.fused_split = (int) std::clamp<long long>(strata::glmenv::env_int("STRATA_GLMD_FUSED_SPLIT", kFusedSplitDefault),
+    p.fused_mla = strata::glmenv::env_flag("MAYA_GLMD_FUSED_MLA", false);
+    p.mla_dec = strata::glmenv::env_flag("MAYA_GLMD_MLA_DEC", true);
+    p.fused_split = (int) std::clamp<long long>(strata::glmenv::env_int("MAYA_GLMD_FUSED_SPLIT", kFusedSplitDefault),
                                                 1, 1 << 20);
-    p.idx_wmma = env_switch("STRATA_GLMD_IDX_WMMA", kSwitchAuto);
-    p.topk_mb = env_switch("STRATA_GLMD_TOPK_MB", kSwitchAuto);
-    p.topk_hist = strata::glmenv::env_flag("STRATA_GLMD_TOPK_HIST", false);
+    p.idx_wmma = env_switch("MAYA_GLMD_IDX_WMMA", kSwitchAuto);
+    p.topk_mb = env_switch("MAYA_GLMD_TOPK_MB", kSwitchAuto);
+    p.topk_hist = strata::glmenv::env_flag("MAYA_GLMD_TOPK_HIST", false);
     return p;
 }
 

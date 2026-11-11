@@ -1,7 +1,7 @@
 // tests/glm_dsa/glm_dsa_prefill_stream_test.cpp - glm-dsa B9.9 on the CPU (no GPU): the prompt's expert streaming
 // driver's planners and the node-split host share.
 //
-//   1. the switches: the driver on glm-dsa only (STRATA_GLM_PREFILL_STREAM=0 off), the prestage buffer on a glm-dsa
+//   1. the switches: the driver on glm-dsa only (MAYA_GLM_PREFILL_STREAM=0 off), the prestage buffer on a glm-dsa
 //      split's parts;
 //   2. the early prestage schedule: on the serial schedule every later part pre-stages before every chunk, under the
 //      chunk pipeline only before chunk 0; a single GPU never;
@@ -51,13 +51,13 @@ void check(bool ok, const std::string& what) {
 
 void test_switches() {
     std::printf("[switches]\n");
-    unsetenv("STRATA_GLM_PREFILL_STREAM");
+    unsetenv("MAYA_GLM_PREFILL_STREAM");
     check(gp::stream_on(true) && !gp::stream_on(false), "on for glm-dsa, off for Flash");
     check(gp::split_prestage(true, 3) && !gp::split_prestage(true, 1) && !gp::split_prestage(false, 3),
           "the prestage buffer on a glm-dsa split's parts only (a single GPU has Maya's)");
-    setenv("STRATA_GLM_PREFILL_STREAM", "0", 1);
-    check(!gp::stream_on(true) && !gp::split_prestage(true, 3), "STRATA_GLM_PREFILL_STREAM=0: off");
-    unsetenv("STRATA_GLM_PREFILL_STREAM");
+    setenv("MAYA_GLM_PREFILL_STREAM", "0", 1);
+    check(!gp::stream_on(true) && !gp::split_prestage(true, 3), "MAYA_GLM_PREFILL_STREAM=0: off");
+    unsetenv("MAYA_GLM_PREFILL_STREAM");
 }
 
 void test_schedule() {
@@ -111,9 +111,9 @@ void test_node() {
 
 void test_prestage_skip() {
     std::printf("[B14.7 in the prestage]\n");
-    unsetenv("STRATA_GLM_UPLOAD_MIN_ROWS");
-    unsetenv("STRATA_GLM_PREFILL_CPU");
-    unsetenv("STRATA_GLM_PREFILL_CPU_ROW_MS");
+    unsetenv("MAYA_GLM_UPLOAD_MIN_ROWS");
+    unsetenv("MAYA_GLM_PREFILL_CPU");
+    unsetenv("MAYA_GLM_PREFILL_CPU_ROW_MS");
     // upload 1.3 ms, lane expert 2 x 0.15, 0.05 ms a row: rows* = ceil((1.3 - 0.3) / 0.05) = 20
     check(glmd::upload_rows_min_measured(1.3, 0.3, 0.05) == 20, "the plan's threshold: 20 rows");
     check(gp::prestage_skip(true, 19.5, 1.3, 0.0, 0.0, 0.15, 0.05, true) &&
@@ -124,30 +124,30 @@ void test_prestage_skip() {
     check(!gp::prestage_skip(false, 1, 1.3, 0, 0, 0.15, 0.05, true) && !gp::prestage_skip(true, 1, 1.3, 0, 0, 0.15, 0.05, false) &&
               !gp::prestage_skip(true, 1, 1.3, 0, 0, 0.0, 0.05, true),
           "never on Flash, without a lane for the layer, or an uncalibrated lane");
-    setenv("STRATA_GLM_PREFILL_CPU", "0", 1);
-    check(!gp::prestage_skip(true, 1, 1.3, 0, 0, 0.15, 0.05, true), "STRATA_GLM_PREFILL_CPU=0: the lane takes nothing");
-    unsetenv("STRATA_GLM_PREFILL_CPU");
-    setenv("STRATA_GLM_UPLOAD_MIN_ROWS", "4", 1);
+    setenv("MAYA_GLM_PREFILL_CPU", "0", 1);
+    check(!gp::prestage_skip(true, 1, 1.3, 0, 0, 0.15, 0.05, true), "MAYA_GLM_PREFILL_CPU=0: the lane takes nothing");
+    unsetenv("MAYA_GLM_PREFILL_CPU");
+    setenv("MAYA_GLM_UPLOAD_MIN_ROWS", "4", 1);
     check(!gp::prestage_skip(true, 5, 1.3, 0, 0, 0.15, 0.05, true) && gp::prestage_skip(true, 3, 1.3, 0, 0, 0.15, 0.05, true),
-          "STRATA_GLM_UPLOAD_MIN_ROWS=4 moves the threshold for the prestage too");
-    unsetenv("STRATA_GLM_UPLOAD_MIN_ROWS");
-    // the plan's row cost honours STRATA_GLM_PREFILL_CPU_ROW_MS; so does the prestage (0.1 ms a row: rows* = 10)
-    setenv("STRATA_GLM_PREFILL_CPU_ROW_MS", "0.1", 1);
+          "MAYA_GLM_UPLOAD_MIN_ROWS=4 moves the threshold for the prestage too");
+    unsetenv("MAYA_GLM_UPLOAD_MIN_ROWS");
+    // the plan's row cost honours MAYA_GLM_PREFILL_CPU_ROW_MS; so does the prestage (0.1 ms a row: rows* = 10)
+    setenv("MAYA_GLM_PREFILL_CPU_ROW_MS", "0.1", 1);
     check(glmd::upload_rows_min_measured(1.3, 0.3, 0.1) == 10 && !gp::prestage_skip(true, 12, 1.3, 0, 0, 0.15, 0.05, true) &&
               gp::prestage_skip(true, 9, 1.3, 0, 0, 0.15, 0.05, true),
-          "STRATA_GLM_PREFILL_CPU_ROW_MS=0.1 replaces the learned 0.05 ms a row, as in the plan");
-    unsetenv("STRATA_GLM_PREFILL_CPU_ROW_MS");
+          "MAYA_GLM_PREFILL_CPU_ROW_MS=0.1 replaces the learned 0.05 ms a row, as in the plan");
+    unsetenv("MAYA_GLM_PREFILL_CPU_ROW_MS");
 }
 
 void test_mtp_token_path() {
     std::printf("[B11.1 NextN rows on the token path]\n");
     check(gp::prefill_min_tokens(nullptr) == 32 && gp::prefill_min_tokens("8") == 8 && gp::prefill_min_tokens("0") == 1 &&
               gp::prefill_min_tokens("") == 1,
-          "STRATA_GLM_PREFILL_MIN: default 32, at least 1 (prefill()'s rule)");
+          "MAYA_GLM_PREFILL_MIN: default 32, at least 1 (prefill()'s rule)");
     check(gp::mtp_token_fill(true, true, true, 31, 32) && !gp::mtp_token_fill(true, true, true, 32, 32),
           "a short follow-up (31 < 32 tokens) fills the NextN rows; 32 take the batched path (mtp_fill)");
     check(gp::mtp_token_fill(true, true, false, 5000, 32),
-          "no batched state (--prefill 0, STRATA_GLM_NO_PREFILL, 'not covered'): every prompt fills them");
+          "no batched state (--prefill 0, MAYA_GLM_NO_PREFILL, 'not covered'): every prompt fills them");
     check(!gp::mtp_token_fill(false, true, false, 5, 32) && !gp::mtp_token_fill(true, false, false, 5, 32) &&
               !gp::mtp_token_fill(true, true, false, 0, 32),
           "never on Flash, without a NextN block, or for an empty prompt (Maya's prefill())");

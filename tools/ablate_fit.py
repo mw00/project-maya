@@ -197,16 +197,19 @@ def read_records(path, start: int = 0) -> tuple:
     return out, start + i
 
 
-def prompt_pass(recs: list, writes: int) -> np.ndarray:
+def prompt_pass(recs: list, writes: int, final: bool = False) -> np.ndarray:
     """The last prompt pass's writes [writes, dim] of one request's records: blocks of `writes` in order, each of one
-    T; the last block before the decode steps (T 1) - a prompt read in several chunks leaves its last chunk's."""
+    T; the last block before the decode steps (T 1) - a prompt read in several chunks leaves its last chunk's.
+    final: the last block whatever its T - a max_tokens 1 request runs no decode step, and the GLM engine reads a
+    prompt's last token as a pass of its own (T 1), so the block before it holds the token before the last (on
+    GLM-5.3 a prefix every prompt shares: no direction)."""
     if writes <= 0 or len(recs) < writes or len(recs) % writes:
         raise ValueError(f"{len(recs)} writes read out, not a multiple of {writes} (a request's prompt pass)")
     blocks = [recs[i:i + writes] for i in range(0, len(recs), writes)]
     for b in blocks:
         if len({t for t, _ in b}) != 1:
             raise ValueError("a block of writes mixes passes (the layer count is wrong, or --parallel is above 1)")
-    pick = [b for b in blocks if b[0][0] > 1] or blocks[:1]
+    pick = blocks if final else [b for b in blocks if b[0][0] > 1] or blocks[:1]
     return np.stack([row for _, row in pick[-1]])
 
 
@@ -261,7 +264,7 @@ def cmd_collect(a) -> int:
                     if len({t for t, _ in recs}) != 1:
                         raise SystemExit("the first prompt was read in several passes: pass --writes (2 x layers)")
                     writes = meta["writes"] = len(recs)
-                res = residuals(prompt_pass(recs, writes)).astype(np.float16)
+                res = residuals(prompt_pass(recs, writes, final=True)).astype(np.float16)   # (max_tokens 1)
                 if arr is None:
                     arr = np.lib.format.open_memmap(run / f"{name}.{mode}.npy", mode="w+", dtype=np.float16,
                                                     shape=(len(prompts),) + res.shape)

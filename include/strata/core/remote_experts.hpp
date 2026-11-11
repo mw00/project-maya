@@ -38,7 +38,7 @@ public:
     bool owns(int key) const { return !owned_.empty() && owned_[(size_t) key] != 0; }
     bool integrated() const { return integrated_; }
     bool zero_copy() const { return zero_copy_; }   // the selected call path (an integrated helper's default)
-    bool profiling() const { return prof_; }         // STRATA_GLM_PROF read at open
+    bool profiling() const { return prof_; }         // MAYA_GLM_PROF read at open
     size_t available() const { return capacity_ - used_; }
     size_t used() const { return used_; }
     bool compute(int gu_type, int d_type, size_t down_off, float limit, int ne,
@@ -46,11 +46,11 @@ public:
                  float* out, std::string& err);
     /// The same for an EXL3 pack's experts (lay: their layer's blob layout; open(..., exl3 = true)): the F32 input
     /// through exl3::moe_gate_up / moe_down on the helper's device - its decode kernels are exl3.cu's choice for it
-    /// (STRATA_GLM_EXL3_DECODE<n>).  A launch that failed there (exl3::launch_errors) fails the call.
+    /// (MAYA_GLM_EXL3_DECODE<n>).  A launch that failed there (exl3::launch_errors) fails the call.
     bool compute_exl3(const strata::kernels::exl3::ExpertLayout& lay, float limit, int ne,
                       const int* keys, const float* weights, const float* x,
                       float* out, std::string& err);
-    /// compute / compute_exl3 in two halves, for a caller with work of its own meanwhile (STRATA_GLM_HELPER_OVERLAP):
+    /// compute / compute_exl3 in two halves, for a caller with work of its own meanwhile (MAYA_GLM_HELPER_OVERLAP):
     /// enqueue copies the input and the plan up and queues the kernels and the result's copy into out - out must stay
     /// untouched until wait returns (mapped pinned memory: the copy runs while the caller works) - and wait finishes
     /// the call (the stream, the EXL3 launch check, the profile).  One call at a time: wait before the next enqueue
@@ -65,7 +65,7 @@ public:
                       float* out, std::string& err);
     bool wait(std::string& err);
     bool pending() const { return pending_.load(std::memory_order_acquire); }
-    /// the last waited call's GPU time (its stages' events, ms) with STRATA_GLM_PROF, else -1
+    /// the last waited call's GPU time (its stages' events, ms) with MAYA_GLM_PROF, else -1
     double last_gpu_ms() const { return last_gpu_ms_; }
     void close();
     int device() const { return device_; }
@@ -100,7 +100,7 @@ private:
     void *xq_ = nullptr, *hq_ = nullptr;
     strata::kernels::glmf::MoeDev plan_;
     // an integrated (UMA) helper: the input, the plan and the result in mapped pinned memory the kernels use in place
-    // - four copies fewer a call (STRATA_GLM_HELPER_ZEROCOPY=0: the copies)
+    // - four copies fewer a call (MAYA_GLM_HELPER_ZEROCOPY=0: the copies)
     bool zero_copy_ = false;
     uint8_t* zc_host_ = nullptr;      // [x | out | plan pointers | plan weights], host side
     float *x_h_ = nullptr, *out_h_ = nullptr;
@@ -108,7 +108,7 @@ private:
     float* plan_w_h_ = nullptr;
     float *x_z_ = nullptr, *out_z_ = nullptr;   // the same, as the helper's device sees them
     strata::kernels::glmf::MoeDev zplan_;
-    // STRATA_GLM_PROF: each call's host time and its stages' GPU time, summed; printed when the helper closes
+    // MAYA_GLM_PROF: each call's host time and its stages' GPU time, summed; printed when the helper closes
     bool prof_ = false;
     cudaEvent_t ev_[6] = {};
     unsigned long long calls_ = 0, experts_ = 0, bytes_ = 0, split_calls_ = 0;

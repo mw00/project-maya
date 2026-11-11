@@ -1,16 +1,16 @@
 // tests/glm_dsa/glm_dsa_pack_fast_test.cpp - glm-dsa B6.4 (label gpu): the glm-dsa fast path on a synthetic pack, one
 // part against three parts at full-indexer boundaries, the speculative decode on and off, slots and snapshots.
 //
-// The pack: $STRATA_TEST_GLM_DSA_PACK when set, else the PACK9 preset (12 layers + NextN, full indexer layers 0, 1, 2,
+// The pack: $MAYA_TEST_GLM_DSA_PACK when set, else the PACK9 preset (12 layers + NextN, full indexer layers 0, 1, 2,
 // 6, 10) made with tools/glm_dsa_synth_gguf.py --preset PACK9 and packed by tools/iq_pack.py's glm-dsa mode
 // (tests/glm_dsa/glm_dsa_fixtures.hpp).  Without a device, or without the tools, the test exits 77.
 //
-//   1. greedy 32 tokens from a fixed prompt on one part (STRATA_GLM_SPLIT=0) and on three parts at full-indexer
+//   1. greedy 32 tokens from a fixed prompt on one part (MAYA_GLM_SPLIT=0) and on three parts at full-indexer
 //      bounds (glm_snap_bounds of the thirds): identical tokens (the hop carries the residual exactly; each part's
 //      first layer is full, so no selection crosses a part);
 //   2. the speculative decode (decode_spec: the head part runs the NextN draft's next token while the tail finishes;
 //      needs a split whose last part carries the NextN block) emits the very tokens of the token-at-a-time greedy
-//      decode, with STRATA_GLM_SPEC_DRAFT_EARLY off and on (B11.2: the draft beside the tail group's front parts);
+//      decode, with MAYA_GLM_SPEC_DRAFT_EARLY off and on (B11.2: the draft beside the tail group's front parts);
 //      tried on the 3-part split, then on a 2-part one;
 //   3. slot round trip on the 3-part split (B14.5): snapshot after prompt[:-1], slot_save, 16 greedy tokens, reset,
 //      slot_load, the same 16 tokens; the slot holds at least every layer's latent + k_pe rows and the full layers'
@@ -22,7 +22,7 @@
 //      the fresh run's first draft; the fingerprint names the NextN block (words 12, 13) and a slot whose block word
 //      differs is refused.
 //   6. B8.1 (warm): one part, and with 3 devices the parallel 3-part load, warmed in slot order
-//      (STRATA_GLM_WARM_SEQ=0, Maya's) and in file order (glm-dsa's default): the same digest of every VRAM and
+//      (MAYA_GLM_WARM_SEQ=0, Maya's) and in file order (glm-dsa's default): the same digest of every VRAM and
 //      RAM-tier slot (which expert, its state, its bytes), with experts in both tiers; a usage file scrambles each
 //      layer's warm order, so the file order must move experts and reads them in contiguous runs; the 3 parts'
 //      file-order warm-ups run one at a time.
@@ -91,21 +91,21 @@ std::unique_ptr<strata::core::Glm5Model> load_split(const fs::path& pack, const 
     return m;
 }
 
-/// The speculative decode vs the plain greedy tokens, with STRATA_GLM_SPEC_DRAFT_EARLY off (today's step order) and on
+/// The speculative decode vs the plain greedy tokens, with MAYA_GLM_SPEC_DRAFT_EARLY off (today's step order) and on
 /// (glm-dsa B11.2: the NextN draft runs while the tail group's front parts compute; on a one-part tail the redo goes in
 /// before the draft); "" when it ran, else why it did not.
 std::string spec_check(strata::core::Glm5Model& m, const std::vector<int32_t>& prompt, const std::vector<int>& want,
                        const std::string& what) {
     if (!m.spec_ready()) return what + ": the speculative decode is not ready (no NextN block on the last part?)";
     for (int early = 0; early < 2; ++early) {
-        if (early) setenv("STRATA_GLM_SPEC_DRAFT_EARLY", "1", 1);
-        else unsetenv("STRATA_GLM_SPEC_DRAFT_EARLY");
-        const std::string label = what + (early ? ", STRATA_GLM_SPEC_DRAFT_EARLY=1" : "");
+        if (early) setenv("MAYA_GLM_SPEC_DRAFT_EARLY", "1", 1);
+        else unsetenv("MAYA_GLM_SPEC_DRAFT_EARLY");
+        const std::string label = what + (early ? ", MAYA_GLM_SPEC_DRAFT_EARLY=1" : "");
         m.reset();
         std::string err;
         std::vector<float> logits;
         if (!m.forward(prompt, logits, err)) {
-            unsetenv("STRATA_GLM_SPEC_DRAFT_EARLY");
+            unsetenv("MAYA_GLM_SPEC_DRAFT_EARLY");
             return label + ": prompt: " + err;
         }
         strata::kernels::SamplerParams sp;
@@ -120,17 +120,17 @@ std::string spec_check(strata::core::Glm5Model& m, const std::vector<int32_t>& p
                       (unsigned long long) (m.spec_steps_ - s0), (unsigned long long) (m.spec_hits_ - h0));
         check(ok && got == want, label + ": spec on vs off: " + (ok ? first_diff(got, want) : "decode_spec: " + err) + buf);
     }
-    unsetenv("STRATA_GLM_SPEC_DRAFT_EARLY");
+    unsetenv("MAYA_GLM_SPEC_DRAFT_EARLY");
     return "";
 }
 
-/// 6. B8.1 (warm): the pack loaded with STRATA_GLM_WARM_SEQ=0 (slot order, Maya's parallel reads) and =1 (file
-/// order, one reader, the parts in turn) gives the same warm digest (STRATA_GLM_WARM_SUM: every part's tiers at the end
+/// 6. B8.1 (warm): the pack loaded with MAYA_GLM_WARM_SEQ=0 (slot order, Maya's parallel reads) and =1 (file
+/// order, one reader, the parts in turn) gives the same warm digest (MAYA_GLM_WARM_SUM: every part's tiers at the end
 /// of its warm-up) - only the order of the reads differs.
 void warm_order_check(const fs::path& pack, const strata::core::Glm5Geometry& g, const std::vector<int>& b3,
                       int n_dev) {
     namespace gw = strata::core::glmwarm;
-    // the usage file (STRATA_GLM_USAGE) leads each layer's warm order: a scrambled one, so the VRAM slots take
+    // the usage file (MAYA_GLM_USAGE) leads each layer's warm order: a scrambled one, so the VRAM slots take
     // experts from all over each layer and the slot order reads all over the files
     const fs::path usage = glmfx::fixture_dir() / "pack_fast_test_warm.usage";
     {
@@ -145,19 +145,19 @@ void warm_order_check(const fs::path& pack, const strata::core::Glm5Geometry& g,
             f << '\n';
         }
     }
-    setenv("STRATA_GLM_USAGE", usage.string().c_str(), 1);
-    setenv("STRATA_GLM_WARM_SUM", "1", 1);   // each part's digest at the end of its warm-up (glmwarm::warm_digest)
+    setenv("MAYA_GLM_USAGE", usage.string().c_str(), 1);
+    setenv("MAYA_GLM_WARM_SUM", "1", 1);   // each part's digest at the end of its warm-up (glmwarm::warm_digest)
     const auto load = [&](const char* seq, bool three, gw::Digest& d, gw::Stats& st, std::string& err) {
-        setenv("STRATA_GLM_WARM_SEQ", seq, 1);
+        setenv("MAYA_GLM_WARM_SEQ", seq, 1);
         gw::stats_reset();
         std::unique_ptr<strata::core::Glm5Model> m;
         if (three) {
             m = load_split(pack, b3, {0, 1, 2}, err);
         } else {
-            setenv("STRATA_GLM_SPLIT", "0", 1);
+            setenv("MAYA_GLM_SPLIT", "0", 1);
             m = std::make_unique<strata::core::Glm5Model>();
             if (!m->load_pack_env(pack.string(), kCtx, err) || !m->fast()) m.reset();
-            unsetenv("STRATA_GLM_SPLIT");
+            unsetenv("MAYA_GLM_SPLIT");
         }
         if (!m) return false;
         d = gw::warm_digest();
@@ -209,9 +209,9 @@ void warm_order_check(const fs::path& pack, const strata::core::Glm5Geometry& g,
             check(s1.max_busy == 1, what + ": the parts' file-order warm-ups ran one at a time (slot order: " +
                                         std::to_string(s0.max_busy) + " at once)");
     }
-    unsetenv("STRATA_GLM_WARM_SEQ");
-    unsetenv("STRATA_GLM_WARM_SUM");
-    unsetenv("STRATA_GLM_USAGE");
+    unsetenv("MAYA_GLM_WARM_SEQ");
+    unsetenv("MAYA_GLM_WARM_SUM");
+    unsetenv("MAYA_GLM_USAGE");
     std::error_code ec;
     fs::remove(usage, ec);
 }
@@ -222,7 +222,7 @@ int main() {
     std::printf("glm_dsa_pack_fast_test: the glm-dsa fast path on a synthetic pack (B6.4)\n");
     std::string why, err;
     fs::path pack;
-    if (const char* p = std::getenv("STRATA_TEST_GLM_DSA_PACK"); p != nullptr && p[0] != '\0') {
+    if (const char* p = std::getenv("MAYA_TEST_GLM_DSA_PACK"); p != nullptr && p[0] != '\0') {
         pack = p;
     } else {
         const fs::path gguf = glmfx::synth("PACK9", why);
@@ -241,14 +241,14 @@ int main() {
         std::fprintf(stderr, "glm_dsa_pack_fast_test: the glm-dsa forward is gated off: %s\n", err.c_str());
         return 1;
     }
-    {   // the pack passes the glm-dsa loader's geometry and tensor-shape checks (no GPU work: STRATA_GLM_CHECK_ONLY)
-        setenv("STRATA_GLM_CHECK_ONLY", "1", 1);
-        setenv("STRATA_GLM_SPLIT", "0", 1);
+    {   // the pack passes the glm-dsa loader's geometry and tensor-shape checks (no GPU work: MAYA_GLM_CHECK_ONLY)
+        setenv("MAYA_GLM_CHECK_ONLY", "1", 1);
+        setenv("MAYA_GLM_SPLIT", "0", 1);
         strata::core::Glm5Model m;
         std::string e;
         m.load_pack_env(pack.string(), kCtx, e);
-        unsetenv("STRATA_GLM_CHECK_ONLY");
-        unsetenv("STRATA_GLM_SPLIT");
+        unsetenv("MAYA_GLM_CHECK_ONLY");
+        unsetenv("MAYA_GLM_SPLIT");
         check(e.find("check-only load") != std::string::npos, "the pack passes the loader's shape checks: " + e);
     }
     int n_dev = 0;
@@ -257,23 +257,23 @@ int main() {
         return g_fail ? 1 : kSkip;
     }
     std::printf("glm_dsa_pack_fast_test: the glm-dsa fast path on a synthetic pack (B6.4), %d device(s)\n", n_dev);
-    unsetenv("STRATA_GLM_SLOW");
-    unsetenv("STRATA_GLM_NO_SPEC");
-    unsetenv("STRATA_GLM_SPEC_DRAFT_EARLY");   // spec_check sets it for its second run
-    unsetenv("STRATA_GLM_NO_MTP");
-    unsetenv("STRATA_GLM_DSA_DENSE");
+    unsetenv("MAYA_GLM_SLOW");
+    unsetenv("MAYA_GLM_NO_SPEC");
+    unsetenv("MAYA_GLM_SPEC_DRAFT_EARLY");   // spec_check sets it for its second run
+    unsetenv("MAYA_GLM_NO_MTP");
+    unsetenv("MAYA_GLM_DSA_DENSE");
 
     const std::vector<int32_t> prompt = {11, 220, 3, 47, 1000 % std::max(1, (int) g.n_vocab), 5, 9, 31};
     std::vector<int> one;
-    {   // 1 part (no NextN block: STRATA_GLM_MTP unset)
-        setenv("STRATA_GLM_SPLIT", "0", 1);
-        unsetenv("STRATA_GLM_MTP");
+    {   // 1 part (no NextN block: MAYA_GLM_MTP unset)
+        setenv("MAYA_GLM_SPLIT", "0", 1);
+        unsetenv("MAYA_GLM_MTP");
         auto m = std::make_unique<strata::core::Glm5Model>();
         if (!m->load_pack_env(pack.string(), kCtx, err) || !m->fast() || !greedy(*m, prompt, kTokens, one, err)) {
             std::fprintf(stderr, "glm_dsa_pack_fast_test: 1 part: %s\n", err.c_str());
             return 1;
         }
-        unsetenv("STRATA_GLM_SPLIT");
+        unsetenv("MAYA_GLM_SPLIT");
         check(m->dsa_n_sel_last() == std::min<int>((int) (prompt.size() + kTokens - 1), g.idx_top_k),
               "1 part: dsa_n_sel_last = min(p + 1, top_k) = " + std::to_string(m->dsa_n_sel_last()));
     }

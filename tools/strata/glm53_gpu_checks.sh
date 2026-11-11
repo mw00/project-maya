@@ -15,11 +15,11 @@
 # B (default ~/glm53-base/build) is a v1.1.55 build with tests; P (default this tree's build) the port's.  Results go
 # to --out (default ~/logs/glm53-gpu-<date>); every check prints PASS / FAIL and the last line is the summary.
 # flash-ab: the same Flash pack, the same token file (data/glm-dsa/parity's first case, cut to 2,048 tokens), on both
-# builds: (1) STRATA_GLM_SCORE log-softmax dumps compared byte for byte, (2) 256 greedy tokens compared with the rest of
-# the run's output (its INFO / VRAM memory layout and its DONE counts; gen_answer), each on one GPU (STRATA_GLM_SPLIT=0)
+# builds: (1) MAYA_GLM_SCORE log-softmax dumps compared byte for byte, (2) 256 greedy tokens compared with the rest of
+# the run's output (its INFO / VRAM memory layout and its DONE counts; gen_answer), each on one GPU (MAYA_GLM_SPLIT=0)
 # and on the default split; any difference is a FAIL - the port must not move a Flash bit.  A run that exits non-zero,
 # prints ERR or ends without its DONE line is a FAIL too, whatever the other build did.
-# Both runs go with the CPU lane off (STRATA_GLM_CPU_LANE=0 STRATA_GLM_PREFILL_CPU=0): the lane's plan comes from
+# Both runs go with the CPU lane off (MAYA_GLM_CPU_LANE=0 MAYA_GLM_PREFILL_CPU=0): the lane's plan comes from
 # timings measured at load, and its results are not bit-equal to the GPU's, so with it on even base vs base differs
 # (GPU day 1: base run 1 vs 2 differed; with the lane off both builds repeat and match byte for byte).
 # A machine with a card the build has no kernels for (e.g. a Quadro P400) needs CUDA_VISIBLE_DEVICES set by the caller.
@@ -67,9 +67,9 @@ tokens_file() {   # the first parity case's prompt, at most CTX + 256 tokens, as
 # (both read from the device's free memory, window= as its drop across the verify window's allocations: they move when
 # anything else holds GPU memory - the desktop on a Windows APU - and with the size of the build's own GPU code on HIP:
 # v1.1.56 against the port on the 8065S, free= 16 MiB and window= 140 KiB apart, every other field equal).  The greedy
-# runs fix the MTP draft length (STRATA_GLM_MTP_ADAPT=0: the cap, every round) so that the drafting counters repeat:
+# runs fix the MTP draft length (MAYA_GLM_MTP_ADAPT=0: the cap, every round) so that the drafting counters repeat:
 # the adaptive length (glm_mtp.cu mtp_choose; the one-GPU MTP decode, on by default on the Halo APUs, and the
-# STRATA_GLM_SPEC_WIN pipe) follows measured round times, and with it the drafts and the decode's expert lookups
+# MAYA_GLM_SPEC_WIN pipe) follows measured round times, and with it the drafts and the decode's expert lookups
 gen_answer() {
     sed -E -e 's/^(DONE [0-9]+ [0-9]+) [0-9.]+ [0-9.]+( |$)/\1 - -\2/' -e '/^VRAM /s/ (free|window)=[0-9]+/ \1=-/g' "$1"
 }
@@ -87,13 +87,13 @@ flash_ab() {
     for split in 0 auto; do
         for side in base port; do
             local bin=$BASE/maya; [ $side = port ] && bin=$PORT/maya
-            local sp=(env STRATA_GLM_CPU_LANE=0 STRATA_GLM_PREFILL_CPU=0); [ $split = 0 ] && sp+=(STRATA_GLM_SPLIT=0)
+            local sp=(env MAYA_GLM_CPU_LANE=0 MAYA_GLM_PREFILL_CPU=0); [ $split = 0 ] && sp+=(MAYA_GLM_SPLIT=0)
             rm -f "$OUT/flash.$split.$side.score"   # (an earlier run's, in a reused --out)
-            "${sp[@]}" env STRATA_GLM_SCORE=$CTX STRATA_GLM_SCORE_DUMP="$OUT/flash.$split.$side.score" \
+            "${sp[@]}" env MAYA_GLM_SCORE=$CTX MAYA_GLM_SCORE_DUMP="$OUT/flash.$split.$side.score" \
                 "$bin" --glm-pack "$FLASH" --tokens-file "$tok" > "$OUT/flash.$split.$side.score.log" 2>&1
             rc[score.$side]=$?
             head -c 200000 "$tok" | cut -d, -f1-$CTX > "$OUT/ab.prompt"
-            "${sp[@]}" STRATA_GLM_MTP_ADAPT=0 "$bin" --glm-pack "$FLASH" --tokens-file "$OUT/ab.prompt" --greedy \
+            "${sp[@]}" MAYA_GLM_MTP_ADAPT=0 "$bin" --glm-pack "$FLASH" --tokens-file "$OUT/ab.prompt" --greedy \
                 --max-new 256 > "$OUT/flash.$split.$side.gen" 2> "$OUT/flash.$split.$side.gen.log"
             rc[gen.$side]=$?
         done
@@ -143,8 +143,8 @@ parity() {
 kld() {
     need --pack "$PACK"; need --ref "$REF"
     local tok; tok=$(tokens_file) || return 1
-    local var=STRATA_GLM_SCORE_REF; head -c 4 "$REF" | od -An -tu4 | grep -qE '^ *(16|32|64|128|256) *$' && var=STRATA_GLM_SCORE_TOPK
-    env STRATA_GLM_SCORE=$CTX $var="$REF" "$PORT/maya" --glm-pack "$PACK" --tokens-file "$tok" \
+    local var=MAYA_GLM_SCORE_REF; head -c 4 "$REF" | od -An -tu4 | grep -qE '^ *(16|32|64|128|256) *$' && var=MAYA_GLM_SCORE_TOPK
+    env MAYA_GLM_SCORE=$CTX $var="$REF" "$PORT/maya" --glm-pack "$PACK" --tokens-file "$tok" \
         > "$OUT/kld.log" 2>&1 && pass "kld: $(grep -iE 'kl|ppl|top-1' "$OUT/kld.log" | tail -2 | tr '\n' ' ')" \
         || fail "kld (see $OUT/kld.log)"
 }

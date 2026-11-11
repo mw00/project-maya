@@ -13,9 +13,9 @@
 namespace strata::core::glmwarm {
 
 // read at each warm-up, not once a process: a test loads the same pack in both orders
-bool seq_on(bool glm_dsa) { return strata::glmenv::env_flag("STRATA_GLM_WARM_SEQ", glm_dsa); }
+bool seq_on(bool glm_dsa) { return strata::glmenv::env_flag("MAYA_GLM_WARM_SEQ", glm_dsa); }
 
-bool sum_on() { return strata::glmenv::env_flag("STRATA_GLM_WARM_SUM", false); }
+bool sum_on() { return strata::glmenv::env_flag("MAYA_GLM_WARM_SUM", false); }
 
 static bool before(const At& a, const At& b) { return a.shard != b.shard ? a.shard < b.shard : a.off < b.off; }
 

@@ -51,7 +51,7 @@ SpecPrice spec_price(const std::vector<PartCost>& parts, int head, double accept
     // ... and only once the head has finished the rejected speculation (decode_spec restores the head's states on
     // its stream and spec_head synchronises it before the redo): a miss is the overlapped step plus the redo, which
     // runs alone (the tail waits for its hop).  Equal to T + H while H <= T without a lane-bound pool; 2H once the
-    // head is the slower group, where T + H under-prices it.  STRATA_GLM_SPEC_DRAFT_EARLY's pricing
+    // head is the slower group, where T + H under-prices it.  MAYA_GLM_SPEC_DRAFT_EARLY's pricing
     if (redo_waits) r.miss_ms = r.hit_ms + r.head_ms;
     r.step_ms = accept * r.hit_ms + (1.0 - accept) * r.miss_ms;
     r.speedup = r.step_ms > 0.0 ? r.base_ms / r.step_ms : 0.0;
@@ -70,10 +70,10 @@ std::vector<SpecPrice> spec_prices(const std::vector<PartCost>& parts, double ac
     return v;
 }
 
-bool spec_draft_early() { return strata::glmenv::env_flag("STRATA_GLM_SPEC_DRAFT_EARLY", false); }
+bool spec_draft_early() { return strata::glmenv::env_flag("MAYA_GLM_SPEC_DRAFT_EARLY", false); }
 
 double spec_accept_assumed() {
-    const double a = strata::glmenv::env_num("STRATA_GLM_SPEC_ACCEPT", 0.8);
+    const double a = strata::glmenv::env_num("MAYA_GLM_SPEC_ACCEPT", 0.8);
     return a >= 0.05 && a <= 1.0 ? a : 0.8;
 }
 
@@ -118,8 +118,8 @@ int spec_record_prices(const std::vector<PartCost>& parts, bool log) {
                          &p == &v[(size_t) best] ? "  <- priced" : "");
         }
         if (v[(size_t) best].speedup < 1.05)
-            std::fprintf(stderr, "glm spec price: the best head is x%.2f (< 1.05): STRATA_GLM_NO_SPEC=1 may be faster "
-                                 "(STRATA_GLM_SPEC_TUNE_PLAIN=1 measures it on 3+ GPUs)\n",
+            std::fprintf(stderr, "glm spec price: the best head is x%.2f (< 1.05): MAYA_GLM_NO_SPEC=1 may be faster "
+                                 "(MAYA_GLM_SPEC_TUNE_PLAIN=1 measures it on 3+ GPUs)\n",
                          v[(size_t) best].speedup);
     }
     return v[(size_t) best].head;
@@ -147,7 +147,7 @@ bool spec_bench_off() { return glmd::random_routing_seed() != 0; }
 
 int spec_tune_window() {
     static const int w = [] {
-        return (int) std::clamp<long long>(strata::glmenv::env_int("STRATA_GLM_SPEC_TUNE", 128), 0, 1 << 30);
+        return (int) std::clamp<long long>(strata::glmenv::env_int("MAYA_GLM_SPEC_TUNE", 128), 0, 1 << 30);
     }();
     return w;
 }
@@ -181,7 +181,7 @@ double HeadTuner::ms_per_token(int head) const {
 
 bool spec_tune_plain() {
     static const bool on = [] {
-        const char* v = getenv("STRATA_GLM_SPEC_TUNE_PLAIN");
+        const char* v = getenv("MAYA_GLM_SPEC_TUNE_PLAIN");
         return v != nullptr && std::atoi(v) != 0;
     }();
     return on;
@@ -265,9 +265,9 @@ void tune_end(int64_t produced) {
             if (g_tuner.ms_per_token(0) < g_tuner.ms_per_token(best) * (1.0 - HeadTuner::kPlainMargin)) best = 0;
         }
         if (best == 0)
-            std::fprintf(stderr, "glm spec tune: %s -> no drafting (STRATA_GLM_SPEC_HEAD pins a head)\n", s.c_str());
+            std::fprintf(stderr, "glm spec tune: %s -> no drafting (MAYA_GLM_SPEC_HEAD pins a head)\n", s.c_str());
         else
-            std::fprintf(stderr, "glm spec tune: %s -> head of %d part%s (STRATA_GLM_SPEC_HEAD pins one)\n", s.c_str(),
+            std::fprintf(stderr, "glm spec tune: %s -> head of %d part%s (MAYA_GLM_SPEC_HEAD pins one)\n", s.c_str(),
                          best, best > 1 ? "s" : "");
     }
 }
@@ -364,15 +364,15 @@ AcceptStats accept_stats(const void* model) {
 
 void note(const void* model, int depth, int64_t pos, int draft, int truth) {
     static const long long every = [] {
-        const char* v = getenv("STRATA_GLM_SPEC_LOG");   // (set: a line every N first-position drafts, N >= 1)
-        return v != nullptr ? std::max(1LL, strata::glmenv::int_value("STRATA_GLM_SPEC_LOG", v, 1)) : 0LL;
+        const char* v = getenv("MAYA_GLM_SPEC_LOG");   // (set: a line every N first-position drafts, N >= 1)
+        return v != nullptr ? std::max(1LL, strata::glmenv::int_value("MAYA_GLM_SPEC_LOG", v, 1)) : 0LL;
     }();
     std::lock_guard<std::mutex> lk(g_mu);
     AcceptStats& s = g_stats[model];
     s.note(depth, pos, draft == truth);
     if (!g_trace_tried) {
         g_trace_tried = true;
-        if (const char* path = getenv("STRATA_GLM_SPEC_TRACE"))
+        if (const char* path = getenv("MAYA_GLM_SPEC_TRACE"))
             if ((g_trace = std::fopen(path, "a")) != nullptr) std::fprintf(g_trace, "# pos depth draft truth accepted\n");
     }
     if (g_trace != nullptr) {
@@ -391,7 +391,7 @@ void report(const void* model, bool final) {
         if (it == g_stats.end()) return;
         s = it->second;
     }
-    static const bool each = getenv("STRATA_GLM_SPEC_LOG") != nullptr;
+    static const bool each = getenv("MAYA_GLM_SPEC_LOG") != nullptr;
     if (s.tried[0] == 0 || (!final && !each)) return;
     std::fprintf(stderr, "glm spec acceptance%s: %s\n", final ? " (this load)" : "", s.line().c_str());
 }

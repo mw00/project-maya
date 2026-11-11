@@ -10,7 +10,7 @@
 // given (default 1 6 12), on a persistent spinning pool (no thread start per expert):
 //  - lane: the engine's CPU lane call (Glm5Model::lane_experts) timed the way its setup calibrates it
 //    (fast_cpu_lane_setup): --experts experts a call (default 4, the calibration's), their gate/up rows end to end cut
-//    in threads x max(1, min(8, 48 / threads)) contiguous pieces (STRATA_GLM_CPU_SPLIT=<pieces a thread> overrides, as
+//    in threads x max(1, min(8, 48 / threads)) contiguous pieces (MAYA_GLM_CPU_SPLIT=<pieces a thread> overrides, as
 //    in the engine), each h quantized on the caller, the down rows likewise, the sum; 100 ms of calls for the clocks,
 //    then 5 rounds of 16 calls 100 ms apart, and an expert's time is the fastest round's median over the call's
 //    experts.  At the engine's thread count on its calibration layer this is the engine log's "CPU lane: N threads
@@ -18,7 +18,7 @@
 //    Each count's output is checked bit for bit against one single-thread run with row4 off (exit 1 on a mismatch).
 //  - alone: one expert a call, gate/up (2 x n_ff rows of n_embd) and down (n_embd rows of n_ff) timed apart, the rows
 //    split evenly over the threads (mean over 3 laps of the 64, and the best).
-// STRATA_GLM_LANE_ROW4=1 turns the lane's 4-row GEMV on as in the engine (a type without a 4-row kernel keeps ggml's
+// MAYA_GLM_LANE_ROW4=1 turns the lane's 4-row GEMV on as in the engine (a type without a 4-row kernel keeps ggml's
 // dots; the header line says which); --row4 0 / 1 overrides it, --row4 both runs every count with it off, then on.
 // GLM_CPU_BENCH_TOKENS=k (1..16): each row dotted with k activations (a verify window's tokens sharing the expert):
 // the same DRAM reads, k times the dots (row4 runs only at k = 1).  The engine interleaves its RAM tier over the NUMA
@@ -160,7 +160,7 @@ int main(int argc, char** argv) {
     if (bad || pos.size() < 2 || (row4 != "env" && row4 != "0" && row4 != "1" && row4 != "both") || n_call < 1 ||
         n_call > 8) {
         std::fprintf(stderr, "usage: %s <pack_dir> <layer> [threads...] [--row4 0|1|both] [--experts 1..8]\n"
-                             "  (env: STRATA_GLM_LANE_ROW4, STRATA_GLM_CPU_SPLIT, GLM_CPU_BENCH_TOKENS)\n", argv[0]);
+                             "  (env: MAYA_GLM_LANE_ROW4, MAYA_GLM_CPU_SPLIT, GLM_CPU_BENCH_TOKENS)\n", argv[0]);
         return 2;
     }
     if (counts.empty()) counts = {1, 6, 12};
@@ -238,8 +238,8 @@ int main(int argc, char** argv) {
     for (int e = 0; e < n_exp; ++e) ex[(size_t) e] = blobs.data() + eb * e;
     const int K = std::max(1, std::min(16, getenv("GLM_CPU_BENCH_TOKENS") ? std::atoi(getenv("GLM_CPU_BENCH_TOKENS")) : 1));
     const int E = std::min(n_call, n_exp), n_sets = n_exp / E;
-    static const int split = [] {   // the engine's STRATA_GLM_CPU_SPLIT (glm_fast_path.cu lane_experts)
-        const char* v = getenv("STRATA_GLM_CPU_SPLIT");
+    static const int split = [] {   // the engine's MAYA_GLM_CPU_SPLIT (glm_fast_path.cu lane_experts)
+        const char* v = getenv("MAYA_GLM_CPU_SPLIT");
         return v ? std::max(1, std::min(64, std::atoi(v))) : 0;
     }();
     std::vector<float> xs((size_t) K * n_embd);
@@ -316,7 +316,7 @@ int main(int argc, char** argv) {
                 "(gate/up %.2f, down %.2f), %d experts cycled from DRAM, %d activation(s) a row\n",
                 layer, geo.arch.c_str(), n_embd, n_ff, (double) geo.limit, strata::ggml_type_name((uint32_t) gu), gu,
                 strata::ggml_type_name((uint32_t) dt), dt, (double) eb / 1e6, 2.0 * gub / 1e6, dnb / 1e6, n_exp, K);
-    std::printf("row4: STRATA_GLM_LANE_ROW4 %s, --row4 %s; a 4-row kernel for gate/up %s, down %s%s\n",
+    std::printf("row4: MAYA_GLM_LANE_ROW4 %s, --row4 %s; a 4-row kernel for gate/up %s, down %s%s\n",
                 kc::lane_row4_on() ? "on" : "off", row4.c_str(), kc::row4_supported(gu) ? "yes" : "no (ggml's dots)",
                 kc::row4_supported(dt) ? "yes" : "no (ggml's dots)", K > 1 ? " (unused: k > 1)" : "");
     std::vector<int> modes;   // lane_row4_override values: -1 follows the env

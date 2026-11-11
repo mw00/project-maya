@@ -1,12 +1,14 @@
-"""tools/maya_names.py - Maya's settings by the names users see, MAYA_*, and the older STRATA_* names the code still
-reads: the environment and a config's "env" take either; on disk and on screen they are MAYA_*.
+"""tools/maya_names.py - Maya's settings are MAYA_*; the older STRATA_* names still work as fallbacks: the environment
+and a config's "env" take either, the code reads MAYA_* (MAYA_X first, then STRATA_X), on disk and on screen they are MAYA_*.
 
-    alias_env(os.environ)    every MAYA_X also sets STRATA_X (MAYA_X wins), so what a program reads and what it starts
-                             (the engines) find the setting under the name they read
+    alias_env(os.environ)    every STRATA_X that has no MAYA_X also sets MAYA_X (MAYA_X wins), so what a program reads and
+                             what it starts (the engines) find the setting under the name they read
     env_in(cfg)              a config as read from disk: its "env" under the names the code reads
     env_out(cfg)             a config about to be written: its "env" under the names users see
 """
 from __future__ import annotations
+
+import os
 
 OLD, NEW = "STRATA_", "MAYA_"
 
@@ -17,20 +19,21 @@ def shown(name: str) -> str:
 
 
 def read_as(name: str) -> str:
-    """A setting's name as the code reads it."""
-    return OLD + name[len(NEW):] if name.startswith(NEW) else name
+    """A setting's name as the code reads it (MAYA_*; the older STRATA_* name is the fallback)."""
+    return shown(name)
 
 
 def alias_env(env) -> None:
-    """In place (os.environ too): every MAYA_X also sets STRATA_X, over an older value."""
+    """In place (os.environ too): every STRATA_X that has no MAYA_X sets MAYA_X (the MAYA_ one counts when both are set)."""
     for k, v in list(env.items()):
-        if k.startswith(NEW):
-            env[read_as(k)] = v
+        if k.startswith(OLD) and shown(k) not in env:
+            env[shown(k)] = v
 
 
 def both_names(name: str) -> tuple[str, str]:
     """(MAYA_X, STRATA_X) for a setting under either name; a name with neither prefix is its own twice."""
-    return shown(name), read_as(name)
+    m = shown(name)
+    return m, (OLD + m[len(NEW):] if m.startswith(NEW) else m)
 
 
 def lookup(env, name: str, default=None):
@@ -58,8 +61,8 @@ def env_in(cfg):
     has a setting under both names, the MAYA_ one counts."""
     e = cfg.get("env") if isinstance(cfg, dict) else None
     if isinstance(e, dict):
-        out = {k: v for k, v in e.items() if not k.startswith(NEW)}
-        out.update({read_as(k): v for k, v in e.items() if k.startswith(NEW)})
+        out = {shown(k): v for k, v in e.items() if not k.startswith(NEW)}
+        out.update({k: v for k, v in e.items() if k.startswith(NEW)})
         cfg["env"] = out
     return cfg
 
@@ -70,3 +73,6 @@ def env_out(cfg):
     if not isinstance(e, dict):
         return cfg
     return {**cfg, "env": {shown(k): v for k, v in e.items()}}
+
+
+alias_env(os.environ)   # (importing this module is enough: an older STRATA_X in the environment also counts as MAYA_X)

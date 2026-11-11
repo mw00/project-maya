@@ -1,7 +1,7 @@
 # glm-dsa wave 9 (guards): B15.1 the FP16 activation range guard of the prompt path, B15.2 the MMQ read-past guard of
 # the expert banks, B15.5 thread pools from the affinity mask, B15.6 the CUDA-graph generation, B15.7 the
 # random-routing bench mode.
-#   src/core/glm_guards_host.cpp      plain C++: STRATA_GLM_F16_GUARD, the guard's CPU twins, the bank gap ranges, the
+#   src/core/glm_guards_host.cpp      plain C++: MAYA_GLM_F16_GUARD, the guard's CPU twins, the bank gap ranges, the
 #                                     graph generation (every backend; the CPU tests link it directly)
 #   src/kernels/cuda/glmd_guards.cu   the guard kernels and binding table, mmq_malloc / mmq_zero_gaps; joins on any GPU
 #                                     backend because Maya-owned glm_prefill.cu / glm_fast_path.cu call it (HIP: the

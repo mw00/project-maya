@@ -8,9 +8,9 @@
 // list with an earlier one reads only what differs (BUILD-PLAN B14.14, ik_llama.cpp's --prompt-cache across
 // conversations, docs/parameters.md:162-164).
 //
-// STRATA_GLM_PROMPT_CACHE_DIR=<dir> turns it on (default off).  STRATA_GLM_PROMPT_CACHE_GB caps the bytes on disk
-// (default 64), STRATA_GLM_PROMPT_CACHE_MIN (default 512) is the shortest state stored and the shortest prefix
-// restored, STRATA_GLM_PROMPT_CACHE_MAX the entry count (default 64).
+// MAYA_GLM_PROMPT_CACHE_DIR=<dir> turns it on (default off).  MAYA_GLM_PROMPT_CACHE_GB caps the bytes on disk
+// (default 64), MAYA_GLM_PROMPT_CACHE_MIN (default 512) is the shortest state stored and the shortest prefix
+// restored, MAYA_GLM_PROMPT_CACHE_MAX the entry count (default 64).
 //
 // Files per entry: pc-<16 hex>.bin (Maya's MAYALST3 slot file, written by Glm5Model::slot_save) and pc-<16 hex>.meta
 // (this store's record).  The name is entry_key(): the 64-bit hash of the entry's tokens (FNV-1a over the int32 ids,
@@ -73,9 +73,9 @@ size_t restore_len(size_t lcp, size_t n_entry, size_t n_prompt);
 
 struct StoreConfig {
     std::string dir;                   // empty: off
-    uint64_t cap_bytes = 64ull << 30;  // STRATA_GLM_PROMPT_CACHE_GB
-    size_t max_entries = 64;           // STRATA_GLM_PROMPT_CACHE_MAX
-    size_t min_tokens = 512;           // STRATA_GLM_PROMPT_CACHE_MIN
+    uint64_t cap_bytes = 64ull << 30;  // MAYA_GLM_PROMPT_CACHE_GB
+    size_t max_entries = 64;           // MAYA_GLM_PROMPT_CACHE_MAX
+    size_t min_tokens = 512;           // MAYA_GLM_PROMPT_CACHE_MIN
     uint64_t min_free_bytes = 0;       // put() stores nothing below this free space (config_env: kMinFreeBytes)
     std::string identity;              // the model identity an entry must carry
 };
@@ -152,11 +152,11 @@ private:
 
 // ---- the engine glue (src/core/glm_prompt_cache_engine.cpp; one-line hooks in generate.cpp: the slots' setup,
 // prep_prompt and the end of the run, every context's with several conversations).  All do nothing unless
-// STRATA_GLM_PROMPT_CACHE_DIR is set, STRATA_GLM_NO_REUSE is not, and the model is glm-dsa on the fast path; the store
+// MAYA_GLM_PROMPT_CACHE_DIR is set, MAYA_GLM_NO_REUSE is not, and the model is glm-dsa on the fast path; the store
 // opens at the first call (its line goes to stderr).
 
-/// The store is on for this model (STRATA_GLM_PROMPT_CACHE_DIR set and writable, glm-dsa on the fast path, no
-/// STRATA_GLM_NO_REUSE).  generate.cpp then turns Maya's conversation slots off: the store restores every prefix a slot
+/// The store is on for this model (MAYA_GLM_PROMPT_CACHE_DIR set and writable, glm-dsa on the fast path, no
+/// MAYA_GLM_NO_REUSE).  generate.cpp then turns Maya's conversation slots off: the store restores every prefix a slot
 /// would, and both would write the same multi-GB state at each conversation switch.
 bool engine_on(Glm5Model& model);
 /// The conversation in the model (snap_tokens: the tokens of its snapshot, which stands at their count) into the

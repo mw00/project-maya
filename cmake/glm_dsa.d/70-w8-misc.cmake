@@ -31,12 +31,12 @@ if(STRATA_BUILD_TESTS)
   add_test(NAME glm_prompt_cache_test COMMAND glm_prompt_cache_test)
 
   # B14.10 (CPU, no build of ik_llama.cpp): the oracle script parses, --help works, the dumper compiles against ik's
-  # headers when the clone is there (STRATA_IK_SRC, default /home/user/ik_llama.cpp; skipped otherwise).
-  set(STRATA_IK_SRC "$ENV{STRATA_IK_SRC}" CACHE PATH "an ik_llama.cpp source tree for the B14.10 oracle checks")
+  # headers when the clone is there (MAYA_IK_SRC, default /home/user/ik_llama.cpp; skipped otherwise).
+  set(STRATA_IK_SRC "$ENV{MAYA_IK_SRC}" CACHE PATH "an ik_llama.cpp source tree for the B14.10 oracle checks")
   add_test(NAME strata_ik_oracle_help
            COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tools/strata/ik_oracle.sh selftest)
   set_tests_properties(strata_ik_oracle_help PROPERTIES SKIP_RETURN_CODE 77
-                       ENVIRONMENT "STRATA_IK_SRC=${STRATA_IK_SRC};CXX=${CMAKE_CXX_COMPILER}")
+                       ENVIRONMENT "MAYA_IK_SRC=${STRATA_IK_SRC};CXX=${CMAKE_CXX_COMPILER}")
 
   if(TARGET strata_engine)
     # B14.11 (CPU): the rotation, score preservation, FP16 outlier keys, the mixer through the twins, the layout.

@@ -13,7 +13,7 @@
 //   * the expert profile (--expert-profile, glm-dsa's STRP file) is arch-neutral in the engine (n_layers + 1 layers of
 //     n_expert pairs), but the profile setup ships (data/expert-profile-glm.bin) is Flash's 46 x 288: a glm-dsa
 //     model needs its own (tools/strata/glm_dsa_profile.py), and the refusal says so (glm_profile_hint);
-//   * the disk-expert skip and STRATA_GLM_MTP_KEEP apply unchanged (the route kernel and fast_moe are arch-neutral).
+//   * the disk-expert skip and MAYA_GLM_MTP_KEEP apply unchanged (the route kernel and fast_moe are arch-neutral).
 //
 // Every function is host-only and CUDA-free, so tests/glm_dsa/glm_maya_sync_test.cpp checks them on a CPU box.
 #pragma once
@@ -28,7 +28,7 @@ namespace strata::core {
 /// An EXL3 pack (exl3.txt) on this arch: true for GLM-5.3-Flash; false + err on glm-dsa.
 bool glm_exl3_ok(GlmArch a, std::string& err);
 
-/// A DFlash2 drafter (--dflash / STRATA_GLM_DFLASH) on this arch: true for GLM-5.3-Flash; false + err on glm-dsa.
+/// A DFlash2 drafter (--dflash / MAYA_GLM_DFLASH) on this arch: true for GLM-5.3-Flash; false + err on glm-dsa.
 bool glm_dflash_ok(GlmArch a, std::string& err);
 
 /// --parallel's batched rows (glm_rows.cu) on this arch: true for GLM-5.3-Flash (Maya), false on glm-dsa (the

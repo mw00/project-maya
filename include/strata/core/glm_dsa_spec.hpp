@@ -10,12 +10,12 @@
 //   spec_price       the expected time of one emitted token for a head of h parts, from each part's token time and
 //                    its CPU-lane share (a CPU-lane pool shared by head and tail serialises their lane work), the
 //                    draft acceptance and the hop cost; against the token-at-a-time decode (the parts added).
-//   spec_head_parts  STRATA_GLM_SPEC_HEAD: a number keeps Maya's meaning (head = that many parts, clamped to
+//   spec_head_parts  MAYA_GLM_SPEC_HEAD: a number keeps Maya's meaning (head = that many parts, clamped to
 //                    [1, n-1]); "auto" (and unset, on glm-dsa) takes the priced choice recorded by the split search
 //                    (glm_model.cu glm_search_bounds -> spec_record_prices); without a price: Maya's n / 2.
 //   AcceptStats      B11.3: accepted / tried per draft position (depth 1 = the token after next, the only depth the
 //                    pipelined path drafts; 2..4 kept for chain drafts, B11.4) and per context bucket; a running log
-//                    (STRATA_GLM_SPEC_LOG=<steps>) and a per-draft trace file (STRATA_GLM_SPEC_TRACE=<path>).
+//                    (MAYA_GLM_SPEC_LOG=<steps>) and a per-draft trace file (MAYA_GLM_SPEC_TRACE=<path>).
 //   spec_rows        what a rejected draft leaves behind on glm-dsa: the latent, k_pe and index-key rows of every DSA
 //                    layer of the head at the speculative position, and nothing else.  A redo at the same position
 //                    rewrites exactly these rows (the caches are append-only, cell s = position s), so no copy-back
@@ -59,7 +59,7 @@ struct SpecPrice {
 };
 
 /// Prices head = `head` parts (1 <= head < parts.size()).  accept: the draft acceptance (0..1); hop_ms: one residual
-/// hop between parts (device -> host -> device).  redo_waits (STRATA_GLM_SPEC_DRAFT_EARLY's pricing): a rejected
+/// hop between parts (device -> host -> device).  redo_waits (MAYA_GLM_SPEC_DRAFT_EARLY's pricing): a rejected
 /// draft costs the hit step plus the head's redo, because decode_spec's redo first waits for the head to finish the
 /// rejected speculation (spec_head synchronises the head's stream) - T + H while H <= T as before, 2H once the head
 /// is the slower group; false: T + H always (the B11.2 price, the default).
@@ -70,12 +70,12 @@ SpecPrice spec_price(const std::vector<PartCost>& parts, int head, double accept
 std::vector<SpecPrice> spec_prices(const std::vector<PartCost>& parts, double accept, double hop_ms, int& best,
                                    bool redo_waits = false);
 
-/// STRATA_GLM_SPEC_DRAFT_EARLY (default off; read at each call): decode_spec runs each step's NextN draft while the
+/// MAYA_GLM_SPEC_DRAFT_EARLY (default off; read at each call): decode_spec runs each step's NextN draft while the
 /// tail group's parts before its last compute (glm_fast_path.cu spec_tail_front / spec_tail_back), and the head
 /// pricing (spec_record_prices) prices a miss with redo_waits.
 bool spec_draft_early();
 
-/// The acceptance the pricing assumes: STRATA_GLM_SPEC_ACCEPT (0.05..1), else 0.8 (GLM-5.2's 0.83, R).
+/// The acceptance the pricing assumes: MAYA_GLM_SPEC_ACCEPT (0.05..1), else 0.8 (GLM-5.2's 0.83, R).
 double spec_accept_assumed();
 
 /// The lane share of a part's token time from the split search's terms: hits and misses (routes - hits) of its
@@ -91,13 +91,13 @@ int spec_priced_head(int n_parts);
 /// Forgets the recorded prices (tests).
 void spec_clear_prices();
 
-/// The head group's size for an n-part split.  env: STRATA_GLM_SPEC_HEAD (nullptr = unset).  dsa: glm-dsa (Flash
+/// The head group's size for an n-part split.  env: MAYA_GLM_SPEC_HEAD (nullptr = unset).  dsa: glm-dsa (Flash
 /// keeps Maya's rule: n / 2, or atoi(env)).  glm-dsa unset / "auto": the priced head (else n / 2), then, on 3+ parts
 /// with the tuner on, the measured A/B (head_tuner below).  Clamped to [1, n - 1].
 int spec_head_parts(int n_parts, const char* env, bool dsa);
 
-/// B11.2 in-situ A/B of the head group (glm-dsa, 3+ parts, STRATA_GLM_SPEC_HEAD unset or "auto"): the speculative
-/// decode runs each candidate head for `window` emitted tokens (STRATA_GLM_SPEC_TUNE=<tokens>, default 128; 0 off),
+/// B11.2 in-situ A/B of the head group (glm-dsa, 3+ parts, MAYA_GLM_SPEC_HEAD unset or "auto"): the speculative
+/// decode runs each candidate head for `window` emitted tokens (MAYA_GLM_SPEC_TUNE=<tokens>, default 128; 0 off),
 /// the priced (or n / 2) head first, then keeps the one with the lowest measured wall time a token (cumulative, so it
 /// can still switch when the averages cross).  The output is the same for every head (the decode is exact); only the
 /// speed differs.  Explicit layer bounds (layer_split 26,54) have no split-search price, so this is how the test PC's
@@ -110,7 +110,7 @@ struct HeadTuner {
     bool settled_logged = false;
     /// "no drafting" (the token-by-token decode, the same tokens) is a candidate too, as head 0: measured after the
     /// heads, kept only when it is faster than the fastest head by kPlainMargin (drafting stays the default when the
-    /// two are within the noise).  STRATA_GLM_SPEC_TUNE_PLAIN=1 (off by default until measured on the GPUs).
+    /// two are within the noise).  MAYA_GLM_SPEC_TUNE_PLAIN=1 (off by default until measured on the GPUs).
     bool plain = false;
     static constexpr double kPlainMargin = 0.02;
     /// The head for the next decode (stable until feed): the first candidate (base, then 1 .. n-1, then 0 when
@@ -119,18 +119,18 @@ struct HeadTuner {
     void feed(int head, int64_t n_tokens, double wall_ms);
     double ms_per_token(int head) const;
 };
-/// STRATA_GLM_SPEC_TUNE_PLAIN (default off; read once): the tuner also measures the token-by-token decode.
+/// MAYA_GLM_SPEC_TUNE_PLAIN (default off; read once): the tuner also measures the token-by-token decode.
 bool spec_tune_plain();
-/// The tuner's no-drafting turn (glm-dsa, n_parts >= 3, STRATA_GLM_SPEC_HEAD unset / "auto", the tuner and
+/// The tuner's no-drafting turn (glm-dsa, n_parts >= 3, MAYA_GLM_SPEC_HEAD unset / "auto", the tuner and
 /// spec_tune_plain on, after the split's first speculative decode): true when the next decode should go token by token
 /// (the plain candidate is short of its window, or measured fastest) - its clock then runs as tune_begin's, and
 /// tune_end(produced) after the plain loop feeds it as head 0.  false: decode_spec as before.  head_env:
-/// STRATA_GLM_SPEC_HEAD (nullptr = unset).
+/// MAYA_GLM_SPEC_HEAD (nullptr = unset).
 bool tune_plain_turn(int n_parts, const char* head_env);
-/// The window from STRATA_GLM_SPEC_TUNE (0: the tuner is off).
+/// The window from MAYA_GLM_SPEC_TUNE (0: the tuner is off).
 int spec_tune_window();
-/// B15.7: true when the random-routing bench mode is on (STRATA_GLM_RANDOM_ROUTING=1): Glm5Model::spec_ready() then
-/// says no, as STRATA_GLM_NO_SPEC=1 does (random routes make every draft a miss, so the floor would count re-runs).
+/// B15.7: true when the random-routing bench mode is on (MAYA_GLM_RANDOM_ROUTING=1): Glm5Model::spec_ready() then
+/// says no, as MAYA_GLM_NO_SPEC=1 does (random routes make every draft a miss, so the floor would count re-runs).
 bool spec_bench_off();
 /// decode_spec's start / end (process-wide; the head the call used is the one spec_head_parts returned): feeds the
 /// tuner the call's emitted tokens and wall time.  An end without a start, or a call that emitted under 8 tokens,

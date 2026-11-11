@@ -44,25 +44,25 @@ void test_policy() {
               parse_switch("auto", kSwitchOff) == kSwitchAuto && parse_switch("0", kSwitchOn) == kSwitchOff &&
               parse_switch("1", kSwitchOff) == kSwitchOn && parse_switch("yes", kSwitchOff) == kSwitchOn,
           "parse_switch: unset -> default, auto, 0 off, anything else on");
-    unsetenv("STRATA_GLMD_FUSED_MLA");
-    unsetenv("STRATA_GLMD_IDX_WMMA");
-    unsetenv("STRATA_GLMD_TOPK_MB");
-    unsetenv("STRATA_GLMD_FUSED_SPLIT");
+    unsetenv("MAYA_GLMD_FUSED_MLA");
+    unsetenv("MAYA_GLMD_IDX_WMMA");
+    unsetenv("MAYA_GLMD_TOPK_MB");
+    unsetenv("MAYA_GLMD_FUSED_SPLIT");
     DecodePolicy e = decode_policy_env();
     check(!e.fused_mla && e.idx_wmma == kSwitchAuto && e.topk_mb == kSwitchAuto && !e.idx_fp16 &&
               e.fused_split == kFusedSplitDefault,
           "engine defaults: mla2, WMMA scorer auto, radix top-k auto, F32 keys (the layout sets FP16)");
-    setenv("STRATA_GLMD_FUSED_MLA", "1", 1);
-    setenv("STRATA_GLMD_IDX_WMMA", "0", 1);
-    setenv("STRATA_GLMD_TOPK_MB", "1", 1);
-    setenv("STRATA_GLMD_FUSED_SPLIT", "8", 1);
+    setenv("MAYA_GLMD_FUSED_MLA", "1", 1);
+    setenv("MAYA_GLMD_IDX_WMMA", "0", 1);
+    setenv("MAYA_GLMD_TOPK_MB", "1", 1);
+    setenv("MAYA_GLMD_FUSED_SPLIT", "8", 1);
     e = decode_policy_env();
     check(e.fused_mla && e.idx_wmma == kSwitchOff && e.topk_mb == kSwitchOn && e.fused_split == 8,
           "the switches as set: fused on, WMMA off, radix forced, split 8");
-    unsetenv("STRATA_GLMD_FUSED_MLA");
-    unsetenv("STRATA_GLMD_IDX_WMMA");
-    unsetenv("STRATA_GLMD_TOPK_MB");
-    unsetenv("STRATA_GLMD_FUSED_SPLIT");
+    unsetenv("MAYA_GLMD_FUSED_MLA");
+    unsetenv("MAYA_GLMD_IDX_WMMA");
+    unsetenv("MAYA_GLMD_TOPK_MB");
+    unsetenv("MAYA_GLMD_FUSED_SPLIT");
     DecodePolicy a;   // the engine defaults
     a.idx_wmma = kSwitchAuto;
     a.topk_mb = kSwitchAuto;

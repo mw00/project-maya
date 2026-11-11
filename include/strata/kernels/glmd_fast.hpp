@@ -174,7 +174,7 @@ bool topk(const float* score, int ld, int n_kv, int T, const int* pos, int top_k
 /// same ties): per row a min / max pass over the order-preserving keys, a histogram of kTopkHistBuckets buckets spread
 /// linearly over [kmin, kmax], the boundary bucket's keys (at most kTopkHistCand, else the radix cut-off) sorted in
 /// shared memory, then topk's compaction.  5 passes over the row against topk's 6.  The decode policy runs it under
-/// STRATA_GLMD_TOPK_HIST=1 (glmd_decode_policy.hpp); off by default.
+/// MAYA_GLMD_TOPK_HIST=1 (glmd_decode_policy.hpp); off by default.
 constexpr int kTopkHistBuckets = 2048;
 constexpr int kTopkHistCand = 4096;
 bool topk_hist(const float* score, int ld, int n_kv, int T, const int* pos, int top_k, int* sel, void* stream);

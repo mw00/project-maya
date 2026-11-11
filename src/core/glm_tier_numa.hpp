@@ -6,13 +6,13 @@
 //
 //   pin_class      B8.2: a RAM class as one virtual range in segments of <= 16 GiB, mbind-ed (MPOL_INTERLEAVE as
 //                  Maya, or the half's node with MPOL_BIND when split), madvise(MADV_HUGEPAGE) per segment while free
-//                  2 MB blocks cover it (STRATA_GLM_THP), faulted in by node-pinned threads (2 MB strides in parallel
+//                  2 MB blocks cover it (MAYA_GLM_THP), faulted in by node-pinned threads (2 MB strides in parallel
 //                  with huge pages, else one thread per segment) and cudaHostRegister-ed - one thread per NUMA node, so
 //                  segments register concurrently.  A refusal shrinks only the last segment.  A bound class (split,
-//                  STRATA_GLM_NUMA_SEG=bind) is first capped by each node's free memory less STRATA_GLM_NODE_RESERVE_GB
+//                  MAYA_GLM_NUMA_SEG=bind) is first capped by each node's free memory less MAYA_GLM_NODE_RESERVE_GB
 //                  (MPOL_BIND has no fallback node): shrunk, or interleaved when < 3/4 fits; bound units' THP budget is
 //                  their own node's free 2 MB blocks (W6 runtime fix).  Logs the AnonHugePages
-//                  share of the tier (B8.7).  On glm-dsa by default; STRATA_GLM_RAM_SEG_GB=<GiB> (0 off) anywhere.
+//                  share of the tier (B8.7).  On glm-dsa by default; MAYA_GLM_RAM_SEG_GB=<GiB> (0 off) anywhere.
 //   unpin_class    the matching free.
 //   fetch/prefetch B8.4: the device's zero-copy pulls of a split expert (two half reads, re-interleaved into the VRAM
 //                  slot); a source outside the split ranges (the disk staging) is copied as Maya does.
@@ -20,7 +20,7 @@
 //                  slot (glmtier::split_ops), Maya's one cudaMemcpyAsync otherwise.
 //   read_split     B8.4: a disk read (warm-up, a miss, a lookahead) into a split slot goes through a bounce buffer and
 //                  scatter_range; false (the caller reads as before) for any other destination.
-//   lane_pools     B8.3 (STRATA_GLM_CPU_SHARED=socket) and B8.4 (node-split): the CPU lane's per-node pinned pools.
+//   lane_pools     B8.3 (MAYA_GLM_CPU_SHARED=socket) and B8.4 (node-split): the CPU lane's per-node pinned pools.
 //   cpu_experts    B8.4: the lane on split experts, both sockets at once, partial sums added.
 #pragma once
 
@@ -73,7 +73,7 @@ struct NodeLane {
 struct TierState {
     bool ready = false;         ///< filled by tier_of (pin_class or lane_pools, whichever came first)
     bool dsa = false;
-    bool split_req = false;     ///< STRATA_GLM_NUMA_SPLIT=1 on glm-dsa
+    bool split_req = false;     ///< MAYA_GLM_NUMA_SPLIT=1 on glm-dsa
     size_t seg_cap = 0;
     int dev = 0;
     std::vector<int> nodes;

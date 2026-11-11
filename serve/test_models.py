@@ -130,7 +130,7 @@ class Settings(unittest.TestCase):
         cfg = M.read(glm_cfg(self.d))
         cfg["args"] = ["--glm-pack", "/m/pack", "--max-context", "32768"]
         self.assertFalse(M.settings_of(cfg)["kv_streaming"])
-        self.assertTrue(M.settings_of(dict(cfg, env={"STRATA_GLM_KV_RESIDENT": "65536"}))["kv_streaming"])
+        self.assertTrue(M.settings_of(dict(cfg, env={"MAYA_GLM_KV_RESIDENT": "65536"}))["kv_streaming"])
         new = M.apply(cfg, {"context": 65536})
         self.assertEqual(new["args"], ["--glm-pack", "/m/pack", "--max-context", "65536"])
         on = M.apply(cfg, {"kv_streaming": True})

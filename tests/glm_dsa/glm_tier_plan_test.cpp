@@ -1,9 +1,9 @@
 // tests/glm_dsa/glm_tier_plan_test.cpp - glm-dsa B8.2 / B8.3 / B8.4 / B8.7 host rules on the CPU (no GPU, no ggml).
 //
-//   1. B8.2 segments: the cap (16 GiB on glm-dsa, off on glm5-next, STRATA_GLM_RAM_SEG_GB), seg_plan's whole-slot
+//   1. B8.2 segments: the cap (16 GiB on glm-dsa, off on glm5-next, MAYA_GLM_RAM_SEG_GB), seg_plan's whole-slot
 //      segments, Maya's shrink steps, seg_pin against a simulated pinning cap (only the LAST segment shrinks, the
 //      later ones are released, a fall below `least` releases everything), seg_node, the budget reset rule;
-//   2. B8.7: STRATA_GLM_THP, /proc/buddyinfo's free 2 MB bytes, the per-segment madvise plan, the AnonHugePages sum of
+//   2. B8.7: MAYA_GLM_THP, /proc/buddyinfo's free 2 MB bytes, the per-segment madvise plan, the AnonHugePages sum of
 //      a /proc/self/smaps text over the tier's ranges, the fault-in plans (every byte touched once);
 //   3. B8.3: the lane pool mode table (Maya's rules for unset / 0 / 1 unchanged, "socket", node-split);
 //   4. B8.4: split_layout at GLM-5.3 (6144 x 2048, IQ2_XXS / IQ2_S gate/up, IQ3_XXS / Q2_K down) and its refusals;
@@ -37,8 +37,8 @@ void test_segments() {
     std::printf("B8.2 segments\n");
     check(gt::seg_cap_bytes(true, nullptr) == 16 * GiB, "glm-dsa default cap 16 GiB");
     check(gt::seg_cap_bytes(false, nullptr) == 0, "glm5-next default: off (Maya's single allocation)");
-    check(gt::seg_cap_bytes(true, "0") == 0, "STRATA_GLM_RAM_SEG_GB=0: off");
-    check(gt::seg_cap_bytes(false, "8") == 8 * GiB, "STRATA_GLM_RAM_SEG_GB=8 on glm5-next: 8 GiB");
+    check(gt::seg_cap_bytes(true, "0") == 0, "MAYA_GLM_RAM_SEG_GB=0: off");
+    check(gt::seg_cap_bytes(false, "8") == 8 * GiB, "MAYA_GLM_RAM_SEG_GB=8 on glm5-next: 8 GiB");
     check(gt::seg_cap_bytes(true, "") == 16 * GiB, "empty env: the default");
 
     // GLM-5.3 UD-IQ2_M: ~9.75 MB a slot (4 KB rounded), 12000 slots ~ 117 GB
@@ -134,8 +134,8 @@ void test_segments() {
 
 void test_thp() {
     std::printf("B8.7 huge pages\n");
-    check(gt::thp_mode(nullptr) == -1 && gt::thp_mode("auto") == -1, "STRATA_GLM_THP unset / auto");
-    check(gt::thp_mode("0") == 0 && gt::thp_mode("1") == 1, "STRATA_GLM_THP=0 / 1");
+    check(gt::thp_mode(nullptr) == -1 && gt::thp_mode("auto") == -1, "MAYA_GLM_THP unset / auto");
+    check(gt::thp_mode("0") == 0 && gt::thp_mode("1") == 1, "MAYA_GLM_THP=0 / 1");
     const std::string buddy =
         "Node 0, zone      DMA      1      1      1      0      2      1      1      0      1      1      3 \n"
         "Node 0, zone    DMA32      5      6      4      5      4      3      3      4      3      3    300 \n"
@@ -198,16 +198,16 @@ void test_pools() {
     check(gt::lane_pool_mode(1, false, nullptr, false, 2) == LanePool::One, "one part: one pool");
     check(gt::lane_pool_mode(2, false, nullptr, false, 2) == LanePool::PerPart, "2 parts, unset: per part (Maya)");
     check(gt::lane_pool_mode(3, false, nullptr, false, 2) == LanePool::Shared, "3 parts, unset: shared (Maya)");
-    check(gt::lane_pool_mode(3, false, "0", false, 2) == LanePool::PerPart, "STRATA_GLM_CPU_SHARED=0: per part");
-    check(gt::lane_pool_mode(2, false, "1", false, 2) == LanePool::Shared, "STRATA_GLM_CPU_SHARED=1: shared");
-    check(gt::lane_pool_mode(3, true, "1", false, 2) == LanePool::PerPart, "STRATA_GLM_CPU_LANE<dev>: its own pool");
+    check(gt::lane_pool_mode(3, false, "0", false, 2) == LanePool::PerPart, "MAYA_GLM_CPU_SHARED=0: per part");
+    check(gt::lane_pool_mode(2, false, "1", false, 2) == LanePool::Shared, "MAYA_GLM_CPU_SHARED=1: shared");
+    check(gt::lane_pool_mode(3, true, "1", false, 2) == LanePool::PerPart, "MAYA_GLM_CPU_LANE<dev>: its own pool");
     check(gt::lane_pool_mode(3, false, "socket", false, 2) == LanePool::Socket, "socket: a pinned pool per socket");
     check(gt::lane_pool_mode(3, false, "2", false, 2) == LanePool::Socket, "2: a pinned pool per socket");
     check(gt::lane_pool_mode(3, false, "socket", false, 1) == LanePool::Shared, "socket on one node: shared");
     check(gt::lane_pool_mode(3, false, nullptr, true, 2) == LanePool::NodeSplit, "a node-split tier: NodeSplit");
     check(gt::lane_pool_mode(1, false, "0", true, 2) == LanePool::NodeSplit, "node-split on one GPU too");
     check(gt::lane_pool_mode(3, false, nullptr, true, 1) == LanePool::Shared, "node-split needs two nodes");
-    // review fix: Flash keeps Maya's reading of STRATA_GLM_CPU_SHARED ("2" any non-zero: shared; "socket": atoi 0)
+    // review fix: Flash keeps Maya's reading of MAYA_GLM_CPU_SHARED ("2" any non-zero: shared; "socket": atoi 0)
     check(gt::lane_pool_mode(3, false, "2", false, 2, false) == LanePool::Shared &&
               gt::lane_pool_mode(3, false, "socket", false, 2, false) == LanePool::PerPart &&
               gt::lane_pool_mode(3, false, "1", false, 2, false) == LanePool::Shared,
@@ -219,10 +219,10 @@ void test_pools() {
     check(gt::lane_pool_maya_shared(LanePool::Shared) && !gt::lane_pool_maya_shared(LanePool::Socket),
           "only Shared sets Maya's shared flag");
     check(std::string(gt::lane_pool_name(LanePool::Socket)).find("socket") != std::string::npos, "mode names");
-    check(!gt::numa_split_requested(false, "1"), "STRATA_GLM_NUMA_SPLIT never on glm5-next");
+    check(!gt::numa_split_requested(false, "1"), "MAYA_GLM_NUMA_SPLIT never on glm5-next");
     check(gt::numa_split_requested(true, "1") && !gt::numa_split_requested(true, "0") &&
               !gt::numa_split_requested(true, nullptr),
-          "STRATA_GLM_NUMA_SPLIT=1 on glm-dsa only (default off)");
+          "MAYA_GLM_NUMA_SPLIT=1 on glm-dsa only (default off)");
 }
 
 // ---------------------------------------------------------------- 4. split layout
@@ -373,7 +373,7 @@ void test_w6() {
     check(gt::node_mem_avail("garbage") == -1, "node meminfo unparsable: -1 (no limit)");
     check(gt::node_reserve_bytes(nullptr) == (int64_t) (4 * GiB) && gt::node_reserve_bytes("0") == 0 &&
               gt::node_reserve_bytes("2.5") == (int64_t) (5 * GiB / 2),
-          "STRATA_GLM_NODE_RESERVE_GB: default 4 GiB, 0, 2.5");
+          "MAYA_GLM_NODE_RESERVE_GB: default 4 GiB, 0, 2.5");
     const std::vector<int> nodes = {0, 1};
     const size_t MiB = (size_t) 1 << 20, st = 10 * MiB;
     // the review's case: node split, every part's half 0 on node 0, node 0 fuller than the machine-wide figure says
@@ -420,7 +420,7 @@ void test_w6() {
           "interleaved units (-1): Maya's machine-wide rule unchanged");
     check(gt::thp_plan_nodes(units, un, nf, all, 1) == std::vector<char>({1, 1, 1, 1}) &&
               gt::thp_plan_nodes(units, un, nf, all, 0) == std::vector<char>({0, 0, 0, 0}),
-          "STRATA_GLM_THP=1 / 0 unchanged");
+          "MAYA_GLM_THP=1 / 0 unchanged");
     check(gt::thp_plan_nodes(units, un, {-1, -1}, all, -1) == std::vector<char>({1, 1, 1, 1}),
           "a node's buddyinfo unknown: madvise (Maya's rule)");
 

@@ -2,16 +2,16 @@
 
 On one or two GPUs most of a token's experts are not in VRAM; the CPU LANE computes the ones in the RAM tier while the
 GPU runs the rest.  Two of its settings depend on the PC more than on the model:
-  STRATA_GLM_PCIE_SHARE  the share of a route's RAM-tier experts copied over PCIe and run on the GPU instead of on the
+  MAYA_GLM_PCIE_SHARE  the share of a route's RAM-tier experts copied over PCIe and run on the GPU instead of on the
                          CPU (0: the CPU takes every one).  A fast PCIe link and a slow CPU want more; an x8 link beside
                          a many-core CPU wants none.  The engine starts with a guess from timing one expert each way.
-  STRATA_GLM_CPU_LANE    the CPU threads that compute them.  Every core is not always fastest: the experts are read
+  MAYA_GLM_CPU_LANE    the CPU threads that compute them.  Every core is not always fastest: the experts are read
                          from RAM, and past the memory's bandwidth more threads only wait (or, on a hybrid CPU, the
                          efficiency cores make the rest wait for them).  Nor is the engine's own count always enough:
                          it takes two thirds of CPUs without SMT siblings, which a VM's vCPUs also are - on one GPU
-                         and such CPUs the engine runs with STRATA_GLM_CPU_LANE_MAX set to this PC's CPUs, so counts
+                         and such CPUs the engine runs with MAYA_GLM_CPU_LANE_MAX set to this PC's CPUs, so counts
                          above its own, up to the pool it reports (INFO cpu_threads_max), are measured too.
-  STRATA_GLM_READ_CHUNKS the pieces (x3) each expert the decode reads from the SSD comes in, when part of the model
+  MAYA_GLM_READ_CHUNKS the pieces (x3) each expert the decode reads from the SSD comes in, when part of the model
                          lives there.  The best size depends on the drive, its driver and the CPU: 8 (the engine's) on
                          a Linux NVMe, 4 on a Windows laptop's Intel RST RAID (#67).
 All are measured through ONE running engine - per-request `strata_tune` keys (pcie_frac, cpu_threads, read_chunks) -
@@ -81,10 +81,10 @@ PROMPTS = tuple(p for c, e, l in zip(CODE, EXPLAIN, LISTS) for p in (
     f"Explain in two paragraphs how {e}.",
     f"List twelve {l} with one sentence about each."))
 GROUP = 3                                # prompts a measurement (the median of their rates)
-SHARE_ENV, THREADS_ENV, CHUNKS_ENV = "STRATA_GLM_PCIE_SHARE", "STRATA_GLM_CPU_LANE", "STRATA_GLM_READ_CHUNKS"
+SHARE_ENV, THREADS_ENV, CHUNKS_ENV = "MAYA_GLM_PCIE_SHARE", "MAYA_GLM_CPU_LANE", "MAYA_GLM_READ_CHUNKS"
 KEYS = (SHARE_ENV, THREADS_ENV, CHUNKS_ENV)   # the environment settings a calibration owns (apply() sets or clears them)
 # the calibration's own engine only: a CPU pool this large, the engine's own count active, so a request can try more
-MAX_ENV = "STRATA_GLM_CPU_LANE_MAX"
+MAX_ENV = "MAYA_GLM_CPU_LANE_MAX"
 READ_CHUNKS = (4, 2)                     # tried against the engine's own (8) when part of the model is read from the SSD
 
 
@@ -251,15 +251,15 @@ class Session:
 def usage_copy(cfg: dict, tmp: Path) -> dict:
     """The env that has the calibration's engine read and write a copy of this PC's expert usage file in `tmp`: the
     engine saves the usage after every answer and the next start's warm-up loads the experts in that order, so ~60
-    answers to the tuning's prompts would lead it with their experts.  The file is the config's STRATA_GLM_USAGE
+    answers to the tuning's prompts would lead it with their experts.  The file is the config's MAYA_GLM_USAGE
     (opt-in); without one (or "0") the engine keeps none, as the config's own starts do."""
-    own = str((cfg.get("env") or {}).get("STRATA_GLM_USAGE", ""))
+    own = str((cfg.get("env") or {}).get("MAYA_GLM_USAGE", ""))
     if own in ("", "0"):
-        return {"STRATA_GLM_USAGE": "0"}
+        return {"MAYA_GLM_USAGE": "0"}
     dst = tmp / "expert_usage.txt"
     if Path(own).is_file():
         shutil.copyfile(own, dst)
-    return {"STRATA_GLM_USAGE": str(dst)}
+    return {"MAYA_GLM_USAGE": str(dst)}
 
 
 # engine arguments that write the user's files: the learned expert profile (--expert-profile-save) and the routing trace

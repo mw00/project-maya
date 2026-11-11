@@ -15,12 +15,12 @@
 //      compute earlier, so part i+1's link works while part i computes;
 //   3. the disk landing ring (the pinned staging the reader lands experts in) bound to the GPU's NUMA node
 //      (host_alloc_node: mmap + mbind(MPOL_BIND) + fault-in + cudaHostRegister), so the DMA never crosses UPI;
-//   4. the prompt's CPU host share on node-split layers (STRATA_GLM_NUMA_SPLIT=1, where Maya's share was turned off):
+//   4. the prompt's CPU host share on node-split layers (MAYA_GLM_NUMA_SPLIT=1, where Maya's share was turned off):
 //      both sockets compute their half of each expert for every routed row, partial outputs added (split_share).
 //   The B14.7 lane-first rule (glmpf::lane_first) applies unchanged to the share's plan, split layers included.
 //
-// Env: STRATA_GLM_PREFILL_STREAM=0 turns 1 and 2 off; STRATA_GLM_STAGE_NUMA=off / <node> (the landing ring's
-// node, default the GPU's); STRATA_GLM_PREFILL_SPLIT_SHARE=0 keeps split layers off the host share (the B8.4 behaviour).
+// Env: MAYA_GLM_PREFILL_STREAM=0 turns 1 and 2 off; MAYA_GLM_STAGE_NUMA=off / <node> (the landing ring's
+// node, default the GPU's); MAYA_GLM_PREFILL_SPLIT_SHARE=0 keeps split layers off the host share (the B8.4 behaviour).
 //
 // The pure parts (schedules, the registry, the node choice, the share's job grid and row math) are in
 // glm_dsa_prefill_stream_plan.cpp (CPU tests: tests/glm_dsa/glm_dsa_prefill_stream_test.cpp); the run-time side
@@ -51,7 +51,7 @@ namespace kc = strata::kernels::cpu;
 
 // ---------------------------------------------------------------- the schedule (pure)
 
-/// The driver is on: glm-dsa and STRATA_GLM_PREFILL_STREAM unset or non-zero.
+/// The driver is on: glm-dsa and MAYA_GLM_PREFILL_STREAM unset or non-zero.
 bool stream_on(bool dsa);
 /// A part of an n-part glm-dsa split gets the prestage buffer (n > 1 and stream_on).
 bool split_prestage(bool dsa, int n_parts);
@@ -77,19 +77,19 @@ bool prestage_only(const void* model);
 /// predicted rows than the measured upload threshold) is not prestaged, so the link carries only what the plan
 /// uploads.  copy_ms / ps_ms / p_ms: the plan's PCIe estimate in its order (the prestage copies' measured time, the
 /// calibration's streamed copy, its single copy); c_ms: the lane's one-token expert; row_ms: the lane's cost a row
-/// (STRATA_GLM_PREFILL_CPU_ROW_MS overrides it, as it does in the plan);
+/// (MAYA_GLM_PREFILL_CPU_ROW_MS overrides it, as it does in the plan);
 /// lane_ok: the layer's experts may go to the lane (the CPU share is on for it, split layers included).  Always false
-/// off glm-dsa, without a lane, or with STRATA_GLM_PREFILL_CPU=0.
+/// off glm-dsa, without a lane, or with MAYA_GLM_PREFILL_CPU=0.
 bool prestage_skip(bool dsa, double pred_rows, double copy_ms, double ps_ms, double p_ms, double c_ms, double row_ms,
                    bool lane_ok);
 
 // ---------------------------------------------------------------- B11.1: the NextN rows on the token path (pure)
 
-/// prefill()'s batched-path minimum: STRATA_GLM_PREFILL_MIN (at least 1) when set, else 32.
+/// prefill()'s batched-path minimum: MAYA_GLM_PREFILL_MIN (at least 1) when set, else 32.
 int64_t prefill_min_tokens(const char* env);
 /// Whether Glm5Model::prefill hands a prompt to prefill_tokens_dsa (glm_dsa_mixer.cu): a glm-dsa model with a NextN
 /// block whose prompt the batched path does not take - some part has no batched state (--prefill 0,
-/// STRATA_GLM_NO_PREFILL, a weight type the prompt path does not cover, a tail lent to the vision encoder) or fewer
+/// MAYA_GLM_NO_PREFILL, a weight type the prompt path does not cover, a tail lent to the vision encoder) or fewer
 /// than min_n tokens.  prefill_tokens_dsa runs the NextN block at every prompt position, so its latent, k_pe and
 /// index-key rows cover the prompt as the batched path's mtp_fill does.  False on Flash and without a NextN block.
 bool mtp_token_fill(bool dsa, bool has_mtp, bool batched_ready, int64_t n_tokens, int64_t min_n);
@@ -138,7 +138,7 @@ int host_alloc_node(void** p, size_t bytes, int dev, bool dsa);
 /// The matching free (cudaFreeHost for a cudaHostAlloc-ed block).
 void host_free_node(void* p);
 /// Whether layer il may give experts to the host share: not node-split, or split with both node lanes and the half
-/// format ready (STRATA_GLM_PREFILL_SPLIT_SHARE != 0).
+/// format ready (MAYA_GLM_PREFILL_SPLIT_SHARE != 0).
 bool share_ok(const glmtier::TierState* T, int il);
 /// The host share of a node-split layer (false: layer il is not split; the caller runs Maya's share).  ex(j) gives
 /// expert j of n_exp; x_h + rt_h[r] * n_embd is row r's input; out_h + r * n_embd its output.  Holds

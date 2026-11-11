@@ -7,7 +7,7 @@
 #include "strata/kernels/cpu/iq_avx512_one.hpp"
 #include "strata/kernels/cpu/iq_avx2.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
-#include "strata/kernels/cpu/glm_lane_row4.hpp"   // glm-dsa B14.9: STRATA_GLM_LANE_ROW4 lane hooks
+#include "strata/kernels/cpu/glm_lane_row4.hpp"   // glm-dsa B14.9: MAYA_GLM_LANE_ROW4 lane hooks
 
 #include "ggml.h"
 #include "ggml-cpu.h"
@@ -104,15 +104,15 @@ bool rows_match_ggml(RowsFn fn, int type, std::initializer_list<int> nts = {2, 5
 
 RowsFn pick_rows(int type) {
     static const bool on = [] {
-        const char* v = std::getenv("STRATA_GLM_CPU_MT");
+        const char* v = std::getenv("MAYA_GLM_CPU_MT");
         return v == nullptr || std::atoi(v) != 0;
     }();
     if (!on) return nullptr;
     init_once();
     // AVX-512 where cpu_avx512_ok() (VNNI and VBMI: Ice Lake / Zen 4 and later, which run 512-bit integer code at
     // full clock); on a Skylake-SP Xeon 6152 the AVX-2 rows were 7-13% faster (glm_cpu_bench, Maya-L, 2-16 tokens)
-    const bool avx512 = cpu_avx512_ok() && std::getenv("STRATA_NO_IQ512") == nullptr;
-    const bool avx2 = cpu_avx2_ok() && std::getenv("STRATA_NO_IQ256") == nullptr;
+    const bool avx512 = cpu_avx512_ok() && std::getenv("MAYA_NO_IQ512") == nullptr;
+    const bool avx2 = cpu_avx2_ok() && std::getenv("MAYA_NO_IQ256") == nullptr;
     RowsFn fn = nullptr;
     void (*set_q5k)(bool) noexcept = nullptr;
     if (avx512 && iq512_supported(type)) {
@@ -150,15 +150,15 @@ RowsFn exact_rows(int type) {
 // CPU, like ggml-cpu's own dot (it has no AVX-512 form for these). IQ1_M and IQ2_XS use the same exact AVX2 row backend
 // in both modes, their grid / scale / delta decode kept off the shuffle port (ggml's is bound by it on Broadwell). IQ2_XXS (Maya-S's gate/up) first tries the
 // AVX-512 rows of iq_avx512_one.cpp (VBMI + BMI2: the grid as 2-bit codes in registers, the signs by pdep), checked
-// the same way.  STRATA_GLM_CPU_1T=0 keeps ggml's dot, STRATA_NO_IQ512 the AVX-2 rows.
+// the same way.  MAYA_GLM_CPU_1T=0 keeps ggml's dot, MAYA_NO_IQ512 the AVX-2 rows.
 RowsFn pick_rows1(int type) {
     static const bool on = [] {
-        const char* mt = std::getenv("STRATA_GLM_CPU_MT");
-        const char* v = std::getenv("STRATA_GLM_CPU_1T");
+        const char* mt = std::getenv("MAYA_GLM_CPU_MT");
+        const char* v = std::getenv("MAYA_GLM_CPU_1T");
         return (mt == nullptr || std::atoi(mt) != 0) && (v == nullptr || std::atoi(v) != 0);
     }();
     if (!on) return nullptr;
-    if (std::getenv("STRATA_NO_IQ512") == nullptr && iq512_one_supported(type)) {
+    if (std::getenv("MAYA_NO_IQ512") == nullptr && iq512_one_supported(type)) {
         init_once();
         if (rows_match_ggml(iq512_one_rows, type, {1}, 306)) return iq512_one_rows;
         std::fprintf(stderr, "native experts: the AVX-512 one-token %s rows differ from ggml-cpu's dot in this build - "
@@ -166,7 +166,7 @@ RowsFn pick_rows1(int type) {
     }
     if (!iq256_rows1_supported(type)) return nullptr;
     init_once();
-    if (!cpu_avx2_ok() || std::getenv("STRATA_NO_IQ256") != nullptr) return nullptr;
+    if (!cpu_avx2_ok() || std::getenv("MAYA_NO_IQ256") != nullptr) return nullptr;
     if (rows_match_ggml(iq256_rows1, type, {1}, 306)) return iq256_rows1;
     std::fprintf(stderr, "native experts: the one-token %s rows differ from ggml-cpu's dot in this build - "
                          "ggml's dot for them\n", ggml_type_name((ggml_type) type));
@@ -247,11 +247,11 @@ void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* 
                     int r0, int r1) {
     // the multi-token kernels decode the weights once for all tokens: 2.0-2.4x ggml-cpu at three tokens, no faster
     // at one (all are bound by the codebook lookups, ~5 GB/s per core), measured by native_expert_parity.  AVX-512
-    // first, then the AVX-2 one (Zen 2/3, Intel 12th-14th gen).  STRATA_NO_IQ512 drops an AVX-512 CPU to the
-    // AVX-2 kernel, STRATA_NO_IQ256 drops the AVX-2 kernel; ggml-cpu's single-token vec_dot is reached only with
-    // both set (and on a CPU without AVX-512, STRATA_NO_IQ512 changes nothing).
-    static const bool avx512 = cpu_avx512_ok() && std::getenv("STRATA_NO_IQ512") == nullptr;
-    static const bool avx2 = cpu_avx2_ok() && std::getenv("STRATA_NO_IQ256") == nullptr;   // pre-AVX2: ggml's vec_dot
+    // first, then the AVX-2 one (Zen 2/3, Intel 12th-14th gen).  MAYA_NO_IQ512 drops an AVX-512 CPU to the
+    // AVX-2 kernel, MAYA_NO_IQ256 drops the AVX-2 kernel; ggml-cpu's single-token vec_dot is reached only with
+    // both set (and on a CPU without AVX-512, MAYA_NO_IQ512 changes nothing).
+    static const bool avx512 = cpu_avx512_ok() && std::getenv("MAYA_NO_IQ512") == nullptr;
+    static const bool avx2 = cpu_avx2_ok() && std::getenv("MAYA_NO_IQ256") == nullptr;   // pre-AVX2: ggml's vec_dot
     if (nt >= 2 && iq512_supported(f.gu_type)) {   // one token: ggml-cpu is as fast or faster
         if (avx512) {
             iq512_gu_rows(f.gu_type, blob, f.gu_row, f.up_off, (int) f.n_embd, act, nt, ff, r0, r1);
@@ -310,7 +310,7 @@ void native_gu_rows_split(const NativeFmt& f, const uint8_t* gate_base, const ui
             return;
         }
     }
-    if (nt == 1 && lane_row4_gu(f, gate_base, up_base, act[0], ff[0], r0, r1, swiglu_limit)) return;   // glm-dsa: STRATA_GLM_LANE_ROW4
+    if (nt == 1 && lane_row4_gu(f, gate_base, up_base, act[0], ff[0], r0, r1, swiglu_limit)) return;   // glm-dsa: MAYA_GLM_LANE_ROW4
     const ggml_vec_dot_t dot = traits(f.gu_type)->vec_dot;
     for (int r = r0; r < r1; ++r) {
         const uint8_t* gr = gate_base + (size_t) r * f.gu_row;
@@ -339,7 +339,7 @@ void native_down_rows_split(const NativeFmt& f, const uint8_t* down_base, const 
             return;
         }
     }
-    if (nt == 1 && lane_row4_down(f, down_base, hq[0], out[0], r0, r1)) return;   // glm-dsa B14.9: STRATA_GLM_LANE_ROW4
+    if (nt == 1 && lane_row4_down(f, down_base, hq[0], out[0], r0, r1)) return;   // glm-dsa B14.9: MAYA_GLM_LANE_ROW4
     const ggml_vec_dot_t dot = traits(f.d_type)->vec_dot;
     const int n = (int) f.n_ff;
     for (int r = r0; r < r1; ++r) {
@@ -355,9 +355,9 @@ void native_down_rows_split(const NativeFmt& f, const uint8_t* down_base, const 
 void native_down_rows(const NativeFmt& f, const uint8_t* blob, const void* const* hq, int nt, float* const* out,
                       int r0, int r1) {
     // IQ4_NL down rows: the AVX-2 multi-token kernel decodes the nibbles and absolutises the weights once per
-    // block instead of once per token; ggml-cpu's dot is single-token.  STRATA_NO_IQ4NL falls back to it.
+    // block instead of once per token; ggml-cpu's dot is single-token.  MAYA_NO_IQ4NL falls back to it.
 #if defined(__x86_64__) || defined(_M_X64)
-    static const bool iq4nl_mt = std::getenv("STRATA_NO_IQ4NL") == nullptr;
+    static const bool iq4nl_mt = std::getenv("MAYA_NO_IQ4NL") == nullptr;
 #else
     static const bool iq4nl_mt = false;
 #endif

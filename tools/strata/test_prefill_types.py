@@ -2,7 +2,7 @@
 """The batched glm-dsa prompt's FP16 types against the pack and tools/strata/type_coverage.py (W7 build review).
 
 Every non-routed type the pack can leave native (tools/strata/glm_dsa_pack.py plan_tensor, with and without
-STRATA_PACK_NATIVE32) must be one the prompt serves: F32 (SGEMM), BF16 (narrowed) or an FP16 dequant type
+MAYA_PACK_NATIVE32) must be one the prompt serves: F32 (SGEMM), BF16 (narrowed) or an FP16 dequant type
 (src/core/glm_prefill_dsa.cu f16_covers + src/core/glm_prefill_types.hpp kExtF16Types). The lists in the C++ sources
 must agree with each other and with type_coverage.py's engine table, and refusal()'s "covered" text must name exactly
 the served types.

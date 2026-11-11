@@ -142,9 +142,9 @@ float* bind(StreamGuard& G, const uint16_t* dst, int64_t ld, int64_t T, bool pha
     }
     if (slot < 0) {
         guard_error("more than 16 guarded FP16 buffers live on one stream: this one runs unguarded");
-        // STRATA_GLMD_GUARD_DEBUG=1: the live bindings at the first overflows (base, row stride, rows, age) - debug
+        // MAYA_GLMD_GUARD_DEBUG=1: the live bindings at the first overflows (base, row stride, rows, age) - debug
         static int dumps = 0;
-        static const bool dbg = std::getenv("STRATA_GLMD_GUARD_DEBUG") != nullptr;
+        static const bool dbg = std::getenv("MAYA_GLMD_GUARD_DEBUG") != nullptr;
         if (dbg && dumps < 3) {
             ++dumps;
             std::fprintf(stderr, "glm f16 guard: new %p ld %lld rows %lld phase %d; live:", (const void*) dst,

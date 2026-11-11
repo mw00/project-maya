@@ -107,7 +107,7 @@ MTP_GROUPS = [
     ("shared expert", ["ffn_gate_shexp.weight", "ffn_up_shexp.weight", "ffn_down_shexp.weight"]),
 ]
 MTP_REMEDY = ("the NextN draft head is IQ2/IQ3-class: expect low MTP acceptance (M4 needs 0.6). Remedy: "
-              "STRATA_GLM_MTP_GGUF=<a GGUF holding a Q4_K-or-better blk.%d>; cut one from a larger community quant with "
+              "MAYA_GLM_MTP_GGUF=<a GGUF holding a Q4_K-or-better blk.%d>; cut one from a larger community quant with "
               "tools/strata/extract_mtp_block.py (local shards, or --remote REPO 'Q4_K_M/*.gguf' to range-read only the "
               "block's bytes), then check it with tools/glm_dsa_mtp_probe.py --agree (docs/strata/volta3/mtp.md)")
 
@@ -670,7 +670,7 @@ class Audit:
     def a9(self) -> Check:
         c = Check("A9", "MTP block (blk.78)")
         if not self.has_mtp:
-            c.warn("no MTP block: M4 needs STRATA_GLM_MTP_GGUF with another file's blk.78 "
+            c.warn("no MTP block: M4 needs MAYA_GLM_MTP_GGUF with another file's blk.78 "
                    "(tools/strata/extract_mtp_block.py cuts one out of a larger community quant)")
             return c
         i = self.n_blocks - 1

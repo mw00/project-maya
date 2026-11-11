@@ -141,10 +141,23 @@ function ThinkBudget() {
 }
 
 // ------------------------------------------------------------------ Chat defaults (sampling)
+// a change saves at once: a small "Saved" after the title says so, then fades (it keeps its room on the title's line, so
+// nothing moves; the status region stays, so a screen reader hears each save)
+export const SAVED_MS = 1600;
+function useSaved() {
+  const [on, setOn] = useState(false), timer = useRef(null);
+  useEffect(() => () => clearTimeout(timer.current), []);
+  const flash = () => { setOn(true); clearTimeout(timer.current); timer.current = setTimeout(() => setOn(false), SAVED_MS); };
+  return [on, flash];
+}
+const Saved = ({on}) => html`<span class=${`set-saved${on ? " is-on" : ""}`}>
+  <span class="set-saved__mark" aria-hidden="true"><${Icon} name="check" sm/>Saved</span>
+  <span class="set-saved__say" role="status" aria-live="polite">${on ? "Saved" : ""}</span></span>`;
 function ChatDefaults() {
   const t = +P.temperature, greedy = t === 0, preset = presetOf(P);
   const titles = thinkTitles();
-  const set = (patch) => { savePrefs(patch); syncShared(); };
+  const [saved, flashSaved] = useSaved();
+  const set = (patch) => { savePrefs(patch); syncShared(); flashSaved(); };
   // the running model's recommended values (its run config: the model card's) say so
   const isDefault = (k) => !greedy && Math.abs(+P[k] - (+DEFAULTS[k] || 0)) < 1e-9;
   const sliders = [
@@ -167,7 +180,8 @@ function ChatDefaults() {
   const sharedNow = S.shared.on && S.shared.now && Object.keys(S.shared.now).length
     ? "API clients get now: " + Object.entries(S.shared.now).map(([k, v]) => `${names[k] || k} ${v}`).join(", ")
     : "API clients get them for anything they don't set themselves.";
-  return html`<${Head} title="Chat defaults" intro=${`How ${modelName(S.health.model)} writes new answers. Each model keeps its own.`}>
+  return html`<${Head} title=${html`Chat defaults<${Saved} on=${saved}/>`}
+      intro=${`How ${modelName(S.health.model)} writes new answers. Each model keeps its own.`}>
       <${TurboButton}/><//>
     <${ModelCtx}/>
     <${Group} cap="Sampling">

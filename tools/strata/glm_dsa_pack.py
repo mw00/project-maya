@@ -25,6 +25,9 @@ from __future__ import annotations
 
 import json
 import os
+import sys as _sys   # (an older STRATA_X counts as MAYA_X: tools/maya_names.py makes it so on import)
+_sys.path.append(os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..')))
+import maya_names  # noqa: E402,F401
 import pathlib
 import subprocess
 import sys
@@ -114,29 +117,29 @@ def tensor_class(name: str) -> str:
 
 # B10.7 (glm-dsa): the engine's mv() reads the 32-value block types (glmd_mv_ext.cuh) and the headwise MLA GEMVs read
 # native Q8_0 W_kb / W_vb (glmd::headwise).  Q8_0 attn_k_b / attn_v_b stay native by default: the GGUF's own weights,
-# where the BF16 copy rounded every one of them (and ~1 GB less to read a token); STRATA_PACK_NATIVE32=0 upcasts them
-# as before.  STRATA_PACK_NATIVE32=1 also keeps the UPCAST_TYPES of the mv tensors native (opt-in, not validated as a
+# where the BF16 copy rounded every one of them (and ~1 GB less to read a token); MAYA_PACK_NATIVE32=0 upcasts them
+# as before.  MAYA_PACK_NATIVE32=1 also keeps the UPCAST_TYPES of the mv tensors native (opt-in, not validated as a
 # default).  The binder serves either through glmdsa::pick_headwise.
 HEADWISE = ("attn_k_b.weight", "attn_v_b.weight")
 HEADWISE_NATIVE_TYPES = ("Q8_0",)
 
 
 def native32_enabled() -> bool:
-    """The mv tensors' 32-value block types native: STRATA_PACK_NATIVE32=1 only."""
-    return os.environ.get("STRATA_PACK_NATIVE32", "") not in ("", "0")
+    """The mv tensors' 32-value block types native: MAYA_PACK_NATIVE32=1 only."""
+    return os.environ.get("MAYA_PACK_NATIVE32", "") not in ("", "0")
 
 
 def headwise_native_enabled() -> bool:
-    """Q8_0 W_kb / W_vb native: the default; STRATA_PACK_NATIVE32=0 upcasts them to BF16."""
-    return os.environ.get("STRATA_PACK_NATIVE32", "").strip() != "0"
+    """Q8_0 W_kb / W_vb native: the default; MAYA_PACK_NATIVE32=0 upcasts them to BF16."""
+    return os.environ.get("MAYA_PACK_NATIVE32", "").strip() != "0"
 
 
 def plan_tensor(name: str, type_name: str, native32: bool | None = None,
                 headwise: bool | None = None) -> tuple[str, str]:
     """(what, target) for a non-routed tensor: what = 'native' (served from the GGUF), 'copy' (dense.bin as
     stored), 'convert' (dequantized into dense.bin) or 'refuse'; target = the dense type (BF16/F32) or a reason.
-    native32 (default: STRATA_PACK_NATIVE32=1) keeps the mv tensors' B10.7 types native instead of upcasting them;
-    headwise (default: on unless STRATA_PACK_NATIVE32=0; an explicit native32 decides it too) keeps Q8_0 W_kb / W_vb
+    native32 (default: MAYA_PACK_NATIVE32=1) keeps the mv tensors' B10.7 types native instead of upcasting them;
+    headwise (default: on unless MAYA_PACK_NATIVE32=0; an explicit native32 decides it too) keeps Q8_0 W_kb / W_vb
     native."""
     if headwise is None:
         headwise = native32 if native32 is not None else headwise_native_enabled()
@@ -239,7 +242,7 @@ def pack(a, src: pathlib.Path, out: pathlib.Path) -> int:
              ", MTP blk.%d" % mtp if mtp is not None else ""))
     if mtp is None:
         print("warning: glm-dsa: no NextN/MTP block (nextn_predict_layers 0): no speculative decode "
-              "(STRATA_GLM_MTP_GGUF can supply another file's draft block)")
+              "(MAYA_GLM_MTP_GGUF can supply another file's draft block)")
     try:
         full, how = indexer_full(md, trunk)
     except ValueError as e:

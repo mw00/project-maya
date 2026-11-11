@@ -1,7 +1,7 @@
 // tests/glm_dsa/glm_ngram_draft_test.cpp - glm-dsa B14.13 (CPU only): the n-gram draft matcher and its bookkeeping
 // (include/strata/core/glm_ngram_draft.hpp).
 //   1. the switches: off by default, n_max 4 (capped at 8), min_match 3; a request's GEN ngram= (glm_req_knobs.hpp)
-//      over STRATA_GLM_NGRAM_DRAFT, the switch again once a request leaves it out;
+//      over MAYA_GLM_NGRAM_DRAFT, the switch again once a request leaves it out;
 //   2. the matcher: the continuation of the earlier occurrence, the longest backward match wins, the most recent wins
 //      equal lengths, a match below min_match or with nothing after it proposes nothing, n_max and the history end
 //      cap the proposal, hash collisions cannot propose (exact token check), incremental appends equal one batch;
@@ -46,29 +46,29 @@ NgramConfig cfg(int n_max = 4, int min_match = 3) {
 
 void test_switches() {
     std::printf("[1. the switches]\n");
-    unsetenv("STRATA_GLM_NGRAM_DRAFT");
-    unsetenv("STRATA_GLM_NGRAM_MAX");
-    unsetenv("STRATA_GLM_NGRAM_MIN");
+    unsetenv("MAYA_GLM_NGRAM_DRAFT");
+    unsetenv("MAYA_GLM_NGRAM_MAX");
+    unsetenv("MAYA_GLM_NGRAM_MIN");
     NgramConfig c = ngram_config_env();
     check(!c.on && c.n_max == 4 && c.min_match == 3, "defaults: off, n_max 4, min_match 3");
-    setenv("STRATA_GLM_NGRAM_DRAFT", "1", 1);
-    setenv("STRATA_GLM_NGRAM_MAX", "64", 1);
-    setenv("STRATA_GLM_NGRAM_MIN", "2", 1);
+    setenv("MAYA_GLM_NGRAM_DRAFT", "1", 1);
+    setenv("MAYA_GLM_NGRAM_MAX", "64", 1);
+    setenv("MAYA_GLM_NGRAM_MIN", "2", 1);
     c = ngram_config_env();
-    check(c.on && c.n_max == kMaxDraft && c.min_match == 2, "STRATA_GLM_NGRAM_MAX=64 is capped at 8; MIN=2 read");
-    setenv("STRATA_GLM_NGRAM_DRAFT", "0", 1);
-    check(!ngram_config_env().on, "STRATA_GLM_NGRAM_DRAFT=0: off");
+    check(c.on && c.n_max == kMaxDraft && c.min_match == 2, "MAYA_GLM_NGRAM_MAX=64 is capped at 8; MIN=2 read");
+    setenv("MAYA_GLM_NGRAM_DRAFT", "0", 1);
+    check(!ngram_config_env().on, "MAYA_GLM_NGRAM_DRAFT=0: off");
     namespace gk = strata::core::glmknob;
     gk::set(gk::Ngram, 1);
-    check(ngram_config_env().on, "a request's ngram=1 over STRATA_GLM_NGRAM_DRAFT=0: on");
-    setenv("STRATA_GLM_NGRAM_DRAFT", "1", 1);
+    check(ngram_config_env().on, "a request's ngram=1 over MAYA_GLM_NGRAM_DRAFT=0: on");
+    setenv("MAYA_GLM_NGRAM_DRAFT", "1", 1);
     gk::set(gk::Ngram, 0);
-    check(!ngram_config_env().on, "a request's ngram=0 over STRATA_GLM_NGRAM_DRAFT=1: off");
+    check(!ngram_config_env().on, "a request's ngram=0 over MAYA_GLM_NGRAM_DRAFT=1: off");
     gk::set(gk::Ngram, gk::kStart);
     check(ngram_config_env().on, "the next request leaves it out: the switch again (on)");
-    unsetenv("STRATA_GLM_NGRAM_DRAFT");
-    unsetenv("STRATA_GLM_NGRAM_MAX");
-    unsetenv("STRATA_GLM_NGRAM_MIN");
+    unsetenv("MAYA_GLM_NGRAM_DRAFT");
+    unsetenv("MAYA_GLM_NGRAM_MAX");
+    unsetenv("MAYA_GLM_NGRAM_MIN");
 }
 
 void test_matcher() {
@@ -199,9 +199,9 @@ struct Sim {
 };
 Sim simulate(const Turn& t, bool on) {
     if (on)
-        setenv("STRATA_GLM_NGRAM_DRAFT", "1", 1);
+        setenv("MAYA_GLM_NGRAM_DRAFT", "1", 1);
     else
-        unsetenv("STRATA_GLM_NGRAM_DRAFT");
+        unsetenv("MAYA_GLM_NGRAM_DRAFT");
     static int model_tag;
     set_history(&model_tag, t.prompt);
     NgramSession ng(&model_tag);
@@ -233,7 +233,7 @@ Sim simulate(const Turn& t, bool on) {
     } else {
         std::printf("     %s\n", ng.book().line().c_str());
     }
-    unsetenv("STRATA_GLM_NGRAM_DRAFT");
+    unsetenv("MAYA_GLM_NGRAM_DRAFT");
     return s;
 }
 
@@ -248,7 +248,7 @@ void test_session() {
     std::snprintf(buf, sizeof buf, "the MTP acceptance counter sees the MTP drafts only: %d / %d off, %d / %d on",
                   off.mtp_hits, off.mtp_noted, on.mtp_hits, on.mtp_noted);
     check(off.mtp_ok && on.mtp_ok && on.mtp_noted == off.mtp_noted && on.mtp_hits == off.mtp_hits, buf);
-    setenv("STRATA_GLM_NGRAM_DRAFT", "1", 1);   // (set_history keeps nothing while the drafts are off)
+    setenv("MAYA_GLM_NGRAM_DRAFT", "1", 1);   // (set_history keeps nothing while the drafts are off)
     static int other;
     set_history(&other, {1, 2, 3});
     check(take_history(&other) == std::vector<int32_t>({1, 2, 3}) && take_history(&other).empty(),

@@ -1,5 +1,5 @@
 // include/strata/core/glm_draft_adaptive.hpp - glm-dsa B15.9: the adaptive draft depth controller for multi-token
-// drafts (the B14.13 n-gram proposals today, B11.4's chain drafts later), behind STRATA_GLM_DRAFT_ADAPTIVE.
+// drafts (the B14.13 n-gram proposals today, B11.4's chain drafts later), behind MAYA_GLM_DRAFT_ADAPTIVE.
 //
 // llama.cpp #27210 (common/speculative-adaptive.h, draft-mtp-adaptive): a deterministic hysteresis state machine
 // instead of an epsilon-greedy tuner.  The depth climbs one step after climb_threshold(depth) consecutive verifies
@@ -8,8 +8,8 @@
 // last full accept, reaches drop_pressure(depth) = max(5 * depth, 20).  It stays within [floor, cap] and resets per
 // generation (one controller per decode_spec call: NgramSession).
 //
-// STRATA_GLM_DRAFT_ADAPTIVE=<floor> (default off; 1 = on with floor 1; 2..8 also sets the floor, which is the start
-// depth): NgramSession proposes at most depth() tokens (the cap is STRATA_GLM_NGRAM_MAX).  Feedback without a
+// MAYA_GLM_DRAFT_ADAPTIVE=<floor> (default off; 1 = on with floor 1; 2..8 also sets the floor, which is the start
+// depth): NgramSession proposes at most depth() tokens (the cap is MAYA_GLM_NGRAM_MAX).  Feedback without a
 // multi-token verify: ProposalTracker checks each proposal against the tokens the decode then confirms, one round at
 // a time (a proposal issued while another is unresolved is not tracked, as a k-token verify would not have issued
 // it), so the controller sees exactly what a k-token verify would have accepted.  In today's depth-1 pipeline the
@@ -26,9 +26,9 @@
 
 namespace strata::core::glmng {
 
-/// STRATA_GLM_DRAFT_ADAPTIVE: 0 off, else the floor (1..8).  Read on every call.
+/// MAYA_GLM_DRAFT_ADAPTIVE: 0 off, else the floor (1..8).  Read on every call.
 inline int draft_adaptive_floor() {
-    const long long f = strata::glmenv::env_int("STRATA_GLM_DRAFT_ADAPTIVE", 0);
+    const long long f = strata::glmenv::env_int("MAYA_GLM_DRAFT_ADAPTIVE", 0);
     return f <= 0 ? 0 : (int) std::min<long long>(f, 8);
 }
 

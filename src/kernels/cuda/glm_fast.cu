@@ -1480,7 +1480,7 @@ __global__ void __launch_bounds__(256) mv_kernel(const STRATA_GRID_CONSTANT MvBa
 }
 
 // ... several columns (a verify window's tokens) of a type the tiled kernels below do not take, or every type with
-// STRATA_GLM_MV_TILED=0: kernels of their own, so the one-column kernels keep their registers and their speed
+// MAYA_GLM_MV_TILED=0: kernels of their own, so the one-column kernels keep their registers and their speed
 __global__ void __launch_bounds__(256) mv_kernel_cols(const STRATA_GRID_CONSTANT MvBatch b) {
     if (b.skip != nullptr && *b.skip) return;
     const int bid = blockIdx.x;
@@ -1927,7 +1927,7 @@ bool mma_arch() {
     if (cache[dev] == 0) {
         int major = 0;
         cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
-        static const bool off = getenv("STRATA_GLM_MV_APPROX") != nullptr && std::atoi(getenv("STRATA_GLM_MV_APPROX")) == 0;
+        static const bool off = getenv("MAYA_GLM_MV_APPROX") != nullptr && std::atoi(getenv("MAYA_GLM_MV_APPROX")) == 0;
         cache[dev] = major >= 8 && !off ? 1 : 2;
     }
     return cache[dev] == 1;
@@ -1947,7 +1947,7 @@ bool mma_ok() {
         int major = 0;
         cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
         cache[dev] = 2;
-        if (const char* v = getenv("STRATA_GLM_MV_MMA")) cache[dev] = std::atoi(v) != 0 && major >= 8 ? 1 : 2;
+        if (const char* v = getenv("MAYA_GLM_MV_MMA")) cache[dev] = std::atoi(v) != 0 && major >= 8 ? 1 : 2;
     }
     return cache[dev] == 1;
 #endif
@@ -1964,7 +1964,7 @@ bool mma_ok() {
 // PH402 die, us (mv_kernel_t -> this): the KDA q/k/v 24576 x 4096 561 -> 389, attn_output 4096 x 16384 406 -> 279,
 // q_b 16384 x 1536 142 -> 105, the shared expert's gate/up 4096 x 4096 106 -> 79, q_a + kv_a 2048 x 4096 59 -> 48
 // (R = 2), the FFN 12288 x 4096 287 -> 204, the head 154880 x 4096 3466 -> 2362.
-// p100_mv_mode: 0 off (mv_kernel_t; STRATA_GLM_MV_P100=0), else R by the launch's rows (STRATA_GLM_MV_P100_R=2 / 4
+// p100_mv_mode: 0 off (mv_kernel_t; MAYA_GLM_MV_P100=0), else R by the launch's rows (MAYA_GLM_MV_P100_R=2 / 4
 // forces one), asked once per device
 #if !defined(STRATA_USE_HIP)
 // a Q6_K block's 53 words, two a lane: w0 = word lane, w1 = word 32 + lane (lanes 0-20) of the words starting sh = the
@@ -2048,7 +2048,7 @@ __global__ void __launch_bounds__(256) mv_q6_p100_kernel(const STRATA_GRID_CONST
     }
 }
 #endif
-// moe_gate_up on cc 6.0 stages the layer input in shared memory (STRATA_GLM_GU_STAGE=0: it reads it from global)
+// moe_gate_up on cc 6.0 stages the layer input in shared memory (MAYA_GLM_GU_STAGE=0: it reads it from global)
 bool sm60_gu_stage() {
 #if defined(STRATA_USE_HIP)
     return false;
@@ -2061,7 +2061,7 @@ bool sm60_gu_stage() {
         int major = 0, minor = 0;
         cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
         cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev);
-        const char* v = getenv("STRATA_GLM_GU_STAGE");
+        const char* v = getenv("MAYA_GLM_GU_STAGE");
         cache[dev] = major == 6 && minor == 0 && (v == nullptr || std::atoi(v) != 0) ? 1 : 2;
     }
     return cache[dev] == 1;
@@ -2079,8 +2079,8 @@ int p100_mv_mode() {
         int major = 0, minor = 0;
         cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
         cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev);
-        const char* v = getenv("STRATA_GLM_MV_P100");
-        const char* rv = getenv("STRATA_GLM_MV_P100_R");
+        const char* v = getenv("MAYA_GLM_MV_P100");
+        const char* rv = getenv("MAYA_GLM_MV_P100_R");
         const int r = rv != nullptr ? std::atoi(rv) : 0;
         const bool on = major == 6 && minor == 0 && (v == nullptr || std::atoi(v) != 0);
         cache[dev] = on ? (r == 2 || r == 4 ? r : 1) : -1;   // 1: by the rows
@@ -2699,7 +2699,7 @@ __device__ __forceinline__ void hc3_block(const HcArgs& a, const unsigned int nb
 __global__ void __launch_bounds__(HC_THREADS) hc3_kernel(const STRATA_GRID_CONSTANT HcArgs a) {
     hc3_block(a, gridDim.x, blockIdx.x);   // 32 blocks
 }
-// STRATA_GLM_ROWS_BATCH: the rows of a batched decode step in one launch - row y's blocks are hc3_kernel's for its
+// MAYA_GLM_ROWS_BATCH: the rows of a batched decode step in one launch - row y's blocks are hc3_kernel's for its
 // args (its own partials and barrier counter): the same block function, so each row's arithmetic is meant to be the
 // one-row kernel's (glm_rows_kernels_test compares them bitwise)
 struct HcBatch {
@@ -3024,7 +3024,7 @@ __device__ __forceinline__ void dsa_score_block(const float* __restrict__ iq, co
     if (lane == 0) score[p] = acc;
 }
 
-// The indexer's scores, take two (STRATA_GLM_DSA_SCORE2, glm_attn_bench), idx_heads 32 x key_dim 128 only: each pool's
+// The indexer's scores, take two (MAYA_GLM_DSA_SCORE2, glm_attn_bench), idx_heads 32 x key_dim 128 only: each pool's
 // arithmetic is dsa_score_block's - every head's dot from the lane's four products in key order, the butterfly,
 // fmaxf(dot, 0) * w summed over the heads in order - so the same bits.  What changes is around it: dsa_score_kernel
 // fills 16 KB of query into LDS for every 8 pools; here a grid of a few blocks a CU fills it once a block (or each lane
@@ -3381,7 +3381,7 @@ __global__ void mla_combine_kernel(const float* __restrict__ part, int n_chunks,
     }
 }
 
-// The split attention, take two (STRATA_GLM_MLA_ATTN2, glm_attn_bench): every head's arithmetic is mla_split_kernel's
+// The split attention, take two (MAYA_GLM_MLA_ATTN2, glm_attn_bench): every head's arithmetic is mla_split_kernel's
 // and mla_combine_kernel's - the same 32-cell chunks, each (head, cell) score from the lane's 16 products and the
 // butterfly, the chunk's max / exp / sum, each column's context over the chunk's cells in order, then the chunks merged
 // in order - so the same bits.  What changes is around it: HPB heads a block (each head is independent; 16 stages
@@ -3853,7 +3853,7 @@ __device__ void topk_warp(float* sel, int E, int k, int* out) {
     __syncthreads();
 }
 
-// topk_warp's picks by rank instead of k rounds (STRATA_GLM_ROUTE_RANK, on by default; =0: topk_warp): thread e counts
+// topk_warp's picks by rank instead of k rounds (MAYA_GLM_ROUTE_RANK, on by default; =0: topk_warp): thread e counts
 // the scores that beat its own - larger, or equal at a lower id - and the experts of rank < k write their id at their
 // rank, those of rank k .. k + n2 - 1 theirs in out2 (the near misses).  The same order as topk_warp's k rounds (the
 // largest first, ties to the lower id), every thread at once - topk_warp's one warp of serial rounds was 6.5 us of a
@@ -3920,38 +3920,38 @@ struct RouteArgs {
     const float* ahead_bias[kAhead];
     int n_ahead;
     int skip_from;              // experts not in VRAM at route rank >= skip_from are left out (no fetch, no wait):
-                                // the draft block, STRATA_GLM_TRUNK_KEEP (0: all of them; >= k: none)
+                                // the draft block, MAYA_GLM_TRUNK_KEEP (0: all of them; >= k: none)
     unsigned long long cpu_plan;   // the CPU LANE: of f RAM-tier experts, (plan >> 4 f) & 15 go to the host (0: off)
-    int promote_min;            // STRATA_GLM_PROMOTE_MIN: keep a fetched expert only when its aged route count
+    int promote_min;            // MAYA_GLM_PROMOTE_MIN: keep a fetched expert only when its aged route count
                                 // clears this; 0 keeps the old rule (a spare, if one is free)
-    int pf_rank;                // STRATA_GLM_PREFETCH_RANK: prefetch only the prediction's first pf_rank ranks
-    int near_n;                 // STRATA_GLM_ROUTE_LOG: the route's next near_n ranks after the top k (0: none)
+    int pf_rank;                // MAYA_GLM_PREFETCH_RANK: prefetch only the prediction's first pf_rank ranks
+    int near_n;                 // MAYA_GLM_ROUTE_LOG: the route's next near_n ranks after the top k (0: none)
     int win;                    // a verify window's token: the CPU lane's answer slot (0: the lone one)
     unsigned int* scr_used;     // a verify window's layer: the scratch slots its tokens took (bit 31: one was taken
                                 // twice), so the batched experts read each token's own (null: entry i's slot)
     const int* skip;            // set_skip's flag: non-zero = a token past a wrong draft (see moe_route_kernel)
     int win_n;                  // a batched verify window's tokens (0: not one) - the host spreads their CPU lanes
-    int disk_skip_from;         // STRATA_GLM_DISK_SKIP_FROM: experts in neither VRAM nor the RAM tier at route rank
+    int disk_skip_from;         // MAYA_GLM_DISK_SKIP_FROM: experts in neither VRAM nor the RAM tier at route rank
                                 // >= this are left out (no disk read); >= k: none
-    float disk_skip_w;          // STRATA_GLM_DISK_SKIP_W: ... and, at any rank, those whose share of the route's
+    float disk_skip_w;          // MAYA_GLM_DISK_SKIP_W: ... and, at any rank, those whose share of the route's
                                 // weights is below this (0: none)
-    float miss_skip_w;          // STRATA_GLM_MISS_SKIP_W (prototype): experts not in VRAM whose share of the route's
+    float miss_skip_w;          // MAYA_GLM_MISS_SKIP_W (prototype): experts not in VRAM whose share of the route's
                                 // weights is below this are left out like skip_from's, at any rank (0: none)
-    int win_rows;               // win / win_n are a batched rows step's row and rows (STRATA_GLM_GROUP_EXPERTS)
-    float affinity;             // STRATA_GLM_ROUTE_AFFINITY: added to a VRAM-resident expert's selection score (its
+    int win_rows;               // win / win_n are a batched rows step's row and rows (MAYA_GLM_GROUP_EXPERTS)
+    float affinity;             // MAYA_GLM_ROUTE_AFFINITY: added to a VRAM-resident expert's selection score (its
                                 // weight stays its own probability) - LOSSY, it changes which experts run (0: off)
-    int rank_sel;               // the selections by topk_rank (STRATA_GLM_ROUTE_RANK; the host checks E fits it)
-    unsigned long long* prof;   // STRATA_GLM_ROUTE_PROF (measurement): block 0's cycles from its start to each phase's
+    int rank_sel;               // the selections by topk_rank (MAYA_GLM_ROUTE_RANK; the host checks E fits it)
+    unsigned long long* prof;   // MAYA_GLM_ROUTE_PROF (measurement): block 0's cycles from its start to each phase's
                                 // end, summed over routes (host-mapped; [15] counts the routes); null: off
-    int fast;                   // STRATA_GLM_ROUTE_FAST (on by default; =0: the old order, A/B): the error flag from
+    int fast;                   // MAYA_GLM_ROUTE_FAST (on by default; =0: the old order, A/B): the error flag from
                                 // its device copy, the request's x out at the start, the plan's reads in parallel
                                 // into shared memory, the request head a thread a field - the same plan and request
-    float res_w;                // STRATA_GLM_RESIDENT_SKIP_W (CHANGES THE ANSWERS - Turbo): a routed expert, in VRAM or not,
+    float res_w;                // MAYA_GLM_RESIDENT_SKIP_W (CHANGES THE ANSWERS - Turbo): a routed expert, in VRAM or not,
                                 // whose share of the route's weights is below this is left out (0: none) ...
-    int res_k;                  // ... STRATA_GLM_RESIDENT_TOPK: only the res_k heaviest of the route's experts run
+    int res_k;                  // ... MAYA_GLM_RESIDENT_TOPK: only the res_k heaviest of the route's experts run
                                 // (0: all); the top-1 always runs, the kept weights are renormalised when the model's are
     int norm_mode;              // glm-dsa B5.1: kRouteNormClamp (Maya, llama.cpp) or kRouteNormHf (glm-dsa, + 1e-20)
-    unsigned long long rand_seed = 0;   // glm-dsa B15.7: STRATA_GLM_RANDOM_ROUTING's seed (0: the router's own ids)
+    unsigned long long rand_seed = 0;   // glm-dsa B15.7: MAYA_GLM_RANDOM_ROUTING's seed (0: the router's own ids)
 };
 
 // kExt: the glm-dsa additions to the route - the HF weight normalisation (norm_mode, B5.1) and the bench mode's random
@@ -4008,7 +4008,7 @@ __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const STRATA_G
     __shared__ int s_bi[32];
     __syncthreads();
     ROUTE_MARK(0);   // the sigmoid scores
-    // the NEAR MISSES (STRATA_GLM_ROUTE_LOG only, cache studies): ranks k+1 .. k+near_n by the same selection score -
+    // the NEAR MISSES (MAYA_GLM_ROUTE_LOG only, cache studies): ranks k+1 .. k+near_n by the same selection score -
     // topk_rank has them with the top k; else the top k are -inf in s_sel after the selection, so it simply goes on
     // (s_sel is rewritten for the prediction below)
     __shared__ int s_near[16];
@@ -4227,7 +4227,7 @@ __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const STRATA_G
         unsigned long long* rtab = a.d.tab + a.d.n_keys;
         unsigned long long* spares = a.d.tab + 2 * (size_t) a.d.n_keys + (size_t) a.layer * kSpares;
         int next_spare = 0;
-        // STRATA_GLM_MISS_SKIP_W: a light expert (its share of the route's weights below the bar) that is not in VRAM
+        // MAYA_GLM_MISS_SKIP_W: a light expert (its share of the route's weights below the bar) that is not in VRAM
         // is left out instead of fetched or computed on the CPU - the weight it carries is what the token loses
         const float msw = skipped ? 0.0f : a.miss_skip_w;
         const auto light_miss = [&](int i) { return msw > 0.0f && (float) ((double) s_p[s_ids[i]] * inv) < msw; };
@@ -4342,7 +4342,7 @@ __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const STRATA_G
         // PREFETCH: the predicted experts of the next layer that are not in VRAM but are in the RAM tier claim
         // that layer's spares now (one spare stays for its real misses); the side stream copies them while this
         // layer and the next one's attention compute, and the next route sees them as resident.  Only the
-        // prediction's first pf_rank ranks (STRATA_GLM_PREFETCH_RANK): its top guesses are right almost always (Maya-M
+        // prediction's first pf_rank ranks (MAYA_GLM_PREFETCH_RANK): its top guesses are right almost always (Maya-M
         // on a 3090 + 3060, the next layer used rank 0 / 1 / 2 / 3 96 / 88 / 75 / 62 % of the time, ranks 4..7 52 .. 24 %)
         // - the first NON-resident guess is often a low rank, and a wrong copy costs the link what a right one saves
         int npf = 0;
@@ -4544,7 +4544,7 @@ __global__ void moe_cpu_wait_kernel(MoeDev d, int n_embd, float* out) {
     for (int e = tid; e < n_embd; e += blockDim.x) out[e] += ((volatile const CpuAnswer*) r)->part[e];
 }
 
-// the deferred form (STRATA_GLM_DEFER_CPU): the answer of a layer whose FFN write already went out without it, added to
+// the deferred form (MAYA_GLM_DEFER_CPU): the answer of a layer whose FFN write already went out without it, added to
 // the streams it would have reached - R[j] += post[j] * part (the layer's FFN-side post weights)
 __global__ void moe_cpu_wait_streams_kernel(MoeDev d, int n_embd, const float* post, float* R, int hc) {
     __shared__ unsigned int s_need;
@@ -4579,7 +4579,7 @@ __global__ void __launch_bounds__(256) moe_prefetch_kernel(MoeDev d, size_t n16)
     }
 }
 
-// STRATA_GLM_STREAM_FETCH: the response's streamed entries (posted before their disk reads finished).  0 when the
+// MAYA_GLM_STREAM_FETCH: the response's streamed entries (posted before their disk reads finished).  0 when the
 // route had no disk misses, or the answer is not this route's (a wait that gave up).
 __device__ unsigned int moe_stream_mask(const MoeDev& d) {
     if (d.wait_seq == nullptr || d.resp == nullptr) return 0u;
@@ -4656,7 +4656,7 @@ __global__ void __launch_bounds__(256) moe_fetch_kernel(MoeDev d, int k, size_t 
     }
 }
 
-// moe_wait + moe_fetch in one launch (STRATA_GLM_SKIP_EMPTY, the batched rows): block 0 waits for the host's answer to
+// moe_wait + moe_fetch in one launch (MAYA_GLM_SKIP_EMPTY, the batched rows): block 0 waits for the host's answer to
 // the route's disk misses (when it had any) and applies it as moe_wait does, then hands the misses' sources to the
 // other blocks through fetch_src and a reset wait_seq (device memory: they spin on L2, not on the host over PCIe); every
 // block then copies its share of each entry with a source, as moe_fetch does.  A route with neither (most of them)
@@ -4705,7 +4705,7 @@ __global__ void __launch_bounds__(256) moe_wait_fetch_kernel(MoeDev d, int n_emb
         __syncthreads();
     }
     if (tid < 8) s_src[tid] = tid < k ? ((volatile const unsigned long long*) d.fetch_src)[tid] : 0ull;
-    __shared__ unsigned int s_sm;   // STRATA_GLM_STREAM_FETCH's streamed entries (block 0 reset wait_seq: s_need)
+    __shared__ unsigned int s_sm;   // MAYA_GLM_STREAM_FETCH's streamed entries (block 0 reset wait_seq: s_need)
     if (tid == 0)
         s_sm = s_need != 0u && d.resp != nullptr && ((volatile const MoeResponse*) d.resp)->seq == s_need
                    ? ((volatile const MoeResponse*) d.resp)->stream_mask : 0u;
@@ -5492,8 +5492,8 @@ std::atomic<int> g_mv_r{-1}, g_mv_u{2}, g_mv_wpb{8}, g_mv_lds{-1};
 // the most activations the RDNA kernels take at once (mv_rdna_launch<1..8>); more go to the other kernels
 constexpr int kMaxRdnaNt = 8;
 // The device the launch runs on: by default the RDNA 3.5 APUs (gfx115x - measured on a Radeon 8065S), whose LPDDR5X
-// latency the in-flight loads hide; STRATA_GLM_MV_RDNA=1 on any gfx11 (an RX 7900's GDDR6: not measured yet),
-// STRATA_GLM_MV_RDNA=0 keeps mv_kernel_t and the generic kernel (A/B)
+// latency the in-flight loads hide; MAYA_GLM_MV_RDNA=1 on any gfx11 (an RX 7900's GDDR6: not measured yet),
+// MAYA_GLM_MV_RDNA=0 keeps mv_kernel_t and the generic kernel (A/B)
 // Which dense GEMV kernels a device's decode runs, once per device: the engine's own record that MAYA_GLM_MV_RDNA reached
 // the dispatch - or did not
 void note_mv(int device, bool on) {
@@ -5505,7 +5505,7 @@ void note_mv(int device, bool on) {
 }
 bool mv_rdna_device() {
     static const int mode = [] {   // -1: default (gfx115x + gfx120x), 0: off, 1: every gfx11/gfx12
-        const char* v = std::getenv("STRATA_GLM_MV_RDNA");
+        const char* v = std::getenv("MAYA_GLM_MV_RDNA");
         return v == nullptr ? -1 : v[0] == '0' ? 0 : 1;
     }();
     if (mode == 0 || g_mv_r.load(std::memory_order_relaxed) == 0) return false;
@@ -5671,7 +5671,7 @@ bool mv(const MvJob* jobs, int n, cudaStream_t s) {
     if (!ext_mv_shape_ok(jobs, n, 1)) return false;   // glm-dsa B10.7: the new types take one column only
     // the jobs of the common dense types go to a kernel compiled for their type (one launch per type present), the
     // rest to the generic one; the jobs are independent, so their order does not matter
-    static const bool typed = getenv("STRATA_GLM_MV_GENERIC") == nullptr;
+    static const bool typed = getenv("MAYA_GLM_MV_GENERIC") == nullptr;
     constexpr int kTyped[] = {14, 8, 12, 13};
     bool done[kMaxMvJobs] = {};
     ext_mv(jobs, n, done, s);   // glm-dsa B10.6/B10.7: the jobs glmd_mv_ext.cuh serves
@@ -5715,9 +5715,9 @@ bool mv(const MvJob* jobs, int n, cudaStream_t s) {
         }
     }
 #endif
-    // several columns: the tiled kernels (STRATA_GLM_MV_TILED=0: the column loops)
+    // several columns: the tiled kernels (MAYA_GLM_MV_TILED=0: the column loops)
     static const bool tiled = [] {
-        const char* v = getenv("STRATA_GLM_MV_TILED");
+        const char* v = getenv("MAYA_GLM_MV_TILED");
         return v == nullptr || std::atoi(v) != 0;
     }();
     // five or more columns of Q4_K / Q8_0 that may differ in float rounding (a drafter's): the tensor cores.  Below five
@@ -5747,7 +5747,7 @@ bool mv(const MvJob* jobs, int n, cudaStream_t s) {
         }
     }
     if (tiled) {
-        // Q8_0 on the tensor cores only when asked (STRATA_GLM_MV_MMA=1; it is not bit for bit the single column's)
+        // Q8_0 on the tensor cores only when asked (MAYA_GLM_MV_MMA=1; it is not bit for bit the single column's)
         const bool mma = mma_ok();
         // Q5_K (13) too: DecW<13> (glmd_mv_ext.cuh, included above) is dot_q5_K split in two, bit for bit, so each
         // (row, column) sum stays the column kernel's - GLM-5.3's attn_output / q_a / shared gate+up / dense gate+up
@@ -5783,7 +5783,7 @@ bool mv(const MvJob* jobs, int n, cudaStream_t s) {
                 mvc_kernel_bf16<<<acc, 256, (size_t) nc * MVC_FTILE * sizeof(float), s>>>(b);
         }
     }
-    // several columns the tiled kernels left (another type, or STRATA_GLM_MV_TILED=0): the column kernels
+    // several columns the tiled kernels left (another type, or MAYA_GLM_MV_TILED=0): the column kernels
     for (const int T : kTyped) {
         if (!typed) break;
         MvBatch b{};
@@ -5937,11 +5937,11 @@ bool mv_nt(const MvJob* jobs, int n, int nt, cudaStream_t s) {
         }
     if (!mv_inputs_ok(jobs, n, "mv_nt")) return false;
     if (!ext_mv_shape_ok(jobs, n, nt)) return false;   // glm-dsa B10.7: the new types take one activation only
-    static const bool typed = getenv("STRATA_GLM_MV_GENERIC") == nullptr;
+    static const bool typed = getenv("MAYA_GLM_MV_GENERIC") == nullptr;
     bool done[kMaxMvJobs] = {};
     if (!exl3_jobs(jobs, n, nt, done, s)) return false;   // (EXL3: one EXL3 job an activation)
     if (nt > 8) {
-        // more activations than the kernels take (a verify window's rows, STRATA_GLM_MULTI_MTP): the rest in groups of
+        // more activations than the kernels take (a verify window's rows, MAYA_GLM_MULTI_MTP): the rest in groups of
         // 8 - each activation's output is mv()'s for it alone either way (the EXL3 jobs above took all nt at once)
         for (int base = 0; base < nt; base += 8) {
             const int w = std::min(8, nt - base);
@@ -6005,7 +6005,7 @@ void quantize_q8_1(const float* x, void* xq, int n, cudaStream_t s) {
 }
 
 // hc's kernel: the grid-barrier kernel needs every block resident at once; checked once per process (and per device
-// count of SMs), the single-tail kernel otherwise.  STRATA_GLM_HC1=1 forces the old one (A/B).  cap_rows: how many
+// count of SMs), the single-tail kernel otherwise.  MAYA_GLM_HC1=1 forces the old one (A/B).  cap_rows: how many
 // hc3_rows_kernel blocks the CURRENT device can hold resident at once - its own occupancy, not hc3_kernel's (a different
 // parameter block, so its registers can differ), since hc_rows' rows must all be resident for their grid barriers;
 // kept per device (a split's GPUs can differ)
@@ -6020,8 +6020,8 @@ static int hc_mode(const HcArgs& a, int* cap_rows = nullptr) {
         cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
         cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per, hc2_kernel, HC_THREADS, 0);
         cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per3, hc3_kernel, HC_THREADS, 0);
-        mode = (getenv("STRATA_GLM_HC1") == nullptr && per * sms >= a.n_embd / HC2_EB) ? 2 : 1;
-        if (mode == 2 && getenv("STRATA_GLM_HC2") == nullptr && a.n_embd == 4096 && per3 * sms >= a.n_embd / HC2_EB)
+        mode = (getenv("MAYA_GLM_HC1") == nullptr && per * sms >= a.n_embd / HC2_EB) ? 2 : 1;
+        if (mode == 2 && getenv("MAYA_GLM_HC2") == nullptr && a.n_embd == 4096 && per3 * sms >= a.n_embd / HC2_EB)
             mode = 3;
     }
     if (cap_rows != nullptr) {
@@ -6175,7 +6175,7 @@ namespace {
 //                                          shuffles, pools a warp at a time, blocks a multiprocessor (rl2b4, sx1b8, ...)
 //   mla_split2  h<16|32|64>[l|x][v|e][c|o] heads a block, lanes or shuffles, 16-byte or element staging, the one-pass
 //                                          merge or the original one (h64lvc, h16xeo, ...)
-// The engine takes them from STRATA_GLM_DSA_SCORE2 / STRATA_GLM_MLA_ATTN2 (unset or 0: the original kernels, which stay
+// The engine takes them from MAYA_GLM_DSA_SCORE2 / MAYA_GLM_MLA_ATTN2 (unset or 0: the original kernels, which stay
 // the default; a value that is no label stops the process - a typo must never run the originals under a variant's
 // name); the bench sets them through hip_expert_bench.  The labels are exactly the ones glm_attn_bench --sweep checks.
 struct DsaScore2 {
@@ -6243,11 +6243,11 @@ std::atomic<int> g_dsa2_set{0}, g_mla2_set{0};
 DsaScore2 g_dsa2_bench;
 MlaAttn2 g_mla2_bench;
 DsaScore2 dsa2_shape() {
-    static const DsaScore2 env = env_shape<DsaScore2, parse_dsa2>("STRATA_GLM_DSA_SCORE2");   // (not STRATA_GLM_DSA_SCORE: the prompt's numeric switch, glm_batch.cu)
+    static const DsaScore2 env = env_shape<DsaScore2, parse_dsa2>("MAYA_GLM_DSA_SCORE2");   // (not MAYA_GLM_DSA_SCORE: the prompt's numeric switch, glm_batch.cu)
     return g_dsa2_set.load(std::memory_order_acquire) ? g_dsa2_bench : env;
 }
 MlaAttn2 mla2_shape() {
-    static const MlaAttn2 env = env_shape<MlaAttn2, parse_mla2>("STRATA_GLM_MLA_ATTN2");
+    static const MlaAttn2 env = env_shape<MlaAttn2, parse_mla2>("MAYA_GLM_MLA_ATTN2");
     return g_mla2_set.load(std::memory_order_acquire) ? g_mla2_bench : env;
 }
 // the engine's own record of the kernels each device's attention runs, once per device (the dispatch proof)
@@ -6333,7 +6333,7 @@ __global__ void dsa_select_all_kernel(int n_vis, int kpool, int n_sel, int pos, 
 
 bool dsa_select_all_on() {
     static const bool on = [] {
-        const char* v = getenv("STRATA_GLM_DSA_ALL");
+        const char* v = getenv("MAYA_GLM_DSA_ALL");
         return v == nullptr || std::atoi(v) != 0;
     }();
     return on;
@@ -6421,7 +6421,7 @@ void mla_q_abs(const float* q, int64_t q_stride, const uint16_t* wk_b, int n_hea
 
 bool mla_attend(const float* q_abs, const uint16_t* lat, const int* cells, int n_sel, int n_head, int qk_nope,
                 int kv_lora, float* ctx, cudaStream_t s, bool lat_q8) {
-    if (kv_lora % 32 != 0 || getenv("STRATA_GLM_MLA1") != nullptr) return false;
+    if (kv_lora % 32 != 0 || getenv("MAYA_GLM_MLA1") != nullptr) return false;
     return mla_split_attend(q_abs, lat, cells, n_sel, n_head, qk_nope, kv_lora, ctx, s, lat_q8);
 }
 
@@ -6452,14 +6452,14 @@ static float* mla_part(int dev, int n_head, int kv_lora, int chunks, int* cap) {
     return part[dev];
 }
 
-// whether this device takes the tensor-core attention (NVIDIA sm_80+); STRATA_GLM_MLA_MMA=0: the F32 chunks (A/B)
+// whether this device takes the tensor-core attention (NVIDIA sm_80+); MAYA_GLM_MLA_MMA=0: the F32 chunks (A/B)
 static bool mla_mma_on(int dev) {
     static int on_[16] = {};
     if (on_[dev] == 0) {
         int major = 0;
         cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
-        const char* v = getenv("STRATA_GLM_MLA_MMA");
-        bool on = major >= 8 && (v == nullptr || std::atoi(v) != 0) && getenv("STRATA_GLM_MLA_ATTN1") == nullptr;
+        const char* v = getenv("MAYA_GLM_MLA_MMA");
+        bool on = major >= 8 && (v == nullptr || std::atoi(v) != 0) && getenv("MAYA_GLM_MLA_ATTN1") == nullptr;
 #if defined(STRATA_USE_HIP)
         on = false;
 #endif
@@ -6478,7 +6478,7 @@ bool mla_attend_batch(const float* q_abs, int64_t q_stride, const uint16_t* lat,
                       cudaStream_t s, bool lat_q8) {
     int dev = 0;
     cudaGetDevice(&dev);
-    if (dev >= 16 || kv_lora != MLA_KV || T < 1 || getenv("STRATA_GLM_MLA1") != nullptr ||
+    if (dev >= 16 || kv_lora != MLA_KV || T < 1 || getenv("MAYA_GLM_MLA1") != nullptr ||
         !mla_mma_on(dev))
         return false;
     int cap = 0;
@@ -6504,7 +6504,7 @@ size_t mla_rows_part_floats(int n_head, int kv_lora) { return (size_t) MLA_NC * 
 bool mla_rows_ok(int kv_lora) {
     int dev = 0;
     cudaGetDevice(&dev);
-    return dev < 16 && kv_lora == MLA_KV && getenv("STRATA_GLM_MLA1") == nullptr && mla_mma_on(dev);
+    return dev < 16 && kv_lora == MLA_KV && getenv("MAYA_GLM_MLA1") == nullptr && mla_mma_on(dev);
 }
 
 bool mla_attend_rows(const float* q_abs, int64_t q_stride, const uint16_t* const* lat, const int* const* cells,
@@ -6535,8 +6535,8 @@ static bool mla_split_attend(const float* q_abs, const uint16_t* lat, const int*
     cudaGetDevice(&dev);
     if (dev >= 16) return false;
     if (mla_attend_batch(q_abs, 0, lat, cells, 0, &n_sel, 1, n_head, qk_nope, kv_lora, ctx, 0, s, lat_q8)) return true;
-    // Volta: the prompt's one-pass tensor-core kernel in cell splits (STRATA_GLM_MLA_V70=0: the F32 chunks below)
-    if (kv_lora == 512 && getenv("STRATA_GLM_MLA_ATTN1") == nullptr) {
+    // Volta: the prompt's one-pass tensor-core kernel in cell splits (MAYA_GLM_MLA_V70=0: the F32 chunks below)
+    if (kv_lora == 512 && getenv("MAYA_GLM_MLA_ATTN1") == nullptr) {
         int vcap = 0;
         float* vpart = mla_part(dev, n_head, kv_lora, 64, &vcap);
         if (vpart != nullptr && strata::kernels::glmb::mla_decode_v70(q_abs, lat, cells, n_sel, n_head, kv_lora,
@@ -6559,7 +6559,7 @@ static bool mla_split_attend(const float* q_abs, const uint16_t* lat, const int*
         }
     }
     int cap = 0;
-    float* part = split_ok[dev] && kv_lora <= 512 && n_head <= 128 && getenv("STRATA_GLM_MLA_ATTN1") == nullptr
+    float* part = split_ok[dev] && kv_lora <= 512 && n_head <= 128 && getenv("MAYA_GLM_MLA_ATTN1") == nullptr
                       ? mla_part(dev, n_head, kv_lora, n_chunks, &cap)
                       : nullptr;
     // the take-two kernels on the decode's token path only (and under the bench's override), as dsa_score
@@ -6603,7 +6603,7 @@ void mla(const float* q, const uint16_t* wk_b, const uint16_t* wv_b, const uint1
     static float* scratch[16] = {};
     int dev = 0;
     cudaGetDevice(&dev);
-    if (getenv("STRATA_GLM_MLA1") != nullptr || dev >= 16 || kv_lora % 32 || v_head % 32) {
+    if (getenv("MAYA_GLM_MLA1") != nullptr || dev >= 16 || kv_lora % 32 || v_head % 32) {
         const size_t smem = ((size_t) qk_nope + 2 * kv_lora + v_head + n_sel) * sizeof(float);
         mla_kernel<<<n_head, 256, smem, s>>>(q, wk_b, wv_b, lat, cells, n_sel, qk_nope, kv_lora, v_head,
                                              (block_q8_1*) out_q8_1, lat_q8);
@@ -6657,40 +6657,40 @@ void moe_route(const float* logits, const float* bias, int n_expert, int k, floa
                 pf_rank > 0 ? pf_rank : k, std::max(0, std::min(near_n, std::min(16, n_expert - k))), win, scr_used,
                 g_skip, win_n, disk_skip_from, disk_skip_w, miss_skip_w, win_rows};
     static const float affinity = [] {
-        const char* v = getenv("STRATA_GLM_ROUTE_AFFINITY");
+        const char* v = getenv("MAYA_GLM_ROUTE_AFFINITY");
         return v ? std::max(0.0f, (float) std::atof(v)) : 0.0f;
     }();
     a.affinity = affinity;
     a.norm_mode = norm_mode;   // glm-dsa B5.1
-    a.rand_seed = glmd::random_routing_seed();   // glm-dsa B15.7 (0 unless STRATA_GLM_RANDOM_ROUTING=1)
-    // STRATA_GLM_RESIDENT_SKIP_W / STRATA_GLM_RESIDENT_TOPK (changes the answers; Turbo): read once; 0 = off
+    a.rand_seed = glmd::random_routing_seed();   // glm-dsa B15.7 (0 unless MAYA_GLM_RANDOM_ROUTING=1)
+    // MAYA_GLM_RESIDENT_SKIP_W / MAYA_GLM_RESIDENT_TOPK (changes the answers; Turbo): read once; 0 = off
     static const float res_w = [] {
-        const char* v = getenv("STRATA_GLM_RESIDENT_SKIP_W");
+        const char* v = getenv("MAYA_GLM_RESIDENT_SKIP_W");
         return v ? std::max(0.0f, std::min(0.9f, (float) std::atof(v))) : 0.0f;
     }();
     static const int res_k = [] {
-        const char* v = getenv("STRATA_GLM_RESIDENT_TOPK");
+        const char* v = getenv("MAYA_GLM_RESIDENT_TOPK");
         return v ? std::max(0, std::atoi(v)) : 0;
     }();
     a.res_w = resident_ok ? res_w : 0.0f;
     a.res_k = resident_ok ? res_k : 0;
-    // STRATA_GLM_ROUTE_RANK=0: the selections by topk_warp's serial rounds again (A/B); topk_rank needs whole warps of
+    // MAYA_GLM_ROUTE_RANK=0: the selections by topk_warp's serial rounds again (A/B); topk_rank needs whole warps of
     // experts that one block's threads cover and at most 8 picks
     static const bool rank_on = [] {
-        const char* v = getenv("STRATA_GLM_ROUTE_RANK");
+        const char* v = getenv("MAYA_GLM_ROUTE_RANK");
         return v == nullptr || std::atoi(v) != 0;
     }();
     a.rank_sel = rank_on && n_expert % 32 == 0 && n_expert <= ROUTE_THREADS && k <= 8 ? 1 : 0;
-    // STRATA_GLM_ROUTE_FAST=0: the route kernel's old order of reads and writes (A/B; the same plan and request)
+    // MAYA_GLM_ROUTE_FAST=0: the route kernel's old order of reads and writes (A/B; the same plan and request)
     static const int route_fast = [] {
-        const char* v = getenv("STRATA_GLM_ROUTE_FAST");
+        const char* v = getenv("MAYA_GLM_ROUTE_FAST");
         return v == nullptr || std::atoi(v) != 0 ? 1 : 0;
     }();
     a.fast = route_fast && k <= 8 ? 1 : 0;
-    // STRATA_GLM_ROUTE_PROF=1 (measurement): the route kernel's phases in cycles, averaged and printed at exit
+    // MAYA_GLM_ROUTE_PROF=1 (measurement): the route kernel's phases in cycles, averaged and printed at exit
     static unsigned long long* prof_h = [] {
         unsigned long long* p = nullptr;
-        if (getenv("STRATA_GLM_ROUTE_PROF") == nullptr) return p;
+        if (getenv("MAYA_GLM_ROUTE_PROF") == nullptr) return p;
         if (cudaHostAlloc((void**) &p, 16 * sizeof(unsigned long long), cudaHostAllocMapped) != cudaSuccess) {
             cudaGetLastError();
             return (unsigned long long*) nullptr;
@@ -6758,10 +6758,10 @@ void moe_prefetch(const MoeDev& d, size_t blob_bytes, cudaStream_t s) {
         cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
         if (sms <= 0) sms = 80;
     }
-    // half the SMs: it runs beside the main stream's kernels.  STRATA_GLM_PREFETCH_BLOCKS=<n>: n blocks instead - a
+    // half the SMs: it runs beside the main stream's kernels.  MAYA_GLM_PREFETCH_BLOCKS=<n>: n blocks instead - a
     // PCIe pull needs few SMs to keep the link busy, and every SM it holds is one the main stream's kernels wait for
     static const int blocks_start = [] {   // glm-dsa request knobs: the start value
-        const char* v = getenv("STRATA_GLM_PREFETCH_BLOCKS");
+        const char* v = getenv("MAYA_GLM_PREFETCH_BLOCKS");
         return v != nullptr ? std::max(1, std::atoi(v)) : 0;
     }();
     const int blocks_env = strata::core::glmknob::get(strata::core::glmknob::PrefetchBlocks,
@@ -6828,11 +6828,11 @@ void moe_cpu_wait_rows(const CpuWaitRows& w, int n, int n_embd, cudaStream_t s) 
 #if defined(STRATA_USE_HIP)
 namespace {
 // Limit automatic dispatch to the measured decode geometry and RDNA3/3.5
-// targets (plus opt-in gfx906 when allow_gfx906 is set via STRATA_GLM_GU22_TUNED=1).
+// targets (plus opt-in gfx906 when allow_gfx906 is set via MAYA_GLM_GU22_TUNED=1).
 // RDNA4 and all other shapes retain the original expert kernels.
 bool rdna3_expert_device(bool allow_gfx1151 = true, bool allow_gfx906 = false) {
     static const bool legacy = [] {
-        const char* v = std::getenv("STRATA_HIP_EXPERTS_LEGACY");
+        const char* v = std::getenv("MAYA_HIP_EXPERTS_LEGACY");
         return v && v[0] == '1';
     }();
     if (legacy) return false;
@@ -6854,12 +6854,12 @@ bool rdna3_expert_device(bool allow_gfx1151 = true, bool allow_gfx906 = false) {
     }
     return gfx1100 || gfx120x || (allow_gfx1151 && gfx1151) || (allow_gfx906 && gfx906);
 }
-// IQ2_S gate/up (Maya-M's) on IQ2_XXS's tuned path above - opt-in (STRATA_GLM_GU22_TUNED=1) until it is measured end
+// IQ2_S gate/up (Maya-M's) on IQ2_XXS's tuned path above - opt-in (MAYA_GLM_GU22_TUNED=1) until it is measured end
 // to end: the expert bench's sweep (--exact, gu22/down18) found it bit-identical to the original kernel on gfx1100 and
 // gfx1151 and 1.34-1.43x (gfx1100, device memory) / 1.12x (gfx1151, pinned host memory) faster at 4-8 experts a call
 bool gu22_tuned() {
     static const bool on = [] {
-        const char* v = std::getenv("STRATA_GLM_GU22_TUNED");
+        const char* v = std::getenv("MAYA_GLM_GU22_TUNED");
         return v && v[0] == '1';
     }();
     return on;
@@ -7174,7 +7174,7 @@ __global__ void moe_win_group_kernel(const STRATA_GRID_CONSTANT MoeWin w) {
     *w.n_groups = ng;
 }
 
-// moe_win_group_kernel's grouping with a thread an entry (STRATA_GLM_ROWS_SMALL): the same groups in the same order (by
+// moe_win_group_kernel's grouping with a thread an entry (MAYA_GLM_ROWS_SMALL): the same groups in the same order (by
 // each plan's first entry), the same members in entry order - every array it writes, value for value
 __global__ void __launch_bounds__(kWinEnt) moe_win_group_par_kernel(const STRATA_GRID_CONSTANT MoeWin w) {
     __shared__ unsigned long long sp[kWinEnt];

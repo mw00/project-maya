@@ -10,10 +10,10 @@
 //          Q4_0 (2), Q4_1 (3), Q5_0 (6), Q5_1 (7), IQ4_NL (20) through glmd_mv_dots.cuh's llama.cpp dots, one
 //          warp per row (the typed kernel mv_kernel_t<T>), and F16 (1) with the f32 input or the q8_1 one.
 //   B10.6  behind switches (read once; default off until measured on the test PC):
-//          STRATA_GLMD_MV_NW2=1    K-quant rows (Q2_K..Q6_K) at batch 1 split over TWO warps (llama.cpp 42d95816: the
+//          MAYA_GLMD_MV_NW2=1    K-quant rows (Q2_K..Q6_K) at batch 1 split over TWO warps (llama.cpp 42d95816: the
 //                                  sm_70 nwarps table); changes the summation order (the two warps' sums are added
 //                                  last), so it is a numerics change, not only a schedule;
-//          STRATA_GLMD_MV_TYPED=1  typed launches for IQ2_XXS / IQ2_XS / IQ2_S / IQ3_XXS / Q2_K / Q3_K (the generic
+//          MAYA_GLMD_MV_TYPED=1  typed launches for IQ2_XXS / IQ2_XS / IQ2_S / IQ3_XXS / Q2_K / Q3_K (the generic
 //                                  kernel's switch costs registers); same row_dot<T>, so the same arithmetic.
 #pragma once
 
@@ -118,8 +118,8 @@ __global__ void __launch_bounds__(256) mv_kernel_nw2(const STRATA_GRID_CONSTANT 
 int ext_mv_cfg() {
     static const int cfg = [] {
         // (strata/core/glm_env.hpp: included at glm_fast.cu's top through glmd_random_route.hpp)
-        return (::strata::glmenv::env_flag("STRATA_GLMD_MV_TYPED", false) ? 1 : 0) |
-               (::strata::glmenv::env_flag("STRATA_GLMD_MV_NW2", false) ? 2 : 0);
+        return (::strata::glmenv::env_flag("MAYA_GLMD_MV_TYPED", false) ? 1 : 0) |
+               (::strata::glmenv::env_flag("MAYA_GLMD_MV_NW2", false) ? 2 : 0);
     }();
     return cfg;
 }
@@ -347,7 +347,7 @@ bool dsa_launch(const MvJob* jobs, int n, cudaStream_t s) {
 // The device policy (L1-4 review).  mv_dsa_kernel reproduces mv_kernel_t's / mv_kernel's sums, so it stands in only
 // for jobs mv() itself gives those kernels, and only where the bits were seen to match: a device-tuned one-column
 // kernel of mv() keeps its types (its own sums, its own tuning) - the P100 Q6_K kernel on cc 6.0 (p100_mv_mode),
-// mv_kernel_nw2's K-quants when STRATA_GLMD_MV_NW2=1 asks for them, everything when STRATA_GLM_MV_GENERIC asks for the
+// mv_kernel_nw2's K-quants when MAYA_GLMD_MV_NW2=1 asks for them, everything when MAYA_GLM_MV_GENERIC asks for the
 // generic kernel - and a HIP build takes Q4_K / Q5_K / Q8_0 only: the RDNA GEMV serves Q6_K and BF16 on gfx115x /
 // gfx12, and the float rows' sums are not gf::mv's bit for bit under HIP's contraction (gfx1151, glmd_dec_bench: the
 // F32 indexer row differs; Q4_K / Q5_K / Q8_0 match).
@@ -359,7 +359,7 @@ struct DsaLeft {
     }
 };
 DsaLeft dsa_left() {
-    static const bool generic = getenv("STRATA_GLM_MV_GENERIC") != nullptr;   // (mv()'s own reading of it)
+    static const bool generic = getenv("MAYA_GLM_MV_GENERIC") != nullptr;   // (mv()'s own reading of it)
     DsaLeft l;
     l.all = generic;
     l.k_quants = (ext_mv_cfg() & 2) != 0;
@@ -373,7 +373,7 @@ DsaLeft dsa_left() {
 
 // kMvDsaAuto's devices: where mv_dsa was measured faster than mv() - NVIDIA cc >= 7.0 (a V100: glmd_dec_bench, HANDOFF
 // "L1-4").  AMD keeps mv(): on gfx1151 (the Gorgon Halo) the mixer's GEMVs are bound by the LPDDR5X (220-240 GB/s
-// either way) and mv_dsa's launches came within 0-3% of mv()'s; Pascal is not measured.  STRATA_GLMD_MV_DSA=1 runs
+// either way) and mv_dsa's launches came within 0-3% of mv()'s; Pascal is not measured.  MAYA_GLMD_MV_DSA=1 runs
 // mv_dsa on any device.  Once per device.
 bool dsa_auto_device() {
 #if defined(STRATA_USE_HIP)

@@ -20,24 +20,24 @@ class Names(unittest.TestCase):
         env = {"MAYA_GLM_CPU_LANE": "8", "STRATA_GLM_SPLIT": "0", "STRATA_GLM_PREFILL_MB": "1", "MAYA_GLM_PREFILL_MB": "2",
                "PATH": "/bin"}
         N.alias_env(env)
-        self.assertEqual(env["STRATA_GLM_CPU_LANE"], "8")       # the name the code reads
-        self.assertEqual(env["STRATA_GLM_SPLIT"], "0")          # an older name alone still counts
-        self.assertEqual(env["STRATA_GLM_PREFILL_MB"], "2")     # both: the MAYA_ one wins
+        self.assertEqual(env["MAYA_GLM_CPU_LANE"], "8")         # the name the code reads
+        self.assertEqual(env["MAYA_GLM_SPLIT"], "0")            # an older name alone still counts
+        self.assertEqual(env["MAYA_GLM_PREFILL_MB"], "2")       # both: the MAYA_ one wins
         self.assertEqual(env["PATH"], "/bin")
 
     def test_config_round_trip(self):
         disk = {"exe": "x", "env": {"MAYA_GLM_CPU_LANE": "8", "STRATA_GLM_SPLIT": "0", "HIP_VISIBLE_DEVICES": "0"}}
         cfg = N.env_in(json.loads(json.dumps(disk)))
-        self.assertEqual(cfg["env"], {"STRATA_GLM_CPU_LANE": "8", "STRATA_GLM_SPLIT": "0", "HIP_VISIBLE_DEVICES": "0"})
+        self.assertEqual(cfg["env"], {"MAYA_GLM_CPU_LANE": "8", "MAYA_GLM_SPLIT": "0", "HIP_VISIBLE_DEVICES": "0"})
         out = N.env_out(cfg)
         self.assertEqual(out["env"], {"MAYA_GLM_CPU_LANE": "8", "MAYA_GLM_SPLIT": "0", "HIP_VISIBLE_DEVICES": "0"})
-        self.assertEqual(cfg["env"]["STRATA_GLM_SPLIT"], "0")   # (the copy written; the config in memory unchanged)
+        self.assertEqual(cfg["env"]["MAYA_GLM_SPLIT"], "0")     # (the copy written; the config in memory unchanged)
         self.assertEqual(N.env_out({"exe": "x"}), {"exe": "x"})
 
     def test_setup_reads_and_writes_configs_so(self):
         p = Path(tempfile.mkdtemp()) / "maya-x.json"
         p.write_text(json.dumps({"env": {"MAYA_GLM_RESERVE_MB": "3072"}}))
-        self.assertEqual(maya.read_json(p)["env"], {"STRATA_GLM_RESERVE_MB": "3072"})
+        self.assertEqual(maya.read_json(p)["env"], {"MAYA_GLM_RESERVE_MB": "3072"})
         self.assertEqual(N.shown("STRATA_GLM_RESERVE_MB"), "MAYA_GLM_RESERVE_MB")
 
     def test_both_names_and_lookup(self):
@@ -84,7 +84,7 @@ class EngineSeesMayaOnlySettings(unittest.TestCase):
             with self.subTest(backend=backend):
                 disk = {"exe": "x", "backend": backend, "gpu": [0], "env": {n: "7" for n in names}}
                 cfg = N.env_in(json.loads(json.dumps(disk)))      # as read from a config on disk
-                self.assertTrue(all(k.startswith("STRATA_") for k in cfg["env"]))
+                self.assertTrue(all(k.startswith("MAYA_") for k in cfg["env"]))
                 env = child_env(cfg)
                 for n in names:
                     self.assertEqual(env.get(n), "7", n)           # what getenv("MAYA_...") reads

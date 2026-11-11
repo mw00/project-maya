@@ -13,7 +13,7 @@
 //               at long context (wmma_args() derives its IdxScoreWmma from this struct; n_grid is its launch extent).
 //   f32_to_bf16 round-to-nearest-even BF16 copies of F32 attn_k_b / attn_v_b (glmd::mla2 reads BF16 only; a pack
 //               whose k_b / v_b are small enough to stay F32 gets them converted once at setup).
-//   iota        cells 0..n-1 (the dense-attention switch, STRATA_GLM_DSA_DENSE=1, B14.3).
+//   iota        cells 0..n-1 (the dense-attention switch, MAYA_GLM_DSA_DENSE=1, B14.3).
 // CPU twins in glmd::twin take the same structs with host pointers (p_dev and n_sel_out are host ints there).
 #pragma once
 

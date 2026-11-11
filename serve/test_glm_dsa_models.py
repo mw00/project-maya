@@ -103,7 +103,7 @@ class CacheBytes(Base):
         self.assertEqual(M.glm53_kv_bytes(dict(cfg, env={"MAYA_GLM_KV_INT8": "0"})), fp16)
         self.assertEqual(M.glm53_kv_bytes(dict(cfg, args=cfg["args"] + ["--kv", "fp16"])), fp16)
         self.assertEqual(M.glm53_kv_bytes(dict(cfg, args=cfg["args"] + ["--kv", "fp16"],
-                                               env={"STRATA_GLM_KV_INT8": "1"})), 64352)   # (the environment wins)
+                                               env={"MAYA_GLM_KV_INT8": "1"})), 64352)   # (the environment wins)
         self.assertEqual(M.glm53_kv_bytes(dict(cfg, env={"MAYA_GLM_IDX_FP16": "1"})), 79 * 672 + 22 * 256)
         self.assertIsNone(M.glm53_kv_bytes(M.read(self.flash)))
 
@@ -206,14 +206,25 @@ class Apply(Base):
 
 
 class Turbo(Base):
-    """e) Turbo: hidden for GLM-5.3 until its own values are measured on it; GLM-5.3-Flash's as before."""
+    """e) Turbo: GLM-5.3 its own values (TURBO_ENV_G53: the route affinity measured on it, none of Flash's skips);
+    GLM-5.3-Flash's as before."""
 
-    def test_hidden_and_refused(self):
-        self.assertEqual(M.turbo_info(M.read(self.g53)),
-                         {"on": False, "family": "glm", "plan": {}, "env": {}, "hidden": True})
-        with self.assertRaisesRegex(ValueError, "not offered for GLM-5.3"):
-            M.turbo_enable(self.g53)
-        self.assertEqual(M.read(self.g53)["args"][-2:], ["--kv-streaming", "off"])      # (nothing written)
+    def test_g53_own_values(self):
+        info = M.turbo_info(M.read(self.g53))
+        self.assertEqual(info, {"on": False, "family": "glm",
+                                "plan": {"context": {"from": 65536, "to": 32768}},
+                                "env": {"MAYA_GLM_ROUTE_AFFINITY": "0.2"}})
+        self.assertNotIn("hidden", info)
+        before = M.read(self.g53)
+        out = M.turbo_enable(self.g53)
+        self.assertTrue(out["changed"])
+        on = M.read(self.g53)
+        self.assertTrue(M.turbo_on(on))
+        self.assertEqual(on["env"], {"MAYA_GLM_ROUTE_AFFINITY": "0.2"})                 # (no MISS_SKIP / RESIDENT_TOPK)
+        M.turbo_disable(self.g53)
+        off = M.read(self.g53)
+        self.assertFalse(M.turbo_on(off))
+        self.assertEqual((off["args"], off.get("env")), (before["args"], before.get("env")))   # (restored exactly)
 
     def test_flash_as_before(self):
         info = M.turbo_info(M.read(self.flash))

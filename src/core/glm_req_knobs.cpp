@@ -60,7 +60,7 @@ void apply(Glm5Model& model, const Request& r) {
     for (int k = 0; k < kCount; ++k) set((Id) k, r.value((Id) k));
     if (regraph) ::glmd::graph_generation_bump("request knob promote_min");
     // the lane's row4 switch, only on a change (a request without it calls nothing): lane_row4_override(-1) is
-    // STRATA_GLM_LANE_ROW4 as the engine started, 0 off, 1 on
+    // MAYA_GLM_LANE_ROW4 as the engine started, 0 off, 1 on
     if (g_row4.exchange(r.lane_row4) != r.lane_row4) {
 #if defined(STRATA_NATIVE_EXPERTS)
         strata::kernels::cpu::lane_row4_override(r.lane_row4);

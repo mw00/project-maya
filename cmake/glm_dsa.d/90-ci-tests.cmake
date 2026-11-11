@@ -131,8 +131,8 @@ endif()
 
 if(TARGET glm_pack_test AND STRATA_REAL_PACK AND STRATA_PYTHON3)
   if(EXISTS "${STRATA_REAL_PACK}/index.txt")
-    # the pack-backed forward over STRATA_REAL_TOKENS teacher-forced ids; the run's environment (STRATA_GLM_SLOW,
-    # STRATA_GLM_SPLIT, CUDA_VISIBLE_DEVICES) comes from the caller, as in BRINGUP.md
+    # the pack-backed forward over STRATA_REAL_TOKENS teacher-forced ids; the run's environment (MAYA_GLM_SLOW,
+    # MAYA_GLM_SPLIT, CUDA_VISIBLE_DEVICES) comes from the caller, as in BRINGUP.md
     set(_gate ${STRATA_PYTHON3} ${CMAKE_CURRENT_SOURCE_DIR}/tools/strata/pack_test_gate.py
               --bin $<TARGET_FILE:glm_pack_test> --pack ${STRATA_REAL_PACK} --tokens ${STRATA_REAL_TOKENS})
     if(STRATA_REAL_IDS AND STRATA_REAL_REF AND EXISTS "${STRATA_REAL_IDS}" AND EXISTS "${STRATA_REAL_REF}")

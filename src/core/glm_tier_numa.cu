@@ -233,19 +233,19 @@ TierState& tier_of(Glm5Model::FastState& F, const Glm5Geometry& g, int dev, cons
         T.ready = true;
         T.dsa = dsa;
         // the port keeps Maya v1.1.55's RAM tier for glm-dsa too: one class per size, pinned by numa_pinned (with
-        // STRATA_GLM_ROW_HALVES for the per-node halves) - pin_class's node-split segments are not wired in, so the
-        // node-split lanes stay off whatever STRATA_GLM_NUMA_SPLIT says
+        // MAYA_GLM_ROW_HALVES for the per-node halves) - pin_class's node-split segments are not wired in, so the
+        // node-split lanes stay off whatever MAYA_GLM_NUMA_SPLIT says
         T.split_req = false;
-        if (dsa && numa_split_requested(dsa, getenv("STRATA_GLM_NUMA_SPLIT")))
-            std::fprintf(stderr, "glm tier: STRATA_GLM_NUMA_SPLIT is not served by this build (STRATA_GLM_ROW_HALVES=1 "
+        if (dsa && numa_split_requested(dsa, getenv("MAYA_GLM_NUMA_SPLIT")))
+            std::fprintf(stderr, "glm tier: MAYA_GLM_NUMA_SPLIT is not served by this build (MAYA_GLM_ROW_HALVES=1 "
                                  "gives each node its half): ignored\n");
-        T.seg_cap = seg_cap_bytes(dsa, getenv("STRATA_GLM_RAM_SEG_GB"));
+        T.seg_cap = seg_cap_bytes(dsa, getenv("MAYA_GLM_RAM_SEG_GB"));
         T.dev = dev;
         T.nodes = nodes;
         T.L.assign(F.L.size(), SplitLayout{});
         T.half.assign(F.L.size(), kc::NativeFmt{});
-        if (!dsa && numa_split_requested(true, getenv("STRATA_GLM_NUMA_SPLIT")))
-            std::fprintf(stderr, "glm tier: STRATA_GLM_NUMA_SPLIT is glm-dsa only: ignored\n");
+        if (!dsa && numa_split_requested(true, getenv("MAYA_GLM_NUMA_SPLIT")))
+            std::fprintf(stderr, "glm tier: MAYA_GLM_NUMA_SPLIT is glm-dsa only: ignored\n");
     }
     return T;
 }
@@ -308,9 +308,9 @@ void* pin_class(Glm5Model::FastState& F, const Glm5Geometry& g, int c, int64_t& 
 #ifdef __linux__
     auto& R = F.rc[(size_t) c];
     const bool dsa = g.arch == GlmArch::GlmDsa;
-    const size_t cap = seg_cap_bytes(dsa, getenv("STRATA_GLM_RAM_SEG_GB"));
+    const size_t cap = seg_cap_bytes(dsa, getenv("MAYA_GLM_RAM_SEG_GB"));
     if (cap == 0 || n <= 0 || R.stride == 0) return nullptr;
-    if (const char* v = getenv("STRATA_GLM_NUMA"); v != nullptr && std::atoi(v) == 0) return nullptr;
+    if (const char* v = getenv("MAYA_GLM_NUMA"); v != nullptr && std::atoi(v) == 0) return nullptr;
     const std::vector<int> nodes = online_nodes();
     if (nodes.size() < 2) return nullptr;   // (Maya's numa_pinned rule: one node pins with cudaHostAlloc)
     int ok_attr = 0;
@@ -357,7 +357,7 @@ void* pin_class(Glm5Model::FastState& F, const Glm5Geometry& g, int c, int64_t& 
         std::fprintf(stderr, "glm tier: CUDA%d RAM class %d stays interleaved (no node split): %s\n", dev, c, why.c_str());
         for (int il : layers) T.L[(size_t) il] = SplitLayout{};
     }
-    const char* segpol = getenv("STRATA_GLM_NUMA_SEG");
+    const char* segpol = getenv("MAYA_GLM_NUMA_SEG");
     bool bind_seg = segpol != nullptr && std::strcmp(segpol, "bind") == 0;
     // every segment must start on a page (mbind, and cudaHostRegister works in whole pages: two segments sharing one
     // would register it twice), so a slot is a whole number of pages here (+ < 4 KB on a ~11 MB expert)
@@ -366,7 +366,7 @@ void* pin_class(Glm5Model::FastState& F, const Glm5Geometry& g, int c, int64_t& 
     // so a bound class (node split, NUMA_SEG=bind) is capped by each node's own free memory less a reserve before any
     // page is faulted in: shrunk when the nodes still hold >= 3/4 of it, else interleaved (which spills over)
     for (int pass = 0; pass < 2 && (split || bind_seg); ++pass) {
-        const int64_t reserve = node_reserve_bytes(getenv("STRATA_GLM_NODE_RESERVE_GB"));
+        const int64_t reserve = node_reserve_bytes(getenv("MAYA_GLM_NODE_RESERVE_GB"));
         std::vector<int64_t> budget(nodes.size(), -1);
         for (size_t j = 0; j < nodes.size(); ++j) {
             const std::string mi = read_file(("/sys/devices/system/node/node" + std::to_string(nodes[j]) + "/meminfo").c_str());
@@ -401,13 +401,13 @@ void* pin_class(Glm5Model::FastState& F, const Glm5Geometry& g, int c, int64_t& 
     uint8_t* map = (uint8_t*) mp;
     const auto t0 = std::chrono::steady_clock::now();
 
-    // ---- huge pages per (segment, half), in order (B8.7: STRATA_GLM_THP=0/1, auto = Maya's buddyinfo rule)
+    // ---- huge pages per (segment, half), in order (B8.7: MAYA_GLM_THP=0/1, auto = Maya's buddyinfo rule)
     const int halves = split ? 2 : 1;
     const int ns = (int) plan.slots.size();
     std::vector<size_t> unit_bytes;
     for (int k = 0; k < ns; ++k)
         for (int h = 0; h < halves; ++h) unit_bytes.push_back((size_t) plan.slots[(size_t) k] * stride);
-    const int thp = thp_mode(getenv("STRATA_GLM_THP"));
+    const int thp = thp_mode(getenv("MAYA_GLM_THP"));
     const auto node_index = [&](int node) {
         for (size_t j = 0; j < nodes.size(); ++j)
             if (nodes[j] == node) return (int) j;
@@ -421,7 +421,7 @@ void* pin_class(Glm5Model::FastState& F, const Glm5Geometry& g, int c, int64_t& 
         for (int h = 0; h < halves; ++h) unit_node.push_back(split || bind_seg ? node_index(seg_node(k, h, split, nodes)) : -1);
     const std::vector<char> huge = thp_plan_nodes(unit_bytes, unit_node, buddy_huge_free_nodes(buddy, nodes),
                                                   buddy_huge_free(buddy), thp);
-    const int fault_threads = std::max(1, std::min(32, env_int("STRATA_GLM_PIN_THREADS", 4)));
+    const int fault_threads = std::max(1, std::min(32, env_int("MAYA_GLM_PIN_THREADS", 4)));
     std::vector<std::vector<int>> cpus_of(nodes.size());
     for (size_t j = 0; j < nodes.size(); ++j) cpus_of[j] = node_cpus(nodes[j]);
 
@@ -637,7 +637,7 @@ bool prefetch(TierState* T, const gf::MoeDev& d, int il1, cudaStream_t s) {
     const SplitLayout& L = T->L[(size_t) il1];
     const unsigned long long lo = (unsigned long long) tc->map, hi = lo + (unsigned long long) tc->n * tc->stride;
     const size_t n16 = (L.blob + 15) / 16;
-    static const int blocks_start = env_int("STRATA_GLM_PREFETCH_BLOCKS", 0);
+    static const int blocks_start = env_int("MAYA_GLM_PREFETCH_BLOCKS", 0);
     const int blocks_env = glmknob::get(glmknob::PrefetchBlocks, blocks_start);   // GEN prefetch_blocks= (knobs)
     const int blocks = blocks_env > 0 ? blocks_env : std::max(1, sm_count() / 2);
     const int w = split_word(L);
@@ -698,16 +698,16 @@ bool lane_pools(Glm5Model::FastState& F, const Glm5Geometry& g, int n_parts, int
     TierState* T = F.tier.get();
     const std::vector<int> nodes = online_nodes();
     const bool split = T != nullptr && T->split_any();
-    const char* shv = getenv("STRATA_GLM_CPU_SHARED");
+    const char* shv = getenv("MAYA_GLM_CPU_SHARED");
     const LanePool mode = lane_pool_mode(n_parts, own_count, shv, split, (int) nodes.size(),
                                          g.arch == GlmArch::GlmDsa);
     if (T != nullptr) T->mode = mode;
     if (n_parts >= 2 || split)
-        std::fprintf(stderr, "glm tier: CUDA%d CPU lane pool mode: %s (STRATA_GLM_CPU_SHARED=%s, %d part(s), %zu NUMA node(s))\n",
+        std::fprintf(stderr, "glm tier: CUDA%d CPU lane pool mode: %s (MAYA_GLM_CPU_SHARED=%s, %d part(s), %zu NUMA node(s))\n",
                      dev, lane_pool_name(mode), shv != nullptr ? shv : "unset", n_parts, nodes.size());
     if (mode != LanePool::Socket && mode != LanePool::NodeSplit) return false;
     const auto per_node = [&](int node) {
-        if (const int t = env_int("STRATA_GLM_NUMA_LANE_THREADS", 0); t > 0) return std::min(64, t);
+        if (const int t = env_int("MAYA_GLM_NUMA_LANE_THREADS", 0); t > 0) return std::min(64, t);
         if (lane_env) return std::max(2, threads);
         const std::vector<int> cpus = node_cpus(node);
         return numa_lane_threads((int) cpus.size(), physical_cores(cpus));
@@ -788,7 +788,7 @@ bool cpu_experts(Glm5Model::FastState& F, const Glm5Geometry& g, int il, int ne,
     const int H = (int) L.H, n_embd = (int) L.n_embd;
     const float limit = g.swiglu_exp;
     static const int kSplitStart = [] {
-        const char* v = getenv("STRATA_GLM_CPU_SPLIT");
+        const char* v = getenv("MAYA_GLM_CPU_SPLIT");
         return v ? std::max(1, std::min(64, std::atoi(v))) : 0;
     }();
     const int kSplit = glmknob::get(glmknob::CpuSplit, kSplitStart);   // GEN cpu_split= (knobs)
@@ -871,7 +871,7 @@ int dev_numa_node(int dev) {
 std::vector<int> glm_split_pool_ids(const Glm5Geometry& g, const std::vector<int>& devs) {
     std::vector<int> gpu_node;
     for (int d : devs) gpu_node.push_back(dev_numa_node(d));
-    return glm_cpu_pool_ids(g, (int) devs.size(), std::getenv("STRATA_GLM_CPU_SHARED"), glmtier::online_nodes(),
+    return glm_cpu_pool_ids(g, (int) devs.size(), std::getenv("MAYA_GLM_CPU_SHARED"), glmtier::online_nodes(),
                             gpu_node);
 }
 

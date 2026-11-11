@@ -23,11 +23,11 @@ namespace strata::core {
 
 /// A split's DFlash verify window: pipelined (consecutive tokens on the parts at once, glm_window.cu's win_pipe_*) or
 /// batched (all of the window a part at a time, staggered, each part's CPU lane on both parts' pools).
-/// STRATA_GLM_WIN_PIPE=1 / 0 forces either; by default pipelined from three parts up.  Maya-L, 3090 + 5060 Ti:
+/// MAYA_GLM_WIN_PIPE=1 / 0 forces either; by default pipelined from three parts up.  Maya-L, 3090 + 5060 Ti:
 /// batched 21.8 tok/s against MTP's 20.5 (pipelined 17.3); nine GPUs: pipelined 59.8-62.0 against MTP's 42.5.
 inline bool dflash_pipelined(int n_parts) {
     if (n_parts < 2) return false;
-    const char* v = std::getenv("STRATA_GLM_WIN_PIPE");
+    const char* v = std::getenv("MAYA_GLM_WIN_PIPE");
     if (v != nullptr && v[0] != '\0') return std::atoi(v) != 0;
     return n_parts >= 3;
 }
@@ -81,7 +81,7 @@ public:
     /// [c0, vocab) on device `hdev` (`hi`, on its stream `hs`) at once, each side its own slices' top-k candidates,
     /// the helper's copied in for the merge.  On the helper: `hx` (rows x n_embd floats), `hlg` (rows x (vocab - c0)
     /// floats), `hcand` (cand_bytes).  A draft of more rows, or a c0 off the top-k's slices, keeps the whole head here.
-    /// STRATA_GLM_DFLASH_HEAD_SPLIT=0: off.  false: its pinned rows did not allocate
+    /// MAYA_GLM_DFLASH_HEAD_SPLIT=0: off.  false: its pinned rows did not allocate
     bool split_head(const WSlot* lo, const WSlot* hi, int c0, int hdev, cudaStream_t hs, float* hx, float* hlg,
                     void* hcand, size_t cand_bytes, int rows, std::string& err);
     /// Forget every cached position at or past `from` (0: a new sequence, or a state loaded from elsewhere; else the

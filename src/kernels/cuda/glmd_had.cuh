@@ -1,6 +1,6 @@
 // src/kernels/cuda/glmd_had.cuh - the 128-point Walsh-Hadamard rotation of the glm-dsa indexer (glm-dsa B14.11).
 //
-// STRATA_GLM_IDX_HADAMARD=1 (read once, by the state carve: GlmStateLayout::ik_had) rotates every index key after
+// MAYA_GLM_IDX_HADAMARD=1 (read once, by the state carve: GlmStateLayout::ik_had) rotates every index key after
 // its rope, before the cache store, and every indexer query head after its rope.  H is orthonormal and symmetric
 // (H H = I), so (H q) . (H k) = q . k and the scores are those of the unrotated pair in exact arithmetic; what changes
 // is the FP16 key store: a key whose energy sits in a few outlier channels is spread over all idx_dim channels, so

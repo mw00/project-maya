@@ -122,7 +122,7 @@ class HipSetupTests(unittest.TestCase):
         tables = self.root / "tools/hip"
         tables.mkdir(parents=True)
         for arch in ("gfx1100", "gfx1201"):
-            (tables / f"{arch}-glm-hipblaslt-100202.txt").write_text(f"STRATA_HIPBLASLT_TUNING_V1 {arch} 100202\n")
+            (tables / f"{arch}-glm-hipblaslt-100202.txt").write_text(f"MAYA_HIPBLASLT_TUNING_V1 {arch} 100202\n")
         self.a.gpu = None
         self.a.gpus = "0,1"
         pc = maya.check_pc(self.a)
@@ -131,20 +131,20 @@ class HipSetupTests(unittest.TestCase):
                               self.root / "pack", "test", 8192, self.root / "data", None)
         cfg = maya.read_json(p)
         self.assertEqual(cfg["gpu"], [1, 0])
-        self.assertNotIn("STRATA_GLM_SPLIT", cfg["env"])
-        self.assertEqual(cfg["env"]["STRATA_HIPBLASLT_TUNING"],
+        self.assertNotIn("MAYA_GLM_SPLIT", cfg["env"])
+        self.assertEqual(cfg["env"]["MAYA_HIPBLASLT_TUNING"],
                          f"{tables / 'gfx1201-glm-hipblaslt-100202.txt'}{os.pathsep}{tables / 'gfx1100-glm-hipblaslt-100202.txt'}")
 
     def test_config_selects_hip_and_preserves_user_tuning(self):
         pc = maya.check_pc(self.a)
-        self.a.env = ["STRATA_GLM_RESERVE_MB=4096"]
+        self.a.env = ["MAYA_GLM_RESERVE_MB=4096"]
         p = maya.write_config(self.a, pc, {"lib_dirs": [str(self.rocm / "lib")]},
                               self.root / "pack", "test", 8192, self.root / "data", None)
         cfg = maya.read_json(p)
         self.assertEqual(cfg["backend"], "hip")
         self.assertEqual(cfg["gpu"], [0])
-        self.assertEqual(cfg["env"]["STRATA_GLM_SPLIT"], "0")
-        self.assertEqual(cfg["env"]["STRATA_GLM_RESERVE_MB"], "4096")
+        self.assertEqual(cfg["env"]["MAYA_GLM_SPLIT"], "0")
+        self.assertEqual(cfg["env"]["MAYA_GLM_RESERVE_MB"], "4096")
         self.assertEqual(cfg["exe"], str(self.root / "build-hip/maya"))
         self.assertNotIn("vision", cfg)
 
@@ -166,42 +166,42 @@ class HipSetupTests(unittest.TestCase):
     def test_config_prompt_defaults_and_tuning_table(self):
         tables = self.root / "tools/hip"
         tables.mkdir(parents=True)
-        (tables / "gfx1100-glm-hipblaslt-100202.txt").write_text("STRATA_HIPBLASLT_TUNING_V1 gfx1100 100202\n")
-        (tables / "gfx1201-glm-hipblaslt-100202.txt").write_text("STRATA_HIPBLASLT_TUNING_V1 gfx1201 100202\n")
-        (tables / "gfx1100-glm-hipblaslt-100401.txt").write_text("STRATA_HIPBLASLT_TUNING_V1 gfx1100 100401\n")
+        (tables / "gfx1100-glm-hipblaslt-100202.txt").write_text("MAYA_HIPBLASLT_TUNING_V1 gfx1100 100202\n")
+        (tables / "gfx1201-glm-hipblaslt-100202.txt").write_text("MAYA_HIPBLASLT_TUNING_V1 gfx1201 100202\n")
+        (tables / "gfx1100-glm-hipblaslt-100401.txt").write_text("MAYA_HIPBLASLT_TUNING_V1 gfx1100 100401\n")
         # a second table for one version (another build's solution numbers) comes after that version's own file
-        (tables / "gfx1100-glm-hipblaslt-100401-b.txt").write_text("STRATA_HIPBLASLT_TUNING_V1 gfx1100 100401\n")
+        (tables / "gfx1100-glm-hipblaslt-100401-b.txt").write_text("MAYA_HIPBLASLT_TUNING_V1 gfx1100 100401\n")
         pc = maya.check_pc(self.a)
-        self.a.env = ["STRATA_GLM_PREFILL_SUB=512"]
+        self.a.env = ["MAYA_GLM_PREFILL_SUB=512"]
         p = maya.write_config(self.a, pc, {"lib_dirs": [str(self.rocm / "lib")]},
                               self.root / "pack", "test", 8192, self.root / "data", None)
         env = maya.read_json(p)["env"]
-        self.assertNotIn("STRATA_GLM_PREFILL_CHUNK", env)
-        self.assertEqual(env["STRATA_GLM_PREFILL_SUB"], "512")   # the user's setting wins
-        self.assertEqual(env["STRATA_GLM_PREFILL_MB"], "4096")
-        self.assertEqual(env["STRATA_GLM_RESERVE_MB"], "3072")
-        self.assertEqual(env["STRATA_GLM_RAM_HEADROOM_GB"], "16")
-        self.assertEqual(env["STRATA_HIPBLASLT_TUNING"].split(os.pathsep),
+        self.assertNotIn("MAYA_GLM_PREFILL_CHUNK", env)
+        self.assertEqual(env["MAYA_GLM_PREFILL_SUB"], "512")   # the user's setting wins
+        self.assertEqual(env["MAYA_GLM_PREFILL_MB"], "4096")
+        self.assertEqual(env["MAYA_GLM_RESERVE_MB"], "3072")
+        self.assertEqual(env["MAYA_GLM_RAM_HEADROOM_GB"], "16")
+        self.assertEqual(env["MAYA_HIPBLASLT_TUNING"].split(os.pathsep),
                          [str(tables / "gfx1100-glm-hipblaslt-100202.txt"),
                           str(tables / "gfx1100-glm-hipblaslt-100401.txt"),
                           str(tables / "gfx1100-glm-hipblaslt-100401-b.txt")])
         # Keep the runtime's exact-version choice; an explicit operator table still wins.
-        self.a.env.append("STRATA_HIPBLASLT_TUNING=/selected/table.txt")
+        self.a.env.append("MAYA_HIPBLASLT_TUNING=/selected/table.txt")
         p = maya.write_config(self.a, pc, {"lib_dirs": [str(self.rocm / "lib")]},
                               self.root / "pack", "test", 8192, self.root / "data", None)
-        self.assertEqual(maya.read_json(p)["env"]["STRATA_HIPBLASLT_TUNING"], "/selected/table.txt")
+        self.assertEqual(maya.read_json(p)["env"]["MAYA_HIPBLASLT_TUNING"], "/selected/table.txt")
 
     def test_glm53_tuning_table_only_on_a_glm_dsa_pack(self):
         # GLM-5.3 (glm-dsa) prompt shapes have their own rows (<arch>-glm53-hipblaslt-<version>.txt), after the GLM
         # tables; a GLM-5.3-Flash pack's config never names that file
         tables = self.root / "tools/hip"
         tables.mkdir(parents=True)
-        (tables / "gfx1100-glm-hipblaslt-100202.txt").write_text("STRATA_HIPBLASLT_TUNING_V1 gfx1100 100202\n")
-        (tables / "gfx1100-glm53-hipblaslt-100202.txt").write_text("STRATA_HIPBLASLT_TUNING_V1 gfx1100 100202\n")
+        (tables / "gfx1100-glm-hipblaslt-100202.txt").write_text("MAYA_HIPBLASLT_TUNING_V1 gfx1100 100202\n")
+        (tables / "gfx1100-glm53-hipblaslt-100202.txt").write_text("MAYA_HIPBLASLT_TUNING_V1 gfx1100 100202\n")
         pc = maya.check_pc(self.a)
         flash = maya.write_config(self.a, pc, {"lib_dirs": [str(self.rocm / "lib")]},
                                   self.root / "pack", "test", 8192, self.root / "data", None)
-        self.assertEqual(maya.read_json(flash)["env"]["STRATA_HIPBLASLT_TUNING"].split(os.pathsep),
+        self.assertEqual(maya.read_json(flash)["env"]["MAYA_HIPBLASLT_TUNING"].split(os.pathsep),
                          [str(tables / "gfx1100-glm-hipblaslt-100202.txt")])
         pack53 = self.root / "pack53"
         pack53.mkdir()
@@ -209,7 +209,7 @@ class HipSetupTests(unittest.TestCase):
                                           "mtp 1, indexer full 21\n")
         g53 = maya.write_config(self.a, pc, {"lib_dirs": [str(self.rocm / "lib")]},
                                 pack53, "test53", 8192, self.root / "data", None)
-        self.assertEqual(maya.read_json(g53)["env"]["STRATA_HIPBLASLT_TUNING"].split(os.pathsep),
+        self.assertEqual(maya.read_json(g53)["env"]["MAYA_HIPBLASLT_TUNING"].split(os.pathsep),
                          [str(tables / "gfx1100-glm-hipblaslt-100202.txt"),
                           str(tables / "gfx1100-glm53-hipblaslt-100202.txt")])
 
@@ -243,13 +243,13 @@ class HipSetupTests(unittest.TestCase):
         tables = self.root / "tools/hip"
         tables.mkdir(parents=True)
         for v in ("100202", "100401"):
-            (tables / f"gfx1100-glm-hipblaslt-{v}.txt").write_text(f"STRATA_HIPBLASLT_TUNING_V1 gfx1100 {v}\n")
+            (tables / f"gfx1100-glm-hipblaslt-{v}.txt").write_text(f"MAYA_HIPBLASLT_TUNING_V1 gfx1100 {v}\n")
         pc = maya.check_pc(self.a)
         for sep in (";", ":"):
             with self.subTest(sep=sep), patch.object(maya.os, "pathsep", sep):
                 p = maya.write_config(self.a, pc, {"lib_dirs": [str(self.rocm / "lib")]},
                                       self.root / "pack", "test", 8192, self.root / "data", None)
-                self.assertEqual(maya.read_json(p)["env"]["STRATA_HIPBLASLT_TUNING"],
+                self.assertEqual(maya.read_json(p)["env"]["MAYA_HIPBLASLT_TUNING"],
                                  sep.join(str(tables / f"gfx1100-glm-hipblaslt-{v}.txt")
                                           for v in ("100202", "100401")))
 
@@ -263,8 +263,8 @@ class HipSetupTests(unittest.TestCase):
             p = maya.write_config(self.a, pc, {}, self.root / "pack", "test", 8192, self.root / "data", None)
             cfg = maya.read_json(p)
             self.assertEqual(cfg["gpu"], [1, 3])
-            self.assertEqual(cfg["env"]["STRATA_GLM_PARALLEL_LOAD"], "0")
-            self.assertNotIn("STRATA_GLM_SPLIT", cfg["env"])
+            self.assertEqual(cfg["env"]["MAYA_GLM_PARALLEL_LOAD"], "0")
+            self.assertNotIn("MAYA_GLM_SPLIT", cfg["env"])
         self.a.gpus = None
         self.a.gpu = 3
         self.assertEqual(maya.check_pc(self.a)["gpus"], [self.gpus[3]])
@@ -276,7 +276,7 @@ class HipSetupTests(unittest.TestCase):
         tables = self.root / "tools/hip"
         tables.mkdir(parents=True)
         table = tables / "gfx1151-glm-hipblaslt-100202.txt"
-        table.write_text("STRATA_HIPBLASLT_TUNING_V1 gfx1151 100202\n")
+        table.write_text("MAYA_HIPBLASLT_TUNING_V1 gfx1151 100202\n")
         pc = maya.check_pc(self.a)
         self.assertEqual(pc["gpus"], [self.gpus[3]])
         self.assertTrue(maya.hip_unified_memory(pc["gpus"][0]))
@@ -285,15 +285,15 @@ class HipSetupTests(unittest.TestCase):
                 p = maya.write_config(self.a, pc, {}, self.root / "pack", "test", 8192,
                                       self.root / "data", None)
                 env = maya.read_json(p)["env"]
-                self.assertEqual(env["STRATA_GLM_SPLIT"], "0")
-                self.assertEqual(env["STRATA_GLM_RESERVE_MB"], "1024")
-                self.assertEqual(env["STRATA_GLM_RAM_HEADROOM_GB"], "16")
-                self.assertEqual(env["STRATA_GLM_PREFILL_SUB"], "1024")
-                self.assertEqual(env["STRATA_GLM_PREFILL_MB"], budget)
-                self.assertEqual(env["STRATA_HIPBLASLT_TUNING"], str(table))
-                self.assertNotIn("STRATA_GLM_POOL_GB", env)
-                self.assertNotIn("STRATA_GLM_RAM_GB", env)
-                self.assertNotIn("STRATA_GLM_PREFILL_CHUNK", env)
+                self.assertEqual(env["MAYA_GLM_SPLIT"], "0")
+                self.assertEqual(env["MAYA_GLM_RESERVE_MB"], "1024")
+                self.assertEqual(env["MAYA_GLM_RAM_HEADROOM_GB"], "16")
+                self.assertEqual(env["MAYA_GLM_PREFILL_SUB"], "1024")
+                self.assertEqual(env["MAYA_GLM_PREFILL_MB"], budget)
+                self.assertEqual(env["MAYA_HIPBLASLT_TUNING"], str(table))
+                self.assertNotIn("MAYA_GLM_POOL_GB", env)
+                self.assertNotIn("MAYA_GLM_RAM_GB", env)
+                self.assertNotIn("MAYA_GLM_PREFILL_CHUNK", env)
 
     def test_glm53_on_a_windows_apu_keeps_8_gb_of_ram_headroom(self):
         # GLM-5.3 (glm-dsa) on a Windows APU: 8 GB of headroom (the engine caps the tier by Windows' shared GPU memory);
@@ -308,16 +308,16 @@ class HipSetupTests(unittest.TestCase):
         for win, pack, want in ((True, pack53, "8"), (True, self.root / "pack", "16"), (False, pack53, "16")):
             with self.subTest(win=win, pack=pack.name), patch.object(maya, "WIN", win):
                 p = maya.write_config(self.a, pc, {}, pack, "test", 8192, self.root / "data", None)
-                self.assertEqual(maya.read_json(p)["env"]["STRATA_GLM_RAM_HEADROOM_GB"], want)
+                self.assertEqual(maya.read_json(p)["env"]["MAYA_GLM_RAM_HEADROOM_GB"], want)
 
     def test_strix_halo_explicit_settings_win(self):
         self.gpus.append({"index": 3, "arch": "gfx1151", "vendor": "amd",
                           "name": "Radeon 8060S", "vram_gb": 112})
         self.a.gpu = 3
-        explicit = {"STRATA_GLM_RESERVE_MB": "2048", "STRATA_GLM_RAM_HEADROOM_GB": "8",
-                    "STRATA_GLM_POOL_GB": "84", "STRATA_GLM_RAM_GB": "4",
-                    "STRATA_GLM_PREFILL_SUB": "512", "STRATA_GLM_PREFILL_MB": "3072",
-                    "STRATA_HIPBLASLT_TUNING": "/custom/table.txt"}
+        explicit = {"MAYA_GLM_RESERVE_MB": "2048", "MAYA_GLM_RAM_HEADROOM_GB": "8",
+                    "MAYA_GLM_POOL_GB": "84", "MAYA_GLM_RAM_GB": "4",
+                    "MAYA_GLM_PREFILL_SUB": "512", "MAYA_GLM_PREFILL_MB": "3072",
+                    "MAYA_HIPBLASLT_TUNING": "/custom/table.txt"}
         self.a.env = [f"{k}={v}" for k, v in explicit.items()]
         p = maya.write_config(self.a, maya.check_pc(self.a), {}, self.root / "pack", "test", 8192,
                               self.root / "data", None)
@@ -330,8 +330,8 @@ class HipSetupTests(unittest.TestCase):
         p = maya.write_config(self.a, maya.check_pc(self.a), {}, self.root / "pack", "test", 8192,
                               self.root / "data", None)
         self.assertEqual(maya.read_json(p)["env"], {
-            "STRATA_GLM_SPLIT": "0", "STRATA_GLM_RESERVE_MB": "3072", "STRATA_GLM_RAM_HEADROOM_GB": "16",
-            "STRATA_GLM_PREFILL_SUB": "1024", "STRATA_GLM_PREFILL_MB": "4096"})
+            "MAYA_GLM_SPLIT": "0", "MAYA_GLM_RESERVE_MB": "3072", "MAYA_GLM_RAM_HEADROOM_GB": "16",
+            "MAYA_GLM_PREFILL_SUB": "1024", "MAYA_GLM_PREFILL_MB": "4096"})
         self.assertFalse(maya.hip_unified_memory(self.gpus[1]))
 
     def test_hip_build_enables_mmq_and_never_cuda(self):
@@ -434,7 +434,7 @@ class HipSetupTests(unittest.TestCase):
         # A stale CUDA executable in a HIP config must not select the CUDA build.
         cfg = {"exe": str(self.root / "build/maya"), "args": ["--max-context", "16384"],
                "tokenizer": str(tp), "gpu": [0] if gpu is None else gpu,
-               "env": {"STRATA_GLM_PREFILL_SUB": "512", "STRATA_GLM_RAM_GB": "60"},
+               "env": {"MAYA_GLM_PREFILL_SUB": "512", "MAYA_GLM_RAM_GB": "60"},
                "lib_dirs": [str(self.rocm / "lib")]}
         if backend == "hip":
             cfg["backend"] = backend
@@ -474,8 +474,8 @@ class HipSetupTests(unittest.TestCase):
         self.assertEqual(env["HIP_VISIBLE_DEVICES"], "1,0")
         self.assertNotIn("CUDA_VISIBLE_DEVICES", env)
         self.assertNotIn("CUDA_DEVICE_ORDER", env)
-        self.assertEqual(env["STRATA_GLM_PREFILL_SUB"], "512")
-        self.assertEqual(env["STRATA_GLM_RAM_GB"], "60")
+        self.assertEqual(env["MAYA_GLM_PREFILL_SUB"], "512")
+        self.assertEqual(env["MAYA_GLM_RAM_GB"], "60")
         self.assertEqual(env["LD_LIBRARY_PATH"], str(self.rocm / "lib"))
         self.assertIn("GPUs: R9700 32 GB, RX 7900 XT 20 GB", text)
         self.assertIn("GPUs [1, 0]", text)
@@ -1048,7 +1048,7 @@ class WindowsHipSetupTests(unittest.TestCase):
     def test_windows_apu_config(self):
         tables = self.root / "tools/hip"
         tables.mkdir(parents=True)
-        (tables / "gfx1151-glm-hipblaslt-100202.txt").write_text("STRATA_HIPBLASLT_TUNING_V1 gfx1151 100202\n")
+        (tables / "gfx1151-glm-hipblaslt-100202.txt").write_text("MAYA_HIPBLASLT_TUNING_V1 gfx1151 100202\n")
         with patch.dict(os.environ, {"ROCM_PATH": str(self.rocm)}):
             pc = maya.check_pc(self.a)
         p = maya.write_config(self.a, pc, {"lib_dirs": [str(self.rocm / "bin")]}, self.root / "pack", "Maya-L", 32768,
@@ -1058,11 +1058,11 @@ class WindowsHipSetupTests(unittest.TestCase):
         self.assertEqual((cfg["backend"], cfg["gpu"], cfg["exe"]), ("hip", [0], str(self.root / "build-hip/maya.exe")))
         self.assertEqual(cfg["lib_dirs"], [str(self.rocm / "bin")])
         env = cfg["env"]
-        self.assertEqual(env["STRATA_GLM_RESERVE_MB"], "3072")    # the desktop runs on the APU's GPU too
-        self.assertEqual(env["STRATA_GLM_PREFILL_MB"], "6144")    # 32 GB Windows + 96 GB the GPU's
-        self.assertEqual(env["STRATA_GLM_PREFILL_SUB"], "1024")
-        self.assertEqual(env["STRATA_GLM_SPLIT"], "0")
-        self.assertNotIn("STRATA_GLM_POOL_GB", env)
+        self.assertEqual(env["MAYA_GLM_RESERVE_MB"], "3072")    # the desktop runs on the APU's GPU too
+        self.assertEqual(env["MAYA_GLM_PREFILL_MB"], "6144")    # 32 GB Windows + 96 GB the GPU's
+        self.assertEqual(env["MAYA_GLM_PREFILL_SUB"], "1024")
+        self.assertEqual(env["MAYA_GLM_SPLIT"], "0")
+        self.assertNotIn("MAYA_GLM_POOL_GB", env)
 
 
 class Vs2026Hint(unittest.TestCase):

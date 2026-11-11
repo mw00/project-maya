@@ -297,7 +297,7 @@ int main(int argc, char** argv) {
                 outp[(size_t) t * E + e] = (float) acc;
             }
     };
-    const char* dd = getenv("STRATA_GLM_DFLASH_DUMP");
+    const char* dd = getenv("MAYA_GLM_DFLASH_DUMP");
     const auto cmp = [&](const char* name, const std::vector<float>& ref, size_t n) {
         if (dd == nullptr) return;
         std::vector<float> g(n);

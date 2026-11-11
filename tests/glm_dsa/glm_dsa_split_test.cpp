@@ -126,8 +126,8 @@ int main() {
         std::string err;
         const bool ok = sc::glm_split_bounds_ok(g, {27, 54}, err);
         check(!ok && err.find("layer 27") != std::string::npos && err.find("26 or 30") != std::string::npos,
-              "STRATA_GLM_SPLIT=27,54 refused naming 26 or 30: " + err.substr(0, 60) + "...");
-        check(sc::glm_split_bounds_ok(g, {26, 54}, err), "STRATA_GLM_SPLIT=26,54 accepted");
+              "MAYA_GLM_SPLIT=27,54 refused naming 26 or 30: " + err.substr(0, 60) + "...");
+        check(sc::glm_split_bounds_ok(g, {26, 54}, err), "MAYA_GLM_SPLIT=26,54 accepted");
         // the default bounds: 2 GPUs n_layers / 2 + 2 = 41, 3 GPUs the proportional split's
         check(sc::glm_snap_bounds(g, {41}) == std::vector<int>{42}, "2 GPUs: default 41 snaps to 42");
         check(sc::glm_snap_bounds(g, {27, 53}) == std::vector<int>{26, 54}, "3 GPUs: {27, 53} -> {26, 54}");
@@ -154,8 +154,8 @@ int main() {
                              const V& gpu = {}) { return sc::glm_cpu_pool_ids(gg, n, env, nodes, gpu); };
         check(ids(g, 3, nullptr) == V({0, 0, 0}) && ids(g, 3, "0") == V({0, 1, 2}) && ids(g, 2, nullptr) == V({0, 1}) &&
                   ids(g, 2, "1") == V({0, 0}) && ids(g, 1, "1") == V({0}) && ids(g, 3, "") == V({0, 0, 0}),
-              "pool rule: one shared pool for 3+ parts, STRATA_GLM_CPU_SHARED overrides");
-        // review fix: the planner reads STRATA_GLM_CPU_SHARED as the runtime does (glmtier::lane_pool_mode)
+              "pool rule: one shared pool for 3+ parts, MAYA_GLM_CPU_SHARED overrides");
+        // review fix: the planner reads MAYA_GLM_CPU_SHARED as the runtime does (glmtier::lane_pool_mode)
         check(ids(g, 3, "socket", nodes01, {0, 0, 1}) == V({0, 0, 1}) && ids(g, 3, "2", nodes01, {0, 0, 1}) == V({0, 0, 1}) &&
                   sc::glm_cpu_pool_count(ids(g, 3, "socket", nodes01, {0, 0, 1})) == 2,
               "glm-dsa, 'socket' or '2' on two nodes: a pool per socket, by the GPUs' nodes (2 pools)");

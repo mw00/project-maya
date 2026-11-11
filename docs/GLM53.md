@@ -60,7 +60,9 @@ at Max too - the model's default - with the 32768 budget, as does the shared Cha
 goes only as far as the request's room allows: its `max_tokens`, or the context left, keeps 32768 tokens for the answer
 (so a 64K context, or a long prompt, stays at 32768). A budget saved on the dashboard (Settings > Chat defaults >
 Thinking budget) applies at every level, Max included. Drafting: its MTP block (DFlash2 is not offered for it). Several
-requests at once (`--parallel`) are answered one after another for now. Turbo is not offered for it yet.
+requests at once (`--parallel`) are answered one after another for now. Turbo has its own setting for it:
+the route affinity (`MAYA_GLM_ROUTE_AFFINITY=0.2`, about 22-25% faster decoding; it changes the answers) and a
+32K context, none of GLM-5.3-Flash's expert skips.
 
 ## The APIs
 

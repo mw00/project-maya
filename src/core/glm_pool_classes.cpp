@@ -46,7 +46,7 @@ int glm_pool_merge_classes(std::vector<int>& layer_class, std::vector<size_t>& s
         layers[(size_t) keep] = l;
         for (int& c : layer_class)
             if (c > keep) c = keep;
-        std::fprintf(stderr, "glm pool classes: %d expert size classes folded to %d (STRATA_GLM_POOL_CLASSES)\n", n,
+        std::fprintf(stderr, "glm pool classes: %d expert size classes folded to %d (MAYA_GLM_POOL_CLASSES)\n", n,
                      cap);
     }
     const int out = (int) stride.size();

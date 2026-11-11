@@ -1901,10 +1901,10 @@ bool rdna_wmma_device() {
     return c == 1;
 }
 
-// STRATA_GLMD_PF_RDNA=0 keeps every device on the F32 attention kernel (A/B; the scorer: STRATA_GLMD_IDX_WMMA=0)
+// MAYA_GLMD_PF_RDNA=0 keeps every device on the F32 attention kernel (A/B; the scorer: MAYA_GLMD_IDX_WMMA=0)
 bool mla_prompt_rdna_ok() {
     static const bool off = [] {
-        const char* v = std::getenv("STRATA_GLMD_PF_RDNA");
+        const char* v = std::getenv("MAYA_GLMD_PF_RDNA");
         return v != nullptr && v[0] == '0';
     }();
     return !off && rdna_wmma_device();

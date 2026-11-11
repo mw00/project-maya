@@ -35,7 +35,7 @@ void iq_embed_rows(int ggml_type, const void* table, size_t row_bytes, const int
 void iq_dequant_gu_f16(int ggml_type, const void* gate, const void* up, int64_t n_ff, int64_t n_embd, uint16_t* dst,
                        void* stream);
 
-/// The grouped WMMA launches' by-value weight table (the Volta prompt experts, STRATA_PF_WMMA): expert e's gate/up
+/// The grouped WMMA launches' by-value weight table (the Volta prompt experts, MAYA_PF_WMMA): expert e's gate/up
 /// matrix at gu[e], its down matrix at dn[e].  The prompt path's group size (16) is the table's capacity.
 constexpr int kGroupedWeightTableMax = 16;
 struct GroupedWeightTable {

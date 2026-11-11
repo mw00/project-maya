@@ -1,4 +1,4 @@
-# glm-dsa wave 8, B14.9: the lockstep 4-row CPU decode GEMV for the CPU expert lane (STRATA_GLM_LANE_ROW4=1).
+# glm-dsa wave 8, B14.9: the lockstep 4-row CPU decode GEMV for the CPU expert lane (MAYA_GLM_LANE_ROW4=1).
 #
 # glm_lane_row4.cpp joins strata_kernels_cpu next to Maya's native_expert.cpp (whose nt = 1 split-row functions call
 # its two hooks, STRATA-EDITS.txt) on every native-experts build, so it exists exactly when the ggml-cpu path does.

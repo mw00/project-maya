@@ -235,7 +235,7 @@ arguments, `--parallel 4`, no `--dflash` - the drafter is not used with it - and
 MAYA_CONFIG=$PWD/maya-maya-s-v2-iq2_xxs-parallel4.json ./serve-maya.sh
 ```
 
-Measured with the engine's own multi bench (`STRATA_GLM_MULTI_BENCH=4,512,256`: four synthetic 512-token prompts,
+Measured with the engine's own multi bench (`MAYA_GLM_MULTI_BENCH=4,512,256`: four synthetic 512-token prompts,
 256 greedy tokens each, sequence 0 alone first as the reference):
 
 | | tokens/s | |

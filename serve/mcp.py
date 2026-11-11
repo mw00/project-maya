@@ -124,7 +124,7 @@ class StdioTransport:
             line = raw.decode("utf-8", "replace").rstrip()
             if line:
                 self.stderr.append(line)
-                if os.environ.get("STRATA_DEBUG"):
+                if os.environ.get("MAYA_DEBUG"):
                     print(f"[mcp {self.name}] {line}", flush=True)
 
     def _read(self):

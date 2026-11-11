@@ -1,6 +1,6 @@
 # glm-dsa glm-dsa tests (B0.12). Included from cmake/strata.cmake when STRATA_BUILD_TESTS is on.
 # GPU tests carry the label "gpu"; tests needing the real GLM-5.3 pack carry "realpack" and skip themselves
-# unless STRATA_TEST_PACK is set.
+# unless MAYA_TEST_PACK is set.
 if((STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP) AND TARGET strata_engine)
   add_executable(glmd_stub_test tests/glm_dsa/glmd_stub_test.cpp)
   target_link_libraries(glmd_stub_test PRIVATE strata_engine)

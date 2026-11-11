@@ -1,5 +1,5 @@
 #pragma once
-// Several conversations drafting with the NextN (MTP) block at once (STRATA_GLM_MULTI_MTP, glm_mtp_rows.cu): the
+// Several conversations drafting with the NextN (MTP) block at once (MAYA_GLM_MULTI_MTP, glm_mtp_rows.cu): the
 // host-side rules of a batched verify step, kept apart so they can be tested without a GPU.
 //
 // A conversation's WINDOW in a step is the token it feeds (the last one it wrote) and its drafts: 1 + d rows at

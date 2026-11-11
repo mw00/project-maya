@@ -21,7 +21,7 @@ Maya-S with the weights every token uses in 4-bit instead of 6-bit, for GPUs wit
 ## Speed
 
 One Tesla V100 32 GB, 64 GB RAM, the same engine for both models (`--bench`-style: five questions, 256 tokens each).
-"24 GB" is the same card limited to 23.5 GB (`STRATA_GLM_VRAM_GB=23.5`):
+"24 GB" is the same card limited to 23.5 GB (`MAYA_GLM_VRAM_GB=23.5`):
 
 | | Maya-S | Maya-S24 |
 | --- | ---: | ---: |

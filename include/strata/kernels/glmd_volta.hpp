@@ -3,12 +3,12 @@
 // These are ALTERNATIVES to the simple glmd kernels of glmd_fast.hpp (mla2, topk) and to the CUDA-core indexer
 // scorer; the simple kernels stay the default.  Each one is selected by its own environment switch (read once per
 // process, see the *_enabled() functions) for the kernel tests' dispatchers below:
-//   STRATA_GLMD_FUSED_MLA=1   mla_auto() runs mla_fused() (B10.2) instead of mla2() when the shape is supported
-//   STRATA_GLMD_IDX_WMMA=1    idx_score() runs the WMMA scorer (B10.3) at T > 1 or n_kv > kIdxWmmaMinDecode
-//   STRATA_GLMD_FUSED_SPLIT=n split count of mla_fused (default kFusedSplitDefault)
+//   MAYA_GLMD_FUSED_MLA=1   mla_auto() runs mla_fused() (B10.2) instead of mla2() when the shape is supported
+//   MAYA_GLMD_IDX_WMMA=1    idx_score() runs the WMMA scorer (B10.3) at T > 1 or n_kv > kIdxWmmaMinDecode
+//   MAYA_GLMD_FUSED_SPLIT=n split count of mla_fused (default kFusedSplitDefault)
 // The FORWARD does not use these dispatchers or their *_enabled() readers: it decides through the decode policy
-// (glmd_decode_policy.hpp: STRATA_GLMD_IDX_WMMA / STRATA_GLMD_TOPK_MB are auto / 1 / 0 there, auto when unset), and
-// the index-key dtype (STRATA_GLM_IDX_FP16, B10.8: dsa_prep writes FP16 keys when DsaPrep::ik_f16 is set) comes from
+// (glmd_decode_policy.hpp: MAYA_GLMD_IDX_WMMA / MAYA_GLMD_TOPK_MB are auto / 1 / 0 there, auto when unset), and
+// the index-key dtype (MAYA_GLM_IDX_FP16, B10.8: dsa_prep writes FP16 keys when DsaPrep::ik_f16 is set) comes from
 // the state layout (GlmStateLayout::ik_bytes).
 // Every kernel has a CPU twin in glmd::vtwin (src/core/glm_dsa_cpu_volta_twin.cpp) that runs the same algorithm
 // (tiling, split, selection, accumulation order where the hardware lets it be reproduced); the CPU test
@@ -90,7 +90,7 @@ size_t mla_fused_work_bytes(int n_head, int kv_lora, int qk_rope, int max_sel, i
 /// % 8 == 0 (BF16), v_head % 32 == 0, w_type BF16 or Q8_0.
 bool mla_fused_supported(int n_head, int qk_nope, int qk_rope, int kv_lora, int v_head, int w_type);
 bool mla_fused(const FusedMla& a, void* stream);
-/// STRATA_GLMD_FUSED_MLA=1 (read once); fused_split_default(): STRATA_GLMD_FUSED_SPLIT or kFusedSplitDefault.
+/// MAYA_GLMD_FUSED_MLA=1 (read once); fused_split_default(): MAYA_GLMD_FUSED_SPLIT or kFusedSplitDefault.
 bool fused_mla_enabled();
 int fused_split_default();
 /// The dispatcher B4.6 calls: mla_fused() when fused_mla_enabled() and the shape is supported (the BF16 Mla2
@@ -138,7 +138,7 @@ constexpr bool idx_wmma_shape_rule(int idx_heads, int idx_dim) {
 bool idx_score_wmma_supported(int idx_heads, int idx_dim);
 bool idx_score_wmma(const IdxScoreWmma& a, void* stream);
 bool idx_score_simple(const IdxScoreWmma& a, void* stream);
-/// STRATA_GLMD_IDX_WMMA=1 (read once; off when unset).  The kernel tests' dispatcher only: the forward decides through
+/// MAYA_GLMD_IDX_WMMA=1 (read once; off when unset).  The kernel tests' dispatcher only: the forward decides through
 /// the decode policy, where the same switch defaults to auto (glmd_decode_policy.hpp).
 bool idx_wmma_enabled();
 /// WMMA when idx_wmma_enabled() and (T > 1 or n_kv > kIdxWmmaMinDecode) and the shape is supported, else simple.

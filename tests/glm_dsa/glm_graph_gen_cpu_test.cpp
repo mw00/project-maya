@@ -105,7 +105,7 @@ void key_logic() {
     CHECK(G.captures == before + 2, "crossing p + 1 > top_k re-captures");
 }
 
-// review fix: several sequences (STRATA_GLM_SEQS / --parallel) bind their own state arenas; the cache keeps a graph
+// review fix: several sequences (MAYA_GLM_SEQS / --parallel) bind their own state arenas; the cache keeps a graph
 // per (part, state) up to the sequence count, so alternating sequences replay instead of re-capturing every token
 void sequences() {
     MockGraphs G;

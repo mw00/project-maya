@@ -4,7 +4,7 @@
 // covers BF16 (narrowed), Q4_0, Q5_0, Q8_0, IQ4_NL, Q3_K..Q6_K, IQ4_XS, the i-quants IQ2_XXS / IQ2_XS / IQ3_XXS /
 // IQ3_S / IQ2_S / IQ1_M and Maya's type 42; Maya's prefill_setup admits only BF16 and the dequant_bf16 table, so the
 // i-quants are taken on glm-dsa only (glmpf::f16_covers). The glm-dsa pack (tools/strata/glm_dsa_pack.py
-// plan_tensor) can also leave F16, Q4_1, Q5_1 (STRATA_PACK_NATIVE32), Q2_K and IQ1_S native; those five are glm-dsa's:
+// plan_tensor) can also leave F16, Q4_1, Q5_1 (MAYA_PACK_NATIVE32), Q2_K and IQ1_S native; those five are glm-dsa's:
 // decoded here (F16 / Q4_1 / Q5_1 / Q2_K, ggml's dequantize_row_* order and float math) or by iq_dequant_f16 (IQ1_S),
 // on glm-dsa only (Flash keeps Maya's set: bit-identical). Any other type is refused with refusal() and the prompt
 // runs token by token. tools/strata/test_prefill_types.py checks these lists against tools/strata/type_coverage.py's tables and the

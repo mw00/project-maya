@@ -57,7 +57,7 @@ class _Glm53Api(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         # (each part undone by a class cleanup as soon as it exists: a start that fails half-way leaves nothing behind)
-        env_patch = mock.patch.dict(os.environ, {"STRATA_GPU_RELEASE_S": "0"})
+        env_patch = mock.patch.dict(os.environ, {"MAYA_GPU_RELEASE_S": "0"})
         env_patch.start()
         cls.addClassCleanup(env_patch.stop)
         tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=WIN)

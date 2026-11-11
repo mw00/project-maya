@@ -5,7 +5,7 @@
 //   res_read(R, previous FFN out, attn_norm) -> the mixer (fast_dsa) -> res_read(R, mixer, ffn_norm) -> the FFN
 // and once at the end of the part res_close(R, last FFN out), so the residual at state_ is complete for the hop or the
 // head (the same convention as the mHC path: "the residual lives at state_").  R is updated in place (no ping-pong).
-// glm-dsa B10.1: with STRATA_GLM_DSA_GRAPHS=1 the whole loop (and the close) is one captured CUDA graph per part, replayed
+// glm-dsa B10.1: with MAYA_GLM_DSA_GRAPHS=1 the whole loop (and the close) is one captured CUDA graph per part, replayed
 // per token (glmdsa::graph_prepare / graph_run, src/core/glm_dsa_mixer.cu); the MoE CPU-lane waits stay device spins
 // inside it, as Maya's KDA layer graphs keep them.
 #include "glm_residual.hpp"
@@ -197,7 +197,7 @@ bool Glm5Model::fast_window_layers_plain(int64_t p0, int T, std::string& err) {
         if (err.empty()) err = "glm window: the glm-dsa mixer is not set up on this part";
         return false;
     }
-    static const bool prof = getenv("STRATA_GLM_WIN_PROF") != nullptr;
+    static const bool prof = getenv("MAYA_GLM_WIN_PROF") != nullptr;
     const auto mark = [&](const char* nm) {
         if (prof) W.mark(nm, s);
     };
@@ -263,10 +263,10 @@ bool Glm5Model::fast_window_layers_plain(int64_t p0, int T, std::string& err) {
     mark("start");
     // (fast_window_layers' staggered row groups and their switches)
     static const bool stagger_env = [] {
-        const char* v = getenv("STRATA_GLM_WIN_STAGGER");
+        const char* v = getenv("MAYA_GLM_WIN_STAGGER");
         return v == nullptr || std::atoi(v) != 0;
     }();
-    static const bool batch_env = glmfast::off_by_default_on_amd("STRATA_GLM_WIN_BATCH");
+    static const bool batch_env = glmfast::off_by_default_on_amd("MAYA_GLM_WIN_BATCH");
     const bool stagger = stagger_env && batch_env && T >= 2 && !W.per_token && W.mplan_ptr != nullptr;
     if (stagger) {
         const int ka = (T + 1) / 2, kb = T - ka;

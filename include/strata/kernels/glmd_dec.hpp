@@ -13,7 +13,7 @@
 // Arithmetic f32 throughout (FP16 latents as staged by mla2, INT8 records decoded to FP16 the same way); the sums are
 // associated differently from mla2's (f32 rounding apart).  kv_lora 512, qk_rope 64, n_head % 16 == 0 (GLM-5.3);
 // other shapes keep mla2's kernels.  Where it runs (glmd_dec.cu, auto_device): every CUDA device it fits; on HIP only
-// the archs it was measured faster on (gfx1151) unless STRATA_GLMD_MLA_DEC=1; 8 heads a block where a block gets
+// the archs it was measured faster on (gfx1151) unless MAYA_GLMD_MLA_DEC=1; 8 heads a block where a block gets
 // 64 KB of shared memory (the AMD GPUs).
 #pragma once
 

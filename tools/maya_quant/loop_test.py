@@ -118,7 +118,7 @@ def main():
                     "--tokens", ",".join(map(str, ids))]
             args += ["--greedy"] if greedy else ["--seed", str(1234 + run), "--temperature", "1.0", "--top-p", "0.95"]
             t0 = time.time()
-            run_kw = dict(cwd=pathlib.Path(a.exe).parents[1], env=dict(os.environ, STRATA_GLM_USAGE="0"))
+            run_kw = dict(cwd=pathlib.Path(a.exe).parents[1], env=dict(os.environ, MAYA_GLM_USAGE="0"))
             if a.save:
                 base = pathlib.Path(a.save) / f"{name}.{'greedy' if greedy else f't1-{run}'}"
                 base.parent.mkdir(parents=True, exist_ok=True)

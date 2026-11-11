@@ -17,7 +17,7 @@ nothing large is committed; data/glm-dsa/ holds only hashes and reference logits
 Gate values (BUILD-PLAN B3.5/B3.6): logits max abs error 1e-4; KL p99 1e-4 with KL taken over the
 reference's top-64 tokens plus a rest bucket.
 
-Opt-in (not part of CI): STRATA_SYNTH_LARGE=1 also generates BIG (~2.3 GB) and WIDE (~1 GB) and runs
+Opt-in (not part of CI): MAYA_SYNTH_LARGE=1 also generates BIG (~2.3 GB) and WIDE (~1 GB) and runs
 the oracle on BIG; tools/strata/glm_dsa_hf_xcheck.py compares against transformers when torch is
 installed.
 
@@ -508,7 +508,7 @@ class HFTransformers(unittest.TestCase):
 
 
 # ============================================================================ large presets (opt-in)
-@unittest.skipUnless(os.environ.get("STRATA_SYNTH_LARGE") == "1", "set STRATA_SYNTH_LARGE=1 (writes ~3.3 GB)")
+@unittest.skipUnless(os.environ.get("MAYA_SYNTH_LARGE") == "1", "set MAYA_SYNTH_LARGE=1 (writes ~3.3 GB)")
 class LargePresets(unittest.TestCase):
     def test_big_and_wide(self):
         with tempfile.TemporaryDirectory() as d:

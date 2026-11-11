@@ -8,7 +8,7 @@
 // (mHC), the KDA recurrence, the DSA indexer and attention against that conversation's caches, and the routed
 // experts (the tiers serve the n routes one after another, as they serve the layers of a token).  So each row's
 // token is the one the token path gives that conversation alone - as long as the tiers hold the same experts
-// (greedy with the CPU lane off: the multi bench compares them).  STRATA_GLM_GROUP_EXPERTS=1 instead routes every row of
+// (greedy with the CPU lane off: the multi bench compares them).  MAYA_GLM_GROUP_EXPERTS=1 instead routes every row of
 // the step first and runs each distinct routed expert once for all the rows that chose it (rows_moe_grouped, the verify
 // window's batched MoE) - each row's output bit for bit the per-row kernels' for it.
 //
@@ -16,12 +16,12 @@
 // card); the per-row scratch the token path's kernels use in between (the conv outputs, the gates, the DSA scores and
 // cells, the experts' h) is the token path's own, used by one row after the other on that part's stream.
 //
-// STRATA_GLM_ROWS_BATCH=1: the residual mixing (mHC) and the KDA recurrence of all the rows in one launch each instead
+// MAYA_GLM_ROWS_BATCH=1: the residual mixing (mHC) and the KDA recurrence of all the rows in one launch each instead
 // of one a row (gf::hc_rows, gf::kda_layers over the rows) - each row with its own scratch (rows_alloc) and the same
 // device functions as the per-row kernels, so its arithmetic is meant to be theirs (glm_rows_kernels_test compares
 // them bitwise).
 //
-// STRATA_GLM_ROWS_ATTN=1: a DSA layer's absorbed attention of all the rows in one launch instead of one a row: wk_b . q
+// MAYA_GLM_ROWS_ATTN=1: a DSA layer's absorbed attention of all the rows in one launch instead of one a row: wk_b . q
 // for every row at once (gf::mla_q_abs), each row's selection (and, streamed, its slot cells) into its own buffers, the
 // split attention of all the rows over their own caches in one launch (gf::mla_attend_rows: a row's blocks on
 // blockIdx.z, so its 64 blocks no longer leave half the card idle), then wv_b . ctx for every row at once
@@ -49,34 +49,34 @@ using glmrows::up256;
 using glmrows::row_at;
 using glmrows::rowq_at;
 using glmrows::image_row_in;
-bool rows_batch_on() {   // STRATA_GLM_ROWS_BATCH=1 (off by default)
+bool rows_batch_on() {   // MAYA_GLM_ROWS_BATCH=1 (off by default)
     static const bool on = [] {
-        const char* v = getenv("STRATA_GLM_ROWS_BATCH");
+        const char* v = getenv("MAYA_GLM_ROWS_BATCH");
         return v != nullptr && std::atoi(v) != 0;
     }();
     return on;
 }
-bool rows_small_on() {   // STRATA_GLM_ROWS_SMALL=1 (off by default)
+bool rows_small_on() {   // MAYA_GLM_ROWS_SMALL=1 (off by default)
     static const bool on = [] {
-        const char* v = getenv("STRATA_GLM_ROWS_SMALL");
+        const char* v = getenv("MAYA_GLM_ROWS_SMALL");
         return v != nullptr && std::atoi(v) != 0;
     }();
     return on;
 }
-bool rows_attn_on() {   // STRATA_GLM_ROWS_ATTN=1 (off by default)
+bool rows_attn_on() {   // MAYA_GLM_ROWS_ATTN=1 (off by default)
     static const bool on = [] {
-        const char* v = getenv("STRATA_GLM_ROWS_ATTN");
+        const char* v = getenv("MAYA_GLM_ROWS_ATTN");
         return v != nullptr && std::atoi(v) != 0;
     }();
     return on;
 }
 }  // namespace
 
-// 8 rows (one a conversation); with STRATA_GLM_MULTI_MTP a group's verify windows, multi_mtp_cap() rows
+// 8 rows (one a conversation); with MAYA_GLM_MULTI_MTP a group's verify windows, multi_mtp_cap() rows
 int Glm5Model::rows_max() { return multi_mtp_setting() > 0 ? multi_mtp_cap() : 8; }
 
 int Glm5Model::split_rows_setting() {
-    const char* v = getenv("STRATA_GLM_SPLIT_ROWS");
+    const char* v = getenv("MAYA_GLM_SPLIT_ROWS");
     return v != nullptr ? std::clamp((int) std::atof(v), 0, rows_max()) : 0;
 }
 
@@ -139,7 +139,7 @@ bool Glm5Model::rows_alloc(std::string& err) {
         S->head_xq = q8(E);
         S->logits = f32(g.n_vocab);
         S->tok = (int*) take(sizeof(int));
-        if (rows_batch_on()) {   // (STRATA_GLM_ROWS_BATCH's own per-row scratch: none with the setting off)
+        if (rows_batch_on()) {   // (MAYA_GLM_ROWS_BATCH's own per-row scratch: none with the setting off)
             for (auto& p : S->kconv) p = f32(DI);
             S->kg1 = f32(DI);
             S->kg2 = f32(DI);
@@ -147,7 +147,7 @@ bool Glm5Model::rows_alloc(std::string& err) {
             S->hc_part = f32(S->hc_part_n);
             S->hc_ctr = take(64);
         }
-        if (attn) {   // (STRATA_GLM_ROWS_ATTN's buffers: none with the setting off)
+        if (attn) {   // (MAYA_GLM_ROWS_ATTN's buffers: none with the setting off)
             S->aq = f32((int64_t) g.n_head * g.kv_lora);
             S->actx = f32((int64_t) g.n_head * g.kv_lora);
             S->acells = (int*) take((size_t) g.n_sel_max() * sizeof(int));
@@ -360,7 +360,7 @@ bool Glm5Model::rows_layers(RowSeq* rw, int n, std::string& err) {
             j[4] = {Ly.g_a, nullptr, S->x, S->ga, nullptr, 1.0f, gf::kTypeBF16, E, g.kda_head_dim};
             j[5] = {Ly.beta, nullptr, S->x, S->beta, nullptr, 1.0f, gf::kTypeBF16, E, g.n_head};
             if (!mv(j, 6, "kda projections")) return false;
-            if (keep_in) {   // (STRATA_GLM_MULTI_MTP: the window rows' inputs, for the commit's replay)
+            if (keep_in) {   // (MAYA_GLM_MULTI_MTP: the window rows' inputs, for the commit's replay)
                 gf::KdaGatherArgs ga;
                 ga.src[0] = S->proj[0];
                 ga.src[1] = S->proj[1];
@@ -525,7 +525,7 @@ bool Glm5Model::rows_dsa(int il, RowSeq* rw, int n, std::string& err) {
                 : gf::MvJob{Ly.idx_q_b, nullptr, S->qr, S->iq, nullptr, 1.0f, gf::kTypeBF16, g.q_lora,
                             g.idx_heads * g.idx_key};
     if (!mv(j2, 2, "dsa q")) return false;
-    // STRATA_GLM_ROWS_ATTN: the attention of every row in one launch (each row's selection into its own buffers).  A
+    // MAYA_GLM_ROWS_ATTN: the attention of every row in one launch (each row's selection into its own buffers).  A
     // verify window's rows of one conversation (consecutive rows) on a streamed layer share its slot pool: one resolve
     // over all their selections then (a resolve never evicts a block it names), not one a row - a row's resolve could
     // evict a block the row before it still has to read.  Rows of one conversation that are not consecutive: one by one
@@ -550,7 +550,7 @@ bool Glm5Model::rows_dsa(int il, RowSeq* rw, int n, std::string& err) {
     if (attn) gf::mla_q_abs(S->q, qd, Ly.k_b, g.n_head, g.qk_nope, g.kv_lora, n, S->aq, ad, s);
     gf::DsaSelectRows sr;   // (with the rows' attention: the rows' selections in one launch, then each one resolved)
     int n_sr = 0;
-    const bool small = attn && rows_small_on();   // (STRATA_GLM_ROWS_SMALL: the rows' scores in one launch too)
+    const bool small = attn && rows_small_on();   // (MAYA_GLM_ROWS_SMALL: the rows' scores in one launch too)
     gf::DsaScoreRows sc;
     int n_sc = 0;
     for (int i = 0; i < n; ++i) {
@@ -600,7 +600,7 @@ bool Glm5Model::rows_dsa(int il, RowSeq* rw, int n, std::string& err) {
         if (n_sc > 0) gf::dsa_score_rows(sc, n_sc, g.idx_key, g.idx_heads, s);
         gf::dsa_select_rows(sr, n_sr, g.idx_kpool, s);
         // KV streaming: each run's blocks resident, its rows' selections in slot rows (resident: the cells themselves);
-        // STRATA_GLM_ROWS_SMALL: the runs' resolves in one launch (each run its own sequence's map)
+        // MAYA_GLM_ROWS_SMALL: the runs' resolves in one launch (each run its own sequence's map)
         gf::KvResolveRows kr;
         int n_kr = 0, kr_row = 0, kr_page = 0;
         for (int i = 0; i < n;) {
@@ -681,7 +681,7 @@ bool Glm5Model::rows_moe(int il, RowSeq* rw, int n, std::string& err) {
     return true;
 }
 
-// STRATA_GLM_GROUP_EXPERTS=1: the n rows' routed experts as the verify window's batched MoE takes a window's tokens
+// MAYA_GLM_GROUP_EXPERTS=1: the n rows' routed experts as the verify window's batched MoE takes a window's tokens
 // (fast_moe_window).  Every row is routed first - into its own plan, fetch sources, disk answer, CPU-lane answer slot
 // (the window's route state, its rows the window's tokens) and its own 8 scratch slots (rows_scr), each row's wait and
 // fetch before the next row's route (the host's answer to a disk miss is one buffer) - then each distinct expert runs
@@ -701,7 +701,7 @@ bool Glm5Model::rows_moe_grouped(int il, int n, std::string& err) {
     const auto& Ly = F->L[(size_t) il];
     const int E = g.n_embd, FFs = g.n_ff_exp * g.n_shared, K = g.n_exp_used;
     if (n < 2) return false;
-    const bool wide = n > F->rows_group && n <= F->rows_scr_rows && F->all_in_vram;   // (STRATA_GLM_MULTI_MTP)
+    const bool wide = n > F->rows_group && n <= F->rows_scr_rows && F->all_in_vram;   // (MAYA_GLM_MULTI_MTP)
     if ((n > F->rows_group && !wide) || F->rows_scr == nullptr || W.mplan_ptr == nullptr || W.tmax < n ||
         (Ly.exl3 && (W.wh == nullptr || !x3::several_ok()))) {
         static std::atomic<bool> told{false};   // (a run with the setting on that never groups should say so; both

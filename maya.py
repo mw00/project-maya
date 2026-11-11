@@ -50,8 +50,8 @@ no tuning step - it balances its own split):
 The tuning (tools/calibrate_glm.py): decode speed measured with a few splits of the RAM-tier
 experts between the CPU and the PCIe link, with fewer and more CPU threads, and - when part of the model is read from
 the SSD - with smaller disk reads, in one engine run (~10-15 minutes, the model loads first); a setting is kept when
-it is more than 3% faster than the engine's own choice.  The result goes into the config's "env" (STRATA_GLM_PCIE_SHARE,
-STRATA_GLM_CPU_LANE, STRATA_GLM_READ_CHUNKS) and into ~/.config/project-maya/calibration.json for this PC, model and
+it is more than 3% faster than the engine's own choice.  The result goes into the config's "env" (MAYA_GLM_PCIE_SHARE,
+MAYA_GLM_CPU_LANE, MAYA_GLM_READ_CHUNKS) and into ~/.config/project-maya/calibration.json for this PC, model and
 context, so a setup again keeps it.  DeepSeek-V4.1-Flash-1017's (tools/calibrate_ds4_tp.py, ./maya.sh --calibrate only):
 decode speed with each --tp that groups the GPUs differently and with fewer CPU threads, an engine start each (~25-40
 minutes on 9 GPUs); a setting is kept when it is more than 5% faster and still reads a long prompt at 60% of the
@@ -993,6 +993,12 @@ def hip_unified_memory(g) -> bool:
         re.search(r"Ryzen AI Max|Radeon(?:\s*\(TM\))?\s+80[4-6]\dS", g.get("name", ""), re.I))
 
 
+def apu_margin_gb(ram: float) -> float:
+    """The memory both engines keep free for Windows / Linux and the other programs on a unified-memory APU,
+    max(8 GB, 10% of the RAM)."""
+    return max(8.0, 0.1 * ram)
+
+
 def hip_reserve_mib(gpus) -> int:
     """The VRAM (MiB) an engine on these AMD GPUs leaves free on each: the desktop runs on them and allocates after
     the engine has filled its expert pool - 3072, but 1024 on a Linux APU (its pool is sized from the RAM it shares;
@@ -1311,7 +1317,7 @@ def check_hip_pc(a, installed=False, text_only=True) -> dict:
         # engines keep free for the others, max(8 GB, 10% of the RAM) - with less, experts stay off the GPU or the
         # other programs run out of memory while the model runs (docs/AMD_MAYA.md, "The page file on a Windows APU")
         pf = S.page_file_gb()
-        need_pf = math.ceil(vram + max(8.0, 0.1 * total))
+        need_pf = math.ceil(vram + apu_margin_gb(total))
         if pf is not None and pf < need_pf:
             warn(f"Windows' page file is {pf:.0f} GB: set it to at least {need_pf} GB ({need_pf * 1024} MB, with that "
                  f"much free disk). Windows charges all of the GPU's memory ({vram:.0f} GB, as HIP reports it) to its "
@@ -1864,6 +1870,53 @@ def choose_family(a, prev: dict) -> str:
     return FAMILIES[pick]
 
 
+# The quant the setup's lists recommend (fit_recommendation): RAM the engines leave the OS (MAYA_GLM_RAM_HEADROOM_GB's
+# default), and the least share of a quant's memory (with its cache) that should sit in GPU memory - below it the
+# decode reads most experts from RAM every token, and a smaller quant of the same model answers faster
+FIT_RAM_HEADROOM_GB = 6.0
+FIT_MIN_VRAM_SHARE = 0.2
+
+
+def fit_memory(gpus: list, ram: float) -> tuple:
+    """(the memory a model's files and caches may take without reading experts from the SSD, of it GPU memory) on a
+    PC with these GPUs (their "vram_gb") and this RAM (GiB, mem_gb's total): VRAM + RAM less FIT_RAM_HEADROOM_GB.  A
+    unified-memory APU (apu_kind: Strix / Gorgon Halo) counts its one memory once - on Linux the GPU's memory is drawn
+    from the RAM (its VRAM figure, a carve-out or the RAM it maps, is part of it: the larger of the two), on Windows
+    the carve-out sits beside the RAM Windows counts (the sum) - and all of it as GPU memory (the GPU reads the RAM at
+    the same speed); a Mac's GPU (metal_gpus: a share of its RAM) as Linux's APU."""
+    vram = sum(float(g.get("vram_gb") or 0) for g in gpus or [])
+    apu = "linux" if any(g.get("vendor") == "apple" for g in gpus or []) else apu_kind(gpus)   # (a Mac: as Linux's)
+    pool = (max(vram, ram) if apu == "linux" else vram + ram) - FIT_RAM_HEADROOM_GB
+    return max(pool, 0.0), (max(pool, 0.0) if apu else vram)
+
+
+def fit_recommendation(sizes: dict, gpus: list, ram: float, kv_gb: float = 0.0, top: str | None = None) -> str:
+    """The quant to recommend among `sizes` ({quant: the VRAM + RAM it takes, GB, the cache aside}, quants of one model)
+    on this PC (fit_memory): no larger than `top` (the family's usual pick; None: any) - the largest whose memory with
+    the default context's cache (kv_gb) fits without reading experts from the SSD and has at least FIT_MIN_VRAM_SHARE
+    of it in GPU memory (no VRAM figure: the largest that fits), else the smallest that fits; none fits: the smallest
+    of all (the SSD streams the rest).  A PC whose RAM does not read: `top` (or the largest)."""
+    pool, gpu = fit_memory(gpus, ram)
+    ladder = sorted((k for k in sizes if top is None or sizes[k] <= sizes[top]), key=lambda k: -sizes[k])
+    if ram <= 0 or pool <= 0:
+        return top or ladder[0]
+    fit = [k for k in ladder if sizes[k] + kv_gb <= pool]
+    if not fit:
+        return min(sizes, key=sizes.get)
+    if gpu <= 0:                                   # (no VRAM figure: by the memory alone)
+        return fit[0]
+    return next((k for k in fit if gpu >= FIT_MIN_VRAM_SHARE * (sizes[k] + kv_gb)), fit[-1])
+
+
+def setup_gpus(a) -> list:
+    """The GPUs a setup's lists size their recommendation by: AMD's on --backend hip, else NVIDIA's; none when the
+    tools do not read."""
+    try:
+        return list((S.amd_gpus() if getattr(a, "backend", None) == "hip" else S.gpus()) or [])
+    except Exception:  # noqa: BLE001 - no GPU tools
+        return []
+
+
 def choose_model(a, models: Path, inst: dict) -> tuple:
     """("download", one of MODELS) or ("local", the model's first .gguf file): --gguf-dir, --model, else asked among
     the downloads - the earlier download is the default.  ("exl3", the folder): --model-dir naming an EXL3 folder of
@@ -1894,7 +1947,18 @@ def choose_model(a, models: Path, inst: dict) -> tuple:
         cards = [g for g in S.gpus() if g.get("vram_gb")]
     except Exception:  # noqa: BLE001 - no NVIDIA tools (AMD): no card-based recommendation
         cards = []
-    rec = "Maya-S24" if cards and all(g["vram_gb"] <= 24.5 for g in cards) and "Maya-S24" in MODELS else opts[0]
+    top = "Maya-S24" if cards and all(g["vram_gb"] <= 24.5 for g in cards) and "Maya-S24" in MODELS else opts[0]
+    # by this PC's VRAM + RAM (fit_recommendation): no larger than that one, Maya-S24 only where it is that one (its
+    # 4-bit attention is for small cards); the cache at the default context sized as GLM-5.3's (G53.KV_BYTES: its
+    # INT8 latent, at least Flash's)
+    try:
+        ram = mem_gb()[0]
+        gpus = metal_gpus() if metal else setup_gpus(a)
+    except Exception:  # noqa: BLE001 - the PC does not read: the usual pick
+        ram, gpus = 0.0, []
+    sizes = {q: MODELS[q]["download_gb"] for q in opts if q in (top, "Maya-XS-IQ1_S") or
+             (q != "Maya-S24" and not is_exl3(q))}
+    rec = fit_recommendation(sizes, gpus, ram, DEFAULT_CONTEXT * G53.KV_BYTES / 2**30, top)
     default = inst["quant"] if inst.get("quant") in MODELS or inst.get("quant") in g53 else rec
     rows = []
     for q in opts:
@@ -1904,11 +1968,17 @@ def choose_model(a, models: Path, inst: dict) -> tuple:
                                                  f"download {m['download_gb']:.1f} GB from Hugging Face"),
                      ("recommended for cards of 24 GB or less" if q == "Maya-S24" else "recommended") if q == rec
                      else None, m["about"]))
+    # GLM-5.3 (744B)'s own recommendation where it lists more than one (fit_recommendation by g53_figures' memory),
+    # at most Maya's own quant (the owner, 2026-11-11): a larger third-party quant is listed, never recommended
+    rec53 = fit_recommendation({q: g53_figures(q)[0] for q in g53}, gpus, ram,
+                               DEFAULT_CONTEXT * G53.KV_BYTES / 2**30,
+                               "GLM-5.3-Maya-XS" if "GLM-5.3-Maya-XS" in g53 else None) if len(g53) > 1 else None
     for q in g53:                                      # GLM-5.3 (744B, glm-dsa): its downloads (hidden)
         m, d = G53_MODELS[q], download_dir(models, q)
         have = all(p.exists() for p in local_shards(m, d))
         rows.append((f"{G53.LABEL} · {Q.glm53_quant(q)}, text only: " +
-                     (f"downloaded, in {d}" if have else f"download {m['download_gb']:.1f} GB from Hugging Face"), None,
+                     (f"downloaded, in {d}" if have else f"download {m['download_gb']:.1f} GB from Hugging Face"),
+                     f"recommended for {G53.SHOWN}" if q == rec53 else None,
                      f"{m['about']}; {g53_memory_note(quant=q)}"))
     rows.append((f"{G53.SHOWN} (744B, text only): GGUF files you already have", None,   # GLM-5.3 (744B, glm-dsa)
                  "Z.ai's GLM-5.3 on the same engine; set up from its GGUF folder with --gguf-dir <folder>"))
@@ -1961,6 +2031,49 @@ def g53_contexts(pc: dict, parallel: int = 1, kv_bytes: int | None = None, reser
              f"its dense weights and the smallest context need more VRAM than these GPUs have ({vram:.0f} GB) - "
              "it may not start"))
     return fit or CONTEXTS[:1]
+
+
+def apu_memory(vram: float, ram: float, linux: bool) -> float:
+    """A unified-memory APU's one memory, as fit_memory counts it: on Linux the GPU's memory is drawn from the RAM
+    (the larger of the two figures), on Windows the carve-out sits beside the RAM Windows counts (the sum)."""
+    return max(vram, ram) if linux else vram + ram
+
+
+def apu_context(vram: float, ram: float, need: float, kv_bytes: int, parallel: int = 1,
+                contexts=CONTEXTS, linux: bool = False) -> int | None:
+    """On a unified-memory APU (hip_unified_memory: the GPU's memory and the RAM are one pool; Windows charges the GPU's
+    carve-out to its commit): the largest context whose cache (`kv_bytes` a position, one a conversation) still leaves
+    the whole model (`need`: VRAM + RAM that keep every expert in memory, g53_figures) in memory - the APU's memory
+    (apu_memory: `linux` counts it once) less what the engines keep free (apu_margin_gb) - so no expert is read from
+    the SSD.  None when the memory does not read or not even the smallest context leaves the model in memory."""
+    if ram <= 0 or need <= 0:
+        return None
+    room = apu_memory(vram, ram, linux) - apu_margin_gb(ram) - need
+    fits = [c for c in contexts if max(1, parallel) * c * kv_bytes / 2**30 <= room]
+    return max(fits) if fits else None
+
+
+def g53_apu_context(pc: dict, plan: dict, quant: str | None, contexts) -> tuple:
+    """(the context to recommend, its one line) for GLM-5.3 on a unified-memory APU (apu_context), else (None, None):
+    the memory measured as everywhere else (check_pc's GPUs, mem_gb)."""
+    gpus = pc.get("gpus") or []
+    if not any(hip_unified_memory(g) for g in gpus):
+        return None, None
+    try:
+        ram = mem_gb()[0]
+    except Exception:  # noqa: BLE001 - no reading of the memory: the usual context
+        return None, None
+    vram, need = sum(g.get("vram_gb") or 0 for g in gpus), g53_figures(quant)[0]
+    linux = apu_kind(gpus) == "linux"
+    rec = apu_context(vram, ram, need, plan["kv_bytes"], plan["parallel"], contexts, linux=linux)
+    pool = apu_memory(vram, ram, linux) - apu_margin_gb(ram)
+    if rec is None:
+        return None, (f"unified memory: about {pool:.0f} GB for the model here, below the ~{need:.0f} GB that keep all "
+                      f"of it in memory - the engine reads some experts from the SSD at any context")
+    kv = max(1, plan["parallel"]) * rec * plan["kv_bytes"] / 2**30
+    return rec, (f"unified memory: {context_label(rec)} recommended - the largest context whose cache (~{kv:.1f} GB) "
+                 f"keeps all of the model (~{need:.0f} GB) in this PC's ~{pool:.0f} GB; a longer one reads experts "
+                 "from the SSD")
 
 
 def g53_cache_plan(a, pc: dict, choice: tuple) -> dict:
@@ -3220,7 +3333,7 @@ def pack_step(a, d: Path, shards: list, llama: Path, quant: str | None = None) -
              "--gguf-dir DIR")
     say("  Writing the index of every tensor, the small float weights (about 1 GB) and the tokenizer; the experts")
     say("  stay in the GGUF files (a few minutes) ...")
-    env = dict(os.environ, STRATA_GGUF_PY=str(llama / "gguf-py"))
+    env = dict(os.environ, MAYA_GGUF_PY=str(llama / "gguf-py"))
     # --compat-bf16: the GLM pack stores the projections its kernels read as BF16 (router, indexer, absorbed MLA,
     # KDA gates) in BF16 even where the GGUF quantized them or keeps them F32 (tools/iq_pack.py GLM5NEXT_BF16)
     run([sys.executable, str(ROOT / "tools" / "iq_pack.py"), "--gguf", str(shards[0]), "--out", str(pack),
@@ -3712,32 +3825,32 @@ def write_config(a, pc, meta, pack: Path, quant: str, ctx: int, models: Path, vi
         cfg["backend"] = "hip"
         # Leave space for the Linux desktop. The engine sizes its prompt chunk from
         # the available prompt-memory budget; forcing 256 here severely slows HIP.
-        hip_env = {"STRATA_GLM_RESERVE_MB": str(hip_reserve_mib(pc["gpus"])), "STRATA_GLM_RAM_HEADROOM_GB": "16"}
+        hip_env = {"MAYA_GLM_RESERVE_MB": str(hip_reserve_mib(pc["gpus"])), "MAYA_GLM_RAM_HEADROOM_GB": "16"}
         gpus = pc["gpus"]
         if len(gpus) == 1:
-            hip_env["STRATA_GLM_SPLIT"] = "0"   # two or more cards: the engine picks the split (and drafts with MTP)
+            hip_env["MAYA_GLM_SPLIT"] = "0"   # two or more cards: the engine picks the split (and drafts with MTP)
         # GLM-5.3 on one APU: one-GPU drafting until the speed calibration measures it (g53_drafting_default)
         drafting = None if dflash is not None else g53_drafting_default(pc, pack, ctx, {**hip_env, **env})
         if drafting is not None:
-            hip_env["STRATA_GLM_MTP_DECODE"] = "1" if drafting["on"] else "0"
+            hip_env["MAYA_GLM_MTP_DECODE"] = "1" if drafting["on"] else "0"
         # Larger prompt sub-batches feed the matrix cores much better (7900 XT: ~250 -> ~410 tok/s); they need
         # a bigger prompt budget, borrowed from the expert pool only while a prompt runs.
         if any(hip_unified_memory(g) for g in gpus):
             if len(gpus) > 1:
                 # Pin the first part's RAM tier before the APU measures the shared memory left.
-                hip_env["STRATA_GLM_PARALLEL_LOAD"] = "0"
+                hip_env["MAYA_GLM_PARALLEL_LOAD"] = "0"
             if WIN and G53.pack_is_glm_dsa(pack):
                 # GLM-5.3 on a Windows APU: the engine already holds its RAM tier within Windows' shared GPU memory
                 # (glm_fast_path's apu_shared_room cap), so 8 GB of headroom is enough - a Radeon 8065S (32 GB of
                 # system RAM) gets a 10.4 GB tier instead of ~3 GB, decode +10% with the same tokens, 7.8 GB still free
-                hip_env["STRATA_GLM_RAM_HEADROOM_GB"] = "8"
+                hip_env["MAYA_GLM_RAM_HEADROOM_GB"] = "8"
             total_ram, _ = mem_gb()
             if WIN:     # Windows counts the GPU's carve-out apart from its RAM, and its desktop runs on that GPU
                 total_ram += sum(g.get("vram_gb", 0) for g in gpus)
-            hip_env.update({"STRATA_GLM_PREFILL_SUB": "1024",
-                            "STRATA_GLM_PREFILL_MB": "6144" if total_ram >= 96 else "4096"})
+            hip_env.update({"MAYA_GLM_PREFILL_SUB": "1024",
+                            "MAYA_GLM_PREFILL_MB": "6144" if total_ram >= 96 else "4096"})
         elif min(g.get("vram_gb", 0) for g in gpus) >= 20:
-            hip_env.update({"STRATA_GLM_PREFILL_SUB": "1024", "STRATA_GLM_PREFILL_MB": "4096"})
+            hip_env.update({"MAYA_GLM_PREFILL_SUB": "1024", "MAYA_GLM_PREFILL_MB": "4096"})
         # Pass every available version per architecture: the engine's existing header guard selects the
         # table matching each card and its installed hipBLASLt, or keeps plain hipBLAS when none matches.
         # A version can have more than one table (<version>.txt, then <version>-b.txt, ...: builds of one hipBLASLt
@@ -3754,7 +3867,7 @@ def write_config(a, pc, meta, pack: Path, quant: str, ctx: int, models: Path, vi
                 tables.extend(str(path) for path in found)
         if tables:
             # the OS's path-list separator: a ':' would also split a Windows drive letter (C:\...)
-            hip_env["STRATA_HIPBLASLT_TUNING"] = os.pathsep.join(tables)
+            hip_env["MAYA_HIPBLASLT_TUNING"] = os.pathsep.join(tables)
         env = {**hip_env, **env}
     if env:
         cfg["env"] = env
@@ -4100,7 +4213,7 @@ def gpu_env_changes(was: dict, now: dict) -> list:
 def stale_tuning(cfg: dict) -> str | None:
     """The CPU lane's tuned settings in the config's env (CAL.KEYS: setup's calibration, or one kept by hand) left out
     when the driver, the GPUs' slots or their P2P layout changed since they were measured (#419: a P2P driver installed
-    later made a split's STRATA_GLM_PCIE_SHARE=0.25 pin the wrong experts - 25 tok/s instead of 40), so the engine
+    later made a split's MAYA_GLM_PCIE_SHARE=0.25 pin the wrong experts - 25 tok/s instead of 40), so the engine
     measures again at its start.  `cfg` is changed in place; the message, or None (nothing changed).  Settings without
     a record of where they were measured (an older config) get this PC's now, so the next change is seen."""
     env = cfg.get("env") or {}
@@ -4420,9 +4533,9 @@ G53_DRAFT_PROBE = {"mixed": True, "tokens": 512, "answer": 128, "warm": 32}
 
 
 def g53_with_drafting(cfg: dict, on: bool) -> dict:
-    """A copy of a GLM-5.3 config with one-GPU drafting on or off (its STRATA_GLM_MTP_DECODE)."""
+    """A copy of a GLM-5.3 config with one-GPU drafting on or off (its MAYA_GLM_MTP_DECODE)."""
     out = json.loads(json.dumps(cfg))
-    out["env"] = {**(out.get("env") or {}), "STRATA_GLM_MTP_DECODE": "1" if on else "0"}
+    out["env"] = {**(out.get("env") or {}), "MAYA_GLM_MTP_DECODE": "1" if on else "0"}
     return out
 
 
@@ -5331,8 +5444,17 @@ def set_up(a, prev: dict) -> Path | None:
     else:
         ok(f"model: {choice[1]} (yours)")
     if g53_choice(choice):                             # GLM-5.3 (744B): the contexts its cache fits on these GPUs
-        contexts = g53_contexts(pc, **g53_cache_plan(a, pc, choice))   # (as the config will run: write_config's)
-        ctx = choose_context(a, prev_ctx, contexts, DEFAULT_CONTEXT if DEFAULT_CONTEXT in contexts else contexts[-1])
+        plan = g53_cache_plan(a, pc, choice)           # (as the config will run: write_config's)
+        contexts = g53_contexts(pc, **plan)
+        # (a unified-memory APU: the largest context that keeps the whole model in memory - --context still wins)
+        rec, line = g53_apu_context(pc, plan, choice[1] if choice[0] == "download" else quant_of(Path(choice[1])),
+                                    contexts)
+        if line and not getattr(a, "context", None):
+            (ok if rec else warn)(line)
+        ctx = choose_context(a, prev_ctx, contexts, rec or (DEFAULT_CONTEXT if DEFAULT_CONTEXT in contexts else contexts[-1]))
+        if rec and ctx > rec:                          # (--context, or the earlier setup's answer: kept, said)
+            warn(f"a {context_label(ctx)} context's cache pushes experts to the SSD on this PC; "
+                 f"{context_label(rec)} keeps the whole model in memory")
     else:
         ctx = choose_context(a, prev_ctx, recommended=recommended_context(choice, pc))
     ok(f"context: {ctx} tokens")
@@ -5784,7 +5906,16 @@ def choose_ds4_quant(a, prev: dict) -> str:
         k for k in DS4_QUANTS if k not in DS4_MAYA + DS4_ABL + DS4_UD_LISTED and (exl3_ok or k not in DS4_EXL3)
                                    and (k not in DS4_BY_HAND + DS4_UD or k == before)]   # (a chosen-by-hand one: only where it is installed)
     abl = ds4_abl_recommended(hip)
-    default = before if before in keys else maya[0] if maya else DS4_DEFAULT_QUANT
+    # Maya's quants by this PC's VRAM + RAM (fit_recommendation): no larger than Maya-S (the first listed), the cache
+    # at the default context on each GPU (ds4_kv_gb)
+    gpus = setup_gpus(a)
+    try:
+        ram = mem_gb()[0]
+    except Exception:  # noqa: BLE001 - the RAM does not read: the usual pick
+        ram = 0.0
+    rec = fit_recommendation({k: ds4_memory_gb(k) for k in maya}, gpus, ram,
+                             ds4_kv_gb(DS4_DEFAULT_CONTEXT, len(gpus)), maya[0]) if maya else keys[0]
+    default = before if before in keys else rec if maya else DS4_DEFAULT_QUANT
     gb = {k: ds4_gguf_model(k)["download_gb"] for k in maya + [k for k in DS4_ABL + DS4_UD if k in keys]}
     for k in DS4_ABL + ("maya-xs",):   # (as the other entries: the whole download, Maya's n-gram tables with it)
         if k in gb:
@@ -5830,7 +5961,7 @@ def choose_ds4_quant(a, prev: dict) -> str:
                                              "the memory: the experts that do not", "fit in VRAM are read from RAM and "
                                              "the SSD. The EXL3 quants need a V100 or newer, or AMD, and "
                                              "~230 / ~280 GB of VRAM + RAM:"],
-                  [(label[k][0], "recommended" if k == keys[0] else
+                  [(label[k][0], "recommended" if k == rec else
                     "abliterated: fits this PC" if k == abl else None, label[k][1]) for k in keys],
                   keys.index(default), a.yes or a.check)
     return keys[pick]
@@ -6633,18 +6764,14 @@ def choose_mm3_quant(a, prev: dict) -> str:
         return a.mm3_quant
     if mm3_own_dir(a, "exl3") is not None:            # --model-dir names an EXL3 folder of your own: its files are the quant
         return "exl3"
-    hip = getattr(a, "backend", None) == "hip"
     ggufs = [k for k in ("gguf-xs", "gguf-s") if mm3_gguf_published(k)]
     keys = ["exl3"] + ggufs
     before = (prev.get("installer") or {}).get("mm3_quant")
     total, _ = mem_gb()
-    try:
-        vram = sum(g["vram_gb"] for g in (S.amd_gpus() if hip else S.gpus()))
-    except Exception:  # noqa: BLE001 - no NVIDIA tools
-        vram = 0.0
-    have = vram + total
-    fit = [k for k in keys if have >= mm3_memory_gb(k)]
-    rec = "exl3" if "exl3" in fit else max(fit, key=mm3_memory_gb) if fit else min(keys, key=mm3_memory_gb)
+    # by this PC's VRAM + RAM (fit_recommendation): the EXL3 quant first where it fits, else the largest GGUF, the
+    # KV cache at the default context in the engine's format (mm3_kv_gb)
+    rec = fit_recommendation({k: mm3_memory_gb(k) for k in keys}, setup_gpus(a), total,
+                             mm3_kv_gb(MM3_DEFAULT_CONTEXT, MM3_KV_FORMAT), "exl3")
     if len(keys) == 1:
         return keys[0]
     gb = {k: mm3_models()[0]["download_gb"] if k == "exl3" else mm3_gguf_entry(k)["download_gb"] for k in keys}
@@ -7165,7 +7292,7 @@ def qwen_pack_step(a, d: Path, files: list, llama: Path, mtp_gguf: Path | None =
         return pack
     if not os.access(d, os.W_OK):
         fail(f"{d} is not writable: the pack is written next to the GGUF file")
-    env = dict(os.environ, STRATA_GGUF_PY=str(llama / "gguf-py"))
+    env = dict(os.environ, MAYA_GGUF_PY=str(llama / "gguf-py"))
     say("  Writing the index of every tensor, the small float weights (about 1.5 GB) and the tokenizer; the experts and")
     say("  the n-gram table stay in the GGUF file (a few minutes) ...")
     # (--compat-bf16: the projections the engine reads as BF16 - the hyper-connections' mixes, the router - are

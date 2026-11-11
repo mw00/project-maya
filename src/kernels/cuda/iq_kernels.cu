@@ -1111,7 +1111,7 @@ bool native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
 }
 }  // namespace strata::kernels
 
-// ---- Volta prompt experts (STRATA_PF_WMMA): a group's experts as one launch of FP16 tensor-core tiles, the weights
+// ---- Volta prompt experts (MAYA_PF_WMMA): a group's experts as one launch of FP16 tensor-core tiles, the weights
 // dequantized into shared memory by dq_dispatch (the FP16 path's own formulas), the activations FP16, FP32 sums.
 // Replaces MMQ's dp4a products on sm_70, and the FP16 path's dequantize-to-global + one cuBLAS call per expert.
 #if !defined(__HIPCC__)

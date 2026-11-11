@@ -39,7 +39,7 @@ MEMORY_GB = 245
 # the dense weights (DENSE_GB: 4.90 + 4.83 + 4.64 GB measured on 3x V100 with UD-IQ2_M, GPU day 1) and on each GPU its
 # working memory (GPU_WORK_GB: activations, MTP, scratch, the prompt path ~0.7-0.9 GB) and the VRAM the engine leaves
 # free beside the expert pool (the reserve: --vram-reserve-mib, RESERVE_MIB by default; the HIP setup's
-# STRATA_GLM_RESERVE_MB) must leave a tenth of the VRAM to the experts
+# MAYA_GLM_RESERVE_MB) must leave a tenth of the VRAM to the experts
 GEOMETRY = {"trunk": 78, "mtp": True, "full": 21, "kv_lora": 512, "kv_row": 576, "idx_key": 128}   # (geometry()'s)
 KV_BYTES = 64352
 DENSE_GB = 14.5
@@ -112,7 +112,7 @@ def kv_bytes_per_token(pack, int8: bool = True, idx_fp16: bool = False) -> int |
     """What one context position of a glm-dsa model takes in its caches, as the engine lays them out
     (src/core/glm_state_layout.cpp): every layer and the NextN block its latent - INT8 (the default: kv_lora codes and
     an FP16 scale per 32) or FP16 - and its rope part k_pe (FP16); every full-indexer layer and the NextN block its index
-    key (FP32; FP16 with STRATA_GLM_IDX_FP16=1).  GLM-5.3: 79 x 672 + 22 x 512 = 64,352 bytes (FP16 latent: 102,272).
+    key (FP32; FP16 with MAYA_GLM_IDX_FP16=1).  GLM-5.3: 79 x 672 + 22 x 512 = 64,352 bytes (FP16 latent: 102,272).
     None for any other pack."""
     g = geometry(pack)
     return None if g is None else kv_bytes_of(g, int8, idx_fp16)
@@ -148,7 +148,7 @@ def pack_headwise_q8(pack) -> bool | None:
     return None
 
 
-# One-GPU drafting (STRATA_GLM_MTP_DECODE=1: the NextN block drafts, one verify pass checks the drafts - the same
+# One-GPU drafting (MAYA_GLM_MTP_DECODE=1: the NextN block drafts, one verify pass checks the drafts - the same
 # tokens) pays off when the routed experts nearly all sit in GPU memory, and costs when many come from RAM: the
 # setup's speed calibration measures it on the PC (drafting on vs off, the faster kept).  Until it has, or when it is
 # skipped, the setup writes drafting on when at most DRAFT_OUTSIDE_MAX of the trunk's routed experts would stay

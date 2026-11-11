@@ -39,4 +39,30 @@ inline int tail_keep(size_t off, size_t u, size_t step, size_t b0, int avail) {
     return keep;
 }
 
+// #884 (DS4_LENT_RAM_GB): a copy into the lent experts' RAM copies failed (Impl::lent_take, before anything of that
+// device's slots was overwritten).  The copies only spare the files' reads - the same bytes - so the lend goes on
+// without them: the runtime's error cleared, every device's stream drained (no copy into the arena still in flight),
+// then the copies dropped for the rest of the process and the lent experts read from the files, as without the knob.
+// false (a stream did not drain: a device's state is unknown): nothing dropped - the caller's lend_broken.
+// Rt: clear_error(), drain(int device) -> bool, drop_copies()
+template <class Rt>
+bool lent_recover(Rt& rt, int n_dev) {
+    rt.clear_error();
+    bool ok = true;
+    for (int i = 0; i < n_dev; ++i) ok = rt.drain(i) && ok;   // (every one, even after one failed)
+    if (!ok) return false;
+    rt.drop_copies();
+    return true;
+}
+
+// ... and the clear of a lent room (its memset and sync) that returned an error: once more after the error is cleared
+// (a repeat writes the same zeros over the same bytes, before any slot under them is used); a second failure: the
+// caller's lend_broken.  Rt: clear_error(), clear() -> bool
+template <class Rt>
+bool clear_retry(Rt& rt) {
+    if (rt.clear()) return true;
+    rt.clear_error();
+    return rt.clear();
+}
+
 }  // namespace strata::ds4

@@ -920,7 +920,8 @@ class Gguf(unittest.TestCase):
                 patch.object(maya.S, "gpus", return_value=[{"arch": 86}]):   # (EXL3 offered: an RTX 30)
             self.assertEqual(maya.choose_ds4_quant(args(ds4_quant="gguf-q4"), {}), "gguf-q4")
             self.assertEqual(maya.choose_ds4_quant(args(ds4_quant=None), {"installer": {"ds4_quant": "exl3"}}), "exl3")
-            self.assertEqual(maya.choose_ds4_quant(args(ds4_quant=None), {}), "maya-s")   # (published: the default)
+            with patch.object(maya, "mem_gb", return_value=(512.0, 500.0)):   # (a PC that holds it: Maya-S)
+                self.assertEqual(maya.choose_ds4_quant(args(ds4_quant=None), {}), "maya-s")   # (published: the default)
         self.assertEqual(maya.ds4_dir(args(), Path("/models"), {}, "gguf-q8"),
                          Path("/models") / "DeepSeek-V4.1-Flash-1017-GGUF" / "UD-Q8_K_XL")
         self.assertEqual(maya.ds4_dir(args(), Path("/models"), {}, "exl3"), Path("/models") / maya.DS4)
@@ -966,8 +967,8 @@ class Abliterated(unittest.TestCase):
             for ram, want in ((128, "abliterated-128g"), (256, "abliterated-256g")):   # (VRAM + RAM: the one that fits)
                 with patch.object(maya, "mem_gb", return_value=(ram, ram)):
                     self.assertEqual(maya.choose_ds4_quant(args(ds4_quant="abliterated"), {}), want)
-            with patch.object(maya, "mem_gb", return_value=(128, 128)):
-                self.assertEqual(maya.choose_ds4_quant(args(ds4_quant=None), {}), "maya-s")   # (offered, not the default)
+            with patch.object(maya, "mem_gb", return_value=(128, 128)):   # (24 + 128 GB: Maya-S's 186 GB would read
+                self.assertEqual(maya.choose_ds4_quant(args(ds4_quant=None), {}), "maya-xs")   # from the SSD; offered, not the default)
             maya_rows = [r for r in rows if "Maya-" in r]
             i = rows.index("DeepSeek V4.1 · orcarouter Abliterated Mix-128G (275 GB)")   # (the n-gram tables included)
             self.assertEqual(rows[i + 1], "DeepSeek V4.1 · orcarouter Abliterated Mix-256G (397 GB)")
@@ -1275,7 +1276,8 @@ class MayaQuants(unittest.TestCase):
                 maya.ds4_gguf_model("maya-s")
 
     def test_published(self):
-        with self.published(), patch.object(maya.S, "UI", None):
+        with self.published(), patch.object(maya.S, "UI", None), \
+                patch.object(maya, "mem_gb", return_value=(512.0, 500.0)):   # (a PC that holds Maya-S)
             self.assertTrue(maya.ds4_maya_published("maya-s"))
             self.assertFalse(maya.ds4_maya_published("maya-m"))
             self.assertEqual(maya.choose_ds4_quant(args(ds4_quant=None), {}), "maya-s")   # (recommended)

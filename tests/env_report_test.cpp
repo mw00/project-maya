@@ -27,7 +27,7 @@ int main() {
     expect({}, "");
     // set, in the order of the setting's name past MAYA_ / STRATA_, each under the name used
     expect({"STRATA_GLM_SLOTS=0", "MAYA_GLM_PREFETCH_N=1"}, "glm env: MAYA_GLM_PREFETCH_N=1, STRATA_GLM_SLOTS=0");
-    // both names (env_aliases copies MAYA_X to STRATA_X): said once, by the MAYA_ name, whichever comes first
+    // both names (env_aliases copies STRATA_X to MAYA_X): said once, by the MAYA_ name, whichever comes first
     expect({"STRATA_GLM_SLOTS=4", "MAYA_GLM_SLOTS=4"}, "glm env: MAYA_GLM_SLOTS=4");
     expect({"MAYA_GLM_SLOTS=4", "STRATA_GLM_SLOTS=4"}, "glm env: MAYA_GLM_SLOTS=4");
     // clamped: the value used and why

@@ -18,7 +18,7 @@
 //                   n <= top_k, -1 padded) into `cells`, and the cell count min(n, top_k) on the device.
 //                   shared: nothing - `cells` and the count of the previous full layer (same token, same stream,
 //                   layers in order) are reused; the SelState check refuses a stale selection.
-//                   STRATA_GLM_DSA_DENSE=1 (B14.3): every cell 0..p from a static iota buffer, no score / topk.
+//                   MAYA_GLM_DSA_DENSE=1 (B14.3): every cell 0..p from a static iota buffer, no score / topk.
 //   6. mla2         over the selected cells, scale 1/16 at GLM-5.3; f32 and q8_1 outputs
 //   7. GEMV         attn_output -> mixer [6144]
 //

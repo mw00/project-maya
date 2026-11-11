@@ -1,7 +1,7 @@
 # glm-dsa wave 5: MTP on 3 GPUs (B11.2 head grouping and pricing, the glm-dsa rollback, B11.3 acceptance logging)
 # and the prefill expert streaming driver (B9.9, with the B14.7 lane-first policy and the node-split host share).
 #
-#   src/core/glm_dsa_spec.cpp            host: head-group pricing, STRATA_GLM_SPEC_HEAD, acceptance stats, rollback rows
+#   src/core/glm_dsa_spec.cpp            host: head-group pricing, MAYA_GLM_SPEC_HEAD, acceptance stats, rollback rows
 #   src/core/glm_dsa_prefill_stream_plan.cpp  host: the early prestage schedule and registry, the landing ring's node
 #   src/core/glm_dsa_prefill_share.cpp   host (ggml-cpu): one node's share of a node-split layer's prompt experts
 #   src/core/glm_dsa_prefill_stream.cpp  CUDA runtime: the next parts' early prestage (a Glm5Model member), the
@@ -26,7 +26,7 @@ if(STRATA_BUILD_TESTS)
   add_test(NAME glm_dsa_spec_test COMMAND glm_dsa_spec_test)
   # ... and with the head tuner's no-drafting candidate on (S3)
   add_test(NAME glm_dsa_spec_test_plain COMMAND glm_dsa_spec_test)
-  set_tests_properties(glm_dsa_spec_test_plain PROPERTIES ENVIRONMENT "STRATA_GLM_SPEC_TUNE_PLAIN=1")
+  set_tests_properties(glm_dsa_spec_test_plain PROPERTIES ENVIRONMENT "MAYA_GLM_SPEC_TUNE_PLAIN=1")
 
   # CPU: a rejected draft on the mixer twins - only row p written, the redo bit-identical, no stale selection.
   add_executable(glm_dsa_spec_rollback_test tests/glm_dsa/glm_dsa_spec_rollback_test.cpp src/core/glm_dsa_cpu_ref.cpp

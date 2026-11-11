@@ -51,7 +51,7 @@ void glm_kv_pull(uint8_t* dst, const uint8_t* src_mapped, size_t bytes, cudaStre
 void glm_kv_copy_misses(const KvStreamMap& m, const uint8_t* host, uint8_t* slots, int row_bytes, int page,
                         cudaStream_t s);
 
-/// glm_kv_resolve of several rows in one launch (STRATA_GLM_ROWS_SMALL), each row its own sequence's map, host copy,
+/// glm_kv_resolve of several rows in one launch (MAYA_GLM_ROWS_SMALL), each row its own sequence's map, host copy,
 /// slots, selection and slot cells - no two rows may share a map; a row of n_sel <= 0 does nothing.  Each row's map,
 /// slots and slot cells come out as its own glm_kv_resolve leaves them
 inline constexpr int kKvResolveRowsMax = 16;

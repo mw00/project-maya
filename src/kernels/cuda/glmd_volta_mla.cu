@@ -186,7 +186,7 @@ __global__ void __launch_bounds__(kFusedThreads, 1)
                       const uint16_t* __restrict__ k_pe, const int* __restrict__ cells, int n_sel, int cps, float scale,
                       float* __restrict__ part_o, float* __restrict__ part_ml) {
 #if !GLMD_WMMA
-    __trap();   // Pascal (no tensor cores): STRATA_GLMD_FUSED_MLA=1 there stops loudly instead of computing nothing
+    __trap();   // Pascal (no tensor cores): MAYA_GLMD_FUSED_MLA=1 there stops loudly instead of computing nothing
 #else
     constexpr int L = kFusedLora, K = L + R, LDK = K + 8, KS = K / 16, HP = kFusedHeads, SUB = kFusedSub;
     constexpr int VPC = K / 8;   // uint4 per staged cell
@@ -397,14 +397,14 @@ bool fused_mla_enabled() {
 #if defined(STRATA_USE_HIP)
     return false;   // the fused attention is a WMMA kernel of CUDA builds; mla_auto runs mla2 here
 #else
-    static const bool on = env_on("STRATA_GLMD_FUSED_MLA");
+    static const bool on = env_on("MAYA_GLMD_FUSED_MLA");
     return on;
 #endif
 }
 
 int fused_split_default() {
     static const int n = [] {
-        const long long x = strata::glmenv::env_int("STRATA_GLMD_FUSED_SPLIT", 0);
+        const long long x = strata::glmenv::env_int("MAYA_GLMD_FUSED_SPLIT", 0);
         return x > 0 ? (int) std::min<long long>(x, 1 << 20) : kFusedSplitDefault;
     }();
     return n;

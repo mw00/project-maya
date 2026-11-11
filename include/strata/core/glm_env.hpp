@@ -13,6 +13,8 @@
 // dependency), so the CPU tests check it directly (glm_env_test).
 #pragma once
 
+#include "strata/platform/env_alias.hpp"   // (an older STRATA_X counts as MAYA_X, once at program start)
+
 #include <cerrno>
 #include <cmath>
 #include <cstdio>

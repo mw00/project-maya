@@ -284,7 +284,7 @@ def deepseek_keep_thinking() -> bool:
     """MAYA_DS4_KEEP_THINKING=1: an earlier turn's reasoning stays in the prompt for the turns after it, where
     DeepSeek's own serving drops it at the next user turn - so a tool-less chat's next turn starts with the prompt the
     model already holds (with MAYA_DS4_SLOT_KEEP, with its state), instead of one that differs at every assistant turn."""
-    return os.environ.get("STRATA_DS4_KEEP_THINKING", "0") not in ("", "0")
+    return os.environ.get("MAYA_DS4_KEEP_THINKING", "0") not in ("", "0")
 
 
 def budget_effort(tokens) -> dict:

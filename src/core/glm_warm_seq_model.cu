@@ -1,13 +1,13 @@
 // src/core/glm_warm_seq_model.cu - glm-dsa B8.1 (warm): the engine side of the file-order warm-up
 // (include/strata/core/glm_warm_seq.hpp): the parts' turn on the disk and the digest of the warmed tiers.
 //
-//   Turn            fast_warm holds one for the whole warm-up: in a parallel split load with STRATA_GLM_WARM_SEQ the
+//   Turn            fast_warm holds one for the whole warm-up: in a parallel split load with MAYA_GLM_WARM_SEQ the
 //                   part waits for the parts before it (SplitLoad::wait_warm) and lets the next one on when it ends
 //                   (pass_warm; load_pack_split passes again after load_pack for a part that never warmed).
 //   part_digest     every VRAM slot of the part's MoE layers (copied to the host 8 at a time on the copy stream) and
 //                   every RAM-tier slot (a node-split slot through glmtier::unified), hashed by the part's disk-read
 //                   workers, then folded in slot order with each slot's layer / class, index, expert and state.
-//   print_digest    STRATA_GLM_WARM_SUM's line at the end of a part's warm-up (the tiers as the warm-up left them,
+//   print_digest    MAYA_GLM_WARM_SUM's line at the end of a part's warm-up (the tiers as the warm-up left them,
 //                   before the rest of the load or any token), kept for glmwarm::warm_digest().
 // The digest reads the tiers while nothing moves them; it changes nothing.
 #include "strata/core/glm_model.hpp"
@@ -29,7 +29,7 @@ Turn::Turn(Glm5Model& m, bool seq) : m_(m) {
     if (seq && m_.split_load_ != nullptr) {
         if (m_.part_ > 0)
             std::fprintf(stderr, "glm fast: CUDA%d warms its expert tiers after the parts before it "
-                                 "(STRATA_GLM_WARM_SEQ: one disk stream)\n", m_.dev_);
+                                 "(MAYA_GLM_WARM_SEQ: one disk stream)\n", m_.dev_);
         m_.split_load_->wait_warm(m_.part_);
     }
     busy_enter();

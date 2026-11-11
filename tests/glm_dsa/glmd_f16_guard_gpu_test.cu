@@ -3,7 +3,7 @@
 //           rewritten bits and the scales == glmd::guard_twin exactly; rows without an outlier untouched
 //   swiglu  glm_batch.cu swiglu_f16 + glmd::f16_guard_swiglu == the twin within one FP16 ulp (host vs device expf)
 //   ffn     the dense FFN as the prompt path runs it (cuBLAS FP16 GEMMs, F32 accumulate, the f16_guard_after
-//           epilogue) over amax 1e5 rows: finite and within 4e-3 of the twin pipeline; with STRATA_GLM_F16_GUARD=0
+//           epilogue) over amax 1e5 rows: finite and within 4e-3 of the twin pipeline; with MAYA_GLM_F16_GUARD=0
 //           the outlier rows are not finite and every other row is bit-identical to the guarded run
 //   mla     glmd::mla_prompt_wmma (16 heads) and mla_prompt_h64 (64 heads) with a Q tile past 65504 (q_abs 1.5e6 x
 //           the 0.0625 scale) vs the F32 twin
@@ -171,11 +171,11 @@ void test_ffn() {
     cudaStream_t s;
     cudaStreamCreate(&s);
     cublasSetStream(h, s);
-    setenv("STRATA_GLM_F16_GUARD", "1", 1);
+    setenv("MAYA_GLM_F16_GUARD", "1", 1);
     const auto y1 = ffn_device(h, s, x, d_wg, d_wu, d_wd, T, E, FF);
-    setenv("STRATA_GLM_F16_GUARD", "0", 1);
+    setenv("MAYA_GLM_F16_GUARD", "0", 1);
     const auto y0 = ffn_device(h, s, x, d_wg, d_wu, d_wd, T, E, FF);
-    setenv("STRATA_GLM_F16_GUARD", "1", 1);
+    setenv("MAYA_GLM_F16_GUARD", "1", 1);
     // the twin pipeline (guarded)
     std::vector<uint16_t> x16((size_t) T * E), h16((size_t) T * FF);
     std::vector<float> g((size_t) T * FF), u((size_t) T * FF), y((size_t) T * E), sx(T), sh(T);
@@ -271,13 +271,13 @@ int main() {
         return 77;
     }
     // the default (unset) and auto are on for every device (the prompt GEMMs take FP16 activations on all of them)
-    unsetenv("STRATA_GLM_F16_GUARD");
+    unsetenv("MAYA_GLM_F16_GUARD");
     expect(glmd::f16_guard_active(), "auto (unset): the guard is on for this device");
-    setenv("STRATA_GLM_F16_GUARD", "auto", 1);
+    setenv("MAYA_GLM_F16_GUARD", "auto", 1);
     expect(glmd::f16_guard_active(), "auto: the guard is on for this device");
-    setenv("STRATA_GLM_F16_GUARD", "0", 1);
-    expect(!glmd::f16_guard_active(), "STRATA_GLM_F16_GUARD=0: off");
-    setenv("STRATA_GLM_F16_GUARD", "1", 1);
+    setenv("MAYA_GLM_F16_GUARD", "0", 1);
+    expect(!glmd::f16_guard_active(), "MAYA_GLM_F16_GUARD=0: off");
+    setenv("MAYA_GLM_F16_GUARD", "1", 1);
     test_rows(false);
     test_rows(true);
     test_swiglu();

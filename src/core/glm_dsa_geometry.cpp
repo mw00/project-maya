@@ -265,13 +265,13 @@ bool from_gguf_glm_dsa(const strata::GgufFile& g, Glm5Geometry& out_ref, std::st
     if (out.idx_rope > out.idx_key)
         return fail("indexer key_length " + std::to_string(idx_key) + " < its rope dims " + std::to_string(n_rot));
     // HF / vLLM: nn.LayerNorm(eps 1e-6); llama.cpp never loads f_norm_eps for glm-dsa (eps 0) -
-    // STRATA_GLM_IDX_LN_EPS=0 reproduces it for parity runs
+    // MAYA_GLM_IDX_LN_EPS=0 reproduces it for parity runs
     out.idx_ln_eps = 1e-6f;
-    if (const char* e = std::getenv("STRATA_GLM_IDX_LN_EPS"); e != nullptr && e[0] != '\0') {
+    if (const char* e = std::getenv("MAYA_GLM_IDX_LN_EPS"); e != nullptr && e[0] != '\0') {
         char* end = nullptr;
         const double v = std::strtod(e, &end);
         if (end == e || *end != '\0' || !(v >= 0) || !std::isfinite(v))
-            return fail(std::string("STRATA_GLM_IDX_LN_EPS='") + e + "' is not a number >= 0");
+            return fail(std::string("MAYA_GLM_IDX_LN_EPS='") + e + "' is not a number >= 0");
         out.idx_ln_eps = (float) v;
     }
 
@@ -377,18 +377,18 @@ bool glm_split_bounds_ok(const Glm5Geometry& g, const std::vector<int>& bounds, 
 
 bool glm_forward_available(const Glm5Geometry& g, std::string& err) {
     if (g.arch != GlmArch::GlmDsa) return true;
-    // glm-dsa B4.6 integration: both glm-dsa forwards exist - the F32 reference (STRATA_GLM_SLOW, B3.5,
+    // glm-dsa B4.6 integration: both glm-dsa forwards exist - the F32 reference (MAYA_GLM_SLOW, B3.5,
     // src/core/glm_dsa_ref.cu) and the fast decode path (fast_layers_plain + the glm-dsa mixer, src/core/glm_dsa_mixer.cu).
     // A geometry the decode kernels cannot serve is refused by glmdsa::mixer_setup with the reason.
-    // STRATA_GLM_CHECK_ONLY=1 stops a glm-dsa load here, after the geometry and tensor-shape checks and before any
+    // MAYA_GLM_CHECK_ONLY=1 stops a glm-dsa load here, after the geometry and tensor-shape checks and before any
     // weight upload (a pack check without a GPU; the loader test uses it).
-    if (!strata::glmenv::env_flag("STRATA_GLM_CHECK_ONLY", false)) return true;
+    if (!strata::glmenv::env_flag("MAYA_GLM_CHECK_ONLY", false)) return true;
     int full = 0;
     for (int il = 0; il < g.n_layers; ++il) full += g.idx_full(il) ? 1 : 0;
     char buf[512];
     std::snprintf(buf, sizeof buf,
                   "glm-dsa: the pack's geometry and tensor shapes check out (%d layers + %d NextN, n_embd %d, %d "
-                  "full-indexer layers, %d experts top-%d); check-only load (STRATA_GLM_CHECK_ONLY) - stopped before "
+                  "full-indexer layers, %d experts top-%d); check-only load (MAYA_GLM_CHECK_ONLY) - stopped before "
                   "any weight upload",
                   g.n_layers, g.nextn, g.n_embd, full, g.n_expert, g.n_exp_used);
     err = buf;

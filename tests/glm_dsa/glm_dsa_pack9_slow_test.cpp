@@ -2,15 +2,15 @@
 // expert size classes, on the synthetic PACK9 preset (12 layers + NextN, 10 MoE layers whose (gate/up, down) expert
 // types form 9 row-byte classes; tools/glm_dsa_synth_gguf.py --preset PACK9, packed by tools/iq_pack.py's glm-dsa
 // mode).  Maya's four class arrays were [8] with no bound check; they are vectors now (glm_model.hpp) and
-// STRATA_GLM_POOL_CLASSES folds the classes past a cap into one (src/core/glm_pool_classes.cpp), so the SAME weights
+// MAYA_GLM_POOL_CLASSES folds the classes past a cap into one (src/core/glm_pool_classes.cpp), so the SAME weights
 // run with 9, 8 and 1 classes.
 //
-// STRATA_GLM_SLOW=1, one GPU, 12 reference tokens ((i * 37 + 11) % 1024), token by token:
+// MAYA_GLM_SLOW=1, one GPU, 12 reference tokens ((i * 37 + 11) % 1024), token by token:
 //   9 classes                         the pool really has 9 classes (glm_pool_classes_last), logits L9
-//   STRATA_GLM_POOL_CLASSES=8         8 classes: max |logit - L9| < 1e-5 (the B3.7 gate: same kernels, other slots)
-//   STRATA_GLM_NO_STAGE=1             the three-copy fill instead of the staging workers: < 1e-5
-//   STRATA_GLM_POOL_CLASSES=1         Maya's uniform slots: < 1e-5
-//   STRATA_GLM_NO_STAGE + _BOUNCE=1   the pinned bounce ring (it copied slot_bytes_ into smaller class slots before
+//   MAYA_GLM_POOL_CLASSES=8         8 classes: max |logit - L9| < 1e-5 (the B3.7 gate: same kernels, other slots)
+//   MAYA_GLM_NO_STAGE=1             the three-copy fill instead of the staging workers: < 1e-5
+//   MAYA_GLM_POOL_CLASSES=1         Maya's uniform slots: < 1e-5
+//   MAYA_GLM_NO_STAGE + _BOUNCE=1   the pinned bounce ring (it copied slot_bytes_ into smaller class slots before
 //                                     B3.7, overrunning the next slot): < 1e-5
 //   L9 vs ref/glm_dsa.py --mode hf    mean KL < 1e-2 and top-1 >= 11 / 12 (the slow path's GPU experts take q8_1
 //                                     activations; glmd_layer_parity uses the same bound)
@@ -47,8 +47,8 @@ void check(bool ok, const std::string& what) {
     if (!ok) ++g_fail;
 }
 
-const char* kEnv[] = {"STRATA_GLM_POOL_CLASSES", "STRATA_GLM_NO_STAGE", "STRATA_GLM_BOUNCE", "STRATA_GLM_CPU_EXPERTS",
-                      "STRATA_GLM_POOL_SLOTS0"};
+const char* kEnv[] = {"MAYA_GLM_POOL_CLASSES", "MAYA_GLM_NO_STAGE", "MAYA_GLM_BOUNCE", "MAYA_GLM_CPU_EXPERTS",
+                      "MAYA_GLM_POOL_SLOTS0"};
 
 struct Case {
     std::string name;
@@ -61,14 +61,14 @@ bool run(const fs::path& pack, const Case& c, const std::vector<int32_t>& tokens
          std::vector<std::vector<float>>& out, int& classes, std::string& err) {
     for (const char* e : kEnv) unsetenv(e);
     for (const auto& kv : c.env) setenv(kv.first, kv.second, 1);
-    setenv("STRATA_GLM_SLOW", "1", 1);
-    setenv("STRATA_GLM_SPLIT", "0", 1);
+    setenv("MAYA_GLM_SLOW", "1", 1);
+    setenv("MAYA_GLM_SPLIT", "0", 1);
     bool ok = false;
     {
         strata::core::Glm5Model m;
         ok = m.load_pack(pack.string(), kCtx, err);
         if (ok && m.fast()) {
-            err = "STRATA_GLM_SLOW=1 loaded the fast path";
+            err = "MAYA_GLM_SLOW=1 loaded the fast path";
             ok = false;
         }
         classes = strata::core::glm_pool_classes_last();
@@ -79,8 +79,8 @@ bool run(const fs::path& pack, const Case& c, const std::vector<int32_t>& tokens
         }
     }
     for (const char* e : kEnv) unsetenv(e);
-    unsetenv("STRATA_GLM_SLOW");
-    unsetenv("STRATA_GLM_SPLIT");
+    unsetenv("MAYA_GLM_SLOW");
+    unsetenv("MAYA_GLM_SPLIT");
     return ok;
 }
 
@@ -120,11 +120,11 @@ int main() {
     // the order makes each load change glm_pool_classes_last(), so every case proves its pool was built
     const std::vector<Case> cases = {
         {"9 classes", {}, 9},
-        {"STRATA_GLM_POOL_CLASSES=8", {{"STRATA_GLM_POOL_CLASSES", "8"}}, 8},
-        {"9 classes, STRATA_GLM_NO_STAGE=1 (three-copy fill)", {{"STRATA_GLM_NO_STAGE", "1"}}, 9},
-        {"STRATA_GLM_POOL_CLASSES=1 (uniform slots)", {{"STRATA_GLM_POOL_CLASSES", "1"}}, 1},
-        {"9 classes, STRATA_GLM_BOUNCE=1 (pinned bounce ring)",
-         {{"STRATA_GLM_NO_STAGE", "1"}, {"STRATA_GLM_BOUNCE", "1"}}, 9},
+        {"MAYA_GLM_POOL_CLASSES=8", {{"MAYA_GLM_POOL_CLASSES", "8"}}, 8},
+        {"9 classes, MAYA_GLM_NO_STAGE=1 (three-copy fill)", {{"MAYA_GLM_NO_STAGE", "1"}}, 9},
+        {"MAYA_GLM_POOL_CLASSES=1 (uniform slots)", {{"MAYA_GLM_POOL_CLASSES", "1"}}, 1},
+        {"9 classes, MAYA_GLM_BOUNCE=1 (pinned bounce ring)",
+         {{"MAYA_GLM_NO_STAGE", "1"}, {"MAYA_GLM_BOUNCE", "1"}}, 9},
     };
     std::vector<std::vector<float>> base;
     for (const Case& c : cases) {

@@ -1,4 +1,4 @@
-"""serve/test_fair.py - the FIFO's order and the fair slices (STRATA_FAIR_SLICE_S), against a scripted engine that
+"""serve/test_fair.py - the FIFO's order and the fair slices (MAYA_FAIR_SLICE_S), against a scripted engine that
 continues an answer from wherever the prompt says it got to (as the real engine does with its conversation slots).
 
     python -m unittest serve.test_fair -v
@@ -140,13 +140,13 @@ class FairSlices(unittest.TestCase):
         self.tok = ByteTokenizer()
         self.engine = ResumingEngine(self.tok, {"long": self.LONG, "short": self.SHORT})
         self.svc = Service(self.engine, self.tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
-        self.env = os.environ.get("STRATA_FAIR_SLICE_S")
+        self.env = os.environ.get("MAYA_FAIR_SLICE_S")
 
     def tearDown(self):
         if self.env is None:
-            os.environ.pop("STRATA_FAIR_SLICE_S", None)
+            os.environ.pop("MAYA_FAIR_SLICE_S", None)
         else:
-            os.environ["STRATA_FAIR_SLICE_S"] = self.env
+            os.environ["MAYA_FAIR_SLICE_S"] = self.env
 
     def race(self, **kw):
         out = {}
@@ -161,7 +161,7 @@ class FairSlices(unittest.TestCase):
         return out
 
     def test_off_by_default_the_short_one_waits(self):
-        os.environ.pop("STRATA_FAIR_SLICE_S", None)
+        os.environ.pop("MAYA_FAIR_SLICE_S", None)
         out = self.race()
         self.assertEqual(out["long one"][0], self.LONG)
         self.assertEqual(out["short one"][0], self.SHORT)
@@ -169,7 +169,7 @@ class FairSlices(unittest.TestCase):
         self.assertEqual(len(self.engine.calls), 2)
 
     def test_the_short_one_goes_first_and_the_long_one_continues(self):
-        os.environ["STRATA_FAIR_SLICE_S"] = "0.05"
+        os.environ["MAYA_FAIR_SLICE_S"] = "0.05"
         out = self.race()
         self.assertEqual(out["short one"][0], self.SHORT)
         self.assertEqual(out["long one"][0], self.LONG)          # nothing lost or repeated at the seam
@@ -185,7 +185,7 @@ class FairSlices(unittest.TestCase):
         self.assertFalse(self.svc.status["busy"])
 
     def test_pause_keeps_the_tokens_still_on_their_way(self):
-        os.environ["STRATA_FAIR_SLICE_S"] = "0.05"
+        os.environ["MAYA_FAIR_SLICE_S"] = "0.05"
         self.engine = PausingEngine(self.tok, {"long": self.LONG, "short": self.SHORT})
         self.svc.engine = self.engine
         out = self.race()
@@ -196,14 +196,14 @@ class FairSlices(unittest.TestCase):
         self.assertFalse(self.svc.fifo.locked())
 
     def test_alone_it_is_never_cut(self):
-        os.environ["STRATA_FAIR_SLICE_S"] = "0.01"
+        os.environ["MAYA_FAIR_SLICE_S"] = "0.01"
         out = {}
         collect(self.svc, "long one", 4096, out)
         self.assertEqual(out["long one"][0], self.LONG)
         self.assertEqual(len(self.engine.calls), 1)
 
     def test_a_client_gone_while_queued_again_leaves_the_line(self):
-        os.environ["STRATA_FAIR_SLICE_S"] = "0.02"
+        os.environ["MAYA_FAIR_SLICE_S"] = "0.02"
         short = "".join(random.Random(400).choices(string.ascii_lowercase, k=400))
         self.engine.answers["short"] = short                    # long enough to hold the engine for a while
         out = {}
