@@ -5,8 +5,9 @@
 //
 //   * EXL3 packs (exllamav3 trellis experts, tools/exl3_pack.py) exist for GLM-5.3-Flash only: a glm-dsa pack with an
 //     exl3.txt is refused (glm_exl3_ok);
-//   * the DFlash2 block drafter (--dflash) is a GLM-5.3-Flash drafter (and sm_80+ in Maya's setup): glm-dsa drafts with
-//     its NextN block, so --dflash is refused there (glm_dflash_ok);
+//   * the DFlash2 block drafter (--dflash) serves both: GLM-5.3-Flash's reads the mHC stream means, GLM-5.3 744B's
+//     (Anbeeld/GLM-5.3-DFlash2-GGUF) the plain residual entering its target layers (glm_residual.cu); a drafter made
+//     for the other model is refused when it binds (its hidden size / vocabulary / layers), so glm_dflash_ok is open;
 //   * --parallel's batched rows (glm_rows.cu, multi_rows) run the Flash token path's kernels (mHC, KDA, the k-pool
 //     DSA): on glm-dsa the arena is not allocated, so rows_ok() is false and the server's pipelined multi path serves
 //     the conversations one after the other (glm_rows_ok);
@@ -28,7 +29,8 @@ namespace strata::core {
 /// An EXL3 pack (exl3.txt) on this arch: true for GLM-5.3-Flash; false + err on glm-dsa.
 bool glm_exl3_ok(GlmArch a, std::string& err);
 
-/// A DFlash2 drafter (--dflash / MAYA_GLM_DFLASH) on this arch: true for GLM-5.3-Flash; false + err on glm-dsa.
+/// A DFlash2 drafter (--dflash / MAYA_GLM_DFLASH) on this arch: true on both (GlmDflash::bind checks it is this
+/// model's drafter).
 bool glm_dflash_ok(GlmArch a, std::string& err);
 
 /// --parallel's batched rows (glm_rows.cu) on this arch: true for GLM-5.3-Flash (Maya), false on glm-dsa (the

@@ -1132,18 +1132,30 @@ bool Glm5Model::fast_setup(std::string& err) {
     }
 
     // ---- host-mapped routing ring + response, pinned staging for the embedding / hop / token
+    // The ring: CUDA keeps kRingSize entries of sizeof(MoeRequest) (x kMaxEmbd floats wide); HIP sizes it from the model
+    // (gf::ring_entries_for / ring_stride_for): GLM-5.3-Flash 64 entries of 4096 floats, glm-dsa 128 of 6144 - a decode
+    // round's routes (every layer once + a verify window's drafts) fit as before, the host-mapped footprint 1 / 3 MB
+    // instead of 8.4 MB (on the gfx1151 APU the big ring cost the Flash drafting decode ~0.8 %)
+#if defined(STRATA_USE_HIP)
+    F->md.ring_n = gf::ring_entries_for(NL + kWinMax);
+    F->md.ring_stride = gf::ring_stride_for(g.n_embd);
+#else
+    F->md.ring_n = (unsigned int) gf::kRingSize;
+    F->md.ring_stride = (unsigned int) sizeof(gf::MoeRequest);
+#endif
+    const size_t ring_bytes = (size_t) F->md.ring_n * F->md.ring_stride;
     void* hp = nullptr;
-    if (cudaHostAlloc(&hp, sizeof(gf::MoeRequest) * gf::kRingSize + sizeof(int), cudaHostAllocMapped) != cudaSuccess) {
+    if (cudaHostAlloc(&hp, ring_bytes + sizeof(int), cudaHostAllocMapped) != cudaSuccess) {
         err = "glm fast: the routing ring did not allocate";
         return false;
     }
-    std::memset(hp, 0, sizeof(gf::MoeRequest) * gf::kRingSize + sizeof(int));
+    std::memset(hp, 0, ring_bytes + sizeof(int));
     F->ring_h = (gf::MoeRequest*) hp;
     void* dp = nullptr;
     cudaHostGetDevicePointer(&dp, hp, 0);
     F->md.ring = dp;
-    F->route_error_h = (volatile int*) (F->ring_h + gf::kRingSize);
-    F->md.route_error = (volatile int*) ((gf::MoeRequest*) dp + gf::kRingSize);
+    F->route_error_h = (volatile int*) ((char*) hp + ring_bytes);
+    F->md.route_error = (volatile int*) ((char*) dp + ring_bytes);
     if (cudaMalloc((void**) &F->md.route_err_d, 64) != cudaSuccess || cudaMemset(F->md.route_err_d, 0, 64) != cudaSuccess) {
         err = "glm fast: the route error flag did not allocate";
         return false;
@@ -4827,18 +4839,19 @@ void Glm5Model::fast_service() {
         w_n = w_held = 0;
     };
     unsigned int polls = 0;
+    const unsigned int ring_n = F->md.ring_n, ring_stride = F->md.ring_stride;   // (fast_setup: the ring's shape)
 #if defined(_WIN32) && defined(STRATA_USE_HIP)
     auto last_kick = last_route;
     unsigned int kick_polls = 0;
 #endif
     while (!F->quit.load(std::memory_order_relaxed)) {
         if (idle == 3) gate_seen = gate.epoch();   // (before the look at the ring: a poke after it ends the sleep at once)
-        gf::MoeRequest* rq = F->ring_h + (next % gf::kRingSize);
+        gf::MoeRequest* rq = gf::ring_entry(F->ring_h, next, ring_n, ring_stride);
         const unsigned int sq = rq->seq;
         if (sq != next) {
             // an entry AHEAD of us means the device lapped the ring (only non-waiting routes can be lapped: a
             // disk miss parks the device until it is answered) - resync instead of waiting forever
-            if ((int) (sq - next) > 0 && sq % gf::kRingSize == next % gf::kRingSize) {
+            if ((int) (sq - next) > 0 && ((sq ^ next) & (ring_n - 1u)) == 0u) {
                 F->ring_laps.fetch_add(1, std::memory_order_relaxed);
                 F->processed.fetch_add((uint64_t) (sq - next), std::memory_order_release);
                 next = sq;
@@ -6669,7 +6682,10 @@ bool Glm5Model::fast_token(int32_t token, std::string& err) {
             for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
                 const FastState* Fm = m->fast_;
                 unsigned int last = 0;
-                for (int i = 0; i < gf::kRingSize; ++i) last = std::max(last, (unsigned int) Fm->ring_h[i].seq);
+                for (unsigned int i = 0; i < Fm->md.ring_n; ++i) {
+                    const gf::MoeRequest* rq = gf::ring_entry(Fm->ring_h, i, Fm->md.ring_n, Fm->md.ring_stride);
+                    last = std::max(last, (unsigned int) rq->seq);
+                }
                 std::fprintf(stderr, "glm fast: token %lld waiting > 10 s - CUDA%d last route seq %u, last answer %u\n",
                              (long long) p, m->dev_, last, (unsigned int) Fm->resp_h->seq);
             }

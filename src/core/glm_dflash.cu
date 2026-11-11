@@ -1668,7 +1668,7 @@ bool Glm5Model::dflash_bind(std::string& err) {
     }
     // a two-GPU split's batched window (dflash_pipelined): each part's window layer on both parts' CPU pools - the
     // other part's pool idles while the window is on this one (MAYA_GLM_WIN_LANES=0: its own only)
-    const bool win_pipe = dflash_pipelined(2);
+    const bool win_pipe = dflash_pipelined(2, !g_.mhc());
     static const bool win_lanes = [] {
         const char* v = getenv("MAYA_GLM_WIN_LANES");
         return v == nullptr || std::atoi(v) != 0;
@@ -1798,7 +1798,7 @@ bool Glm5Model::decode_dflash(strata::kernels::SamplerParams& sp, int64_t max_ne
     }();
     static const bool explore = getenv("MAYA_GLM_DFLASH_EXPLORE") != nullptr;
     // the pipelined window (its parts on consecutive tokens at once) or the batched one: dflash_pipelined
-    const bool pipe = split_next_ != nullptr && dflash_pipelined(std::max(2, n_parts_));
+    const bool pipe = split_next_ != nullptr && dflash_pipelined(std::max(2, n_parts_), !g_.mhc());
     // the defaults (n_max / p_min < 0): on the pipelined window a draft after a wrong one costs little (its work is
     // skipped) - Maya-L over 9 GPUs, 5 prompts: 0.3 / 0.5 / 0.7 / none within ~2% of each other, 0.5 the steadiest on
     // a long context (53.8 against 43-52 tok/s at 0.3).  The batched window on two GPUs: a draft a round whatever its

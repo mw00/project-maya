@@ -4,6 +4,17 @@ Every release is on GitHub (Releases) with these notes; every published change m
 page's Settings › About and updates (About > Update before the redesign; from v1.0.18), or `git pull`, then `./setup.sh` (Windows: `START-MAYA.bat`) - it recompiles
 only what changed and starts; the model is not downloaded again.
 
+## v1.1.60 - 2026-11-11
+
+GLM-5.3-Flash decodes faster again on AMD Ryzen AI Max APUs (up to ~0.8% vs v1.1.59, back to v1.1.56's speed), turboderp's 2.25 bpw EXL3 quant of DeepSeek in the setup, DFlash2 drafting for GLM-5.3 (744B) as an opt-in, and fixes.
+
+- **Faster: GLM-5.3-Flash on AMD Ryzen AI Max APUs:** drafting decode is up to ~0.8% faster than in v1.1.59, back to v1.1.56's speed, with identical answers (how much depends on the system's state; sometimes there is no difference). Since v1.1.57 a routing buffer sized for GLM-5.3 (744B) slowed it; AMD builds now size it for the model. NVIDIA is unchanged.
+- **turboderp's DeepSeek-V4.1-Flash EXL3 at 2.25 bpw in the setup:** [turboderp's 2.25 bpw EXL3 quant](https://huggingface.co/turboderp/DeepSeek-V4.1-Flash-1017-exl3/tree/2.25bpw) of DeepSeek-V4.1-Flash-1017 is now in the setup's DeepSeek list (`--ds4-quant exl3-2.25`), the smallest of its EXL3 options: 158.6 GB of weights, about 160 GB of VRAM and RAM added together (192 GB recommended); 362 GB on disk with its Engram tables (an install of another EXL3 quant shares them). Every file is pinned and checked by size and sha256. Pictures work: the setup uses DeepSeek's own vision tower, shared with a GGUF install. DeepSeek's sampling and effort, DSpark drafting (chosen by the speed calibration) and the refusal ablation switch work as with the other EXL3 quants. It is listed, never recommended over Maya's own quants. Thanks to turboderp for the quant.
+- **GLM-5.3 (744B): DFlash2 drafting as an opt-in:** `--dflash GGUF` in a GLM-5.3 config's `"args"` is no longer refused: it drafts with Anbeeld's [GLM-5.3-DFlash2-GGUF](https://huggingface.co/Anbeeld/GLM-5.3-DFlash2-GGUF) (CC BY-NC-ND 4.0: non-commercial use only) in place of the model's MTP block, and the engine checks that the drafter was made for GLM-5.3. The setup does not offer it: GLM-5.3 keeps drafting with its MTP block by default, which was faster at the default sampling everywhere we measured.
+- **README:** speed rows from community reports (#890 thanks @imaginitivename, #895 thanks @digitalhomesteader, #905 and #908 thanks @pepuscz, #934 thanks @bob-u, #939 thanks @scranst, #942 thanks @rim-jaynor), in all four languages.
+- **Fixes:**
+  - GLM-5.3 (744B) on AMD Ryzen AI Max APUs: the setup's context recommendation now keeps 4 GB more free for the engine's own buffers, so with GLM-5.3-Maya-XS on a 192 GB APU it recommends 32K instead of 64K, where a few experts were still read from the SSD. A longer context given with `--context` or kept from an earlier setup stays, with the warning.
+
 ## v1.1.59 - 2026-11-11
 
 Refusal ablation for DeepSeek, MiniMax and GLM-5.3-Flash, Turbo for GLM-5.3 (744B), a setup that recommends the quant and context your PC's memory holds, and fixes.

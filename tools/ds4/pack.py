@@ -51,11 +51,14 @@ def flat_patch(name: str, shape: tuple) -> tuple:
 
 
 def vision_bf16(st, model: pathlib.Path, vdir: pathlib.Path | None) -> str | None:
-    """The engine reads the vision tower in BF16 only: a quant that ships its own copy in another type (turboderp's
-    EXL3 quants: F16) had its tensors count as missing and pictures off (#886).  Those tensors are taken from a BF16
-    copy instead: DeepSeek's shard 1 in the model's folder (SafeTensors keeps a name's later copies in .dup), else
-    vision_pack.py's folder (vdir: its vision.bin / vision.json, as a GGUF install makes).  The line to print: what was
-    taken from where, or why pictures stay off.  None: the tower is BF16 already, or there is none."""
+    """The engine reads the vision tower in BF16 only, under DeepSeek's names: a quant that ships its own copy in
+    another type (turboderp's EXL3 quants: F16 - #886 - or, at 2.25 bits, EXL3 matrices under other names, its
+    attention's q / k / v and the MLP's gate / up apart) had its tensors count as missing and pictures off.  The tower
+    is taken from a BF16 copy instead: DeepSeek's shard 1 in the model's folder (SafeTensors keeps a name's later copies
+    in .dup; the shard is the whole tower), else vision_pack.py's folder (vdir: its vision.bin / vision.json, as a GGUF
+    install makes - every one of its tensors).  The quant's own tower tensors the copy does not replace are left out of
+    the pack (the engine does not read them).  The line to print: what was taken from where, or why pictures stay
+    off.  None: the tower is BF16 already, or there is none."""
     bad = [k for k in st.t if (k.startswith(TOWER) or k in MARKS) and st.t[k][1] != "BF16"]
     if not bad:
         return None
@@ -67,27 +70,33 @@ def vision_bf16(st, model: pathlib.Path, vdir: pathlib.Path | None) -> str | Non
             fn, dt, shape, off, nb = e
             st.t[k] = (fn, dt, flat_patch(k, shape), off, nb)
             src.add(fn)
+    whole = SHARD1 if SHARD1 in st.files else None   # (a whole BF16 tower: shard 1, else the vision folder's)
     left = [k for k in bad if st.t[k][1] != "BF16"]
-    if left and vdir is not None and (vdir / "vision.json").is_file() and (vdir / "vision.bin").is_file():
+    if left and whole is None and vdir is not None and (vdir / "vision.json").is_file() and \
+            (vdir / "vision.bin").is_file():
         have = {e[0]: e for e in json.loads((vdir / "vision.json").read_text())["tensors"]}
         try:
             rel = os.path.relpath(vdir / "vision.bin", model).replace(os.sep, "/")
         except ValueError:     # (Windows: another drive)
             rel = None
-        if rel is not None and " " not in rel and all(k in have and have[k][1] == "BF16" for k in left):
+        if rel is not None and " " not in rel and have and all(e[1] == "BF16" for e in have.values()):
             if rel not in st.files:
                 st.files.append(rel)
-            for k in left:
-                _, dt, off, nb, shape = have[k]
-                st.t[k] = (rel, dt, flat_patch(k, tuple(shape)), off, nb)
-            src.add(rel)
-            left = []
-    if not left:
-        return "  the vision tower: %d tensors in BF16 from %s (the quant's own copy is %s, which the engine does not " \
-               "read)" % (len(bad), ", ".join(sorted(src)), kinds)
-    return "  WARNING - the vision tower is %s here and the engine reads it in BF16 only: pictures stay off.  Put shard " \
-           "1 of DeepSeek's checkpoint (deepseek-ai/DeepSeek-V4.1-Flash-1017, %s, 0.97 GB: the tower in BF16) in %s " \
-           "and run this again" % (kinds, SHARD1, model)
+            for k, (_, dt, off, nb, shape) in have.items():
+                if (st.t.get(k) or (None, None))[1] != "BF16":
+                    st.t[k] = (rel, dt, flat_patch(k, tuple(shape)), off, nb)
+            whole = rel
+    if whole is None:
+        return "  WARNING - the vision tower is %s here and the engine reads it in BF16 only: pictures stay off.  " \
+               "Put shard 1 of DeepSeek's checkpoint (deepseek-ai/DeepSeek-V4.1-Flash-1017, %s, 0.97 GB: the tower " \
+               "in BF16) in %s and run this again" % (kinds, SHARD1, model)
+    src.add(whole)
+    for k in bad:                                    # (the quant's own layout of it: not the engine's)
+        if st.t[k][1] != "BF16":
+            del st.t[k]
+    n = sum(1 for k, v in st.t.items() if (k.startswith(TOWER) or k in MARKS) and v[0] in src)
+    return "  the vision tower: %d tensors in BF16 from %s (the quant's own copy is %s, which the engine does not " \
+           "read)" % (n, ", ".join(sorted(src)), kinds)
 
 
 def need(st: SafeTensors, t: dict) -> list[str]:

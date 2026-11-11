@@ -619,7 +619,7 @@ DS4_MIN_CC = 70                                    # (V100 on: the experts' kern
 DS4_GGUF_MANIFEST = ROOT / "tools" / "ds4" / "download_gguf.json"
 DS4_GGUF_PACK_TOOLS = ("tools/ds4/pack_gguf.py", "tools/ds4/chat_template.jinja")
 DS4_QUANTS = {"gguf-q8": "UD-Q8_K_XL", "gguf-q4": "UD-Q4_K_XL", "maya-s": "Maya-S", "maya-m": "Maya-M", "maya-xs": "Maya-XS",
-              "exl3": "EXL3 2.9bpw", "exl3-3.5": "EXL3 3.5bpw", "abliterated-128g": "Mix-128G",
+              "exl3-2.25": "EXL3 2.25bpw", "exl3": "EXL3 2.9bpw", "exl3-3.5": "EXL3 3.5bpw", "abliterated-128g": "Mix-128G",
               "abliterated-256g": "Mix-256G", "gguf-iq1_s": "UD-IQ1_S", "gguf-iq1_m": "UD-IQ1_M",
               "gguf-iq2_xxs": "UD-IQ2_XXS", "gguf-q2_k_xl": "UD-Q2_K_XL", "gguf-iq3_xxs": "UD-IQ3_XXS",
               "gguf-iq3_s": "UD-IQ3_S", "gguf-q3_k_xl": "UD-Q3_K_XL"}
@@ -659,12 +659,18 @@ DS4_SAMPLING, DS4_EFFORT = Q.MODEL_DEFAULTS["deepseek"]   # DeepSeek's own (its 
 DS4_MEMORY_GB = 230                                 # VRAM + RAM that hold it all (211 GB of weights, the pinned
                                                     # tables); with less the engine reads experts from the SSD
 DS4_35 = DS4 + "-3.5bpw"                            # the same model in LibertAIDAI's EXL3 quant at 3.5 bits
-# LibertAIDAI's EXL3 quants: each one's manifest, the GB of its weights, the VRAM + RAM that hold all of it and its folder
-# (<models>/<dir>) - their card: perplexity over the unquantized model's on held-out code / prose +1.8% / +0.4% at 2.9
-# bits, +0.8% / +0.1% at 3.5
-DS4_EXL3 = {"exl3": {"bits": "2.9", "manifest": DS4_MANIFEST, "weights_gb": 211, "memory_gb": DS4_MEMORY_GB, "dir": DS4},
-            "exl3-3.5": {"bits": "3.5", "manifest": ROOT / "tools" / "ds4" / "download-3.5bpw.json", "weights_gb": 258,
-                         "memory_gb": 280, "dir": DS4_35}}
+DS4_225 = DS4 + "-EXL3-2.25bpw"                     # ... and in turboderp's at 2.25 bits (its repo's 2.25bpw branch)
+# The EXL3 quants: each one's maker ("by"), manifest, the GB of its weights, the VRAM + RAM that hold all of it (the
+# engine's own use measured with every expert resident, the context aside) and its folder (<models>/<dir>).
+# LibertAIDAI's card: perplexity over the unquantized model's on held-out code / prose +1.8% / +0.4% at 2.9 bits, +0.8%
+# / +0.1% at 3.5.  turboderp's 2.25: its vision tower is EXL3 too (6 bits), which the engine does not read - "tower":
+# DeepSeek's BF16 one (the vision folder a GGUF install makes, ds4_exl3_vision_step) is packed in its place
+DS4_EXL3 = {"exl3": {"bits": "2.9", "by": "LibertAIDAI", "manifest": DS4_MANIFEST, "weights_gb": 211,
+                     "memory_gb": DS4_MEMORY_GB, "dir": DS4},
+            "exl3-3.5": {"bits": "3.5", "by": "LibertAIDAI", "manifest": ROOT / "tools" / "ds4" / "download-3.5bpw.json",
+                         "weights_gb": 258, "memory_gb": 280, "dir": DS4_35},
+            "exl3-2.25": {"bits": "2.25", "by": "turboderp", "manifest": ROOT / "tools" / "ds4" / "download-2.25bpw.json",
+                          "weights_gb": 159, "memory_gb": 160, "dir": DS4_225, "tower": "deepseek"}}
 # MiniMax-M3.1-Flash: its own engine (src/mm3, build/maya-mm3) reads Mia-AiLab's EXL3 quant at 3.5 bits (EAQ v1) in place
 # from its safetensors; every file is pinned and checked (tools/mm3/download.json, its DSpark draft a download of its
 # own).  NVIDIA: the layers split across the GPUs, the most-routed experts in VRAM (data/expert-profile-mm3.bin), the
@@ -1847,8 +1853,8 @@ def choose_family(a, prev: dict) -> str:
             (DS4, None,
              "DeepSeek's DeepSeek-V4.1-Flash-1017 (748B) on its own engine: unsloth's GGUF (UD-Q8_K_XL, 508 GB; "
              "NVIDIA from V100 on or AMD, Linux or Windows), orcarouter's abliterated one (Mix-128G or "
-             "Mix-256G, its refusals removed) or LibertAIDAI's EXL3 quants at 2.9 or "
-             "3.5 bits with DeepSeek's two Engram tables (414 / 461 GB; NVIDIA V100 or newer, DSpark drafting, "
+             "Mix-256G, its refusals removed), turboderp's EXL3 quant at 2.25 bits or LibertAIDAI's at 2.9 or "
+             "3.5 bits with DeepSeek's two Engram tables (362 / 414 / 461 GB; NVIDIA V100 or newer, DSpark drafting, "
              "pictures from RTX 30 / A100 on); "
              f"fast with about {DS4_MEMORY_GB} GB of VRAM and RAM together{here}, with less the experts that do not "
              "fit are read from the SSD; tensor parallel across pairs of equal GPUs, a 256K context."),
@@ -2039,6 +2045,12 @@ def apu_memory(vram: float, ram: float, linux: bool) -> float:
     return max(vram, ram) if linux else vram + ram
 
 
+# apu_context's extra room on top of the model, its cache and apu_margin_gb: what `need` leaves out (the engine's work
+# buffers, the drafting block's own cache) plus a margin.  Measured on a 192 GB Gorgon Halo (Windows) with
+# GLM-5.3-Maya-XS: at 64K, 55 experts (0.43 GB) were still read from the SSD; with this the setup recommends 32K there.
+APU_CONTEXT_SAFETY_GB = 4.0
+
+
 def apu_context(vram: float, ram: float, need: float, kv_bytes: int, parallel: int = 1,
                 contexts=CONTEXTS, linux: bool = False) -> int | None:
     """On a unified-memory APU (hip_unified_memory: the GPU's memory and the RAM are one pool; Windows charges the GPU's
@@ -2048,7 +2060,7 @@ def apu_context(vram: float, ram: float, need: float, kv_bytes: int, parallel: i
     the SSD.  None when the memory does not read or not even the smallest context leaves the model in memory."""
     if ram <= 0 or need <= 0:
         return None
-    room = apu_memory(vram, ram, linux) - apu_margin_gb(ram) - need
+    room = apu_memory(vram, ram, linux) - apu_margin_gb(ram) - need - APU_CONTEXT_SAFETY_GB
     fits = [c for c in contexts if max(1, parallel) * c * kv_bytes / 2**30 <= room]
     return max(fits) if fits else None
 
@@ -3473,7 +3485,8 @@ def fetch(url: str, dst: Path, want: str | None) -> None:
 
 
 # ------------------------------------------------------------------ refusal ablation: the model's direction file
-# <Model>-refusal-direction.gguf at the top of each model's own Maya repo (fitted by tools/ablate_fit.py, a few KB):
+# <Model>-refusal-direction.gguf in the refusal-directions/ folder of each model's own Maya repo (the repo's top before
+# v1.1.60, still read; fitted by tools/ablate_fit.py, a few KB):
 # downloaded with the model into <models>/refusal-directions/ and recorded as the config's "ablate" (loaded, off by
 # default - the Models page's switch).  A repo that ships none yet, no connection, or a file that is not a direction
 # for this model: the setup goes on without it and the switch stays off ("not available").
@@ -3512,7 +3525,25 @@ def fetch_ablate_direction(key: str, models: Path) -> Path | None:
     name = model + "-refusal-direction.gguf"
     dst = models / ABLATE_DIR / name
     part = dst.with_name(name + ".part")
-    url = hf_url(repo, "main", "", name)
+    why = ""
+    # the file sits in the repo's refusal-directions/ folder (at the repo's top the Hub took it for the model and showed
+    # its few thousand values as the parameter count); a repo that still has it at the top is read there
+    for url in (hf_url(repo, "main", ABLATE_DIR, name), hf_url(repo, "main", "", name)):
+        got = _fetch_ablate_file(url, dst, part, model, repo, name)
+        if got is True:
+            return dst
+        why = got
+        if why != "the repo ships none yet":
+            break
+    if dst.is_file() and not ablate_direction_check(dst, model):
+        ok(f"refusal ablation: the {name} from an earlier setup ({why})")
+        return dst
+    # (no line: until a model's repo has its direction file, the setup says nothing about it)
+    return None
+
+
+def _fetch_ablate_file(url: str, dst: Path, part: Path, model: str, repo: str, name: str):
+    """One try of fetch_ablate_direction's download: True (checked, in place) or why it failed."""
     why = ""
     try:
         dst.parent.mkdir(parents=True, exist_ok=True)
@@ -3539,16 +3570,12 @@ def fetch_ablate_direction(key: str, models: Path) -> Path | None:
                 os.replace(part, dst)
                 ok(f"refusal ablation: {name} from https://huggingface.co/{repo} (off until you switch it on: the "
                    "Models page or a request's \"ablate\")")
-                return dst
+                return True
     except OSError as e:
         why = str(e)
     finally:
         part.unlink(missing_ok=True)
-    if dst.is_file() and not ablate_direction_check(dst, model):
-        ok(f"refusal ablation: the {name} from an earlier setup ({why})")
-        return dst
-    # (no line: until a model's repo has its direction file, the setup says nothing about it)
-    return None
+    return why
 
 
 def ablate_step(cfg_path: Path, key: str, models: Path) -> None:
@@ -5827,6 +5854,30 @@ def ds4_pack_has_vision(pack: Path) -> bool:
         return False
 
 
+def ds4_exl3_vision_dir(models: Path) -> Path:
+    """The vision folder an EXL3 quant whose own tower the engine does not read (DS4_EXL3's "tower") packs DeepSeek's
+    BF16 tower from: one a GGUF install made already (Maya's, unsloth's, orcarouter's - the same vision.bin, shared),
+    else Maya's GGUF folder's, where the setup makes it."""
+    homes = [models / f"{DS4}-Maya-GGUF" / "vision", models / f"{DS4}-GGUF" / "vision",
+             models / f"{DS4}-abliterated-GGUF" / "vision"]
+    return next((v for v in homes if (v / "vision.bin").is_file() and (v / "vision.json").is_file()), homes[0])
+
+
+def ds4_pack_tower(pack: Path) -> bool:
+    """The EXL3 pack reads its vision tower from a vision folder's vision.bin (pack.py --vision): tensors.txt's file
+    lines, at its top, name it."""
+    try:
+        with (pack / "tensors.txt").open(encoding="utf-8", errors="replace") as f:
+            for line in f:
+                if not line.startswith("file "):
+                    return False
+                if line.rstrip().endswith("/vision.bin"):
+                    return True
+    except OSError:
+        pass
+    return False
+
+
 def ds4_vision_blocker(pc: dict) -> str | None:
     """Why the vision tower cannot run on this PC, or None: it needs ~1 GB of RAM (its weights, streamed from there)
     and, while a picture is read, ~320 MB of the first GPU's memory (lent, none between pictures) - every GPU the GGUF
@@ -5837,12 +5888,13 @@ def ds4_vision_blocker(pc: dict) -> str | None:
     return None
 
 
-def ds4_vision_step(a, pc: dict, d: Path, mmproj: bool = False) -> bool:
+def ds4_vision_step(a, pc: dict, d: Path, mmproj: bool = False, v: Path | None = None) -> bool:
     """Step 7 for a GGUF: the vision tower in ds4_vision_dir(d) - downloaded when it is not there (shard 1 of
     DeepSeek's checkpoint, 0.97 GB, and its config.json), then made the GGUF path's file (tools/ds4/vision_pack.py:
     vision.bin, with the picture markers read from shard 2 by a 30 KB range request); the shard is removed after
     that.  mmproj (unsloth's UD quants): unsloth's mmproj-BF16.gguf (0.97 GB) instead, made into the same vision.bin.
-    False: no vision tower (skipped, cannot run here, or not downloaded): the model reads text only."""
+    False: no vision tower (skipped, cannot run here, or not downloaded): the model reads text only.  v: the folder
+    (default ds4_vision_dir(d); an EXL3 quant whose own tower the engine does not read: ds4_exl3_vision_dir's)."""
     step(7, "images (the vision tower)")
     if a.no_vision:
         ok("skipped (--no-vision): the model reads text only")
@@ -5852,7 +5904,7 @@ def ds4_vision_step(a, pc: dict, d: Path, mmproj: bool = False) -> bool:
         warn(f"{why}: the model reads text only - the vision tower's weights (~1 GB) are held in pinned RAM while the "
              f"model runs; with 16 GB of RAM or more {ME} --setup turns pictures on")
         return False
-    v = ds4_vision_dir(d)
+    v = v or ds4_vision_dir(d)
     if (v / "vision.bin").is_file() and (v / "vision.json").is_file():
         ok(f"the vision tower: {v / 'vision.bin'} (its weights in RAM; no VRAM between pictures - about 320 MB of the "
            "first GPU's while one is read; the server resizes the pictures)")
@@ -5926,8 +5978,9 @@ def choose_ds4_quant(a, prev: dict) -> str:
         if t and k in keys:
             mk = ds4_gguf_model(k)
             gb[k] = mk["download_gb"] - mk["files"].get(t, 0) / 1e9 + ds4_abl_engram_gb()
-    if "exl3-3.5" in keys:
-        gb["exl3-3.5"] = ds4_model("exl3-3.5")["download_gb"]
+    for k in ("exl3-3.5", "exl3-2.25"):   # (each one's whole download, from its own manifest)
+        if k in keys:
+            gb[k] = ds4_model(k)["download_gb"]
     about = {"maya-s": "Maya's quant: experts in 2-3 bits, the most of it in memory",
              "maya-m": "Maya's quant: experts in 3.4 bits, closer to the original",
              "maya-xs": "Maya's smallest quant: experts in ~1.6 bits, the whole model in a 128 GB PC's memory",
@@ -5939,6 +5992,9 @@ def choose_ds4_quant(a, prev: dict) -> str:
              "exl3": "LibertAIDAI's quant, with the DSpark drafter and the vision tower",
              "exl3-3.5": f"closer to the original, slower: ~{DS4_EXL3['exl3-3.5']['memory_gb']} GB of VRAM + RAM "
                          "hold it",
+             "exl3-2.25": f"turboderp's quant, the smallest EXL3: ~{DS4_EXL3['exl3-2.25']['memory_gb']} GB of VRAM + "
+                          "RAM hold it; with the DSpark drafter, and DeepSeek's own vision tower (0.97 GB, shared with "
+                          "the GGUFs)",
              "abliterated-128g": "orcarouter's model with its refusals removed: experts ~1.6 bits, ~114 GB of VRAM + "
                                  "RAM hold it; its 161 GB of n-gram tables are Maya's, shared with Maya's DeepSeek "
                                  "quants (downloaded once); a gated repo: your Hugging Face token",
@@ -5960,7 +6016,7 @@ def choose_ds4_quant(a, prev: dict) -> str:
     pick = choose(f"Which files of {DS4}?", ["The GGUFs run on any NVIDIA GPU from Volta (V100) on and on AMD, whatever "
                                              "the memory: the experts that do not", "fit in VRAM are read from RAM and "
                                              "the SSD. The EXL3 quants need a V100 or newer, or AMD, and "
-                                             "~230 / ~280 GB of VRAM + RAM:"],
+                                             f"~{DS4_EXL3['exl3-2.25']['memory_gb']} / ~230 / ~280 GB of VRAM + RAM:"],
                   [(label[k][0], "recommended" if k == rec else
                     "abliterated: fits this PC" if k == abl else None, label[k][1]) for k in keys],
                   keys.index(default), a.yes or a.check)
@@ -6256,8 +6312,9 @@ def ds4_model(quant: str = "exl3") -> dict:
     if not man.get("files") or not eg.get("files"):
         fail(f"{q['manifest']} is missing or damaged", f"restore it (git checkout tools/ds4/{q['manifest'].name})")
     both = {**man["files"], **eg["files"]}
-    return {"about": f"{DS4} in LibertAIDAI's EXL3 quant at {q['bits']} bits per weight (with its DSpark drafter and "
-                     "vision tower), and the two Engram tables of DeepSeek's base repo", "format": "ds4",
+    return {"about": f"{DS4} in {q['by']}'s EXL3 quant at {q['bits']} bits per weight (with its DSpark drafter" +
+                     (")" if q.get("tower") else " and vision tower)") + ", and the two Engram tables of DeepSeek's "
+                     "base repo", "format": "ds4",
             "repo": man["repo"], "revision": man["revision"], "folder": "",
             "files": {k: v[0] for k, v in both.items()}, "sha256": {k: v[1] for k, v in both.items()},
             "sources": {k: (eg["repo"], eg["revision"]) for k in eg["files"]},
@@ -6350,13 +6407,15 @@ def ds4_model_step(a, d: Path, m: dict, announce: bool = True):
 
 
 def ds4_pack_step(a, d: Path, gguf: bool = False, announce: bool = True, engram: Path | None = None,
-                  files: list | None = None, drafter: Path | None = None, without: list | None = None) -> Path:
+                  files: list | None = None, drafter: Path | None = None, without: list | None = None,
+                  vision_dir: Path | None = None) -> Path:
     """tools/ds4/pack.py's pack in <model>/maya-ds4: the geometry, where every tensor sits in the safetensors (read
     in place), the Engram hash tables and the tokenizer - built again when its tools or the model's files changed, or
     (a GGUF) when the drafter or the vision tower arrived after it.  announce=False: no step heading (step 7 adds the
     vision tower it just made).  files: a GGUF's shards (default: every .gguf in d; the folder may also hold an
     earlier layout's).  engram: the folder of the Engram tables v1.1.16's Maya-S leaves out (ds4_earlier's) - a pack of
-    other files is built again."""
+    other files is built again.  vision_dir (an EXL3 quant whose own tower the engine does not read): the vision folder
+    whose BF16 tower pack.py takes instead - a pack without it is built again."""
     if announce:
         step(6, "the pack (the engine's index of the model files)")
     pack = d / "maya-ds4"
@@ -6367,7 +6426,8 @@ def ds4_pack_step(a, d: Path, gguf: bool = False, announce: bool = True, engram:
         shards += sorted(engram.glob("*.gguf"))
     drafter_new = gguf and (drafter or d.parent / "dspark" / "dspark.json").is_file() and not CDS.has_drafter(
         {"args": ["--pack", str(pack)]})               # (the drafter arrived after the pack was built)
-    vision_new = gguf and (ds4_vision_dir(d) / "vision.json").is_file() and not ds4_pack_has_vision(pack)
+    vision_new = (gguf and (ds4_vision_dir(d) / "vision.json").is_file() and not ds4_pack_has_vision(pack)) or (
+        not gguf and vision_dir is not None and not ds4_pack_tower(pack))
     if not a.repack and read_json(pack / PACK_SOURCES).get("tools") == tools and not drafter_new and \
             not vision_new and all((pack / f).exists() for f in need) and pack_stale(pack, shards) is None:
         ok(f"pack already built: {pack}")
@@ -6378,7 +6438,8 @@ def ds4_pack_step(a, d: Path, gguf: bool = False, announce: bool = True, engram:
         "Engram hash tables and the")
     say("  tokenizer (about a minute) ...")
     run([sys.executable, str(ROOT / "tools" / "ds4" / ("pack_gguf.py" if gguf else "pack.py")), "--model", str(d),
-         "--out", str(pack)] + (["--vision", str(ds4_vision_dir(d))] if gguf else []) +
+         "--out", str(pack)] + (["--vision", str(ds4_vision_dir(d))] if gguf else
+                                ["--vision", str(vision_dir)] if vision_dir is not None else []) +
         (["--engram", str(engram)] if gguf and engram is not None else []) +
         (["--drafter", str(drafter)] if gguf and drafter is not None else []) +
         (["--shards"] + [Path(f).name for f in files] if gguf and files else []) +
@@ -6500,7 +6561,7 @@ def set_up_ds4(a, prev: dict) -> Path | None:
     ok(f"files: {Q.shown('deepseek', quant)}" + (" (Maya's quant)" if quant in DS4_MAYA else
                                                  " (a gated repo: your Hugging Face token)" if quant in DS4_ABL else
                                                  " (unsloth's GGUF)" if gguf else
-                                                 f" (LibertAIDAI's EXL3 quant at {DS4_EXL3[quant]['bits']} bits)"))
+                                                 f" ({DS4_EXL3[quant]['by']}'s EXL3 quant at {DS4_EXL3[quant]['bits']} bits)"))
     vram = sum(g.get("vram_gb", 0) for g in pc["gpus"])
     par = getattr(a, "parallel", None) or int(flag_value(prev_args, "--parallel") or 1)   # (--parallel: kept)
     rec = ds4_recommended_context(vram, mem_gb()[0], ds4_memory_gb(quant), len(pc["gpus"]), par)
@@ -6560,12 +6621,22 @@ def set_up_ds4(a, prev: dict) -> Path | None:
     drafter = gguf and ds4_drafter_step(a, d.parent / "dspark", quant)   # (the EXL3 quant has its own)
     own = ds4_quant_drafter(quant) if gguf else None   # (Maya-XS: its own drafter beside the shared one)
     dj = d.parent / "dspark" / own["json"] if own is not None and drafter else None
-    pack = ds4_pack_step(a, d, gguf, engram=engram, files=files, drafter=dj, without=without)   # 6
+    tower = None if gguf or a.no_vision else DS4_EXL3[quant].get("tower")   # (DeepSeek's BF16 tower for the quant's own)
+    vdir = ds4_exl3_vision_dir(models) if tower else None
+    pack = ds4_pack_step(a, d, gguf, engram=engram, files=files, drafter=dj, without=without,
+                         vision_dir=vdir if vdir is not None and (vdir / "vision.bin").is_file() else None)   # 6
     if gguf:                                           # 7 (DeepSeek's checkpoint's tower, added to the pack)
         vision = ds4_vision_step(a, pc, d, mmproj=quant in DS4_UD)   # (UD quants: unsloth's mmproj, the same tower)
         if vision and not ds4_pack_has_vision(pack):
             pack = ds4_pack_step(a, d, gguf, announce=False, engram=engram, files=files, drafter=dj, without=without)
         vision = vision and ds4_pack_has_vision(pack)
+    elif tower:                                        # 7 (the quant's own tower is EXL3: DeepSeek's BF16 one instead)
+        vision = ds4_vision_step(a, pc, d, v=vdir)
+        if vision and not ds4_pack_tower(pack):
+            pack = ds4_pack_step(a, d, False, announce=False, vision_dir=vdir)
+        vision = vision and ds4_pack_tower(pack)
+        if not vision and (vdir / "vision.bin").is_file():
+            warn("the pack did not take DeepSeek's vision tower (the reason is above): the model reads text only")
     else:
         step(7, "images (the vision tower)")
         vision = not a.no_vision
@@ -7679,7 +7750,9 @@ def main() -> int:
                          "(dense weights Q8_0: less VRAM; chosen by hand only, not in the setup's list), gguf-iq1_s / gguf-iq1_m / "
                          "gguf-iq2_xxs / gguf-q2_k_xl / gguf-iq3_xxs / gguf-iq3_s / gguf-q3_k_xl = its smaller UD quants (experts "
                          "1.6-3.5 bits; chosen by hand too), exl3 = LibertAIDAI's EXL3 quant at 2.9 bits, exl3-3.5 = its "
-                         "3.5-bit quant (closer to the original; ~280 GB of VRAM + RAM; both V100 or newer, or AMD); "
+                         "3.5-bit quant (closer to the original; ~280 GB of VRAM + RAM), exl3-2.25 = turboderp's EXL3 "
+                         f"quant at 2.25 bits (~{DS4_EXL3['exl3-2.25']['memory_gb']} GB of VRAM + RAM; all three V100 or "
+                         "newer, or AMD); "
                          "abliterated-128g / abliterated-256g = orcarouter's abliterated model (its refusals removed) "
                          "as its Mix-128G / Mix-256G GGUF (~114 / ~236 GB of VRAM + RAM, with Maya's Q6_K n-gram "
                          "tables; a gated repo: HF_TOKEN or `hf auth login`), abliterated = the one that fits this "

@@ -61,8 +61,8 @@ int main(int argc, char** argv) {
           "EXL3 refused on glm-dsa, naming Flash");
     err.clear();
     check(sc::glm_dflash_ok(GlmArch::Glm5Next, err) && err.empty(), "DFlash2 open on Flash");
-    check(!sc::glm_dflash_ok(GlmArch::GlmDsa, err) && err.find("NextN") != std::string::npos,
-          "DFlash2 refused on glm-dsa, naming the NextN block");
+    check(sc::glm_dflash_ok(GlmArch::GlmDsa, err) && err.empty(),
+          "DFlash2 open on glm-dsa (the 744B's own drafter; its bind checks the model)");
     check(sc::glm_rows_ok(GlmArch::Glm5Next), "batched rows on Flash");
     check(!sc::glm_rows_ok(GlmArch::GlmDsa), "no batched rows on glm-dsa");
 

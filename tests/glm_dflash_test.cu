@@ -145,7 +145,11 @@ int main(int argc, char** argv) {
     const std::string path = argv[1];
     const int64_t n_past = argc > 2 ? std::atoll(argv[2]) : 2100;
     g_q8 = getenv("DFT_FLOAT") == nullptr;   // DFT_FLOAT=1: the reference without the q8_1 rounding
-    const int E = 4096, V = 154880, NL_T = 45;
+    strata::GgufFile G(path);
+    const auto num = [&](const char* k) { return G.get(std::string("dflash.") + k)->num(); };
+    // the model the drafter serves: its hidden size (GLM-5.3-Flash 4096, GLM-5.3 744B 6144), the shared vocabulary, a
+    // trunk deep enough for its taps (Flash 45 layers, the 744B 78)
+    const int E = (int) num("embedding_length"), V = 154880, NL_T = E == 4096 ? 45 : 78;
     std::string err;
     GlmDflash D;
     if (!D.load(path, 0, err) || !D.bind(E, V, NL_T, err)) {
@@ -153,8 +157,6 @@ int main(int argc, char** argv) {
         return 1;
     }
     std::printf("%s\n", D.describe().c_str());
-    strata::GgufFile G(path);
-    const auto num = [&](const char* k) { return G.get(std::string("dflash.") + k)->num(); };
     const int n_layer = (int) num("block_count"), n_head = (int) num("attention.head_count"),
               n_kv = (int) num("attention.head_count_kv"), n_ff = (int) num("feed_forward_length"),
               taps = (int) num("conv_kernel_size"), group = (int) num("conv_group_size"),

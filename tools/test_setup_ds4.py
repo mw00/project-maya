@@ -136,15 +136,16 @@ class Quant35(unittest.TestCase):
             if tags is not None:
                 tags.extend(r[1] for r in ex)
             return [r[0] for r in ex]
-        self.assertEqual(len(offered([{"arch": 86}, {"arch": 70}])), 2)
-        self.assertEqual(len(offered([{"arch": 70}, {"arch": 70}])), 2)       # (Volta: since v1.1.20)
+        # (three EXL3 quants: turboderp's 2.25, LibertAIDAI's 2.9 and 3.5 - v1.1.60)
+        self.assertEqual(len(offered([{"arch": 86}, {"arch": 70}])), 3)
+        self.assertEqual(len(offered([{"arch": 70}, {"arch": 70}])), 3)       # (Volta: since v1.1.20)
         self.assertEqual(offered([{"arch": 61}, {"arch": 61}]), [])            # (Pascal: the GGUFs only)
         nv, amd = [], []
         offered([{"arch": 89}], tags=nv)
-        self.assertEqual(len(offered([], backend="hip", tags=amd)), 2)          # (AMD: since v1.1.30)
-        self.assertEqual(amd, [None] * 2)                                       # (no longer marked: v1.1.53)
-        self.assertEqual(nv, [None] * 2)
-        self.assertRegex(offered([{"arch": 89}])[1], r"^DeepSeek V4\.1 · EXL3 3\.5 bpw \(461 GB\)$")
+        self.assertEqual(len(offered([], backend="hip", tags=amd)), 3)          # (AMD: since v1.1.30)
+        self.assertEqual(amd, [None] * 3)                                       # (no longer marked: v1.1.53)
+        self.assertEqual(nv, [None] * 3)
+        self.assertRegex(offered([{"arch": 89}])[2], r"^DeepSeek V4\.1 · EXL3 3\.5 bpw \(461 GB\)$")
         self.assertEqual(maya.choose_ds4_quant(args(ds4_quant="exl3-3.5"), {}), "exl3-3.5")
 
     def test_exl3_on_amd(self):
@@ -204,6 +205,121 @@ class Quant35(unittest.TestCase):
                 self.assertTrue(Path.samefile(d / n, have / n))   # (a hard link, not a copy)
                 self.assertIsNone(maya.file_incomplete(m, d / n))
             self.assertEqual(json.loads((d / maya.VERIFIED).read_text()), book)
+
+
+class Quant225(unittest.TestCase):
+    """turboderp's 2.25-bit quant (v1.1.60): its own manifest pinned to the 2.25bpw branch's commit, every file's size
+    and sha256; the n-gram (Engram) tables from Maya's own repo, the same pinned files as the other EXL3 quants' (its
+    repo's own copy, ngram_embedding.safetensors, not downloaded); DeepSeek's BF16 vision tower packed in place of its
+    EXL3 one; listed where the EXL3 quants run, never the recommended pick."""
+
+    def test_every_file_pinned(self):
+        m = maya.ds4_model("exl3-2.25")
+        man = json.loads(maya.DS4_EXL3["exl3-2.25"]["manifest"].read_text(encoding="utf-8"))
+        self.assertEqual(man["repo"], "turboderp/DeepSeek-V4.1-Flash-1017-exl3")
+        self.assertEqual(man["revision"], "9183eaaeb6f08dff6ee5b6e34b852911cf6733c9")   # (the 2.25bpw branch, #871's)
+        for n in ["config.json", "model.safetensors.index.json", "tokenizer.json", "quantization_config.json",
+                  "chat_template.jinja"] + [f"model-{i:05d}-of-00026.safetensors" for i in range(1, 27)] + \
+                 ["model-00047-of-00048.safetensors", "model-00048-of-00048.safetensors"]:
+            self.assertIn(n, m["files"])
+        self.assertNotIn("ngram_embedding.safetensors", m["files"])   # (Maya's copy of the same tables instead)
+        for n, size in m["files"].items():
+            self.assertNotIn("/", n)
+            self.assertGreater(size, 0)
+            self.assertRegex(m["sha256"][n], r"^[0-9a-f]{64}$")
+        weights = sum(v for n, v in m["files"].items() if n not in m["sources"]) / 1e9
+        self.assertAlmostEqual(weights, 158.6, delta=0.1)
+        self.assertEqual(round(weights), maya.DS4_EXL3["exl3-2.25"]["weights_gb"])
+        self.assertAlmostEqual(m["download_gb"], 361.7, delta=0.5)
+        self.assertIn("turboderp's EXL3 quant at 2.25 bits", m["about"])
+        u = maya.file_url(m, "model-00001-of-00026.safetensors")
+        self.assertTrue(u.startswith("https://huggingface.co/turboderp/DeepSeek-V4.1-Flash-1017-exl3/resolve/"
+                                     "9183eaaeb6f08dff6ee5b6e34b852911cf6733c9/"))
+        u = maya.file_url(m, "model-00047-of-00048.safetensors")
+        self.assertTrue(u.startswith("https://huggingface.co/peasantsmith/DeepSeek-V4.1-Flash-1017-Maya-GGUF/"))
+        self.assertIn("/Engram-BF16/", u)
+        e29 = maya.ds4_model("exl3")
+        for n in m["sources"]:
+            self.assertEqual((m["files"][n], m["sha256"][n], m["sources"][n]),
+                             (e29["files"][n], e29["sha256"][n], e29["sources"][n]))
+
+    def test_memory_and_folder(self):
+        q = maya.DS4_EXL3["exl3-2.25"]
+        self.assertEqual((q["bits"], q["by"], q["tower"]), ("2.25", "turboderp", "deepseek"))
+        self.assertGreater(q["memory_gb"], q["weights_gb"])
+        self.assertLess(q["memory_gb"], maya.DS4_EXL3["exl3"]["memory_gb"])
+        self.assertEqual(maya.ds4_memory_gb("exl3-2.25"), float(q["memory_gb"]))
+        models = Path("/models")
+        self.assertEqual(maya.ds4_dir(args(), models, {}, "exl3-2.25"), models / "DeepSeek-V4.1-Flash-1017-EXL3-2.25bpw")
+        self.assertEqual(maya.Q.OTHERS[("deepseek", "exl3-2.25")], "EXL3 2.25 bpw")
+
+    def test_listed_not_recommended(self):
+        """Listed first of the EXL3 rows (fewest bits); the recommendation stays the fit rule's among Maya's quants,
+        also on a PC whose memory holds the 2.25 and not Maya-S."""
+        for vram, ram in ((24.0, 160.0), (160.0, 32.0), (96.0, 512.0)):
+            rows = []
+
+            def pick(title, intro, opts, default, yes, *x):
+                rows.extend(opts)
+                return default
+            gpus = [{"arch": 86, "vram_gb": vram, "index": 0}]
+            with patch.object(maya.S, "gpus", return_value=gpus), patch.object(maya, "choose", pick), \
+                    patch.object(maya.S, "UI", None), patch.object(maya, "mem_gb", return_value=(ram, ram)):
+                maya.choose_ds4_quant(args(), {})
+            ex = [r for r in rows if r[0].startswith("DeepSeek V4.1 · EXL3")]
+            self.assertRegex(ex[0][0], r"^DeepSeek V4\.1 · EXL3 2\.25 bpw \(362 GB\)$")
+            self.assertIsNone(ex[0][1])                                   # (not "recommended")
+            self.assertIn("turboderp", ex[0][2])
+            self.assertEqual(sum(r[1] == "recommended" for r in rows), 1)
+            rec = next(r for r in rows if r[1] == "recommended")
+            self.assertIn("Maya-", rec[0])
+        self.assertEqual(maya.choose_ds4_quant(args(ds4_quant="exl3-2.25"), {}), "exl3-2.25")
+
+    def test_vision_from_deepseeks_tower(self):
+        """The pack takes the shared vision folder's BF16 tower (pack.py --vision): a GGUF install's folder when one
+        is there, else Maya's GGUF folder's (the setup makes it there)."""
+        models = Path(tempfile.mkdtemp())
+        self.assertEqual(maya.ds4_exl3_vision_dir(models), models / f"{maya.DS4}-Maya-GGUF" / "vision")
+        v = models / f"{maya.DS4}-GGUF" / "vision"
+        v.mkdir(parents=True)
+        (v / "vision.bin").write_bytes(b"x")
+        (v / "vision.json").write_text("{}")
+        self.assertEqual(maya.ds4_exl3_vision_dir(models), v)
+        pack = models / "pack"
+        pack.mkdir()
+        (pack / "tensors.txt").write_text("file 0 model-00001-of-00026.safetensors\nt x BF16 0 0 2 1\n")
+        self.assertFalse(maya.ds4_pack_tower(pack))
+        (pack / "tensors.txt").write_text("file 0 model-00001-of-00026.safetensors\n"
+                                          "file 1 ../DeepSeek-V4.1-Flash-1017-GGUF/vision/vision.bin\nt x BF16 0 0 2 1\n")
+        self.assertTrue(maya.ds4_pack_tower(pack))
+        self.assertFalse(maya.ds4_pack_tower(models / "none"))
+        for k in ("exl3", "exl3-3.5"):                                   # (their own towers are BF16)
+            self.assertIsNone(maya.DS4_EXL3[k].get("tower"))
+
+    def test_config(self):
+        """DeepSeek's own sampling and effort, the vision tower on, drafting as the other EXL3 quants (no --dspark
+        until the speed calibration or the user's choice)."""
+        models = Path("/models")
+        d = Path(tempfile.mkdtemp())
+        quiet = [patch.object(maya, "ROOT", d), patch.object(maya, "say", lambda *a: None),
+                 patch.object(maya, "ok", lambda *a: None), patch.object(maya, "step", lambda *a: None)]
+        for q in quiet:
+            q.start()
+        try:
+            p = maya.write_config_ds4(args(), {"gpus": [{"index": 0}]}, {}, d / "maya-ds4", 65536, models, d,
+                                      "exl3-2.25", vision=True)
+            c = json.loads(p.read_text())
+            off = maya.write_config_ds4(args(), {"gpus": [{"index": 0}]}, {}, d / "maya-ds4", 65536, models, d,
+                                        "exl3-2.25", vision=False)
+            c_off = json.loads(off.read_text())
+        finally:
+            for q in quiet:
+                q.stop()
+        self.assertEqual(c["installer"]["ds4_quant"], "exl3-2.25")
+        self.assertEqual((c["sampling"], c["reasoning_effort"]), (dict(maya.DS4_SAMPLING), maya.DS4_EFFORT))
+        self.assertEqual(c["model_name"], maya.DS4_MODEL_NAME)
+        self.assertNotIn("--vision", c["args"])
+        self.assertIn("--vision", c_off["args"])                          # (no tower packed: text only, said)
 
 
 GPUS3 = [{"index": i, "name": "RTX 5060 Ti", "vram_gb": 15.9} for i in range(3)]

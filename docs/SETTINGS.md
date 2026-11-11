@@ -1423,14 +1423,15 @@ conversation is not kept as a slot or a shared start.
 | Models page: Refusal ablation | off | the default for requests that leave `ablate` out (no restart) |
 | `--ablate-default on\|off` (engine) | on (the startup flag as before) | off: loaded, projected only for requests with `ablate=1` |
 
-**Direction files.** A model's repo can ship `<Model>-refusal-direction.gguf` beside the weights: a control vector
+**Direction files.** A model's repo can ship `<Model>-refusal-direction.gguf` in its `refusal-directions/` folder: a control vector
 GGUF (`general.architecture` `controlvector`, one F32 tensor `direction.1` of the model's hidden size) with
 `maya.ablate.scale` (its strength; `--ablate-scale` overrides it), `maya.ablate.fit_layer` (the layer it was taken
 at), `maya.ablate.model`, `maya.ablate.fitted_on` (the quant it was fitted on) and `maya.ablate.version`. A config
 names it as `"ablate": {"file": "<path>", "fitted_on": "<quant>"}` (optional `"scale"`), with `--ablate FILE
---ablate-default off` in its engine `args`. The setup downloads the file from the model's own Maya repo
-(`GLM-5.3-Flash`, `GLM-5.3`, `DeepSeek-V4.1-Flash` and `MiniMax-M3.1-Flash-refusal-direction.gguf`, a few KB, into
-`<models folder>/refusal-directions/`) and writes both; when the repo has none yet, there is no connection or the file
+--ablate-default off` in its engine `args`. The setup downloads the file from the `refusal-directions/` folder of the
+model's own Maya repo, or from the repo's top when that folder has none (`GLM-5.3-Flash`, `GLM-5.3`,
+`DeepSeek-V4.1-Flash` and `MiniMax-M3.1-Flash-refusal-direction.gguf`, a few KB, into
+`<models folder>/refusal-directions/`), and writes both; when the repo has none yet, there is no connection or the file
 is not a direction for that model, the setup goes on without it and the switch stays off. A file named by hand (outside
 that folder) is kept as it is.
 

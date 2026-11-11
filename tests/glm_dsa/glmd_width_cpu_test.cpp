@@ -181,6 +181,34 @@ int main() {
     std::printf("glmd_width_cpu_test: MoeRequest %zu B, ring %zu KB, MoeResponse %zu B, CpuAnswer %zu B\n",
                 sizeof(gf::MoeRequest), sizeof(gf::MoeRequest) * gf::kRingSize / 1024, sizeof(gf::MoeResponse),
                 sizeof(gf::CpuAnswer));
+    // the ring HIP's fast_setup sizes from the model (a decode round's routes: n_layers + 1 + a 16-token window):
+    // GLM-5.3-Flash (45 layers, 4096) = v1.1.56's 64 entries of 4096 floats, glm-dsa (78, 6144) 128 of 6144
+    {
+        constexpr unsigned int flash_stride = gf::ring_stride_for(4096), dsa_stride = gf::ring_stride_for(6144);
+        static_assert(gf::ring_entries_for(45 + 1 + 16) == 64 && gf::ring_entries_for(78 + 1 + 16) == 128, "entries");
+        static_assert(gf::ring_entries_for(1) == gf::kRingMinEntries && gf::ring_entries_for(100000) == gf::kRingSize,
+                      "entries 64..kRingSize");
+        static_assert(gf::ring_stride_for(gf::kMaxEmbd) == sizeof(gf::MoeRequest), "a kMaxEmbd entry = MoeRequest");
+        static_assert(flash_stride % alignof(gf::MoeRequest) == 0 && dsa_stride % alignof(gf::MoeRequest) == 0, "align");
+        check(flash_stride >= offsetof(gf::MoeRequest, x) + 4096 * sizeof(float) &&
+                  dsa_stride >= offsetof(gf::MoeRequest, x) + 6144 * sizeof(float),
+              "a sized entry holds the fields + n_embd floats");
+        for (unsigned int n = gf::kRingMinEntries; n <= (unsigned int) gf::kRingSize; n *= 2u)
+            check(gf::ring_entries_for((int) n) == n && gf::ring_entries_for((int) n + 1) == std::min(2u * n, 256u),
+                  "entries: the power of two covering the routes");
+        // addressing: seq & (n - 1) entries of stride bytes; 0, 0 = the kRingSize x sizeof(MoeRequest) ring
+        std::vector<uint8_t> ring((size_t) 64 * flash_stride);
+        uint8_t* base = ring.data();
+        bool addr_ok = true;
+        for (unsigned int seq = 0xFFFFFF00u; seq != 0x100u; ++seq) {   // across the unsigned wrap
+            const uint8_t* want = base + (size_t) (seq % 64u) * flash_stride;
+            addr_ok &= (const uint8_t*) gf::ring_entry(base, seq, 64, flash_stride) == want;
+            addr_ok &= gf::ring_entry(base, seq, 0, 0) == (gf::MoeRequest*) base + (seq % (unsigned int) gf::kRingSize);
+        }
+        check(addr_ok, "ring_entry addresses (sized and the default ring, across the sequence wrap)");
+        std::printf("glmd_width_cpu_test: sized ring Flash 64 x %u B = %u KB, glm-dsa 128 x %u B = %u KB\n",
+                    flash_stride, 64 * flash_stride / 1024, dsa_stride, 128 * dsa_stride / 1024);
+    }
 
     // B5.2: native_fmt's caps at 6144 (kNativeActBytes 8192 holds 24 Q8_K blocks = 7008 B; n_ff 2048 h = 2336 B)
     const int types[][2] = {{GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ3_XXS}, {GGML_TYPE_IQ2_XS, GGML_TYPE_Q2_K},

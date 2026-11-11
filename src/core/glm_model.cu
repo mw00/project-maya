@@ -1675,7 +1675,7 @@ static std::vector<int> glm_search_bounds(const std::string& pack_dir, int64_t m
     // a DFlash drafter's pipelined window (dflash_pipelined): the anchor crosses every part, and each draft kept behind
     // it costs about the slowest part, so a round of a kept drafts costs sum + a * slowest for a + 1 tokens (a ~1.5 at
     // the pipelined window's default cut); the batched one crosses the parts in turn (the parts added)
-    const bool df_pipe = dflash > 0 && dflash_pipelined(n);
+    const bool df_pipe = dflash > 0 && dflash_pipelined(n, !g.mhc());
     constexpr double kDfKept = 1.5;
     // ... and there each layer also costs a fixed time a token beyond its reads (launches, the CPU lane's answer, the
     // hops): Maya-L over 9 GPUs measured ~0.78 ms a layer on a 5060 Ti and ~0.59 on the 3090 (2.1x its bandwidth),

@@ -1057,6 +1057,13 @@ public:
     bool dflash_load(const std::string& path, int dev, std::string& err);
     bool dflash_bind(std::string& err);                    // after the parts loaded: the captures wired
     void dflash_capture(int il, const float* R, int n, int64_t p0, float* scratch, int rows, cudaStream_t s);
+    /// a layer of this part is one the drafter reads (its token pass then copies rows out: no replayed graph)
+    bool dflash_captures_here() const {
+        if (cap_d_ == nullptr) return false;
+        for (int il = l0_; il < l1_ && il < (int) cap_k_.size(); ++il)
+            if (cap_k_[(size_t) il] >= 0) return true;
+        return false;
+    }
     bool dflash_ready() const;
     void dflash_reset();
     /// The DFlash decode (Strata's serial speculative loop with a block drafter): each round the drafter's block for

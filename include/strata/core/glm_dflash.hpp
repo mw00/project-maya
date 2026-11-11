@@ -25,8 +25,10 @@ namespace strata::core {
 /// batched (all of the window a part at a time, staggered, each part's CPU lane on both parts' pools).
 /// MAYA_GLM_WIN_PIPE=1 / 0 forces either; by default pipelined from three parts up.  Maya-L, 3090 + 5060 Ti:
 /// batched 21.8 tok/s against MTP's 20.5 (pipelined 17.3); nine GPUs: pipelined 59.8-62.0 against MTP's 42.5.
-inline bool dflash_pipelined(int n_parts) {
-    if (n_parts < 2) return false;
+/// plain: a model without hyper-connections (GLM-5.3 744B) - the pipelined window is the mHC token path's, so its
+/// splits always verify in the batched window (glm_window.cu's window(), plain-residual rows).
+inline bool dflash_pipelined(int n_parts, bool plain = false) {
+    if (n_parts < 2 || plain) return false;
     const char* v = std::getenv("MAYA_GLM_WIN_PIPE");
     if (v != nullptr && v[0] != '\0') return std::atoi(v) != 0;
     return n_parts >= 3;

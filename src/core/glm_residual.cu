@@ -99,6 +99,9 @@ bool Glm5Model::fast_layers_plain(int64_t p, bool hop_in, std::string& err) {
         const char* host_off = glmdsa::host_off_reason(F->prof_on, dumps, glmknob::get(glmknob::PrefetchN, F->max_pf),
                                                         F->n_ahead, getenv("GLM_DUMP_H") != nullptr,
                                                         glmknob::get(glmknob::GraphsOff, 0) != 0);
+        // a DFlash2 drafter's captures (dflash_capture) copy each position's rows to the host and book them there:
+        // host work a replayed graph would skip
+        if (host_off == nullptr && dflash_captures_here()) host_off = "the DFlash2 drafter's captures";
         uint64_t requests = 0;
         for (int il = l0_; il < l1_; ++il) requests += F->L[(size_t) il].moe ? 1 : 0;
         if (!glmdsa::graph_prepare(*F->dsa, lay_, l0_, l1_, p, F->cpu_plan, R, state_, host_off, requests, s, pg, err,
@@ -118,6 +121,9 @@ bool Glm5Model::fast_layers_plain(int64_t p, bool hop_in, std::string& err) {
         if (il != l0_) ablate(F->ffn, 1, s);   // (--ablate: the previous FFN's write loses the direction)
         glmres::res_read(R, il == l0_ ? nullptr : F->ffn, Ly.attn_norm, g.norm_eps, E, F->x, F->xq, s);
         if (F->prof_on) F->mark("res_attn");
+        // R now holds the layer's input (the previous FFN's add is in): the DFlash2 drafter's feature when it reads
+        // this layer (GLM-5.3 744B's taps, dflash.target_layers)
+        dflash_capture(il, R, 1, p, F->cap, F->cap_rows, s);
         if (dumps) {
             if (il != l0_) plain_dump(s, "l_out-" + std::to_string(il - 1), R, E);
             plain_dump(s, "attn_norm-" + std::to_string(il), F->x, E);
@@ -216,6 +222,9 @@ bool Glm5Model::fast_window_layers_plain(int64_t p0, int T, std::string& err) {
             glmres::res_read(R + (size_t) t * E, il == l0_ ? nullptr : W.ffn + (size_t) t * E, Ly.attn_norm, g.norm_eps,
                              E, W.x + (size_t) t * E, (uint8_t*) W.xq + (size_t) t * W.xq_s, s);
         mark("res_attn");
+        // the rows' layer inputs: the DFlash2 drafter's features when it reads this layer (rejected rows are written
+        // again by the next window at their positions; only kept ones reach its ring)
+        dflash_capture(il, R + (size_t) t0 * E, n, p0 + t0, F->cap, F->cap_rows, s);
         if (!fast_dsa_glm_window(il, p0, t0, n, W.x, W.xq, W.xq_s, W.mixer, err)) return false;
         mark("dsa");
         ablate(W.mixer + (size_t) t0 * E, n, s);

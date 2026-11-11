@@ -3990,7 +3990,7 @@ __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const STRATA_G
     // ROUTE_FAST: the FFN input out to the request's slot now (this route's slot: seq is this kernel's to advance),
     // its PCIe writes beside the selection instead of after the plan - whether or not the CPU lane takes an expert
     if (a.fast) {
-        MoeRequest* rq0 = (MoeRequest*) a.d.ring + ((*a.d.seq + 1) % kRingSize);
+        MoeRequest* rq0 = ring_entry(a.d.ring, *a.d.seq + 1, a.d.ring_n, a.d.ring_stride);
         for (int e = tid; e < a.n_embd; e += ROUTE_THREADS) rq0->x[e] = a.x[e];
     }
     __syncthreads();
@@ -4115,7 +4115,7 @@ __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const STRATA_G
             }
             const unsigned int seq = *a.d.seq + 1;
             *a.d.seq = seq;
-            MoeRequest* rq = (MoeRequest*) a.d.ring + (seq % kRingSize);
+            MoeRequest* rq = ring_entry(a.d.ring, seq, a.d.ring_n, a.d.ring_stride);
             rq->layer = a.layer;
             rq->error = bad;
             rq->win = a.win;
@@ -4403,7 +4403,7 @@ __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const STRATA_G
         }
         a.d.fetch_src[tid] = on ? s_fsrc[tid] : 0ull;
     }
-    MoeRequest* rq = (MoeRequest*) a.d.ring + (s_seq % kRingSize);
+    MoeRequest* rq = ring_entry(a.d.ring, s_seq, a.d.ring_n, a.d.ring_stride);
     if (s_cpu != 0u && !a.fast)
         for (int e = tid; e < a.n_embd; e += ROUTE_THREADS) rq->x[e] = a.x[e];
     // the request's fields before x: put together in shared memory by thread 0, then out over PCIe in 8-byte words by
@@ -6648,6 +6648,12 @@ void moe_route(const float* logits, const float* bias, int n_expert, int k, floa
                int win_rows, bool resident_ok, int norm_mode) {
     if (const char* why = moe_limits_error(n_embd, k, n_expert)) {   // glm-dsa: fail closed, never past x[kMaxEmbd]
         std::fprintf(stderr, "glm_fast moe_route: n_embd %d, k %d, n_expert %d refused: %s\n", n_embd, k, n_expert, why);
+        g_launch_errors.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    if (d.ring_stride != 0u && ring_stride_for(n_embd) > d.ring_stride) {   // a sized ring: never past its entry
+        std::fprintf(stderr, "glm_fast moe_route: n_embd %d refused: wider than the routing ring's entries (%u B)\n",
+                     n_embd, d.ring_stride);
         g_launch_errors.fetch_add(1, std::memory_order_relaxed);
         return;
     }

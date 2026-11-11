@@ -308,6 +308,56 @@ static int ring_canary(cudaStream_t s) {
     CHECK(cudaMemcpy(&seq_after, d.seq, 4, cudaMemcpyDeviceToHost));
     expect(gf::launch_errors() == e0 + 4, "n_embd > kMaxEmbd, k > 8, n_expert > 512, wide wait: refused and counted");
     expect(seq_after == seq_before, "a refused route publishes nothing");
+
+    // the ring HIP's fast_setup sizes from the model: 128 entries of ring_stride_for(6144) bytes - the last entry's
+    // route and the wrap to entry 0 publish x inside their own entry, the next entry and the route_error word keep the
+    // canary; a route wider than the entries is refused and counted
+    {
+        const unsigned int n = gf::ring_entries_for(78 + 1 + 16), stride = gf::ring_stride_for(N);
+        const size_t bytes = (size_t) n * stride + sizeof(int);
+        uint8_t* sring = nullptr;
+        CHECK(cudaHostAlloc((void**) &sring, bytes, cudaHostAllocMapped));
+        std::memset(sring, 0xA5, bytes);
+        void* smapped = nullptr;
+        CHECK(cudaHostGetDevicePointer(&smapped, sring, 0));
+        gf::MoeDev ds = d;
+        ds.ring = smapped;
+        ds.ring_n = n;
+        ds.ring_stride = stride;
+        auto* serr = (volatile int*) (sring + (size_t) n * stride);
+        *serr = 0;
+        ds.route_error = (volatile int*) ((uint8_t*) smapped + (size_t) n * stride);
+        const unsigned int sstart = n - 2;
+        CHECK(cudaMemcpy(ds.seq, &sstart, 4, cudaMemcpyHostToDevice));
+        for (int pass = 0; pass < 2; ++pass) {
+            gf::moe_route(logits, bias, E, K, 2.5f, true, 0, input, N, ds, nullptr, nullptr, 1.0f, 0, nullptr, s,
+                          nullptr, nullptr, 0, nullptr, nullptr, 0, K, plan);
+            CHECK(cudaStreamSynchronize(s));
+            const unsigned int seq = sstart + 1 + (unsigned) pass;
+            const gf::MoeRequest* rq = gf::ring_entry(sring, seq, n, stride);
+            expect((const uint8_t*) rq == sring + (size_t) (seq % n) * stride, "sized ring: entry seq % n");
+            expect(rq->seq == seq && rq->error == 0 && rq->cpu_mask == 0xffu, "sized ring: route published");
+            bool x_ok = true;
+            for (int e = 0; e < N; ++e) x_ok &= rq->x[e] == x[(size_t) e];
+            expect(x_ok, "sized ring: x carries the 6144-wide input");
+            const uint8_t* end = (const uint8_t*) rq + stride;   // the entry's padding, then the next entry
+            bool rest_ok = true;
+            for (const uint8_t* b = (const uint8_t*) (rq->x + N); b < end; ++b) rest_ok &= *b == 0xA5;
+            if (pass == 0) {   // entry n - 1: next is the route_error word
+                expect(*serr == 0, "sized ring: route_error after the last entry untouched");
+            } else {
+                for (size_t b = 0; b < stride; ++b) rest_ok &= end[b] == 0xA5;
+            }
+            expect(rest_ok, "sized ring: the entry's tail and the next entry untouched (canary)");
+        }
+        const int e1 = gf::launch_errors();
+        gf::moe_route(logits, bias, E, K, 2.5f, true, 0, input, N + 64, ds, nullptr, nullptr, 1.0f, 0, nullptr, s);
+        CHECK(cudaStreamSynchronize(s));
+        unsigned int sseq = 0;
+        CHECK(cudaMemcpy(&sseq, ds.seq, 4, cudaMemcpyDeviceToHost));
+        expect(gf::launch_errors() == e1 + 1 && sseq == sstart + 2, "sized ring: a wider route refused and counted");
+        cudaFreeHost(sring);
+    }
     cudaFreeHost(ring);
     cudaFree(arena);
     return 0;

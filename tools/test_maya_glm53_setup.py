@@ -208,11 +208,12 @@ class Setup(unittest.TestCase):
     def test_apu_context_keeps_the_whole_model_in_memory(self):
         """A unified-memory APU (the GPU's share and the RAM one pool): the largest context whose cache leaves the whole
         model in memory.  As measured on a 192 GB Gorgon Halo on Windows (160 GB the GPU's, ~32 GB RAM) with Maya-XS:
-        256K (~15.7 GB of cache) put 10.1 GB of experts on the SSD, 64K did not."""
+        256K (~15.7 GB of cache) put 10.1 GB of experts on the SSD, 64K still 55 experts (0.43 GB): 32K is recommended
+        (APU_CONTEXT_SAFETY_GB)."""
         need, kv = maya.g53_figures("GLM-5.3-Maya-XS")[0], maya.G53.KV_BYTES
-        self.assertEqual(maya.apu_context(160, 31.6, need, kv), 65536)
-        self.assertEqual(maya.apu_context(160, 31.6, need, kv, contexts=maya.CONTEXTS + [262144]), 65536)
-        self.assertEqual(maya.apu_context(160, 31.6, need, kv, parallel=2), 32768)       # (a cache each)
+        self.assertEqual(maya.apu_context(160, 31.6, need, kv), 32768)
+        self.assertEqual(maya.apu_context(160, 31.6, need, kv, contexts=maya.CONTEXTS + [262144]), 32768)
+        self.assertEqual(maya.apu_context(160, 31.6, need, kv, parallel=2), 8192)        # (a cache each)
         self.assertEqual(maya.apu_context(200, 64, need, kv), 131072)                    # (room: the largest)
         self.assertIsNone(maya.apu_context(96, 31.6, need, kv))                          # (the model alone spills)
         self.assertIsNone(maya.apu_context(160, 0, need, kv))                            # (the RAM did not read)
@@ -228,10 +229,10 @@ class Setup(unittest.TestCase):
                                             "vram_gb": 160}]}
         # (the measured Halo was on Windows: its 160 GB carve-out beside ~32 GB RAM)
         with patch.object(maya, "mem_gb", return_value=(31.6, 20.0)), patch.object(maya, "WIN", True):
-            self.assertEqual(self.offered(g53, halo), {"contexts": maya.CONTEXTS, "recommended": 65536})
+            self.assertEqual(self.offered(g53, halo), {"contexts": maya.CONTEXTS, "recommended": 32768})
             rec, line = maya.g53_apu_context(halo, {"kv_bytes": kv, "parallel": 1}, "GLM-5.3-Maya-XS", maya.CONTEXTS)
-            self.assertEqual(rec, 65536)
-            self.assertIn("64K recommended", line)
+            self.assertEqual(rec, 32768)
+            self.assertIn("32K recommended", line)
             self.assertNotIn("\n", line)
             # an explicit --context wins (choose_context returns it), and the setup says what it costs here
             a = SimpleNamespace(**{**vars(self.a), "models_dir": None, "context": 131072})
@@ -245,7 +246,7 @@ class Setup(unittest.TestCase):
                 maya.set_up(a, {})
             self.assertIn("context: 131072 tokens", q.text)
             self.assertIn("128K context's cache pushes experts to the SSD", q.text)
-            self.assertNotIn("64K recommended", q.text)
+            self.assertNotIn("32K recommended", q.text)
         # a discrete card: as before
         one = {"backend": "cuda", "gpus": [{"index": 0, "name": "V100", "vram_gb": 32}]}
         self.assertEqual(maya.g53_apu_context(one, {"kv_bytes": kv, "parallel": 1}, None, maya.CONTEXTS), (None, None))

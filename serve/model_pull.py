@@ -28,8 +28,8 @@ PROGRESS = re.compile(r"([\d.]+) / ([\d.]+) GB(?: \((\d+)%\))?(?: · ([\d.]+) MB
 # by its name): (catalog id, family, the setup's key, who made them).  The Models page lists them under "Other quants".
 # Left out as the setup's own list leaves them out: DeepSeek's UD-Q4_K_XL (maya.DS4_BY_HAND) and GLM's
 # EXL3-sc_4.10bpw (maya.MODELS_BY_HAND) - a command line still takes them.
-DS4_OTHER = (("exl3", "LibertAIDAI"), ("exl3-3.5", "LibertAIDAI"), ("gguf-q8", "unsloth"), ("gguf-iq1_s", "unsloth"),
-             ("gguf-iq1_m", "unsloth"), ("gguf-iq2_xxs", "unsloth"), ("gguf-q2_k_xl", "unsloth"),
+DS4_OTHER = (("exl3-2.25", "turboderp"), ("exl3", "LibertAIDAI"), ("exl3-3.5", "LibertAIDAI"), ("gguf-q8", "unsloth"),
+             ("gguf-iq1_s", "unsloth"), ("gguf-iq1_m", "unsloth"), ("gguf-iq2_xxs", "unsloth"), ("gguf-q2_k_xl", "unsloth"),
              ("gguf-iq3_xxs", "unsloth"), ("gguf-iq3_s", "unsloth"), ("gguf-q3_k_xl", "unsloth"),
              ("abliterated-128g", "orcarouter"), ("abliterated-256g", "orcarouter"))
 GLM_EXL3 = ("EXL3-3.05bpw", "EXL3-4.05bpw")
