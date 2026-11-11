@@ -3424,6 +3424,9 @@ def write_config(a, pc, meta, pack: Path, quant: str, ctx: int, models: Path, vi
     if getattr(a, "vram_reserve_mib", None) is not None and not metal:   # given now: written, and a later setup keeps it
         set_arg(cfg["args"], "--vram-reserve-mib", a.vram_reserve_mib)
         ok(f"VRAM kept free beside the expert pool: {a.vram_reserve_mib} MiB (--vram-reserve-mib)")
+    if getattr(a, "vram_reserve_later_mib", None) is not None and pc.get("backend") == "hip":
+        set_arg(cfg["args"], "--vram-reserve-later-mib", a.vram_reserve_later_mib)
+        ok(f"VRAM kept free on the split's later GPUs: {a.vram_reserve_later_mib} MiB (--vram-reserve-later-mib)")
     for line in prefill_tips(cfg["args"], mem_gb()[0], len(pc["gpus"])):
         ok(line)
     gguf_dir = local.parent if local else Path(a.gguf_dir).expanduser().resolve() if a.gguf_dir else None
@@ -7095,6 +7098,10 @@ def main() -> int:
     ap.add_argument("--vram-reserve-mib", type=int, metavar="N",
                     help="VRAM in MiB the expert pool leaves free on each GPU for the driver, the desktop and other "
                          "programs (default 700), kept in the config")
+    ap.add_argument("--vram-reserve-later-mib", type=int, metavar="N",
+                    help="GLM on AMD, a layer split: the reserve in MiB on the split's later GPUs (the 2nd, 3rd, ... "
+                         "card), where --vram-reserve-mib covers only the first - e.g. a big reserve on the APU part "
+                         "whose pool comes from the shared RAM (default: --vram-reserve-mib's), kept in the config")
     ap.add_argument("--mmap-experts", choices=["auto", "on", "off"],
                     help="DeepSeek: the experts VRAM does not hold - read in place from the files (auto, the default), "
                          "or off: copied into RAM (with DS4_REQUIRE_ALL_RAM=1 all of them); kept in the config")
@@ -7139,6 +7146,8 @@ def main() -> int:
         ap.error(why)
     if a.vram_reserve_mib is not None and a.vram_reserve_mib < 0:
         ap.error("--vram-reserve-mib takes a number of MiB, 0 or more, e.g. --vram-reserve-mib 2048")
+    if a.vram_reserve_later_mib is not None and a.vram_reserve_later_mib < 0:
+        ap.error("--vram-reserve-later-mib takes a number of MiB, 0 or more, e.g. --vram-reserve-later-mib 16384")
     if a.config is not None:
         if not a.config.is_file():
             ap.error(f"config not found: {a.config}")
