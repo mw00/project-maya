@@ -196,6 +196,7 @@ Header released(uint32_t E = 896) {
         h.tensors.push_back({b + "ffn_gate_exps.weight", {3584, 3072, E}});
         h.tensors.push_back({b + "ffn_up_exps.weight", {3584, 3072, E}});
         h.tensors.push_back({b + "ffn_down_exps.weight", {3072, 3584, E}});
+        h.tensors.push_back({b + "ffn_routed_down.weight", {7168, 3584}});   // (the latent's own width: not thin)
     }
     return h;
 }
@@ -395,9 +396,12 @@ void test_key_refusals() {
           "expert_count", "expert_used_count", "expert_shared_count", "expert_latent_length",
           "expert_feed_forward_length", "expert_gating_func", "expert_weights_scale", "expert_weights_norm",
           "activation.situ_beta", "activation.situ_linear_beta", "attn_res.block_size", "attention.indexer.head_count",
-          "attention.indexer.key_length", "attention.indexer.top_k", "attention.layer_norm_rms_epsilon",
-          "attention.layer_norm_epsilon"})
+          "attention.indexer.key_length", "attention.indexer.top_k", "attention.layer_norm_rms_epsilon"})
         refuse(std::string("missing ") + k, released().erase(P + k), P + k + " is missing");
+    {   // attention.layer_norm_epsilon is optional (upstream llama.cpp's converter leaves it out): the indexer's 1e-5
+        const Run r = accept("missing attention.layer_norm_epsilon", released().erase(P + "attention.layer_norm_epsilon"));
+        expect(r.ok && r.g.eps_indexer_ln == 1e-5f, "missing attention.layer_norm_epsilon: the default 1e-5");
+    }
 
     // types
     refuse("embedding_length f32", released().set(kv_f32(P + "embedding_length", 7168.0f)),
