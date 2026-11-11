@@ -9458,6 +9458,25 @@ struct Model::Impl {
         const bool leaves_none = logical == 0 || logical - std::min(logical, used) < (size_t) spare_cores + 1;
         for (size_t X = 0; X < c.cpus.size(); ++X) {
             std::vector<int> v = c.cpus[X];
+            // Opt-in: order only the CPU-lane workers without restricting the rest of the engine.
+            // The list is filtered to this part's allowed CPUs and any unlisted CPUs retain their original order.
+            if (X == 0 && c.cpus.size() == 1) {
+                const char* order = ds4_env("DS4_CPU_LANE_CPUS");
+                if (order != nullptr && *order != 0) {
+                    std::vector<int> reordered;
+                    for (int cpu : cpu_list(order))
+                        if (std::find(v.begin(), v.end(), cpu) != v.end() &&
+                            std::find(reordered.begin(), reordered.end(), cpu) == reordered.end())
+                            reordered.push_back(cpu);
+                    for (int cpu : v)
+                        if (std::find(reordered.begin(), reordered.end(), cpu) == reordered.end())
+                            reordered.push_back(cpu);
+                    if (!reordered.empty()) {
+                        v = std::move(reordered);
+                        std::fprintf(stderr, "ds4: CPU lane order: DS4_CPU_LANE_CPUS (%zu allowed CPUs)\n", v.size());
+                    }
+                }
+            }
             if (X == 0) v.erase(std::remove(v.begin(), v.end(), svc), v.end());   // (the service thread's)
             if (X == 0 && o.cpu_threads <= 0 && leaves_none && (int) v.size() > spare_cores + 1)
                 v.resize(v.size() - (size_t) spare_cores);
