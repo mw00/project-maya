@@ -563,6 +563,7 @@ struct Model::Impl {
     bool dio_direct = true;
     std::vector<std::vector<int>> slot_of;        // [layer][expert]: its slot, or -1
     std::vector<std::array<Experts*, 3>> lx;      // [layer]: its gate, up and down experts (null: not a MoE layer)
+    std::vector<int> tier_cls;                    // [layer]: its RAM tier size class, or -1
     uint64_t tier_run = 0, tier_clock = 1ULL << 40;   // a layer's run (slots busy in it stay), the LRU's clock
     uint64_t tier_cold = 0;                       // --tier-prompt-cold: prompt reads' stamps, below every decode stamp
     uint64_t prompt_clock0 = 0;                   // the clock when this call began (stamps above it: set in this call)
@@ -579,22 +580,33 @@ struct Model::Impl {
         int demoted = -1;           // the RAM slot this slot's victim is being copied back into (adopted), or -1
         uint64_t stamp = 0, busy = 0;
         cudaEvent_t ev = nullptr;   // the copies queued for this slot (victim back, then upload) are done
+        int cls = 0;                // its size class in the pool
+        uint8_t* at = nullptr;      // its bytes
     };
     enum : int { kVEmpty = 0, kVUp = 1, kVReady = 2 };
+    struct VCls {                         // a size class of a card's pool (opt.tier_classes; one: the whole pool)
+        uint8_t* base = nullptr;          // its slots (cudaFree)
+        size_t sb = 0, region[3] = {0, 0, 0};
+        std::vector<int> ids, free;       // its slots in slot order (the LRU scan's); its free slots
+        std::string name;
+    };
     struct VPool {
         int cuda = -1;
-        uint8_t* base = nullptr;
-        size_t sb = 0, region[3] = {0, 0, 0};
+        std::vector<VCls> c;
         std::vector<VSlot> s;
-        std::vector<int> free, pending;   // free slots; slots with copies in flight
+        std::vector<int> pending;         // slots with copies in flight
         cudaStream_t copy = nullptr;      // non-blocking: the copies overlap the calls' kernels
     };
     std::vector<VPool> vpools;
     std::vector<int> vpool_l;                     // [layer]: its card's pool, or -1
+    std::vector<int> vcls_l;                      // [layer]: its size class in that pool
     std::vector<std::vector<int>> vslot_of;       // [layer][expert]: its pool slot, or -1
     std::map<int, std::pair<int, int>> vcover;
     std::map<int, size_t> free0;                  // each card's free VRAM before the load (a shared card's cap)    // an adopted RAM slot -> the (pool, slot) whose event completes it
-    uint8_t* vaddr(const VPool& v, int s, int i) const { return v.base + (size_t) s * v.sb + v.region[i]; }
+    uint8_t* vaddr(const VPool& v, int s, int i) const {
+        const VSlot& x = v.s[(size_t) s];
+        return x.at + v.c[(size_t) x.cls].region[i];
+    }
     // a slot's copies are done: its victim's RAM slot is ready, its expert runs from VRAM and its RAM slot is freed.
     // Only on the slot's card after the call's first synchronous copy (every earlier kernel there is done, so none
     // still reads the RAM slot)
@@ -647,14 +659,15 @@ struct Model::Impl {
     bool vpromote(int il, int e, uint64_t run) {
         const int pi = vpool_l[(size_t) il];
         VPool& v = vpools[(size_t) pi];
+        VCls& k = v.c[(size_t) vcls_l[(size_t) il]];
         int si = -1;
-        if (!v.free.empty()) { si = v.free.back(); v.free.pop_back(); }
+        if (!k.free.empty()) { si = k.free.back(); k.free.pop_back(); }
         else {
             uint64_t bs = UINT64_MAX;
-            for (size_t j = 0; j < v.s.size(); ++j) {
-                const VSlot& x = v.s[j];
+            for (const int j : k.ids) {
+                const VSlot& x = v.s[(size_t) j];
                 if (x.state != kVReady || x.busy == run || x.demoted >= 0) continue;
-                if (x.stamp < bs) { bs = x.stamp; si = (int) j; }
+                if (x.stamp < bs) { bs = x.stamp; si = j; }
             }
         }
         if (si < 0) return false;
@@ -665,7 +678,7 @@ struct Model::Impl {
         if (x.state == kVReady) {   // the victim: back to a RAM slot, else to the mapping
             const int ol = x.layer, oe = x.expert;
             int al = -1, ae = -1;
-            const int vs = vtest_drop ? -1 : tier->take(ol, oe, run, al, ae);
+            const int vs = vtest_drop ? -1 : tier->take(ol, oe, run, al, ae, tier_cls[(size_t) ol]);
             vslot_of[(size_t) ol][(size_t) oe] = -1;
             if (vs < 0) {
                 tier_unmap(ol, oe);
@@ -728,7 +741,7 @@ struct Model::Impl {
     // expert stays in the mapping)
     int tier_fetch(int il, int e, bool high, uint64_t busy) {
         int ol = -1, oe = -1;
-        const int s = tier->take(il, e, busy, ol, oe);
+        const int s = tier->take(il, e, busy, ol, oe, tier_cls[(size_t) il]);
         if (s < 0) { if (high) ++pg_last.tier_fallback; return -1; }   // (a prediction with no slot is just skipped)
         if (ol >= 0) { tier_unmap(ol, oe); ++pg_last.tier_evicts; }
         k31::RamTier::Range r[3];
@@ -876,7 +889,7 @@ struct Model::Impl {
             use(v.cuda);
             if (v.copy) { cudaStreamSynchronize(v.copy); cudaStreamDestroy(v.copy); }
             for (VSlot& x : v.s) if (x.ev) cudaEventDestroy(x.ev);
-            if (v.base) cudaFree(v.base);
+            for (VCls& k : v.c) if (k.base) cudaFree(k.base);
         }
         for (void* c : tier_chunks) cudaFreeHost(c);
         for (int fd : dio_fds) if (fd >= 0) ::close(fd);
@@ -2114,10 +2127,64 @@ bool Model::load(const std::string& path, const ModelOptions& opt, std::string& 
             m.summary += b;
         }
         m.summary += override_note;
-        if (opt.page_experts && opt.ram_slots != 0) {   // the RAM expert tier
+        // the size classes' budget shares (opt.tier_classes): a layer's routing-weighted share of its experts that are
+        // paged (its pick counts from usage_path over the paged ones, else the paged count over all)
+        std::map<int, std::vector<double>> cls_usage;
+        if (opt.tier_classes && opt.tier_split.empty() && !opt.usage_path.empty() && !read_usage(opt.usage_path, cls_usage, err)) return false;
+        auto paged_share = [&](int il, const std::vector<char>& pg) {
+            const auto u = cls_usage.find(il);
+            const std::vector<int>& kp = m.g.keep[(size_t) il];
+            double all = 0, on = 0, n_on = 0;
+            for (size_t e = 0; e < pg.size(); ++e) {
+                double f = 1.0;
+                if (u != cls_usage.end()) {
+                    const size_t src = kp.empty() ? e : (size_t) kp[e];
+                    f = src < u->second.size() ? u->second[src] : 0.0;
+                }
+                all += f;
+                if (pg[e]) { on += f; ++n_on; }
+            }
+            return all > 0 ? on / all : pg.empty() ? 0.0 : n_on / (double) pg.size();
+        };
+        // a byte budget over the classes: each its share by weight, never more slots than its paged experts; what a
+        // capped class leaves goes to the others by weight.  (One class: budget / slot, capped by its paged experts.)
+        auto split_budget = [](long long B, const std::vector<double>& w, const std::vector<size_t>& sb, const std::vector<long long>& cand) {
+            const size_t C = w.size();
+            std::vector<long long> n(C, 0);
+            std::vector<char> done(C, 0);
+            long long left = B;
+            for (size_t round = 0; round < C && left > 0; ++round) {
+                double ws = 0;
+                for (size_t c = 0; c < C; ++c) if (!done[c]) ws += w[c];
+                if (ws <= 0) break;
+                bool capped = false;
+                long long used = 0;
+                for (size_t c = 0; c < C; ++c) {
+                    if (done[c]) continue;
+                    long long k = (long long) ((double) left * (w[c] / ws)) / (long long) sb[c];
+                    if (n[c] + k >= cand[c]) { k = cand[c] - n[c]; done[c] = 1; capped = true; }
+                    n[c] += k;
+                    used += k * (long long) sb[c];
+                }
+                left -= used;
+                if (!capped) break;
+            }
+            return n;
+        };
+        auto tname = [](int t) { return std::string(t == 0 ? "F32" : iq::name(t)); };
+        if (opt.page_experts && (opt.ram_slots != 0 || opt.ram_gb > 0)) {   // the RAM expert tier
             m.lx.assign((size_t) NL, {nullptr, nullptr, nullptr});
             m.slot_of.assign((size_t) NL, {});
-            size_t mx[3] = {0, 0, 0};
+            m.tier_cls.assign((size_t) NL, -1);
+            // size classes: one (every slot sized for the largest matrices over all layers) or one per layout
+            std::vector<std::array<size_t, 3>> cl;   // each class's matrices' bytes
+            std::vector<std::string> cl_name;
+            std::vector<long long> cand_c;           // per class: paged experts
+            std::vector<int> nl_c;                   // per class: layers
+            std::vector<double> share_c;             // per class: its layers' paged shares, summed
+            auto new_class = [&](const std::array<size_t, 3>& b, const std::string& nm) {
+                cl.push_back(b); cl_name.push_back(nm); cand_c.push_back(0); nl_c.push_back(0); share_c.push_back(0);
+            };
             long long n_cand = 0;   // paged experts (gate, up, down together)
             for (int il = 0; il < NL; ++il) {
                 if (!m.g.is_moe(il)) continue;
@@ -2127,16 +2194,36 @@ bool Model::load(const std::string& path, const ModelOptions& opt, std::string& 
                     auto it = m.ex.find(m.L(il, nm3[i]));
                     if (it == m.ex.end() || !it->second.map0) { ok = false; break; }
                     m.lx[(size_t) il][(size_t) i] = &it->second;
-                    mx[i] = std::max(mx[i], it->second.ebytes);
                 }
                 if (!ok) { m.lx[(size_t) il] = {nullptr, nullptr, nullptr}; continue; }
-                const int E = (int) m.lx[(size_t) il][0]->p.size();
+                const auto& X = m.lx[(size_t) il];
+                const std::array<size_t, 3> b = {X[0]->ebytes, X[1]->ebytes, X[2]->ebytes};
+                int c = 0;
+                if (opt.tier_classes) {
+                    c = (int) (std::find(cl.begin(), cl.end(), b) - cl.begin());
+                    if (c == (int) cl.size()) new_class(b, tname(X[0]->type) + "/" + tname(X[1]->type) + "/" + tname(X[2]->type));
+                } else {
+                    if (cl.empty()) new_class({0, 0, 0}, "one");
+                    for (int i = 0; i < 3; ++i) cl[0][(size_t) i] = std::max(cl[0][(size_t) i], b[(size_t) i]);
+                }
+                m.tier_cls[(size_t) il] = c;
+                const int E = (int) X[0]->p.size();
                 m.slot_of[(size_t) il].assign((size_t) E, -1);
-                for (int x = 0; x < E; ++x) n_cand += !m.lx[(size_t) il][0]->p[(size_t) x];
+                std::vector<char> pg((size_t) E, 0);
+                long long nc = 0;
+                for (int x = 0; x < E; ++x) { pg[(size_t) x] = !X[0]->p[(size_t) x]; nc += pg[(size_t) x]; }
+                n_cand += nc;
+                cand_c[(size_t) c] += nc;
+                ++nl_c[(size_t) c];
+                if (opt.tier_classes) share_c[(size_t) c] += paged_share(il, pg);
             }
+            if (cl.empty()) new_class({0, 0, 0}, "one");
             m.tier = std::make_unique<k31::RamTier>();
-            m.tier->layout(mx);
-            const size_t sb = m.tier->slot_bytes();
+            for (const auto& b : cl) m.tier->add_class(b.data());
+            const size_t C = cl.size();
+            std::vector<size_t> sbc(C);
+            size_t sb = SIZE_MAX;   // the smallest class's slot (one class: the slot)
+            for (size_t c = 0; c < C; ++c) { sbc[c] = m.tier->slot_bytes((int) c); sb = std::min(sb, sbc[c]); }
             // the budget: MemAvailable less 16 GB (receipts, the desktop, the page cache's floor), the slots asked
             // for (-1: all of that), never more than the paged experts
             long long avail_kb = 0;
@@ -2150,19 +2237,42 @@ bool Model::load(const std::string& path, const ModelOptions& opt, std::string& 
             // (K31_RAM_HEADROOM_MB: tests only, e.g. a fixture check beside a big run that already pinned the RAM)
             const long long headroom = getenv("K31_RAM_HEADROOM_MB") ? std::atoll(getenv("K31_RAM_HEADROOM_MB")) << 20 : 16LL << 30;
             const long long budget = std::max(0LL, avail_kb * 1024 - headroom);
-            const long long cap = std::min<long long>(budget / (long long) sb, n_cand);
-            long long want = opt.ram_slots < 0 ? cap : std::min<long long>(opt.ram_slots, cap);
-            const size_t per_chunk = std::max<size_t>(1, ((size_t) 1 << 30) / sb);   // ~1 GB a cudaHostAlloc
-            long long got = 0;
-            while (got < want) {
-                const size_t n = (size_t) std::min<long long>((long long) per_chunk, want - got);
-                void* c = nullptr;
-                if (cudaHostAlloc(&c, n * sb, kPin) != cudaSuccess || !c) { cudaGetLastError(); break; }
-                void* dp = nullptr;
-                if (cudaHostGetDevicePointer(&dp, c, 0) != cudaSuccess) { cudaGetLastError(); cudaFreeHost(c); break; }
-                m.tier_chunks.push_back(c);
-                m.tier->add_chunk((uint8_t*) c, (uint8_t*) dp, n * sb);
-                got += (long long) n;
+            const long long cap = std::min<long long>(budget / (long long) sb, n_cand);   // (one class: the slots that fit)
+            const long long bytes = opt.ram_gb > 0 ? std::min<long long>((long long) (opt.ram_gb * 1e9), budget)
+                                    : opt.ram_slots < 0 ? budget : std::min<long long>((long long) opt.ram_slots * (long long) sb, budget);
+            std::vector<double> w(C, 1.0);
+            std::string split = "one class";
+            if (C > 1) {
+                if (!opt.tier_split.empty()) {
+                    if (opt.tier_split.size() != C) {
+                        err = "maya-k31: --tier-split has " + std::to_string(opt.tier_split.size()) + " shares for " + std::to_string(C) + " classes:";
+                        for (size_t c = 0; c < C; ++c) err += " " + cl_name[c];
+                        return false;
+                    }
+                    w = opt.tier_split;
+                    split = "given";
+                } else {
+                    for (size_t c = 0; c < C; ++c) w[c] = share_c[c] * (double) sbc[c];
+                    split = cls_usage.empty() ? "uniform" : "usage";
+                }
+            }
+            const std::vector<long long> want_c = split_budget(bytes, w, sbc, cand_c);
+            long long want = 0;
+            for (long long n : want_c) want += n;
+            bool short_pin = false;   // a refused chunk ends the allocation (the pool is what was pinned)
+            for (size_t c = 0; c < C && !short_pin; ++c) {
+                const size_t per_chunk = std::max<size_t>(1, ((size_t) 1 << 30) / sbc[c]);   // ~1 GB a cudaHostAlloc
+                long long got = 0;
+                while (got < want_c[c]) {
+                    const size_t n = (size_t) std::min<long long>((long long) per_chunk, want_c[c] - got);
+                    void* ch = nullptr;
+                    if (cudaHostAlloc(&ch, n * sbc[c], kPin) != cudaSuccess || !ch) { cudaGetLastError(); short_pin = true; break; }
+                    void* dp = nullptr;
+                    if (cudaHostGetDevicePointer(&dp, ch, 0) != cudaSuccess) { cudaGetLastError(); cudaFreeHost(ch); short_pin = true; break; }
+                    m.tier_chunks.push_back(ch);
+                    m.tier->add_chunk((uint8_t*) ch, (uint8_t*) dp, n * sbc[c], (int) c);
+                    got += (long long) n;
+                }
             }
             m.dio_fds.assign(F.n_open(), -1);
             for (size_t sh = 0; sh < F.n_open(); ++sh) {
@@ -2182,20 +2292,47 @@ bool Model::load(const std::string& path, const ModelOptions& opt, std::string& 
                 m.tier->start(std::max(1, opt.ram_readers));
                 char b[320];
                 char asked[48];
-                if (opt.ram_slots < 0) std::snprintf(asked, sizeof asked, "auto");
+                if (opt.ram_gb > 0) std::snprintf(asked, sizeof asked, "%.1f GB", opt.ram_gb);
+                else if (opt.ram_slots < 0) std::snprintf(asked, sizeof asked, "auto");
                 else std::snprintf(asked, sizeof asked, "%d", opt.ram_slots);
-                std::snprintf(b, sizeof b, "ram tier: %zu slots of %.2f MB = %.1f GB pinned (asked %s, cap %lld: MemAvailable "
-                              "%.1f GB less %.1f GB, %lld paged experts), %d readers, %s\n", m.tier->n_slots(), sb / 1e6,
-                              (double) m.tier->n_slots() * sb / 1e9, asked, cap, avail_kb / 1048576.0, headroom / 1073741824.0, n_cand,
-                              std::max(1, opt.ram_readers), m.dio_direct ? "O_DIRECT" : "buffered (no O_DIRECT here)");
+                double pinned = 0;
+                for (size_t c = 0; c < C; ++c) pinned += (double) m.tier->n_slots((int) c) * (double) sbc[c];
+                if (C == 1)
+                    std::snprintf(b, sizeof b, "ram tier: %zu slots of %.2f MB = %.1f GB pinned (asked %s, cap %lld: MemAvailable "
+                                  "%.1f GB less %.1f GB, %lld paged experts), %d readers, %s\n", m.tier->n_slots(), sb / 1e6,
+                                  pinned / 1e9, asked, cap, avail_kb / 1048576.0, headroom / 1073741824.0, n_cand,
+                                  std::max(1, opt.ram_readers), m.dio_direct ? "O_DIRECT" : "buffered (no O_DIRECT here)");
+                else
+                    std::snprintf(b, sizeof b, "ram tier: %zu slots in %zu size classes = %.1f GB pinned (asked %s = %.1f GB; MemAvailable "
+                                  "%.1f GB less %.1f GB; %lld paged experts), %d readers, %s\n", m.tier->n_slots(), C,
+                                  pinned / 1e9, asked, bytes / 1e9, avail_kb / 1048576.0, headroom / 1073741824.0, n_cand,
+                                  std::max(1, opt.ram_readers), m.dio_direct ? "O_DIRECT" : "buffered (no O_DIRECT here)");
                 m.summary += b;
+                if (C > 1) {
+                    std::string line = "ram tier classes (split " + split + "):";
+                    double wsum = 0;
+                    for (double x : w) wsum += x;
+                    for (size_t c = 0; c < C; ++c) {
+                        std::snprintf(b, sizeof b, " [%zu] %s %.2f MB x %zu = %.1f GB (%d layers, %lld paged, share %.1f%%);", c,
+                                      cl_name[c].c_str(), sbc[c] / 1e6, m.tier->n_slots((int) c), (double) m.tier->n_slots((int) c) * sbc[c] / 1e9,
+                                      nl_c[c], cand_c[c], wsum > 0 ? 100.0 * w[c] / wsum : 0.0);
+                        line += b;
+                    }
+                    m.summary += line + "\n";
+                }
             }
         }
         if (m.tier && opt.vram_dyn != 0) {   // the dynamic VRAM tier: a pool of expert slots on each card
             m.vpool_l.assign((size_t) NL, -1);
             m.vslot_of.assign((size_t) NL, {});
+            m.vcls_l.assign((size_t) NL, -1);
             std::map<int, int> pool_of;                 // cuda id -> pool
-            std::vector<std::array<size_t, 3>> mxp;      // per pool: each kind's largest expert
+            // per pool, per size class (one: a class of each kind's largest expert): its matrices' bytes, name, paged
+            // experts, routing-weighted paged share
+            std::vector<std::vector<std::array<size_t, 3>>> vk;
+            std::vector<std::vector<std::string>> vname;
+            std::vector<std::vector<long long>> vcand;
+            std::vector<std::vector<double>> vshare;
             std::vector<long long> cand, cache_b;        // per pool: paged experts of its layers; their caches' bytes
             for (int il = 0; il < NL; ++il) {
                 const int cu = m.dev_of(il);
@@ -2204,7 +2341,7 @@ bool Model::load(const std::string& path, const ModelOptions& opt, std::string& 
                     it = pool_of.emplace(cu, (int) m.vpools.size()).first;
                     m.vpools.emplace_back();
                     m.vpools.back().cuda = cu;
-                    mxp.push_back({0, 0, 0});
+                    vk.emplace_back(); vname.emplace_back(); vcand.emplace_back(); vshare.emplace_back();
                     cand.push_back(0);
                     cache_b.push_back(0);
                 }
@@ -2219,16 +2356,43 @@ bool Model::load(const std::string& path, const ModelOptions& opt, std::string& 
                 m.vpool_l[(size_t) il] = pi;
                 const int E = (int) m.lx[(size_t) il][0]->p.size();
                 m.vslot_of[(size_t) il].assign((size_t) E, -1);
-                for (int i = 0; i < 3; ++i) mxp[(size_t) pi][(size_t) i] = std::max(mxp[(size_t) pi][(size_t) i], m.lx[(size_t) il][(size_t) i]->ebytes);
-                for (int x = 0; x < E; ++x) cand[(size_t) pi] += m.paged(*m.lx[(size_t) il][0], il, x);
+                const auto& X = m.lx[(size_t) il];
+                const std::array<size_t, 3> b = {X[0]->ebytes, X[1]->ebytes, X[2]->ebytes};
+                auto& K = vk[(size_t) pi];
+                int c = 0;
+                if (opt.tier_classes) c = (int) (std::find(K.begin(), K.end(), b) - K.begin());
+                if (c == (int) K.size()) {
+                    K.push_back(opt.tier_classes ? b : std::array<size_t, 3>{0, 0, 0});
+                    vname[(size_t) pi].push_back(opt.tier_classes ? tname(X[0]->type) + "/" + tname(X[1]->type) + "/" + tname(X[2]->type) : "one");
+                    vcand[(size_t) pi].push_back(0);
+                    vshare[(size_t) pi].push_back(0);
+                }
+                if (!opt.tier_classes)
+                    for (int i = 0; i < 3; ++i) K[0][(size_t) i] = std::max(K[0][(size_t) i], b[(size_t) i]);
+                m.vcls_l[(size_t) il] = c;
+                std::vector<char> pg((size_t) E, 0);
+                long long nc = 0;
+                for (int x = 0; x < E; ++x) { pg[(size_t) x] = m.paged(*X[0], il, x); nc += pg[(size_t) x]; }
+                cand[(size_t) pi] += nc;
+                vcand[(size_t) pi][(size_t) c] += nc;
+                if (opt.tier_classes) vshare[(size_t) pi][(size_t) c] += paged_share(il, pg);
             }
             const long long reserve = (long long) std::max(P.reserve_mb, 2048) << 20, margin = 256LL << 20;
             for (size_t pi = 0; pi < m.vpools.size(); ++pi) {
                 Impl::VPool& v = m.vpools[pi];
-                size_t o = 0;
-                for (int i = 0; i < 3; ++i) { v.region[i] = o; o += (mxp[pi][(size_t) i] + 255) / 256 * 256; }
-                v.sb = o;
-                if (!v.sb || !cand[pi]) continue;
+                const size_t C = vk[pi].size();
+                v.c.resize(C);
+                size_t unit = SIZE_MAX;   // the smallest class's slot
+                std::vector<size_t> sbs(C);
+                for (size_t c = 0; c < C; ++c) {
+                    Impl::VCls& k = v.c[c];
+                    size_t o = 0;
+                    for (int i = 0; i < 3; ++i) { k.region[i] = o; o += (vk[pi][c][(size_t) i] + 255) / 256 * 256; }
+                    k.sb = sbs[c] = o;
+                    k.name = vname[pi][c];
+                    unit = std::min(unit, o);
+                }
+                if (!C || !unit || !cand[pi]) continue;
                 m.use(v.cuda);
                 size_t fr = 0, tot = 0;
                 ck(cudaMemGetInfo(&fr, &tot), "cudaMemGetInfo");
@@ -2248,20 +2412,41 @@ bool Model::load(const std::string& path, const ModelOptions& opt, std::string& 
                             break;
                         }
                 }
-                long long n = opt.vram_dyn > 0 ? opt.vram_dyn : std::max(0LL, avail) / (long long) v.sb;
-                n = std::min(n, cand[pi]);
-                if (opt.vram_dyn > 0 && n * (long long) v.sb > std::max(0LL, avail)) {
+                // the card's bytes (--vram-dyn N: N x its smallest class's slot), split as the RAM tier's (by weight;
+                // a given --tier-split names the RAM tier's classes, so the cards always split by weight)
+                const long long vbytes = opt.vram_dyn > 0 ? (long long) opt.vram_dyn * (long long) unit : std::max(0LL, avail);
+                std::vector<double> w(C, 1.0);
+                if (C > 1)
+                    for (size_t c = 0; c < C; ++c) w[c] = vshare[pi][c] * (double) sbs[c];
+                std::vector<long long> nc = split_budget(vbytes, w, sbs, vcand[pi]);
+                long long n = 0, nb = 0;
+                for (size_t c = 0; c < C; ++c) { n += nc[c]; nb += nc[c] * (long long) sbs[c]; }
+                if (opt.vram_dyn > 0 && nb > std::max(0LL, avail)) {
                     err = "maya-k31: --vram-dyn " + std::to_string(opt.vram_dyn) + ": card " + std::to_string(v.cuda) + " has room for " +
-                          std::to_string(std::max(0LL, avail) / (long long) v.sb) + " slots";
+                          std::to_string(std::max(0LL, avail) / (long long) unit) + " slots";
                     return false;
                 }
                 if (n <= 0) continue;
-                if (cudaMalloc(&v.base, (size_t) n * v.sb) != cudaSuccess) { cudaGetLastError(); v.base = nullptr; continue; }
+                n = 0;
+                for (size_t c = 0; c < C; ++c) {
+                    if (nc[c] > 0 && cudaMalloc(&v.c[c].base, (size_t) nc[c] * sbs[c]) != cudaSuccess) { cudaGetLastError(); v.c[c].base = nullptr; nc[c] = 0; }
+                    n += nc[c];
+                }
+                if (n <= 0) continue;
                 ck(cudaStreamCreateWithFlags(&v.copy, cudaStreamNonBlocking), "vram dyn stream");
                 v.s.resize((size_t) n);
-                for (long long j = 0; j < n; ++j) {
-                    ck(cudaEventCreateWithFlags(&v.s[(size_t) j].ev, cudaEventDisableTiming), "vram dyn event");
-                    v.free.push_back((int) (n - 1 - j));
+                long long first = 0;
+                for (size_t c = 0; c < C; ++c) {
+                    Impl::VCls& k = v.c[c];
+                    for (long long j = 0; j < nc[c]; ++j) {
+                        Impl::VSlot& x = v.s[(size_t) (first + j)];
+                        ck(cudaEventCreateWithFlags(&x.ev, cudaEventDisableTiming), "vram dyn event");
+                        x.cls = (int) c;
+                        x.at = k.base + (size_t) j * sbs[c];
+                        k.ids.push_back((int) (first + j));
+                    }
+                    for (long long j = 0; j < nc[c]; ++j) k.free.push_back((int) (first + nc[c] - 1 - j));
+                    first += nc[c];
                 }
             }
             std::string line = "vram dyn:";
@@ -2269,9 +2454,22 @@ bool Model::load(const std::string& path, const ModelOptions& opt, std::string& 
             for (size_t pi = 0; pi < m.vpools.size(); ++pi) {
                 const Impl::VPool& v = m.vpools[pi];
                 char b[160];
-                std::snprintf(b, sizeof b, " card %d %zu slots of %.2f MB = %.1f GB (%lld paged experts);", v.cuda, v.s.size(), v.sb / 1e6,
-                              (double) v.s.size() * v.sb / 1e9, cand[pi]);
-                line += b;
+                if (v.c.size() <= 1) {
+                    const size_t sb = v.c.empty() ? 0 : v.c[0].sb;
+                    std::snprintf(b, sizeof b, " card %d %zu slots of %.2f MB = %.1f GB (%lld paged experts);", v.cuda, v.s.size(), sb / 1e6,
+                                  (double) v.s.size() * sb / 1e9, cand[pi]);
+                    line += b;
+                } else {
+                    double gb = 0;
+                    for (const auto& k : v.c) gb += (double) k.ids.size() * k.sb / 1e9;
+                    std::snprintf(b, sizeof b, " card %d %zu slots = %.1f GB (%lld paged experts) [", v.cuda, v.s.size(), gb, cand[pi]);
+                    line += b;
+                    for (size_t c = 0; c < v.c.size(); ++c) {
+                        std::snprintf(b, sizeof b, "%s%s %.2f MB x %zu", c ? ", " : "", v.c[c].name.c_str(), v.c[c].sb / 1e6, v.c[c].ids.size());
+                        line += b;
+                    }
+                    line += "];";
+                }
                 any |= !v.s.empty();
             }
             for (int il = 0; il < NL; ++il)   // (a card with no pool: its layers promote nothing)

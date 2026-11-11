@@ -88,6 +88,11 @@ const char* const kUsage =
     "           24 MLA layers, float32), so a sequence past N answers ERR context full.\n"
     "           --ram-slots N|auto (with --load page): the RAM expert tier, paged experts read with O_DIRECT into\n"
     "           pinned slots (auto: MemAvailable less 16 GB), an LRU by layer and expert; --ram-readers N (16).\n"
+    "           --tier-classes one|layout: one slot size for every layer (one, the default) or a size class per\n"
+    "           (gate, up, down) expert byte layout (layout: mixed expert types, each layer only in its class's slots).\n"
+    "           The budget is bytes: --ram-gb G (1e9 bytes, enables the tier), else --ram-slots N x the smallest class's\n"
+    "           slot; split over the classes by routing-weighted paged bytes (--usage counts, else uniform), or\n"
+    "           --tier-split S0,S1,.. (shares in the logged class order).  The VRAM pool's classes split by weight.\n"
     "           --tier-prompt-cold: a prompt call's RAM tier reads go in at the LRU's cold end (decode's set stays).\n"
     "           --dense-override FILE: dense tensors of the same name and shape from FILE replace the model's (another\n"
     "           type: tools/k31_dense_requant.py); routed experts are refused.\n"
@@ -1024,6 +1029,37 @@ int main(int argc, char** argv) {
             if (v != "auto" && (v.empty() || *end || n < 0 || n > 10000000)) {
                 std::fprintf(stderr, "maya-k31: --ram-slots takes a slot count or auto\n");
                 return 2;
+            }
+        } else if (a == "--tier-classes" && i + 1 < argc) {
+            const std::string v = argv[++i];
+            if (v != "one" && v != "layout") {
+                std::fprintf(stderr, "maya-k31: --tier-classes takes one or layout\n");
+                return 2;
+            }
+            opt.tier_classes = v == "layout" ? 1 : 0;
+        } else if (a == "--ram-gb" && i + 1 < argc) {
+            const std::string v = argv[++i];
+            char* end = nullptr;
+            opt.ram_gb = std::strtod(v.c_str(), &end);
+            if (v.empty() || *end || !(opt.ram_gb > 0) || opt.ram_gb > 1e5) {
+                std::fprintf(stderr, "maya-k31: --ram-gb takes a positive size in GB\n");
+                return 2;
+            }
+        } else if (a == "--tier-split" && i + 1 < argc) {
+            std::string v = argv[++i];
+            opt.tier_split.clear();
+            for (size_t p0 = 0; p0 <= v.size();) {
+                size_t p1 = v.find(',', p0);
+                if (p1 == std::string::npos) p1 = v.size();
+                const std::string x = v.substr(p0, p1 - p0);
+                char* end = nullptr;
+                const double d = std::strtod(x.c_str(), &end);
+                if (x.empty() || *end || !(d >= 0) || d > 1e12) {
+                    std::fprintf(stderr, "maya-k31: --tier-split takes shares S0,S1,.. (>= 0)\n");
+                    return 2;
+                }
+                opt.tier_split.push_back(d);
+                p0 = p1 + 1;
             }
         } else if (a == "--tier-prompt-cold") {
             opt.tier_prompt_cold = true;

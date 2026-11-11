@@ -10,7 +10,9 @@
 // offset).  What a slot holds is the file's bytes, so what the engine computes is unchanged.
 //
 // The pool is allocated in chunks (cudaHostAlloc each) up to the size asked for; a refused chunk ends the allocation
-// and the pool is what was pinned.  Reads: a high queue (a layer's picks it is about to run) and a low queue (pregate's
+// and the pool is what was pinned.  Slots come in size classes (add_class): a model whose layers hold experts of
+// different types (e.g. IQ1_S and IQ2_S) gets a slot size per layer layout instead of every slot sized for the largest
+// one.  A layer's experts only ever take slots of its class (its own LRU); with one class this is the single pool.  Reads: a high queue (a layer's picks it is about to run) and a low queue (pregate's
 // predictions); a slot's three reads complete it (ready).  A slot is never evicted while it is loading or while the
 // layer running now uses it.
 #pragma once
@@ -50,6 +52,7 @@ public:
         uint8_t* host = nullptr;         // the slot's bytes (pinned, device-mapped)
         uint8_t* dev = nullptr;          // the same bytes' device address
         size_t inner[3] = {0, 0, 0};     // each matrix's offset inside the slot
+        int cls = 0;                     // its size class
     };
     struct Stats {
         std::atomic<long long> reads{0}, bytes{0}, fails{0};
@@ -61,27 +64,44 @@ public:
     RamTier& operator=(const RamTier&) = delete;
     ~RamTier() { stop(); }
 
-    /// The slot layout: each of the three matrices gets max_len[i] rounded out (start and end to kAlign) plus kAlign.
-    void layout(const size_t max_len[3]) {
+    /// A size class's slot layout: each of the three matrices gets max_len[i] rounded out (start and end to kAlign)
+    /// plus kAlign.  Returns the class's id (0, 1, ... in the order added).
+    int add_class(const size_t max_len[3]) {
+        Class c;
         size_t o = 0;
         for (int i = 0; i < 3; ++i) {
-            region_[i] = o;
+            c.region[i] = o;
             o += round_up(max_len[i], kAlign) + 2 * kAlign;
         }
-        slot_bytes_ = o;
+        c.slot_bytes = o;
+        cls_.push_back(c);
+        return (int) cls_.size() - 1;
     }
-    size_t slot_bytes() const { return slot_bytes_; }
+    /// One class for every layer (sized for the largest matrices)
+    void layout(const size_t max_len[3]) { cls_.clear(); add_class(max_len); }
+    /// Class c's slot size for max_len (no class added)
+    static size_t slot_size(const size_t max_len[3]) {
+        size_t o = 0;
+        for (int i = 0; i < 3; ++i) o += round_up(max_len[i], kAlign) + 2 * kAlign;
+        return o;
+    }
+    size_t slot_bytes(int c = 0) const { return cls_[(size_t) c].slot_bytes; }
+    int n_classes() const { return (int) cls_.size(); }
 
-    /// Takes the pinned chunks (allocated by the caller) and carves them into slots.
-    void add_chunk(uint8_t* p, uint8_t* dp, size_t bytes) {
-        for (size_t o = 0; o + slot_bytes_ <= bytes; o += slot_bytes_) {
+    /// Takes the pinned chunks (allocated by the caller) and carves them into slots of class c.
+    void add_chunk(uint8_t* p, uint8_t* dp, size_t bytes, int c = 0) {
+        Class& k = cls_[(size_t) c];
+        for (size_t o = 0; o + k.slot_bytes <= bytes; o += k.slot_bytes) {
             slots_.emplace_back(new Slot());
             slots_.back()->host = p + o;
             slots_.back()->dev = dp + o;
-            free_.push_back((int) slots_.size() - 1);
+            slots_.back()->cls = c;
+            k.ids.push_back((int) slots_.size() - 1);
+            k.free.push_back((int) slots_.size() - 1);
         }
     }
     size_t n_slots() const { return slots_.size(); }
+    size_t n_slots(int c) const { return cls_[(size_t) c].ids.size(); }
     Slot& slot(int s) { return *slots_[(size_t) s]; }
 
     void start(int threads) {
@@ -99,22 +119,24 @@ public:
         th_.clear();
     }
 
-    /// A free or evictable slot for (layer, expert), or -1 (every slot loading or busy in run `now_run`).  The victim
-    /// is the least recently used one; the caller unmaps the expert it held (returned in old_layer / old_expert).
-    int take(int layer, int expert, uint64_t now_run, int& old_layer, int& old_expert) {
+    /// A free or evictable slot of class c for (layer, expert), or -1 (every slot of the class loading or busy in run
+    /// `now_run`).  The victim is the class's least recently used one; the caller unmaps the expert it held (returned
+    /// in old_layer / old_expert).
+    int take(int layer, int expert, uint64_t now_run, int& old_layer, int& old_expert, int c = 0) {
         int best = -1;
         uint64_t bs = UINT64_MAX;
+        Class& k = cls_[(size_t) c];
         // a clock-free scan is O(slots); a call takes at most a few hundred slots, so keep a free list first
-        while (!free_.empty()) {
-            const int s = free_.back();
-            free_.pop_back();
+        while (!k.free.empty()) {
+            const int s = k.free.back();
+            k.free.pop_back();
             if (slots_[(size_t) s]->layer < 0) { best = s; break; }
         }
         if (best < 0) {
-            for (size_t i = 0; i < slots_.size(); ++i) {
-                Slot& x = *slots_[i];
+            for (const int i : k.ids) {
+                Slot& x = *slots_[(size_t) i];
                 if (x.busy == now_run || x.hold || x.state.load(std::memory_order_acquire) == kLoading) continue;
-                if (x.stamp < bs) { bs = x.stamp; best = (int) i; }
+                if (x.stamp < bs) { bs = x.stamp; best = i; }
             }
         }
         if (best < 0) return -1;
@@ -133,13 +155,14 @@ public:
         x.stamp = 0;
         x.hold = x.adopted = false;
         x.state.store(kEmpty, std::memory_order_release);
-        free_.push_back(s);
+        cls_[(size_t) x.cls].free.push_back(s);
     }
     /// Slot s (just taken) will be filled by the caller with the three matrices at file offsets off[i] (the same inner
     /// offsets a read would use, so the slot is laid out as if read): loading until adopted_done(s).
     void adopt(int s, const uint64_t off[3]) {
         Slot& x = *slots_[(size_t) s];
-        for (int i = 0; i < 3; ++i) x.inner[i] = region_[i] + (size_t) (off[i] & (uint64_t) (kAlign - 1));
+        const size_t* region = cls_[(size_t) x.cls].region;
+        for (int i = 0; i < 3; ++i) x.inner[i] = region[i] + (size_t) (off[i] & (uint64_t) (kAlign - 1));
         x.adopted = true;
         x.failed.store(false, std::memory_order_relaxed);
         x.state.store(kLoading, std::memory_order_release);
@@ -158,13 +181,14 @@ public:
         x.pending.store(3, std::memory_order_relaxed);
         x.failed.store(false, std::memory_order_relaxed);
         x.state.store(kLoading, std::memory_order_release);
+        const size_t* region = cls_[(size_t) x.cls].region;
         {
             std::lock_guard<std::mutex> l(mu_);
             for (int i = 0; i < 3; ++i) {
                 const uint64_t a = r[i].off & ~(uint64_t) (kAlign - 1);
-                x.inner[i] = region_[i] + (size_t) (r[i].off - a);
+                x.inner[i] = region[i] + (size_t) (r[i].off - a);
                 Job j{s, r[i].fd, a, round_up((size_t) (r[i].off + r[i].len - a), kAlign),
-                      (size_t) (r[i].off + r[i].len - a), x.host + region_[i]};
+                      (size_t) (r[i].off + r[i].len - a), x.host + region[i]};
                 (high ? hi_ : lo_).push_back(j);
             }
         }
@@ -237,10 +261,14 @@ private:
         }
     }
 
-    size_t region_[3] = {0, 0, 0};
-    size_t slot_bytes_ = 0;
+    struct Class {
+        size_t region[3] = {0, 0, 0};
+        size_t slot_bytes = 0;
+        std::vector<int> ids;    // its slots, in slot order (the LRU scan's order)
+        std::vector<int> free;   // its free slots
+    };
+    std::vector<Class> cls_;
     std::vector<std::unique_ptr<Slot>> slots_;
-    std::vector<int> free_;
     std::mutex mu_, done_mu_;
     std::condition_variable cv_, done_cv_;
     std::deque<Job> hi_, lo_;

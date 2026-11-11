@@ -134,6 +134,15 @@ struct ModelOptions {
     // fills slots ahead (low priority); CAR counts an expert with a slot (ready or loading) as resident.
     int ram_slots = 0;
     int ram_readers = 16;
+    // size classes (RAM tier and dynamic VRAM pool): tier_classes 0 (one): every slot sized for the largest gate, up
+    // and down over all layers (467ff87's pool); 1 (layout): a class per distinct (gate, up, down) expert byte layout,
+    // a layer's experts only in slots of its class.  The budget is bytes: ram_gb > 0 pins that many GB (1e9), else
+    // ram_slots x the smallest class's slot (one class: ram_slots slots as before); MemAvailable less 16 GB caps it.
+    // tier_split: the classes' shares of the budget in class order (empty: by routing-weighted paged bytes, from
+    // usage_path's pick counts, else uniform per paged expert); --vram-dyn N is N x a card's smallest class slot.
+    int tier_classes = 0;
+    double ram_gb = 0;
+    std::vector<double> tier_split;
     // the dynamic VRAM tier (with the RAM tier): per card a pool of VRAM expert slots, an LRU by layer and expert.  On
     // a decode call a RAM tier hit is copied to its layer's card on a copy stream while the call runs (it computes from
     // its RAM slot this time); once the copy is done the expert runs from VRAM and its RAM slot is freed.  A VRAM
