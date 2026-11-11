@@ -7104,10 +7104,12 @@ def main() -> int:
     ap.add_argument("--vram-reserve-mib", type=int, metavar="N",
                     help="VRAM in MiB the expert pool leaves free on each GPU for the driver, the desktop and other "
                          "programs (default 700), kept in the config")
-    ap.add_argument("--vram-reserve-later-mib", type=int, metavar="N",
+    ap.add_argument("--vram-reserve-later-mib", type=str, metavar="LIST",
                     help="GLM on AMD, a layer split: the reserve in MiB on the split's later GPUs (the 2nd, 3rd, ... "
-                         "card), where --vram-reserve-mib covers only the first - e.g. a big reserve on the APU part "
-                         "whose pool comes from the shared RAM (default: --vram-reserve-mib's), kept in the config")
+                         "card), where --vram-reserve-mib covers only the first - one number for every later GPU, or "
+                         "a comma list for the parts in order, its last value repeating (e.g. 16384,700,700 with 5 "
+                         "GPUs: 16384, 700, 700, 700) - e.g. a big reserve on the APU part whose pool comes from the "
+                         "shared RAM (default: --vram-reserve-mib's), kept in the config")
     ap.add_argument("--mmap-experts", choices=["auto", "on", "off"],
                     help="DeepSeek: the experts VRAM does not hold - read in place from the files (auto, the default), "
                          "or off: copied into RAM (with DS4_REQUIRE_ALL_RAM=1 all of them); kept in the config")
@@ -7152,8 +7154,13 @@ def main() -> int:
         ap.error(why)
     if a.vram_reserve_mib is not None and a.vram_reserve_mib < 0:
         ap.error("--vram-reserve-mib takes a number of MiB, 0 or more, e.g. --vram-reserve-mib 2048")
-    if a.vram_reserve_later_mib is not None and a.vram_reserve_later_mib < 0:
-        ap.error("--vram-reserve-later-mib takes a number of MiB, 0 or more, e.g. --vram-reserve-later-mib 16384")
+    if a.vram_reserve_later_mib is not None:
+        try:
+            if any(int(m) < 0 for m in a.vram_reserve_later_mib.split(",")):
+                raise ValueError
+        except ValueError:
+            ap.error("--vram-reserve-later-mib takes 0 or more MiB, one number or a comma list for the split's parts "
+                     "in order, e.g. --vram-reserve-later-mib 16384,700,700")
     if a.config is not None:
         if not a.config.is_file():
             ap.error(f"config not found: {a.config}")

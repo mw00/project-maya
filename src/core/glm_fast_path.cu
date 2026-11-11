@@ -6703,11 +6703,30 @@ int Glm5Model::fast_sample_verify(strata::kernels::SamplerParams& sp, std::strin
 // this process already holds on the device, so the pool gets what such a card would have).  The prompt path and the
 // layer split search size from the same number, before the pool is carved (a discrete card's: fast_setup prices a
 // unified-memory APU's pool from its RAM).
+static std::string later_reserve_value(const char* list, int part) {
+    const std::string s(list);
+    size_t pos = 0;
+    for (int i = 0; i < part - 1; i++) {          // walk to this part's value, part 1's first
+        const size_t comma = s.find(',', pos);
+        if (comma == std::string::npos)           // the list ran out: its last value repeats
+            return s.substr(s.rfind(',') == std::string::npos ? 0 : s.rfind(',') + 1);
+        pos = comma + 1;
+    }
+    const size_t comma = s.find(',', pos);
+    return s.substr(pos, comma == std::string::npos ? std::string::npos : comma - pos);
+}
+
 Glm5Model::PoolBudget Glm5Model::pool_budget(size_t free_b, size_t total_b, int part, size_t floor_b, size_t slot_b,
                                              bool unified) {
     PoolBudget b;
     const char* later = part > 0 ? getenv("STRATA_GLM_RESERVE_LATER_MB") : nullptr;
-    const char* r = later != nullptr && later[0] ? later : getenv("STRATA_GLM_RESERVE_MB");
+    // a comma list values the split's later parts in order (16384,700,700: parts 1, 2, 3); a list shorter than
+    // the later parts repeats its last value (16384,700 on 4 parts: 16384, 700, 700, 700)
+    std::string later_pick;
+    if (later != nullptr && later[0] && std::strchr(later, ',') != nullptr)
+        later_pick = later_reserve_value(later, part);
+    const char* r = later != nullptr && later[0] ? (later_pick.size() ? later_pick.c_str() : later)
+                                                 : getenv("STRATA_GLM_RESERVE_MB");
     b.reserve_given = r != nullptr && r[0];
     b.reserve = (size_t) (b.reserve_given ? std::max(0LL, std::atoll(r)) : unified ? 1024 : 700) << 20;
     if (const char* ec = getenv("STRATA_GLM_EXPERT_CACHE"); ec != nullptr && part == 0)

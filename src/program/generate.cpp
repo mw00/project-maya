@@ -264,8 +264,9 @@ struct Options {
     /// and the KV state, minus this reserve for the graphs, the hit scratch and the head.
     int vram_reserve_mib = 700;
     bool vram_reserve_given = false;   ///< --vram-reserve-mib on the command line (--glm-pack: a small card's default gives way)
-    /// `--vram-reserve-later-mib N` (--glm-pack): the reserve on a layer split's later GPUs (-1: --vram-reserve-mib's)
-    int vram_reserve_later_mib = -1;
+    /// `--vram-reserve-later-mib N` (--glm-pack): the reserve on a layer split's later GPUs (empty: --vram-reserve-mib's);
+    /// one number for every later GPU, or a comma list for the parts 1, 2, ... in order (its last value repeating)
+    std::string vram_reserve_later;
     /// Plan v0.3 P5: batched prompt processing in chunks of this many tokens (0 = the token path).
     int64_t prefill_chunk = 0;
     /// `--prefill auto`: the largest chunk (up to 8192) whose buffers the expert cache can lend.  Every expert a chunk
@@ -384,8 +385,9 @@ void usage() {
                  "                       GPU's at N of its largest experts.  Env: MAYA_GLM_EXPERT_CACHE\n"
                  "  --vram-reserve-mib N (--glm-pack) VRAM kept free beside the expert pool (default 700; a small\n"
                  "                       card's gives way to the pool's floor).  Env: MAYA_GLM_RESERVE_MB\n"
-                 "  --vram-reserve-later-mib N  (--glm-pack) the same on a split's later GPUs (default: the above).\n"
-                 "                       Env: MAYA_GLM_RESERVE_LATER_MB\n"
+                 "  --vram-reserve-later-mib N  (--glm-pack) the same on a split's later GPUs (default: the above); one\n"
+                 "                       number, or a comma list for the parts 1, 2, ... in order, its last repeating\n"
+                 "                       (16384,700,700 with 5 GPUs: 16384, 700, 700, 700).  Env: MAYA_GLM_RESERVE_LATER_MB\n"
                  "  --glm-ram-resident   the pinned RAM tier holds every expert VRAM does not, and nothing is evicted\n"
                  "                       to disk. The start fails if the tier cannot hold them (raise MAYA_GLM_RAM_GB\n"
                  "                       or lower --max-context). Env: MAYA_GLM_RAM_RESIDENT=1\n"
@@ -4729,7 +4731,7 @@ int main(int argc, char** argv) {
             o.vram_reserve_mib = std::atoi(next("--vram-reserve-mib"));
             o.vram_reserve_given = true;
         }
-        else if (a == "--vram-reserve-later-mib") o.vram_reserve_later_mib = std::atoi(next("--vram-reserve-later-mib"));
+        else if (a == "--vram-reserve-later-mib") o.vram_reserve_later = next("--vram-reserve-later-mib");
         else if (a == "--prefill") {
             const std::string v = next("--prefill");
             o.prefill_arg = v;
@@ -4881,15 +4883,29 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "maya generate: --expert-cache takes auto or a number of experts\n");
             return 2;
         }
-        if ((o.vram_reserve_given && o.vram_reserve_mib < 0) || o.vram_reserve_later_mib < -1) {
-            std::fprintf(stderr, "maya generate: --vram-reserve-mib and --vram-reserve-later-mib take 0 or more MiB\n");
+        // the later GPUs' reserve: one number, or a comma list for the parts 1, 2, ... in order (the last repeating)
+        bool later_ok = true;
+        if (!o.vram_reserve_later.empty()) {
+            size_t pos = 0;
+            while (later_ok) {
+                const size_t comma = o.vram_reserve_later.find(',', pos);
+                const std::string item = o.vram_reserve_later.substr(
+                    pos, comma == std::string::npos ? std::string::npos : comma - pos);
+                later_ok = !item.empty() && item.find_first_not_of("0123456789") == std::string::npos;
+                if (comma == std::string::npos) break;
+                pos = comma + 1;
+            }
+        }
+        if ((o.vram_reserve_given && o.vram_reserve_mib < 0) || !later_ok) {
+            std::fprintf(stderr, "maya generate: --vram-reserve-mib and --vram-reserve-later-mib take 0 or more MiB, "
+                                 "the later one as one number or a comma list for the split's parts in order, "
+                                 "e.g. 16384,700\n");
             return 2;
         }
         if (o.expert_cache != 0)
             set_env("STRATA_GLM_EXPERT_CACHE", o.expert_cache < 0 ? "auto" : std::to_string(o.expert_cache).c_str());
         if (o.vram_reserve_given) set_env("STRATA_GLM_RESERVE_MB", std::to_string(o.vram_reserve_mib).c_str());
-        if (o.vram_reserve_later_mib >= 0)
-            set_env("STRATA_GLM_RESERVE_LATER_MB", std::to_string(o.vram_reserve_later_mib).c_str());
+        if (!o.vram_reserve_later.empty()) set_env("STRATA_GLM_RESERVE_LATER_MB", o.vram_reserve_later.c_str());
         if (o.pack != "pack/full") {
             std::fprintf(stderr, "maya generate: note: --glm-pack supersedes --pack (%s ignored)\n", o.pack.c_str());
         }

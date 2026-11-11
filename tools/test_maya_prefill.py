@@ -54,8 +54,9 @@ class PrefillConfigTests(unittest.TestCase):
             self.addCleanup(ctx.stop)
         self.a = SimpleNamespace(env=[], port=None, host=None, api_key=None, gguf_dir=None)
 
-    def write(self, gpus, ctx=32768):
-        pc = {"gpus": [{"index": i, "name": "GPU", "vram_gb": 24} for i in gpus]}
+    def write(self, gpus, ctx=32768, backend=None):
+        pc = {"gpus": [{"index": i, "name": "GPU", "vram_gb": 24} for i in gpus],
+              **({"backend": backend} if backend else {})}
         p = maya.write_config(self.a, pc, {}, self.model / "pack", "test", ctx, self.root / "models", None,
                               ("local", self.first))
         return p, maya.read_json(p)["args"]
@@ -177,6 +178,21 @@ class PrefillConfigTests(unittest.TestCase):
         _, args = self.write([0])
         self.assertEqual(args[args.index("--vram-reserve-mib") + 1], "0")
         self.assertEqual(args.count("--vram-reserve-mib"), 1)
+
+    def test_vram_reserve_later_comma_list(self):
+        # the later GPUs' reserve as a comma list, one value per later part in order: a CUDA setup writes none (its
+        # engine takes --reserve-mib), a HIP setup writes it as given, and a later setup keeps what the config has
+        self.a.vram_reserve_later_mib = "16384,700,700"
+        _, args = self.write([0, 1])
+        self.assertNotIn("--vram-reserve-later-mib", args)
+        _, args = self.write([0, 1], backend="hip")
+        self.assertEqual(args[args.index("--vram-reserve-later-mib") + 1], "16384,700,700")
+        _, args = self.write([0, 1], backend="hip")
+        self.assertEqual(args[args.index("--vram-reserve-later-mib") + 1], "16384,700,700")
+        self.assertEqual(args.count("--vram-reserve-later-mib"), 1)
+        self.a.vram_reserve_later_mib = None
+        _, args = self.write([0, 1], backend="hip")   # not given now: the config's own is kept (as --vram-reserve-mib's)
+        self.assertEqual(args[args.index("--vram-reserve-later-mib") + 1], "16384,700,700")
 
     def test_dflash2_drafter_in_the_config(self):
         # a DFlash2 setup: --dflash with the drafter's file, the answer kept for the next setup, its own tuning key
