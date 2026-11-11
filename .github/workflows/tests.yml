@@ -37,6 +37,18 @@ jobs:
         run: |
           c++ -std=c++20 -O2 -DNDEBUG -Wall -Wextra -Werror tests/glm_memory_test.cpp -o "$RUNNER_TEMP/glm_memory_test"
           "$RUNNER_TEMP/glm_memory_test"
+      - name: Kimi K3.1 geometry reading and refusals, against the reference's (CPU only)
+        run: |
+          c++ -std=c++20 -O2 -DNDEBUG -Wall -Wextra -Werror -Iinclude tests/k31_geo_test.cpp -o "$RUNNER_TEMP/k31_geo_test"
+          "$RUNNER_TEMP/k31_geo_test"
+          "$RUNNER_TEMP/venv/bin/python" tools/k31/geo_ref.py "$RUNNER_TEMP/k31-tiny.gguf" --write-tiny > "$RUNNER_TEMP/k31-tiny.ref"
+          "$RUNNER_TEMP/k31_geo_test" --gguf "$RUNNER_TEMP/k31-tiny.gguf" --ref "$RUNNER_TEMP/k31-tiny.ref"
+      - name: Kimi K3.1 text pack, its refusals and the packer's output read back (CPU only)
+        run: |
+          c++ -std=c++20 -O2 -DNDEBUG -Wall -Wextra -Werror -Iinclude tests/k31_pack_test.cpp -o "$RUNNER_TEMP/k31_pack_test"
+          "$RUNNER_TEMP/k31_pack_test"
+          "$RUNNER_TEMP/venv/bin/python" tools/k31/pack_gguf.py --model "$RUNNER_TEMP/k31-tiny.gguf" --out "$RUNNER_TEMP/k31-tiny-pack"
+          "$RUNNER_TEMP/k31_pack_test" "$RUNNER_TEMP/k31-tiny-pack/k31.txt"
       - name: DeepSeek CPU row preparation (CPU only)
         run: |
           c++ -std=c++20 -O2 -DNDEBUG -Wall -Wextra -Werror tests/ds4_cpu_prepare_rows_test.cpp -o "$RUNNER_TEMP/ds4_cpu_prepare_rows_test"

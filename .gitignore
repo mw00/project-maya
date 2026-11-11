@@ -20,6 +20,8 @@ __pycache__/
 *.nsys-rep
 *.sqlite
 *.npz
+# ... except the Kimi K3.1 gate's golden subset (~0.8 MB of test data, tools/kimi_k31_gate.py)
+!data/kimi-k31-synth-golden/golden.npz
 *.occ1
 td.log
 
