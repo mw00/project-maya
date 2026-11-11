@@ -1397,7 +1397,8 @@ the sampling settings), which starts at the model's default. Off by default ever
 The switch is there only when the model has a direction file and its engine projects one: DeepSeek (`maya-ds4`),
 MiniMax (`maya-mm3`, not with `--tp`: the tensor-parallel path does not project), and GLM-5.3-Flash and GLM-5.3
 (`maya --glm-pack ... --ablate FILE`, a control vector of the model's hidden size; not on the Mac engine). Qwen has
-none. Maya's own direction files are not published yet; `tools/ablate_fit.py` fits one. On GLM the projection covers every write of the
+none. Maya's own direction files are published for DeepSeek-V4.1-Flash, MiniMax-M3.1-Flash and GLM-5.3-Flash (the setup
+downloads them, see below); for another model `tools/ablate_fit.py` fits one. On GLM the projection covers every write of the
 main layers on every path - the decode token, the verify windows, the batched rows of `--parallel` (each row by its
 own conversation), the prompt chunks, every card of a split and the experts the CPU lane computes (they join the FFN
 output before it is projected; the lossy `MAYA_GLM_DEFER_CPU` deferral is skipped for a projecting conversation). The
