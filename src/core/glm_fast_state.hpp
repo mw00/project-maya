@@ -683,6 +683,11 @@ struct Glm5Model::FastState {
     uint64_t diag_resident_skip = 0;   // RAM-resident mode: spare refills skipped (no free RAM slot, no drop)
     std::atomic<uint64_t> ring_laps{0};   // B2.5: times the service thread found the device a whole ring ahead
     uint64_t diag_dup = 0, diag_adopt = 0;   // the boundary's clean-up: duplicate RAM copies freed, lost ones adopted
+    // MAYA_GLM_ADMIT=all: a decode's disk read with no free RAM slot takes the least recently used RAM expert's slot of
+    // a layer this token has passed (the route service thread's), and the boundary forgets the evicted experts' table
+    // entries; admit_evict counts them
+    std::vector<int> admit_cleared;
+    uint64_t admit_evict = 0;
     size_t ram_bytes = 0;
     size_t all_bytes = 0;   // the bytes of every routed expert of this part's layers (the Monitor's tiers)
     // ---- demotions VRAM -> RAM (copy stream, D2H) of the victims that make room for spares

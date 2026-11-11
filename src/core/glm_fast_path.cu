@@ -5106,6 +5106,33 @@ void Glm5Model::fast_service() {
                             rs = s2;
                             break;
                         }
+                    // MAYA_GLM_ADMIT=all (libosmos's membrane: every miss admitted): no free slot - the least recently
+                    // used held expert of a layer this token has passed gives up its slot.  Nothing reads those layers
+                    // again before the boundary (a device walks its layers in order, a verify window's tokens
+                    // together), so its bytes can be overwritten now; the boundary clears its table entry.  Without
+                    // it the read lands in staging and is gone after this route: on Maya-XS over 2x RTX 5090 with a
+                    // 60 GB RAM tier the replayed routes read ~30% more from the disk that way
+                    static const bool admit_all = [] {
+                        const char* v = getenv("MAYA_GLM_ADMIT");
+                        return v != nullptr && std::strcmp(v, "all") == 0;
+                    }();
+                    if (rs < 0 && admit_all) {
+                        uint64_t bt = UINT64_MAX;
+                        for (int s2 = 0; s2 < R.n; ++s2) {
+                            if (R.st[(size_t) s2] != FastState::kRHold) continue;
+                            const int ok2 = R.key[(size_t) s2];
+                            if (ok2 < 0 || ok2 / g.n_expert >= il || R.tick[(size_t) s2] >= bt) continue;
+                            bt = R.tick[(size_t) s2];
+                            rs = s2;
+                        }
+                        if (rs >= 0) {
+                            const int old = R.key[(size_t) rs];
+                            if (F->ram_of[(size_t) old] == rs) F->ram_of[(size_t) old] = -1;
+                            F->left[(size_t) old] = 2;
+                            F->admit_cleared.push_back(old);
+                            ++F->admit_evict;
+                        }
+                    }
                     if (rs >= 0) {
                         R.key[(size_t) rs] = key;
                         R.tick[(size_t) rs] = F->clock;
@@ -5591,6 +5618,10 @@ bool Glm5Model::fast_boundary(std::string& err) {
         F->upd_val_h[nu] = v;
         ++nu;
     };
+    // (0) the experts MAYA_GLM_ADMIT=all evicted during the token: out of the RAM table (unless read back since)
+    for (const int k : F->admit_cleared)
+        if (F->ram_of[(size_t) k] < 0) upd(F->rtab_key(k), 0ull);
+    F->admit_cleared.clear();
     // the RAM tier's victim among its held experts: the least-used by the aged counts among those no route used in the
     // last `protect` routes (~64 tokens) - a newly hot expert keeps its place while its count catches up, instead of
     // going back to disk as the lowest count and being read again a moment later (real chats measured 7-11 disk reads
