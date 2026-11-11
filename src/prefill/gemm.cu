@@ -1,5 +1,6 @@
 // src/prefill/gemm.cu - see include/strata/prefill/gemm.hpp.
 #include "strata/prefill/gemm.hpp"
+#include "strata/cuda_compat/pascal_gemm.hpp"
 #include "strata/kernels/dequant_bf16.hpp"
 #include "strata/prefill/failure.hpp"
 
@@ -416,7 +417,7 @@ void Gemm::f16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_
 #endif
     ck(cublasGemmEx((cublasHandle_t) handle_, CUBLAS_OP_T, CUBLAS_OP_N, (int) N, (int) T, (int) K, &alpha, W,
                     CUDA_R_16F, (int) K, X, CUDA_R_16F, (int) K, &beta, Y, CUDA_R_32F, (int) ldy,
-                    CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT),
+                    CUBLAS_COMPUTE_32F, STRATA_F16_GEMM_ALGO(CUBLAS_GEMM_DEFAULT, T)),
        "cublasGemmEx f16");
 }
 

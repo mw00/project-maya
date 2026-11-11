@@ -1587,8 +1587,8 @@ if(STRATA_NATIVE_EXPERTS)
     else()
       set(_strata_mmq ${_strata_gg}/src/ggml-cuda)
     endif()
-    add_library(strata_mmq STATIC src/prefill/moe_mmq.cu src/prefill/ggml_cuda_host.cu ${_strata_mmq}/quantize.cu
-                ${_strata_mmq}/convert.cu)
+    add_library(strata_mmq STATIC src/prefill/moe_mmq.cu src/prefill/moe_pascal.cu src/prefill/ggml_cuda_host.cu
+                ${_strata_mmq}/quantize.cu ${_strata_mmq}/convert.cu)
     if(_strata_mmq_glu)
       target_compile_definitions(strata_mmq PRIVATE STRATA_MMQ_GLU=1)
     endif()
@@ -1614,6 +1614,12 @@ if(STRATA_NATIVE_EXPERTS)
       target_link_libraries(glm_mmq_glu_test PRIVATE strata_mmq strata_kernels ggml-base ${_strata_gpu_runtime_target})
       add_test(NAME glm_mmq_glu_test COMMAND glm_mmq_glu_test)
       set_tests_properties(glm_mmq_glu_test PROPERTIES TIMEOUT 300)
+      # the Pascal prompt path's FP32 expert product against ggml's dequantizer
+      add_executable(pascal_moe_gemm_test tests/pascal_moe_gemm_test.cu)
+      target_include_directories(pascal_moe_gemm_test PRIVATE ${_strata_gpu_include_directories})
+      target_link_libraries(pascal_moe_gemm_test PRIVATE strata_mmq ggml-base ${_strata_gpu_runtime_target})
+      add_test(NAME pascal_moe_gemm_test COMMAND pascal_moe_gemm_test)
+      set_tests_properties(pascal_moe_gemm_test PROPERTIES TIMEOUT 300)
     endif()
   elseif(STRATA_PREFILL_MMQ)
     # Compile only the pinned GGML MMQ and activation-quantizer sources used by prefill. This uses

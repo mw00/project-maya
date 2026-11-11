@@ -188,6 +188,18 @@ __device__ __forceinline__ uint32_t unpack_ksigns(const uint8_t v) {
     const uint32_t s = v ^ p << 7;
     return s * 0x01010101;
 }
+// Four weights' signs without __vcmpne4 / __vsub4 (about 16 emulated ops each on sm_60): bits 0..3 of x4 negate bytes 0..3
+// of g.  A grid byte is never 0, so (g ^ m) + (m & 1) per byte is the exact two's complement without a carry into the
+// next byte, and (x4 * 0x00204081) & 0x01010101 puts bit j of x4 in byte j.
+__device__ __forceinline__ int sflip4(uint32_t g, uint32_t x4) {
+    const uint32_t m1 = ((x4 & 0xFu) * 0x00204081u) & 0x01010101u;
+    return (int) ((g ^ (m1 * 255u)) + m1);
+}
+// ... the IQ2_XXS / IQ3_XXS sign byte: 7 sign bits and their parity (unpack_ksigns' bits 0..7)
+__device__ __forceinline__ uint32_t ksign8(uint32_t v) {
+    v &= 0xFFu;
+    return v ^ ((__popc(v) & 1u) << 7);
+}
 __device__ __forceinline__ int2 get_int_from_table_16(const int& q4, const int8_t* table) {
     const uint32_t* table32 = (const uint32_t*) table;
     uint32_t tmp[2];
@@ -839,6 +851,10 @@ template<> __device__ __forceinline__ float dw<16>(const uint8_t* row, int kbx, 
         const uint4 sgn = hip_fast_signs(aux32 >> (7 * k0 / 2), true);
         sumi = __dp4a((int) ((grid_pos.x ^ sgn.x) + sgn.y), x.u[k0 + 0], sumi);
         sumi = __dp4a((int) ((grid_pos.y ^ sgn.z) + sgn.w), x.u[k0 + 1], sumi);
+#elif defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 610
+        const uint32_t sb = ksign8(aux32 >> (7 * k0 / 2));
+        sumi = __dp4a(sflip4(grid_pos.x, sb), x.u[k0 + 0], sumi);
+        sumi = __dp4a(sflip4(grid_pos.y, sb >> 4), x.u[k0 + 1], sumi);
 #else
         const uint32_t signs = unpack_ksigns(aux32 >> (7 * k0 / 2));
         const int signs0 = __vcmpne4(signs & 0x08040201, 0);
@@ -864,6 +880,10 @@ template<> __device__ __forceinline__ float dw<18>(const uint8_t* row, int kbx, 
         const uint4 sgn = hip_fast_signs(aux32 >> (7 * l0 / 2), true);
         sumi = __dp4a((int) ((grid_pos.x ^ sgn.x) + sgn.y), x.u[l0 + 0], sumi);
         sumi = __dp4a((int) ((grid_pos.y ^ sgn.z) + sgn.w), x.u[l0 + 1], sumi);
+#elif defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 610
+        const uint32_t sb = ksign8(aux32 >> (7 * l0 / 2));
+        sumi = __dp4a(sflip4(grid_pos.x, sb), x.u[l0 + 0], sumi);
+        sumi = __dp4a(sflip4(grid_pos.y, sb >> 4), x.u[l0 + 1], sumi);
 #else
         const uint32_t signs = unpack_ksigns(aux32 >> (7 * l0 / 2));
         const int signs0 = __vcmpne4(signs & 0x08040201, 0);
@@ -941,6 +961,9 @@ template<> __device__ __forceinline__ float dw<22>(const uint8_t* row, int kbx, 
         const uint4 sgn = hip_fast_signs(signs_packed_8[l0 / 2], false);
         const int grid_l = (int) ((grid_pos.x ^ sgn.x) + sgn.y);
         const int grid_h = (int) ((grid_pos.y ^ sgn.z) + sgn.w);
+#elif defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 610
+        const int grid_l = sflip4(grid_pos.x, signs_packed_8[l0 / 2]);
+        const int grid_h = sflip4(grid_pos.y, signs_packed_8[l0 / 2] >> 4);
 #else
         const int signs0 =
             __vcmpne4(((signs_packed_8[l0 / 2] & 0x03) << 7) | ((signs_packed_8[l0 / 2] & 0x0C) << 21), 0x00000000);
@@ -1544,6 +1567,117 @@ __global__ void __launch_bounds__(256) mv_kernel_t_cols(const STRATA_GRID_CONSTA
             if (c < J.ncol) J.y[c * J.y_cstride + row] = mv_out(J.alpha, s[c], J.bias ? J.bias[row] : 0.0f);
 }
 
+// ---------------------------------------------------------------- Q4_K GEMV without dp4a (Pascal, sm_60)
+// The emulated __dp4a is not what limits the P100's Q4_K GEMV (a free dp4a changes nothing); the per-weight work around
+// it is.  A pair of weights and a pair of activations go through ONE IMAD here: with P = (a0 << 16) + a2 and
+// W = w0 | (w2 << 16) (w a 4-bit value), the high half of P * W is a0 * w0 + a2 * w2 and the low half, a2 * w0, a
+// bounded rest; 8 such IMADs stay under 2^15 in both halves, so (acc + 0x8000) >> 16 is the exact integer dot, the
+// same value dp4a gives.  The activations are staged once a block in shared memory as those pairs (16 B granules,
+// bank-conflict free), with each 32-value sub-block's scale and its exact sum (the min term).  A lane takes 16 weights
+// of two sub-blocks from one 16 B load; the scales of all eight sub-blocks unpack without a branch.  Every column has the
+// same arithmetic as a single column's, so a column is bit for bit the one-column result.
+constexpr int PQ_COLS = 4;
+__host__ __device__ constexpr size_t pq_col_bytes(int n_in) { return (size_t) n_in * 2 + (size_t) n_in / 8 + (size_t) n_in / 4; }
+
+template<int NC>
+__global__ void __launch_bounds__(256) mv_q4k_pascal(const STRATA_GRID_CONSTANT MvBatch b) {
+    if (b.skip != nullptr && *b.skip) return;
+    const int bid = blockIdx.x;
+    int ji = 0;
+    while (ji < b.n - 1 && bid >= b.blk_end[ji]) ++ji;
+    const MvJob& J = b.j[ji];
+    const int blk0 = ji ? b.blk_end[ji - 1] : 0;
+    extern __shared__ __align__(16) unsigned char pq_sm[];
+    const int n_in = J.n_in, ncol = J.ncol, nb = n_in / 256, nsub = n_in / 32;
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    const int row = (bid - blk0) * MV_ROWS + warp;
+    const int c8 = lane & 7, lb = lane >> 3, g = c8 >> 1, h = c8 & 1;
+    const bool live = row < J.n_out;
+    const uint8_t* wrow = (const uint8_t*) J.w + (size_t) (live ? row : 0) * nb * 144;
+    uint4 hdn = make_uint4(0, 0, 0, 0), qn = hdn;
+    if (live && lb < nb) {   // (the first weights are in flight while the activations are staged)
+        const uint4* blk = (const uint4*) wrow + lb * 9;
+        hdn = blk[0];
+        qn = blk[1 + c8];
+    }
+    const size_t cb = pq_col_bytes(n_in);
+    for (int c = 0; c < ncol; ++c) {
+        int4* xp = (int4*) (pq_sm + c * cb);
+        float* d8s = (float*) (xp + n_in / 8);
+        int* sums = (int*) (d8s + nsub);
+        const block_q8_1* x = (const block_q8_1*) ((const uint8_t*) J.xq + (size_t) c * J.xq_cstride);
+        for (int i = tid; i < nsub; i += 256) {
+            d8s[i] = __low2float(x[i].ds);
+            const int* qi = (const int*) x[i].qs;
+            const int bq = i >> 3, sg = (i & 7) >> 1, st = i & 1;
+            int s0 = 0, s1 = 0;
+#pragma unroll
+            for (int k = 0; k < 8; ++k) {
+                const int u = qi[k];
+                const int a0 = (int8_t) u, a1 = (int8_t) (u >> 8), a2 = (int8_t) (u >> 16), a3 = u >> 24;
+                int* dst = (int*) &xp[bq * 32 + (st * 2 + ((k & 3) >> 1)) * 8 + ((k >> 2) * 4 + sg)] + (k & 1) * 2;
+                dst[0] = (a0 << 16) + a2;
+                dst[1] = (a1 << 16) + a3;
+                if (k < 4) s0 += a0 + a1 + a2 + a3; else s1 += a0 + a1 + a2 + a3;
+            }
+            sums[2 * i] = s0;
+            sums[2 * i + 1] = s1;
+        }
+    }
+    __syncthreads();
+    float acc[NC];
+#pragma unroll
+    for (int c = 0; c < NC; ++c) acc[c] = 0.0f;
+    for (int bb = lb; bb < nb; bb += 4) {
+        const uint4 hd = hdn, q = qn;
+        if (live && bb + 4 < nb) {
+            const uint4* blk = (const uint4*) wrow + (bb + 4) * 9;
+            hdn = blk[0];
+            qn = blk[1 + c8];
+        }
+        // the scales and mins of the eight sub-blocks (ggml's unpacking), then this lane's pair of sub-blocks
+        const uint32_t s0 = hd.y, s1 = hd.z, s2 = hd.w;
+        const uint32_t t0 = s0 & 0x3f3f3f3fu, t2 = s1 & 0x3f3f3f3fu;
+        const uint32_t t1 = (s2 & 0x0f0f0f0fu) | (((s0 >> 6) & 0x03030303u) << 4);
+        const uint32_t t3 = ((s2 >> 4) & 0x0f0f0f0fu) | (((s1 >> 6) & 0x03030303u) << 4);
+        const uint32_t scw = (g >> 1) ? t1 : t0, mnw = (g >> 1) ? t3 : t2;
+        const uint32_t scp = scw >> (16 * (g & 1)), mnp = mnw >> (16 * (g & 1));
+        const int scA = scp & 0xff, scB = (scp >> 8) & 0xff, mA = mnp & 0xff, mB = (mnp >> 8) & 0xff;
+        const float2 dm = __half22float2(*(const __half2*) &hd.x);
+        const uint32_t qa[4] = {q.x, q.y, q.z, q.w};
+        const int sa = bb * 8 + 2 * g;
+#pragma unroll
+        for (int c = 0; c < NC; ++c) {
+            if (c >= ncol) break;
+            const int4* xp = (const int4*) (pq_sm + c * cb);
+            const float* d8s = (const float*) (xp + n_in / 8);
+            const int* sums = (const int*) (d8s + nsub);
+            const int4 pA0 = xp[bb * 32 + h * 4 + g], pA1 = xp[bb * 32 + 8 + h * 4 + g];
+            const int4 pB0 = xp[bb * 32 + 16 + h * 4 + g], pB1 = xp[bb * 32 + 24 + h * 4 + g];
+            const int pA[8] = {pA0.x, pA0.y, pA0.z, pA0.w, pA1.x, pA1.y, pA1.z, pA1.w};
+            const int pB[8] = {pB0.x, pB0.y, pB0.z, pB0.w, pB1.x, pB1.y, pB1.z, pB1.w};
+            int accA = 0, accB = 0;
+#pragma unroll
+            for (int k = 0; k < 4; ++k) {
+                accA = pA[2 * k] * (int) (qa[k] & 0x000f000fu) + accA;
+                accA = pA[2 * k + 1] * (int) ((qa[k] >> 8) & 0x000f000fu) + accA;
+                accB = pB[2 * k] * (int) ((qa[k] >> 4) & 0x000f000fu) + accB;
+                accB = pB[2 * k + 1] * (int) ((qa[k] >> 12) & 0x000f000fu) + accB;
+            }
+            const int HA = (accA + 0x8000) >> 16, HB = (accB + 0x8000) >> 16;
+            const float dA = d8s[sa], dB = d8s[sa + 1];
+            const int sumA = sums[sa * 2 + h], sumB = sums[(sa + 1) * 2 + h];
+            acc[c] += dm.x * (dA * (HA * scA) + dB * (HB * scB)) - dm.y * (dA * (sumA * mA) + dB * (sumB * mB));
+        }
+    }
+#pragma unroll
+    for (int c = 0; c < NC; ++c) {
+        const float sum = warp_sum(acc[c]);
+        if (lane == 0 && live && c < ncol)
+            J.y[(size_t) c * J.y_cstride + row] = mv_out(J.alpha, sum, J.bias ? J.bias[row] : 0.0f);
+    }
+}
+
 // ---------------------------------------------------------------- the same GEMVs for NT activations at once (mv_nt)
 // Several conversations' tokens through one layer: activation t is xs q8_1 blocks (or n_in floats) after activation
 // t - 1, output t n_out floats after output t - 1.  Each lane makes row_dot's calls in row_dot's order for every
@@ -1914,6 +2048,67 @@ void mvc_launch(const MvBatch& b, int blocks, int nc, cudaStream_t s) {
     else if (nc <= 8) mvc_kernel_t<T, 8><<<blocks, 256, 0, s>>>(b);
     else mvc_kernel_t<T, 16><<<blocks, 256, 0, s>>>(b);
 }
+
+// whether the Pascal Q4_K GEMV above serves this device (compute 6.0, no dp4a; STRATA_GLM_PASCAL_MV=0: never), once per device
+bool pascal_mv_arch() {
+#if defined(STRATA_USE_HIP)
+    return false;
+#else
+    static int cache[64];
+    int dev = 0;
+    cudaGetDevice(&dev);
+    if (dev < 0 || dev >= 64) return false;
+    if (cache[dev] == 0) {
+        int major = 0, minor = 0;
+        cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
+        cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev);
+        static const bool off = getenv("STRATA_GLM_PASCAL_MV") != nullptr && std::atoi(getenv("STRATA_GLM_PASCAL_MV")) == 0;
+        cache[dev] = major * 10 + minor < 61 && !off ? 1 : 2;
+    }
+    return cache[dev] == 1;
+#endif
+}
+
+// ... the Pascal Q4_K path's jobs: whether a job takes it, a job's columns cut into chunks that fit the shared memory
+// (each chunk a job of its own; its columns keep the one-column result), and the launches
+#if !defined(STRATA_USE_HIP)
+inline bool pq_ok(const MvJob& J) {
+    return J.type == 12 && J.ncol >= 1 && J.n_in % 256 == 0 && ((uintptr_t) J.w & 15) == 0 &&
+           pq_col_bytes(J.n_in) <= 46 * 1024;
+}
+inline int pq_split(const MvJob& J, MvJob* ent) {
+    const int cap = (int) std::min<size_t>(PQ_COLS, (46 * 1024) / pq_col_bytes(J.n_in));
+    int ne = 0;
+    for (int c0 = 0; c0 < J.ncol; c0 += cap) {
+        MvJob E = J;
+        E.ncol = std::min(cap, J.ncol - c0);
+        E.xq = (const uint8_t*) J.xq + (int64_t) c0 * J.xq_cstride;
+        if (J.xf != nullptr) E.xf = J.xf + (int64_t) c0 * J.xf_cstride;
+        E.y = J.y + (int64_t) c0 * J.y_cstride;
+        ent[ne++] = E;
+    }
+    return ne;
+}
+void pq_launch(const MvJob* ent, int ne, cudaStream_t s) {
+    for (int e0 = 0; e0 < ne; e0 += kMaxMvJobs) {
+        MvBatch b{};
+        b.skip = g_skip;
+        int acc = 0, m = 0, nc = 1;
+        size_t smem = 0;
+        for (int e = e0; e < ne && m < kMaxMvJobs; ++e) {
+            b.j[m] = ent[e];
+            acc += (ent[e].n_out + MV_ROWS - 1) / MV_ROWS;
+            b.blk_end[m++] = acc;
+            nc = std::max(nc, ent[e].ncol);
+            smem = std::max(smem, (size_t) ent[e].ncol * pq_col_bytes(ent[e].n_in));
+        }
+        b.n = m;
+        if (nc == 1) mv_q4k_pascal<1><<<acc, 256, smem, s>>>(b);
+        else if (nc == 2) mv_q4k_pascal<2><<<acc, 256, smem, s>>>(b);
+        else mv_q4k_pascal<4><<<acc, 256, smem, s>>>(b);
+    }
+}
+#endif
 
 // whether this device has the int8 mma.sync of the tensor-core GEMVs (NVIDIA sm_80+), asked once per device
 bool mma_arch() {
@@ -5715,6 +5910,20 @@ bool mv(const MvJob* jobs, int n, cudaStream_t s) {
         }
     }
 #endif
+#if !defined(STRATA_USE_HIP)
+    // Q4_K on a Pascal card (no dp4a): every Q4_K job, whatever its column count, from the pair-IMAD kernel, so that a
+    // column, an mv_nt activation and a one-column call all have one result
+    if (typed && pascal_mv_arch()) {
+        MvJob ent[kMaxMvJobs * kMaxMvCols];
+        int ne = 0;
+        for (int i = 0; i < n; ++i)
+            if (!done[i] && pq_ok(jobs[i])) {
+                ne += pq_split(jobs[i], ent + ne);
+                done[i] = true;
+            }
+        if (ne > 0) pq_launch(ent, ne, s);
+    }
+#endif
     // several columns: the tiled kernels (STRATA_GLM_MV_TILED=0: the column loops)
     static const bool tiled = [] {
         const char* v = getenv("STRATA_GLM_MV_TILED");
@@ -5891,6 +6100,24 @@ namespace {
 template<int NT>
 void mv_nt_launch(const MvJob* jobs, int n, bool typed, bool* done, cudaStream_t s) {
     constexpr int kTyped[] = {14, 8, 12, 13};
+#if !defined(STRATA_USE_HIP)
+    if (typed && pascal_mv_arch()) {   // (Q4_K on a Pascal card: the NT activations are columns of the pair-IMAD kernel)
+        MvJob ent[kMaxMvJobs * kMaxMvCols];
+        int ne = 0;
+        for (int i = 0; i < n; ++i) {
+            MvJob J = jobs[i];
+            J.ncol = NT;
+            J.xq_cstride = (int64_t) (J.n_in / 32) * (int64_t) sizeof(block_q8_1);
+            J.xf_cstride = J.n_in;
+            J.y_cstride = J.n_out;
+            if (!done[i] && pq_ok(J)) {
+                ne += pq_split(J, ent + ne);
+                done[i] = true;
+            }
+        }
+        if (ne > 0) pq_launch(ent, ne, s);
+    }
+#endif
     if (typed) {
         for (const int T : kTyped) {
             MvBatch b{};
