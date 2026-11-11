@@ -69,7 +69,7 @@ private:
 };
 
 struct ModelOptions {
-    int n_ctx = 4096;          // positions the caches hold
+    int n_ctx = 4096;          // positions the caches hold (--n-ctx)
     int n_layers = 0;          // layers to run (0: all); fewer: a truncated run (the cut's layers, then the head)
     bool fast_mix = false;     // reserved: the M3 attn_res / moe_combine forms (k31/p3-w4 145cef7) once merged
     // ---- placement (milestone S): a layer split over cards, the experts by usage rank in VRAM slots, the rest in RAM
@@ -168,6 +168,12 @@ public:
     bool load(const std::string& gguf_path, const ModelOptions& opt, std::string& err, EpsPreset eps = EpsPreset::moonshot);
     /// A fresh sequence: n_past 0, the KDA states and caches cleared.
     void reset();
+    /// The sequence's state as bytes (n_past; the MLA and indexer cache rows 0..n_past of each attention layer; each
+    /// KDA layer's conv and recurrent state; a geometry header), and back: a sequence restored from it continues as the
+    /// saved one would (the same bits in every cache).  load_state replaces the sequence; a state from another geometry,
+    /// or longer than n_ctx, is refused with err (the sequence is then reset).
+    bool save_state(std::vector<uint8_t>& out, std::string& err);
+    bool load_state(const std::vector<uint8_t>& in, std::string& err);
     /// Runs `tokens` as the continuation of the sequence.  logits (optional): [T][n_vocab]; dumps (optional): every
     /// seam of the call appended.  false + err on a refusal (context full, a bad token id) or a CUDA/cuBLAS failure.
     /// decode: the call's rows are generated tokens (cache-aware routing applies to them; ModelOptions::car_rank).

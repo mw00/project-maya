@@ -42,6 +42,11 @@
 #include <numeric>
 #include <sstream>
 #include <exception>
+#include <fstream>
+#include <iterator>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
 #include <filesystem>
 #include <map>
 #include <regex>
@@ -79,6 +84,8 @@ const char* const kUsage =
     "           L+1's picks from L's FFN input and prefetch them while L computes; --page-stats counts the hit rate.\n"
     "           --car-rank R: cache-aware routing on decode tokens: a pick not resident is read only if its router rank\n"
     "           < R, else the token routes among the resident experts plus the picks read (R = 16: today's routing).\n"
+    "           --n-ctx N: positions the attention caches hold (default 4096; KLX: 2816 B a position a MLA layer,\n"
+    "           24 MLA layers, float32), so a sequence past N answers ERR context full.\n"
     "           --ram-slots N|auto (with --load page): the RAM expert tier, paged experts read with O_DIRECT into\n"
     "           pinned slots (auto: MemAvailable less 16 GB), an LRU by layer and expert; --ram-readers N (16).\n"
     "           --tier-prompt-cold: a prompt call's RAM tier reads go in at the LRU's cold end (decode's set stays).\n"
@@ -542,6 +549,18 @@ int bench(const std::string& file, k31::EpsPreset eps, const k31::ModelOptions& 
 // tier_evicts tier_fallback tier_wait_us dio_reads dio_bytes dio_fails remote_calls remote_picks remote_tx remote_rx
 // remote_wait_us dyn_hits dyn_up dyn_down dyn_drop dyn_up_bytes cp_rows cp_missed cp_read cp_full cp_skipped" for it
 // (43 fields; cp_*: prompt CAR, --car-prompt-rank).  Prompt CAR applies to P's last --car-prompt-rows ids.
+//   F topk q,q,..|- id id ...           teacher forcing: for each id, the last logits' step line, then the id fed as a
+//                                      decode call (as G feeds a sampled id, so decode CAR acts as in serving)
+//                                      -> D <step> <id> <logprob> <rank> <car_rows car_missed car_fetched car_skipped
+//                                         car_checked> top <id:logprob x topk>, one a forced id (step 0: the logits
+//                                         before F; the CAR counts: the call that made the step's logits, 0s for
+//                                         step 0), then D <n> -1 ... for the logits after the last id with q <id:logprob
+//                                         ...> for the query ids, then E forced <n> <seconds>
+//   SAVE target key                    the sequence's state (caches + the last logits) under a key (e.g. a hash of
+//                                      its ids, the caller's) -> OK SAVE <n_past> <bytes> <seconds>.  target @NAME:
+//                                      held in this process; else a file path, written mode 0600
+//   LOAD target key                    the sequence replaced by a saved state; the key and the model file must match
+//                                      -> OK LOAD <n_past> <seconds> (a mismatch: ERR, the sequence reset)
 // A failure answers ERR <why> (the sequence is then reset).
 int gen_loop(const std::string& file, k31::EpsPreset eps, const k31::ModelOptions& opt, int chunk) {
     using clk = std::chrono::steady_clock;
@@ -565,6 +584,7 @@ int gen_loop(const std::string& file, k31::EpsPreset eps, const k31::ModelOption
     const int V = m.geo().n_vocab;
     std::vector<float> lg, last;
     int n_past = 0;
+    std::map<std::string, std::vector<uint8_t>> saved;   // SAVE @NAME
     auto prof = [&](const char* what) {   // --profile: the parts of the call(s) and the experts' split, on stderr
         if (!opt.profile) return;
         std::fprintf(stderr, "PROFILE %s %s; %s\n", what, m.profile().c_str(), m.expert_stats().c_str());
@@ -694,6 +714,128 @@ int gen_loop(const std::string& file, k31::EpsPreset eps, const k31::ModelOption
             std::printf("E %s %d %.3f\n", why, n, std::chrono::duration<double>(clk::now() - a).count());
             stats();
             prof("G");
+        } else if (cmd == "SAVE" || cmd == "LOAD") {
+            std::string target, key;
+            if (!(in >> target >> key)) { fail(cmd + " target key"); continue; }
+            const auto a = clk::now();
+            // the wrapper: "K31GEN01", the key, the model file, n_past, the last logits, then the model's state
+            auto put_s = [](std::vector<uint8_t>& b, const std::string& x) {
+                const uint64_t n = x.size();
+                b.insert(b.end(), (const uint8_t*) &n, (const uint8_t*) &n + 8);
+                b.insert(b.end(), x.begin(), x.end());
+            };
+            if (cmd == "SAVE") {
+                if (last.empty()) { fail("SAVE before any P"); continue; }
+                std::vector<uint8_t> st;
+                if (!m.save_state(st, err)) { fail(err); continue; }
+                std::vector<uint8_t> b = {'K', '3', '1', 'G', 'E', 'N', '0', '1'};
+                put_s(b, key);
+                put_s(b, file);
+                const int64_t np = n_past, nv = (int64_t) last.size();
+                b.insert(b.end(), (const uint8_t*) &np, (const uint8_t*) &np + 8);
+                b.insert(b.end(), (const uint8_t*) &nv, (const uint8_t*) &nv + 8);
+                b.insert(b.end(), (const uint8_t*) last.data(), (const uint8_t*) (last.data() + last.size()));
+                b.insert(b.end(), st.begin(), st.end());
+                const size_t nbytes = b.size();
+                if (target[0] == '@') saved[target] = std::move(b);
+                else {
+                    const int fd = ::open(target.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+                    bool ok = fd >= 0 && ::fchmod(fd, 0600) == 0;
+                    for (size_t o = 0; ok && o < b.size();) {
+                        const ssize_t w = ::write(fd, b.data() + o, b.size() - o);
+                        if (w <= 0) ok = false; else o += (size_t) w;
+                    }
+                    if (fd >= 0 && ::close(fd) != 0) ok = false;
+                    if (!ok) { fail("SAVE: cannot write " + target); continue; }
+                }
+                std::printf("OK SAVE %d %zu %.3f\n", n_past, nbytes, std::chrono::duration<double>(clk::now() - a).count());
+            } else {
+                std::vector<uint8_t> b;
+                if (target[0] == '@') {
+                    const auto it = saved.find(target);
+                    if (it == saved.end()) { fail("LOAD: no state " + target); continue; }
+                    b = it->second;
+                } else {
+                    std::ifstream f(target, std::ios::binary);
+                    if (!f) { fail("LOAD: cannot read " + target); continue; }
+                    b.assign(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
+                }
+                size_t o = 0;
+                auto get = [&](void* p, size_t n) { if (o + n > b.size()) return false; std::memcpy(p, b.data() + o, n); o += n; return true; };
+                auto get_s = [&](std::string& x) {
+                    uint64_t n = 0;
+                    if (!get(&n, 8) || o + n > b.size()) return false;
+                    x.assign((const char*) b.data() + o, (size_t) n);
+                    o += (size_t) n;
+                    return true;
+                };
+                char mg[8];
+                std::string k2, f2;
+                int64_t np = 0, nv = 0;
+                if (!get(mg, 8) || std::memcmp(mg, "K31GEN01", 8) || !get_s(k2) || !get_s(f2) || !get(&np, 8) || !get(&nv, 8) ||
+                    nv != V || o + (size_t) nv * 4 > b.size()) { fail("LOAD: not a saved state"); continue; }
+                if (k2 != key) { fail("LOAD: the key differs (saved " + k2 + ")"); continue; }
+                if (f2 != file) { fail("LOAD: saved from another model file (" + f2 + ")"); continue; }
+                std::vector<float> lg2((size_t) nv);
+                std::memcpy(lg2.data(), b.data() + o, (size_t) nv * 4);
+                o += (size_t) nv * 4;
+                if (!m.load_state(std::vector<uint8_t>(b.begin() + (long) o, b.end()), err)) { fail(err); continue; }
+                n_past = (int) np;
+                last = std::move(lg2);
+                std::printf("OK LOAD %d %.3f\n", n_past, std::chrono::duration<double>(clk::now() - a).count());
+            }
+        } else if (cmd == "F") {
+            int topk = 0;
+            std::string qs;
+            if (!(in >> topk >> qs) || topk < 0 || topk > 4096) { fail("F topk q,q,..|- id id .."); continue; }
+            std::vector<int> q, ids;
+            for (size_t a = 0; qs != "-" && a < qs.size();) {
+                const size_t b = std::min(qs.find(',', a), qs.size());
+                if (b > a) q.push_back(std::atoi(qs.substr(a, b - a).c_str()));
+                a = b + 1;
+            }
+            int x;
+            while (in >> x) ids.push_back(x);
+            if (last.empty()) { fail("F before any P"); continue; }
+            bool bad = false;
+            for (int i : ids) bad |= i < 0 || i >= V;
+            for (int i : q) bad |= i < 0 || i >= V;
+            if (bad) { fail("F: an id out of the vocabulary"); continue; }
+            const auto a = clk::now();
+            std::vector<int> idx((size_t) V);
+            k31::Model::PageCount pc{};   // the CAR counts of the call that made `last` (none for step 0)
+            auto step = [&](size_t st, int id) {   // the step line for `last` (log-softmax in double)
+                const float mx = *std::max_element(last.begin(), last.end());
+                double sum = 0;
+                for (float v : last) sum += std::exp((double) v - mx);
+                const double lse = (double) mx + std::log(sum);
+                auto lp = [&](int i) { return (double) last[(size_t) i] - lse; };
+                long long rank = 0;
+                if (id >= 0) for (float v : last) rank += v > last[(size_t) id];
+                std::printf("D %zu %d %.6f %lld %lld %lld %lld %lld %lld top", st, id, id >= 0 ? lp(id) : 0.0, id >= 0 ? rank : -1LL,
+                            pc.car_rows, pc.car_missed, pc.car_fetched, pc.car_skipped, pc.car_checked);
+                std::iota(idx.begin(), idx.end(), 0);
+                const size_t k = std::min((size_t) topk, (size_t) V);
+                std::partial_sort(idx.begin(), idx.begin() + (long) k, idx.end(), [&](int u, int w) {
+                    return last[(size_t) u] > last[(size_t) w] || (last[(size_t) u] == last[(size_t) w] && u < w); });
+                for (size_t i = 0; i < k; ++i) std::printf(" %d:%.6f", idx[i], lp(idx[i]));
+                if (id < 0) {
+                    std::printf(" q");
+                    for (int i : q) std::printf(" %d:%.6f", i, lp(i));
+                }
+                std::printf("\n");
+            };
+            bool ok = true;
+            for (size_t st = 0; st < ids.size(); ++st) {
+                step(st, ids[st]);
+                if (!feed({ids[st]}, true)) { ok = false; break; }
+                pc = m.page_last();
+            }
+            if (!ok) { fail(err); continue; }
+            step(ids.size(), -1);
+            std::printf("E forced %zu %.3f\n", ids.size(), std::chrono::duration<double>(clk::now() - a).count());
+            stats();
+            prof("F");
         } else {
             fail("unknown command " + cmd);
             continue;
@@ -819,6 +961,15 @@ int main(int argc, char** argv) {
                 if (c == std::string::npos) break;
                 at = c + 1;
             }
+        } else if (a == "--n-ctx" && i + 1 < argc) {
+            const std::string v = argv[++i];
+            char* end = nullptr;
+            const long n = std::strtol(v.c_str(), &end, 10);
+            if (v.empty() || *end || n < 16 || n > (1L << 20)) {
+                std::fprintf(stderr, "maya-k31: --n-ctx takes positions 16..1048576\n");
+                return 2;
+            }
+            opt.n_ctx = (int) n;
         } else if (a == "--chunk" && i + 1 < argc) {
             chunk = std::atoi(argv[++i]);
             if (chunk < 1) {

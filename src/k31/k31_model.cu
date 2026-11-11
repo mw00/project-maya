@@ -2309,6 +2309,93 @@ void Model::reset() {
     m.free_caches();
 }
 
+// the state file: "K31SNAP1", then int64 n_past n_ctx n_layers n_embd n_vocab mla_row idx_dim kda_conv kda_ssm,
+// then entries (int32 kind il, int64 bytes, the bytes): kind 1 MLA rows, 2 indexer rows, 3..5 KDA conv 0..2, 6 KDA ssm
+namespace {
+constexpr char kSnapMagic[8] = {'K', '3', '1', 'S', 'N', 'A', 'P', '1'};
+}
+bool Model::save_state(std::vector<uint8_t>& out, std::string& err) {
+    Impl& m = *p_;
+    const auto& g = m.g;
+    const int64_t row = g.kv_lora_rank + g.n_rot, Di = g.idx_key_dim, d = g.d_inner(), dc = g.ssm_d_conv;
+    const int64_t conv = d * (dc - 1), ssm = (int64_t) g.n_kda_head * g.kda_head_dim * g.kda_head_dim;
+    out.clear();
+    auto put = [&](const void* p, size_t n) { const uint8_t* b = (const uint8_t*) p; out.insert(out.end(), b, b + n); };
+    auto put64 = [&](int64_t v) { put(&v, 8); };
+    put(kSnapMagic, 8);
+    for (int64_t v : {(int64_t) m.n_past, (int64_t) m.opt.n_ctx, (int64_t) g.n_layers, (int64_t) g.n_embd, (int64_t) g.n_vocab, row, Di, conv, ssm}) put64(v);
+    auto entry = [&](int kind, int il, const float* dev, int64_t n) {
+        const int32_t h[2] = {kind, il};
+        put(h, 8);
+        put64(n * 4);
+        const size_t o = out.size();
+        out.resize(o + (size_t) n * 4);
+        if (n) ck(cudaMemcpy(out.data() + o, dev, (size_t) n * 4, cudaMemcpyDefault), "state save");
+    };
+    try {
+        for (auto& [il, p] : m.mla_cache) entry(1, il, p, (int64_t) m.n_past * row);
+        for (auto& [il, p] : m.idx_cache) entry(2, il, p, (int64_t) m.n_past * Di);
+        for (auto& [il, s] : m.kda) {
+            for (int i = 0; i < 3; ++i) if (s.conv[i]) entry(3 + i, il, s.conv[i], conv);
+            if (s.ssm) entry(6, il, s.ssm, ssm);
+        }
+    } catch (const std::exception& e) {
+        err = e.what();
+        return false;
+    }
+    return true;
+}
+bool Model::load_state(const std::vector<uint8_t>& in, std::string& err) {
+    Impl& m = *p_;
+    const auto& g = m.g;
+    const int64_t row = g.kv_lora_rank + g.n_rot, Di = g.idx_key_dim, d = g.d_inner(), dc = g.ssm_d_conv;
+    const int64_t conv = d * (dc - 1), ssm = (int64_t) g.n_kda_head * g.kda_head_dim * g.kda_head_dim;
+    reset();
+    size_t o = 0;
+    auto get = [&](void* p, size_t n) { if (o + n > in.size()) return false; std::memcpy(p, in.data() + o, n); o += n; return true; };
+    char mg[8];
+    int64_t h[9];
+    if (!get(mg, 8) || std::memcmp(mg, kSnapMagic, 8) || !get(h, sizeof h)) { err = "maya-k31: not a state file"; return false; }
+    const int64_t want[9] = {h[0], h[1], g.n_layers, g.n_embd, g.n_vocab, row, Di, conv, ssm};
+    for (int i = 2; i < 9; ++i)
+        if (h[i] != want[i]) { err = "maya-k31: the state is from another model (geometry field " + std::to_string(i) + ")"; return false; }
+    if (h[0] < 0 || h[0] > m.opt.n_ctx) {
+        err = "maya-k31: the state holds " + std::to_string(h[0]) + " positions, more than --n-ctx " + std::to_string(m.opt.n_ctx);
+        return false;
+    }
+    const int64_t np = h[0];
+    try {
+        while (o < in.size()) {
+            int32_t kh[2];
+            int64_t nb;
+            if (!get(kh, 8) || !get(&nb, 8) || nb < 0 || o + (size_t) nb > in.size()) throw std::runtime_error("maya-k31: a truncated state");
+            const int kind = kh[0], il = kh[1];
+            if (il < 0 || il >= g.n_layers) throw std::runtime_error("maya-k31: a state entry for layer " + std::to_string(il));
+            const bool mla = !g.is_recr(il);
+            int64_t n = -1, alloc = 0;
+            if (kind == 1 && mla) { n = np * row; alloc = (int64_t) m.opt.n_ctx * row; }
+            else if (kind == 2 && mla) { n = np * Di; alloc = (int64_t) m.opt.n_ctx * Di; }
+            else if (kind >= 3 && kind <= 5 && !mla) n = alloc = conv;
+            else if (kind == 6 && !mla) n = alloc = ssm;
+            if (n < 0 || nb != n * 4) throw std::runtime_error("maya-k31: state entry " + std::to_string(kind) + " of layer " + std::to_string(il) + " does not fit");
+            m.use(m.dev_of(il));
+            float* p = m.zeros_persist((size_t) alloc);
+            if (kind == 1) m.mla_cache[il] = p;
+            else if (kind == 2) m.idx_cache[il] = p;
+            else if (kind == 6) m.kda[il].ssm = p;
+            else m.kda[il].conv[kind - 3] = p;
+            if (n) ck(cudaMemcpy(p, in.data() + o, (size_t) nb, cudaMemcpyHostToDevice), "state load");
+            o += (size_t) nb;
+        }
+    } catch (const std::exception& e) {
+        err = e.what();
+        reset();
+        return false;
+    }
+    m.n_past = (int) np;
+    return true;
+}
+
 bool Model::forward(const std::vector<int>& tokens, std::vector<float>* logits, Dumps* dumps, std::string& err, bool decode,
                     int car_tail) {
     Impl& m = *p_;
