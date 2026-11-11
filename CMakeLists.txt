@@ -300,6 +300,11 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/ds4_prompt_mem_test.cpp")
   target_link_libraries(ds4_prompt_mem_test PRIVATE strata_warnings)
   add_test(NAME ds4_prompt_mem_test COMMAND ds4_prompt_mem_test)
 endif()
+# Cache-aware expert substitution's pure selector and strict startup configuration (no GPU or model).
+add_executable(ds4_cache_sub_test EXCLUDE_FROM_ALL tests/ds4_cache_sub_test.cpp)
+target_link_libraries(ds4_cache_sub_test PRIVATE strata_warnings)
+add_test(NAME ds4_cache_sub_test COMMAND ds4_cache_sub_test)
+
 # DeepSeek CPU-row startup selection policy and native-experts OFF symbol (no GPU or ggml dependency).
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/ds4_cpu_prepare_rows_test.cpp")
   add_executable(ds4_cpu_prepare_rows_test EXCLUDE_FROM_ALL tests/ds4_cpu_prepare_rows_test.cpp)
@@ -802,6 +807,11 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     if(STRATA_ENABLE_HIP)
       target_link_libraries(ds4_gguf_test PRIVATE strata_mmq)
     endif()
+    # The opt-in substitution router, native disabled path, helper membership and reference normalization.
+    add_executable(ds4_route_sub_test EXCLUDE_FROM_ALL tests/ds4_route_sub_test.cu src/ds4/ds4_kernels.cu
+                                   src/ds4/ds4_host_ar.cpp)
+    target_include_directories(ds4_route_sub_test PRIVATE ${_strata_gpu_include_directories} include)
+    target_link_libraries(ds4_route_sub_test PRIVATE ${_strata_gpu_runtime_target})
     # DS4_MULTI_ATTN: a multi step's attention for all its rows in one launch a step against each conversation's run
     # alone (attn_core's launches), bit for bit on random rings and caches - decode rows, verify windows, drafter
     # blocks (needs a GPU, no model; built by name)

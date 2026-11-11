@@ -1001,6 +1001,27 @@ decode at 118K context the same (33.0 against 31.9 tok/s, 32 greedy tokens); per
 short prompts with DSpark (temperature 1) 63.7 against 69.8 tok/s - the first group's 10 layers keep ~89% of their
 experts in VRAM, the second's 27 only ~23%, and each token waits on the second's CPU lane.
 
+## DeepSeek: cache-resident expert substitution (experimental, changes answers)
+
+**Off by default. Enabling substitution changes expert choices, logits and potentially answers; it is approximate
+inference and can reduce accuracy.** During decode and target verification, an uncached routed expert can be replaced
+by a lower-ranked expert already in primary or healthy-helper VRAM. The number of active experts stays the same;
+prompt feeding and the drafter keep their native routing. This is not limited to EXL3 packs or a fixed GPU count.
+
+Set these in the config's `env` before loading the model; reload after changing them. The native engine also accepts
+the `DS4_` and `STRATA_DS4_` prefixes in place of `MAYA_DS4_`.
+
+| Setting | Default | Meaning |
+| --- | --- | --- |
+| `MAYA_DS4_CACHE_SUB_RATIO` | `0` (off) | Minimum replacement/original unbiased positive router-score ratio, in `[0, 1]`. Zero disables substitution and preserves native routing. A positive value enables it; even `1` is approximate because selection bias can rank a higher unbiased score below a native choice. |
+| `MAYA_DS4_CACHE_SUB_N` | `12` | Candidate window: `12`, `16` or `32`, clipped to the layer's expert count. Replacements come from unused resident candidates below the normal top-k cutoff. |
+| `MAYA_DS4_CACHE_SUB_RISK_BUDGET` | `0.6` | Nonnegative finite limit per token/layer on the sum of each swap's original plus replacement scores, divided by the original top-k score sum. Smaller budgets permit less total substitution. This is a routing-mass heuristic, not an error probability or an accuracy guarantee. |
+| `MAYA_DS4_CACHE_SUB_NORM` | `reference` | Only `reference` is supported: retain the original top-k score denominator, without renormalizing replacements to restore the original routing mass. |
+
+Residency affects the choices: the same sampling seed does not guarantee the same answer with a different cache
+history, batch or verification window. Do not combine substitution with `DS4_SYNC` or resident/RAM/disk expert
+skipping; the engine rejects these combinations. See [selection rules, counters and measured limitations](ds4-cache-substitution.md).
+
 ## DeepSeek: skipping light experts the SSD would read (experimental)
 
 When DeepSeek-V4.1-Flash's experts do not fit in VRAM and RAM, a token waits for the SSD to read the experts it was

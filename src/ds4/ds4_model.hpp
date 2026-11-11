@@ -126,6 +126,10 @@ struct Stats {
     int64_t eg_cached = 0, eg_cache_cap = 0;          // the row cache's rows held, its capacity
     int64_t eg_cache_row_bytes = 0;                   // each cached row's payload bytes
     int64_t swaps = 0;                // experts the cache moved into VRAM
+    // Cache substitution's native demand versus executed routing (decode/verification layer rows, not emitted tokens).
+    int64_t sub_rows = 0, sub_picks = 0, cache_substituted = 0;
+    int64_t sub_demand_gpu = 0, sub_executed_gpu = 0;
+    double sub_removed_mass = 0.0, sub_executed_mass = 0.0; // normalized by each row's original top-k mass
     int64_t skipped = 0;              // routed experts STRATA_DS4_DISK_SKIP_W left out (light, not in RAM)
     int skip_on = -1;                 // DISK_SKIP_AUTO: 1 skipping, 0 off (warm), -1 not in use
     int64_t skip_switches = 0;        // ... the times it switched
