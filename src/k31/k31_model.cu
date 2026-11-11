@@ -2695,10 +2695,16 @@ bool Model::load(const std::string& path, const ModelOptions& opt, std::string& 
     }
 }
 
-void Model::reset() {
+void Model::reset() {   // a fresh sequence: the caches stay allocated (rows past n_past are never read), KDA state zeroed
     Impl& m = *p_;
     m.n_past = 0;
-    m.free_caches();
+    const int64_t conv = (int64_t) m.g.d_inner() * (m.g.ssm_d_conv - 1),
+                  ssm = (int64_t) m.g.n_kda_head * m.g.kda_head_dim * m.g.kda_head_dim;
+    for (auto& [il, st] : m.kda) {
+        m.use(m.dev_of(il));
+        for (float* c : st.conv) if (c) ck(cudaMemset(c, 0, (size_t) conv * 4), "reset");
+        if (st.ssm) ck(cudaMemset(st.ssm, 0, (size_t) ssm * 4), "reset");
+    }
 }
 
 // the state file: "K31SNAP1", then int64 n_past n_ctx n_layers n_embd n_vocab mla_row idx_dim kda_conv kda_ssm,
@@ -2813,11 +2819,12 @@ bool Model::save_state(std::vector<uint8_t>& out, std::string& err) {
     return true;
 }
 bool Model::load_state(const std::vector<uint8_t>& in, std::string& err) {
+    // The caches are reused: the input is checked whole first, then only the caches not yet allocated are allocated
+    // (one failing: the ones just allocated are freed again and nothing else changed), then the rows are copied in.
     Impl& m = *p_;
     const auto& g = m.g;
     const int64_t row = g.kv_lora_rank + g.n_rot, Di = g.idx_key_dim, d = g.d_inner(), dc = g.ssm_d_conv;
     const int64_t conv = d * (dc - 1), ssm = (int64_t) g.n_kda_head * g.kda_head_dim * g.kda_head_dim;
-    reset();
     size_t o = 0;
     auto get = [&](void* p, size_t n) { if (o + n > in.size()) return false; std::memcpy(p, in.data() + o, n); o += n; return true; };
     char mg[8];
@@ -2831,28 +2838,61 @@ bool Model::load_state(const std::vector<uint8_t>& in, std::string& err) {
         return false;
     }
     const int64_t np = h[0];
+    struct Entry { int kind, il; int64_t n, alloc; size_t at; };
+    std::vector<Entry> es;
+    while (o < in.size()) {
+        int32_t kh[2];
+        int64_t nb;
+        if (!get(kh, 8) || !get(&nb, 8) || nb < 0 || o + (size_t) nb > in.size()) { err = "maya-k31: a truncated state"; return false; }
+        const int kind = kh[0], il = kh[1];
+        if (il < 0 || il >= g.n_layers) { err = "maya-k31: a state entry for layer " + std::to_string(il); return false; }
+        const bool mla = !g.is_recr(il);
+        int64_t n = -1, alloc = 0;
+        if (kind == 1 && mla) { n = np * row; alloc = (int64_t) m.opt.n_ctx * row; }
+        else if (kind == 2 && mla) { n = np * Di; alloc = (int64_t) m.opt.n_ctx * Di; }
+        else if (kind >= 3 && kind <= 5 && !mla) n = alloc = conv;
+        else if (kind == 6 && !mla) n = alloc = ssm;
+        if (n < 0 || nb != n * 4) { err = "maya-k31: state entry " + std::to_string(kind) + " of layer " + std::to_string(il) + " does not fit"; return false; }
+        es.push_back({kind, il, n, alloc, o});
+        o += (size_t) nb;
+    }
+    auto slot = [&](const Entry& e) -> float*& {
+        if (e.kind == 1) return m.mla_cache[e.il];
+        if (e.kind == 2) return m.idx_cache[e.il];
+        if (e.kind == 6) return m.kda[e.il].ssm;
+        return m.kda[e.il].conv[e.kind - 3];
+    };
+    // the caches this state needs and the engine has not allocated yet (K31_TEST_LOAD_FAIL_ALLOC: the test of a
+    // failing allocation)
+    std::vector<std::pair<const Entry*, float*>> fresh;
+    const bool test_fail = std::getenv("K31_TEST_LOAD_FAIL_ALLOC") != nullptr;
+    for (const Entry& e : es) {
+        if (slot(e)) continue;
+        m.use(m.dev_of(e.il));
+        void* p = nullptr;
+        if (test_fail || cudaMalloc(&p, (size_t) std::max<int64_t>(e.alloc, 1) * 4) != cudaSuccess ||
+            cudaMemset(p, 0, (size_t) std::max<int64_t>(e.alloc, 1) * 4) != cudaSuccess) {
+            cudaGetLastError();
+            if (p) m.free_at(m.dev_of(e.il), p);
+            for (auto& [fe, fp] : fresh) m.free_at(m.dev_of(fe->il), fp);
+            // (entries made by slot() for caches that stayed unallocated go: the maps hold allocated caches only)
+            for (auto it = m.mla_cache.begin(); it != m.mla_cache.end();) it = it->second ? std::next(it) : m.mla_cache.erase(it);
+            for (auto it = m.idx_cache.begin(); it != m.idx_cache.end();) it = it->second ? std::next(it) : m.idx_cache.erase(it);
+            for (auto it = m.kda.begin(); it != m.kda.end();) it = it->second.ssm ? std::next(it) : m.kda.erase(it);
+            err = std::string("maya-k31: LOAD: cannot allocate a cache of ") + std::to_string(e.alloc * 4 >> 20) +
+                  " MB on CUDA " + std::to_string(m.dev_of(e.il)) + (test_fail ? " (test)" : "") + "; the caches are as they were";
+            return false;
+        }
+        fresh.push_back({&e, (float*) p});
+    }
+    for (auto& [fe, fp] : fresh) slot(*fe) = fp;
+    // the rows in; a KDA layer the state does not hold starts from zero
     try {
-        while (o < in.size()) {
-            int32_t kh[2];
-            int64_t nb;
-            if (!get(kh, 8) || !get(&nb, 8) || nb < 0 || o + (size_t) nb > in.size()) throw std::runtime_error("maya-k31: a truncated state");
-            const int kind = kh[0], il = kh[1];
-            if (il < 0 || il >= g.n_layers) throw std::runtime_error("maya-k31: a state entry for layer " + std::to_string(il));
-            const bool mla = !g.is_recr(il);
-            int64_t n = -1, alloc = 0;
-            if (kind == 1 && mla) { n = np * row; alloc = (int64_t) m.opt.n_ctx * row; }
-            else if (kind == 2 && mla) { n = np * Di; alloc = (int64_t) m.opt.n_ctx * Di; }
-            else if (kind >= 3 && kind <= 5 && !mla) n = alloc = conv;
-            else if (kind == 6 && !mla) n = alloc = ssm;
-            if (n < 0 || nb != n * 4) throw std::runtime_error("maya-k31: state entry " + std::to_string(kind) + " of layer " + std::to_string(il) + " does not fit");
-            m.use(m.dev_of(il));
-            float* p = m.zeros_persist((size_t) alloc);
-            if (kind == 1) m.mla_cache[il] = p;
-            else if (kind == 2) m.idx_cache[il] = p;
-            else if (kind == 6) m.kda[il].ssm = p;
-            else m.kda[il].conv[kind - 3] = p;
-            if (n) ck(cudaMemcpy(p, in.data() + o, (size_t) nb, cudaMemcpyHostToDevice), "state load");
-            o += (size_t) nb;
+        reset();
+        for (const Entry& e : es) {
+            if (!e.n) continue;
+            m.use(m.dev_of(e.il));
+            ck(cudaMemcpy(slot(e), in.data() + e.at, (size_t) e.n * 4, cudaMemcpyHostToDevice), "state load");
         }
     } catch (const std::exception& e) {
         err = e.what();
