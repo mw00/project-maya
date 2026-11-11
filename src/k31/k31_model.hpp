@@ -183,7 +183,8 @@ public:
     /// or longer than n_ctx, is refused with err (the sequence is then reset).
     bool save_state(std::vector<uint8_t>& out, std::string& err);
     bool load_state(const std::vector<uint8_t>& in, std::string& err);
-    /// Runs `tokens` as the continuation of the sequence.  logits (optional): [T][n_vocab]; dumps (optional): every
+    /// Runs `tokens` as the continuation of the sequence.  logits (optional): the call's last R rows [R][n_vocab],
+    /// R = T - (T-1)/16*16 (1..16; read the last row), or all T rows when dumps is given; dumps (optional): every
     /// seam of the call appended.  false + err on a refusal (context full, a bad token id) or a CUDA/cuBLAS failure.
     /// decode: the call's rows are generated tokens (cache-aware routing applies to them; ModelOptions::car_rank).
     /// car_tail: on a prompt call with ModelOptions::car_prompt_rank, its last car_tail rows are the prompt CAR batch.

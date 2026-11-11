@@ -245,6 +245,7 @@ bool read_usage(const std::string& path, std::map<int, std::vector<double>>& out
 }  // namespace
 
 struct Model::Impl {
+    static constexpr int kExpRelease = 64;   // a call of this many tokens or more frees each expert's scratch as it goes
     Geo g;
     ModelOptions opt;
     std::unique_ptr<k31::Shards> file;   // the GGUF (one file or its shards); kept open with paged experts
@@ -920,6 +921,11 @@ struct Model::Impl {
         if (it != scr_size.end()) { scr_live[dev] -= it->second; scr_size.erase(it); }
         free_at(dev, p);
     }
+    // free the scratch taken since arena.size() was `mark` (cudaFree waits for the kernels still using it)
+    void release_arena(size_t mark) {
+        for (size_t i = mark; i < arena.size(); ++i) scr_free(arena[i].first, arena[i].second);
+        arena.resize(mark);
+    }
     void free_arena() {
         for (auto& [d, p] : arena) scr_free(d, p);
         arena.clear();
@@ -936,6 +942,11 @@ struct Model::Impl {
         kept.emplace_back(cur_dev, p);
         scr_add(cur_dev, p, std::max<size_t>(n, 1) * 4);
         return (const float*) p;
+    }
+    // drop one kept copy before the call ends (the previous layer's partial sum once the next one is kept)
+    void unkeep(const float* p) {
+        for (size_t i = 0; i < kept.size(); ++i)
+            if (kept[i].second == (const void*) p) { scr_free(kept[i].first, kept[i].second); kept.erase(kept.begin() + (long) i); return; }
     }
     float* buf(size_t n) {
         void* p = nullptr;
@@ -1488,15 +1499,20 @@ struct Model::Impl {
                 }
             });
         }
+        // a prompt call (T >= kExpRelease) frees each expert's rows once they are in parts: the call holds one expert's
+        // scratch, not K experts' worth a token (decode keeps them to the layer's end: no extra syncs)
+        const bool release = T >= kExpRelease;
         for (int e : run) {
             if (on_cpu[(size_t) e]) { ++n_cpu; continue; }
             ++(Wg.h[(size_t) e] ? n_ram : n_vram);
             std::vector<int> toks(users[e].size());
             for (size_t r = 0; r < toks.size(); ++r) toks[r] = users[e][r] / K;
             const int m = (int) toks.size();
+            const size_t mark = arena.size();
             float* pe = expert_dev(Wg, Wu, Wd, e, toks, quant, zin, eff, lat, zq, zd, z);
             for (int r = 0; r < m; ++r)
                 ck(cudaMemcpyAsync(parts + (size_t) users[e][r] * lat, pe + (size_t) r * lat, lat * 4, cudaMemcpyDeviceToDevice), "scatter");
+            if (release) release_arena(mark);
         }
         tick(kExpGpu);
         if (lane.joinable()) {   // the lane's parts into their rows
@@ -1561,6 +1577,7 @@ struct Model::Impl {
         seam("inp_embd", {n}, x, T);
         std::vector<const float*> blocks;
         const float* prefix = keep(x, (size_t) T * n);
+        const float* pk = prefix;   // the kept partial sum this card holds now (the one before it is dropped unless banked)
         for (int il = 0; il < n_run; ++il) {
             if (dev_of(il) != cur_dev) {   // the layer split: the partial sum and the banked blocks move to the next card
                 ck(cudaDeviceSynchronize(), "split");
@@ -1573,6 +1590,7 @@ struct Model::Impl {
                 };
                 prefix = mv_(prefix);
                 for (auto& b : blocks) b = mv_(b);
+                pk = prefix;
             }
             const float* cur = res_mix(blocks, prefix, L(il, "attn_res_score"), il, "attn", T);
             const bool banked = il % B == 0;
@@ -1597,14 +1615,26 @@ struct Model::Impl {
             prefix = add(prefix, f, (size_t) T * n);
             seam(nm("l_out", il), {n}, prefix, T);
             prefix = keep(prefix, (size_t) T * n);   // the layer's scratch goes; the partial sum and the blocks stay
+            if (std::find(blocks.begin(), blocks.end(), pk) == blocks.end()) unkeep(pk);   // (a banked one stays)
+            pk = prefix;
             free_arena();
         }
-        const float* cur = res_mix(blocks, prefix, "output_res_score.weight", -1, "out", T);
-        float* on = rms(cur, n, t("output_norm.weight").d, eps, n, T);
-        seam("result_norm", {n}, on, T);
-        float* lg = mv("output.weight", on, T);
-        seam("result_output", {g.n_vocab}, lg, T);
-        if (logits) *logits = host(lg, (size_t) T * g.n_vocab);
+        // the head: every row only for the dumps; else only when logits are asked for, and then only the last 16-column
+        // job of rows (the same job as in a T-row product: the same bits), so a long call never holds T x n_vocab
+        if (D) {
+            const float* cur = res_mix(blocks, prefix, "output_res_score.weight", -1, "out", T);
+            float* on = rms(cur, n, t("output_norm.weight").d, eps, n, T);
+            seam("result_norm", {n}, on, T);
+            float* lg = mv("output.weight", on, T);
+            seam("result_output", {g.n_vocab}, lg, T);
+            if (logits) *logits = host(lg, (size_t) T * g.n_vocab);
+        } else if (logits) {
+            const float* cur = res_mix(blocks, prefix, "output_res_score.weight", -1, "out", T);
+            const int r0 = (T - 1) / 16 * 16, R = T - r0;
+            float* on = rms(cur + (size_t) r0 * n, n, t("output_norm.weight").d, eps, n, R);
+            float* lg = mv("output.weight", on, R);
+            *logits = host(lg, (size_t) R * g.n_vocab);   // rows r0..T-1: callers read the last row
+        }
         ck(cudaDeviceSynchronize(), "forward");
         tick(kOther);
         n_past += T;
@@ -1805,21 +1835,39 @@ bool Model::load(const std::string& path, const ModelOptions& opt, std::string& 
             for (int i = 0; i < nd; ++i)
                 for (int il = first[(size_t) i]; il < (i + 1 < nd ? first[(size_t) i + 1] : NL); ++il) P.layer_dev[(size_t) il] = i;
             // each card's budget: its free memory less the reserve, shared by the logical cards on one physical card.
-            // The auto reserve: a call's scratch a token (the MLA scores and their softmax over the indexer's picks, the
-            // routed experts' hidden rows, a few activation rows, the attention-residual blocks kept across layers, an
-            // indexer score row over the context) times the call's tokens, plus 768 MB for the CUDA context and the
-            // libraries' workspaces.  Measured 2.34 MB a token on the thin 208 file (chunk 128 and 512, prompts of 1000
-            // and 4000 tokens: the context barely moves it); this formula gives 2.6 MB there.
+            // The auto reserve: the scratch a call holds at its peak, which is inside one layer (the layer's scratch goes
+            // at its end), as floats a token, from the buffers the layer takes: the partial sums kept across layers (the
+            // banked attention-residual blocks, the current sum and the layer's own rows), the attention's buffers (MLA
+            // with the indexer's score row over the context, or KDA), then the FFN's (the routed experts' gathered parts,
+            // the router, the shared expert, and the experts' own rows: one expert's at a time on a prompt call of
+            // kExpRelease tokens or more, all K a token below that), and the int8 copies of the products' inputs.  Times
+            // the call's tokens, plus the head's last 16 rows and 768 MB for the CUDA context and the libraries.
             long long reserve = (long long) opt.vram_reserve_mb << 20;
             if (opt.vram_reserve_mb < 0) {
-                int ffm = 0;
-                for (int v : m.g.n_ff_exp) ffm = std::max(ffm, v);
+                const Geo& G = m.g;
+                long long eff = 0, zin = 0;
+                for (int v : G.n_ff_exp) eff = std::max(eff, (long long) v);
+                for (int v : G.n_exp_in) zin = std::max(zin, (long long) v);
+                if (zin == 0) zin = G.n_expert_latent;
+                const long long n = G.n_embd, H = G.n_head, row = G.kv_lora_rank + G.n_rot, vh = G.n_head_v_mla;
+                const long long hk = G.n_head_k_mla, Hi = G.idx_n_head, Di = G.idx_key_dim, d = G.d_inner();
+                const long long K = G.n_expert_used, E = G.n_expert, lat = G.n_expert_latent;
+                const long long sff = eff * std::max(G.n_expert_shared, 1), wmax = std::max({n, d, (long long) G.q_lora_rank, zin, eff, (long long) G.n_ff});
                 const long long T = std::max(opt.max_call_tokens > 0 ? opt.max_call_tokens : 512, 8);
-                const long long blocks = (long long) m.g.n_layers / std::max(m.g.attn_res_block_size, 1) + 2;
-                const long long per_tok = 4LL * (2LL * m.g.n_head * m.g.idx_top_k +
-                                                 (long long) m.g.n_expert_used * (3LL * ffm + m.g.n_expert_latent) +
-                                                 (8 + blocks) * (long long) m.g.n_embd + (long long) opt.n_ctx);
-                reserve = (768LL << 20) + T * per_tok;
+                const long long blocks = (long long) G.n_layers / std::max(G.attn_res_block_size, 1) + 2;
+                const long long rows = (12 + blocks) * n;
+                const long long mla = H * (row + G.kv_lora_rank + hk + 3 * vh) + Hi * Di + Hi + 2 * Di + 2LL * G.q_lora_rank + row +
+                                      std::min<long long>(G.idx_top_k, kMlaMaxSel) + opt.n_ctx;
+                const long long kda = 13 * d + 2LL * G.kda_head_dim + 2LL * G.n_kda_head;
+                const long long one = 3 * eff + lat + zin / 4 + zin / 32 + eff / 4 + eff / 32;   // one expert's rows
+                const long long moe = K * lat + 2 * E + 2 * K + zin + zin / 4 + zin / 32 + 2 * lat + 2 * n + 3 * sff;
+                const long long dense = 3LL * G.n_ff + n;
+                const long long q8 = 12 * (wmax / 4 + wmax / 32);
+                auto per_tok = [&](long long experts) { return rows + std::max(mla, kda) + std::max(moe + experts * one, dense) + q8; };
+                const long long rel = Impl::kExpRelease;
+                const long long call = T >= rel ? std::max(T * per_tok(1), (rel - 1) * per_tok(K)) : T * per_tok(K);
+                const long long head = 16 * ((long long) G.n_vocab + n + wmax / 4 + wmax / 32);
+                reserve = (768LL << 20) + 4 * (call + head);
             }
             P.reserve_mb = (int) (reserve >> 20);
             std::map<int, int> share;
