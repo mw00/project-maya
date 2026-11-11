@@ -3658,6 +3658,51 @@ class Service:
                 ids = [bos] + ids
         return {"tokens": ids, "count": len(ids), "max_model_len": self.engine.max_context}
 
+    def fim_markers(self):
+        """The fill-in-the-middle markers this vocabulary has, in the order a prompt takes them - (before the prefix,
+        between prefix and suffix, after the suffix) - or None.  Only single-token (real special) encodings count, as
+        for stop_ids."""
+        for marks in FIM_LAYOUTS:
+            if all(len(self.tok.encode(m, parse_special=True)) == 1 for m in marks):
+                return marks
+        return None
+
+    def completion_ids(self, req: dict) -> list[int]:
+        """POST /v1/completions (OpenAI's legacy completions, which editor autocomplete uses): the ids of `prompt` as
+        it is - no chat template, no thinking.  A special token's text in it is that token (the client may render its
+        own fill-in-the-middle prompt, as Continue does); with `suffix`, the server renders it with the model's own
+        markers (FIM_LAYOUTS).  `prompt` may also be one list of token ids.  The model's BOS goes first unless the
+        prompt starts with it or add_special is false (as llama.cpp's /v1/completions does)."""
+        prompt, suffix = req.get("prompt"), req.get("suffix")
+        if isinstance(prompt, list) and len(prompt) == 1 and isinstance(prompt[0], (str, list)):
+            prompt = prompt[0]                           # (OpenAI's batch form, one prompt)
+        if isinstance(prompt, list):
+            if not prompt or not all(isinstance(t, int) and not isinstance(t, bool) and t >= 0 for t in prompt):
+                raise ValueError("prompt: a string, or a list of token ids (one prompt; several at once are not "
+                                 "supported)")
+            if suffix is not None:
+                raise ValueError("suffix: send the prompt as text with a suffix, or render the whole prompt yourself")
+            return list(prompt)
+        if not isinstance(prompt, str) or not prompt:
+            raise ValueError("prompt: a non-empty string")
+        if suffix is not None:
+            if not isinstance(suffix, str):
+                raise ValueError("suffix: a string")
+            marks = self.fim_markers()
+            if marks is None:
+                raise ValueError("suffix: this model's tokenizer has no fill-in-the-middle tokens Maya knows; send the "
+                                 "whole prompt without a suffix")
+            prompt = marks[0] + prompt + marks[1] + suffix + marks[2]
+        ids = self.tok.encode(prompt, parse_special=True)
+        if req.get("add_special", True) is not False:
+            for b in COMPLETION_BOS:
+                bos = self.tok.encode(b, parse_special=True)
+                if len(bos) == 1:
+                    if not ids or ids[0] != bos[0]:
+                        ids = bos + ids
+                    break
+        return ids
+
     def detokenize(self, req: dict) -> dict:
         """POST /detokenize: the text of `tokens`, as `content` (llama.cpp's name) and `prompt` (vLLM's)."""
         ids = req.get("tokens")
@@ -5123,6 +5168,60 @@ def jobs_put(job: StreamJob) -> None:
         JOBS[job.id] = job
 
 
+# /v1/completions with a suffix: (before the prefix, between prefix and suffix, after the suffix), the first one the
+# vocabulary has.  DeepSeek's prefix-suffix-middle order (DeepSeek-Coder's README; the V4.1 tokenizer has these three
+# tokens), then Qwen's (Qwen2.5-Coder's, the same tokens in Qwen3.8-Flash-Next)
+FIM_LAYOUTS = (("<\uff5cfim\u2581begin\uff5c>", "<\uff5cfim\u2581hole\uff5c>", "<\uff5cfim\u2581end\uff5c>"),
+               ("<|fim_prefix|>", "<|fim_suffix|>", "<|fim_middle|>"))
+# the BOS a raw completion starts with, where the model's chat prompts start with one (DeepSeek)
+COMPLETION_BOS = ("<\uff5cbegin\u2581of\u2581sentence\uff5c>",)
+COMPLETION_MAX_TOKENS = 16                      # OpenAI's default max_tokens for /v1/completions
+
+
+def completions_on() -> bool:
+    """POST /v1/completions is served unless MAYA_COMPLETIONS is 0 / false / off / no."""
+    return os.environ.get("MAYA_COMPLETIONS", "1").strip().lower() not in ("0", "false", "off", "no")
+
+
+def completion_chunks(svc: Service, req: dict, ids, max_new, cancel):
+    """The chat pipeline's chunks (openai_chunks: no thinking, no tools) as OpenAI's text_completion chunks: the text,
+    then one with the finish_reason, the usage and the timings.  None stays None (a keep-alive)."""
+    cid, created = "cmpl-" + uuid.uuid4().hex[:24], int(time.time())
+    for c in openai_chunks(svc, req, ids, False, None, max_new, cancel):
+        if c is None:
+            yield None
+            continue
+        if c.get("prompt_progress"):
+            continue
+        choice = c["choices"][0]
+        text, finish = (choice.get("delta") or {}).get("content") or "", choice.get("finish_reason")
+        if not text and finish is None:
+            continue
+        out = {"id": cid, "object": "text_completion", "created": created, "model": c["model"],
+               "choices": [{"index": 0, "text": text, "logprobs": None, "finish_reason": finish}]}
+        if "usage" in c:
+            out["usage"] = c["usage"]
+        if c.get("timings"):
+            out["timings"] = c["timings"]
+        yield out
+
+
+def completion_collect(chunks) -> dict:
+    """completion_chunks as one text_completion."""
+    texts, last = [], None
+    for c in chunks:
+        if c is None:
+            continue
+        texts.append(c["choices"][0]["text"])
+        last = c
+    out = {"id": last["id"], "object": "text_completion", "created": last["created"], "model": last["model"],
+           "choices": [{"index": 0, "text": "".join(texts), "logprobs": None,
+                        "finish_reason": last["choices"][0]["finish_reason"]}], "usage": last.get("usage")}
+    if last.get("timings"):
+        out["timings"] = last["timings"]
+    return out
+
+
 def openai_collect(chunks, logprobs: bool = False) -> dict:
     """The chunks as one chat.completion; `logprobs` (the request asked): the choice's logprobs, every text chunk's
     entries in order - OpenAI's `content`, and `reasoning_content` when there was reasoning."""
@@ -6175,7 +6274,7 @@ def make_handler(svc: Service):
                 if path == "/detokenize":
                     self._json(200, svc.detokenize(req))
                     return
-                if path in ("/v1/chat/completions", "/v1/responses", "/v1/messages") and (svc.reloading() or svc.updater.busy()):
+                if path in ("/v1/chat/completions", "/v1/responses", "/v1/messages", "/v1/completions") and (svc.reloading() or svc.updater.busy()):
                     # a context change is reloading the model, or Maya is updating: say so, and when to try again
                     why = ("Project Maya is updating and starts again in a few minutes" if svc.updater.busy() else
                            "the model is reloading with a new context size; try again in a minute")
@@ -6196,6 +6295,8 @@ def make_handler(svc: Service):
                         **({"text_only": svc.text_only()} if svc.text_only() else {}))   # (GLM-5.3's words)
                 if path == "/v1/chat/completions":
                     self._openai(req)
+                elif path == "/v1/completions" and completions_on():
+                    self._completions(req)
                 elif path == "/v1/responses":
                     self._responses(req)
                 elif path == "/v1/messages":
@@ -6543,6 +6644,46 @@ def make_handler(svc: Service):
                 self.wfile.write(b"data: " + json.dumps(err).encode() + b"\n\ndata: [DONE]\n\n")
             except ValueError as e:                          # the engine's ERR after the stream started: the
                 err = {"error": {"type": "server_error", "message": str(e)}}   # headers are sent, so no 400 now
+                self.wfile.write(b"data: " + json.dumps(err).encode() + b"\n\ndata: [DONE]\n\n")
+
+        def _completions(self, req):
+            """POST /v1/completions: a raw prompt (Service.completion_ids) through the same queue, engine and stop
+            strings as a chat answer, with thinking off and no tools; OpenAI's text_completion back, or its SSE chunks."""
+            if req.get("echo"):
+                raise ValueError("echo: not supported")
+            if int(req.get("n") or 1) != 1 or int(req.get("best_of") or 1) != 1:
+                raise ValueError("n / best_of: one completion per request")
+            if req.get("logprobs") not in (None, False, 0):
+                raise ValueError("logprobs: not supported on /v1/completions (use /v1/chat/completions)")
+            req = {k: v for k, v in req.items() if k not in ("logprobs", "top_logprobs", "messages", "tools")}
+            req = svc.with_shared(req, "openai")
+            req["_api"] = "openai"
+            svc.check_request(req)
+            ids = svc.completion_ids(req)
+            asked = req.get("max_tokens")
+            max_new = COMPLETION_MAX_TOKENS if asked is None else int(asked)
+            cancel = threading.Event()
+            watch_client(self, cancel)
+            chunks = completion_chunks(svc, req, ids, max_new, cancel)
+            if not req.get("stream"):
+                return self._json(200, completion_collect(chunks))
+            self._sse()
+            try:
+                for c in chunks:
+                    if c is None:
+                        self.wfile.write(b": keep-alive\n\n")
+                    else:
+                        self.wfile.write(b"data: " + json.dumps(c, ensure_ascii=False).encode() + b"\n\n")
+                    self.wfile.flush()
+                self.wfile.write(b"data: [DONE]\n\n")
+            except OSError:
+                cancel.set()
+                chunks.close()
+            except EngineDied as e:
+                err = {"error": {"type": "server_error", "message": f"{e}; the next request restarts it"}}
+                self.wfile.write(b"data: " + json.dumps(err).encode() + b"\n\ndata: [DONE]\n\n")
+            except ValueError as e:
+                err = {"error": {"type": "server_error", "message": str(e)}}
                 self.wfile.write(b"data: " + json.dumps(err).encode() + b"\n\ndata: [DONE]\n\n")
 
         def _stream_job(self, job: StreamJob, n: int):

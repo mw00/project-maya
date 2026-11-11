@@ -430,6 +430,21 @@ as in llama.cpp, so the model goes on with what it would write next instead of s
 fixed answer length. It needs `max_tokens`, and an engine that applies token biases - GLM's and DeepSeek's (which take
 a request's own `logit_bias` as well); MiniMax's does not, so there it is refused.
 
+## Raw completions and fill-in-the-middle (`/v1/completions`)
+
+`POST /v1/completions` (OpenAI's legacy completions, which editor autocomplete such as Continue's uses) sends `prompt`
+to the engine as it is: no chat template, thinking off, no tools, through the same queue, stop strings and timings as a
+chat answer, and returns a `text_completion` (or its SSE chunks with `"stream": true`). A special token's text in the
+prompt is that token, so a client that renders its own fill-in-the-middle prompt works. With `"suffix"`, the server
+renders it with the model's own markers: DeepSeek's `<｜fim▁begin｜>prefix<｜fim▁hole｜>suffix<｜fim▁end｜>`, Qwen's
+`<|fim_prefix|>prefix<|fim_suffix|>suffix<|fim_middle|>`; a model without those tokens answers 400. DeepSeek's BOS goes
+first unless the prompt has it or `"add_special": false`. `prompt` may also be a list of token ids. The default
+`max_tokens` is OpenAI's 16; `echo`, `n` above 1, `best_of` and `logprobs` are refused.
+
+| Setting | Default | Meaning |
+| --- | --- | --- |
+| `MAYA_COMPLETIONS` | on | `0` (or `false`, `off`, `no`): `/v1/completions` answers 404, as before |
+
 ## The thinking level and the thinking budget
 
 Two config settings shape the thinking, and only one of them counts tokens:
