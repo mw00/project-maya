@@ -84,6 +84,9 @@ const char* const kUsage =
     "           L+1's picks from L's FFN input and prefetch them while L computes; --page-stats counts the hit rate.\n"
     "           --car-rank R: cache-aware routing on decode tokens: a pick not resident is read only if its router rank\n"
     "           < R, else the token routes among the resident experts plus the picks read (R = 16: today's routing).\n"
+    "           --ablate FILE: directional ablation, y -= w (y . r_l) r_l per layer (format: k31_model.cu load_ablation;\n"
+    "           flags 0 = each sublayer's output before the residual add, 1 = the partial sum, 2 = each sublayer's input;\n"
+    "           version 2 adds an embedding record applied to each token's embedding row before layer 0).\n"
     "           --n-ctx N: positions the attention caches hold (default 4096; KLX: 2816 B a position a MLA layer,\n"
     "           24 MLA layers, float32), so a sequence past N answers ERR context full.\n"
     "           --ram-slots N|auto (with --load page): the RAM expert tier, paged experts read with O_DIRECT into\n"
@@ -561,6 +564,10 @@ int bench(const std::string& file, k31::EpsPreset eps, const k31::ModelOptions& 
 //                                         before F; the CAR counts: the call that made the step's logits, 0s for
 //                                         step 0), then D <n> -1 ... for the logits after the last id with q <id:logprob
 //                                         ...> for the query ids, then E forced <n> <seconds>
+//   HCAP in|out last|all all|L,L,..   arm the residual capture: each listed layer's attention input mix (in) or its
+//                                      partial sum after the layer (out), the last row of each call or every row;
+//                                      HCAP off disarms -> OK HCAP <layers>
+//   HSAVE path                         write the rows held (Model::save_capture's format) and clear them -> OK HSAVE <layers>
 //   RESIDENCY path                     the experts resident now per MoE layer, as JSON (VRAM slots, RAM tier, classes)
 //   SAVE target key                    the sequence's state (caches + the last logits) under a key (e.g. a hash of
 //                                      its ids, the caller's) -> OK SAVE <n_past> <bytes> <seconds>.  target @NAME:
@@ -720,6 +727,35 @@ int gen_loop(const std::string& file, k31::EpsPreset eps, const k31::ModelOption
             std::printf("E %s %d %.3f\n", why, n, std::chrono::duration<double>(clk::now() - a).count());
             stats();
             prof("G");
+        } else if (cmd == "HCAP") {
+            std::string kind, rows, ls;
+            if (!(in >> kind)) { fail("HCAP in|out last|all all|L,L,.. or HCAP off"); continue; }
+            if (kind == "off") { m.capture({}, 0, true); std::printf("OK HCAP 0\n"); continue; }
+            if (!(in >> rows >> ls) || (kind != "in" && kind != "out") || (rows != "last" && rows != "all")) {
+                fail("HCAP in|out last|all all|L,L,..");
+                continue;
+            }
+            std::vector<int> layers;
+            if (ls == "all") for (int il = 0; il < m.geo().n_layers; ++il) layers.push_back(il);
+            else {
+                std::stringstream ss(ls);
+                std::string x;
+                bool bad = false;
+                while (std::getline(ss, x, ',')) {
+                    char* end = nullptr;
+                    const long v = std::strtol(x.c_str(), &end, 10);
+                    if (x.empty() || *end || v < 0 || v >= m.geo().n_layers) { bad = true; break; }
+                    layers.push_back((int) v);
+                }
+                if (bad || layers.empty()) { fail("HCAP: layers are all or 0.." + std::to_string(m.geo().n_layers - 1) + ", comma separated"); continue; }
+            }
+            m.capture(layers, kind == "in" ? 0 : 1, rows == "last");
+            std::printf("OK HCAP %zu\n", layers.size());
+        } else if (cmd == "HSAVE") {
+            std::string path;
+            if (!(in >> path)) { fail("HSAVE path"); continue; }
+            if (!m.save_capture(path, err)) { fail(err); continue; }
+            std::printf("OK HSAVE\n");
         } else if (cmd == "RESIDENCY") {   // RESIDENCY path: the resident experts per layer now (Model::residency)
             std::string path;
             if (!(in >> path)) { fail("RESIDENCY path"); continue; }
@@ -975,6 +1011,8 @@ int main(int argc, char** argv) {
                 if (c == std::string::npos) break;
                 at = c + 1;
             }
+        } else if (a == "--ablate" && i + 1 < argc) {
+            opt.ablate_path = argv[++i];
         } else if (a == "--n-ctx" && i + 1 < argc) {
             const std::string v = argv[++i];
             char* end = nullptr;

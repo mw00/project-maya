@@ -86,6 +86,7 @@ struct ModelOptions {
     std::string usage_path;    // expert usage counts per layer (tools/k31_usage.py from a REAP report); else file order
     std::string placement_in;  // take the placement from this file (written by placement_out, maybe edited)
     std::string placement_out; // write the placement used to this file
+    std::string ablate_path;   // --ablate FILE: directional ablation (k31_model.cu load_ablation for the format)
     // ---- the CPU lane (src/k31/k31_cpu_lane): RAM experts' rows on the host, the device's bits, while the device runs
     // the others.  (The routed experts' SiTU is the portable form on both sides, so it gives the same bits too.)
     int cpu_threads = 0;       // 0: off
@@ -184,6 +185,10 @@ public:
     /// The experts resident now, per MoE layer, as JSON: its card, matrix types and bytes, RAM tier size class, the
     /// static VRAM slots, the RAM tier's ready slots and the dynamic VRAM pool's (expert ids; the tier's change as it runs).
     std::string residency() const;
+    /// Residual capture: arm (layers, kind 0 = each layer's attention input mix, 1 = the partial sum after the layer;
+    /// the last row of each call or every row); an empty list disarms.  save_capture writes and clears what is held.
+    void capture(const std::vector<int>& layers, int kind, bool last_only);
+    bool save_capture(const std::string& path, std::string& err);
     bool save_state(std::vector<uint8_t>& out, std::string& err);
     bool load_state(const std::vector<uint8_t>& in, std::string& err);
     /// Runs `tokens` as the continuation of the sequence.  logits (optional): the call's last R rows [R][n_vocab],

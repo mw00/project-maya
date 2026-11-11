@@ -111,6 +111,22 @@ __global__ void __launch_bounds__(256) q8_quant_kernel(const float* __restrict__
 }
 
 // dst row slot[j] = src row j (width floats): the CPU lane's parts into their rows
+// directional ablation of one row a block: x -= w (x . r) r  (r a unit vector; the dot in a fixed order: deterministic)
+__global__ void ablate_kernel(float* __restrict__ h, int n, const float* __restrict__ r, float w) {
+    float* x = h + (size_t) blockIdx.x * n;
+    __shared__ float s[256];
+    float acc = 0.0f;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) acc += x[i] * r[i];
+    s[threadIdx.x] = acc;
+    __syncthreads();
+    for (int k = blockDim.x / 2; k > 0; k >>= 1) {
+        if (threadIdx.x < k) s[threadIdx.x] += s[threadIdx.x + k];
+        __syncthreads();
+    }
+    const float c = w * s[0];
+    for (int i = threadIdx.x; i < n; i += blockDim.x) x[i] -= c * r[i];
+}
+
 __global__ void scatter_rows_kernel(const float* __restrict__ src, const int* __restrict__ slot, int width, float* __restrict__ dst) {
     const float* a = src + (size_t) blockIdx.x * width;
     float* b = dst + (size_t) slot[blockIdx.x] * width;
@@ -943,6 +959,41 @@ struct Model::Impl {
         scr_add(cur_dev, p, std::max<size_t>(n, 1) * 4);
         return (const float*) p;
     }
+    // directional ablation (--ablate): per layer a unit vector on the layer's card and two weights (the attention's
+    // and the FFN's); mode 0 (write): each sublayer's output before the residual add; 1 (stream): the partial sum
+    // after each add; 2 (read): each sublayer's input mix
+    int abl_mode = -1;                        // -1: off
+    std::vector<float> abl_wa, abl_wf;
+    std::vector<float*> abl_r;
+    float* abl_emb_r = nullptr;               // version 2: the embedding row's direction (on layer 0's card), or null
+    float abl_emb_w = 0.0f;
+    void ablate(float* h, int il, float w, int T) {
+        if (w == 0.0f || !abl_r[(size_t) il]) return;
+        ablate_kernel<<<T, 256>>>(h, g.n_embd, abl_r[(size_t) il], w);
+        ck(cudaPeekAtLastError(), "ablate");
+    }
+    const float* ablated_copy(const float* x, int il, float w, int T) {   // (x may be a kept sum: never in place)
+        if (w == 0.0f || !abl_r[(size_t) il]) return x;
+        float* c = buf((size_t) T * g.n_embd);
+        ck(cudaMemcpyAsync(c, x, (size_t) T * g.n_embd * 4, cudaMemcpyDeviceToDevice), "ablate copy");
+        ablate(c, il, w, T);
+        return c;
+    }
+    // residual capture (HCAP): kind 0 = a layer's attention input mix (what it reads), 1 = the partial sum after it;
+    // the last row of each call, or every row
+    std::vector<char> cap_on;
+    int cap_kind = 0;
+    bool cap_last = true;
+    std::map<int, std::vector<float>> cap;
+    void capture_rows(const float* h, int il, int T, int kind) {
+        if (cap_on.empty() || kind != cap_kind || !cap_on[(size_t) il]) return;
+        const int rows = cap_last ? 1 : T, n = g.n_embd;
+        std::vector<float> v((size_t) rows * n);
+        ck(cudaMemcpy(v.data(), h + (size_t) (T - rows) * n, v.size() * 4, cudaMemcpyDeviceToHost), "capture");
+        auto& d = cap[il];
+        if (cap_last) d = std::move(v);
+        else d.insert(d.end(), v.begin(), v.end());
+    }
     // drop one kept copy before the call ends (the previous layer's partial sum once the next one is kept)
     void unkeep(const float* p) {
         for (size_t i = 0; i < kept.size(); ++i)
@@ -1574,6 +1625,10 @@ struct Model::Impl {
             for (int r = 0; r < T; ++r) req(iq::decode_values(E.type, E.q + (size_t) tokens[r] * rb, n, 1, x + (size_t) r * n, tile, nullptr), "decode_values");
         }
         ck(cudaPeekAtLastError(), "embed");
+        if (abl_emb_r) {   // --ablate version 2: the embedding rows (what layer 0's mix and the first block see)
+            ablate_kernel<<<T, 256>>>(x, n, abl_emb_r, abl_emb_w);
+            ck(cudaPeekAtLastError(), "ablate");
+        }
         seam("inp_embd", {n}, x, T);
         std::vector<const float*> blocks;
         const float* prefix = keep(x, (size_t) T * n);
@@ -1593,6 +1648,8 @@ struct Model::Impl {
                 pk = prefix;
             }
             const float* cur = res_mix(blocks, prefix, L(il, "attn_res_score"), il, "attn", T);
+            if (abl_mode == 2) cur = ablated_copy(cur, il, abl_wa[(size_t) il], T);
+            capture_rows(cur, il, T, 0);
             const bool banked = il % B == 0;
             if (banked) blocks.push_back(prefix);   // (prefix is a kept copy: see the layer's end)
             float* an = rms(cur, n, t(L(il, "attn_norm")).d, eps, n, T);
@@ -1600,9 +1657,12 @@ struct Model::Impl {
             tick(kOther);
             const float* a = g.is_recr(il) ? kda_layer(an, il, T) : mla_layer(an, il, T);
             tick(kAttn);
+            if (abl_mode == 0) ablate(const_cast<float*>(a), il, abl_wa[(size_t) il], T);        // (the layer's own output buffer)
             prefix = banked ? a : add(prefix, a, (size_t) T * n);
+            if (abl_mode == 1) ablate(const_cast<float*>(prefix), il, abl_wa[(size_t) il], T);   // (a or the sum: this layer's own)
             seam(nm("prefix_sum_attn", il), {n}, prefix, T);
             cur = res_mix(blocks, prefix, L(il, "ffn_res_score"), il, "ffn", T);
+            if (abl_mode == 2) cur = ablated_copy(cur, il, abl_wf[(size_t) il], T);
             float* fn = rms(cur, n, t(L(il, "ffn_norm")).d, eps, n, T);
             seam(nm("ffn_norm", il), {n}, fn, T);
             tick(kOther);
@@ -1612,7 +1672,10 @@ struct Model::Impl {
             if (pg && !pg_in) pregate(cur, il + 1, T);                              // the layer's own slots are marked
             const float* f = g.is_moe(il) ? moe_ffn(fn, il, T, pg_in ? cur : nullptr) : dense_ffn(fn, il, T);
             tick(g.is_moe(il) ? kMoeRest : kDense);
+            if (abl_mode == 0) ablate(const_cast<float*>(f), il, abl_wf[(size_t) il], T);
             prefix = add(prefix, f, (size_t) T * n);
+            if (abl_mode == 1) ablate(const_cast<float*>(prefix), il, abl_wf[(size_t) il], T);
+            capture_rows(prefix, il, T, 1);
             seam(nm("l_out", il), {n}, prefix, T);
             prefix = keep(prefix, (size_t) T * n);   // the layer's scratch goes; the partial sum and the blocks stay
             if (std::find(blocks.begin(), blocks.end(), pk) == blocks.end()) unkeep(pk);   // (a banked one stays)
@@ -1696,6 +1759,88 @@ bool read_usage(const std::string& path, std::map<int, std::vector<double>>& out
     return true;
 }
 
+}  // namespace
+
+namespace {
+// --ablate FILE (little-endian): "K31ABL1\0", u32 version (1), n_layer, n_embd, flags (0 write, 1 stream, 2 read),
+// then (version 2 only) the embedding record: f32 w_emb, f32 0, f32 r_emb[n_embd] (each token's embedding row, before
+// layer 0), then per layer: f32 w_attn, f32 w_ffn, f32 r[n_embd] (normalized here; a layer with both weights 0 is
+// untouched).
+// write: each sublayer's output (attention; the whole FFN: dense, or shared + routed) before the residual add;
+// stream: the partial sum after each add; read: each sublayer's input mix.  y -= w (y . r) r, in f32.
+template <class Impl>
+bool load_ablation(Impl& m, const std::string& path, std::string& err) {
+    const std::string pre = "maya-k31: --ablate " + path + ": ";
+    std::FILE* fp = std::fopen(path.c_str(), "rb");
+    if (!fp) { err = pre + "cannot open"; return false; }
+    std::vector<uint8_t> b;
+    uint8_t chunk[1 << 16];
+    for (size_t r; (r = std::fread(chunk, 1, sizeof chunk, fp)) > 0;) b.insert(b.end(), chunk, chunk + r);
+    std::fclose(fp);
+    const size_t head = 8 + 4 * 4;
+    if (b.size() < head || std::memcmp(b.data(), "K31ABL1\0", 8) != 0) { err = pre + "not an ablation file (magic K31ABL1)"; return false; }
+    uint32_t h[4];
+    std::memcpy(h, b.data() + 8, sizeof h);
+    const uint32_t ver = h[0], nl = h[1], ne = h[2], mode = h[3];
+    if (ver != 1 && ver != 2) { err = pre + "version " + std::to_string(ver) + " (this engine reads 1 and 2)"; return false; }
+    if (mode > 2) { err = pre + "flags " + std::to_string(mode) + " (0 write, 1 stream, 2 read)"; return false; }
+    if ((int) ne != m.g.n_embd || (int) nl != m.g.n_layers) {
+        err = pre + "n_layer " + std::to_string(nl) + ", n_embd " + std::to_string(ne) + " vs the model's " + std::to_string(m.g.n_layers) +
+              ", " + std::to_string(m.g.n_embd);
+        return false;
+    }
+    const size_t per = 8 + (size_t) ne * 4, emb = ver == 2 ? per : 0, want = head + emb + (size_t) nl * per;
+    if (b.size() != want) { err = pre + std::to_string(b.size()) + " bytes, want " + std::to_string(want); return false; }
+    m.abl_wa.assign((size_t) nl, 0.0f);
+    m.abl_wf.assign((size_t) nl, 0.0f);
+    m.abl_r.assign((size_t) nl, nullptr);
+    int on = 0;
+    std::vector<float> r((size_t) ne);
+    auto unit = [&](const uint8_t* q, const std::string& what) {   // r from the file, normalized; false: zero / not finite
+        std::memcpy(r.data(), q, (size_t) ne * 4);
+        double ss = 0;
+        for (float v : r) ss += (double) v * v;
+        if (!(ss > 0) || !std::isfinite(ss)) { err = pre + what + ": the direction is zero or not finite"; return false; }
+        const double inv = 1.0 / std::sqrt(ss);
+        for (float& v : r) v = (float) (v * inv);
+        return true;
+    };
+    if (ver == 2) {   // the embedding record (before layer 0): f32 w_emb, f32 0, r_emb
+        float we;
+        std::memcpy(&we, b.data() + head, 4);
+        if (!std::isfinite(we)) { err = pre + "the embedding weight is not finite"; return false; }
+        if (we != 0.0f) {
+            if (!unit(b.data() + head + 8, "the embedding record")) return false;
+            m.use(m.dev_of(0));
+            void* d = nullptr;
+            ck(cudaMalloc(&d, (size_t) ne * 4), "cudaMalloc ablate");
+            ck(cudaMemcpy(d, r.data(), (size_t) ne * 4, cudaMemcpyHostToDevice), "ablate");
+            m.abl_emb_r = (float*) d;
+            m.abl_emb_w = we;
+        }
+    }
+    for (int il = 0; il < nl; ++il) {
+        const uint8_t* q = b.data() + head + emb + (size_t) il * per;
+        float wa, wf;
+        std::memcpy(&wa, q, 4);
+        std::memcpy(&wf, q + 4, 4);
+        if (!std::isfinite(wa) || !std::isfinite(wf)) { err = pre + "layer " + std::to_string(il) + ": a weight is not finite"; return false; }
+        if (wa == 0.0f && wf == 0.0f) continue;
+        if (!unit(q + 8, "layer " + std::to_string(il))) return false;
+        m.use(m.dev_of(il));
+        void* d = nullptr;
+        ck(cudaMalloc(&d, (size_t) ne * 4), "cudaMalloc ablate");
+        ck(cudaMemcpy(d, r.data(), (size_t) ne * 4, cudaMemcpyHostToDevice), "ablate");
+        m.abl_r[(size_t) il] = (float*) d;
+        m.abl_wa[(size_t) il] = wa;
+        m.abl_wf[(size_t) il] = wf;
+        ++on;
+    }
+    m.abl_mode = (int) mode;
+    m.summary += "ablate: " + std::string(mode == 0 ? "write" : mode == 1 ? "stream" : "read") + " mode, " + std::to_string(on) + " of " +
+                 std::to_string(nl) + " layers, embedding " + (m.abl_emb_r ? "on" : "off") + " (version " + std::to_string(ver) + ")\n";
+    return true;
+}
 }  // namespace
 
 bool Model::load(const std::string& path, const ModelOptions& opt, std::string& err, EpsPreset eps) {
@@ -2536,6 +2681,7 @@ bool Model::load(const std::string& path, const ModelOptions& opt, std::string& 
         } else {
             m.file.reset();   // every tensor is copied: drop the mapping (its pages would otherwise stay resident)
         }
+        if (!opt.ablate_path.empty() && !load_ablation(m, opt.ablate_path, err)) return false;
         if (opt.cpu_threads > 0) {
             m.pool = std::make_unique<k31::cpu::Pool>(opt.cpu_threads);
             m.summary += "cpu lane: " + std::to_string(opt.cpu_threads) + " threads (" + k31::cpu::form() + "), " +
@@ -2560,6 +2706,34 @@ void Model::reset() {
 namespace {
 constexpr char kSnapMagic[8] = {'K', '3', '1', 'S', 'N', 'A', 'P', '1'};
 }
+void Model::capture(const std::vector<int>& layers, int kind, bool last_only) {
+    Impl& m = *p_;
+    m.cap.clear();
+    m.cap_on.assign(layers.empty() ? 0 : (size_t) m.g.n_layers, 0);
+    for (int il : layers)
+        if (il >= 0 && il < m.g.n_layers) m.cap_on[(size_t) il] = 1;
+    m.cap_kind = kind;
+    m.cap_last = last_only;
+}
+// HSAVE: "K31HCP01", int32 n_embd, kind, last_only, n (layers held), then per layer: int32 layer, int64 rows,
+// float [rows][n_embd]; the held rows are cleared (the capture stays armed)
+bool Model::save_capture(const std::string& path, std::string& err) {
+    Impl& m = *p_;
+    std::FILE* fp = std::fopen(path.c_str(), "wb");
+    if (!fp) { err = "maya-k31: HSAVE: cannot write " + path; return false; }
+    const int32_t h[4] = {m.g.n_embd, m.cap_kind, m.cap_last ? 1 : 0, (int32_t) m.cap.size()};
+    bool ok = std::fwrite("K31HCP01", 1, 8, fp) == 8 && std::fwrite(h, 4, 4, fp) == 4;
+    for (const auto& [il, v] : m.cap) {
+        const int32_t l = il;
+        const int64_t rows = (int64_t) (v.size() / (size_t) m.g.n_embd);
+        ok = ok && std::fwrite(&l, 4, 1, fp) == 1 && std::fwrite(&rows, 8, 1, fp) == 1 && std::fwrite(v.data(), 4, v.size(), fp) == v.size();
+    }
+    ok = std::fclose(fp) == 0 && ok;
+    m.cap.clear();
+    if (!ok) err = "maya-k31: HSAVE: short write to " + path;
+    return ok;
+}
+
 std::string Model::residency() const {
     const Impl& m = *p_;
     auto tname = [](int t) { return std::string(t == 0 ? "F32" : iq::name(t)); };
