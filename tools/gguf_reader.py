@@ -10,6 +10,7 @@ no ggml dependency)"). It parses the header only; tensor data is never read.
 from __future__ import annotations
 
 import dataclasses
+import os
 import pathlib
 import struct
 from typing import Any
@@ -81,10 +82,17 @@ class GGUFFile:
         self.version = 0
         self.alignment = 32
         with self.path.open("rb") as fh:
+            self._size = os.fstat(fh.fileno()).st_size
             self._parse(fh)
         self.data_start = self._data_start
 
     # ------------------------------------------------------------------ internals
+    def _room(self, fh, nbytes: int, what: str) -> None:
+        """A length read from the header is checked against the bytes the file has left before anything is
+        read or allocated: a corrupt length (2^62, 2^64-1) is a ValueError, not a MemoryError/OverflowError."""
+        if nbytes > self._size - fh.tell():
+            raise ValueError(f"{self.path.name}: the header ends inside {what}")
+
     def _parse(self, fh) -> None:
         magic = struct.unpack("<I", fh.read(4))[0]
         if magic != GGUF_MAGIC:
@@ -98,6 +106,7 @@ class GGUFFile:
         for _ in range(n_tensors):
             name = self._str(fh)
             (n_dims,) = struct.unpack("<I", fh.read(4))
+            self._room(fh, 8 * n_dims, f"the shape of {name!r}")
             shape = list(struct.unpack(f"<{n_dims}Q", fh.read(8 * n_dims)))
             type_id, offset = struct.unpack("<IQ", fh.read(12))
             self.tensors.append(TensorInfo(name, shape, type_id,
@@ -111,20 +120,23 @@ class GGUFFile:
 
     def _str(self, fh) -> str:
         (n,) = struct.unpack("<Q", fh.read(8))
-        b = fh.read(n)
-        if len(b) < n:   # (a cut file: its header ends early)
-            raise ValueError(f"{self.path.name}: the header ends inside a string")
-        return b.decode("utf-8", "replace")
+        self._room(fh, n, "a string")   # (a cut file: its header ends early; or a corrupt length)
+        return fh.read(n).decode("utf-8", "replace")
 
     def _value(self, fh):
         (t,) = struct.unpack("<I", fh.read(4))
+        if t not in GGUF_META:
+            raise ValueError(f"{self.path.name}: metadata value type {t} is not a GGUF type")
         name, size = GGUF_META[t]
         if name == "string":
             return self._str(fh)
         if name == "array":
             (et,) = struct.unpack("<I", fh.read(4))
             (count,) = struct.unpack("<Q", fh.read(8))
+            if et not in GGUF_META or GGUF_META[et][0] == "array":
+                raise ValueError(f"{self.path.name}: array element type {et} is not one this reader handles")
             ename, esize = GGUF_META[et]
+            self._room(fh, count * (esize or 8), "an array")   # (a string element is at least its 8-byte length)
             if ename == "string":
                 return [self._str(fh) for _ in range(count)]
             fmt = {"u8": "B", "i8": "b", "u16": "H", "i16": "h", "u32": "I", "i32": "i",
