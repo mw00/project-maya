@@ -27,6 +27,7 @@
 #include "strata/core/prefill_chunks.hpp"
 #include "strata/core/prefill_gaps.hpp"
 #include "strata/core/progress.hpp"
+#include "strata/cuda_compat/pascal_gemm.hpp"
 #include "strata/kernels/cpu/exl3_cpu.hpp"
 #include "strata/kernels/cpu/kq_avx512.hpp"
 #include "strata/kernels/dequant_bf16.hpp"
@@ -39,6 +40,7 @@
 #include "strata/prefill/moe_fused_rdna4.hpp"
 #endif
 #include "strata/prefill/moe_mmq.hpp"
+#include "strata/prefill/moe_pascal.hpp"
 
 #include "ggml.h"
 
@@ -70,6 +72,7 @@ namespace strata::core {
 
 namespace gb = strata::kernels::glmb;
 namespace mmq = strata::prefill::mmq;
+namespace pas = strata::prefill::pascal;
 
 // The floats a prompt token's residual rows hold that the next part reads: Flash's four mHC streams (4 x n_embd),
 // GLM-5.3's one (n_embd - glm-dsa writes and reads T x n_embd of R, glm_prefill_dsa.cu).  The split's hand-over copies
@@ -116,8 +119,9 @@ constexpr int kShSub = 2048;   // the shared expert's on CUDA (shexp_sub)
 // size classes (src/prefill/ggml_cuda_host.cu) for why 16 MB bounds every product a chunk launches, at any chunk size
 constexpr size_t kMmqSlab = (size_t) 16 << 20;
 // prestaging (PrefillState::pbuf): the buffer's slots on one GPU, the chunk from which it is carved, and the fewest
-// predicted rows an expert is prestaged for (below that it may not be routed at all)
-constexpr int kPreSlots = 160, kPreMinT = 1024, kPreMinRows = 4;
+// predicted rows an expert is prestaged for (below that it may not be routed at all); kSplitAutoChunk: the chunk a
+// split's parts pipeline when --prefill is auto (prefill_setup)
+constexpr int kPreSlots = 160, kPreSlotsSplit = 32, kSplitAutoChunk = 1024, kPreMinT = 512, kPreMinRows = 4;
 // resident experts routed by at most kLightRows rows of a chunk take the light kernels (gf::rows_experts) instead of
 // MMQ (STRATA_GLM_PREFILL_LIGHT overrides, 0 = MMQ only); their {slot, r0, nr} ride the bounds array from kLightOff
 constexpr int kLightRows = 32, kLightOff = 6144, kLightMax = (8192 - kLightOff) / 3;
@@ -517,7 +521,7 @@ void x3_run_blas(const X3Lane& L, const uint8_t* blob, int a, int nrows, int r0)
                 blas_ck(cublasGemmEx(L.blas, CUBLAS_OP_T, CUBLAS_OP_N, nff, n, E, &one,
                                      L.w16 + (size_t) r * nff * E, CUDA_R_16F, E, Xr, CUDA_R_16F, E, &zero,
                                      GU + (size_t) c0 * E + (size_t) r * nff, CUDA_R_32F, E,
-                                     CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP),
+                                     CUBLAS_COMPUTE_32F, STRATA_F16_GEMM_ALGO(CUBLAS_GEMM_DEFAULT_TENSOR_OP, n)),
                         "gemm exl3 gate/up");
             }
         }
@@ -530,7 +534,7 @@ void x3_run_blas(const X3Lane& L, const uint8_t* blob, int a, int nrows, int r0)
             x3::rows_rot_f16(GU + (size_t) c0 * E, E, nullptr, n, nff, mat(2).suh, H16, s);
             blas_ck(cublasGemmEx(L.blas, CUBLAS_OP_T, CUBLAS_OP_N, E, n, nff, &one, L.w16, CUDA_R_16F, nff,
                                  H16, CUDA_R_16F, nff, &zero, GU + (size_t) c0 * E, CUDA_R_32F, E,
-                                 CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP),
+                                 CUBLAS_COMPUTE_32F, STRATA_F16_GEMM_ALGO(CUBLAS_GEMM_DEFAULT_TENSOR_OP, n)),
                     "gemm exl3 down");
         }
         x3::rows_rot_out(GU, E, nrows, E, mat(2).svh, s);
@@ -544,7 +548,7 @@ void x3_run_blas(const X3Lane& L, const uint8_t* blob, int a, int nrows, int r0)
         x3::rows_f16(L.x, E, L.row_tok + r0 + a + c0, n, E, X16, s);
         blas_ck(cublasGemmEx(L.blas, CUBLAS_OP_T, CUBLAS_OP_N, 2 * nff, n, E, &one, L.w16, CUDA_R_16F, E,
                              X16, CUDA_R_16F, E, &zero, GU + (size_t) c0 * E, CUDA_R_32F, E, CUBLAS_COMPUTE_32F,
-                             CUBLAS_GEMM_DEFAULT_TENSOR_OP),
+                             STRATA_F16_GEMM_ALGO(CUBLAS_GEMM_DEFAULT_TENSOR_OP, n)),
                 "gemm exl3 gate/up");
     }
     gb::swiglu_rows(GU, GU, nrows, nff, L.limit, s, 2 * nff);
@@ -555,7 +559,7 @@ void x3_run_blas(const X3Lane& L, const uint8_t* blob, int a, int nrows, int r0)
         x3::rows_f16(GU + (size_t) c0 * E, E, nullptr, n, nff, H16, s);
         blas_ck(cublasGemmEx(L.blas, CUBLAS_OP_T, CUBLAS_OP_N, E, n, nff, &one, L.w16, CUDA_R_16F, nff, H16,
                              CUDA_R_16F, nff, &zero, GU + (size_t) c0 * E, CUDA_R_32F, E, CUBLAS_COMPUTE_32F,
-                             CUBLAS_GEMM_DEFAULT_TENSOR_OP),
+                             STRATA_F16_GEMM_ALGO(CUBLAS_GEMM_DEFAULT_TENSOR_OP, n)),
                 "gemm exl3 down");
     }
 }
@@ -656,7 +660,10 @@ struct Glm5Model::PrefillState {
     float* w32 = nullptr;
     int64_t w32_elems = 0;
     // non-resident experts: a ring of NG staging groups of GE slots each (the layer's slot stride apart)
-    static constexpr int NG = 3, GE = 4;
+    // (NG 3 -> 6: the copy stream ran at most NG * GE experts ahead of the layer's compute, which starts with the
+    // resident experts - the staged copies stalled behind that; 4x P100, 4K prompt: 9 groups alone 202 -> 213 tok/s,
+    // 6 beside the prestage buffer 213 -> 217)
+    static constexpr int NG = 6, GE = 4;
     uint8_t* gbuf = nullptr;
     size_t gstride = 0;
     // pinned: the disk reads' landing ring, nland slots of gstride - deep enough that the reader runs a layer's disk
@@ -1214,7 +1221,9 @@ bool Glm5Model::prefill_setup(std::string& err) {
     // STRATA_GLM_PREFILL_MB=<MB> fixes what may be lent.
     const std::string mode = prefill_mode();
     const bool is_auto = mode == "auto";
-    const int64_t auto_max = n_parts_ == 1 ? 32768 : 8192;
+    // a split's parts pipeline chunks, so auto stops at kSplitAutoChunk: 8192 cut a 4K prompt into ONE chunk that no part
+    // overlaps with another, and its buffers took 2.3 GB of the pool (4x P100: 4K prompt 162-205 tok/s, 1024 254)
+    const int64_t auto_max = n_parts_ == 1 ? 32768 : kSplitAutoChunk;
     const int64_t ceiling = is_auto ? auto_max : (int64_t) std::atoll(mode.c_str());
     // the pool to come: `per` slots a layer over the tier layers, as fast_setup sizes it from the same free VRAM
     size_t dev_free = 0, dev_total = 0;
@@ -1242,7 +1251,11 @@ bool Glm5Model::prefill_setup(std::string& err) {
     const char* mb_env = getenv("STRATA_GLM_PREFILL_MB");
     const size_t gbuf = has_moe ? glmd::mmq_group_ring_bytes(PrefillState::NG, PrefillState::GE, gstride) : 0;   // glm-dsa B15.2: a 512-B tail a group
     // the prestage buffer (the ring): one GPU (a split's parts hold most of their experts); STRATA_GLM_PRESTAGE=<slots>
-    int ring_max = has_moe && (n_parts_ == 1 || glmpfs::split_prestage(g.arch == GlmArch::GlmDsa, n_parts_)) ? kPreSlots : 0;   // glm-dsa B9.9: a glm-dsa split's parts too
+    // A split's parts prestage too when some of their experts are outside VRAM (kPreSlotsSplit: 4x P100, 4K prompt,
+    // 202 -> 212 tok/s with 32 slots; 16 -> 207, 64 -> 211); the copy stream idles through the mixer on every part.
+    // (glm-dsa B9.9: a glm-dsa split's parts too, with the one-GPU buffer)
+    int ring_max = !has_moe ? 0 : n_parts_ == 1 || glmpfs::split_prestage(g.arch == GlmArch::GlmDsa, n_parts_) ? kPreSlots
+                   : per < g.n_expert ? kPreSlotsSplit : 0;
     if (const char* v = getenv("STRATA_GLM_PRESTAGE")) ring_max = has_moe ? std::max(0, std::atoi(v)) : 0;
     const bool ring_set = getenv("STRATA_GLM_PRESTAGE") != nullptr;   // (glm-dsa L1-2: an explicit buffer is kept whole)
     // A COMPLETE pool to come (fast_setup: every expert and the spares in each layer's main slots, this path's buffers
@@ -2178,10 +2191,29 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                 S->lt->f16(X16, S->w16, Y + r0, Tn, n, Kd, ldy, beta);
                 continue;
             }
+#else
+            // compute < 6.1 (no tensor cores): cuBLAS's FP16 x FP16 -> F32 runs at the FP32 rate; the HFMA2 kernel
+            // is 1.8x that on the big projections (STRATA_GLM_PREFILL_PASCAL_DENSE=0 keeps cuBLAS)
+            if (beta == 0.0f) {
+                pas::Dense dd;
+                dd.w = S->w16;
+                dd.n = n;
+                dd.k = Kd;
+                dd.x = X16;
+                dd.ld_x = ldx;
+                dd.t = Tn;
+                dd.y = Y + r0;
+                dd.ld_y = ldy;
+                if (pas::dense_usable(dd)) {
+                    pas::dense_run(dd, s);
+                    continue;
+                }
+            }
 #endif
             const cublasStatus_t st = cublasGemmEx(S->blas, CUBLAS_OP_T, CUBLAS_OP_N, n, Tn, Kd, &one, S->w16,
                                                    CUDA_R_16F, Kd, X16, CUDA_R_16F, ldx, &beta, Y + r0, CUDA_R_32F, ldy,
-                                                   CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+                                                   CUBLAS_COMPUTE_32F,
+                                                   STRATA_F16_GEMM_ALGO(CUBLAS_GEMM_DEFAULT_TENSOR_OP, Tn));
             gemm_fail(st, "gemm f16", S->w16, X16, Y + r0, n, Tn, Kd, Kd, ldx, ldy);
             blas_ck(st, "gemm f16");
         }
@@ -3026,10 +3058,12 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
         const int b_res = nb;
         // resident experts with at most light_rows rows go to the light kernels (gf::rows_experts): their rows come
         // after the MMQ product's, which sees them as empty
-        static const int light_env = [] {   // (stable products: none - only a resident expert can take them)
-            const char* v = getenv("STRATA_GLM_PREFILL_LIGHT");
-            return v ? std::atoi(v) : prefill_stable() ? 0 : kLightRows;
-        }();
+        // (the Pascal expert product takes every expert unless STRATA_GLM_PREFILL_LIGHT says otherwise: it decodes
+        // a weight tile once for up to 64 rows, the light kernels' cost per row stays high)
+        // (stable products: none - only a resident expert can take them)
+        static const char* light_v = getenv("STRATA_GLM_PREFILL_LIGHT");
+        const int light_env = light_v ? std::atoi(light_v)
+                              : prefill_stable() || pas::usable(Ly.gu_type, Ly.d_type, E, nff) ? 0 : kLightRows;
         const auto lt_ok = [](int t) { return t == 16 || t == 18 || t == 19; };
         static const int light_layer = getenv("STRATA_GLM_PREFILL_LIGHT_LAYER") ? std::atoi(getenv("STRATA_GLM_PREFILL_LIGHT_LAYER")) : -1;
         const int light_rows = lt_ok(Ly.gu_type) && lt_ok(Ly.d_type) && (light_layer < 0 || il == light_layer) ? light_env : 0;
@@ -3519,6 +3553,8 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                 }
             }
         };
+        // Pascal (no dp4a): FP32 activations against weights decoded to shared memory, in place of MMQ's emulated dots
+        const bool pascal_mm = pas::usable(Ly.gu_type, Ly.d_type, E, nff);
 #if defined(STRATA_HIP_PREFILL_FUSED)
         // X is rounded once per token; the fused GU epilogue writes rounded H.
         // The shared scratch reserves the larger of the two activation formats.
@@ -3556,6 +3592,40 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                         continue;
                     }
 #endif
+                    if (pascal_mm) {
+                        float* GU = M.OUTP + (size_t) o * E;
+                        pas::Product gp;
+                        gp.w = wbase + (size_t) i0 * stride;
+                        gp.type = Ly.gu_type;
+                        gp.w_rows = 2 * nff;
+                        gp.w_cols = E;
+                        gp.expert_bytes = stride;
+                        gp.n = i1 - i0;
+                        gp.x = S->x;
+                        gp.ld_x = E;
+                        gp.row_map = M.row_tok + r0;
+                        gp.bounds = d_bounds + i0;
+                        gp.max_rows = max_rows;
+                        gp.dst = GU - (size_t) a * (2 * nff);
+                        gp.ld_dst = 2 * nff;
+                        gp.f16 = pas::f16_default();
+                        pas::run(gp, s);
+                        gb::swiglu_rows(GU, GU, nrows, nff, g.swiglu_exp, s, 2 * nff);   // (h in each row's first n_ff floats)
+                        pas::Product dp = gp;
+                        dp.w = wbase + (size_t) i0 * stride + Ly.down_off;
+                        dp.type = Ly.d_type;
+                        dp.w_rows = E;
+                        dp.w_cols = nff;
+                        dp.x = GU - (size_t) a * (2 * nff);
+                        dp.ld_x = 2 * nff;
+                        dp.row_map = nullptr;
+                        dp.dst = M.OUTP + (size_t) (o - a) * E;
+                        dp.ld_dst = E;
+                        pas::run(dp, s);
+                        S->mark("moe_pascal", s);
+                        i0 = i1;
+                        continue;
+                    }
                     float* GU = M.OUTP + (size_t) o * E;   // 2 * n_ff == n_embd: the set's own OUTP rows hold its gate/up
                     if (wmma && !wmma_fell_back) {
                         // the FP16 tensor-core products: the part's rows gathered from S->x into Xq (the q8_1 sizing
@@ -3706,7 +3776,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                 x3::rows_f16(S->x, E, M.row_tok + r0 + a + c0, n, E, X16, s);
                 blas_ck(cublasGemmEx(S->blas, CUBLAS_OP_T, CUBLAS_OP_N, 2 * nff, n, E, &one, S->w16, CUDA_R_16F, E,
                                      X16, CUDA_R_16F, E, &zero, G2 + (size_t) c0 * ldg, CUDA_R_32F, ldg,
-                                     CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP),
+                                     CUBLAS_COMPUTE_32F, STRATA_F16_GEMM_ALGO(CUBLAS_GEMM_DEFAULT_TENSOR_OP, n)),
                         "gemm q gate/up");
             }
             gb::swiglu_rows(G2, G2, nrows, nff, g.swiglu_exp, s, 2 * nff);
@@ -3717,7 +3787,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                 x3::rows_f16(G2 + (size_t) c0 * ldg, ldg, nullptr, n, nff, H16, s);
                 blas_ck(cublasGemmEx(S->blas, CUBLAS_OP_T, CUBLAS_OP_N, E, n, nff, &one, S->w16, CUDA_R_16F, nff, H16,
                                      CUDA_R_16F, nff, &zero, GU + (size_t) c0 * E, CUDA_R_32F, E, CUBLAS_COMPUTE_32F,
-                                     CUBLAS_GEMM_DEFAULT_TENSOR_OP),
+                                     STRATA_F16_GEMM_ALGO(CUBLAS_GEMM_DEFAULT_TENSOR_OP, n)),
                         "gemm q down");
             }
         };
