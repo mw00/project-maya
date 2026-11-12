@@ -163,6 +163,23 @@ class Settings(unittest.TestCase):
             M.apply(cfg, {"images": True})
         self.assertEqual(M.choices(M.read(ds4_cfg(self.d, "maya-x.json", drafter=False)))["draft"], ["none"])
 
+    def test_deepseek_fast_prompt_reading_is_an_opt_in_switch(self):
+        from serve.server import child_env
+        cfg = M.read(ds4_cfg(self.d))
+        self.assertIs(M.settings_of(cfg)["fast_prefill"], False)                # (off by default)
+        self.assertNotIn("DS4_YOCO_CONE", {k: v for k, v in child_env(cfg).items() if k not in os.environ})
+        on = M.apply(cfg, {"fast_prefill": True})
+        self.assertEqual((on["fast_prefill"], on["args"]), (True, cfg["args"]))  # (a config key, no engine flag)
+        self.assertIs(M.settings_of(on)["fast_prefill"], True)
+        self.assertEqual(child_env(on)["DS4_YOCO_CONE"], "1")
+        off = M.apply(on, {"fast_prefill": False})
+        self.assertNotIn("fast_prefill", off)                                   # (off: nothing in the config)
+        self.assertEqual(child_env({**off, "fast_prefill": False})["DS4_YOCO_CONE"], "0")
+        with self.assertRaisesRegex(ValueError, "Fast prompt reading"):
+            M.apply(cfg, {"fast_prefill": "yes"})
+        with self.assertRaisesRegex(ValueError, "not a setting"):              # (DeepSeek's only)
+            M.apply(M.read(mm3_cfg(self.d)), {"fast_prefill": True})
+
     def test_deepseek_prompt_lookup_and_draft_confidence(self):
         cfg = M.read(ds4_cfg(self.d))
         s = M.settings_of(cfg)

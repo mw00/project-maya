@@ -103,6 +103,7 @@ struct FeedPlan {
     int n = 0, logits_rows = 0, slot = -1;
     std::vector<int> ends;
     int skip = -1, cut_k = 0, cut_r = 0;
+    std::vector<int> cone;   // (the cone: the row each layer from `skip` on starts at, later layer by layer; empty: the cut)
 };
 
 struct Stats {

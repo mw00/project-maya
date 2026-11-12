@@ -861,7 +861,8 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
                             src/mm3/mm3_host.cpp ${_mm3_nv_sources} ${_mm3_gguf_sources} ${_mm3_gguf_cpu_sources})
     target_include_directories(maya-mm3 PRIVATE ${_strata_gpu_include_directories} include src/mm3 third_party/ggml)
     # (the CPU lane: the shared CPU EXL3 kernels, used as they are; ggml-cpu's dots for a GGUF's experts)
-    target_link_libraries(maya-mm3 PRIVATE strata_kernels_cpu ${_strata_gpu_runtime_target} ${_strata_gpu_blas_target})
+    target_link_libraries(maya-mm3 PRIVATE strata_kernels_cpu strata_spec ${_strata_gpu_runtime_target}
+                                           ${_strata_gpu_blas_target})
     # (ds4_iq.cu without the rest of maya-ds4: its dependent launch (src/ds4/ds4_pdl.cuh) and its AMD prompt experts'
     #  MMQ (MAYA_DS4_EXPERT_MMQ) left out - MiniMax's kernels launch as before)
     target_compile_definitions(maya-mm3 PRIVATE MAYA_DS4_IQ_ONLY)

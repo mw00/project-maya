@@ -800,7 +800,8 @@ struct Chunk {
     int spec_k = -1, spec_il = -1, n_spec = 0;   // the likely items queued last: (chunk, layer), how many, from where
     size_t spec_begin = 0;
     std::vector<int> fl_layers, fl_T;        // the device's trunk layers in order; the run's chunk sizes
-    int fl_yoco = -1, fl_cut_k = 0, fl_cut_r = 0;   // Run::yoco / cut_k / cut_r: what a layer's chunk streams for
+    int fl_yoco = -1;                        // Run::yoco / ck / cr: what a layer's chunk streams for
+    std::vector<int> fl_ck, fl_cr;
     int bc_n = 0, bc_w = 0;                  // a batch's compacted bounds: bc_n regions of bc_w, by batch count
     int *bc_pin = nullptr, *bc_dev = nullptr;
     uint64_t n_batch = 0;
@@ -6387,16 +6388,17 @@ struct Model::Impl {
     // long prompt's skip leaves out its early chunks' layers from Run::yoco on (kv_only there: no experts)
     bool flow_next(const Chunk& c, int k, int il, int& k2, int& il2) const {
         while (flow_next1(c, k, il, k2, il2)) {
-            if (c.fl_yoco < 0 || k2 >= c.fl_cut_k || il2 < c.fl_yoco) return true;
+            if (c.fl_yoco < 0 || il2 < c.fl_yoco || k2 >= c.fl_ck[(size_t) il2]) return true;
             k = k2;
             il = il2;
         }
         return false;
     }
-    // the rows chunk k runs layer il on (a long prompt's skip: the cut chunk's from cut_r on, from the yoco layer on)
+    // the rows chunk k runs layer il on (a long prompt's skip: the layer's cut chunk's from its cut row on, from the
+    // yoco layer on)
     static int fl_rows(const Chunk& c, int k, int il) {
         const int T = c.fl_T[(size_t) k];
-        return c.fl_yoco >= 0 && k == c.fl_cut_k && il >= c.fl_yoco ? T - c.fl_cut_r : T;
+        return c.fl_yoco >= 0 && il >= c.fl_yoco && k == c.fl_ck[(size_t) il] ? T - c.fl_cr[(size_t) il] : T;
     }
     bool flow_next1(const Chunk& c, int k, int il, int& k2, int& il2) const {
         const auto it = std::find(c.fl_layers.begin(), c.fl_layers.end(), il);
@@ -18296,13 +18298,18 @@ struct Model::Impl {
                     wp.snap_ix[wp.snap_n++] = (int) i;
                 }
         }
-        // a long prompt's skip (forward_chunks): the cut at row cut_r of chunk cut_k - the chunks before it go through
-        // the layers before `yoco`, that layer as layer_chunk's kv_only and none after it; chunk cut_k's rows before
-        // cut_r the same, its rows from cut_r on and the chunks after it through every layer (yoco -1: no skip)
-        int yoco = -1, cut_k = 0, cut_r = 0;
-        bool runs(int k, int il) const { return yoco < 0 || k >= cut_k || il <= yoco; }
-        bool kv_only(int k, int il) const { return yoco >= 0 && k < cut_k && il == yoco; }
-        int r0(int k, int il) const { return yoco >= 0 && k == cut_k && il >= yoco ? cut_r : 0; }   // the first row
+        // a long prompt's skip (forward_chunks): layer il's cut (il >= yoco) at row cr[il] of chunk ck[il] - the
+        // chunks before the yoco layer's cut go through the layers before `yoco` and that layer as layer_chunk's
+        // kv_only (that chunk's rows before it the same); from the yoco layer on, a layer runs its cut chunk's rows from
+        // the cut on and the chunks after it - one cut for every layer, or the cone's, later layer by layer (plan_chunks)
+        // (yoco -1: no skip)
+        int yoco = -1;
+        std::vector<int> ck, cr;   // (by layer)
+        bool runs(int k, int il) const { return yoco < 0 || il <= yoco || k >= ck[(size_t) il]; }
+        bool kv_only(int k, int il) const { return yoco >= 0 && il == yoco && k < ck[(size_t) il]; }
+        int r0(int k, int il) const {   // the first row
+            return yoco >= 0 && il >= yoco && k == ck[(size_t) il] ? cr[(size_t) il] : 0;
+        }
     };
     // Whole-prompt Engram read-ahead: fill the ordinary row cache in consumption order, independently of the two
     // pinned staging slots.  A consumer waits for its unit before doing the normal lookup/copy, so no row is read by
@@ -18462,10 +18469,16 @@ struct Model::Impl {
             if (!layer_chunk(L0, mi, p0, r0, w0, S, err, true)) return false;
         }
         Chunk& c = *chunks[(size_t) member(L0, mi).dev];
+        // (the chunk's state from row r0 on - its rows' places kept, so a layer of another cut reads them where they
+        //  were written: the candidates the source layer picks and the top-k an index layer leaves to the layers after it)
         float* const h0 = c.h;
         float* const pre0 = c.pre;
+        int* const topk0 = c.topk;
+        int* const cand0 = c.cand;
         c.h += (size_t) r0 * g.hc * g.dim;
         c.pre += (size_t) r0 * 8;
+        c.topk += (size_t) r0 * topk_stride();
+        c.cand += (size_t) r0 * cand_stride();
         WinPlan w1 = wp;
         w1.snap_n = 0;
         for (int i = 0; i < wp.snap_n; ++i)
@@ -18476,6 +18489,8 @@ struct Model::Impl {
         const bool ok = layer_chunk(L0, mi, p0 + r0, T - r0, w1, S, err);
         c.h = h0;
         c.pre = pre0;
+        c.topk = topk0;
+        c.cand = cand0;
         return ok;
     }
 
@@ -18644,8 +18659,8 @@ struct Model::Impl {
                     if (member(L[(size_t) il], m).dev == di) c.fl_layers.push_back(il);
             c.fl_T = run.T;
             c.fl_yoco = run.yoco;
-            c.fl_cut_k = run.cut_k;
-            c.fl_cut_r = run.cut_r;
+            c.fl_ck = run.ck;
+            c.fl_cr = run.cr;
             c.spec_k = c.spec_il = -1;
             c.wait_ms = 0;
             c.it_file = c.it_ram = c.it_spec = c.it_spec_unused = c.it_lc = c.it_helper = c.chk_n = 0;
@@ -18668,7 +18683,7 @@ struct Model::Impl {
                 // A group starting at the YOCO source has only KV work before the cut: no flow_layer to advance it.
                 // (A part of a prompt's run read before its cut, Model::feed_part: no chunk of it past the cut, so
                 // nothing for such a group to stream.)
-                const int il = c.fl_layers[0], k = run.yoco >= 0 && il >= run.yoco ? run.cut_k : 0;
+                const int il = c.fl_layers[0], k = run.yoco >= 0 && il >= run.yoco ? run.ck[(size_t) il] : 0;
                 if (k < nk) {
                     flow_spec(c, k, il, fl_rows(c, k, il));
                     if (!flow_pump(c, err)) return false;
@@ -20181,6 +20196,34 @@ struct Model::Impl {
                : keep_env > 0 ? std::max(keep_env, g.win)
                : yoco_mode() == 2 ? g.win : (g.nl - yl) * (g.win - 1) + g.win;
     }
+    // DS4_YOCO_CONE=1 (default off): a long prompt's skip as a cone on one GPU -
+    // each layer past the skip's first leaves out the win - 1 rows more the layer after it cannot reach (layer il runs
+    // the last keep - (il - yoco) (win - 1) rows, the yoco layer keep), and it starts at any prompt length (the yoco
+    // layer's KV-only split from a window's rows).  The rows left out are the ones the skip's single cut runs with
+    // the earlier layers' rows they look back to left out already: every row whose result reaches the run's last
+    // rows, the rings and the drafter's taps sees what it saw before.  Off by default: the same sums, but the kernels
+    // a set of experts or a GEMM takes go by its row count (a few rows' experts on the light int8 kernel, the library
+    // GEMMs by row buckets), so the bits move a little as with the single cut against none (Radeon 8065S, Maya-XS:
+    // the same tokens at 2K-32K, the first token's top-5 log-probs within ~0.1)
+    static bool cone_on() {
+        static const bool on = [] {
+            const char* v = std::getenv("DS4_YOCO_CONE");
+            return v != nullptr && std::atoi(v) != 0;
+        }();
+        return on;
+    }
+    // the chunk and row a plan's layer il (from fp.skip on) starts at
+    static void plan_cut(const FeedPlan& fp, int il, int& k, int& r) {
+        if (fp.cone.empty()) {
+            k = fp.cut_k;
+            r = fp.cut_r;
+            return;
+        }
+        const int x = fp.cone[(size_t) (il - fp.skip)], nk = (int) fp.ends.size();
+        k = 0;
+        while (k < nk && fp.ends[(size_t) k] <= x) ++k;
+        r = k < nk ? x - (k > 0 ? fp.ends[(size_t) k - 1] : 0) : 0;
+    }
     // a read of n tokens that keeps restore points at rows rel (in order) on the way (feed_marks): the rows it runs
     // through the layers past a long prompt's skip that reading up to each point and stopping there would have left out
     // - each stretch after the first one's skip (the one read runs every row from keep before its first point through
@@ -20201,13 +20244,22 @@ struct Model::Impl {
         fp.ends.clear();
         fp.skip = -1;
         fp.cut_k = fp.cut_r = 0;
+        fp.cone.clear();
         const int yl = logits_rows > kWin ? -1 : yoco_layer();
         const int keep = yoco_keep(yl);
         // (a piece of a longer prompt, `after` more of its tokens in later feeds: the kept rows are the prompt's last,
         //  so a piece wholly before them is KV-only past yoco - as its rows are in the prompt read whole)
         int skip = std::min(n, n + after - keep);
         if (first_mark >= 0) skip = std::min(skip, first_mark - keep);
-        const int a = yl > 0 && skip >= kYocoMin ? skip : 0;
+        // the cone (cone_on): layer il's first row, from yl on (empty: none to leave out)
+        std::vector<int> cone;
+        if (yl > 0 && cone_on() && keep == (g.nl - yl) * (g.win - 1) + g.win && yoco_one_gpu()) {
+            for (int il = yl; il < g.nl; ++il)
+                cone.push_back(std::max(0, std::min(n, skip + (il - yl) * (g.win - 1))));
+            if (cone[0] < g.win) cone[0] = 0;
+            if (cone.back() <= 0) cone.clear();
+        }
+        const int a = !cone.empty() ? cone[0] : yl > 0 && skip >= kYocoMin ? skip : 0;
         const bool cut_rows = a > 0 && (yoco_one_gpu() || yoco_suffix_gpu(yl) || yoco_tp_group());
         if (a > 0 && yoco_tp_group()) {   // (DS4_YOCO_TP: once)
             static bool said = false;
@@ -20254,6 +20306,13 @@ struct Model::Impl {
                 fp.cut_r = a - fp.cut_k * per;
             }
         }
+        if (!cone.empty()) {
+            fp.skip = yl;
+            fp.cone = std::move(cone);
+        }
+        if (fp.skip >= 0 && o.verbose && !fp.cone.empty())
+            std::fprintf(stderr, "ds4: prompt cone: layer %d from row %d (KV-only before it), layer %d from row %d\n",
+                         yl, fp.cone.front(), g.nl - 1, fp.cone.back());
         if (fp.skip >= 0 && o.verbose)
             std::fprintf(stderr, "ds4: prompt skip: layers %d-%d from CUDA%d, %d early rows KV-only, %d kept\n",
                          yl, g.nl - 1, devs[(size_t) L[(size_t) yl].dev].id, a, n - a);
@@ -20318,10 +20377,20 @@ struct Model::Impl {
         }
         // (a part: the chunks before the cut skip as the whole run's do, the cut's chunk is cut where it is; past it
         //  no skip)
-        if (fp.skip >= 0 && k0 <= fp.cut_k) {
-            run.yoco = fp.skip;
-            run.cut_k = std::min(fp.cut_k, k1) - k0;
-            run.cut_r = fp.cut_k < k1 ? fp.cut_r : 0;
+        if (fp.skip >= 0) {   // (each layer's cut, from the skip's first layer on)
+            run.ck.assign((size_t) g.nl, 0);
+            run.cr.assign((size_t) g.nl, 0);
+            bool any = false;
+            for (int il = fp.skip; il < g.nl; ++il) {
+                int gk = 0, gr = 0;
+                plan_cut(fp, il, gk, gr);
+                if (gk < k0) continue;   // (the part wholly past the layer's cut)
+                run.ck[(size_t) il] = std::min(gk, k1) - k0;
+                run.cr[(size_t) il] = gk < k1 ? gr : 0;
+                any = any || run.ck[(size_t) il] > 0 || run.cr[(size_t) il] > 0;
+            }
+            if (any) run.yoco = fp.skip;
+            else run.ck.clear(), run.cr.clear();
         }
         logits_all = logits_rows > kWin;
         if (logits_all) chunk_logits.resize((size_t) n * g.vocab);
@@ -20732,7 +20801,9 @@ struct Model::Impl {
         }
         // the drafter seeded from the run's last rows - when they went through every layer: not after a yield, nor a
         // run wholly KV-only past the skip (a piece of a longer prompt, `after`: the piece that ends it seeds it)
-        const bool kv_only = fp.skip >= 0 && fp.cut_k >= k1;
+        int cut_kl = 0, cut_rl = 0;   // (the last layer's cut)
+        if (fp.skip >= 0) plan_cut(fp, g.nl - 1, cut_kl, cut_rl);
+        const bool kv_only = fp.skip >= 0 && cut_kl >= k1;
         const int nr = std::min(T_last, tap_cap);
         const double trc_warm = now_ms();
         if (run_end && took == n && !kv_only && !seed_drafter(pos - nr, nr, 0, err)) return false;

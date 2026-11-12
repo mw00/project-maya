@@ -411,6 +411,7 @@ struct Model::Impl {
     uint8_t* pool = nullptr;         // the pinned pool
     std::unique_ptr<CpuLane> lane;
     std::unique_ptr<Draft> draftm;   // the DSpark draft (on the head's GPU)
+    double draft_plan = 0.0;         // plan_memory's room for it (bytes: the draft, its taps, a margin)
     int last_done = 0;               // the last forward's tokens in the cache
     int chunk_run = 0;               // (the prefill calibration: a forward's chunk, at most o.chunk - 0: o.chunk)
     int run_chunk() const { return chunk_run > 0 ? std::min(chunk_run, o.chunk) : o.chunk; }
@@ -940,6 +941,15 @@ struct Model::Impl {
         size_t blob_max = 0;
         for (int li = 0; li < g.n_layers; ++li)
             if (g.moe[(size_t) li]) blob_max = std::max(blob_max, blob_estimate(li));
+        // the DSpark draft's room on the head's GPU: what its load will hold (Draft::plan_bytes, its MXFP8 matrices as
+        // stored), its taps buffer and 0.1 GB beside (was a flat 3 GB: MiniMax-M3.1-Flash's draft holds 2.5 GB, its taps
+        // 0.13 GB at --chunk 1024, 0.5 GB at 4096); a draft geometry the pack does not give: 3 GB
+        draft_plan = 0.0;
+        if (o.dspark) {
+            const size_t db = Draft::plan_bytes(pk, o.chunk);
+            const size_t taps = pk.ints("dspark.dspark_target_layer_ids").size() * (size_t) o.chunk * (size_t) g.dim * 4;
+            draft_plan = db > 0 ? (double) (db + taps) + 0.1 * GB : 3.0 * GB;
+        }
         auto fixed_of = [&](size_t di, int slots) {
             double b = 0;
             for (int li : D[di].layers) b += (double) dense_bytes(li);
@@ -950,7 +960,7 @@ struct Model::Impl {
             if (di + 1 == D.size()) {                                               // (the output head, its logits)
                 const Tensor* h = pk.get(gguf ? "language_model.lm_head.weight" : "language_model.lm_head.trellis");
                 b += (h ? (double) h->bytes : 0.0) + 32.0 * g.vocab * 4;
-                if (o.dspark) b += 3.0 * GB;
+                b += draft_plan;
             }
             // (the vision tower: no room - it stays in host memory, a picture's room lent by the staging slots)
             if (gguf) b += (double) gg::scratch_bytes();   // (the GGUF kernels' activations, FP16 bands, cuBLAS)
@@ -1376,6 +1386,10 @@ struct Model::Impl {
             info.push_back("DSpark draft: " + std::to_string(draftm->bytes() >> 20) + " MB on CUDA" +
                            std::to_string(hd.id) + ", block " + std::to_string(draftm->geo().block) + ", taps " +
                            std::to_string(tl.size()));
+            const double held = (double) draftm->bytes() + (double) (tl.size() * (size_t) o.chunk * g.dim * 4);
+            if (held > draft_plan)   // (Draft::plan_bytes no longer what load() holds: the placement left too little)
+                info.push_back("DSpark draft: " + std::to_string((long long) held >> 20) + " MB with its taps, over the " +
+                               std::to_string((long long) draft_plan >> 20) + " MB the placement planned");
         }
         // the vision tower, also before the experts take the memory (on by default: a pack without one runs text only)
         if (o.vision && o.vision_auto && !Vision::in_pack(pk)) {

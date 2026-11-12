@@ -155,9 +155,10 @@ int main() {
 #include <vector>
 struct Chunk {
     std::vector<int> fl_layers, fl_T;
-    int fl_yoco = -1, fl_cut_k = 0, fl_cut_r = 0;
+    int fl_yoco = -1;
+    std::vector<int> fl_ck, fl_cr;   // (the skip's cut per layer: chunk, rows)
 };
-struct Run { std::vector<int> T; int yoco = -1, cut_k = 0; };
+struct Run { std::vector<int> T; int yoco = -1; std::vector<int> ck; };
 struct Model {
     int spec_k = -1, spec_il = -1, spec_T = -1;
     void flow_spec(Chunk&, int k, int il, int T) { spec_k = k; spec_il = il; spec_T = T; }
@@ -170,9 +171,10 @@ SEED
     }
 };
 void check(int first, int yoco, int cut_k, int cut_r) {
-    Run run; run.T.assign(8, 8192); run.yoco = yoco; run.cut_k = cut_k;
+    // (the same cut at every layer, as the skip before the per-layer cone)
+    Run run; run.T.assign(8, 8192); run.yoco = yoco; run.ck.assign(64, cut_k);
     Chunk c; c.fl_layers.push_back(first); c.fl_T = run.T;
-    c.fl_yoco = yoco; c.fl_cut_k = cut_k; c.fl_cut_r = cut_r;
+    c.fl_yoco = yoco; c.fl_ck.assign(64, cut_k); c.fl_cr.assign(64, cut_r);
     Model m; std::string err;
     const bool suffix = yoco >= 0 && first >= yoco;
     const int expected_k = suffix ? cut_k : 0;

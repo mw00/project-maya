@@ -88,11 +88,9 @@ def with_dflash(cfg: dict, drafter) -> dict:
     return out
 
 
-def requests(cfg: dict, doc_tokens: int = DOC_TOKENS, mixed: bool = False) -> tuple[list[int], list[list[int]], int]:
-    """(the warm-up's ids, one list of ids per question, the document's tokens): chats as the server renders them -
-    the model's template at the config's thinking level - each a document made of Maya's own docs, then a question
-    about it.  Every request opens with the same document, so the engine reads it once and keeps it.  `mixed`: the
-    MIXED requests instead (no document: 0 tokens)."""
+def chat_parts(cfg: dict):
+    """(the config's tokenizer, its chat template, the template's kwargs at the config's thinking level): requests
+    rendered as the server renders them."""
     import strata_tokenizer as ST
     from serve.frontend import ChatTemplate, effort_kwargs
     tpath = Path(cfg["tokenizer"])
@@ -103,6 +101,15 @@ def requests(cfg: dict, doc_tokens: int = DOC_TOKENS, mixed: bool = False) -> tu
         kw = effort_kwargs(cfg.get("reasoning_effort"))
     except ValueError:                                 # (a level the template does not know: its own default)
         kw = {}
+    return tok, tpl, kw
+
+
+def requests(cfg: dict, doc_tokens: int = DOC_TOKENS, mixed: bool = False) -> tuple[list[int], list[list[int]], int]:
+    """(the warm-up's ids, one list of ids per question, the document's tokens): chats as the server renders them -
+    the model's template at the config's thinking level - each a document made of Maya's own docs, then a question
+    about it.  Every request opens with the same document, so the engine reads it once and keeps it.  `mixed`: the
+    MIXED requests instead (no document: 0 tokens)."""
+    tok, tpl, kw = chat_parts(cfg)
     if mixed:
         def one(q, think):
             t_kw = kw if think else {"enable_thinking": False}

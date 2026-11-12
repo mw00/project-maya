@@ -55,7 +55,7 @@ ENV_LOADER = re.compile(r"^(?:LD_\w*|DYLD_\w*|PYTHON\w*|PATH|PATHEXT|BASH_ENV|EN
 GLM_KEYS = ("context", "images", "gpus", "reserve_mib", "env", "parallel", "draft", "expert_cache", "prefill",
             "kv_streaming", "kv_resident")
 DS4_KEYS = ("context", "images", "gpus", "reserve_mib", "env", "parallel", "draft", "tp", "mmap", "prefill_chunk",
-            "cpu_threads", "prompt_lookup", "dspark_conf")
+            "cpu_threads", "prompt_lookup", "dspark_conf", "fast_prefill")
 MM3_KEYS = ("context", "images", "gpus", "env", "parallel", "draft", "tp", "kv_cache", "kv_streaming", "kv_resident",
             "cpu_threads", "reserve_gb", "prefill_chunk", "cache_gb", "dspark_conf")
 QWEN_KEYS = ("context", "images", "gpus", "reserve_mib", "env", "draft", "expert_cache", "prefill", "kv", "ram_gb")
@@ -362,7 +362,10 @@ def settings_of(cfg: dict) -> dict:
                    prefill_chunk=_int(flag(args, "--prefill-chunk")), cpu_threads=_int(flag(args, "--cpu-threads")),
                    # (--suffix-draft: the prompt lookup's shortest match, 3 by the engine; 0 off)
                    prompt_lookup=_int(flag(args, "--suffix-draft"), 3) != 0,
-                   dspark_conf=_float(flag(args, "--dspark-conf")))
+                   dspark_conf=_float(flag(args, "--dspark-conf")),
+                   # (fast prompt reading: the long prompt's skip as a per-layer cone, DS4_YOCO_CONE=1 in the engine's
+                   #  environment - serve/server.py's child_env; off by default, answers can shift slightly)
+                   fast_prefill=cfg.get("fast_prefill") is True)
         if out["mmap"] not in ("auto", "on", "off"):
             out["mmap"] = "auto"
         return out
@@ -599,6 +602,12 @@ def apply(cfg: dict, settings: dict) -> dict:
             args = drop_flag(args, "--suffix-draft")
         conf = _dec(s, "dspark_conf", 0, 1, "Draft confidence")
         args = set_flag(args, "--dspark-conf", f"{conf:g}") if conf is not None else drop_flag(args, "--dspark-conf")
+        if not isinstance(s.get("fast_prefill"), bool):
+            raise ValueError("Fast prompt reading: on or off")
+        if s["fast_prefill"]:
+            out["fast_prefill"] = True
+        else:
+            out.pop("fast_prefill", None)               # (off: the engine's default, nothing in the config)
     else:
         dsa = G53.config_is_glm_dsa(cfg)                # GLM-5.3 (744B): what its engine takes (choices)
         par = _num(s, "parallel", 1, 8, "Answers at once", none_ok=False)

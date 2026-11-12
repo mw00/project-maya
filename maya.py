@@ -4687,9 +4687,9 @@ def speed_calibration_ds4(cfg_path: Path, cfg: dict, why: str = "") -> bool:
     say("  Speed calibration: the DSpark drafter or none?" + (f" ({why})" if why else ""))
     say("  Drafting makes some PCs faster and others slower: it depends on how much of the model fits in the GPUs'")
     say("  memory, and on the CPU, the RAM and the SSD. So Maya measures both here, the way you will use it. It loads")
-    say(f"  the model twice; each time it warms up, then writes about {CDS.MIN_TOKENS} tokens of answers, and the "
-        "sustained")
-    say("  speeds are compared. About 10-30 minutes; the PC is busy.")
+    say(f"  the model twice; each time it warms up, then writes about {CDS.MIN_TOKENS} tokens of chat, code and tool")
+    say("  calls alike (drafting pays most on code), and the combined speeds are compared. About 10-30 minutes; the")
+    say("  PC is busy.")
     log = cfg.get("log")
     since = os.path.getsize(log) if log and os.path.isfile(log) else 0
     try:
@@ -4709,16 +4709,34 @@ def speed_calibration_ds4(cfg_path: Path, cfg: dict, why: str = "") -> bool:
     out.setdefault("installer", {})["speed_calibration"] = {
         "date": time.strftime("%Y-%m-%d %H:%M"), "version": maya_version(), "dspark_tok_s": d, "no_drafting_tok_s": o,
         "drafts_accepted": [res["dspark"]["drafts_accepted"], res["dspark"]["drafts_offered"]],
-        "tokens": [res["none"]["tokens"], res["dspark"]["tokens"]], "kept": "dspark" if keep else "none"}
+        "tokens": [res["none"]["tokens"], res["dspark"]["tokens"]], "kept": "dspark" if keep else "none",
+        "kinds": {k: [res["none"]["kinds"][k]["tok_s"], res["dspark"]["kinds"][k]["tok_s"]]
+                  for k in res["dspark"].get("kinds") or {}}}
     cfg_path.write_text(json.dumps(N.env_out(out), indent=1), encoding="utf-8")
     say()
+    each = ", ".join(f"{name} {res['dspark']['kinds'][k]['tok_s']:.1f} against {res['none']['kinds'][k]['tok_s']:.1f}"
+                     for k, name, _, _ in CDS.KINDS if k in (res["dspark"].get("kinds") or {}))
     if keep:
         ok(f"speed calibration: the DSpark drafter is faster on this PC - {d:.1f} against {o:.1f} tokens/s "
-           f"(+{res['gain'] * 100:.0f}%): Maya drafts with it")
+           f"(+{res['gain'] * 100:.0f}%, chat, code and tool calls combined): Maya drafts with it")
     else:
-        ok(f"speed calibration: the DSpark drafter is not faster on this PC - {d:.1f} against {o:.1f} tokens/s: "
-           "Maya decodes without drafting (and its memory holds more of the model)")
+        ok(f"speed calibration: the DSpark drafter is not faster on this PC - {d:.1f} against {o:.1f} tokens/s "
+           "(chat, code and tool calls combined): Maya decodes without drafting (and its memory holds more of the "
+           "model)")
+    if each:
+        say(f"       (each kind with the drafter against without: {each} tokens/s)")
     return True
+
+
+def set_fast_prefill(cfg: dict, value: str | None) -> None:
+    """--fast-prefill on|off into a DeepSeek config: "fast_prefill": true (serve/server.py's child_env gives the engine
+    DS4_YOCO_CONE=1, the long prompt's skip as a per-layer cone), or left out (off, the default).  None: unchanged."""
+    if value == "on":
+        cfg["fast_prefill"] = True
+        ok("fast prompt reading: on (--fast-prefill; long prompts read faster, answers can shift slightly)")
+    elif value == "off":
+        cfg.pop("fast_prefill", None)
+        ok("fast prompt reading: off (--fast-prefill off; the default)")
 
 
 def drafting_choice(a, drafter: str, minutes: str) -> str:
@@ -6512,10 +6530,11 @@ def write_config_ds4(a, pc: dict, meta: dict, pack: Path, ctx: int, models: Path
            "gpu": [g["index"] for g in pc["gpus"]],
            "sampling": dict(DS4_SAMPLING), "reasoning_effort": DS4_EFFORT,   # (the model's own, every setup)
            "lib_dirs": meta.get("lib_dirs") or old.get("lib_dirs") or [], "port": port}
-    for k in ("host", "api_key", "cors_origins", "mcp_servers"):
+    for k in ("host", "api_key", "cors_origins", "mcp_servers", "fast_prefill"):
         if old.get(k) is not None:
             cfg[k] = old[k]
             kept.append(k)
+    set_fast_prefill(cfg, getattr(a, "fast_prefill", None))
     env = {**(old.get("env") or {}), **parse_env(a.env)}
     if env:
         cfg["env"] = env
@@ -7055,7 +7074,7 @@ def write_config_mm3(a, pc: dict, meta: dict, pack: Path, ctx: int, models: Path
     #  has them: a kept --vision on without a tower in the pack dropped)
     # (--tp: the config before's for the same GPUs only, else worked out again below from the GPUs chosen now - #436)
     keep = ("--chunk", "--staging", "--cpu-threads", "--reserve-gb", "--resident-cap", "--kv-cache", "--kv-streaming",
-            "--kv-resident", "--dspark", "--dspark-conf", "--vision-gpu", "--parallel") + \
+            "--kv-resident", "--dspark", "--dspark-conf", "--vision-gpu", "--parallel", "--suffix-draft") + \
         (() if gguf else (("--tp",) if tp_keepable(old, pc) else ()) + ("--cache-gb",))
     kept = keep_args(old.get("args") or [], args, keep)
     if getattr(a, "parallel", None):   # given now: written, and a later setup keeps it
@@ -7092,6 +7111,11 @@ def write_config_mm3(a, pc: dict, meta: dict, pack: Path, ctx: int, models: Path
     # calibration (tools/calibrate_ds4.py, as DeepSeek's) or the user's choice says it pays (set_up_mm3)
     if "--dspark" not in args[:-1] and "dspark.num_hidden_layers" in (pack / "mm3.txt").read_text(encoding="utf-8"):
         args += ["--dspark", "off"]
+    # prompt lookup (--suffix-draft 3): on for one GPU, where it measured faster on code and tool calls; on several GPUs
+    # (with DSpark) it gained ~2% and the greedy answers repeated less often run to run, so there it is the user's
+    # choice (a kept --suffix-draft stays)
+    if "--suffix-draft" not in args[:-1] and n == 1:
+        args += ["--suffix-draft", "3"]
     # pictures, ON by default: the pack's vision tower in the engine (in RAM, on a GPU only during a picture) - a setup
     # again turns them on (a config's --vision off is not kept); --no-vision frees it for experts
     if getattr(a, "no_vision", False):
@@ -7796,6 +7820,9 @@ def main() -> int:
     ap.add_argument("--mmap-experts", choices=["auto", "on", "off"],
                     help="DeepSeek: the experts VRAM does not hold - read in place from the files (auto, the default), "
                          "or off: copied into RAM (with DS4_REQUIRE_ALL_RAM=1 all of them); kept in the config")
+    ap.add_argument("--fast-prefill", choices=["on", "off"],
+                    help="DeepSeek: fast prompt reading - long prompts read faster (the prompt skip as a per-layer "
+                         "cone); answers can shift slightly, so it is off by default; kept in the config")
     ap.add_argument("--port", type=int, help="the dashboard's and the API's port (default 8080)")
     ap.add_argument("--host", help="where the server listens: 127.0.0.1 = this machine only (default), 0.0.0.0 = also "
                                    "other devices on your network (set --api-key too)")
@@ -7881,6 +7908,13 @@ def main() -> int:
                 say(f"  {i}) {c.name}")
             pick = have[int(ask("Which one?", [str(i) for i in range(1, len(have) + 1)], "1", a.yes)) - 1]
         check_parallel(a, config_family(read_json(pick)))
+        if getattr(a, "fast_prefill", None):   # (given on a start too: written into a DeepSeek config, which keeps it)
+            cfg = read_json(pick)
+            if config_family(cfg) != "deepseek":
+                warn("--fast-prefill is a DeepSeek setting: this config does not use it")
+            else:
+                set_fast_prefill(cfg, a.fast_prefill)
+                pick.write_text(json.dumps(cfg, indent=1), encoding="utf-8")
         if a.mmap_experts:   # (#422: given on a start too - written into a DeepSeek config, which keeps it)
             cfg = read_json(pick)
             if config_family(cfg) != "deepseek":

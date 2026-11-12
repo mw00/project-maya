@@ -1223,6 +1223,9 @@ class StrataEngine:
             sd = tune.get("suffix_draft")   # the DeepSeek engine's prompt lookup beside DSpark: off (0) / on (1)
             if isinstance(sd, int) and not isinstance(sd, bool) and sd in (0, 1):
                 tune_keys += f" suffix_draft={sd}"
+            lt = tune.get("lookup_trust")   # ... (DeepSeek, MiniMax) its trusted rounds without a draft: off / on
+            if isinstance(lt, int) and not isinstance(lt, bool) and lt in (0, 1):
+                tune_keys += f" lookup_trust={lt}"
             ct = tune.get("cpu_threads")   # the GLM engine's CPU lane threads (more: MAYA_GLM_CPU_LANE_MAX)
             if isinstance(ct, int) and not isinstance(ct, bool) and ct > 0:
                 tune_keys += f" cpu_threads={ct}"
@@ -2031,6 +2034,12 @@ def child_env(cfg: dict) -> dict:
     # engine settings the config carries (AMD: the GEMM tuning table), under BOTH names: env_in left the config with the
     # older STRATA_ one, and some of the engines' settings are read by their MAYA_ name alone (issue #686)
     maya_names.export_env(env, cfg.get("env"))
+    # DeepSeek's fast prompt reading (the config's "fast_prefill", the Models page's switch, --fast-prefill on|off):
+    # the long prompt's skip as a per-layer cone in maya-ds4 (DS4_YOCO_CONE).  Opt-in - the same sums, but a kernel's
+    # choice goes by its row count, so the bits (and an answer) can shift slightly; a config without it: the engine's
+    # default (off)
+    if isinstance(cfg.get("fast_prefill"), bool):
+        env["DS4_YOCO_CONE"] = "1" if cfg["fast_prefill"] else "0"
     dirs = [d for d in cfg.get("lib_dirs") or [] if Path(d).is_dir()]
     if dirs:
         var = "PATH" if os.name == "nt" else "LD_LIBRARY_PATH"

@@ -134,25 +134,39 @@ class Geometry(unittest.TestCase):
                          {"dspark_block_size": 5, "dspark_noise_token_id": 128799})
 
 
+def kind_requests(cfg):
+    """CDS.requests' stand-in: request ids [kind index, request index] (the warm-up [9])."""
+    return [9], {key: [[i, j] for j in range(len(reqs))] for i, (key, _, reqs, _) in enumerate(CDS.KINDS)}
+
+
 class Calibration(unittest.TestCase):
-    def run_cal(self, none_tok_s, dspark_tok_s):
+    def run_cal(self, none_tok_s, dspark_tok_s, answer_len=None):
+        """none_tok_s / dspark_tok_s: one speed, or {kind: speed}; answer_len: answers end after that many tokens."""
+        engines = {}
+
         class Fake:
             def __init__(self, tok_s):
-                self.tok_s, self.last = tok_s, {}
+                self.tok_s, self.last, self.asked = tok_s, {}, []
 
             def generate(self, ids, max_new, sampling, cancel):
-                self.last = {"decode_ms": max_new / self.tok_s * 1000.0, "drafts_accepted": 3, "drafts_offered": 5}
-                yield from range(max_new)
+                self.asked.append((tuple(ids), max_new, sampling.get("seed")))
+                n = max_new if answer_len is None else min(max_new, answer_len)
+                rate = self.tok_s if not isinstance(self.tok_s, dict) else \
+                    self.tok_s.get(CDS.KINDS[ids[0]][0] if ids != [9] else "chat", 1.0)
+                self.last = {"decode_ms": n / rate * 1000.0, "drafts_accepted": 3, "drafts_offered": 5}
+                yield from range(n)
         seen = []
 
         def start(cfg):
             mode = cfg["args"][cfg["args"].index("--dspark") + 1]
             seen.append((mode, cfg["args"][cfg["args"].index("--expert-profile") + 1] if "--expert-profile" in
                          cfg["args"] else None))
-            return Fake(dspark_tok_s if mode == "on" else none_tok_s)
+            engines[mode] = Fake(dspark_tok_s if mode == "on" else none_tok_s)
+            return engines[mode]
         cfg = {"args": ["--pack", "/nowhere", "--max-context", "8192", "--dspark", "none"],
                "sampling": {"temperature": 1.0, "top_p": 1.0}}
-        with patch.object(CD, "requests", lambda c: ([1], [[2]] * 8, 2048)):
+        self.engines = engines
+        with patch.object(CDS, "requests", kind_requests):
             return CDS.run(cfg, say=lambda *a: None, start_engine=start), seen
 
     def test_keeps_the_faster(self):
@@ -160,6 +174,79 @@ class Calibration(unittest.TestCase):
         self.assertEqual((res["keep"], [m for m, _ in seen]), ("dspark", ["none", "on"]))
         self.assertEqual(self.run_cal(3.0, 3.1)[0]["keep"], "none")       # (a tie: no drafting)
         self.assertEqual(self.run_cal(3.0, 2.5)[0]["keep"], "none")
+
+    def test_code_and_tool_calls_count_as_much_as_chat(self):
+        # Sun's MiniMax: the drafter doubles code and tool calls and slows chat - a chat-only measurement turned it off
+        res, _ = self.run_cal(10.0, {"chat": 8.0, "code": 20.0, "tools": 20.0})
+        self.assertEqual(res["keep"], "dspark")
+        self.assertAlmostEqual(res["dspark"]["tok_s"], round(3 / (1 / 8 + 1 / 20 + 1 / 20), 2))
+        self.assertEqual({k: v["tok_s"] for k, v in res["dspark"]["kinds"].items()},
+                         {"chat": 8.0, "code": 20.0, "tools": 20.0})
+        self.assertEqual(res["none"]["tok_s"], 10.0)
+        # ... and a drafter that wins on code alone but loses chat and tool calls is not kept
+        self.assertEqual(self.run_cal(10.0, {"chat": 8.0, "code": 14.0, "tools": 9.0})[0]["keep"], "none")
+
+    def test_combined_is_equal_tokens_of_each_kind(self):
+        self.assertEqual(CDS.combined({"a": {"tok_s": 10.0}, "b": {"tok_s": 10.0}, "c": {"tok_s": 10.0}}), 10.0)
+        self.assertEqual(CDS.combined({"a": {"tok_s": 6.0}, "b": {"tok_s": 12.0}}), 8.0)   # (one fast kind: no mask)
+        self.assertEqual(CDS.combined({"a": {"tok_s": 6.0}, "b": {"tok_s": 0.0}}), 0.0)
+
+    def test_each_kind_writes_its_tokens_with_the_same_requests_and_seeds_on_both_sides(self):
+        res, _ = self.run_cal(3.0, 4.0)
+        none, on = self.engines["none"].asked, self.engines["on"].asked
+        self.assertEqual(none, on)                                          # (deterministic: same ids, caps, seeds)
+        self.assertEqual(none[0], ((9,), CD.WARM_ANSWER, 1))               # (the warm-up first, not counted)
+        self.assertEqual(len({s for _, _, s in none}), len(none))           # (a seed per request)
+        for key, _, _, _ in CDS.KINDS:
+            self.assertEqual(res["none"]["kinds"][key]["tokens"], CDS.KIND_TOKENS)
+        self.assertEqual(res["none"]["tokens"], CDS.MIN_TOKENS)
+        # short answers (a tool call that ends early) take more of the kind's requests
+        res, _ = self.run_cal(3.0, 4.0, answer_len=100)
+        self.assertEqual(res["none"]["kinds"]["tools"]["tokens"], 400)
+
+    def test_a_kind_with_nothing_measured_is_no_calibration(self):
+        with self.assertRaises(RuntimeError):
+            self.run_cal(3.0, 4.0, answer_len=1)
+
+    def test_the_requests_are_chat_code_and_tool_calls_rendered_by_the_template(self):
+        calls = []
+
+        class Tpl:
+            def render(self, messages, tools=None, **kw):
+                calls.append((messages[0]["content"], tools, kw))
+                return messages[0]["content"]
+
+        class Tok:
+            def encode(self, text, parse_special=False):
+                return [len(text)]
+        with patch.object(CD, "chat_parts", lambda cfg: (Tok(), Tpl(), {"reasoning_effort": "high"})):
+            warm, kinds = CDS.requests({})
+        self.assertEqual(set(kinds), {"chat", "code", "tools"})
+        self.assertEqual([len(v) for v in kinds.values()], [len(CDS.CHAT), len(CDS.CODE), len(CDS.TOOL_CALLS)])
+        by_q = {q: (t, kw) for q, t, kw in calls}
+        self.assertEqual(by_q[CDS.CHAT[0][0]], (None, {"reasoning_effort": "high"}))   # (the config's thinking)
+        self.assertEqual(by_q[CDS.CODE[0][0]], (None, {"enable_thinking": False}))     # (the tokens are the code)
+        t, kw = by_q[CDS.TOOL_CALLS[0][0]]
+        self.assertEqual(([x["name"] for x in t], kw), (["write_file", "run_command"], {"enable_thinking": False}))
+        self.assertTrue(all("write_file" in q for q, _ in CDS.TOOL_CALLS))
+
+    def test_the_setup_keeps_the_combined_choice_and_each_kinds_speeds(self):
+        import maya
+        res, _ = self.run_cal(10.0, {"chat": 8.0, "code": 20.0, "tools": 20.0})
+        d = Path(tempfile.mkdtemp())
+        cfg_path = d / "maya-ds4.json"
+        cfg_path.write_text(json.dumps({"args": ["--pack", "p", "--dspark", "none"]}), encoding="utf-8")
+        said = []
+        with patch.object(CDS, "has_drafter", lambda c: True), patch.object(CDS, "run", lambda c, say: res), \
+                patch.object(maya, "busy_gpus", lambda c: []), patch.object(maya, "say", lambda *a: said.append(a)), \
+                patch.object(maya, "ok", lambda *a: said.append(a)), patch.object(maya, "config_family",
+                                                                               lambda c: "deepseek"):
+            self.assertTrue(maya.speed_calibration_ds4(cfg_path, json.loads(cfg_path.read_text())))
+        out = json.loads(cfg_path.read_text())
+        self.assertEqual(out["args"][-2:], ["--dspark", "on"])
+        cal = out["installer"]["speed_calibration"]
+        self.assertEqual((cal["kept"], cal["kinds"]["code"], cal["kinds"]["chat"]), ("dspark", [10.0, 20.0], [10.0, 8.0]))
+        self.assertTrue(any("code 20.0 against 10.0" in " ".join(map(str, a)) for a in said))
 
     def test_options(self):
         cfg = {"args": ["--pack", "p", "--dspark", "on", "--max-context", "1"]}

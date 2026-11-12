@@ -8,8 +8,9 @@
 // head; then left to right each position's logits plus the Markov bias of the token before it (markov_w2 .
 // markov_w1[prev], prev the anchor first), greedy, and its confidence sigmoid(proj . [hidden ; markov_w1[prev]] + b).
 //
-// The weights: the MXFP8 matrices expanded to BF16 (exact), fc / the Markov tables / the confidence head as stored
-// (BF16), on one GPU with the target's head.
+// The weights: the layers' MXFP8 matrices as stored (E4M3 + a UE8M0 scale every 32 - mx_rows reads them), fc / the
+// Markov tables as stored (BF16; fc in FP16 on GPUs without BF16 tensor cores), the norms and the confidence head in
+// F32, on one GPU with the target's head.
 #pragma once
 
 #include <cstdint>
@@ -70,6 +71,9 @@ public:
                          std::vector<std::vector<std::pair<int, float>>>& q, std::string& err);
     /// Device bytes the draft holds.
     size_t bytes() const;
+    /// The device bytes load() will hold for this pack and max_rows (its allocations, from the pack's geometry - the
+    /// placement's room for the draft before it loads; 0: the pack has no draft).
+    static size_t plan_bytes(const Pack& pk, int max_rows);
 
 private:
     struct Impl;

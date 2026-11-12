@@ -4,6 +4,16 @@ Every release is on GitHub (Releases) with these notes; every published change m
 page's Settings › About and updates (About > Update before the redesign; from v1.0.18), or `git pull`, then `./setup.sh` (Windows: `START-MAYA.bat`) - it recompiles
 only what changed and starts; the model is not downloaded again.
 
+## v1.1.61 - 2026-11-12
+
+DeepSeek reads prompts up to 17% faster on AMD Ryzen AI Max APUs with the same answers, a fast prompt reading switch, faster EXL3 decode on AMD, and prompt lookup for MiniMax on one GPU.
+
+- **Faster: DeepSeek prompt reading on AMD Ryzen AI Max APUs:** Maya-XS reads prompts 14-17% faster than in v1.1.60 at every length from 2K to 128K tokens, and Maya-S 8-9% faster at 8K-32K, with identical answers. Each expert's weights are now unpacked once for more prompt rows, and the sparse attention handles all head groups of a token together without memory bank clashes. Measured on a Ryzen AI Max APU; other RDNA3 GPUs (Radeon RX 7000) use the same code.
+- **Faster: DeepSeek EXL3 decode on AMD:** EXL3 quants decode 5-8% faster than in v1.1.60 on a Ryzen AI Max APU, with identical answers (thanks @pepuscz for #945).
+- **DeepSeek: fast prompt reading (opt-in):** Models page > Speed > Fast prompt reading (or `"fast_prefill": true`, `--fast-prefill on`). For shorter prompts, the later layers also skip the rows that cannot affect the answer: on a Ryzen AI Max APU Maya-XS reads prompts about 14% faster at 2K and 12% faster at 8K than with it off. The answers can shift slightly, so it is off until you switch it on.
+- **MiniMax: prompt lookup on one GPU:** where an answer repeats earlier text (code edits, tool-call arguments, quoted text), the tokens that followed it earlier are checked in one step. On one GPU it is on: code and tool calls decoded about 6% faster than in v1.1.60 on our test PC, with the DSpark draft on. On several GPUs it is your choice (`--suffix-draft 3`).
+- **Setup: the speed calibration now measures code and tool calls too:** DeepSeek's and MiniMax's draft (DSpark) is kept or turned off by its speed on chat, code and tool calls together, not chat alone, so it stays on where it speeds up coding work. It applies the next time you run the setup.
+
 ## v1.1.60 - 2026-11-11
 
 GLM-5.3-Flash decodes faster again on AMD Ryzen AI Max APUs (up to ~0.8% vs v1.1.59, back to v1.1.56's speed), turboderp's 2.25 bpw EXL3 quant of DeepSeek in the setup, DFlash2 drafting for GLM-5.3 (744B) as an opt-in, and fixes.

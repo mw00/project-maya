@@ -49,6 +49,13 @@ public:
     Pick choose(int t_mtp, int lookup_k, int match) const;
     /// After the round: the window it used, the drafts accepted, and the round's time (verify + commit + draft).
     void observe(bool lookup, int t, int accepted, int match, double round_ms);
+    /// A lookup proposal trusted enough to be verified alone, the drafter not run for the round (its draft time
+    /// saved; the drafter's context still follows every verified token): its match is kTrustMatch tokens or longer,
+    /// lookup windows of that match length were measured (kTrustN, decayed) with their drafts holding at kTrustQ or
+    /// more, and choose() takes it over the drafter's window of t_mtp tokens.  The window is choose()'s.
+    bool trust(int t_mtp, int lookup_k, int match) const;
+    static constexpr int kTrustMatch = 12;
+    static constexpr double kTrustQ = 0.9, kTrustN = 4.0;
 
     double lookup_rate(int match) const;   // current q for a match length
     double cost_ms(int t) const;           // measured or scaled round time of a window of t tokens (this band's)
@@ -98,6 +105,7 @@ private:
     std::array<std::array<double, kMaxT + 1>, kBands> last_{};              // the round each size was last measured
     std::array<double, kMaxT + 1> mtp_tok_{}, mtp_n_{};    // tokens committed by MTP windows of that size
     std::array<double, kBuckets> ok_{}, bad_{};            // lookup drafts accepted / windows cut short, decayed
+    std::array<double, kBuckets> win_{};                   // lookup windows, decayed (trust())
     std::array<std::array<double, kOddsBins>, kOddsPos> held_{}, seen_{};   // block drafts held / verified, decayed
 };
 

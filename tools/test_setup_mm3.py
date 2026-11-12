@@ -249,6 +249,16 @@ class Config(unittest.TestCase):
         a = self.write(args(no_vision=True))["args"]
         self.assertEqual(a[a.index("--vision") + 1], "off")
 
+    def test_prompt_lookup_on_for_one_gpu_only(self):
+        """Prompt lookup (--suffix-draft 3) is written for one GPU; on several GPUs it is the user's choice (not written,
+        the engine's default is off), and a --suffix-draft in the config before is kept."""
+        self.assertNotIn("--suffix-draft", self.write(args(), gpus=3)["args"])
+        a = self.write(args(), gpus=1)["args"]
+        self.assertEqual(a[a.index("--suffix-draft") + 1], "3")
+        old = {"installer": {"family": "minimax"}, "args": ["--pack", "/p", "--suffix-draft", "3"]}
+        a = self.write(args(), old=old, gpus=3)["args"]
+        self.assertEqual(a[a.index("--suffix-draft") + 1], "3")
+
     def test_parallel_written_kept_and_given_back(self):
         """--parallel N is written and kept by a setup again; with N above 1 a new config does not ask for KV streaming
         (the engine runs each conversation's cache in VRAM), and --parallel 1 brings it back."""

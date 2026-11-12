@@ -291,12 +291,20 @@ float dspark_cum_default() {
 // still the model's own draw.  Not beside DS4_DSPARK_SAMPLE=1's drawn drafts (the choice would then hang on a draw).
 // A round with no drafter window (--dspark none or off, or DSpark resting after drafts below its confidence) weighs
 // the lookup's drafts against a plain step the same way.  --suffix-draft N: the shortest match it proposes from (3; 0:
-// off)
+// off).  A proposal the policy trusts (DraftPolicy::trust: a long match whose windows measured hold) is verified alone,
+// DSpark's draft not made that round (verify() seeds the drafter with the kept tokens as after any window, so the next
+// drafted round is current); such a round's time counts with the draft's measured time added, so the policy keeps
+// comparing rounds that drafted.  MAYA_DS4_LOOKUP_TRUST=0: every round drafts first (a request's lookup_trust=0|1 key
+// over it)
 struct Lookup {
     strata::spec::SuffixDrafter sfx;
     strata::spec::DraftPolicy policy;   // (over the engine's life: the round times are this PC's)
     std::vector<int32_t> buf;
     long long windows = 0, offered = 0, accepted = 0;   // the lookup's own rounds and drafts
+    long long trusted = 0;                               // ... of them verified alone (no draft made)
+    double draft_ms = 0.0;                               // a draft()'s time (EMA)
+    int t_mtp = 1;                                       // the last drafted window's tokens (trust's comparison)
+    int trust_req = -1;                                  // the request's lookup_trust key (-1: MAYA_DS4_LOOKUP_TRUST)
     Lookup(int min_match, int max_t, size_t cap) : sfx(min_match, 64, cap), policy(max_t), buf((size_t) max_t) {}
     void start(const std::vector<int32_t>& ctx) {   // a request's history: what the state has consumed
         sfx.reset();
@@ -390,14 +398,43 @@ bool round(strata::ds4::Model& m, int tok, int room, bool spec, float conf_min, 
         // (the lookup's proposal first: with one, the drafter makes its first row even past the cut - the lazy head
         //  would skip it at a cut first draft, leaving none to weigh the lookup against; past it, the lazy cut)
         const int k = lk != nullptr ? lk->sfx.propose(std::min(room, m.verify_max()) - 1, lk->buf.data()) : 0;
+        // a trusted lookup (Lookup, above): its window verified alone, no draft this round
+        static const bool trust_on = [] {
+            const char* e = ds4_env("DS4_LOOKUP_TRUST");
+            return e == nullptr || std::atoi(e) != 0;
+        }();
+        const bool trust = k > 0 && (lk->trust_req < 0 ? trust_on : lk->trust_req != 0);
+        if (trust && lk->draft_ms > 0.0 && lk->policy.trust(lk->t_mtp, k, lk->sfx.last_match())) {
+            match = lk->sfx.last_match();
+            const int t = lk->policy.choose(lk->t_mtp, k, match).t;
+            const std::vector<int> lw(lk->buf.begin(), lk->buf.begin() + (t - 1));
+            int acc = 0, next = -1;
+            if (!m.verify(tok, lw, temperature, top_p, top_k, min_p, seed, counter, acc, next, err)) return false;
+            if (rl.on()) rl.note(pos0, true, t - 1, t - 1, acc, {});
+            counter += (unsigned long long) acc + 1;
+            for (int i = 0; i < acc; ++i) out.push_back(lw[(size_t) i]);
+            out.push_back(next);
+            offered = t - 1;
+            accepted = acc;
+            const double ms = now_ms() - t0 + lk->draft_ms;   // (as a round that drafted: the policy's costs stay alike)
+            if (dc != nullptr) dc->alone.observe_cost(t, ms);
+            lk->policy.observe(true, t, acc, match, ms);
+            ++lk->windows;
+            ++lk->trusted;
+            lk->offered += t - 1;
+            lk->accepted += acc;
+            return true;
+        }
         // the round's cut for the lazy drafter: the drafts-cost window keeps the drafts under the floor alone (no
         // running product), the plain cut the product too
         const bool dc_win = dc != nullptr && cum_min < 0;
         if (!dc_win && cum_min < 0) cum_min = dspark_cum_default();
         const int max_n = dc_win ? std::min(room - 1, strata::spec::DraftPolicy::kMaxT - 1) : room - 1;
+        const double td = now_ms();
         if (!m.draft(tok, drafts, conf, err, temperature, top_p, top_k, min_p, seed, counter, max_n, conf_min,
                      dc_win ? 0.0f : cum_min, k > 0 ? 1 : 0))
             return false;
+        if (lk != nullptr) lk->draft_ms = lk->draft_ms > 0.0 ? 0.9 * lk->draft_ms + 0.1 * (now_ms() - td) : now_ms() - td;
         const int made = (int) drafts.size();
         int keep = 0;
         if (dc != nullptr) dc->alone.set_context(m.pos());
@@ -417,6 +454,7 @@ bool round(strata::ds4::Model& m, int tok, int room, bool spec, float conf_min, 
                 ++keep;
         }
         bool from_lk = false;
+        if (lk != nullptr) lk->t_mtp = keep + 1;
         if (lk != nullptr && !drafts.empty() && !m.drafts_sampled()) {
             match = lk->sfx.last_match();
             if (k > 0 && lk->buf[0] == drafts[0]) {
@@ -495,6 +533,7 @@ struct Req {
     float conf = -1.0f;     // dspark_conf=F: the drafts' confidence floor for this request (-1: the engine's)
     float cum = -1.0f;      // dspark_cum=F: the cut on the product of the confidences (-1: the engine's, dspark_cum_default)
     int lookup = -1;        // suffix_draft=0|1: this request's prompt lookup off / on (-1: as the engine was started)
+    int trust = -1;         // lookup_trust=0|1: its trusted rounds without a draft off / on (-1: MAYA_DS4_LOOKUP_TRUST)
     // the penalties (penalty_last_n / _repeat / _freq / _present, llama.cpp's): over the last pen_n tokens of the state
     // (-1: the whole context, which the engine caps at its window; 0: none)
     int pen_n = 0;
@@ -657,6 +696,7 @@ bool parse_gen(const std::string& line, Req& r, bool geni) {
         else if (k == "dspark_cum" || k == "spec_cum") r.cum = std::strtof(v.c_str(), nullptr);
         else if (k == "spec_min_p") r.conf = std::strtof(v.c_str(), nullptr);   // (the server's strata_tune names)
         else if (k == "suffix_draft") r.lookup = std::atoi(v.c_str()) != 0;
+        else if (k == "lookup_trust") r.trust = std::atoi(v.c_str()) != 0;
         else if (k == "penalty_last_n") r.pen_n = std::atoi(v.c_str());
         else if (k == "penalty_repeat") r.pen_repeat = std::strtof(v.c_str(), nullptr);
         else if (k == "penalty_freq") r.pen_freq = std::strtof(v.c_str(), nullptr);
@@ -1866,7 +1906,8 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         std::vector<strata::ds4::LogprobRow> got_lp;
         if (r.logprobs >= 0) tok_lp = lp_take(m, 1).back();
         if (lk) lk->start(m.tokens());
-        const long long lk_w0 = lk ? lk->windows : 0, lk_o0 = lk ? lk->offered : 0, lk_a0 = lk ? lk->accepted : 0;
+        const long long lk_w0 = lk ? lk->windows : 0, lk_o0 = lk ? lk->offered : 0, lk_a0 = lk ? lk->accepted : 0,
+                        lk_t0 = lk ? lk->trusted : 0;
         // STAT for the Monitor every 8 tokens and at the end, over this answer so far: the GLM engine's keys (speed, the
         // VRAM hit, promotions a token) and DeepSeek's own - experts a token on the CPU lane, MB a token the storage
         // read (Linux), the n-gram memory's (Engram) read time a token, the drafts' acceptance
@@ -1915,6 +1956,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                 // (a request's spec / dspark_conf keys over the engine's: the speed calibration measures both ways)
                 const bool try_spec = (r.spec < 0 ? spec : r.spec != 0) && !cool;
                 m.set_logprobs(r.logprobs, close_think ? r.think_end : -1);
+                if (lk != nullptr) lk->trust_req = r.trust;
                 if (!round(m, tok, room, try_spec, r.conf >= 0 ? r.conf : conf_min, r.temperature, r.top_p, r.top_k,
                            r.min_p, r.seed, counter, got,
                            off, acc, err, r.cum, r.lookup == 0 ? nullptr : lk, dc)) {
@@ -1978,8 +2020,9 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                          (long long) (s.hr_evicts - s_dec.hr_evicts), (long long) (s.hr_fails - s_dec.hr_fails),
                          (long long) (s.hr_abandoned - s_dec.hr_abandoned));
         if (lk && lk->windows > lk_w0)
-            std::fprintf(stderr, "maya ds4 serve: prompt lookup: %lld rounds, %lld of its %lld drafts kept (in the above)\n",
-                         lk->windows - lk_w0, lk->accepted - lk_a0, lk->offered - lk_o0);
+            std::fprintf(stderr, "maya ds4 serve: prompt lookup: %lld rounds (%lld without a draft), %lld of its %lld "
+                         "drafts kept (in the above)\n", lk->windows - lk_w0, lk->trusted - lk_t0,
+                         lk->accepted - lk_a0, lk->offered - lk_o0);
         if (dc != nullptr && d_off > 0)
             std::fprintf(stderr, "maya ds4 serve: draft cost (DS4_DRAFT_COST), ms a round by its rows: %s\n", dc->text().c_str());
         prof_line(s_dec, s);   // DS4_PROF: this request's decode (the CLI's line, a request at a time)
@@ -2331,6 +2374,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                 m.set_logprobs(a.r.logprobs, closing ? a.r.think_end : -1);
                 int off = 0, acc = 0;
                 const bool try_spec = (a.r.spec < 0 ? spec : a.r.spec != 0) && !a.cool;
+                if (L != nullptr) L->trust_req = a.r.trust;
                 if (!round(m, a.tok, room, try_spec, a.r.conf >= 0 ? a.r.conf : conf_min, a.r.temperature, a.r.top_p,
                            a.r.top_k, a.r.min_p, a.r.seed, a.counter, a.got, off, acc, err, a.r.cum, L, dc)) {
                     std::fprintf(stderr, "ds4: %s\n", err.c_str());
@@ -3952,7 +3996,8 @@ int main(int argc, char** argv) {
         std::vector<int> got;
         round_log().tag = "ids";   // (DS4_ROUND_LOG)
         if (lk) lk->start(m.tokens());
-        const long long lk_w0 = lk ? lk->windows : 0, lk_o0 = lk ? lk->offered : 0, lk_a0 = lk ? lk->accepted : 0;
+        const long long lk_w0 = lk ? lk->windows : 0, lk_o0 = lk ? lk->offered : 0, lk_a0 = lk ? lk->accepted : 0,
+                        lk_t0 = lk ? lk->trusted : 0;
         for (;;) {
             if (tok < 0) {   // (a sample's CUDA error, printed by the sampler)
                 std::fprintf(stderr, "maya-ds4: the sample failed\n");
@@ -3983,8 +4028,9 @@ int main(int argc, char** argv) {
         std::printf("\n");
         if (df != nullptr && m.logits(lg)) std::fwrite(lg.data(), 4, lg.size(), df);
         if (lk && lk->windows > lk_w0)
-            std::fprintf(stderr, "prompt lookup: %lld rounds, %lld of its %lld drafts kept (in the dspark line's)\n",
-                         lk->windows - lk_w0, lk->accepted - lk_a0, lk->offered - lk_o0);
+            std::fprintf(stderr, "prompt lookup: %lld rounds (%lld without a draft), %lld of its %lld drafts kept (in "
+                         "the dspark line's)\n", lk->windows - lk_w0, lk->trusted - lk_t0, lk->accepted - lk_a0,
+                         lk->offered - lk_o0);
         if (dc != nullptr) std::fprintf(stderr, "draft cost (DS4_DRAFT_COST), ms a round by its rows: %s\n", dc->text().c_str());
     }
     if (prof && rep == reps - 1) cudaProfilerStop();

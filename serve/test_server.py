@@ -665,6 +665,12 @@ class SamplingKeys(unittest.TestCase):
         for bad in (2, -1, True, 1.0, "1"):
             self.assertFalse([k for k in self.keys(temperature=0, strata_tune={"suffix_draft": bad})
                               if k.startswith("suffix_draft=")], bad)
+        # ... and its trusted rounds (a lookup verified alone, no draft made): 0 or 1, nothing else
+        self.assertIn("lookup_trust=0", self.keys(temperature=0, strata_tune={"lookup_trust": 0}))
+        self.assertIn("lookup_trust=1", self.keys(temperature=0.7, strata_tune={"lookup_trust": 1}))
+        for bad in (2, -1, True, 1.0, "1"):
+            self.assertFalse([k for k in self.keys(temperature=0, strata_tune={"lookup_trust": bad})
+                              if k.startswith("lookup_trust=")], bad)
 
     def test_read_chunks_tune_key(self):
         # setup's calibration of the disk reads' size (#67): 1-16 pieces, nothing else

@@ -436,6 +436,9 @@ function fieldsOf(m, d) {
       html`<${Row} label="Prompt lookup" flag="--suffix-draft" changed=${ch("prompt_lookup")}
         hint="Where the answer repeats earlier text (code edits, quotes), the words that followed it there are checked as drafts: the same answer, often much faster. Off: --suffix-draft 0.">
         <${Switch} label="Prompt lookup" on=${d.prompt_lookup} onChange=${(v) => setDraft({prompt_lookup: v})}/><//>`,
+      html`<${Row} label="Fast prompt reading" flag="--fast-prefill" changed=${ch("fast_prefill")}
+        hint="Long prompts are read faster: the later layers leave out the work no later token needs. Off by default: answers can shift slightly.">
+        <${Switch} label="Fast prompt reading" on=${d.fast_prefill} onChange=${(v) => setDraft({fast_prefill: v})}/><//>`,
       draftConf(d, ch, 0.5)].filter(Boolean)},
   ];
 }
