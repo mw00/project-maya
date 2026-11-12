@@ -4108,14 +4108,17 @@ class Service:
                 return ids[:i + 1]
         return []
 
-    def preread(self, messages, tools, kw, guard, answer: str, prompt_ids=(), delay: float = 0.1):
+    def preread(self, messages, tools, kw, guard, answer: str, prompt_ids=(), delay: float = 0.1,
+                ablate: bool = False):
         """MAYA_DS4_PREREAD=1: after a thinking answer, read the next turn's start while nobody waits.  A client that
         sends the answer back without its reasoning makes the next prompt part from this one's end where the reasoning
         was, so that prompt reads the whole answer again with the user watching; read ahead, it reads only its own
         tokens.  In pieces (MAYA_DS4_PREREAD_PIECE): a request that comes meanwhile waits at most for the piece being
         read, then reads what it would have read anyway.  The first piece keeps a restore point one token past where
         this turn's prompt and the guess part, so a next prompt that differs from the guess (a client that changes the
-        answer) goes back there, not to the system prompt: it reads what it would have read without the setting."""
+        answer) goes back there, not to the system prompt: it reads what it would have read without the setting.  The read
+        takes the answer's refusal ablation (`ablate`): the engine starts a conversation over when a request's
+        projection differs from its state's, so a read without it would start the chat over twice."""
         def work():
             time.sleep(delay)
             t0 = time.time()
@@ -4147,6 +4150,8 @@ class Service:
                     #  after this turn's prompt, or where the loop guard left text out, the first one that changed - so
                     #  every client's next prompt has it, and only text the client sent can differ after it)
                     sampling = {"_restore": {"marks": [shared + 1]}} if k == 0 and point and shared + 1 < end - 1 else {}
+                    if ablate:                           # (the answer's projection: the engine keeps its state then)
+                        sampling["ablate"] = True
                     gen = self.engine.generate(ids[:end], 1, sampling, threading.Event())   # (one token, never fed)
                     try:
                         for _ in gen:
@@ -4838,7 +4843,7 @@ class Service:
         pre = (sampling or {}).get("_preread")
         if pre and finish == "stop" and not called and not sent_call and said and thinking and not emb \
                 and not cancel.is_set() and not self.stopping:
-            self.preread(*pre, "".join(said), ids)
+            self.preread(*pre, "".join(said), ids, ablate=(sampling or {}).get("ablate") is True)
         yield "done", {"finish": finish, "completion_tokens": n, "reasoning_tokens": reasoning_tokens,
                        "reused": (timings or {}).get("cache_n", 0),
                        "timings": timings, "stop_sequence": matched if finish == "stop" else None}

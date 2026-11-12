@@ -262,6 +262,18 @@ class PreRead(unittest.TestCase):
             self.assertFalse(preread_applies(back, None))
             self.assertTrue(preread_applies([{"role": "user", "content": "q"}, {"role": "assistant", "content": "a"}], None))
 
+    def test_the_read_goes_with_the_answers_ablation(self):
+        # (olobarius, PR #902: with refusal ablation on, a read without it would start the conversation over)
+        messages = [{"role": "system", "content": SYSTEM}, {"role": "user", "content": "What is the answer?"}]
+        for default in (True, False):
+            svc, eng = self.service()
+            svc.sampling_defaults = {"ablate": True} if default else {}
+            self.request(svc, messages, {ON: "1"})
+            with self.subTest(default=default):
+                self.assertEqual([n for _, n in eng.calls][1:], [1])
+                self.assertEqual(eng.samplings[0].get("ablate"), True if default else None)   # the answer's
+                self.assertEqual(eng.samplings[1].get("ablate"), eng.samplings[0].get("ablate"))   # the read's: the same
+
 
 if __name__ == "__main__":
     unittest.main()
