@@ -547,7 +547,7 @@ public:
         const size_t cb = chunk_slots_ * slot_bytes_;
         size_t gave = 0;
         if (av < cfg_.floor) {
-            gave = shrink((size_t) ((cfg_.floor - av + cb - 1) / cb));
+            gave = shrink((size_t) (cfg_.floor - av));
             grow_ok_ = false;
         } else {
             grow_ok_ = av >= (uint64_t) cfg_.grow_room + cb;
@@ -781,18 +781,22 @@ private:
         counts_.shrunk.fetch_add(1, std::memory_order_relaxed);
         return true;
     }
-    // up to `want` chunks given back, the class holding the most bytes first each time (mu_ held)
+    // at least `want` bytes given back if possible, the class holding the most bytes first each time (mu_ held)
     size_t shrink(size_t want) {
         size_t done = 0;
         std::vector<char> stuck(cls_.size(), 0);
-        while (done < want) {
+        while (want > 0) {
             int c = -1;
             for (size_t i = 0; i < cls_.size(); ++i)
                 if (!stuck[i] && !cls_[i].chunks.empty() &&
                     (c < 0 || cls_[i].nalloc * cls_[i].slot_bytes > cls_[(size_t) c].nalloc * cls_[(size_t) c].slot_bytes))
                     c = (int) i;
             if (c < 0) break;
-            if (shrink_one(c)) ++done;
+            const size_t bytes = cls_[(size_t) c].chunks.back().second;
+            if (shrink_one(c)) {
+                ++done;
+                want -= std::min(want, bytes);
+            }
             else stuck[(size_t) c] = 1;
         }
         return done;

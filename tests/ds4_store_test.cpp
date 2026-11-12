@@ -590,6 +590,93 @@ void test_classes(const Model& m) {
     mix.files = ExpertStore::Files{};
 }
 
+// A RAM deficit is in bytes: two small-class chunks may be needed even when it is less than one large chunk.
+void test_classes_shrink(const Model& m) {
+    Model mix;
+    mix.geo = {m.geo[0], m.geo[1]};
+    const uint64_t small_b[3] = {4001, 4001, 2001};
+    for (int r = 0; r < 3; ++r) mix.geo[1].bytes[r] = small_b[r];
+    mix.files = m.files;
+    const size_t big = ExpertStore::layer_layout(mix.geo[0]), small = ExpertStore::layer_layout(mix.geo[1]);
+    for (bool pin : {false, true}) {
+        std::atomic<uint64_t> avail{1ull << 30};
+        ExpertStore::Cfg c;
+        c.budget = kExp * (big + small);
+        c.chunk_slots = 2;
+        c.readers = 2;
+        c.floor = 1 << 20;
+        c.grow_room = 0;
+        c.ram_avail = [&] { return avail.load(); };
+        ExpertStore st;
+        std::string err;
+        EXPECT(st.init(c, mix.geo, mix.files, err));
+        for (int e : {0, 1}) ask(st, mix, 0, {e});
+        for (int e = 0; e < kExp; ++e) ask(st, mix, 1, {e});
+        EXPECT(st.slots_now() == 10);
+        const int s = pin ? st.acquire(0, 1) : -1;
+        if (pin) EXPECT(s >= 0);
+        avail = c.floor - (pin ? 6 * small : 2 * small + 1);
+        const size_t gave = st.watch();
+        std::fprintf(stderr, "  mixed shrink (pinned=%d): deficit=%zu, small chunk=%zu, gave=%zu, slots=%zu\n",
+                     (int) pin, (size_t) (c.floor - avail.load()), 2 * small, gave, st.slots_now());
+        EXPECT(gave == (pin ? 3 : 2));
+        EXPECT(st.slots_now() == (pin ? 4 : 6));
+        EXPECT(st.has(0, 0) && st.has(0, 1));
+        if (s >= 0) {
+            for (int r = 0; r < 3; ++r) EXPECT(same(mix, 0, 1, r, st.mat_of(s, r)));
+            st.unpin(s);
+        }
+    }
+    mix.files = ExpertStore::Files{};   // m owns these handles
+}
+
+// One slot per class, partial chunks, and simultaneous windows on the two classes.
+void test_classes_tight_concurrent(const Model& m) {
+    Model mix;
+    mix.geo = {m.geo[0], m.geo[1]};
+    const uint64_t small_b[3] = {4001, 4001, 2001};
+    for (int r = 0; r < 3; ++r) mix.geo[1].bytes[r] = small_b[r];
+    mix.files = m.files;
+    const size_t big = ExpertStore::layer_layout(mix.geo[0]), small = ExpertStore::layer_layout(mix.geo[1]);
+    ExpertStore::Cfg c;
+    c.budget = big + small;
+    c.chunk_slots = 2;
+    c.readers = 2;
+    ExpertStore st;
+    std::string err;
+    const bool ready = st.init(c, mix.geo, mix.files, err);
+    EXPECT(ready);
+    if (ready) {
+        EXPECT(st.slots_max() == 2 && st.bytes_max() <= c.budget);
+        bool ok[2] = {true, true};
+        auto read = [&](int layer) {
+            for (int i = 0; i < 20; ++i) {
+                const int e = i % kExp;
+                ExpertStore::Hold h;
+                st.begin(layer, &e, 1, h);
+                std::vector<int> out;
+                int got = 0;
+                while (st.next(h, out, true))
+                    for (int j : out) {
+                        ++got;
+                        if (h.st[(size_t) j] != ExpertStore::kHit) ok[layer] = false;
+                        else
+                            for (int r = 0; r < 3; ++r)
+                                if (!same(mix, layer, e, r, st.mat(h, j, r))) ok[layer] = false;
+                    }
+                if (got != 1) ok[layer] = false;
+                st.release(h);
+            }
+        };
+        std::thread a(read, 0), b(read, 1);
+        a.join();
+        b.join();
+        EXPECT(ok[0] && ok[1]);
+        EXPECT(st.slots_now() == 2 && st.counts().failed.load() == 0);
+    }
+    mix.files = ExpertStore::Files{};   // m owns these handles
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -614,6 +701,8 @@ int main(int argc, char** argv) {
     test_split(m);
     test_put(m);
     test_classes(m);
+    test_classes_shrink(m);
+    test_classes_tight_concurrent(m);
     if (failures == 0) std::fprintf(stderr, "ds4_store_test: ALL OK\n");
     else std::fprintf(stderr, "ds4_store_test: %d FAILED\n", failures);
     return failures == 0 ? 0 : 1;
