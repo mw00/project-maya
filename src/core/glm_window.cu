@@ -453,7 +453,7 @@ bool Glm5Model::fast_dsa_window(int il, int64_t p0, int t0, int T, std::string& 
         d.kv_raw = W.kv_raw + (size_t) t * g.kv_lora;
         d.kv_norm = Ly.kv_a_norm;
         kv_prep_targets(kv_, il, (uint16_t*) (state_ + dsa_lat_[(size_t) il]), d);   // (KV streaming: + host copy)
- d.paged_lat_table = lat_table_; // NULL when STRATA_GLM_PAGED is off
+ d.paged_lat_table = lat_table_; // NULL when MAYA_GLM_PAGED is off
         d.paged_page_rows = lat_pages_.page_size();
         d.paged_max_rows = lat_max_rows();
         d.kv_lora = g.kv_lora;

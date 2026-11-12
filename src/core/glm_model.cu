@@ -3582,15 +3582,15 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
     // the cap is a cap in BOTH paths (the slow path's lifecycle test runs here); with
     // the default STRATA_GLM_SEQS=1 this parks nothing and reserves no bytes
     if (!seq_alloc_arenas(err)) return false;   // STRATA_GLM_SEQS: before the expert pool takes the rest
- // the latent page pool (STRATA_GLM_PAGED, default OFF), constructed after the seq
+ // the latent page pool (MAYA_GLM_PAGED, default OFF), constructed after the seq
     // arenas and before the expert pool sizing so its VRAM is accounted first; with the
     // identity table the pool's slab holds rows at the incumbent addresses (byte-identical).
-    if (const char* pg = getenv("STRATA_GLM_PAGED"); pg != nullptr && pg[0] != '\0' && pg[0] != '0') {
+    if (const char* pg = getenv("MAYA_GLM_PAGED"); pg != nullptr && pg[0] != '\0' && pg[0] != '0') {
         const int32_t bytes_per_token = (g_.kv_lora * (lat_q8_ ? 1 : 2) + 31) / 32 * 32
                                             + (lat_q8_ ? 32 : 0);
         if (!lat_pages_.init(GlmPages::env_page_size(), GlmPages::env_pool_pages(bytes_per_token),
                              bytes_per_token)) {
-            err = std::string("pages: the latent pool init failed (STRATA_GLM_PAGED)");
+            err = std::string("pages: the latent pool init failed (MAYA_GLM_PAGED)");
             return false;
         }
         const int32_t blocks = (int32_t)((max_ctx_ + lat_pages_.page_size() - 1) / lat_pages_.page_size());

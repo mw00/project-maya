@@ -27,12 +27,12 @@
 namespace strata {
 
 int32_t GlmPages::env_page_size() {
-    const char* v = getenv("STRATA_GLM_PAGE_SIZE");
+    const char* v = getenv("MAYA_GLM_PAGE_SIZE");
     return v ? (int32_t)atoi(v) : 256;
 }
 
 int32_t GlmPages::env_pool_pages(int64_t bytes_per_token) {
-    const char* v = getenv("STRATA_GLM_PAGE_POOL_GB");
+    const char* v = getenv("MAYA_GLM_PAGE_POOL_GB");
     int64_t gb = v ? (int64_t)atoll(v) : 1;
     int64_t page_bytes = (int64_t)env_page_size() * bytes_per_token;
     if (page_bytes <= 0) return 1;

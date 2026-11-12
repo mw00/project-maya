@@ -28,13 +28,13 @@ namespace strata::core {
 // buffers on demand (free-list first) and builds the SeqCtx through the UNCHANGED seq_layout();
 // seq_release frees them back (the bytes-outstanding counter returns to 0) and parks the slot.
 // The expert pool sizing subtracts the guaranteed states' floor (seq_bytes_floor_, the
-// STRATA_GLM_SEQ_FLOOR first states; default the full cap = seq_bytes_reserved_): the cap's
+// MAYA_GLM_SEQ_FLOOR first states; default the full cap = seq_bytes_reserved_): the cap's
 // tail is the pressure ladder's to arbitrate (generate.cpp's evict_idle_for_admission).
 // The pinned pipeline buffers (seq_pipe_ready's cudaHostAlloc per sequence)
 // live in ONE cap-sized reusable pool carved per slot.
 
 size_t Glm5Model::seq_arena_bytes() const {
-    // one parked slot's own arena bytes: captured at load from the STRATA_GLM_SEQ_CTX layout
+    // one parked slot's own arena bytes: captured at load from the MAYA_GLM_SEQ_CTX layout
     // (seq_alloc_arenas), the sizing anchor every acquire re-runs
     return seq_state_bytes_;
 }
@@ -215,11 +215,11 @@ bool Glm5Model::seq_live(int s) const {
 // one more sequence fits if a free-list slot exists, its parked context holds the
 // want, and the slot's own bytes (the arena + the snapshot pair, the load-time sizing anchors -
 // every parked slot's are the same size on this part) fit the device's free VRAM on every part
-// of the split.  STRATA_GLM_SEQ_VRAM_FIT forces the VRAM leg (the unit test pins the admission
+// of the split.  MAYA_GLM_SEQ_VRAM_FIT forces the VRAM leg (the unit test pins the admission
 // logic; the driver's real gate is cudaMemGetInfo's answer).
 bool Glm5Model::seq_ready(int64_t want) const {
     if (seq_.empty()) return max_ctx_ >= want;
-    const char* vf = getenv("STRATA_GLM_SEQ_VRAM_FIT");
+    const char* vf = getenv("MAYA_GLM_SEQ_VRAM_FIT");
     const bool vram_fit_forced = vf && std::atof(vf) != 0.0;
     bool visited = false;
     for (const Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
@@ -456,7 +456,7 @@ bool Glm5Model::seq_alloc_arenas(std::string& err) {
     SeqCtx check;
     if (seq_layout(max_ctx_, check) != state_bytes_ || check.dsa_pool != dsa_pool_ || check.kda_conv != kda_conv_ ||
         check.dsa_lat != dsa_lat_ || check.ik_ring != ik_ring_) {
-        err = "glm multi: the state layout does not match load_pack's (this build cannot run STRATA_GLM_SEQS)";
+        err = "glm multi: the state layout does not match load_pack's (this build cannot run MAYA_GLM_SEQS)";
         return false;
     }
     // slot 0 stays the load-time alias (the members hold its arena), the rest park: only their
@@ -495,12 +495,12 @@ bool Glm5Model::seq_alloc_arenas(std::string& err) {
  // the full-cap reservation starves the
     // expert pool while the ladder cannot reach pressure at the production context (the 2-GPU
     // split halves the per-state cost). The pool sizing subtracts the FLOOR instead: the first
- // STRATA_GLM_SEQ_FLOOR states' bytes stay guaranteed (the common case keeps 
+ // MAYA_GLM_SEQ_FLOOR states' bytes stay guaranteed (the common case keeps 
     // promise), and the cap's tail is the ladder's to arbitrate (each parked acquire the device
     // cannot honor evicts live-idle states LRU-first, or the request waits - never a failed
     // bind). Default: the full cap (today's sizing, unchanged). seq_bytes_reserved_ stays the
     // cap's true accounting.
-    const char* fl = getenv("STRATA_GLM_SEQ_FLOOR");
+    const char* fl = getenv("MAYA_GLM_SEQ_FLOOR");
     int f = fl ? std::atoi(fl) : n;
     f = std::max(1, std::min(n, f));
     seq_bytes_floor_ = ((size_t) f - 1) * (one_arena + one_snaps + one_bak) + one_snaps;
@@ -523,7 +523,7 @@ bool Glm5Model::seq_pipe_ready(std::string& err) {
     const Glm5Geometry& g = g_;
     for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
         if (m->seq_.empty()) {
-            err = "glm multi: one sequence state only (STRATA_GLM_SEQS)";
+            err = "glm multi: one sequence state only (MAYA_GLM_SEQS)";
             return false;
         }
         cudaSetDevice(m->dev_);
@@ -658,9 +658,9 @@ bool Glm5Model::multi_boundary(std::string& err) {
 }
 // ---------------------------------------------------------------------------
 //Step 1: the prefix cache (the intake lookup + LRU eviction), gated
-// on STRATA_GLM_PAGED (the pool exists) - the incumbent path is untouched.
+// on MAYA_GLM_PAGED (the pool exists) - the incumbent path is untouched.
 //
-// A block is one TILE of the prompt: up to STRATA_GLM_PAGE_SIZE positions,
+// A block is one TILE of the prompt: up to MAYA_GLM_PAGE_SIZE positions,
 // tiled contiguously from the prompt's position 0 (so a skip is always a
 // whole chain of whole tiles).  The canonical rows live in the pool's slab
 // pages (per part, one page per DSA layer; the identity table keeps the
@@ -1421,7 +1421,7 @@ void Glm5Model::prefix_release() {
 // the ladder's pool-pages rung - every refcount-0 page back under the capture's
 // allocator lock (the same invariant page_alloc's pressure sweep runs under: the lock guards
 // both the refcounts and the capture's page allocations).  The answer is the pages swept; the
-// pool off (STRATA_GLM_PAGED unset or init failed) is a clean 0.
+// pool off (MAYA_GLM_PAGED unset or init failed) is a clean 0.
 int Glm5Model::pages_sweep_idle() {
     if (lat_pages_.n_pages() <= 0) return 0;
     std::lock_guard<std::mutex> lk(g_prefix_mu);
@@ -1930,17 +1930,17 @@ bool Glm5Model::glm_pause_snapshots_selftest(const std::string& pack, int* check
         printf(ok ? "ok: %s\n" : "FAIL: %s\n", name);
         if (!ok) ++*failures;
     };
-    const char* seqs_env = getenv("STRATA_GLM_SEQS");
-    const char* seqctx_env = getenv("STRATA_GLM_SEQ_CTX");
+    const char* seqs_env = getenv("MAYA_GLM_SEQS");
+    const char* seqctx_env = getenv("MAYA_GLM_SEQ_CTX");
     auto restore_envs = [&]() {
-        if (seqs_env) setenv("STRATA_GLM_SEQS", seqs_env, 1); else unsetenv("STRATA_GLM_SEQS");
-        if (seqctx_env) setenv("STRATA_GLM_SEQ_CTX", seqctx_env, 1); else unsetenv("STRATA_GLM_SEQ_CTX");
-        unsetenv("STRATA_GLM_PAGED");
-        unsetenv("STRATA_GLM_PAGE_SIZE");
-        unsetenv("STRATA_GLM_PAGE_POOL_GB");
+        if (seqs_env) setenv("MAYA_GLM_SEQS", seqs_env, 1); else unsetenv("MAYA_GLM_SEQS");
+        if (seqctx_env) setenv("MAYA_GLM_SEQ_CTX", seqctx_env, 1); else unsetenv("MAYA_GLM_SEQ_CTX");
+        unsetenv("MAYA_GLM_PAGED");
+        unsetenv("MAYA_GLM_PAGE_SIZE");
+        unsetenv("MAYA_GLM_PAGE_POOL_GB");
         unsetenv("STRATA_GLM_PAUSE_BLOCKS");
         unsetenv("STRATA_GLM_NO_PREFIX");
-        unsetenv("STRATA_GLM_SEQ_FLOOR");
+        unsetenv("MAYA_GLM_SEQ_FLOOR");
     };
     setenv("STRATA_GLM_SLOW", "1", 1);          // the harness's path (the caller's main set it)
     const std::vector<int32_t> prompt = {11, 13, 17, 19, 23, 29};
@@ -1985,7 +1985,7 @@ bool Glm5Model::glm_pause_snapshots_selftest(const std::string& pack, int* check
     sp.temperature = 0.0f;
 
     // ---- leg A: the reference drive (the pool off) + the registry-off refusal
-    unsetenv("STRATA_GLM_PAGED");
+    unsetenv("MAYA_GLM_PAGED");
     unsetenv("STRATA_GLM_NO_PREFIX");
     int ref_a3 = -1, ref_s4 = -1;
     std::vector<char> ref_bytes;
@@ -2024,12 +2024,12 @@ bool Glm5Model::glm_pause_snapshots_selftest(const std::string& pack, int* check
 
     // ---- leg B: the registry on (the pool + the identity table): capture ->
     // pressure -> park -> resume -> byte-identical continuation + state
-    setenv("STRATA_GLM_SEQS", "2", 1);
-    setenv("STRATA_GLM_SEQ_CTX", "2048", 1);
-    setenv("STRATA_GLM_SEQ_VRAM_FIT", "1", 1);
-    setenv("STRATA_GLM_PAGED", "1", 1);
-    setenv("STRATA_GLM_PAGE_SIZE", "4096", 1);     // one page covers the whole ctx: identity
-    // (STRATA_GLM_PAGE_POOL_GB stays unset: atoll parses whole GBs; the pool
+    setenv("MAYA_GLM_SEQS", "2", 1);
+    setenv("MAYA_GLM_SEQ_CTX", "2048", 1);
+    setenv("MAYA_GLM_SEQ_VRAM_FIT", "1", 1);
+    setenv("MAYA_GLM_PAGED", "1", 1);
+    setenv("MAYA_GLM_PAGE_SIZE", "4096", 1);     // one page covers the whole ctx: identity
+    // (MAYA_GLM_PAGE_POOL_GB stays unset: atoll parses whole GBs; the pool
     //  shrinks by halves beside production, the 4-page floor always fits)
     setenv("STRATA_GLM_PAUSE_BLOCKS", "2", 1);     // the cap the legs below exercise
     bool leg_b_ok = true;
@@ -2162,8 +2162,8 @@ bool Glm5Model::glm_pause_snapshots_selftest(const std::string& pack, int* check
     req("the destructor dropped the entries", g_pause_snaps.empty());
 
     // ---- leg C: the registry off (the pool off): the incumbent path carries
-    unsetenv("STRATA_GLM_PAGED");
-    unsetenv("STRATA_GLM_PAGE_SIZE");
+    unsetenv("MAYA_GLM_PAGED");
+    unsetenv("MAYA_GLM_PAGE_SIZE");
     unsetenv("STRATA_GLM_PAUSE_BLOCKS");
     unsetenv("STRATA_GLM_NO_PREFIX");
     {
@@ -2213,8 +2213,8 @@ bool Glm5Model::glm_pause_snapshots_selftest(const std::string& pack, int* check
     // pending chunk (the capture_part shape) and proves the store's
     // registration lands refs 0 (the store's pin, not a request's hold):
     // the eviction reclaims the tile when the capture needs the pages.
-    setenv("STRATA_GLM_PAGED", "1", 1);
-    setenv("STRATA_GLM_PAGE_SIZE", "4096", 1);
+    setenv("MAYA_GLM_PAGED", "1", 1);
+    setenv("MAYA_GLM_PAGE_SIZE", "4096", 1);
     setenv("STRATA_GLM_PAUSE_BLOCKS", "2", 1);
     {
         Glm5Model d;
@@ -2376,8 +2376,8 @@ bool Glm5Model::glm_pause_snapshots_selftest(const std::string& pack, int* check
     }   // d's destructor: the pause store's entries drop with their pages
 
     restore_envs();
-    req("the envs restored", getenv("STRATA_GLM_PAGED") == nullptr
-        && getenv("STRATA_GLM_PAGE_SIZE") == nullptr && getenv("STRATA_GLM_PAGE_POOL_GB") == nullptr
+    req("the envs restored", getenv("MAYA_GLM_PAGED") == nullptr
+        && getenv("MAYA_GLM_PAGE_SIZE") == nullptr && getenv("MAYA_GLM_PAGE_POOL_GB") == nullptr
         && getenv("STRATA_GLM_PAUSE_BLOCKS") == nullptr && getenv("STRATA_GLM_NO_PREFIX") == nullptr);
     printf("glm_pause_snapshots_selftest: %d checks, %d failures\n", *checks, *failures);
     return *failures == 0;

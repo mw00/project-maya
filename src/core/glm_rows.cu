@@ -229,7 +229,7 @@ bool Glm5Model::rows_bind(const int* seqs, int n, RowSeq* rw, std::string& err) 
             r.dsa_ik = &dsa_ik_;
             r.dsa_ig = &dsa_ig_;
             r.dsa_pool = &dsa_pool_;
- r.lat_table = lat_table_; // NULL when STRATA_GLM_PAGED is off
+ r.lat_table = lat_table_; // NULL when MAYA_GLM_PAGED is off
             r.kv = kv_;
             r.img = image_row(r.p);
             max_ctx = max_ctx_;

@@ -4315,7 +4315,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                 d.lat_table = kv_->map[(size_t) mtp_il_].page_table;
                 d.lat_page = kv_->page;
             }
- d.paged_lat_table = lat_table_; // NULL when STRATA_GLM_PAGED is off
+ d.paged_lat_table = lat_table_; // NULL when MAYA_GLM_PAGED is off
             d.paged_page_rows = lat_pages_.page_size();
             d.paged_max_rows = lat_max_rows();
             d.lat_q8 = lat_q8_;

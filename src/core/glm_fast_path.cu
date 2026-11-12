@@ -6106,7 +6106,7 @@ bool Glm5Model::fast_dsa(int il, int64_t p, std::string& err) {
     d.kv_raw = F->kv_raw;
     d.kv_norm = Ly.kv_a_norm;
     kv_prep_targets(kv_, il, lat, d);
- d.paged_lat_table = lat_table_; // NULL when STRATA_GLM_PAGED is off (incumbent rows)
+ d.paged_lat_table = lat_table_; // NULL when MAYA_GLM_PAGED is off (incumbent rows)
     d.paged_page_rows = lat_pages_.page_size();
     d.paged_max_rows = lat_max_rows();
     d.kv_lora = g.kv_lora;

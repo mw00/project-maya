@@ -1,5 +1,5 @@
 // glm_seq_dynamic_test.cpp --selftest
-// the acquire/release lifecycle. STRATA_GLM_SEQS is a cap, not a reservation: a
+// the acquire/release lifecycle. MAYA_GLM_SEQS is a cap, not a reservation: a
 // sequence's own buffers (the state arena, the snapshot pair, the KDA backup) are allocated on
 // demand by seq_acquire through the UNCHANGED seq_layout(), freed or parked by seq_release, and
 // the pinned hop slots live in one cap-sized reusable pool.  The destructor's per-pointer sweep
@@ -19,7 +19,7 @@
 //
 // The fixture pack (data/glm5-synth-pack, tools/glm_synth_pack.py) packs the 6-layer synthetic
 // GGUF through the REAL packer, so this is the real load_pack path; the model runs on the slow
-// path (STRATA_GLM_SLOW) because the synth pack's small BF16 rows resolve only there - the
+// path (MAYA_GLM_SLOW, renamed from STRATA_GLM_SLOW at v1.1.58) because the synth pack's small BF16 rows resolve only there - the
 // lifecycle methods are shared by both paths (glm_multi.cu).
 #include "strata/core/glm_model.hpp"
 
@@ -51,15 +51,15 @@ int main(int argc, char** argv) {
     }
     const std::string pack = argc > 2 ? argv[2] : "data/glm5-synth-pack";
     std::string err;
-    // the cap comes from STRATA_GLM_SEQS at load; pick a small one the loop can churn, with a
-    // parked-slot context smaller than the first sequence's (the STRATA_GLM_SEQ_CTX form)
-    setenv("STRATA_GLM_SLOW", "1", 1);
-    setenv("STRATA_GLM_SEQS", "4", 1);
-    setenv("STRATA_GLM_SEQ_CTX", "2048", 1);   // the parked slots' own context: the 8320 floor
-                                               // applies (STRATA_GLM_SEQ_CTX=2048 under it)
-    setenv("STRATA_GLM_SEQ_VRAM_FIT", "1", 1); // the VRAM-fit leg is forced (the unit test pins the
+    // the cap comes from MAYA_GLM_SEQS at load; pick a small one the loop can churn, with a
+    // parked-slot context smaller than the first sequence's (the MAYA_GLM_SEQ_CTX form)
+    setenv("MAYA_GLM_SLOW", "1", 1);
+    setenv("MAYA_GLM_SEQS", "4", 1);
+    setenv("MAYA_GLM_SEQ_CTX", "2048", 1);   // the parked slots' own context: the 8320 floor
+                                               // applies (MAYA_GLM_SEQ_CTX=2048 under it)
+    setenv("MAYA_GLM_SEQ_VRAM_FIT", "1", 1); // the VRAM-fit leg is forced (the unit test pins the
                                                // admission logic; the real query is the driver's gate)
-    unsetenv("STRATA_GLM_SEQ_FLOOR");          // the first load pins the default: the floor is the full cap
+    unsetenv("MAYA_GLM_SEQ_FLOOR");          // the first load pins the default: the floor is the full cap
 
     strata::core::Glm5Model model;
     if (!model.load_pack(pack, 4096, err)) {
@@ -72,7 +72,7 @@ int main(int argc, char** argv) {
     require("load parked the cap (bytes outstanding == 0 at load)", model.state_bytes_outstanding() == 0, 0);
     require("the load-time capture: the reservation is anchored", model.seq_bytes_reserved_ > 0, 0);
     require("the load-time capture: the per-slot arena bytes are anchored", model.seq_arena_bytes() > 0, 0);
- // with no STRATA_GLM_SEQ_FLOOR the floor defaults to the full cap (the
+ // with no MAYA_GLM_SEQ_FLOOR the floor defaults to the full cap (the
  // sizing is identical to reservation), so the first load's two agree
     require("the floor defaults to the full cap", model.seq_bytes_floor_ == model.seq_bytes_reserved_, 0);
     require("the floor is anchored", model.seq_bytes_floor_ > 0, 0);
@@ -96,7 +96,7 @@ int main(int argc, char** argv) {
 
  // ---- dynamic slots + eviction (the scheduler's primitives)
     // the admission check at load: a parked slot with room, its bytes fit the device (the
-    // parked ctx is the 8320 floor: STRATA_GLM_SEQ_CTX=2048 under max_ctx=4096 resolves to it)
+    // parked ctx is the 8320 floor: MAYA_GLM_SEQ_CTX=2048 under max_ctx=4096 resolves to it)
     require("a parked slot's own context is known at load", model.seq_max_ctx(1) == 8320, 0);
     require("ready at load: the cap holds one more for a 2048-token want", model.seq_ready(2048), 0);
     require("a want above every context is not ready", !model.seq_ready(8321), 0);
@@ -144,17 +144,17 @@ int main(int argc, char** argv) {
         return true;
     }(), 0);
 
-    // the pressure ladder's first rung: the pool is off here (STRATA_GLM_PAGED unset), so the
+    // the pressure ladder's first rung: the pool is off here (MAYA_GLM_PAGED unset), so the
     // sweep is a clean 0 and must not fail; the pages selftests cover the pool-on sweep
     require("the pool sweep with the pool off returns 0", model.pages_sweep_idle() == 0, 0);
 
  // ---- the state floor (the second load, a separate model)
-    // STRATA_GLM_SEQ_FLOOR=2 of the cap 4: only slots 1-2's bytes stay guaranteed against the
+    // MAYA_GLM_SEQ_FLOOR=2 of the cap 4: only slots 1-2's bytes stay guaranteed against the
     // expert-pool sizing; slots 3's bytes are the ladder's to arbitrate. The first model is
     // destroyed by scope, so a fresh one re-runs the full load path (the env read happens in
     // seq_alloc_arenas, at glm_model.cu's load_pack call site, before the pool sizing).
     {
-        setenv("STRATA_GLM_SEQ_FLOOR", "2", 1);
+        setenv("MAYA_GLM_SEQ_FLOOR", "2", 1);
         strata::core::Glm5Model floored;
         if (!floored.load_pack(pack, 4096, err)) {
             printf("FAIL: glm_seq_dynamic_test: the floored load_pack(%s) failed: %s\\n", pack.c_str(), err.c_str());
@@ -176,8 +176,8 @@ int main(int argc, char** argv) {
         if (s >= 0) floored.seq_release(s);
         require("the floored model released cleanly", floored.state_bytes_outstanding() == 0, 0);
     }
-    unsetenv("STRATA_GLM_SEQ_FLOOR");
-    require("the floor env restored (unset)", getenv("STRATA_GLM_SEQ_FLOOR") == nullptr, 0);
+    unsetenv("MAYA_GLM_SEQ_FLOOR");
+    require("the floor env restored (unset)", getenv("MAYA_GLM_SEQ_FLOOR") == nullptr, 0);
 
  // ---- the PAUSE path's registry-owned snapshots. The legs live in
     // glm_multi.cu's selftest (the byte-identity legs read the state's private
