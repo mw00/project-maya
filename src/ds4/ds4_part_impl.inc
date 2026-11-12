@@ -13,6 +13,7 @@
 // ---- state
 int part_lo = 0, part_hi = 1 << 30;   // the trunk layers this process runs now (a front with a live link: [0, K))
 bool part_srv = false;                // this process is a part server
+bool front_only = false;              // a front that holds only its own layers (MAYA_MIXED_FRONT): no fallback
 std::unique_ptr<part::Conn> pc;       // a front's link to its part (null or closed: none)
 std::string part_host;
 int part_port = 0, part_k = 0;
@@ -293,7 +294,7 @@ void part_lost(const std::string& why) {
         std::fprintf(stderr, "ds4 pool: the link to the part failed (%s) - this PC runs every layer from here\n",
                      why.c_str());
     if (pc != nullptr) pc->close();
-    part_hi = 1 << 30;
+    if (!front_only) part_hi = 1 << 30;
     part_failed = true;
     part_pending = true;
     part_pre.have = false;
@@ -327,6 +328,11 @@ bool part_connect(std::string& err) {
     const int32_t K = r.get<int32_t>();
     if (st != 0 || r.bad || K <= 0 || K >= g.nl) {
         err = "pool: the part refused: " + msg;
+        pc->close();
+        return false;
+    }
+    if (front_only && K != part_hi) {
+        err = "the part starts at layer " + std::to_string(K) + ", this front ends at " + std::to_string(part_hi);
         pc->close();
         return false;
     }
@@ -552,6 +558,10 @@ bool part_restore_check(int64_t limit, bool here, int64_t here_pos) {
 // the conversation's first keep tokens read again through every layer here (after the link failed); logits: the last
 // row's, for a sample
 bool part_recover(int64_t keep, bool logits, std::string& err) {
+    if (front_only) {
+        err = "MAYA_MIXED_FRONT: the link to the part failed (this front holds only its own layers)";
+        return false;
+    }
     std::vector<int> t(toks.begin(), toks.begin() + std::min<int64_t>(keep, (int64_t) toks.size()));
     if (pc != nullptr) pc->close();
     part_hi = 1 << 30;
@@ -678,7 +688,7 @@ bool part_chunk_out(Dev& d, int di, Chunk& c, const Run& run, int k, cudaStream_
     const int64_t p0 = run.p0[(size_t) k];
     const int T = run.T[(size_t) k];
     const bool hand = run.runs(k, part_hi);
-    const int r0 = hand && run.yoco >= 0 && k == run.cut_k ? std::max(0, std::min(run.cut_r, T - 1)) : 0;
+    const int r0 = hand ? std::max(0, std::min(run.r0(k, part_hi), T - 1)) : 0;
     std::vector<uint8_t> h;
     size_t raw = 0;
     {

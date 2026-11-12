@@ -3562,6 +3562,17 @@ struct Model::Impl {
             part_lo = o.part_from;
             part_srv = true;
         }
+        // MAYA_MIXED_FRONT=K (opt-in, with --remote-part): this front keeps only the layers [0, K) - their experts take
+        // its whole VRAM and the part's layers' dense weights stay on disk.  It cannot go on alone: a link that fails
+        // fails the request.
+        if (!part_srv && !o.remote_part.empty())
+            if (const char* v = std::getenv("MAYA_MIXED_FRONT")) {
+                const int k = std::atoi(v);
+                if (k > 0) {
+                    part_hi = k;
+                    front_only = true;
+                }
+            }
         if (!pk.load(o.pack, err)) return false;
         // (AMD: the prompt GEMMs' measured kernels) the pack's lt-picks.txt, or MAYA_DS4_LT_STORE's file - empty: none,
         // each start measures its own and keeps them to itself (a pack that must not change: a run's own store instead)
@@ -5070,8 +5081,13 @@ struct Model::Impl {
             part_port = c == std::string::npos ? 8092 : std::atoi(o.remote_part.c_str() + c + 1);
             if (const char* v = std::getenv("MAYA_POOL_TIMEOUT_MS")) part_timeout_ms = std::max(1000, std::atoi(v));
             std::string e;
-            if (!part_connect(e))
+            if (!part_connect(e)) {
+                if (front_only) {
+                    err = "MAYA_MIXED_FRONT: " + e;
+                    return false;
+                }
                 std::fprintf(stderr, "ds4 pool: %s - every layer runs here\n", e.c_str());
+            }
         }
         return true;
     }
@@ -6805,7 +6821,7 @@ struct Model::Impl {
           for (int mi = 0; mi < l0.nm; ++mi) {
             Layer& l = member(l0, mi);
             if (l.dev != di) continue;
-            if (part_srv && away(l.il) && part_skip_dense()) {   // (a part server: the front's layers' weights stay on
+            if ((part_srv || front_only) && away(l.il) && part_skip_dense()) {   // (a part server: the front's layers' weights stay on
                 if (!layer_state(d, l, err, acct)) return false;    //  disk; their state buffers - every loop over the
                 continue;                                           //  layers (reset, undo, checkpoints) touches them)
             }
