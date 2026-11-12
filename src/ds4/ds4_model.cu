@@ -730,6 +730,7 @@ struct Chunk {
     bool pc_ev_set = false;
     long long pc_experts = 0, pc_rows = 0, pc_layers = 0;
     double pc_ms = 0.0, pc_wait_ms = 0.0;
+    double pc_link = 0.0;   // (DS4_PREFILL_CPU: this device's host-to-device link, bytes a second; 0: not measured)
     // the CPU lane's experts streamed in: ring_n VRAM slots of ring_stride bytes in kParts parts, a batch a part,
     // kParts batches in flight on the copy stream (filled / freed: each part's last copy, its last use)
     static constexpr int kParts = 4;
@@ -5516,6 +5517,20 @@ struct Model::Impl {
                     c.ring_n = std::max(Chunk::kParts, (int) ((mb << 20) / stride) / Chunk::kParts * Chunk::kParts);
                 }
                 if (!dalloc(d, c.ring, (size_t) c.ring_n * stride, err)) return false;
+                if (pcpu_cfg().on && !pcpu_cfg().exp_set) {   // (DS4_PREFILL_CPU: a streamed expert's time by this link)
+                    c.pc_link = link_h2d(d);
+                    double lo = 0, hi = 0;
+                    for (const Layer& l : L)
+                        if (l.nm == 1 && !l.mtp && l.dev == (int) di) {
+                            const double ms = pcpu_exp_ms(c, l);
+                            lo = lo > 0 ? std::min(lo, ms) : ms;
+                            hi = std::max(hi, ms);
+                        }
+                    if (c.pc_link > 0 && hi > 0)
+                        std::fprintf(stderr, "ds4: CUDA%d DS4_PREFILL_CPU: a streamed expert %.2f-%.2f ms at its %.1f GB/s "
+                                             "link (DS4_PREFILL_CPU_EXPERT_MS sets one for every GPU)\n",
+                                     d.id, lo, hi, c.pc_link / 1e9);
+                }
             }
             const size_t down_b = flow_down_bytes((int) di);   // (the flow's down scratch, where it takes one)
             if (down_b > 0 && !dalloc(d, c.down, down_b, err)) return false;
@@ -6612,7 +6627,7 @@ struct Model::Impl {
     // streams nearly every CPU-lane expert it routes to, most of them for one to three rows (2x RTX 3090 on PCIe 3,
     // Maya-S: 600 new tokens 10 s, 7,700 experts / 87 GB streamed, 1,500 of them for one row). Per layer the experts
     // not read early (flow_spec) are taken fewest rows first while the lane's estimated time stays under the stream's
-    // for the rest (DS4_PREFILL_CPU_ROW_MS a row, DS4_PREFILL_CPU_EXPERT_MS a streamed expert); their virtual slots
+    // for the rest (DS4_PREFILL_CPU_ROW_MS a row, pcpu_exp_ms a streamed expert on that device); their virtual slots
     // move behind the streamed ones and the chunk is sorted again, so the stream sees only its own and the CPU's rows
     // are one range, combined after the layer's streamed and VRAM experts - the CPU's sums of those experts, not the
     // GPU's, so the last bits can move as with the window path. Two Xeon E5-2697 v2 (AVX, no AVX2) + 2x RTX 3090 on
@@ -6624,7 +6639,8 @@ struct Model::Impl {
         bool on = false;
         int max_t = 4096;
         double row_ms = 0.49;
-        double exp_ms = 0.9;   // (measured best there through staging; 1.2 with DS4_FLOW_COPY_DMA=1)
+        double exp_ms = 0.9;   // (where a device's link was not measured: the best there through the staging)
+        bool exp_set = false;  // (DS4_PREFILL_CPU_EXPERT_MS given: that for every device, not its link's)
     };
     static const PcpuCfg& pcpu_cfg() {
         static const PcpuCfg c = [] {
@@ -6633,10 +6649,23 @@ struct Model::Impl {
             p.on = v != nullptr && std::atoi(v) != 0;
             if (const char* m = ds4_env("DS4_PREFILL_CPU_MAX_T")) p.max_t = std::max(1, std::atoi(m));
             if (const char* r = ds4_env("DS4_PREFILL_CPU_ROW_MS")) p.row_ms = std::max(1e-4, std::atof(r));
-            if (const char* e = ds4_env("DS4_PREFILL_CPU_EXPERT_MS")) p.exp_ms = std::max(1e-4, std::atof(e));
+            if (const char* e = ds4_env("DS4_PREFILL_CPU_EXPERT_MS")) {
+                p.exp_ms = std::max(1e-4, std::atof(e));
+                p.exp_set = true;
+            }
             return p;
         }();
         return c;
+    }
+    // a streamed expert's time on this device, ms: the layer's expert bytes over the device's link (link_h2d, measured
+    // at the load) in steps of 0.05 ms, so a restart's slightly different measurement plans the same shares unless a
+    // layer's time sits at a step's edge; DS4_PREFILL_CPU_EXPERT_MS for every device where it is set, its default where
+    // the link was not measured (one value for every device gave the slowest link the smallest CPU share on a layer
+    // split of a 5090 on PCIe 5 x8 and two 3090s on PCIe 4 x4 / x8, #959)
+    static double pcpu_exp_ms(const Chunk& c, const Layer& l) {
+        const PcpuCfg& cf = pcpu_cfg();
+        if (cf.exp_set || c.pc_link <= 0) return cf.exp_ms;
+        return std::max(0.05, std::round((double) unit(l) / c.pc_link * 1e3 / 0.05) * 0.05);
     }
     // (the lane's scratch, c_xh / c_yd / the pools: one caller at a time - the devices run chunks side by side, and a
     // prompt's CPU share holds it from its first call to its last outputs read; cpu_experts takes it too)
@@ -6674,11 +6703,12 @@ struct Model::Impl {
         }
         std::sort(cand.begin(), cand.end());   // (fewest rows first, then by expert: the same choice every run)
         const int n_items = ns + (int) cand.size();
+        const double exp_ms = pcpu_exp_ms(c, L0);
         double rows = 0;
         int j = 0;
         for (; j < (int) cand.size(); ++j) {
             const double cpu_t = (rows + cand[(size_t) j].first) * cf.row_ms;
-            const double pcie_t = (double) (n_items - (j + 1)) * cf.exp_ms;
+            const double pcie_t = (double) (n_items - (j + 1)) * exp_ms;
             if (cpu_t > pcie_t) break;
             rows += cand[(size_t) j].first;
         }
