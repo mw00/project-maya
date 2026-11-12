@@ -4,8 +4,8 @@
 // host keeps a free list and per-page refcounts; a logical->physical
 // table (plus its physical->logical mirror) lives on the device for the
 // paged gather of. evict_lru frees refcount-0 pages only, so a
-// pinned page survives pressure. Page size comes from STRATA_GLM_PAGE_SIZE
-// (default 256), pool size from STRATA_GLM_PAGE_POOL_GB.
+// pinned page survives pressure. Page size comes from MAYA_GLM_PAGE_SIZE
+// (default 256), pool size from MAYA_GLM_PAGE_POOL_GB.
 //
 // Remediation: init() tries the requested pool and shrinks it by
 // halves (floor 4 pages, or the request itself when smaller) until the slab
@@ -66,7 +66,7 @@ public:
     int32_t n_pages() const { return n_pages_; }
     int32_t page_size() const { return page_size_; }
 
-    // STRATA_GLM_PAGE_SIZE (default 256) and STRATA_GLM_PAGE_POOL_GB.
+    // MAYA_GLM_PAGE_SIZE (default 256) and MAYA_GLM_PAGE_POOL_GB.
     static int32_t env_page_size();
     static int32_t env_pool_pages(int64_t bytes_per_token);
 

@@ -99,7 +99,7 @@ struct Glm5Geometry : GlmArchExt<Glm5Geometry> {   // glm-dsa: arch + glm-dsa fi
 
 class Glm5Model {
 public:
- // dynamic acquire/release - STRATA_GLM_SEQS is a CAP, not a reservation. seq_
+ // dynamic acquire/release - MAYA_GLM_SEQS is a CAP, not a reservation. seq_
     // stays pre-sized to the cap at load (slot 0 is the load-time alias, the others park with
     // null pointers until seq_acquire), so the destructor's per-pointer sweep needs no edit for
     // the state/snapshot/KDA pointers; the pipeline buffers moved into ONE reusable pool
@@ -129,7 +129,7 @@ public:
     size_t seq_bytes_outstanding_ = 0;    // live per-sequence device bytes
     // the load-time captures (seq_alloc_arenas): the sizing anchors every later acquire re-runs
     size_t seq_state_bytes_ = 0;          // one sequence's arena bytes (slot 0's own layout)
-    int64_t seq_ctx_ = 0;                 // the parked slots' ctx (STRATA_GLM_SEQ_CTX at load)
+    int64_t seq_ctx_ = 0;                 // the parked slots' ctx (MAYA_GLM_SEQ_CTX at load)
     size_t seq_snap_n_rec_bytes_ = 0;     // one sequence's snapshot bytes (the recurrent run)
     size_t seq_snap_pool_bytes_ = 0;      // ... and its open key pool
     void* seq_hop_pool_ = nullptr;        // one cap-sized reusable pinned pipeline-buffer pool
@@ -381,7 +381,7 @@ private:
     bool state_carve(int64_t ctx, GlmStateMode mode, int ik_ring, int mtp_il, std::string& err,
                      int64_t lat_rows = -1);   // glm-dsa B4.1
 
- // the latent page pool (STRATA_GLM_PAGED, default OFF) and the bound sequence's
+ // the latent page pool (MAYA_GLM_PAGED, default OFF) and the bound sequence's
     // page table: NULL = incumbent absolute rows (byte-identical), else the pool's device
     // identity table for now; per-sequence non-identity tables land with the kernel work.
     GlmPages lat_pages_;
@@ -889,7 +889,7 @@ public:
     // The pipelined decode issues a token of one sequence through every part without waiting, so with n sequences in
     // flight each part works on a different one (a layer split's cards no longer wait for each other).
     struct SeqCtx {
- int32_t* lat_table = nullptr; // this sequence's latent page table (NULL = incumbent absolute rows, STRATA_GLM_PAGED off)
+ int32_t* lat_table = nullptr; // this sequence's latent page table (NULL = incumbent absolute rows, MAYA_GLM_PAGED off)
         float* state = nullptr;
         int64_t pos = 0, snap_pos = -1;
         // its own context (MAYA_GLM_SEQ_CTX: the extra sequences can be smaller than the first) and so its own
@@ -926,7 +926,7 @@ public:
     int seq_bound() const { return cur_seq_; }
     bool seq_bind(int s);                                  // this part (false: the arena did not fit)
     bool seq_bind_all(int s);                              // every part of the split
-    bool seq_alloc_arenas(std::string& err);               // load: the extra arenas (STRATA_GLM_SEQS), before the pool
+    bool seq_alloc_arenas(std::string& err);               // load: the extra arenas (MAYA_GLM_SEQS), before the pool
     uint64_t seq_layout(int64_t ctx, SeqCtx& c) const;     // load_pack's arena layout for a context of ctx tokens
  // the lazy lifecycle's helpers (the load-time anchors + the pooled pipeline buffers)
     size_t seq_arena_bytes() const;                        // the per-sequence arena bytes (the load-time capture)
@@ -1086,7 +1086,7 @@ public:
  // [0, pos) through the bound table) packs D2D into refcounted pool pages (the
     // carriage), so the pages survive every pressure sweep and the conversation resumes from
     // them even after the ladder parked the slot (the incumbent pair dies at the park).  The
-    // registry is off = the pool off or STRATA_GLM_NO_PREFIX: the incumbent snap_/snap_pool_
+    // registry is off = the pool off or MAYA_GLM_NO_PREFIX: the incumbent snap_/snap_pool_
  // pair is the only path (unchanged). The capture's room: the packer's
     // free+idle pages first; the tile store's refcount-0 entries evict LRU-first to cover the
     // shortfall; a still-short pool refuses with numbers.  pause_resume answers the restored

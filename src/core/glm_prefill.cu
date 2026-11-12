@@ -4779,7 +4779,7 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
     int Tc = pf_->T_bound;
     for (Glm5Model* m = split_next_.get(); m != nullptr; m = m->split_next_.get()) Tc = std::min(Tc, m->pf_->T_bound);
  // the align semantics (the LMCache contract), OPT-IN. When the
-    // operator sets STRATA_GLM_PREFIX_PAGE_ALIGN=1 and the prefix store is
+    // operator sets MAYA_GLM_PREFIX_PAGE_ALIGN=1 and the prefix store is
     // live, a chunk advances exactly one page, so every chunk end is a block
     // boundary and its stateful tile carries the 34 KDA layers' state snapshot
     // at the boundary - the finest partial-prefix reuse at every page edge.
@@ -4789,9 +4789,9 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
     // the natural chunk end (a partial page, which prefix_capture_part handles)
     // and the prompt keeps its full chunk size. The staging stays carved for
     // the unclamped chunk (the kernels read only the chunk's rows); the
-    // reference window (STRATA_GLM_NO_PREFIX) always keeps the unclamped chunk.
-    if (getenv("STRATA_GLM_NO_PREFIX") == nullptr &&
-        getenv("STRATA_GLM_PREFIX_PAGE_ALIGN") != nullptr && std::atoi(getenv("STRATA_GLM_PREFIX_PAGE_ALIGN")) != 0) {
+    // reference window (MAYA_GLM_NO_PREFIX) always keeps the unclamped chunk.
+    if (getenv("MAYA_GLM_NO_PREFIX") == nullptr &&
+        getenv("MAYA_GLM_PREFIX_PAGE_ALIGN") != nullptr && std::atoi(getenv("MAYA_GLM_PREFIX_PAGE_ALIGN")) != 0) {
         int32_t pg_rows = 0;
         for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get())
             if (m->lat_pages_.n_pages() > 0)

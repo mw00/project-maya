@@ -18,7 +18,7 @@
 //
 // Builds: every native-experts build has these functions (src/kernels/cpu/glm_lane_row4.cpp, compiled for any CPU of
 // its architecture: on x86-64 the kernels, glm_lane_row4_avx2.cpp, run only after its CPUID check for AVX2 + FMA +
-// F16C).  The kernels are x86-64 only (the CMake option STRATA_GLM_LANE_ROW4_KERNELS, ON by default).  Without them -
+// F16C).  The kernels are x86-64 only (the CMake option MAYA_GLM_LANE_ROW4_KERNELS, ON by default).  Without them -
 // aarch64 (DGX Spark / Grace), ppc64le (IBM AC922), or the option OFF - row4_supported() is false for every type,
 // row4_iq1s_form() is -1, lane_row4_on() is false whatever MAYA_GLM_LANE_ROW4 says, lane_row4_types() is 0 and both
 // hooks return false (row4_dot / row4_rows, which require row4_supported(), abort).

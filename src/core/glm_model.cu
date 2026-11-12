@@ -3580,8 +3580,8 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
     { cudaError_t e_ = cudaMalloc(&state_, state_bytes_); if (e_ != cudaSuccess) { err = std::string("pack: ") + cudaGetErrorString(e_); return false; } }
     if (kv_cells > 0 && !kv_stream_setup(kv_cells, err)) return false;
     // the cap is a cap in BOTH paths (the slow path's lifecycle test runs here); with
-    // the default STRATA_GLM_SEQS=1 this parks nothing and reserves no bytes
-    if (!seq_alloc_arenas(err)) return false;   // STRATA_GLM_SEQS: before the expert pool takes the rest
+    // the default MAYA_GLM_SEQS=1 this parks nothing and reserves no bytes
+    if (!seq_alloc_arenas(err)) return false;   // MAYA_GLM_SEQS: before the expert pool takes the rest
  // the latent page pool (MAYA_GLM_PAGED, default OFF), constructed after the seq
     // arenas and before the expert pool sizing so its VRAM is accounted first; with the
     // identity table the pool's slab holds rows at the incumbent addresses (byte-identical).
@@ -3711,7 +3711,7 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
         // tail dynamically (glm_multi.cu's seq_alloc_arenas)
         const size_t pool_avail = free_b > reserve + seq_bytes_floor_
                                       ? free_b - reserve - seq_bytes_floor_ : 0;
-        // STRATA_GLM_POOL_SLOTS0=n caps the pool at n largest-class-equivalent slots (debug/tuning)
+        // MAYA_GLM_POOL_SLOTS0=n caps the pool at n largest-class-equivalent slots (debug/tuning)
         size_t pool_bytes_cap = pool_avail;
         if (const char* ps = getenv("MAYA_GLM_POOL_SLOTS0"))
             pool_bytes_cap = std::min<size_t>(pool_avail, (size_t) std::atoi(ps) * slot_bytes_);

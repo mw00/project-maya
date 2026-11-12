@@ -2,8 +2,8 @@
 // A block ID is a 128-bit truncation of a SHA-256 over the block's token IDs
 // followed by every DSA layer's page bytes in layer order, so two prompts
 // share a block only when the tokens AND all 11 layers' bytes match.
-#ifndef STRATA_GLM_PREFIX_HPP
-#define STRATA_GLM_PREFIX_HPP
+#ifndef MAYA_GLM_PREFIX_HPP
+#define MAYA_GLM_PREFIX_HPP
 
 #include <cstdint>
 #include <cstddef>

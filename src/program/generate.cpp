@@ -1974,7 +1974,7 @@ static int glm_pack_generate(const Options& o) {
         // snapshot/slot reuse (the snapshot's state is fresher than any tile's); the skip
         // rides the prefill's start exactly like the snapshot's reuse does, and a failed
         // apply falls back to the incumbent path (the refs released, the state re-zeroed)
-        if (reuse == 0 && model.fast() && getenv("STRATA_GLM_NO_PREFIX") == nullptr) {
+        if (reuse == 0 && model.fast() && getenv("MAYA_GLM_NO_PREFIX") == nullptr) {
             const size_t skip = model.prefix_intake(prompt);
             std::fprintf(stderr, "glm prefix: intake %zu of %zu prompt tokens\n",
                          skip, prompt.size());   // Step 2's window diagnostic: the miss prints too
@@ -2801,18 +2801,18 @@ static int glm_pack_generate(const Options& o) {
     std::map<int, bool> wait_announced;
     // the room a context must leave for the answer (at most what the request asked for): a long prompt goes to a
     // context with this much left after it, and its max tokens are cut to that context
-    static const int64_t multi_room = (int64_t) env_num("STRATA_GLM_MULTI_ROOM", 16384);
+    static const int64_t multi_room = (int64_t) env_num("MAYA_GLM_MULTI_ROOM", 16384);
     // the wait gate's terminal path: a request that cannot be admitted within this budget stops
     // retrying and is rejected (the operator sees the ERR on the request's own channel)
-    static const double multi_wait_s = env_num("STRATA_GLM_MULTI_WAIT", 600);
-    static const int multi_boundary_every = (int) env_num("STRATA_GLM_MULTI_BOUNDARY", 32);
-    static const bool multi_spec = env_num("STRATA_GLM_MULTI_SPEC", 1) != 0;
+    static const double multi_wait_s = env_num("MAYA_GLM_MULTI_WAIT", 600);
+    static const int multi_boundary_every = (int) env_num("MAYA_GLM_MULTI_BOUNDARY", 32);
+    static const bool multi_spec = env_num("MAYA_GLM_MULTI_SPEC", 1) != 0;
     // the drafter under concurrency, default ON: the stint scheme's outputs were
     // byte-identical to the serial MTP path under concurrency, +12.5% aggregate vs the incumbent
     // pipelined reference in the same window.  On: a bounded speculative stint per scheduler step,
-    // round-robin over the running requests, STRATA_GLM_SPEC_STINT tokens each (8)
-    static const bool multi_conc = env_num("STRATA_GLM_MTP_CONC", 1) != 0;
-    static const int multi_spec_stint = (int) env_num("STRATA_GLM_SPEC_STINT", 8);
+    // round-robin over the running requests, MAYA_GLM_SPEC_STINT tokens each (8)
+    static const bool multi_conc = env_num("MAYA_GLM_MTP_CONC", 1) != 0;
+    static const int multi_spec_stint = (int) env_num("MAYA_GLM_SPEC_STINT", 8);
     long long multi_spec_rot = 0;
     static const int split_rows = strata::core::Glm5Model::split_rows_setting();
     // MAYA_GLM_EVEN_GROUPS=1: the split's groups cut evenly from all the running requests, two at least, instead of
@@ -3532,9 +3532,9 @@ static int glm_pack_generate(const Options& o) {
             std::none_of(gens.begin(), gens.end(), [](const std::unique_ptr<Gen>& p) { return p->ready && !p->done; }))
             flush_pauses();
         Gen* only = gens.size() == 1 ? gens[0].get() : nullptr;
- // (STRATA_GLM_MTP_CONC=1): the drafter under concurrency. One scheduler step = one
+ // (MAYA_GLM_MTP_CONC=1): the drafter under concurrency. One scheduler step = one
         // request's turn: its pending token through the token path (the incumbent solo branch's shape),
-        // then a bounded decode_spec stint of STRATA_GLM_SPEC_STINT tokens (8).  The turn moves past the
+        // then a bounded decode_spec stint of MAYA_GLM_SPEC_STINT tokens (8).  The turn moves past the
         // stinted request, and the stint's last token becomes that request's next pending.  The
         // gate-off path below is unchanged.
         if (multi_conc && multi_spec && !step_no_spec && model.spec_ready() && gens.size() > 1) {
@@ -4016,8 +4016,8 @@ static int glm_pack_generate(const Options& o) {
     if (const char* mb = getenv("MAYA_GLM_MULTI_BENCH")) {
         int n = 2, L = 512, G = 256, K = 32, same_prompt = 0;
         int prefix_shared = 0, prefill_tok[256] = {0};   // probe state: how many leading tokens are shared (0 = probe off) and the per-sequence prefill token meter P3's prefix-hit gate reads
-        const char *mbx = std::getenv("STRATA_GLM_MULTI_BENCH"), *px = std::getenv("STRATA_GLM_MULTI_BENCH_PREFIX");
-        if (mbx && px) {   // probe default OFF: only when both STRATA_GLM_MULTI_BENCH and STRATA_GLM_MULTI_BENCH_PREFIX are set
+        const char *mbx = std::getenv("MAYA_GLM_MULTI_BENCH"), *px = std::getenv("MAYA_GLM_MULTI_BENCH_PREFIX");
+        if (mbx && px) {   // probe default OFF: only when both MAYA_GLM_MULTI_BENCH and MAYA_GLM_MULTI_BENCH_PREFIX are set
             int px_n = std::atoi(px);
             prefix_shared = px_n > 0 ? px_n : 0;
         }

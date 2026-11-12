@@ -110,7 +110,7 @@ bool Glm5Model::seq_alloc_slot(int s) {
     // A parked sequence does not inherit slot 0's pre-pool speculative backup.
     // Allocate it with the rest of this slot, before admission can run a draft:
     // allocating on the first spec step can fail after the request is already live.
-    const size_t bak_bytes = getenv("STRATA_GLM_NO_MTP") == nullptr && getenv("STRATA_GLM_NO_SPEC") == nullptr
+    const size_t bak_bytes = getenv("MAYA_GLM_NO_MTP") == nullptr && getenv("MAYA_GLM_NO_SPEC") == nullptr
                                  ? spec_kda_bytes() : 0;
     if (bak_bytes > 0 && cudaMalloc(&c.kda_bak, bak_bytes) != cudaSuccess) {
         cudaGetLastError();
@@ -224,7 +224,7 @@ bool Glm5Model::seq_ready(int64_t want) const {
     bool visited = false;
     for (const Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
         if (m->seq_.empty()) continue;
-        const size_t bak_bytes = getenv("STRATA_GLM_NO_MTP") == nullptr && getenv("STRATA_GLM_NO_SPEC") == nullptr
+        const size_t bak_bytes = getenv("MAYA_GLM_NO_MTP") == nullptr && getenv("MAYA_GLM_NO_SPEC") == nullptr
                                      ? m->spec_kda_bytes() : 0;
         const size_t need = m->seq_arena_bytes() + m->seq_snap_bytes(m->seq_[0]) + bak_bytes;
         bool slot = false;
@@ -489,7 +489,7 @@ bool Glm5Model::seq_alloc_arenas(std::string& err) {
     // reservation carries it - the pool sizing must not spend the bytes slot 0 will need
     // Slot 0's backup was allocated before the pool; only parked slots need
     // their speculative backups charged against the sequence reservation.
-    const size_t one_bak = getenv("STRATA_GLM_NO_MTP") == nullptr && getenv("STRATA_GLM_NO_SPEC") == nullptr
+    const size_t one_bak = getenv("MAYA_GLM_NO_MTP") == nullptr && getenv("MAYA_GLM_NO_SPEC") == nullptr
                                ? spec_kda_bytes() : 0;
     seq_bytes_reserved_ = ((size_t) n - 1) * (one_arena + one_snaps + one_bak) + one_snaps;
  // the full-cap reservation starves the
@@ -731,7 +731,7 @@ std::mutex g_prefix_mu;
 
 // the store's capacity (the least-recently-hit refcount-0 tiles get dropped).
 int prefix_block_cap() {
-    const char* v = getenv("STRATA_GLM_PREFIX_BLOCKS");
+    const char* v = getenv("MAYA_GLM_PREFIX_BLOCKS");
     return v ? std::max(4, std::atoi(v)) : 64;
 }
 
@@ -847,7 +847,7 @@ static bool snap_unpack(const GlmPages& pool, const std::vector<int32_t>& pages,
 // slot's park (the incumbent snap_/snap_pool_ pair dies at the park).  The
 // restore walks the entries for the longest span that is a strict prefix of the
 // resuming prompt, unpacks into the freshly-acquired arena, consumes the entry.
-// The registry is off = the pool off or STRATA_GLM_NO_PREFIX: the incumbent pair
+// The registry is off = the pool off or MAYA_GLM_NO_PREFIX: the incumbent pair
 // is the only path (unchanged).
 struct PauseSnap {
     std::vector<int32_t> span;                 // the capture's token span (the restore's match)
@@ -863,7 +863,7 @@ std::vector<PauseSnap> g_pause_snaps;
 // the entries' cap (a conversation that never resumes must not hold pages
 // forever): the least-recently-used entry drops at capture time over this.
 int pause_snap_cap() {
-    const char* v = getenv("STRATA_GLM_PAUSE_BLOCKS");
+    const char* v = getenv("MAYA_GLM_PAUSE_BLOCKS");
     return v ? std::max(2, std::atoi(v)) : 8;
 }
 
@@ -919,7 +919,7 @@ int64_t Glm5Model::prefix_row_bytes(const Glm5Model* m) {
 void Glm5Model::prefix_capture_part(int64_t boundary, int64_t chunk_start, int64_t pos_start) {
     if (lat_pages_.n_pages() <= 0) return;   // the pool is off: the incumbent path
     if (fast_ == nullptr) return;            // the reference path: the incumbent prefill
-    if (getenv("STRATA_GLM_NO_PREFIX") != nullptr) return;   // the reference window: the cache is off
+    if (getenv("MAYA_GLM_NO_PREFIX") != nullptr) return;   // the reference window: the cache is off
     const Glm5Geometry& g = g_;
     const int32_t page_rows = lat_pages_.page_size();
     const int64_t row_bytes = prefix_row_bytes(this);
@@ -1053,7 +1053,7 @@ void Glm5Model::prefix_capture_part(int64_t boundary, int64_t chunk_start, int64
 void Glm5Model::prefix_finalize(const std::vector<int32_t>& tokens, int64_t pos_start,
                                 int64_t prompt_end, bool final) {
     (void) prompt_end;
-    if (getenv("STRATA_GLM_NO_PREFIX") != nullptr) return;   // the reference window: nothing captures, nothing stores
+    if (getenv("MAYA_GLM_NO_PREFIX") != nullptr) return;   // the reference window: nothing captures, nothing stores
     // the chain's parts, in split order
     std::vector<Glm5Model*> chain;
     for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) chain.push_back(m);
@@ -1440,7 +1440,7 @@ int Glm5Model::pages_sweep_idle() {
 // every pressure sweep and the slot's park; RESUME unpacks the capture into the
 // fresh arena when the new prompt extends the capture's token span.  The
 // incumbent snap_/snap_pool_ pair stays the registry-off fallback (the pool off
-// or STRATA_GLM_NO_PREFIX: the capture is refused, the pair carries).  Under
+// or MAYA_GLM_NO_PREFIX: the capture is refused, the pair carries).  Under
 // pressure the tile store's unheld (registry refcount 0) LRU tiles evict first
 //; a still-short pool refuses cleanly, with numbers.
 //
@@ -1521,7 +1521,7 @@ int64_t Glm5Model::pause_evict_tiles_for(const std::vector<Glm5Model*>& chain,
 bool Glm5Model::pause_capture(const int32_t* tokens, int n) {
     // the registry off: the pool off or the reference window (the incumbent
     // snap_/snap_pool_ pair carries; the capture is refused, never fails PAUSE)
-    if (lat_pages_.n_pages() <= 0 || getenv("STRATA_GLM_NO_PREFIX") != nullptr) return false;
+    if (lat_pages_.n_pages() <= 0 || getenv("MAYA_GLM_NO_PREFIX") != nullptr) return false;
     std::vector<Glm5Model*> chain;
     for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) chain.push_back(m);
     const int64_t pos = pos_;
@@ -1712,7 +1712,7 @@ bool Glm5Model::pause_capture(const int32_t* tokens, int n) {
 
 int64_t Glm5Model::pause_resume(const std::vector<int32_t>& prompt, std::vector<int32_t>& span_out) {
     span_out.clear();
-    if (lat_pages_.n_pages() <= 0 || getenv("STRATA_GLM_NO_PREFIX") != nullptr) return 0;
+    if (lat_pages_.n_pages() <= 0 || getenv("MAYA_GLM_NO_PREFIX") != nullptr) return 0;
     std::vector<Glm5Model*> chain;
     for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) chain.push_back(m);
     std::lock_guard<std::mutex> lk(g_prefix_mu);
@@ -1910,7 +1910,7 @@ std::vector<char> Glm5Model::pause_state_bytes(const Glm5Model& m) {
         for (size_t i = 0; i < ls.size(); ++i)
             take(p->state_ + p->dsa_pool_[(size_t) ls[i]], pools * g.idx_key * sizeof(float));
         // 4. the latent rows [0, pos): the identity table's absolute rows (the
-        //    slow path's FP32 rows; the harness runs STRATA_GLM_SLOW)
+        //    slow path's FP32 rows; the harness runs MAYA_GLM_SLOW)
         for (size_t i = 0; i < ls.size(); ++i)
             for (int64_t t = 0; t < pos; ++t)
                 take((const uint8_t*)(p->state_ + p->dsa_lat_[(size_t) ls[i]])
@@ -1938,11 +1938,11 @@ bool Glm5Model::glm_pause_snapshots_selftest(const std::string& pack, int* check
         unsetenv("MAYA_GLM_PAGED");
         unsetenv("MAYA_GLM_PAGE_SIZE");
         unsetenv("MAYA_GLM_PAGE_POOL_GB");
-        unsetenv("STRATA_GLM_PAUSE_BLOCKS");
-        unsetenv("STRATA_GLM_NO_PREFIX");
+        unsetenv("MAYA_GLM_PAUSE_BLOCKS");
+        unsetenv("MAYA_GLM_NO_PREFIX");
         unsetenv("MAYA_GLM_SEQ_FLOOR");
     };
-    setenv("STRATA_GLM_SLOW", "1", 1);          // the harness's path (the caller's main set it)
+    setenv("MAYA_GLM_SLOW", "1", 1);          // the harness's path (the caller's main set it)
     const std::vector<int32_t> prompt = {11, 13, 17, 19, 23, 29};
     const std::string pack_path = pack.empty() ? "data/glm5-synth-pack" : pack;
     std::string err;
@@ -1986,7 +1986,7 @@ bool Glm5Model::glm_pause_snapshots_selftest(const std::string& pack, int* check
 
     // ---- leg A: the reference drive (the pool off) + the registry-off refusal
     unsetenv("MAYA_GLM_PAGED");
-    unsetenv("STRATA_GLM_NO_PREFIX");
+    unsetenv("MAYA_GLM_NO_PREFIX");
     int ref_a3 = -1, ref_s4 = -1;
     std::vector<char> ref_bytes;
     {
@@ -2031,7 +2031,7 @@ bool Glm5Model::glm_pause_snapshots_selftest(const std::string& pack, int* check
     setenv("MAYA_GLM_PAGE_SIZE", "4096", 1);     // one page covers the whole ctx: identity
     // (MAYA_GLM_PAGE_POOL_GB stays unset: atoll parses whole GBs; the pool
     //  shrinks by halves beside production, the 4-page floor always fits)
-    setenv("STRATA_GLM_PAUSE_BLOCKS", "2", 1);     // the cap the legs below exercise
+    setenv("MAYA_GLM_PAUSE_BLOCKS", "2", 1);     // the cap the legs below exercise
     bool leg_b_ok = true;
     {
         Glm5Model b;
@@ -2054,10 +2054,10 @@ bool Glm5Model::glm_pause_snapshots_selftest(const std::string& pack, int* check
         }
         req("leg B drove to the pause position", true);
         // the reference window env: the capture refuses, the incumbent carries
-        setenv("STRATA_GLM_NO_PREFIX", "1", 1);
-        req("the capture refuses under STRATA_GLM_NO_PREFIX",
+        setenv("MAYA_GLM_NO_PREFIX", "1", 1);
+        req("the capture refuses under MAYA_GLM_NO_PREFIX",
             !b.pause_capture(span_b.data(), (int) span_b.size()));
-        unsetenv("STRATA_GLM_NO_PREFIX");
+        unsetenv("MAYA_GLM_NO_PREFIX");
         // the capture lands
         const bool captured = b.pause_capture(span_b.data(), (int) span_b.size());
         req("the capture captured the paused state", captured);
@@ -2164,8 +2164,8 @@ bool Glm5Model::glm_pause_snapshots_selftest(const std::string& pack, int* check
     // ---- leg C: the registry off (the pool off): the incumbent path carries
     unsetenv("MAYA_GLM_PAGED");
     unsetenv("MAYA_GLM_PAGE_SIZE");
-    unsetenv("STRATA_GLM_PAUSE_BLOCKS");
-    unsetenv("STRATA_GLM_NO_PREFIX");
+    unsetenv("MAYA_GLM_PAUSE_BLOCKS");
+    unsetenv("MAYA_GLM_NO_PREFIX");
     {
         Glm5Model c;
         if (!c.load_pack(pack_path, 4096, err)) {
@@ -2215,7 +2215,7 @@ bool Glm5Model::glm_pause_snapshots_selftest(const std::string& pack, int* check
     // the eviction reclaims the tile when the capture needs the pages.
     setenv("MAYA_GLM_PAGED", "1", 1);
     setenv("MAYA_GLM_PAGE_SIZE", "4096", 1);
-    setenv("STRATA_GLM_PAUSE_BLOCKS", "2", 1);
+    setenv("MAYA_GLM_PAUSE_BLOCKS", "2", 1);
     {
         Glm5Model d;
         if (!d.load_pack(pack_path, 4096, err)) {
@@ -2378,7 +2378,7 @@ bool Glm5Model::glm_pause_snapshots_selftest(const std::string& pack, int* check
     restore_envs();
     req("the envs restored", getenv("MAYA_GLM_PAGED") == nullptr
         && getenv("MAYA_GLM_PAGE_SIZE") == nullptr && getenv("MAYA_GLM_PAGE_POOL_GB") == nullptr
-        && getenv("STRATA_GLM_PAUSE_BLOCKS") == nullptr && getenv("STRATA_GLM_NO_PREFIX") == nullptr);
+        && getenv("MAYA_GLM_PAUSE_BLOCKS") == nullptr && getenv("MAYA_GLM_NO_PREFIX") == nullptr);
     printf("glm_pause_snapshots_selftest: %d checks, %d failures\n", *checks, *failures);
     return *failures == 0;
 }
