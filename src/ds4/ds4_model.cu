@@ -8325,6 +8325,7 @@ struct Model::Impl {
         if (ram_tier) return off("the RAM tier (MAYA_DS4_RAM_TIER) is on");
         std::vector<ExpertStore::Geo> geo((size_t) g.nl);   // (the trunk's layers: the drafter's stay in place)
         size_t lane = 0, all = 0;   // (the in-place CPU-lane experts; every routed expert of the layers)
+        std::vector<size_t> lane_l((size_t) g.nl, 0), all_l((size_t) g.nl, 0);   // (the same, a layer)
         for (const Layer& l : L) {
             if (l.mtp || l.il < 0 || l.il >= g.nl || l.lay.fmt != gg::kFmtMXFP4 || l.packed_host) continue;
             ExpertStore::Geo& gl = geo[(size_t) l.il];
@@ -8336,12 +8337,13 @@ struct Model::Impl {
                 gl.bytes[r] = mx_part_bytes(l, r);
             }
             all += (size_t) l.n_exp;
-            for (int e = 0; e < l.n_exp; ++e) lane += file_read(l, e) ? 1 : 0;
+            all_l[(size_t) l.il] = (size_t) l.n_exp;
+            for (int e = 0; e < l.n_exp; ++e) lane_l[(size_t) l.il] += file_read(l, e) ? 1 : 0;
+            lane += lane_l[(size_t) l.il];
         }
         if (lane == 0) return off(copy_mode ? "every CPU-lane expert is copied into RAM" : "no expert is read in place");
         const bool spare = store_env("DS4_STORE_SPARE", 1) != 0;
-        const size_t sb = ExpertStore::slot_layout(geo);
-        const uint64_t cap = (uint64_t) sb * (uint64_t) (spare ? all : lane);
+        const uint64_t cap = ExpertStore::bytes_for(geo, spare ? all_l : lane_l);   // (each layer's own slot size)
         const double req = store_request();
         uint64_t bytes = 0;
         if (req < 0) {
@@ -8383,9 +8385,11 @@ struct Model::Impl {
         store_put = store_env("DS4_STORE_PUT", 1.0) != 0;
         store_ahead = store_env("DS4_STORE_AHEAD", 0.0) != 0;
         store_flow = store_env("DS4_STORE_FLOW", 1.0) != 0;
-        std::fprintf(stderr, "ds4: RAM store (--ssd-cache): up to %zu experts in slots of %.1f MB (%.1f GB; the CPU lane "
-                             "reads %zu in place), %s, %d readers, %s; below %.1f GB of free RAM it gives RAM back\n",
-                     store->slots_max(), sb / 1e6, store->slots_max() * (double) sb / 1e9, lane,
+        std::fprintf(stderr, "ds4: RAM store (--ssd-cache): up to %zu experts in %zu size classes of %.1f-%.1f MB "
+                             "(%.1f GB; the CPU lane reads %zu in place), %s, %d readers, %s; below %.1f GB of free RAM it "
+                             "gives RAM back\n",
+                     store->slots_max(), store->classes(), store->slot_bytes_min() / 1e6, store->slot_bytes() / 1e6,
+                     store->bytes_max() / 1e9, lane,
                      c.policy == ExpertStore::kLfu ? "lfu" : "lru", c.readers,
                      direct ? "reads past the page cache" : "reads through the page cache (no unbuffered handle)",
                      c.floor / 1e9);
@@ -8409,7 +8413,8 @@ struct Model::Impl {
             const size_t n = store->preload(list, 0);
             std::fprintf(stderr, "ds4: RAM store: %zu experts read in at load (%.1f GB, %.1f s) - the profile's hottest "
                                  "CPU-lane experts first (%zu)%s\n",
-                         n, n * (double) sb / 1e9, (now_ms() - t0) / 1000.0, std::min(n, n_hot),
+                         n, (double) store->bytes_max() * (double) n / (double) std::max<size_t>(1, store->slots_max()) / 1e9,
+                         (now_ms() - t0) / 1000.0, std::min(n, n_hot),
                          spare ? ", then the VRAM ones it counts least (DS4_STORE_SPARE)" : "");
         }
         store->watch_every(1000);

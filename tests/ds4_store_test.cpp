@@ -2,7 +2,8 @@
 // the reads (unbuffered where the file system takes O_DIRECT, and buffered), where a matrix lands in its slot, which
 // expert gives way (lru, lfu), the read queue (demand before guesses, a guess asked for, stale guesses dropped), the
 // store giving RAM back below its floor (a fake free-RAM figure), preload (the hottest kept longest), the miss split's
-// order (hits at once, each miss as its read lands, a failed read read in place), put() and acquire().
+// order (hits at once, each miss as its read lands, a failed read read in place), put() and acquire(), and size
+// classes (layers of smaller experts in slots of their own size).
 // Usage: ds4_store_test [dir] (the fake model's files are written there, ~1 MB, and removed; default: the current
 // directory - a file system that enforces O_DIRECT's alignment, ext4 or xfs, tests the unbuffered reads for real).
 // Build: g++ -std=c++17 -O2 -pthread -I src/ds4 tests/ds4_store_test.cpp
@@ -551,6 +552,44 @@ void test_put(const Model& m) {
     }
 }
 
+// size classes: a layer of smaller experts takes slots of its own size - the budget split by the classes' bytes, so
+// the store holds more experts than in slots of the largest layer's size, and an expert gives way to one of its class
+void test_classes(const Model& m) {
+    Model mix;
+    mix.geo = {m.geo[0], m.geo[1]};
+    const uint64_t small_b[3] = {4001, 4001, 2001};
+    for (int r = 0; r < 3; ++r) mix.geo[1].bytes[r] = small_b[r];
+    mix.files = m.files;
+    const size_t big = ExpertStore::layer_layout(mix.geo[0]), small = ExpertStore::layer_layout(mix.geo[1]);
+    EXPECT(small < big);
+    EXPECT(ExpertStore::bytes_for(mix.geo, {(size_t) kExp, (size_t) kExp}) == (uint64_t) kExp * (big + small));
+    ExpertStore::Cfg c;
+    c.budget = 4 * big + 4 * small;
+    c.chunk_slots = 2;
+    c.readers = 2;
+    ExpertStore st;
+    std::string err;
+    EXPECT(st.init(c, mix.geo, mix.files, err));
+    EXPECT(st.classes() == 2 && st.slot_bytes() == big && st.slot_bytes_min() == small);
+    EXPECT(st.slots_max() == 8 && st.slots_max() > c.budget / big);   // (one class of the largest: fewer)
+    for (int e : {0, 1, 2, 3}) ask(st, mix, 0, {e});
+    for (int e : {0, 1, 2, 3}) ask(st, mix, 1, {e});
+    EXPECT(st.held() == 8 && st.counts().evicted.load() == 0);
+    ask(st, mix, 1, {4});   // (the small class full: its oldest gives way, the large one's untouched)
+    EXPECT(!st.has(1, 0) && st.has(1, 4) && st.has(0, 0) && st.has(0, 3));
+    ask(st, mix, 0, {4});
+    EXPECT(!st.has(0, 0) && st.has(0, 4) && st.has(1, 1));
+    EXPECT(st.counts().evicted.load() == 2);
+    const int s = st.acquire(1, 4);
+    EXPECT(s >= 0);
+    if (s >= 0) {
+        for (int r = 0; r < 3; ++r) EXPECT(same(mix, 1, 4, r, st.mat_of(s, r)));
+        st.unpin(s);
+    }
+    mix.paths.clear();   // (m's files: m closes and removes them)
+    mix.files = ExpertStore::Files{};
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -574,6 +613,7 @@ int main(int argc, char** argv) {
     test_shrink(m);
     test_split(m);
     test_put(m);
+    test_classes(m);
     if (failures == 0) std::fprintf(stderr, "ds4_store_test: ALL OK\n");
     else std::fprintf(stderr, "ds4_store_test: %d FAILED\n", failures);
     return failures == 0 ? 0 : 1;

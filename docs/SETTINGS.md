@@ -1062,11 +1062,19 @@ any other I/O. `--ssd-cache` gives that RAM to a store of whole experts instead:
 - the PCIe lane, the expert cache's moves into VRAM and the prompt's chunks copy an expert out of the store when it
   holds one, instead of reading it;
 - it grows in chunks while 8 GB of RAM stays free beside it, and gives chunks back when the free RAM falls below 4 GB
-  (another program opened), checked every second.
+  (another program opened), checked every second;
+- a slot is its layer's size: the layers whose experts need the same room share a size class, and the store's RAM
+  goes to the classes by their bytes - a GGUF that mixes types by layer (unsloth's UD quants: IQ2_XXS beside IQ3_S)
+  holds as many experts as a copy of the same size would, not as many as slots of its largest layer's (UD-Q2_K_XL:
+  4,810 experts in 60 GB in 7 classes of 9.1-14.1 MB, against 3,917 in slots of 15.3 MB); an expert gives way to one
+  of its own class.
 
 It changes no arithmetic: the same bytes are computed the same way (the PCIe lane's split follows measured times, so
-it may stream other experts, as it can from one run to the next). Whether it is faster than the page cache has not been
-measured yet, so it is off by default. It applies to a GGUF's experts read in place; where
+it may stream other experts, as it can from one run to the next). Measured against a copy of the same size
+(`DS4_COPY_GB=60`, the rest read in place): DeepSeek-V4.1-Flash UD-Q2_K_XL on 2x RTX 5090 with 96 GB of RAM, the
+store at 60 GB (`DS4_COPY_GB=0`) decodes about 20% faster (four requests, two rounds, every request faster), though
+it reads more from the SSD (it reads past the page cache, which the copy's in-place reads also use). It stays off by
+default until it is measured on other PCs and quants. It applies to a GGUF's experts read in place; where
 `--mmap-experts auto` copies them all into RAM it does nothing (the copy is the faster way), and it stays off with
 `MAYA_DS4_RAM_TIER=1`. The engine log says what it took (`ds4: RAM store ...`) and, after a decode, how a token's
 experts came (`RAM store: ...`; STAT lines: `store_hit=`, `store_miss=`, `store_wait_ms=`).
