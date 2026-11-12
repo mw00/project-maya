@@ -7769,7 +7769,7 @@ struct Model::Impl {
             size_t step = 0;
             int min_slots = 1 << 30;
             for (const Layer& l : L)
-                if (l.dev == (int) di && !l.mtp) {
+                if (l.dev == (int) di && !l.mtp && !away(l.il)) {   // (the pool: another PC's layers lend nothing)
                     step += align256(unit(l));
                     min_slots = std::min(min_slots, std::min(l.n_vram, l.n_exp));
                 }
@@ -7808,7 +7808,7 @@ struct Model::Impl {
             d.experts += cap;
             size_t xoff = 0;
             for (Layer& l : L)
-                if (l.dev == (int) di && !l.mtp) {
+                if (l.dev == (int) di && !l.mtp && !away(l.il)) {
                     l.xbase = t + xoff;
                     l.xstep = step;
                     n_tail[(size_t) (&l - &L[0])] = k;
@@ -18735,7 +18735,7 @@ struct Model::Impl {
             c.fl_layers.clear();
             for (int il = 0; il < g.nl; ++il)   // (a group's layers: on each member)
                 for (int m = 0; m < L[(size_t) il].nm; ++m)
-                    if (member(L[(size_t) il], m).dev == di) c.fl_layers.push_back(il);
+                    if (member(L[(size_t) il], m).dev == di && !away(il)) c.fl_layers.push_back(il);   // (the pool: not another PC's)
             c.fl_T = run.T;
             c.fl_yoco = run.yoco;
             c.fl_ck = run.ck;
