@@ -258,7 +258,7 @@ class PreRead(unittest.TestCase):
         self.assertFalse(preread_applies(back, [TOOL]))              # tools: the template keeps it, the engine has it
         self.assertTrue(preread_applies(back, None))                 # no tools: the template drops it anyway
         self.assertTrue(preread_applies([{"role": "user", "content": "q"}, {"role": "assistant", "content": "a"}], [TOOL]))
-        with unittest.mock.patch.dict(os.environ, {"STRATA_DS4_KEEP_THINKING": "1"}):   # it keeps it without tools too
+        with unittest.mock.patch.dict(os.environ, {"MAYA_DS4_KEEP_THINKING": "1"}):   # it keeps it without tools too
             self.assertFalse(preread_applies(back, None))
             self.assertTrue(preread_applies([{"role": "user", "content": "q"}, {"role": "assistant", "content": "a"}], None))
 
