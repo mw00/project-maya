@@ -1423,8 +1423,10 @@ off carries nothing, so its line and its answer are the same as without a direct
 conversation has its own setting: a step that holds several conversations projects only the rows of those that asked
 (the projection is a block per row, so a projected row has the same bits as with the startup flag, and the others
 are not touched). A conversation's cache was read with one setting: a request with the other one starts it over (no
-cached prefix, restore point, kept conversation or shared start is reused across the two), and an ablated
-conversation is not kept as a slot or a shared start.
+cached prefix, restore point, kept conversation or shared start is reused across the two). DeepSeek keeps an ablated
+conversation as a slot (`MAYA_DS4_SLOT_KEEP`) and a shared start as it keeps any other, with the projection it was
+read with (a hash of the direction and its scale, in a slot's `.meta` too): only a request with the same projection
+takes it back, so a server that ablates every request keeps its conversations as one that ablates none.
 
 | Setting | Default | |
 | --- | --- | --- |

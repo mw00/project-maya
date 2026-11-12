@@ -3,7 +3,7 @@
 conversation in the model takes the kept one it does continue back, so A, B, A's next turn reads only the new tokens.
 
     python tools/ds4/slot_keep_test.py --pack /mnt/data/models/.../maya-ds4 [--exe build/maya-ds4] [--gpus 0,2,1]
-                                       [--config maya-ds4.json]
+                                       [--config maya-ds4.json] [--ablate direction.gguf]
 
 The engine gets the environment this test inherits plus, with `--config <maya-ds4.json>`, that config's DeepSeek
 settings (`DS4_*` and the `MAYA_DS4_*` names, under the names the engine reads): on a unified-memory APU the pool it
@@ -23,6 +23,12 @@ Six runs of the engine's `--serve` protocol (greedy, spec=0 so the state's posit
   restart  A's next turn alone, a new process          the same prefix reused, from the folder
   evict    A, B, C into a folder capped at A+B's bytes three conversations cannot fit: the least recently used (A) is
                                                        gone, B and C stay
+
+With `--ablate <direction.gguf>` every run loads the direction (--ablate-default off) and every request asks for it
+(GEN ablate=1), so the same checks hold for abliterated conversations; one run more:
+  projection A, B with the projection, then A's next   a state read with another projection is not taken back
+             turn without it, and with it              (reused 0), the kept one with the same projection is (A's
+                                                       full prefix)
 
 The prompts are real text - this repo's tokenizer corpus, tokenized through the pack's tokenizer - not random ids:
 random ids draw near-tie logits, where two greedy runs print different tokens and nothing can be compared.  spec=0 is
@@ -83,7 +89,7 @@ def _readable(stream, timeout_s: float) -> bool:
 
 
 CORPUS = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tokenizer_corpus.txt")
-META_MAGIC = 0x334154454d345344   # "DS4META3" (little endian): a slot's .meta, as src/ds4/ds4_main.cpp writes it
+META_MAGIC = 0x344154454d345344   # "DS4META4" (little endian): a slot's .meta, as src/ds4/ds4_main.cpp writes it
 DS4_ENV = ("DS4_", "MAYA_DS4_", "STRATA_DS4_")   # (the engine's own names: it takes an older STRATA_DS4_* as MAYA_DS4_* at start)
 
 
@@ -102,8 +108,14 @@ def text_tokens(tok, salt: str, n: int) -> list[int]:
 
 def meta_tokens(path: str) -> list[int] | None:
     """A slot's .meta, as the engine writes it: the magic, its identity (length, bytes), the state's size, its tokens,
-    its checkpoints (count, positions), its pictures (count, (start, hash) each - DS4META3), the magic again.  None:
-    not one of the engine's .meta files, or damaged."""
+    its checkpoints (count, positions), its pictures (count, (start, hash) each), the projection it was read with
+    (length, bytes - DS4META4), the magic again.  None: not one of the engine's .meta files, or damaged."""
+    m = meta_read(path)
+    return m[0] if m else None
+
+
+def meta_read(path: str) -> tuple[list[int], str] | None:
+    """A slot's .meta (meta_tokens): its tokens and the projection its state was read with ("": none)."""
     try:
         with open(path, "rb") as f:
             data = f.read()
@@ -116,10 +128,12 @@ def meta_tokens(path: str) -> list[int] | None:
         off = 40 + il + 4 * nt + 8 * nc
         (np,) = struct.unpack_from("<Q", data, off)
         off += 8 + 16 * np
-        (m1,) = struct.unpack_from("<Q", data, off)
+        (al,) = struct.unpack_from("<Q", data, off)
+        abl = data[off + 8:off + 8 + al].decode("ascii", "replace")
+        (m1,) = struct.unpack_from("<Q", data, off + 8 + al)
     except (OSError, struct.error):
         return None
-    return toks if m1 == META_MAGIC else None
+    return (toks, abl) if m1 == META_MAGIC else None
 
 
 class Engine:
@@ -168,8 +182,10 @@ class Engine:
         line, self.buffer = self.buffer.split(b"\n", 1)
         return line.decode("utf-8", "replace").strip()
 
-    def request(self, prompt: list[int], max_new: int, spec: int = 0, timeout: float = 3600.0) -> dict:
-        self.proc.stdin.write(f"GEN {max_new} spec={spec} {','.join(str(t) for t in prompt)}\n".encode())
+    def request(self, prompt: list[int], max_new: int, spec: int = 0, timeout: float = 3600.0,
+                ablate: int | None = None) -> dict:
+        abl = f" ablate={ablate}" if ablate is not None else ""   # (the per-request projection: --ablate's, on or off)
+        self.proc.stdin.write(f"GEN {max_new} spec={spec}{abl} {','.join(str(t) for t in prompt)}\n".encode())
         self.proc.stdin.flush()
         out = {"tokens": [], "reused": None, "prompt": None, "finish": None, "s": 0.0}
         t0 = time.monotonic()
@@ -251,22 +267,29 @@ def engine_env(settings: dict, keep: bool, slots: str, slot_gb: float | None) ->
     return env
 
 
-def run(exe: str, gpus: list[int], pack: str, ctx: int, slots: str, keep: bool, steps: list[tuple[str, Callable]],
-        max_new: int, slot_gb: float | None = None, settings: dict | None = None) -> tuple[dict, list[str], float]:
-    """One engine process: each step (a name, and a function of the answers so far that gives its prompt) in order.
-    `settings`: the config's engine settings (config_env), the slot settings here over them."""
+def run(exe: str, gpus: list[int], pack: str, ctx: int, slots: str, keep: bool, steps: list[tuple],
+        max_new: int, slot_gb: float | None = None, settings: dict | None = None,
+        ablate: str = "") -> tuple[dict, list[str], float]:
+    """One engine process: each step (a name, and a function of the answers so far that gives its prompt) in order; a
+    third element is Engine.request's own keywords (`{"ablate": 0}`).  `settings`: the config's engine settings
+    (config_env), the slot settings here over them.  `ablate`: a direction file - loaded with --ablate-default off, and
+    every step asks for it (ablate=1) unless its keywords say otherwise."""
     env = engine_env(settings or {}, keep, slots, slot_gb)
     args = [*(("--gpus", ",".join(str(g) for g in gpus)) if gpus else ()), "--pack", pack, "--max-context", str(ctx),
-            "--dspark", "on", "--threads", "on", "--vision", "off", "--expert-profile", "none", "--serve"]
+            "--dspark", "on", "--threads", "on", "--vision", "off", "--expert-profile", "none",
+            *(("--ablate", ablate, "--ablate-default", "off") if ablate else ()), "--serve"]
     eng = Engine(exe, args, env)
     t0 = time.monotonic()
     answers: dict[str, dict] = {}
     try:
         eng.start(timeout=1800.0)
         load_s = time.monotonic() - t0
-        for name, make in steps:
+        for step in steps:
+            name, make = step[0], step[1]
+            kw = {"ablate": 1} if ablate else {}   # (the projection, unless the step's own keywords say otherwise)
+            kw.update(step[2] if len(step) > 2 else {})
             prompt = make(answers)
-            answers[name] = eng.request(prompt, max_new)
+            answers[name] = eng.request(prompt, max_new, **kw)
             if "error" in answers[name]:
                 raise RuntimeError(f"{name}: {answers[name]['error']}")
             answers[name]["len"] = len(prompt)
@@ -296,8 +319,14 @@ def main() -> int:
                                                              "B and C fit under A+B's bytes once A is gone)")
     ap.add_argument("--len-turn", type=int, default=64, help="A's next turn's new tokens")
     ap.add_argument("--max-new", type=int, default=24, help="the answers' length (greedy)")
+    ap.add_argument("--ablate", default="",
+                    help="a refusal direction (GGUF): every run loads it and every request asks for it, and one run "
+                         "more mixes the projection on and off")
     a_ = ap.parse_args()
     settings = config_env(a_.config) if a_.config else {}
+    if a_.ablate and not os.path.exists(a_.ablate):
+        print(f"{a_.ablate}: no such direction file", flush=True)
+        return 2
 
     if not os.path.exists(a_.exe):
         print(f"{a_.exe}: no engine - build it first (cmake --build build --target maya-ds4)", flush=True)
@@ -337,7 +366,8 @@ def main() -> int:
         print("no-keep: A, B, A's next turn, one process (MAYA_DS4_SLOT_KEEP=0, the reference)", flush=True)
         r0, _, _ = run(a_.exe, gpus, a_.pack, a_.ctx, os.path.join(tmp, "off-1"), False,
                        [("A", lambda _: a), ("B", lambda _: b),
-                        ("A-turn", lambda ans: a + ans["A"]["tokens"] + turn)], max_new, settings=settings)
+                        ("A-turn", lambda ans: a + ans["A"]["tokens"] + turn)], max_new, settings=settings,
+                       ablate=a_.ablate)
         ref, ref_a = r0["A-turn"], r0["A"]["tokens"]
         print(f"        A {len(a)} tok in {r0['A']['s']:.0f} s, B {len(b)} tok in {r0['B']['s']:.0f} s; A's next turn "
               f"{ref['len']} tok in {ref['s']:.0f} s, reused {ref['reused']}", flush=True)
@@ -347,7 +377,7 @@ def main() -> int:
               flush=True)
         r0b, _, _ = run(a_.exe, gpus, a_.pack, a_.ctx, os.path.join(tmp, "off-2"), False,
                         [("A", lambda _: a), ("B", lambda _: b), ("A-turn", lambda _: a + ref_a + turn)], max_new,
-                        settings=settings)
+                        settings=settings, ablate=a_.ablate)
         ref2 = r0b["A-turn"]
         same_a = r0b["A"]["tokens"] == ref_a
         same_turn = ref2["tokens"] == ref["tokens"]
@@ -380,7 +410,7 @@ def main() -> int:
         print("in-run: A, B, A's next turn, one process (the slots in RAM)", flush=True)
         r1, _, load1 = run(a_.exe, gpus, a_.pack, a_.ctx, dir_inrun, True,
                            [("A", lambda _: a), ("B", lambda _: b), ("A-turn", lambda _: a + ref_a + turn)], max_new,
-                           settings=settings)
+                           settings=settings, ablate=a_.ablate)
         an, third = r1["A"], r1["A-turn"]
         print(f"        load {load1:.0f} s; A {len(a)} tok in {r1['A']['s']:.0f} s, B {len(b)} tok in "
               f"{r1['B']['s']:.0f} s; A's next turn {third['len']} tok in {third['s']:.1f} s, reused {third['reused']}",
@@ -392,7 +422,8 @@ def main() -> int:
 
         print("kept: A, B, then QUIT (both conversations written to the folder)", flush=True)
         rk, _, _ = run(a_.exe, gpus, a_.pack, a_.ctx, dir_kept, True,
-                       [("A", lambda _: a), ("B", lambda _: b)], max_new, slot_gb=0.05, settings=settings)
+                       [("A", lambda _: a), ("B", lambda _: b)], max_new, slot_gb=0.05, settings=settings,
+                       ablate=a_.ablate)
         a_answer("kept", rk)
         bins = [f for f in os.listdir(dir_kept) if f.startswith("slot-") and f.endswith(".bin")]
         metas = [f for f in os.listdir(dir_kept) if f.startswith("slot-") and f.endswith(".meta")]
@@ -422,7 +453,8 @@ def main() -> int:
 
         print("restart: A's next turn alone, a new process (the folder's slots)", flush=True)
         r2, notes2, _ = run(a_.exe, gpus, a_.pack, a_.ctx, dir_kept, True,
-                            [("A-turn", lambda _: a + ref_a + turn)], max_new, settings=settings)
+                            [("A-turn", lambda _: a + ref_a + turn)], max_new, settings=settings,
+                            ablate=a_.ablate)
         sr = r2["A-turn"]
         kept = [n for n in notes2 if "kept from earlier runs" in n]
         print(f"        {kept[0] if kept else '(no kept line)'}; reused {sr['reused']} in {sr['s']:.1f} s", flush=True)
@@ -437,7 +469,7 @@ def main() -> int:
         print(f"evict: A, B, C into a folder capped at A+B's bytes, {cap_gb:.3f} GB (three cannot fit)", flush=True)
         r4, _, _ = run(a_.exe, gpus, a_.pack, a_.ctx, dir_evict, True,
                        [("A", lambda _: a), ("B", lambda _: b), ("C", lambda _: c)], max_new, slot_gb=cap_gb,
-                       settings=settings)
+                       settings=settings, ablate=a_.ablate)
         a_answer("evict", r4)
         evict_slots = folder_slots(dir_evict)
         print(f"        the folder holds '{', '.join(sorted(evict_slots)) or 'nothing'}' "
@@ -447,6 +479,24 @@ def main() -> int:
         check("evict: B stays (A's bytes made room for C)", "B" in evict_slots)
         check(f"evict: the folder stays under the cap ({sum(evict_slots.values())} of {round(cap_gb * 2**30)} bytes)",
               sum(evict_slots.values()) <= cap_gb * 2**30)
+
+        if a_.ablate:
+            print("projection: A, B, A's next turn without the projection, then with it, one process", flush=True)
+            r5, _, _ = run(a_.exe, gpus, a_.pack, a_.ctx, os.path.join(tmp, "projection"), True,
+                           [("A", lambda _: a), ("B", lambda _: b),
+                            ("A-plain", lambda _: a + ref_a + turn, {"ablate": 0}),   # (the projection off)
+                            ("A-turn", lambda _: a + ref_a + turn)], max_new, settings=settings, ablate=a_.ablate)
+            plain, back = r5["A-plain"], r5["A-turn"]
+            print(f"        A's next turn without the projection: reused {plain['reused']} in {plain['s']:.1f} s; "
+                  f"with it: reused {back['reused']} in {back['s']:.1f} s", flush=True)
+            a_answer("projection", r5)
+            check(f"projection: a state read with the projection is not taken back without it "
+                  f"(reused {plain['reused']})", plain["reused"] == 0)
+            reuse_check("projection", back["reused"], r5["A"]["tokens"])
+            kept_abl = {m[1] for m in (meta_read(os.path.join(dir_kept, f)) for f in os.listdir(dir_kept)
+                                       if f.endswith(".meta")) if m}
+            check(f"projection: the kept folder's .meta name the projection ({', '.join(sorted(kept_abl)) or 'none'})",
+                  len(kept_abl) == 1 and "" not in kept_abl)
 
         if deterministic:
             check(f"greedy: in-run's {len(ref['tokens'])} tokens are the reference's", third["tokens"] == ref["tokens"])

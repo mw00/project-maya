@@ -23506,6 +23506,21 @@ void Model::set_ablate(bool on) {
 bool Model::ablating() const {
     return !p_->abl_on.empty() && p_->abl_on[(size_t) (p_->sqs.empty() ? 0 : p_->sq_bound)] != 0;
 }
+std::string Model::ablate_identity() const {
+    if (p_->abl_on.empty()) return {};
+    uint64_t h = 1469598103934665603ull;   // (FNV-1a over what the projection uses: the direction's floats, its scale)
+    const auto mix = [&h](const void* q, size_t n) {
+        for (size_t i = 0; i < n; ++i) {
+            h ^= ((const uint8_t*) q)[i];
+            h *= 1099511628211ull;
+        }
+    };
+    mix(p_->abl_dir.data(), p_->abl_dir.size() * sizeof(float));
+    mix(&p_->abl_scale, sizeof p_->abl_scale);
+    char s[40];
+    std::snprintf(s, sizeof s, "ablate:%016llx", (unsigned long long) h);
+    return s;
+}
 int Model::seq_bound() const { return p_->sq_bound; }
 int64_t Model::seq_pos(int s) const { return p_->seq_pos(s); }
 const std::vector<int32_t>& Model::seq_tokens(int s) const { return p_->seq_tokens(s); }
