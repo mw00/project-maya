@@ -7243,6 +7243,9 @@ struct Model::Impl {
     bool draft_caps(std::string& err) {
         draft_vram.clear();
         const char* v = ds4_env("DS4_DRAFT_VRAM");
+        // (MAYA_MIXED_FRONT: the part drafts - this front keeps none of the drafter's experts in VRAM, its own layers
+        //  take the room: a V100 holds 10 layers of a ~112 GB quant instead of 8)
+        if (v == nullptr && front_only && g.n_mtp > 0) v = "0";
         if (v == nullptr) return true;
         std::vector<long> n;
         bool ok = *v != '\0';
