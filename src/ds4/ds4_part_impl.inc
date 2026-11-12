@@ -650,6 +650,8 @@ bool part_chunks_begin(const FeedPlan& fp, bool whole, int k0, int k1, const int
     w.put<int32_t>(fp.cut_r);
     w.put<uint32_t>((uint32_t) fp.ends.size());
     for (int e : fp.ends) w.put<int32_t>(e);
+    w.put<uint32_t>((uint32_t) fp.cone.size());   // (DS4_YOCO_CONE: each skipped layer's first row - the part's layers too)
+    for (int c : fp.cone) w.put<int32_t>(c);
     w.put<int32_t>(k0);
     w.put<int32_t>(k1);
     w.put<int32_t>(n);
@@ -1142,6 +1144,8 @@ std::string part_session() {
             fp.cut_r = r.get<int32_t>();
             const uint32_t ne = r.get<uint32_t>();
             for (uint32_t i = 0; i < ne && !r.bad; ++i) fp.ends.push_back(r.get<int32_t>());
+            const uint32_t nc = r.get<uint32_t>();
+            for (uint32_t i = 0; i < nc && !r.bad; ++i) fp.cone.push_back(r.get<int32_t>());
             const int k0 = r.get<int32_t>(), k1 = r.get<int32_t>(), n = r.get<int32_t>(), lr = r.get<int32_t>();
             const int snap = r.get<int32_t>(), after = r.get<int32_t>(), ni = r.get<int32_t>();
             std::vector<std::pair<int64_t, bool>> inner;
