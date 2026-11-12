@@ -63,7 +63,14 @@ struct PartTx {
     std::string err;
     int dev_id = 0;
     double send_ms = 0;
+    bool shm = false;   // the slots are the shared block's (pshm): the part copies the rows out of them itself
 } ptx;
+// a front and its part on one PC: the block of host memory both map (the front: created and pinned; the part: opened)
+part::Shm pshm;
+static bool part_trace() {   // MAYA_MIXED_TRACE=1: a line a prompt run on each side (where its time went)
+    static const bool on = std::getenv("MAYA_MIXED_TRACE") != nullptr && std::atoi(std::getenv("MAYA_MIXED_TRACE")) != 0;
+    return on;
+}
 // a part server's input: the frame being read, its sources' rows and its hand-off rows
 struct PartRows {
     std::vector<uint8_t> buf;
@@ -86,6 +93,13 @@ std::condition_variable prx_cv;
 std::deque<std::unique_ptr<PartRows>> prx_chunks;
 std::deque<std::pair<uint32_t, std::vector<uint8_t>>> prx_ops;
 std::unique_ptr<PartRows> prx_hold[2];
+std::vector<std::vector<uint8_t>> prx_pool;   // frames' buffers to use again (a chunk's rows: hundreds of MB)
+bool prx_run = false;                         // a run of chunks is being read (the reader holds back past two waiting)
+double prx_wait_ms = 0, prx_copy_ms = 0;      // a run: waiting for the front's rows; copying them out of the block
+void prx_recycle(std::unique_ptr<PartRows>& f) {   // (prx_mu held)
+    if (f != nullptr && f->buf.capacity() > (1u << 20) && prx_pool.size() < 4) prx_pool.push_back(std::move(f->buf));
+    f.reset();
+}
 // pre-drafting: the part drafts the next round right after a verify, with the last draft call's arguments
 struct DraftArgs {
     bool set = false;
@@ -580,6 +594,40 @@ bool part_recover(int64_t keep, bool logits, std::string& err) {
                  ok ? "ok" : err.c_str());
     return ok;
 }
+// a front whose part runs on this PC: a block both map, pinned here (the GPU writes the rows into it), opened there
+bool part_shm_setup(size_t cap, std::string& why) {
+    static const bool on = [] {
+        const char* e = std::getenv("MAYA_MIXED_SHM");
+        return e == nullptr || std::atoi(e) != 0;
+    }();
+    if (!on || (part_host != "127.0.0.1" && part_host != "localhost")) return false;
+    if (!pshm.create(cap, why)) return false;
+    if (cudaHostRegister(pshm.base(), pshm.bytes(), cudaHostRegisterPortable) != cudaSuccess) {
+        cudaGetLastError();
+        why = "the block could not be pinned";
+        pshm.close();
+        return false;
+    }
+    part::Writer w;
+    w.put_str(pshm.name());
+    w.put<uint64_t>((uint64_t) pshm.cap());
+    std::vector<uint8_t> rep;
+    std::string e;
+    bool ok = part_send(part::kShm, w) && part_reply(rep, e);
+    if (ok) {
+        part::Reader r(rep);
+        (void) r.get<int32_t>();
+        ok = r.get<int32_t>() == 1;
+        if (!ok) why = "the part could not open it";
+    } else
+        why = "the link failed";
+    pshm.unlink();   // (both hold it, or it is not used: no name left behind)
+    if (!ok) {
+        cudaHostUnregister(pshm.base());
+        pshm.close();
+    }
+    return ok;
+}
 // the front's run of chunks: the header (the plan, the call, the tokens) before the devices start
 bool part_chunks_begin(const FeedPlan& fp, bool whole, int k0, int k1, const int* tk, int n, int logits_rows,
                        int snap_slot, int after, const std::vector<std::pair<int64_t, bool>>* inner, int per,
@@ -607,27 +655,46 @@ bool part_chunks_begin(const FeedPlan& fp, bool whole, int k0, int k1, const int
             w.put<int64_t>(m.first);
             w.put<uint8_t>(m.second ? 1 : 0);
         }
+    // the slots: a chunk's rows at most (its sources' rows and its hand-off) - before the run's header: the part
+    // answers the shared block's frame from its main loop
+    const int rows = std::max(per, chunk);
+    size_t need = (size_t) rows * part_hand_row();
+    for (const PartSrc& ps : part_srcs) {
+        (void) ps;
+        need += (size_t) (rows + 2) * (ckv_rb() + ik_rb());
+    }
+    const int dl = L[(size_t) part_hi - 1].dev;
+    cudaSetDevice(devs[(size_t) dl].id);
+    if (ptx.cap < need) {
+        if (ptx.shm) {
+            cudaHostUnregister(pshm.base());
+            pshm.close();
+        }
+        ptx.slot[0] = ptx.slot[1] = nullptr;   // (pinned slots of an earlier, smaller run: freed with the model)
+        ptx.cap = 0;
+        ptx.shm = false;
+        std::string why;
+        if (part_shm_setup(need, why)) {
+            ptx.slot[0] = pshm.slot(0);
+            ptx.slot[1] = pshm.slot(1);
+            ptx.shm = true;
+            std::fprintf(stderr, "ds4 pool: a prompt's rows go to the part through %zu MB of shared pinned memory "
+                         "(MAYA_MIXED_SHM=0: through the link)\n", pshm.bytes() >> 20);
+        } else {
+            if (!why.empty()) std::fprintf(stderr, "ds4 pool: no shared memory with the part (%s) - rows through the link\n", why.c_str());
+            if (!part_link()) {
+                err = "pool: the link failed";
+                return false;
+            }
+            if (!halloc(ptx.slot[0], need, err) || !halloc(ptx.slot[1], need, err)) return false;
+        }
+        ptx.cap = need;
+    }
     w.put<int64_t>(pos);
     w.put_bytes(tk, (size_t) n * 4);
     if (!part_send(part::kChunks, w)) {
         err = "pool: the link failed";
         return false;
-    }
-    // the slots: a chunk's rows at most (its sources' rows and its hand-off)
-    size_t need = (size_t) per * part_hand_row();
-    for (const PartSrc& ps : part_srcs) {
-        (void) ps;
-        need += (size_t) (per + 2) * (ckv_rb() + ik_rb());
-    }
-    const int dl = L[(size_t) part_hi - 1].dev;
-    cudaSetDevice(devs[(size_t) dl].id);
-    if (ptx.cap < need) {
-        for (auto& s : ptx.slot)
-            if (s != nullptr) cudaFreeHost(s);
-        ptx.slot[0] = ptx.slot[1] = nullptr;
-        ptx.cap = 0;
-        if (!halloc(ptx.slot[0], need, err) || !halloc(ptx.slot[1], need, err)) return false;
-        ptx.cap = need;
     }
     for (auto& e : ptx.ev)
         if (e == nullptr) CK(cudaEventCreateWithFlags(&e, cudaEventDisableTiming));
@@ -661,14 +728,35 @@ void part_tx_loop() {
                 ptx.err = "pool: a chunk's rows could not be read back";
                 ptx.bad.store(true);
             } else {
-                const std::vector<uint8_t>& h = ptx.hdr[(size_t) j[2]];
+                std::vector<uint8_t> h;
+                {   // (the sender's own copy: the devices' thread adds headers meanwhile)
+                    std::lock_guard<std::mutex> lk(ptx.mu);
+                    h = ptx.hdr[(size_t) j[2]];
+                }
                 const double t0 = now_ms();
-                if (!pc->send_frame(part::kChunk, h.data(), h.size(), ptx.slot[sl], (size_t) j[3])) {
+                if (ptx.shm) {   // (the rows wait in the block: the part copies them out and frees the slot)
+                    pshm.set_full(sl, true);
+                    part::Writer w;
+                    w.put<int32_t>(sl);
+                    w.put<uint64_t>((uint64_t) j[3]);
+                    if (!pc->send_frame(part::kChunkShm, w.b.data(), w.b.size(), h.data(), h.size())) {
+                        ptx.err = "pool: sending a chunk: " + pc->last_error();
+                        ptx.bad.store(true);
+                    }
+                    const double t_end = t0 + (double) part_timeout_ms * 6;
+                    while (!ptx.bad.load() && pshm.full(sl)) {
+                        if (now_ms() > t_end || !pc->ok()) {
+                            ptx.err = "pool: the part did not take a chunk's rows";
+                            ptx.bad.store(true);
+                        }
+                        std::this_thread::sleep_for(std::chrono::microseconds(100));
+                    }
+                } else if (!pc->send_frame(part::kChunk, h.data(), h.size(), ptx.slot[sl], (size_t) j[3])) {
                     ptx.err = "pool: sending a chunk: " + pc->last_error();
                     ptx.bad.store(true);
                 }
                 ptx.send_ms += now_ms() - t0;
-                part_tx_bytes += (int64_t) (h.size() + (size_t) j[3]);
+                part_tx_bytes += (int64_t) (h.size() + (ptx.shm ? 0 : (size_t) j[3]));
             }
         }
         ptx.busy[sl].store(0, std::memory_order_release);
@@ -754,25 +842,29 @@ bool part_chunks_end(int took, bool ok_here, std::string& err) {
 bool part_chunk_in(int k, std::string& err) {
     std::unique_lock<std::mutex> lk(prx_mu);
     const auto t_end = std::chrono::steady_clock::now() + std::chrono::milliseconds(part_timeout_ms * 6);
+    const double tw = now_ms();
     while (prx_chunks.empty()) {
         if (prx_cv.wait_until(lk, t_end) == std::cv_status::timeout) {
             err = "pool: no chunk from the front in time";
             return false;
         }
     }
+    prx_wait_ms += now_ms() - tw;
+    if (prx_chunks.front()->k == -1) {   // (the front's run ended: left in the queue for the main thread)
+        std::fprintf(stderr, "ds4 pool: the front's run ended before its chunk %d\n", k);
+        err = kHalted;
+        return false;
+    }
     std::unique_ptr<PartRows> f = std::move(prx_chunks.front());
+    prx_chunks.pop_front();
     if (f->k != k) {
-        if (f->k == -1) {   // (the front's run ended: kept for the main thread)
-            err = kHalted;
-            return false;
-        }
-        prx_chunks.pop_front();
         err = f->k == -2 ? "pool: the link closed" : "pool: chunk " + std::to_string(f->k) + " where " +
                                                          std::to_string(k) + " was due";
         return false;
     }
-    prx_chunks.pop_front();
+    prx_recycle(prx_hold[k % 2]);
     prx_hold[k % 2] = std::move(f);
+    prx_cv.notify_all();   // (the reader: room for a chunk more)
     return true;
 }
 void part_reader_loop() {
@@ -781,12 +873,44 @@ void part_reader_loop() {
         std::vector<uint8_t> b;
         pc->set_timeout(0);
         const bool ok = pc->recv_frame(op, b);
+        if (ok && op == part::kChunkShm) {   // (a chunk's rows in the shared block: copied out, its slot freed)
+            part::Reader r(b);
+            const int sl = r.get<int32_t>();
+            const uint64_t nraw = r.get<uint64_t>();
+            auto f = std::make_unique<PartRows>();
+            std::unique_lock<std::mutex> lk(prx_mu);
+            // (two chunks waiting: the front's GPU holds the next in its slot until the part's layers took one)
+            prx_cv.wait(lk, [this] { return prx_chunks.size() < 2 || !prx_run; });
+            if (r.bad || !pshm.ok() || sl < 0 || sl > 1 || nraw > pshm.cap()) f->k = -3;
+            else {
+                if (!prx_pool.empty()) {
+                    f->buf = std::move(prx_pool.back());
+                    prx_pool.pop_back();
+                }
+                lk.unlock();
+                const double t0 = now_ms();
+                const size_t nh = b.size() - r.at;
+                f->buf.resize(nh + (size_t) nraw);
+                std::memcpy(f->buf.data(), b.data() + r.at, nh);
+                std::memcpy(f->buf.data() + nh, pshm.slot(sl), (size_t) nraw);
+                pshm.set_full(sl, false);
+                prx_copy_ms += now_ms() - t0;
+                part::Reader q(f->buf);
+                f->k = q.get<int32_t>();
+                if (f->k < 0 || !part_rows_parse(q, *f)) f->k = -3;
+                lk.lock();
+            }
+            prx_chunks.push_back(std::move(f));
+            prx_cv.notify_all();
+            continue;
+        }
         std::lock_guard<std::mutex> lk(prx_mu);
         if (!ok) {
             auto f = std::make_unique<PartRows>();
             f->k = -2;
             prx_chunks.push_back(std::move(f));
             prx_ops.push_back({part::kBye, {}});
+            prx_run = false;
             prx_cv.notify_all();
             return;
         }
@@ -801,8 +925,10 @@ void part_reader_loop() {
                 f->T = r.get<int32_t>();
             }
             prx_chunks.push_back(std::move(f));
-        } else
+        } else {
+            if (op == part::kChunks) prx_run = true;
             prx_ops.push_back({op, std::move(b)});
+        }
         prx_cv.notify_all();
     }
 }
@@ -1034,6 +1160,16 @@ std::string part_session() {
                 }
                 if (!run_ok && !halted) ok = false;
             }
+            {   // (the run over here: the reader takes what the front still sends without holding it back)
+                std::lock_guard<std::mutex> lk(prx_mu);
+                prx_run = false;
+                prx_cv.notify_all();
+            }
+            if (part_trace())
+                std::fprintf(stderr, "ds4 pool: a run of %d tokens in %zu chunk(s): %.0f ms here, %.0f ms of it waiting for "
+                             "the front's rows (%.0f ms copying them out of the shared memory)\n", n, fp.ends.size(),
+                             now_ms() - t_op, prx_wait_ms, prx_copy_ms);
+            prx_wait_ms = prx_copy_ms = 0;
             // the front's end of the run: wait for it (its chunks this run did not take dropped)
             int took = -1, front_ok = 0;
             for (;;) {
@@ -1055,8 +1191,11 @@ std::string part_session() {
             }
             (void) took;
             (void) front_ok;
-            prx_hold[0].reset();
-            prx_hold[1].reset();
+            {
+                std::lock_guard<std::mutex> lk(prx_mu);
+                prx_recycle(prx_hold[0]);
+                prx_recycle(prx_hold[1]);
+            }
             if (!pc->ok()) return "the link closed";
             if (ok && fail.empty()) {
                 w.put<int32_t>(run_ok ? 1 : 0);
@@ -1109,6 +1248,16 @@ std::string part_session() {
         case part::kSync:
             reply = true;
             break;
+        case part::kShm: {   // (a front on this PC: the block its chunks' rows come through)
+            reply = true;
+            const std::string name = r.str();
+            const uint64_t cap = r.get<uint64_t>();
+            std::string e;
+            const bool got = !r.bad && pshm.open(name, (size_t) cap, e);
+            if (!got) std::fprintf(stderr, "ds4 pool: the front's shared memory: %s\n", e.empty() ? "a bad frame" : e.c_str());
+            w.put<int32_t>(got ? 1 : 0);
+            break;
+        }
         default:
             ok = false;
             err = "an unknown frame " + std::to_string(op);

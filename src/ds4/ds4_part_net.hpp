@@ -31,6 +31,8 @@ enum Op : uint32_t {
     kLogprobs = 16,
     kSync = 17,
     kBye = 18,
+    kShm = 19,       // a front on the part's own PC: the name and size of the shared memory its chunks' rows go through
+    kChunkShm = 20,  // a chunk whose rows wait in a slot of that memory: the slot, the bytes, then kChunk's header
     kReply = 100,
 };
 
@@ -61,6 +63,39 @@ private:
     bool recv_all(void* p, size_t n);
     long long fd_ = -1, lfd_ = -1;
     std::string err_, peer_;
+};
+
+// Two programs on one PC (a front and a part, each on its own GPU): a block of host memory both map.  The front's GPU
+// writes a chunk's rows straight into one of its two slots (the front pins the block), the part copies them out and
+// frees the slot - no socket carries the rows.  A header page holds a state word a slot (0 free, 1 full).
+class Shm {
+public:
+    Shm() = default;
+    ~Shm() { close(); }
+    Shm(const Shm&) = delete;
+    Shm& operator=(const Shm&) = delete;
+    // the front: a new block of two slots of `cap` bytes each (the name: for the part's open())
+    bool create(size_t cap, std::string& err);
+    // the part: the front's block
+    bool open(const std::string& name, size_t cap, std::string& err);
+    // the name off the file system (the mappings stay): once both sides hold it
+    void unlink();
+    void close();
+    bool ok() const { return p_ != nullptr; }
+    const std::string& name() const { return name_; }
+    size_t cap() const { return cap_; }
+    uint8_t* base() const { return p_; }
+    size_t bytes() const { return bytes_; }
+    uint8_t* slot(int i) const { return p_ + kHdr + (size_t) i * cap_; }
+    bool full(int i) const;
+    void set_full(int i, bool f);
+    static constexpr size_t kHdr = 4096;
+
+private:
+    uint8_t* p_ = nullptr;
+    size_t bytes_ = 0, cap_ = 0;
+    std::string name_;
+    bool owner_ = false;
 };
 
 // a payload written and read field by field

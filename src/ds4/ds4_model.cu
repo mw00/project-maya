@@ -19330,6 +19330,9 @@ struct Model::Impl {
     bool lm_begin(const Run& run) {
         static const char* env = std::getenv("DS4_LAYER_MAJOR");
         if (devs.size() != 1 || run.T.size() < 2 || (env != nullptr && std::atoi(env) == 0)) return false;
+        // (the pool: a run's chunks cross the link one by one, in order - a front that ran its layers layer by layer
+        //  handed none of them over, and the part waited for chunk 0 until the run's end)
+        if (part_srv || part_link()) return false;
         Chunk& c = *chunks[0];
         if (!c.flow) return false;
         size_t need = 0, n_exp = 0, blob_max = 0;
@@ -20525,6 +20528,7 @@ struct Model::Impl {
             if (ln_one || ln_land) rc_drain();
         } else if (!borrow_begin(per, err))
             return false;
+        const double trc_lent = now_ms();
         plan_streams();
         // the states the layers keep on the way: feed_marks' restore points inside the run, then feed_mark's state
         // before the run's last row - a set of buffers each
@@ -20684,6 +20688,7 @@ struct Model::Impl {
         const bool ahead_next = whole != nullptr && !run_end && !part_srv;
         // (a front: the run's plan and tokens to the part before the devices start; each chunk's rows follow)
         const bool part_run = part_link();
+        const double trc_go = now_ms();
         if (part_run && !part_chunks_begin(fp, whole != nullptr, k0, k1, tk, n, logits_rows, snap_slot, after, inner,
                                            per, err)) {
             part_failed = true;
@@ -20762,6 +20767,11 @@ struct Model::Impl {
                 err = pe;
                 return false;
             }
+            if (part_trace())
+                std::fprintf(stderr, "ds4 pool: a run of %d tokens in %zu chunk(s): %.0f ms before its room was lent, %.0f ms "
+                             "more before the layers started, this side's layers %.0f ms, the part's answer %.0f ms later "
+                             "(rows handed over in %.0f ms%s)\n", n, run.T.size(), trc_lent - trc_t0, trc_go - trc_lent,
+                             trc_done - trc_go, now_ms() - trc_done, ptx.send_ms, ptx.shm ? ", shared memory" : "");
         }
 #if defined(STRATA_USE_HIP) || defined(DS4_CUDA_PEER_AR)
         if (!check_peer_ar(err)) return false;

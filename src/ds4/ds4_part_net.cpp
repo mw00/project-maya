@@ -20,7 +20,9 @@ static void part_close(sock_t s) { closesocket(s); }
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <poll.h>
+#include <sys/mman.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <unistd.h>
 using sock_t = int;
 #define PART_BAD (-1)
@@ -29,6 +31,7 @@ static void part_close(sock_t s) { ::close(s); }
 #endif
 
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 
 namespace strata::ds4::part {
@@ -252,5 +255,81 @@ bool Conn::recv_frame(uint32_t& op, std::vector<uint8_t>& out) {
     out.resize((size_t) len);
     return len == 0 || recv_all(out.data(), (size_t) len);
 }
+
+// ---- Shm
+#if defined(_WIN32)
+bool Shm::create(size_t, std::string& err) {
+    err = "shared memory between a front and a part: not on Windows yet";
+    return false;
+}
+bool Shm::open(const std::string&, size_t, std::string& err) {
+    err = "shared memory between a front and a part: not on Windows yet";
+    return false;
+}
+void Shm::unlink() {}
+void Shm::close() {}
+#else
+static bool shm_map(const std::string& name, size_t bytes, bool make, uint8_t*& p, std::string& err) {
+    const int fd = ::shm_open(name.c_str(), make ? O_CREAT | O_EXCL | O_RDWR : O_RDWR, 0600);
+    if (fd < 0) {
+        err = "shm_open " + name + ": errno " + std::to_string(errno);
+        return false;
+    }
+    if (make && ::ftruncate(fd, (off_t) bytes) != 0) {
+        err = "shared memory of " + std::to_string(bytes >> 20) + " MiB: errno " + std::to_string(errno);
+        ::close(fd);
+        ::shm_unlink(name.c_str());
+        return false;
+    }
+    void* v = ::mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_SHARED | (make ? MAP_POPULATE : 0), fd, 0);
+    ::close(fd);
+    if (v == MAP_FAILED) {
+        err = "mapping the shared memory: errno " + std::to_string(errno);
+        if (make) ::shm_unlink(name.c_str());
+        return false;
+    }
+    p = (uint8_t*) v;
+    return true;
+}
+bool Shm::create(size_t cap, std::string& err) {
+    close();
+    static std::atomic<unsigned> seq{0};
+    cap = (cap + 4095) & ~(size_t) 4095;
+    const std::string name = "/maya-mixed-" + std::to_string((long long) ::getpid()) + "-" + std::to_string(seq.fetch_add(1));
+    if (!shm_map(name, kHdr + 2 * cap, true, p_, err)) return false;
+    bytes_ = kHdr + 2 * cap;
+    cap_ = cap;
+    name_ = name;
+    owner_ = true;
+    std::memset(p_, 0, kHdr);
+    return true;
+}
+bool Shm::open(const std::string& name, size_t cap, std::string& err) {
+    close();
+    if (name.empty() || name[0] != '/' || name.find('/', 1) != std::string::npos || (cap & 4095) != 0) {
+        err = "a bad shared-memory name or size";
+        return false;
+    }
+    if (!shm_map(name, kHdr + 2 * cap, false, p_, err)) return false;
+    bytes_ = kHdr + 2 * cap;
+    cap_ = cap;
+    name_ = name;
+    return true;
+}
+void Shm::unlink() {
+    if (owner_ && !name_.empty()) ::shm_unlink(name_.c_str());
+    owner_ = false;
+}
+void Shm::close() {
+    unlink();
+    if (p_ != nullptr) ::munmap(p_, bytes_);
+    p_ = nullptr;
+    bytes_ = cap_ = 0;
+    name_.clear();
+}
+#endif
+static std::atomic<uint32_t>* shm_word(uint8_t* p, int i) { return reinterpret_cast<std::atomic<uint32_t>*>(p + (size_t) i * 64); }
+bool Shm::full(int i) const { return shm_word(p_, i)->load(std::memory_order_acquire) != 0; }
+void Shm::set_full(int i, bool f) { shm_word(p_, i)->store(f ? 1u : 0u, std::memory_order_release); }
 
 }  // namespace strata::ds4::part
