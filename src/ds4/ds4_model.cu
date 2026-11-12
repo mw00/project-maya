@@ -2124,7 +2124,7 @@ struct Model::Impl {
     // allocation, a bad argument - is not one.  The helper is not asked: an error there already hands its picks to the
     // CPU lane (helper_dead) and the layer devices go on
     bool broken() {
-        if (lend_broken) return true;
+        if (lend_broken || front_dead) return true;
         int cur = -1;
         const bool had = cudaGetDevice(&cur) == cudaSuccess;
         bool bad = false;
@@ -5081,7 +5081,23 @@ struct Model::Impl {
             part_port = c == std::string::npos ? 8092 : std::atoi(o.remote_part.c_str() + c + 1);
             if (const char* v = std::getenv("MAYA_POOL_TIMEOUT_MS")) part_timeout_ms = std::max(1000, std::atoi(v));
             std::string e;
-            if (!part_connect(e)) {
+            bool linked = part_connect(e);
+            if (!linked && front_only) {
+                // (MAYA_MIXED_FRONT: both engines start together - the part may still be loading its layers; waited
+                //  for up to MAYA_MIXED_WAIT_S seconds, 900 by default)
+                const char* ws = std::getenv("MAYA_MIXED_WAIT_S");
+                const double wait_ms = 1000.0 * std::max(0.0, ws != nullptr ? std::atof(ws) : 900.0);
+                const double tw = now_ms();
+                if (wait_ms > 0)
+                    std::fprintf(stderr, "ds4 pool: waiting for the part on %s (it may still be loading)\n",
+                                 o.remote_part.c_str());
+                while (!linked && now_ms() - tw < wait_ms) {
+                    std::this_thread::sleep_for(std::chrono::seconds(1));
+                    e.clear();
+                    linked = part_connect(e);
+                }
+            }
+            if (!linked) {
                 if (front_only) {
                     err = "MAYA_MIXED_FRONT: " + e;
                     return false;
@@ -8240,6 +8256,7 @@ struct Model::Impl {
         };
         std::vector<Warm> warm;
         for (const Layer& l : L) {
+            if (away(l.il)) continue;   // (the pool: the other side's layers - never copied into RAM nor read ahead here)
             const uint32_t* p = prof.data() + (size_t) l.il * g.n_exp;
             double sum = 0;
             for (int e = 0; e < l.n_exp; ++e) sum += p[e];
@@ -22924,6 +22941,57 @@ bool Model::step(int token, bool logits, std::string& err) {
 }
 bool Model::part_serve(int port, std::string& err) { return p_->part_serve(port, err); }
 std::string Model::pool_line() const { return p_->pc != nullptr && !p_->part_srv ? p_->part_stats() : std::string(); }
+bool Model::pool_front() const { return p_->front_only; }
+bool Model::pool_lost() const { return p_->front_dead; }
+int Model::mixed_plan(const std::string& pack, int reserve_mib, double margin_gb, std::string& msg, std::string& err) {
+    Pack pk;
+    if (!pk.load(pack, err)) return -1;
+    const int nl = (int) pk.num("num_hidden_layers", 0);
+    // each trunk layer's bytes as the front keeps them: every routed expert (in its packed form, as on disk) and the
+    // layer's other weights; the Engram tables stay on the disk; the drafter and the vision tower are not the front's
+    std::vector<double> lay;
+    double shared = 0;
+    for (const auto& kv : pk.t) {
+        const std::string& n = kv.first;
+        if (n.rfind("mtp.", 0) == 0 || n.rfind("vision.", 0) == 0 || n.find(".engram.embed") != std::string::npos)
+            continue;
+        if (n.rfind("layers.", 0) == 0) {
+            const int il = std::atoi(n.c_str() + 7);
+            if (il < 0 || il > 4096) continue;
+            if ((size_t) il >= lay.size()) lay.resize((size_t) il + 1, 0.0);
+            lay[(size_t) il] += (double) kv.second.bytes;
+        } else
+            shared += (double) kv.second.bytes;
+    }
+    if (nl < 2 || lay.size() < (size_t) nl) {
+        err = pack + ": no trunk layers found";
+        return -1;
+    }
+    int ndev = 0;
+    if (cudaGetDeviceCount(&ndev) != cudaSuccess || ndev == 0) {
+        err = "no CUDA device";
+        return -1;
+    }
+    cudaSetDevice(0);
+    cudaFree(nullptr);   // (the context first: its own memory is not the front's to plan with)
+    size_t fr = 0, tot = 0;
+    if (mem_info(&fr, &tot) != cudaSuccess) {
+        err = "the GPU's free memory could not be read";
+        return -1;
+    }
+    cudaDeviceProp pr{};
+    (void) cudaGetDeviceProperties(&pr, 0);
+    const double room = (double) fr - (double) ((size_t) std::max(0, reserve_mib) << 20) - margin_gb * 1e9 - shared;
+    double used = 0;
+    int k = 0;
+    while (k < nl - 1 && used + lay[(size_t) k] <= room) used += lay[(size_t) k++];
+    char b[400];
+    std::snprintf(b, sizeof b, "%s: %.2f GB free of %.2f; shared weights %.2f GB, reserve %d MiB, margin %.2f GB -> "
+                               "layers 0-%d (%.2f GB)%s", pr.name, fr / 1e9, tot / 1e9, shared / 1e9, reserve_mib,
+                  margin_gb, k - 1, used / 1e9, k == 0 ? " - not one layer fits" : "");
+    msg = b;
+    return k;
+}
 std::string Model::where() const { return p_->where(); }
 bool Model::feed(const int* tokens, int n, int logits_rows, std::string& err, int after) {
     Impl& p = *p_;

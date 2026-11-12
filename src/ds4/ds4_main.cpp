@@ -779,8 +779,12 @@ std::vector<int> g_vram_gpus;   // --gpus (empty: every visible GPU): the cards 
 int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float conf_min, const std::string& pack,
           Lookup* lk, DraftCost* dc) {
     std::vector<int> eos = parse_ids(eos_list);
-    for (const std::string& l : m.info_lines()) std::printf("%s\n", l.c_str());
-    std::printf("INFO logprobs=%d\n", strata::ds4::kTopLogprobs);   // (GEN logprobs=<k>: LP lines, k at most this)
+    // (MAYA_MIXED_FRONT: the first layers here, the rest in a second engine - pictures and log-probabilities are not
+    //  carried through it: the server is told there are none, and a request that asks is refused below)
+    const bool mixed = m.pool_front();
+    for (const std::string& l : m.info_lines())
+        std::printf("%s\n", mixed && l.rfind("INFO vision=", 0) == 0 ? "INFO vision=off" : l.c_str());
+    if (!mixed) std::printf("INFO logprobs=%d\n", strata::ds4::kTopLogprobs);   // (GEN logprobs=<k>: LP lines, k at most this)
     std::printf("INFO logit_bias=1\n");   // (GEN logit_bias=<id>:<bias>,...: added to the logits of every pick)
     if (m.ablate_loaded())   // (--ablate: GEN ablate=0|1 turns its projection off / on for the request)
         std::printf("INFO ablate=1 ablate_default=%d\n", m.ablating() ? 1 : 0);
@@ -807,16 +811,22 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
     const auto end_note = [&m, &ending] {   // (before a request's DONE)
         if (ending || !m.broken()) return;
         ending = true;
+        if (m.pool_lost()) {   // (MAYA_MIXED_FRONT: its second engine is gone - the server goes on without it)
+            std::printf("END the second GPU's engine (--mixed-gpus) is gone - this engine ends (exit 4); the next "
+                        "request starts the model on one GPU\n");
+            std::fprintf(stderr, "maya ds4 serve: the second GPU's engine is gone - the engine ends (exit 4)\n");
+            return;
+        }
         std::printf("END a GPU's state is unknown after this request - the engine ends (exit 3); the next request "
                     "starts a fresh one\n");
         std::fprintf(stderr, "maya ds4 serve: a GPU's state is unknown after this request - the engine ends (exit 3) "
                              "so the server starts it again for the next request\n");
     };
-    const auto end_if_broken = [&ending] {   // (after it)
+    const auto end_if_broken = [&ending, &m] {   // (after it)
         if (!ending) return;
         std::fflush(stdout);
         std::fflush(stderr);
-        std::_Exit(3);   // (not abort(): a core dump of the pinned expert tiers takes minutes)
+        std::_Exit(m.pool_lost() ? 4 : 3);   // (not abort(): a core dump of the pinned expert tiers takes minutes)
     };
     // (DS4_SERVE_DUMP=<prefix>, tests: request i's logits - the prompt's last row, then every decode step's rows - into
     //  <prefix>.<i>.f32, to compare a request's logits byte for byte across processes and histories)
@@ -1500,7 +1510,10 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         std::vector<Pic>& pics = P.pics;
         {
             std::string e;
-            if (geni && img_tok < 0) e = "this engine has no vision tower, so it cannot read pictures";
+            if (geni && mixed) e = "pictures are not read with two GPUs (--mixed-gpus) yet: start without it for them";
+            else if (r.logprobs >= 0 && mixed)
+                e = "log-probabilities are not given with two GPUs (--mixed-gpus) yet: start without it for them";
+            else if (geni && img_tok < 0) e = "this engine has no vision tower, so it cannot read pictures";
             else if (geni && read_pics(r.file, pics, e))
                 for (const Pic& q : pics)
                     if (q.start < 0 || (size_t) q.start >= r.ids.size() || r.ids[(size_t) q.start] != img_tok)
@@ -3597,6 +3610,7 @@ int main(int argc, char** argv) {
     float temp = 0.0f;   // the CLI's sampling (0: greedy)
     unsigned long long cli_seed = 1;
     int part_port = 0;
+    bool mixed_plan = false;   // (--mixed-plan: the front's layer count for this GPU, printed; nothing loaded)
     bool serve_mode = false, multi_check = false, parts_check = false, marks_check = false, describe = false, dspark_set = false;
     std::string prof_run, prof_out, spec_eval_path;
     int sampler_n = 0;
@@ -3713,6 +3727,7 @@ int main(int argc, char** argv) {
         else if (a == "--remote-part") o.remote_part = val("--remote-part");   // the pool: host:port of the part server
         else if (a == "--part-from") o.part_from = (int) num("--part-from", 1, 1000, true);   // the pool: a part's first layer
         else if (a == "--part-serve") part_port = (int) num("--part-serve", 1, 65535, true);  // the pool: serve as a part
+        else if (a == "--mixed-plan") mixed_plan = true;   // (serve/mixed_gpus.py: how many layers this GPU takes)
         else if (a == "--parallel") o.seqs = (int) num("--parallel", 1, 8, true);   // (--serve: conversations at once)
         else if (a == "--multi-check") multi_check = true;   // (tests: --parallel's rows against each alone)
         else if (a == "--parts-check") parts_check = true;   // (tests: a prompt in parts against one call)
@@ -3755,6 +3770,22 @@ int main(int argc, char** argv) {
     }
     if (sampler_n > 0 && ids_s.empty()) {
         std::fprintf(stderr, "--sampler-test needs --ids (a prompt whose next tokens are open)\n");
+        return 2;
+    }
+    if (mixed_plan && !o.pack.empty()) {   // MIXED_PLAN <layers> <the numbers>: MAYA_MIXED_MARGIN_GB (1.0) is the margin
+        const char* mg = std::getenv("MAYA_MIXED_MARGIN_GB");
+        std::string msg, err;
+        const int k = strata::ds4::Model::mixed_plan(o.pack, (int) o.reserve_mib, mg != nullptr ? std::atof(mg) : 1.0,
+                                                     msg, err);
+        if (k < 0) {
+            std::fprintf(stderr, "maya-ds4: --mixed-plan: %s\n", err.c_str());
+            return 1;
+        }
+        std::printf("MIXED_PLAN %d %s\n", k, msg.c_str());
+        return 0;
+    }
+    if (!o.remote_part.empty() && o.seqs > 1) {
+        std::fprintf(stderr, "maya-ds4: --remote-part runs one conversation: --parallel %d is not covered\n", o.seqs);
         return 2;
     }
     if (o.pack.empty() || (!serve_mode && part_port == 0 && ids_s.empty() && enc_rgb.empty() && ppl.empty() && prof_run.empty() &&

@@ -385,6 +385,16 @@ public:
     bool part_serve(int port, std::string& err);
     /// The pool's line for the logs ("" when not a front).
     std::string pool_line() const;
+    /// MAYA_MIXED_FRONT: this engine holds only the trunk's first layers, a second engine the rest (two GPUs of one
+    /// PC): no pictures, log-probabilities or --parallel through it.
+    bool pool_front() const;
+    /// The front's link failed (MAYA_MIXED_FRONT): the engine ends after the request (broken() is true).
+    bool pool_lost() const;
+    /// --mixed-plan: how many of the trunk's first layers (weights and every expert) fit the free VRAM of the first
+    /// visible GPU, beside the model's shared weights, reserve_mib and margin_gb (a long prompt's room); 0: none. msg
+    /// says the numbers it went by.
+    static int mixed_plan(const std::string& pack, int reserve_mib, double margin_gb, std::string& msg,
+                          std::string& err);
     const Stats& stats() const;
     std::string describe() const;
     /// INFO / VRAM lines for the server's Monitor.

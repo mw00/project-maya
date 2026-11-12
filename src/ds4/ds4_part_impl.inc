@@ -19,6 +19,7 @@ std::string part_host;
 int part_port = 0, part_k = 0;
 bool part_failed = false;   // a front: the link failed under the last call
 bool part_pending = false;  // a front: the link failed between calls - the conversation must be read again here
+bool front_dead = false;    // a MAYA_MIXED_FRONT front whose link failed: it cannot go on (broken(): the engine ends)
 bool part_defer = false;    // a front: forward() keeps its window's frame in part_w (verify sends it)
 int part_timeout_ms = 20000;
 part::Writer part_w;
@@ -309,6 +310,11 @@ void part_lost(const std::string& why) {
                      why.c_str());
     if (pc != nullptr) pc->close();
     if (!front_only) part_hi = 1 << 30;
+    if (front_only && !front_dead) {
+        front_dead = true;
+        std::fprintf(stderr, "ds4 pool: MAYA_MIXED_FRONT: the second GPU's engine is gone (%s) - this engine holds only "
+                             "layers 0-%d, so it ends after this request\n", why.c_str(), part_hi - 1);
+    }
     part_failed = true;
     part_pending = true;
     part_pre.have = false;
