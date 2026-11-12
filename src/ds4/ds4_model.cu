@@ -4880,7 +4880,9 @@ struct Model::Impl {
                 // window, a page fault at a time) - DS4_CHUNK_MIN still overrides
                 bool all_flow = true;
                 for (const auto& cp : chunks) all_flow = all_flow && (cp == nullptr || cp->ring == nullptr || cp->flow);
-                if (all_flow && std::getenv("DS4_CHUNK_MIN") == nullptr) chunk_min = kFlowChunkMin;
+                // (MAYA_MIXED_FRONT: its CPU lane is only the other GPU's layers, never run here - a short prompt
+                //  in windows, as on the AMD GPU alone)
+                if (all_flow && !front_only && std::getenv("DS4_CHUNK_MIN") == nullptr) chunk_min = kFlowChunkMin;
                 if (down_share()) {   // (DS4_FLOW_DOWN_SHARE: a count a (layer, expert) - the members' flows share it)
                     bool on = tp_uneven && flow_tp;
                     for (const auto& cp : chunks) on = on && (cp == nullptr || cp->ring == nullptr || cp->flow);
