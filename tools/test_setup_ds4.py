@@ -1758,5 +1758,84 @@ class Drafting(unittest.TestCase):
         self.assertFalse(maya.needs_speed_calibration(c))
 
 
+class Coder(unittest.TestCase):
+    """ISTA-DASLab's GSQ-RCO quant of DeepSeek, tuned for coding (--ds4-quant gguf-iq2_xxs-coder): pinned in
+    download_gguf.json at one revision, in <models>/DeepSeek-V4.1-Flash-1017-Coder-GGUF/IQ2_XXS, served under a name of
+    its own.  Its five shards are a six-shard split: the sixth (the n-gram tables alone) is published as
+    DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf at the repo's root, so it is fetched (no other quant's tables are read) and
+    the pack takes it from beside the shards, the shard itself left out."""
+    REPO = "ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-Coder-GGUF"
+    SHARDS = ["DeepSeek-V4.1-Flash-1017-GSQ-RCO-Coder-IQ2_XXS-%05d-of-00006.gguf" % i for i in range(1, 6)]
+    TABLE = "DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf"
+
+    def test_manifest_and_urls(self):
+        man = maya.read_json(maya.DS4_GGUF_MANIFEST)["coder"]
+        rev = man["revision"]
+        m = maya.ds4_gguf_model("gguf-iq2_xxs-coder")
+        self.assertEqual((m["format"], m["folder"], m["repo"], m["revision"], m.get("gated")),
+                         ("ds4-gguf", "IQ2_XXS", self.REPO, rev, None))
+        self.assertEqual(sorted(m["files"]), sorted(self.SHARDS + [self.TABLE]))
+        for f in m["files"]:
+            self.assertRegex(m["sha256"][f], r"^[0-9a-f]{64}$")
+        self.assertEqual(m["engram_file"], self.TABLE)                     # (the split's sixth shard, its own GGUF)
+        self.assertEqual(m["without"], [self.SHARDS[0].replace("00001", "00006")])
+        self.assertAlmostEqual(m["download_gb"], 182.72, delta=0.02)
+        # the shards sit in IQ2_XXS/, the tables' GGUF at the repo's root (sources / source_folders)
+        self.assertEqual(maya.file_url(m, self.SHARDS[0]),
+                         f"https://huggingface.co/{self.REPO}/resolve/{rev}/IQ2_XXS/" + self.SHARDS[0])
+        self.assertEqual(maya.file_url(m, self.TABLE), f"https://huggingface.co/{self.REPO}/resolve/{rev}/" + self.TABLE)
+
+    def test_folder_name_and_label(self):
+        self.assertEqual(maya.ds4_dir(args(), Path("/models"), {}, "gguf-iq2_xxs-coder"),
+                         Path("/models") / "DeepSeek-V4.1-Flash-1017-Coder-GGUF" / "IQ2_XXS")
+        self.assertAlmostEqual(maya.ds4_memory_gb("gguf-iq2_xxs-coder"), 72.1, delta=0.1)   # (the tables stay on the SSD)
+        self.assertEqual(maya.Q.shown("deepseek", "gguf-iq2_xxs-coder"), "DeepSeek V4.1 · ISTA-DASLab Coder IQ2_XXS")
+        root = Path(tempfile.mkdtemp())
+        with patch.object(maya, "ROOT", root), patch.object(maya, "say", lambda *a: None), \
+                patch.object(maya, "ok", lambda *a: None), patch.object(maya, "step", lambda *a: None):
+            p = maya.write_config_ds4(args(), {"gpus": [{"index": 0}]}, {}, Path("/m/A/maya-ds4"), 65536,
+                                      Path("/models"), Path("/m/A"), "gguf-iq2_xxs-coder")
+        c = json.loads(p.read_text())
+        self.assertEqual((c["model_name"], c["installer"]["ds4_quant"]),
+                         ("deepseek-v4.1-flash-coder", "gguf-iq2_xxs-coder"))
+
+    def test_offered_in_the_setup(self):
+        rows = []
+        def pick(title, intro, opts, default, yes, *x):
+            rows.extend(o[0] for o in opts)
+            return default
+        with patch.object(maya, "say", lambda *a: None), patch.object(maya.S, "UI", None), \
+                patch.object(maya.S, "gpus", return_value=[{"arch": 86, "vram_gb": 24}]), \
+                patch.object(maya, "mem_gb", return_value=(256, 256)), patch.object(maya, "choose", pick):
+            maya.choose_ds4_quant(args(ds4_quant=None), {})        # (the list the question shows)
+            self.assertEqual(maya.choose_ds4_quant(args(ds4_quant="gguf-iq2_xxs-coder"), {}), "gguf-iq2_xxs-coder")
+        self.assertIn("DeepSeek V4.1 · ISTA-DASLab Coder IQ2_XXS (183 GB)", rows)
+
+    def test_pack_takes_the_tables_from_beside_the_shards(self):
+        """ds4_pack_step's command: the five shards named, the sixth left out, the tables' GGUF from the folder it is
+        in - and the pack's stamp holds each file once (the folder's glob repeats the shards)."""
+        d = Path(tempfile.mkdtemp()) / "DeepSeek-V4.1-Flash-1017-Coder-GGUF" / "IQ2_XXS"
+        d.mkdir(parents=True)
+        for n in self.SHARDS + [self.TABLE]:
+            (d / n).write_bytes(b"gguf")
+        pack = d / "maya-ds4"
+        (pack / "tokenizer").mkdir(parents=True)
+        for f in ("ds4.txt", "tensors.txt", "engram.bin", "tokenizer/vocab.json", "tokenizer/chat_template.jinja"):
+            (pack / f).write_text("hidden_size 4096\n")   # (the patched build writes nothing: as if it had)
+        m = maya.ds4_gguf_model("gguf-iq2_xxs-coder")
+        files = [d / n for n in self.SHARDS]
+        calls = []
+        with patch.object(maya, "run", lambda cmd, **k: calls.append(cmd)), \
+                patch.object(maya.S, "source_hash", return_value="h"):
+            maya.ds4_pack_step(args(repack=True), d, gguf=True, engram=d, files=files, without=m["without"])
+        cmd = calls[0]
+        self.assertEqual(cmd[cmd.index("--engram") + 1], str(d))
+        self.assertEqual(cmd[cmd.index("--without") + 1:], m["without"])
+        self.assertEqual([cmd[cmd.index("--shards") + 1 + i] for i in range(5)], self.SHARDS)
+        stamp = json.loads((d / "maya-ds4" / maya.PACK_SOURCES).read_text())["files"]
+        names = [r["name"] for r in stamp]
+        self.assertEqual(sorted(names), sorted(self.SHARDS + [self.TABLE]))   # (each once)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -31,7 +31,8 @@ PROGRESS = re.compile(r"([\d.]+) / ([\d.]+) GB(?: \((\d+)%\))?(?: · ([\d.]+) MB
 DS4_OTHER = (("exl3-2.25", "turboderp"), ("exl3", "LibertAIDAI"), ("exl3-3.5", "LibertAIDAI"), ("gguf-q8", "unsloth"),
              ("gguf-iq1_s", "unsloth"), ("gguf-iq1_m", "unsloth"), ("gguf-iq2_xxs", "unsloth"), ("gguf-q2_k_xl", "unsloth"),
              ("gguf-iq3_xxs", "unsloth"), ("gguf-iq3_s", "unsloth"), ("gguf-q3_k_xl", "unsloth"),
-             ("abliterated-128g", "orcarouter"), ("abliterated-256g", "orcarouter"))
+             ("abliterated-128g", "orcarouter"), ("abliterated-256g", "orcarouter"),
+             ("gguf-iq2_xxs-coder", "ISTA-DASLab"))
 GLM_EXL3 = ("EXL3-3.05bpw", "EXL3-4.05bpw")
 # (Qwen3.8-Flash-Next itself: unsloth's UD-IQ2_XS only - its other UD quants run on the same code but are not listed;
 #  the setup id: maya_quants.QWEN_UD_IDS[0])

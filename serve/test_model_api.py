@@ -294,6 +294,7 @@ class OtherQuantsTest(unittest.TestCase):
         self.assertEqual(c["deepseek-exl3-3.5"]["by"], "LibertAIDAI")
         self.assertEqual(c["deepseek-gguf-q8"]["name"], "DeepSeek V4.1 · UD-Q8_K_XL")
         self.assertIn("deepseek-gguf-iq1_s", c)
+        self.assertEqual(c["deepseek-gguf-iq2_xxs-coder"]["name"], "DeepSeek V4.1 · ISTA-DASLab Coder IQ2_XXS")
         self.assertNotIn("deepseek-gguf-q4", c)                   # (by hand only, as in the setup's list)
         self.assertNotIn("glm-exl3-sc_4.10bpw", c)
         self.assertIn("HF_TOKEN", c["deepseek-abliterated-128g"]["note"])

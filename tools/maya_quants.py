@@ -191,6 +191,7 @@ OTHERS = {("deepseek", "gguf-q8"): "UD-Q8_K_XL", ("deepseek", "gguf-q4"): "UD-Q4
           ("deepseek", "exl3-3.5"): "EXL3 3.5 bpw",
           ("deepseek", "abliterated-128g"): "orcarouter Abliterated Mix-128G",
           ("deepseek", "abliterated-256g"): "orcarouter Abliterated Mix-256G",
+          ("deepseek", "gguf-iq2_xxs-coder"): "ISTA-DASLab Coder IQ2_XXS",
           ("minimax", "exl3"): "EXL3 3.5 bpw", ("qwen", "q5_k_m"): "Q5_K_M",
           ("qwen", "ud-iq2_xs"): "unsloth UD-IQ2_XS"}   # (the base model in unsloth's GGUF: maya.QWEN_UD)
 # files of the base model rather than CYBER-FROST: the model's name on screen without "(CYBER-FROST)"

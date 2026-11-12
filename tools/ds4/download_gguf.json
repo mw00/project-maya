@@ -690,6 +690,47 @@
    "download": "Maya-XS"
   }
  },
+ "coder": {
+  "_": "ISTA-DASLab's GSQ-RCO quant of DeepSeek-V4.1-Flash-1017, tuned for coding (ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-Coder-GGUF): the routed experts in IQ2_XXS, the dense weights Q5_K, five shards - every file at one revision, with its size and sha256.  The split counts six: its sixth shard holds only the n-gram (Engram) tables, IQ4_NL, and is published as DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf at the repo's root - so the five shards are the model's set, that GGUF is fetched beside them (\"engram_file\") and the sixth shard is left out (\"engram_shard\": pack_gguf reads the tables' GGUF where it lies).  Its vision tower and DSpark drafter are the entries every GGUF of the model shares (\"vision\" / \"drafter\": from DeepSeek's own checkpoint).",
+  "name": "DeepSeek-V4.1-Flash-1017 GSQ-RCO Coder",
+  "repo": "ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-Coder-GGUF",
+  "revision": "54229d38d588a66d1c6cff08af7b281b9326c656",
+  "license": "MIT",
+  "quants": {
+   "IQ2_XXS": {
+    "about": "the experts IQ2_XXS, the dense weights Q5_K: about 72 GB of VRAM + RAM hold all but the n-gram tables",
+    "memory_gb": 72.1,
+    "files": {
+     "IQ2_XXS/DeepSeek-V4.1-Flash-1017-GSQ-RCO-Coder-IQ2_XXS-00001-of-00006.gguf": [
+      5780704,
+      "108e63d27240da2d99846250727a7b282e05a7fdf2448435e81904b9a98d8a4a"
+     ],
+     "IQ2_XXS/DeepSeek-V4.1-Flash-1017-GSQ-RCO-Coder-IQ2_XXS-00002-of-00006.gguf": [
+      19776064960,
+      "75079999eb3a492ad695f3466fd6a068a1cf1920980eac1c7f51406363fadf7a"
+     ],
+     "IQ2_XXS/DeepSeek-V4.1-Flash-1017-GSQ-RCO-Coder-IQ2_XXS-00003-of-00006.gguf": [
+      19939989696,
+      "ea964e525922f36d3b984299c1a5bb8d896f50b9c2942364cd221c37863331f2"
+     ],
+     "IQ2_XXS/DeepSeek-V4.1-Flash-1017-GSQ-RCO-Coder-IQ2_XXS-00004-of-00006.gguf": [
+      19682533472,
+      "2d95806d186597cb0ea32635c92f0b66a9a6afae1a399ff74b13aebaa4ac7a52"
+     ],
+     "IQ2_XXS/DeepSeek-V4.1-Flash-1017-GSQ-RCO-Coder-IQ2_XXS-00005-of-00006.gguf": [
+      12719198624,
+      "3665b48c3bd46330780caf286ee40a087ac11499e5b7df8c943b098d10f426d4"
+     ],
+     "DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf": [
+      110595290816,
+      "3dac4c54893ad7aa89103c0028500eadc78e74112cef3a2930a97e67dc9fb4f3"
+     ]
+    },
+    "engram_file": "DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf",
+    "engram_shard": "DeepSeek-V4.1-Flash-1017-GSQ-RCO-Coder-IQ2_XXS-00006-of-00006.gguf"
+   }
+  }
+ },
  "drafter": {
   "_": "DeepSeek's DSpark drafter (the speculative decoder the GGUFs leave out): the three shards of DeepSeek's own checkpoint that hold only its blocks (mtp.0-2), at the revision the Engram tables come from; tools/ds4/drafter_pack.py makes them the GGUF path's formats (dspark.bin, beside the quants' folders).",
   "repo": "deepseek-ai/DeepSeek-V4.1-Flash-1017",

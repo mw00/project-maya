@@ -622,7 +622,7 @@ DS4_QUANTS = {"gguf-q8": "UD-Q8_K_XL", "gguf-q4": "UD-Q4_K_XL", "maya-s": "Maya-
               "exl3-2.25": "EXL3 2.25bpw", "exl3": "EXL3 2.9bpw", "exl3-3.5": "EXL3 3.5bpw", "abliterated-128g": "Mix-128G",
               "abliterated-256g": "Mix-256G", "gguf-iq1_s": "UD-IQ1_S", "gguf-iq1_m": "UD-IQ1_M",
               "gguf-iq2_xxs": "UD-IQ2_XXS", "gguf-q2_k_xl": "UD-Q2_K_XL", "gguf-iq3_xxs": "UD-IQ3_XXS",
-              "gguf-iq3_s": "UD-IQ3_S", "gguf-q3_k_xl": "UD-Q3_K_XL"}
+              "gguf-iq3_s": "UD-IQ3_S", "gguf-q3_k_xl": "UD-Q3_K_XL", "gguf-iq2_xxs-coder": "IQ2_XXS"}
 DS4_MAYA = ("maya-s", "maya-m", "maya-xs")
 # unsloth's UD-Q4_K_XL is no longer in the setup's list (the owner, v1.1.34): --ds4-quant gguf-q4 and an install of it
 # work as before; the list shows it only on a PC that has it set up
@@ -642,6 +642,13 @@ DS4_UD_LISTED = ("gguf-iq1_m", "gguf-iq3_s")   # (UD-IQ3_S: close to Q8's qualit
 DS4_ABL = ("abliterated-128g", "abliterated-256g")
 DS4_ABL_ALIAS = "abliterated"
 DS4_ABL_MODEL_NAME = "deepseek-v4.1-flash-abliterated"
+# ... and ISTA-DASLab's GSQ-RCO quant of it, tuned for coding (download_gguf.json's "coder": the experts in IQ2_XXS,
+# five shards), in <models>/DeepSeek-V4.1-Flash-1017-Coder-GGUF/IQ2_XXS, served under a name of its own.  Its n-gram
+# (Engram) tables are the split's sixth shard, published as a GGUF of their own beside the shards (the shard itself is
+# left out: pack_gguf reads the tables' GGUF), and its vision tower and DSpark drafter come from the entries every GGUF
+# of the model shares.  --ds4-quant gguf-iq2_xxs-coder
+DS4_CODER = ("gguf-iq2_xxs-coder",)
+DS4_CODER_MODEL_NAME = "deepseek-v4.1-flash-coder"
 DS4_DEFAULT_QUANT = "gguf-q8"
 DS4_GGUF_MIN_CC = 70
 # (the model's own reach, natively: 1M positions - its config's max_position_embeddings, nothing scaled; 512K and 1M
@@ -5588,6 +5595,14 @@ def ds4_gguf_model(quant: str) -> dict:
                  f"set up unsloth's GGUF meanwhile: {ME} --setup --model {DS4} --ds4-quant gguf-q8")
         about, repo, revision = (f"{DS4} {DS4_QUANTS[quant]}, Maya's quant ({q.get('about', 'the experts in 2-3 bits')})",
                                  my["repo"], my["revision"])
+    elif quant in DS4_CODER:
+        co = man.get("coder") or {}
+        q = (co.get("quants") or {}).get(DS4_QUANTS[quant]) or {}
+        if not q.get("files"):
+            fail(f"{DS4_GGUF_MANIFEST} is missing or damaged", "restore it (git checkout tools/ds4/download_gguf.json)")
+        about, repo, revision = (f"{co.get('name', DS4 + ' GSQ-RCO Coder')} {DS4_QUANTS[quant]}, ISTA-DASLab's quant "
+                                 f"of the model tuned for coding ({q.get('about', 'the experts in IQ2_XXS')})",
+                                 co["repo"], co["revision"])
     else:
         q = (man.get("quants") or {}).get(DS4_QUANTS[quant]) or {}
         if not q.get("files"):
@@ -5605,6 +5620,15 @@ def ds4_gguf_model(quant: str) -> dict:
     m = form(q["files"], revision)
     if quant in DS4_ABL and q.get("table"):
         m["table"] = Path(q["table"]).name   # (listed in the manifest, never fetched)
+    if quant in DS4_CODER:
+        # the n-gram (Engram) tables: a GGUF of their own beside the shards, at the repo's root (the split's sixth
+        # shard, published under that name) - fetched, and read by pack_gguf; the shard itself is left out
+        if q.get("engram_file"):
+            m["engram_file"] = Path(q["engram_file"]).name
+            m["sources"] = {m["engram_file"]: (repo, revision)}
+            m["source_folders"] = {m["engram_file"]: ""}
+        if q.get("engram_shard"):
+            m["without"] = [Path(q["engram_shard"]).name]
     m["earlier"] = [dict(form(e["files"], e["revision"]), engram=[form(s, e["revision"]) for s in e.get("engram") or []],
                          upgrade=bool(e.get("upgrade")))
                     for e in q.get("earlier") or []]
@@ -5954,8 +5978,8 @@ def choose_ds4_quant(a, prev: dict) -> str:
         ccs = []
     exl3_ok = hip or not ccs or max(ccs) >= DS4_MIN_CC
     before = (prev.get("installer") or {}).get("ds4_quant")
-    keys = maya + list(DS4_ABL) + list(DS4_UD_LISTED) + [
-        k for k in DS4_QUANTS if k not in DS4_MAYA + DS4_ABL + DS4_UD_LISTED and (exl3_ok or k not in DS4_EXL3)
+    keys = maya + list(DS4_ABL) + list(DS4_CODER) + list(DS4_UD_LISTED) + [
+        k for k in DS4_QUANTS if k not in DS4_MAYA + DS4_ABL + DS4_CODER + DS4_UD_LISTED and (exl3_ok or k not in DS4_EXL3)
                                    and (k not in DS4_BY_HAND + DS4_UD or k == before)]   # (a chosen-by-hand one: only where it is installed)
     abl = ds4_abl_recommended(hip)
     # Maya's quants by this PC's VRAM + RAM (fit_recommendation): no larger than Maya-S (the first listed), the cache
@@ -5968,7 +5992,7 @@ def choose_ds4_quant(a, prev: dict) -> str:
     rec = fit_recommendation({k: ds4_memory_gb(k) for k in maya}, gpus, ram,
                              ds4_kv_gb(DS4_DEFAULT_CONTEXT, len(gpus)), maya[0]) if maya else keys[0]
     default = before if before in keys else rec if maya else DS4_DEFAULT_QUANT
-    gb = {k: ds4_gguf_model(k)["download_gb"] for k in maya + [k for k in DS4_ABL + DS4_UD if k in keys]}
+    gb = {k: ds4_gguf_model(k)["download_gb"] for k in maya + [k for k in DS4_ABL + DS4_UD + DS4_CODER if k in keys]}
     for k in DS4_ABL + ("maya-xs",):   # (as the other entries: the whole download, Maya's n-gram tables with it)
         if k in gb:
             gb[k] += ds4_abl_engram_gb()
@@ -6005,6 +6029,11 @@ def choose_ds4_quant(a, prev: dict) -> str:
     for k in DS4_UD:   # (download_gguf.json's own words: the experts' and dense weights' types, the tables')
         q = ((read_json(DS4_GGUF_MANIFEST).get("quants") or {}).get(DS4_QUANTS[k]) or {})
         about[k] = f"unsloth's GGUF: {q.get('about', 'experts in 1.6-3.5 bits')}; ~{q.get('memory_gb', '?')} GB of VRAM + RAM hold it"
+    for k in DS4_CODER:   # (download_gguf.json's own words: the quant's types, the tables' file)
+        q = ((read_json(DS4_GGUF_MANIFEST).get("coder") or {}).get("quants") or {}).get(DS4_QUANTS[k]) or {}
+        about[k] = (f"ISTA-DASLab's quant of the model tuned for coding: {q.get('about', 'the experts in IQ2_XXS')}; "
+                    f"~{q.get('memory_gb', '?')} GB of VRAM + RAM hold it, its n-gram tables (IQ4_NL, the split's own "
+                    "sixth shard) read from the SSD")
     about["gguf-iq1_m"] = ("unsloth's UD-IQ1_M: KLD 0.198 against the original, 90.3% the same top token (our scorer; "
                            "the same scale as the other KLD numbers here); about 140 GB of VRAM + RAM plus 110 GB of "
                            "n-gram tables (IQ4_NL, not shareable with Maya's Q6_K tables) read from the SSD; for PCs "
@@ -6030,8 +6059,8 @@ def ds4_memory_gb(quant: str) -> float:
     if quant in DS4_EXL3:
         return float(DS4_EXL3[quant]["memory_gb"])
     man = read_json(DS4_GGUF_MANIFEST)
-    q = ((man.get("maya") if quant in DS4_MAYA else man.get("abliterated") if quant in DS4_ABL else man) or {}).get(
-        "quants", {}).get(DS4_QUANTS.get(quant)) or {}
+    q = ((man.get("maya") if quant in DS4_MAYA else man.get("abliterated") if quant in DS4_ABL else
+          man.get("coder") if quant in DS4_CODER else man) or {}).get("quants", {}).get(DS4_QUANTS.get(quant)) or {}
     if q.get("memory_gb"):
         return float(q["memory_gb"])
     return sum(v[0] for v in (q.get("files") or {}).values()) / 1e9 or float(DS4_MEMORY_GB)
@@ -6340,7 +6369,9 @@ def ds4_dir(a, models: Path, prev: dict, quant: str = "exl3") -> Path:
             return d
     if quant in DS4_EXL3:
         return models / DS4_EXL3[quant]["dir"]
-    return models / (f"{DS4}-abliterated-GGUF" if quant in DS4_ABL else f"{DS4}-GGUF") / DS4_QUANTS[quant]
+    home = (f"{DS4}-abliterated-GGUF" if quant in DS4_ABL else f"{DS4}-Coder-GGUF" if quant in DS4_CODER
+            else f"{DS4}-GGUF")
+    return models / home / DS4_QUANTS[quant]
 
 
 def ds4_link_engram(d: Path, m: dict, models: Path, prev: dict):
@@ -6423,7 +6454,7 @@ def ds4_pack_step(a, d: Path, gguf: bool = False, announce: bool = True, engram:
     need = ("ds4.txt", "tensors.txt", "engram.bin", "tokenizer/vocab.json", "tokenizer/chat_template.jinja")
     shards = list(files) if gguf and files else ds4_shards(d)
     if gguf and engram is not None:                    # (v1.1.16's Maya-S: its Engram tables are beside it)
-        shards += sorted(engram.glob("*.gguf"))
+        shards = list(dict.fromkeys(shards + sorted(engram.glob("*.gguf"))))
     drafter_new = gguf and (drafter or d.parent / "dspark" / "dspark.json").is_file() and not CDS.has_drafter(
         {"args": ["--pack", str(pack)]})               # (the drafter arrived after the pack was built)
     vision_new = (gguf and (ds4_vision_dir(d) / "vision.json").is_file() and not ds4_pack_has_vision(pack)) or (
@@ -6508,7 +6539,8 @@ def write_config_ds4(a, pc: dict, meta: dict, pack: Path, ctx: int, models: Path
            "engine; --vram-reserve-mib changes it)")
     cfg = {"exe": str(DS4_EXE), "args": args, "cwd": str(ROOT), "tokenizer": str(pack / "tokenizer"),
            **({"backend": "hip"} if hip else {}),
-           "model_name": DS4_ABL_MODEL_NAME if quant in DS4_ABL else DS4_MODEL_NAME,
+           "model_name": (DS4_ABL_MODEL_NAME if quant in DS4_ABL else DS4_CODER_MODEL_NAME if quant in DS4_CODER
+                          else DS4_MODEL_NAME),
            "gpu": [g["index"] for g in pc["gpus"]],
            "sampling": dict(DS4_SAMPLING), "reasoning_effort": DS4_EFFORT,   # (the model's own, every setup)
            "lib_dirs": meta.get("lib_dirs") or old.get("lib_dirs") or [], "port": port}
@@ -6560,6 +6592,7 @@ def set_up_ds4(a, prev: dict) -> Path | None:
     step(2, "your choices")                            # 2
     ok(f"files: {Q.shown('deepseek', quant)}" + (" (Maya's quant)" if quant in DS4_MAYA else
                                                  " (a gated repo: your Hugging Face token)" if quant in DS4_ABL else
+                                                 " (ISTA-DASLab's Coder GGUF)" if quant in DS4_CODER else
                                                  " (unsloth's GGUF)" if gguf else
                                                  f" ({DS4_EXL3[quant]['by']}'s EXL3 quant at {DS4_EXL3[quant]['bits']} bits)"))
     vram = sum(g.get("vram_gb", 0) for g in pc["gpus"])
@@ -6609,7 +6642,11 @@ def set_up_ds4(a, prev: dict) -> Path | None:
         ds4_unused(m, d)
     engram = old and old["engram"]                     # (v1.1.16's Maya-S: its Engram tables beside it)
     without = [m["table"]] if quant in DS4_ABL and m.get("table") else [own_table] if own_table else None
-    if without or (tabled and quant == "maya-xs"):     # (Maya's Q6_K tables; the quant's own table shard, if any, left out)
+    if quant in DS4_CODER:
+        # (the n-gram tables are the split's sixth shard, published as a GGUF of their own beside the shards: read
+        # from there, not Maya's Q6_K pair - nothing else to download)
+        without, engram = m.get("without"), d
+    elif without or (tabled and quant == "maya-xs"):   # (Maya's Q6_K tables; the quant's own table shard, if any, left out)
         if without and (d / without[0]).exists():
             warn(f"{d / without[0]}: the n-gram table the model's publisher ships, not used - Maya's Q6_K tables are "
                  f"read instead; you can delete it ({(d / without[0]).stat().st_size / 1e9:.1f} GB)")
@@ -6626,7 +6663,7 @@ def set_up_ds4(a, prev: dict) -> Path | None:
     pack = ds4_pack_step(a, d, gguf, engram=engram, files=files, drafter=dj, without=without,
                          vision_dir=vdir if vdir is not None and (vdir / "vision.bin").is_file() else None)   # 6
     if gguf:                                           # 7 (DeepSeek's checkpoint's tower, added to the pack)
-        vision = ds4_vision_step(a, pc, d, mmproj=quant in DS4_UD)   # (UD quants: unsloth's mmproj, the same tower)
+        vision = ds4_vision_step(a, pc, d, mmproj=quant in DS4_UD + DS4_CODER)   # (UD quants: unsloth's mmproj, the same tower)
         if vision and not ds4_pack_has_vision(pack):
             pack = ds4_pack_step(a, d, gguf, announce=False, engram=engram, files=files, drafter=dj, without=without)
         vision = vision and ds4_pack_has_vision(pack)
@@ -7756,7 +7793,8 @@ def main() -> int:
                          "abliterated-128g / abliterated-256g = orcarouter's abliterated model (its refusals removed) "
                          "as its Mix-128G / Mix-256G GGUF (~114 / ~236 GB of VRAM + RAM, with Maya's Q6_K n-gram "
                          "tables; a gated repo: HF_TOKEN or `hf auth login`), abliterated = the one that fits this "
-                         "PC; a Maya "
+                         "PC, gguf-iq2_xxs-coder = ISTA-DASLab's GSQ-RCO quant of the model tuned for coding (experts "
+                         "IQ2_XXS; its n-gram tables are the split's own sixth shard, a GGUF of its own); a Maya "
                          "quant also as --model deepseek-maya-s / -maya-m / -maya-xs")
     ap.add_argument("--mm3-quant", choices=list(MM3_QUANTS) + list(Q.MM3_QUANT_ALIASES),
                     help=f"{MM3}'s files: exl3 = Mia-AiLab's EXL3 quant at 3.5 bits (NVIDIA; pictures, DSpark), "
