@@ -579,7 +579,8 @@ bool part_restore_check(int64_t limit, bool here, int64_t here_pos) {
 // row's, for a sample
 bool part_recover(int64_t keep, bool logits, std::string& err) {
     if (front_only) {
-        err = "MAYA_MIXED_FRONT: the link to the part failed (this front holds only its own layers)";
+        err = "two GPUs (--mixed-gpus): the other GPU's engine is gone, so this request cannot finish - the next one "
+              "runs the model on one GPU";
         return false;
     }
     std::vector<int> t(toks.begin(), toks.begin() + std::min<int64_t>(keep, (int64_t) toks.size()));

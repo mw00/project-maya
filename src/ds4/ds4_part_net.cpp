@@ -190,7 +190,11 @@ bool Conn::send_all(const void* p, size_t n) {
     const char* c = (const char*) p;
     while (n > 0) {
         const int k = (int) std::min<size_t>(n, (size_t) 1 << 24);
+#if defined(MSG_NOSIGNAL)
+        const int r = (int) ::send((sock_t) fd_, c, k, MSG_NOSIGNAL);   // (a peer gone: an error here, no SIGPIPE)
+#else
         const int r = (int) ::send((sock_t) fd_, c, k, 0);
+#endif
         if (r <= 0) {
             err_ = "send failed (" + std::to_string(part_errno()) + ")";
             close();

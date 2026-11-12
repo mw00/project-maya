@@ -28,7 +28,11 @@ ABLATE_FLAGS = {"--ablate": 1, "--ablate-default": 1, "--ablate-layer": 1, "--ab
 
 
 class Unavailable(Exception):
-    """Why the two-GPU run cannot start: the model then runs on the HIP GPU alone."""
+    """Why the two-GPU run cannot start: the model then runs on the HIP GPU alone (again: a later start may work)."""
+
+    def __init__(self, why: str, again: bool = True):
+        super().__init__(why)
+        self.again = again
 
 
 def config_of(cfg: dict) -> dict | None:
@@ -119,26 +123,28 @@ def engine_class(base, wait_gpu_release):
                         p.wait(timeout=20)
                         wait_gpu_release(p.pid)
                     self._stop_part()
-                    self._fall(str(e))
+                    self._fall(str(e), e.again)
             base.__init__(self, *spawn)
 
-        def _fall(self, why: str):
+        def _fall(self, why: str, again: bool = True):
             self.mixed_off = why
-            print(f"[maya] two GPUs (--mixed-gpus): {why} - the model runs on the AMD GPU alone from here (it loads "
-                  "all its layers now; Maya's next start tries both GPUs again)", flush=True)
+            print(f"[maya] two GPUs (--mixed-gpus): {why} - the model runs on the AMD GPU alone" +
+                  (" from here (it loads all its layers now; Maya's next start tries both GPUs again)" if again else ""),
+                  flush=True)
 
         def _start_mixed(self, spawn):
             exe, args, cwd, log, env = spawn
             m = self.mixed_cfg
             if os.name == "nt":
-                raise Unavailable("not on Windows yet (no shared-memory path between the two engines there)")
+                raise Unavailable("not on Windows yet (no shared-memory path between the two engines there)", False)
             if "--parallel" in args[:-1] and int(args[args.index("--parallel") + 1]) > 1:
                 raise Unavailable("it runs one conversation at a time, and this config has --parallel "
-                                  f"{args[args.index('--parallel') + 1]}")
+                                  f"{args[args.index('--parallel') + 1]}", False)
             if not Path(m["exe"]).is_file():
-                raise Unavailable(f"no CUDA build of maya-ds4 at {m['exe']} (mixed_exe in the config names another)")
+                raise Unavailable(f"no CUDA build of maya-ds4 at {m['exe']} (mixed_exe in the config names another)",
+                                  False)
             if "--pack" not in args[:-1]:
-                raise Unavailable("the config names no --pack")
+                raise Unavailable("the config names no --pack", False)
             pack = args[args.index("--pack") + 1]
             common = set_flag(strip_flags(list(args), ABLATE_FLAGS), "--threads", "on")
             if any(a in args for a in ABLATE_FLAGS):
@@ -207,6 +213,13 @@ def engine_class(base, wait_gpu_release):
                     p.kill()
                     p.wait(timeout=20)
             wait_gpu_release(p.pid)
+
+        def death_note(self) -> str:
+            if not self.mixed_on:
+                return base.death_note(self)
+            side = "the NVIDIA card's engine" if self._part_alive() else "the AMD GPU's engine"
+            return (f"Two GPUs (--mixed-gpus): {side} ended, so this request could not finish; the next request runs the "
+                    f"model on the AMD GPU alone (logs: {self.log_path}, {getattr(self, 'part_log', '')}).")
 
         def alive(self) -> bool:
             return base.alive(self) and (not self.mixed_on or self._part_alive())

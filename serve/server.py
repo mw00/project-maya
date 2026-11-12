@@ -2514,6 +2514,8 @@ class Service:
         if isinstance(req.get("top_logprobs"), str):
             req["top_logprobs"] = n
         top = (getattr(self.engine, "info", None) or {}).get("logprobs")
+        if n is not None and (getattr(self.engine, "info", None) or {}).get("mixed_gpus"):
+            raise ValueError("logprobs: not given with two GPUs (--mixed-gpus) yet - start Maya without it for them")
         if n is not None and not (isinstance(top, int) and top >= n):
             raise ValueError("logprobs: this model's engine does not report token log-probabilities (the DeepSeek "
                              "engine does - update Maya (./maya.sh --setup) if it is that one)")
@@ -3573,6 +3575,9 @@ class Service:
                 # GLM-5.3 (glm-dsa) has no vision tower: say so plainly - there is no encoder to choose
                 raise ValueError(f"{self.model} reads text only, so it cannot read images: send the request without "
                                  "the image parts (describe the picture in text instead)")
+            if self.vision is None and (getattr(self.engine, "info", None) or {}).get("mixed_gpus"):
+                raise ValueError("pictures are not read with two GPUs (--mixed-gpus) yet - start Maya without it for "
+                                 "them")
             if self.vision is None:
                 raise ValueError("this server was started without the vision encoder (run setup again and choose "
                                  "'vision'), so it cannot read images or videos")
