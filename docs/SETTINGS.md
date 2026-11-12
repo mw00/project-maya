@@ -725,6 +725,13 @@ A request can set its own window and cut (for tuning, without a restart): `"stra
 the confidences - two GPUs default to 1 and 0.9; `MAYA_GLM_DFLASH_MIN` / `_CUM` set them for every request);
 `"spec": 1` decodes without drafting.
 
+With multiple GLM serving slots (`MAYA_GLM_SEQS`), this build uses DFlash while exactly one request is active,
+then yields at a committed verify-round boundary when another request arrives. Several active requests use the
+multi-session scheduler; the configured slot count is unchanged. Returning to one request restarts the shared
+draft cache and fills it from new target captures, so draft acceptance can initially be lower. The target KV
+state stays with each session. `MAYA_GLM_MULTI_SPEC=0` disables the solo speculative stint, and each request's
+`spec`, `spec_min_p`, `spec_n_min` and `spec_cum` settings survive waiting for a slot.
+
 Maya-L, greedy answers to five prompts - explanation, code, a list, a short story, a question about a
 20,000-character document - in tokens/s, each pair measured back to back. Nine GPUs (an RTX 3090 and eight RTX 5060
 Ti, the CPU lane on):
