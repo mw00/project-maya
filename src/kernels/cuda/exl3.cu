@@ -98,13 +98,23 @@ __device__ __forceinline__ uint32_t bytesum_plus(uint32_t x, uint32_t acc) {
 #endif
 }
 
+// codebook 2's two products -> the half2 (0x6400 + bytes of x0, 0x6400 + bytes of x1): on AMD the second byte sum goes
+// straight into the high half (v_sad_hi_u8: its sum << 16 onto the first's 0x6400 + sum : 0x6400) - no mask, no pack,
+// the same bits (a sum of 4 bytes is at most 1020: nothing carries into the high half)
+__device__ __forceinline__ __half2 bytesum2h(uint32_t x0, uint32_t x1) {
+#if defined(STRATA_USE_HIP)
+    const uint32_t pk = __builtin_amdgcn_sad_hi_u8(x1, 0u, __builtin_amdgcn_sad_u8(x0, 0u, 0x64006400u));
+    return *reinterpret_cast<const __half2*>(&pk);
+#else
+    const uint32_t a = bytesum_plus(x0, 0x6400u), b = bytesum_plus(x1, 0x6400u);
+    return __halves2half2(__ushort_as_half((unsigned short) a), __ushort_as_half((unsigned short) b));
+#endif
+}
 // two states -> two values, FP16 arithmetic as exllamav3's decode_3inst_2 (the tensor-core kernels take the half2)
 template <int cb>
 __device__ __forceinline__ __half2 decode2h(uint32_t s0, uint32_t s1) {
     if constexpr (cb == 2) {
-        const uint32_t a = bytesum_plus(s0 * 0x83DCD12Du, 0x6400u);
-        const uint32_t b = bytesum_plus(s1 * 0x83DCD12Du, 0x6400u);
-        const __half2 h = __halves2half2(__ushort_as_half((unsigned short) a), __ushort_as_half((unsigned short) b));
+        const __half2 h = bytesum2h(s0 * 0x83DCD12Du, s1 * 0x83DCD12Du);
         return __hfma2(h, __half2half2(__ushort_as_half(0x1eee)), __half2half2(__ushort_as_half(0xc931)));
     } else {
         uint32_t x0 = cb == 1 ? s0 * 0xCBAC1FEDu : s0 * 89226354u + 64248484u;
