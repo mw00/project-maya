@@ -4321,6 +4321,8 @@ bool Glm5Model::fast_warm(std::string& err) {
     // Experts in file order: the warm-up reads whole experts, and in the order the routes rank
     // them (layer round-robin), reads seek all over the model's files (a cold read from a disk at ~0.05-0.10 GB/s).
     // Sorting jobs by physical (shard, offset) turns ~37,000 random seeks into sequential streaming.
+    std::vector<const uint8_t*> slot_order(jobs.size());   // (glm-dsa B8.1: the jobs the sort moves are counted)
+    for (size_t i = 0; i < jobs.size(); ++i) slot_order[i] = jobs[i].dst;
     std::stable_sort(jobs.begin(), jobs.end(), [&](const Job& a, const Job& b) {
         const auto& na = pack_layers_[(size_t) a.il];
         const auto& nb = pack_layers_[(size_t) b.il];
@@ -4332,6 +4334,7 @@ bool Glm5Model::fast_warm(std::string& err) {
                                             : nb.gate_off + (uint64_t) b.e * F->L[(size_t) b.il].gu_bytes;
         return std::make_pair(shard_a, off_a) < std::make_pair(shard_b, off_b);
     });
+    for (size_t i = 0; i < jobs.size(); ++i) n_moved += jobs[i].dst != slot_order[i];
     // stream them: 8 experts per batch, 3 slices each in parallel; VRAM ones through the pinned staging
     size_t done_bytes = 0, total_bytes = 0;
     for (const auto& j : jobs) total_bytes += F->L[(size_t) j.il].blob;
