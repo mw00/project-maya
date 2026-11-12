@@ -143,20 +143,20 @@ int main(int argc, char** argv) {
 
     // Defect 5 evidence: the env-var sources the Interfaces line requires
     {
-        unsetenv("STRATA_GLM_PAGE_POOL_GB");
-        setenv("STRATA_GLM_PAGE_SIZE", "128", 1);
-        require("STRATA_GLM_PAGE_SIZE=128 honored", GlmPages::env_page_size() == 128, 0);
+        unsetenv("MAYA_GLM_PAGE_POOL_GB");
+        setenv("MAYA_GLM_PAGE_SIZE", "128", 1);
+        require("MAYA_GLM_PAGE_SIZE=128 honored", GlmPages::env_page_size() == 128, 0);
         require("env pool pages 1 GiB / 1 MiB page", GlmPages::env_pool_pages(8 * 1024) == 1024, 0);
-        unsetenv("STRATA_GLM_PAGE_SIZE");
-        require("STRATA_GLM_PAGE_SIZE default is 256", GlmPages::env_page_size() == 256, 0);
+        unsetenv("MAYA_GLM_PAGE_SIZE");
+        require("MAYA_GLM_PAGE_SIZE default is 256", GlmPages::env_page_size() == 256, 0);
         require("env pool pages at the 256 default", GlmPages::env_pool_pages(8 * 1024) == 512, 0);
     }
 
     // the eviction unit check + the pressure branch (the selftests in glm_pages.cu;
     // their own check lines print as they run)
     {
-        setenv("STRATA_GLM_PAGE_POOL_GB", "", 1);   // a small pool fits beside production
-        unsetenv("STRATA_GLM_PAGE_SIZE");
+        setenv("MAYA_GLM_PAGE_POOL_GB", "", 1);   // a small pool fits beside production
+        unsetenv("MAYA_GLM_PAGE_SIZE");
         const bool lru_ok = strata::glm_pages_lru_selftest();
         require("lru_selftest: fill, force evict, in-use gathers bit-exact", lru_ok ? 1 : 0, 0);
         const bool pressure_ok = strata::glm_pages_pressure_selftest();

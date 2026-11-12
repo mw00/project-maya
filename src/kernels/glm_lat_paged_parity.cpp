@@ -3,7 +3,7 @@
 // bit-exact against the contiguous arena for FP16 (1024 B rows, kv_lora
 // 512 x 2) and INT8 (544 B rows) at page sizes 4/64/256/512, with a
 // SHUFFLED (non-identity) table so the physical reordering is observable.
-// With STRATA_GLM_PAGED unset the incumbent path is untouched: lat_table
+// With MAYA_GLM_PAGED unset the incumbent path is untouched: lat_table
 // stays null and every write/gather keeps the contiguous offsets.
 // SeqCtx lives in strata/core/glm_model.hpp (the corrected
 // anchor: glm_fast_state.hpp does not exist in the tree).
@@ -74,14 +74,14 @@ int main(int argc, char** argv) {
     if (argc < 2 || strcmp(argv[1], "--selftest") != 0) return 0;
     const int Ps[4] = {4, 64, 256, 512};
     const int T = 1024;   // spans several pages at every P
-    const char* paged_env = getenv("STRATA_GLM_PAGED");
+    const char* paged_env = getenv("MAYA_GLM_PAGED");
     int flag_off = (paged_env == NULL || paged_env[0] == '\0' ||
                     (paged_env[0] == '0' && paged_env[1] == '\0'));
  // (TDD artifact, flag-on run: the check became state-asserting)
     if (flag_off)
-        require("flag-off incumbent (STRATA_GLM_PAGED unset)", flag_off, 0);
+        require("flag-off incumbent (MAYA_GLM_PAGED unset)", flag_off, 0);
     else
-        require("flag-on paged routing (STRATA_GLM_PAGED set)", !flag_off, 0);
+        require("flag-on paged routing (MAYA_GLM_PAGED set)", !flag_off, 0);
     char name[128];
     for (int pi = 0; pi < 4; pi++) {
         int P = Ps[pi];
