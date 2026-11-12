@@ -19269,6 +19269,9 @@ struct Model::Impl {
         double f_res = 0, f_cold = 0, w = 0;
         const int nw = n / kWin, rem = n % kWin;
         for (int il = 0; il < g.nl; ++il) {
+            // (MAYA_MIXED_FRONT: the other GPU's layers never run here - their experts in RAM or not must not pick
+            //  this front's path: that made a short prompt's reading, and so its answer, hang on the page cache)
+            if (front_only && away(il)) continue;
             const Layer& l = L[(size_t) il];
             int nc = 0;
             const double a = pm_rate(l, nc);
@@ -20423,6 +20426,22 @@ struct Model::Impl {
         if (!cone.empty()) {
             fp.skip = yl;
             fp.cone = std::move(cone);
+        }
+        // MAYA_MIXED_FRONT: the run's first chunk starts with a short lead - its rows reach the part while this GPU
+        // reads the rest of that chunk, so the part's layers start early (one chunk: the two GPUs otherwise run one
+        // after the other).  Its rows: the first chunk's share of the front's layers (part_hi of g.nl), whole 64s;
+        // MAYA_MIXED_LEAD=<rows> sets them, 0: no lead
+        if (front_only && part_hi > 0 && part_hi < g.nl && !fp.ends.empty()) {
+            static const int env_lead = std::getenv("MAYA_MIXED_LEAD") != nullptr ? std::atoi(std::getenv("MAYA_MIXED_LEAD")) : -1;
+            const int w0 = fp.ends[0];
+            int lead = env_lead >= 0 ? env_lead : (int) (((int64_t) w0 * part_hi / g.nl + 63) / 64 * 64);
+            if (lead >= 64 && w0 - lead >= 256) {
+                fp.ends.insert(fp.ends.begin(), lead);
+                if (fp.skip >= 0 && fp.cone.empty()) {   // (the cut: the same row, one chunk later where it is past the lead)
+                    if (fp.cut_k > 0) ++fp.cut_k;
+                    else if (fp.cut_r >= lead) fp.cut_k = 1, fp.cut_r -= lead;
+                }
+            }
         }
         if (fp.skip >= 0 && o.verbose && !fp.cone.empty())
             std::fprintf(stderr, "ds4: prompt cone: layer %d from row %d (KV-only before it), layer %d from row %d\n",

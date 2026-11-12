@@ -440,6 +440,7 @@ bool part_verify(int y, const std::vector<int>& drafts, float temperature, float
     drafts_q = false;
     rollback(p0, T, m + 1);
     accepted = m;
+    mg_round(m, n);
     ++part_rounds;
     st.drafts_offered += n;
     st.drafts_accepted += m;
@@ -470,7 +471,9 @@ bool part_draft(int y, std::vector<int>& out, std::vector<float>& conf, std::str
     a_cut.conf_min = part_dargs.conf_min;
     a_cut.cum_min = part_dargs.cum_min;
     a_cut.min_n = part_dargs.min_n;
+    bool pre_hit = false;
     if (part_pre.have && part_pre.y == y && a_cut.same(part_dargs, part_pre.q)) {   // (drafted with the last answer)
+        pre_hit = true;
         out.clear();
         conf.clear();
         double cum = 1.0;
@@ -529,6 +532,7 @@ bool part_draft(int y, std::vector<int>& out, std::vector<float>& conf, std::str
         out.resize((size_t) max_drafts);
         conf.resize((size_t) max_drafts);
     }
+    if (mg.on) mg_draft(y, pre_hit ? part_pre.d : out, out);
     st.draft_ms += now_ms() - t0;
     ++st.drafts_rounds;
     return true;
@@ -1330,11 +1334,47 @@ void set_pen(int last_n, float repeat, float freq, float present) {
     pen_freq = freq;
     pen_present = present;
 }
+// MAYA_MIXED_GUESS_STATS=1 (a front, measuring only): how often the next round's window could have been guessed
+// before the part's verify ended - every draft kept, `next` the round's block's first token past its cut, the next
+// round's drafts the block's tokens after it (MAYA_POOL_FULL_DRAFT=1 on the part: the whole block comes back)
+struct GuessStats {
+    bool on = std::getenv("MAYA_MIXED_GUESS_STATS") != nullptr;
+    bool pending = false, all = false;
+    std::vector<int> block;   // the last round's drafts as they came, before the cut
+    int n = 0;                // ... of them the round offered
+    int64_t rounds = 0, all_kept = 0, next_hit = 0, win_hit = 0;
+} mg;
+void mg_round(int m, int n) {   // (part_verify: the verdict)
+    if (!mg.on) return;
+    ++mg.rounds;
+    mg.pending = true;
+    mg.all = m == n;
+}
+void mg_draft(int y, const std::vector<int>& whole, const std::vector<int>& out) {   // (part_draft: the next drafts)
+    if (!mg.on) return;
+    if (mg.pending && mg.all) {
+        ++mg.all_kept;
+        const size_t c = (size_t) mg.n;
+        if (mg.block.size() > c && mg.block[c] == y) {
+            ++mg.next_hit;
+            bool w = mg.block.size() >= c + 1 + out.size();
+            for (size_t i = 0; w && i < out.size(); ++i) w = mg.block[c + 1 + i] == out[i];
+            if (w) ++mg.win_hit;
+        }
+    }
+    mg.pending = false;
+    mg.block = whole;
+    mg.n = (int) out.size();
+}
 std::string part_stats() const {
-    char b[320];
-    std::snprintf(b, sizeof b, "pool: %lld verify rounds, %lld answers, %lld drafts from answers; own layers (verify) %.0f ms, sending %.0f ms, "
+    char b[480];
+    int k = std::snprintf(b, sizeof b, "pool: %lld verify rounds, %lld answers, %lld drafts from answers; own layers (verify) %.0f ms, sending %.0f ms, "
                   "waiting for answers %.0f ms (the part busy %.0f ms of it, the link the rest), %.1f MB sent",
                   (long long) part_rounds, (long long) part_waits, (long long) part_pre_hits, part_local_ms, part_net_ms, part_wait_ms,
                   part_remote_ms, part_tx_bytes / 1e6);
+    if (mg.on && k > 0 && k < (int) sizeof b)
+        std::snprintf(b + k, sizeof b - (size_t) k, "; guess: %lld rounds, %lld all kept, %lld next = the block's, %lld "
+                      "whole window guessed", (long long) mg.rounds, (long long) mg.all_kept, (long long) mg.next_hit,
+                      (long long) mg.win_hit);
     return b;
 }
