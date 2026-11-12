@@ -1253,7 +1253,8 @@ bool Glm5Model::prefill_setup(std::string& err) {
     // there, the pool is the capped one - without a prestage buffer).  MAYA_GLM_COMPLETE_POOL=0: never (on by
     // default on every GPU: complete_pool_on).
     bool complete = false;
-    if (glmfast::complete_pool_on() && !F->unified_memory && has_moe && stride_sum > 0 &&
+    if (glmfast::complete_pool_on() && (!F->unified_memory || glmfast::unified_complete_pool()) && has_moe &&
+        stride_sum > 0 &&
         ceiling > 0) {
         const auto pu = prefill_bytes_for((size_t) ceiling);
         size_t bufs = pu.first + pu.second + (size_t) w16_elems * 2 + (size_t) w32_elems * 4 + ws_bytes + gbuf + 4096;
