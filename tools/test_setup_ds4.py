@@ -1243,6 +1243,42 @@ class Vision(unittest.TestCase):
         self.assertEqual(self.v, self.models / "DeepSeek-V4.1-Flash-1017-GGUF" / "vision")
         self.assertEqual(maya.ds4_vision_dir(self.d.parent / "UD-Q4_K_XL"), self.v)
 
+    def test_setup_keeps_flat_model_vision_inside_models_dir(self):
+        """A retained pack directly in --models-dir must not download vision on its parent disk."""
+        shard = self.models / "model.gguf"
+        shard.write_bytes(b"g")
+        pack = self.models / "maya-ds4"
+        previous = {"args": ["--pack", str(pack)], "installer": {"ds4_quant": "maya-s"}}
+        with patch.object(maya, "check_pc", return_value={"gpus": [{"index": 0}]}), \
+                patch.object(maya, "choose_context", return_value=65536), \
+                patch.object(maya, "tools_step", return_value=None), patch.object(maya, "build_step", return_value={}), \
+                patch.object(maya, "ds4_earlier", return_value=None), \
+                patch.object(maya, "ds4_upgrade_from", return_value=None), \
+                patch.object(maya, "ds4_shared_tables", return_value=None), \
+                patch.object(maya, "ds4_model_step", return_value=[shard]), \
+                patch.object(maya, "ds4_unused"), patch.object(maya, "ds4_drafter_step", return_value=False), \
+                patch.object(maya, "ds4_vision_step", return_value=True) as vision, \
+                patch.object(maya, "ds4_pack_step", return_value=pack) as packs, \
+                patch.object(maya, "ds4_pack_has_vision", return_value=False), \
+                patch.object(maya, "write_config_ds4", return_value=self.models / "maya-ds4.json"), \
+                patch.object(maya.CDS, "has_drafter", return_value=False):
+            maya.set_up_ds4(args(ds4_quant="maya-s", models_dir=str(self.models)), previous)
+        self.assertEqual(vision.call_args.kwargs.get("v"), self.models / "vision")
+        self.assertEqual(len(packs.call_args_list), 2)
+        for call in packs.call_args_list:
+            self.assertEqual(call.kwargs.get("vision_dir"), self.models / "vision")
+
+    def test_explicit_vision_dir_is_passed_to_gguf_pack(self):
+        pack = self.d / "maya-ds4"
+        (pack / "tokenizer").mkdir(parents=True)
+        for f in ("ds4.txt", "tensors.txt", "engram.bin", "tokenizer/vocab.json", "tokenizer/chat_template.jinja"):
+            (pack / f).write_text("hidden_size 4096\n")
+        target = self.d / "vision"
+        with patch.object(maya, "run") as run:
+            maya.ds4_pack_step(args(repack=True), self.d, gguf=True, vision_dir=target)
+        command = run.call_args.args[0]
+        self.assertEqual(command[command.index("--vision") + 1], str(target))
+
     def test_no_vision_downloads_nothing(self):
         with patch.object(maya, "offer_download", side_effect=AssertionError("asked")):
             self.assertFalse(maya.ds4_vision_step(args(no_vision=True), {}, self.d))
