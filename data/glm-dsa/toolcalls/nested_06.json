@@ -1,0 +1,76 @@
+{
+ "id": "nested_06",
+ "group": "nested",
+ "api": "openai",
+ "request": {
+  "messages": [
+   {
+    "role": "user",
+    "content": "Make a line chart of temperature: label 'Berlin' values 3.5, 4.1, 7.8, 12.2."
+   }
+  ],
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "plot_chart",
+     "description": "Draw a chart from data series.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "kind": {
+        "type": "string",
+        "enum": [
+         "line",
+         "bar",
+         "pie"
+        ]
+       },
+       "title": {
+        "type": "string"
+       },
+       "series": {
+        "type": "array",
+        "items": {
+         "type": "object",
+         "properties": {
+          "label": {
+           "type": "string"
+          },
+          "values": {
+           "type": "array",
+           "items": {
+            "type": "number"
+           }
+          }
+         },
+         "required": [
+          "label",
+          "values"
+         ]
+        }
+       }
+      },
+      "required": [
+       "kind",
+       "series"
+      ]
+     }
+    }
+   }
+  ]
+ },
+ "expect": {
+  "calls": [
+   {
+    "name": "plot_chart",
+    "args": {
+     "kind": "line"
+    }
+   }
+  ],
+  "min_calls": 1,
+  "max_calls": 3,
+  "no_call": false
+ }
+}

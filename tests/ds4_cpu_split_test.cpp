@@ -16,7 +16,7 @@
 // somewhere (else the test proves nothing).
 //
 // The EXL3 kernels run on the one tier this CPU picks (exl3_cpu_tier(), printed at start-up): 0 scalar, 1 AVX2 + FMA +
-// F16C, 2 AVX-512 F/BW, 3 AVX-512 VNNI - the widest the CPU has.  STRATA_FORCE_AVX2=1 keeps an AVX-512 CPU on tier 1
+// F16C, 2 AVX-512 F/BW, 3 AVX-512 VNNI - the widest the CPU has.  MAYA_FORCE_AVX2=1 keeps an AVX-512 CPU on tier 1
 // (ctest ds4_cpu_split_test_avx2; on a CPU without AVX-512 that is the default run again).  Tier 2 cannot be forced on a
 // VNNI CPU (it always takes 3), so only a CPU with AVX-512 F/BW and no VNNI tests it.
 #include "../src/ds4/ds4_cpu_exl3.hpp"
@@ -109,12 +109,12 @@ int main(int argc, char** argv) {
     // the kernels' tier this run tests (src/kernels/cpu/exl3_cpu.cpp detect_tier)
     const int tier = kc::exl3_cpu_tier();
     const char* tier_names[] = {"scalar", "AVX2 + FMA + F16C", "AVX-512 F/BW", "AVX-512 VNNI"};
-    const char* force = std::getenv("STRATA_FORCE_AVX2");
+    const char* force = std::getenv("MAYA_FORCE_AVX2");
     const bool forced = force != nullptr && force[0] == '1';
     std::printf("EXL3 CPU tier %d (%s)%s\n", tier, tier >= 0 && tier <= 3 ? tier_names[tier] : "unknown",
-                forced ? ", STRATA_FORCE_AVX2=1" : "");
+                forced ? ", MAYA_FORCE_AVX2=1" : "");
     expect(tier >= 0 && tier <= 3, "exl3_cpu_tier() = " + std::to_string(tier) + ", not 0-3");
-    expect(!forced || tier <= 1, "STRATA_FORCE_AVX2=1 but tier " + std::to_string(tier));
+    expect(!forced || tier <= 1, "MAYA_FORCE_AVX2=1 but tier " + std::to_string(tier));
     test_runs();
 
     const int E = small ? 1280 : 5120, FF = small ? 768 : 2304;

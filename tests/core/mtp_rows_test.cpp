@@ -1,4 +1,4 @@
-// The host-side rules of several conversations drafting at once (STRATA_GLM_MULTI_MTP, strata/core/mtp_rows.hpp): a
+// The host-side rules of several conversations drafting at once (MAYA_GLM_MULTI_MTP, strata/core/mtp_rows.hpp): a
 // window's rows from its drafts, budget and room; a group cut to its row cap; the kept rows of a window, with stops,
 // forced tokens and the last row; the head's argmax-or-sampler rule.  CPU only.
 #include "strata/core/mtp_rows.hpp"

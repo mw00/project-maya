@@ -56,6 +56,8 @@ void gather_native(const void*, const void*, size_t, const void*, size_t, void*,
 void gather_strata_q2(const uint8_t*, void*, void*, void*) {}
 void swiglu(const float*, float*, int64_t, int64_t, bool, void*) {}
 void iota(int32_t*, int64_t, void*) {}
+bool set_whole_tiles(bool) { return false; }
+bool whole_tiles() { return false; }
 }  // namespace strata::prefill::mmq
 #endif
 
@@ -78,18 +80,18 @@ double g_pinned_share = 1.0;
 // The streamed ring: 384 slots when (nearly) every streamed expert is DMA'd from pinned RAM - measured on Q2_0,
 // 8192-token chunks: 96 slots 1153 tok/s, 384 1294 (the next layer's experts arrive during its attention half) -
 // and 96 when a large share goes through host copies (IQ3_S on 64 GB, a third unpinned: 96 slots 1216, 256 1070 -
-// the host copies are the limit and the bigger ring only takes cache slots).  STRATA_PREFILL_RING overrides.
+// the host copies are the limit and the bigger ring only takes cache slots).  MAYA_PREFILL_RING overrides.
 inline int ring_slots(size_t T) {
-    const char* v = std::getenv("STRATA_PREFILL_RING");
+    const char* v = std::getenv("MAYA_PREFILL_RING");
     const int r = v ? std::atoi(v) : (g_pinned_share >= 0.9 ? 384 : 96);
     const int big = r < 16 ? 16 : r > RING_MAX ? RING_MAX : r;
     return (int64_t) T >= STREAM_ALL_MIN ? big : STAGE;
 }
 constexpr int DQ = 2;              // dequantized-expert ring (FP16 gate/up + down)
 
-// F-1: STRATA_GR_UNFUSED=1 keeps the FP32 copy of the normalized rows (gr_norm + gr_mix), the A/B arm
+// F-1: MAYA_GR_UNFUSED=1 keeps the FP32 copy of the normalized rows (gr_norm + gr_mix), the A/B arm
 inline bool gr_unfused() {
-    static const bool v = [] { const char* e = std::getenv("STRATA_GR_UNFUSED"); return e && e[0] == '1'; }();
+    static const bool v = [] { const char* e = std::getenv("MAYA_GR_UNFUSED"); return e && e[0] == '1'; }();
     return v;
 }
 
@@ -127,7 +129,7 @@ struct Alloc {
 // j-th unpinned expert, in launch order - lands in host buffer j % kRing, which is free again once the DMA of job
 // j - kRing (recorded by the launching thread, `issued`) is done.
 struct Stager {
-    // D-5: the pinned ring's depth (STRATA_STAGER_RING, default 16) - how far the host copies can run ahead of the
+    // D-5: the pinned ring's depth (MAYA_STAGER_RING, default 16) - how far the host copies can run ahead of the
     // DMAs of the unpinned experts' blobs
     int kRing = 16;
     // v1.1.32: `src` null = an expert a staging source assembles on demand (GgufExpertSource): copied by `from`
@@ -152,7 +154,7 @@ struct Stager {
     int device = 0;
 
     bool init(size_t blob_bytes, int nthreads) {
-        if (const char* v = std::getenv("STRATA_STAGER_RING")) kRing = std::clamp(std::atoi(v), 2, 256);
+        if (const char* v = std::getenv("MAYA_STAGER_RING")) kRing = std::clamp(std::atoi(v), 2, 256);
         buf.assign((size_t) kRing, nullptr);
         pinned.assign((size_t) kRing, 0);
         dma_done.assign((size_t) kRing, nullptr);
@@ -298,7 +300,7 @@ struct Prefill::Impl {
     // The grouping tables in mapped pinned memory, [ids | slot | src] of T_max * K each, then the MMQ bounds: kernels
     // read and write them in place.  A cudaMemcpyAsync of them queues behind the expert blobs the copy stream already
     // holds (up to `ring` of them, ~70 us each), and the GPU idles meanwhile - measured 4.2 s of a 128K prompt's
-    // 70 s at the default ring, 0.7 s with a 16-slot one.  STRATA_GROUP_COPY=1: the copies (the A/B arm).
+    // 70 s at the default ring, 0.7 s with a 16-slot one.  MAYA_GROUP_COPY=1: the copies (the A/B arm).
     int32_t* grp_host = nullptr;
     int32_t* grp_dev = nullptr;          // its device alias
     size_t grp_n = 0, grp_tk = 0;        // int32s allocated; T_max * K (the offset of slot, and of src past it)
@@ -339,10 +341,10 @@ struct Prefill::Impl {
 
 namespace {
 // the staging pool of a streamed session: every page of one layer (same sequence in init and bytes_needed)
-// STRATA_KV_STAGE_OWN (A/B only): the staging pool gets its own allocation instead of borrowed expert slots, so a
+// MAYA_KV_STAGE_OWN (A/B only): the staging pool gets its own allocation instead of borrowed expert slots, so a
 // streamed run lends the prompt path exactly the slots a resident one does (a lent expert runs on the CPU, which
 // rounds differently: without this an A/B compares two expert placements as well as two KV placements)
-bool stage_own() { static const bool v = std::getenv("STRATA_KV_STAGE_OWN") != nullptr; return v; }
+bool stage_own() { static const bool v = std::getenv("MAYA_KV_STAGE_OWN") != nullptr; return v; }
 void take_stage(Alloc& o_borrowed, const core::SessionState& ss, const strata::kernels::QsaShapes& s,
                 strata::kernels::KvHostPools& st, bool& ok) {
     const core::QsaState& q0 = ss.qsa_states[0];
@@ -420,7 +422,7 @@ uint64_t qsa_set_bytes(size_t T, int64_t cap, int64_t max_blocks, int64_t sel_ba
 }
 // Step 2b: which layers' experts go through MMQ (both weight types covered; the Strata Q2_0 pack always - its blob
 // is converted to GGUF Q2_0 blocks on the gather), whether any layer keeps the FP16 path (IQ1_M), and the largest
-// gate/up and down matrices a group buffer slot holds.  STRATA_PREFILL_MMQ=0: the FP16 path everywhere (the A/B).
+// gate/up and down matrices a group buffer slot holds.  MAYA_PREFILL_MMQ=0: the FP16 path everywhere (the A/B).
 constexpr int MMQ_GROUP = 16;                  // experts per MMQ launch (the gather is per expert, as blobs arrive)
 // MMQ reads up to one 256-value tile past a matrix's last row when the row length is not a multiple of it (the down
 // product: 640 values).  Those bytes meet zero activations, which is harmless only if they decode to finite numbers -
@@ -437,7 +439,7 @@ const MmqPlan& mmq_plan() {
     static const MmqPlan plan = [] {
         MmqPlan p;
         const auto& lay = strata::kernels::cpu::expert_layout();
-        const char* env = std::getenv("STRATA_PREFILL_MMQ");
+        const char* env = std::getenv("MAYA_PREFILL_MMQ");
         const bool on = mmq::built() && (env == nullptr || std::atoi(env) != 0);
         const int64_t layers = lay.native ? (int64_t) lay.fmt.size() : lay.n_layers;
         p.layer.assign((size_t) std::max<int64_t>(layers, 0), 0);
@@ -457,7 +459,7 @@ const MmqPlan& mmq_plan() {
     }();
     return plan;
 }
-// The Volta grouped-WMMA prompt experts (STRATA_PF_WMMA): requested, this pack's layers all in the kernel's format
+// The Volta grouped-WMMA prompt experts (MAYA_PF_WMMA): requested, this pack's layers all in the kernel's format
 // set (gate/up IQ3_XXS / IQ3_S / IQ2_S / IQ4_XS, down IQ4_NL / Q2_0 - the 640-column down needs a block size that
 // divides it), and the current device strict Volta (sm_70).  When on, the MoE products skip the q8_1 quantization:
 // the activations stay FP16 (mixed_h, gathered by src; H reused as FP16), so Xq and Hq are not sized and H is a
@@ -467,7 +469,7 @@ bool wmma_buffers() {
     return false;
 #else
     static const bool covered = [] {
-        const char* e = std::getenv("STRATA_PF_WMMA");
+        const char* e = std::getenv("MAYA_PF_WMMA");
         if (!e || std::atoi(e) == 0 || !mmq_plan().any || mmq_plan().fallback) return false;
         const auto& lay = strata::kernels::cpu::expert_layout();
         if (!lay.native || lay.fmt.empty()) return false;
@@ -555,7 +557,7 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
         m.stager = std::make_unique<Stager>();
         m.stager->from = src;
         const int hw = (int) std::thread::hardware_concurrency();
-        const char* stv = std::getenv("STRATA_STAGER_THREADS");   // D-5: the host copy threads of unpinned blobs
+        const char* stv = std::getenv("MAYA_STAGER_THREADS");   // D-5: the host copy threads of unpinned blobs
         if (!m.stager->init((size_t) MAXBLOB(), stv ? std::clamp(std::atoi(stv), 1, 32) : std::max(2, std::min(4, hw / 4))))
             ok = false;
     }
@@ -563,7 +565,7 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
     m.ids_host.resize(T * K); m.slot_host.resize(T * K); m.src_host.resize(T * K); m.cnt.resize(m.g->n_expert); m.off.resize(m.g->n_expert + 1);
     {
         const size_t need = 3 * T * K + (size_t) (2 * (m.g->n_expert + m.g->n_expert / MMQ_GROUP + 2));
-        const char* gc = std::getenv("STRATA_GROUP_COPY");
+        const char* gc = std::getenv("MAYA_GROUP_COPY");
         if (m.grp_n < need && !(gc && gc[0] == '1')) {
             if (m.grp_host) cudaFreeHost(m.grp_host);
             m.grp_host = m.grp_dev = nullptr;
@@ -707,10 +709,10 @@ bool Prefill::carve(size_t T, void* alloc) {
 
 bool Prefill::relayout(int64_t chunk, void* borrow, uint64_t borrow_bytes, std::string& err) {
     Impl& m = *impl_;
-    // A test hook: STRATA_PREALLOC_FAIL=<tokens> makes the layout of a chunk bigger than that fail, so the
+    // A test hook: MAYA_PREALLOC_FAIL=<tokens> makes the layout of a chunk bigger than that fail, so the
     // recovery (the request is read again with a smaller chunk) can be checked.
     static const int64_t fail_above = [] {
-        const char* v = std::getenv("STRATA_PREALLOC_FAIL");
+        const char* v = std::getenv("MAYA_PREALLOC_FAIL");
         return v ? std::atoll(v) : 0;
     }();
     if (fail_above > 0 && chunk > fail_above) {
@@ -745,7 +747,7 @@ int64_t Prefill::chunk() const { return impl_->T; }
 bool Prefill::draft_kv(core::MtpDrafter& mtp, const float* R_rows, const int32_t* next_tokens, int64_t n, int64_t cell0,
                        std::string& err) {
     Impl& m = *impl_;
-    static const bool off = [] { const char* v = std::getenv("STRATA_MTP_BATCH"); return v != nullptr && v[0] == '0'; }();
+    static const bool off = [] { const char* v = std::getenv("MAYA_MTP_BATCH"); return v != nullptr && v[0] == '0'; }();
     core::QsaState& st = mtp.kv_state_rw();
     if (off || n <= 0 || m.g == nullptr || m.region == nullptr || st.kv_mode != 0 || st.kv_hybrid ||
         mtp.device() != m.device)
@@ -776,8 +778,8 @@ bool Prefill::draft_kv(core::MtpDrafter& mtp, const float* R_rows, const int32_t
     // per row: emb/e2 (N), en16 (N half), hn/h2/Rm/gated (HCN), hn16/xn16 (HCN half), lo (LR) + lo16, grs, mixed (N) +
     // mixed_h, K and V (KV each), the token id
     // E-9: the drafter's Q8_0 matrices through Q8_1 x Q8_0 MMQ - its own pass's integer dot products (mmvq), so
-    // its K/V stay close to what the drafter computes itself; STRATA_MTP_BATCH_F16=1: FP16 GEMMs (the A/B)
-    static const bool f16_only = [] { const char* v = std::getenv("STRATA_MTP_BATCH_F16"); return v && v[0] == '1'; }();
+    // its K/V stay close to what the drafter computes itself; MAYA_MTP_BATCH_F16=1: FP16 GEMMs (the A/B)
+    static const bool f16_only = [] { const char* v = std::getenv("MAYA_MTP_BATCH_F16"); return v && v[0] == '1'; }();
     const bool q8 = !f16_only && mmq::built() && mmq::supported(kQ8_0);
     const uint64_t per_row = 4 * (2 * Nn + 4 * HCN + LR + HC + Nn + 2 * KV + 1) + 2 * (Nn + 2 * HCN + LR + Nn) + 64 +
                              (q8 ? (uint64_t) mmq::q8_bytes(g.hc, Nn) + 4 * g.hc : 0);
@@ -947,7 +949,7 @@ bool bf16_proj(Gemm& gm, const core::WeightRef* w, const uint16_t* X, float* Y, 
 }  // namespace
 
 namespace {
-// STRATA_PREFILL_TIMING=1: the prompt path's GPU time by phase.  Events are recorded on the compute stream in order;
+// MAYA_PREFILL_TIMING=1: the prompt path's GPU time by phase.  Events are recorded on the compute stream in order;
 // the time between two consecutive marks is charged to the phase of the first, so a gap where the GPU waits (for the
 // host's expert grouping, or for an expert's copy) lands on the phase that was waiting.  Events are reused: the marks
 // are folded at every MoE layer's host sync, after which all of them have completed.
@@ -959,7 +961,7 @@ const char* const kPfNames[kPfCount] = {"embed+steps", "hc read", "gdn", "qsa pr
                                         "gemm gate/up", "gemm down", "combine", "ple", "kv stage", "gdn conv+gates",
                                         "gdn recurrence", "gdn out proj"};
 struct PfTimer {
-    bool on = std::getenv("STRATA_PREFILL_TIMING") != nullptr;
+    bool on = std::getenv("MAYA_PREFILL_TIMING") != nullptr;
     std::vector<cudaEvent_t> ev;
     std::vector<int> ph;
     size_t used = 0;
@@ -1035,7 +1037,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
             }
         }
     } pipe_end{hand_in_ == nullptr ? this : nullptr};
-    double host_sync_ms = 0, host_chunk_ms = 0, host_setup_ms = 0;   // STRATA_PREFILL_TIMING: the host's share
+    double host_sync_ms = 0, host_chunk_ms = 0, host_setup_ms = 0;   // MAYA_PREFILL_TIMING: the host's share
     strata::kernels::QsaShapes s = strata::kernels::qsa_real_shapes();
     s.n_head = g.n_head; s.n_head_kv = g.n_head_kv; s.head_dim = g.head_dim; s.idx_n_head = g.idx_q_heads;
     s.idx_dim = g.idx_key_dim;
@@ -1052,9 +1054,9 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
     // depend only on the tokens (the two before a position name its n-grams), so this is the same data.
     const bool ple_on = ss.ple.ready() && LB <= 1 && 1 < LE;
     // the PLE block batched over the chunk: the pinned postops and a BF16 or GGUF-native key (else token by token);
-    // STRATA_PLE_BATCH=0 keeps the per-token block (the A/B)
+    // MAYA_PLE_BATCH=0 keeps the per-token block (the A/B)
     static const bool ple_batch_env = [] {
-        const char* v = std::getenv("STRATA_PLE_BATCH");
+        const char* v = std::getenv("MAYA_PLE_BATCH");
         return v == nullptr || std::atoi(v) != 0;
     }();
     const bool ple_batch = ple_on && ple_batch_env && strata::kernels::ple_native_postops_enabled() &&
@@ -1080,7 +1082,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
 
     for (int64_t c0 = 0; c0 < n; c0 += m.T) {
         if (should_stop && should_stop()) { err = "cancelled"; return false; }
-        if (std::getenv("STRATA_TRACE")) { std::fprintf(stderr, "maya trace: prompt chunk %lld of %lld\n", (long long) c0, (long long) n); std::fflush(stderr); }
+        if (std::getenv("MAYA_TRACE")) { std::fprintf(stderr, "maya trace: prompt chunk %lld of %lld\n", (long long) c0, (long long) n); std::fflush(stderr); }
         const int64_t T = std::min(m.T, n - c0), p0 = pos0 + c0;
         ++stats_.chunks;
         pt.mark(kPfStart, cs);
@@ -1228,9 +1230,9 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
         // D-5: the stream is issued by its own host thread, so the thread launching the layers' kernels never waits
         // behind a host copy of an unpinned blob (that wait left the GPU idle: the 'wait copy' / 'dequant' time of the
         // i-quant prompts).  The same copies in the same order into the same slots, and a slot is refilled only once
-        // the compute stream has recorded that it is done with it: the same results.  STRATA_PREFILL_ISSUER=0: inline.
+        // the compute stream has recorded that it is done with it: the same results.  MAYA_PREFILL_ISSUER=0: inline.
         static const bool issuer_on = [] {
-            const char* v = std::getenv("STRATA_PREFILL_ISSUER");
+            const char* v = std::getenv("MAYA_PREFILL_ISSUER");
             return v == nullptr || std::atoi(v) != 0;
         }();
         std::atomic<size_t> a_issued{0}, a_consumed{0};
@@ -1440,9 +1442,9 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     const strata::kernels::QsaIndexerBuffers ib{st.idx_tail, st.idx_dead, st.idx_pooled, st.idx_block_pos};
                     pt.mark(kPfQsaIdx, cs);
                     // C-2: the chunk's appends in three launches instead of one per token (the same end state:
-                    // the queries below read it only after the whole chunk is appended). STRATA_INDEXER_PER_TOKEN=1: the old
+                    // the queries below read it only after the whole chunk is appended). MAYA_INDEXER_PER_TOKEN=1: the old
                     try {
-                        static const bool per_token = std::getenv("STRATA_INDEXER_PER_TOKEN") != nullptr;
+                        static const bool per_token = std::getenv("MAYA_INDEXER_PER_TOKEN") != nullptr;
                         if (!per_token) {
                             strata::kernels::native_qsa_indexer_append_batch(m.idx_raw, T, p0, 0, (const float*) wikn->data,
                                                                              EPS, ib, s, st.max_cells,
@@ -1462,8 +1464,8 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                         // C-1: the grid reaches the batch's last query's n_bid (they rise with the position)
                         const int64_t active = (int64_t) m.steps_host[(size_t) ((t0 + nb - 1) * strata::kernels::kStepCount +
                                                                                 strata::kernels::kStepNBid)] + 1;
-                        // the scores on tensor cores (3xTF32: FP32-level, not bitwise); STRATA_SELECT_OLD=1: the warp kernel
-                        static const bool old_sel = std::getenv("STRATA_SELECT_OLD") != nullptr;
+                        // the scores on tensor cores (3xTF32: FP32-level, not bitwise); MAYA_SELECT_OLD=1: the warp kernel
+                        static const bool old_sel = std::getenv("MAYA_SELECT_OLD") != nullptr;
                         if (old_sel || !strata::kernels::qsa_block_scores_tc(st.idx_pooled, st.idx_dead, m.q_idx + t0 * 512,
                                                                              steps0, nb, m.max_blocks, s, m.sel_scores,
                                                                              m.cs, active))
@@ -1472,9 +1474,9 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                         strata::kernels::qsa_block_topk(m.sel_scores, steps0, nb, m.max_blocks, m.cap, s,
                                                         m.sel_ids + t0 * m.cap, m.cs);
                     }
-                    // STRATA_SEL_OVERLAP (debug, D-1's question): how much do neighbouring queries' selections share?
+                    // MAYA_SEL_OVERLAP (debug, D-1's question): how much do neighbouring queries' selections share?
                     // Per tile of 16 queries: the union of their selected cells against the sum of their widths.
-                    if (static const bool ovl = std::getenv("STRATA_SEL_OVERLAP") != nullptr; ovl && qsa_index == 0) {
+                    if (static const bool ovl = std::getenv("MAYA_SEL_OVERLAP") != nullptr; ovl && qsa_index == 0) {
                         std::vector<int32_t> ids((size_t) (T * m.cap));
                         cudaMemcpyAsync(ids.data(), m.sel_ids, ids.size() * 4, cudaMemcpyDeviceToHost, m.cs);
                         cudaStreamSynchronize(m.cs);
@@ -1492,11 +1494,11 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                         std::fprintf(stderr, "maya prefill: selection overlap at %lld: 16-query tiles read %.1f%% of the "
                                              "cells one query at a time does\n", (long long) p0, sum_w > 0 ? 100.0 * sum_u / sum_w : 0.0);
                     }
-                    // STRATA_IDX_FP16_CHECK: would FP16 pooled indexer keys select the same cells? (the KV-streaming
+                    // MAYA_IDX_FP16_CHECK: would FP16 pooled indexer keys select the same cells? (the KV-streaming
                     // design's last question). Every query is selected again from the pooled keys and `dead` rounded
                     // to fp16 (exactly what an fp16 store reads back); the agreement with the fp32 selection is
                     // printed cumulatively after each chunk's last QSA layer. Debug: syncs per layer.
-                    if (static const bool f16chk = std::getenv("STRATA_IDX_FP16_CHECK") != nullptr; f16chk) {
+                    if (static const bool f16chk = std::getenv("MAYA_IDX_FP16_CHECK") != nullptr; f16chk) {
                         static float *pooled16 = nullptr, *dead16 = nullptr;
                         static int32_t* ids16 = nullptr;
                         static double shared = 0, cells = 0;
@@ -1539,12 +1541,12 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                                                  "where the selection is sparse, %.4f%% of cells shared (%lld queries)\n",
                                          same, queries, cells > 0 ? 100.0 * shared / cells : 100.0, sel_queries);
                     }
-                    // STRATA_QSA_DUMP=<file>: append every QSA layer's selected cells for the prompt's last
-                    // STRATA_QSA_DUMP_LAST (4096) positions - records of int32 {qsa layer, pos0, T, cap} + T*cap cells,
+                    // MAYA_QSA_DUMP=<file>: append every QSA layer's selected cells for the prompt's last
+                    // MAYA_QSA_DUMP_LAST (4096) positions - records of int32 {qsa layer, pos0, T, cap} + T*cap cells,
                     // for tools/qsa_locality.py (how local the sparse attention's reads are: the KV-streaming question)
-                    if (static const char* dump = std::getenv("STRATA_QSA_DUMP"); dump != nullptr) {
-                        static const long long last = std::getenv("STRATA_QSA_DUMP_LAST")
-                                                          ? std::atoll(std::getenv("STRATA_QSA_DUMP_LAST")) : 4096;
+                    if (static const char* dump = std::getenv("MAYA_QSA_DUMP"); dump != nullptr) {
+                        static const long long last = std::getenv("MAYA_QSA_DUMP_LAST")
+                                                          ? std::atoll(std::getenv("MAYA_QSA_DUMP_LAST")) : 4096;
                         if (p0 + T > pos0 + n - last) {
                             std::vector<int32_t> h((size_t) (T * m.cap));
                             cudaMemcpyAsync(h.data(), m.sel_ids, h.size() * 4, cudaMemcpyDeviceToHost, m.cs);
@@ -1561,10 +1563,10 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                                                                        : core::qsa_attn_pools(st);
                     pt.mark(kPfQsaAttn, cs);
                     // perf-review D-1: the whole chunk on tensor cores, one block per (query, KV head), FP32-level
-                    // accuracy but not bitwise (qsa_prompt_attn.hpp). Q4_0 KV, or STRATA_PROMPT_ATTN_OLD=1: the
+                    // accuracy but not bitwise (qsa_prompt_attn.hpp). Q4_0 KV, or MAYA_PROMPT_ATTN_OLD=1: the
                     // decode kernel, 32 queries at a time (K8V4 runs the tensor kernel's mode 3: INT8 K,
                     // V dequantized from its q4_0 blocks to fp16 at gather)
-                    static const bool old_attn = std::getenv("STRATA_PROMPT_ATTN_OLD") != nullptr;
+                    static const bool old_attn = std::getenv("MAYA_PROMPT_ATTN_OLD") != nullptr;
                     if (old_attn || !strata::kernels::qsa_prompt_attn_batch(m.q, pools, m.sel_ids, m.steps_dev, m.cap, s,
                                                                             m.attn, T, m.cs))
                         for (int64_t t0 = 0; t0 < T; t0 += m.attn_batch) {
@@ -1847,8 +1849,8 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     }
                     pt.mark(kPfCombine, cs);
                     moe_combine(m.Dm, m.slot_dev, m.w, m.shared, m.sg, m.bo, T, m.cs);
-                    // debug: STRATA_DBG_NAN=1 reports the first layer of a chunk whose MoE produced non-finite values
-                    if (static const bool dbg = std::getenv("STRATA_DBG_NAN") != nullptr; dbg) {
+                    // debug: MAYA_DBG_NAN=1 reports the first layer of a chunk whose MoE produced non-finite values
+                    if (static const bool dbg = std::getenv("MAYA_DBG_NAN") != nullptr; dbg) {
                         cudaStreamSynchronize(m.cs);
                         auto bad = [&](const float* d, int64_t n) {
                             std::vector<float> h((size_t) n);
@@ -1918,7 +1920,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
             hand_buf ^= 1;
             continue;   // the last stage reports the chunk (on_chunk)
         }
-        if (const char* dump = std::getenv("STRATA_PREFILL_DUMP_R")) {   // debug: the final residuals, every 64th
+        if (const char* dump = std::getenv("MAYA_PREFILL_DUMP_R")) {   // debug: the final residuals, every 64th
             cudaStreamSynchronize(m.cs);                                  // position (A/B quality of this path)
             if (std::FILE* f = std::fopen(dump, c0 == 0 ? "wb" : "ab")) {
                 std::vector<float> row((size_t) D);
@@ -1947,7 +1949,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
     if (hand_in_ == nullptr && !drain_pipe(err)) return false;   // the first stage waits for the whole chain
     ss.ple_prev[0] = prev[0];
     ss.ple_prev[1] = prev[1];
-    if (std::getenv("STRATA_DBG_NAN") != nullptr) {   // debug: the state the prompt leaves for the token path
+    if (std::getenv("MAYA_DBG_NAN") != nullptr) {   // debug: the state the prompt leaves for the token path
         cudaStreamSynchronize(m.cs);
         auto bad = [&](const float* d, int64_t n) {
             std::vector<float> h((size_t) n);
@@ -1998,7 +2000,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                              "waiting for each chunk %.0f ms, after each chunk (the draft layer, progress) %.0f ms, "
                              "PLE %.0f ms\n", host_setup_ms, host_sync_ms, host_chunk_ms, stats_.ms_ple);
     }
-    if (std::getenv("STRATA_STATE_HASH_GDN") != nullptr) {   // debug: the GDN states as the prompt path leaves them
+    if (std::getenv("MAYA_STATE_HASH_GDN") != nullptr) {   // debug: the GDN states as the prompt path leaves them
         cudaStreamSynchronize(m.cs);
         std::vector<uint8_t> b((size_t) gdn_floats * 4);
         std::string line;

@@ -138,9 +138,9 @@ def check_config(cfg):
     if cfg.get('backend', 'cuda') != 'cuda' or cfg.get('family', 'glm') != 'glm' or '--glm-pack' not in args:
         raise ValueError('CUDA+HIP setup requires an existing CUDA GLM native-GGUF config (--glm-pack). '
                          'First run ./maya.sh --backend cuda --setup --no-start.')
-    if '--layer-split' in args or cfg.get('layer_split') or env.get('STRATA_GLM_SPLIT', '0') not in ('', '0'):
+    if '--layer-split' in args or cfg.get('layer_split') or env.get('MAYA_GLM_SPLIT', '0') not in ('', '0'):
         raise ValueError('CUDA+HIP currently supports one CUDA primary; remove layer splitting from the input config.')
-    if env.get('STRATA_GLM_EXPERT_HELPER'):
+    if env.get('MAYA_GLM_EXPERT_HELPER'):
         raise ValueError('Remove the native EXPERT_HELPER setting before configuring the external HIP helper.')
     ids = cfg.get('gpu', [0])
     if not isinstance(ids, list):
@@ -173,16 +173,16 @@ def validate(cfg, env=None):
         if cfg.get('gpu') != [record['cuda']['index']]:
             raise ValueError('The CUDA primary changed; rerun setup for the selected device.')
         expected = {'engine/maya': cfg['exe'], 'modules/libmaya_expert_hip.so':
-                    config_env.get('STRATA_GLM_EXPERT_PLUGIN', '')}
+                    config_env.get('MAYA_GLM_EXPERT_PLUGIN', '')}
         for name, actual in expected.items():
             path = manifest.parent / name
             if Path(actual).resolve() != path.resolve() or digest(path) != record['artifacts'][name]:
                 raise ValueError('CUDA/HIP build is missing, changed or mismatched: ' + name)
         mask = config_env.get('HIP_VISIBLE_DEVICES', '')
-        if not re.fullmatch(r'\d+', mask) or config_env.get('STRATA_GLM_EXPERT_PLUGIN_DEVICE') != '0':
+        if not re.fullmatch(r'\d+', mask) or config_env.get('MAYA_GLM_EXPERT_PLUGIN_DEVICE') != '0':
             raise ValueError('The setup needs one HIP_VISIBLE_DEVICES ordinal and plugin DEVICE=0 within that mask.')
-        budget = int(config_env['STRATA_GLM_EXPERT_PLUGIN_MIB'])
-        share = float(config_env.get('STRATA_GLM_EXPERT_PLUGIN_PREFILL_SHARE', '0'))
+        budget = int(config_env['MAYA_GLM_EXPERT_PLUGIN_MIB'])
+        share = float(config_env.get('MAYA_GLM_EXPERT_PLUGIN_PREFILL_SHARE', '0'))
         if not 1 <= budget <= 131072 or not 0 <= share <= 0.49:
             raise ValueError('Invalid helper budget (1..131072 MiB) or prefill share (0..0.49).')
         if env is not None:
@@ -197,7 +197,7 @@ def validate(cfg, env=None):
 def description(cfg):
     env = N.env_in(copy.deepcopy(cfg)).get('env') or {}
     return ('CUDA+HIP: HIP helper index ' + str(env.get('HIP_VISIBLE_DEVICES', '?')) +
-            ', budget ' + str(env.get('STRATA_GLM_EXPERT_PLUGIN_MIB', '?')) +
+            ', budget ' + str(env.get('MAYA_GLM_EXPERT_PLUGIN_MIB', '?')) +
             ' MiB; UMA shares system RAM')
 
 
@@ -219,17 +219,17 @@ def make_config(base, source_path, output, release, device, hip_device, budget, 
     # Retain model/drafter choices, sampling and serving preferences; CPU tuning and
     # helper ownership from another installation do not describe this device pair.
     for k in list(env):
-        if k.startswith(('STRATA_GLM_CPU_', 'STRATA_GLM_EXPERT_PLUGIN', 'STRATA_GLM_HELPER_',
-                         'STRATA_GLM_RAM_', 'STRATA_GLM_PREFILL_CPU', 'STRATA_GLM_DISK_')) or \
-                k in (*VISIBILITY, 'CUDA_VISIBLE_DEVICES', 'CUDA_DEVICE_ORDER', 'STRATA_GLM_EXPERT_HELPER'):
+        if k.startswith(('MAYA_GLM_CPU_', 'MAYA_GLM_EXPERT_PLUGIN', 'MAYA_GLM_HELPER_',
+                         'MAYA_GLM_RAM_', 'MAYA_GLM_PREFILL_CPU', 'MAYA_GLM_DISK_')) or \
+                k in (*VISIBILITY, 'CUDA_VISIBLE_DEVICES', 'CUDA_DEVICE_ORDER', 'MAYA_GLM_EXPERT_HELPER'):
             del env[k]
-    env.update({'HIP_VISIBLE_DEVICES': str(hip_device), 'STRATA_GLM_SPLIT': '0',
-                'STRATA_GLM_RAM_GB': '0', 'STRATA_GLM_CPU_LANE': '0', 'STRATA_GLM_PREFILL_CPU': '0',
-                'STRATA_GLM_EXPERT_PLUGIN': str(release / 'modules/libmaya_expert_hip.so'),
-                'STRATA_GLM_EXPERT_PLUGIN_DEVICE': '0', 'STRATA_GLM_EXPERT_PLUGIN_MIB': str(budget),
-                'STRATA_GLM_EXPERT_PLUGIN_READ': '1', 'STRATA_GLM_EXPERT_PLUGIN_PREFILL_SHARE': str(share),
-                'STRATA_GLM_EXPERT_PLUGIN_PREFILL_MAX_ROWS': '64',
-                'STRATA_GLM_EXPERT_PLUGIN_PRESTAGE': '32', 'STRATA_GLM_HELPER_ZEROCOPY': '1'})
+    env.update({'HIP_VISIBLE_DEVICES': str(hip_device), 'MAYA_GLM_SPLIT': '0',
+                'MAYA_GLM_RAM_GB': '0', 'MAYA_GLM_CPU_LANE': '0', 'MAYA_GLM_PREFILL_CPU': '0',
+                'MAYA_GLM_EXPERT_PLUGIN': str(release / 'modules/libmaya_expert_hip.so'),
+                'MAYA_GLM_EXPERT_PLUGIN_DEVICE': '0', 'MAYA_GLM_EXPERT_PLUGIN_MIB': str(budget),
+                'MAYA_GLM_EXPERT_PLUGIN_READ': '1', 'MAYA_GLM_EXPERT_PLUGIN_PREFILL_SHARE': str(share),
+                'MAYA_GLM_EXPERT_PLUGIN_PREFILL_MAX_ROWS': '64',
+                'MAYA_GLM_EXPERT_PLUGIN_PRESTAGE': '32', 'MAYA_GLM_HELPER_ZEROCOPY': '1'})
     cwd = Path(base.get('cwd') or source_path.parent).resolve()
     args = list(cfg['args'])
     for flag in ('--glm-pack', '--dflash', '--expert-profile', '--expert-profile-save'):

@@ -15,7 +15,8 @@
 namespace strata::kernels::cpu {
 
 /// Bytes of the largest quantized activation any native layer uses.  qwen4exp: 2560 values as
-/// Q8_K (10 x 292 = 2604); glm5-next: 4096 values as Q8_K (16 x 260 = 4164).
+/// Q8_K (10 x 292 = 2604); glm5-next: 4096 values as Q8_K (16 x 260 = 4164); glm-dsa: 6144 values as Q8_K
+/// (24 x 292 = 7008, fits; 8192 would need 9344 and native_fmt refuses it).
 inline constexpr size_t kNativeActBytes = 8192;
 /// Bytes of the largest quantized down activation.  qwen4exp: 640 values as Q8_0/Q8_K (1024);
 /// glm5-next: 2048 values as Q8_K (8 x 260 = 2084).
@@ -50,7 +51,7 @@ void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* 
 /// Several tokens (a verify window's tokens sharing an expert, a prompt's CPU rows): the
 /// multi-token kernels (iq_avx512 / iq_avx2: IQ2_*, IQ3_*, IQ4_XS, Q4_K, Q5_K) when they give
 /// ggml's results bit for bit - checked once per type (native_multi_rows_exact) - so a window
-/// computes exactly what its tokens one at a time would; STRATA_GLM_CPU_MT=0 keeps ggml's
+/// computes exactly what its tokens one at a time would; MAYA_GLM_CPU_MT=0 keeps ggml's
 /// dots.  swiglu_limit is GLM's swiglu clamp (gate clamped above, up both sides; +infinity =
 /// qwen4exp's plain path) - the same semantics as the device grouped path, so the two agree.
 void native_gu_rows_split(const NativeFmt& f, const uint8_t* gate_base, const uint8_t* up_base,

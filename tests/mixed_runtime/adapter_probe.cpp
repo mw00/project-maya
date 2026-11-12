@@ -4,7 +4,7 @@
 #include <cstring>
 #include <stdexcept>
 #include <vector>
-extern "C" __attribute__((visibility("default")))
+extern "C" MAYA_EXPERT_EXPORT
 int maya_adapter_probe(const char* path,uint32_t abi,int device,int gu,int down,int width,int ff,int k,
     const void* blobs,size_t bytes,size_t stride,size_t offset,const float* routing,const float* input,
     float clamp,float* output,char* error,size_t error_size) {
@@ -28,7 +28,7 @@ int maya_adapter_probe(const char* path,uint32_t abi,int device,int gu,int down,
         }
         std::vector<unsigned char> readback(stride+2,173);
         for (int i=0;i<k;i++) {
-            if (!helper.can_read(i)) throw std::runtime_error("readback unavailable (enable STRATA_GLM_EXPERT_PLUGIN_READ)");
+            if (!helper.can_read(i)) throw std::runtime_error("readback unavailable (enable MAYA_GLM_EXPERT_PLUGIN_READ)");
             check(helper.read(i,readback.data()+1,stride,err));
             if (readback.front()!=173 || readback.back()!=173 ||
                 std::memcmp(readback.data()+1,static_cast<const unsigned char*>(blobs)+size_t(i)*stride,stride))

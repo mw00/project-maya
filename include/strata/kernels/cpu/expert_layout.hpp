@@ -39,13 +39,13 @@ struct ExpertLayout {
 };
 
 /// Plan v0.3 P6: whether this CPU (and its OS) runs the AVX-512 kernels (F, BW, VL, VNNI, VBMI).  Probed in a
-/// file compiled without AVX-512, so asking is safe everywhere; STRATA_FORCE_AVX2=1 answers no (for tests).
+/// file compiled without AVX-512, so asking is safe everywhere; MAYA_FORCE_AVX2=1 answers no (for tests).
 bool cpu_avx512_ok();
 /// AVX2 + FMA, with the OS saving the YMM state (the AVX2 kernels' gate).
 bool cpu_avx2_ok();
 /// AVX-512 F, BW, VL and DQ with the OS saving the state: what iq_avx512.cpp's kernels need to run (no VNNI or
 /// VBMI).  The engine still picks them only where cpu_avx512_ok() (faster than AVX-2 there); tests run them on any
-/// such CPU.  STRATA_FORCE_AVX2=1 answers no.
+/// such CPU.  MAYA_FORCE_AVX2=1 answers no.
 bool cpu_avx512bw_ok();
 /// Whether Q2_0 rows of a native pack take this repository's own kernels (AVX-512 / AVX2, x86 only).  Elsewhere
 /// (aarch64) they go through ggml-cpu like every other native format (its NEON vec_dot_q2_0_q8_0).

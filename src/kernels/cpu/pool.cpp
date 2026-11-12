@@ -174,7 +174,7 @@ void ExpertPool::diag(std::FILE* f) const {
 }
 
 ExpertPool::ExpertPool(int n_workers, bool pin, bool host_works) : host_works_(host_works) {
-    if (const char* e = std::getenv("STRATA_POOL_SPIN_US"))   // a test knob; see kSpinBeforeSleep
+    if (const char* e = std::getenv("MAYA_POOL_SPIN_US"))   // a test knob; see kSpinBeforeSleep
         spin_before_sleep_ = std::chrono::microseconds((std::max)(0, std::atoi(e)));
     const std::vector<int> cores = physical_cores(true);
     n_ = n_workers > 0 ? n_workers : (int) cores.size();

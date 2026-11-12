@@ -122,17 +122,20 @@ int selftest(const std::string& dir) {
             CHECK(rd.cache_size() <= rd.cache_capacity(), "row cache exceeded its bound");
         }
     }
-    // fault injection: a 3 ms delay must be observed, and must not change the bytes
+    // fault injection: a delay must be observed, and must not change the bytes.  glm-dsa B0.6: 100 ms, longer than
+    // any read here, so every completion arrives inside it and is held back (a 3 ms delay was shorter than a read
+    // under a parallel ctest: nothing was held back and the late_injected check failed)
+    const double delay_us = 100000;
     for (bool thr : {false, true}) {
         ng::PleReader rd;
         std::string err;
         CHECK(rd.open(path, HEADER, N, 16, 0, err, thr), "open: %s", err.c_str());
-        rd.set_injected_delay_us(3000);
+        rd.set_injected_delay_us(delay_us);
         std::vector<uint32_t> rows(16);
         for (auto& r : rows) r = rng() % N;
         const double t0 = now_us();
         check_rows(rd, rows, N, "delayed");
-        CHECK(now_us() - t0 >= 3000, "injected delay not observed (%.0f us)", now_us() - t0);
+        CHECK(now_us() - t0 >= delay_us, "injected delay not observed (%.0f us)", now_us() - t0);
         CHECK(rd.stats().late_injected > 0, "no read was held back");
     }
     std::filesystem::remove(path);

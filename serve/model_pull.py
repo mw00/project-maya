@@ -18,6 +18,7 @@ sys.path.insert(0, str(ROOT / "tools"))
 import maya_quants as Q  # noqa: E402  (tools/) the quants the setup offers
 
 from serve import models  # noqa: E402
+from serve import glm_dsa_product as G53  # noqa: E402  GLM-5.3 (744B, glm-dsa)
 
 # the setup's progress line: "12.3 / 96.5 GB (13%) · 40 MB/s · 4 files at once"
 PROGRESS = re.compile(r"([\d.]+) / ([\d.]+) GB(?: \((\d+)%\))?(?: · ([\d.]+) MB/s)?")
@@ -27,8 +28,8 @@ PROGRESS = re.compile(r"([\d.]+) / ([\d.]+) GB(?: \((\d+)%\))?(?: · ([\d.]+) MB
 # by its name): (catalog id, family, the setup's key, who made them).  The Models page lists them under "Other quants".
 # Left out as the setup's own list leaves them out: DeepSeek's UD-Q4_K_XL (maya.DS4_BY_HAND) and GLM's
 # EXL3-sc_4.10bpw (maya.MODELS_BY_HAND) - a command line still takes them.
-DS4_OTHER = (("exl3", "LibertAIDAI"), ("exl3-3.5", "LibertAIDAI"), ("gguf-q8", "unsloth"), ("gguf-iq1_s", "unsloth"),
-             ("gguf-iq1_m", "unsloth"), ("gguf-iq2_xxs", "unsloth"), ("gguf-q2_k_xl", "unsloth"),
+DS4_OTHER = (("exl3-2.25", "turboderp"), ("exl3", "LibertAIDAI"), ("exl3-3.5", "LibertAIDAI"), ("gguf-q8", "unsloth"),
+             ("gguf-iq1_s", "unsloth"), ("gguf-iq1_m", "unsloth"), ("gguf-iq2_xxs", "unsloth"), ("gguf-q2_k_xl", "unsloth"),
              ("gguf-iq3_xxs", "unsloth"), ("gguf-iq3_s", "unsloth"), ("gguf-q3_k_xl", "unsloth"),
              ("abliterated-128g", "orcarouter"), ("abliterated-256g", "orcarouter"))
 GLM_EXL3 = ("EXL3-3.05bpw", "EXL3-4.05bpw")
@@ -63,7 +64,7 @@ def _note(fam: str, key: str, backend: str) -> str:
 
 
 def _other_name(fam: str, key: str) -> str:
-    if fam == "glm":                                   # ("EXL3-3.05bpw" -> "GLM-5.3 · EXL3 3.05 bpw")
+    if fam == "glm":                                   # ("EXL3-3.05bpw" -> "GLM-5.3-Flash · EXL3 3.05 bpw")
         m = re.match(r"EXL3-([\d.]+)bpw$", key)
         return Q.SHOWN["glm"] + Q.SEP + (f"EXL3 {m.group(1)} bpw" if m else key)
     return Q.shown(fam, key)
@@ -117,7 +118,30 @@ def catalog(root: Path, glm_sizes: dict | None = None, cfg: dict | None = None, 
         out.append({"id": ident, "family": fam, "name": _other_name(fam, key), "group": "other", "by": by,
                     "note": _note(fam, key, backend), "installed": (fam, key) in have,
                     "size_gb": sizes.get(key) if fam == "glm" else extra.get(ident)})
+    # GLM-5.3 (744B, glm-dsa): its downloads (maya.G53_MODELS) - NVIDIA from V100 on and AMD, not
+    # on Metal; the id is the setup's --model name in lower case (Puller.start lowers what it is given); Maya's own
+    # quant of it ("maya": GLM-5.3-Maya-XS) among Maya's, the others by their makers
+    if backend != "metal" and (backend == "hip" or not ccs or max(ccs) >= G53_MIN_CC):
+        for key, m in _g53_downloads().items():
+            own = bool(m.get("maya"))
+            out.append({"id": key.lower(), "family": "glm", "name": G53.LABEL + Q.SEP + Q.glm53_quant(key),
+                        "group": "maya" if own else "other", "by": "Maya" if own else m["repo"].split("/")[0],
+                        "note": "text only",
+                        "installed": ("glm", key) in have, "size_gb": m.get("download_gb")})
     return out
+
+
+G53_MIN_CC = 70                                      # (GLM-5.3's kernels: V100 on - the owner's scope, 2026-11-07)
+
+
+def _g53_downloads() -> dict:
+    """GLM-5.3's downloads (maya.G53_MODELS)."""
+    try:
+        sys.path.insert(0, str(ROOT))
+        import maya                                    # (the setup's own table; nothing runs on import)
+        return dict(maya.G53_MODELS)
+    except Exception:  # noqa: BLE001 - a catalog entry is a nicety
+        return {}
 
 
 _other_gb: dict = {}

@@ -1,0 +1,64 @@
+{
+ "id": "error_08",
+ "group": "error_reply",
+ "api": "openai",
+ "request": {
+  "messages": [
+   {
+    "role": "user",
+    "content": "Time on Mars/Olympus?"
+   },
+   {
+    "role": "assistant",
+    "content": "",
+    "tool_calls": [
+     {
+      "id": "call_8",
+      "type": "function",
+      "function": {
+       "name": "get_time",
+       "arguments": "{\"timezone\": \"Mars/Olympus\"}"
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "tool_call_id": "call_8",
+    "content": "{\"error\": \"unknown time zone\"}"
+   }
+  ],
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "get_time",
+     "description": "Current local time in an IANA time zone.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "timezone": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "timezone"
+      ]
+     }
+    }
+   }
+  ]
+ },
+ "expect": {
+  "calls": [],
+  "min_calls": 0,
+  "max_calls": 2,
+  "no_call": false,
+  "must_not_repeat": {
+   "name": "get_time",
+   "args": {
+    "timezone": "Mars/Olympus"
+   }
+  }
+ }
+}

@@ -1,67 +1,45 @@
 # GLM CUDA+HIP helper: Strix Halo / RTX 5090
 
-Measured 2026-11-06 on upstream v1.1.55 (`c4effee67cb95fb4303720919b075fddf04b4e69`).
-The stock engine is pristine upstream; the hybrid engine includes this contribution.
-Latest main was checked before and after both benchmark sessions.
+Measured 2026-11-12 on upstream v1.1.60
+(`8b0a449c599fbb370a1dcc0979ae7c84d4310529`) plus this contribution.
+Earlier throughput is retained in Git history; HELPER_COST_BENCHMARK.md records
+historical v1.1.55 cost-admission measurements.
 
-## Hardware and method
+## Hardware, method and results
 
-- Ryzen AI Max+ 395 / Radeon 8060S (gfx1151), 128 GB physical unified RAM;
-  RTX 5090 32 GB (sm_120) over OCuLink, measured PCIe 4.0 x4 under load.
-- Ubuntu 26.04, Linux 7.0.0-42-generic, NVIDIA 595.99.02, CUDA 13.1,
-  HIP 7.1.52801. A Release CUDA engine; separately compiled CUDA and HIP executors.
-- GLM-5.3-Flash-Maya-M IQ2_S, three GGUF shards (116003563168 bytes),
-  native pack with BF16 compatibility projections. Same tokenizer and starting
-  expert profile in every run. Verified model hashes are listed below.
-- Native `maya.py --bench`: three greedy answers, thinking off, up to 256 tokens
-  each, native warm-ups and 2048/8192-token prefill; context 9216, native INT8 KV.
-  Two runs per mode, in none / MTP2 / DFlash4 / DFlash4 / MTP2 / none order.
-  Prefill input token hashes match between source trees, including the warm-up.
-- Stock CUDA+CPU: 4 GiB UMA reservation, 119 GiB host RAM, native automatic RAM
-  sizing and CPU scheduling. Hybrid: 96 GiB UMA reservation, about 30 GiB host RAM,
-  a 90112 MiB HIP executor budget, CPU expert computation disabled. Count physical
-  unified memory once; the UMA and host budgets share the same physical RAM.
+I ran Maya’s unchanged built-in benchmark twice per mode on a Ryzen AI Max+ 395 / Radeon 8060S, 128 GB unified RAM with 96 GiB BIOS UMA, and an RTX 5090 32 GB over PCIe 4.0 x4 OCuLink. Ubuntu 26.04, CUDA 13.1 / HIP 7.1; GLM-5.3-Flash Maya-M IQ2_S, context 9216, INT8 KV and automatic CUDA memory sizing. Each run starts from the same expert profile; greedy decoding, thinking off, three answers up to 256 tokens each.
 
-This is a practical configuration comparison with different memory reservations
-and scheduler settings, not an isolated code-only A/B. Short greedy benchmarks
-are not quality or long-context qualification. CPU/GPU arithmetic can change
-output tokens; stock-versus-hybrid generated-output equality was not established.
+| CUDA+HIP configuration | Decode tok/s | 2K prefill tok/s | 8K prefill tok/s |
+|---|---:|---:|---:|
+| No speculation, static prefill | 44.95 | 330.5 | 953.0 |
+| No speculation, adaptive prefill | 45.25 | 383.0 | 973.0 |
+| Built-in MTP, 2 fixed drafts | 64.35 | 323.5 | 920.5 |
+| DFlash2, up to 4 drafts | 68.60 | 324.5 | 943.5 |
 
-## Throughput
+Static prefill uses a 64-row per-expert cap and a 0.25 helper admission ceiling; adaptive prefill permits up to 128 rows after calibration. MTP and DFlash use static prefill. Sampled device-wide CUDA peaks were 31566–31590 MiB (30.83–30.85 GiB).
 
-Mean native reported tokens/s over two runs:
+These are two-run means for the current CUDA+HIP configuration, not a fresh CUDA+CPU comparison or a general speed guarantee. The existing model pack was retained.
+| Run | Decode | 2K prefill | 8K prefill | CUDA slots | Sampled CUDA MiB |
+|---|---:|---:|---:|---:|---:|
+| none-1 | 44.5 | 330.0 | 948.0 | 2782 | 31566 |
+| adaptive-1 | 45.0 | 383.0 | 972.0 | 2782 | 31566 |
+| mtp2-1 | 64.3 | 324.0 | 920.0 | 2705 | 31590 |
+| dflash4-1 | 68.5 | 324.0 | 944.0 | 2667 | 31588 |
+| dflash4-2 | 68.7 | 325.0 | 943.0 | 2667 | 31588 |
+| mtp2-2 | 64.4 | 323.0 | 921.0 | 2705 | 31590 |
+| adaptive-2 | 45.5 | 383.0 | 974.0 | 2782 | 31566 |
+| none-2 | 45.4 | 331.0 | 958.0 | 2782 | 31566 |
 
-| Mode | Stock decode | Hybrid decode | Stock 2K | Hybrid 2K | Stock 8K | Hybrid 8K |
-|---|---:|---:|---:|---:|---:|---:|
-| No speculation | 30.65 | 45.10 | 213.5 | 332.0 | 771.5 | 969.0 |
-| Built-in MTP, fixed 2 drafts | 32.95 | 64.85 | 209.0 | 321.0 | 752.5 | 932.5 |
-| DFlash2, up to 4 drafts | 36.80 | 69.05 | 213.5 | 321.5 | 768.5 | 954.0 |
-
-Individual native results, decode / 2K / 8K tokens/s:
-
-| Mode | Stock run 1 | Stock run 2 | Hybrid run 1 | Hybrid run 2 |
-|---|---|---|---|---|
-| No speculation | 30.6 / 214 / 768 | 30.7 / 213 / 775 | 45.1 / 333 / 969 | 45.1 / 331 / 969 |
-| Built-in MTP, fixed 2 drafts | 32.7 / 209 / 752 | 33.2 / 209 / 753 | 64.8 / 321 / 933 | 64.9 / 321 / 932 |
-| DFlash2, up to 4 drafts | 36.8 / 213 / 766 | 36.8 / 214 / 771 | 68.9 / 322 / 953 | 69.2 / 321 / 955 |
-
-All 12 runs exited successfully. Stock CUDA peaks were 31751 / 31769 / 31758 MiB
-(no-spec / MTP2 / DFlash4); hybrid peaks were 31569 / 31567 / 31575 MiB. These are
-device-wide samples every 500 ms, including desktop usage. Native CUDA pool sizing
-was automatic in both configurations. Stock used roughly 84–90 GiB pinned expert
-RAM, 16 CPU threads and native DFlash verification lanes of 16 and 12 threads.
-Measured decode logs show no stock disk reads. Hybrid expert residency was
-76.25 / 79.92 / 77.18 GiB on HIP, within the configured helper budget.
-
-Measured-answer acceptance across both runs, excluding warm-up:
-stock MTP 952/1148 (82.93%), hybrid MTP 954/1146 (83.25%);
-stock DFlash 941/985 (95.53%), hybrid DFlash 968/1012 (95.65%).
-DFlash uses its native confidence filter; these are accepted proposals, not an
-unconditional drafter-accuracy or model-quality score.
+Order: static/adaptive/MTP2/DFlash4/DFlash4/MTP2/adaptive/static. Native warmups,
+no profiling/tracing. Memory samples every 500 ms; sampled peaks, not exact maxima.
+The Ubuntu desktop prefers AMD. Both runtime libraries were observed in inference;
+Maya's native report lists CUDA and host-visible RAM, not the external HIP budget.
+Physical unified RAM is counted once. All eight runs exited successfully.
 
 ## Reproduce the settings
 
-Build the upstream CUDA engine normally, or this branch's CUDA engine plus the
+
+Build this branch's CUDA engine plus the
 [separate executor modules](../../docs/EXPERT_PLUGIN.md). Use the same pinned
 llama.cpp/ggml dependency as the installer:
 `3cf03257f219afbe7334045ff7c6a06ac68c627d`. The measured engine used Release,
@@ -77,35 +55,34 @@ source directory and tokenizer. Common engine arguments:
 --expert-profile /absolute/path/to/a-fresh-copy-of-profile.bin
 ```
 
-Omit `--kv` to use v1.1.55's INT8 default. Run
+Omit `--kv` to use v1.1.60's INT8 default. Run
 `python maya.py --bench --config /absolute/path/to/config.json` in the normal
 Maya Python environment. Preserve `maya-bench.txt` and `maya-bench.log` after each
 run; copy the same starting profile for each run. The measured starting profile's
 SHA256 is `53b03a13482b6fedc599d149be2d69f88c38d9edc4611a740da46314ab1dc5a7`.
 A different profile changes initial residency and may change performance.
 
-Stock configuration has only the speculation-selection environment below.
-Hybrid adds:
+The CUDA+HIP configuration uses:
 
 ```json
 {
   "HIP_VISIBLE_DEVICES": "0",
-  "STRATA_GLM_SPLIT": "0",
-  "STRATA_GLM_RAM_GB": "0",
-  "STRATA_GLM_NO_REUSE": "1",
-  "STRATA_GLM_CPU_LANE": "0",
-  "STRATA_GLM_PREFILL_CPU": "0",
-  "STRATA_GLM_DISK_READERS": "2",
-  "STRATA_GLM_EXPERT_PLUGIN": "/absolute/path/to/modules/libmaya_expert_hip.so",
-  "STRATA_GLM_EXPERT_PLUGIN_DEVICE": "0",
-  "STRATA_GLM_EXPERT_PLUGIN_MIB": "90112",
-  "STRATA_GLM_EXPERT_PLUGIN_READ": "1",
-  "STRATA_GLM_HELPER_CHECK": "1",
-  "STRATA_GLM_EXPERT_PLUGIN_PREFILL_SHARE": "0.25",
-  "STRATA_GLM_EXPERT_PLUGIN_PRESTAGE": "32",
-  "STRATA_GLM_EXPERT_PLUGIN_PREFILL_MAX_ROWS": "64",
-  "STRATA_GLM_PREFILL_PRED_T": "0",
-  "STRATA_GLM_HELPER_ZEROCOPY": "1"
+  "MAYA_GLM_SPLIT": "0",
+  "MAYA_GLM_RAM_GB": "0",
+  "MAYA_GLM_NO_REUSE": "1",
+  "MAYA_GLM_CPU_LANE": "0",
+  "MAYA_GLM_PREFILL_CPU": "0",
+  "MAYA_GLM_DISK_READERS": "2",
+  "MAYA_GLM_EXPERT_PLUGIN": "/absolute/path/to/modules/libmaya_expert_hip.so",
+  "MAYA_GLM_EXPERT_PLUGIN_DEVICE": "0",
+  "MAYA_GLM_EXPERT_PLUGIN_MIB": "90112",
+  "MAYA_GLM_EXPERT_PLUGIN_READ": "1",
+  "MAYA_GLM_HELPER_CHECK": "1",
+  "MAYA_GLM_EXPERT_PLUGIN_PREFILL_SHARE": "0.25",
+  "MAYA_GLM_EXPERT_PLUGIN_PRESTAGE": "32",
+  "MAYA_GLM_EXPERT_PLUGIN_PREFILL_MAX_ROWS": "64",
+  "MAYA_GLM_PREFILL_PRED_T": "0",
+  "MAYA_GLM_HELPER_ZEROCOPY": "1"
 }
 ```
 
@@ -118,15 +95,21 @@ Select exactly one speculative mode (unset flags that are not listed):
 
 | Mode | Environment additions | Extra engine arguments |
 |---|---|---|
-| None | `STRATA_GLM_NO_MTP=1`, `STRATA_GLM_NO_SPEC=1` | none |
-| MTP2 | `STRATA_GLM_MTP_DECODE=1`, `STRATA_GLM_MTP_DRAFT=2`, `STRATA_GLM_MTP_FIXED=2` | none |
-| DFlash4 | `STRATA_GLM_NO_MTP=1` | `--dflash /absolute/path/to/GLM-5.3-Flash-DFlash2-Q4_K_M.gguf --spec 5` |
+| None | `MAYA_GLM_NO_MTP=1`, `MAYA_GLM_NO_SPEC=1` | none |
+| MTP2 | `MAYA_GLM_MTP_DECODE=1`, `MAYA_GLM_MTP_DRAFT=2`, `MAYA_GLM_MTP_FIXED=2` | none |
+| DFlash4 | `MAYA_GLM_NO_MTP=1` | `--dflash /absolute/path/to/GLM-5.3-Flash-DFlash2-Q4_K_M.gguf --spec 5` |
 
 `--spec 5` is the current token plus at most four draft tokens; confidence filtering
 may accept fewer proposals for verification. The DFlash drafter is on CUDA;
 target verification uses the selected engine's expert execution path.
 
+
+Adaptive prefill adds `MAYA_GLM_HELPER_COST=1` and sets
+`MAYA_GLM_EXPERT_PLUGIN_PREFILL_MAX_ROWS=128`, retaining the 0.25 share ceiling.
+Static and both speculative modes leave cost admission off and use a 64-row cap.
+
 ## Artifact checksums
+
 
 No model weights are included in this contribution. Maya-M GGUF shard SHA256:
 
@@ -139,27 +122,29 @@ DFlash: `Anbeeld/GLM-5.3-Flash-DFlash2-GGUF` at
 SHA256 `f4158ffb805b26c4fe439669c2009908a80ea89e1576ecea4d03eaded18f017c`.
 It has its own CC BY-NC-ND 4.0 license; no drafter weights are redistributed here.
 
+
 ## Validation and limits
 
-- Server suite: 738 tests, 33 skipped; tools suite: 730 tests, 37 skipped.
-  HIP API mapping and the Release reader-lifetime regression pass.
-- Fresh CUDA engine and separate CUDA/HIP executor builds; source, static libraries,
-  modules and actual loaded runtime identities verified. Stock process maps show
-  CUDA with no HIP plugin. Hybrid maps show both runtime libraries and the executor.
-- Real-weight expert fixtures: 144 arrays exactly match the previous validated
-  executor modules after rebasing to v1.1.55. Coverage includes mapped/copy and
-  row/single execution, concurrent callers and stale-generation/failure checks.
-- Previous modified v1.1.53 versus modified v1.1.55: three full-vocabulary FP16
-  endpoints match exactly at 1025 tokens with the helper, and three match at
-  17 tokens with the plugin disabled. This is a cross-version regression, not a
-  pristine-upstream-versus-modified numerical comparison.
-- Maya-M and UD-IQ3_XXS INT8 short smoke probes pass. Observed token/batch KL was
-  0.01109 and 0.04174 respectively, repeat KL zero; the harness's finite-output /
-  KL < 0.1 smoke threshold is not broad quality qualification.
+- Ubuntu server: 946 tests (55 skipped), tools: 959 (41 skipped), HIP mappings and
+  Release helper dispatch/reader/cost plus upstream CPU fixtures pass.
+- Fresh engine and separate CUDA/HIP 7.1 modules build. Source, static libraries,
+  modules, actual runtime libraries, original GGUF and existing pack verified.
+- All 108 real-weight expert arrays exactly match previous validated modules;
+  row/single, mapped/copy, weighted routes, generation and concurrent-call checks pass.
+- At 1,025 tokens with FP16 KV and a fixed 22 GiB pool, static token/batch/repeat
+  endpoints and adaptive sequential endpoint match v1.1.56 bitwise. Adaptive
+  batch/repeat KL 4.20993e-6 / 2.28158e-6, maximum absolute differences 3.40570 / 3.86947, same top token.
+  Within-run sequential/prefill and repeated-prefill checks pass. Throughput uses
+  native INT8 KV and automatic sizing instead of these numerical-probe controls.
+- Unsupported plugin/native-helper-overlap startup is rejected before allocation.
+  Native gfx1151/model/budget preflight and explicit architecture mismatch rejection pass.
 
-The adapter supports the documented native-GGUF GLM expert shape on Linux only.
-DeepSeek, EXL3, Windows, other model shapes, long-context quality, other hardware,
-and the maintainers' full NVIDIA/V100 validation matrix remain unqualified.
-Primary/helper hot-expert exchange and adaptive prefill balancing are outside this
-contribution. The external executor is opt-in; shared reader-lifetime and error
-handling changes also affect the existing path and are covered by the host fixture.
+This is cross-version regression evidence, not stock-versus-hybrid numerical
+parity or broad quality qualification. The existing pack was retained, so upstream
+packing changes were not exercised by repacking. Other hardware, Windows, EXL3,
+DeepSeek, other shapes, long-context quality and the maintainers' full NVIDIA/V100
+matrix remain unqualified. Primary/helper hot-expert exchange remains deferred.
+Static and optional cost-based prefill admission are included in this contribution.
+
+Measured engine SHA256: `b19833dc4c414aaf148cf15c1baf0ca4d50c180230ec85428c5076361fb58754`.
+HIP executor SHA256: `12b58a0ee4b5d8ee918efd21f516055611339e7eb0e366fc2917b598a230acd2`.

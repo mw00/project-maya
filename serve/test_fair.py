@@ -1,4 +1,4 @@
-"""serve/test_fair.py - the FIFO's order and the fair slices (STRATA_FAIR_SLICE_S), against a scripted engine that
+"""serve/test_fair.py - the FIFO's order and the fair slices (MAYA_FAIR_SLICE_S), against a scripted engine that
 continues an answer from wherever the prompt says it got to (as the real engine does with its conversation slots).
 
     python -m unittest serve.test_fair -v
@@ -140,13 +140,13 @@ class FairSlices(unittest.TestCase):
         self.tok = ByteTokenizer()
         self.engine = ResumingEngine(self.tok, {"long": self.LONG, "short": self.SHORT})
         self.svc = Service(self.engine, self.tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
-        self.env = os.environ.get("STRATA_FAIR_SLICE_S")
+        self.env = os.environ.get("MAYA_FAIR_SLICE_S")
 
     def tearDown(self):
         if self.env is None:
-            os.environ.pop("STRATA_FAIR_SLICE_S", None)
+            os.environ.pop("MAYA_FAIR_SLICE_S", None)
         else:
-            os.environ["STRATA_FAIR_SLICE_S"] = self.env
+            os.environ["MAYA_FAIR_SLICE_S"] = self.env
 
     def race(self, **kw):
         out = {}
@@ -161,7 +161,7 @@ class FairSlices(unittest.TestCase):
         return out
 
     def test_off_by_default_the_short_one_waits(self):
-        os.environ.pop("STRATA_FAIR_SLICE_S", None)
+        os.environ.pop("MAYA_FAIR_SLICE_S", None)
         out = self.race()
         self.assertEqual(out["long one"][0], self.LONG)
         self.assertEqual(out["short one"][0], self.SHORT)
@@ -169,7 +169,7 @@ class FairSlices(unittest.TestCase):
         self.assertEqual(len(self.engine.calls), 2)
 
     def test_the_short_one_goes_first_and_the_long_one_continues(self):
-        os.environ["STRATA_FAIR_SLICE_S"] = "0.05"
+        os.environ["MAYA_FAIR_SLICE_S"] = "0.05"
         out = self.race()
         self.assertEqual(out["short one"][0], self.SHORT)
         self.assertEqual(out["long one"][0], self.LONG)          # nothing lost or repeated at the seam
@@ -185,7 +185,7 @@ class FairSlices(unittest.TestCase):
         self.assertFalse(self.svc.status["busy"])
 
     def test_pause_keeps_the_tokens_still_on_their_way(self):
-        os.environ["STRATA_FAIR_SLICE_S"] = "0.05"
+        os.environ["MAYA_FAIR_SLICE_S"] = "0.05"
         self.engine = PausingEngine(self.tok, {"long": self.LONG, "short": self.SHORT})
         self.svc.engine = self.engine
         out = self.race()
@@ -196,14 +196,14 @@ class FairSlices(unittest.TestCase):
         self.assertFalse(self.svc.fifo.locked())
 
     def test_alone_it_is_never_cut(self):
-        os.environ["STRATA_FAIR_SLICE_S"] = "0.01"
+        os.environ["MAYA_FAIR_SLICE_S"] = "0.01"
         out = {}
         collect(self.svc, "long one", 4096, out)
         self.assertEqual(out["long one"][0], self.LONG)
         self.assertEqual(len(self.engine.calls), 1)
 
     def test_a_client_gone_while_queued_again_leaves_the_line(self):
-        os.environ["STRATA_FAIR_SLICE_S"] = "0.02"
+        os.environ["MAYA_FAIR_SLICE_S"] = "0.02"
         short = "".join(random.Random(400).choices(string.ascii_lowercase, k=400))
         self.engine.answers["short"] = short                    # long enough to hold the engine for a while
         out = {}
@@ -221,6 +221,96 @@ class FairSlices(unittest.TestCase):
         self.assertFalse(self.svc.fifo.locked())
         self.assertEqual(self.svc.fifo.waiting(), 0)
         self.assertEqual(self.svc.status["queued"], 0)
+
+
+class FairLockYields(unittest.TestCase):
+    """claim_yield: a runner gives its place up for a waiter once, not every runner at the same time."""
+
+    def full(self, n=4):
+        lock = FairLock(n)
+        for _ in range(n):
+            lock.acquire(units=1)
+        return lock
+
+    def test_one_waiter_takes_one_place(self):
+        lock = self.full()
+        lock.enqueue(units=1)
+        self.assertTrue(lock.claim_yield(0.0))
+        self.assertFalse(lock.claim_yield(0.0))                 # the others stay: it is covered
+        lock.unclaim_yield()                                    # (that runner went on instead)
+        self.assertTrue(lock.claim_yield(0.0))
+
+    def test_two_waiters_take_two(self):
+        lock = self.full()
+        lock.enqueue(units=1)
+        lock.enqueue(units=1)
+        self.assertEqual([lock.claim_yield(0.0) for _ in range(3)], [True, True, False])
+
+    def test_nobody_waiting_or_a_place_free_nobody_yields(self):
+        lock = self.full()
+        self.assertFalse(lock.claim_yield(0.0))
+        lock.release(units=1)                                   # a place is free: the waiter takes it
+        lock.enqueue(units=1)
+        self.assertFalse(lock.claim_yield(0.0))
+
+    def test_yielding_frees_the_place_and_ends_the_claim(self):
+        lock = self.full()
+        first = lock.enqueue(units=1)
+        self.assertTrue(lock.claim_yield(0.0))
+        again = lock.yield_place(units=1)
+        self.assertTrue(lock.wait_turn(first, timeout=1))       # the waiter first, the runner behind it
+        self.assertEqual(lock.waiting(), 1)
+        self.assertFalse(lock.claim_yield(30.0))                # (a runner put back is no reason yet to cut another)
+        self.assertTrue(lock.claim_yield(0.0))                  # (after its own slice it is: long answers take turns)
+        lock.leave(again)
+
+    def test_a_request_for_all_places_takes_all(self):
+        lock = self.full()
+        lock.enqueue(units=None)                                # an image encode, a reload
+        self.assertEqual([lock.claim_yield(0.0) for _ in range(5)], [True] * 4 + [False])
+
+
+class FairSlicesParallel(unittest.TestCase):
+    """--parallel: four long answers run, one short request comes - one of them gives its place up, not all four."""
+    LONGS = {f"long {c}": "".join(random.Random(700 + i).choices(string.ascii_letters, k=600))
+             for i, c in enumerate("ABCD")}
+    SHORT = "s" * 20
+
+    def setUp(self):
+        self.tok = ByteTokenizer()
+        self.engine = ResumingEngine(self.tok, {**self.LONGS, "short": self.SHORT}, delay_s=0.003)
+        self.svc = Service(self.engine, self.tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        self.svc.fifo.set_capacity(4)
+        self.env = os.environ.get("MAYA_FAIR_SLICE_S")
+
+    def tearDown(self):
+        if self.env is None:
+            os.environ.pop("MAYA_FAIR_SLICE_S", None)
+        else:
+            os.environ["MAYA_FAIR_SLICE_S"] = self.env
+
+    def test_one_short_request_cuts_one_long_answer(self):
+        os.environ["MAYA_FAIR_SLICE_S"] = "0.3"
+        out, threads = {}, []
+        for user in self.LONGS:
+            th = threading.Thread(target=collect, args=(self.svc, user, 4096, out))
+            th.start()
+            threads.append(th)
+        while len(self.engine.calls) < 4:
+            time.sleep(0.001)
+        time.sleep(0.4)                                         # every long answer is past its slice
+        short = threading.Thread(target=collect, args=(self.svc, "short one", 4096, out))
+        short.start()
+        for th in threads + [short]:
+            th.join(60)
+        self.assertEqual(out["short one"][0], self.SHORT)
+        for user, text in self.LONGS.items():
+            self.assertEqual(out[user][0], text)                # nothing lost or repeated at the seam
+        self.assertTrue(all(out["short one"][1] < out[u][1] for u in self.LONGS))
+        resumed = [c for c in self.engine.calls if any(c[0][:len(b)] == b and len(c[0]) > len(b) for b in self.engine.bases)]
+        self.assertEqual(len(resumed), 1)
+        self.assertFalse(self.svc.fifo.locked())
+        self.assertEqual(self.svc.fifo._yields, 0)
 
 
 if __name__ == "__main__":

@@ -253,8 +253,7 @@ error rather than claiming successful cancellation.
 
 All values are integer server settings, read at Service creation. Put them in the
 config's `env` block, or export them before starting Maya. Names below have the
-prefix **`MAYA_GLM_RESPONSES_`** (legacy `STRATA_GLM_RESPONSES_` spellings also work;
-the `MAYA_` spelling wins when both are set). Owner cache quotas default to 0 (disabled); all
+prefix **`MAYA_GLM_RESPONSES_`**. Owner cache quotas default to 0 (disabled); all
 other values must be positive. Byte values count serialized data, not process RSS.
 
 | Suffix | Default | Meaning |

@@ -129,9 +129,9 @@ bool run_case(strata::prefill::Gemm& gemm, hipblasHandle_t blas, hipStream_t str
 }
 
 int main() {
-    const char* tuning_path = std::getenv("STRATA_HIPBLASLT_TUNING");
+    const char* tuning_path = std::getenv("MAYA_HIPBLASLT_TUNING");
     if (!tuning_path || !*tuning_path) {
-        std::fprintf(stderr, "SKIP: set STRATA_HIPBLASLT_TUNING to a calibrated matching table\n");
+        std::fprintf(stderr, "SKIP: set MAYA_HIPBLASLT_TUNING to a calibrated matching table\n");
         return 77;
     }
 

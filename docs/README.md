@@ -5,7 +5,8 @@ Every page in this folder, by what you want to do. Back to the [README](../READM
 ## Start here
 
 - [SETUP.md](SETUP.md): what the first run does, starting again and updating, the setup's options, and the fix for each build failure.
-- [MODELS.md](MODELS.md): the three models, how the quants are named, and each one's files, drafters, pictures and options.
+- [MODELS.md](MODELS.md): the four models, how the quants are named, and each one's files, drafters, pictures and options.
+- [GLM53.md](GLM53.md): GLM-5.3 (744B): its files, setup, context and defaults.
 - [MEMORY.md](MEMORY.md): which model fits your PC - each model's recommended memory (VRAM + RAM together).
 - [WINDOWS.md](WINDOWS.md): installing and running Maya on Windows 10/11.
 

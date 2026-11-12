@@ -1,0 +1,94 @@
+{
+ "id": "nested_03",
+ "group": "nested",
+ "api": "openai",
+ "request": {
+  "messages": [
+   {
+    "role": "user",
+    "content": "Show me laptops between 800 and 1500 dollars that are in stock, tagged 'ultrabook' or 'oled', sorted by rating descending, top 5."
+   }
+  ],
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "query_products",
+     "description": "Search the product catalogue with structured filters.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "filters": {
+        "type": "object",
+        "properties": {
+         "category": {
+          "type": "string"
+         },
+         "price": {
+          "type": "object",
+          "properties": {
+           "min": {
+            "type": "number"
+           },
+           "max": {
+            "type": "number"
+           }
+          }
+         },
+         "tags": {
+          "type": "array",
+          "items": {
+           "type": "string"
+          }
+         },
+         "in_stock": {
+          "type": "boolean"
+         }
+        }
+       },
+       "sort": {
+        "type": "object",
+        "properties": {
+         "field": {
+          "type": "string",
+          "enum": [
+           "price",
+           "rating",
+           "name"
+          ]
+         },
+         "order": {
+          "type": "string",
+          "enum": [
+           "asc",
+           "desc"
+          ]
+         }
+        }
+       },
+       "limit": {
+        "type": "integer"
+       }
+      },
+      "required": [
+       "filters"
+      ]
+     }
+    }
+   }
+  ]
+ },
+ "expect": {
+  "calls": [
+   {
+    "name": "query_products",
+    "args": {
+     "limit": 5
+    }
+   }
+  ],
+  "min_calls": 1,
+  "max_calls": 3,
+  "no_call": false
+ }
+}

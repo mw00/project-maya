@@ -132,7 +132,8 @@ void usage() {
                  "           [--vision on|off] [--mmap-experts on|off|auto] [--experts N (lossy: the router's top N)]\n"
                  "           [--parallel N (--serve: N conversations at once)]\n"
                  "           [--ssd-cache GB|auto|off [--ssd-policy lru|lfu]]   (the in-place experts in a RAM store; opt-in)\n"
-                 "           [--ablate DIRECTION.gguf|ADAPTER.gguf [--ablate-layer N] [--ablate-scale F]]\n"
+                 "           [--ablate DIRECTION.gguf|ADAPTER.gguf [--ablate-layer N] [--ablate-scale F]\n"
+                 "            [--ablate-default on|off]]   (--serve: GEN ablate=0|1 per request)\n"
                  "           (--ids I,J,... | @FILE [--images FILE] [--n N] [--dump-logits FILE] | --ppl FILE | --serve\n"
                  "           | --encode-image FILE.rgb --size WxH --dump-image OUT)\n"
                  "maya-ds4 --pack <model>/maya-ds4 --pack-info [--expert-profile FILE]   the pack described: no GPU, no "
@@ -270,12 +271,12 @@ std::string per_position(const strata::ds4::Stats& s0, const strata::ds4::Stats&
 
 // The drafts' cut on the product of their confidences (DeepInfer's cumulative rule, GLM's spec_cum): a draft is
 // verified while the chance that it and every draft before it are kept stays at least this - a long window whose later
-// drafts are likely lost is not verified whole.  MAYA_DS4_DSPARK_CUM=F (STRATA_DS4_DSPARK_CUM), a request's dspark_cum
+// drafts are likely lost is not verified whole.  MAYA_DS4_DSPARK_CUM=F, a request's dspark_cum
 // key; 0: off, only the floor on each draft's own confidence (dspark_conf).  0.5 by default: a Radeon 8065S, Maya-S,
 // greedy over code / chat / a list, two runs: decode 12.04 -> 12.82 tok/s (+6.5%), the same tokens
 float dspark_cum_default() {
     static const float v = [] {
-        const char* e = std::getenv("STRATA_DS4_DSPARK_CUM");
+        const char* e = std::getenv("MAYA_DS4_DSPARK_CUM");
         return e != nullptr ? (float) std::atof(e) : 0.5f;
     }();
     return v;
@@ -341,9 +342,9 @@ RoundLog& round_log() {
     return r;
 }
 
-// a DS4_ setting as MAYA_DS4_* sets it (read as STRATA_DS4_*), else the DS4_* name itself (the model's ds4_env)
+// a DS4_ setting as MAYA_DS4_* sets it, else the DS4_* name itself (the model's ds4_env)
 const char* ds4_env(const char* name) {
-    const char* v = std::getenv((std::string("STRATA_") + name).c_str());
+    const char* v = std::getenv((std::string("MAYA_") + name).c_str());
     return v != nullptr ? v : std::getenv(name);
 }
 
@@ -540,6 +541,9 @@ struct Req {
     // logit_bias=<id>:<bias>,... (OpenAI's logit_bias; the server's ignore_eos bans the end tokens with -100): added to
     // the logits of every pick of the answer (Model::set_logit_bias); none: the picks exactly as without
     std::vector<std::pair<int, float>> bias;
+    // ablate=0|1 (the server's per-request switch, INFO ablate=1): this request's passes project the --ablate direction
+    // out or not; -1: as the engine started (--ablate-default).  Without a direction: ignored
+    int ablate = -1;
 };
 
 // A prompt's picture: where its span starts, its pixels (the server's resize: RGB rows, both sides multiples of the
@@ -664,6 +668,7 @@ bool parse_gen(const std::string& line, Req& r, bool geni) {
         else if (k == "think_weak") { for (int x : parse_ids(v)) r.soft_weak.insert(x); }
         else if (k == "think_dig") { for (int x : parse_ids(v)) r.soft_dig.insert(x); }
         else if (k == "rid") r.rid = std::atoll(v.c_str());
+        else if (k == "ablate") r.ablate = std::atoi(v.c_str()) != 0;
         else if (k == "marks") {
             for (int x : parse_ids(v))
                 if (x > 0) r.marks.push_back(x);
@@ -708,8 +713,7 @@ std::atomic<uint64_t> g_beats{0};
 std::atomic<bool> g_busy{false};
 void beat() { g_beats.fetch_add(1, std::memory_order_relaxed); }
 void start_watchdog(const strata::ds4::Model& m) {
-    const char* v = std::getenv("STRATA_DS4_WATCHDOG_S");
-    if (v == nullptr) v = std::getenv("MAYA_DS4_WATCHDOG_S");
+    const char* v = std::getenv("MAYA_DS4_WATCHDOG_S");
     const int limit = v != nullptr ? std::atoi(v) : 600;
     if (limit <= 0) return;
     std::thread([&m, limit] {
@@ -738,6 +742,9 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
     for (const std::string& l : m.info_lines()) std::printf("%s\n", l.c_str());
     std::printf("INFO logprobs=%d\n", strata::ds4::kTopLogprobs);   // (GEN logprobs=<k>: LP lines, k at most this)
     std::printf("INFO logit_bias=1\n");   // (GEN logit_bias=<id>:<bias>,...: added to the logits of every pick)
+    if (m.ablate_loaded())   // (--ablate: GEN ablate=0|1 turns its projection off / on for the request)
+        std::printf("INFO ablate=1 ablate_default=%d\n", m.ablating() ? 1 : 0);
+    const bool abl_default = m.ablating();   // (a GEN without ablate=: as the engine started)
     if (m.seq_count() > 1)   // (--parallel: n conversations at once, GEN rid=<id>)
         std::printf("READY %lld stop multi=%d\n", (long long) m.max_context(), m.seq_count());
     else
@@ -811,13 +818,13 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
     // picture, or the same one elsewhere, shares no state past that place.
     const auto env_num = [](const char* k, double d) { const char* v = std::getenv(k); return v ? std::atof(v) : d; };
     const bool slot_keep =
-        std::getenv("STRATA_DS4_SLOT_KEEP") != nullptr && std::atoi(std::getenv("STRATA_DS4_SLOT_KEEP")) != 0;
-    int slot_max = slot_keep ? std::max(0, (int) env_num("STRATA_DS4_SLOT_CAP", 4)) : 0;
-    const size_t slot_min = (size_t) std::max(1.0, env_num("STRATA_DS4_SLOT_MIN", 1024));
-    const double slot_days = env_num("STRATA_DS4_SLOT_DAYS", 7);
-    const uint64_t slot_budget = (uint64_t) (env_num("STRATA_DS4_SLOT_GB", 16) * 1073741824.0);
+        std::getenv("MAYA_DS4_SLOT_KEEP") != nullptr && std::atoi(std::getenv("MAYA_DS4_SLOT_KEEP")) != 0;
+    int slot_max = slot_keep ? std::max(0, (int) env_num("MAYA_DS4_SLOT_CAP", 4)) : 0;
+    const size_t slot_min = (size_t) std::max(1.0, env_num("MAYA_DS4_SLOT_MIN", 1024));
+    const double slot_days = env_num("MAYA_DS4_SLOT_DAYS", 7);
+    const uint64_t slot_budget = (uint64_t) (env_num("MAYA_DS4_SLOT_GB", 16) * 1073741824.0);
     const uint64_t slot_ram_budget = [] {
-        const char* k = "STRATA_DS4_SLOT_RAM_GB", *v = std::getenv(k);
+        const char* k = "MAYA_DS4_SLOT_RAM_GB", *v = std::getenv(k);
         if (v == nullptr) return (uint64_t) 0;
         char* end = nullptr;
         const double gb = std::strtod(v, &end);
@@ -1013,7 +1020,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
     };
     // the conversation in the model into a slot (the state is lost otherwise: another one takes the model)
     const auto slot_put = [&](const char* why) {
-        if (slot_max <= 0) return;
+        if (slot_max <= 0 || m.ablating()) return;   // (an abliterated conversation is not kept: read again)
         const std::vector<int32_t>& t = m.tokens();
         if (t.size() < slot_min) return;   // (a fresh engine's 0-token state is no conversation: nothing to set aside)
         std::vector<strata::ds4::PicMark> marks;   // (the state's pictures: what the slot keeps of them - no pixels,
@@ -1162,9 +1169,9 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
     };
     std::vector<Prefix> prefixes;
     uint64_t prefix_clock = 0;
-    const int prefix_max = m.marks_cap() > 0 ? std::max(0, (int) env_num("STRATA_DS4_PREFIX_KEEP", 2)) : 0;
-    const uint64_t prefix_budget = (uint64_t) (std::max(0.0, env_num("STRATA_DS4_PREFIX_GB", 2)) * 1073741824.0);
-    const size_t prefix_min = (size_t) std::max(1.0, env_num("STRATA_DS4_PREFIX_MIN", 1024));
+    const int prefix_max = m.marks_cap() > 0 ? std::max(0, (int) env_num("MAYA_DS4_PREFIX_KEEP", 2)) : 0;
+    const uint64_t prefix_budget = (uint64_t) (std::max(0.0, env_num("MAYA_DS4_PREFIX_GB", 2)) * 1073741824.0);
+    const size_t prefix_min = (size_t) std::max(1.0, env_num("MAYA_DS4_PREFIX_MIN", 1024));
     // the longest kept start the prompt begins with, past `floor` tokens and short of its last token (none: -1)
     const auto prefix_find = [&](const std::vector<int>& prompt, const std::vector<Pic>& want, size_t floor) -> int {
         int best = -1;
@@ -1183,7 +1190,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
     // the state as the read keeps it at a shared start: kept apart (a copy of it), unless it already is
     const auto prefix_keep = [&]() {
         const std::vector<int32_t>& t = m.tokens();
-        if (prefix_max <= 0 || t.size() < prefix_min) return;
+        if (prefix_max <= 0 || t.size() < prefix_min || m.ablating()) return;   // (nor an abliterated start)
         for (Prefix& p : prefixes)
             if (p.tokens == t) {
                 p.used = ++prefix_clock;
@@ -1233,7 +1240,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         return true;
     };
     if (slot_max > 0) {
-        slot_dir = std::getenv("STRATA_DS4_SLOT_DIR") ? std::filesystem::path(std::getenv("STRATA_DS4_SLOT_DIR"))
+        slot_dir = std::getenv("MAYA_DS4_SLOT_DIR") ? std::filesystem::path(std::getenv("MAYA_DS4_SLOT_DIR"))
                                                       : std::filesystem::path(pack) / "slots";
         std::error_code ec;
         std::filesystem::create_directories(slot_dir, ec);
@@ -1407,7 +1414,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                           (double) (s.ahead_pf - s_dec.ahead_pf) / fed);
             out += b;
         }
-        if (s.skipped > s_dec.skipped) {   // (STRATA_DS4_DISK_SKIP_W: experts left out a token)
+        if (s.skipped > s_dec.skipped) {   // (MAYA_DS4_DISK_SKIP_W: experts left out a token)
             std::snprintf(b, sizeof b, " skipped=%.3f", (double) (s.skipped - s_dec.skipped) / fed);
             out += b;
         }
@@ -1475,6 +1482,12 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             if ((size_t) q.start < c && !pic_same(held, q)) c = (size_t) q.start;
         for (const Pic& q : held)
             if ((size_t) q.start < c && !pic_same(pics, q)) c = (size_t) q.start;
+        // abliteration: a state read with the projection on shares nothing with a request that has it off, and the
+        // other way round - the conversation starts over (an abliterated one is never kept as a slot or a shared start:
+        // slot_put / prefix_keep, so none is taken back either)
+        const bool abl = m.ablate_loaded() && (r.ablate >= 0 ? r.ablate != 0 : abl_default);
+        const bool abl_flip = m.ablate_loaded() && abl != m.ablating();
+        if (abl_flip) c = 0;
         size_t from = 0;
         bool continued = false;
         // the conversation continues, reused in place - a conversation has to be in the model first: a fresh engine
@@ -1495,9 +1508,9 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             bool whole = false;
             // (a kept shared start, when it covers more than the state itself can go back to; a kept conversation
             //  only when it covers more than either)
-            const int pi = prefix_find(r.ids, pics, rs > 0 ? (size_t) rs : 0);
+            const int pi = abl ? -1 : prefix_find(r.ids, pics, rs > 0 ? (size_t) rs : 0);
             const size_t plen = pi >= 0 ? prefixes[(size_t) pi].tokens.size() : 0;
-            const size_t back = slot_take(r.ids, pics, std::max(rs > 0 ? (size_t) rs : 0, plen), whole);
+            const size_t back = abl ? 0 : slot_take(r.ids, pics, std::max(rs > 0 ? (size_t) rs : 0, plen), whole);
             beat();
             if (back > 0) {
                 from = back;
@@ -1509,6 +1522,8 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                 from = (size_t) m.pos();
             else m.reset();
         }
+        if (abl_flip && from == 0 && m.pos() != 0) m.reset();
+        m.set_ablate(abl);
         if (from == 0) held.clear();   // (a slot that came back set held itself: its pictures' marks, not only start
                                        //  and hash, so the spans already in the KV are not encoded again)
         if ((int64_t) r.ids.size() + std::max(0LL, r.max_new) > m.max_context()) {
@@ -1948,15 +1963,15 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                                             : 0.0);
         if (d_off > 0) std::fprintf(stderr, "maya ds4 serve: drafts %lld of %lld kept; %s\n", d_acc, d_off,
                                     per_position(s_dec, s).c_str());
-        // (DS4_DRAFT_VRAM, read as STRATA_DS4_DRAFT_VRAM or DS4_DRAFT_VRAM: the cap's misses - this request's decode,
+        // (DS4_DRAFT_VRAM, read as MAYA_DS4_DRAFT_VRAM or DS4_DRAFT_VRAM: the cap's misses - this request's decode,
         //  the drafter's picks)
-        if (std::getenv("STRATA_DS4_DRAFT_VRAM") != nullptr || std::getenv("DS4_DRAFT_VRAM") != nullptr)
+        if (std::getenv("MAYA_DS4_DRAFT_VRAM") != nullptr || std::getenv("DS4_DRAFT_VRAM") != nullptr)
             std::fprintf(stderr, "maya ds4 serve: drafter experts: %lld picks, %lld of them on the CPU lane (this "
                                  "request's decode; DS4_DRAFT_VRAM)\n",
                          (long long) (s.draft_experts - s_dec.draft_experts),
                          (long long) (s.draft_cpu - s_dec.draft_cpu));
         if (s.hr_maps + s.hr_fails + s.hr_abandoned + s.hr_hits > 0 ||
-            std::getenv("STRATA_DS4_HELPER_RECENT") != nullptr || std::getenv("DS4_HELPER_RECENT") != nullptr)
+            std::getenv("MAYA_DS4_HELPER_RECENT") != nullptr || std::getenv("DS4_HELPER_RECENT") != nullptr)
             std::fprintf(stderr, "maya ds4 serve: helper recent slots: %lld picks served, %lld mapped, %lld let go, "
                                  "%lld fills not done, %lld left unmapped (this request)\n",
                          (long long) (s.hr_hits - s_dec.hr_hits), (long long) (s.hr_maps - s_dec.hr_maps),
@@ -3640,6 +3655,14 @@ int main(int argc, char** argv) {
         else if (a == "--ablate") o.ablate = val("--ablate");
         else if (a == "--ablate-layer") o.ablate_layer = (int) num("--ablate-layer", 1, 4096, true);
         else if (a == "--ablate-scale") o.ablate_scale = (float) num("--ablate-scale", 1e-6, 1e6, false);
+        else if (a == "--ablate-default") {   // on (as before: every pass) | off (loaded; GEN ablate=1 turns it on)
+            const std::string v = val("--ablate-default");
+            if (v != "on" && v != "off" && v != "1" && v != "0") {
+                std::fprintf(stderr, "--ablate-default: on or off\n");
+                return 2;
+            }
+            o.ablate_default = v == "on" || v == "1";
+        }
         else if (a == "--serve") serve_mode = true;
         else if (a == "--parallel") o.seqs = (int) num("--parallel", 1, 8, true);   // (--serve: conversations at once)
         else if (a == "--multi-check") multi_check = true;   // (tests: --parallel's rows against each alone)
@@ -4014,7 +4037,7 @@ int main(int argc, char** argv) {
     const long long io1 = io_read_bytes();
     if (io0 >= 0 && io1 >= 0)
         std::fprintf(stderr, "decode reads from the disk: %.1f MB a token\n", (double) (io1 - io0) / 1e6 / nt);
-    if (s.skipped > s0.skipped)   // STRATA_DS4_DISK_SKIP_W
+    if (s.skipped > s0.skipped)   // MAYA_DS4_DISK_SKIP_W
         std::fprintf(stderr, "decode left out %.1f experts a token not in RAM (%.1f%% of the routed)\n",
                      (double) (s.skipped - s0.skipped) / nt,
                      100.0 * (double) (s.skipped - s0.skipped) / std::max<double>(1.0, (double) (s.experts - s0.experts)));

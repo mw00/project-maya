@@ -1,7 +1,7 @@
 """tools/maya_quant/mtp_gguf.py - GLM-5.3-Flash's NextN (MTP) draft block alone, as a small GGUF.
 
 The engine drafts tokens with this block on two GPUs (speculative decoding).  A quant published without it - or one
-whose block is less precise - takes it from this file instead: STRATA_GLM_MTP_GGUF=<the file> (the engine looks up
+whose block is less precise - takes it from this file instead: MAYA_GLM_MTP_GGUF=<the file> (the engine looks up
 the draft block there first; it reads the trunk's hidden state and the embedding, so a block from any quant of the
 same model fits).  This copies the blk.<block_count>.* tensors as they are (no requantization) from a Maya GGUF that
 has them, with the model's hyperparameters (no tokenizer: the model's own GGUF carries it).

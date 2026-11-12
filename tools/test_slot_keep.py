@@ -23,11 +23,11 @@ class ConfigEnv(unittest.TestCase):
             return SK.config_env(str(path))
 
     def test_the_engines_settings_reach_it_under_its_names(self):
-        self.assertEqual(self.env_of({"DS4_POOL_GB": "88", "MAYA_DS4_STREAM": "0", "STRATA_DS4_SLOT_CAP": 8}),
-                         {"DS4_POOL_GB": "88", "STRATA_DS4_STREAM": "0", "STRATA_DS4_SLOT_CAP": "8"})
+        self.assertEqual(self.env_of({"DS4_POOL_GB": "88", "MAYA_DS4_STREAM": "0", "MAYA_DS4_SLOT_CAP": 8}),
+                         {"DS4_POOL_GB": "88", "MAYA_DS4_STREAM": "0", "MAYA_DS4_SLOT_CAP": "8"})
 
     def test_another_engines_settings_stay_out(self):
-        self.assertEqual(self.env_of({"STRATA_GLM_RAM_GB": "65", "MAYA_GLM_SLOTS": "0", "CUDA_VISIBLE_DEVICES": "1"}),
+        self.assertEqual(self.env_of({"MAYA_GLM_RAM_GB": "65", "MAYA_GLM_SLOTS": "0", "CUDA_VISIBLE_DEVICES": "1"}),
                          {})
 
 

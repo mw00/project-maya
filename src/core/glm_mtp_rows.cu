@@ -1,4 +1,4 @@
-// src/core/glm_mtp_rows.cu - several conversations drafting with the NextN (MTP) block at once (STRATA_GLM_MULTI_MTP).
+// src/core/glm_mtp_rows.cu - several conversations drafting with the NextN (MTP) block at once (MAYA_GLM_MULTI_MTP).
 //
 // The batched rows (glm_rows.cu) take one token of each of a group's conversations through the split.  Here each
 // conversation brings a WINDOW instead: the token it feeds (the last one it wrote) and up to d drafts the NextN block
@@ -34,6 +34,7 @@
 #include "glm_rows_state.hpp"
 
 #include "strata/core/mtp_rows.hpp"
+#include "strata/core/glm_maya_sync.hpp"   // glm-dsa: glm_rows_ok (these rows are Flash kernels)
 #include "strata/kernels/sampler.hpp"
 
 #include "ggml.h"
@@ -99,7 +100,7 @@ struct Glm5Model::MtpRows {
 
 int Glm5Model::multi_mtp_setting() {
     static const int v = [] {
-        const char* e = getenv("STRATA_GLM_MULTI_MTP");
+        const char* e = getenv("MAYA_GLM_MULTI_MTP");
         return e != nullptr ? std::clamp(std::atoi(e), 0, 7) : 0;
     }();
     return v;
@@ -107,7 +108,7 @@ int Glm5Model::multi_mtp_setting() {
 
 int Glm5Model::multi_mtp_cap() {
     static const int v = [] {
-        const char* e = getenv("STRATA_GLM_MULTI_MTP_ROWS");
+        const char* e = getenv("MAYA_GLM_MULTI_MTP_ROWS");
         return e != nullptr ? std::clamp(std::atoi(e), 8, gf::kMaxMvNt) : gf::kMaxMvNt;
     }();
     return v;
@@ -122,6 +123,7 @@ size_t Glm5Model::mtpw_kin_offset(int il) const {
 
 bool Glm5Model::mtpw_alloc(std::string& err) {
     if (mtpw_ != nullptr || multi_mtp_setting() <= 0 || seq_.empty()) return true;
+    if (!glm_rows_ok(g_.arch)) return true;   // glm-dsa: the conversations draft one after the other (no MTP rows)
     const Glm5Geometry& g = g_;
     auto* M = new MtpRows();
     mtpw_ = M;
@@ -264,6 +266,7 @@ void Glm5Model::mtpw_destroy() {
 
 bool Glm5Model::mtpw_ok() const {
     if (multi_mtp_setting() <= 0 || seq_.empty()) return false;
+    if (!glm_rows_ok(g_.arch)) return false;   // glm-dsa: no MTP rows (mtpw_alloc made none)
     const Glm5Model* last = this;
     for (const Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
         if (m->fast_ == nullptr || m->mtpw_ == nullptr || m->rows_ == nullptr) return false;
@@ -474,7 +477,7 @@ struct RowsCrew {
 
 }  // namespace
 
-// ---------------------------------------------------------------- the rows crews (STRATA_GLM_MTPW_CREWS=1)
+// ---------------------------------------------------------------- the rows crews (MAYA_GLM_MTPW_CREWS=1)
 // One worker per part: each runs its part's own share of a group (mtpw_part).  The host's serial launch chain - which
 // a row-4 group's round otherwise spends ~80-100 ms on - runs on all the parts at once.  The rows still flow through
 // the per-row hop events (device-side ordering), and the workers' stage tags only gate the events' capture.  The host
@@ -485,8 +488,8 @@ bool Glm5Model::mtpw_front(const int* seqs, const int* counts, int n, const int3
         return false;
     }
     if (seq_[0].hop_h == nullptr && !seq_pipe_ready(err)) return false;
-    static const bool crews = getenv("STRATA_GLM_MTPW_CREWS") != nullptr &&
-                              std::atoi(getenv("STRATA_GLM_MTPW_CREWS")) != 0;
+    static const bool crews = getenv("MAYA_GLM_MTPW_CREWS") != nullptr &&
+                              std::atoi(getenv("MAYA_GLM_MTPW_CREWS")) != 0;
     if (crews) {
         auto* C = (RowsCrew*) rows_crew_;
         if (C == nullptr) rows_crew_start(err);
@@ -636,13 +639,13 @@ void Glm5Model::rows_crew_start(std::string& err) {
         });
     }
     rows_crew_ = C;
-    std::fprintf(stderr, "glm multi mtp: the parts' enqueue crews on (STRATA_GLM_MTPW_CREWS)\n");
+    std::fprintf(stderr, "glm multi mtp: the parts' enqueue crews on (MAYA_GLM_MTPW_CREWS)\n");
 }
 
 bool Glm5Model::mtpw_back(const int* seqs, const int* counts, int n, const int32_t* tokens,
                           const strata::kernels::SamplerParams* sps, std::string& err) {
-    static const bool crews = getenv("STRATA_GLM_MTPW_CREWS") != nullptr &&
-                              std::atoi(getenv("STRATA_GLM_MTPW_CREWS")) != 0;
+    static const bool crews = getenv("MAYA_GLM_MTPW_CREWS") != nullptr &&
+                              std::atoi(getenv("MAYA_GLM_MTPW_CREWS")) != 0;
     if (crews) {
         auto* C = (RowsCrew*) rows_crew_;
         RowsCrew::Worker* wk = C->w.back().get();
@@ -980,7 +983,7 @@ bool Glm5Model::mtpw_draft_queue(const int* seqs, const int* keep, int n, const 
         return false;
     }
     static const bool whole_head = [] {
-        const char* e = getenv("STRATA_GLM_MULTI_MTP_VOCAB");
+        const char* e = getenv("MAYA_GLM_MULTI_MTP_VOCAB");
         return e != nullptr && std::atoi(e) == 0;
     }();
     const bool sub = !whole_head && F->mtp_dv > 0;
@@ -998,10 +1001,10 @@ bool Glm5Model::mtpw_draft_queue(const int* seqs, const int* keep, int n, const 
     M->d_tok.assign((size_t) n, -1);
     M->d_out.assign((size_t) n * (size_t) std::max(1, M->W - 1), -1);
     M->d_pending = false;
-    // STRATA_GLM_MULTI_MTP_DRAFT_ROWS (on): the conversations' draft steps as batched rows of the NextN block, nothing
+    // MAYA_GLM_MULTI_MTP_DRAFT_ROWS (on): the conversations' draft steps as batched rows of the NextN block, nothing
     // bound; 0: each conversation's steps through the token path's block (fast_mtp), the last part bound to it
     static const bool draft_rows = [] {
-        const char* e = getenv("STRATA_GLM_MULTI_MTP_DRAFT_ROWS");
+        const char* e = getenv("MAYA_GLM_MULTI_MTP_DRAFT_ROWS");
         return e == nullptr || std::atoi(e) != 0;
     }();
     RowSeq base[gf::kMaxMvNt];

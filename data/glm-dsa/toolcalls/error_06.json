@@ -1,0 +1,67 @@
+{
+ "id": "error_06",
+ "group": "error_reply",
+ "api": "openai",
+ "request": {
+  "messages": [
+   {
+    "role": "user",
+    "content": "Search for the weather."
+   },
+   {
+    "role": "assistant",
+    "content": "",
+    "tool_calls": [
+     {
+      "id": "call_6",
+      "type": "function",
+      "function": {
+       "name": "search_web",
+       "arguments": "{\"query\": \"weather\"}"
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "tool_call_id": "call_6",
+    "content": "{\"error\": \"rate limited, retry after 2 seconds\"}"
+   }
+  ],
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "search_web",
+     "description": "Search the web and return the top results.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "query": {
+        "type": "string"
+       },
+       "max_results": {
+        "type": "integer"
+       }
+      },
+      "required": [
+       "query"
+      ]
+     }
+    }
+   }
+  ]
+ },
+ "expect": {
+  "calls": [],
+  "min_calls": 0,
+  "max_calls": 2,
+  "no_call": false,
+  "must_not_repeat": {
+   "name": "search_web",
+   "args": {
+    "query": "weather"
+   }
+  }
+ }
+}

@@ -74,7 +74,7 @@ The original explicit workflow remains available:
 Replace `maya-my-glm.json` with the configuration printed by normal setup.
 The example budget requires enough HIP runtime memory (the performance fixture
 used 96 GiB UMA). BIOS reservation alone does not determine HIP's allocation
-limit: our current 4 GiB BIOS setup reports about 59.6 GiB to HIP, still too little
+limit: a historical 4 GiB BIOS boot reported about 59.6 GiB to HIP, still too little
 for this 90112 MiB example. Stop other GPU workloads and choose a budget within
 the helper's actual free memory. `--list-devices` shows NVIDIA indices separately
 from **HIP runtime ordinals**; `--hip-device` uses the latter, without inherited
@@ -173,31 +173,31 @@ Keep fixture and production outputs in separate directories.
 Set these in the engine environment (or Maya configuration's `env` object):
 
 ```sh
-export STRATA_GLM_SPLIT=0
-export STRATA_GLM_EXPERT_PLUGIN=/absolute/path/to/modules/libmaya_expert_hip.so
-export STRATA_GLM_EXPERT_PLUGIN_DEVICE=0
-export STRATA_GLM_EXPERT_PLUGIN_MIB=90112
+export MAYA_GLM_SPLIT=0
+export MAYA_GLM_EXPERT_PLUGIN=/absolute/path/to/modules/libmaya_expert_hip.so
+export MAYA_GLM_EXPERT_PLUGIN_DEVICE=0
+export MAYA_GLM_EXPERT_PLUGIN_MIB=90112
 ```
 
 The device ordinal belongs to the **helper runtime** and is independent of the
 primary CUDA ordinal. The budget is required, includes scratch, and accepts
 1–131072 MiB. The example 90112 MiB is for the tested 96 GiB UMA machine; choose a
 budget within the actual device's available memory. Do not also configure
-`STRATA_GLM_EXPERT_HELPER` or layer splitting. The primary GPU keeps Maya's native
+`MAYA_GLM_EXPERT_HELPER` or layer splitting. The primary GPU keeps Maya's native
 automatic VRAM sizing; the adapter adds no primary pool limit or reserve rule.
 
 | Optional setting | Default | Effect |
 |---|---|---|
-| `STRATA_GLM_EXPERT_PLUGIN_READ` | off | `1` reads helper-owned weights into the existing host landing ring for CUDA prefill. Requires the readback extension. |
-| `STRATA_GLM_EXPERT_PLUGIN_PREFILL_SHARE` | `0` | Fraction cap on helper-computed routed expert rows per layer, accepted range `0..0.49`. Requires the row extension. |
-| `STRATA_GLM_EXPERT_PLUGIN_PREFILL_MAX_ROWS` | `16` | Per-expert admission limit, clamped to 1–256 rows. Admitted work still executes in tiles of at most 16 rows. |
-| `STRATA_GLM_HELPER_COST` | `0` | Adapt prefill admission to observed helper and CUDA staging costs; requires positive helper share. |
-| `STRATA_GLM_HELPER_COST_TRACE` | `0` | Log per-layer costs, with either static or adaptive admission. Diagnostic only. |
-| `STRATA_GLM_EXPERT_PLUGIN_PRESTAGE` | `0` | Maximum helper-backed experts admitted per layer to Maya's next-layer prestager. Requires readback; existing prestage slots and prediction rules still apply. |
-| `STRATA_GLM_HELPER_ZEROCOPY` | off for this executor | `1` enables runtime-owned mapped input/plan/result buffers on an integrated helper. Discrete devices, insufficient budget or unavailable mapping retain copies. Grouped rows are unchanged. |
+| `MAYA_GLM_EXPERT_PLUGIN_READ` | off | `1` reads helper-owned weights into the existing host landing ring for CUDA prefill. Requires the readback extension. |
+| `MAYA_GLM_EXPERT_PLUGIN_PREFILL_SHARE` | `0` | Fraction cap on helper-computed routed expert rows per layer, accepted range `0..0.49`. Requires the row extension. |
+| `MAYA_GLM_EXPERT_PLUGIN_PREFILL_MAX_ROWS` | `16` | Per-expert admission limit, clamped to 1–256 rows. Admitted work still executes in tiles of at most 16 rows. |
+| `MAYA_GLM_HELPER_COST` | `0` | Adapt prefill admission to observed helper and CUDA staging costs; requires positive helper share. |
+| `MAYA_GLM_HELPER_COST_TRACE` | `0` | Log per-layer costs, with either static or adaptive admission. Diagnostic only. |
+| `MAYA_GLM_EXPERT_PLUGIN_PRESTAGE` | `0` | Maximum helper-backed experts admitted per layer to Maya's next-layer prestager. Requires readback; existing prestage slots and prediction rules still apply. |
+| `MAYA_GLM_HELPER_ZEROCOPY` | off for this executor | `1` enables runtime-owned mapped input/plan/result buffers on an integrated helper. Discrete devices, insufficient budget or unavailable mapping retain copies. Grouped rows are unchanged. |
 
-For GPU-only expert computation, set `STRATA_GLM_CPU_LANE=0` and
-`STRATA_GLM_PREFILL_CPU=0`. CPU orchestration and host staging still run. With
+For GPU-only expert computation, set `MAYA_GLM_CPU_LANE=0` and
+`MAYA_GLM_PREFILL_CPU=0`. CPU orchestration and host staging still run. With
 readback enabled and helper share zero, CUDA computes prefill while helper weights
 remain resident for subsequent dual-device decode. Positive share selects
 helper-owned, nonresident experts lightest first within the row limit, fraction
@@ -207,7 +207,7 @@ The fraction is an admission cap, not a measured compute-time ratio.
 The tested HengHa machine preset uses share `0.25`, max rows `64`, prestage `32`,
 readback and mapped buffers enabled. These are fixture settings, not universal
 defaults. Increasing helper work may increase layer latency. Leave profiling off
-for throughput tests; `STRATA_GLM_PROF` enables executor stage timings.
+for throughput tests; `MAYA_GLM_PROF` enables executor stage timings.
 
 ### Cost-based prefill admission
 
@@ -215,8 +215,8 @@ For an existing CUDA+HIP setup with readback and grouped prefill enabled, the
 tested adaptive configuration changes only these two environment values:
 
 ```sh
-export STRATA_GLM_HELPER_COST=1
-export STRATA_GLM_EXPERT_PLUGIN_PREFILL_MAX_ROWS=128
+export MAYA_GLM_HELPER_COST=1
+export MAYA_GLM_EXPERT_PLUGIN_PREFILL_MAX_ROWS=128
 ```
 
 In a Maya JSON configuration, put these values in its `env` object. Keep the
@@ -240,7 +240,7 @@ native benchmark runs per arm measured +15.3% at 2K and +1.6% at 8K, with
 effectively unchanged decode. This policy remains opt-in; MTP/DFlash, other
 hardware and long-context quality were not qualified with it. See the
 [cost-admission benchmark](../tests/mixed_runtime/HELPER_COST_BENCHMARK.md) for
-settings, numerical differences and limits. Set `STRATA_GLM_HELPER_COST=0` and
+settings, numerical differences and limits. Set `MAYA_GLM_HELPER_COST=0` and
 restore the previous row limit to reproduce the static control.
 
 ## Ownership and completion

@@ -1,0 +1,71 @@
+{
+ "id": "parallel_07",
+ "group": "parallel",
+ "api": "openai",
+ "request": {
+  "messages": [
+   {
+    "role": "user",
+    "content": "Weather in Oslo, Helsinki, Stockholm and Copenhagen?"
+   }
+  ],
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "get_weather",
+     "description": "Current weather for a city.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string"
+       },
+       "unit": {
+        "type": "string",
+        "enum": [
+         "celsius",
+         "fahrenheit"
+        ]
+       }
+      },
+      "required": [
+       "city"
+      ]
+     }
+    }
+   }
+  ]
+ },
+ "expect": {
+  "calls": [
+   {
+    "name": "get_weather",
+    "args": {
+     "city": "Oslo"
+    }
+   },
+   {
+    "name": "get_weather",
+    "args": {
+     "city": "Helsinki"
+    }
+   },
+   {
+    "name": "get_weather",
+    "args": {
+     "city": "Stockholm"
+    }
+   },
+   {
+    "name": "get_weather",
+    "args": {
+     "city": "Copenhagen"
+    }
+   }
+  ],
+  "min_calls": 2,
+  "max_calls": 6,
+  "no_call": false
+ }
+}

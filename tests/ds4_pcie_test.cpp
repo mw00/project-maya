@@ -1,6 +1,7 @@
 #include "../src/ds4/ds4_pcie.hpp"
 
 #include <cstdio>
+#include <initializer_list>
 #include <string>
 #include <vector>
 
@@ -57,6 +58,37 @@ int main() {
     CHECK(!pcie::verdicts_allow(-1, -1, true) && !pcie::verdicts_allow(-1, 1, false));
     CHECK(pcie::verdicts_allow(1, -1, false) && pcie::verdicts_allow(-1, 1, true));
 
+    // decode's checks (#697): a tie keeps streaming; only 3% slower twice in a row turns it off
+    const auto run = [](std::initializer_list<double> gains) {
+        int wins = 0, good = 0, bad = 0, v = 0;
+        for (double g : gains)
+            if ((v = pcie::ab_window(wins, good, bad, g)) != 0) break;
+        return v;
+    };
+    CHECK(run({-0.5}) == 0);                              // (the first window only warms up)
+    CHECK(run({0.0, -0.001, -0.008}) == 1);               // (an RTX 3090's +0.1% / +0.8%: it keeps streaming)
+    CHECK(run({0.0, 0.05, 0.04}) == 1);                   // (faster: as before)
+    CHECK(run({0.0, -0.045, -0.03}) == -1);               // (slower twice in a row: off, as before)
+    CHECK(run({0.0, -0.045, 0.01}) == 0);                 // (not twice in a row yet)
+    CHECK(run({0.0, -0.045, 0.01, -0.04, 0.0, -0.05, 0.02, -0.06, 0.0}) == 1);   // (undecided after 9: keeps it)
+    CHECK(run({0.0, -0.045, 0.01, -0.04, 0.0, -0.05, 0.02, -0.06}) == 0);
+    CHECK(run({0.0, 0.01, -0.04, -0.04}) == -1);          // (a tie, then slower twice: off)
+
+    // #920: a one-GPU PC whose CPU lane is far faster than its link for experts in RAM (the reporter's timed costs: an
+    // RTX PRO 5000 over a 7.2 GB/s link, a Ryzen AI Max+ 395): nothing streams warm, only disk reads split - with most
+    // of the CPU lane copied into RAM the one-GPU path ends; mostly in place, or a warm stream: kept as before
+    const pcie::Costs fast_cpu{0.107, 0.037, 1.907, 0.163, 0.006, 3.54};
+    CHECK(!pcie::streams_any(fast_cpu, 16, 6, false));
+    CHECK(pcie::streams_any(fast_cpu, 16, 6, true));   // (the cold split: what kept the path on)
+    CHECK(!pcie::one_gpu_keep(true, false, 9910, 11536));
+    CHECK(!pcie::one_gpu_keep(true, false, 5768, 11536));       // (exactly half copied: still the warm rule)
+    CHECK(pcie::one_gpu_keep(true, false, 5767, 11536));        // (most in place: as before)
+    CHECK(pcie::one_gpu_keep(true, false, 0, 11536) && pcie::one_gpu_keep(true, false, 0, 0));
+    CHECK(pcie::one_gpu_keep(true, true, 9910, 11536));         // (a warm stream: the measured case, kept)
+    CHECK(!pcie::one_gpu_keep(false, true, 9910, 11536) && !pcie::one_gpu_keep(false, false, 0, 11536));
+    CHECK(pcie::one_gpu_keep(true, pcie::streams_any(slow, 8, 6, false), 9910, 11536));
+
     std::puts("DS4 PCIe gates: persisted lane off, no/zero/partial pinning, force and hold cases passed; the warm-only "
-              "decision where no pick can be cold (#551) passed");
+              "decision where no pick can be cold (#551) passed; decode's checks keep streaming on a tie (#697); "
+              "the one-GPU path's warm rule (#920) passed");
 }

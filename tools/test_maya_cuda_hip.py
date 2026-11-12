@@ -77,6 +77,20 @@ class CudaHipSetupTests(unittest.TestCase):
         self.assertEqual(H.main(self.args), 0)
         return json.loads(self.output.read_text())
 
+    def test_legacy_settings_survive_setup_with_canonical_names_taking_precedence(self):
+        base = copy.deepcopy(self.base)
+        base['env'] = {'STRATA_GLM_NO_MTP': '1', 'STRATA_GLM_CPU_LANE': '16',
+                       'STRATA_GLM_SPLIT': '1', 'MAYA_GLM_SPLIT': '0',
+                       'STRATA_GLM_EXPERT_HELPER': '1', 'MAYA_GLM_EXPERT_HELPER': ''}
+        self.input.write_text(json.dumps(base))
+        cfg = self.install()
+        self.assertEqual(cfg['env']['MAYA_GLM_NO_MTP'], '1')
+        self.assertEqual(cfg['env']['MAYA_GLM_CPU_LANE'], '0')
+        self.assertEqual(cfg['env']['MAYA_GLM_SPLIT'], '0')
+        self.assertNotIn('MAYA_GLM_EXPERT_HELPER', cfg['env'])
+        self.assertTrue(all(not k.startswith('STRATA_') for k in cfg['env']))
+        self.assertEqual(json.loads(self.input.read_text()), base)
+
     def test_new_generations_do_not_overwrite_either_normal_backend_or_old_pair(self):
         originals = {self.input: self.input.read_bytes()}
         for name in ('build/maya', 'build-hip/maya', 'build/MAYA-BUILD.json', 'build-hip/MAYA-BUILD.json'):
@@ -105,9 +119,9 @@ class CudaHipSetupTests(unittest.TestCase):
     def test_preserves_model_and_drafter_choices_resolves_paths_and_separates_ordinals(self):
         cfg = self.install(); env = maya.N.env_in(copy.deepcopy(cfg))['env']
         self.assertEqual(cfg['gpu'], [2]); self.assertEqual(env['HIP_VISIBLE_DEVICES'], '1')
-        self.assertEqual(env['STRATA_GLM_EXPERT_PLUGIN_DEVICE'], '0')
-        self.assertEqual(env['STRATA_GLM_NO_MTP'], '1')
-        self.assertEqual(env['STRATA_GLM_CPU_LANE'], '0'); self.assertNotIn('ROCR_VISIBLE_DEVICES', env)
+        self.assertEqual(env['MAYA_GLM_EXPERT_PLUGIN_DEVICE'], '0')
+        self.assertEqual(env['MAYA_GLM_NO_MTP'], '1')
+        self.assertEqual(env['MAYA_GLM_CPU_LANE'], '0'); self.assertNotIn('ROCR_VISIBLE_DEVICES', env)
         self.assertEqual(cfg['port'], 9000); self.assertEqual(cfg['sampling'], self.base['sampling'])
         self.assertEqual(cfg['tokenizer'], str(self.pack / 'tokenizer'))
         self.assertIn(str(self.root / 'drafter.gguf'), cfg['args'])

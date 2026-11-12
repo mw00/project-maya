@@ -1,0 +1,79 @@
+{
+ "id": "nested_07",
+ "group": "nested",
+ "api": "openai",
+ "request": {
+  "messages": [
+   {
+    "role": "user",
+    "content": "Switch to dark theme, font size 16, turn off push notifications and set quiet hours from 22:00 to 07:00."
+   }
+  ],
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "update_settings",
+     "description": "Update application settings; only the given keys change.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "settings": {
+        "type": "object",
+        "properties": {
+         "theme": {
+          "type": "string",
+          "enum": [
+           "light",
+           "dark",
+           "system"
+          ]
+         },
+         "font_size": {
+          "type": "integer"
+         },
+         "notifications": {
+          "type": "object",
+          "properties": {
+           "email": {
+            "type": "boolean"
+           },
+           "push": {
+            "type": "boolean"
+           },
+           "quiet_hours": {
+            "type": "object",
+            "properties": {
+             "start": {
+              "type": "string"
+             },
+             "end": {
+              "type": "string"
+             }
+            }
+           }
+          }
+         }
+        }
+       }
+      },
+      "required": [
+       "settings"
+      ]
+     }
+    }
+   }
+  ]
+ },
+ "expect": {
+  "calls": [
+   {
+    "name": "update_settings",
+    "args": {}
+   }
+  ],
+  "min_calls": 1,
+  "max_calls": 3,
+  "no_call": false
+ }
+}

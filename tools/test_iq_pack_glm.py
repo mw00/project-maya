@@ -142,7 +142,7 @@ class ArchitectureCheck(unittest.TestCase):
         self.assertIn("qwen4exp", iq_pack.ARCHITECTURES)
         self.assertIn("glm5-next", iq_pack.ARCHITECTURES)
         self.assertIn("glm5next", iq_pack.ARCHITECTURES)   # unsloth's spelling, same KV family
-        self.assertEqual(len(iq_pack.ARCHITECTURES), 3)
+        self.assertEqual(len(iq_pack.ARCHITECTURES), 4)   # + glm-dsa (glm-dsa B1.6)
 
 
 if __name__ == "__main__":

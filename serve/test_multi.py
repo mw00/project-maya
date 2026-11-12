@@ -110,7 +110,7 @@ class Engine(unittest.TestCase):
 
 
 class Interleaved(unittest.TestCase):
-    """STRATA_GLM_PREFILL_INTERLEAVE's lines: a new prompt's PP lines come between the running requests' T lines."""
+    """MAYA_GLM_PREFILL_INTERLEAVE's lines: a new prompt's PP lines come between the running requests' T lines."""
 
     def setUp(self):
         import os

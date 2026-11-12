@@ -1,6 +1,11 @@
 #pragma once
 #include <stdint.h>
 #include <stddef.h>
+#if defined(_WIN32)
+#define MAYA_EXPERT_EXPORT __declspec(dllexport)
+#else
+#define MAYA_EXPERT_EXPORT __attribute__((visibility("default")))
+#endif
 #ifdef __cplusplus
 extern "C" {
 #endif

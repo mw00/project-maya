@@ -26,7 +26,7 @@ struct Resources {
     }
 };
 }
-extern "C" __attribute__((visibility("default")))
+extern "C" MAYA_EXPERT_EXPORT
 int maya_expert_probe(uint32_t abi, int device, int gu_type, int down_type,
     int n_embd, int n_ff, int k, const void *blobs, size_t bytes, size_t stride,
     size_t down_offset, const float *routing, const float *input, float clamp,

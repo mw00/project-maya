@@ -1,4 +1,5 @@
 #include "strata/core/plugin_experts.hpp"
+#include "strata/platform/env_alias.hpp"
 #include <algorithm>
 #include <charconv>
 #include <cmath>
@@ -22,10 +23,10 @@ bool number(const char* text,uint64_t& v) {
 }
 }
 bool PluginExperts::settings(std::string& path,int& device,size_t& budget,std::string& error) {
-    const char* p=std::getenv("STRATA_GLM_EXPERT_PLUGIN");
+    const char* p=std::getenv("MAYA_GLM_EXPERT_PLUGIN");
     uint64_t d=0,mib=0;
-    if (!p || *p!='/' || !number(std::getenv("STRATA_GLM_EXPERT_PLUGIN_DEVICE"),d) || d>1024 ||
-        !number(std::getenv("STRATA_GLM_EXPERT_PLUGIN_MIB"),mib) || mib==0 || mib>131072) {
+    if (!p || *p!='/' || !number(std::getenv("MAYA_GLM_EXPERT_PLUGIN_DEVICE"),d) || d>1024 ||
+        !number(std::getenv("MAYA_GLM_EXPERT_PLUGIN_MIB"),mib) || mib==0 || mib>131072) {
         error="expert plugin requires an absolute library path, explicit DEVICE (0..1024), and MIB (1..131072)";
         return false;
     }
@@ -46,12 +47,12 @@ bool PluginExperts::open(const std::string& path,int device,size_t budget,int wi
         !api_->create || !api_->upload || !api_->compute || !api_->stats || !api_->destroy) {
         error="expert plugin ABI mismatch"; return false;
     }
-    const char* read_env=std::getenv("STRATA_GLM_EXPERT_PLUGIN_READ");
+    const char* read_env=std::getenv("MAYA_GLM_EXPERT_PLUGIN_READ");
     if (read_env && std::atoi(read_env)!=0) {
         read_=reinterpret_cast<maya_context_read_fn>(dlsym(library_,"maya_expert_context_read"));
         if (!read_) { error="expert plugin lacks readback extension"; return false; }
     }
-    if (const char* value=std::getenv("STRATA_GLM_EXPERT_PLUGIN_PREFILL_SHARE")) {
+    if (const char* value=std::getenv("MAYA_GLM_EXPERT_PLUGIN_PREFILL_SHARE")) {
         char* end=nullptr; prefill_share_=std::strtod(value,&end);
         if (end==value || *end || !std::isfinite(prefill_share_) || prefill_share_<0 || prefill_share_>0.49) {
             error="expert plugin prefill share must be 0..0.49"; return false;

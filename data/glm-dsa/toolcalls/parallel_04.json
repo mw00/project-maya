@@ -1,0 +1,73 @@
+{
+ "id": "parallel_04",
+ "group": "parallel",
+ "api": "openai",
+ "request": {
+  "messages": [
+   {
+    "role": "user",
+    "content": "What time is it in New York and what's the weather there?"
+   }
+  ],
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "get_time",
+     "description": "Current local time in an IANA time zone.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "timezone": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "timezone"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "get_weather",
+     "description": "Current weather for a city.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string"
+       },
+       "unit": {
+        "type": "string",
+        "enum": [
+         "celsius",
+         "fahrenheit"
+        ]
+       }
+      },
+      "required": [
+       "city"
+      ]
+     }
+    }
+   }
+  ]
+ },
+ "expect": {
+  "calls": [
+   {
+    "name": "get_time",
+    "args": {}
+   },
+   {
+    "name": "get_weather",
+    "args": {}
+   }
+  ],
+  "min_calls": 2,
+  "max_calls": 4,
+  "no_call": false
+ }
+}

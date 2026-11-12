@@ -207,8 +207,19 @@ export function levelFor(level) {
   return (NEAREST[level] || []).find((l) => THINKING.includes(l)) || null;
 }
 
-export const prefsKey = () => ({deepseek: "sampling_deepseek", minimax: "sampling_minimax", qwen: "sampling_qwen"}[familyOf()] ||
-  "sampling");
+// GLM-5.3 (744B, its API name "glm-5.3") keeps its own, apart from GLM-5.3-Flash's ("sampling"): before v1.1.59 both
+// used "sampling", so the 744B's starts once from what was saved there (Flash's stays as it was)
+const GLM53_KEY = "sampling_glm53";
+const isGlm53 = (model = S.health.model) => /^glm-5\.3$/i.test(String(model || "").trim());
+function ownKeyOnce(key) {
+  if (key === GLM53_KEY && store.get(key, null) === null) {
+    const was = store.get("sampling", null);
+    if (was !== null) store.set(key, was);
+  }
+  return key;
+}
+export const prefsKey = () => ownKeyOnce(isGlm53() ? GLM53_KEY
+  : {deepseek: "sampling_deepseek", minimax: "sampling_minimax", qwen: "sampling_qwen"}[familyOf()] || "sampling");
 export let P = null;                     // the running model's chat settings: its defaults, then its user's own choices
 // stored: only what the user chose (a preset, a slider, a level) - the model's own defaults fill the rest, so they apply
 // until its user picks something.  Before (prefs_v 3) a change saved every value as it was then, the defaults too:
@@ -233,7 +244,7 @@ export function savePrefs(patch) {
   store.set(key, {...(store.get(key, {}) || {}), ...patch, prefs_v: 3});
   emit();
 }
-// the model running: its id and its files (the label: "GLM-5.3 · Maya-L") - another one is a model switch
+// the model running: its id and its files (the label: "GLM-5.3-Flash · Maya-L") - another one is a model switch
 export const modelId = () => `${S.health.model || ""}|${S.health.model_label || ""}`;
 // a model switch (the Models page's, or another model found when the page loads - a setup that changed it): the
 // user's sampling choices and level do not carry over - each model starts at its own standard parameters (the owner,
@@ -241,6 +252,7 @@ export const modelId = () => `${S.health.model || ""}|${S.health.model_label || 
 export function newModelCheck() {
   const id = modelId(), was = store.get("model", null);
   store.set("model", id);
+  ownKeyOnce(GLM53_KEY);                          // (the 744B's own first: a switch away from it clears what it chose)
   if (!S.health.model || was === null || was === id) return false;
   let keys = [];                                  // (every model's stored settings: "maya.sampling", "maya.sampling_<family>")
   try { keys = Object.keys(localStorage).filter((k) => k.startsWith("maya.sampling")).map((k) => k.slice(5)); } catch (e) { /* none */ }

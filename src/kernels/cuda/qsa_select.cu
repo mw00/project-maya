@@ -505,9 +505,9 @@ void qsa_block_topk_ref(const float* scores, const int32_t* steps, int64_t nq, i
 
 void qsa_block_topk(const float* scores, const int32_t* steps, int64_t nq, int64_t max_blocks, int64_t cap,
                     const QsaShapes& s, int32_t* ids, void* stream) {
-    // keys in registers when every query's blocks fit (contexts up to ~135K cells); the same ids. STRATA_TOPK_OLD=1:
+    // keys in registers when every query's blocks fit (contexts up to ~135K cells); the same ids. MAYA_TOPK_OLD=1:
     // the kernel that reads them from memory on every pass
-    static const bool old = std::getenv("STRATA_TOPK_OLD") != nullptr;
+    static const bool old = std::getenv("MAYA_TOPK_OLD") != nullptr;
     if (nq <= 0) return;
     if (old || max_blocks > (int64_t) TK_T * TK_PER) {
         qsa_block_topk_ref(scores, steps, nq, max_blocks, cap, s, ids, stream);

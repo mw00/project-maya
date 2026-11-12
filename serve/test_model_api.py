@@ -298,7 +298,7 @@ class OtherQuantsTest(unittest.TestCase):
         self.assertNotIn("glm-exl3-sc_4.10bpw", c)
         self.assertIn("HF_TOKEN", c["deepseek-abliterated-128g"]["note"])
         self.assertEqual(c["minimax-exl3"]["name"], "MiniMax M3.1 · EXL3 3.5 bpw")
-        self.assertEqual(c["glm-exl3-3.05bpw"]["name"], "GLM-5.3 · EXL3 3.05 bpw")
+        self.assertEqual(c["glm-exl3-3.05bpw"]["name"], "GLM-5.3-Flash · EXL3 3.05 bpw")
         self.assertEqual(c["deepseek-exl3"]["note"], "")
         self.assertEqual(c["glm-exl3-4.05bpw"]["note"], "")         # (the EXL3 quants: no longer experimental)
         ids = [m["id"] for m in self.cat()]

@@ -1,4 +1,4 @@
-// src/kernels/pf_wmma_parity.cpp - gemm_iq_f16_grouped (the Volta prompt experts, STRATA_PF_WMMA) against a double
+// src/kernels/pf_wmma_parity.cpp - gemm_iq_f16_grouped (the Volta prompt experts, MAYA_PF_WMMA) against a double
 // reference over the same FP16 weights (iq_dequant_f16, the FP16 path's dequantization) and FP16 activations.
 //
 //     build/pf_wmma_parity            the checks (a ctest; needs a CUDA GPU with FP16 tensor cores: sm_70+)

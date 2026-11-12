@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Replay STRATA_GLM_ROUTE_LOG traces through a model of the GLM fast path's VRAM expert tier - the engine's own rules
+"""Replay MAYA_GLM_ROUTE_LOG traces through a model of the GLM fast path's VRAM expert tier - the engine's own rules
 and alternatives - to measure an eviction or promotion idea on recorded routes before building it.
 
-Recording a trace: start the engine as usual with STRATA_GLM_ROUTE_LOG=<prefix> (the config's "env" or the shell).
+Recording a trace: start the engine as usual with MAYA_GLM_ROUTE_LOG=<prefix> (the config's "env" or the shell).
 Every route goes to <prefix>.<device> (0 = a split's first GPU, 1 = its second), one line per route:
     layer e0 .. e7 fetch miss cpu [| n0 .. n15]
 the route's experts in selection order, then bit masks over e0..e7: fetched over PCIe, read from disk, computed by
@@ -15,7 +15,7 @@ residents from it and rewrites it when it stops):
 <split> is the split layer; <slotsN> the per-layer slots of device N's pool (the "expert pool ..., N-N slots/layer"
 line of the engine's log); [plan] the CPU lane's split table as 9 digits, plan[f] = how many of a route's f RAM-tier
 misses the CPU takes (the "of 0..8 RAM-tier experts the CPU takes" line; default 011233456). Validate first: trace a
-run with STRATA_GLM_PREFETCH_N unset and compare "hit" (the replay) with "live" (what the trace's own masks show) -
+run with MAYA_GLM_PREFETCH_N unset and compare "hit" (the replay) with "live" (what the trace's own masks show) -
 with the engine's policy they agree within a few points.
 
 The model (src/kernels/cuda/glm_fast.cu route kernel, src/core/glm_fast_path.cu service thread + fast_boundary):
@@ -26,10 +26,10 @@ The model (src/kernels/cuda/glm_fast.cu route kernel, src/core/glm_fast_path.cu 
     others are fetched over PCIe into the layer's free spares (promoted: resident from then on) or into scratch;
   - at each token boundary a layer's used spares are refilled by evicting residents - the engine evicts the lowest
     aged count (ties: the least recently used);
-  - draft routes (the NextN layer, --nextn) leave their misses out from route rank --keep on (STRATA_GLM_MTP_KEEP).
+  - draft routes (the NextN layer, --nextn) leave their misses out from route rank --keep on (MAYA_GLM_MTP_KEEP).
 
 What it leaves out: time - "off-card" is per route max(n_cpu * c_ms, n_fetch * p_ms) (set both from your own
-STRATA_GLM_TIMING numbers), with no overlap between layers, no pipeline between the devices and no prompt reads;
+MAYA_GLM_TIMING numbers), with no overlap between layers, no pipeline between the devices and no prompt reads;
 the RAM tier and the disk are one level (a disk miss counts as a fetch); the prefetch (its copies are not routes);
 anything the engine does to its residents outside these rules.
 
@@ -251,7 +251,7 @@ def replay(rows, usage, cap, policy, plan, nextn=45, keep=2, p_ms=0.67, c_ms=0.3
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    ap.add_argument("prefix", help="the STRATA_GLM_ROUTE_LOG prefix (<prefix>.0, <prefix>.1 are read)")
+    ap.add_argument("prefix", help="the MAYA_GLM_ROUTE_LOG prefix (<prefix>.0, <prefix>.1 are read)")
     ap.add_argument("usage", help="the run's expert_usage.txt")
     ap.add_argument("split", type=int, help="the split layer (informational)")
     ap.add_argument("cap_head", type=int, help="device 0's slots per layer")
@@ -259,7 +259,7 @@ def main(argv=None):
     ap.add_argument("plan", nargs="?", default="011233456", help="the CPU lane's split table, 9 digits")
     ap.add_argument("--policy", action="append", default=None, help="see the module docstring (repeatable)")
     ap.add_argument("--nextn", type=int, default=45, help="the NextN (draft) layer")
-    ap.add_argument("--keep", type=int, default=2, help="STRATA_GLM_MTP_KEEP of the traced run")
+    ap.add_argument("--keep", type=int, default=2, help="MAYA_GLM_MTP_KEEP of the traced run")
     ap.add_argument("--p_ms", type=float, default=0.67, help="ms per expert fetched over PCIe")
     ap.add_argument("--c_ms", type=float, default=0.32, help="ms per expert on the CPU lane")
     args = ap.parse_args(argv)

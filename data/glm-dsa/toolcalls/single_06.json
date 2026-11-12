@@ -1,0 +1,87 @@
+{
+ "id": "single_06",
+ "group": "single",
+ "api": "openai",
+ "request": {
+  "messages": [
+   {
+    "role": "user",
+    "content": "Email bob@example.com with subject 'Lunch' and say I am running ten minutes late."
+   }
+  ],
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "send_email",
+     "description": "Send an e-mail.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "to": {
+        "type": "string"
+       },
+       "subject": {
+        "type": "string"
+       },
+       "body": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "to",
+       "subject",
+       "body"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "create_event",
+     "description": "Create a calendar event.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "title": {
+        "type": "string"
+       },
+       "start": {
+        "type": "string",
+        "description": "ISO 8601 date-time"
+       },
+       "duration_minutes": {
+        "type": "integer"
+       },
+       "attendees": {
+        "type": "array",
+        "items": {
+         "type": "string"
+        }
+       }
+      },
+      "required": [
+       "title",
+       "start"
+      ]
+     }
+    }
+   }
+  ]
+ },
+ "expect": {
+  "calls": [
+   {
+    "name": "send_email",
+    "args": {
+     "to": "bob@example.com",
+     "subject": "Lunch"
+    }
+   }
+  ],
+  "min_calls": 1,
+  "max_calls": 3,
+  "no_call": false
+ }
+}

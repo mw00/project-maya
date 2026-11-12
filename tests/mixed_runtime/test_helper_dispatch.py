@@ -73,17 +73,17 @@ int main() {
     need(h.starts==2 && h.finishes==1 && h.exl3);
     need(h.wait(err) && h.finishes==2);
     Model m;
-    setenv("STRATA_GLM_EXPERT_PLUGIN","helper.so",1);
-    unsetenv("STRATA_GLM_HELPER_OVERLAP");
+    setenv("MAYA_GLM_EXPERT_PLUGIN","helper.so",1);
+    unsetenv("MAYA_GLM_HELPER_OVERLAP");
     need(m.check(err)); // HIP ordinal 0 is independent of CUDA ordinal 0.
-    setenv("STRATA_GLM_HELPER_OVERLAP","1",1); need(!m.check(err));
-    unsetenv("STRATA_GLM_HELPER_OVERLAP");
-    m.exl3_=true; setenv("STRATA_GLM_HELPER_EXL3","1",1); need(!m.check(err));
-    unsetenv("STRATA_GLM_EXPERT_PLUGIN");
-    setenv("STRATA_GLM_EXPERT_HELPER","1",1); need(m.check(err));
-    unsetenv("STRATA_GLM_HELPER_EXL3"); need(!m.check(err));
-    m.exl3_=false; setenv("STRATA_GLM_HELPER_OVERLAP","1",1); need(m.check(err));
-    setenv("STRATA_GLM_EXPERT_HELPER","0",1); need(!m.check(err));
+    setenv("MAYA_GLM_HELPER_OVERLAP","1",1); need(!m.check(err));
+    unsetenv("MAYA_GLM_HELPER_OVERLAP");
+    m.exl3_=true; setenv("MAYA_GLM_HELPER_EXL3","1",1); need(!m.check(err));
+    unsetenv("MAYA_GLM_EXPERT_PLUGIN");
+    setenv("MAYA_GLM_EXPERT_HELPER","1",1); need(m.check(err));
+    unsetenv("MAYA_GLM_HELPER_EXL3"); need(!m.check(err));
+    m.exl3_=false; setenv("MAYA_GLM_HELPER_OVERLAP","1",1); need(m.check(err));
+    setenv("MAYA_GLM_EXPERT_HELPER","0",1); need(!m.check(err));
     std::puts("native EXL3/overlap retained; external sync dispatch and capability gates pass");
 }
 '''

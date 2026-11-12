@@ -223,5 +223,137 @@ class MarkovNames(unittest.TestCase):
         self.assertEqual(st.deepseek_name("layers.0.attn.wq_a.trellis"), "layers.0.attn.wq_a.trellis")
 
 
+class VisionBf16(unittest.TestCase):
+    """#886: a quant's own vision tower in F16 (turboderp's EXL3) is replaced by a BF16 copy - DeepSeek's shard 1 in
+    the folder, else vision_pack.py's folder - and a warning says what to do when neither is there."""
+
+    QUANT = "model-00001-of-00002.safetensors"
+
+    def model(self, root: pathlib.Path, dt: str = "F16", shard1: bool = False) -> pathlib.Path:
+        m = root / "quant"
+        m.mkdir()
+        own = {"vision.patch_embed.proj.weight": (dt, [4, 12], bytes(96)), "aligner.w1.bias": (dt, [4], bytes(8)),
+               "layers.0.attn.wq_a.trellis": ("I16", [2, 2], bytes(8))}
+        write_st(m / self.QUANT, own)
+        (m / "model.safetensors.index.json").write_text(json.dumps({"weight_map": {k: self.QUANT for k in own}}))
+        if shard1:   # (the checkpoint's patch embedding as a 4-D [hidden][3][p][p], and a name the quant lacks)
+            write_st(m / pack.SHARD1, {"vision.patch_embed.proj.weight": ("BF16", [4, 3, 2, 2], bytes(range(96))),
+                                       "aligner.w1.bias": ("BF16", [4], bytes(8)),
+                                       "vision.norm.weight": ("BF16", [4], bytes(8))})
+        return m
+
+    def test_shard1_wins_over_the_quants_f16(self):
+        import st
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            m = self.model(pathlib.Path(td), shard1=True)
+            s = st.SafeTensors(m)
+            self.assertEqual(s.t["vision.patch_embed.proj.weight"][:3], (self.QUANT, "F16", (4, 12)))
+            line = pack.vision_bf16(s, m, m.parent / "vision")
+            self.assertIn("3 tensors in BF16 from %s" % pack.SHARD1, line)   # (its whole tower)
+            self.assertIn("F16", line)
+            fn, dt, shape, off, nb = s.t["vision.patch_embed.proj.weight"]
+            self.assertEqual((fn, dt, shape, nb), (pack.SHARD1, "BF16", (4, 12), 96))
+            self.assertEqual(bytes(s.raw("vision.patch_embed.proj.weight")), bytes(range(96)))
+            self.assertEqual(s.t["aligner.w1.bias"][:3], (pack.SHARD1, "BF16", (4,)))
+            self.assertEqual(s.t["vision.norm.weight"][:2], (pack.SHARD1, "BF16"))   # (added as before)
+            self.assertEqual(s.t["layers.0.attn.wq_a.trellis"][0], self.QUANT)          # (nothing else moves)
+
+    def test_the_vision_folder_when_shard1_is_not_there(self):
+        import st
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            m = self.model(pathlib.Path(td))
+            v = pathlib.Path(td) / "vision"
+            v.mkdir()
+            (v / "vision.bin").write_bytes(bytes(512))
+            (v / "vision.json").write_text(json.dumps({"tensors": [
+                ["aligner.w1.bias", "BF16", 0, 8, [4]], ["vision.patch_embed.proj.weight", "BF16", 256, 96, [4, 12]]]}))
+            s = st.SafeTensors(m)
+            line = pack.vision_bf16(s, m, v)
+            self.assertIn("../vision/vision.bin", line)
+            self.assertIn("../vision/vision.bin", s.files)
+            self.assertEqual(s.t["vision.patch_embed.proj.weight"], ("../vision/vision.bin", "BF16", (4, 12), 256, 96))
+            self.assertEqual(s.t["aligner.w1.bias"], ("../vision/vision.bin", "BF16", (4,), 0, 8))
+
+    def exl3_tower(self, root: pathlib.Path, shard1: bool = False) -> pathlib.Path:
+        """turboderp's 2.25 bpw: the tower's matrices in EXL3 (.trellis / .suh / .svh / .mul1), its biases F16."""
+        m = root / "quant"
+        m.mkdir()
+        own = {"vision.blocks.0.attn.q_proj.trellis": ("I16", [1, 1, 16], bytes(32)),
+               "vision.blocks.0.attn.q_proj.suh": ("F16", [4], bytes(8)),
+               "vision.blocks.0.attn.q_proj.svh": ("F16", [4], bytes(8)),
+               "vision.blocks.0.attn.q_proj.mul1": ("I32", [1], bytes(4)),
+               "vision.blocks.0.attn.q_proj.bias": ("F16", [4], bytes(8)),
+               "vision.blocks.0.attn.k_proj.bias": ("F16", [4], bytes(8)),   # (a name DeepSeek's tower has not: wqkv)
+               "layers.0.attn.wq_a.trellis": ("I16", [2, 2], bytes(8))}
+        write_st(m / self.QUANT, own)
+        (m / "model.safetensors.index.json").write_text(json.dumps({"weight_map": {k: self.QUANT for k in own}}))
+        if shard1:
+            write_st(m / pack.SHARD1, {"vision.blocks.0.attn.q_proj.weight": ("BF16", [4, 4], bytes(32)),
+                                       "vision.blocks.0.attn.q_proj.bias": ("BF16", [4], bytes(8))})
+        return m
+
+    def test_an_exl3_tower_from_the_vision_folder(self):
+        import st
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            m = self.exl3_tower(pathlib.Path(td))
+            v = pathlib.Path(td) / "vision"
+            v.mkdir()
+            (v / "vision.bin").write_bytes(bytes(512))
+            (v / "vision.json").write_text(json.dumps({"tensors": [
+                ["vision.blocks.0.attn.q_proj.bias", "BF16", 0, 8, [4]],
+                ["vision.blocks.0.attn.q_proj.weight", "BF16", 64, 32, [4, 4]]]}))
+            s = st.SafeTensors(m)
+            line = pack.vision_bf16(s, m, v)
+            self.assertIn("2 tensors in BF16 from ../vision/vision.bin", line)
+            self.assertEqual(s.t["vision.blocks.0.attn.q_proj.weight"], ("../vision/vision.bin", "BF16", (4, 4), 64, 32))
+            self.assertEqual(s.t["vision.blocks.0.attn.q_proj.bias"][:2], ("../vision/vision.bin", "BF16"))
+            for p in (".trellis", ".suh", ".svh", ".mul1"):   # (the quant's EXL3 pieces of it: not in the pack)
+                self.assertNotIn("vision.blocks.0.attn.q_proj" + p, s.t)
+            self.assertNotIn("vision.blocks.0.attn.k_proj.bias", s.t)          # (the quant's own layout: left out)
+            self.assertEqual(s.t["layers.0.attn.wq_a.trellis"][0], self.QUANT)   # (the model's own EXL3 stays)
+
+    def test_an_exl3_tower_from_shard1(self):
+        import st
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            m = self.exl3_tower(pathlib.Path(td), shard1=True)
+            s = st.SafeTensors(m)
+            line = pack.vision_bf16(s, m, None)
+            self.assertIn("2 tensors in BF16 from %s" % pack.SHARD1, line)
+            self.assertEqual(s.t["vision.blocks.0.attn.q_proj.weight"][:2], (pack.SHARD1, "BF16"))
+            self.assertNotIn("vision.blocks.0.attn.q_proj.trellis", s.t)
+            self.assertNotIn("vision.blocks.0.attn.k_proj.bias", s.t)
+
+    def test_an_exl3_tower_without_a_copy_warns(self):
+        import st
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            m = self.exl3_tower(pathlib.Path(td))
+            s = st.SafeTensors(m)
+            self.assertIn("WARNING", pack.vision_bf16(s, m, pathlib.Path(td) / "vision"))
+            self.assertIn("vision.blocks.0.attn.q_proj.trellis", s.t)   # (nothing removed: pictures off, said)
+
+    def test_a_warning_without_a_bf16_copy(self):
+        import st
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            m = self.model(pathlib.Path(td))
+            s = st.SafeTensors(m)
+            line = pack.vision_bf16(s, m, m.parent / "vision")
+            self.assertIn("WARNING", line)
+            self.assertIn(pack.SHARD1, line)
+            self.assertEqual(s.t["vision.patch_embed.proj.weight"][1], "F16")
+
+    def test_a_bf16_tower_is_left_alone(self):
+        import st
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            m = self.model(pathlib.Path(td), dt="BF16", shard1=True)
+            s = st.SafeTensors(m)
+            self.assertIsNone(pack.vision_bf16(s, m, None))
+            self.assertEqual(s.t["vision.patch_embed.proj.weight"][:2], (self.QUANT, "BF16"))
+
+    def test_flat_patch(self):
+        self.assertEqual(pack.flat_patch("vision.patch_embed.proj.weight", (1024, 3, 14, 14)), (1024, 588))
+        self.assertEqual(pack.flat_patch("vision.patch_embed.proj.weight", (1024, 588)), (1024, 588))
+        self.assertEqual(pack.flat_patch("aligner.w1.weight", (2, 3, 4)), (2, 3, 4))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -135,9 +135,9 @@ class ThinkingBudget(unittest.TestCase):
 
     def test_reserve_override_cannot_consume_small_limit(self):
         from unittest.mock import patch
-        with patch.dict(os.environ, {"STRATA_GLM_THINK_RESERVE": "4096"}):
+        with patch.dict(os.environ, {"MAYA_GLM_THINK_RESERVE": "4096"}):
             self.assertGreaterEqual(self.call("openai", 512)["_think_budget"], 255)
-        with patch.dict(os.environ, {"STRATA_GLM_THINK_RESERVE": "16"}):
+        with patch.dict(os.environ, {"MAYA_GLM_THINK_RESERVE": "16"}):
             self.assertEqual(self.call("openai", 512)["_think_budget"], 383)
 
     def test_tiny_limits_still_honour_total_output(self):
@@ -151,7 +151,7 @@ class ThinkingBudget(unittest.TestCase):
         from unittest.mock import patch
         from serve.server import apply_server_env
         with patch.dict(os.environ):
-            apply_server_env({"env": {"STRATA_GLM_THINK_RESERVE": "16"}})
+            apply_server_env({"env": {"MAYA_GLM_THINK_RESERVE": "16"}})
             self.assertEqual(self.call("openai", 512)["_think_budget"], 383)
 
 
@@ -249,7 +249,7 @@ class MaxTokens(unittest.TestCase):
     def test_debug_log_shows_the_resolved_budget(self):
         import contextlib
         import io
-        os.environ["STRATA_DEBUG"] = "1"
+        os.environ["MAYA_DEBUG"] = "1"
         try:
             for api in ("openai", "anthropic"):
                 with self.subTest(api=api):
@@ -258,7 +258,7 @@ class MaxTokens(unittest.TestCase):
                         _, _, pt, _ = self.call(api, max_tokens=-1)
                     self.assertIn(f"max_new={CTX - CTX_SLACK - pt} ", out.getvalue())
         finally:
-            del os.environ["STRATA_DEBUG"]
+            del os.environ["MAYA_DEBUG"]
 
 
 class FitMaxTokens(unittest.TestCase):
@@ -674,7 +674,7 @@ class SamplingKeys(unittest.TestCase):
                               if k.startswith("read_chunks=")], bad)
 
     def test_miss_skip_tune_keys(self):
-        # the GLM engine's light-miss bar and first layer for one request (STRATA_GLM_MISS_SKIP_W / _FROM)
+        # the GLM engine's light-miss bar and first layer for one request (MAYA_GLM_MISS_SKIP_W / _FROM)
         k = self.keys(temperature=0, strata_tune={"miss_skip_w": 0.14, "miss_skip_from": 23})
         self.assertIn("miss_skip_w=0.14", k)
         self.assertIn("miss_skip_from=23", k)
@@ -787,6 +787,25 @@ class RequestChecks(unittest.TestCase):
         with self.assertRaises(ValueError):
             svc.check_request({"logit_bias": {"65": 1}})
         svc.check_request({"logit_bias": {}})      # none asked for: fine anywhere
+
+    def test_ablate(self):
+        """`ablate` (Maya's refusal ablation, one name on every API): true / false; true needs an engine with a
+        direction loaded (INFO ablate=1); the GEN key goes only when on, so a line without it is the line as before."""
+        tok = ByteTokenizer()
+        svc = Service(MockEngine(tok, "x", max_context=CTX), tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        svc.check_request({"ablate": False})       # off: fine anywhere
+        with self.assertRaises(ValueError):
+            svc.check_request({"ablate": True})    # no direction loaded: refused, not ignored
+        with self.assertRaises(ValueError):
+            svc.check_request({"ablate": "yes"})
+        svc.engine.info = {**svc.engine.info, "ablate": 1}
+        svc.check_request({"ablate": True})
+        self.assertEqual(svc.ablate_state(), {"available": True, "default": False, "why": ""})
+        self.assertIn("ablate=1", StrataEngine.sampling_keys({"temperature": 0, "ablate": True}).split())
+        self.assertIn("ablate=1", StrataEngine.sampling_keys({"temperature": 0.7, "ablate": True}).split())
+        for s in ({"temperature": 0}, {"temperature": 0, "ablate": False}, {"temperature": 0.7, "ablate": False}):
+            self.assertEqual(StrataEngine.sampling_keys(s), StrataEngine.sampling_keys(
+                {k: v for k, v in s.items() if k != "ablate"}))
 
     def test_ignore_eos(self):
         """ignore_eos bans every token that ends an answer through the logit bias (a client's other biases kept), needs
@@ -1998,7 +2017,7 @@ class StallWatchdog(unittest.TestCase):
         import serve.server as S
         saved = {k: os.environ.get(k) for k in S.SERVER_ENV}
         try:
-            S.apply_server_env({"env": {"STRATA_ENGINE_STALL_S": "0", "STRATA_HTTP_BACKLOG": "64"}})
+            S.apply_server_env({"env": {"MAYA_ENGINE_STALL_S": "0", "MAYA_HTTP_BACKLOG": "64"}})
             self.assertEqual((S.ENGINE_STALL_S, S.Server.request_queue_size), (0.0, 64))
         finally:
             for k, v in saved.items():

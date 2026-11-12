@@ -129,9 +129,9 @@ bool GlmExpertHelper::open(int device, int n_embd, int n_ff,
     plan_.plan_w = (float*) take(8 * sizeof(float));
     plan_.cpu_flag = (int*) take(64);
     if (!check(cudaMemset(plan_.cpu_flag, 0, 64), "helper flags", err, device)) return false;
-    // zero-copy on an integrated helper (the Qwen helper's STRATA_REMOTE_ZEROCOPY pattern): its device reads the host's
+    // zero-copy on an integrated helper (the Qwen helper's MAYA_REMOTE_ZEROCOPY pattern): its device reads the host's
     // memory as its own, so the input, the plan and the result stay in one mapped pinned block
-    const char* zc = std::getenv("STRATA_GLM_HELPER_ZEROCOPY");
+    const char* zc = std::getenv("MAYA_GLM_HELPER_ZEROCOPY");
     if (integrated_ && !(zc != nullptr && zc[0] == '0')) {
         const size_t xb = (size_t) n_embd * sizeof(float);
         void* block = nullptr;
@@ -152,7 +152,7 @@ bool GlmExpertHelper::open(int device, int n_embd, int n_ff,
         zplan_.plan_w = (float*) (z + 2 * xb + 8 * sizeof(unsigned long long));
         zero_copy_ = true;
     }
-    prof_ = std::getenv("STRATA_GLM_PROF") != nullptr;
+    prof_ = std::getenv("MAYA_GLM_PROF") != nullptr;
     for (auto& e : ev_)
         if (prof_ && !check(cudaEventCreate(&e), "helper profile event", err, device)) return false;
     return true;
@@ -526,9 +526,9 @@ bool RemoteExperts::preflight(int device, double& free_gib, std::string& err) {
     }
     // The layer waits for this GPU on the CPU pool's critical path: spin instead of sleeping, whose wake-up
     // costs more than a small expert batch takes (measured: ~0.3 ms per round trip on Windows).  Only possible
-    // before the device's context exists, so first thing; STRATA_REMOTE_SPIN=0 keeps the driver's default.
+    // before the device's context exists, so first thing; MAYA_REMOTE_SPIN=0 keeps the driver's default.
 #if !defined(STRATA_USE_HIP)
-    const char* spin = std::getenv("STRATA_REMOTE_SPIN");
+    const char* spin = std::getenv("MAYA_REMOTE_SPIN");
     if (!(spin && spin[0] == '0')) cudaInitDevice(device, cudaDeviceScheduleSpin | cudaDeviceMapHost, 0);
     cudaGetLastError();
 #endif
@@ -652,8 +652,8 @@ bool RemoteExperts::open(int device, int slots, int64_t layers, int64_t experts,
         check(cudaMalloc(&d_meta_, sizeof(RemoteMeta)), "group metadata", err, device);
     if (!allocated) { close(); return false; }
     // Zero-copy: the helper reads its input from, and writes its compact rows into, the pinned host buffers
-    // directly - two copies fewer per layer, each of which is a PCIe round trip.  STRATA_REMOTE_ZEROCOPY=0 copies.
-    const char* zc = std::getenv("STRATA_REMOTE_ZEROCOPY");
+    // directly - two copies fewer per layer, each of which is a PCIe round trip.  MAYA_REMOTE_ZEROCOPY=0 copies.
+    const char* zc = std::getenv("MAYA_REMOTE_ZEROCOPY");
     zero_copy_ = !(zc && zc[0] == '0') &&
                  cudaHostGetDevicePointer((void**) &z_x_, h_x_, 0) == cudaSuccess &&
                  cudaHostGetDevicePointer((void**) &z_out_, h_out_, 0) == cudaSuccess;
@@ -751,8 +751,12 @@ bool RemoteExperts::begin(int64_t layer, const float* x, const int32_t* ids, int
         strata::kernels::quantize_q8_1_rows(zero_copy_ ? z_x_ : d_x_, n_tok, H, d_q8_, s);
         const auto& fmt = lay.fmt[(size_t) layer];
         auto L = strata::kernels::native_expert_layout(fmt.gu_type, fmt.d_type, fmt.n_embd, fmt.n_ff);
-        strata::kernels::native_expert_grouped(L, d_ptr_, d_start_, d_count_, d_dst_, d_tok_,
-                                               groups_, (int64_t) dst_.size(), d_q8_, d_scratch_, zero_copy_ ? z_out_ : d_out_, s);
+        if (!strata::kernels::native_expert_grouped(L, d_ptr_, d_start_, d_count_, d_dst_, d_tok_,
+                                               groups_, (int64_t) dst_.size(), d_q8_, d_scratch_, zero_copy_ ? z_out_ : d_out_, s)) {
+            err = "CUDA" + std::to_string(device_) + " experts: no device kernel for layer " + std::to_string(layer) +
+                  "'s expert types";   // glm-dsa B3.5: was std::exit in the kernel
+            return false;
+        }
     } else {
         strata::kernels::quantize_q8_0_scaled(zero_copy_ ? z_x_ : d_x_, d_q8_, d_scales_, n_tok * H, s);
         strata::kernels::moe_grouped_s2(d_ptr_, d_start_, d_count_, d_dst_, d_tok_,

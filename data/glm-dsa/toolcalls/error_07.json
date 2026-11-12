@@ -1,0 +1,74 @@
+{
+ "id": "error_07",
+ "group": "error_reply",
+ "api": "openai",
+ "request": {
+  "messages": [
+   {
+    "role": "user",
+    "content": "Email bob saying hello."
+   },
+   {
+    "role": "assistant",
+    "content": "",
+    "tool_calls": [
+     {
+      "id": "call_7",
+      "type": "function",
+      "function": {
+       "name": "send_email",
+       "arguments": "{\"to\": \"bob@\", \"subject\": \"Hi\", \"body\": \"Hello\"}"
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "tool_call_id": "call_7",
+    "content": "{\"error\": \"invalid address: bob@\"}"
+   }
+  ],
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "send_email",
+     "description": "Send an e-mail.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "to": {
+        "type": "string"
+       },
+       "subject": {
+        "type": "string"
+       },
+       "body": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "to",
+       "subject",
+       "body"
+      ]
+     }
+    }
+   }
+  ]
+ },
+ "expect": {
+  "calls": [],
+  "min_calls": 0,
+  "max_calls": 2,
+  "no_call": false,
+  "must_not_repeat": {
+   "name": "send_email",
+   "args": {
+    "to": "bob@",
+    "subject": "Hi",
+    "body": "Hello"
+   }
+  }
+ }
+}

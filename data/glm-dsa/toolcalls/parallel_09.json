@@ -1,0 +1,60 @@
+{
+ "id": "parallel_09",
+ "group": "parallel",
+ "api": "openai",
+ "request": {
+  "messages": [
+   {
+    "role": "user",
+    "content": "Email alice@example.com and carol@example.com the subject 'Standup moved' saying it is now at 10:30."
+   }
+  ],
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "send_email",
+     "description": "Send an e-mail.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "to": {
+        "type": "string"
+       },
+       "subject": {
+        "type": "string"
+       },
+       "body": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "to",
+       "subject",
+       "body"
+      ]
+     }
+    }
+   }
+  ]
+ },
+ "expect": {
+  "calls": [
+   {
+    "name": "send_email",
+    "args": {
+     "to": "alice@example.com"
+    }
+   },
+   {
+    "name": "send_email",
+    "args": {
+     "to": "carol@example.com"
+    }
+   }
+  ],
+  "min_calls": 2,
+  "max_calls": 4,
+  "no_call": false
+ }
+}

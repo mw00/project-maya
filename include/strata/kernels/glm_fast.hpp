@@ -12,6 +12,7 @@
 // parameters are F32.
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <cuda_runtime.h>
 
@@ -38,7 +39,7 @@ struct MvJob {
     int ncol = 1;
     int64_t xq_cstride = 0, xf_cstride = 0, y_cstride = 0;
     /// The sums may differ from the single column's in float rounding (a drafter's GEMVs: its drafts are only
-    /// proposals): five or more Q4_K / Q8_0 columns then go to the tensor cores (sm_80+; STRATA_GLM_MV_APPROX=0: never).
+    /// proposals): five or more Q4_K / Q8_0 columns then go to the tensor cores (sm_80+; MAYA_GLM_MV_APPROX=0: never).
     bool approx = false;
 };
 constexpr int kMaxMvCols = 16;   // a verify window's tokens, a draft block's
@@ -46,15 +47,28 @@ constexpr int kMaxMvJobs = 8;
 /// One launch for up to kMaxMvJobs independent GEMVs (they share nothing but the launch).
 bool mv(const MvJob* jobs, int n, cudaStream_t s);
 /// The most activations mv_nt() takes at once (the rows of one batched decode step: one a conversation, or a
-/// conversation's verify window of several with STRATA_GLM_MULTI_MTP).
+/// conversation's verify window of several with MAYA_GLM_MULTI_MTP).
 constexpr int kMaxMvNt = 16;
 /// mv() for nt activations at once (nt <= kMaxMvNt; 1 = mv()), the jobs' ncol 1: each job's xq / xf hold nt activations
 /// one after another (n_in values each) and its y nt outputs (n_out each).  Output t is bit for bit what mv() gives
 /// for activation t alone, and each weight row is read from memory once for all of them (more than 8 activations: once
 /// for each group of 8, EXL3 weights once for all).
 bool mv_nt(const MvJob* jobs, int n, int nt, cudaStream_t s);
-/// Whether mv() serves this weight type.
+/// Whether mv() serves this weight type (the Flash / DFlash2 list, Maya v1.1.55).
 bool mv_supported(int type);
+/// glm-dsa B10.7: mv_supported plus the extra glm-dsa dense types (glmd_mv_ext.cuh).
+bool mv_supported_ext(int type);
+/// glm-dsa L1-4: mv() for the glm-dsa decode's GEMVs - the one-column Q5_K / Q8_0 / Q4_K / Q6_K / BF16 / F32 jobs of a
+/// batch in one launch (one row a warp when K-quants are among them, else two), every output bit for bit mv()'s
+/// (glmd_mv_ext.cuh); a batch of K-quants only, and the other jobs, through mv().  The types a device-tuned one-column
+/// kernel of mv() serves always stay with mv() (cc 6.0: the P100 Q6_K kernel; MAYA_GLMD_MV_NW2=1: the K-quants), and a
+/// HIP build takes Q4_K / Q5_K / Q8_0 only (the RDNA kernel's Q6_K / BF16; F32 not bit for bit there).
+/// cfg kMvDsaAuto: the device's default - on where it was measured faster (NVIDIA cc >= 7.0: V100, glmd_dec_bench), mv()
+/// alone elsewhere (AMD: gfx1151 within 0-3%, bandwidth-bound; Pascal: not measured); kMvDsaOn: on any device;
+/// kMvDsaOff: mv() alone (A/Bs); 1-3, 5: fixed shapes on any device, for glmd_dec_bench (1: one launch of every job it
+/// takes, 2: 4-row warps, 3: a launch a type, 5: one-row warps).
+constexpr int kMvDsaOff = -1, kMvDsaAuto = 0, kMvDsaOn = 4;
+bool mv_dsa(const MvJob* jobs, int n, cudaStream_t s, int cfg = kMvDsaAuto);
 /// The calling thread's launches of mv(), moe_gate_up() and moe_down() read `flag` (a device int) first and do nothing
 /// while it is non-zero - a pipelined window's tokens after a wrong draft (skip_gate sets it from the host's word);
 /// nullptr (the default): no check.
@@ -151,7 +165,7 @@ struct KdaRecArgs {
     void* out = nullptr;   // the gated output (q8_1, kda_rec's out_q8_1); null: the state only (a commit's replay)
 };
 void kda_layers(const KdaPrepArgs* prep, const KdaRecArgs* rec, int n, float eps, cudaStream_t s);
-/// The batched rows' KDA inputs kept for a verify window's commit (STRATA_GLM_MULTI_MTP): row i's q | k | v projections
+/// The batched rows' KDA inputs kept for a verify window's commit (MAYA_GLM_MULTI_MTP): row i's q | k | v projections
 /// (d_inner each), f_a, g_a (head_dim each) and beta (n_head) - read from src[0..5] at row i (rows di / hd / nh apart) -
 /// into its conversation's record at dst[i] in the verify window's layout (glm_window.cu's kda_in: each piece tmax
 /// rows, row t[i] of it).  dst[i] null: row i is not kept.  One launch for every row of a layer.
@@ -185,7 +199,7 @@ struct DsaPrepArgs {
 };
 void dsa_prep(const DsaPrepArgs& a, cudaStream_t s);
 /// score[p] = sum_h relu(iq_h . pooled_p) * iw_h for the n_pools completed pools.
-/// token: a decode token (fast_dsa, a decode row) - only it takes the take-two kernel STRATA_GLM_DSA_SCORE2 names (a
+/// token: a decode token (fast_dsa, a decode row) - only it takes the take-two kernel MAYA_GLM_DSA_SCORE2 names (a
 /// prompt's windows keep the original: their per-token calls run beside the expert copies; glm_attn_bench's override
 /// applies anywhere); the scores are the same bits either way.
 void dsa_score(const float* iq, const float* pooled, const float* iw, int key_dim, int idx_heads, int n_pools,
@@ -213,7 +227,7 @@ struct DsaSelectRows {
 void dsa_select_rows(const DsaSelectRows& a, int n, int kpool, cudaStream_t s);
 /// While a token's every pool is in its selection (n_vis <= the top pools, a context of at most idx_top_k positions):
 /// dsa_select's cells in position order - no scores needed (the indexer's query and dsa_score are left out).  The
-/// decode's paths all take it alike (dsa_select_all_on; STRATA_GLM_DSA_ALL=0: off), so a window's token is the
+/// decode's paths all take it alike (dsa_select_all_on; MAYA_GLM_DSA_ALL=0: off), so a window's token is the
 /// token path's bit for bit
 bool dsa_select_all_on();
 void dsa_select_all(int n_vis, int kpool, int n_sel, int pos, int* cells, cudaStream_t s);
@@ -226,7 +240,7 @@ struct MlaMarks {
     void (*fn)(void* ctx, const char* name);
     void* ctx;
 };
-/// token: the decode's token path - only it takes the take-two split attention STRATA_GLM_MLA_ATTN2 names (as dsa_score).
+/// token: the decode's token path - only it takes the take-two split attention MAYA_GLM_MLA_ATTN2 names (as dsa_score).
 void mla(const float* q, const uint16_t* wk_b, const uint16_t* wv_b, const uint16_t* lat, const int* cells, int n_sel,
          int n_head, int qk_nope, int kv_lora, int v_head, void* out_q8_1, cudaStream_t s, bool lat_q8 = false,
          const MlaMarks* marks = nullptr, bool token = false);
@@ -258,7 +272,7 @@ bool mla_attend_rows(const float* q_abs, int64_t q_stride, const uint16_t* const
                      float* part, int part_tokens, cudaStream_t s, bool lat_q8);
 void mla_out(const float* ctx, int64_t ctx_stride, const uint16_t* wv_b, int n_head, int kv_lora, int v_head, int ncol,
              void* out_q8_1, int64_t out_stride_bytes, cudaStream_t s);
-/// The INT8 latent cache (STRATA_GLM_KV_INT8): per position kv_lora int8 codes, then one FP16 scale per 32 values
+/// The INT8 latent cache (MAYA_GLM_KV_INT8): per position kv_lora int8 codes, then one FP16 scale per 32 values
 /// (symmetric, absmax / 127) - 544 bytes at kv_lora 512 against the FP16 row's 1024.
 __host__ __device__ constexpr inline int lat8_rec_bytes(int kv_lora) { return kv_lora + kv_lora / 16; }
 
@@ -306,14 +320,28 @@ struct MoeDev {
     // strides (q8_1 blocks: its FFN input, its h, its shared expert's h; floats: its output, its CPU part)
     int mt_T = 1;
     unsigned int mt_xq_s = 0, mt_hq_s = 0, mt_sh_hq_s = 0, mt_out_s = 0, mt_cpu_s = 0;
+    // the routing ring's shape (ring_entry below): ring_n entries (a power of two) of ring_stride bytes; 0, 0: kRingSize
+    // entries of sizeof(MoeRequest)
+    unsigned int ring_n = 0, ring_stride = 0;
 };
+/// The widest residual the host-mapped routing structs below carry (glm5-next 4096, glm-dsa 6144).
+constexpr int kMaxEmbd = 8192;
+/// moe_route's hard limits: n_embd <= kMaxEmbd (the request's x), k <= 8 (the plan arrays), n_expert <= 512 (its
+/// shared score tables).  nullptr when a geometry fits, else why not (fast_setup and moe_route refuse it).
+inline const char* moe_limits_error(int n_embd, int k, int n_expert) {
+    if (n_embd <= 0 || n_embd > kMaxEmbd) return "n_embd outside 1..kMaxEmbd (8192, the routing ring's width)";
+    if (k < 1 || k > 8) return "experts per token outside 1..8";
+    if (n_expert < 1 || n_expert > 512) return "n_expert outside 1..512";
+    return nullptr;
+}
 /// The CPU LANE's answer: the weighted sum of the RAM-tier experts the host computed for route `seq`.
 struct CpuAnswer {
     volatile unsigned int seq;
     unsigned int pad[3];
-    float part[4096];
+    float part[kMaxEmbd];
 };
-constexpr int kRingSize = 64;
+/// Ring entries: a non-waiting route can be lapped; 256 covers a 76-route glm-dsa token (B2.5)
+constexpr int kRingSize = 256;
 /// LOOKAHEAD: a route may also carry the top-k of the next (up to) kAhead layers' routers applied to its FFN input.
 constexpr int kAhead = 4;
 /// One routing request, written by the device into host-mapped memory.
@@ -333,21 +361,42 @@ struct MoeRequest {
     unsigned long long pf_ptr[8];
     short ahead[kAhead][8];      // layer + 1 + d's router on this layer's FFN input: its top-k (-1: none)
     unsigned int cpu_mask;       // the CPU LANE: RAM-tier experts the host computes (the device skips them) ...
-    unsigned int skip_mask;      // DISK SKIP: disk-only experts left out of this token (STRATA_GLM_DISK_SKIP_W / _FROM)
+    unsigned int skip_mask;      // DISK SKIP: disk-only experts left out of this token (MAYA_GLM_DISK_SKIP_W / _FROM)
     unsigned long long cpu_src[8];   // ... their RAM-tier blobs
-    short near_ids[16];          // STRATA_GLM_ROUTE_LOG only: the route's next ranks after the top k (-1: none)
+    short near_ids[16];          // MAYA_GLM_ROUTE_LOG only: the route's next ranks after the top k (-1: none)
     int win;                     // ... and the answer slot they go to: a verify window's token (0: the lone answer)
     int win_n;                   // a batched verify window's tokens (0: not one): their CPU lanes may run at once
-    int win_rows;                // ... a batched rows step's group instead (STRATA_GLM_GROUP_EXPERTS): win the row,
+    int win_rows;                // ... a batched rows step's group instead (MAYA_GLM_GROUP_EXPERTS): win the row,
     int pad_;                    //     win_n the rows; their CPU lanes merged on this part's own pool
-    float x[4096];               // the FFN input, written only when cpu_mask != 0
+    float x[kMaxEmbd];           // the FFN input, written only when cpu_mask != 0
 };
+/// A ring sized from the model (fast_setup on HIP): each entry MoeRequest's fields + n_embd floats of x (rounded up to
+/// its alignment), as many entries as a decode round routes (every layer once + a verify window's drafts) as a power of
+/// two, kRingMinEntries (v1.1.56's 64) .. kRingSize.  The device writes every route's x to its entry: on the gfx1151
+/// APU the full 256 x 8192-float ring (8.4 MB host-mapped) made GLM-5.3-Flash's drafting decode ~0.8 % slower than
+/// its own 64 x 4096 floats (1 MB).
+constexpr unsigned int kRingMinEntries = 64;
+constexpr unsigned int ring_stride_for(int n_embd) {
+    return (unsigned int) ((offsetof(MoeRequest, x) + (size_t) n_embd * sizeof(float) + alignof(MoeRequest) - 1) /
+                           alignof(MoeRequest) * alignof(MoeRequest));
+}
+constexpr unsigned int ring_entries_for(int routes) {
+    unsigned int n = kRingMinEntries;
+    while (n < (unsigned int) routes && n < (unsigned int) kRingSize) n *= 2u;
+    return n;
+}
+/// Ring entry `seq`: n entries (a power of two) of `stride` bytes (0, 0: kRingSize entries of sizeof(MoeRequest)).
+__host__ __device__ inline MoeRequest* ring_entry(void* ring, unsigned int seq, unsigned int n, unsigned int stride) {
+    if (n == 0u) n = (unsigned int) kRingSize;
+    if (stride == 0u) stride = (unsigned int) sizeof(MoeRequest);
+    return (MoeRequest*) ((char*) ring + (size_t) (seq & (n - 1u)) * stride);
+}
 /// The host's answer to a request with misses.
 struct MoeResponse {
     volatile unsigned int seq;
     unsigned int ptr_mask;            // plan entries the host made resident: ptr[i] valid
     unsigned long long ptr[8];
-    // STRATA_GLM_STREAM_FETCH=1: entries in stream_mask were posted before their disk reads finished; ready[i] gets
+    // MAYA_GLM_STREAM_FETCH=1: entries in stream_mask were posted before their disk reads finished; ready[i] gets
     // bit (part * s_chunks + chunk) as each chunk lands in ptr[i] (fast_read_part's layout: gate 0, up s_gu, down
     // 2 s_gu), and the fetch kernels copy each chunk once its bit is set (zephel01/Abyss d626d96, mw00 #570)
     unsigned int stream_mask;
@@ -358,8 +407,12 @@ struct MoeResponse {
     int upd_key[64];
     unsigned long long upd_val[64];
     int cpu;                          // 1: cpu_part (host-mapped, below) holds the missed experts' weighted sum
-    float cpu_part[4096];
+    float cpu_part[kMaxEmbd];
 };
+/// moe_route's weight normalisation (norm_w on): w_i = p_i / D * w_scale over the k selected sigmoid scores.
+/// kRouteNormClamp: D = max(sum, 2^-14) (Maya, llama.cpp's ggml_clamp); kRouteNormHf: D = sum + 1e-20 (HF
+/// GLM-5.3 / DeepSeek-V3, glm-dsa glm-dsa B5.1).  The two differ only when sum < 6.1e-5 (all k sigmoids tiny).
+constexpr int kRouteNormClamp = 0, kRouteNormHf = 1;
 /// Router (sigmoid + bias, stable top-k, normalised weights - router_sigmoid's arithmetic), the plan
 /// lookup in `tab`, the request publish, and the shared expert's swiglu + q8_1.
 void moe_route(const float* logits, const float* bias, int n_expert, int k, float w_scale, bool norm_w,
@@ -369,7 +422,7 @@ void moe_route(const float* logits, const float* bias, int n_expert, int k, floa
                const float* const* ahead_bias = nullptr, int n_ahead = 0, int skip_from = 8,
                unsigned long long cpu_plan = 0, int promote_min = 0, int pf_rank = 0, int near_n = 0, int win = 0,
                unsigned int* scr_used = nullptr, int win_n = 0, int disk_skip_from = 8, float disk_skip_w = 0.0f,
-               float miss_skip_w = 0.0f, int win_rows = 0, bool resident_ok = true);
+               float miss_skip_w = 0.0f, int win_rows = 0, bool resident_ok = true, int norm_mode = kRouteNormClamp);
 /// A verify window's MoE layer with each distinct expert computed ONCE: the T tokens were routed one after another into
 /// their own plan arrays (moe_route with win = t and a scr_used word, so no two of them land in one scratch slot - the
 /// word's bit 31 says one did), then moe_win_experts groups the entries by expert slot, reads each expert's gate/up and
@@ -407,19 +460,19 @@ inline int cpu_take(unsigned long long plan, int f) { return (int) ((plan >> (4 
 /// Waits (on the device) for the host's CPU-lane answer of the last route when it had CPU experts, then adds it to
 /// `out` (the layer's FFN output, which moe_down wrote first - its work runs while the CPU computes).
 void moe_cpu_wait(const MoeDev& d, int n_embd, float* out, cudaStream_t s);
-/// ... a layer's late answer into the streams: R[j] += post[j] * part, j < hc (STRATA_GLM_DEFER_CPU)
+/// ... a layer's late answer into the streams: R[j] += post[j] * part, j < hc (MAYA_GLM_DEFER_CPU)
 void moe_cpu_wait_streams(const MoeDev& d, int n_embd, const float* post, float* R, int hc, cudaStream_t s);
 /// The side stream's copy of the prefetch list (pf_src -> pf_dst, pf_n entries of blob_bytes each).
 void moe_prefetch(const MoeDev& d, size_t blob_bytes, cudaStream_t s);
-/// STRATA_GLM_PF_CE: need = (this route prefetched anything) ? its seq : 0 - read after the route, on its stream
+/// MAYA_GLM_PF_CE: need = (this route prefetched anything) ? its seq : 0 - read after the route, on its stream
 void moe_pf_need(const MoeDev& d, unsigned int* need, cudaStream_t s);
-/// STRATA_GLM_PF_CE: hold the stream until flag reaches need (no-op for need 0; gives up after ~25 s)
+/// MAYA_GLM_PF_CE: hold the stream until flag reaches need (no-op for need 0; gives up after ~25 s)
 void moe_pf_wait(const unsigned int* need, const unsigned int* flag, cudaStream_t s);
 /// Waits (on the device) for the host's response when the last route had misses, then applies it.
 void moe_wait(const MoeDev& d, int n_embd, cudaStream_t s);
 /// Copies every planned expert with a fetch source from the RAM tier (host-mapped) into its VRAM slot.
 void moe_fetch(const MoeDev& d, int k, size_t blob_bytes, cudaStream_t s);
-/// moe_wait then moe_fetch as ONE launch (the same effects; STRATA_GLM_SKIP_EMPTY's batched rows): a route with no
+/// moe_wait then moe_fetch as ONE launch (the same effects; MAYA_GLM_SKIP_EMPTY's batched rows): a route with no
 /// disk miss and nothing to fetch costs one near-empty launch instead of two.
 void moe_wait_fetch(const MoeDev& d, int n_embd, int k, size_t blob_bytes, cudaStream_t s);
 /// moe_cpu_wait for the n rows of a batched step in one launch: row r waits for the answer *seq[r] names (0: none) in
@@ -459,10 +512,12 @@ bool rows_experts(int gu_type, int d_type, const uint8_t* base, size_t stride, s
 /// tab[keys[i]] = vals[i] for i < n (the expert-table edits the host queues between tokens).
 void tab_update(unsigned long long* tab, const int* keys, const unsigned long long* vals, int n, cudaStream_t s);
 
-/// The NextN block's input: cat = [rms(emb) * enorm, rms(h) * hnorm] (2 n values) as q8_1.  n <= 4096.
+/// The NextN block's input: cat = [rms(emb) * enorm, rms(h) * hnorm] (2 n values) as q8_1.  n <= kMaxEmbd, a
+/// multiple of 32 (else refused: an error is counted).
 void mtp_in(const float* emb, const float* h, const float* enorm, const float* hnorm, float eps, int n, void* cat_q8_1,
             cudaStream_t s);
-/// h += add (add may be null), then x = rms(h) * w and its q8_1 (a plain pre-norm residual step).  n <= 4096.
+/// h += add (add may be null), then x = rms(h) * w and its q8_1 (a plain pre-norm residual step).  n <= kMaxEmbd, a
+/// multiple of 32 (else refused: an error is counted).
 void rms_q8(float* h, const float* add, const float* w, float eps, int n, float* x, void* xq, cudaStream_t s);
 
 /// A chained draft's embedding: out = row *tok (a device int) of token_embd on the device (n_rows rows of type 14 =

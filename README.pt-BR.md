@@ -4,10 +4,11 @@
 
 <h1 align="center">Project Maya</h1>
 
-<p align="center"><b>GLM-5.3-Flash (321 B), DeepSeek-V4.1-Flash-1017 (748 B) e MiniMax-M3.1-Flash (428 B) na sua própria GPU</b><br>
+<p align="center"><b>GLM-5.3 (744 B), GLM-5.3-Flash (321 B), DeepSeek-V4.1-Flash-1017 (748 B) e MiniMax-M3.1-Flash (428 B) na sua própria GPU</b><br>
 privado e rápido · de uma a 16 GPUs NVIDIA · AMD e Windows · chat, imagens, API compatível com OpenAI e Anthropic · várias requisições ao mesmo tempo</p>
 
 <p align="center">
+<a href="https://huggingface.co/peasantsmith/GLM-5.3-Maya-GGUF"><img src="https://raw.githubusercontent.com/mw00/project-maya/badges/glm53.svg" alt="GLM-5.3 Maya downloads"></a>
 <a href="https://huggingface.co/peasantsmith/GLM-5.3-Flash-Maya-GGUF"><img src="https://raw.githubusercontent.com/mw00/project-maya/badges/glm.svg" alt="GLM-5.3-Flash Maya downloads"></a>
 <a href="https://huggingface.co/peasantsmith/GLM-5.3-Flash-Maya-M-Derisked-IQ2_S-GGUF"><img src="https://raw.githubusercontent.com/mw00/project-maya/badges/glm-m-derisked.svg" alt="GLM-5.3-Flash Maya-M-Derisked downloads"></a>
 <a href="https://huggingface.co/peasantsmith/DeepSeek-V4.1-Flash-1017-Maya-GGUF"><img src="https://raw.githubusercontent.com/mw00/project-maya/badges/deepseek.svg" alt="DeepSeek-V4.1-Flash Maya downloads"></a>
@@ -20,8 +21,8 @@ privado e rápido · de uma a 16 GPUs NVIDIA · AMD e Windows · chat, imagens, 
 <a href="https://buymeacoffee.com/peasantsmith"><img src="https://img.shields.io/badge/Buy_me_a_coffee-FFDD00?logo=buymeacoffee&logoColor=black&style=for-the-badge" alt="Buy Me A Coffee" height="32"></a><br>
 <sub>O Project Maya é gratuito. Se ele roda bem no seu PC, patrocinar ajuda a pagar o hardware de testes e o trabalho no projeto.</sub></p>
 
-Modelos desse tamanho costumam precisar de um datacenter. O Maya roda três deles no hardware que você já tem:
-**GLM-5.3-Flash**, **DeepSeek-V4.1-Flash-1017** e **MiniMax-M3.1-Flash**. Cada modelo tem um motor feito para ele. O motor mantém na GPU os especialistas (experts) que a sua conversa mais usa, os próximos na RAM e o resto no seu SSD NVMe, e os move conforme você conversa. Ele mede suas GPUs, CPU, RAM e SSD e se ajusta a eles. Nada sai da sua máquina.
+Modelos desse tamanho costumam precisar de um datacenter. O Maya roda quatro deles no hardware que você já tem:
+**GLM-5.3**, **GLM-5.3-Flash**, **DeepSeek-V4.1-Flash-1017** e **MiniMax-M3.1-Flash**. Cada modelo tem um motor feito para ele. O motor mantém na GPU os especialistas (experts) que a sua conversa mais usa, os próximos na RAM e o resto no seu SSD NVMe, e os move conforme você conversa. Ele mede suas GPUs, CPU, RAM e SSD e se ajusta a eles. Nada sai da sua máquina.
 
 - **Rápido:** até 149 tokens/s com duas RTX 5090 e uma RTX 4090, 124 com duas H100, 118 com quatro RTX 4090, 81 com uma RTX PRO 6000, mais de 30 com uma única RTX 5090. [Números reais de usuários reais](#how-fast-is-it).
 - **Perto do original:** as quantizações próprias do Maya do GLM-5.3-Flash mantêm 97,7-99,2% da precisão zero-shot do modelo FP8; o DeepSeek V4.1 · Maya-S escolhe o mesmo próximo token que o original em 92,6% das vezes, e o MiniMax M3.1 · Maya-S em 87,6% (a média das suas categorias).
@@ -52,6 +53,8 @@ Toda quantização do Maya tem o nome do modelo seguido do nível - XS, S, M ou 
 | | Maya-M · `glm-maya-m` | 116 GB | um pool de memória maior; calibrado para chamadas de ferramentas e código de front-end |
 | | Maya-M-Derisked · `glm-maya-m-derisked` | 116 GB | Maya-M com uma edição de pesos de [Blackfrost_AI](https://x.com/Blackfrost_AI) que reduz as recusas generalizadas; experimental |
 | | Maya-L · `glm-maya-l` | 156,3 GB | os maiores pools de memória; o mais próximo do original |
+| **[GLM-5.3](https://huggingface.co/zai-org/GLM-5.3)**<br><sub>zai-org · [licença própria](https://huggingface.co/zai-org/GLM-5.3) · 744 B, 40 B ativos · até 1M de contexto · só texto</sub> | **Maya-XS** · `glm-5.3-maya-xs` | 170,0 GB | o modelo inteiro num pool de memória de 192 GB (VRAM e RAM juntas); NVIDIA a partir da V100 e AMD ([detalhes](docs/GLM53.md)) |
+| | UD-IQ2_M (unsloth) · `GLM-5.3-UD-IQ2_M` | 238,6 GB | os maiores pools de memória; mais perto do original |
 | **[DeepSeek-V4.1-Flash-1017](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017)**<br><sub>DeepSeek · MIT · 748 B</sub> | **Maya-S** (padrão) · `deepseek-maya-s` | 340 GB | qualquer quantidade de memória: o que a VRAM e a RAM não comportam é lido do SSD |
 | | Maya-XS (v2) · `deepseek-maya-xs` | 277 GB | o modelo inteiro na memória de um PC de 128 GB (as tabelas Engram ficam no SSD); a v2 é cerca de 12% mais próxima do original e cerca de 20% mais rápida para escrever que a v1 - rodar a instalação de novo oferece a atualização |
 | **[MiniMax-M3.1-Flash](https://huggingface.co/MiniMaxAI/MiniMax-M3.1-Flash)**<br><sub>MiniMax · [MiniMax Community License](LICENSE.minimax-m31) · 428 B, 23 B ativos · até 1M de contexto</sub> | Maya-XS · `minimax-maya-xs` | 93 GB | o modelo inteiro na memória de um PC de 128 GB |
@@ -59,13 +62,13 @@ Toda quantização do Maya tem o nome do modelo seguido do nível - XS, S, M ou 
 
 **Qual modelo cabe no seu PC?** Veja em [docs/MEMORY.md](docs/MEMORY.md) a memória recomendada de cada modelo (VRAM + RAM somadas).
 
-Todos rodam em NVIDIA a partir da V100 / RTX 20, e em AMD e Windows (veja [O que você precisa](#what-you-need)). Os tamanhos do DeepSeek incluem as tabelas Engram. A instalação também oferece os GGUFs da unsloth e as quantizações EXL3 da LibertAIDAI do DeepSeek, o DeepSeek abliterated da orcarouter, a quantização EXL3 do MiniMax da Mia-AiLab, as quantizações EXL3 do GLM da turboderp o Qwen-3.8-Flash-Next (CYBER-FROST) como GGUF Q5_K_M e o próprio Qwen-3.8-Flash-Next como GGUF UD-IQ2_XS da unsloth, ambos com imagens ([suas configurações](docs/SETTINGS.md#qwen-38-flash-next-cyber-frost)). **Arquivos, drafters, imagens e opções de cada modelo: [docs/MODELS.md](docs/MODELS.md).**
+Todos rodam em NVIDIA a partir da V100 / RTX 20, e em AMD e Windows (veja [O que você precisa](#what-you-need)). Os tamanhos do DeepSeek incluem as tabelas Engram. A instalação também oferece os GGUFs da unsloth e as quantizações EXL3 da turboderp e da LibertAIDAI do DeepSeek, o DeepSeek abliterated da orcarouter, a quantização EXL3 do MiniMax da Mia-AiLab, as quantizações EXL3 do GLM da turboderp o Qwen-3.8-Flash-Next (CYBER-FROST) como GGUF Q5_K_M e o próprio Qwen-3.8-Flash-Next como GGUF UD-IQ2_XS da unsloth, ambos com imagens ([suas configurações](docs/SETTINGS.md#qwen-38-flash-next-cyber-frost)). **Arquivos, drafters, imagens e opções de cada modelo: [docs/MODELS.md](docs/MODELS.md).**
 
 ## <a name="quality"></a>Qualidade
 
 As quantizações do Maya são feitas a partir dos pesos divulgados de cada modelo e medidas contra o original:
 
-- **GLM-5.3 · quantizações Maya** mantêm 97,7-99,2% da precisão zero-shot do modelo FP8 e acertam o próximo token dele em 83-90% das vezes (Maya-L: 99,2%, 90%). Como são feitas e medidas: [MAYA-S](bench/results/MAYA-S.md), [MAYA-S24](bench/results/MAYA-S24.md), [MAYA-M](bench/results/MAYA-M.md), [MAYA-L](bench/results/MAYA-L.md).
+- **GLM-5.3-Flash · quantizações Maya** mantêm 97,7-99,2% da precisão zero-shot do modelo FP8 e acertam o próximo token dele em 83-90% das vezes (Maya-L: 99,2%, 90%). Como são feitas e medidas: [MAYA-S](bench/results/MAYA-S.md), [MAYA-S24](bench/results/MAYA-S24.md), [MAYA-M](bench/results/MAYA-M.md), [MAYA-L](bench/results/MAYA-L.md).
 - **DeepSeek V4.1 · Maya-S** escolhe o mesmo próximo token que o original em 92,6% das vezes.
 - **MiniMax M3.1 · Maya-S** em 87,6% das vezes (a média das suas categorias).
 
@@ -99,6 +102,7 @@ Máquinas reais medidas por nossos usuários, a maioria com `./maya.sh --bench` 
 | **3x Tesla V100 32 GB** (PCIe 3.0 x16), 2x Xeon E5-2696 v3, 128 GB DDR3L, Windows 10 | Maya-S, 128K context | 52.9 tokens/s | 616 tokens/s | @noahark (v1.1.20, #346) |
 | **RTX PRO 6000 Blackwell 96 GB** (PCIe 5.0 x16), Ryzen 9 9950X3D, 253 GB RAM, Windows 11 | Maya-L, 512K context | 48.8 tokens/s | 3810 tokens/s | @Andrey0710 (v1.1.43, #730) |
 | **4x Tesla V100 32 GB** (PCIe 3.0 x16), 24 CPU cores, a 100 GiB RAM limit | Maya-L, 32K context | 48.3 tokens/s (after `--calibrate`) | 499 tokens/s | @areslp (v1.1.3, [#130](https://github.com/mw00/project-maya/issues/130)) |
+| **2x Radeon AI PRO R9700 32 GB** (gfx1201), Core i5-13500, 96 GB DDR5 | Maya-S, 128K context | 45.2 tokens/s | 848 tokens/s | @rim-jaynor (v1.1.57, #942) |
 | **2x Radeon AI PRO R9700 32 GB** (gfx1201, PCIe 4.0 x16 each, 240 W), EPYC 7313, 256 GB RAM | Maya-M-Derisked, 256K context | 44.4 tokens/s | 703 tokens/s | @knoodrake (v1.1.28, #509) |
 | **4x RTX 3090 24 GB** (PCIe 4.0 x8 behind one switch), Xeon Platinum 8260M, 376 GB RAM | Maya-L, 1M context | 44.2 tokens/s (tuned) | 698 tokens/s | @foureight84 (v1.1.17, #302) |
 | **2x Radeon AI PRO R9700 32 GB** (gfx1201, PCIe 4.0 x8 each), Ryzen 5 3600, 64 GB RAM | Maya-S24 / Maya-M-Derisked, 256K context | 44.1 / 24.9 tokens/s | 704 / 617 tokens/s | @gegnep (v1.1.20, #395) |
@@ -108,8 +112,10 @@ Máquinas reais medidas por nossos usuários, a maioria com `./maya.sh --bench` 
 | **2x RTX 4090 24 GB** (PCIe 3.0 + 4.0 x16), 2x Xeon Silver 4309Y, 188 GB RAM | Maya-S24 | 40.5 tokens/s | 1271 tokens/s | @fuad00 (v1.1.0, #122) |
 | **RTX PRO 6000 Blackwell 96 GB** (PCIe 4.0 x16), Ryzen 5 5600, 92 GB DDR4 | Maya-L, 1M context | 39.6 tokens/s | 2708 tokens/s (3246 warm) | @QueTensors (v1.1.28, #532) |
 | **4x Tesla T10 15 GB** (PCIe 3.0 x16), Xeon E5-2680 v4, 63 GB RAM | Maya-S24, 100K context | 38.4 tokens/s | 393 tokens/s | @zeallag (v1.1.16, #291) |
+| **2x Tesla V100 32 GB** (PCIe 3.0 x16 each, power-capped at 150 W), EPYC 7V12, 256 GB DDR4-3200 | Maya-L, 128K context | 34.9 tokens/s (after `--calibrate`) | 589 tokens/s | @scranst (v1.1.52, #939) |
 | **2x Tesla V100 32 GB** (PCIe 3.0 x8 each), Ryzen 9 7945HX3D, 96 GB RAM | Maya-M / Maya-L | 33.8 / 13.3 tokens/s | 490 / 372 tokens/s | @nkhaooat (v1.1.11, #208) |
 | **RTX 3090 24 GB + RTX 3060 12 GB** (PCIe 4.0 x16), EPYC 7702P (8-channel DDR4), 141 GB RAM (a VM) | Maya-M, 128K context | 33.7 tokens/s | 682 tokens/s | @erikash (v1.1.4, #157) |
+| **2x RX 9070 16 GB** (gfx1201, PCIe x8 each), Ryzen 9 9950X, 89 GB RAM | Maya-S24, 128K context, tuned | 33.0 tokens/s | 562 tokens/s | @bob-u (v1.1.56, #934) |
 | **AMD Radeon 8065S** (Ryzen AI Max+ PRO 495, 192 GB, 160 GB of it for the GPU), Windows 11 | Maya-S, 32K context | 31.5 tokens/s | 342 tokens/s | @tobitege (v1.1.37, #663) |
 | **RTX 5090 32 GB**, Ryzen 9 7950X, 96 GB DDR5 | Maya-M | 30+ tokens/s | ~2000 tokens/s | @siganos (#43) |
 | **2x RTX 3090 24 GB** (PCIe 4.0 x16, NVLink), Threadripper PRO 3955WX, 247 GB RAM | EXL3-3.05bpw, 128K context | 29.2 tokens/s | - | @catonooka (v1.1.9, #187) |
@@ -133,6 +139,7 @@ Máquinas reais medidas por nossos usuários, a maioria com `./maya.sh --bench` 
 | **AMD Radeon 8060S** (Ryzen AI Max+ 395, 128 GB, 96 GB of it for the GPU), Windows 11 | Maya-S | 18.3 tokens/s | 320 tokens/s | @LIN-LAB-AI (v1.0.30, #102) |
 | **RTX 3090 Ti 24 GB** (PCIe 3.0 x16, a VM), EPYC 7302P, 240 GB RAM | Maya-L, 32K context | 18.2 tokens/s (tuned, #177) | 791 tokens/s | @Jw88888 (v1.1.7, #177) |
 | **3x Tesla P100 16 GB** (Pascal; PCIe 3.0 x8, 3.0 x8, 2.0 x4), Ryzen 5 2600, 64 GB RAM | Maya-S24, 64K context | 17.9 tokens/s | 105 tokens/s | @maxlawrie (v1.1.28 + #479, #504) |
+| **2x RX 6800 16 GB** (gfx1030, PCIe 3.0 x16 each), Core i9-7980XE, 256 GB DDR4-2666 | Maya-L, 1M context | 16.7 tokens/s | 195 tokens/s | @digitalhomesteader (v1.1.56, #895) |
 | **RTX 4090 24 GB**, Ryzen 7 9700X, 64 GB RAM | Maya-S24, 32K context | 16.6 tokens/s | 1320 tokens/s | @MagikEh (#274) |
 | **RTX 5070 12 GB** (PCIe 4.0 x16), EPYC 7302 (4-channel DDR4), 126 GB RAM | Maya-S24, 64K context | 16.6 tokens/s | 323 tokens/s | @hugou74130 (v1.1.45, #755) |
 | **NVIDIA DGX Spark** (GB10, 121 GB unified memory) | Maya-S, 128K context | 16.5 tokens/s | ~730 tokens/s (6K prompt) | @ericoh88 (v1.1.15, #282) |
@@ -158,14 +165,17 @@ Máquinas reais medidas por nossos usuários, a maioria com `./maya.sh --bench` 
 | **4x AMD Instinct MI100 32 GB** (gfx908, PCIe 4.0 x16 each), EPYC 7402, 252 GB RAM | Maya-XS, 32K context | 51.8 tokens/s | 172 tokens/s | @nsaxploit (v1.1.22, #396) |
 | **4x RTX 3090 24 GB** (PCIe 3.0, SM clocks capped at 1500 MHz), Threadripper 1950X, 126 GB RAM | Maya-S, 256K context | 50-53 tokens/s (code), 40-43 (prose) | 947 tokens/s (10K), 1954 (90K) | @mgabor3141 (v1.1.26, #448) |
 | **2x NVIDIA A40 48 GB** (PCIe 4.0 x16), 2x Xeon Gold 6330, 256 GB RAM, Windows Server 2022 | Maya-S, 256K context | 48.9 tokens/s (tuned) | ~660 tokens/s (3K) | @yjyz1011 (v1.1.28, #508) |
+| **2x RX 7900 XTX 24 GB** (tensor parallel 2, PCIe 4.0 x4 each) + **Radeon 8060S** helper (Ryzen AI Max+ 395, 128 GB), the model on a USB4 NVMe | turboderp EXL3 2.25 bpw, 1M context, DSpark | 48.6 tokens/s | 650 tokens/s (8K) | @pepuscz (v1.1.56, #905) |
 | **2x RTX PRO 6000 Blackwell 96 GB** (tensor parallel 2, PCIe 5.0), Core Ultra 7 270K Plus, 188 GB DDR5 | UD-Q8_K_XL, 1M context, DSpark | 48.3 tokens/s | 1245 tokens/s (3360 at 48K) | v1.1.51, #819 |
 | **RTX 4090 24 GB** (PCIe 4.0 x8), Ryzen 9 9950X3D, 192 GB DDR5 | Maya-XS, 64K context | 44.1 tokens/s | 539 tokens/s | @naeq (v1.1.27, #503) |
 | **4x Tesla V100 32 GB** (PCIe 3.0 x16), 2x Xeon E5-2630 v4, 504 GB RAM | Maya-S / UD-Q4_K_XL / UD-Q8_K_XL, 64K context | 44.0 / 28.6 / 29.7 tokens/s | 592 / 236 / 233 tokens/s | @HansStrupat (v1.1.49, #785) |
+| **RX 7900 XTX 24 GB** (PCIe 4.0 x4) + **Radeon 8060S** helper (Ryzen AI Max+ 395, 128 GB), the model on a USB4 NVMe | turboderp EXL3 2.25 bpw, 1M context, DSpark | 43.3 tokens/s | 371 tokens/s (8K) | @pepuscz (v1.1.56, #908) |
 | **1x L40S 48 GB** (vGPU), Xeon Platinum 8580 (a VM, 32 vCPUs), 504 GB RAM | UD-Q8_K_XL, 256K context | 43.2 tokens/s | 1862 tokens/s (174K) | @talisp (v1.1.32, #577) |
 | **AMD Radeon 8065S** (Ryzen AI Max+ PRO 495, 192 GB, 160 GB of it for the GPU), Windows 11 | orcarouter abliterated Mix-128G, 256K context, DSpark | 43.2 tokens/s | 453 tokens/s | @tobitege (v1.1.37, #663) |
 | **2x RX 7900 XTX 24 GB** (tensor parallel 2, PCIe 4.0 x4 each) + **Radeon 8060S** helper (Ryzen AI Max+ 395, 128 GB), the model on a USB4 NVMe | Maya-S, 512K context, `DS4_INDEX_TC=1` | 41.7 tokens/s (49.4 after a 130K-token prompt, cached) | 1378 tokens/s (130K; 478 at 8K) | @pepuscz (v1.1.48 + #801, #797) |
 | **4x RTX 3090 24 GB** (PCIe 4.0 x16), Threadripper PRO 3975WX, 502 GB RAM | UD-Q8_K_XL, 256K context | 37.1 tokens/s | 596 tokens/s | @bandito1 (v1.1.50, #766) |
 | **4x RX 7900 XT 20 GB** (gfx1100, `--tp 4`, tuned), 2x Xeon E5-2699C v4 (a Dell T7910), 1 TB DDR4-2400 | UD-Q4_K_XL | 35.0 tokens/s | - | @Cass67 (v1.1.32, #566) |
+| **2x Radeon AI PRO R9700 32 GB** (gfx1201, PCIe 3.0 x16 each), Xeon E5-2690 v4, 126 GB RAM | Maya-XS, 256K context | 34.0 tokens/s | 444 tokens/s | @imaginitivename (v1.1.55, #890) |
 | **2x RTX 3090 24 GB** (PCIe 4.0 x8, 270 W), Core Ultra 7 265K, 192 GB DDR5 | Maya-S, 1M context, tuned | 33.3 tokens/s | 467 tokens/s | @Jellepepe (v1.1.35, #614) |
 | **2x Tesla V100 16 GB** (PCIe 3.0 x16), 2x Xeon E5-2696 v4, 128 GB DDR3-1866 | Maya-XS (v2), 256K context, DSpark | 32.0 tokens/s | 420 tokens/s | @c200762620-max (v1.1.51, #815) |
 | **3x Tesla V100 32 GB** (PCIe 3.0 x16), 2x Xeon E5-2696 v3, 128 GB DDR3L, Windows 10 | Maya-S, 64K context | 23-26 tokens/s (long answers) | 377 tokens/s | @noahark (v1.1.26, #450) |
@@ -216,7 +226,7 @@ Um token equivale a cerca de ¾ de uma palavra. A velocidade se mantém conforme
 | --- | --- |
 | **GPU** | NVIDIA, compute capability 7.0 ou superior (V100, RTX 20 e mais novas): uma, ou até 16 que dividem o modelo. Mais VRAM é mais rápido. Pascal (Tesla P40 / P100, GTX 10) é experimental, ainda não validada. **AMD:** RX 7900 XT / XTX, Radeon AI PRO R9700 / RX 9070, Strix Halo e Gorgon Halo (Radeon 8060S / 8065S); RX 6800 / 6900 e Radeon PRO V620 / W6800 ainda não validadas; GLM-5.3-Flash e DeepSeek-V4.1-Flash-1017 leem imagens lá também - [docs/AMD_MAYA.md](docs/AMD_MAYA.md) |
 | **RAM** | 32 GB já roda. Mais RAM mantém mais especialistas por perto e é mais rápido |
-| **Disco** | **Um SSD NVMe rápido** com espaço para o modelo (~75 GB para GLM-5.3 · Maya-XS, ~100 GB para GLM-5.3 · Maya-S, ~160 GB para GLM-5.3 · Maya-L, ~350 GB para DeepSeek V4.1 · Maya-S, ~470 GB para o GGUF Q8 da unsloth dele, ~95 GB para MiniMax M3.1 · Maya-XS, ~200 GB para a quantização EXL3 do MiniMax-M3.1-Flash) e o codificador de imagens (1,1 GB). Não um HD |
+| **Disco** | **Um SSD NVMe rápido** com espaço para o modelo (~75 GB para GLM-5.3-Flash · Maya-XS, ~100 GB para GLM-5.3-Flash · Maya-S, ~160 GB para GLM-5.3-Flash · Maya-L, ~350 GB para DeepSeek V4.1 · Maya-S, ~470 GB para o GGUF Q8 da unsloth dele, ~95 GB para MiniMax M3.1 · Maya-XS, ~200 GB para a quantização EXL3 do MiniMax-M3.1-Flash) e o codificador de imagens (1,1 GB). Não um HD |
 | **Sistema** | Linux (x86-64; uma CPU com AVX2 é o ideal), o driver NVIDIA, CUDA 12.x (o CUDA 13 funciona para RTX 20 e mais novas, não para a V100 nem Pascal), g++, Python 3.10+. Windows 10/11: [docs/WINDOWS.md](docs/WINDOWS.md). Não WSL2. AMD: ROCm 7 |
 
 A instalação verifica tudo isso, mostra o comando exato para o que faltar e não instala nada no sistema inteiro.
@@ -261,7 +271,7 @@ Relatos de velocidade, relatos de bugs e pull requests são bem-vindos: o [CONTR
 - **Pessoas:** o Project Maya é criado e liderado por Peasant Smith ([@mw00](https://github.com/mw00), [X](https://x.com/PeasantSmith)), dono do projeto, do nome e dos modelos Maya. [@needmorevram](https://github.com/needmorevram) ([X](https://x.com/needmorevram)) é co-mantenedor e contribuiu com grandes funcionalidades: o drafting DFlash2, o suporte a EXL3, o streaming de KV, os checkpoints de conversa, a busca de divisão de camadas, o perfil de especialistas e os kernels de especialistas na CPU, e, para o `maya-ds4`, a opção EXL3 de 3,5 bits, o tensor parallel em 4 / 8 GPUs e as trocas do cache de especialistas em threads (#276). Obrigado também a todos que enviaram código e relatos de velocidade ([contribuidores](https://github.com/mw00/project-maya/graphs/contributors)).
 - **Construído sobre o [ggml / llama.cpp](https://github.com/ggml-org/llama.cpp)** (MIT License, Copyright (c) 2023-2026 The ggml authors): os formatos de quantização, os produtos escalares na CPU e os kernels MMQ do caminho de prompts, compilados a partir de um commit fixo (`third_party/ggml/LICENSE`).
 - **O suporte a EXL3** segue o formato, os codebooks, o kernel de especialistas na CPU e a decodificação de um bloco em tensor cores do [exllamav3](https://github.com/turboderp-org/exllamav3) (MIT License, Copyright (c) 2025 Turboderp; `third_party/exllamav3/LICENSE`). **O forward do drafter DFlash2** segue o do [beellama.cpp](https://github.com/Anbeeld/beellama.cpp) (MIT License, Copyright (c) 2023-2026 The ggml authors, Anbeeld; `third_party/beellama.cpp/LICENSE`).
-- Os modelos: [GLM-5.3-Flash](https://huggingface.co/zai-org/GLM-5.3-Flash) da zai-org (MIT); as quantizações do Maya e o arquivo do codificador de imagens são feitos a partir dos pesos divulgados pela zai-org e mantêm a licença dela. [DeepSeek-V4.1-Flash-1017](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017) da DeepSeek (MIT); a quantização do Maya, suas tabelas Engram e o drafter são feitos a partir dos pesos divulgados pela DeepSeek e mantêm a licença dela; a torre de visão vem do checkpoint da DeepSeek, a opção GGUF vem dos [GGUFs da unsloth](https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF) e as opções EXL3 são da LibertAIDAI ([2.9](https://huggingface.co/LibertAIDAI/DeepSeek-V4.1-Flash-1017-EXL3-2.9bpw) e [3.5 bpw](https://huggingface.co/LibertAIDAI/DeepSeek-V4.1-Flash-1017-EXL3-3.5bpw)). O drafter DFlash2 opcional ([GLM-5.3-Flash-DFlash2-GGUF](https://huggingface.co/Anbeeld/GLM-5.3-Flash-DFlash2-GGUF), de Anbeeld) é CC BY-NC-ND 4.0, só para uso não comercial, e só é baixado quando você o escolhe.
+- Os modelos: [GLM-5.3-Flash](https://huggingface.co/zai-org/GLM-5.3-Flash) da zai-org (MIT); as quantizações do Maya e o arquivo do codificador de imagens são feitos a partir dos pesos divulgados pela zai-org e mantêm a licença dela. [DeepSeek-V4.1-Flash-1017](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017) da DeepSeek (MIT); a quantização do Maya, suas tabelas Engram e o drafter são feitos a partir dos pesos divulgados pela DeepSeek e mantêm a licença dela; a torre de visão vem do checkpoint da DeepSeek, a opção GGUF vem dos [GGUFs da unsloth](https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF) e as opções EXL3 são da turboderp ([2.25 bpw](https://huggingface.co/turboderp/DeepSeek-V4.1-Flash-1017-exl3/tree/2.25bpw)) e da LibertAIDAI ([2.9](https://huggingface.co/LibertAIDAI/DeepSeek-V4.1-Flash-1017-EXL3-2.9bpw) e [3.5 bpw](https://huggingface.co/LibertAIDAI/DeepSeek-V4.1-Flash-1017-EXL3-3.5bpw)). O drafter DFlash2 opcional ([GLM-5.3-Flash-DFlash2-GGUF](https://huggingface.co/Anbeeld/GLM-5.3-Flash-DFlash2-GGUF), de Anbeeld) é CC BY-NC-ND 4.0, só para uso não comercial, e só é baixado quando você o escolhe.
 - A fonte do painel: Outfit (SIL Open Font License 1.1, `serve/web/fonts/OFL.txt`); seus ícones: [Lucide](https://lucide.dev) (ISC License, `serve/web/LICENSE.lucide.txt`); sua biblioteca de UI: [Preact](https://preactjs.com) (MIT License) com [htm](https://github.com/developit/htm) (Apache License 2.0), embutidos em `serve/web/preact.js` com seus avisos.
 - O Maya é de código aberto sob a [MIT License](LICENSE); os avisos em [LICENSE](LICENSE) e `third_party/` acompanham cada cópia.
 

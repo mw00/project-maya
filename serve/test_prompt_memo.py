@@ -1,6 +1,7 @@
 """MAYA_PROMPT_MEMO (#813): prompt preparation by increment gives exactly the token ids the whole-way preparation does.
 
-Every model's chat template (DeepSeek-V4.1, GLM-5.x, MiniMax-M3.1, Qwen3.8) with a tokenizer carrying that model's own
+Every model's chat template (DeepSeek-V4.1, GLM-5.x, GLM-5.3's official one rendered as for its glm-dsa pack,
+MiniMax-M3.1, Qwen3.8) with a tokenizer carrying that model's own
 special literals: multi-turn agent histories (appends, an edit in the middle, a literal quoted in a message appearing
 and going, tool calls and results, <think> blocks, non-ASCII, segments long enough for the tokenizer's segment cache,
 re-sent and branched histories), each prompt prepared with the memo on and off - the ids must be equal.  Also
@@ -48,6 +49,12 @@ MODELS = {
              ["[gMASK]", "<sop>", "<|system|>", "<|user|>", "<|assistant|>", "<|observation|>", "<|endoftext|>"],
              ["<think>", "</think>", "<tool_call>", "</tool_call>", "<arg_key>", "</arg_key>", "<arg_value>",
               "</arg_value>", "<tool_response>", "</tool_response>"]),
+    # GLM-5.3 (744B, glm-dsa): its official template, rendered as the server renders it (ChatTemplate(glm_dsa=True),
+    # the tool call ids and clear_thinking passed through: GLM53 below)
+    "glm53": ("data/glm-dsa/templates/glm-5.3.official.jinja", "glm4",
+              ["[gMASK]", "<sop>", "<|system|>", "<|user|>", "<|assistant|>", "<|observation|>", "<|endoftext|>"],
+              ["<think>", "</think>", "<tool_call>", "</tool_call>", "<arg_key>", "</arg_key>", "<arg_value>",
+               "</arg_value>", "<tool_response>", "</tool_response>", "<tools>", "</tools>"]),
     "minimax": ("tools/mm3/chat_template.jinja", "minimax",
                 ["]~!b[", "]~b]", "[e~[", "]!d~[", "]!p~[", "]<]minimax[>[", "]<]image[>["],
                 ["<mm:think>", "</mm:think>", "<think>", "</think>", "<tool_call>", "</tool_call>"]),
@@ -192,10 +199,16 @@ class _MemoEnv:
             os.environ["MAYA_PROMPT_MEMO"] = self.saved
 
 
-def service(name: str, tok=None) -> Service:
+GLM53 = {"glm53"}          # the server's ChatTemplate(glm_dsa=True) for these (a glm-dsa pack's template)
+
+
+def service(name: str, tok=None, template: Path | None = None, glm_dsa: bool | None = None) -> Service:
+    """`name`'s template with its tokenizer, or with `tok` (a real pack's) - and `template` in place of the name's
+    (the template the server picks for that pack; glm_dsa: the server's flag for it)."""
     path, pre, control, user = MODELS[name]
     tok = tok or make_tokenizer(pre, control, user)
-    return Service(MockEngine(tok, "ok"), tok, ChatTemplate(ROOT / path))
+    glm_dsa = name in GLM53 if glm_dsa is None else glm_dsa
+    return Service(MockEngine(tok, "ok"), tok, ChatTemplate(template or ROOT / path, glm_dsa=glm_dsa))
 
 
 def ids_both(svc: Service, messages, tools, mode: str = "1"):
@@ -204,19 +217,20 @@ def ids_both(svc: Service, messages, tools, mode: str = "1"):
     if tools:
         req["tools"] = copy.deepcopy(tools)
     deepseek = getattr(svc.template, "deepseek", False)
+    glm_dsa = getattr(svc.template, "glm_dsa", False)      # (GLM-5.3: the call ids reach the template, as the server's)
     os.environ["MAYA_PROMPT_MEMO"] = "0"                  # (the whole way: off; unset is on since v1.1.55)
-    m, t, kw = openai_to_messages(copy.deepcopy(req), deepseek=deepseek)
+    m, t, kw = openai_to_messages(copy.deepcopy(req), deepseek=deepseek, glm_dsa=glm_dsa)
     full = svc.render_ids(m, t, kw)
     os.environ["MAYA_PROMPT_MEMO"] = mode
-    m, t, kw = openai_to_messages(copy.deepcopy(req), deepseek=deepseek)
+    m, t, kw = openai_to_messages(copy.deepcopy(req), deepseek=deepseek, glm_dsa=glm_dsa)
     memo = svc.render_ids(m, t, kw)
     os.environ.pop("MAYA_PROMPT_MEMO", None)
     return full, memo
 
 
 class SameIds(_MemoEnv, unittest.TestCase):
-    def check_model(self, name: str, tok=None):
-        svc = service(name, tok)
+    def check_model(self, name: str, tok=None, template: Path | None = None, glm_dsa: bool | None = None):
+        svc = service(name, tok, template, glm_dsa)
         lits = sorted(svc.literals)
         self.assertTrue(lits, "the tokenizer must carry special literals")
         lit = next((s for s in lits if "User" in s or "user" in s or "~b]" in s or "im_start" in s), lits[0])
@@ -238,6 +252,9 @@ class SameIds(_MemoEnv, unittest.TestCase):
 
     def test_glm5(self):
         self.check_model("glm5")
+
+    def test_glm53(self):
+        self.check_model("glm53")
 
     def test_minimax(self):
         self.check_model("minimax")
@@ -285,15 +302,24 @@ class SameIds(_MemoEnv, unittest.TestCase):
 
 @unittest.skipUnless(os.environ.get("MAYA_TEST_TOKENIZERS"), "MAYA_TEST_TOKENIZERS names no pack tokenizer")
 class SameIdsRealTokenizers(SameIds):
-    """The same histories with real packs' tokenizers (MAYA_TEST_TOKENIZERS=<pack>/tokenizer[<os.pathsep>...])."""
+    """The same histories with real packs' tokenizers (MAYA_TEST_TOKENIZERS=<pack>/tokenizer[<os.pathsep>...]): the
+    templates of the tokenizer's family, and the one the server renders that pack with (serve/server.py
+    chat_template_path: a GLM-5.3 pack's own, glm-dsa's rendering)."""
     def test_real(self):
-        by_pre = {"deepseek3": ["deepseek"], "glm4": ["glm", "glm5"], "glm5": ["glm", "glm5"], "minimax": ["minimax"],
-                  "qwen35": ["qwen"]}
+        from serve import glm_dsa_product
+        from serve.server import chat_template_path
+        by_pre = {"deepseek3": ["deepseek"], "glm4": ["glm", "glm5", "glm53"], "glm5": ["glm", "glm5", "glm53"],
+                  "minimax": ["minimax"], "qwen35": ["qwen"]}
         for d in os.environ["MAYA_TEST_TOKENIZERS"].split(os.pathsep):
             tok = Tokenizer.from_dir(d)
-            for name in by_pre.get(tok.pre, []):
+            names = by_pre.get(tok.pre, [])
+            for name in names:
                 with self.subTest(tokenizer=d, template=name):
                     self.check_model(name, tok)
+            if names and (Path(d) / "chat_template.jinja").exists():
+                served = chat_template_path(Path(d))
+                with self.subTest(tokenizer=d, template=str(served)):
+                    self.check_model(names[0], tok, served, glm_dsa_product.pack_is_glm_dsa(Path(d).parent))
 
 
 class LiteralMemoSame(unittest.TestCase):

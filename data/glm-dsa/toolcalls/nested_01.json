@@ -1,0 +1,102 @@
+{
+ "id": "nested_01",
+ "group": "nested",
+ "api": "openai",
+ "request": {
+  "messages": [
+   {
+    "role": "user",
+    "content": "Order 2 units of SKU A-100 and 1 of SKU B-7 for Jane Doe, jane@example.com, 12 Rose Street, Leeds, LS1 4AB, United Kingdom. Express shipping."
+   }
+  ],
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "create_order",
+     "description": "Place an order in the shop.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "customer": {
+        "type": "object",
+        "properties": {
+         "name": {
+          "type": "string"
+         },
+         "email": {
+          "type": "string"
+         },
+         "address": {
+          "type": "object",
+          "properties": {
+           "street": {
+            "type": "string"
+           },
+           "city": {
+            "type": "string"
+           },
+           "postcode": {
+            "type": "string"
+           },
+           "country": {
+            "type": "string"
+           }
+          },
+          "required": [
+           "street",
+           "city",
+           "country"
+          ]
+         }
+        },
+        "required": [
+         "name",
+         "address"
+        ]
+       },
+       "items": {
+        "type": "array",
+        "items": {
+         "type": "object",
+         "properties": {
+          "sku": {
+           "type": "string"
+          },
+          "quantity": {
+           "type": "integer"
+          }
+         },
+         "required": [
+          "sku",
+          "quantity"
+         ]
+        }
+       },
+       "express": {
+        "type": "boolean"
+       }
+      },
+      "required": [
+       "customer",
+       "items"
+      ]
+     }
+    }
+   }
+  ]
+ },
+ "expect": {
+  "calls": [
+   {
+    "name": "create_order",
+    "args": {
+     "express": true
+    }
+   }
+  ],
+  "min_calls": 1,
+  "max_calls": 3,
+  "no_call": false
+ }
+}

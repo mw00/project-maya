@@ -141,7 +141,7 @@ int create(const maya_context_config *cfg, void **opaque, char *error, size_t n)
             c->counters.allocated_bytes=used;
             // Opt in with the existing native-helper setting; retain copying on
             // discrete devices, insufficient budget or unavailable host mapping.
-            const char *zc=std::getenv("STRATA_GLM_HELPER_ZEROCOPY");
+            const char *zc=std::getenv("MAYA_GLM_HELPER_ZEROCOPY");
             if (zc && std::strcmp(zc,"1")==0) {
                 int integrated=0;
                 ck(cudaDeviceGetAttribute(&integrated,cudaDevAttrIntegrated,cfg->device));
@@ -162,7 +162,7 @@ int create(const maya_context_config *cfg, void **opaque, char *error, size_t n)
                     c->mapped?sizeof(Context::Mapped):size_t(0),status==cudaSuccess?"":"; ",
                     status==cudaSuccess?"":cudaGetErrorString(status));
             }
-            c->prof=std::getenv("STRATA_GLM_PROF")!=nullptr;
+            c->prof=std::getenv("MAYA_GLM_PROF")!=nullptr;
             if (c->prof) for (auto &e:c->events) ck(cudaEventCreate(&e));
         } catch (...) { try { c->cleanup(); } catch (...) {} dev.restore(); throw; }
         try { dev.restore(); } catch (...) { try { c->cleanup(); } catch (...) {} throw; }
@@ -253,10 +253,10 @@ int destroy(void **opaque, char *error, size_t n) {
 }
 const maya_context_api api{sizeof(maya_context_api),1,create,upload,compute,stats,destroy};
 }
-extern "C" __attribute__((visibility("default")))
+extern "C" MAYA_EXPERT_EXPORT
 const maya_context_api *maya_expert_context_api(uint32_t version) { return version==1 ? &api : nullptr; }
 
-extern "C" __attribute__((visibility("default")))
+extern "C" MAYA_EXPERT_EXPORT
 int maya_expert_context_read(void *ctx, uint32_t slot, uint64_t generation,
                              size_t offset, void *output, size_t bytes, char *error, size_t n) {
     return invoke(ctx,error,n,[&](Context &c) {
@@ -268,7 +268,7 @@ int maya_expert_context_read(void *ctx, uint32_t slot, uint64_t generation,
     });
 }
 
-extern "C" __attribute__((visibility("default")))
+extern "C" MAYA_EXPERT_EXPORT
 int maya_expert_context_rows(void *ctx, uint32_t count, const uint32_t *slots,
                              const uint64_t *gens, const float *input, float clamp,
                              float *output, char *error, size_t n) {

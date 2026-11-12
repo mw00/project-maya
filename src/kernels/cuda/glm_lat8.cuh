@@ -1,4 +1,4 @@
-// src/kernels/cuda/glm_lat8.cuh - the INT8 latent records (STRATA_GLM_KV_INT8; glm_fast.hpp lat8_rec_bytes) read as
+// src/kernels/cuda/glm_lat8.cuh - the INT8 latent records (MAYA_GLM_KV_INT8; glm_fast.hpp lat8_rec_bytes) read as
 // the FP16 an FP16 row would hold, for the batched kernels: per position kv int8 codes, then an FP16 scale per 32.
 //
 // A value is (half) (q * d), the exact product rounded once.  The prompt attention reads every selected row this way,

@@ -27,14 +27,14 @@ ROOT = Path(__file__).resolve().parents[1]
 
 class Dashboard(unittest.TestCase):
     def setUp(self):
-        os.environ["STRATA_MOCK_RELOAD_S"] = "0.3"
+        os.environ["MAYA_MOCK_RELOAD_S"] = "0.3"
         tok = ByteTokenizer()
         self.engine = MockEngine(tok, "</think>\n\nhello", max_context=32768)
         self.svc = Service(self.engine, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
         self.tmp = tempfile.TemporaryDirectory()
         self.cfg = Path(self.tmp.name) / "maya-test.json"
         self.cfg.write_text(json.dumps({"exe": "strata", "args": ["--glm-pack", "/x/pack", "--max-context", "32768"],
-                                        "env": {"STRATA_GLM_RAM_GB": "20", "MY_API_KEY": "secret"}}, indent=1))
+                                        "env": {"MAYA_GLM_RAM_GB": "20", "MY_API_KEY": "secret"}}, indent=1))
         self.svc.config_path = str(self.cfg)
         self.httpd = serve(self.svc, port=0)
         self.base = f"http://127.0.0.1:{self.httpd.server_address[1]}"
@@ -114,7 +114,7 @@ class Dashboard(unittest.TestCase):
         self.assertEqual((j["reload"]["state"], j["context"]), ("done", 65536))
         args = json.loads(self.cfg.read_text())["args"]
         self.assertEqual(args[args.index("--max-context") + 1], "65536")
-        self.assertEqual(json.loads(self.cfg.read_text())["env"]["STRATA_GLM_RAM_GB"], "20")   # the rest kept
+        self.assertEqual(json.loads(self.cfg.read_text())["env"]["MAYA_GLM_RAM_GB"], "20")   # the rest kept
         self.assertGreaterEqual(j["load_s"], 0.3)       # (how long that load took: the page's estimate of the next)
         # the setup's own size is kept for the Models page's "Reset to the setup's values", through later reloads
         self.assertEqual(json.loads(self.cfg.read_text())["installer"]["as_set_up"]["context"], 32768)
@@ -183,7 +183,7 @@ class Dashboard(unittest.TestCase):
         self.assertFalse(row["spec_off"])
 
     def test_chat_gets_503_while_reloading(self):
-        os.environ["STRATA_MOCK_RELOAD_S"] = "1.5"
+        os.environ["MAYA_MOCK_RELOAD_S"] = "1.5"
         self.req("POST", "/api/context", {"max_context": 16384})
         s, h, b = self.req("POST", "/v1/chat/completions", {"model": "m", "messages": [{"role": "user", "content": "hi"}]})
         self.assertEqual(s, 503)
@@ -714,6 +714,45 @@ class PageLogic(unittest.TestCase):
                                encoding="utf-8", timeout=60)
         self.assertEqual(r.returncode, 0, r.stderr[-2000:])
         return json.loads(r.stdout.strip().splitlines()[-1])
+
+    def test_glm53_keeps_its_own_chat_defaults(self):
+        # GLM-5.3 (744B, "glm-5.3") and GLM-5.3-Flash shared "maya.sampling" before v1.1.59: the 744B gets its own
+        # key, which starts once from what was saved there - Flash's stays as it was, and nothing is lost
+        got = self.node("""
+const mem = new Map();
+globalThis.localStorage = {getItem: (k) => (mem.has(k) ? mem.get(k) : null), setItem: (k, v) => mem.set(k, String(v)),
+                           removeItem: (k) => mem.delete(k), key: (i) => [...mem.keys()][i], get length() { return mem.size; }};
+const read = (k) => JSON.parse(mem.get("maya." + k) || "null");
+const out = {};
+mem.set("maya.sampling", JSON.stringify({prefs_v: 3, temperature: 0.3, system: "Be brief", sys_default: true}));
+st.S.health = {model: "glm-5.3", model_label: "GLM-5.3 (744B) · Maya-XS"};
+mem.set("maya.model", JSON.stringify(st.modelId()));
+out.key744 = st.prefsKey();
+out.migrated = read("sampling_glm53");
+st.loadPrefs(); st.savePrefs({temperature: 0.9});
+out.after744 = read("sampling_glm53").temperature; out.flashKept = read("sampling").temperature;
+mem.set("maya.sampling", JSON.stringify({prefs_v: 3, temperature: 0.5}));
+st.prefsKey();
+out.once = read("sampling_glm53").temperature;              // (only once: never over the 744B's own again)
+st.S.health = {model: "glm-5.3-flash", model_label: "GLM-5.3-Flash · Maya-L"};
+out.keyFlash = st.prefsKey();
+st.S.health = {model: "deepseek-v4.1-flash", model_label: "x"};
+out.keyDs = st.prefsKey();
+// a first start after the update straight on another model: the 744B's copy is made before a switch clears choices
+mem.clear();
+mem.set("maya.sampling", JSON.stringify({prefs_v: 3, temperature: 0.3, system: "Be brief"}));
+mem.set("maya.model", JSON.stringify("glm-5.3|GLM-5.3 (744B) · Maya-XS"));
+st.S.health = {model: "glm-5.3-flash", model_label: "GLM-5.3-Flash · Maya-L"};
+out.switched = st.newModelCheck();
+out.switch744 = read("sampling_glm53");
+console.log(JSON.stringify(out));""")
+        self.assertEqual(got["key744"], "sampling_glm53")
+        self.assertEqual(got["migrated"], {"prefs_v": 3, "temperature": 0.3, "system": "Be brief", "sys_default": True})
+        self.assertEqual((got["after744"], got["flashKept"]), (0.9, 0.3))
+        self.assertEqual(got["once"], 0.9)
+        self.assertEqual((got["keyFlash"], got["keyDs"]), ("sampling", "sampling_deepseek"))
+        self.assertTrue(got["switched"])
+        self.assertEqual(got["switch744"]["system"], "Be brief")                 # (kept: not a sampling choice)
 
     def test_thinking_pill_covers_the_chosen_level_only(self):
         # the owner's phone: Low chosen, the fill spanned Off and Low.  Every model's levels, every level: the pill sits

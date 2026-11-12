@@ -1,6 +1,6 @@
 #pragma once
-// STRATA_GLM_EXL3_MMA_ROWS_SHORT=<rows>[,<max chunk tokens>]: in a prompt chunk of up to <max chunk tokens> (4096) an
-// EXL3 expert with up to <rows> rows goes through the tensor-core kernels instead of STRATA_GLM_EXL3_MMA_ROWS's (64).
+// MAYA_GLM_EXL3_MMA_ROWS_SHORT=<rows>[,<max chunk tokens>]: in a prompt chunk of up to <max chunk tokens> (4096) an
+// EXL3 expert with up to <rows> rows goes through the tensor-core kernels instead of MAYA_GLM_EXL3_MMA_ROWS's (64).
 // A short chunk's experts have tens to a few hundred rows each, and reconstructing each one to FP16 once a chunk (its
 // fixed cost) is what such a chunk pays most for; a long chunk keeps the default, where the FP16 product is cheaper.
 // Used by glm_prefill.cu's x3_run_set; CPU-tested (tests/core/exl3_mma_rows_test.cpp).
@@ -25,7 +25,7 @@ inline MmaRowsShort mma_rows_short_parse(const char* v) {
     return r;
 }
 
-/// The most rows an expert of a chunk of t tokens takes through the tensor-core kernels: base (STRATA_GLM_EXL3_MMA_ROWS)
+/// The most rows an expert of a chunk of t tokens takes through the tensor-core kernels: base (MAYA_GLM_EXL3_MMA_ROWS)
 /// unless the chunk is short and the short setting is on
 inline int mma_rows_for(int t, int base, const MmaRowsShort& s) {
     return s.rows > 0 && t > 0 && t <= s.max_tokens ? s.rows : base;

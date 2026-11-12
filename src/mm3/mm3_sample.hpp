@@ -29,6 +29,7 @@ struct Req {
     std::string file;       // GENI: the pictures
     std::vector<int> ids;
     int rid = -1;           // rid=N: the request's id (--parallel: every line it causes carries it)
+    int ablate = -1;        // ablate=0|1: this request projects the --ablate direction out or not (-1: as started)
 };
 
 inline bool penalised(const Req& r) {

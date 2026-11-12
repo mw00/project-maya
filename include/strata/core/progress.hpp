@@ -2,7 +2,7 @@
 //
 // The engine's host loop and the GPU wait on each other through flags; a protocol bug there does not crash, it
 // spins forever (the GPU "100%", one CPU core busy, no tokens).  `--serve` runs a watchdog thread over this: a
-// request whose heartbeat stops for `STRATA_WATCHDOG_S` seconds (default 60; 0 = off) ends the engine with the
+// request whose heartbeat stops for `MAYA_WATCHDOG_S` seconds (default 60; 0 = off) ends the engine with the
 // stage it was stuck in, and the server starts it again instead of hanging.  Tokens, prompt chunks and verify
 // windows beat; the stage is two relaxed stores per layer, which the token path does not notice.
 #pragma once

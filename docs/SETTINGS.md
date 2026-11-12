@@ -4,8 +4,7 @@ Everything on this page is optional: the engine sizes itself for the PC it runs 
 [README](../README.md).
 
 The settings below are environment variables named `MAYA_*`: set them before a start, or keep them in the config
-with `./maya.sh --setup --env MAYA_NAME=value`. Their earlier `STRATA_*` spellings still work; where both are set, the
-`MAYA_` one counts.
+with `./maya.sh --setup --env MAYA_NAME=value`.
 
 The switches that turn something off - `MAYA_GLM_NO_SPEC` (no drafting on a split: token by token), `MAYA_GLM_NO_MTP`
 (the NextN draft block not loaded) and `MAYA_GLM_NO_PREFILL` (prompts read token by token) - are on with `1`, and off
@@ -57,6 +56,7 @@ These settings change what the engine chooses (put them in the config with `--en
 | `MAYA_GLM_HELPER_ZEROCOPY` | on for an integrated helper | An integrated (unified-memory) expert helper reads each call's input and plan from, and writes its result into, one mapped pinned block - four copies fewer a call; `0` makes the copies (a discrete helper always copies). With `MAYA_GLM_PROF` set, each helper prints a `glm helper prof` line at the end: its calls, experts a call, host time (enqueue, wait, the result's copy), each stage's GPU time and the bandwidth its kernels read the experts at |
 | `MAYA_GLM_RAM_HEADROOM_GB` | 6 | RAM left free for the system when the RAM tier is sized (Apple Silicon: unified memory left free beside maya-metal's expert pool, from what is free when it starts); it also takes one more GPU's prompt buffers, pinned after the measurement - a split of three or more GPUs sets the others' aside on top, and each later GPU measures again and leaves at least half of it free. The pinned tier can't be swapped out, so a Linux desktop whose kernel starts swapping with more free (several displays, a busy session) wants more: a 128 GB desktop with three GPUs and three displays stayed responsive at 16, and swapped at 12 (#77) |
 | `MAYA_GLM_RAM_GB` | from free RAM | a fixed RAM-tier size in GB |
+| `MAYA_GLM_PIN_ROOM_MB` | 512 (Windows with a discrete AMD card: a tenth of the pinning cap) | where Windows caps the pinned memory, what the RAM tier leaves pinnable above it (rounded up to 256 MB) |
 | `MAYA_GLM_COMPLETE_POOL` | on | where the GPU's expert budget holds every expert, the 3 spares a layer and the prompt path's borrowed slots (the Ryzen AI Max APUs' memory on Windows - a Radeon 8065S holds Maya-S with ~60 GB to spare), each layer keeps exactly that many: the start loads every expert, a prompt borrows only the slots beyond them (none moved out, none read from the SSD again), the decode never misses and the CPU lane has nothing to take (8065S, Maya-S: decode +2.6-4%, +7% after an 8K-token prompt, the same answers; NVIDIA since v1.1.35, where a split held every expert and the capped pool lent residents to every long prompt: a 4x A100 split's decode 2.5x, #474). `0` = off (the capped pool, for A/B). Where the budget cannot hold every expert nothing changes. Linux APUs keep their unified-memory policy |
 | `MAYA_GLM_RESIDENT_SKIP` | AMD: on | while every expert is in VRAM, the decode leaves out each route's wait and fetch launches, which would find nothing to do (two a layer and token); `0` = launch them anyway; `1` = on for NVIDIA too |
 | `MAYA_GLM_FLUSH`, `MAYA_GLM_PREFILL_FLUSH` | off, off | Windows + AMD only, experimental: the HIP runtime holds queued kernels until the host waits; `n` = the decode submits its first layer as soon as it is queued and then every n layers, `1` = the prompt path each sub-batch and each layer's experts (`cudaStreamQuery`, which does not wait). On a Radeon 8065S every 4 layers was ~4% slower than without; prompts no faster |
@@ -80,7 +80,7 @@ These settings change what the engine chooses (put them in the config with `--en
 | `MAYA_GLM_CPU_SPLIT` | about 48 pieces in all | decode: each CPU-lane thread's share of a token's RAM-tier experts is cut into this many pieces (1-64), claimed in turn, so one thread held up by the disk readers doesn't hold up the token. Few threads take several pieces each (6 threads: 8 - one V100, Maya-S: 17.1 tok/s against 14.3 with one); 40 or more take one each, which streams the memory best |
 | `MAYA_GLM_PCIE_SHARE` | measured at start | the share of a token's RAM-tier experts copied over PCIe and run on the GPU instead of on the CPU: `0` = the CPU takes every one, `1` = none (the tuning sets it; `MAYA_GLM_CPU_PLAN` = the split per expert count, digits for 0..8) |
 | `MAYA_GLM_CPU_RETIME` | on | the split the start-up timing chose (neither of the two above set) is timed again in decode: over the first windows of 2,000 CPU-lane experts (at most eight; the first only warms up), when the lane's own cost an expert there is more than 15% from the one the split was planned with the same way in two windows in a row, the split is planned again from their mean, at most three times, with one `CPU lane timed again in decode` line each. A start on a busy CPU (one timed 0.611 ms an expert against the usual ~0.24) no longer keeps its split for the engine's life. `0` = off |
-| `MAYA_GLM_P2P` | unset (off) | `1`: across a multi-GPU layer split, the token states go GPU to GPU directly over PCIe instead of through host memory - on any pair the driver reports peer access for (NVIDIA or AMD); a pair without it keeps the host copy. The same bytes, so the same answers. Consumer AMD cards' peer access over PCIe can be unreliable: leave it off if a split misbehaves with it. Earlier `STRATA_GLM_P2P` spelling still works |
+| `MAYA_GLM_P2P` | unset (off) | `1`: across a multi-GPU layer split, the token states go GPU to GPU directly over PCIe instead of through host memory - on any pair the driver reports peer access for (NVIDIA or AMD); a pair without it keeps the host copy. The same bytes, so the same answers. Consumer AMD cards' peer access over PCIe can be unreliable: leave it off if a split misbehaves with it. |
 | `MAYA_GLM_DUAL_PREFILL` | off | `1`, two GPUs that reach each other's memory (NVLink): a prompt of one chunk runs the split's halves one after the other, so the waiting GPU and its PCIe link sit idle. With this on, the waiting GPU stages every second expert of the working half's staging groups: host to its own (idle) staging buffer over its own link, then peer to peer over NVLink. A group then arrives through both links. Longer prompts (several chunks) are pipelined across the GPUs and stage as before. The answers stay the same unless the prompt's CPU share plan, which learns from the copy times, gives the CPU different experts (`MAYA_GLM_SCORE_PREFILL=1`, 3000-token context: KL 0.000000). Maya-M on 2x RTX 3090 (x8 each + NVLink), Ryzen 3950X, 128 GB: prompt 1K 283 -> 362 tokens/s (+28 %), 4K 622 -> 772 (+24 %), 16K 1034 -> 1142 (+10 %), 64K unchanged. Over PCIe-only peer access the copy would cross the working GPU's link anyway, so expect no gain there. The start checks that peer copies arrive intact (a 4 MB pattern each way): a machine whose GPUs report peer access but deliver wrong bytes keeps it off and says so |
 | `MAYA_GLM_PREFILL_CALC` | off | `1`, two GPUs without peer access (no NVLink; with it `MAYA_GLM_DUAL_PREFILL` is the one): while one GPU runs its half of a one-chunk prompt, the waiting GPU **computes** a share of each MoE layer's RAM-tier experts - their weights over its own PCIe link from the working GPU's pinned RAM tier, the chunk's inputs and routes over the host to it, the weighted sum of its rows back - so both links stream. The share is learned per GPU from both lanes' times (`MAYA_GLM_PREFILL_CALC_SHARE=0..0.9` fixes it); the GPU with fewer multiprocessors takes the lightest experts. EXL3 experts only; longer prompts (several chunks) are pipelined and stage as before. No VRAM beyond the prompt path's loan (the waiting GPU's buffers are carved from its own idle prompt buffers); a chunk's sum (T x n_embd floats) of pinned RAM more per GPU. Not bit-exact - the share's rows are summed apart and added, and cuBLAS may pick other kernels on the other GPU: `MAYA_GLM_SCORE_PREFILL=1`, 2048-token context, CPU lane off: KL 0.0126, the size of any re-blocking (`MAYA_GLM_PREFILL_SUB=512`: 0.0138). turboderp's sc_3.10bpw on RTX 3090 + RTX 3060 (PCIe 4.0 x8 each), Ryzen 9 5900X, most experts in RAM: prompt 512 tokens 98 -> 144 tokens/s (+48 %), 1K 155 -> 229 (+48 %), 2K 244 -> 349 (+43 %), 4K 352 -> 468 (+33 %), 7K 445 -> 557 (+25 %). `MAYA_GLM_PREFILL_CALC_CHECK=1` (debug, slow) computes the share again on the working GPU and prints how far the two sums differ, layer by layer |
 | `MAYA_GLM_PREFETCH_N` | 0 | `1` or `2` (more is read as 2; the engine log says the settings at start): each layer copies up to this many of the next layer's predicted experts (its router on this layer's input) that are not in VRAM into that layer's spares while it computes. `MAYA_GLM_PREFETCH_AT`: when the copy starts - `route` (the default: at once, beside this layer's own PCIe fetch and CPU lane), `fetch` (after this layer's fetch) or `cpu` (after its CPU lane); `MAYA_GLM_PREFETCH_BLOCKS`: the copy's blocks (default half the SMs); `MAYA_GLM_PREFETCH_RANK`: copy only the prediction's first n ranks (its first guesses are right almost always, its 5th-8th mostly not). Maya-M on an RTX 3090 + 3060 with `RAM_RESIDENT=1`, decode at 21K: off 19.64, `N=1` 17.0, `N=1 AT=fetch BLOCKS=4` 19.75, `+ RANK=2` 20.22 tokens/s (VRAM hits 64 -> 69 %); Maya-L there (bigger experts, a busier link): no gain |
@@ -93,6 +93,7 @@ These settings change what the engine chooses (put them in the config with `--en
 | `MAYA_GLM_PREFILL_CHUNK` | unset | `--prefill N` from the environment (the older setting; it wins over the config's `--prefill`) |
 | `MAYA_PREFILL_LEND_PCT`, `MAYA_GLM_PREFILL_MB` | 90 or 85, unset | `--prefill auto`: the share of each card's expert-pool slots a prompt may borrow for its buffers: 90 when at least 90% of the experts' bytes are held pinned (in VRAM or the RAM tier), else 85 - or a fixed budget in MB |
 | `MAYA_GLM_LEND_PARK_LRU` | 1 | when a prompt borrows the pool's tail, an expert leaving VRAM is moved over a RAM-tier expert of a lower use count - and, at `1`, on equal counts over the one used less recently (the counts age, so most are equal). A V100, Maya-S24, 512 tokens after a fresh 24K prompt: disk reads 520-578 -> 309-337, decode +2-5%. `0` = a strictly lower count only (before v1.1.21). `MAYA_GLM_TIER_DIAG=1` counts the disk reads by cause (`MAYA_GLM_TIER_DIAG_EVERY`: every N boundaries, 64) |
+| `MAYA_GLM_PREFILL_STABLE` | off | GLM prompts, opt-in (`1`): a prompt's numbers no longer depend on which experts the expert cache holds at that moment - every expert product is computed the same way whether the expert is in VRAM or copied in (off, the same prompt read again after other requests can give a different greedy answer). It costs about 2-5% prompt speed; useful for reproducible prompt reads (A/B checks). With the CPU lane on, answers can still vary through the decode either way. Off = the launches of v1.1.57 (split expert products on NVIDIA, separate kernels for lightly used VRAM experts) |
 | `MAYA_GLM_PREFILL_TAIL_SKIP` | on | single-device prompts without a loaded NextN/MTP block: skip the last layer's attention output projection and FFN after updating all its caches; `0` restores the full computation. Splits and `GLM_CB_DIR` seam dumps keep the full path |
 | `MAYA_GLM_PREFILL_WINDOW` | the chunk's tokens | prompts: the expert output rows kept on the GPU at once - each expert set's rows are added into the layer's output as the window fills, instead of every routed row waiting for one combine (~40 KB a token instead of ~185, so a chunk holds ~2x the tokens); `0` = every row (the old layout) |
 | `MAYA_GLM_PREFILL_FUSED` | on for gfx1151, gfx1100 and RDNA4 (gfx1200 / gfx1201) | HIP with MMQ built: fused int8 WMMA gate/up, clipped SwiGLU and down for GLM routed experts (4096/2048 geometry and covered IQ types). `0` retains MMQ and its scratch layout. Strix Halo measured +13.2/+7.5/+4.8% prompt speed at 4K/8K/16K on the v1.0.16-based prototype; with the wmma2 attention on a Radeon 8065S (Windows, Maya-S), 3K / 8K-token prompts 233 / 253 -> 271 / 278 tokens/s. 4x RX 7900 XT (gfx1100, Maya-S24, ROCm 10): +5-13% at 1.3K-16K-token prompts. Other AMD architectures retain MMQ. |
@@ -134,6 +135,7 @@ These settings change what the engine chooses (put them in the config with `--en
 | `MAYA_GLM_DISK_SKIP_W`, `MAYA_GLM_DISK_SKIP_FROM` | off (0, 8) | **an approximation, for experts that do not fit in VRAM + RAM**: a routed expert in neither VRAM nor the RAM tier is left out of the token instead of read from the SSD when its share of the route's weights is below `MAYA_GLM_DISK_SKIP_W`, or its rank (0-7, the route's order: score + bias) is at least `MAYA_GLM_DISK_SKIP_FROM`. The weight rule leaves out what matters least: a 3090 with 60 GB of RAM and 74 GB of experts on a PCIe 4 NVMe, `--bench` decode 13.3 -> 21.6 tokens/s at `_W=0.12`; KL against the full computation (CPU lane off, 575 tokens): `_W=0.12` 0.12, `_W=0.14` 0.15, `_FROM=6` 0.08, `_FROM=4` 0.11 (Maya-S is 0.43 from FP8; the CPU lane's own arithmetic moves the output by ~0.06). The engine log's `glm skip` line counts the experts left out. Lookahead (`MAYA_GLM_AHEAD`) then reads only the ranks a route would wait for |
 | `MAYA_GLM_MISS_SKIP_W`, `MAYA_GLM_MISS_SKIP_FROM` | off (0, 0) | **changes the answers** - for a RAM-bound decode: a routed expert that is NOT IN VRAM and carries less than this share of the route's weights is left out (no PCIe fetch, no CPU-lane work), on layers from `_FROM` on - `TRUNK_KEEP`'s idea by weight instead of rank, so a token routed to one or two strong experts drops more of its light misses than one spread evenly. GLM-5.3's early layers notice it far more than its late ones: keep `_FROM` at about 23 (on every layer, 0.04 already gave KL 0.041 for ~1% speed). RTX 3090 alone, Ryzen 7 9700X, DDR5-3600, `_FROM=23`, full suite (chat / agent tok/s, KL to the untrimmed model on 1,746 tokens): Maya-S24 `TRUNK_KEEP_MAP` stage 4 (`...5555555444...`) 27.4 / 27.3, KL 0.027; 0.12: 29.3 / 27.7, KL 0.037; 0.14: 30.1 / 29.0, KL 0.052; 0.16: 30.9 / 29.6, KL 0.075 (`TRUNK_KEEP_MAP` at the same KL: 29.7 / 28.8). Maya-M stage 4 19.9 / 18.1, KL 0.038; 0.12: 21.3 / 19.5, KL 0.047; 0.14: 21.8 / 21.0, KL 0.060. A request may set its own for a sweep without a restart: `"strata_tune": {"miss_skip_w": 0.14, "miss_skip_from": 23}` (0: off for it) |
 | `MAYA_GLM_RESIDENT_TOPK`, `MAYA_GLM_RESIDENT_SKIP_W` | off (0, 0) | **changes the answers - Turbo**: for a model that fits in VRAM, where the miss skips above have nothing to leave out. A decoded token computes only its `_TOPK` heaviest routed experts (by route weight; the top-1 always runs), and/or drops every routed expert whose share of the route's weights is below `_SKIP_W`, **wherever the expert lives** (VRAM too): a dropped expert is a null plan entry - no fetch, no CPU-lane work, no weight - and the kept weights are renormalised when the model's are (GLM's are). Decode and verify windows only; prefill and the MTP layer stay exact. AMD Strix Halo (Windows, all experts in VRAM), Maya-M-Derisked with MTP, greedy, a three.js page: 33.2 tok/s (Turbo's other settings) -> 34.6 (`_TOPK=6`), 37.0 (5), 38.8 (4), 30.2 (3: the page had a duplicate import and the drafts missed more); `_SKIP_W=0.10` 36.9, `0.20` garbage. Turbo uses `_TOPK=4` |
+| `MAYA_GLM_ROUTE_AFFINITY` | off (0) | **changes the answers** - Turbo's value on GLM-5.3 (744B): 0.2. Added to the selection score of a routed expert VRAM holds (its weight stays its own probability), so more of a token's experts are ones already in VRAM and fewer are read from RAM or the SSD. Decode only. GLM-5.3 Maya-XS, greedy: 0.2 decodes 22-25% faster, KL 0.20 against the exact route; 0.05 7-11% faster, KL 0.15; 0.5 and up drift into echoing the prompt |
 | `MAYA_GLM_DEFER_CPU` | `0` (off) | **changes the answers** - for a decode that waits on the CPU lane: a MoE layer's CPU-lane experts are added to the residual after the NEXT layer's mixer instead of before that layer's read, so the CPU's work overlaps the next layer's attention (that attention misses them; a part's last layer always waits). `1` = on the first part of a split only (one GPU: on); `2` = on every part of a split - each part has its own CPU lane and its last layer is never deferred, so nothing deferred crosses to the next GPU. (Before `2`, any non-zero value meant the first part only.) 2x RTX 4060 Ti (PCIe 3.0 x8), GLM-5.3-Flash UD-IQ3_XXS, `--bench` decode (2 starts each): 13.0 unset, 13.4-13.7 `1`, 14.0 `2`; KL to the unset run on 999 teacher-forced tokens 0.034 (`1`) / 0.038 (`2`), no unset-against-unset run on this pack (with a re-biased router and another expert profile: 21.1 unset, 22.2-22.3 `1`, 23.7-24.0 `2`, 2 starts each; KL there to the unset run 0.108 (`1`) / 0.120 (`2`), unset against unset 0.037) |
 | `MAYA_GLM_SPEC_HEAD` | half the GPUs | more than two GPUs: how many of the split's first GPUs form the head group of the speculative decode - the head group runs the draft's position while the rest finish the current token, as the two halves of a two-GPU split do (4x Tesla T4, Maya-S: decode 14.1 -> 21.0 tok/s against no drafting); `MAYA_GLM_NO_SPEC=1` = token by token |
 | `MAYA_GLM_SPEC_CANCEL` | off | two GPUs (a head group of one GPU): `1` = when the tail's token shows that the draft was wrong, the head's speculative pass for it stops at its next layer (its heavy kernels do nothing, its routes go out empty) and the redo starts at once, while the tail drafts - instead of after the rest of a pass already known to be thrown away. The tokens are the same (greedy, CPU lane and layer map off: three requests identical to the token, 166 cancels in one of them). RTX 3090 + 3060, Maya-M: 5.4-6.5 ms of the first GPU's time saved per rejected draft (greedy, identical text: decode +0.9 to +2.6 %); at 21K with sampling it stayed within the run-to-run noise there (+0.6-1.2 %) - it pays more where the first GPU paces more clearly and more drafts are rejected. With `MAYA_GLM_SPEC_SAMPLE=1` the two add up: +5.3 % together on that box (the first GPU's average pass 31.6 -> 30.4 ms) |
@@ -142,7 +144,7 @@ These settings change what the engine chooses (put them in the config with `--en
 | `MAYA_GLM_SPEC_FOLLOW_SAVE` | off | `--spec-follow-save PATH`: each request's decoded token ids are written to that file - the continuation `MAYA_GLM_SPEC_FOLLOW` reads |
 | `MAYA_GLM_SERVICE_IDLE_MS` | 200 | the engine's tier threads (one per GPU) spin while a decode routes experts and sleep after this long without one, so an idle engine uses ~1% of a core instead of one core per GPU; `0` = spin always |
 | `MAYA_GLM_SERVICE_DEEP_S` | 60 | after this many seconds without a request the tier threads sleep on a gate (`MAYA_GLM_SERVICE_DEEP_MS`, 100, at a time) instead of waking 500 times a second; the next request's line wakes them at once, so the first token waits for nothing. `0` = never |
-| `MAYA_DS4_CPU_PREPARE_ROWS` | off | `1`: at DeepSeek GGUF load, before CPU-lane tuning, run the existing guarded one-token and multi-token row selection/parity checks for each distinct gate/up or down format with experts outside VRAM. IQ1_S also prepares its native multi-token fallback, since the one-GPU plan can later disable its own rows. This moves first-use checks to startup; it keeps the same numerical checks and fallback decisions. Unset or any value other than exactly `1` keeps lazy checks. `DS4_CPU_PREPARE_ROWS` and `STRATA_DS4_CPU_PREPARE_ROWS` are aliases (the `MAYA_` spelling wins). Adds startup work; no steady-state speedup is claimed. Builds with `STRATA_NATIVE_EXPERTS=OFF` keep a no-op stub. |
+| `MAYA_DS4_CPU_PREPARE_ROWS` | off | `1`: at DeepSeek GGUF load, before CPU-lane tuning, run the existing guarded one-token and multi-token row selection/parity checks for each distinct gate/up or down format with experts outside VRAM. IQ1_S also prepares its native multi-token fallback, since the one-GPU plan can later disable its own rows. This moves first-use checks to startup; it keeps the same numerical checks and fallback decisions. Unset or any value other than exactly `1` keeps lazy checks. `DS4_CPU_PREPARE_ROWS` is an alias (the `MAYA_` spelling wins). Adds startup work; no steady-state speedup is claimed. Builds with `STRATA_NATIVE_EXPERTS=OFF` keep a no-op stub. |
 | `MAYA_DS4_SERVICE_IDLE_MS` | 200 | DeepSeek's CPU-lane thread: the same stages as `MAYA_GLM_SERVICE_IDLE_MS` (spin through a decode, then sleeps of 0.1 ms, 2 ms), where it used to wake every 20 µs for ever; `0` = the old behaviour |
 | `MAYA_DS4_SERVICE_DEEP_S` | 60 | DeepSeek's CPU-lane thread after this many seconds without a request: it sleeps on the gate (`MAYA_DS4_SERVICE_DEEP_MS`, 100, at a time) until the next request's line; `0` = never |
 | `MAYA_GLM_PREFILL_CPU` | on | prompts: the least routed RAM-tier experts are computed on the CPU while the GPU loads the rest over PCIe, the split balanced each layer so both finish together; `0` = off. `MAYA_GLM_PREFILL_CPU_ROW_MS` fixes the CPU cost of a row it plans with (default: learned) |
@@ -200,7 +202,7 @@ These settings change what the engine chooses (put them in the config with `--en
 | `MAYA_GLM_ROUTE_LOG` | off | `<prefix>`: every decode route as a line in `<prefix>.<GPU>` - the layer, its experts, which were fetched, missed or computed on the CPU, then after a `\|` the 16 near misses (the next ranks by the same score) - for cache studies: `tools/glm_tier_replay.py` replays a log through a model of the VRAM tier's rules and alternatives |
 | `MAYA_GLM_SCORE_PREFILL` | off | with `MAYA_GLM_SCORE=<c>` (score `--tokens` after the first c): `1` reads those c tokens through the prompt path instead of one by one, so a long context is scored in minutes (debug: comparing KV-cache formats at long context) |
 | `MAYA_GLM_MULTI_BENCH` | off | `<n>,<prompt>,<tokens>` (with `MAYA_GLM_SEQS` >= n, `--glm-pack`, no `--serve`): n prompts, then that many greedy tokens each - sequence 0 alone through the token path, then all n through the pipelined decode; positive `MAYA_GLM_SPLIT_ROWS` groups up to k sequences per part and reports `split-rows`; prints both rates and how many of sequence 0's tokens agree (all of them with `MAYA_GLM_CPU_LANE=0`). `MAYA_GLM_MULTI_DUMP=<file>` also writes every sequence's tokens there, a line each (then the lone run's), to compare two builds or settings token for token |
-| `MAYA_GLM_THINK_RESERVE` | 1024 | the server: the token reserve for the final answer when a request's output limit is tiny. The config's `"thinking_budget"` (32768) is lowered by a request's `max_tokens` (or the context left) only when that limit is 1024 tokens or fewer (a side request such as a title): then a quarter is kept for the answer, with this preferred floor, capped at half the limit so reasoning still has room; the forced `</think>` token also counts toward the limit. A larger `max_tokens` is the cap on the whole output and leaves the thinking budget as it is (a chat client's 4096 no longer closes the thinking at ~3K tokens; a thinking that reaches the limit ends with `finish_reason` "length"); the reserve can also be supplied as `STRATA_GLM_THINK_RESERVE` in the run config's `env` |
+| `MAYA_GLM_THINK_RESERVE` | 1024 | the server: the token reserve for the final answer when a request's output limit is tiny. The config's `"thinking_budget"` (32768) is lowered by a request's `max_tokens` (or the context left) only when that limit is 1024 tokens or fewer (a side request such as a title): then a quarter is kept for the answer, with this preferred floor, capped at half the limit so reasoning still has room; the forced `</think>` token also counts toward the limit. A larger `max_tokens` is the cap on the whole output and leaves the thinking budget as it is (a chat client's 4096 no longer closes the thinking at ~3K tokens; a thinking that reaches the limit ends with `finish_reason` "length"); the reserve can also be supplied as `MAYA_GLM_THINK_RESERVE` in the run config's `env` |
 | `MAYA_ENGINE_STALL_S` | 90 | the server: an engine silent this long that also used no CPU, disk or GPU in that time is stuck - it is ended, the request gets an error and the next request starts it again (a silent engine that is working is never ended); `0` = off |
 | `MAYA_WATCHDOG_S` | 180 | the engine: a request that finishes no prompt layer and no token for this long has hung, even with a thread spinning (#40). The engine writes where it stopped to its log (on Windows also `maya-stall-<pid>.dmp`, every thread's stack: attach both to an issue) and ends; the request gets an error and the next request starts it again. `0` = off |
 | `MAYA_DS4_WATCHDOG_S` | 600 | DeepSeek's engine (`maya-ds4 --serve`): a request whose prompt, tokens and steps between stop moving for this long has hung (#539, #494: a tensor-parallel group with one GPU spinning and the other idle). The engine writes where the main thread and each GPU's thread of a prompt were (`maya ds4 serve: where it stopped: ...`) and ends; the request gets an error and the next one starts it again. `0` = off. Not this setting's, and always on: a request that leaves a GPU holding layers in a fault (an illegal address, a failed launch - every later call on that GPU fails) or the prompt path's room not handed back ends the engine the same way once that request's error is out (`maya ds4 serve: a GPU's state is unknown after this request`, exit 3), and the next request - even one already waiting - starts a fresh one; before, it stayed up and refused every later request until a restart by hand |
@@ -268,7 +270,9 @@ there, and the reserves below, go there too, and a setup again keeps them (`MAYA
 
 At start the engine log says how much VRAM each GPU has free with everything loaded (`maya serve: CUDA0: ... MiB of
 VRAM free with everything loaded`). Under 256 MiB (512 on a split's later GPUs) it adds `LOW` and the reserve that would
-leave room. The engine only says so: raise `--vram-reserve-mib` (`--vram-reserve-later-mib`), lower `--max-context`, or
+leave room - except on an integrated GPU (an APU), where what is allocated after the expert
+pool (one-GPU drafting's buffers) goes on into its shared GPU memory, the same RAM: there it says so and nothing needs
+to change. The engine only says so: raise `--vram-reserve-mib` (`--vram-reserve-later-mib`), lower `--max-context`, or
 close other programs that use the GPU. A drafter's verify windows allocate on first use, after the start: an RTX 3090
 with DFlash2 at 32K had 431 MiB free at start and 77 MiB after the first request - fine on Linux, where a full card
 fails an allocation instead of paging, but on Windows a reason to raise the reserve.
@@ -397,8 +401,7 @@ members' bands against the device's kernels bit for bit.
 | `DS4_LANE_PARITY_DEBUG` | off | set (debugging): the log names the first two layers that do not take the parity path, and why |
 | `DS4_DUMP_ACC` | off | `<file>` (debugging): every layer's output written to the file, a record a pass `[layer, T, dim]` then T x dim floats - to see where two placements' hidden states part. Large; never for normal use |
 
-`MAYA_DS4_LANE_PARITY` takes precedence over the older `STRATA_DS4_LANE_PARITY` and `DS4_LANE_PARITY` aliases,
-in that order. A set value of `0` disables parity even if a lower-priority alias is `1`.
+`MAYA_DS4_LANE_PARITY` takes precedence over the `DS4_LANE_PARITY` alias. A set value of `0` disables parity even if a lower-priority alias is `1`.
 
 ## Repetition penalties
 
@@ -432,7 +435,7 @@ Two config settings shape the thinking, and only one of them counts tokens:
 
 | Setting | What it is |
 |---|---|
-| `"thinking_budget"` | the cap on the thinking, in tokens (32768 by default; 8192 for GLM-5.3-Flash Maya-XS; 0 = none). Past it the server closes the thinking at the next sentence or line end and the answer starts. Settings > Chat defaults > Thinking budget changes it without a restart |
+| `"thinking_budget"` | the cap on the thinking, in tokens (32768 by default; 8192 for GLM-5.3-Flash Maya-XS; 0 = none). Past it the server closes the thinking at the next sentence or line end and the answer starts. Settings > Chat defaults > Thinking budget changes it without a restart. GLM-5.3 (744B): a request that asks for Max itself gets up to 65536, as far as its room keeps 32768 for the answer, while the budget is the default (none set, or 32768); another value, or any value saved on the dashboard, applies at every level |
 | `"reasoning_effort"` | the thinking level a request gets when it names none: a word (`none`, `auto`, `low`, `medium`, `high`, `xhigh`, `max`). DeepSeek-V4.1 also takes a number from 1 to 100 (`42` or `"42"`), its own effort level: it is written into the prompt as a hint to the model, not a token cap |
 
 A `reasoning_effort` the model does not take (a number above 100 for DeepSeek, any number for the other models) stops
@@ -512,10 +515,12 @@ model (GLM, DeepSeek, MiniMax) - beside the GLM engine's own check for short pat
   already said - and the agent stops there while the work is not done. Such an answer goes on: a short user message,
   marked as the server's, follows it ("do not stop here, the task is not done: take the next concrete step") and the
   model continues in the same answer. An answer with anything new in it - a finding, an answer to the user, one line
-  of it - ends the turn as always, however short it is, and so does any answer after 3 such notes in one answer. The
-  reasoning is not re-opened: it was closed before the answer went out, so the model goes on in the answer's own
-  channel (a client sees the answer continue, not its thinking rewritten). Counted in `loop_guard.kept_going` and
-  `maya:loop_guard_kept_going_total`.
+  of it - ends the turn as always, however short it is, and so does any answer after 3 such notes in one answer. An
+  answer to the user is never kept going: when the request ends with a user message, not a tool result, the model is
+  answering the user, and a sentence said again across user turns is the user asking the same kind of thing again,
+  not a loop (#921). The reasoning is not re-opened: it was closed before the answer went out, so the model goes on
+  in the answer's own channel (a client sees the answer continue, not its thinking rewritten, with a paragraph break
+  before the continuation). Counted in `loop_guard.kept_going` and `maya:loop_guard_kept_going_total`.
 - **A turn-end marker inside the thinking:** a model that quotes these markers, or writes about them, wrote them in its
   thinking - and there the server ended the turn (or the engine itself, at its EOS token): the thinking was cut off
   and the answer never came. Inside the thinking such a marker is the model's text, not the turn's end: the server
@@ -799,11 +804,11 @@ them from pinned memory where they lie when that measured faster. The times are 
 in `lane-times.txt` beside the model's pack; later starts check them in a few milliseconds, and decode times both lanes
 again under load. Both lanes share the PC's memory, SSD and cores, so while answering the first tokens it also checks
 that streaming really is faster here, taking turns with the CPU lane alone (separately for tokens whose experts are all
-in RAM and tokens that read some from the SSD); where it is not at least 3% faster, it stops streaming and the times
-file keeps that verdict. It applies while answering, not while reading the prompt. That check times each layer's
+in RAM and tokens that read some from the SSD); where it is 3% slower or more, it stops streaming and the times file
+keeps that verdict - a tie keeps streaming (#697). It applies while answering, not while reading the prompt. That check times each layer's
 lanes; a second one (v1.1.25, #329) times whole tokens - runs of 8 with streaming allowed and without - because the
 streamed experts' trips through the host memory can slow the rest of a token, which no layer's own timing sees; where
-whole tokens are not at least 3% faster with it, streaming stops (kept for the next start too).
+whole tokens are 3% slower or more with it, streaming stops (kept for the next start too); a tie keeps it.
 
 With one discrete NVIDIA GPU, on Linux or Windows (a single GPU, no helper GPU - where this path was measured; AMD
 and several GPUs keep v1.1.27's path unless the settings below are set to 1, and the start's log says which path
@@ -833,6 +838,7 @@ experts left in the files); all 101 GB of copies pinned in 3.3 s.
 | `DS4_STREAM_WIN` | on with one NVIDIA GPU (Linux or Windows) where experts stream | `0`: verify windows do not stream (a single token's experts only, as before) |
 | `DS4_STREAM_SLOTS` | 16 | a verify window's streamed experts at most, a layer (1-16) |
 | `DS4_LAND` | on with one NVIDIA GPU (Linux or Windows) where experts stream | `0`: a streamed expert does not stay in VRAM, and a GGUF gets no recent slots |
+| `DS4_STREAM_ONE_WARM` | on (1) | where the RAM copies hold at least half of the CPU lane's experts, the one-GPU path (`DS4_STREAM_WIN`, `DS4_LAND`, `DS4_STREAM_ZC`) stays on only if the PCIe lane's timing streams some experts that are all in RAM; else it ends after the timing and the next start places the experts without the recent slots (`lane-times.txt` in the pack keeps it; delete it to measure again). `0`: a split of experts read from the disk keeps the path too, as in v1.1.57 (#920) |
 | `DS4_RECENT` | 32 (a GGUF: with `DS4_LAND`) | the recent slots a layer (VRAM slots taken from the profile's coldest experts) |
 | `MAYA_DS4_RECENT_FIT` | off (0) | `1`: a layer whose VRAM slots cannot hold the whole `DS4_RECENT` set beside one profile expert and the cache's spare (it gets no recent slots at all otherwise - on the 2.25bpw EXL3 DeepSeek pack with its profile, the 2.5-bit layers keep 18-34 slots, so ten of them have none) keeps as many recent slots as leave one of each; `2`: also the placement gives each layer its recent set, one profile expert and the spare first, then the slots past them by the profile experts they add (where that does not fit: as `1`). Each profile expert that leaves VRAM for a recent slot keeps a copy in RAM: the start's `DS4_RECENT_FIT` line says how many and about how many GB (2.7 / 3.5 GB on that pack). Only which side computes an expert changes, so the answers can differ in the last bits. Not on an EXL3 lender's layers (`DS4_EXL3_LEND`) or the drafter's |
 | `MAYA_DS4_PIN_BY_NEED` | off (0); on for Windows' one-GPU path | where the system cannot lock every expert copied into RAM for the GPU (Windows locks about half the RAM): `1` pins them a layer at a time, the layers whose copies the routing profile uses most first, until a pin fails or `MAYA_DS4_PIN_GB` is reached; the GPU pulls those in place, the rest go through the staging. Without it a pin that fails leaves every copy to the staging (an RTX 3090, Maya-XS, 101 GB of copies held to 50 GB pinned: decode 16.3 -> 20.3 tokens/s; all of them pinned: 29.0). A GPU that does not address registered memory at its host address (Windows' WDDM) takes its mapped address, with one GPU |
@@ -1160,7 +1166,7 @@ on are used (`taskset`, a container's cpuset).
 | `MAYA_DS4_LANE_SPIN_US` | 20000 | the lane's workers spin this many us idle before they sleep (0 .. 1000000): a decode hands the lane work on few layers, and on an APU a shorter spin leaves the integrated GPU more of the shared power (the answers are the same) |
 | `MAYA_DS4_CPU_SPLIT_COLS` | off | `1`: a call of few EXL3 experts on the lane (a decoded token's one or two a layer) has its gate / up and down pieces cut by columns too, so more of the lane's threads share it. A step is cut only where its pieces would leave threads idle for a whole piece (fewer than 8 jobs a thread), into the equal runs that take the fewest rounds; a call of more experts runs as before. Each output is the same sum in the same order, so the answers are the same bit for bit (`ds4_cpu_split_test` checks it; with the engine's own `DS4_CPU_FLOW_CHECK=1` - that bare name, in the config's `"env"`, as the engine reads no `MAYA_` or `STRATA_` name of it - each call is checked against the uncut steps). Off until measured: it may help where the lane has many threads for the few experts a layer leaves it |
 | `MAYA_DS4_CPU_W16` | off | `1`: on a CPU whose lane runs the AVX2 tier (no AVX-512), the EXL3 experts' codebook products and byte sums are computed in 16-bit lanes, a tile row's two halves at once (an expert's call of 1-3 tokens; 4 or more keep the 32-bit path) - fewer of the uops that Haswell and Broadwell run on one port only. The same byte sums and the same float steps, so the answers are the same bit for bit (`exl3_cpu_w16_test` checks it; `DS4_CPU_W16_CHECK=1`, the engine's bare name, checks each lane call against the 32-bit path). The log says whether it took (`ds4: CPU lane: EXL3 codebook products in 16-bit lanes on`); other tiers ignore it. Off until measured: CPUs with more integer-multiply ports (AMD Zen) may not gain |
-| `MAYA_EXL3_AVX2_SHUF` | off | `1`: on a CPU whose EXL3 CPU lane runs the AVX2 tier (no AVX-512), the trellis windows that start on a byte boundary (a shift of 8, 16 or 24 bits) are cut out with byte shuffles instead of vector shifts - on Haswell and Broadwell every vector shift shares the one port the codebook multiplies are bound by. Read by the EXL3 CPU kernels, so every model's CPU lane takes it (`STRATA_EXL3_AVX2_SHUF=1` when an engine is started directly). The same states, so the answers are the same bit for bit (`exl3_cpu_shuf_test` checks it); at its first call the kernel also checks the shuffles against the shifts on random weights and stays off if any output differs, with one line in the log either way (`EXL3 CPU lane: STRATA_EXL3_AVX2_SHUF=1, ... start check 0 of N outputs differ - on`). Other tiers ignore it. Off until measured: CPUs with two vector-shift ports may not gain |
+| `MAYA_EXL3_AVX2_SHUF` | off | `1`: on a CPU whose EXL3 CPU lane runs the AVX2 tier (no AVX-512), the trellis windows that start on a byte boundary (a shift of 8, 16 or 24 bits) are cut out with byte shuffles instead of vector shifts - on Haswell and Broadwell every vector shift shares the one port the codebook multiplies are bound by. Read by the EXL3 CPU kernels, so every model's CPU lane takes it (`MAYA_EXL3_AVX2_SHUF=1` when an engine is started directly). The same states, so the answers are the same bit for bit (`exl3_cpu_shuf_test` checks it); at its first call the kernel also checks the shuffles against the shifts on random weights and stays off if any output differs, with one line in the log either way (`EXL3 CPU lane: MAYA_EXL3_AVX2_SHUF=1, ... start check 0 of N outputs differ - on`). Other tiers ignore it. Off until measured: CPUs with two vector-shift ports may not gain |
 
 ## DeepSeek: IQ1_S experts on AMD Zen, Zen+ and Zen 2 CPUs
 
@@ -1378,6 +1384,65 @@ themselves more in the thinking; a direction refitted on thinking-on prompts did
 | `--ablate FILE` (the config's engine `args`) | off | a control vector or a whole-model abliteration adapter (GGUF) |
 | `--ablate-layer N` | the adapter's, or a one-direction file's | which `direction.N` of a control vector (1-4096) |
 | `--ablate-scale F` | the adapter's `abliterate.scale` (x `adapter.lora.alpha`), else 1 | s, 1e-6 to 1e6; 1 removes the component along r, above 1 over-projects |
+
+## Refusal ablation per request (`ablate`)
+
+The direction above can be switched on and off per request, with no restart: the engine loads it once and each
+request says whether its passes project it out. One name on every API: `"ablate": true` or `false` on OpenAI's Chat
+Completions and Responses, Anthropic's Messages and Maya's model API (`/api/chat`, `/api/generate`: top level or in
+`options`). A request that leaves it out takes the model's default, the Models page's **Refusal ablation** switch
+(stored as the config's `ablate.default`, applied at once). The web chat has its own switch per chat (Settings, under
+the sampling settings), which starts at the model's default. Off by default everywhere.
+
+The switch is there only when the model has a direction file and its engine projects one: DeepSeek (`maya-ds4`),
+MiniMax (`maya-mm3`, not with `--tp`: the tensor-parallel path does not project), and GLM-5.3-Flash and GLM-5.3
+(`maya --glm-pack ... --ablate FILE`, a control vector of the model's hidden size; not on the Mac engine). Qwen has
+none. Maya's own direction files are published for DeepSeek-V4.1-Flash, MiniMax-M3.1-Flash, GLM-5.3-Flash and GLM-5.3 (the setup
+downloads them, see below); for another model `tools/ablate_fit.py` fits one. On GLM the projection covers every write of the
+main layers on every path - the decode token, the verify windows, the batched rows of `--parallel` (each row by its
+own conversation), the prompt chunks, every card of a split and the experts the CPU lane computes (they join the FFN
+output before it is projected; the lossy `MAYA_GLM_DEFER_CPU` deferral is skipped for a projecting conversation). The
+draft heads (the MTP block, DFlash) only propose tokens and are left as they are: the main layers check every draft,
+so the tokens kept are the ablated model's. Without a file, the Models page
+and the Chat show no switch, `/health` and `/props` say `"ablate": {"available":
+false, ...}`, and a request with `"ablate": true` gets a 400 (an answer that came back unchanged could not be told from
+one that was ablated).
+
+How it runs: the server starts the engine with `--ablate FILE --ablate-default off`, and the engine says `INFO
+ablate=1` when the direction is loaded. A request with ablation on carries `ablate=1` on its engine line; one with it
+off carries nothing, so its line and its answer are the same as without a direction file. Under `--parallel` each
+conversation has its own setting: a step that holds several conversations projects only the rows of those that asked
+(the projection is a block per row, so a projected row has the same bits as with the startup flag, and the others
+are not touched). A conversation's cache was read with one setting: a request with the other one starts it over (no
+cached prefix, restore point, kept conversation or shared start is reused across the two), and an ablated
+conversation is not kept as a slot or a shared start.
+
+| Setting | Default | |
+| --- | --- | --- |
+| `ablate` (request field) | the model's default | `true` / `false`; `true` needs a loaded direction (else a 400) |
+| Models page: Refusal ablation | off | the default for requests that leave `ablate` out (no restart) |
+| `--ablate-default on\|off` (engine) | on (the startup flag as before) | off: loaded, projected only for requests with `ablate=1` |
+
+**Direction files.** A model's repo can ship `<Model>-refusal-direction.gguf` in its `refusal-directions/` folder: a control vector
+GGUF (`general.architecture` `controlvector`, one F32 tensor `direction.1` of the model's hidden size) with
+`maya.ablate.scale` (its strength; `--ablate-scale` overrides it), `maya.ablate.fit_layer` (the layer it was taken
+at), `maya.ablate.model`, `maya.ablate.fitted_on` (the quant it was fitted on) and `maya.ablate.version`. A config
+names it as `"ablate": {"file": "<path>", "fitted_on": "<quant>"}` (optional `"scale"`), with `--ablate FILE
+--ablate-default off` in its engine `args`. The setup downloads the file from the `refusal-directions/` folder of the
+model's own Maya repo, or from the repo's top when that folder has none (`GLM-5.3-Flash`, `GLM-5.3`,
+`DeepSeek-V4.1-Flash` and `MiniMax-M3.1-Flash-refusal-direction.gguf`, a few KB, into
+`<models folder>/refusal-directions/`), and writes both; when the repo has none yet, there is no connection or the file
+is not a direction for that model, the setup goes on without it and the switch stays off. A file named by hand (outside
+that folder) is kept as it is.
+
+**Fitting a direction** (`tools/ablate_fit.py`): `prompts` writes the prompt sets (harmful and harmless, each split
+into fitting and held-out prompts, and everyday prompts for coherence); `probe` writes a random direction of the
+model's hidden size; with `MAYA_ABLATE_CAPTURE=<file>` set for the engine and the probe as the config's direction,
+`collect` sends each prompt once with `"ablate": true` and one token to generate - the engine then reads out every
+residual write of the prompt's last token into the file instead of projecting - and `fit` takes the difference of the
+two sets' mean residual at each layer, ranks the layers on the held-out prompts and writes the best one's direction
+with its `maya.ablate.*` metadata. `eval` measures a direction against a normal server: the refusal rate on the
+held-out prompts with ablation off and on, and loops, empty answers and length on the everyday prompts.
 
 ## DeepSeek: tensor parallel 2 on Maya's own quants
 
@@ -1605,7 +1670,7 @@ DOT2 arithmetic order. Decode/verification-window kernels are unchanged.
 
 The cutoffs are nonnegative integers (`0` always selects the larger tile); invalid or overflowing values use their
 documented defaults. They are starting points from a small R9700 study, not tuning recommendations for every card.
-Serving configs use `MAYA_*`; native launches also accept `STRATA_*` or the unprefixed `EXL3_*` names. See
+Serving configs use `MAYA_*`; native launches also accept the unprefixed `EXL3_*` names. See
 [EXL3_HIP_SCALAR_ROWS.md](EXL3_HIP_SCALAR_ROWS.md) for the measured scope and reproducer.
 
 ## DeepSeek: packed EXL3 tensor-parallel cache transfers
@@ -2181,6 +2246,46 @@ Engine options, in the config's `"args"`:
 | `MAYA_EXPERT_RAM_GB` | unset (what the RAM allows) | caps the experts' RAM tier, in GB (the dashboard's Models page: Experts in RAM) |
 | `MAYA_EXPERT_STAGERS` | Linux: the reads at once the model's drive serves fastest (2, 4, 8 or 16, measured in ~1 s at the first start on a drive and kept in `~/.config/project-maya/drive-reads.txt`; `MAYA_EXPERT_DRIVE_PROBE=0` skips the measurement); otherwise a quarter of the CPU threads, 2 to 8 | the threads that read a layer's experts from the file while the CPU prepares the layer (their reads overlap); `0`: read one by one when the CPU needs them |
 
+## GLM-5.3 (744B)
+
+GLM-5.3 ([the model's page](GLM53.md)) runs on the same engine as GLM-5.3-Flash, so the GLM settings above apply to it
+too (the expert tiers, the CPU lane, `MAYA_GLM_SPLIT`, `MAYA_GLM_PREFETCH_*`, `MAYA_GLM_ROW_HALVES`, the thinking
+budget, ...). Its thinking budget is 32768 tokens by default - also at Max, its default level - and up to 65536 for a
+request that asks for Max itself (its own `reasoning_effort` / `output_config.effort` / `thinking`, or a Max picked in
+the web chat), as far as its `max_tokens` or the context left keeps 32768 tokens for the answer, while the budget is
+that default; a budget the user set (the dashboard's field, or another `"thinking_budget"` in the config) applies at
+every level ([the model's page](GLM53.md#its-defaults)). Its own:
+
+| Setting | Default | What it does |
+|---|---|---|
+| `MAYA_GLM_KV_INT8` | on (1) | its latent cache in INT8: 64,352 bytes a token; `0` (or `--kv fp16`): FP16, 102,272 bytes a token |
+| `MAYA_GLM_IDX_FP16` | off | `1`: the indexer's keys in FP16 instead of F32 (58,720 bytes a token with the INT8 latent); the indexer picks from FP16 scores, so the answers can differ |
+| `MAYA_GLM_DSA_GRAPHS` | off | `1`: a token's attention steps run as GPU graphs (fewer launches a token). A request can turn them off for itself (`"graphs": false`, below) |
+| `MAYA_GLM_LANE_ROW4` | on | `0`: off. On, the CPU lane computes four rows of an expert's matrix at once (x86-64 CPUs with AVX2, FMA and F16C; other CPUs ignore it), with the same results bit for bit; a request can switch it (`lane_row4`) |
+| `MAYA_GLM_NGRAM_DRAFT` | off | `1`: where the conversation repeats itself (edits, quoted code, tool-call arguments), the tokens that followed the earlier occurrence are drafted instead of the MTP block's (`MAYA_GLM_NGRAM_MIN`, default 3: the shortest match that drafts; `MAYA_GLM_NGRAM_MAX`, default 4, at most 8: the longest draft); the model checks every drafted token, as it checks the MTP block's |
+| `MAYA_GLM_PROMPT_CACHE_DIR` | unset (off) | a folder on a fast SSD: the conversation the engine holds is saved there before another one takes its place, and a later prompt that starts with a saved conversation goes on from it instead of reading that part again. `MAYA_GLM_PROMPT_CACHE_GB` caps the folder (64), `MAYA_GLM_PROMPT_CACHE_MIN` (512 tokens) is the shortest one kept, `MAYA_GLM_PROMPT_CACHE_MAX` (64) the number kept. The kept-conversation slots are off while it is on |
+| `MAYA_GLM_SPLIT_CARDS` | unset | `"<free GiB>:<GB/s>[:<name>],..."`, one entry for each GPU the engine is given: the layer split is planned for those cards instead of the ones it finds - to see the split another set of cards would get (`MAYA_GLM_SPLIT_LOG=1` prints every placement it weighed) |
+
+**A request's own engine settings.** A request to GLM-5.3 can set these in its `"strata_tune"` object (beside
+`pcie_frac`, `cpu_threads`, `read_chunks` and `spec`); the engine applies them from the request's first token and puts
+every one the request leaves out back to how it started, so a request without them runs exactly as the engine
+started. A value out of range, or of the wrong type, is dropped.
+
+| Key | Values | The start setting it overrides |
+|---|---|---|
+| `promote_min` | 0..65535 | `MAYA_GLM_PROMOTE_MIN` |
+| `prefetch_n` | 0..2 | `MAYA_GLM_PREFETCH_N` (above 0 the decode graphs stay off) |
+| `prefetch_at` | `route`, `fetch`, `cpu` | `MAYA_GLM_PREFETCH_AT` |
+| `prefetch_rank` | 0..64 | `MAYA_GLM_PREFETCH_RANK` (0: any rank) |
+| `prefetch_blocks` | 0..1024 | `MAYA_GLM_PREFETCH_BLOCKS` (0: half the GPU's SMs) |
+| `mtp_keep` | 0..8 | `MAYA_GLM_MTP_KEEP` |
+| `cpu_split` | 0..64 | `MAYA_GLM_CPU_SPLIT` (0: about 48 pieces in all) |
+| `vram_evict` | `lfu`, `lru` | `MAYA_GLM_VRAM_EVICT` |
+| `ngram` | true / false | `MAYA_GLM_NGRAM_DRAFT` |
+| `lane_row4` | true / false | `MAYA_GLM_LANE_ROW4` |
+| `graphs` | true / false | false: this request decodes without the attention's CUDA graphs |
+| `pcie_frac_head` | 0..1 | the CPU lane's share for the parts of a draft's verification head (the rest keep `pcie_frac`) |
+
 ## HIP EXL3 single-row matrix jobs
 
 HIP automatically uses a smaller EXL3 matrix-vector kernel when every job in a batch has one activation row.
@@ -2225,13 +2330,13 @@ rules and current capability limits.
 
 | Setting | Default | Purpose |
 |---|---|---|
-| `STRATA_GLM_EXPERT_PLUGIN` | unset | Absolute executor library path; opt-in. |
-| `STRATA_GLM_EXPERT_PLUGIN_DEVICE` | required with plugin | Helper runtime's device ordinal. |
-| `STRATA_GLM_EXPERT_PLUGIN_MIB` | required with plugin | Helper allocation budget, including scratch. |
-| `STRATA_GLM_EXPERT_PLUGIN_READ` | off | Read helper weights for CUDA prefill. |
-| `STRATA_GLM_EXPERT_PLUGIN_PREFILL_SHARE` | `0` | Helper prefill row-fraction cap, `0..0.49`. |
-| `STRATA_GLM_EXPERT_PLUGIN_PREFILL_MAX_ROWS` | `16` | Per-expert prefill admission limit. |
-| `STRATA_GLM_HELPER_COST` | `0` | Opt into measured-cost prefill admission for the external helper. Requires a positive helper prefill share; retains share and buffer bounds. See [cost-based admission](EXPERT_PLUGIN.md#cost-based-prefill-admission). |
-| `STRATA_GLM_HELPER_COST_TRACE` | `0` | Print observed per-layer helper/staging costs for diagnosis, including with adaptive admission off. Keep off for throughput tests. |
-| `STRATA_GLM_EXPERT_PLUGIN_PRESTAGE` | `0` | Per-layer helper-backed prestage cap. |
-| `STRATA_GLM_HELPER_ZEROCOPY` (external executor) | off | Opt into mapped decode buffers on integrated devices. |
+| `MAYA_GLM_EXPERT_PLUGIN` | unset | Absolute executor library path; opt-in. |
+| `MAYA_GLM_EXPERT_PLUGIN_DEVICE` | required with plugin | Helper runtime's device ordinal. |
+| `MAYA_GLM_EXPERT_PLUGIN_MIB` | required with plugin | Helper allocation budget, including scratch. |
+| `MAYA_GLM_EXPERT_PLUGIN_READ` | off | Read helper weights for CUDA prefill. |
+| `MAYA_GLM_EXPERT_PLUGIN_PREFILL_SHARE` | `0` | Helper prefill row-fraction cap, `0..0.49`. |
+| `MAYA_GLM_EXPERT_PLUGIN_PREFILL_MAX_ROWS` | `16` | Per-expert prefill admission limit. |
+| `MAYA_GLM_HELPER_COST` | `0` | Opt into measured-cost prefill admission for the external helper. Requires a positive helper prefill share; retains share and buffer bounds. See [cost-based admission](EXPERT_PLUGIN.md#cost-based-prefill-admission). |
+| `MAYA_GLM_HELPER_COST_TRACE` | `0` | Print observed per-layer helper/staging costs for diagnosis, including with adaptive admission off. Keep off for throughput tests. |
+| `MAYA_GLM_EXPERT_PLUGIN_PRESTAGE` | `0` | Per-layer helper-backed prestage cap. |
+| `MAYA_GLM_HELPER_ZEROCOPY` (external executor) | off | Opt into mapped decode buffers on integrated devices. |

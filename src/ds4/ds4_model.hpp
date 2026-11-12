@@ -71,6 +71,9 @@ struct Options {
     std::string ablate;
     int ablate_layer = 0;
     float ablate_scale = 0.0f;
+    // whether a conversation projects the direction out until set_ablate() says otherwise (--ablate-default on|off;
+    // the server loads the direction with off and turns it on per request, GEN ablate=1)
+    bool ablate_default = true;
     // --parallel: conversations held at once (1-8), each its own state - its position, tokens, checkpoints, window rings,
     // the compressors' partial groups, the compressed KV and the index keys (a full context's each); 1: as before
     int seqs = 1;
@@ -123,7 +126,7 @@ struct Stats {
     int64_t eg_cached = 0, eg_cache_cap = 0;          // the row cache's rows held, its capacity
     int64_t eg_cache_row_bytes = 0;                   // each cached row's payload bytes
     int64_t swaps = 0;                // experts the cache moved into VRAM
-    int64_t skipped = 0;              // routed experts STRATA_DS4_DISK_SKIP_W left out (light, not in RAM)
+    int64_t skipped = 0;              // routed experts MAYA_DS4_DISK_SKIP_W left out (light, not in RAM)
     int skip_on = -1;                 // DISK_SKIP_AUTO: 1 skipping, 0 off (warm), -1 not in use
     int64_t skip_switches = 0;        // ... the times it switched
     double skip_cold = 0.0;           // ... the cold share over its window (while skipping)
@@ -195,6 +198,13 @@ public:
     /// request's sampling (-100 bans the token).  The drafter's own proposals are not biased; the verify judges them
     /// by the biased logits.  Empty: none, the picks exactly as without.
     void set_logit_bias(const std::vector<std::pair<int, float>>& entries);
+    /// Abliteration per conversation (Options::ablate): ablate_loaded() whether a direction is loaded; set_ablate(on)
+    /// whether the bound conversation's passes project it out from here (a multi step's rows each by their own
+    /// conversation's); ablating() as set (at load: Options::ablate_default).  The state a conversation holds was read
+    /// with one setting: the serve loop starts it over when a request asks for the other.  No direction: no-ops, false.
+    bool ablate_loaded() const;
+    void set_ablate(bool on);
+    bool ablating() const;
     /// The request's log-probabilities (GEN logprobs=<k>, ds4_logprobs.hpp) for every pick after this - sample(),
     /// sample_multi(), verify() and verify_multi() alike: logprobs() then holds a row for each token the pick returned
     /// (verify: the accepted drafts, then the token after them), each its token's logprob and its row's top k, from the

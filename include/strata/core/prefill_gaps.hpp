@@ -1,5 +1,5 @@
 #pragma once
-// STRATA_GLM_PREFILL_GAPS=<percent>[,<max gap ms>]: while a new prompt is read on a split (the parts pipeline its chunks:
+// MAYA_GLM_PREFILL_GAPS=<percent>[,<max gap ms>]: while a new prompt is read on a split (the parts pipeline its chunks:
 // part 1 on chunk c while part 0 is on c + 1), the other requests decode at the chunk boundaries - every part idle, the
 // expert pool's tail still lent, the pipeline not drained - for about <percent>% of the time (the gap after a stage
 // lasts percent / (100 - percent) of that stage, a decode round at least, at most <max gap ms>).  The prompt is read
@@ -7,7 +7,7 @@
 // the next chunk can find other experts resident, staged or on the CPU lane than the uncut read does, and sum their
 // outputs in another order.  A running request waits about one stage instead of the whole read (a gap whose round
 // overruns <max gap ms> ends the gaps of that read: Glm5Model::prefill_gap_wanted).
-// Unlike STRATA_GLM_PREFILL_INTERLEAVE, which reads the prompt in separate calls (each one fills and drains the
+// Unlike MAYA_GLM_PREFILL_INTERLEAVE, which reads the prompt in separate calls (each one fills and drains the
 // pipeline), the read stays one call.
 //
 // The boundaries, counted by part 0's chunks: boundary b comes after part 0 has read chunk b (b = 0 .. nc - 2).  At
@@ -22,7 +22,7 @@ struct PrefillGaps {
     double max_ms = 4000.0;   // the longest gap (the read's own stall bound)
 };
 
-/// STRATA_GLM_PREFILL_GAPS's text (null: unset) -> the setting; the share is 1..90 percent.
+/// MAYA_GLM_PREFILL_GAPS's text (null: unset) -> the setting; the share is 1..90 percent.
 inline PrefillGaps prefill_gaps_parse(const char* v) {
     PrefillGaps r;
     if (v == nullptr || v[0] == '\0') return r;
@@ -44,7 +44,7 @@ inline double prefill_gap_budget_ms(const PrefillGaps& g, double stage_ms) {
 
 /// Is a gap at this chunk boundary due: the budget the read earned since the last gap (prefill_gap_budget_ms of the
 /// stage since then) is half a decode round (round_ms: the last gap's round; 0, not known yet: due) or more.  A gap is
-/// one round at least, so with short chunks (STRATA_GLM_PREFILL_MIN_CHUNKS) a gap at every boundary would take more
+/// one round at least, so with short chunks (MAYA_GLM_PREFILL_MIN_CHUNKS) a gap at every boundary would take more
 /// than the share; a boundary that is not due adds its stage to the next one's.
 inline bool prefill_gap_due(const PrefillGaps& g, double stage_ms, double round_ms) {
     if (g.percent <= 0) return false;

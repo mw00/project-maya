@@ -29,6 +29,7 @@
 #include <thread>
 #include <tuple>
 
+#include "../core/ablate_capture.hpp"   // (MAYA_ABLATE_CAPTURE: the direction fitting's read-out)
 #include "mm3_ablate.hpp"
 #include "mm3_cands.hpp"
 #include "mm3_cpu.hpp"
@@ -421,9 +422,36 @@ struct Model::Impl {
     // --ablate (mm3_ablate.hpp): the unit direction (empty: off; a copy on every GPU, Dev::abl_r) and its scale
     std::vector<float> abl_dir;
     float abl_scale = 0.0f;
-    // a residual write y [T][dim] (the attention's or the FFN's, before h += y) loses its component along it
+    // ... per sequence whether its forwards project it out (set_ablate; empty: no direction)
+    std::vector<uint8_t> abl_on;
+    bool abl_row(int s) const { return s >= 0 && s < (int) abl_on.size() && abl_on[(size_t) s] != 0; }
+    // whether any row of this forward (T rows: forward_rows' rseq, else the bound sequence's) projects it out - the
+    // prompt path's split products (gemm_acc, the MoE's write into out) only then, else its fused adds as without
+    bool abl_any(const Dev& d, int T) const {
+        if (d.abl_r == nullptr || abl_on.empty()) return false;
+        if (rseq.empty() || (int) rseq.size() != T) return abl_row(bound);
+        for (int s : rseq)
+            if (abl_row(s)) return true;
+        return false;
+    }
+    // a residual write y [T][dim] (the attention's or the FFN's, before h += y) loses its component along it - the rows
+    // whose sequence asks, a run of rows of one setting at a time (the kernel is a block a row: a row comes out the same
+    // whatever else the launch holds; a row left out is not touched)
     void ablate(const Dev& d, float* y, int T) const {
-        if (d.abl_r != nullptr) k::project_out(y, d.abl_r, abl_scale, T, g.dim, d.s);
+        if (d.abl_r == nullptr || abl_on.empty()) return;
+        if (rseq.empty() || (int) rseq.size() != T) {
+            if (!abl_row(bound)) return;
+            if (strata::ablcap::on()) return strata::ablcap::put(y, T, g.dim, d.s);   // (a fitting run: read out)
+            k::project_out(y, d.abl_r, abl_scale, T, g.dim, d.s);
+            return;
+        }
+        for (int t = 0; t < T;) {
+            const bool on = abl_row(rseq[(size_t) t]);
+            int u = t + 1;
+            while (u < T && abl_row(rseq[(size_t) u]) == on) ++u;
+            if (on) k::project_out(y + (size_t) t * g.dim, d.abl_r, abl_scale, u - t, g.dim, d.s);
+            t = u;
+        }
     }
 
     // ---- MAYA_MM3_PROF=1 (one GPU): each forward's GPU time by part, from events on the stream - the time between two
@@ -1019,6 +1047,7 @@ struct Model::Impl {
             std::string what;
             if (!::mm3::ablate::load(o.ablate,o.ablate_layer, g.dim, abl_scale, abl_dir, what, err)) return false;
             info.push_back(what);
+            abl_on.assign((size_t) std::max(1, o.seqs), o.ablate_default ? 1 : 0);
         }
         gguf = pk.str("format") == "gguf";
         if (gguf) {   // (the prompt GEMMs' backend; hipBLASLt's measured kernels kept beside the pack)
@@ -1683,7 +1712,8 @@ struct Model::Impl {
             }
             graph_on = (gv == nullptr || std::atoi(gv) != 0) && D.size() == 1 && nhf > 0 && nhf == nmoe &&
                        !o.verbose &&
-                       ::mm3::env("MM3_DUMP_HS") == nullptr;
+                       ::mm3::env("MM3_DUMP_HS") == nullptr &&
+                       !strata::ablcap::on();   // (a fitting run's read-out waits on the host: not in a capture)
             if (graph_on) info.push_back("decode: a token's and a verify window's forward replayed as a graph");
         }
         for (Dev& d : D) {
@@ -2571,7 +2601,7 @@ struct Model::Impl {
         // h += x W: the BLAS's beta 1; with hipBLASLt (beta 0 products only) or --ablate the product into ao, then the
         // add - the same sum of the product and h (projected first: ablate)
         const auto gemm_acc = [&](const x3::Mat& m, const uint16_t* x16, int ldx) {
-            if ((gguf && gg::gemm_backend() == 1) || d.abl_r != nullptr) {
+            if ((gguf && gg::gemm_backend() == 1) || abl_any(d, T)) {
                 x3::gemm_rows(m, x16, ldx, T, d.ao, g.dim, 0.0f, d.s);
                 ablate(d, d.ao, T);
                 k::add(d.h, d.ao, (size_t) T * g.dim, d.s);
@@ -2650,7 +2680,7 @@ struct Model::Impl {
         st.profiled += (long) top.size();
         pmark(d, kPSync);
         if (!experts(l, d, T, top, err)) return false;
-        if (d.abl_r != nullptr) {   // (--ablate: the MoE's write alone into out, projected, then added to h)
+        if (abl_any(d, T)) {   // (--ablate: the MoE's write alone into out, projected, then added to h)
             k::moe_combine(nullptr, d.y, d.invrow, d.w, d.sh, T, g.k_exp, g.dim, g.scale, d.out, d.s);
             ablate(d, d.out, T);
             k::add(d.h, d.out, (size_t) T * g.dim, d.s);
@@ -3204,6 +3234,16 @@ bool Model::load(const Options& o_in, std::string& err) {
             return ok;
         }
     }
+    if (o.tp > 0 && !o.ablate.empty() && !o.ablate_default) {
+        // (--ablate-default off - the server's per-request switch: the tensor-parallel path the user picked stays, the
+        //  direction is not loaded - no INFO ablate, so the page says the switch is not there with --tp)
+        Options o2 = o;
+        o2.ablate.clear();
+        const bool ok = load(o2, err);
+        p->info.insert(p->info.begin(), "NOTE: --tp " + std::to_string(o.tp) + ": no --ablate (the tensor-parallel "
+                                        "path does not project; the layer split does)");
+        return ok;
+    }
     if (o.tp > 0 && !o.ablate.empty()) {   // (--ablate: the layer split's residual writes - not the host's sums)
         Options o2 = o;
         o2.tp = 0;
@@ -3419,6 +3459,11 @@ int Model::seqs() const { return tpe || p->L.empty() ? 1 : (int) std::max<size_t
 void Model::bind(int s) {
     if (!tpe) p->bind(s);
 }
+bool Model::ablate_loaded() const { return !tpe && !p->abl_on.empty(); }
+void Model::set_ablate(bool on) {
+    if (ablate_loaded() && p->bound >= 0 && p->bound < (int) p->abl_on.size()) p->abl_on[(size_t) p->bound] = on ? 1 : 0;
+}
+bool Model::ablating() const { return ablate_loaded() && p->abl_row(p->bound); }
 
 bool Model::forward_rows(const int* ids, const int* seq, const int* pos, int R, float* logits_out, std::string& err) {
     if (R <= 0) return true;

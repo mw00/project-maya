@@ -79,7 +79,7 @@ bool down(const Args& a, int groups, int ne_max, cudaStream_t s);
 /// [bounds[i], bounds[i + 1]) (local row = sorted row - row0); gate / up: h16[local] = F16 swiglu over x[idx[local]]
 /// (F32 rows, ldx); down: y[local] = down(h16[local]) (F16 rows in, ldx; F32 out, ldo).  A set's experts of at most 16
 /// rows take the token kernels' form (each weight read once, the rows' inputs rounded to int8 per 32 as the token path
-/// rounds them; STRATA_DS4_NO_LIGHT=1: never), the others GEMM tiles (tensor cores on CUDA, F16 operands).
+/// rounds them; MAYA_DS4_NO_LIGHT=1: never), the others GEMM tiles (tensor cores on CUDA, F16 operands).
 struct SetArgs {
     const uint8_t* wbase = nullptr;
     size_t stride = 0;
@@ -116,7 +116,7 @@ private:
     int previous_rows_;
     const int* previous_bounds_;
 };
-// The prompt set's scratch for its int8 activations (the fused experts, STRATA_DS4_PREFILL_FUSED): the caller's down
+// The prompt set's scratch for its int8 activations (the fused experts, MAYA_DS4_PREFILL_FUSED): the caller's down
 // output rows, which the set's gate / up leaves unused until its down writes them; nested scopes restore their caller's.
 class FusedScratchScope {
 public:

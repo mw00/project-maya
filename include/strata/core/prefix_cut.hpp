@@ -2,8 +2,8 @@
 // The end of a prompt's system prompt as a cut of its read (generate.cpp's prep_prompt): the state there goes into a
 // conversation slot of its own (slot_prefix, #179), so another conversation with the same system prompt and tools - a
 // new conversation of the same client, another request of the same kind - restores it instead of reading it all
-// again.  The one-conversation path cuts there through its checkpoint marks; without checkpoints (STRATA_GLM_CKPTS=0,
-// and the several-conversation scheduler, which keeps none) the cut comes from here (STRATA_GLM_PREFIX_CUT=0: not).  CPU
+// again.  The one-conversation path cuts there through its checkpoint marks; without checkpoints (MAYA_GLM_CKPTS=0,
+// and the several-conversation scheduler, which keeps none) the cut comes from here (MAYA_GLM_PREFIX_CUT=0: not).  CPU
 // only, no state.
 #include <algorithm>
 #include <cstddef>

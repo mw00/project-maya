@@ -41,7 +41,7 @@ def fake_requests(cfg):
     return [7, 7, 7], [[i, i] for i in range(len(CD.QUESTIONS))], 8000
 
 
-BASE = {"args": ["--glm-pack", "pack", "--max-context", "32768"], "env": {"STRATA_GLM_USAGE": "0"},
+BASE = {"args": ["--glm-pack", "pack", "--max-context", "32768"], "env": {"MAYA_GLM_USAGE": "0"},
         "sampling": {"temperature": 1.0, "top_p": 0.95}}
 
 
@@ -60,6 +60,21 @@ def calibrate(other_tok_s, dflash_tok_s, **kw):
 
 
 class Measure(unittest.TestCase):
+    def test_the_mixed_probe_answers_the_mixed_requests(self):
+        asked = []
+
+        def mixed_requests(cfg, doc_tokens=CD.DOC_TOKENS, mixed=False):
+            asked.append(mixed)
+            return [5], [[i] for i in range(len(CD.MIXED))], 0
+        eng = FakeEngine(10.0)
+        with patch.object(CD, "requests", mixed_requests):
+            res = CD.run(BASE, BASE, say=lambda *a: None, start_engine=lambda c: eng,
+                         size={"mixed": True, "tokens": 512, "answer": 128, "warm": 32})
+        self.assertEqual(asked, [True])
+        self.assertEqual(res["other"]["answers"], len(CD.MIXED))       # one answer of each kind
+        self.assertEqual([r[0] for r in eng.requests[1:len(CD.MIXED) + 1]], [(i,) for i in range(len(CD.MIXED))])
+        self.assertTrue(any(t for _, t in CD.MIXED) and not all(t for _, t in CD.MIXED))   # thinking and answers
+
     def test_dflash2_is_kept_only_when_clearly_faster(self):
         res, _ = calibrate(20.0, 25.0)
         self.assertEqual(res["keep"], "dflash2")
@@ -100,8 +115,8 @@ class Measure(unittest.TestCase):
     def test_each_side_keeps_this_pcs_usage_untouched(self):
         _, eng = calibrate(20.0, 30.0)
         for side in ("other", "dflash2"):
-            self.assertEqual(eng[side + "_env"]["STRATA_GLM_USAGE"], "0")   # (usage_copy: "0" stays "0")
-            self.assertEqual(eng[side + "_env"]["STRATA_GLM_SLOTS"], "0")   # no conversations kept aside
+            self.assertEqual(eng[side + "_env"]["MAYA_GLM_USAGE"], "0")   # (usage_copy: "0" stays "0")
+            self.assertEqual(eng[side + "_env"]["MAYA_GLM_SLOTS"], "0")   # no conversations kept aside
 
     def test_no_learned_profile_or_trace_is_written(self):
         base = {**BASE, "args": BASE["args"] + ["--expert-profile", "p.bin", "--expert-profile-save", "learned.bin",

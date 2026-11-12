@@ -97,7 +97,7 @@ AC922 needs. Check that it reached the engine, since `maya.py` passes the config
 name it reads:
 
 ```sh
-tr '\0' '\n' < /proc/$(pgrep -x maya)/environ | grep GLM_NUMA       # STRATA_GLM_NUMA=0
+tr '\0' '\n' < /proc/$(pgrep -x maya)/environ | grep GLM_NUMA       # MAYA_GLM_NUMA=0
 ```
 
 ## Six GPUs, not four

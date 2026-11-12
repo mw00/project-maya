@@ -1,11 +1,11 @@
 # tests/exl3_dump_compare.cmake - v1.1.8's EXL3 kernels with the FP32 weight decode against the FP16 one, bit for bit:
-# exl3_test --dump-legacy under STRATA_GLM_EXL3_DECODE=legacy and =legacy-f32, the two files the same bytes, each run's
+# exl3_test --dump-legacy under MAYA_GLM_EXL3_DECODE=legacy and =legacy-f32, the two files the same bytes, each run's
 # start-up line naming its decode.  Unset (the default) never takes the FP32 decode; where it takes v1.1.8's kernels
 # (sm_6x / sm_7x: it must) it writes the legacy run's bytes too.
 #
 # The FP32 decode is built for sm_6x only: on compute capability 7 and later legacy-f32 is accepted and runs the FP16
 # kernels - the start-up line "exl3: CUDA<n> decodes with v1.1.8's kernels (legacy-f32 is built for sm_6x only; the
-# same bits)" and legacy_f32() false; the same bytes.  STRATA_GLM_EXL3_DECODE<n> (device n's own setting) the same,
+# same bits)" and legacy_f32() false; the same bytes.  MAYA_GLM_EXL3_DECODE<n> (device n's own setting) the same,
 # over the global setting; one that names no decode falls back to the global one.
 #
 # Each invocation writes its dumps to a directory of its own under OUT (two runs in one build directory at once, e.g.
@@ -37,7 +37,7 @@ set(_line_legacy "exl3: CUDA[0-9]+ decodes with v1\\.1\\.8's kernels\n")
 set(_line_f32 "exl3: CUDA[0-9]+ decodes with v1\\.1\\.8's kernels, FP32 decode\n")
 set(_line_f32_off "exl3: CUDA[0-9]+ decodes with v1\\.1\\.8's kernels \\(legacy-f32 is built for sm_6x only; the same bits\\)\n")
 # the environment every run starts from: no decode setting of the caller's (exl3_test runs on device 0: its own
-# setting is STRATA_GLM_EXL3_DECODE0)
+# setting is MAYA_GLM_EXL3_DECODE0)
 set(_clean_env --unset=MAYA_GLM_EXL3_DECODE --unset=STRATA_GLM_EXL3_DECODE
                --unset=MAYA_GLM_EXL3_DECODE0 --unset=STRATA_GLM_EXL3_DECODE0)
 
@@ -143,14 +143,14 @@ function(_same tag log)
 endfunction()
 
 set(_bad_all "")
-_dump(legacy log_legacy STRATA_GLM_EXL3_DECODE=legacy)
-_dump(legacy-f32 log_f32 STRATA_GLM_EXL3_DECODE=legacy-f32)
+_dump(legacy log_legacy MAYA_GLM_EXL3_DECODE=legacy)
+_dump(legacy-f32 log_f32 MAYA_GLM_EXL3_DECODE=legacy-f32)
 _dump(unset log_unset)
-# the device's own setting (STRATA_GLM_EXL3_DECODE<n>) over the global one, both ways; one that names no decode falls
+# the device's own setting (MAYA_GLM_EXL3_DECODE<n>) over the global one, both ways; one that names no decode falls
 # back to the global one
-_dump(dev-f32 log_dev_f32 STRATA_GLM_EXL3_DECODE=legacy STRATA_GLM_EXL3_DECODE0=legacy-f32)
-_dump(dev-legacy log_dev_legacy STRATA_GLM_EXL3_DECODE=legacy-f32 STRATA_GLM_EXL3_DECODE0=legacy)
-_dump(dev-invalid log_dev_invalid STRATA_GLM_EXL3_DECODE=legacy-f32 STRATA_GLM_EXL3_DECODE0=bogus)
+_dump(dev-f32 log_dev_f32 MAYA_GLM_EXL3_DECODE=legacy MAYA_GLM_EXL3_DECODE0=legacy-f32)
+_dump(dev-legacy log_dev_legacy MAYA_GLM_EXL3_DECODE=legacy-f32 MAYA_GLM_EXL3_DECODE0=legacy)
+_dump(dev-invalid log_dev_invalid MAYA_GLM_EXL3_DECODE=legacy-f32 MAYA_GLM_EXL3_DECODE0=bogus)
 _expect(legacy "${log_legacy}" plain)
 _expect(legacy-f32 "${log_f32}" f32)
 _expect(unset "${log_unset}" default)

@@ -1,6 +1,7 @@
 #pragma once
 #include <stddef.h>
 #include <stdint.h>
+#include "strata/core/expert_executor.h"
 /* Diagnostic ABI, not a production cache. Synchronous; all pointers host-owned.
  * blobs: k consecutive [gate | up | down] experts with common types and layout.
  * output: n_embd floats. No model routing decisions are made by this module. */

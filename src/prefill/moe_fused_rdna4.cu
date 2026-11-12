@@ -721,7 +721,7 @@ DeviceInfo device_info() {
 
 bool available() {
     static const bool on = [] {
-        const char* off = std::getenv("STRATA_GLM_PREFILL_FUSED");
+        const char* off = std::getenv("MAYA_GLM_PREFILL_FUSED");
         return !(off && off[0] == '0');
     }();
     if (!on) return false;

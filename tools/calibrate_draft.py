@@ -19,7 +19,7 @@ way Maya is used, and only the sustained speed counts:
   - DFlash2 is kept only when it beats the other side by more than MIN_GAIN: a tie keeps the MTP block.
 
 The engine works on a copy of this PC's expert usage file (calibrate_glm.usage_copy), writes no learned expert profile
-or routing trace (calibrate_glm.without_writes) and keeps no conversations aside (STRATA_GLM_SLOTS=0): the
+or routing trace (calibrate_glm.without_writes) and keeps no conversations aside (MAYA_GLM_SLOTS=0): the
 calibration's answers neither lead the next start's warm-up nor take the place of this PC's kept conversations.
 
     python tools/calibrate_draft.py maya-<model>.json     # measure and print; ./maya.sh --speed-calibration applies it
@@ -55,6 +55,20 @@ QUESTIONS = (              # one fresh question per answer: the expert tiers fol
     "What problems could a user run into, according to the document above, and how are they solved?",
     "Write a short blog post that announces the features described in the document above.",
 )
+# The short probe's requests (GLM-5.3's one-GPU drafting, size {"mixed": True}): what Maya writes in real use - code,
+# an explanation, plain text and the model's thinking - each a fresh chat of its own (no document read first: the probe
+# measures the writing, not a prompt).  (question, thinking): True = the config's thinking level (the answer's first
+# tokens are its thinking), False = thinking off (they are the answer itself).
+MIXED = (
+    ("Write a Python script that reads a CSV file of sales (date, region, amount) and prints the total for each region "
+     "and month as a table, with comments.", False),
+    ("Explain how a hash table works, then show a short Python class that implements one.", False),
+    ("Write a friendly email to my team: the release is on track for Friday, two bugs are left, and every test passes. "
+     "Ask who can review the last changes.", False),
+    ("Write a JavaScript function that removes duplicate objects from an array by their id, keeping the newest one, "
+     "and explain the choice of data structure.", True),
+)
+MIXED_WARM = "Say hello in one sentence."
 
 
 def without_dflash(cfg: dict) -> dict:
@@ -74,10 +88,11 @@ def with_dflash(cfg: dict, drafter) -> dict:
     return out
 
 
-def requests(cfg: dict) -> tuple[list[int], list[list[int]], int]:
+def requests(cfg: dict, doc_tokens: int = DOC_TOKENS, mixed: bool = False) -> tuple[list[int], list[list[int]], int]:
     """(the warm-up's ids, one list of ids per question, the document's tokens): chats as the server renders them -
     the model's template at the config's thinking level - each a document made of Maya's own docs, then a question
-    about it.  Every request opens with the same document, so the engine reads it once and keeps it."""
+    about it.  Every request opens with the same document, so the engine reads it once and keeps it.  `mixed`: the
+    MIXED requests instead (no document: 0 tokens)."""
     import strata_tokenizer as ST
     from serve.frontend import ChatTemplate, effort_kwargs
     tpath = Path(cfg["tokenizer"])
@@ -88,12 +103,17 @@ def requests(cfg: dict) -> tuple[list[int], list[list[int]], int]:
         kw = effort_kwargs(cfg.get("reasoning_effort"))
     except ValueError:                                 # (a level the template does not know: its own default)
         kw = {}
+    if mixed:
+        def one(q, think):
+            t_kw = kw if think else {"enable_thinking": False}
+            return tok.encode(tpl.render([{"role": "user", "content": q}], **t_kw), parse_special=True)
+        return one(MIXED_WARM, False), [one(q, think) for q, think in MIXED], 0
     text = "\n\n".join(p.read_text(encoding="utf-8", errors="replace")
                        for p in [ROOT / "README.md"] + sorted((ROOT / "docs").glob("*.md")) if p.exists())
     ids = tok.encode(text)
     args = cfg.get("args") or []
     ctx = int(args[args.index("--max-context") + 1]) if "--max-context" in args[:-1] else 32768
-    n = max(256, min(DOC_TOKENS, ctx - ANSWER - 2048, len(ids)))
+    n = max(256, min(doc_tokens, ctx - ANSWER - 2048, len(ids)))
     doc = tok.decode(ids[:n])
 
     def chat(q):
@@ -110,9 +130,12 @@ def answer(engine, ids: list[int], max_new: int, sampling: dict, seed: int) -> t
 
 
 def measure(cfg: dict, label: str, warm: list[int], questions: list[list[int]], n_doc: int, start_engine,
-            say=print, tag: str = "") -> dict:
+            say=print, tag: str = "", size: dict | None = None) -> dict:
     """One side: start its engine, the warm-up (not counted), then the questions until MIN_TOKENS tokens are written:
-    {"tok_s": the sustained speed, "tokens", "answers", "seconds" (writing), "load_s", "drafts_accepted", ...}."""
+    {"tok_s": the sustained speed, "tokens", "answers", "seconds" (writing), "load_s", "drafts_accepted", ...}.
+    `size` (a short probe): {"tokens", "answer", "warm"} in place of MIN_TOKENS, ANSWER, WARM_ANSWER."""
+    size = size or {}
+    min_tokens, answer_len = size.get("tokens", MIN_TOKENS), size.get("answer", ANSWER)
     sampling = dict(cfg.get("sampling") or {"temperature": 1.0, "top_p": 0.95})
     t0 = time.time()
     say(f"  {tag}{label}: loading the model (it reads the experts into the GPUs' memory and RAM first) ...")
@@ -120,20 +143,22 @@ def measure(cfg: dict, label: str, warm: list[int], questions: list[list[int]], 
     tokens, ms, answers, acc, off = 0, 0.0, 0, 0, 0
     try:
         load_s = time.time() - t0
-        say(f"  {tag}{label}: loaded in {load_s:.0f} s; warming up - it reads a document of {n_doc} tokens and "
-            f"answers once (not counted) ...")
-        answer(eng, warm, WARM_ANSWER, sampling, 1)
+        say(f"  {tag}{label}: loaded in {load_s:.0f} s; warming up - " +
+            (f"it reads a document of {n_doc} tokens and answers once" if n_doc else "one short answer") +
+            " (not counted) ...")
+        answer(eng, warm, size.get("warm", WARM_ANSWER), sampling, 1)
         for i, q in enumerate(questions):
-            n, last = answer(eng, q, ANSWER, sampling, i + 2)
+            n, last = answer(eng, q, answer_len, sampling, i + 2)
             d = float(last.get("decode_ms") or 0.0)
             if n < 2 or d <= 0.0:                      # (an answer that ended at once tells nothing)
                 continue
             tokens, ms, answers = tokens + n, ms + d, answers + 1
-            acc += int(last.get("drafts_accepted") or 0)
-            off += int(last.get("drafts_offered") or 0)
-            say(f"  {tag}{label}: answer {answers}: {n} tokens at {n / d * 1000.0:.1f} tokens/s - "
-                f"{min(tokens, MIN_TOKENS)} of {MIN_TOKENS} tokens measured")
-            if tokens >= MIN_TOKENS:
+            a, o = int(last.get("drafts_accepted") or 0), int(last.get("drafts_offered") or 0)
+            acc, off = acc + a, off + o
+            say(f"  {tag}{label}: answer {answers}: {n} tokens at {n / d * 1000.0:.1f} tokens/s" +
+                (f" ({100.0 * a / o:.0f}% of its drafts accepted)" if o else "") +
+                f" - {min(tokens, min_tokens)} of {min_tokens} tokens measured")
+            if tokens >= min_tokens:
                 break
     finally:
         CAL.close(eng)
@@ -144,30 +169,37 @@ def measure(cfg: dict, label: str, warm: list[int], questions: list[list[int]], 
             "load_s": round(load_s), "drafts_accepted": acc, "drafts_offered": off}
 
 
-def run(other: dict, dflash: dict, say=print, start_engine=None, other_label: str = "the MTP block") -> dict:
+def run(other: dict, dflash: dict, say=print, start_engine=None, other_label: str = "the MTP block",
+        draft_label: str = "DFlash2", size: dict | None = None) -> dict:
     """Both sides measured, `other` (the config without DFlash2) first: {"other": {...}, "dflash2": {...},
     "keep": "dflash2" or "other", "gain": DFlash2's speed over the other's - 1}.  `start_engine(cfg)` returns a
-    started engine (serve.server.StrataEngine, or a stand-in in tests).  Raises when a side could not be measured."""
+    started engine (serve.server.StrataEngine, or a stand-in in tests); `draft_label` names the drafting side (GLM-5.3's
+    one-GPU drafting: the same two sides, its MAYA_GLM_MTP_DECODE off and on); `size` makes it a short probe
+    ({"doc" or "mixed", "tokens", "answer", "warm"}: measure's; "mixed": the MIXED requests).  Raises when a side could
+    not be measured."""
     if start_engine is None:
         from serve.server import StrataEngine, child_env, engine_args
 
         def start_engine(c):
             return StrataEngine(c["exe"], engine_args(c), cwd=c.get("cwd"), log=c.get("log"), env=child_env(c))
-    warm, questions, n_doc = requests(dflash)
+    if size and size.get("mixed"):
+        warm, questions, n_doc = requests(dflash, mixed=True)
+    else:
+        warm, questions, n_doc = requests(dflash, size["doc"]) if size and "doc" in size else requests(dflash)
     res: dict = {}
     t0 = time.time()
     with tempfile.TemporaryDirectory(prefix="maya-speed-") as tmp:
-        for i, (key, cfg, label) in enumerate((("other", other, other_label), ("dflash2", dflash, "DFlash2"))):
+        for i, (key, cfg, label) in enumerate((("other", other, other_label), ("dflash2", dflash, draft_label))):
             if i == 1:
-                say(f"  (the first side took {(time.time() - t0) / 60.0:.0f} min: about as long again for DFlash2)")
-            # (no conversations kept aside: with STRATA_GLM_SLOT_KEEP the calibration's would push out this PC's own;
+                say(f"  (the first side took {(time.time() - t0) / 60.0:.0f} min: about as long again for {draft_label})")
+            # (no conversations kept aside: with MAYA_GLM_SLOT_KEEP the calibration's would push out this PC's own;
             # and no learned expert profile or routing trace written: its answers are not this PC's use)
             c = {**cfg, "args": CAL.without_writes(list(cfg.get("args") or [])),
-                 "env": {**(cfg.get("env") or {}), **CAL.usage_copy(cfg, Path(tmp)), "STRATA_GLM_SLOTS": "0"}}
-            res[key] = measure(c, label, warm, questions, n_doc, start_engine, say, f"[{i + 1}/2] ")
+                 "env": {**(cfg.get("env") or {}), **CAL.usage_copy(cfg, Path(tmp)), "MAYA_GLM_SLOTS": "0"}}
+            res[key] = measure(c, label, warm, questions, n_doc, start_engine, say, f"[{i + 1}/2] ", size)
     for key in ("other", "dflash2"):
-        if res[key]["tokens"] < MIN_TOKENS // 2:
-            raise RuntimeError(f"{'DFlash2' if key == 'dflash2' else other_label} wrote only {res[key]['tokens']} "
+        if res[key]["tokens"] < (size or {}).get("tokens", MIN_TOKENS) // 2:
+            raise RuntimeError(f"{draft_label if key == 'dflash2' else other_label} wrote only {res[key]['tokens']} "
                                "tokens: too few for a sustained speed")
     o, d = res["other"]["tok_s"], res["dflash2"]["tok_s"]
     res["keep"] = "dflash2" if d > o * (1.0 + MIN_GAIN) else "other"

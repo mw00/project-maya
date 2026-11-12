@@ -14,11 +14,12 @@ import maya  # noqa: E402
 
 
 class ModelChoice(unittest.TestCase):
-    def choose(self, inst, vram_gb=32.0):
+    def choose(self, inst, vram_gb=32.0, ram_gb=256.0):
         args = SimpleNamespace(gguf_dir=None, model=None, yes=True, backend="cuda")
         lines = []
         with tempfile.TemporaryDirectory() as d, \
                 patch.object(maya.S, "gpus", return_value=[{"vram_gb": vram_gb}]), \
+                patch.object(maya, "mem_gb", return_value=(ram_gb, ram_gb)), \
                 patch.object(maya, "say", side_effect=lambda *a: lines.append(" ".join(map(str, a)))):
             kind, quant = maya.choose_model(args, Path(d), inst)
         return kind, quant, "\n".join(lines)
@@ -26,8 +27,8 @@ class ModelChoice(unittest.TestCase):
     def test_new_setup_offers_the_maya_quants(self):
         kind, quant, text = self.choose({})
         self.assertEqual((kind, quant), ("download", "Maya-S-v2-IQ2_XXS"))
-        for q in ("GLM-5.3 · Maya-S:", "GLM-5.3 · Maya-S24:", "GLM-5.3 · Maya-M:", "GLM-5.3 · Maya-M-Derisked:",
-                  "GLM-5.3 · Maya-L:"):   # (the model first, the tier: maya_quants)
+        for q in ("GLM-5.3-Flash · Maya-S:", "GLM-5.3-Flash · Maya-S24:", "GLM-5.3-Flash · Maya-M:", "GLM-5.3-Flash · Maya-M-Derisked:",
+                  "GLM-5.3-Flash · Maya-L:"):   # (the model first, the tier: maya_quants)
             self.assertIn(q, text)
 
     def test_maya_m_derisked_downloads_from_its_own_repo_with_mayas_vision_files(self):
@@ -61,11 +62,11 @@ class ModelChoice(unittest.TestCase):
         self.assertIn("EXL3-sc_4.10bpw", maya.MODELS)
         kind, quant, text = self.choose({})
         self.assertNotIn("sc_4.10", text)
-        self.assertIn("GLM-5.3 · EXL3-4.05bpw: download", text)                # (the other EXL3 quants are still listed)
-        self.assertIn("GLM-5.3 · EXL3-3.05bpw: download", text)
+        self.assertIn("GLM-5.3-Flash · EXL3-4.05bpw: download", text)                # (the other EXL3 quants are still listed)
+        self.assertIn("GLM-5.3-Flash · EXL3-3.05bpw: download", text)
         kind, quant, text = self.choose({"quant": "EXL3-sc_4.10bpw"})
         self.assertEqual((kind, quant), ("download", "EXL3-sc_4.10bpw"))
-        self.assertIn("GLM-5.3 · EXL3-sc_4.10bpw: download 167.8 GB from Hugging Face", text)
+        self.assertIn("GLM-5.3-Flash · EXL3-sc_4.10bpw: download 167.8 GB from Hugging Face", text)
         self.assertNotIn("EXL3-sc_4.10bpw: download 167.8 GB from Hugging Face   (experimental)", text)   # (v1.1.53)
         args = SimpleNamespace(gguf_dir=None, model="EXL3-sc_4.10bpw", yes=True)   # (by hand: no question at all)
         self.assertEqual(maya.choose_model(args, Path("/m"), {}), ("download", "EXL3-sc_4.10bpw"))
@@ -88,6 +89,82 @@ class ModelChoice(unittest.TestCase):
             self.assertTrue(maya.sha256_ok(p, good))
             self.assertTrue(maya.sha256_ok(p, ["0" * 64, good.upper()]))
             self.assertFalse(maya.sha256_ok(p, ["0" * 64]))
+
+
+class FitRecommendation(unittest.TestCase):
+    """The quant each list recommends (fit_recommendation): the largest no larger than the family's usual pick that
+    VRAM + RAM hold without reading experts from the SSD, a smaller one when under a fifth of it would sit in VRAM,
+    the smallest when none fits; a unified-memory Halo counted once."""
+    HALO = {"vram_gb": 160.0, "arch": "gfx1151", "name": "AMD Radeon 8065S"}
+    PCS = {   # name: (GPUs, RAM GiB, backend, Windows)
+        "24 GB + 64 GB": ([{"vram_gb": 24.0}], 64.0, "cuda", False),
+        "3x32 GB + 183 GB": ([{"vram_gb": 32.0}] * 3, 183.0, "cuda", False),
+        "Halo 192 GB, Windows": ([HALO], 32.0, "hip", True),           # (160 GB carve-out beside 32 GB of RAM)
+        "Halo 192 GB, Linux": ([dict(HALO, vram_gb=160.0)], 192.0, "hip", False),   # (the GPU maps the RAM)
+        "8 GB + 32 GB": ([{"vram_gb": 8.0}], 32.0, "cuda", False)}
+    WANT = {   # name: (GLM-5.3-Flash, GLM-5.3 744B, DeepSeek, MiniMax)
+        "24 GB + 64 GB": ("Maya-XS-IQ1_S", "GLM-5.3-Maya-XS", "maya-xs", "gguf-xs"),
+        "3x32 GB + 183 GB": ("Maya-S-v2-IQ2_XXS", "GLM-5.3-Maya-XS", "maya-s", "exl3"),
+        "Halo 192 GB, Windows": ("Maya-S-v2-IQ2_XXS", "GLM-5.3-Maya-XS", "maya-xs", "gguf-s"),
+        "Halo 192 GB, Linux": ("Maya-S-v2-IQ2_XXS", "GLM-5.3-Maya-XS", "maya-xs", "gguf-s"),
+        "8 GB + 32 GB": ("Maya-XS-IQ1_S", "GLM-5.3-Maya-XS", "maya-xs", "gguf-xs")}
+
+    def recommended(self, gpus, ram, backend, win):
+        tags = {}
+
+        def choose(title, intro, rows, default, yes, *x):
+            tags[title] = [r[1] for r in rows]
+            return default
+        a = SimpleNamespace(backend=backend, model_dir=None, gguf_dir=None, model=None, yes=True, check=False,
+                            ds4_quant=None, mm3_quant=None)
+        with patch.object(maya.S, "gpus", return_value=gpus if backend == "cuda" else []), \
+                patch.object(maya.S, "amd_gpus", return_value=gpus if backend == "hip" else []), \
+                patch.object(maya, "mem_gb", return_value=(ram, ram)), patch.object(maya, "WIN", win), \
+                patch.object(maya, "choose", side_effect=choose), patch.object(maya, "say", lambda *x: None), \
+                patch.object(maya.S, "UI", None):
+            glm = maya.choose_model(a, Path("/nowhere"), {})[1]
+            ds4, mm3 = maya.choose_ds4_quant(a, {}), maya.choose_mm3_quant(a, {})
+        flash = [q for q in maya.MODELS if q not in maya.MODELS_BY_HAND]
+        g53 = [q for q in maya.G53_MODELS]
+        glm_tags = tags["Which GLM-5.3-Flash?"]
+        self.assertEqual(sum(t == "recommended" or (t or "").startswith("recommended for cards") for t in glm_tags), 1)
+        g53_rec = [q for q, t in zip(g53, glm_tags[len(flash):]) if t == f"recommended for {maya.G53.SHOWN}"]
+        return glm, g53_rec[0], ds4, mm3
+
+    def test_profiles(self):
+        for name, pc in self.PCS.items():
+            with self.subTest(name):
+                self.assertEqual(self.recommended(*pc), self.WANT[name])
+
+    def test_every_quant_stays_listed(self):
+        tags = {}
+
+        def choose(title, intro, rows, default, yes, *x):
+            tags[title] = len(rows)
+            return default
+        with patch.object(maya.S, "gpus", return_value=[{"vram_gb": 8.0}]), \
+                patch.object(maya, "mem_gb", return_value=(32.0, 32.0)), patch.object(maya, "choose", side_effect=choose):
+            maya.choose_model(SimpleNamespace(backend="cuda", gguf_dir=None, model=None, yes=True), Path("/m"), {})
+        self.assertEqual(tags["Which GLM-5.3-Flash?"],
+                         len([q for q in maya.MODELS if q not in maya.MODELS_BY_HAND]) + len(maya.G53_MODELS) + 1)
+
+    def test_rule(self):
+        sizes = {"L": 150.0, "S": 100.0, "XS": 70.0}
+        rec = lambda gpus, ram, top=None: maya.fit_recommendation(sizes, gpus, ram, 2.0, top)
+        self.assertEqual(rec([{"vram_gb": 96.0}], 183.0), "L")              # all fit, 96 of 152 GB in VRAM
+        self.assertEqual(rec([{"vram_gb": 96.0}], 183.0, "S"), "S")         # never above the family's pick
+        self.assertEqual(rec([{"vram_gb": 24.0}], 128.0), "S")              # L would read from the SSD
+        self.assertEqual(rec([{"vram_gb": 16.0}], 256.0), "XS")             # all fit, L and S under 20% in VRAM, XS 22%
+        self.assertEqual(rec([{"vram_gb": 8.0}], 256.0), "XS")              # none reaches 20%: the smallest that fits
+        self.assertEqual(rec([{"vram_gb": 8.0}], 32.0), "XS")               # none fits: the smallest
+        self.assertEqual(rec([], 256.0), "L")                                # no VRAM figure: by the memory alone
+        self.assertEqual(rec([{"vram_gb": 24.0}], 0.0, "S"), "S")           # RAM unread: the usual pick
+        # a Halo's one memory counted once: Linux the larger figure, Windows its carve-out beside the RAM it counts
+        with patch.object(maya, "WIN", False):
+            self.assertEqual(maya.fit_memory([self.HALO], 192.0), (186.0, 186.0))
+        with patch.object(maya, "WIN", True):
+            self.assertEqual(maya.fit_memory([self.HALO], 32.0), (186.0, 186.0))
+        self.assertEqual(maya.fit_memory([{"vram_gb": 24.0}], 64.0), (82.0, 24.0))
 
 
 class WholeShards(unittest.TestCase):

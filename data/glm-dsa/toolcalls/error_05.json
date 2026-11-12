@@ -1,0 +1,64 @@
+{
+ "id": "error_05",
+ "group": "error_reply",
+ "api": "openai",
+ "request": {
+  "messages": [
+   {
+    "role": "user",
+    "content": "Count the orders."
+   },
+   {
+    "role": "assistant",
+    "content": "",
+    "tool_calls": [
+     {
+      "id": "call_5",
+      "type": "function",
+      "function": {
+       "name": "run_sql",
+       "arguments": "{\"query\": \"SELEC count(*) FROM orders\"}"
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "tool_call_id": "call_5",
+    "content": "{\"error\": \"syntax error at or near \\\"SELEC\\\"\"}"
+   }
+  ],
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "run_sql",
+     "description": "Run a read-only SQL query on the analytics database.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "query": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "query"
+      ]
+     }
+    }
+   }
+  ]
+ },
+ "expect": {
+  "calls": [],
+  "min_calls": 0,
+  "max_calls": 2,
+  "no_call": false,
+  "must_not_repeat": {
+   "name": "run_sql",
+   "args": {
+    "query": "SELEC count(*) FROM orders"
+   }
+  }
+ }
+}

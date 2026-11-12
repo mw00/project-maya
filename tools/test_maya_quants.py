@@ -29,12 +29,12 @@ ALIASES = {
 }
 # the setup ids (new) -> (family, key, what the picker and the dashboard show)
 IDS = {
-    "glm-maya-s": ("glm", "Maya-S-v2-IQ2_XXS", "GLM-5.3 · Maya-S"),
-    "glm-maya-s24": ("glm", "Maya-S24", "GLM-5.3 · Maya-S24"),
-    "glm-maya-xs": ("glm", "Maya-XS-IQ1_S", "GLM-5.3 · Maya-XS"),
-    "glm-maya-m": ("glm", "Maya-M", "GLM-5.3 · Maya-M"),
-    "glm-maya-m-derisked": ("glm", "Maya-M-Derisked", "GLM-5.3 · Maya-M-Derisked"),
-    "glm-maya-l": ("glm", "Maya-L", "GLM-5.3 · Maya-L"),
+    "glm-maya-s": ("glm", "Maya-S-v2-IQ2_XXS", "GLM-5.3-Flash · Maya-S"),
+    "glm-maya-s24": ("glm", "Maya-S24", "GLM-5.3-Flash · Maya-S24"),
+    "glm-maya-xs": ("glm", "Maya-XS-IQ1_S", "GLM-5.3-Flash · Maya-XS"),
+    "glm-maya-m": ("glm", "Maya-M", "GLM-5.3-Flash · Maya-M"),
+    "glm-maya-m-derisked": ("glm", "Maya-M-Derisked", "GLM-5.3-Flash · Maya-M-Derisked"),
+    "glm-maya-l": ("glm", "Maya-L", "GLM-5.3-Flash · Maya-L"),
     "deepseek-maya-xs": ("deepseek", "maya-xs", "DeepSeek V4.1 · Maya-XS"),
     "deepseek-maya-s": ("deepseek", "maya-s", "DeepSeek V4.1 · Maya-S"),
     "deepseek-maya-m": ("deepseek", "maya-m", "DeepSeek V4.1 · Maya-M"),
@@ -110,8 +110,8 @@ class Aliases(unittest.TestCase):
         self.assertEqual(Q.shown("minimax", "gguf-xs", 92.98), "MiniMax M3.1 · Maya-XS (93 GB)")
         self.assertEqual(Q.shown("deepseek", "gguf-q8"), "DeepSeek V4.1 · UD-Q8_K_XL")
         self.assertEqual(Q.shown("minimax", "exl3"), "MiniMax M3.1 · EXL3 3.5 bpw")
-        self.assertEqual(Q.shown("glm", "EXL3-3.05bpw"), "GLM-5.3 · EXL3-3.05bpw")
-        self.assertEqual(Q.shown("glm", "UD-Q2_K_XL"), "GLM-5.3 · UD-Q2_K_XL")   # (a GGUF of the user's: its name)
+        self.assertEqual(Q.shown("glm", "EXL3-3.05bpw"), "GLM-5.3-Flash · EXL3-3.05bpw")
+        self.assertEqual(Q.shown("glm", "UD-Q2_K_XL"), "GLM-5.3-Flash · UD-Q2_K_XL")   # (a GGUF of the user's: its name)
         self.assertEqual(Q.shown("deepseek"), "DeepSeek V4.1")
 
 
@@ -200,7 +200,7 @@ class OldConfigs(unittest.TestCase):
     def test_loaded_and_shown(self):
         names = sorted(p.name for p in maya.configs())
         self.assertEqual(names, sorted(self.cfgs))
-        want = {"maya-maya-s24.json": ("glm", "GLM-5.3 · Maya-S24"),
+        want = {"maya-maya-s24.json": ("glm", "GLM-5.3-Flash · Maya-S24"),
                 "maya-ds4.json": ("deepseek", "DeepSeek V4.1 · Maya-XS"),
                 "maya-mm3.json": ("minimax", "MiniMax M3.1 · EXL3 3.5 bpw")}
         for name, (family, label) in want.items():
@@ -227,7 +227,7 @@ class OldConfigs(unittest.TestCase):
             return default
         with patch.object(maya, "choose", pick), patch.object(maya.S, "gpus", return_value=[]):
             self.assertEqual(maya.choose_model(args(), self.root, glm["installer"]), ("download", "Maya-S24"))
-        self.assertTrue(any(r.startswith("GLM-5.3 · Maya-S24: download") for r in rows), rows)
+        self.assertTrue(any(r.startswith("GLM-5.3-Flash · Maya-S24: download") for r in rows), rows)
         self.assertFalse(any(r.startswith("Maya-") for r in rows), rows)       # (never a bare tier)
         ds4 = maya.read_json(self.root / "maya-ds4.json")
         rows.clear()
@@ -244,7 +244,7 @@ class OldConfigs(unittest.TestCase):
         s = {"model": "glm-5.3-flash", "quant": "Maya-S24", "context": "65536", "dashboard": "http://127.0.0.1:9/",
              "api": "http://127.0.0.1:9/v1", "state": "ready", "since": 0, "speed": None}
         label = Q.config_label(maya.read_json(self.root / "maya-maya-s24.json"))
-        self.assertIn("GLM-5.3 · Maya-S24 · 64K context", serving_card(dict(s, label=label), "").plain)
+        self.assertIn("GLM-5.3-Flash · Maya-S24 · 64K context", serving_card(dict(s, label=label), "").plain)
         self.assertIn("glm-5.3-flash · Maya-S24 · 64K context", serving_card(s, "").plain)
         self.assertIn('"label": Q.config_label(cfg)', Path(maya.__file__).read_text(encoding="utf-8"))
 

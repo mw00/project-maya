@@ -365,7 +365,7 @@ class Settings(unittest.TestCase):
     def test_on_by_default_and_the_ways_to_turn_it_off(self):
         self.assertTrue(loop_guard_setting({}, {}))
         self.assertFalse(loop_guard_setting({}, {"MAYA_LOOP_GUARD": "0"}))
-        self.assertFalse(loop_guard_setting({}, {"STRATA_LOOP_GUARD": "off"}))
+        self.assertFalse(loop_guard_setting({}, {"MAYA_LOOP_GUARD": "off"}))
         self.assertFalse(loop_guard_setting({"loop_guard": False}, {}))
         self.assertFalse(loop_guard_setting({"loop_guard": "false"}, {}))
         self.assertTrue(loop_guard_setting({"loop_guard": True}, {}))
@@ -897,6 +897,50 @@ class ToolBlock(unittest.TestCase):
         # a conversation that does not repeat itself: a short answer ends the turn as always
         svc, eng, kw, calls, text, done = self.answer("Done.", call_text(other), rounds=(NMCLI, GREP))
         self.assertEqual((calls, len(eng.prompts), text), ([], 1, "Done."))
+
+    def test_an_anthropic_tool_result_is_not_an_answer_to_the_user(self):
+        # #925's rule over Anthropic requests: a user turn of tool_result blocks (text beside them or not) is a tool
+        # result - as tool messages then a user message, or (DeepSeek) one user message with content_blocks
+        from serve.frontend import anthropic_to_messages
+        call = {"role": "assistant", "content": [{"type": "tool_use", "id": "t1", "name": "lookup", "input": {}}]}
+        result = {"type": "tool_result", "tool_use_id": "t1", "content": "found it"}
+        for turn in ([result], [result, {"type": "text", "text": "<reminder>keep going</reminder>"}]):
+            req = {"messages": [{"role": "user", "content": "find it"}, call, {"role": "user", "content": turn}]}
+            for deepseek in (False, True):
+                with self.subTest(turn=len(turn), deepseek=deepseek):
+                    self.assertFalse(LG.answers_user(anthropic_to_messages(req, deepseek=deepseek)[0]))
+        req = {"messages": [{"role": "user", "content": "find it"}, call, {"role": "user", "content": [result]},
+                            {"role": "assistant", "content": "Found it."}, {"role": "user", "content": "thanks"}]}
+        for deepseek in (False, True):
+            self.assertTrue(LG.answers_user(anthropic_to_messages(req, deepseek=deepseek)[0]))
+        self.assertFalse(LG.answers_user([]))
+
+    def test_an_answer_to_the_user_ends_the_turn(self):
+        # #921: a chat of short acknowledgements, tools offered and none called - "Affirmative. Loud and clear." to
+        # "can you hear me" was kept going (every sentence of it said before), 3 times at most, and the continuation
+        # was joined to it without a space ("clear.I am still here")
+        from serve.frontend import openai_to_messages
+        other = "grep -n on_bytes host/bellhost/bridge.py"
+        ack = "Acknowledged. Standing by for the next command."
+        req = agent(user="all tests pass")
+        for _ in range(3):
+            req["messages"] += [{"role": "assistant", "content": ack}, {"role": "user", "content": "do you mean standing by"}]
+        msgs, tools, kw = openai_to_messages(req)
+        self.assertTrue(LG.echoes(msgs))                                # the conversation repeats itself ...
+        self.assertTrue(LG.answers_user(msgs))                          # ... and the model answers the user
+        self.assertFalse(LG.answers_user(openai_to_messages(agent(NMCLI))[0]))   # (a tool result: it works on)
+        eng = ScriptEngine(Tok(), ack, call_text(other))
+        svc = Server().service(eng)
+        ids, thinking, max_new = svc.prepare(msgs, tools, kw, 2000)
+        events = [x for k, x in svc.run(ids, thinking, tools, max_new, {"_blocked": kw.get("_blocked")},
+                                        threading.Event()) if k == "event"]
+        self.assertEqual("".join(e.text for e in events if e.kind == "content"), ack)   # the model's own stop ends it
+        self.assertEqual((len(eng.prompts), svc.metrics()["loop_guard"]["kept_going"]), (1, 0))
+        # after a tool result the rule stands, and the continuation starts a new paragraph in the client's text
+        talk = "OK \u2014 the loop guard is right. Stop repeating identical greps. Break out: use what I have."
+        svc, eng, kw, calls, text, done = self.answer(talk, "Next I read bridge.py itself.", rounds=(NMCLI,) * 4)
+        self.assertEqual((calls, len(eng.prompts), done["finish"]), ([], 2, "stop"))
+        self.assertEqual(text, talk + "\n\nNext I read bridge.py itself.")
 
     def test_what_is_not_blocked(self):
         # four runs: notes only, the call goes out

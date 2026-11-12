@@ -43,7 +43,7 @@ public:
     /// E-9: the draft layer's K/V for prompt cells [cell0, cell0 + n) from their final residual rows `R_rows`
     /// (device) and `next_tokens` (host: the token at cell+1), in batches through this path's GEMMs and its idle
     /// scratch - call it from on_chunk.  false with `err` empty: not applicable here (a ring or hybrid K/V, another
-    /// device, too little scratch; STRATA_MTP_BATCH=0), the caller runs the drafter's own pass.  Not bit-identical to
+    /// device, too little scratch; MAYA_MTP_BATCH=0), the caller runs the drafter's own pass.  Not bit-identical to
     /// that pass (FP16 GEMMs instead of Q8_1 activations): the drafts may differ, never the target's tokens' logits.
     bool draft_kv(core::MtpDrafter& mtp, const float* R_rows, const int32_t* next_tokens, int64_t n, int64_t cell0,
                   std::string& err);
