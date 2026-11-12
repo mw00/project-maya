@@ -2077,6 +2077,16 @@ bool Glm5Model::load_pack_place(const std::string& pack_dir, int64_t max_ctx, st
     // MAYA_GLM_EXPERT_HELPER=<device>: the expert helper - alone beside one trunk GPU (no split: dense, state and
     // MTP stay on device 0), or beside a layer split, which then leaves the helper's device out and gives each part
     // its own share of the helper over its own layers (fast_helper_setup): two cards and a Ryzen AI Max APU
+    if (const char* plugin = getenv("MAYA_GLM_EXPERT_PLUGIN"); plugin && *plugin) {
+        std::string path; int device = -1; size_t budget = 0;
+        const char* native = getenv("MAYA_GLM_EXPERT_HELPER");
+        if ((native && *native) || (!spec.empty() && spec != "0")) {
+            err = "expert plugin requires one primary GPU (split=0) and no native helper setting"; return false;
+        }
+        if (!PluginExperts::settings(path, device, budget, err)) return false;
+        // Plugin ordinals are in a separate runtime; never pass them to CUDA preflight.
+        return load_pack(pack_dir, max_ctx, err);
+    }
     int helper = -1;
     if (const char* h = getenv("MAYA_GLM_EXPERT_HELPER"); h != nullptr && h[0] != '\0') {
         if (std::strspn(h, "0123456789") != std::strlen(h)) {

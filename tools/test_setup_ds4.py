@@ -1393,7 +1393,8 @@ class MayaQuants(unittest.TestCase):
 
     def test_published(self):
         with self.published(), patch.object(maya.S, "UI", None), \
-                patch.object(maya, "mem_gb", return_value=(512.0, 500.0)):   # (a PC that holds Maya-S)
+                patch.object(maya, "mem_gb", return_value=(512.0, 500.0)), \
+                patch.object(maya, "setup_gpus", return_value=[]):   # (RAM-only recommendation; no host GPU probe)
             self.assertTrue(maya.ds4_maya_published("maya-s"))
             self.assertFalse(maya.ds4_maya_published("maya-m"))
             self.assertEqual(maya.choose_ds4_quant(args(ds4_quant=None), {}), "maya-s")   # (recommended)

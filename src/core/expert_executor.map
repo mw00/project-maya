@@ -1,0 +1,4 @@
+{
+    global: maya_expert_context_api; maya_expert_context_read; maya_expert_context_rows;
+    local: *;
+};

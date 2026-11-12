@@ -75,6 +75,7 @@ from serve.update import RESTART_EXIT, Updater  # noqa: E402
 from serve import glm_dsa_product, glm_dsa_tune  # noqa: E402  (GLM-5.3, glm-dsa: the pack test, its release gate, its knobs)
 from serve.glm_dsa_template import reads_images  # noqa: E402
 import maya_names  # noqa: E402  (tools/) the settings' names users see (MAYA_*) and the older ones the code reads
+import maya_cuda_hip  # noqa: E402  validates optional paired builds before an engine starts
 import maya_quants  # noqa: E402  (tools/) the quants' names users see (the model first: "GLM-5.3-Flash · Maya-S")
 
 try:                        # Project Maya's release (the dashboard's About; the engine's INFO carries none)
@@ -2035,6 +2036,10 @@ def child_env(cfg: dict) -> dict:
     if dirs:
         var = "PATH" if os.name == "nt" else "LD_LIBRARY_PATH"
         env[var] = os.pathsep.join(dirs + ([env[var]] if env.get(var) else []))
+    if cfg.get("cuda_hip"):
+        env = maya_cuda_hip.clean_visibility(env)
+        env["HIP_VISIBLE_DEVICES"] = str((cfg.get("env") or {}).get("HIP_VISIBLE_DEVICES", ""))
+        maya_cuda_hip.validate(cfg, env)
     return env
 
 
@@ -2992,6 +2997,7 @@ class Service:
         why = models.missing(cfg)                        # (maya.py would stop at it: no model would run)
         if why:
             raise ValueError(f"{p.name} cannot start: {why} - run the setup again to repair it")
+        maya_cuda_hip.validate(cfg)  # reject a stale/missing pair before stopping the current model
         self._restart_busy()
         if models.own_defaults(p):                       # (its model's own sampling and level, as the setup writes)
             print(f"[maya] {p.name}: its model's own sampling and thinking level written into it", flush=True)
@@ -7158,6 +7164,8 @@ def main() -> int:
             ap.error("--engine maya needs --config")
         vision = None
         env = child_env(cfg)
+        if cfg.get("cuda_hip"):
+            print("[maya] " + maya_cuda_hip.description(cfg), flush=True)
         sampling_defaults = sampling_defaults_from_config(cfg)
         if "sampling" not in cfg:                       # (a config without them: the model's own, not none)
             sampling_defaults = maya_quants.model_defaults(cfg)[0]

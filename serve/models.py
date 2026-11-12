@@ -26,6 +26,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 import maya_names  # noqa: E402  (tools/) a setting under either of its names
+import maya_cuda_hip  # noqa: E402  optional paired configuration validation
 import maya_quants  # noqa: E402  (tools/) the quants' names users see, and each config's family
 from serve import glm_dsa_product as G53  # noqa: E402  GLM-5.3 (744B, glm-dsa): what its engine serves today
 
@@ -462,6 +463,8 @@ def apply(cfg: dict, settings: dict) -> dict:
                                                         for g in gpus):
         raise ValueError("GPUs: pick at least one")
     if gpus != gpus_of(cfg):
+        if cfg.get("cuda_hip"):
+            raise ValueError("Use setup-cuda-hip.sh to change the paired setup's CUDA device; HIP has its own ordinal.")
         out["gpu"] = sorted(set(gpus))
 
     env = s.get("env") or {}
@@ -647,6 +650,8 @@ def apply(cfg: dict, settings: dict) -> dict:
     if isinstance(out.get("ablate"), dict):   # (a direction the setup recorded: loaded, off by default)
         args = ablate_args(out, args)
     out["args"] = args
+    if out.get("cuda_hip"):
+        maya_cuda_hip.validate(out)  # reject unsupported edits before saving/restarting
     return out
 
 
@@ -715,7 +720,8 @@ def quant_label(cfg: dict, path: Path) -> str:
         return str(maya_quants.glm53_quant(key) or path.stem.removeprefix("maya-").removesuffix("-hip"))
     what = maya_quants.tier(fam, key) or maya_quants.OTHERS.get((fam, key)) or OTHER_QUANTS.get((fam, str(key).lower()))
     what = maya_quants.exl3_bits(cfg) or what          # (an EXL3 quant set up by hand: its folder's bits, maya_quants)
-    return str(what or key or path.stem.removeprefix("maya-").removesuffix("-hip"))
+    label = str(what or key or path.stem.removeprefix("maya-").removesuffix("-hip"))
+    return label + " · CUDA + HIP" if cfg.get("cuda_hip") else label
 
 
 def missing(cfg: dict) -> str | None:

@@ -2255,7 +2255,8 @@ bool Glm5Model::fast_setup_finish(std::string& err) {
     F->lane_pending = false;
     cudaSetDevice(dev_);
     if (!fast_cpu_lane_setup(err)) return false;   // keep the existing CPU pool/calibration for batched prefill
-    if (const char* h = getenv("MAYA_GLM_EXPERT_HELPER"); h != nullptr && h[0] != '\0')
+    if ((getenv("MAYA_GLM_EXPERT_HELPER") && *getenv("MAYA_GLM_EXPERT_HELPER")) ||
+        (getenv("MAYA_GLM_EXPERT_PLUGIN") && *getenv("MAYA_GLM_EXPERT_PLUGIN")))
         if (!fast_helper_setup(err)) return false;
     F->svc = std::thread([this] { fast_service(); });
     const std::vector<int> svc_cpus = cpu_list_env("MAYA_GLM_SVC_CPUS" + std::to_string(dev_));
@@ -2268,13 +2269,26 @@ bool Glm5Model::fast_helper_setup(std::string& err) {
     FastState* F = fast_;
     // the helper's device is its own: not this part's, nor any part's of a layer split (each part opens its own
     // helper there - an integrated one aliases this part's RAM tier - over its own layers [l0_, lt_))
-    const int device = std::atoi(getenv("MAYA_GLM_EXPERT_HELPER"));
+    const bool external = getenv("MAYA_GLM_EXPERT_PLUGIN") && *getenv("MAYA_GLM_EXPERT_PLUGIN");
+    std::string plugin_path; size_t plugin_budget = 0; int device = -1;
+    if (external) {
+        if (n_parts_ != 1 || !PluginExperts::settings(plugin_path, device, plugin_budget, err)) return false;
+    } else device = std::atoi(getenv("MAYA_GLM_EXPERT_HELPER"));
+    if (external && exl3_) {
+        err = "GLM external helper: EXL3 experts are not supported";
+        return false;
+    }
+    const char* overlap = getenv("MAYA_GLM_HELPER_OVERLAP");
+    if (external && overlap && std::strcmp(overlap, "1") == 0) {
+        err = "GLM external helper: HELPER_OVERLAP requires a native helper; unset it for the plugin";
+        return false;
+    }
     const bool a_part = device == dev_ || std::find(split_devs_.begin(), split_devs_.end(), device) != split_devs_.end();
     // an EXL3 pack's experts only with MAYA_GLM_HELPER_EXL3=1 (opt-in, as DS4_HELPER_EXL3): the helper then owns the
     // mul1 (cb 2) layers' experts - those the CPU lane's kernel takes, whose answer the device adds (cpu_fmt below)
     const char* hx = getenv("MAYA_GLM_HELPER_EXL3");
     const bool exl3_helper = exl3_ && hx != nullptr && std::strcmp(hx, "1") == 0;
-    if (a_part || (exl3_ && !exl3_helper) || g_.n_embd > 4096 || g_.n_exp_used > 8) {
+    if ((!external && a_part) || (exl3_ && !exl3_helper) || g_.n_embd > 4096 || g_.n_exp_used > 8) {
         err = "GLM expert helper: a device of its own (not a trunk GPU or a part of the split) and native GGUF experts "
               "(up to 8 per route)";
         return false;
@@ -2295,7 +2309,8 @@ bool Glm5Model::fast_helper_setup(std::string& err) {
                              ? "legacy-f32 (v1.1.8's kernels, the weights decoded in FP32: the same bits)"
                              : "the kernels MAYA_GLM_EXL3_DECODE names");
     }
-    if (!F->helper.open(device, g_.n_embd, g_.n_ff_exp, regions, err, exl3_helper)) return false;
+    if (!external && !F->helper.open(device, g_.n_embd, g_.n_ff_exp, regions, err, exl3_helper)) return false;
+    std::vector<PluginExperts::Layout> layouts((size_t) F->n_keys);
     // (an EXL3 layer's experts on the helper: mul1's, not the MTP layer's - the layers whose answer the device adds,
     // cpu_fmt.n_ff > 0 as the CPU lane sets it; the others stay with the trunk's PCIe fetch)
     const auto exl3_ok = [&](const FastState::Layer& ly) { return ly.exl3 && !ly.mtp && ly.xl.cb == 2; };
@@ -2315,6 +2330,7 @@ bool Glm5Model::fast_helper_setup(std::string& err) {
         const auto& R = F->rc[(size_t) c];
         for (int e = 0; e < g_.n_expert; ++e) {
             const int key = il * g_.n_expert + e;
+            layouts[(size_t) key] = {ly.gu_type, ly.d_type, ly.blob, ly.down_off};
             if (F->slot_of[(size_t) key] >= 0) continue;
             const int rs = F->ram_of[(size_t) key];
             if (F->helper.integrated() && (rs < 0 || R.st[(size_t) rs] != FastState::kRHold)) continue;
@@ -2322,13 +2338,15 @@ bool Glm5Model::fast_helper_setup(std::string& err) {
             requested += R.stride;
         }
     }
-    if (!F->helper.reserve(F->n_keys, requested, err)) return false;
     std::stable_sort(ranked.begin(), ranked.end(), [&](int a, int b) { return F->usage[(size_t) a] > F->usage[(size_t) b]; });
+    if (external) {
+        if (!F->helper.open_plugin(plugin_path, device, plugin_budget, g_.n_embd, g_.n_ff_exp, layouts, ranked, err)) return false;
+    } else if (!F->helper.reserve(F->n_keys, requested, err)) return false;
     int resident = 0;
     for (int key : ranked) {
         const int il = key / g_.n_expert, e = key % g_.n_expert;
         auto& R = F->rc[(size_t) F->layer_rc[(size_t) il]];
-        if (R.stride > F->helper.available()) continue;
+        if (external ? !F->helper.selected(key) : R.stride > F->helper.available()) continue;
         const int rs = F->ram_of[(size_t) key];
         const uint8_t* host = rs >= 0 ? R.slot((size_t) rs) : F->stage[0];
         if (rs < 0) for (int role = 0; role < 3; ++role) fast_read_part(il, e, role, F->stage[0], 0, 1);
@@ -2382,7 +2400,10 @@ bool Glm5Model::fast_helper_setup(std::string& err) {
         std::fprintf(stderr, "glm helper: CUDA%d's experts run beside the CPU lane's in a route (MAYA_GLM_HELPER_OVERLAP)\n",
                      device);
     }
-    if (n_parts_ > 1)
+    if (external)
+        std::fprintf(stderr, "glm helper: plugin device %d owns %d complementary experts (%.2f GiB); CUDA%d trunk; prefill readback/compute opt-in\n",
+                     device, resident, double(F->helper.used())/1073741824.0, dev_);
+    else if (n_parts_ > 1)
         std::fprintf(stderr, "glm helper: CUDA%d owns %d complementary experts in %.2f GiB of %s for part %d's layers "
                              "[%d, %d); CUDA%d keeps that part's trunk layers; prefill unchanged\n",
                      device, resident, (double) F->helper.used() / 1073741824.0,
@@ -2597,8 +2618,9 @@ bool Glm5Model::fast_helper_adapt(std::string& err) {
         }
         ++F->helper_swaps;
     }
-    return swaps.empty() || glmfast::cuda_ok(cudaMemcpy(F->helper_owned_d, F->helper.owners().data(),
-                         (size_t) F->n_keys, cudaMemcpyHostToDevice), "helper adapted ownership", err);
+    return swaps.empty() || (glmfast::cuda_ok(cudaMemcpy(F->helper_owned_d, F->helper.owners().data(),
+                         (size_t) F->n_keys, cudaMemcpyHostToDevice), "helper adapted ownership", err) &&
+                         glmfast::cuda_ok(cudaStreamSynchronize(0), "helper adapted publication", err));
 }
 
 // EXL3 on the CPU lane, one (token, expert) entry's rows: the gate and up inputs xh = H(x * suh) and their 128-value
@@ -4417,7 +4439,7 @@ void Glm5Model::fast_destroy() {
     win_lanes_stop();   // (after the service thread: it hands them their routes)
     F->cpu_pool.reset();
     if (F->helper.device() >= 0) {
-        std::fprintf(stderr, "glm helper: CUDA%d computed %llu experts in %llu routes, %.1f ms, %llu cache swaps\n", F->helper.device(),
+        std::fprintf(stderr, "glm helper: %s%d computed %llu experts in %llu routes, %.1f ms, %llu cache swaps\n", F->helper.backend_label(), F->helper.device(),
                      (unsigned long long) F->helper_experts.load(), (unsigned long long) F->helper_routes.load(),
                      (double) F->helper_us.load() / 1000.0, (unsigned long long) F->helper_swaps);
         if (F->helper_overlap)
@@ -6019,7 +6041,11 @@ bool Glm5Model::fast_boundary(std::string& err) {
         }
     }
     flush();
-    if (ok && !fast_helper_adapt(err)) return false;
+    if (ok && !fast_helper_adapt(err)) {
+        F->helper_error = err.empty() ? "helper adaptation failed; reload model" : err;
+        F->helper_failed.store(true, std::memory_order_release);
+        return false;
+    }
     F->check_resident(l0_, lt_, g.n_expert);   // (the tables as the next token's routes find them)
     static const bool diag = getenv("MAYA_GLM_TIER_DIAG") != nullptr;
     static const int diag_every = getenv("MAYA_GLM_TIER_DIAG_EVERY") ? std::max(1, std::atoi(getenv("MAYA_GLM_TIER_DIAG_EVERY"))) : 64;
