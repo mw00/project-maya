@@ -3682,6 +3682,30 @@ __global__ void moe_combine_kernel(float* acc, const float* __restrict__ y, cons
     acc[(size_t) t * dim + e] = a;
 }
 
+__global__ void light_gather_kernel(float* hx, const float* __restrict__ x, const int* __restrict__ row_tok,
+                                    const int* __restrict__ prow, int dim) {
+    const int p = blockIdx.y, t = row_tok[prow[p]];
+    for (int e = blockIdx.x * blockDim.x + threadIdx.x; e < dim; e += gridDim.x * blockDim.x)
+        hx[(size_t) p * dim + e] = x[(size_t) t * dim + e];
+}
+__global__ void light_add_kernel(float* acc, const float* __restrict__ hy, const int* __restrict__ lidx,
+                                 const int* __restrict__ pos, const float* __restrict__ w, int k, int dim) {
+    const int e = blockIdx.x * blockDim.x + threadIdx.x, t = blockIdx.y;
+    if (e >= dim) return;
+    bool any = false;
+    for (int i = 0; i < k; ++i) {
+        const int r = pos[(size_t) t * kPicks + i];
+        any = any || (r >= 0 && lidx[r] >= 0);
+    }
+    if (!any) return;
+    float a = acc[(size_t) t * dim + e];
+    for (int i = 0; i < k; ++i) {
+        const int r = pos[(size_t) t * kPicks + i], p = r >= 0 ? lidx[r] : -1;
+        if (p >= 0) a = __fmaf_rn(w[(size_t) t * kPicks + i], hy[(size_t) p * dim + e], a);
+    }
+    acc[(size_t) t * dim + e] = a;
+}
+
 // logprob_rows: one block a row.  A value is the row's logit after the penalties (the window's ids marked in a shared
 // bitmap, as the sampler marks them; only a marked id counts its window).  Each thread keeps its stride's running
 // log-sum-exp and its k best in order (LpStride, ds4_logprobs.hpp); the block merges the sums, then takes the k best of
@@ -3958,6 +3982,13 @@ void moe_combine(float* acc, const float* y, const int* pos, const float* w, int
     if (r1 > r0 && T > 0) pdl_launch(moe_combine_kernel, dim3(cdiv(dim, kThreads), T), kThreads, 0, s, acc, y, pos, w, k, r0, r1, dim);
 }
 
+void light_gather(float* hx, const float* x, const int* row_tok, const int* prow, int n, int dim, cudaStream_t s) {
+    if (n > 0) light_gather_kernel<<<dim3(cdiv(dim, kThreads * 4), n), kThreads, 0, s>>>(hx, x, row_tok, prow, dim);
+}
+void light_add(float* acc, const float* hy, const int* lidx, const int* pos, const float* w, int T, int k, int dim,
+               cudaStream_t s) {
+    if (T > 0) light_add_kernel<<<dim3(cdiv(dim, kThreads), T), kThreads, 0, s>>>(acc, hy, lidx, pos, w, k, dim);
+}
 void gemv_f16(const uint16_t* W, const float* x, int n, int k, int T, float alpha, float* y, cudaStream_t s) {
     pdl_launch(gemv_f16_kernel, dim3(cdiv(n, kThreads / 32), T), kThreads, 0, s, W, x, n, k, alpha, y);
 }
