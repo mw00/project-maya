@@ -14350,9 +14350,18 @@ struct Model::Impl {
             double share;
         };
         std::vector<Cand> c;
+        // DS4_HELPER_DRAFT=1 (opt-in until measured; EXL3): the DSpark blocks' experts without a VRAM slot are
+        // candidates too, ranked with the trunk's by their share of their layer - a block is one device's, so the
+        // service thread answers its picks as a trunk layer's of one GPU.  Without it they stay on the CPU lane, which
+        // the drafter's every round waits on
+        static const bool helper_draft = [] {
+            const char* v = ds4_env("DS4_HELPER_DRAFT");
+            return v != nullptr && std::atoi(v) != 0;
+        }();
         for (const Layer& l : L) {
             const bool supported = pk.gguf ? helper_layer(l)
-                                            : !l.mtp && l.n_cls == 1 && l.lay.fmt == 0;
+                                            : (!l.mtp || (helper_draft && l.nm == 1)) && l.n_cls == 1 &&
+                                                  l.lay.fmt == 0;
             if (!supported) continue;
             const uint32_t* p = prof.data() + (size_t) l.il * g.n_exp;
             double sum = 0;
@@ -14360,7 +14369,15 @@ struct Model::Impl {
             for (int e = 0; e < l.n_exp; ++e)
                 if (l.slot[(size_t) e] < 0) c.push_back({l.il, e, sum > 0 ? p[e] / sum : 0.0});
         }
-        std::stable_sort(c.begin(), c.end(), [](const Cand& a, const Cand& b) { return a.share > b.share; });
+        // (DS4_HELPER_DRAFT: a block's experts first - the drafter runs every round, and its hottest are in VRAM
+        //  already, so by their share the rest lost the pool's last places to the trunk's and stayed on the CPU lane:
+        //  61 of a request's 495 drafter picks with a 109 GB pool.  The shares themselves stay as they are: the load
+        //  says how much of the routing the pool covers from them)
+        std::stable_sort(c.begin(), c.end(), [&](const Cand& a, const Cand& b) {
+            const bool da = helper_draft && L[(size_t) a.layer].mtp, db = helper_draft && L[(size_t) b.layer].mtp;
+            if (da != db) return da;
+            return a.share > b.share;
+        });
         // DS4_HELPER_RECENT: hr_want slots of each layer it takes experts of, carved first (the profile's coldest of
         // its pool give way) - all of them inside DS4_HELPER_GB, refused before any upload if they do not fit
         size_t hr_bytes = 0;
@@ -14749,12 +14766,14 @@ struct Model::Impl {
         }
     }
 
-    // (the window's plan) its layers' requests to the helper's thread, in seq order
-    void helper_window(int T, const WinPlan& wp) {
+    // (the window's plan) its layers' requests to the helper's thread, in seq order - the trunk's, or (DS4_HELPER_DRAFT)
+    // a draft's DSpark blocks [il0, il1)
+    void helper_window(int T, const WinPlan& wp, int il0 = 0, int il1 = -1) {
         if (helper_dead.load(std::memory_order_relaxed)) return;
+        if (il1 < 0) il1 = g.nl;
         {
             std::lock_guard<std::mutex> lk(hq_mu);
-            for (int il = 0; il < g.nl; ++il)
+            for (int il = il0; il < il1; ++il)
                 if (L[(size_t) il].helper_tab != nullptr) hq.push_back({il, wp.seq[il], T});
         }
         hq_cv.notify_one();
@@ -16766,6 +16785,9 @@ struct Model::Impl {
             dp.seq[il] = ++seq_issued;
             layer_of[dp.seq[il] % kRing].store(il, std::memory_order_release);
         }
+        // (DS4_HELPER_DRAFT: a block with experts in the helper's pool - its requests to the helper's thread, as a
+        //  trunk window's; without them the service thread waited for a helper that was never asked)
+        if (helper_n > 0 && dp.async) helper_window(T, dp, g.nl, g.nl + g.n_mtp);
         const size_t hs = (size_t) T * H * D, rs = (size_t) g.win * g.hd;
         if (dump_d != nullptr && h_dump == nullptr &&
             (!halloc(h_dump, (size_t) g.n_mtp * kWin * H * D, err) || !halloc(h_dump_ring, (size_t) g.n_mtp * rs, err)))
@@ -17075,6 +17097,9 @@ struct Model::Impl {
             dp.seq[il] = ++seq_issued;
             layer_of[dp.seq[il] % kRing].store(il, std::memory_order_release);
         }
+        // (DS4_HELPER_DRAFT: the blocks' requests to the helper's thread, as draft_'s - a window of NR rows, as the
+        //  trunk's multi window of T rows is)
+        if (helper_n > 0 && dp.async) helper_window(NR, dp, g.nl, g.nl + g.n_mtp);
         int cur = d_dev;   // the device the blocks' rows are on
         std::vector<char> handed(devs.size(), 0);   // (DS4_DECODE_TRIM 8: a device's one block hand-off region)
         const size_t nh = (size_t) NR * H * D * 4, np = (size_t) NR * 8 * 4;
