@@ -911,13 +911,14 @@ below that prompts run in windows of 16. The log says which.
 A short prompt (an agent's turn of a few hundred to a few thousand tokens) routes to nearly every expert in RAM, most of
 them for one to three of its tokens, and the chunked pass streams each of them whole over PCIe - on PCIe 3.0 about
 1 ms an expert. With `MAYA_DS4_PREFILL_CPU=1`, after each layer's routing the experts not already copied early are
-taken fewest tokens first for the CPU lane while its estimated time stays under the stream's for the rest (an expert's
-stream time by that GPU's own link, so a slower link gives the CPU more); the CPU computes them while the GPU streams
-and computes the others, and their outputs are added after the layer's streamed and VRAM experts (as
-`MAYA_GLM_PREFILL_CPU` does for GLM). Those experts' sums are then the CPU's, not the GPU's, so the
-last bits of the answer can move as they do between the chunked pass and windows of 16. Prompt chunks of more than
-`MAYA_DS4_PREFILL_CPU_MAX_T` tokens, tensor-parallel layers and the helper are unchanged. `DS4_PREFILL_STATS=1` adds
-a line a prompt and GPU: `DS4_PREFILL_CPU gpu= layers= experts= rows= cpu_ms= wait_ms= lane_busy=`.
+taken fewest tokens first for the CPU lane while its estimated time stays under the stream's for the rest (a row's
+CPU time measured at the load, an expert's stream time by that GPU's own link, so a slower link gives the CPU more);
+the CPU computes them while the GPU streams and computes the others, and their outputs are added after the layer's
+streamed and VRAM experts (as `MAYA_GLM_PREFILL_CPU` does for GLM). Those experts' sums are then the CPU's, not the
+GPU's, so the last bits of the answer can move as they do between the chunked pass and windows of 16. Prompt chunks of
+more than `MAYA_DS4_PREFILL_CPU_MAX_T` tokens, tensor-parallel layers and the helper are unchanged.
+`DS4_PREFILL_STATS=1` adds a line a prompt and GPU: `DS4_PREFILL_CPU gpu= layers= experts= rows= cpu_ms= wait_ms=
+lane_busy=`.
 
 Two Xeon E5-2697 v2 (Ivy Bridge, AVX without AVX2, DDR3-1600) + 2x RTX 3090 on PCIe 3.0 x16, Maya-S, layer split,
 a fresh engine per run with the same expert profile: fresh prompts of 326 / 602 / 1,638 tokens 7.6 / 9.0 / 11.5 ->
@@ -926,13 +927,15 @@ a fresh engine per run with the same expert profile: fresh prompts of 326 / 602 
 4.1-4.9 s. Decode the same; a 20K start (chunks of 8,192) unchanged. Each GPU's expert time by its link (the default:
 0.85-1.10 ms there, 11.4-12.1 GB/s) against the fixed values, two runs each: through the staging the same as 0.9 (fresh
 prompts 17.9 / 18.1 s together, agent turns 56.6 / 56.4 s), with `DS4_FLOW_COPY_DMA=1` fresh prompts 14.2 / 14.5 s
-and agent turns 2% slower than 1.2 (47.5 / 46.5 s).
+and agent turns 2% slower than 1.2 (47.5 / 46.5 s). The load's row time came out 0.48-0.49 ms there, the 0.49 read
+from the prompts' own `DS4_PREFILL_CPU` lines before (six runs: agent turns 47.4 / 47.7 s with the DMA copies, 56.7 /
+56.3 s through the staging, against 0.49 set).
 
 | Setting | Default | |
 | --- | --- | --- |
 | `MAYA_DS4_PREFILL_CPU` | off (0) | `1`: a prompt chunk's least-picked RAM experts on the CPU lane while the GPU streams the rest (the last bits can move) |
 | `MAYA_DS4_PREFILL_CPU_MAX_T` | 4096 | the largest chunk, in tokens, that gets a CPU share |
-| `MAYA_DS4_PREFILL_CPU_ROW_MS` | 0.49 | the CPU lane's time for one token of one expert it plans with, ms (measured on the box above) |
+| `MAYA_DS4_PREFILL_CPU_ROW_MS` | measured at the load | the CPU lane's time for one token of one expert it plans with, ms: lower gives the CPU more. Unset: the lane computes 64 of a layer's experts for one and two tokens once at the load, in steps of 0.01 ms (the log's `DS4_PREFILL_CPU: the CPU lane` line; 0.49 where nothing was measured, the box above). A value sets it |
 | `MAYA_DS4_PREFILL_CPU_EXPERT_MS` | each GPU's link | the stream's time for one expert it plans with, ms: higher gives the CPU more. Unset: each GPU's own, the layer's expert bytes over the link the load measures, in steps of 0.05 ms (the log's `DS4_PREFILL_CPU: a streamed expert` line; 0.9 where a link was not measured). A value sets it for every GPU (on the box above 0.9 measured best through the staging, 1.2 with `DS4_FLOW_COPY_DMA=1`; 0.3 / 0.5 / 1.5 / 2.0 slower) |
 
 ## DeepSeek: long prompts on a layer split (`DS4_SPLIT`, several GPUs)

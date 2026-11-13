@@ -4782,6 +4782,7 @@ struct Model::Impl {
                          cs_margin, cs_every);
         }
         if (pk.gguf) make_pools();
+        if (chunk > 0) pcpu_measure_rows();   // (DS4_PREFILL_CPU: the lane's time a row, before any request)
         if (chunk > 0) {
             // the CPU lane's parts pinned (the chunks stream them to the GPUs by DMA), each layer's virtual slots
             // An OS that will not lock them all keeps them unpinned (#521: Windows counts page-locked memory against its
@@ -6627,7 +6628,7 @@ struct Model::Impl {
     // streams nearly every CPU-lane expert it routes to, most of them for one to three rows (2x RTX 3090 on PCIe 3,
     // Maya-S: 600 new tokens 10 s, 7,700 experts / 87 GB streamed, 1,500 of them for one row). Per layer the experts
     // not read early (flow_spec) are taken fewest rows first while the lane's estimated time stays under the stream's
-    // for the rest (DS4_PREFILL_CPU_ROW_MS a row, pcpu_exp_ms a streamed expert on that device); their virtual slots
+    // for the rest (pcpu_measure_rows a row, pcpu_exp_ms a streamed expert on that device); their virtual slots
     // move behind the streamed ones and the chunk is sorted again, so the stream sees only its own and the CPU's rows
     // are one range, combined after the layer's streamed and VRAM experts - the CPU's sums of those experts, not the
     // GPU's, so the last bits can move as with the window path. Two Xeon E5-2697 v2 (AVX, no AVX2) + 2x RTX 3090 on
@@ -6638,8 +6639,9 @@ struct Model::Impl {
     struct PcpuCfg {
         bool on = false;
         int max_t = 4096;
-        double row_ms = 0.49;
+        double row_ms = 0.49;  // (where the lane was not measured: two Xeon E5-2697 v2)
         double exp_ms = 0.9;   // (where a device's link was not measured: the best there through the staging)
+        bool row_set = false;  // (DS4_PREFILL_CPU_ROW_MS given: that, not the load's measurement)
         bool exp_set = false;  // (DS4_PREFILL_CPU_EXPERT_MS given: that for every device, not its link's)
     };
     static const PcpuCfg& pcpu_cfg() {
@@ -6648,7 +6650,10 @@ struct Model::Impl {
             const char* v = ds4_env("DS4_PREFILL_CPU");
             p.on = v != nullptr && std::atoi(v) != 0;
             if (const char* m = ds4_env("DS4_PREFILL_CPU_MAX_T")) p.max_t = std::max(1, std::atoi(m));
-            if (const char* r = ds4_env("DS4_PREFILL_CPU_ROW_MS")) p.row_ms = std::max(1e-4, std::atof(r));
+            if (const char* r = ds4_env("DS4_PREFILL_CPU_ROW_MS")) {
+                p.row_ms = std::max(1e-4, std::atof(r));
+                p.row_set = true;
+            }
             if (const char* e = ds4_env("DS4_PREFILL_CPU_EXPERT_MS")) {
                 p.exp_ms = std::max(1e-4, std::atof(e));
                 p.exp_set = true;
@@ -6666,6 +6671,59 @@ struct Model::Impl {
         const PcpuCfg& cf = pcpu_cfg();
         if (cf.exp_set || c.pc_link <= 0) return cf.exp_ms;
         return std::max(0.05, std::round((double) unit(l) / c.pc_link * 1e3 / 0.05) * 0.05);
+    }
+    // the CPU lane's time a row, ms, measured once at the load (DS4_PREFILL_CPU_ROW_MS unset): the first layer with 64
+    // experts on the lane (no VRAM slot; copied into RAM where the lane copies), those 64 for one and two rows in turn
+    // (the share's experts: the fewest rows first), four passes, the first a warm-up, the middle of the other three, in
+    // steps of 0.01 ms; 0: not measured, the default (0.49 on two Ivy Bridge Xeons is about four times what a
+    // Threadripper 5975WX's lane takes, #959). (plan_streams' host_list is made before each prompt, not yet here)
+    double pc_row_ms = 0.0;
+    void pcpu_measure_rows() {
+        const PcpuCfg& cf = pcpu_cfg();
+        if (!cf.on || cf.row_set) return;
+        const Layer* lp = nullptr;
+        std::vector<int> es;
+        for (const Layer& l : L) {
+            if (l.nm != 1 || l.mtp || l.packed_host || l.slot.size() < (size_t) l.n_exp) continue;
+            es.clear();
+            for (int e = 0; e < l.n_exp && es.size() < 64; ++e)
+                if (l.slot[(size_t) e] < 0 && (!copy_mode || l.ram[(size_t) e] >= 0)) es.push_back(e);
+            if (es.size() == 64) {
+                lp = &l;
+                break;
+            }
+        }
+        if (lp == nullptr) {
+            std::fprintf(stderr, "ds4: DS4_PREFILL_CPU: no layer with 64 experts on the CPU lane to time: %.2f ms a row "
+                                 "(DS4_PREFILL_CPU_ROW_MS sets it)\n", cf.row_ms);
+            return;
+        }
+        const int D = g.dim;
+        std::vector<float> x((size_t) 2 * D);   // (two tokens' inputs: small values, no zeros)
+        for (size_t i = 0; i < x.size(); ++i) x[i] = 0.01f * (float) ((int) (i % 13) - 6) + 0.001f;
+        std::vector<Ent> ents;
+        int rows = 0;
+        for (int i = 0; i < 64; ++i) {
+            Ent en;
+            en.e = es[(size_t) i];
+            en.n = 1 + (i & 1);
+            en.slot0 = rows;
+            for (int k = 0; k < en.n; ++k) en.tok[k] = k;
+            if (rows + en.n > kSlots) break;
+            rows += en.n;
+            ents.push_back(en);
+        }
+        std::vector<double> t;
+        for (int rep = 0; rep < 4; ++rep) {
+            const double t0 = now_ms();
+            cpu_experts(*lp, x.data(), ents, (size_t) D);
+            if (rep > 0) t.push_back(now_ms() - t0);
+        }
+        std::sort(t.begin(), t.end());
+        pc_row_ms = std::max(0.01, std::round(t[1] / rows / 0.01) * 0.01);
+        std::fprintf(stderr, "ds4: DS4_PREFILL_CPU: the CPU lane %.2f ms a row (%zu experts, %d rows of layer %d, "
+                             "measured; DS4_PREFILL_CPU_ROW_MS sets it)\n",
+                     pc_row_ms, ents.size(), rows, lp->il);
     }
     // (the lane's scratch, c_xh / c_yd / the pools: one caller at a time - the devices run chunks side by side, and a
     // prompt's CPU share holds it from its first call to its last outputs read; cpu_experts takes it too)
@@ -6704,10 +6762,11 @@ struct Model::Impl {
         std::sort(cand.begin(), cand.end());   // (fewest rows first, then by expert: the same choice every run)
         const int n_items = ns + (int) cand.size();
         const double exp_ms = pcpu_exp_ms(c, L0);
+        const double row_ms = pc_row_ms > 0 ? pc_row_ms : cf.row_ms;
         double rows = 0;
         int j = 0;
         for (; j < (int) cand.size(); ++j) {
-            const double cpu_t = (rows + cand[(size_t) j].first) * cf.row_ms;
+            const double cpu_t = (rows + cand[(size_t) j].first) * row_ms;
             const double pcie_t = (double) (n_items - (j + 1)) * exp_ms;
             if (cpu_t > pcie_t) break;
             rows += cand[(size_t) j].first;
