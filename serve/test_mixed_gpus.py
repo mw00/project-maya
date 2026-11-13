@@ -1,4 +1,4 @@
-"""serve/mixed_gpus.py: the two-GPU opt-in's config switch, its arguments, and its fallback to one GPU."""
+"""serve/mixed_gpus.py: the two-GPU mode's config switch (on by itself where found), its arguments, and its fallback to one GPU."""
 import os
 import sys
 import unittest
@@ -22,8 +22,33 @@ class Base:
 
 
 class TestMixedGpus(unittest.TestCase):
-    def test_off_by_default(self):
-        self.assertIsNone(MG.config_of(dict(CFG)))
+    def test_auto_where_found(self):
+        real = (MG.nvidia_listed, MG.windows, MG.Path.is_file)
+        try:
+            MG.Path.is_file = lambda self: True
+            MG.windows = lambda: False
+            MG.nvidia_listed = lambda: False   # (no NVIDIA card: as before)
+            self.assertIsNone(MG.config_of(dict(CFG)))
+            MG.nvidia_listed = lambda: True    # (a card and a CUDA build: on by itself where AUTO)
+            self.assertIsNone(MG.config_of(dict(CFG)))   # (AUTO False: only said)
+            MG.AUTO = True
+            self.assertEqual(MG.config_of(dict(CFG))["layers"], "auto")
+            self.assertIsNone(MG.config_of(dict(CFG, mixed_gpus=False)))   # (switched off)
+            self.assertEqual(MG.config_of(dict(CFG, mixed_gpus=6))["layers"], 6)
+            self.assertIsNone(MG.config_of(dict(CFG, backend="cuda")))
+            MG.windows = lambda: True           # (Windows: as before)
+            self.assertIsNone(MG.config_of(dict(CFG)))
+        finally:
+            MG.nvidia_listed, MG.windows, MG.Path.is_file = real
+            MG.AUTO = False
+
+    def test_off_when_not_found(self):
+        real = MG.nvidia_listed
+        try:
+            MG.nvidia_listed = lambda: False
+            self.assertIsNone(MG.config_of(dict(CFG)))
+        finally:
+            MG.nvidia_listed = real
         self.assertIsNone(MG.config_of(dict(CFG, mixed_gpus=False)))
 
     def test_on_and_layers(self):

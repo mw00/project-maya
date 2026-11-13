@@ -1,5 +1,6 @@
-"""Two GPUs of different makers in one PC as one DeepSeek-V4.1 model (opt-in: "mixed_gpus" in the config, maya.py
---mixed-gpus on|off|<layers>; off by default).  An AMD APU's GPU (the config's HIP engine) runs the trunk's later layers,
+"""Two GPUs of different makers in one PC as one DeepSeek-V4.1 model (on by itself where it is found: a DeepSeek
+config on an AMD GPU (HIP), Linux, an NVIDIA card that nvidia-smi lists and a CUDA build of maya-ds4 beside the HIP one;
+"mixed_gpus": false in the config / maya.py --mixed-gpus off turns it off, a layer count sets the card's share).  An AMD APU's GPU (the config's HIP engine) runs the trunk's later layers,
 the head, the sampling and the drafter; an NVIDIA card beside it (a CUDA build of maya-ds4) the first layers - as many
 as its free VRAM holds with every expert resident, measured at each start (maya-ds4 --mixed-plan).  A prompt's rows go
 from one engine to the other through shared pinned memory.
@@ -9,9 +10,11 @@ and watches both.  If either ends - the NVIDIA card or its link gone, a crash, a
 with a clear line, and the next request starts the model on the HIP GPU alone (it loads the first layers then, which
 the part never held: no RAM spent on them while both run); the next Maya start tries both GPUs again.
 
-Answer-changing: the NVIDIA card computes its layers in FP16, so answers can be worded differently from the HIP GPU
-alone (prompt answers match in tests).  Not through it (refused with a clear message): pictures, log-probabilities,
-abliteration, --parallel above 1.  Linux only for now (Windows has no shared-memory path for it yet)."""
+Answer-changing (on by default as the owner's exception): the NVIDIA card computes its layers in FP16, so answers can
+be worded differently from the HIP GPU alone (prompt answers match in tests).  A request with pictures,
+log-probabilities or refusal ablation runs on the HIP GPU alone (the engines are swapped for it, a load of a minute or
+so), the next request on both again; a config with --parallel above 1 runs on the HIP GPU alone.  Linux only for now
+(Windows has no shared-memory path for it yet): Windows and PCs without a second maker's card run as before."""
 from __future__ import annotations
 
 import os
@@ -22,6 +25,10 @@ import threading
 from pathlib import Path
 
 PLAN_TIMEOUT_S = 180
+# found two GPUs and no "mixed_gpus" in the config: on by itself only where it is faster at decode too (the owner's
+# rule) - Radeon 8065S + V100, Maya-XS: prompts +11/+39/+75 % at 2K/8K/32K but decode -1..-4 %, so not yet: the setup and
+# the log say how to turn it on.  A prompt-reading-only mode (decode on the AMD GPU alone) would make it on by itself.
+AUTO = False
 # flags the two-GPU run leaves out: abliteration's projection is not carried through the link (the engines would
 # disagree), and the AMD GPU's VRAM reserve is not the NVIDIA card's
 ABLATE_FLAGS = {"--ablate": 1, "--ablate-default": 1, "--ablate-layer": 1, "--ablate-scale": 1}
@@ -35,19 +42,53 @@ class Unavailable(Exception):
         self.again = again
 
 
+def nvidia_listed() -> bool:
+    """nvidia-smi lists a card (Linux; no nvidia-smi: none)."""
+    try:
+        r = subprocess.run(["nvidia-smi", "-L"], capture_output=True, text=True, timeout=20)
+        return r.returncode == 0 and "GPU 0" in r.stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+def windows() -> bool:
+    return os.name == "nt"
+
+
+def cuda_exe(cfg: dict) -> str:
+    return cfg.get("mixed_exe") or str(Path(cfg["exe"]).resolve().parents[1] / "build-cuda" / Path(cfg["exe"]).name)
+
+
+def auto_found(cfg: dict) -> bool:
+    """Two GPUs found for a config that does not set "mixed_gpus": Linux, a DeepSeek config on the HIP engine, an
+    NVIDIA card listed and the CUDA build of maya-ds4 there (the card's layer room is measured at the start)."""
+    return (not windows() and cfg.get("backend") == "hip" and "maya-ds4" in Path(str(cfg.get("exe", ""))).name
+            and Path(cuda_exe(cfg)).is_file() and nvidia_listed())
+
+
 def config_of(cfg: dict) -> dict | None:
-    """The config's two-GPU setting ("mixed_gpus": true / a layer count / false), None when off or not for this
-    config (a DeepSeek config on the HIP engine)."""
+    """The config's two-GPU setting ("mixed_gpus": true / a layer count / false; not set: on when auto_found), None
+    when off or not for this config (a DeepSeek config on the HIP engine)."""
     v = cfg.get("mixed_gpus")
-    if v is None or v is False or v == 0 or str(v).lower() in ("off", "false", "0", ""):
+    if v is None:
+        if not auto_found(cfg):
+            return None   # (Windows, no NVIDIA card or no CUDA build: as before, not a line said)
+        if not AUTO:
+            print("[maya] two GPUs: an NVIDIA card beside the AMD GPU - `maya --mixed-gpus on` runs DeepSeek on both "
+                  "(long prompts read much faster, decode about the same; answers can be worded slightly differently)",
+                  flush=True)
+            return None
+        print("[maya] two GPUs: an NVIDIA card beside the AMD GPU - DeepSeek runs on both (on by itself; "
+              "`maya --mixed-gpus off` or \"mixed_gpus\": false in the config turns it off)", flush=True)
+        v = True
+    if v is False or v == 0 or str(v).lower() in ("off", "false", "0", ""):
         return None
     if cfg.get("backend") != "hip" or "maya-ds4" not in Path(str(cfg.get("exe", ""))).name:
         print("[maya] two GPUs (mixed_gpus): only a DeepSeek config on an AMD GPU (HIP) with an NVIDIA card beside it "
               "- this config runs as before", flush=True)
         return None
     layers = "auto" if v is True or str(v).lower() in ("on", "true", "auto") else int(v)
-    exe = cfg.get("mixed_exe") or str(Path(cfg["exe"]).resolve().parents[1] / "build-cuda" / Path(cfg["exe"]).name)
-    return {"layers": layers, "exe": exe, "gpu": int(cfg.get("mixed_gpu", 0))}
+    return {"layers": layers, "exe": cuda_exe(cfg), "gpu": int(cfg.get("mixed_gpu", 0))}
 
 
 def strip_flags(args: list[str], flags: dict[str, int]) -> list[str]:
@@ -147,9 +188,7 @@ def engine_class(base, wait_gpu_release):
                 raise Unavailable("the config names no --pack", False)
             pack = args[args.index("--pack") + 1]
             common = set_flag(strip_flags(list(args), ABLATE_FLAGS), "--threads", "on")
-            if any(a in args for a in ABLATE_FLAGS):
-                print("[maya] two GPUs: abliteration is off in this mode (not carried between the two engines)",
-                      flush=True)
+            ablate = "--ablate" in args[:-1]   # (a request that ablates runs on the AMD GPU alone, which loads it)
             fenv = dict(env or os.environ)
             fenv.pop("HIP_VISIBLE_DEVICES", None)
             fenv["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
@@ -188,6 +227,53 @@ def engine_class(base, wait_gpu_release):
                 raise Unavailable(f"the AMD GPU's engine stopped (exit {self.part.returncode}; its log: {part_log})")
             self.mixed_on = True
             self.info["mixed_gpus"] = k
+            if ablate:   # (INFO ablate as the AMD GPU alone has it: a request may ask, and then runs there)
+                d = args[args.index("--ablate-default") + 1] if "--ablate-default" in args[:-1] else "off"
+                self.info["ablate"] = 1
+                self.info["ablate_default"] = 1 if d == "on" else 0
+            print("[maya] two GPUs: on - `maya --mixed-gpus off` (or \"mixed_gpus\": false in the config) runs the "
+                  "model on the AMD GPU alone", flush=True)
+
+        def use(self, alone: str | None):
+            """Before a request (the caller holds the engine): alone (why) - the AMD GPU alone for it (the two engines
+            stopped, it loads every layer); None - both GPUs again if this one ran alone for an earlier request."""
+            spawn = getattr(self, "spawn", None)
+            if spawn is None or self.mixed_off or self._closed:
+                return
+            keep = (self._rids, self._routes, self._routes_lock)   # (as restart(): the request numbers go on)
+            try:
+                self._use(alone, spawn)
+            finally:
+                self._rids, self._routes, self._routes_lock = keep
+
+        def _use(self, alone, spawn):
+            if alone and self.mixed_on:
+                print(f"[maya] two GPUs: this request {alone} - it runs on the AMD GPU alone (loading it, a minute or "
+                      "so); the next request without it runs on both again", flush=True)
+                base.stop(self)
+                self._stop_part()
+                self.ended = False
+                self.mixed_on = False
+                self.alone_for = alone
+                base.__init__(self, *spawn)
+            elif not alone and getattr(self, "alone_for", None) and not self.mixed_on:
+                print("[maya] two GPUs: back on both GPUs (loading them, a minute or so)", flush=True)
+                base.stop(self)
+                self.ended = False
+                self.alone_for = None
+                try:
+                    self._start_mixed(spawn)
+                    self.spawn = spawn   # (as at the first start: the HIP engine's command)
+                except Unavailable as e:
+                    self.spawn = spawn
+                    p = getattr(self, "proc", None)
+                    if p is not None and p.poll() is None:
+                        p.kill()
+                        p.wait(timeout=20)
+                        wait_gpu_release(p.pid)
+                    self._stop_part()
+                    self._fall(str(e), e.again)
+                    base.__init__(self, *spawn)
 
         def _watch_load(self, ready: threading.Event):
             """While the front loads (it waits for the part): a part that ends ends the front too, at once."""

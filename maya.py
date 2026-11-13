@@ -4755,14 +4755,15 @@ def nvidia_beside() -> bool:
 
 
 def set_mixed_gpus(cfg: dict, value: str | None) -> None:
-    """--mixed-gpus on|off|<layers> into a DeepSeek config on an AMD GPU: "mixed_gpus": true (or the layer count), or
-    left out (off, the default).  serve/mixed_gpus.py then starts a CUDA engine on the NVIDIA card beside it for the
-    first layers (sized from its free VRAM at each start) and watches both.  None: unchanged."""
+    """--mixed-gpus on|off|<layers> into a DeepSeek config on an AMD GPU: "mixed_gpus": true (or the layer count) or
+    false; left out: on by itself where an NVIDIA card and a CUDA build are found (Linux).  serve/mixed_gpus.py then
+    starts a CUDA engine on the NVIDIA card beside it for the first layers (sized from its free VRAM at each start) and
+    watches both.  None: unchanged."""
     if value is None:
         return
     if value == "off":
-        cfg.pop("mixed_gpus", None)
-        ok("two GPUs: off (--mixed-gpus off; the default)")
+        cfg["mixed_gpus"] = False
+        ok("two GPUs: off (--mixed-gpus off: the model runs on the AMD GPU alone; --mixed-gpus on turns it on again)")
         return
     if cfg.get("backend") != "hip":
         warn("--mixed-gpus is for a DeepSeek config on an AMD GPU with an NVIDIA card beside it: not this config")
@@ -4771,7 +4772,8 @@ def set_mixed_gpus(cfg: dict, value: str | None) -> None:
     exe = Path(cfg.get("mixed_exe") or Path(cfg["exe"]).resolve().parents[1] / "build-cuda" / Path(cfg["exe"]).name)
     ok("two GPUs: on (--mixed-gpus; the NVIDIA card runs the first layers - " +
        ("as many as its free VRAM holds" if value == "on" else f"{value} of them") +
-       "; answers can be worded differently, pictures and log-probabilities are not available in this mode)")
+       "; answers can be worded slightly differently from one GPU alone; a request with pictures, log-probabilities "
+       "or refusal ablation runs on the AMD GPU alone; --mixed-gpus off turns it off)")
     if not exe.is_file():
         warn(f"two GPUs: no CUDA build of maya-ds4 at {exe} - build it (cmake -S . -B build-cuda "
              "-DSTRATA_ENABLE_CUDA=ON -DSTRATA_ENABLE_HIP=OFF; cmake --build build-cuda --target maya-ds4) or set "
@@ -6575,9 +6577,16 @@ def write_config_ds4(a, pc: dict, meta: dict, pack: Path, ctx: int, models: Path
             kept.append(k)
     set_fast_prefill(cfg, getattr(a, "fast_prefill", None))
     set_mixed_gpus(cfg, getattr(a, "mixed_gpus", None))
-    if hip and "mixed_gpus" not in cfg and getattr(a, "mixed_gpus", None) is None and nvidia_beside():
-        say("  (optional, off: this PC also has an NVIDIA card - `--mixed-gpus on` runs DeepSeek's first layers on it "
-            "beside the AMD GPU, long prompts read faster; answers can be worded differently; needs a CUDA build)")
+    if hip and os.name != "nt" and "mixed_gpus" not in cfg and getattr(a, "mixed_gpus", None) is None and nvidia_beside():
+        exe = Path(cfg.get("mixed_exe") or Path(cfg["exe"]).resolve().parents[1] / "build-cuda" / Path(cfg["exe"]).name)
+        if exe.is_file():
+            say("  two GPUs: this PC also has an NVIDIA card - `--mixed-gpus on` runs DeepSeek's first layers there "
+                "beside the AMD GPU (long prompts read much faster, decode about the same; answers can be worded "
+                "slightly differently from the AMD GPU alone; `--mixed-gpus off` turns it off again)")
+        else:
+            say(f"  (this PC also has an NVIDIA card: with a CUDA build of maya-ds4 at {exe} (cmake -S . -B build-cuda "
+                "-DSTRATA_ENABLE_CUDA=ON -DSTRATA_ENABLE_HIP=OFF; cmake --build build-cuda --target maya-ds4) DeepSeek "
+                "can run on both GPUs (`--mixed-gpus on`) - long prompts read much faster)")
     env = {**(old.get("env") or {}), **parse_env(a.env)}
     if env:
         cfg["env"] = env
@@ -7867,9 +7876,9 @@ def main() -> int:
                     help="DeepSeek: fast prompt reading - long prompts read faster (the prompt skip as a per-layer "
                          "cone); answers can shift slightly, so it is off by default; kept in the config")
     ap.add_argument("--mixed-gpus", type=mixed_gpus_value, metavar="on|off|LAYERS",
-                    help="DeepSeek on an AMD GPU with an NVIDIA card beside it: the card runs the first layers (as many "
-                         "as its free VRAM holds, or LAYERS) - long prompts read faster; answers can be worded "
-                         "differently, no pictures or log-probabilities in this mode; off by default; kept in the config")
+                    help="DeepSeek on an AMD GPU with an NVIDIA card beside it (Linux): the card runs the first layers (as "
+                         "many as its free VRAM holds, or LAYERS) - long prompts read much faster; answers can be "
+                         "worded slightly differently; off: the AMD GPU alone; kept in the config")
     ap.add_argument("--port", type=int, help="the dashboard's and the API's port (default 8080)")
     ap.add_argument("--host", help="where the server listens: 127.0.0.1 = this machine only (default), 0.0.0.0 = also "
                                    "other devices on your network (set --api-key too)")

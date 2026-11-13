@@ -782,9 +782,10 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
     // (MAYA_MIXED_FRONT: the first layers here, the rest in a second engine - pictures and log-probabilities are not
     //  carried through it: the server is told there are none, and a request that asks is refused below)
     const bool mixed = m.pool_front();
-    for (const std::string& l : m.info_lines())
-        std::printf("%s\n", mixed && l.rfind("INFO vision=", 0) == 0 ? "INFO vision=off" : l.c_str());
-    if (!mixed) std::printf("INFO logprobs=%d\n", strata::ds4::kTopLogprobs);   // (GEN logprobs=<k>: LP lines, k at most this)
+    // (serve/mixed_gpus.py runs a request with pictures or log-probabilities on the AMD GPU alone, whose INFO lines
+    //  these are - one that reaches this engine anyway is refused below)
+    for (const std::string& l : m.info_lines()) std::printf("%s\n", l.c_str());
+    std::printf("INFO logprobs=%d\n", strata::ds4::kTopLogprobs);   // (GEN logprobs=<k>: LP lines, k at most this)
     std::printf("INFO logit_bias=1\n");   // (GEN logit_bias=<id>:<bias>,...: added to the logits of every pick)
     if (m.ablate_loaded())   // (--ablate: GEN ablate=0|1 turns its projection off / on for the request)
         std::printf("INFO ablate=1 ablate_default=%d\n", m.ablating() ? 1 : 0);

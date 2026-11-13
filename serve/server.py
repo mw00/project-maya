@@ -2514,8 +2514,6 @@ class Service:
         if isinstance(req.get("top_logprobs"), str):
             req["top_logprobs"] = n
         top = (getattr(self.engine, "info", None) or {}).get("logprobs")
-        if n is not None and (getattr(self.engine, "info", None) or {}).get("mixed_gpus"):
-            raise ValueError("logprobs: not given with two GPUs (--mixed-gpus) yet - start Maya without it for them")
         if n is not None and not (isinstance(top, int) and top >= n):
             raise ValueError("logprobs: this model's engine does not report token log-probabilities (the DeepSeek "
                              "engine does - update Maya (./maya.sh --setup) if it is that one)")
@@ -2607,6 +2605,25 @@ class Service:
                     part.close()
             except Exception as e:  # noqa: BLE001 - ending anyway
                 print(f"[maya] stopping {type(part).__name__}: {e}", flush=True)
+
+    def alone_reason(self, sampling: dict, pictures) -> str | None:
+        """Two GPUs (serve/mixed_gpus.py): why this request runs on the AMD GPU alone - None: on both."""
+        if not hasattr(self.engine, "use"):
+            return None
+        if pictures:
+            return "has pictures"
+        if logprobs_asked(sampling) is not None:
+            return "asks for log-probabilities"
+        if sampling.get("ablate", self.sampling_defaults.get("ablate")) is True:
+            return "uses refusal ablation"
+        return None
+
+    def engine_for(self, alone: str | None):
+        """Two GPUs: the engines for this request (the caller holds the FIFO) - see MixedEngine.use."""
+        use = getattr(self.engine, "use", None)
+        if use is not None:
+            with self._engine_start:
+                use(alone)
 
     def ensure_engine(self):
         """The engine running (the caller holds the FIFO): started again after an idle unload, or after it died in an
@@ -3575,9 +3592,6 @@ class Service:
                 # GLM-5.3 (glm-dsa) has no vision tower: say so plainly - there is no encoder to choose
                 raise ValueError(f"{self.model} reads text only, so it cannot read images: send the request without "
                                  "the image parts (describe the picture in text instead)")
-            if self.vision is None and (getattr(self.engine, "info", None) or {}).get("mixed_gpus"):
-                raise ValueError("pictures are not read with two GPUs (--mixed-gpus) yet - start Maya without it for "
-                                 "them")
             if self.vision is None:
                 raise ValueError("this server was started without the vision encoder (run setup again and choose "
                                  "'vision'), so it cannot read images or videos")
@@ -3602,6 +3616,7 @@ class Service:
                 if cancel is not None and cancel.is_set():
                     raise ValueError("image preparation was cancelled")
                 self.ensure_engine()                     # (the encoder borrows the engine's memory: it must run)
+                self.engine_for("has pictures")          # (two GPUs: pictures are read on the AMD GPU alone)
                 with self.vision.active():
                     enc = []
                     for kind, src in media:
@@ -4340,6 +4355,7 @@ class Service:
                 if self.vision is not None and self.vision.owed:   # memory an encode borrowed, not back yet
                     self.vision.settle()
                 self.ensure_engine()   # after an idle unload, or issue #27: it died in an earlier request
+                self.engine_for(self.alone_reason(sampling, emb))   # (two GPUs: what runs on the AMD GPU alone)
                 with self.status_lock:
                     self.status.update(busy=True, phase="reading the prompt", prompt_tokens=len(ids), generated=0,
                                        started=time.time(), tool=None, tail="", max_tokens=max_new)
