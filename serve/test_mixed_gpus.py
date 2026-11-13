@@ -56,6 +56,12 @@ class TestMixedGpus(unittest.TestCase):
         self.assertEqual(MG.config_of(dict(CFG, mixed_gpus=8))["layers"], 8)
         self.assertTrue(MG.config_of(dict(CFG, mixed_gpus=True))["exe"].endswith(os.path.join("build-cuda", "maya-ds4")))
 
+    def test_mode(self):
+        self.assertEqual(MG.config_of(dict(CFG, mixed_gpus=True))["mode"], MG.MODE)
+        self.assertEqual(MG.config_of(dict(CFG, mixed_gpus=True, mixed_mode="helper"))["mode"], "helper")
+        self.assertEqual(MG.config_of(dict(CFG, mixed_gpus=True, mixed_mode="split"))["mode"], "split")
+        self.assertEqual(MG.config_of(dict(CFG, mixed_gpus=True, mixed_mode="x"))["mode"], MG.MODE)
+
     def test_only_hip_deepseek(self):
         self.assertIsNone(MG.config_of(dict(CFG, mixed_gpus=True, backend="cuda")))
         self.assertIsNone(MG.config_of(dict(CFG, mixed_gpus=True, exe="/x/build/maya")))

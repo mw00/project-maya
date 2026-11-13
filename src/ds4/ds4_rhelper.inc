@@ -8,7 +8,7 @@
     // kHelperWaitMs: its CPU lane takes the picks from then on (helper_dead), as with DS4_HELPER.
     struct RhHdr {
         unsigned magic, nl, n_exp, dim;
-        volatile unsigned lead_ready, helper_ready, quit, dead, bits_ready, pad_[3];
+        volatile unsigned lead_ready, helper_ready, quit, dead, bits_ready, pdone, pad_[2];   // (pdone: a prompt job's seq)
         volatile unsigned long long head, tail;   // jobs written by the lead / taken by the helper
     };
     struct RhJob {
@@ -21,6 +21,12 @@
     // DS4_RHELPER_HOT=1 (both engines): the helper's own VRAM experts are its share (the lead keeps every expert and
     // leaves those to it in decode) - a lead that holds the whole model, a helper with the fastest memory
     bool rh_hot = std::getenv("DS4_RHELPER_HOT") != nullptr && std::atoi(std::getenv("DS4_RHELPER_HOT")) != 0;
+    // DS4_RHELPER_ONLY=1 (the hot helper): its GPU holds experts only - no layer's dense weights, no head - so its
+    // VRAM takes about twice the hottest experts (it never runs a layer itself)
+    bool rh_only() const {
+        static const bool on = std::getenv("DS4_RHELPER_ONLY") != nullptr && std::atoi(std::getenv("DS4_RHELPER_ONLY")) != 0;
+        return on && rh_serve && rh_hot;
+    }
     float* rh_dout = nullptr;   // (the hot helper: its sums on its GPU, copied out by DMA to rh_hres)
     float* rh_hres = nullptr;
     uint8_t* rh_base = nullptr;
@@ -31,9 +37,13 @@
     size_t rh_off_flags = 0, rh_off_res = 0, rh_off_reqs = 0;
     std::string rh_name;
 
+    // DS4_RHELPER_PROMPT=1 (the hot helper, both engines): a prompt chunk's experts of the helper's VRAM go to it too -
+    // the chunk's rows and picks out, its sums of the experts the lead leaves to it back, added before the layer's end
+    static constexpr int kRhPRows = 4096;   // (a chunk of more rows: the lead alone)
+    size_t rh_off_px = 0, rh_off_pidx = 0, rh_off_pw = 0, rh_off_ptake = 0, rh_off_pout = 0, rh_off_end = 0;
     size_t rh_size() const {
         rh_layout();
-        return rh_off_reqs + sizeof(Req) * kRing;
+        return rh_off_end;
     }
     void rh_layout() const {
         auto* self = const_cast<Impl*>(this);
@@ -45,6 +55,19 @@
         self->rh_off_res = off;
         off += al((size_t) kRing * kWin * (size_t) g.dim * 4);
         self->rh_off_reqs = off;
+        off += al(sizeof(Req) * kRing);
+        const size_t R = (size_t) kRhPRows;
+        self->rh_off_px = off;
+        off += al(R * (size_t) g.dim * 4);
+        self->rh_off_pidx = off;
+        off += al(R * kPicks * 4);
+        self->rh_off_pw = off;
+        off += al(R * kPicks * 4);
+        self->rh_off_ptake = off;
+        off += al((size_t) g.n_exp);
+        self->rh_off_pout = off;
+        off += al(R * (size_t) g.dim * 4);
+        self->rh_off_end = off;
     }
     bool rh_map(bool make, std::string& err) {
 #ifdef _WIN32
@@ -185,6 +208,17 @@
     bool rh_direct_on(const Layer& l) const {
         return rh_direct && l.helper_tab != nullptr && !helper_dead.load(std::memory_order_relaxed);
     }
+    // DS4_RHELPER_LATE=1 (a hot helper's lead, verify windows): the helper's sums read in place by the experts' combine,
+    // which waits for its flag on this GPU after this GPU's own experts (not before them) - the same sums, in the
+    // same order; the lead's memory must reach the block at full speed (an integrated GPU's host memory)
+    // (decode's routing) the helper's experts left out of this GPU's table while it answers; gone: the whole table again
+    unsigned long long* rh_vtab(const Layer& l) const {
+        return l.rh_tab != nullptr && !helper_dead.load(std::memory_order_relaxed) ? l.rh_tab : l.vram_tab;
+    }
+    bool rh_late_on() const {
+        static const bool on = std::getenv("DS4_RHELPER_LATE") != nullptr && std::atoi(std::getenv("DS4_RHELPER_LATE")) != 0;
+        return on && rh_hot;
+    }
     bool rh_help_in(int slot, unsigned sq, int T, cudaStream_t s, std::string& err) {
         wait_seq(helper_flags + kRing + slot, sq, s);
         const float* y = helper_res + (size_t) slot * kWin * (size_t) g.dim;
@@ -280,6 +314,7 @@
             devs[0].allocs.push_back(rh_ones);
         }
         if (const char* v = std::getenv("DS4_RHELPER_DIRECT")) rh_direct = std::atoi(v) != 0;
+        if (rh_hot && !rh_p_alloc(err)) return false;
         devs[0].allocs.push_back(rh_dreq);
         devs[0].allocs.push_back(rh_dresp);
         reqs = (Req*) (rh_base + rh_off_reqs);
@@ -299,16 +334,243 @@
             j.il = il;
             j.T = T;
             j.seq = wp.seq[il];
+            j.pad = 0;   // (a decode job)
             ++h;
         }
         std::atomic_thread_fence(std::memory_order_release);
         rh_hdr->head = h;
     }
+    // ---- DS4_RHELPER_PROMPT: a prompt chunk's helper experts (the lead's side) ----
+    bool rh_pon = std::getenv("DS4_RHELPER_PROMPT") != nullptr && std::atoi(std::getenv("DS4_RHELPER_PROMPT")) != 0;
+    bool rh_pdead = false;
+    unsigned rh_pseq = 0;
+    int* rh_ppos = nullptr;     // (device: row t's one "pick" is row t - pout added to acc through moe_combine)
+    float* rh_pone = nullptr;   // (device: weight 1)
+    double rh_pwait_ms = 0, rh_phelp_ms = 0;
+    long long rh_pjobs = 0, rh_prows = 0, rh_pall = 0, rh_plate = 0;
+    // DS4_RHELPER_PSHARE (0.45): the share of a chunk's routed rows the helper takes at most (its experts, busiest
+    // first); DS4_RHELPER_PMIN (512): fewer rows a chunk - the lead alone
+    double rh_pshare = std::getenv("DS4_RHELPER_PSHARE") ? std::atof(std::getenv("DS4_RHELPER_PSHARE")) : 0.45;
+    int rh_pmin = std::getenv("DS4_RHELPER_PMIN") ? std::atoi(std::getenv("DS4_RHELPER_PMIN")) : 512;
+    bool rh_p_ok(const Layer& L0, const Chunk& c, int T) const {
+        static std::atomic<bool> said{false};
+        if (rh_pon && L0.il == 10 && !said.exchange(true))
+            std::fprintf(stderr, "ds4: helper engine: a prompt chunk (layer %d, %d rows): lead %d hot %d dead %d rows %d "
+                                 "tab %d own %zu members %d acc64 %d host %zu helper_dead %d\n", L0.il, T, (int) rh_lead,
+                         (int) rh_hot, (int) rh_pdead, (int) (rh_ppos != nullptr), (int) (L0.helper_tab != nullptr),
+                         L0.helper.size(), L0.nm, (int) (c.acc64 != nullptr), L0.host_list.size(),
+                         (int) helper_dead.load());
+        return rh_lead && rh_hot && rh_pon && !rh_pdead && rh_ppos != nullptr && L0.helper_tab != nullptr &&
+               !L0.helper.empty() && L0.nm == 1 && !(c.acc64 != nullptr && chunk_par()) && L0.host_list.empty() &&
+               T >= rh_pmin && T <= kRhPRows && !helper_dead.load(std::memory_order_relaxed);
+    }
+    bool rh_p_alloc(std::string& err) {   // (the lead, rh_reqs: its add's rows and weights)
+        if (!rh_pon) return true;
+        std::vector<int> p((size_t) kRhPRows * kPicks, -1);
+        std::vector<float> w((size_t) kRhPRows * kPicks, 0.0f);
+        for (int t = 0; t < kRhPRows; ++t) p[(size_t) t * kPicks] = t, w[(size_t) t * kPicks] = 1.0f;
+        if (cudaMalloc((void**) &rh_ppos, p.size() * 4) != cudaSuccess ||
+            cudaMalloc((void**) &rh_pone, w.size() * 4) != cudaSuccess ||
+            cudaMemcpy(rh_ppos, p.data(), p.size() * 4, cudaMemcpyHostToDevice) != cudaSuccess ||
+            cudaMemcpy(rh_pone, w.data(), w.size() * 4, cudaMemcpyHostToDevice) != cudaSuccess) {
+            err = "a helper in another engine: its prompt rows";
+            return false;
+        }
+        devs[0].allocs.push_back(rh_ppos);
+        devs[0].allocs.push_back(rh_pone);
+        std::fprintf(stderr, "ds4: helper engine: prompt chunks of %d-%d rows give it its experts (at most %.0f %% of "
+                             "the rows; DS4_RHELPER_PROMPT)\n", rh_pmin, kRhPRows, rh_pshare * 100.0);
+        return true;
+    }
+    // (before the routing's sync) the chunk's rows and picks into the block
+    bool rh_p_out(const Chunk& c, int T, cudaStream_t s, std::string& err) {
+        CK(cudaMemcpyAsync(rh_base + rh_off_px, c.x, (size_t) T * g.dim * 4, cudaMemcpyDeviceToHost, s));
+        CK(cudaMemcpyAsync(rh_base + rh_off_pidx, c.ridx, (size_t) T * kPicks * 4, cudaMemcpyDeviceToHost, s));
+        CK(cudaMemcpyAsync(rh_base + rh_off_pw, c.rw, (size_t) T * kPicks * 4, cudaMemcpyDeviceToHost, s));
+        return true;
+    }
+    // (after it, the bounds b known) the helper's experts, busiest first, up to its share; vt[v] = 1: its slot v
+    unsigned rh_p_push(const Layer& L0, int T, const std::vector<int>& b, std::vector<char>& vt) {
+        const int ne = L0.n_exp;
+        vt.assign(b.size(), 0);
+        std::vector<std::pair<int, int>> own;   // (rows, expert)
+        for (int e = 0; e < ne; ++e)
+            if (L0.helper[(size_t) e] != nullptr) {
+                const int v = L0.vs_pin[e];
+                own.push_back({b[(size_t) v + 1] - b[(size_t) v], e});
+            }
+        std::sort(own.begin(), own.end(), [](const std::pair<int, int>& a, const std::pair<int, int>& c) {
+            return a.first != c.first ? a.first > c.first : a.second < c.second;
+        });
+        uint8_t* take = rh_base + rh_off_ptake;
+        std::memset(take, 0, (size_t) ne);
+        const long long cap = (long long) (rh_pshare * (double) T * (double) L0.k_exp);
+        long long rows = 0;
+        for (const auto& o : own) {
+            if (o.first == 0 || rows + o.first > cap) continue;
+            rows += o.first;
+            take[o.second] = 1;
+            vt[(size_t) L0.vs_pin[o.second]] = 1;
+        }
+        rh_prows += rows;
+        rh_pall += (long long) T * L0.k_exp;
+        const unsigned sq = ++rh_pseq;
+        unsigned long long h = rh_hdr->head;
+        while (h - rh_hdr->tail >= kRhJobs) cpu_relax();
+        RhJob& j = rh_jobs[h % kRhJobs];
+        j.il = L0.il;
+        j.T = T;
+        j.seq = sq;
+        j.pad = 1;   // (a prompt job)
+        std::atomic_thread_fence(std::memory_order_release);
+        rh_hdr->head = h + 1;
+        ++rh_pjobs;
+        return sq;
+    }
+    // (the lead, right after the routing's sort) the rows, picks and bounds out; the job pushed once they landed - the
+    // shared expert still running here
+    cudaEvent_t rh_pev = nullptr;
+    bool rh_p_early(const Chunk& c, const Layer& L0, int T, int n_vs, cudaStream_t s, std::vector<char>& vt,
+                    unsigned& sq, std::string& err) {
+        if (!rh_p_out(c, T, s, err)) return false;
+        if (rh_pev == nullptr) CK(cudaEventCreateWithFlags(&rh_pev, cudaEventDisableTiming));
+        CK(cudaEventRecord(rh_pev, s));
+        CK(cudaEventSynchronize(rh_pev));
+        const std::vector<int> b(c.bounds_pin, c.bounds_pin + n_vs + 1);
+        sq = rh_p_push(L0, T, b, vt);
+        return true;
+    }
+    // the lead's own experts of the chunk: the runs of slots the helper does not take
+    bool rh_p_lead(Dev& d, Chunk& c, const Layer& L0, const Layer& l, const std::vector<int>& b,
+                   const std::vector<char>& vt, int v0, int n, int T, std::string& err) {
+        int v = v0;
+        while (v < n) {
+            while (v < n && vt[(size_t) v]) ++v;
+            int w = v;
+            while (w < n && !vt[(size_t) w]) ++w;
+            if (w > v && !run_vram(d, c, L0, l, l, b.data(), v, w, T, err)) return false;
+            v = w;
+        }
+        return true;
+    }
+    // its sums waited for (the host: no answer in kHelperWaitMs - the lead computes those experts itself from then on)
+    bool rh_p_join(Dev& d, Chunk& c, const Layer& L0, const Layer& l, const std::vector<int>& b,
+                   const std::vector<char>& vt, unsigned sq, int T, std::string& err) {
+        const double t0 = now_ms();
+        bool late = false;
+        while ((int) (*(volatile unsigned*) &rh_hdr->pdone - sq) < 0) {
+            if (!late && cudaStreamQuery(d.st) == cudaSuccess) late = true;   // (this GPU done first: the helper late)
+            if (rh_hdr->dead != 0 || now_ms() - t0 > (double) kHelperWaitMs) {
+                std::fprintf(stderr, "ds4: helper engine: no answer to a prompt chunk in %.0f ms - prompts on this GPU "
+                                     "alone from now on\n", now_ms() - t0);
+                rh_pdead = true;
+                std::vector<char> rest(vt.size(), 0);
+                for (size_t i = 0; i < vt.size(); ++i) rest[i] = !vt[i];
+                return rh_p_lead(d, c, L0, l, b, rest, 0, L0.pv_n, T, err);
+            }
+            cpu_relax();
+        }
+        std::atomic_thread_fence(std::memory_order_acquire);
+        rh_pwait_ms += now_ms() - t0;
+        rh_plate += late;
+        float* y = rh_dev<float>(rh_off_pout);
+        if (y == nullptr) {
+            err = "a helper in another engine: its prompt sums' device address";
+            return false;
+        }
+        moe_combine(c.acc, y, rh_ppos, rh_pone, T, 1, 0, T, g.dim, d.st);
+        return true;
+    }
+    // ---- (the helper's side) a prompt job: its experts the lead left to it, over the chunk's rows ----
+    std::vector<int> rh_pvs_h;
+    int* rh_pvs = nullptr;
+    bool rh_p_serve(const RhJob& j, std::string& err) {
+        Layer& l = L[(size_t) j.il];
+        Dev& d = devs[0];
+        if (chunks.empty() || chunks[0] == nullptr || j.T > chunks[0]->C) {
+            err = "DS4_RHELPER_SERVE: a prompt job of " + std::to_string(j.T) + " rows (its chunks: --prefill-chunk " +
+                  std::to_string(chunks.empty() || chunks[0] == nullptr ? 0 : chunks[0]->C) + ")";
+            return false;
+        }
+        Chunk& c = *chunks[0];
+        cudaStream_t s = d.st;
+        const int T = j.T, D = g.dim, ne = l.n_exp, nv = l.pv_n + 1;
+        if (rh_pvs == nullptr && cudaMalloc((void**) &rh_pvs, (size_t) ne * 4) != cudaSuccess) {
+            err = "DS4_RHELPER_SERVE: its prompt slots";
+            return false;
+        }
+        const uint8_t* take = rh_base + rh_off_ptake;
+        rh_pvs_h.assign((size_t) ne, l.pv_n);   // (not its: the last slot, never run)
+        for (int e = 0; e < ne; ++e)
+            if (take[e] && l.slot[(size_t) e] >= 0 && l.slot[(size_t) e] < l.pv_n) rh_pvs_h[(size_t) e] = l.slot[(size_t) e];
+        const double t0 = now_ms();
+        CK(cudaMemcpyAsync(rh_pvs, rh_pvs_h.data(), (size_t) ne * 4, cudaMemcpyHostToDevice, s));
+        // DS4_RHELPER_PPIECE=N: the rows in pieces of N, each piece's copy in (stream ci) and its sums out (co) beside
+        // the compute of the others (the same sums: a row's experts are summed in one piece in slot order)
+        static const int piece = std::getenv("DS4_RHELPER_PPIECE") ? std::max(0, std::atoi(std::getenv("DS4_RHELPER_PPIECE"))) : 0;
+        const int P = piece > 0 ? piece : T;
+        if (rh_pci == nullptr) {
+            CK(cudaStreamCreateWithFlags(&rh_pci, cudaStreamNonBlocking));
+            CK(cudaStreamCreateWithFlags(&rh_pco, cudaStreamNonBlocking));
+            for (auto& e : rh_pev_in) CK(cudaEventCreateWithFlags(&e, cudaEventDisableTiming));
+            for (auto& e : rh_pev_done) CK(cudaEventCreateWithFlags(&e, cudaEventDisableTiming));
+        }
+        const int np = (T + P - 1) / P;
+        if (np > (int) rh_pev_in.size()) {
+            err = "DS4_RHELPER_PPIECE: more than " + std::to_string(rh_pev_in.size()) + " pieces a chunk";
+            return false;
+        }
+        for (int p = 0; p < np; ++p) {   // (every piece's rows in at once, in order: the link streams them)
+            const size_t r0 = (size_t) p * P, n = (size_t) std::min(P, T - (int) r0);
+            CK(cudaMemcpyAsync(c.x + r0 * D, rh_base + rh_off_px + r0 * D * 4, n * D * 4, cudaMemcpyHostToDevice, rh_pci));
+            CK(cudaMemcpyAsync(c.ridx + r0 * kPicks, rh_base + rh_off_pidx + r0 * kPicks * 4, n * kPicks * 4,
+                               cudaMemcpyHostToDevice, rh_pci));
+            CK(cudaMemcpyAsync(c.rw + r0 * kPicks, rh_base + rh_off_pw + r0 * kPicks * 4, n * kPicks * 4,
+                               cudaMemcpyHostToDevice, rh_pci));
+            CK(cudaEventRecord(rh_pev_in[(size_t) p], rh_pci));
+        }
+        CK(cudaMemsetAsync(c.acc, 0, (size_t) T * D * 4, s));
+        float *x0 = c.x, *a0 = c.acc, *w0 = c.rw;
+        int* i0 = c.ridx;
+        bool ok = true;
+        for (int p = 0; p < np && ok; ++p) {
+            const size_t r0 = (size_t) p * P;
+            const int n = std::min(P, T - (int) r0);
+            CK(cudaStreamWaitEvent(s, rh_pev_in[(size_t) p], 0));
+            c.x = x0 + r0 * D, c.acc = a0 + r0 * D, c.rw = w0 + r0 * kPicks, c.ridx = i0 + r0 * kPicks;
+            x3::rows_f16(c.x, D, nullptr, n, D, c.x16, s);
+            moe_sort(c.ridx, n, l.k_exp, rh_pvs, nv, c.bounds, c.row_tok, c.pos, s);
+            ok = cudaMemcpyAsync(c.bounds_pin, c.bounds, (size_t) (nv + 1) * 4, cudaMemcpyDeviceToHost, s) == cudaSuccess &&
+                 cudaStreamSynchronize(s) == cudaSuccess;
+            std::vector<int> b(c.bounds_pin, c.bounds_pin + nv + 1);
+            ok = ok && run_vram(d, c, l, l, l, b.data(), 0, l.pv_n, n, err) &&
+                 cudaEventRecord(rh_pev_done[(size_t) p], s) == cudaSuccess &&
+                 cudaStreamWaitEvent(rh_pco, rh_pev_done[(size_t) p], 0) == cudaSuccess &&
+                 cudaMemcpyAsync(rh_base + rh_off_pout + r0 * D * 4, c.acc, (size_t) n * D * 4, cudaMemcpyDeviceToHost,
+                                 rh_pco) == cudaSuccess;
+            c.x = x0, c.acc = a0, c.rw = w0, c.ridx = i0;
+        }
+        if (!ok || cudaStreamSynchronize(rh_pco) != cudaSuccess) {
+            if (err.empty()) err = "DS4_RHELPER_SERVE: a prompt job's copies or kernels";
+            return false;
+        }
+        rh_pserve_ms += now_ms() - t0;
+        std::atomic_thread_fence(std::memory_order_release);
+        rh_hdr->pdone = j.seq;
+        return true;
+    }
+    cudaStream_t rh_pci = nullptr, rh_pco = nullptr;
+    std::array<cudaEvent_t, 16> rh_pev_in{}, rh_pev_done{};
+    double rh_pserve_ms = 0;
     void rh_lead_end() {
         if (rh_hdr == nullptr) return;
         std::fprintf(stderr, "ds4: helper engine: the service thread waited %.1f ms for its answers, %lld experts "
                              "theirs, %lld of its own (CPU lane)\n", st.helper_ms, (long long) st.helper_experts,
                      (long long) st.cpu_experts);
+        if (rh_pjobs > 0)
+            std::fprintf(stderr, "ds4: helper engine: %lld prompt jobs, it took %.1f %% of their routed rows, the lead "
+                                 "waited %.1f ms for it (%lld chunks its sums came after this GPU's own)\n", rh_pjobs,
+                         rh_pall > 0 ? 100.0 * (double) rh_prows / (double) rh_pall : 0.0, rh_pwait_ms, rh_plate);
         rh_hdr->quit = 1;
         if (helper_flags != nullptr) *(volatile unsigned*) (helper_flags + 2 * kRing) = 1u;
     }
@@ -378,7 +640,12 @@
             rh_hres = (float*) (rh_base + rh_off_res);
             rh_dout = (float*) dev((size_t) kWin * D * 4);
             for (Layer& l : L) {
-                if (l.mtp || l.nm != 1 || l.vram_tab == nullptr) continue;
+                if (l.mtp || l.nm != 1 || l.vram_tab == nullptr) {
+                    if (l.n_vram > 0)
+                        std::fprintf(stderr, "ds4: helper engine: layer %d's %d VRAM experts not the lead's (drafter %d, "
+                                             "members %d)\n", l.il, l.n_vram, (int) l.mtp, l.nm);
+                    continue;
+                }
                 std::vector<unsigned long long> tb((size_t) l.n_exp, 0ull);
                 if (cudaMemcpy(tb.data(), l.vram_tab, tb.size() * 8, cudaMemcpyDeviceToHost) != cudaSuccess) ok = false;
                 uint8_t* bits = rh_bits + (size_t) l.il * (size_t) g.n_exp;
@@ -439,7 +706,7 @@
         }
         unsigned long long t = rh_hdr->tail;
         double idle0 = now_ms();
-        long long jobs = 0;
+        long long jobs = 0, pjobs = 0;
         while (!rh_hdr->quit) {
             const unsigned long long h = rh_hdr->head;
             if (t == h) {
@@ -453,6 +720,14 @@
             for (; t < h; ++t) {
                 const RhJob j = rh_jobs[t % kRhJobs];
                 if (j.il < 0 || j.il >= g.nl || L[(size_t) j.il].helper_tab == nullptr) continue;
+                if (j.pad == 1) {   // (a prompt chunk's experts: answered before the next job)
+                    if (!rh_p_serve(j, err)) {
+                        rh_hdr->dead = 1;
+                        return false;
+                    }
+                    ++pjobs;
+                    continue;
+                }
                 helper_enqueue(L[(size_t) j.il], (int) (j.seq % kRing), j.seq, j.T);
                 ++jobs;
             }
@@ -464,7 +739,8 @@
                 return false;
             }
         }
-        std::fprintf(stderr, "ds4: helper engine: the lead ended after %lld jobs\n", jobs);
+        std::fprintf(stderr, "ds4: helper engine: the lead ended after %lld jobs (%lld prompt chunks', %.1f ms a chunk)\n", jobs, pjobs,
+                     pjobs > 0 ? rh_pserve_ms / (double) pjobs : 0.0);
         if (rh_timed > 0)
             std::fprintf(stderr, "ds4: helper engine: a job %.3f ms on its GPU (the sums), %.3f ms between jobs (the next "
                                  "request's wait and take), %lld timed\n", rh_comp_ms / rh_timed, rh_gap_ms / rh_timed,

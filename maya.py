@@ -4740,10 +4740,10 @@ def set_fast_prefill(cfg: dict, value: str | None) -> None:
 
 
 def mixed_gpus_value(v: str) -> str:
-    """--mixed-gpus: on, off, or a layer count for the NVIDIA card (argparse's type)."""
-    if v in ("on", "off") or (v.isdigit() and int(v) > 0):
+    """--mixed-gpus: on, off, helper, split, or a layer count for the NVIDIA card (argparse's type)."""
+    if v in ("on", "off", "helper", "split") or (v.isdigit() and int(v) > 0):
         return v
-    raise argparse.ArgumentTypeError("on, off or a number of layers")
+    raise argparse.ArgumentTypeError("on, off, helper, split or a number of layers")
 
 
 def nvidia_beside() -> bool:
@@ -4768,6 +4768,11 @@ def set_mixed_gpus(cfg: dict, value: str | None) -> None:
     if cfg.get("backend") != "hip":
         warn("--mixed-gpus is for a DeepSeek config on an AMD GPU with an NVIDIA card beside it: not this config")
         return
+    if value in ("helper", "split"):   # (the way the two GPUs share the model: serve/mixed_gpus.py's mixed_mode)
+        cfg["mixed_mode"] = value
+        ok("two GPUs: " + ("the model on the AMD GPU, the NVIDIA card computes its most-routed experts for it"
+                           if value == "helper" else "the NVIDIA card runs the first layers") + " (mixed_mode)")
+        value = "on"
     cfg["mixed_gpus"] = True if value == "on" else int(value)
     exe = Path(cfg.get("mixed_exe") or Path(cfg["exe"]).resolve().parents[1] / "build-cuda" / Path(cfg["exe"]).name)
     ok("two GPUs: on (--mixed-gpus; the NVIDIA card runs the first layers - " +
@@ -6571,7 +6576,8 @@ def write_config_ds4(a, pc: dict, meta: dict, pack: Path, ctx: int, models: Path
            "gpu": [g["index"] for g in pc["gpus"]],
            "sampling": dict(DS4_SAMPLING), "reasoning_effort": DS4_EFFORT,   # (the model's own, every setup)
            "lib_dirs": meta.get("lib_dirs") or old.get("lib_dirs") or [], "port": port}
-    for k in ("host", "api_key", "cors_origins", "mcp_servers", "fast_prefill", "mixed_gpus", "mixed_exe", "mixed_gpu"):
+    for k in ("host", "api_key", "cors_origins", "mcp_servers", "fast_prefill", "mixed_gpus", "mixed_exe", "mixed_gpu",
+              "mixed_mode"):
         if old.get(k) is not None:
             cfg[k] = old[k]
             kept.append(k)
@@ -7875,7 +7881,7 @@ def main() -> int:
     ap.add_argument("--fast-prefill", choices=["on", "off"],
                     help="DeepSeek: fast prompt reading - long prompts read faster (the prompt skip as a per-layer "
                          "cone); answers can shift slightly, so it is off by default; kept in the config")
-    ap.add_argument("--mixed-gpus", type=mixed_gpus_value, metavar="on|off|LAYERS",
+    ap.add_argument("--mixed-gpus", type=mixed_gpus_value, metavar="on|off|helper|split|LAYERS",
                     help="DeepSeek on an AMD GPU with an NVIDIA card beside it (Linux): the card runs the first layers (as "
                          "many as its free VRAM holds, or LAYERS) - long prompts read much faster; answers can be "
                          "worded slightly differently; off: the AMD GPU alone; kept in the config")

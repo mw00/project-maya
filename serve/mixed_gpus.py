@@ -31,6 +31,16 @@ PLAN_SETTLE_S = 90   # (back on both GPUs: how long the NVIDIA card may take to 
 # rule) - Radeon 8065S + V100, Maya-XS: prompts +11/+39/+75 % at 2K/8K/32K but decode -1..-4 %, so not yet: the setup and
 # the log say how to turn it on.  A prompt-reading-only mode (decode on the AMD GPU alone) would make it on by itself.
 AUTO = False
+# "mixed_mode" (config): "helper" - the AMD GPU runs the whole model and the NVIDIA card computes the experts its VRAM
+# holds (the most-routed, experts only) for the AMD GPU's decode windows and prompt chunks, through shared memory (one
+# conversation; a card or link gone: the AMD GPU goes on alone, the request too); "split" - the card runs the first
+# layers (as before)
+MODE = "split"
+# the helper's engine settings: its VRAM all experts (no layer's dense weights), prompt chunks up to 4096 rows
+HELPER_ARGS = ["--max-context", "4352", "--threads", "on", "--dspark", "off", "--mmap-experts", "on",
+               "--prefill-chunk", "4096", "--reserve-mib", "1024"]
+HELPER_ENV = {"DS4_RHELPER_HOT": "1", "DS4_RHELPER_ONLY": "1", "DS4_BORROW": "0"}
+LEAD_ENV = {"DS4_RHELPER_HOT": "1"}
 # flags the two-GPU run leaves out: abliteration's projection is not carried through the link (the engines would
 # disagree), and the AMD GPU's VRAM reserve is not the NVIDIA card's
 ABLATE_FLAGS = {"--ablate": 1, "--ablate-default": 1, "--ablate-layer": 1, "--ablate-scale": 1}
@@ -90,7 +100,11 @@ def config_of(cfg: dict) -> dict | None:
               "- this config runs as before", flush=True)
         return None
     layers = "auto" if v is True or str(v).lower() in ("on", "true", "auto") else int(v)
-    return {"layers": layers, "exe": cuda_exe(cfg), "gpu": int(cfg.get("mixed_gpu", 0))}
+    mode = str(cfg.get("mixed_mode", MODE)).lower()
+    if mode not in ("helper", "split"):
+        print(f"[maya] two GPUs: mixed_mode {mode!r} is not \"helper\" or \"split\" - {MODE}", flush=True)
+        mode = MODE
+    return {"layers": layers, "exe": cuda_exe(cfg), "gpu": int(cfg.get("mixed_gpu", 0)), "mode": mode}
 
 
 def strip_flags(args: list[str], flags: dict[str, int]) -> list[str]:
@@ -152,7 +166,7 @@ def engine_class(base, wait_gpu_release):
         def __init__(self, exe, args, cwd=None, log=None, env=None, mixed=None):
             if mixed is not None:
                 self.mixed_cfg = mixed
-            self.mixed_on, self.part, self._closed = False, None, False
+            self.mixed_on, self.part, self._closed, self.helper_mode = False, None, False, False
             spawn = (exe, list(args), cwd, log, env)
             if getattr(self, "mixed_cfg", None) and not self.mixed_off:
                 try:
@@ -195,6 +209,8 @@ def engine_class(base, wait_gpu_release):
             fenv.pop("HIP_VISIBLE_DEVICES", None)
             fenv["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
             fenv["CUDA_VISIBLE_DEVICES"] = str(m["gpu"])
+            if m.get("mode") == "helper":
+                return self._start_helper(spawn, pack, fenv)
             k, why = plan(m["exe"], pack, fenv, cwd)
             # back on both GPUs after a request ran on the AMD GPU alone: the card frees the front's memory in its own
             # time, so plan again until it fits as many layers as the first start found (or PLAN_SETTLE_S passed)
@@ -248,12 +264,48 @@ def engine_class(base, wait_gpu_release):
             print("[maya] two GPUs: on - `maya --mixed-gpus off` (or \"mixed_gpus\": false in the config) runs the "
                   "model on the AMD GPU alone", flush=True)
 
+        def _start_helper(self, spawn, pack, fenv):
+            """mixed_mode "helper": the AMD GPU's engine as always (the whole model) and, beside it, the NVIDIA card's
+            engine holding the most-routed experts only, which computes them for the AMD GPU's decode windows and
+            prompt chunks (both engines find each other by a shared-memory block of their own name)."""
+            exe, args, cwd, log, env = spawn
+            m = self.mixed_cfg
+            name = f"maya-rh-{os.getpid()}-{int(time.time())}"
+            henv = dict(fenv)
+            henv.update(HELPER_ENV)
+            henv["DS4_RHELPER_SERVE"] = name
+            part_log = (str(Path(log).with_suffix("")) + ".helper.log") if log else os.devnull
+            self.part_log = part_log
+            with open(part_log, "a", encoding="utf-8") as plog:
+                self.part = subprocess.Popen([m["exe"], "--pack", pack, "--serve", *HELPER_ARGS], cwd=cwd,
+                                             stdin=subprocess.DEVNULL, stdout=plog, stderr=subprocess.STDOUT, env=henv,
+                                             preexec_fn=end_with_parent)
+            lenv = dict(env or os.environ)
+            lenv.update(LEAD_ENV)
+            lenv["DS4_RHELPER"] = name
+            print(f"[maya] two GPUs: the model on the AMD GPU, the NVIDIA card computes its most-routed experts for it "
+                  f"(its log: {part_log})", flush=True)
+            ready = threading.Event()
+            threading.Thread(target=self._watch_load, args=(ready,), daemon=True).start()
+            try:
+                base.__init__(self, exe, list(args), cwd, log, lenv)
+            except RuntimeError as e:
+                why = "the NVIDIA card's engine stopped while loading" if self.part.poll() is not None else str(e)
+                raise Unavailable(f"{why} (logs: {log}, {part_log})") from None
+            finally:
+                ready.set()
+            self.mixed_on = True
+            self.helper_mode = True
+            self.info["mixed_gpus"] = "helper"
+            print("[maya] two GPUs: on - `maya --mixed-gpus off` (or \"mixed_gpus\": false in the config) runs the "
+                  "model on the AMD GPU alone", flush=True)
+
         def use(self, alone: str | None):
             """Before a request (the caller holds the engine): alone (why) - the AMD GPU alone for it (the two engines
             stopped, it loads every layer); None - both GPUs again if this one ran alone for an earlier request."""
             spawn = getattr(self, "spawn", None)
-            if spawn is None or self.mixed_off or self._closed:
-                return
+            if spawn is None or self.mixed_off or self._closed or self.helper_mode:
+                return   # (helper mode: the AMD GPU's engine is the whole model and takes every request itself)
             keep = (self._rids, self._routes, self._routes_lock)   # (as restart(): the request numbers go on)
             try:
                 self._use(alone, spawn)
@@ -315,14 +367,15 @@ def engine_class(base, wait_gpu_release):
             wait_gpu_release(p.pid)
 
         def death_note(self) -> str:
-            if not self.mixed_on:
+            if not self.mixed_on or self.helper_mode:
                 return base.death_note(self)
             side = "the NVIDIA card's engine" if self._part_alive() else "the AMD GPU's engine"
             return (f"Two GPUs (--mixed-gpus): {side} ended, so this request could not finish; the next request runs the "
                     f"model on the AMD GPU alone (logs: {self.log_path}, {getattr(self, 'part_log', '')}).")
 
         def alive(self) -> bool:
-            return base.alive(self) and (not self.mixed_on or self._part_alive())
+            # (helper mode: the AMD GPU's engine goes on alone, with every expert, when the card's engine ends)
+            return base.alive(self) and (not self.mixed_on or self.helper_mode or self._part_alive())
 
         def restart(self):
             if self.mixed_on:

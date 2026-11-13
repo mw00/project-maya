@@ -6677,7 +6677,8 @@ struct Model::Impl {
     }
     // layer L0 of chunk k routed (bounds b, the device's copy d_bounds): its streamed experts as they land, the VRAM
     // ones in shares between them (the device works while the reads run)
-    bool flow_layer(Dev& d, Chunk& c, Layer& L0, int mi, int k, int T, const std::vector<int>& b, std::string& err) {
+    bool flow_layer(Dev& d, Chunk& c, Layer& L0, int mi, int k, int T, const std::vector<int>& b, std::string& err,
+                    const std::vector<char>* rh_vt = nullptr) {   // (rh_vt: the slots a helper engine takes, not run here)
         cudaStream_t s = d.st;
         const Layer& vx = member(L0, mi);   // (a member's: its part of each VRAM expert, L0's slots)
         if (c.spec_k != k || c.spec_il != L0.il) {
@@ -6725,10 +6726,14 @@ struct Model::Impl {
             c.n_comp = i1;
             if (!flow_pump(c, err)) return false;
             const int v_to = (int) ((int64_t) L0.pv_n * (int64_t) (c.n_comp - lb) / (int64_t) std::max<size_t>(1, n_lay));
-            if (!run_vram(d, c, L0, vx, vx, b.data(), v_done, v_to, T, err)) return false;
+            if (!(rh_vt ? rh_p_lead(d, c, L0, vx, b, *rh_vt, v_done, v_to, T, err)
+                        : run_vram(d, c, L0, vx, vx, b.data(), v_done, v_to, T, err)))
+                return false;
             v_done = v_to;
         }
-        if (!run_vram(d, c, L0, vx, vx, b.data(), v_done, L0.pv_n, T, err)) return false;
+        if (!(rh_vt ? rh_p_lead(d, c, L0, vx, b, *rh_vt, v_done, L0.pv_n, T, err)
+                    : run_vram(d, c, L0, vx, vx, b.data(), v_done, L0.pv_n, T, err)))
+            return false;
         while (c.base < c.n_comp && c.items.size() > 4096) {   // (done with: read, copied and used)
             flow_unpin(c.items.front());
             c.items.pop_front();
@@ -6862,7 +6867,7 @@ struct Model::Impl {
           for (int mi = 0; mi < l0.nm; ++mi) {
             Layer& l = member(l0, mi);
             if (l.dev != di) continue;
-            if ((part_srv || front_only) && away(l.il) && part_skip_dense()) {   // (a part server: the front's layers' weights stay on
+            if (((part_srv || front_only) && away(l.il) && part_skip_dense()) || rh_only()) {   // (a part server: the front's layers' weights stay on
                 if (!layer_state(d, l, err, acct)) return false;    //  disk; their state buffers - every loop over the
                 continue;                                           //  layers (reset, undo, checkpoints) touches them)
             }
@@ -6950,7 +6955,7 @@ struct Model::Impl {
             if (nm > 1) d.tp_w += (d.weights - w0) / (size_t) nm * (size_t) (nm - 1);
             d.weights += sp;
           }
-        if (d.grp == devs[(size_t) head_dev].grp) {   // the head: each member of its group a share of the columns
+        if (d.grp == devs[(size_t) head_dev].grp && !rh_only()) {   // the head: each member of its group a share of the columns
             const int hn = head_nm();
             if (!mat(d, "head", d.head, err, acct, d.mi, hn, true) || !f32(d, "norm.weight", d.norm_w, err, acct, (size_t) g.dim))
                 return false;
@@ -7620,7 +7625,10 @@ struct Model::Impl {
                 if (l.grp == (int) gi && l.mtp && l.n_cls == 1)
                     for (int e = 0; e < l.n_exp; ++e) dseen = dseen || prof[(size_t) l.il * g.n_exp + e] > 0;
             // (DS4_DRAFT_VRAM: each block's hottest up to its cap, as room goes - the profile's rule below not asked)
-            if (mroom.size() == 1 || !dseen || std::getenv("DS4_PLACE_UNIFORM") != nullptr || !draft_vram.empty()) {
+            if (rh_only()) {   // (MAYA_MIXED_HELPER's experts-only helper: the lead runs its drafter, none here)
+                for (Layer& l : L)
+                    if (l.grp == (int) gi && l.mtp && l.n_cls == 1) l.n_vram = 0;
+            } else if (mroom.size() == 1 || !dseen || std::getenv("DS4_PLACE_UNIFORM") != nullptr || !draft_vram.empty()) {
                 for (Layer& l : L)   // all of them, as room goes (DS4_DRAFT_VRAM: up to vram_cap)
                     if (l.grp == (int) gi && l.mtp && l.n_cls == 1) {
                         double& r = mroom[bm(l)];
@@ -18255,6 +18263,11 @@ struct Model::Impl {
         CK(cudaMemcpyAsync(l.vs_dev, l.vs_pin, (size_t) l.n_exp * 4, cudaMemcpyHostToDevice, s));   // (this member's)
         moe_sort(c.ridx, T, l.k_exp, l.vs_dev, n_vs, c.bounds, c.row_tok, c.pos, s);
         CK(cudaMemcpyAsync(c.bounds_pin, c.bounds, (size_t) (n_vs + 1) * 4, cudaMemcpyDeviceToHost, s));
+        // (MAYA_MIXED_HELPER, DS4_RHELPER_PROMPT: the helper's share of the chunk's experts out before the shared expert)
+        const bool rhp = mi == 0 && rh_p_ok(L0, c, T);
+        std::vector<char> rh_vt;
+        unsigned rh_sq = 0;
+        if (rhp && !rh_p_early(c, L0, T, n_vs, s, rh_vt, rh_sq, err)) return false;
         // the shared expert into acc while the host waits for the bounds
         if (!gemm(d, c, l.s1, c.x16, D, T, c.sg, FF, 0.0f, err) || !gemm(d, c, l.s3, c.x16, D, T, c.su, FF, 0.0f, err))
             return false;
@@ -18316,7 +18329,9 @@ struct Model::Impl {
             }
         }
         if (c.flow) {
-            if (!flow_layer(d, c, L0, mi, wp.k, T, b, err)) return false;
+            if (!flow_layer(d, c, L0, mi, wp.k, T, b, err, rhp ? &rh_vt : nullptr) ||
+                (rhp && !rh_p_join(d, c, L0, l, b, rh_vt, rh_sq, T, err)))
+                return false;
             if (xsum) moe_x_finish(c.acc, c.acc64, (size_t) T * D, s);
             static const bool flow_ar_dma = [] {
                 const char* on = ds4_env("DS4_FLOW_AR_DMA");
@@ -18347,6 +18362,12 @@ struct Model::Impl {
         int nb = 0;
         for (size_t q = S.kp; q < S.b.size() && S.b[q].il == L0.il && S.b[q].k == wp.k; ++q) ++nb;
         int v_done = 0;
+        if (rhp) {   // (the lead's experts but the helper's, then its sums added; no streamed batches: host_list empty)
+            if (!rh_p_lead(d, c, L0, l, b, rh_vt, 0, L0.pv_n, T, err) || !rh_p_join(d, c, L0, l, b, rh_vt, rh_sq, T, err))
+                return false;
+            v_done = L0.pv_n;
+            nb = 0;
+        }
         for (int bi = 0; bi < nb; ++bi) {
             const Batch& bt = S.b[S.kp];
             const int half = (int) (S.kp % P);
@@ -22125,7 +22146,7 @@ struct Model::Impl {
                 rp.n = l.n_exp;
                 rp.k = l.k_exp;
                 rp.route_scale = g.route_scale;
-                rp.vram = l.rh_tab != nullptr ? l.rh_tab : l.vram_tab;
+                rp.vram = rh_vtab(l);
                 rp.x = d.x;
                 rp.dim = D;
                 rp.idx = d.ridx;
@@ -22164,7 +22185,7 @@ struct Model::Impl {
                     route_ahead(gl, nx->gate_bias, nx->n_exp, m, T, preq, (a - 1) * kAhead1, s);
                     na[a - 1] = m;
                 }
-                route_publish(d.glog, l.gate_bias, l.n_exp, l.k_exp, T, g.route_scale, l.rh_tab != nullptr ? l.rh_tab : l.vram_tab, d.x, D, d.ridx, d.rw,
+                route_publish(d.glog, l.gate_bias, l.n_exp, l.k_exp, T, g.route_scale, rh_vtab(l), d.x, D, d.ridx, d.rw,
                               d.plan_ptr, lead ? preq : nullptr, sq, s, l.gate_bias_vl, l.mtp ? 0u : wp.vl,
                               na[0], na[1], lead && self_answer ? resps + slot : nullptr, d.cpu_any,
                               lane_done);
@@ -22264,11 +22285,19 @@ struct Model::Impl {
                 wa.wait_val = sq;
                 if (rh_lead && lead) {   // (MAYA_MIXED_HELPER's lead: the answer waited for, in by DMA, read here)
                     const bool rhd = rh_direct_on(l);
-                    if (!rhd) wait_seq(&resps[slot].seq, sq, s);
-                    if (!(rhd ? rh_help_in(slot, sq, T, s, err) : rh_resp_in(slot, T, s, err))) return false;
-                    wa.wait_ptr = nullptr;
-                    wa.cpu_part = &rh_dresp->part[0][0];
-                    wa.cpu_flag = rhd ? rh_ones : rh_dresp->cpu;
+                    if (rhd && rh_late_on()) {   // (DS4_RHELPER_LATE: its sums read in place, waited for after this GPU's own)
+                        wa.wait_ptr = helper_flags + kRing + slot;
+                        wa.wait_val = sq;
+                        wa.cpu_part = helper_res + (size_t) slot * kWin * (size_t) D;
+                        wa.cpu_stride = (size_t) D;
+                        wa.cpu_flag = rh_ones;
+                    } else {
+                        if (!rhd) wait_seq(&resps[slot].seq, sq, s);
+                        if (!(rhd ? rh_help_in(slot, sq, T, s, err) : rh_resp_in(slot, T, s, err))) return false;
+                        wa.wait_ptr = nullptr;
+                        wa.cpu_part = &rh_dresp->part[0][0];
+                        wa.cpu_flag = rhd ? rh_ones : rh_dresp->cpu;
+                    }
                 }
                 wa.x = d.x;
                 wa.x_stride = (size_t) D;
