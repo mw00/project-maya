@@ -145,8 +145,10 @@ glmd::PromptDims dims(const Glm5Geometry& g, size_t T, int64_t max_ctx) {
 size_t scratch_bytes(const Glm5Geometry& g, size_t T, int64_t max_ctx) {
     return glmd::prompt_tiling(dims(g, T, max_ctx)).sub_bytes + 4096;
 }
-size_t keep_bytes(const Glm5Geometry& g, size_t T, int64_t max_ctx) {
-    return glmd::prompt_tiling(dims(g, T, max_ctx)).keep_bytes + 4096;
+size_t keep_bytes(const Glm5Geometry& g, size_t T, int64_t max_ctx, bool halves) {
+    const auto one = [&](size_t t) { return glmd::prompt_tiling(dims(g, t, max_ctx)).keep_bytes + 4096; };
+    // (halves: room for the staggered prompt pipeline's two chunk halves too, each up to T / 2 + 128 rows)
+    return halves ? std::max(one(T), 2 * one(T / 2 + 128)) : one(T);
 }
 
 // Every GPU backend runs the code below: HIP through hip_compat (hipBLAS for the cuBLAS calls, the F32 prompt attention
