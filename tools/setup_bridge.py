@@ -138,7 +138,7 @@ class Bridge:
         self.log.write(("\n" if kind == "step" else "") + text + "\n")
 
     def _wait(self, *event):
-        key = (event[0], event[1]) if event[0] in ("ask", "choose") else None
+        key = (event[0], event[1]) if event[0] in ("ask", "choose", "text") else None
         if key is not None and self.step_no < 3:
             if self.replay:
                 old_key, answer = self.replay.pop(0)
@@ -149,10 +149,11 @@ class Bridge:
             if self.reopen is not None:
                 old_key, answer = self.reopen
                 self.reopen = None
-                valid = answer in (event[2] if event[0] == "ask" else range(len(event[3])))
+                valid = (answer in event[2] if event[0] == "ask" else
+                         answer in range(len(event[3])) if event[0] == "choose" else True)
                 if old_key == key and valid:
                     event = list(event)
-                    event[3 if event[0] == "ask" else 4] = answer
+                    event[{"ask": 3, "choose": 4, "text": 2}[event[0]]] = answer
         fut = Future()
         self.events.put((*event, fut))
         answer = fut.result()                            # a stop/back raises in the setup's thread
@@ -171,6 +172,13 @@ class Bridge:
         self.answers = []
         fut.set_exception(BackRequested())
         return True
+
+    def commit_add(self) -> None:
+        """After placing files, Esc from the model list returns to the family, not to the completed file action."""
+        if self.step_no < 3:
+            self.answers = self.answers[:1] if self.answers and self.answers[0][0] == ("choose", "Model?") else []
+            self.replay.clear()
+            self.reopen = None
 
     def _emit(self, event: tuple, text: str | None = None) -> bool:
         """`event` for the screen, `text` (the line printed without it) for the log and the summary."""
@@ -227,8 +235,17 @@ class Bridge:
         if not self._here():
             return None
         pick = self._wait("choose", question, list(intro), list(options), default, list(outro))
-        self._note("answer", f"  {question} {pick + 1}) {options[pick][0]}")
+        number = pick if options[0][0].startswith("0) ") else pick + 1
+        label = options[pick][0].removeprefix("0) ")
+        self._note("answer", f"  {question} {number}) {label}")
         return pick
+
+    def text(self, question, default=""):
+        if not self._here():
+            return None
+        answer = self._wait("text", question.strip(), default)
+        self._note("answer", f"  {question} {answer}")
+        return answer
 
     def run(self, cmd, cwd=None, env=None, keep=True, parent_pipe=False):
         """The command with its output on the screen as it comes (stdin closed: nothing can wait for a key).  keep:

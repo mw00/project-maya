@@ -137,6 +137,28 @@ class PlainSetup(unittest.TestCase):
         with patch.object(maya, "say", side_effect=AssertionError("nothing is printed")):
             self.assertEqual(maya.choose("Context?", [], [("8K", None, None), ("32K", None, None)], 1, False), 0)
 
+    def test_plain_model_menu_keeps_numbers_and_accepts_zero(self):
+        rows = [("0) Add downloaded model", None, None),
+                ("First", None, None), ("Second", None, None)]
+        with patch.object(maya, "say") as lines, patch.object(maya, "ask", return_value="0") as ask:
+            self.assertEqual(maya.choose("Which files?", [], rows, 0, False), 2)
+        printed = [call.args[0] for call in lines.call_args_list if call.args]
+        self.assertEqual(printed[:3], ["  0) Add downloaded model", "  1) First", "  2) Second"])
+        self.assertIn("  1) First", printed)
+        self.assertIn("  2) Second", printed)
+        self.assertIn("  0) Add downloaded model", printed)
+        self.assertEqual(ask.call_args.args[1], ["0", "1", "2"])
+
+    def test_add_menu_calls_standard_import_then_returns_to_model_list(self):
+        a = SimpleNamespace(copy=False, yes=False)
+        with tempfile.TemporaryDirectory() as folder, patch.object(maya, "choose", side_effect=[1, 1, 0]), \
+                patch.object(S, "ask_text", return_value=folder), \
+                patch.object(maya, "import_model", return_value=0) as imported:
+            models = Path(folder) / "models"
+            pick = maya.choose_with_add(a, "Which files?", [], [("First", None, None)], 0, False, models)
+            self.assertEqual(pick, 0)
+            imported.assert_called_once_with(a, folder, link=False, models_override=models, from_setup=True)
+
     def test_a_closed_screen_falls_back_to_print(self):
         S.UI = SimpleNamespace(say=lambda msg: False, ok=lambda msg: False)
         with patch("sys.stdout", new=io.StringIO()) as out:
@@ -300,6 +322,42 @@ class Screen(unittest.IsolatedAsyncioTestCase):
                 while app.return_value is None:
                     await pilot.pause(0.02)
         self.assertEqual(app.return_value, ("done", ("deepseek", None)))
+        bridge.log.close()
+
+    async def test_add_downloaded_model_accepts_path_and_returns_to_files_menu(self):
+        a = SimpleNamespace(models_dir=str(Path(self.dir.name) / "models"), copy=False, yes=False)
+        rows = [("First files", None, None), ("Second files", None, None)]
+        bridge = Bridge(self.log)
+        S.UI = bridge
+        body = lambda: maya.choose_with_add(a, "Which files?", [], rows, 0, False,
+                                             Path(a.models_dir))
+        app = T.SetupApp(bridge, body, "1.0", "./maya.sh", self.log)
+        async with app.run_test(size=(110, 40)) as pilot:
+            async def until(question):
+                t0 = time.time()
+                while app.pending is None or question not in str(app.query_one("#ask").border_title):
+                    self.assertLess(time.time() - t0, 20)
+                    await pilot.pause(0.02)
+
+            with patch.object(maya, "import_model", return_value=0) as imported:
+                await until("Which files?")
+                await pilot.press("0")
+                await until("Directory with downloaded model files")
+                await pilot.press("escape")
+                await until("Which files?")
+                await pilot.press("0")
+                await until("Directory with downloaded model files")
+                app.query_one("#text-answer", T.Input).value = self.dir.name
+                await pilot.press("enter")
+                await until("How to add the files?")
+                await pilot.press("1")
+                await until("Which files?")
+                await pilot.press("2")
+                while app.return_value is None:
+                    await pilot.pause(0.02)
+            imported.assert_called_once_with(a, self.dir.name, link=True,
+                                             models_override=Path(a.models_dir), from_setup=True)
+        self.assertEqual(app.return_value, ("done", 1))
         bridge.log.close()
 
     async def test_glm_model_files_come_before_gpu_choice(self):

@@ -139,14 +139,15 @@ def record(dest: Path) -> None:
     book_path.write_text(json.dumps(book, indent=1), encoding="utf-8")
 
 
-def place(path: Path, real: Path, size: int, entries: list, models: Path, copy: bool, say) -> dict:
+def place(path: Path, real: Path, size: int, entries: list, models: Path, copy: bool, say,
+          link: bool = False) -> dict:
     """Put one found file at its place(s) in the models folder: moved when it can be (same drive, no link), else
-    copied when copy says so (the original stays).  Returns {"moved": n, "copied": n, "skipped": [text]}."""
-    out = {"moved": 0, "copied": 0, "skipped": []}
+    copied when copy says so, or symlinked when link says so (the original stays)."""
+    out = {"moved": 0, "copied": 0, "linked": 0, "skipped": []}
     first = None                               # where the file went first: further places are copied from it
     for e in entries:
         dest = models / e["rel"]
-        if dest.exists():
+        if dest.exists() or dest.is_symlink():
             try:
                 same = dest.samefile(real)
             except OSError:
@@ -154,10 +155,24 @@ def place(path: Path, real: Path, size: int, entries: list, models: Path, copy: 
             if same:
                 record(dest)
                 continue
-            out["skipped"].append(f"{e['rel']} is there already ({dest.stat().st_size:,} bytes); not replaced "
+            size_here = f"{dest.stat().st_size:,} bytes" if dest.exists() else "broken link"
+            out["skipped"].append(f"{e['rel']} is there already ({size_here}); not replaced "
                                   f"(move it away to use {path.name})")
             continue
         dest.parent.mkdir(parents=True, exist_ok=True)
+        if link:
+            created = False
+            try:
+                dest.symlink_to(real)
+                created = True
+                record(dest)
+            except OSError as exc:
+                if created:
+                    dest.unlink(missing_ok=True)
+                out["skipped"].append(f"{path.name}: not linked to {dest} ({exc})")
+                continue
+            out["linked"] += 1
+            continue
         source = first or real
         linked = os.path.normcase(os.path.abspath(path)) != os.path.normcase(str(real))   # (reached through a link)
         can_move = first is None and not linked and same_drive(real, dest.parent)

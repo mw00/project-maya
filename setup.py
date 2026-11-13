@@ -111,6 +111,18 @@ def ask(question, choices, default, yes):
         say(f"  please answer one of: {', '.join(choices)}")
 
 
+def ask_text(question, default=""):
+    """Read a path or other free text during setup, on its screen or in the terminal."""
+    if UI is not None:
+        answer = UI.text(question, default)
+        if answer is not None:
+            return answer.strip()
+    try:
+        return input(f"{question}" + (f" [{default}]" if default else "") + ": ").strip() or default
+    except EOFError:
+        return default
+
+
 def run(cmd, cwd=None, env=None, check=True, quiet=False, echo=True):
     if echo:
         say("  > " + " ".join(str(c) for c in cmd))

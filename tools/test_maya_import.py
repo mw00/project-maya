@@ -56,11 +56,11 @@ class ImportTests(unittest.TestCase):
         p.write_bytes(data)
         return p
 
-    def run_import(self, copy=True, yes=True):
+    def run_import(self, copy=True, yes=True, link=False):
         a = argparse.Namespace(models_dir=str(self.models), copy=copy, yes=yes)
         with patch.object(maya, "import_catalog", return_value=self.cat), patch.object(maya, "configs", return_value=[]), \
                 patch.object(maya, "say"), patch.object(maya, "ok"), patch.object(maya, "warn") as warn:
-            code = maya.import_model(a, str(self.src))
+            code = maya.import_model(a, str(self.src), link=link)
         return code, warn
 
     def test_found_by_content_not_name_moved_and_recorded(self):
@@ -128,6 +128,33 @@ class ImportTests(unittest.TestCase):
         self.run_import()
         self.assertEqual((self.models / "Model-A/a-00001.safetensors").read_bytes(), BIG)
         self.assertTrue(blob.exists() and snap.is_symlink())       # the cache still works
+
+    def test_link_verifies_and_keeps_originals_on_the_same_drive(self):
+        good = self.put("renamed.bin", BIG)
+        wrong = self.put("wrong.bin", b"C" * len(BIG))
+        self.run_import(link=True)
+        dest = self.models / "Model-A/a-00001.safetensors"
+        self.assertTrue(dest.is_symlink())
+        self.assertEqual(dest.resolve(), good.resolve())
+        self.assertTrue(good.exists() and wrong.exists())
+        self.assertEqual(dest.read_bytes(), BIG)
+        with patch.object(maya, "sha256_ok", side_effect=AssertionError("read again")):
+            self.assertTrue(maya.sha256_checked(dest, sha(BIG)))
+
+    def test_link_to_cache_target_does_not_replace_an_existing_destination(self):
+        blob = self.put("blobs/a", BIG)
+        snap = self.src / "snapshots/a"
+        snap.parent.mkdir()
+        try:
+            os.symlink(blob, snap)
+        except (OSError, NotImplementedError):
+            self.skipTest("no symlinks here")
+        dest = self.models / "Model-A/a-00001.safetensors"
+        dest.parent.mkdir(parents=True)
+        dest.write_bytes(b"existing")
+        self.run_import(link=True)
+        self.assertEqual(dest.read_bytes(), b"existing")
+        self.assertTrue(blob.exists() and snap.is_symlink())
 
     def test_report_names_what_is_missing(self):
         self.put("a.bin", BIG)

@@ -915,18 +915,23 @@ def pick_cmake():
 def choose(question: str, intro: list, options: list, default: int, yes: bool, outro: list = ()) -> int:
     """The answer's index among `options`, each (label, note or None, about or None): a menu on the setup's screen
     (tools/setup_tui.py; `about` shows under the highlighted one), else the numbered list and the number typed."""
+    zero = bool(options) and options[0][0].startswith("0) ")
     if S.UI is not None and not yes:
-        pick = S.UI.choose(question, intro, options, default, outro)
+        pick = S.UI.choose(question, intro, options, default + int(zero), outro)
         if pick is not None:
-            return pick
+            return len(options) - 1 if zero and pick == 0 else pick - int(zero)
     say()
     for line in intro:
         say("  " + line)
     for i, (label, note, _) in enumerate(options, 1):
-        say(f"  {i}) {label}" + (f"   ({note})" if note else ""))
+        number = i - 1 if zero else i
+        say(f"  {label}" if zero and i == 1 else
+            f"  {number}) {label}" + (f"   ({note})" if note else ""))
     for line in outro:
         say("     " + line)
-    return int(ask(question, [str(i) for i in range(1, len(options) + 1)], str(default + 1), yes)) - 1
+    pick = ask(question, (["0"] if zero else []) + [str(i) for i in range(1, len(options) + 1 - int(zero))],
+               str(default + 1), yes)
+    return len(options) - 1 if zero and pick == "0" else int(pick) - 1
 
 
 def gpu_label(g) -> str:
@@ -1926,6 +1931,42 @@ def setup_gpus(a) -> list:
         return []
 
 
+def setup_models_dir(a, prev: dict) -> Path:
+    """The models folder this setup will use for the selected family."""
+    inst = prev.get("installer") or {}
+    return (Path(a.models_dir).expanduser().resolve() if getattr(a, "models_dir", None) else
+            Path(inst["models_dir"]) if inst.get("models_dir") else
+            Path(inst["data_dir"]) / "models" if inst.get("data_dir") else ROOT.parent / "Maya-data" / "models")
+
+
+def choose_with_add(a, question: str, intro: list, rows: list, default: int, yes: bool,
+                    models: Path) -> int:
+    """A model-files menu with 0 to place verified files, then choose from the same list."""
+    if yes:
+        return choose(question, intro, rows, default, yes)
+    options = [("0) Add downloaded model", None,
+                "Choose a directory, then link its verified files or import them into Maya's models folder.")] + rows
+    while True:
+        pick = choose(question, intro, options, default, False)
+        if pick < len(rows):
+            return pick
+        folder = S.ask_text("Directory with downloaded model files")
+        if not folder:
+            warn("enter a directory with downloaded model files")
+            continue
+        src = Path(folder).expanduser().resolve()
+        if not src.is_dir():
+            warn(f"{folder} is not a directory")
+            continue
+        action = choose("How to add the files?", [f"Source: {src}"],
+                        [("Link files", None, "Verify SHA-256, then create symbolic links. Originals stay in place."),
+                         ("Import Model", None, "Standard import: move files on the same drive, copy on another drive.")],
+                        0, False)
+        import_model(a, str(src), link=action == 0, models_override=models, from_setup=True)
+        if S.UI is not None and hasattr(S.UI, "commit_add"):
+            S.UI.commit_add()
+
+
 def choose_model(a, models: Path, inst: dict, family: str = "glm") -> tuple:
     """("download", one of MODELS) or ("local", the model's first .gguf file): --gguf-dir, --model, else asked among
     the downloads - the earlier download is the default.  ("exl3", the folder): --model-dir naming an EXL3 folder of
@@ -1967,7 +2008,8 @@ def choose_model(a, models: Path, inst: dict, family: str = "glm") -> tuple:
                          f"{m['about']}; {g53_memory_note(quant=q)}"))
         rows.append((f"{G53.SHOWN} (744B, text only): GGUF files you already have", None,
                      "Z.ai's GLM-5.3 on the same engine; set up from its GGUF folder with --gguf-dir <folder>"))
-        pick = choose(f"Which {G53.SHOWN}?", ["The model to set up:"], rows, g53.index(default), a.yes)
+        pick = choose_with_add(a, f"Which {G53.SHOWN}?", ["The model to set up:"], rows,
+                               g53.index(default), a.yes, models)
         if pick == len(g53):
             fail(f"{G53.SHOWN} is set up from its GGUF files", f"{ME} --setup --gguf-dir <the folder of its .gguf files>")
         return "download", g53[pick]
@@ -2000,8 +2042,9 @@ def choose_model(a, models: Path, inst: dict, family: str = "glm") -> tuple:
                                                  f"download {m['download_gb']:.1f} GB from Hugging Face"),
                      ("recommended for cards of 24 GB or less" if q == "Maya-S24" else "recommended") if q == rec
                      else None, m["about"]))
-    pick = choose("Which GLM-5.3-Flash?", ["The model to download (GLM-5.3-Flash GGUF files you already have: "
-                                           "--gguf-dir <file or folder>):"], rows, opts.index(default), a.yes)
+    pick = choose_with_add(a, "Which GLM-5.3-Flash?", ["The model to download (GLM-5.3-Flash GGUF files you already have: "
+                                                       "--gguf-dir <file or folder>):"], rows, opts.index(default),
+                           a.yes, models)
     return "download", opts[pick]
 
 
@@ -2800,6 +2843,8 @@ def import_catalog(models: Path) -> list:
         v = m.get("vision")
         if v:
             add(quant, f"{quant}/{v['folder']}", v["sha256"])
+    for quant, m in G53_MODELS.items():
+        entry(quant, quant, m)
     cat.append({"label": "GLM-5.3-Flash-DFlash2", "rel": f"GLM-5.3-Flash-DFlash2/{DFLASH['file']}",
                 "size": DFLASH["bytes"], "sha": [DFLASH["sha256"].lower()]})
     quiet = contextlib.redirect_stdout(io.StringIO())
@@ -2841,7 +2886,8 @@ def import_catalog(models: Path) -> list:
     return cat
 
 
-def import_model(a, folder: str) -> int:
+def import_model(a, folder: str, *, link: bool = False, models_override: Path | None = None,
+                 from_setup: bool = False) -> int:
     """--import-model <folder>: find the published model files in a folder by their size and sha256 (whatever the
     downloader named them, in whatever subfolders, also a Hugging Face cache's blobs/snapshots), and move them (same
     drive) or copy them (another drive: --copy) into the models folder's layout; then print what was found, what
@@ -2851,7 +2897,8 @@ def import_model(a, folder: str) -> int:
         fail(f"{folder} is not a folder", f"{ME} --import-model <the folder with the downloaded files>")
     have = configs()
     inst = (read_json(have[0]).get("installer") or {}) if have else {}
-    models = (Path(a.models_dir).expanduser().resolve() if a.models_dir else
+    models = (models_override if models_override is not None else
+              Path(a.models_dir).expanduser().resolve() if a.models_dir else
               Path(inst["models_dir"]) if inst.get("models_dir") else
               Path(inst["data_dir"]) / "models" if inst.get("data_dir") else ROOT.parent / "Maya-data" / "models")
     cat = import_catalog(models)
@@ -2884,7 +2931,9 @@ def import_model(a, folder: str) -> int:
     anchor = next(p for p in [models, *models.parents] if p.exists())
     apart = [p for p, r, _, _ in placed if not MI.same_drive(r, anchor) or os.path.abspath(p) != str(r)]
     copy = bool(a.copy)
-    if apart and not copy:
+    if link:
+        say(f"  Link verified files into {models}; originals stay in {src}.")
+    elif apart and not copy:
         say()
         say(f"  {len(apart)} file(s) are on another drive than {models} (or are links into a cache): they can only be "
             "copied - the original stays where it is, so the space is used twice.")
@@ -2894,16 +2943,21 @@ def import_model(a, folder: str) -> int:
         if ask(f"  Move {len(placed)} file(s) into {models}? (y/n)", ["y", "n"], "y", False) != "y":
             say("  Nothing was moved.")
             return 0
-    moved = copied = 0
+    moved = copied = linked = 0
     skipped_now = []
     for path, real, size, hits in placed:
-        r = MI.place(path, real, size, hits, models, copy, say)
+        r = MI.place(path, real, size, hits, models, copy, say, link=link)
         moved, copied = moved + r["moved"], copied + r["copied"]
+        linked += r["linked"]
         skipped_now += r["skipped"]
     for line in skipped_now:
         warn(line)
-    ok(f"{moved} file(s) moved, {copied} copied into {models}; they are recorded as verified (no second check)")
-    say(f"  Now run {ME} --setup and pick the model (or {ME} --setup --model <name>): the files are used where they are.")
+    ok(f"{moved} file(s) moved, {copied} copied, {linked} linked into {models}; "
+       "they are recorded as verified (no second check)")
+    if from_setup:
+        say("  Select the model's files in the list to continue setup.")
+    else:
+        say(f"  Now run {ME} --setup and pick the model (or {ME} --setup --model <name>): the files are used where they are.")
     return 0
 
 
@@ -6041,13 +6095,14 @@ def choose_ds4_quant(a, prev: dict) -> str:
                            "VRAM + RAM plus the 161 GB n-gram tables read from the SSD; for PCs with about 270 GB or more of "
                            "VRAM + RAM - below that it reads experts from the disk and gets slow")
     label = {k: (Q.shown("deepseek", k, gb.get(k)), about[k]) for k in DS4_QUANTS}
-    pick = choose(f"Which files of {DS4}?", ["The GGUFs run on any NVIDIA GPU from Volta (V100) on and on AMD, whatever "
-                                             "the memory: the experts that do not", "fit in VRAM are read from RAM and "
-                                             "the SSD. The EXL3 quants need a V100 or newer, or AMD, and "
-                                             f"~{DS4_EXL3['exl3-2.25']['memory_gb']} / ~230 / ~280 GB of VRAM + RAM:"],
-                  [(label[k][0], "recommended" if k == rec else
-                    "abliterated: fits this PC" if k == abl else None, label[k][1]) for k in keys],
-                  keys.index(default), a.yes or a.check)
+    pick = choose_with_add(a, f"Which files of {DS4}?",
+                           ["The GGUFs run on any NVIDIA GPU from Volta (V100) on and on AMD, whatever "
+                            "the memory: the experts that do not", "fit in VRAM are read from RAM and "
+                            "the SSD. The EXL3 quants need a V100 or newer, or AMD, and "
+                            f"~{DS4_EXL3['exl3-2.25']['memory_gb']} / ~230 / ~280 GB of VRAM + RAM:"],
+                           [(label[k][0], "recommended" if k == rec else
+                             "abliterated: fits this PC" if k == abl else None, label[k][1]) for k in keys],
+                           keys.index(default), a.yes or a.check, setup_models_dir(a, prev))
     return keys[pick]
 
 
@@ -6872,7 +6927,7 @@ def choose_mm3_quant(a, prev: dict) -> str:
     # KV cache at the default context in the engine's format (mm3_kv_gb)
     rec = fit_recommendation({k: mm3_memory_gb(k) for k in keys}, setup_gpus(a), total,
                              mm3_kv_gb(MM3_DEFAULT_CONTEXT, MM3_KV_FORMAT), "exl3")
-    if len(keys) == 1:
+    if len(keys) == 1 and (a.yes or a.check):
         return keys[0]
     gb = {k: mm3_models()[0]["download_gb"] if k == "exl3" else mm3_gguf_entry(k)["download_gb"] for k in keys}
     about = {"exl3": f"Mia-AiLab's quant: pictures and DSpark drafting; ~{MM3_MEMORY_GB} GB of VRAM + RAM",
@@ -6882,10 +6937,10 @@ def choose_mm3_quant(a, prev: dict) -> str:
     label = {k: (Q.shown("minimax", k, gb[k]), about[k] + ("" if k == "exl3" else pics)) for k in keys}
     order = sorted(keys, key=lambda k: k != rec)
     default = before if before in order else rec
-    pick = choose(f"Which files of {MM3}?", ["Maya's GGUF quants and the EXL3 quant run on NVIDIA from V100 on and "
-                                             "on AMD:"],
-                  [(label[k][0], "recommended" if k == rec else None, label[k][1]) for k in order],
-                  order.index(default), a.yes or a.check)
+    pick = choose_with_add(a, f"Which files of {MM3}?",
+                           ["Maya's GGUF quants and the EXL3 quant run on NVIDIA from V100 on and on AMD:"],
+                           [(label[k][0], "recommended" if k == rec else None, label[k][1]) for k in order],
+                           order.index(default), a.yes or a.check, setup_models_dir(a, prev))
     return order[pick]
 
 
@@ -7634,8 +7689,8 @@ def choose_qwen_quant(a, prev: dict) -> str:
                      f"head, the experts in about {m['memory_gb']:.0f} GB of VRAM and RAM together)" if q == QWEN_UD else
                      "Blackfrost-AI's cybersecurity fine-tune in peasantsmith's GGUF (Q5_K experts, all of them in about "
                      f"{m['memory_gb']:.0f} GB of VRAM and RAM together)"))
-    pick = choose("Which Qwen3.8-Flash-Next?", ["The files to set up:"], rows, QWEN_QUANTS.index(default),
-                  getattr(a, "yes", False))
+    pick = choose_with_add(a, "Which Qwen3.8-Flash-Next?", ["The files to set up:"], rows,
+                           QWEN_QUANTS.index(default), getattr(a, "yes", False), setup_models_dir(a, prev))
     return QWEN_QUANTS[pick]
 
 

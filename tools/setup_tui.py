@@ -24,7 +24,7 @@ from textual import events
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Center, Horizontal, Vertical
-from textual.widgets import OptionList, RichLog, Static
+from textual.widgets import Input, OptionList, RichLog, Static
 from textual.widgets.option_list import Option
 
 from setup_bridge import TAIL, BackRequested, Bridge, curl_meter, describe
@@ -86,6 +86,7 @@ class SetupApp(App):
         self.doing, self.doing_since, self.said_doing, self.last = "", 0.0, False, ""
         self.bar, self.bar_since = None, 0.0            # (share done, what to show) while a command tells it
         self.pending = None                             # the question shown: (future, values, kind)
+        self.zero_option = False                         # a menu's first item is the 0 action
         self.abouts: list = []                          # its options' descriptions (under the highlighted one)
         self.shown = 0                                  # the Bridge's entries handled so far
         self.written, self.flow = 0, 0                  # lines in the output box, and the width they wrap at
@@ -114,6 +115,7 @@ class SetupApp(App):
                     with Vertical(id="ask"):
                         yield Static(id="intro")
                         yield OptionList(id="options")
+                        yield Input(id="text-answer", placeholder="Directory containing downloaded model files")
                         yield Static(id="about")
             yield Dashboard(id="dash")                  # Maya's, once it runs
 
@@ -373,6 +375,12 @@ class SetupApp(App):
     def ev_choose(self, question, intro, options, default, outro, fut: Future) -> None:
         self.show_question(fut, "choose", question, intro, options, list(range(len(options))), default, outro)
 
+    def ev_text(self, question: str, default: str, fut: Future) -> None:
+        self.show_question(fut, "text", question, [], [], [], 0, [])
+        field = self.query_one("#text-answer", Input)
+        field.value = default
+        field.focus()
+
     def ev_fail(self, msg: str, hint, fut: Future) -> None:
         self.end_step("fail")
         self.set_doing("")
@@ -384,6 +392,7 @@ class SetupApp(App):
         if self.serving is not None and self.view is None:   # (the dashboard shows: the log's page has the box)
             self.show_view(LOG)
         self.pending = (fut, values, kind)
+        self.zero_option = kind == "choose" and bool(options) and options[0][0].startswith("0) ")
         self.abouts = [" ".join(x for x in (o[2], " ".join(outro)) if x) for o in options]
         box = self.query_one("#ask")
         named = kind != "fail" and len(question) <= 40  # a short question names the box, a long one opens it
@@ -395,16 +404,22 @@ class SetupApp(App):
         self.query_one("#intro", Static).update(body)
         self.query_one("#intro").display = bool(body.plain)
         ol = self.query_one("#options", OptionList)
+        field = self.query_one("#text-answer", Input)
+        ol.display = kind != "text"
+        field.display = kind == "text"
         ol.clear_options()
-        ol.add_options([Option(Text.assemble(f"{i}) " if kind == "choose" and len(options) < 10 else "", label,
+        ol.add_options([Option(Text.assemble(("" if label.startswith("0) ") else f"{i - int(self.zero_option)}) ")
+                                             if kind == "choose" and len(options) < 10 else "", label,
                                              (f"   {note}", f"italic {OK_TEXT}") if note else ""))
                         for i, (label, note, _) in enumerate(options, 1)])
-        ol.highlighted = default
-        self.query_one("#about", Static).update(self.abouts[default])
+        if options:
+            ol.highlighted = default
+        self.query_one("#about", Static).update(self.abouts[default] if options else "")
         box.set_class(kind == "fail", "fail")
         box.add_class("on")
         self.screen.add_class("asking")
-        ol.focus()
+        if kind != "text":
+            ol.focus()
         self.show_keys()
 
     def on_option_list_option_highlighted(self, event: OptionList.OptionHighlighted) -> None:
@@ -415,6 +430,19 @@ class SetupApp(App):
         if self.pending is not None and event.option_list.id == "options":
             self.answer(event.option_index)
 
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        if self.pending is not None and self.pending[2] == "text" and event.input.id == "text-answer":
+            value = event.value.strip()
+            if value:
+                fut = self.pending[0]
+                self.pending = None
+                self.query_one("#ask").remove_class("on")
+                self.screen.remove_class("asking")
+                self.show_keys()
+                fut.set_result(value)
+            else:
+                self.query_one("#about", Static).update("Enter a directory path.")
+
     def on_key(self, event) -> None:
         if self.pending is None or isinstance(self.screen, StopScreen):
             return
@@ -422,9 +450,13 @@ class SetupApp(App):
         if kind == "yn" and event.key in ("y", "n"):
             event.stop()
             self.answer(0 if event.key == "y" else 1)
-        elif kind == "choose" and event.key.isdigit() and 1 <= int(event.key) <= n:
+        elif kind == "choose" and event.key.isdigit() and 1 <= int(event.key) <= n - int(self.zero_option):
             event.stop()
-            self.answer(int(event.key) - 1)
+            self.answer(int(event.key) - 1 + int(self.zero_option))
+        elif kind == "choose" and event.key == "0" and self.zero_option:
+            # The zero action is first, leaving existing 1..N choices unchanged.
+            event.stop()
+            self.answer(0)
 
     def answer(self, i: int) -> None:
         fut, values, _ = self.pending
@@ -546,8 +578,11 @@ class SetupApp(App):
             return
         if kind == "yn":
             keys = [("Enter", "Choose"), ("y n", "Answer")]
+        elif kind == "text":
+            keys = [("Enter", "Use path")]
         elif kind:
-            keys = [("Enter", "Choose"), ("↑↓", "Move")] + ([(f"1-{len(self.pending[1])}", "Pick")]
+            zero = kind == "choose" and self.zero_option
+            keys = [("Enter", "Choose"), ("↑↓", "Move")] + ([(f"0, 1-{len(self.pending[1]) - int(zero)}", "Pick")]
                                                             if kind == "choose" else [])
         live, maya = self.view is None, self.serving is not None
         keys += [("↑↓", "Scroll")] * (maya and live) + \

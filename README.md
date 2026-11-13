@@ -299,6 +299,9 @@ The setup shows every download before it starts it, builds everything once (20-4
 - **Model files downloaded another way** (a download manager, another PC, a Hugging Face cache): `./maya.sh --import-model FOLDER`
   finds Maya's files in FOLDER by size and checksum, whatever they are called, and moves them into place (`--copy` when
   FOLDER is on another drive; the originals stay). Files that do not match are left alone.
+  During interactive setup, choose **0) Add downloaded model** on the model-files screen, enter the directory, then
+  choose **Link files** to verify the files and create symbolic links without moving or copying them, or **Import Model**
+  for the standard import. Linked files must stay at their original location for Maya to use them.
 - **Every option** (GPUs, context, a model folder you already have, remote access, ...): [docs/SETUP.md](docs/SETUP.md).
 
 > **The start takes a few minutes:** the engine pins most of the free RAM (all but about 6 GB) for its expert tier,
