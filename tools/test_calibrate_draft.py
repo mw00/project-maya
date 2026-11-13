@@ -256,5 +256,168 @@ class InTheSetup(unittest.TestCase):
         self.assertNotIn("measure yours", text)
 
 
+class PhaseEngine:
+    """Reads a prompt at `read` tokens/s (less what it shares with the prompt before) and writes at `write`."""
+
+    def __init__(self, read, write, answer_len=None):
+        self.read, self.write, self.answer_len = read, write, answer_len
+        self.last, self.requests, self.prev, self.closed = {}, [], [], False
+
+    def generate(self, ids, max_new, sampling, cancel):
+        self.requests.append((tuple(ids), max_new, dict(sampling)))
+        shared = 0
+        while shared < min(len(ids), len(self.prev)) and ids[shared] == self.prev[shared]:
+            shared += 1
+        self.prev = list(ids)
+        n = max_new if self.answer_len is None else min(max_new, self.answer_len)
+        self.last = {"prompt_tokens": len(ids), "reused": shared, "prompt_ms": (len(ids) - shared) / self.read * 1000.0,
+                     "decode_ms": n / self.write * 1000.0}
+        for i in range(n):
+            yield i
+
+
+def fake_phase_requests(cfg):
+    def make(first, n, question):
+        return [1, 2] + list(range(1000 + first, 1000 + first + n)) + [3]
+    return make, 20000, 30000
+
+
+def phases(alone=(300.0, 30.0), both=(345.0, 39.0), **kw):
+    engines, order = {}, []
+
+    def start(cfg):
+        side = "both" if cfg.get("mixed_gpus") else "other"
+        engines[side] = PhaseEngine(*(both if side == "both" else alone), **kw)
+        order.append("start " + side)
+        return engines[side]
+
+    def close(eng):
+        eng.closed = True
+    with patch.object(CD, "phase_requests", fake_phase_requests):
+        res = CD.run_phases({**BASE, "mixed_gpus": False}, {**BASE, "mixed_gpus": True}, say=lambda *a: None,
+                            start_engine=start, between=lambda: order.append("between"), close=close)
+    return res, engines, order
+
+
+class ReadAndWrite(unittest.TestCase):
+    """calibrate_draft.run_phases: DeepSeek's two-GPU speed check."""
+
+    def test_reading_and_writing_are_both_measured_and_weighed_alike(self):
+        res, _, _ = phases()
+        self.assertAlmostEqual(res["read"], 1.15, places=2)
+        self.assertAlmostEqual(res["write"], 1.3, places=2)
+        self.assertAlmostEqual(res["gain"], (1.15 * 1.3) ** 0.5 - 1.0, places=2)
+        self.assertEqual(res["other"]["write_tokens"], CD.PHASE_DOCS * CD.PHASE_ANSWER)
+        self.assertAlmostEqual(res["other"]["write_tok_s"], 30.0, places=1)
+        self.assertAlmostEqual(res["both"]["read_tok_s"], 345.0, delta=1.0)
+
+    def test_the_answers_are_fixed_and_the_same_on_both_sides(self):
+        _, eng, _ = phases()
+        self.assertEqual(eng["other"].requests, eng["both"].requests)
+        self.assertTrue(all(s.get("temperature") == 0.0 for _, _, s in eng["other"].requests))   # greedy: no seed's luck
+        warm, docs = eng["other"].requests[0], eng["other"].requests[1:]
+        self.assertEqual((len(warm[0]), warm[1]), (CD.PHASE_WARM_DOC + 3, CD.PHASE_WARM_ANSWER))   # not counted
+        self.assertEqual(len(docs), CD.PHASE_DOCS)
+        self.assertTrue(all(n == CD.PHASE_ANSWER for _, n, _ in docs))
+        self.assertFalse(set(docs[0][0][2:-1]) & set(docs[1][0][2:-1]))    # each document fresh: read whole
+
+    def test_the_documents_are_sized_by_this_pcs_own_read_speed(self):
+        res, eng, _ = phases(alone=(300.0, 30.0))
+        self.assertEqual(res["other"]["doc_tokens"], 2816)                 # ~PHASE_READ_S of reading, in whole 256s
+        self.assertEqual(res["both"]["doc_tokens"], 2816)                  # the first side's size on both
+        self.assertEqual(CD.phase_doc_tokens(30.0, 20000, 30000), CD.PHASE_DOC[0])     # a slow PC: the least
+        self.assertEqual(CD.phase_doc_tokens(5000.0, 20000, 30000), CD.PHASE_DOC[1])   # a fast one: the most
+        self.assertEqual(CD.phase_doc_tokens(300.0, 2000, 30000), 1000)    # the text there is
+        self.assertEqual(CD.phase_doc_tokens(300.0, 20000, 700), 700)      # a small context
+
+    def test_each_side_starts_after_between_and_is_closed(self):
+        _, eng, order = phases()
+        self.assertEqual(order, ["between", "start other", "between", "start both"])
+        self.assertTrue(eng["other"].closed and eng["both"].closed)
+
+    def test_answers_that_end_at_once_are_no_measurement(self):
+        with self.assertRaises(RuntimeError):
+            phases(answer_len=1)
+
+
+def phase_result(read, write, o_read=300.0, o_write=30.0):
+    return {"other": {"read_tok_s": o_read, "write_tok_s": o_write, "doc_tokens": 2816},
+            "both": {"read_tok_s": o_read * read, "write_tok_s": o_write * write, "doc_tokens": 2816},
+            "read": read, "write": write, "gain": round((read * write) ** 0.5 - 1.0, 4)}
+
+
+class BothGpus(unittest.TestCase):
+    """maya.link_calibration: the config the two-GPU speed check leaves behind."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+        self.pack = self.dir / "pack"
+        self.pack.mkdir()
+        (self.pack / "expert-profile.bin").write_bytes(b"mine")
+        self.cfg_path = self.dir / "maya-ds4-hip.json"
+        self.cfg_path.write_text(json.dumps({"exe": "build-hip/maya-ds4", "backend": "hip", "gpu": [0],
+                                             "args": ["--pack", str(self.pack), "--max-context", "32768"],
+                                             "installer": {"family": "deepseek"}}), encoding="utf-8")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def run_it(self, res, family="deepseek"):
+        calls = []
+
+        def fake_phases(alone, both, say=None, start_engine=None, between=None, close=None):
+            calls.append(("phases", alone.get("mixed_gpus"), both.get("mixed_gpus")))
+            for _ in range(2):                                           # each side's engine learns into the pack
+                between()
+                calls.append(("profile", (self.pack / "expert-profile.bin").read_bytes(),
+                              (self.pack / "lane-times.txt").exists()))
+                (self.pack / "expert-profile.bin").write_bytes(b"the check's")
+                (self.pack / "lane-times.txt").write_text("x")
+            return res
+
+        def fake_run(alone, both, **kw):
+            calls.append(("run", kw.get("size")))
+            return res
+        with patch.object(maya.CD, "run_phases", side_effect=fake_phases), patch.object(maya.CD, "run", side_effect=fake_run), \
+                patch.object(maya, "busy_gpus", return_value=[]), patch.object(maya, "mixed_why_not", return_value=None), \
+                patch.object(maya, "mixed_family", return_value=family), \
+                patch.object(maya.GL, "link_config", side_effect=lambda c: json.loads(json.dumps(c))), \
+                patch.object(maya, "say"), patch.object(maya, "ok"), patch.object(maya, "warn"):
+            out = maya.link_calibration(self.cfg_path)
+        return out, calls, json.loads(self.cfg_path.read_text(encoding="utf-8"))
+
+    def test_deepseek_goes_on_both_when_reading_and_writing_gain(self):
+        out, calls, cfg = self.run_it(phase_result(1.13, 1.25))
+        self.assertTrue(out)
+        self.assertIs(cfg["mixed_gpus"], True)
+        self.assertEqual(calls[0], ("phases", False, True))              # the AMD GPU alone first, then both
+        rec = cfg["installer"]["mixed_gpus_calibration"]
+        self.assertEqual((rec["alone_tok_s"], rec["alone_read_tok_s"], rec["doc_tokens"]), (30.0, 300.0, 2816))
+        self.assertAlmostEqual(rec["both_tok_s"], 37.5)
+        self.assertAlmostEqual(rec["both_read_tok_s"], 339.0)
+
+    def test_deepseek_stays_alone_within_the_margin_or_when_writing_is_slower(self):
+        self.assertIs(self.run_it(phase_result(1.02, 1.03))[2]["mixed_gpus"], False)    # +2.5%: a tie
+        self.assertIs(self.run_it(phase_result(1.40, 0.97))[2]["mixed_gpus"], False)    # reads faster, writes slower
+        self.assertIs(self.run_it(phase_result(0.95, 0.95))[2]["mixed_gpus"], False)
+        self.assertIs(self.run_it(phase_result(1.00, 1.08))[2]["mixed_gpus"], True)     # +3.9% over both
+
+    def test_the_packs_learned_files_are_as_before_for_each_side_and_after(self):
+        _, calls, _ = self.run_it(phase_result(1.13, 1.25))
+        self.assertEqual([c for c in calls if c[0] == "profile"], [("profile", b"mine", False)] * 2)
+        self.assertEqual((self.pack / "expert-profile.bin").read_bytes(), b"mine")
+        self.assertFalse((self.pack / "lane-times.txt").exists())
+
+    def test_glm_keeps_its_short_decode_probe(self):
+        res = {"other": {"tok_s": 25.8, "tokens": 512}, "dflash2": {"tok_s": 31.2, "tokens": 512}}
+        out, calls, cfg = self.run_it(res, family="glm")
+        self.assertTrue(out)
+        self.assertEqual(calls, [("run", maya.G53_DRAFT_PROBE)])
+        self.assertIs(cfg["mixed_gpus"], True)
+        self.assertEqual(cfg["installer"]["mixed_gpus_calibration"]["both_tok_s"], 31.2)
+        self.assertEqual((self.pack / "expert-profile.bin").read_bytes(), b"mine")
+
+
 if __name__ == "__main__":
     unittest.main()

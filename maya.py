@@ -4697,6 +4697,43 @@ def speed_calibration_g53(cfg_path: Path, cfg: dict, why: str = "") -> bool:
 
 
 LINK_TIE = 0.03          # both GPUs (GLM link mode) only when their decode beats the AMD GPU alone by more than this
+# ... DeepSeek: when reading and writing, weighed alike (tools/calibrate_draft.py's run_phases: documents read and fixed
+# answers written), beat it by more than this - and the writing alone is not slower (on by itself only where the
+# decode gains too).  The files DeepSeek's engine learns into its pack at every run: put back before each side
+# starts and after the check, so both sides start alike and the check's documents lead no later start
+DS4_LEARNED = ("expert-profile.bin", "lane-times.txt")
+
+
+def ds4_learned_kept(cfg: dict):
+    """-> put(): the pack's DS4_LEARNED files as they are now (one that is not there: not there again)."""
+    args = cfg.get("args") or []
+    pack = Path(args[args.index("--pack") + 1]) if "--pack" in args[:-1] else None
+    kept = {}
+    for name in DS4_LEARNED if pack is not None else ():
+        try:
+            kept[name] = (pack / name).read_bytes()
+        except OSError:
+            kept[name] = None
+
+    def put():
+        for name, data in kept.items():
+            try:
+                if data is None:
+                    (pack / name).unlink(missing_ok=True)
+                else:
+                    (pack / name).write_bytes(data)
+            except OSError:
+                pass
+    return put
+
+
+def mixed_close(eng) -> None:
+    """The speed check's engine ended, the NVIDIA card's engine beside it too (serve/mixed_gpus.py's close), and
+    their memory back before the next one loads."""
+    try:
+        eng.close()
+    except Exception:
+        CAL.close(eng)
 
 
 def mixed_family(cfg: dict) -> str | None:
@@ -4767,9 +4804,11 @@ def needs_link_calibration(cfg: dict) -> bool:
 
 
 def link_calibration(cfg_path: Path, why: str = "") -> bool:
-    """On both GPUs (GLM: link mode; DeepSeek: the helper layout, or "mixed_mode") or on the AMD GPU alone: the decode
-    speed of each, measured on this PC as the drafting calibration measures (tools/calibrate_draft.py, the same short
-    probe); "mixed_gpus" becomes true only when both GPUs win by more than LINK_TIE.  The numbers are kept
+    """On both GPUs (GLM: link mode; DeepSeek: the helper layout, or "mixed_mode") or on the AMD GPU alone, measured
+    on this PC.  GLM: the decode speed of each, as the drafting calibration measures (tools/calibrate_draft.py, the
+    same short probe).  DeepSeek: documents read and fixed answers written (its run_phases - the card helps both, and
+    sampled short answers differed more from run to run than the two sides do), reading and writing weighed alike.
+    "mixed_gpus" becomes true only when both GPUs win by more than LINK_TIE.  The numbers are kept
     (installer.mixed_gpus_calibration), so it runs once; --speed-calibration measures again.  False: not measured
     (nothing changed)."""
     cfg = read_json(cfg_path)
@@ -4796,10 +4835,22 @@ def link_calibration(cfg_path: Path, why: str = "") -> bool:
     say()
     say("  Speed check: this PC has an NVIDIA card beside the AMD GPU - is the model faster on both?" +
         (f" ({why})" if why else ""))
-    say("  Maya loads the model twice (the AMD GPU alone, then both GPUs) and compares the decode speed.")
+    if glm:
+        say("  Maya loads the model twice (the AMD GPU alone, then both GPUs) and compares the decode speed.")
+    else:
+        say("  Maya loads the model twice (the AMD GPU alone, then both GPUs); each time it reads two documents and")
+        say("  writes a fixed answer to each, and both speeds - reading and writing - are compared.")
+    put_back = (lambda: None) if glm else ds4_learned_kept(cfg)
     try:
-        res = CD.run(alone, both, say=say, start_engine=mixed_start_engine, other_label="the AMD GPU alone",
-                     draft_label="both GPUs", size=G53_DRAFT_PROBE)
+        if glm:
+            res = CD.run(alone, both, say=say, start_engine=mixed_start_engine, other_label="the AMD GPU alone",
+                         draft_label="both GPUs", size=G53_DRAFT_PROBE)
+        else:
+            try:
+                res = CD.run_phases(alone, both, say=say, start_engine=mixed_start_engine, between=put_back,
+                                    close=mixed_close)
+            finally:
+                put_back()
     except Exception as e:                             # never stops a start: the config stays as it was
         warn(f"the both-GPU measurement did not finish ({e}): the model runs on the AMD GPU alone; "
              f"{ME} --speed-calibration tries again")
@@ -4807,11 +4858,26 @@ def link_calibration(cfg_path: Path, why: str = "") -> bool:
                                                                      "failed": str(e)[:300]}
         cfg_path.write_text(json.dumps(N.env_out(cfg), indent=1), encoding="utf-8")
         return False
+    if not glm:
+        o, d = res["other"]["write_tok_s"], res["both"]["write_tok_s"]
+        ro, rd = res["other"]["read_tok_s"], res["both"]["read_tok_s"]
+        cfg["mixed_gpus"] = res["gain"] > LINK_TIE and d >= o
+        cfg.setdefault("installer", {})["mixed_gpus_calibration"] = {
+            "date": time.strftime("%Y-%m-%d %H:%M"), "version": maya_version(), "both_tok_s": d, "alone_tok_s": o,
+            "both_read_tok_s": rd, "alone_read_tok_s": ro, "doc_tokens": res["other"]["doc_tokens"],
+            "gain": res["gain"]}
+        cfg_path.write_text(json.dumps(N.env_out(cfg), indent=1), encoding="utf-8")
+        say()
+        ok(f"speed check: on both GPUs it reads {rd:.0f} tokens/s and writes {d:.1f}, on the AMD GPU alone {ro:.0f} "
+           f"and {o:.1f} ({100.0 * res['gain']:+.0f}% over both) - " +
+           ("Maya runs on both GPUs (--mixed-gpus off turns it off)" if cfg["mixed_gpus"] else
+            "Maya stays on the AMD GPU alone (--mixed-gpus on turns both on)"))
+        return True
     o, d = res["other"]["tok_s"], res["dflash2"]["tok_s"]
     cfg["mixed_gpus"] = d > o * (1 + LINK_TIE)
     cfg.setdefault("installer", {})["mixed_gpus_calibration"] = {
         "date": time.strftime("%Y-%m-%d %H:%M"), "version": maya_version(), "both_tok_s": d, "alone_tok_s": o}
-    try:                                               # (the both-GPU run's part of the log: after its settings line)
+    try:                                             # (the both-GPU run's part of the log: after its settings line)
         with open(log_path, "rb") as f:
             f.seek(log_at)
             text = f.read().decode("utf-8", "replace")
