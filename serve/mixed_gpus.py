@@ -28,20 +28,25 @@ from pathlib import Path
 PLAN_TIMEOUT_S = 180
 PLAN_SETTLE_S = 90   # (back on both GPUs: how long the NVIDIA card may take to free the front's memory)
 # found two GPUs and no "mixed_gpus" in the config: on by itself only where it is faster at decode too (the owner's
-# rule): the helper layout (MODE) is - decode and prompts both measured faster (below); the split's decode is not
+# rule): the helper layout (MODE) is - decode and prompts both measured faster (below); the split's decode is not.
+# (False: a config without "mixed_gpus" runs on the AMD GPU alone and the start says both are available)
 AUTO = True
 # "mixed_mode" (config): "helper" - the AMD GPU runs the whole model and the NVIDIA card computes the experts its VRAM
 # holds (the most-routed, experts only) for the AMD GPU's decode windows and prompt chunks, through shared memory (one
 # conversation; a card or link gone: the AMD GPU goes on alone, the request too); "split" - the card runs the first
-# layers (as before).  Radeon 8065S + V100 32 GB, Maya-XS, one start each, same session (2026-11-13): helper - decode
-# rounds 69-76 / 62-63 / 77-81 ms vs alone's 87 / 69 / 104, prompts +14 / +11 / +14 % at 2K/8K/32K; split - decode
+# layers (as before).  Radeon 8065S + V100 32 GB, Maya-XS, two starts each, interleaved (2026-11-13, after the fix
+# that makes the lead read the card's sums): helper - decode rounds 76 / 66 / 89 ms vs alone's 87 / 68 / 104 (+18 / +6 /
+# +11 % tokens a second), prompts +13 / +11 / +14 % at 2K/8K/32K; without DS4_RHELPER_LATE (the AMD GPU waiting for the
+# card before its own experts) decode is less than half of alone's; split - decode
 # -1..-3 %, prompts +25 / +42 / +72 % (`maya --mixed-gpus split` for long-document reading)
 MODE = "helper"
 # the helper's engine settings: its VRAM all experts (no layer's dense weights), prompt chunks up to 4096 rows
 HELPER_ARGS = ["--max-context", "4352", "--threads", "on", "--dspark", "off", "--mmap-experts", "on",
                "--prefill-chunk", "4096", "--reserve-mib", "1024"]
 HELPER_ENV = {"DS4_RHELPER_HOT": "1", "DS4_RHELPER_ONLY": "1", "DS4_BORROW": "0"}
-LEAD_ENV = {"DS4_RHELPER_HOT": "1", "DS4_RHELPER_PROMPT": "1"}   # (prompt chunks through the card too: measured faster)
+# (prompt chunks through the card too: measured faster; DS4_RHELPER_LATE: the card's sums waited for after the AMD
+#  GPU's own experts - the two compute side by side, the same sums)
+LEAD_ENV = {"DS4_RHELPER_HOT": "1", "DS4_RHELPER_PROMPT": "1", "DS4_RHELPER_LATE": "1"}
 # flags the two-GPU run leaves out: abliteration's projection is not carried through the link (the engines would
 # disagree), and the AMD GPU's VRAM reserve is not the NVIDIA card's
 ABLATE_FLAGS = {"--ablate": 1, "--ablate-default": 1, "--ablate-layer": 1, "--ablate-scale": 1}
@@ -104,9 +109,8 @@ def config_of(cfg: dict) -> dict | None:
         if not auto_found(cfg):
             return None   # (Windows, no NVIDIA card or no CUDA build: as before, not a line said)
         if not AUTO:
-            print("[maya] two GPUs: an NVIDIA card beside the AMD GPU - `maya --mixed-gpus on` runs DeepSeek on both "
-                  "(long prompts read much faster, decode about the same; answers can be worded slightly differently)",
-                  flush=True)
+            print("[maya] two GPUs: an NVIDIA card beside the AMD GPU - available, off until verified "
+                  "(`maya --mixed-gpus on` runs DeepSeek on both)", flush=True)
             return None
         print("[maya] two GPUs: an NVIDIA card beside the AMD GPU - DeepSeek runs on both (on by itself; "
               "`maya --mixed-gpus off` or \"mixed_gpus\": false in the config turns it off)", flush=True)

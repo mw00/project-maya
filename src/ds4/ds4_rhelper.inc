@@ -314,6 +314,7 @@
             devs[0].allocs.push_back(rh_ones);
         }
         if (const char* v = std::getenv("DS4_RHELPER_DIRECT")) rh_direct = std::atoi(v) != 0;
+        if (rh_cmp != 0) rh_direct = false;   // (DS4_RHELPER_CMP: the service thread reads every answer)
         if (rh_hot && !rh_p_alloc(err)) return false;
         devs[0].allocs.push_back(rh_dreq);
         devs[0].allocs.push_back(rh_dresp);
@@ -564,6 +565,7 @@
     double rh_pserve_ms = 0;
     void rh_lead_end() {
         if (rh_hdr == nullptr) return;
+        helper_cmp_end();
         std::fprintf(stderr, "ds4: helper engine: the service thread waited %.1f ms for its answers, %lld experts "
                              "theirs, %lld of its own (CPU lane)\n", st.helper_ms, (long long) st.helper_experts,
                      (long long) st.cpu_experts);

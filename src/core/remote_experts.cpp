@@ -684,9 +684,10 @@ bool GlmExpertHelper::open_link(int n_embd, int n_ff, const std::vector<std::pai
         const int cap = tv != nullptr ? std::atoi(tv) : 32768;
         if (!(pv != nullptr && std::strcmp(pv, "0") == 0) && cap > 0) {
             pf_lay_ = hlink::PfLayout((size_t) cap, (size_t) n_embd);
-            pf_ = (uint8_t*) hlink::xchg_alloc(pf_lay_.bytes, pf_fd_);
+            const size_t xb = hlink::pf_exchange_bytes((size_t) cap, (size_t) n_embd);   // (slot 0, or slots 1 + 2)
+            pf_ = (uint8_t*) hlink::xchg_alloc(xb, pf_fd_);
             if (pf_ != nullptr) {
-                pf_bytes_ = pf_lay_.bytes;
+                pf_bytes_ = xb;
                 pf_cap_ = cap;
                 args.push_back("--xchg");
                 args.push_back(std::to_string(pf_fd_) + ":" + std::to_string(pf_bytes_) + ":" + std::to_string(cap));
@@ -1107,8 +1108,9 @@ bool RemoteExperts::finish(float* out, std::string& err) {
 // ---- the linked helper's prompt exchange (glm_helper_link.hpp PfLayout) ----
 
 bool GlmExpertHelper::pf_post(int gu_type, int d_type, size_t down_off, float limit, bool dsa, int T, int K, int n,
-                              int rows, int r0, std::string& err, const strata::kernels::exl3::ExpertLayout* xl) {
-    if (!link_ || ctl_ == nullptr || pf_cap_ <= 0 || T > pf_cap_ || K > hlink::kPfMaxK || n > hlink::kPfMaxExperts) {
+                              int rows, int r0, std::string& err, int slot,
+                              const strata::kernels::exl3::ExpertLayout* xl) {
+    if (!link_ || ctl_ == nullptr || pf_cap_ <= 0 || T > (slot > 0 ? pf_slot_cap() : pf_cap_) || slot < 0 || slot > 2 || K > hlink::kPfMaxK || n > hlink::kPfMaxExperts) {
         err = "GLM expert helper link: no prompt exchange for this layer";
         return false;
     }
@@ -1134,6 +1136,7 @@ bool GlmExpertHelper::pf_post(int gu_type, int d_type, size_t down_off, float li
     ctl_->pf_rows = rows;
     ctl_->pf_r0 = r0;
     ctl_->pf_dsa = dsa ? 1 : 0;
+    ctl_->pf_slot = slot;   // (the exchange slot: glm_helper_link.hpp pf_slot_layout)
     ctl_->pf_gpu_ms = 0.0;
     return link_post(err);
 }
@@ -1154,7 +1157,7 @@ bool GlmExpertHelper::pf_attach(uint8_t* host, size_t bytes, int cap_tokens, std
     void* dp = nullptr;
     if (!check(cudaHostGetDevicePointer(&dp, host, 0), "map the prompt exchange", err, device_)) return false;
     pf_lay_ = hlink::PfLayout((size_t) cap_tokens, (size_t) n_embd_);
-    if (pf_lay_.bytes > bytes) {
+    if (hlink::pf_exchange_bytes((size_t) cap_tokens, (size_t) n_embd_) > bytes) {
         err = "GLM expert helper: the prompt exchange is smaller than its layout";
         return false;
     }
@@ -1165,11 +1168,11 @@ bool GlmExpertHelper::pf_attach(uint8_t* host, size_t bytes, int cap_tokens, std
 }
 
 bool GlmExpertHelper::pf_run(int gu_type, int d_type, size_t down_off, float limit, bool dsa, int T, int K, int n,
-                             int rows, int r0, const uint8_t* const* blobs, std::string& err) {
+                             int rows, int r0, const uint8_t* const* blobs, std::string& err, int slot) {
 #if defined(STRATA_USE_HIP)
     namespace mmq = strata::prefill::mmq;
     namespace gb = strata::kernels::glmb;
-    if (pf_ == nullptr || T <= 0 || T > pf_cap_ || K <= 0 || K > hlink::kPfMaxK || n < 0 || n > hlink::kPfMaxExperts ||
+    if (pf_ == nullptr || T <= 0 || slot < 0 || slot > 2 || T > (slot > 0 ? pf_slot_cap() : pf_cap_) || K <= 0 || K > hlink::kPfMaxK || n < 0 || n > hlink::kPfMaxExperts ||
         rows < 0 || rows > T * K || r0 < 0) {
         err = "GLM expert helper: invalid prompt call";
         return false;
@@ -1224,12 +1227,12 @@ bool GlmExpertHelper::pf_run(int gu_type, int d_type, size_t down_off, float lim
                 break;
             }
         }
-    const int32_t* cnts = (const int32_t*) (pf_ + pf_lay_.cnts);
-    const float* x_d = (const float*) (pf_dev_ + pf_lay_.x);
-    float* out_d = (float*) (pf_dev_ + pf_lay_.out);
-    const int32_t* pos_d = (const int32_t*) (pf_dev_ + pf_lay_.pos);
-    const float* rw_d = (const float*) (pf_dev_ + pf_lay_.rw);
-    const int32_t* rtok_d = (const int32_t*) (pf_dev_ + pf_lay_.rtok);
+    const int32_t* cnts = pf_cnts(slot);
+    const float* x_d = (const float*) pf_at(slot, &hlink::PfLayout::x, pf_dev_);
+    float* out_d = (float*) pf_at(slot, &hlink::PfLayout::out, pf_dev_);
+    const int32_t* pos_d = (const int32_t*) pf_at(slot, &hlink::PfLayout::pos, pf_dev_);
+    const float* rw_d = (const float*) pf_at(slot, &hlink::PfLayout::rw, pf_dev_);
+    const int32_t* rtok_d = (const int32_t*) pf_at(slot, &hlink::PfLayout::rtok, pf_dev_);
     int64_t sum = 0;
     for (int j = 0; j < n; ++j) {
         if (cnts[j] < 0 || dev_of[(size_t) j] == nullptr) {
@@ -1319,7 +1322,7 @@ bool GlmExpertHelper::pf_run(int gu_type, int d_type, size_t down_off, float lim
     return true;
 #else
     (void) gu_type; (void) d_type; (void) down_off; (void) limit; (void) dsa; (void) T; (void) K; (void) n;
-    (void) rows; (void) r0; (void) blobs;
+    (void) rows; (void) r0; (void) blobs; (void) slot;
     err = "GLM expert helper: prompt products need the helper program of a HIP build";
     return false;
 #endif
@@ -1329,11 +1332,11 @@ bool GlmExpertHelper::pf_run(int gu_type, int d_type, size_t down_off, float lim
 // prompt path's EXL3 lane (glmpf::x3_expert_rows: the weights decoded once, FP16 GEMMs), a window of rows at a time,
 // and the window's weighted rows are added into out as pf_run does.
 bool GlmExpertHelper::pf_run_x3(const strata::kernels::exl3::ExpertLayout& lay, float limit, int T, int K, int n,
-                                int rows, int r0, const uint8_t* const* blobs, std::string& err) {
+                                int rows, int r0, const uint8_t* const* blobs, std::string& err, int slot) {
 #if defined(STRATA_USE_HIP)
     namespace gb = strata::kernels::glmb;
     namespace x3 = strata::kernels::exl3;
-    if (pf_ == nullptr || T <= 0 || T > pf_cap_ || K <= 0 || K > hlink::kPfMaxK || n < 0 || n > hlink::kPfMaxExperts ||
+    if (pf_ == nullptr || T <= 0 || slot < 0 || slot > 2 || T > (slot > 0 ? pf_slot_cap() : pf_cap_) || K <= 0 || K > hlink::kPfMaxK || n < 0 || n > hlink::kPfMaxExperts ||
         rows < 0 || rows > T * K || r0 < 0) {
         err = "GLM expert helper: invalid prompt call";
         return false;
@@ -1377,12 +1380,12 @@ bool GlmExpertHelper::pf_run_x3(const strata::kernels::exl3::ExpertLayout& lay, 
                 break;
             }
         }
-    const int32_t* cnts = (const int32_t*) (pf_ + pf_lay_.cnts);
-    const float* x_d = (const float*) (pf_dev_ + pf_lay_.x);
-    float* out_d = (float*) (pf_dev_ + pf_lay_.out);
-    const int32_t* pos_d = (const int32_t*) (pf_dev_ + pf_lay_.pos);
-    const float* rw_d = (const float*) (pf_dev_ + pf_lay_.rw);
-    const int32_t* rtok_d = (const int32_t*) (pf_dev_ + pf_lay_.rtok);
+    const int32_t* cnts = pf_cnts(slot);
+    const float* x_d = (const float*) pf_at(slot, &hlink::PfLayout::x, pf_dev_);
+    float* out_d = (float*) pf_at(slot, &hlink::PfLayout::out, pf_dev_);
+    const int32_t* pos_d = (const int32_t*) pf_at(slot, &hlink::PfLayout::pos, pf_dev_);
+    const float* rw_d = (const float*) pf_at(slot, &hlink::PfLayout::rw, pf_dev_);
+    const int32_t* rtok_d = (const int32_t*) pf_at(slot, &hlink::PfLayout::rtok, pf_dev_);
     int64_t sum = 0;
     for (int j = 0; j < n; ++j) {
         if (cnts[j] < 0 || dev_of[(size_t) j] == nullptr) {
@@ -1421,7 +1424,7 @@ bool GlmExpertHelper::pf_run_x3(const strata::kernels::exl3::ExpertLayout& lay, 
     }
     return true;
 #else
-    (void) lay; (void) limit; (void) T; (void) K; (void) n; (void) rows; (void) r0; (void) blobs;
+    (void) lay; (void) limit; (void) T; (void) K; (void) n; (void) rows; (void) r0; (void) blobs; (void) slot;
     err = "GLM expert helper: prompt products need the helper program of a HIP build";
     return false;
 #endif

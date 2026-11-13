@@ -69,6 +69,23 @@ MIXED = (
      "and explain the choice of data structure.", True),
 )
 MIXED_WARM = "Say hello in one sentence."
+# The read-and-write probe (run_phases; DeepSeek on two GPUs, maya.py's link_calibration): both of a request's phases
+# - a document read, then an answer written - with fixed answers (temperature 0: the same tokens at every run, so the
+# two sides differ by their speed alone, not by what a seed made them write).  A short warm-up document first (not
+# counted: the first read and answer after a start are the slowest), whose read speed on this PC sizes the documents:
+# each should take about PHASE_READ_S to read on the first side (PHASE_DOC tokens at least / at most; the same
+# documents on both sides).  Then PHASE_DOCS fresh documents, each read whole (nothing of it kept from the one before)
+# and answered with PHASE_ANSWER tokens.
+PHASE_WARM_DOC = 1024      # the warm-up document's tokens
+PHASE_WARM_ANSWER = 32     # ... and its answer's
+PHASE_READ_S = 10.0        # the seconds a document's read should take
+PHASE_DOC = (512, 4096)    # a document's tokens: at least, at most
+PHASE_DOCS = 2             # documents read and answered a side
+PHASE_ANSWER = 100         # the tokens an answer takes (PHASE_DOCS of them: ~200 tokens written a side)
+PHASE_QUESTIONS = (
+    "Summarize the document above in about 150 words.",
+    "List the settings and commands the document above mentions, with one sentence on what each does.",
+)
 
 
 def without_dflash(cfg: dict) -> dict:
@@ -211,6 +228,109 @@ def run(other: dict, dflash: dict, say=print, start_engine=None, other_label: st
     o, d = res["other"]["tok_s"], res["dflash2"]["tok_s"]
     res["keep"] = "dflash2" if d > o * (1.0 + MIN_GAIN) else "other"
     res["gain"] = round(d / o - 1.0, 3) if o > 0 else None
+    return res
+
+
+def phase_requests(cfg: dict):
+    """(make(first, n, question) -> the ids of a chat whose user turn is the n document tokens from `first` and the
+    question, the document tokens there are, the most a document may take in this config's context)."""
+    tok, tpl, kw = chat_parts(cfg)
+    ids = tok.encode("\n\n".join(p.read_text(encoding="utf-8", errors="replace")
+                                 for p in [ROOT / "README.md"] + sorted((ROOT / "docs").glob("*.md")) if p.exists()))
+    args = cfg.get("args") or []
+    ctx = int(args[args.index("--max-context") + 1]) if "--max-context" in args[:-1] else 32768
+
+    def make(first: int, n: int, question: str) -> list[int]:
+        doc = tok.decode(ids[first:first + n])
+        return tok.encode(tpl.render([{"role": "user", "content": doc + "\n\n" + question}], **kw),
+                          parse_special=True)
+    return make, len(ids), ctx - PHASE_ANSWER - 2048
+
+
+def phase_doc_tokens(read_tok_s: float, have: int, room: int) -> int:
+    """A document's tokens for a PC that read the warm-up at `read_tok_s`: about PHASE_READ_S of reading, in whole
+    256s, within PHASE_DOC, the context's room and the text there is (`have` tokens after the warm-up's)."""
+    n = int(read_tok_s * PHASE_READ_S) // 256 * 256
+    n = max(PHASE_DOC[0], min(PHASE_DOC[1], n))
+    return max(64, min(n, room, have // PHASE_DOCS))
+
+
+def read_speed(last: dict) -> tuple[int, float]:
+    """(the prompt tokens the engine read for its last answer - less what it kept from the prompt before -, the
+    milliseconds that took)."""
+    n = int(last.get("prompt_tokens") or 0) - int(last.get("reused") or 0)
+    return max(0, n), float(last.get("prompt_ms") or 0.0)
+
+
+def measure_phases(cfg: dict, label: str, make, have: int, room: int, start_engine, say=print, tag: str = "",
+                   doc_tokens: int | None = None, close=None) -> dict:
+    """One side of the read-and-write probe: {"read_tok_s", "write_tok_s", "doc_tokens" (sized here when
+    `doc_tokens` is None: the first side), "read_tokens", "write_tokens", "seconds" (reading and writing, the
+    warm-up too), "load_s"}."""
+    greedy = {"temperature": 0.0}
+    t0 = time.time()
+    say(f"  {tag}{label}: loading the model ...")
+    eng = start_engine(cfg)
+    r_n, r_ms, w_n, w_ms = 0, 0.0, 0, 0.0
+    try:
+        load_s = time.time() - t0
+        t1 = time.time()
+        warm_n = max(64, min(PHASE_WARM_DOC, room, have // (PHASE_DOCS + 1)))
+        say(f"  {tag}{label}: loaded in {load_s:.0f} s; warming up - a document of {warm_n} tokens, read and "
+            "answered once (not counted) ...")
+        _, last = answer(eng, make(0, warm_n, "Say in one sentence what the document above is about."),
+                         PHASE_WARM_ANSWER, greedy, 1)
+        if doc_tokens is None:
+            n, ms = read_speed(last)
+            if n < 1 or ms <= 0.0:
+                raise RuntimeError(f"{label} did not say how long it read the warm-up for")
+            doc_tokens = phase_doc_tokens(n / ms * 1000.0, have - warm_n, room)
+        for i in range(PHASE_DOCS):
+            ids = make(warm_n + i * doc_tokens, doc_tokens, PHASE_QUESTIONS[i % len(PHASE_QUESTIONS)])
+            n, last = answer(eng, ids, PHASE_ANSWER, greedy, 1)
+            pn, pms = read_speed(last)
+            d = float(last.get("decode_ms") or 0.0)
+            if pn < 1 or pms <= 0.0 or n < 2 or d <= 0.0:
+                continue
+            r_n, r_ms, w_n, w_ms = r_n + pn, r_ms + pms, w_n + n, w_ms + d
+            say(f"  {tag}{label}: document {i + 1} of {PHASE_DOCS}: {pn} tokens read at {pn / pms * 1000.0:.0f} "
+                f"tokens/s, {n} written at {n / d * 1000.0:.1f} tokens/s")
+        seconds = time.time() - t1
+    finally:
+        (close or CAL.close)(eng)
+    if r_ms <= 0.0 or w_ms <= 0.0 or w_n < PHASE_DOCS * PHASE_ANSWER // 2:
+        raise RuntimeError(f"{label} wrote only {w_n} tokens after {r_n} read: too few for a speed")
+    return {"read_tok_s": round(r_n / r_ms * 1000.0, 1), "write_tok_s": round(w_n / w_ms * 1000.0, 2),
+            "doc_tokens": doc_tokens, "read_tokens": r_n, "write_tokens": w_n, "seconds": round(seconds, 1),
+            "load_s": round(load_s)}
+
+
+def run_phases(other: dict, both: dict, say=print, start_engine=None, other_label: str = "the AMD GPU alone",
+               both_label: str = "both GPUs", between=None, close=None) -> dict:
+    """The read-and-write probe, `other` first: {"other": {...}, "both": {...} (measure_phases), "read": both's read
+    speed over the other's, "write": the same for the answers, "gain": the two weighed alike (their geometric mean)
+    - 1}.  `between()` runs before each side's engine starts (maya.py: the pack's learned files as they were, so
+    both sides start alike); `close(engine)` ends a side's engine (calibrate_glm.close when None).  Raises when a
+    side could not be measured."""
+    if start_engine is None:
+        from serve.server import StrataEngine, child_env, engine_args
+
+        def start_engine(c):
+            return StrataEngine(c["exe"], engine_args(c), cwd=c.get("cwd"), log=c.get("log"), env=child_env(c))
+    make, have, room = phase_requests(both)
+    res: dict = {}
+    with tempfile.TemporaryDirectory(prefix="maya-speed-") as tmp:
+        for i, (key, cfg, label) in enumerate((("other", other, other_label), ("both", both, both_label))):
+            if between is not None:
+                between()
+            c = {**cfg, "args": CAL.without_writes(list(cfg.get("args") or [])),
+                 "env": {**(cfg.get("env") or {}), **CAL.usage_copy(cfg, Path(tmp)), "MAYA_GLM_SLOTS": "0"}}
+            res[key] = measure_phases(c, label, make, have, room, start_engine, say, f"[{i + 1}/2] ",
+                                      res["other"]["doc_tokens"] if i else None, close)
+    o, b = res["other"], res["both"]
+    res["read"] = round(b["read_tok_s"] / o["read_tok_s"], 4)
+    res["write"] = round(b["write_tok_s"] / o["write_tok_s"], 4)
+    res["gain"] = round((res["read"] * res["write"]) ** 0.5 - 1.0, 4)
     return res
 
 
