@@ -515,6 +515,12 @@ int Glm5Model::mtp_choose(int n_cap) {
         return e != nullptr ? std::max(0, std::atoi(e)) : 2;
     }();
     if (forced_n >= 0) return std::min(forced_n, n_cap);
+    // repeatable answers (glmfast::repeatable: a linked helper): the search below picks by measured round times, so
+    // two runs can verify different windows and part - the start length instead, unless MAYA_GLM_MTP_ADAPT=1 (the
+    // setup's speed check runs the search once and keeps its pick as MAYA_GLM_MTP_FIXED, serve/glm_link.py)
+    static const bool adapt_set = getenv("MAYA_GLM_MTP_ADAPT") != nullptr;
+    if (!adapt_set && fast_ != nullptr && glmfast::repeatable(fast_->helper.linked()))
+        return std::min(start_n, n_cap);
     if (n_cap <= 0) return 0;
     if (fixed) return n_cap;
     ++mtp_round_no_;

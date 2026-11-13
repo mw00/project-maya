@@ -8,10 +8,15 @@ A GLM config's "mixed_gpus": true - both GPUs; false - the AMD GPU alone; not se
 setup's measurement (maya.py's link calibration: the decode speed of both ways on this PC) writes true or false, so
 link mode is on only where it measured faster.  `--mixed-gpus on|off` sets it.  A start that cannot use both GPUs
 (no NVIDIA card answers, a build missing) runs on the AMD GPU alone and says why.  Configs without the key, and every
-other PC, start exactly as before."""
+other PC, start exactly as before.
+
+Answers in link mode repeat run to run: the engine moves experts between the tiers on a fixed schedule and drafts a
+fixed MTP length there (glmfast::repeatable); the speed check runs the adaptive draft search once and keeps the length
+it used most (installer.mixed_gpus_calibration.mtp_draft), which every link start then drafts."""
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 from pathlib import Path
 
@@ -66,6 +71,21 @@ def why_not(cfg: dict, cards: list[int] | None = None) -> str | None:
     return None
 
 
+def mtp_draft(cfg: dict) -> int | None:
+    """The MTP draft length the speed check kept for link mode (installer.mixed_gpus_calibration.mtp_draft), or None."""
+    n = ((cfg.get("installer") or {}).get("mixed_gpus_calibration") or {}).get("mtp_draft")
+    return n if isinstance(n, int) and not isinstance(n, bool) and 0 <= n <= 8 else None
+
+
+def draft_pick(log_text: str) -> int | None:
+    """The draft length the engine's adaptive search used most, from its "rounds by draft length 1:5 2:88" lines."""
+    counts: dict[int, int] = {}
+    for m in re.finditer(r"rounds by draft length((?: \d+:\d+)+)", log_text):
+        for n, c in re.findall(r"(\d+):(\d+)", m.group(1)):
+            counts[int(n)] = counts.get(int(n), 0) + int(c)
+    return max(counts, key=lambda k: (counts[k], -k)) if counts else None
+
+
 def link_config(cfg: dict, cards: list[int] | None = None) -> dict:
     """The config as the NVIDIA lead runs it: its CUDA build on the first NVIDIA card, the AMD GPU as the helper."""
     out = dict(cfg)
@@ -77,6 +97,12 @@ def link_config(cfg: dict, cards: list[int] | None = None) -> dict:
     env = {k: v for k, v in (cfg.get("env") or {}).items() if k not in AMD_ONLY_ENV}
     env.update({"MAYA_GLM_EXPERT_HELPER": "link", "MAYA_GLM_SPLIT": "0", "MAYA_GLM_HELPER_EXE": str(helper_exe(cfg)),
                 "HIP_VISIBLE_DEVICES": ",".join(amd)})
+    # repeatable answers: the engine drafts a fixed length in link mode - the one the speed check's search kept
+    n = mtp_draft(cfg)
+    if n is not None and "MAYA_GLM_MTP_FIXED" not in env and "MAYA_GLM_MTP_ADAPT" not in env:
+        env["MAYA_GLM_MTP_FIXED"] = str(n)
+    # ... and plans the prompts' CPU share from the CPU lane's start-up timing as the first start measured it (kept)
+    env.setdefault("MAYA_GLM_CPU_CAL", str(Path(cfg["exe"]).resolve().parent.parent / "data" / "glm-link-cpu-cal.txt"))
     out["env"] = env
     if out.get("vision"):   # the encoder (a HIP build) stays on the AMD GPU, loaded once: nothing to lend it there
         out["vision"] = dict(out["vision"], resident=True)

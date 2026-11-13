@@ -3964,6 +3964,10 @@ bool Glm5Model::fast_cpu_lane_setup(std::string& err) {
     }
     cudaEventDestroy(e0);
     cudaEventDestroy(e1);
+    // repeatable answers: the timing as the cache keeps it (4 decimals), so the start that measured it plans the
+    // prompts' CPU share exactly as every later start reading MAYA_GLM_CPU_CAL does
+    if (glmfast::repeatable(F->helper.linked()))
+        for (double* v : {&c_ms, &p_ms, &ps_ms}) *v = std::round(*v * 1e4) / 1e4;
     if (!cal_key.empty()) cal_put(calf, cal_key, cal_vals(c_ms, p_ms, ps_ms, 0.0));
     }
     F->cpu_c_ms = c_ms;   // (the prompt path splits its staged experts by them too)
@@ -4731,6 +4735,7 @@ void Glm5Model::lane_drift_check() {
     for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
         FastState* F = m->fast_;
         if (F == nullptr || F->cpu_pool == nullptr || F->cal_key.empty()) continue;
+        if (glmfast::repeatable(F->helper.linked())) continue;   // (repeatable answers: the cached timing stays)
         const uint64_t e = F->cpu_experts.load(), us = F->cpu_us.load();
         if (e - F->drift_e0 < 2000) continue;
         const double ms = (double) (us - F->drift_us0) / 1000.0 / (double) (e - F->drift_e0);
@@ -4769,6 +4774,7 @@ void Glm5Model::lane_retime() {
     if (!on) return;
     for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
         FastState* F = m->fast_;
+        if (F != nullptr && glmfast::repeatable(F->helper.linked())) continue;   // (repeatable answers: no timed re-plan)
         if (F == nullptr || F->cpu_pool == nullptr || !F->cpu_retime || F->rt_windows >= 8 || F->rt_changes >= 3)
             continue;
         const uint64_t e = F->cpu_experts.load(), us = F->cpu_us.load(), r = F->cpu_routes.load();
@@ -5849,10 +5855,16 @@ bool Glm5Model::fast_boundary(std::string& err) {
             }
         }
     }
-    // (2)
+    // (2)  (repeatable answers: a demotion lands exactly fixed_moves boundaries after it started, as step 5's moves;
+    //      a prompt's lending - bg_hold - retires them all at once)
     std::vector<FastState::Drain> still;
+    const int fixed_drains = glmfast::fixed_moves(F->helper.linked());
     for (auto& d : F->draining) {
-        const cudaError_t de = cudaEventQuery(d.ev);
+        if (fixed_drains > 0 && !F->bg_hold && F->bnd_seq < d.seq + (uint64_t) fixed_drains) {
+            still.push_back(d);
+            continue;
+        }
+        const cudaError_t de = fixed_drains > 0 ? cudaEventSynchronize(d.ev) : cudaEventQuery(d.ev);
         if (de != cudaSuccess && de != cudaErrorNotReady)
             return glmfast::cuda_ok(de, "glm demotion event", err);
         if (de == cudaErrorNotReady) {
@@ -5965,7 +5977,7 @@ bool Glm5Model::fast_boundary(std::string& err) {
                                 F->L[(size_t) il].blob, cudaMemcpyDeviceToHost, F->copy);
                 cudaEvent_t ev = F->get_event();
                 cudaEventRecord(ev, F->copy);
-                F->draining.push_back(FastState::Drain{il, v, vkey, F->layer_rc[(size_t) il], rs, ev});
+                F->draining.push_back(FastState::Drain{il, v, vkey, F->layer_rc[(size_t) il], rs, ev, F->bnd_seq});
                 P.st[(size_t) v] = FastState::kDraining;
                 P.key[(size_t) v] = -1;
                 F->demotions.fetch_add(1, std::memory_order_relaxed);
@@ -6010,15 +6022,13 @@ bool Glm5Model::fast_boundary(std::string& err) {
     //     the layer's least used resident is demoted when a RAM-only expert is used bg_ratio times as much (the slot
     //     takes the promotion at a later boundary).  Either way the expert stays live where it was until its copy
     //     landed - no window in which a route would go to disk.  MAYA_GLM_PROMOTE=<moves a boundary>, 0: off.
-    //     MAYA_GLM_FIXED_MOVES=<n> (opt-in): a move goes live exactly n boundaries after it started - waiting for its
+    //     MAYA_GLM_FIXED_MOVES=<n> (4 by default with repeatable answers - glmfast::repeatable, a linked helper; else
+    //     0 = off): a move goes live exactly n boundaries after it started - waiting for its
     //     copy there if it is still on its way - and never earlier, so which experts sit in VRAM follows the routes
     //     alone, not how fast the copies ran: the same prompt gives the same placement token for token, and a lead
     //     beside a helper on another GPU (MAYA_GLM_EXPERT_HELPER=link) gives the same answer run to run.
     {
-        static const int fixed_moves = [] {
-            const char* v = getenv("MAYA_GLM_FIXED_MOVES");
-            return v != nullptr ? std::max(0, std::atoi(v)) : 0;
-        }();
+        const int fixed_moves = glmfast::fixed_moves(F->helper.linked());
         ++F->bnd_seq;
         const int NE = g.n_expert;
         std::vector<FastState::BgMove> keep;
@@ -6195,6 +6205,20 @@ bool Glm5Model::fast_boundary(std::string& err) {
     }
     flush();
     if (ok && !fast_helper_adapt(err)) return false;
+    if (glmfast::dt_on()) {
+        uint64_t hs = glmfast::dt_fnv(F->slot_of.data(), F->slot_of.size() * sizeof(int));
+        uint64_t hr = glmfast::dt_fnv(F->ram_of.data(), F->ram_of.size() * sizeof(int));
+        uint64_t hc = 1469598103934665603ull;
+        for (const auto& R : F->rc) hc = glmfast::dt_fnv(R.st.data(), R.st.size(), glmfast::dt_fnv(R.key.data(), R.key.size() * sizeof(int), hc));
+        uint64_t hv = 1469598103934665603ull;
+        for (const auto& P : F->lp) hv = glmfast::dt_fnv(P.st.data(), P.st.size(), glmfast::dt_fnv(P.key.data(), P.key.size() * sizeof(int), hv));
+        const auto& ow = F->helper.owners();
+        const uint64_t ho = glmfast::dt_fnv(ow.data(), ow.size() * sizeof(ow[0]));
+        std::fprintf(stderr, "DT bnd %llu slot=%016llx ram=%016llx rc=%016llx lp=%016llx own=%016llx bg=%zu dr=%zu sw=%llu\n",
+                     (unsigned long long) F->bnd_seq, (unsigned long long) hs, (unsigned long long) hr,
+                     (unsigned long long) hc, (unsigned long long) hv, (unsigned long long) ho, F->bg.size(),
+                     F->draining.size(), (unsigned long long) F->helper_swaps);
+    }
     F->check_resident(l0_, lt_, g.n_expert);   // (the tables as the next token's routes find them)
     static const bool diag = getenv("MAYA_GLM_TIER_DIAG") != nullptr;
     static const int diag_every = getenv("MAYA_GLM_TIER_DIAG_EVERY") ? std::max(1, std::atoi(getenv("MAYA_GLM_TIER_DIAG_EVERY"))) : 64;

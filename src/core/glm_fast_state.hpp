@@ -48,6 +48,39 @@ inline bool wait_event(cudaEvent_t ev, const char* what, std::string& err) {
     while ((e = cudaEventQuery(ev)) == cudaErrorNotReady) std::this_thread::yield();
     return cuda_ok(e, what, err);
 }
+// MAYA_GLM_DET_TRACE=1 (debug): "DT ..." lines on stderr - hashes of the placement at every boundary and of each
+// prompt layer's plan and rows, to find where two runs of the same requests part
+inline bool dt_on() {
+    static const bool on = getenv("MAYA_GLM_DET_TRACE") != nullptr && std::atoi(getenv("MAYA_GLM_DET_TRACE")) != 0;
+    return on;
+}
+inline uint64_t dt_fnv(const void* p, size_t n, uint64_t h = 1469598103934665603ull) {
+    const unsigned char* b = (const unsigned char*) p;
+    for (size_t i = 0; i < n; ++i) h = (h ^ b[i]) * 1099511628211ull;
+    return h;
+}
+// Repeatable answers: nothing the decode or a prompt computes may depend on how fast something ran. On by default
+// with a linked helper on another GPU (MAYA_GLM_EXPERT_HELPER=link: two GPUs whose copies and kernels race each other
+// run to run), else off; MAYA_GLM_REPEATABLE=1/0 forces it.  It sets tier moves and demotions on a fixed schedule
+// (MAYA_GLM_FIXED_MOVES, 4 boundaries unless set) and the MTP draft length fixed (MAYA_GLM_MTP_FIXED; unset: the
+// adaptive search's start length) instead of picked by measured round times.
+inline bool repeatable(bool linked) {
+    static const int env = [] {
+        const char* v = getenv("MAYA_GLM_REPEATABLE");
+        if (v != nullptr) return std::atoi(v) != 0 ? 1 : 0;
+        const char* h = getenv("MAYA_GLM_EXPERT_HELPER");   // (asked for: on before the helper has linked as well)
+        return h != nullptr && std::string(h) == "link" ? 1 : -1;
+    }();
+    return env >= 0 ? env == 1 : linked;
+}
+// the boundaries a tier move or demotion takes before it goes live (0: as soon as its copy is done - timing)
+inline int fixed_moves(bool linked) {
+    static const int env = [] {
+        const char* v = getenv("MAYA_GLM_FIXED_MOVES");
+        return v != nullptr ? std::max(0, std::atoi(v)) : -1;
+    }();
+    return env >= 0 ? env : repeatable(linked) ? 4 : 0;
+}
 
 namespace gf = strata::kernels::glmf;
 
@@ -689,6 +722,7 @@ struct Glm5Model::FastState {
     struct Drain {
         int il, vslot, key, rclass, rslot;
         cudaEvent_t ev;
+        uint64_t seq = 0;   // the boundary it started at (MAYA_GLM_FIXED_MOVES)
     };
     std::vector<Drain> draining;
     // ---- background moves between the tiers (fast_boundary step 5): a promotion (up, RAM -> VRAM) or a demotion
