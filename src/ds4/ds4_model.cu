@@ -12759,6 +12759,22 @@ struct Model::Impl {
         }
         l.helper[(size_t) sw.out] = region;
         ++xch_done;
+        if (check_swaps) {   // (DS4_CHECK_SWAPS: the helper's table on the device as the host's, no expert in both)
+            std::vector<unsigned long long> t((size_t) l.n_exp);
+            cudaGetDevice(&cur);
+            const bool rd = cudaSetDevice(helper_id) == cudaSuccess &&
+                            cudaMemcpy(t.data(), l.helper_tab, t.size() * 8, cudaMemcpyDeviceToHost) == cudaSuccess;
+            cudaSetDevice(cur);
+            int diff = 0, both = 0, held = 0;
+            for (int x = 0; x < l.n_exp; ++x) {
+                diff += !rd || t[(size_t) x] != (unsigned long long) l.helper[(size_t) x];
+                both += l.slot[(size_t) x] >= 0 && l.helper[(size_t) x] != nullptr;
+                held += l.helper[(size_t) x] != nullptr;
+            }
+            std::fprintf(stderr, "ds4 settle: layer %d: the helper's table %s the host's (%d entries differ), %d experts "
+                                 "in VRAM and the pool, %d in the pool\n",
+                         l.il, diff == 0 ? "matches" : "DIFFERS from", diff, both, held);
+        }
     }
     // (the engine thread, idle) the exchanges that landed switched in, the next ones queued: true while any is under way
     bool settle_idle_step() {
