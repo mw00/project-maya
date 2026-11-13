@@ -4702,6 +4702,10 @@ LINK_TIE = 0.03          # both GPUs (GLM link mode) only when their decode beat
 # decode gains too).  The files DeepSeek's engine learns into its pack at every run: put back before each side
 # starts and after the check, so both sides start alike and the check's documents lead no later start
 DS4_LEARNED = ("expert-profile.bin", "lane-times.txt")
+# DeepSeek on both GPUs turns itself on after a winning speed check: not yet - with thinking on, the two-GPU answers
+# are not right (the NVIDIA card's expert sums); until that is fixed and verified the check measures and says the
+# result, and the config stays on the AMD GPU alone (--mixed-gpus on still turns both on).  GLM's link mode: as before
+DS4_BOTH_AUTO = False
 
 
 def ds4_learned_kept(cfg: dict):
@@ -4861,16 +4865,19 @@ def link_calibration(cfg_path: Path, why: str = "") -> bool:
     if not glm:
         o, d = res["other"]["write_tok_s"], res["both"]["write_tok_s"]
         ro, rd = res["other"]["read_tok_s"], res["both"]["read_tok_s"]
-        cfg["mixed_gpus"] = res["gain"] > LINK_TIE and d >= o
+        faster = res["gain"] > LINK_TIE and d >= o
+        cfg["mixed_gpus"] = faster and DS4_BOTH_AUTO
         cfg.setdefault("installer", {})["mixed_gpus_calibration"] = {
             "date": time.strftime("%Y-%m-%d %H:%M"), "version": maya_version(), "both_tok_s": d, "alone_tok_s": o,
             "both_read_tok_s": rd, "alone_read_tok_s": ro, "doc_tokens": res["other"]["doc_tokens"],
-            "gain": res["gain"]}
+            "gain": res["gain"], "faster": faster}
         cfg_path.write_text(json.dumps(N.env_out(cfg), indent=1), encoding="utf-8")
         say()
         ok(f"speed check: on both GPUs it reads {rd:.0f} tokens/s and writes {d:.1f}, on the AMD GPU alone {ro:.0f} "
            f"and {o:.1f} ({100.0 * res['gain']:+.0f}% over both) - " +
            ("Maya runs on both GPUs (--mixed-gpus off turns it off)" if cfg["mixed_gpus"] else
+            "both GPUs are available, off until their answers are verified: Maya stays on the AMD GPU alone "
+            "(--mixed-gpus on turns both on)" if faster else
             "Maya stays on the AMD GPU alone (--mixed-gpus on turns both on)"))
         return True
     o, d = res["other"]["tok_s"], res["dflash2"]["tok_s"]
@@ -6877,8 +6884,10 @@ def write_config_ds4(a, pc: dict, meta: dict, pack: Path, ctx: int, models: Path
         exe = Path(cfg.get("mixed_exe") or Path(cfg["exe"]).resolve().parents[1] / "build-cuda" / Path(cfg["exe"]).name)
         if exe.is_file():
             say("  two GPUs (experimental): this PC also has an NVIDIA card - the first start measures DeepSeek on the "
-                "AMD GPU alone and with the card beside it (the card computes its most-routed experts) and keeps the "
-                "faster; answers can be worded slightly differently from the AMD GPU alone; `--mixed-gpus split` "
+                "AMD GPU alone and with the card beside it (the card computes its most-routed experts) and " +
+                ("keeps the faster" if DS4_BOTH_AUTO else
+                 "says the result; both GPUs stay off until their answers are verified, `--mixed-gpus on` turns them on") +
+                "; answers can be worded slightly differently from the AMD GPU alone; `--mixed-gpus split` "
                 "gives the card the first layers instead - long prompts read faster still, decode about the same; "
                 "`--mixed-gpus off` turns it off)")
         else:

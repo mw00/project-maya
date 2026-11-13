@@ -363,8 +363,9 @@ class BothGpus(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
-    def run_it(self, res, family="deepseek"):
+    def run_it(self, res, family="deepseek", auto=True):
         calls = []
+        self.said = []
 
         def fake_phases(alone, both, say=None, start_engine=None, between=None, close=None):
             calls.append(("phases", alone.get("mixed_gpus"), both.get("mixed_gpus")))
@@ -383,9 +384,22 @@ class BothGpus(unittest.TestCase):
                 patch.object(maya, "busy_gpus", return_value=[]), patch.object(maya, "mixed_why_not", return_value=None), \
                 patch.object(maya, "mixed_family", return_value=family), \
                 patch.object(maya.GL, "link_config", side_effect=lambda c: json.loads(json.dumps(c))), \
-                patch.object(maya, "say"), patch.object(maya, "ok"), patch.object(maya, "warn"):
+                patch.object(maya, "DS4_BOTH_AUTO", auto),                 patch.object(maya, "say"), patch.object(maya, "ok", side_effect=self.said.append), patch.object(maya, "warn"):
             out = maya.link_calibration(self.cfg_path)
         return out, calls, json.loads(self.cfg_path.read_text(encoding="utf-8"))
+
+    def test_deepseek_measures_but_stays_alone_until_both_gpus_are_verified(self):
+        self.assertIs(maya.DS4_BOTH_AUTO, False)                         # (the gate: off until the answers are right)
+        out, calls, cfg = self.run_it(phase_result(1.13, 1.25), auto=False)
+        self.assertTrue(out)
+        self.assertIs(cfg["mixed_gpus"], False)                          # measured faster, not turned on
+        self.assertIs(cfg["installer"]["mixed_gpus_calibration"]["faster"], True)
+        self.assertIn("available, off until", self.said[-1])
+        cfg = self.run_it(phase_result(0.95, 0.95), auto=False)[2]       # slower: the plain line
+        self.assertIs(cfg["mixed_gpus"], False)
+        self.assertNotIn("off until", self.said[-1])
+        res = {"other": {"tok_s": 25.8, "tokens": 512}, "dflash2": {"tok_s": 31.2, "tokens": 512}}
+        self.assertIs(self.run_it(res, family="glm", auto=False)[2]["mixed_gpus"], True)   # GLM: as before
 
     def test_deepseek_goes_on_both_when_reading_and_writing_gain(self):
         out, calls, cfg = self.run_it(phase_result(1.13, 1.25))

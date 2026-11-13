@@ -28,8 +28,10 @@ from pathlib import Path
 PLAN_TIMEOUT_S = 180
 PLAN_SETTLE_S = 90   # (back on both GPUs: how long the NVIDIA card may take to free the front's memory)
 # found two GPUs and no "mixed_gpus" in the config: on by itself only where it is faster at decode too (the owner's
-# rule): the helper layout (MODE) is - decode and prompts both measured faster (below); the split's decode is not
-AUTO = True
+# rule): the helper layout (MODE) is - decode and prompts both measured faster (below); the split's decode is not.
+# Off for now: with thinking on, the helper layout's answers are not right (the card's expert sums) - until that is
+# fixed and verified a config without "mixed_gpus" runs on the AMD GPU alone and the start says both are available
+AUTO = False
 # "mixed_mode" (config): "helper" - the AMD GPU runs the whole model and the NVIDIA card computes the experts its VRAM
 # holds (the most-routed, experts only) for the AMD GPU's decode windows and prompt chunks, through shared memory (one
 # conversation; a card or link gone: the AMD GPU goes on alone, the request too); "split" - the card runs the first
@@ -104,9 +106,8 @@ def config_of(cfg: dict) -> dict | None:
         if not auto_found(cfg):
             return None   # (Windows, no NVIDIA card or no CUDA build: as before, not a line said)
         if not AUTO:
-            print("[maya] two GPUs: an NVIDIA card beside the AMD GPU - `maya --mixed-gpus on` runs DeepSeek on both "
-                  "(long prompts read much faster, decode about the same; answers can be worded slightly differently)",
-                  flush=True)
+            print("[maya] two GPUs: an NVIDIA card beside the AMD GPU - available, off until verified "
+                  "(`maya --mixed-gpus on` runs DeepSeek on both)", flush=True)
             return None
         print("[maya] two GPUs: an NVIDIA card beside the AMD GPU - DeepSeek runs on both (on by itself; "
               "`maya --mixed-gpus off` or \"mixed_gpus\": false in the config turns it off)", flush=True)
