@@ -77,6 +77,11 @@ struct Options {
     // --parallel: conversations held at once (1-8), each its own state - its position, tokens, checkpoints, window rings,
     // the compressors' partial groups, the compressed KV and the index keys (a full context's each); 1: as before
     int seqs = 1;
+    // the pool: a front runs the trunk's first layers and sends the rest to the part server at remote_part
+    // (host:port); a part server (part_from > 0) runs the layers from part_from on, the head, the sampling and the
+    // drafter (Model::part_serve)
+    std::string remote_part;
+    int part_from = 0;
 };
 
 /// A picture in the prompt: its span's rows (every position of the span carries the image token), BF16 [span][dim]
@@ -376,6 +381,22 @@ public:
     void set_images(std::vector<Image> images);
 
     void save_profile() const;
+    /// The pool's part server: answers one front at a time on port (never returns unless the port cannot be used).
+    bool part_serve(int port, std::string& err);
+    /// MAYA_MIXED_HELPER (DS4_RHELPER_SERVE=<name>): computes a lead engine's experts its VRAM leaves over, until it ends.
+    bool rhelper_serve(std::string& err);
+    /// The pool's line for the logs ("" when not a front).
+    std::string pool_line() const;
+    /// MAYA_MIXED_FRONT: this engine holds only the trunk's first layers, a second engine the rest (two GPUs of one
+    /// PC): no pictures, log-probabilities or --parallel through it.
+    bool pool_front() const;
+    /// The front's link failed (MAYA_MIXED_FRONT): the engine ends after the request (broken() is true).
+    bool pool_lost() const;
+    /// --mixed-plan: how many of the trunk's first layers (weights and every expert) fit the free VRAM of the first
+    /// visible GPU, beside the model's shared weights, reserve_mib and margin_gb (a long prompt's room); 0: none. msg
+    /// says the numbers it went by.
+    static int mixed_plan(const std::string& pack, int reserve_mib, double margin_gb, std::string& msg,
+                          std::string& err);
     const Stats& stats() const;
     std::string describe() const;
     /// INFO / VRAM lines for the server's Monitor.
@@ -396,6 +417,11 @@ public:
     struct Impl;
 
 private:
+    bool feed_(const int* tokens, int n, int logits_rows, std::string& err, int after);
+    bool feed_mark_(const int* tokens, int n, int logits_rows, int slot, std::string& err);
+    bool feed_marks_(const int* tokens, int n, int logits_rows, int slot,
+                     const std::vector<std::pair<int64_t, bool>>& inner, std::string& err);
+    bool feed_part_(const FeedPlan& plan, const int* tokens, int k0, int k1, std::string& err);
     std::unique_ptr<Impl> p_;
 };
 

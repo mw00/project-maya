@@ -779,6 +779,11 @@ std::vector<int> g_vram_gpus;   // --gpus (empty: every visible GPU): the cards 
 int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float conf_min, const std::string& pack,
           Lookup* lk, DraftCost* dc) {
     std::vector<int> eos = parse_ids(eos_list);
+    // (MAYA_MIXED_FRONT: the first layers here, the rest in a second engine - pictures and log-probabilities are not
+    //  carried through it: the server is told there are none, and a request that asks is refused below)
+    const bool mixed = m.pool_front();
+    // (serve/mixed_gpus.py runs a request with pictures or log-probabilities on the AMD GPU alone, whose INFO lines
+    //  these are - one that reaches this engine anyway is refused below)
     for (const std::string& l : m.info_lines()) std::printf("%s\n", l.c_str());
     std::printf("INFO logprobs=%d\n", strata::ds4::kTopLogprobs);   // (GEN logprobs=<k>: LP lines, k at most this)
     std::printf("INFO logit_bias=1\n");   // (GEN logit_bias=<id>:<bias>,...: added to the logits of every pick)
@@ -807,16 +812,22 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
     const auto end_note = [&m, &ending] {   // (before a request's DONE)
         if (ending || !m.broken()) return;
         ending = true;
+        if (m.pool_lost()) {   // (MAYA_MIXED_FRONT: its second engine is gone - the server goes on without it)
+            std::printf("END the second GPU's engine (--mixed-gpus) is gone - this engine ends (exit 4); the next "
+                        "request starts the model on one GPU\n");
+            std::fprintf(stderr, "maya ds4 serve: the second GPU's engine is gone - the engine ends (exit 4)\n");
+            return;
+        }
         std::printf("END a GPU's state is unknown after this request - the engine ends (exit 3); the next request "
                     "starts a fresh one\n");
         std::fprintf(stderr, "maya ds4 serve: a GPU's state is unknown after this request - the engine ends (exit 3) "
                              "so the server starts it again for the next request\n");
     };
-    const auto end_if_broken = [&ending] {   // (after it)
+    const auto end_if_broken = [&ending, &m] {   // (after it)
         if (!ending) return;
         std::fflush(stdout);
         std::fflush(stderr);
-        std::_Exit(3);   // (not abort(): a core dump of the pinned expert tiers takes minutes)
+        std::_Exit(m.pool_lost() ? 4 : 3);   // (not abort(): a core dump of the pinned expert tiers takes minutes)
     };
     // (DS4_SERVE_DUMP=<prefix>, tests: request i's logits - the prompt's last row, then every decode step's rows - into
     //  <prefix>.<i>.f32, to compare a request's logits byte for byte across processes and histories)
@@ -1500,7 +1511,10 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         std::vector<Pic>& pics = P.pics;
         {
             std::string e;
-            if (geni && img_tok < 0) e = "this engine has no vision tower, so it cannot read pictures";
+            if (geni && mixed) e = "pictures are not read with two GPUs (--mixed-gpus) yet: start without it for them";
+            else if (r.logprobs >= 0 && mixed)
+                e = "log-probabilities are not given with two GPUs (--mixed-gpus) yet: start without it for them";
+            else if (geni && img_tok < 0) e = "this engine has no vision tower, so it cannot read pictures";
             else if (geni && read_pics(r.file, pics, e))
                 for (const Pic& q : pics)
                     if (q.start < 0 || (size_t) q.start >= r.ids.size() || r.ids[(size_t) q.start] != img_tok)
@@ -2005,6 +2019,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                                             : 0.0);
         if (d_off > 0) std::fprintf(stderr, "maya ds4 serve: drafts %lld of %lld kept; %s\n", d_acc, d_off,
                                     per_position(s_dec, s).c_str());
+        if (!m.pool_line().empty()) std::fprintf(stderr, "maya ds4 serve: %s\n", m.pool_line().c_str());
         // (DS4_DRAFT_VRAM, read as MAYA_DS4_DRAFT_VRAM or DS4_DRAFT_VRAM: the cap's misses - this request's decode,
         //  the drafter's picks)
         if (std::getenv("MAYA_DS4_DRAFT_VRAM") != nullptr || std::getenv("DS4_DRAFT_VRAM") != nullptr)
@@ -3595,6 +3610,8 @@ int main(int argc, char** argv) {
     bool dspark_on_asked = false;   // (--dspark on given: a pack without drafter blocks is then told)
     float temp = 0.0f;   // the CLI's sampling (0: greedy)
     unsigned long long cli_seed = 1;
+    int part_port = 0;
+    bool mixed_plan = false;   // (--mixed-plan: the front's layer count for this GPU, printed; nothing loaded)
     bool serve_mode = false, multi_check = false, parts_check = false, marks_check = false, describe = false, dspark_set = false;
     std::string prof_run, prof_out, spec_eval_path;
     int sampler_n = 0;
@@ -3708,6 +3725,10 @@ int main(int argc, char** argv) {
             o.ablate_default = v == "on" || v == "1";
         }
         else if (a == "--serve") serve_mode = true;
+        else if (a == "--remote-part") o.remote_part = val("--remote-part");   // the pool: host:port of the part server
+        else if (a == "--part-from") o.part_from = (int) num("--part-from", 1, 1000, true);   // the pool: a part's first layer
+        else if (a == "--part-serve") part_port = (int) num("--part-serve", 1, 65535, true);  // the pool: serve as a part
+        else if (a == "--mixed-plan") mixed_plan = true;   // (serve/mixed_gpus.py: how many layers this GPU takes)
         else if (a == "--parallel") o.seqs = (int) num("--parallel", 1, 8, true);   // (--serve: conversations at once)
         else if (a == "--multi-check") multi_check = true;   // (tests: --parallel's rows against each alone)
         else if (a == "--parts-check") parts_check = true;   // (tests: a prompt in parts against one call)
@@ -3752,7 +3773,23 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "--sampler-test needs --ids (a prompt whose next tokens are open)\n");
         return 2;
     }
-    if (o.pack.empty() || (!serve_mode && ids_s.empty() && enc_rgb.empty() && ppl.empty() && prof_run.empty() &&
+    if (mixed_plan && !o.pack.empty()) {   // MIXED_PLAN <layers> <the numbers>: MAYA_MIXED_MARGIN_GB (1.0) is the margin
+        const char* mg = std::getenv("MAYA_MIXED_MARGIN_GB");
+        std::string msg, err;
+        const int k = strata::ds4::Model::mixed_plan(o.pack, (int) o.reserve_mib, mg != nullptr ? std::atof(mg) : 1.0,
+                                                     msg, err);
+        if (k < 0) {
+            std::fprintf(stderr, "maya-ds4: --mixed-plan: %s\n", err.c_str());
+            return 1;
+        }
+        std::printf("MIXED_PLAN %d %s\n", k, msg.c_str());
+        return 0;
+    }
+    if (!o.remote_part.empty() && o.seqs > 1) {
+        std::fprintf(stderr, "maya-ds4: --remote-part runs one conversation: --parallel %d is not covered\n", o.seqs);
+        return 2;
+    }
+    if (o.pack.empty() || (!serve_mode && part_port == 0 && ids_s.empty() && enc_rgb.empty() && ppl.empty() && prof_run.empty() &&
                            spec_eval_path.empty())) {
         usage();
         return 2;
@@ -3791,6 +3828,10 @@ int main(int argc, char** argv) {
 #endif
     }
     o.vision_only = !enc_rgb.empty();
+    if (part_port > 0 && o.part_from <= 0) {
+        std::fprintf(stderr, "maya-ds4: --part-serve needs --part-from <the first layer it runs>\n");
+        return 2;
+    }
     strata::ds4::Model m;
     std::string err;
     o.lookup = suffix_draft > 0;   // (its verify windows' buffers, with no drafter too)
@@ -3812,6 +3853,20 @@ int main(int argc, char** argv) {
                              "same tokens)\n");
     } else if (ds4_env("DS4_DRAFT_COST") != nullptr && std::atoi(ds4_env("DS4_DRAFT_COST")) != 0)
         std::fprintf(stderr, "maya-ds4: DS4_DRAFT_COST: no DSpark drafter loaded, nothing to size\n");
+    if (ds4_env("DS4_RHELPER_SERVE") != nullptr) {   // MAYA_MIXED_HELPER: a lead engine's experts, then the end
+        if (!m.rhelper_serve(err)) {
+            std::fprintf(stderr, "maya-ds4: %s\n", err.c_str());
+            return 1;
+        }
+        return 0;
+    }
+    if (part_port > 0) {   // the pool's part server: the front's layers come over the link
+        if (!m.part_serve(part_port, err)) {
+            std::fprintf(stderr, "maya-ds4: %s\n", err.c_str());
+            return 1;
+        }
+        return 0;
+    }
     if (serve_mode) {
         g_vram_gpus = o.gpus;
         return serve(m, eos, spec, o.dspark_conf, o.pack, lk.get(), dc.get());
@@ -4046,6 +4101,7 @@ int main(int argc, char** argv) {
     const double t2 = now_ms();
     const auto& s = m.stats();
     const double nt = std::max<double>(1.0, (double) (s.tokens - s0.tokens));
+    if (!m.pool_line().empty()) std::fprintf(stderr, "%s\n", m.pool_line().c_str());
     std::fprintf(stderr, "decode: %zu tokens in %.0f ms (%.2f tok/s); CPU lane: %lld of %lld experts, streamed to the GPU: "
                          "%lld; the cache moved %lld (%lld in all)\n", out.size(), t2 - t1,
                  out.size() > 1 ? 1000.0 * (double) (out.size() - 1) / (t2 - t1) : 0.0,
