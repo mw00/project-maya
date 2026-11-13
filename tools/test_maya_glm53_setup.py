@@ -376,23 +376,19 @@ class Download(unittest.TestCase):
                 patch.object(maya, "choose", side_effect=choose), patch.object(maya.S, "gpus", return_value=[]), \
                 patch.object(maya, "mem_gb", return_value=(512.0, 500.0)):
             got = maya.choose_model(SimpleNamespace(backend=backend, model_dir=None, gguf_dir=None, model=None,
-                                                    yes=True), Path(t), {})
+                                                    yes=True), Path(t), {}, "glm53")
         return got, seen["rows"], seen["default"]
 
     def test_the_list(self):
-        flash = [q for q in maya.MODELS if q not in maya.MODELS_BY_HAND]
         got, on, default = self.rows()
-        rows = on[:len(flash)]                                                      # (Flash's rows first)
-        self.assertFalse(any("744B" in r[0] for r in rows))
-        self.assertEqual(on[len(rows)][0], "GLM-5.3 (744B) · Maya-XS, text only: download 170.0 GB from Hugging Face")
-        self.assertIn("every expert stays in memory from about 176 GB of VRAM and RAM together", on[len(rows)][2])
-        self.assertEqual(on[len(rows) + 1][0],
+        self.assertEqual(len(on), len(maya.G53_MODELS) + 1)
+        self.assertEqual(on[0][0], "GLM-5.3 (744B) · Maya-XS, text only: download 170.0 GB from Hugging Face")
+        self.assertIn("every expert stays in memory from about 176 GB of VRAM and RAM together", on[0][2])
+        self.assertEqual(on[1][0],
                          "GLM-5.3 (744B) · UD-IQ2_M, text only: download 238.6 GB from Hugging Face")
-        self.assertIn("every expert stays in memory from about 245 GB of VRAM and RAM together", on[len(rows) + 1][2])
-        self.assertIn("GGUF files you already have", on[len(rows) + 2][0])
-        self.assertEqual((got, default), (("download", flash[0]), 0))
-        _, metal, _ = self.rows("metal")
-        self.assertFalse(any("UD-IQ2_M" in r[0] or "Maya-XS," in r[0] for r in metal))   # (not on Metal)
+        self.assertIn("every expert stays in memory from about 245 GB of VRAM and RAM together", on[1][2])
+        self.assertIn("GGUF files you already have", on[2][0])
+        self.assertEqual((got, default), (("download", "GLM-5.3-Maya-XS"), 0))
 
     def test_metal_refused_before_the_download(self):
         a = SimpleNamespace(backend="metal", model_dir=None, gguf_dir=None, model="GLM-5.3-UD-IQ2_M", yes=True)

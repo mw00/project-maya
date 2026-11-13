@@ -774,7 +774,7 @@ QWEN_UD_DIR = "Qwen3.8-Flash-Next-UD-IQ2_XS"       # (its folder in the models f
 QWEN_UD_MANIFEST = ROOT / "tools" / "qwen" / "download_unsloth.json"
 QWEN_UD_MODEL_NAME = "qwen3.8-flash-next"
 QWEN_QUANTS = ("q5_k_m", QWEN_UD)
-FAMILIES = ("glm", "deepseek", "minimax", "qwen")
+FAMILIES = ("glm", "glm53", "deepseek", "minimax", "qwen")
 SHARD_RE = re.compile(r"-(\d{5})-of-(\d{5})\.gguf$")
 
 
@@ -1802,22 +1802,25 @@ def config_family(cfg: dict) -> str:
     return Q.family_of(cfg)
 
 
+def setup_family(cfg: dict) -> str:
+    """Split the two GLM model choices in setup; both still use the engine's 'glm' config family."""
+    inst = cfg.get("installer") or {}
+    return "glm53" if inst.get("quant") in G53_MODELS or G53.config_is_glm_dsa(cfg) else config_family(cfg)
+
+
 # each model's name on the setup's screen, under its logo (Qwen's: the model, whichever of its files - never its id)
-FAMILY_TITLE = {**Q.MODEL, "qwen": "Qwen-3.8-Flash-Next"}
+FAMILY_TITLE = {**Q.MODEL, "glm53": G53.SHOWN, "qwen": "Qwen-3.8-Flash-Next"}
 
 
 def setup_title(cfg: dict) -> str:
-    """The setup screen's header name for a config: its family's, except a glm-dsa config (family "glm"), which
-    is GLM-5.3's own name, not GLM-5.3-Flash."""
-    if G53.config_is_glm_dsa(cfg):
-        return G53.SHOWN
-    return FAMILY_TITLE.get(config_family(cfg), "")
+    """The setup screen's model name, including GLM-5.3's own name for a glm-dsa config."""
+    return FAMILY_TITLE.get(setup_family(cfg), "")
 
 
 # the models whose engine answers several requests at once (--parallel): GLM-5.3-Flash's, DeepSeek-V4.1-Flash's
 # (maya-ds4 --parallel: a conversation's state each, their tokens decoded together), MiniMax-M3.1-Flash's (maya-mm3
 # --parallel: a KV cache each in VRAM - no KV streaming, no DSpark)
-PARALLEL_FAMILIES = ("glm", "deepseek", "minimax")
+PARALLEL_FAMILIES = ("glm", "glm53", "deepseek", "minimax")
 
 
 def check_parallel(a, family: str) -> None:
@@ -1829,10 +1832,10 @@ def check_parallel(a, family: str) -> None:
 
 
 def choose_family(a, prev: dict) -> str:
-    """"glm" or "deepseek": what the options say (--model, --gguf-dir, --draft), else asked - the model set up before
-    is the default."""
+    """The setup's model choice, or the model named by options; an earlier setup is the default."""
     if a.model:
-        return "deepseek" if a.model == DS4 else "minimax" if a.model == MM3 else "qwen" if a.model == QWEN else "glm"
+        return ("deepseek" if a.model == DS4 else "minimax" if a.model == MM3 else "qwen" if a.model == QWEN
+                else "glm53" if a.model in G53_MODELS else "glm")
     if getattr(a, "qwen_quant", None):                 # (--qwen-quant alone: Qwen's files named)
         return "qwen"
     metal = getattr(a, "backend", None) == "metal"
@@ -1840,7 +1843,7 @@ def choose_family(a, prev: dict) -> str:
         return "glm"
     if a.model_dir:                                    # (an EXL3 folder of GLM or MiniMax; else DeepSeek's files)
         return exl3_folder_family(a.model_dir) or "deepseek"
-    default = config_family(prev) if prev else "glm"
+    default = setup_family(prev) if prev else "glm"
     try:
         have = sum(g["vram_gb"] for g in S.gpus() if g.get("vram_gb")) + mem_gb()[0]
     except Exception:  # noqa: BLE001 - no NVIDIA tools: no figure for this PC
@@ -1850,6 +1853,9 @@ def choose_family(a, prev: dict) -> str:
              "Z.ai's GLM-5.3-Flash in Project Maya's GGUF quants (GLM-5.3-Flash-Maya-S to -Maya-L, 95-156 GB) or "
              "turboderp's EXL3 quants: from one GPU up, the experts that do not fit in VRAM from RAM and the SSD; "
              "NVIDIA and AMD; pictures with its vision encoder."),
+            (G53.SHOWN, None,
+             "Z.ai's GLM-5.3 (744B, 40B active per token): text only, with its own NextN drafting block; "
+             "NVIDIA and AMD. Its experts can use VRAM, RAM and the SSD."),
             (DS4, None,
              "DeepSeek's DeepSeek-V4.1-Flash-1017 (748B) on its own engine: unsloth's GGUF (UD-Q8_K_XL, 508 GB; "
              "NVIDIA from V100 on or AMD, Linux or Windows), orcarouter's abliterated one (Mix-128G or "
@@ -1920,7 +1926,7 @@ def setup_gpus(a) -> list:
         return []
 
 
-def choose_model(a, models: Path, inst: dict) -> tuple:
+def choose_model(a, models: Path, inst: dict, family: str = "glm") -> tuple:
     """("download", one of MODELS) or ("local", the model's first .gguf file): --gguf-dir, --model, else asked among
     the downloads - the earlier download is the default.  ("exl3", the folder): --model-dir naming an EXL3 folder of
     GLM-5.3-Flash."""
@@ -1940,10 +1946,33 @@ def choose_model(a, models: Path, inst: dict) -> tuple:
         if metal and a.model in G53_MODELS:            # (GLM-5.3: before its download, not after it)
             fail(f"{G53.SHOWN} runs on NVIDIA and AMD GPUs (not on Metal yet)", f"{ME} --setup picks another model")
         return "download", a.model
+    if family == "glm53":
+        if metal:
+            fail(f"{G53.SHOWN} runs on NVIDIA and AMD GPUs (not on Metal yet)", f"{ME} --setup picks another model")
+        g53 = list(G53_MODELS)
+        try:
+            ram, gpus = mem_gb()[0], setup_gpus(a)
+        except Exception:  # noqa: BLE001 - the PC does not read: the usual pick
+            ram, gpus = 0.0, []
+        rec = fit_recommendation({q: g53_figures(q)[0] for q in g53}, gpus, ram,
+                                 DEFAULT_CONTEXT * G53.KV_BYTES / 2**30, g53[0])
+        default = inst.get("quant") if inst.get("quant") in g53 else rec
+        rows = []
+        for q in g53:
+            m, d = G53_MODELS[q], download_dir(models, q)
+            have = all(p.exists() for p in local_shards(m, d))
+            rows.append((f"{G53.LABEL} · {Q.glm53_quant(q)}, text only: " +
+                         (f"downloaded, in {d}" if have else f"download {m['download_gb']:.1f} GB from Hugging Face"),
+                         f"recommended for {G53.SHOWN}" if q == rec else None,
+                         f"{m['about']}; {g53_memory_note(quant=q)}"))
+        rows.append((f"{G53.SHOWN} (744B, text only): GGUF files you already have", None,
+                     "Z.ai's GLM-5.3 on the same engine; set up from its GGUF folder with --gguf-dir <folder>"))
+        pick = choose(f"Which {G53.SHOWN}?", ["The model to set up:"], rows, g53.index(default), a.yes)
+        if pick == len(g53):
+            fail(f"{G53.SHOWN} is set up from its GGUF files", f"{ME} --setup --gguf-dir <the folder of its .gguf files>")
+        return "download", g53[pick]
     opts = [q for q in MODELS if (q not in MODELS_BY_HAND or q == inst.get("quant"))
             and not (metal and is_exl3(q))]   # (a chosen-by-hand download: only where it is installed; Metal: GGUFs)
-    # GLM-5.3 (744B): its downloads after GLM-5.3-Flash's - not on Metal
-    g53 = [q for q in G53_MODELS if q in glm_downloads()] if not metal else []
     # cards of 24 GB or less: Maya-S24 (its 4-bit attention leaves ~1.5 GB more of the card for experts - decode about
     # 14% faster there), else Maya-S
     try:
@@ -1962,7 +1991,7 @@ def choose_model(a, models: Path, inst: dict) -> tuple:
     sizes = {q: MODELS[q]["download_gb"] for q in opts if q in (top, "Maya-XS-IQ1_S") or
              (q != "Maya-S24" and not is_exl3(q))}
     rec = fit_recommendation(sizes, gpus, ram, DEFAULT_CONTEXT * G53.KV_BYTES / 2**30, top)
-    default = inst["quant"] if inst.get("quant") in MODELS or inst.get("quant") in g53 else rec
+    default = inst["quant"] if inst.get("quant") in opts else rec
     rows = []
     for q in opts:
         m, d = MODELS[q], download_dir(models, q)
@@ -1971,25 +2000,9 @@ def choose_model(a, models: Path, inst: dict) -> tuple:
                                                  f"download {m['download_gb']:.1f} GB from Hugging Face"),
                      ("recommended for cards of 24 GB or less" if q == "Maya-S24" else "recommended") if q == rec
                      else None, m["about"]))
-    # GLM-5.3 (744B)'s own recommendation where it lists more than one (fit_recommendation by g53_figures' memory),
-    # at most Maya's own quant (the owner, 2026-11-11): a larger third-party quant is listed, never recommended
-    rec53 = fit_recommendation({q: g53_figures(q)[0] for q in g53}, gpus, ram,
-                               DEFAULT_CONTEXT * G53.KV_BYTES / 2**30,
-                               "GLM-5.3-Maya-XS" if "GLM-5.3-Maya-XS" in g53 else None) if len(g53) > 1 else None
-    for q in g53:                                      # GLM-5.3 (744B, glm-dsa): its downloads (hidden)
-        m, d = G53_MODELS[q], download_dir(models, q)
-        have = all(p.exists() for p in local_shards(m, d))
-        rows.append((f"{G53.LABEL} · {Q.glm53_quant(q)}, text only: " +
-                     (f"downloaded, in {d}" if have else f"download {m['download_gb']:.1f} GB from Hugging Face"),
-                     f"recommended for {G53.SHOWN}" if q == rec53 else None,
-                     f"{m['about']}; {g53_memory_note(quant=q)}"))
-    rows.append((f"{G53.SHOWN} (744B, text only): GGUF files you already have", None,   # GLM-5.3 (744B, glm-dsa)
-                 "Z.ai's GLM-5.3 on the same engine; set up from its GGUF folder with --gguf-dir <folder>"))
     pick = choose("Which GLM-5.3-Flash?", ["The model to download (GLM-5.3-Flash GGUF files you already have: "
-                                           "--gguf-dir <file or folder>):"], rows, (opts + g53).index(default), a.yes)
-    if pick >= len(opts) + len(g53):
-        fail(f"{G53.SHOWN} is set up from its GGUF files", f"{ME} --setup --gguf-dir <the folder of its .gguf files>")
-    return "download", (opts + g53)[pick]
+                                           "--gguf-dir <file or folder>):"], rows, opts.index(default), a.yes)
+    return "download", opts[pick]
 
 
 def g53_choice(choice: tuple | None) -> bool:
@@ -5458,8 +5471,8 @@ def set_up(a, prev: dict) -> Path | None:
     family = choose_family(a, prev)
     S.model_named(FAMILY_TITLE[family])
     check_parallel(a, family)
-    if config_family(prev) != family:
-        prev = next((c for c in map(read_json, configs()) if config_family(c) == family and
+    if setup_family(prev) != family:
+        prev = next((c for c in map(read_json, configs()) if setup_family(c) == family and
                      c.get("backend", "cuda") == a.backend), {})
     if family == "deepseek":
         return set_up_ds4(a, prev)
@@ -5475,7 +5488,7 @@ def set_up(a, prev: dict) -> Path | None:
     models = (Path(a.models_dir).expanduser().resolve() if a.models_dir else
               Path(inst["models_dir"]) if inst.get("models_dir") else
               Path(inst["data_dir"]) / "models" if inst.get("data_dir") else ROOT.parent / "Maya-data" / "models")
-    choice = choose_model(a, models, inst)
+    choice = choose_model(a, models, inst, family)
     pc = check_pc(a)                                   # 1
     metal = pc["backend"] == "metal"
     step(2, "your choices")                            # 2

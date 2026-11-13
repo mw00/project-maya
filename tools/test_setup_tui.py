@@ -201,10 +201,11 @@ class ModelName(unittest.TestCase):
                     patch.object(maya, "set_up_ds4", return_value=None), \
                     patch.object(maya, "set_up_mm3", return_value=None), \
                     patch.object(maya, "set_up_qwen", return_value=None), \
+                    patch.object(maya, "choose_model", return_value=("download", "Maya-S-v2-IQ2_XXS")), \
                     patch.object(maya, "check_pc", side_effect=KeyboardInterrupt), \
                     patch.object(maya, "configs", return_value=[]), patch.object(S, "model_named") as named:
                 try:
-                    maya.set_up(SimpleNamespace(parallel=None, backend="cuda"), {})
+                    maya.set_up(SimpleNamespace(parallel=None, backend="cuda", models_dir=None), {})
                 except KeyboardInterrupt:                # (GLM's step 1: the test stops there)
                     pass
                 named.assert_called_once_with(maya.FAMILY_TITLE[family])
@@ -290,12 +291,12 @@ class Screen(unittest.IsolatedAsyncioTestCase):
                 await until("Model?")
                 await pilot.press("escape")                # no earlier question yet
                 self.assertIn("Model?", str(app.query_one("#ask").border_title))
-                await pilot.press("4")
+                await pilot.press("5")
                 await until("Which Qwen3.8-Flash-Next?")
                 await pilot.press("escape")
                 await until("Model?")
-                self.assertEqual(app.query_one("#options").highlighted, 3)
-                await pilot.press("2")                   # change the family after going back
+                self.assertEqual(app.query_one("#options").highlighted, 4)
+                await pilot.press("3")                   # change the family after going back
                 while app.return_value is None:
                     await pilot.pause(0.02)
         self.assertEqual(app.return_value, ("done", ("deepseek", None)))
@@ -335,6 +336,39 @@ class Screen(unittest.IsolatedAsyncioTestCase):
                 while app.return_value is None:
                     await pilot.pause(0.02)
         self.assertEqual(app.return_value, ("stopped", None))
+        bridge.log.close()
+
+    async def test_glm53_has_its_own_second_screen_and_escape_returns_to_flash(self):
+        a = SimpleNamespace(model=None, gguf_dir=None, draft=None, model_dir=None, backend="cuda", yes=False)
+
+        def body():
+            family = maya.choose_family(a, {})
+            return family, maya.choose_model(a, Path(self.dir.name), {}, family)
+
+        bridge = Bridge(self.log)
+        S.UI = bridge
+        app = T.SetupApp(bridge, body, "1.0", "./maya.sh", self.log)
+        async with app.run_test(size=(110, 40)) as pilot:
+            async def until(question):
+                t0 = time.time()
+                while app.pending is None or question not in str(app.query_one("#ask").border_title):
+                    self.assertLess(time.time() - t0, 20)
+                    await pilot.pause(0.02)
+
+            with patch.object(maya.S, "gpus", return_value=[]), patch.object(maya, "mem_gb", return_value=(189, 170)):
+                await until("Model?")
+                await pilot.press("2")
+                await until("Which GLM-5.3?")
+                await pilot.press("escape")
+                await until("Model?")
+                self.assertEqual(app.query_one("#options").highlighted, 1)
+                await pilot.press("1")
+                await until("Which GLM-5.3-Flash?")
+                await pilot.press("enter")
+                while app.return_value is None:
+                    await pilot.pause(0.02)
+        self.assertEqual(app.return_value[0], "done")
+        self.assertEqual(app.return_value[1][0], "glm")
         bridge.log.close()
 
     async def test_the_line_under_the_logo_names_the_model_once_it_is_known(self):

@@ -71,11 +71,11 @@ class Names(unittest.TestCase):
         a = type("A", (), {"model": None, "gguf_dir": None, "draft": None, "model_dir": None, "yes": True})()
         with patch.object(maya, "choose", pick), patch.object(maya.S, "gpus", return_value=[]):
             maya.choose_family(a, {})
-        (label, note, about) = rows[3]
+        (label, note, about) = rows[4]
         self.assertEqual(label, "Qwen-3.8-Flash-Next")
         self.assertTrue(about.startswith("Qwen3.8-Flash-Next: 180B"), about)
-        self.assertIn("UD-Q8_K_XL", rows[1][2])
-        self.assertNotIn("UD-Q4_K_XL", rows[1][2])
+        self.assertIn("UD-Q8_K_XL", rows[2][2])
+        self.assertNotIn("UD-Q4_K_XL", rows[2][2])
 
     def test_family(self):
         with tempfile.TemporaryDirectory() as t:
