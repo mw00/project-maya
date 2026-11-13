@@ -62,8 +62,10 @@ int main(int argc, char** argv) {
     const char* dv = std::getenv("MAYA_GLM_HELPER_DEVICE");
     const int dev = dv != nullptr ? std::atoi(dv) : 0;
 #ifdef STRATA_USE_HIP
-    // each call ends in a stream wait: spin in it (a blocking wait adds tens of us a call); MAYA_GLM_HELPER_SPIN=0 off
-    if (const char* sp = std::getenv("MAYA_GLM_HELPER_SPIN"); sp == nullptr || std::strcmp(sp, "0") != 0) {
+    // MAYA_GLM_HELPER_SPIN=1: spin in each call's stream wait instead of blocking - measured no faster (GLM-5.3-Flash
+    // decode 34.8/32.5 tok/s blocking vs 34.7-34.8/31.2-32.6 spinning, a Radeon 8065S helper), and a spinning core
+    // heats the APU the GPU shares, so it is off unless asked
+    if (const char* sp = std::getenv("MAYA_GLM_HELPER_SPIN"); sp != nullptr && std::strcmp(sp, "0") != 0) {
         hipSetDevice(dev);
         hipSetDeviceFlags(hipDeviceScheduleSpin);
     }
