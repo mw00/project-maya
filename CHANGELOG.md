@@ -4,6 +4,68 @@ Every release is on GitHub (Releases) with these notes; every published change m
 page's Settings › About and updates (About > Update before the redesign; from v1.0.18), or `git pull`, then `./setup.sh` (Windows: `START-MAYA.bat`) - it recompiles
 only what changed and starts; the model is not downloaded again.
 
+## v1.1.62 - 2026-11-13
+
+AMD Strix Halo and Gorgon Halo APUs (Ryzen AI Max) can now be paired with an NVIDIA GPU: Maya runs one model on both at once, with GLM-5.3-Flash prefilling up to 3 times faster and DeepSeek-V4.1-Flash decoding up to 18% faster than on the APU alone.
+
+- **New: an AMD Halo APU and an NVIDIA GPU sharing one model (Linux, experimental):** the AMD side runs on ROCm (HIP) and the NVIDIA side on CUDA, both drivers loaded side by side in one PC. The NVIDIA card can sit in a USB4/PCIe dock. The two GPUs share one copy of the model in the APU's system memory: each computes its own part of every layer, and while it runs only activations cross between them, not the model's weights. For GLM-5.3-Flash the NVIDIA card runs attention, the KV cache, drafting and the most-used experts, and the APU computes every other expert in place from its own memory. For DeepSeek-V4.1-Flash the APU runs the whole model and the NVIDIA card computes its most-used experts for it.
+  - **Maya tunes itself:** when it finds both GPUs, the setup builds both engines and the first start measures each model on the APU alone and on both. It keeps both only where that is more than 3% faster; the Models page then shows "AMD + NVIDIA". `--mixed-gpus off` (or `"mixed_gpus": "off"`) turns it off.
+  - **Answers** repeat run to run, and can differ slightly from the APU alone.
+  - **GLM-5.3 (744B)** stays on the APU alone unless you start it with `--mixed-gpus on`: on some starts it stalls for a while on this setup.
+  - **Tested on** a Gorgon Halo APU (Radeon 8065S) with a Tesla V100 32 GB in a USB4 dock, ROCm 7.14 and CUDA 12.4. Strix Halo uses the same AMD code.
+
+  **Biggest gains, A/B on the same PC** (tokens per second; A = the APU alone, B = the APU and the NVIDIA GPU together)
+
+  | | A | B | Change |
+  |---|---|---|---|
+  | GLM-5.3-Flash prefill, 32K tokens | 293 | 901 | +208% |
+  | GLM-5.3-Flash prefill, 8K tokens | 315 | 837 | +166% |
+  | GLM-5.3-Flash prefill, 2K tokens | 310 | 591 | +91% |
+  | GLM-5.3-Flash decode | 26.6 | 32.1 | +21% |
+  | DeepSeek-V4.1-Flash decode | 36.8 | 43.5 | +18% |
+  | DeepSeek-V4.1-Flash prefill, 32K tokens, `--mixed-gpus split` | 615 | 1,062 | +73% |
+
+  **All measurements**
+
+  GLM-5.3-Flash (Maya-S)
+
+  | | A | B | Change |
+  |---|---|---|---|
+  | Decode, question 1 | 30.2 | 34.4 | +14% |
+  | Decode, question 2 | 26.6 | 32.1 | +21% |
+  | Prefill, 2K tokens | 310 | 591 | +91% |
+  | Prefill, 8K tokens | 315 | 837 | +166% |
+  | Prefill, 32K tokens | 293 | 901 | +208% |
+
+  DeepSeek-V4.1-Flash (Maya-XS)
+
+  | | A | B | Change |
+  |---|---|---|---|
+  | Decode, question 1 | 36.8 | 43.5 | +18% |
+  | Decode, question 2 | 29.6 | 31.4 | +6% |
+  | Decode, question 3 | 44.7 | 49.6 | +11% |
+  | Prefill, 2K tokens | 283 | 322 | +14% |
+  | Prefill, 8K tokens | 475 | 528 | +11% |
+  | Prefill, 32K tokens | 615 | 696 | +13% |
+
+  DeepSeek-V4.1-Flash (Maya-XS) with `--mixed-gpus split`, for long documents: the NVIDIA card runs the first layers instead (decode is 1-4% slower than the APU alone)
+
+  | | A | B | Change |
+  |---|---|---|---|
+  | Prefill, 2K tokens | 283 | 348 | +23% |
+  | Prefill, 8K tokens | 475 | 674 | +42% |
+  | Prefill, 32K tokens | 615 | 1,062 | +73% |
+
+  With DeepSeek, requests with pictures, log-probabilities or refusal ablation run on the APU alone.
+
+- **Faster: GLM decode after a prefill on AMD APUs under Linux:** GLM-5.3-Flash (Maya-S) on the APU alone, v1.1.61 against v1.1.62. The answers now repeat run to run. Prefill and decode in a fresh chat are unchanged.
+
+  | Decode right after | v1.1.61 | v1.1.62 | Change |
+  |---|---|---|---|
+  | a 2K-token prefill | 20.9 | 29.2 | +40% |
+  | an 8K-token prefill | 19.7 | 20.7 | +5% |
+  | a 32K-token prefill | 16.6 | 21.0 | +27% |
+
 ## v1.1.61 - 2026-11-12
 
 DeepSeek reads prompts up to 17% faster on AMD Ryzen AI Max APUs with the same answers, a fast prompt reading switch, faster EXL3 decode on AMD, and prompt lookup for MiniMax on one GPU.
