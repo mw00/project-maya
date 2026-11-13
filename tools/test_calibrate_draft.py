@@ -432,5 +432,22 @@ class BothGpus(unittest.TestCase):
         self.assertEqual((self.pack / "expert-profile.bin").read_bytes(), b"mine")
 
 
+class BothGpusDue(unittest.TestCase):
+    """maya.needs_link_calibration: which configs the first attended start measures on both GPUs."""
+
+    def due(self, family, glm_dsa, auto=False):
+        cfg = {"exe": "build-hip/maya", "backend": "hip", "args": ["--glm-pack", "pack"]}
+        with patch.object(maya, "mixed_family", return_value=family),                 patch.object(maya, "mixed_why_not", return_value=None),                 patch.object(maya.G53, "config_is_glm_dsa", return_value=glm_dsa),                 patch.object(maya, "G53_BOTH_AUTO", auto):
+            return maya.needs_link_calibration(cfg)
+
+    def test_glm_5_3_744b_is_not_measured(self):
+        self.assertFalse(self.due("glm", True))                          # GLM-5.3 (744B): alone unless --mixed-gpus on
+        self.assertTrue(self.due("glm", True, auto=True))                # (the switch back on: measured again)
+
+    def test_glm_flash_and_deepseek_are_measured(self):
+        self.assertTrue(self.due("glm", False))
+        self.assertTrue(self.due("deepseek", False))
+
+
 if __name__ == "__main__":
     unittest.main()

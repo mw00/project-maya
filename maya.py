@@ -4706,6 +4706,11 @@ DS4_LEARNED = ("expert-profile.bin", "lane-times.txt")
 # the config stays on the AMD GPU alone - --mixed-gpus on still turns both on).  On again since the helper layout's
 # answers are right (the AMD GPU reads the card's sums) and both its reading and its writing measured faster
 DS4_BOTH_AUTO = True
+# GLM-5.3 (744B, glm-dsa) on both GPUs only when asked (--mixed-gpus on): its helper maps the largest shared RAM tier,
+# and the AMD driver at times stops the helper's queues for seconds to minutes while it re-validates that range after
+# the kernel moved pages - so the first start does not measure it and it starts on the AMD GPU alone.  GLM-5.3-Flash
+# and DeepSeek measure as before
+G53_BOTH_AUTO = False
 
 
 def ds4_learned_kept(cfg: dict):
@@ -4802,7 +4807,10 @@ def set_glm_mixed_gpus(cfg: dict, value: str | None) -> None:
 
 def needs_link_calibration(cfg: dict) -> bool:
     """A GLM or DeepSeek config on an AMD GPU with an NVIDIA card and the builds beside it, never measured both ways
-    and with no "mixed_gpus" of the user's: its next attended start measures (link_calibration)."""
+    and with no "mixed_gpus" of the user's: its next attended start measures (link_calibration).  Not GLM-5.3 (744B)
+    while G53_BOTH_AUTO is off: it starts on the AMD GPU alone, --mixed-gpus on turns both on."""
+    if not G53_BOTH_AUTO and mixed_family(cfg) == "glm" and G53.config_is_glm_dsa(cfg):
+        return False
     return "mixed_gpus" not in cfg and "mixed_gpus_calibration" not in (cfg.get("installer") or {}) and \
         mixed_family(cfg) is not None and mixed_why_not(cfg) is None
 
@@ -8187,7 +8195,7 @@ def main() -> int:
                          "GPUs, in the layout that suits the model (DeepSeek: the card computes the AMD GPU's most-used "
                          "experts, or `split`: it runs the first layers - as many as its VRAM holds, or LAYERS; GLM: "
                          "the card leads, the AMD GPU computes the other experts); off - the AMD GPU alone; not given - "
-                         "the first start measures both and keeps the faster; answers can be worded slightly "
+                         "the first start measures both and keeps the faster (GLM-5.3 744B: only with on); answers can be worded slightly "
                          "differently from one GPU alone; kept in the config")
     ap.add_argument("--port", type=int, help="the dashboard's and the API's port (default 8080)")
     ap.add_argument("--host", help="where the server listens: 127.0.0.1 = this machine only (default), 0.0.0.0 = also "
