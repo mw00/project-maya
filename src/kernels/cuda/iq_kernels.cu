@@ -1051,7 +1051,7 @@ bool native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
     // glm-dsa B3.5: a type with no kernel below (the two switches' cases) is refused before any launch and reported by
     // the caller; it stopped the process (std::exit) when the K-quants were missing
     const auto has_kernel = [](int t) { return (t >= 10 && t <= 14) || (t >= 16 && t <= 23) || t == 29 || t == 42; };
-    if (!has_kernel(L.gu_type) || !(has_kernel(L.d_type) || L.d_type == 6)) {   // (down: Maya v1.1.55 Q5_0 too)
+    if (!has_kernel(L.gu_type) || !(has_kernel(L.d_type) || L.d_type == 6 || L.d_type == 8)) {   // (down: Q5_0 & Q8_0 too)
         std::fprintf(stderr, "native_expert_grouped: no kernel for gate/up type %d, down type %d\n", L.gu_type, L.d_type);
         return false;
     }
