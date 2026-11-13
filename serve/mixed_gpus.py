@@ -22,9 +22,11 @@ import re
 import socket
 import subprocess
 import threading
+import time
 from pathlib import Path
 
 PLAN_TIMEOUT_S = 180
+PLAN_SETTLE_S = 90   # (back on both GPUs: how long the NVIDIA card may take to free the front's memory)
 # found two GPUs and no "mixed_gpus" in the config: on by itself only where it is faster at decode too (the owner's
 # rule) - Radeon 8065S + V100, Maya-XS: prompts +11/+39/+75 % at 2K/8K/32K but decode -1..-4 %, so not yet: the setup and
 # the log say how to turn it on.  A prompt-reading-only mode (decode on the AMD GPU alone) would make it on by itself.
@@ -194,6 +196,18 @@ def engine_class(base, wait_gpu_release):
             fenv["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
             fenv["CUDA_VISIBLE_DEVICES"] = str(m["gpu"])
             k, why = plan(m["exe"], pack, fenv, cwd)
+            # back on both GPUs after a request ran on the AMD GPU alone: the card frees the front's memory in its own
+            # time, so plan again until it fits as many layers as the first start found (or PLAN_SETTLE_S passed)
+            best, t0 = getattr(self, "k_seen", 0), time.time()
+            while k < best and time.time() - t0 < PLAN_SETTLE_S:
+                time.sleep(2.0)
+                k, why = plan(m["exe"], pack, fenv, cwd)
+            if k < best:
+                print(f"[maya] two GPUs: the NVIDIA card has less room than at the first start after "
+                      f"{time.time() - t0:.0f} s", flush=True)
+            elif best and time.time() - t0 > 1:
+                print(f"[maya] two GPUs: the NVIDIA card had its memory back after {time.time() - t0:.0f} s", flush=True)
+            self.k_seen = max(best, k)
             print(f"[maya] two GPUs: {why}", flush=True)
             if m["layers"] != "auto":
                 k = int(m["layers"])
