@@ -29,9 +29,8 @@ PLAN_TIMEOUT_S = 180
 PLAN_SETTLE_S = 90   # (back on both GPUs: how long the NVIDIA card may take to free the front's memory)
 # found two GPUs and no "mixed_gpus" in the config: on by itself only where it is faster at decode too (the owner's
 # rule): the helper layout (MODE) is - decode and prompts both measured faster (below); the split's decode is not.
-# Off for now: with thinking on, the helper layout's answers are not right (the card's expert sums) - until that is
-# fixed and verified a config without "mixed_gpus" runs on the AMD GPU alone and the start says both are available
-AUTO = False
+# (False: a config without "mixed_gpus" runs on the AMD GPU alone and the start says both are available)
+AUTO = True
 # "mixed_mode" (config): "helper" - the AMD GPU runs the whole model and the NVIDIA card computes the experts its VRAM
 # holds (the most-routed, experts only) for the AMD GPU's decode windows and prompt chunks, through shared memory (one
 # conversation; a card or link gone: the AMD GPU goes on alone, the request too); "split" - the card runs the first

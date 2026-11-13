@@ -4702,10 +4702,10 @@ LINK_TIE = 0.03          # both GPUs (GLM link mode) only when their decode beat
 # decode gains too).  The files DeepSeek's engine learns into its pack at every run: put back before each side
 # starts and after the check, so both sides start alike and the check's documents lead no later start
 DS4_LEARNED = ("expert-profile.bin", "lane-times.txt")
-# DeepSeek on both GPUs turns itself on after a winning speed check: not yet - with thinking on, the two-GPU answers
-# are not right (the NVIDIA card's expert sums); until that is fixed and verified the check measures and says the
-# result, and the config stays on the AMD GPU alone (--mixed-gpus on still turns both on).  GLM's link mode: as before
-DS4_BOTH_AUTO = False
+# DeepSeek on both GPUs turns itself on after a winning speed check (False: the check measures and says the result,
+# the config stays on the AMD GPU alone - --mixed-gpus on still turns both on).  On again since the helper layout's
+# answers are right (the AMD GPU reads the card's sums) and both its reading and its writing measured faster
+DS4_BOTH_AUTO = True
 
 
 def ds4_learned_kept(cfg: dict):

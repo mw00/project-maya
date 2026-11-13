@@ -388,8 +388,7 @@ class BothGpus(unittest.TestCase):
             out = maya.link_calibration(self.cfg_path)
         return out, calls, json.loads(self.cfg_path.read_text(encoding="utf-8"))
 
-    def test_deepseek_measures_but_stays_alone_until_both_gpus_are_verified(self):
-        self.assertIs(maya.DS4_BOTH_AUTO, False)                         # (the gate: off until the answers are right)
+    def test_deepseek_measures_but_stays_alone_while_the_switch_is_off(self):
         out, calls, cfg = self.run_it(phase_result(1.13, 1.25), auto=False)
         self.assertTrue(out)
         self.assertIs(cfg["mixed_gpus"], False)                          # measured faster, not turned on
