@@ -155,9 +155,9 @@ class PlainSetup(unittest.TestCase):
                 patch.object(S, "ask_text", return_value=folder), \
                 patch.object(maya, "import_model", return_value=0) as imported:
             models = Path(folder) / "models"
-            pick = maya.choose_with_add(a, "Which files?", [], [("First", None, None)], 0, False, models)
+            pick = maya.choose_with_add(a, "Which files?", [], [("First", None, None)], 0, False, models, "glm")
             self.assertEqual(pick, 0)
-            imported.assert_called_once_with(a, folder, link=False, models_override=models, from_setup=True)
+            imported.assert_called_once_with(a, folder, models_override=models, from_setup=True)
 
     def test_a_closed_screen_falls_back_to_print(self):
         S.UI = SimpleNamespace(say=lambda msg: False, ok=lambda msg: False)
@@ -330,7 +330,7 @@ class Screen(unittest.IsolatedAsyncioTestCase):
         bridge = Bridge(self.log)
         S.UI = bridge
         body = lambda: maya.choose_with_add(a, "Which files?", [], rows, 0, False,
-                                             Path(a.models_dir))
+                                             Path(a.models_dir), "glm")
         app = T.SetupApp(bridge, body, "1.0", "./maya.sh", self.log)
         async with app.run_test(size=(110, 40)) as pilot:
             async def until(question):
@@ -339,7 +339,7 @@ class Screen(unittest.IsolatedAsyncioTestCase):
                     self.assertLess(time.time() - t0, 20)
                     await pilot.pause(0.02)
 
-            with patch.object(maya, "import_model", return_value=0) as imported:
+            with patch.object(maya, "link_model", return_value=0) as linked:
                 await until("Which files?")
                 await pilot.press("0")
                 await until("Directory with downloaded model files")
@@ -355,8 +355,7 @@ class Screen(unittest.IsolatedAsyncioTestCase):
                 await pilot.press("2")
                 while app.return_value is None:
                     await pilot.pause(0.02)
-            imported.assert_called_once_with(a, self.dir.name, link=True,
-                                             models_override=Path(a.models_dir), from_setup=True)
+            linked.assert_called_once_with(self.dir.name, Path(a.models_dir), "glm")
         self.assertEqual(app.return_value, ("done", 1))
         bridge.log.close()
 

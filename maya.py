@@ -1940,12 +1940,12 @@ def setup_models_dir(a, prev: dict) -> Path:
 
 
 def choose_with_add(a, question: str, intro: list, rows: list, default: int, yes: bool,
-                    models: Path) -> int:
-    """A model-files menu with 0 to place verified files, then choose from the same list."""
+                    models: Path, family: str) -> int:
+    """A model-files menu with 0 to link by type or import, then choose from the same list."""
     if yes:
         return choose(question, intro, rows, default, yes)
     options = [("0) Add downloaded model", None,
-                "Choose a directory, then link its verified files or import them into Maya's models folder.")] + rows
+                "Choose a directory, then link files by model type or import them with full verification.")] + rows
     while True:
         pick = choose(question, intro, options, default, False)
         if pick < len(rows):
@@ -1959,10 +1959,13 @@ def choose_with_add(a, question: str, intro: list, rows: list, default: int, yes
             warn(f"{folder} is not a directory")
             continue
         action = choose("How to add the files?", [f"Source: {src}"],
-                        [("Link files", None, "Verify SHA-256, then create symbolic links. Originals stay in place."),
+                        [("Link files", None, "Check the model type, then create symbolic links. No size or SHA-256 check."),
                          ("Import Model", None, "Standard import: move files on the same drive, copy on another drive.")],
                         0, False)
-        import_model(a, str(src), link=action == 0, models_override=models, from_setup=True)
+        if action == 0:
+            link_model(str(src), models, family)
+        else:
+            import_model(a, str(src), models_override=models, from_setup=True)
         if S.UI is not None and hasattr(S.UI, "commit_add"):
             S.UI.commit_add()
 
@@ -2009,7 +2012,7 @@ def choose_model(a, models: Path, inst: dict, family: str = "glm") -> tuple:
         rows.append((f"{G53.SHOWN} (744B, text only): GGUF files you already have", None,
                      "Z.ai's GLM-5.3 on the same engine; set up from its GGUF folder with --gguf-dir <folder>"))
         pick = choose_with_add(a, f"Which {G53.SHOWN}?", ["The model to set up:"], rows,
-                               g53.index(default), a.yes, models)
+                               g53.index(default), a.yes, models, "glm53")
         if pick == len(g53):
             fail(f"{G53.SHOWN} is set up from its GGUF files", f"{ME} --setup --gguf-dir <the folder of its .gguf files>")
         return "download", g53[pick]
@@ -2044,7 +2047,7 @@ def choose_model(a, models: Path, inst: dict, family: str = "glm") -> tuple:
                      else None, m["about"]))
     pick = choose_with_add(a, "Which GLM-5.3-Flash?", ["The model to download (GLM-5.3-Flash GGUF files you already have: "
                                                        "--gguf-dir <file or folder>):"], rows, opts.index(default),
-                           a.yes, models)
+                           a.yes, models, "glm")
     return "download", opts[pick]
 
 
@@ -2764,6 +2767,8 @@ def incomplete(path: Path):
 def file_incomplete(m: dict, path: Path):
     """Why a download's file is not whole, or None when it is: a GGUF by its own tensor directory (incomplete), an
     EXL3 model's file by its published size."""
+    if MI.is_linked(path):
+        return None
     if "files" not in m:
         return incomplete(path)
     if not path.exists():
@@ -2803,6 +2808,8 @@ VERIFIED = ".maya-verified.json"                   # in a model folder: the file
 def sha256_checked(path: Path, want) -> bool:
     """sha256_ok, read once: a file that matched is remembered (VERIFIED) with its size and modification time, and not
     read again until either changes."""
+    if MI.is_linked(path):
+        return True
     book = read_json(path.parent / VERIFIED)
     st = path.stat()
     seen = book.get(path.name) or {}
@@ -2886,7 +2893,7 @@ def import_catalog(models: Path) -> list:
     return cat
 
 
-def import_model(a, folder: str, *, link: bool = False, models_override: Path | None = None,
+def import_model(a, folder: str, *, models_override: Path | None = None,
                  from_setup: bool = False) -> int:
     """--import-model <folder>: find the published model files in a folder by their size and sha256 (whatever the
     downloader named them, in whatever subfolders, also a Hugging Face cache's blobs/snapshots), and move them (same
@@ -2931,9 +2938,7 @@ def import_model(a, folder: str, *, link: bool = False, models_override: Path | 
     anchor = next(p for p in [models, *models.parents] if p.exists())
     apart = [p for p, r, _, _ in placed if not MI.same_drive(r, anchor) or os.path.abspath(p) != str(r)]
     copy = bool(a.copy)
-    if link:
-        say(f"  Link verified files into {models}; originals stay in {src}.")
-    elif apart and not copy:
+    if apart and not copy:
         say()
         say(f"  {len(apart)} file(s) are on another drive than {models} (or are links into a cache): they can only be "
             "copied - the original stays where it is, so the space is used twice.")
@@ -2943,22 +2948,113 @@ def import_model(a, folder: str, *, link: bool = False, models_override: Path | 
         if ask(f"  Move {len(placed)} file(s) into {models}? (y/n)", ["y", "n"], "y", False) != "y":
             say("  Nothing was moved.")
             return 0
-    moved = copied = linked = 0
+    moved = copied = 0
     skipped_now = []
     for path, real, size, hits in placed:
-        r = MI.place(path, real, size, hits, models, copy, say, link=link)
+        r = MI.place(path, real, size, hits, models, copy, say)
         moved, copied = moved + r["moved"], copied + r["copied"]
-        linked += r["linked"]
         skipped_now += r["skipped"]
     for line in skipped_now:
         warn(line)
-    ok(f"{moved} file(s) moved, {copied} copied, {linked} linked into {models}; "
+    ok(f"{moved} file(s) moved, {copied} copied into {models}; "
        "they are recorded as verified (no second check)")
     if from_setup:
         say("  Select the model's files in the list to continue setup.")
     else:
         say(f"  Now run {ME} --setup and pick the model (or {ME} --setup --model <name>): the files are used where they are.")
     return 0
+
+
+def linked_model_type(path: Path) -> str | None:
+    """Family from a model header/config only. No size or checksum is consulted."""
+    if path.suffix.lower() == ".gguf":
+        arch = gguf_head(path)[0]
+        return ("glm" if arch in GLM_ARCHS else "glm53" if arch == G53.ARCH else
+                "deepseek" if arch == "deepseek41" else "minimax" if arch == "minimax-m3" else
+                "qwen" if arch == "qwen4exp" else None)
+    if path.name == "config.json":
+        conf = read_json(path)
+        if (conf.get("quantization_config") or {}).get("quant_method") == "exl3":
+            return {"glm5_next": "glm", "deepseek_v41": "deepseek",
+                    "minimax_m3_vl": "minimax"}.get(conf.get("model_type"))
+    return None
+
+
+def link_catalog_family(label: str, family: str) -> bool:
+    if family == "glm":
+        return label in MODELS
+    if family == "glm53":
+        return label in G53_MODELS
+    if family == "deepseek":
+        return label.startswith(DS4)
+    if family == "minimax":
+        return label.startswith(MM3)
+    return family == "qwen" and label in (QWEN, QWEN_UD_DIR)
+
+
+def link_model(folder: str, models: Path, family: str) -> int:
+    """Link named published files after checking the model family in GGUF/EXL3 metadata only."""
+    src = Path(folder).expanduser().resolve()
+    files = [(path, real) for path, real, _ in MI.files_under(src)]
+    typed = [(path, real, linked_model_type(real)) for path, real in files
+             if path.suffix.lower() == ".gguf" or path.name == "config.json"]
+    anchors = [(path, real) for path, real, kind in typed if kind == family]
+    if not anchors:
+        found = sorted({kind for _, _, kind in typed if kind})
+        warn(f"no {FAMILY_TITLE[family]} model in {src}" +
+             (f"; detected: {', '.join(FAMILY_TITLE[k] for k in found)}" if found else
+              "; no recognized GGUF header or EXL3 config.json"))
+        return 1
+    catalog = [e for e in import_catalog(models) if link_catalog_family(e["label"], family)]
+    by_label, by_name = {}, {}
+    for e in catalog:
+        by_label.setdefault(e["label"], []).append(e)
+    for path, real in files:
+        by_name.setdefault(path.name, []).append((path, real))
+    selected = {}
+    for anchor, _ in anchors:
+        candidates = [label for label, entries in by_label.items()
+                      if any(Path(e["rel"]).name == anchor.name for e in entries)]
+        if not candidates:
+            continue
+        names = {path.name for path, _ in files if path.parent == anchor.parent}
+        score = {label: sum(Path(e["rel"]).name in names for e in by_label[label]) for label in candidates}
+        best = max(score.values())
+        candidates = [label for label in candidates if score[label] == best]
+        hinted = [label for label in candidates if label.split("/")[-1] == anchor.parent.name]
+        if len(hinted) == 1:
+            candidates = hinted
+        label = candidates[0] if len(candidates) == 1 else candidates[choose(
+            "Which downloaded variant?", [f"Files in {anchor.parent}:"],
+            [(name, None, None) for name in candidates], 0, False)]
+        selected[label] = anchor.parent
+    if not selected:
+        warn("the model type matches, but no published file names match; use Import Model for renamed files")
+        return 1
+    linked = ready = 0
+    for label, root in selected.items():
+        for e in by_label[label]:
+            name = Path(e["rel"]).name
+            choices = by_name.get(name, [])
+            nearby = [(path, real) for path, real in choices if path == root / name or root in path.parents]
+            choices = nearby or choices
+            if len(choices) != 1:
+                if choices:
+                    warn(f"{name}: found in several directories; left alone")
+                continue
+            dest = models / e["rel"]
+            made, why = MI.link_file(choices[0][0], dest)
+            if why:
+                warn(why)
+            else:
+                ready += 1
+                if made:
+                    linked += 1
+                    say(f"  linked {dest} -> {choices[0][1]}")
+    ok(f"{linked} symbolic link(s) created, {ready - linked} already linked in {models}; "
+       "model type checked, size and SHA-256 not checked")
+    say("  Keep the source files in place; select the model's variant in the list to continue setup.")
+    return 0 if ready else 1
 
 
 def file_url(m: dict, name: str) -> str:
@@ -6102,7 +6198,7 @@ def choose_ds4_quant(a, prev: dict) -> str:
                             f"~{DS4_EXL3['exl3-2.25']['memory_gb']} / ~230 / ~280 GB of VRAM + RAM:"],
                            [(label[k][0], "recommended" if k == rec else
                              "abliterated: fits this PC" if k == abl else None, label[k][1]) for k in keys],
-                           keys.index(default), a.yes or a.check, setup_models_dir(a, prev))
+                           keys.index(default), a.yes or a.check, setup_models_dir(a, prev), "deepseek")
     return keys[pick]
 
 
@@ -6940,7 +7036,7 @@ def choose_mm3_quant(a, prev: dict) -> str:
     pick = choose_with_add(a, f"Which files of {MM3}?",
                            ["Maya's GGUF quants and the EXL3 quant run on NVIDIA from V100 on and on AMD:"],
                            [(label[k][0], "recommended" if k == rec else None, label[k][1]) for k in order],
-                           order.index(default), a.yes or a.check, setup_models_dir(a, prev))
+                           order.index(default), a.yes or a.check, setup_models_dir(a, prev), "minimax")
     return order[pick]
 
 
@@ -7690,7 +7786,7 @@ def choose_qwen_quant(a, prev: dict) -> str:
                      "Blackfrost-AI's cybersecurity fine-tune in peasantsmith's GGUF (Q5_K experts, all of them in about "
                      f"{m['memory_gb']:.0f} GB of VRAM and RAM together)"))
     pick = choose_with_add(a, "Which Qwen3.8-Flash-Next?", ["The files to set up:"], rows,
-                           QWEN_QUANTS.index(default), getattr(a, "yes", False), setup_models_dir(a, prev))
+                           QWEN_QUANTS.index(default), getattr(a, "yes", False), setup_models_dir(a, prev), "qwen")
     return QWEN_QUANTS[pick]
 
 

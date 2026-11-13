@@ -3,6 +3,7 @@ the models folder's layout.  Fake small files and a patched catalog; no GPU, no 
 import argparse
 import hashlib
 import os
+import struct
 import sys
 import tempfile
 import unittest
@@ -56,11 +57,11 @@ class ImportTests(unittest.TestCase):
         p.write_bytes(data)
         return p
 
-    def run_import(self, copy=True, yes=True, link=False):
+    def run_import(self, copy=True, yes=True):
         a = argparse.Namespace(models_dir=str(self.models), copy=copy, yes=yes)
         with patch.object(maya, "import_catalog", return_value=self.cat), patch.object(maya, "configs", return_value=[]), \
                 patch.object(maya, "say"), patch.object(maya, "ok"), patch.object(maya, "warn") as warn:
-            code = maya.import_model(a, str(self.src), link=link)
+            code = maya.import_model(a, str(self.src))
         return code, warn
 
     def test_found_by_content_not_name_moved_and_recorded(self):
@@ -129,32 +130,72 @@ class ImportTests(unittest.TestCase):
         self.assertEqual((self.models / "Model-A/a-00001.safetensors").read_bytes(), BIG)
         self.assertTrue(blob.exists() and snap.is_symlink())       # the cache still works
 
-    def test_link_verifies_and_keeps_originals_on_the_same_drive(self):
-        good = self.put("renamed.bin", BIG)
-        wrong = self.put("wrong.bin", b"C" * len(BIG))
-        self.run_import(link=True)
-        dest = self.models / "Model-A/a-00001.safetensors"
-        self.assertTrue(dest.is_symlink())
-        self.assertEqual(dest.resolve(), good.resolve())
-        self.assertTrue(good.exists() and wrong.exists())
-        self.assertEqual(dest.read_bytes(), BIG)
-        with patch.object(maya, "sha256_ok", side_effect=AssertionError("read again")):
-            self.assertTrue(maya.sha256_checked(dest, sha(BIG)))
+    def test_link_checks_type_only_and_keeps_originals(self):
+        first = self.put("model-00001.gguf", b"GGUF short header")
+        second = self.put("model-00002.gguf", b"other shard")
+        cat = [{"label": "Maya-S-v2-IQ2_XXS", "rel": f"Maya-S-v2-IQ2_XXS/{p.name}",
+                "size": 1000000, "sha": ["wrong"]} for p in (first, second)]
+        with patch.object(maya, "import_catalog", return_value=cat), \
+                patch.object(maya, "gguf_head", side_effect=lambda p: ("glm5-next", 1) if p == first else ("", 0)), \
+                patch.object(MI, "sha256_of", side_effect=AssertionError("hashed during link")), \
+                patch.object(maya, "sha256_ok", side_effect=AssertionError("hashed during link")), \
+                patch.object(maya, "say"), patch.object(maya, "ok"), patch.object(maya, "warn"):
+            self.assertEqual(maya.link_model(str(self.src), self.models, "glm"), 0)
+            dest = self.models / "Maya-S-v2-IQ2_XXS/model-00001.gguf"
+            self.assertTrue(dest.is_symlink())
+            self.assertEqual(dest.resolve(), first.resolve())
+            self.assertTrue((dest.parent / "model-00002.gguf").is_symlink())
+            self.assertTrue(first.exists() and second.exists())
+            self.assertFalse((dest.parent / MI.VERIFIED).exists())
+            self.assertTrue(MI.is_linked(dest))
+            self.assertIsNone(maya.file_incomplete({"files": {dest.name: 1000000}}, dest))
+            self.assertTrue(maya.sha256_checked(dest, "wrong"))
 
-    def test_link_to_cache_target_does_not_replace_an_existing_destination(self):
-        blob = self.put("blobs/a", BIG)
-        snap = self.src / "snapshots/a"
-        snap.parent.mkdir()
-        try:
-            os.symlink(blob, snap)
-        except (OSError, NotImplementedError):
-            self.skipTest("no symlinks here")
-        dest = self.models / "Model-A/a-00001.safetensors"
+    def test_link_rejects_wrong_model_type_and_does_not_replace_existing_file(self):
+        first = self.put("model.gguf", b"GGUF header")
+        cat = [{"label": "Maya-S-v2-IQ2_XXS", "rel": "Maya-S-v2-IQ2_XXS/model.gguf",
+                "size": 1000000, "sha": ["wrong"]}]
+        dest = self.models / cat[0]["rel"]
         dest.parent.mkdir(parents=True)
         dest.write_bytes(b"existing")
-        self.run_import(link=True)
-        self.assertEqual(dest.read_bytes(), b"existing")
-        self.assertTrue(blob.exists() and snap.is_symlink())
+        with patch.object(maya, "import_catalog", return_value=cat), \
+                patch.object(maya, "gguf_head", return_value=("glm-dsa", 1)), \
+                patch.object(maya, "say"), patch.object(maya, "ok"), patch.object(maya, "warn"):
+            self.assertEqual(maya.link_model(str(self.src), self.models, "glm"), 1)
+            self.assertEqual(dest.read_bytes(), b"existing")
+        with patch.object(maya, "import_catalog", return_value=cat), \
+                patch.object(maya, "gguf_head", return_value=("glm5-next", 1)), \
+                patch.object(maya, "say"), patch.object(maya, "ok"), patch.object(maya, "warn"):
+            self.assertEqual(maya.link_model(str(self.src), self.models, "glm"), 1)
+            self.assertEqual(dest.read_bytes(), b"existing")
+            self.assertTrue(first.exists())
+
+    def test_gguf_type_needs_no_config_json_and_exl3_type_uses_it(self):
+        def blob(value):
+            raw = value.encode("utf-8")
+            return struct.pack("<Q", len(raw)) + raw
+        gguf = self.put("glm.gguf", b"GGUF" + struct.pack("<IQQ", 3, 1, 1) +
+                        blob("general.architecture") + struct.pack("<I", 8) + blob("glm5-next"))
+        self.assertEqual(maya.linked_model_type(gguf), "glm")
+        self.assertFalse((self.src / "config.json").exists())
+        conf = self.put("config.json", b'{"model_type":"minimax_m3_vl","quantization_config":{"quant_method":"exl3"}}')
+        self.assertEqual(maya.linked_model_type(conf), "minimax")
+
+    def test_exl3_links_by_config_type_without_published_size_or_sha(self):
+        conf = self.put("config.json", b'{"model_type":"glm5_next","quantization_config":{"quant_method":"exl3"}}')
+        shard = self.put("model-00001-of-00015.safetensors", b"short but linked")
+        label = "EXL3-3.05bpw"
+        cat = [{"label": label, "rel": f"{label}/{p.name}", "size": 1000000, "sha": ["wrong"]}
+               for p in (conf, shard)]
+        with patch.object(maya, "import_catalog", return_value=cat), \
+                patch.object(MI, "sha256_of", side_effect=AssertionError("hashed during link")), \
+                patch.object(maya, "sha256_ok", side_effect=AssertionError("hashed during link")), \
+                patch.object(maya, "say"), patch.object(maya, "ok"), patch.object(maya, "warn"):
+            self.assertEqual(maya.link_model(str(self.src), self.models, "glm"), 0)
+        dest = self.models / label / shard.name
+        self.assertTrue(dest.is_symlink())
+        self.assertEqual(dest.resolve(), shard.resolve())
+        self.assertIsNone(maya.file_incomplete({"files": {shard.name: 1000000}}, dest))
 
     def test_report_names_what_is_missing(self):
         self.put("a.bin", BIG)

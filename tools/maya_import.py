@@ -18,6 +18,7 @@ import shutil
 from pathlib import Path
 
 VERIFIED = ".maya-verified.json"          # the same record maya.py keeps: a file whose sha256 matched, by size and time
+LINKED = ".maya-linked.json"              # user-trusted source paths: linked by model type, without size or SHA-256
 MIN_UNLISTED = 1 << 20                     # a GGUF the table lists by sha256 only is read from this size on
 SHARED_SMALL = 16 << 20                    # a file below this that several models share is only placed beside a model
 
@@ -48,7 +49,7 @@ def files_under(folder: Path) -> list:
         dirs.sort()
         for n in sorted(names):
             p = Path(root) / n
-            if n == VERIFIED or n.endswith((".maya-import", ".incomplete", ".part", ".aria2", ".td", ".xltd", ".!ut")):
+            if n in (VERIFIED, LINKED) or n.endswith((".maya-import", ".incomplete", ".part", ".aria2", ".td", ".xltd", ".!ut")):
                 continue                       # (a download that is not finished is not a file yet)
             try:
                 st = p.stat()
@@ -139,11 +140,53 @@ def record(dest: Path) -> None:
     book_path.write_text(json.dumps(book, indent=1), encoding="utf-8")
 
 
-def place(path: Path, real: Path, size: int, entries: list, models: Path, copy: bool, say,
-          link: bool = False) -> dict:
+def is_linked(dest: Path) -> bool:
+    """A live symlink this user added by model type; no size or content is read."""
+    if not dest.is_symlink() or not dest.is_file():
+        return False
+    try:
+        book = json.loads((dest.parent / LINKED).read_text(encoding="utf-8"))
+        return book.get(dest.name) == str(dest.resolve())
+    except (OSError, ValueError):
+        return False
+
+
+def link_file(source: Path, dest: Path) -> tuple[bool, str | None]:
+    """Create one symlink and record its target without inspecting the model's size or checksum."""
+    real = source.resolve()
+    if not real.is_file():
+        return False, f"{source}: source file is missing"
+    if dest.exists() or dest.is_symlink():
+        if dest.is_symlink() and dest.resolve() == real:
+            created = False
+        else:
+            return False, f"{dest}: already exists; not replaced"
+    else:
+        created = True
+        try:
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.symlink_to(real)
+        except OSError as exc:
+            return False, f"{dest}: could not create symlink ({exc})"
+    book_path = dest.parent / LINKED
+    try:
+        book = json.loads(book_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        book = {}
+    book[dest.name] = str(real)
+    try:
+        book_path.write_text(json.dumps(book, indent=1), encoding="utf-8")
+    except OSError as exc:
+        if created:
+            dest.unlink(missing_ok=True)
+        return False, f"{dest}: could not record linked file ({exc})"
+    return created, None
+
+
+def place(path: Path, real: Path, size: int, entries: list, models: Path, copy: bool, say) -> dict:
     """Put one found file at its place(s) in the models folder: moved when it can be (same drive, no link), else
-    copied when copy says so, or symlinked when link says so (the original stays)."""
-    out = {"moved": 0, "copied": 0, "linked": 0, "skipped": []}
+    copied when copy says so (the original stays)."""
+    out = {"moved": 0, "copied": 0, "skipped": []}
     first = None                               # where the file went first: further places are copied from it
     for e in entries:
         dest = models / e["rel"]
@@ -160,19 +203,6 @@ def place(path: Path, real: Path, size: int, entries: list, models: Path, copy: 
                                   f"(move it away to use {path.name})")
             continue
         dest.parent.mkdir(parents=True, exist_ok=True)
-        if link:
-            created = False
-            try:
-                dest.symlink_to(real)
-                created = True
-                record(dest)
-            except OSError as exc:
-                if created:
-                    dest.unlink(missing_ok=True)
-                out["skipped"].append(f"{path.name}: not linked to {dest} ({exc})")
-                continue
-            out["linked"] += 1
-            continue
         source = first or real
         linked = os.path.normcase(os.path.abspath(path)) != os.path.normcase(str(real))   # (reached through a link)
         can_move = first is None and not linked and same_drive(real, dest.parent)
