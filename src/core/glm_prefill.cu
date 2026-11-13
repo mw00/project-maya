@@ -625,6 +625,42 @@ __global__ void add_f32_kernel(float* __restrict__ y, const float* __restrict__ 
 
 }  // namespace
 
+// The prompt path's EXL3 lane for a caller outside it - the linked helper's prompt products (remote_experts.cpp's
+// pf_run_x3): a BLAS handle on the caller's stream, and one expert's rows through x3_run_blas (the weights decoded
+// once, the GEMMs in FP16): out[r] = the expert over x[row_tok[r]] for r < nrows (rows of E floats; out's rows hold
+// gate/up meanwhile).  w16: FP16 scratch of w16_elems values, at least 2 * nff * E and room for the rows' inputs.
+namespace glmpf {
+void* x3_blas_open(cudaStream_t s) {
+    cublasHandle_t h = nullptr;
+    if (cublasCreate(&h) != CUBLAS_STATUS_SUCCESS) return nullptr;
+    cublasSetStream(h, s);
+    cublasSetMathMode(h, CUBLAS_DEFAULT_MATH);
+    return (void*) h;
+}
+void x3_blas_close(void* blas) {
+    if (blas != nullptr) cublasDestroy((cublasHandle_t) blas);
+}
+void x3_expert_rows(void* blas, cudaStream_t s, uint16_t* w16, int64_t w16_elems, const uint8_t* blob,
+                    const strata::kernels::exl3::ExpertLayout& lay, int E, int nff, float limit, const float* x,
+                    const int* row_tok, int nrows, float* out) {
+    X3Lane L;
+    L.s = s;
+    L.blas = (cublasHandle_t) blas;
+    L.w16 = w16;
+    L.w16_elems = w16_elems;
+    L.x = x;
+    L.row_tok = row_tok;
+    L.OUTP = out;
+    L.W = nrows;
+    L.place = [](int, int) { return 0; };
+    L.lay = &lay;
+    L.E = E;
+    L.nff = nff;
+    L.limit = limit;
+    x3_run_blas(L, blob, 0, nrows, 0);
+}
+}  // namespace glmpf
+
 struct Glm5Model::PrefillState {
     int T = 0;                       // tokens per chunk
     // --prefill: the chunk and its prestage slots for a lend cap (% of the pool's slots), the cap it was sized with,
@@ -2486,7 +2522,8 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
             K > hlink::kPfMaxK || g.n_expert > hlink::kPfMaxExperts)
             return false;
         const auto& Ly = F->L[(size_t) il];
-        return Ly.moe && !Ly.exl3 && F->helper.pf_type_ok(Ly.gu_type) && F->helper.pf_type_ok(Ly.d_type);
+        if (Ly.moe && Ly.exl3) return F->helper.pf_x3_ok();   // (an EXL3 pack: the helper's EXL3 prompt lane)
+        return Ly.moe && F->helper.pf_type_ok(Ly.gu_type) && F->helper.pf_type_ok(Ly.d_type);
     };
     const auto prestage = [&](int il) {
         S->pre_layer = -1;
@@ -3388,7 +3425,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                     return;
                 }
                 hlp_ok = F->helper.pf_post(Ly.gu_type, Ly.d_type, Ly.down_off, g.swiglu_exp, dsa, T, K, nh, hlp_nrows,
-                                           hlp_r0, hlp_err) &&
+                                           hlp_r0, hlp_err, Ly.exl3 ? &Ly.xl : nullptr) &&
                          F->helper.pf_wait(hlp_err, &hlp_ms);
             });
         }

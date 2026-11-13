@@ -80,6 +80,8 @@ public:
     /// chunk at most (0: none), the exchange's arrays in this process (pf_out_dev: out as this GPU reads it),
     /// pf_post sends the layer (keys/cnts/rtok/pos/rw/x filled), pf_wait waits for out.
     int pf_cap() const { return pf_cap_; }
+    /// (an EXL3 pack) whether the linked helper's prompt products cover EXL3 experts (kOpen's answer)
+    bool pf_x3_ok() const { return link_ && ctl_ != nullptr && ctl_->x3_pf != 0; }
     bool pf_type_ok(int t) const { return link_ && ctl_ != nullptr && t >= 0 && t < 64 && ctl_->pf_types[t] != 0; }
     float* pf_x() const { return (float*) (pf_ + pf_lay_.x); }
     const float* pf_out() const { return (const float*) (pf_ + pf_lay_.out); }   // (this process's mapping)
@@ -90,7 +92,8 @@ public:
     uint64_t* pf_ptrs() const { return (uint64_t*) (pf_ + pf_lay_.keys); }   // the experts' blobs (lead addresses)
     int32_t* pf_cnts() const { return (int32_t*) (pf_ + pf_lay_.cnts); }
     bool pf_post(int gu_type, int d_type, size_t down_off, float limit, bool dsa, int T, int K, int n, int rows, int r0,
-                 std::string& err);
+                 std::string& err,
+                 const strata::kernels::exl3::ExpertLayout* xl = nullptr);
     bool pf_wait(std::string& err, double* helper_ms = nullptr);
     /// Helper side (the helper program): the exchange mapped here (registered with this GPU), then one layer's call.
     bool pf_attach(uint8_t* host, size_t bytes, int cap_tokens, std::string& err);
@@ -98,6 +101,10 @@ public:
     /// of the shared tier, owned for decode or not (an APU reads it in place)
     bool pf_run(int gu_type, int d_type, size_t down_off, float limit, bool dsa, int T, int K, int n, int rows, int r0,
                 const uint8_t* const* blobs, std::string& err);
+    /// helper program: the same for an EXL3 pack's experts (lay: the layer's blob layout) - each expert's rows
+    /// through the prompt path's EXL3 lane (the weights decoded once, FP16 GEMMs)
+    bool pf_run_x3(const strata::kernels::exl3::ExpertLayout& lay, float limit, int T, int K, int n, int rows,
+                   int r0, const uint8_t* const* blobs, std::string& err);
 
 private:
     bool start(const strata::kernels::exl3::ExpertLayout* xl, int gu_type, int d_type, size_t down_off, float limit,
@@ -117,7 +124,8 @@ private:
     hlink::Ctl* ctl_ = nullptr;
     int ctl_fd_ = -1, child_ = -1;
     uint32_t seq_ = 0;
-    bool open_link(int n_embd, int n_ff, const std::vector<std::pair<void*, size_t>>& regions, std::string& err);
+    bool open_link(int n_embd, int n_ff, const std::vector<std::pair<void*, size_t>>& regions, std::string& err,
+                   bool exl3 = false);
     bool link_post(std::string& err);            // sends the request the control block holds
     bool link_wait(std::string& err);            // waits for its answer (status 0) or the program's end
     void close_link();
@@ -135,6 +143,9 @@ private:
     int32_t* pf_bnd_h_ = nullptr;
     int32_t* pf_bnd_d_ = nullptr;
     void* pf_mq_ = nullptr;
+    void* pf_x3_blas_ = nullptr;      // (pf_run_x3) its BLAS handle, FP16 scratch and rows window
+    void* pf_x3_scratch_ = nullptr;
+    int pf_x3_win_ = 0;
     std::atomic<bool> pending_{false};   // a call (enqueue .. wait) or a replace holds the stream and the buffers
     double last_gpu_ms_ = -1.0;
     struct Region { const uint8_t* host; uint8_t* mapped; size_t bytes; };

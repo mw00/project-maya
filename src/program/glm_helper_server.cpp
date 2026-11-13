@@ -138,7 +138,7 @@ int main(int argc, char** argv) {
         bool ok = true;
         switch (c->op) {
         case hl::kOpen:
-            ok = h.open(dev, (int) c->a, (int) c->b, regions, err);
+            ok = h.open(dev, (int) c->a, (int) c->b, regions, err, c->x3_on != 0);
             n_embd = (int) c->a;
             if (ok && xchg != nullptr && !h.pf_attach(xchg, (size_t) xbytes, xcap, err)) {
                 std::fprintf(stderr, "maya-glm-helper: %s (prompt calls will fail)\n", err.c_str());
@@ -146,9 +146,13 @@ int main(int argc, char** argv) {
             } else if (ok && xchg != nullptr) {
                 for (int t = 0; t < 64; ++t)
                     c->pf_types[t] = strata::prefill::mmq::built() && strata::prefill::mmq::supported(t) ? 1 : 0;
+#ifdef STRATA_USE_HIP
+                c->x3_pf = c->x3_on != 0 ? 1 : 0;   // (an EXL3 pack: its experts' prompt rows through pf_run_x3)
+#endif
             }
             break;
-        case hl::kPrompt: {
+        case hl::kPrompt:
+        case hl::kPromptX3: {
             const auto p0 = std::chrono::steady_clock::now();
             // the experts' blobs: lead addresses in the shared tier, as this program maps them
             static std::vector<const uint8_t*> blobs;
@@ -158,8 +162,24 @@ int main(int argc, char** argv) {
                 const uint64_t* lp = (const uint64_t*) (xchg + hl::PfLayout((size_t) xcap, (size_t) n_embd).keys);
                 for (int j = 0; j < pn; ++j) blobs[(size_t) j] = mine(lp[j], 1);
             }
-            ok = xchg != nullptr && h.pf_run(c->gu_type, c->d_type, (size_t) c->down_off, c->limit, c->pf_dsa != 0,
-                                             c->pf_T, c->pf_K, pn, c->pf_rows, c->pf_r0, blobs.data(), err);
+            if (c->op == hl::kPromptX3) {   // an EXL3 pack's experts: the layer's blob layout came with the call
+                strata::kernels::exl3::ExpertLayout lay;
+                for (int r = 0; r < 3; ++r) {
+                    lay.suh[r] = (size_t) c->x3_suh[r];
+                    lay.svh[r] = (size_t) c->x3_svh[r];
+                    lay.trellis[r] = (size_t) c->x3_trellis[r];
+                    lay.k2[r] = c->x3_k2[r];
+                    lay.gg_type[r] = c->x3_gg[r];
+                }
+                lay.cb = c->x3_cb;
+                lay.fmt = c->x3_fmt;
+                ok = xchg != nullptr && h.pf_run_x3(lay, c->limit, c->pf_T, c->pf_K, pn, c->pf_rows, c->pf_r0,
+                                                    blobs.data(), err);
+            } else {
+                ok = xchg != nullptr && h.pf_run(c->gu_type, c->d_type, (size_t) c->down_off, c->limit,
+                                                 c->pf_dsa != 0, c->pf_T, c->pf_K, pn, c->pf_rows, c->pf_r0,
+                                                 blobs.data(), err);
+            }
             if (xchg == nullptr) err = "no prompt exchange";
             c->pf_gpu_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - p0).count();
             break;
@@ -182,6 +202,20 @@ int main(int argc, char** argv) {
         case hl::kCompute:
             ok = h.compute(c->gu_type, c->d_type, (size_t) c->down_off, c->limit, c->ne, c->keys, c->w, c->x, c->out, err);
             break;
+        case hl::kComputeX3: {   // an EXL3 pack's experts: the layer's blob layout came with the call
+            strata::kernels::exl3::ExpertLayout lay;
+            for (int r = 0; r < 3; ++r) {
+                lay.suh[r] = (size_t) c->x3_suh[r];
+                lay.svh[r] = (size_t) c->x3_svh[r];
+                lay.trellis[r] = (size_t) c->x3_trellis[r];
+                lay.k2[r] = c->x3_k2[r];
+                lay.gg_type[r] = c->x3_gg[r];
+            }
+            lay.cb = c->x3_cb;
+            lay.fmt = c->x3_fmt;
+            ok = h.compute_exl3(lay, c->limit, c->ne, c->keys, c->w, c->x, c->out, err);
+            break;
+        }
         case hl::kQuit:
             h.close();
             c->status = 0;
