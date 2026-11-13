@@ -5470,15 +5470,15 @@ def set_up(a, prev: dict) -> Path | None:
     inst = prev.get("installer") or {}
     prev_args = prev.get("args") or []
     prev_ctx = int(prev_args[prev_args.index("--max-context") + 1]) if "--max-context" in prev_args[:-1] else None
-    pc = check_pc(a)                                   # 1
-    metal = pc["backend"] == "metal"
-    step(2, "your choices")                            # 2
     # the models folder: --models-dir, else the one set up before (a config from before the option has its data
     # folder, whose models/ held the downloads), else Maya-data/models next to this folder
     models = (Path(a.models_dir).expanduser().resolve() if a.models_dir else
               Path(inst["models_dir"]) if inst.get("models_dir") else
               Path(inst["data_dir"]) / "models" if inst.get("data_dir") else ROOT.parent / "Maya-data" / "models")
     choice = choose_model(a, models, inst)
+    pc = check_pc(a)                                   # 1
+    metal = pc["backend"] == "metal"
+    step(2, "your choices")                            # 2
     if choice[0] == "download" and choice[1] in G53_MODELS:   # (GLM-5.3: "GLM-5.3 (744B) · UD-IQ2_M")
         ok(f"model: {G53.LABEL} · {Q.glm53_quant(choice[1])}, in {download_dir(models, choice[1])}")
     elif choice[0] == "download":
