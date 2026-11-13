@@ -68,6 +68,18 @@ class GlmLinkTest(unittest.TestCase):
         self.assertIsNotNone(GL.why_not(config(self.exe, backend="cuda"), [0]))
         self.assertIsNotNone(GL.why_not({"exe": str(self.exe), "backend": "hip", "args": ["--pack", "x"]}, [0]))
 
+    def test_draft_length_kept(self):
+        log = ("glm mtp: 97 rounds, 2.64 tokens a round | rounds by draft length 1:5 2:88 3:4\n"
+               "glm mtp: 12 rounds | rounds by draft length 0:4 1:30 2:3\n")
+        self.assertEqual(GL.draft_pick(log), 2)
+        self.assertIsNone(GL.draft_pick("no drafting here"))
+        c = config(self.exe, installer={"mixed_gpus_calibration": {"mtp_draft": 1}})
+        self.assertEqual(GL.link_config(c, [0])["env"]["MAYA_GLM_MTP_FIXED"], "1")
+        self.assertNotIn("MAYA_GLM_MTP_FIXED", GL.link_config(config(self.exe), [0])["env"])
+        self.assertTrue(GL.link_config(c, [0])["env"]["MAYA_GLM_CPU_CAL"].endswith("glm-link-cpu-cal.txt"))
+        c["env"]["MAYA_GLM_MTP_FIXED"] = "3"   # (the user's own setting wins)
+        self.assertEqual(GL.link_config(c, [0])["env"]["MAYA_GLM_MTP_FIXED"], "3")
+
 
 if __name__ == "__main__":
     unittest.main()

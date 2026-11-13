@@ -4663,6 +4663,12 @@ def link_calibration(cfg_path: Path, why: str = "") -> bool:
         return False
     alone = json.loads(json.dumps(cfg))
     both = GL.link_config(cfg)
+    # the drafting length: the adaptive search runs in this measurement and its pick is kept (link starts draft a
+    # fixed length, so their answers repeat run to run - serve/glm_link.py)
+    both["env"] = {k: v for k, v in (both.get("env") or {}).items() if k != "MAYA_GLM_MTP_FIXED"}
+    both["env"]["MAYA_GLM_MTP_ADAPT"] = "1"
+    log_path = Path(both["log"]) if both.get("log") else None
+    log_at = log_path.stat().st_size if log_path is not None and log_path.is_file() else 0
     say()
     say("  Speed check: this PC has an NVIDIA card beside the AMD GPU - is the model faster on both?" +
         (f" ({why})" if why else ""))
@@ -4681,6 +4687,15 @@ def link_calibration(cfg_path: Path, why: str = "") -> bool:
     cfg["mixed_gpus"] = d > o * (1 + LINK_TIE)
     cfg.setdefault("installer", {})["mixed_gpus_calibration"] = {
         "date": time.strftime("%Y-%m-%d %H:%M"), "version": maya_version(), "both_tok_s": d, "alone_tok_s": o}
+    try:                                               # (the both-GPU run's part of the log: after its settings line)
+        with open(log_path, "rb") as f:
+            f.seek(log_at)
+            text = f.read().decode("utf-8", "replace")
+        pick = GL.draft_pick(text.rsplit("MAYA_GLM_EXPERT_HELPER=link", 1)[-1]) if "MAYA_GLM_EXPERT_HELPER=link" in text else None
+    except (OSError, TypeError):
+        pick = None
+    if pick is not None:
+        cfg["installer"]["mixed_gpus_calibration"]["mtp_draft"] = pick
     cfg_path.write_text(json.dumps(N.env_out(cfg), indent=1), encoding="utf-8")
     say()
     ok(f"speed check: {d:.1f} tokens/s on both GPUs against {o:.1f} on the AMD GPU alone - " +
