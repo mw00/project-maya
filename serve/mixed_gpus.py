@@ -79,9 +79,26 @@ def auto_found(cfg: dict) -> bool:
             and Path(cuda_exe(cfg)).is_file() and nvidia_listed())
 
 
+def why_not(cfg: dict) -> str | None:
+    """Why this DeepSeek config cannot run on both GPUs here (None: it can) - the setup's speed check asks first."""
+    if windows():
+        return "Linux only"
+    if cfg.get("backend") != "hip" or "maya-ds4" not in Path(str(cfg.get("exe", ""))).name:
+        return "a DeepSeek config on the AMD GPU only"
+    if int(cfg.get("parallel") or 1) > 1:
+        return "not with --parallel"
+    if not nvidia_listed():
+        return "no NVIDIA card answers nvidia-smi"
+    if not Path(cuda_exe(cfg)).is_file():
+        return f"no CUDA build of maya-ds4 at {cuda_exe(cfg)} (maya --setup builds it)"
+    return None
+
+
 def config_of(cfg: dict) -> dict | None:
     """The config's two-GPU setting ("mixed_gpus": true / a layer count / false; not set: on when auto_found), None
     when off or not for this config (a DeepSeek config on the HIP engine)."""
+    if cfg.get("mixed_gpus_active") or "--glm-pack" in (cfg.get("args") or [])[:-1]:
+        return None   # (GLM's two GPUs: serve/glm_link.py's link mode, the same "mixed_gpus" key)
     v = cfg.get("mixed_gpus")
     if v is None:
         if not auto_found(cfg):

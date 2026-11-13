@@ -7184,6 +7184,7 @@ def main() -> int:
     if glm_dsa:
         print(f"[maya] GLM-5.3 (glm-dsa), text only; chat template: {template.dialect.describe()}", flush=True)
     cfg = checked_config_effort(cfg, template, a.engine == "maya")
+    two_gpus = False
     if a.engine == "maya":
         if not cfg:
             ap.error("--engine maya needs --config")
@@ -7239,6 +7240,7 @@ def main() -> int:
         else:
             engine = StrataEngine(cfg["exe"], engine_args(cfg), cwd=cfg.get("cwd"), log=cfg.get("log"), env=engine_env)
         engine.load_s = round(time.time() - t0, 1)      # (the dashboard's estimate of a reload: this start's time)
+        two_gpus = bool(getattr(engine, "mixed_on", False))   # (DeepSeek on both GPUs: serve/mixed_gpus.py)
         warn_tight_ram(engine.info.get("arena_mib"))
         if vision is None and not vcfg and engine.info.get("vision") == "ds4":
             # DeepSeek-V4.1: the engine's own vision tower (the checkpoint's); the server resizes the pictures
@@ -7326,7 +7328,7 @@ def main() -> int:
         from serve import telemetry
         telemetry.HIP_BIN_DIRS = [d for d in cfg.get("lib_dirs") or [] if Path(d).is_dir()]
     svc.model_label = maya_quants.config_label(cfg)     # (configs of every release: by their installer record)
-    if cfg.get("mixed_gpus_active") and svc.model_label:   # (the dashboard shows it: both GPUs in link mode)
+    if (cfg.get("mixed_gpus_active") or two_gpus) and svc.model_label:   # (the dashboard shows it: both GPUs on)
         svc.model_label += " · AMD + NVIDIA"
     if a.config:
         svc.config_path = str(Path(a.config).resolve())  # a context change from the dashboard is saved there
