@@ -75,6 +75,29 @@ public:
     static constexpr int kLinkDevice = 99;
     bool linked() const { return link_; }
 
+    /// The prompt exchange of a linked helper (glm_helper_link.hpp PfLayout): a prompt chunk's MoE layer computes the
+    /// experts the helper owns there - only the chunk's rows cross, never an expert.  Lead side: pf_cap() tokens a
+    /// chunk at most (0: none), the exchange's arrays in this process (pf_out_dev: out as this GPU reads it),
+    /// pf_post sends the layer (keys/cnts/rtok/pos/rw/x filled), pf_wait waits for out.
+    int pf_cap() const { return pf_cap_; }
+    bool pf_type_ok(int t) const { return link_ && ctl_ != nullptr && t >= 0 && t < 64 && ctl_->pf_types[t] != 0; }
+    float* pf_x() const { return (float*) (pf_ + pf_lay_.x); }
+    const float* pf_out_dev() const { return (const float*) (pf_dev_ + pf_lay_.out); }
+    int32_t* pf_pos() const { return (int32_t*) (pf_ + pf_lay_.pos); }
+    float* pf_rw() const { return (float*) (pf_ + pf_lay_.rw); }
+    int32_t* pf_rtok() const { return (int32_t*) (pf_ + pf_lay_.rtok); }
+    uint64_t* pf_ptrs() const { return (uint64_t*) (pf_ + pf_lay_.keys); }   // the experts' blobs (lead addresses)
+    int32_t* pf_cnts() const { return (int32_t*) (pf_ + pf_lay_.cnts); }
+    bool pf_post(int gu_type, int d_type, size_t down_off, float limit, bool dsa, int T, int K, int n, int rows, int r0,
+                 std::string& err);
+    bool pf_wait(std::string& err, double* helper_ms = nullptr);
+    /// Helper side (the helper program): the exchange mapped here (registered with this GPU), then one layer's call.
+    bool pf_attach(uint8_t* host, size_t bytes, int cap_tokens, std::string& err);
+    /// blobs: the n experts' blobs in this process (the helper program translated the lead's addresses); any expert
+    /// of the shared tier, owned for decode or not (an APU reads it in place)
+    bool pf_run(int gu_type, int d_type, size_t down_off, float limit, bool dsa, int T, int K, int n, int rows, int r0,
+                const uint8_t* const* blobs, std::string& err);
+
 private:
     bool start(const strata::kernels::exl3::ExpertLayout* xl, int gu_type, int d_type, size_t down_off, float limit,
                int ne, const int* keys, const float* weights, const float* x, float* out, std::string& err);
@@ -97,6 +120,20 @@ private:
     bool link_post(std::string& err);            // sends the request the control block holds
     bool link_wait(std::string& err);            // waits for its answer (status 0) or the program's end
     void close_link();
+    // the prompt exchange: its host mapping (pf_), as this process's GPU sees it (pf_dev_), its layout and fd
+    uint8_t* pf_ = nullptr;
+    uint8_t* pf_dev_ = nullptr;
+    hlink::PfLayout pf_lay_{0, 0};
+    size_t pf_bytes_ = 0;
+    int pf_cap_ = 0, pf_fd_ = -1;
+    bool pf_registered_ = false;
+    // helper side: the prompt scratch (rows a window at most), the window bounds (mapped), the MMQ context
+    void* pf_scratch_ = nullptr;
+    size_t pf_scratch_bytes_ = 0;
+    int pf_win_ = 0;
+    int32_t* pf_bnd_h_ = nullptr;
+    int32_t* pf_bnd_d_ = nullptr;
+    void* pf_mq_ = nullptr;
     std::atomic<bool> pending_{false};   // a call (enqueue .. wait) or a replace holds the stream and the buffers
     double last_gpu_ms_ = -1.0;
     struct Region { const uint8_t* host; uint8_t* mapped; size_t bytes; };

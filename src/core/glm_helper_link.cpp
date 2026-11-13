@@ -51,6 +51,24 @@ void* shared_alloc(size_t bytes) {
 
 const std::vector<Block>& blocks() { return g_blocks; }
 
+bool in_shared(const void* p, size_t bytes) {
+    for (const auto& b : g_blocks) {
+        const uintptr_t off = (uintptr_t) p - (uintptr_t) b.base;
+        if ((uintptr_t) p >= (uintptr_t) b.base && off <= b.bytes && bytes <= b.bytes - off) return true;
+    }
+    return false;
+}
+
+void* xchg_alloc(size_t bytes, int& fd) {
+#ifdef __linux__
+    return map_fd("maya-glm-xchg", bytes, fd);
+#else
+    (void) bytes;
+    fd = -1;
+    return nullptr;
+#endif
+}
+
 Ctl* ctl_alloc(int& fd) {
 #ifdef __linux__
     void* p = map_fd("maya-glm-link", sizeof(Ctl), fd);

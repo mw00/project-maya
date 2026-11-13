@@ -6,7 +6,9 @@
 // MAYA_GLM_HELPER_DEVICE: this program's GPU (default 0).
 #include "strata/core/glm_helper_link.hpp"
 #include "strata/core/remote_experts.hpp"
+#include "strata/prefill/moe_mmq.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -28,9 +30,13 @@ int main(int argc, char** argv) {
 #else
     struct Region { int fd; size_t bytes; uintptr_t lead; uint8_t* mine; };
     std::vector<Region> rs;
-    int ctl_fd = -1;
+    int ctl_fd = -1, xfd = -1, xcap = 0;
+    unsigned long long xbytes = 0;
     for (int i = 1; i + 1 < argc; i += 2) {
         if (std::strcmp(argv[i], "--ctl") == 0) ctl_fd = std::atoi(argv[i + 1]);
+        else if (std::strcmp(argv[i], "--xchg") == 0) {   // the prompt exchange: FD:BYTES:CAP_TOKENS
+            if (std::sscanf(argv[i + 1], "%d:%llu:%d", &xfd, &xbytes, &xcap) != 3) xfd = -1;
+        }
         else if (std::strcmp(argv[i], "--region") == 0) {
             Region r{};
             unsigned long long b = 0, l = 0;
@@ -55,6 +61,13 @@ int main(int argc, char** argv) {
     hl::Ctl* c = (hl::Ctl*) cp;
     const char* dv = std::getenv("MAYA_GLM_HELPER_DEVICE");
     const int dev = dv != nullptr ? std::atoi(dv) : 0;
+#ifdef STRATA_USE_HIP
+    // each call ends in a stream wait: spin in it (a blocking wait adds tens of us a call); MAYA_GLM_HELPER_SPIN=0 off
+    if (const char* sp = std::getenv("MAYA_GLM_HELPER_SPIN"); sp == nullptr || std::strcmp(sp, "0") != 0) {
+        hipSetDevice(dev);
+        hipSetDeviceFlags(hipDeviceScheduleSpin);
+    }
+#endif
     if (cudaSetDevice(dev) != cudaSuccess) {
         std::fprintf(stderr, "maya-glm-helper: GPU %d did not open\n", dev);
         return 4;
@@ -82,6 +95,16 @@ int main(int argc, char** argv) {
     }
     std::fprintf(stderr, "maya-glm-helper: GPU %d (%s) mapped %.2f GB of the lead's RAM tier in %.1f s\n", dev, prop.name,
                  gb, std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+    // the prompt exchange (optional: without it the lead streams its prompts' experts as before)
+    uint8_t* xchg = nullptr;
+    if (xfd >= 0 && xbytes > 0) {
+        void* p = mmap(nullptr, (size_t) xbytes, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_POPULATE, xfd, 0);
+        if (p != MAP_FAILED && cudaHostRegister(p, (size_t) xbytes, cudaHostRegisterPortable | cudaHostRegisterMapped) ==
+                                   cudaSuccess)
+            xchg = (uint8_t*) p;
+        else
+            std::fprintf(stderr, "maya-glm-helper: the prompt exchange did not map (prompt calls will fail)\n");
+    }
     const auto mine = [&](uint64_t lead, size_t bytes) -> const uint8_t* {
         for (const auto& r : rs) {
             const uintptr_t off = (uintptr_t) lead - r.lead;
@@ -92,6 +115,7 @@ int main(int argc, char** argv) {
     const pid_t lead = getppid();
     __atomic_store_n(&c->ready, 1u, __ATOMIC_RELEASE);
     strata::core::GlmExpertHelper h;
+    int n_embd = 0;
     uint32_t last = c->rep.load(std::memory_order_acquire);
     for (;;) {
         uint32_t seq = 0;
@@ -113,7 +137,31 @@ int main(int argc, char** argv) {
         switch (c->op) {
         case hl::kOpen:
             ok = h.open(dev, (int) c->a, (int) c->b, regions, err);
+            n_embd = (int) c->a;
+            if (ok && xchg != nullptr && !h.pf_attach(xchg, (size_t) xbytes, xcap, err)) {
+                std::fprintf(stderr, "maya-glm-helper: %s (prompt calls will fail)\n", err.c_str());
+                err.clear();
+            } else if (ok && xchg != nullptr) {
+                for (int t = 0; t < 64; ++t)
+                    c->pf_types[t] = strata::prefill::mmq::built() && strata::prefill::mmq::supported(t) ? 1 : 0;
+            }
             break;
+        case hl::kPrompt: {
+            const auto p0 = std::chrono::steady_clock::now();
+            // the experts' blobs: lead addresses in the shared tier, as this program maps them
+            static std::vector<const uint8_t*> blobs;
+            const int pn = std::max(0, std::min(c->pf_n, hl::kPfMaxExperts));
+            blobs.assign((size_t) pn, nullptr);
+            if (xchg != nullptr) {
+                const uint64_t* lp = (const uint64_t*) (xchg + hl::PfLayout((size_t) xcap, (size_t) n_embd).keys);
+                for (int j = 0; j < pn; ++j) blobs[(size_t) j] = mine(lp[j], 1);
+            }
+            ok = xchg != nullptr && h.pf_run(c->gu_type, c->d_type, (size_t) c->down_off, c->limit, c->pf_dsa != 0,
+                                             c->pf_T, c->pf_K, pn, c->pf_rows, c->pf_r0, blobs.data(), err);
+            if (xchg == nullptr) err = "no prompt exchange";
+            c->pf_gpu_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - p0).count();
+            break;
+        }
         case hl::kReserve:
             ok = h.reserve((int) c->a, (size_t) c->b, err);
             break;
