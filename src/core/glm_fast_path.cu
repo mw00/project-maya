@@ -5092,8 +5092,7 @@ void Glm5Model::fast_service() {
         // own pool - the other part works on its own group meanwhile; not with a helper GPU (it answers per route)
         const bool lheld = link_win && rq->win_n > 1 && rq->win_rows == 0 && F->cpu_ans_h != nullptr &&
                            F->helper.pf_cap() >= kWinMax && !F->L[(size_t) rq->layer].exl3 &&
-                           F->helper.pf_type_ok(F->L[(size_t) rq->layer].gu_type) &&
-                           F->helper.pf_type_ok(F->L[(size_t) rq->layer].d_type) &&
+                           F->helper.pf_pair_ok(F->L[(size_t) rq->layer].gu_type, F->L[(size_t) rq->layer].d_type) &&
                            !F->helper_failed.load(std::memory_order_acquire);
         const bool held = lheld ||
                           (win_merge && rq->win_n > 0 && F->cpu_ans_h != nullptr && !F->cpu_win.dn.empty() &&

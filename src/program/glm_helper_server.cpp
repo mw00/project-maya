@@ -145,7 +145,7 @@ int main(int argc, char** argv) {
                 err.clear();
             } else if (ok && xchg != nullptr) {
                 for (int t = 0; t < 64; ++t)
-                    c->pf_types[t] = strata::prefill::mmq::built() && strata::prefill::mmq::supported(t) ? 1 : 0;
+                    c->pf_types[t] = (uint8_t) h.pf_type_bits(t);
             }
             break;
         case hl::kPrompt: {

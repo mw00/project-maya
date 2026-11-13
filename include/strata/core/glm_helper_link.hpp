@@ -35,6 +35,16 @@ enum Op : int32_t { kOpen = 1, kReserve = 2, kInsert = 3, kReplace = 4, kCompute
 // owns, each row's token and each expert's key and row count; the helper computes those experts in place and writes
 // the weighted sum of their rows per token into out (T rows), which the lead adds into its FFN output.
 constexpr int kPfMaxK = 16, kPfMaxExperts = 2048;
+// Ctl::pf_types: what the helper's prompt products do with a ggml type - MMQ multiplies it; the fused kernel decodes
+// it as a gate/up, as a down matrix.  A layer's pair: 1 fused (gate/up and down), 2 MMQ's gate/up and the fused
+// down, 0 MMQ, -1 no product (the lead keeps such a layer).
+constexpr int kPfMmq = 1, kPfFusedGu = 2, kPfFusedDown = 4;
+inline int pf_pair_mode(int gu_bits, int d_bits) {
+    if ((gu_bits & kPfFusedGu) && (d_bits & kPfFusedDown)) return 1;
+    if ((gu_bits & kPfMmq) && (d_bits & kPfFusedDown)) return 2;
+    if ((gu_bits & kPfMmq) && (d_bits & kPfMmq)) return 0;
+    return -1;
+}
 struct PfLayout {
     size_t x = 0, out = 0, pos = 0, rw = 0, rtok = 0, keys = 0, cnts = 0, bytes = 0;
     PfLayout(size_t cap_tokens, size_t n_embd) {
@@ -85,7 +95,7 @@ struct alignas(64) Ctl {
     uint64_t host;                  // a pointer in the LEAD's address space (translated by the helper)
     int32_t pf_T, pf_K, pf_n, pf_rows, pf_r0, pf_dsa, pf_nff, pf_slot;   // kPrompt: the layer's chunk (PfLayout; pf_slot: pf_slot_layout)
     double pf_gpu_ms;               // kPrompt: the helper's time for it (host clock, ms)
-    uint8_t pf_types[64];           // kOpen's answer: the ggml types the helper's prompt products cover (1 = yes)
+    uint8_t pf_types[64];           // kOpen's answer: the helper's prompt products by ggml type (kPfMmq | kPfFusedGu | kPfFusedDown)
     char err[512];
     float x[kMaxEmbd];
     float out[kMaxEmbd];
