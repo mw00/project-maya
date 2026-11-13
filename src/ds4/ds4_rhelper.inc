@@ -354,14 +354,14 @@
     int rh_pmin = std::getenv("DS4_RHELPER_PMIN") ? std::atoi(std::getenv("DS4_RHELPER_PMIN")) : 512;
     bool rh_p_ok(const Layer& L0, const Chunk& c, int T) const {
         static std::atomic<bool> said{false};
-        if (rh_pon && L0.il == 10 && !said.exchange(true))
+        if (rh_pon && L0.il == 10 && T >= 512 && !said.exchange(true))
             std::fprintf(stderr, "ds4: helper engine: a prompt chunk (layer %d, %d rows): lead %d hot %d dead %d rows %d "
                                  "tab %d own %zu members %d acc64 %d host %zu helper_dead %d\n", L0.il, T, (int) rh_lead,
                          (int) rh_hot, (int) rh_pdead, (int) (rh_ppos != nullptr), (int) (L0.helper_tab != nullptr),
                          L0.helper.size(), L0.nm, (int) (c.acc64 != nullptr), L0.host_list.size(),
                          (int) helper_dead.load());
         return rh_lead && rh_hot && rh_pon && !rh_pdead && rh_ppos != nullptr && L0.helper_tab != nullptr &&
-               !L0.helper.empty() && L0.nm == 1 && !(c.acc64 != nullptr && chunk_par()) && L0.host_list.empty() &&
+               !L0.helper.empty() && L0.nm == 1 && !(c.acc64 != nullptr && chunk_par()) && (c.flow || L0.host_list.empty()) &&
                T >= rh_pmin && T <= kRhPRows && !helper_dead.load(std::memory_order_relaxed);
     }
     bool rh_p_alloc(std::string& err) {   // (the lead, rh_reqs: its add's rows and weights)
@@ -395,7 +395,7 @@
         vt.assign(b.size(), 0);
         std::vector<std::pair<int, int>> own;   // (rows, expert)
         for (int e = 0; e < ne; ++e)
-            if (L0.helper[(size_t) e] != nullptr) {
+            if (L0.helper[(size_t) e] != nullptr && L0.vs_pin[e] < L0.pv_n) {   // (a streamed one: the lead's flow)
                 const int v = L0.vs_pin[e];
                 own.push_back({b[(size_t) v + 1] - b[(size_t) v], e});
             }
