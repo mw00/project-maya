@@ -3853,6 +3853,13 @@ int main(int argc, char** argv) {
                              "same tokens)\n");
     } else if (ds4_env("DS4_DRAFT_COST") != nullptr && std::atoi(ds4_env("DS4_DRAFT_COST")) != 0)
         std::fprintf(stderr, "maya-ds4: DS4_DRAFT_COST: no DSpark drafter loaded, nothing to size\n");
+    if (ds4_env("DS4_RHELPER_SERVE") != nullptr) {   // MAYA_MIXED_HELPER: a lead engine's experts, then the end
+        if (!m.rhelper_serve(err)) {
+            std::fprintf(stderr, "maya-ds4: %s\n", err.c_str());
+            return 1;
+        }
+        return 0;
+    }
     if (part_port > 0) {   // the pool's part server: the front's layers come over the link
         if (!m.part_serve(part_port, err)) {
             std::fprintf(stderr, "maya-ds4: %s\n", err.c_str());

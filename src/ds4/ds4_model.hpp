@@ -383,6 +383,8 @@ public:
     void save_profile() const;
     /// The pool's part server: answers one front at a time on port (never returns unless the port cannot be used).
     bool part_serve(int port, std::string& err);
+    /// MAYA_MIXED_HELPER (DS4_RHELPER_SERVE=<name>): computes a lead engine's experts its VRAM leaves over, until it ends.
+    bool rhelper_serve(std::string& err);
     /// The pool's line for the logs ("" when not a front).
     std::string pool_line() const;
     /// MAYA_MIXED_FRONT: this engine holds only the trunk's first layers, a second engine the rest (two GPUs of one
