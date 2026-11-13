@@ -44,7 +44,7 @@ c++ -std=c++20 -O2 -DNDEBUG -Wall -Wextra -Werror -pthread -Isrc/core \
 /tmp/glm_prefill_row_local_test
 ```
 
-Linux CI runs that host fixture. With `STRATA_BUILD_TESTS=ON`, CMake registers
+Linux CI is configured to run that host fixture. With `STRATA_BUILD_TESTS=ON`, CMake registers
 `glm_prefill_row_local_test`; x86 builds with `STRATA_NATIVE_EXPERTS=ON` also link
 the real CPU kernels and enable the numerical cases. Build that target and run
 `ctest --test-dir <build> -R '^glm_prefill_row_local_test$' --output-on-failure`.
@@ -58,8 +58,8 @@ exercise full-model dimensions, the actual worker call chain or CPU/GPU parity.
 The host scheduling cases also passed with native Windows MSVC and CTest.
 
 The earlier candidate compiled for CUDA architecture 89 and ran the experiments
-below. That binary included a local shared CPU-pool overlay and other local
-commits; it was not built from this clean PR branch. This PR carries only the
+below. That binary used the historical source base identified below and a local
+shared CPU-pool overlay; it was not built from this clean PR branch. This PR carries only the
 four-file prefill patch, its tests and documentation. A complete CUDA build and
 GPU run of the submitted branch, HIP validation and other NVIDIA architectures
 remain pending.
@@ -74,7 +74,8 @@ IQ3_S gate/up with Q5_K down and 34 using IQ3_S gate/up with IQ4_XS down.
 Each fresh process used the same frozen expert profile and eight fixed public
 code/document tasks: eight sequential requests, then the same eight in two
 waves of four clients. The 256-output-token experiment used greedy decoding,
-seed 1729, DFlash spec 8, CPU prefill and adaptive timing. All completed samples
+request-manifest seed 1729, DFlash spec 8, CPU prefill and adaptive timing. The
+greedy path did not forward that seed to the native engine. All completed samples
 were retained. This was a custom workload, not `maya.sh --bench` or
 `tools/agent_bench.py`, so these numbers are not directly comparable to the
 README speed tables.
