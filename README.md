@@ -323,7 +323,7 @@ your setup and the engine's speed lines; nothing is sent anywhere by itself. The
 - **Port 8080 is in use:** Maya is already running, or `--port 8081` starts another one. Settings > Port moves Maya to
   another port for good (it starts again there).
 
-## Support
+## Your Support ❤️
 
 Maya is free and open source, and it always will be. It exists so that anyone can run the biggest open models at home,
 on hardware they already own. Sponsors make that possible:
