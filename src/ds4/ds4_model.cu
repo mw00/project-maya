@@ -21254,7 +21254,12 @@ struct Model::Impl {
 
     // host_free_on's layers: every expert in VRAM (none on the CPU lane, nothing to stream or swap in) - on one GPU, or
     // with host_free_tp a tensor-parallel group's
+    // Not a layer whose experts a helper engine computes (MAYA_MIXED_HELPER's hot lead holds every expert, so each of
+    // its layers looked host-free: no request went out, the helper's sums were never read, and the picks the routing
+    // leaves to the helper - rh_vtab - were computed by no one): it publishes its request and waits, while the helper
+    // answers
     bool host_free(const Layer& l) const {
+        if (l.rh_tab != nullptr && !helper_dead.load(std::memory_order_relaxed)) return false;
         return host_free_on && (l.nm == 1 || host_free_tp) && l.n_exp > 0 && l.n_vram >= l.n_exp;
     }
     int head_nm() const { return (int) groups[(size_t) devs[(size_t) head_dev].grp].mem.size(); }
