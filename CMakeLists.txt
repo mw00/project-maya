@@ -1406,6 +1406,12 @@ int main() { return 0; }
 endif()
 find_package(Threads REQUIRED)
 target_link_libraries(strata_kernels_cpu PUBLIC Threads::Threads)
+if(STRATA_BUILD_TESTS)
+  add_executable(glm_prefill_row_local_test tests/glm_prefill_row_local_test.cpp)
+  target_include_directories(glm_prefill_row_local_test PRIVATE src/core)
+  target_link_libraries(glm_prefill_row_local_test PRIVATE Threads::Threads)
+  add_test(NAME glm_prefill_row_local_test COMMAND glm_prefill_row_local_test)
+endif()
 
 # ---- plan v0.3 P6: the i-quant models' CPU experts (IQ2_XS / IQ3_XXS files) ----
 #
@@ -1490,6 +1496,10 @@ if(STRATA_NATIVE_EXPERTS)
   endif()
   target_link_libraries(strata_kernels_cpu PUBLIC ggml-cpu ggml-base)
   target_compile_definitions(strata_kernels_cpu PUBLIC STRATA_NATIVE_EXPERTS=1)
+  if(STRATA_BUILD_TESTS AND STRATA_CPU_X86)
+    target_compile_definitions(glm_prefill_row_local_test PRIVATE MAYA_ROW_LOCAL_NATIVE_TEST=1)
+    target_link_libraries(glm_prefill_row_local_test PRIVATE strata_kernels_cpu)
+  endif()
   # DeepSeek's DSpark markov head as Q8_0 blocks (DS4_MARKOV_Q8, src/ds4/ds4_markov_q8.hpp) byte for byte against
   # ggml's quantize_row_q8_0_ref, a head group member's rows against the whole head's (no GPU)
   add_executable(ds4_markov_q8_test tests/ds4_markov_q8_test.cpp)

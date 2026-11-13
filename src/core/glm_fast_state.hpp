@@ -9,6 +9,7 @@
 #include "strata/kernels/glm_kv_stream.hpp"
 #include "strata/kernels/cpu/native_expert.hpp"
 #include "glm_memory.hpp"
+#include "glm_prefill_row_local.hpp"
 #include "glm_layer_graphs.hpp"
 
 #include "ggml.h"
@@ -649,6 +650,7 @@ struct Glm5Model::FastState {
         uint8_t* base = nullptr;   // the first piece (the only one unless per_part > 0)
         int n = 0;
         bool registered = false;   // numa_pinned's (mmap + cudaHostRegister), not cudaHostAlloc's
+        glmfast::RowHalvesPlacement row_halves;
         // pinned in pieces of per_part slots (Windows: a big block takes far more of the per-process pinning budget
         // than its size - a 2-GPU split's second part got 0 GB, #417); 0: one block from base
         int per_part = 0;
