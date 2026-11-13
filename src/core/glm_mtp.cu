@@ -89,6 +89,9 @@ bool Glm5Model::mtp_decode_wanted(int dev, int n_parts, bool dsa) {
     if (const char* q = getenv("MAYA_GLM_SEQS"); q != nullptr && std::atoi(q) > 1) return false;   // (--parallel)
     if (const char* d = getenv("MAYA_GLM_DFLASH"); d != nullptr && d[0] != '\0') return false;
     if (const char* e = getenv("MAYA_GLM_MTP_DECODE")) return std::atoi(e) != 0 && n_parts == 1;
+    // MAYA_GLM_EXPERT_HELPER=link: the lead (a discrete card) drafts with the MTP block, the glm-dsa models too - with
+    // the helper's experts read in place its decode is faster with MTP (GLM-5.3-Flash +15..18 %, GLM-5.3 744B as well)
+    if (hlink::wanted()) return n_parts == 1;
     if (n_parts != 1 || dsa) return false;
 #if defined(STRATA_USE_HIP)
     // the Strix / Gorgon Halo APUs (gfx1150 / gfx1151 / gfx1152): their memory holds every expert

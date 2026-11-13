@@ -104,6 +104,17 @@ inline bool complete_pool(int main_slots, int experts, int spares) {
     return main_slots >= experts + spares;
 }
 
+// A unified-memory host's complete pool: its budget is RAM's (MemAvailable less the headroom and the reserve), so where
+// that holds every expert, the spares and the prompt path's tail the pool is the complete one too - short of it, the
+// experts' bytes exactly, as before.  An AMD APU under Linux; CUDA's unified hosts keep the exact pool.
+inline bool unified_complete_pool() {
+#if defined(STRATA_USE_HIP) && !defined(_WIN32)
+    return true;
+#else
+    return false;
+#endif
+}
+
 // The slots a layer gets where the budget (avail bytes; stride_sum: one slot in every MoE layer) holds a complete pool
 // plus the lendable tail - every expert, the spares and `tail` slots - else 0 (the pool is sized from the budget)
 inline int complete_pool_slots(size_t avail, size_t stride_sum, int experts, int spares, int tail) {

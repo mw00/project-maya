@@ -57,6 +57,7 @@ sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT))   # run as a script (run-<model>.bat) as well as a module
 from serve import ds4_vision, gpu_map, loop_guard, mm3_vision, model_api, model_pull, models, savings  # noqa: E402
 from serve import attach, mixed_gpus  # noqa: E402
+from serve import glm_link  # noqa: E402  GLM on an AMD APU + an NVIDIA card ("mixed_gpus")
 
 ENGINE_VISION = (ds4_vision.Vision, mm3_vision.Vision)   # the engines that run their vision tower themselves
 from serve.frontend import (CALL_END, CALL_START, MINIMAX_NS, ChatTemplate, Event, OutputParser,  # noqa: E402
@@ -7186,6 +7187,11 @@ def main() -> int:
     if a.engine == "maya":
         if not cfg:
             ap.error("--engine maya needs --config")
+        # GLM on an AMD APU with an NVIDIA card beside it ("mixed_gpus": true): the card leads, the APU helps
+        # (serve/glm_link.py; a config without the key starts as before)
+        cfg, link_line = glm_link.at_start(cfg)
+        if link_line:
+            print(link_line, flush=True)
         vision = None
         env = child_env(cfg)
         sampling_defaults = sampling_defaults_from_config(cfg)
@@ -7320,6 +7326,8 @@ def main() -> int:
         from serve import telemetry
         telemetry.HIP_BIN_DIRS = [d for d in cfg.get("lib_dirs") or [] if Path(d).is_dir()]
     svc.model_label = maya_quants.config_label(cfg)     # (configs of every release: by their installer record)
+    if cfg.get("mixed_gpus_active") and svc.model_label:   # (the dashboard shows it: both GPUs in link mode)
+        svc.model_label += " · AMD + NVIDIA"
     if a.config:
         svc.config_path = str(Path(a.config).resolve())  # a context change from the dashboard is saved there
         p = Path(svc.config_path)                        # the tokens it serves, and what its API would have charged

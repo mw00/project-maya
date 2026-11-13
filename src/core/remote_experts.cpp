@@ -4,6 +4,8 @@
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/quantize_act.hpp"
 #include "strata/kernels/s2_expert_grouped.hpp"
+#include "strata/kernels/glm_batch.hpp"
+#include "strata/prefill/moe_mmq.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -11,8 +13,20 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#ifdef __linux__
+#include <signal.h>
+#include <spawn.h>
+#include <sys/mman.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#include <thread>
+extern char** environ;
+#endif
 
 namespace strata::core {
+namespace glmpf {   // glm_prefill_dsa.cu (B14.1: the glm-dsa clamp after MMQ's quantizer, HIP only)
+void mmq_clamp(bool on, void* xq, int64_t rows, int64_t cols, int type, cudaStream_t s);
+}
 namespace {
 constexpr int64_t H = strata::kernels::cpu::H;
 constexpr int64_t FF = strata::kernels::cpu::FF;
@@ -89,12 +103,16 @@ GlmExpertHelper::~GlmExpertHelper() {
 bool GlmExpertHelper::open(int device, int n_embd, int n_ff,
                            const std::vector<std::pair<void*, size_t>>& regions, std::string& err, bool exl3) {
     close();
+    if (device == kLinkDevice) {
+        if (exl3) { err = "GLM expert helper link: native GGUF experts only"; return false; }
+        return open_link(n_embd, n_ff, regions, err);
+    }
     DeviceScope scope(device);
     if (!scope.ok) { err = scope.error(device); return false; }
     int integrated = 0;
     if (!check(cudaDeviceGetAttribute(&integrated, cudaDevAttrIntegrated, device), "integrated memory", err, device))
         return false;
-    if (n_embd <= 0 || n_embd > 4096 || n_embd % 32 || n_ff <= 0 || n_ff % 32) {
+    if (n_embd <= 0 || n_embd > 8192 || n_embd % 32 || n_ff <= 0 || n_ff % 32) {
         err = "GLM expert helper: unsupported expert dimensions";
         return false;
     }
@@ -159,6 +177,16 @@ bool GlmExpertHelper::open(int device, int n_embd, int n_ff,
 }
 
 bool GlmExpertHelper::reserve(int keys, size_t requested_bytes, std::string& err) {
+    if (link_) {
+        ctl_->op = hlink::kReserve;
+        ctl_->a = keys;
+        ctl_->b = (int64_t) requested_bytes;
+        if (!link_post(err) || !link_wait(err)) return false;
+        slots_.assign((size_t) keys, {});
+        owned_.assign((size_t) keys, 0);
+        capacity_ = requested_bytes;
+        return true;
+    }
     DeviceScope scope(device_);
     if (!scope.ok) { err = scope.error(device_); return false; }
     slots_.assign((size_t) keys, {});
@@ -180,6 +208,18 @@ bool GlmExpertHelper::insert(int key, const uint8_t* host, size_t bytes, size_t 
         err = "GLM expert helper: invalid cache insertion"; return false;
     }
     Slot s{const_cast<uint8_t*>(host), nullptr, bytes};
+    if (link_) {
+        ctl_->op = hlink::kInsert;
+        ctl_->a = key;
+        ctl_->b = (int64_t) bytes;
+        ctl_->c = (int64_t) stride;
+        ctl_->host = (uint64_t) (uintptr_t) host;
+        if (!link_post(err) || !link_wait(err)) return false;
+        slots_[(size_t) key] = s;
+        owned_[(size_t) key] = 1;
+        used_ += stride;
+        return true;
+    }
     if (integrated_) {
         for (const auto& r : regions_) {
             const uintptr_t offset = (uintptr_t) host - (uintptr_t) r.host;
@@ -212,6 +252,27 @@ bool GlmExpertHelper::replace(int out, int in, const uint8_t* host, std::string&
         err = "GLM expert helper: invalid cache replacement"; return false;
     }
     Slot s = slots_[(size_t) out];
+    if (link_) {
+        // the helper program swaps its own slots; the bytes travel only when they are not in the shared tier
+        bool shared = false;
+        for (const auto& b : hlink::blocks()) {
+            const uintptr_t off = (uintptr_t) host - (uintptr_t) b.base;
+            if ((uintptr_t) host >= (uintptr_t) b.base && off <= b.bytes && s.bytes <= b.bytes - off) { shared = true; break; }
+        }
+        if (!shared && s.bytes > hlink::kStage) { err = "GLM expert helper link: expert larger than the stage"; return false; }
+        if (!shared) std::memcpy(ctl_->stage, host, s.bytes);
+        ctl_->op = hlink::kReplace;
+        ctl_->a = out;
+        ctl_->b = in;
+        ctl_->d = shared ? 0 : 1;
+        ctl_->host = (uint64_t) (uintptr_t) host;
+        if (!link_post(err) || !link_wait(err)) return false;
+        slots_[(size_t) in] = {const_cast<uint8_t*>(host), nullptr, s.bytes};
+        slots_[(size_t) out] = {};
+        owned_[(size_t) out] = 0;
+        owned_[(size_t) in] = 1;
+        return true;
+    }
     if (integrated_) {
         uint8_t* mapped = nullptr;
         for (const auto& r : regions_) {
@@ -325,6 +386,27 @@ bool GlmExpertHelper::start(const strata::kernels::exl3::ExpertLayout* xl, int g
     }
     size_t bytes = 0;
     for (int i = 0; i < ne; ++i) bytes += slots_[(size_t) keys[i]].bytes;
+    if (link_) {
+        if (xl != nullptr) { err = "GLM expert helper link: native GGUF experts only"; return false; }
+        const auto t0 = std::chrono::steady_clock::now();
+        ctl_->op = hlink::kCompute;
+        ctl_->ne = ne;
+        ctl_->gu_type = gu_type;
+        ctl_->d_type = d_type;
+        ctl_->down_off = down_off;
+        ctl_->limit = limit;
+        for (int i = 0; i < ne; ++i) ctl_->keys[i] = keys[i], ctl_->w[i] = weights[i];
+        std::memcpy(ctl_->x, x, (size_t) n_embd_ * sizeof(float));
+        if (!link_post(err)) return false;
+        pend_ = {};
+        pend_.ne = ne;
+        pend_.bytes = bytes;
+        pend_.out = out;
+        pend_.t0 = t0;
+        pend_.t1 = std::chrono::steady_clock::now();
+        claim.keep = true;
+        return true;
+    }
     DeviceScope scope(device_);
     if (!scope.ok) { err = scope.error(device_); return false; }
     const auto t0 = std::chrono::steady_clock::now();
@@ -392,6 +474,26 @@ bool GlmExpertHelper::finish(std::string& err, bool split) {
     }
     Claim claim{pending_, false};   // (this call's, taken in start(): released when the stream is idle)
     const Pending p = pend_;
+    if (link_) {
+        const auto tw = split ? std::chrono::steady_clock::now() : p.t1;
+        const bool ok = link_wait(err);
+        claim.idle = ok;   // (a lost helper program keeps the claim: nothing more goes to it)
+        if (!ok) return false;
+        std::memcpy(p.out, ctl_->out, (size_t) n_embd_ * sizeof(float));
+        if (prof_) {
+            const auto t3 = std::chrono::steady_clock::now();
+            enqueue_ms_ += std::chrono::duration<double, std::milli>(p.t1 - p.t0).count();
+            wait_ms_ += std::chrono::duration<double, std::milli>(t3 - tw).count();
+            ++calls_;
+            experts_ += (unsigned long long) p.ne;
+            bytes_ += (unsigned long long) p.bytes;
+            if (split) {
+                ++split_calls_;
+                beside_ms_ += std::chrono::duration<double, std::milli>(tw - p.t1).count();
+            }
+        }
+        return true;
+    }
     DeviceScope scope(device_);
     if (!scope.ok) {
         // The helper's device could not be made current, yet nothing of this call may land in out (or read a slot)
@@ -439,6 +541,38 @@ bool GlmExpertHelper::finish(std::string& err, bool split) {
 
 void GlmExpertHelper::close() {
     if (device_ < 0) return;
+    if (link_) {
+        if (prof_ && calls_ > 0)
+            std::fprintf(stderr, "glm helper link prof: %llu calls, %.2f experts a call: host %.3f ms a call (post %.3f, "
+                                 "wait %.3f), %llu split calls, %.3f ms a split call between the halves\n", calls_,
+                         (double) experts_ / (double) calls_, (enqueue_ms_ + wait_ms_) / (double) calls_,
+                         enqueue_ms_ / (double) calls_, wait_ms_ / (double) calls_, split_calls_,
+                         split_calls_ ? beside_ms_ / (double) split_calls_ : 0.0);
+        close_link();
+        calls_ = experts_ = bytes_ = split_calls_ = 0;
+        enqueue_ms_ = wait_ms_ = out_ms_ = beside_ms_ = 0;
+        pending_.store(false, std::memory_order_release);
+        pend_ = {};
+        device_ = -1;
+        capacity_ = used_ = 0;
+        slots_.clear();
+        owned_.clear();
+        return;
+    }
+    {   // the helper program's prompt scratch
+        DeviceScope scope(device_);
+        if (stream_ != nullptr && pf_scratch_ != nullptr) cudaStreamSynchronize(stream_);
+        if (pf_scratch_ != nullptr) cudaFree(pf_scratch_);
+        if (pf_bnd_h_ != nullptr) cudaFreeHost(pf_bnd_h_);
+        delete (strata::prefill::mmq::Context*) pf_mq_;
+        pf_scratch_ = nullptr;
+        pf_bnd_h_ = pf_bnd_d_ = nullptr;
+        pf_mq_ = nullptr;
+        pf_scratch_bytes_ = 0;
+        pf_win_ = 0;
+        pf_ = pf_dev_ = nullptr;
+        pf_cap_ = 0;
+    }
     if (prof_ && calls_ > 0) {
         const double n = (double) calls_, kernels_ms = stage_ms_[2] + stage_ms_[3];
         std::fprintf(stderr, "glm helper prof CUDA%d: %llu calls, %.2f experts a call, zero-copy %s: host %.3f ms a call "
@@ -483,6 +617,206 @@ void GlmExpertHelper::close() {
     slots_.clear();
     owned_.clear();
     plan_ = {};
+}
+
+// ---------------------------------------------------------------- the helper in a second program (Linux)
+bool GlmExpertHelper::open_link(int n_embd, int n_ff, const std::vector<std::pair<void*, size_t>>& regions,
+                                std::string& err) {
+#ifdef __linux__
+    if (n_embd <= 0 || n_embd > hlink::kMaxEmbd || n_ff <= 0) {
+        err = "GLM expert helper link: unsupported dimensions";
+        return false;
+    }
+    const char* exe = std::getenv("MAYA_GLM_HELPER_EXE");
+    if (exe == nullptr || exe[0] == '\0') {
+        err = "GLM expert helper link: MAYA_GLM_HELPER_EXE names no helper program (maya-glm-helper of a HIP build)";
+        return false;
+    }
+    // every region must lie in a shared block (the RAM tier the link allocated): the helper reads them in place
+    const auto& blocks = hlink::blocks();
+    std::vector<int> used(blocks.size(), 0);
+    for (const auto& [host, bytes] : regions) {
+        bool in = false;
+        for (size_t i = 0; i < blocks.size() && !in; ++i) {
+            const uintptr_t off = (uintptr_t) host - (uintptr_t) blocks[i].base;
+            if ((uintptr_t) host >= (uintptr_t) blocks[i].base && off <= blocks[i].bytes && bytes <= blocks[i].bytes - off)
+                in = true, used[i] = 1;
+        }
+        if (!in) {
+            err = "GLM expert helper link: a RAM-tier region outside the shared memory";
+            return false;
+        }
+    }
+    ctl_ = hlink::ctl_alloc(ctl_fd_);
+    if (ctl_ == nullptr) {
+        err = "GLM expert helper link: the control block did not allocate";
+        return false;
+    }
+    std::vector<std::string> args = {exe, "--ctl", std::to_string(ctl_fd_)};
+    double gb = 0;
+    for (size_t i = 0; i < used.size(); ++i)
+        if (used[i]) {
+            args.push_back("--region");
+            args.push_back(std::to_string(blocks[i].fd) + ":" + std::to_string(blocks[i].bytes) + ":" +
+                           std::to_string((uintptr_t) blocks[i].base));
+            gb += blocks[i].bytes / 1073741824.0;
+        }
+    // the prompt exchange (MAYA_GLM_LINK_PROMPT=0: none - prompts then stream the experts the lead lacks, as before):
+    // MAYA_GLM_LINK_PF_TOKENS chunk tokens at most (default 32768; a longer chunk's layers stream as before)
+    {
+        const char* pv = std::getenv("MAYA_GLM_LINK_PROMPT");
+        const char* tv = std::getenv("MAYA_GLM_LINK_PF_TOKENS");
+        const int cap = tv != nullptr ? std::atoi(tv) : 32768;
+        if (!(pv != nullptr && std::strcmp(pv, "0") == 0) && cap > 0) {
+            pf_lay_ = hlink::PfLayout((size_t) cap, (size_t) n_embd);
+            pf_ = (uint8_t*) hlink::xchg_alloc(pf_lay_.bytes, pf_fd_);
+            if (pf_ != nullptr) {
+                pf_bytes_ = pf_lay_.bytes;
+                pf_cap_ = cap;
+                args.push_back("--xchg");
+                args.push_back(std::to_string(pf_fd_) + ":" + std::to_string(pf_bytes_) + ":" + std::to_string(cap));
+            }
+        }
+    }
+    std::vector<char*> argv;
+    for (auto& a : args) argv.push_back(a.data());
+    argv.push_back(nullptr);
+    pid_t pid = -1;
+    if (posix_spawn(&pid, exe, nullptr, nullptr, argv.data(), environ) != 0) {
+        err = std::string("GLM expert helper link: could not start ") + exe;
+        close_link();
+        return false;
+    }
+    child_ = (int) pid;
+    link_ = true;
+    device_ = kLinkDevice;
+    integrated_ = true;   // (it reads the shared RAM tier in place: the integrated helper's ownership rules)
+    n_embd_ = n_embd;
+    n_ff_ = n_ff;
+    prof_ = std::getenv("MAYA_GLM_PROF") != nullptr;
+    std::fprintf(stderr, "glm helper link: started %s (pid %d) over %.2f GB of shared RAM tier\n", exe, child_, gb);
+    // its registration of the shared tier takes a while (tens of GB): wait for ready, or its end
+    for (;;) {
+        if (__atomic_load_n(&ctl_->ready, __ATOMIC_ACQUIRE) != 0) break;
+        int st = 0;
+        if (waitpid(child_, &st, WNOHANG) == child_) {
+            child_ = -1;
+            err = "GLM expert helper link: the helper program ended while starting";
+            close();
+            return false;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    ctl_->op = hlink::kOpen;
+    ctl_->a = n_embd;
+    ctl_->b = n_ff;
+    if (!link_post(err) || !link_wait(err)) {
+        close();
+        return false;
+    }
+    // the exchange as this GPU reads it (out is added into the FFN in place; x and the plan are copied down into it)
+    if (pf_ != nullptr) {
+        void* dp = nullptr;
+        if (cudaHostRegister(pf_, pf_bytes_, cudaHostRegisterPortable | cudaHostRegisterMapped) == cudaSuccess &&
+            cudaHostGetDevicePointer(&dp, pf_, 0) == cudaSuccess) {
+            pf_registered_ = true;
+            pf_dev_ = (uint8_t*) dp;
+            std::fprintf(stderr, "glm helper link: prompt exchange %.2f GB (chunks up to %d tokens): the helper computes "
+                                 "its own experts' prompt rows\n", pf_bytes_ / 1073741824.0, pf_cap_);
+        } else {
+            (void) cudaGetLastError();
+            pf_cap_ = 0;
+            std::fprintf(stderr, "glm helper link: the prompt exchange did not register - prompts stream as before\n");
+        }
+    }
+    return true;
+#else
+    (void) n_embd;
+    (void) n_ff;
+    (void) regions;
+    err = "GLM expert helper link: Linux only";
+    return false;
+#endif
+}
+
+bool GlmExpertHelper::link_post(std::string& err) {
+    if (ctl_ == nullptr || child_ < 0) {
+        err = "GLM expert helper link: the helper program is gone";
+        return false;
+    }
+    ctl_->req.store(++seq_, std::memory_order_release);
+    return true;
+}
+
+bool GlmExpertHelper::link_wait(std::string& err) {
+#ifdef __linux__
+    if (ctl_ == nullptr) {
+        err = "GLM expert helper link: not open";
+        return false;
+    }
+    for (uint64_t spin = 0;; ++spin) {
+        if (ctl_->rep.load(std::memory_order_acquire) == seq_) break;
+        if ((spin & 0xffff) == 0xffff) {
+            int st = 0;
+            if (child_ < 0 || waitpid(child_, &st, WNOHANG) == child_) {
+                child_ = -1;
+                err = "GLM expert helper link: the helper program ended";
+                return false;
+            }
+            if (spin > (1ull << 22)) std::this_thread::yield();
+        }
+#if defined(__x86_64__)
+        __builtin_ia32_pause();
+#endif
+    }
+    if (ctl_->status != 0) {
+        ctl_->err[sizeof ctl_->err - 1] = '\0';
+        err = std::string("GLM expert helper link: ") + ctl_->err;
+        return false;
+    }
+    return true;
+#else
+    err = "GLM expert helper link: Linux only";
+    return false;
+#endif
+}
+
+void GlmExpertHelper::close_link() {
+#ifdef __linux__
+    if (ctl_ != nullptr && child_ >= 0) {
+        ctl_->op = hlink::kQuit;
+        ctl_->req.store(++seq_, std::memory_order_release);
+        for (int i = 0; i < 250; ++i) {   // (5 s, then it is stopped)
+            int st = 0;
+            if (waitpid(child_, &st, WNOHANG) == child_) {
+                child_ = -1;
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+        if (child_ >= 0) {
+            kill(child_, SIGKILL);
+            int st = 0;
+            waitpid(child_, &st, 0);
+            child_ = -1;
+        }
+    }
+    if (ctl_ != nullptr) munmap(ctl_, sizeof(hlink::Ctl));
+    if (ctl_fd_ >= 0) ::close(ctl_fd_);
+    if (pf_registered_) cudaHostUnregister(pf_);
+    if (pf_ != nullptr) munmap(pf_, pf_bytes_);
+    if (pf_fd_ >= 0) ::close(pf_fd_);
+#endif
+    pf_ = pf_dev_ = nullptr;
+    pf_bytes_ = 0;
+    pf_cap_ = 0;
+    pf_fd_ = -1;
+    pf_registered_ = false;
+    ctl_ = nullptr;
+    ctl_fd_ = -1;
+    child_ = -1;
+    link_ = false;
+    integrated_ = false;
 }
 
 RemoteExperts::~RemoteExperts() { close(); }
@@ -751,6 +1085,216 @@ bool RemoteExperts::finish(float* out, std::string& err) {
     for (size_t i = 0; i < original_row_.size(); ++i)
         std::memcpy(out + (size_t) original_row_[i] * H, h_out_ + i * H, (size_t) H * sizeof(float));
     return true;
+}
+
+// ---- the linked helper's prompt exchange (glm_helper_link.hpp PfLayout) ----
+
+bool GlmExpertHelper::pf_post(int gu_type, int d_type, size_t down_off, float limit, bool dsa, int T, int K, int n,
+                              int rows, int r0, std::string& err) {
+    if (!link_ || ctl_ == nullptr || pf_cap_ <= 0 || T > pf_cap_ || K > hlink::kPfMaxK || n > hlink::kPfMaxExperts) {
+        err = "GLM expert helper link: no prompt exchange for this layer";
+        return false;
+    }
+    ctl_->op = hlink::kPrompt;
+    ctl_->gu_type = gu_type;
+    ctl_->d_type = d_type;
+    ctl_->down_off = down_off;
+    ctl_->limit = limit;
+    ctl_->pf_T = T;
+    ctl_->pf_K = K;
+    ctl_->pf_n = n;
+    ctl_->pf_rows = rows;
+    ctl_->pf_r0 = r0;
+    ctl_->pf_dsa = dsa ? 1 : 0;
+    ctl_->pf_gpu_ms = 0.0;
+    return link_post(err);
+}
+
+bool GlmExpertHelper::pf_wait(std::string& err, double* helper_ms) {
+    if (!link_wait(err)) return false;
+    if (helper_ms != nullptr) *helper_ms = ctl_->pf_gpu_ms;
+    return true;
+}
+
+bool GlmExpertHelper::pf_attach(uint8_t* host, size_t bytes, int cap_tokens, std::string& err) {
+    if (!integrated_ || device_ < 0 || cap_tokens <= 0) {
+        err = "GLM expert helper: the prompt exchange needs an open integrated helper";
+        return false;
+    }
+    DeviceScope scope(device_);
+    if (!scope.ok) { err = scope.error(device_); return false; }
+    void* dp = nullptr;
+    if (!check(cudaHostGetDevicePointer(&dp, host, 0), "map the prompt exchange", err, device_)) return false;
+    pf_lay_ = hlink::PfLayout((size_t) cap_tokens, (size_t) n_embd_);
+    if (pf_lay_.bytes > bytes) {
+        err = "GLM expert helper: the prompt exchange is smaller than its layout";
+        return false;
+    }
+    pf_ = host;
+    pf_dev_ = (uint8_t*) dp;
+    pf_cap_ = cap_tokens;
+    return true;
+}
+
+bool GlmExpertHelper::pf_run(int gu_type, int d_type, size_t down_off, float limit, bool dsa, int T, int K, int n,
+                             int rows, int r0, const uint8_t* const* blobs, std::string& err) {
+#if defined(STRATA_USE_HIP)
+    namespace mmq = strata::prefill::mmq;
+    namespace gb = strata::kernels::glmb;
+    if (pf_ == nullptr || T <= 0 || T > pf_cap_ || K <= 0 || K > hlink::kPfMaxK || n < 0 || n > hlink::kPfMaxExperts ||
+        rows < 0 || rows > T * K || r0 < 0) {
+        err = "GLM expert helper: invalid prompt call";
+        return false;
+    }
+    if (!mmq::built() || !mmq::supported(gu_type) || !mmq::supported(d_type)) {
+        err = "GLM expert helper: this build's MMQ does not cover the layer's expert types";
+        return false;
+    }
+    DeviceScope scope(device_);
+    if (!scope.ok) { err = scope.error(device_); return false; }
+    const int E = n_embd_, nff = n_ff_;
+    const auto al = [](size_t b) { return (b + 255) & ~(size_t) 255; };
+    // the scratch for a window of W rows (MAYA_GLM_LINK_PF_WIN, default 8192): q8 x, gate/up, q8 h, the rows' out
+    if (pf_win_ == 0) {
+        const char* wv = std::getenv("MAYA_GLM_LINK_PF_WIN");
+        int W = wv != nullptr ? std::atoi(wv) : 8192;
+        W = (std::max(W, 256) + 255) & ~255;
+        const size_t need = al(mmq::q8_bytes(W, E)) + al((size_t) W * 2 * nff * sizeof(float)) +
+                            al(mmq::q8_bytes(W, nff)) + al((size_t) W * E * sizeof(float)) +
+                            al(((size_t) W + mmq::IDS_PAD) * sizeof(int32_t));
+        if (!check(cudaMalloc(&pf_scratch_, need), "prompt scratch", err, device_)) return false;
+        pf_scratch_bytes_ = need;
+        void* bh = nullptr;
+        void* bd = nullptr;
+        if (!check(cudaHostAlloc(&bh, (size_t) 2 * (hlink::kPfMaxExperts + 8192) * sizeof(int32_t),
+                                 cudaHostAllocPortable | cudaHostAllocMapped), "prompt bounds", err, device_) ||
+            !check(cudaHostGetDevicePointer(&bd, bh, 0), "prompt bounds mapping", err, device_)) return false;
+        pf_bnd_h_ = (int32_t*) bh;
+        pf_bnd_d_ = (int32_t*) bd;
+        pf_mq_ = new mmq::Context();
+        pf_win_ = W;
+        uint8_t* p = (uint8_t*) pf_scratch_;
+        p += al(mmq::q8_bytes(W, E)) + al((size_t) W * 2 * nff * sizeof(float)) + al(mmq::q8_bytes(W, nff)) +
+             al((size_t) W * E * sizeof(float));
+        mmq::iota((int32_t*) p, (int64_t) W + mmq::IDS_PAD, stream_);
+        std::fprintf(stderr, "maya-glm-helper: prompt windows of %d rows (%.0f MB scratch)\n", W, need / 1048576.0);
+    }
+    const int W = pf_win_;
+    uint8_t* p = (uint8_t*) pf_scratch_;
+    void* Xq = p;                 p += al(mmq::q8_bytes(W, E));
+    float* GU = (float*) p;       p += al((size_t) W * 2 * nff * sizeof(float));
+    void* Hq = p;                 p += al(mmq::q8_bytes(W, nff));
+    float* OUTP = (float*) p;     p += al((size_t) W * E * sizeof(float));
+    const int32_t* iota = (const int32_t*) p;
+    // each expert's blob as this GPU reads it (the registered shared tier, in place)
+    std::vector<const uint8_t*> dev_of((size_t) n, nullptr);
+    for (int j = 0; j < n; ++j)
+        for (const auto& r : regions_) {
+            const uintptr_t off = (uintptr_t) blobs[j] - (uintptr_t) r.host;
+            if (blobs[j] != nullptr && (uintptr_t) blobs[j] >= (uintptr_t) r.host && off < r.bytes) {
+                dev_of[(size_t) j] = r.mapped + off;
+                break;
+            }
+        }
+    const int32_t* cnts = (const int32_t*) (pf_ + pf_lay_.cnts);
+    const float* x_d = (const float*) (pf_dev_ + pf_lay_.x);
+    float* out_d = (float*) (pf_dev_ + pf_lay_.out);
+    const int32_t* pos_d = (const int32_t*) (pf_dev_ + pf_lay_.pos);
+    const float* rw_d = (const float*) (pf_dev_ + pf_lay_.rw);
+    const int32_t* rtok_d = (const int32_t*) (pf_dev_ + pf_lay_.rtok);
+    int64_t sum = 0;
+    for (int j = 0; j < n; ++j) {
+        if (cnts[j] < 0 || dev_of[(size_t) j] == nullptr) {
+            err = "GLM expert helper: a prompt expert outside the shared RAM tier";
+            return false;
+        }
+        sum += cnts[j];
+    }
+    if (sum != rows) {
+        err = "GLM expert helper: the prompt experts' rows do not add up";
+        return false;
+    }
+    const int errs0 = mmq::launch_errors();
+    auto& mq = *(mmq::Context*) pf_mq_;
+    cudaStream_t s = stream_;
+    cudaMemsetAsync(out_d, 0, (size_t) T * E * sizeof(float), s);
+    const size_t gu_bytes = mmq::matrix_bytes(gu_type, 2 * (int64_t) nff, E);
+    const size_t dn_bytes = mmq::matrix_bytes(d_type, E, nff);
+    struct Piece { int j, lo, hi, b; };
+    std::vector<Piece> ps;
+    int bp = 0, j = 0, jr = 0;
+    for (int a = 0; a < rows;) {
+        const int b = std::min(rows, a + W), nr = b - a;
+        ps.clear();
+        for (int at = a; at < b;) {
+            const int take = std::min(cnts[j] - jr, b - at);
+            if (take > 0) {
+                pf_bnd_h_[2 * bp] = at - a;
+                pf_bnd_h_[2 * bp + 1] = at - a + take;
+                ps.push_back({j, at - a, at - a + take, bp++});
+            }
+            at += take;
+            jr += take;
+            if (jr == cnts[j]) { ++j; jr = 0; }
+        }
+        mmq::quantize(x_d, rtok_d + a, Xq, gu_type, E, E, nr, s);
+        glmpf::mmq_clamp(dsa, Xq, nr, E, gu_type, s);
+        for (const auto& pc : ps) {
+            mmq::Product P;
+            P.w = dev_of[(size_t) pc.j];
+            P.type = gu_type;
+            P.w_rows = 2 * (int64_t) nff;
+            P.w_cols = E;
+            P.expert_bytes = gu_bytes;
+            P.n = 1;
+            P.xq = Xq;
+            P.bounds = pf_bnd_d_ + 2 * pc.b;
+            P.ids = iota;
+            P.total_rows = nr;
+            P.max_rows = pc.hi - pc.lo;
+            P.dst = GU;
+            P.ld_dst = 2 * (int64_t) nff;
+            mq.run(P, s);
+        }
+        gb::swiglu_rows(GU, GU, nr, nff, limit, s, 2 * nff);
+        mmq::quantize(GU, nullptr, Hq, d_type, nff, 2 * (int64_t) nff, nr, s);
+        glmpf::mmq_clamp(dsa, Hq, nr, nff, d_type, s);
+        for (const auto& pc : ps) {
+            mmq::Product D;
+            D.w = dev_of[(size_t) pc.j] + down_off;
+            D.type = d_type;
+            D.w_rows = E;
+            D.w_cols = nff;
+            D.expert_bytes = dn_bytes;
+            D.n = 1;
+            D.xq = Hq;
+            D.bounds = pf_bnd_d_ + 2 * pc.b;
+            D.ids = iota;
+            D.total_rows = nr;
+            D.max_rows = pc.hi - pc.lo;
+            D.dst = OUTP;
+            D.ld_dst = E;
+            mq.run(D, s);
+        }
+        gb::moe_combine_add(OUTP, r0 + a, r0 + a, r0 + b, pos_d, rw_d, T, K, E, out_d, s);
+        a = b;
+        if (2 * (bp + n + 2) > 2 * (hlink::kPfMaxExperts + 8192)) {   // (the bounds table is reused from its start)
+            if (!check(cudaStreamSynchronize(s), "prompt window", err, device_)) return false;
+            bp = 0;
+        }
+    }
+    if (!check(cudaStreamSynchronize(s), "prompt layer", err, device_)) return false;
+    if (mmq::launch_errors() != errs0) {
+        err = "GLM expert helper: MMQ refused a prompt product";
+        return false;
+    }
+    return true;
+#else
+    (void) gu_type; (void) d_type; (void) down_off; (void) limit; (void) dsa; (void) T; (void) K; (void) n;
+    (void) rows; (void) r0; (void) blobs;
+    err = "GLM expert helper: prompt products need the helper program of a HIP build";
+    return false;
+#endif
 }
 
 } // namespace strata::core

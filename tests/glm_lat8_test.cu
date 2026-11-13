@@ -34,7 +34,12 @@ __global__ void check_kernel(const uint8_t* recs, int n_rec, unsigned long long*
     unsigned long long nbad = 0;
     for (int k = 0; k < 4; ++k) {
         const __half2 r = __floats2half2_rn((float) q[2 * k] * df, (float) q[2 * k + 1] * df);
+#if defined(STRATA_LAT8_UNSIGNED_ZEROS)
+        // (AMD: a zero has no sign in a record's read - the F32 product's own zero sign varies with the compiler)
+        const unsigned ref = lat8_unsigned_zeros(*(const unsigned*) &r);
+#else
         const unsigned ref = *(const unsigned*) &r;
+#endif
         nbad += (got8[k] != ref) + (got4[k] != ref);
         for (int h = 0; h < 2; ++h)
             if (((got8[k] >> (16 * h)) & 0xFFFFu) != ((ref >> (16 * h)) & 0xFFFFu)) {

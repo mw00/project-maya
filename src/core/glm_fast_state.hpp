@@ -697,8 +697,10 @@ struct Glm5Model::FastState {
         int il, vslot, key, rclass, rslot;
         bool up;
         cudaEvent_t ev;
+        uint64_t seq = 0;   // the boundary it started at (MAYA_GLM_FIXED_MOVES)
     };
     std::vector<BgMove> bg;
+    uint64_t bnd_seq = 0;   // boundaries so far (MAYA_GLM_FIXED_MOVES)
     bool bg_hold = false;   // lend_tail: no new moves while the pool's tail is lent
     volatile int* route_error_h = nullptr;   // in the mapped ring allocation, visible after compute completion
     uint64_t bg_up = 0, bg_down = 0;
