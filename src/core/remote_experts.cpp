@@ -1154,7 +1154,7 @@ static bool pf_fused_here(int n_embd, int n_ff) {
         const char* v = std::getenv("MAYA_GLM_LINK_PF_FUSED");
         return v == nullptr || std::atoi(v) != 0;
     }();
-    return env && n_embd != 5120 && strata::prefill::rdna4::shape_ok(n_embd, n_ff) && strata::prefill::rdna4::available();
+    return env && n_embd == 4096 && n_ff == 2048 && strata::prefill::rdna4::shape_ok(n_embd, n_ff) && strata::prefill::rdna4::available();
 #else
     (void) n_embd; (void) n_ff;
     return false;
