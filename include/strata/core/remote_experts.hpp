@@ -80,7 +80,12 @@ public:
     /// chunk at most (0: none), the exchange's arrays in this process (pf_out_dev: out as this GPU reads it),
     /// pf_post sends the layer (keys/cnts/rtok/pos/rw/x filled), pf_wait waits for out.
     int pf_cap() const { return pf_cap_; }
-    bool pf_type_ok(int t) const { return link_ && ctl_ != nullptr && t >= 0 && t < 64 && ctl_->pf_types[t] != 0; }
+    bool pf_pair_ok(int gu, int d) const {   // (the helper has a prompt product for a layer of these expert types)
+        return link_ && ctl_ != nullptr && gu >= 0 && gu < 64 && d >= 0 && d < 64 &&
+               hlink::pf_pair_mode(ctl_->pf_types[gu], ctl_->pf_types[d]) >= 0;
+    }
+    int pf_type_bits(int t) const;                  // helper side: kOpen's answer for a type
+    int pf_mode(int gu_type, int d_type) const;     // helper side: hlink::pf_pair_mode of the two
     // slot 0: the whole exchange (chunks up to pf_cap() tokens); slots 1 / 2: two halves of up to pf_slot_cap() tokens
     // each (glm_helper_link.hpp pf_slot_layout), for the staggered prompt pipeline's two chunk halves
     int pf_slot_cap() const { return pf_cap_ / 2; }
@@ -143,6 +148,12 @@ private:
     int32_t* pf_bnd_h_ = nullptr;
     int32_t* pf_bnd_d_ = nullptr;
     void* pf_mq_ = nullptr;
+    // ... and the fused expert kernel's (pf_run): the chunk's rounded input, a window's rounded H and its tiles; the
+    // experts' places in the shared tier (mapped, beside the bounds)
+    void* pf_fx_ = nullptr;
+    int pf_fx_T_ = 0;
+    uint64_t* pf_off_h_ = nullptr;
+    uint64_t* pf_off_d_ = nullptr;
     std::atomic<bool> pending_{false};   // a call (enqueue .. wait) or a replace holds the stream and the buffers
     double last_gpu_ms_ = -1.0;
     struct Region { const uint8_t* host; uint8_t* mapped; size_t bytes; };

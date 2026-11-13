@@ -6,6 +6,9 @@
 #include "strata/kernels/s2_expert_grouped.hpp"
 #include "strata/kernels/glm_batch.hpp"
 #include "strata/prefill/moe_mmq.hpp"
+#if defined(STRATA_USE_HIP) && defined(STRATA_HIP_PREFILL_FUSED)
+#include "strata/prefill/moe_fused_rdna4.hpp"
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -564,6 +567,11 @@ void GlmExpertHelper::close() {
         if (stream_ != nullptr && pf_scratch_ != nullptr) cudaStreamSynchronize(stream_);
         if (pf_scratch_ != nullptr) cudaFree(pf_scratch_);
         if (pf_bnd_h_ != nullptr) cudaFreeHost(pf_bnd_h_);
+        if (pf_fx_ != nullptr) cudaFree(pf_fx_);
+        if (pf_off_h_ != nullptr) cudaFreeHost(pf_off_h_);
+        pf_fx_ = nullptr;
+        pf_off_h_ = pf_off_d_ = nullptr;
+        pf_fx_T_ = 0;
         delete (strata::prefill::mmq::Context*) pf_mq_;
         pf_scratch_ = nullptr;
         pf_bnd_h_ = pf_bnd_d_ = nullptr;
@@ -1138,6 +1146,38 @@ bool GlmExpertHelper::pf_attach(uint8_t* host, size_t bytes, int cap_tokens, std
     return true;
 }
 
+// the helper's prompt product for a layer's expert types: 1 the fused kernel (gate/up and down), 2 MMQ's gate/up and the
+// fused down, 0 MMQ, -1 none.  pf_type_bits: a type's part of that for kOpen's answer (hlink::Ctl::pf_types).
+static bool pf_fused_here(int n_embd, int n_ff) {
+#if defined(STRATA_USE_HIP) && defined(STRATA_HIP_PREFILL_FUSED)
+    static const bool env = [] {
+        const char* v = std::getenv("MAYA_GLM_LINK_PF_FUSED");
+        return v == nullptr || std::atoi(v) != 0;
+    }();
+    return env && n_embd == 4096 && n_ff == 2048 && strata::prefill::rdna4::shape_ok(n_embd, n_ff) && strata::prefill::rdna4::available();
+#else
+    (void) n_embd; (void) n_ff;
+    return false;
+#endif
+}
+
+int GlmExpertHelper::pf_type_bits(int t) const {
+    namespace mmq = strata::prefill::mmq;
+    int bits = mmq::built() && mmq::supported(t) ? hlink::kPfMmq : 0;
+#if defined(STRATA_USE_HIP) && defined(STRATA_HIP_PREFILL_FUSED)
+    constexpr int kAny = 16;   // (IQ2_XXS: the fused kernel takes it on either side)
+    if (pf_fused_here(n_embd_, n_ff_)) {
+        if (strata::prefill::rdna4::supported(t, kAny)) bits |= hlink::kPfFusedGu;
+        if (strata::prefill::rdna4::supported(kAny, t)) bits |= hlink::kPfFusedDown;
+    }
+#endif
+    return bits;
+}
+
+int GlmExpertHelper::pf_mode(int gu_type, int d_type) const {
+    return hlink::pf_pair_mode(pf_type_bits(gu_type), pf_type_bits(d_type));
+}
+
 bool GlmExpertHelper::pf_run(int gu_type, int d_type, size_t down_off, float limit, bool dsa, int T, int K, int n,
                              int rows, int r0, const uint8_t* const* blobs, std::string& err, int slot) {
 #if defined(STRATA_USE_HIP)
@@ -1148,13 +1188,14 @@ bool GlmExpertHelper::pf_run(int gu_type, int d_type, size_t down_off, float lim
         err = "GLM expert helper: invalid prompt call";
         return false;
     }
-    if (!mmq::built() || !mmq::supported(gu_type) || !mmq::supported(d_type)) {
-        err = "GLM expert helper: this build's MMQ does not cover the layer's expert types";
-        return false;
-    }
     DeviceScope scope(device_);
     if (!scope.ok) { err = scope.error(device_); return false; }
     const int E = n_embd_, nff = n_ff_;
+    const int fmode = pf_mode(gu_type, d_type);   // (-1: no product here covers the layer's types)
+    if (fmode < 0) {
+        err = "GLM expert helper: this build's prompt products do not cover the layer's expert types";
+        return false;
+    }
     const auto al = [](size_t b) { return (b + 255) & ~(size_t) 255; };
     // the scratch for a window of W rows (MAYA_GLM_LINK_PF_WIN, default 8192): q8 x, gate/up, q8 h, the rows' out
     if (pf_win_ == 0) {
@@ -1219,10 +1260,97 @@ bool GlmExpertHelper::pf_run(int gu_type, int d_type, size_t down_off, float lim
     const int errs0 = mmq::launch_errors();
     auto& mq = *(mmq::Context*) pf_mq_;
     cudaStream_t s = stream_;
+    // MAYA_GLM_PF_PROF=1 (measure only): this call's host enqueue time against its wait, and the experts by rows
+    static const bool pf_prof = std::getenv("MAYA_GLM_PF_PROF") != nullptr && std::atoi(std::getenv("MAYA_GLM_PF_PROF")) != 0;
+    static double pp_enq = 0.0, pp_wait = 0.0;
+    static long long pp_calls = 0, pp_hn[8] = {0}, pp_hr[8] = {0};
+    const auto pp_t0 = std::chrono::steady_clock::now();
+    if (pf_prof)
+        for (int q = 0; q < n; ++q) {
+            const int c = cnts[q];
+            const int k = c <= 0 ? 0 : c <= 4 ? 1 : c <= 8 ? 2 : c <= 16 ? 3 : c <= 32 ? 4 : c <= 64 ? 5 : c <= 128 ? 6 : 7;
+            ++pp_hn[k];
+            pp_hr[k] += c;
+        }
     cudaMemsetAsync(out_d, 0, (size_t) T * E * sizeof(float), s);
     const size_t gu_bytes = mmq::matrix_bytes(gu_type, 2 * (int64_t) nff, E);
     const size_t dn_bytes = mmq::matrix_bytes(d_type, E, nff);
+    const int NB = hlink::kPfMaxExperts + 8192;   // (the bounds table's pieces between two waits)
     struct Piece { int j, lo, hi, b; };
+    // THE FUSED EXPERT KERNEL (the Radeons it is built for, the expert shapes and types it covers - pf_mode): a
+    // window's experts in one launch a product instead of two MMQ launches an expert - a short chunk's lightly routed
+    // experts cost the launches more than their rows - and the IQ1_M matrices MMQ has no product for.  The experts
+    // are read in place through their offsets (Geometry::offs), the chunk's input is rounded once.  Mode 2: MMQ's
+    // gate/up (a type the fused kernel does not decode), its H rounded for the fused down.
+    // MAYA_GLM_LINK_PF_FUSED=0: MMQ as before.
+    const bool fused = fmode > 0 && n > 0 && rows > 0;
+#if defined(STRATA_HIP_PREFILL_FUSED)
+    namespace rf = strata::prefill::rdna4;
+    uint8_t* Xa = nullptr;
+    uint8_t* Ha = nullptr;
+    int* tiles = nullptr;
+    int32_t* cum_h = nullptr;
+    const int32_t* cum_d = nullptr;
+    const uint8_t* wb = nullptr;
+    int cq = 0;
+    if (fused) {
+        const int cap = std::max(pf_cap_, T);
+        if (pf_fx_ == nullptr || pf_fx_T_ < cap) {
+            if (pf_fx_ != nullptr) {
+                cudaStreamSynchronize(s);
+                cudaFree(pf_fx_);
+                pf_fx_ = nullptr;
+            }
+            const size_t need = al(rf::act_bytes(cap, E)) + al(rf::act_bytes(W, nff)) +
+                                al((size_t) 2 * ((size_t) (W + 63) / 64 + 512 + 8) * sizeof(int));
+            if (!check(cudaMalloc(&pf_fx_, need), "prompt scratch (fused)", err, device_)) return false;
+            pf_fx_T_ = cap;
+            std::fprintf(stderr, "maya-glm-helper: prompt experts through the fused kernel (%.0f MB more scratch; "
+                                 "MAYA_GLM_LINK_PF_FUSED=0: MMQ)\n", need / 1048576.0);
+        }
+        if (pf_off_h_ == nullptr) {
+            void* oh = nullptr;
+            void* od = nullptr;
+            if (!check(cudaHostAlloc(&oh, (size_t) NB * sizeof(uint64_t) + (size_t) 2 * NB * sizeof(int32_t),
+                                     cudaHostAllocPortable | cudaHostAllocMapped), "prompt offsets", err, device_) ||
+                !check(cudaHostGetDevicePointer(&od, oh, 0), "prompt offsets mapping", err, device_)) return false;
+            pf_off_h_ = (uint64_t*) oh;
+            pf_off_d_ = (uint64_t*) od;
+        }
+        Xa = (uint8_t*) pf_fx_;
+        Ha = Xa + al(rf::act_bytes(pf_fx_T_, E));
+        tiles = (int*) (Ha + al(rf::act_bytes(W, nff)));
+        cum_h = (int32_t*) (pf_off_h_ + NB);
+        cum_d = (const int32_t*) (pf_off_d_ + NB);
+        wb = dev_of[0];
+        for (int q = 1; q < n; ++q) wb = std::min(wb, dev_of[(size_t) q]);
+        if (fmode == 1) rf::quantize(x_d, T, E, Xa, s);
+    }
+    // a window's pieces in launches of at most 512 experts (a group's rows, H and out start at its first piece)
+    const auto fused_run = [&](const std::vector<Piece>& ps, int a, bool gate_up) {
+        for (size_t i0 = 0; i0 < ps.size(); i0 += 512) {
+            const size_t i1 = std::min(ps.size(), i0 + 512);
+            const int np = (int) (i1 - i0), lo = ps[i0].lo;
+            for (size_t i = i0; i < i1; ++i) {
+                cum_h[cq + (int) (i - i0)] = ps[i].lo;
+                pf_off_h_[ps[i].b] = (uint64_t) (dev_of[(size_t) ps[i].j] - wb);
+            }
+            cum_h[cq + np] = ps[i1 - 1].hi;
+            rf::Geometry geo{gu_type, d_type, gu_bytes / (size_t) (2 * nff), dn_bytes / (size_t) E, gu_bytes / 2,
+                             down_off, limit};
+            if (E != 4096 || nff != 2048) geo.n_embd = E, geo.n_ff = nff;
+            geo.offs = pf_off_d_ + ps[i0].b;
+            if (gate_up)
+                rf::experts(wb, 0, geo, np, cum_d + cq, cum_h + cq, tiles, Xa, rtok_d + a + lo, Ha,
+                            OUTP + (size_t) lo * E, s);
+            else
+                rf::experts_down(wb, 0, geo, np, cum_d + cq, cum_h + cq, tiles, Ha + rf::act_bytes(lo, nff),
+                                 OUTP + (size_t) lo * E, s);
+            cq += np + 1;
+        }
+    };
+#endif
+    (void) fused;
     std::vector<Piece> ps;
     int bp = 0, j = 0, jr = 0;
     for (int a = 0; a < rows;) {
@@ -1239,6 +1367,19 @@ bool GlmExpertHelper::pf_run(int gu_type, int d_type, size_t down_off, float lim
             jr += take;
             if (jr == cnts[j]) { ++j; jr = 0; }
         }
+#if defined(STRATA_HIP_PREFILL_FUSED)
+        if (fused && fmode == 1) {
+            fused_run(ps, a, true);
+            gb::moe_combine_add(OUTP, r0 + a, r0 + a, r0 + b, pos_d, rw_d, T, K, E, out_d, s);
+            a = b;
+            if (bp + n + 2 > NB) {   // (the tables are reused from their start)
+                if (!check(cudaStreamSynchronize(s), "prompt window", err, device_)) return false;
+                bp = 0;
+                cq = 0;
+            }
+            continue;
+        }
+#endif
         mmq::quantize(x_d, rtok_d + a, Xq, gu_type, E, E, nr, s);
         glmpf::mmq_clamp(dsa, Xq, nr, E, gu_type, s);
         for (const auto& pc : ps) {
@@ -1259,9 +1400,16 @@ bool GlmExpertHelper::pf_run(int gu_type, int d_type, size_t down_off, float lim
             mq.run(P, s);
         }
         gb::swiglu_rows(GU, GU, nr, nff, limit, s, 2 * nff);
-        mmq::quantize(GU, nullptr, Hq, d_type, nff, 2 * (int64_t) nff, nr, s);
-        glmpf::mmq_clamp(dsa, Hq, nr, nff, d_type, s);
+#if defined(STRATA_HIP_PREFILL_FUSED)
+        if (fused) {   // (mode 2: H rounded as the fused gate/up writes it, the down in one launch)
+            rf::quantize_rows(GU, 2 * (int64_t) nff, iota, nr, nff, Ha, s);
+            fused_run(ps, a, false);
+        }
+#endif
+        if (!fused) mmq::quantize(GU, nullptr, Hq, d_type, nff, 2 * (int64_t) nff, nr, s);
+        if (!fused) glmpf::mmq_clamp(dsa, Hq, nr, nff, d_type, s);
         for (const auto& pc : ps) {
+            if (fused) break;
             mmq::Product D;
             D.w = dev_of[(size_t) pc.j] + down_off;
             D.type = d_type;
@@ -1283,9 +1431,26 @@ bool GlmExpertHelper::pf_run(int gu_type, int d_type, size_t down_off, float lim
         if (2 * (bp + n + 2) > 2 * (hlink::kPfMaxExperts + 8192)) {   // (the bounds table is reused from its start)
             if (!check(cudaStreamSynchronize(s), "prompt window", err, device_)) return false;
             bp = 0;
+#if defined(STRATA_HIP_PREFILL_FUSED)
+            cq = 0;
+#endif
         }
     }
+    const auto pp_t1 = std::chrono::steady_clock::now();
     if (!check(cudaStreamSynchronize(s), "prompt layer", err, device_)) return false;
+    if (pf_prof) {
+        pp_enq += std::chrono::duration<double, std::milli>(pp_t1 - pp_t0).count();
+        pp_wait += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - pp_t1).count();
+        if (++pp_calls % 64 == 0) {
+            std::fprintf(stderr, "maya-glm-helper pf prof: %lld calls (T %d), enqueue %.0f ms, wait %.0f ms | experts/rows by "
+                                 "rows 0: %lld | 1-4: %lld/%lld | 5-8: %lld/%lld | 9-16: %lld/%lld | 17-32: %lld/%lld | "
+                                 "33-64: %lld/%lld | 65-128: %lld/%lld | more: %lld/%lld\n", pp_calls, T, pp_enq, pp_wait,
+                         pp_hn[0], pp_hn[1], pp_hr[1], pp_hn[2], pp_hr[2], pp_hn[3], pp_hr[3], pp_hn[4], pp_hr[4],
+                         pp_hn[5], pp_hr[5], pp_hn[6], pp_hr[6], pp_hn[7], pp_hr[7]);
+            pp_enq = pp_wait = 0.0;
+            for (int q = 0; q < 8; ++q) pp_hn[q] = pp_hr[q] = 0;
+        }
+    }
     if (mmq::launch_errors() != errs0) {
         err = "GLM expert helper: MMQ refused a prompt product";
         return false;

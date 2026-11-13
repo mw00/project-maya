@@ -2487,7 +2487,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
             K > hlink::kPfMaxK || g.n_expert > hlink::kPfMaxExperts)
             return false;
         const auto& Ly = F->L[(size_t) il];
-        return Ly.moe && !Ly.exl3 && F->helper.pf_type_ok(Ly.gu_type) && F->helper.pf_type_ok(Ly.d_type);
+        return Ly.moe && !Ly.exl3 && F->helper.pf_pair_ok(Ly.gu_type, Ly.d_type);
     };
     const auto prestage = [&](int il) {
         S->pre_layer = -1;
