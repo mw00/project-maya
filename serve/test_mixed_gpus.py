@@ -30,6 +30,7 @@ class TestMixedGpus(unittest.TestCase):
             MG.nvidia_listed = lambda: False   # (no NVIDIA card: as before)
             self.assertIsNone(MG.config_of(dict(CFG)))
             MG.nvidia_listed = lambda: True    # (a card and a CUDA build: on by itself where AUTO)
+            auto, MG.AUTO = MG.AUTO, False
             self.assertIsNone(MG.config_of(dict(CFG)))   # (AUTO False: only said)
             MG.AUTO = True
             self.assertEqual(MG.config_of(dict(CFG))["layers"], "auto")
@@ -40,6 +41,7 @@ class TestMixedGpus(unittest.TestCase):
             self.assertIsNone(MG.config_of(dict(CFG)))
         finally:
             MG.nvidia_listed, MG.windows, MG.Path.is_file = real
+            MG.AUTO = auto
             MG.AUTO = False
 
     def test_off_when_not_found(self):

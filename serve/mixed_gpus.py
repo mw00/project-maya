@@ -28,16 +28,15 @@ from pathlib import Path
 PLAN_TIMEOUT_S = 180
 PLAN_SETTLE_S = 90   # (back on both GPUs: how long the NVIDIA card may take to free the front's memory)
 # found two GPUs and no "mixed_gpus" in the config: on by itself only where it is faster at decode too (the owner's
-# rule) - Radeon 8065S + V100, Maya-XS: prompts +11/+39/+75 % at 2K/8K/32K but decode -1..-4 %, so not yet: the setup and
-# the log say how to turn it on.  A prompt-reading-only mode (decode on the AMD GPU alone) would make it on by itself.
-AUTO = False
+# rule): the helper layout (MODE) is - decode and prompts both measured faster (below); the split's decode is not
+AUTO = True
 # "mixed_mode" (config): "helper" - the AMD GPU runs the whole model and the NVIDIA card computes the experts its VRAM
 # holds (the most-routed, experts only) for the AMD GPU's decode windows and prompt chunks, through shared memory (one
 # conversation; a card or link gone: the AMD GPU goes on alone, the request too); "split" - the card runs the first
 # layers (as before).  Radeon 8065S + V100 32 GB, Maya-XS, one start each, same session (2026-11-13): helper - decode
 # rounds 69-76 / 62-63 / 77-81 ms vs alone's 87 / 69 / 104, prompts +14 / +11 / +14 % at 2K/8K/32K; split - decode
-# -1..-3 %, prompts +25 / +42 / +72 %
-MODE = "split"
+# -1..-3 %, prompts +25 / +42 / +72 % (`maya --mixed-gpus split` for long-document reading)
+MODE = "helper"
 # the helper's engine settings: its VRAM all experts (no layer's dense weights), prompt chunks up to 4096 rows
 HELPER_ARGS = ["--max-context", "4352", "--threads", "on", "--dspark", "off", "--mmap-experts", "on",
                "--prefill-chunk", "4096", "--reserve-mib", "1024"]

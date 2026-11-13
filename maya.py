@@ -6586,9 +6586,10 @@ def write_config_ds4(a, pc: dict, meta: dict, pack: Path, ctx: int, models: Path
     if hip and os.name != "nt" and "mixed_gpus" not in cfg and getattr(a, "mixed_gpus", None) is None and nvidia_beside():
         exe = Path(cfg.get("mixed_exe") or Path(cfg["exe"]).resolve().parents[1] / "build-cuda" / Path(cfg["exe"]).name)
         if exe.is_file():
-            say("  two GPUs: this PC also has an NVIDIA card - `--mixed-gpus on` runs DeepSeek's first layers there "
-                "beside the AMD GPU (long prompts read much faster, decode about the same; answers can be worded "
-                "slightly differently from the AMD GPU alone; `--mixed-gpus off` turns it off again)")
+            say("  two GPUs: this PC also has an NVIDIA card - DeepSeek uses it beside the AMD GPU by itself (the card "
+                "computes its most-routed experts: faster decode and prompts; answers can be worded slightly "
+                "differently from the AMD GPU alone; `--mixed-gpus split` gives the card the first layers instead - "
+                "long prompts read faster still, decode about the same; `--mixed-gpus off` turns it off)")
         else:
             say(f"  (this PC also has an NVIDIA card: with a CUDA build of maya-ds4 at {exe} (cmake -S . -B build-cuda "
                 "-DSTRATA_ENABLE_CUDA=ON -DSTRATA_ENABLE_HIP=OFF; cmake --build build-cuda --target maya-ds4) DeepSeek "
