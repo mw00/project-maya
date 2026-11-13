@@ -89,6 +89,7 @@ import calibrate_draft as CD  # noqa: E402  the speed calibration: DFlash2 or th
 import calibrate_ds4 as CDS  # noqa: E402  DeepSeek's: the DSpark drafter or none, on this PC
 import calibrate_mm3_prefill as CPF  # noqa: E402  MiniMax's: how this PC reads prompts fastest (chunk, GEMMs)
 from serve import glm_dsa_product as G53  # noqa: E402  GLM-5.3 (744B, glm-dsa)
+from serve import glm_link as GL  # noqa: E402  GLM on an AMD APU + an NVIDIA card ("mixed_gpus")
 from strata import maya_sync  # noqa: E402  (tools/strata/) a glm-dsa pack's expert profile and drafting
 
 WIN = S.WIN
@@ -3902,9 +3903,11 @@ def write_config(a, pc, meta, pack: Path, quant: str, ctx: int, models: Path, vi
     old_cfg = read_json(cfg_path)
     # the server's own settings from the config before (the address it listens on, its API key, ...): kept, as the
     # DeepSeek, MiniMax and Qwen setups keep them - a GLM setup run again dropped them; --host / --api-key given now win
-    for k in ("host", "api_key", "cors_origins", "mcp_servers"):
+    for k in ("host", "api_key", "cors_origins", "mcp_servers", "mixed_gpus", "mixed_exe", "mixed_gpu"):
         if old_cfg.get(k) is not None:
             cfg[k] = old_cfg[k]
+    if getattr(a, "mixed_gpus", None):
+        set_glm_mixed_gpus(cfg, a.mixed_gpus)
     if a.host:
         cfg["host"] = a.host
     if a.api_key:
@@ -4445,6 +4448,8 @@ def skip_start_calibrations(cfg_path: Path, cfg: dict, why: str) -> None:
         todo.append(("prefill calibration", "--calibrate"))
     if needs_speed_calibration(cfg):
         todo.append(("speed calibration", "--speed-calibration"))
+    elif needs_link_calibration(cfg):
+        todo.append(("both-GPU speed check", "--speed-calibration"))
     if todo:
         say("  Calibration skipped on this start (" + why + "): the model starts with its default settings. Run it once "
             "when you can wait for it: " + "; ".join(f"{ME} --config {cfg_path} {flag} --no-start ({name})"
@@ -4612,6 +4617,75 @@ def speed_calibration_g53(cfg_path: Path, cfg: dict, why: str = "") -> bool:
        ("drafts with the MTP block on this GPU" if keep else "decodes without drafting") +
        (" (a tie: the default for this PC)" if abs(d - o) <= G53_DRAFT_TIE * max(o, d) else ""))
     say(f"       (saved in {cfg_path.name}; {ME} --speed-calibration measures again)")
+    return True
+
+
+LINK_TIE = 0.03          # both GPUs (GLM link mode) only when their decode beats the AMD GPU alone by more than this
+
+
+def set_glm_mixed_gpus(cfg: dict, value: str | None) -> None:
+    """--mixed-gpus on|off into a GLM config ("mixed_gpus": true / false; serve/glm_link.py reads it at each start)."""
+    if value is None:
+        return
+    if value == "off":
+        cfg["mixed_gpus"] = False
+        ok("both GPUs: off (--mixed-gpus off: the model runs on the AMD GPU alone; --mixed-gpus on turns it on again)")
+        return
+    why = GL.why_not(cfg)
+    cfg["mixed_gpus"] = True
+    ok("both GPUs: on (--mixed-gpus on: the NVIDIA card leads, the AMD GPU computes the other experts; answers can be "
+       "worded slightly differently from the AMD GPU alone; --mixed-gpus off turns it off)")
+    if why:
+        warn(f"both GPUs: not possible on this PC yet ({why}) - until then the model runs on the AMD GPU alone")
+
+
+def needs_link_calibration(cfg: dict) -> bool:
+    """A GLM config on an AMD APU with an NVIDIA card and both builds beside it, never measured both ways and with no
+    "mixed_gpus" of the user's: its next attended start measures (link_calibration)."""
+    return "mixed_gpus" not in cfg and "mixed_gpus_calibration" not in (cfg.get("installer") or {}) and \
+        GL.why_not(cfg) is None
+
+
+def link_calibration(cfg_path: Path, why: str = "") -> bool:
+    """GLM on both GPUs (link mode) or on the AMD GPU alone: the decode speed of each, measured on this PC as the
+    drafting calibration measures (tools/calibrate_draft.py, the same short probe); "mixed_gpus" becomes true only
+    when both GPUs win by more than LINK_TIE.  The numbers are kept (installer.mixed_gpus_calibration), so it runs
+    once; --speed-calibration measures again.  False: not measured (nothing changed)."""
+    cfg = read_json(cfg_path)
+    reason = GL.why_not(cfg)
+    if reason:
+        warn(f"both GPUs: not measured ({reason})")
+        return False
+    busy = busy_gpus(cfg)
+    if busy:
+        warn("the both-GPU measurement needs the GPU to itself: " +
+             ", ".join(f"GPU {i} has {m} MiB in use" for i, m in busy) + f" - {ME} --speed-calibration tries again")
+        return False
+    alone = json.loads(json.dumps(cfg))
+    both = GL.link_config(cfg)
+    say()
+    say("  Speed check: this PC has an NVIDIA card beside the AMD GPU - is the model faster on both?" +
+        (f" ({why})" if why else ""))
+    say("  Maya loads the model twice (the AMD GPU alone, then both GPUs) and compares the decode speed.")
+    try:
+        res = CD.run(alone, both, say=say, other_label="the AMD GPU alone", draft_label="both GPUs",
+                     size=G53_DRAFT_PROBE)
+    except Exception as e:                             # never stops a start: the config stays as it was
+        warn(f"the both-GPU measurement did not finish ({e}): the model runs on the AMD GPU alone; "
+             f"{ME} --speed-calibration tries again")
+        cfg.setdefault("installer", {})["mixed_gpus_calibration"] = {"date": time.strftime("%Y-%m-%d %H:%M"),
+                                                                     "failed": str(e)[:300]}
+        cfg_path.write_text(json.dumps(N.env_out(cfg), indent=1), encoding="utf-8")
+        return False
+    o, d = res["other"]["tok_s"], res["dflash2"]["tok_s"]
+    cfg["mixed_gpus"] = d > o * (1 + LINK_TIE)
+    cfg.setdefault("installer", {})["mixed_gpus_calibration"] = {
+        "date": time.strftime("%Y-%m-%d %H:%M"), "version": maya_version(), "both_tok_s": d, "alone_tok_s": o}
+    cfg_path.write_text(json.dumps(N.env_out(cfg), indent=1), encoding="utf-8")
+    say()
+    ok(f"speed check: {d:.1f} tokens/s on both GPUs against {o:.1f} on the AMD GPU alone - " +
+       ("Maya runs on both GPUs (--mixed-gpus off turns it off)" if cfg["mixed_gpus"] else
+        "Maya stays on the AMD GPU alone (--mixed-gpus on turns both on)"))
     return True
 
 
@@ -4880,6 +4954,10 @@ def server_command(cfg_path: Path, a) -> tuple:
         drafter = {"deepseek": "DeepSeek's DSpark drafter", "minimax": "MiniMax's DSpark drafter"}.get(
             config_family(cfg), "DFlash2")
         if speed_calibration(cfg_path, f"once, for a setup that drafts with {drafter}"):
+            cfg = read_json(cfg_path)
+            args = cfg.get("args") or []
+    if not unattended and needs_link_calibration(cfg):      # an NVIDIA card beside the AMD APU: both GPUs, measured once
+        if link_calibration(cfg_path, "once, for this PC"):
             cfg = read_json(cfg_path)
             args = cfg.get("args") or []
     port = a.port or cfg.get("port") or 8080
@@ -7820,6 +7898,10 @@ def main() -> int:
     ap.add_argument("--mmap-experts", choices=["auto", "on", "off"],
                     help="DeepSeek: the experts VRAM does not hold - read in place from the files (auto, the default), "
                          "or off: copied into RAM (with DS4_REQUIRE_ALL_RAM=1 all of them); kept in the config")
+    ap.add_argument("--mixed-gpus", choices=["on", "off"],
+                    help="GLM on an AMD APU with an NVIDIA card beside it (Linux): on - both GPUs (the card leads, the "
+                         "APU computes the other experts); off - the AMD GPU alone; not given - the setup measures both "
+                         "and keeps the faster; kept in the config")
     ap.add_argument("--fast-prefill", choices=["on", "off"],
                     help="DeepSeek: fast prompt reading - long prompts read faster (the prompt skip as a per-layer "
                          "cone); answers can shift slightly, so it is off by default; kept in the config")
@@ -7908,6 +7990,13 @@ def main() -> int:
                 say(f"  {i}) {c.name}")
             pick = have[int(ask("Which one?", [str(i) for i in range(1, len(have) + 1)], "1", a.yes)) - 1]
         check_parallel(a, config_family(read_json(pick)))
+        if getattr(a, "mixed_gpus", None):   # (given on a start too: written into a GLM config, which keeps it)
+            cfg = read_json(pick)
+            if not GL.is_glm(cfg):
+                warn("--mixed-gpus here is a GLM setting: this config does not use it")
+            else:
+                set_glm_mixed_gpus(cfg, a.mixed_gpus)
+                pick.write_text(json.dumps(cfg, indent=1), encoding="utf-8")
         if getattr(a, "fast_prefill", None):   # (given on a start too: written into a DeepSeek config, which keeps it)
             cfg = read_json(pick)
             if config_family(cfg) != "deepseek":
@@ -7942,6 +8031,9 @@ def main() -> int:
         if a.speed_calibration:
             refresh_engine(read_json(pick))            # (the engine it measures is the current one)
             speed_calibration(pick, "asked for")
+            if GL.is_glm(read_json(pick)) and GL.why_not(read_json(pick)) is None and \
+                    read_json(pick).get("mixed_gpus") is not False:   # (the user's --mixed-gpus off stays)
+                link_calibration(pick, "asked for")
             if a.no_start:
                 return 0
         return start(pick, a)
