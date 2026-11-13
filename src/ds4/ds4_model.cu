@@ -22345,7 +22345,11 @@ struct Model::Impl {
             // (a tensor-parallel group: every member sums its own FF band, so every member adds its own part of the
             //  lane's picks and every member waits for the answer - the lane writes a part a member)
             const bool lane_m = lane_par && nm > 1 && lane_picks != nullptr;
-            if (T == 1 && moe_token_path) {
+            // (DS4_RHELPER_LATE: a single token's layer the helper answers goes the window's way too - its combine
+            //  waits for the helper's sums after this GPU's own experts, not before them; the same sums, WinArgs'
+            //  contract)
+            const bool rh_late_tok = rh_lead && lead && rh_late_on() && rh_direct_on(l);
+            if (T == 1 && moe_token_path && !rh_late_tok) {
                 const int lc = lead && nm == 1 && lay.fmt == gg::kFmtMXFP4 ? lane_class(l.il) : -1;
                 const bool zc_nowait = lc >= 0 && ln_zc_nowait && zc_layer_full(l);
                 if (zc_nowait && !zc_nowait_seen.exchange(true))
