@@ -15009,7 +15009,8 @@ struct Model::Impl {
         const size_t D = (size_t) g.dim;
         unsigned tmask = 0;
         for (const auto& pk_ : hp) tmask |= 1u << (pk_.second / kPicks);
-        if (ok) {
+        if (ok && rh_cmp != 0) helper_cmp(l, r, seq, T, hp, ents, tmask);
+        if (ok && rh_cmp != 2) {
             for (int t = 0; t < T; ++t) {
                 if (!((tmask >> t) & 1u)) continue;
                 const float* y = helper_res + ((size_t) slot * kWin + (size_t) t) * D;
@@ -15058,6 +15059,144 @@ struct Model::Impl {
         }
         st.helper_fallback += (int64_t) hp.size();
         if (rh_lead) rh_fallback_flag(rp, slot, seq, T);   // (DS4_RHELPER_DIRECT: the lead's GPU waits on that flag)
+    }
+
+    // DS4_RHELPER_CMP=1 (a debug run; the helper's sums go through the service thread - DS4_RHELPER_DIRECT off): every
+    // answer of the helper against the CPU lane's weighted sums of the same picks, token by token - the largest
+    // difference over the largest output (kHelperTol: more is not rounding), the helper's sum's best fit on the
+    // picks' own outputs (a weight each: 1 = the route weight as asked, 0 = the pick missing, 2 = counted twice) -
+    // the first cases said, a layer's count at the end.  =2: the CPU lane's sums go on in place of the helper's
+    int rh_cmp = std::getenv("DS4_RHELPER_CMP") != nullptr ? std::atoi(std::getenv("DS4_RHELPER_CMP")) : 0;
+    struct RhCmp {
+        long long toks = 0, bad = 0;
+        double worst = 0, sum = 0;
+    };
+    std::vector<RhCmp> rh_cmp_l;
+    int rh_cmp_said = 0;
+    void helper_cmp(const Layer& l, const Req& r, unsigned seq, int T, const std::vector<std::pair<int, int>>& hp,
+                    std::vector<Ent>& ents, unsigned tmask) {
+        const size_t D = (size_t) g.dim;
+        const int slot = (int) (seq % kRing);
+        if (rh_cmp_l.empty()) rh_cmp_l.assign((size_t) g.nl * 2 + 2, RhCmp{});
+        float wv[kWin * kPicks];
+        int tok_of[kWin * kPicks], exp_of[kWin * kPicks], pos_of[kWin * kPicks];
+        int nslots = 0;
+        ents.clear();
+        for (size_t a = 0; a < hp.size();) {
+            Ent en;
+            en.e = hp[a].first;
+            en.slot0 = nslots;
+            en.n = 0;
+            while (a < hp.size() && hp[a].first == en.e && en.n < kc::kExl3CpuMaxN) {
+                const int t = hp[a].second / kPicks, i = hp[a].second % kPicks;
+                en.tok[en.n++] = t;
+                tok_of[nslots] = t;
+                exp_of[nslots] = en.e;
+                pos_of[nslots] = i;
+                wv[nslots] = r.w[t][i];
+                ++nslots;
+                ++a;
+            }
+            ents.push_back(en);
+        }
+        cpu_experts(l, &r.x[0][0], ents, (size_t) kMaxDim);
+        std::vector<double> want(D);
+        for (int t = 0; t < T; ++t) {
+            if (!((tmask >> t) & 1u)) continue;
+            const float* y = helper_res + ((size_t) slot * kWin + (size_t) t) * D;
+            std::fill(want.begin(), want.end(), 0.0);
+            int sl_of[kPicks], m = 0;
+            for (int sl = 0; sl < nslots; ++sl) {
+                if (tok_of[sl] != t) continue;
+                if (m < kPicks) sl_of[m++] = sl;
+                const float* c = c_yd.data() + (size_t) sl * D;
+                for (size_t e = 0; e < D; ++e) want[e] += (double) wv[sl] * c[e];
+            }
+            double mx = 0, md = 0, dot = 0, nw = 0, ng = 0, xm = 0;
+            bool fin = true;
+            for (size_t e = 0; e < D; ++e) {
+                fin = fin && std::isfinite(y[e]);
+                mx = std::max(mx, std::fabs(want[e]));
+                md = std::max(md, std::fabs(want[e] - (double) y[e]));
+                dot += want[e] * y[e];
+                nw += want[e] * want[e];
+                ng += (double) y[e] * y[e];
+                xm = std::max(xm, (double) std::fabs(r.x[t][e]));
+            }
+            const double rel = !fin ? 1e30 : mx > 0 ? md / mx : md;
+            RhCmp& c = rh_cmp_l[(size_t) l.il * 2 + (T > 1 ? 1 : 0)];
+            ++c.toks;
+            c.sum += std::min(rel, 1e3);
+            c.worst = std::max(c.worst, rel);
+            if (rel <= kHelperTol) continue;
+            ++c.bad;
+            if (rh_cmp_said >= 200) continue;
+            ++rh_cmp_said;
+            // the helper's sum's best fit on the picks' own outputs: (At A) a = At y, a over the route weight
+            double A[kPicks][kPicks + 1] = {};
+            for (int i = 0; i < m; ++i) {
+                const float* ci = c_yd.data() + (size_t) sl_of[i] * D;
+                for (int j = 0; j < m; ++j) {
+                    const float* cj = c_yd.data() + (size_t) sl_of[j] * D;
+                    double s = 0;
+                    for (size_t e = 0; e < D; ++e) s += (double) ci[e] * cj[e];
+                    A[i][j] = s;
+                }
+                double s = 0;
+                for (size_t e = 0; e < D; ++e) s += (double) ci[e] * y[e];
+                A[i][m] = s;
+            }
+            for (int i = 0; i < m; ++i) {
+                int p = i;
+                for (int q = i + 1; q < m; ++q)
+                    if (std::fabs(A[q][i]) > std::fabs(A[p][i])) p = q;
+                for (int j = 0; j <= m; ++j) std::swap(A[i][j], A[p][j]);
+                if (std::fabs(A[i][i]) < 1e-30) continue;
+                for (int q = 0; q < m; ++q) {
+                    if (q == i) continue;
+                    const double f = A[q][i] / A[i][i];
+                    for (int j = i; j <= m; ++j) A[q][j] -= f * A[i][j];
+                }
+            }
+            std::string picks;
+            double res2 = 0;
+            {
+                std::vector<double> fit(D, 0.0);
+                for (int i = 0; i < m; ++i) {
+                    const double a = std::fabs(A[i][i]) < 1e-30 ? 0.0 : A[i][m] / A[i][i];
+                    const float* ci = c_yd.data() + (size_t) sl_of[i] * D;
+                    for (size_t e = 0; e < D; ++e) fit[e] += a * ci[e];
+                    char b[96];
+                    std::snprintf(b, sizeof b, " e%d@%d w %.4f fit %.3f", exp_of[sl_of[i]], pos_of[sl_of[i]],
+                                  wv[sl_of[i]], wv[sl_of[i]] != 0.0f ? a / wv[sl_of[i]] : a);
+                    picks += b;
+                }
+                for (size_t e = 0; e < D; ++e) res2 += (fit[e] - (double) y[e]) * (fit[e] - (double) y[e]);
+            }
+            int all = 0;   // (the token's routed picks in all)
+            for (int i = 0; i < l.k_exp; ++i) all += r.ids[t][i] >= 0;
+            std::fprintf(stderr, "ds4: rh-cmp: layer %d seq %u T %d token %d: %s max|diff| %.4g of max|want| %.4g (%.3g), "
+                                 "|got|/|want| %.4f cos %.5f, unfit %.3g of |got|, max|x| %.3g, %d of %d picks its:%s\n",
+                         l.il, seq, T, t, fin ? "" : "NOT FINITE", md, mx, rel, nw > 0 ? std::sqrt(ng / nw) : 0.0,
+                         nw > 0 && ng > 0 ? dot / std::sqrt(nw * ng) : 0.0, ng > 0 ? std::sqrt(res2 / ng) : 0.0, xm, m,
+                         all, picks.c_str());
+        }
+    }
+    void helper_cmp_end() {
+        if (rh_cmp == 0 || rh_cmp_l.empty()) return;
+        long long toks = 0, bad = 0;
+        for (int il = 0; il < g.nl; ++il)
+            for (int w = 0; w < 2; ++w) {
+                const RhCmp& c = rh_cmp_l[(size_t) il * 2 + w];
+                if (c.toks == 0) continue;
+                toks += c.toks;
+                bad += c.bad;
+                std::fprintf(stderr, "ds4: rh-cmp: layer %d %s: %lld token sums, %lld off by more than %.0e, worst %.3g, "
+                                     "mean %.3g\n", il, w ? "windows" : "one token", c.toks, c.bad, kHelperTol, c.worst,
+                             c.sum / (double) c.toks);
+            }
+        std::fprintf(stderr, "ds4: rh-cmp: %lld token sums of the helper against the CPU lane's, %lld off by more than "
+                             "%.0e\n", toks, bad, kHelperTol);
     }
 
     // DS4_HELPER_CHECK=1 (at load, before decode: nothing waits on the helper yet): for each expert format the pool
