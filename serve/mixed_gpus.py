@@ -34,13 +34,15 @@ AUTO = False
 # "mixed_mode" (config): "helper" - the AMD GPU runs the whole model and the NVIDIA card computes the experts its VRAM
 # holds (the most-routed, experts only) for the AMD GPU's decode windows and prompt chunks, through shared memory (one
 # conversation; a card or link gone: the AMD GPU goes on alone, the request too); "split" - the card runs the first
-# layers (as before)
+# layers (as before).  Radeon 8065S + V100 32 GB, Maya-XS, one start each, same session (2026-11-13): helper - decode
+# rounds 69-76 / 62-63 / 77-81 ms vs alone's 87 / 69 / 104, prompts +14 / +11 / +14 % at 2K/8K/32K; split - decode
+# -1..-3 %, prompts +25 / +42 / +72 %
 MODE = "split"
 # the helper's engine settings: its VRAM all experts (no layer's dense weights), prompt chunks up to 4096 rows
 HELPER_ARGS = ["--max-context", "4352", "--threads", "on", "--dspark", "off", "--mmap-experts", "on",
                "--prefill-chunk", "4096", "--reserve-mib", "1024"]
 HELPER_ENV = {"DS4_RHELPER_HOT": "1", "DS4_RHELPER_ONLY": "1", "DS4_BORROW": "0"}
-LEAD_ENV = {"DS4_RHELPER_HOT": "1"}
+LEAD_ENV = {"DS4_RHELPER_HOT": "1", "DS4_RHELPER_PROMPT": "1"}   # (prompt chunks through the card too: measured faster)
 # flags the two-GPU run leaves out: abliteration's projection is not carried through the link (the engines would
 # disagree), and the AMD GPU's VRAM reserve is not the NVIDIA card's
 ABLATE_FLAGS = {"--ablate": 1, "--ablate-default": 1, "--ablate-layer": 1, "--ablate-scale": 1}
@@ -316,7 +318,7 @@ def engine_class(base, wait_gpu_release):
             if alone and self.mixed_on:
                 print(f"[maya] two GPUs: this request {alone} - it runs on the AMD GPU alone (loading it, a minute or "
                       "so); the next request without it runs on both again", flush=True)
-                base.stop(self)
+                self._end_engine()
                 self._stop_part()
                 self.ended = False
                 self.mixed_on = False
@@ -324,7 +326,7 @@ def engine_class(base, wait_gpu_release):
                 base.__init__(self, *spawn)
             elif not alone and getattr(self, "alone_for", None) and not self.mixed_on:
                 print("[maya] two GPUs: back on both GPUs (loading them, a minute or so)", flush=True)
-                base.stop(self)
+                self._end_engine()
                 self.ended = False
                 self.alone_for = None
                 try:
@@ -340,6 +342,27 @@ def engine_class(base, wait_gpu_release):
                     self._stop_part()
                     self._fall(str(e), e.again)
                     base.__init__(self, *spawn)
+
+        def _end_engine(self):
+            """The running engine ended (QUIT; killed if it does not end in time) and its GPU memory back, before the
+            other layout starts - StrataEngine.stop is a request's STOP (its later definition), which leaves the engine
+            running: the NVIDIA card then still held the front's memory when both GPUs were planned again."""
+            p = getattr(self, "proc", None)
+            if p is None:
+                return
+            try:
+                if p.poll() is None:
+                    p.stdin.write("QUIT\n")
+                    p.stdin.flush()
+                    p.wait(timeout=60)
+            except (OSError, ValueError, subprocess.TimeoutExpired):
+                try:
+                    p.kill()
+                    p.wait(timeout=20)
+                except (OSError, subprocess.TimeoutExpired):
+                    pass
+            self.ended = True
+            wait_gpu_release(p.pid)
 
         def _watch_load(self, ready: threading.Event):
             """While the front loads (it waits for the part): a part that ends ends the front too, at once."""
@@ -390,10 +413,6 @@ def engine_class(base, wait_gpu_release):
                 self._stop_part()
             self._closed = False
             base.restart(self)
-
-        def stop(self, timeout: float = 60.0):
-            base.stop(self, timeout)
-            self._stop_part()
 
         def close(self):
             self._closed = True
