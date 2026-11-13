@@ -601,7 +601,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   # already links `strata_core` - putting `gdn_layer` in core would make the two mutually dependent.  A third
   # library is the honest shape of the dependency graph: core knows about devices and weights, kernels know
   # about arithmetic, and this one knows the ORDER the arithmetic happens in.
-  add_library(strata_engine STATIC src/core/layer.cpp src/core/session.cpp src/core/expert_source.cpp src/core/remote_experts.cpp
+  add_library(strata_engine STATIC src/core/layer.cpp src/core/session.cpp src/core/expert_source.cpp src/core/remote_experts.cpp src/core/glm_helper_link.cpp
     src/core/expert_cache.cpp src/core/native_head.cpp src/core/native_dense.cpp src/core/verify.cpp src/core/mtp.cpp
     src/core/glm_model.cu src/core/glm_fast_path.cu src/core/glm_prefill.cu src/core/glm_multi.cu src/core/glm_rows.cu
     src/core/glm_window.cu src/core/glm_dflash.cu src/core/glm_mtp.cu src/core/glm_mtp_rows.cu src/core/glm_ablate.cu)
@@ -991,6 +991,10 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     target_link_libraries(hip_expert_cache_staging PRIVATE strata_engine)
     add_test(NAME hip_expert_cache_staging COMMAND hip_expert_cache_staging)
     list(APPEND _strata_hip_tests hip_expert_cache_staging)
+    # MAYA_GLM_EXPERT_HELPER=link: the GLM expert helper as a program of its own (a CUDA lead + this AMD GPU, Linux)
+    add_executable(maya-glm-helper src/program/glm_helper_server.cpp)
+    target_include_directories(maya-glm-helper PRIVATE third_party/ggml)
+    target_link_libraries(maya-glm-helper PRIVATE strata_engine)
     add_executable(hip_glm_expert_helper tests/hip/glm_expert_helper.cpp)
     target_include_directories(hip_glm_expert_helper PRIVATE third_party/ggml)
     target_link_libraries(hip_glm_expert_helper PRIVATE strata_engine)

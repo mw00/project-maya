@@ -11,6 +11,15 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#ifdef __linux__
+#include <signal.h>
+#include <spawn.h>
+#include <sys/mman.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#include <thread>
+extern char** environ;
+#endif
 
 namespace strata::core {
 namespace {
@@ -89,12 +98,16 @@ GlmExpertHelper::~GlmExpertHelper() {
 bool GlmExpertHelper::open(int device, int n_embd, int n_ff,
                            const std::vector<std::pair<void*, size_t>>& regions, std::string& err, bool exl3) {
     close();
+    if (device == kLinkDevice) {
+        if (exl3) { err = "GLM expert helper link: native GGUF experts only"; return false; }
+        return open_link(n_embd, n_ff, regions, err);
+    }
     DeviceScope scope(device);
     if (!scope.ok) { err = scope.error(device); return false; }
     int integrated = 0;
     if (!check(cudaDeviceGetAttribute(&integrated, cudaDevAttrIntegrated, device), "integrated memory", err, device))
         return false;
-    if (n_embd <= 0 || n_embd > 4096 || n_embd % 32 || n_ff <= 0 || n_ff % 32) {
+    if (n_embd <= 0 || n_embd > 8192 || n_embd % 32 || n_ff <= 0 || n_ff % 32) {
         err = "GLM expert helper: unsupported expert dimensions";
         return false;
     }
@@ -159,6 +172,16 @@ bool GlmExpertHelper::open(int device, int n_embd, int n_ff,
 }
 
 bool GlmExpertHelper::reserve(int keys, size_t requested_bytes, std::string& err) {
+    if (link_) {
+        ctl_->op = hlink::kReserve;
+        ctl_->a = keys;
+        ctl_->b = (int64_t) requested_bytes;
+        if (!link_post(err) || !link_wait(err)) return false;
+        slots_.assign((size_t) keys, {});
+        owned_.assign((size_t) keys, 0);
+        capacity_ = requested_bytes;
+        return true;
+    }
     DeviceScope scope(device_);
     if (!scope.ok) { err = scope.error(device_); return false; }
     slots_.assign((size_t) keys, {});
@@ -180,6 +203,18 @@ bool GlmExpertHelper::insert(int key, const uint8_t* host, size_t bytes, size_t 
         err = "GLM expert helper: invalid cache insertion"; return false;
     }
     Slot s{const_cast<uint8_t*>(host), nullptr, bytes};
+    if (link_) {
+        ctl_->op = hlink::kInsert;
+        ctl_->a = key;
+        ctl_->b = (int64_t) bytes;
+        ctl_->c = (int64_t) stride;
+        ctl_->host = (uint64_t) (uintptr_t) host;
+        if (!link_post(err) || !link_wait(err)) return false;
+        slots_[(size_t) key] = s;
+        owned_[(size_t) key] = 1;
+        used_ += stride;
+        return true;
+    }
     if (integrated_) {
         for (const auto& r : regions_) {
             const uintptr_t offset = (uintptr_t) host - (uintptr_t) r.host;
@@ -212,6 +247,27 @@ bool GlmExpertHelper::replace(int out, int in, const uint8_t* host, std::string&
         err = "GLM expert helper: invalid cache replacement"; return false;
     }
     Slot s = slots_[(size_t) out];
+    if (link_) {
+        // the helper program swaps its own slots; the bytes travel only when they are not in the shared tier
+        bool shared = false;
+        for (const auto& b : hlink::blocks()) {
+            const uintptr_t off = (uintptr_t) host - (uintptr_t) b.base;
+            if ((uintptr_t) host >= (uintptr_t) b.base && off <= b.bytes && s.bytes <= b.bytes - off) { shared = true; break; }
+        }
+        if (!shared && s.bytes > hlink::kStage) { err = "GLM expert helper link: expert larger than the stage"; return false; }
+        if (!shared) std::memcpy(ctl_->stage, host, s.bytes);
+        ctl_->op = hlink::kReplace;
+        ctl_->a = out;
+        ctl_->b = in;
+        ctl_->d = shared ? 0 : 1;
+        ctl_->host = (uint64_t) (uintptr_t) host;
+        if (!link_post(err) || !link_wait(err)) return false;
+        slots_[(size_t) in] = {const_cast<uint8_t*>(host), nullptr, s.bytes};
+        slots_[(size_t) out] = {};
+        owned_[(size_t) out] = 0;
+        owned_[(size_t) in] = 1;
+        return true;
+    }
     if (integrated_) {
         uint8_t* mapped = nullptr;
         for (const auto& r : regions_) {
@@ -325,6 +381,27 @@ bool GlmExpertHelper::start(const strata::kernels::exl3::ExpertLayout* xl, int g
     }
     size_t bytes = 0;
     for (int i = 0; i < ne; ++i) bytes += slots_[(size_t) keys[i]].bytes;
+    if (link_) {
+        if (xl != nullptr) { err = "GLM expert helper link: native GGUF experts only"; return false; }
+        const auto t0 = std::chrono::steady_clock::now();
+        ctl_->op = hlink::kCompute;
+        ctl_->ne = ne;
+        ctl_->gu_type = gu_type;
+        ctl_->d_type = d_type;
+        ctl_->down_off = down_off;
+        ctl_->limit = limit;
+        for (int i = 0; i < ne; ++i) ctl_->keys[i] = keys[i], ctl_->w[i] = weights[i];
+        std::memcpy(ctl_->x, x, (size_t) n_embd_ * sizeof(float));
+        if (!link_post(err)) return false;
+        pend_ = {};
+        pend_.ne = ne;
+        pend_.bytes = bytes;
+        pend_.out = out;
+        pend_.t0 = t0;
+        pend_.t1 = std::chrono::steady_clock::now();
+        claim.keep = true;
+        return true;
+    }
     DeviceScope scope(device_);
     if (!scope.ok) { err = scope.error(device_); return false; }
     const auto t0 = std::chrono::steady_clock::now();
@@ -392,6 +469,26 @@ bool GlmExpertHelper::finish(std::string& err, bool split) {
     }
     Claim claim{pending_, false};   // (this call's, taken in start(): released when the stream is idle)
     const Pending p = pend_;
+    if (link_) {
+        const auto tw = split ? std::chrono::steady_clock::now() : p.t1;
+        const bool ok = link_wait(err);
+        claim.idle = ok;   // (a lost helper program keeps the claim: nothing more goes to it)
+        if (!ok) return false;
+        std::memcpy(p.out, ctl_->out, (size_t) n_embd_ * sizeof(float));
+        if (prof_) {
+            const auto t3 = std::chrono::steady_clock::now();
+            enqueue_ms_ += std::chrono::duration<double, std::milli>(p.t1 - p.t0).count();
+            wait_ms_ += std::chrono::duration<double, std::milli>(t3 - tw).count();
+            ++calls_;
+            experts_ += (unsigned long long) p.ne;
+            bytes_ += (unsigned long long) p.bytes;
+            if (split) {
+                ++split_calls_;
+                beside_ms_ += std::chrono::duration<double, std::milli>(tw - p.t1).count();
+            }
+        }
+        return true;
+    }
     DeviceScope scope(device_);
     if (!scope.ok) {
         // The helper's device could not be made current, yet nothing of this call may land in out (or read a slot)
@@ -439,6 +536,24 @@ bool GlmExpertHelper::finish(std::string& err, bool split) {
 
 void GlmExpertHelper::close() {
     if (device_ < 0) return;
+    if (link_) {
+        if (prof_ && calls_ > 0)
+            std::fprintf(stderr, "glm helper link prof: %llu calls, %.2f experts a call: host %.3f ms a call (post %.3f, "
+                                 "wait %.3f), %llu split calls, %.3f ms a split call between the halves\n", calls_,
+                         (double) experts_ / (double) calls_, (enqueue_ms_ + wait_ms_) / (double) calls_,
+                         enqueue_ms_ / (double) calls_, wait_ms_ / (double) calls_, split_calls_,
+                         split_calls_ ? beside_ms_ / (double) split_calls_ : 0.0);
+        close_link();
+        calls_ = experts_ = bytes_ = split_calls_ = 0;
+        enqueue_ms_ = wait_ms_ = out_ms_ = beside_ms_ = 0;
+        pending_.store(false, std::memory_order_release);
+        pend_ = {};
+        device_ = -1;
+        capacity_ = used_ = 0;
+        slots_.clear();
+        owned_.clear();
+        return;
+    }
     if (prof_ && calls_ > 0) {
         const double n = (double) calls_, kernels_ms = stage_ms_[2] + stage_ms_[3];
         std::fprintf(stderr, "glm helper prof CUDA%d: %llu calls, %.2f experts a call, zero-copy %s: host %.3f ms a call "
@@ -483,6 +598,166 @@ void GlmExpertHelper::close() {
     slots_.clear();
     owned_.clear();
     plan_ = {};
+}
+
+// ---------------------------------------------------------------- the helper in a second program (Linux)
+bool GlmExpertHelper::open_link(int n_embd, int n_ff, const std::vector<std::pair<void*, size_t>>& regions,
+                                std::string& err) {
+#ifdef __linux__
+    if (n_embd <= 0 || n_embd > hlink::kMaxEmbd || n_ff <= 0) {
+        err = "GLM expert helper link: unsupported dimensions";
+        return false;
+    }
+    const char* exe = std::getenv("MAYA_GLM_HELPER_EXE");
+    if (exe == nullptr || exe[0] == '\0') {
+        err = "GLM expert helper link: MAYA_GLM_HELPER_EXE names no helper program (maya-glm-helper of a HIP build)";
+        return false;
+    }
+    // every region must lie in a shared block (the RAM tier the link allocated): the helper reads them in place
+    const auto& blocks = hlink::blocks();
+    std::vector<int> used(blocks.size(), 0);
+    for (const auto& [host, bytes] : regions) {
+        bool in = false;
+        for (size_t i = 0; i < blocks.size() && !in; ++i) {
+            const uintptr_t off = (uintptr_t) host - (uintptr_t) blocks[i].base;
+            if ((uintptr_t) host >= (uintptr_t) blocks[i].base && off <= blocks[i].bytes && bytes <= blocks[i].bytes - off)
+                in = true, used[i] = 1;
+        }
+        if (!in) {
+            err = "GLM expert helper link: a RAM-tier region outside the shared memory";
+            return false;
+        }
+    }
+    ctl_ = hlink::ctl_alloc(ctl_fd_);
+    if (ctl_ == nullptr) {
+        err = "GLM expert helper link: the control block did not allocate";
+        return false;
+    }
+    std::vector<std::string> args = {exe, "--ctl", std::to_string(ctl_fd_)};
+    double gb = 0;
+    for (size_t i = 0; i < used.size(); ++i)
+        if (used[i]) {
+            args.push_back("--region");
+            args.push_back(std::to_string(blocks[i].fd) + ":" + std::to_string(blocks[i].bytes) + ":" +
+                           std::to_string((uintptr_t) blocks[i].base));
+            gb += blocks[i].bytes / 1073741824.0;
+        }
+    std::vector<char*> argv;
+    for (auto& a : args) argv.push_back(a.data());
+    argv.push_back(nullptr);
+    pid_t pid = -1;
+    if (posix_spawn(&pid, exe, nullptr, nullptr, argv.data(), environ) != 0) {
+        err = std::string("GLM expert helper link: could not start ") + exe;
+        close_link();
+        return false;
+    }
+    child_ = (int) pid;
+    link_ = true;
+    device_ = kLinkDevice;
+    integrated_ = true;   // (it reads the shared RAM tier in place: the integrated helper's ownership rules)
+    n_embd_ = n_embd;
+    n_ff_ = n_ff;
+    prof_ = std::getenv("MAYA_GLM_PROF") != nullptr;
+    std::fprintf(stderr, "glm helper link: started %s (pid %d) over %.2f GB of shared RAM tier\n", exe, child_, gb);
+    // its registration of the shared tier takes a while (tens of GB): wait for ready, or its end
+    for (;;) {
+        if (__atomic_load_n(&ctl_->ready, __ATOMIC_ACQUIRE) != 0) break;
+        int st = 0;
+        if (waitpid(child_, &st, WNOHANG) == child_) {
+            child_ = -1;
+            err = "GLM expert helper link: the helper program ended while starting";
+            close();
+            return false;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    ctl_->op = hlink::kOpen;
+    ctl_->a = n_embd;
+    ctl_->b = n_ff;
+    if (!link_post(err) || !link_wait(err)) {
+        close();
+        return false;
+    }
+    return true;
+#else
+    (void) n_embd;
+    (void) n_ff;
+    (void) regions;
+    err = "GLM expert helper link: Linux only";
+    return false;
+#endif
+}
+
+bool GlmExpertHelper::link_post(std::string& err) {
+    if (ctl_ == nullptr || child_ < 0) {
+        err = "GLM expert helper link: the helper program is gone";
+        return false;
+    }
+    ctl_->req.store(++seq_, std::memory_order_release);
+    return true;
+}
+
+bool GlmExpertHelper::link_wait(std::string& err) {
+#ifdef __linux__
+    if (ctl_ == nullptr) {
+        err = "GLM expert helper link: not open";
+        return false;
+    }
+    for (uint64_t spin = 0;; ++spin) {
+        if (ctl_->rep.load(std::memory_order_acquire) == seq_) break;
+        if ((spin & 0xffff) == 0xffff) {
+            int st = 0;
+            if (child_ < 0 || waitpid(child_, &st, WNOHANG) == child_) {
+                child_ = -1;
+                err = "GLM expert helper link: the helper program ended";
+                return false;
+            }
+            if (spin > (1ull << 22)) std::this_thread::yield();
+        }
+#if defined(__x86_64__)
+        __builtin_ia32_pause();
+#endif
+    }
+    if (ctl_->status != 0) {
+        ctl_->err[sizeof ctl_->err - 1] = '\0';
+        err = std::string("GLM expert helper link: ") + ctl_->err;
+        return false;
+    }
+    return true;
+#else
+    err = "GLM expert helper link: Linux only";
+    return false;
+#endif
+}
+
+void GlmExpertHelper::close_link() {
+#ifdef __linux__
+    if (ctl_ != nullptr && child_ >= 0) {
+        ctl_->op = hlink::kQuit;
+        ctl_->req.store(++seq_, std::memory_order_release);
+        for (int i = 0; i < 250; ++i) {   // (5 s, then it is stopped)
+            int st = 0;
+            if (waitpid(child_, &st, WNOHANG) == child_) {
+                child_ = -1;
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+        if (child_ >= 0) {
+            kill(child_, SIGKILL);
+            int st = 0;
+            waitpid(child_, &st, 0);
+            child_ = -1;
+        }
+    }
+    if (ctl_ != nullptr) munmap(ctl_, sizeof(hlink::Ctl));
+    if (ctl_fd_ >= 0) ::close(ctl_fd_);
+#endif
+    ctl_ = nullptr;
+    ctl_fd_ = -1;
+    child_ = -1;
+    link_ = false;
+    integrated_ = false;
 }
 
 RemoteExperts::~RemoteExperts() { close(); }

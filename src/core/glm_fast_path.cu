@@ -20,6 +20,7 @@
 #include "glm_residual.hpp"   // glm-dsa B2.3
 #include "glm_tier_numa.hpp"   // glm-dsa B8.2-B8.4
 #include "strata/core/expert_cache.hpp"
+#include "strata/core/glm_helper_link.hpp"
 #include "strata/core/glm_model.hpp"
 #include "strata/core/glm_dsa_split.hpp"   // glm-dsa B6.3
 #include "strata/core/glm_dsa_spec.hpp"   // glm-dsa B11.2 / B11.3
@@ -2044,6 +2045,19 @@ bool Glm5Model::fast_setup(std::string& err) {
                         rl = {R.stride, F->L[(size_t) il2].gu_bytes, F->L[(size_t) il2].down_off, F->L[(size_t) il2].blob};
                         break;
                     }
+                // MAYA_GLM_EXPERT_HELPER=link: the tier in shared memory, which the helper program maps too
+                if (strata::core::hlink::wanted()) {
+                    const size_t bytes = (size_t) n * R.stride;
+                    if ((p = strata::core::hlink::shared_alloc(bytes)) != nullptr &&
+                        cudaHostRegister(p, bytes, cudaHostRegisterPortable | cudaHostRegisterMapped) == cudaSuccess) {
+                        R.registered = true;
+                        R.per_part = 0;
+                        break;
+                    }
+                    cudaGetLastError();
+                    err = "glm helper link: the shared RAM tier did not allocate or register";
+                    return false;
+                }
                 if ((p = numa_pinned((size_t) n * R.stride, rl.gu > 0 ? &rl : nullptr)) != nullptr) {   // (over every socket: numa_pinned)
                     R.registered = true;
                     R.per_part = 0;   // (one mapping)
@@ -2287,13 +2301,14 @@ bool Glm5Model::fast_helper_setup(std::string& err) {
     FastState* F = fast_;
     // the helper's device is its own: not this part's, nor any part's of a layer split (each part opens its own
     // helper there - an integrated one aliases this part's RAM tier - over its own layers [l0_, lt_))
-    const int device = std::atoi(getenv("MAYA_GLM_EXPERT_HELPER"));
+    const int device = strata::core::hlink::wanted() ? strata::core::GlmExpertHelper::kLinkDevice
+                                                     : std::atoi(getenv("MAYA_GLM_EXPERT_HELPER"));
     const bool a_part = device == dev_ || std::find(split_devs_.begin(), split_devs_.end(), device) != split_devs_.end();
     // an EXL3 pack's experts only with MAYA_GLM_HELPER_EXL3=1 (opt-in, as DS4_HELPER_EXL3): the helper then owns the
     // mul1 (cb 2) layers' experts - those the CPU lane's kernel takes, whose answer the device adds (cpu_fmt below)
     const char* hx = getenv("MAYA_GLM_HELPER_EXL3");
     const bool exl3_helper = exl3_ && hx != nullptr && std::strcmp(hx, "1") == 0;
-    if (a_part || (exl3_ && !exl3_helper) || g_.n_embd > 4096 || g_.n_exp_used > 8) {
+    if (a_part || (exl3_ && !exl3_helper) || g_.n_embd > (device == strata::core::GlmExpertHelper::kLinkDevice ? 8192 : 4096) || g_.n_exp_used > 8) {
         err = "GLM expert helper: a device of its own (not a trunk GPU or a part of the split) and native GGUF experts "
               "(up to 8 per route)";
         return false;
@@ -5304,7 +5319,7 @@ void Glm5Model::fast_service() {
                             F->helper_failed.store(true, std::memory_order_release);
                         }
                     }
-                    float cpu_part[4096];
+                    float cpu_part[gf::kMaxEmbd];
                     uint64_t lane_us = 0;
                     if (ne > 0) {
                         const auto cpu_t0 = std::chrono::steady_clock::now();
@@ -5350,7 +5365,7 @@ void Glm5Model::fast_service() {
                     // Quantize on the CPU only when this route actually has CPU fallback.
                     if (ne > 0) {
                         const auto cpu_t0 = std::chrono::steady_clock::now();
-                        float cpu_part[4096];
+                        float cpu_part[gf::kMaxEmbd];
                         fast_cpu_experts(rq->layer, ne, blob, w, rq->x, cpu_part);
                         for (int j = 0; j < g.n_embd; ++j) ans->part[j] += cpu_part[j];
                         F->cpu_experts.fetch_add((uint64_t) ne, std::memory_order_relaxed);

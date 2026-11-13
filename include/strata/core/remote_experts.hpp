@@ -2,6 +2,7 @@
 
 #include "strata/core/expert_cache.hpp"
 #include "strata/core/expert_source.hpp"
+#include "strata/core/glm_helper_link.hpp"
 #include "strata/kernels/exl3.hpp"
 #include "strata/kernels/glm_fast.hpp"
 
@@ -69,6 +70,10 @@ public:
     double last_gpu_ms() const { return last_gpu_ms_; }
     void close();
     int device() const { return device_; }
+    /// MAYA_GLM_EXPERT_HELPER=link: the helper in a second program (glm_helper_link.hpp) - the device number the
+    /// lead passes to open() for it, and whether this helper is one
+    static constexpr int kLinkDevice = 99;
+    bool linked() const { return link_; }
 
 private:
     bool start(const strata::kernels::exl3::ExpertLayout* xl, int gu_type, int d_type, size_t down_off, float limit,
@@ -83,6 +88,15 @@ private:
         std::chrono::steady_clock::time_point t0{}, t1{};   // the enqueue's start and end
     };
     Pending pend_;
+    // the linked helper (a second program): its control block, its process, the last request's sequence
+    bool link_ = false;
+    hlink::Ctl* ctl_ = nullptr;
+    int ctl_fd_ = -1, child_ = -1;
+    uint32_t seq_ = 0;
+    bool open_link(int n_embd, int n_ff, const std::vector<std::pair<void*, size_t>>& regions, std::string& err);
+    bool link_post(std::string& err);            // sends the request the control block holds
+    bool link_wait(std::string& err);            // waits for its answer (status 0) or the program's end
+    void close_link();
     std::atomic<bool> pending_{false};   // a call (enqueue .. wait) or a replace holds the stream and the buffers
     double last_gpu_ms_ = -1.0;
     struct Region { const uint8_t* host; uint8_t* mapped; size_t bytes; };
