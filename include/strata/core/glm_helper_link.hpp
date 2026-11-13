@@ -50,6 +50,22 @@ struct PfLayout {
         bytes = at;
     }
 };
+// The exchange's slots: slot 0 = one layout for chunks up to cap tokens; slots 1 and 2 = two layouts for up to cap / 2
+// tokens each, side by side in the same bytes (the staggered prompt pipeline keeps one chunk half's layer in each
+// while the other's is computed).  base: the slot's first byte in the exchange.
+inline PfLayout pf_slot_layout(size_t cap_tokens, size_t n_embd, int slot, size_t* base) {
+    if (slot <= 0) {
+        *base = 0;
+        return PfLayout(cap_tokens, n_embd);
+    }
+    const PfLayout h(cap_tokens / 2, n_embd);
+    *base = (size_t) (slot - 1) * h.bytes;
+    return h;
+}
+inline size_t pf_exchange_bytes(size_t cap_tokens, size_t n_embd) {
+    const size_t one = PfLayout(cap_tokens, n_embd).bytes, two = 2 * PfLayout(cap_tokens / 2, n_embd).bytes;
+    return one > two ? one : two;
+}
 
 struct alignas(64) Ctl {
     uint32_t magic;
@@ -67,7 +83,7 @@ struct alignas(64) Ctl {
     float w[8];
     int64_t a, b, c, d;
     uint64_t host;                  // a pointer in the LEAD's address space (translated by the helper)
-    int32_t pf_T, pf_K, pf_n, pf_rows, pf_r0, pf_dsa, pf_nff, pf_pad;   // kPrompt: the layer's chunk (PfLayout)
+    int32_t pf_T, pf_K, pf_n, pf_rows, pf_r0, pf_dsa, pf_nff, pf_slot;   // kPrompt: the layer's chunk (PfLayout; pf_slot: pf_slot_layout)
     double pf_gpu_ms;               // kPrompt: the helper's time for it (host clock, ms)
     uint8_t pf_types[64];           // kOpen's answer: the ggml types the helper's prompt products cover (1 = yes)
     char err[512];

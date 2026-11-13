@@ -155,11 +155,14 @@ int main(int argc, char** argv) {
             const int pn = std::max(0, std::min(c->pf_n, hl::kPfMaxExperts));
             blobs.assign((size_t) pn, nullptr);
             if (xchg != nullptr) {
-                const uint64_t* lp = (const uint64_t*) (xchg + hl::PfLayout((size_t) xcap, (size_t) n_embd).keys);
+                size_t sb = 0;   // (the call's exchange slot: glm_helper_link.hpp pf_slot_layout)
+                const hl::PfLayout sl = hl::pf_slot_layout((size_t) xcap, (size_t) n_embd, c->pf_slot, &sb);
+                const uint64_t* lp = (const uint64_t*) (xchg + sb + sl.keys);
                 for (int j = 0; j < pn; ++j) blobs[(size_t) j] = mine(lp[j], 1);
             }
             ok = xchg != nullptr && h.pf_run(c->gu_type, c->d_type, (size_t) c->down_off, c->limit, c->pf_dsa != 0,
-                                             c->pf_T, c->pf_K, pn, c->pf_rows, c->pf_r0, blobs.data(), err);
+                                             c->pf_T, c->pf_K, pn, c->pf_rows, c->pf_r0, blobs.data(), err,
+                                             c->pf_slot);
             if (xchg == nullptr) err = "no prompt exchange";
             c->pf_gpu_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - p0).count();
             break;
