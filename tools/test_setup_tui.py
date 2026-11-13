@@ -63,6 +63,16 @@ class Streaming(unittest.TestCase):
 
 
 class Bridging(unittest.TestCase):
+    def test_back_history_ends_when_installation_work_begins(self):
+        with tempfile.TemporaryDirectory() as d:
+            b = Bridge(Path(d) / "setup.log")
+            b.thread = threading.current_thread()
+            b.answers = [(("choose", "Model?"), 3)]
+            self.assertTrue(b.can_go_back())
+            b.step(3, "Python packages")
+            self.assertFalse(b.can_go_back())
+            b.log.close()
+
     def test_after_the_screen_other_threads_print_and_the_setup_thread_stops(self):
         with tempfile.TemporaryDirectory() as d:
             b = Bridge(Path(d) / "setup.log")
@@ -258,6 +268,38 @@ class Screen(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(end, ("done", (2, 1, "y")))
         self.assertEqual([t for _, k, t in bridge.entries if k == "answer"],
                          ["  Context? 3) 64K tokens", "  Model? 2) Maya-L", "  Download them now? y"])
+
+    async def test_escape_from_qwen_files_returns_to_model_families(self):
+        a = SimpleNamespace(model=None, gguf_dir=None, draft=None, model_dir=None, yes=False)
+
+        def body():
+            family = maya.choose_family(a, {})
+            return family, maya.choose_qwen_quant(a, {}) if family == "qwen" else None
+
+        bridge = Bridge(self.log)
+        S.UI = bridge
+        app = T.SetupApp(bridge, body, "1.0", "./maya.sh", self.log)
+        async with app.run_test(size=(110, 40)) as pilot:
+            async def until(question):
+                t0 = time.time()
+                while app.pending is None or question not in str(app.query_one("#ask").border_title):
+                    self.assertLess(time.time() - t0, 20)
+                    await pilot.pause(0.02)
+
+            with patch.object(maya.S, "gpus", return_value=[]), patch.object(maya, "mem_gb", return_value=(189, 170)):
+                await until("Model?")
+                await pilot.press("escape")                # no earlier question yet
+                self.assertIn("Model?", str(app.query_one("#ask").border_title))
+                await pilot.press("4")
+                await until("Which Qwen3.8-Flash-Next?")
+                await pilot.press("escape")
+                await until("Model?")
+                self.assertEqual(app.query_one("#options").highlighted, 3)
+                await pilot.press("2")                   # change the family after going back
+                while app.return_value is None:
+                    await pilot.pause(0.02)
+        self.assertEqual(app.return_value, ("done", ("deepseek", None)))
+        bridge.log.close()
 
     async def test_the_line_under_the_logo_names_the_model_once_it_is_known(self):
         seen, real = [], T.splash

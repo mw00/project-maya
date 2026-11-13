@@ -27,7 +27,7 @@ from textual.containers import Center, Horizontal, Vertical
 from textual.widgets import OptionList, RichLog, Static
 from textual.widgets.option_list import Option
 
-from setup_bridge import TAIL, Bridge, curl_meter, describe
+from setup_bridge import TAIL, BackRequested, Bridge, curl_meter, describe
 from setup_dash import Dashboard
 from setup_look import (ACCENT, ACCENT_TEXT, DANGER, EDGE, FAINT, INK, LINE, MUTED, OK, OK_TEXT, SETUP_CSS, THEME,
                         TINT, Card, Output, StopScreen, clock, hints, serving_card, setup_card, splash, styled, title)
@@ -68,7 +68,7 @@ class SetupApp(App):
                 Binding("ctrl+q", "stop", show=False, priority=True),
                 Binding("tab", "browse(1)", show=False, priority=True),
                 Binding("shift+tab", "browse(-1)", show=False, priority=True),
-                Binding("escape", "live", show=False)]
+                Binding("escape", "back", show=False)]
     ENABLE_COMMAND_PALETTE = False
     TITLE = "Project Maya"
 
@@ -176,14 +176,18 @@ class SetupApp(App):
 
     def work(self) -> None:
         """The setup's thread: maya.py's set_up, then the screen closes."""
-        try:
-            end = ("done", self.body())
-        except KeyboardInterrupt:
-            end = ("stopped", None)
-        except SystemExit as e:
-            end = ("fail", self.bridge.failure or (f"the setup ended (exit {e.code})", None))
-        except BaseException as e:                     # noqa: BLE001 - a bug: raised again once the screen is gone
-            end = ("error", e)
+        while True:
+            try:
+                end = ("done", self.body())
+            except BackRequested:
+                continue
+            except KeyboardInterrupt:
+                end = ("stopped", None)
+            except SystemExit as e:
+                end = ("fail", self.bridge.failure or (f"the setup ended (exit {e.code})", None))
+            except BaseException as e:                 # noqa: BLE001 - a bug: raised again once the screen is gone
+                end = ("error", e)
+            break
         self.bridge.events.put(("end", end))
 
     # ---------------------------------------------------------------------------------------- the setup's events
@@ -457,9 +461,16 @@ class SetupApp(App):
         pick = seen[(at + by) % len(seen)]
         self.show_view(None if pick == self.cur else pick)
 
-    def action_live(self) -> None:
+    def action_back(self) -> None:
         if self.view is not None:
             self.show_view(None)
+        elif self.pending is not None and self.pending[2] != "fail" and not isinstance(self.screen, StopScreen):
+            if self.bridge.go_back(self.pending[0]):
+                self.pending = None
+                self.query_one("#ask").remove_class("on")
+                self.screen.remove_class("asking")
+                self.query_one("#splash", Static).update(splash())
+                self.show_keys()
 
     def show_view(self, view) -> None:
         """The output of a step, or Maya's log - or (None) the live page: the setup's, then Maya's dashboard."""
@@ -541,7 +552,8 @@ class SetupApp(App):
         live, maya = self.view is None, self.serving is not None
         keys += [("↑↓", "Scroll")] * (maya and live) + \
             [("Tab", "Log" if maya and live else "Steps" if self.steps else "Dashboard")] + \
-            ([] if live or not self.steps else [("Esc", "Dashboard" if maya else "Live")]) + \
+            ([("Esc", "Dashboard" if maya else "Live")] if not live and self.steps else
+             [("Esc", "Back")] if live and kind and kind != "fail" and self.bridge.can_go_back() else []) + \
             [("Ctrl+C", "Stop Maya" if maya else "Stop")]
         self.query_one("#main").border_subtitle = hints(*keys)
 

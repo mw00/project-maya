@@ -72,9 +72,8 @@ class Names(unittest.TestCase):
         with patch.object(maya, "choose", pick), patch.object(maya.S, "gpus", return_value=[]):
             maya.choose_family(a, {})
         (label, note, about) = rows[3]
-        self.assertEqual(label, "Qwen-3.8-Flash-Next (CYBER-FROST) · Q5_K_M (113 GB)")
-        self.assertTrue(about.startswith("Qwen-3.8-Flash-Next (CYBER-FROST): 180B"), about)
-        self.assertNotIn("CYBER-FROST-3.8-PS", about)
+        self.assertEqual(label, "Qwen-3.8-Flash-Next")
+        self.assertTrue(about.startswith("Qwen3.8-Flash-Next: 180B"), about)
         self.assertIn("UD-Q8_K_XL", rows[1][2])
         self.assertNotIn("UD-Q4_K_XL", rows[1][2])
 

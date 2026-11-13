@@ -17,6 +17,10 @@ from concurrent.futures import Future
 from pathlib import Path
 
 TAIL = 40                                               # the output lines a summary keeps of a step that stopped
+
+
+class BackRequested(Exception):
+    """The user returned to an earlier setup choice; restart the choice flow."""
 # the GLM engine's start, in its log: each GPU's expert tiers warmed up in turn - "glm fast: CUDA2 warming the expert
 # tiers 40% (5.4 of 13.4 GB, 11 s)", then "glm fast: CUDA2 tiers warm: 1152 experts (13.4 GB) in 29 s"
 WARMING = re.compile(r"glm fast: (\S+?)(\d+) warming the expert tiers \d+% \(([\d.]+) of ([\d.]+) GB")
@@ -118,6 +122,9 @@ class Bridge:
         self.interrupted: subprocess.Popen | None = None   # the one a stop interrupted
         self.stopped = threading.Event()
         self.closed = False
+        self.answers: list = []                          # choices made before downloads/builds begin
+        self.replay: list = []                           # answers before the question Esc returned to
+        self.reopen = None                               # that question's old answer, for its highlighted default
 
     def _here(self) -> bool:
         if threading.current_thread() is self.thread:
@@ -131,9 +138,39 @@ class Bridge:
         self.log.write(("\n" if kind == "step" else "") + text + "\n")
 
     def _wait(self, *event):
+        key = (event[0], event[1]) if event[0] in ("ask", "choose") else None
+        if key is not None and self.step_no < 3:
+            if self.replay:
+                old_key, answer = self.replay.pop(0)
+                if old_key == key:
+                    self.answers.append((key, answer))
+                    return answer
+                self.replay.clear()                     # the new model has a different question sequence
+            if self.reopen is not None:
+                old_key, answer = self.reopen
+                self.reopen = None
+                valid = answer in (event[2] if event[0] == "ask" else range(len(event[3])))
+                if old_key == key and valid:
+                    event = list(event)
+                    event[3 if event[0] == "ask" else 4] = answer
         fut = Future()
         self.events.put((*event, fut))
-        return fut.result()                             # the screen's answer; a stop raises KeyboardInterrupt here
+        answer = fut.result()                            # a stop/back raises in the setup's thread
+        if key is not None and self.step_no < 3:
+            self.answers.append((key, answer))
+        return answer
+
+    def can_go_back(self) -> bool:
+        return self.step_no < 3 and bool(self.answers)
+
+    def go_back(self, fut: Future) -> bool:
+        """Wake the waiting setup thread, then replay earlier answers and ask the preceding question again."""
+        if not self.can_go_back():
+            return False
+        self.replay, self.reopen = self.answers[:-1], self.answers[-1]
+        self.answers = []
+        fut.set_exception(BackRequested())
+        return True
 
     def _emit(self, event: tuple, text: str | None = None) -> bool:
         """`event` for the screen, `text` (the line printed without it) for the log and the summary."""
@@ -150,6 +187,10 @@ class Bridge:
     def step(self, n, title):
         if self._here():
             self.step_no = n
+            if n >= 3:                                  # do not replay setup after work has started
+                self.answers.clear()
+                self.replay.clear()
+                self.reopen = None
         return self._emit(("step", n, title), f"=== Step {n}: {title} ===")
 
     def model(self, name):
@@ -196,6 +237,9 @@ class Bridge:
         ends, however it ends), and on Windows in a job object that ends it with this process (setup.end_with_me)."""
         if not self._here():
             return None
+        self.answers.clear()                            # work has begun: earlier choices are no longer revisited
+        self.replay.clear()
+        self.reopen = None
         self.events.put(("run", cmd))
         own = {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if os.name == "nt" else {"start_new_session": True}
         if parent_pipe:
