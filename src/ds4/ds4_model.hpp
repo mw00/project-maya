@@ -397,6 +397,12 @@ public:
     /// says the numbers it went by.
     static int mixed_plan(const std::string& pack, int reserve_mib, double margin_gb, std::string& msg,
                           std::string& err);
+    /// DS4_SETTLE_IDLE_MS: whether the server should move experts while it waits for a request, after how many ms of
+    /// quiet, and one step of it (the engine's thread): true while moves are under way (call again soon)
+    bool settle_idle_on() const;
+    double settle_idle_quiet_ms() const;
+    bool settle_idle_step();
+    void settle_idle_end();   ///< (before a request) the moves under way finished while still idle
     const Stats& stats() const;
     std::string describe() const;
     /// INFO / VRAM lines for the server's Monitor.

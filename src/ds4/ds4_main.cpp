@@ -238,6 +238,15 @@ struct Lines {
         q.pop_front();
         return true;
     }
+    // next's, waiting at most ms: 1 a line, 0 none yet, -1 the end
+    int poll(std::string& l, double ms) {
+        std::unique_lock<std::mutex> lk(mu);
+        cv.wait_for(lk, std::chrono::microseconds((int64_t) (ms * 1000.0)), [&] { return !q.empty() || eof; });
+        if (q.empty()) return eof ? -1 : 0;
+        l = q.front();
+        q.pop_front();
+        return 1;
+    }
 };
 
 // DS4_PROF: the GPU's time a decoded token by stage between two snapshots - the CLI's run, or a serve request's
@@ -1879,7 +1888,22 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
     while (!multi) {   // one conversation: a request at a time
         end_if_broken();   // (the last request's DONE is out, on every path that ended it)
         g_busy.store(false);   // (waiting for a request: no watchdog)
-        if (!in.next(line) || line == "QUIT") break;
+        if (m.settle_idle_on()) {   // (DS4_SETTLE_IDLE_MS: after that long without a request, the experts the decode
+            const double quiet = m.settle_idle_quiet_ms(), t_idle = now_ms();   //  used lately moved into VRAM)
+            int got = 0;
+            for (;;) {
+                const double left = quiet - (now_ms() - t_idle);
+                if ((got = in.poll(line, left > 0 ? left : 2.0)) != 0) break;
+                if (now_ms() - t_idle >= quiet && !m.settle_idle_step()) {   // (nothing more to move: wait as before)
+                    got = in.next(line) ? 1 : -1;
+                    break;
+                }
+            }
+            m.settle_idle_end();   // (the moves under way finished before the request: a few ms at most)
+            if (got < 0 || line == "QUIT") break;
+        } else if (!in.next(line) || line == "QUIT") {
+            break;
+        }
         static const bool turn_trace = std::getenv("DS4_TURN_TRACE") != nullptr;   // (one line a request: this clock's times)
         const double tr_got = now_ms();
         double tr_first = 0;
