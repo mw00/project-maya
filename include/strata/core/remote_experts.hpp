@@ -82,6 +82,7 @@ public:
     int pf_cap() const { return pf_cap_; }
     bool pf_type_ok(int t) const { return link_ && ctl_ != nullptr && t >= 0 && t < 64 && ctl_->pf_types[t] != 0; }
     float* pf_x() const { return (float*) (pf_ + pf_lay_.x); }
+    const float* pf_out() const { return (const float*) (pf_ + pf_lay_.out); }   // (this process's mapping)
     const float* pf_out_dev() const { return (const float*) (pf_dev_ + pf_lay_.out); }
     int32_t* pf_pos() const { return (int32_t*) (pf_ + pf_lay_.pos); }
     float* pf_rw() const { return (float*) (pf_ + pf_lay_.rw); }
