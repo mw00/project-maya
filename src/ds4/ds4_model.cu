@@ -16227,7 +16227,20 @@ struct Model::Impl {
     // decode's check that streaming pays (LaneAB): a window's mean time with the split against the CPU lane alone;
     // the first window only warms up; 3% slower twice in a row: off (this kind of request streams nothing from then
     // on), twice not slower - faster or a tie: it keeps streaming, as it does when still undecided after 9 windows
-    // (pcie::ab_window, #697).  The times file keeps the verdict for the next start
+    // (pcie::ab_window, #697); a layer split: a tie turns it off (ab_tie_keeps).  The times file keeps the verdict for
+    // the next start
+    // one GPU: a tie in decode's checks keeps streaming (#697: there the lane's slots also carry the one-GPU decode
+    // path, which a written-off tie took away); several GPUs: the rule before #697 - 3% faster, else off (#956: on
+    // 2x RTX A4000 and 4x RTX 3090 a start with the lane off decoded 4-5% faster where the checks measured ties: the
+    // lane's cost when little streams falls on both of a check's turns).  DS4_STREAM_TIE=keep / off: either rule on
+    // any PC (A/B tests)
+    bool ab_tie_keeps() const {
+        static const int forced = [] {
+            const char* v = std::getenv("DS4_STREAM_TIE");
+            return v == nullptr ? -1 : std::strcmp(v, "keep") == 0 ? 1 : std::strcmp(v, "off") == 0 ? 0 : -1;
+        }();
+        return forced >= 0 ? forced == 1 : devs.size() <= 1;
+    }
     void lane_ab(LaneCls& C, int kind, bool split, double ms) {
         LaneAB& A = C.ab[kind];
         if (A.verdict != 0 || !(ms >= 0.0)) return;
@@ -16237,7 +16250,7 @@ struct Model::Impl {
         const double m0 = A.ms[0] / A.n[0], m1 = A.ms[1] / A.n[1], gain = 1.0 - m1 / m0;
         A.ms[0] = A.ms[1] = 0;
         A.n[0] = A.n[1] = 0;
-        A.verdict = pcie::ab_window(A.wins, A.good, A.bad, gain);   // (a tie keeps streaming: #697)
+        A.verdict = pcie::ab_window(A.wins, A.good, A.bad, gain, ab_tie_keeps());   // (see ab_tie_keeps)
         if (A.verdict == 0) return;
         std::fprintf(stderr, "ds4: PCIe lane: CUDA%d %s: decode measured the split against the CPU lane alone on "
                              "requests with %s: %.2f against %.2f ms (%+.1f%%) -> %s\n",
@@ -16258,7 +16271,8 @@ struct Model::Impl {
     // streaming allowed, or none (decoded tokens: the lane serves T == 1 steps only) - and their time a token decides with lane_ab's rule over windows of 64 tokens of each:
     // 3% slower twice in a row: none from then on, and the times file keeps it for the next start; twice not slower
     // (faster or a tie), or undecided after 9 windows: streaming stays (lane_ab decides the rest) - a tie is not written
-    // as off (pcie::ab_window, #697).  DS4_STREAM_TOKEN_AB=0: off (A/B tests)
+    // as off (pcie::ab_window, #697) on one GPU; a layer split: 3% faster or off, as before #697 (ab_tie_keeps, #956).
+    // DS4_STREAM_TOKEN_AB=0: off (A/B tests)
     struct TokAB {
         double ms[2] = {0, 0};
         int64_t n[2] = {0, 0};
@@ -16303,7 +16317,7 @@ struct Model::Impl {
         const double m0 = A.ms[0] / (double) A.n[0], m1 = A.ms[1] / (double) A.n[1], gain = 1.0 - m1 / m0;
         A.ms[0] = A.ms[1] = 0;
         A.n[0] = A.n[1] = 0;
-        A.verdict = pcie::ab_window(A.wins, A.good, A.bad, gain);   // (the first window warms up; a tie keeps it: #697)
+        A.verdict = pcie::ab_window(A.wins, A.good, A.bad, gain, ab_tie_keeps());   // (see ab_tie_keeps)
         if (A.verdict == 0) return;
         std::fprintf(stderr, "ds4: PCIe lane: decode measured whole steps with the split against the CPU lane alone: "
                              "%.2f against %.2f ms a token (%+.1f%%) -> %s\n", m1, m0, -100.0 * gain,
