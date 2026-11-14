@@ -1,3 +1,33 @@
+## What this changes
+
+Adds interactive setup for downloaded GGUF models, including directory/file browsing, editable model/drafter/vision selection, and Esc navigation.
+- Supports linking unlisted quants without copying weights or checking published sizes/SHA-256.
+- Adds DeepSeek and MiniMax GGUF DSpark/vision companions and distinct model IDs per quant.
+- Extends Qwen quantization support and fixes PLE precision and split-shard expert loading.
+- Supports both GLM vision formats, Q5_K DFlash2 selectors, and 256K/512K GLM context options.
+
+## Checks
+
+- [x] Builds on Linux/CUDA.
+- [x] Relevant automated tests pass.
+- [x] Local model setup documentation updated.
+
+### Tested models
+
+- [MiniMax-M3.1-Flash - Q2_K ](https://huggingface.co/smalinin/MiniMax-M3.1-Flash-Q2_K-GGUF)
+- [MiniMax-M3.1-Flash - Q3_K ]
+- [GLM-5.3 - UD-IQ3_XXS ](https://huggingface.co/unsloth/GLM-5.3-GGUF)
+- [GLM-5.3-Flash — UD-Q5_K_XL ](https://huggingface.co/unsloth/GLM-5.3-Flash-GGUF)
+- [GLM-5.3-Flash-Uncensored — Q4_K_M ](https://huggingface.co/orcarouter/GLM-5.3-Flash-Uncensored-GGUF/tree/main/Q4_K_M)
+- [DeepSeek-V4.1-Flash-1017 — IQ2_XXS ](https://huggingface.co/smalinin/DeepSeek-V4.1-Flash-1017-IQ2_XXS-GGUF/tree/main/IQ2_XXS_GU-Q2_K_Down-Q5)
+- [DeepSeek-V4.1-Flash-1017 — MXFP4]
+- [DeepSeek-V4.1-Flash-1017 — Q3_K]
+- [Qwen3.8-Flash-Next-Uncensored — Q8_0](https://huggingface.co/orcarouter/Qwen3.8-Flash-Next-Uncensored-GGUF)
+- [Qwen3.8-Flash-Next — Q8_0](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF/tree/main/Q8_0)
+
+
+
+<hr>
 <p align="center">English | <a href="README.ja.md">日本語</a> | <a href="README.zh-CN.md">简体中文</a> | <a href="README.pt-BR.md">Português</a></p>
 
 <p align="center"><img src="assets/maya-logo.png" width="128" alt="Maya logo"></p>
