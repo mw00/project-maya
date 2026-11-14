@@ -1526,6 +1526,15 @@ struct Model::Impl {
     std::atomic<int64_t> eg_pf_rows_n{0}, eg_pf_hits_n{0}, eg_pf_reads_n{0}, eg_pf_wait_ns{0}, eg_pf_io_ns{0};
     uint16_t* h_emb = nullptr;        // the window's embedding rows
     std::vector<float> c_xh, c_xsb, c_acc, c_xhd, c_xsd, c_accd, c_yd;
+    // the IQ flow's counters (DS4_IQ_FLOW): a call's [slot][block] h-block counts, a slot's blocks-done counts and
+    // the window tokens' x-quantize flags - reused across calls, zeroed by every one
+    std::unique_ptr<std::atomic<int>[]> iq_fc;   // grown once to (kSlots * (nbh + 1) + kWin), zeroed every call
+    size_t iq_fc_n = 0;
+    // the IQ path's own (DS4_CPU_STATS): how many calls, experts and rows it saw (the calling thread's), the whole
+    // call's jobs' times summed (x rows, gate / up, down) and each call's wall
+    long iq_calls = 0, iq_ents_n = 0, iq_rows_n = 0;
+    std::atomic<uint64_t> iq_call_ns{}, iq_gu_ns{}, iq_dn_ns{}, iq_xq_ns{}, iq_gu_n{}, iq_dn_n{}, iq_xq_n{};
+    long iq_flo_chk_ok = 0;   // (DS4_IQ_FLOW_CHECK: the flow's calls whose per-call compare came back clean)
     Exl3Lane lane_x;                            // (cpu_experts' view of them, ds4_cpu_exl3.hpp)
     // the state
     int64_t pos = 0;
@@ -11175,7 +11184,16 @@ struct Model::Impl {
     // (DS4_LANE_PARITY: the device's arithmetic instead, cpu_experts_par, where the layer's types have its rows)
     void cpu_experts_iq(const Layer& l, const float* x, const std::vector<Ent>& ents, size_t ldx, const int* ord) {
         if (lane_par_layer(l)) return cpu_experts_par(l, x, ents, ldx, ord);
-        constexpr int RB = 64;   // rows a job
+        // rows a job (DS4_IQ_RB, default 64): the gate / up and down jobs' row counts.  A row's sum is one
+        // job's work whatever the rows a job, and the flow's per-block counters (bexp below) count job
+        // contributions generically, so the outputs are the same bits for any RB; only the balance changes
+        static const int RB = [] {
+            const char* v = ds4_env("DS4_IQ_RB");
+            int r = v != nullptr && v[0] != '\0' ? std::atoi(v) : 64;
+            if (r < 16) r = 16;
+            if (r > 256) r = 256;
+            return r;
+        }();
         const int E = g.dim, FF = g.ff, FFh = FF / NH, Eh = E / NH;
         const int GB = (FFh + RB - 1) / RB, DB = (Eh + RB - 1) / RB, ne = (int) ents.size();
         gg::IqCpu fm;
@@ -11208,6 +11226,237 @@ struct Model::Impl {
             const int t = en.tok[i];
             return aq + (size_t) (t < kWin ? t : kWin + en.slot0 + i) * E * 4;
         };
+        {
+            bool done[kWin] = {};
+            for (const Ent& en : ents)
+                for (int i = 0; i < en.n; ++i) {
+                    const int t = en.tok[i];
+                    if (t < kWin && done[t]) continue;
+                    if (t < kWin) done[t] = true;
+                    gg::iq_cpu_quant(fm.gu_act, x + (size_t) t * ldx, E, x_act(en, i));
+                }
+        }
+
+        // ---- the flow (DS4_IQ_FLOW, on by default): one batch a call instead of two barriers and two serial quant
+        // steps.  Each node's job list walks the tokens' x quantizes first (node 0's, deduped; the other nodes' first
+        // jobs are nothing), then the gate / up jobs, then the down jobs; counts between the jobs stand in for the
+        // barriers:
+        //  * an x job quantizes a deduped window token's rows (its count goes 2; a gate / up job spins to it before
+        //    its first dot reads the token - tiny rows, so nothing waits long),
+        //  * a gate / up job computes the rows it always did (one job's sums either way), then counts itself in for
+        //    every 256-value block of h its rows touch; the last of a block's jobs quantizes that block into the
+        //    down's input row - a Q8_K block takes its own max, so the block form is the row quantize byte for byte.
+        //    A block can straddle the two nodes' parts (FFh = 1152: block 4), so its count comes from both nodes.
+        //  * a down job waits only for its own slots' h blocks (all `nbh` of them), then the rows it always did.
+        //  DS4_CPU_STATS: the x and gate / up jobs count into phase 0, the down jobs into phase 1 (their summed
+        //  times only - a phase's wall time in the steps is its barrier's, which this path has none of).
+        //  The code below is the fallback for what this cannot take (h not whole 256-value blocks, another
+        //  activation, a token past the window): the two barriers and the serial phases as before.
+        static const bool stats = std::getenv("DS4_CPU_STATS") != nullptr;
+        static const bool flow_on = [] {
+            const char* v = ds4_env("DS4_IQ_FLOW");
+            return v == nullptr || std::atoi(v) != 0;
+        }();
+        const int nbh = FF / 256;   // h's Q8_K blocks a slot row
+        const size_t bb = gg::iq_cpu_act_block_bytes(fm.d_act);   // one block's bytes (292 for Q8_K)
+        bool all_in = flow_on && nbh >= 1 && nbh * 256 == FF && nbh <= 64 && bb == 292 &&
+                      gg::iq_cpu_act_q8k(fm.d_act) && gg::iq_cpu_act_q8k(fm.gu_act) && ne > 0;
+        for (const Ent& en : ents)
+            for (int i = 0; i < en.n && all_in; ++i) all_in = en.tok[i] >= 0 && en.tok[i] < kWin;
+        if (all_in) {
+            // counters: a slot's h blocks (kSlots * nbh), a slot's blocks done (kSlots), a token's x done (kWin);
+            // a job that leaves rows behind adds 1 to its counts, the jobs that use them spin to their sums
+            const size_t cneed = (size_t) kSlots * (nbh + 1) + kWin;
+            if (iq_fc_n < cneed) {   // (grown once; every element zeroed by this call before use)
+                iq_fc.reset(new std::atomic<int>[cneed]);
+                iq_fc_n = cneed;
+            }
+            for (size_t i = 0; i < cneed; ++i) iq_fc[i].store(0, std::memory_order_relaxed);
+            std::atomic<int>* B = iq_fc.get();                 // slot s's block b: B[s * nbh + b]
+            std::atomic<int>* Dn = B + (size_t) kSlots * nbh;  // slot s's h blocks quantized: Dn[s]
+            std::atomic<int>* Fx = Dn + kSlots;                // token t's x rows quantized: Fx[t]
+            int ut[kWin], nut = 0;   // the tokens' x rows: one deduped token a job (the serial loop's done[])
+            {
+                bool seen[kWin] = {};
+                for (const Ent& en : ents)
+                    for (int i = 0; i < en.n; ++i)
+                        if (!seen[en.tok[i]]) {
+                            seen[en.tok[i]] = true;
+                            ut[nut++] = en.tok[i];
+                        }
+            }
+            int bexp[64];   // how many (node, job) pairs touch each block of h; every slot the same counts
+            for (int b = 0; b < nbh; ++b) bexp[b] = 0;
+            for (int X = 0; X < NH; ++X)
+                for (int j = 0; j < GB; ++j) {
+                    const int lo = X * FFh + j * RB, hi = std::min(X * FFh + FFh, lo + RB);
+                    for (int b = lo / 256; b <= (hi - 1) / 256 && b < nbh; ++b) ++bexp[b];
+                }
+            const int Jg = ne * GB, Jd = ne * DB, Jt = nut;
+            std::function<void(int)> fj[4];
+            for (int X = 0; X < NH; ++X)
+                fj[X] = [&, X, B, Dn, Fx, ut, bexp](int j) {
+                    const double t0 = stats ? now_ms() : 0.0;
+                    int ph = 0;
+                    if (j < Jt) {   // token ut[j]'s x rows (node 0's jobs; the others' first Jt are nothing)
+                        if (X == 0) {
+                            const int t = ut[j];
+                            gg::iq_cpu_quant(fm.gu_act, x + (size_t) t * ldx, E, aq + (size_t) t * E * 4);
+                            Fx[t].store(2, std::memory_order_release);
+                        }
+                    } else {
+                        int jj = j - Jt;
+                        if (jj < Jg) {   // the gate / up rows, then every 256-block of h their range touches
+                            const Ent& en = ents[(size_t) (ord != nullptr ? ord[jj / GB] : jj / GB)];
+                            const int r0 = X * FFh + (jj % GB) * RB, r1 = std::min(X * FFh + FFh, r0 + RB);
+                            const void* ap[gg::kMxCpuMaxN];
+                            float* hp[gg::kMxCpuMaxN];
+                            for (int i = 0; i < en.n; ++i) {
+                                while (Fx[en.tok[i]].load(std::memory_order_acquire) < 2) cpu_relax();
+                                ap[i] = x_act(en, i);
+                            }
+                            for (int i = 0; i < en.n; ++i)
+                                hp[i] = c_xhd.data() + (size_t) (en.slot0 + i) * FF + (size_t) X * FFh;
+                            // (part X's rows, from where they are: a copy's part on node X, or the file's - whole
+                            // rows, so any block size of the type)
+                            gg::iq_cpu_gate_up(fm, ent_part(l, en, 0, X), ent_part(l, en, 1, X), ap, en.n, hp,
+                                               r0 - X * FFh, r1 - X * FFh, lim);
+                            for (int i = 0; i < en.n; ++i) {
+                                const int s = en.slot0 + i;
+                                std::atomic<int>* Bs = B + (size_t) s * nbh;
+                                for (int b = r0 / 256; b <= (r1 - 1) / 256 && b < nbh; ++b)
+                                    if (Bs[b].fetch_add(1, std::memory_order_acq_rel) == bexp[b] - 1) {
+                                        // the block's last contributor quantizes it: a Q8_K block of 256 values
+                                        // (the floats' own amax scale, the int8s, their pair sums) at `bb` a block
+                                        gg::iq_cpu_quant(fm.d_act, c_xhd.data() + (size_t) s * FF + (size_t) b * 256, 256,
+                                                         aq + (size_t) (kWin + s) * E * 4 + (size_t) b * bb);
+                                        Dn[s].fetch_add(1, std::memory_order_acq_rel);
+                                    }
+                            }
+                        } else {   // the down rows, each waiting for its own slots' h blocks
+                            jj -= Jg;
+                            ph = 1;
+                            const Ent& en = ents[(size_t) (ord != nullptr ? ord[jj / DB] : jj / DB)];
+                            const int r0 = X * Eh + (jj % DB) * RB, r1 = std::min(X * Eh + Eh, r0 + RB);
+                            const void* hp[gg::kMxCpuMaxN];
+                            float* yp[gg::kMxCpuMaxN];
+                            for (int i = 0; i < en.n; ++i) {
+                                const int s = en.slot0 + i;
+                                while (Dn[s].load(std::memory_order_acquire) < nbh) cpu_relax();
+                                hp[i] = aq + (size_t) (kWin + s) * E * 4;
+                            }
+                            for (int i = 0; i < en.n; ++i)
+                                yp[i] = c_yd.data() + (size_t) (en.slot0 + i) * E + (size_t) X * Eh;
+                            gg::iq_cpu_down(fm, ent_part(l, en, 2, X), hp, en.n, yp, r0 - X * Eh, r1 - X * Eh);
+                        }
+                    }
+                    if (stats) {   // (the jobs' own times; a call's wall is iq_call_ns)
+                        const uint64_t ns = (uint64_t) ((now_ms() - t0) * 1e6);
+                        (ph == 1 ? iq_dn_ns : j < Jt ? iq_xq_ns : iq_gu_ns).fetch_add(ns, std::memory_order_relaxed);
+                        (ph == 1 ? iq_dn_n : j < Jt ? iq_xq_n : iq_gu_n).fetch_add(1, std::memory_order_relaxed);
+                    }
+                };
+            const double tc = stats ? now_ms() : 0.0;
+            run_nodes(Jt + Jg + Jd, fj);
+            if (stats) {   // (this thread runs the lane's calls one at a time)
+                ++iq_calls;
+                iq_call_ns.fetch_add((uint64_t) ((now_ms() - tc) * 1e6), std::memory_order_relaxed);
+                iq_ents_n += (long) ents.size();
+                for (const Ent& en : ents) iq_rows_n += (long) en.n;
+            }
+            // ---- DS4_IQ_FLOW_CHECK=1: the flow's outputs of THIS call against the two-barrier steps, bit for
+            // bit: snapshot every slot's h and yd rows, quantize the x rows again (the same floats, the same
+            // quantize), run the serial phases into the same buffers, and compare every byte.  The buffers
+            // end as the flow's either way: a byte that differs is counted and restored from the snapshot,
+            // and reported with the profile's save.  The check path costs the serial phases again a call.
+            static const bool flo_chk = std::getenv("DS4_IQ_FLOW_CHECK") != nullptr &&
+                                        std::atoi(std::getenv("DS4_IQ_FLOW_CHECK")) != 0;
+            if (flo_chk) {
+                int rows = 0;
+                for (const Ent& en : ents) rows = std::max(rows, en.slot0 + en.n);
+                std::vector<float> iq_yd((size_t) rows * E);
+                std::memcpy(iq_yd.data(), c_yd.data(), iq_yd.size() * 4);
+                std::vector<uint8_t> iq_hq((size_t) rows * fm.h_bytes);
+                for (const Ent& en : ents)
+                    for (int i = 0; i < en.n; ++i)
+                        std::memcpy(iq_hq.data() + (size_t) (en.slot0 + i) * fm.h_bytes,
+                                    aq + (size_t) (kWin + en.slot0 + i) * E * 4, fm.h_bytes);
+                {
+                    bool done[kWin] = {};
+                    for (const Ent& en : ents)
+                        for (int i = 0; i < en.n; ++i) {
+                            const int t = en.tok[i];
+                            if (t < kWin && done[t]) continue;
+                            if (t < kWin) done[t] = true;
+                            gg::iq_cpu_quant(fm.gu_act, x + (size_t) t * ldx, E, x_act(en, i));
+                        }
+                }
+                // the gate / up phase, across the pools the same way the steps run it: node X its rows
+                std::function<void(int)> fc[4];
+                for (int X = 0; X < NH; ++X)
+                    fc[X] = [&, X](int j) {
+                        const Ent& en = ents[(size_t) (ord != nullptr ? ord[j / GB] : j / GB)];
+                        const int r0 = X * FFh + (j % GB) * RB, r1 = std::min(X * FFh + FFh, r0 + RB);
+                        const void* ap[gg::kMxCpuMaxN];
+                        float* hp[gg::kMxCpuMaxN];
+                        for (int i = 0; i < en.n; ++i) {
+                            ap[i] = x_act(en, i);
+                            hp[i] = c_xhd.data() + (size_t) (en.slot0 + i) * FF + (size_t) X * FFh;
+                        }
+                        gg::iq_cpu_gate_up(fm, ent_part(l, en, 0, X), ent_part(l, en, 1, X), ap, en.n, hp,
+                                           r0 - X * FFh, r1 - X * FFh, lim);
+                    };
+                run_nodes(ne * GB, fc);
+                for (const Ent& en : ents)
+                    for (int i = 0; i < en.n; ++i)
+                        gg::iq_cpu_quant(fm.d_act, c_xhd.data() + (size_t) (en.slot0 + i) * FF, FF,
+                                         aq + (size_t) (kWin + en.slot0 + i) * E * 4);
+                for (int X = 0; X < NH; ++X)
+                    fc[X] = [&, X](int j) {
+                        const Ent& en = ents[(size_t) (ord != nullptr ? ord[j / DB] : j / DB)];
+                        const int r0 = X * Eh + (j % DB) * RB, r1 = std::min(X * Eh + Eh, r0 + RB);
+                        const void* hp[gg::kMxCpuMaxN];
+                        float* yp[gg::kMxCpuMaxN];
+                        for (int i = 0; i < en.n; ++i) {
+                            hp[i] = aq + (size_t) (kWin + en.slot0 + i) * E * 4;
+                            yp[i] = c_yd.data() + (size_t) (en.slot0 + i) * E + (size_t) X * Eh;
+                        }
+                        gg::iq_cpu_down(fm, ent_part(l, en, 2, X), hp, en.n, yp, r0 - X * Eh, r1 - X * Eh);
+                    };
+                run_nodes(ne * DB, fc);
+                // the compare: every slot's h bytes and yd row, bank against bank
+                int dbad = 0, hbad = 0, dfirst = -1;
+                for (const Ent& en : ents)
+                    for (int i = 0; i < en.n; ++i) {
+                        const int s = en.slot0 + i;
+                        const uint8_t* got_hq = aq + (size_t) (kWin + s) * E * 4;
+                        for (size_t o = 0; o < fm.h_bytes && hbad < 4; ++o)
+                            if (iq_hq[(size_t) s * fm.h_bytes + o] != got_hq[o]) {
+                                ++hbad;
+                                if (hbad == 1) std::fprintf(stderr, "  first h byte diff: slot %d offset %zu\n", s, o);
+                            }
+                        for (int e = 0; e < E; ++e)
+                            if (std::memcmp(&iq_yd[(size_t) s * E + e], &c_yd[(size_t) s * E + e], 4) != 0) {
+                                ++dbad;
+                                if (dfirst < 0) dfirst = e;
+                            }
+                    }
+                if (hbad || dbad) {
+                    std::fprintf(stderr, "ds4: IQ flow check FAILED: %ld calls ok, %d slots' h bytes differ, "
+                                         "%d outputs differ (first row column %d) - restoring the flow's bytes and "
+                                         "\n", iq_flo_chk_ok, hbad, dbad, dfirst);
+                    std::fflush(stderr);
+                    std::abort();
+                }
+                ++iq_flo_chk_ok;
+                for (const Ent& en : ents)   // (restore the flow's own outputs: the steps' equal them, so this
+                    for (int i = 0; i < en.n; ++i)   //  is for the next call's snapshot integrity)
+                        std::memcpy(aq + (size_t) (kWin + en.slot0 + i) * E * 4,
+                                    iq_hq.data() + (size_t) (en.slot0 + i) * fm.h_bytes, fm.h_bytes);
+                std::memcpy(c_yd.data(), iq_yd.data(), iq_yd.size() * 4);
+            }
+            return;
+        }
         {
             bool done[kWin] = {};
             for (const Ent& en : ents)
@@ -22998,6 +23247,18 @@ struct Model::Impl {
     }
 
     void save_profile() const {
+        if (std::getenv("DS4_CPU_STATS") != nullptr && iq_calls > 0)
+            std::fprintf(stderr, "CPU lane iq flow: %ld calls, %.2f experts and %.2f rows a call; jobs a call: x %.1f, "
+                                 "gate/up %.1f, down %.1f; us a job: x %.1f, gate/up %.1f, down %.1f; wall %.3f ms a "
+                                 "call\n", iq_calls, (double) iq_ents_n / iq_calls, (double) iq_rows_n / iq_calls,
+                         (double) iq_xq_n.load() / iq_calls, (double) iq_gu_n.load() / iq_calls,
+                         (double) iq_dn_n.load() / iq_calls, (double) iq_xq_ns.load() / 1e3 / std::max(1l, (long) iq_xq_n.load()),
+                         (double) iq_gu_ns.load() / 1e3 / std::max(1l, (long) iq_gu_n.load()),
+                         (double) iq_dn_ns.load() / 1e3 / std::max(1l, (long) iq_dn_n.load()),
+                         (double) iq_call_ns.load() / 1e6 / iq_calls);
+        if (std::getenv("DS4_CPU_STATS") != nullptr && iq_flo_chk_ok > 0)
+            std::fprintf(stderr, "CPU lane iq flow check: %ld calls matched the two-barrier steps bit for bit\n",
+                         iq_flo_chk_ok);
         if (std::getenv("DS4_CPU_STATS") != nullptr && cpu_calls > 0)
             std::fprintf(stderr, "CPU lane: %ld calls, %.2f experts and %.2f rows a call; per call: gate/up %.3f ms, "
                                  "bands %.3f, down %.3f, down bands %.3f\n", cpu_calls, (double) cpu_ents / cpu_calls,

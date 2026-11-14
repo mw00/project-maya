@@ -27,6 +27,11 @@
 #include <thread>
 #include <vector>
 
+#if !defined(_WIN32)
+#include <sched.h>
+#include <sys/mman.h>
+#endif
+
 namespace gg = strata::ds4::gguf;
 namespace pcie = strata::ds4::pcie;
 using strata::ds4::Pool;
@@ -96,12 +101,112 @@ void fill(Experts& X, uint64_t seed) {
         }
 }
 
+void fill(const Experts& X, uint64_t seed);   // (defined above - the master copy the numa layout copies from)
+
+// --numa: the same experts, their matrices split by rows across the two sockets the way the engine's RAM copies hold
+// them: node X's buffer holds gate rows [X FF/2, ..) then the up's, then the down rows [X E/2, ..) - one freshly
+// mmap'd buffer per node, every page first-touched by a thread pinned to that node, the values copied from the
+// one-buffer master above (so the two layouts hold exactly the same weights and their outputs can be compared)
+struct NumaExperts {
+    Fmt f;
+    int n = 0;
+    uint8_t* part[2] = {};   // node X's rows of all experts' three matrices back to back
+    size_t ebytes = 0;       // one expert's part: 2 x (FF/2 x gr) + (E/2 x dr)
+    size_t pbytes = 0;       // the whole buffer: n x ebytes
+    ~NumaExperts() {
+        for (int px = 0; px < 2; ++px)
+            if (part[px] != nullptr) munmap(part[px], pbytes);
+    }
+};
+
+void pin_to(const std::vector<int>& cpus) {
+#if !defined(_WIN32)
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    for (int v : cpus) CPU_SET(v, &set);
+    sched_setaffinity(0, sizeof set, &set);
+#endif
+}
+
+void fill_numa(NumaExperts& X, const std::vector<uint8_t>& ref) {
+    const int FFh = FF / 2, Eh = E / 2;
+    const size_t mg = (size_t) FFh * X.f.gr, md = (size_t) Eh * X.f.dr;
+    X.ebytes = 2 * mg + md;
+    X.pbytes = (size_t) X.n * X.ebytes;
+    const size_t blob = 2 * (size_t) FF * X.f.gr + (size_t) E * X.f.dr;
+    if (ref.size() < (size_t) X.n * blob) return;
+    for (int px = 0; px < 2; ++px) {
+        if (X.part[px] != nullptr) {
+            munmap(X.part[px], X.pbytes);
+            X.part[px] = nullptr;
+        }
+        void* p = mmap(nullptr, X.pbytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        X.part[px] = p == MAP_FAILED ? nullptr : (uint8_t*) p;
+    }
+    for (int px = 0; px < 2; ++px) {
+        if (X.part[px] == nullptr) return;
+        std::thread th([&] {
+            pin_to(std::vector<int>{px ? 14 : 0});   // (a first logical CPU of the node: 0's "0", 1's "14")
+            for (int e = 0; e < X.n; ++e)
+                for (int r = 0; r < 3; ++r) {
+                    const size_t rows_part = r < 2 ? (size_t) FFh : (size_t) Eh;
+                    const size_t rb = r < 2 ? X.f.gr : X.f.dr;
+                    uint8_t* m = X.part[px] + (size_t) e * X.ebytes + (r == 0 ? 0 : r == 1 ? mg : 2 * mg);
+                    const uint8_t* src = ref.data() + (size_t) e * blob +
+                        (r == 0 ? 0 : r == 1 ? (size_t) FF * X.f.gr : 2 * (size_t) FF * X.f.gr) +
+                        (size_t) px * rows_part * rb;
+                    std::memcpy(m, src, rows_part * rb);
+                }
+        });
+        th.join();
+    }
+}
+
+// the logical CPUs per node (this host: node 0's "0-13,28-41", node 1's "14-27,42-55"), the cores' first(w) CPU only
+struct NumaCores {
+    std::vector<int> node[2];
+    bool ok() const { return !node[0].empty() && !node[1].empty(); }
+};
+
+NumaCores numa_cores(const std::vector<int>& cores) {
+    NumaCores out;
+    out.node[0] = cores;
+    for (int d = 0; d < 2; ++d) {
+        std::FILE* fp = std::fopen(("/sys/devices/system/node/node" + std::to_string(d) + "/cpulist").c_str(), "r");
+        if (fp == nullptr) { out = NumaCores{}; return out; }
+        std::string txt;
+        for (int c; (c = std::fgetc(fp)) != EOF;) if (c != ' ') txt += (char) c;
+        std::fclose(fp);
+        std::vector<int> on;
+        size_t i = 0;
+        while (i < txt.size()) {
+            size_t j = txt.find_first_not_of("0123456789-", i);
+            if (j == std::string::npos) j = txt.size();
+            const std::string item = txt.substr(i, j - i);
+            const size_t dash = item.find('-');
+            const int lo = std::atoi(item.c_str()),
+                      hi = dash == std::string::npos ? lo : std::atoi(item.c_str() + dash + 1);
+            for (int v = lo; v <= hi; ++v) on.push_back(v);
+            i = j + (j < txt.size() ? 1 : 0);
+        }
+        std::vector<int> first;
+        for (int v : on)
+            if (std::find(cores.begin(), cores.end(), v) != cores.end()) first.push_back(v);
+        out.node[d] = first;
+        if (out.node[d].empty()) { out = NumaCores{}; return out; }
+    }
+    return out;
+}
+
+
 // one call of the CPU lane: n experts (e0, e0 + 1, ..) of one token x - cpu_experts_mx / cpu_experts_iq's jobs
 struct Lane {
     Pool* pool = nullptr;
     std::vector<uint8_t> xq, hq;
     std::vector<float> h, y;
     void call(const Experts& X, int e0, int n, const float* x) {
+        if (nx != nullptr && flown) return call_numa_flow(X, e0, n, x);
+        if (nx != nullptr) return call_numa(X, e0, n, x);
         const int GB = (FF + RB - 1) / RB, DB = (E + RB - 1) / RB;
         const Fmt& f = X.f;
         const bool mx = f.tg == 0;
@@ -154,6 +259,150 @@ struct Lane {
             gg::iq_cpu_down(f.iq, X.mat(e, 2), hp, 1, yp, r0, r1);
         };
         pool->run(n * DB, dn);
+    }
+
+    // the same call over the row-split experts (--numa): each node's pool its jobs (start both, the caller helps node
+    // 0, wait for both), the same two barriers and serial quant steps.  Same jobs, same sums: the outputs must be the
+    // one-pool call's byte for byte (the main checks).
+    Pool* pool1 = nullptr;      // node 1's pool
+    NumaExperts* nx = nullptr;  // the row-split experts (null: the one-pool path above)
+    bool flown = false;         // (--flow, with the split: the engine's one-batch flow)
+    // (probe: wall of each phase of the split call, printed at the formats loop's end)
+    double wall_gu = 0, wall_ds = 0, wall_others = 0;
+    // --flow (with --numa): the engine cpu_experts_iq flow's shape - one batch instead of two barriers and
+    // the serial quant steps: the tokens' x rows first (node 0's jobs), then the gate / up jobs publishing
+    // every 256-value block of h they touch (the last contributor quantizes it, quantize_row_q8_K being
+    // block-independent), then the down jobs waiting only their slots' blocks.  Same sums, same rows.
+    std::unique_ptr<std::atomic<int>[]> fcnt;   // [slot][nbh blocks] | slot done | the token's x flag
+    size_t fcnt_n = 0;
+    double wait_max_ms = 0;                     // (the down jobs' h-block spins: the probe at the end)
+    int wait_slot = -1, wait_px = -1, wait_n = 0;
+    void call_numa_flow(const Experts& X, int e0, int n, const float* x) {
+        const Fmt& f = X.f;
+        const int FFh = FF / 2, Eh = E / 2;
+        const int GB = (FFh + RB - 1) / RB, DB = (Eh + RB - 1) / RB;
+        const int nbh = FF / 256;                      // (h's Q8_K blocks; FF % 256 == 0 for these formats)
+        const size_t bb = gg::iq_cpu_act_block_bytes(f.iq.d_act);   // 292 for Q8_K
+        xq.resize((size_t) E * 4);
+        hq.resize((size_t) 8 * E * 4);
+        h.resize((size_t) 8 * FF);
+        y.resize((size_t) 8 * E);
+        const size_t cneed = (size_t) 8 * (nbh + 1) + 16;
+        if (fcnt_n < cneed) {
+            fcnt.reset(new std::atomic<int>[cneed]);
+            fcnt_n = cneed;
+        }
+        for (size_t i = 0; i < cneed; ++i) fcnt[i].store(0, std::memory_order_relaxed);
+        std::atomic<int>* B = fcnt.get();              // slot s's block b: B[s * nbh + b]
+        std::atomic<int>* Dn = B + (size_t) 8 * nbh;   // slot s's h blocks quantized: Dn[s]
+        std::atomic<int>* Fx = Dn + 8;                 // token t's x rows quantized: Fx[t] (one token here)
+        // how many jobs a block of h needs: every node's every job whose rows touch it
+        int bexp[64];
+        for (int b = 0; b < nbh; ++b) bexp[b] = 0;
+        for (int px = 0; px < 2; ++px)
+            for (int j = 0; j < GB; ++j) {
+                const int lo = px * FFh + j * RB, hi = std::min(px * FFh + FFh, lo + RB);
+                for (int b = lo / 256; b <= (hi - 1) / 256 && b < nbh; ++b) ++bexp[b];
+            }
+        const int Jg = n * GB, Jd = n * DB;
+        std::function<void(int)> fj[2];
+        for (int px = 0; px < 2; ++px)
+            fj[px] = [&, px](int j) {
+                if (j < 1) {   // the one token's x rows: node 0's job (the other's first job is nothing)
+                    if (px == 0) {
+                        gg::iq_cpu_quant(f.iq.gu_act, x, E, (uint8_t*) xq.data());
+                        Fx[0].store(2, std::memory_order_release);
+                    }
+                    return;
+                }
+                int jj = j - 1;
+                if (jj < Jg) {   // the gate / up rows, then every 256-value block of h their range touches
+                    const int slot = jj / GB, l0 = (jj % GB) * RB, lr = std::min(FFh, l0 + RB);
+                    const int e = (e0 + slot) % nx->n;
+                    uint8_t* m = nx->part[px] + (size_t) e * nx->ebytes;
+                    const void* ap[1] = {xq.data()};
+                    float* hp[1] = {h.data() + (size_t) slot * FF + (size_t) px * FFh};
+                    gg::iq_cpu_gate_up(f.iq, m, m + (size_t) FFh * f.gr, ap, 1, hp, l0, lr, kLim);
+                    std::atomic<int>* Bs = B + (size_t) slot * nbh;
+                    const int b0 = px * FFh + l0, b1 = px * FFh + lr;
+                    for (int b = b0 / 256; b <= (b1 - 1) / 256 && b < nbh; ++b)
+                        if (Bs[b].fetch_add(1, std::memory_order_acq_rel) == bexp[b] - 1) {
+                            gg::iq_cpu_quant(f.iq.d_act, h.data() + (size_t) slot * FF + (size_t) b * 256, 256,
+                                             hq.data() + (size_t) slot * E * 4 + (size_t) b * bb);
+                            Dn[slot].fetch_add(1, std::memory_order_acq_rel);
+                        }
+                } else {   // the down rows, waiting for their slot's h blocks (all nbh of them)
+                    jj -= Jg;
+                    const int slot = jj / DB, l0 = (jj % DB) * RB, lr = std::min(Eh, l0 + RB);
+                    const int e = (e0 + slot) % nx->n;
+                    uint8_t* m = nx->part[px] + (size_t) e * nx->ebytes + 2 * (size_t) FFh * f.gr;
+                    const void* hp[1] = {hq.data() + (size_t) slot * E * 4};
+                    const double tw0 = now_ms();
+                    while (Dn[slot].load(std::memory_order_acquire) < nbh) strata::ds4::cpu_relax();
+                    const double tw = now_ms() - tw0;
+                    if (tw > wait_max_ms) {
+                        wait_max_ms = tw;
+                        wait_slot = slot;
+                        wait_px = px;
+                    }
+                    ++wait_n;
+                    float* yp[1] = {y.data() + (size_t) slot * E + (size_t) px * Eh};
+                    gg::iq_cpu_down(f.iq, m, hp, 1, yp, l0, lr);
+                }
+            };
+        pool->start(1 + Jg + Jd, fj[0]);
+        pool1->start(1 + Jg + Jd, fj[1]);
+        pool->help();
+        pool1->wait();
+        pool->wait();
+    }
+    void call_numa(const Experts& X, int e0, int n, const float* x) {
+        const Fmt& f = X.f;
+        const int FFh = FF / 2, Eh = E / 2;
+        const int GB = (FFh + RB - 1) / RB, DB = (Eh + RB - 1) / RB;
+        const double t0 = now_ms();
+        xq.resize((size_t) E * 4);
+        hq.resize((size_t) 8 * E * 4);
+        h.resize((size_t) 8 * FF);
+        y.resize((size_t) 8 * E);
+        gg::iq_cpu_quant(f.iq.gu_act, x, E, xq.data());
+        std::function<void(int)> fu[2], fdn[2];
+        for (int px = 0; px < 2; ++px)
+            fu[px] = [&, px](int j) {
+                const int slot = j / GB, l0 = (j % GB) * RB, lr = std::min(FFh, l0 + RB);
+                const int e = (e0 + slot) % nx->n;
+                uint8_t* m = nx->part[px] + (size_t) e * nx->ebytes;   // gate rows | up rows | down rows (parts)
+                const void* ap[1] = {xq.data()};
+                float* hp[1] = {h.data() + (size_t) slot * FF + (size_t) px * FFh};
+                gg::iq_cpu_gate_up(f.iq, m, m + (size_t) FFh * f.gr, ap, 1, hp, l0, lr, kLim);
+            };
+        pool->start(n * GB, fu[0]);
+        pool1->start(n * GB, fu[1]);
+        pool->help();
+        pool1->wait();
+        pool->wait();
+        const double t1 = now_ms();
+        for (int s = 0; s < n; ++s)
+            gg::iq_cpu_quant(f.iq.d_act, h.data() + (size_t) s * FF, FF, hq.data() + (size_t) s * E * 4);
+        const double t2 = now_ms();
+        for (int px = 0; px < 2; ++px)
+            fdn[px] = [&, px](int j) {
+                const int slot = j / DB, l0 = (j % DB) * RB, lr = std::min(Eh, l0 + RB);
+                const int e = (e0 + slot) % nx->n;
+                uint8_t* m = nx->part[px] + (size_t) e * nx->ebytes + 2 * (size_t) FFh * f.gr;
+                const void* hp[1] = {hq.data() + (size_t) slot * E * 4};
+                float* yp[1] = {y.data() + (size_t) slot * E + (size_t) px * Eh};
+                gg::iq_cpu_down(f.iq, m, hp, 1, yp, l0, lr);
+            };
+        pool->start(n * DB, fdn[0]);
+        pool1->start(n * DB, fdn[1]);
+        pool->help();
+        pool1->wait();
+        pool->wait();
+        const double t3 = now_ms();
+        wall_gu += t1 - t0;
+        wall_ds += t3 - t2;
+        wall_others += (t2 - t1) + (t0 - t3);
     }
 };
 
@@ -231,11 +480,23 @@ int main(int argc, char** argv) {
     double link = 12.0, gpu_ms = 0.03;
     std::string formats = "mxfp4,iq2_xxs,iq2_s";
     bool check = false;
+    bool numa = false;
+    bool flow = false;
     int failed = 0;
     for (int i = 1; i < argc; i += 2) {
         const std::string a = argv[i];
         if (a == "--check") {   // (a flag: no value)
             check = true;
+            --i;
+            continue;
+        }
+        if (a == "--numa") {    // (a flag: the two-socket split, see --numa's comment at the top)
+            numa = true;
+            --i;
+            continue;
+        }
+        if (a == "--flow") {    // (a flag: with --numa, the engine's one-batch flow for the split calls)
+            flow = true;
             --i;
             continue;
         }
@@ -249,9 +510,28 @@ int main(int argc, char** argv) {
     }
     const std::vector<int> cores = core_cpus();
     if (threads <= 0) threads = (int) cores.size();
+    // --numa: the engine's split - node 0's cores but the caller's and 2 spares (its pools_for leaves them), node 1's
+    // all; the experts' row halves live on their node (fill_numa's first-touch), the calls as cpu_experts_iq runs them
+    NumaCores nc;
+    std::vector<int> p0c, p1c;
+    if (numa) {
+        nc = numa_cores(cores);
+        if (!nc.ok() || nc.node[0].size() < 6 || nc.node[1].size() < 6) {
+            std::printf("numa: the two nodes did not come up - one pool, one buffer\n");
+            numa = false;
+        } else {
+            p0c.assign(nc.node[0].begin() + 1, nc.node[0].end());
+            if (p0c.size() > 2) p0c.resize(p0c.size() - 2);
+            p1c = nc.node[1];
+            std::printf("numa: node 0 (%zu cores, %d worker threads beside the caller's core and 2 spares), "
+                        "node 1 (%d threads)\n", nc.node[0].size(), (int) p0c.size(), (int) p1c.size());
+        }
+    }
+    const bool nsplit = numa && !p0c.empty();
+    std::vector<int> pin = nsplit ? p0c : std::vector<int>(cores.begin() + 1, cores.end());
+    Pool pool(nsplit ? (int) p0c.size() : threads - 1, pin, 20000);
+    std::unique_ptr<Pool> pool1(nsplit ? new Pool((int) p1c.size(), p1c, 20000) : nullptr);
     // (the engine's pool: a worker on each physical core but the caller's, the caller helping)
-    std::vector<int> pin(cores.begin() + 1, cores.end());
-    Pool pool(threads - 1, pin, 20000);
     std::printf("CPU lane: %d threads (%zu physical cores), MXFP4 rows %s\n", threads, cores.size(),
                 gg::mx_tier_name(gg::mx_tier()));
     std::vector<float> x((size_t) E);
@@ -285,8 +565,45 @@ int main(int argc, char** argv) {
         }
         X.f.blob = 2 * (size_t) FF * X.f.gr + (size_t) E * X.f.dr;
         fill(X, 1234);
+        NumaExperts nx;
+        if (nsplit && X.f.tg != 0) {   // (the row-split experts; the MXFP4 rows stay one-pool here)
+            nx.f = X.f;
+            nx.n = X.n;
+            fill_numa(nx, X.mem);
+        }
         Lane ln;
         ln.pool = &pool;
+        ln.pool1 = pool1.get();
+        ln.nx = (nsplit && X.f.tg != 0) ? &nx : nullptr;
+        ln.flown = flow && ln.nx != nullptr;
+        if (ln.nx != nullptr && ln.wait_n > 0)
+            std::printf("(flow probe: the last timed call's down waits: max %.3f ms on slot %d node %d over %d waits)\n",
+                        ln.wait_max_ms, ln.wait_slot, ln.wait_px, ln.wait_n);
+        if (ln.nx != nullptr) {   // the two layouts' outputs must be the same: one expert, one token, each way
+            std::vector<float> y1, h1;
+            ln.call_numa(X, 0, 1, x.data());
+            y1 = ln.y;
+            h1 = ln.h;
+            ln.call(X, 0, 1, x.data());
+            int hbad = 0, ybad = 0, hfirst = -1, yfirst = -1;
+            float hmax = 0, ymax = 0;
+            for (int i = 0; i < FF; ++i)
+                if (std::memcmp(&h1[(size_t) i], &ln.h[(size_t) i], 4) != 0) {
+                    ++hbad;
+                    if (hfirst < 0) hfirst = i;
+                    hmax = std::max(hmax, std::fabs(h1[(size_t) i] - ln.h[(size_t) i]));
+                }
+            for (int i = 0; i < E; ++i)
+                if (std::memcmp(&y1[(size_t) i], &ln.y[(size_t) i], 4) != 0) {
+                    ++ybad;
+                    if (yfirst < 0) yfirst = i;
+                    ymax = std::max(ymax, std::fabs(y1[(size_t) i] - ln.y[(size_t) i]));
+                }
+            std::printf("check %s: the node split's outputs against the one-pool run (1 expert, 1 token): h %d bad "
+                        "(first %d, max %.3g), down %d bad (first %d, max %.3g)  %s\n", fn.c_str(), hbad, hfirst, hmax,
+                        ybad, yfirst, ymax, hbad == 0 && ybad == 0 ? "same" : "DIFFER");
+            if ((hbad != 0 || ybad != 0) && check) ++failed;
+        }
         if (check) {
             if (X.f.tg != 0 && !check_fmt(ln, X, x.data())) ++failed;
             continue;
@@ -309,6 +626,9 @@ int main(int argc, char** argv) {
             t1 = std::min(t1, timed(1, 4));
             t3 = std::min(t3, timed(3, 4));
         }
+        if (ln.nx != nullptr)
+            std::printf("numa phases (sums over the timed calls): gate/up %.3f ms, down %.3f, quant+other %.3f\n",
+                        ln.wall_gu, ln.wall_ds, ln.wall_others);
         pcie::Costs k;
         k.c = std::max(0.5 * (t3 - t1), t3 / 6.0);
         k.oc = std::max(0.0, t1 - k.c);
