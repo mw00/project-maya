@@ -1647,6 +1647,7 @@ model's files (each read again, so those prompts are not timed); a difference fa
 | Setting | Default | |
 | --- | --- | --- |
 | `MAYA_DS4_FLOW_HELPER` | off | `1`: a prompt's streamed experts the helper's pool holds copied out of it instead of read from the files (the same bytes) |
+| `MAYA_DS4_PROMPT_LIGHT` | off | `<R>` (1-512, 64 measured best on two RX 7900 XTX + a Radeon 8060S; EXL3 read in place, with the helper and `MAYA_DS4_FLOW_HELPER`): a prompt chunk's streamed experts that at most R of its rows pick are computed on the helper from its pool instead of copied to the GPUs - their rows go out, the sums come back and join the lead's before the all-reduce. For short prompts, whose copies over the links are their bottleneck. Not bit for bit (the helper's sums). `MAYA_DS4_PROMPT_LIGHT_CAP`: rows a layer may send (4096) |
 | `MAYA_DS4_FLOW_HELPER_CHECK` | 0 | N: the load's first N prompts compare every expert copied out of the pool with the model's files; a difference fails the prompt |
 | `MAYA_DS4_HELPER_RECENT` | 0 (off) | N (up to 64): N slots a layer in the helper's pool (inside `MAYA_DS4_HELPER_GB`, carved first) for the CPU lane's experts the layer used lately - one used `MAYA_DS4_HELPER_RECENT_NEED` times in the layer's last `MAYA_DS4_HELPER_RECENT_WIN` decode steps is copied in, the least recently used goes; such an expert is summed on the helper, so the answers can differ in the last bits |
 | `MAYA_DS4_HELPER_RECENT_NEED` | 2 | its uses in the window that bring an expert to a recent slot (1-64, at most `_WIN`) |

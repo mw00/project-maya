@@ -752,6 +752,19 @@ struct Chunk {
     uint8_t* hand[2] = {nullptr, nullptr};
     unsigned* hand_flag[2] = {nullptr, nullptr};
     unsigned* hand_ack = nullptr;
+    // (DS4_PROMPT_LIGHT) the routed layer's light experts (a mask over its virtual slots: run_set leaves them out) and
+    // the lead's buffers for them: lt_hx / lt_hy (pinned, mapped) the rows out to the helper and its rows back, lt_hb
+    // (pinned, mapped) the helper's bounds, lt_prow / lt_lidx (pinned) packed row -> sorted row and back, their device
+    // copies, and on the helper its stream, FP16 hidden rows and row indices 0, 1, ...
+    const char* light = nullptr;
+    int light_n = 0;
+    float *lt_hx = nullptr, *lt_hy = nullptr;
+    int *lt_hb = nullptr, *lt_prow = nullptr, *lt_lidx = nullptr, *lt_dprow = nullptr, *lt_dlidx = nullptr;
+    int lt_lcap = 0;
+    cudaStream_t lt_st = nullptr;
+    cudaEvent_t lt_g = nullptr, lt_h = nullptr;
+    uint16_t* lt_hh = nullptr;
+    int* lt_ident = nullptr;
     unsigned arb_seq = 0;        // the group's chunk all-reduces
     ArAux ar_aux;                // (allreduce_dma's pieces: its copies out on a stream of their own)
     // the attention's sums slab by slab beside the next slab's compute: a stream of their own (its own ArAux), and
@@ -5948,8 +5961,18 @@ struct Model::Impl {
         std::vector<char> spec_k;
         bool spec(int k) const { return k >= 0 && (size_t) k < spec_k.size() && spec_k[(size_t) k]; }
         std::vector<int> routed_bounds;
+        std::vector<char> light;   // (DS4_PROMPT_LIGHT) the routed layer's experts the helper computes: never copied
+        size_t light_n = 0, light_rows = 0;
         size_t skipped = 0, copied = 0;
         size_t pooled = 0;   // (DS4_FLOW_HELPER: EXL3 experts staged out of the helper's pool)
+        // (DS4_FLOW_STATS) the copied experts by how many of the chunk's rows (token picks) each serves: 1, 2, 3-4,
+        // 5-8, 9-16, 17-32, 33-64, 65+ - how much of the link a light expert takes for little work
+        size_t rows_hist[8] = {};
+        static int rows_bucket(int n) {
+            int b = 0;
+            while (b < 7 && n > (1 << b)) ++b;
+            return b;
+        }
     };
     // in place (file_experts): the batches' file regions read ahead of their copies - POSIX_FADV_WILLNEED, the kernel
     // reading them in the background in large requests, where the copies alone fault the pages in a few at a time -
@@ -6137,6 +6160,7 @@ struct Model::Impl {
                 if (!skip_unpicked || bt.il != S.routed_layer || bt.k != S.routed_chunk) return true;
                 const size_t v = (size_t) l0.pv_n + bt.j0 + i;   // (the streamed ones' virtual slots: from pv_n - slots lent
                                                                   //  to a prompt's buffers stream too, plan_streams)
+                if (!S.light.empty() && S.light[v]) return false;   // (DS4_PROMPT_LIGHT: the helper computes it)
                 return S.routed_bounds[v + 1] > S.routed_bounds[v];
             };
             int mi = 0;
@@ -6168,6 +6192,10 @@ struct Model::Impl {
             for (int i = 0; i < bt.n; ++i) {
                 if (!picked(i)) { ++S.skipped; continue; }
                 if (skip_unpicked) ++S.copied;
+                if (skip_unpicked && bt.il == S.routed_layer && bt.k == S.routed_chunk) {   // (DS4_FLOW_STATS)
+                    const size_t v = (size_t) l0.pv_n + bt.j0 + i;
+                    ++S.rows_hist[Streamer::rows_bucket(S.routed_bounds[v + 1] - S.routed_bounds[v])];
+                }
                 uint8_t* dst = c.ring + ((size_t) half * (c.ring_n / P) + i) * c.ring_stride;
                 if (!copy_streamed(l0, mi, l0.host_list[(size_t) (bt.j0 + i)], sb != nullptr ? sb + (size_t) i * c.stage_stride
                                                                                              : nullptr,
@@ -6744,6 +6772,122 @@ struct Model::Impl {
 
     // a run's VRAM experts [i0, i1) of layer L0 (its own slots, then the tail's it kept: their blobs at member x's
     // vram_base and xbase), through run_set with layer l's layout
+    // DS4_PROMPT_LIGHT=<R> (opt-in, 0/unset: off): a prompt chunk's streamed experts that at most R of its rows pick
+    // and the helper GPU's pool holds (DS4_FLOW_HELPER, an EXL3 pack in place) are computed on the helper instead of
+    // copied to the members: their rows go out (light_gather, ~16 KB a row), the helper runs the prompt's set kernels
+    // over each one's blob in its pool, the sums come back (light_add on the lead, before the all-reduce).  A short
+    // prompt's copies are its bottleneck (a 2K read: the links ~6.7 s busy, the kernels ~3.0 s), and ~half the experts
+    // it copies serve at most 8 rows.  Not bit for bit: the helper's sums and the order they join the lead's differ.
+    // DS4_PROMPT_LIGHT_CAP: the rows a layer may send (4096)
+    static int prompt_light() {
+        static const int r = [] {
+            const char* v = ds4_env("DS4_PROMPT_LIGHT");
+            return v != nullptr ? std::max(0, std::min(512, std::atoi(v))) : 0;
+        }();
+        return r;
+    }
+    static int light_cap() {
+        static const int n = [] {
+            const char* v = ds4_env("DS4_PROMPT_LIGHT_CAP");
+            return v != nullptr ? std::max(64, std::atoi(v)) : 4096;
+        }();
+        return n;
+    }
+    bool light_ok(const Layer& L0) const {
+        return prompt_light() > 0 && helper_id >= 0 && flow_helper && file_experts && !helper_dead.load() &&
+               L0.lay.fmt != gg::kFmtMXFP4 && L0.n_cls == 1 && !L0.helper.empty();
+    }
+    // (the lead) the light experts' rows out and the helper's work in: lv their virtual slots, b the chunk's bounds
+    bool light_send(Dev& d, Chunk& c, const Layer& L0, const std::vector<int>& lv, const std::vector<int>& b, int T,
+                    std::string& err) {
+        const int D = g.dim, cap = light_cap(), R = prompt_light(), nr = T * L0.k_exp;
+        cudaStream_t s = d.st;
+        if (c.lt_hx == nullptr) {   // (once: the lead's buffers, the helper's stream and scratch)
+            bool ok = cudaHostAlloc((void**) &c.lt_hx, (size_t) cap * D * 4, cudaHostAllocMapped | cudaHostAllocPortable) ==
+                          cudaSuccess &&
+                      cudaHostAlloc((void**) &c.lt_hy, (size_t) cap * D * 4, cudaHostAllocMapped | cudaHostAllocPortable) ==
+                          cudaSuccess &&
+                      cudaHostAlloc((void**) &c.lt_hb, (size_t) (g.n_exp + 1) * 4,
+                                    cudaHostAllocMapped | cudaHostAllocPortable) == cudaSuccess &&
+                      cudaHostAlloc((void**) &c.lt_prow, (size_t) cap * 4, cudaHostAllocDefault) == cudaSuccess &&
+                      cudaMalloc((void**) &c.lt_dprow, (size_t) cap * 4) == cudaSuccess &&
+                      cudaEventCreateWithFlags(&c.lt_g, cudaEventDisableTiming) == cudaSuccess;
+            ok = ok && cudaSetDevice(helper_id) == cudaSuccess &&
+                 cudaStreamCreateWithFlags(&c.lt_st, cudaStreamNonBlocking) == cudaSuccess &&
+                 (pk.gguf ? gg::prepare(c.lt_st) : x3::prepare(c.lt_st)) &&
+                 cudaMalloc((void**) &c.lt_hh, (size_t) R * g.ff * 2) == cudaSuccess &&
+                 cudaMalloc((void**) &c.lt_ident, (size_t) cap * 4) == cudaSuccess &&
+                 cudaEventCreateWithFlags(&c.lt_h, cudaEventDisableTiming) == cudaSuccess;
+            if (ok) {
+                std::vector<int> id((size_t) cap);
+                for (int i = 0; i < cap; ++i) id[(size_t) i] = i;
+                ok = cudaMemcpy(c.lt_ident, id.data(), id.size() * 4, cudaMemcpyHostToDevice) == cudaSuccess;
+            }
+            ok = cudaSetDevice(d.id) == cudaSuccess && ok;
+            if (!ok) {
+                err = "DS4_PROMPT_LIGHT: its buffers (" + std::to_string((size_t) cap * D * 8 >> 20) + " MB pinned) failed";
+                return false;
+            }
+            std::fprintf(stderr, "ds4: DS4_PROMPT_LIGHT=%d: a prompt chunk's experts of at most %d rows from the helper's "
+                                 "pool computed on CUDA%d, not copied (up to %d rows a layer)\n",
+                         R, R, helper_id, cap);
+        }
+        if (nr > c.lt_lcap) {   // (the sorted rows' map: the chunk's rows grow it)
+            if (c.lt_lidx != nullptr) cudaFreeHost(c.lt_lidx);
+            if (c.lt_dlidx != nullptr) cudaFree(c.lt_dlidx);
+            c.lt_lidx = nullptr;
+            c.lt_dlidx = nullptr;
+            if (cudaHostAlloc((void**) &c.lt_lidx, (size_t) nr * 4, cudaHostAllocDefault) != cudaSuccess ||
+                cudaMalloc((void**) &c.lt_dlidx, (size_t) nr * 4) != cudaSuccess) {
+                err = "DS4_PROMPT_LIGHT: its row map failed";
+                return false;
+            }
+            c.lt_lcap = nr;
+        }
+        std::fill(c.lt_lidx, c.lt_lidx + nr, -1);
+        int p = 0;
+        for (size_t q = 0; q < lv.size(); ++q) {
+            const int v = lv[q];
+            c.lt_hb[q] = p;
+            for (int r = b[(size_t) v]; r < b[(size_t) v + 1]; ++r) {
+                c.lt_prow[p] = r;
+                c.lt_lidx[r] = p++;
+            }
+        }
+        c.lt_hb[lv.size()] = p;
+        CK(cudaMemcpyAsync(c.lt_dprow, c.lt_prow, (size_t) p * 4, cudaMemcpyHostToDevice, s));
+        CK(cudaMemcpyAsync(c.lt_dlidx, c.lt_lidx, (size_t) nr * 4, cudaMemcpyHostToDevice, s));
+        light_gather(c.lt_hx, c.x, c.row_tok, c.lt_dprow, p, D, s);
+        CK(cudaEventRecord(c.lt_g, s));
+        CK(cudaEventSynchronize(c.lt_g));   // (the rows are in host memory: the helper reads them there)
+        const int e0 = x3::launch_errors();
+        bool ok = cudaSetDevice(helper_id) == cudaSuccess;
+        for (size_t q = 0; ok && q < lv.size(); ++q) {
+            const int e = L0.host_list[(size_t) (lv[q] - L0.pv_n)];
+            x3::SetArgs sa;
+            sa.wbase = x3_pool(L0, e);
+            sa.stride = L0.blob;
+            sa.lay = L0.lay;
+            sa.n_exp = 1;
+            sa.bounds = c.lt_hb + q;
+            sa.row0 = c.lt_hb[q];
+            sa.max_rows = c.lt_hb[q + 1] - c.lt_hb[q];
+            sa.n_embd = D;
+            sa.n_ff = g.ff;
+            sa.limit = g.lim;
+            if (sa.wbase == nullptr) {
+                ok = false;
+                break;
+            }
+            x3::set_gate_up(sa, c.lt_hx, D, c.lt_ident + sa.row0, c.lt_hh, g.ff, c.lt_st);
+            x3::set_down(sa, c.lt_hh, g.ff, c.lt_hy + (size_t) sa.row0 * D, D, c.lt_st);
+        }
+        ok = ok && cudaEventRecord(c.lt_h, c.lt_st) == cudaSuccess && cudaGetLastError() == cudaSuccess &&
+             x3::launch_errors() == e0;
+        ok = cudaSetDevice(d.id) == cudaSuccess && ok;
+        if (!ok) err = "DS4_PROMPT_LIGHT: the helper's launches failed (layer " + std::to_string(L0.il) + ")";
+        return ok;
+    }
     bool run_vram(Dev& d, Chunk& c, const Layer& L0, const Layer& l, const Layer& x, const int* b, int i0, int i1, int T,
                   std::string& err) {
         const int m = std::min(i1, L0.n_main), t0 = std::max(i0, L0.n_main);
@@ -6755,9 +6899,14 @@ struct Model::Impl {
     bool run_set(Dev& d, Chunk& c, const Layer& l, const uint8_t* wbase, int wb0, size_t stride, const int* d_bounds,
                  const int* b, int i0, int i1, int T, std::string& err) {
         const int D = g.dim, FF = l.ffn;
+        const auto light = [&](int i) { return c.light != nullptr && i < c.light_n && c.light[i]; };
         while (i0 < i1) {
+            if (light(i0)) {   // (DS4_PROMPT_LIGHT: the helper's, added by light_add)
+                ++i0;
+                continue;
+            }
             int j = i0 + 1;
-            while (j < i1 && b[j + 1] - b[i0] <= c.C) ++j;
+            while (j < i1 && !light(j) && b[j + 1] - b[i0] <= c.C) ++j;
             const int a = b[i0], nrows = b[j] - a;
             int max_rows = 0;
             for (int i = i0; i < j; ++i) max_rows = std::max(max_rows, b[i + 1] - b[i]);
@@ -18104,6 +18253,7 @@ struct Model::Impl {
         Layer& l = member(L0, mi);
         Dev& d = devs[(size_t) l.dev];
         Chunk& c = *chunks[(size_t) l.dev];
+        c.light = nullptr;   // (DS4_PROMPT_LIGHT: set for its routed layer's sets only)
         cudaSetDevice(d.id);
         cudaStream_t s = d.st;
         prof_mark(d, 0);
@@ -18492,12 +18642,39 @@ struct Model::Impl {
         // the streamed experts as their batches arrive (each batch's slots freed for the copies at once), the VRAM ones
         // in shares between them (the device works while the copies run)
         const int di = l.dev, P = Chunk::kParts;
+        // (DS4_PROMPT_LIGHT=R) the streamed experts at most R of the chunk's rows picked, from the helper's pool: the
+        // helper computes them instead of the members copying them over their links - every member drops them from its
+        // copies and sets alike (the same routing, the same choice), the lead sends their rows and adds the sums
+        std::vector<char> lmask;
+        std::vector<int> lv;   // their virtual slots, in slot order
+        if (light_ok(L0) && S.skips(wp.k) && !S.spec(wp.k) && !xsum) {
+            const int R = prompt_light(), cap = light_cap();
+            int rows = 0;
+            for (size_t j = 0; j < L0.host_list.size(); ++j) {
+                const int v = L0.pv_n + (int) j, n = b[(size_t) v + 1] - b[(size_t) v];
+                if (n <= 0 || n > R || x3_pool(L0, L0.host_list[j]) == nullptr) continue;
+                if (rows + n > cap) break;
+                lv.push_back(v);
+                rows += n;
+            }
+            if (!lv.empty()) {
+                lmask.assign((size_t) n_vs, 0);
+                for (const int v : lv) lmask[(size_t) v] = 1;
+                S.light_n += lv.size();
+                S.light_rows += (size_t) rows;
+            }
+        }
+        const bool lt_sent = !lv.empty() && mi == 0;
+        if (lt_sent && !light_send(d, c, L0, lv, b, T, err)) return false;
         if (S.skips(wp.k)) {
             S.routed_layer = L0.il;
             S.routed_chunk = wp.k;
             S.routed_bounds = b;
+            S.light = lmask;
             if (!copy_ahead(d, c, S, di, err)) return false;
         }
+        c.light = lmask.empty() ? nullptr : lmask.data();
+        c.light_n = n_vs;
         int nb = 0;
         for (size_t q = S.kp; q < S.b.size() && S.b[q].il == L0.il && S.b[q].k == wp.k; ++q) ++nb;
         int v_done = 0;
@@ -18523,6 +18700,14 @@ struct Model::Impl {
             v_done = v_to;
         }
         if (!run_vram(d, c, L0, l, l, b.data(), v_done, L0.pv_n, T, err)) return false;
+        c.light = nullptr;
+        if (lt_sent) {   // (the helper's sums into the lead's before the group's all-reduce)
+            if (cudaEventSynchronize(c.lt_h) != cudaSuccess || helper_dead.load()) {
+                err = "the helper's light experts of layer " + std::to_string(L0.il) + " failed (DS4_PROMPT_LIGHT)";
+                return false;
+            }
+            light_add(c.acc, c.lt_hy, c.lt_dlidx, c.pos, c.rw, T, l.k_exp, D, s);
+        }
         if (xsum) moe_x_finish(c.acc, c.acc64, (size_t) T * D, s);
         if (nm > 1) chunk_allreduce(d, c, ab, mi, T * D, s);
         ablate(d, c.acc, T, wp, s);
@@ -19270,6 +19455,15 @@ struct Model::Impl {
                                  "of the helper's pool%s\n",
                          devs[(size_t) di].id, S.copied, S.skipped, S.pooled,
                          flow_check_now && S.pooled > 0 ? " (DS4_FLOW_HELPER_CHECK: each compared with the files)" : "");
+        if (!c.flow && S.light_n > 0)
+            std::fprintf(stderr, "ds4 prompt batches, CUDA%d: %zu light experts (%zu rows) computed on the helper, not "
+                                 "copied (DS4_PROMPT_LIGHT=%d)\n",
+                         devs[(size_t) di].id, S.light_n, S.light_rows, prompt_light());
+        if (!c.flow && S.copied > 0 && std::getenv("DS4_FLOW_STATS") != nullptr)
+            std::fprintf(stderr, "ds4 prompt batches, CUDA%d: copied experts by rows each: 1:%zu 2:%zu 3-4:%zu 5-8:%zu "
+                                 "9-16:%zu 17-32:%zu 33-64:%zu 65+:%zu\n",
+                         devs[(size_t) di].id, S.rows_hist[0], S.rows_hist[1], S.rows_hist[2], S.rows_hist[3],
+                         S.rows_hist[4], S.rows_hist[5], S.rows_hist[6], S.rows_hist[7]);
         return true;
     }
 
