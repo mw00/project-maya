@@ -98,13 +98,23 @@ __device__ __forceinline__ uint32_t bytesum_plus(uint32_t x, uint32_t acc) {
 #endif
 }
 
+// codebook 2's two products -> the half2 (0x6400 + bytes of x0, 0x6400 + bytes of x1): on AMD the second byte sum goes
+// straight into the high half (v_sad_hi_u8: its sum << 16 onto the first's 0x6400 + sum : 0x6400) - no mask, no pack,
+// the same bits (a sum of 4 bytes is at most 1020: nothing carries into the high half)
+__device__ __forceinline__ __half2 bytesum2h(uint32_t x0, uint32_t x1) {
+#if defined(STRATA_USE_HIP)
+    const uint32_t pk = __builtin_amdgcn_sad_hi_u8(x1, 0u, __builtin_amdgcn_sad_u8(x0, 0u, 0x64006400u));
+    return *reinterpret_cast<const __half2*>(&pk);
+#else
+    const uint32_t a = bytesum_plus(x0, 0x6400u), b = bytesum_plus(x1, 0x6400u);
+    return __halves2half2(__ushort_as_half((unsigned short) a), __ushort_as_half((unsigned short) b));
+#endif
+}
 // two states -> two values, FP16 arithmetic as exllamav3's decode_3inst_2 (the tensor-core kernels take the half2)
 template <int cb>
 __device__ __forceinline__ __half2 decode2h(uint32_t s0, uint32_t s1) {
     if constexpr (cb == 2) {
-        const uint32_t a = bytesum_plus(s0 * 0x83DCD12Du, 0x6400u);
-        const uint32_t b = bytesum_plus(s1 * 0x83DCD12Du, 0x6400u);
-        const __half2 h = __halves2half2(__ushort_as_half((unsigned short) a), __ushort_as_half((unsigned short) b));
+        const __half2 h = bytesum2h(s0 * 0x83DCD12Du, s1 * 0x83DCD12Du);
         return __hfma2(h, __half2half2(__ushort_as_half(0x1eee)), __half2half2(__ushort_as_half(0xc931)));
     } else {
         uint32_t x0 = cb == 1 ? s0 * 0xCBAC1FEDu : s0 * 89226354u + 64248484u;
@@ -1005,9 +1015,9 @@ struct KWin {
 
 // grid (n_ff / 128, groups at most, 2): group blockIdx.y's gate (z 0, into h) or up (z 1, into u) for 128 h values of
 // each of its entries, kTok entries a pass; the pair's second block to finish turns them into the clamped swiglu
-template <int K2, int cb>
+template <int K2, int cb, int Tok = kTok>
 __global__ void EXL3_BOUNDS(kMinBlocksX<K2>) win_gu_kernel(const KWin a) {
-    __shared__ __align__(16) BlockSmem<K2> sm;
+    __shared__ __align__(16) BlockSmem<K2, Tok> sm;
     __shared__ int last;
 #if defined(EXL3_SEP_DEV)
     const int grp = blockIdx.y, g = blockIdx.x, r = (int) blockIdx.z / a.gS, sp = (int) blockIdx.z % a.gS;
@@ -1019,12 +1029,12 @@ __global__ void EXL3_BOUNDS(kMinBlocksX<K2>) win_gu_kernel(const KWin a) {
     const int warp = threadIdx.x >> 5;
     const int m0 = a.grp_start[grp], m1 = a.grp_start[grp + 1];
     float* dst = r == 0 ? a.h : a.u;
-    for (int mm = m0; mm < m1; mm += kTok) {
-        const int nc = min(kTok, m1 - mm);
+    for (int mm = m0; mm < m1; mm += Tok) {
+        const int nc = min(Tok, m1 - mm);
         Xin x;
         if (warp < nc) x.f = a.x + (size_t) (a.grp_ent[mm + warp] >> 3) * a.x_stride;
 #if defined(EXL3_SEP_DEV)
-        block_gemv<K2, cb>((const uint32_t*) (blob + a.tr[r]), a.n_ff / 16, g * 8, sp * a.gkr,
+        block_gemv<K2, cb, Xin, 0, Tok>((const uint32_t*) (blob + a.tr[r]), a.n_ff / 16, g * 8, sp * a.gkr,
                           min(a.n_embd, (sp + 1) * a.gkr), x, (const uint16_t*) (blob + a.suh[r]), nc, sm);
         if (a.gS > 1)   // (win_gu_red_kernel)
             split_store(sm.out, nc, [&](int c) {
@@ -1032,7 +1042,7 @@ __global__ void EXL3_BOUNDS(kMinBlocksX<K2>) win_gu_kernel(const KWin a) {
             });
         else if (warp < nc)
 #else
-        EXL3_DECODE_INLINE block_gemv<K2, cb>((const uint32_t*) (blob + a.tr[r]), a.n_ff / 16, g * 8, 0, a.n_embd, x,
+        EXL3_DECODE_INLINE block_gemv<K2, cb, Xin, 0, Tok>((const uint32_t*) (blob + a.tr[r]), a.n_ff / 16, g * 8, 0, a.n_embd, x,
                                              (const uint16_t*) (blob + a.suh[r]), nc, sm);
         if (warp < nc)
 #endif
@@ -1049,9 +1059,9 @@ __global__ void EXL3_BOUNDS(kMinBlocksX<K2>) win_gu_kernel(const KWin a) {
 }
 
 // grid (n_embd / 128, groups at most): group blockIdx.y's down rows for 128 outputs of each entry into its part rows
-template <int K2, int cb>
+template <int K2, int cb, int Tok = kTok>
 __global__ void EXL3_BOUNDS(kMinBlocksX<K2>) win_down_kernel(const KWin a) {
-    __shared__ __align__(16) BlockSmem<K2> sm;
+    __shared__ __align__(16) BlockSmem<K2, Tok> sm;
     const int grp = blockIdx.y, g = blockIdx.x;
 #if defined(EXL3_SEP_DEV)
     const int sp = blockIdx.z;
@@ -1060,12 +1070,12 @@ __global__ void EXL3_BOUNDS(kMinBlocksX<K2>) win_down_kernel(const KWin a) {
     const uint8_t* blob = (const uint8_t*) a.grp_ptr[grp];
     const int warp = threadIdx.x >> 5;
     const int m0 = a.grp_start[grp], m1 = a.grp_start[grp + 1];
-    for (int mm = m0; mm < m1; mm += kTok) {
-        const int nc = min(kTok, m1 - mm);
+    for (int mm = m0; mm < m1; mm += Tok) {
+        const int nc = min(Tok, m1 - mm);
         Xin x;
         if (warp < nc) x.f = a.h + (size_t) a.grp_ent[mm + warp] * a.n_ff;
 #if defined(EXL3_SEP_DEV)
-        block_gemv<K2, cb>((const uint32_t*) (blob + a.tr[2]), a.n_embd / 16, g * 8, sp * a.dkr,
+        block_gemv<K2, cb, Xin, 0, Tok>((const uint32_t*) (blob + a.tr[2]), a.n_embd / 16, g * 8, sp * a.dkr,
                           min(a.n_ff, (sp + 1) * a.dkr), x, (const uint16_t*) (blob + a.suh[2]), nc, sm);
         if (a.dS > 1)   // (win_down_red_kernel)
             split_store(sm.out, nc, [&](int c) {
@@ -1073,7 +1083,7 @@ __global__ void EXL3_BOUNDS(kMinBlocksX<K2>) win_down_kernel(const KWin a) {
             });
         else if (warp < nc)
 #else
-        EXL3_DECODE_INLINE block_gemv<K2, cb>((const uint32_t*) (blob + a.tr[2]), a.n_embd / 16, g * 8, 0, a.n_ff, x,
+        EXL3_DECODE_INLINE block_gemv<K2, cb, Xin, 0, Tok>((const uint32_t*) (blob + a.tr[2]), a.n_embd / 16, g * 8, 0, a.n_ff, x,
                                              (const uint16_t*) (blob + a.suh[2]), nc, sm);
         if (warp < nc)
 #endif
@@ -2687,16 +2697,32 @@ template <int K2, int cb> struct RunMv {
 #define EXL3_XS(n) 1u
 #define EXL3_XS_RED(on, kernel, grid, a, s) (void) 0
 #endif
+// (HIP) a window's groups hold at most its T entries: blocks sized for 2 or 4 activations when T is that small - the
+// unrolled per-activation code and its registers for 8 go unused otherwise (the same arithmetic each, the same bits)
+template <int K2, int cb, class F> void win_tok(int T, F&& f) {
+#if defined(STRATA_USE_HIP)
+    if (T <= 2) return f(std::integral_constant<int, 2>{});
+    if (T <= 4) return f(std::integral_constant<int, 4>{});
+#endif
+    (void) T;
+    f(std::integral_constant<int, kTok>{});
+}
 template <int K2, int cb> struct RunWin {
     static void run(const KWin& a, int groups, cudaStream_t s) {
-        win_gu_kernel<K2, cb><<<dim3((unsigned) (a.n_ff / kCols), (unsigned) groups, 2u * EXL3_XS(a.gS)), kThreads, 0, s>>>(a);
+        win_tok<K2, cb>(groups / a.k, [&](auto tk) {
+            win_gu_kernel<K2, cb, decltype(tk)::value>
+                <<<dim3((unsigned) (a.n_ff / kCols), (unsigned) groups, 2u * EXL3_XS(a.gS)), kThreads, 0, s>>>(a);
+        });
         EXL3_XS_RED(a.gS > 1, win_gu_red_kernel, dim3((unsigned) (a.n_ff / kCols), (unsigned) groups), a, s);
         EXL3_WIN_SWIGLU(a, groups, s);
     }
 };
 template <int K2, int cb> struct RunWinDown {
     static void run(const KWin& a, int groups, cudaStream_t s) {
-        win_down_kernel<K2, cb><<<dim3((unsigned) (a.n_embd / kCols), (unsigned) groups, EXL3_XS((unsigned) a.dS)), kThreads, 0, s>>>(a);
+        win_tok<K2, cb>(groups / a.k, [&](auto tk) {
+            win_down_kernel<K2, cb, decltype(tk)::value>
+                <<<dim3((unsigned) (a.n_embd / kCols), (unsigned) groups, EXL3_XS((unsigned) a.dS)), kThreads, 0, s>>>(a);
+        });
         EXL3_XS_RED(a.dS > 1, win_down_red_kernel, dim3((unsigned) (a.n_embd / kCols), (unsigned) groups), a, s);
     }
 };
