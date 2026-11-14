@@ -381,13 +381,13 @@ class Download(unittest.TestCase):
 
     def test_the_list(self):
         got, on, default = self.rows()
-        self.assertEqual(len(on), len(maya.G53_MODELS) + 1)
+        self.assertEqual(len(on), len(maya.G53_MODELS))
         self.assertEqual(on[0][0], "GLM-5.3 (744B) · Maya-XS, text only: download 170.0 GB from Hugging Face")
         self.assertIn("every expert stays in memory from about 176 GB of VRAM and RAM together", on[0][2])
         self.assertEqual(on[1][0],
                          "GLM-5.3 (744B) · UD-IQ2_M, text only: download 238.6 GB from Hugging Face")
         self.assertIn("every expert stays in memory from about 245 GB of VRAM and RAM together", on[1][2])
-        self.assertIn("GGUF files you already have", on[2][0])
+        self.assertFalse(any("GGUF files you already have" in row[0] for row in on))
         self.assertEqual((got, default), (("download", "GLM-5.3-Maya-XS"), 0))
 
     def test_metal_refused_before_the_download(self):

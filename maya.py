@@ -2010,12 +2010,8 @@ def choose_model(a, models: Path, inst: dict, family: str = "glm") -> tuple:
                          (f"downloaded, in {d}" if have else f"download {m['download_gb']:.1f} GB from Hugging Face"),
                          f"recommended for {G53.SHOWN}" if q == rec else None,
                          f"{m['about']}; {g53_memory_note(quant=q)}"))
-        rows.append((f"{G53.SHOWN} (744B, text only): GGUF files you already have", None,
-                     "Z.ai's GLM-5.3 on the same engine; set up from its GGUF folder with --gguf-dir <folder>"))
         pick = choose_with_add(a, f"Which {G53.SHOWN}?", ["The model to set up:"], rows,
                                g53.index(default), a.yes, models, "glm53")
-        if pick == len(g53):
-            fail(f"{G53.SHOWN} is set up from its GGUF files", f"{ME} --setup --gguf-dir <the folder of its .gguf files>")
         return "download", g53[pick]
     opts = [q for q in MODELS if (q not in MODELS_BY_HAND or q == inst.get("quant"))
             and not (metal and is_exl3(q))]   # (a chosen-by-hand download: only where it is installed; Metal: GGUFs)

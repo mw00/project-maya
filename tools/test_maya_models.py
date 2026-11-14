@@ -148,7 +148,7 @@ class FitRecommendation(unittest.TestCase):
             maya.choose_model(a, Path("/m"), {}, "glm53")
         self.assertEqual(tags["Which GLM-5.3-Flash?"],
                          len([q for q in maya.MODELS if q not in maya.MODELS_BY_HAND]))
-        self.assertEqual(tags["Which GLM-5.3?"], len(maya.G53_MODELS) + 1)
+        self.assertEqual(tags["Which GLM-5.3?"], len(maya.G53_MODELS))
 
     def test_rule(self):
         sizes = {"L": 150.0, "S": 100.0, "XS": 70.0}
