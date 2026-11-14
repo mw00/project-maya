@@ -19,6 +19,7 @@ MARK = "glm5next"
 
 def edit(path: pathlib.Path, pairs: list[tuple[str, str]], count: int | None = 1):
     s = path.read_text(encoding="utf-8")
+    original = s
     for old, new in pairs:
         if new in s:
             continue                                   # already applied
@@ -26,7 +27,8 @@ def edit(path: pathlib.Path, pairs: list[tuple[str, str]], count: int | None = 1
         if n == 0 or (count is not None and n != count):
             raise SystemExit(f"glm5next patch: {path}: anchor found {n} times:\n{old}")
         s = s.replace(old, new)
-    path.write_text(s, encoding="utf-8", newline="\n")
+    if s != original:
+        path.write_text(s, encoding="utf-8", newline="\n")
 
 
 def main():
@@ -38,6 +40,13 @@ def main():
         ("    PROJECTOR_TYPE_GLM4V,\n", "    PROJECTOR_TYPE_GLM4V,\n    PROJECTOR_TYPE_GLM5NEXT,\n"),
         ('    { PROJECTOR_TYPE_GLM4V,             "glm4v"},\n',
          '    { PROJECTOR_TYPE_GLM4V,             "glm4v"},\n    { PROJECTOR_TYPE_GLM5NEXT,          "glm5next"},\n'),
+    ])
+    # Unsloth's mmproj uses the same tensors/graph under the name "glm5v".
+    # Keep this separate so it also applies to an already patched checkout.
+    edit(m / "clip-impl.h", [
+        ('static projector_type clip_projector_type_from_string(const std::string & str) {\n',
+         'static projector_type clip_projector_type_from_string(const std::string & str) {\n'
+         '    if (str == "glm5v") return PROJECTOR_TYPE_GLM5NEXT;\n'),
     ])
     edit(m / "clip-model.h", [
         ("    ffn_op_type ffn_op = FFN_GELU;\n",
@@ -61,9 +70,32 @@ def main():
     edit(m / "CMakeLists.txt", [
         ("            models/glm4v.cpp\n", "            models/glm4v.cpp\n            models/glm5next.cpp\n"),
     ])
-    shutil.copy2(here / "glm5next" / "glm5next.cpp", m / "models" / "glm5next.cpp")
+    graph, dest = here / "glm5next" / "glm5next.cpp", m / "models" / "glm5next.cpp"
+    if not dest.exists() or graph.read_bytes() != dest.read_bytes():
+        shutil.copy2(graph, dest)
 
     clip = m / "clip.cpp"
+    old_limits = (
+        "                        int min_tok = 16, max_tok = 8000;\n"
+        "                        get_u32(\"clip.vision.image_min_tokens\", min_tok, false);\n"
+        "                        get_u32(\"clip.vision.image_max_tokens\", max_tok, false);\n"
+        "                        hparams.set_limit_image_tokens(min_tok, max_tok);\n")
+    limits = (
+        "                        int min_tok = 16, max_tok = 8000, min_pix = 0, max_pix = 0;\n"
+        "                        get_u32(\"clip.vision.image_min_pixels\", min_pix, false);\n"
+        "                        get_u32(\"clip.vision.image_max_pixels\", max_pix, false);\n"
+        "                        const int area = hparams.patch_size * hparams.patch_size * hparams.n_merge * hparams.n_merge;\n"
+        "                        if (min_pix > 0) min_tok = std::max(1, (min_pix + area - 1) / area);\n"
+        "                        if (max_pix > 0) max_tok = std::max(1, max_pix / area);\n"
+        "                        get_u32(\"clip.vision.image_min_tokens\", min_tok, false);\n"
+        "                        get_u32(\"clip.vision.image_max_tokens\", max_tok, false);\n"
+        "                        hparams.set_limit_image_tokens(min_tok, max_tok);\n")
+    old_clamp = "                        get_f32(\"clip.vision.ffn_clamp\", hparams.ffn_clamp, false);\n"
+    clamp = ("                        get_f32(\"clip.vision.swiglu_clamp\", hparams.ffn_clamp, false);\n" + old_clamp)
+    # Upgrade previously patched checkouts before matching the full insertion
+    # below, so repeated setup stays idempotent.
+    if "case PROJECTOR_TYPE_GLM5NEXT:" in clip.read_text(encoding="utf-8"):
+        edit(clip, [(old_limits, limits), (old_clamp, clamp)])
     edit(clip, [
         # the SwiGLU clamp (glm5next's blocks and merger: gate <= limit, -limit <= up <= limit)
         ("        case FFN_SILU:\n"
@@ -99,12 +131,9 @@ def main():
          "                        hparams.n_merge = 2;\n"
          "                        hparams.image_resize_algo = RESIZE_ALGO_BICUBIC;\n"
          "                        get_u32(KEY_SPATIAL_MERGE_SIZE, hparams.n_merge, false);\n"
-         "                        int min_tok = 16, max_tok = 8000;\n"
-         "                        get_u32(\"clip.vision.image_min_tokens\", min_tok, false);\n"
-         "                        get_u32(\"clip.vision.image_max_tokens\", max_tok, false);\n"
-         "                        hparams.set_limit_image_tokens(min_tok, max_tok);\n"
+         + limits +
          "                        hparams.set_warmup_n_tokens(46*46); // avoid OOM on warmup\n"
-         "                        get_f32(\"clip.vision.ffn_clamp\", hparams.ffn_clamp, false);\n"
+         + clamp +
          "                    } break;\n"
          "                case PROJECTOR_TYPE_GLM4V:\n"
          "                    {\n"

@@ -18,6 +18,9 @@ def gguf(path, arch, file_type=None):
         data = value.encode()
         return struct.pack("<Q", len(data)) + data
     fields = [text("general.architecture") + struct.pack("<I", 8) + text(arch)]
+    if arch in maya.GLM_ARCHS:
+        fields += [text("tokenizer.ggml.model") + struct.pack("<I", 8) + text("gpt2"),
+                   text("tokenizer.ggml.tokens") + struct.pack("<IIQ", 9, 8, 2) + text("a") + text("b")]
     if file_type is not None:
         fields.append(text("general.file_type") + struct.pack("<II", 4, file_type))
     data = b"GGUF" + struct.pack("<IQQ", 3, 0, len(fields)) + b"".join(fields)
@@ -140,6 +143,19 @@ class LocalGlm(unittest.TestCase):
             self.assertEqual(linked["model"].resolve(), main)
             self.assertEqual(maya.link_glm_local(self.models, chosen), linked)
 
+    def test_local_qwen_vision_still_uses_its_own_gguf(self):
+        model = gguf(self.source / "qwen.gguf", "qwen4exp")
+        with patch.object(maya, "vision_encoder_ready", return_value=True):
+            cfg = maya.local_vision_step(SimpleNamespace(no_vision=False), {}, {}, self.root,
+                                         {"model": model, "vision": self.vision})
+        self.assertEqual(cfg["model"], str(model))
+
+    def test_no_vision_does_not_export_a_vocabulary(self):
+        for disabled, vision in ((True, self.vision), (False, None)):
+            with patch.object(maya, "vision_encoder_ready", side_effect=AssertionError("vision was enabled")):
+                self.assertIsNone(maya.local_vision_step(SimpleNamespace(no_vision=disabled), {}, {}, self.root,
+                                                        {"model": self.shards[0], "vision": vision}))
+
     def test_setup_writes_the_selected_files_into_the_config(self):
         linked = self.link()
         pack = linked["folder"] / "pack"
@@ -172,7 +188,10 @@ class LocalGlm(unittest.TestCase):
         self.assertEqual(other_config.read_text(), '{"preserve": true}')
         self.assertEqual(cfg["args"][cfg["args"].index("--dflash") + 1], str(linked["drafter"]))
         self.assertEqual(cfg["vision"]["mmproj"], str(linked["vision"]))
-        self.assertEqual(cfg["vision"]["model"], str(linked["model"]))
+        vocab = linked["folder"] / "vision" / "maya-vision-vocab.gguf"
+        self.assertEqual(cfg["vision"]["model"], str(vocab))
+        self.assertTrue(vocab.is_file())
+        self.assertEqual(maya.gguf_head(vocab)[0], "llama")
         self.assertEqual(cfg["installer"]["gguf"], str(linked["model"]))
         self.assertEqual(cfg["installer"]["local_drafter"], str(linked["drafter"]))
         self.assertEqual(cfg["installer"]["local_vision"], str(linked["vision"]))

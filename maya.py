@@ -4156,8 +4156,18 @@ def local_vision_step(a, pc: dict, meta: dict, llama: Path, local: dict) -> dict
         fail(f"{mmproj} is missing", "keep the source files in place and run the setup again")
     if not vision_encoder_ready(a, pc, meta, llama):
         return None
+    model = local["model"]
+    if gguf_head(model)[0] in GLM_ARCHS:
+        # The pinned vision library needs only the tokenizer and does not know
+        # GLM's text architecture. Keep the selected model untouched (also when
+        # linked) and export its vocabulary under a known, vocab-only arch.
+        from vision_vocab import write_glm_vocab
+        try:
+            model = write_glm_vocab(model, model.parent / "vision" / "maya-vision-vocab.gguf")
+        except (OSError, ValueError) as e:
+            fail(f"the vision vocabulary could not be exported: {e}")
     ok(f"pictures: ON - {mmproj.name} linked from the selected directory")
-    return {"exe": str(VEXE), "mmproj": str(mmproj), "model": str(local["model"]), "gpu": True}
+    return {"exe": str(VEXE), "mmproj": str(mmproj), "model": str(model), "gpu": True}
 
 
 def vision_step(a, pc, meta, llama: Path, d: Path, quant: str) -> dict | None:
