@@ -2992,6 +2992,64 @@ def link_catalog_family(label: str, family: str) -> bool:
     return family == "qwen" and label in (QWEN, QWEN_UD_DIR)
 
 
+def link_companion_specs(models: Path, family: str, selected: dict) -> list:
+    """(kind, destination folder, published names, distinctive name) for optional files beside these models."""
+    specs = []
+    if family == "glm":
+        specs.append(("DFlash2", models / "GLM-5.3-Flash-DFlash2", [DFLASH["file"]], DFLASH["file"]))
+    elif family == "qwen":
+        vision = qwen_vision_model()
+        if vision:
+            for label in selected:
+                names = list(vision["files"])
+                specs.append(("vision", models / label / "vision", names, names[0]))
+    elif family == "deepseek":
+        for label in selected:
+            base = (Path(label).parent if "-GGUF/" in label else Path(f"{DS4}-Maya-GGUF"))
+            for mmproj in (False, True):
+                vision = ds4_vision_model(mmproj)
+                names = list(vision["files"])
+                specs.append(("vision", models / base / "vision", names, names[0]))
+    elif family == "minimax":
+        main, draft = mm3_models()
+        for label in selected:
+            base = models / (MM3_DIR if label == MM3_DIR else MM3_COMPANIONS)
+            if label != MM3_DIR:
+                names = [n for n in MM3_VISION_FILES if n in main["files"]]
+                specs.append(("vision", base, names, "model-vision-00001-of-00001.safetensors"))
+            names = list(draft["files"])
+            specs.append(("DSpark", base / draft["folder"], names, "model-dspark-00001.safetensors"))
+    return specs
+
+
+def link_companions(models: Path, family: str, selected: dict, by_name: dict) -> tuple:
+    """Link optional known files from the same source tree; their names and model context select the destination."""
+    made = ready = 0
+    for kind, dest_dir, names, anchor in link_companion_specs(models, family, selected):
+        anchors = by_name.get(anchor, [])
+        if len(anchors) != 1:
+            if anchors:
+                warn(f"{kind}: {anchor} occurs in several directories; left alone")
+            continue
+        source_dir = anchors[0][0].parent
+        if anchor.endswith(".gguf") and not MI.is_gguf(anchors[0][1]):
+            warn(f"{kind}: {anchor} is not a GGUF file; left alone")
+            continue
+        for name in names:
+            choices = [(path, real) for path, real in by_name.get(name, []) if path.parent == source_dir]
+            if len(choices) != 1:
+                continue
+            created, why = MI.link_file(choices[0][0], dest_dir / name)
+            if why:
+                warn(why)
+            else:
+                ready += 1
+                if created:
+                    made += 1
+                    say(f"  linked {kind}: {dest_dir / name} -> {choices[0][1]}")
+    return made, ready
+
+
 def link_model(folder: str, models: Path, family: str) -> int:
     """Link named published files after checking the model family in GGUF/EXL3 metadata only."""
     src = Path(folder).expanduser().resolve()
@@ -3050,7 +3108,12 @@ def link_model(folder: str, models: Path, family: str) -> int:
                 ready += 1
                 if made:
                     linked += 1
-                    say(f"  linked {dest} -> {choices[0][1]}")
+                    role = ("vision" if "/vision/" in e["rel"] or name.startswith("model-vision-") else
+                            "MTP" if name.startswith("mtp-") else "model")
+                    say(f"  linked {role}: {dest} -> {choices[0][1]}")
+    extra_linked, extra_ready = link_companions(models, family, selected, by_name)
+    linked += extra_linked
+    ready += extra_ready
     ok(f"{linked} symbolic link(s) created, {ready - linked} already linked in {models}; "
        "model type checked, size and SHA-256 not checked")
     say("  Keep the source files in place; select the model's variant in the list to continue setup.")
@@ -3347,6 +3410,9 @@ def drafter_step(models: Path) -> Path:
     """The DFlash2 drafter's file in the models folder (GLM-5.3-Flash-DFlash2/): downloaded and its sha256 checked
     unless it is there already."""
     dst = models / "GLM-5.3-Flash-DFlash2" / DFLASH["file"]
+    if MI.is_linked(dst):
+        ok(f"the DFlash2 drafter: {dst} (linked from your files)")
+        return dst
     size = dst.stat().st_size if dst.exists() else 0
     if size == DFLASH["bytes"] and sha256_ok(dst, DFLASH["sha256"]):
         ok(f"the DFlash2 drafter: {dst}")

@@ -197,6 +197,74 @@ class ImportTests(unittest.TestCase):
         self.assertEqual(dest.resolve(), shard.resolve())
         self.assertIsNone(maya.file_incomplete({"files": {shard.name: 1000000}}, dest))
 
+    def link_with_companions(self, family, label, arch, extras):
+        main = self.put("main.gguf", b"GGUF model header")
+        for name, data in extras.items():
+            self.put(name, data)
+        cat = [{"label": label, "rel": f"{label}/main.gguf", "size": 1000000, "sha": ["wrong"]}]
+        with patch.object(maya, "import_catalog", return_value=cat), \
+                patch.object(maya, "gguf_head", side_effect=lambda path: (arch, 1) if path == main else ("", 0)), \
+                patch.object(MI, "sha256_of", side_effect=AssertionError("hashed during link")), \
+                patch.object(maya, "sha256_ok", side_effect=AssertionError("hashed during link")), \
+                patch.object(maya, "say"), patch.object(maya, "ok"), patch.object(maya, "warn"):
+            self.assertEqual(maya.link_model(str(self.src), self.models, family), 0)
+
+    def test_glm_links_dflash_and_setup_uses_it_without_hashing(self):
+        name = maya.DFLASH["file"]
+        self.link_with_companions("glm", "Maya-S-v2-IQ2_XXS", "glm5-next", {name: b"GGUF draft"})
+        dest = self.models / "GLM-5.3-Flash-DFlash2" / name
+        self.assertTrue(dest.is_symlink())
+        with patch.object(maya, "sha256_ok", side_effect=AssertionError("hashed DFlash")), \
+                patch.object(maya, "fetch", side_effect=AssertionError("downloaded DFlash")), patch.object(maya, "ok"):
+            self.assertEqual(maya.drafter_step(self.models), dest)
+
+    def test_qwen_links_separate_vision_file(self):
+        name = next(iter(maya.qwen_vision_model()["files"]))
+        self.link_with_companions("qwen", maya.QWEN, "qwen4exp", {name: b"GGUF vision"})
+        self.assertTrue((self.models / maya.QWEN / "vision" / name).is_symlink())
+
+    def test_deepseek_links_vision_mmproj(self):
+        name = next(iter(maya.ds4_vision_model(True)["files"]))
+        label = f"{maya.DS4}-GGUF/UD-Q8_K_XL"
+        self.link_with_companions("deepseek", label, "deepseek41", {name: b"GGUF vision"})
+        self.assertTrue((self.models / f"{maya.DS4}-GGUF" / "vision" / name).is_symlink())
+
+    def test_deepseek_links_vision_config_from_the_vision_folder(self):
+        shard = "model-00001-of-00048.safetensors"
+        vision_config = self.put("vision/config.json", b'{"vision": true}')
+        self.link_with_companions("deepseek", f"{maya.DS4}-GGUF/UD-Q8_K_XL", "deepseek41",
+                                  {f"vision/{shard}": b"vision", "config.json": b"{}"})
+        dest = self.models / f"{maya.DS4}-GGUF" / "vision" / "config.json"
+        self.assertTrue(dest.is_symlink())
+        self.assertEqual(dest.resolve(), vision_config.resolve())
+
+    def test_qwen_links_separate_mtp_head_with_the_model(self):
+        mtp = self.put("extra/mtp-Qwen3.8-Flash-Next-Q8_0.gguf", b"GGUF MTP")
+        main = self.put("main.gguf", b"GGUF model")
+        label = maya.QWEN_UD_DIR
+        cat = [{"label": label, "rel": f"{label}/{name}", "size": 1000000, "sha": ["wrong"]}
+               for name in (main.name, mtp.name)]
+        with patch.object(maya, "import_catalog", return_value=cat), \
+                patch.object(maya, "gguf_head", side_effect=lambda path: ("qwen4exp", 1) if path == main else ("", 0)), \
+                patch.object(maya, "say"), patch.object(maya, "ok"), patch.object(maya, "warn"):
+            self.assertEqual(maya.link_model(str(self.src), self.models, "qwen"), 0)
+        dest = self.models / label / mtp.name
+        self.assertTrue(dest.is_symlink())
+        self.assertEqual(dest.resolve(), mtp.resolve())
+
+    def test_minimax_gguf_links_vision_and_dspark(self):
+        label = maya.MM3_QUANTS["gguf-xs"]
+        self.link_with_companions("minimax", label, "minimax-m3", {
+            "vision/model-vision-00001-of-00001.safetensors": b"vision",
+            "vision/config.json": b"{}", "vision/preprocessor_config.json": b"{}",
+            "dspark/model-dspark-00001.safetensors": b"draft", "dspark/config.json": b"{}",
+        })
+        base = self.models / maya.MM3_COMPANIONS
+        self.assertTrue((base / "model-vision-00001-of-00001.safetensors").is_symlink())
+        self.assertTrue((base / "config.json").is_symlink())
+        self.assertTrue((base / "dspark/model-dspark-00001.safetensors").is_symlink())
+        self.assertTrue((base / "dspark/config.json").is_symlink())
+
     def test_report_names_what_is_missing(self):
         self.put("a.bin", BIG)
         got = MI.find(self.src, self.cat)
