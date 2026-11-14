@@ -1326,6 +1326,108 @@ __global__ void __launch_bounds__(kThreads) index_score_kernel(const float* __re
     o[i] = s;
 }
 
+#if defined(STRATA_USE_HIP)
+template <int HD>
+__global__ void __launch_bounds__(kThreads) index_score_sdot4_kernel(
+    const float* __restrict__ q, const float* __restrict__ w, const uint8_t* __restrict__ kc, int heads, int n,
+    const int* __restrict__ cand, int cand_stride, int blk, Rows lim, float* __restrict__ out, long long out_stride) {
+    pdl_wait();
+    pdl_trigger();
+    constexpr int NB = HD / 32;
+    extern __shared__ int32_t sdot_smem[];   // qs_i32[heads * NB * 8], q_sc[heads * NB], ws[heads]
+    int32_t* qs_i32 = sdot_smem;
+    float* q_sc = (float*) (qs_i32 + heads * NB * 8);
+    float* ws = q_sc + heads * NB;
+    const int t = blockIdx.y;
+    const int g8 = threadIdx.x >> 3, lane8 = threadIdx.x & 7;
+    for (int blk_id = g8; blk_id < heads * NB; blk_id += (kThreads >> 3)) {
+        const int h = blk_id / NB, b = blk_id % NB;
+        const float4 v = *(const float4*) (q + ((size_t) t * heads + h) * HD + b * 32 + lane8 * 4);
+        float a = fmaxf(fmaxf(fabsf(v.x), fabsf(v.y)), fmaxf(fabsf(v.z), fabsf(v.w)));
+        for (int o = 4; o > 0; o >>= 1) a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, o));
+        const int e = a > 0.0f ? (int) ((__float_as_uint(a) >> 23) & 0xffu) - 126 : 0;
+        const float sc = __int_as_float((127 + 4 - e) << 23);
+        const uint32_t b0 = (uint8_t) (int8_t) __float2int_rn(v.x * sc);
+        const uint32_t b1 = (uint8_t) (int8_t) __float2int_rn(v.y * sc);
+        const uint32_t b2 = (uint8_t) (int8_t) __float2int_rn(v.z * sc);
+        const uint32_t b3 = (uint8_t) (int8_t) __float2int_rn(v.w * sc);
+        qs_i32[blk_id * 8 + lane8] = (int32_t) (b0 | (b1 << 8) | (b2 << 16) | (b3 << 24));
+        if (lane8 == 0) q_sc[blk_id] = a > 0.0f ? __int_as_float((127 + e - 4) << 23) : 0.0f;
+    }
+    if (threadIdx.x < heads) ws[threadIdx.x] = w[(size_t) t * 64 + threadIdx.x];
+    __syncthreads();
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    float* o = out + (long long) t * out_stride;
+    int ln, lk;
+    rows_at(lim, t, ln, lk);
+    int p = i;
+    if (cand != nullptr) {
+        if (i >= lk * blk) {
+            o[i] = -INFINITY;
+            return;
+        }
+        p = cand[(size_t) t * cand_stride + i / blk] * blk + i % blk;
+    }
+    if (p >= ln) {
+        o[i] = -INFINITY;
+        return;
+    }
+    const uint8_t* kr = kc + (size_t) p * kv_row_bytes(kKvFp4p, HD);
+    float acc[32];
+#pragma unroll
+    for (int h = 0; h < 32; ++h) acc[h] = 0.0f;
+    static constexpr int8_t e2m1_lut[16] = {0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12};
+#pragma unroll
+    for (int b = 0; b < NB; ++b) {
+        const uint4 kw = *(const uint4*) (kr + b * 16);
+        const uint32_t words[4] = {kw.x, kw.y, kw.z, kw.w};
+        int32_t k_i32[8];
+#pragma unroll
+        for (int w_idx = 0; w_idx < 4; ++w_idx) {
+            const uint32_t cw = words[w_idx];
+            k_i32[w_idx * 2 + 0] = (int32_t) (
+                ((uint32_t) (uint8_t) e2m1_lut[cw & 15u]) |
+                (((uint32_t) (uint8_t) e2m1_lut[(cw >> 4) & 15u]) << 8) |
+                (((uint32_t) (uint8_t) e2m1_lut[(cw >> 8) & 15u]) << 16) |
+                (((uint32_t) (uint8_t) e2m1_lut[(cw >> 12) & 15u]) << 24));
+            k_i32[w_idx * 2 + 1] = (int32_t) (
+                ((uint32_t) (uint8_t) e2m1_lut[(cw >> 16) & 15u]) |
+                (((uint32_t) (uint8_t) e2m1_lut[(cw >> 20) & 15u]) << 8) |
+                (((uint32_t) (uint8_t) e2m1_lut[(cw >> 24) & 15u]) << 16) |
+                (((uint32_t) (uint8_t) e2m1_lut[(cw >> 28) & 15u]) << 24));
+        }
+        const float ks = ue8m0_val(kr[HD / 2 + b]) * 0.5f;
+#pragma unroll
+        for (int h = 0; h < 32; ++h) {
+            if (h >= heads) break;
+            const int32_t* qp = qs_i32 + (h * NB + b) * 8;
+            int32_t dot = 0;
+#pragma unroll
+            for (int u = 0; u < 8; ++u) {
+#if defined(__gfx906__)
+                dot = __builtin_amdgcn_sdot4(qp[u], k_i32[u], dot, false);
+#else
+                const int32_t qa = qp[u], kb = k_i32[u];
+                dot += (int32_t) (int8_t) (qa) * (int32_t) (int8_t) (kb) +
+                       (int32_t) (int8_t) (qa >> 8) * (int32_t) (int8_t) (kb >> 8) +
+                       (int32_t) (int8_t) (qa >> 16) * (int32_t) (int8_t) (kb >> 16) +
+                       (int32_t) (int8_t) (qa >> 24) * (int32_t) (int8_t) (kb >> 24);
+#endif
+            }
+            acc[h] += (float) dot * (q_sc[h * NB + b] * ks);
+        }
+    }
+    float s = 0.0f;
+#pragma unroll
+    for (int h = 0; h < 32; ++h) {
+        if (h >= heads) break;
+        s += fmaxf(acc[h], 0.0f) * ws[h];
+    }
+    o[i] = s;
+}
+#endif
+
 __device__ __forceinline__ uint32_t ord_key(float f) {
     const uint32_t b = __float_as_uint(f);
     return (b & 0x80000000u) ? ~b : (b | 0x80000000u);
@@ -4218,8 +4320,36 @@ void index_score(const float* q, const float* w, const void* k, int heads, int h
             return;
         }
     }
-    const size_t smem = (size_t) (heads * hd + heads) * sizeof(float);
     const dim3 grid(cdiv(n, kThreads), T);
+#if defined(STRATA_USE_HIP)
+    if (kfmt == kKvFp4p && hd == 128) {
+        static const bool sdot4_env = [] {
+            const char* e = std::getenv("DS4_INDEX_SDOT4");
+            return e != nullptr && std::atoi(e) != 0;
+        }();
+        if (sdot4_env) {
+            static std::atomic<uint64_t> sdot4_checked{0}, sdot4_cap{0};
+            int dev = 0;
+            cudaGetDevice(&dev);
+            if (!(sdot4_checked.load(std::memory_order_relaxed) >> dev & 1u)) {
+                cudaDeviceProp p{};
+                if (cudaGetDeviceProperties(&p, dev) == cudaSuccess && std::strncmp(p.gcnArchName, "gfx906", 6) == 0) {
+                    sdot4_cap.fetch_or(1ull << dev);
+                    std::fprintf(stderr, "ds4: GPU%d (%s) the indexer's scores on sdot4 int8 (DS4_INDEX_SDOT4=1)\n", dev,
+                                 p.gcnArchName);
+                }
+                sdot4_checked.fetch_or(1ull << dev);
+            }
+            if (sdot4_cap.load(std::memory_order_relaxed) >> dev & 1u) {
+                const size_t sdot_smem = (size_t) (heads * (hd / 4 + hd / 32) + heads) * sizeof(float);
+                pdl_launch(index_score_sdot4_kernel<128>, grid, kThreads, sdot_smem, s, q, w, (const uint8_t*) k, heads,
+                           n, cand, cand_stride, blk, lim, out, out_stride);
+                return;
+            }
+        }
+    }
+#endif
+    const size_t smem = (size_t) (heads * hd + heads) * sizeof(float);
     if (kfmt == kKvFp4p)
         pdl_launch(index_score_kernel<128, kKvFp4p>, grid, kThreads, smem, s, q, w, (const uint8_t*) k, heads, n, cand,
                    cand_stride, blk, lim, out, out_stride);
