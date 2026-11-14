@@ -3167,6 +3167,12 @@ def local_model_folder(models: Path, first: Path, prefix: str = "GLM") -> Path:
         number += 1
 
 
+def local_gguf_model_name(folder: Path) -> str:
+    """A linked model's API id: quant and any source-folder disambiguator included."""
+    name = re.sub(r"^(?:DeepSeek|MiniMax)-local-", "", folder.name, flags=re.I)
+    return re.sub(r"[^a-z0-9._-]+", "-", name.lower()).strip("-") or "local-model"
+
+
 def link_glm_local(models: Path, chosen: dict, family: str = "glm") -> dict | None:
     """Link a GGUF quant of the chosen GLM family and its companions by model type only."""
     first = chosen["model"]["anchor"]
@@ -7152,7 +7158,8 @@ def write_config_ds4(a, pc: dict, meta: dict, pack: Path, ctx: int, models: Path
            "engine; --vram-reserve-mib changes it)")
     cfg = {"exe": str(DS4_EXE), "args": args, "cwd": str(ROOT), "tokenizer": str(pack / "tokenizer"),
            **({"backend": "hip"} if hip else {}),
-           "model_name": DS4_ABL_MODEL_NAME if quant in DS4_ABL else DS4_MODEL_NAME,
+           "model_name": local_gguf_model_name(d) if linked_files is not None else
+                         DS4_ABL_MODEL_NAME if quant in DS4_ABL else DS4_MODEL_NAME,
            "gpu": [g["index"] for g in pc["gpus"]],
            "sampling": dict(DS4_SAMPLING), "reasoning_effort": DS4_EFFORT,   # (the model's own, every setup)
            "lib_dirs": meta.get("lib_dirs") or old.get("lib_dirs") or [], "port": port}
@@ -7810,7 +7817,8 @@ def write_config_mm3(a, pc: dict, meta: dict, pack: Path, ctx: int, models: Path
            "beside the engine)")
     cfg = {"exe": str(MM3_EXE), "args": args, "cwd": str(ROOT), "tokenizer": str(pack / "tokenizer"),
            **({"backend": "hip"} if hip else {}),
-           "model_name": MM3_MODEL_NAME, "gpu": [g["index"] for g in pc["gpus"]],
+           "model_name": local_gguf_model_name(d) if linked_files is not None else MM3_MODEL_NAME,
+           "gpu": [g["index"] for g in pc["gpus"]],
            # (the model's own, every setup - an EXL3 folder of the user's own: its generation_config.json's)
            "sampling": folder_sampling(d, MM3_SAMPLING) if own else dict(MM3_SAMPLING),
            "reasoning_effort": MM3_EFFORT,

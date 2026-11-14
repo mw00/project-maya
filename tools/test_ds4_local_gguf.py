@@ -110,6 +110,7 @@ class Local(unittest.TestCase):
         cfg = json.loads(path.read_text())
         self.assertEqual(cfg["installer"]["local_drafter"], str(linked["drafter"]))
         self.assertEqual(cfg["installer"]["local_vision"], str(linked["vision"]))
+        self.assertEqual(cfg["model_name"], "custom-mxfp4")
         self.assertNotEqual(maya.flag_value(cfg["args"], "--vision"), "off")
         self.assertEqual(maya.flag_value(cfg["args"], "--dspark"), "none")
         linked["vision"] = None

@@ -179,7 +179,35 @@ class LocalOther(unittest.TestCase):
                 self.assertIn(262144, context.call_args.args[2])
                 if family == "deepseek":
                     self.assertIn(524288, context.call_args.args[2])
-                self.assertEqual(cfg["model_name"], maya.DS4_MODEL_NAME if family == "deepseek" else maya.MM3_MODEL_NAME)
+                self.assertEqual(cfg["model_name"], f"custom-{family}-q3_k")
+
+    def test_linked_config_model_names_distinguish_quants_and_source_folders(self):
+        a = SimpleNamespace(no_vision=True, parallel=None, env=[], port=None, host=None, api_key=None)
+        pc = {"backend": "cuda", "gpus": [{"index": 0}]}
+        for family, title, model in (("deepseek", "DeepSeek", "DeepSeek-V4.1-Flash-1017"),
+                                      ("minimax", "MiniMax", "MiniMax-M3.1-Flash")):
+            names = []
+            for quant in ("MXFP4", "Q3_K-AntirezLike", "Q3_K-AntirezLike-second-source"):
+                d = self.models / f"{title}-local-{model}-{quant}"
+                pack = d / ("maya-ds4" if family == "deepseek" else "maya-mm3")
+                pack.mkdir(parents=True)
+                (pack / "mm3.txt").write_text("hidden_size 32\n")
+                linked = {"model": d / f"{model}-{quant}-00001-of-00010.gguf"}
+                with patch.object(maya, "ROOT", self.root), \
+                        patch.object(maya, "saved_calibration", return_value=None), \
+                        patch.object(maya, "ds4_seed_profile", return_value=False), \
+                        patch.object(maya, "write_run_script", return_value=self.root / "run-test.sh"):
+                    if family == "deepseek":
+                        p = maya.write_config_ds4(a, pc, {}, pack, 262144, self.models, d, "local-gguf",
+                                                  linked_files=linked)
+                    else:
+                        p = maya.write_config_mm3(a, pc, {}, pack, 262144, self.models, d, "local-gguf", own=True,
+                                                  linked_files=linked)
+                cfg = json.loads(p.read_text())
+                names.append(cfg["model_name"])
+                self.assertEqual(cfg["model_name"], f"{model}-{quant}".lower())
+                self.assertEqual(maya.config_family(cfg), family)
+            self.assertEqual(len(set(names)), 3)
 
 
 if __name__ == "__main__":
