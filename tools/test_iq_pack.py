@@ -44,9 +44,9 @@ class CompatibilityTests(unittest.TestCase):
             source = root / "model.gguf"
             values = np.linspace(-1, 1, 256, dtype=np.float32).reshape(2, 128)
             router = np.full((2, 128), 0.10001, dtype=np.float32)
-            names = ["blk.0.hc_attn_down.weight", "output_hc_up.weight", "blk.1.ple_key.weight",
+            names = ["blk.0.hc_attn_down.weight", "output_hc_up.weight",
                      "blk.0.ssm_alpha.weight", "blk.3.indexer.q_proj.weight", "blk.1.ple_value.weight"]
-            write_gguf(source, [(n, values, Q.Q8_0) for n in names] + [
+            write_gguf(source, [(n, values, Q.Q8_0) for n in names + ["blk.1.ple_key.weight"]] + [
                 ("blk.0.ffn_gate_inp.weight", router, Q.F32),
                 ("blk.0.attn_qkv.weight", values, Q.Q8_0),
                 ("per_layer_token_embd.weight", values, Q.Q8_0),
@@ -70,12 +70,13 @@ class CompatibilityTests(unittest.TestCase):
                 self.assertEqual(row[2], "4")
                 offset, size = int(row[3]), int(row[4])
                 np.testing.assert_array_equal(np.frombuffer(dense[offset:offset + size], dtype=np.uint16), expected)
-            native = rows["blk.0.attn_qkv.weight"]
-            self.assertEqual(native[4], "0")
-            self.assertEqual(native[9], "8")
+            for name in ("blk.0.attn_qkv.weight", "blk.1.ple_key.weight"):
+                native = rows[name]
+                self.assertEqual(native[4], "0")
+                self.assertEqual(native[9], "8")
             self.assertNotIn("per_layer_token_embd.weight", rows)
             self.assertEqual(source.read_bytes(), before)
-            self.assertEqual(len(json.loads((root / "compat-bf16.json").read_text())["tensors"]), 7)
+            self.assertEqual(len(json.loads((root / "compat-bf16.json").read_text())["tensors"]), 6)
 
     def test_default_still_refuses_inexact_f32_router(self):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
