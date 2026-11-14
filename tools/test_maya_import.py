@@ -190,6 +190,11 @@ class ImportTests(unittest.TestCase):
         self.assertFalse((self.models / "Model-B/shard-00001.gguf").exists())
         self.assertTrue(other.exists())
 
+    def test_catalog_skips_unpublished_quants_without_failing_the_live_setup(self):
+        with patch.object(maya, "fail", side_effect=AssertionError("catalog interrupted the setup")):
+            catalog = maya.import_catalog(self.models)
+        self.assertTrue(any(e["label"] == maya.QWEN_UD_DIR for e in catalog))
+
     def test_edited_file_name_keeps_an_invalid_value_for_correction(self):
         chosen = self.put("extra/model.gguf", b"GGUF model")
         with patch.object(maya, "choose", return_value=0), \

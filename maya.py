@@ -1962,9 +1962,12 @@ def choose_with_add(a, question: str, intro: list, rows: list, default: int, yes
                 warn(f"{folder} is not a directory")
             if S.UI is not None and hasattr(S.UI, "retry_text"):
                 S.UI.retry_text("Directory with downloaded model files")
-        if review_downloaded_model(a, src, models, family) == 0:
+        added = review_downloaded_model(a, src, models, family)
+        if added == 0 or isinstance(added, dict):
             if S.UI is not None and hasattr(S.UI, "commit_add"):
                 S.UI.commit_add()
+            if isinstance(added, dict):
+                return added
 
 
 def choose_model(a, models: Path, inst: dict, family: str = "glm") -> tuple:
@@ -2853,15 +2856,17 @@ def import_catalog(models: Path) -> list:
                 "size": DFLASH["bytes"], "sha": [DFLASH["sha256"].lower()]})
     quiet = contextlib.redirect_stdout(io.StringIO())
 
-    def tolerant(make, *args):                         # (a manifest that is not published yet: fail() exits)
+    def tolerant(make, *args, **kwargs):               # (an optional manifest may not be published yet)
         try:
             with quiet:
-                return make(*args)
+                return make(*args, **kwargs)
         except (SystemExit, OSError, KeyError, ValueError):
             return None
     nsa = argparse.Namespace(model_dir=None)
     for quant in DS4_QUANTS:
-        m = tolerant(ds4_gguf_model, quant)
+        if quant in DS4_MAYA and not ds4_maya_published(quant):
+            continue
+        m = tolerant(ds4_gguf_model, quant, allow_missing=True)
         if m and m.get("files"):
             d = ds4_dir(nsa, models, {}, quant)
             entry(d.relative_to(models).as_posix(), d.relative_to(models).as_posix(), m)
@@ -3044,6 +3049,10 @@ def review_candidates(src: Path, family: str) -> dict[str, list[dict]]:
             if role == "vision" and "vocab" in path.name.casefold():
                 continue
             found[role].append(review_candidate(path, role, files))
+    if family == "qwen":
+        found["drafter"].sort(key=lambda c: (not c["path"].name.casefold().startswith("mtp-qwen"),
+                                                "shared" in c["path"].name.casefold(),
+                                                c["path"].name.casefold()))
     return found
 
 
@@ -3073,7 +3082,7 @@ def review_pick_file(src: Path, role: str, candidates: list[dict], current: dict
                 S.UI.retry_text(f"{role.title()} file name")
 
 
-def review_downloaded_model(a, src: Path, models: Path, family: str) -> int:
+def review_downloaded_model(a, src: Path, models: Path, family: str) -> int | dict:
     """Show detected files, let the user correct them, then link or import exactly the chosen variant."""
     found = review_candidates(src, family)
     chosen = {role: options[0] if options else None for role, options in found.items()}
@@ -3085,7 +3094,7 @@ def review_downloaded_model(a, src: Path, models: Path, family: str) -> int:
                 (f"Drafter: {shown('drafter')}", None, "Choose an MTP, DFlash, DFlash2 or other draft file."),
                 (f"Vision: {shown('vision')}", None, "Choose a vision file, if present."),
                 ("Link files", None, "Check model type only; create symbolic links without size or SHA-256 checks."),
-                ("Import Model", None, "Verify size and SHA-256, then move or copy the selected files.")]
+                ("Import Model", None, "Verify selected published files by size and SHA-256, then move or copy them.")]
         pick = choose("Detected model files", [f"Directory: {src}", "Review the files before adding them:"],
                       rows, 3, False)
         if pick < 3:
@@ -3098,12 +3107,57 @@ def review_downloaded_model(a, src: Path, models: Path, family: str) -> int:
             if model is None:
                 warn("select a model file before linking")
                 continue
+            if family == "qwen" and model["anchor"].name not in set().union(
+                    *(set(qwen_entry(quant)["files"]) for quant in QWEN_QUANTS)):
+                local = link_qwen_local(models, chosen)
+                if local is not None:
+                    return local
+                continue
             result = link_model(str(src), models, family, selected_model=model["anchor"], selected_files=selected)
         else:
             result = import_model(a, str(src), models_override=models, from_setup=True,
                                   selected_files=selected if chosen["model"] else None)
         if result == 0:
             return 0
+
+
+def link_qwen_local(models: Path, chosen: dict) -> dict | None:
+    """Link an unlisted Qwen GGUF as its own local quant, keeping the selected MTP and mmproj beside it."""
+    model = chosen["model"]
+    first = model["anchor"]
+    if first.suffix.lower() != ".gguf" or linked_model_type(first) != "qwen":
+        warn(f"{first.name} is not a Qwen3.8-Flash-Next GGUF model")
+        return None
+    shards = shard_set(first)
+    missing = [path for path in shards if not path.is_file()]
+    if missing:
+        warn(f"{missing[0].name} is missing; finish the model download before linking")
+        return None
+    drafter, vision = chosen["drafter"], chosen["vision"]
+    if drafter and gguf_head(drafter["anchor"])[0] != "qwen4exp":
+        warn(f"{drafter['path'].name}: this Qwen setup can use a qwen4exp MTP head, not this drafter")
+        return None
+    if vision and (vision["anchor"].suffix.lower() != ".gguf" or gguf_head(vision["anchor"])[0] != "clip"):
+        warn(f"{vision['path'].name}: Qwen vision needs an mmproj GGUF")
+        return None
+    name = re.sub(r"[^A-Za-z0-9._-]", "-", re.sub(r"-\d{5}-of-\d{5}\.gguf$", "", first.name))[:100]
+    dest = models / f"Qwen-local-{name}"
+    placements = [(path, dest / path.name) for path in shards]
+    placements += [(path, dest / path.name) for path in sorted(drafter["files"])] if drafter else []
+    placements += [(path, dest / "vision" / path.name) for path in sorted(vision["files"])] if vision else []
+    made = 0
+    for source, target in placements:
+        created, why = MI.link_file(source, target)
+        if why:
+            warn(why)
+            return None
+        if created:
+            made += 1
+            say(f"  linked {target} -> {source.resolve()}")
+    ok(f"{made} symbolic link(s) created for local Qwen; model type checked, size and SHA-256 not checked")
+    return {"folder": dest, "model": dest / first.name, "files": [dest / p.name for p in shards],
+            "drafter": dest / drafter["path"].name if drafter else None,
+            "vision": dest / "vision" / vision["path"].name if vision else None}
 
 
 def link_catalog_family(label: str, family: str) -> bool:
@@ -5937,7 +5991,7 @@ def ds4_maya_published(quant: str) -> bool:
     return bool(q.get("files"))
 
 
-def ds4_gguf_model(quant: str) -> dict:
+def ds4_gguf_model(quant: str, *, allow_missing: bool = False) -> dict | None:
     """A GGUF of DeepSeek as a MODELS entry (offer_download's form): its shards, sizes, sha256, repo folder - unsloth's,
     Maya's (the Engram tables in its own shards) or orcarouter's abliterated one ("gated": its download sends a token) -
     and "earlier": the layouts its files had before, each in the same form (ds4_earlier)."""
@@ -5947,6 +6001,8 @@ def ds4_gguf_model(quant: str) -> dict:
         ab = man.get("abliterated") or {}
         q = (ab.get("quants") or {}).get(DS4_QUANTS[quant]) or {}
         if not q.get("files"):
+            if allow_missing:
+                return None
             fail(f"{DS4_GGUF_MANIFEST} is missing or damaged", "restore it (git checkout tools/ds4/download_gguf.json)")
         about, repo, revision = (f"{ab.get('name', DS4 + '-abliterated')} {DS4_QUANTS[quant]}, orcarouter's abliterated "
                                  f"model as GGUFs ({q.get('about', 'the experts in 2-4 bits')}; its shard 2, the n-gram "
@@ -5958,6 +6014,8 @@ def ds4_gguf_model(quant: str) -> dict:
         my = man.get("maya") or {}
         q = (my.get("quants") or {}).get(DS4_QUANTS[quant]) or {}
         if not q.get("files"):
+            if allow_missing:
+                return None
             fail(f"{DS4} {DS4_QUANTS[quant]} is not published yet",
                  f"set up unsloth's GGUF meanwhile: {ME} --setup --model {DS4} --ds4-quant gguf-q8")
         about, repo, revision = (f"{DS4} {DS4_QUANTS[quant]}, Maya's quant ({q.get('about', 'the experts in 2-3 bits')})",
@@ -5965,6 +6023,8 @@ def ds4_gguf_model(quant: str) -> dict:
     else:
         q = (man.get("quants") or {}).get(DS4_QUANTS[quant]) or {}
         if not q.get("files"):
+            if allow_missing:
+                return None
             fail(f"{DS4_GGUF_MANIFEST} is missing or damaged", "restore it (git checkout tools/ds4/download_gguf.json)")
         about, repo, revision = (f"{DS4} as unsloth's {DS4_QUANTS[quant]} GGUF ("
                                  + (q.get("about") or f"dense weights {'BF16' if quant == 'gguf-q8' else 'Q8_0'}, "
@@ -7730,16 +7790,62 @@ def qwen_model_step(a, d: Path, quant: str = "q5_k_m", models: Path | None = Non
     return files
 
 
-def qwen_pack_step(a, d: Path, files: list, llama: Path, mtp_gguf: Path | None = None) -> Path:
+def qwen_local_model_step(local: dict) -> list[Path]:
+    """Use the selected local GGUF shards without comparing their size or SHA-256 to a download manifest."""
+    step(5, "the local Qwen model")
+    files = local["files"]
+    for path in files:
+        if not path.is_file():
+            fail(f"{path} is missing", "keep the source files in place and run the setup again")
+    if local.get("drafter") and not local["drafter"].is_file():
+        fail(f"{local['drafter']} is missing", "keep the source MTP file in place and run the setup again")
+    if linked_model_type(files[0]) != "qwen":
+        fail(f"{files[0].name} is not a Qwen GGUF")
+    ok(f"Qwen3.8-Flash-Next: {len(files)} local GGUF file(s) linked in {local['folder']}")
+    return files
+
+
+def qwen_local_ple(files: list[Path]) -> tuple[Path, int]:
+    """Find the disk-backed n-gram table by tensor name and report its bytes for memory guidance."""
+    from gguf_reader import GGUFFile
+    for path in files:
+        try:
+            for tensor in GGUFFile(path).tensors:
+                if tensor.name == "per_layer_token_embd.weight":
+                    return path, tensor.expected_bytes() or 0
+        except (OSError, ValueError, KeyError, struct.error) as exc:
+            fail(f"could not read {path.name}'s GGUF header: {exc}")
+    fail("the local Qwen GGUF has no per_layer_token_embd.weight n-gram table",
+         "select all shards of one Qwen3.8-Flash-Next quant")
+
+
+def qwen_local_vision_step(a, pc: dict, meta: dict, llama: Path, local: dict) -> dict | None:
+    """Use the selected mmproj file in place; only its GGUF type was checked when it was linked."""
+    step(7, "images (the vision encoder)")
+    mmproj = local.get("vision")
+    if a.no_vision or mmproj is None:
+        ok("pictures: off (--no-vision)" if a.no_vision else "pictures: no vision file selected")
+        return None
+    if not mmproj.is_file():
+        fail(f"{mmproj} is missing", "keep the source files in place and run the setup again")
+    if not vision_encoder_ready(a, pc, meta, llama):
+        return None
+    ok(f"pictures: ON - {mmproj.name} linked from the selected directory")
+    return {"exe": str(VEXE), "mmproj": str(mmproj), "model": str(local["model"]), "gpu": True}
+
+
+def qwen_pack_step(a, d: Path, files: list, llama: Path, mtp_gguf: Path | None = None,
+                   build_mtp: bool = True) -> Path:
     """tools/iq_pack.py's pack in <model>/pack (the index of every tensor, the small float weights, the tokenizer with
     the GGUF's chat template), and the MTP drafter built from the GGUF's NextN block (<pack>/mtp, tools/mtp_from_gguf.py;
     mtp_gguf: unsloth's separate MTP head) - built again when its tools or the model files changed."""
     step(6, "the pack (the engine's index of the model file) and the MTP drafter")
     pack = d / "pack"
     tools = S.source_hash(QWEN_PACK_TOOLS)
-    need = PACK_FILES + ("mtp/dense.txt", "mtp/experts.bin")
+    need = PACK_FILES + (("mtp/dense.txt", "mtp/experts.bin") if build_mtp else ())
+    sources = list(dict.fromkeys([*files, *([mtp_gguf] if mtp_gguf else [])]))
     if not a.repack and read_json(pack / PACK_SOURCES).get("tools") == tools and \
-            all((pack / f).exists() for f in need) and pack_stale(pack, files) is None:
+            all((pack / f).exists() for f in need) and pack_stale(pack, sources) is None:
         ok(f"pack already built: {pack}")
         return pack
     if not os.access(d, os.W_OK):
@@ -7754,13 +7860,14 @@ def qwen_pack_step(a, d: Path, files: list, llama: Path, mtp_gguf: Path | None =
     missing = [f for f in PACK_FILES if not (pack / f).exists()]
     if missing:
         fail(f"the pack builder did not write {pack / missing[0]}", "the reason is in the messages above")
-    say("  The MTP drafter from the model's NextN block (its 512 experts requantized to 2 bits for the drafts; a few "
-        "minutes) ...")
-    run([sys.executable, str(ROOT / "tools" / "mtp_from_gguf.py"), "--gguf", str(mtp_gguf or files[0]),
-         "--out", str(pack / "mtp")], env=env)
+    if build_mtp:
+        say("  The MTP drafter from the model's NextN block (its 512 experts requantized to 2 bits for the drafts; a few "
+            "minutes) ...")
+        run([sys.executable, str(ROOT / "tools" / "mtp_from_gguf.py"), "--gguf", str(mtp_gguf or files[0]),
+             "--out", str(pack / "mtp")], env=env)
     if QWEN_PROFILE.exists():                          # (the shipped ranking of the experts: which start in VRAM)
         shutil.copyfile(QWEN_PROFILE, pack / "expert-profile.bin")
-    stamp_pack(pack, files)
+    stamp_pack(pack, sources)
     rec = read_json(pack / PACK_SOURCES)
     rec["tools"] = tools
     (pack / PACK_SOURCES).write_text(json.dumps(rec, indent=1), encoding="utf-8")
@@ -7769,7 +7876,8 @@ def qwen_pack_step(a, d: Path, files: list, llama: Path, mtp_gguf: Path | None =
 
 
 def write_config_qwen(a, pc: dict, meta: dict, pack: Path, gguf: Path, ctx: int, models: Path, d: Path,
-                      vision: dict | None = None, quant: str = "q5_k_m", ple: Path | None = None) -> Path:
+                      vision: dict | None = None, quant: str = "q5_k_m", ple: Path | None = None,
+                      use_mtp: bool = True, local_drafter: Path | None = None) -> Path:
     """maya-cyber-frost.json (maya-cyber-frost-hip.json on AMD; unsloth's UD-IQ2_XS: maya-qwen-ud-iq2_xs.json) and its
     start script.  A setup again keeps what the config before says that this one does not ask: its engine settings,
     where the server listens and its key; the model's own sampling and thinking level every setup.  ple: the shard
@@ -7777,7 +7885,9 @@ def write_config_qwen(a, pc: dict, meta: dict, pack: Path, gguf: Path, ctx: int,
     step(8, "the configuration and the start script")
     port = a.port or 8080
     hip = pc.get("backend") == "hip"
-    cfg_path = ROOT / f"{Q.config_stem('qwen', quant)}{'-hip' if hip else ''}.json"
+    stem = ("maya-qwen-" + re.sub(r"[^a-z0-9_-]", "-", d.name.casefold())[:60]) if quant == "local" else \
+        Q.config_stem("qwen", quant)
+    cfg_path = ROOT / f"{stem}{'-hip' if hip else ''}.json"
     old = read_json(cfg_path)
     profile = pack / "expert-profile.bin"
     # the Qwen path: the pack, the model file for its native weights and its n-gram table, decode windows of up to 4
@@ -7785,22 +7895,27 @@ def write_config_qwen(a, pc: dict, meta: dict, pack: Path, gguf: Path, ctx: int,
     # chunks sized from the expert cache it lends them, the expert cache sized from the free VRAM
     args = ["--pack", str(pack), "--native", str(gguf), "--ple-gguf", str(ple or gguf), "--spec", "4", "--prefill",
             "auto", "--expert-cache", "auto", "--max-context", str(ctx), "--kv", QWEN_KV]
-    if quant == QWEN_UD:                               # (its n-gram table memory-mapped: the page cache, never loaded)
+    if quant in (QWEN_UD, "local"):                    # (the n-gram table is read in place from its GGUF shard)
         args += ["--ple-io", "mmap"]
     if profile.exists():
         args += ["--expert-profile", str(profile)]
     # (the engine's server needs the MTP drafter loaded - the setup always builds it; drafting off is --mtp-max-t 1)
-    if (pack / "mtp" / "dense.txt").exists():
+    if use_mtp and (pack / "mtp" / "dense.txt").exists():
         args += ["--mtp", str(pack / "mtp")]
     if vision:                                         # (pictures: GENI requests, each image's rows at its pad tokens)
         args.append("--vision")
     kept = keep_args(old.get("args") or [], args, ("--mtp-max-t", "--kv", "--vram-reserve-mib", "--pool-workers",
                                                    "--experts-from-gguf", "--ple-io"))
-    inst = {"family": "qwen", "quant": QWEN_UD_DIR if quant == QWEN_UD else QWEN, "qwen_quant": quant}
-    sampling, effort = Q.model_defaults({"installer": inst})   # (the model's own, every setup: its card's)
+    inst = {"family": "qwen", "quant": d.name if quant == "local" else QWEN_UD_DIR if quant == QWEN_UD else QWEN,
+            "qwen_quant": quant}
+    if quant == "local":
+        match = re.search(r"(?i)(?:^|[-_])((?:Q|IQ)\d+_[A-Z0-9_]+)(?=[-.])", gguf.name)
+        inst["local_quant"] = match.group(1).upper() if match else gguf.stem
+        inst["local_drafter"] = str(local_drafter) if local_drafter else None
+    sampling, effort = Q.model_defaults({"installer": inst})
     cfg = {"exe": str(EXE), "args": args, "cwd": str(ROOT), "tokenizer": str(pack / "tokenizer"),
            **({"backend": "hip"} if hip else {}),
-           "model_name": QWEN_UD_MODEL_NAME if quant == QWEN_UD else QWEN_MODEL_NAME,
+           "model_name": QWEN_UD_MODEL_NAME if quant in (QWEN_UD, "local") else QWEN_MODEL_NAME,
            "gpu": [g["index"] for g in pc["gpus"]],
            "sampling": sampling, "reasoning_effort": effort,
            "lib_dirs": meta.get("lib_dirs") or old.get("lib_dirs") or [], "port": port,
@@ -7965,7 +8080,23 @@ def qwen_vision_step(a, pc: dict, meta: dict, llama: Path, d: Path, gguf: Path,
     return {"exe": str(VEXE), "mmproj": str(files[0]), "model": str(gguf), "gpu": True}
 
 
-def choose_qwen_quant(a, prev: dict) -> str:
+def qwen_local_from_config(cfg: dict) -> dict | None:
+    """Restore a local Qwen selection so a later setup offers its files again."""
+    inst = cfg.get("installer") or {}
+    args = cfg.get("args") or []
+    if inst.get("qwen_quant") != "local" or "--native" not in args[:-1]:
+        return None
+    first = Path(args[args.index("--native") + 1])
+    files = shard_set(first)
+    if not all(path.is_file() for path in files):
+        return None
+    vision = (cfg.get("vision") or {}).get("mmproj")
+    drafter = inst.get("local_drafter")
+    return {"folder": Path(inst.get("model_dir") or first.parent), "model": first, "files": files,
+            "drafter": Path(drafter) if drafter else None, "vision": Path(vision) if vision else None}
+
+
+def choose_qwen_quant(a, prev: dict) -> str | dict:
     """Which Qwen files: --qwen-quant (or a --model id that names them), else asked - CYBER-FROST-3.8-PS's Q5_K_M or
     unsloth's UD-IQ2_XS of the base model; the files set up before are the default."""
     given = getattr(a, "qwen_quant", None)
@@ -7981,9 +8112,14 @@ def choose_qwen_quant(a, prev: dict) -> str:
                      f"head, the experts in about {m['memory_gb']:.0f} GB of VRAM and RAM together)" if q == QWEN_UD else
                      "Blackfrost-AI's cybersecurity fine-tune in peasantsmith's GGUF (Q5_K experts, all of them in about "
                      f"{m['memory_gb']:.0f} GB of VRAM and RAM together)"))
+    local_before = qwen_local_from_config(prev)
+    if local_before:
+        rows.append((f"Local Qwen3.8-Flash-Next · {(prev.get('installer') or {}).get('local_quant') or local_before['model'].name}", None,
+                     f"Previously linked GGUF in {local_before['folder']}"))
     pick = choose_with_add(a, "Which Qwen3.8-Flash-Next?", ["The files to set up:"], rows,
-                           QWEN_QUANTS.index(default), getattr(a, "yes", False), setup_models_dir(a, prev), "qwen")
-    return QWEN_QUANTS[pick]
+                           len(QWEN_QUANTS) if local_before else QWEN_QUANTS.index(default), getattr(a, "yes", False),
+                           setup_models_dir(a, prev), "qwen")
+    return pick if isinstance(pick, dict) else local_before if local_before and pick == len(QWEN_QUANTS) else QWEN_QUANTS[pick]
 
 
 def set_up_qwen(a, prev: dict) -> Path | None:
@@ -7991,14 +8127,18 @@ def set_up_qwen(a, prev: dict) -> Path | None:
     the engine (build/maya), the file (pinned, sha256-checked), the pack and the MTP drafter, the config; then the
     drafter measured."""
     inst = prev.get("installer") or {}
-    quant = choose_qwen_quant(a, prev)
+    choice = choose_qwen_quant(a, prev)
+    local = choice if isinstance(choice, dict) else None
+    quant = "local" if local else choice
     if (inst.get("qwen_quant") or "q5_k_m") != quant:   # (the other Qwen files' setup before: its own config's answers)
         prev = next((c for c in map(read_json, configs()) if config_family(c) == "qwen" and
                      ((c.get("installer") or {}).get("qwen_quant") or "q5_k_m") == quant), {})
         inst = prev.get("installer") or inst
     prev_args = prev.get("args") or []
     prev_ctx = int(prev_args[prev_args.index("--max-context") + 1]) if "--max-context" in prev_args[:-1] else None
-    m = qwen_entry(quant)
+    ple, ple_bytes = qwen_local_ple(local["files"]) if local else (None, 0)
+    m = ({"memory_gb": (sum(p.stat().st_size for p in local["files"]) - ple_bytes) / 1e9}
+         if local else qwen_entry(quant))
     pc = check_pc(a, "qwen")                           # 1
     total, _ = mem_gb()
     vram = sum(g["vram_gb"] for g in pc["gpus"])
@@ -8006,28 +8146,36 @@ def set_up_qwen(a, prev: dict) -> Path | None:
         warn(f"{vram:.0f} GB of VRAM and {total:.0f} GB of RAM: below the ~{m['memory_gb']:.0f} GB that hold all of its "
              "experts - the engine reads the others from the SSD when they are routed (slower)")
     step(2, "your choices")                            # 2
-    ok(f"model: {Q.shown('qwen', quant, m['download_gb'])} - " +
-       ("unsloth's GGUF of Qwen3.8-Flash-Next " if quant == QWEN_UD else "a fine-tune of Qwen3.8-Flash-Next ") +
-       "(Qwen Community License 1.0: LICENSE.qwen-community-1.0; a Model-as-a-Service business needs Qwen's own license)")
+    if local:
+        ok(f"model: Qwen3.8-Flash-Next, local GGUF {local['model'].name} "
+           "(Qwen Community License 1.0; a Model-as-a-Service business needs Qwen's own license)")
+    else:
+        ok(f"model: {Q.shown('qwen', quant, m['download_gb'])} - " +
+           ("unsloth's GGUF of Qwen3.8-Flash-Next " if quant == QWEN_UD else "a fine-tune of Qwen3.8-Flash-Next ") +
+           "(Qwen Community License 1.0: LICENSE.qwen-community-1.0; a Model-as-a-Service business needs Qwen's own license)")
     rec = qwen_recommended_context(vram, vram + total < m["memory_gb"])
     ctx = choose_context(a, prev_ctx, QWEN_CONTEXTS, rec)
     ok(f"context: {ctx} tokens" + (" (recommended for this PC's VRAM)" if ctx == rec else "") +
        f"; its KV cache: {qwen_kv_gb(ctx):.1f} GB of VRAM")
     models = (Path(a.models_dir).expanduser().resolve() if a.models_dir else
               Path(inst["models_dir"]) if inst.get("models_dir") else ROOT.parent / "Maya-data" / "models")
-    d = qwen_dir(a, models, prev, quant)
+    d = local["folder"] if local else qwen_dir(a, models, prev, quant)
     ok(f"model folder: {d}")
     llama = tools_step(a)                              # 3
     meta = build_step(a, pc, llama)                    # 4
-    files = qwen_model_step(a, d, quant, models)       # 5
+    files = qwen_local_model_step(local) if local else qwen_model_step(a, d, quant, models)  # 5
     if files is None:
         return None
     ud = quant == QWEN_UD
-    pack = qwen_pack_step(a, d, files, llama, d / m["mtp"] if ud else None)   # 6
-    vision = qwen_vision_step(a, pc, meta, llama, d, files[0], models)       # 7
+    mtp = local.get("drafter") if local else d / m["mtp"] if ud else None
+    pack = qwen_pack_step(a, d, files, llama, mtp, build_mtp=bool(mtp) if local else True)  # 6
+    vision = qwen_local_vision_step(a, pc, meta, llama, local) if local else \
+        qwen_vision_step(a, pc, meta, llama, d, files[0], models)             # 7
     cfg_path = write_config_qwen(a, pc, meta, pack, files[0], ctx, models, d, vision, quant,
-                                 d / m["ngram"] if ud else None)                # 8
-    if "mtp_calibration" not in (read_json(cfg_path).get("installer") or {}) or a.calibrate:
+                                 ple if local else d / m["ngram"] if ud else None,
+                                 use_mtp=bool(mtp) if local else True,
+                                 local_drafter=mtp if local else None)        # 8
+    if (not local or mtp) and ("mtp_calibration" not in (read_json(cfg_path).get("installer") or {}) or a.calibrate):
         how = drafting_choice(a, "the MTP drafter", "10-40")
         if how != "measure":
             keep_drafting(cfg_path, how == "on")

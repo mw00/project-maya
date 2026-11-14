@@ -13,6 +13,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -383,6 +384,89 @@ class UnslothUD(unittest.TestCase):
             self.assertEqual(maya.choose_qwen_quant(a, {"installer": {"qwen_quant": UD}}), UD)
         a.qwen_quant = UD
         self.assertEqual(maya.choose_qwen_quant(a, {}), UD)
+        a.qwen_quant = None
+        local_first = self.d / "Qwen3.8-Flash-Next-Q8_0.gguf"
+        local_first.write_bytes(b"GGUF")
+        previous = {"installer": {"qwen_quant": "local", "local_quant": "Q8_0", "model_dir": str(self.d)},
+                    "args": ["--native", str(local_first)]}
+        with patch.object(maya, "choose", lambda t, i, rows, default, yes: default):
+            restored = maya.choose_qwen_quant(a, previous)
+        self.assertEqual(restored["model"], local_first)
+
+    def test_unlisted_q8_links_as_local_qwen_and_uses_the_selected_mtp(self):
+        source = self.d / "downloads"
+        source.mkdir()
+        names = [f"Qwen3.8-Flash-Next-Q8_0-0000{i}-of-00002.gguf" for i in (1, 2)]
+        first, second = [source / name for name in names]
+        for path in (first, second):
+            path.write_bytes(b"GGUF")
+        mtp = source / "mtp-Qwen3.8-Flash-Next-Q8_0.gguf"
+        mtp.write_bytes(b"GGUF")
+        mmproj = source / "mmproj-F16.gguf"
+        mmproj.write_bytes(b"GGUF")
+        def head(path):
+            return (("clip", 1) if path == mmproj else ("qwen4exp", 1) if path in (first, mtp) else ("", 0))
+        with patch.object(maya, "gguf_head", side_effect=head), patch.object(maya, "choose", return_value=3):
+            local = maya.review_downloaded_model(SimpleNamespace(), source, self.d / "models", "qwen")
+        self.assertEqual(local["model"].name, first.name)
+        self.assertEqual(local["files"], [local["folder"] / name for name in names])
+        self.assertEqual((local["drafter"].name, local["vision"].name), (mtp.name, mmproj.name))
+        self.assertTrue(all(path.is_symlink() for path in [*local["files"], local["drafter"], local["vision"]]))
+        self.assertEqual(local["files"][0].resolve(), first)
+        self.assertTrue(second.exists())
+
+    def test_local_qwen_config_uses_its_own_model_ple_mtp_and_vision(self):
+        d = self.d / "Qwen-local-Qwen3.8-Flash-Next-Q8_0"
+        pack = d / "pack"
+        (pack / "mtp").mkdir(parents=True)
+        (pack / "mtp" / "dense.txt").write_text("x")
+        first = d / "Qwen3.8-Flash-Next-Q8_0-00001-of-00006.gguf"
+        ple = d / "Qwen3.8-Flash-Next-Q8_0-00003-of-00006.gguf"
+        vision = {"exe": "/b/maya-vision", "mmproj": str(d / "vision/mmproj-F16.gguf"),
+                  "model": str(first), "gpu": True}
+        a = SimpleNamespace(port=None, env=[], host=None, api_key=None)
+        with patch.object(maya, "ROOT", self.d), patch.object(maya, "write_run_script", return_value=self.d / "run"):
+            path = maya.write_config_qwen(a, {"gpus": [{"index": 0}]}, {}, pack, first, 65536,
+                                          self.d, d, vision, "local", ple, local_drafter=d / "mtp-Qwen-Q8_0.gguf")
+        cfg = json.loads(path.read_text())
+        args = cfg["args"]
+        value = lambda flag: args[args.index(flag) + 1]
+        self.assertEqual((value("--native"), value("--ple-gguf"), value("--ple-io"), value("--mtp")),
+                         (str(first), str(ple), "mmap", str(pack / "mtp")))
+        self.assertEqual(cfg["model_name"], "qwen3.8-flash-next")
+        self.assertEqual(cfg["vision"], vision)
+        self.assertEqual(cfg["installer"]["local_quant"], "Q8_0")
+        self.assertEqual(cfg["installer"]["local_drafter"], str(d / "mtp-Qwen-Q8_0.gguf"))
+        self.assertEqual(Q.config_label(cfg), "Qwen-3.8-Flash-Next · Q8_0")
+        self.assertEqual(Q.model_defaults(cfg)[0], {"temperature": 1.0, "top_p": 0.95,
+                                                     "top_k": 20, "min_p": 0.0})
+
+    def test_local_qwen_setup_passes_selected_files_to_the_qwen_steps(self):
+        d = self.d / "Qwen-local-Q8_0"
+        d.mkdir()
+        first, ple, mtp = (d / name for name in ("model-00001-of-00002.gguf", "model-00002-of-00002.gguf",
+                                                  "mtp-Qwen-Q8_0.gguf"))
+        for path in (first, ple, mtp):
+            path.write_bytes(b"GGUF")
+        local = {"folder": d, "model": first, "files": [first, ple], "drafter": mtp, "vision": None}
+        a = SimpleNamespace(backend="cuda", models_dir=str(self.d), context=None, calibrate=False)
+        with patch.object(maya, "choose_qwen_quant", return_value=local), \
+                patch.object(maya, "configs", return_value=[]), \
+                patch.object(maya, "qwen_local_ple", return_value=(ple, 0)), \
+                patch.object(maya, "check_pc", return_value={"gpus": [{"vram_gb": 80, "index": 0}]}), \
+                patch.object(maya, "mem_gb", return_value=(256, 200)), \
+                patch.object(maya, "choose_context", return_value=65536), \
+                patch.object(maya, "tools_step", return_value=self.d), \
+                patch.object(maya, "build_step", return_value={}), \
+                patch.object(maya, "qwen_local_model_step", return_value=local["files"]), \
+                patch.object(maya, "qwen_pack_step", return_value=d / "pack") as packed, \
+                patch.object(maya, "qwen_local_vision_step", return_value=None), \
+                patch.object(maya, "write_config_qwen", return_value=d / "local.json") as configured, \
+                patch.object(maya, "read_json", return_value={"installer": {"mtp_calibration": True}}):
+            self.assertEqual(maya.set_up_qwen(a, {}), d / "local.json")
+        packed.assert_called_once_with(a, d, [first, ple], self.d, mtp, build_mtp=True)
+        self.assertEqual(configured.call_args.args[3:8], (d / "pack", first, 65536, self.d, d))
+        self.assertEqual(configured.call_args.args[9:11], ("local", ple))
 
     def test_shared_file_one_copy(self):
         """A file another Qwen setup has (the mmproj: CYBER-FROST's and the base model's are the same bytes) is

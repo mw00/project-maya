@@ -64,6 +64,8 @@ def model_defaults(cfg: dict) -> tuple:
     quant's own sampling where it has one: QUANT_SAMPLING), copies."""
     key = model_key(cfg)
     sampling, effort = MODEL_DEFAULTS.get(key, MODEL_DEFAULTS["glm"])
+    if key == "qwen" and (cfg.get("installer") or {}).get("qwen_quant") == "local":
+        return dict(QUANT_SAMPLING[("qwen", "Qwen3.8-Flash-Next-UD-IQ2_XS")]), effort
     return dict(QUANT_SAMPLING.get((key, tier_of(cfg)), sampling)), effort
 
 
@@ -317,6 +319,8 @@ def config_label(cfg: dict) -> str | None:
     if is_glm53(cfg):
         what = glm53_quant(config_key(cfg))
         return _g53.LABEL + (SEP + what if what else "")
+    if family_of(cfg) == "qwen" and (cfg.get("installer") or {}).get("qwen_quant") == "local":
+        return "Qwen-3.8-Flash-Next" + SEP + str(cfg["installer"].get("local_quant") or "local GGUF")
     fam, bits = family_of(cfg), exl3_bits(cfg)
     return SHOWN.get(fam, fam) + SEP + bits if bits else shown(fam, config_key(cfg))
 

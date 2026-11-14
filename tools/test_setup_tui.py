@@ -159,6 +159,17 @@ class PlainSetup(unittest.TestCase):
             self.assertEqual(pick, 0)
             reviewed.assert_called_once_with(a, Path(folder), models, "glm")
 
+    def test_unlisted_qwen_link_goes_directly_to_its_local_model(self):
+        a = SimpleNamespace(copy=False, yes=False)
+        local = {"model": Path("Qwen3.8-Flash-Next-Q8_0-00001-of-00006.gguf")}
+        with tempfile.TemporaryDirectory() as folder, patch.object(maya, "choose", return_value=1) as choose, \
+                patch.object(S, "ask_text", return_value=folder), \
+                patch.object(maya, "review_downloaded_model", return_value=local):
+            picked = maya.choose_with_add(a, "Which Qwen?", [], [("Official", None, None)], 0, False,
+                                          Path(folder) / "models", "qwen")
+        self.assertIs(picked, local)
+        self.assertEqual(choose.call_count, 1)       # no standard quant choice after linking
+
     def test_invalid_directory_is_prompted_again_with_its_previous_value(self):
         a = SimpleNamespace(copy=False, yes=False)
         with tempfile.TemporaryDirectory() as folder:
