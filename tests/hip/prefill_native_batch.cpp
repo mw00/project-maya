@@ -177,7 +177,7 @@ bool qsa_chunks_case(cudaStream_t stream, std::mt19937& rng, int64_t max_cells,
 bool embed_case(cudaStream_t stream, int type, int64_t T) {
     constexpr int vocab = 19;
     const size_t row_bytes = strata::kernels::iq_row_bytes(type, EMB);
-    const size_t block_bytes = type == 20 ? 18 : 110;  // IQ4_NL or IQ3_S GGML block layout
+    const size_t block_bytes = type == 8 ? 34 : type == 20 ? 18 : 110;
     const size_t table_bytes = (size_t) vocab * row_bytes;
     if (row_bytes == 0 || row_bytes % block_bytes != 0) {
         std::fprintf(stderr, "bad test embedding row size for type=%d\n", type);
@@ -187,7 +187,7 @@ bool embed_case(cudaStream_t stream, int type, int64_t T) {
     CHECK(cudaHostAlloc(&host_table, table_bytes, cudaHostAllocMapped | cudaHostAllocPortable));
     auto* table_bytes_u8 = (uint8_t*) host_table;
     std::memset(table_bytes_u8, 0, table_bytes);
-    // Both test formats begin with a finite fp16 scale; the remaining packed code bits are all legal values.
+    // Each test format begins with a finite fp16 scale; the remaining packed code bits are legal values.
     for (size_t r = 0; r < (size_t) vocab; ++r) {
         for (size_t b = 0; b < row_bytes; b += block_bytes) {
             table_bytes_u8[r * row_bytes + b] = 0x00;
@@ -254,6 +254,23 @@ bool embed_case(cudaStream_t stream, int type, int64_t T) {
             same = false;
             break;
         }
+        if (type == 8) for (int64_t local = 0; local < rows; ++local) {
+            const int64_t t = t0 + local;
+            if (image_rows[(size_t) t]) continue;
+            const uint8_t* src = table_bytes_u8 + (size_t) ids[(size_t) t] * row_bytes;
+            for (int i = 0; i < EMB; ++i) {
+                const int block = i / 32, q = i % 32;
+                const float expected = (float) (int8_t) src[block * 34 + 2 + q]; // fp16 scale was set to 1
+                if (a[(size_t) local * EMB + i] != expected) {
+                    std::fprintf(stderr, "Q8_0 embedding differs from signed-byte CPU reference at token %lld value %d\n",
+                                 (long long) t, i);
+                    same = false;
+                    break;
+                }
+            }
+            if (!same) break;
+        }
+        if (!same) break;
     }
     if (T > 3 && (!image_rows[1] || !image_rows[3] || ids[1] != 0 || ids[3] != 0)) same = false;
     if (!same) std::fprintf(stderr, "NativeEmbed image placeholder sanitization mismatch type=%d T=%lld\n",
@@ -280,7 +297,7 @@ int main() {
     ok = qsa_chunks_case(stream, rng, 33, 7, 17) && ok;
     // Production-scale, non-block-aligned first chunk with a short continuation.
     ok = qsa_chunks_case(stream, rng, 8210, 8193, 17) && ok;
-    for (int type : {20, 21}) for (int64_t T : {1, 2, 7, 17})
+    for (int type : {8, 20, 21}) for (int64_t T : {1, 2, 7, 17})
         ok = embed_case(stream, type, T) && ok;
     ok = embed_case(stream, 21, 4096) && ok;
     const cudaError_t destroy = cudaStreamDestroy(stream);

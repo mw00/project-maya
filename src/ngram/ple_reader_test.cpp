@@ -39,33 +39,34 @@ int g_fail = 0;
 
 constexpr uint64_t HEADER = 192;   // the real shard's data offset, so rows are misaligned the same way
 
-void expected_row(uint32_t row, uint8_t* out) {
-    for (uint32_t b = 0; b < ng::ROW_BYTES; ++b) out[b] = (uint8_t) ((row * 2654435761u + b * 97u) >> 7);
+void expected_row(uint32_t row, uint8_t* out, uint32_t row_bytes = ng::ROW_BYTES) {
+    for (uint32_t b = 0; b < row_bytes; ++b) out[b] = (uint8_t) ((row * 2654435761u + b * 97u) >> 7);
     std::memcpy(out, &row, 4);
 }
 
-bool make_table(const std::string& path, uint32_t rows) {
+bool make_table(const std::string& path, uint32_t rows, uint32_t row_bytes = ng::ROW_BYTES) {
     std::ofstream f(path, std::ios::binary);
     std::vector<uint8_t> head(HEADER, 0xAB);
     f.write((const char*) head.data(), (std::streamsize) head.size());
-    uint8_t r[ng::ROW_BYTES];
+    uint8_t r[k::PLE_Q8_ROW_BYTES];
     for (uint32_t i = 0; i < rows; ++i) {
-        expected_row(i, r);
-        f.write((const char*) r, ng::ROW_BYTES);
+        expected_row(i, r, row_bytes);
+        f.write((const char*) r, row_bytes);
     }
     return (bool) f;
 }
 
-bool check_rows(ng::PleReader& rd, const std::vector<uint32_t>& rows, uint32_t n_rows, const char* what) {
-    std::vector<uint8_t> out(rows.size() * ng::ROW_BYTES, 0xCC);
+bool check_rows(ng::PleReader& rd, const std::vector<uint32_t>& rows, uint32_t n_rows, const char* what,
+                uint32_t row_bytes = ng::ROW_BYTES) {
+    std::vector<uint8_t> out(rows.size() * row_bytes, 0xCC);
     std::string err;
     const auto t = rd.issue(rows.data(), rows.size(), out.data());
     if (!rd.collect(t, err)) { CHECK(false, "%s: collect failed: %s", what, err.c_str()); return false; }
-    uint8_t want[ng::ROW_BYTES];
+    uint8_t want[k::PLE_Q8_ROW_BYTES];
     for (size_t i = 0; i < rows.size(); ++i) {
-        if (rows[i] >= n_rows) std::memset(want, 0, sizeof want);
-        else expected_row(rows[i], want);
-        if (std::memcmp(want, &out[i * ng::ROW_BYTES], ng::ROW_BYTES) != 0) {
+        if (rows[i] >= n_rows) std::memset(want, 0, row_bytes);
+        else expected_row(rows[i], want, row_bytes);
+        if (std::memcmp(want, &out[i * row_bytes], row_bytes) != 0) {
             CHECK(false, "%s: row %u (index %zu) differs", what, rows[i], i);
             return false;
         }
@@ -138,6 +139,37 @@ int selftest(const std::string& dir) {
         CHECK(now_us() - t0 >= delay_us, "injected delay not observed (%.0f us)", now_us() - t0);
         CHECK(rd.stats().late_injected > 0, "no read was held back");
     }
+    // Q8_0 uses 170-byte rows. Exercise page straddles, the row cache and both submission modes.
+    const std::string q8_path = dir + "/ple_reader_q8_selftest.bin";
+    constexpr uint32_t Q8_N = 10000;
+    constexpr uint32_t Q8_BYTES = k::PLE_Q8_ROW_BYTES;
+    CHECK(make_table(q8_path, Q8_N, Q8_BYTES), "cannot write Q8 table");
+    for (bool thr : {false, true}) {
+        ng::PleReader rd;
+        std::string err;
+        CHECK(rd.open(q8_path, HEADER, Q8_N, 16, 512, err, thr, Q8_BYTES), "Q8 open: %s", err.c_str());
+        std::vector<uint32_t> straddle;
+        for (uint32_t r = 0; r < Q8_N && straddle.size() < 32; ++r) {
+            const uint64_t at = HEADER + (uint64_t) r * Q8_BYTES;
+            if (at / ng::PAGE != (at + Q8_BYTES - 1) / ng::PAGE) straddle.push_back(r);
+        }
+        check_rows(rd, straddle, Q8_N, "Q8 straddle", Q8_BYTES);
+        check_rows(rd, {5, 5, 6, Q8_N - 1, Q8_N}, Q8_N, "Q8 cache/edges", Q8_BYTES);
+        check_rows(rd, {5, 6}, Q8_N, "Q8 cached rows", Q8_BYTES);
+        CHECK(rd.stats().cache_hits > 0, "Q8 row cache never hit");
+    }
+    std::filesystem::remove(q8_path);
+    // Independent scalar Q8_0 reference: five blocks, scales 1 and -2, signed samples.
+    uint8_t q8_row[Q8_BYTES] = {};
+    float decoded[k::PLE_HEAD_DIM] = {};
+    for (int b = 0; b < 5; ++b) {
+        const uint16_t scale = b % 2 ? 0xC000 : 0x3C00;
+        std::memcpy(q8_row + b * 34, &scale, 2);
+        for (int j = 0; j < 32; ++j) q8_row[b * 34 + 2 + j] = (uint8_t) (int8_t) (j - 16);
+    }
+    k::q8_0_dequant_row(q8_row, decoded);
+    for (int b = 0; b < 5; ++b) for (int j = 0; j < 32; ++j)
+        CHECK(decoded[b * 32 + j] == (b % 2 ? -2.0f : 1.0f) * (j - 16), "Q8 decode block %d sample %d", b, j);
     std::filesystem::remove(path);
     std::printf("ple_reader selftest: %s\n", g_fail ? "FAILED" : "OK");
     return g_fail ? 1 : 0;
