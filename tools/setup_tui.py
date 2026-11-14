@@ -29,6 +29,7 @@ from textual.widgets.option_list import Option
 
 from setup_bridge import TAIL, BackRequested, Bridge, curl_meter, describe
 from setup_dash import Dashboard
+from setup_dir_picker import DirectoryPicker
 from setup_look import (ACCENT, ACCENT_TEXT, DANGER, EDGE, FAINT, INK, LINE, MUTED, OK, OK_TEXT, SETUP_CSS, THEME,
                         TINT, Card, Output, StopScreen, clock, hints, serving_card, setup_card, splash, styled, title)
 
@@ -68,6 +69,7 @@ class SetupApp(App):
                 Binding("ctrl+q", "stop", show=False, priority=True),
                 Binding("tab", "browse(1)", show=False, priority=True),
                 Binding("shift+tab", "browse(-1)", show=False, priority=True),
+                Binding("ctrl+o", "open_directory_picker", show=False, priority=True),
                 Binding("escape", "back", show=False)]
     ENABLE_COMMAND_PALETTE = False
     TITLE = "Project Maya"
@@ -379,6 +381,7 @@ class SetupApp(App):
         self.show_question(fut, "text", question, [], [], [], 0, [])
         field = self.query_one("#text-answer", Input)
         field.value = default
+        self.query_one("#about", Static).update("Ctrl+O: browse and search folders.")
         field.focus()
 
     def ev_fail(self, msg: str, hint, fut: Future) -> None:
@@ -467,6 +470,17 @@ class SetupApp(App):
         fut.set_result(values[i])
 
     # ---------------------------------------------------------------------------------------- keys
+    def action_open_directory_picker(self) -> None:
+        if self.pending is not None and self.pending[2] == "text" and not isinstance(self.screen, DirectoryPicker):
+            field = self.query_one("#text-answer", Input)
+            self.push_screen(DirectoryPicker(field.value), self.directory_picked)
+
+    def directory_picked(self, path: str | None) -> None:
+        if path is not None and self.pending is not None and self.pending[2] == "text":
+            field = self.query_one("#text-answer", Input)
+            field.value = path
+            field.focus()
+
     def action_stop(self) -> None:
         if isinstance(self.screen, StopScreen):         # Ctrl+C twice
             self.screen.dismiss(True)
@@ -579,7 +593,7 @@ class SetupApp(App):
         if kind == "yn":
             keys = [("Enter", "Choose"), ("y n", "Answer")]
         elif kind == "text":
-            keys = [("Enter", "Use path")]
+            keys = [("Enter", "Use path"), ("Ctrl+O", "Browse folders")]
         elif kind:
             zero = kind == "choose" and self.zero_option
             keys = [("Enter", "Choose"), ("↑↓", "Move")] + ([(f"0, 1-{len(self.pending[1]) - int(zero)}", "Pick")]

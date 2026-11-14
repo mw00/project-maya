@@ -389,6 +389,69 @@ class Screen(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(app.return_value, ("done", 1))
         bridge.log.close()
 
+    async def test_add_downloaded_model_can_find_a_directory_in_the_browser(self):
+        source = Path(self.dir.name) / "source"
+        model = source / "Downloads" / "MyModel"
+        model.mkdir(parents=True)
+        (source / "Downloads-old").mkdir()
+        a = SimpleNamespace(models_dir=str(Path(self.dir.name) / "models"), copy=False, yes=False)
+        bridge = Bridge(self.log)
+        S.UI = bridge
+        app = T.SetupApp(bridge,
+                         lambda: maya.choose_with_add(a, "Which files?", [], [("First", None, None)], 0, False,
+                                                      Path(a.models_dir), "glm"),
+                         "1.0", "./maya.sh", self.log)
+        async with app.run_test(size=(110, 40)) as pilot:
+            async def until(condition):
+                t0 = time.time()
+                while not condition():
+                    self.assertLess(time.time() - t0, 20)
+                    await pilot.pause(0.02)
+
+            with patch.object(maya, "link_model", return_value=0) as linked:
+                await until(lambda: app.pending is not None)
+                await pilot.press("0")
+                await until(lambda: app.pending is not None and app.pending[2] == "text")
+                field = app.query_one("#text-answer", T.Input)
+                typed = str(source / "mistyped")
+                field.value = typed
+                await pilot.press("ctrl+o")
+                await until(lambda: isinstance(app.screen, T.DirectoryPicker))
+                await pilot.press("escape")
+                await until(lambda: not isinstance(app.screen, T.DirectoryPicker))
+                self.assertEqual(field.value, typed)
+                await pilot.press("ctrl+o")
+                await until(lambda: isinstance(app.screen, T.DirectoryPicker))
+                picker = app.screen
+                self.assertEqual(picker.current, source)
+                search = picker.query_one("#directory-search", T.Input)
+                search.value = "down"
+                await until(lambda: len(picker.items) == 4 and picker.items[2][0] == "Downloads/")
+                await pilot.press("down")
+                self.assertEqual(picker.query_one("#directory-list").highlighted, 3)
+                await pilot.press("up")
+                self.assertEqual(picker.query_one("#directory-list").highlighted, 2)
+                await pilot.press("enter")
+                await until(lambda: picker.current == source / "Downloads")
+                search.value = "mym"
+                await until(lambda: picker.items[-1][0] == "MyModel/")
+                await pilot.press("enter")
+                await until(lambda: picker.current == model)
+                await pilot.press("enter")      # Use this directory
+                await until(lambda: not isinstance(app.screen, T.DirectoryPicker))
+                self.assertEqual(field.value, str(model))
+                await pilot.press("enter")      # Confirm the path in the setup
+                await until(lambda: app.pending is not None and app.pending[2] == "choose" and
+                            "How to add" in str(app.query_one("#ask").border_title))
+                await pilot.press("enter")      # Link files
+                await until(lambda: app.pending is not None and "Which files?" in
+                            str(app.query_one("#ask").border_title))
+                await pilot.press("1")
+                await until(lambda: app.return_value is not None)
+            linked.assert_called_once_with(str(model), Path(a.models_dir), "glm")
+        self.assertEqual(app.return_value, ("done", 0))
+        bridge.log.close()
+
     async def test_glm_model_files_come_before_gpu_choice(self):
         a = SimpleNamespace(model=None, gguf_dir=None, draft=None, model_dir=None, models_dir=None,
                             backend="cuda", parallel=None, yes=False)
