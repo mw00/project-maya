@@ -1,9 +1,10 @@
-// src/kernels/ngram.cpp - P2.S4: the PLE n-gram hash and IQ4_NL/Q8_0 table reads.
+// src/kernels/ngram.cpp - P2.S4: the PLE n-gram hash and IQ4_NL/Q5_1/Q8_0/BF16 table reads.
 //
 // See include/strata/kernels/ngram.hpp for the semantics, the rival readings, and the note on MADV_RANDOM.
 #include "strata/kernels/ngram.hpp"
 #include "strata/artifact/gguf_reader.hpp"
 #include "strata/kernels/f16_bits.hpp"
+#include "strata/kernels/bf16_bits.hpp"
 #include "strata/ngram/ple_reader.hpp"
 
 #include <cstdio>
@@ -118,13 +119,55 @@ void q8_0_dequant_row(const uint8_t* row, float* out160) {
     }
 }
 
+void q5_1_dequant_row(const uint8_t* row, float* out160) {
+    for (int b = 0; b < PLE_HEAD_DIM / 32; ++b) {
+        const uint8_t* blk = row + (size_t) b * 24;
+        const float d = f32_from_f16((uint16_t) (blk[0] | (blk[1] << 8)));
+        const float m = f32_from_f16((uint16_t) (blk[2] | (blk[3] << 8)));
+        const uint32_t qh = (uint32_t) blk[4] | ((uint32_t) blk[5] << 8) |
+                            ((uint32_t) blk[6] << 16) | ((uint32_t) blk[7] << 24);
+        for (int j = 0; j < 16; ++j) {
+            const int lo = (blk[8 + j] & 15) | (int) (((qh >> j) << 4) & 16);
+            const int hi = (blk[8 + j] >> 4) | (int) ((qh >> (j + 12)) & 16);
+            out160[b * 32 + j] = (float) lo * d + m;
+            out160[b * 32 + j + 16] = (float) hi * d + m;
+        }
+    }
+}
+
+void bf16_dequant_row(const uint8_t* row, float* out160) {
+    for (int i = 0; i < PLE_HEAD_DIM; ++i)
+        out160[i] = f32_from_bf16((uint16_t) (row[2 * i] | (row[2 * i + 1] << 8)));
+}
+
+namespace {
+int ple_row_bytes(int type) {
+    switch (type) {
+    case 20: return PLE_ROW_BYTES;
+    case 7: return PLE_Q5_1_ROW_BYTES;
+    case 8: return PLE_Q8_ROW_BYTES;
+    case 30: return PLE_BF16_ROW_BYTES;
+    default: return 0;
+    }
+}
+
+void ple_dequant_row(int type, const uint8_t* row, float* out160) {
+    switch (type) {
+    case 20: iq4nl_dequant_row(row, out160); break;
+    case 7: q5_1_dequant_row(row, out160); break;
+    case 8: q8_0_dequant_row(row, out160); break;
+    case 30: bf16_dequant_row(row, out160); break;
+    }
+}
+}  // namespace
+
 // ---------------------------------------------------------------------------------------------------
 struct PleTable::Impl {
     GgufFile* file = nullptr;
     const uint8_t* data = nullptr;
     uint64_t n_rows = 0;
     int row_bytes = PLE_ROW_BYTES;
-    bool q8 = false;
+    int type = 20;
     mutable uint64_t bytes_read = 0;
     // Direct mode (plan v0.3 P2): the mapping above is released after the header parse and every row comes
     // from an unbuffered SSD read into `raw`.
@@ -133,7 +176,7 @@ struct PleTable::Impl {
     strata::ngram::PleReader::Ticket ticket;
     bool pending = false;
     uint32_t rows[PLE_N_HEADS] = {};
-    uint8_t raw[PLE_N_HEADS * PLE_Q8_ROW_BYTES] = {};
+    uint8_t raw[PLE_N_HEADS * PLE_MAX_ROW_BYTES] = {};
 };
 
 PleTable::PleTable() : impl_(new Impl) {}
@@ -163,13 +206,15 @@ bool PleTable::open(const std::string& gguf_path, std::string& err, const PleIoO
         close();
         return false;
     }
-    if (t->type != 20 && t->type != 8) {
-        err = std::string("per_layer_token_embd.weight is ") + t->type_name() + ", expected IQ4_NL or Q8_0";
+    const int row_bytes = ple_row_bytes((int) t->type);
+    if (!row_bytes) {
+        err = std::string("per_layer_token_embd.weight is ") + t->type_name() +
+              ", expected IQ4_NL, Q5_1, Q8_0 or BF16";
         close();
         return false;
     }
-    impl_->q8 = t->type == 8;
-    impl_->row_bytes = impl_->q8 ? PLE_Q8_ROW_BYTES : PLE_ROW_BYTES;
+    impl_->type = (int) t->type;
+    impl_->row_bytes = row_bytes;
     impl_->n_rows = t->shape[1];
     impl_->data = impl_->file->tensor_data(*t);
 
@@ -224,7 +269,7 @@ void PleTable::close() {
     impl_->data = nullptr;
     impl_->n_rows = 0;
     impl_->row_bytes = PLE_ROW_BYTES;
-    impl_->q8 = false;
+    impl_->type = 20;
 }
 
 bool PleTable::is_open() const { return impl_->data != nullptr || impl_->reader.is_open(); }
@@ -234,15 +279,14 @@ uint64_t PleTable::bytes_read() const { return impl_->bytes_read; }
 
 void PleTable::read_row(uint32_t row, float* out160) const {
     if (impl_->mode == PleIo::Direct && impl_->reader.is_open()) {
-        uint8_t raw[PLE_Q8_ROW_BYTES];
+        uint8_t raw[PLE_MAX_ROW_BYTES];
         std::string err;
         const auto t = impl_->reader.issue(&row, 1, raw);
         if (!impl_->reader.collect(t, err)) {
             std::memset(out160, 0, (size_t) PLE_HEAD_DIM * sizeof(float));
             return;
         }
-        if (impl_->q8) q8_0_dequant_row(raw, out160);
-        else iq4nl_dequant_row(raw, out160);
+        ple_dequant_row(impl_->type, raw, out160);
         impl_->bytes_read += impl_->row_bytes;
         return;
     }
@@ -251,8 +295,7 @@ void PleTable::read_row(uint32_t row, float* out160) const {
         return;
     }
     const uint8_t* raw = impl_->data + (size_t) row * impl_->row_bytes;
-    if (impl_->q8) q8_0_dequant_row(raw, out160);
-    else iq4nl_dequant_row(raw, out160);
+    ple_dequant_row(impl_->type, raw, out160);
     impl_->bytes_read += impl_->row_bytes;
 }
 
@@ -289,8 +332,7 @@ bool PleTable::collect(float* out2560, std::string& err) {
         for (int h = 0; h < PLE_N_HEADS; ++h) {
             const uint8_t* row = impl_->raw + (size_t) h * impl_->row_bytes;
             float* out = out2560 + (size_t) h * PLE_HEAD_DIM;
-            if (impl_->q8) q8_0_dequant_row(row, out);
-            else iq4nl_dequant_row(row, out);
+            ple_dequant_row(impl_->type, row, out);
         }
         impl_->bytes_read += (uint64_t) PLE_N_HEADS * impl_->row_bytes;
         return true;
@@ -308,8 +350,7 @@ bool PleTable::gather_batch(const uint32_t* rows, size_t n_tokens, float* out, s
         if (!impl_->reader.collect(ticket, err)) return false;
         for (size_t i = 0; i < n; ++i) {
             const uint8_t* row = raw.data() + i * impl_->row_bytes;
-            if (impl_->q8) q8_0_dequant_row(row, out + i * PLE_HEAD_DIM);
-            else iq4nl_dequant_row(row, out + i * PLE_HEAD_DIM);
+            ple_dequant_row(impl_->type, row, out + i * PLE_HEAD_DIM);
         }
         impl_->bytes_read += (uint64_t) n * impl_->row_bytes;
         return true;

@@ -1,6 +1,7 @@
 // include/strata/ngram/ple_reader.hpp - plan v0.3 P2: the n-gram table read straight from the SSD.
 //
-// The table is 320,001,536 rows of 90 bytes (26.8 GiB) and is never held in RAM: every row comes from an
+// The original IQ4_NL table is 320,001,536 rows of 90 bytes (26.8 GiB); other GGUF types use wider rows.
+// The table is never held in RAM: every row comes from an
 // unbuffered 4 KiB read (platform::DirectFile). A token needs 16 rows on 16 different pages, and all 16 depend
 // on the token itself, so the only time to hide them is the embedding plus layer 0. Hence the split API:
 //
@@ -11,7 +12,7 @@
 // `issue` also serves prefill: pass all 16 x N rows of a chunk; pages are deduplicated, sorted by offset and
 // kept at most `max_inflight` deep, so a chunk's reads can run while the previous chunk computes.
 //
-// THE ROW CACHE IS NOT THE TABLE. It keeps rows this process has already fetched (90 bytes each, bounded,
+// THE ROW CACHE IS NOT THE TABLE. It keeps rows this process has already fetched (one encoded row each, bounded,
 // clock eviction). Measured on the frozen corpus (bench/results/2026-09-23-ngram-io): 1M rows (~95 MB)
 // would serve up to ~82% of reads; within one long prompt 20-34% of rows recur. Capacity 0 disables it.
 #pragma once

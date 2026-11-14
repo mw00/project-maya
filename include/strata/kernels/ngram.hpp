@@ -5,8 +5,8 @@
 //   * `ngram_rows` - the HOST hash.  Sixteen row indices per token from the last three token ids, computed
 //     with 64-bit multiply/xor and no tensor op at all.  `qwen4exp.cpp` L1092-1124, where the source says
 //     outright that it is host-side because "ggml has no int64 and no xor".
-//   * `PleTable`  - the row gather.  `per_layer_token_embd.weight` is IQ4_NL or Q8_0 and is NOT IN THE PACK: it is
-//     51.2e9 elements (28.8 GB) in the ORIGINAL second GGUF shard, and it is the only tensor this engine
+//   * `PleTable`  - the row gather. `per_layer_token_embd.weight` is IQ4_NL, Q5_1, Q8_0 or BF16 and is NOT IN THE PACK:
+//     the original IQ4_NL table is 51.2e9 elements (28.8 GB) in the second GGUF shard, and it is the only tensor this engine
 //     reads from the GGUF rather than from the canonical pack.
 //
 // THE HASH IS THE ONE PLACE IN THIS MODEL WHERE A WRONG BIT IS SILENTLY PLAUSIBLE.  Every one of its
@@ -42,10 +42,14 @@ inline constexpr int32_t TOKEN_NULL = -1;       // LLAMA_TOKEN_NULL
 inline constexpr float NG_RMS_EPS = 1e-6f;
 
 // The table: [160, 320001536].  A row is 160 contiguous elements: five 32-value blocks, each 18 bytes for
-// IQ4_NL or 34 bytes for Q8_0. The head-slowest flatten makes 16 rows exactly n_embd = 2560.
+// IQ4_NL, 24 bytes for Q5_1, 34 bytes for Q8_0, or 64 bytes for BF16. The head-slowest flatten makes
+// 16 rows exactly n_embd = 2560.
 inline constexpr uint64_t PLE_TABLE_ROWS = 320001536ull;
 inline constexpr int PLE_ROW_BYTES = (PLE_HEAD_DIM / 32) * 18;           // 90
 inline constexpr int PLE_Q8_ROW_BYTES = (PLE_HEAD_DIM / 32) * 34;        // 170
+inline constexpr int PLE_Q5_1_ROW_BYTES = (PLE_HEAD_DIM / 32) * 24;      // 120
+inline constexpr int PLE_BF16_ROW_BYTES = PLE_HEAD_DIM * 2;             // 320
+inline constexpr int PLE_MAX_ROW_BYTES = PLE_BF16_ROW_BYTES;
 
 /// The artifact's own hash constants, transcribed from `docs/gguf-dump-shard1.txt`:
 ///
@@ -98,6 +102,10 @@ int iq4nl_code(int code);
 void iq4nl_dequant_row(const uint8_t* row, float* out160);
 /// One Q8_0 row (five 34-byte blocks) -> 160 floats.
 void q8_0_dequant_row(const uint8_t* row, float* out160);
+/// One Q5_1 row (five 24-byte blocks) -> 160 floats.
+void q5_1_dequant_row(const uint8_t* row, float* out160);
+/// One BF16 row (160 little-endian 16-bit values) -> 160 floats.
+void bf16_dequant_row(const uint8_t* row, float* out160);
 
 /// How the table's rows are read (plan v0.3 P2). `Direct` is the default: unbuffered 4 KiB reads from the SSD,
 /// so the table never occupies RAM or the OS file cache. `Mmap` is the earlier memory-mapped path, kept as the
@@ -111,7 +119,7 @@ enum class PleIo { Direct, Mmap };
 struct PleIoOptions {
     PleIo mode = PleIo::Direct;
     uint32_t max_inflight = 64;      ///< outstanding SSD reads (decode needs 16; prefill chunks use more)
-    uint64_t cache_rows = 1u << 20;  ///< bounded row cache: 1,048,576 rows x 90 B ~ 95 MB; 0 disables
+    uint64_t cache_rows = 1u << 20;  ///< bounded row cache: 1,048,576 rows; bytes per row depend on table type; 0 disables
     bool io_thread = true;           ///< reads submitted by a worker thread, not the caller
 };
 
