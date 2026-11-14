@@ -6208,9 +6208,9 @@ def ds4_vision_model(mmproj: bool = False) -> dict:
             "download_gb": sum(v[0] for v in man["files"].values()) / 1e9}
 
 
-def ds4_vision_dir(d: Path) -> Path:
-    """The vision tower's folder: beside the GGUFs' folders (as the drafter's), shared by every quant there."""
-    return d.parent / "vision"
+def ds4_vision_dir(d: Path, models: Path | None = None) -> Path:
+    """The shared vision folder; a model directly in --models-dir keeps it inside that folder."""
+    return (d if models is not None and d == models else d.parent) / "vision"
 
 
 def ds4_pack_has_vision(pack: Path) -> bool:
@@ -6795,7 +6795,9 @@ def ds4_pack_step(a, d: Path, gguf: bool = False, announce: bool = True, engram:
         shards += sorted(engram.glob("*.gguf"))
     drafter_new = gguf and (drafter or d.parent / "dspark" / "dspark.json").is_file() and not CDS.has_drafter(
         {"args": ["--pack", str(pack)]})               # (the drafter arrived after the pack was built)
-    vision_new = (gguf and (ds4_vision_dir(d) / "vision.json").is_file() and not ds4_pack_has_vision(pack)) or (
+    if gguf and vision_dir is None:
+        vision_dir = ds4_vision_dir(d)
+    vision_new = (gguf and (vision_dir / "vision.json").is_file() and not ds4_pack_has_vision(pack)) or (
         not gguf and vision_dir is not None and not ds4_pack_tower(pack))
     if not a.repack and read_json(pack / PACK_SOURCES).get("tools") == tools and not drafter_new and \
             not vision_new and all((pack / f).exists() for f in need) and pack_stale(pack, shards) is None:
@@ -6807,8 +6809,7 @@ def ds4_pack_step(a, d: Path, gguf: bool = False, announce: bool = True, engram:
         "Engram hash tables and the")
     say("  tokenizer (about a minute) ...")
     run([sys.executable, str(ROOT / "tools" / "ds4" / ("pack_gguf.py" if gguf else "pack.py")), "--model", str(d),
-         "--out", str(pack)] + (["--vision", str(ds4_vision_dir(d))] if gguf else
-                                ["--vision", str(vision_dir)] if vision_dir is not None else []) +
+         "--out", str(pack)] + (["--vision", str(vision_dir)] if vision_dir is not None else []) +
         (["--engram", str(engram)] if gguf and engram is not None else []) +
         (["--drafter", str(drafter)] if gguf and drafter is not None else []) +
         (["--shards"] + [Path(f).name for f in files] if gguf and files else []) +
@@ -7008,13 +7009,14 @@ def set_up_ds4(a, prev: dict) -> Path | None:
     own = ds4_quant_drafter(quant) if gguf else None   # (Maya-XS: its own drafter beside the shared one)
     dj = d.parent / "dspark" / own["json"] if own is not None and drafter else None
     tower = None if gguf or a.no_vision else DS4_EXL3[quant].get("tower")   # (DeepSeek's BF16 tower for the quant's own)
-    vdir = ds4_exl3_vision_dir(models) if tower else None
+    vdir = ds4_vision_dir(d, models) if gguf else ds4_exl3_vision_dir(models) if tower else None
     pack = ds4_pack_step(a, d, gguf, engram=engram, files=files, drafter=dj, without=without,
-                         vision_dir=vdir if vdir is not None and (vdir / "vision.bin").is_file() else None)   # 6
+                         vision_dir=vdir if gguf or vdir is not None and (vdir / "vision.bin").is_file() else None)   # 6
     if gguf:                                           # 7 (DeepSeek's checkpoint's tower, added to the pack)
-        vision = ds4_vision_step(a, pc, d, mmproj=quant in DS4_UD)   # (UD quants: unsloth's mmproj, the same tower)
+        vision = ds4_vision_step(a, pc, d, mmproj=quant in DS4_UD, v=vdir)   # (UD quants: unsloth's mmproj, the same tower)
         if vision and not ds4_pack_has_vision(pack):
-            pack = ds4_pack_step(a, d, gguf, announce=False, engram=engram, files=files, drafter=dj, without=without)
+            pack = ds4_pack_step(a, d, gguf, announce=False, engram=engram, files=files, drafter=dj, without=without,
+                                 vision_dir=vdir)
         vision = vision and ds4_pack_has_vision(pack)
     elif tower:                                        # 7 (the quant's own tower is EXL3: DeepSeek's BF16 one instead)
         vision = ds4_vision_step(a, pc, d, v=vdir)
