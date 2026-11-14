@@ -790,6 +790,10 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
     if (m.ablate_loaded())   // (--ablate: GEN ablate=0|1 turns its projection off / on for the request)
         std::printf("INFO ablate=1 ablate_default=%d\n", m.ablating() ? 1 : 0);
     const bool abl_default = m.ablating();   // (a GEN without ablate=: as the engine started)
+    // (the projection a state is read with: a kept conversation's and a shared start's key - Model::ablate_identity, ""
+    //  for a state read without it)
+    const std::string abl_id = m.ablate_identity();
+    const auto abl_of = [&]() { return m.ablating() ? abl_id : std::string(); };   // (the state in the model)
     if (m.seq_count() > 1)   // (--parallel: n conversations at once, GEN rid=<id>)
         std::printf("READY %lld stop multi=%d\n", (long long) m.max_context(), m.seq_count());
     else
@@ -866,7 +870,10 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
     // shorter one is read again in about the time its slot would take).  Pictures travel as their marks: where a span
     // starts, the fingerprint of its pixels, its length - not the pixels, not the rows (the KV of the span is what the
     // rows did).  A conversation is taken back for a prompt whose pictures are the same at the same places; another
-    // picture, or the same one elsewhere, shares no state past that place.
+    // picture, or the same one elsewhere, shares no state past that place.  An abliterated conversation (--ablate, GEN
+    // ablate=1) is set aside as any other, with the projection its state was read with (Model::ablate_identity, in its
+    // .meta too): only a request that projects the same direction out takes it back, and one without the projection
+    // takes back only a state read without it.
     const auto env_num = [](const char* k, double d) { const char* v = std::getenv(k); return v ? std::atof(v) : d; };
     const bool slot_keep =
         std::getenv("MAYA_DS4_SLOT_KEEP") != nullptr && std::atoi(std::getenv("MAYA_DS4_SLOT_KEEP")) != 0;
@@ -896,11 +903,12 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         std::shared_ptr<std::vector<uint8_t>> data;   // the RAM slot's bytes (null: a file slot)
         std::vector<int64_t> cks;                     // the positions short of its end it can be taken back at
         std::vector<Pic> pics;                        // the pictures it holds (start, hash; len once it is loaded)
+        std::string abl;                              // the projection its state was read with ("": none)
     };
     std::vector<Slot> slots;
     uint64_t slot_clock = 0, slot_seq = 0;
     const std::string slot_identity = m.slot_identity();
-    constexpr uint64_t kMetaMagic = 0x334154454d345344ull;   // "DS4META3" (little endian)
+    constexpr uint64_t kMetaMagic = 0x344154454d345344ull;   // "DS4META4" (little endian): META3 + the projection
     const auto note = [&](const std::string& msg) {
         std::fprintf(stderr, "ds4 slots: %s\n", msg.c_str());
         std::printf("NOTE sessions: %s\n", msg.c_str());
@@ -913,7 +921,8 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
     };
     const auto meta_of = [](const std::string& bin) { return bin.substr(0, bin.size() - 4) + ".meta"; };
     const auto meta_write = [&](const std::string& path, const std::vector<int32_t>& toks, uint64_t bytes,
-                                const std::vector<int64_t>& cks, const std::vector<Pic>& pics) -> bool {
+                                const std::vector<int64_t>& cks, const std::vector<Pic>& pics,
+                                const std::string& abl) -> bool {
         const std::string tmp = path + ".tmp";
         {
             std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
@@ -933,6 +942,9 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                 f.write((const char*) &q.start, 8);
                 f.write((const char*) &q.hash, 8);
             }
+            const uint64_t al = abl.size();     // (the projection the state was read with: "" none)
+            f.write((const char*) &al, 8);
+            f.write(abl.data(), (std::streamsize) al);
             f.write((const char*) &kMetaMagic, 8);
             f.flush();
             if (!f) return false;
@@ -941,12 +953,12 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         fs::rename(tmp, path, ec);
         return !ec;
     };
-    // a .meta of this model -> its tokens, the slot's size and its pictures (false: foreign, damaged or not this
-    // model's)
+    // a .meta of this model -> its tokens, the slot's size, its pictures and its projection (false: foreign, damaged
+    // or not this model's)
     const auto meta_read = [&](const std::string& path, std::vector<int32_t>& toks, uint64_t& bytes,
-                               std::vector<int64_t>& cks, std::vector<Pic>& pics) -> bool {
+                               std::vector<int64_t>& cks, std::vector<Pic>& pics, std::string& abl) -> bool {
         std::ifstream f(path, std::ios::binary);
-        uint64_t m0 = 0, il = 0, nt = 0, nc = 0, np = 0, m1 = 0;
+        uint64_t m0 = 0, il = 0, nt = 0, nc = 0, np = 0, al = 0, m1 = 0;
         if (!f.read((char*) &m0, 8) || m0 != kMetaMagic || !f.read((char*) &il, 8) || il != slot_identity.size())
             return false;
         std::string id(il, '\0');
@@ -967,6 +979,9 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             if (q.start < 0 || (uint64_t) q.start >= nt || (k > 0 && q.start <= pics.back().start)) return false;
             pics.push_back(q);
         }
+        if (!f.read((char*) &al, 8) || al > 256) return false;
+        abl.assign(al, '\0');
+        if (!f.read(abl.data(), (std::streamsize) al)) return false;
         if (!f.read((char*) &m1, 8) || m1 != kMetaMagic) return false;
         for (int64_t c : cks)
             if (c <= 0 || (uint64_t) c > nt) return false;
@@ -1057,7 +1072,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             }
         }
         fs::rename(path + ".tmp", path, ec);
-        if (ec || !meta_write(meta_of(path), s.tokens, s.data->size(), s.cks, s.pics)) {
+        if (ec || !meta_write(meta_of(path), s.tokens, s.data->size(), s.cks, s.pics, s.abl)) {
             std::filesystem::remove(path + ".tmp", ec);
             std::filesystem::remove(path, ec);
             std::fprintf(stderr, "ds4 slots: writing %s failed\n", path.c_str());
@@ -1071,8 +1086,9 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
     };
     // the conversation in the model into a slot (the state is lost otherwise: another one takes the model)
     const auto slot_put = [&](const char* why) {
-        if (slot_max <= 0 || m.ablating()) return;   // (an abliterated conversation is not kept: read again)
+        if (slot_max <= 0) return;
         const std::vector<int32_t>& t = m.tokens();
+        const std::string abl = abl_of();   // (kept with it: only a request with the same projection takes it back)
         if (t.size() < slot_min) return;   // (a fresh engine's 0-token state is no conversation: nothing to set aside)
         std::vector<strata::ds4::PicMark> marks;   // (the state's pictures: what the slot keeps of them - no pixels,
                                                    //  no rows)
@@ -1090,9 +1106,10 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             return;
         }
         for (size_t i = slots.size(); i-- > 0;)   // an earlier state of this conversation is superseded
-            if (slots[i].tokens.size() <= t.size() && std::equal(slots[i].tokens.begin(), slots[i].tokens.end(), t.begin()))
+            if (slots[i].abl == abl && slots[i].tokens.size() <= t.size() &&
+                std::equal(slots[i].tokens.begin(), slots[i].tokens.end(), t.begin()))
                 slot_drop(i);
-        slots.push_back({t, "", bytes, ++slot_clock, nullptr, m.check_positions(), {}});
+        slots.push_back({t, "", bytes, ++slot_clock, nullptr, m.check_positions(), {}, abl});
         slots.back().data = buf;
         slots.back().pics.clear();
         for (const auto& k : marks)
@@ -1129,13 +1146,15 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
     // earlier reasoning - comes back at its latest checkpoint the prompt still agrees with (the end of a prompt, the
     // position before it, the anchor where its run of continued prompts began).  A conversation whose pictures (their
     // places, their pixels) the prompt agrees with up to that point comes back too: the KV of a picture's span needs
-    // the same picture (the tokens alone are all the image token, whatever the image).
-    const auto slot_take = [&](const std::vector<int>& prompt, const std::vector<Pic>& want, size_t floor,
-                               bool& whole) -> size_t {
+    // the same picture (the tokens alone are all the image token, whatever the image).  Only a conversation read with
+    // the request's projection (`abl`, "" none) comes back: an abliterated state shares nothing with a plain request.
+    const auto slot_take = [&](const std::vector<int>& prompt, const std::vector<Pic>& want, const std::string& abl,
+                               size_t floor, bool& whole) -> size_t {
         whole = false;
         if (slot_max <= 0 || prompt.size() < 2) return 0;
         size_t best = SIZE_MAX, len = 0;
         for (size_t i = 0; i < slots.size(); ++i) {
+            if (slots[i].abl != abl) continue;   // (another projection: not this request's state)
             const auto& t = slots[i].tokens;
             const size_t lim = std::min(t.size(), prompt.size() - 1);   // (a prompt always reads its last token)
             size_t c = 0;
@@ -1212,11 +1231,13 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
     // back and reads only the rest.  It is the state the read itself keeps at that point (a whole read up to it), so
     // the rest is read as a cold read of the same prompt reads it: the same tokens.  MAYA_DS4_PREFIX_KEEP (2) starts at
     // most, the least recently used giving way, MAYA_DS4_PREFIX_GB (2) their bytes at most, MAYA_DS4_PREFIX_MIN (1024)
-    // the shortest start kept; MAYA_DS4_PREFIX_KEEP=0: none.  Starts with pictures are not kept.
+    // the shortest start kept; MAYA_DS4_PREFIX_KEEP=0: none.  Starts with pictures are not kept.  A start read with a
+    // projection (--ablate) is kept with it, and only a request with the same projection takes it back.
     struct Prefix {
         std::vector<int32_t> tokens;
         std::vector<uint8_t> data;
         uint64_t used = 0;
+        std::string abl;   // the projection its state was read with ("": none)
     };
     std::vector<Prefix> prefixes;
     uint64_t prefix_clock = 0;
@@ -1224,9 +1245,11 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
     const uint64_t prefix_budget = (uint64_t) (std::max(0.0, env_num("MAYA_DS4_PREFIX_GB", 2)) * 1073741824.0);
     const size_t prefix_min = (size_t) std::max(1.0, env_num("MAYA_DS4_PREFIX_MIN", 1024));
     // the longest kept start the prompt begins with, past `floor` tokens and short of its last token (none: -1)
-    const auto prefix_find = [&](const std::vector<int>& prompt, const std::vector<Pic>& want, size_t floor) -> int {
+    const auto prefix_find = [&](const std::vector<int>& prompt, const std::vector<Pic>& want, const std::string& abl,
+                                 size_t floor) -> int {
         int best = -1;
         for (size_t i = 0; i < prefixes.size(); ++i) {
+            if (prefixes[i].abl != abl) continue;   // (another projection: not this request's state)
             const auto& t = prefixes[i].tokens;
             if (t.size() <= floor || t.size() + 1 > prompt.size() ||
                 (best >= 0 && t.size() <= prefixes[(size_t) best].tokens.size()))
@@ -1241,9 +1264,10 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
     // the state as the read keeps it at a shared start: kept apart (a copy of it), unless it already is
     const auto prefix_keep = [&]() {
         const std::vector<int32_t>& t = m.tokens();
-        if (prefix_max <= 0 || t.size() < prefix_min || m.ablating()) return;   // (nor an abliterated start)
+        if (prefix_max <= 0 || t.size() < prefix_min) return;
+        const std::string abl = abl_of();
         for (Prefix& p : prefixes)
-            if (p.tokens == t) {
+            if (p.tokens == t && p.abl == abl) {
                 p.used = ++prefix_clock;
                 return;
             }
@@ -1258,6 +1282,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         if (bytes > prefix_budget) return;
         p.tokens = t;
         p.used = ++prefix_clock;
+        p.abl = abl;
         prefixes.push_back(std::move(p));
         uint64_t total = 0;
         for (const Prefix& x : prefixes) total += x.data.size();
@@ -1307,6 +1332,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                 std::vector<int64_t> cks;
                 std::vector<Pic> pics;
                 fs::file_time_type t;
+                std::string abl;
             };
             std::vector<Found> found;
             size_t refused = 0;
@@ -1321,9 +1347,9 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                 }
                 if (!is_meta) continue;      // a .bin is judged by its .meta
                 const std::string bin = p.substr(0, p.size() - 5) + ".bin";
-                Found fd{bin, {}, 0, {}, {}, fs::last_write_time(de.path(), ec)};
+                Found fd{bin, {}, 0, {}, {}, fs::last_write_time(de.path(), ec), {}};
                 const uint64_t have = fs::exists(bin, ec) ? (uint64_t) fs::file_size(bin, ec) : 0;
-                if (meta_read(p, fd.toks, fd.bytes, fd.cks, fd.pics) && have == fd.bytes && fd.bytes > 0 &&
+                if (meta_read(p, fd.toks, fd.bytes, fd.cks, fd.pics, fd.abl) && have == fd.bytes && fd.bytes > 0 &&
                     slot_age_days(p) <= slot_days)
                     found.push_back(std::move(fd));
                 else {
@@ -1343,7 +1369,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             for (auto& fd : found) {
                 total += fd.bytes;
                 slots.push_back({std::move(fd.toks), fd.bin, fd.bytes, ++slot_clock, nullptr, std::move(fd.cks),
-                                 std::move(fd.pics)});
+                                 std::move(fd.pics), std::move(fd.abl)});
             }
             std::string msg = "folder " + slot_dir.string() + ": " + std::to_string(slots.size()) +
                               " conversation(s) kept from earlier runs (" + gb(total) + ")";
@@ -1537,8 +1563,8 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         for (const Pic& q : held)
             if ((size_t) q.start < c && !pic_same(pics, q)) c = (size_t) q.start;
         // abliteration: a state read with the projection on shares nothing with a request that has it off, and the
-        // other way round - the conversation starts over (an abliterated one is never kept as a slot or a shared start:
-        // slot_put / prefix_keep, so none is taken back either)
+        // other way round - the conversation starts over.  A conversation set aside and a shared start keep the
+        // projection they were read with (slot_put / prefix_keep), and only a request with the same one takes them back
         const bool abl = m.ablate_loaded() && (r.ablate >= 0 ? r.ablate != 0 : abl_default);
         const bool abl_flip = m.ablate_loaded() && abl != m.ablating();
         if (abl_flip) c = 0;
@@ -1562,9 +1588,10 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             bool whole = false;
             // (a kept shared start, when it covers more than the state itself can go back to; a kept conversation
             //  only when it covers more than either)
-            const int pi = abl ? -1 : prefix_find(r.ids, pics, rs > 0 ? (size_t) rs : 0);
+            const std::string want_abl = abl ? abl_id : std::string();   // (the projection this prompt is read with)
+            const int pi = prefix_find(r.ids, pics, want_abl, rs > 0 ? (size_t) rs : 0);
             const size_t plen = pi >= 0 ? prefixes[(size_t) pi].tokens.size() : 0;
-            const size_t back = abl ? 0 : slot_take(r.ids, pics, std::max(rs > 0 ? (size_t) rs : 0, plen), whole);
+            const size_t back = slot_take(r.ids, pics, want_abl, std::max(rs > 0 ? (size_t) rs : 0, plen), whole);
             beat();
             if (back > 0) {
                 from = back;
