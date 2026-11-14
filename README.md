@@ -308,7 +308,8 @@ The setup shows every download before it starts it, builds everything once (20-4
   stay at their original location for Maya to use them.
   An unlisted Qwen3.8-Flash-Next GGUF (for example unsloth's Q8_0) is linked as a local quant and set up with its
   selected MTP and vision files. Keep all its shards at their original location; Maya builds a separate pack and
-  config for that quant.
+  config for that quant. The Qwen runtime reads `qwen4exp.attention.indexer.top_k` from the model GGUF and supports
+  both 2048 and 4096; older files without the key use 2048.
 - **Every option** (GPUs, context, a model folder you already have, remote access, ...): [docs/SETUP.md](docs/SETUP.md).
 
 > **The start takes a few minutes:** the engine pins most of the free RAM (all but about 6 GB) for its expert tier,

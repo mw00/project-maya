@@ -14,8 +14,9 @@
 //    runs in ONE block so the ascending walk is a chunked scan rather than a second global pass.  Phase 3
 //    replaces it with a radix select; this one is the thing that radix select has to agree with.
 //
-// 2. ONE BLOCK PER HEAD IN `qsa_attend`, SCORES IN SHARED MEMORY.  n_ids reaches 2051, so a per-head score
-//    vector is 8 KB and 24 heads are 24 blocks: the whole attention is 24 blocks x 256 threads, which is a
+// 2. ONE BLOCK PER HEAD IN `qsa_attend`, SCORES IN SHARED MEMORY.  n_ids reaches 4099 for a model with
+//    indexer.top_k=4096, so a per-head score vector is at most 16 KB. The whole attention is 24 blocks x 256
+//    threads, which is a
 //    small grid, but it is also exactly the shape the source uses (one flash tile per query head) and it keeps
 //    the softmax's three passes over the scores in shared memory instead of in global.  The score loop has one
 //    thread per CELL walking the 256 dims sequentially, which reads 16-byte-vectorisable half2 runs; the value

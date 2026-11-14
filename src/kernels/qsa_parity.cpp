@@ -47,6 +47,7 @@
 //     1e-3 for FP16 paths.  That difference is the FP16 CACHE's cost, not the kernel's, and it is kept
 //     separate so a kernel bug cannot hide inside it.
 #include "strata/kernels/qsa.hpp"
+#include "strata/kernels/qsa_select.hpp"
 
 #include "strata/kernels/f16_bits.hpp"
 #include "strata/kernels/rope.hpp"
@@ -885,6 +886,35 @@ int main(int argc, char** argv) {
             require("  ...exactly one cell is dropped, and it is the smallest score",
                     missing == 1 && !kept[(size_t) argmin], std::to_string(missing) + " dropped");
         }
+    }
+
+    // An unlisted Qwen GGUF may set indexer.top_k=4096. Check both the per-token and prompt selectors
+    // against an independent sort beyond the 4099-cell identity boundary.
+    {
+        const auto s = strata::kernels::qsa_real_shapes(4096);
+        constexpr int64_t n = 5000;
+        const int64_t cap = strata::kernels::qsa_selection_width(MAXC, s);
+        const int64_t blocks = (n + s.idx_block - 1) / s.idx_block;
+        std::vector<float> block_scores((size_t) (blocks + 1), 0.0f);
+        std::vector<float> cell_scores((size_t) n);
+        for (int64_t b = 0; b < blocks; ++b) {
+            block_scores[(size_t) b] = rnd(1.0);
+            for (int64_t j = b * s.idx_block; j < std::min(n, (b + 1) * s.idx_block); ++j)
+                cell_scores[(size_t) j] = block_scores[(size_t) b];
+        }
+        const auto want = ref_select(as_d(cell_scores), n, s.idx_top_k, false);
+        Dev<float> d_cells, d_blocks;
+        Dev<int32_t> d_ids((size_t) cap), d_step;
+        d_cells.put(cell_scores);
+        d_blocks.put(block_scores);
+        std::vector<int32_t> step(strata::kernels::kStepCount);
+        strata::kernels::qsa_step_fill(step.data(), n - 1, s);
+        d_step.put(step);
+        strata::kernels::topk_512(d_cells.p, n, s, cap, d_ids.p, nullptr);
+        require("Q8 indexer 4096: decode selector matches independent sort", d_ids.get(want.size()) == want);
+        strata::kernels::qsa_block_topk(d_blocks.p, d_step.p, 1, blocks + 1, cap, s, d_ids.p, nullptr);
+        check(cudaDeviceSynchronize(), "Q8 indexer prompt selector");
+        require("Q8 indexer 4096: prompt selector matches independent sort", d_ids.get(want.size()) == want);
     }
 
     // ================= 5. qsa_attend on the loud-cell fixture =================

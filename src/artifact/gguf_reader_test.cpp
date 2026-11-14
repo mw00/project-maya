@@ -10,6 +10,7 @@
 // alignment), so the test needs neither gguf-py nor a shard.  The file is closed before it is removed:
 // on Windows an open mapping keeps it.
 #include "strata/artifact/gguf_reader.hpp"
+#include "strata/kernels/qsa.hpp"
 
 #include <cstdint>
 #include <cstdio>
@@ -37,12 +38,17 @@ void put_str(std::vector<uint8_t>& b, const std::string& s) {
 }
 
 // A GGUF v3 file of F32[8] tensors named `names`, laid out 32 bytes apart from a 32-byte-aligned data start.
-std::filesystem::path write_gguf(const std::vector<std::string>& names) {
+std::filesystem::path write_gguf(const std::vector<std::string>& names, int indexer_top_k = -1) {
     std::vector<uint8_t> b;
     put<uint32_t>(b, 0x46554747u);   // "GGUF"
     put<uint32_t>(b, 3);
     put<uint64_t>(b, names.size());  // n_tensors
-    put<uint64_t>(b, 0);             // n_kv
+    put<uint64_t>(b, indexer_top_k >= 0 ? 1 : 0); // n_kv
+    if (indexer_top_k >= 0) {
+        put_str(b, "qwen4exp.attention.indexer.top_k");
+        put<uint32_t>(b, (uint32_t) strata::MetaType::U32);
+        put<uint32_t>(b, (uint32_t) indexer_top_k);
+    }
     for (size_t i = 0; i < names.size(); ++i) {
         put_str(b, names[i]);
         put<uint32_t>(b, 1);         // n_dims
@@ -87,6 +93,27 @@ int main() {
         check(err.find("blk.0.attn_q.weight") != std::string::npos, "  the error names the tensor");
         check(err.find(path.filename().string()) != std::string::npos, "  the error names the file");
         if (!err.empty()) std::printf("  (%s)\n", err.c_str());
+    }
+    for (const int declared : {-1, 2048, 4096, 3072}) {
+        const auto path = write_gguf({}, declared);
+        int64_t top_k = 0;
+        std::string err;
+        try {
+            strata::GgufFile g(path.string());
+            err = strata::qwen_indexer_top_k(g, top_k);
+        } catch (const std::exception& e) {
+            err = e.what();
+        }
+        std::filesystem::remove(path);
+        const bool supported = declared != 3072;
+        check(supported ? err.empty() && top_k == (declared < 0 ? 2048 : declared) :
+                          err.find("supported: 2048 or 4096") != std::string::npos,
+              ("indexer budget in GGUF: " + std::to_string(declared)).c_str());
+        if (supported) {
+            const auto shapes = strata::kernels::qsa_real_shapes(top_k);
+            check(strata::kernels::qsa_selection_width(5000, shapes) == top_k + 3,
+                  ("QSA selection width follows GGUF budget " + std::to_string(top_k)).c_str());
+        }
     }
     std::printf(g_fail ? "gguf_reader_test: %d FAILED\n" : "gguf_reader_test: all passed\n", g_fail);
     return g_fail ? 1 : 0;

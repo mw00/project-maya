@@ -5445,6 +5445,11 @@ int main(int argc, char** argv) {
             }
             if (const strata::MetaValue* v = model_gguf.get("qwen4exp.expert_count")) g.n_expert = (int64_t) v->u;
             if (const strata::MetaValue* v = model_gguf.get("qwen4exp.expert_used_count")) K = (int64_t) v->u;
+            if (const std::string e = strata::qwen_indexer_top_k(model_gguf, g.idx_top_k); !e.empty()) {
+                std::fprintf(stderr, "maya generate: %s\n", e.c_str());
+                return 2;
+            }
+            std::fprintf(stderr, "maya generate: Qwen indexer top_k=%lld\n", (long long) g.idx_top_k);
         } catch (const std::exception& e) {
             std::fprintf(stderr, "maya generate: reading the model's expert shape from %s: %s\n",
                          o.native_preset.c_str(), e.what());
@@ -8649,7 +8654,7 @@ int main(int argc, char** argv) {
                 cudaDeviceSynchronize();
                 const int64_t L = (int64_t) live.size();
                 const strata::kernels::QsaShapes qs = [&] {
-                    strata::kernels::QsaShapes s = strata::kernels::qsa_real_shapes();
+                    strata::kernels::QsaShapes s = strata::kernels::qsa_real_shapes(g.idx_top_k);
                     s.n_head_kv = g.n_head_kv; s.head_dim = g.head_dim; s.idx_dim = g.idx_key_dim;
                     return s;
                 }();

@@ -140,7 +140,7 @@ void gdn_point_at(const ModelGeometry& g, int64_t layer, SessionState& s) {
 /// The per-token staging every QSA layer's captured H2D reads FROM.  Must run before each replay: the graphs
 /// captured the SOURCE POINTER, not the value, and that is exactly why the buffers are pinned and fixed.
 void stage_token(const ModelGeometry& g, int64_t pos, int32_t pos_base, SessionState& s) {
-    strata::kernels::QsaShapes sh = strata::kernels::qsa_real_shapes();
+    strata::kernels::QsaShapes sh = strata::kernels::qsa_real_shapes(g.idx_top_k);
     sh.n_head = g.n_head;
     sh.n_head_kv = g.n_head_kv;
     sh.head_dim = g.head_dim;

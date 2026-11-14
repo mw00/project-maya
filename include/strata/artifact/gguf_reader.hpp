@@ -494,6 +494,23 @@ struct Qwen4ExpGuard {
                                   // fewer experts than the canonical 512; the graph reads the true value
 };
 
+inline std::string qwen_indexer_top_k(const GgufFile& g, int64_t& out) {
+    out = 2048;   // older GGUFs without the key use the original Qwen indexer budget
+    const MetaValue* v = g.get("qwen4exp.attention.indexer.top_k");
+    if (!v) return {};
+    switch (v->type) {
+    case MetaType::U8: case MetaType::I8: case MetaType::U16: case MetaType::I16:
+    case MetaType::U32: case MetaType::I32: case MetaType::U64: case MetaType::I64:
+        break;
+    default:
+        return "qwen4exp.attention.indexer.top_k must be an integer";
+    }
+    if (v->u != 2048 && v->u != 4096)
+        return "qwen4exp.attention.indexer.top_k = " + std::to_string(v->u) + ", supported: 2048 or 4096";
+    out = (int64_t) v->u;
+    return {};
+}
+
 inline std::string check_architecture(const GgufFile& g, const Qwen4ExpGuard& want = {}) {
     const MetaValue* arch = g.get("general.architecture");
     if (!arch) return "missing general.architecture";
@@ -520,6 +537,8 @@ inline std::string check_architecture(const GgufFile& g, const Qwen4ExpGuard& wa
         if (r.want && v->u != r.want && !(r.key == reqs[0].key && extra > 0 && v->u == r.want + extra))
             return std::string(r.key) + " = " + std::to_string(v->u) + ", expected " + std::to_string(r.want);
     }
+    int64_t top_k = 0;
+    if (const std::string err = qwen_indexer_top_k(g, top_k); !err.empty()) return err;
     return {}; // empty == ok
 }
 

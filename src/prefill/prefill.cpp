@@ -638,7 +638,7 @@ bool Prefill::carve(size_t T, void* alloc) {
     m.mixed = o.take<float>(T * N, ok); m.mixed_bf = o.take<uint16_t>(T * N, ok);
     m.mixed_h = o.take<uint16_t>(T * N, ok); m.bo = o.take<float>(T * N, ok);
     m.steps_dev = o.take<int32_t>(T * strata::kernels::kStepCount, ok);
-    strata::kernels::QsaShapes s = strata::kernels::qsa_real_shapes();
+    strata::kernels::QsaShapes s = strata::kernels::qsa_real_shapes(g.idx_top_k);
     s.n_head = g.n_head; s.n_head_kv = g.n_head_kv; s.head_dim = g.head_dim; s.idx_n_head = g.idx_q_heads;
     s.idx_dim = g.idx_key_dim;
     m.cap = strata::kernels::qsa_selection_width(strata::kernels::kTopkMaxCells, s);
@@ -809,7 +809,7 @@ bool Prefill::draft_kv(core::MtpDrafter& mtp, const float* R_rows, const int32_t
     int32_t* bnd = q8 ? (int32_t*) carve(16) : nullptr;
     if ((uint64_t) (q - m.region) > m.region_bytes) return false;
     if (!mtp.idle(err)) return false;   // the drafter's own stream (its graph uploads) before this writes its K/V
-    strata::kernels::QsaShapes s = strata::kernels::qsa_real_shapes();
+    strata::kernels::QsaShapes s = strata::kernels::qsa_real_shapes(g.idx_top_k);
     s.n_head = g.n_head; s.n_head_kv = g.n_head_kv; s.head_dim = g.head_dim; s.idx_n_head = g.idx_q_heads;
     s.idx_dim = g.idx_key_dim;
     std::vector<int32_t> tk((size_t) B);
@@ -903,7 +903,7 @@ uint64_t Prefill::bytes_needed(const core::ModelGeometry& g, const core::Session
     f(T * N); f(T * D); f(T * D); o.take<uint16_t>(T * D, ok); f(T * LR); o.take<uint16_t>(T * LR, ok);
     f(T * D); f(T * HC); f(T * N); o.take<uint16_t>(T * N, ok); o.take<uint16_t>(T * N, ok); f(T * N);
     o.take<int32_t>(T * strata::kernels::kStepCount, ok);
-    strata::kernels::QsaShapes s = strata::kernels::qsa_real_shapes();
+    strata::kernels::QsaShapes s = strata::kernels::qsa_real_shapes(g.idx_top_k);
     s.n_head = g.n_head; s.n_head_kv = g.n_head_kv; s.head_dim = g.head_dim; s.idx_n_head = g.idx_q_heads;
     s.idx_dim = g.idx_key_dim;
     const int64_t cap = strata::kernels::qsa_selection_width(strata::kernels::kTopkMaxCells, s);
@@ -1038,7 +1038,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
         }
     } pipe_end{hand_in_ == nullptr ? this : nullptr};
     double host_sync_ms = 0, host_chunk_ms = 0, host_setup_ms = 0;   // MAYA_PREFILL_TIMING: the host's share
-    strata::kernels::QsaShapes s = strata::kernels::qsa_real_shapes();
+    strata::kernels::QsaShapes s = strata::kernels::qsa_real_shapes(g.idx_top_k);
     s.n_head = g.n_head; s.n_head_kv = g.n_head_kv; s.head_dim = g.head_dim; s.idx_n_head = g.idx_q_heads;
     s.idx_dim = g.idx_key_dim;
     const uint64_t gdn_floats = (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size +
