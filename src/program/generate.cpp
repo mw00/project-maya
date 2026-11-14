@@ -32,6 +32,7 @@
 #include "strata/kernels/ngram.hpp"
 #include "strata/kernels/s2_expert_grouped.hpp"
 #include "strata/kernels/sampler.hpp"
+#include "strata/core/glm_pages.hpp" // intake lookup refs the shared-prefix pages
 #include "strata/kernels/verify_kernels.hpp"
 #include "strata/kernels/shared_expert.hpp"
 #include "strata/kernels/native_moe.hpp"
@@ -1547,7 +1548,10 @@ static int glm_pack_generate(const Options& o) {
             slot_max = 0;
         }
     }
-    const auto slot_drop = [&](size_t i) {
+    const auto slot_drop = [&](size_t i) -> bool {
+ // an anchored slot (a paused request's kept prompt state) refuses the drop:
+        // the eviction paths' "not evicted" answer
+        if (slots[i].anchor) return false;
         if (slots[i].data)                       // a RAM slot: its buffer simply dies
             slots[i].data.reset();
         else {
@@ -1556,6 +1560,7 @@ static int glm_pack_generate(const Options& o) {
             std::filesystem::remove(meta_of(slots[i].path), ec);
         }
         slots.erase(slots.begin() + (long) i);
+        return true;
     };
     const auto slot_lru = [&](size_t keep) {   // the least recently used slot other than `keep`
         size_t lru = SIZE_MAX;
@@ -1574,7 +1579,10 @@ static int glm_pack_generate(const Options& o) {
                 slots[i].tokens.size() <= snap_tokens.size() &&
                 std::equal(slots[i].tokens.begin(), slots[i].tokens.end(), snap_tokens.begin()))
                 slot_drop(i);
-        while (!slots.empty() && slots.size() >= (size_t) slot_max) slot_drop(slot_lru(SIZE_MAX));
+        while (!slots.empty() && slots.size() >= (size_t) slot_max) {
+            const size_t lru = slot_lru(SIZE_MAX);
+            if (lru == SIZE_MAX || !slot_drop(lru)) break;   // an anchored slot refuses: the cap stays over
+        }
         if (slot_ram) {   // the conversation is parked in a host buffer; nothing touches the disk
             const auto t0 = std::chrono::steady_clock::now();
             std::string e;
@@ -1595,8 +1603,10 @@ static int glm_pack_generate(const Options& o) {
             size_t evicted = 0;
             while (slots.size() > 1 && total > slot_cap) {
                 const size_t i = slot_lru(slots.size() - 1);
-                total -= slots[i].bytes;
-                slot_drop(i);
+                if (i >= slots.size()) break;
+                const uint64_t b = slots[i].bytes;
+                if (!slot_drop(i)) break;        // an anchored slot refuses: the budget stays over
+                total -= b;
                 ++evicted;
             }
             char m[288];
@@ -1637,8 +1647,10 @@ static int glm_pack_generate(const Options& o) {
         size_t evicted = 0;
         while (slots.size() > 1 && total > slot_cap) {
             const size_t i = slot_lru(slots.size() - 1);
-            total -= slots[i].bytes;
-            slot_drop(i);
+            if (i >= slots.size()) break;
+            const uint64_t b = slots[i].bytes;
+            if (!slot_drop(i)) break;        // an anchored slot refuses: the budget stays over
+            total -= b;
             ++evicted;
         }
         char m[256];
@@ -1876,12 +1888,25 @@ static int glm_pack_generate(const Options& o) {
         // CONVERSATION REUSE (the fast path): the previous prompt's state, saved just before its last token, is
         // restored when this prompt extends it - a chat's next turn reads only what is new
         strata::core::progress_at("the request: restoring a conversation");
+        // the registry capture first (a paused conversation's pages
+        // live in the pool refcounted; the restore consumes the entry), the
+        // incumbent snapshot_restore second when no capture matches
+        {
+            std::vector<int32_t> span;
+            const int64_t r = model.pause_resume(prompt, span);
+            if (r > 0) {
+                snap_tokens = std::move(span);
+                snap_img_hash = img_hash(snap_tokens.size());
+                snap_in_slot = false;
+                reuse = (size_t) r;
+            }
+        }
         // --ablate: the state, its snapshot and its checkpoints were read with this conversation's setting - a request
         // with the other one reuses none of them (the prompt is read from the start); projected states are never kept
         // as slots or in the prompt cache (slot_put / below), and none is taken back for a projecting request
         const bool abl_want = abl_req();
         const bool abl_flip = model.ablate_loaded() && abl_want != model.ablating();
-        const bool snap_ok = !abl_flip && model.fast() && !snap_tokens.empty() && snap_tokens.size() < prompt.size() &&
+        const bool snap_ok = !abl_flip && model.fast() && reuse == 0 && !snap_tokens.empty() && snap_tokens.size() < prompt.size() &&
                              std::equal(snap_tokens.begin(), snap_tokens.end(), prompt.begin()) &&
                              img_hash(snap_tokens.size()) == snap_img_hash && getenv("MAYA_GLM_NO_REUSE") == nullptr;
         // the longest checkpoint this prompt starts with (it holds less than the snapshot when both match)
@@ -1944,6 +1969,30 @@ static int glm_pack_generate(const Options& o) {
         if (model.ablate_loaded()) {   // (the conversation's setting from here on: the state it holds now is read so)
             model.set_ablate(abl_want);
             if (abl_flip && reuse == 0) snap_tokens.clear();   // (the other setting's snapshot: never restored again)
+        }
+        // the shared-prefix tiles (the intake's verified chain) - only without a
+        // snapshot/slot reuse (the snapshot's state is fresher than any tile's); the skip
+        // rides the prefill's start exactly like the snapshot's reuse does, and a failed
+        // apply falls back to the incumbent path (the refs released, the state re-zeroed)
+        if (reuse == 0 && model.fast() && getenv("MAYA_GLM_NO_PREFIX") == nullptr) {
+            const size_t skip = model.prefix_intake(prompt);
+            std::fprintf(stderr, "glm prefix: intake %zu of %zu prompt tokens\n",
+                         skip, prompt.size());   // Step 2's window diagnostic: the miss prints too
+            if (skip > 0) {
+                if (model.prefix_apply(prompt, skip, err)) {
+                    reuse = skip;
+                    // Step 2's window gate: the skip is the gate's primary measurement
+                    std::fprintf(stderr, "glm prefix: skip %zu of %zu prompt tokens\n",
+                                 skip, prompt.size());
+                } else {
+                    std::fprintf(stderr, "glm prefix: the intake's apply failed (%s) - the prompt reads again\n",
+                                 err.c_str());
+                    model.prefix_release();
+                    model.reset();
+                    reuse = 0;
+                    err.clear();
+                }
+            }
         }
         ckpt_drop_past(reuse);   // this prompt writes the state from `reuse` on (all of it after a reset)
         // THE TURN'S START: a prompt that goes on from the snapshot and opens its last turn (<|user|> / <|observation|>)
@@ -2251,6 +2300,12 @@ static int glm_pack_generate(const Options& o) {
                 snap_in_slot = false;
                 std::fprintf(stderr, "glm slots: paused at %lld tokens (%lld written): the state is kept there\n",
                              (long long) p, (long long) emitted.size());
+ // the state ALSO lives as a registry-owned capture (the paused
+                // sequence's pages refcounted in the pool, keyed by this token span), so the
+                // slot's park and every pressure sweep leave the conversation intact.  When
+                // the capture is refused (the pool off or full) the incumbent snap_/snap_pool_
+                // pair above is the only path (unchanged behaviour).
+                model.pause_capture(snap_tokens.data(), (int) snap_tokens.size());
             } else if (p > (int64_t) prompt.size()) {
                 std::fprintf(stderr, "glm slots: paused, but the state stands at %lld of %lld tokens: not kept\n",
                              (long long) p, (long long) full);
@@ -2615,7 +2670,7 @@ static int glm_pack_generate(const Options& o) {
     std::vector<Ctx> ctxs((size_t) model.seq_count());
     int cur_ctx = 0;
     uint64_t ctx_clock = 0;
-    const auto bind_ctx = [&](int c) {
+    const auto bind_ctx = [&](int c) -> bool {
         if (c != cur_ctx) {
             Ctx& was = ctxs[(size_t) cur_ctx];
             was.snap_tokens = std::move(snap_tokens);
@@ -2632,7 +2687,64 @@ static int glm_pack_generate(const Options& o) {
             cur_ctx = c;
         }
         ckpt_base = c * ckpt_max;   // (one conversation, or none kept: 0)
-        model.seq_bind_all(c);   // (the pipelined decode binds the model's sequences itself)
+        return model.seq_bind_all(c);   // (the pipelined decode binds the model's sequences itself)
+    };
+ // one context's release, its conversation set aside first: the save runs while
+    // the ctx is bound (the bound slot's snapshot is the conversation's state), then the slot's
+    // state releases (the parked arena is VRAM the next admission re-allocates).  The answer is
+    // the parts that released (slot 0's alias never parks: its arena is the load-time state_).
+    const auto release_ctx = [&](int c, const char* why) -> int {
+        bind_ctx(c);
+        const bool had = !snap_tokens.empty();
+        if (had) slot_put(why);
+        if (had && !snap_in_slot) {
+            // the conversation cannot be set aside (under slot_min, images, disk full): its
+            // description clears - a zeroed state is never saved as this conversation's snapshot
+            snap_tokens.clear();
+            snap_img_hash = kNoImages;
+            snap_in_slot = false;
+        }
+        const int released = model.seq_release_all(c);
+        if (c != 0) bind_ctx(0);   // the model's park rebound it to slot 0 (the bound slot's
+                                   // release): the driver follows - the swap also parks the ctx's
+                                   // description in ctxs[c] for its next turn
+        return released;
+    };
+ // the VRAM pressure ladder, run at admission when the chosen context's parked
+    // slot cannot allocate its state: the pool's refcount-0 pages come back first (rung 1:
+    // capacity inside the pool slab, the capture's refcounted pages protected), then the idle
+    // contexts' state (rung 2, least recently used first), each its conversation set aside
+    // before the release parks it.  Still short: the caller waits (the pressure left is the
+    // running requests' arenas, which no eviction may touch).  The answer is what came free.
+    const auto evict_idle_for_admission = [&](int64_t want) -> size_t {
+        if (model.seq_ready(want)) return 0;   // admission needs nothing: nothing evicted
+        size_t freed = 0;
+        const int64_t swept = model.pages_sweep_idle();   // rung 1: the pool-pages rung
+        if (swept > 0)
+            std::fprintf(stderr, "glm multi: pressure ladder rung 1: swept %lld idle pool page(s) back\n",
+                         (long long) swept);
+        if (model.seq_ready(want)) return 0;   // rung 1 alone cleared the pressure
+        std::vector<size_t> order;   // rung 2: the idle ctxs whose slots are actually live (the
+                                     // pointer truth; a parked slot binds with an allocation, the
+                                     // VRAM this ladder is freeing).  Ctx 0 is skipped: its slot is
+                                     // the load-time alias (the arena never frees, the release
+                                     // gains nothing but the snapshot pair) - it never evicts.
+        for (size_t c = 1; c < ctxs.size(); ++c)
+            if (!ctxs[c].busy && model.seq_live((int) c)) order.push_back(c);
+        std::sort(order.begin(), order.end(), [&](size_t a, size_t b) {
+            return ctxs[a].used < ctxs[b].used;
+        });
+        for (const size_t c : order) {
+            const int released = release_ctx((int) c, " (released under VRAM pressure)");
+            if (released > 0) {
+                freed += (size_t) released;
+                std::fprintf(stderr, "glm multi: pressure ladder rung 2: context %zu's idle state released "
+                                     "(%d part(s), %zu slot(s) free now)\n", c, released,
+                             model.seq_free_.size());
+            }
+            if (model.seq_ready(want)) break;   // enough came free: stop evicting
+        }
+        return freed;
     };
     struct Gen {
         int rid = -1, ctx = 0;
@@ -2654,6 +2766,10 @@ static int glm_pack_generate(const Options& o) {
         size_t reuse = 0;
         std::chrono::steady_clock::time_point t0, t1;
         uint64_t spec_steps0 = 0, spec_hits0 = 0;
+ uint64_t spec_steps_own = 0, spec_hits_own = 0; // the request's own stints' counters
+                                                          // (the model's are shared under concurrency)
+        bool spec_conc = false;     // served through the stint scheme at least once: the DONE line's
+                                    // spec fields are the own counters, not the model's shared delta
         strata::core::Glm5Model::FastStats st1;
         // MAYA_GLM_MULTI_MTP: the NextN block's drafts for the positions after `pending` (made at position
         // draft_at after draft_tok: stale once either moved), and this request's verify statistics
@@ -2669,6 +2785,7 @@ static int glm_pack_generate(const Options& o) {
     // here with what its GEN line said, and is admitted when one frees
     struct Pending {
         int rid;
+        std::chrono::steady_clock::time_point first_queued;   // the wait-gate's terminal path (a timeout)
         std::vector<int64_t> ids;
         int64_t max_new;
         strata::kernels::SamplerParams rq;
@@ -2680,11 +2797,23 @@ static int glm_pack_generate(const Options& o) {
         int abl = -1;   // its GEN ablate= (-1: --ablate-default)
     };
     std::deque<Pending> pending;
+    // a request's wait is printed the first time it queues, not on every scheduler re-check
+    std::map<int, bool> wait_announced;
     // the room a context must leave for the answer (at most what the request asked for): a long prompt goes to a
     // context with this much left after it, and its max tokens are cut to that context
     static const int64_t multi_room = (int64_t) env_num("MAYA_GLM_MULTI_ROOM", 16384);
+    // the wait gate's terminal path: a request that cannot be admitted within this budget stops
+    // retrying and is rejected (the operator sees the ERR on the request's own channel)
+    static const double multi_wait_s = env_num("MAYA_GLM_MULTI_WAIT", 600);
     static const int multi_boundary_every = (int) env_num("MAYA_GLM_MULTI_BOUNDARY", 32);
     static const bool multi_spec = env_num("MAYA_GLM_MULTI_SPEC", 1) != 0;
+    // the drafter under concurrency, default ON: the stint scheme's outputs were
+    // byte-identical to the serial MTP path under concurrency, +12.5% aggregate vs the incumbent
+    // pipelined reference in the same window.  On: a bounded speculative stint per scheduler step,
+    // round-robin over the running requests, MAYA_GLM_SPEC_STINT tokens each (8)
+    static const bool multi_conc = env_num("MAYA_GLM_MTP_CONC", 1) != 0;
+    static const int multi_spec_stint = (int) env_num("MAYA_GLM_SPEC_STINT", 8);
+    long long multi_spec_rot = 0;
     static const int split_rows = strata::core::Glm5Model::split_rows_setting();
     // MAYA_GLM_EVEN_GROUPS=1: the split's groups cut evenly from all the running requests, two at least, instead of
     // k at a time (strata/core/split_groups.hpp): k 4 no longer makes one group - and idle GPUs - at 4 requests or fewer
@@ -2839,9 +2968,9 @@ static int glm_pack_generate(const Options& o) {
         const uint64_t d_hits = st2.hits - g.st1.hits, d_miss = st2.misses - g.st1.misses;
         std::printf("DONE %d %lld %lld %.1f %.1f %s %llu %llu %zu %llu %llu\n", g.rid, (long long) g.produced,
                     (long long) g.prompt.size(), prompt_ms, decode_ms, g.finish,
-                    (unsigned long long) (model.spec_hits_ - g.spec_hits0 + g.mtp_acc),
-                    (unsigned long long) (model.spec_steps_ - g.spec_steps0 + g.mtp_drafts), g.reuse,
-                    (unsigned long long) d_hits, (unsigned long long) (d_hits + d_miss));
+                    (unsigned long long) ((g.spec_conc ? g.spec_hits_own : model.spec_hits_ - g.spec_hits0) + g.mtp_acc),
+                    (unsigned long long) ((g.spec_conc ? g.spec_steps_own : model.spec_steps_ - g.spec_steps0) + g.mtp_drafts),
+                    g.reuse, (unsigned long long) d_hits, (unsigned long long) (d_hits + d_miss));
         if (mtp_rows && g.mtp_steps > 0)
             std::fprintf(stderr, "glm multi mtp: request %d: %llu of %llu drafts accepted (%.1f%%) in %llu verify steps, "
                                  "%.2f tokens a step\n", g.rid, (unsigned long long) g.mtp_acc,
@@ -2849,6 +2978,8 @@ static int glm_pack_generate(const Options& o) {
                          100.0 * (double) g.mtp_acc / (double) std::max<uint64_t>(1, g.mtp_drafts),
                          (unsigned long long) g.mtp_steps,
                          (double) (g.mtp_steps + g.mtp_acc) / (double) g.mtp_steps);
+ if (model.fast()) model.prefix_release();   // the request's tile refs (the canonical
+                                                    // pages stay for the next request's hits)
         bool deferred = false;
         if (g.pause && std::strcmp(g.finish, "cancel") == 0) {
             if (in_read_gap) {   // (another context's prompt is being read and stays bound: the snapshot after it)
@@ -2867,6 +2998,11 @@ static int glm_pack_generate(const Options& o) {
             std::lock_guard<std::mutex> lk(ctl_mu);
             ctl.erase(g.rid);
         }
+        wait_announced.erase(g.rid);   // the request finished: free its wait flag (no leak across many requests)
+ // DONE releases the request's HOLD (the busy flag): the slot's state stays
+        // live-idle (the conversation continues in-model at the next turn - the fast path), and
+        // the VRAM pressure ladder evicts idle states (LRU, each its conversation set aside)
+        // only when a parked slot's allocation would fail.  The arena is not freed here.
         ctxs[(size_t) g.ctx].busy = deferred;   // (a deferred snapshot: busy until flush_pauses)
         ctxs[(size_t) g.ctx].used = ++ctx_clock;
         g.done = true;
@@ -3064,6 +3200,11 @@ static int glm_pack_generate(const Options& o) {
         deferred_pauses.clear();
         for (int c = 0; c < (int) ctxs.size(); ++c) {
             bind_ctx(c);
+            if (!snap_tokens.empty()) {
+ // the ERR path drops the conversation's registry capture too
+                // (the record clears below; a dead conversation never holds pages)
+                model.pause_release(snap_tokens);
+            }
             snap_tokens.clear();
             ckpts.clear();   // (the caches they stood on are reset too)
             model.reset();
@@ -3132,35 +3273,47 @@ static int glm_pack_generate(const Options& o) {
         // those.  prep_prompt then restores the one it found, as with one conversation.
         const int64_t want = (int64_t) g->prompt.size() + std::min<int64_t>(max_new, multi_room) + 8;
         const auto fits = [&](int c) { return model.seq_max_ctx(c) >= want; };
-        int best = -1;
-        size_t blen = 0;
-        for (int c = 0; c < (int) ctxs.size(); ++c) {
-            if (ctxs[(size_t) c].busy || !fits(c)) continue;
-            const auto& st = c == cur_ctx ? snap_tokens : ctxs[(size_t) c].snap_tokens;
-            const uint64_t hh = c == cur_ctx ? snap_img_hash : ctxs[(size_t) c].snap_img_hash;
-            size_t len = 0;
-            // (--ablate: a context read with the other setting holds nothing this request can continue)
-            const bool abl_same = !model.ablate_loaded() || model.abl_seq_on(c) == abl_req();
-            if (abl_same && !st.empty() && st.size() < g->prompt.size() &&
-                std::equal(st.begin(), st.end(), g->prompt.begin()) && img_hash(st.size()) == hh)
-                len = st.size();
-            if (abl_same && ckpt_max > 0 && cur_img_pos.empty()) {   // (checkpoints are kept of text prompts only)
-                const std::vector<Ckpt>& cl = c == cur_ctx ? ckpts : ctxs[(size_t) c].ckpts;
-                for (const Ckpt& k : cl)
-                    if (k.tokens.size() > len && k.tokens.size() < g->prompt.size() &&
-                        std::equal(k.tokens.begin(), k.tokens.end(), g->prompt.begin()))
-                        len = k.tokens.size();
+        const auto pick = [&]() -> int {   // an idle ctx whose parked state can hold this request, or -1
+            int best = -1;
+            size_t blen = 0;
+            for (int c = 0; c < (int) ctxs.size(); ++c) {
+                if (ctxs[(size_t) c].busy || !fits(c)) continue;
+                const auto& st = c == cur_ctx ? snap_tokens : ctxs[(size_t) c].snap_tokens;
+                const uint64_t hh = c == cur_ctx ? snap_img_hash : ctxs[(size_t) c].snap_img_hash;
+                size_t len = 0;
+                // (--ablate: a context read with the other setting holds nothing this request can continue)
+                const bool abl_same = !model.ablate_loaded() || model.abl_seq_on(c) == abl_req();
+                if (abl_same && !st.empty() && st.size() < g->prompt.size() && std::equal(st.begin(), st.end(), g->prompt.begin()) &&
+                    img_hash(st.size()) == hh)
+                    len = st.size();
+                if (abl_same && ckpt_max > 0 && cur_img_pos.empty()) {   // (checkpoints are kept of text prompts only)
+                    const std::vector<Ckpt>& cl = c == cur_ctx ? ckpts : ctxs[(size_t) c].ckpts;
+                    for (const Ckpt& k : cl)
+                        if (k.tokens.size() > len && k.tokens.size() < g->prompt.size() &&
+                            std::equal(k.tokens.begin(), k.tokens.end(), g->prompt.begin()))
+                            len = k.tokens.size();
+                }
+                if (len > blen) {
+                    best = c;
+                    blen = len;
+                }
             }
-            if (len > blen) {
-                best = c;
-                blen = len;
-            }
-        }
-        if (best < 0)
+            if (best >= 0) return best;
             for (int c = 0; c < (int) ctxs.size(); ++c)
                 if (!ctxs[(size_t) c].busy && fits(c) &&
                     (best < 0 || ctxs[(size_t) c].used < ctxs[(size_t) best].used))
                     best = c;
+            return best;
+        };
+        int best = pick();
+ // the ladder, when the pick needs an allocation the device cannot honor: the
+        // pool's idle pages back (rung 1), then idle contexts' state (rung 2, LRU), each its
+        // conversation set aside before the release parks it; re-pick, then wait if still short.
+        // A live idle slot needs no allocation (the bind allocates nothing), so it never triggers.
+        if (best >= 0 && !model.seq_live(best) && !model.seq_ready(want)) {
+            evict_idle_for_admission(want);
+            best = pick();
+        }
         if (best < 0) {
             bool ever = false;
             for (int c = 0; c < (int) ctxs.size(); ++c) ever = ever || fits(c);
@@ -3169,10 +3322,27 @@ static int glm_pack_generate(const Options& o) {
                             g->prompt.size());
                 return;
             }
-            pending.push_back({rid, ids, max_new, rq, req_think_budget, req_think_end, cur_img_pos, cur_img_rows,
-                               req_bias, req_abl});
+            pending.push_back({rid, std::chrono::steady_clock::now(), ids, max_new, rq, req_think_budget, req_think_end,
+                               cur_img_pos, cur_img_rows, req_bias, req_abl});
+            if (!wait_announced[rid]) {
+                wait_announced[rid] = true;
             std::fprintf(stderr, "glm multi: request %d waits for a context that holds %lld tokens\n", rid,
-                         (long long) want);
+            (long long) want);
+            }
+            return;
+        }
+ // the pick is a parked ctx and the device still cannot honor its allocation:
+        // the remaining pressure is the running requests' arenas, which no eviction may touch -
+        // the request waits instead of binding into a failed alloc (a bind allocates nothing on
+        // a live idle slot, so a live pick never reaches this)
+        if (!model.seq_live(best) && !model.seq_ready(want)) {
+            pending.push_back({rid, std::chrono::steady_clock::now(), ids, max_new, rq, req_think_budget, req_think_end,
+                               cur_img_pos, cur_img_rows, req_bias, req_abl});
+            if (!wait_announced[rid]) {
+                wait_announced[rid] = true;
+            std::fprintf(stderr, "glm multi: request %d waits: no free VRAM for context %d's state "
+            "(the running requests hold the rest)\n", rid, best);
+            }
             return;
         }
         g->max_new = std::min<int64_t>(max_new, model.seq_max_ctx(best) - (int64_t) g->prompt.size() - 8);
@@ -3190,7 +3360,12 @@ static int glm_pack_generate(const Options& o) {
             ctl.erase(rid);
         }
         gap_failed = false;
-        bind_ctx(best);
+        if (!bind_ctx(best)) {
+            // the slot's state did not fit: a bind failure used to leave the caller on the
+            // old sequence while the slot was marked busy (cross-talk).  Fail the request.
+            std::printf("ERR %d context %d could not bind its sequence state - rejected\n", rid, best);
+            return;
+        }
         model.set_image_rows(cur_img_pos, cur_img_rows);
         model.force_next(-1);
         ctxs[(size_t) best].busy = true;
@@ -3306,7 +3481,19 @@ static int glm_pack_generate(const Options& o) {
                 }
             }
             if (stopped) {
+                wait_announced.erase(w.rid);   // the request ends: a later one may print its wait
                 std::printf("DONE %d 0 %zu 0.0 0.0 cancel 0 0 0 0 0\n", w.rid, w.ids.size());
+                pending.erase(pending.begin() + (long) i);
+                continue;
+            }
+            // the terminal path: a request that cannot fit WITHIN the wait budget stops
+            // retrying and is rejected (the operator's signal).  Without it a never-fitting
+            // request re-enters the queue every scheduler iteration, forever
+            const double wait_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - w.first_queued).count();
+            if (multi_wait_s > 0 && wait_s > multi_wait_s) {
+                wait_announced.erase(w.rid);
+                std::printf("ERR %d the request waited %.0f s for a context (budget %.0f s) - rejected\n",
+                            w.rid, wait_s, multi_wait_s);
                 pending.erase(pending.begin() + (long) i);
                 continue;
             }
@@ -3326,7 +3513,13 @@ static int glm_pack_generate(const Options& o) {
             req_abl = w2.abl;
             cur_img_pos = std::move(w2.img_pos);
             cur_img_rows = std::move(w2.img_rows);
+            wait_announced.erase(w2.rid);
             gen_admit(w2.rid, w2.ids, w2.max_new, w2.rq);
+            // a failed push leaves the entry re-queued AT THE BACK, not consumed: the
+            // loop must stop or it re-admits the same request every pass and starves the
+            // running requests, which never free what the waiter needs.  Break and let the
+            // next scheduler iteration retry after a decode step has run.
+            if (!pending.empty() && pending.back().rid == w2.rid) break;
         }
     };
     // one step of the scheduler: a stint of the speculative path for a request alone, else one token back from the
@@ -3339,6 +3532,70 @@ static int glm_pack_generate(const Options& o) {
             std::none_of(gens.begin(), gens.end(), [](const std::unique_ptr<Gen>& p) { return p->ready && !p->done; }))
             flush_pauses();
         Gen* only = gens.size() == 1 ? gens[0].get() : nullptr;
+ // (MAYA_GLM_MTP_CONC=1): the drafter under concurrency. One scheduler step = one
+        // request's turn: its pending token through the token path (the incumbent solo branch's shape),
+        // then a bounded decode_spec stint of MAYA_GLM_SPEC_STINT tokens (8).  The turn moves past the
+        // stinted request, and the stint's last token becomes that request's next pending.  The
+        // gate-off path below is unchanged.
+        if (multi_conc && multi_spec && !step_no_spec && model.spec_ready() && gens.size() > 1) {
+            const size_t start = (size_t) (multi_spec_rot % (long long) gens.size());
+            Gen* st = nullptr;   // the turn's request: the first servable one from the rotation head on
+            for (size_t k = 0; k < gens.size(); ++k) {
+                Gen& g = *gens[(start + k) % gens.size()];
+                if (g.done || g.inflight || g.max_new - g.produced <= 0) continue;
+                st = &g;
+                break;
+            }
+            if (st == nullptr) {   // every running request ended: the sweep ends the scheme's step
+                gen_sweep();
+                return;
+            }
+            Gen& g = *st;
+            bind_ctx(g.ctx);
+            if (g.pending >= 0) {   // its last token through the token path: the next one's logits on the tail
+                if (!model.forward({g.pending}, lg, err)) {
+                    multi_fail(err);
+                    return;
+                }
+                g.pending = -1;
+            }
+            g.ready = false;
+            model.force_next(g.force);
+            g.force = -1;
+            int32_t forced_unused = -1, last = -1;
+            bool ended = false;
+            int64_t n_spec = 0;
+            const uint64_t steps0 = model.spec_steps_, hits0 = model.spec_hits_;
+            const int64_t want = std::min((int64_t) multi_spec_stint, g.max_new - g.produced);
+            const bool ok = model.decode_spec(g.sp, want, [&](int tok) {
+                forced_unused = -1;   // a force handed over is consumed by the token that comes next
+                last = tok;
+                if (!gen_token(g, tok)) { ended = true; return false; }
+                if (g.force >= 0) {
+                    model.force_next(g.force);
+                    forced_unused = g.force;
+                    g.force = -1;
+                }
+                if (input_pending()) return false;
+                return true;
+            }, n_spec, err);
+            g.spec_conc = true;
+            g.spec_steps_own += model.spec_steps_ - steps0;   // this stint's share only: the
+            g.spec_hits_own += model.spec_hits_ - hits0;      // model's counters are shared
+            if (forced_unused >= 0) {   // handed over, never taken: it stays the request's
+                g.force = forced_unused;
+                model.force_next(-1);
+            }
+            if (!ok) {
+                multi_fail(err);
+                return;
+            }
+            if (ended) gen_finish(g);   // the request's own end: a stop, its budget, a cancel, the context
+            else g.pending = last;      // the stint's cap: the next turn feeds the last token in
+            ++multi_spec_rot;           // the turn moves past the stinted request
+            gen_sweep();
+            return;
+        }
         static const bool spec_win_env = [] {
             const char* e = getenv("MAYA_GLM_SPEC_WIN");
             return e != nullptr && std::atoi(e) != 0;
@@ -3405,6 +3662,7 @@ static int glm_pack_generate(const Options& o) {
             bool interrupted = false;
             int64_t n_spec = 0;
             strata::core::glmng::set_history(&model, g.prompt, g.emitted);   // glm-dsa B14.13
+            const uint64_t steps0 = model.spec_steps_, hits0 = model.spec_hits_;
             const bool ok = model.decode_spec(g.sp, g.max_new - g.produced, [&](int tok) {
                 forced_unused = -1;   // a force handed over is consumed by the token that comes next
                 last = tok;
@@ -3420,6 +3678,11 @@ static int glm_pack_generate(const Options& o) {
                 }
                 return true;
             }, n_spec, err);
+            if (g.spec_conc) {   // a stint-scheme request that became solo: its stints' counters keep
+                                 // accruing per request (the DONE line's own fields stay truthful)
+                g.spec_steps_own += model.spec_steps_ - steps0;
+                g.spec_hits_own += model.spec_hits_ - hits0;
+            }
             if (forced_unused >= 0) {   // handed over, never taken: it stays the request's
                 g.force = forced_unused;
                 model.force_next(-1);
@@ -3752,6 +4015,12 @@ static int glm_pack_generate(const Options& o) {
     // same tokens both ways.
     if (const char* mb = getenv("MAYA_GLM_MULTI_BENCH")) {
         int n = 2, L = 512, G = 256, K = 32, same_prompt = 0;
+        int prefix_shared = 0, prefill_tok[256] = {0};   // probe state: how many leading tokens are shared (0 = probe off) and the per-sequence prefill token meter P3's prefix-hit gate reads
+        const char *mbx = std::getenv("MAYA_GLM_MULTI_BENCH"), *px = std::getenv("MAYA_GLM_MULTI_BENCH_PREFIX");
+        if (mbx && px) {   // probe default OFF: only when both MAYA_GLM_MULTI_BENCH and MAYA_GLM_MULTI_BENCH_PREFIX are set
+            int px_n = std::atoi(px);
+            prefix_shared = px_n > 0 ? px_n : 0;
+        }
         std::sscanf(mb, "%d,%d,%d,%d,%d", &n, &L, &G, &K, &same_prompt);
         if (n > model.seq_count() || n < 1 || L < 2 || G < 2) {
             std::fprintf(stderr, "multi bench: %d sequences asked, %d states (MAYA_GLM_SEQS)\n", n, model.seq_count());
@@ -3776,11 +4045,24 @@ static int glm_pack_generate(const Options& o) {
         std::vector<float> lg;
         const auto now = [] { return std::chrono::steady_clock::now(); };
         const auto secs = [](auto a, auto b) { return std::chrono::duration<double>(b - a).count(); };
+        if (prefix_shared > 0) {   // probe: the first prefix_shared tokens come from one shared stream, the remainder re-seeded per sequence (partial overlap, the case the existing modes do not cover)
+            for (int s = 0; s < n; ++s) {
+                srand(20261014u);   // the shared prefix: one fixed stream for every sequence
+                for (int i = 0; i < prefix_shared && i < L; ++i)
+                    prompts[(size_t) s][(size_t) i] = 1 + (int) (rand() % 30000);
+                srand(20261014u + 7919u * (unsigned) (s + 1));   // the remainder: a fresh per-sequence stream
+                for (int i = prefix_shared; i < L; ++i)
+                    prompts[(size_t) s][(size_t) i] = 1 + (int) (rand() % 30000);
+            }
+        }
         for (int s = 0; s < n; ++s) {   // every prompt read once, its state saved before its last token
             model.seq_bind_all(s);
             model.reset();
             const std::vector<int32_t> head(prompts[(size_t) s].begin(), prompts[(size_t) s].end() - 1);
-            if (!model.prefill(head, err, prompts[(size_t) s].back()) && !err.empty()) {
+            // meter: what the bench fed prefill (head plus its last token); P3's prefix-hit gate reads it against the shared count
+            bool mbx_pf_ok = model.prefill(head, err, prompts[(size_t) s].back());
+            if (prefix_shared > 0) prefill_tok[s < 256 ? s : 255] = (int) head.size() + 1;
+            if (!mbx_pf_ok && !err.empty()) {
                 std::fprintf(stderr, "multi bench: prefill: %s\n", err.c_str());
                 return 1;
             }
@@ -4062,6 +4344,12 @@ static int glm_pack_generate(const Options& o) {
         };
         const size_t same = agree(solo, out[0]);
         std::printf("  solo vs its untimed warm-up run: %zu of %zu agree\n", agree(solo, solo2), solo.size());
+        if (prefix_shared > 0) {   // probe-only per-sequence prefill meter, printed alongside the agreement block
+            std::printf("  prefix probe: %d shared tokens, per-sequence prefill tokens:", prefix_shared);
+            for (int s = 0; s < n && s < 256; ++s)
+                std::printf(" seq%d=%d", s, prefill_tok[s]);
+            std::printf("\n");
+        }
         for (int s = 1; s < n; ++s)
             std::printf("  seq %d vs seq 0: %zu agree, vs solo: %zu\n", s, agree(out[(size_t) s], out[0]),
                         agree(out[(size_t) s], solo));
