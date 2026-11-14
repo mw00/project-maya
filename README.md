@@ -299,11 +299,13 @@ The setup shows every download before it starts it, builds everything once (20-4
 - **Model files downloaded another way** (a download manager, another PC, a Hugging Face cache): `./maya.sh --import-model FOLDER`
   finds Maya's files in FOLDER by size and checksum, whatever they are called, and moves them into place (`--copy` when
   FOLDER is on another drive; the originals stay). Files that do not match are left alone.
-  During interactive setup, choose **0) Add downloaded model** on the model-files screen, enter the directory, then
-  choose **Link files** to check the model type (GGUF header or EXL3 `config.json`) and create symbolic links without
-  moving or copying files, or **Import Model** for the standard size and SHA-256 verified import. Linking does not check
-  file size or SHA-256; it also finds known vision, separate MTP, DFlash2 and DSpark files in the same directory tree.
-  The files need their published names and must stay at their original location for Maya to use them.
+  During interactive setup, choose **0) Add downloaded model** on the model-files screen and enter its directory
+  (or press **Ctrl+O** to browse and search folders). The next screen shows the detected **Model**, **Drafter** and
+  **Vision** files. Select a row to choose another detected file or edit its name, then choose **Link files** to check
+  the model type (GGUF header or EXL3 `config.json`) and create symbolic links without moving or copying files, or
+  **Import Model** to verify the selected files by size and SHA-256 before moving or copying them. Linking does not
+  compare file sizes or SHA-256 values; linked files need their published names and must stay at their original
+  location for Maya to use them.
 - **Every option** (GPUs, context, a model folder you already have, remote access, ...): [docs/SETUP.md](docs/SETUP.md).
 
 > **The start takes a few minutes:** the engine pins most of the free RAM (all but about 6 GB) for its expert tier,

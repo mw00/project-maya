@@ -88,6 +88,7 @@ class SetupApp(App):
         self.doing, self.doing_since, self.said_doing, self.last = "", 0.0, False, ""
         self.bar, self.bar_since = None, 0.0            # (share done, what to show) while a command tells it
         self.pending = None                             # the question shown: (future, values, kind)
+        self.text_is_directory = False                  # Ctrl+O is for the downloaded-model folder, not a file name
         self.zero_option = False                         # a menu's first item is the 0 action
         self.abouts: list = []                          # its options' descriptions (under the highlighted one)
         self.shown = 0                                  # the Bridge's entries handled so far
@@ -378,10 +379,12 @@ class SetupApp(App):
         self.show_question(fut, "choose", question, intro, options, list(range(len(options))), default, outro)
 
     def ev_text(self, question: str, default: str, fut: Future) -> None:
+        self.text_is_directory = question == "Directory with downloaded model files"
         self.show_question(fut, "text", question, [], [], [], 0, [])
         field = self.query_one("#text-answer", Input)
         field.value = default
-        self.query_one("#about", Static).update("Ctrl+O: browse and search folders.")
+        self.query_one("#about", Static).update("Ctrl+O: browse and search folders." if self.text_is_directory else
+                                                "Enter a file name relative to the selected directory.")
         field.focus()
 
     def ev_fail(self, msg: str, hint, fut: Future) -> None:
@@ -471,7 +474,8 @@ class SetupApp(App):
 
     # ---------------------------------------------------------------------------------------- keys
     def action_open_directory_picker(self) -> None:
-        if self.pending is not None and self.pending[2] == "text" and not isinstance(self.screen, DirectoryPicker):
+        if self.pending is not None and self.pending[2] == "text" and self.text_is_directory and \
+                not isinstance(self.screen, DirectoryPicker):
             field = self.query_one("#text-answer", Input)
             self.push_screen(DirectoryPicker(field.value), self.directory_picked)
 
@@ -593,7 +597,7 @@ class SetupApp(App):
         if kind == "yn":
             keys = [("Enter", "Choose"), ("y n", "Answer")]
         elif kind == "text":
-            keys = [("Enter", "Use path"), ("Ctrl+O", "Browse folders")]
+            keys = [("Enter", "Use path")] + ([("Ctrl+O", "Browse folders")] if self.text_is_directory else [])
         elif kind:
             zero = kind == "choose" and self.zero_option
             keys = [("Enter", "Choose"), ("↑↓", "Move")] + ([(f"0, 1-{len(self.pending[1]) - int(zero)}", "Pick")]

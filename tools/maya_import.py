@@ -70,9 +70,10 @@ def files_under(folder: Path) -> list:
     return out
 
 
-def find(folder: Path, catalog: list, progress=None, hashing=None) -> dict:
+def find(folder: Path, catalog: list, progress=None, hashing=None, only: set[Path] | None = None) -> dict:
     """Match the folder's files to the catalog: {"found": [(found path, real path, size, [entries])], "unmatched":
-    [(path, size)], "shared": [(path, [labels])]}.  progress(text): a line before a big file is read."""
+    [(path, size)], "shared": [(path, [labels])]}.  progress(text): a line before a big file is read.  only: the
+    selected source paths when interactive setup has multiple model variants in one directory."""
     by_size, sha_only = {}, []
     for e in catalog:
         (by_size.setdefault(e["size"], []) if e["size"] is not None else sha_only).append(e)
@@ -82,6 +83,8 @@ def find(folder: Path, catalog: list, progress=None, hashing=None) -> dict:
             by_sha.setdefault(s, []).append(e)
     found, unmatched = [], []
     for path, real, size in files_under(folder):
+        if only is not None and path not in only and real not in only:
+            continue
         if size == 0:
             continue
         candidates = size in by_size or (sha_only and size >= MIN_UNLISTED and is_gguf(real))

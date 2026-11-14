@@ -149,27 +149,27 @@ class PlainSetup(unittest.TestCase):
         self.assertIn("  0) Add downloaded model", printed)
         self.assertEqual(ask.call_args.args[1], ["0", "1", "2"])
 
-    def test_add_menu_calls_standard_import_then_returns_to_model_list(self):
+    def test_add_menu_reviews_files_then_returns_to_model_list(self):
         a = SimpleNamespace(copy=False, yes=False)
-        with tempfile.TemporaryDirectory() as folder, patch.object(maya, "choose", side_effect=[1, 1, 0]), \
+        with tempfile.TemporaryDirectory() as folder, patch.object(maya, "choose", side_effect=[1, 0]), \
                 patch.object(S, "ask_text", return_value=folder), \
-                patch.object(maya, "import_model", return_value=0) as imported:
+                patch.object(maya, "review_downloaded_model", return_value=0) as reviewed:
             models = Path(folder) / "models"
             pick = maya.choose_with_add(a, "Which files?", [], [("First", None, None)], 0, False, models, "glm")
             self.assertEqual(pick, 0)
-            imported.assert_called_once_with(a, folder, models_override=models, from_setup=True)
+            reviewed.assert_called_once_with(a, Path(folder), models, "glm")
 
     def test_invalid_directory_is_prompted_again_with_its_previous_value(self):
         a = SimpleNamespace(copy=False, yes=False)
         with tempfile.TemporaryDirectory() as folder:
             wrong = str(Path(folder) / "mistyped")
-            with patch.object(maya, "choose", side_effect=[1, 1, 0]) as choose, \
+            with patch.object(maya, "choose", side_effect=[1, 0]) as choose, \
                     patch.object(S, "ask_text", side_effect=[wrong, folder]) as ask_text, \
                     patch.object(maya, "warn") as warning, \
-                    patch.object(maya, "import_model", return_value=0):
+                    patch.object(maya, "review_downloaded_model", return_value=0):
                 maya.choose_with_add(a, "Which files?", [], [("First", None, None)], 0, False,
                                      Path(folder) / "models", "glm")
-            self.assertEqual(choose.call_count, 3)
+            self.assertEqual(choose.call_count, 2)
             self.assertEqual([call.args for call in ask_text.call_args_list],
                              [("Directory with downloaded model files", ""),
                               ("Directory with downloaded model files", wrong)])
@@ -355,7 +355,7 @@ class Screen(unittest.IsolatedAsyncioTestCase):
                     self.assertLess(time.time() - t0, 20)
                     await pilot.pause(0.02)
 
-            with patch.object(maya, "link_model", return_value=0) as linked:
+            with patch.object(maya, "import_model", return_value=0) as imported:
                 await until("Which files?")
                 await pilot.press("0")
                 await until("Directory with downloaded model files")
@@ -379,13 +379,20 @@ class Screen(unittest.IsolatedAsyncioTestCase):
                 await until("Directory with downloaded model files")
                 app.query_one("#text-answer", T.Input).value = self.dir.name
                 await pilot.press("enter")
-                await until("How to add the files?")
-                await pilot.press("1")
+                await until("Detected model files")
+                self.assertIn("Model: None", str(app.query_one("#options").get_option_at_index(0).prompt))
+                await pilot.press("escape")
+                await until("Directory with downloaded model files")
+                self.assertEqual(app.query_one("#text-answer", T.Input).value, self.dir.name)
+                await pilot.press("enter")
+                await until("Detected model files")
+                await pilot.press("5")
                 await until("Which files?")
                 await pilot.press("2")
                 while app.return_value is None:
                     await pilot.pause(0.02)
-            linked.assert_called_once_with(self.dir.name, Path(a.models_dir), "glm")
+            imported.assert_called_once_with(a, self.dir.name, models_override=Path(a.models_dir),
+                                             from_setup=True, selected_files=None)
         self.assertEqual(app.return_value, ("done", 1))
         bridge.log.close()
 
@@ -393,6 +400,10 @@ class Screen(unittest.IsolatedAsyncioTestCase):
         source = Path(self.dir.name) / "source"
         model = source / "Downloads" / "MyModel"
         model.mkdir(parents=True)
+        main = model / "a-model.gguf"
+        main.write_bytes(b"GGUF")
+        other = model / "b-model.gguf"
+        other.write_bytes(b"GGUF")
         (source / "Downloads-old").mkdir()
         a = SimpleNamespace(models_dir=str(Path(self.dir.name) / "models"), copy=False, yes=False)
         bridge = Bridge(self.log)
@@ -408,7 +419,8 @@ class Screen(unittest.IsolatedAsyncioTestCase):
                     self.assertLess(time.time() - t0, 20)
                     await pilot.pause(0.02)
 
-            with patch.object(maya, "link_model", return_value=0) as linked:
+            with patch.object(maya, "gguf_head", return_value=("glm5-next", 1)), \
+                    patch.object(maya, "link_model", return_value=0) as linked:
                 await until(lambda: app.pending is not None)
                 await pilot.press("0")
                 await until(lambda: app.pending is not None and app.pending[2] == "text")
@@ -442,13 +454,28 @@ class Screen(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(field.value, str(model))
                 await pilot.press("enter")      # Confirm the path in the setup
                 await until(lambda: app.pending is not None and app.pending[2] == "choose" and
-                            "How to add" in str(app.query_one("#ask").border_title))
-                await pilot.press("enter")      # Link files
+                            "Detected model files" in str(app.query_one("#ask").border_title))
+                self.assertIn(main.name, str(app.query_one("#options").get_option_at_index(0).prompt))
+                await pilot.press("1")          # Model: choose the other detected quant
+                await until(lambda: app.pending is not None and
+                            "Model file?" in str(app.query_one("#ask").border_title))
+                await pilot.press("escape")
+                await until(lambda: app.pending is not None and
+                            "Detected model files" in str(app.query_one("#ask").border_title))
+                await pilot.press("1")
+                await until(lambda: app.pending is not None and
+                            "Model file?" in str(app.query_one("#ask").border_title))
+                await pilot.press("2")
+                await until(lambda: app.pending is not None and
+                            "Detected model files" in str(app.query_one("#ask").border_title))
+                self.assertIn(other.name, str(app.query_one("#options").get_option_at_index(0).prompt))
+                await pilot.press("4")          # Link files
                 await until(lambda: app.pending is not None and "Which files?" in
                             str(app.query_one("#ask").border_title))
                 await pilot.press("1")
                 await until(lambda: app.return_value is not None)
-            linked.assert_called_once_with(str(model), Path(a.models_dir), "glm")
+            linked.assert_called_once_with(str(model), Path(a.models_dir), "glm",
+                                           selected_model=other, selected_files={other})
         self.assertEqual(app.return_value, ("done", 0))
         bridge.log.close()
 

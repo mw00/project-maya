@@ -1962,16 +1962,9 @@ def choose_with_add(a, question: str, intro: list, rows: list, default: int, yes
                 warn(f"{folder} is not a directory")
             if S.UI is not None and hasattr(S.UI, "retry_text"):
                 S.UI.retry_text("Directory with downloaded model files")
-        action = choose("How to add the files?", [f"Source: {src}"],
-                        [("Link files", None, "Check the model type, then create symbolic links. No size or SHA-256 check."),
-                         ("Import Model", None, "Standard import: move files on the same drive, copy on another drive.")],
-                        0, False)
-        if action == 0:
-            link_model(str(src), models, family)
-        else:
-            import_model(a, str(src), models_override=models, from_setup=True)
-        if S.UI is not None and hasattr(S.UI, "commit_add"):
-            S.UI.commit_add()
+        if review_downloaded_model(a, src, models, family) == 0:
+            if S.UI is not None and hasattr(S.UI, "commit_add"):
+                S.UI.commit_add()
 
 
 def choose_model(a, models: Path, inst: dict, family: str = "glm") -> tuple:
@@ -2898,11 +2891,12 @@ def import_catalog(models: Path) -> list:
 
 
 def import_model(a, folder: str, *, models_override: Path | None = None,
-                 from_setup: bool = False) -> int:
+                 from_setup: bool = False, selected_files: set[Path] | None = None) -> int:
     """--import-model <folder>: find the published model files in a folder by their size and sha256 (whatever the
     downloader named them, in whatever subfolders, also a Hugging Face cache's blobs/snapshots), and move them (same
     drive) or copy them (another drive: --copy) into the models folder's layout; then print what was found, what
-    is missing and what did not match.  Nothing that did not match is touched; nothing is deleted."""
+    is missing and what did not match.  Nothing that did not match is touched; nothing is deleted.  Interactive setup
+    passes selected_files so another quant in the same directory is left alone."""
     src = Path(folder).expanduser().resolve()
     if not src.is_dir():
         fail(f"{folder} is not a folder", f"{ME} --import-model <the folder with the downloaded files>")
@@ -2914,7 +2908,7 @@ def import_model(a, folder: str, *, models_override: Path | None = None,
               Path(inst["data_dir"]) / "models" if inst.get("data_dir") else ROOT.parent / "Maya-data" / "models")
     cat = import_catalog(models)
     say(f"  Looking in {src} for Maya's model files (by size and sha256, not by name); they go to {models}")
-    got = MI.find(src, cat, progress=say)
+    got = MI.find(src, cat, progress=say, only=selected_files)
     placed, shared = MI.choose(got["found"])
     if not placed and not shared:
         warn("none of the files there is one of Maya's published model files")
@@ -2982,6 +2976,134 @@ def linked_model_type(path: Path) -> str | None:
             return {"glm5_next": "glm", "deepseek_v41": "deepseek",
                     "minimax_m3_vl": "minimax"}.get(conf.get("model_type"))
     return None
+
+
+def review_role(path: Path, src: Path) -> str:
+    """Classify a model weight, optional drafter, or vision file by its published name/folder."""
+    parts = [part.casefold() for part in path.relative_to(src).parts]
+    name = parts[-1]
+    if "mmproj" in name or "vision" in name or any("vision" in part for part in parts[:-1]):
+        return "vision"
+    if any(tag in name for tag in ("mtp", "dflash", "dspark", "draft")) or any(
+            any(tag in part for tag in ("mtp", "dflash", "dspark", "draft")) for part in parts[:-1]):
+        return "drafter"
+    return "model"
+
+
+def review_candidate(path: Path, role: str, files: list[Path]) -> dict:
+    """The displayed first file, the type-checking anchor, and the files selected along with it."""
+    nearby = [p for p in files if p.parent == path.parent]
+    if role == "model" and path.suffix.lower() == ".gguf":
+        path = shard_set(path)[0]
+        group = [p for p in shard_set(path) if p in files]
+        anchor = path
+    elif role == "model":
+        anchor = path.parent / "config.json"
+        # An EXL3 directory's config/tokenizer files belong to its weights, even when no safetensors are present.
+        group = [p for p in nearby if p.suffix.lower() in (".json", ".safetensors", ".model")
+                 and not any(tag in p.name.casefold() for tag in ("vision", "dspark", "dflash", "mtp"))]
+    elif path.suffix.lower() == ".gguf":
+        path = shard_set(path)[0]
+        anchor = path
+        group = [p for p in shard_set(path) if p in files]
+        if role == "vision":
+            group += [p for p in nearby if "vocab" in p.name.casefold() and p.suffix.lower() == ".gguf"]
+    else:
+        anchor = path
+        tags = ("vision", "mmproj") if role == "vision" else ("mtp", "dflash", "dspark", "draft")
+        own_folder = any(tag in path.parent.name.casefold() for tag in tags)
+        group = [p for p in nearby if p.suffix.lower() in (".json", ".safetensors", ".model") and
+                 (own_folder or p == path or any(tag in p.name.casefold() for tag in tags) or
+                  p.name in ("config.json", "preprocessor_config.json"))]
+    return {"path": path, "anchor": anchor, "files": set(group) or {path}}
+
+
+def review_candidates(src: Path, family: str) -> dict[str, list[dict]]:
+    """Quickly inspect filenames and GGUF/EXL3 type metadata; do not read sizes or SHA-256."""
+    listing = [(path, real) for path, real, _ in MI.files_under(src)]
+    files = [path for path, _ in listing]
+    found = {"model": [], "drafter": [], "vision": []}
+    for path, _ in listing:
+        role = review_role(path, src)
+        suffix = path.suffix.lower()
+        if role == "model" and suffix == ".gguf":
+            shard = SHARD_RE.search(path.name)
+            if (not shard or int(shard.group(1)) == 1) and linked_model_type(path) == family:
+                found["model"].append(review_candidate(path, role, files))
+        elif role == "model" and path.name == "config.json" and linked_model_type(path) == family:
+            weights = sorted(p for p in files if p.parent == path.parent and p.suffix.lower() == ".safetensors"
+                             and review_role(p, src) == "model")
+            found["model"].append(review_candidate(weights[0] if weights else path, role, files))
+        elif role in ("drafter", "vision") and suffix in (".gguf", ".safetensors"):
+            shard = SHARD_RE.search(path.name) if suffix == ".gguf" else None
+            if shard and int(shard.group(1)) != 1:
+                continue
+            if suffix == ".safetensors" and re.search(r"-\d{5}-of-\d{5}\.safetensors$", path.name):
+                if not re.search(r"-00001-of-\d{5}\.safetensors$", path.name):
+                    continue
+            if role == "vision" and "vocab" in path.name.casefold():
+                continue
+            found[role].append(review_candidate(path, role, files))
+    return found
+
+
+def review_pick_file(src: Path, role: str, candidates: list[dict], current: dict | None) -> dict | None:
+    """Choose a detected file or edit its relative path; optional roles can be cleared."""
+    while True:
+        rows = [(c["path"].relative_to(src).as_posix(), None, None) for c in candidates]
+        rows.append(("Enter file name...", None, "A path relative to the selected directory."))
+        if role != "model":
+            rows.append(("None", None, "Do not add this optional file."))
+        default = next((i for i, c in enumerate(candidates) if current and c["path"] == current["path"]),
+                       len(candidates) if current else len(rows) - 1 if role != "model" else len(candidates))
+        pick = choose(f"{role.title()} file?", [f"Directory: {src}"], rows, default, False)
+        if pick < len(candidates):
+            return candidates[pick]
+        if role != "model" and pick == len(rows) - 1:
+            return None
+        answer = current["path"].relative_to(src).as_posix() if current else ""
+        while True:
+            answer = S.ask_text(f"{role.title()} file name", answer)
+            path = Path(os.path.abspath(src / answer)) if answer else None
+            if path is not None and src in path.parents and path.is_file():
+                files = [p for p, _, _ in MI.files_under(src)]
+                return review_candidate(path, role, files)
+            warn(f"{answer or '(empty)'} is not a file inside {src}")
+            if S.UI is not None and hasattr(S.UI, "retry_text"):
+                S.UI.retry_text(f"{role.title()} file name")
+
+
+def review_downloaded_model(a, src: Path, models: Path, family: str) -> int:
+    """Show detected files, let the user correct them, then link or import exactly the chosen variant."""
+    found = review_candidates(src, family)
+    chosen = {role: options[0] if options else None for role, options in found.items()}
+    while True:
+        def shown(role):
+            c = chosen[role]
+            return c["path"].relative_to(src).as_posix() if c else "None"
+        rows = [(f"Model: {shown('model')}", None, "Choose or edit the first model file."),
+                (f"Drafter: {shown('drafter')}", None, "Choose an MTP, DFlash, DFlash2 or other draft file."),
+                (f"Vision: {shown('vision')}", None, "Choose a vision file, if present."),
+                ("Link files", None, "Check model type only; create symbolic links without size or SHA-256 checks."),
+                ("Import Model", None, "Verify size and SHA-256, then move or copy the selected files.")]
+        pick = choose("Detected model files", [f"Directory: {src}", "Review the files before adding them:"],
+                      rows, 3, False)
+        if pick < 3:
+            role = ("model", "drafter", "vision")[pick]
+            chosen[role] = review_pick_file(src, role, found[role], chosen[role])
+            continue
+        selected = set().union(*(c["files"] for c in chosen.values() if c))
+        if pick == 3:
+            model = chosen["model"]
+            if model is None:
+                warn("select a model file before linking")
+                continue
+            result = link_model(str(src), models, family, selected_model=model["anchor"], selected_files=selected)
+        else:
+            result = import_model(a, str(src), models_override=models, from_setup=True,
+                                  selected_files=selected if chosen["model"] else None)
+        if result == 0:
+            return 0
 
 
 def link_catalog_family(label: str, family: str) -> bool:
@@ -3054,13 +3176,17 @@ def link_companions(models: Path, family: str, selected: dict, by_name: dict) ->
     return made, ready
 
 
-def link_model(folder: str, models: Path, family: str) -> int:
-    """Link named published files after checking the model family in GGUF/EXL3 metadata only."""
+def link_model(folder: str, models: Path, family: str, *, selected_model: Path | None = None,
+               selected_files: set[Path] | None = None) -> int:
+    """Link named published files after checking the model family in GGUF/EXL3 metadata only. Interactive setup
+    limits the scan to selected_files and one selected_model anchor."""
     src = Path(folder).expanduser().resolve()
-    files = [(path, real) for path, real, _ in MI.files_under(src)]
-    typed = [(path, real, linked_model_type(real)) for path, real in files
+    files = [(path, real) for path, real, _ in MI.files_under(src)
+             if selected_files is None or path in selected_files or real in selected_files]
+    typed = [(path, real, linked_model_type(path)) for path, real in files
              if path.suffix.lower() == ".gguf" or path.name == "config.json"]
-    anchors = [(path, real) for path, real, kind in typed if kind == family]
+    anchors = [(path, real) for path, real, kind in typed if kind == family and
+               (selected_model is None or path == selected_model)]
     if not anchors:
         found = sorted({kind for _, _, kind in typed if kind})
         warn(f"no {FAMILY_TITLE[family]} model in {src}" +
