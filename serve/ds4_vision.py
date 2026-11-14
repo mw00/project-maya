@@ -13,13 +13,33 @@ see it) and transparent areas become white, as for the server's other models.
 """
 from __future__ import annotations
 
+import contextlib
+import contextvars
 import hashlib
 import io
 import math
 import struct
 import threading
+from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
+
+# Identity comes from the HTTP authentication boundary, never from image/request fields.
+IMAGE_SCOPE = contextvars.ContextVar("ds4_image_scope", default=None)
+
+
+@contextlib.contextmanager
+def image_scope(owner):
+    token = IMAGE_SCOPE.set(owner)
+    try:
+        yield
+    finally:
+        IMAGE_SCOPE.reset(token)
+
+
+class ImageCacheMiss(ValueError):
+    """A vLLM-compatible UUID reference whose picture has been evicted."""
+
 
 PLACEHOLDER = "<｜deepseek_image｜>"
 
@@ -135,6 +155,7 @@ class Vision:
         self.dir.mkdir(parents=True, exist_ok=True)
         self.lock = threading.RLock()
         self.cache: dict[str, Picture] = {}
+        self.image_ids = OrderedDict()
         self.owed = False                      # (serve.server.Vision's: no GPU memory is ever lent here)
 
     def settle(self) -> bool:
@@ -144,7 +165,35 @@ class Vision:
         import contextlib
         return contextlib.nullcontext(self)
 
-    def picture(self, source: str) -> Picture:
+    IMAGE_IDS_MAX = 64
+
+    def picture(self, source: str | dict) -> Picture:
+        if isinstance(source, dict):
+            uid, index = source.get("uuid"), source.get("index", 0)
+            src = source.get("source")
+            if uid:
+                scope = IMAGE_SCOPE.get()
+                if scope is None:
+                    # Direct callers without a trusted identity may use data, but cannot
+                    # publish or resolve persistent UUIDs in a shared default namespace.
+                    if not src:
+                        raise ImageCacheMiss(f"Cache miss for image at index {index} but data is not provided.")
+                    return self.picture(src)
+                key = (scope, uid)
+                # A retained UUID names its original pixels even when data is resent.
+                # Hold the lock through preparation so concurrent requests cannot rebind it.
+                with self.lock:
+                    if key in self.image_ids:
+                        self.image_ids.move_to_end(key)
+                        return self.image_ids[key]
+                    if not src:
+                        raise ImageCacheMiss(f"Cache miss for image at index {index} but data is not provided.")
+                    pic = self.picture(src)
+                    self.image_ids[key] = pic
+                    while len(self.image_ids) > self.IMAGE_IDS_MAX:
+                        self.image_ids.popitem(last=False)
+                    return pic
+            source = src
         data = self._load(source)
         key = hashlib.sha256(data).hexdigest()[:32]
         with self.lock:

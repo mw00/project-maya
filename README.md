@@ -257,6 +257,22 @@ slowest while the caches fill with what you use.
 - **Loop guard:** on by default - an agent that repeats the same tool call with the same result is steered off it.
 - **Pictures:** attach one in the chat, or send image parts through either API. Every model reads them (setup details per
   model: [docs/MODELS.md](docs/MODELS.md)). Videos too, for the models that read them.
+  DeepSeek image parts can include a `uuid` alongside their data. Later requests can send
+  `{"type":"image_url","image_url":null,"uuid":"frame-1"}` to reuse that picture. The server keeps the
+  64 most recently used UUIDs in memory. A retained UUID keeps its original picture. After a server restart
+  or eviction, the client can register it again with its data. A missing UUID returns HTTP 400 with `Cache miss for image at index N but data is not provided.`
+  so the client can retry with the image data.
+  UUID lookup is isolated by the **authenticated API key** (Bearer and `x-api-key` use the same namespace).
+  Another key cannot resolve or overwrite that key's UUID, even when it knows the ID. Clients sharing one key
+  share its namespace; use separate keys for separate tenants.
+  With no configured API key, each conversation uses a separate 256-bit bearer token: retain the
+  `X-Maya-Image-Session` response header and send it on subsequent requests in that conversation.
+  Omit it to start a new conversation. Treat this token as a secret; an image UUID or a JSON conversation ID
+  alone cannot open its namespace. Clients that do not retain the header must resend image data each time.
+  The token is available on JSON and streaming responses and exposed to allowed CORS origins. UUID entries
+  use a bounded **64-entry total LRU**, keyed by namespace and ID, not 64 entries multiplied by client count.
+  Prepared RGB pictures are stored in host RAM, not VRAM. The limit is 64 IDs, not a byte budget:
+  memory depends on resized dimensions, and the ordinary 32-picture content cache shares references where possible.
 - **Files:** attach any file in the chat. Text and code go in as they are; **PDFs** as their text, or a scanned one's
   first pages as pictures; Word, Excel, PowerPoint, OpenDocument, EPUB and RTF files as their text. Anything Maya can't
   read says why. The same works through the APIs: OpenAI `file` / `input_file` parts and Anthropic `document` blocks

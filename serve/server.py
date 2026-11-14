@@ -38,6 +38,7 @@ import os
 import queue
 import socket
 import re
+import secrets
 import subprocess
 import struct
 import sys
@@ -422,6 +423,8 @@ class ContextOverflow(ValueError):
 
 def error_body(e: Exception, kind: str = "invalid_request_error") -> dict:
     """An error response's body: OpenAI's shape, with the exception's `code` when it has one (ContextOverflow)."""
+    if isinstance(e, ds4_vision.ImageCacheMiss):
+        return {"error": {"type": "BadRequestError", "message": str(e), "param": None, "code": 400}}
     err = {"type": kind, "message": str(e)}
     if getattr(e, "code", None):
         err["code"] = e.code
@@ -3568,7 +3571,7 @@ class Service:
             # screenshot) - its template already wrote its own note in their place ("You are unable to process this
             # image ..."), so the agent's turn goes on instead of failing every retry; a user's picture is the 400 below
             media = []
-        images = (deepseek_images(messages) if getattr(self.template, "deepseek", False)
+        images = (deepseek_images(messages, with_ids=True) if getattr(self.template, "deepseek", False)
                   else [src for kind, src in media if kind == "image"])
         if isinstance(self.vision, ENGINE_VISION) and any(kind == "video" for kind, _ in media):
             # the engines' own vision towers (DeepSeek, MiniMax) read pictures only: say so instead of dropping the
@@ -3737,7 +3740,7 @@ class Service:
         messages, tools, kw = self.chat_prompt(req)
         if getattr(self.template, "deepseek", False) or isinstance(self.vision, mm3_vision.Vision):
             # (DeepSeek, MiniMax: the engine's own vision tower - a picture's span is its resize's)
-            sources = (deepseek_images(messages) if getattr(self.template, "deepseek", False)
+            sources = (deepseek_images(messages, with_ids=True) if getattr(self.template, "deepseek", False)
                        else [src for kind, src in media_of(messages) if kind == "image"])
             n, approximate = len(self.render_ids(messages, tools, kw)), bool(sources)
             if sources and isinstance(self.vision, ENGINE_VISION):
@@ -5048,7 +5051,11 @@ class StreamJob:
         self.readers = 0
         self.cv = threading.Condition()
         self.log, self.flushed = job_file(jid), time.time()   # its chunks on disk too: a restart keeps the answer
-        threading.Thread(target=self._run, args=(chunks,), daemon=True, name="strata-job").start()
+        image_owner = ds4_vision.IMAGE_SCOPE.get()
+        def run():
+            with ds4_vision.image_scope(image_owner):
+                self._run(chunks)
+        threading.Thread(target=run, daemon=True, name="strata-job").start()
 
     @classmethod
     def restored(cls, jid: str, items: list, ended: float) -> "StreamJob":
@@ -5784,6 +5791,11 @@ def make_handler(svc: Service):
                 self.send_header("Access-Control-Allow-Origin", allow)
                 if allow != "*":
                     self.send_header("Vary", "Origin")
+            session = getattr(self, "_image_session", None)
+            if session:
+                self.send_header("X-Maya-Image-Session", session)
+                if allow:
+                    self.send_header("Access-Control-Expose-Headers", "X-Maya-Image-Session")
             super().end_headers()
 
         def do_OPTIONS(self):
@@ -5814,6 +5826,20 @@ def make_handler(svc: Service):
             auth = self.headers.get("Authorization", "")
             given = auth[7:].strip() if auth.lower().startswith("bearer ") else self.headers.get("x-api-key", "")
             return hashlib.sha256(given.encode()).hexdigest()
+
+        def _image_owner(self):
+            self._image_session = None
+            if not isinstance(svc.vision, ds4_vision.Vision):
+                return None
+            if svc.api_key:
+                return ("api-key", self._response_owner())
+            # A separate unguessable bearer token identifies an unauthenticated
+            # conversation. Knowing an image UUID alone never grants access.
+            session = self.headers.get("X-Maya-Image-Session", "")
+            if not re.fullmatch(r"[0-9a-f]{64}", session):
+                session = secrets.token_hex(32)
+            self._image_session = session
+            return ("conversation", hashlib.sha256(session.encode()).hexdigest())
 
         def _response_lookup(self, owner, response_id):
             try:
@@ -6148,10 +6174,15 @@ def make_handler(svc: Service):
             self._json(code, {"error": {"type": kind, "message": message}})
 
         def do_POST(self):
+            self._image_session = None
             TURN.clear() if TURN_TRACE else None
             turn_mark("http")
             if not self._authorized() or self._foreign_page():
                 return
+            with ds4_vision.image_scope(self._image_owner()):
+                self._post_authorized()
+
+        def _post_authorized(self):
             path = self.path.split("?")[0].rstrip("/")   # issue #55: Claude Code posts /v1/messages?beta=true
             try:
                 if path in ("/models/load", "/models/unload"):
@@ -6491,7 +6522,10 @@ def make_handler(svc: Service):
             svc.check_request(sampling)
             if req.get("background"):
                 initial = new_response(svc.model, req, status="queued")
-                work = lambda cancel, rid: self._response_work(req, sampling, history, validation, owner, cancel, rid, False)
+                image_owner = ds4_vision.IMAGE_SCOPE.get()
+                def work(cancel, rid):
+                    with ds4_vision.image_scope(image_owner):
+                        yield from self._response_work(req, sampling, history, validation, owner, cancel, rid, False)
                 svc.response_jobs.store = svc.responses
                 out = svc.response_jobs.submit(owner, initial, history, work)
                 if req.get("stream"):

@@ -346,6 +346,7 @@ class BackgroundResponses(ResponseCase):
         class Vision(ds4_vision.Vision):
             def picture(self, source):
                 self.thread = threading.get_ident()
+                self.scope = ds4_vision.IMAGE_SCOPE.get()
                 return ds4_vision.Picture(b"\x7f" * 12, 2, 2, 1, 1)
 
         class Engine(RecordingEngine):
@@ -368,6 +369,8 @@ class BackgroundResponses(ResponseCase):
                         out = self.wait(out["id"])
                     self.assertEqual(out["status"], "completed")
                     self.assertEqual(self.svc.vision.thread, self.engine.thread)
+                    self.assertIsNotNone(self.svc.vision.scope)
+                    self.assertEqual(self.svc.vision.scope[0], "conversation")
                     magic, count, start, width, height = struct.unpack("<4siqii", self.engine.image_bytes[:24])
                     self.assertEqual((magic, count, width, height), (b"DSI1", 1, 2, 2))
                     self.assertEqual(self.engine.last_prompt[start:start + 4], [image_token] * 4)
