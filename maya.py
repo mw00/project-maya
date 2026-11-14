@@ -1940,7 +1940,7 @@ def setup_models_dir(a, prev: dict) -> Path:
 
 
 def choose_with_add(a, question: str, intro: list, rows: list, default: int, yes: bool,
-                    models: Path, family: str) -> int:
+                    models: Path, family: str) -> int | dict:
     """A model-files menu with 0 to link by type or import, then choose from the same list."""
     if yes:
         return choose(question, intro, rows, default, yes)
@@ -1973,7 +1973,7 @@ def choose_with_add(a, question: str, intro: list, rows: list, default: int, yes
 def choose_model(a, models: Path, inst: dict, family: str = "glm") -> tuple:
     """("download", one of MODELS) or ("local", the model's first .gguf file): --gguf-dir, --model, else asked among
     the downloads - the earlier download is the default.  ("exl3", the folder): --model-dir naming an EXL3 folder of
-    GLM-5.3-Flash."""
+    GLM-5.3-Flash. ("linked", the selected local files): an unlisted GGUF added through Link files."""
     metal = getattr(a, "backend", None) == "metal"
     if getattr(a, "model_dir", None) and exl3_folder_family(a.model_dir) == "glm":
         if metal:
@@ -2048,6 +2048,8 @@ def choose_model(a, models: Path, inst: dict, family: str = "glm") -> tuple:
     pick = choose_with_add(a, "Which GLM-5.3-Flash?", ["The model to download (GLM-5.3-Flash GGUF files you already have: "
                                                        "--gguf-dir <file or folder>):"], rows, opts.index(default),
                            a.yes, models, "glm")
+    if isinstance(pick, dict):
+        return "linked", pick
     return "download", opts[pick]
 
 
@@ -3115,6 +3117,13 @@ def review_downloaded_model(a, src: Path, models: Path, family: str) -> int | di
             if model is None:
                 warn("select a model file before linking")
                 continue
+            if family == "glm" and model["anchor"].suffix.lower() == ".gguf" and not any(
+                    Path(e["rel"]).name == model["anchor"].name for e in import_catalog(models)
+                    if link_catalog_family(e["label"], family)):
+                local = link_glm_local(models, chosen)
+                if local is not None:
+                    return local
+                continue
             if family == "qwen" and model["anchor"].name not in set().union(
                     *(set(qwen_entry(quant)["files"]) for quant in QWEN_QUANTS)):
                 local = link_qwen_local(models, chosen)
@@ -3127,6 +3136,44 @@ def review_downloaded_model(a, src: Path, models: Path, family: str) -> int | di
                                   selected_files=selected if chosen["model"] else None)
         if result == 0:
             return 0
+
+
+def link_glm_local(models: Path, chosen: dict) -> dict | None:
+    """Link an unlisted GLM-5.3-Flash quant and its selected companions by GGUF type only."""
+    first = chosen["model"]["anchor"]
+    if first.suffix.lower() != ".gguf" or linked_model_type(first) != "glm":
+        warn(f"{first.name} is not a GLM-5.3-Flash GGUF model")
+        return None
+    shards = shard_set(first)
+    missing = next((path for path in shards if not path.is_file()), None)
+    if missing is not None:
+        warn(f"{missing.name} is missing; finish the model download before linking")
+        return None
+    drafter, vision = chosen["drafter"], chosen["vision"]
+    if drafter and (drafter["anchor"].suffix.lower() != ".gguf" or gguf_head(drafter["anchor"])[0] != "dflash"):
+        warn(f"{drafter['path'].name}: select a DFlash2 GGUF, or None to use the model's own MTP block")
+        return None
+    if vision and (vision["anchor"].suffix.lower() != ".gguf" or gguf_head(vision["anchor"])[0] != "clip"):
+        warn(f"{vision['path'].name}: GLM vision needs an mmproj GGUF")
+        return None
+    name = re.sub(r"[^A-Za-z0-9._-]", "-", re.sub(r"(?:-\d{5}-of-\d{5})?\.gguf$", "", first.name, flags=re.I))[:100]
+    dest = models / f"GLM-local-{name}"
+    placements = [(path, dest / path.name) for path in shards]
+    placements += [(path, dest / "drafter" / path.name) for path in sorted(drafter["files"])] if drafter else []
+    placements += [(path, dest / "vision" / path.name) for path in sorted(vision["files"])] if vision else []
+    made = 0
+    for source, target in placements:
+        created, why = MI.link_file(source, target)
+        if why:
+            warn(why)
+            return None
+        if created:
+            made += 1
+            say(f"  linked {target} -> {source.resolve()}")
+    ok(f"{made} symbolic link(s) created for local GLM; model type checked, size and SHA-256 not checked")
+    return {"folder": dest, "model": dest / first.name, "files": [dest / p.name for p in shards],
+            "drafter": dest / "drafter" / drafter["path"].name if drafter else None,
+            "vision": dest / "vision" / vision["path"].name if vision else None}
 
 
 def link_qwen_local(models: Path, chosen: dict) -> dict | None:
@@ -3558,7 +3605,7 @@ def model_step(a, models: Path, choice: tuple):
     elif kind == "local":
         shards, quant, d = shard_set(what), quant_of(what), what.parent
         for s in shards:
-            why = incomplete(s)
+            why = None if MI.is_linked(s) else incomplete(s)
             if why:
                 fail(f"{s.name}: {why}", f"finish copying or downloading it, then run {ME} again")
         if quant not in glm_downloads():
@@ -4081,6 +4128,21 @@ def compile_vision(pc, meta, llama: Path, src: str) -> bool:
     return VEXE.exists()
 
 
+def local_vision_step(a, pc: dict, meta: dict, llama: Path, local: dict) -> dict | None:
+    """Use the selected local mmproj and the model's own tokenizer without downloading other vision files."""
+    step(7, "images (the vision encoder)")
+    mmproj = local.get("vision")
+    if a.no_vision or mmproj is None:
+        ok("pictures: off (--no-vision)" if a.no_vision else "pictures: no vision file selected")
+        return None
+    if not mmproj.is_file():
+        fail(f"{mmproj} is missing", "keep the source files in place and run the setup again")
+    if not vision_encoder_ready(a, pc, meta, llama):
+        return None
+    ok(f"pictures: ON - {mmproj.name} linked from the selected directory")
+    return {"exe": str(VEXE), "mmproj": str(mmproj), "model": str(local["model"]), "gpu": True}
+
+
 def vision_step(a, pc, meta, llama: Path, d: Path, quant: str) -> dict | None:
     """The config's "vision" entry - the image encoder and its files - or None (images off).  The server starts the
     encoder only while a request's new pictures are encoded, in GPU memory the model lends it, and measures on the
@@ -4233,7 +4295,8 @@ def glm_config_path(pc: dict, quant: str) -> Path:
 
 
 def write_config(a, pc, meta, pack: Path, quant: str, ctx: int, models: Path, vision: dict | None,
-                 choice: tuple | None = None, dflash: Path | None = None, gguf: Path | None = None) -> Path:
+                 choice: tuple | None = None, dflash: Path | None = None, gguf: Path | None = None,
+                 *, linked_files: dict | None = None) -> Path:
     step(8, "the configuration and the start script")
     port = a.port or 8080
     metal = pc.get("backend") == "metal"
@@ -4360,6 +4423,9 @@ def write_config(a, pc, meta, pack: Path, quant: str, ctx: int, models: Path, vi
                         **({"model_dir": str(choice[1])} if choice and choice[0] == "exl3" else {}),
                         **({"one_gpu_drafting": drafting} if drafting is not None else {}),
                         "written": time.strftime("%Y-%m-%d %H:%M")}
+    if linked_files is not None:
+        cfg["installer"].update({"local_drafter": str(linked_files["drafter"]) if linked_files.get("drafter") else None,
+                                  "local_vision": str(linked_files["vision"]) if linked_files.get("vision") else None})
     if drafting is not None:
         ok(f"one-GPU drafting (the MTP block): {'on' if drafting['on'] else 'off'} until the speed calibration "
            f"measures it here (about {drafting['outside'] * 100:.0f}% of the experts would stay outside GPU memory)")
@@ -4823,11 +4889,13 @@ def calibrate_ds4_config(cfg_path: Path) -> bool:
 
 
 def drafter_file(cfg: dict) -> Path | None:
-    """The DFlash2 drafter this config drafts with (--dflash), else the one a setup downloaded into its models folder
-    when it is there; None: no drafter on this PC."""
+    """The configured DFlash2 drafter, its saved local selection, or the downloaded default when it exists."""
     args = cfg.get("args") or []
     if "--dflash" in args[:-1]:
         return Path(args[args.index("--dflash") + 1])
+    local = (cfg.get("installer") or {}).get("local_drafter")
+    if local:
+        return Path(local) if Path(local).is_file() else None
     models = (cfg.get("installer") or {}).get("models_dir")
     f = Path(models) / "GLM-5.3-Flash-DFlash2" / DFLASH["file"] if models else None
     return f if f is not None and f.is_file() else None
@@ -5896,6 +5964,9 @@ def set_up(a, prev: dict) -> Path | None:
               Path(inst["models_dir"]) if inst.get("models_dir") else
               Path(inst["data_dir"]) / "models" if inst.get("data_dir") else ROOT.parent / "Maya-data" / "models")
     choice = choose_model(a, models, inst, family)
+    linked = choice[1] if choice[0] == "linked" else None
+    if linked is not None:
+        choice = "local", linked["model"]
     pc = check_pc(a)                                   # 1
     metal = pc["backend"] == "metal"
     step(2, "your choices")                            # 2
@@ -5920,8 +5991,11 @@ def set_up(a, prev: dict) -> Path | None:
     else:
         ctx = choose_context(a, prev_ctx, recommended=recommended_context(choice, pc))
     ok(f"context: {ctx} tokens")
-    draft = choose_draft(a, pc, inst)
-    ok("drafting: " + ("a DFlash2 drafter (downloaded with the model)" if draft == "dflash2" else "the MTP block"))
+    draft = ("dflash2" if linked.get("drafter") else "mtp") if linked is not None else choose_draft(a, pc, inst)
+    if linked is not None and linked.get("drafter"):
+        ok(f"drafting: selected DFlash2 drafter {linked['drafter'].name}")
+    else:
+        ok("drafting: " + ("a DFlash2 drafter (downloaded with the model)" if draft == "dflash2" else "the MTP block"))
     llama = tools_step(a)                              # 3
     meta = build_step(a, pc, llama)                    # 4
     got = model_step(a, models, choice)                # 5
@@ -5937,15 +6011,17 @@ def set_up(a, prev: dict) -> Path | None:
         have = g53_memory_gb(pc)                       # (neutral memory guidance, no speeds)
         (ok if have is not None and have >= g53_figures(quant)[0] else warn)(
             f"{G53.SHOWN}: {g53_memory_note(pc, quant)}")
-    dflash = drafter_step(models) if draft == "dflash2" else None
+    dflash = linked.get("drafter") if linked is not None else drafter_step(models) if draft == "dflash2" else None
     pack = metal_tokenizer_step(a, d, shards, quant) if metal else pack_step(a, d, shards, llama, quant)       # 6
     if dsa:
         step(7, "images (the vision encoder)")
         ok(f"{G53.SHOWN}: text only (the model has no vision tower)")
         vision = None
     else:
-        vision = vision_step(a, pc, meta, llama, d, quant)  # 7
-    cfg_path = write_config(a, pc, meta, pack, quant, ctx, models, vision, choice, dflash, shards[0] if metal else None)   # 8
+        vision = (local_vision_step(a, pc, meta, llama, linked) if linked is not None else
+                  vision_step(a, pc, meta, llama, d, quant))  # 7
+    cfg_path = write_config(a, pc, meta, pack, quant, ctx, models, vision, choice, dflash, shards[0] if metal else None,
+                            **({"linked_files": linked} if linked is not None else {}))   # 8
     if not metal:                                      # (the Mac engine does not project a direction)
         ablate_step(cfg_path, "glm-dsa" if dsa else "glm", models)
     if dflash is not None and metal:                   # (the speed calibration is CUDA's: on a Mac the choice is yours)
@@ -7828,17 +7904,7 @@ def qwen_local_ple(files: list[Path]) -> tuple[Path, int]:
 
 def qwen_local_vision_step(a, pc: dict, meta: dict, llama: Path, local: dict) -> dict | None:
     """Use the selected mmproj file in place; only its GGUF type was checked when it was linked."""
-    step(7, "images (the vision encoder)")
-    mmproj = local.get("vision")
-    if a.no_vision or mmproj is None:
-        ok("pictures: off (--no-vision)" if a.no_vision else "pictures: no vision file selected")
-        return None
-    if not mmproj.is_file():
-        fail(f"{mmproj} is missing", "keep the source files in place and run the setup again")
-    if not vision_encoder_ready(a, pc, meta, llama):
-        return None
-    ok(f"pictures: ON - {mmproj.name} linked from the selected directory")
-    return {"exe": str(VEXE), "mmproj": str(mmproj), "model": str(local["model"]), "gpu": True}
+    return local_vision_step(a, pc, meta, llama, local)
 
 
 def qwen_pack_step(a, d: Path, files: list, llama: Path, mtp_gguf: Path | None = None,

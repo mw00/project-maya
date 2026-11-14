@@ -431,7 +431,7 @@ class Screen(unittest.IsolatedAsyncioTestCase):
                     await pilot.pause(0.02)
 
             with patch.object(maya, "gguf_head", return_value=("glm5-next", 1)), \
-                    patch.object(maya, "link_model", return_value=0) as linked:
+                    patch.object(maya, "link_model", side_effect=AssertionError("catalog link used")) as published_link:
                 await until(lambda: app.pending is not None)
                 await pilot.press("0")
                 await until(lambda: app.pending is not None and app.pending[2] == "text")
@@ -481,13 +481,11 @@ class Screen(unittest.IsolatedAsyncioTestCase):
                             "Detected model files" in str(app.query_one("#ask").border_title))
                 self.assertIn(other.name, str(app.query_one("#options").get_option_at_index(0).prompt))
                 await pilot.press("4")          # Link files
-                await until(lambda: app.pending is not None and "Which files?" in
-                            str(app.query_one("#ask").border_title))
-                await pilot.press("1")
                 await until(lambda: app.return_value is not None)
-            linked.assert_called_once_with(str(model), Path(a.models_dir), "glm",
-                                           selected_model=other, selected_files={other})
-        self.assertEqual(app.return_value, ("done", 0))
+            published_link.assert_not_called()
+        self.assertEqual(app.return_value[0], "done")
+        self.assertEqual(app.return_value[1]["model"].name, other.name)
+        self.assertEqual(app.return_value[1]["model"].resolve(), other)
         bridge.log.close()
 
     async def test_browse_model_drafter_and_vision_files(self):
