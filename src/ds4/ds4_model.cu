@@ -17,6 +17,7 @@
 #include "../core/ablate_capture.hpp"   // (MAYA_ABLATE_CAPTURE: the direction fitting's read-out)
 #include "ds4_engram_io.hpp"
 #include "ds4_draft_placement.hpp"
+#include "ds4_embedding_f16.hpp"
 
 #include "ds4_gguf.cuh"
 #if defined(STRATA_USE_HIP)
@@ -343,21 +344,7 @@ static uint16_t f32_to_bf16(float f) {
     return (uint16_t) ((u + 0x7fffu + (u >> 16 & 1u)) >> 16);
 }
 float f16_to_f32(uint16_t h) {
-    const uint32_t s = (uint32_t) (h >> 15) << 31, e = (h >> 10) & 0x1f, m = h & 0x3ff;
-    uint32_t u;
-    if (e == 0) {
-        if (m == 0) u = s;
-        else {   // subnormal
-            int ee = -1;
-            uint32_t mm = m;
-            do {
-                ++ee;
-                mm <<= 1;
-            } while ((mm & 0x400) == 0);
-            u = s | (uint32_t) (127 - 15 - ee) << 23 | (mm & 0x3ff) << 13;
-        }
-    } else if (e == 31) u = s | 0x7f800000u | m << 13;
-    else u = s | (e - 15 + 127) << 23 | m << 13;
+    const uint32_t u = ::ds4::f16_to_f32_bits(h);
     float f;
     std::memcpy(&f, &u, 4);
     return f;
@@ -4582,17 +4569,36 @@ struct Model::Impl {
         {
             const Tensor* t = pk.get("embed.weight");
             const size_t nv = (size_t) g.vocab * g.dim;
+            const bool f16 = t != nullptr && t->dtype == "F16" && t->bytes == nv * 2;
             const bool q8 = t != nullptr && t->dtype == "Q8_0" && t->bytes == nv / 32 * gg::kQ8Bytes;
             // (Q4_K: 144 bytes every 256 values; Q5_K: 176; Q6_K: 210)
             const bool q4k = t != nullptr && t->dtype == "Q4_K" && g.dim % 256 == 0 && t->bytes == nv / 256 * 144;
             const bool q5k = t != nullptr && t->dtype == "Q5_K" && g.dim % 256 == 0 && t->bytes == nv / 256 * 176;
             const bool q6k = t != nullptr && t->dtype == "Q6_K" && g.dim % 256 == 0 && t->bytes == nv / 256 * kQ6kBytes;
-            if (t == nullptr || (!q8 && !q4k && !q5k && !q6k && (t->dtype != "BF16" || t->bytes != nv * 2))) {
-                err = "embed.weight: not a BF16 (or Q8_0, Q4_K, Q5_K, Q6_K) [vocab][dim] table";
+            if (t == nullptr || (!f16 && !q8 && !q4k && !q5k && !q6k && (t->dtype != "BF16" || t->bytes != nv * 2))) {
+                err = "embed.weight: not a BF16 or exact finite F16 (or Q8_0, Q4_K, Q5_K, Q6_K) [vocab][dim] table";
                 return false;
             }
             if (!halloc(embed_pinned, nv, err)) return false;
-            if (q8 || q4k || q5k || q6k) {   // (a GGUF's: each value rounded to BF16, a row at a time)
+            if (f16) {
+                // A pack may store originally BF16 embedding values in F16. Accept only an exact
+                // conversion: never silently round a genuinely higher-precision F16 embedding.
+                std::vector<uint16_t> row((size_t) g.dim);
+                for (size_t r = 0; r < (size_t) g.vocab; ++r) {
+                    if (!pk.read_at(t->file, t->off + r * row.size() * 2, row.size() * 2, row.data())) {
+                        err = "embed.weight: F16 read failed";
+                        return false;
+                    }
+                    for (size_t c = 0; c < row.size(); ++c) {
+                        uint16_t converted;
+                        if (!::ds4::f16_to_exact_bf16(row[c], converted)) {
+                            err = "embed.weight: F16 value cannot be represented exactly as finite BF16";
+                            return false;
+                        }
+                        embed_pinned[r * g.dim + c] = converted;
+                    }
+                }
+            } else if (q8 || q4k || q5k || q6k) {   // (a GGUF's: each value rounded to BF16, a row at a time)
                 const size_t kb = q4k ? 144 : q5k ? 176 : kQ6kBytes;   // (a K-quant's bytes every 256 values)
                 std::vector<uint8_t> row(q8 ? (size_t) g.dim / 32 * gg::kQ8Bytes : (size_t) g.dim / 256 * kb);
                 for (size_t r = 0; r < (size_t) g.vocab; ++r) {
