@@ -67,8 +67,15 @@ struct NativeExpertLayout {
     size_t gu_row = 0, d_row = 0;       // bytes per row
     size_t up_off = 0, down_off = 0;    // byte offsets inside the blob
     size_t bytes = 0;                   // the whole blob
+    int u_type = -1;                    // the up rows' type: gu_type except on a mixed layer (gate:up in the pack)
+    size_t u_row = 0;
 };
 NativeExpertLayout native_expert_layout(int gu_type, int d_type, int64_t n_embd, int64_t n_ff);
+/// The same for a layer whose up rows have their own type (up_type == gu_type: exactly the call above).
+NativeExpertLayout native_expert_layout(int gu_type, int up_type, int d_type, int64_t n_embd, int64_t n_ff);
+/// iq_dequant_gu_f16 with the gate and the up rows of two types (a mixed layer).
+void iq_dequant_gu_f16_mixed(int gate_type, int up_type, const void* gate, const void* up, int64_t n_ff,
+                             int64_t n_embd, uint16_t* dst, void* stream);
 
 /// Bytes of scratch `native_expert_grouped` needs for `cap_entries` entries.
 size_t native_expert_scratch_bytes(int64_t cap_entries, int64_t n_ff);

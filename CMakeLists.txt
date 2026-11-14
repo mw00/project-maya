@@ -1506,6 +1506,10 @@ if(STRATA_NATIVE_EXPERTS)
     add_executable(native_split_test src/kernels/cpu/native_split_test.cpp)
     target_link_libraries(native_split_test PRIVATE strata_kernels_cpu)
     add_test(NAME native_split_test COMMAND native_split_test)
+    # a native layer whose gate and up are of two types (Qwen3.8 UD-IQ1_S blk.18): layout, rows vs ggml-cpu, pack index
+    add_executable(native_mixed_test src/kernels/cpu/native_mixed_test.cpp)
+    target_link_libraries(native_mixed_test PRIVATE strata_kernels_cpu)
+    add_test(NAME native_mixed_test COMMAND native_mixed_test)
     # the multi-token expert rows (iq_avx512 / iq_avx2) bit for bit against ggml-cpu's dot, and GLM's split rows for a
     # window of tokens against the same tokens one at a time
     if(STRATA_CPU_X86)   # (#471: x86-only kernels - native rows, the IQ1_S rows without pdep)

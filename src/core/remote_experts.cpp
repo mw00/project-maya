@@ -1063,7 +1063,7 @@ bool RemoteExperts::begin(int64_t layer, const float* x, const int32_t* ids, int
     if (lay.native) {
         strata::kernels::quantize_q8_1_rows(zero_copy_ ? z_x_ : d_x_, n_tok, H, d_q8_, s);
         const auto& fmt = lay.fmt[(size_t) layer];
-        auto L = strata::kernels::native_expert_layout(fmt.gu_type, fmt.d_type, fmt.n_embd, fmt.n_ff);
+        auto L = strata::kernels::native_expert_layout(fmt.gu_type, fmt.u_type, fmt.d_type, fmt.n_embd, fmt.n_ff);
         if (!strata::kernels::native_expert_grouped(L, d_ptr_, d_start_, d_count_, d_dst_, d_tok_,
                                                groups_, (int64_t) dst_.size(), d_q8_, d_scratch_, zero_copy_ ? z_out_ : d_out_, s)) {
             err = "CUDA" + std::to_string(device_) + " experts: no device kernel for layer " + std::to_string(layer) +
