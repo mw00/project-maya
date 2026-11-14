@@ -1544,10 +1544,20 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         if (abl_flip) c = 0;
         size_t from = 0;
         bool continued = false;
+        // a kept shared start is no conversation: prefix_take leaves it in the model when a prompt that begins with it
+        // takes it back, and a read that a STOP ends before it wrote a token leaves it there whole.  A prompt that
+        // begins with it would then "continue" the start, while the conversation it does continue sits in a slot (just
+        // set aside, in RAM) and is never taken back: the whole prompt reads again (a 190K-token conversation: ~73 s)
+        bool state_is_prefix = false;
+        for (const Prefix& p : prefixes) {
+            if (p.tokens.size() != n_state) continue;
+            state_is_prefix = std::equal(p.tokens.begin(), p.tokens.end(), st.begin());
+            if (state_is_prefix) break;
+        }
         // the conversation continues, reused in place - a conversation has to be in the model first: a fresh engine
         // (the start of a run, so every restart) holds 0 tokens, and every prompt "continues" that to token 0; taken
         // as a continuation, the take below would never run for the folder's conversations, the case they are for
-        if (n_state > 0 && c == n_state && n_state < r.ids.size()) {
+        if (!state_is_prefix && n_state > 0 && c == n_state && n_state < r.ids.size()) {
             from = n_state;
             continued = true;
         }
@@ -1555,7 +1565,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             // CONVERSATION SLOTS: this prompt does not continue the conversation in the model - that one is set aside
             // first (another one takes the model, and its state is lost otherwise), then the kept conversation this
             // prompt does continue is taken back - if it goes further back than the checkpoints the state itself holds
-            if (slot_max > 0) slot_put("");
+            if (slot_max > 0 && !state_is_prefix) slot_put("");   // (a shared start is nobody's conversation)
             beat();
             const int64_t limit = (int64_t) std::min(c, r.ids.size() - 1);
             const int64_t rs = m.restorable(limit);
