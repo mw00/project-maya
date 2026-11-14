@@ -1206,6 +1206,121 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         note(msg);
         return len;
     };
+    // EXPORT / IMPORT (#655): a kept conversation out to a file pair another engine of the same model and pack takes
+    // in - another process, another GPU split, another machine.  SLOTOUT <file.bin> [id,id,...]: the conversation in
+    // the model is set aside first, then the kept one sharing the most of the ids (none given: the latest) is written
+    // to <file.bin> and its .meta.  SLOTIN <file.bin>: a pair whose .meta names this model is copied into the folder
+    // as a kept conversation - the next prompt that continues it takes it back like any other.
+    const auto slot_export = [&](const std::string& arg, std::string& e) -> std::string {
+        if (slot_max <= 0) {
+            e = "conversations are not kept here (MAYA_DS4_SLOT_KEEP=1 keeps them)";
+            return "";
+        }
+        const size_t sp = arg.find(' ');
+        const std::string path = arg.substr(0, sp);
+        std::vector<int32_t> ids;
+        if (sp != std::string::npos) {
+            const char* s = arg.c_str() + sp + 1;
+            while (*s) {
+                char* end = nullptr;
+                const long v = std::strtol(s, &end, 10);
+                if (end == s) break;
+                ids.push_back((int32_t) v);
+                s = *end == ',' ? end + 1 : end;
+            }
+        }
+        if (path.size() < 5 || path.compare(path.size() - 4, 4, ".bin") != 0) {
+            e = "SLOTOUT needs a file name ending in .bin";
+            return "";
+        }
+        slot_put(" for an export");
+        size_t best = SIZE_MAX, shared = 0;
+        for (size_t i = 0; i < slots.size(); ++i) {
+            const auto& t = slots[i].tokens;
+            size_t c = 0;
+            if (!ids.empty())
+                while (c < t.size() && c < ids.size() && t[c] == ids[c]) ++c;
+            if (!ids.empty() && c == 0) continue;
+            if (best == SIZE_MAX || c > shared || (c == shared && slots[i].used > slots[best].used)) {
+                best = i;
+                shared = c;
+            }
+        }
+        if (best == SIZE_MAX) {
+            e = ids.empty() ? "there is no conversation to export" : "no kept conversation starts like these tokens";
+            return "";
+        }
+        Slot& s = slots[best];
+        std::error_code ec;
+        if (s.data) {
+            std::ofstream f(path + ".tmp", std::ios::binary | std::ios::trunc);
+            f.write((const char*) s.data->data(), (std::streamsize) s.data->size());
+            f.flush();
+            if (!f) {
+                std::filesystem::remove(path + ".tmp", ec);
+                e = "writing " + path + " failed";
+                return "";
+            }
+            f.close();
+            fs::rename(path + ".tmp", path, ec);
+        } else
+            fs::copy_file(s.path, path, fs::copy_options::overwrite_existing, ec);
+        const uint64_t bytes = s.data ? s.data->size() : s.bytes;
+        if (ec || !meta_write(meta_of(path), s.tokens, bytes, s.cks, s.pics)) {
+            e = "writing " + path + " failed" + (ec ? " (" + ec.message() + ")" : "");
+            return "";
+        }
+        note("exported a " + std::to_string(s.tokens.size()) + "-token conversation (" + gb(bytes) + ") to " + path);
+        return "SLOTSAVED " + std::to_string(s.tokens.size()) + " " + std::to_string(bytes);
+    };
+    const auto slot_import = [&](const std::string& path, std::string& e) -> std::string {
+        if (slot_max <= 0) {
+            e = "conversations are not kept here (MAYA_DS4_SLOT_KEEP=1 keeps them)";
+            return "";
+        }
+        if (path.size() < 5 || path.compare(path.size() - 4, 4, ".bin") != 0) {
+            e = "SLOTIN needs a file name ending in .bin";
+            return "";
+        }
+        std::vector<int32_t> toks;
+        uint64_t bytes = 0;
+        std::vector<int64_t> cks;
+        std::vector<Pic> pics;
+        if (!meta_read(meta_of(path), toks, bytes, cks, pics)) {
+            e = "the conversation is not this model's (another model, pack or Maya version) or its .meta is damaged";
+            return "";
+        }
+        std::error_code ec;
+        if ((uint64_t) fs::file_size(path, ec) != bytes || ec) {
+            e = path + " does not match its .meta's size";
+            return "";
+        }
+        const auto space = fs::space(slot_dir, ec);
+        if (!ec && space.available < bytes + ((uint64_t) 8 << 30)) {
+            e = "under 8 GB would be free in " + slot_dir.string() + " after the import";
+            return "";
+        }
+        const auto stamp = std::chrono::duration_cast<std::chrono::milliseconds>(
+                               std::chrono::system_clock::now().time_since_epoch()).count();
+        const std::string to =
+            (slot_dir / ("slot-" + std::to_string(stamp) + "-" + std::to_string(++slot_seq) + ".bin")).string();
+        fs::copy_file(path, to + ".tmp", fs::copy_options::overwrite_existing, ec);
+        if (!ec) fs::rename(to + ".tmp", to, ec);
+        if (ec || !meta_write(meta_of(to), toks, bytes, cks, pics)) {
+            fs::remove(to + ".tmp", ec);
+            fs::remove(to, ec);
+            e = "copying the conversation into " + slot_dir.string() + " failed";
+            return "";
+        }
+        for (size_t i = slots.size(); i-- > 0;)   // (an earlier state of the same conversation is superseded)
+            if (slots[i].tokens.size() <= toks.size() &&
+                std::equal(slots[i].tokens.begin(), slots[i].tokens.end(), toks.begin()))
+                slot_drop(i);
+        slots.push_back({toks, to, bytes, ++slot_clock, nullptr, cks, pics});
+        slot_trim(to);
+        note("imported a " + std::to_string(toks.size()) + "-token conversation (" + gb(bytes) + ") from " + path);
+        return "SLOTADDED " + std::to_string(toks.size()) + " " + std::to_string(bytes);
+    };
     // SHARED STARTS (#607): the state at the end of a system prompt and its tools (the shared= restore point of a
     // prompt read from token 0) is also kept apart from its conversation, in RAM, so a NEW conversation behind the same
     // start - after an unrelated one, in another --parallel conversation, with or without MAYA_DS4_SLOT_KEEP - takes it
@@ -1870,9 +1985,19 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         double tr_first = 0;
         beat();
         g_busy.store(true);
+        if (line.rfind("SLOTOUT ", 0) == 0 || line.rfind("SLOTIN ", 0) == 0) {
+            std::string e;
+            const bool out = line[4] == 'O';
+            const std::string msg = out ? slot_export(line.substr(8), e) : slot_import(line.substr(7), e);
+            if (msg.empty()) std::printf("ERR %s\n", e.c_str());
+            else std::printf("%s\n", msg.c_str());
+            std::fflush(stdout);
+            continue;
+        }
         const bool geni = line.rfind("GENI ", 0) == 0;
         if (!geni && line.rfind("GEN ", 0) != 0) {
-            std::printf("ERR unsupported command '%s' (GEN, GENI, STOP and QUIT)\n", line.substr(0, line.find(' ')).c_str());
+            std::printf("ERR unsupported command '%s' (GEN, GENI, SLOTOUT, SLOTIN, STOP and QUIT)\n",
+                        line.substr(0, line.find(' ')).c_str());
             std::fflush(stdout);
             continue;
         }
