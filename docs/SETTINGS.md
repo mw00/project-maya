@@ -2294,6 +2294,7 @@ started. A value out of range, or of the wrong type, is dropped.
 | `vram_evict` | `lfu`, `lru` | `MAYA_GLM_VRAM_EVICT` |
 | `ngram` | true / false | `MAYA_GLM_NGRAM_DRAFT` |
 | `lane_row4` | true / false | `MAYA_GLM_LANE_ROW4` |
+| `prefill_row_local` | true / false | `MAYA_GLM_PREFILL_ROW_LOCAL` |
 | `graphs` | true / false | false: this request decodes without the attention's CUDA graphs |
 | `pcie_frac_head` | 0..1 | the CPU lane's share for the parts of a draft's verification head (the rest keep `pcie_frac`) |
 

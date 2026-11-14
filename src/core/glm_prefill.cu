@@ -4230,6 +4230,26 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                 cudaMemcpyAsync(M.OUTPc, S->out_h, (size_t) cpu_nrows * E * sizeof(float), cudaMemcpyHostToDevice,
                                 F->copy);
             } else {
+                static const bool row_local = [] {
+                    const char* value = getenv("MAYA_GLM_PREFILL_ROW_LOCAL");
+                    return value != nullptr && std::strcmp(value, "1") == 0;
+                }();
+                int low_node = -1;
+                // All CPU candidates come from this layer's RAM class. Check the live mapping and the
+                // layer's layout before treating its original GGML row blocks as low/high-half jobs.
+                if (row_local && g.arch == GlmArch::Glm5Next && T > 1 && RC.registered && RC.per_part == 0 &&
+                    RC.split_d == 0 && RC.n > 0 && RC.row_halves.matches(Ly.gu_bytes, Ly.down_off, Ly.blob) &&
+                    glmfast::row_halves_fit_blocks(nff, kGu) && glmfast::row_halves_fit_blocks(E, kDn) &&
+                    std::all_of(cpu_set.begin(), cpu_set.end(), [&](const Staged& expert) {
+                        return !expert.dev && glmfast::row_halves_has_slot(expert.ram, RC.base, RC.stride, (size_t) RC.n);
+                    })) {
+                    low_node = RC.row_halves.low_node;
+                    static std::once_flag noted;
+                    std::call_once(noted, [&] {
+                        std::fprintf(stderr, "glm prefill: CUDA%d GGML CPU row halves active (NUMA %d / %d)\n",
+                                     dev_, low_node, RC.row_halves.high_node);
+                    });
+                }
                 if (S->c_act.size() < (size_t) cpu_nrows * kA) S->c_act.resize((size_t) cpu_nrows * kA);
                 if (S->c_hq.size() < (size_t) cpu_nrows * kH) S->c_hq.resize((size_t) cpu_nrows * kH);
                 if (S->c_ff.size() < (size_t) cpu_nrows * nff) S->c_ff.resize((size_t) cpu_nrows * nff);
@@ -4276,7 +4296,8 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                     });
                 };
                 if (pack_a > 0) pack(true);
-                F->cpu_pool->run(ncx * (nff / kGu), [&](int job) {
+                glmfast::run_prefill_row_blocks(*F->cpu_pool, ncx, nff, kGu, low_node, glmfast::prefill_row_node,
+                                                [&](int job) {
                     const int j = job % ncx, r0 = (job / ncx) * kGu, b = r_of[(size_t) j];
                     const int cnt = S->h_counts[cpu_set[(size_t) j].e];
                     const uint8_t* blob = cpu_set[(size_t) j].ram;
@@ -4333,7 +4354,8 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                 const auto down = [&](int j0, int j1) {
                   const int nj = j1 - j0;
                   if (nj <= 0) return;
-                  F->cpu_pool->run(nj * (E / kDn), [&](int job) {
+                  glmfast::run_prefill_row_blocks(*F->cpu_pool, nj, E, kDn, low_node, glmfast::prefill_row_node,
+                                                  [&](int job) {
                     const int j = j0 + job % nj, r0 = (job / nj) * kDn, b = r_of[(size_t) j];
                     const int cnt = S->h_counts[cpu_set[(size_t) j].e];
                     thread_local std::vector<const void*> h;
