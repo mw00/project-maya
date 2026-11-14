@@ -551,7 +551,7 @@ private:
     bool read_part_direct(int64_t layer, int64_t expert, int part, uint8_t* dst) const;
     bool direct_ = false;                  ///< every map has its O_DIRECT descriptor and stagers exist
     std::vector<Map> maps_;
-    std::vector<int> map_of_;              ///< per layer: which map holds its experts
+    std::vector<int> map_of_;              ///< per layer and gate/up/down role: which map holds its weights
     int64_t n_layers_ = 0, n_expert_ = 0;
     // the resident arena: compact, grouped by layer; offset per pair or kNone
     static constexpr uint64_t kNone = ~uint64_t{0};

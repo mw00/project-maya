@@ -45,9 +45,22 @@ class Contexts(unittest.TestCase):
 
 
 class Family(unittest.TestCase):
+    def test_glm53_is_directly_below_flash_on_the_first_screen(self):
+        labels = []
+
+        def pick(title, intro, rows, default, yes):
+            labels.extend(row[0] for row in rows)
+            return default
+
+        with patch.object(maya, "choose", side_effect=pick), patch.object(maya.S, "gpus", return_value=[]):
+            maya.choose_family(args(yes=False), {})
+        self.assertEqual(labels[:2], ["GLM-5.3-Flash", "GLM-5.3"])
+        self.assertEqual(labels[-1], "Qwen-3.8-Flash-Next")
+
     def test_options_pick_the_model(self):
         self.assertEqual(maya.choose_family(args(model=maya.DS4), {}), "deepseek")
         self.assertEqual(maya.choose_family(args(model="Maya-L"), {}), "glm")
+        self.assertEqual(maya.choose_family(args(model="GLM-5.3-Maya-XS"), {}), "glm53")
         self.assertEqual(maya.choose_family(args(model_dir="/x"), {}), "deepseek")
         self.assertEqual(maya.choose_family(args(gguf_dir="/x"), {}), "glm")
         self.assertEqual(maya.choose_family(args(draft="dflash2"), {}), "glm")
@@ -56,9 +69,11 @@ class Family(unittest.TestCase):
     def test_default_is_the_model_before(self):
         ds4 = {"exe": "/m/build/maya-ds4", "args": ["--pack", "/m/maya-ds4", "--max-context", "65536"]}
         glm = {"exe": "/m/build/maya", "args": ["--glm-pack", "/m/pack"]}
+        g53 = {"installer": {"quant": "GLM-5.3-Maya-XS"}}
         with patch.object(maya.S, "gpus", return_value=[]), patch.object(maya, "say", lambda *a: None):
             self.assertEqual(maya.choose_family(args(), ds4), "deepseek")
             self.assertEqual(maya.choose_family(args(), glm), "glm")
+            self.assertEqual(maya.choose_family(args(), g53), "glm53")
             self.assertEqual(maya.choose_family(args(), {}), "glm")
         self.assertEqual(maya.config_family(ds4), "deepseek")
         self.assertEqual(maya.config_family(glm), "glm")

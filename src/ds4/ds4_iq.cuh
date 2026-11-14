@@ -51,6 +51,7 @@ const char* name(int type);
 /// ..], entry e's input row e >> 3).  x / h as int8 rows with an F32 scale per 32 (xq, xd: rows of n_embd; hq, hd: row e
 /// = entry e, rows of n_ff).
 struct Args {
+    size_t scale[3] = {0, 0, 0}; // optional per-expert F32 multipliers at these blob offsets
     const unsigned long long* plan_ptr = nullptr;
     const unsigned long long* grp_ptr = nullptr;
     const int *grp_start = nullptr, *grp_ent = nullptr, *n_groups = nullptr;
@@ -81,6 +82,7 @@ bool down(const Args& a, int groups, int ne_max, cudaStream_t s);
 /// rows take the token kernels' form (each weight read once, the rows' inputs rounded to int8 per 32 as the token path
 /// rounds them; MAYA_DS4_NO_LIGHT=1: never), the others GEMM tiles (tensor cores on CUDA, F16 operands).
 struct SetArgs {
+    size_t scale[3] = {0, 0, 0};
     const uint8_t* wbase = nullptr;
     size_t stride = 0;
     size_t tr[3] = {0, 0, 0};

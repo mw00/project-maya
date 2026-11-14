@@ -19,6 +19,7 @@
 #include "strata/core/glm_dflash.hpp"
 
 #include "glm_fast_state.hpp"
+#include "glm_dflash_selector.cuh"
 #include "strata/artifact/gguf_reader.hpp"
 #include "strata/core/glm_model.hpp"
 #include "strata/kernels/glm_fast.hpp"
@@ -553,6 +554,7 @@ __device__ float tab_at(const uint8_t* tab, int type, int rank, int row, int e) 
             const int v = hi ? b >> 4 : b & 0xF;
             return __low2float(q->dm) * (float) sc * (float) v - __high2float(q->dm) * (float) mn;
         }
+        case 13: return dflash_detail::q5_k_at(tab, rank, row, e); // Q5_K
         case 14: {   // Q6_K
             const BlkQ6K* q = (const BlkQ6K*) tab + (size_t) row * (rank / 256) + e / 256;
             const int r = e % 256, n = r / 128, rr = r % 128, qt = rr / 32, l = rr % 32, is = l / 16;
@@ -944,10 +946,10 @@ bool GlmDflash::load(const std::string& path, int dev, std::string& err) {
         m.sel_type = (int) ip->second.second->type;
         const int st = m.sel_type;
         const bool ok = st == 0 || st == 1 || st == 30 || (st == 8 && m.rank % 32 == 0) ||
-                        ((st == 12 || st == 14) && m.rank % 256 == 0);
+                        ((st == 12 || st == 13 || st == 14) && m.rank % 256 == 0);
         if (!ok) {
             err = std::string("glm dflash: selector tables in ") + ip->second.second->type_name() +
-                  " (F32 / F16 / BF16 / Q8_0 / Q4_K / Q6_K are read)";
+                  " (F32 / F16 / BF16 / Q8_0 / Q4_K / Q5_K / Q6_K are read)";
             return false;
         }
         m.sel_prev = (const uint8_t*) ip->second.first;

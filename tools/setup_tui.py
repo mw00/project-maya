@@ -24,11 +24,12 @@ from textual import events
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Center, Horizontal, Vertical
-from textual.widgets import OptionList, RichLog, Static
+from textual.widgets import Input, OptionList, RichLog, Static
 from textual.widgets.option_list import Option
 
-from setup_bridge import TAIL, Bridge, curl_meter, describe
+from setup_bridge import TAIL, BackRequested, Bridge, curl_meter, describe
 from setup_dash import Dashboard
+from setup_dir_picker import DirectoryPicker, FilePicker
 from setup_look import (ACCENT, ACCENT_TEXT, DANGER, EDGE, FAINT, INK, LINE, MUTED, OK, OK_TEXT, SETUP_CSS, THEME,
                         TINT, Card, Output, StopScreen, clock, hints, serving_card, setup_card, splash, styled, title)
 
@@ -68,7 +69,8 @@ class SetupApp(App):
                 Binding("ctrl+q", "stop", show=False, priority=True),
                 Binding("tab", "browse(1)", show=False, priority=True),
                 Binding("shift+tab", "browse(-1)", show=False, priority=True),
-                Binding("escape", "live", show=False)]
+                Binding("ctrl+o", "open_directory_picker", show=False, priority=True),
+                Binding("escape", "back", show=False)]
     ENABLE_COMMAND_PALETTE = False
     TITLE = "Project Maya"
 
@@ -86,6 +88,10 @@ class SetupApp(App):
         self.doing, self.doing_since, self.said_doing, self.last = "", 0.0, False, ""
         self.bar, self.bar_since = None, 0.0            # (share done, what to show) while a command tells it
         self.pending = None                             # the question shown: (future, values, kind)
+        self.text_is_directory = False                  # The downloaded-model folder's path field
+        self.text_file_root: Path | None = None
+        self.text_question = ""
+        self.zero_option = False                         # a menu's first item is the 0 action
         self.abouts: list = []                          # its options' descriptions (under the highlighted one)
         self.shown = 0                                  # the Bridge's entries handled so far
         self.written, self.flow = 0, 0                  # lines in the output box, and the width they wrap at
@@ -114,6 +120,7 @@ class SetupApp(App):
                     with Vertical(id="ask"):
                         yield Static(id="intro")
                         yield OptionList(id="options")
+                        yield Input(id="text-answer", placeholder="Directory containing downloaded model files")
                         yield Static(id="about")
             yield Dashboard(id="dash")                  # Maya's, once it runs
 
@@ -176,14 +183,18 @@ class SetupApp(App):
 
     def work(self) -> None:
         """The setup's thread: maya.py's set_up, then the screen closes."""
-        try:
-            end = ("done", self.body())
-        except KeyboardInterrupt:
-            end = ("stopped", None)
-        except SystemExit as e:
-            end = ("fail", self.bridge.failure or (f"the setup ended (exit {e.code})", None))
-        except BaseException as e:                     # noqa: BLE001 - a bug: raised again once the screen is gone
-            end = ("error", e)
+        while True:
+            try:
+                end = ("done", self.body())
+            except BackRequested:
+                continue
+            except KeyboardInterrupt:
+                end = ("stopped", None)
+            except SystemExit as e:
+                end = ("fail", self.bridge.failure or (f"the setup ended (exit {e.code})", None))
+            except BaseException as e:                 # noqa: BLE001 - a bug: raised again once the screen is gone
+                end = ("error", e)
+            break
         self.bridge.events.put(("end", end))
 
     # ---------------------------------------------------------------------------------------- the setup's events
@@ -369,6 +380,21 @@ class SetupApp(App):
     def ev_choose(self, question, intro, options, default, outro, fut: Future) -> None:
         self.show_question(fut, "choose", question, intro, options, list(range(len(options))), default, outro)
 
+    def ev_text(self, question: str, default: str, file_root: str | None, fut: Future) -> None:
+        self.text_is_directory = question == "Directory with downloaded model files"
+        self.text_file_root = Path(file_root) if file_root is not None else None
+        self.text_question = question
+        self.show_question(fut, "text", question, [], [], [], 0, [])
+        field = self.query_one("#text-answer", Input)
+        field.value = default
+        self.query_one("#about", Static).update("Ctrl+O: browse and search folders." if self.text_is_directory else
+                                                "Ctrl+O: browse files. You can also enter a relative or full path."
+                                                if self.text_file_root is not None else
+                                                "Enter a file name relative to the selected directory.")
+        field.focus()
+        if self.text_file_root is not None:
+            self.action_open_directory_picker()
+
     def ev_fail(self, msg: str, hint, fut: Future) -> None:
         self.end_step("fail")
         self.set_doing("")
@@ -380,6 +406,7 @@ class SetupApp(App):
         if self.serving is not None and self.view is None:   # (the dashboard shows: the log's page has the box)
             self.show_view(LOG)
         self.pending = (fut, values, kind)
+        self.zero_option = kind == "choose" and bool(options) and options[0][0].startswith("0) ")
         self.abouts = [" ".join(x for x in (o[2], " ".join(outro)) if x) for o in options]
         box = self.query_one("#ask")
         named = kind != "fail" and len(question) <= 40  # a short question names the box, a long one opens it
@@ -391,16 +418,22 @@ class SetupApp(App):
         self.query_one("#intro", Static).update(body)
         self.query_one("#intro").display = bool(body.plain)
         ol = self.query_one("#options", OptionList)
+        field = self.query_one("#text-answer", Input)
+        ol.display = kind != "text"
+        field.display = kind == "text"
         ol.clear_options()
-        ol.add_options([Option(Text.assemble(f"{i}) " if kind == "choose" and len(options) < 10 else "", label,
+        ol.add_options([Option(Text.assemble(("" if label.startswith("0) ") else f"{i - int(self.zero_option)}) ")
+                                             if kind == "choose" and len(options) < 10 else "", label,
                                              (f"   {note}", f"italic {OK_TEXT}") if note else ""))
                         for i, (label, note, _) in enumerate(options, 1)])
-        ol.highlighted = default
-        self.query_one("#about", Static).update(self.abouts[default])
+        if options:
+            ol.highlighted = default
+        self.query_one("#about", Static).update(self.abouts[default] if options else "")
         box.set_class(kind == "fail", "fail")
         box.add_class("on")
         self.screen.add_class("asking")
-        ol.focus()
+        if kind != "text":
+            ol.focus()
         self.show_keys()
 
     def on_option_list_option_highlighted(self, event: OptionList.OptionHighlighted) -> None:
@@ -411,6 +444,20 @@ class SetupApp(App):
         if self.pending is not None and event.option_list.id == "options":
             self.answer(event.option_index)
 
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        if self.pending is not None and self.pending[2] == "text" and event.input.id == "text-answer":
+            value = event.value.strip()
+            if value:
+                fut = self.pending[0]
+                self.pending = None
+                self.query_one("#ask").remove_class("on")
+                self.screen.remove_class("asking")
+                self.show_keys()
+                fut.set_result(value)
+            else:
+                self.query_one("#about", Static).update("Enter a file path." if self.text_file_root is not None else
+                                                        "Enter a directory path.")
+
     def on_key(self, event) -> None:
         if self.pending is None or isinstance(self.screen, StopScreen):
             return
@@ -418,9 +465,13 @@ class SetupApp(App):
         if kind == "yn" and event.key in ("y", "n"):
             event.stop()
             self.answer(0 if event.key == "y" else 1)
-        elif kind == "choose" and event.key.isdigit() and 1 <= int(event.key) <= n:
+        elif kind == "choose" and event.key.isdigit() and 1 <= int(event.key) <= n - int(self.zero_option):
             event.stop()
-            self.answer(int(event.key) - 1)
+            self.answer(int(event.key) - 1 + int(self.zero_option))
+        elif kind == "choose" and event.key == "0" and self.zero_option:
+            # The zero action is first, leaving existing 1..N choices unchanged.
+            event.stop()
+            self.answer(0)
 
     def answer(self, i: int) -> None:
         fut, values, _ = self.pending
@@ -431,6 +482,24 @@ class SetupApp(App):
         fut.set_result(values[i])
 
     # ---------------------------------------------------------------------------------------- keys
+    def action_open_directory_picker(self) -> None:
+        if self.pending is not None and self.pending[2] == "text" and \
+                not isinstance(self.screen, DirectoryPicker):
+            field = self.query_one("#text-answer", Input)
+            if self.text_file_root is not None:
+                path = Path(field.value).expanduser() if field.value else self.text_file_root
+                if not path.is_absolute():
+                    path = self.text_file_root / path
+                self.push_screen(FilePicker(str(path), self.text_question), self.directory_picked)
+            elif self.text_is_directory:
+                self.push_screen(DirectoryPicker(field.value), self.directory_picked)
+
+    def directory_picked(self, path: str | None) -> None:
+        if path is not None and self.pending is not None and self.pending[2] == "text":
+            field = self.query_one("#text-answer", Input)
+            field.value = path
+            field.focus()
+
     def action_stop(self) -> None:
         if isinstance(self.screen, StopScreen):         # Ctrl+C twice
             self.screen.dismiss(True)
@@ -457,9 +526,16 @@ class SetupApp(App):
         pick = seen[(at + by) % len(seen)]
         self.show_view(None if pick == self.cur else pick)
 
-    def action_live(self) -> None:
+    def action_back(self) -> None:
         if self.view is not None:
             self.show_view(None)
+        elif self.pending is not None and self.pending[2] != "fail" and not isinstance(self.screen, StopScreen):
+            if self.bridge.go_back(self.pending[0]):
+                self.pending = None
+                self.query_one("#ask").remove_class("on")
+                self.screen.remove_class("asking")
+                self.query_one("#splash", Static).update(splash())
+                self.show_keys()
 
     def show_view(self, view) -> None:
         """The output of a step, or Maya's log - or (None) the live page: the setup's, then Maya's dashboard."""
@@ -535,13 +611,18 @@ class SetupApp(App):
             return
         if kind == "yn":
             keys = [("Enter", "Choose"), ("y n", "Answer")]
+        elif kind == "text":
+            keys = [("Enter", "Use path")] + ([("Ctrl+O", "Browse folders")] if self.text_is_directory else
+                                              [("Ctrl+O", "Browse files")] if self.text_file_root is not None else [])
         elif kind:
-            keys = [("Enter", "Choose"), ("↑↓", "Move")] + ([(f"1-{len(self.pending[1])}", "Pick")]
+            zero = kind == "choose" and self.zero_option
+            keys = [("Enter", "Choose"), ("↑↓", "Move")] + ([(f"0, 1-{len(self.pending[1]) - int(zero)}", "Pick")]
                                                             if kind == "choose" else [])
         live, maya = self.view is None, self.serving is not None
         keys += [("↑↓", "Scroll")] * (maya and live) + \
             [("Tab", "Log" if maya and live else "Steps" if self.steps else "Dashboard")] + \
-            ([] if live or not self.steps else [("Esc", "Dashboard" if maya else "Live")]) + \
+            ([("Esc", "Dashboard" if maya else "Live")] if not live and self.steps else
+             [("Esc", "Back")] if live and kind and kind != "fail" and self.bridge.can_go_back() else []) + \
             [("Ctrl+C", "Stop Maya" if maya else "Stop")]
         self.query_one("#main").border_subtitle = hints(*keys)
 

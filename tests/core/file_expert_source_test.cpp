@@ -7,6 +7,7 @@
 #include "ggml.h"
 #endif
 
+#include <algorithm>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -182,6 +183,68 @@ void test_native_variable_layout() {
     require(reopened && source.reads() == 1 && reopened[0] == 'c', "reopened native source kept stale state");
     source.close();
 }
+
+void test_native_split_roles() {
+    using namespace strata::core;
+    using namespace strata::kernels::cpu;
+    constexpr int64_t experts = 3;
+    constexpr uint64_t offset = 4096;
+    TempDirectory dir;
+    NativeFmt fmt;
+    std::string err;
+    require(native_fmt(GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, H, FF, fmt, err), err);
+    const uint64_t per[3] = {fmt.up_off, fmt.up_off, fmt.bytes - fmt.down_off};
+    const uint64_t at[3] = {0, fmt.up_off, fmt.down_off};
+    const std::string names[3] = {"gate.gguf", "up.gguf", "down.gguf"};
+    for (int r = 0; r < 3; ++r) {
+        std::ofstream file(dir.path / names[r], std::ios::binary);
+        std::vector<char> data((size_t) (offset + per[r] * experts), (char) ('G' + r));
+        file.write(data.data(), (std::streamsize) data.size());
+        require((bool) file, "could not write synthetic role shard");
+    }
+    auto metadata = [&](const std::string& files) {
+        std::ofstream file(dir.path / "native_experts.txt");
+        file << "0 8 8 0 " << fmt.bytes << ' ' << offset << ' ' << offset << ' ' << offset << files << '\n';
+    };
+    // Older rows still name either the --native file or one shard for every role.
+    for (const auto& files : {std::string(), std::string(" gate.gguf")}) {
+        metadata(files);
+        require(expert_layout_load(dir.path.string(), 1, experts, err), err);
+    }
+    metadata(" gate.gguf up.gguf down.gguf");
+    require(expert_layout_load(dir.path.string(), 1, experts, err), err);
+    auto check = [&](const uint8_t* blob) {
+        require(blob != nullptr, "split-role blob lookup failed");
+        for (int r = 0; r < 3; ++r)
+            require(std::all_of(blob + at[r], blob + at[r] + per[r],
+                                [r](uint8_t value) { return value == (uint8_t) ('G' + r); }),
+                    "expert role " + names[r] + " was read from the wrong shard");
+    };
+    GgufExpertSource mapped;
+    require(mapped.open((dir.path / names[0]).string(), 1, experts, experts, err), err);
+    std::vector<uint8_t> blob((size_t) fmt.bytes);
+    for (int64_t e = 0; e < experts; ++e) {
+        require(mapped.copy_blob(0, e, blob.data()), "could not copy split-role expert");
+        check(blob.data());
+    }
+    const int32_t ids[] = {0, 1, 2};
+    mapped.begin_layer(0, ids, experts);
+    for (int64_t e = 0; e < experts; ++e) check(mapped.blob(0, e));
+    mapped.close();
+
+    ArenaExpertSource arena;
+    arena.set_gguf((dir.path / names[0]).string());
+    require(arena.open(dir.path.string(), 1, experts, 2, err), err);
+    for (int64_t e = 0; e < experts; ++e) check(arena.blob(0, e));
+    arena.close();
+
+    fs::resize_file(dir.path / names[1], offset + per[1] * experts - 1);
+    require(!mapped.open((dir.path / names[0]).string(), 1, experts, experts, err),
+            "a truncated up shard was accepted");
+    require(!mapped.mapped(), "rejected role shard left stale mappings");
+    metadata(" gate.gguf up.gguf");
+    require(!expert_layout_load(dir.path.string(), 1, experts, err), "two shard names were silently accepted");
+}
 #endif
 
 void test_complement_plan() {
@@ -316,6 +379,7 @@ int main() {
         test_begin_layer_prefetch();
 #if defined(STRATA_NATIVE_EXPERTS)
         test_native_variable_layout();
+        test_native_split_roles();
 #endif
         std::cout << "file_expert_source_test: PASS\n";
         return 0;

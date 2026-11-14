@@ -27,6 +27,7 @@ MARK = "MAYA_VISION_F32_SUMS"
 
 def edit(path: pathlib.Path, pairs: list[tuple[str, str, int]]):
     s = path.read_text(encoding="utf-8")
+    original = s
     for old, new, count in pairs:
         if new in s:
             continue                                   # already applied
@@ -34,7 +35,8 @@ def edit(path: pathlib.Path, pairs: list[tuple[str, str, int]]):
         if n != count:
             raise SystemExit(f"ggml vision precision patch: {path}: anchor found {n} times (expected {count}):\n{old}")
         s = s.replace(old, new)
-    path.write_text(s, encoding="utf-8", newline="\n")
+    if s != original:
+        path.write_text(s, encoding="utf-8", newline="\n")
 
 
 FP16 = "#ifdef FAST_FP16_AVAILABLE\n"

@@ -280,7 +280,7 @@ bool geometry(const char* who, int k, int n_embd, int n_ff) {
 // a layer's experts as ds4_iq's arguments: the roles' offsets and types, MiniMax's swigluoai (false: types not covered)
 bool iq_args(const x3::ExpertLayout& lay, int n_embd, int n_ff, float limit, iq::Args& ia, const char* who) {
     ia = iq::Args{};
-    for (int r = 0; r < 3; ++r) ia.tr[r] = lay.trellis[r];
+    for (int r = 0; r < 3; ++r) { ia.tr[r] = lay.trellis[r]; ia.scale[r] = lay.gg_scale[r]; }
     ia.n_embd = n_embd;
     ia.n_ff = n_ff;
     ia.limit = limit;
@@ -536,7 +536,7 @@ iq::SetArgs set_args(const x3::SetArgs& sa, const iq::Args& ia) {
     iq::SetArgs q;
     q.wbase = sa.wbase;
     q.stride = sa.stride;
-    for (int r = 0; r < 3; ++r) q.tr[r] = sa.lay.trellis[r];
+    for (int r = 0; r < 3; ++r) { q.tr[r] = sa.lay.trellis[r]; q.scale[r] = sa.lay.gg_scale[r]; }
     q.bounds = sa.bounds;
     q.row0 = sa.row0;
     q.max_rows = sa.max_rows;

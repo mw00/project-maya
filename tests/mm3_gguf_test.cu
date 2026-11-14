@@ -117,6 +117,7 @@ std::vector<uint8_t> q_rand(int type, int n, int k) {
     for (size_t o = 0; o < w.size(); o += bb) {
         const float d = 0.001f + 0.002f * std::fabs(frand());
         switch (type) {
+            case iq::kQ3_K: put(o + 108, d); break;
             case iq::kQ4_K:
             case iq::kQ5_K: put(o, d), put(o + 2, 0.5f * d); break;
             case iq::kQ6_K: put(o + 208, d); break;
@@ -315,14 +316,20 @@ struct QE {
     uint8_t* d = nullptr;
     const uint8_t* mat(int e, int r) const { return h.data() + (size_t) e * blob + lay.trellis[r]; }
     const float* row(int e, int r, int i) const { return w[(size_t) e * 3 + r].data() + (size_t) i * (r < 2 ? D : F); }
+    float scale(int e, int r) const {
+        float value = 1.0f;
+        if (lay.gg_scale[r]) std::memcpy(&value, h.data() + (size_t) e * blob + lay.gg_scale[r], 4);
+        return value;
+    }
 };
-QE make(int D, int F, int n_exp, int tg, int tu, int td) {
+QE make(int D, int F, int n_exp, int tg, int tu, int td, bool scaled = false) {
     QE E{D, F, n_exp, {tg, tu, td}};
     size_t off = 0;
     for (int r = 0; r < 3; ++r) {
         E.lay.trellis[r] = E.lay.suh[r] = E.lay.svh[r] = off;
         E.lay.gg_type[r] = E.ty[r];
         off += ((r < 2 ? F : D) * iq::row_bytes(E.ty[r], r < 2 ? D : F) + 255) / 256 * 256;
+        if (scaled) { E.lay.gg_scale[r] = off; off += 256; }
     }
     E.lay.fmt = gg::kFmtGG;
     E.blob = off;
@@ -333,17 +340,21 @@ QE make(int D, int F, int n_exp, int tg, int tu, int td) {
             const std::vector<uint8_t> m = q_rand(E.ty[r], rows, k);
             std::memcpy(E.h.data() + (size_t) e * E.blob + E.lay.trellis[r], m.data(), m.size());
             E.w.push_back(deq(E.ty[r], m, (size_t) rows * k));
+            if (scaled) {
+                const float scale = 0.25f + 0.125f * ((e + 2 * r) % 7);
+                std::memcpy(E.h.data() + (size_t) e * E.blob + E.lay.gg_scale[r], &scale, 4);
+            }
         }
     E.d = dev(E.h);
     return E;
 }
 
-void test_experts(int tg, int tu, int td, cudaStream_t s) {
+void test_experts(int tg, int tu, int td, cudaStream_t s, bool scaled = false) {
     const int D = 512, F = 256, n_exp = 10, K = 4, T = 3;
     const float lim = 7.0f;
-    QE E = make(D, F, n_exp, tg, tu, td);
+    QE E = make(D, F, n_exp, tg, tu, td, scaled);
     char name[64];
-    std::snprintf(name, sizeof name, "%s/%s/%s", iq::name(tg), iq::name(tu), iq::name(td));
+    std::snprintf(name, sizeof name, "%s%s/%s/%s", scaled ? "scaled " : "", iq::name(tg), iq::name(tu), iq::name(td));
     // the plans: token 1's third pick off the device, token 2 with the CPU lane's part
     std::vector<int> pick((size_t) T * 8, 0);
     std::vector<float> pw((size_t) T * 8, 0.0f);
@@ -397,14 +408,14 @@ void test_experts(int tg, int tu, int td, cudaStream_t s) {
             const int e = pick[t * 8 + i];
             const float* h = gh.data() + ((size_t) t * 8 + i) * F;
             for (int f = 0; f < F; ++f) {
-                hwant.push_back(oai(dot(E.row(e, 0, f), xr.data() + (size_t) t * D, D),
-                                    dot(E.row(e, 1, f), xr.data() + (size_t) t * D, D), lim));
+                hwant.push_back(oai(dot(E.row(e, 0, f), xr.data() + (size_t) t * D, D) * E.scale(e, 0),
+                                    dot(E.row(e, 1, f), xr.data() + (size_t) t * D, D) * E.scale(e, 1), lim));
                 hgot.push_back(h[f]);
             }
             float* dhi = dev(std::vector<float>(h, h + F));
             const std::vector<float> hr = act_dev(dhi, 1, F, s);
             cudaFree(dhi);
-            for (int d = 0; d < D; ++d) want[(size_t) t * D + d] += pw[t * 8 + i] * dot(E.row(e, 2, d), hr.data(), F);
+            for (int d = 0; d < D; ++d) want[(size_t) t * D + d] += pw[t * 8 + i] * dot(E.row(e, 2, d), hr.data(), F) * E.scale(e, 2);
         }
         for (int d = 0; d < D; ++d) want[(size_t) t * D + d] += (cflag[t] ? cpu[(size_t) t * D + d] : 0.0f) + sh[(size_t) t * D + d];
     }
@@ -528,14 +539,14 @@ void test_experts(int tg, int tu, int td, cudaStream_t s) {
                     g += (double) (light ? wg : f16r(wg)) * xi[i];
                     u += (double) (light ? wu : f16r(wu)) * xi[i];
                 }
-                hw[(size_t) r * F + f] = oai(g, u, lim);
+                hw[(size_t) r * F + f] = oai(g * E.scale(e, 0), u * E.scale(e, 1), lim);
                 hg[(size_t) r * F + f] = hr[f] = h2f(h16[(size_t) r * F + f]);
             }
             if (light) hr = q8_round(hr.data(), F);
             for (int d = 0; d < D; ++d) {
                 double a = 0;
                 for (int i = 0; i < F; ++i) a += (double) (light ? E.row(e, 2, d)[i] : f16r(E.row(e, 2, d)[i])) * hr[i];
-                yw[(size_t) r * D + d] = a;
+                yw[(size_t) r * D + d] = a * E.scale(e, 2);
             }
         }
         std::snprintf(what, sizeof what, "%s set gate/up (F16 h), %d rows, %d light", name, R, n_light);
@@ -560,7 +571,7 @@ void test_experts(int tg, int tu, int td, cudaStream_t s) {
                 mm3::CpuExpert c;
                 c.gf = &f;
                 c.w = pw[i];
-                for (int r = 0; r < 3; ++r) c.gg[r] = E.mat(pick[i], r);
+                for (int r = 0; r < 3; ++r) { c.gg[r] = E.mat(pick[i], r); c.gg_scale[r] = E.scale(pick[i], r); }
                 ex.push_back(c);
             }
             std::vector<float> out(D);
@@ -581,7 +592,7 @@ void test_experts(int tg, int tu, int td, cudaStream_t s) {
                         slot_of[e] = (int) wx.size();
                         mm3::CpuExpert c;
                         c.gf = &f;
-                        for (int r = 0; r < 3; ++r) c.gg[r] = E.mat(e, r);
+                        for (int r = 0; r < 3; ++r) { c.gg[r] = E.mat(e, r); c.gg_scale[r] = E.scale(e, r); }
                         wx.push_back(c);
                         users.emplace_back();
                     }
@@ -697,6 +708,10 @@ int main(int argc, char** argv) {
     if (only.empty() || only == "--dense" || only == "--gv") test_gv(s);
     if (only.empty() || only == "--experts" || only == "--cpu")
         for (const auto& tr : kTriples) test_experts(tr[0], tr[1], tr[2], s);
+    if (only.empty() || only == "--scaled") {
+        test_experts(iq::kQ3_K, iq::kQ3_K, iq::kQ4_K, s, true);
+        test_experts(iq::kQ4_K, iq::kQ3_K, iq::kQ3_K, s, true);
+    }
     if (x3::launch_errors() != 0) {
         std::printf("launch errors: %d\n", x3::launch_errors());
         ++g_fail;

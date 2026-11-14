@@ -60,7 +60,7 @@ bool mapped(size_t bytes, void** h, void** d) {
 }
 
 strata::kernels::QsaShapes shapes_of(const ModelGeometry& g) {
-    strata::kernels::QsaShapes s = strata::kernels::qsa_real_shapes();
+    strata::kernels::QsaShapes s = strata::kernels::qsa_real_shapes(g.idx_top_k);
     s.n_head = g.n_head;
     s.n_head_kv = g.n_head_kv;
     s.head_dim = g.head_dim;

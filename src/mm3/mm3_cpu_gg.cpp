@@ -132,7 +132,8 @@ void gg_run_multi(CpuLane& lane, int dim, int ff, float limit, const std::vector
     lane.parallel_for(N, [&](int j) {
         float* g = gu + (size_t) j * 2 * ff;
         const float* u = g + ff;
-        for (int i = 0; i < ff; ++i) g[i] = oai(g[i], u[i], limit);
+        const CpuExpert& expert = ex[(size_t) ent[(size_t) j].e];
+        for (int i = 0; i < ff; ++i) g[i] = oai(g[i] * expert.gg_scale[0], u[i] * expert.gg_scale[1], limit);
         dg::iq_cpu_quant(f.act[2], g, ff, hq + (size_t) j * f.ab[2]);
     });
     // down rows: job (chunk, block of kRows rows)
@@ -159,7 +160,7 @@ void gg_run_multi(CpuLane& lane, int dim, int ff, float limit, const std::vector
         const int d0 = b * 128, d1 = std::min(dim, d0 + 128);
         for (int j : seq) {
             float* o = out + (size_t) ent[(size_t) j].t * dim;
-            const float w = ent[(size_t) j].w;
+            const float w = ent[(size_t) j].w * ex[(size_t) ent[(size_t) j].e].gg_scale[2];
             const float* y = yd + (size_t) j * dim;
             for (int d = d0; d < d1; ++d) o[d] += w * y[d];
         }

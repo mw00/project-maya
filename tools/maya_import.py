@@ -18,6 +18,7 @@ import shutil
 from pathlib import Path
 
 VERIFIED = ".maya-verified.json"          # the same record maya.py keeps: a file whose sha256 matched, by size and time
+LINKED = ".maya-linked.json"              # user-trusted source paths: linked by model type, without size or SHA-256
 MIN_UNLISTED = 1 << 20                     # a GGUF the table lists by sha256 only is read from this size on
 SHARED_SMALL = 16 << 20                    # a file below this that several models share is only placed beside a model
 
@@ -40,38 +41,46 @@ def is_gguf(path: Path) -> bool:
         return False
 
 
-def files_under(folder: Path) -> list:
+def files_under(folder: Path, *, only: set[Path] | None = None) -> list:
     """Every file under folder (links followed), each real file once: (the path it was found by, its real path).  A
-    link (a Hugging Face cache's snapshot -> blob) is found by its link's name; Maya's own bookkeeping is skipped."""
+    link (a Hugging Face cache's snapshot -> blob) is found by its link's name; Maya's own bookkeeping is skipped.
+    only: explicitly selected files, which may live outside folder; do not scan any other files in that case."""
+    def paths():
+        if only is not None:
+            yield from sorted(only)
+        else:
+            for root, dirs, names in os.walk(folder, followlinks=True):
+                dirs.sort()
+                for name in sorted(names):
+                    yield Path(root) / name
+
     seen, out = {}, []
-    for root, dirs, names in os.walk(folder, followlinks=True):
-        dirs.sort()
-        for n in sorted(names):
-            p = Path(root) / n
-            if n == VERIFIED or n.endswith((".maya-import", ".incomplete", ".part", ".aria2", ".td", ".xltd", ".!ut")):
-                continue                       # (a download that is not finished is not a file yet)
-            try:
-                st = p.stat()
-            except OSError:
-                continue
-            key = (st.st_dev, st.st_ino) if st.st_ino else (str(p.resolve()),)
-            if not p.is_file():
-                continue
-            real = p.resolve()
-            via_link = os.path.normcase(os.path.abspath(p)) != os.path.normcase(str(real))
-            if key in seen:                    # (the same file twice: a link and its target - the link is kept, so the
-                i = seen[key]                  #  file is copied, never moved out from under a Hugging Face cache)
-                if via_link and out[i][0] == out[i][1]:
-                    out[i] = (p, real, st.st_size)
-                continue
-            seen[key] = len(out)
-            out.append((p, real, st.st_size))
+    for p in paths():
+        if p.name in (VERIFIED, LINKED) or p.name.endswith((".maya-import", ".incomplete", ".part", ".aria2", ".td", ".xltd", ".!ut")):
+            continue                       # (a download that is not finished is not a file yet)
+        try:
+            st = p.stat()
+        except OSError:
+            continue
+        key = (st.st_dev, st.st_ino) if st.st_ino else (str(p.resolve()),)
+        if not p.is_file():
+            continue
+        real = p.resolve()
+        via_link = os.path.normcase(os.path.abspath(p)) != os.path.normcase(str(real))
+        if key in seen:                    # (the same file twice: a link and its target - the link is kept, so the
+            i = seen[key]                  #  file is copied, never moved out from under a Hugging Face cache)
+            if via_link and out[i][0] == out[i][1]:
+                out[i] = (p, real, st.st_size)
+            continue
+        seen[key] = len(out)
+        out.append((p, real, st.st_size))
     return out
 
 
-def find(folder: Path, catalog: list, progress=None, hashing=None) -> dict:
+def find(folder: Path, catalog: list, progress=None, hashing=None, only: set[Path] | None = None) -> dict:
     """Match the folder's files to the catalog: {"found": [(found path, real path, size, [entries])], "unmatched":
-    [(path, size)], "shared": [(path, [labels])]}.  progress(text): a line before a big file is read."""
+    [(path, size)], "shared": [(path, [labels])]}.  progress(text): a line before a big file is read.  only: the
+    selected source paths when interactive setup has multiple model variants in one directory."""
     by_size, sha_only = {}, []
     for e in catalog:
         (by_size.setdefault(e["size"], []) if e["size"] is not None else sha_only).append(e)
@@ -80,7 +89,7 @@ def find(folder: Path, catalog: list, progress=None, hashing=None) -> dict:
         for s in e["sha"]:
             by_sha.setdefault(s, []).append(e)
     found, unmatched = [], []
-    for path, real, size in files_under(folder):
+    for path, real, size in files_under(folder, only=only):
         if size == 0:
             continue
         candidates = size in by_size or (sha_only and size >= MIN_UNLISTED and is_gguf(real))
@@ -139,14 +148,57 @@ def record(dest: Path) -> None:
     book_path.write_text(json.dumps(book, indent=1), encoding="utf-8")
 
 
+def is_linked(dest: Path) -> bool:
+    """A live symlink this user added by model type; no size or content is read."""
+    if not dest.is_symlink() or not dest.is_file():
+        return False
+    try:
+        book = json.loads((dest.parent / LINKED).read_text(encoding="utf-8"))
+        return book.get(dest.name) == str(dest.resolve())
+    except (OSError, ValueError):
+        return False
+
+
+def link_file(source: Path, dest: Path) -> tuple[bool, str | None]:
+    """Create one symlink and record its target without inspecting the model's size or checksum."""
+    real = source.resolve()
+    if not real.is_file():
+        return False, f"{source}: source file is missing"
+    if dest.exists() or dest.is_symlink():
+        if dest.is_symlink() and dest.resolve() == real:
+            created = False
+        else:
+            return False, f"{dest}: already exists; not replaced"
+    else:
+        created = True
+        try:
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.symlink_to(real)
+        except OSError as exc:
+            return False, f"{dest}: could not create symlink ({exc})"
+    book_path = dest.parent / LINKED
+    try:
+        book = json.loads(book_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        book = {}
+    book[dest.name] = str(real)
+    try:
+        book_path.write_text(json.dumps(book, indent=1), encoding="utf-8")
+    except OSError as exc:
+        if created:
+            dest.unlink(missing_ok=True)
+        return False, f"{dest}: could not record linked file ({exc})"
+    return created, None
+
+
 def place(path: Path, real: Path, size: int, entries: list, models: Path, copy: bool, say) -> dict:
     """Put one found file at its place(s) in the models folder: moved when it can be (same drive, no link), else
-    copied when copy says so (the original stays).  Returns {"moved": n, "copied": n, "skipped": [text]}."""
+    copied when copy says so (the original stays)."""
     out = {"moved": 0, "copied": 0, "skipped": []}
     first = None                               # where the file went first: further places are copied from it
     for e in entries:
         dest = models / e["rel"]
-        if dest.exists():
+        if dest.exists() or dest.is_symlink():
             try:
                 same = dest.samefile(real)
             except OSError:
@@ -154,7 +206,8 @@ def place(path: Path, real: Path, size: int, entries: list, models: Path, copy: 
             if same:
                 record(dest)
                 continue
-            out["skipped"].append(f"{e['rel']} is there already ({dest.stat().st_size:,} bytes); not replaced "
+            size_here = f"{dest.stat().st_size:,} bytes" if dest.exists() else "broken link"
+            out["skipped"].append(f"{e['rel']} is there already ({size_here}); not replaced "
                                   f"(move it away to use {path.name})")
             continue
         dest.parent.mkdir(parents=True, exist_ok=True)

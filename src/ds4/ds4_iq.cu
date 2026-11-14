@@ -712,6 +712,14 @@ __device__ __forceinline__ float act_out(float gv, float uv, float limit, int pe
 }
 template <int EPI>
 constexpr int kRole0 = EPI == 3 ? 1 : 0;   // the matrix the pass reads first (3: the up)
+template <class A>
+__device__ __forceinline__ float scaled_dot(const A& a, const uint8_t* blob, int role, float value) {
+    return a.scale[role] ? value * *(const float*) (blob + a.scale[role]) : value;
+}
+template <int EPI, class A>
+__device__ __forceinline__ float scaled_act(const A& a, const uint8_t* blob, float g, float u, int pexp = 0) {
+    return act_out<EPI>(scaled_dot(a, blob, 0, g), scaled_dot(a, blob, 1, u), a.limit, pexp);
+}
 __device__ __forceinline__ bool group(const Args& a, int grp, const uint8_t*& blob, int& m0, int& m1) {
     if (a.grp_ptr == nullptr) {
         const unsigned long long p = a.plan_ptr[grp];
@@ -896,10 +904,11 @@ __global__ void __launch_bounds__(kThreads) gate_up_kernel(const Args a, int gro
                         float* hp = &a.h[(size_t) es[i] * a.n_ff + row];
                         if constexpr (TWO) {
                             const float gv = lanes_sum<RW>(ag[i]), uv = lanes_sum<RW>(au[i]);
-                            if (lane == 0) *hp = act_out<EPI>(gv, uv, a.limit, a.pexp);
+                            if (lane == 0) *hp = scaled_act<EPI>(a, blob, gv, uv, a.pexp);
                         } else {
                             const float v = lanes_sum<RW>(ag[i]);   // (EPI 2: the gate's sums; 3: the up's)
-                            if (lane == 0) *hp = EPI == 2 ? v : swigluoai(*hp, v, a.limit);
+                            if (lane == 0) *hp = EPI == 2 ? scaled_dot(a, blob, 0, v) :
+                                swigluoai(*hp, scaled_dot(a, blob, 1, v), a.limit);
                         }
                     }
             }
@@ -968,7 +977,7 @@ __global__ void __launch_bounds__(kThreads) down_kernel(const Args a, int groups
                 for (int i = 0; i < NE; ++i)
                     if (i < ne) {
                         const float v = lanes_sum<RW>(ad[i]);
-                        if (lane == 0) a.part[(size_t) es[i] * a.n_embd + row] = v;
+                        if (lane == 0) a.part[(size_t) es[i] * a.n_embd + row] = scaled_dot(a, blob, 2, v);
                     }
             }
         }
@@ -1063,11 +1072,11 @@ __global__ void __launch_bounds__(kThreads) set_kernel(const SetArgs a) {
 #pragma unroll
         for (int j = 0; j < TN; ++j) {
             const int c = c0 + tx * TN + j;
-            if constexpr (!GATE_UP) a.y[lr * a.ldo + c] = ag[i][j];
+            if constexpr (!GATE_UP) a.y[lr * a.ldo + c] = scaled_dot(a, blob, 2, ag[i][j]);
             else if constexpr (TWO)
-                a.h[lr * a.ldo + c] = __half_as_ushort(__float2half_rn(act_out<EPI>(ag[i][j], au[i][j], a.limit)));
-            else if constexpr (EPI == 2) a.graw[lr * a.n_ff + c] = ag[i][j];
-            else a.h[lr * a.ldo + c] = __half_as_ushort(__float2half_rn(swigluoai(a.graw[lr * a.n_ff + c], ag[i][j], a.limit)));
+                a.h[lr * a.ldo + c] = __half_as_ushort(__float2half_rn(scaled_act<EPI>(a, blob, ag[i][j], au[i][j])));
+            else if constexpr (EPI == 2) a.graw[lr * a.n_ff + c] = scaled_dot(a, blob, 0, ag[i][j]);
+            else a.h[lr * a.ldo + c] = __half_as_ushort(__float2half_rn(swigluoai(a.graw[lr * a.n_ff + c], scaled_dot(a, blob, 1, ag[i][j]), a.limit)));
         }
     }
 }
@@ -1192,17 +1201,17 @@ __global__ void __launch_bounds__(kThreads) set_tc_kernel(const SetArgs a) {
         if (q >= nrm) break;   // (uniform)
         if (TWO)
             for (int i = 0; i < (int) fg[q][j].num_elements; ++i)
-                fg[q][j].x[i] = act_out<EPI>(fg[q][j].x[i], fu[q][j].x[i], a.limit);
+                fg[q][j].x[i] = scaled_act<EPI>(a, blob, fg[q][j].x[i], fu[q][j].x[i]);
         wm::store_matrix_sync(ow, fg[q][j], 16, wm::mem_row_major);
         __syncthreads();   // (uniform: every warp stores, then reads its own tile)
         for (int i = lane; i < 16 * 16; i += 32) {
             const int r = q * BM + wm_ * 16 + i / 16, c = c0 + (wn + j) * 16 + i % 16;
             if (r >= nr) continue;
             const size_t lr = (size_t) (r0 + r);
-            if constexpr (!GATE_UP) a.y[lr * a.ldo + c] = ow[i];
+            if constexpr (!GATE_UP) a.y[lr * a.ldo + c] = scaled_dot(a, blob, 2, ow[i]);
             else if constexpr (TWO) a.h[lr * a.ldo + c] = __half_as_ushort(__float2half_rn(ow[i]));
-            else if constexpr (EPI == 2) a.graw[lr * a.n_ff + c] = ow[i];
-            else a.h[lr * a.ldo + c] = __half_as_ushort(__float2half_rn(swigluoai(a.graw[lr * a.n_ff + c], ow[i], a.limit)));
+            else if constexpr (EPI == 2) a.graw[lr * a.n_ff + c] = scaled_dot(a, blob, 0, ow[i]);
+            else a.h[lr * a.ldo + c] = __half_as_ushort(__float2half_rn(swigluoai(a.graw[lr * a.n_ff + c], scaled_dot(a, blob, 1, ow[i]), a.limit)));
         }
         __syncthreads();
     }
@@ -1345,10 +1354,10 @@ __global__ void __launch_bounds__(kThreads) light_kernel(const SetArgs a, const 
                 const float v1 = TWO ? warp_sum(a1[i]) : 0.0f;
                 if (lane == 0) {
                     const size_t lr = (size_t) (lo + i);
-                    if constexpr (!GATE_UP) a.y[lr * a.ldo + row] = v0;
-                    else if constexpr (TWO) a.h[lr * a.ldo + row] = __half_as_ushort(__float2half_rn(act_out<EPI>(v0, v1, a.limit)));
-                    else if constexpr (EPI == 2) a.graw[lr * a.n_ff + row] = v0;
-                    else a.h[lr * a.ldo + row] = __half_as_ushort(__float2half_rn(swigluoai(a.graw[lr * a.n_ff + row], v0, a.limit)));
+                    if constexpr (!GATE_UP) a.y[lr * a.ldo + row] = scaled_dot(a, blob, 2, v0);
+                    else if constexpr (TWO) a.h[lr * a.ldo + row] = __half_as_ushort(__float2half_rn(scaled_act<EPI>(a, blob, v0, v1)));
+                    else if constexpr (EPI == 2) a.graw[lr * a.n_ff + row] = scaled_dot(a, blob, 0, v0);
+                    else a.h[lr * a.ldo + row] = __half_as_ushort(__float2half_rn(swigluoai(a.graw[lr * a.n_ff + row], scaled_dot(a, blob, 1, v0), a.limit)));
                 }
             }
     }
@@ -2237,6 +2246,7 @@ void* fused_tiles(int rows, int n_exp) {
     return t.first;
 }
 bool fused_gate_up(const SetArgs& a, cudaStream_t s) {
+    if (a.scale[0] || a.scale[1]) return false;
     if (a.xf == nullptr || a.idx == nullptr || a.h == nullptr) return false;
     void* tiles = fused_tiles(mmq_rows, a.n_exp);
     if (tiles == nullptr) return false;
@@ -2246,6 +2256,7 @@ bool fused_gate_up(const SetArgs& a, cudaStream_t s) {
     return true;
 }
 bool fused_down(const SetArgs& a, cudaStream_t s) {
+    if (a.scale[2]) return false;
     if (a.xh == nullptr || a.y == nullptr || a.ldo != a.n_embd) return false;
     void* tiles = fused_tiles(mmq_rows, a.n_exp);
     if (tiles == nullptr) return false;

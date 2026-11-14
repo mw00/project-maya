@@ -3,6 +3,7 @@ the models folder's layout.  Fake small files and a patched catalog; no GPU, no 
 import argparse
 import hashlib
 import os
+import struct
 import sys
 import tempfile
 import unittest
@@ -128,6 +129,258 @@ class ImportTests(unittest.TestCase):
         self.run_import()
         self.assertEqual((self.models / "Model-A/a-00001.safetensors").read_bytes(), BIG)
         self.assertTrue(blob.exists() and snap.is_symlink())       # the cache still works
+
+    def test_link_checks_type_only_and_keeps_originals(self):
+        first = self.put("model-00001.gguf", b"GGUF short header")
+        second = self.put("model-00002.gguf", b"other shard")
+        cat = [{"label": "Maya-S-v2-IQ2_XXS", "rel": f"Maya-S-v2-IQ2_XXS/{p.name}",
+                "size": 1000000, "sha": ["wrong"]} for p in (first, second)]
+        with patch.object(maya, "import_catalog", return_value=cat), \
+                patch.object(maya, "gguf_head", side_effect=lambda p: ("glm5-next", 1) if p == first else ("", 0)), \
+                patch.object(MI, "sha256_of", side_effect=AssertionError("hashed during link")), \
+                patch.object(maya, "sha256_ok", side_effect=AssertionError("hashed during link")), \
+                patch.object(maya, "say"), patch.object(maya, "ok"), patch.object(maya, "warn"):
+            self.assertEqual(maya.link_model(str(self.src), self.models, "glm"), 0)
+            dest = self.models / "Maya-S-v2-IQ2_XXS/model-00001.gguf"
+            self.assertTrue(dest.is_symlink())
+            self.assertEqual(dest.resolve(), first.resolve())
+            self.assertTrue((dest.parent / "model-00002.gguf").is_symlink())
+            self.assertTrue(first.exists() and second.exists())
+            self.assertFalse((dest.parent / MI.VERIFIED).exists())
+            self.assertTrue(MI.is_linked(dest))
+            self.assertIsNone(maya.file_incomplete({"files": {dest.name: 1000000}}, dest))
+            self.assertTrue(maya.sha256_checked(dest, "wrong"))
+
+    def test_review_detects_two_quants_and_links_only_the_selected_one(self):
+        first = self.put("one/first-00001-of-00002.gguf", b"GGUF first")
+        second = self.put("one/first-00002-of-00002.gguf", b"GGUF second")
+        other = self.put("two/other.gguf", b"GGUF other")
+        draft = self.put(maya.DFLASH["file"], b"GGUF draft")
+        vision = self.put("vision/mmproj-test.gguf", b"GGUF vision")
+        with patch.object(maya, "gguf_head", side_effect=lambda p: ("glm5-next", 1) if p in (first, other)
+                          else ("dflash", 1) if p == draft else ("clip", 1)), \
+                patch.object(maya, "import_catalog", side_effect=AssertionError("catalog consulted")), \
+                patch.object(maya, "choose", side_effect=[0, 1, 3]), \
+                patch.object(maya, "say"), patch.object(maya, "ok"), patch.object(maya, "warn"):
+            found = maya.review_candidates(self.src, "glm")
+            self.assertEqual([c["path"] for c in found["model"]], [first, other])
+            self.assertEqual(found["model"][0]["files"], {first, second})
+            self.assertEqual([c["path"] for c in found["drafter"]], [draft])
+            self.assertEqual([c["path"] for c in found["vision"]], [vision])
+            linked = maya.review_downloaded_model(argparse.Namespace(), self.src, self.models, "glm")
+        self.assertEqual(linked["model"].resolve(), other)
+        self.assertEqual(linked["vision"].resolve(), vision)
+        self.assertEqual(linked["drafter"].resolve(), draft)
+        self.assertFalse(list(self.models.rglob(first.name)))
+
+    def test_import_selected_files_ignores_another_quant(self):
+        selected = self.put("one/a.bin", BIG)
+        other = self.put("two/shard-00001.gguf", SHAPE)
+        args = argparse.Namespace(models_dir=str(self.models), copy=True, yes=True)
+        with patch.object(maya, "import_catalog", return_value=self.cat), \
+                patch.object(maya, "configs", return_value=[]), patch.object(maya, "say"), \
+                patch.object(maya, "ok"), patch.object(maya, "warn"):
+            self.assertEqual(maya.import_model(args, str(self.src), selected_files={selected}), 0)
+        self.assertTrue((self.models / "Model-A/a-00001.safetensors").exists())
+        self.assertFalse((self.models / "Model-B/shard-00001.gguf").exists())
+        self.assertTrue(other.exists())
+
+    def test_catalog_skips_unpublished_quants_without_failing_the_live_setup(self):
+        with patch.object(maya, "fail", side_effect=AssertionError("catalog interrupted the setup")):
+            catalog = maya.import_catalog(self.models)
+        self.assertTrue(any(e["label"] == maya.QWEN_UD_DIR for e in catalog))
+
+    def test_edited_file_name_keeps_an_invalid_value_for_correction(self):
+        chosen = self.put("extra/model.gguf", b"GGUF model")
+        with patch.object(maya, "choose", return_value=0), \
+                patch.object(maya.S, "ask_text", side_effect=["extra/missing.gguf", "extra/model.gguf"]) as ask, \
+                patch.object(maya, "warn"):
+            result = maya.review_pick_file(self.src, "model", [], None)
+        self.assertEqual(result["path"], chosen)
+        self.assertEqual([call.args[1] for call in ask.call_args_list], ["", "extra/missing.gguf"])
+
+    def test_review_can_select_a_file_in_another_directory(self):
+        for role in ("model", "drafter", "vision"):
+            with self.subTest(role=role):
+                folder = self.root / f"outside-{role}"
+                folder.mkdir()
+                first = folder / "weights-00001-of-00002.gguf"
+                second = folder / "weights-00002-of-00002.gguf"
+                first.write_bytes(b"GGUF first")
+                second.write_bytes(b"GGUF second")
+                with patch.object(maya, "choose", return_value=0), \
+                        patch.object(maya.S, "ask_text", return_value=str(second)) as ask:
+                    result = maya.review_pick_file(self.src, role, [], None)
+                self.assertEqual(result["path"], first)
+                self.assertEqual(result["files"], {first, second})
+                self.assertEqual(maya.review_path(first, self.src), str(first))
+                self.assertEqual(ask.call_args.kwargs["file_root"], self.src)
+
+    def test_link_selected_companions_from_other_directories(self):
+        main = self.put("main.gguf", b"GGUF model")
+        other = self.root / "companion-files"
+        other.mkdir()
+        draft = other / maya.DFLASH["file"]
+        draft.write_bytes(b"GGUF drafter")
+        vision = other / "mmproj-test.gguf"
+        vision.write_bytes(b"GGUF vision")
+        label = next(iter(maya.MODELS))
+        cat = [{"label": label, "rel": f"{label}/main.gguf", "size": 999, "sha": ["wrong"]},
+               {"label": label, "rel": f"{label}/vision/{vision.name}", "size": 999, "sha": ["wrong"]}]
+        with patch.object(maya, "import_catalog", return_value=cat), \
+                patch.object(maya, "gguf_head", side_effect=lambda p: ("glm5-next", 1) if p == main else ("", 0)), \
+                patch.object(MI, "sha256_of", side_effect=AssertionError("hashed during link")), \
+                patch.object(maya, "say"), patch.object(maya, "ok"), patch.object(maya, "warn"):
+            self.assertEqual(maya.link_model(str(self.src), self.models, "glm", selected_model=main,
+                                             selected_files={main, draft, vision}), 0)
+        for source, dest in ((main, self.models / label / main.name),
+                             (vision, self.models / label / "vision" / vision.name),
+                             (draft, self.models / "GLM-5.3-Flash-DFlash2" / draft.name)):
+            self.assertTrue(source.is_file())
+            self.assertTrue(dest.is_symlink())
+            self.assertEqual(dest.resolve(), source.resolve())
+
+    def test_import_selected_file_outside_the_source_directory(self):
+        external = self.root / "external.bin"
+        external.write_bytes(BIG)
+        args = argparse.Namespace(models_dir=str(self.models), copy=True, yes=True)
+        with patch.object(maya, "import_catalog", return_value=self.cat), \
+                patch.object(maya, "configs", return_value=[]), patch.object(MI, "same_drive", return_value=False), \
+                patch.object(maya, "say"), patch.object(maya, "ok"), patch.object(maya, "warn"):
+            self.assertEqual(maya.import_model(args, str(self.src), selected_files={external}), 0)
+        self.assertEqual((self.models / "Model-A/a-00001.safetensors").read_bytes(), BIG)
+        self.assertEqual(external.read_bytes(), BIG)
+
+    def test_link_rejects_wrong_model_type_and_does_not_replace_existing_file(self):
+        first = self.put("model.gguf", b"GGUF header")
+        cat = [{"label": "Maya-S-v2-IQ2_XXS", "rel": "Maya-S-v2-IQ2_XXS/model.gguf",
+                "size": 1000000, "sha": ["wrong"]}]
+        dest = self.models / cat[0]["rel"]
+        dest.parent.mkdir(parents=True)
+        dest.write_bytes(b"existing")
+        with patch.object(maya, "import_catalog", return_value=cat), \
+                patch.object(maya, "gguf_head", return_value=("glm-dsa", 1)), \
+                patch.object(maya, "say"), patch.object(maya, "ok"), patch.object(maya, "warn"):
+            self.assertEqual(maya.link_model(str(self.src), self.models, "glm"), 1)
+            self.assertEqual(dest.read_bytes(), b"existing")
+        with patch.object(maya, "import_catalog", return_value=cat), \
+                patch.object(maya, "gguf_head", return_value=("glm5-next", 1)), \
+                patch.object(maya, "say"), patch.object(maya, "ok"), patch.object(maya, "warn"):
+            self.assertEqual(maya.link_model(str(self.src), self.models, "glm"), 1)
+            self.assertEqual(dest.read_bytes(), b"existing")
+            self.assertTrue(first.exists())
+
+    def test_gguf_type_needs_no_config_json_and_exl3_type_uses_it(self):
+        def blob(value):
+            raw = value.encode("utf-8")
+            return struct.pack("<Q", len(raw)) + raw
+        gguf = self.put("glm.gguf", b"GGUF" + struct.pack("<IQQ", 3, 1, 1) +
+                        blob("general.architecture") + struct.pack("<I", 8) + blob("glm5-next"))
+        self.assertEqual(maya.linked_model_type(gguf), "glm")
+        self.assertFalse((self.src / "config.json").exists())
+        conf = self.put("config.json", b'{"model_type":"minimax_m3_vl","quantization_config":{"quant_method":"exl3"}}')
+        self.assertEqual(maya.linked_model_type(conf), "minimax")
+
+    def test_exl3_links_by_config_type_without_published_size_or_sha(self):
+        conf = self.put("config.json", b'{"model_type":"glm5_next","quantization_config":{"quant_method":"exl3"}}')
+        shard = self.put("model-00001-of-00015.safetensors", b"short but linked")
+        label = "EXL3-3.05bpw"
+        cat = [{"label": label, "rel": f"{label}/{p.name}", "size": 1000000, "sha": ["wrong"]}
+               for p in (conf, shard)]
+        with patch.object(maya, "import_catalog", return_value=cat), \
+                patch.object(MI, "sha256_of", side_effect=AssertionError("hashed during link")), \
+                patch.object(maya, "sha256_ok", side_effect=AssertionError("hashed during link")), \
+                patch.object(maya, "say"), patch.object(maya, "ok"), patch.object(maya, "warn"):
+            self.assertEqual(maya.link_model(str(self.src), self.models, "glm"), 0)
+        dest = self.models / label / shard.name
+        self.assertTrue(dest.is_symlink())
+        self.assertEqual(dest.resolve(), shard.resolve())
+        self.assertIsNone(maya.file_incomplete({"files": {shard.name: 1000000}}, dest))
+
+    def test_review_shows_first_exl3_weight_and_links_its_config(self):
+        label = "EXL3-3.05bpw"
+        conf = self.put(f"{label}/config.json",
+                        b'{"model_type":"glm5_next","quantization_config":{"quant_method":"exl3"}}')
+        shard = self.put(f"{label}/model-00001-of-00015.safetensors", b"weight")
+        cat = [{"label": label, "rel": f"{label}/{p.name}", "size": 999, "sha": ["wrong"]}
+               for p in (conf, shard)]
+        found = maya.review_candidates(self.src, "glm")
+        self.assertEqual([c["path"] for c in found["model"]], [shard])
+        self.assertEqual(found["model"][0]["files"], {conf, shard})
+        with patch.object(maya, "import_catalog", return_value=cat), \
+                patch.object(maya, "say"), patch.object(maya, "ok"), patch.object(maya, "warn"):
+            self.assertEqual(maya.link_model(str(self.src), self.models, "glm", selected_model=conf,
+                                             selected_files={conf, shard}), 0)
+        self.assertTrue((self.models / label / conf.name).is_symlink())
+        self.assertTrue((self.models / label / shard.name).is_symlink())
+
+    def link_with_companions(self, family, label, arch, extras):
+        main = self.put("main.gguf", b"GGUF model header")
+        for name, data in extras.items():
+            self.put(name, data)
+        cat = [{"label": label, "rel": f"{label}/main.gguf", "size": 1000000, "sha": ["wrong"]}]
+        with patch.object(maya, "import_catalog", return_value=cat), \
+                patch.object(maya, "gguf_head", side_effect=lambda path: (arch, 1) if path == main else ("", 0)), \
+                patch.object(MI, "sha256_of", side_effect=AssertionError("hashed during link")), \
+                patch.object(maya, "sha256_ok", side_effect=AssertionError("hashed during link")), \
+                patch.object(maya, "say"), patch.object(maya, "ok"), patch.object(maya, "warn"):
+            self.assertEqual(maya.link_model(str(self.src), self.models, family), 0)
+
+    def test_glm_links_dflash_and_setup_uses_it_without_hashing(self):
+        name = maya.DFLASH["file"]
+        self.link_with_companions("glm", "Maya-S-v2-IQ2_XXS", "glm5-next", {name: b"GGUF draft"})
+        dest = self.models / "GLM-5.3-Flash-DFlash2" / name
+        self.assertTrue(dest.is_symlink())
+        with patch.object(maya, "sha256_ok", side_effect=AssertionError("hashed DFlash")), \
+                patch.object(maya, "fetch", side_effect=AssertionError("downloaded DFlash")), patch.object(maya, "ok"):
+            self.assertEqual(maya.drafter_step(self.models), dest)
+
+    def test_qwen_links_separate_vision_file(self):
+        name = next(iter(maya.qwen_vision_model()["files"]))
+        self.link_with_companions("qwen", maya.QWEN, "qwen4exp", {name: b"GGUF vision"})
+        self.assertTrue((self.models / maya.QWEN / "vision" / name).is_symlink())
+
+    def test_deepseek_links_vision_mmproj(self):
+        name = next(iter(maya.ds4_vision_model(True)["files"]))
+        label = f"{maya.DS4}-GGUF/UD-Q8_K_XL"
+        self.link_with_companions("deepseek", label, "deepseek41", {name: b"GGUF vision"})
+        self.assertTrue((self.models / f"{maya.DS4}-GGUF" / "vision" / name).is_symlink())
+
+    def test_deepseek_links_vision_config_from_the_vision_folder(self):
+        shard = "model-00001-of-00048.safetensors"
+        vision_config = self.put("vision/config.json", b'{"vision": true}')
+        self.link_with_companions("deepseek", f"{maya.DS4}-GGUF/UD-Q8_K_XL", "deepseek41",
+                                  {f"vision/{shard}": b"vision", "config.json": b"{}"})
+        dest = self.models / f"{maya.DS4}-GGUF" / "vision" / "config.json"
+        self.assertTrue(dest.is_symlink())
+        self.assertEqual(dest.resolve(), vision_config.resolve())
+
+    def test_qwen_links_separate_mtp_head_with_the_model(self):
+        mtp = self.put("extra/mtp-Qwen3.8-Flash-Next-Q8_0.gguf", b"GGUF MTP")
+        main = self.put("main.gguf", b"GGUF model")
+        label = maya.QWEN_UD_DIR
+        cat = [{"label": label, "rel": f"{label}/{name}", "size": 1000000, "sha": ["wrong"]}
+               for name in (main.name, mtp.name)]
+        with patch.object(maya, "import_catalog", return_value=cat), \
+                patch.object(maya, "gguf_head", side_effect=lambda path: ("qwen4exp", 1) if path == main else ("", 0)), \
+                patch.object(maya, "say"), patch.object(maya, "ok"), patch.object(maya, "warn"):
+            self.assertEqual(maya.link_model(str(self.src), self.models, "qwen"), 0)
+        dest = self.models / label / mtp.name
+        self.assertTrue(dest.is_symlink())
+        self.assertEqual(dest.resolve(), mtp.resolve())
+
+    def test_minimax_gguf_links_vision_and_dspark(self):
+        label = maya.MM3_QUANTS["gguf-xs"]
+        self.link_with_companions("minimax", label, "minimax-m3", {
+            "vision/model-vision-00001-of-00001.safetensors": b"vision",
+            "vision/config.json": b"{}", "vision/preprocessor_config.json": b"{}",
+            "dspark/model-dspark-00001.safetensors": b"draft", "dspark/config.json": b"{}",
+        })
+        base = self.models / maya.MM3_COMPANIONS
+        self.assertTrue((base / "model-vision-00001-of-00001.safetensors").is_symlink())
+        self.assertTrue((base / "config.json").is_symlink())
+        self.assertTrue((base / "dspark/model-dspark-00001.safetensors").is_symlink())
+        self.assertTrue((base / "dspark/config.json").is_symlink())
 
     def test_report_names_what_is_missing(self):
         self.put("a.bin", BIG)

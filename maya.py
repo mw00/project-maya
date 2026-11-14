@@ -117,6 +117,8 @@ HIP_ARCHS_WAVE64 = ("gfx908", "gfx906", "gfx942", "gfx950")  # CDNA 1 (MI100), V
                                                    # logical-32-lane half-wavefront warp mapping; experimental
 PY_PACKAGES = list(S.PY_PACKAGES)                  # (pillow: pictures in formats other than JPEG/PNG/BMP/GIF)
 CONTEXTS = [8192, 32768, 65536, 131072]
+GLM_FLASH_CONTEXTS = CONTEXTS + [262144, 524288]
+GLM53_CONTEXTS = CONTEXTS + [262144, 524288]
 DEFAULT_CONTEXT = 32768
 # KV streaming, on in every config (--kv-streaming on): the attention layers' latent cache lives in RAM and 32768
 # positions of each layer in VRAM (--kv-resident N, beside it, sets another window) - from a context above that (a
@@ -618,7 +620,8 @@ DS4_MIN_CC = 70                                    # (V100 on: the experts' kern
 # Files of an earlier layout are used as they are when a folder holds them whole (ds4_earlier): v1.1.16's Maya-S (4
 # shards + unsloth's MXFP8 shard of the Engram tables in <...-GGUF>/Engram), unsloth's GGUFs before their re-shard.
 DS4_GGUF_MANIFEST = ROOT / "tools" / "ds4" / "download_gguf.json"
-DS4_GGUF_PACK_TOOLS = ("tools/ds4/pack_gguf.py", "tools/ds4/chat_template.jinja")
+DS4_GGUF_PACK_TOOLS = ("tools/ds4/pack_gguf.py", "tools/ds4/ds4_gguf_companions.py", "tools/ds4/vision_pack.py",
+                       "tools/ds4/chat_template.jinja")
 DS4_QUANTS = {"gguf-q8": "UD-Q8_K_XL", "gguf-q4": "UD-Q4_K_XL", "maya-s": "Maya-S", "maya-m": "Maya-M", "maya-xs": "Maya-XS",
               "exl3-2.25": "EXL3 2.25bpw", "exl3": "EXL3 2.9bpw", "exl3-3.5": "EXL3 3.5bpw", "abliterated-128g": "Mix-128G",
               "abliterated-256g": "Mix-256G", "gguf-iq1_s": "UD-IQ1_S", "gguf-iq1_m": "UD-IQ1_M",
@@ -732,7 +735,7 @@ MM3_PROFILE = ROOT / "data" / "expert-profile-mm3.bin"
 # used as they are.
 MM3_GGUF_MANIFEST = ROOT / "tools" / "mm3" / "download_gguf.json"
 MM3_QUANTS = {"exl3": "EXL3 3.5 bits", "gguf-xs": "MiniMax-M3.1-Flash-Maya-XS", "gguf-s": "MiniMax-M3.1-Flash-Maya-S"}
-MM3_GGUF_PACK_TOOLS = ("tools/mm3/pack_gguf.py", "tools/ds4/pack_gguf.py", "tools/mm3/pack.py", "tools/mm3/st.py",
+MM3_GGUF_PACK_TOOLS = ("tools/mm3/pack_gguf.py", "tools/mm3/gguf_companions.py", "tools/ds4/pack_gguf.py", "tools/mm3/pack.py", "tools/mm3/st.py",
                        "tools/mm3/chat_template.jinja")
 # the GGUFs' pictures and drafting: the EXL3 repo's vision tower (model-vision-00001-of-00001.safetensors, 1.7 GB, with
 # config.json / preprocessor_config.json) and DSpark draft (dspark/, 2.3 GB) - download.json's own pinned files, the same
@@ -775,7 +778,7 @@ QWEN_UD_DIR = "Qwen3.8-Flash-Next-UD-IQ2_XS"       # (its folder in the models f
 QWEN_UD_MANIFEST = ROOT / "tools" / "qwen" / "download_unsloth.json"
 QWEN_UD_MODEL_NAME = "qwen3.8-flash-next"
 QWEN_QUANTS = ("q5_k_m", QWEN_UD)
-FAMILIES = ("glm", "deepseek", "minimax", "qwen")
+FAMILIES = ("glm", "glm53", "deepseek", "minimax", "qwen")
 SHARD_RE = re.compile(r"-(\d{5})-of-(\d{5})\.gguf$")
 
 
@@ -918,18 +921,23 @@ def pick_cmake():
 def choose(question: str, intro: list, options: list, default: int, yes: bool, outro: list = ()) -> int:
     """The answer's index among `options`, each (label, note or None, about or None): a menu on the setup's screen
     (tools/setup_tui.py; `about` shows under the highlighted one), else the numbered list and the number typed."""
+    zero = bool(options) and options[0][0].startswith("0) ")
     if S.UI is not None and not yes:
-        pick = S.UI.choose(question, intro, options, default, outro)
+        pick = S.UI.choose(question, intro, options, default + int(zero), outro)
         if pick is not None:
-            return pick
+            return len(options) - 1 if zero and pick == 0 else pick - int(zero)
     say()
     for line in intro:
         say("  " + line)
     for i, (label, note, _) in enumerate(options, 1):
-        say(f"  {i}) {label}" + (f"   ({note})" if note else ""))
+        number = i - 1 if zero else i
+        say(f"  {label}" if zero and i == 1 else
+            f"  {number}) {label}" + (f"   ({note})" if note else ""))
     for line in outro:
         say("     " + line)
-    return int(ask(question, [str(i) for i in range(1, len(options) + 1)], str(default + 1), yes)) - 1
+    pick = ask(question, (["0"] if zero else []) + [str(i) for i in range(1, len(options) + 1 - int(zero))],
+               str(default + 1), yes)
+    return len(options) - 1 if zero and pick == "0" else int(pick) - 1
 
 
 def gpu_label(g) -> str:
@@ -1805,22 +1813,25 @@ def config_family(cfg: dict) -> str:
     return Q.family_of(cfg)
 
 
+def setup_family(cfg: dict) -> str:
+    """Split the two GLM model choices in setup; both still use the engine's 'glm' config family."""
+    inst = cfg.get("installer") or {}
+    return "glm53" if inst.get("quant") in G53_MODELS or G53.config_is_glm_dsa(cfg) else config_family(cfg)
+
+
 # each model's name on the setup's screen, under its logo (Qwen's: the model, whichever of its files - never its id)
-FAMILY_TITLE = {**Q.MODEL, "qwen": "Qwen-3.8-Flash-Next"}
+FAMILY_TITLE = {**Q.MODEL, "glm53": G53.SHOWN, "qwen": "Qwen-3.8-Flash-Next"}
 
 
 def setup_title(cfg: dict) -> str:
-    """The setup screen's header name for a config: its family's, except a glm-dsa config (family "glm"), which
-    is GLM-5.3's own name, not GLM-5.3-Flash."""
-    if G53.config_is_glm_dsa(cfg):
-        return G53.SHOWN
-    return FAMILY_TITLE.get(config_family(cfg), "")
+    """The setup screen's model name, including GLM-5.3's own name for a glm-dsa config."""
+    return FAMILY_TITLE.get(setup_family(cfg), "")
 
 
 # the models whose engine answers several requests at once (--parallel): GLM-5.3-Flash's, DeepSeek-V4.1-Flash's
 # (maya-ds4 --parallel: a conversation's state each, their tokens decoded together), MiniMax-M3.1-Flash's (maya-mm3
 # --parallel: a KV cache each in VRAM - no KV streaming, no DSpark)
-PARALLEL_FAMILIES = ("glm", "deepseek", "minimax")
+PARALLEL_FAMILIES = ("glm", "glm53", "deepseek", "minimax")
 
 
 def check_parallel(a, family: str) -> None:
@@ -1832,10 +1843,10 @@ def check_parallel(a, family: str) -> None:
 
 
 def choose_family(a, prev: dict) -> str:
-    """"glm" or "deepseek": what the options say (--model, --gguf-dir, --draft), else asked - the model set up before
-    is the default."""
+    """The setup's model choice, or the model named by options; an earlier setup is the default."""
     if a.model:
-        return "deepseek" if a.model == DS4 else "minimax" if a.model == MM3 else "qwen" if a.model == QWEN else "glm"
+        return ("deepseek" if a.model == DS4 else "minimax" if a.model == MM3 else "qwen" if a.model == QWEN
+                else "glm53" if a.model in G53_MODELS else "glm")
     if getattr(a, "qwen_quant", None):                 # (--qwen-quant alone: Qwen's files named)
         return "qwen"
     metal = getattr(a, "backend", None) == "metal"
@@ -1843,7 +1854,7 @@ def choose_family(a, prev: dict) -> str:
         return "glm"
     if a.model_dir:                                    # (an EXL3 folder of GLM or MiniMax; else DeepSeek's files)
         return exl3_folder_family(a.model_dir) or "deepseek"
-    default = config_family(prev) if prev else "glm"
+    default = setup_family(prev) if prev else "glm"
     try:
         have = sum(g["vram_gb"] for g in S.gpus() if g.get("vram_gb")) + mem_gb()[0]
     except Exception:  # noqa: BLE001 - no NVIDIA tools: no figure for this PC
@@ -1853,6 +1864,9 @@ def choose_family(a, prev: dict) -> str:
              "Z.ai's GLM-5.3-Flash in Project Maya's GGUF quants (GLM-5.3-Flash-Maya-S to -Maya-L, 95-156 GB) or "
              "turboderp's EXL3 quants: from one GPU up, the experts that do not fit in VRAM from RAM and the SSD; "
              "NVIDIA and AMD; pictures with its vision encoder."),
+            (G53.SHOWN, None,
+             "Z.ai's GLM-5.3 (744B, 40B active per token): text only, with its own NextN drafting block; "
+             "NVIDIA and AMD. Its experts can use VRAM, RAM and the SSD."),
             (DS4, None,
              "DeepSeek's DeepSeek-V4.1-Flash-1017 (748B) on its own engine: unsloth's GGUF (UD-Q8_K_XL, 508 GB; "
              "NVIDIA from V100 on or AMD, Linux or Windows), orcarouter's abliterated one (Mix-128G or "
@@ -1869,12 +1883,9 @@ def choose_family(a, prev: dict) -> str:
              "up to a 1M context" + ("; or Maya's own GGUF quants (MiniMax-M3.1-Flash-Maya-XS ~93 GB, -Maya-S ~122 "
                                      "GB: NVIDIA from V100 on and AMD)"
                                      if any(map(mm3_gguf_published, ("gguf-xs", "gguf-s"))) else "") + "."),
-            (Q.shown("qwen", "q5_k_m", qwen_entry()["download_gb"]), "new",
-             f"{QWEN_SHOWN}: 180B, 10 of 512 experts a token; Blackfrost-AI's cybersecurity fine-tune of Qwen3.8-Flash-Next "
-             "in peasantsmith's GGUF, on Maya's own Qwen path; NVIDIA from V100 on or AMD, Linux or Windows; all its "
-             f"experts in about {qwen_entry()['memory_gb']:.0f} GB of VRAM and RAM together{here}, with less the others "
-             "read from the SSD; tool calls, its three reasoning efforts, MTP drafting, up to a 256K context; text only. "
-             f"Or the base model itself in unsloth's UD-IQ2_XS GGUF ({qwen_entry(QWEN_UD)['download_gb']:.0f} GB).")]
+            (FAMILY_TITLE["qwen"], "new",
+             "Qwen3.8-Flash-Next: 180B parameters, 10 of 512 experts per token; NVIDIA from V100 on or AMD, "
+             "Linux or Windows.")]
     pick = choose("Model?", ["Which model to set up:"], rows, FAMILIES.index(default), a.yes)
     return FAMILIES[pick]
 
@@ -1926,10 +1937,49 @@ def setup_gpus(a) -> list:
         return []
 
 
-def choose_model(a, models: Path, inst: dict) -> tuple:
+def setup_models_dir(a, prev: dict) -> Path:
+    """The models folder this setup will use for the selected family."""
+    inst = prev.get("installer") or {}
+    return (Path(a.models_dir).expanduser().resolve() if getattr(a, "models_dir", None) else
+            Path(inst["models_dir"]) if inst.get("models_dir") else
+            Path(inst["data_dir"]) / "models" if inst.get("data_dir") else ROOT.parent / "Maya-data" / "models")
+
+
+def choose_with_add(a, question: str, intro: list, rows: list, default: int, yes: bool,
+                    models: Path, family: str) -> int | dict:
+    """A model-files menu with 0 to link by type or import, then choose from the same list."""
+    if yes:
+        return choose(question, intro, rows, default, yes)
+    options = [("0) Add downloaded model", None,
+                "Choose a directory, then link files by model type or import them with full verification.")] + rows
+    while True:
+        pick = choose(question, intro, options, default, False)
+        if pick < len(rows):
+            return pick
+        folder = ""
+        while True:
+            folder = S.ask_text("Directory with downloaded model files", folder)
+            if not folder:
+                warn("enter a directory with downloaded model files")
+            else:
+                src = Path(folder).expanduser().resolve()
+                if src.is_dir():
+                    break
+                warn(f"{folder} is not a directory")
+            if S.UI is not None and hasattr(S.UI, "retry_text"):
+                S.UI.retry_text("Directory with downloaded model files")
+        added = review_downloaded_model(a, src, models, family)
+        if added == 0 or isinstance(added, dict):
+            if S.UI is not None and hasattr(S.UI, "commit_add"):
+                S.UI.commit_add()
+            if isinstance(added, dict):
+                return added
+
+
+def choose_model(a, models: Path, inst: dict, family: str = "glm") -> tuple:
     """("download", one of MODELS) or ("local", the model's first .gguf file): --gguf-dir, --model, else asked among
     the downloads - the earlier download is the default.  ("exl3", the folder): --model-dir naming an EXL3 folder of
-    GLM-5.3-Flash."""
+    GLM-5.3-Flash. ("linked", the selected local files): any GGUF added through Link files."""
     metal = getattr(a, "backend", None) == "metal"
     if getattr(a, "model_dir", None) and exl3_folder_family(a.model_dir) == "glm":
         if metal:
@@ -1946,10 +1996,32 @@ def choose_model(a, models: Path, inst: dict) -> tuple:
         if metal and a.model in G53_MODELS:            # (GLM-5.3: before its download, not after it)
             fail(f"{G53.SHOWN} runs on NVIDIA and AMD GPUs (not on Metal yet)", f"{ME} --setup picks another model")
         return "download", a.model
+    if family == "glm53":
+        if metal:
+            fail(f"{G53.SHOWN} runs on NVIDIA and AMD GPUs (not on Metal yet)", f"{ME} --setup picks another model")
+        g53 = list(G53_MODELS)
+        try:
+            ram, gpus = mem_gb()[0], setup_gpus(a)
+        except Exception:  # noqa: BLE001 - the PC does not read: the usual pick
+            ram, gpus = 0.0, []
+        rec = fit_recommendation({q: g53_figures(q)[0] for q in g53}, gpus, ram,
+                                 DEFAULT_CONTEXT * G53.KV_BYTES / 2**30, g53[0])
+        default = inst.get("quant") if inst.get("quant") in g53 else rec
+        rows = []
+        for q in g53:
+            m, d = G53_MODELS[q], download_dir(models, q)
+            have = all(p.exists() for p in local_shards(m, d))
+            rows.append((f"{G53.LABEL} · {Q.glm53_quant(q)}, text only: " +
+                         (f"downloaded, in {d}" if have else f"download {m['download_gb']:.1f} GB from Hugging Face"),
+                         f"recommended for {G53.SHOWN}" if q == rec else None,
+                         f"{m['about']}; {g53_memory_note(quant=q)}"))
+        pick = choose_with_add(a, f"Which {G53.SHOWN}?", ["The model to set up:"], rows,
+                               g53.index(default), a.yes, models, "glm53")
+        if isinstance(pick, dict):
+            return "linked", pick
+        return "download", g53[pick]
     opts = [q for q in MODELS if (q not in MODELS_BY_HAND or q == inst.get("quant"))
             and not (metal and is_exl3(q))]   # (a chosen-by-hand download: only where it is installed; Metal: GGUFs)
-    # GLM-5.3 (744B): its downloads after GLM-5.3-Flash's - not on Metal
-    g53 = [q for q in G53_MODELS if q in glm_downloads()] if not metal else []
     # cards of 24 GB or less: Maya-S24 (its 4-bit attention leaves ~1.5 GB more of the card for experts - decode about
     # 14% faster there), else Maya-S
     try:
@@ -1968,7 +2040,7 @@ def choose_model(a, models: Path, inst: dict) -> tuple:
     sizes = {q: MODELS[q]["download_gb"] for q in opts if q in (top, "Maya-XS-IQ1_S") or
              (q != "Maya-S24" and not is_exl3(q))}
     rec = fit_recommendation(sizes, gpus, ram, DEFAULT_CONTEXT * G53.KV_BYTES / 2**30, top)
-    default = inst["quant"] if inst.get("quant") in MODELS or inst.get("quant") in g53 else rec
+    default = inst["quant"] if inst.get("quant") in opts else rec
     rows = []
     for q in opts:
         m, d = MODELS[q], download_dir(models, q)
@@ -1977,25 +2049,12 @@ def choose_model(a, models: Path, inst: dict) -> tuple:
                                                  f"download {m['download_gb']:.1f} GB from Hugging Face"),
                      ("recommended for cards of 24 GB or less" if q == "Maya-S24" else "recommended") if q == rec
                      else None, m["about"]))
-    # GLM-5.3 (744B)'s own recommendation where it lists more than one (fit_recommendation by g53_figures' memory),
-    # at most Maya's own quant (the owner, 2026-11-11): a larger third-party quant is listed, never recommended
-    rec53 = fit_recommendation({q: g53_figures(q)[0] for q in g53}, gpus, ram,
-                               DEFAULT_CONTEXT * G53.KV_BYTES / 2**30,
-                               "GLM-5.3-Maya-XS" if "GLM-5.3-Maya-XS" in g53 else None) if len(g53) > 1 else None
-    for q in g53:                                      # GLM-5.3 (744B, glm-dsa): its downloads (hidden)
-        m, d = G53_MODELS[q], download_dir(models, q)
-        have = all(p.exists() for p in local_shards(m, d))
-        rows.append((f"{G53.LABEL} · {Q.glm53_quant(q)}, text only: " +
-                     (f"downloaded, in {d}" if have else f"download {m['download_gb']:.1f} GB from Hugging Face"),
-                     f"recommended for {G53.SHOWN}" if q == rec53 else None,
-                     f"{m['about']}; {g53_memory_note(quant=q)}"))
-    rows.append((f"{G53.SHOWN} (744B, text only): GGUF files you already have", None,   # GLM-5.3 (744B, glm-dsa)
-                 "Z.ai's GLM-5.3 on the same engine; set up from its GGUF folder with --gguf-dir <folder>"))
-    pick = choose("Which GLM-5.3-Flash?", ["The model to download (GLM-5.3-Flash GGUF files you already have: "
-                                           "--gguf-dir <file or folder>):"], rows, (opts + g53).index(default), a.yes)
-    if pick >= len(opts) + len(g53):
-        fail(f"{G53.SHOWN} is set up from its GGUF files", f"{ME} --setup --gguf-dir <the folder of its .gguf files>")
-    return "download", (opts + g53)[pick]
+    pick = choose_with_add(a, "Which GLM-5.3-Flash?", ["The model to download (GLM-5.3-Flash GGUF files you already have: "
+                                                       "--gguf-dir <file or folder>):"], rows, opts.index(default),
+                           a.yes, models, "glm")
+    if isinstance(pick, dict):
+        return "linked", pick
+    return "download", opts[pick]
 
 
 def g53_choice(choice: tuple | None) -> bool:
@@ -2027,19 +2086,19 @@ def g53_contexts(pc: dict, parallel: int = 1, kv_bytes: int | None = None, reser
     gpus = pc.get("gpus") or []
     vram = sum(g.get("vram_gb") or 0 for g in gpus)
     if G53.KV_STREAMING or not gpus or not vram or any(hip_unified_memory(g) for g in gpus):
-        return list(CONTEXTS)
+        return list(GLM53_CONTEXTS)
     reserve = G53.RESERVE_MIB if reserve_mib is None else reserve_mib
     dense = G53.DENSE_GB if dense_gb is None else dense_gb
     room = 0.9 * vram - dense - (G53.GPU_WORK_GB + reserve / 1024) * len(gpus)
-    fit = [c for c in CONTEXTS if max(1, parallel) * c * (kv_bytes or G53.KV_BYTES) / 2**30 <= room]
-    if len(fit) < len(CONTEXTS):
+    fit = [c for c in GLM53_CONTEXTS if max(1, parallel) * c * (kv_bytes or G53.KV_BYTES) / 2**30 <= room]
+    if len(fit) < len(GLM53_CONTEXTS):
         (ok if fit else warn)(
             f"{G53.SHOWN} keeps its whole attention cache in VRAM for now: " +
             (f"up to a {context_label(fit[-1])} context on these GPUs ({vram:.0f} GB of VRAM" +
              (f", {parallel} answers at once" if parallel > 1 else "") + ")" if fit else
              f"its dense weights and the smallest context need more VRAM than these GPUs have ({vram:.0f} GB) - "
              "it may not start"))
-    return fit or CONTEXTS[:1]
+    return fit or GLM53_CONTEXTS[:1]
 
 
 def apu_memory(vram: float, ram: float, linux: bool) -> float:
@@ -2091,7 +2150,7 @@ def g53_apu_context(pc: dict, plan: dict, quant: str | None, contexts) -> tuple:
                  "from the SSD")
 
 
-def g53_cache_plan(a, pc: dict, choice: tuple) -> dict:
+def g53_cache_plan(a, pc: dict, choice: tuple, *, linked_files: dict | None = None) -> dict:
     """g53_contexts' "parallel", "kv_bytes", "reserve_mib" and "dense_gb" as the GLM-5.3 config this setup writes will
     have them (write_config): --parallel given now, else the one its config before has (keep_args keeps it - the Models
     page sets it there), else 1; the cache's formats an --env given now asks for (MAYA_GLM_KV_INT8=0: an FP16 latent,
@@ -2099,7 +2158,7 @@ def g53_cache_plan(a, pc: dict, choice: tuple) -> dict:
     environment in the engine), else an --env MAYA_GLM_RESERVE_MB, else the HIP setup's (hip_reserve_mib), else
     CUDA's default; the dense weights: the quant's (g53_figures)."""
     quant = choice[1] if choice[0] == "download" else quant_of(Path(choice[1]))
-    old = read_json(glm_config_path(pc, quant)).get("args") or []
+    old = read_json(glm_setup_config_path(pc, quant, linked_files)).get("args") or []
     env = parse_env(getattr(a, "env", None) or [])
 
     def num(v):
@@ -2788,6 +2847,8 @@ def incomplete(path: Path):
 def file_incomplete(m: dict, path: Path):
     """Why a download's file is not whole, or None when it is: a GGUF by its own tensor directory (incomplete), an
     EXL3 model's file by its published size."""
+    if MI.is_linked(path):
+        return None
     if "files" not in m:
         return incomplete(path)
     if not path.exists():
@@ -2827,6 +2888,8 @@ VERIFIED = ".maya-verified.json"                   # in a model folder: the file
 def sha256_checked(path: Path, want) -> bool:
     """sha256_ok, read once: a file that matched is remembered (VERIFIED) with its size and modification time, and not
     read again until either changes."""
+    if MI.is_linked(path):
+        return True
     book = read_json(path.parent / VERIFIED)
     st = path.stat()
     seen = book.get(path.name) or {}
@@ -2867,19 +2930,23 @@ def import_catalog(models: Path) -> list:
         v = m.get("vision")
         if v:
             add(quant, f"{quant}/{v['folder']}", v["sha256"])
+    for quant, m in G53_MODELS.items():
+        entry(quant, quant, m)
     cat.append({"label": "GLM-5.3-Flash-DFlash2", "rel": f"GLM-5.3-Flash-DFlash2/{DFLASH['file']}",
                 "size": DFLASH["bytes"], "sha": [DFLASH["sha256"].lower()]})
     quiet = contextlib.redirect_stdout(io.StringIO())
 
-    def tolerant(make, *args):                         # (a manifest that is not published yet: fail() exits)
+    def tolerant(make, *args, **kwargs):               # (an optional manifest may not be published yet)
         try:
             with quiet:
-                return make(*args)
+                return make(*args, **kwargs)
         except (SystemExit, OSError, KeyError, ValueError):
             return None
     nsa = argparse.Namespace(model_dir=None)
     for quant in DS4_QUANTS:
-        m = tolerant(ds4_gguf_model, quant)
+        if quant in DS4_MAYA and not ds4_maya_published(quant):
+            continue
+        m = tolerant(ds4_gguf_model, quant, allow_missing=True)
         if m and m.get("files"):
             d = ds4_dir(nsa, models, {}, quant)
             entry(d.relative_to(models).as_posix(), d.relative_to(models).as_posix(), m)
@@ -2908,22 +2975,25 @@ def import_catalog(models: Path) -> list:
     return cat
 
 
-def import_model(a, folder: str) -> int:
+def import_model(a, folder: str, *, models_override: Path | None = None,
+                 from_setup: bool = False, selected_files: set[Path] | None = None) -> int:
     """--import-model <folder>: find the published model files in a folder by their size and sha256 (whatever the
     downloader named them, in whatever subfolders, also a Hugging Face cache's blobs/snapshots), and move them (same
     drive) or copy them (another drive: --copy) into the models folder's layout; then print what was found, what
-    is missing and what did not match.  Nothing that did not match is touched; nothing is deleted."""
+    is missing and what did not match.  Nothing that did not match is touched; nothing is deleted.  Interactive setup
+    passes selected_files so another quant in the same directory is left alone."""
     src = Path(folder).expanduser().resolve()
     if not src.is_dir():
         fail(f"{folder} is not a folder", f"{ME} --import-model <the folder with the downloaded files>")
     have = configs()
     inst = (read_json(have[0]).get("installer") or {}) if have else {}
-    models = (Path(a.models_dir).expanduser().resolve() if a.models_dir else
+    models = (models_override if models_override is not None else
+              Path(a.models_dir).expanduser().resolve() if a.models_dir else
               Path(inst["models_dir"]) if inst.get("models_dir") else
               Path(inst["data_dir"]) / "models" if inst.get("data_dir") else ROOT.parent / "Maya-data" / "models")
     cat = import_catalog(models)
     say(f"  Looking in {src} for Maya's model files (by size and sha256, not by name); they go to {models}")
-    got = MI.find(src, cat, progress=say)
+    got = MI.find(src, cat, progress=say, only=selected_files)
     placed, shared = MI.choose(got["found"])
     if not placed and not shared:
         warn("none of the files there is one of Maya's published model files")
@@ -2969,9 +3039,501 @@ def import_model(a, folder: str) -> int:
         skipped_now += r["skipped"]
     for line in skipped_now:
         warn(line)
-    ok(f"{moved} file(s) moved, {copied} copied into {models}; they are recorded as verified (no second check)")
-    say(f"  Now run {ME} --setup and pick the model (or {ME} --setup --model <name>): the files are used where they are.")
+    ok(f"{moved} file(s) moved, {copied} copied into {models}; "
+       "they are recorded as verified (no second check)")
+    if from_setup:
+        say("  Select the model's files in the list to continue setup.")
+    else:
+        say(f"  Now run {ME} --setup and pick the model (or {ME} --setup --model <name>): the files are used where they are.")
     return 0
+
+
+def linked_model_type(path: Path) -> str | None:
+    """Family from a model header/config only. No size or checksum is consulted."""
+    if path.suffix.lower() == ".gguf":
+        arch = gguf_head(path)[0]
+        return ("glm" if arch in GLM_ARCHS else "glm53" if arch == G53.ARCH else
+                "deepseek" if arch == "deepseek41" else "minimax" if arch == "minimax-m3" else
+                "qwen" if arch == "qwen4exp" else None)
+    if path.name == "config.json":
+        conf = read_json(path)
+        if (conf.get("quantization_config") or {}).get("quant_method") == "exl3":
+            return {"glm5_next": "glm", "deepseek_v41": "deepseek",
+                    "minimax_m3_vl": "minimax"}.get(conf.get("model_type"))
+    return None
+
+
+def review_role(path: Path, src: Path) -> str:
+    """Classify a model weight, optional drafter, or vision file by its published name/folder."""
+    parts = [part.casefold() for part in path.relative_to(src).parts]
+    name = parts[-1]
+    if "mmproj" in name or "vision" in name or any("vision" in part for part in parts[:-1]):
+        return "vision"
+    if any(tag in name for tag in ("mtp", "dflash", "dspark", "draft")) or any(
+            any(tag in part for tag in ("mtp", "dflash", "dspark", "draft")) for part in parts[:-1]):
+        return "drafter"
+    return "model"
+
+
+def review_candidate(path: Path, role: str, files: list[Path]) -> dict:
+    """The displayed first file, the type-checking anchor, and the files selected along with it."""
+    nearby = [p for p in files if p.parent == path.parent]
+    if role == "model" and path.suffix.lower() == ".gguf":
+        path = shard_set(path)[0]
+        group = [p for p in shard_set(path) if p in files]
+        anchor = path
+    elif role == "model":
+        anchor = path.parent / "config.json"
+        # An EXL3 directory's config/tokenizer files belong to its weights, even when no safetensors are present.
+        group = [p for p in nearby if p.suffix.lower() in (".json", ".safetensors", ".model")
+                 and not any(tag in p.name.casefold() for tag in ("vision", "dspark", "dflash", "mtp"))]
+    elif path.suffix.lower() == ".gguf":
+        path = shard_set(path)[0]
+        anchor = path
+        group = [p for p in shard_set(path) if p in files]
+        if role == "vision":
+            group += [p for p in nearby if "vocab" in p.name.casefold() and p.suffix.lower() == ".gguf"]
+    else:
+        anchor = path
+        tags = ("vision", "mmproj") if role == "vision" else ("mtp", "dflash", "dspark", "draft")
+        own_folder = any(tag in path.parent.name.casefold() for tag in tags)
+        group = [p for p in nearby if p.suffix.lower() in (".json", ".safetensors", ".model") and
+                 (own_folder or p == path or any(tag in p.name.casefold() for tag in tags) or
+                  p.name in ("config.json", "preprocessor_config.json"))]
+    return {"path": path, "anchor": anchor, "files": set(group) or {path}}
+
+
+def review_candidates(src: Path, family: str) -> dict[str, list[dict]]:
+    """Quickly inspect filenames and GGUF/EXL3 type metadata; do not read sizes or SHA-256."""
+    listing = [(path, real) for path, real, _ in MI.files_under(src)]
+    files = [path for path, _ in listing]
+    found = {"model": [], "drafter": [], "vision": []}
+    for path, _ in listing:
+        role = review_role(path, src)
+        suffix = path.suffix.lower()
+        if role == "model" and suffix == ".gguf":
+            shard = SHARD_RE.search(path.name)
+            if (not shard or int(shard.group(1)) == 1) and linked_model_type(path) == family:
+                found["model"].append(review_candidate(path, role, files))
+        elif role == "model" and path.name == "config.json" and linked_model_type(path) == family:
+            weights = sorted(p for p in files if p.parent == path.parent and p.suffix.lower() == ".safetensors"
+                             and review_role(p, src) == "model")
+            found["model"].append(review_candidate(weights[0] if weights else path, role, files))
+        elif role in ("drafter", "vision") and suffix in (".gguf", ".safetensors"):
+            shard = SHARD_RE.search(path.name) if suffix == ".gguf" else None
+            if shard and int(shard.group(1)) != 1:
+                continue
+            if suffix == ".safetensors" and re.search(r"-\d{5}-of-\d{5}\.safetensors$", path.name):
+                if not re.search(r"-00001-of-\d{5}\.safetensors$", path.name):
+                    continue
+            if role == "vision" and "vocab" in path.name.casefold():
+                continue
+            found[role].append(review_candidate(path, role, files))
+    if family == "qwen":
+        found["drafter"].sort(key=lambda c: (not c["path"].name.casefold().startswith("mtp-qwen"),
+                                                "shared" in c["path"].name.casefold(),
+                                                c["path"].name.casefold()))
+    return found
+
+
+def review_pick_file(src: Path, role: str, candidates: list[dict], current: dict | None) -> dict | None:
+    """Choose a detected file or browse for one, including outside src; optional roles can be cleared."""
+    while True:
+        rows = [(review_path(c["path"], src), None, None) for c in candidates]
+        rows.append(("Browse files...", None, "Browse folders and search for a file, or enter its path."))
+        if role != "model":
+            rows.append(("None", None, "Do not add this optional file."))
+        default = next((i for i, c in enumerate(candidates) if current and c["path"] == current["path"]),
+                       len(candidates) if current else len(rows) - 1 if role != "model" else len(candidates))
+        pick = choose(f"{role.title()} file?", [f"Directory: {src}"], rows, default, False)
+        if pick < len(candidates):
+            return candidates[pick]
+        if role != "model" and pick == len(rows) - 1:
+            return None
+        answer = review_path(current["path"], src) if current else ""
+        while True:
+            answer = S.ask_text(f"{role.title()} file name", answer, file_root=src)
+            path = Path(os.path.abspath(src / Path(answer).expanduser())) if answer else None
+            if path is not None and path.is_file():
+                files = [p for p in path.parent.iterdir() if p.is_file()]
+                return review_candidate(path, role, files)
+            warn(f"{answer or '(empty)'} is not a file")
+            if S.UI is not None and hasattr(S.UI, "retry_text"):
+                S.UI.retry_text(f"{role.title()} file name")
+
+
+def review_path(path: Path, src: Path) -> str:
+    """Relative filenames in the source directory; full paths for files chosen in another directory."""
+    try:
+        return path.relative_to(src).as_posix()
+    except ValueError:
+        return str(path)
+
+
+def review_downloaded_model(a, src: Path, models: Path, family: str) -> int | dict:
+    """Show detected files, let the user correct them, then link or import exactly the chosen variant."""
+    found = review_candidates(src, family)
+    if not found["model"]:
+        for path in sorted(src.rglob("*.gguf")):
+            if path.is_symlink() and not path.exists():
+                warn(f"broken symbolic link: {path.name} -> {path.resolve()}")
+                break
+    chosen = {role: options[0] if options else None for role, options in found.items()}
+    while True:
+        def shown(role):
+            c = chosen[role]
+            return review_path(c["path"], src) if c else "None"
+        rows = [(f"Model: {shown('model')}", None, "Choose or edit the first model file."),
+                (f"Drafter: {shown('drafter')}", None, "Choose an MTP, DFlash, DFlash2 or other draft file."),
+                (f"Vision: {shown('vision')}", None, "Choose a vision file, if present."),
+                ("Link files", None, "Check model type only; create symbolic links without size or SHA-256 checks."),
+                ("Import Model", None, "Verify selected published files by size and SHA-256, then move or copy them.")]
+        pick = choose("Detected model files", [f"Directory: {src}", "Review the files before adding them:"],
+                      rows, 3, False)
+        if pick < 3:
+            role = ("model", "drafter", "vision")[pick]
+            chosen[role] = review_pick_file(src, role, found[role], chosen[role])
+            continue
+        selected = set().union(*(c["files"] for c in chosen.values() if c))
+        if pick == 3:
+            model = chosen["model"]
+            if model is None:
+                warn("select a model file before linking")
+                continue
+            if family in ("glm", "glm53") and model["anchor"].suffix.lower() == ".gguf":
+                local = link_glm_local(models, chosen, family=family)
+                if local is not None:
+                    return local
+                continue
+            if family in ("deepseek", "minimax") and model["anchor"].suffix.lower() == ".gguf" and \
+                    model["anchor"].name not in published_other_gguf_names(family):
+                local = link_other_gguf(models, chosen, family)
+                if local is not None:
+                    return local
+                continue
+            if family == "qwen" and model["anchor"].name not in set().union(
+                    *(set(qwen_entry(quant)["files"]) for quant in QWEN_QUANTS)):
+                local = link_qwen_local(models, chosen)
+                if local is not None:
+                    return local
+                continue
+            result = link_model(str(src), models, family, selected_model=model["anchor"], selected_files=selected)
+        else:
+            result = import_model(a, str(src), models_override=models, from_setup=True,
+                                  selected_files=selected if chosen["model"] else None)
+        if result == 0:
+            return 0
+
+
+def local_model_folder(models: Path, first: Path, prefix: str = "GLM") -> Path:
+    """Keep same-named files from different source folders as separate installed models."""
+    def slug(value):
+        return re.sub(r"[^A-Za-z0-9._-]", "-", value)[:100] or "model"
+    name = slug(re.sub(r"(?:-\d{5}-of-\d{5})?\.gguf$", "", first.name, flags=re.I))
+    base = f"{prefix}-local-{name}"
+    occupied = {p.name.casefold(): p for p in models.iterdir()} if models.is_dir() else {}
+    number = 0
+    while True:
+        label = base if number == 0 else f"{base}-{slug(first.parent.name)}" + (f"-{number}" if number > 1 else "")
+        existing = occupied.get(label.casefold())
+        if existing is None:
+            return models / label
+        target = existing / first.name
+        if target.is_symlink() and target.resolve() == first.resolve():
+            return existing
+        number += 1
+
+
+def local_gguf_model_name(folder: Path) -> str:
+    """A linked model's API id: quant and any source-folder disambiguator included."""
+    name = re.sub(r"^(?:DeepSeek|MiniMax)-local-", "", folder.name, flags=re.I)
+    return re.sub(r"[^a-z0-9._-]+", "-", name.lower()).strip("-") or "local-model"
+
+
+def link_glm_local(models: Path, chosen: dict, family: str = "glm") -> dict | None:
+    """Link a GGUF quant of the chosen GLM family and its companions by model type only."""
+    first = chosen["model"]["anchor"]
+    if family not in ("glm", "glm53") or first.suffix.lower() != ".gguf" or linked_model_type(first) != family:
+        warn(f"{first.name} is not a {FAMILY_TITLE.get(family, family)} GGUF model")
+        return None
+    shards = shard_set(first)
+    missing = next((path for path in shards if not path.is_file()), None)
+    if missing is not None:
+        warn(f"{missing.name} is missing; finish the model download before linking")
+        return None
+    drafter, vision = chosen["drafter"], chosen["vision"]
+    if family == "glm53" and (drafter or vision):
+        warn("GLM-5.3 uses its built-in MTP block and is text only; set Drafter and Vision to None")
+        return None
+    if drafter and (drafter["anchor"].suffix.lower() != ".gguf" or gguf_head(drafter["anchor"])[0] != "dflash"):
+        warn(f"{drafter['path'].name}: select a DFlash2 GGUF, or None to use the model's own MTP block")
+        return None
+    if vision and (vision["anchor"].suffix.lower() != ".gguf" or gguf_head(vision["anchor"])[0] != "clip"):
+        warn(f"{vision['path'].name}: GLM vision needs an mmproj GGUF")
+        return None
+    dest = local_model_folder(models, first)
+    placements = [(path, dest / path.name) for path in shards]
+    placements += [(path, dest / "drafter" / path.name) for path in sorted(drafter["files"])] if drafter else []
+    placements += [(path, dest / "vision" / path.name) for path in sorted(vision["files"])] if vision else []
+    made = 0
+    for source, target in placements:
+        created, why = MI.link_file(source, target)
+        if why:
+            warn(why)
+            return None
+        if created:
+            made += 1
+            say(f"  linked {target} -> {source.resolve()}")
+    ok(f"{made} symbolic link(s) created for local GLM; model type checked, size and SHA-256 not checked")
+    return {"folder": dest, "model": dest / first.name, "files": [dest / p.name for p in shards],
+            "drafter": dest / "drafter" / drafter["path"].name if drafter else None,
+            "vision": dest / "vision" / vision["path"].name if vision else None}
+
+
+def published_other_gguf_names(family: str) -> set[str]:
+    """Keep published downloads on their existing path, including native companion packs and shared tables."""
+    man = read_json(DS4_GGUF_MANIFEST if family == "deepseek" else MM3_GGUF_MANIFEST)
+    sections = [man] + ([man.get("maya") or {}, man.get("abliterated") or {}] if family == "deepseek" else [])
+    return {Path(name).name for section in sections for quant in (section.get("quants") or {}).values()
+            for name in quant.get("files", {})}
+
+
+def link_other_gguf(models: Path, chosen: dict, family: str) -> dict | None:
+    """An unlisted DeepSeek/MiniMax GGUF, kept separate from published downloads."""
+    first = chosen["model"]["anchor"]
+    if first.suffix.lower() != ".gguf" or linked_model_type(first) != family:
+        warn(f"{first.name} is not a {FAMILY_TITLE[family]} GGUF model")
+        return None
+    files = shard_set(first)
+    missing = next((p for p in files if not p.is_file()), None)
+    if missing is not None:
+        warn(f"{missing.name} is missing" + (f" (broken link to {missing.resolve()})" if missing.is_symlink() else ""))
+        return None
+    if family in ("deepseek", "minimax"):
+        checks = (("drafter", "dflash", "dflash.hyper_connection.count", None),
+                  ("vision", "clip", "clip.projector_type", "deepseek41v")) if family == "deepseek" else (
+                  ("drafter", "dflash", "dflash.backbone", "minimax-m3"),
+                  ("vision", "clip", "clip.projector_type", "minimax_m3"))
+        for role, arch, key, want in checks:
+            if not chosen.get(role):
+                continue
+            from gguf_reader import GGUFFile
+            source = chosen[role]["anchor"]
+            meta = GGUFFile(source).metadata if source.suffix.lower() == ".gguf" else {}
+            if meta.get("general.architecture") != arch or (meta.get(key) != want if want is not None else
+                                                           not meta.get(key)):
+                warn(f"{source.name}: not a {FAMILY_TITLE[family]} {role} GGUF")
+                return None
+    if family == "minimax":
+        stem = re.sub(r"(?:-\d{5}-of-\d{5})?\.gguf$", "", first.name, flags=re.I)
+        for suffix in ("-maya-indexers.bin", "-maya-indexers.gguf"):
+            side = first.with_name(stem + suffix)
+            if side.is_file() and gguf_head(side)[0] == "minimax-m3":
+                files.append(side)
+                break
+    dest = local_model_folder(models, first, "DeepSeek" if family == "deepseek" else "MiniMax")
+    for source in files:
+        _, why = MI.link_file(source, dest / source.name)
+        if why:
+            warn(why)
+            return None
+    companions = {}
+    for role in ("drafter", "vision"):
+        companion = chosen.get(role)
+        companions[role] = None
+        if companion is not None:
+            for source in sorted(companion["files"]):
+                target = dest / role / source.name
+                _, why = MI.link_file(source, target)
+                if why:
+                    warn(why)
+                    return None
+            companions[role] = dest / role / companion["path"].name
+    ok(f"{len(files)} local {FAMILY_TITLE[family]} GGUF file(s) linked; size and SHA-256 not checked")
+    return {"folder": dest, "model": dest / first.name, "files": [dest / p.name for p in files],
+            **companions}
+
+
+def link_qwen_local(models: Path, chosen: dict) -> dict | None:
+    """Link an unlisted Qwen GGUF as its own local quant, keeping the selected MTP and mmproj beside it."""
+    model = chosen["model"]
+    first = model["anchor"]
+    if first.suffix.lower() != ".gguf" or linked_model_type(first) != "qwen":
+        warn(f"{first.name} is not a Qwen3.8-Flash-Next GGUF model")
+        return None
+    shards = shard_set(first)
+    missing = [path for path in shards if not path.is_file()]
+    if missing:
+        warn(f"{missing[0].name} is missing; finish the model download before linking")
+        return None
+    drafter, vision = chosen["drafter"], chosen["vision"]
+    if drafter and gguf_head(drafter["anchor"])[0] != "qwen4exp":
+        warn(f"{drafter['path'].name}: this Qwen setup can use a qwen4exp MTP head, not this drafter")
+        return None
+    if vision and (vision["anchor"].suffix.lower() != ".gguf" or gguf_head(vision["anchor"])[0] != "clip"):
+        warn(f"{vision['path'].name}: Qwen vision needs an mmproj GGUF")
+        return None
+    name = re.sub(r"[^A-Za-z0-9._-]", "-", re.sub(r"-\d{5}-of-\d{5}\.gguf$", "", first.name))[:100]
+    dest = models / f"Qwen-local-{name}"
+    placements = [(path, dest / path.name) for path in shards]
+    placements += [(path, dest / path.name) for path in sorted(drafter["files"])] if drafter else []
+    placements += [(path, dest / "vision" / path.name) for path in sorted(vision["files"])] if vision else []
+    made = 0
+    for source, target in placements:
+        created, why = MI.link_file(source, target)
+        if why:
+            warn(why)
+            return None
+        if created:
+            made += 1
+            say(f"  linked {target} -> {source.resolve()}")
+    ok(f"{made} symbolic link(s) created for local Qwen; model type checked, size and SHA-256 not checked")
+    return {"folder": dest, "model": dest / first.name, "files": [dest / p.name for p in shards],
+            "drafter": dest / drafter["path"].name if drafter else None,
+            "vision": dest / "vision" / vision["path"].name if vision else None}
+
+
+def link_catalog_family(label: str, family: str) -> bool:
+    if family == "glm":
+        return label in MODELS
+    if family == "glm53":
+        return label in G53_MODELS
+    if family == "deepseek":
+        return label.startswith(DS4)
+    if family == "minimax":
+        return label.startswith(MM3)
+    return family == "qwen" and label in (QWEN, QWEN_UD_DIR)
+
+
+def link_companion_specs(models: Path, family: str, selected: dict) -> list:
+    """(kind, destination folder, published names, distinctive name) for optional files beside these models."""
+    specs = []
+    if family == "glm":
+        specs.append(("DFlash2", models / "GLM-5.3-Flash-DFlash2", [DFLASH["file"]], DFLASH["file"]))
+    elif family == "qwen":
+        vision = qwen_vision_model()
+        if vision:
+            for label in selected:
+                names = list(vision["files"])
+                specs.append(("vision", models / label / "vision", names, names[0]))
+    elif family == "deepseek":
+        for label in selected:
+            base = (Path(label).parent if "-GGUF/" in label else Path(f"{DS4}-Maya-GGUF"))
+            for mmproj in (False, True):
+                vision = ds4_vision_model(mmproj)
+                names = list(vision["files"])
+                specs.append(("vision", models / base / "vision", names, names[0]))
+    elif family == "minimax":
+        main, draft = mm3_models()
+        for label in selected:
+            base = models / (MM3_DIR if label == MM3_DIR else MM3_COMPANIONS)
+            if label != MM3_DIR:
+                names = [n for n in MM3_VISION_FILES if n in main["files"]]
+                specs.append(("vision", base, names, "model-vision-00001-of-00001.safetensors"))
+            names = list(draft["files"])
+            specs.append(("DSpark", base / draft["folder"], names, "model-dspark-00001.safetensors"))
+    return specs
+
+
+def link_companions(models: Path, family: str, selected: dict, by_name: dict) -> tuple:
+    """Link optional known files from the same source tree; their names and model context select the destination."""
+    made = ready = 0
+    for kind, dest_dir, names, anchor in link_companion_specs(models, family, selected):
+        anchors = by_name.get(anchor, [])
+        if len(anchors) != 1:
+            if anchors:
+                warn(f"{kind}: {anchor} occurs in several directories; left alone")
+            continue
+        source_dir = anchors[0][0].parent
+        if anchor.endswith(".gguf") and not MI.is_gguf(anchors[0][1]):
+            warn(f"{kind}: {anchor} is not a GGUF file; left alone")
+            continue
+        for name in names:
+            choices = [(path, real) for path, real in by_name.get(name, []) if path.parent == source_dir]
+            if len(choices) != 1:
+                continue
+            created, why = MI.link_file(choices[0][0], dest_dir / name)
+            if why:
+                warn(why)
+            else:
+                ready += 1
+                if created:
+                    made += 1
+                    say(f"  linked {kind}: {dest_dir / name} -> {choices[0][1]}")
+    return made, ready
+
+
+def link_model(folder: str, models: Path, family: str, *, selected_model: Path | None = None,
+               selected_files: set[Path] | None = None) -> int:
+    """Link named published files after checking the model family in GGUF/EXL3 metadata only. Interactive setup
+    limits the scan to selected_files and one selected_model anchor."""
+    src = Path(folder).expanduser().resolve()
+    files = [(path, real) for path, real, _ in MI.files_under(src, only=selected_files)]
+    typed = [(path, real, linked_model_type(path)) for path, real in files
+             if path.suffix.lower() == ".gguf" or path.name == "config.json"]
+    anchors = [(path, real) for path, real, kind in typed if kind == family and
+               (selected_model is None or path == selected_model)]
+    if not anchors:
+        found = sorted({kind for _, _, kind in typed if kind})
+        warn(f"no {FAMILY_TITLE[family]} model in {src}" +
+             (f"; detected: {', '.join(FAMILY_TITLE[k] for k in found)}" if found else
+              "; no recognized GGUF header or EXL3 config.json"))
+        return 1
+    catalog = [e for e in import_catalog(models) if link_catalog_family(e["label"], family)]
+    by_label, by_name = {}, {}
+    for e in catalog:
+        by_label.setdefault(e["label"], []).append(e)
+    for path, real in files:
+        by_name.setdefault(path.name, []).append((path, real))
+    selected = {}
+    for anchor, _ in anchors:
+        candidates = [label for label, entries in by_label.items()
+                      if any(Path(e["rel"]).name == anchor.name for e in entries)]
+        if not candidates:
+            continue
+        names = {path.name for path, _ in files if path.parent == anchor.parent}
+        score = {label: sum(Path(e["rel"]).name in names for e in by_label[label]) for label in candidates}
+        best = max(score.values())
+        candidates = [label for label in candidates if score[label] == best]
+        hinted = [label for label in candidates if label.split("/")[-1] == anchor.parent.name]
+        if len(hinted) == 1:
+            candidates = hinted
+        label = candidates[0] if len(candidates) == 1 else candidates[choose(
+            "Which downloaded variant?", [f"Files in {anchor.parent}:"],
+            [(name, None, None) for name in candidates], 0, False)]
+        selected[label] = anchor.parent
+    if not selected:
+        warn("the model type matches, but no published file names match; use Import Model for renamed files")
+        return 1
+    linked = ready = 0
+    for label, root in selected.items():
+        for e in by_label[label]:
+            name = Path(e["rel"]).name
+            choices = by_name.get(name, [])
+            nearby = [(path, real) for path, real in choices if path == root / name or root in path.parents]
+            choices = nearby or choices
+            if len(choices) != 1:
+                if choices:
+                    warn(f"{name}: found in several directories; left alone")
+                continue
+            dest = models / e["rel"]
+            made, why = MI.link_file(choices[0][0], dest)
+            if why:
+                warn(why)
+            else:
+                ready += 1
+                if made:
+                    linked += 1
+                    role = ("vision" if "/vision/" in e["rel"] or name.startswith("model-vision-") else
+                            "MTP" if name.startswith("mtp-") else "model")
+                    say(f"  linked {role}: {dest} -> {choices[0][1]}")
+    extra_linked, extra_ready = link_companions(models, family, selected, by_name)
+    linked += extra_linked
+    ready += extra_ready
+    ok(f"{linked} symbolic link(s) created, {ready - linked} already linked in {models}; "
+       "model type checked, size and SHA-256 not checked")
+    say("  Keep the source files in place; select the model's variant in the list to continue setup.")
+    return 0 if ready else 1
 
 
 def file_url(m: dict, name: str) -> str:
@@ -3221,7 +3783,7 @@ def model_step(a, models: Path, choice: tuple):
     elif kind == "local":
         shards, quant, d = shard_set(what), quant_of(what), what.parent
         for s in shards:
-            why = incomplete(s)
+            why = None if MI.is_linked(s) else incomplete(s)
             if why:
                 fail(f"{s.name}: {why}", f"finish copying or downloading it, then run {ME} again")
         if quant not in glm_downloads():
@@ -3264,6 +3826,9 @@ def drafter_step(models: Path) -> Path:
     """The DFlash2 drafter's file in the models folder (GLM-5.3-Flash-DFlash2/): downloaded and its sha256 checked
     unless it is there already."""
     dst = models / "GLM-5.3-Flash-DFlash2" / DFLASH["file"]
+    if MI.is_linked(dst):
+        ok(f"the DFlash2 drafter: {dst} (linked from your files)")
+        return dst
     size = dst.stat().st_size if dst.exists() else 0
     if size == DFLASH["bytes"] and sha256_ok(dst, DFLASH["sha256"]):
         ok(f"the DFlash2 drafter: {dst}")
@@ -3741,6 +4306,31 @@ def compile_vision(pc, meta, llama: Path, src: str) -> bool:
     return VEXE.exists()
 
 
+def local_vision_step(a, pc: dict, meta: dict, llama: Path, local: dict) -> dict | None:
+    """Use the selected local mmproj and the model's own tokenizer without downloading other vision files."""
+    step(7, "images (the vision encoder)")
+    mmproj = local.get("vision")
+    if a.no_vision or mmproj is None:
+        ok("pictures: off (--no-vision)" if a.no_vision else "pictures: no vision file selected")
+        return None
+    if not mmproj.is_file():
+        fail(f"{mmproj} is missing", "keep the source files in place and run the setup again")
+    if not vision_encoder_ready(a, pc, meta, llama):
+        return None
+    model = local["model"]
+    if gguf_head(model)[0] in GLM_ARCHS:
+        # The pinned vision library needs only the tokenizer and does not know
+        # GLM's text architecture. Keep the selected model untouched (also when
+        # linked) and export its vocabulary under a known, vocab-only arch.
+        from vision_vocab import write_glm_vocab
+        try:
+            model = write_glm_vocab(model, model.parent / "vision" / "maya-vision-vocab.gguf")
+        except (OSError, ValueError) as e:
+            fail(f"the vision vocabulary could not be exported: {e}")
+    ok(f"pictures: ON - {mmproj.name} linked from the selected directory")
+    return {"exe": str(VEXE), "mmproj": str(mmproj), "model": str(model), "gpu": True}
+
+
 def vision_step(a, pc, meta, llama: Path, d: Path, quant: str) -> dict | None:
     """The config's "vision" entry - the image encoder and its files - or None (images off).  The server starts the
     encoder only while a request's new pictures are encoded, in GPU memory the model lends it, and measures on the
@@ -3892,8 +4482,19 @@ def glm_config_path(pc: dict, quant: str) -> Path:
     return ROOT / f"maya-{quant.lower()}{({'hip': '-hip', 'metal': '-metal'}.get(pc.get('backend'), ''))}.json"
 
 
+def glm_setup_config_path(pc: dict, quant: str, linked_files: dict | None = None) -> Path:
+    """Use the same local-model config for the context plan and the saved settings."""
+    if linked_files is None:
+        return glm_config_path(pc, quant)
+    legacy = glm_config_path(pc, quant)
+    if (read_json(legacy).get("installer") or {}).get("gguf") == str(linked_files["model"]):
+        return legacy
+    return glm_config_path(pc, linked_files["folder"].name)
+
+
 def write_config(a, pc, meta, pack: Path, quant: str, ctx: int, models: Path, vision: dict | None,
-                 choice: tuple | None = None, dflash: Path | None = None, gguf: Path | None = None) -> Path:
+                 choice: tuple | None = None, dflash: Path | None = None, gguf: Path | None = None,
+                 *, linked_files: dict | None = None) -> Path:
     step(8, "the configuration and the start script")
     port = a.port or 8080
     metal = pc.get("backend") == "metal"
@@ -3975,7 +4576,7 @@ def write_config(a, pc, meta, pack: Path, quant: str, ctx: int, models: Path, vi
         env = {**hip_env, **env}
     if env:
         cfg["env"] = env
-    cfg_path = glm_config_path(pc, quant)
+    cfg_path = glm_setup_config_path(pc, quant, linked_files)
     old_cfg = read_json(cfg_path)
     # the server's own settings from the config before (the address it listens on, its API key, ...): kept, as the
     # DeepSeek, MiniMax and Qwen setups keep them - a GLM setup run again dropped them; --host / --api-key given now win
@@ -4022,6 +4623,9 @@ def write_config(a, pc, meta, pack: Path, quant: str, ctx: int, models: Path, vi
                         **({"model_dir": str(choice[1])} if choice and choice[0] == "exl3" else {}),
                         **({"one_gpu_drafting": drafting} if drafting is not None else {}),
                         "written": time.strftime("%Y-%m-%d %H:%M")}
+    if linked_files is not None:
+        cfg["installer"].update({"local_drafter": str(linked_files["drafter"]) if linked_files.get("drafter") else None,
+                                  "local_vision": str(linked_files["vision"]) if linked_files.get("vision") else None})
     if drafting is not None:
         ok(f"one-GPU drafting (the MTP block): {'on' if drafting['on'] else 'off'} until the speed calibration "
            f"measures it here (about {drafting['outside'] * 100:.0f}% of the experts would stay outside GPU memory)")
@@ -4485,11 +5089,13 @@ def calibrate_ds4_config(cfg_path: Path) -> bool:
 
 
 def drafter_file(cfg: dict) -> Path | None:
-    """The DFlash2 drafter this config drafts with (--dflash), else the one a setup downloaded into its models folder
-    when it is there; None: no drafter on this PC."""
+    """The configured DFlash2 drafter, its saved local selection, or the downloaded default when it exists."""
     args = cfg.get("args") or []
     if "--dflash" in args[:-1]:
         return Path(args[args.index("--dflash") + 1])
+    local = (cfg.get("installer") or {}).get("local_drafter")
+    if local:
+        return Path(local) if Path(local).is_file() else None
     models = (cfg.get("installer") or {}).get("models_dir")
     f = Path(models) / "GLM-5.3-Flash-DFlash2" / DFLASH["file"] if models else None
     return f if f is not None and f.is_file() else None
@@ -5811,8 +6417,8 @@ def set_up(a, prev: dict) -> Path | None:
     family = choose_family(a, prev)
     S.model_named(FAMILY_TITLE[family])
     check_parallel(a, family)
-    if config_family(prev) != family:
-        prev = next((c for c in map(read_json, configs()) if config_family(c) == family and
+    if setup_family(prev) != family:
+        prev = next((c for c in map(read_json, configs()) if setup_family(c) == family and
                      c.get("backend", "cuda") == a.backend), {})
     if family == "deepseek":
         return set_up_ds4(a, prev)
@@ -5823,15 +6429,18 @@ def set_up(a, prev: dict) -> Path | None:
     inst = prev.get("installer") or {}
     prev_args = prev.get("args") or []
     prev_ctx = int(prev_args[prev_args.index("--max-context") + 1]) if "--max-context" in prev_args[:-1] else None
-    pc = check_pc(a)                                   # 1
-    metal = pc["backend"] == "metal"
-    step(2, "your choices")                            # 2
     # the models folder: --models-dir, else the one set up before (a config from before the option has its data
     # folder, whose models/ held the downloads), else Maya-data/models next to this folder
     models = (Path(a.models_dir).expanduser().resolve() if a.models_dir else
               Path(inst["models_dir"]) if inst.get("models_dir") else
               Path(inst["data_dir"]) / "models" if inst.get("data_dir") else ROOT.parent / "Maya-data" / "models")
-    choice = choose_model(a, models, inst)
+    choice = choose_model(a, models, inst, family)
+    linked = choice[1] if choice[0] == "linked" else None
+    if linked is not None:
+        choice = "local", linked["model"]
+    pc = check_pc(a)                                   # 1
+    metal = pc["backend"] == "metal"
+    step(2, "your choices")                            # 2
     if choice[0] == "download" and choice[1] in G53_MODELS:   # (GLM-5.3: "GLM-5.3 (744B) · UD-IQ2_M")
         ok(f"model: {G53.LABEL} · {Q.glm53_quant(choice[1])}, in {download_dir(models, choice[1])}")
     elif choice[0] == "download":
@@ -5839,7 +6448,7 @@ def set_up(a, prev: dict) -> Path | None:
     else:
         ok(f"model: {choice[1]} (yours)")
     if g53_choice(choice):                             # GLM-5.3 (744B): the contexts its cache fits on these GPUs
-        plan = g53_cache_plan(a, pc, choice)           # (as the config will run: write_config's)
+        plan = g53_cache_plan(a, pc, choice, **({"linked_files": linked} if linked is not None else {}))
         contexts = g53_contexts(pc, **plan)
         # (a unified-memory APU: the largest context that keeps the whole model in memory - --context still wins)
         rec, line = g53_apu_context(pc, plan, choice[1] if choice[0] == "download" else quant_of(Path(choice[1])),
@@ -5851,10 +6460,13 @@ def set_up(a, prev: dict) -> Path | None:
             warn(f"a {context_label(ctx)} context's cache pushes experts to the SSD on this PC; "
                  f"{context_label(rec)} keeps the whole model in memory")
     else:
-        ctx = choose_context(a, prev_ctx, recommended=recommended_context(choice, pc))
+        ctx = choose_context(a, prev_ctx, GLM_FLASH_CONTEXTS, recommended=recommended_context(choice, pc))
     ok(f"context: {ctx} tokens")
-    draft = choose_draft(a, pc, inst)
-    ok("drafting: " + ("a DFlash2 drafter (downloaded with the model)" if draft == "dflash2" else "the MTP block"))
+    draft = ("dflash2" if linked.get("drafter") else "mtp") if linked is not None else choose_draft(a, pc, inst)
+    if linked is not None and linked.get("drafter"):
+        ok(f"drafting: selected DFlash2 drafter {linked['drafter'].name}")
+    else:
+        ok("drafting: " + ("a DFlash2 drafter (downloaded with the model)" if draft == "dflash2" else "the MTP block"))
     llama = tools_step(a)                              # 3
     meta = build_step(a, pc, llama)                    # 4
     mixed_builds(a, pc, llama, "maya")                 # (an NVIDIA card beside an AMD GPU: its engine too)
@@ -5871,15 +6483,17 @@ def set_up(a, prev: dict) -> Path | None:
         have = g53_memory_gb(pc)                       # (neutral memory guidance, no speeds)
         (ok if have is not None and have >= g53_figures(quant)[0] else warn)(
             f"{G53.SHOWN}: {g53_memory_note(pc, quant)}")
-    dflash = drafter_step(models) if draft == "dflash2" else None
+    dflash = linked.get("drafter") if linked is not None else drafter_step(models) if draft == "dflash2" else None
     pack = metal_tokenizer_step(a, d, shards, quant) if metal else pack_step(a, d, shards, llama, quant)       # 6
     if dsa:
         step(7, "images (the vision encoder)")
         ok(f"{G53.SHOWN}: text only (the model has no vision tower)")
         vision = None
     else:
-        vision = vision_step(a, pc, meta, llama, d, quant)  # 7
-    cfg_path = write_config(a, pc, meta, pack, quant, ctx, models, vision, choice, dflash, shards[0] if metal else None)   # 8
+        vision = (local_vision_step(a, pc, meta, llama, linked) if linked is not None else
+                  vision_step(a, pc, meta, llama, d, quant))  # 7
+    cfg_path = write_config(a, pc, meta, pack, quant, ctx, models, vision, choice, dflash, shards[0] if metal else None,
+                            **({"linked_files": linked} if linked is not None else {}))   # 8
     if not metal:                                      # (the Mac engine does not project a direction)
         ablate_step(cfg_path, "glm-dsa" if dsa else "glm", models)
     if dflash is not None and metal:                   # (the speed calibration is CUDA's: on a Mac the choice is yours)
@@ -5932,7 +6546,7 @@ def ds4_maya_published(quant: str) -> bool:
     return bool(q.get("files"))
 
 
-def ds4_gguf_model(quant: str) -> dict:
+def ds4_gguf_model(quant: str, *, allow_missing: bool = False) -> dict | None:
     """A GGUF of DeepSeek as a MODELS entry (offer_download's form): its shards, sizes, sha256, repo folder - unsloth's,
     Maya's (the Engram tables in its own shards) or orcarouter's abliterated one ("gated": its download sends a token) -
     and "earlier": the layouts its files had before, each in the same form (ds4_earlier)."""
@@ -5942,6 +6556,8 @@ def ds4_gguf_model(quant: str) -> dict:
         ab = man.get("abliterated") or {}
         q = (ab.get("quants") or {}).get(DS4_QUANTS[quant]) or {}
         if not q.get("files"):
+            if allow_missing:
+                return None
             fail(f"{DS4_GGUF_MANIFEST} is missing or damaged", "restore it (git checkout tools/ds4/download_gguf.json)")
         about, repo, revision = (f"{ab.get('name', DS4 + '-abliterated')} {DS4_QUANTS[quant]}, orcarouter's abliterated "
                                  f"model as GGUFs ({q.get('about', 'the experts in 2-4 bits')}; its shard 2, the n-gram "
@@ -5953,6 +6569,8 @@ def ds4_gguf_model(quant: str) -> dict:
         my = man.get("maya") or {}
         q = (my.get("quants") or {}).get(DS4_QUANTS[quant]) or {}
         if not q.get("files"):
+            if allow_missing:
+                return None
             fail(f"{DS4} {DS4_QUANTS[quant]} is not published yet",
                  f"set up unsloth's GGUF meanwhile: {ME} --setup --model {DS4} --ds4-quant gguf-q8")
         about, repo, revision = (f"{DS4} {DS4_QUANTS[quant]}, Maya's quant ({q.get('about', 'the experts in 2-3 bits')})",
@@ -5960,6 +6578,8 @@ def ds4_gguf_model(quant: str) -> dict:
     else:
         q = (man.get("quants") or {}).get(DS4_QUANTS[quant]) or {}
         if not q.get("files"):
+            if allow_missing:
+                return None
             fail(f"{DS4_GGUF_MANIFEST} is missing or damaged", "restore it (git checkout tools/ds4/download_gguf.json)")
         about, repo, revision = (f"{DS4} as unsloth's {DS4_QUANTS[quant]} GGUF ("
                                  + (q.get("about") or f"dense weights {'BF16' if quant == 'gguf-q8' else 'Q8_0'}, "
@@ -6308,7 +6928,7 @@ def ds4_vision_step(a, pc: dict, d: Path, mmproj: bool = False, v: Path | None =
     return True
 
 
-def choose_ds4_quant(a, prev: dict) -> str:
+def choose_ds4_quant(a, prev: dict) -> str | dict:
     """--ds4-quant, else the one set up before, else asked (the GGUF at Q8 recommended)."""
     if getattr(a, "ds4_quant", None):
         return ds4_abl_recommended(getattr(a, "backend", None) == "hip") if a.ds4_quant == DS4_ABL_ALIAS else a.ds4_quant
@@ -6382,14 +7002,15 @@ def choose_ds4_quant(a, prev: dict) -> str:
                            "VRAM + RAM plus the 161 GB n-gram tables read from the SSD; for PCs with about 270 GB or more of "
                            "VRAM + RAM - below that it reads experts from the disk and gets slow")
     label = {k: (Q.shown("deepseek", k, gb.get(k)), about[k]) for k in DS4_QUANTS}
-    pick = choose(f"Which files of {DS4}?", ["The GGUFs run on any NVIDIA GPU from Volta (V100) on and on AMD, whatever "
-                                             "the memory: the experts that do not", "fit in VRAM are read from RAM and "
-                                             "the SSD. The EXL3 quants need a V100 or newer, or AMD, and "
-                                             f"~{DS4_EXL3['exl3-2.25']['memory_gb']} / ~230 / ~280 GB of VRAM + RAM:"],
-                  [(label[k][0], "recommended" if k == rec else
-                    "abliterated: fits this PC" if k == abl else None, label[k][1]) for k in keys],
-                  keys.index(default), a.yes or a.check)
-    return keys[pick]
+    pick = choose_with_add(a, f"Which files of {DS4}?",
+                           ["The GGUFs run on any NVIDIA GPU from Volta (V100) on and on AMD, whatever "
+                            "the memory: the experts that do not", "fit in VRAM are read from RAM and "
+                            "the SSD. The EXL3 quants need a V100 or newer, or AMD, and "
+                            f"~{DS4_EXL3['exl3-2.25']['memory_gb']} / ~230 / ~280 GB of VRAM + RAM:"],
+                           [(label[k][0], "recommended" if k == rec else
+                             "abliterated: fits this PC" if k == abl else None, label[k][1]) for k in keys],
+                           keys.index(default), a.yes or a.check, setup_models_dir(a, prev), "deepseek")
+    return pick if isinstance(pick, dict) else keys[pick]
 
 
 def ds4_memory_gb(quant: str) -> float:
@@ -6777,7 +7398,7 @@ def ds4_model_step(a, d: Path, m: dict, announce: bool = True):
 
 def ds4_pack_step(a, d: Path, gguf: bool = False, announce: bool = True, engram: Path | None = None,
                   files: list | None = None, drafter: Path | None = None, without: list | None = None,
-                  vision_dir: Path | None = None) -> Path:
+                  vision_dir: Path | None = None, local_only: bool = False, linked_files: dict | None = None) -> Path:
     """tools/ds4/pack.py's pack in <model>/maya-ds4: the geometry, where every tensor sits in the safetensors (read
     in place), the Engram hash tables and the tokenizer - built again when its tools or the model's files changed, or
     (a GGUF) when the drafter or the vision tower arrived after it.  announce=False: no step heading (step 7 adds the
@@ -6791,14 +7412,19 @@ def ds4_pack_step(a, d: Path, gguf: bool = False, announce: bool = True, engram:
     tools = S.source_hash(DS4_GGUF_PACK_TOOLS if gguf else DS4_PACK_TOOLS)
     need = ("ds4.txt", "tensors.txt", "engram.bin", "tokenizer/vocab.json", "tokenizer/chat_template.jinja")
     shards = list(files) if gguf and files else ds4_shards(d)
+    local = {role: str(linked_files[role]) for role in ("drafter", "vision") if linked_files and linked_files.get(role)
+             and (role != "vision" or not a.no_vision)}
     if gguf and engram is not None:                    # (v1.1.16's Maya-S: its Engram tables are beside it)
         shards += sorted(engram.glob("*.gguf"))
-    drafter_new = gguf and (drafter or d.parent / "dspark" / "dspark.json").is_file() and not CDS.has_drafter(
+    tracked = shards + [Path(p) for p in local.values()]
+    drafter_new = not local_only and gguf and (drafter or d.parent / "dspark" / "dspark.json").is_file() and not CDS.has_drafter(
         {"args": ["--pack", str(pack)]})               # (the drafter arrived after the pack was built)
-    vision_new = (gguf and (ds4_vision_dir(d) / "vision.json").is_file() and not ds4_pack_has_vision(pack)) or (
-        not gguf and vision_dir is not None and not ds4_pack_tower(pack))
+    vision_new = not local_only and ((gguf and (ds4_vision_dir(d) / "vision.json").is_file() and not ds4_pack_has_vision(pack)) or (
+        not gguf and vision_dir is not None and not ds4_pack_tower(pack)))
     if not a.repack and read_json(pack / PACK_SOURCES).get("tools") == tools and not drafter_new and \
-            not vision_new and all((pack / f).exists() for f in need) and pack_stale(pack, shards) is None:
+            not vision_new and read_json(pack / PACK_SOURCES).get("local_only", False) == local_only and \
+            read_json(pack / PACK_SOURCES).get("local_companions", {}) == local and \
+            all((pack / f).exists() for f in need) and pack_stale(pack, tracked) is None:
         ok(f"pack already built: {pack}")
         return pack
     if not os.access(d, os.W_OK):
@@ -6807,25 +7433,29 @@ def ds4_pack_step(a, d: Path, gguf: bool = False, announce: bool = True, engram:
         "Engram hash tables and the")
     say("  tokenizer (about a minute) ...")
     run([sys.executable, str(ROOT / "tools" / "ds4" / ("pack_gguf.py" if gguf else "pack.py")), "--model", str(d),
-         "--out", str(pack)] + (["--vision", str(ds4_vision_dir(d))] if gguf else
+         "--out", str(pack)] + (["--vision", local["vision"]] if "vision" in local else
+                                ["--vision", str(ds4_vision_dir(d))] if gguf and not local_only else
                                 ["--vision", str(vision_dir)] if vision_dir is not None else []) +
         (["--engram", str(engram)] if gguf and engram is not None else []) +
-        (["--drafter", str(drafter)] if gguf and drafter is not None else []) +
+        (["--drafter", local["drafter"]] if "drafter" in local else
+         ["--drafter", str(drafter)] if gguf and drafter is not None else []) +
         (["--shards"] + [Path(f).name for f in files] if gguf and files else []) +
-        (["--without"] + list(without) if gguf and without else []))
+        (["--without"] + list(without) if gguf and without else []) + (["--no-companions"] if local_only else []))
     missing = [f for f in need if not (pack / f).exists()]
     if missing:
         fail(f"the pack builder did not write {pack / missing[0]}", "the reason is in the messages above")
-    stamp_pack(pack, shards)
+    stamp_pack(pack, tracked)
     rec = read_json(pack / PACK_SOURCES)
     rec["tools"] = tools
+    rec["local_only"] = local_only
+    rec["local_companions"] = local
     (pack / PACK_SOURCES).write_text(json.dumps(rec, indent=1), encoding="utf-8")
     ok(f"pack: {pack}")
     return pack
 
 
 def write_config_ds4(a, pc: dict, meta: dict, pack: Path, ctx: int, models: Path, d: Path,
-                     quant: str = "exl3", vision: bool | None = None) -> Path:
+                     quant: str = "exl3", vision: bool | None = None, *, linked_files: dict | None = None) -> Path:
     """maya-ds4.json and run-maya-ds4.sh.  A setup again keeps what the config before says that this one does not
     ask: the engine settings below, the thinking level and sampling, where the server listens and its key.  vision:
     whether the engine runs the vision tower (default: the EXL3 quant's own; a GGUF's when its pack has one)."""
@@ -6833,6 +7463,8 @@ def write_config_ds4(a, pc: dict, meta: dict, pack: Path, ctx: int, models: Path
     port = a.port or 8080
     hip = pc.get("backend") == "hip"
     cfg_path = ROOT / ("maya-ds4-hip.json" if hip else "maya-ds4.json")
+    if linked_files is not None:
+        cfg_path = glm_config_path(pc, d.name)
     old = read_json(cfg_path)
     # --tp is the tensor-parallel group: two equal GPUs per group (a GPU without an equal neighbour runs
     # its layers alone).  On one GPU that group must be the GPU itself: with --tp 2 the prompt path falls
@@ -6877,7 +7509,8 @@ def write_config_ds4(a, pc: dict, meta: dict, pack: Path, ctx: int, models: Path
            "engine; --vram-reserve-mib changes it)")
     cfg = {"exe": str(DS4_EXE), "args": args, "cwd": str(ROOT), "tokenizer": str(pack / "tokenizer"),
            **({"backend": "hip"} if hip else {}),
-           "model_name": DS4_ABL_MODEL_NAME if quant in DS4_ABL else DS4_MODEL_NAME,
+           "model_name": local_gguf_model_name(d) if linked_files is not None else
+                         DS4_ABL_MODEL_NAME if quant in DS4_ABL else DS4_MODEL_NAME,
            "gpu": [g["index"] for g in pc["gpus"]],
            "sampling": dict(DS4_SAMPLING), "reasoning_effort": DS4_EFFORT,   # (the model's own, every setup)
            "lib_dirs": meta.get("lib_dirs") or old.get("lib_dirs") or [], "port": port}
@@ -6913,6 +7546,10 @@ def write_config_ds4(a, pc: dict, meta: dict, pack: Path, ctx: int, models: Path
     cfg["log"] = str(cfg_path.with_suffix(".log"))
     cfg["installer"] = {"family": "deepseek", "models_dir": str(models), "quant": DS4, "ds4_quant": quant,
                         "model_dir": str(d), "written": time.strftime("%Y-%m-%d %H:%M")}
+    if linked_files is not None:
+        cfg["installer"].update(quant=d.name, gguf=str(linked_files["model"]),
+                                 local_drafter=str(linked_files["drafter"]) if linked_files.get("drafter") else None,
+                                 local_vision=str(linked_files["vision"]) if linked_files.get("vision") else None, own=True)
     cal = saved_calibration(cfg, any_context=True)     # --tp and the CPU threads tuned on this PC for this quant before
     if cal is not None and isinstance(cal.get("args"), dict):
         had = [f for f in CAL4.KEYS if f in (old.get("args") or [])[:-1] and   # (the config before's own values win,
@@ -6933,6 +7570,49 @@ def write_config_ds4(a, pc: dict, meta: dict, pack: Path, ctx: int, models: Path
     return cfg_path
 
 
+def set_up_linked_gguf(a, prev: dict, linked: dict, family: str) -> Path:
+    """Set up local DeepSeek/MiniMax weights without substituting catalog files or companions."""
+    deepseek = family == "deepseek"
+    d, files = linked["folder"], linked["files"]
+    pc = check_pc(a, family, gguf=True)                # 1
+    step(2, "your choices")
+    ok(f"model: {linked['model']} (linked local GGUF)")
+    before = prev.get("args") or []
+    old_ctx = int(flag_value(before, "--max-context") or 0) or None
+    par = getattr(a, "parallel", None) or int(flag_value(before, "--parallel") or 1)
+    ram = mem_gb()[0]
+    vram = sum(g.get("vram_gb", 0) for g in pc["gpus"])
+    # A conservative recommendation only; this is not a size/integrity check.
+    need = sum(p.stat().st_size for p in files) / 1e9
+    rec = (ds4_recommended_context(vram, ram, need, len(pc["gpus"]), par) if deepseek else
+           mm3_recommended_context(vram, ram, mm3_kv_format(before), need, par, apu_kind(pc["gpus"])))
+    ctx = choose_context(a, old_ctx, DS4_CONTEXTS if deepseek else MM3_CONTEXTS, rec)
+    llama = tools_step(a, PY_PACKAGES + ["tokenizers"]) if deepseek else tools_step(a)  # 3
+    meta = build_step(a, pc, llama, "maya-ds4" if deepseek else "maya-mm3")          # 4
+    step(5, "the linked model files")
+    if any(not p.is_file() for p in files):
+        fail("a linked model file is missing", "keep the downloaded source files in place")
+    ok(f"{len(files)} model file(s); size and SHA-256 not checked")
+    pack = (ds4_pack_step(a, d, gguf=True, files=files, local_only=True, linked_files=linked) if deepseek else
+            mm3_pack_step(a, d, files, gguf=True, linked_files=linked))             # 6
+    step(7, "images (the vision tower)")
+    ok("pictures: ON (selected vision GGUF)" if not a.no_vision and
+       (ds4_pack_has_vision(pack) if deepseek else mm3_pack_has_vision(pack)) else
+       "pictures: off")
+    if deepseek:
+        path = write_config_ds4(a, pc, meta, pack, ctx, d.parent, d, "local-gguf", linked_files=linked)
+    else:
+        path = write_config_mm3(a, pc, meta, pack, ctx, d.parent, d, "local-gguf", own=True, linked_files=linked)
+    ablate_step(path, family, d.parent)
+    if linked.get("drafter") and CDS.has_drafter(read_json(path)):
+        how = drafting_choice(a, "The DSpark drafter" if deepseek else "MiniMax's DSpark drafter", "10-30")
+        if how == "measure":
+            speed_calibration(path)
+        else:
+            keep_drafting(path, how == "on")
+    return path
+
+
 def set_up_ds4(a, prev: dict) -> Path | None:
     """DeepSeek-V4.1-Flash-1017's steps 1-8: the PC (Linux, RTX 30 / A100 or newer, the memory), the context, its
     engine (build/maya-ds4), the files, the pack, the config.  No tuning: the engine balances its own split."""
@@ -6940,6 +7620,8 @@ def set_up_ds4(a, prev: dict) -> Path | None:
     prev_args = prev.get("args") or []
     prev_ctx = int(prev_args[prev_args.index("--max-context") + 1]) if "--max-context" in prev_args[:-1] else None
     quant = choose_ds4_quant(a, prev)
+    if isinstance(quant, dict):
+        return set_up_linked_gguf(a, prev, quant, "deepseek")
     gguf = quant not in DS4_EXL3
     pc = check_pc(a, "deepseek", gguf, quant)          # 1
     step(2, "your choices")                            # 2
@@ -7214,7 +7896,7 @@ def mm3_memory_gb(quant: str, own: Path | None = None) -> float:
     return MM3_MEMORY_GB if quant == "exl3" else float(mm3_gguf_entry(quant)["memory_gb"])
 
 
-def choose_mm3_quant(a, prev: dict) -> str:
+def choose_mm3_quant(a, prev: dict) -> str | dict:
     """--mm3-quant, else the one set up before, else asked among those this PC runs: Maya's GGUF quants once published
     and the EXL3 quant - by this PC's memory the one recommended."""
     if getattr(a, "mm3_quant", None):
@@ -7229,7 +7911,7 @@ def choose_mm3_quant(a, prev: dict) -> str:
     # KV cache at the default context in the engine's format (mm3_kv_gb)
     rec = fit_recommendation({k: mm3_memory_gb(k) for k in keys}, setup_gpus(a), total,
                              mm3_kv_gb(MM3_DEFAULT_CONTEXT, MM3_KV_FORMAT), "exl3")
-    if len(keys) == 1:
+    if len(keys) == 1 and (a.yes or a.check):
         return keys[0]
     gb = {k: mm3_models()[0]["download_gb"] if k == "exl3" else mm3_gguf_entry(k)["download_gb"] for k in keys}
     about = {"exl3": f"Mia-AiLab's quant: pictures and DSpark drafting; ~{MM3_MEMORY_GB} GB of VRAM + RAM",
@@ -7239,11 +7921,11 @@ def choose_mm3_quant(a, prev: dict) -> str:
     label = {k: (Q.shown("minimax", k, gb[k]), about[k] + ("" if k == "exl3" else pics)) for k in keys}
     order = sorted(keys, key=lambda k: k != rec)
     default = before if before in order else rec
-    pick = choose(f"Which files of {MM3}?", ["Maya's GGUF quants and the EXL3 quant run on NVIDIA from V100 on and "
-                                             "on AMD:"],
-                  [(label[k][0], "recommended" if k == rec else None, label[k][1]) for k in order],
-                  order.index(default), a.yes or a.check)
-    return order[pick]
+    pick = choose_with_add(a, f"Which files of {MM3}?",
+                           ["Maya's GGUF quants and the EXL3 quant run on NVIDIA from V100 on and on AMD:"],
+                           [(label[k][0], "recommended" if k == rec else None, label[k][1]) for k in order],
+                           order.index(default), a.yes or a.check, setup_models_dir(a, prev), "minimax")
+    return pick if isinstance(pick, dict) else order[pick]
 
 
 def mm3_dir(a, models: Path, prev: dict, quant: str = "exl3") -> Path:
@@ -7382,7 +8064,8 @@ def mm3_companions_step(a, d: Path, hip: bool) -> Path | None:
     return c
 
 
-def mm3_pack_step(a, d: Path, files: list, gguf: bool = False, companions: Path | None = None) -> Path:
+def mm3_pack_step(a, d: Path, files: list, gguf: bool = False, companions: Path | None = None,
+                  *, linked_files: dict | None = None) -> Path:
     """tools/mm3/pack.py's pack in <model>/maya-mm3 (a GGUF's: pack_gguf.py's): the geometry, where every tensor sits in
     the safetensors / the GGUF's shards (read in place) and the tokenizer - built again when its tools or the model's
     files changed."""
@@ -7391,8 +8074,12 @@ def mm3_pack_step(a, d: Path, files: list, gguf: bool = False, companions: Path 
     tools = S.source_hash(MM3_GGUF_PACK_TOOLS if gguf else MM3_PACK_TOOLS)
     need = ("mm3.txt", "tensors.txt", "tokenizer/vocab.json", "tokenizer/chat_template.jinja")
     shards = [f for f in files if f.suffix == (".gguf" if gguf else ".safetensors")]
+    local = {role: str(linked_files[role]) for role in ("drafter", "vision") if linked_files and linked_files.get(role)
+             and (role != "vision" or not a.no_vision)}
+    tracked = shards + [Path(p) for p in local.values()]
     if not a.repack and read_json(pack / PACK_SOURCES).get("tools") == tools and \
-            all((pack / f).exists() for f in need) and pack_stale(pack, shards) is None:
+            read_json(pack / PACK_SOURCES).get("local_companions", {}) == local and \
+            all((pack / f).exists() for f in need) and pack_stale(pack, tracked) is None:
         ok(f"pack already built: {pack}")
         return pack
     if not os.access(d, os.W_OK):
@@ -7402,22 +8089,23 @@ def mm3_pack_step(a, d: Path, files: list, gguf: bool = False, companions: Path 
     if gguf:
         run([sys.executable, str(ROOT / "tools" / "mm3" / "pack_gguf.py"), "--model", str(d), "--out", str(pack)] +
             (["--companions", str(companions)] if companions else ["--text-only"]) +
-            ["--shards"] + [f.name for f in shards])
+            ["--shards"] + [f.name for f in shards] + [v for role, path in local.items() for v in ("--" + role, path)])
     else:
         run([sys.executable, str(ROOT / "tools" / "mm3" / "pack.py"), "--model", str(d), "--out", str(pack)])
     missing = [f for f in need if not (pack / f).exists()]
     if missing:
         fail(f"the pack builder did not write {pack / missing[0]}", "the reason is in the messages above")
-    stamp_pack(pack, shards)
+    stamp_pack(pack, tracked)
     rec = read_json(pack / PACK_SOURCES)
     rec["tools"] = tools
+    rec["local_companions"] = local
     (pack / PACK_SOURCES).write_text(json.dumps(rec, indent=1), encoding="utf-8")
     ok(f"pack: {pack}")
     return pack
 
 
 def write_config_mm3(a, pc: dict, meta: dict, pack: Path, ctx: int, models: Path, d: Path,
-                     quant: str = "exl3", own: bool = False) -> Path:
+                     quant: str = "exl3", own: bool = False, *, linked_files: dict | None = None) -> Path:
     """maya-mm3.json and run-maya-mm3.sh (a Maya GGUF quant: maya-minimax-maya-xs.json - maya_quants.config_stem).  A
     setup again keeps what the config before says that this one does not ask: the engine settings below, the thinking
     level and sampling, where the server listens and its key - a GGUF quant's first config takes them from the EXL3
@@ -7496,7 +8184,8 @@ def write_config_mm3(a, pc: dict, meta: dict, pack: Path, ctx: int, models: Path
            "beside the engine)")
     cfg = {"exe": str(MM3_EXE), "args": args, "cwd": str(ROOT), "tokenizer": str(pack / "tokenizer"),
            **({"backend": "hip"} if hip else {}),
-           "model_name": MM3_MODEL_NAME, "gpu": [g["index"] for g in pc["gpus"]],
+           "model_name": local_gguf_model_name(d) if linked_files is not None else MM3_MODEL_NAME,
+           "gpu": [g["index"] for g in pc["gpus"]],
            # (the model's own, every setup - an EXL3 folder of the user's own: its generation_config.json's)
            "sampling": folder_sampling(d, MM3_SAMPLING) if own else dict(MM3_SAMPLING),
            "reasoning_effort": MM3_EFFORT,
@@ -7516,9 +8205,13 @@ def write_config_mm3(a, pc: dict, meta: dict, pack: Path, ctx: int, models: Path
         ok("kept from the config before: " + ", ".join(kept))
     cfg["log"] = str(cfg_path.with_suffix(".log"))
     cfg["installer"] = {"family": "minimax", "models_dir": str(models),
-                        "quant": MM3 if quant == "exl3" else MM3_QUANTS[quant], "mm3_quant": quant,
+                        "quant": d.name if linked_files is not None else MM3 if quant == "exl3" else MM3_QUANTS[quant], "mm3_quant": quant,
                         "model_dir": str(d), **({"own": True} if own else {}),
                         "written": time.strftime("%Y-%m-%d %H:%M")}
+    if linked_files is not None:
+        cfg["installer"].update(gguf=str(linked_files["model"]),
+                                 local_drafter=str(linked_files["drafter"]) if linked_files.get("drafter") else None,
+                                 local_vision=str(linked_files["vision"]) if linked_files.get("vision") else None)
     cfg_path.write_text(json.dumps(N.env_out(cfg), indent=1), encoding="utf-8")
     ok(f"config: {cfg_path}")
     ok(f"start script: {write_run_script(cfg_path, port)}")
@@ -7550,6 +8243,8 @@ def set_up_mm3(a, prev: dict) -> Path | None:
     prev_args = prev.get("args") or []
     prev_ctx = int(prev_args[prev_args.index("--max-context") + 1]) if "--max-context" in prev_args[:-1] else None
     quant = choose_mm3_quant(a, prev)
+    if isinstance(quant, dict):
+        return set_up_linked_gguf(a, prev, quant, "minimax")
     gguf = quant != "exl3"
     own = mm3_own_dir(a, quant)                        # --model-dir: an EXL3 folder of your own, not the pinned download
     need = mm3_memory_gb(quant, own)
@@ -7740,16 +8435,52 @@ def qwen_model_step(a, d: Path, quant: str = "q5_k_m", models: Path | None = Non
     return files
 
 
-def qwen_pack_step(a, d: Path, files: list, llama: Path, mtp_gguf: Path | None = None) -> Path:
+def qwen_local_model_step(local: dict) -> list[Path]:
+    """Use the selected local GGUF shards without comparing their size or SHA-256 to a download manifest."""
+    step(5, "the local Qwen model")
+    files = local["files"]
+    for path in files:
+        if not path.is_file():
+            fail(f"{path} is missing", "keep the source files in place and run the setup again")
+    if local.get("drafter") and not local["drafter"].is_file():
+        fail(f"{local['drafter']} is missing", "keep the source MTP file in place and run the setup again")
+    if linked_model_type(files[0]) != "qwen":
+        fail(f"{files[0].name} is not a Qwen GGUF")
+    ok(f"Qwen3.8-Flash-Next: {len(files)} local GGUF file(s) linked in {local['folder']}")
+    return files
+
+
+def qwen_local_ple(files: list[Path]) -> tuple[Path, int]:
+    """Find the disk-backed n-gram table by tensor name and report its bytes for memory guidance."""
+    from gguf_reader import GGUFFile
+    for path in files:
+        try:
+            for tensor in GGUFFile(path).tensors:
+                if tensor.name == "per_layer_token_embd.weight":
+                    return path, tensor.expected_bytes() or 0
+        except (OSError, ValueError, KeyError, struct.error) as exc:
+            fail(f"could not read {path.name}'s GGUF header: {exc}")
+    fail("the local Qwen GGUF has no per_layer_token_embd.weight n-gram table",
+         "select all shards of one Qwen3.8-Flash-Next quant")
+
+
+def qwen_local_vision_step(a, pc: dict, meta: dict, llama: Path, local: dict) -> dict | None:
+    """Use the selected mmproj file in place; only its GGUF type was checked when it was linked."""
+    return local_vision_step(a, pc, meta, llama, local)
+
+
+def qwen_pack_step(a, d: Path, files: list, llama: Path, mtp_gguf: Path | None = None,
+                   build_mtp: bool = True) -> Path:
     """tools/iq_pack.py's pack in <model>/pack (the index of every tensor, the small float weights, the tokenizer with
     the GGUF's chat template), and the MTP drafter built from the GGUF's NextN block (<pack>/mtp, tools/mtp_from_gguf.py;
     mtp_gguf: unsloth's separate MTP head) - built again when its tools or the model files changed."""
     step(6, "the pack (the engine's index of the model file) and the MTP drafter")
     pack = d / "pack"
     tools = S.source_hash(QWEN_PACK_TOOLS)
-    need = PACK_FILES + ("mtp/dense.txt", "mtp/experts.bin")
+    need = PACK_FILES + (("mtp/dense.txt", "mtp/experts.bin") if build_mtp else ())
+    sources = list(dict.fromkeys([*files, *([mtp_gguf] if mtp_gguf else [])]))
     if not a.repack and read_json(pack / PACK_SOURCES).get("tools") == tools and \
-            all((pack / f).exists() for f in need) and pack_stale(pack, files) is None:
+            all((pack / f).exists() for f in need) and pack_stale(pack, sources) is None:
         ok(f"pack already built: {pack}")
         return pack
     if not os.access(d, os.W_OK):
@@ -7764,13 +8495,14 @@ def qwen_pack_step(a, d: Path, files: list, llama: Path, mtp_gguf: Path | None =
     missing = [f for f in PACK_FILES if not (pack / f).exists()]
     if missing:
         fail(f"the pack builder did not write {pack / missing[0]}", "the reason is in the messages above")
-    say("  The MTP drafter from the model's NextN block (its 512 experts requantized to 2 bits for the drafts; a few "
-        "minutes) ...")
-    run([sys.executable, str(ROOT / "tools" / "mtp_from_gguf.py"), "--gguf", str(mtp_gguf or files[0]),
-         "--out", str(pack / "mtp")], env=env)
+    if build_mtp:
+        say("  The MTP drafter from the model's NextN block (its 512 experts requantized to 2 bits for the drafts; a few "
+            "minutes) ...")
+        run([sys.executable, str(ROOT / "tools" / "mtp_from_gguf.py"), "--gguf", str(mtp_gguf or files[0]),
+             "--out", str(pack / "mtp")], env=env)
     if QWEN_PROFILE.exists():                          # (the shipped ranking of the experts: which start in VRAM)
         shutil.copyfile(QWEN_PROFILE, pack / "expert-profile.bin")
-    stamp_pack(pack, files)
+    stamp_pack(pack, sources)
     rec = read_json(pack / PACK_SOURCES)
     rec["tools"] = tools
     (pack / PACK_SOURCES).write_text(json.dumps(rec, indent=1), encoding="utf-8")
@@ -7779,7 +8511,8 @@ def qwen_pack_step(a, d: Path, files: list, llama: Path, mtp_gguf: Path | None =
 
 
 def write_config_qwen(a, pc: dict, meta: dict, pack: Path, gguf: Path, ctx: int, models: Path, d: Path,
-                      vision: dict | None = None, quant: str = "q5_k_m", ple: Path | None = None) -> Path:
+                      vision: dict | None = None, quant: str = "q5_k_m", ple: Path | None = None,
+                      use_mtp: bool = True, local_drafter: Path | None = None) -> Path:
     """maya-cyber-frost.json (maya-cyber-frost-hip.json on AMD; unsloth's UD-IQ2_XS: maya-qwen-ud-iq2_xs.json) and its
     start script.  A setup again keeps what the config before says that this one does not ask: its engine settings,
     where the server listens and its key; the model's own sampling and thinking level every setup.  ple: the shard
@@ -7787,7 +8520,9 @@ def write_config_qwen(a, pc: dict, meta: dict, pack: Path, gguf: Path, ctx: int,
     step(8, "the configuration and the start script")
     port = a.port or 8080
     hip = pc.get("backend") == "hip"
-    cfg_path = ROOT / f"{Q.config_stem('qwen', quant)}{'-hip' if hip else ''}.json"
+    stem = ("maya-qwen-" + re.sub(r"[^a-z0-9_-]", "-", d.name.casefold())[:60]) if quant == "local" else \
+        Q.config_stem("qwen", quant)
+    cfg_path = ROOT / f"{stem}{'-hip' if hip else ''}.json"
     old = read_json(cfg_path)
     profile = pack / "expert-profile.bin"
     # the Qwen path: the pack, the model file for its native weights and its n-gram table, decode windows of up to 4
@@ -7795,22 +8530,27 @@ def write_config_qwen(a, pc: dict, meta: dict, pack: Path, gguf: Path, ctx: int,
     # chunks sized from the expert cache it lends them, the expert cache sized from the free VRAM
     args = ["--pack", str(pack), "--native", str(gguf), "--ple-gguf", str(ple or gguf), "--spec", "4", "--prefill",
             "auto", "--expert-cache", "auto", "--max-context", str(ctx), "--kv", QWEN_KV]
-    if quant == QWEN_UD:                               # (its n-gram table memory-mapped: the page cache, never loaded)
+    if quant in (QWEN_UD, "local"):                    # (the n-gram table is read in place from its GGUF shard)
         args += ["--ple-io", "mmap"]
     if profile.exists():
         args += ["--expert-profile", str(profile)]
     # (the engine's server needs the MTP drafter loaded - the setup always builds it; drafting off is --mtp-max-t 1)
-    if (pack / "mtp" / "dense.txt").exists():
+    if use_mtp and (pack / "mtp" / "dense.txt").exists():
         args += ["--mtp", str(pack / "mtp")]
     if vision:                                         # (pictures: GENI requests, each image's rows at its pad tokens)
         args.append("--vision")
     kept = keep_args(old.get("args") or [], args, ("--mtp-max-t", "--kv", "--vram-reserve-mib", "--pool-workers",
                                                    "--experts-from-gguf", "--ple-io"))
-    inst = {"family": "qwen", "quant": QWEN_UD_DIR if quant == QWEN_UD else QWEN, "qwen_quant": quant}
-    sampling, effort = Q.model_defaults({"installer": inst})   # (the model's own, every setup: its card's)
+    inst = {"family": "qwen", "quant": d.name if quant == "local" else QWEN_UD_DIR if quant == QWEN_UD else QWEN,
+            "qwen_quant": quant}
+    if quant == "local":
+        match = re.search(r"(?i)(?:^|[-_])((?:Q|IQ)\d+_[A-Z0-9_]+)(?=[-.])", gguf.name)
+        inst["local_quant"] = match.group(1).upper() if match else gguf.stem
+        inst["local_drafter"] = str(local_drafter) if local_drafter else None
+    sampling, effort = Q.model_defaults({"installer": inst})
     cfg = {"exe": str(EXE), "args": args, "cwd": str(ROOT), "tokenizer": str(pack / "tokenizer"),
            **({"backend": "hip"} if hip else {}),
-           "model_name": QWEN_UD_MODEL_NAME if quant == QWEN_UD else QWEN_MODEL_NAME,
+           "model_name": QWEN_UD_MODEL_NAME if quant in (QWEN_UD, "local") else QWEN_MODEL_NAME,
            "gpu": [g["index"] for g in pc["gpus"]],
            "sampling": sampling, "reasoning_effort": effort,
            "lib_dirs": meta.get("lib_dirs") or old.get("lib_dirs") or [], "port": port,
@@ -7975,7 +8715,23 @@ def qwen_vision_step(a, pc: dict, meta: dict, llama: Path, d: Path, gguf: Path,
     return {"exe": str(VEXE), "mmproj": str(files[0]), "model": str(gguf), "gpu": True}
 
 
-def choose_qwen_quant(a, prev: dict) -> str:
+def qwen_local_from_config(cfg: dict) -> dict | None:
+    """Restore a local Qwen selection so a later setup offers its files again."""
+    inst = cfg.get("installer") or {}
+    args = cfg.get("args") or []
+    if inst.get("qwen_quant") != "local" or "--native" not in args[:-1]:
+        return None
+    first = Path(args[args.index("--native") + 1])
+    files = shard_set(first)
+    if not all(path.is_file() for path in files):
+        return None
+    vision = (cfg.get("vision") or {}).get("mmproj")
+    drafter = inst.get("local_drafter")
+    return {"folder": Path(inst.get("model_dir") or first.parent), "model": first, "files": files,
+            "drafter": Path(drafter) if drafter else None, "vision": Path(vision) if vision else None}
+
+
+def choose_qwen_quant(a, prev: dict) -> str | dict:
     """Which Qwen files: --qwen-quant (or a --model id that names them), else asked - CYBER-FROST-3.8-PS's Q5_K_M or
     unsloth's UD-IQ2_XS of the base model; the files set up before are the default."""
     given = getattr(a, "qwen_quant", None)
@@ -7991,9 +8747,14 @@ def choose_qwen_quant(a, prev: dict) -> str:
                      f"head, the experts in about {m['memory_gb']:.0f} GB of VRAM and RAM together)" if q == QWEN_UD else
                      "Blackfrost-AI's cybersecurity fine-tune in peasantsmith's GGUF (Q5_K experts, all of them in about "
                      f"{m['memory_gb']:.0f} GB of VRAM and RAM together)"))
-    pick = choose("Which Qwen3.8-Flash-Next?", ["The files to set up:"], rows, QWEN_QUANTS.index(default),
-                  getattr(a, "yes", False))
-    return QWEN_QUANTS[pick]
+    local_before = qwen_local_from_config(prev)
+    if local_before:
+        rows.append((f"Local Qwen3.8-Flash-Next · {(prev.get('installer') or {}).get('local_quant') or local_before['model'].name}", None,
+                     f"Previously linked GGUF in {local_before['folder']}"))
+    pick = choose_with_add(a, "Which Qwen3.8-Flash-Next?", ["The files to set up:"], rows,
+                           len(QWEN_QUANTS) if local_before else QWEN_QUANTS.index(default), getattr(a, "yes", False),
+                           setup_models_dir(a, prev), "qwen")
+    return pick if isinstance(pick, dict) else local_before if local_before and pick == len(QWEN_QUANTS) else QWEN_QUANTS[pick]
 
 
 def set_up_qwen(a, prev: dict) -> Path | None:
@@ -8001,14 +8762,18 @@ def set_up_qwen(a, prev: dict) -> Path | None:
     the engine (build/maya), the file (pinned, sha256-checked), the pack and the MTP drafter, the config; then the
     drafter measured."""
     inst = prev.get("installer") or {}
-    quant = choose_qwen_quant(a, prev)
+    choice = choose_qwen_quant(a, prev)
+    local = choice if isinstance(choice, dict) else None
+    quant = "local" if local else choice
     if (inst.get("qwen_quant") or "q5_k_m") != quant:   # (the other Qwen files' setup before: its own config's answers)
         prev = next((c for c in map(read_json, configs()) if config_family(c) == "qwen" and
                      ((c.get("installer") or {}).get("qwen_quant") or "q5_k_m") == quant), {})
         inst = prev.get("installer") or inst
     prev_args = prev.get("args") or []
     prev_ctx = int(prev_args[prev_args.index("--max-context") + 1]) if "--max-context" in prev_args[:-1] else None
-    m = qwen_entry(quant)
+    ple, ple_bytes = qwen_local_ple(local["files"]) if local else (None, 0)
+    m = ({"memory_gb": (sum(p.stat().st_size for p in local["files"]) - ple_bytes) / 1e9}
+         if local else qwen_entry(quant))
     pc = check_pc(a, "qwen")                           # 1
     total, _ = mem_gb()
     vram = sum(g["vram_gb"] for g in pc["gpus"])
@@ -8016,28 +8781,36 @@ def set_up_qwen(a, prev: dict) -> Path | None:
         warn(f"{vram:.0f} GB of VRAM and {total:.0f} GB of RAM: below the ~{m['memory_gb']:.0f} GB that hold all of its "
              "experts - the engine reads the others from the SSD when they are routed (slower)")
     step(2, "your choices")                            # 2
-    ok(f"model: {Q.shown('qwen', quant, m['download_gb'])} - " +
-       ("unsloth's GGUF of Qwen3.8-Flash-Next " if quant == QWEN_UD else "a fine-tune of Qwen3.8-Flash-Next ") +
-       "(Qwen Community License 1.0: LICENSE.qwen-community-1.0; a Model-as-a-Service business needs Qwen's own license)")
+    if local:
+        ok(f"model: Qwen3.8-Flash-Next, local GGUF {local['model'].name} "
+           "(Qwen Community License 1.0; a Model-as-a-Service business needs Qwen's own license)")
+    else:
+        ok(f"model: {Q.shown('qwen', quant, m['download_gb'])} - " +
+           ("unsloth's GGUF of Qwen3.8-Flash-Next " if quant == QWEN_UD else "a fine-tune of Qwen3.8-Flash-Next ") +
+           "(Qwen Community License 1.0: LICENSE.qwen-community-1.0; a Model-as-a-Service business needs Qwen's own license)")
     rec = qwen_recommended_context(vram, vram + total < m["memory_gb"])
     ctx = choose_context(a, prev_ctx, QWEN_CONTEXTS, rec)
     ok(f"context: {ctx} tokens" + (" (recommended for this PC's VRAM)" if ctx == rec else "") +
        f"; its KV cache: {qwen_kv_gb(ctx):.1f} GB of VRAM")
     models = (Path(a.models_dir).expanduser().resolve() if a.models_dir else
               Path(inst["models_dir"]) if inst.get("models_dir") else ROOT.parent / "Maya-data" / "models")
-    d = qwen_dir(a, models, prev, quant)
+    d = local["folder"] if local else qwen_dir(a, models, prev, quant)
     ok(f"model folder: {d}")
     llama = tools_step(a)                              # 3
     meta = build_step(a, pc, llama)                    # 4
-    files = qwen_model_step(a, d, quant, models)       # 5
+    files = qwen_local_model_step(local) if local else qwen_model_step(a, d, quant, models)  # 5
     if files is None:
         return None
     ud = quant == QWEN_UD
-    pack = qwen_pack_step(a, d, files, llama, d / m["mtp"] if ud else None)   # 6
-    vision = qwen_vision_step(a, pc, meta, llama, d, files[0], models)       # 7
+    mtp = local.get("drafter") if local else d / m["mtp"] if ud else None
+    pack = qwen_pack_step(a, d, files, llama, mtp, build_mtp=bool(mtp) if local else True)  # 6
+    vision = qwen_local_vision_step(a, pc, meta, llama, local) if local else \
+        qwen_vision_step(a, pc, meta, llama, d, files[0], models)             # 7
     cfg_path = write_config_qwen(a, pc, meta, pack, files[0], ctx, models, d, vision, quant,
-                                 d / m["ngram"] if ud else None)                # 8
-    if "mtp_calibration" not in (read_json(cfg_path).get("installer") or {}) or a.calibrate:
+                                 ple if local else d / m["ngram"] if ud else None,
+                                 use_mtp=bool(mtp) if local else True,
+                                 local_drafter=mtp if local else None)        # 8
+    if (not local or mtp) and ("mtp_calibration" not in (read_json(cfg_path).get("installer") or {}) or a.calibrate):
         how = drafting_choice(a, "the MTP drafter", "10-40")
         if how != "measure":
             keep_drafting(cfg_path, how == "on")

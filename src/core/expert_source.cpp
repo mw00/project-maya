@@ -1203,12 +1203,12 @@ LoadStats load_experts_gguf(const std::string& gguf, uint8_t* dst, const strata:
     const auto t0 = std::chrono::steady_clock::now();
     std::atomic<int64_t> next{0};
     std::atomic<bool> bad{false};
-    // a layer's experts may sit in another shard of the model (native_experts.txt v3): a name beside `gguf`
+    // v3 names one shard per layer; v4 can place each role in a different shard beside `gguf`.
     const size_t cut = gguf.find_last_of("/\\");
     const std::string dir = cut == std::string::npos ? std::string() : gguf.substr(0, cut + 1);
-    auto file_of = [&](int64_t l) -> std::string {
-        if (lay.gguf_file.empty() || lay.gguf_file[(size_t) l].empty()) return gguf;
-        return dir + lay.gguf_file[(size_t) l];
+    auto file_of = [&](int64_t l, int r) -> std::string {
+        if (lay.gguf_file.empty() || lay.gguf_file[(size_t) (3 * l + r)].empty()) return gguf;
+        return dir + lay.gguf_file[(size_t) (3 * l + r)];
     };
     auto worker = [&]() {
         std::ifstream f;
@@ -1217,19 +1217,19 @@ LoadStats load_experts_gguf(const std::string& gguf, uint8_t* dst, const strata:
         for (;;) {
             const int64_t l = next.fetch_add(1);
             if (l >= lay.n_layers || bad) break;
-            const std::string name = file_of(l);
-            if (name != open_name) {
-                f.close();
-                f.clear();
-                f.open(name, std::ios::binary);
-                if (!f) { bad = true; return; }
-                open_name = name;
-            }
             const auto& fm = lay.fmt[(size_t) l];
             const uint64_t blob = lay.bytes[(size_t) l];
             const uint64_t per[3] = {fm.up_off, fm.up_off, blob - fm.down_off};
             const uint64_t at[3] = {0, fm.up_off, fm.down_off};
             for (int r = 0; r < 3; ++r) {
+                const std::string name = file_of(l, r);
+                if (name != open_name) {
+                    f.close();
+                    f.clear();
+                    f.open(name, std::ios::binary);
+                    if (!f) { bad = true; return; }
+                    open_name = name;
+                }
                 const uint64_t src = lay.gguf_off[(size_t) (3 * l + r)];
                 const uint64_t total = per[r] * (uint64_t) lay.n_expert;
                 const uint64_t chunk = per[r] * 16;           // 16 experts per read
@@ -1609,17 +1609,20 @@ bool GgufExpertSource::open(const std::string& shard1, int64_t n_layers, int64_t
     close();
     const auto& lay = strata::kernels::cpu::expert_layout();
     if (!lay.native || lay.n_layers != n_layers || lay.n_expert != n_expert || n_layers <= 0 || n_expert <= 0 ||
-        lay.gguf_off.size() != (size_t) (3 * n_layers) || lay.fmt.size() != (size_t) n_layers) {
+        lay.gguf_off.size() != (size_t) (3 * n_layers) || lay.fmt.size() != (size_t) n_layers ||
+        (!lay.gguf_file.empty() && lay.gguf_file.size() != (size_t) (3 * n_layers))) {
         err = "GgufExpertSource: the experts' GGUF offsets are not in the pack (re-pack it with tools/iq_pack.py)";
         return false;
     }
     if (per_layer < 1) { err = "GgufExpertSource: the dispatch width is empty"; return false; }
     const size_t cut = shard1.find_last_of("/\\");
     const std::string dir = cut == std::string::npos ? std::string() : shard1.substr(0, cut + 1);
-    map_of_.assign((size_t) n_layers, -1);
-    for (int64_t l = 0; l < n_layers; ++l) {
-        const std::string path = lay.gguf_file.empty() || lay.gguf_file[(size_t) l].empty()
-                                     ? shard1 : dir + lay.gguf_file[(size_t) l];
+    map_of_.assign((size_t) (3 * n_layers), -1);
+    for (int64_t part = 0; part < 3 * n_layers; ++part) {
+        const int64_t l = part / 3;
+        const int r = (int) (part % 3);
+        const std::string path = lay.gguf_file.empty() || lay.gguf_file[(size_t) part].empty()
+                                     ? shard1 : dir + lay.gguf_file[(size_t) part];
         int at = -1;
         for (size_t i = 0; i < maps_.size(); ++i) if (maps_[i].path == path) at = (int) i;
         if (at < 0) {
@@ -1682,19 +1685,17 @@ bool GgufExpertSource::open(const std::string& shard1, int64_t n_layers, int64_t
             maps_.push_back(m);
             at = (int) maps_.size() - 1;
         }
-        map_of_[(size_t) l] = at;
-        // every slice of this layer inside its file: refused at open rather than faulting at token 4000
+        map_of_[(size_t) part] = at;
+        // Each role must fit inside its own file, including layers that straddle shard boundaries.
         const auto& fm = lay.fmt[(size_t) l];
         const uint64_t blob = lay.bytes[(size_t) l];
         const uint64_t per[3] = {fm.up_off, fm.up_off, blob - fm.down_off};
-        for (int r = 0; r < 3; ++r) {
-            const uint64_t off = lay.gguf_off[(size_t) (3 * l + r)], need = per[r] * (uint64_t) n_expert;
-            if (off == 0 || per[r] == 0 || off > maps_[(size_t) at].bytes || need > maps_[(size_t) at].bytes - off) {
-                err = "GgufExpertSource: layer " + std::to_string(l) + "'s experts lie outside " + path +
-                      " - this is not the file the pack was made from";
-                close();
-                return false;
-            }
+        const uint64_t off = lay.gguf_off[(size_t) part], need = per[r] * (uint64_t) n_expert;
+        if (off == 0 || per[r] == 0 || off > maps_[(size_t) at].bytes || need > maps_[(size_t) at].bytes - off) {
+            err = "GgufExpertSource: layer " + std::to_string(l) + "'s expert role " + std::to_string(r) +
+                  " lies outside " + path + " - this is not the file the pack was made from";
+            close();
+            return false;
         }
     }
     n_layers_ = n_layers;
@@ -1774,8 +1775,8 @@ void GgufExpertSource::parts(int64_t layer, int64_t expert, const uint8_t* src[3
     bytes[0] = fm.up_off;
     bytes[1] = fm.up_off;
     bytes[2] = blob - fm.down_off;
-    const Map& m = maps_[(size_t) map_of_[(size_t) layer]];
     for (int r = 0; r < 3; ++r) {
+        const Map& m = maps_[(size_t) map_of_[(size_t) (3 * layer + r)]];
         file_off[r] = lay.gguf_off[(size_t) (3 * layer + r)] + (uint64_t) expert * bytes[r];
         src[r] = m.base + file_off[r];
     }
@@ -1793,7 +1794,7 @@ void GgufExpertSource::assemble(int64_t layer, int64_t expert, uint8_t* dst) con
 
 bool GgufExpertSource::read_part_direct(int64_t layer, int64_t expert, int part, uint8_t* dst) const {
 #if defined(__linux__)
-    const Map& m = maps_[(size_t) map_of_[(size_t) layer]];
+    const Map& m = maps_[(size_t) map_of_[(size_t) (3 * layer + part)]];
     if (m.dfd < 0) return false;
     const uint8_t* src[3];
     uint64_t bytes[3], off[3];
@@ -1945,8 +1946,10 @@ bool GgufExpertSource::make_resident(const std::vector<std::pair<int32_t, int32_
                     const uint8_t* src[3];
                     uint64_t bytes[3], off[3];
                     parts(l, e, src, bytes, off);
-                    const int fd = maps_[(size_t) map_of_[(size_t) l]].fd;
-                    for (int r = 0; r < 3; ++r) (void) ::posix_fadvise(fd, (off_t) off[r], (off_t) bytes[r], POSIX_FADV_DONTNEED);
+                    for (int r = 0; r < 3; ++r) {
+                        const int fd = maps_[(size_t) map_of_[(size_t) (3 * l + r)]].fd;
+                        (void) ::posix_fadvise(fd, (off_t) off[r], (off_t) bytes[r], POSIX_FADV_DONTNEED);
+                    }
 #endif
                 }
             }
@@ -1962,8 +1965,10 @@ bool GgufExpertSource::make_resident(const std::vector<std::pair<int32_t, int32_
         const uint8_t* src[3];
         uint64_t bytes[3], off[3];
         parts(l, e, src, bytes, off);
-        const int fd = maps_[(size_t) map_of_[(size_t) l]].fd;
-        for (int r = 0; r < 3; ++r) (void) ::posix_fadvise(fd, (off_t) off[r], (off_t) bytes[r], POSIX_FADV_DONTNEED);
+        for (int r = 0; r < 3; ++r) {
+            const int fd = maps_[(size_t) map_of_[(size_t) (3 * l + r)]].fd;
+            (void) ::posix_fadvise(fd, (off_t) off[r], (off_t) bytes[r], POSIX_FADV_DONTNEED);
+        }
     }
 #else
     (void) drop;
@@ -2074,8 +2079,10 @@ void GgufExpertSource::begin_layer(int64_t layer, const int32_t* ids, int64_t k)
         }
 #elif defined(POSIX_FADV_WILLNEED)
         if (!direct_) {   // (unbuffered reads fill their own ring slots: nothing to read ahead into the page cache)
-            const int fd = maps_[(size_t) map_of_[(size_t) layer]].fd;
-            for (int r = 0; r < 3; ++r) (void) ::posix_fadvise(fd, (off_t) off[r], (off_t) bytes[r], POSIX_FADV_WILLNEED);
+            for (int r = 0; r < 3; ++r) {
+                const int fd = maps_[(size_t) map_of_[(size_t) (3 * layer + r)]].fd;
+                (void) ::posix_fadvise(fd, (off_t) off[r], (off_t) bytes[r], POSIX_FADV_WILLNEED);
+            }
         }
 #else
         (void) src; (void) bytes; (void) off;

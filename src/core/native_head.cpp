@@ -116,7 +116,7 @@ bool NativeEmbed::load(const std::string& path, int64_t n_embd, int64_t n_vocab,
         for (const auto& c : gguf.tensors())
             if (c.name == "token_embd.weight") t = &c;
         if (!t || t->shape.size() != 2 || t->shape[0] != (uint64_t) n_embd || t->shape[1] != (uint64_t) n_vocab ||
-            !strata::kernels::iq_supported((int) t->type) || n_embd % 256) {
+            !strata::kernels::iq_embed_supported((int) t->type) || n_embd % 256) {
             err = "native embedding: token_embd.weight is absent, of another shape, or of a type without a GPU "
                   "dequantizer";
             return false;

@@ -1,7 +1,7 @@
 // src/kernels/cuda/dequant_bf16.cu - see include/strata/kernels/dequant_bf16.hpp.
 //
 // Arithmetic transcribed from ggml/src/ggml-quants.c at the pinned llama.cpp (MIT License, Copyright (c) 2023-2026
-// The ggml authors): dequantize_row_q2_0/q4_0/q5_0/q8_0/q3_K/q4_K/q5_K/q6_K/iq4_nl/iq4_xs.
+// The ggml authors): dequantize_row_q2_0/q2_K/q4_0/q5_0/q8_0/q3_K/q4_K/q5_K/q6_K/iq4_nl/iq4_xs.
 #include "strata/kernels/dequant_bf16.hpp"
 #include "strata/kernels/iq_kernels.hpp"
 
@@ -74,6 +74,17 @@ __device__ __forceinline__ void group32(const uint8_t* row_blocks, int gi_in_row
         for (int j = 0; j < 16; ++j) {
             put(out, j, d * (float) kv_iq4nl[b[2 + j] & 0xf]);
             put(out, j + 16, d * (float) kv_iq4nl[b[2 + j] >> 4]);
+        }
+    } else if constexpr (TYPE == 10) {                             // Q2_K: scales[16] qs[64] d dmin
+        const uint8_t* b = row_blocks + (size_t) (gi_in_row / 8) * 84;
+        const int gi = gi_in_row % 8, n = gi / 4, j = gi % 4, shift = 2 * j;
+        const uint8_t* q = b + 16 + 32 * n;
+        const float d = h2f(b + 80), mn = h2f(b + 82);
+        for (int h = 0; h < 2; ++h) {
+            const uint8_t sc = b[2 * gi + h];
+            const float dl = d * (float) (sc & 15), ml = mn * (float) (sc >> 4);
+            for (int l = 0; l < 16; ++l)
+                put(out, 16 * h + l, dl * (float) ((q[16 * h + l] >> shift) & 3) - ml);
         }
     } else if constexpr (TYPE == 11) {                             // Q3_K: hmask[32] qs[64] scales[12] d
         const uint8_t* b = row_blocks + (size_t) (gi_in_row / 8) * 110;
@@ -158,6 +169,27 @@ __global__ void dequant_kernel(const uint8_t* __restrict__ blocks, int64_t row_b
     if (g >= rows * groups_per_row) return;
     const int64_t r = g / groups_per_row, gi = g % groups_per_row;
     group32<TYPE>(blocks + (row0 + r) * row_bytes, (int) gi, out + r * groups_per_row * 32 + gi * 32);
+}
+
+template <int TYPE>
+__global__ void embed_kernel(const uint8_t* __restrict__ table, int64_t row_bytes,
+                             const int32_t* __restrict__ tokens, int64_t groups_per_row, float* __restrict__ out) {
+    const int64_t gi = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (gi >= groups_per_row) return;
+    const int64_t r = blockIdx.y;
+    group32<TYPE>(table + (int64_t) tokens[r] * row_bytes, (int) gi,
+                  out + (r * groups_per_row + gi) * 32);
+}
+
+template <int TYPE>
+__global__ void gu_kernel(const uint8_t* __restrict__ gate, const uint8_t* __restrict__ up,
+                          int64_t row_bytes, int64_t groups_per_row, H16* __restrict__ out) {
+    const int64_t gi = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (gi >= groups_per_row) return;
+    const int64_t r = blockIdx.y / 2;
+    const uint8_t* matrix = blockIdx.y & 1 ? up : gate;
+    group32<TYPE>(matrix + r * row_bytes, (int) gi,
+                  out + ((int64_t) blockIdx.y * groups_per_row + gi) * 32);
 }
 
 // Q8_0 -> f16, 8 values a thread: one 16-byte store each, so a warp writes 512 contiguous bytes (the generic kernel's
@@ -254,6 +286,7 @@ bool geometry(int type, int& block_elems, int& block_bytes) {
     case 6: block_elems = 32; block_bytes = 22; return true;
     case 8: block_elems = 32; block_bytes = 34; return true;
     case 20: block_elems = 32; block_bytes = 18; return true;
+    case 10: block_elems = 256; block_bytes = 84; return true;
     case 11: block_elems = 256; block_bytes = 110; return true;
     case 12: block_elems = 256; block_bytes = 144; return true;
     case 13: block_elems = 256; block_bytes = 176; return true;
@@ -281,6 +314,7 @@ void launch(int type, const void* blocks, int64_t row0, int64_t rows, int64_t co
     case 2: STRATA_DQ(2);
     case 6: STRATA_DQ(6);
     case 8: STRATA_DQ(8);
+    case 10: STRATA_DQ(10);
     case 11: STRATA_DQ(11);
     case 12: STRATA_DQ(12);
     case 13: STRATA_DQ(13);
@@ -354,6 +388,55 @@ void dequant_f32(int ggml_type, const void* blocks, int64_t row0, int64_t rows, 
         return;
     }
     launch<float>(ggml_type, blocks, row0, rows, cols, out, stream);
+}
+
+void dequant_embed_rows(int ggml_type, const void* table, int64_t row_bytes, const int32_t* tokens,
+                        int64_t n_tok, int64_t n_embd, float* out, void* stream) {
+    int be = 0, bb = 0;
+    if (!geometry(ggml_type, be, bb) || n_embd % be || row_bytes != n_embd / be * bb || n_embd <= 0) {
+        std::fprintf(stderr, "dequant_embed_rows: unsupported type %d or shape\n", ggml_type);
+        std::exit(1);
+    }
+    if (n_tok <= 0) return;
+    const int64_t gpr = n_embd / 32;
+    const dim3 grid((unsigned) ((gpr + 255) / 256), (unsigned) n_tok);
+#define STRATA_EMBED(TY) embed_kernel<TY><<<grid, 256, 0, (cudaStream_t) stream>>>(\
+    (const uint8_t*) table, row_bytes, tokens, gpr, out); break
+    switch (ggml_type) {
+    case 10: STRATA_EMBED(10);
+    case 11: STRATA_EMBED(11);
+    case 12: STRATA_EMBED(12);
+    case 13: STRATA_EMBED(13);
+    case 14: STRATA_EMBED(14);
+    default: std::fprintf(stderr, "dequant_embed_rows: type %d\n", ggml_type); std::exit(1);
+    }
+#undef STRATA_EMBED
+    const cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) { std::fprintf(stderr, "dequant_embed_rows: %s\n", cudaGetErrorString(e)); std::exit(1); }
+}
+
+void dequant_gu_f16(int ggml_type, const void* gate, const void* up, int64_t n_ff, int64_t n_embd,
+                    uint16_t* out, void* stream) {
+    int be = 0, bb = 0;
+    if (!geometry(ggml_type, be, bb) || n_embd % be || n_ff <= 0 || n_embd <= 0) {
+        std::fprintf(stderr, "dequant_gu_f16: unsupported type %d or shape\n", ggml_type);
+        std::exit(1);
+    }
+    const int64_t gpr = n_embd / 32;
+    const dim3 grid((unsigned) ((gpr + 255) / 256), (unsigned) (2 * n_ff));
+#define STRATA_GU(TY) gu_kernel<TY><<<grid, 256, 0, (cudaStream_t) stream>>>(\
+    (const uint8_t*) gate, (const uint8_t*) up, n_embd / be * bb, gpr, (H16*) out); break
+    switch (ggml_type) {
+    case 10: STRATA_GU(10);
+    case 11: STRATA_GU(11);
+    case 12: STRATA_GU(12);
+    case 13: STRATA_GU(13);
+    case 14: STRATA_GU(14);
+    default: std::fprintf(stderr, "dequant_gu_f16: type %d\n", ggml_type); std::exit(1);
+    }
+#undef STRATA_GU
+    const cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) { std::fprintf(stderr, "dequant_gu_f16: %s\n", cudaGetErrorString(e)); std::exit(1); }
 }
 
 }  // namespace strata::kernels

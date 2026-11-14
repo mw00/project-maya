@@ -20,11 +20,11 @@ struct ExpertLayout {
     int64_t n_layers = 0, n_expert = NE;
     std::vector<NativeFmt> fmt;           ///< per layer (native packs)
     std::vector<uint64_t> offset, bytes;  ///< per layer: where its 512 blobs start, bytes per blob
-    /// Plan v0.3 P6: per layer, the absolute offsets of the gate / up / down tensors in the model's shard 1, so
+    /// Per layer, the absolute offsets of the gate / up / down tensors in their respective GGUF shards, so
     /// the arena can be filled from the GGUF itself when the pack has no experts.bin (3 x n_layers, 0 = unknown).
     std::vector<uint64_t> gguf_off;
-    /// Per layer, the GGUF file (a name beside the --native shard) that holds its experts when the model's
-    /// shards split the layers (Swift's GGUFs: layers 13-47 in shard 2).  Empty = the --native shard itself.
+    /// Per layer and role (3 x n_layers, gate/up/down), the GGUF file beside --native.
+    /// An empty vector or name means the --native shard itself. v3 rows repeat one name for all roles.
     std::vector<std::string> gguf_file;
     uint64_t max_blob = BLOB;
     uint64_t total = 0;                   ///< experts.bin size

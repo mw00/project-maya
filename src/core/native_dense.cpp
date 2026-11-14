@@ -17,9 +17,9 @@ namespace {
 bool eligible(const strata::TensorInfo& tensor, bool include_ple_key) {
     const auto& name = tensor.name;
     if (name.rfind("blk.", 0) != 0) return false;
-    // Match the native PLE kernel: Q2_0, IQ3_XXS and IQ4_XS. Other keys retain the packed BF16 fallback.
+    // Match the native PLE kernel: Q2_0, IQ3_XXS, IQ4_XS and Q8_0. Other keys retain the packed BF16 fallback.
     if (name == "blk.1.ple_key.weight")
-        return include_ple_key && (tensor.type == 42 || tensor.type == 18 || tensor.type == 23);
+        return include_ple_key && (tensor.type == 42 || tensor.type == 18 || tensor.type == 23 || tensor.type == 8);
     static const char* suffixes[] = {".attn_qkv.weight", ".attn_gate.weight", ".ssm_out.weight",
         ".attn_q.weight", ".attn_k.weight", ".attn_v.weight", ".attn_output.weight",
         ".ffn_gate_shexp.weight", ".ffn_up_shexp.weight", ".ffn_down_shexp.weight"};
@@ -51,9 +51,10 @@ struct Pending {
 bool NativeDense::served_names(const std::vector<std::string>& shards, bool include_ple_key,
                                std::set<std::string>& out, std::string& err) {
     try {
+        int trunk = INT_MAX; // split GGUFs may keep the model geometry only in shard 0
         for (const auto& path : shards) {
             strata::GgufFile gguf(path);
-            const int trunk = trunk_layers(gguf);
+            if (trunk == INT_MAX) trunk = trunk_layers(gguf);
             for (const auto& tensor : gguf.tensors())
                 if (eligible(tensor, include_ple_key) && !in_mtp_block(tensor, trunk) &&
                     strata::kernels::native_mmvq_supported(tensor.type) &&
@@ -84,6 +85,7 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
         uint64_t split_count = 0, split_tensors = 0;
         std::set<uint64_t> split_numbers;
         bool have_architecture = false;
+        int trunk = INT_MAX;
         for (const auto& path : shards) {
             strata::GgufFile gguf(path);
             const auto* count = gguf.get("split.count");
@@ -92,6 +94,7 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
             if (gguf.get("general.architecture")) {
                 err = strata::check_architecture(gguf);
                 if (!err.empty()) return false;
+                if (!have_architecture) trunk = trunk_layers(gguf);
                 have_architecture = true;
                 if (count && number && tensors && number->u == 0 && count->u > 1) {
                     split_count = count->u;
@@ -141,7 +144,6 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                     err = "native dense: overlapping payload " + tensor.name; return false;
                 }
             }
-            const int trunk = trunk_layers(gguf);
             for (const auto& tensor : gguf.tensors()) {
                 if (!eligible(tensor, include_ple_key) || in_mtp_block(tensor, trunk)) continue;
                 if (!seen.insert(tensor.name).second) {

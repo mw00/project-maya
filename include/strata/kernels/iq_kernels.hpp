@@ -14,6 +14,8 @@ namespace strata::kernels {
 
 /// ggml type ids handled here.
 bool iq_supported(int ggml_type) noexcept;
+/// Types with a GPU decoder suitable for token embedding rows.
+bool iq_embed_supported(int ggml_type) noexcept;
 /// Bytes of one row of `n` values of `ggml_type` (n a multiple of the type's block).
 size_t iq_row_bytes(int ggml_type, int64_t n) noexcept;
 

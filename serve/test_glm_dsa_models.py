@@ -142,6 +142,8 @@ class Page(Base):
         g = M.describe(self.g53, None)
         self.assertEqual((g["shown"], g["kv_bytes"], g["quant"], g["model"], g["family"], g["ok"]),
                          ("GLM-5.3 (744B)", 64352, "UD-IQ2_M", "glm-5.3", "glm", True))
+        self.assertIn(262144, g["contexts"])
+        self.assertIn(524288, g["contexts"])
         f = M.describe(self.flash, None)
         self.assertEqual(list(f), ["file", "path", "model", "family", "quant", "backend", "written", "used", "running",
                                    "port", "script", "folder", "size", "ok", "missing", "settings", "setup", "choices",

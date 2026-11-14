@@ -146,17 +146,17 @@ class Setup(unittest.TestCase):
     def test_contexts_that_fit(self):
         one = lambda gb, **kw: {"gpus": [{"index": 0, "vram_gb": gb, **kw}]}   # noqa: E731
         with Quiet() as q:
-            self.assertEqual(maya.g53_contexts(self.pc), maya.CONTEXTS)              # 3x V100 32 GB: every one
+            self.assertEqual(maya.g53_contexts(self.pc), maya.GLM53_CONTEXTS)        # 3x V100 32 GB: through 512K
             self.assertEqual(maya.g53_contexts(one(32)), maya.CONTEXTS)              # (128K: 7.9 GB of cache)
             self.assertEqual(maya.g53_contexts(one(24)), [8192, 32768, 65536])
             self.assertEqual(maya.g53_contexts(one(32), parallel=2), [8192, 32768, 65536])   # (a cache each)
             self.assertEqual(maya.g53_contexts(one(16)), [8192])
-            self.assertEqual(maya.g53_contexts(one(0.5, arch="gfx1151")), maya.CONTEXTS)   # (an APU: its RAM)
-            self.assertEqual(maya.g53_contexts({"gpus": []}), maya.CONTEXTS)
+            self.assertEqual(maya.g53_contexts(one(0.5, arch="gfx1151")), maya.GLM53_CONTEXTS)   # (an APU: its RAM)
+            self.assertEqual(maya.g53_contexts({"gpus": []}), maya.GLM53_CONTEXTS)
         self.assertIn("up to a 64K context on these GPUs (24 GB of VRAM)", q.text)
         self.assertIn("it may not start", q.text)
         with patch.object(maya.G53, "KV_STREAMING", True):
-            self.assertEqual(maya.g53_contexts(one(24)), maya.CONTEXTS)
+            self.assertEqual(maya.g53_contexts(one(24)), maya.GLM53_CONTEXTS)
 
     def offered(self, choice, pc, **given) -> dict:
         """set_up run up to its context question for `choice` on `pc` (--parallel etc. as `given`): what it offers."""
@@ -200,9 +200,9 @@ class Setup(unittest.TestCase):
                                                                           "--parallel", "8"]}))
         p.unlink()
         self.assertEqual(self.offered(g53, one)["contexts"], maya.CONTEXTS)
-        # GLM-5.3-Flash's question as before: every context, its own recommendation
+        # GLM-5.3-Flash offers the longer contexts independently of GLM-5.3's cache limits.
         flash = self.offered(("download", "Maya-M"), one)
-        self.assertEqual(flash, {"contexts": maya.CONTEXTS,
+        self.assertEqual(flash, {"contexts": [8192, 32768, 65536, 131072, 262144, 524288],
                                  "recommended": maya.recommended_context(("download", "Maya-M"), one)})
 
     def test_apu_context_keeps_the_whole_model_in_memory(self):
@@ -229,7 +229,7 @@ class Setup(unittest.TestCase):
                                             "vram_gb": 160}]}
         # (the measured Halo was on Windows: its 160 GB carve-out beside ~32 GB RAM)
         with patch.object(maya, "mem_gb", return_value=(31.6, 20.0)), patch.object(maya, "WIN", True):
-            self.assertEqual(self.offered(g53, halo), {"contexts": maya.CONTEXTS, "recommended": 32768})
+            self.assertEqual(self.offered(g53, halo), {"contexts": maya.GLM53_CONTEXTS, "recommended": 32768})
             rec, line = maya.g53_apu_context(halo, {"kv_bytes": kv, "parallel": 1}, "GLM-5.3-Maya-XS", maya.CONTEXTS)
             self.assertEqual(rec, 32768)
             self.assertIn("32K recommended", line)
@@ -293,7 +293,7 @@ class Setup(unittest.TestCase):
         self.assertEqual(maya.g53_figures("GLM-5.3-Mine"), (maya.G53.MEMORY_GB, maya.G53.DENSE_GB))
         with Quiet():
             self.assertEqual(maya.g53_contexts(cuda, **plan), [8192, 32768])
-            self.assertEqual(maya.g53_contexts({"gpus": [{"index": 0, "vram_gb": 32}] * 3}, **plan), maya.CONTEXTS)
+            self.assertEqual(maya.g53_contexts({"gpus": [{"index": 0, "vram_gb": 32}] * 3}, **plan), maya.GLM53_CONTEXTS)
         with tempfile.TemporaryDirectory() as t:
             first = write_split(Path(t), "GLM-5.3-Maya-XS")[0]
             self.assertEqual(maya.quant_of(first), "GLM-5.3-Maya-XS")
@@ -376,23 +376,19 @@ class Download(unittest.TestCase):
                 patch.object(maya, "choose", side_effect=choose), patch.object(maya.S, "gpus", return_value=[]), \
                 patch.object(maya, "mem_gb", return_value=(512.0, 500.0)):
             got = maya.choose_model(SimpleNamespace(backend=backend, model_dir=None, gguf_dir=None, model=None,
-                                                    yes=True), Path(t), {})
+                                                    yes=True), Path(t), {}, "glm53")
         return got, seen["rows"], seen["default"]
 
     def test_the_list(self):
-        flash = [q for q in maya.MODELS if q not in maya.MODELS_BY_HAND]
         got, on, default = self.rows()
-        rows = on[:len(flash)]                                                      # (Flash's rows first)
-        self.assertFalse(any("744B" in r[0] for r in rows))
-        self.assertEqual(on[len(rows)][0], "GLM-5.3 (744B) · Maya-XS, text only: download 170.0 GB from Hugging Face")
-        self.assertIn("every expert stays in memory from about 176 GB of VRAM and RAM together", on[len(rows)][2])
-        self.assertEqual(on[len(rows) + 1][0],
+        self.assertEqual(len(on), len(maya.G53_MODELS))
+        self.assertEqual(on[0][0], "GLM-5.3 (744B) · Maya-XS, text only: download 170.0 GB from Hugging Face")
+        self.assertIn("every expert stays in memory from about 176 GB of VRAM and RAM together", on[0][2])
+        self.assertEqual(on[1][0],
                          "GLM-5.3 (744B) · UD-IQ2_M, text only: download 238.6 GB from Hugging Face")
-        self.assertIn("every expert stays in memory from about 245 GB of VRAM and RAM together", on[len(rows) + 1][2])
-        self.assertIn("GGUF files you already have", on[len(rows) + 2][0])
-        self.assertEqual((got, default), (("download", flash[0]), 0))
-        _, metal, _ = self.rows("metal")
-        self.assertFalse(any("UD-IQ2_M" in r[0] or "Maya-XS," in r[0] for r in metal))   # (not on Metal)
+        self.assertIn("every expert stays in memory from about 245 GB of VRAM and RAM together", on[1][2])
+        self.assertFalse(any("GGUF files you already have" in row[0] for row in on))
+        self.assertEqual((got, default), (("download", "GLM-5.3-Maya-XS"), 0))
 
     def test_metal_refused_before_the_download(self):
         a = SimpleNamespace(backend="metal", model_dir=None, gguf_dir=None, model="GLM-5.3-UD-IQ2_M", yes=True)

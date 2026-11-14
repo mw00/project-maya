@@ -63,6 +63,16 @@ class Streaming(unittest.TestCase):
 
 
 class Bridging(unittest.TestCase):
+    def test_back_history_ends_when_installation_work_begins(self):
+        with tempfile.TemporaryDirectory() as d:
+            b = Bridge(Path(d) / "setup.log")
+            b.thread = threading.current_thread()
+            b.answers = [(("choose", "Model?"), 3)]
+            self.assertTrue(b.can_go_back())
+            b.step(3, "Python packages")
+            self.assertFalse(b.can_go_back())
+            b.log.close()
+
     def test_after_the_screen_other_threads_print_and_the_setup_thread_stops(self):
         with tempfile.TemporaryDirectory() as d:
             b = Bridge(Path(d) / "setup.log")
@@ -126,6 +136,55 @@ class PlainSetup(unittest.TestCase):
         S.UI = SimpleNamespace(choose=lambda *a: 0)
         with patch.object(maya, "say", side_effect=AssertionError("nothing is printed")):
             self.assertEqual(maya.choose("Context?", [], [("8K", None, None), ("32K", None, None)], 1, False), 0)
+
+    def test_plain_model_menu_keeps_numbers_and_accepts_zero(self):
+        rows = [("0) Add downloaded model", None, None),
+                ("First", None, None), ("Second", None, None)]
+        with patch.object(maya, "say") as lines, patch.object(maya, "ask", return_value="0") as ask:
+            self.assertEqual(maya.choose("Which files?", [], rows, 0, False), 2)
+        printed = [call.args[0] for call in lines.call_args_list if call.args]
+        self.assertEqual(printed[:3], ["  0) Add downloaded model", "  1) First", "  2) Second"])
+        self.assertIn("  1) First", printed)
+        self.assertIn("  2) Second", printed)
+        self.assertIn("  0) Add downloaded model", printed)
+        self.assertEqual(ask.call_args.args[1], ["0", "1", "2"])
+
+    def test_add_menu_reviews_files_then_returns_to_model_list(self):
+        a = SimpleNamespace(copy=False, yes=False)
+        with tempfile.TemporaryDirectory() as folder, patch.object(maya, "choose", side_effect=[1, 0]), \
+                patch.object(S, "ask_text", return_value=folder), \
+                patch.object(maya, "review_downloaded_model", return_value=0) as reviewed:
+            models = Path(folder) / "models"
+            pick = maya.choose_with_add(a, "Which files?", [], [("First", None, None)], 0, False, models, "glm")
+            self.assertEqual(pick, 0)
+            reviewed.assert_called_once_with(a, Path(folder), models, "glm")
+
+    def test_unlisted_qwen_link_goes_directly_to_its_local_model(self):
+        a = SimpleNamespace(copy=False, yes=False)
+        local = {"model": Path("Qwen3.8-Flash-Next-Q8_0-00001-of-00006.gguf")}
+        with tempfile.TemporaryDirectory() as folder, patch.object(maya, "choose", return_value=1) as choose, \
+                patch.object(S, "ask_text", return_value=folder), \
+                patch.object(maya, "review_downloaded_model", return_value=local):
+            picked = maya.choose_with_add(a, "Which Qwen?", [], [("Official", None, None)], 0, False,
+                                          Path(folder) / "models", "qwen")
+        self.assertIs(picked, local)
+        self.assertEqual(choose.call_count, 1)       # no standard quant choice after linking
+
+    def test_invalid_directory_is_prompted_again_with_its_previous_value(self):
+        a = SimpleNamespace(copy=False, yes=False)
+        with tempfile.TemporaryDirectory() as folder:
+            wrong = str(Path(folder) / "mistyped")
+            with patch.object(maya, "choose", side_effect=[1, 0]) as choose, \
+                    patch.object(S, "ask_text", side_effect=[wrong, folder]) as ask_text, \
+                    patch.object(maya, "warn") as warning, \
+                    patch.object(maya, "review_downloaded_model", return_value=0):
+                maya.choose_with_add(a, "Which files?", [], [("First", None, None)], 0, False,
+                                     Path(folder) / "models", "glm")
+            self.assertEqual(choose.call_count, 2)
+            self.assertEqual([call.args for call in ask_text.call_args_list],
+                             [("Directory with downloaded model files", ""),
+                              ("Directory with downloaded model files", wrong)])
+            warning.assert_called_once_with(f"{wrong} is not a directory")
 
     def test_a_closed_screen_falls_back_to_print(self):
         S.UI = SimpleNamespace(say=lambda msg: False, ok=lambda msg: False)
@@ -191,10 +250,11 @@ class ModelName(unittest.TestCase):
                     patch.object(maya, "set_up_ds4", return_value=None), \
                     patch.object(maya, "set_up_mm3", return_value=None), \
                     patch.object(maya, "set_up_qwen", return_value=None), \
+                    patch.object(maya, "choose_model", return_value=("download", "Maya-S-v2-IQ2_XXS")), \
                     patch.object(maya, "check_pc", side_effect=KeyboardInterrupt), \
                     patch.object(maya, "configs", return_value=[]), patch.object(S, "model_named") as named:
                 try:
-                    maya.set_up(SimpleNamespace(parallel=None, backend="cuda"), {})
+                    maya.set_up(SimpleNamespace(parallel=None, backend="cuda", models_dir=None), {})
                 except KeyboardInterrupt:                # (GLM's step 1: the test stops there)
                     pass
                 named.assert_called_once_with(maya.FAMILY_TITLE[family])
@@ -258,6 +318,340 @@ class Screen(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(end, ("done", (2, 1, "y")))
         self.assertEqual([t for _, k, t in bridge.entries if k == "answer"],
                          ["  Context? 3) 64K tokens", "  Model? 2) Maya-L", "  Download them now? y"])
+
+    async def test_escape_from_qwen_files_returns_to_model_families(self):
+        a = SimpleNamespace(model=None, gguf_dir=None, draft=None, model_dir=None, yes=False)
+
+        def body():
+            family = maya.choose_family(a, {})
+            return family, maya.choose_qwen_quant(a, {}) if family == "qwen" else None
+
+        bridge = Bridge(self.log)
+        S.UI = bridge
+        app = T.SetupApp(bridge, body, "1.0", "./maya.sh", self.log)
+        async with app.run_test(size=(110, 40)) as pilot:
+            async def until(question):
+                t0 = time.time()
+                while app.pending is None or question not in str(app.query_one("#ask").border_title):
+                    self.assertLess(time.time() - t0, 20)
+                    await pilot.pause(0.02)
+
+            with patch.object(maya.S, "gpus", return_value=[]), patch.object(maya, "mem_gb", return_value=(189, 170)):
+                await until("Model?")
+                await pilot.press("escape")                # no earlier question yet
+                self.assertIn("Model?", str(app.query_one("#ask").border_title))
+                await pilot.press("5")
+                await until("Which Qwen3.8-Flash-Next?")
+                await pilot.press("escape")
+                await until("Model?")
+                self.assertEqual(app.query_one("#options").highlighted, 4)
+                await pilot.press("3")                   # change the family after going back
+                while app.return_value is None:
+                    await pilot.pause(0.02)
+        self.assertEqual(app.return_value, ("done", ("deepseek", None)))
+        bridge.log.close()
+
+    async def test_add_downloaded_model_accepts_path_and_returns_to_files_menu(self):
+        a = SimpleNamespace(models_dir=str(Path(self.dir.name) / "models"), copy=False, yes=False)
+        rows = [("First files", None, None), ("Second files", None, None)]
+        bridge = Bridge(self.log)
+        S.UI = bridge
+        body = lambda: maya.choose_with_add(a, "Which files?", [], rows, 0, False,
+                                             Path(a.models_dir), "glm")
+        app = T.SetupApp(bridge, body, "1.0", "./maya.sh", self.log)
+        async with app.run_test(size=(110, 40)) as pilot:
+            async def until(question):
+                t0 = time.time()
+                while app.pending is None or question not in str(app.query_one("#ask").border_title):
+                    self.assertLess(time.time() - t0, 20)
+                    await pilot.pause(0.02)
+
+            with patch.object(maya, "import_model", return_value=0) as imported:
+                await until("Which files?")
+                await pilot.press("0")
+                await until("Directory with downloaded model files")
+                await pilot.press("escape")
+                await until("Which files?")
+                await pilot.press("0")
+                await until("Directory with downloaded model files")
+                wrong = str(Path(self.dir.name) / "mistyped")
+                app.query_one("#text-answer", T.Input).value = wrong
+                previous = app.pending[0]
+                await pilot.press("enter")
+                t0 = time.time()
+                while app.pending is None or app.pending[0] is previous:
+                    self.assertLess(time.time() - t0, 20)
+                    await pilot.pause(0.02)
+                await until("Directory with downloaded model files")
+                self.assertEqual(app.query_one("#text-answer", T.Input).value, wrong)
+                await pilot.press("escape")
+                await until("Which files?")
+                await pilot.press("0")
+                await until("Directory with downloaded model files")
+                app.query_one("#text-answer", T.Input).value = self.dir.name
+                await pilot.press("enter")
+                await until("Detected model files")
+                self.assertIn("Model: None", str(app.query_one("#options").get_option_at_index(0).prompt))
+                await pilot.press("escape")
+                await until("Directory with downloaded model files")
+                self.assertEqual(app.query_one("#text-answer", T.Input).value, self.dir.name)
+                await pilot.press("enter")
+                await until("Detected model files")
+                await pilot.press("5")
+                await until("Which files?")
+                await pilot.press("2")
+                while app.return_value is None:
+                    await pilot.pause(0.02)
+            imported.assert_called_once_with(a, self.dir.name, models_override=Path(a.models_dir),
+                                             from_setup=True, selected_files=None)
+        self.assertEqual(app.return_value, ("done", 1))
+        bridge.log.close()
+
+    async def test_add_downloaded_model_can_find_a_directory_in_the_browser(self):
+        source = Path(self.dir.name) / "source"
+        model = source / "Downloads" / "MyModel"
+        model.mkdir(parents=True)
+        main = model / "a-model.gguf"
+        main.write_bytes(b"GGUF")
+        other = model / "b-model.gguf"
+        other.write_bytes(b"GGUF")
+        (source / "Downloads-old").mkdir()
+        a = SimpleNamespace(models_dir=str(Path(self.dir.name) / "models"), copy=False, yes=False)
+        bridge = Bridge(self.log)
+        S.UI = bridge
+        app = T.SetupApp(bridge,
+                         lambda: maya.choose_with_add(a, "Which files?", [], [("First", None, None)], 0, False,
+                                                      Path(a.models_dir), "glm"),
+                         "1.0", "./maya.sh", self.log)
+        async with app.run_test(size=(110, 40)) as pilot:
+            async def until(condition):
+                t0 = time.time()
+                while not condition():
+                    self.assertLess(time.time() - t0, 20)
+                    await pilot.pause(0.02)
+
+            with patch.object(maya, "gguf_head", return_value=("glm5-next", 1)), \
+                    patch.object(maya, "link_model", side_effect=AssertionError("catalog link used")) as published_link:
+                await until(lambda: app.pending is not None)
+                await pilot.press("0")
+                await until(lambda: app.pending is not None and app.pending[2] == "text")
+                field = app.query_one("#text-answer", T.Input)
+                typed = str(source / "mistyped")
+                field.value = typed
+                await pilot.press("ctrl+o")
+                await until(lambda: isinstance(app.screen, T.DirectoryPicker))
+                await pilot.press("escape")
+                await until(lambda: not isinstance(app.screen, T.DirectoryPicker))
+                self.assertEqual(field.value, typed)
+                await pilot.press("ctrl+o")
+                await until(lambda: isinstance(app.screen, T.DirectoryPicker))
+                picker = app.screen
+                self.assertEqual(picker.current, source)
+                search = picker.query_one("#directory-search", T.Input)
+                search.value = "down"
+                await until(lambda: len(picker.items) == 4 and picker.items[2][0] == "Downloads/")
+                await pilot.press("down")
+                self.assertEqual(picker.query_one("#directory-list").highlighted, 3)
+                await pilot.press("up")
+                self.assertEqual(picker.query_one("#directory-list").highlighted, 2)
+                await pilot.press("enter")
+                await until(lambda: picker.current == source / "Downloads")
+                search.value = "mym"
+                await until(lambda: picker.items[-1][0] == "MyModel/")
+                await pilot.press("enter")
+                await until(lambda: picker.current == model)
+                await pilot.press("enter")      # Use this directory
+                await until(lambda: not isinstance(app.screen, T.DirectoryPicker))
+                self.assertEqual(field.value, str(model))
+                await pilot.press("enter")      # Confirm the path in the setup
+                await until(lambda: app.pending is not None and app.pending[2] == "choose" and
+                            "Detected model files" in str(app.query_one("#ask").border_title))
+                self.assertIn(main.name, str(app.query_one("#options").get_option_at_index(0).prompt))
+                await pilot.press("1")          # Model: choose the other detected quant
+                await until(lambda: app.pending is not None and
+                            "Model file?" in str(app.query_one("#ask").border_title))
+                await pilot.press("escape")
+                await until(lambda: app.pending is not None and
+                            "Detected model files" in str(app.query_one("#ask").border_title))
+                await pilot.press("1")
+                await until(lambda: app.pending is not None and
+                            "Model file?" in str(app.query_one("#ask").border_title))
+                await pilot.press("2")
+                await until(lambda: app.pending is not None and
+                            "Detected model files" in str(app.query_one("#ask").border_title))
+                self.assertIn(other.name, str(app.query_one("#options").get_option_at_index(0).prompt))
+                await pilot.press("4")          # Link files
+                await until(lambda: app.return_value is not None)
+            published_link.assert_not_called()
+        self.assertEqual(app.return_value[0], "done")
+        self.assertEqual(app.return_value[1]["model"].name, other.name)
+        self.assertEqual(app.return_value[1]["model"].resolve(), other)
+        bridge.log.close()
+
+    async def test_browse_model_drafter_and_vision_files(self):
+        source = Path(self.dir.name) / "source"
+        source.mkdir()
+        heads = source.parent / "heads"
+        heads.mkdir()
+        main = source / "model-Q6_K.gguf"
+        draft = heads / "mtp-Q6_K.gguf"
+        vision = heads / "mmproj-F16.gguf"
+        for path in (main, draft, vision):
+            path.write_bytes(b"GGUF")
+        bridge = Bridge(self.log)
+        S.UI = bridge
+        def body():
+            return {role: maya.review_pick_file(source, role, [], None) for role in ("model", "drafter", "vision")}
+        app = T.SetupApp(bridge, body, "1.0", "./maya.sh", self.log)
+        async with app.run_test(size=(110, 40)) as pilot:
+            async def until(condition):
+                t0 = time.time()
+                while not condition():
+                    self.assertLess(time.time() - t0, 20)
+                    await pilot.pause(0.02)
+
+            for role, path in (("model", main), ("drafter", draft), ("vision", vision)):
+                await until(lambda: app.pending is not None and app.pending[2] == "choose")
+                self.assertIn("Browse files", str(app.query_one("#options").get_option_at_index(0).prompt))
+                await pilot.press("1")
+                await until(lambda: isinstance(app.screen, T.FilePicker))
+                if role == "drafter":
+                    await pilot.press("escape")
+                    await until(lambda: not isinstance(app.screen, T.FilePicker))
+                    self.assertEqual(app.query_one("#text-answer", T.Input).value, "")
+                    await pilot.press("ctrl+o")
+                    await until(lambda: isinstance(app.screen, T.FilePicker))
+                    picker = app.screen
+                    picker.query_one("#directory-list").highlighted = 0  # Parent directory
+                    await pilot.press("enter")
+                    await until(lambda: picker.current == source.parent)
+                    picker.query_one("#directory-search", T.Input).value = "heads"
+                    await until(lambda: picker.items[-1][0] == "heads/")
+                    await pilot.press("enter")
+                    await until(lambda: picker.current == heads)
+                    picker.query_one("#directory-search", T.Input).value = "mtp"
+                elif role == "vision":
+                    app.screen.query_one("#directory-search", T.Input).value = str(path)
+                else:
+                    picker = app.screen
+                    picker.query_one("#directory-search", T.Input).value = "not-a-matching-filename"
+                    await until(lambda: picker.query_one("#directory-list").highlighted is None)
+                    await pilot.press("enter")
+                    self.assertEqual(picker.current, source)
+                    app.screen.query_one("#directory-search", T.Input).value = "Q6_K"
+                if role != "vision":
+                    await until(lambda: app.screen.items[-1][1] == path)
+                await pilot.press("enter")
+                await until(lambda: not isinstance(app.screen, T.FilePicker))
+                self.assertEqual(app.query_one("#text-answer", T.Input).value, str(path))
+                await pilot.press("enter")
+            await until(lambda: app.return_value is not None)
+        self.assertEqual(app.return_value[0], "done")
+        self.assertEqual({role: chosen["path"] for role, chosen in app.return_value[1].items()},
+                         {"model": main, "drafter": draft, "vision": vision})
+        bridge.log.close()
+
+    async def test_file_browser_escape_keeps_the_previous_filename(self):
+        source = Path(self.dir.name)
+        main = source / "model.gguf"
+        main.write_bytes(b"GGUF")
+        current = maya.review_candidate(main, "model", [main])
+        bridge = Bridge(self.log)
+        S.UI = bridge
+        app = T.SetupApp(bridge, lambda: maya.review_pick_file(source, "model", [], current),
+                         "1.0", "./maya.sh", self.log)
+        async with app.run_test(size=(110, 40)) as pilot:
+            async def until(condition):
+                t0 = time.time()
+                while not condition():
+                    self.assertLess(time.time() - t0, 20)
+                    await pilot.pause(0.02)
+            await until(lambda: app.pending is not None)
+            await pilot.press("1")
+            await until(lambda: isinstance(app.screen, T.FilePicker))
+            self.assertEqual(app.screen.items[app.screen.query_one("#directory-list").highlighted][1], main)
+            await pilot.press("escape")
+            await until(lambda: not isinstance(app.screen, T.FilePicker))
+            self.assertEqual(app.query_one("#text-answer", T.Input).value, main.name)
+            await pilot.press("escape")
+            await until(lambda: app.pending is not None and app.pending[2] == "choose")
+            await pilot.press("1")
+            await until(lambda: isinstance(app.screen, T.FilePicker))
+            await pilot.press("enter")
+            await until(lambda: not isinstance(app.screen, T.FilePicker))
+            await pilot.press("enter")
+            await until(lambda: app.return_value is not None)
+        self.assertEqual(app.return_value, ("done", current))
+        bridge.log.close()
+
+    async def test_glm_model_files_come_before_gpu_choice(self):
+        a = SimpleNamespace(model=None, gguf_dir=None, draft=None, model_dir=None, models_dir=None,
+                            backend="cuda", parallel=None, yes=False)
+
+        def pc(_):
+            S.step(1, "checking this PC")
+            maya.choose("Which GPUs?", [], [("GPU 0", None, None), ("all GPUs", None, None)], 0, False)
+            raise KeyboardInterrupt                    # stop before packages, downloads, or build
+
+        bridge = Bridge(self.log)
+        S.UI = bridge
+        app = T.SetupApp(bridge, lambda: maya.set_up(a, {}), "1.0", "./maya.sh", self.log)
+        async with app.run_test(size=(110, 40)) as pilot:
+            async def until(question):
+                t0 = time.time()
+                while app.pending is None or question not in str(app.query_one("#ask").border_title):
+                    self.assertLess(time.time() - t0, 20)
+                    await pilot.pause(0.02)
+
+            with patch.object(maya, "check_pc", side_effect=pc), patch.object(maya, "configs", return_value=[]), \
+                    patch.object(maya.S, "gpus", return_value=[]), patch.object(maya, "mem_gb", return_value=(189, 170)):
+                await until("Model?")
+                await pilot.press("1")
+                await until("Which GLM-5.3-Flash?")
+                await pilot.press("enter")
+                await until("Which GPUs?")
+                await pilot.press("escape")
+                await until("Which GLM-5.3-Flash?")
+                await pilot.press("enter")
+                await until("Which GPUs?")
+                await pilot.press("enter")
+                while app.return_value is None:
+                    await pilot.pause(0.02)
+        self.assertEqual(app.return_value, ("stopped", None))
+        bridge.log.close()
+
+    async def test_glm53_has_its_own_second_screen_and_escape_returns_to_flash(self):
+        a = SimpleNamespace(model=None, gguf_dir=None, draft=None, model_dir=None, backend="cuda", yes=False)
+
+        def body():
+            family = maya.choose_family(a, {})
+            return family, maya.choose_model(a, Path(self.dir.name), {}, family)
+
+        bridge = Bridge(self.log)
+        S.UI = bridge
+        app = T.SetupApp(bridge, body, "1.0", "./maya.sh", self.log)
+        async with app.run_test(size=(110, 40)) as pilot:
+            async def until(question):
+                t0 = time.time()
+                while app.pending is None or question not in str(app.query_one("#ask").border_title):
+                    self.assertLess(time.time() - t0, 20)
+                    await pilot.pause(0.02)
+
+            with patch.object(maya.S, "gpus", return_value=[]), patch.object(maya, "mem_gb", return_value=(189, 170)):
+                await until("Model?")
+                await pilot.press("2")
+                await until("Which GLM-5.3?")
+                await pilot.press("escape")
+                await until("Model?")
+                self.assertEqual(app.query_one("#options").highlighted, 1)
+                await pilot.press("1")
+                await until("Which GLM-5.3-Flash?")
+                await pilot.press("enter")
+                while app.return_value is None:
+                    await pilot.pause(0.02)
+        self.assertEqual(app.return_value[0], "done")
+        self.assertEqual(app.return_value[1][0], "glm")
+        bridge.log.close()
 
     async def test_the_line_under_the_logo_names_the_model_once_it_is_known(self):
         seen, real = [], T.splash

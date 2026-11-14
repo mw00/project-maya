@@ -5445,6 +5445,11 @@ int main(int argc, char** argv) {
             }
             if (const strata::MetaValue* v = model_gguf.get("qwen4exp.expert_count")) g.n_expert = (int64_t) v->u;
             if (const strata::MetaValue* v = model_gguf.get("qwen4exp.expert_used_count")) K = (int64_t) v->u;
+            if (const std::string e = strata::qwen_indexer_top_k(model_gguf, g.idx_top_k); !e.empty()) {
+                std::fprintf(stderr, "maya generate: %s\n", e.c_str());
+                return 2;
+            }
+            std::fprintf(stderr, "maya generate: Qwen indexer top_k=%lld\n", (long long) g.idx_top_k);
         } catch (const std::exception& e) {
             std::fprintf(stderr, "maya generate: reading the model's expert shape from %s: %s\n",
                          o.native_preset.c_str(), e.what());
@@ -5556,6 +5561,12 @@ int main(int argc, char** argv) {
                                  "wired - and running without it is a DIFFERENT MODEL (LEDGER L123)\n");
             return 1;
         }
+        if (wc->kind != strata::core::WeightKind::F16InF32 ||
+            wc->bytes != (uint64_t) strata::kernels::PLE_CONV_KERNEL * strata::kernels::NG_HC_DIM * sizeof(uint16_t)) {
+            std::fprintf(stderr, "maya generate: blk.1.ple_conv1d.weight must be F16 in the pack; rebuild it "
+                                 "with tools/iq_pack.py\n");
+            return 1;
+        }
         // `ple_key` is S2 and the loader has already widened its scales to f32, so the two planes are located
         // by the sizes the `WeightRef` records rather than re-derived - the same rule `plane_ptrs` follows.
         if (!wk->quantized()) {
@@ -5566,7 +5577,8 @@ int main(int argc, char** argv) {
             ss.ple.w.key_scales = (const float*) ((const uint8_t*) wk->data + wk->codes_bytes);
         }
         if (o.native_ple_key && wk->quantized()) {
-            if (!wk->native_data || (wk->native_type != 42 && wk->native_type != 18 && wk->native_type != 23) || !wk->native_q8_1) {
+            if (!wk->native_data || (wk->native_type != 42 && wk->native_type != 18 &&
+                                     wk->native_type != 23 && wk->native_type != 8) || !wk->native_q8_1) {
                 std::fprintf(stderr, "maya generate: native PLE key is absent or incompatible\n");
                 return 1;
             }
@@ -8649,7 +8661,7 @@ int main(int argc, char** argv) {
                 cudaDeviceSynchronize();
                 const int64_t L = (int64_t) live.size();
                 const strata::kernels::QsaShapes qs = [&] {
-                    strata::kernels::QsaShapes s = strata::kernels::qsa_real_shapes();
+                    strata::kernels::QsaShapes s = strata::kernels::qsa_real_shapes(g.idx_top_k);
                     s.n_head_kv = g.n_head_kv; s.head_dim = g.head_dim; s.idx_dim = g.idx_key_dim;
                     return s;
                 }();

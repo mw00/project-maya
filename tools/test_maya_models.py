@@ -123,13 +123,12 @@ class FitRecommendation(unittest.TestCase):
                 patch.object(maya, "choose", side_effect=choose), patch.object(maya, "say", lambda *x: None), \
                 patch.object(maya.S, "UI", None):
             glm = maya.choose_model(a, Path("/nowhere"), {})[1]
+            g53_choice = maya.choose_model(a, Path("/nowhere"), {}, "glm53")[1]
             ds4, mm3 = maya.choose_ds4_quant(a, {}), maya.choose_mm3_quant(a, {})
-        flash = [q for q in maya.MODELS if q not in maya.MODELS_BY_HAND]
-        g53 = [q for q in maya.G53_MODELS]
         glm_tags = tags["Which GLM-5.3-Flash?"]
         self.assertEqual(sum(t == "recommended" or (t or "").startswith("recommended for cards") for t in glm_tags), 1)
-        g53_rec = [q for q, t in zip(g53, glm_tags[len(flash):]) if t == f"recommended for {maya.G53.SHOWN}"]
-        return glm, g53_rec[0], ds4, mm3
+        self.assertEqual(tags["Which GLM-5.3?"].count(f"recommended for {maya.G53.SHOWN}"), 1)
+        return glm, g53_choice, ds4, mm3
 
     def test_profiles(self):
         for name, pc in self.PCS.items():
@@ -144,9 +143,12 @@ class FitRecommendation(unittest.TestCase):
             return default
         with patch.object(maya.S, "gpus", return_value=[{"vram_gb": 8.0}]), \
                 patch.object(maya, "mem_gb", return_value=(32.0, 32.0)), patch.object(maya, "choose", side_effect=choose):
-            maya.choose_model(SimpleNamespace(backend="cuda", gguf_dir=None, model=None, yes=True), Path("/m"), {})
+            a = SimpleNamespace(backend="cuda", gguf_dir=None, model=None, yes=True)
+            maya.choose_model(a, Path("/m"), {})
+            maya.choose_model(a, Path("/m"), {}, "glm53")
         self.assertEqual(tags["Which GLM-5.3-Flash?"],
-                         len([q for q in maya.MODELS if q not in maya.MODELS_BY_HAND]) + len(maya.G53_MODELS) + 1)
+                         len([q for q in maya.MODELS if q not in maya.MODELS_BY_HAND]))
+        self.assertEqual(tags["Which GLM-5.3?"], len(maya.G53_MODELS))
 
     def test_rule(self):
         sizes = {"L": 150.0, "S": 100.0, "XS": 70.0}

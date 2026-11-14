@@ -43,6 +43,7 @@ struct ModelGeometry {
     int64_t head_dim = 256;
     int64_t idx_q_heads = 4;
     int64_t idx_key_dim = 128;
+    int64_t idx_top_k = 2048;         ///< qwen4exp.attention.indexer.top_k from the model GGUF
 
     // gated residual, on every layer
     int64_t hc = 4;

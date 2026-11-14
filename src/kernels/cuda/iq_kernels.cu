@@ -5,6 +5,7 @@
 // MIT license, third_party/ggml/LICENSE).  The block structs and codebook grids come from its ggml-common.h,
 // included unchanged.
 #include "strata/kernels/iq_kernels.hpp"
+#include "strata/kernels/dequant_bf16.hpp"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -402,7 +403,23 @@ __device__ __forceinline__ float vec_dot_q5_K_q8_1(const void* __restrict__ vbq,
 
 // ---------------------------------------------------------------- the formats
 // qk = values per block, ipb = dot calls per block (qi / vdr), step = the iqs stride between calls.
+__device__ __forceinline__ float vec_dot_q8_0_q8_1(const void* v, const block_q8_1* y,
+                                                     int kbx, int) {
+    const block_q8_0* w = (const block_q8_0*) v + kbx;
+    int sum = 0;
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        int wi, xi;
+        memcpy(&wi, w->qs + 4 * i, sizeof(wi));
+        memcpy(&xi, y->qs + 4 * i, sizeof(xi));
+        sum = ggml_cuda_dp4a(wi, xi, sum);
+    }
+    return (float) w->d * __low2float(y->ds) * sum;
+}
+
 template<int TY> struct Fmt;
+template<> struct Fmt<8> { static constexpr int qk = 32, ipb = 1, step = 0;
+    __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) { return vec_dot_q8_0_q8_1(v, y, kbx, iqs); } };
 template<> struct Fmt<16> { static constexpr int qk = 256, ipb = 8, step = 2;
     __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) { return vec_dot_iq2_xxs_q8_1(v, y, kbx, iqs); } };
 template<> struct Fmt<17> { static constexpr int qk = 256, ipb = 8, step = 2;
@@ -893,9 +910,19 @@ __device__ void dq_q5_0(const void* vx, int64_t ibs, dst_t* yy, int tid) {
 }
 
 template<typename dst_t>
+__device__ void dq_q8_0(const void* vx, int64_t ibs, dst_t* yy, int tid) {
+    const block_q8_0* x = (const block_q8_0*) vx + ibs * (QK_K / QK8_0);
+    const int b = tid / 4, first = (tid % 4) * 8;
+    const float d = (float) x[b].d;
+    for (int j = 0; j < 8; ++j)
+        yy[b * QK8_0 + first + j] = cvt<dst_t>(d * (float) x[b].qs[first + j]);
+}
+
+template<typename dst_t>
 __device__ __forceinline__ void dq_dispatch(int ty, const void* vx, int64_t ibs, dst_t* y, int tid) {
     switch (ty) {
         case 6: dq_q5_0(vx, ibs, y, tid); break;
+        case 8: dq_q8_0(vx, ibs, y, tid); break;
         case 16: dq_iq2_xxs(vx, ibs, y, tid); break;
         case 17: dq_iq2_xs(vx, ibs, y, tid); break;
         case 18: dq_iq3_xxs(vx, ibs, y, tid); break;
@@ -931,6 +958,7 @@ bool is_iq(int t) { return t == 16 || t == 17 || t == 18 || t == 19 || t == 20 |
 }  // namespace
 
 bool iq_supported(int t) noexcept { return is_iq(t); }
+bool iq_embed_supported(int t) noexcept { return is_iq(t) || t == 8 || (t >= 10 && t <= 14); }
 
 size_t iq_row_bytes(int t, int64_t n) noexcept {
     switch (t) {
@@ -970,6 +998,7 @@ void iq_mmvq(int t, const void* w, const void* x_q8_1, float* y, int n_in, int n
     const auto* W = (const uint8_t*) w;
     const auto* X = (const block_q8_1*) x_q8_1;
     switch (t) {
+        case 10: launch_mmvq<10>(W, rb, X, y, n_in, n_out, ncols, grid, block, s); break;
         case 16: launch_mmvq<16>(W, rb, X, y, n_in, n_out, ncols, grid, block, s); break;
         case 17: launch_mmvq<17>(W, rb, X, y, n_in, n_out, ncols, grid, block, s); break;
         case 18: launch_mmvq<18>(W, rb, X, y, n_in, n_out, ncols, grid, block, s); break;
@@ -988,7 +1017,8 @@ void iq_mmvq(int t, const void* w, const void* x_q8_1, float* y, int n_in, int n
 
 void iq_dequant_f16(int t, const void* src, int64_t n, uint16_t* dst, void* stream) {
     // (+ Q5_0: a routed down matrix of unsloth's Qwen3.8 UD-IQ2_XS; iq_supported() stays the i-quant set)
-    if (n % 256 != 0 || !(is_iq(t) || t == 6)) { std::fprintf(stderr, "iq_dequant_f16: bad arguments\n"); std::exit(1); }
+    if (n % 256 != 0 || !(is_iq(t) || t == 6 || t == 8 || (t >= 10 && t <= 14))) { std::fprintf(stderr, "iq_dequant_f16: bad arguments\n"); std::exit(1); }
+    if (t >= 10 && t <= 14) { dequant_f16(t, src, 0, 1, n, dst, stream); return; }
     dequant_flat_kernel<__half><<<(unsigned) (n / 256), 32, 0, (cudaStream_t) stream>>>(t, src, (__half*) dst);
     check("iq_dequant_f16");
 }
@@ -1006,19 +1036,22 @@ __global__ void embed_rows_kernel(int ty, const uint8_t* __restrict__ table, siz
 void iq_embed_rows(int t, const void* table, size_t row_bytes, const int32_t* tokens, int64_t n_tok, int64_t n_embd,
                    float* out, void* stream) {
     if (n_tok <= 0) return;
-    if (n_embd % 256 != 0 || !is_iq(t)) { std::fprintf(stderr, "iq_embed_rows: bad arguments\n"); std::exit(1); }
+    if (n_embd % 256 != 0 || !iq_embed_supported(t)) { std::fprintf(stderr, "iq_embed_rows: bad arguments\n"); std::exit(1); }
+    if (t >= 10 && t <= 14) { dequant_embed_rows(t, table, (int64_t) row_bytes, tokens, n_tok, n_embd, out, stream); return; }
     embed_rows_kernel<<<dim3((unsigned) (n_embd / 256), (unsigned) n_tok), 32, 0, (cudaStream_t) stream>>>(
         t, (const uint8_t*) table, row_bytes, tokens, n_embd, out);
     check("iq_embed_rows");
 }
 
 void iq_dequant_f32(int t, const void* src, int64_t n, float* dst, void* stream) {
-    if (n % 256 != 0 || !is_iq(t)) { std::fprintf(stderr, "iq_dequant_f32: bad arguments\n"); std::exit(1); }
+    if (n % 256 != 0 || !iq_embed_supported(t)) { std::fprintf(stderr, "iq_dequant_f32: bad arguments\n"); std::exit(1); }
+    if (t >= 10 && t <= 14) { dequant_f32(t, src, 0, 1, n, dst, stream); return; }
     dequant_flat_kernel<float><<<(unsigned) (n / 256), 32, 0, (cudaStream_t) stream>>>(t, src, dst);
     check("iq_dequant_f32");
 }
 
 void iq_dequant_gu_f16(int t, const void* gate, const void* up, int64_t n_ff, int64_t n_embd, uint16_t* dst, void* stream) {
+    if (t >= 10 && t <= 14) { dequant_gu_f16(t, gate, up, n_ff, n_embd, dst, stream); return; }
     const int64_t per_row = n_embd / 256;
     dequant_gu_kernel<<<dim3((unsigned) (n_ff * per_row), 2), 32, 0, (cudaStream_t) stream>>>(t, gate, up, per_row,
                                                                                            (__half*) dst);
@@ -1050,7 +1083,7 @@ bool native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
                            float swiglu_limit) {
     // glm-dsa B3.5: a type with no kernel below (the two switches' cases) is refused before any launch and reported by
     // the caller; it stopped the process (std::exit) when the K-quants were missing
-    const auto has_kernel = [](int t) { return (t >= 10 && t <= 14) || (t >= 16 && t <= 23) || t == 29 || t == 42; };
+    const auto has_kernel = [](int t) { return t == 8 || (t >= 10 && t <= 14) || (t >= 16 && t <= 23) || t == 29 || t == 42; };
     if (!has_kernel(L.gu_type) || !(has_kernel(L.d_type) || L.d_type == 6)) {   // (down: Maya v1.1.55 Q5_0 too)
         std::fprintf(stderr, "native_expert_grouped: no kernel for gate/up type %d, down type %d\n", L.gu_type, L.d_type);
         return false;
@@ -1065,6 +1098,7 @@ bool native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
     const auto* X = (const block_q8_1*) x_q8_1;
     const dim3 ggu((unsigned) ((2 * L.n_ff + GU_ROWS - 1) / GU_ROWS), (unsigned) cap_groups);
     switch (L.gu_type) {
+        case 8: native_gu_kernel<8><<<ggu, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
         case 16: native_gu_kernel<16><<<ggu, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
         case 17: native_gu_kernel<17><<<ggu, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
         case 18: native_gu_kernel<18><<<ggu, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
@@ -1088,6 +1122,7 @@ bool native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
     quantize_q8_1_kernel<<<(unsigned) ((nh + 255) / 256), 256, 0, s>>>(h, hq, nh);
     const dim3 gd((unsigned) ((L.n_embd + 7) / 8), (unsigned) cap_groups);
     switch (L.d_type) {
+        case 8: native_down_kernel<8><<<gd, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;
         case 6: native_down_kernel<6><<<gd, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;
         case 18: native_down_kernel<18><<<gd, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;
         case 20: native_down_kernel<20><<<gd, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;

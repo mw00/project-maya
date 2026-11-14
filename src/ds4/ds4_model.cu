@@ -19,6 +19,7 @@
 #include "ds4_draft_placement.hpp"
 
 #include "ds4_gguf.cuh"
+#include "ds4_vision_weights.hpp"
 #if defined(STRATA_USE_HIP)
 #include "ds4_iq.cuh"
 #endif
@@ -10469,31 +10470,27 @@ struct Model::Impl {
         vg.dim = (int) pk.num("vision.hidden_size", 1024), vg.heads = (int) pk.num("vision.num_attention_heads", 16);
         vg.inter = (int) pk.num("vision.intermediate_size", 2816), vg.patch = (int) pk.num("vision.patch_size", 14);
         vg.merge = (int) pk.num("vision.downsample_ratio", 3), vg.theta = (float) pk.num("vision.rope_theta", 1e4);
+        vg.eps = (float) pk.num("vision.rms_norm_eps", 1e-6);
         vg.max_tokens = (int) pk.num("vision.max_image_tokens", 1024), vg.out = g.dim;
         const char* mark[3] = {"image_start", "image_newline", "image_end"};
         for (int i = 0; i < 3; ++i) {
             const Tensor* t = pk.get(mark[i]);
             img_mark[i].resize((size_t) g.dim);
-            if (t == nullptr || t->dtype != "BF16" || t->bytes != (uint64_t) g.dim * 2 || !pk.read(*t, img_mark[i].data())) {
-                err = std::string(mark[i]) + ": not a BF16 row of the model's width";
+            std::vector<int64_t> shape;
+            if (t == nullptr || t->shape != std::vector<int64_t>{g.dim} ||
+                !vision_read_bf16(pk, mark[i], shape, img_mark[i].data(), err)) {
+                if (err.empty()) err = std::string(mark[i]) + ": not a marker row of the model's width";
                 return false;
             }
         }
         const double t0 = now_ms();
         Dev& d = devs[0];
-        std::string not_bf16;   // (a quant's own copy of the tower in another type - turboderp's EXL3: F16, #886)
-        auto read = [this, &not_bf16](const std::string& n, std::vector<int64_t>& shape, void* dst) {
-            const Tensor* t = pk.get(n);
-            if (t != nullptr && t->dtype != "BF16" && not_bf16.empty()) not_bf16 = n + " is " + t->dtype;
-            if (t == nullptr || t->dtype != "BF16") return false;
-            shape = t->shape;
-            return dst == nullptr || pk.read(*t, dst);
+        std::string read_error;
+        auto read = [this, &read_error](const std::string& n, std::vector<int64_t>& shape, void* dst) {
+            return vision_read_bf16(pk, n, shape, dst, read_error);
         };
         if (!vt.load(vg, d.id, read, err)) {
-            if (!not_bf16.empty())
-                err = "vision: " + not_bf16 + ", and the tower is read in BF16 only - put shard 1 of DeepSeek's "
-                      "checkpoint (model-00001-of-00048.safetensors) in the model's folder and run tools/ds4/pack.py "
-                      "again: it takes the BF16 tower from there";
+            if (!read_error.empty()) err = read_error;
             return false;
         }
         img_tok = tok;

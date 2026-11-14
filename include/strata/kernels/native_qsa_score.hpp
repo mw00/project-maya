@@ -8,7 +8,7 @@ void native_qsa_score_set_enabled(bool enabled);
 bool native_qsa_score_enabled();
 
 // SM120, single contiguous text sequence: F32 pooled[128,max_blocks] and
-// query[128,4], four-cell blocks, top-k budget2048. Matches the pinned CUDA MMF
+// query[128,4], four-cell blocks, top-k budget from the GGUF (2048 or 4096). Matches the pinned CUDA MMF
 // dispatch with the model's n_kv padded to256 (n_blocks a multiple of64), even
 // when only a partial32-row tile is live. This is not the unpadded odd-row
 // cuBLAS contract. MMA consumes the same raw F32 register bits as the oracle.

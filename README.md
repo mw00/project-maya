@@ -301,6 +301,17 @@ The setup shows every download before it starts it, builds everything once (20-4
 - **Model files downloaded another way** (a download manager, another PC, a Hugging Face cache): `./maya.sh --import-model FOLDER`
   finds Maya's files in FOLDER by size and checksum, whatever they are called, and moves them into place (`--copy` when
   FOLDER is on another drive; the originals stay). Files that do not match are left alone.
+  During interactive setup, choose **0) Add downloaded model** on the model-files screen and enter its directory
+  (or press **Ctrl+O** to browse and search folders). The next screen shows the detected **Model**, **Drafter** and
+  **Vision** files. Select a row to choose another detected file or edit its name, then choose **Link files** to check
+  the model type (GGUF header or EXL3 `config.json`) and create symbolic links without moving or copying files, or
+  **Import Model** to verify the selected files by size and SHA-256 before moving or copying them. Linking does not
+  compare file sizes or SHA-256 values. Listed variants need their published file names; all linked source files must
+  stay at their original location for Maya to use them.
+  An unlisted Qwen3.8-Flash-Next GGUF (for example unsloth's Q8_0) is linked as a local quant and set up with its
+  selected MTP and vision files. Keep all its shards at their original location; Maya builds a separate pack and
+  config for that quant. The Qwen runtime reads `qwen4exp.attention.indexer.top_k` from the model GGUF and supports
+  both 2048 and 4096; older files without the key use 2048.
 - **Every option** (GPUs, context, a model folder you already have, remote access, ...): [docs/SETUP.md](docs/SETUP.md).
 
 > **The start takes a few minutes:** the engine pins most of the free RAM (all but about 6 GB) for its expert tier,

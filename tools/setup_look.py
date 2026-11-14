@@ -209,6 +209,8 @@ SETUP_CSS = """
     #options > .option-list--option-highlighted,
     #options:focus > .option-list--option-highlighted { background: $maya-tint; color: $maya-accent-text;
                                                         text-style: bold; }
+    #text-answer { display: none; width: 100%; border: solid $maya-edge; background: $background; color: $text; }
+    #text-answer:focus { border: solid $maya-accent-text; }
     #about { margin-top: 1; color: $maya-muted; text-style: italic; }
 """
 # Ctrl+C's question, over the screen

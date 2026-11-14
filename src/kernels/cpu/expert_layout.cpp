@@ -208,10 +208,17 @@ bool expert_layout_load(const std::string& pack_dir, int64_t n_layers, int64_t n
             L.gguf_off[(size_t) (3 * l)] = go;
             L.gguf_off[(size_t) (3 * l + 1)] = uo;
             L.gguf_off[(size_t) (3 * l + 2)] = dox;
-            std::string file;             // v3: the shard that holds this layer (a file name beside --native)
-            if (ss >> file) {
-                if (L.gguf_file.empty()) L.gguf_file.assign((size_t) n_layers, std::string());
-                L.gguf_file[(size_t) l] = file;
+            std::vector<std::string> files;
+            std::string file;
+            while (ss >> file) files.push_back(file);
+            if (!files.empty()) {
+                if (files.size() != 1 && files.size() != 3) {
+                    err = "native_experts.txt: layer " + std::to_string(l) + " must name one shard or gate/up/down shards";
+                    return false;
+                }
+                if (L.gguf_file.empty()) L.gguf_file.resize((size_t) (3 * n_layers));
+                for (int r = 0; r < 3; ++r)
+                    L.gguf_file[(size_t) (3 * l + r)] = files[files.size() == 1 ? 0 : (size_t) r];
             }
         }
         L.fmt[(size_t) l] = f;
