@@ -29,6 +29,12 @@ extern char** environ;
 namespace strata::core {
 namespace glmpf {   // glm_prefill_dsa.cu (B14.1: the glm-dsa clamp after MMQ's quantizer, HIP only)
 void mmq_clamp(bool on, void* xq, int64_t rows, int64_t cols, int type, cudaStream_t s);
+// glm_prefill.cu: the prompt path's EXL3 lane (a BLAS handle on a stream; one expert's rows)
+void* x3_blas_open(cudaStream_t s);
+void x3_blas_close(void* blas);
+void x3_expert_rows(void* blas, cudaStream_t s, uint16_t* w16, int64_t w16_elems, const uint8_t* blob,
+                    const strata::kernels::exl3::ExpertLayout& lay, int E, int nff, float limit, const float* x,
+                    const int* row_tok, int nrows, float* out);
 }
 namespace {
 constexpr int64_t H = strata::kernels::cpu::H;
@@ -107,8 +113,7 @@ bool GlmExpertHelper::open(int device, int n_embd, int n_ff,
                            const std::vector<std::pair<void*, size_t>>& regions, std::string& err, bool exl3) {
     close();
     if (device == kLinkDevice) {
-        if (exl3) { err = "GLM expert helper link: native GGUF experts only"; return false; }
-        return open_link(n_embd, n_ff, regions, err);
+        return open_link(n_embd, n_ff, regions, err, exl3);
     }
     DeviceScope scope(device);
     if (!scope.ok) { err = scope.error(device); return false; }
@@ -390,9 +395,19 @@ bool GlmExpertHelper::start(const strata::kernels::exl3::ExpertLayout* xl, int g
     size_t bytes = 0;
     for (int i = 0; i < ne; ++i) bytes += slots_[(size_t) keys[i]].bytes;
     if (link_) {
-        if (xl != nullptr) { err = "GLM expert helper link: native GGUF experts only"; return false; }
         const auto t0 = std::chrono::steady_clock::now();
-        ctl_->op = hlink::kCompute;
+        ctl_->op = xl != nullptr ? hlink::kComputeX3 : hlink::kCompute;
+        if (xl != nullptr) {   // (an EXL3 pack: the layer's blob layout with the call)
+            for (int r = 0; r < 3; ++r) {
+                ctl_->x3_suh[r] = xl->suh[r];
+                ctl_->x3_svh[r] = xl->svh[r];
+                ctl_->x3_trellis[r] = xl->trellis[r];
+                ctl_->x3_k2[r] = xl->k2[r];
+                ctl_->x3_gg[r] = xl->gg_type[r];
+            }
+            ctl_->x3_cb = xl->cb;
+            ctl_->x3_fmt = xl->fmt;
+        }
         ctl_->ne = ne;
         ctl_->gu_type = gu_type;
         ctl_->d_type = d_type;
@@ -629,7 +644,7 @@ void GlmExpertHelper::close() {
 
 // ---------------------------------------------------------------- the helper in a second program (Linux)
 bool GlmExpertHelper::open_link(int n_embd, int n_ff, const std::vector<std::pair<void*, size_t>>& regions,
-                                std::string& err) {
+                                std::string& err, bool exl3) {
 #ifdef __linux__
     if (n_embd <= 0 || n_embd > hlink::kMaxEmbd || n_ff <= 0) {
         err = "GLM expert helper link: unsupported dimensions";
@@ -719,6 +734,7 @@ bool GlmExpertHelper::open_link(int n_embd, int n_ff, const std::vector<std::pai
     ctl_->op = hlink::kOpen;
     ctl_->a = n_embd;
     ctl_->b = n_ff;
+    ctl_->x3_on = exl3 ? 1 : 0;
     if (!link_post(err) || !link_wait(err)) {
         close();
         return false;
@@ -743,6 +759,7 @@ bool GlmExpertHelper::open_link(int n_embd, int n_ff, const std::vector<std::pai
     (void) n_embd;
     (void) n_ff;
     (void) regions;
+    (void) exl3;
     err = "GLM expert helper link: Linux only";
     return false;
 #endif
@@ -1099,12 +1116,24 @@ bool RemoteExperts::finish(float* out, std::string& err) {
 // ---- the linked helper's prompt exchange (glm_helper_link.hpp PfLayout) ----
 
 bool GlmExpertHelper::pf_post(int gu_type, int d_type, size_t down_off, float limit, bool dsa, int T, int K, int n,
-                              int rows, int r0, std::string& err, int slot) {
+                              int rows, int r0, std::string& err, int slot,
+                              const strata::kernels::exl3::ExpertLayout* xl) {
     if (!link_ || ctl_ == nullptr || pf_cap_ <= 0 || T > (slot > 0 ? pf_slot_cap() : pf_cap_) || slot < 0 || slot > 2 || K > hlink::kPfMaxK || n > hlink::kPfMaxExperts) {
         err = "GLM expert helper link: no prompt exchange for this layer";
         return false;
     }
-    ctl_->op = hlink::kPrompt;
+    ctl_->op = xl != nullptr ? hlink::kPromptX3 : hlink::kPrompt;
+    if (xl != nullptr) {   // (an EXL3 pack: the layer's blob layout with the call)
+        for (int r = 0; r < 3; ++r) {
+            ctl_->x3_suh[r] = xl->suh[r];
+            ctl_->x3_svh[r] = xl->svh[r];
+            ctl_->x3_trellis[r] = xl->trellis[r];
+            ctl_->x3_k2[r] = xl->k2[r];
+            ctl_->x3_gg[r] = xl->gg_type[r];
+        }
+        ctl_->x3_cb = xl->cb;
+        ctl_->x3_fmt = xl->fmt;
+    }
     ctl_->gu_type = gu_type;
     ctl_->d_type = d_type;
     ctl_->down_off = down_off;
@@ -1459,6 +1488,108 @@ bool GlmExpertHelper::pf_run(int gu_type, int d_type, size_t down_off, float lim
 #else
     (void) gu_type; (void) d_type; (void) down_off; (void) limit; (void) dsa; (void) T; (void) K; (void) n;
     (void) rows; (void) r0; (void) blobs; (void) slot;
+    err = "GLM expert helper: prompt products need the helper program of a HIP build";
+    return false;
+#endif
+}
+
+// The same layer for an EXL3 pack's experts: MMQ does not read their trellis, so each expert's rows go through the
+// prompt path's EXL3 lane (glmpf::x3_expert_rows: the weights decoded once, FP16 GEMMs), a window of rows at a time,
+// and the window's weighted rows are added into out as pf_run does.
+bool GlmExpertHelper::pf_run_x3(const strata::kernels::exl3::ExpertLayout& lay, float limit, int T, int K, int n,
+                                int rows, int r0, const uint8_t* const* blobs, std::string& err, int slot) {
+#if defined(STRATA_USE_HIP)
+    namespace gb = strata::kernels::glmb;
+    namespace x3 = strata::kernels::exl3;
+    if (pf_ == nullptr || T <= 0 || slot < 0 || slot > 2 || T > (slot > 0 ? pf_slot_cap() : pf_cap_) || K <= 0 || K > hlink::kPfMaxK || n < 0 || n > hlink::kPfMaxExperts ||
+        rows < 0 || rows > T * K || r0 < 0) {
+        err = "GLM expert helper: invalid prompt call";
+        return false;
+    }
+    DeviceScope scope(device_);
+    if (!scope.ok) { err = scope.error(device_); return false; }
+    const int E = n_embd_, nff = n_ff_;
+    if (2 * nff != E) {   // (the lane keeps an expert's gate/up in its own output rows)
+        err = "GLM expert helper: EXL3 prompt products need n_embd = 2 x the experts' width";
+        return false;
+    }
+    const auto al = [](size_t b) { return (b + 255) & ~(size_t) 255; };
+    // the scratch: the decoded gate/up (or down) in FP16 and the inputs of up to w16_rows rows of one expert, and the
+    // window's output rows (MAYA_GLM_LINK_PF_WIN rows, default 8192)
+    const int64_t w16_rows = 2048;
+    const int64_t w16_elems = (int64_t) 2 * nff * E + 2 * w16_rows * E;
+    if (pf_x3_win_ == 0) {
+        const char* wv = std::getenv("MAYA_GLM_LINK_PF_WIN");
+        int W = wv != nullptr ? std::atoi(wv) : 8192;
+        W = (std::max(W, 256) + 255) & ~255;
+        const size_t need = al((size_t) w16_elems * sizeof(uint16_t)) + al((size_t) W * E * sizeof(float));
+        if (!check(cudaMalloc(&pf_x3_scratch_, need), "EXL3 prompt scratch", err, device_)) return false;
+        pf_x3_blas_ = glmpf::x3_blas_open(stream_);
+        if (pf_x3_blas_ == nullptr) {
+            err = "GLM expert helper: no BLAS handle for the EXL3 prompt products";
+            return false;
+        }
+        pf_x3_win_ = W;
+        std::fprintf(stderr, "maya-glm-helper: EXL3 prompt windows of %d rows (%.0f MB scratch)\n", W, need / 1048576.0);
+    }
+    const int W = pf_x3_win_;
+    uint16_t* w16 = (uint16_t*) pf_x3_scratch_;
+    float* OUTP = (float*) ((uint8_t*) pf_x3_scratch_ + al((size_t) w16_elems * sizeof(uint16_t)));
+    // each expert's blob as this GPU reads it (the registered shared tier, in place)
+    std::vector<const uint8_t*> dev_of((size_t) n, nullptr);
+    for (int j = 0; j < n; ++j)
+        for (const auto& r : regions_) {
+            const uintptr_t off = (uintptr_t) blobs[j] - (uintptr_t) r.host;
+            if (blobs[j] != nullptr && (uintptr_t) blobs[j] >= (uintptr_t) r.host && off < r.bytes) {
+                dev_of[(size_t) j] = r.mapped + off;
+                break;
+            }
+        }
+    const int32_t* cnts = pf_cnts(slot);
+    const float* x_d = (const float*) pf_at(slot, &hlink::PfLayout::x, pf_dev_);
+    float* out_d = (float*) pf_at(slot, &hlink::PfLayout::out, pf_dev_);
+    const int32_t* pos_d = (const int32_t*) pf_at(slot, &hlink::PfLayout::pos, pf_dev_);
+    const float* rw_d = (const float*) pf_at(slot, &hlink::PfLayout::rw, pf_dev_);
+    const int32_t* rtok_d = (const int32_t*) pf_at(slot, &hlink::PfLayout::rtok, pf_dev_);
+    int64_t sum = 0;
+    for (int j = 0; j < n; ++j) {
+        if (cnts[j] < 0 || dev_of[(size_t) j] == nullptr) {
+            err = "GLM expert helper: a prompt expert outside the shared RAM tier";
+            return false;
+        }
+        sum += cnts[j];
+    }
+    if (sum != rows) {
+        err = "GLM expert helper: the prompt experts' rows do not add up";
+        return false;
+    }
+    const int errs0 = x3::launch_errors();
+    cudaStream_t s = stream_;
+    cudaMemsetAsync(out_d, 0, (size_t) T * E * sizeof(float), s);
+    int j = 0, jr = 0;
+    for (int a = 0; a < rows;) {
+        const int b = std::min(rows, a + W);
+        for (int at = a; at < b;) {
+            // (an expert's rows in pieces of at most w16_rows: the lane's scratch holds that many inputs)
+            const int take = std::min({cnts[j] - jr, b - at, (int) w16_rows});
+            if (take > 0)
+                glmpf::x3_expert_rows(pf_x3_blas_, s, w16, w16_elems, dev_of[(size_t) j], lay, E, nff, limit, x_d,
+                                      rtok_d + at, take, OUTP + (size_t) (at - a) * E);
+            at += take;
+            jr += take;
+            if (jr == cnts[j]) { ++j; jr = 0; }
+        }
+        gb::moe_combine_add(OUTP, r0 + a, r0 + a, r0 + b, pos_d, rw_d, T, K, E, out_d, s);
+        a = b;
+    }
+    if (!check(cudaStreamSynchronize(s), "EXL3 prompt layer", err, device_)) return false;
+    if (x3::launch_errors() != errs0) {
+        err = "GLM expert helper: an EXL3 prompt kernel did not run";
+        return false;
+    }
+    return true;
+#else
+    (void) lay; (void) limit; (void) T; (void) K; (void) n; (void) rows; (void) r0; (void) blobs; (void) slot;
     err = "GLM expert helper: prompt products need the helper program of a HIP build";
     return false;
 #endif
