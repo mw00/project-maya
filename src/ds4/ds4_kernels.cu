@@ -4322,7 +4322,7 @@ void index_score(const float* q, const float* w, const void* k, int heads, int h
     }
     const dim3 grid(cdiv(n, kThreads), T);
 #if defined(STRATA_USE_HIP)
-    if (kfmt == kKvFp4p) {
+    if (kfmt == kKvFp4p && hd == 128) {
         static const bool sdot4_env = [] {
             const char* e = std::getenv("DS4_INDEX_SDOT4");
             return e != nullptr && std::atoi(e) != 0;
