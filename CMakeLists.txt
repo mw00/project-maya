@@ -290,6 +290,13 @@ if(NOT WIN32 AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/ds4_engram_reader_tes
   target_link_libraries(ds4_engram_reader_test PRIVATE strata_warnings Threads::Threads)
   add_test(NAME ds4_engram_reader_test COMMAND ds4_engram_reader_test)
 endif()
+# Linux Engram NUMA startup failure paths; simulated syscalls need no NUMA topology or privilege.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/ds4_engram_numa_test.cpp")
+  add_executable(ds4_engram_numa_test EXCLUDE_FROM_ALL tests/ds4_engram_numa_test.cpp)
+  target_include_directories(ds4_engram_numa_test PRIVATE include)
+  target_link_libraries(ds4_engram_numa_test PRIVATE strata_warnings Threads::Threads)
+  add_test(NAME ds4_engram_numa_test COMMAND ds4_engram_numa_test)
+endif()
 # maya-ds4 --parallel, DS4_MULTI_ATTN: a multi step's window buffers side by side and the attention's launches over them
 # (src/ds4/ds4_multi_attn.hpp; host code only, so a build without the suite builds it by name)
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/ds4_multi_attn_plan_test.cpp")
