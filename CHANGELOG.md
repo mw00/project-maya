@@ -4,6 +4,13 @@ Every release is on GitHub (Releases) with these notes; every published change m
 page's Settings › About and updates (About > Update before the redesign; from v1.0.18), or `git pull`, then `./setup.sh` (Windows: `START-MAYA.bat`) - it recompiles
 only what changed and starts; the model is not downloaded again.
 
+## v1.1.63 - 2026-11-14
+
+Fixes for v1.1.62: the DeepSeek engine builds on Windows again, and GLM on an AMD APU paired with an NVIDIA GPU no longer restarts its engine before every request.
+
+- **Fix: DeepSeek on Windows with an NVIDIA GPU (#983, @pietroMastro92):** v1.1.62's DeepSeek engine did not compile on Windows, so the setup could not update it. The new two-GPU code used Linux-only calls; it compiles on Windows again, and nothing else changes there.
+- **Fix: GLM on an AMD APU + NVIDIA GPU (Linux):** after a context change, an engine restart or an idle unload, Maya started the engine again before every request, about a minute each. It now starts once and stays running.
+
 ## v1.1.62 - 2026-11-13
 
 AMD Strix Halo and Gorgon Halo APUs (Ryzen AI Max) can now be paired with an NVIDIA GPU: Maya runs one model on both at once, with GLM-5.3-Flash prefilling up to 3 times faster and DeepSeek-V4.1-Flash decoding up to 18% faster than on the APU alone.
