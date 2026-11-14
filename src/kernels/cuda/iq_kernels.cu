@@ -5,6 +5,7 @@
 // MIT license, third_party/ggml/LICENSE).  The block structs and codebook grids come from its ggml-common.h,
 // included unchanged.
 #include "strata/kernels/iq_kernels.hpp"
+#include "strata/kernels/dequant_bf16.hpp"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -957,7 +958,7 @@ bool is_iq(int t) { return t == 16 || t == 17 || t == 18 || t == 19 || t == 20 |
 }  // namespace
 
 bool iq_supported(int t) noexcept { return is_iq(t); }
-bool iq_embed_supported(int t) noexcept { return is_iq(t) || t == 8; }
+bool iq_embed_supported(int t) noexcept { return is_iq(t) || t == 8 || (t >= 10 && t <= 14); }
 
 size_t iq_row_bytes(int t, int64_t n) noexcept {
     switch (t) {
@@ -997,6 +998,7 @@ void iq_mmvq(int t, const void* w, const void* x_q8_1, float* y, int n_in, int n
     const auto* W = (const uint8_t*) w;
     const auto* X = (const block_q8_1*) x_q8_1;
     switch (t) {
+        case 10: launch_mmvq<10>(W, rb, X, y, n_in, n_out, ncols, grid, block, s); break;
         case 16: launch_mmvq<16>(W, rb, X, y, n_in, n_out, ncols, grid, block, s); break;
         case 17: launch_mmvq<17>(W, rb, X, y, n_in, n_out, ncols, grid, block, s); break;
         case 18: launch_mmvq<18>(W, rb, X, y, n_in, n_out, ncols, grid, block, s); break;
@@ -1015,7 +1017,8 @@ void iq_mmvq(int t, const void* w, const void* x_q8_1, float* y, int n_in, int n
 
 void iq_dequant_f16(int t, const void* src, int64_t n, uint16_t* dst, void* stream) {
     // (+ Q5_0: a routed down matrix of unsloth's Qwen3.8 UD-IQ2_XS; iq_supported() stays the i-quant set)
-    if (n % 256 != 0 || !(is_iq(t) || t == 6 || t == 8)) { std::fprintf(stderr, "iq_dequant_f16: bad arguments\n"); std::exit(1); }
+    if (n % 256 != 0 || !(is_iq(t) || t == 6 || t == 8 || (t >= 10 && t <= 14))) { std::fprintf(stderr, "iq_dequant_f16: bad arguments\n"); std::exit(1); }
+    if (t >= 10 && t <= 14) { dequant_f16(t, src, 0, 1, n, dst, stream); return; }
     dequant_flat_kernel<__half><<<(unsigned) (n / 256), 32, 0, (cudaStream_t) stream>>>(t, src, (__half*) dst);
     check("iq_dequant_f16");
 }
@@ -1034,6 +1037,7 @@ void iq_embed_rows(int t, const void* table, size_t row_bytes, const int32_t* to
                    float* out, void* stream) {
     if (n_tok <= 0) return;
     if (n_embd % 256 != 0 || !iq_embed_supported(t)) { std::fprintf(stderr, "iq_embed_rows: bad arguments\n"); std::exit(1); }
+    if (t >= 10 && t <= 14) { dequant_embed_rows(t, table, (int64_t) row_bytes, tokens, n_tok, n_embd, out, stream); return; }
     embed_rows_kernel<<<dim3((unsigned) (n_embd / 256), (unsigned) n_tok), 32, 0, (cudaStream_t) stream>>>(
         t, (const uint8_t*) table, row_bytes, tokens, n_embd, out);
     check("iq_embed_rows");
@@ -1041,11 +1045,13 @@ void iq_embed_rows(int t, const void* table, size_t row_bytes, const int32_t* to
 
 void iq_dequant_f32(int t, const void* src, int64_t n, float* dst, void* stream) {
     if (n % 256 != 0 || !iq_embed_supported(t)) { std::fprintf(stderr, "iq_dequant_f32: bad arguments\n"); std::exit(1); }
+    if (t >= 10 && t <= 14) { dequant_f32(t, src, 0, 1, n, dst, stream); return; }
     dequant_flat_kernel<float><<<(unsigned) (n / 256), 32, 0, (cudaStream_t) stream>>>(t, src, dst);
     check("iq_dequant_f32");
 }
 
 void iq_dequant_gu_f16(int t, const void* gate, const void* up, int64_t n_ff, int64_t n_embd, uint16_t* dst, void* stream) {
+    if (t >= 10 && t <= 14) { dequant_gu_f16(t, gate, up, n_ff, n_embd, dst, stream); return; }
     const int64_t per_row = n_embd / 256;
     dequant_gu_kernel<<<dim3((unsigned) (n_ff * per_row), 2), 32, 0, (cudaStream_t) stream>>>(t, gate, up, per_row,
                                                                                            (__half*) dst);
