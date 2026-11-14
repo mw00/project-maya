@@ -23976,7 +23976,8 @@ int Model::sample(float t, float tp, int tk, float mp, uint64_t seed, uint64_t c
         return -1;
     }
     const int x = p.sample(t, tp, tk, mp, seed, counter);
-    if (x != -2) return x;
+    // Grammar exhaustion uses -2 too, and reaches the request as DONE grammar.
+    if (x != -2 || p.grammar != nullptr) return x;
     std::fprintf(stderr, "ds4 pool: the sample's answer did not come - the request goes on here\n");
     if (!p.part_recover(p.pos, true, err)) {
         std::fprintf(stderr, "ds4 pool fallback: %s\n", err.c_str());
