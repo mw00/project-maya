@@ -173,6 +173,11 @@ class Bridge:
         fut.set_exception(BackRequested())
         return True
 
+    def retry_text(self, question: str) -> None:
+        """An invalid path is still being edited; Esc should return to the preceding menu."""
+        if self.step_no < 3 and self.answers and self.answers[-1][0] == ("text", question):
+            self.answers.pop()
+
     def commit_add(self) -> None:
         """After placing files, Esc from the model list returns to the family, not to the completed file action."""
         if self.step_no < 3:

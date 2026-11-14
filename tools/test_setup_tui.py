@@ -159,6 +159,22 @@ class PlainSetup(unittest.TestCase):
             self.assertEqual(pick, 0)
             imported.assert_called_once_with(a, folder, models_override=models, from_setup=True)
 
+    def test_invalid_directory_is_prompted_again_with_its_previous_value(self):
+        a = SimpleNamespace(copy=False, yes=False)
+        with tempfile.TemporaryDirectory() as folder:
+            wrong = str(Path(folder) / "mistyped")
+            with patch.object(maya, "choose", side_effect=[1, 1, 0]) as choose, \
+                    patch.object(S, "ask_text", side_effect=[wrong, folder]) as ask_text, \
+                    patch.object(maya, "warn") as warning, \
+                    patch.object(maya, "import_model", return_value=0):
+                maya.choose_with_add(a, "Which files?", [], [("First", None, None)], 0, False,
+                                     Path(folder) / "models", "glm")
+            self.assertEqual(choose.call_count, 3)
+            self.assertEqual([call.args for call in ask_text.call_args_list],
+                             [("Directory with downloaded model files", ""),
+                              ("Directory with downloaded model files", wrong)])
+            warning.assert_called_once_with(f"{wrong} is not a directory")
+
     def test_a_closed_screen_falls_back_to_print(self):
         S.UI = SimpleNamespace(say=lambda msg: False, ok=lambda msg: False)
         with patch("sys.stdout", new=io.StringIO()) as out:
@@ -343,6 +359,20 @@ class Screen(unittest.IsolatedAsyncioTestCase):
                 await until("Which files?")
                 await pilot.press("0")
                 await until("Directory with downloaded model files")
+                await pilot.press("escape")
+                await until("Which files?")
+                await pilot.press("0")
+                await until("Directory with downloaded model files")
+                wrong = str(Path(self.dir.name) / "mistyped")
+                app.query_one("#text-answer", T.Input).value = wrong
+                previous = app.pending[0]
+                await pilot.press("enter")
+                t0 = time.time()
+                while app.pending is None or app.pending[0] is previous:
+                    self.assertLess(time.time() - t0, 20)
+                    await pilot.pause(0.02)
+                await until("Directory with downloaded model files")
+                self.assertEqual(app.query_one("#text-answer", T.Input).value, wrong)
                 await pilot.press("escape")
                 await until("Which files?")
                 await pilot.press("0")

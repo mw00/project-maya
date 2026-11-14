@@ -1950,14 +1950,18 @@ def choose_with_add(a, question: str, intro: list, rows: list, default: int, yes
         pick = choose(question, intro, options, default, False)
         if pick < len(rows):
             return pick
-        folder = S.ask_text("Directory with downloaded model files")
-        if not folder:
-            warn("enter a directory with downloaded model files")
-            continue
-        src = Path(folder).expanduser().resolve()
-        if not src.is_dir():
-            warn(f"{folder} is not a directory")
-            continue
+        folder = ""
+        while True:
+            folder = S.ask_text("Directory with downloaded model files", folder)
+            if not folder:
+                warn("enter a directory with downloaded model files")
+            else:
+                src = Path(folder).expanduser().resolve()
+                if src.is_dir():
+                    break
+                warn(f"{folder} is not a directory")
+            if S.UI is not None and hasattr(S.UI, "retry_text"):
+                S.UI.retry_text("Directory with downloaded model files")
         action = choose("How to add the files?", [f"Source: {src}"],
                         [("Link files", None, "Check the model type, then create symbolic links. No size or SHA-256 check."),
                          ("Import Model", None, "Standard import: move files on the same drive, copy on another drive.")],
