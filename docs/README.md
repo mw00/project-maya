@@ -43,6 +43,7 @@ How the engine works and how changes were measured. You do not need these to run
 - [deepseek-prompt-format.md](deepseek-prompt-format.md): DeepSeek-V4.1's prompt encoding and the vendored `serve/ds41_encoding.py`.
 - [ds4-draft-timing.md](ds4-draft-timing.md): the DSpark drafter timing fields in DeepSeek `STAT` lines.
 - [ds4-skip-unpicked.md](ds4-skip-unpicked.md): DeepSeek prefill transfers of only the experts a chunk picks (`DS4_SKIP_UNPICKED`).
+- [ds4-exl3-packs.md](ds4-exl3-packs.md): other makers' DeepSeek EXL3 packs - type-ordered shards (`tools/ds4/reorder.py`) and Diffbot's 3 bpw.
 - [DS4_PROFILE_REFRESH.md](DS4_PROFILE_REFRESH.md): refreshing DeepSeek's startup expert placement, measured on a three-GPU AMD PC.
 - [EXL3_HIP.md](EXL3_HIP.md): EXL3 prefill on HIP.
 - [EXL3_HIP_SCALAR_ROWS.md](EXL3_HIP_SCALAR_ROWS.md): configurable scalar EXL3 prompt tiles on RDNA4.
