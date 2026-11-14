@@ -134,7 +134,39 @@ class CheckpointTests(unittest.TestCase):
         engine.max_context = 1024
         with patch("serve.server.wait_gpu_release"), patch.object(StrataEngine, "__init__", return_value=None) as init:
             engine.restart()
-        init.assert_called_once_with(*engine.spawn, sleep_mode="checkpoint")
+        init.assert_called_once_with(*engine.spawn)
+        self.assertEqual(engine.deep_sleep, "checkpoint")
+
+    def test_mixed_engine_restart_preserves_sleep_mode_and_constructor_contract(self):
+        from serve import mixed_gpus
+        for mode in ("off", "checkpoint"):
+            for fail in (False, True):
+                with self.subTest(mode=mode, restart_fails=fail):
+                    starts = []
+                    def initialize(engine, exe, args, cwd=None, log=None, env=None, sleep_mode="off"):
+                        engine.spawn = (exe, list(args), cwd, log, env)
+                        engine.deep_sleep = sleep_mode
+                        engine.proc = unittest.mock.Mock(pid=123)
+                        engine._routes_lock = threading.Lock()
+                        engine._routes, engine._rids = {}, iter(range(10))
+                        engine.info, engine.max_context = {}, 1024
+                        starts.append(engine.spawn)
+                        if fail and len(starts) == 2:
+                            raise RuntimeError("start failed")
+                    cls = mixed_gpus.engine_class(StrataEngine, lambda pid: None)
+                    with patch.object(StrataEngine, "__init__", initialize), \
+                            patch("serve.server.wait_gpu_release"):
+                        engine = cls("engine", ["--max-context", "1024"])
+                        engine.deep_sleep = mode
+                        engine.set_context(2048)
+                        if fail:
+                            with self.assertRaisesRegex(RuntimeError, "start failed"):
+                                engine.restart()
+                        else:
+                            engine.restart()
+                    self.assertEqual(len(starts), 2)
+                    self.assertEqual(starts[-1][1], ["--max-context", "2048"])
+                    self.assertEqual(engine.deep_sleep, mode)
 
     def test_reused_pid_never_touches_driver_or_receives_signal(self):
         drv = Driver()

@@ -1257,9 +1257,10 @@ class StrataEngine:
         # trigger, the silent wait the bug).
         rids, routes, routes_lock = self._rids, self._routes, self._routes_lock
         ctx = self.max_context
+        sleep_mode = self.deep_sleep
         self.ended, self.end_reason = False, ""
         try:
-            self.__init__(*self.spawn, sleep_mode=self.deep_sleep)
+            self.__init__(*self.spawn)
         except Exception:
             # (#351: a start that fails - a GPU that fell off the bus - left max_context 0, so every later request
             #  failed its size check with "exceeds the context (0)" before ensure_engine could try again; the context
@@ -1268,6 +1269,8 @@ class StrataEngine:
             self.info = {**info, **self.info}
             self._rids, self._routes, self._routes_lock = rids, routes, routes_lock
             raise
+        finally:
+            self.deep_sleep = sleep_mode
         self._rids, self._routes, self._routes_lock = rids, routes, routes_lock
         self.info = {**info, **self.info}
 
