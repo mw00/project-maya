@@ -79,6 +79,45 @@ int main(int argc, char** argv) {
     const auto t0 = std::chrono::steady_clock::now();
     double gb = 0;
     std::vector<std::pair<void*, size_t>> regions;
+    // A RAM-tier block registered in pieces (MAYA_GLM_HELPER_REG_GB, default 1; 0: whole) when this GPU maps them
+    // back to back: the kernel moving one page (memory compaction - the NVIDIA lead pins these pages, so it retries
+    // them) stops this program's queues until the AMD driver re-validates the registration that holds the page - one
+    // piece instead of the whole tier (a 96 GB block: 30-70 s a time on a Radeon 8065S, measured; a 1 GB piece well
+    // under a second).  Not back to back (or a piece fails): the block registered whole, as before.
+    static const size_t reg_piece = [] {
+        const char* v = std::getenv("MAYA_GLM_HELPER_REG_GB");
+        const double g = v != nullptr ? std::atof(v) : 1.0;
+        return g > 0 ? ((size_t) (g * 1073741824.0) + 4095) & ~(size_t) 4095 : (size_t) 0;
+    }();
+    const auto register_pieces = [&](void* p, size_t bytes) -> bool {
+        if (reg_piece == 0 || bytes <= reg_piece) return false;
+        uint8_t* b = (uint8_t*) p;
+        std::vector<uint8_t*> done;
+        bool ok = true;
+        uint8_t* d0 = nullptr;
+        for (size_t off = 0; off < bytes && ok; off += reg_piece) {
+            const size_t n = std::min(reg_piece, bytes - off);
+            if (cudaHostRegister(b + off, n, cudaHostRegisterPortable | cudaHostRegisterMapped) != cudaSuccess) {
+                cudaGetLastError();
+                ok = false;
+                break;
+            }
+            done.push_back(b + off);
+            void* d = nullptr;
+            ok = cudaHostGetDevicePointer(&d, b + off, 0) == cudaSuccess;
+            if (ok && off == 0) d0 = (uint8_t*) d;
+            ok = ok && (uint8_t*) d == d0 + off;
+        }
+        if (!ok) {
+            for (uint8_t* q : done) cudaHostUnregister(q);
+            cudaGetLastError();
+            std::fprintf(stderr, "maya-glm-helper: the RAM tier registered whole (its pieces did not map back to back)\n");
+            return false;
+        }
+        std::fprintf(stderr, "maya-glm-helper: a %.2f GB RAM-tier block registered in %zu pieces of %.2f GB "
+                             "(MAYA_GLM_HELPER_REG_GB)\n", bytes / 1073741824.0, done.size(), reg_piece / 1073741824.0);
+        return true;
+    };
     for (auto& r : rs) {
         void* p = mmap(nullptr, r.bytes, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_POPULATE, r.fd, 0);
         if (p == MAP_FAILED) {
@@ -86,7 +125,8 @@ int main(int argc, char** argv) {
             return 5;
         }
         madvise(p, r.bytes, MADV_HUGEPAGE);
-        if (cudaHostRegister(p, r.bytes, cudaHostRegisterPortable | cudaHostRegisterMapped) != cudaSuccess) {
+        if (!register_pieces(p, r.bytes) &&
+            cudaHostRegister(p, r.bytes, cudaHostRegisterPortable | cudaHostRegisterMapped) != cudaSuccess) {
             std::fprintf(stderr, "maya-glm-helper: GPU %d could not register a RAM-tier block (%.2f GB): %s\n", dev,
                          r.bytes / 1073741824.0, cudaGetErrorString(cudaGetLastError()));
             return 6;
