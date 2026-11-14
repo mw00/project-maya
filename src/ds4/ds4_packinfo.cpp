@@ -368,7 +368,8 @@ int pack_info(const std::string& dir, const std::string& profile_path, const Ker
         }
         if (starts_with(name, "vision.") || starts_with(name, "aligner.") || starts_with(name, "image_")) {
             b_vision += (double) x.bytes;   // (the tower borrows its room while a picture is read)
-            if (x.dtype != "BF16" && x.dtype != "F16" && x.dtype != "F32") bad("the vision tower in " + x.dtype);
+            if (x.dtype != "BF16" && x.dtype != "F16" && x.dtype != "F32" && x.dtype != "Q8_0")
+                bad("the vision tower in " + x.dtype);
             continue;
         }
         if (!ends_with(name, ".trellis") && !ends_with(name, ".suh") && !ends_with(name, ".svh") &&

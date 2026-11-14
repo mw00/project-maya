@@ -619,7 +619,8 @@ DS4_MIN_CC = 70                                    # (V100 on: the experts' kern
 # Files of an earlier layout are used as they are when a folder holds them whole (ds4_earlier): v1.1.16's Maya-S (4
 # shards + unsloth's MXFP8 shard of the Engram tables in <...-GGUF>/Engram), unsloth's GGUFs before their re-shard.
 DS4_GGUF_MANIFEST = ROOT / "tools" / "ds4" / "download_gguf.json"
-DS4_GGUF_PACK_TOOLS = ("tools/ds4/pack_gguf.py", "tools/ds4/chat_template.jinja")
+DS4_GGUF_PACK_TOOLS = ("tools/ds4/pack_gguf.py", "tools/ds4/ds4_gguf_companions.py", "tools/ds4/vision_pack.py",
+                       "tools/ds4/chat_template.jinja")
 DS4_QUANTS = {"gguf-q8": "UD-Q8_K_XL", "gguf-q4": "UD-Q4_K_XL", "maya-s": "Maya-S", "maya-m": "Maya-M", "maya-xs": "Maya-XS",
               "exl3-2.25": "EXL3 2.25bpw", "exl3": "EXL3 2.9bpw", "exl3-3.5": "EXL3 3.5bpw", "abliterated-128g": "Mix-128G",
               "abliterated-256g": "Mix-256G", "gguf-iq1_s": "UD-IQ1_S", "gguf-iq1_m": "UD-IQ1_M",
@@ -3225,20 +3226,20 @@ def link_other_gguf(models: Path, chosen: dict, family: str) -> dict | None:
     if missing is not None:
         warn(f"{missing.name} is missing" + (f" (broken link to {missing.resolve()})" if missing.is_symlink() else ""))
         return None
-    if family == "deepseek" and (chosen.get("drafter") or chosen.get("vision")):
-        warn(f"{FAMILY_TITLE[family]}: this local GGUF path currently packs the text model only; "
-             "its drafter and vision require native companion packs. Set Drafter and Vision to None to continue")
-        return None
-    if family == "minimax":
-        for role, arch, key, want in (("drafter", "dflash", "dflash.backbone", "minimax-m3"),
-                                     ("vision", "clip", "clip.projector_type", "minimax_m3")):
+    if family in ("deepseek", "minimax"):
+        checks = (("drafter", "dflash", "dflash.hyper_connection.count", None),
+                  ("vision", "clip", "clip.projector_type", "deepseek41v")) if family == "deepseek" else (
+                  ("drafter", "dflash", "dflash.backbone", "minimax-m3"),
+                  ("vision", "clip", "clip.projector_type", "minimax_m3"))
+        for role, arch, key, want in checks:
             if not chosen.get(role):
                 continue
             from gguf_reader import GGUFFile
             source = chosen[role]["anchor"]
             meta = GGUFFile(source).metadata if source.suffix.lower() == ".gguf" else {}
-            if meta.get("general.architecture") != arch or meta.get(key) != want:
-                warn(f"{source.name}: not a MiniMax-M3 {role} GGUF")
+            if meta.get("general.architecture") != arch or (meta.get(key) != want if want is not None else
+                                                           not meta.get(key)):
+                warn(f"{source.name}: not a {FAMILY_TITLE[family]} {role} GGUF")
                 return None
     if family == "minimax":
         stem = re.sub(r"(?:-\d{5}-of-\d{5})?\.gguf$", "", first.name, flags=re.I)
@@ -7040,7 +7041,7 @@ def ds4_model_step(a, d: Path, m: dict, announce: bool = True):
 
 def ds4_pack_step(a, d: Path, gguf: bool = False, announce: bool = True, engram: Path | None = None,
                   files: list | None = None, drafter: Path | None = None, without: list | None = None,
-                  vision_dir: Path | None = None, local_only: bool = False) -> Path:
+                  vision_dir: Path | None = None, local_only: bool = False, linked_files: dict | None = None) -> Path:
     """tools/ds4/pack.py's pack in <model>/maya-ds4: the geometry, where every tensor sits in the safetensors (read
     in place), the Engram hash tables and the tokenizer - built again when its tools or the model's files changed, or
     (a GGUF) when the drafter or the vision tower arrived after it.  announce=False: no step heading (step 7 adds the
@@ -7054,15 +7055,19 @@ def ds4_pack_step(a, d: Path, gguf: bool = False, announce: bool = True, engram:
     tools = S.source_hash(DS4_GGUF_PACK_TOOLS if gguf else DS4_PACK_TOOLS)
     need = ("ds4.txt", "tensors.txt", "engram.bin", "tokenizer/vocab.json", "tokenizer/chat_template.jinja")
     shards = list(files) if gguf and files else ds4_shards(d)
+    local = {role: str(linked_files[role]) for role in ("drafter", "vision") if linked_files and linked_files.get(role)
+             and (role != "vision" or not a.no_vision)}
     if gguf and engram is not None:                    # (v1.1.16's Maya-S: its Engram tables are beside it)
         shards += sorted(engram.glob("*.gguf"))
+    tracked = shards + [Path(p) for p in local.values()]
     drafter_new = not local_only and gguf and (drafter or d.parent / "dspark" / "dspark.json").is_file() and not CDS.has_drafter(
         {"args": ["--pack", str(pack)]})               # (the drafter arrived after the pack was built)
     vision_new = not local_only and ((gguf and (ds4_vision_dir(d) / "vision.json").is_file() and not ds4_pack_has_vision(pack)) or (
         not gguf and vision_dir is not None and not ds4_pack_tower(pack)))
     if not a.repack and read_json(pack / PACK_SOURCES).get("tools") == tools and not drafter_new and \
             not vision_new and read_json(pack / PACK_SOURCES).get("local_only", False) == local_only and \
-            all((pack / f).exists() for f in need) and pack_stale(pack, shards) is None:
+            read_json(pack / PACK_SOURCES).get("local_companions", {}) == local and \
+            all((pack / f).exists() for f in need) and pack_stale(pack, tracked) is None:
         ok(f"pack already built: {pack}")
         return pack
     if not os.access(d, os.W_OK):
@@ -7071,19 +7076,22 @@ def ds4_pack_step(a, d: Path, gguf: bool = False, announce: bool = True, engram:
         "Engram hash tables and the")
     say("  tokenizer (about a minute) ...")
     run([sys.executable, str(ROOT / "tools" / "ds4" / ("pack_gguf.py" if gguf else "pack.py")), "--model", str(d),
-         "--out", str(pack)] + (["--vision", str(ds4_vision_dir(d))] if gguf else
+         "--out", str(pack)] + (["--vision", local["vision"]] if "vision" in local else
+                                ["--vision", str(ds4_vision_dir(d))] if gguf and not local_only else
                                 ["--vision", str(vision_dir)] if vision_dir is not None else []) +
         (["--engram", str(engram)] if gguf and engram is not None else []) +
-        (["--drafter", str(drafter)] if gguf and drafter is not None else []) +
+        (["--drafter", local["drafter"]] if "drafter" in local else
+         ["--drafter", str(drafter)] if gguf and drafter is not None else []) +
         (["--shards"] + [Path(f).name for f in files] if gguf and files else []) +
         (["--without"] + list(without) if gguf and without else []) + (["--no-companions"] if local_only else []))
     missing = [f for f in need if not (pack / f).exists()]
     if missing:
         fail(f"the pack builder did not write {pack / missing[0]}", "the reason is in the messages above")
-    stamp_pack(pack, shards)
+    stamp_pack(pack, tracked)
     rec = read_json(pack / PACK_SOURCES)
     rec["tools"] = tools
     rec["local_only"] = local_only
+    rec["local_companions"] = local
     (pack / PACK_SOURCES).write_text(json.dumps(rec, indent=1), encoding="utf-8")
     ok(f"pack: {pack}")
     return pack
@@ -7167,7 +7175,8 @@ def write_config_ds4(a, pc: dict, meta: dict, pack: Path, ctx: int, models: Path
                         "model_dir": str(d), "written": time.strftime("%Y-%m-%d %H:%M")}
     if linked_files is not None:
         cfg["installer"].update(quant=d.name, gguf=str(linked_files["model"]),
-                                 local_drafter=None, local_vision=None, own=True)
+                                 local_drafter=str(linked_files["drafter"]) if linked_files.get("drafter") else None,
+                                 local_vision=str(linked_files["vision"]) if linked_files.get("vision") else None, own=True)
     cal = saved_calibration(cfg, any_context=True)     # --tp and the CPU threads tuned on this PC for this quant before
     if cal is not None and isinstance(cal.get("args"), dict):
         had = [f for f in CAL4.KEYS if f in (old.get("args") or [])[:-1] and   # (the config before's own values win,
@@ -7211,18 +7220,19 @@ def set_up_linked_gguf(a, prev: dict, linked: dict, family: str) -> Path:
     if any(not p.is_file() for p in files):
         fail("a linked model file is missing", "keep the downloaded source files in place")
     ok(f"{len(files)} model file(s); size and SHA-256 not checked")
-    pack = (ds4_pack_step(a, d, gguf=True, files=files, local_only=True) if deepseek else
+    pack = (ds4_pack_step(a, d, gguf=True, files=files, local_only=True, linked_files=linked) if deepseek else
             mm3_pack_step(a, d, files, gguf=True, linked_files=linked))             # 6
     step(7, "images (the vision tower)")
-    ok("pictures: ON (selected vision GGUF)" if not deepseek and not a.no_vision and mm3_pack_has_vision(pack) else
+    ok("pictures: ON (selected vision GGUF)" if not a.no_vision and
+       (ds4_pack_has_vision(pack) if deepseek else mm3_pack_has_vision(pack)) else
        "pictures: off")
     if deepseek:
-        path = write_config_ds4(a, pc, meta, pack, ctx, d.parent, d, "local-gguf", False, linked_files=linked)
+        path = write_config_ds4(a, pc, meta, pack, ctx, d.parent, d, "local-gguf", linked_files=linked)
     else:
         path = write_config_mm3(a, pc, meta, pack, ctx, d.parent, d, "local-gguf", own=True, linked_files=linked)
     ablate_step(path, family, d.parent)
-    if not deepseek and linked.get("drafter") and CDS.has_drafter(read_json(path)):
-        how = drafting_choice(a, "MiniMax's DSpark drafter", "10-30")
+    if linked.get("drafter") and CDS.has_drafter(read_json(path)):
+        how = drafting_choice(a, "The DSpark drafter" if deepseek else "MiniMax's DSpark drafter", "10-30")
         if how == "measure":
             speed_calibration(path)
         else:

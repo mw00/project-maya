@@ -16,7 +16,9 @@ writes <model>/maya-ds4/ in pack.py's format, so the engine reads both:
 A GGUF has no DSpark drafter: drafter_pack.py makes it from DeepSeek's checkpoint into ../dspark/, and the pack takes it
 from there when it is present.  Nor a vision tower: vision_pack.py makes it from DeepSeek's checkpoint into ../vision/
 (--vision: another folder), and the pack takes it and its geometry (vision.<key>, image_token_id) from there when it is
-present; without it the engine reads text only.
+present; without it the engine reads text only. --drafter and --vision also accept selected DSpark / mmproj GGUFs:
+their tensors are indexed directly, without writing dspark.bin or vision.bin. --no-companions disables automatic
+discovery; explicitly selected GGUF companions are still included.
 
 A quant that leaves the two Engram tables out (v1.1.16's Maya-S; Maya's quants hold them since) takes them from a set
 of GGUF files that holds them, beside it: --engram, else ../Engram/ (unsloth's MXFP8 shard of them, where setups before
@@ -284,6 +286,7 @@ NEWER_KEYS = (("kv_source_layer_ids", "attention.kv_source_layers"),
               ("attention.candidate_block_size", "attention.indexer.candidate_block_size"),
               ("dspark_target_layer_ids", "dspark.target_layers"),
               ("engram.layer_ids", "engram.layers"), ("engram_max_ngram_size", "engram.max_ngram_size"),
+              ("engram.key_length", "engram.head_dim"), ("engram.pad_id", "engram.pad_token_id"),
               ("engram_n_heads", "engram.head_count"), ("engram_head_dim", "engram.head_dim"),
               ("engram_pad_token_id", "engram.pad_token_id"))
 # its Engram hash parameters as tensors (I64 / I32) -> the engram.* lists write_engram takes (each layer's in turn)
@@ -316,6 +319,16 @@ def newer_keys(gs: list, kv: dict):
                 vals = list(struct.unpack(fmt[0] + "%d" % n + fmt[1], f.read(n * size)))
             kv.setdefault("%s.%s" % (a, HASH_TENSORS[name]), vals)   # (ggml ne0 innermost: each layer's row in turn)
         g.tensors = keep
+    # Some deepseek41 exporters omit the source lists. The matrices identify
+    # exactly which layers produce the shared compressed KV and index queries.
+    for key, tensor in (("attention.kv_source_layers", "attn_compressor_kv.weight"),
+                        ("attention.indexer.source_layers", "indexer.attn_q_b.weight")):
+        full = a + "." + key
+        if full not in kv:
+            found = {int(m[1]) for g in gs for name, *_ in g.tensors
+                     if (m := re.fullmatch(r"blk\.(\d+)\." + re.escape(tensor), name))}
+            if found:
+                kv[full] = sorted(found)
 
 
 def split_ple(g: Gguf, kv: dict):
@@ -425,8 +438,8 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--model", required=True, help="the directory of the GGUF's shards")
     ap.add_argument("--out", help="default: <model>/maya-ds4")
-    ap.add_argument("--vision", help="vision_pack.py's folder (default: <model>/../vision; taken when it is there)")
-    ap.add_argument("--drafter", help="the DSpark drafter's .json (drafter_pack.py's; default <model>/../dspark/dspark.json)")
+    ap.add_argument("--vision", help="the selected mmproj GGUF, or vision_pack.py's folder (default: <model>/../vision)")
+    ap.add_argument("--drafter", help="the selected DSpark GGUF or drafter_pack.py's .json (default: ../dspark/dspark.json)")
     ap.add_argument("--no-companions", action="store_true", help="do not include a drafter or vision tower from nearby folders")
     ap.add_argument("--engram", help="the folder of the Engram tables' GGUF set, for a quant that leaves them out "
                                      "(default: <model>/../Engram, when it is whole)")
@@ -565,14 +578,26 @@ def main() -> int:
     files = names
     if eg_from:
         print("Engram tables from %s (%d shards)" % (eg_dir, len(eg_from)))
-    drafter = pathlib.Path(a.drafter).expanduser().resolve() if a.drafter else model.parent / "dspark" / "dspark.json"
+    drafter = pathlib.Path(a.drafter).expanduser().absolute() if a.drafter else model.parent / "dspark" / "dspark.json"
     if a.drafter and not drafter.is_file():
         raise SystemExit("%s: no drafter there" % drafter)
-    drafter_in = not a.no_companions and drafter.is_file() and drafter.with_suffix(".bin").is_file()
+    drafter_in = not a.no_companions and drafter.suffix.lower() != ".gguf" and \
+        drafter.is_file() and drafter.with_suffix(".bin").is_file()
     vocab = next(t[5][0] for t in tensors if t[0] == "embed.weight")
     geo = geometry(kv, vocab)
     dinfo = json.loads(drafter.read_text()) if drafter_in else {}
-    if drafter_in:   # (its geometry: the GGUF's, else filled in - a drafter without it never drafts: left out, said so)
+    if a.drafter and drafter.suffix.lower() == ".gguf":
+        import ds4_gguf_companions as GC
+        dg = Gguf(drafter)
+        if (why := short(dg)):
+            raise SystemExit(f"{drafter}: incomplete drafter ({why})")
+        entries, config = GC.drafter(dg, TYPES, len(files), LAYER, geo, vocab)
+        files.append(rel(drafter))
+        tensors += entries
+        geo.update(config)
+        drafter_in = True
+        dinfo = {}
+    if drafter_in and dinfo:   # (a native companion's geometry: the GGUF's, else filled in)
         fill, src = dspark_fill(geo, dinfo, vocab)
         if fill is None:
             print("WARNING: the DSpark drafter %s is left out of the pack: the GGUF has no %s for it (and this is not "
@@ -584,7 +609,7 @@ def main() -> int:
             geo.update(fill)
             print("DSpark geometry not in the GGUF, taken from %s: %s" %
                   (src, ", ".join("%s %s" % (k, fill[k]) for k in DSPARK_KEYS if k in fill)))
-    if drafter_in:
+    if drafter_in and dinfo:
         files.append(rel(drafter.with_suffix(".bin")))
         groups = int(kv["%s.attention.output_group_count" % kv["general.architecture"]])
         for name, dt, off, nb, shape in dinfo["tensors"]:
@@ -596,8 +621,16 @@ def main() -> int:
             tensors.append((name, dt, len(files) - 1, off, nb, shape))
     # the vision tower (vision_pack.py's vision.bin, from DeepSeek's checkpoint): its tensors under the checkpoint's
     # names, the picture span's marker rows, and the geometry config.json gives them
-    vdir = pathlib.Path(a.vision).expanduser().resolve() if a.vision else model.parent / "vision"
+    vdir = pathlib.Path(a.vision).expanduser().absolute() if a.vision else model.parent / "vision"
     vision = {}
+    if a.vision and vdir.suffix.lower() == ".gguf":
+        import ds4_gguf_companions as GC
+        vg = Gguf(vdir)
+        if (why := short(vg)):
+            raise SystemExit(f"{vdir}: incomplete vision ({why})")
+        entries, vision = GC.vision(vg, TYPES, len(files), geo["hidden_size"])
+        files.append(rel(vdir))
+        tensors += entries
     if not a.no_companions and (vdir / "vision.json").is_file() and (vdir / "vision.bin").is_file():
         try:
             rel = os.path.relpath(vdir / "vision.bin", model).replace(os.sep, "/")
