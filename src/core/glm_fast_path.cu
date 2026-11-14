@@ -2316,7 +2316,7 @@ bool Glm5Model::fast_helper_setup(std::string& err) {
     std::vector<std::pair<void*, size_t>> regions;
     for (const auto& r : F->rc)
         for (size_t i = 0; i < r.n_parts(); ++i) regions.push_back({r.part(i), r.part_slots(i) * r.stride});
-    if (exl3_helper) {
+    if (exl3_helper && device != strata::core::GlmExpertHelper::kLinkDevice) {   // (a linked helper: its own program's GPU)
         // a Pascal helper (sm_61 / 62: FP16 at 1/64 of its F32 rate) decodes with legacy-f32 - v1.1.8's kernels, the
         // same bits, ~5.5x faster there (a P4000, 6 experts: 3.87 -> 0.69 ms) - unless MAYA_GLM_EXL3_DECODE<n> or
         // MAYA_GLM_EXL3_DECODE names its kernels; the trunk GPUs keep their own choice

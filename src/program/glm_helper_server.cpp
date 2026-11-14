@@ -79,6 +79,45 @@ int main(int argc, char** argv) {
     const auto t0 = std::chrono::steady_clock::now();
     double gb = 0;
     std::vector<std::pair<void*, size_t>> regions;
+    // A RAM-tier block registered in pieces (MAYA_GLM_HELPER_REG_GB, default 1; 0: whole) when this GPU maps them
+    // back to back: the kernel moving one page (memory compaction - the NVIDIA lead pins these pages, so it retries
+    // them) stops this program's queues until the AMD driver re-validates the registration that holds the page - one
+    // piece instead of the whole tier (a 96 GB block: 30-70 s a time on a Radeon 8065S, measured; a 1 GB piece well
+    // under a second).  Not back to back (or a piece fails): the block registered whole, as before.
+    static const size_t reg_piece = [] {
+        const char* v = std::getenv("MAYA_GLM_HELPER_REG_GB");
+        const double g = v != nullptr ? std::atof(v) : 1.0;
+        return g > 0 ? ((size_t) (g * 1073741824.0) + 4095) & ~(size_t) 4095 : (size_t) 0;
+    }();
+    const auto register_pieces = [&](void* p, size_t bytes) -> bool {
+        if (reg_piece == 0 || bytes <= reg_piece) return false;
+        uint8_t* b = (uint8_t*) p;
+        std::vector<uint8_t*> done;
+        bool ok = true;
+        uint8_t* d0 = nullptr;
+        for (size_t off = 0; off < bytes && ok; off += reg_piece) {
+            const size_t n = std::min(reg_piece, bytes - off);
+            if (cudaHostRegister(b + off, n, cudaHostRegisterPortable | cudaHostRegisterMapped) != cudaSuccess) {
+                cudaGetLastError();
+                ok = false;
+                break;
+            }
+            done.push_back(b + off);
+            void* d = nullptr;
+            ok = cudaHostGetDevicePointer(&d, b + off, 0) == cudaSuccess;
+            if (ok && off == 0) d0 = (uint8_t*) d;
+            ok = ok && (uint8_t*) d == d0 + off;
+        }
+        if (!ok) {
+            for (uint8_t* q : done) cudaHostUnregister(q);
+            cudaGetLastError();
+            std::fprintf(stderr, "maya-glm-helper: the RAM tier registered whole (its pieces did not map back to back)\n");
+            return false;
+        }
+        std::fprintf(stderr, "maya-glm-helper: a %.2f GB RAM-tier block registered in %zu pieces of %.2f GB "
+                             "(MAYA_GLM_HELPER_REG_GB)\n", bytes / 1073741824.0, done.size(), reg_piece / 1073741824.0);
+        return true;
+    };
     for (auto& r : rs) {
         void* p = mmap(nullptr, r.bytes, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_POPULATE, r.fd, 0);
         if (p == MAP_FAILED) {
@@ -86,7 +125,8 @@ int main(int argc, char** argv) {
             return 5;
         }
         madvise(p, r.bytes, MADV_HUGEPAGE);
-        if (cudaHostRegister(p, r.bytes, cudaHostRegisterPortable | cudaHostRegisterMapped) != cudaSuccess) {
+        if (!register_pieces(p, r.bytes) &&
+            cudaHostRegister(p, r.bytes, cudaHostRegisterPortable | cudaHostRegisterMapped) != cudaSuccess) {
             std::fprintf(stderr, "maya-glm-helper: GPU %d could not register a RAM-tier block (%.2f GB): %s\n", dev,
                          r.bytes / 1073741824.0, cudaGetErrorString(cudaGetLastError()));
             return 6;
@@ -138,7 +178,7 @@ int main(int argc, char** argv) {
         bool ok = true;
         switch (c->op) {
         case hl::kOpen:
-            ok = h.open(dev, (int) c->a, (int) c->b, regions, err);
+            ok = h.open(dev, (int) c->a, (int) c->b, regions, err, c->x3_on != 0);
             n_embd = (int) c->a;
             if (ok && xchg != nullptr && !h.pf_attach(xchg, (size_t) xbytes, xcap, err)) {
                 std::fprintf(stderr, "maya-glm-helper: %s (prompt calls will fail)\n", err.c_str());
@@ -146,9 +186,18 @@ int main(int argc, char** argv) {
             } else if (ok && xchg != nullptr) {
                 for (int t = 0; t < 64; ++t)
                     c->pf_types[t] = (uint8_t) h.pf_type_bits(t);
+#ifdef STRATA_USE_HIP
+                c->x3_pf = c->x3_on != 0 ? 1 : 0;   // (an EXL3 pack: its experts' prompt rows through pf_run_x3)
+                if (c->x3_on != 0 && !h.pf_x3_init(err)) {   // (its scratch now, not in the first prompt)
+                    std::fprintf(stderr, "maya-glm-helper: %s (EXL3 prompt calls will fail)\n", err.c_str());
+                    err.clear();
+                    c->x3_pf = 0;
+                }
+#endif
             }
             break;
-        case hl::kPrompt: {
+        case hl::kPrompt:
+        case hl::kPromptX3: {
             const auto p0 = std::chrono::steady_clock::now();
             // the experts' blobs: lead addresses in the shared tier, as this program maps them
             static std::vector<const uint8_t*> blobs;
@@ -160,9 +209,24 @@ int main(int argc, char** argv) {
                 const uint64_t* lp = (const uint64_t*) (xchg + sb + sl.keys);
                 for (int j = 0; j < pn; ++j) blobs[(size_t) j] = mine(lp[j], 1);
             }
-            ok = xchg != nullptr && h.pf_run(c->gu_type, c->d_type, (size_t) c->down_off, c->limit, c->pf_dsa != 0,
-                                             c->pf_T, c->pf_K, pn, c->pf_rows, c->pf_r0, blobs.data(), err,
-                                             c->pf_slot);
+            if (c->op == hl::kPromptX3) {   // an EXL3 pack's experts: the layer's blob layout came with the call
+                strata::kernels::exl3::ExpertLayout lay;
+                for (int r = 0; r < 3; ++r) {
+                    lay.suh[r] = (size_t) c->x3_suh[r];
+                    lay.svh[r] = (size_t) c->x3_svh[r];
+                    lay.trellis[r] = (size_t) c->x3_trellis[r];
+                    lay.k2[r] = c->x3_k2[r];
+                    lay.gg_type[r] = c->x3_gg[r];
+                }
+                lay.cb = c->x3_cb;
+                lay.fmt = c->x3_fmt;
+                ok = xchg != nullptr && h.pf_run_x3(lay, c->limit, c->pf_T, c->pf_K, pn, c->pf_rows, c->pf_r0,
+                                                    blobs.data(), err, c->pf_slot);
+            } else {
+                ok = xchg != nullptr && h.pf_run(c->gu_type, c->d_type, (size_t) c->down_off, c->limit,
+                                                 c->pf_dsa != 0, c->pf_T, c->pf_K, pn, c->pf_rows, c->pf_r0,
+                                                 blobs.data(), err, c->pf_slot);
+            }
             if (xchg == nullptr) err = "no prompt exchange";
             c->pf_gpu_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - p0).count();
             break;
@@ -185,6 +249,20 @@ int main(int argc, char** argv) {
         case hl::kCompute:
             ok = h.compute(c->gu_type, c->d_type, (size_t) c->down_off, c->limit, c->ne, c->keys, c->w, c->x, c->out, err);
             break;
+        case hl::kComputeX3: {   // an EXL3 pack's experts: the layer's blob layout came with the call
+            strata::kernels::exl3::ExpertLayout lay;
+            for (int r = 0; r < 3; ++r) {
+                lay.suh[r] = (size_t) c->x3_suh[r];
+                lay.svh[r] = (size_t) c->x3_svh[r];
+                lay.trellis[r] = (size_t) c->x3_trellis[r];
+                lay.k2[r] = c->x3_k2[r];
+                lay.gg_type[r] = c->x3_gg[r];
+            }
+            lay.cb = c->x3_cb;
+            lay.fmt = c->x3_fmt;
+            ok = h.compute_exl3(lay, c->limit, c->ne, c->keys, c->w, c->x, c->out, err);
+            break;
+        }
         case hl::kQuit:
             h.close();
             c->status = 0;
