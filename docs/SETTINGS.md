@@ -920,9 +920,13 @@ below that prompts run in windows of 16. The log says which.
 With the layers split across GPUs (one GPU a group) a prompt runs as a relay: a chunk goes through the first GPU's
 layers, then the next GPU's. Four settings help that path when the experts sit in RAM; each is off by default.
 
-- `DS4_FLOW_COPY_DMA=1`: a streamed expert whose RAM copy is in one pinned part is DMA'd to the GPU from that copy.
+- `DS4_FLOW_COPY_DMA=1`: a streamed expert whose RAM copy is pinned is DMA'd to the GPU from that copy - from one part,
+  or, where the copies are split across the CPU sockets' memory (2 NUMA parts), each matrix's rows from the part that
+  holds them (a layer on one GPU; tensor-parallel members keep the staging).
   Without it only MXFP4 experts went that way; the GGUF low-bit experts (IQ2_XXS, IQ3_S, ...) were first copied by a
   reader thread into the pinned staging, about 2.7 GB/s a GPU on PCIe 3.0, which the four GPUs waited on. The same bytes.
+  Two sockets (two Xeon E5-2697 v2 + 2x RTX 3090 on PCIe 3.0 x16, Maya-S, a layer split): fresh prompts of 326 / 602 /
+  1,638 tokens 7.6 / 9.0 / 11.5 -> 6.7 / 7.5 / 9.8 s, the stream at the link's ~11 GB/s instead of ~7.8.
 - `DS4_YOCO_FLOW=1`: the prompt skip of the layers after the YOCO source (`DS4_YOCO`) also on a layer split whose groups
   read the prompt on the flow; the cut is at a chunk's start. It changes the answers as little as the skip does on one GPU.
 - `DS4_CHUNK_AUTO=1`: a prompt's chunk is `n / (DS4_CHUNK_PER_GROUP x groups)` rows, rounded up to 16, at least
@@ -935,7 +939,7 @@ layers, then the next GPU's. Four settings help that path when the experts sit i
 
 | Setting | Default | |
 | --- | --- | --- |
-| `DS4_FLOW_COPY_DMA` | off (0) | `1`: on the flow, an expert with a pinned RAM copy in one part is DMA'd from that copy, any format (the same bytes) |
+| `DS4_FLOW_COPY_DMA` | off (0) | `1`: on the flow, an expert with a pinned RAM copy is DMA'd from that copy, any format - one part, or each matrix's rows from its NUMA part where the copies are split across sockets (a layer on one GPU) (the same bytes) |
 | `DS4_YOCO_FLOW` | off (0) | `1`: the YOCO prompt skip also on a layer split whose groups are on the flow (changes the answers slightly) |
 | `DS4_CHUNK_GFX11` | `4096` on RDNA 3 / 3.5 (gfx11) GPUs | the largest prompt chunk, in tokens, on gfx11 GPUs. Integrated ones (Strix / Gorgon Halo) read a long prompt faster in 4K chunks (experts resident); a discrete card that streams its experts from RAM can read faster in the default's larger chunks (one RX 7900 XTX: +15-45% prompt speed with `0`). `N`: this cap; `0`: the default chunk (changes the answers slightly) |
 | `DS4_CHUNK_AUTO` | off (0) | `1`: on a layer split, a prompt's chunk from its length, so every group has work (changes the answers slightly) |
