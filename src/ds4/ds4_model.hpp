@@ -204,6 +204,8 @@ public:
     /// verify() and verify_multi() alike: each bias is added to its token's logit before the penalties and the
     /// request's sampling (-100 bans the token).  The drafter's own proposals are not biased; the verify judges them
     /// by the biased logits.  Empty: none, the picks exactly as without.
+    /// Grammar masking requires the local sampling head (a linked pool part samples remotely).
+    bool grammar_supported() const;
     void set_grammar(Grammar * grammar);
     void set_logit_bias(const std::vector<std::pair<int, float>>& entries);
     /// Abliteration per conversation (Options::ablate): ablate_loaded() whether a direction is loaded; set_ablate(on)

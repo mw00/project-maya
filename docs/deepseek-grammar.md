@@ -53,3 +53,8 @@ logits remain engine failures.
 The optional host test target `maya-ds4-grammar-state-test` takes one `PACK`
 argument. It exercises clone isolation, assignment, fresh request reset,
 delayed activation, EOS, malformed syntax and file paths with spaces/Unicode without running inference.
+
+A linked pool part or mixed-GPU split layout samples in the other engine. It
+reports `grammar=0 grammar_replay=0 grammar_hex=0` and refuses explicit grammar
+requests before changing request state. The mixed-GPU helper layout keeps its
+sampling head local and supports grammar when built with the option enabled.

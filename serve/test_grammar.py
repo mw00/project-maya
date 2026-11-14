@@ -41,6 +41,17 @@ class GrammarAdapter(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "native GBNF"):
             self.service().check_request({"grammar": GRAMMAR})
 
+    def test_remote_sampling_capability_refuses_before_validation_or_generation(self):
+        svc = self.service()
+        svc.engine.info = {"grammar": 0, "grammar_replay": 0, "grammar_hex": 0}
+        svc.engine.validate_grammar = Mock()
+        svc.engine.generate = Mock()
+        with self.assertRaisesRegex(ValueError, "native GBNF"):
+            svc.check_request({"grammar": GRAMMAR})
+        svc.engine.validate_grammar.assert_not_called()
+        svc.engine.generate.assert_not_called()
+        svc.check_request({"temperature": 0})
+
     def test_compile_errors_propagate_before_generation(self):
         svc = self.service()
         svc.engine.info = {"grammar": 1, "grammar_replay": 1}

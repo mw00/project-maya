@@ -802,11 +802,15 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         std::printf("INFO ablate=1 ablate_default=%d\n", m.ablating() ? 1 : 0);
     const bool abl_default = m.ablating();   // (a GEN without ablate=: as the engine started)
 #ifdef MAYA_DS4_GRAMMAR
-    std::printf("INFO grammar=1 grammar_replay=1 grammar_hex=1\n");
+    const int grammar_local = m.grammar_supported() ? 1 : 0;
+    std::printf("INFO grammar=%d grammar_replay=%d grammar_hex=%d\n", grammar_local, grammar_local, grammar_local);
 #endif
     std::unique_ptr<GrammarVocabulary> grammar_vocab;
     const auto prepare_grammar = [&](Req & r) {
         try {
+            if ((!r.grammar_path.empty() || r.has_grammar_hex || !r.grammar_after.empty() || !r.grammar_prefix.empty()) &&
+                !m.grammar_supported())
+                throw std::runtime_error("native GBNF requires a local sampling head; linked pool parts are unsupported");
             if (r.has_grammar_hex) {
                 if (!r.grammar_path.empty()) throw std::runtime_error("grammar and grammar_hex are mutually exclusive");
                 r.grammar_path = ds4_decode_grammar_path(r.grammar_hex);
