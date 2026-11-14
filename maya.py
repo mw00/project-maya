@@ -1973,7 +1973,7 @@ def choose_with_add(a, question: str, intro: list, rows: list, default: int, yes
 def choose_model(a, models: Path, inst: dict, family: str = "glm") -> tuple:
     """("download", one of MODELS) or ("local", the model's first .gguf file): --gguf-dir, --model, else asked among
     the downloads - the earlier download is the default.  ("exl3", the folder): --model-dir naming an EXL3 folder of
-    GLM-5.3-Flash. ("linked", the selected local files): an unlisted GGUF added through Link files."""
+    GLM-5.3-Flash. ("linked", the selected local files): any GGUF added through Link files."""
     metal = getattr(a, "backend", None) == "metal"
     if getattr(a, "model_dir", None) and exl3_folder_family(a.model_dir) == "glm":
         if metal:
@@ -3117,9 +3117,7 @@ def review_downloaded_model(a, src: Path, models: Path, family: str) -> int | di
             if model is None:
                 warn("select a model file before linking")
                 continue
-            if family == "glm" and model["anchor"].suffix.lower() == ".gguf" and not any(
-                    Path(e["rel"]).name == model["anchor"].name for e in import_catalog(models)
-                    if link_catalog_family(e["label"], family)):
+            if family == "glm" and model["anchor"].suffix.lower() == ".gguf":
                 local = link_glm_local(models, chosen)
                 if local is not None:
                     return local
@@ -3138,8 +3136,27 @@ def review_downloaded_model(a, src: Path, models: Path, family: str) -> int | di
             return 0
 
 
+def glm_local_folder(models: Path, first: Path) -> Path:
+    """Keep same-named files from different source folders as separate installed models."""
+    def slug(value):
+        return re.sub(r"[^A-Za-z0-9._-]", "-", value)[:100] or "model"
+    name = slug(re.sub(r"(?:-\d{5}-of-\d{5})?\.gguf$", "", first.name, flags=re.I))
+    base = f"GLM-local-{name}"
+    occupied = {p.name.casefold(): p for p in models.iterdir()} if models.is_dir() else {}
+    number = 0
+    while True:
+        label = base if number == 0 else f"{base}-{slug(first.parent.name)}" + (f"-{number}" if number > 1 else "")
+        existing = occupied.get(label.casefold())
+        if existing is None:
+            return models / label
+        target = existing / first.name
+        if target.is_symlink() and target.resolve() == first.resolve():
+            return existing
+        number += 1
+
+
 def link_glm_local(models: Path, chosen: dict) -> dict | None:
-    """Link an unlisted GLM-5.3-Flash quant and its selected companions by GGUF type only."""
+    """Link any GLM-5.3-Flash GGUF quant and its selected companions by model type only."""
     first = chosen["model"]["anchor"]
     if first.suffix.lower() != ".gguf" or linked_model_type(first) != "glm":
         warn(f"{first.name} is not a GLM-5.3-Flash GGUF model")
@@ -3156,8 +3173,7 @@ def link_glm_local(models: Path, chosen: dict) -> dict | None:
     if vision and (vision["anchor"].suffix.lower() != ".gguf" or gguf_head(vision["anchor"])[0] != "clip"):
         warn(f"{vision['path'].name}: GLM vision needs an mmproj GGUF")
         return None
-    name = re.sub(r"[^A-Za-z0-9._-]", "-", re.sub(r"(?:-\d{5}-of-\d{5})?\.gguf$", "", first.name, flags=re.I))[:100]
-    dest = models / f"GLM-local-{name}"
+    dest = glm_local_folder(models, first)
     placements = [(path, dest / path.name) for path in shards]
     placements += [(path, dest / "drafter" / path.name) for path in sorted(drafter["files"])] if drafter else []
     placements += [(path, dest / "vision" / path.name) for path in sorted(vision["files"])] if vision else []
@@ -4378,7 +4394,12 @@ def write_config(a, pc, meta, pack: Path, quant: str, ctx: int, models: Path, vi
         env = {**hip_env, **env}
     if env:
         cfg["env"] = env
-    cfg_path = glm_config_path(pc, quant)
+    cfg_path = glm_config_path(pc, linked_files["folder"].name if linked_files is not None else quant)
+    if linked_files is not None:
+        # Keep a local config made before local models had separate names; a downloaded model's config stays separate.
+        legacy = glm_config_path(pc, quant)
+        if (read_json(legacy).get("installer") or {}).get("gguf") == str(linked_files["model"]):
+            cfg_path = legacy
     old_cfg = read_json(cfg_path)
     # the server's own settings from the config before (the address it listens on, its API key, ...): kept, as the
     # DeepSeek, MiniMax and Qwen setups keep them - a GLM setup run again dropped them; --host / --api-key given now win

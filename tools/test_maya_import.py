@@ -157,14 +157,9 @@ class ImportTests(unittest.TestCase):
         other = self.put("two/other.gguf", b"GGUF other")
         draft = self.put(maya.DFLASH["file"], b"GGUF draft")
         vision = self.put("vision/mmproj-test.gguf", b"GGUF vision")
-        labels = list(maya.MODELS)[:2]
-        cat = ([{"label": labels[0], "rel": f"{labels[0]}/{p.name}", "size": 999, "sha": ["wrong"]}
-                for p in (first, second)] +
-               [{"label": labels[1], "rel": f"{labels[1]}/{other.name}", "size": 999, "sha": ["wrong"]},
-                {"label": labels[1], "rel": f"{labels[1]}/vision/{vision.name}", "size": 999,
-                 "sha": ["wrong"]}])
         with patch.object(maya, "gguf_head", side_effect=lambda p: ("glm5-next", 1) if p in (first, other)
-                          else ("", 0)), patch.object(maya, "import_catalog", return_value=cat), \
+                          else ("dflash", 1) if p == draft else ("clip", 1)), \
+                patch.object(maya, "import_catalog", side_effect=AssertionError("catalog consulted")), \
                 patch.object(maya, "choose", side_effect=[0, 1, 3]), \
                 patch.object(maya, "say"), patch.object(maya, "ok"), patch.object(maya, "warn"):
             found = maya.review_candidates(self.src, "glm")
@@ -172,11 +167,11 @@ class ImportTests(unittest.TestCase):
             self.assertEqual(found["model"][0]["files"], {first, second})
             self.assertEqual([c["path"] for c in found["drafter"]], [draft])
             self.assertEqual([c["path"] for c in found["vision"]], [vision])
-            self.assertEqual(maya.review_downloaded_model(argparse.Namespace(), self.src, self.models, "glm"), 0)
-        self.assertTrue((self.models / labels[1] / other.name).is_symlink())
-        self.assertFalse((self.models / labels[0] / first.name).exists())
-        self.assertTrue((self.models / labels[1] / "vision" / vision.name).is_symlink())
-        self.assertTrue((self.models / "GLM-5.3-Flash-DFlash2" / draft.name).is_symlink())
+            linked = maya.review_downloaded_model(argparse.Namespace(), self.src, self.models, "glm")
+        self.assertEqual(linked["model"].resolve(), other)
+        self.assertEqual(linked["vision"].resolve(), vision)
+        self.assertEqual(linked["drafter"].resolve(), draft)
+        self.assertFalse(list(self.models.rglob(first.name)))
 
     def test_import_selected_files_ignores_another_quant(self):
         selected = self.put("one/a.bin", BIG)
