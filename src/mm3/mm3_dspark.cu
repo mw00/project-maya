@@ -84,6 +84,7 @@ struct Draft::Impl {
     struct MX {   // an MXFP8 matrix [N][K] as stored: E4M3 weights, a UE8M0 scale every 32
         const uint8_t *w = nullptr, *s = nullptr;
         int N = 0, K = 0;
+        bool bf16 = false;
     };
     struct L {
         MX q, k, v, o, g, u, d;
@@ -148,13 +149,18 @@ struct Draft::Impl {
     // a float vector (BF16 stored) + add
     bool vec(const Pack& pk, const std::string& name, float add, float*& out, size_t want, std::string& err) {
         const Tensor* t = pk.get(name);
-        if (!t || t->dtype != "BF16" || t->bytes != want * 2) {
-            err = "dspark: " + name + ": not the BF16 vector of " + std::to_string(want);
+        if (!t || (t->dtype != "BF16" && t->dtype != "F32") || t->bytes != want * (t->dtype == "F32" ? 4 : 2)) {
+            err = "dspark: " + name + ": not the BF16/F32 vector of " + std::to_string(want);
             return false;
         }
         std::vector<float> hv(want);
         const uint16_t* b = (const uint16_t*) pk.data(*t);
         for (size_t i = 0; i < want; ++i) {
+            if (t->dtype == "F32") {
+                std::memcpy(&hv[i], (const uint8_t*) pk.data(*t) + i * 4, 4);
+                hv[i] += add;
+                continue;
+            }
             const uint32_t u = (uint32_t) b[i] << 16;
             float f;
             std::memcpy(&f, &u, 4);
@@ -168,6 +174,12 @@ struct Draft::Impl {
     // an MXFP8 matrix [N][K] on the device as it is stored (mx_rows reads it)
     bool mx(const Pack& pk, const std::string& pre, int N, int K, MX& m, std::string& err) {
         const Tensor* w = pk.get(pre + ".weight");
+        if (w && w->dtype == "BF16" && w->bytes == (uint64_t) N * K * 2) {
+            uint16_t* raw = nullptr;
+            if (!bf16(pk, pre + ".weight", raw, (size_t) N * K, err)) return false;
+            m.w = (const uint8_t*) raw; m.N = N; m.K = K; m.bf16 = true;
+            return true;
+        }
         const Tensor* sc = pk.get(pre + ".weight_scale_inv");
         if (!w || !sc || w->dtype != "F8_E4M3" || w->bytes != (uint64_t) N * K || sc->bytes != (uint64_t) N * (K / 32) ||
             N % 32 || K % 512) {
@@ -185,8 +197,13 @@ struct Draft::Impl {
         return true;
     }
     // C [rows][N] F32 = X [rows][K] F32 . W^T (+ beta C), W MXFP8
-    void mxg(const MX& m, const float* X, int rows, int ldx, float* C, int ldc, float beta) {
+    bool mxg(const MX& m, const float* X, int rows, int ldx, float* C, int ldc, float beta, std::string& err) {
+        if (m.bf16) {
+            k::to_bf16(X, rows, m.K, ldx, x16, m.K, s);
+            return gemm((const uint16_t*) m.w, m.N, m.K, m.K, x16, rows, m.K, C, ldc, beta, err);
+        }
         k::mx_rows(m.w, m.s, m.N, m.K, X, rows, ldx, C, ldc, beta, mxpart, s);
+        return true;
     }
 
     // (the expansion to BF16, kept for reference)
@@ -259,9 +276,10 @@ struct Draft::Impl {
         cudaSetDevice(dev);
         const int D = g.dim, Q = g.n_head * g.hd, KV = g.n_kv * g.hd, F = g.ff, V = g.vocab, R = g.rank;
         const int NT = (int) g.taps.size();
+        const float norm_add = pk.num("dspark.norms_plus_one", 0) != 0 ? 0.0f : 1.0f;
         if (!bf16(pk, DP + "fc.weight", fc, (size_t) D * NT * D, err) ||
-            !vec(pk, DP + "hidden_norm.weight", 1.0f, hid1, (size_t) D, err) ||
-            !vec(pk, DP + "final_norm.weight", 1.0f, fin1, (size_t) D, err) ||
+            !vec(pk, DP + "hidden_norm.weight", norm_add, hid1, (size_t) D, err) ||
+            !vec(pk, DP + "final_norm.weight", norm_add, fin1, (size_t) D, err) ||
             !bf16(pk, DP + "markov_head.markov_w1.weight", w1, (size_t) V * R, err) ||
             !bf16(pk, DP + "markov_head.markov_w2.weight", w2, (size_t) V * R, err) ||
             !vec(pk, DP + "confidence_head.proj.weight", 0.0f, cw, (size_t) D + R, err) ||
@@ -298,10 +316,10 @@ struct Draft::Impl {
                 !mx(pk, P + "self_attn.v_proj", KV, D, l.v, err) || !mx(pk, P + "self_attn.o_proj", D, Q, l.o, err) ||
                 !mx(pk, P + "mlp.gate_proj", F, D, l.g, err) || !mx(pk, P + "mlp.up_proj", F, D, l.u, err) ||
                 !mx(pk, P + "mlp.down_proj", D, F, l.d, err) ||
-                !vec(pk, P + "input_layernorm.weight", 1.0f, l.in1, (size_t) D, err) ||
-                !vec(pk, P + "post_attention_layernorm.weight", 1.0f, l.post1, (size_t) D, err) ||
-                !vec(pk, P + "self_attn.q_norm.weight", 1.0f, l.qn1, (size_t) g.hd, err) ||
-                !vec(pk, P + "self_attn.k_norm.weight", 1.0f, l.kn1, (size_t) g.hd, err) ||
+                !vec(pk, P + "input_layernorm.weight", norm_add, l.in1, (size_t) D, err) ||
+                !vec(pk, P + "post_attention_layernorm.weight", norm_add, l.post1, (size_t) D, err) ||
+                !vec(pk, P + "self_attn.q_norm.weight", norm_add, l.qn1, (size_t) g.hd, err) ||
+                !vec(pk, P + "self_attn.k_norm.weight", norm_add, l.kn1, (size_t) g.hd, err) ||
                 !alloc(l.kc, (size_t) ring * KV, err) || !alloc(l.vc, (size_t) ring * KV, err))
                 return false;
         }
@@ -368,8 +386,7 @@ struct Draft::Impl {
         k::rms(ctx, hid1, n, D, g.eps, xn, nullptr, s);
         k::iota(pos, n, pos0, s);   // (on the device: an upload would wait behind the promotions' copies)
         for (auto& l : L) {
-            mxg(l.k, xn, n, D, kk, KV, 0.0f);
-            mxg(l.v, xn, n, D, vv, KV, 0.0f);
+            if (!mxg(l.k, xn, n, D, kk, KV, 0.0f, err) || !mxg(l.v, xn, n, D, vv, KV, 0.0f, err)) return false;
             k::qk_norm_rope(nullptr, kk, vv, nullptr, l.kn1, pos, n, 0, g.n_kv, g.hd, g.n_rot, inv, g.eps, l.kc,
                             l.vc, s, ring);
         }
@@ -395,18 +412,16 @@ struct Draft::Impl {
         const float scale = 1.0f / std::sqrt((float) g.hd);
         for (auto& l : L) {
             k::rms(h, l.in1, B, D, g.eps, xn, nullptr, s);
-            mxg(l.q, xn, B, D, q, Q, 0.0f);
-            mxg(l.k, xn, B, D, kk, KV, 0.0f);
-            mxg(l.v, xn, B, D, vv, KV, 0.0f);
+            if (!mxg(l.q, xn, B, D, q, Q, 0.0f, err) || !mxg(l.k, xn, B, D, kk, KV, 0.0f, err) ||
+                !mxg(l.v, xn, B, D, vv, KV, 0.0f, err)) return false;
             k::qk_norm_rope(q, kk, vv, l.qn1, l.kn1, pos, B, g.n_head, g.n_kv, g.hd, g.n_rot, inv, g.eps, l.kc, l.vc,
                             s, ring);
             k::window_attn(q, l.kc, l.vc, ring, lo, P + B - 1, B, g.n_head, g.n_kv, scale, att, s, apart, kSplits);
-            mxg(l.o, att, B, Q, h, D, 1.0f);   // h += attn Wo
+            if (!mxg(l.o, att, B, Q, h, D, 1.0f, err)) return false;   // h += attn Wo
             k::rms(h, l.post1, B, D, g.eps, xn, nullptr, s);
-            mxg(l.g, xn, B, D, gt, F, 0.0f);
-            mxg(l.u, xn, B, D, up, F, 0.0f);
+            if (!mxg(l.g, xn, B, D, gt, F, 0.0f, err) || !mxg(l.u, xn, B, D, up, F, 0.0f, err)) return false;
             k::swigluoai(gt, up, (size_t) B * F, g.alpha, g.limit, gt, nullptr, s);
-            mxg(l.d, gt, B, F, h, D, 1.0f);   // h += mlp
+            if (!mxg(l.d, gt, B, F, h, D, 1.0f, err)) return false;   // h += mlp
         }
         k::rms(h, fin1, B, D, g.eps, hid, hid16, s);
         prof.mark(s, 0);
@@ -505,10 +520,17 @@ size_t Draft::plan_bytes(const Pack& pk, int max_rows) {
     const size_t n_rot = (size_t) pk.num("rotary_dim", (double) hd * pk.num("partial_rotary_factor", 1.0));
     if (NL == 0 || B == 0 || NT == 0 || D == 0) return 0;
     const size_t Rw = (size_t) std::max(max_rows, 8), M = std::max(D, std::max(Q, F));
-    const auto mx = [](size_t N, size_t K) { return N * K + N * (K / 32); };   // (E4M3 + a scale every 32)
+    const auto mx = [&](const std::string& name, size_t N, size_t K) {
+        const Tensor* t = pk.get(name + ".weight");
+        return t && t->dtype == "BF16" ? N * K * 2 : N * K + N * (K / 32);
+    };
     size_t b = D * NT * D * 2 + 2 * D * 4 + 2 * V * R * 2 + (D + R) * 4 + 4;   // fc, the norms, Markov, confidence
-    b += NL * (mx(Q, D) + 2 * mx(KV, D) + mx(D, Q) + 2 * mx(F, D) + mx(D, F) + 2 * D * 4 + 2 * hd * 4 +
-               2 * ring * KV * 2);                                              // the layers, their rings
+    for (size_t i = 0; i < NL; ++i) {
+        const std::string p = DP + "layers." + std::to_string(i) + ".decoder_layer.";
+        b += mx(p + "self_attn.q_proj", Q, D) + mx(p + "self_attn.k_proj", KV, D) + mx(p + "self_attn.v_proj", KV, D) +
+             mx(p + "self_attn.o_proj", D, Q) + mx(p + "mlp.gate_proj", F, D) + mx(p + "mlp.up_proj", F, D) +
+             mx(p + "mlp.down_proj", D, F) + 2 * D * 4 + 2 * hd * 4 + 2 * ring * KV * 2;
+    }
     b += 16 * 16 * M * 4 + k::attn_part_floats((int) B, (int) (KV / hd), Impl::kSplits) * 4 +
          k::markov_part_floats() * 4 + n_rot / 2 * 4;
     b += (2 * Rw * D + B * D + B * Q + 2 * Rw * KV + B * Q + B * D + 2 * B * F + B * D + B * V + V + R + B) * 4;

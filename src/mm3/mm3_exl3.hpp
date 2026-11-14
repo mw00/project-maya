@@ -108,6 +108,7 @@ struct ExpertLayout {
     int cb = 2;
     int fmt = 0;   // 4: a GGUF's expert (mm3_gguf.cuh's kFmtGG): trellis[r] = matrix r's offset, [out][blocks]
     int gg_type[3] = {0, 0, 0};   // fmt 4: each role's ggml type (gate, up and down may differ)
+    size_t gg_scale[3] = {0, 0, 0}; // optional F32 multiplier within each expert blob (0: unit scale)
 };
 /// The routed experts of one token (the engine's device plan: plan_ptr[i] = the blob in VRAM, 0 = not on the device;
 /// plan_w[i] its weight).  gate/up over x (n_embd F32) -> swigluoai -> h (F32 [k][n_ff], scratch the caller

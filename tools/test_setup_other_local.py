@@ -67,6 +67,38 @@ class LocalOther(unittest.TestCase):
                 self.assertIsNone(maya.link_other_gguf(self.models, selected, family))
         self.assertFalse(self.models.exists())
 
+    def test_minimax_links_the_selected_gguf_drafter_and_vision(self):
+        from test_mm3_pack_gguf import gguf_companions
+        src, paths, chosen = self.source("minimax")
+        drafter, vision = gguf_companions(src)
+        for role, path in (("drafter", drafter), ("vision", vision)):
+            chosen[role] = maya.review_candidate(path, role, [path])
+        linked = maya.link_other_gguf(self.models, chosen, "minimax")
+        self.assertEqual(len(linked["files"]), len(paths))
+        for role, src in (("drafter", drafter), ("vision", vision)):
+            self.assertTrue(linked[role].is_symlink())
+            self.assertEqual(linked[role].resolve(), src)
+
+    def test_minimax_pack_rebuilds_when_selected_companions_change(self):
+        from test_mm3_pack_gguf import model, gguf_companions
+        src = model(self.root, scales=True)
+        drafter, vision = gguf_companions(src)
+        first = next(src.glob("*00001-of-*.gguf"))
+        chosen = {role: maya.review_candidate(path, role, [path]) for role, path in
+                  (("model", first), ("drafter", drafter), ("vision", vision))}
+        linked = maya.link_other_gguf(self.models, chosen, "minimax")
+        a = SimpleNamespace(no_vision=False, repack=False)
+        pack = maya.mm3_pack_step(a, linked["folder"], linked["files"], gguf=True, linked_files=linked)
+        self.assertTrue(maya.mm3_pack_has_vision(pack))
+        self.assertIn("dspark.num_hidden_layers", (pack / "mm3.txt").read_text())
+        linked["vision"] = None
+        maya.mm3_pack_step(a, linked["folder"], linked["files"], gguf=True, linked_files=linked)
+        self.assertFalse(maya.mm3_pack_has_vision(pack))
+        self.assertNotIn(vision.name, (pack / "tensors.txt").read_text())
+        self.assertIn(drafter.name, (pack / "tensors.txt").read_text())
+        self.assertEqual(json.loads((pack / maya.PACK_SOURCES).read_text())["local_companions"],
+                         {"drafter": str(linked["drafter"])})
+
     def test_broken_source_links_have_a_useful_message(self):
         src = self.root / "broken"
         src.mkdir()

@@ -733,7 +733,7 @@ MM3_PROFILE = ROOT / "data" / "expert-profile-mm3.bin"
 # used as they are.
 MM3_GGUF_MANIFEST = ROOT / "tools" / "mm3" / "download_gguf.json"
 MM3_QUANTS = {"exl3": "EXL3 3.5 bits", "gguf-xs": "MiniMax-M3.1-Flash-Maya-XS", "gguf-s": "MiniMax-M3.1-Flash-Maya-S"}
-MM3_GGUF_PACK_TOOLS = ("tools/mm3/pack_gguf.py", "tools/ds4/pack_gguf.py", "tools/mm3/pack.py", "tools/mm3/st.py",
+MM3_GGUF_PACK_TOOLS = ("tools/mm3/pack_gguf.py", "tools/mm3/gguf_companions.py", "tools/ds4/pack_gguf.py", "tools/mm3/pack.py", "tools/mm3/st.py",
                        "tools/mm3/chat_template.jinja")
 # the GGUFs' pictures and drafting: the EXL3 repo's vision tower (model-vision-00001-of-00001.safetensors, 1.7 GB, with
 # config.json / preprocessor_config.json) and DSpark draft (dspark/, 2.3 GB) - download.json's own pinned files, the same
@@ -3225,10 +3225,21 @@ def link_other_gguf(models: Path, chosen: dict, family: str) -> dict | None:
     if missing is not None:
         warn(f"{missing.name} is missing" + (f" (broken link to {missing.resolve()})" if missing.is_symlink() else ""))
         return None
-    if chosen.get("drafter") or chosen.get("vision"):
+    if family == "deepseek" and (chosen.get("drafter") or chosen.get("vision")):
         warn(f"{FAMILY_TITLE[family]}: this local GGUF path currently packs the text model only; "
              "its drafter and vision require native companion packs. Set Drafter and Vision to None to continue")
         return None
+    if family == "minimax":
+        for role, arch, key, want in (("drafter", "dflash", "dflash.backbone", "minimax-m3"),
+                                     ("vision", "clip", "clip.projector_type", "minimax_m3")):
+            if not chosen.get(role):
+                continue
+            from gguf_reader import GGUFFile
+            source = chosen[role]["anchor"]
+            meta = GGUFFile(source).metadata if source.suffix.lower() == ".gguf" else {}
+            if meta.get("general.architecture") != arch or meta.get(key) != want:
+                warn(f"{source.name}: not a MiniMax-M3 {role} GGUF")
+                return None
     if family == "minimax":
         stem = re.sub(r"(?:-\d{5}-of-\d{5})?\.gguf$", "", first.name, flags=re.I)
         for suffix in ("-maya-indexers.bin", "-maya-indexers.gguf"):
@@ -3242,9 +3253,21 @@ def link_other_gguf(models: Path, chosen: dict, family: str) -> dict | None:
         if why:
             warn(why)
             return None
+    companions = {}
+    for role in ("drafter", "vision"):
+        companion = chosen.get(role)
+        companions[role] = None
+        if companion is not None:
+            for source in sorted(companion["files"]):
+                target = dest / role / source.name
+                _, why = MI.link_file(source, target)
+                if why:
+                    warn(why)
+                    return None
+            companions[role] = dest / role / companion["path"].name
     ok(f"{len(files)} local {FAMILY_TITLE[family]} GGUF file(s) linked; size and SHA-256 not checked")
     return {"folder": dest, "model": dest / first.name, "files": [dest / p.name for p in files],
-            "drafter": None, "vision": None}
+            **companions}
 
 
 def link_qwen_local(models: Path, chosen: dict) -> dict | None:
@@ -7189,14 +7212,21 @@ def set_up_linked_gguf(a, prev: dict, linked: dict, family: str) -> Path:
         fail("a linked model file is missing", "keep the downloaded source files in place")
     ok(f"{len(files)} model file(s); size and SHA-256 not checked")
     pack = (ds4_pack_step(a, d, gguf=True, files=files, local_only=True) if deepseek else
-            mm3_pack_step(a, d, files, gguf=True))                                 # 6
+            mm3_pack_step(a, d, files, gguf=True, linked_files=linked))             # 6
     step(7, "images (the vision tower)")
-    ok("pictures and separate drafting: off (no native companion packs selected)")
+    ok("pictures: ON (selected vision GGUF)" if not deepseek and not a.no_vision and mm3_pack_has_vision(pack) else
+       "pictures: off")
     if deepseek:
         path = write_config_ds4(a, pc, meta, pack, ctx, d.parent, d, "local-gguf", False, linked_files=linked)
     else:
         path = write_config_mm3(a, pc, meta, pack, ctx, d.parent, d, "local-gguf", own=True, linked_files=linked)
     ablate_step(path, family, d.parent)
+    if not deepseek and linked.get("drafter") and CDS.has_drafter(read_json(path)):
+        how = drafting_choice(a, "MiniMax's DSpark drafter", "10-30")
+        if how == "measure":
+            speed_calibration(path)
+        else:
+            keep_drafting(path, how == "on")
     return path
 
 
@@ -7650,7 +7680,8 @@ def mm3_companions_step(a, d: Path, hip: bool) -> Path | None:
     return c
 
 
-def mm3_pack_step(a, d: Path, files: list, gguf: bool = False, companions: Path | None = None) -> Path:
+def mm3_pack_step(a, d: Path, files: list, gguf: bool = False, companions: Path | None = None,
+                  *, linked_files: dict | None = None) -> Path:
     """tools/mm3/pack.py's pack in <model>/maya-mm3 (a GGUF's: pack_gguf.py's): the geometry, where every tensor sits in
     the safetensors / the GGUF's shards (read in place) and the tokenizer - built again when its tools or the model's
     files changed."""
@@ -7659,8 +7690,12 @@ def mm3_pack_step(a, d: Path, files: list, gguf: bool = False, companions: Path 
     tools = S.source_hash(MM3_GGUF_PACK_TOOLS if gguf else MM3_PACK_TOOLS)
     need = ("mm3.txt", "tensors.txt", "tokenizer/vocab.json", "tokenizer/chat_template.jinja")
     shards = [f for f in files if f.suffix == (".gguf" if gguf else ".safetensors")]
+    local = {role: str(linked_files[role]) for role in ("drafter", "vision") if linked_files and linked_files.get(role)
+             and (role != "vision" or not a.no_vision)}
+    tracked = shards + [Path(p) for p in local.values()]
     if not a.repack and read_json(pack / PACK_SOURCES).get("tools") == tools and \
-            all((pack / f).exists() for f in need) and pack_stale(pack, shards) is None:
+            read_json(pack / PACK_SOURCES).get("local_companions", {}) == local and \
+            all((pack / f).exists() for f in need) and pack_stale(pack, tracked) is None:
         ok(f"pack already built: {pack}")
         return pack
     if not os.access(d, os.W_OK):
@@ -7670,15 +7705,16 @@ def mm3_pack_step(a, d: Path, files: list, gguf: bool = False, companions: Path 
     if gguf:
         run([sys.executable, str(ROOT / "tools" / "mm3" / "pack_gguf.py"), "--model", str(d), "--out", str(pack)] +
             (["--companions", str(companions)] if companions else ["--text-only"]) +
-            ["--shards"] + [f.name for f in shards])
+            ["--shards"] + [f.name for f in shards] + [v for role, path in local.items() for v in ("--" + role, path)])
     else:
         run([sys.executable, str(ROOT / "tools" / "mm3" / "pack.py"), "--model", str(d), "--out", str(pack)])
     missing = [f for f in need if not (pack / f).exists()]
     if missing:
         fail(f"the pack builder did not write {pack / missing[0]}", "the reason is in the messages above")
-    stamp_pack(pack, shards)
+    stamp_pack(pack, tracked)
     rec = read_json(pack / PACK_SOURCES)
     rec["tools"] = tools
+    rec["local_companions"] = local
     (pack / PACK_SOURCES).write_text(json.dumps(rec, indent=1), encoding="utf-8")
     ok(f"pack: {pack}")
     return pack
@@ -7788,7 +7824,9 @@ def write_config_mm3(a, pc: dict, meta: dict, pack: Path, ctx: int, models: Path
                         "model_dir": str(d), **({"own": True} if own else {}),
                         "written": time.strftime("%Y-%m-%d %H:%M")}
     if linked_files is not None:
-        cfg["installer"].update(gguf=str(linked_files["model"]), local_drafter=None, local_vision=None)
+        cfg["installer"].update(gguf=str(linked_files["model"]),
+                                 local_drafter=str(linked_files["drafter"]) if linked_files.get("drafter") else None,
+                                 local_vision=str(linked_files["vision"]) if linked_files.get("vision") else None)
     cfg_path.write_text(json.dumps(N.env_out(cfg), indent=1), encoding="utf-8")
     ok(f"config: {cfg_path}")
     ok(f"start script: {write_run_script(cfg_path, port)}")

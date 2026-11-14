@@ -23,7 +23,11 @@ the model as MiniMax defines it, never those layers on full attention in silence
 The GGUF's norms already hold Gemma's 1 + w (llama.cpp's converter adds it): mm3.txt says so (norms_plus_one 1) and the
 engine adds nothing.
 
-A GGUF set has no vision tower and no DSpark draft.  Both come with the EXL3 repo (Mia-AiLab's, tools/mm3/download.json)
+A GGUF text set can use separately selected --drafter / --vision GGUFs: MiniMax's DSpark BF16 and vision F32/BF16
+with their embedded configuration. Their weights are indexed in place, including the vision's temporal patch slices.
+The optional per-expert .scale tensors are indexed as one F32 multiplier per expert and matrix.
+
+The native vision tower and DSpark draft also come with the EXL3 repo (Mia-AiLab's, tools/mm3/download.json)
 as files of their own - model-vision-00001-of-00001.safetensors with config.json / preprocessor_config.json, and dspark/
 - which do not depend on the experts' quant: --companions names a folder holding them (the setup downloads them there:
 <models>/MiniMax-M3.1-Flash-companions, the repo's own layout; a whole EXL3 download beside the GGUF serves as well), and
@@ -49,6 +53,7 @@ _spec.loader.exec_module(_ds4)
 Gguf, TYPES = _ds4.Gguf, _ds4.TYPES   # (maya-ds4's GGUF reader: the shards' metadata and tensor infos)
 sys.path.insert(0, str(HERE))
 import pack as exl3_pack  # noqa: E402  (tools/mm3/pack.py: its mm3.txt writer for the vision / DSpark keys)
+import gguf_companions
 from st import SafeTensors  # noqa: E402
 
 COMPANIONS = "MiniMax-M3.1-Flash-companions"   # (the setup's folder of the EXL3 repo's vision tower and DSpark draft)
@@ -136,6 +141,9 @@ LAYER = {
     "ffn_gate_exps.weight": "block_sparse_moe.experts.w1",   # [n_exp][ff][dim]: an entry an expert
     "ffn_up_exps.weight": "block_sparse_moe.experts.w3",
     "ffn_down_exps.weight": "block_sparse_moe.experts.w2",   # [n_exp][dim][ff]
+    "ffn_gate_exps.scale": "block_sparse_moe.experts.w1.scale",
+    "ffn_up_exps.scale": "block_sparse_moe.experts.w3.scale",
+    "ffn_down_exps.scale": "block_sparse_moe.experts.w2.scale",
     "ffn_gate.weight": "mlp.gate_proj.weight",                # (the leading dense layers)
     "ffn_up.weight": "mlp.up_proj.weight",
     "ffn_down.weight": "mlp.down_proj.weight",
@@ -236,7 +244,9 @@ def main() -> int:
                                        "*-maya-indexers.bin, or .gguf)")
     ap.add_argument("--companions", help="the EXL3 repo's vision tower / DSpark draft files (default: <model>/../"
                                          "%s, or a whole EXL3 download beside the model)" % COMPANIONS)
-    ap.add_argument("--text-only", action="store_true", help="leave the companions' vision tower and draft out")
+    ap.add_argument("--text-only", action="store_true", help="do not discover native companions in adjacent folders")
+    ap.add_argument("--drafter", help="the selected MiniMax DSpark GGUF")
+    ap.add_argument("--vision", help="the selected MiniMax vision GGUF")
     a = ap.parse_args()
     model = pathlib.Path(a.model).expanduser().resolve()
     out = pathlib.Path(a.out).expanduser() if a.out else model / "maya-mm3"
@@ -291,6 +301,13 @@ def main() -> int:
                 continue
             shape = list(reversed(dims))     # ggml ne0 innermost -> torch order, outermost first
             base = g.data_start + off
+            if ck.endswith((".experts.w1.scale", ".experts.w2.scale", ".experts.w3.scale")):
+                if tname != "F32" or shape != [n_exp]:
+                    raise SystemExit(f"{name}: expected {n_exp} F32 expert scales")
+                pre, role, _ = ck.rsplit(".", 2)
+                for i in range(n_exp):
+                    tensors.append((f"{pre}.{i}.{role}.scale", tname, fi, base + i * 4, 4, [1]))
+                continue
             if ck.endswith((".experts.w1", ".experts.w2", ".experts.w3")):
                 if shape[0] != n_exp:
                     raise SystemExit("%s: %s holds %d experts, not %d" % (g.path.name, name, shape[0], n_exp))
@@ -321,6 +338,20 @@ def main() -> int:
             raise SystemExit("the companions' path relative to the model has a space: %s" % cfiles[0])
         files += cfiles
         tensors += ctensors
+    hidden = kv[ARCH + ".embedding_length"]
+    for kind, path in (("drafter", a.drafter), ("vision", a.vision)):
+        if not path:
+            continue
+        src = pathlib.Path(path).expanduser().absolute()  # keep the setup's symlink on the model's drive
+        g = Gguf(src)
+        if (why := _ds4.short(g)):
+            raise SystemExit(f"{src}: incomplete companion ({why})")
+        if kind == "drafter":
+            extra, dcfg = gguf_companions.draft(g, TYPES, len(files), LAYER, hidden)
+        else:
+            extra, vision = gguf_companions.vision(g, TYPES, len(files), kv["tokenizer.ggml.tokens"], hidden)
+        files.append(rel(src))
+        tensors += extra
     embd = next(t for t in tensors if t[0] == GLOBAL["token_embd.weight"])
     shexp = next((t for t in tensors if t[0].endswith("shared_experts.gate_proj.weight")), None)
     geo = geometry(kv, embd[5][0], shexp[5][0] if shexp else 0)
@@ -330,7 +361,7 @@ def main() -> int:
     dense = sorted({t[1] for t in tensors if ".experts." not in t[0] and t[1] != "F32"})
     exp_types = {}   # (each layer and role once: its expert 0's entry)
     for t in tensors:
-        if ".experts.0." in t[0]:
+        if ".experts.0." in t[0] and t[0].endswith(".weight"):
             exp_types[t[1]] = exp_types.get(t[1], 0) + 1
     recipe = {}
     try:
@@ -380,8 +411,8 @@ def main() -> int:
     print("  experts (layer x role): %s" % ", ".join("%s %d" % (k, v) for k, v in sorted(exp_types.items())))
     print("  special ids: %s" % special)
     print("  vision tower: %s; DSpark draft: %s" % (
-        "from %s" % comp if vision else "none (text only)",
-        "%d tensors from %s" % (sum(1 for t in tensors if t[0].startswith("dspark.")), comp) if dcfg else "none"))
+        "from %s" % (a.vision or comp) if vision else "none (text only)",
+        "%d tensors from %s" % (sum(1 for t in tensors if t[0].startswith("dspark.")), a.drafter or comp) if dcfg else "none"))
     return 0
 
 

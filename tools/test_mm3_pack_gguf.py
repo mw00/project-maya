@@ -18,7 +18,7 @@ HERE = pathlib.Path(__file__).resolve().parent
 PACK = HERE / "mm3" / "pack_gguf.py"
 
 # ggml type -> (values a block, bytes a block)
-BLOCK = {0: (1, 4), 8: (32, 34), 12: (256, 144), 13: (256, 176), 14: (256, 210), 16: (256, 66), 19: (256, 50)}
+BLOCK = {0: (1, 4), 30: (1, 2), 8: (32, 34), 12: (256, 144), 13: (256, 176), 14: (256, 210), 16: (256, 66), 19: (256, 50)}
 D, F, FD, E, NL, LEAD, VOCAB = 256, 256, 512, 4, 3, 1, 8
 
 
@@ -57,7 +57,7 @@ def gguf(path: pathlib.Path, kv: dict, tensors: list):
             f.write(d + b"\0" * ((32 - len(d) % 32) % 32))
 
 
-def model(root: pathlib.Path, side: bool = True, side_ext: str = ".bin") -> pathlib.Path:
+def model(root: pathlib.Path, side: bool = True, side_ext: str = ".bin", scales: bool = False) -> pathlib.Path:
     m = root / "MiniMax-M3.1-Flash-Maya-XS"
     m.mkdir()
     a = "minimax-m3."
@@ -85,6 +85,8 @@ def model(root: pathlib.Path, side: bool = True, side_ext: str = ".bin") -> path
                    (L + "attn_output.weight", 13, [32 * 128, D]), (L + "attn_q_norm.weight", 0, [128]),
                    (L + "attn_k_norm.weight", 0, [128]), (L + "ffn_norm.weight", 0, [D])]
         if li >= LEAD:
+            if scales:
+                layers += [(L + "ffn_" + role + "_exps.scale", 0, [E]) for role in ("gate", "up", "down")]
             layers += [(L + "indexer.q_proj.weight", 8, [D, 256]), (L + "indexer.k_proj.weight", 8, [D, 128]),
                        (L + "indexer.q_norm.weight", 0, [128]), (L + "indexer.k_norm.weight", 0, [128]),
                        (L + "ffn_gate_inp.weight", 0, [D, E]), (L + "exp_probs_b.bias", 0, [E]),
@@ -145,6 +147,32 @@ def run(m: pathlib.Path, *extra) -> subprocess.CompletedProcess:
     return subprocess.run([sys.executable, str(PACK), "--model", str(m), *extra], capture_output=True, text=True)
 
 
+def gguf_companions(root):
+    """Small files in the reported MiniMax GGUF schemas, including split temporal patch weights."""
+    draft, vision = root / "draft.gguf", root / "mmproj.gguf"
+    cfg = {"num_hidden_layers": 1, "hidden_size": D, "dspark_ffn_hidden_size": 512,
+           "dspark_markov_rank": 32, "dspark_block_size": 3, "dspark_noise_token_id": 2,
+           "dspark_target_layer_ids": [1], "dflash_config": {"sliding_window": 64}}
+    gguf(draft, {"general.architecture": (8, "dflash"), "dflash.backbone": (8, "minimax-m3"),
+                 "dflash.embedding_length": (4, D), "dflash.minimax.source_config": (8, json.dumps({"text_config": cfg}))},
+         [("fc.weight", 30, [D, D]), ("enc.output_norm.weight", 0, [D]), ("output_norm.weight", 0, [D]),
+          ("conf_proj.weight", 30, [D + 32, 1]), ("conf_proj.bias", 0, [1]),
+          ("markov_w1.weight", 30, [32, VOCAB]), ("markov_w2.weight", 30, [32, VOCAB]),
+          ("blk.0.attn_q.weight", 30, [D, 32 * 128]), ("blk.0.attn_norm.weight", 0, [D])])
+    vc = {"hidden_size": 16, "intermediate_size": 32, "num_hidden_layers": 1, "num_attention_heads": 2,
+          "patch_size": 2, "img_token_compression_config": {"spatial_merge_size": 2, "temporal_patch_size": 2}}
+    cfg = {"vision_config": vc, "projector_hidden_size": 16, "image_token_index": 6}
+    pp = {"image_mean": [0.5] * 3, "image_std": [0.5] * 3}
+    gguf(vision, {"general.architecture": (8, "clip"), "clip.projector_type": (8, "minimax_m3"),
+                  "clip.vision.projection_dim": (4, D), "clip.vision.minimax.config": (8, json.dumps(cfg)),
+                  "clip.vision.minimax.preprocessor_config": (8, json.dumps(pp))},
+         [("v.patch_embd.weight", 30, [2, 2, 3, 16]), ("v.patch_embd.weight.1", 30, [2, 2, 3, 16]),
+          ("v.pre_ln.weight", 0, [16]), ("v.pre_ln.bias", 0, [16]),
+          ("v.blk.0.attn_q.weight", 30, [16, 16]), ("v.blk.0.ln1.weight", 0, [16]),
+          ("mm.1.weight", 30, [16, 16]), ("mm.merger.fc1.weight", 30, [D * 4, 16])])
+    return draft, vision
+
+
 def tensors(pack: pathlib.Path) -> tuple[list, dict]:
     files, t = [], {}
     for line in (pack / "tensors.txt").read_text().splitlines():
@@ -157,6 +185,33 @@ def tensors(pack: pathlib.Path) -> tuple[list, dict]:
 
 
 class PackGguf(unittest.TestCase):
+    def test_selected_gguf_companions_and_expert_scales_keep_their_source_offsets(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            m = model(root, scales=True)
+            draft, vision = gguf_companions(root)
+            r = run(m, "--text-only", "--drafter", str(draft), "--vision", str(vision))
+            self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
+            pack = m / "maya-mm3"
+            files, ts = tensors(pack)
+            kv = dict(line.split(" ", 1) for line in (pack / "mm3.txt").read_text().splitlines())
+            self.assertEqual(kv["dspark.norms_plus_one"], "1")
+            self.assertEqual(kv["vision.hidden_size"], "16")
+            self.assertEqual(kv["dspark.num_hidden_layers"], "1")
+            for prefix, name, dtype, shape in (
+                    ("dspark.language_model.model.dspark.", "hidden_norm.weight", "F32", [D]),
+                    ("dspark.language_model.model.dspark.", "layers.0.decoder_layer.self_attn.q_proj.weight", "BF16", [4096, D]),
+                    ("vision_tower.vision_model.", "embeddings.patch_embedding.weight.1", "BF16", [16, 3, 2, 2])):
+                t = ts[prefix + name]
+                self.assertEqual((t[0], t[4]), (dtype, shape))
+                self.assertIn((m / files[t[1]]).resolve(), (draft, vision))
+            for role in ("w1", "w3", "w2"):
+                start = ts[f"language_model.model.layers.1.block_sparse_moe.experts.0.{role}.scale"][2]
+                for e in range(E):
+                    t = ts[f"language_model.model.layers.1.block_sparse_moe.experts.{e}.{role}.scale"]
+                    self.assertEqual((t[0], t[3], t[4]), ("F32", 4, [1]))
+                    self.assertEqual(t[2], start + e * 4)
+
     def test_pack(self):
         with tempfile.TemporaryDirectory() as d:
             m = model(pathlib.Path(d))

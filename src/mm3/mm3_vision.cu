@@ -261,6 +261,24 @@ struct Vision::Impl {
         return (const uint8_t*) hv.data();
     }
 
+    // GGUF stores the two temporal slices separately; interleave them in the
+    // loader's CPU staging, in the original [out, channel, time, y, x] order.
+    const uint8_t* patch(const Pack& pk, const std::string& name, int dim, int width, std::string& err) {
+        if (pk.get(name + ".1") == nullptr) return f32(pk, name, (size_t) dim * width, err);
+        const size_t part = (size_t) dim * width / 2, area = (size_t) width / 6;
+        const uint8_t* a = f32(pk, name, part, err);
+        const uint8_t* b = f32(pk, name + ".1", part, err);
+        if (!a || !b) return nullptr;
+        hostf.emplace_back((size_t) dim * width);
+        float* out = hostf.back().data();
+        for (size_t row = 0; row < (size_t) dim * 3; ++row) {
+            std::memcpy(out + row * area * 2, a + row * area * 4, area * 4);
+            std::memcpy(out + row * area * 2 + area, b + row * area * 4, area * 4);
+        }
+        host_b += (size_t) dim * width * 4;
+        return (const uint8_t*) out;
+    }
+
     // a BF16 tensor where the pack maps it
     const uint8_t* bf16(const Pack& pk, const std::string& n, size_t elems, std::string& err) {
         const Tensor* t = need(pk, n, elems, err);
@@ -344,7 +362,7 @@ struct Vision::Impl {
         const int nf = ((g.hd / 3) / 2);   // (the RoPE's frequencies: 2 nf dims an axis, theta^(-2j / that))
         std::vector<float> iv((size_t) nf);
         for (int j = 0; j < nf; ++j) iv[(size_t) j] = 1.0f / std::pow(g.theta, (float) (2 * j) / (float) (2 * nf));
-        if (!pre(f32(pk, V + "embeddings.patch_embedding.weight", (size_t) D * P, err), (size_t) D * P, o_wpatch) ||
+        if (!pre(patch(pk, V + "embeddings.patch_embedding.weight", D, P, err), (size_t) D * P, o_wpatch) ||
             !pre(f32(pk, V + "pre_layrnorm.weight", D, err), D, o_prew) ||
             !pre(f32(pk, V + "pre_layrnorm.bias", D, err), D, o_preb) ||
             !pre((const uint8_t*) iv.data(), (size_t) nf, o_inv) ||

@@ -618,11 +618,31 @@ struct Model::Impl {
                     s.p[r * 3 + q] = nullptr;
                     s.n[r * 3 + q] = 0;
                 }
+                const Tensor* scale = pk.get(E + std::to_string(e) + "." + parts[r] + ".scale");
+                if (scale) {
+                    float value = 0.0f;
+                    if (scale->dtype != "F32" || scale->bytes != sizeof(float)) {
+                        err = E + std::to_string(e) + "." + parts[r] + ": invalid expert scale";
+                        return false;
+                    }
+                    std::memcpy(&value, pk.data(*scale), sizeof(value));
+                    if (!std::isfinite(value)) { err = "invalid GGUF expert scale"; return false; }
+                    s.p[r * 3 + 1] = pk.data(*scale);
+                    s.n[r * 3 + 1] = sizeof(float);
+                }
+                if ((s.n[r * 3 + 1] != 0) != (e == 0 ? scale != nullptr : l.src[0].n[r * 3 + 1] != 0)) {
+                    err = "GGUF expert scales must be present for every expert of a role";
+                    return false;
+                }
             }
             l.lay.trellis[r] = l.lay.suh[r] = l.lay.svh[r] = off;
             l.lay.gg_type[r] = ty;
             l.lay.k2[r] = 0;
             off += up(bytes);
+            if (l.src[0].n[r * 3 + 1]) {
+                l.lay.gg_scale[r] = l.lay.suh[r] = off;
+                off += up(sizeof(float));
+            }
         }
         l.lay.fmt = gg::kFmtGG;
         l.lay.cb = 0;
@@ -2296,7 +2316,11 @@ struct Model::Impl {
         const uint8_t* blob = l.host_blob.empty() ? nullptr : l.host_blob[(size_t) e];
         if (gguf) {   // (the three matrices' rows: the pool's blob, or the GGUF's mapping)
             c.gf = &l.gf;
-            for (int r = 0; r < 3; ++r) c.gg[r] = blob ? blob + l.lay.trellis[r] : l.src[(size_t) e].p[r * 3];
+            for (int r = 0; r < 3; ++r) {
+                c.gg[r] = blob ? blob + l.lay.trellis[r] : l.src[(size_t) e].p[r * 3];
+                if (l.lay.gg_scale[r])
+                    std::memcpy(&c.gg_scale[r], blob ? blob + l.lay.gg_scale[r] : l.src[(size_t) e].p[r * 3 + 1], sizeof(float));
+            }
             return c;
         }
         for (int r = 0; r < 3; ++r) {
