@@ -23,6 +23,7 @@
 #include "strata/core/glm_arch.hpp"
 #include "strata/core/glm_dflash.hpp"
 #include "strata/core/glm_state_layout.hpp"   // glm-dsa B4.1
+#include "strata/core/state_cache.hpp"
 #include "strata/kernels/cpu/native_expert.hpp"
 #include "strata/kernels/exl3.hpp"
 #include "strata/kernels/sampler.hpp"
@@ -224,12 +225,21 @@ public:
     /// position; false (+ err) when that slot holds none.  ~150 MB a checkpoint for GLM-5.3-Flash's 34 KDA layers.
     bool ckpt_save(int slot, std::string& err);
     bool ckpt_restore(int slot, std::string& err);
+    bool state_capture(statecache::Capture& out, const statecache::Prefix& prefix, int checkpoint,
+                       std::string& err);
+    bool state_restore(const statecache::Prefix& prefix, const std::vector<statecache::Region>& regions,
+                       std::string& err);
+    bool state_sources(const statecache::Prefix& prefix, int checkpoint,
+                       std::vector<statecache::RegionSource>& sources, std::string& err);
+    bool state_load(statecache::StateCache& cache, const statecache::StateCache::Lease& lease, std::string& err);
     /// glm-dsa L1-2: whether the state at an earlier position is just the cache rows before it (glm-dsa: no KDA
     /// states, no open indexer pool), so a checkpoint can be kept for a position the prompt already read past:
     /// ckpt_save_at(slot, at) with at <= the current position (at < 0: ckpt_save's own).  The driver then reads
     /// through a checkpoint mark in one prompt-path call - a split's pipeline does not drain there.
     bool ckpt_positional() const;
     bool ckpt_save_at(int slot, int64_t at, std::string& err);
+    bool prefill_export_prepare(int slot, int64_t at, std::string& err);
+    bool prefill_export_collect(int slot, int64_t at, std::string& err);
     /// The snapshot (the previous prompt's state, before its last token) copied into checkpoint `slot` on a side
     /// thread, while the next prompt runs: the snapshot stays intact until that prompt's snapshot_save, which waits
     /// for the copy (as every checkpoint call does).  A turn that starts within 512 tokens of the snapshot gets no
@@ -669,6 +679,7 @@ public:
     std::vector<int> dsa_layers() const;                   // this half's DSA layers (NextN block first), slot order
     void snap_pool_copy(bool restore);
     int64_t snap_pos_ = -1;
+    std::vector<float> snap_hidden_;  // Flash NextN's endpoint trunk row, when actually written
     std::vector<std::vector<float>> ckpt_buf_;             // ckpt_save's checkpoints (this half): KDA runs, pool rows
     std::vector<int64_t> ckpt_pos_;                        // ... their positions (-1: none)
     void ckpt_pool_copy(int64_t pos, float* host, bool restore);   // the open pool's rows at pos <-> host
@@ -856,6 +867,7 @@ public:
         std::vector<int64_t> kda_S, kda_conv, dsa_lat, dsa_ik, dsa_ig, dsa_pool;
         GlmStateLayout lay;   // glm-dsa B4.1
         float *snap = nullptr, *snap_pool = nullptr, *kda_bak = nullptr;
+        std::vector<float> snap_hidden;
         int last_tok = -1;
         std::vector<int64_t> img_pos;
         std::vector<float> img_rows;

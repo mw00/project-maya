@@ -6,6 +6,9 @@ Everything on this page is optional: the engine sizes itself for the PC it runs 
 The settings below are environment variables named `MAYA_*`: set them before a start, or keep them in the config
 with `./maya.sh --setup --env MAYA_NAME=value`.
 
+Complete conversation-state caching (GLM) is opt-in with `MAYA_GLM_STATE_CACHE=1`.
+Its controls, RAM/SSD budgets and checkpoint behavior are documented in [Conversation state cache](FLASHSTATES.md).
+
 The switches that turn something off - `MAYA_GLM_NO_SPEC` (no drafting on a split: token by token), `MAYA_GLM_NO_MTP`
 (the NextN draft block not loaded) and `MAYA_GLM_NO_PREFILL` (prompts read token by token) - are on with `1`, and off
 when unset or set to `0`, `false`, `off`, `no` or nothing. (Before v1.1.56 any value turned them on, `0` included.)

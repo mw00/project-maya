@@ -251,13 +251,25 @@ static bool exl3_table(const std::string& pack_dir, Exl3Table& t, std::string& e
     return true;
 }
 
+// Kernel input dtype is a per-tensor contract. Small BF16 projections (including
+// NextN/indexer tensors) must not become F32 merely because of their dimensions.
+static bool bf16_projection(const std::string& name) {
+    for (const char* suffix : {"hc_attn_fn.weight", "hc_ffn_fn.weight", "ssm_f_a.weight", "ssm_f_b.weight",
+                             "ssm_g_a.weight", "ssm_g_b.weight", "ssm_beta.weight", "ffn_gate_inp.weight",
+                             "indexer.attn_k.weight", "indexer_compressor_gate.weight", "indexer.attn_q_b.weight",
+                             "indexer.proj.weight", "attn_k_b.weight", "attn_v_b.weight"}) {
+        const size_t n = std::strlen(suffix);
+        if (name.size() >= n && name.compare(name.size()-n, n, suffix) == 0) return true;
+    }
+    return false;
+}
 // a dense row's VRAM bytes as load_pack uploads it (0: not uploaded), and how: the fast path keeps the pack's big BF16
 // rows (kind 4) BF16 and the natively served rows (kind 0) quantized, dequantizes the rest to F32, and leaves
 // token_embd on the host (the embedding row is dequantized there from the shard mapping)
 static uint64_t pack_row_vram(const std::string& name, const std::string& kind, const strata::TensorInfo* t, bool fast,
                               std::string* how = nullptr, bool keep_bf16 = false) {
     if (fast && name == "token_embd.weight") return 0;
-    if ((fast || keep_bf16) && kind == "4" && t->elements() >= 65536) {   // glm-dsa B3.5: keep_bf16 (glm-dsa slow)
+    if ((fast || keep_bf16) && kind == "4" && (t->elements() >= 65536 || bf16_projection(name))) {
         if (how) *how = " bf16";
         return ((uint64_t) t->elements() * 2 + 255u) & ~(uint64_t) 255u;
     }
@@ -3197,7 +3209,8 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
         return false;
     }
     const auto keep16 = [&](const Row& r, const strata::TensorInfo* t) {
-        return (fast_mode_ || g_.arch == GlmArch::GlmDsa) && r.kind == "4" && t->elements() >= 65536;   // glm-dsa B3.5
+        return (fast_mode_ || g_.arch == GlmArch::GlmDsa) && r.kind == "4" &&
+               (t->elements() >= 65536 || bf16_projection(r.name));
     };
     const auto skip_upload = [&](const Row& r) { return fast_mode_ && r.name == "token_embd.weight"; };
     uint64_t bytes = 0;

@@ -37,6 +37,10 @@ jobs:
         run: |
           c++ -std=c++20 -O2 -DNDEBUG -Wall -Wextra -Werror tests/glm_memory_test.cpp -o "$RUNNER_TEMP/glm_memory_test"
           "$RUNNER_TEMP/glm_memory_test"
+      - name: Complete conversation states (CPU only)
+        run: |
+          c++ -std=c++20 -O2 -DNDEBUG -Wall -Wextra -Werror -pthread -Iinclude src/core/state_cache.cpp src/core/state_digest.cpp tests/core/state_cache_test.cpp -o "$RUNNER_TEMP/state_cache_test"
+          "$RUNNER_TEMP/state_cache_test"
       - name: DeepSeek CPU row preparation (CPU only)
         run: |
           c++ -std=c++20 -O2 -DNDEBUG -Wall -Wextra -Werror tests/ds4_cpu_prepare_rows_test.cpp -o "$RUNNER_TEMP/ds4_cpu_prepare_rows_test"
@@ -47,3 +51,17 @@ jobs:
         run: '"$RUNNER_TEMP/venv/bin/python" -m unittest discover -s serve -p "test_*.py" -t .'
       - name: Installer and tools tests
         run: '"$RUNNER_TEMP/venv/bin/python" -m unittest discover -s tools -p "test_*.py"'
+
+  state-windows:
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ilammy/msvc-dev-cmd@v1
+      - name: Native Windows persistence and ownership
+        shell: pwsh
+        run: |
+          cl /nologo /std:c++20 /EHsc /O2 /Iinclude src/core/state_cache.cpp src/core/state_digest.cpp tests/core/state_cache_test.cpp /Fe:state_cache_test.exe
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          ./state_cache_test.exe
+
