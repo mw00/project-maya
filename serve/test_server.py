@@ -2806,6 +2806,24 @@ class EngineEndTests(unittest.TestCase):
         self.assertTrue(e.ended)
         self.assertFalse(e.alive())                      # (the process may still be exiting: the next request restarts)
 
+    def test_a_replaced_engines_late_end_leaves_the_new_one_running(self):
+        # GLM link mode: the AMD GPU's helper shares the lead's output and ends after it, so the old engine's output
+        # can close after a restart started the new one - that must not mark the new engine ended
+        import io
+        import queue
+        from types import SimpleNamespace
+        e = StrataEngine.__new__(StrataEngine)
+        old = SimpleNamespace(stdout=io.StringIO("helper: a late line\n"), poll=lambda: None)
+        old_lines = queue.Queue()
+        e.proc = SimpleNamespace(stdout=io.StringIO(""), poll=lambda: None)   # the new start's process
+        e.lines, e.multi, e.ended = queue.Queue(), 0, False
+        e._routes, e._routes_lock = {}, threading.Lock()
+        e._pump(old, old_lines)
+        self.assertFalse(e.ended)
+        self.assertTrue(e.alive())
+        self.assertTrue(e.lines.empty())                 # nothing of the old engine in the new one's queue
+        self.assertTrue(old_lines.empty())
+
     def test_the_watchdog_and_ram_notes_are_unchanged(self):
         self.assertIn("a hang it caught", self.note("maya ds4 serve: no progress for 600 s during a request - stopping "
                                                     "the engine so the server starts it again (issue #29, #539)\n"))
