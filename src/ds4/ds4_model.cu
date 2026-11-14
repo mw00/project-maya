@@ -24007,6 +24007,7 @@ void Model::set_logit_bias(const std::vector<std::pair<int, float>>& entries) {
         p_->part_mirror(part::kBias, w);
     }
 }
+bool Model::grammar_supported() const { return !p_->part_link(); }
 void Model::set_grammar(Grammar * grammar) { p_->grammar = grammar; }
 void Model::set_logprobs(int k, int force) {
     p_->lp_k = k < 0 ? -1 : std::min(k, kTopLogprobs);
