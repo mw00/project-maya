@@ -2529,11 +2529,12 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
         return std::make_pair(std::max(0, n), n > 0 ? ph % n : 0);
     }();
     // An EXL3 pack's chunk shorter than this streams the helper's experts to this GPU instead: the helper decodes each
-    // expert's whole weights for a call, so a short chunk's few rows an expert cost it far more than the copy here
-    // (Radeon 8065S + V100: a 23-token chat prompt 2.7 s through the helper, 1.0 s streamed).  MAYA_GLM_LINK_PF_X3_MIN
+    // expert's whole weights for a call, so a short chunk's few rows an expert cost it more than the copy here (Radeon
+    // 8065S + V100: a 23-token chat prompt 2.7 s through the helper, 1.0 s streamed; 512 tokens 54 vs 92 tok/s, 1K 82
+    // vs 116; 2K 128 through the helper vs 80 streamed).  MAYA_GLM_LINK_PF_X3_MIN
     static const int pf_x3_min = [] {
         const char* v = getenv("MAYA_GLM_LINK_PF_X3_MIN");
-        return v != nullptr ? std::max(0, std::atoi(v)) : 512;
+        return v != nullptr ? std::max(0, std::atoi(v)) : 1024;
     }();
     const auto link_pf_for = [&](int il) {
         if (!link_pf_on || il < 0 || il >= g.n_layers || !F->helper.linked() || F->helper.pf_cap() < T ||
