@@ -2747,13 +2747,18 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                 TB <= F->helper.pf_slot_cap() && C == nullptr && !S->trace && l0_ == 0 &&
                 l1_ == g.n_layers && split_next_ == nullptr;
     const auto pipe_moe = [&](int il) { return link_pf_for(il) && disk_only(il).empty(); };
+    // An EXL3 pack's helper layers run whole unless MAYA_GLM_PF_PIPE=1: the helper decodes each expert's weights for
+    // every call, so two halves decode them twice - measured on a Radeon 8065S + V100, the halves read a 2K prompt
+    // ~30 % slower and an 8K one no faster than whole chunks
+    const auto pipe_x3_whole = [&](int il) { return pipe_env != 1 && F->L[(size_t) il].exl3; };
     std::vector<char> pipe_l((size_t) std::max(0, l1_), 0);
     int pipe_n = 0;
     if (pipe)
         for (int il = l0_; il < l1_; ++il) {
             const auto& Ly = F->L[(size_t) il];
             const int nx = next_moe(il + 1);
-            pipe_l[(size_t) il] = !Ly.moe || (pipe_moe(il) && (nx >= l1_ || pipe_moe(nx)));
+            const auto ok = [&](int l) { return pipe_moe(l) && !pipe_x3_whole(l); };
+            pipe_l[(size_t) il] = !Ly.moe || (ok(il) && (nx >= l1_ || ok(nx)));
             pipe_n += Ly.moe && pipe_l[(size_t) il];
         }
     if (pipe_n == 0) pipe = false;
