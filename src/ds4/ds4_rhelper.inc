@@ -177,7 +177,7 @@
                 err = "a helper in another engine: it did not get ready";
                 return false;
             }
-            ::usleep(20000);
+            std::this_thread::sleep_for(std::chrono::microseconds(20000));
         }
         std::fprintf(stderr, "ds4: helper engine %s: it computes %llu experts this GPU's VRAM leaves over (every "
                              "trunk layer's), in %.0f ms ready\n", rh_name.c_str(), left, now_ms() - t0);
@@ -245,7 +245,7 @@
                 err = "a helper in another engine: no list of its experts";
                 return false;
             }
-            ::usleep(20000);
+            std::this_thread::sleep_for(std::chrono::microseconds(20000));
         }
         std::atomic_thread_fence(std::memory_order_acquire);
         long long took = 0;
@@ -286,7 +286,7 @@
                 err = "a helper in another engine: it did not get ready";
                 return false;
             }
-            ::usleep(20000);
+            std::this_thread::sleep_for(std::chrono::microseconds(20000));
         }
         std::fprintf(stderr, "ds4: helper engine %s: it computes %lld of this GPU's experts in decode (its own VRAM's; "
                              "DS4_RHELPER_HOT)\n", rh_name.c_str(), took);
@@ -665,7 +665,7 @@
                      rh_bytes / 1048576.0);
         while (rh_hdr->lead_ready == 0) {
             if (rh_hdr->quit) return true;
-            ::usleep(20000);
+            std::this_thread::sleep_for(std::chrono::microseconds(20000));
         }
         std::atomic_thread_fence(std::memory_order_acquire);
         long long took = 0;
@@ -714,7 +714,7 @@
             if (t == h) {
                 if (now_ms() - idle0 > 2.0) {
                     if (rh_evn > 0) rh_ev_sum();
-                    ::usleep(20);
+                    std::this_thread::sleep_for(std::chrono::microseconds(20));
                 } else cpu_relax();
                 continue;
             }
@@ -748,6 +748,8 @@
                                  "request's wait and take), %lld timed\n", rh_comp_ms / rh_timed, rh_gap_ms / rh_timed,
                          rh_timed);
         cudaStreamSynchronize(helper_st);
+#ifndef _WIN32
         ::shm_unlink(rh_name.c_str());
+#endif
         return true;
     }
