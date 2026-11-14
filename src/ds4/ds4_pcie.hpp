@@ -102,16 +102,21 @@ inline bool verdicts_allow(int warm, int cold, bool cold_possible) {
 /// keeps it, and so does a check still undecided after 9 windows.  (Ties went the other way - 3% faster or off - and an
 /// RTX 3090 that measured +0.1% had streaming written off, and the next start turned off more than was measured; every
 /// later start kept it: #697)
-inline int ab_window(int& wins, int& good, int& bad, double gain) {
+/// tie_keeps false: the rule before #697 - 3% faster twice in a row keeps streaming, anything else twice in a row (a
+/// tie included) or undecided after 9 windows turns it off.  A layer split (several GPUs) takes that rule (#956: on
+/// 2x RTX A4000 and 4x RTX 3090 the whole-step check measured ties while a start with the lane off decoded 4-5%
+/// faster - the lane's cost when nothing much streams falls on both of the check's turns, so it reads as a tie); one
+/// GPU keeps #697's
+inline int ab_window(int& wins, int& good, int& bad, double gain, bool tie_keeps = true) {
     if (++wins == 1) return 0;
-    if (gain <= -0.03) {
+    if (tie_keeps ? gain <= -0.03 : gain < 0.03) {
         good = 0;
         if (++bad >= 2) return -1;
     } else {
         bad = 0;
         if (++good >= 2) return 1;
     }
-    return wins >= 9 ? 1 : 0;
+    return wins >= 9 ? (tie_keeps ? 1 : -1) : 0;
 }
 
 /// Whether the one-GPU decode path (landings, its recent slots, verify windows streamed) stays on after the lane's
