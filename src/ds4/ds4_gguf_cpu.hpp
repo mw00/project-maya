@@ -45,10 +45,12 @@ void iq_cpu_rows(int type, const uint8_t* w, size_t rb, int k, const void* const
 /// The CPU lane's MXFP4 rows in the device's arithmetic (ds4_gguf.cu's mx_dot): the activations rounded to int8 per 32
 /// values as the device rounds them (q8_round's q and scale), each block's products summed exactly in integers, then
 /// times (weight scale x activation scale) into F32 sums - the same numbers as the device up to the order of the
-/// blocks' sums.  The vector tiers (ds4_mx_kern.inc): AVX2 vpmaddubsw, AVX-VNNI and AVX-512 (VNNI) vpdpbusd; the CPU's
+/// blocks' sums. The vector tiers: SSSE3 pshufb/pmaddubsw (scalar fma), AVX2 vpmaddubsw, AVX-VNNI and AVX-512
+/// (VNNI) vpdpbusd; the CPU's
 /// fastest is taken at run time (DS4_MX_TIER=<name> picks another one it runs).  Every tier, the scalar one included,
 /// sums in the same order: they give the same bits, so the choice never changes an answer.
-enum MxTier { kMxScalar = 0, kMxAvx2, kMxAvxVnni, kMxAvx512, kMxAvx512Vnni, kMxTiers };
+// Append new tiers so existing numeric tier IDs remain unchanged.
+enum MxTier { kMxScalar = 0, kMxAvx2, kMxAvxVnni, kMxAvx512, kMxAvx512Vnni, kMxSsse3, kMxTiers };
 /// Bytes of an activation of k values (k % 32 == 0) for mx_rows: the int8 values in quads of blocks, then a scale and
 /// an offset correction a block in groups of 8 (ds4_mx_kern.inc) - 1.25 k for k % 256 == 0.
 inline size_t mx_act_bytes(int k) {
@@ -64,13 +66,20 @@ void mx_quant_blocks_scalar(const float* x, int b0, int b1, void* act, int k);  
 inline void mx_quant(const float* x, int k, void* act) { mx_quant_blocks(x, 0, k / 32, act, k); }
 /// y[i][r - r0] = (row r of W) . act[i] for r0 <= r < r1, i < n (any n; act[i] mx_quant's of k values).
 void mx_rows(const uint8_t* w, size_t rb, int k, int r0, int r1, const void* const* act, int n, float* const* y);
-/// The same with tier t (the scalar one when the CPU does not run t, or k % 256 != 0); pf: bytes prefetched ahead.
+/// The same with tier t (scalar if unsupported; AVX2+ also needs k % 256 == 0, SSSE3 only k % 32 == 0).
+/// pf: bytes prefetched ahead.
 void mx_rows_tier(int t, const uint8_t* w, size_t rb, int k, int r0, int r1, const void* const* act, int n,
                   float* const* y, int pf = 0);
 int mx_tier();                   // the tier mx_rows takes (measured on first use: the fastest a core, ds4_gguf_cpu.cpp)
 const char* mx_tier_report();    // the measurement behind it (each candidate's time), or how it was picked
 bool mx_tier_ok(int t);          // this CPU runs tier t
 const char* mx_tier_name(int t);
+bool mx_ssse3_enabled();         // DS4_MX_SSSE3=0 disables, 1 forces when supported, unset keeps the automatic selection
+bool mx_fast_fma_requested();    // DS4_MX_FAST_FMA=1 opts in, independently of the integer tier (default: off)
+bool mx_fast_fma_active();       // requested and this thread's FP environment is supported
+/// Unchanged scalar std::fma arithmetic, independent of both flags: numerical reference / diagnostics.
+void mx_rows_reference(const uint8_t* w, size_t rb, int k, int r0, int r1, const void* const* act, int n,
+                       float* const* y);
 /// Whether the rows of `type` are ds4's own here (IQ3_XXS / IQ3_S on AVX2 / AVX-512 VBMI, IQ2_XS / IQ1_M on AVX-512
 /// without VBMI - ds4_iq512_kern.inc, DS4_IQ512: ggml-cpu's numbers bit for bit, checked against its dot on first use;
 /// DS4_IQ_OWN=0 turns them off) rather than ggml's / the GLM lane's.
