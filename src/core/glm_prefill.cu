@@ -2518,15 +2518,18 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
     }();
     // repeatable answers (a linked helper): plans from fixed inputs, never from measured times (the CPU share below)
     const bool rep = glmfast::repeatable(F->helper.linked());
-    // (experiment) MAYA_GLM_LINK_PF_STREAM=<n>[,<phase>]: every n-th layer (il % n == phase) streams its experts to
-    // this GPU instead of the helper computing them - the copy runs while the helper works on the layer before
+    // An EXL3 pack's helper layers: every n-th (il % n == phase) streams its experts to this GPU instead of the helper
+    // computing them - the copy runs while the helper works on the layer before, so both links work at once (Radeon
+    // 8065S + V100, GLM-5.3-Flash EXL3 3.05: 2K prompts 128 tok/s all on the helper, 136 every 4th streamed, 149 every
+    // 2nd; 8K 218 / 264 / 328).  MAYA_GLM_LINK_PF_STREAM=<n>[,<phase>] (default 2,0; 0: all on the helper)
     static const std::pair<int, int> pf_stream = [] {
         const char* v = getenv("MAYA_GLM_LINK_PF_STREAM");
-        int n = 0, ph = 0;
-        if (v != nullptr && std::sscanf(v, "%d,%d", &n, &ph) >= 1 && n > 0)
-            std::fprintf(stderr, "glm prefill: every %d-th layer (phase %d) streams its experts instead of the "
-                                 "helper (MAYA_GLM_LINK_PF_STREAM)\n", n, ph % n);
-        return std::make_pair(std::max(0, n), n > 0 ? ph % n : 0);
+        int n = 2, ph = 0;
+        if (v != nullptr && std::sscanf(v, "%d,%d", &n, &ph) < 1) n = 2;
+        if (n > 0 && v != nullptr)
+            std::fprintf(stderr, "glm prefill: an EXL3 pack's every %d-th layer (phase %d) streams its experts instead "
+                                 "of the helper (MAYA_GLM_LINK_PF_STREAM)\n", n, ph % n);
+        return std::make_pair(std::max(0, n), n > 0 ? ((ph % n) + n) % n : 0);
     }();
     // An EXL3 pack's chunk shorter than this streams the helper's experts to this GPU instead: the helper decodes each
     // expert's whole weights for a call, so a short chunk's few rows an expert cost it more than the copy here (Radeon
@@ -2540,9 +2543,10 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
         if (!link_pf_on || il < 0 || il >= g.n_layers || !F->helper.linked() || F->helper.pf_cap() < T ||
             K > hlink::kPfMaxK || g.n_expert > hlink::kPfMaxExperts)
             return false;
-        if (pf_stream.first > 0 && il % pf_stream.first == pf_stream.second) return false;
         const auto& Ly = F->L[(size_t) il];
-        if (Ly.moe && Ly.exl3) return T >= pf_x3_min && F->helper.pf_x3_ok();   // (an EXL3 pack: the helper's EXL3 prompt lane)
+        if (Ly.moe && Ly.exl3)   // (an EXL3 pack: the helper's EXL3 prompt lane)
+            return T >= pf_x3_min && !(pf_stream.first > 0 && il % pf_stream.first == pf_stream.second) &&
+                   F->helper.pf_x3_ok();
         return Ly.moe && !Ly.exl3 && F->helper.pf_pair_ok(Ly.gu_type, Ly.d_type);
     };
     const auto prestage = [&](int il) {
