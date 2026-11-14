@@ -130,6 +130,8 @@ struct Dev {
     uint8_t* stg = nullptr;
     size_t slot_bytes = 0;
     int n_slots = 0;
+    double lane_copy = 0;                // ms: an expert's copy from the pinned pool into this GPU's slot (calibrate_lane;
+                                         // each GPU its own - a narrow link, e.g. a x4 card beside a x16 one, copies slower)
     std::vector<long long> slot_owner;   // layer * 1024 + expert, -1
     std::vector<long long> slot_used;    // the forward counter at its last use
     // the promotions (Options::promote): a slot being filled on the copy stream (pending: its key, its event) is no
@@ -352,6 +354,15 @@ std::string tune_key_of(const std::vector<int>& gpus) {
 
 }  // namespace
 
+// MAYA_MM3_HELPER: -1 not set, -2 not a GPU index, else the visible index
+int helper_env_id() {
+    const char* v = ::mm3::env("MM3_HELPER");
+    if (v == nullptr || *v == '\0') return -1;
+    char* end = nullptr;
+    const long id = std::strtol(v, &end, 10);
+    return end != v && *end == '\0' && id >= 0 && id < 64 ? (int) id : -2;
+}
+
 struct Model::Impl {
     Options o;
     Pack pk;
@@ -410,6 +421,32 @@ struct Model::Impl {
     static constexpr int kMaxPending = 4;
     uint8_t* pool = nullptr;         // the pinned pool
     std::unique_ptr<CpuLane> lane;
+    // ---- the helper GPU (MAYA_MM3_HELPER=<visible GPU>, MAYA_MM3_HELPER_GB=<its pool>): no layer of its own, outside
+    // --gpus; a pool of the most routed experts the layer GPUs do not hold (by the expert profile), copied once at the
+    // load.  A decoded token's or a verify window's picks it holds go to it instead of the CPU lane: the host enqueues
+    // them on its stream (the routing's normed rows, the plan, the token kernels / win_experts, the sums back to pinned
+    // memory) before the CPU lane runs its own, then adds the helper's sums to the CPU lane's part - the layer GPU sees
+    // one part as before.  A failure or no answer within MAYA_MM3_HELPER_TIMEOUT_MS (10 s) hands its picks back to the
+    // CPU lane for the rest of the run.  The prompt path (chunks above a window) stages as before
+    struct Helper {
+        int id = -1;
+        bool on = false, dead = false;
+        size_t cap = 0;                                  // the pool's bytes asked for
+        uint8_t* pool = nullptr;                         // its experts' blobs (device)
+        std::vector<unsigned long long> ptr;             // [layer][expert] -> the blob's device address (0: not held)
+        cudaStream_t s = nullptr;
+        cudaEvent_t ev = nullptr;
+        float *x_d = nullptr, *out_d = nullptr;          // [kWin][dim] the rows in, the sums out
+        float *h_d = nullptr, *part_d = nullptr;         // win_experts' scratch: [kWin * 8][ff], [kWin * 8][dim]
+        uint8_t* plan_d = nullptr;                       // the plan (a token's: 8 pointers then 8 weights; a window's:
+        uint8_t* plan_h = nullptr;                       //   win_plan_d's layout), pinned on the host
+        float *x_h = nullptr, *out_h = nullptr;          // pinned: [kWin][dim] each
+        double timeout_s = 10.0;
+        bool issued = false;                             // (an answer pending on its event)
+    } hp;
+    bool helper_owned(size_t li, int e) const {
+        return hp.on && !hp.dead && hp.ptr[li * (size_t) g.n_exp + (size_t) e] != 0;
+    }
     std::unique_ptr<Draft> draftm;   // the DSpark draft (on the head's GPU)
     double draft_plan = 0.0;         // plan_memory's room for it (bytes: the draft, its taps, a margin)
     int last_done = 0;               // the last forward's tokens in the cache
@@ -537,6 +574,17 @@ struct Model::Impl {
             }
             std::fprintf(stderr, "CPU lane: %ld expert computations, %ld distinct experts, %ld repeats (%.0f%%)\n", tot,
                          distinct, twice, tot ? 100.0 * twice / tot : 0.0);
+        }
+        // the helper first (its stream done before its memory goes); one that failed or never answered may still hold
+        // work - its host buffers are left to the process' exit
+        if (hp.on && !hp.dead) {
+            cudaSetDevice(hp.id);
+            if (hp.s) cudaStreamSynchronize(hp.s);
+            if (hp.plan_h) cudaFreeHost(hp.plan_h);
+            if (hp.x_h) cudaFreeHost(hp.x_h);
+            if (hp.out_h) cudaFreeHost(hp.out_h);
+            if (hp.ev) cudaEventDestroy(hp.ev);
+            if (hp.s) cudaStreamDestroy(hp.s);
         }
         for (size_t i = 0; i < owned.size(); ++i) {
             cudaSetDevice(owned_dev[i]);
@@ -729,14 +777,15 @@ struct Model::Impl {
     }
 
     // of m such experts (each in the pool), how many to stage: the fewest that bring max(CPU lane, copies) down by more
-    // than a tenth
-    int lane_split(int m) const {
-        if (lane_copy <= 0 || m <= 0) return 0;
+    // than a tenth (copy: the staging GPU's time to copy one - Dev::lane_copy; < 0: the first GPU's, lane_copy)
+    int lane_split(int m, double copy = -1.0) const {
+        if (copy < 0.0) copy = lane_copy;
+        if (copy <= 0 || m <= 0) return 0;
         const auto cpu = [&](int c) { return c > 0 ? lane_cpu1 + (c - 1) * lane_cpu_add : 0.0; };
         int best = 0;
         double bt = cpu(m);
         for (int s = 1; s <= m; ++s) {
-            const double t = std::max(cpu(m - s), s * lane_copy);
+            const double t = std::max(cpu(m - s), s * copy);
             if (t < bt * 0.9) {
                 bt = t;
                 best = s;
@@ -833,6 +882,41 @@ struct Model::Impl {
         lane_copy = best_copy;
         lane_cpu1 = best1;
         lane_cpu_add = best_add;
+        dp->lane_copy = best_copy;
+        // every other GPU with staging slots: its own copy time, the same blobs (MAYA_MM3_LANE_COPY_EACH=0: all take the
+        // first one's, as before)
+        static const bool each = [] {
+            const char* v = ::mm3::env("MM3_LANE_COPY_EACH");
+            return v == nullptr || std::atoi(v) != 0;
+        }();
+        for (Dev& d : D) {
+            if (&d == dp || d.n_slots <= 0 || d.stg == nullptr) continue;
+            if (!each) {
+                d.lane_copy = best_copy;
+                continue;
+            }
+            cudaSetDevice(d.id);
+            std::vector<double> tc;
+            for (int r = 0; r < 5; ++r) {   // (the first warms the path up)
+                const Layer& l = *ex[(size_t) r].first;
+                const double t0 = now();
+                if (cudaMemcpyAsync(d.stg, l.host_blob[(size_t) ex[(size_t) r].second], l.blob, cudaMemcpyHostToDevice,
+                                    d.s) != cudaSuccess ||
+                    cudaStreamSynchronize(d.s) != cudaSuccess) {
+                    cudaGetLastError();
+                    tc.clear();
+                    break;
+                }
+                if (r > 0) tc.push_back(1e3 * (now() - t0));
+            }
+            d.slot_owner.assign((size_t) d.n_slots, -1);   // (slot 0 was written)
+            d.lane_copy = tc.size() >= 4 ? med(tc) : best_copy;
+            char bd[200];
+            std::snprintf(bd, sizeof bd, "staging copy on CUDA%d (measured): %.2f ms an expert - 4 such experts: %d staged "
+                          "(CUDA%d: %.2f ms)", d.id, d.lane_copy, lane_split(4, d.lane_copy), dp->id, best_copy);
+            info.push_back(bd);
+        }
+        cudaSetDevice(dp->id);
         char b[260];
         std::snprintf(b, sizeof b, "CPU lane vs staging (measured): an expert %.2f ms on the CPU lane (+%.2f ms each more), "
                       "%.2f ms to copy - 4 such experts: %d staged%s", lane_cpu1, lane_cpu_add, lane_copy, lane_split(4),
@@ -1035,6 +1119,401 @@ struct Model::Impl {
         return true;
     }
 
+    // ---- the helper GPU (Helper above)
+    // MAYA_MM3_HELPER=<visible GPU> with MAYA_MM3_HELPER_GB=<its pool, GB>: both or neither, the GPU outside --gpus (left
+    // out of their default), a GGUF pack (an EXL3 one: MAYA_MM3_HELPER_EXL3=1, untested) and the CPU lane on
+    bool helper_parse(int ndev, std::string& err) {
+        hp.id = helper_env_id();
+        const char* gv = ::mm3::env("MM3_HELPER_GB");
+        if (hp.id == -1 && gv == nullptr) return true;
+        if (hp.id == -2) {
+            err = "MAYA_MM3_HELPER: a visible GPU's index (0, 1, ...)";
+            return false;
+        }
+        if (hp.id < 0 || gv == nullptr || !(std::atof(gv) > 0.0)) {
+            err = "MAYA_MM3_HELPER=<visible GPU> and MAYA_MM3_HELPER_GB=<its experts' pool, GB> go together";
+            return false;
+        }
+        if (hp.id >= ndev) {
+            err = "MAYA_MM3_HELPER: no CUDA" + std::to_string(hp.id) + " (" + std::to_string(ndev) + " visible)";
+            return false;
+        }
+        for (int id : o.gpus)
+            if (id == hp.id) {
+                err = "MAYA_MM3_HELPER: CUDA" + std::to_string(hp.id) + " is one of the layer GPUs (--gpus): give the "
+                      "layer GPUs without it";
+                return false;
+            }
+        const char* xv = ::mm3::env("MM3_HELPER_EXL3");
+        if (!gguf && (xv == nullptr || std::atoi(xv) != 1)) {
+            err = "MAYA_MM3_HELPER: an EXL3 pack needs MAYA_MM3_HELPER_EXL3=1 (the helper is tested on the GGUF packs)";
+            return false;
+        }
+        if (o.cpu_threads < 0) {
+            err = "MAYA_MM3_HELPER: the helper takes the CPU lane's picks - it needs the CPU lane (--cpu-threads)";
+            return false;
+        }
+        hp.cap = (size_t) (std::atof(gv) * (double) (1ull << 30));
+        if (const char* tv = ::mm3::env("MM3_HELPER_TIMEOUT_MS")) hp.timeout_s = std::max(0.1, std::atof(tv) / 1000.0);
+        hp.on = true;
+        st.helper_id = hp.id;
+        return true;
+    }
+
+    // its stream, scratch and pool: the most routed experts not in a layer GPU's VRAM (by the profile; without one, round
+    // robin over the layers) while the pool holds them and the GPU keeps half a GB free, copied from the pinned pool (or
+    // assembled from the files); then the layers' tables
+    bool helper_load(bool have_prof, std::string& err) {
+        if (!hp.on) return true;
+        hp.ptr.assign((size_t) g.n_layers * g.n_exp, 0ull);
+        const int dv = hp.id;
+        CK(cudaSetDevice(dv));
+        CK(cudaStreamCreateWithFlags(&hp.s, cudaStreamNonBlocking));
+        CK(cudaEventCreateWithFlags(&hp.ev, cudaEventDisableTiming));
+        if (gguf && !gg::prepare(hp.s)) {
+            err = "MAYA_MM3_HELPER: CUDA" + std::to_string(dv) + ": the GGUF kernels' scratch did not fit";
+            return false;
+        }
+        if (!x3::prepare(hp.s)) {
+            err = "MAYA_MM3_HELPER: CUDA" + std::to_string(dv) + ": the expert kernels' scratch did not fit";
+            return false;
+        }
+        const int acat0 = acat;
+        acat = kAAct;
+        if (!dalloc(dv, hp.x_d, (size_t) kWin * g.dim, err) || !dalloc(dv, hp.out_d, (size_t) kWin * g.dim, err) ||
+            !dalloc(dv, hp.h_d, (size_t) kWin * 8 * g.ff, err) || !dalloc(dv, hp.part_d, (size_t) kWin * 8 * g.dim, err) ||
+            !dalloc(dv, hp.plan_d, win_plan_bytes(), err))
+            return false;
+        CK(cudaHostAlloc((void**) &hp.plan_h, win_plan_bytes(), cudaHostAllocPortable));
+        CK(cudaHostAlloc((void**) &hp.x_h, (size_t) kWin * g.dim * 4, cudaHostAllocPortable));
+        CK(cudaHostAlloc((void**) &hp.out_h, (size_t) kWin * g.dim * 4, cudaHostAllocPortable));
+        size_t fr = 0, tot = 0;
+        CK(cudaMemGetInfo(&fr, &tot));
+        const size_t keep = (size_t) 1 << 29;
+        const size_t budget = std::min(hp.cap, fr > keep ? fr - keep : 0);
+        struct C {
+            uint32_t n;
+            int li, e;
+        };
+        std::vector<C> cand;
+        double all_n = 0;
+        for (size_t li = 0; li < L.size(); ++li) {
+            const Layer& l = L[li];
+            if (!l.moe) continue;
+            for (int e = 0; e < g.n_exp; ++e)
+                if (l.res_slot[(size_t) e] < 0) {
+                    cand.push_back({prof[li * g.n_exp + e], (int) li, e});
+                    all_n += prof[li * g.n_exp + e];
+                }
+        }
+        if (have_prof)
+            std::stable_sort(cand.begin(), cand.end(), [](const C& a, const C& b) { return a.n > b.n; });
+        else   // (round robin: expert 0 of every layer, then 1, ...)
+            std::stable_sort(cand.begin(), cand.end(), [](const C& a, const C& b) { return a.e < b.e; });
+        std::vector<C> pick;
+        size_t bytes = 0;
+        double pick_n = 0;
+        for (const C& c : cand) {
+            const size_t b = L[(size_t) c.li].blob;
+            if (bytes + b > budget) continue;
+            bytes += b;
+            pick_n += c.n;
+            pick.push_back(c);
+        }
+        if (pick.empty()) {
+            info.push_back("NOTE: helper: CUDA" + std::to_string(dv) + " has no room for an expert (" +
+                           std::to_string(fr >> 20) + " MB free) - off");
+            hp.on = false;
+            st.helper_id = -1;
+            acat = acat0;
+            CK(cudaSetDevice(D[0].id));
+            return true;
+        }
+        acat = kAPool;
+        if (!dalloc(dv, hp.pool, bytes, err)) return false;
+        acat = acat0;
+        // the blobs: the pinned pool's as they are; the others assembled from the files into two pinned buffers in turn
+        size_t mx = 0;
+        for (const C& c : pick) mx = std::max(mx, L[(size_t) c.li].blob);
+        uint8_t* pin[2] = {nullptr, nullptr};
+        cudaEvent_t pev[2] = {nullptr, nullptr};
+        for (int b = 0; b < 2; ++b) {
+            CK(cudaHostAlloc((void**) &pin[b], mx, cudaHostAllocPortable));
+            CK(cudaEventCreateWithFlags(&pev[b], cudaEventDisableTiming));
+            CK(cudaEventRecord(pev[b], hp.s));
+        }
+        const double t0 = now();
+        size_t off = 0;
+        int na = 0;
+        for (const C& c : pick) {
+            const Layer& l = L[(size_t) c.li];
+            uint8_t* dst = hp.pool + off;
+            if (pooled(l, c.e)) {
+                CK(cudaMemcpyAsync(dst, l.host_blob[(size_t) c.e], l.blob, cudaMemcpyHostToDevice, hp.s));
+            } else {
+                const int b = na++ & 1;
+                CK(cudaEventSynchronize(pev[b]));
+                assemble(l, c.e, pin[b]);
+                CK(cudaMemcpyAsync(dst, pin[b], l.blob, cudaMemcpyHostToDevice, hp.s));
+                CK(cudaEventRecord(pev[b], hp.s));
+            }
+            hp.ptr[(size_t) c.li * g.n_exp + (size_t) c.e] = (unsigned long long) dst;
+            off += l.blob;
+        }
+        CK(cudaStreamSynchronize(hp.s));
+        for (int b = 0; b < 2; ++b) {
+            cudaEventDestroy(pev[b]);
+            cudaFreeHost(pin[b]);
+        }
+        st.helper_held = (long) pick.size();
+        st.helper_gb = (double) bytes / (1u << 30);
+        char b[400];
+        std::snprintf(b, sizeof b,
+                      "helper: CUDA%d, %zu of the %zu experts outside the layer GPUs' VRAM (%.1f GB, copied in %.0f s)%s - "
+                      "their picks there instead of the CPU lane",
+                      dv, pick.size(), cand.size(), st.helper_gb, now() - t0,
+                      have_prof && all_n > 0
+                          ? (", " + std::to_string((int) (100.0 * pick_n / all_n + 0.5)) + "% of their routings in the profile")
+                                .c_str()
+                          : " (no profile: round robin)");
+        info.push_back(b);
+        CK(cudaSetDevice(D[0].id));
+        return true;
+    }
+
+    bool helper_down(const std::string& why, int back) {
+        hp.dead = true;
+        hp.issued = false;
+        st.helper_dead = 1;
+        cudaGetLastError();
+        std::fprintf(stderr, "maya-mm3: the helper GPU (CUDA%d) %s - its experts on the CPU lane from now on\n", hp.id,
+                     why.c_str());
+        cudaSetDevice(back);
+        return false;
+    }
+
+    // a token's n picks the helper holds (experts ex, weights wt, the normed row x on the host) onto its stream: the
+    // token kernels over its pool, the sum to hp.out_h, its event after (back: the device to make current again);
+    // false: it failed, now off - the caller hands the picks to the CPU lane
+    bool helper_issue_token(const Layer& l, size_t li, const float* x, const int* ex, const float* wt, int n, int back) {
+        hp.issued = false;
+        if (cudaSetDevice(hp.id) != cudaSuccess) return helper_down("could not be made current", back);
+        unsigned long long* pp = (unsigned long long*) hp.plan_h;
+        float* pw = (float*) (pp + 8);
+        for (int i = 0; i < 8; ++i) {
+            pp[i] = i < n ? hp.ptr[li * g.n_exp + (size_t) ex[i]] : 0ull;
+            pw[i] = i < n ? wt[i] : 0.0f;
+        }
+        std::memcpy(hp.x_h, x, (size_t) g.dim * 4);
+        bool ok = cudaMemcpyAsync(hp.plan_d, hp.plan_h, 8 * sizeof(unsigned long long) + 8 * sizeof(float),
+                                  cudaMemcpyHostToDevice, hp.s) == cudaSuccess &&
+                  cudaMemcpyAsync(hp.x_d, hp.x_h, (size_t) g.dim * 4, cudaMemcpyHostToDevice, hp.s) == cudaSuccess;
+        if (ok) {
+            x3::MoeArgs a;
+            a.plan_ptr = (const unsigned long long*) hp.plan_d;
+            a.plan_w = (const float*) (hp.plan_d + 8 * sizeof(unsigned long long));
+            a.lay = l.lay;
+            a.k = n;
+            a.n_embd = g.dim;
+            a.n_ff = g.ff;
+            a.limit = g.limit;
+            x3::moe_gate_up(a, hp.x_d, nullptr, hp.s);
+            x3::moe_down(a, nullptr, nullptr, hp.out_d, hp.s);
+            ok = cudaGetLastError() == cudaSuccess &&
+                 cudaMemcpyAsync(hp.out_h, hp.out_d, (size_t) g.dim * 4, cudaMemcpyDeviceToHost, hp.s) == cudaSuccess &&
+                 cudaEventRecord(hp.ev, hp.s) == cudaSuccess;
+        }
+        if (!ok) return helper_down("failed to take a token's experts", back);
+        cudaSetDevice(back);
+        hp.issued = true;
+        return true;
+    }
+
+    // a window's picks the helper holds - its plan already in hp.plan_h (win_plan_d's layout: the helper's pointers, the
+    // others 0), the T normed rows on the host - onto its stream: win_experts over its pool, the T sums to hp.out_h
+    bool helper_issue_window(const Layer& l, const float* rows, int T, int back) {
+        hp.issued = false;
+        if (cudaSetDevice(hp.id) != cudaSuccess) return helper_down("could not be made current", back);
+        const size_t off_w = (size_t) kWin * 8 * 8, off_gp = off_w + (size_t) kWin * 8 * 4,
+                     off_gs = off_gp + (size_t) kWin * 8 * 8, off_ge = off_gs + ((size_t) kWin * 8 + 1) * 4,
+                     off_ng = off_ge + (size_t) kWin * 8 * 4;
+        std::memcpy(hp.x_h, rows, (size_t) T * g.dim * 4);
+        bool ok = cudaMemcpyAsync(hp.plan_d, hp.plan_h, win_plan_bytes(), cudaMemcpyHostToDevice, hp.s) == cudaSuccess &&
+                  cudaMemcpyAsync(hp.x_d, hp.x_h, (size_t) T * g.dim * 4, cudaMemcpyHostToDevice, hp.s) == cudaSuccess;
+        if (ok) {
+            x3::WinArgs a;
+            a.grp_ptr = (const unsigned long long*) (hp.plan_d + off_gp);
+            a.grp_start = (const int*) (hp.plan_d + off_gs);
+            a.grp_ent = (const int*) (hp.plan_d + off_ge);
+            a.n_groups = (const int*) (hp.plan_d + off_ng);
+            a.plan_ptr = (const unsigned long long*) hp.plan_d;
+            a.plan_w = (const float*) (hp.plan_d + off_w);
+            a.x = hp.x_d;
+            a.x_stride = (size_t) g.dim;
+            a.h = hp.h_d;
+            a.part = hp.part_d;
+            a.sh_out = nullptr;
+            a.out = hp.out_d;
+            a.out_stride = (size_t) g.dim;
+            a.lay = l.lay;
+            a.T = T;
+            a.k = g.k_exp;
+            a.n_embd = g.dim;
+            a.n_ff = g.ff;
+            a.limit = g.limit;
+            ok = x3::win_experts(a, hp.s) && cudaGetLastError() == cudaSuccess &&
+                 cudaMemcpyAsync(hp.out_h, hp.out_d, (size_t) T * g.dim * 4, cudaMemcpyDeviceToHost, hp.s) ==
+                     cudaSuccess &&
+                 cudaEventRecord(hp.ev, hp.s) == cudaSuccess;
+        }
+        if (!ok) return helper_down("failed to take a window's experts", back);
+        cudaSetDevice(back);
+        hp.issued = true;
+        return true;
+    }
+
+    // the helper's answer: true when its sums are in hp.out_h; false when it failed or did not answer in time (now off)
+    bool helper_wait(int back) {
+        if (!hp.issued) return false;
+        hp.issued = false;
+        const double t0 = now();
+        for (;;) {
+            const cudaError_t e = cudaEventQuery(hp.ev);
+            if (e == cudaSuccess) break;
+            if (e != cudaErrorNotReady) return helper_down(std::string("failed: ") + cudaGetErrorString(e), back);
+            if (now() - t0 > hp.timeout_s) return helper_down("did not answer in time", back);
+        }
+        st.t_helper += now() - t0;
+        return true;
+    }
+
+    // MAYA_MM3_HELPER_CHECK=1: one held expert of up to 16 layers on the helper and on the CPU lane, the same input: their
+    // largest difference against the largest value.  The two round the activations differently (the GPU's 32-value int8
+    // blocks, the CPU's Q8_K), so a small one is expected; a large one (a wrong layout, a kernel the helper's GPU does
+    // not run as the layer GPUs do) refuses the load
+    bool helper_check(std::string& err) {
+        if (!hp.on || !lane) return true;
+        std::vector<float> x((size_t) g.dim), cpu((size_t) g.dim);
+        for (int i = 0; i < g.dim; ++i) x[(size_t) i] = 0.5f * std::sin(0.37f * (float) i) + 0.01f * (float) ((i * 37) % 101 - 50);
+        const int back = D[0].id;
+        int checked = 0, wl = -1;
+        double worst = 0, tmv = 0, wmv = 0;   // (the largest values seen: a check over zeros would prove nothing)
+        const size_t step = std::max<size_t>(1, L.size() / 16);
+        for (size_t li = 0; li < L.size() && checked < 16; li += step) {
+            const Layer& l = L[li];
+            if (!l.moe) continue;
+            int e = -1;
+            for (int x2 = 0; x2 < g.n_exp && e < 0; ++x2)
+                if (hp.ptr[li * g.n_exp + (size_t) x2] != 0) e = x2;
+            if (e < 0) continue;
+            const int ex[1] = {e};
+            const float w1[1] = {1.0f};
+            if (!helper_issue_token(l, li, x.data(), ex, w1, 1, back) || !helper_wait(back)) {
+                err = "MAYA_MM3_HELPER_CHECK: the helper GPU failed on layer " + std::to_string(li) + "'s expert " +
+                      std::to_string(e);
+                return false;
+            }
+            const std::vector<CpuExpert> one{cpu_expert(l, e, 1.0f)};
+            lane_run(one, x.data(), cpu.data());
+            double md = 0, mv = 0;
+            for (int r = 0; r < g.dim; ++r) {
+                md = std::max(md, (double) std::fabs(hp.out_h[r] - cpu[(size_t) r]));
+                mv = std::max(mv, (double) std::fabs(cpu[(size_t) r]));
+            }
+            const double rel = mv > 0 ? md / mv : md;
+            tmv = std::max(tmv, mv);
+            if (rel >= worst) {
+                worst = rel;
+                wl = (int) li;
+            }
+            ++checked;
+        }
+        // a verify window's path too (win_experts on the helper, the plan grouped by expert as window_post makes it): T
+        // tokens, each its k picks among one layer's held experts, against the CPU lane's run_multi of the same picks
+        double wworst = -1;
+        int wlayer = -1;
+        for (size_t li = L.size() / 2, n = 0; n < L.size() && wlayer < 0; ++n, li = (li + 1) % L.size()) {
+            const Layer& l = L[li];
+            if (!l.moe) continue;
+            std::vector<int> held;
+            for (int e = 0; e < g.n_exp; ++e)
+                if (hp.ptr[li * g.n_exp + (size_t) e] != 0) held.push_back(e);
+            if ((int) held.size() < g.k_exp + 3) continue;
+            const int T = std::min(kWin, 6);
+            std::vector<float> rows((size_t) T * g.dim), outc((size_t) T * g.dim);
+            for (int t = 0; t < T; ++t)
+                for (int i = 0; i < g.dim; ++i)
+                    rows[(size_t) t * g.dim + i] = x[(size_t) i] * (1.0f + 0.15f * (float) t) + 0.02f * std::cos(0.11f * (float) (i + 7 * t));
+            unsigned long long* pp = (unsigned long long*) hp.plan_h;
+            float* pw = (float*) (pp + (size_t) kWin * 8);
+            unsigned long long* gp = (unsigned long long*) (pw + (size_t) kWin * 8);
+            int* gs = (int*) (gp + (size_t) kWin * 8);
+            int* ge = gs + kWin * 8 + 1;
+            int* ng = ge + kWin * 8;
+            std::vector<int> ids;
+            std::vector<std::vector<int>> ents;
+            std::vector<std::vector<std::pair<int, float>>> users;
+            for (int t = 0; t < T; ++t)
+                for (int i = 0; i < 8; ++i) {
+                    const int e = t * 8 + i;
+                    pp[e] = 0;
+                    pw[e] = 0.0f;
+                    if (i >= g.k_exp) continue;
+                    const int x2 = held[(size_t) ((t * 2 + i) % (int) held.size())];   // (tokens share some experts)
+                    const float wt = 0.2f + 0.1f * (float) i + 0.05f * (float) t;
+                    pp[e] = hp.ptr[li * g.n_exp + (size_t) x2];
+                    pw[e] = wt;
+                    size_t hi = 0;
+                    while (hi < ids.size() && ids[hi] != x2) ++hi;
+                    if (hi == ids.size()) {
+                        ids.push_back(x2);
+                        ents.emplace_back();
+                        users.emplace_back();
+                    }
+                    ents[hi].push_back(e);
+                    users[hi].push_back({t, wt});
+                }
+            int hn = 0;
+            for (size_t hi = 0; hi < ids.size(); ++hi) {
+                gp[hi] = hp.ptr[li * g.n_exp + (size_t) ids[hi]];
+                gs[hi] = hn;
+                for (int e : ents[hi]) ge[hn++] = e;
+            }
+            gs[ids.size()] = hn;
+            *ng = (int) ids.size();
+            if (!helper_issue_window(l, rows.data(), T, back) || !helper_wait(back)) {
+                err = "MAYA_MM3_HELPER_CHECK: the helper GPU failed on layer " + std::to_string(li) + "'s window";
+                return false;
+            }
+            std::vector<CpuExpert> hc;
+            for (int x2 : ids) hc.push_back(cpu_expert(l, x2, 1.0f));
+            lane_run_multi(hc, users, rows.data(), T, outc.data(), nullptr);
+            double md = 0, mv = 0;
+            for (size_t r = 0; r < outc.size(); ++r) {
+                md = std::max(md, (double) std::fabs(hp.out_h[r] - outc[r]));
+                mv = std::max(mv, (double) std::fabs(outc[r]));
+            }
+            wworst = mv > 0 ? md / mv : md;
+            wmv = mv;
+            wlayer = (int) li;
+        }
+        char b[320];
+        std::snprintf(b, sizeof b, "helper check: %d experts on CUDA%d against the CPU lane, the largest difference %.6f "
+                      "of the largest value %.3g (layer %d); a %d-token window %.6f of %.3g (layer %d)", checked, hp.id,
+                      worst, tmv, wl, std::min(kWin, 6), wworst, wmv, wlayer);
+        info.push_back(b);
+        worst = std::max(worst, wworst);
+        if (tmv == 0.0 || (wlayer >= 0 && wmv == 0.0)) {
+            err = std::string("MAYA_MM3_HELPER_CHECK: ") + b + " - all zeros: nothing was compared";
+            return false;
+        }
+        if (worst > 0.05) {
+            err = std::string("MAYA_MM3_HELPER_CHECK: ") + b + " - more than 0.05: the helper's sums are not the experts'";
+            return false;
+        }
+        return true;
+    }
+
     bool load(const Options& opt, std::string& err) {
         const double t0 = now();
         o = opt;
@@ -1083,8 +1562,10 @@ struct Model::Impl {
         }
         int ndev = 0;
         CK(cudaGetDeviceCount(&ndev));
+        if (!helper_parse(ndev, err)) return false;
         if (o.gpus.empty())
-            for (int i = 0; i < ndev; ++i) o.gpus.push_back(i);
+            for (int i = 0; i < ndev; ++i)
+                if (i != hp.id) o.gpus.push_back(i);
         for (int id : o.gpus) {
             if (id < 0 || id >= ndev) {
                 err = "no CUDA" + std::to_string(id);
@@ -1675,6 +2156,7 @@ struct Model::Impl {
                                    "most routed; the rest from the model's files");
             }
         }
+        if (!helper_load(have_prof, err)) return false;
         // host-free layers: a MoE layer with every routed expert in VRAM makes its decode plan on the device (the routing
         // read, the experts' addresses looked up and a window's experts grouped there) - a token or a verify window is
         // enqueued whole, with no wait for the host between its layers.  MAYA_MM3_HOST_FREE=0: every layer through the
@@ -1750,6 +2232,9 @@ struct Model::Impl {
             st.cpu_threads = lane->threads();
             calibrate_lane();
         }
+        if (hp.on && ::mm3::env("MM3_HELPER_CHECK") != nullptr && std::atoi(::mm3::env("MM3_HELPER_CHECK")) != 0 &&
+            !helper_check(err))
+            return false;
         {
             std::string kv = std::string("KV cache: K ") + k::kv_name(o.kv_k) + ", V " + k::kv_name(o.kv_v) +
                              (o.kv_rot && (o.kv_k || o.kv_v) ? " (rows rotated)" : "") + ", " +
@@ -2060,17 +2545,32 @@ struct Model::Impl {
         std::vector<std::vector<int>> by_ptr_ent;
         std::vector<unsigned long long> by_ptr;
         std::vector<char> stage_it((size_t) g.n_exp, 0);   // (lane_split's: distinct experts staged instead)
-        if (lane && lane_copy > 0) {
+        if (lane && d.lane_copy > 0) {
             std::vector<int> cand;
             for (int t = 0; t < T; ++t)
                 for (int i = 0; i < g.k_exp; ++i) {
                     const int x = rtop[t * g.k_exp + i];
-                    if (on_cpu(l, d, x) && pooled(l, x) && std::find(cand.begin(), cand.end(), x) == cand.end())
+                    if (on_cpu(l, d, x) && pooled(l, x) && !helper_owned(li, x) &&
+                        std::find(cand.begin(), cand.end(), x) == cand.end())
                         cand.push_back(x);
                 }
-            const int s = std::min((int) cand.size(), std::min(lane_split((int) cand.size()), d.n_slots / 2));
+            const int s = std::min((int) cand.size(), std::min(lane_split((int) cand.size(), d.lane_copy), d.n_slots / 2));
             for (int i = 0; i < s; ++i) stage_it[(size_t) cand[(size_t) i]] = 1;
         }
+        // the helper's plan (hp.plan_h, the same layout): its pointers for the picks it holds, the others 0, grouped by
+        // expert; its experts and their (token, weight) users for the CPU lane should it fail
+        const bool use_h = hp.on && !hp.dead && lane;
+        unsigned long long* hpp = use_h ? (unsigned long long*) hp.plan_h : nullptr;
+        float* hpw = use_h ? (float*) (hpp + (size_t) kWin * 8) : nullptr;
+        std::vector<std::vector<int>> h_ent;   // per helper expert (h_ids): its entries t * 8 + i
+        std::vector<int> h_ids;
+        std::vector<std::vector<std::pair<int, float>>> h_users;
+        std::vector<char> h_tok((size_t) T, 0);
+        if (use_h)
+            for (int e = 0; e < T * 8; ++e) {
+                hpp[e] = 0;
+                hpw[e] = 0.0f;
+            }
         for (int t = 0; t < T; ++t)
             for (int i = 0; i < 8; ++i) {
                 const int e = t * 8 + i;
@@ -2081,6 +2581,21 @@ struct Model::Impl {
                 const float wt = rw[t * g.k_exp + i] * g.scale;
                 pw[e] = wt;
                 ++prof[li * g.n_exp + x];
+                if (use_h && on_cpu(l, d, x) && helper_owned(li, x)) {   // (the layer GPU skips it: pp[e] stays 0)
+                    hpp[e] = hp.ptr[li * g.n_exp + (size_t) x];
+                    hpw[e] = wt;
+                    size_t hi = 0;
+                    while (hi < h_ids.size() && h_ids[hi] != x) ++hi;
+                    if (hi == h_ids.size()) {
+                        h_ids.push_back(x);
+                        h_ent.emplace_back();
+                        h_users.emplace_back();
+                    }
+                    h_ent[hi].push_back(e);
+                    h_users[hi].push_back({t, wt});
+                    h_tok[(size_t) t] = 1;
+                    continue;
+                }
                 if (lane && on_cpu(l, d, x) && !stage_it[(size_t) x]) {
                     if (cpu_seen.empty()) cpu_seen.assign((size_t) g.n_layers * g.n_exp, 0);
                     if (cpu_of[(size_t) x] < 0) ++cpu_seen[li * g.n_exp + x];
@@ -2112,12 +2627,27 @@ struct Model::Impl {
         }
         gs[by_ptr.size()] = ne;
         *ng = (int) by_ptr.size();
+        if (!h_ids.empty()) {   // the helper's groups, then its work onto its stream before the CPU lane runs
+            unsigned long long* hgp = (unsigned long long*) (hpw + (size_t) kWin * 8);
+            int* hgs = (int*) (hgp + (size_t) kWin * 8);
+            int* hge = hgs + kWin * 8 + 1;
+            int* hng = hge + kWin * 8;
+            int hn = 0;
+            for (size_t hi = 0; hi < h_ids.size(); ++hi) {
+                hgp[hi] = hp.ptr[li * g.n_exp + (size_t) h_ids[hi]];
+                hgs[hi] = hn;
+                for (int e : h_ent[hi]) hge[hn++] = e;
+            }
+            hgs[h_ids.size()] = hn;
+            *hng = (int) h_ids.size();
+            helper_issue_window(l, rx, T, d.id);
+        }
         CK(cudaMemcpyAsync(d.win_plan_d, d.win_plan_h, win_plan_bytes(), cudaMemcpyHostToDevice, d.s));
         float* cpu_rows = d.win_cpu;
         int* cpu_flags = (int*) (d.win_cpu + (size_t) kWin * g.dim);
         unsigned* wait_word = (unsigned*) (cpu_flags + kWin);
         x3::WinArgs a = win_args();
-        const bool with_cpu = !cpu.empty();
+        const bool with_cpu = !cpu.empty() || !h_ids.empty();
         if (with_cpu) {
             a.cpu_part = cpu_rows;
             a.cpu_stride = (size_t) g.dim;
@@ -2132,12 +2662,43 @@ struct Model::Impl {
         }
         if (with_cpu) {   // the CPU lane's parts while the device runs the others; then the word it waits on
             const double tl = now();
-            lane_run_multi(cpu, users, rx, T, cpu_rows, &order);
+            if (!cpu.empty()) {
+                lane_run_multi(cpu, users, rx, T, cpu_rows, &order);
+            } else {
+                for (int t = 0; t < T; ++t) std::memset(cpu_rows + (size_t) t * g.dim, 0, (size_t) g.dim * 4);
+            }
             for (int t = 0; t < T; ++t) cpu_flags[t] = 0;
             for (const auto& u : users)
                 for (const auto& tu : u) cpu_flags[tu.first] = 1;
             st.t_lane += now() - tl;
             st.cpu_experts += (long) cpu.size();
+            if (!h_ids.empty()) {   // the helper's sums added to its tokens' rows; failed: the CPU lane computes them
+                const float* add = nullptr;
+                std::vector<float> fb;
+                long nent = 0;
+                for (const auto& u : h_users) nent += (long) u.size();
+                if (helper_wait(d.id)) {
+                    add = hp.out_h;
+                    st.helper_experts += nent;
+                } else {
+                    std::vector<CpuExpert> hc;
+                    for (int x : h_ids) hc.push_back(cpu_expert(l, x, 1.0f));
+                    fb.assign((size_t) T * g.dim, 0.0f);
+                    const double tf = now();
+                    lane_run_multi(hc, h_users, rx, T, fb.data(), nullptr);
+                    st.t_lane += now() - tf;
+                    st.helper_fallback += nent;
+                    st.cpu_experts += (long) hc.size();
+                    add = fb.data();
+                }
+                for (int t = 0; t < T; ++t) {
+                    if (!h_tok[(size_t) t]) continue;
+                    float* row = cpu_rows + (size_t) t * g.dim;
+                    const float* hr = add + (size_t) t * g.dim;
+                    for (int r = 0; r < g.dim; ++r) row[r] += hr[r];
+                    cpu_flags[t] = 1;
+                }
+            }
             std::atomic_thread_fence(std::memory_order_seq_cst);
             *(volatile unsigned*) wait_word = d.win_wait;
         }
@@ -2441,14 +3002,22 @@ struct Model::Impl {
         std::vector<CpuExpert> cpu;
         // (of the experts the CPU lane would take, lane_split's - ones in the pinned pool - to staging slots instead)
         int to_stage = 0;
-        if (lane && lane_copy > 0) {
+        if (lane && d.lane_copy > 0) {
             int cand = 0;
             for (int i = 0; i < g.k_exp; ++i)
-                cand += on_cpu(l, d, top[i]) && pooled(l, top[i]);
-            to_stage = lane_split(cand);
+                cand += on_cpu(l, d, top[i]) && pooled(l, top[i]) && !helper_owned(li, top[i]);
+            to_stage = lane_split(cand, d.lane_copy);
         }
+        int hx[8], nh = 0;   // (the helper's picks: neither in VRAM nor in a slot, in its pool)
+        float hw[8];
         for (int i = 0; i < g.k_exp; ++i) {
             pw[i] = w[i] * g.scale;
+            if (lane && on_cpu(l, d, top[i]) && helper_owned(li, top[i])) {
+                ph[i] = 0;   // (the layer GPU skips it: its sum comes with the CPU lane's part)
+                hx[nh] = top[i];
+                hw[nh++] = pw[i];
+                continue;
+            }
             if (lane && on_cpu(l, d, top[i]) && to_stage > 0 && pooled(l, top[i])) {
                 --to_stage;   // (staged: locate below)
             } else if (lane && on_cpu(l, d, top[i])) {   // (not in VRAM nor in a staging slot: the CPU lane's)
@@ -2461,6 +3030,9 @@ struct Model::Impl {
             }
             if (!locate(l, d, top[i], busy, ph[i], err)) return false;
         }
+        // the helper's picks onto its stream first (the normed row came back with the routing): it computes them while
+        // the layer GPU runs its own and the CPU lane its part
+        if (nh > 0) helper_issue_token(l, li, d.xh_h, hx, hw, nh, d.id);
         CK(cudaMemcpyAsync(d.plan_d, ph, 16 * sizeof(unsigned long long), cudaMemcpyHostToDevice, d.s));
         x3::MoeArgs a;
         a.plan_ptr = d.plan_d;
@@ -2482,6 +3054,29 @@ struct Model::Impl {
                 flag = 1;
                 st.cpu_experts += (long) cpu.size();
                 if (lane_copy > 0) lane_retime((int) cpu.size(), 1e3 * dt);
+            }
+            if (nh > 0) {   // the helper's sum added to the CPU lane's part (or the part alone); failed: the CPU lane's
+                const float* add = nullptr;
+                std::vector<float> fb;
+                if (helper_wait(d.id)) {
+                    add = hp.out_h;
+                    st.helper_experts += nh;
+                } else {
+                    std::vector<CpuExpert> hc;
+                    for (int j = 0; j < nh; ++j) hc.push_back(cpu_expert(l, hx[j], hw[j]));
+                    fb.assign((size_t) g.dim, 0.0f);
+                    const double tl = now();
+                    lane_run(hc, d.xh_h, fb.data());
+                    st.t_lane += now() - tl;
+                    st.helper_fallback += nh;
+                    st.cpu_experts += nh;
+                    add = fb.data();
+                }
+                if (flag)
+                    for (int r = 0; r < g.dim; ++r) part[r] += add[r];
+                else
+                    std::memcpy(part, add, (size_t) g.dim * 4);
+                flag = 1;
             }
             std::memcpy(part + g.dim, &flag, 4);
             CK(cudaMemcpyAsync(d.cpu_d, part, (size_t) (g.dim + 1) * 4, cudaMemcpyHostToDevice, d.s));
@@ -3180,7 +3775,9 @@ bool Model::load(const Options& o_in, std::string& err) {
             return false;
         }
         std::vector<std::string> skipped;
+        const int hid = helper_env_id();   // (MAYA_MM3_HELPER's GPU: not a layer GPU)
         for (int i = 0; i < n; ++i) {
+            if (i == hid) continue;
             cudaDeviceProp pr{};
             if (cudaGetDeviceProperties(&pr, i) != cudaSuccess) continue;
             if (pr.major * 10 + pr.minor >= 70) o.gpus.push_back(i);
@@ -3278,6 +3875,8 @@ bool Model::load(const Options& o_in, std::string& err) {
     }
 #endif
     if (o.tp > 0) {
+        if (helper_env_id() != -1)
+            std::fprintf(stderr, "maya-mm3: NOTE: MAYA_MM3_HELPER is the layer split's - not with --tp (ignored)\n");
         tpe = new TpEngine;
         if (tpe->load(o, err)) return true;
         // (the tensor-parallel path does not fit this PC - its memory, its GPUs: the layer split instead, which sizes

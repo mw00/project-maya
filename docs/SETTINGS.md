@@ -2136,6 +2136,10 @@ Setup and debugging variables:
 | Variable | Default | What it does |
 |---|---|---|
 | `MAYA_MM3_HOST_FREE` | `1` | decode: a layer whose routed experts are all in VRAM plans them on the GPU, so a token or a verify window runs without waiting for the host at each layer; `0`: the host plans every layer (the same tokens) |
+| `MAYA_MM3_HELPER` | off | the helper GPU's visible index (outside `--gpus`; left out of their default): no layers of its own, a pool of the most routed experts the layer GPUs do not hold (by the expert profile), copied once at load. A decoded token's or a verify window's picks it holds run there instead of on the CPU lane, beside it; the host adds its sums to the CPU lane's part. With `MAYA_MM3_HELPER_GB`. The layer split only (not `--tp`); a GGUF pack (an EXL3 one: `MAYA_MM3_HELPER_EXL3=1`, untested). The prompt path stages as before |
+| `MAYA_MM3_HELPER_GB` | - | its experts' pool, GB (the GPU keeps half a GB free beyond it) |
+| `MAYA_MM3_HELPER_CHECK` | off | `1`: at load, one held expert of up to 16 layers on the helper and on the CPU lane: their largest difference against the largest value (a NOTE); above 0.05 the load is refused |
+| `MAYA_MM3_HELPER_TIMEOUT_MS` | 10000 | the host's wait for the helper's answer; a failure or no answer hands its picks to the CPU lane for the rest of the run |
 | `MAYA_MM3_PIPE` | `1` | `--parallel` on a layer split: the GPUs as a pipeline (each holds a different group of the running conversations, the same tokens); `0`: all of them through the GPUs together, one GPU at a time |
 | `MAYA_MM3_GRAPH` | `1` | decode on one GPU with every MoE layer host-free: a token's and a verify window's forward replayed as one graph (the same tokens); `0`: launched kernel by kernel |
 | `MAYA_MM3_WIN_SUBMIT` | `1` | Windows + AMD: each layer's queued work started as it is enqueued (the driver otherwise waits for the host); `0`: off |
