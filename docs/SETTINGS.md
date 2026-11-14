@@ -1464,6 +1464,12 @@ are fitted to its own VRAM (a slot fewer at a time when the mean overshoots). A 
 own part (its gate / up rows and its columns of the down), not the whole expert. With `DS4_FLOW_TP=1` its members take
 the prompt flow too, each streaming its own rows, the down gathered on the GPU (on a disk-streaming box the group's
 prompts are much slower off the flow).
+
+This is an experimental opt-in, not a general prompt speed-up. On two RTX 4090s connected by PCIe without NVLink,
+forcing the two-member group instead of the automatic layer split reduced mean prompt reading from 1,092 to 224
+tokens/s at about 9.2K tokens and from 1,867 to 590 tokens/s at about 36.5K tokens ([#888](https://github.com/mw00/project-maya/issues/888)).
+Compare both layouts on your own link and workload before enabling it.
+
 `MAYA_DS4_TP_CHECK=1` checks every expert format and rotation at load, before any request: one token through each
 member's parts as decode runs them, summed on the host and compared with the whole expert and shared expert (more than
 1e-3 of the largest output fails the start), and each member's prompt copies on its GPU against the file's bytes, bit
@@ -1483,7 +1489,7 @@ split change does.
 
 | Setting | Default | |
 | --- | --- | --- |
-| `MAYA_DS4_TP_GGUF_UNEVEN` | off | `1`: a GGUF's experts split in whole blocks, as even as they go, so its group can form; with `MAYA_DS4_HELPER`, the helper takes the group's layers too (on its lead) |
+| `MAYA_DS4_TP_GGUF_UNEVEN` | off | `1`: a GGUF's experts split in whole blocks, as even as they go, so its group can form; with `MAYA_DS4_HELPER`, the helper takes the group's layers too (on its lead). On PCIe without NVLink, compare prompt speed with Maya's automatic layer split before enabling ([#888](https://github.com/mw00/project-maya/issues/888)) |
 | `MAYA_DS4_TP_CHECK` | off | `1`: each member's parts checked against the whole expert at load |
 | `DS4_TP_SHARES` | from the members' rooms (GGUF packs) | the parts by hand instead, in whole blocks: `w0,w1,..` a member's share of each layer's FFN, `:` between patterns that go round the layers, `/` between groups (`4,5`: the lead 4 of 9 blocks); `off`: the split as before (even, or `MAYA_DS4_TP_GGUF_UNEVEN`'s) |
 | `MAYA_DS4_FLOW_DOWN_SHARE` | off | `1` (with `DS4_FLOW_TP=1`): a group's members read each streamed expert's down from the files once, through the page cache (dropped once every member read it), where each member read it from the disk itself - the same bytes |
