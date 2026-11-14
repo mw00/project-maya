@@ -1057,6 +1057,7 @@ public:
     GlmDflash* cap_d_ = nullptr;                           // every part: the drafter its captures go to ...
     std::vector<int> cap_k_;                               // ... absolute layer -> its feature index (-1: not read)
     int64_t cap_floor_ = 0;                                // ... positions below it are not captured (a long prompt)
+    int cap_seq_ = 0;                                      // shared drafter's owner; -1 disables multi-session captures
     bool dflash_load(const std::string& path, int dev, std::string& err);
     bool dflash_bind(std::string& err);                    // after the parts loaded: the captures wired
     void dflash_capture(int il, const float* R, int n, int64_t p0, float* scratch, int rows, cudaStream_t s);
@@ -1069,15 +1070,18 @@ public:
     }
     bool dflash_ready() const;
     void dflash_reset();
+    // Call on the head after draining scheduler work. A changed owner starts with an empty draft context.
+    bool dflash_select_context(int seq, std::string& err);
     /// The DFlash decode (Strata's serial speculative loop with a block drafter): each round the drafter's block for
     /// the last token (up to n_max drafts, fewer where the selector's confidence is below p_min; n_max < 0: the
     /// drafter's block, p_min < 0: 0.5 on a split, 0.9 on one GPU) is checked by one verify window - pipelined on a split (window_pipe's steps, stopped at
     /// the first wrong draft), batched on one GPU - the same tokens as token-at-a-time decode for the same samples.
     /// After the prompt's last forward().
     /// n_min / p_cum: GlmDflash::draft_finish's (< 0: MAYA_GLM_DFLASH_MIN / _CUM, else 0)
+    /// should_yield: checked only after an emitted, un-fed anchor; all background work is drained on return.
     bool decode_dflash(strata::kernels::SamplerParams& sp, int64_t max_new, int n_max, float p_min,
                        const std::function<bool(int)>& emit, int64_t& produced, std::string& err, int n_min = -1,
-                       float p_cum = -1.0f);
+                       float p_cum = -1.0f, const std::function<bool()>& should_yield = {});
     // ---- the batched prompt path (src/core/glm_prefill.cu)
     struct PrefillState;
     PrefillState* pf_ = nullptr;

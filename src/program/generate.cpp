@@ -2601,8 +2601,8 @@ static int glm_pack_generate(const Options& o) {
                              "(%d rows a group)\n", strata::core::Glm5Model::multi_mtp_setting(),
                      strata::core::Glm5Model::rows_max());
     if (multi && model.dflash_ready())
-        std::fprintf(stderr, "glm dflash: not used with MAYA_GLM_SEQS=%d - the several-conversation scheduler decodes "
-                             "without it (and without the MTP block, which --dflash leaves unloaded)\n",
+        std::fprintf(stderr, "glm dflash: MAYA_GLM_SEQS=%d - DFlash for one active request, multi-session decode "
+                             "for several; the shared draft context restarts on return to one request\n",
                      model.seq_count());
     struct Ctx {   // a context's driver-side state while another one is bound (the bound one's is in the globals)
         std::vector<int32_t> snap_tokens;
@@ -2637,6 +2637,8 @@ static int glm_pack_generate(const Options& o) {
     struct Gen {
         int rid = -1, ctx = 0;
         strata::kernels::SamplerParams sp;
+        int spec = 0, spec_n_min = -1;
+        double spec_min_p = -1.0, spec_cum = -1.0;
         int64_t max_new = 0, produced = 0;
         std::vector<int32_t> prompt, emitted;
         std::vector<int32_t> pen;   // the penalties' history (sp.host_history): the prompt, then every token written
@@ -2678,6 +2680,8 @@ static int glm_pack_generate(const Options& o) {
         std::vector<float> img_rows;
         std::vector<std::pair<int32_t, float>> bias;
         int abl = -1;   // its GEN ablate= (-1: --ablate-default)
+        int spec = 0, spec_n_min = -1;
+        double spec_min_p = -1.0, spec_cum = -1.0;
     };
     std::deque<Pending> pending;
     // the room a context must leave for the answer (at most what the request asked for): a long prompt goes to a
@@ -3107,6 +3111,10 @@ static int glm_pack_generate(const Options& o) {
         auto g = std::make_unique<Gen>();
         g->rid = rid;
         g->sp = rq;
+        g->spec = req_spec;
+        g->spec_n_min = req_spec_n_min;
+        g->spec_min_p = req_spec_min_p;
+        g->spec_cum = req_spec_cum;
         g->max_new = max_new;
         g->in_think = req_think_budget > 0 && req_think_end >= 0;
         g->think_budget = req_think_budget;
@@ -3170,7 +3178,7 @@ static int glm_pack_generate(const Options& o) {
                 return;
             }
             pending.push_back({rid, ids, max_new, rq, req_think_budget, req_think_end, cur_img_pos, cur_img_rows,
-                               req_bias, req_abl});
+                               req_bias, req_abl, req_spec, req_spec_n_min, req_spec_min_p, req_spec_cum});
             std::fprintf(stderr, "glm multi: request %d waits for a context that holds %lld tokens\n", rid,
                          (long long) want);
             return;
@@ -3190,6 +3198,16 @@ static int glm_pack_generate(const Options& o) {
             ctl.erase(rid);
         }
         gap_failed = false;
+        // The new prompt must not overwrite another request's shared draft context. Even reusing the same
+        // idle slot starts a fresh draft context: a restored prefix need not match its old ring contents.
+        const bool alone = std::none_of(gens.begin(), gens.end(),
+                                       [](const std::unique_ptr<Gen>& p) { return !p->done; });
+        if (!model.dflash_select_context(-1, err) || (alone && !model.dflash_select_context(best, err))) {
+            const std::string why = err;
+            multi_fail(why);
+            std::printf("ERR %d %s\n", rid, why.c_str());
+            return;
+        }
         bind_ctx(best);
         model.set_image_rows(cur_img_pos, cur_img_rows);
         model.force_next(-1);
@@ -3324,6 +3342,10 @@ static int glm_pack_generate(const Options& o) {
             req_think_end = w2.think_end;
             req_bias = std::move(w2.bias);
             req_abl = w2.abl;
+            req_spec = w2.spec;
+            req_spec_n_min = w2.spec_n_min;
+            req_spec_min_p = w2.spec_min_p;
+            req_spec_cum = w2.spec_cum;
             cur_img_pos = std::move(w2.img_pos);
             cur_img_rows = std::move(w2.img_rows);
             gen_admit(w2.rid, w2.ids, w2.max_new, w2.rq);
@@ -3339,6 +3361,74 @@ static int glm_pack_generate(const Options& o) {
             std::none_of(gens.begin(), gens.end(), [](const std::unique_ptr<Gen>& p) { return p->ready && !p->done; }))
             flush_pauses();
         Gen* only = gens.size() == 1 ? gens[0].get() : nullptr;
+        if (only != nullptr && !only->done && multi_spec && !step_no_spec && model.dflash_ready() &&
+            only->spec != 1) {
+            // A multi-session step may still be in flight when the other request finishes. Take it first,
+            // then reconsider the live set (taking its token can itself finish the remaining request).
+            if (!flight.empty() || !wflight.empty()) {
+                if (!multi_drain()) multi_fail(err);
+                gen_sweep();
+                return;
+            }
+            Gen& g = *only;
+            bind_ctx(g.ctx);
+            if (!model.dflash_select_context(g.ctx, err)) {
+                multi_fail(err);
+                return;
+            }
+            if (g.pending >= 0) {
+                if (!model.forward({g.pending}, lg, err)) {
+                    multi_fail(err);
+                    return;
+                }
+                g.pending = -1;
+            }
+            g.ready = false;
+            model.force_next(g.force);
+            g.force = -1;
+            int32_t last = -1, forced_unused = -1;
+            bool interrupted = false;
+            int64_t n_spec = 0;
+            const int spec = g.spec >= 2 ? g.spec : o.spec;
+            const int n_max = spec >= 2 ? spec - 1 : -1;
+            const float p_min = g.spec_min_p >= 0.0 && g.spec_min_p <= 1.0 ? (float) g.spec_min_p
+                                : o.spec_min_p_set ? (float) o.spec_min_p : -1.0f;
+            strata::core::glmng::set_history(&model, g.prompt, g.emitted);
+            const bool ok = model.decode_dflash(g.sp, g.max_new - g.produced, n_max, p_min, [&](int tok) {
+                forced_unused = -1;
+                last = tok;
+                if (!gen_token(g, tok)) return false;
+                if (g.force >= 0) {
+                    model.force_next(g.force);
+                    forced_unused = g.force;
+                    g.force = -1;
+                }
+                return true;
+            }, n_spec, err, g.spec_n_min,
+                g.spec_cum >= 0.0 && g.spec_cum <= 1.0 ? (float) g.spec_cum : -1.0f, [&] {
+                    // DFlash calls this only for an un-fed anchor, never in the accepted draft prefix.
+                    interrupted = input_pending();
+                    return interrupted;
+                });
+            if (forced_unused >= 0) {
+                g.force = forced_unused;
+                model.force_next(-1);
+            }
+            if (!ok) {
+                multi_fail(err);
+                return;
+            }
+            if (interrupted) g.pending = last;
+            else gen_finish(g);
+            gen_sweep();
+            return;
+        }
+        // Admission disabled captures before another prompt. Keep them disabled through multi decode and
+        // prompt gaps; rows from different contexts must never share the drafter's position-indexed ring.
+        if (!model.dflash_select_context(-1, err)) {
+            multi_fail(err);
+            return;
+        }
         static const bool spec_win_env = [] {
             const char* e = getenv("MAYA_GLM_SPEC_WIN");
             return e != nullptr && std::atoi(e) != 0;

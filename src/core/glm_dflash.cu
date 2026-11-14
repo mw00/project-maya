@@ -1689,7 +1689,8 @@ bool Glm5Model::dflash_bind(std::string& err) {
 // rows [0, n) of R (hc x n_embd floats each, positions p0..): the input of layer il.  The rows the drafter reads -
 // at or past cap_floor_ - leave as their stream mean through `scratch` (at least min(n, rows) rows) to the staging
 void Glm5Model::dflash_capture(int il, const float* R, int n, int64_t p0, float* scratch, int rows, cudaStream_t s) {
-    if (cap_d_ == nullptr || il >= (int) cap_k_.size() || cap_k_[(size_t) il] < 0 || scratch == nullptr || rows <= 0)
+    if (cap_d_ == nullptr || cap_seq_ < 0 || cap_seq_ != cur_seq_ || il >= (int) cap_k_.size() ||
+        cap_k_[(size_t) il] < 0 || scratch == nullptr || rows <= 0)
         return;
     const int k = cap_k_[(size_t) il];
     const Glm5Geometry& g = g_;
@@ -1718,13 +1719,34 @@ void Glm5Model::dflash_reset() {
     if (cap_d_) cap_d_->reset();
 }
 
+bool Glm5Model::dflash_select_context(int seq, std::string& err) {
+    if (!dflash_ready() || cap_seq_ == seq) return true;
+    // Old capture copies must finish before their staging metadata can be cleared. The caller has already
+    // drained multi work (and decode_dflash joins DraftAhead before returning).
+    for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
+        cudaError_t rc = cudaSetDevice(m->dev_);
+        if (rc == cudaSuccess) rc = cudaStreamSynchronize(m->fast_->cs);
+        if (rc != cudaSuccess) {
+            err = std::string("glm dflash: context switch: ") + cudaGetErrorString(rc);
+            cudaSetDevice(dev_);
+            return false;
+        }
+    }
+    if (seq >= 0) dflash_reset();
+    for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) m->cap_seq_ = seq;
+    if (seq >= 0) std::fprintf(stderr, "glm dflash: active context %d (draft cache restarted)\n", seq);
+    else std::fprintf(stderr, "glm dflash: draft capture paused\n");
+    cudaSetDevice(dev_);
+    return true;
+}
+
 // The DFlash decode: each round the drafter's block for the last accepted token (up to n_max drafts, or fewer when the
 // selector's confidence falls below p_min), a verify window of that token and the drafts, its longest right prefix and
 // the pick after it kept (window_commit) - the same tokens the token-at-a-time loop produces for the same samples -
 // and the kept positions' trunk features into the drafter's ring.  After the prompt's last forward().
 bool Glm5Model::decode_dflash(strata::kernels::SamplerParams& sp, int64_t max_new, int n_max, float p_min,
                               const std::function<bool(int)>& emit, int64_t& produced, std::string& err, int n_min,
-                              float p_cum) {
+                              float p_cum, const std::function<bool()>& should_yield) {
     produced = 0;
     if (!dflash_ready()) {
         err = "glm dflash: no draft loaded";
@@ -1777,6 +1799,7 @@ bool Glm5Model::decode_dflash(strata::kernels::SamplerParams& sp, int64_t max_ne
     sp.counter += 1;
     ++produced;
     if (!emit(y) || produced >= max_new || pos_ + 1 >= max_ctx_) return true;
+    if (should_yield && should_yield()) return true;
     // the prompt's positions (their passes are done) into the ring
     for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
         cudaSetDevice(m->dev_);
@@ -1823,7 +1846,6 @@ bool Glm5Model::decode_dflash(strata::kernels::SamplerParams& sp, int64_t max_ne
     // the last window's late tokens and the commit behind them done before the caller reads the state - on every
     // way out, an error's too
     const auto drain = [&] {
-        if (!pipe) return;
         win_commit_wait();
         for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
             cudaSetDevice(m->dev_);
@@ -1926,6 +1948,7 @@ bool Glm5Model::decode_dflash(strata::kernels::SamplerParams& sp, int64_t max_ne
             ++produced;
             last_tok_ = y2;
             if (!emit(y2) || produced >= max_new || pos_ + 1 >= max_ctx_) break;
+            if (should_yield && should_yield()) break;
             y = y2;
             continue;
         }
@@ -2043,6 +2066,12 @@ bool Glm5Model::decode_dflash(strata::kernels::SamplerParams& sp, int64_t max_ne
         ++produced;
         last_tok_ = y2;
         if (!emit(y2) || produced >= max_new || pos_ + 1 >= max_ctx_) break;
+        if (should_yield && should_yield()) {
+            // The next draft may already be queued beside this round's commit. Finish it before handing
+            // the shared ring to another context; drain_on_exit then waits the device work and commit.
+            if (ahead_queued && !ahead.wait(err)) return false;
+            break;
+        }
         y = y2;
         if (pipe) {
             // the next window's anchor now, behind the commit; the drafter's catch-up at the top of the round
