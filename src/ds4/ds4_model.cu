@@ -2554,11 +2554,37 @@ struct Model::Impl {
     // back after), so their chunk buffers hold no VRAM of their own between prompts and a larger chunk costs the
     // decode nothing.  Not on one GPU: lent there, the answers came out wrong (not found yet).  Opt-in until a
     // DeepSeek EXL3 pack has run it on our machines (a layer split that lends refuses to load where its layers keep too
-    // few recent slots for the chunk)
+    // few recent slots for the chunk).  An EXL3 pack read in place (--mmap-experts on) lends too: every expert's file
+    // backs it, so the lent tail is the coldest VRAM slots as a GGUF's (no recent slots needed), their experts streamed
+    // from the files while lent and read back from them after (borrow_end, read_blob_file)
     bool exl3_lend_on() const {
         const char* v = ds4_env("DS4_EXL3_LEND");
-        return v != nullptr && std::atoi(v) != 0 && devs.size() > 1 && !file_experts && !pk.gguf && o.expert_cache &&
-               recent_n > 0;
+        return v != nullptr && std::atoi(v) != 0 && devs.size() > 1 && !pk.gguf &&
+               (file_experts || (o.expert_cache && recent_n > 0));
+    }
+    // expert e of l read from the model's files as its blob (the VRAM slots' layout): a GGUF's from its matrices, an
+    // EXL3 expert's file region repacked (region: the caller's scratch)
+    bool read_blob_file(const Layer& l, int e, uint8_t* blob, std::vector<uint8_t>& region, bool cached = false) const {
+        if (l.lay.fmt == gg::kFmtMXFP4) return read_mx_file(l, e, blob, cached);
+        region.resize(l.region_bytes[(size_t) e]);
+        const bool read = e < (int) l.esplit.size() && l.esplit[(size_t) e]
+                              ? read_split(l, e, region.data())
+                              : cached ? os::pread_full(pk.fds[(size_t) l.region_file[(size_t) e]], region.data(),
+                                                        region.size(), l.region_off[(size_t) e])
+                                       : pk.read_at(l.region_file[(size_t) e], l.region_off[(size_t) e], region.size(),
+                                                    region.data());
+        if (read) repack(l, e, region.data(), blob);
+        return read;
+    }
+    // (an expert read back into VRAM: one copy of it there again - its file pages need not stay cached)
+    void drop_file_pages(const Layer& l, int e) const {
+        if (l.lay.fmt == gg::kFmtMXFP4)
+            for (int r = 0; r < 3; ++r)
+                os::advise(pk.fds[(size_t) l.mx_file[r]], l.mx_off[r] + (uint64_t) e * l.mx_stride[r], mx_part_bytes(l, r),
+                           false);
+        else if (!(e < (int) l.esplit.size() && l.esplit[(size_t) e]))
+            os::advise(pk.fds[(size_t) l.region_file[(size_t) e]], l.region_off[(size_t) e], l.region_bytes[(size_t) e],
+                       false);
     }
     static bool tp_borrow_on() {
         const auto on = [](const char* v) { return v != nullptr && std::atoi(v) != 0; };
@@ -7803,7 +7829,7 @@ struct Model::Impl {
         //  recent ones its part of the lent tail, their experts copies of RAM's to stream from while lent)
         for (Layer& l : L) {
             if (chunk <= 0 || l.mtp || l.n_cls > 1 || l.n_vram < l.n_exp || (size_t) l.dev >= chunks.size() ||
-                chunks[(size_t) l.dev] == nullptr || !chunks[(size_t) l.dev]->x3_lend)
+                chunks[(size_t) l.dev] == nullptr || !chunks[(size_t) l.dev]->x3_lend || file_experts)
                 continue;
             l.n_vram = l.n_exp - 1;
             if (o.verbose)
@@ -7830,7 +7856,7 @@ struct Model::Impl {
             //  is more - the tail stays expert slots between prompts and pictures, so it costs the decode nothing)
             const size_t vneed = di == 0 && vis_mode == kVisTail ? vt.room_bytes() + 256 : 0;
             // (an EXL3 lender: the cache's slots alone - the spare and the recent ones, whose experts RAM holds)
-            const int kmax = c.x3_lend ? std::min(min_slots - 1, recent_n) : min_slots - 1;
+            const int kmax = c.x3_lend && !file_experts ? std::min(min_slots - 1, recent_n) : min_slots - 1;
             const int k = (int) std::min<size_t>((std::max(need, vneed) + step - 1) / step, (size_t) std::max(0, kmax));
             const size_t cap = (size_t) k * step;
             if (vneed > cap)
@@ -7893,7 +7919,7 @@ struct Model::Impl {
             };
             needs(chunk);
             const bool gx3 = chunks[(size_t) mems[0]]->x3_lend;   // (an EXL3 group: the cache's slots alone)
-            const int k = tp_tail_k(need, step, gx3 ? std::min(min_slots - 1, recent_n) : min_slots - 1);
+            const int k = tp_tail_k(need, step, gx3 && !file_experts ? std::min(min_slots - 1, recent_n) : min_slots - 1);
             if (k > 0 && !tp_tail_fits(need, step, k)) {   // (few VRAM slots a layer: chunks the tails hold)
                 int c2 = chunk;
                 while (c2 > 256 && !tp_tail_fits(need, step, k)) {
@@ -8055,7 +8081,8 @@ struct Model::Impl {
             l.n_main = l.n_slots - std::min(l.n_slots, n_tail[(size_t) (&l - &L[0])]);
             l.pv_n = l.n_slots;
             // (DS4_EXL3_LEND: the tail the cache's slots alone - an expert placed there has no copy in RAM to stream from)
-            if ((l.rc_n == 0 || l.n_main < l.rc_base) && l.n_main < l.n_slots && !l.mtp && chunks.size() > (size_t) l.dev &&
+            if (!file_experts && (l.rc_n == 0 || l.n_main < l.rc_base) && l.n_main < l.n_slots && !l.mtp &&
+                chunks.size() > (size_t) l.dev &&
                 chunks[(size_t) l.dev] != nullptr && chunks[(size_t) l.dev]->x3_lend) {
                 err = "DS4_EXL3_LEND: layer " + std::to_string(l.il) + " keeps " + std::to_string(l.rc_n) +
                       " recent slots, its tail " + std::to_string(l.n_slots - l.n_main) +
@@ -19790,7 +19817,10 @@ struct Model::Impl {
         }
         static const bool check = std::getenv("DS4_CHECK_LEND") != nullptr;
         x3_check.clear();
-        if (check && x3)   // (an EXL3 lender's tail slots as they are, before the room is cleared: borrow_end compares)
+        // (an EXL3 lender's tail slots as they are, before the room is cleared: borrow_end compares - a lender whose
+        //  experts are copies in RAM; in place the files are the reference, borrow_end compares each part with its
+        //  file, and the whole tail's copy - 14.5 GB on 2x RX 7900 XTX at chunk 32768 - would take the host's RAM)
+        if (check && x3 && !file_experts)
             for (const Layer& l : L) {
                 if (l.mtp || l.n_main >= l.n_slots || l.lay.fmt == gg::kFmtMXFP4) continue;
                 for (int e = 0; e < l.n_exp; ++e) {
@@ -19892,13 +19922,20 @@ struct Model::Impl {
         };
         std::vector<Rng> rg;
         for (const Layer& l : L) {
-            if (l.mtp || l.pv_n >= l.n_slots || l.lay.fmt != gg::kFmtMXFP4) continue;
+            if (l.mtp || l.pv_n >= l.n_slots || (l.lay.fmt != gg::kFmtMXFP4 && !file_experts)) continue;
             for (int e = 0; e < l.n_exp; ++e)
                 if (l.slot[(size_t) e] >= l.pv_n &&
-                    !(lc_arena != nullptr && l.nm == 1 && !l.lent_copy.empty() && l.lent_copy[(size_t) e] >= 0))
+                    !(lc_arena != nullptr && l.nm == 1 && !l.lent_copy.empty() && l.lent_copy[(size_t) e] >= 0)) {
+                    if (l.lay.fmt != gg::kFmtMXFP4) {   // (an EXL3 lender in place: its file region; across two: none)
+                        if (!(e < (int) l.esplit.size() && l.esplit[(size_t) e]))
+                            rg.push_back({pk.fds[(size_t) l.region_file[(size_t) e]], l.region_off[(size_t) e],
+                                          (uint64_t) l.region_bytes[(size_t) e]});
+                        continue;
+                    }
                     for (int r = 0; r < 3; ++r)   // (DS4_LENT_RAM_GB: one with a RAM copy goes back from it, not read)
                         rg.push_back({pk.fds[(size_t) l.mx_file[r]], l.mx_off[r] + (uint64_t) e * l.mx_stride[r],
                                       (uint64_t) mx_part_bytes(l, r)});
+                }
         }
         uint64_t total = 0;
         for (const Rng& x : rg) total += x.n;
@@ -20001,6 +20038,27 @@ struct Model::Impl {
         held_list.clear();
         lend_held.store(false, std::memory_order_relaxed);
     }
+    // (DS4_CHECK_LEND, an EXL3 lender) each lent slot part against its bytes before the lend (borrow_begin's x3_check)
+    void x3_check_compare() {
+        size_t n_diff = 0;
+        for (const LentCheck& k : x3_check) {
+            const Layer& l = L[(size_t) k.layer];
+            const Layer& x = member(l, k.m);
+            std::vector<uint8_t> now(k.bytes.size());
+            cudaSetDevice(devs[(size_t) x.dev].id);
+            cudaMemcpy(now.data(), sat(l, x, k.slot, unit(x)), now.size(), cudaMemcpyDeviceToHost);
+            const bool moved = l.slot[(size_t) k.e] != k.slot;
+            if (moved || now != k.bytes) {
+                if (n_diff < 8)
+                    std::fprintf(stderr, "ds4 DS4_CHECK_LEND: layer %d expert %d slot %d member %d: %s\n", l.il, k.e,
+                                 k.slot, k.m, moved ? "moved" : "bytes differ from before the lend");
+                ++n_diff;
+            }
+        }
+        if (!x3_check.empty())
+            std::fprintf(stderr, "ds4 DS4_CHECK_LEND: %zu lent slot parts, %zu not as before\n", x3_check.size(), n_diff);
+        x3_check.clear();
+    }
     // after the run (every device done with its buffers): the experts under them read back into their slots, in file
     // order by a few threads - one that cannot be read leaves VRAM for the CPU lane (the decode finds every other one
     // where it was).  false: DS4_CHECK_LEND found a part read back different from the file - those experts went to the
@@ -20052,7 +20110,8 @@ struct Model::Impl {
             if (!ok) lend_broken = true;
             return ok;
         }
-        if (L[(size_t) jobs[0].layer].lay.fmt != gg::kFmtMXFP4) {   // (DS4_EXL3_LEND) the cache's experts, from RAM
+        if (L[(size_t) jobs[0].layer].lay.fmt != gg::kFmtMXFP4 && !file_experts) {   // (DS4_EXL3_LEND) the cache's
+                                                                                       //  experts, from RAM
             const double t0 = now_ms();
             std::string e2;
             for (size_t i = 0; i < jobs.size() && !broken; ++i) {
@@ -20083,24 +20142,7 @@ struct Model::Impl {
             }
             st.lent_back += (int64_t) jobs.size();
             st.lent_back_ms += now_ms() - t0;
-            size_t n_diff = 0;
-            for (const LentCheck& k : x3_check) {   // (DS4_CHECK_LEND)
-                const Layer& l = L[(size_t) k.layer];
-                const Layer& x = member(l, k.m);
-                std::vector<uint8_t> now(k.bytes.size());
-                cudaSetDevice(devs[(size_t) x.dev].id);
-                cudaMemcpy(now.data(), sat(l, x, k.slot, unit(x)), now.size(), cudaMemcpyDeviceToHost);
-                const bool moved = l.slot[(size_t) k.e] != k.slot;
-                if (moved || now != k.bytes) {
-                    if (n_diff < 8)
-                        std::fprintf(stderr, "ds4 DS4_CHECK_LEND: layer %d expert %d slot %d member %d: %s\n", l.il, k.e,
-                                     k.slot, k.m, moved ? "moved" : "bytes differ from before the lend");
-                    ++n_diff;
-                }
-            }
-            if (!x3_check.empty())
-                std::fprintf(stderr, "ds4 DS4_CHECK_LEND: %zu lent slot parts, %zu not as before\n", x3_check.size(), n_diff);
-            x3_check.clear();
+            x3_check_compare();
             return true;
         }
         // (DS4_LENT_RAM_GB) those with a RAM copy: DMA'd back on their devices' streams, nothing read; the rest as before
@@ -20177,10 +20219,14 @@ struct Model::Impl {
                 return true;
             }
         }
-        std::sort(jobs.begin(), jobs.end(), [&](const Job& a, const Job& b) {
+        std::sort(jobs.begin(), jobs.end(), [&](const Job& a, const Job& b) {   // (file order; an EXL3 expert's region)
             const Layer &la = L[(size_t) a.layer], &lb = L[(size_t) b.layer];
-            if (la.mx_file[0] != lb.mx_file[0]) return la.mx_file[0] < lb.mx_file[0];
-            return la.mx_off[0] + (uint64_t) a.e * la.mx_stride[0] < lb.mx_off[0] + (uint64_t) b.e * lb.mx_stride[0];
+            const bool xa = la.lay.fmt != gg::kFmtMXFP4, xb = lb.lay.fmt != gg::kFmtMXFP4;
+            const int fa = xa ? la.region_file[(size_t) a.e] : la.mx_file[0],
+                      fb = xb ? lb.region_file[(size_t) b.e] : lb.mx_file[0];
+            if (fa != fb) return fa < fb;
+            return (xa ? la.region_off[(size_t) a.e] : la.mx_off[0] + (uint64_t) a.e * la.mx_stride[0]) <
+                   (xb ? lb.region_off[(size_t) b.e] : lb.mx_off[0] + (uint64_t) b.e * lb.mx_stride[0]);
         });
         const double t0 = now_ms();
         if (rf_bytes == 0)
@@ -20213,7 +20259,7 @@ struct Model::Impl {
         for (int t = 0; t < (int) n_th; ++t)
             th.emplace_back([&, t] {
                 uint8_t* stage = rf_stage[(size_t) t];
-                std::vector<uint8_t> back;
+                std::vector<uint8_t> back, region;   // (region: an EXL3 expert's, read_blob_file's scratch)
                 for (;;) {
                     const size_t i = next.fetch_add(1);
                     if (i >= jobs.size()) break;
@@ -20221,7 +20267,7 @@ struct Model::Impl {
                     const int e = jobs[i].e;
                     if (l.nm > 1) {   // (DS4_TP_BORROW) each member its part
                         uint8_t* half = rf_half[(size_t) t];
-                        bool ok = l.blob <= rf_bytes && read_mx_file(l, e, stage), same = true;
+                        bool ok = l.blob <= rf_bytes && read_blob_file(l, e, stage, region), same = true;
                         const bool read = ok;   // (a read that fails: the CPU lane takes it - the file has it)
                         for (int m = 0; m < l.nm && ok; ++m) {
                             const Layer& x = member(l, m);
@@ -20243,13 +20289,10 @@ struct Model::Impl {
                             }
                         }
                         bad[i] = !read || !ok || !same;   // (a part that differs: to the CPU lane, as a failed read)
-                        if (ok && same)   // (one copy of it: in VRAM again)
-                            for (int r = 0; r < 3; ++r)
-                                os::advise(pk.fds[(size_t) l.mx_file[r]], l.mx_off[r] + (uint64_t) e * l.mx_stride[r],
-                                           mx_part_bytes(l, r), false);
+                        if (ok && same) drop_file_pages(l, e);   // (one copy of it: in VRAM again)
                         continue;
                     }
-                    const bool read = l.blob <= rf_bytes && read_mx_file(l, e, stage, cached);
+                    const bool read = l.blob <= rf_bytes && read_blob_file(l, e, stage, region, cached);
                     const bool put = read && cudaSetDevice(devs[(size_t) l.dev].id) == cudaSuccess &&
                                      cudaMemcpy(sat(l, l, l.slot[(size_t) e], l.blob), stage, l.blob,
                                                 cudaMemcpyHostToDevice) == cudaSuccess;
@@ -20265,10 +20308,7 @@ struct Model::Impl {
                             bad[i] = 1;   // (to the CPU lane, as a failed read)
                         }
                     }
-                    if (!bad[i])   // (one copy of it: in VRAM again)
-                        for (int r = 0; r < 3; ++r)
-                            os::advise(pk.fds[(size_t) l.mx_file[r]], l.mx_off[r] + (uint64_t) e * l.mx_stride[r],
-                                       mx_part_bytes(l, r), false);
+                    if (!bad[i]) drop_file_pages(l, e);   // (one copy of it: in VRAM again)
                 }
             });
         for (auto& t : th) t.join();
@@ -20286,7 +20326,8 @@ struct Model::Impl {
             }
             ++n_bad;   // (to the CPU lane: the file has it)
             l.slot[(size_t) e] = -1;
-            l.host[(size_t) e] = (uint8_t*) mx_mat(l, e, 0);
+            if (l.lay.fmt == gg::kFmtMXFP4) l.host[(size_t) e] = (uint8_t*) mx_mat(l, e, 0);
+            else l.host[(size_t) e] = l.hh[(size_t) e][0] = file_part(l, e);   // (an EXL3 expert in place: as the load)
             --l.n_vram;
             const unsigned long long zero = 0;
             for (int m = 0; m < l.nm; ++m) {   // (a group's: every member's table - DS4_TP_BORROW)
