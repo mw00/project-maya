@@ -267,12 +267,20 @@ struct Draft::Impl {
             !vec(pk, DP + "confidence_head.proj.weight", 0.0f, cw, (size_t) D + R, err) ||
             !vec(pk, DP + "confidence_head.proj.bias", 0.0f, cb, 1, err))
             return false;
-#if !defined(STRATA_USE_HIP)
-        {   // (fc in FP16 where BF16 has no tensor cores; MAYA_MM3_DSPARK_FC16=0 keeps BF16 everywhere)
+        {   // (fc in FP16 where BF16 BLAS is unavailable: pre-Ampere CUDA and gfx906/gfx10 HIP; MAYA_MM3_DSPARK_FC16=0 keeps BF16)
             cudaDeviceProp pr{};
             const char* fv = std::getenv("MAYA_MM3_DSPARK_FC16");
-            if ((fv == nullptr || std::atoi(fv) != 0) && cudaGetDeviceProperties(&pr, dev) == cudaSuccess &&
-                pr.major < 8) {
+            bool need_fc16 = false;
+            if (cudaGetDeviceProperties(&pr, dev) == cudaSuccess) {
+#if !defined(STRATA_USE_HIP)
+                need_fc16 = pr.major < 8;
+#else
+                need_fc16 = std::strstr(pr.gcnArchName, "gfx906") != nullptr ||
+                            std::strstr(pr.gcnArchName, "gfx10") != nullptr;
+#endif
+            }
+            const bool want_fc16 = fv != nullptr ? std::atoi(fv) != 0 : need_fc16;
+            if (want_fc16) {
                 const size_t n = (size_t) D * NT * D;
                 uint16_t* h = nullptr;
                 if (cudaMalloc(&h, n * 2) == cudaSuccess) {
@@ -289,7 +297,6 @@ struct Draft::Impl {
                 cudaGetLastError();
             }
         }
-#endif
         L.resize((size_t) g.n_layers);
         for (int i = 0; i < g.n_layers; ++i) {
             const std::string P = DP + "layers." + std::to_string(i) + ".decoder_layer.";
@@ -434,9 +441,11 @@ struct Draft::Impl {
                                         D, conf + i, mkpart, nullptr, s))
                 continue;
             k::gather_row(w1, R, prev, embb, embf, s);
-            const float one = 1.0f, zero = 0.0f;
-            DB(cublasGemmEx(blas, CUBLAS_OP_T, CUBLAS_OP_N, V, 1, R, &one, w2, CUDA_R_16BF, R, embb, CUDA_R_16BF, R,
-                            &zero, bias, CUDA_R_32F, V, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
+            if (!(fc16 && k::markov_bias(w2, w1, V, R, prev, bias, s))) {
+                const float one = 1.0f, zero = 0.0f;
+                DB(cublasGemmEx(blas, CUBLAS_OP_T, CUBLAS_OP_N, V, 1, R, &one, w2, CUDA_R_16BF, R, embb, CUDA_R_16BF,
+                                R, &zero, bias, CUDA_R_32F, V, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
+            }
             if (sa) {
                 k::SampleArgs a = *sa;
                 a.u = u[i];

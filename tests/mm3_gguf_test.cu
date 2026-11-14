@@ -497,6 +497,7 @@ void test_experts(int tg, int tu, int td, cudaStream_t s) {
         sa.n_embd = D;
         sa.n_ff = F;
         sa.limit = lim;
+        sa.hbounds = bounds.data();
         sa.graw = graw;
         sa.x16 = dx16;
         x3::set_gate_up(sa, dxs, D, didx, dh16, F, s);
