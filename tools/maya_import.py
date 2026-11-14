@@ -41,32 +41,39 @@ def is_gguf(path: Path) -> bool:
         return False
 
 
-def files_under(folder: Path) -> list:
+def files_under(folder: Path, *, only: set[Path] | None = None) -> list:
     """Every file under folder (links followed), each real file once: (the path it was found by, its real path).  A
-    link (a Hugging Face cache's snapshot -> blob) is found by its link's name; Maya's own bookkeeping is skipped."""
+    link (a Hugging Face cache's snapshot -> blob) is found by its link's name; Maya's own bookkeeping is skipped.
+    only: explicitly selected files, which may live outside folder; do not scan any other files in that case."""
+    def paths():
+        if only is not None:
+            yield from sorted(only)
+        else:
+            for root, dirs, names in os.walk(folder, followlinks=True):
+                dirs.sort()
+                for name in sorted(names):
+                    yield Path(root) / name
+
     seen, out = {}, []
-    for root, dirs, names in os.walk(folder, followlinks=True):
-        dirs.sort()
-        for n in sorted(names):
-            p = Path(root) / n
-            if n in (VERIFIED, LINKED) or n.endswith((".maya-import", ".incomplete", ".part", ".aria2", ".td", ".xltd", ".!ut")):
-                continue                       # (a download that is not finished is not a file yet)
-            try:
-                st = p.stat()
-            except OSError:
-                continue
-            key = (st.st_dev, st.st_ino) if st.st_ino else (str(p.resolve()),)
-            if not p.is_file():
-                continue
-            real = p.resolve()
-            via_link = os.path.normcase(os.path.abspath(p)) != os.path.normcase(str(real))
-            if key in seen:                    # (the same file twice: a link and its target - the link is kept, so the
-                i = seen[key]                  #  file is copied, never moved out from under a Hugging Face cache)
-                if via_link and out[i][0] == out[i][1]:
-                    out[i] = (p, real, st.st_size)
-                continue
-            seen[key] = len(out)
-            out.append((p, real, st.st_size))
+    for p in paths():
+        if p.name in (VERIFIED, LINKED) or p.name.endswith((".maya-import", ".incomplete", ".part", ".aria2", ".td", ".xltd", ".!ut")):
+            continue                       # (a download that is not finished is not a file yet)
+        try:
+            st = p.stat()
+        except OSError:
+            continue
+        key = (st.st_dev, st.st_ino) if st.st_ino else (str(p.resolve()),)
+        if not p.is_file():
+            continue
+        real = p.resolve()
+        via_link = os.path.normcase(os.path.abspath(p)) != os.path.normcase(str(real))
+        if key in seen:                    # (the same file twice: a link and its target - the link is kept, so the
+            i = seen[key]                  #  file is copied, never moved out from under a Hugging Face cache)
+            if via_link and out[i][0] == out[i][1]:
+                out[i] = (p, real, st.st_size)
+            continue
+        seen[key] = len(out)
+        out.append((p, real, st.st_size))
     return out
 
 
@@ -82,9 +89,7 @@ def find(folder: Path, catalog: list, progress=None, hashing=None, only: set[Pat
         for s in e["sha"]:
             by_sha.setdefault(s, []).append(e)
     found, unmatched = [], []
-    for path, real, size in files_under(folder):
-        if only is not None and path not in only and real not in only:
-            continue
+    for path, real, size in files_under(folder, only=only):
         if size == 0:
             continue
         candidates = size in by_size or (sha_only and size >= MIN_UNLISTED and is_gguf(real))

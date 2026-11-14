@@ -29,7 +29,7 @@ from textual.widgets.option_list import Option
 
 from setup_bridge import TAIL, BackRequested, Bridge, curl_meter, describe
 from setup_dash import Dashboard
-from setup_dir_picker import DirectoryPicker
+from setup_dir_picker import DirectoryPicker, FilePicker
 from setup_look import (ACCENT, ACCENT_TEXT, DANGER, EDGE, FAINT, INK, LINE, MUTED, OK, OK_TEXT, SETUP_CSS, THEME,
                         TINT, Card, Output, StopScreen, clock, hints, serving_card, setup_card, splash, styled, title)
 
@@ -88,7 +88,9 @@ class SetupApp(App):
         self.doing, self.doing_since, self.said_doing, self.last = "", 0.0, False, ""
         self.bar, self.bar_since = None, 0.0            # (share done, what to show) while a command tells it
         self.pending = None                             # the question shown: (future, values, kind)
-        self.text_is_directory = False                  # Ctrl+O is for the downloaded-model folder, not a file name
+        self.text_is_directory = False                  # The downloaded-model folder's path field
+        self.text_file_root: Path | None = None
+        self.text_question = ""
         self.zero_option = False                         # a menu's first item is the 0 action
         self.abouts: list = []                          # its options' descriptions (under the highlighted one)
         self.shown = 0                                  # the Bridge's entries handled so far
@@ -378,14 +380,20 @@ class SetupApp(App):
     def ev_choose(self, question, intro, options, default, outro, fut: Future) -> None:
         self.show_question(fut, "choose", question, intro, options, list(range(len(options))), default, outro)
 
-    def ev_text(self, question: str, default: str, fut: Future) -> None:
+    def ev_text(self, question: str, default: str, file_root: str | None, fut: Future) -> None:
         self.text_is_directory = question == "Directory with downloaded model files"
+        self.text_file_root = Path(file_root) if file_root is not None else None
+        self.text_question = question
         self.show_question(fut, "text", question, [], [], [], 0, [])
         field = self.query_one("#text-answer", Input)
         field.value = default
         self.query_one("#about", Static).update("Ctrl+O: browse and search folders." if self.text_is_directory else
+                                                "Ctrl+O: browse files. You can also enter a relative or full path."
+                                                if self.text_file_root is not None else
                                                 "Enter a file name relative to the selected directory.")
         field.focus()
+        if self.text_file_root is not None:
+            self.action_open_directory_picker()
 
     def ev_fail(self, msg: str, hint, fut: Future) -> None:
         self.end_step("fail")
@@ -447,7 +455,8 @@ class SetupApp(App):
                 self.show_keys()
                 fut.set_result(value)
             else:
-                self.query_one("#about", Static).update("Enter a directory path.")
+                self.query_one("#about", Static).update("Enter a file path." if self.text_file_root is not None else
+                                                        "Enter a directory path.")
 
     def on_key(self, event) -> None:
         if self.pending is None or isinstance(self.screen, StopScreen):
@@ -474,10 +483,16 @@ class SetupApp(App):
 
     # ---------------------------------------------------------------------------------------- keys
     def action_open_directory_picker(self) -> None:
-        if self.pending is not None and self.pending[2] == "text" and self.text_is_directory and \
+        if self.pending is not None and self.pending[2] == "text" and \
                 not isinstance(self.screen, DirectoryPicker):
             field = self.query_one("#text-answer", Input)
-            self.push_screen(DirectoryPicker(field.value), self.directory_picked)
+            if self.text_file_root is not None:
+                path = Path(field.value).expanduser() if field.value else self.text_file_root
+                if not path.is_absolute():
+                    path = self.text_file_root / path
+                self.push_screen(FilePicker(str(path), self.text_question), self.directory_picked)
+            elif self.text_is_directory:
+                self.push_screen(DirectoryPicker(field.value), self.directory_picked)
 
     def directory_picked(self, path: str | None) -> None:
         if path is not None and self.pending is not None and self.pending[2] == "text":
@@ -597,7 +612,8 @@ class SetupApp(App):
         if kind == "yn":
             keys = [("Enter", "Choose"), ("y n", "Answer")]
         elif kind == "text":
-            keys = [("Enter", "Use path")] + ([("Ctrl+O", "Browse folders")] if self.text_is_directory else [])
+            keys = [("Enter", "Use path")] + ([("Ctrl+O", "Browse folders")] if self.text_is_directory else
+                                              [("Ctrl+O", "Browse files")] if self.text_file_root is not None else [])
         elif kind:
             zero = kind == "choose" and self.zero_option
             keys = [("Enter", "Choose"), ("↑↓", "Move")] + ([(f"0, 1-{len(self.pending[1]) - int(zero)}", "Pick")]

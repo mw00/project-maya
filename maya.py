@@ -3057,10 +3057,10 @@ def review_candidates(src: Path, family: str) -> dict[str, list[dict]]:
 
 
 def review_pick_file(src: Path, role: str, candidates: list[dict], current: dict | None) -> dict | None:
-    """Choose a detected file or edit its relative path; optional roles can be cleared."""
+    """Choose a detected file or browse for one, including outside src; optional roles can be cleared."""
     while True:
-        rows = [(c["path"].relative_to(src).as_posix(), None, None) for c in candidates]
-        rows.append(("Enter file name...", None, "A path relative to the selected directory."))
+        rows = [(review_path(c["path"], src), None, None) for c in candidates]
+        rows.append(("Browse files...", None, "Browse folders and search for a file, or enter its path."))
         if role != "model":
             rows.append(("None", None, "Do not add this optional file."))
         default = next((i for i, c in enumerate(candidates) if current and c["path"] == current["path"]),
@@ -3070,16 +3070,24 @@ def review_pick_file(src: Path, role: str, candidates: list[dict], current: dict
             return candidates[pick]
         if role != "model" and pick == len(rows) - 1:
             return None
-        answer = current["path"].relative_to(src).as_posix() if current else ""
+        answer = review_path(current["path"], src) if current else ""
         while True:
-            answer = S.ask_text(f"{role.title()} file name", answer)
-            path = Path(os.path.abspath(src / answer)) if answer else None
-            if path is not None and src in path.parents and path.is_file():
-                files = [p for p, _, _ in MI.files_under(src)]
+            answer = S.ask_text(f"{role.title()} file name", answer, file_root=src)
+            path = Path(os.path.abspath(src / Path(answer).expanduser())) if answer else None
+            if path is not None and path.is_file():
+                files = [p for p in path.parent.iterdir() if p.is_file()]
                 return review_candidate(path, role, files)
-            warn(f"{answer or '(empty)'} is not a file inside {src}")
+            warn(f"{answer or '(empty)'} is not a file")
             if S.UI is not None and hasattr(S.UI, "retry_text"):
                 S.UI.retry_text(f"{role.title()} file name")
+
+
+def review_path(path: Path, src: Path) -> str:
+    """Relative filenames in the source directory; full paths for files chosen in another directory."""
+    try:
+        return path.relative_to(src).as_posix()
+    except ValueError:
+        return str(path)
 
 
 def review_downloaded_model(a, src: Path, models: Path, family: str) -> int | dict:
@@ -3089,7 +3097,7 @@ def review_downloaded_model(a, src: Path, models: Path, family: str) -> int | di
     while True:
         def shown(role):
             c = chosen[role]
-            return c["path"].relative_to(src).as_posix() if c else "None"
+            return review_path(c["path"], src) if c else "None"
         rows = [(f"Model: {shown('model')}", None, "Choose or edit the first model file."),
                 (f"Drafter: {shown('drafter')}", None, "Choose an MTP, DFlash, DFlash2 or other draft file."),
                 (f"Vision: {shown('vision')}", None, "Choose a vision file, if present."),
@@ -3235,8 +3243,7 @@ def link_model(folder: str, models: Path, family: str, *, selected_model: Path |
     """Link named published files after checking the model family in GGUF/EXL3 metadata only. Interactive setup
     limits the scan to selected_files and one selected_model anchor."""
     src = Path(folder).expanduser().resolve()
-    files = [(path, real) for path, real, _ in MI.files_under(src)
-             if selected_files is None or path in selected_files or real in selected_files]
+    files = [(path, real) for path, real, _ in MI.files_under(src, only=selected_files)]
     typed = [(path, real, linked_model_type(path)) for path, real in files
              if path.suffix.lower() == ".gguf" or path.name == "config.json"]
     anchors = [(path, real) for path, real, kind in typed if kind == family and

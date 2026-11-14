@@ -490,6 +490,102 @@ class Screen(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(app.return_value, ("done", 0))
         bridge.log.close()
 
+    async def test_browse_model_drafter_and_vision_files(self):
+        source = Path(self.dir.name) / "source"
+        source.mkdir()
+        heads = source.parent / "heads"
+        heads.mkdir()
+        main = source / "model-Q6_K.gguf"
+        draft = heads / "mtp-Q6_K.gguf"
+        vision = heads / "mmproj-F16.gguf"
+        for path in (main, draft, vision):
+            path.write_bytes(b"GGUF")
+        bridge = Bridge(self.log)
+        S.UI = bridge
+        def body():
+            return {role: maya.review_pick_file(source, role, [], None) for role in ("model", "drafter", "vision")}
+        app = T.SetupApp(bridge, body, "1.0", "./maya.sh", self.log)
+        async with app.run_test(size=(110, 40)) as pilot:
+            async def until(condition):
+                t0 = time.time()
+                while not condition():
+                    self.assertLess(time.time() - t0, 20)
+                    await pilot.pause(0.02)
+
+            for role, path in (("model", main), ("drafter", draft), ("vision", vision)):
+                await until(lambda: app.pending is not None and app.pending[2] == "choose")
+                self.assertIn("Browse files", str(app.query_one("#options").get_option_at_index(0).prompt))
+                await pilot.press("1")
+                await until(lambda: isinstance(app.screen, T.FilePicker))
+                if role == "drafter":
+                    await pilot.press("escape")
+                    await until(lambda: not isinstance(app.screen, T.FilePicker))
+                    self.assertEqual(app.query_one("#text-answer", T.Input).value, "")
+                    await pilot.press("ctrl+o")
+                    await until(lambda: isinstance(app.screen, T.FilePicker))
+                    picker = app.screen
+                    picker.query_one("#directory-list").highlighted = 0  # Parent directory
+                    await pilot.press("enter")
+                    await until(lambda: picker.current == source.parent)
+                    picker.query_one("#directory-search", T.Input).value = "heads"
+                    await until(lambda: picker.items[-1][0] == "heads/")
+                    await pilot.press("enter")
+                    await until(lambda: picker.current == heads)
+                    picker.query_one("#directory-search", T.Input).value = "mtp"
+                elif role == "vision":
+                    app.screen.query_one("#directory-search", T.Input).value = str(path)
+                else:
+                    picker = app.screen
+                    picker.query_one("#directory-search", T.Input).value = "not-a-matching-filename"
+                    await until(lambda: picker.query_one("#directory-list").highlighted is None)
+                    await pilot.press("enter")
+                    self.assertEqual(picker.current, source)
+                    app.screen.query_one("#directory-search", T.Input).value = "Q6_K"
+                if role != "vision":
+                    await until(lambda: app.screen.items[-1][1] == path)
+                await pilot.press("enter")
+                await until(lambda: not isinstance(app.screen, T.FilePicker))
+                self.assertEqual(app.query_one("#text-answer", T.Input).value, str(path))
+                await pilot.press("enter")
+            await until(lambda: app.return_value is not None)
+        self.assertEqual(app.return_value[0], "done")
+        self.assertEqual({role: chosen["path"] for role, chosen in app.return_value[1].items()},
+                         {"model": main, "drafter": draft, "vision": vision})
+        bridge.log.close()
+
+    async def test_file_browser_escape_keeps_the_previous_filename(self):
+        source = Path(self.dir.name)
+        main = source / "model.gguf"
+        main.write_bytes(b"GGUF")
+        current = maya.review_candidate(main, "model", [main])
+        bridge = Bridge(self.log)
+        S.UI = bridge
+        app = T.SetupApp(bridge, lambda: maya.review_pick_file(source, "model", [], current),
+                         "1.0", "./maya.sh", self.log)
+        async with app.run_test(size=(110, 40)) as pilot:
+            async def until(condition):
+                t0 = time.time()
+                while not condition():
+                    self.assertLess(time.time() - t0, 20)
+                    await pilot.pause(0.02)
+            await until(lambda: app.pending is not None)
+            await pilot.press("1")
+            await until(lambda: isinstance(app.screen, T.FilePicker))
+            self.assertEqual(app.screen.items[app.screen.query_one("#directory-list").highlighted][1], main)
+            await pilot.press("escape")
+            await until(lambda: not isinstance(app.screen, T.FilePicker))
+            self.assertEqual(app.query_one("#text-answer", T.Input).value, main.name)
+            await pilot.press("escape")
+            await until(lambda: app.pending is not None and app.pending[2] == "choose")
+            await pilot.press("1")
+            await until(lambda: isinstance(app.screen, T.FilePicker))
+            await pilot.press("enter")
+            await until(lambda: not isinstance(app.screen, T.FilePicker))
+            await pilot.press("enter")
+            await until(lambda: app.return_value is not None)
+        self.assertEqual(app.return_value, ("done", current))
+        bridge.log.close()
+
     async def test_glm_model_files_come_before_gpu_choice(self):
         a = SimpleNamespace(model=None, gguf_dir=None, draft=None, model_dir=None, models_dir=None,
                             backend="cuda", parallel=None, yes=False)

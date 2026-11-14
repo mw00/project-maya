@@ -204,6 +204,58 @@ class ImportTests(unittest.TestCase):
         self.assertEqual(result["path"], chosen)
         self.assertEqual([call.args[1] for call in ask.call_args_list], ["", "extra/missing.gguf"])
 
+    def test_review_can_select_a_file_in_another_directory(self):
+        for role in ("model", "drafter", "vision"):
+            with self.subTest(role=role):
+                folder = self.root / f"outside-{role}"
+                folder.mkdir()
+                first = folder / "weights-00001-of-00002.gguf"
+                second = folder / "weights-00002-of-00002.gguf"
+                first.write_bytes(b"GGUF first")
+                second.write_bytes(b"GGUF second")
+                with patch.object(maya, "choose", return_value=0), \
+                        patch.object(maya.S, "ask_text", return_value=str(second)) as ask:
+                    result = maya.review_pick_file(self.src, role, [], None)
+                self.assertEqual(result["path"], first)
+                self.assertEqual(result["files"], {first, second})
+                self.assertEqual(maya.review_path(first, self.src), str(first))
+                self.assertEqual(ask.call_args.kwargs["file_root"], self.src)
+
+    def test_link_selected_companions_from_other_directories(self):
+        main = self.put("main.gguf", b"GGUF model")
+        other = self.root / "companion-files"
+        other.mkdir()
+        draft = other / maya.DFLASH["file"]
+        draft.write_bytes(b"GGUF drafter")
+        vision = other / "mmproj-test.gguf"
+        vision.write_bytes(b"GGUF vision")
+        label = next(iter(maya.MODELS))
+        cat = [{"label": label, "rel": f"{label}/main.gguf", "size": 999, "sha": ["wrong"]},
+               {"label": label, "rel": f"{label}/vision/{vision.name}", "size": 999, "sha": ["wrong"]}]
+        with patch.object(maya, "import_catalog", return_value=cat), \
+                patch.object(maya, "gguf_head", side_effect=lambda p: ("glm5-next", 1) if p == main else ("", 0)), \
+                patch.object(MI, "sha256_of", side_effect=AssertionError("hashed during link")), \
+                patch.object(maya, "say"), patch.object(maya, "ok"), patch.object(maya, "warn"):
+            self.assertEqual(maya.link_model(str(self.src), self.models, "glm", selected_model=main,
+                                             selected_files={main, draft, vision}), 0)
+        for source, dest in ((main, self.models / label / main.name),
+                             (vision, self.models / label / "vision" / vision.name),
+                             (draft, self.models / "GLM-5.3-Flash-DFlash2" / draft.name)):
+            self.assertTrue(source.is_file())
+            self.assertTrue(dest.is_symlink())
+            self.assertEqual(dest.resolve(), source.resolve())
+
+    def test_import_selected_file_outside_the_source_directory(self):
+        external = self.root / "external.bin"
+        external.write_bytes(BIG)
+        args = argparse.Namespace(models_dir=str(self.models), copy=True, yes=True)
+        with patch.object(maya, "import_catalog", return_value=self.cat), \
+                patch.object(maya, "configs", return_value=[]), patch.object(MI, "same_drive", return_value=False), \
+                patch.object(maya, "say"), patch.object(maya, "ok"), patch.object(maya, "warn"):
+            self.assertEqual(maya.import_model(args, str(self.src), selected_files={external}), 0)
+        self.assertEqual((self.models / "Model-A/a-00001.safetensors").read_bytes(), BIG)
+        self.assertEqual(external.read_bytes(), BIG)
+
     def test_link_rejects_wrong_model_type_and_does_not_replace_existing_file(self):
         first = self.put("model.gguf", b"GGUF header")
         cat = [{"label": "Maya-S-v2-IQ2_XXS", "rel": "Maya-S-v2-IQ2_XXS/model.gguf",

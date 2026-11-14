@@ -245,10 +245,10 @@ class Bridge:
         self._note("answer", f"  {question} {number}) {label}")
         return pick
 
-    def text(self, question, default=""):
+    def text(self, question, default="", *, file_root=None):
         if not self._here():
             return None
-        answer = self._wait("text", question.strip(), default)
+        answer = self._wait("text", question.strip(), default, file_root)
         self._note("answer", f"  {question} {answer}")
         return answer
 

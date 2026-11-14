@@ -111,10 +111,11 @@ def ask(question, choices, default, yes):
         say(f"  please answer one of: {', '.join(choices)}")
 
 
-def ask_text(question, default=""):
+def ask_text(question, default="", *, file_root=None):
     """Read a path or other free text during setup, on its screen or in the terminal."""
     if UI is not None:
-        answer = UI.text(question, default)
+        answer = (UI.text(question, default, file_root=str(file_root)) if file_root is not None else
+                  UI.text(question, default))
         if answer is not None:
             return answer.strip()
     try:
