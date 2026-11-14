@@ -44,6 +44,7 @@
 #include "mm3_os.hpp"
 #include "mm3_tp.hpp"
 #include "mm3_vision.hpp"
+#include "mm3_wscan.hpp"
 
 namespace mm3 {
 namespace x3 = strata::mm3::exl3;
@@ -902,7 +903,12 @@ struct Model::Impl {
     // logits are NaN (no expert compares better), and the host indexed its per-expert tables with it - an access
     // violation with nothing in the log (#672: Windows, an RTX 4070 Ti SUPER + 5070 Ti, the first request).  Such a
     // request now ends with an error that says where.
-    bool routes_ok(const int* top, int n, size_t li, std::string& err) const {
+    // l, d, T given (the router's T rows of input in d.xn, its logits in d.logit): the error also says where the NaN
+    // came from - the router's input and logits, the layer's gate and bias on the GPU against the model's files, and
+    // the first NaN / Inf the files hold in the layers up to this one (a damaged download keeps its size; #672: the
+    // same layer on every GPU and split).  MAYA_MM3_DUMP_ROUTER=<file>: the input and logits rows written there too.
+    bool routes_ok(const int* top, int n, size_t li, std::string& err, const Layer* l = nullptr, Dev* d = nullptr,
+                   int T = 0) const {
         for (int i = 0; i < n; ++i)
             if (top[i] < 0 || top[i] >= g.n_exp) {
                 const cudaError_t e = cudaGetLastError();
@@ -910,9 +916,94 @@ struct Model::Impl {
                       " of " + std::to_string(g.n_exp) + " (row " + std::to_string(i / std::max(1, g.k_exp)) +
                       ") - the layer's input holds NaN/Inf or its routing did not run (last CUDA error: " +
                       cudaGetErrorString(e) + ")";
+                if (l != nullptr && d != nullptr && T > 0) err += route_diag(*l, *d, T, li);
                 return false;
             }
         return true;
+    }
+    std::string route_diag(const Layer& l, Dev& d, int T, size_t li) const {
+        namespace ws = ::mm3::wscan;
+        const auto num = [](double v) {
+            char b[32];
+            std::snprintf(b, sizeof b, "%.4g", v);
+            return std::string(b);
+        };
+        const auto stats = [&](const char* what, const ws::Stats& s) {
+            std::string r = std::string(what) + ": " + std::to_string(s.bad()) + " of " + std::to_string(s.n) +
+                            " not finite (" + std::to_string(s.nan) + " NaN, " + std::to_string(s.inf) + " Inf)";
+            if (s.bad() < s.n) r += ", the finite ones " + num(s.lo) + " .. " + num(s.hi);
+            return r;
+        };
+        std::string r;
+        int cur = 0;
+        (void) cudaGetDevice(&cur);
+        (void) cudaSetDevice(d.id);
+        (void) cudaDeviceSynchronize();   // (the router's side stream too)
+        (void) cudaSetDevice(cur);
+        std::vector<float> xn((size_t) T * g.dim), lg((size_t) T * g.n_exp), gw((size_t) g.n_exp * g.dim),
+            bw((size_t) g.n_exp);
+        const bool got = cudaMemcpy(xn.data(), d.xn, xn.size() * 4, cudaMemcpyDeviceToHost) == cudaSuccess &&
+                         cudaMemcpy(lg.data(), d.logit, lg.size() * 4, cudaMemcpyDeviceToHost) == cudaSuccess &&
+                         l.gate != nullptr && l.bias != nullptr &&
+                         cudaMemcpy(gw.data(), l.gate, gw.size() * 4, cudaMemcpyDeviceToHost) == cudaSuccess &&
+                         cudaMemcpy(bw.data(), l.bias, bw.size() * 4, cudaMemcpyDeviceToHost) == cudaSuccess;
+        if (!got) return std::string(" [no read-back: ") + cudaGetErrorString(cudaGetLastError()) + "]";
+        const ws::Stats sx = ws::finite_stats(xn.data(), xn.size()), sl = ws::finite_stats(lg.data(), lg.size());
+        r += " [" + stats("router input", sx);
+        if (sx.first_bad >= 0) r += ", first in row " + std::to_string(sx.first_bad / g.dim);
+        r += "; " + stats("logits", sl);
+        // the gate and bias on the GPU against the model's files (F32 as stored: the same bytes, or the VRAM's copy
+        // changed)
+        const std::string M = P + "layers." + std::to_string(li) + ".block_sparse_moe.";
+        for (int w = 0; w < 2; ++w) {
+            const std::vector<float>& v = w == 0 ? gw : bw;
+            const Tensor* t = pk.get(M + (w == 0 ? "gate.weight" : "e_score_correction_bias"));
+            r += std::string("; ") + (w == 0 ? "gate" : "bias") + ": " +
+                 std::to_string(ws::finite_stats(v.data(), v.size()).bad()) + " not finite on the GPU";
+            if (t != nullptr && t->dtype == "F32" && t->bytes == v.size() * 4)
+                r += std::memcmp(pk.data(*t), v.data(), t->bytes) == 0 ? ", the same bytes as the file"
+                                                                        : ", NOT the file's bytes";
+        }
+        r += "]";
+        // the model's files: the first NaN / Inf in the embedding and layers 0..li as stored (read once a run - its
+        // time is the error's, a few seconds for the experts)
+        static std::atomic<bool> scanned{false};
+        if (!scanned.exchange(true)) {
+            std::fprintf(stderr, "maya-mm3: layer %zu's router: reading the model's files for NaN/Inf (layers 0-%zu) ...\n",
+                         li, li);
+            std::string hit;
+            int unread = 0;
+            for (const auto& [name, t] : pk.t) {
+                if (name.rfind(P, 0) != 0) continue;
+                bool want = name == P + "embed_tokens.weight";
+                for (size_t j = 0; j <= li && !want; ++j)
+                    want = name.rfind(P + "layers." + std::to_string(j) + ".", 0) == 0;
+                if (!want) continue;
+                const ws::Hit h = ws::scan_blocks(t.dtype, pk.data(t), t.bytes);
+                if (!h.known) ++unread;
+                if (h.found) {
+                    hit = name + " (" + t.dtype + ", its " + h.what + " at byte " + std::to_string(h.at) + ", file " +
+                          pk.files[(size_t) t.file] + " offset " + std::to_string(t.off + h.at) + ")";
+                    break;
+                }
+            }
+            r += hit.empty() ? " [the model's files: no NaN/Inf in layers 0-" + std::to_string(li) + "'s weights" +
+                                   (unread ? " (" + std::to_string(unread) + " tensors of types not read)" : "") +
+                                   " - it arose on the GPU]"
+                             : " [the model's files hold NaN/Inf: " + hit +
+                                   " - a damaged download; check the shards' sha256 against the published ones]";
+        }
+        if (const char* dp = ::mm3::env("MM3_DUMP_ROUTER")) {   // header: layer, T, dim, n_exp (int32); then xn, logits
+            if (std::FILE* f = std::fopen(dp, "wb")) {
+                const int hdr[4] = {(int) li, T, g.dim, g.n_exp};
+                std::fwrite(hdr, 4, 4, f);
+                std::fwrite(xn.data(), 4, xn.size(), f);
+                std::fwrite(lg.data(), 4, lg.size(), f);
+                std::fclose(f);
+                r += " [router input and logits written to " + std::string(dp) + "]";
+            }
+        }
+        return r;
     }
     // a layer's expert blob (the plan's estimate before expert_layout reads it): EXL3's three trellises with their
     // scales, a GGUF's three matrices aligned
@@ -2044,7 +2135,7 @@ struct Model::Impl {
         CK(cudaStreamSynchronize(d.s));
         st.t_sync += now() - ts;
         const size_t li = (size_t) (&l - L.data());
-        if (!routes_ok(rtop, T * g.k_exp, li, err)) return false;
+        if (!routes_ok(rtop, T * g.k_exp, li, err, &l, &d, T)) return false;
         // the plan: each token's experts (its 8 slots, k used), their pointers (0: the CPU lane's), the groups
         unsigned long long* pp = (unsigned long long*) d.win_plan_h;
         float* pw = (float*) (pp + (size_t) kWin * 8);
@@ -2432,7 +2523,7 @@ struct Model::Impl {
         std::memcpy(top, d.plan_h, (size_t) g.k_exp * 4);
         std::memcpy(w, d.plan_h + 4, (size_t) g.k_exp * 4);
         const size_t li = (size_t) (&l - L.data());
-        if (!routes_ok(top, g.k_exp, li, err)) return false;
+        if (!routes_ok(top, g.k_exp, li, err, &l, &d, 1)) return false;
         for (int i = 0; i < g.k_exp; ++i) ++prof[li * g.n_exp + top[i]];
         st.profiled += g.k_exp;
         std::vector<char> busy((size_t) d.n_slots, 0);
@@ -2689,7 +2780,7 @@ struct Model::Impl {
         CK(cudaMemcpyAsync(d.top_h, d.top, (size_t) T * g.k_exp * 4, cudaMemcpyDeviceToHost, d.s));
         CK(cudaStreamSynchronize(d.s));
         const std::vector<int> top(d.top_h, d.top_h + (size_t) T * g.k_exp);
-        if (!routes_ok(top.data(), (int) top.size(), (size_t) li, err)) return false;
+        if (!routes_ok(top.data(), (int) top.size(), (size_t) li, err, &l, &d, T)) return false;
         for (int e : top) ++prof[(size_t) li * g.n_exp + e];
         st.profiled += (long) top.size();
         pmark(d, kPSync);
