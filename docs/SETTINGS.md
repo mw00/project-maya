@@ -1241,6 +1241,26 @@ log says `ds4: CPU lane iq2_xs rows: AVX-512` when they apply.
 | --- | --- | --- |
 | `DS4_IQ512` | by CPU (above) | `1`: these rows for every call of the three types wherever the CPU runs them (tests: `ds4_iq512_rows_test` checks them against ggml-cpu); `0`: never |
 
+## DeepSeek: AVX-512 rows for IQ1_S experts
+
+Maya-XS's experts are IQ1_S. On a CPU with AVX-512 (F, BW, VL, DQ) and BMI2 the CPU lane can take rows of its own for
+them: ggml-cpu's AVX2 dot in 512-bit lanes, each 64 values' grid decoded once for all the call's tokens (up to 8 a
+pass), the products by `vpdpbusd` where the CPU has AVX-512 VNNI (Ice Lake, Rocket Lake, Zen 4 and later). They serve
+every call, one token too - a decoded token's experts, where the lane used ggml-cpu's dot before. They give ggml-cpu's
+numbers bit for bit: the same integer sums, then ggml's float steps in ggml's order, in the form the start check finds
+equal to ggml-cpu's dot (now also on sums in the subnormal range, where an FMA of the last step shows; this also fixes
+the form the AVX2 IQ1_S rows pick). If they ever differ, the log says so and the rows before are kept. The log says
+`ds4: CPU lane iq1_s rows: AVX-512 (VNNI), every call (DS4_IQ1S512)` when they apply.
+
+An i7-11700KF (Rocket Lake, DDR4-3200 x 2), GB/s of IQ1_S weights for 1 / 2 / 4 / 8 tokens a call against the rows the
+lane takes without them (`ds4_iq1s512_rows_test --bench [--threads 8]`, medians): one thread 3.15 / 2.09 / 1.45 / 0.73
+-> 4.34 / 3.59 / 2.15 / 1.32, eight threads 23.3 / 14.8 / 9.8 / 4.9 -> 26.1 / 21.5 / 12.9 / 7.0. Not yet measured on
+a whole decode; off by default until it is.
+
+| Setting | Default | |
+| --- | --- | --- |
+| `DS4_IQ1S512` | off | `1`: these rows for every IQ1_S call wherever the CPU runs them (tests: `ds4_iq1s512_rows_test` checks them against ggml-cpu); `2`: the same without VNNI (`vpmaddubsw`, the same bits - for comparing); unset / `0`: the rows before. Independent of `DS4_IQ512` and of the one-GPU path's switch for the AVX2 IQ1_S rows |
+
 ## DeepSeek: a GEMV call's int8 inputs rounded in one launch
 
 A GGUF pack's Q8_0 (and low-bit dense) GEMVs round their activations to int8 first. This used to take one small launch

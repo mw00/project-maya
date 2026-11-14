@@ -1,4 +1,4 @@
-// src/ds4/ds4_iq512_kern.inc - the CPU lane's exact AVX-512 rows that need no VBMI: IQ2_XS, IQ3_XXS and IQ1_M.
+// src/ds4/ds4_iq512_kern.inc - the CPU lane's exact AVX-512 rows that need no VBMI: IQ2_XS, IQ3_XXS, IQ1_M and IQ1_S.
 // ds4_iq_cpu.cpp includes it once a tier, inside its unnamed namespace (after hsum_ggml, tab4, tab8, fold, scales4),
 // with
 //   IQX_NS    the tier's namespace
@@ -6,9 +6,11 @@
 //             function here, so the file is built for the baseline and each tier runs only where iq_isa() says it can
 //   IQX_POP   (the second tier) the sign bytes' parity by VPOPCNTDQ; without it, by a 16-entry table in a register
 //             (ggml's own AVX2 trick) - the same bytes, so either tier gives the same bits
-// and gets IQX_NS::rows<TY, NT>(...) for TY 17 (IQ2_XS) and 18 (IQ3_XXS), and in the first tier rows_iq1m<NT>(...)
-// (IQ1_M has no sign indices; its grid indices and delta signs come from BMI2's pdep / pext, as ggml's).  The
-// macros are undefined at the end.
+//   IQX_VNNI  (the third tier, AVX-512 VNNI) IQ1_S's products by vpdpbusd; without it, vpmaddubsw / vpmaddwd - the
+//             same integers, so either tier gives the same bits
+// and gets IQX_NS::rows<TY, NT>(...) for TY 17 (IQ2_XS) and 18 (IQ3_XXS), and in the tiers without IQX_POP
+// rows_iq1m<NT>(...) (IQ1_M has no sign indices; its grid indices and delta signs come from BMI2's pdep / pext, as
+// ggml's) and rows_iq1s<NT>(...) (IQ1_S, NT up to 8).  The macros are undefined at the end.
 //
 // A 64-value chunk a step, as the GLM lane's AVX-512 rows (src/kernels/cpu/iq_avx512.cpp): its grid bytes (table
 // entries put together in two 256-bit halves by tab4 / tab8), one 64-bit sign mask, the scales as int16 lanes - decoded
@@ -200,8 +202,101 @@ IQX_ATTR void rows_iq1m(const uint8_t* w, size_t rb, int nb, const block_q8_K* c
 }
 #endif
 
+#if !defined(IQX_POP)
+// IQ1_S rows [r0, r1) of NT tokens (NT <= 8): ggml_vec_dot_iq1_s_q8_K's AVX2 branch (the grid's sum in 8 int32 lanes,
+// the deltas' in one int) in 512-bit lanes, a 64-value step's grid decoded once for all the call's tokens.  The grid
+// indices of a step by two pdep each four (ggml's own; on Rocket Lake faster than the indices in a vector stored and
+// read back, and far faster than vpgatherqq under the GDS microcode), the grid values (-1, 0, 1) as two masks; the
+// chunk's scale 2 s + 1 goes into the unsigned operand (|g| (2 s + 1) <= 15, so no pair sum saturates: the same
+// integers as ggml's vpmaddwd by the scale), the grid's sign onto the activations by a masked subtract (ggml's vpsignb:
+// -128 stays -128 in both).  With VNNI (IQX_VNNI) vpdpbusd takes the four products of a lane at once; without,
+// vpmaddubsw into 16-bit lanes (a block's 4 steps at most 4 x 3840 a lane, exact) and one vpmaddwd by 1 a block.  The
+// lanes fold to ggml's 8 (lane k + lane k + 8); the delta sum is ggml's from the activations' bsums (one vpmaddwd by
+// the signed scales, summed).  The float steps are ggml's in ggml's order, g_iq1_fma's form (own()'s check): every
+// result ggml-cpu's dot to the bit.
+template <int NT>
+IQX_ATTR void rows_iq1s(const uint8_t* w, size_t rb, int nb, const block_q8_K* const* y, float* const* out, int r0,
+                        int r1) {
+    const bool fa = (g_iq1_fma & 1) != 0, ff = (g_iq1_fma & 2) != 0;
+    const __m512i zero = _mm512_setzero_si512();
+#if !defined(IQX_VNNI)
+    const __m512i ones16 = _mm512_set1_epi16(1);
+#endif
+    // step j's scale bytes out of the block's 8 (in every 128-bit lane): bytes 0-31 chunk 2 j's, 32-63 chunk 2 j + 1's
+    __m512i ssel[4];
+    for (int j = 0; j < 4; ++j)
+        ssel[j] = _mm512_inserti64x4(_mm512_castsi256_si512(_mm256_set1_epi8((char) (2 * j))), _mm256_set1_epi8((char) (2 * j + 1)), 1);
+    for (int r = r0; r < r1; ++r) {
+        const block_iq1_s* x = (const block_iq1_s*) (w + (size_t) r * rb);
+        __m256 accf[NT];
+        float acc1[NT];
+        for (int t = 0; t < NT; ++t) {
+            accf[t] = _mm256_setzero_ps();
+            acc1[t] = 0.0f;
+        }
+        for (int i = 0; i < nb; ++i) {
+            _mm_prefetch((const char*) (x + i) + 2048, _MM_HINT_T0);
+            const uint8_t* qs = x[i].qs;
+            const uint16_t* qh = x[i].qh;
+            // the 8 chunks' scales 2 s + 1 (words), as bytes in every 128-bit lane; signed by the delta bit (bit 15) and
+            // each twice (words 2 c, 2 c + 1: chunk c's two bsums) for the delta sum
+            const __m128i h = _mm_loadu_si128((const __m128i*) qh);
+            __m128i ls = _mm_and_si128(_mm_srli_epi16(h, 12), _mm_set1_epi16(7));
+            ls = _mm_add_epi16(_mm_add_epi16(ls, ls), _mm_set1_epi16(1));
+            const __m512i lsb = _mm512_broadcast_i32x4(_mm_packus_epi16(ls, ls));
+            const __m256i sl = _mm256_cvtepu16_epi32(_mm_mask_sub_epi16(ls, _mm_movepi16_mask(h), _mm_setzero_si128(), ls));
+            const __m256i slw = _mm256_or_si256(sl, _mm256_slli_epi32(sl, 16));
+            __m512i acc[NT];
+            for (int t = 0; t < NT; ++t) acc[t] = _mm512_setzero_si512();
+            for (int j = 0; j < 4; ++j) {
+                const uint64_t p1 = _pdep_u64(u32(qs + 8 * j), 0x00ff00ff00ff00ffull) |
+                                    _pdep_u64(qh[2 * j], 0x0700070007000700ull);
+                const uint64_t p2 = _pdep_u64(u32(qs + 8 * j + 4), 0x00ff00ff00ff00ffull) |
+                                    _pdep_u64(qh[2 * j + 1], 0x0700070007000700ull);
+                const __m512i g = _mm512_inserti64x4(
+                    _mm512_castsi256_si512(tab4(iq1s_grid, (unsigned) (p1 & 0xffff), (unsigned) ((p1 >> 16) & 0xffff),
+                                                (unsigned) ((p1 >> 32) & 0xffff), (unsigned) (p1 >> 48))),
+                    tab4(iq1s_grid, (unsigned) (p2 & 0xffff), (unsigned) ((p2 >> 16) & 0xffff),
+                         (unsigned) ((p2 >> 32) & 0xffff), (unsigned) (p2 >> 48)),
+                    1);
+                const __mmask64 gn = _mm512_movepi8_mask(g);
+                const __m512i a = _mm512_maskz_mov_epi8(_mm512_test_epi8_mask(g, g), _mm512_shuffle_epi8(lsb, ssel[j]));
+                for (int t = 0; t < NT; ++t) {
+                    const __m512i yv = _mm512_loadu_si512((const void*) (y[t][i].qs + 64 * j));
+                    const __m512i ys = _mm512_mask_sub_epi8(yv, gn, zero, yv);
+#if defined(IQX_VNNI)
+                    acc[t] = _mm512_dpbusd_epi32(acc[t], a, ys);
+#else
+                    acc[t] = _mm512_add_epi16(acc[t], _mm512_maddubs_epi16(a, ys));
+#endif
+                }
+            }
+            const float dx = h2f(x[i].d);
+            for (int t = 0; t < NT; ++t) {
+#if defined(IQX_VNNI)
+                const __m256i s8 = fold(acc[t]);
+#else
+                const __m256i s8 = fold(_mm512_madd_epi16(acc[t], ones16));
+#endif
+                const __m256i dv = _mm256_madd_epi16(_mm256_loadu_si256((const __m256i*) y[t][i].bsums), slw);
+                __m128i s4 = _mm_add_epi32(_mm256_castsi256_si128(dv), _mm256_extracti128_si256(dv, 1));
+                s4 = _mm_add_epi32(s4, _mm_unpackhi_epi64(s4, s4));
+                s4 = _mm_add_epi32(s4, _mm_shuffle_epi32(s4, 1));
+                const float sumi1 = (float) _mm_cvtsi128_si32(s4);
+                const float d = y[t][i].d * dx;
+                accf[t] = _mm256_fmadd_ps(_mm256_set1_ps(d), _mm256_cvtepi32_ps(s8), accf[t]);
+                acc1[t] = fa ? std::fma(d, sumi1, acc1[t]) : acc1[t] + mul_exact(d, sumi1);
+            }
+        }
+        for (int t = 0; t < NT; ++t)
+            out[t][r - r0] = ff ? std::fma(IQ1S_DELTA, acc1[t], hsum_ggml(accf[t])) : hsum_ggml(accf[t]) + mul_exact(IQ1S_DELTA, acc1[t]);
+    }
+}
+#endif
+
 }  // namespace IQX_NS
 
 #undef IQX_NS
 #undef IQX_ATTR
 #undef IQX_POP
+#undef IQX_VNNI
