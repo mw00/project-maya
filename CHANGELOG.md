@@ -4,6 +4,31 @@ Every release is on GitHub (Releases) with these notes; every published change m
 page's Settings › About and updates (About > Update before the redesign; from v1.0.18), or `git pull`, then `./setup.sh` (Windows: `START-MAYA.bat`) - it recompiles
 only what changed and starts; the model is not downloaded again.
 
+## v1.1.64 - 2026-11-15
+
+EXL3 models now pair an AMD Strix Halo or Gorgon Halo APU with an NVIDIA GPU too, GLM-5.3-Flash EXL3 prefills up to 2.5 times faster on the pair, and DeepSeek on several GPUs decodes as fast as before v1.1.58 again.
+
+- **New: EXL3 on an AMD Halo APU + NVIDIA GPU (Linux, experimental):** GLM-5.3-Flash's EXL3 quants now run on both GPUs at once, like the GGUF quants since v1.1.62. Maya tunes itself: the first start measures the APU alone and the pair, and keeps the pair only where it is faster. `--mixed-gpus off` turns it off.
+
+  A/B on the same PC (tokens per second; A = the APU alone, B = the APU and the NVIDIA GPU together; GLM-5.3-Flash EXL3 3.05 bpw):
+
+  | | A | B | Change |
+  |---|---|---|---|
+  | Decode, question 1 | 21.3 | 24.7 | +16% |
+  | Decode, question 2 | 20.7 | 21.7 | +5% |
+  | Prefill, 512 tokens | 40 | 91 | +128% |
+  | Prefill, 1K tokens | 62 | 116 | +87% |
+  | Prefill, 2K tokens | 92 | 146 | +59% |
+  | Prefill, 8K tokens | 134 | 333 | +149% |
+
+  A short chat message now gets its first token in about 1 s instead of about 3 s on the pair.
+
+- **Steadier AMD + NVIDIA pairing:** the APU side now shares the model's memory with the NVIDIA card in 1 GB pieces. The AMD driver's pauses of the APU side (seconds to minutes when Linux moved memory) became much rarer. GLM-5.3 (744B) still stays on the APU alone unless you start it with `--mixed-gpus on`.
+- **Where the model lives on the pair:** the experts the NVIDIA card does not hold stay in ordinary system RAM, shared by both GPUs, not in the APU's BIOS VRAM carve-out. There is one copy of the model, only activations cross between the GPUs, and no large BIOS VRAM reserve is needed (now in docs/SETTINGS.md).
+- **Fix: DeepSeek decode on several GPUs (#956, @speja969 and @mgabor3141):** since v1.1.58, DeepSeek on a layer split or `--tp` could keep its PCIe expert lane on when it gained nothing, which cost about 4-5% decode on the reporters' PCs. On several GPUs the lane now turns off again unless it measures faster, as in v1.1.57; one GPU is unchanged. `DS4_STREAM_TIE=keep|off` forces either rule. The first start after the update measures again.
+- **Qwen GGUFs with mixed expert formats:** Maya now runs Qwen GGUF quants whose expert gate and up weights use different formats in a layer (for example unsloth's UD-IQ1_S of Qwen3.8-Flash-Next). Every other quant packs and answers exactly as before.
+- **MiniMax: damaged model files are caught (#672, @tanutanu56):** the setup now checks MiniMax GGUF files already in your model folder by their checksum, once, and says which file to download again if one does not match. Before, it checked their size only. If the router still meets broken numbers, the error now says where they come from instead of naming an impossible expert.
+
 ## v1.1.63 - 2026-11-14
 
 Fixes for v1.1.62: the DeepSeek engine builds on Windows again, and GLM on an AMD APU paired with an NVIDIA GPU no longer restarts its engine before every request.
