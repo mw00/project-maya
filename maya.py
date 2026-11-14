@@ -116,6 +116,7 @@ HIP_ARCHS_WAVE64 = ("gfx908", "gfx906", "gfx942", "gfx950")  # CDNA 1 (MI100), V
                                                    # logical-32-lane half-wavefront warp mapping; experimental
 PY_PACKAGES = list(S.PY_PACKAGES)                  # (pillow: pictures in formats other than JPEG/PNG/BMP/GIF)
 CONTEXTS = [8192, 32768, 65536, 131072]
+GLM_FLASH_CONTEXTS = CONTEXTS + [262144, 524288]
 DEFAULT_CONTEXT = 32768
 # KV streaming, on in every config (--kv-streaming on): the attention layers' latent cache lives in RAM and 32768
 # positions of each layer in VRAM (--kv-resident N, beside it, sets another window) - from a context above that (a
@@ -6010,7 +6011,7 @@ def set_up(a, prev: dict) -> Path | None:
             warn(f"a {context_label(ctx)} context's cache pushes experts to the SSD on this PC; "
                  f"{context_label(rec)} keeps the whole model in memory")
     else:
-        ctx = choose_context(a, prev_ctx, recommended=recommended_context(choice, pc))
+        ctx = choose_context(a, prev_ctx, GLM_FLASH_CONTEXTS, recommended=recommended_context(choice, pc))
     ok(f"context: {ctx} tokens")
     draft = ("dflash2" if linked.get("drafter") else "mtp") if linked is not None else choose_draft(a, pc, inst)
     if linked is not None and linked.get("drafter"):

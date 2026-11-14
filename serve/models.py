@@ -32,6 +32,7 @@ from serve import glm_dsa_product as G53  # noqa: E402  GLM-5.3 (744B, glm-dsa):
 SWITCH_FILE = ".maya-switch.json"           # the server's note to maya.py: start this config next (a switch)
 DELETE_FILE = ".maya-delete.json"           # ... and to the next server: delete this config (it was the one running)
 CONTEXTS = [8192, 32768, 65536, 131072]       # the setup's choices (a config's own size is offered too)
+GLM_FLASH_CONTEXTS = CONTEXTS + [262144, 524288]   # GLM-5.3-Flash (maya.py's GLM_FLASH_CONTEXTS)
 DS4_CONTEXTS = [32768, 65536, 131072, 262144, 524288, 1048576]   # ... for DeepSeek (maya.py's DS4_CONTEXTS)
 MM3_CONTEXTS = DS4_CONTEXTS                                       # ... and MiniMax (maya.py's MM3_CONTEXTS)
 QWEN_CONTEXTS = [32768, 65536, 131072, 262144]                    # ... and CYBER-FROST (maya.py's QWEN_CONTEXTS)
@@ -762,7 +763,7 @@ def describe(path: Path, running: str | None) -> dict:
             "size": folder_size(pack), "ok": why is None, "missing": why,
             "settings": cur, "setup": setup, "choices": choices(cfg), "command": command(cfg),
             "contexts": {"deepseek": DS4_CONTEXTS, "minimax": MM3_CONTEXTS, "qwen": QWEN_CONTEXTS}.get(family(cfg),
-                                                                                                       CONTEXTS),
+                                                                         CONTEXTS if own else GLM_FLASH_CONTEXTS),
             # (the Engine settings' Context size slider: the same range as Settings > Model's for this model)
             "context_range": context_range(trained_context_of(cfg), cur.get("context"),
                                            {"deepseek": "ds4", "minimax": "mm3"}.get(family(cfg), ""))}
@@ -798,7 +799,7 @@ def listing(root: Path, running: str | None) -> dict:
             if i not in seen:
                 seen.add(i)
                 gpus.append({"index": i, "name": None, "vram_gb": None})
-    return {"models": models, "gpus": sorted(gpus, key=lambda g: g["index"]), "contexts": CONTEXTS}
+    return {"models": models, "gpus": sorted(gpus, key=lambda g: g["index"]), "contexts": GLM_FLASH_CONTEXTS}
 
 
 def own_defaults(path: Path) -> bool:

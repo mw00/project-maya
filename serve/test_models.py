@@ -331,8 +331,8 @@ class Settings(unittest.TestCase):
         mm = out["models"][1]
         self.assertEqual((mm["running"], mm["quant"], mm["family"], mm["size"]), (True, "Maya-M", "glm", 1000))
         self.assertEqual(out["models"][0]["quant"], "UD-Q8_K_XL")
-        # each model's context choices are its setup's: DeepSeek's reach 1M, GLM's 128K (its own size is offered too)
-        self.assertEqual((out["models"][0]["contexts"], mm["contexts"]), (M.DS4_CONTEXTS, M.CONTEXTS))
+        # Each model's context choices are its setup's: DeepSeek reaches 1M, GLM-5.3-Flash reaches 512K.
+        self.assertEqual((out["models"][0]["contexts"], mm["contexts"]), (M.DS4_CONTEXTS, M.GLM_FLASH_CONTEXTS))
         self.assertEqual([x["index"] for x in out["gpus"]], [0, 1])               # (GPU 1: named by a config only)
 
 

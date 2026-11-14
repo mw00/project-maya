@@ -200,9 +200,9 @@ class Setup(unittest.TestCase):
                                                                           "--parallel", "8"]}))
         p.unlink()
         self.assertEqual(self.offered(g53, one)["contexts"], maya.CONTEXTS)
-        # GLM-5.3-Flash's question as before: every context, its own recommendation
+        # GLM-5.3-Flash offers the longer contexts independently of GLM-5.3's cache limits.
         flash = self.offered(("download", "Maya-M"), one)
-        self.assertEqual(flash, {"contexts": maya.CONTEXTS,
+        self.assertEqual(flash, {"contexts": [8192, 32768, 65536, 131072, 262144, 524288],
                                  "recommended": maya.recommended_context(("download", "Maya-M"), one)})
 
     def test_apu_context_keeps_the_whole_model_in_memory(self):
