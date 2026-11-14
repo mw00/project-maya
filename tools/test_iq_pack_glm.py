@@ -92,6 +92,7 @@ class Glm5NextBf16List(unittest.TestCase):
         self.assertTrue(iq_pack.needs_bf16("blk.0.ssm_alpha.weight", "IQ3_XXS"))
         self.assertTrue(iq_pack.needs_bf16("blk.0.indexer.q_proj.weight", "IQ3_XXS"))
         self.assertTrue(iq_pack.needs_bf16("blk.1.ple_key.weight", "Q4_K"))
+        self.assertFalse(iq_pack.needs_bf16("blk.1.ple_key.weight", "Q8_0"))
         self.assertFalse(iq_pack.needs_bf16("blk.0.hc_attn_fn.weight", "IQ3_XXS"))
         self.assertFalse(iq_pack.needs_bf16("blk.0.ssm_dt.bias", "IQ3_XXS"))
 

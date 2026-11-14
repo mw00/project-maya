@@ -110,8 +110,9 @@ def needs_bf16(name: str, type_name: str, arch: str = "qwen4exp") -> bool:
         return True
     if not name.startswith("blk."):
         return False
-    # The existing native PLE key supports Q2_0 only. Other key encodings use the BF16 path.
-    return name.endswith(BF16_PROJECTIONS) or (name == "blk.1.ple_key.weight" and type_name != "Q2_0")
+    # Q2_0 and Q8_0 PLE keys run from the GGUF. Other key encodings use the BF16 path.
+    return name.endswith(BF16_PROJECTIONS) or (name == "blk.1.ple_key.weight" and
+                                               type_name not in ("Q2_0", "Q8_0"))
 
 
 def index_shape(shape) -> tuple[int, int]:
@@ -237,6 +238,14 @@ def index_standalone(src, out, model: Model, compat_bf16: bool = False, arch: st
                     converted.append({"name": t.name, "source_type": t.type_name, "bytes": len(raw)})
                 else:
                     kind = {"BF16": "4", "F16": "5", "F32": "2"}[t.type_name]
+                if arch == "qwen4exp" and t.name == "blk.1.ple_conv1d.weight" and t.type_name == "F32":
+                    # The PLE convolution reads F16. Kind 3 keeps the GGUF's F32 bytes in dense.bin and makes the
+                    # weight loader round them to F16, as the working Strata pack does.
+                    values = np.frombuffer(raw, dtype="<f4")
+                    if not np.isfinite(values).all() or not np.isfinite(values.astype("<f2")).all():
+                        print(f"{t.name}: F32 values cannot be converted to finite F16 weights")
+                        return 1
+                    kind = "3"
                 if not convert and arch == "qwen4exp" and t.type_name == "F32" and t.name.endswith(ROUTERS):
                     u = np.frombuffer(raw, dtype=np.uint32)
                     if np.count_nonzero(u & 0xFFFF):
@@ -259,7 +268,8 @@ def index_standalone(src, out, model: Model, compat_bf16: bool = False, arch: st
                     kind = "5"
                     converted.append({"name": t.name, "source_type": "BF16", "bytes": len(raw),
                                       "to": "F16", "rounded_subnormals": int(off.sum())})
-                rows.append([t.name, "0", kind, str(at), str(len(raw)), "0", str(len(raw)), str(ne0), str(ne1),
+                dst_bytes = len(raw) // 2 if kind == "3" else len(raw)
+                rows.append([t.name, "0", kind, str(at), str(len(raw)), "0", str(dst_bytes), str(ne0), str(ne1),
                              "0", "0", "1"] + ["0"] * 7)
                 fo.write(raw)
                 pad = (-len(raw)) % ALIGN
