@@ -2020,6 +2020,23 @@ def engine_args(cfg: dict) -> list[str]:
     args = list(cfg["args"])
     if len(gpu_list(cfg)) > 1 and "--layer-split" not in args:
         args += ["--layer-split", str(cfg.get("layer_split") or "auto")]
+    # --parallel N: each extra conversation's rings and KV come out of the experts' room, and the prompt path
+    # needs its own room there.  On a card the model already fills (Maya-XS leaves ~130 MB) the third
+    # conversation leaves nothing and the first prompt fails with "the prompt path's room ... out of memory"
+    # (measured on a 20 GB RTX 4000 Ada: 2 conversations 24.5 tok/s aggregate, 3 unusable).
+    # MAYA_PAR_MAX caps the conversations asked of the engine before it starts; the requests beyond it wait in
+    # this server's own queue instead of starving the others.  MAYA_PAR_MAX=2 on that card, for example.
+    # (the config's own env keys are renamed to their older STRATA_ names by env_in on load: both are read)
+    _env = cfg.get("env") or {}
+    cap = (_env.get("MAYA_PAR_MAX") or _env.get(maya_names.read_as("MAYA_PAR_MAX")) or
+           os.environ.get("MAYA_PAR_MAX"))
+    if cap and str(cap).strip().isdigit():
+        cap = int(str(cap).strip())
+        for i, a in enumerate(args):
+            if a == "--parallel" and i + 1 < len(args) and args[i + 1].isdigit() and int(args[i + 1]) > cap:
+                print("[maya] --parallel %s capped to %d (MAYA_PAR_MAX): the requests beyond it wait in the "
+                      "queue instead of starving the others" % (args[i + 1], cap), flush=True)
+                args[i + 1] = str(cap)
     return args
 
 
