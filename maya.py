@@ -2012,6 +2012,8 @@ def choose_model(a, models: Path, inst: dict, family: str = "glm") -> tuple:
                          f"{m['about']}; {g53_memory_note(quant=q)}"))
         pick = choose_with_add(a, f"Which {G53.SHOWN}?", ["The model to set up:"], rows,
                                g53.index(default), a.yes, models, "glm53")
+        if isinstance(pick, dict):
+            return "linked", pick
         return "download", g53[pick]
     opts = [q for q in MODELS if (q not in MODELS_BY_HAND or q == inst.get("quant"))
             and not (metal and is_exl3(q))]   # (a chosen-by-hand download: only where it is installed; Metal: GGUFs)
@@ -2143,7 +2145,7 @@ def g53_apu_context(pc: dict, plan: dict, quant: str | None, contexts) -> tuple:
                  "from the SSD")
 
 
-def g53_cache_plan(a, pc: dict, choice: tuple) -> dict:
+def g53_cache_plan(a, pc: dict, choice: tuple, *, linked_files: dict | None = None) -> dict:
     """g53_contexts' "parallel", "kv_bytes", "reserve_mib" and "dense_gb" as the GLM-5.3 config this setup writes will
     have them (write_config): --parallel given now, else the one its config before has (keep_args keeps it - the Models
     page sets it there), else 1; the cache's formats an --env given now asks for (MAYA_GLM_KV_INT8=0: an FP16 latent,
@@ -2151,7 +2153,7 @@ def g53_cache_plan(a, pc: dict, choice: tuple) -> dict:
     environment in the engine), else an --env MAYA_GLM_RESERVE_MB, else the HIP setup's (hip_reserve_mib), else
     CUDA's default; the dense weights: the quant's (g53_figures)."""
     quant = choice[1] if choice[0] == "download" else quant_of(Path(choice[1]))
-    old = read_json(glm_config_path(pc, quant)).get("args") or []
+    old = read_json(glm_setup_config_path(pc, quant, linked_files)).get("args") or []
     env = parse_env(getattr(a, "env", None) or [])
 
     def num(v):
@@ -3114,8 +3116,8 @@ def review_downloaded_model(a, src: Path, models: Path, family: str) -> int | di
             if model is None:
                 warn("select a model file before linking")
                 continue
-            if family == "glm" and model["anchor"].suffix.lower() == ".gguf":
-                local = link_glm_local(models, chosen)
+            if family in ("glm", "glm53") and model["anchor"].suffix.lower() == ".gguf":
+                local = link_glm_local(models, chosen, family=family)
                 if local is not None:
                     return local
                 continue
@@ -3152,11 +3154,11 @@ def glm_local_folder(models: Path, first: Path) -> Path:
         number += 1
 
 
-def link_glm_local(models: Path, chosen: dict) -> dict | None:
-    """Link any GLM-5.3-Flash GGUF quant and its selected companions by model type only."""
+def link_glm_local(models: Path, chosen: dict, family: str = "glm") -> dict | None:
+    """Link a GGUF quant of the chosen GLM family and its companions by model type only."""
     first = chosen["model"]["anchor"]
-    if first.suffix.lower() != ".gguf" or linked_model_type(first) != "glm":
-        warn(f"{first.name} is not a GLM-5.3-Flash GGUF model")
+    if family not in ("glm", "glm53") or first.suffix.lower() != ".gguf" or linked_model_type(first) != family:
+        warn(f"{first.name} is not a {FAMILY_TITLE.get(family, family)} GGUF model")
         return None
     shards = shard_set(first)
     missing = next((path for path in shards if not path.is_file()), None)
@@ -3164,6 +3166,9 @@ def link_glm_local(models: Path, chosen: dict) -> dict | None:
         warn(f"{missing.name} is missing; finish the model download before linking")
         return None
     drafter, vision = chosen["drafter"], chosen["vision"]
+    if family == "glm53" and (drafter or vision):
+        warn("GLM-5.3 uses its built-in MTP block and is text only; set Drafter and Vision to None")
+        return None
     if drafter and (drafter["anchor"].suffix.lower() != ".gguf" or gguf_head(drafter["anchor"])[0] != "dflash"):
         warn(f"{drafter['path'].name}: select a DFlash2 GGUF, or None to use the model's own MTP block")
         return None
@@ -4317,6 +4322,16 @@ def glm_config_path(pc: dict, quant: str) -> Path:
     return ROOT / f"maya-{quant.lower()}{({'hip': '-hip', 'metal': '-metal'}.get(pc.get('backend'), ''))}.json"
 
 
+def glm_setup_config_path(pc: dict, quant: str, linked_files: dict | None = None) -> Path:
+    """Use the same local-model config for the context plan and the saved settings."""
+    if linked_files is None:
+        return glm_config_path(pc, quant)
+    legacy = glm_config_path(pc, quant)
+    if (read_json(legacy).get("installer") or {}).get("gguf") == str(linked_files["model"]):
+        return legacy
+    return glm_config_path(pc, linked_files["folder"].name)
+
+
 def write_config(a, pc, meta, pack: Path, quant: str, ctx: int, models: Path, vision: dict | None,
                  choice: tuple | None = None, dflash: Path | None = None, gguf: Path | None = None,
                  *, linked_files: dict | None = None) -> Path:
@@ -4401,12 +4416,7 @@ def write_config(a, pc, meta, pack: Path, quant: str, ctx: int, models: Path, vi
         env = {**hip_env, **env}
     if env:
         cfg["env"] = env
-    cfg_path = glm_config_path(pc, linked_files["folder"].name if linked_files is not None else quant)
-    if linked_files is not None:
-        # Keep a local config made before local models had separate names; a downloaded model's config stays separate.
-        legacy = glm_config_path(pc, quant)
-        if (read_json(legacy).get("installer") or {}).get("gguf") == str(linked_files["model"]):
-            cfg_path = legacy
+    cfg_path = glm_setup_config_path(pc, quant, linked_files)
     old_cfg = read_json(cfg_path)
     # the server's own settings from the config before (the address it listens on, its API key, ...): kept, as the
     # DeepSeek, MiniMax and Qwen setups keep them - a GLM setup run again dropped them; --host / --api-key given now win
@@ -6005,7 +6015,7 @@ def set_up(a, prev: dict) -> Path | None:
     else:
         ok(f"model: {choice[1]} (yours)")
     if g53_choice(choice):                             # GLM-5.3 (744B): the contexts its cache fits on these GPUs
-        plan = g53_cache_plan(a, pc, choice)           # (as the config will run: write_config's)
+        plan = g53_cache_plan(a, pc, choice, **({"linked_files": linked} if linked is not None else {}))
         contexts = g53_contexts(pc, **plan)
         # (a unified-memory APU: the largest context that keeps the whole model in memory - --context still wins)
         rec, line = g53_apu_context(pc, plan, choice[1] if choice[0] == "download" else quant_of(Path(choice[1])),

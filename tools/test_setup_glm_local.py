@@ -211,5 +211,132 @@ class LocalGlm(unittest.TestCase):
         self.assertFalse(path.exists())
 
 
+class LocalGlm53(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+        self.source, self.models = self.root / "downloads", self.root / "models"
+        self.source.mkdir()
+        # Like the reported directory, downloaded parts may themselves be links.
+        self.shards = []
+        for i in range(1, 8):
+            name = f"GLM-5.3-UD-IQ3_XXS-{i:05d}-of-00007.gguf"
+            real = gguf(self.root / "cache" / name, "glm-dsa", 23)
+            linked = self.source / name
+            linked.symlink_to(real)
+            self.shards.append(linked)
+        for target in ("say", "ok", "warn", "step"):
+            p = patch.object(maya, target)
+            p.start()
+            self.addCleanup(p.stop)
+        for target, name in ((MI, "sha256_of"), (maya, "sha256_ok"), (maya, "incomplete")):
+            p = patch.object(target, name, side_effect=AssertionError(f"unexpected verification: {name}"))
+            p.start()
+            self.addCleanup(p.stop)
+
+    def chosen(self):
+        return {role: options[0] if options else None
+                for role, options in maya.review_candidates(self.source, "glm53").items()}
+
+    def link(self):
+        with patch.object(maya, "choose", return_value=3), \
+                patch.object(maya, "import_catalog", side_effect=AssertionError("catalog consulted")), \
+                patch.object(maya, "link_model", side_effect=AssertionError("catalog link used")):
+            return maya.review_downloaded_model(SimpleNamespace(), self.source, self.models, "glm53")
+
+    def test_unlisted_glm53_links_every_shard_and_keeps_sources(self):
+        linked = self.link()
+        self.assertEqual(len(linked["files"]), 7)
+        for src, dest in zip(self.shards, linked["files"]):
+            self.assertTrue(src.is_symlink())
+            self.assertTrue(dest.is_symlink())
+            self.assertEqual(dest.resolve(), src.resolve())
+        self.assertEqual(linked, self.link())
+        choice = ("local", linked["model"])
+        self.assertTrue(maya.g53_choice(choice))
+        self.assertTrue(maya.kind_is_glm_dsa(choice, linked["files"]))
+        self.assertEqual(maya.model_step(SimpleNamespace(), self.models, choice),
+                         (linked["folder"], linked["files"], "GLM-5.3-UD-IQ3_XXS"))
+
+    def test_add_downloaded_model_returns_the_linked_glm53_from_the_menu(self):
+        a = SimpleNamespace(backend="cuda", model_dir=None, gguf_dir=None, model=None, yes=False)
+        with patch.object(maya, "choose", side_effect=[len(maya.G53_MODELS), 3]), \
+                patch.object(maya.S, "ask_text", return_value=str(self.source)), \
+                patch.object(maya.S, "UI", None), patch.object(maya, "setup_gpus", return_value=[]), \
+                patch.object(maya, "mem_gb", return_value=(512, 400)), \
+                patch.object(maya, "import_catalog", side_effect=AssertionError("catalog consulted")):
+            kind, linked = maya.choose_model(a, self.models, {}, "glm53")
+        self.assertEqual(kind, "linked")
+        self.assertEqual(linked["model"].resolve(), self.shards[0].resolve())
+        self.assertEqual(len(linked["files"]), 7)
+
+    def test_glm53_rejects_other_model_types_before_linking(self):
+        chosen = self.chosen()
+        for arch in ("glm5-next", "glm5next", "qwen4exp"):
+            with self.subTest(arch=arch):
+                other = gguf(self.root / f"{arch}.gguf", arch)
+                chosen["model"] = maya.review_candidate(other, "model", [other])
+                self.assertIsNone(maya.link_glm_local(self.models, chosen, family="glm53"))
+                self.assertFalse(self.models.exists())
+
+    def test_glm53_needs_all_shards(self):
+        self.shards[-1].unlink()
+        self.assertIsNone(maya.link_glm_local(self.models, self.chosen(), family="glm53"))
+        self.assertFalse(self.models.exists())
+
+    def test_glm53_uses_its_builtin_mtp_and_has_no_vision(self):
+        for role, arch in (("drafter", "dflash"), ("vision", "clip")):
+            with self.subTest(role=role):
+                chosen = self.chosen()
+                companion = gguf(self.root / f"{role}.gguf", arch)
+                chosen[role] = maya.review_candidate(companion, role, [companion])
+                self.assertIsNone(maya.link_glm_local(self.models, chosen, family="glm53"))
+                self.assertFalse(self.models.exists())
+
+    def test_menu_continues_setup_and_writes_glm53_settings(self):
+        from tools.test_maya_glm53_setup import INDEX
+        linked = self.link()
+        pack = linked["folder"] / "pack"
+        (pack / "tokenizer").mkdir(parents=True)
+        (pack / "index.txt").write_text(INDEX)
+        a = SimpleNamespace(backend="cuda", models_dir=str(self.models), gguf_dir=None, model=None, model_dir=None,
+                            parallel=None, yes=True, no_start=True, context=131072, calibrate=False, no_vision=False,
+                            env=[], port=None, host=None, api_key=None, rebuild=False, repack=False, draft=None)
+        pc = {"backend": "cuda", "gpus": [{"index": i, "vram_gb": 48} for i in range(2)], "archs": [89]}
+        replacements = {
+            "ROOT": self.root, "choose_family": lambda *_: "glm53", "configs": lambda: [],
+            "choose_with_add": lambda *args: linked, "check_pc": lambda *_: pc,
+            "choose_context": lambda *args, **kwargs: 131072, "tools_step": lambda *_: self.root / "llama",
+            "build_step": lambda *_: {}, "pack_step": lambda *args: pack, "rotational": lambda *_: False,
+            "saved_calibration": lambda *args, **kwargs: None, "profile_fits": lambda *_: False,
+            "mem_gb": lambda: (512, 400), "setup_gpus": lambda *_: [],
+            "ablate_step": lambda *args: None, "write_run_script": lambda *args: self.root / "run-test.sh",
+        }
+        with patch.multiple(maya, **replacements), patch.object(maya.S, "gpus", return_value=[]), \
+                patch.object(maya, "choose_draft", side_effect=AssertionError("downloaded Flash drafter")), \
+                patch.object(maya, "drafter_step", side_effect=AssertionError("downloaded a drafter")), \
+                patch.object(maya, "local_vision_step", side_effect=AssertionError("enabled Flash vision")):
+            path = maya.set_up(a, {})
+            self.assertEqual(path, maya.glm_config_path(pc, linked["folder"].name))
+            cfg = json.loads(path.read_text())
+            self.assertEqual(cfg["model_name"], "glm-5.3")
+            self.assertEqual(cfg["sampling"], {"temperature": 1.0, "top_p": 0.95})
+            self.assertEqual(cfg["installer"]["gguf"], str(linked["model"]))
+            self.assertEqual(cfg["installer"]["draft"], "mtp")
+            self.assertIsNone(cfg["installer"]["local_drafter"])
+            self.assertNotIn("vision", cfg)
+            self.assertNotIn("--dflash", cfg["args"])
+            self.assertEqual(maya.flag_value(cfg["args"], "--kv-streaming"), "off")
+            # A later setup must plan cache memory from this local config,
+            # including settings the user changed since the first setup.
+            cfg["args"] += ["--parallel", "2", "--vram-reserve-mib", "1500"]
+            path.write_text(json.dumps(cfg))
+            choice = ("local", linked["model"])
+            plan = maya.g53_cache_plan(a, pc, choice, linked_files=linked)
+            self.assertEqual(plan["parallel"], 2)
+            self.assertEqual(plan["reserve_mib"], 1500)
+
+
 if __name__ == "__main__":
     unittest.main()
