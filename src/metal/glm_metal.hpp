@@ -159,6 +159,9 @@ public:
     void snapshot_save();
     bool snapshot_restore();          // false: no snapshot
     int64_t snapshot_position() const;  // -1: none
+    uint64_t slot_snapshot_size() const;
+    bool slot_snapshot_save(const std::string& path, uint64_t bytes);
+    bool slot_snapshot_load(const std::string& path, int64_t position, uint64_t budget);
 
     const GlmGeometry& geometry() const;
     int64_t position() const;
