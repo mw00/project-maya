@@ -40,7 +40,8 @@ METRICS = {   # GET /metrics as the server sends it (serve/server.py, metrics) -
                "prompt_ms": 4003.6, "decode_ms": 12586.5},
     "hardware": {"gpu_util": 41, "gpu_mem_used": 28 * 2**30, "gpu_mem_total": 32 * 2**30, "gpu_temp": 61,
                  "gpu_power": 176.0, "gpu_power_limit": 360.0, "gpu_pcie_gen_max": 5, "gpu_pcie_width": 8,
-                 "gpu_pcie_rx_mb": 6200.0, "cpu": 34.0, "ram_used": 140 * 2**30, "ram_total": 251 * 2**30,
+                 "gpu_pcie_rx_mb": 6200.0, "cpu": 34.0, "cpu_temp": 52.0, "ram_used": 140 * 2**30,
+                 "ram_total": 251 * 2**30,
                  "disk_read_mb": 12.0, "disk_write_mb": 0.4,
                  "gpus": [dict(GPU, index=0), dict(GPU, index=1, temp=88)]},
     "hardware_static": {"gpu_name": "NVIDIA GeForce RTX 5060 Ti + NVIDIA GeForce RTX 3090", "cores": 88,
@@ -98,13 +99,15 @@ class Boxes(unittest.TestCase):
         for want in ("RTX 5060 Ti", "RTX 3090", "41%", "14.0 / 16 GB", "88 / 180 W", "Gen5 x8", "3.0 GB/s"):
             self.assertIn(want, gpus)
         hw = text(D.hardware(METRICS, 116))
-        for want in ("GPU load", "41%", "28.0 / 32 GB", "5,248 experts cached", "CPU", "88 cores", "RAM",
-                     "92.8 GB pinned", "6.1 GB/s"):
+        for want in ("GPU load", "41%", "28.0 / 32 GB", "5,248 experts cached", "CPU", "88 cores", "CPU temp",
+                     "52 °C", "RAM", "92.8 GB pinned", "6.1 GB/s"):
             self.assertIn(want, hw)
         reqs = text(D.requests(METRICS, 116))
         for want in ("Done", "OpenAI", "1,533", "234", "18.5", "92.0%", "17.2 s", "Since"):
             self.assertIn(want, reqs)
         self.assertIn("GPU 1 is at 88 °C", D.banners(METRICS, 0).plain)
+        self.assertIn("The CPU is at 96 °C",
+                      D.banners(dict(METRICS, hardware=dict(METRICS["hardware"], cpu_temp=96)), 0).plain)
         self.assertIn("does not answer", D.banners(METRICS, 3).plain)
 
     def test_gpu_columns_keep_their_place_when_a_reading_changes(self):   # (#793: a PCIe burst moved the others)

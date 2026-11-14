@@ -13,7 +13,10 @@ A background thread samples once a second and keeps the last 60 readings of each
   DXGI (name, memory size) and Windows' GPU performance counters in pdh.dll (load, memory used), as Task Manager does:
   the _WinGpu class (no temperature, power or PCIe link there).
 - CPU, RAM, disk: `psutil` when it is installed (setup installs it); without it the CPU and RAM readings fall back to
-  the OS (Windows GlobalMemoryStatusEx / GetSystemTimes, Linux /proc) and the disk rate is absent.
+  the OS (Windows GlobalMemoryStatusEx / GetSystemTimes, Linux /proc) and the disk rate is absent.  The CPU's
+  temperature comes from the kernel's hwmon (k10temp, coretemp, zenpower, ...; Linux), from its thermal zone
+  (x86_pkg_temp on many Intel servers), or from psutil's sensors when those are the only source (macOS).
+  `MAYA_CPU_SENSOR_ROOT` looks in another sensor tree first, for a virtual machine whose host shares or simulates one.
 Anything that cannot be read is None; nothing here can stop the server.
 """
 from __future__ import annotations
@@ -889,6 +892,123 @@ def _cpu_name():
     return platform.processor() or None
 
 
+# the hwmon chips that carry the CPU's own sensors (a board's Super I/O chip is not one: its "CPU" reading is a
+# thermistor near the socket, not the die).  acpitz is only a fallback: an ACPI thermal zone is not always the CPU's.
+# MAYA_CPU_SENSOR_ROOT can point at a host-provided sensor tree in a VM.  It may have class/hwmon and class/thermal,
+# or the two folders directly beneath it; the normal /sys remains the fallback.  Values read from it are trusted.
+CPU_SENSOR_ROOT = os.environ.get("MAYA_CPU_SENSOR_ROOT", "").strip()
+CPU_TEMP_CHIPS = frozenset(("k10temp", "coretemp", "zenpower", "cpu_thermal", "soc_thermal"))
+CPU_TEMP_FALLBACK = frozenset(("acpitz",))
+# Intel's DTS and common ARM CPU thermal zones, used when no hwmon chip is present (x86_pkg_temp is typical on Xeons)
+CPU_TEMP_THERMAL = frozenset(("x86_pkg_temp", "pkg_temp_thermal", "core_temp_thermal", "Package id 0",
+                              "cpu_thermal", "cpu-thermal", "cpu0-thermal", "cpu-thermal-zone",
+                              "cpu0-thermal-zone", "soc_thermal", "soc-thermal"))
+
+
+def _cpu_sensor_dir(root, kind):
+    """The sensor folder under a sysfs-like root, accepting both `<root>/class/<kind>` and `<root>/<kind>`."""
+    for path in (os.path.join(root, "class", kind), os.path.join(root, kind)):
+        if os.path.isdir(path):
+            return path
+    return None
+
+
+def _cpu_temp_of(chips, found):
+    vals = [found[c] for c in chips if c in found]
+    return max(vals) if vals else None
+
+
+def _cpu_temp_hwmon(root):
+    """The CPU's temperature from an hwmon root (the hottest of its own chips), or None."""
+    hwmon = _cpu_sensor_dir(root, "hwmon")
+    if hwmon is None:
+        return None
+    try:
+        dirs = sorted(os.listdir(hwmon))
+    except OSError:
+        return None
+    found = {}
+    for n in dirs:
+        d = os.path.join(hwmon, n)
+        try:
+            with open(os.path.join(d, "name"), encoding="utf-8") as f:
+                chip = f.read().strip()
+        except (OSError, TypeError):
+            continue
+        if chip not in CPU_TEMP_CHIPS and chip not in CPU_TEMP_FALLBACK:
+            continue
+        try:
+            files = sorted(f for f in os.listdir(d) if f.startswith("temp") and f.endswith("_input"))
+        except OSError:
+            continue
+        for name in files:
+            try:
+                with open(os.path.join(d, name), encoding="utf-8") as f:
+                    t = int(f.read().strip())
+            except (OSError, ValueError, TypeError):
+                continue
+            if t > 0:
+                found[chip] = max(found.get(chip, 0), t / 1000.0)
+    best = _cpu_temp_of(CPU_TEMP_CHIPS, found)
+    return best if best is not None else _cpu_temp_of(CPU_TEMP_FALLBACK, found)
+
+
+def _cpu_temp_thermal(root):
+    """The CPU's temperature from its kernel thermal zone (Intel's x86_pkg_temp DTS, common ARM CPU zones), or None."""
+    zones = _cpu_sensor_dir(root, "thermal")
+    if zones is None:
+        return None
+    try:
+        names = sorted(os.listdir(zones))
+    except OSError:
+        return None
+    best = None
+    for n in names:
+        d = os.path.join(zones, n)
+        try:
+            with open(os.path.join(d, "type"), encoding="utf-8") as f:
+                kind = f.read().strip()
+            if kind not in CPU_TEMP_THERMAL:
+                continue
+            with open(os.path.join(d, "temp"), encoding="utf-8") as f:
+                t = int(f.read().strip())
+        except (OSError, TypeError, ValueError):
+            continue
+        if t > 0 and (best is None or t > best):
+            best = t
+    return best / 1000.0 if best is not None else None
+
+
+def cpu_temp(roots=None):
+    """The CPU's temperature in °C: the hottest sensor of its own hwmon chip (k10temp / coretemp / zenpower), else its
+    kernel thermal zone (x86_pkg_temp and common ARM CPU zones), else psutil's sensors (where /sys is not the source,
+    as on macOS).  MAYA_CPU_SENSOR_ROOT puts another, host-provided or test sensor tree before /sys.  None when this
+    machine does not report the CPU's temperature to user space (Windows, a server whose sensors only reach IPMI, or a
+    kernel module such as coretemp that is not loaded)."""
+    if roots is None:
+        roots = [SYSFS]
+        if CPU_SENSOR_ROOT and CPU_SENSOR_ROOT != SYSFS:
+            roots.insert(0, CPU_SENSOR_ROOT)
+    for root in roots:
+        best = _cpu_temp_hwmon(root)
+        if best is None:
+            best = _cpu_temp_thermal(root)
+        if best is not None:
+            return best
+    try:
+        import psutil
+        sensors = psutil.sensors_temperatures()
+    except (ImportError, OSError, AttributeError, RuntimeError):
+        return None
+    found = {}
+    for chip, rows in sensors.items():
+        vals = [s.current for s in rows if s.current and s.current > 0]
+        if vals:
+            found[chip] = max(vals)
+    best = _cpu_temp_of(CPU_TEMP_CHIPS, found)
+    return best if best is not None else _cpu_temp_of(CPU_TEMP_FALLBACK, found)
+
+
 class _CpuRamFallback:
     """CPU load and RAM without psutil."""
 
@@ -1061,6 +1181,7 @@ class Telemetry:
             s["cpu"] = self.fallback.cpu()
             s["ram_used"], s["ram_total"] = self.fallback.ram()
         s["disk_read_mb"], s["disk_write_mb"] = self._disk()
+        s["cpu_temp"] = cpu_temp()
         if self.extra:
             try:
                 s.update(self.extra())
@@ -1095,8 +1216,8 @@ class Telemetry:
             last = now
             with self.lock:
                 self.now = s
-                for k in ("gpu_util", "gpu_mem_used", "gpu_temp", "gpu_power", "gpu_pcie_rx_mb", "cpu", "ram_used",
-                          "disk_read_mb", "tok_s", "prefill_tok_s_mean"):
+                for k in ("gpu_util", "gpu_mem_used", "gpu_temp", "gpu_power", "gpu_pcie_rx_mb", "cpu", "cpu_temp",
+                          "ram_used", "disk_read_mb", "tok_s", "prefill_tok_s_mean"):
                     v = s.get(k)
                     for _ in range(held):
                         self.hist[k].append(round(v, 2) if isinstance(v, float) else v)
