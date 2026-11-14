@@ -1518,20 +1518,7 @@ bool GlmExpertHelper::pf_run_x3(const strata::kernels::exl3::ExpertLayout& lay, 
     // window's output rows (MAYA_GLM_LINK_PF_WIN rows, default 8192)
     const int64_t w16_rows = 2048;
     const int64_t w16_elems = (int64_t) 2 * nff * E + 2 * w16_rows * E;
-    if (pf_x3_win_ == 0) {
-        const char* wv = std::getenv("MAYA_GLM_LINK_PF_WIN");
-        int W = wv != nullptr ? std::atoi(wv) : 8192;
-        W = (std::max(W, 256) + 255) & ~255;
-        const size_t need = al((size_t) w16_elems * sizeof(uint16_t)) + al((size_t) W * E * sizeof(float));
-        if (!check(cudaMalloc(&pf_x3_scratch_, need), "EXL3 prompt scratch", err, device_)) return false;
-        pf_x3_blas_ = glmpf::x3_blas_open(stream_);
-        if (pf_x3_blas_ == nullptr) {
-            err = "GLM expert helper: no BLAS handle for the EXL3 prompt products";
-            return false;
-        }
-        pf_x3_win_ = W;
-        std::fprintf(stderr, "maya-glm-helper: EXL3 prompt windows of %d rows (%.0f MB scratch)\n", W, need / 1048576.0);
-    }
+    if (pf_x3_win_ == 0 && !pf_x3_init(err)) return false;
     const int W = pf_x3_win_;
     uint16_t* w16 = (uint16_t*) pf_x3_scratch_;
     float* OUTP = (float*) ((uint8_t*) pf_x3_scratch_ + al((size_t) w16_elems * sizeof(uint16_t)));
@@ -1590,6 +1577,36 @@ bool GlmExpertHelper::pf_run_x3(const strata::kernels::exl3::ExpertLayout& lay, 
     return true;
 #else
     (void) lay; (void) limit; (void) T; (void) K; (void) n; (void) rows; (void) r0; (void) blobs; (void) slot;
+    err = "GLM expert helper: prompt products need the helper program of a HIP build";
+    return false;
+#endif
+}
+
+bool GlmExpertHelper::pf_x3_init(std::string& err) {
+#if defined(STRATA_USE_HIP)
+    if (pf_x3_win_ != 0) return true;
+    DeviceScope scope(device_);
+    if (!scope.ok) { err = scope.error(device_); return false; }
+    const int E = n_embd_, nff = n_ff_;
+    const auto al = [](size_t b) { return (b + 255) & ~(size_t) 255; };
+    const int64_t w16_rows = 2048;   // (pf_run_x3's: an expert's rows in pieces of at most this many)
+    const int64_t w16_elems = (int64_t) 2 * nff * E + 2 * w16_rows * E;
+    {
+        const char* wv = std::getenv("MAYA_GLM_LINK_PF_WIN");
+        int W = wv != nullptr ? std::atoi(wv) : 8192;
+        W = (std::max(W, 256) + 255) & ~255;
+        const size_t need = al((size_t) w16_elems * sizeof(uint16_t)) + al((size_t) W * E * sizeof(float));
+        if (!check(cudaMalloc(&pf_x3_scratch_, need), "EXL3 prompt scratch", err, device_)) return false;
+        pf_x3_blas_ = glmpf::x3_blas_open(stream_);
+        if (pf_x3_blas_ == nullptr) {
+            err = "GLM expert helper: no BLAS handle for the EXL3 prompt products";
+            return false;
+        }
+        pf_x3_win_ = W;
+        std::fprintf(stderr, "maya-glm-helper: EXL3 prompt windows of %d rows (%.0f MB scratch)\n", W, need / 1048576.0);
+    }
+    return true;
+#else
     err = "GLM expert helper: prompt products need the helper program of a HIP build";
     return false;
 #endif

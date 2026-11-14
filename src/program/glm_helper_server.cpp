@@ -148,6 +148,11 @@ int main(int argc, char** argv) {
                     c->pf_types[t] = (uint8_t) h.pf_type_bits(t);
 #ifdef STRATA_USE_HIP
                 c->x3_pf = c->x3_on != 0 ? 1 : 0;   // (an EXL3 pack: its experts' prompt rows through pf_run_x3)
+                if (c->x3_on != 0 && !h.pf_x3_init(err)) {   // (its scratch now, not in the first prompt)
+                    std::fprintf(stderr, "maya-glm-helper: %s (EXL3 prompt calls will fail)\n", err.c_str());
+                    err.clear();
+                    c->x3_pf = 0;
+                }
 #endif
             }
             break;

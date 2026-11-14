@@ -114,6 +114,9 @@ public:
     /// through the prompt path's EXL3 lane (the weights decoded once, FP16 GEMMs)
     bool pf_run_x3(const strata::kernels::exl3::ExpertLayout& lay, float limit, int T, int K, int n, int rows,
                    int r0, const uint8_t* const* blobs, std::string& err, int slot = 0);
+    /// helper program: pf_run_x3's scratch and BLAS handle made now (kOpen of an EXL3 pack) rather than at the first
+    /// prompt call - the first prompt then waits on no allocation
+    bool pf_x3_init(std::string& err);
 
 private:
     bool start(const strata::kernels::exl3::ExpertLayout* xl, int gu_type, int d_type, size_t down_off, float limit,

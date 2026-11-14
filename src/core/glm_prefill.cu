@@ -2518,12 +2518,30 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
     }();
     // repeatable answers (a linked helper): plans from fixed inputs, never from measured times (the CPU share below)
     const bool rep = glmfast::repeatable(F->helper.linked());
+    // (experiment) MAYA_GLM_LINK_PF_STREAM=<n>[,<phase>]: every n-th layer (il % n == phase) streams its experts to
+    // this GPU instead of the helper computing them - the copy runs while the helper works on the layer before
+    static const std::pair<int, int> pf_stream = [] {
+        const char* v = getenv("MAYA_GLM_LINK_PF_STREAM");
+        int n = 0, ph = 0;
+        if (v != nullptr && std::sscanf(v, "%d,%d", &n, &ph) >= 1 && n > 0)
+            std::fprintf(stderr, "glm prefill: every %d-th layer (phase %d) streams its experts instead of the "
+                                 "helper (MAYA_GLM_LINK_PF_STREAM)\n", n, ph % n);
+        return std::make_pair(std::max(0, n), n > 0 ? ph % n : 0);
+    }();
+    // An EXL3 pack's chunk shorter than this streams the helper's experts to this GPU instead: the helper decodes each
+    // expert's whole weights for a call, so a short chunk's few rows an expert cost it far more than the copy here
+    // (Radeon 8065S + V100: a 23-token chat prompt 2.7 s through the helper, 1.0 s streamed).  MAYA_GLM_LINK_PF_X3_MIN
+    static const int pf_x3_min = [] {
+        const char* v = getenv("MAYA_GLM_LINK_PF_X3_MIN");
+        return v != nullptr ? std::max(0, std::atoi(v)) : 512;
+    }();
     const auto link_pf_for = [&](int il) {
         if (!link_pf_on || il < 0 || il >= g.n_layers || !F->helper.linked() || F->helper.pf_cap() < T ||
             K > hlink::kPfMaxK || g.n_expert > hlink::kPfMaxExperts)
             return false;
+        if (pf_stream.first > 0 && il % pf_stream.first == pf_stream.second) return false;
         const auto& Ly = F->L[(size_t) il];
-        if (Ly.moe && Ly.exl3) return F->helper.pf_x3_ok();   // (an EXL3 pack: the helper's EXL3 prompt lane)
+        if (Ly.moe && Ly.exl3) return T >= pf_x3_min && F->helper.pf_x3_ok();   // (an EXL3 pack: the helper's EXL3 prompt lane)
         return Ly.moe && !Ly.exl3 && F->helper.pf_pair_ok(Ly.gu_type, Ly.d_type);
     };
     const auto prestage = [&](int il) {
