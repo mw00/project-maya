@@ -237,6 +237,8 @@ struct SampleArgs {
 bool markov_greedy(const float* logits, const uint16_t* w2, const uint16_t* w1, int V, int R, int* prev, int* out,
                    const float* w, const float* b, const float* hidden, int D, float* conf, float* part, float* bias_out,
                    cudaStream_t s);
+/// Bias vector alone: bias_out[v] = w2[v] . w1[*prev] in F32 (used by sampled DSpark when BF16 BLAS is unavailable).
+bool markov_bias(const uint16_t* w2, const uint16_t* w1, int V, int R, int* prev, float* bias_out, cudaStream_t s);
 size_t markov_part_floats();
 /// One Markov step: emb (BF16 [R], for the GEMV) and embf (F32 [R]) = table row *prev.
 void gather_row(const uint16_t* table, int R, const int* prev, uint16_t* emb, float* embf, cudaStream_t s);

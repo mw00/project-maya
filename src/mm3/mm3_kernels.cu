@@ -1768,13 +1768,16 @@ __global__ void __launch_bounds__(256) markov_bias_kernel(const float* __restric
         for (int o = 4; o > 0; o >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, o);
         if (v < V && sub == 0) {
             if (bias_out) bias_out[v] = acc;
-            const float x = logits[v] + acc;
-            if (x > best || (x == best && v < bid)) {
-                best = x;
-                bid = v;
+            if (logits) {
+                const float x = logits[v] + acc;
+                if (x > best || (x == best && v < bid)) {
+                    best = x;
+                    bid = v;
+                }
             }
         }
     }
+    if (!logits) return;
 #pragma unroll
     for (int o = 16; o > 0; o >>= 1) {
         const float ov = __shfl_xor_sync(0xffffffffu, best, o);
@@ -2600,6 +2603,12 @@ bool markov_greedy(const float* logits, const uint16_t* w2, const uint16_t* w1, 
     markov_bias_kernel<<<kMkBlocks, 256, 0, s>>>(logits, w2, w1, prev, V, pv, pi, bias_out);
     markov_final_kernel<<<1, 1024, 0, s>>>(pv, pi, kMkBlocks, w1, prev, out, w, b, hidden, D, conf);
     check("markov_greedy");
+    return true;
+}
+bool markov_bias(const uint16_t* w2, const uint16_t* w1, int V, int R, int* prev, float* bias_out, cudaStream_t s) {
+    if (R != kMkR || V <= 0) return false;
+    markov_bias_kernel<<<kMkBlocks, 256, 0, s>>>(nullptr, w2, w1, prev, V, nullptr, nullptr, bias_out);
+    check("markov_bias");
     return true;
 }
 size_t markov_part_floats() { return 2 * (size_t) kMkBlocks; }
