@@ -699,7 +699,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             if (lay.native) {
                 // the layer's GGUF formats (i-quant gate/up, Q2_0 / IQ4_NL down)
                 const auto& f = lay.fmt[(size_t) l];
-                const NativeExpertLayout L = native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff);
+                const NativeExpertLayout L = native_expert_layout(f.gu_type, f.u_type, f.d_type, f.n_embd, f.n_ff);
                 return native_expert_grouped(L, gp, gs, gn, p_dst, p_tok, cap, cap,   // glm-dsa B3.5: false, no std::exit
                                              nat_xq_ + (size_t) tb * (N / 32) * 36, hit_scratch_, hit_out, cs);
             } else {
