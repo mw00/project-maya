@@ -427,6 +427,7 @@ def main() -> int:
     ap.add_argument("--out", help="default: <model>/maya-ds4")
     ap.add_argument("--vision", help="vision_pack.py's folder (default: <model>/../vision; taken when it is there)")
     ap.add_argument("--drafter", help="the DSpark drafter's .json (drafter_pack.py's; default <model>/../dspark/dspark.json)")
+    ap.add_argument("--no-companions", action="store_true", help="do not include a drafter or vision tower from nearby folders")
     ap.add_argument("--engram", help="the folder of the Engram tables' GGUF set, for a quant that leaves them out "
                                      "(default: <model>/../Engram, when it is whole)")
     ap.add_argument("--shards", nargs="+", help="the GGUF's files in --model (default: every .gguf there - one "
@@ -567,7 +568,7 @@ def main() -> int:
     drafter = pathlib.Path(a.drafter).expanduser().resolve() if a.drafter else model.parent / "dspark" / "dspark.json"
     if a.drafter and not drafter.is_file():
         raise SystemExit("%s: no drafter there" % drafter)
-    drafter_in = drafter.is_file() and drafter.with_suffix(".bin").is_file()
+    drafter_in = not a.no_companions and drafter.is_file() and drafter.with_suffix(".bin").is_file()
     vocab = next(t[5][0] for t in tensors if t[0] == "embed.weight")
     geo = geometry(kv, vocab)
     dinfo = json.loads(drafter.read_text()) if drafter_in else {}
@@ -597,7 +598,7 @@ def main() -> int:
     # names, the picture span's marker rows, and the geometry config.json gives them
     vdir = pathlib.Path(a.vision).expanduser().resolve() if a.vision else model.parent / "vision"
     vision = {}
-    if (vdir / "vision.json").is_file() and (vdir / "vision.bin").is_file():
+    if not a.no_companions and (vdir / "vision.json").is_file() and (vdir / "vision.bin").is_file():
         try:
             rel = os.path.relpath(vdir / "vision.bin", model).replace(os.sep, "/")
         except ValueError:     # (Windows: another drive)

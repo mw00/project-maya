@@ -146,17 +146,17 @@ class Setup(unittest.TestCase):
     def test_contexts_that_fit(self):
         one = lambda gb, **kw: {"gpus": [{"index": 0, "vram_gb": gb, **kw}]}   # noqa: E731
         with Quiet() as q:
-            self.assertEqual(maya.g53_contexts(self.pc), maya.CONTEXTS)              # 3x V100 32 GB: every one
+            self.assertEqual(maya.g53_contexts(self.pc), maya.GLM53_CONTEXTS)        # 3x V100 32 GB: through 512K
             self.assertEqual(maya.g53_contexts(one(32)), maya.CONTEXTS)              # (128K: 7.9 GB of cache)
             self.assertEqual(maya.g53_contexts(one(24)), [8192, 32768, 65536])
             self.assertEqual(maya.g53_contexts(one(32), parallel=2), [8192, 32768, 65536])   # (a cache each)
             self.assertEqual(maya.g53_contexts(one(16)), [8192])
-            self.assertEqual(maya.g53_contexts(one(0.5, arch="gfx1151")), maya.CONTEXTS)   # (an APU: its RAM)
-            self.assertEqual(maya.g53_contexts({"gpus": []}), maya.CONTEXTS)
+            self.assertEqual(maya.g53_contexts(one(0.5, arch="gfx1151")), maya.GLM53_CONTEXTS)   # (an APU: its RAM)
+            self.assertEqual(maya.g53_contexts({"gpus": []}), maya.GLM53_CONTEXTS)
         self.assertIn("up to a 64K context on these GPUs (24 GB of VRAM)", q.text)
         self.assertIn("it may not start", q.text)
         with patch.object(maya.G53, "KV_STREAMING", True):
-            self.assertEqual(maya.g53_contexts(one(24)), maya.CONTEXTS)
+            self.assertEqual(maya.g53_contexts(one(24)), maya.GLM53_CONTEXTS)
 
     def offered(self, choice, pc, **given) -> dict:
         """set_up run up to its context question for `choice` on `pc` (--parallel etc. as `given`): what it offers."""
@@ -229,7 +229,7 @@ class Setup(unittest.TestCase):
                                             "vram_gb": 160}]}
         # (the measured Halo was on Windows: its 160 GB carve-out beside ~32 GB RAM)
         with patch.object(maya, "mem_gb", return_value=(31.6, 20.0)), patch.object(maya, "WIN", True):
-            self.assertEqual(self.offered(g53, halo), {"contexts": maya.CONTEXTS, "recommended": 32768})
+            self.assertEqual(self.offered(g53, halo), {"contexts": maya.GLM53_CONTEXTS, "recommended": 32768})
             rec, line = maya.g53_apu_context(halo, {"kv_bytes": kv, "parallel": 1}, "GLM-5.3-Maya-XS", maya.CONTEXTS)
             self.assertEqual(rec, 32768)
             self.assertIn("32K recommended", line)
@@ -293,7 +293,7 @@ class Setup(unittest.TestCase):
         self.assertEqual(maya.g53_figures("GLM-5.3-Mine"), (maya.G53.MEMORY_GB, maya.G53.DENSE_GB))
         with Quiet():
             self.assertEqual(maya.g53_contexts(cuda, **plan), [8192, 32768])
-            self.assertEqual(maya.g53_contexts({"gpus": [{"index": 0, "vram_gb": 32}] * 3}, **plan), maya.CONTEXTS)
+            self.assertEqual(maya.g53_contexts({"gpus": [{"index": 0, "vram_gb": 32}] * 3}, **plan), maya.GLM53_CONTEXTS)
         with tempfile.TemporaryDirectory() as t:
             first = write_split(Path(t), "GLM-5.3-Maya-XS")[0]
             self.assertEqual(maya.quant_of(first), "GLM-5.3-Maya-XS")
