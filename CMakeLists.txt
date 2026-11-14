@@ -358,6 +358,35 @@ target_link_libraries(strata_plan INTERFACE strata_warnings)
 add_executable(strata-plan src/plan/plan_main.cpp)
 target_link_libraries(strata-plan PRIVATE strata_plan)
 
+# ---- strata_peer ------------------------------------------------------------
+# The peer expert tier's transport (RDMA READ over RoCE) and its daemon.  Deliberately free of the
+# GPU runtimes: the daemon runs beside an engine on the peer machine and must not pull strata_core's
+# HIP dependency.  Off the build entirely when no ibverbs is installed - the tier is opt-in (--peer),
+# and the engine builds and runs unchanged without it.
+if(NOT WIN32 AND EXISTS "/usr/include/infiniband/verbs.h")
+  find_package(Threads)
+  add_library(strata_peer STATIC src/peer/peer_rdma.cpp src/peer/peer_ctl.cpp src/peer/peer_read.cpp
+                                 src/peer/peer_budget.cpp src/peer/peer_cache.cpp
+                                 src/peer/peer_client.cpp)
+  target_include_directories(strata_peer PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src/peer)
+  target_link_libraries(strata_peer PUBLIC strata_warnings)
+  target_link_libraries(strata_peer PUBLIC ibverbs rdmacm)
+  if(Threads_FOUND)
+    target_link_libraries(strata_peer PUBLIC Threads::Threads)
+  endif()
+  add_executable(strata-peer src/peer/peer_daemon.cpp)
+  target_link_libraries(strata-peer PRIVATE strata_peer)
+  if(STRATA_BUILD_TESTS)
+    enable_testing()
+    add_executable(peer_rdma_test tests/peer_rdma_test.cpp)
+    target_link_libraries(peer_rdma_test PRIVATE strata_peer)
+    target_compile_definitions(peer_rdma_test PRIVATE
+                               STRATA_PEER_BIN="$<TARGET_FILE:strata-peer>")
+    add_test(NAME peer_rdma_test COMMAND peer_rdma_test)
+    set_tests_properties(peer_rdma_test PROPERTIES TIMEOUT 180)
+  endif()
+endif()
+
 # ---- strata_core (GPU runtime) ---------------------------------------------
 # Only built when a GPU backend is on, so the Phase 1 targets keep working without a toolkit.
 if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
