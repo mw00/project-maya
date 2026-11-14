@@ -52,6 +52,18 @@ class GrammarAdapter(unittest.TestCase):
         svc.engine.generate.assert_not_called()
         svc.check_request({"temperature": 0})
 
+    def test_native_remote_guard_precedes_request_state_changes(self):
+        source = (ROOT / "src/ds4/ds4_main.cpp").read_text(encoding="utf-8")
+        prepare = source.split("const auto prepare_grammar =", 1)[1].split("const auto", 1)[0]
+        self.assertIn("!m.grammar_supported()", prepare)
+        self.assertLess(prepare.index("!m.grammar_supported()"), prepare.index("ds4_decode_grammar_path"))
+        self.assertIn("const int grammar_local = m.grammar_supported() ? 1 : 0;", source)
+        self.assertIn('"INFO grammar=%d grammar_replay=%d grammar_hex=%d', source)
+        self.assertLess(source.index("if (!prepare_grammar(r)) continue;"), source.index("m.begin_request();"))
+        model = (ROOT / "src/ds4/ds4_model.cu").read_text(encoding="utf-8")
+        self.assertIn("bool Model::grammar_supported() const { return !p_->part_link(); }", model)
+        self.assertIn("if (x != -2 || p.grammar != nullptr) return x;", model)
+
     def test_compile_errors_propagate_before_generation(self):
         svc = self.service()
         svc.engine.info = {"grammar": 1, "grammar_replay": 1}
