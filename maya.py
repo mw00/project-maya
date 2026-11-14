@@ -7288,6 +7288,12 @@ def mm3_gguf_model_step(a, d: Path, quant: str) -> list | None:
         return None
     if not mm3_gguf_published(quant):
         warn(f"{name} is not published yet: the files in {d} are taken by their sizes (no published sha256 to check)")
+    else:   # (files already there - copied, or downloaded some other way - by sha256 too: checked once, then remembered;
+            #  a damaged file keeps its size and the engine then fails on NaN weights, #672)
+        for f, want in zip(files, m["sha256"].values()):
+            if not sha256_checked(f, want):
+                fail(f"{f}: the sha256 does not match the published one - the file is damaged (its size is right)",
+                     f"delete it and run {ME} --setup again: the setup downloads it again")
     ok(f"{name}: {len(files)} files, {sum(f.stat().st_size for f in files) / 1e9:.1f} GB in {d}")
     if rotational(d):
         warn(f"{d} is on a spinning hard disk: loading reads all {m['download_gb']:.0f} GB from it - use an NVMe SSD "
