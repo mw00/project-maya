@@ -69,10 +69,19 @@ def server_cmd(cfg: Path, port: int) -> list:
     return [sys.executable, str(ROOT / "serve" / "server.py"), *engine, "--port", str(port)]
 
 
+def hup_default() -> None:
+    """(a child's preexec_fn) SIGHUP at its default, as in a terminal: under nohup (a release run's `setsid nohup`)
+    the tests inherit it ignored, and the server and maya.py keep an ignored SIGHUP ignored (by design) - the SIGHUP
+    tests then waited 60 s for an end that never came."""
+    signal.signal(signal.SIGHUP, signal.SIG_DFL)
+
+
 class Proc:
     """A process with its output read line by line (until() waits for a line)."""
 
     def __init__(self, cmd, **kw):
+        if not WIN:
+            kw.setdefault("preexec_fn", hup_default)
         self.p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
                                   encoding="utf-8", errors="replace", bufsize=1, **kw)
         self.lines: queue.Queue = queue.Queue()
@@ -264,6 +273,16 @@ class ServerStops(unittest.TestCase):
         p = self.start(stdin=subprocess.DEVNULL)
         p.p.send_signal(signal.SIGHUP)
         self.ended(p, "SIGHUP")
+
+    @unittest.skipIf(WIN, "POSIX signals")
+    def test_sighup_under_nohup_is_ignored(self):
+        """A server started under nohup (SIGHUP ignored) keeps running on SIGHUP; SIGTERM still stops it."""
+        p = self.start(stdin=subprocess.DEVNULL, preexec_fn=lambda: signal.signal(signal.SIGHUP, signal.SIG_IGN))
+        p.p.send_signal(signal.SIGHUP)
+        time.sleep(2)
+        self.assertIsNone(p.p.poll())
+        p.p.send_signal(signal.SIGTERM)
+        self.ended(p, "SIGTERM")
 
 
 DRIVER = """
