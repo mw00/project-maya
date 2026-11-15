@@ -3244,6 +3244,21 @@ void moe_down(const MoeArgs& a, const float* h, const float* sh_out, float* out,
     launch_check("moe_down");
 }
 
+bool win_rows_covered(const WinArgs& a) {
+    if (!a.rows || a.mix.n > 0 || a.T < 1 || a.k < 1 || a.k > 8 || a.max_groups < 1 || a.n_embd % kCols != 0 ||
+        a.n_ff % kCols != 0 || a.n_embd > kMaxMoeK || a.n_ff > kMaxMoeK || a.lay.k2[0] != a.lay.k2[1] ||
+        kCntGU + (size_t) a.max_groups * (a.n_ff / kCols) > kCounters)
+        return false;
+#if defined(STRATA_USE_HIP)
+    int gS, gkr, dS, dkr;   // (xsplit_set's check, without its message)
+    xsplit(a.n_embd, gS, gkr);
+    xsplit(a.n_ff, dS, dkr);
+    if ((gS > 1 || dS > 1) && ((size_t) a.T * 2 * gS * a.n_ff > kXPFloats || (size_t) a.T * dS * a.n_embd > kXPFloats))
+        return false;
+#endif
+    return true;
+}
+
 bool win_experts(const WinArgs& a, cudaStream_t s) {
     if (a.mix.n == 0 && !a.rows) EXL3_LEGACY_MOE(a, win_experts(a, s));   // (rows: these kernels only)
     if (a.mix.n > 0 && !mixed_ok(a.mix, "win_experts")) return false;

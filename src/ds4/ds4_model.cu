@@ -6902,11 +6902,34 @@ struct Model::Impl {
         const int e0 = x3::launch_errors();
         bool ok = cudaSetDevice(helper_id) == cudaSuccess;
         int nw = 0, wrows = 0;   // (DS4_LIGHT_WIN: its groups, rows)
-        if (WR > 0) c.lt_wgs[0] = 0;
+        int WL = WR;   // (DS4_LIGHT_WIN, this call's: 0 when the window launch would refuse it - decided up front, so
+                       //  those experts take the set kernels instead of failing the request)
+        if (WL > 0) {
+            int n = 0;
+            for (size_t q = 0; q < lv.size(); ++q) n += c.lt_hb[q + 1] - c.lt_hb[q] <= WL;
+            x3::WinArgs t;
+            t.rows = true;
+            t.lay = L0.lay;
+            t.T = c.lt_hb[lv.size()];
+            t.k = 1;
+            t.max_groups = n;
+            t.n_embd = D;
+            t.n_ff = g.ff;
+            if (n > 0 && !x3::win_rows_covered(t)) {
+                static std::atomic<bool> said{false};
+                if (!said.exchange(true))
+                    std::fprintf(stderr,
+                                 "ds4: DS4_LIGHT_WIN: layer %d's %d light experts are not a window launch's (gate K %g, "
+                                 "up K %g, n_ff %d, %d rows); the set kernels take them (said once)\n",
+                                 L0.il, n, L0.lay.k2[0] / 2.0, L0.lay.k2[1] / 2.0, g.ff, t.T);
+                WL = 0;
+            }
+        }
+        if (WL > 0) c.lt_wgs[0] = 0;
         for (size_t q = 0; ok && q < lv.size(); ++q) {
             const int e = L0.host_list[(size_t) (lv[q] - L0.pv_n)];
             const int rows = c.lt_hb[q + 1] - c.lt_hb[q];
-            if (WR > 0 && rows <= WR) {   // (the window launch's: its rows are the packed rows hb[q] ..)
+            if (WL > 0 && rows <= WL) {   // (the window launch's: its rows are the packed rows hb[q] ..)
                 const uint8_t* wb = x3_pool(L0, e);
                 if (wb == nullptr) {
                     ok = false;
