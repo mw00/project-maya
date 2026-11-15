@@ -3173,6 +3173,50 @@ def local_gguf_model_name(folder: Path) -> str:
     return re.sub(r"[^a-z0-9._-]+", "-", name.lower()).strip("-") or "local-model"
 
 
+def glm_drafter_kind(path: Path, model: Path | None = None) -> str:
+    """Identify a DFlash2 or same-model MTP GGUF from its header, without reading weight data or checksums."""
+    from gguf_reader import GGUFFile
+    draft = GGUFFile(path)
+    arch = draft.metadata.get("general.architecture")
+    if arch == "dflash":
+        return "dflash2"
+    if arch not in (*GLM_ARCHS, G53.ARCH):
+        raise ValueError("select a GLM MTP or DFlash2 GGUF, or None to use the model's own MTP block")
+    blocks = [int(m.group(1)) for t in draft.tensors
+              if (m := re.fullmatch(r"blk\.(\d+)\.nextn\.eh_proj\.weight", t.name))]
+    if len(blocks) != 1:
+        raise ValueError("the MTP GGUF must hold one NextN draft block (blk.N.nextn.eh_proj.weight)")
+    if model is not None:
+        base = GGUFFile(model)
+        target = base.metadata.get("general.architecture")
+        if (arch == G53.ARCH) != (target == G53.ARCH) or target not in (*GLM_ARCHS, G53.ARCH):
+            raise ValueError("the MTP GGUF belongs to another GLM model family")
+        keys = ("embedding_length", "vocab_size", "attention.head_count", "attention.head_count_kv", "attention.key_length",
+                "attention.value_length", "attention.q_lora_rank", "attention.kv_lora_rank", "expert_count",
+                "expert_used_count", "expert_feed_forward_length")
+        for key in keys:
+            want = base.metadata.get(f"{target}.{key}")
+            got = draft.metadata.get(f"{arch}.{key}")
+            if want is not None and got is not None and want != got:
+                raise ValueError(f"the MTP GGUF has a different {key} ({got}, expected {want})")
+        count = base.metadata.get(f"{target}.block_count")
+        if count is not None:
+            trunk = int(count) - int(base.metadata.get(f"{target}.nextn_predict_layers", 0))
+            if blocks != [trunk]:
+                raise ValueError(f"the MTP GGUF needs blk.{trunk}, found blk.{blocks[0]}")
+        hidden = base.metadata.get(f"{target}.embedding_length")
+        proj = next(t for t in draft.tensors if t.name == f"blk.{blocks[0]}.nextn.eh_proj.weight")
+        if hidden is not None and proj.shape != [2 * hidden, hidden]:
+            raise ValueError("the MTP projection does not match the model's hidden size")
+    return "mtp"
+
+
+def linked_glm_draft(linked: dict | None) -> str:
+    if not linked or not linked.get("drafter"):
+        return "mtp"
+    return linked.get("drafter_kind") or glm_drafter_kind(linked["drafter"], linked["model"])
+
+
 def link_glm_local(models: Path, chosen: dict, family: str = "glm") -> dict | None:
     """Link a GGUF quant of the chosen GLM family and its companions by model type only."""
     first = chosen["model"]["anchor"]
@@ -3188,9 +3232,15 @@ def link_glm_local(models: Path, chosen: dict, family: str = "glm") -> dict | No
     if family == "glm53" and vision:
         warn("GLM-5.3 is text only; set Vision to None")
         return None
-    if drafter and (drafter["anchor"].suffix.lower() != ".gguf" or gguf_head(drafter["anchor"])[0] != "dflash"):
-        warn(f"{drafter['path'].name}: select a DFlash2 GGUF, or None to use the model's own MTP block")
-        return None
+    drafter_kind = None
+    if drafter:
+        try:
+            drafter_kind = glm_drafter_kind(drafter["anchor"], first)
+            if drafter_kind == "mtp" and len(drafter["files"]) != 1:
+                raise ValueError("select a single GGUF holding the complete MTP block")
+        except (OSError, ValueError, struct.error) as e:
+            warn(f"{drafter['path'].name}: {e}")
+            return None
     if vision and (vision["anchor"].suffix.lower() != ".gguf" or gguf_head(vision["anchor"])[0] != "clip"):
         warn(f"{vision['path'].name}: GLM vision needs an mmproj GGUF")
         return None
@@ -3210,6 +3260,7 @@ def link_glm_local(models: Path, chosen: dict, family: str = "glm") -> dict | No
     ok(f"{made} symbolic link(s) created for local GLM; model type checked, size and SHA-256 not checked")
     return {"folder": dest, "model": dest / first.name, "files": [dest / p.name for p in shards],
             "drafter": dest / "drafter" / drafter["path"].name if drafter else None,
+            "drafter_kind": drafter_kind,
             "vision": dest / "vision" / vision["path"].name if vision else None}
 
 
@@ -4448,6 +4499,8 @@ def write_config(a, pc, meta, pack: Path, quant: str, ctx: int, models: Path, vi
     if dflash is not None:                         # DFlash2 drafts instead of the MTP block (the engine loads no MTP)
         cfg["args"] += ["--dflash", str(dflash)]
     env = parse_env(a.env)
+    if linked_files and linked_files.get("drafter") and linked_glm_draft(linked_files) == "mtp":
+        env["MAYA_GLM_MTP_GGUF"] = str(linked_files["drafter"])
     drafting = None
     if pc.get("backend") == "hip":
         cfg["backend"] = "hip"
@@ -4546,6 +4599,7 @@ def write_config(a, pc, meta, pack: Path, quant: str, ctx: int, models: Path, vi
                         "written": time.strftime("%Y-%m-%d %H:%M")}
     if linked_files is not None:
         cfg["installer"].update({"local_drafter": str(linked_files["drafter"]) if linked_files.get("drafter") else None,
+                                  "local_drafter_kind": linked_glm_draft(linked_files) if linked_files.get("drafter") else None,
                                   "local_vision": str(linked_files["vision"]) if linked_files.get("vision") else None})
     if drafting is not None:
         ok(f"one-GPU drafting (the MTP block): {'on' if drafting['on'] else 'off'} until the speed calibration "
@@ -5016,6 +5070,9 @@ def drafter_file(cfg: dict) -> Path | None:
         return Path(args[args.index("--dflash") + 1])
     local = (cfg.get("installer") or {}).get("local_drafter")
     if local:
+        if (cfg.get("installer") or {}).get("local_drafter_kind") == "mtp" or \
+                N.lookup(cfg.get("env") or {}, "MAYA_GLM_MTP_GGUF") == local:
+            return None
         return Path(local) if Path(local).is_file() else None
     if G53.config_is_glm_dsa(cfg):
         return None                                   # the downloaded default is Flash's drafter
@@ -6114,9 +6171,9 @@ def set_up(a, prev: dict) -> Path | None:
     else:
         ctx = choose_context(a, prev_ctx, GLM_FLASH_CONTEXTS, recommended=recommended_context(choice, pc))
     ok(f"context: {ctx} tokens")
-    draft = ("dflash2" if linked.get("drafter") else "mtp") if linked is not None else choose_draft(a, pc, inst)
+    draft = linked_glm_draft(linked) if linked is not None else choose_draft(a, pc, inst)
     if linked is not None and linked.get("drafter"):
-        ok(f"drafting: selected DFlash2 drafter {linked['drafter'].name}")
+        ok(f"drafting: selected {'DFlash2' if draft == 'dflash2' else 'MTP'} drafter {linked['drafter'].name}")
     else:
         ok("drafting: " + ("a DFlash2 drafter (downloaded with the model)" if draft == "dflash2" else "the MTP block"))
     llama = tools_step(a)                              # 3
@@ -6135,7 +6192,7 @@ def set_up(a, prev: dict) -> Path | None:
         have = g53_memory_gb(pc)                       # (neutral memory guidance, no speeds)
         (ok if have is not None and have >= g53_figures(quant)[0] else warn)(
             f"{G53.SHOWN}: {g53_memory_note(pc, quant)}")
-    dflash = linked.get("drafter") if linked is not None else drafter_step(models) if draft == "dflash2" else None
+    dflash = (linked.get("drafter") if linked is not None else drafter_step(models)) if draft == "dflash2" else None
     pack = metal_tokenizer_step(a, d, shards, quant) if metal else pack_step(a, d, shards, llama, quant)       # 6
     if dsa:
         step(7, "images (the vision encoder)")

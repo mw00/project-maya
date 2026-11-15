@@ -41,11 +41,14 @@ UD-IQ2_M".
 Builds: NVIDIA from the Tesla V100 on (CUDA, Linux and Windows) and AMD (HIP), as GLM-5.3-Flash's. Not on Metal;
 Pascal cards are not supported for it. EXL3 quants of GLM-5.3 are not supported yet.
 
-For a local model with its own DFlash2 drafter, choose **GLM-5.3 → Add downloaded model**, select the model directory,
-then choose the drafter in **Drafter → Browse files...** and **Link files**. The drafter can be in another directory;
-the setup links it without copying the weights or checking size/SHA-256. Its path is saved in the config and can be
-selected again on the Models page after switching to MTP. Use a drafter made for GLM-5.3, rather than Flash's drafter;
-the engine checks its hidden size, vocabulary and target layers. Leave **Vision: None**.
+For a local model with an external MTP or its own DFlash2 drafter, choose **GLM-5.3 → Add downloaded model**, select
+the model directory, then choose the drafter in **Drafter → Browse files...** and **Link files**. The drafter can be
+in another directory; the setup links it without copying the weights or checking size/SHA-256. Its path is saved in
+the config. A selected DFlash2 can be enabled again on the Models page after switching to MTP.
+Use a drafter made for GLM-5.3, rather than Flash's drafter;
+the engine checks its hidden size, vocabulary and target layers. An external MTP GGUF must contain the same model's
+NextN block (`blk.78.nextn.*`); the setup checks the block index and geometry and passes it through
+`MAYA_GLM_MTP_GGUF`. It is used as MTP and is not offered as a DFlash2 file. Leave **Vision: None**.
 
 ## Context and memory
 

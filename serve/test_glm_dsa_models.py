@@ -225,6 +225,23 @@ class Apply(Base):
         draft.unlink()
         self.assertEqual(M.choices(restored)["draft"], ["mtp"])
 
+    def test_external_mtp_is_preserved_and_is_not_offered_as_dflash(self):
+        cfg = M.read(self.g53)
+        draft = self.d / "GLM-5.3-MTP-Q3_K_M-sc.gguf"
+        draft.write_bytes(b"mtp")
+        cfg["env"] = {"MAYA_GLM_MTP_GGUF": str(draft)}
+        cfg["installer"].update(local_drafter=str(draft), local_drafter_kind="mtp")
+        self.assertIsNone(M.dflash_file(cfg))
+        self.assertEqual(M.choices(cfg)["draft"], ["mtp"])
+        self.assertTrue(M.choices(cfg)["mtp_external"])
+        self.assertEqual(M.settings_of(cfg)["draft"], "mtp")
+        saved = M.apply(cfg, {"draft": "mtp", "context": 131072})
+        self.assertEqual(saved["env"]["MAYA_GLM_MTP_GGUF"], str(draft))
+        self.assertNotIn("--dflash", saved["args"])
+        self.assertIn(draft, M.runs_from(saved))
+        with self.assertRaisesRegex(ValueError, "DFlash2"):
+            M.apply(cfg, {"draft": "dflash2"})
+
 
 class Turbo(Base):
     """e) Turbo: GLM-5.3 its own values (TURBO_ENV_G53: the route affinity measured on it, none of Flash's skips);
@@ -371,6 +388,8 @@ M.MS.data = {gpus: [{index: 0, name: "GPU", vram_gb: 32}]};
 const out = {flash: ser(M.fieldsOf(flash, {...flash.settings})), g53: ser(M.fieldsOf(g53, {...g53.settings}))};
 const g53Dflash = {...g53, choices: {...g53.choices, draft: ["mtp", "dflash2"], dflash2: true}};
 out.g53_dflash = ser(M.fieldsOf(g53Dflash, {...g53Dflash.settings, draft: "dflash2"}));
+const g53Mtp = {...g53, choices: {...g53.choices, mtp_external: true}};
+out.g53_mtp = ser(M.fieldsOf(g53Mtp, {...g53Mtp.settings}));
 for (const [k, t] of Object.entries({off: {on: false}, hidden: {on: false, hidden: true}})) {
   st.S.turbo = t;
   out["turbo_" + k] = ser(T.TurboButton());
@@ -417,6 +436,11 @@ class PageJs(unittest.TestCase):
         row = rows_of(self.got["g53_dflash"])["Drafting"]
         self.assertIn("own drafter selected during setup", row["hint"])
         self.assertIn('"id": "dflash2"', json.dumps(row["children"]))
+
+    def test_glm53_external_mtp_is_described_as_external(self):
+        row = rows_of(self.got["g53_mtp"])["Drafting"]
+        self.assertIn("external draft block selected during setup", row["hint"])
+        self.assertNotIn('"id": "dflash2"', json.dumps(row["children"]))
 
     def test_flash_fields_as_before(self):
         f = rows_of(self.got["flash"])

@@ -198,6 +198,8 @@ def dflash_file(cfg: dict) -> Path | None:
         return Path(p)
     inst = cfg.get("installer") or {}
     if local := inst.get("local_drafter"):
+        if inst.get("local_drafter_kind") == "mtp" or maya_names.lookup(cfg.get("env") or {}, "MAYA_GLM_MTP_GGUF") == local:
+            return None
         return Path(local) if Path(local).is_file() else None
     models = inst.get("models_dir")
     folder = "GLM-5.3-DFlash2" if G53.config_is_glm_dsa(cfg) else "GLM-5.3-Flash-DFlash2"
@@ -323,15 +325,16 @@ def _choices(cfg: dict) -> dict:
     if family(cfg) == "qwen":                          # (images: the setup's maya-vision entry, on or kept off)
         return {"draft": ["mtp", "none"] if qwen_mtp(cfg) is not None else ["none"],
                 "images": bool(cfg.get("vision") or cfg.get("vision_off"))}
+    mtp = {"mtp_external": True} if maya_names.lookup(cfg.get("env") or {}, "MAYA_GLM_MTP_GGUF") else {}
     if G53.config_is_glm_dsa(cfg):
         # GLM-5.3 (744B): text only; its own DFlash2 can replace NextN, with compatibility checked by the engine.
         dflash = dflash_file(cfg) is not None
         return {"draft": ["mtp", "dflash2"] if dflash else ["mtp"], "images": False, "text_only": True,
                 "dflash2": dflash,
-                "kv_streaming": G53.KV_STREAMING, "batched": G53.BATCHED_ROWS}
+                "kv_streaming": G53.KV_STREAMING, "batched": G53.BATCHED_ROWS, **mtp}
     f = dflash_file(cfg)
     return {"draft": ["mtp", "dflash2"] if f is not None else ["mtp"],
-            "images": bool(cfg.get("vision") or cfg.get("vision_off"))}
+            "images": bool(cfg.get("vision") or cfg.get("vision_off")), **mtp}
 
 
 # ------------------------------------------------------------------ settings <-> the config
@@ -1082,6 +1085,7 @@ def runs_from(cfg: dict) -> list:
     inst = cfg.get("installer") or {}
     found += [Path(inst[k]) for k in ("model_dir", "gguf", "gguf_dir") if isinstance(inst.get(k), str) and inst[k]]
     found += [Path(v) for v in (flag(cfg.get("args") or [], "--dflash"), flag(cfg.get("args") or [], "--mtp"),
+                                maya_names.lookup(cfg.get("env") or {}, "MAYA_GLM_MTP_GGUF"), inst.get("local_drafter"),
                                 cfg.get("tokenizer")) if isinstance(v, str) and v]
     found += vision_files(cfg)
     return [r for r in map(_res, found) if r is not None]

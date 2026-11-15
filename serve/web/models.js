@@ -377,7 +377,8 @@ function fieldsOf(m, d) {
             (m.choices.batched === false ? ` On ${shownOf(m)} they are answered one after another for now.` : "")}>
           <${Stepper} label="Answers at once" value=${d.parallel} min=${1} max=${8} on=${(v) => setDraft({parallel: v})}/><//>`,
         html`<${Row} label="Drafting" flag="--dflash" changed=${ch("draft")}
-          hint=${m.choices.text_only ? `MTP is built into the model: ${shownOf(m)} drafts with it. ${dflash
+          hint=${m.choices.mtp_external ? "MTP uses the external draft block selected during setup."
+            : m.choices.text_only ? `MTP is built into the model: ${shownOf(m)} drafts with it. ${dflash
               ? "DFlash2 uses this model's own drafter selected during setup."
               : "To use DFlash2, add this model's own drafter through setup's Link files."}`
             : dflash ? "MTP is built into the model. DFlash2 is a separate drafter, often faster for one answer at a time."

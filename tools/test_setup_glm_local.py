@@ -13,7 +13,7 @@ import maya
 import maya_import as MI
 
 
-def gguf(path, arch, file_type=None):
+def gguf(path, arch, file_type=None, *, metadata=None, tensors=()):
     def text(value):
         data = value.encode()
         return struct.pack("<Q", len(data)) + data
@@ -23,7 +23,12 @@ def gguf(path, arch, file_type=None):
                    text("tokenizer.ggml.tokens") + struct.pack("<IIQ", 9, 8, 2) + text("a") + text("b")]
     if file_type is not None:
         fields.append(text("general.file_type") + struct.pack("<II", 4, file_type))
-    data = b"GGUF" + struct.pack("<IQQ", 3, 0, len(fields)) + b"".join(fields)
+    for key, value in (metadata or {}).items():
+        fields.append(text(key) + (struct.pack("<I", 8) + text(value) if isinstance(value, str)
+                                  else struct.pack("<II", 4, value)))
+    records = [text(name) + struct.pack("<I", len(shape)) + struct.pack(f"<{len(shape)}Q", *shape)
+               + struct.pack("<IQ", 0, 0) for name, shape in tensors]
+    data = b"GGUF" + struct.pack("<IQQ", 3, len(tensors), len(fields)) + b"".join(fields + records)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(data + b"\0" * (-len(data) % 32))
     return path
@@ -81,6 +86,15 @@ class LocalGlm(unittest.TestCase):
         linked = maya.link_glm_local(self.models, chosen)
         self.assertIsNone(linked["drafter"])
         self.assertIsNone(linked["vision"])
+
+    def test_flash_accepts_an_external_mtp_with_the_architecture_alias(self):
+        chosen = self.chosen()
+        draft = gguf(self.root / "custom-head.gguf", "glm5next",
+                     tensors=[("blk.45.nextn.eh_proj.weight", [8192, 4096])])
+        chosen["drafter"] = maya.review_candidate(draft, "drafter", [draft])
+        linked = maya.link_glm_local(self.models, chosen)
+        self.assertEqual(linked["drafter_kind"], "mtp")
+        self.assertEqual(linked["drafter"].resolve(), draft)
 
     def test_wrong_model_or_companion_types_are_rejected(self):
         for role, arch in (("model", "glm-dsa"), ("drafter", "qwen4exp"), ("vision", "dflash")):
@@ -222,7 +236,9 @@ class LocalGlm53(unittest.TestCase):
         self.shards = []
         for i in range(1, 8):
             name = f"GLM-5.3-UD-IQ3_XXS-{i:05d}-of-00007.gguf"
-            real = gguf(self.root / "cache" / name, "glm-dsa", 23)
+            real = gguf(self.root / "cache" / name, "glm-dsa", 23,
+                        metadata={"glm-dsa.block_count": 79, "glm-dsa.nextn_predict_layers": 1,
+                                  "glm-dsa.embedding_length": 6144})
             linked = self.source / name
             linked.symlink_to(real)
             self.shards.append(linked)
@@ -297,6 +313,31 @@ class LocalGlm53(unittest.TestCase):
         self.assertEqual(linked["drafter"].resolve(), draft)
         self.assertTrue(MI.is_linked(linked["drafter"]))
 
+    def test_glm53_links_an_external_mtp_by_its_header(self):
+        chosen = self.chosen()
+        draft = gguf(self.root / "external" / "custom-head.gguf", "glm-dsa",
+                     metadata={"glm-dsa.embedding_length": 6144},
+                     tensors=[("blk.78.nextn.eh_proj.weight", [12288, 6144])])
+        chosen["drafter"] = maya.review_candidate(draft, "drafter", [draft])
+        linked = maya.link_glm_local(self.models, chosen, family="glm53")
+        self.assertEqual(linked["drafter_kind"], "mtp")
+        self.assertTrue(draft.is_file())
+        self.assertTrue(linked["drafter"].is_symlink())
+        self.assertEqual(linked["drafter"].resolve(), draft)
+
+    def test_glm53_rejects_incompatible_mtp_headers_before_linking(self):
+        cases = [("glm5-next", 45, 6144, [12288, 6144]), ("glm-dsa", 77, 6144, [12288, 6144]),
+                 ("glm-dsa", 78, 4096, [8192, 4096]), ("glm-dsa", 78, 6144, [6144, 6144])]
+        for arch, block, hidden, shape in cases:
+            with self.subTest(arch=arch, block=block, hidden=hidden, shape=shape):
+                draft = gguf(self.root / "invalid-mtp.gguf", arch,
+                             metadata={f"{arch}.embedding_length": hidden},
+                             tensors=[(f"blk.{block}.nextn.eh_proj.weight", shape)])
+                chosen = self.chosen()
+                chosen["drafter"] = maya.review_candidate(draft, "drafter", [draft])
+                self.assertIsNone(maya.link_glm_local(self.models, chosen, family="glm53"))
+                self.assertFalse(self.models.exists())
+
     def test_glm53_rejects_vision_and_non_dflash_drafters(self):
         for role, arch in (("drafter", "qwen4exp"), ("vision", "clip")):
             with self.subTest(role=role):
@@ -310,12 +351,19 @@ class LocalGlm53(unittest.TestCase):
         self.check_menu_setup()
 
     def test_menu_keeps_the_selected_glm53_dflash2_in_the_config(self):
-        self.check_menu_setup(with_drafter=True)
+        self.check_menu_setup("dflash2")
 
-    def check_menu_setup(self, with_drafter=False):
+    def test_menu_writes_the_selected_external_mtp_as_an_engine_setting(self):
+        self.check_menu_setup("mtp")
+
+    def check_menu_setup(self, draft_kind=None):
         from tools.test_maya_glm53_setup import INDEX
-        if with_drafter:
+        if draft_kind == "dflash2":
             gguf(self.source / "drafter" / "GLM-5.3-DFlash2-Q4_K_M.gguf", "dflash")
+        elif draft_kind == "mtp":
+            gguf(self.source / "drafter" / "GLM-5.3-MTP-Q3_K_M-sc.gguf", "glm-dsa",
+                 metadata={"glm-dsa.embedding_length": 6144},
+                 tensors=[("blk.78.nextn.eh_proj.weight", [12288, 6144])])
         linked = self.link()
         pack = linked["folder"] / "pack"
         (pack / "tokenizer").mkdir(parents=True)
@@ -344,15 +392,23 @@ class LocalGlm53(unittest.TestCase):
             self.assertEqual(cfg["model_name"], "glm-5.3")
             self.assertEqual(cfg["sampling"], {"temperature": 1.0, "top_p": 0.95})
             self.assertEqual(cfg["installer"]["gguf"], str(linked["model"]))
-            self.assertEqual(cfg["installer"]["draft"], "dflash2" if with_drafter else "mtp")
-            if with_drafter:
+            self.assertEqual(cfg["installer"]["draft"], draft_kind or "mtp")
+            if draft_kind:
                 self.assertEqual(cfg["installer"]["local_drafter"], str(linked["drafter"]))
+                self.assertEqual(cfg["installer"]["local_drafter_kind"], draft_kind)
+            else:
+                self.assertIsNone(cfg["installer"]["local_drafter"])
+            if draft_kind == "dflash2":
                 self.assertEqual(maya.flag_value(cfg["args"], "--dflash"), str(linked["drafter"]))
                 self.assertEqual(maya.drafter_file(cfg), linked["drafter"])
                 self.assertFalse(any("drafting with the NextN" in str(call) for call in maya.warn.call_args_list))
             else:
-                self.assertIsNone(cfg["installer"]["local_drafter"])
                 self.assertNotIn("--dflash", cfg["args"])
+            if draft_kind == "mtp":
+                self.assertEqual(cfg["env"]["MAYA_GLM_MTP_GGUF"], str(linked["drafter"]))
+                self.assertIsNone(maya.drafter_file(cfg))
+                from serve.server import child_env
+                self.assertEqual(child_env(cfg)["MAYA_GLM_MTP_GGUF"], str(linked["drafter"]))
             self.assertNotIn("vision", cfg)
             self.assertEqual(maya.flag_value(cfg["args"], "--kv-streaming"), "off")
             # A later setup must plan cache memory from this local config,
