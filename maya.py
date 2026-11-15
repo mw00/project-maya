@@ -4365,6 +4365,23 @@ def busy_gpus(cfg: dict) -> list:
     return [(i, used[i]) for i in cfg.get("gpu") or [] if used.get(i, 0) > 1024]
 
 
+def busy_skip(cfg: dict, asked: bool, name: str, gpus: str, tail: str) -> bool:
+    """A measurement's look at the config's GPUs before it loads the model: True = skip it (the warning says why).
+    A GPU that drives a display already holds some memory, and read as another model loaded (#794): a measurement
+    asked for by name (--speed-calibration, --calibrate) runs anyway, with a warning that names the memory in use;
+    only the automatic ones (a setup's or a start's own) still skip on a busy GPU, as before."""
+    busy = busy_gpus(cfg)
+    if not busy:
+        return False
+    used = ", ".join(f"GPU {i} has {m} MiB in use" for i, m in busy)
+    if asked:
+        warn(f"{name} runs although {used} (a display, or another program) - measuring anyway, as asked; if a model "
+             "server is still running there, stop it first: the measurement can then run short of memory or read slow")
+        return False
+    warn(f"{name} needs {gpus} to itself: {used}{tail}")
+    return True
+
+
 def calibrate_config(cfg_path: Path) -> bool:
     """Tune the CPU lane on this PC (tools/calibrate_glm.py): the result goes into the config's env and into
     CAL_STORE for this PC, model and context (a setup again applies it)."""
@@ -4383,10 +4400,8 @@ def calibrate_config(cfg_path: Path) -> bool:
     if cfg.get("backend") == "metal":
         warn("the tuning measures the CUDA engine's CPU lane: it does not apply to the Metal engine")
         return False
-    busy = busy_gpus(cfg)
-    if busy:
-        warn("the tuning needs the GPU(s) to itself: " + ", ".join(f"GPU {i} has {m} MiB in use" for i, m in busy) +
-             " (a model server still running?) - stop it, then run ./maya.sh --calibrate")
+    if busy_skip(cfg, True, "the tuning", "the GPU(s)",          # (always asked for: --calibrate, or a yes at the setup)
+                 " (a model server still running?) - stop it, then run ./maya.sh --calibrate"):
         return False
     say()
     say("  Tuning Maya for this PC: the output speed is measured with a few splits of the work between the CPU and")
@@ -4441,10 +4456,8 @@ def calibrate_ds4_config(cfg_path: Path) -> bool:
     """Tune maya-ds4 on this PC (tools/calibrate_ds4_tp.py): --tp and --cpu-threads go into the config's args and
     into CAL_STORE for this PC, quant and context (a setup again applies them where the config before had none)."""
     cfg = read_json(cfg_path)
-    busy = busy_gpus(cfg)
-    if busy:
-        warn("the tuning needs the GPU(s) to itself: " + ", ".join(f"GPU {i} has {m} MiB in use" for i, m in busy) +
-             " (a model server still running?) - stop it, then run ./maya.sh --calibrate")
+    if busy_skip(cfg, True, "the tuning", "the GPU(s)",          # (always asked for: --calibrate, or a yes at the setup)
+                 " (a model server still running?) - stop it, then run ./maya.sh --calibrate"):
         return False
     found = {g["index"]: g for g in S.gpus() or []}
     vram = [found[i]["vram_gb"] for i in cfg.get("gpu") or [] if i in found]
@@ -4576,11 +4589,8 @@ def speed_calibration(cfg_path: Path, why: str = "") -> bool:
         return False
     one = len(cfg.get("gpu") or [0]) < 2
     other = "no drafting" if one else "the MTP block"
-    busy = busy_gpus(cfg)
-    if busy:
-        warn("the speed calibration needs the GPU(s) to itself: " +
-             ", ".join(f"GPU {i} has {m} MiB in use" for i, m in busy) +
-             f" (a model server still running?) - it runs at the next start, or: {ME} --speed-calibration")
+    if busy_skip(cfg, why == "asked for", "the speed calibration", "the GPU(s)",
+                 f" (a model server still running?) - it runs at the next start, or: {ME} --speed-calibration"):
         return False
     without = CD.without_dflash(cfg)
     cal = saved_calibration(without)                   # the CPU lane tuned on this PC without DFlash2: that side as so
@@ -4651,11 +4661,8 @@ def speed_calibration_g53(cfg_path: Path, cfg: dict, why: str = "") -> bool:
     """GLM-5.3 on one APU: its sustained decode speed with one-GPU drafting (the MTP block drafts, one verify pass
     checks: the same tokens) and without, measured here as tools/calibrate_draft.py measures DFlash2.  The faster is
     kept; within G53_DRAFT_TIE the setup's own default (installer.one_gpu_drafting) stays.  False: not measured."""
-    busy = busy_gpus(cfg)
-    if busy:
-        warn("the speed calibration needs the GPU to itself: " +
-             ", ".join(f"GPU {i} has {m} MiB in use" for i, m in busy) +
-             f" (a model server still running?) - it runs at the next start, or: {ME} --speed-calibration")
+    if busy_skip(cfg, why == "asked for", "the speed calibration", "the GPU",
+                 f" (a model server still running?) - it runs at the next start, or: {ME} --speed-calibration"):
         return False
     fallback = bool(((cfg.get("installer") or {}).get("one_gpu_drafting") or {}).get("on"))
     off, on = g53_with_drafting(cfg, False), g53_with_drafting(cfg, True)
@@ -4828,10 +4835,8 @@ def link_calibration(cfg_path: Path, why: str = "") -> bool:
     if reason:
         warn(f"both GPUs: not measured ({reason})")
         return False
-    busy = busy_gpus(cfg)
-    if busy:
-        warn("the both-GPU measurement needs the GPU to itself: " +
-             ", ".join(f"GPU {i} has {m} MiB in use" for i, m in busy) + f" - {ME} --speed-calibration tries again")
+    if busy_skip(cfg, why == "asked for", "the both-GPU measurement", "the GPU",
+                 f" - {ME} --speed-calibration tries again"):
         return False
     glm = mixed_family(cfg) == "glm"
     alone = {**json.loads(json.dumps(cfg)), "mixed_gpus": False}
@@ -4921,11 +4926,8 @@ def prefill_calibration(cfg_path: Path, why: str = "") -> bool:
     every start); the result also in the config (installer.prefill_calibration).  False: not measured (the reason is
     shown; the engine then reads prompts with its defaults)."""
     cfg = read_json(cfg_path)
-    busy = busy_gpus(cfg)
-    if busy:
-        warn("the prefill calibration needs the GPU(s) to itself: " +
-             ", ".join(f"GPU {i} has {m} MiB in use" for i, m in busy) +
-             f" (a model server still running?) - {ME} --calibrate measures it later")
+    if busy_skip(cfg, why == "asked for", "the prefill calibration", "the GPU(s)",
+                 f" (a model server still running?) - {ME} --calibrate measures it later"):
         return False
     say()
     say(f"  Prefill calibration: how this PC reads prompts fastest" + (f" ({why})" if why else ""))
@@ -4971,11 +4973,8 @@ def speed_calibration_ds4(cfg_path: Path, cfg: dict, why: str = "") -> bool:
         warn(f"the speed calibration compares the model's DSpark drafter with no drafting, and this pack has no "
              f"drafter: {ME} --setup downloads it")
         return False
-    busy = busy_gpus(cfg)
-    if busy:
-        warn("the speed calibration needs the GPU(s) to itself: " +
-             ", ".join(f"GPU {i} has {m} MiB in use" for i, m in busy) +
-             f" (a model server still running?) - it runs at the next start, or: {ME} --speed-calibration")
+    if busy_skip(cfg, why == "asked for", "the speed calibration", "the GPU(s)",
+                 f" (a model server still running?) - it runs at the next start, or: {ME} --speed-calibration"):
         return False
     say()
     say("  Speed calibration: the DSpark drafter or none?" + (f" ({why})" if why else ""))
@@ -5082,6 +5081,12 @@ def set_ds4_mixed_gpus(cfg: dict, value: str | None) -> None:
     if not exe.is_file():
         warn(f"two GPUs: no CUDA build of maya-ds4 at {exe} - {ME} --setup builds it (or set mixed_exe in the "
              "config); until then the model runs on the AMD GPU alone")
+
+
+def measure_asked(a) -> str:
+    """A setup's speed calibration asked for by name (--speed-calibration, or --drafting measure): "asked for" - it
+    then runs on a GPU that already holds some memory (a display, #794) - else "" (the setup's own: it skips there)."""
+    return "asked for" if getattr(a, "speed_calibration", False) or getattr(a, "drafting", None) == "measure" else ""
 
 
 def drafting_choice(a, drafter: str, minutes: str) -> str:
@@ -5892,7 +5897,7 @@ def set_up(a, prev: dict) -> Path | None:
         else:
             if S.UI is not None:                       # (the screen shows it in the tuning's tab)
                 S.UI.step(9, "speed calibration: DFlash2 or the MTP block")
-            speed_calibration(cfg_path)
+            speed_calibration(cfg_path, measure_asked(a))
     elif g53_one_gpu_drafting(read_json(cfg_path)):    # GLM-5.3 on one APU: drafting kept only where it is faster
         fallback = bool(read_json(cfg_path)["installer"]["one_gpu_drafting"].get("on"))
         how = "on" if fallback else "off"
@@ -5903,7 +5908,7 @@ def set_up(a, prev: dict) -> Path | None:
         else:
             if S.UI is not None:
                 S.UI.step(9, "speed calibration: drafting or not")
-            speed_calibration(cfg_path)
+            speed_calibration(cfg_path, measure_asked(a))
     # the tuning: asked for (--calibrate), or offered when nothing was tuned for this PC and model yet and someone
     # answers (--yes and --no-start setups are not held up by it)
     tuned = None
@@ -7044,7 +7049,7 @@ def set_up_ds4(a, prev: dict) -> Path | None:
         else:
             if S.UI is not None:
                 S.UI.step(9, "speed calibration: the DSpark drafter or none")
-            speed_calibration(cfg_path)
+            speed_calibration(cfg_path, measure_asked(a))
     return cfg_path
 
 
@@ -7617,7 +7622,7 @@ def set_up_mm3(a, prev: dict) -> Path | None:
         else:
             if S.UI is not None:
                 S.UI.step(9, "speed calibration: the DSpark drafter or none")
-            speed_calibration(cfg_path)
+            speed_calibration(cfg_path, measure_asked(a))
     return cfg_path
 
 

@@ -803,6 +803,12 @@ n = no drafting), or pass `--drafting on` / `--drafting off` (`--drafting measur
 measures). Your choice is kept in the config like a measured result, so a start does not measure by itself.
 `--no-speed-calibration` is the same as `--drafting on`.
 
+The measurement wants the GPUs to itself. A measurement Maya starts on its own (the setup's, or once at a start) is
+skipped on a GPU with more than 1 GiB of memory in use, and runs at a later start. One you ask for by name -
+`--speed-calibration`, `--drafting measure`, `--calibrate` - runs anyway, with a warning that names the memory in use:
+a GPU that drives a display holds some memory itself, and it used to be read as another model still loaded (#794).
+Stop a model server that still runs on those GPUs first.
+
 ## DeepSeek: small-prompt path selection
 
 DeepSeek can read a small prompt through the streamed GPU flow or through repeated 16-token windows. It measures

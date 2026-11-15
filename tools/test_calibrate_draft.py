@@ -166,7 +166,7 @@ class InTheSetup(unittest.TestCase):
                "gpu": gpu, "installer": {"draft": "dflash2", "quant": "Maya-S"}}
         self.cfg_path.write_text(json.dumps(cfg), encoding="utf-8")
 
-    def run_it(self, res=None, raises=None, busy=()):
+    def run_it(self, res=None, raises=None, busy=(), why=""):
         calls = []
 
         def fake_run(other, dflash, say=None, other_label=None):
@@ -176,8 +176,9 @@ class InTheSetup(unittest.TestCase):
             return res
         with patch.object(maya.CD, "run", side_effect=fake_run), patch.object(maya, "busy_gpus", return_value=list(busy)), \
                 patch.object(maya, "saved_calibration", return_value=None), patch.object(maya, "say"), \
-                patch.object(maya, "ok"), patch.object(maya, "warn"):
-            out = maya.speed_calibration(self.cfg_path)
+                patch.object(maya, "ok"), patch.object(maya, "warn") as warn:
+            out = maya.speed_calibration(self.cfg_path, why)
+        self.warned = [c.args[0] for c in warn.call_args_list]
         return out, calls, json.loads(self.cfg_path.read_text(encoding="utf-8"))
 
     def test_slower_dflash2_switches_the_config_to_the_mtp_block(self):
@@ -216,6 +217,23 @@ class InTheSetup(unittest.TestCase):
         self.assertFalse(out)
         self.assertEqual(calls, [])
         self.assertTrue(maya.needs_speed_calibration(cfg))
+        self.assertIn("needs the GPU(s) to itself: GPU 0 has 20000 MiB in use", self.warned[0])
+
+    def test_asked_for_it_runs_on_a_gpu_that_drives_a_display(self):
+        # (#794: a display's memory read as another model loaded - --speed-calibration skipped; asked for, it runs,
+        #  and the warning names the memory in use)
+        out, calls, cfg = self.run_it(result("dflash2", o=42.6, d=61.4), busy=[(0, 1800)], why="asked for")
+        self.assertTrue(out)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(cfg["installer"]["speed_calibration"]["kept"], "dflash2")
+        self.assertIn("GPU 0 has 1800 MiB in use", self.warned[0])
+        self.assertIn("measuring anyway, as asked", self.warned[0])
+
+    def test_a_setup_asks_for_it_by_name(self):
+        from types import SimpleNamespace
+        self.assertEqual(maya.measure_asked(SimpleNamespace(speed_calibration=True)), "asked for")
+        self.assertEqual(maya.measure_asked(SimpleNamespace(drafting="measure")), "asked for")
+        self.assertEqual(maya.measure_asked(SimpleNamespace(yes=True)), "")          # (--yes: the setup's own)
 
     def test_which_configs_need_it(self):
         cfg = json.loads(self.cfg_path.read_text(encoding="utf-8"))
