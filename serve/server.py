@@ -413,6 +413,23 @@ class EngineDied(RuntimeError):
     """The engine process ended in the middle of a request (issue #27: on Linux, the out-of-memory killer)."""
 
 
+class EngineFault(EngineDied):
+    """The engine ended an answer itself because of an error - a GPU's fault, a failed decode step, numbers gone
+    non-finite - with nothing asking it to stop (#827: the server called that "length", as if max_tokens had been
+    reached).  Every API reports it as its error (docs/SETTINGS.md, "When the engine stops an answer"), never as a
+    finish reason.  restarts: the engine ends after it (its END line), so the next request starts a fresh one."""
+
+    def __init__(self, message: str, restarts: bool = False):
+        super().__init__(message)
+        self.restarts = restarts
+
+
+def died_text(e: Exception) -> str:
+    """An EngineDied's message for a client: the engine starts again with the next request - unless it is an
+    EngineFault that left the engine running (it says what happened itself)."""
+    return str(e) if isinstance(e, EngineFault) and not e.restarts else f"{e}; the next request restarts it"
+
+
 class ContextOverflow(ValueError):
     """A request too long for the context (rejected, never truncated): a 400 with OpenAI's error code and wording -
     "maximum context length is N tokens" - which OpenAI-compatible clients (opencode, pi-ai, OpenClaw) recognise as a
@@ -1198,6 +1215,29 @@ class StrataEngine:
         if len(f) >= 11:                                  # decode hit rate fields
             self.last.update(hits=int(f[9]), lookups=int(f[10]))
 
+    def _asked_end(self) -> int:
+        """How many times the server told the engine to cut whatever runs (STOP for all, QUIT, WRAP): a request
+        compares it with its own start's (_ended_itself)."""
+        return self.__dict__.get("_ends", 0)
+
+    def _ask_end(self):
+        self.__dict__["_ends"] = self._asked_end() + 1
+
+    def _ended_itself(self, cancel, ends0: int, rid=None) -> None:
+        """A DONE read as the request's own end that says "cancel" while nothing asked for it - no STOP or PAUSE
+        for this request, no cut for all, no cancel - is the engine's own stop on an error (maya-ds4: a decode step
+        or a sample that failed, a GPU's fault; the reason goes to the engine's log).  It used to be reported as
+        "length" (#827); it raises EngineFault, which every API reports as its error."""
+        if (self.last or {}).get("finish") != "cancel" or cancel.is_set() or self._asked_end() != ends0 or \
+                rid in self.__dict__.get("_paused", ()):
+            return
+        gone = bool(getattr(self, "ended", False))       # (its END line: a GPU's state is unknown, it ends now)
+        log = getattr(self, "log_path", None)
+        raise EngineFault(f"the engine stopped this answer itself because of an error after "
+                          f"{self.last.get('generated', 0)} tokens (not the token limit)"
+                          + (": a GPU's state is unknown after it" if gone else "")
+                          + (f"; the reason is in the engine's log ({log})" if log else ""), restarts=gone)
+
     def _parse_stat(self, line):
         """STAT key=value ... (the GLM engine, every few tokens): live expert-tier counters for the Monitor."""
         st = {}
@@ -1362,6 +1402,8 @@ class StrataEngine:
         if self.multi:
             yield from self._generate_multi(ids, max_new, sampling, cancel, embeddings)
             return
+        ends0 = self._asked_end()                         # (_ended_itself: what the server asked of the engine)
+        self.__dict__.setdefault("_paused", set()).discard(None)
         self.progress = None
         self.prefill_tok_s_mean = None
         # an image request takes the same sampling keys as text (#75: it used to decode greedily whatever was asked)
@@ -1444,6 +1486,7 @@ class StrataEngine:
                 elif line.startswith("DONE"):
                     self._parse_done(line)
                     done = True
+                    self._ended_itself(cancel, ends0)
                     return
                 elif line.startswith("ERR"):
                     done = True
@@ -1548,6 +1591,7 @@ class StrataEngine:
 
     def wrap(self):
         """The server is stopping: a request still thinking closes its reasoning at the next token and answers."""
+        self._ask_end()
         try:
             self.proc.stdin.write("WRAP\n")
             self.proc.stdin.flush()
@@ -1558,6 +1602,7 @@ class StrataEngine:
         """generate() on an engine that runs several conversations: this request's GEN carries rid=<id>, its lines come
         back through its own queue (_route), and STOP <id> ends it alone."""
         rid = next(self._rids)
+        ends0 = self._asked_end()                         # (_ended_itself: what the server asked of the engine)
         q: queue.Queue = queue.Queue()
         with self._routes_lock:
             self._routes[rid] = q
@@ -1642,6 +1687,7 @@ class StrataEngine:
                 elif line.startswith("DONE "):
                     self._parse_done("DONE " + line.split(None, 2)[2])
                     done = True
+                    self._ended_itself(cancel, ends0, rid)
                     return
                 elif line.startswith("ERR "):
                     done = True
@@ -1673,6 +1719,7 @@ class StrataEngine:
             with self._routes_lock:
                 if self._routes.get(rid) is q:                # (a restarted engine's table may hold another one)
                     del self._routes[rid]
+            self.__dict__.get("_paused", set()).discard(rid)
             self._tls.rid = None
 
     def pause(self, keep: bool = False):
@@ -1681,6 +1728,9 @@ class StrataEngine:
         before its DONE come as usual.  keep (a request's first slice): the engine first sets its prompt's state
         aside for the chat's next turn, whose history does not repeat the answer as written (no reasoning)."""
         rid = getattr(getattr(self, "_tls", None), "rid", None) if self.multi else None
+        self.__dict__.setdefault("_paused", set()).add(rid)   # (its DONE's "cancel" is this, not an error)
+        if rid is None and self.multi:
+            self._ask_end()
         try:
             if rid is not None:
                 self.proc.stdin.write(f"PAUSE {rid}{' keep' if keep else ''}\n")
@@ -1692,6 +1742,7 @@ class StrataEngine:
 
     def stop(self):
         """End the request in flight at its next step (its answer is cut there)."""
+        self._ask_end()
         if self.can_stop:
             try:
                 self.proc.stdin.write("STOP\n")
@@ -1703,6 +1754,7 @@ class StrataEngine:
         """QUIT, then wait for the engine to end: with kept conversations (MAYA_GLM_SLOT_KEEP) it first writes the
         one it holds, so it gets MAYA_ENGINE_QUIT_S seconds (50; llama-swap's unloadTimeout should exceed it)."""
         wait = float(os.environ.get("MAYA_ENGINE_QUIT_S", "50") or 50)
+        self._ask_end()
         try:
             if self.can_stop:                           # a request in flight ends at its next step first: QUIT
                 self.proc.stdin.write("STOP\n")         # alone lets it run to max_tokens before the engine ends
@@ -4656,6 +4708,14 @@ class Service:
                         held = ""
                     if cancel.is_set():
                         finish = "cancel"
+                except EngineFault as e:                # (#827: the engine ended the answer itself, on an error)
+                    finish = "error"
+                    if e.restarts:
+                        note = self.engine.death_note() if hasattr(self.engine, "death_note") else ""
+                        print(f"[maya] {e}. {note} The next request starts the engine again.", flush=True)
+                    else:
+                        print(f"[maya] {e}. The answer ends there as an error, not as its length.", flush=True)
+                    raise
                 except EngineDied as e:
                     finish = "error"
                     note = self.engine.death_note() if hasattr(self.engine, "death_note") else ""
@@ -4666,16 +4726,19 @@ class Service:
                 except ValueError as e:                 # the engine's ERR line (it may have ended after it)
                     if NONFINITE in str(e) and n > 0:
                         # an answer already under way: it ends here (what was sent stands), and the engine has
-                        # dropped the conversation's state, so the next turn reads it from token 0
-                        finish = "length"
+                        # dropped the conversation's state, so the next turn reads it from token 0.  It is the
+                        # engine's error, not the answer's length (#827): every API reports it as its error
+                        finish = "error"
                         print(f"[maya] the engine's numbers went non-finite after {n} tokens ({e}): the answer ends "
-                              "there", flush=True)
+                              "there, as an error", flush=True)
                         yield from flush()
                         if held:
                             was = parser.state
                             for ev in with_lp(parser.feed(held), was):
                                 yield "event", ev
                             held = ""
+                        raise EngineFault(f"the engine's numbers went non-finite after {n} tokens ({e}); the answer "
+                                          "was cut there (not the token limit)") from e
                     else:
                         finish = "error"
                         print(f"[maya] the engine reported an error: {e}", flush=True)
@@ -5085,7 +5148,7 @@ class StreamJob:
                 if c is not None:                      # heartbeats: each reader writes its own
                     self._add(c)
         except EngineDied as e:
-            self._add({"error": {"type": "server_error", "message": f"{e}; the next request restarts it"}})
+            self._add({"error": {"type": "server_error", "message": died_text(e)}})
         except Exception as e:  # noqa: BLE001 - the engine's ERR after the stream started, or anything else
             self._add({"error": {"type": "server_error", "message": str(e)}})
         finally:
@@ -5746,9 +5809,9 @@ def make_handler(svc: Service):
                 chunks.close()
             except EngineDied as e:
                 if self.answer_started:
-                    line({"error": f"{e}; the next request restarts it"})
+                    line({"error": died_text(e)})
                 else:
-                    self._json(503, {"error": f"{e}; the next request restarts it"})
+                    self._json(503, {"error": died_text(e)})
             finally:
                 if ka == 0:                                      # keep_alive 0: out of memory as soon as it is idle
                     threading.Thread(target=svc.unload, daemon=True).start()
@@ -6290,7 +6353,7 @@ def make_handler(svc: Service):
                 else:
                     self._json(400, error_body(e))
             except EngineDied as e:
-                self._fail(503, "server_error", f"{e}; the next request restarts it")
+                self._fail(503, "server_error", died_text(e))
             except (KeyError, TypeError, AttributeError, IndexError) as e:
                 # a field of the wrong shape (Strata: a 400 with the traceback in the log, not a dropped connection)
                 traceback.print_exc()
@@ -6617,7 +6680,7 @@ def make_handler(svc: Service):
                 cancel.set()                                 # client went away: stop the engine
                 chunks.close()
             except EngineDied as e:                          # mid-stream: say so, then end the stream properly
-                err = {"error": {"type": "server_error", "message": f"{e}; the next request restarts it"}}
+                err = {"error": {"type": "server_error", "message": died_text(e)}}
                 self.wfile.write(b"data: " + json.dumps(err).encode() + b"\n\ndata: [DONE]\n\n")
             except ValueError as e:                          # the engine's ERR after the stream started: the
                 err = {"error": {"type": "server_error", "message": str(e)}}   # headers are sent, so no 400 now
@@ -6703,7 +6766,7 @@ def make_handler(svc: Service):
                 cancel.set()
                 events.close()
             except EngineDied as e:                          # mid-stream: Anthropic's error event
-                err = {"type": "error", "error": {"type": "api_error", "message": f"{e}; the next request restarts it"}}
+                err = {"type": "error", "error": {"type": "api_error", "message": died_text(e)}}
                 self.wfile.write(b"event: error\ndata: " + json.dumps(err).encode() + b"\n\n")
             except ValueError as e:                          # the engine's ERR after the stream started
                 err = {"type": "error", "error": {"type": "api_error", "message": str(e)}}

@@ -430,6 +430,26 @@ as in llama.cpp, so the model goes on with what it would write next instead of s
 fixed answer length. It needs `max_tokens`, and an engine that applies token biases - GLM's and DeepSeek's (which take
 a request's own `logit_bias` as well); MiniMax's does not, so there it is refused.
 
+## When the engine stops an answer
+
+An answer ends with `finish_reason` "length" (Anthropic: `stop_reason` "max_tokens"; Responses: status "incomplete"
+with reason "max_output_tokens") only when it reached its token limit or the context. When the engine stops an
+answer itself because of an error - a GPU's fault, a failed decode step, numbers gone non-finite - the request ends
+with that API's own error instead, never with a finish reason a client would take for the limit:
+
+| API | Streamed | Not streamed |
+|---|---|---|
+| OpenAI chat completions | the text already sent stands; then a `data: {"error": {"type": "server_error", ...}}` chunk and `data: [DONE]` (no `finish_reason` chunk) | HTTP 503, `server_error` |
+| Anthropic messages | the text already sent stands; then `event: error` (`api_error`), no `message_delta` with a `stop_reason` | HTTP 503, `server_error` |
+| Responses | `response.failed` with `error.code` "server_error" | HTTP 500, the response with status "failed" |
+| Maya's model API (`/api/chat`, `/api/generate`) | a last line `{"error": ...}`, no `done: true` line | HTTP 503 with `{"error": ...}` |
+
+The documented finish reasons have no "error" value (OpenAI's are stop / length / tool_calls / content_filter /
+function_call, Anthropic's end_turn / max_tokens / stop_sequence / tool_use / pause_turn / refusal), so a new one
+would be read as a normal end by some clients; the error forms above are the ones every client handles (the OpenAI and
+Anthropic SDKs raise an error on them, and try a 5xx again). The message says how many tokens the answer had and that
+the reason is in the engine's log; after a GPU's fault the engine ends, and the next request starts a fresh one.
+
 ## The thinking level and the thinking budget
 
 Two config settings shape the thinking, and only one of them counts tokens:
