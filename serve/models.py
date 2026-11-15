@@ -192,12 +192,16 @@ def context_range(trained: int | None, current: int, engine_kind: str = "") -> d
 
 # ------------------------------------------------------------------ what a config can be switched to
 def dflash_file(cfg: dict) -> Path | None:
-    """GLM's DFlash2 drafter: the one the config drafts with, else one a setup downloaded into its models folder."""
+    """GLM's configured/local DFlash2 drafter, else the matching model family's downloaded one."""
     p = flag(cfg.get("args") or [], "--dflash")
     if p:
         return Path(p)
-    models = (cfg.get("installer") or {}).get("models_dir")
-    d = Path(models) / "GLM-5.3-Flash-DFlash2" if models else None
+    inst = cfg.get("installer") or {}
+    if local := inst.get("local_drafter"):
+        return Path(local) if Path(local).is_file() else None
+    models = inst.get("models_dir")
+    folder = "GLM-5.3-DFlash2" if G53.config_is_glm_dsa(cfg) else "GLM-5.3-Flash-DFlash2"
+    d = Path(models) / folder if models else None
     try:
         found = sorted(d.glob("*.gguf")) if d is not None and d.is_dir() else []
     except OSError:
@@ -320,9 +324,10 @@ def _choices(cfg: dict) -> dict:
         return {"draft": ["mtp", "none"] if qwen_mtp(cfg) is not None else ["none"],
                 "images": bool(cfg.get("vision") or cfg.get("vision_off"))}
     if G53.config_is_glm_dsa(cfg):
-        # GLM-5.3 (744B): text only (no vision tower), its NextN block drafts (DFlash2's drafter is GLM-5.3-Flash's),
-        # and what its engine serves today - KV streaming, answers at once decoded together (glm_dsa_product)
-        return {"draft": ["mtp"], "images": False, "text_only": True, "dflash2": False,
+        # GLM-5.3 (744B): text only; its own DFlash2 can replace NextN, with compatibility checked by the engine.
+        dflash = dflash_file(cfg) is not None
+        return {"draft": ["mtp", "dflash2"] if dflash else ["mtp"], "images": False, "text_only": True,
+                "dflash2": dflash,
                 "kv_streaming": G53.KV_STREAMING, "batched": G53.BATCHED_ROWS}
     f = dflash_file(cfg)
     return {"draft": ["mtp", "dflash2"] if f is not None else ["mtp"],
@@ -615,7 +620,7 @@ def apply(cfg: dict, settings: dict) -> dict:
         par = _num(s, "parallel", 1, 8, "Answers at once", none_ok=False)
         args = set_flag(args, "--parallel", par) if par > 1 or "--parallel" in args else args
         if s.get("draft") not in can["draft"]:
-            raise ValueError("Drafting: GLM-5.3 drafts with its own MTP (NextN) block" if dsa else
+            raise ValueError("Drafting: add GLM-5.3's own DFlash2 drafter through setup's Link files" if dsa else
                              "Drafting: the DFlash2 drafter is not on this PC (the setup's --draft dflash2 downloads "
                              "it)" if s.get("draft") == "dflash2" else "Drafting: MTP or DFlash2")
         if s["draft"] == "dflash2":

@@ -41,6 +41,12 @@ UD-IQ2_M".
 Builds: NVIDIA from the Tesla V100 on (CUDA, Linux and Windows) and AMD (HIP), as GLM-5.3-Flash's. Not on Metal;
 Pascal cards are not supported for it. EXL3 quants of GLM-5.3 are not supported yet.
 
+For a local model with its own DFlash2 drafter, choose **GLM-5.3 → Add downloaded model**, select the model directory,
+then choose the drafter in **Drafter → Browse files...** and **Link files**. The drafter can be in another directory;
+the setup links it without copying the weights or checking size/SHA-256. Its path is saved in the config and can be
+selected again on the Models page after switching to MTP. Use a drafter made for GLM-5.3, rather than Flash's drafter;
+the engine checks its hidden size, vocabulary and target layers. Leave **Vision: None**.
+
 ## Context and memory
 
 Its attention cache takes **64,352 bytes a token** (the latent cache in INT8, the default; 102,272 in FP16 with

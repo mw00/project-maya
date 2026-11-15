@@ -285,8 +285,20 @@ class LocalGlm53(unittest.TestCase):
         self.assertIsNone(maya.link_glm_local(self.models, self.chosen(), family="glm53"))
         self.assertFalse(self.models.exists())
 
-    def test_glm53_uses_its_builtin_mtp_and_has_no_vision(self):
-        for role, arch in (("drafter", "dflash"), ("vision", "clip")):
+    def test_glm53_links_an_external_dflash2_without_moving_it(self):
+        chosen = self.chosen()
+        draft = gguf(self.root / "external" / "GLM-5.3-DFlash2-Q4_K_M.gguf", "dflash")
+        chosen["drafter"] = maya.review_candidate(draft, "drafter", [draft])
+        with patch.object(maya, "choose", side_effect=[1, 3]), \
+                patch.object(maya, "review_pick_file", return_value=chosen["drafter"]):
+            linked = maya.review_downloaded_model(SimpleNamespace(), self.source, self.models, "glm53")
+        self.assertTrue(draft.is_file())
+        self.assertTrue(linked["drafter"].is_symlink())
+        self.assertEqual(linked["drafter"].resolve(), draft)
+        self.assertTrue(MI.is_linked(linked["drafter"]))
+
+    def test_glm53_rejects_vision_and_non_dflash_drafters(self):
+        for role, arch in (("drafter", "qwen4exp"), ("vision", "clip")):
             with self.subTest(role=role):
                 chosen = self.chosen()
                 companion = gguf(self.root / f"{role}.gguf", arch)
@@ -295,7 +307,15 @@ class LocalGlm53(unittest.TestCase):
                 self.assertFalse(self.models.exists())
 
     def test_menu_continues_setup_and_writes_glm53_settings(self):
+        self.check_menu_setup()
+
+    def test_menu_keeps_the_selected_glm53_dflash2_in_the_config(self):
+        self.check_menu_setup(with_drafter=True)
+
+    def check_menu_setup(self, with_drafter=False):
         from tools.test_maya_glm53_setup import INDEX
+        if with_drafter:
+            gguf(self.source / "drafter" / "GLM-5.3-DFlash2-Q4_K_M.gguf", "dflash")
         linked = self.link()
         pack = linked["folder"] / "pack"
         (pack / "tokenizer").mkdir(parents=True)
@@ -312,6 +332,7 @@ class LocalGlm53(unittest.TestCase):
             "saved_calibration": lambda *args, **kwargs: None, "profile_fits": lambda *_: False,
             "mem_gb": lambda: (512, 400), "setup_gpus": lambda *_: [],
             "ablate_step": lambda *args: None, "write_run_script": lambda *args: self.root / "run-test.sh",
+            "drafting_choice": lambda *args: "on", "keep_drafting": lambda *args: None,
         }
         with patch.multiple(maya, **replacements), patch.object(maya.S, "gpus", return_value=[]), \
                 patch.object(maya, "choose_draft", side_effect=AssertionError("downloaded Flash drafter")), \
@@ -323,10 +344,16 @@ class LocalGlm53(unittest.TestCase):
             self.assertEqual(cfg["model_name"], "glm-5.3")
             self.assertEqual(cfg["sampling"], {"temperature": 1.0, "top_p": 0.95})
             self.assertEqual(cfg["installer"]["gguf"], str(linked["model"]))
-            self.assertEqual(cfg["installer"]["draft"], "mtp")
-            self.assertIsNone(cfg["installer"]["local_drafter"])
+            self.assertEqual(cfg["installer"]["draft"], "dflash2" if with_drafter else "mtp")
+            if with_drafter:
+                self.assertEqual(cfg["installer"]["local_drafter"], str(linked["drafter"]))
+                self.assertEqual(maya.flag_value(cfg["args"], "--dflash"), str(linked["drafter"]))
+                self.assertEqual(maya.drafter_file(cfg), linked["drafter"])
+                self.assertFalse(any("drafting with the NextN" in str(call) for call in maya.warn.call_args_list))
+            else:
+                self.assertIsNone(cfg["installer"]["local_drafter"])
+                self.assertNotIn("--dflash", cfg["args"])
             self.assertNotIn("vision", cfg)
-            self.assertNotIn("--dflash", cfg["args"])
             self.assertEqual(maya.flag_value(cfg["args"], "--kv-streaming"), "off")
             # A later setup must plan cache memory from this local config,
             # including settings the user changed since the first setup.

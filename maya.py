@@ -3185,8 +3185,8 @@ def link_glm_local(models: Path, chosen: dict, family: str = "glm") -> dict | No
         warn(f"{missing.name} is missing; finish the model download before linking")
         return None
     drafter, vision = chosen["drafter"], chosen["vision"]
-    if family == "glm53" and (drafter or vision):
-        warn("GLM-5.3 uses its built-in MTP block and is text only; set Drafter and Vision to None")
+    if family == "glm53" and vision:
+        warn("GLM-5.3 is text only; set Vision to None")
         return None
     if drafter and (drafter["anchor"].suffix.lower() != ".gguf" or gguf_head(drafter["anchor"])[0] != "dflash"):
         warn(f"{drafter['path'].name}: select a DFlash2 GGUF, or None to use the model's own MTP block")
@@ -5017,6 +5017,8 @@ def drafter_file(cfg: dict) -> Path | None:
     local = (cfg.get("installer") or {}).get("local_drafter")
     if local:
         return Path(local) if Path(local).is_file() else None
+    if G53.config_is_glm_dsa(cfg):
+        return None                                   # the downloaded default is Flash's drafter
     models = (cfg.get("installer") or {}).get("models_dir")
     f = Path(models) / "GLM-5.3-Flash-DFlash2" / DFLASH["file"] if models else None
     return f if f is not None and f.is_file() else None
@@ -6123,12 +6125,13 @@ def set_up(a, prev: dict) -> Path | None:
     if got is None:
         return None
     d, shards, quant = got
-    dsa = kind_is_glm_dsa(choice, shards)              # GLM-5.3 (glm-dsa): text only, NextN drafting
+    dsa = kind_is_glm_dsa(choice, shards)              # GLM-5.3 (glm-dsa): text only, NextN or its own DFlash2
     if dsa and metal:
         fail(f"{G53.SHOWN} runs on NVIDIA and AMD GPUs (not on Metal yet)", f"{ME} --setup picks another model")
     if dsa:
         S.model_named(G53.SHOWN)                       # (the header: GLM-5.3, not GLM-5.3-Flash)
-        draft = maya_sync.draft_for(draft, G53.ARCH, warn)
+        draft = maya_sync.draft_for(draft, G53.ARCH, warn,
+                                    own_drafter=bool(linked and linked.get("drafter")))
         have = g53_memory_gb(pc)                       # (neutral memory guidance, no speeds)
         (ok if have is not None and have >= g53_figures(quant)[0] else warn)(
             f"{G53.SHOWN}: {g53_memory_note(pc, quant)}")

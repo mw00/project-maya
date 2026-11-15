@@ -377,8 +377,10 @@ function fieldsOf(m, d) {
             (m.choices.batched === false ? ` On ${shownOf(m)} they are answered one after another for now.` : "")}>
           <${Stepper} label="Answers at once" value=${d.parallel} min=${1} max=${8} on=${(v) => setDraft({parallel: v})}/><//>`,
         html`<${Row} label="Drafting" flag="--dflash" changed=${ch("draft")}
-          hint=${dflash ? "MTP is built into the model. DFlash2 is a separate drafter, often faster for one answer at a time."
-            : m.choices.dflash2 === false ? `MTP is built into the model: ${shownOf(m)} drafts with it (DFlash2's drafter is made for GLM-5.3-Flash).`
+          hint=${m.choices.text_only ? `MTP is built into the model: ${shownOf(m)} drafts with it. ${dflash
+              ? "DFlash2 uses this model's own drafter selected during setup."
+              : "To use DFlash2, add this model's own drafter through setup's Link files."}`
+            : dflash ? "MTP is built into the model. DFlash2 is a separate drafter, often faster for one answer at a time."
             : "MTP is built into the model. DFlash2 needs its drafter: the setup's --draft dflash2 downloads it (0.7 GB)."}
           warn=${d.draft === "dflash2" && d.parallel > 1 ? `DFlash2 drafts for one answer at a time: with ${d.parallel} at once the engine drafts with MTP.` : null}>
           <${Seg} label="Drafting" value=${d.draft} options=${[{id: "mtp", label: "MTP"}, ...(dflash ? [{id: "dflash2", label: "DFlash2"}] : [])]}

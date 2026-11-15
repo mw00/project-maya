@@ -174,7 +174,7 @@ class Apply(Base):
     def test_kv_streaming_refused_and_switched_off(self):
         cfg = M.read(self.g53)
         for bad, why in (({"kv_streaming": True}, "KV streaming"), ({"kv_resident": 49152}, "KV streaming"),
-                         ({"images": True}, "text only"), ({"draft": "dflash2"}, "MTP \\(NextN\\)")):
+                         ({"images": True}, "text only"), ({"draft": "dflash2"}, "GLM-5.3's own DFlash2")):
             with self.assertRaisesRegex(ValueError, why, msg=bad):
                 M.apply(cfg, bad)
         older = M.read(g53_cfg(self.d, "maya-older.json", kv_streaming="on"))
@@ -205,6 +205,25 @@ class Apply(Base):
             M.apply(dict(cfg, vision=None), {"images": True})
         with self.assertRaisesRegex(ValueError, "the setup's --draft dflash2 downloads it"):
             M.apply(cfg, {"draft": "dflash2"})
+
+    def test_glm53_can_switch_to_its_selected_local_drafter_and_back(self):
+        cfg = M.read(self.g53)
+        draft = self.d / "external" / "GLM-5.3-DFlash2-Q4_K_M.gguf"
+        draft.parent.mkdir()
+        draft.write_bytes(b"drafter")
+        cfg["installer"]["local_drafter"] = str(draft)
+        self.assertEqual(M.dflash_file(cfg), draft)
+        self.assertEqual(M.choices(cfg)["draft"], ["mtp", "dflash2"])
+        self.assertTrue(M.choices(cfg)["dflash2"])
+        new = M.apply(cfg, {"draft": "dflash2"})
+        self.assertEqual(M.flag(new["args"], "--dflash"), str(draft))
+        self.assertEqual(M.settings_of(new)["draft"], "dflash2")
+        restored = M.apply(new, {"draft": "mtp"})
+        self.assertNotIn("--dflash", restored["args"])
+        self.assertEqual(M.choices(restored)["draft"], ["mtp", "dflash2"])
+        self.assertEqual(M.apply(restored, {"draft": "dflash2"})["args"], new["args"])
+        draft.unlink()
+        self.assertEqual(M.choices(restored)["draft"], ["mtp"])
 
 
 class Turbo(Base):
@@ -350,6 +369,8 @@ const g53 = {...base, model: "glm-5.3", quant: "UD-IQ2_M", shown: "GLM-5.3 (744B
              choices: {draft: ["mtp"], images: false, text_only: true, dflash2: false, kv_streaming: false, batched: false}};
 M.MS.data = {gpus: [{index: 0, name: "GPU", vram_gb: 32}]};
 const out = {flash: ser(M.fieldsOf(flash, {...flash.settings})), g53: ser(M.fieldsOf(g53, {...g53.settings}))};
+const g53Dflash = {...g53, choices: {...g53.choices, draft: ["mtp", "dflash2"], dflash2: true}};
+out.g53_dflash = ser(M.fieldsOf(g53Dflash, {...g53Dflash.settings, draft: "dflash2"}));
 for (const [k, t] of Object.entries({off: {on: false}, hidden: {on: false, hidden: true}})) {
   st.S.turbo = t;
   out["turbo_" + k] = ser(T.TurboButton());
@@ -388,8 +409,14 @@ class PageJs(unittest.TestCase):
         self.assertTrue(g["Answers at once"]["hint"].endswith("On GLM-5.3 (744B) they are answered one after another "
                                                               "for now."))
         self.assertIn("GLM-5.3 (744B) drafts with it", g["Drafting"]["hint"])
+        self.assertIn("Link files", g["Drafting"]["hint"])
         ctx = json.dumps(g["Context size"])
         self.assertIn("7.9 GB of GPU memory for the context", ctx)                # (131072 x 64,352 bytes)
+
+    def test_glm53_selected_dflash_is_offered_on_the_page(self):
+        row = rows_of(self.got["g53_dflash"])["Drafting"]
+        self.assertIn("own drafter selected during setup", row["hint"])
+        self.assertIn('"id": "dflash2"', json.dumps(row["children"]))
 
     def test_flash_fields_as_before(self):
         f = rows_of(self.got["flash"])

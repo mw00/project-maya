@@ -97,6 +97,9 @@ class LayoutTests(unittest.TestCase):
         self.assertTrue(said and "NextN" in said[0])
         self.assertEqual(maya_sync.draft_for("dflash2", "glm5next", said.append), "dflash2")
         self.assertEqual(maya_sync.draft_for("mtp", "glm-dsa", said.append), "mtp")
+        said.clear()
+        self.assertEqual(maya_sync.draft_for("dflash2", "glm-dsa", said.append, own_drafter=True), "dflash2")
+        self.assertFalse(said)
 
 
 class ProfileToolTests(unittest.TestCase):

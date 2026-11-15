@@ -7,7 +7,8 @@ v1.1.3 added (docs/strata/engine/MAYA-SYNC.md):
     experts) to every GLM config, and the engine refuses a profile of another layout - so a glm-dsa pack gets ITS
     profile (<pack>/expert-profile.bin, tools/strata/glm_dsa_profile.py) when it has one that fits, else none
     (profile_for);
-  * the DFlash2 drafter is a GLM-5.3-Flash drafter: a glm-dsa model keeps its NextN block (draft_for).
+  * the downloaded DFlash2 default is GLM-5.3-Flash's: glm-dsa keeps its NextN block unless its own drafter was
+    selected (draft_for).
 
 Flash packs are answered exactly as Maya v1.1.3 answers them (the shipped profile, the asked draft).
 """
@@ -69,11 +70,10 @@ def is_glm_dsa(arch: str) -> bool:
     return arch == "glm-dsa"
 
 
-def draft_for(draft: str, arch: str, warn=print) -> str:
-    """The setup's drafting choice for a model of `arch`: glm-dsa keeps its NextN (MTP) block - the DFlash2 drafter
-    is made for GLM-5.3-Flash and the engine refuses it there."""
-    if draft == "dflash2" and is_glm_dsa(arch):
-        warn("GLM-5.3 (glm-dsa) drafts with its NextN block: the DFlash2 drafter is made for GLM-5.3-Flash "
-             "(and is offered on sm_80+ GPUs only) - drafting with the MTP block")
+def draft_for(draft: str, arch: str, warn=print, *, own_drafter: bool = False) -> str:
+    """Keep a selected drafter; glm-dsa must not download Flash's default DFlash2. The engine checks compatibility."""
+    if draft == "dflash2" and is_glm_dsa(arch) and not own_drafter:
+        warn("GLM-5.3 (glm-dsa): the downloaded DFlash2 default is made for GLM-5.3-Flash - drafting with the NextN "
+             "(MTP) block; use Add downloaded model to select GLM-5.3's own DFlash2 drafter")
         return "mtp"
     return draft
