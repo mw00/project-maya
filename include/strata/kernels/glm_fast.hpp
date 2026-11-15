@@ -323,6 +323,10 @@ struct MoeDev {
     // the routing ring's shape (ring_entry below): ring_n entries (a power of two) of ring_stride bytes; 0, 0: kRingSize
     // entries of sizeof(MoeRequest)
     unsigned int ring_n = 0, ring_stride = 0;
+    // host-mapped [8] (nullptr: none): a bounded wait for the host's answer that gave up - [0] how many, [1] the kind
+    // (1 moe_wait, 2 the CPU lane's answer, 3 a deferred CPU answer, 4 a rows step's CPU answer, 5 wait_fetch), [2] the
+    // seq it waited for, [3] the seq it saw.  Only written when a wait times out (~25-60 s): the stall report reads it
+    unsigned int* wait_diag = nullptr;
 };
 /// The widest residual the host-mapped routing structs below carry (glm5-next 4096, glm-dsa 6144).
 constexpr int kMaxEmbd = 8192;
