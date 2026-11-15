@@ -75,5 +75,7 @@ if(STRATA_BUILD_TESTS AND (STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP) AND TARGET s
   target_link_libraries(glmd_mmq_pad_gpu_test PRIVATE strata_mmq strata_engine ggml-base)
   glm_dsa_hip_links(glmd_mmq_pad_gpu_test)
   add_test(NAME glmd_mmq_pad_gpu_test COMMAND glmd_mmq_pad_gpu_test)
-  set_tests_properties(glmd_mmq_pad_gpu_test PROPERTIES LABELS gpu SKIP_RETURN_CODE 77)
+  # (a TIMEOUT of its own: without one a command-line ctest --timeout 150 applied; the CPU quantization of its
+  # experts is its long part - minutes on a 2 GHz Xeon until it quantized 512 rows a case)
+  set_tests_properties(glmd_mmq_pad_gpu_test PROPERTIES LABELS gpu SKIP_RETURN_CODE 77 TIMEOUT 600)
 endif()

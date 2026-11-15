@@ -13,7 +13,10 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parent))   # runnable from the repo root too
 
 from _paths import add_gguf_py
-add_gguf_py()
+try:                            # (iq_pack itself loads llama.cpp's gguf-py: no tree, nothing here can run)
+    add_gguf_py()
+except SystemExit as e:
+    raise unittest.SkipTest(str(e))
 from gguf import GGUFWriter, GGMLQuantizationType as Q, quants
 import iq_pack
 

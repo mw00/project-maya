@@ -68,7 +68,16 @@ int main(int argc, char** argv) {
         std::printf("  CPU lacks %s - the VNNI path cannot run here; pool test SKIPPED, not passed.\n",
                     feat.reason());
         std::printf("\npool: 0 failures, 1 SKIPPED\n");
-        return 0;
+        return 77;                                      // (ctest's SKIP_RETURN_CODE: reported as skipped, not passed)
+    }
+
+    // the pack is not in the repo: not on this PC, SKIPPED with the file named (exit 77) - never a pass; a pack that
+    // is there but too short still fails below
+    if (std::FILE* f = std::fopen(path, "rb")) {
+        std::fclose(f);
+    } else {
+        std::printf("pool_test: SKIPPED, the pack is not on this PC: %s (give it with --file)\n", path);
+        return 77;
     }
 
     int bad = 0;

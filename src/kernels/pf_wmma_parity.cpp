@@ -143,23 +143,41 @@ int run(int ty, int n_out, int K, std::mt19937& rng, bool use_ids, bool down, bo
     for (int r = 0; r < yrows; ++r)
         for (int n = 0; n < ldy; ++n)
             if ((r < base || r >= total || n >= n_out) && y[(size_t) r * ldy + n] != SENT) ++bad;
+    // The double reference: every output's sum over kk in order, as before - but the FP16 values are read as float
+    // once (not by a host __half2float per multiply-add) and four outputs' chains run side by side.  The same sums;
+    // one dependency chain at a time took the whole test past its 300 s ctest timeout on a 2 GHz Xeon.
+    std::vector<float> xf(x.size());
+    for (size_t i = 0; i < x.size(); ++i) xf[i] = __half2float(x[i]);
+    std::vector<float> wf((size_t) 4 * K);
     double worst = 0, scale = 0;
-    for (int e = 0; e < E; ++e)
-        for (int r = bounds[e]; r < bounds[e + 1]; ++r) {
-            const __half* xr = &x[(size_t) (use_ids ? ids[(size_t) r] : r) * ldx];
-            for (int n = 0; n < n_out; ++n) {
-                double s = 0;
-                const int we = use_ids ? (down ? e : E - 1 - e) : e;
-                const uint16_t* wr = &q[((size_t) we * n_out + n) * K];
+    for (int e = 0; e < E; ++e) {
+        const int we = use_ids ? (down ? e : E - 1 - e) : e;
+        for (int n0 = 0; n0 < n_out; n0 += 4) {
+            const int nn = std::min(4, n_out - n0);
+            std::fill(wf.begin(), wf.end(), 0.f);
+            for (int j = 0; j < nn; ++j) {
+                const uint16_t* wr = &q[((size_t) we * n_out + n0 + j) * K];
                 for (int kk = 0; kk < K; ++kk) {
                     const __half h = __half_raw{wr[kk]};
-                    s += (double) __half2float(h) * (double) __half2float(xr[kk]);
+                    wf[(size_t) j * K + kk] = __half2float(h);
                 }
-                scale = std::max(scale, std::fabs(s));
-                if (!std::isfinite(y[(size_t) r * ldy + n]) || !std::isfinite(s)) ++bad;
-                worst = std::max(worst, std::fabs(s - (double) y[(size_t) r * ldy + n]));
+            }
+            for (int r = bounds[e]; r < bounds[e + 1]; ++r) {
+                const float* xr = &xf[(size_t) (use_ids ? ids[(size_t) r] : r) * ldx];
+                double s[4] = {0, 0, 0, 0};
+                for (int kk = 0; kk < K; ++kk) {
+                    const double xv = (double) xr[kk];
+                    for (int j = 0; j < 4; ++j) s[j] += (double) wf[(size_t) j * K + kk] * xv;
+                }
+                for (int j = 0; j < nn; ++j) {
+                    const int n = n0 + j;
+                    scale = std::max(scale, std::fabs(s[j]));
+                    if (!std::isfinite(y[(size_t) r * ldy + n]) || !std::isfinite(s[j])) ++bad;
+                    worst = std::max(worst, std::fabs(s[j] - (double) y[(size_t) r * ldy + n]));
+                }
             }
         }
+    }
     const bool ok = worst <= 2e-5 * scale + 1e-6 && bad == 0;
     std::printf("%-8s %5d x %4d, %d rows in %d experts%s: max |err| %.3g of max |ref| %.3g, %d stray %s\n", name_of(ty),
                 n_out, K, total - base, E, use_ids ? (down ? " (ids, down)" : " (ids)") : "", worst, scale, bad, ok ? "ok" : "FAIL");

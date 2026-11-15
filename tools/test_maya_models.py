@@ -2,6 +2,7 @@
 24 GB recommendation, the EXL3 model on NVIDIA only) and that every download names a hash per file.  No GPU, no
 network."""
 from pathlib import Path
+import os
 import shlex
 import sys
 import tempfile
@@ -288,8 +289,9 @@ class RestartAfterUpdate(unittest.TestCase):
         self.assertFalse(left)                          # (read once: a later port change is not a switch)
 
     def test_an_old_note_is_not_followed(self):
-        got, _, left = self.after({"why": "switch", "port": 8123, "time": 0}, config=Path("/x/maya-maya-m.json"))
-        self.assertEqual(got, {"--config": "/x/maya-maya-m.json", "--backend": "cuda"})
+        config = Path("/x/maya-maya-m.json")
+        got, _, left = self.after({"why": "switch", "port": 8123, "time": 0}, config=config)
+        self.assertEqual(got, {"--config": str(config), "--backend": "cuda"})   # (as the OS writes the path)
         self.assertFalse(left)
 
 
@@ -311,7 +313,10 @@ class RunScript(unittest.TestCase):
             mine, other = Path(d) / "maya-maya-l.json", Path(d) / "maya-maya-s.json"
             for p in (mine, other):
                 p.write_text("{}")
+            # (MAYA_SH: a POSIX Python outside a venv would re-start main() through ./maya.sh - an exec that ended
+            # the whole test run there without a word)
             with patch.object(maya, "configs", return_value=[other, mine]), patch.object(maya, "say"), \
+                    patch.dict(os.environ, MAYA_SH="1"), \
                     patch.object(maya.sys, "argv", ["maya.py", "--config", str(mine), "--port", "8091"]), \
                     patch.object(maya, "ask", side_effect=AssertionError("no question: --config names it")), \
                     patch.object(maya, "start", return_value=0) as start:

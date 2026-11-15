@@ -1414,8 +1414,11 @@ class MayaQuants(unittest.TestCase):
                 maya.ds4_gguf_model("maya-s")
 
     def test_published(self):
+        # (a PC that holds Maya-S: its RAM and its GPU both set here - the test host's own GPUs picked Maya-XS on a
+        # 32 GB card, where Maya-S has under FIT_MIN_VRAM_SHARE of it in VRAM)
         with self.published(), patch.object(maya.S, "UI", None), \
-                patch.object(maya, "mem_gb", return_value=(512.0, 500.0)):   # (a PC that holds Maya-S)
+                patch.object(maya, "mem_gb", return_value=(512.0, 500.0)), \
+                patch.object(maya.S, "gpus", return_value=[{"index": 0, "arch": 90, "name": "test GPU", "vram_gb": 80.0}]):
             self.assertTrue(maya.ds4_maya_published("maya-s"))
             self.assertFalse(maya.ds4_maya_published("maya-m"))
             self.assertEqual(maya.choose_ds4_quant(args(ds4_quant=None), {}), "maya-s")   # (recommended)
