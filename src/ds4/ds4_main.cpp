@@ -809,7 +809,12 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
     // fresh one), and once that DONE is out the engine ends (exit 3, as its watchdog does).  Staying up, it refused
     // every later request until a restart by hand
     bool ending = false;
-    const auto end_note = [&m, &ending] {   // (before a request's DONE)
+    // (#827: the decode's own reason - the failed call, the position - went to this log only, and the console read
+    //  just "a GPU's state is unknown" or, a request later, the next call's error: END carries it now)
+    std::string fault_why;
+    const auto end_note = [&m, &ending, &fault_why] {   // (before a request's DONE)
+        const std::string why = std::move(fault_why);
+        fault_why.clear();
         if (ending || !m.broken()) return;
         ending = true;
         if (m.pool_lost()) {   // (MAYA_MIXED_FRONT: its second engine is gone - the server goes on without it)
@@ -818,8 +823,8 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             std::fprintf(stderr, "maya ds4 serve: the second GPU's engine is gone - the engine ends (exit 4)\n");
             return;
         }
-        std::printf("END a GPU's state is unknown after this request - the engine ends (exit 3); the next request "
-                    "starts a fresh one\n");
+        std::printf("END a GPU's state is unknown after this request%s%s%s - the engine ends (exit 3); the next "
+                    "request starts a fresh one\n", why.empty() ? "" : " (", why.c_str(), why.empty() ? "" : ")");
         std::fprintf(stderr, "maya ds4 serve: a GPU's state is unknown after this request - the engine ends (exit 3) "
                              "so the server starts it again for the next request\n");
     };
@@ -1940,6 +1945,8 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             }
             if (tok < 0) {   // (a sample's CUDA error, printed by the sampler: no T -1 to the client)
                 std::fprintf(stderr, "ds4: the sample failed\n");
+                fault_why = "the sample failed after " + std::to_string(produced) + " tokens, at position " +
+                            std::to_string(m.pos()) + " of a " + std::to_string(m.max_context()) + "-token context";
                 finish = "cancel";
                 break;
             }
@@ -1975,6 +1982,11 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                            r.min_p, r.seed, counter, got,
                            off, acc, err, r.cum, r.lookup == 0 ? nullptr : lk, dc)) {
                     std::fprintf(stderr, "ds4: %s\n", err.c_str());
+                    fault_why = err + " - after " + std::to_string(produced) + " tokens, at position " +
+                                std::to_string(m.pos()) + " of a " + std::to_string(m.max_context()) +
+                                "-token context, a round of up to " + std::to_string(room) + " tokens" +
+                                (try_spec ? " with drafts" : "");
+                    std::fprintf(stderr, "ds4: the decode stopped: %s\n", fault_why.c_str());
                     finish = "cancel";
                     break;
                 }
@@ -2393,6 +2405,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                 if (!round(m, a.tok, room, try_spec, a.r.conf >= 0 ? a.r.conf : conf_min, a.r.temperature, a.r.top_p,
                            a.r.top_k, a.r.min_p, a.r.seed, a.counter, a.got, off, acc, err, a.r.cum, L, dc)) {
                     std::fprintf(stderr, "ds4: %s\n", err.c_str());
+                    fault_why = err;
                     a.finish = "cancel";
                     a.done = true;
                 } else {
@@ -2413,6 +2426,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                 const double t_step = now_ms();   // (DS4_DRAFT_COST: the step's time, its drafting included)
                 const auto cancel_all = [&] {
                     std::fprintf(stderr, "ds4: %s\n", err.c_str());
+                    fault_why = err;
                     for (Act* a : need) {
                         a->finish = "cancel";
                         a->done = true;
