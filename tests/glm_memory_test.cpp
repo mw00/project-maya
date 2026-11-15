@@ -158,6 +158,16 @@ int main() {
     assert(pool_reserve(2 * G + 299 * M, R, false, false, 2 * G, S) == std::make_pair(R, false));    // short anyway
     assert(pool_reserve(2 * G + 500 * M, R, true, false, 2 * G, S) == std::make_pair(R, false));     // given
     assert(pool_reserve(2 * G + 500 * M, R, false, true, 2 * G, S) == std::make_pair(R, false));     // --expert-cache N
+    // #899: the "no room" error names a smaller hand-set reserve only where it can make the room; a budget of 0 (the
+    // free VRAM read no more than the reserve) or more short than the whole reserve says it cannot; a default: nothing
+    using strata::core::glmfast::reserve_hint;
+    using strata::core::glmfast::ReserveHint;
+    assert(reserve_hint(true, 2 * G, 600 * M, 3072 * M) == ReserveHint::smaller);
+    assert(reserve_hint(true, 2 * G, 3072 * M, 3072 * M) == ReserveHint::smaller);
+    assert(reserve_hint(true, 0, 600 * M, 3072 * M) == ReserveHint::budget_zero);                   // (#899's case)
+    assert(reserve_hint(true, 2 * G, 4 * G, 3072 * M) == ReserveHint::short_beyond);
+    assert(reserve_hint(false, 0, 600 * M, R) == ReserveHint::none);
+    assert(reserve_hint(false, 2 * G, 600 * M, R) == ReserveHint::none);
     // The written budget's check (20 GiB asked, 700 MiB reserve): free as planned gives nothing back; 200 MiB free
     // gives back the 500 short + 64; nearly nothing free 1 GiB twice, then a quarter; a refused piece what it refused
     using strata::core::glmfast::pool_give_back;
