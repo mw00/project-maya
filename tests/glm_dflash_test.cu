@@ -87,8 +87,11 @@ std::vector<float> q8(const float* x, size_t n) {
     for (size_t b = 0; b + 32 <= n; b += 32) {
         float am = 0;
         for (int i = 0; i < 32; ++i) am = std::max(am, std::fabs(y[b + i]));
-        const float d = am / 127.0f;
-        for (int i = 0; i < 32; ++i) y[b + i] = d > 0 ? std::round(y[b + i] / d) * d : 0.0f;
+        const float d = std::min(am / 127.0f, 65504.0f);
+        // Codes use the F32 scale; GPU dot products read that scale back from the q8_1 block's FP16 field.
+        const float stored_d = __half2float(__float2half(d));
+        for (int i = 0; i < 32; ++i)
+            y[b + i] = d > 0 ? std::clamp(std::round(y[b + i] / d), -127.0f, 127.0f) * stored_d : 0.0f;
     }
     return y;
 }
@@ -139,17 +142,19 @@ void head_norm_rope(float* v, int heads, const float* w, float eps, int64_t pos,
 
 int main(int argc, char** argv) {
     if (argc < 2) {
-        std::fprintf(stderr, "usage: glm_dflash_test <dflash2.gguf> [n_past]\n");
+        std::fprintf(stderr, "usage: glm_dflash_test <dflash2.gguf> [n_past | --load-only]\n");
         return 2;
     }
     const std::string path = argv[1];
-    const int64_t n_past = argc > 2 ? std::atoll(argv[2]) : 2100;
+    const bool load_only = argc > 2 && std::strcmp(argv[2], "--load-only") == 0;
+    const int64_t n_past = argc > 2 && !load_only ? std::atoll(argv[2]) : 2100;
     g_q8 = getenv("DFT_FLOAT") == nullptr;   // DFT_FLOAT=1: the reference without the q8_1 rounding
     strata::GgufFile G(path);
     const auto num = [&](const char* k) { return G.get(std::string("dflash.") + k)->num(); };
     // the model the drafter serves: its hidden size (GLM-5.3-Flash 4096, GLM-5.3 744B 6144), the shared vocabulary, a
     // trunk deep enough for its taps (Flash 45 layers, the 744B 78)
-    const int E = (int) num("embedding_length"), V = 154880, NL_T = E == 4096 ? 45 : 78;
+    const int E = (int) num("embedding_length"), V = (int) G.find("selector_predecessor.weight")->shape[1],
+              NL_T = E == 4096 ? 45 : 78;
     std::string err;
     GlmDflash D;
     if (!D.load(path, 0, err) || !D.bind(E, V, NL_T, err)) {
@@ -157,6 +162,7 @@ int main(int argc, char** argv) {
         return 1;
     }
     std::printf("%s\n", D.describe().c_str());
+    if (load_only) return 0;
     const int n_layer = (int) num("block_count"), n_head = (int) num("attention.head_count"),
               n_kv = (int) num("attention.head_count_kv"), n_ff = (int) num("feed_forward_length"),
               taps = (int) num("conv_kernel_size"), group = (int) num("conv_group_size"),
@@ -193,7 +199,7 @@ int main(int argc, char** argv) {
     head.q = head_d;
     head.n_in = E;
     head.n_out = V;
-    const int anchor = 1234, B = D.block(), n = B - 1;
+    const int anchor = std::min(1234, V - 2), B = D.block(), n = B - 1;
     std::vector<int32_t> out;
     if (!D.draft(anchor, n_past, n, 0.0f, head, (const uint8_t*) emb_h.data(), 30, s, out, err)) {
         std::fprintf(stderr, "draft: %s\n", err.c_str());

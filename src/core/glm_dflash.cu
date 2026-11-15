@@ -872,11 +872,25 @@ bool GlmDflash::load(const std::string& path, int dev, std::string& err) {
     }
     m.ring = m.window + 2 * gf::kMaxMvCols;
     m.cdyn = 2 * m.taps * (m.E / m.group);
-    // ---- the weights: every tensor raw into one arena
+    const auto* prev = G.find("selector_predecessor.weight");
+    const auto* next = G.find("selector_successor.weight");
+    if (prev == nullptr || next == nullptr || prev->shape.size() != 2 || prev->shape != next->shape ||
+        (int) prev->shape[0] != m.rank) {
+        err = "glm dflash: " + path + ": selector_predecessor / selector_successor missing or mismatched";
+        return false;
+    }
+    // The selector's entry kernel reads a few packed formats directly. Other GGUF encodings are decoded once to
+    // F32, without rounding them again. Both tables share one entry type, including a mixed-quant pair.
+    const bool packed_selector = prev->type == next->type && dflash_detail::selector_packed((int) prev->type, m.rank);
+    const auto expand_selector = [&](const strata::TensorInfo& t) {
+        return !packed_selector && (&t == prev || &t == next);
+    };
+    // ---- the weights: one arena, including expanded selectors when needed
     std::vector<const strata::TensorInfo*> ts;
     size_t total = 0;
     const auto al = [](size_t b) { return (b + 255u) & ~(size_t) 255u; };
-    const auto tbytes = [](const strata::TensorInfo& t) -> size_t {
+    const auto tbytes = [&](const strata::TensorInfo& t) -> size_t {
+        if (expand_selector(t)) return (size_t) t.elements() * sizeof(float);
         int el = 0, by = 0;
         if (!strata::block_geometry(t.type, el, by)) return 0;
         return (size_t) (t.elements() / (uint64_t) el) * (size_t) by;
@@ -897,7 +911,16 @@ bool GlmDflash::load(const std::string& path, int dev, std::string& err) {
                 err = "glm dflash: tensor " + t->name + " has type " + t->type_name() + " (unsupported)";
                 return false;
             }
-            if (!ck(cudaMemcpy(p, G.tensor_data(*t), b, cudaMemcpyHostToDevice), "weights upload", err)) return false;
+            if (expand_selector(*t) && t->type != 0) {
+                const auto* tr = t->type < GGML_TYPE_COUNT ? ggml_get_type_traits((ggml_type) t->type) : nullptr;
+                if (tr == nullptr || tr->to_float == nullptr) {
+                    err = "glm dflash: selector " + t->name + " has no decoder for " + t->type_name();
+                    return false;
+                }
+                std::vector<float> host((size_t) t->elements());
+                tr->to_float(G.tensor_data(*t), host.data(), (int64_t) host.size());
+                if (!ck(cudaMemcpy(p, host.data(), b, cudaMemcpyHostToDevice), "selector F32 upload", err)) return false;
+            } else if (!ck(cudaMemcpy(p, G.tensor_data(*t), b, cudaMemcpyHostToDevice), "weights upload", err)) return false;
             at[t->name] = {p, t};
             p += al(b);
         }
@@ -936,26 +959,13 @@ bool GlmDflash::load(const std::string& path, int dev, std::string& err) {
     if (!mat("fc.weight", m.K * m.E, m.E, m.fc) || !f32("enc.output_norm.weight", m.E, m.enc_norm) ||
         !f32("output_norm.weight", m.E, m.out_norm) || !mat("selector_hidden.weight", m.E, m.rank, m.sel_hidden))
         return false;
-    {
-        const auto ip = at.find("selector_predecessor.weight"), in = at.find("selector_successor.weight");
-        if (ip == at.end() || in == at.end() || ip->second.second->type != in->second.second->type ||
-            ip->second.second->shape.size() != 2 || (int) ip->second.second->shape[0] != m.rank) {
-            err = "glm dflash: " + path + ": selector_predecessor / selector_successor missing or mismatched";
-            return false;
-        }
-        m.sel_type = (int) ip->second.second->type;
-        const int st = m.sel_type;
-        const bool ok = st == 0 || st == 1 || st == 30 || (st == 8 && m.rank % 32 == 0) ||
-                        ((st == 12 || st == 13 || st == 14) && m.rank % 256 == 0);
-        if (!ok) {
-            err = std::string("glm dflash: selector tables in ") + ip->second.second->type_name() +
-                  " (F32 / F16 / BF16 / Q8_0 / Q4_K / Q5_K / Q6_K are read)";
-            return false;
-        }
-        m.sel_prev = (const uint8_t*) ip->second.first;
-        m.sel_next = (const uint8_t*) in->second.first;
-        m.V = (int) ip->second.second->shape[1];
-    }
+    m.sel_type = packed_selector ? (int) prev->type : 0;
+    m.sel_prev = (const uint8_t*) at.at(prev->name).first;
+    m.sel_next = (const uint8_t*) at.at(next->name).first;
+    m.V = (int) prev->shape[1];
+    if (!packed_selector)
+        std::fprintf(stderr, "glm dflash: selector %s / %s decoded to F32 in GPU memory (%.1f MiB)\n",
+                     prev->type_name(), next->type_name(), (double) (tbytes(*prev) + tbytes(*next)) / 1048576.0);
     m.L.resize((size_t) m.n_layer);
     for (int il = 0; il < m.n_layer; ++il) {
         auto& Ly = m.L[(size_t) il];

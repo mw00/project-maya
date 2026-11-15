@@ -6,6 +6,11 @@
 
 namespace strata::core::dflash_detail {
 
+inline bool selector_packed(int type, int rank) {
+    return type == 0 || type == 1 || type == 30 || (type == 8 && rank % 32 == 0) ||
+           ((type == 12 || type == 13 || type == 14) && rank % 256 == 0);
+}
+
 struct BlkQ5K {
     __half2 dm; // d, dmin
     uint8_t scales[12];

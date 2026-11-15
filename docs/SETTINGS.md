@@ -700,6 +700,12 @@ and head - takes the place of the MTP block: with it the engine does not load th
 block, one verify window checks the drafts, and the longest right prefix is kept with the model's own next token - the
 same tokens as decoding one at a time.
 
+The DFlash2 selector tables keep their packed F32, F16, BF16, Q8_0, Q4_K, Q5_K or Q6_K representation where the
+entry kernel reads it directly. Other GGUF encodings with a ggml decoder, including Q2_K, Q3_K and IQ formats, are
+decoded once to F32 in GPU memory when the drafter loads; a pair with different encodings is decoded the same way.
+The model files stay as downloaded. For GLM-5.3's rank-256, 154,880-token selector pair, Q3_K to F32 adds 270 MiB of
+VRAM, included in the drafter's allocation before the expert pool is sized.
+
 On three GPUs or more the window is a pipeline: the GPUs work on consecutive tokens of the window at once (one host
 thread a GPU issues the work), the drafter drafts while the window's first token is already running, each token's pick
 is read as it leaves the last GPU, and the tokens after a wrong draft skip their work (their experts are not fetched or
