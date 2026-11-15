@@ -660,7 +660,9 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     target_include_directories(expert_cache_lend_test PRIVATE ${_strata_gpu_include_directories})
     target_link_libraries(expert_cache_lend_test PRIVATE strata_engine ${_strata_gpu_runtime_target})
     add_test(NAME expert_cache_lend_test COMMAND expert_cache_lend_test)
-    set_tests_properties(expert_cache_lend_test PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
+    # RUN_SERIAL: it checks the card's free VRAM (cudaMemGetInfo) before and after each lend, which any other test on
+    # the GPU moves - under ctest -j4 "the free VRAM is back where it was" failed on another test's allocations
+    set_tests_properties(expert_cache_lend_test PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
   endif()
   # --expert-profile-save's profile (rank_learned_profile, write_expert_profile) and the profile header's version
   # (a version other than 1 is refused by its number); the split decode's groups (split_groups); the EXL3 prompt
