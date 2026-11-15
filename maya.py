@@ -4365,18 +4365,63 @@ def busy_gpus(cfg: dict) -> list:
     return [(i, used[i]) for i in cfg.get("gpu") or [] if used.get(i, 0) > 1024]
 
 
+# The most a GPU's memory in use can be and still be a display's and the desktop's (#794): 1.5 GiB.  More, and a
+# measurement asked for by name still refuses, as it does for a Maya engine on the GPU
+DISPLAY_MIB = 1536
+
+# Maya's engines as the GPU's process list names them (and the names they had before the rename)
+ENGINE_PROCESSES = ("maya", "maya-ds4", "maya-mm3", "maya-glm-helper", "strata", "strata-ds4")
+
+
+def maya_engines_on(cfg: dict) -> list:
+    """The Maya engines holding memory on the config's GPUs: [(index, process name, pid)] (nvidia-smi's process list;
+    [] where it has none, as on AMD)."""
+    def query(what):
+        try:
+            return subprocess.run(["nvidia-smi", f"--query-{what}", "--format=csv,noheader,nounits"],
+                                  capture_output=True, text=True, timeout=30).stdout
+        except (OSError, subprocess.SubprocessError):
+            return ""
+    index = {}
+    for line in query("gpu=index,uuid").splitlines():
+        i, _, uuid = (s.strip() for s in line.partition(","))
+        if i.isdigit():
+            index[uuid] = int(i)
+    mine, out = set(cfg.get("gpu") or []), []
+    for line in query("compute-apps=gpu_uuid,pid,process_name").splitlines():
+        parts = [s.strip() for s in line.split(",", 2)]
+        if len(parts) < 3:
+            continue
+        exe = re.split(r"[\\/]", parts[2])[-1].lower()
+        exe = exe[:-4] if exe.endswith(".exe") else exe
+        if exe in ENGINE_PROCESSES and index.get(parts[0]) in mine:
+            out.append((index[parts[0]], exe, parts[1]))
+    return out
+
+
 def busy_skip(cfg: dict, asked: bool, name: str, gpus: str, tail: str) -> bool:
     """A measurement's look at the config's GPUs before it loads the model: True = skip it (the warning says why).
     A GPU that drives a display already holds some memory, and read as another model loaded (#794): a measurement
-    asked for by name (--speed-calibration, --calibrate) runs anyway, with a warning that names the memory in use;
-    only the automatic ones (a setup's or a start's own) still skip on a busy GPU, as before."""
+    asked for by name (--speed-calibration, --calibrate) runs anyway when what is in use can be a display's (at most
+    DISPLAY_MIB a GPU, and no Maya engine on it), with a warning that says how much; another Maya model loaded there,
+    or more memory in use, still refuses.  The automatic ones (a setup's or a start's own) skip on a busy GPU, as
+    before."""
     busy = busy_gpus(cfg)
     if not busy:
         return False
     used = ", ".join(f"GPU {i} has {m} MiB in use" for i, m in busy)
     if asked:
-        warn(f"{name} runs although {used} (a display, or another program) - measuring anyway, as asked; if a model "
-             "server is still running there, stop it first: the measurement can then run short of memory or read slow")
+        engines = maya_engines_on(cfg)
+        if engines:
+            warn(f"{name} needs {gpus} to itself: {used} - another Maya model is loaded there (" +
+                 ", ".join(f"{exe} on GPU {i}, PID {pid}" for i, exe, pid in engines) + "): stop it, then ask again")
+            return True
+        if any(m > DISPLAY_MIB for _, m in busy):
+            warn(f"{name} needs {gpus} to itself: {used} - more than a display uses (at most {DISPLAY_MIB} MiB a GPU): "
+                 "stop what holds it (a model server still running?), then ask again")
+            return True
+        warn(f"{name} runs although {used} - no more than a display and the desktop use, so it measures anyway, as "
+             "asked (the speeds can read a little lower than on a GPU with nothing else on it)")
         return False
     warn(f"{name} needs {gpus} to itself: {used}{tail}")
     return True

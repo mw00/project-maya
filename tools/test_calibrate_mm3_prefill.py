@@ -182,6 +182,7 @@ class Setup(unittest.TestCase):
     def test_asked_for_it_runs_on_a_busy_gpu(self):
         # (#794: --calibrate asks for it by name - a display's memory no longer skips it)
         with patch.object(maya, "busy_gpus", return_value=[(0, 1500)]), \
+                patch.object(maya, "maya_engines_on", return_value=[]), \
                 patch.object(maya.CPF, "run", side_effect=RuntimeError("stop here")) as r:
             maya.prefill_calibration(self.path, "asked for")
         r.assert_called_once()

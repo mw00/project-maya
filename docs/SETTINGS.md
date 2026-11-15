@@ -809,9 +809,10 @@ measures). Your choice is kept in the config like a measured result, so a start 
 
 The measurement wants the GPUs to itself. A measurement Maya starts on its own (the setup's, or once at a start) is
 skipped on a GPU with more than 1 GiB of memory in use, and runs at a later start. One you ask for by name -
-`--speed-calibration`, `--drafting measure`, `--calibrate` - runs anyway, with a warning that names the memory in use:
-a GPU that drives a display holds some memory itself, and it used to be read as another model still loaded (#794).
-Stop a model server that still runs on those GPUs first.
+`--speed-calibration`, `--drafting measure`, `--calibrate` - also runs when what is in use can be a display's and the
+desktop's (at most 1.5 GiB a GPU), with a warning that says how much: a GPU that drives a display holds some memory
+itself, and it used to be read as another model still loaded (#794). It still refuses when another Maya model is
+loaded on those GPUs (a Maya engine in the GPU's process list) or more memory is in use: stop that first.
 
 ## DeepSeek: small-prompt path selection
 

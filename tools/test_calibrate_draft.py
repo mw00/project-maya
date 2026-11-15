@@ -222,15 +222,37 @@ class InTheSetup(unittest.TestCase):
     def test_asked_for_it_runs_on_a_gpu_that_drives_a_display(self):
         # (#794: a display's memory read as another model loaded - --speed-calibration skipped; asked for, it runs,
         #  and the warning names the memory in use)
-        out, calls, cfg = self.run_it(result("dflash2", o=42.6, d=61.4), busy=[(0, 1800)], why="asked for")
+        with patch.object(maya, "maya_engines_on", return_value=[]):
+            out, calls, cfg = self.run_it(result("dflash2", o=42.6, d=61.4), busy=[(0, 1400)], why="asked for")
         self.assertTrue(out)
         self.assertEqual(len(calls), 1)
         self.assertEqual(cfg["installer"]["speed_calibration"]["kept"], "dflash2")
-        self.assertIn("GPU 0 has 1800 MiB in use", self.warned[0])
-        self.assertIn("measuring anyway, as asked", self.warned[0])
+        self.assertIn("GPU 0 has 1400 MiB in use", self.warned[0])
+        self.assertIn("measures anyway, as asked", self.warned[0])
+
+    def test_asked_for_it_still_refuses_a_loaded_model(self):
+        for busy, engines, says in (([(0, 20000)], [], "more than a display uses"),
+                                    ([(1, 1100)], [(1, "maya", "77")], "another Maya model is loaded there")):
+            with patch.object(maya, "maya_engines_on", return_value=engines):
+                out, calls, cfg = self.run_it(result("dflash2"), busy=busy, why="asked for")
+            self.assertFalse(out)
+            self.assertEqual(calls, [])
+            self.assertIn(says, self.warned[0])
+            self.assertTrue(maya.needs_speed_calibration(cfg))
+
+    def test_maya_engines_are_found_in_the_gpu_process_list(self):
+        out = {"gpu=index,uuid": "0, GPU-aaa\n1, GPU-bbb\n",
+               "compute-apps=gpu_uuid,pid,process_name": "GPU-aaa, 11, C:\\Program Files\\x\\firefox.exe\n"
+                                                         "GPU-bbb, 22, /home/u/project-maya/build/maya-ds4\n"
+                                                         "GPU-aaa, 33, C:\\m\\build\\maya.exe\n"}
+
+        def run(cmd, **kw):
+            return SimpleNamespace(stdout=out[cmd[1][len("--query-"):]])
+        with patch.object(maya.subprocess, "run", side_effect=run):
+            self.assertEqual(maya.maya_engines_on({"gpu": [0, 1]}), [(1, "maya-ds4", "22"), (0, "maya", "33")])
+            self.assertEqual(maya.maya_engines_on({"gpu": [0]}), [(0, "maya", "33")])
 
     def test_a_setup_asks_for_it_by_name(self):
-        from types import SimpleNamespace
         self.assertEqual(maya.measure_asked(SimpleNamespace(speed_calibration=True)), "asked for")
         self.assertEqual(maya.measure_asked(SimpleNamespace(drafting="measure")), "asked for")
         self.assertEqual(maya.measure_asked(SimpleNamespace(yes=True)), "")          # (--yes: the setup's own)
