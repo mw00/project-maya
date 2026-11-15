@@ -1234,9 +1234,9 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   # splitting them across two libraries would only add a layer.
   #
   # The pack, the original GGUF and the ggml capture are all REQUIRED inputs: this test's oracles are real
-  # artifacts, so the working directory is pinned to the source tree and a missing input is a hard error
-  # INSIDE the test.  A test that passes by finding nothing to compare is the failure mode this project keeps
-  # re-learning.
+  # artifacts, so the working directory is pinned to the source tree and a missing input is checked INSIDE the
+  # test: an absent file makes it a SKIP that names the file (exit 77), a truncated or incompatible one a failure.
+  # A test that passes by finding nothing to compare is the failure mode this project keeps re-learning.
   add_executable(ple_parity src/kernels/ple_parity.cpp)
   target_include_directories(ple_parity PRIVATE ${_strata_gpu_include_directories})
   target_link_libraries(ple_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
@@ -1245,6 +1245,8 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   add_test(NAME ple_parity COMMAND ple_parity --selftest
     --in "${STRATA_PLE_FIXTURE_DIR}/ple_in.bin" --out "${STRATA_PLE_FIXTURE_DIR}/ple_out.bin"
     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+  # an input that is not on the PC: skipped (77, the missing file named - never a pass); a broken one still fails
+  set_tests_properties(ple_parity PROPERTIES SKIP_RETURN_CODE 77)
 
   # Plan v0.3 P7: INT8 KV storage vs a host reference and vs the FP16 path (GPU, synthetic, no model).
   add_executable(kv_q8_parity src/kernels/kv_q8_parity.cpp)
@@ -1718,13 +1720,15 @@ if(STRATA_BUILD_TESTS)
   add_executable(expert_parity src/kernels/cpu/expert_parity.cpp)
   target_link_libraries(expert_parity PRIVATE strata_kernels_cpu)
   # The pack is a REQUIRED input, not an optional one: this test compares against a real expert blob, and a
-  # missing file would otherwise be reported as a pass by a test that skipped everything.
+  # missing file must never be reported as a pass by a test that skipped everything.  Not on the PC (it is not in
+  # the repo), or a CPU without the VNNI kernel's features: exit 77, a SKIP that says why; a short pack fails.
   add_test(NAME expert_parity COMMAND expert_parity --selftest
            WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
 
   add_executable(pool_test src/kernels/cpu/pool_test.cpp)
   target_link_libraries(pool_test PRIVATE strata_kernels_cpu)
   add_test(NAME pool_test COMMAND pool_test --selftest WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+  set_tests_properties(expert_parity pool_test PROPERTIES SKIP_RETURN_CODE 77)   # (the same pack, the same rule)
   # issue #29: tiny batches with sleeping workers, as on a big-VRAM card; a hang fails it
   add_executable(pool_stress src/kernels/cpu/pool_stress.cpp)
   target_link_libraries(pool_stress PRIVATE strata_kernels_cpu)

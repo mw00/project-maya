@@ -277,6 +277,17 @@ int main(int argc, char** argv) {
     PleCapture cap;
     bool preflight_done = false;
     if (selftest || check_fixtures) {
+        // An input that is NOT THERE (the Qwen GGUF, the pack and the captures are not in the repo) skips the test
+        // with ctest's SKIP_RETURN_CODE 77 - named, never a pass.  One that is there but truncated or incompatible
+        // still fails below.
+        for (const std::string& f : {gguf, pack + "/dense.bin", in_bin, out_bin}) {
+            if (file_size(f.c_str()) < 0) {
+                std::fprintf(stderr, "ple_parity: SKIPPED, a required input is not on this PC: %s (give it with "
+                             "--gguf / $MAYA_PLE_GGUF, --pack, or STRATA_PLE_FIXTURE_DIR for ple_in.bin / ple_out.bin)\n",
+                             f.c_str());
+                return 77;
+            }
+        }
         if (!table.open(gguf, err) || table.rows() != o::kTableRows ||
             file_size(gguf.c_str()) != (long long) o::kTableDataStart + (long long) o::kTableRows * k::PLE_ROW_BYTES) {
             std::fprintf(stderr, "ple_parity: required PLE table is missing or incompatible: %s (%s)\n", gguf.c_str(), err.c_str());
