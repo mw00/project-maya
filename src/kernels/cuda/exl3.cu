@@ -146,8 +146,7 @@ __device__ __forceinline__ void mul_3inst2(uint32_t s0, uint32_t s1, uint32_t& x
 __device__ __forceinline__ __half2 decode2h_pk(uint32_t s0, uint32_t s1) {
     uint32_t x0, x1;
     mul_3inst2(s0, s1, x0, x1);
-    const uint32_t a = bytesum_plus(x0, 0x6400u), b = bytesum_plus(x1, 0x6400u);
-    const __half2 h = __halves2half2(__ushort_as_half((unsigned short) a), __ushort_as_half((unsigned short) b));
+    const __half2 h = bytesum2h(x0, x1);   // (v_sad_hi_u8: no mask, no pack - the same bits)
     return __hfma2(h, __half2half2(__ushort_as_half(0x1eee)), __half2half2(__ushort_as_half(0xc931)));
 }
 #endif
