@@ -129,8 +129,9 @@ bool GlmExpertHelper::open(int device, int n_embd, int n_ff,
     n_embd_ = n_embd;
     n_ff_ = n_ff;
     if (integrated_) for (const auto& [host, bytes] : regions) {
-        void* mapped = nullptr;
-        if (!check(cudaHostGetDevicePointer(&mapped, host, 0), "map RAM tier", err, device)) return false;
+        void* mapped = hlink::device_view(host);   // (a link helper's imported tier: its own GPU address)
+        if (mapped == nullptr && !check(cudaHostGetDevicePointer(&mapped, host, 0), "map RAM tier", err, device))
+            return false;
         regions_.push_back({(const uint8_t*) host, (uint8_t*) mapped, bytes});
     }
     const size_t need = 2 * (size_t) n_embd * sizeof(float) + (size_t) (n_embd + 8 * n_ff) / 32 * 36 + 1024;
@@ -1162,8 +1163,9 @@ bool GlmExpertHelper::pf_attach(uint8_t* host, size_t bytes, int cap_tokens, std
     }
     DeviceScope scope(device_);
     if (!scope.ok) { err = scope.error(device_); return false; }
-    void* dp = nullptr;
-    if (!check(cudaHostGetDevicePointer(&dp, host, 0), "map the prompt exchange", err, device_)) return false;
+    void* dp = hlink::device_view(host);
+    if (dp == nullptr && !check(cudaHostGetDevicePointer(&dp, host, 0), "map the prompt exchange", err, device_))
+        return false;
     pf_lay_ = hlink::PfLayout((size_t) cap_tokens, (size_t) n_embd_);
     if (hlink::pf_exchange_bytes((size_t) cap_tokens, (size_t) n_embd_) > bytes) {
         err = "GLM expert helper: the prompt exchange is smaller than its layout";

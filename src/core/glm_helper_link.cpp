@@ -15,9 +15,12 @@ std::vector<Block> g_blocks;
 
 #ifdef __linux__
 void* map_fd(const char* name, size_t bytes, int& fd) {
-    fd = memfd_create(name, 0);   // (no MFD_CLOEXEC: the helper program inherits it)
+    // (no MFD_CLOEXEC: the helper program inherits it.  Sealing allowed and the file a whole number of pages: an AMD
+    // helper seals it against shrinking and imports its pages as buffers - see maya-glm-helper)
+    fd = memfd_create(name, MFD_ALLOW_SEALING);
     if (fd < 0) return nullptr;
-    if (ftruncate(fd, (off_t) bytes) != 0 || fallocate(fd, 0, 0, (off_t) bytes) != 0) {
+    const size_t file_bytes = (bytes + 4095) & ~(size_t) 4095;
+    if (ftruncate(fd, (off_t) file_bytes) != 0 || fallocate(fd, 0, 0, (off_t) file_bytes) != 0) {
         ::close(fd);
         fd = -1;
         return nullptr;
@@ -81,6 +84,23 @@ Ctl* ctl_alloc(int& fd) {
     fd = -1;
     return nullptr;
 #endif
+}
+
+namespace {
+struct View { uintptr_t host; size_t bytes; uint8_t* dev; };
+std::vector<View> g_views;
+}  // namespace
+
+void add_device_view(const void* host, size_t bytes, void* dev) {
+    std::lock_guard<std::mutex> lk(g_mu);
+    g_views.push_back({(uintptr_t) host, bytes, (uint8_t*) dev});
+}
+
+void* device_view(const void* p) {
+    std::lock_guard<std::mutex> lk(g_mu);
+    for (const auto& v : g_views)
+        if ((uintptr_t) p >= v.host && (uintptr_t) p - v.host < v.bytes) return v.dev + ((uintptr_t) p - v.host);
+    return nullptr;
 }
 
 }  // namespace strata::core::hlink

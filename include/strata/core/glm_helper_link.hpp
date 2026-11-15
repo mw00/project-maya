@@ -119,5 +119,10 @@ Ctl* ctl_alloc(int& fd);
 bool in_shared(const void* p, size_t bytes);
 /// lead side: the prompt exchange block (memfd, mapped, faulted in; not in blocks()); nullptr on failure
 void* xchg_alloc(size_t bytes, int& fd);
+/// helper side: [host, host + bytes) is a block this process's GPU reads at its own address `dev` (the block's pages
+/// imported as buffers, not a registration of the host range); device_view: the GPU address standing for host
+/// pointer p, nullptr when p lies in no such block (the caller then asks its runtime, as before)
+void add_device_view(const void* host, size_t bytes, void* dev);
+void* device_view(const void* p);
 
 }  // namespace strata::core::hlink
