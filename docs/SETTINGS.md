@@ -431,6 +431,30 @@ as in llama.cpp, so the model goes on with what it would write next instead of s
 fixed answer length. It needs `max_tokens`, and an engine that applies token biases - GLM's and DeepSeek's (which take
 a request's own `logit_bias` as well); MiniMax's does not, so there it is refused.
 
+## When the engine stops an answer
+
+An answer ends with `finish_reason` "length" (Anthropic: `stop_reason` "max_tokens"; Responses: status "incomplete"
+with reason "max_output_tokens") only when it reached its token limit or the context. When the engine stops an
+answer itself because of an error - a GPU's fault, a failed decode step, numbers gone non-finite - the request ends
+with that API's own error instead, never with a finish reason a client would take for the limit:
+
+| API | Streamed | Not streamed |
+|---|---|---|
+| OpenAI chat completions | the text already sent stands; then a `data: {"error": {"type": "server_error", ...}}` chunk and `data: [DONE]` (no `finish_reason` chunk) | HTTP 422, `{"error": {"type": "engine_error", "code": "engine_error", "message": ..., "partial_text": ...}}` |
+| Anthropic messages | the text already sent stands; then `event: error` (`api_error`), no `message_delta` with a `stop_reason` | HTTP 422, `{"type": "error", "error": {"type": "engine_error", "message": ..., "partial_text": ...}}` |
+| Responses | `response.failed` with `error.code` "server_error" | HTTP 422, the response with status "failed", `error.code` "engine_error" and `error.partial_text` |
+| Maya's model API (`/api/chat`, `/api/generate`) | a last line `{"error": ...}`, no `done: true` line | HTTP 422 with `{"error": ..., "error_type": "engine_error", "partial_text": ...}` |
+
+The documented finish reasons have no "error" value (OpenAI's are stop / length / tool_calls / content_filter /
+function_call, Anthropic's end_turn / max_tokens / stop_sequence / tool_use / pause_turn / refusal), so a new one
+would be read as a normal end by some clients; the error forms above are the ones every client handles (the OpenAI and
+Anthropic SDKs raise an error on them). A request that is not streamed gets 422, not a 5xx: the SDKs send a 5xx,
+408, 409 or 429 again by themselves, which would run the same long answer once more without the client seeing the
+error. Its error carries what the answer had written before it: `partial_text` (and `partial_reasoning` - Maya's
+model API: `partial_thinking` - when it was still thinking), less the last few tokens the loop guard still held
+back. The message says how many tokens the answer had and that
+the reason is in the engine's log; after a GPU's fault the engine ends, and the next request starts a fresh one.
+
 ## The thinking level and the thinking budget
 
 Two config settings shape the thinking, and only one of them counts tokens:
@@ -783,6 +807,13 @@ You can also choose yourself and skip the measuring: the setup asks first (m = m
 n = no drafting), or pass `--drafting on` / `--drafting off` (`--drafting measure` measures; with `--yes` the setup
 measures). Your choice is kept in the config like a measured result, so a start does not measure by itself.
 `--no-speed-calibration` is the same as `--drafting on`.
+
+The measurement wants the GPUs to itself. A measurement Maya starts on its own (the setup's, or once at a start) is
+skipped on a GPU with more than 1 GiB of memory in use, and runs at a later start. One you ask for by name -
+`--speed-calibration`, `--drafting measure`, `--calibrate` - also runs when what is in use can be a display's and the
+desktop's (at most 1.5 GiB a GPU), with a warning that says how much: a GPU that drives a display holds some memory
+itself, and it used to be read as another model still loaded (#794). It still refuses when another Maya model is
+loaded on those GPUs (a Maya engine in the GPU's process list) or more memory is in use: stop that first.
 
 ## DeepSeek: small-prompt path selection
 

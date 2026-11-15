@@ -1440,18 +1440,34 @@ bool Glm5Model::fast_setup(std::string& err) {
             // what is short, and what makes room
             const size_t need = (size_t) g.n_exp_used * stride_sum;
             const size_t short_mib = ((need > avail ? need - avail : 0) >> 20) + 1;
+            // (#899) a smaller reserve is named only where it can make the room (glmfast::reserve_hint); a reserve set
+            // by hand also keeps the start from lowering the default one on a small card (pool_reserve)
+            const std::string res_flag = part_ > 0 && getenv("MAYA_GLM_RESERVE_LATER_MB") ? "--vram-reserve-later-mib"
+                                                                                           : "--vram-reserve-mib";
+            const size_t res_mib = reserve >> 20;
+            const glmfast::ReserveHint hint =
+                glmfast::reserve_hint(pool_b_.reserve_given, avail, need > avail ? need - avail : 0, reserve);
+            const bool res_helps = hint == glmfast::ReserveHint::smaller;
+            const std::string by_hand = "a reserve set by hand also turns off the start's automatic lowering of the "
+                                        "default reserve on a small card (leave " + res_flag + " out to get it)";
             err = "glm fast: CUDA" + std::to_string(dev_) + " has no room for the expert pool: " + std::to_string(per) +
                   " slots a layer, at least " + std::to_string(g.n_exp_used) + " needed (about " +
-                  std::to_string(short_mib) + " MiB more). To make room: " +
+                  std::to_string(short_mib) + " MiB more; the pool's budget was " + std::to_string(avail >> 20) +
+                  " MiB, the free VRAM less the " + std::to_string(res_mib) + " MiB reserve). To make room: " +
                   (pool_b_.fixed > 0 ? "a larger --expert-cache (" + std::to_string(pool_b_.fixed) + " now) or auto, "
                                      : std::string()) +
-                  (pool_b_.reserve_given
-                       ? std::string(part_ > 0 && getenv("MAYA_GLM_RESERVE_LATER_MB") ? "a smaller --vram-reserve-later-mib ("
-                                                                                       : "a smaller --vram-reserve-mib (") +
-                             std::to_string(reserve >> 20) + " now), "
-                       : std::string()) +
+                  (res_helps ? "a smaller " + res_flag + " (" + std::to_string(res_mib) + " now; " + by_hand + "), "
+                             : std::string()) +
                   "a smaller --max-context, " + (kv_int8() ? "" : "--kv int8, ") +
-                  (kv_ != nullptr ? "" : "--kv-streaming on, ") + "or close other programs that use the GPU";
+                  (kv_ != nullptr ? "" : "--kv-streaming on, ") + "or close other programs that use the GPU" +
+                  (hint == glmfast::ReserveHint::budget_zero || hint == glmfast::ReserveHint::short_beyond
+                       ? ". A smaller " + res_flag + " cannot make this room: " +
+                             (hint == glmfast::ReserveHint::budget_zero ? std::string("the budget measured 0 - the free VRAM read after the dense "
+                                                       "weights and state was no more than the reserve, so the VRAM "
+                                                       "is held by something else (the VRAM line above)")
+                                         : "more is short than the whole " + std::to_string(res_mib) + " MiB reserve") +
+                             "; " + by_hand
+                       : std::string());
             return false;
         }
         // the prompt path borrows the pool's TAIL: the last k slots of every layer, laid out as one region after all

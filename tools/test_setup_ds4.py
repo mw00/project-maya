@@ -516,9 +516,31 @@ class Calibrate(unittest.TestCase):
         self.assertIn("effective TP per GPU: 1/1/1", output.call_args.args[0])
 
     def test_busy_gpus(self):
-        with patch.object(maya, "busy_gpus", return_value=[(0, 15000)]), patch.object(maya.CAL4, "run") as run:
+        with patch.object(maya, "busy_gpus", return_value=[(0, 15000)]), \
+                patch.object(maya, "maya_engines_on", return_value=[]), patch.object(maya.CAL4, "run") as run:
             self.assertFalse(maya.calibrate_config(self.cfg))
         run.assert_not_called()
+
+    def test_another_maya_model_loaded_refuses(self):
+        with patch.object(maya, "busy_gpus", return_value=[(0, 1200)]), \
+                patch.object(maya, "maya_engines_on", return_value=[(0, "maya-ds4", "4242")]), \
+                patch.object(maya.CAL4, "run") as run, patch.object(maya, "warn") as warn:
+            self.assertFalse(maya.calibrate_config(self.cfg))
+        run.assert_not_called()
+        self.assertIn("another Maya model is loaded there (maya-ds4 on GPU 0, PID 4242)", warn.call_args.args[0])
+
+    def test_a_display_does_not_hold_it_back(self):
+        # (#794: --calibrate is always asked for - a GPU that drives a display holds some memory; the tuning runs
+        #  anyway, and says how much is in use)
+        res = {"args": {"--tp": 8, "--cpu-threads": None},
+               "report": {"tok_s": 151.0, "own_tok_s": 103.0, "prompt_tok_s": 607}}
+        with patch.object(maya, "busy_gpus", return_value=[(0, 1500)]), \
+                patch.object(maya, "maya_engines_on", return_value=[]), \
+                patch.object(maya.CAL4, "run", return_value=res) as run, patch.object(maya, "warn") as warn:
+            self.assertTrue(maya.calibrate_config(self.cfg))
+        run.assert_called_once()
+        self.assertIn("GPU 0 has 1500 MiB in use", warn.call_args_list[0].args[0])
+        self.assertIn("measures anyway, as asked", warn.call_args_list[0].args[0])
 
     def test_failed_keeps_the_config(self):
         before = self.cfg.read_text()

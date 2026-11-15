@@ -75,6 +75,17 @@ inline std::pair<size_t, bool> pool_reserve(size_t device_free, size_t reserve, 
     return {device_free - floor, true};
 }
 
+// What the "no room for the expert pool" error says about a reserve set by hand (#899): a smaller one is named only
+// where it can make the room - the pool's budget measured more than 0 and what is short fits in the reserve.  A budget
+// of 0 means the free VRAM read was no more than the reserve: something else holds the VRAM, and a smaller reserve
+// only moves that figure.  A default reserve is not named (the start already lowers it where that helps).
+enum class ReserveHint { none, smaller, budget_zero, short_beyond };
+inline ReserveHint reserve_hint(bool given, size_t budget, size_t short_bytes, size_t reserve) {
+    if (!given) return ReserveHint::none;
+    if (budget == 0) return ReserveHint::budget_zero;
+    return short_bytes <= reserve ? ReserveHint::smaller : ReserveHint::short_beyond;
+}
+
 // The check of a written budget: the bytes it gives back once `have` of the `asked` bytes were allocated and touched
 // and `free_after` was read - what the driver refused, plus what the reserve is short by and 64 MiB.  A read of
 // nearly nothing free (under 16 MiB) only says "at least": the first two give back 1 GiB each, later ones a quarter.
