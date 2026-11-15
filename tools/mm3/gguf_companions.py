@@ -59,13 +59,45 @@ def draft(g, types, fi, layer_map, hidden):
     return entries(g, types, fi, rename), cfg
 
 
+def vision_config(g):
+    # Earlier converters embedded the HF JSONs; llama.cpp/Unsloth now writes the CLIP fields directly.
+    if "clip.vision.minimax.config" in g.kv:
+        return config(g.kv, "clip.vision.minimax.config"), config(g.kv, "clip.vision.minimax.preprocessor_config")
+    kv = g.kv
+    required = {"hidden_size": "embedding_length", "intermediate_size": "feed_forward_length",
+                "num_hidden_layers": "block_count", "num_attention_heads": "attention.head_count",
+                "patch_size": "patch_size"}
+    vc = {}
+    for dst, src in required.items():
+        key = "clip.vision." + src
+        value = kv.get(key)
+        if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+            raise SystemExit(f"{g.path.name}: missing or invalid {key}")
+        vc[dst] = value
+    pp = {}
+    for key in ("image_mean", "image_std"):
+        value = kv.get("clip.vision." + key)
+        if not isinstance(value, (list, tuple)) or len(value) != 3 or not all(isinstance(x, (int, float)) for x in value):
+            raise SystemExit(f"{g.path.name}: missing or invalid clip.vision.{key}")
+        pp[key] = value
+    vc["layer_norm_eps"] = kv.get("clip.vision.attention.layer_norm_epsilon", 1e-5)
+    vc["rope_theta"] = kv.get("clip.vision.rope.freq_base", 10000.0)
+    vc["img_token_compression_config"] = {
+        "spatial_merge_size": kv.get("clip.vision.spatial_merge_size", 2),
+        "temporal_patch_size": 2,  # minimax_m3's two separately stored patch convolutions
+    }
+    projector = next((dims for name, _, dims, _ in g.tensors if name == "mm.1.weight"), None)
+    if projector is None or len(projector) != 2 or projector[0] != vc["hidden_size"]:
+        raise SystemExit(f"{g.path.name}: missing or invalid mm.1.weight vision projector")
+    return {"vision_config": vc, "projector_hidden_size": projector[1]}, pp
+
+
 def vision(g, types, fi, tokens, hidden):
     if g.kv.get("general.architecture") != "clip" or g.kv.get("clip.projector_type") != "minimax_m3":
         raise SystemExit(f"{g.path}: not a MiniMax-M3 vision GGUF")
     if g.kv.get("clip.vision.projection_dim") != hidden:
         raise SystemExit(f"{g.path}: the vision projector's width does not match the model")
-    cfg = config(g.kv, "clip.vision.minimax.config")
-    pp = config(g.kv, "clip.vision.minimax.preprocessor_config")
+    cfg, pp = vision_config(g)
     vc = cfg["vision_config"]
     tok = {t: i for i, t in enumerate(tokens)}
     info = {"_vc": vc, "_comp": vc.get("img_token_compression_config") or cfg.get("img_token_compression_config") or {},

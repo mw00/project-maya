@@ -60,7 +60,7 @@ def gguf(path: pathlib.Path, kv: dict, tensors: list, *, pad_header: bool = True
 
 
 def model(root: pathlib.Path, side: bool = True, side_ext: str = ".bin", scales: bool = False,
-          metadata_only: bool = False) -> pathlib.Path:
+          metadata_only: bool = False, expert_types=(19, 16, 19)) -> pathlib.Path:
     m = root / "MiniMax-M3.1-Flash-Maya-XS"
     m.mkdir()
     a = "minimax-m3."
@@ -93,8 +93,9 @@ def model(root: pathlib.Path, side: bool = True, side_ext: str = ".bin", scales:
             layers += [(L + "indexer.q_proj.weight", 8, [D, 256]), (L + "indexer.k_proj.weight", 8, [D, 128]),
                        (L + "indexer.q_norm.weight", 0, [128]), (L + "indexer.k_norm.weight", 0, [128]),
                        (L + "ffn_gate_inp.weight", 0, [D, E]), (L + "exp_probs_b.bias", 0, [E]),
-                       (L + "ffn_gate_exps.weight", 19, [D, F, E]), (L + "ffn_up_exps.weight", 16, [D, F, E]),
-                       (L + "ffn_down_exps.weight", 19, [F, D, E]), (L + "ffn_gate_shexp.weight", 13, [D, F]),
+                       (L + "ffn_gate_exps.weight", expert_types[0], [D, F, E]),
+                       (L + "ffn_up_exps.weight", expert_types[1], [D, F, E]),
+                       (L + "ffn_down_exps.weight", expert_types[2], [F, D, E]), (L + "ffn_gate_shexp.weight", 13, [D, F]),
                        (L + "ffn_up_shexp.weight", 13, [D, F]), (L + "ffn_down_shexp.weight", 13, [F, D])]
         else:
             layers += [(L + "ffn_gate.weight", 13, [D, FD]), (L + "ffn_up.weight", 13, [D, FD]),
@@ -152,7 +153,7 @@ def run(m: pathlib.Path, *extra) -> subprocess.CompletedProcess:
     return subprocess.run([sys.executable, str(PACK), "--model", str(m), *extra], capture_output=True, text=True)
 
 
-def gguf_companions(root):
+def gguf_companions(root, standard_vision=False):
     """Small files in the reported MiniMax GGUF schemas, including split temporal patch weights."""
     draft, vision = root / "draft.gguf", root / "mmproj.gguf"
     cfg = {"num_hidden_layers": 1, "hidden_size": D, "dspark_ffn_hidden_size": 512,
@@ -168,9 +169,19 @@ def gguf_companions(root):
           "patch_size": 2, "img_token_compression_config": {"spatial_merge_size": 2, "temporal_patch_size": 2}}
     cfg = {"vision_config": vc, "projector_hidden_size": 16, "image_token_index": 6}
     pp = {"image_mean": [0.5] * 3, "image_std": [0.5] * 3}
-    gguf(vision, {"general.architecture": (8, "clip"), "clip.projector_type": (8, "minimax_m3"),
-                  "clip.vision.projection_dim": (4, D), "clip.vision.minimax.config": (8, json.dumps(cfg)),
-                  "clip.vision.minimax.preprocessor_config": (8, json.dumps(pp))},
+    vkv = {"general.architecture": (8, "clip"), "clip.projector_type": (8, "minimax_m3"),
+           "clip.vision.projection_dim": (4, D)}
+    if standard_vision:
+        vkv.update({"clip.vision.embedding_length": (4, 16), "clip.vision.feed_forward_length": (4, 32),
+                    "clip.vision.block_count": (4, 1), "clip.vision.attention.head_count": (4, 2),
+                    "clip.vision.patch_size": (4, 2), "clip.vision.spatial_merge_size": (4, 2),
+                    "clip.vision.attention.layer_norm_epsilon": (6, 1e-5),
+                    "clip.vision.image_mean": (9, (6, pp["image_mean"])),
+                    "clip.vision.image_std": (9, (6, pp["image_std"]))})
+    else:
+        vkv.update({"clip.vision.minimax.config": (8, json.dumps(cfg)),
+                    "clip.vision.minimax.preprocessor_config": (8, json.dumps(pp))})
+    gguf(vision, vkv,
          [("v.patch_embd.weight", 30, [2, 2, 3, 16]), ("v.patch_embd.weight.1", 30, [2, 2, 3, 16]),
           ("v.pre_ln.weight", 0, [16]), ("v.pre_ln.bias", 0, [16]),
           ("v.blk.0.attn_q.weight", 30, [16, 16]), ("v.blk.0.ln1.weight", 0, [16]),
@@ -224,16 +235,61 @@ class PackGguf(unittest.TestCase):
             p.write_bytes(p.read_bytes()[:g.data_start + 2])
             self.assertIsNotNone(short(Gguf(p)))
 
-    def test_nvfp4_is_reported_as_an_unsupported_format(self):
+    def test_nvfp4_experts_keep_source_bytes_and_scales(self):
+        from tools.ds4.pack_gguf import Gguf, short
         with tempfile.TemporaryDirectory() as tmp:
-            m = pathlib.Path(tmp)
-            gguf(m / "model.gguf", {"general.architecture": (8, "minimax-m3"),
-                                     "minimax-m3.expert_count": (4, E), "minimax-m3.block_count": (4, 1)},
-                 [("blk.0.ffn_gate_exps.weight", 40, [D, F, E])])
+            m = model(pathlib.Path(tmp), scales=True, metadata_only=True, expert_types=(40, 40, 40))
             r = run(m, "--text-only")
-            self.assertNotEqual(r.returncode, 0)
-            self.assertIn("NVFP4 (ggml type 40)", r.stderr)
-            self.assertNotIn("download still running", r.stderr)
+            self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
+            files, ts = tensors(m / "maya-mm3")
+            for layer in range(LEAD, NL):
+                for role, source in (("w1", "gate"), ("w3", "up"), ("w2", "down")):
+                    first = ts[f"language_model.model.layers.{layer}.block_sparse_moe.experts.0.{role}.weight"]
+                    g = Gguf(m / files[first[1]])
+                    self.assertIsNone(short(g))
+                    info = next(t for t in g.tensors if t[0] == f"blk.{layer}.ffn_{source}_exps.weight")
+                    for e in range(E):
+                        prefix = f"language_model.model.layers.{layer}.block_sparse_moe.experts.{e}.{role}"
+                        t, scale = ts[prefix + ".weight"], ts[prefix + ".scale"]
+                        nb = D * F // 64 * 36
+                        self.assertEqual((t[0], t[2], t[3]), ("NVFP4", g.data_start + info[3] + e * nb, nb))
+                        self.assertEqual((scale[0], scale[3], scale[4]), ("F32", 4, [1]))
+
+    def test_truncated_nvfp4_data_is_rejected(self):
+        from tools.ds4.pack_gguf import Gguf, short
+        with tempfile.TemporaryDirectory() as tmp:
+            p = pathlib.Path(tmp) / "nvfp4.gguf"
+            gguf(p, {}, [("x", 40, [64])])
+            g = Gguf(p)
+            p.write_bytes(p.read_bytes()[:g.data_start + 35])
+            self.assertIsNotNone(short(Gguf(p)))
+
+    def test_standard_clip_metadata_with_nvfp4_and_dspark(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            m = model(root, scales=True, metadata_only=True, expert_types=(40, 40, 40))
+            draft, vision = gguf_companions(root, standard_vision=True)
+            r = run(m, "--text-only", "--drafter", str(draft), "--vision", str(vision))
+            self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
+            pack = m / "maya-mm3"
+            kv = dict(line.split(" ", 1) for line in (pack / "mm3.txt").read_text().splitlines())
+            for key, value in {"hidden_size": "16", "projector_hidden_size": "16", "intermediate_size": "32",
+                               "num_hidden_layers": "1", "num_attention_heads": "2", "patch_size": "2",
+                               "spatial_merge_size": "2", "temporal_patch_size": "2", "image_token": "6"}.items():
+                self.assertEqual(kv["vision." + key], value)
+            _, ts = tensors(pack)
+            self.assertEqual(ts["language_model.model.layers.1.block_sparse_moe.experts.0.w1.weight"][0], "NVFP4")
+            self.assertEqual(ts["vision_tower.vision_model.embeddings.patch_embedding.weight.1"][0], "BF16")
+
+    def test_standard_clip_metadata_requires_geometry(self):
+        from tools.ds4.pack_gguf import Gguf, TYPES
+        from tools.mm3.gguf_companions import vision
+        with tempfile.TemporaryDirectory() as tmp:
+            p = pathlib.Path(tmp) / "mmproj.gguf"
+            gguf(p, {"general.architecture": (8, "clip"), "clip.projector_type": (8, "minimax_m3"),
+                     "clip.vision.projection_dim": (4, D)}, [])
+            with self.assertRaisesRegex(SystemExit, "clip.vision.embedding_length"):
+                vision(Gguf(p), TYPES, 0, [], D)
 
     def test_selected_gguf_companions_and_expert_scales_keep_their_source_offsets(self):
         with tempfile.TemporaryDirectory() as tmp:

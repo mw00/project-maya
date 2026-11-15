@@ -214,7 +214,7 @@ x3::Mat upload_gg(const Tensor& t, const Pack& pk, const std::string& pre, std::
 
 x3::Mat upload_mat(const Pack& pk, const std::string& pre, std::vector<void*>& owned, std::string& err) {
     x3::Mat m;
-    if (const Tensor* w = pk.get(pre + ".weight"); w != nullptr && gg::type_of(w->dtype) > 0)
+    if (const Tensor* w = pk.get(pre + ".weight"); w != nullptr && gg::type_of(w->dtype) >= 0)
         return upload_gg(*w, pk, pre, owned, err);
     const Tensor* tr = pk.get(pre + ".trellis");
     const Tensor* su = pk.get(pre + ".suh");

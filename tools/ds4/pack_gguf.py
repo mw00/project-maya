@@ -35,6 +35,7 @@ import struct
 import sys
 
 TYPES = {0: ("F32", 1, 4), 1: ("F16", 1, 2), 8: ("Q8_0", 32, 34), 30: ("BF16", 1, 2), 39: ("MXFP4", 32, 17),
+         40: ("NVFP4", 64, 36),
          67: ("MXFP8", 32, 33),          # ggml type -> (name, values a block, bytes a block); 67: unsloth's fork
          43: ("MXFP8", 32, 33),          # unsloth's GGUFs from 2026-10-19 on (upstream's 43 is F8_E4M3: Gguf._type43)
          # the low-bit expert types (the Maya quants' experts; the engine's ds4_iq kernels)

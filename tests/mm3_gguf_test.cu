@@ -18,6 +18,9 @@
 #include "../src/ds4/ds4_iq.cuh"
 
 #include "ggml.h"   // (the reference values: ggml's own dequantize_row_*)
+#include "ggml-cpu.h"
+#define GGML_COMMON_DECL_CPP
+#include "ggml-common.h"
 
 #include <cuda_fp16.h>
 
@@ -117,6 +120,9 @@ std::vector<uint8_t> q_rand(int type, int n, int k) {
     for (size_t o = 0; o < w.size(); o += bb) {
         const float d = 0.001f + 0.002f * std::fabs(frand());
         switch (type) {
+            case iq::kNVFP4:
+                for (int i = 0; i < 4; ++i) w[o + i] = (uint8_t) (1 + rng() % 7);
+                break;
             case iq::kQ3_K: put(o + 108, d); break;
             case iq::kQ4_K:
             case iq::kQ5_K: put(o, d), put(o + 2, 0.5f * d); break;
@@ -139,6 +145,16 @@ std::vector<uint8_t> q_rand(int type, int n, int k) {
 std::vector<float> deq(int type, const std::vector<uint8_t>& w, size_t n) {
     std::vector<float> v(n);
     ggml_get_type_traits((ggml_type) type)->to_float(w.data(), v.data(), (int64_t) n);
+    return v;
+}
+std::vector<float> cpu_round(int type, const float* x, int k) {
+    std::vector<uint8_t> q(ggml_row_size((ggml_type) type, k));
+    std::vector<float> v(k);
+    ggml_get_type_traits_cpu((ggml_type) type)->from_float(x, q.data(), k);
+    if (type == GGML_TYPE_Q8_K) {
+        const auto* blocks = (const block_q8_K*) q.data();
+        for (int i = 0; i < k; ++i) v[i] = blocks[i / QK_K].d * blocks[i / QK_K].qs[i % QK_K];
+    } else ggml_get_type_traits((ggml_type) type)->to_float(q.data(), v.data(), k);
     return v;
 }
 // x rounded as the GEMVs (and the light sets) round it: a scale a 32, max|x| / 127
@@ -180,6 +196,136 @@ double dot(const float* w, const float* x, int k) {
 
 // ---------------------------------------------------------------- the dense types
 const int kDense[] = {iq::kQ4_K, iq::kQ5_K, iq::kQ6_K, iq::kQ8_0};
+
+// All UE4M3 scale bytes, including zero, subnormals and 0x7f, with every E2M1 code in both nibbles.
+// Check both decoders independently against ggml: generation's packed int8 codes and prefill's FP16 rows.
+void test_nvfp4_decode(cudaStream_t s) {
+    const int k = 64 * 256, n = 1;
+    std::vector<uint8_t> w(iq::row_bytes(iq::kNVFP4, k));
+    for (int b = 0; b < 256; ++b) {
+        for (int i = 0; i < 4; ++i) w[b * 36 + i] = (uint8_t) (b + i);
+        for (int i = 0; i < 32; ++i) w[b * 36 + 4 + i] = (uint8_t) ((i & 15) | ((15 - (i & 15)) << 4));
+    }
+    const std::vector<float> want = deq(iq::kNVFP4, w, k);
+    uint8_t* dw = dev(w);
+    float *dsub = dev(std::vector<float>(k)), *dtile = dev(std::vector<float>(k));
+    uint16_t* d16 = dev(std::vector<uint16_t>(k));
+    const bool decoded = iq::decode_values(iq::kNVFP4, dw, k, n, dsub, dtile, s);
+    const bool half = iq::f16_rows(iq::kNVFP4, dw, k, n, d16, k, s);
+    CU(cudaStreamSynchronize(s));
+    const auto sub = host(dsub, k), tile = host(dtile, k);
+    const auto h16 = host(d16, k);
+    std::vector<uint16_t> want16(k);
+    for (int i = 0; i < k; ++i) want16[i] = f2h(want[i]);
+    if (!decoded || !half) ++g_fail;
+    // Signed zeros have identical arithmetic values; ggml and the integer codebook need not preserve their sign.
+    bool ok = decoded && half;
+    for (int i = 0; i < k; ++i)
+        ok = ok && sub[i] == want[i] && tile[i] == want[i] && h2f(h16[i]) == h2f(want16[i]);
+    std::printf("%-52s %s\n", "NVFP4 all scales/codes: token, tiles, FP16 = ggml", ok ? "ok    exact" : "FAIL");
+    if (!ok) ++g_fail;
+    cudaFree(dw), cudaFree(dsub), cudaFree(dtile), cudaFree(d16);
+}
+
+void test_float_dense(cudaStream_t s) {
+    for (int type : {gg::kBF16, gg::kF16, gg::kF32}) {
+        const int k = 1024, n = 93, stride = k + 8;
+        const int bytes = type == gg::kF32 ? 4 : 2;
+        std::vector<uint8_t> w((size_t) n * stride * bytes, 0xa5);
+        std::vector<float> values((size_t) n * k);
+        for (int r = 0; r < n; ++r)
+            for (int i = 0; i < k; ++i) {
+                // Exactly representable in all three formats, with nonzero padding after every row.
+                const float f = (float) ((int) (rng() % 257) - 128) / 256.0f;
+                values[(size_t) r * k + i] = f;
+                uint8_t* p = w.data() + ((size_t) r * stride + i) * bytes;
+                if (type == gg::kF32) std::memcpy(p, &f, 4);
+                else {
+                    uint32_t u;
+                    std::memcpy(&u, &f, 4);
+                    const uint16_t h = type == gg::kBF16 ? (uint16_t) (u >> 16) : f2h(f);
+                    std::memcpy(p, &h, 2);
+                }
+            }
+        uint8_t* dw = dev(w);
+        x3::Mat m;
+        m.fmt = gg::kFmtGG, m.gg_type = type, m.raw = dw, m.k = k, m.n = n, m.ld = stride * bytes;
+        for (int nc : {1, 3, 16}) {
+            const int xcs = k + 16, ycs = n + 8;
+            std::vector<float> x((size_t) nc * xcs), bias(n);
+            for (auto& v : x) v = frand();
+            for (auto& v : bias) v = frand(0.1f);
+            float *dx = dev(x), *db = dev(bias), *dy = dev(std::vector<float>((size_t) nc * ycs));
+            x3::MvJob j;
+            j.m = &m, j.xf = dx, j.y = dy, j.bias = db, j.alpha = 0.75f;
+            j.ncol = nc, j.xf_cs = xcs, j.y_cs = ycs;
+            if (!x3::mv(&j, 1, s)) ++g_fail;
+            CU(cudaStreamSynchronize(s));
+            const auto y = host(dy, (size_t) nc * ycs);
+            std::vector<float> got;
+            std::vector<double> ref;
+            for (int c = 0; c < nc; ++c)
+                for (int r = 0; r < n; ++r) {
+                    got.push_back(y[(size_t) c * ycs + r]);
+                    ref.push_back(0.75 * dot(values.data() + (size_t) r * k, x.data() + (size_t) c * xcs, k) + bias[r]);
+                }
+            char what[96];
+            std::snprintf(what, sizeof what, "%s head mv, %d columns, padded rows", gg::type_name(type), nc);
+            expect(what, got.data(), ref.data(), ref.size(), 2e-5);
+            if (type == gg::kBF16 && nc == 3) {
+                const auto qw = q_rand(iq::kQ8_0, n, k);
+                const auto qvalues = deq(iq::kQ8_0, qw, (size_t) n * k);
+                uint8_t* dqw = dev(qw);
+                float* dqy = dev(std::vector<float>((size_t) nc * ycs));
+                x3::Mat qm = m;
+                qm.gg_type = iq::kQ8_0, qm.raw = dqw, qm.ld = (int) iq::row_bytes(iq::kQ8_0, k);
+                x3::MvJob jobs[2] = {j, j};
+                jobs[1].m = &qm, jobs[1].y = dqy;
+                if (!x3::mv(jobs, 2, s)) ++g_fail;
+                CU(cudaStreamSynchronize(s));
+                const auto qy = host(dqy, (size_t) nc * ycs), again = host(dy, (size_t) nc * ycs);
+                same("BF16/Q8_0 mixed batch: BF16 unchanged", again.data(), y.data(), y.size() * 4);
+                got.clear(), ref.clear();
+                for (int c = 0; c < nc; ++c) {
+                    const auto xr = q8_round(x.data() + (size_t) c * xcs, k);
+                    for (int r = 0; r < n; ++r) {
+                        got.push_back(qy[(size_t) c * ycs + r]);
+                        ref.push_back(0.75 * dot(qvalues.data() + (size_t) r * k, xr.data(), k) + bias[r]);
+                    }
+                }
+                expect("BF16/Q8_0 mixed batch: Q8_0 reference", got.data(), ref.data(), ref.size(), 2e-5);
+                cudaFree(dqw), cudaFree(dqy);
+            }
+            cudaFree(dx), cudaFree(db), cudaFree(dy);
+        }
+        const int rows = 40, ldx = k + 16, ldy = n + 8;
+        std::vector<uint16_t> x((size_t) rows * ldx);
+        for (auto& v : x) v = f2h(frand());
+        uint16_t* dx = dev(x);
+        std::vector<float> y0((size_t) rows * ldy);
+        for (auto& v : y0) v = frand();
+        for (float beta : {0.0f, 1.0f}) {
+            float* dy = dev(y0);
+            x3::gemm_rows(m, dx, ldx, rows, dy, ldy, beta, s);
+            CU(cudaStreamSynchronize(s));
+            const auto y = host(dy, y0.size());
+            std::vector<float> got;
+            std::vector<double> ref;
+            for (int r = 0; r < rows; ++r)
+                for (int c = 0; c < n; ++c) {
+                    double sum = beta * y0[(size_t) r * ldy + c];
+                    for (int i = 0; i < k; ++i) sum += (double) values[(size_t) c * k + i] * h2f(x[(size_t) r * ldx + i]);
+                    got.push_back(y[(size_t) r * ldy + c]);
+                    ref.push_back(sum);
+                }
+            char what[96];
+            std::snprintf(what, sizeof what, "%s head gemm, padded rows, beta %g", gg::type_name(type), beta);
+            expect(what, got.data(), ref.data(), ref.size(), 1e-4);
+            cudaFree(dy);
+        }
+        cudaFree(dw), cudaFree(dx);
+    }
+}
 
 void test_dense(cudaStream_t s) {
     for (int t : kDense) {
@@ -578,7 +724,26 @@ void test_experts(int tg, int tu, int td, cudaStream_t s, bool scaled = false) {
             mm3::gg_run(lane, D, F, lim, ex, x.data(), out.data());
             std::vector<double> dref(D);
             for (int d = 0; d < D; ++d) dref[d] = (double) tok[d] - sh[d];
-            std::snprintf(what, sizeof what, "%s CPU lane token = the device's", name);
+            const bool nv = tg == iq::kNVFP4 || tu == iq::kNVFP4 || td == iq::kNVFP4;
+            if (nv) {
+                // ggml's NVFP4 CPU dot takes Q8_0 activations; the GPU token path takes Q8_K, as other experts do.
+                // Verify the CPU lane independently on its own rounded activations, with ggml-decoded weights.
+                std::fill(dref.begin(), dref.end(), 0.0);
+                const auto xg = cpu_round(f.act[0], x.data(), D), xu = cpu_round(f.act[1], x.data(), D);
+                for (int i = 0; i < K; ++i) {
+                    const int e = pick[i];
+                    std::vector<float> h(F);
+                    for (int j = 0; j < F; ++j) {
+                        const float g = (float) dot(E.row(e, 0, j), xg.data(), D) * E.scale(e, 0);
+                        const float u = (float) dot(E.row(e, 1, j), xu.data(), D) * E.scale(e, 1);
+                        h[j] = (float) oai(g, u, lim);
+                    }
+                    const auto hr = cpu_round(f.act[2], h.data(), F);
+                    for (int d = 0; d < D; ++d)
+                        dref[d] += pw[i] * dot(E.row(e, 2, d), hr.data(), F) * E.scale(e, 2);
+                }
+            }
+            std::snprintf(what, sizeof what, "%s CPU lane token = %s", name, nv ? "ggml reference" : "the device's");
             expect(what, out.data(), dref.data(), dref.size(), 2e-3);
             // a window: tokens 0..2, each with its own experts (their union), users in slot order
             std::vector<mm3::CpuExpert> wx;
@@ -628,7 +793,8 @@ const int kTriples[][3] = {
     {iq::kIQ1_S, iq::kIQ1_S, iq::kIQ1_S},       {iq::kIQ1_S, iq::kIQ1_S, iq::kIQ2_XXS},
     {iq::kIQ2_XXS, iq::kIQ1_S, iq::kIQ2_XXS},   {iq::kIQ2_XS, iq::kIQ2_XXS, iq::kIQ3_XXS},
     {iq::kIQ2_S, iq::kIQ2_S, iq::kIQ3_XXS},     {iq::kIQ3_XXS, iq::kIQ3_XXS, iq::kIQ3_XXS},
-    {iq::kIQ2_XXS, iq::kIQ2_XS, iq::kIQ2_XS},   {iq::kIQ4_XS, iq::kIQ3_S, iq::kIQ1_M}};
+    {iq::kIQ2_XXS, iq::kIQ2_XS, iq::kIQ2_XS},   {iq::kIQ4_XS, iq::kIQ3_S, iq::kIQ1_M},
+    {iq::kNVFP4, iq::kNVFP4, iq::kNVFP4},      {iq::kNVFP4, iq::kQ3_K, iq::kQ4_K}};
 
 // mm3_gv's GEMVs against ds4_iq's mv, bit for bit: every dense type, MiniMax's row lengths, 1 .. 16 columns
 __global__ void q8s_ref_kernel(const float* x, int k, int8_t* q, float* d, int* sums) {   // (the int8 rows + sums)
@@ -704,6 +870,11 @@ int main(int argc, char** argv) {
     cudaStream_t s;
     CU(cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking));
     const std::string only = argc >= 2 ? argv[1] : "";
+    if (only.empty() || only == "--nvfp4") {
+        test_nvfp4_decode(s);
+        test_experts(iq::kNVFP4, iq::kNVFP4, iq::kNVFP4, s, true);
+    }
+    if (only.empty() || only == "--float" || only == "--dense") test_float_dense(s);
     if (only.empty() || only == "--dense") test_dense(s);
     if (only.empty() || only == "--dense" || only == "--gv") test_gv(s);
     if (only.empty() || only == "--experts" || only == "--cpu")

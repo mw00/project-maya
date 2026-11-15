@@ -6,12 +6,14 @@
 // kFmtGG; mm3_exl3.cu's entry points hand them here), so the engine's paths - the token, a verify window, the chunked
 // prompt - take either format:
 //   * a dense GEMV (mv): the activations rounded to int8 per 32 values (llama.cpp's q8_1 scale, ds4_gguf.cu's
-//     q8_quant), each sub-block's dot exact in integers, F32 sums;
+//     q8_quant), each sub-block's dot exact in integers, F32 sums. F32 / F16 / BF16 matrices use the F32 inputs
+//     directly, without int8 rounding;
 //   * the prompt path's GEMMs (gemm_rows): the weight decoded to FP16 rows (ds4_iq's f16_rows: ggml's values) and a
 //     cuBLAS FP16 GEMM with F32 accumulation - a few column bands at a time when the matrix is large; the output head
 //     of a short call through the GEMV instead;
 //   * the routed experts: the activations rounded as the CPU lane rounds them (ggml's Q8_K, a scale a 256 - so an
-//     expert gives the same sums on either side; MAYA_MM3_IQ_Q8K=0: a scale a 32), gate and up then swigluoai fused
+//     expert gives the same sums on either side; NVFP4's CPU dot uses Q8_0 instead; MAYA_MM3_IQ_Q8K=0: a scale a 32),
+//     gate and up then swigluoai fused
 //     (two passes where the layer's gate and up differ in type), down, and the weighted sum in plan order with the
 //     CPU lane's part and the shared expert's - as the EXL3 kernels combine them.
 // An expert's blob: gate | up | down, each [rows][blocks] as the GGUF holds it, 256-byte aligned
@@ -27,6 +29,8 @@
 #include "mm3_exl3.hpp"
 
 namespace mm3::gg {
+
+constexpr int kF32 = 0, kF16 = 1, kBF16 = 30;
 
 namespace x3 = strata::mm3::exl3;
 

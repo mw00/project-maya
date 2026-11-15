@@ -45,6 +45,31 @@ constexpr int kMaxEmbd = 8192;       // n_embd and n_ff at most (MiniMax-M3.1: 6
 constexpr int kMaxQK = 16384;        // a GEMV's inputs at most (the dense MLP's down: 12288)
 constexpr size_t kBand = 64u << 20;  // a GEMM's FP16 weight band (bytes): the rows decoded at a time
 
+bool floating(int type) { return type == kF32 || type == kF16 || type == kBF16; }
+template <int T>
+__device__ __forceinline__ float float_value(const uint8_t* row, int i) {
+    if constexpr (T == kF32) return ((const float*) row)[i];
+    else if constexpr (T == kF16) return __half2float(__ushort_as_half(((const uint16_t*) row)[i]));
+    else return __uint_as_float((uint32_t) ((const uint16_t*) row)[i] << 16);
+}
+template <int T>
+__global__ void float_mv(const uint8_t* w, size_t ld, const float* x, size_t xcs, float* y, size_t ycs,
+                         int k, int n, const float* bias, float alpha) {
+    const int r = blockIdx.x * kWarps + threadIdx.x / 32, lane = threadIdx.x & 31, c = blockIdx.y;
+    if (r >= n) return;
+    const uint8_t* row = w + (size_t) r * ld;
+    float sum = 0.0f;
+    for (int i = lane; i < k; i += 32) sum = fmaf(float_value<T>(row, i), x[(size_t) c * xcs + i], sum);
+    for (int off = 16; off > 0; off >>= 1) sum += __shfl_down_sync(0xffffffffu, sum, off);
+    if (lane == 0) y[(size_t) c * ycs + r] = fmaf(alpha, sum, bias ? bias[r] : 0.0f);
+}
+template <int T>
+__global__ void float_f16_rows(const uint8_t* w, size_t ld, int k, int n, uint16_t* dst) {
+    for (size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x; i < (size_t) n * k;
+         i += (size_t) gridDim.x * blockDim.x)
+        dst[i] = __half_as_ushort(__float2half_rn(float_value<T>(w + i / k * ld, (int) (i % k))));
+}
+
 // ---- int8 activations
 // per 32 values (llama.cpp's q8_1 scale, ds4_gguf.cu's q8_quant - the same operations): rows of k F32 values (row r
 // at x + r ldx) -> q[r][k], d[r][k / 32] = max|x| / 127 (a warp a 32-block)
@@ -309,16 +334,20 @@ void combine(const x3::ExpertLayout&, const unsigned long long* plan_ptr, const 
 
 // ---------------------------------------------------------------- types
 int type_of(const std::string& dtype) {
+    if (dtype == "F32") return kF32;
+    if (dtype == "F16") return kF16;
+    if (dtype == "BF16") return kBF16;
     for (int t : {iq::kQ8_0, iq::kQ2_K, iq::kQ3_K, iq::kQ4_K, iq::kQ5_K, iq::kQ6_K, iq::kIQ2_XXS, iq::kIQ2_XS,
-                  iq::kIQ3_XXS, iq::kIQ1_S, iq::kIQ3_S, iq::kIQ2_S, iq::kIQ4_XS, iq::kIQ1_M})
+                  iq::kIQ3_XXS, iq::kIQ1_S, iq::kIQ3_S, iq::kIQ2_S, iq::kIQ4_XS, iq::kIQ1_M, iq::kNVFP4})
         if (dtype == iq::name(t)) return t;
     return -1;
 }
 bool expert_type(int t) { return iq::supported(t); }
-bool dense_type(int t) { return iq::mv_supported(t); }
-const char* type_name(int t) { return iq::name(t); }
-int block_values(int t) { return iq::block_values(t); }
+bool dense_type(int t) { return floating(t) || iq::mv_supported(t); }
+const char* type_name(int t) { return t == kF32 ? "F32" : t == kF16 ? "F16" : t == kBF16 ? "BF16" : iq::name(t); }
+int block_values(int t) { return floating(t) ? 1 : iq::block_values(t); }
 size_t row_bytes(int t, int64_t k) {
+    if (floating(t)) return (size_t) k * (t == kF32 ? 4 : 2);
     return iq::mv_supported(t) && k % iq::block_values(t) == 0 ? iq::row_bytes(t, k) : 0;
 }
 
@@ -361,6 +390,28 @@ void q8_quant(const float* x, size_t ldx, int rows, int k, int8_t* q, float* d, 
 // ---------------------------------------------------------------- dense matrices
 bool mv(const x3::MvJob* jobs, int n, cudaStream_t s) {
     if (n <= 0 || n > x3::kMaxMvJobs) return false;
+    x3::MvJob quant[x3::kMaxMvJobs];
+    int nq = 0;
+    for (int i = 0; i < n; ++i) {
+        const x3::MvJob& j = jobs[i];
+        if (j.m == nullptr) return false;
+        const x3::Mat& m = *j.m;
+        if (!floating(m.gg_type)) { quant[nq++] = j; continue; }
+        if (m.fmt != kFmtGG || m.raw == nullptr || j.xf == nullptr || j.y == nullptr || m.k <= 0 || m.n <= 0 ||
+            j.ncol < 1 || j.ncol > x3::kMaxMvCols) return false;
+        const size_t ld = m.ld > 0 ? (size_t) m.ld : row_bytes(m.gg_type, m.k);
+        if (ld < row_bytes(m.gg_type, m.k)) return false;
+        const dim3 grid((unsigned) ((m.n + kWarps - 1) / kWarps), (unsigned) j.ncol);
+#define FLOAT_MV(T) float_mv<T><<<grid, kThreads, 0, s>>>((const uint8_t*) m.raw, ld, j.xf, j.xf_cs, j.y, j.y_cs, m.k, m.n, j.bias, j.alpha)
+        if (m.gg_type == kF32) { FLOAT_MV(kF32); }
+        else if (m.gg_type == kF16) { FLOAT_MV(kF16); }
+        else { FLOAT_MV(kBF16); }
+#undef FLOAT_MV
+    }
+    if (nq < n) {
+        check("floating mv");
+        return nq == 0 || ::mm3::gg::mv(quant, nq, s);
+    }
     Scratch* sc = scratch(s);
     if (sc == nullptr) return false;
     iq::MvJob J[x3::kMaxMvJobs];
@@ -449,7 +500,15 @@ void gemm_rows(const x3::Mat& m, const uint16_t* x16, int ldx, int rows, float* 
     const float one = 1.0f;
     for (int c0 = 0; c0 < m.n; c0 += band) {
         const int nc = std::min(band, m.n - c0);
-        if (!iq::f16_rows(m.gg_type, (const uint8_t*) m.raw + (size_t) c0 * ld, m.k, nc, sc->wb, m.k, s)) {
+        const uint8_t* src = (const uint8_t*) m.raw + (size_t) c0 * ld;
+        if (floating(m.gg_type)) {
+            const unsigned blocks = (unsigned) std::min<size_t>(65535, ((size_t) nc * m.k + 255) / 256);
+#define FLOAT_F16(T) float_f16_rows<T><<<blocks, 256, 0, s>>>(src, ld, m.k, nc, sc->wb)
+            if (m.gg_type == kF32) { FLOAT_F16(kF32); }
+            else if (m.gg_type == kF16) { FLOAT_F16(kF16); }
+            else { FLOAT_F16(kBF16); }
+#undef FLOAT_F16
+        } else if (!iq::f16_rows(m.gg_type, src, m.k, nc, sc->wb, m.k, s)) {
             fail("gemm_rows: f16_rows");
             return;
         }

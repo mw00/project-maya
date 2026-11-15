@@ -80,16 +80,19 @@ template <> struct Ty<kIQ1_M> { static constexpr int B = 56, TAB = 2048, MIN = 0
 // (d, then 32 int8: a block of 32 values) - the GEMVs, the FP16 rows and decode_values (maya-mm3's MiniMax quants)
 template <> struct Ty<kQ6_K> { static constexpr int B = 210, TAB = 0, MIN = 0; };
 template <> struct Ty<kQ8_0> { static constexpr int B = 34, TAB = 0, MIN = 0; };
+// NVFP4: four UE4M3 scales, each covering 16 E2M1 values (8 packed bytes), 64 values per block.
+template <> struct Ty<kNVFP4> { static constexpr int B = 36, TAB = 0, MIN = 0; };
 // MXFP4 (ds4_gguf.cu's own kernels everywhere else): a block of 32 values, an E8M0 scale then 16 code bytes; the light
 // sets take it too
 constexpr int kMXFP4 = 39;
 template <> struct Ty<kMXFP4> { static constexpr int B = 17, TAB = 0, MIN = 0; };
-template <int T> constexpr int kQK = T == kMXFP4 || T == kQ8_0 || T == kIQ4_NL ? 32 : 256;   // values a block
+template <int T> constexpr int kQK = T == kNVFP4 ? 64 : T == kMXFP4 || T == kQ8_0 || T == kIQ4_NL ? 32 : 256;
 static_assert(sizeof(block_iq2_xxs) == 66 && sizeof(block_iq2_s) == 82 && sizeof(block_iq3_xxs) == 98 &&
                   sizeof(block_iq3_s) == 110 && sizeof(block_iq4_xs) == 136 && sizeof(block_q4_K) == 144 &&
                   sizeof(block_q2_K) == 84 && sizeof(block_q3_K) == 110 && sizeof(block_iq1_s) == 50 &&
                   sizeof(block_iq1_m) == 56 && sizeof(block_iq2_xs) == 74 && sizeof(block_q5_K) == 176 &&
-                  sizeof(block_q6_K) == 210 && sizeof(block_q8_0) == 34 && sizeof(block_iq4_nl) == 18,
+                  sizeof(block_q6_K) == 210 && sizeof(block_q8_0) == 34 && sizeof(block_iq4_nl) == 18 &&
+                  sizeof(block_nvfp4) == 36,
               "ggml's block sizes");
 static_assert(IQ1S_DELTA == 0.125f && IQ1M_DELTA == 0.125f, "IQ1's delta: the codes 8 g +- 1 below");
 
@@ -132,6 +135,12 @@ __device__ __forceinline__ uint32_t ld2(const uint8_t* p) {   // 4 bytes from a 
 }
 __device__ __forceinline__ uint32_t ld4(const uint8_t* p) { return *(const uint32_t*) p; }
 __device__ __forceinline__ float h2f(const uint8_t* p) { return __half2float(__ushort_as_half(*(const uint16_t*) p)); }
+// ggml_ue4m3_to_fp32: half the unsigned E4M3 value, since kvalues_mxfp4 holds doubled E2M1 codes.
+__device__ __forceinline__ float nvfp4_scale(uint8_t x) {
+    if (x == 0 || x == 0x7f) return 0.0f;
+    const int e = (x >> 3) & 15, m = x & 7;
+    return e == 0 ? (float) m * 0x1p-10f : __uint_as_float((uint32_t) (e + 119) << 23 | (uint32_t) m << 20);
+}
 // 7 sign bits (bits 0..6 of v) -> the 8 signs, bit 7 their parity (ggml's ksigns_iq2xs)
 __device__ __forceinline__ uint32_t ksigns8(uint32_t v) {
     v &= 127u;
@@ -176,7 +185,7 @@ __device__ __forceinline__ void q4k_scale(const uint8_t* q, int j, int& d, int& 
 }
 
 // a 32-value sub-block (kb: its index in the row) as 32 int8 codes and its scales: weight i = d s q_i - m, s and m of
-// its half (i < 16: s0, m0; else s1, m1)
+// its half (i < 16: s0, m0; else s1, m1). NVFP4 uses weight i = m0/1 q_i: independent float scales per 16.
 struct Sub {
     int q[8];
     float d, m0, m1;
@@ -241,7 +250,7 @@ __device__ __forceinline__ void iq1_decode(const Raw1& r, int kb, const uint32_t
 template <int T, bool CT = false>
 __device__ __forceinline__ void decode(const uint8_t* __restrict__ row, int kb, const uint32_t* tab, Sub& s) {
     const int ib = kb & 7;
-    const uint8_t* b = row + (size_t) (kQK<T> == 32 ? kb : kb >> 3) * Ty<T>::B;
+    const uint8_t* b = row + (size_t) (kb / (kQK<T> / 32)) * Ty<T>::B;
     if constexpr (T == kMXFP4) {   // codes: value j in byte j's low nibble, j + 16 in its high one (any alignment)
         const uint32_t t[4] = {0x03020100u, 0x0C080604u, 0xFDFEFF00u, 0xF4F8FAFCu};   // ggml's kvalues_mxfp4
 #pragma unroll
@@ -256,6 +265,19 @@ __device__ __forceinline__ void decode(const uint8_t* __restrict__ row, int kb, 
         s.s0 = s.s1 = 1;
         (void) ib;
         (void) tab;
+    } else if constexpr (T == kNVFP4) {
+        const uint32_t t[4] = {0x03020100u, 0x0C080604u, 0xFDFEFF00u, 0xF4F8FAFCu};
+#pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            const uint8_t* q = b + 4 + (2 * (kb & 1) + h) * 8;
+            const int2 lo = tab16(ld4(q), t), hi = tab16(ld4(q + 4), t);
+            s.q[4 * h] = lo.x;
+            s.q[4 * h + 1] = hi.x;
+            s.q[4 * h + 2] = lo.y;
+            s.q[4 * h + 3] = hi.y;
+        }
+        s.m0 = nvfp4_scale(b[2 * (kb & 1)]);
+        s.m1 = nvfp4_scale(b[2 * (kb & 1) + 1]);
     } else if constexpr (T == kIQ2_XXS) {
         const uint8_t* q = b + 2 + 8 * ib;
         const uint32_t a0 = ld2(q), a1 = ld2(q + 4);
@@ -485,6 +507,8 @@ __device__ __forceinline__ float sub_dot(const Sub& s, const int4& xa, const int
     hi = __dp4a(s.q[5], xb.y, hi);
     hi = __dp4a(s.q[6], xb.z, hi);
     hi = __dp4a(s.q[7], xb.w, hi);
+    if constexpr (T == kNVFP4)
+        return fadd_no_fma(fmul_no_fma(s.m0, (float) lo), fmul_no_fma(s.m1, (float) hi));
     float v = fmul_no_fma(s.d, (float) (s.s0 * lo + s.s1 * hi));
     if constexpr (Ty<T>::MIN) {
         int sl = __dp4a(0x01010101, xa.x, 0);
@@ -504,8 +528,13 @@ __device__ __forceinline__ float sub_dot(const Sub& s, const int4& xa, const int
 template <int T>
 __device__ __forceinline__ void deq8(const uint8_t* __restrict__ row, int kb, int p, const uint32_t* tab, float* w) {
     const int ib = kb & 7;
-    const uint8_t* b = row + (size_t) (kQK<T> == 32 ? kb : kb >> 3) * Ty<T>::B;
-    if constexpr (T == kIQ2_XXS) {
+    const uint8_t* b = row + (size_t) (kb / (kQK<T> / 32)) * Ty<T>::B;
+    if constexpr (T == kNVFP4) {
+        const int group = 2 * (kb & 1) + (p >> 1), shift = 4 * (p & 1);
+        const float d = nvfp4_scale(b[group]);
+#pragma unroll
+        for (int j = 0; j < 8; ++j) w[j] = d * (float) kvalues_mxfp4[(b[4 + group * 8 + j] >> shift) & 15];
+    } else if constexpr (T == kIQ2_XXS) {
         const uint8_t* q = b + 2 + 8 * ib;
         const uint32_t a1 = ld2(q + 4);
         const uint2 g = ((const uint2*) tab)[q[p]];
@@ -1389,7 +1418,9 @@ __global__ void __launch_bounds__(kThreads) values_kernel(const uint8_t* __restr
 #pragma unroll
             for (int j = 0; j < 4; ++j) {
                 const int at = 4 * t + j, q = (int) (int8_t) (uint8_t) ((uint32_t) s.q[t] >> (8 * j));
-                float v = __fmul_rn(s.d, (float) ((at < 16 ? s.s0 : s.s1) * q));
+                float v;
+                if constexpr (T == kNVFP4) v = __fmul_rn(at < 16 ? s.m0 : s.m1, (float) q);
+                else v = __fmul_rn(s.d, (float) ((at < 16 ? s.s0 : s.s1) * q));
                 if constexpr (Ty<T>::MIN) v = __fsub_rn(v, at < 16 ? s.m0 : s.m1);
                 o[at] = v;
             }
@@ -1450,6 +1481,7 @@ bool tc_ok() {
         case kIQ1_S: F(kIQ1_S); break;     \
         case kIQ1_M: F(kIQ1_M); break;     \
         case kIQ4_NL: F(kIQ4_NL); break;   \
+        case kNVFP4: F(kNVFP4); break;     \
         default: return false;       \
     }
 // ... and the dense matrices' types beside them (the GEMVs, the FP16 rows, decode_values)
@@ -1709,7 +1741,7 @@ void launch_light(const SetArgs& a, const LightBuf& b, cudaStream_t s) {
 }
 // a set's gate and up of different types (SetArgs::tu, kActOai only): two passes, the gate's sums in graw between them
 bool split_gu(const SetArgs& a) { return a.act == kActOai && a.tu != 0 && a.tu != a.tg; }
-// the gate / up's inputs (the up's own type too) and the down's in whole blocks of their types (256 values; IQ4_NL's 32)
+// the gate / up's inputs (the up's own type too) and the down's in whole blocks of their types
 bool k_whole(int n_embd, int n_ff, int tg, int tu, int td) {
     return n_embd % block_values(tg) == 0 && (tu == 0 || n_embd % block_values(tu) == 0) && n_ff % block_values(td) == 0;
 }
@@ -1786,6 +1818,7 @@ int block_bytes(int t) {
         case kIQ1_S: return Ty<kIQ1_S>::B;
         case kIQ1_M: return Ty<kIQ1_M>::B;
         case kIQ4_NL: return Ty<kIQ4_NL>::B;
+        case kNVFP4: return Ty<kNVFP4>::B;
         default: return 0;
     }
 }
@@ -1807,6 +1840,7 @@ const char* name(int t) {
         case kIQ1_S: return "IQ1_S";
         case kIQ1_M: return "IQ1_M";
         case kIQ4_NL: return "IQ4_NL";
+        case kNVFP4: return "NVFP4";
         default: return "?";
     }
 }

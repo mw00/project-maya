@@ -24,7 +24,8 @@ The GGUF's norms already hold Gemma's 1 + w (llama.cpp's converter adds it): mm3
 engine adds nothing.
 
 A GGUF text set can use separately selected --drafter / --vision GGUFs: MiniMax's DSpark BF16 and vision F32/BF16
-with their embedded configuration. Their weights are indexed in place, including the vision's temporal patch slices.
+with embedded JSON or standard CLIP metadata. Their weights are indexed in place, including the vision's temporal
+patch slices. NVFP4 experts keep their native 64-value, 36-byte blocks.
 The optional per-expert .scale tensors are indexed as one F32 multiplier per expert and matrix.
 
 The native vision tower and DSpark draft also come with the EXL3 repo (Mia-AiLab's, tools/mm3/download.json)
@@ -282,7 +283,7 @@ def main() -> int:
     for fi, g in enumerate(gs + ([sg] if sg else [])):
         for name, typ, dims, off in g.tensors:
             if typ not in TYPES:
-                kind = "NVFP4 (ggml type 40)" if typ == 40 else "ggml type %d" % typ
+                kind = "ggml type %d" % typ
                 raise SystemExit("%s: %s has %s, which the MiniMax engine does not read" % (g.path.name, name, kind))
             tname, per, bpb = TYPES[typ]
             nel = 1
