@@ -433,6 +433,10 @@ class EngineFault(EngineDied):
 # again by themselves (the same long request, minutes of decode, for an error the client should see)
 ENGINE_ERROR_STATUS = 422
 
+# maya-ds4's END line (ahead of the request's DONE) carries the decode's own reason since #827 - the failed call, the
+# position: "END a GPU's state is unknown after this request (<reason>) - the engine ends (exit 3); ..."
+END_REASON = re.compile(r"after this request \((.*)\) - the engine ends")
+
 
 def with_partial(items, text_of):
     """The items as they come; an EngineFault raised among them takes the text they carried (text_of(item) ->
@@ -1086,6 +1090,8 @@ class StrataEngine:
             # instead of writing to this one while it exits
             if line.startswith("END "):
                 print("[maya] " + line[4:].strip(), flush=True)
+                m = END_REASON.search(line)             # (its reason goes into the request's error: EngineFault)
+                self.end_reason = m.group(1).strip() if m else ""
                 self.ended = True
                 continue
             if self.multi and self._route(line):
@@ -1226,7 +1232,7 @@ class StrataEngine:
         # trigger, the silent wait the bug).
         rids, routes, routes_lock = self._rids, self._routes, self._routes_lock
         ctx = self.max_context
-        self.ended = False
+        self.ended, self.end_reason = False, ""
         try:
             self.__init__(*self.spawn)
         except Exception:
@@ -1280,16 +1286,20 @@ class StrataEngine:
         """A DONE read as the request's own end that says "cancel" while nothing asked for it - no STOP or PAUSE
         for this request, no cut for all, no cancel - is the engine's own stop on an error (maya-ds4: a decode step
         or a sample that failed, a GPU's fault; the reason goes to the engine's log).  It used to be reported as
-        "length" (#827); it raises EngineFault, which every API reports as its error."""
+        "length" (#827); it raises EngineFault, which every API reports as its error - with the END line's reason
+        (the failed call, the position) when the engine gave one."""
         if (self.last or {}).get("finish") != "cancel" or cancel.is_set() or self._asked_end() != ends0 or \
                 rid in self.__dict__.get("_paused", ()):
             return
         gone = bool(getattr(self, "ended", False))       # (its END line: a GPU's state is unknown, it ends now)
+        why = (getattr(self, "end_reason", "") or "") if gone else ""   # (the END line's reason, #827)
         log = getattr(self, "log_path", None)
         raise EngineFault(f"the engine stopped this answer itself because of an error after "
                           f"{self.last.get('generated', 0)} tokens (not the token limit)"
                           + (": a GPU's state is unknown after it" if gone else "")
-                          + (f"; the reason is in the engine's log ({log})" if log else ""), restarts=gone)
+                          + (f" - {why}" if why else "")
+                          + ((f"; more in the engine's log ({log})" if why else
+                              f"; the reason is in the engine's log ({log})") if log else ""), restarts=gone)
 
     def _parse_stat(self, line):
         """STAT key=value ... (the GLM engine, every few tokens): live expert-tier counters for the Monitor."""

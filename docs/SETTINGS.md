@@ -453,9 +453,9 @@ Anthropic SDKs raise an error on them). A request that is not streamed gets 422,
 408, 409 or 429 again by themselves, which would run the same long answer once more without the client seeing the
 error. Its error carries what the answer had written before it: `partial_text` (and `partial_reasoning` - Maya's
 model API: `partial_thinking` - when it was still thinking), less the last few tokens the loop guard still held
-back. The message says how many tokens the answer had and that the reason is in the engine's log. After a GPU's
-fault the engine ends (DeepSeek's also prints the reason and the position on the console as it ends), and the next
-request starts a fresh one.
+back. The message says how many tokens the answer had and why it stopped: after a GPU's fault on DeepSeek, the call
+that failed and the position in the context (what the engine prints on the console as it ends); otherwise that the
+reason is in the engine's log. After a GPU's fault the engine ends, and the next request starts a fresh one.
 
 ## The thinking level and the thinking budget
 
