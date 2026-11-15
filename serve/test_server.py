@@ -1211,12 +1211,39 @@ class EngineEndsItself(unittest.TestCase):
                 with self.assertRaises(EngineFault):
                     list(eng.generate([1, 2, 3], 16, {}, threading.Event()))
 
+    def test_the_error_carries_what_was_written(self):
+        from serve.server import anthropic_texts, engine_error_body, openai_texts, with_partial
+
+        def chunks():
+            yield {"choices": [{"delta": {"reasoning_content": "hmm "}}]}
+            yield None
+            yield {"choices": [{"delta": {"content": "Hello"}}]}
+            yield {"choices": [{"delta": {"content": " there"}}]}
+            raise EngineFault("the engine stopped this answer itself because of an error after 4 tokens")
+
+        with self.assertRaises(EngineFault) as cm:
+            list(with_partial(chunks(), openai_texts))
+        body = engine_error_body(cm.exception)
+        self.assertEqual((body["error"]["partial_text"], body["error"]["partial_reasoning"]), ("Hello there", "hmm "))
+        self.assertEqual((body["error"]["type"], body["error"]["code"]), ("engine_error", "engine_error"))
+
+        def events():
+            yield "content_block_delta", {"delta": {"type": "text_delta", "text": "Hi"}}
+            yield "message_start", {"message": {}}
+            raise EngineFault("x")
+
+        with self.assertRaises(EngineFault) as cm:
+            list(with_partial(events(), anthropic_texts))
+        body = engine_error_body(cm.exception, anthropic=True)
+        self.assertEqual((body["type"], body["error"]["type"], body["error"]["partial_text"]),
+                         ("error", "engine_error", "Hi"))
+
     def test_every_api_reports_an_error(self):
         class FaultEngine(MockEngine):
             def generate(self, ids, max_new, sampling, cancel, embeddings=None):
                 for i, t in enumerate(super().generate(ids, max_new, sampling, cancel, embeddings)):
-                    if i == 3:
-                        raise EngineFault("the engine stopped this answer itself because of an error after 3 tokens "
+                    if i == 300:
+                        raise EngineFault("the engine stopped this answer itself because of an error after 300 tokens "
                                           "(not the token limit)")
                     yield t
 
@@ -1226,10 +1253,10 @@ class EngineEndsItself(unittest.TestCase):
         httpd = serve(svc, port=0)
         base = f"http://127.0.0.1:{httpd.server_address[1]}"
         msgs = [{"role": "user", "content": "hi"}]
-        cases = [("/v1/chat/completions", {"model": "m", "max_tokens": 20, "messages": msgs}),
-                 ("/v1/messages", {"model": "m", "max_tokens": 20, "messages": msgs}),
-                 ("/v1/responses", {"model": "m", "max_output_tokens": 20, "input": "hi"}),
-                 ("/api/chat", {"model": "m", "messages": msgs, "options": {"num_predict": 20}})]
+        cases = [("/v1/chat/completions", {"model": "m", "max_tokens": 400, "messages": msgs}),
+                 ("/v1/messages", {"model": "m", "max_tokens": 400, "messages": msgs}),
+                 ("/v1/responses", {"model": "m", "max_output_tokens": 400, "input": "hi"}),
+                 ("/api/chat", {"model": "m", "messages": msgs, "options": {"num_predict": 400}})]
         try:
             for path, body in cases:
                 for stream in (True, False):
@@ -1242,10 +1269,22 @@ class EngineEndsItself(unittest.TestCase):
                         with e:
                             code, text = e.code, e.read().decode()
                     what = f"{path} stream={stream}"
-                    self.assertIn("because of an error after 3 tokens", text, what)
+                    self.assertIn("because of an error after 300 tokens", text, what)
                     for word in ('"length"', ': "max_tokens"', '"reason": "max_output_tokens"', '"end_turn"'):
                         self.assertNotIn(word, text, what)
-                    self.assertEqual(code >= 500, not stream, (what, code))   # (not streamed: a server error)
+                    if stream:
+                        self.assertEqual(code, 200, what)
+                    else:
+                        # not streamed: 422 "engine_error" (no 5xx / 408 / 409 / 429, which the OpenAI and Anthropic
+                        # SDKs send again by themselves) with the text written before the error
+                        self.assertEqual(code, 422, what)
+                        body = json.loads(text)
+                        err = body["error"] if isinstance(body.get("error"), dict) else body
+                        self.assertIn("engine_error", (err.get("type"), err.get("code"), err.get("error_type")), what)
+                        got = err["partial_text"] + (err.get("partial_reasoning") or err.get("partial_thinking") or "")
+                        self.assertTrue(len(got) > 100 and ANSWER[:300].startswith(got), (what, got))   # (the guard holds a tail)
+                        if path == "/v1/messages":
+                            self.assertEqual(body["type"], "error")
                     self.assertEqual(svc.metrics()["requests"][0]["finish"], "error", what)
         finally:
             httpd.shutdown()

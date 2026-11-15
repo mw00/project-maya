@@ -417,11 +417,64 @@ class EngineFault(EngineDied):
     """The engine ended an answer itself because of an error - a GPU's fault, a failed decode step, numbers gone
     non-finite - with nothing asking it to stop (#827: the server called that "length", as if max_tokens had been
     reached).  Every API reports it as its error (docs/SETTINGS.md, "When the engine stops an answer"), never as a
-    finish reason.  restarts: the engine ends after it (its END line), so the next request starts a fresh one."""
+    finish reason.  restarts: the engine ends after it (its END line), so the next request starts a fresh one.
+    partial_text / partial_reasoning: what the answer had written before it (with_partial), which a request that is
+    not streamed gets back in its error (HTTP 422, ENGINE_ERROR_STATUS)."""
+    engine_fault = True                                  # (serve/responses.py tells it from other failures by this)
 
     def __init__(self, message: str, restarts: bool = False):
         super().__init__(message)
         self.restarts = restarts
+        self.partial_text, self.partial_reasoning = "", ""
+
+
+# A request that is not streamed and whose answer the engine stopped on an error (EngineFault): 422 with type
+# "engine_error" and the text written so far - not a 5xx, 408, 409 or 429, which the OpenAI and Anthropic SDKs send
+# again by themselves (the same long request, minutes of decode, for an error the client should see)
+ENGINE_ERROR_STATUS = 422
+
+
+def with_partial(items, text_of):
+    """The items as they come; an EngineFault raised among them takes the text they carried (text_of(item) ->
+    (answer text, reasoning text)) as its partial_text / partial_reasoning."""
+    text, reasoning = [], []
+    try:
+        for it in items:
+            if it is not None:
+                t, r = text_of(it)
+                text.append(t or "")
+                reasoning.append(r or "")
+            yield it
+    except EngineFault as e:
+        e.partial_text, e.partial_reasoning = "".join(text), "".join(reasoning)
+        raise
+    finally:
+        close = getattr(items, "close", None)
+        if close is not None:
+            close()
+
+
+def openai_texts(c) -> tuple:
+    """A chat completion chunk's (content, reasoning_content) - with_partial's text_of."""
+    d = ((c.get("choices") or [{}])[0].get("delta") or {}) if isinstance(c, dict) else {}
+    return d.get("content"), d.get("reasoning_content")
+
+
+def anthropic_texts(item) -> tuple:
+    """An Anthropic stream event's (text, thinking) - with_partial's text_of."""
+    name, e = item
+    d = (e.get("delta") or {}) if name == "content_block_delta" else {}
+    return d.get("text"), d.get("thinking")
+
+
+def engine_error_body(e: "EngineFault", anthropic: bool = False) -> dict:
+    """The 422's body: OpenAI's error object, or Anthropic's, with the text written before the error."""
+    err = {"type": "engine_error", "message": died_text(e), "partial_text": e.partial_text}
+    if e.partial_reasoning:
+        err["partial_reasoning"] = e.partial_reasoning
+    if anthropic:
+        return {"type": "error", "error": err}
+    return {"error": {**err, "code": "engine_error"}}
 
 
 def died_text(e: Exception) -> str:
@@ -5781,7 +5834,7 @@ def make_handler(svc: Service):
                 self.wfile.write((json.dumps(ev, ensure_ascii=False) + "\n").encode())
             try:
                 if not oreq.get("stream"):
-                    pieces = [ev for c in chunks for ev in tr.feed(c)]
+                    pieces = [ev for c in with_partial(chunks, openai_texts) for ev in tr.feed(c)]
                     calls = [c for ev in tr.finish_calls() for c in ev["message"]["tool_calls"]]
                     last = tr.done()
                     if kind == "chat":
@@ -5807,6 +5860,14 @@ def make_handler(svc: Service):
             except OSError:
                 cancel.set()
                 chunks.close()
+            except EngineFault as e:                             # (#827: not streamed - a 422 with what it wrote)
+                if self.answer_started:
+                    line({"error": died_text(e)})
+                else:
+                    self._json(ENGINE_ERROR_STATUS, {"error": died_text(e), "error_type": "engine_error",
+                                                     "partial_text": e.partial_text,
+                                                     **({"partial_thinking": e.partial_reasoning}
+                                                        if e.partial_reasoning else {})})
             except EngineDied as e:
                 if self.answer_started:
                     line({"error": died_text(e)})
@@ -6352,6 +6413,11 @@ def make_handler(svc: Service):
                     self._fail(400, "invalid_request_error", str(e))
                 else:
                     self._json(400, error_body(e))
+            except EngineFault as e:                         # (#827: not streamed - a status SDKs do not retry)
+                if self.answer_started:
+                    self._fail(503, "server_error", died_text(e))
+                else:
+                    self._json(ENGINE_ERROR_STATUS, engine_error_body(e, anthropic=path == "/v1/messages"))
             except EngineDied as e:
                 self._fail(503, "server_error", died_text(e))
             except (KeyError, TypeError, AttributeError, IndexError) as e:
@@ -6576,6 +6642,10 @@ def make_handler(svc: Service):
             try:
                 if not req.get("stream"):
                     out = response_collect(events)
+                    if out["status"] == "failed" and "partial_text" in (out.get("error") or {}):
+                        # (#827: the engine stopped it on an error - a status SDKs do not send again by themselves)
+                        out["error"]["code"] = "engine_error"
+                        return self._json(ENGINE_ERROR_STATUS, out)
                     return self._json(500 if out["status"] == "failed" else 200, out)
                 first = next(events)
                 self._sse()
@@ -6657,7 +6727,8 @@ def make_handler(svc: Service):
                                {t["name"] for t in extra}) if use_mcp else None
             chunks = openai_chunks(svc, req, ids, thinking, tools, max_new, cancel, run=run)
             if not req.get("stream"):
-                return self._json(200, openai_collect(chunks, logprobs=logprobs_asked(req) is not None))
+                return self._json(200, openai_collect(with_partial(chunks, openai_texts),
+                                                      logprobs=logprobs_asked(req) is not None))
             if req.get("strata_resume") is True:
                 # the web app: the answer runs on if the connection drops; the page reconnects to it by id
                 first = next(chunks)
@@ -6751,7 +6822,7 @@ def make_handler(svc: Service):
             watch_client(self, cancel)
             events = anthropic_events(svc, req, ids, thinking, tools, max_new, cancel)
             if not req.get("stream"):
-                return self._json(200, anthropic_collect(events))
+                return self._json(200, anthropic_collect(with_partial(events, anthropic_texts)))
             self._sse()
             try:
                 for item in events:

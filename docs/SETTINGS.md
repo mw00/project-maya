@@ -439,15 +439,19 @@ with that API's own error instead, never with a finish reason a client would tak
 
 | API | Streamed | Not streamed |
 |---|---|---|
-| OpenAI chat completions | the text already sent stands; then a `data: {"error": {"type": "server_error", ...}}` chunk and `data: [DONE]` (no `finish_reason` chunk) | HTTP 503, `server_error` |
-| Anthropic messages | the text already sent stands; then `event: error` (`api_error`), no `message_delta` with a `stop_reason` | HTTP 503, `server_error` |
-| Responses | `response.failed` with `error.code` "server_error" | HTTP 500, the response with status "failed" |
-| Maya's model API (`/api/chat`, `/api/generate`) | a last line `{"error": ...}`, no `done: true` line | HTTP 503 with `{"error": ...}` |
+| OpenAI chat completions | the text already sent stands; then a `data: {"error": {"type": "server_error", ...}}` chunk and `data: [DONE]` (no `finish_reason` chunk) | HTTP 422, `{"error": {"type": "engine_error", "code": "engine_error", "message": ..., "partial_text": ...}}` |
+| Anthropic messages | the text already sent stands; then `event: error` (`api_error`), no `message_delta` with a `stop_reason` | HTTP 422, `{"type": "error", "error": {"type": "engine_error", "message": ..., "partial_text": ...}}` |
+| Responses | `response.failed` with `error.code` "server_error" | HTTP 422, the response with status "failed", `error.code` "engine_error" and `error.partial_text` |
+| Maya's model API (`/api/chat`, `/api/generate`) | a last line `{"error": ...}`, no `done: true` line | HTTP 422 with `{"error": ..., "error_type": "engine_error", "partial_text": ...}` |
 
 The documented finish reasons have no "error" value (OpenAI's are stop / length / tool_calls / content_filter /
 function_call, Anthropic's end_turn / max_tokens / stop_sequence / tool_use / pause_turn / refusal), so a new one
 would be read as a normal end by some clients; the error forms above are the ones every client handles (the OpenAI and
-Anthropic SDKs raise an error on them, and try a 5xx again). The message says how many tokens the answer had and that
+Anthropic SDKs raise an error on them). A request that is not streamed gets 422, not a 5xx: the SDKs send a 5xx,
+408, 409 or 429 again by themselves, which would run the same long answer once more without the client seeing the
+error. Its error carries what the answer had written before it: `partial_text` (and `partial_reasoning` - Maya's
+model API: `partial_thinking` - when it was still thinking), less the last few tokens the loop guard still held
+back. The message says how many tokens the answer had and that
 the reason is in the engine's log; after a GPU's fault the engine ends, and the next request starts a fresh one.
 
 ## The thinking level and the thinking budget
