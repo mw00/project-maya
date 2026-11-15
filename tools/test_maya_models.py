@@ -271,8 +271,9 @@ class RestartAfterUpdate(unittest.TestCase):
         self.assertFalse(left)                          # (read once: a later port change is not a switch)
 
     def test_an_old_note_is_not_followed(self):
-        got, _, left = self.after({"why": "switch", "port": 8123, "time": 0}, config=Path("/x/maya-maya-m.json"))
-        self.assertEqual(got, {"--config": "/x/maya-maya-m.json", "--backend": "cuda"})
+        config = Path("/x/maya-maya-m.json")
+        got, _, left = self.after({"why": "switch", "port": 8123, "time": 0}, config=config)
+        self.assertEqual(got, {"--config": str(config), "--backend": "cuda"})   # (as the OS writes the path)
         self.assertFalse(left)
 
 
