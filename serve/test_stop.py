@@ -212,11 +212,20 @@ class ServerStops(unittest.TestCase):
         self.cfg = fake_config(Path(self.tmp.name))
 
     def start(self, extra=(), **kw) -> Proc:
-        p = Proc(server_cmd(self.cfg, free_port()) + list(extra), **kw)
+        p = self.serve(server_cmd(self.cfg, free_port()) + list(extra), **kw)
+        self.assertTrue(self.engine or not FAKE_ENGINE, "no engine process")
+        return p
+
+    def serve(self, cmd, **kw) -> Proc:
+        """The server, started and ready; self.engine: its engine's processes."""
+        p = Proc(cmd, **kw)
+        # (after p.close, before the folder goes: a server the test leaves running is killed there, and its engine -
+        # no QUIT then - ends only on its input's EOF a moment later; on Windows it still held engine.log)
+        self.engine = []
+        self.addCleanup(lambda: (kill_all(self.engine), gone(self.engine, 15)))
         self.addCleanup(p.close)
         self.assertTrue(p.until("ready:"), "the server did not start:\n" + "\n".join(p.seen))
         self.engine = descendants(p.p.pid)
-        self.assertTrue(self.engine or not FAKE_ENGINE, "no engine process")
         return p
 
     def ended(self, p: Proc, why: str):
@@ -230,10 +239,8 @@ class ServerStops(unittest.TestCase):
         """--engine strata (the old name, in older run scripts) starts the configured engine, not the mock one."""
         cmd = server_cmd(self.cfg, free_port())
         cmd[cmd.index("maya")] = "strata"
-        p = Proc(cmd, stdin=subprocess.DEVNULL)
-        self.addCleanup(p.close)
-        self.assertTrue(p.until("ready:"), "the server did not start:\n" + "\n".join(p.seen))
-        self.assertTrue(descendants(p.p.pid), "no engine process: --engine strata ran the mock engine")
+        self.serve(cmd, stdin=subprocess.DEVNULL)
+        self.assertTrue(self.engine, "no engine process: --engine strata ran the mock engine")
 
     def test_parent_pipe_closed(self):
         p = self.start(["--parent-pipe"], stdin=subprocess.PIPE)
@@ -289,6 +296,7 @@ class MayaStops(unittest.TestCase):
     def cleanup(self):
         kill_all([self.maya.p.pid] + self.tree)
         self.maya.close()
+        gone(self.tree, 15)                             # (they let go of engine.log before the folder goes)
 
     @unittest.skipIf(WIN, "POSIX signals")
     def test_sigterm_to_maya_alone(self):
