@@ -22,6 +22,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <random>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -109,15 +110,23 @@ inline std::string committed_sha(const std::string& stem) {
     return "";
 }
 
-/// sha256 of a file through the interpreter (hashlib; no extra dependency).
+/// sha256 of a file through the interpreter (hashlib; no extra dependency).  The hash goes through a file of this
+/// call's own: one shared <gguf>.sha, truncated by another test's check of the same GGUF while this one read it, read
+/// back empty - a "mismatch" that regenerated the GGUF in place, made every pack built from it stale and had them
+/// rebuilt under the tests reading them (the likely way to ctest -j4's garbage cache rows in
+/// glm_dsa_prefill_decode_test_native32; ctest also runs the fixture tests one at a time: RESOURCE_LOCK, 90-ci-tests).
 inline std::string sha256(const fs::path& p, const fs::path& log) {
-    const fs::path out = p.string() + ".sha";
+    const fs::path out = p.string() + "." + std::to_string(std::random_device{}()) + ".sha";
     const std::string c = python() + " -c \"import hashlib,sys;print(hashlib.sha256(open(sys.argv[1],'rb').read()).hexdigest())\" " +
                           q(p) + " > " + q(out) + " 2>> " + q(log);
-    if (std::system(c.c_str()) != 0) return "";
-    std::ifstream f(out);
+    const bool ok = std::system(c.c_str()) == 0;
     std::string h;
-    f >> h;
+    if (ok) {
+        std::ifstream f(out);
+        f >> h;
+    }
+    std::error_code ec;
+    fs::remove(out, ec);
     return h;
 }
 
