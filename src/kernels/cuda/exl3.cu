@@ -297,20 +297,47 @@ __device__ __forceinline__ void decode8(const uint32_t* w, int lane, float* v) {
 
 // ---------------------------------------------------------------- the rotation
 // the 128-point transform of the 128 values a warp holds 4 per lane (value lane * 4 + i), over sqrt(128)
+// a lane's value from lane ^ M (32-lane waves): on RDNA (gfx10 and later) in registers - DPP for 1 and 2 (quad_perm)
+// and 4 and 8 (row_xmask), v_permlanex16 for 16 - instead of ds_bpermute's LDS round trip each.  The same value moved,
+// so the same bits.  EXL3_XOR_BPERMUTE: the shuffle, as before
+template <int M>
+__device__ __forceinline__ float xor_lane(float v) {
+#if defined(STRATA_USE_HIP) && !defined(STRATA_HIP_WAVE64) && !defined(EXL3_XOR_BPERMUTE) &&                          \
+    (defined(__GFX10__) || defined(__GFX11__) || defined(__GFX12__))
+    const int x = __builtin_bit_cast(int, v);
+    int r;
+    if constexpr (M == 1) r = __builtin_amdgcn_update_dpp(0, x, 0xB1, 0xF, 0xF, false);         // quad_perm [1,0,3,2]
+    else if constexpr (M == 2) r = __builtin_amdgcn_update_dpp(0, x, 0x4E, 0xF, 0xF, false);    // quad_perm [2,3,0,1]
+    else if constexpr (M == 4) r = __builtin_amdgcn_update_dpp(0, x, 0x164, 0xF, 0xF, false);   // row_xmask:4
+    else if constexpr (M == 8) r = __builtin_amdgcn_update_dpp(0, x, 0x168, 0xF, 0xF, false);   // row_xmask:8
+    else {
+        static_assert(M == 16, "xor_lane: 1, 2, 4, 8 or 16");
+        r = (int) __builtin_amdgcn_permlanex16((unsigned) x, (unsigned) x, 0x76543210u, 0xFEDCBA98u, false, false);
+    }
+    return __builtin_bit_cast(float, r);
+#else
+    return __shfl_xor_sync(0xffffffffu, v, M);
+#endif
+}
+template <int M>
+__device__ __forceinline__ void had_stage(float* v, int lane) {
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const float o = xor_lane<M>(v[i]);
+        v[i] = (lane & M) ? o - v[i] : v[i] + o;
+    }
+}
 __device__ __forceinline__ void had128(float* v, int lane) {
     const float s0 = v[0] + v[1], d0 = v[0] - v[1], s1 = v[2] + v[3], d1 = v[2] - v[3];
     v[0] = s0 + s1;
     v[1] = d0 + d1;
     v[2] = s0 - s1;
     v[3] = d0 - d1;
-#pragma unroll
-    for (int m = 1; m < 32; m <<= 1) {
-#pragma unroll
-        for (int i = 0; i < 4; ++i) {
-            const float o = __shfl_xor_sync(0xffffffffu, v[i], m);
-            v[i] = (lane & m) ? o - v[i] : v[i] + o;
-        }
-    }
+    had_stage<1>(v, lane);
+    had_stage<2>(v, lane);
+    had_stage<4>(v, lane);
+    had_stage<8>(v, lane);
+    had_stage<16>(v, lane);
 #pragma unroll
     for (int i = 0; i < 4; ++i) v[i] *= kHad;
 }
@@ -671,8 +698,8 @@ __device__ void block_gemv(const uint32_t* __restrict__ tr, int ld, int tc0, int
         if (cc < nc) {
 #pragma unroll
             for (int h = 0; h < 2; ++h) {
-                acc[cc][h] += __shfl_xor_sync(0xffffffffu, acc[cc][h], 1);
-                acc[cc][h] += __shfl_xor_sync(0xffffffffu, acc[cc][h], 2);
+                acc[cc][h] += xor_lane<1>(acc[cc][h]);
+                acc[cc][h] += xor_lane<2>(acc[cc][h]);
             }
             if (t == 0) {
                 sm.out[cc * kCols + o] = acc[cc][0];
@@ -1947,8 +1974,8 @@ __device__ void hip_scalar_gemv(const uint32_t* __restrict__ tr, int ld, int tc0
         if (cc < nc) {
 #pragma unroll
             for (int h = 0; h < 2; ++h) {
-                acc[cc][h] += __shfl_xor_sync(0xffffffffu, acc[cc][h], 1);
-                acc[cc][h] += __shfl_xor_sync(0xffffffffu, acc[cc][h], 2);
+                acc[cc][h] += xor_lane<1>(acc[cc][h]);
+                acc[cc][h] += xor_lane<2>(acc[cc][h]);
             }
             if (t == 0) {
                 sm.out[cc * kCols + o] = acc[cc][0];
