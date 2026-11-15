@@ -765,6 +765,11 @@ struct Chunk {
     cudaEvent_t lt_g = nullptr, lt_h = nullptr;
     uint16_t* lt_hh = nullptr;
     int* lt_ident = nullptr;
+    // (DS4_LIGHT_WIN) the window launch's groups (pinned, mapped: blob addresses, bounds, rows, the count) and on the
+    // helper its F32 gate / up values, a row each
+    unsigned long long* lt_wgp = nullptr;
+    int *lt_wgs = nullptr, *lt_went = nullptr, *lt_wng = nullptr;
+    float *lt_wh = nullptr, *lt_wu = nullptr;
     unsigned arb_seq = 0;        // the group's chunk all-reduces
     ArAux ar_aux;                // (allreduce_dma's pieces: its copies out on a stream of their own)
     // the attention's sums slab by slab beside the next slab's compute: a stream of their own (its own ArAux), and
@@ -6793,6 +6798,18 @@ struct Model::Impl {
         }();
         return n;
     }
+    // DS4_LIGHT_WIN=<W> (opt-in, 0/unset: off; with DS4_PROMPT_LIGHT, an EXL3 pack): the light experts of at most W
+    // rows go to the helper as one launch pair for the layer - the decode window's kernels in their rows mode
+    // (exl3::win_experts, WinArgs::rows: an entry a packed row, each expert's weights decoded once per 8 of its rows)
+    // - instead of a set-kernel pair each (~250 launches a layer, ~350 us an expert).  The others as before.  Not bit
+    // for bit (the window kernels' sums, F32 gate / up values), as the light path already is not
+    static int light_win() {
+        static const int w = [] {
+            const char* v = ds4_env("DS4_LIGHT_WIN");
+            return v != nullptr ? std::max(0, std::min(64, std::atoi(v))) : 0;
+        }();
+        return w;
+    }
     bool light_ok(const Layer& L0) const {
         return prompt_light() > 0 && helper_id >= 0 && flow_helper && file_experts && !helper_dead.load() &&
                L0.lay.fmt != gg::kFmtMXFP4 && L0.n_cls == 1 && !L0.helper.empty();
@@ -6832,6 +6849,28 @@ struct Model::Impl {
                                  "pool computed on CUDA%d, not copied (up to %d rows a layer)\n",
                          R, R, helper_id, cap);
         }
+        const int WR = pk.gguf ? 0 : light_win();
+        if (WR > 0 && c.lt_wgp == nullptr) {   // (once: the window launch's tables and the helper's gate / up rows)
+            bool ok = cudaHostAlloc((void**) &c.lt_wgp, (size_t) g.n_exp * 8, cudaHostAllocMapped | cudaHostAllocPortable) ==
+                          cudaSuccess &&
+                      cudaHostAlloc((void**) &c.lt_wgs, (size_t) (g.n_exp + 1) * 4,
+                                    cudaHostAllocMapped | cudaHostAllocPortable) == cudaSuccess &&
+                      cudaHostAlloc((void**) &c.lt_went, (size_t) cap * 4, cudaHostAllocMapped | cudaHostAllocPortable) ==
+                          cudaSuccess &&
+                      cudaHostAlloc((void**) &c.lt_wng, 4, cudaHostAllocMapped | cudaHostAllocPortable) == cudaSuccess;
+            ok = ok && cudaSetDevice(helper_id) == cudaSuccess &&
+                 cudaMalloc((void**) &c.lt_wh, (size_t) cap * g.ff * 4) == cudaSuccess &&
+                 cudaMalloc((void**) &c.lt_wu, (size_t) cap * g.ff * 4) == cudaSuccess;
+            ok = cudaSetDevice(d.id) == cudaSuccess && ok;
+            if (!ok) {
+                err = "DS4_LIGHT_WIN: its buffers (" + std::to_string((size_t) cap * g.ff * 8 >> 20) +
+                      " MB on the helper) failed";
+                return false;
+            }
+            std::fprintf(stderr, "ds4: DS4_LIGHT_WIN=%d: the light experts of at most %d rows in one window launch pair a "
+                                 "layer on CUDA%d (the others a set-kernel pair each)\n",
+                         WR, WR, helper_id);
+        }
         if (nr > c.lt_lcap) {   // (the sorted rows' map: the chunk's rows grow it)
             if (c.lt_lidx != nullptr) cudaFreeHost(c.lt_lidx);
             if (c.lt_dlidx != nullptr) cudaFree(c.lt_dlidx);
@@ -6862,8 +6901,22 @@ struct Model::Impl {
         CK(cudaEventSynchronize(c.lt_g));   // (the rows are in host memory: the helper reads them there)
         const int e0 = x3::launch_errors();
         bool ok = cudaSetDevice(helper_id) == cudaSuccess;
+        int nw = 0, wrows = 0;   // (DS4_LIGHT_WIN: its groups, rows)
+        if (WR > 0) c.lt_wgs[0] = 0;
         for (size_t q = 0; ok && q < lv.size(); ++q) {
             const int e = L0.host_list[(size_t) (lv[q] - L0.pv_n)];
+            const int rows = c.lt_hb[q + 1] - c.lt_hb[q];
+            if (WR > 0 && rows <= WR) {   // (the window launch's: its rows are the packed rows hb[q] ..)
+                const uint8_t* wb = x3_pool(L0, e);
+                if (wb == nullptr) {
+                    ok = false;
+                    break;
+                }
+                c.lt_wgp[nw] = (unsigned long long) wb;
+                for (int r = c.lt_hb[q]; r < c.lt_hb[q + 1]; ++r) c.lt_went[wrows++] = r;
+                c.lt_wgs[++nw] = wrows;
+                continue;
+            }
             x3::SetArgs sa;
             sa.wbase = x3_pool(L0, e);
             sa.stride = L0.blob;
@@ -6881,6 +6934,28 @@ struct Model::Impl {
             }
             x3::set_gate_up(sa, c.lt_hx, D, c.lt_ident + sa.row0, c.lt_hh, g.ff, c.lt_st);
             x3::set_down(sa, c.lt_hh, g.ff, c.lt_hy + (size_t) sa.row0 * D, D, c.lt_st);
+        }
+        if (ok && nw > 0) {   // (DS4_LIGHT_WIN) one launch pair for those: an entry a packed row, out at lt_hy's row
+            *c.lt_wng = nw;
+            x3::WinArgs w;
+            w.rows = true;
+            w.grp_ptr = c.lt_wgp;
+            w.grp_start = c.lt_wgs;
+            w.grp_ent = c.lt_went;
+            w.n_groups = c.lt_wng;
+            w.x = c.lt_hx;
+            w.x_stride = D;
+            w.h = c.lt_wh;
+            w.u = c.lt_wu;
+            w.part = c.lt_hy;
+            w.lay = L0.lay;
+            w.T = c.lt_hb[lv.size()];   // (the entries: the packed rows, every one below it)
+            w.k = 1;
+            w.max_groups = nw;
+            w.n_embd = D;
+            w.n_ff = g.ff;
+            w.limit = g.lim;
+            ok = x3::win_experts(w, c.lt_st);
         }
         ok = ok && cudaEventRecord(c.lt_h, c.lt_st) == cudaSuccess && cudaGetLastError() == cudaSuccess &&
              x3::launch_errors() == e0;
