@@ -7259,6 +7259,49 @@ void Glm5Model::pool_check(size_t floor_b, size_t slot_b, size_t all_b) {
         size_t fr = 0, tot = 0;
         cudaMemGetInfo(&fr, &tot);
         for (void* p : got) cudaFree(p);
+#if defined(STRATA_USE_HIP) && !defined(_WIN32)
+        // (#899) Linux HIP: the frees above can land late - the free VRAM read just after them still counted the
+        // whole budget as in use, and the pool fast_setup sized next found 0 slots a layer (2x RX 9070, the head
+        // part).  Wait until the free figure is back (within 256 MiB of the read before the write; a sync and a tiny
+        // write each 5 ms, at most MAYA_GLM_POOL_CHECK_WAIT_MS, default 10000; 0: no wait).  CUDA builds: unchanged.
+        {
+            int wait_ms = 10000;
+            if (const char* v = getenv("MAYA_GLM_POOL_CHECK_WAIT_MS")) wait_ms = std::max(0, std::atoi(v));
+            void* probe = nullptr;
+            if (cudaMalloc(&probe, 256) != cudaSuccess) {
+                cudaGetLastError();
+                probe = nullptr;
+            }
+            int polls = 0;
+            const auto t0 = std::chrono::steady_clock::now();
+            const size_t now = glmfast::await_check_frees(
+                free_b, (size_t) 256 << 20, wait_ms / 5,
+                [&] {
+                    cudaDeviceSynchronize();
+                    size_t f = 0, t = 0;
+                    cudaMemGetInfo(&f, &t);
+                    return f;
+                },
+                [&] {
+                    if (probe != nullptr) cudaMemset(probe, 0, 256);   // (a submission retires the queue's old work)
+                    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                },
+                polls);
+            if (probe != nullptr) cudaFree(probe);
+            if (polls > 0) {
+                const long long ms = (long long) std::chrono::duration_cast<std::chrono::milliseconds>(
+                                         std::chrono::steady_clock::now() - t0).count();
+                if (now + ((size_t) 256 << 20) >= free_b)
+                    std::fprintf(stderr, "glm fast: CUDA%d the expert pool's check: its %.2f GB came back as free "
+                                         "VRAM %lld ms after it was freed\n", dev_, (double) have / 1073741824.0, ms);
+                else
+                    std::fprintf(stderr, "glm fast: CUDA%d WARNING the expert pool's check: %.2f GB of its %.2f GB "
+                                         "still read as in use %lld ms after it was freed (MAYA_GLM_POOL_CHECK=0 skips "
+                                         "the check)\n", dev_, (double) (free_b - now) / 1073741824.0,
+                                 (double) have / 1073741824.0, ms);
+            }
+        }
+#endif
         // MAYA_GLM_POOL_CHECK_TEST_MB=N (a test): the free figure read before the budget ran N MiB high, as Windows'
         if (const char* t = getenv("MAYA_GLM_POOL_CHECK_TEST_MB")) {
             const size_t hi = (size_t) std::max(0LL, std::atoll(t)) << 20;
