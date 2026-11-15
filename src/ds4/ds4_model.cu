@@ -1421,6 +1421,10 @@ struct Model::Impl {
     // input's rows rounded there for its GEMVs (PreQ8::rows); and the FFN's split rounds its input too, for the shared
     // expert's w1 / w3 - checked at load on 1 and kWin rows (hc_fuse_check's T, ffn_q8)
     bool hc_fuse_win = false;
+    // (DS4_HC_FUSE) whether the fused split rounds x to int8 for the GEMVs after it: a GGUF's, whose q8 GEMVs take the
+    // rows (PreQ8).  An EXL3 pack's GEMVs take x as F32, so there the fused launch writes x alone: the split, the norm
+    // and the pre copy in one launch instead of three, the same bits (hc_fuse_check compares them, without the GEMVs)
+    bool hc_q8 = true;
     // DS4_ROUTE_FUSE=1: a decoded token's (T 1) router stage on a group's lead with a next layer to guess
     // (route_fusable) - its gate and the next layer's in one launch (gemv_f32_pair), the routing and the guesses in
     // another (route_pair), publish as before - checked at load (route_fuse_check).  The load refuses it with
@@ -3719,17 +3723,20 @@ struct Model::Impl {
                 return false;
             }
 #endif
-            if (hc_fuse && (!pk.gguf || g.hc != 4 || g.dim % 32 != 0 || g.dim > 8 * 1024 || g.sinkhorn < 1)) {
+            if (hc_fuse && (g.hc != 4 || g.dim % 32 != 0 || g.dim > 8 * 1024 || g.sinkhorn < 1)) {
                 err = std::string("DS4_HC_FUSE=") + v +
-                      ": not this model's shapes (a GGUF, 4 streams, dim a multiple of 32 up to 8192)";
+                      ": not this model's shapes (4 streams, dim a multiple of 32 up to 8192)";
                 return false;
             }
+            hc_q8 = pk.gguf;   // (an EXL3 pack: x alone, its GEMVs take it as F32)
             if (hc_fuse)
-                std::fprintf(stderr, "ds4: a decoded token's HC split and norm in one launch, its attention input "
-                                     "rounded to int8 there, the layer's pre copy by its FFN split (DS4_HC_FUSE)%s\n",
-                             hc_fuse_win ? "; a decode window's rows too, the FFN input rounded for the shared expert "
-                                           "(DS4_HC_FUSE=2)"
-                                         : "");
+                std::fprintf(stderr, "ds4: a decoded token's HC split and norm in one launch%s, the layer's pre "
+                                     "copy by its FFN split (DS4_HC_FUSE)%s\n",
+                             hc_q8 ? ", its attention input rounded to int8 there" : "",
+                             !hc_fuse_win ? ""
+                             : hc_q8      ? "; a decode window's rows too, the FFN input rounded for the shared expert "
+                                            "(DS4_HC_FUSE=2)"
+                                          : "; a decode window's rows too (DS4_HC_FUSE=2)");
         }
         if (const char* v = ds4_env("DS4_HC_MIX_SPLIT")) {   // (MAYA_DS4_HC_MIX_SPLIT)
             if (std::strcmp(v, "1") != 0 && std::strcmp(v, "2") != 0 && std::strcmp(v, "0") != 0) {
@@ -4407,8 +4414,9 @@ struct Model::Impl {
                 return false;
             if ((decode_trim & 8) && g.n_mtp > 0 && !(hmap(d.dhand, dhand_bytes(), err) && hmap(d.dhand_flag, 8, err)))
                 return false;   // (hmap zeroes them: the flag starts below every sequence)
-            if (hc_fuse && !(dalloc(d, d.xq8, (size_t) (hc_fuse_win ? kWin : 1) * D, err) &&   // (=2: a window's rows)
-                             dalloc(d, d.xd8, (size_t) (hc_fuse_win ? kWin : 1) * D / 32, err)))
+            if (hc_fuse && hc_q8 &&   // (=2: a window's rows)
+                !(dalloc(d, d.xq8, (size_t) (hc_fuse_win ? kWin : 1) * D, err) &&
+                  dalloc(d, d.xd8, (size_t) (hc_fuse_win ? kWin : 1) * D / 32, err)))
                 return false;
             if (!g.eg_layers.empty()) {
                 const int cols = (pk.eg_ngram - 1) * pk.eg_heads;
@@ -13313,7 +13321,8 @@ struct Model::Impl {
                 for (int kind = 0; kind < 3 && bad.empty(); ++kind)
                     for (int ffn = 0; ffn < 2 && bad.empty(); ++ffn) {
                         const Layer& l = *lp;
-                        const bool q8 = !ffn || ffn_q8;   // (x's int8 rows: the attention's; the FFN's with ffn_q8)
+                        const bool q8 = hc_q8 && (!ffn || ffn_q8);   // (x's int8 rows: the attention's; the FFN's with
+                                                                     //  ffn_q8; none for an EXL3 pack)
                         float *hh = hin.data(), *hm = hh + (size_t) T * 4 * D, *hl = hm + 32 * T, *hw = hl + 8 * T;
                         for (int t = 0; t < T; ++t)
                             for (int e = 0; e < D; ++e) {
@@ -13459,20 +13468,23 @@ struct Model::Impl {
             cudaEventDestroy(ev);
             if (!bad.empty()) return fail_at(bad);
             std::string kinds;
-            for (int k = 2; k <= 4; ++k) {
+            for (int k = 2; k <= 4 && hc_q8; ++k) {   // (an EXL3 pack: no rounding, its GEMVs take x itself)
                 if (kind_held[k] && !kind_run[k])
                     return fail_at("the attention's " + std::to_string(k) + "-GEMV input not checked");
                 if (kind_run[k]) kinds += (kinds.empty() ? "" : ", ") + std::to_string(k);
             }
             std::string ids;
             for (const Layer* lp : ls) ids += (ids.empty() ? "" : " ") + std::to_string(lp->il);
+            const std::string what = hc_q8 ? "attention inputs of " + kinds + " GEMVs; " : "";
             std::fprintf(stderr,
-                         "ds4: CUDA%d HC fuse check%s: %d runs (layers %s; attention inputs of %s GEMVs; attention and "
-                         "FFN; random / edges / ties): pre, post, comb, the pre copy, x, its int8 rounding and the "
-                         "attention GEMVs%s the old kernels' bit for bit, all finite, every guard intact "
-                         "(DS4_HC_FUSE%s)\n",
-                         d.id, rows.c_str(), runs, ids.c_str(), kinds.c_str(),
-                         ffn_q8 ? ", the FFN's int8 rounding and the shared expert's w1 / w3 GEMVs" : "",
+                         "ds4: CUDA%d HC fuse check%s: %d runs (layers %s; %sattention and FFN; random / edges / "
+                         "ties): pre, post, comb, the pre copy, x%s the old kernels' bit for bit, all finite, every "
+                         "guard intact (DS4_HC_FUSE%s)\n",
+                         d.id, rows.c_str(), runs, ids.c_str(), what.c_str(),
+                         !hc_q8   ? " (x as F32: an EXL3 pack's GEMVs take it so)"
+                         : ffn_q8 ? ", its int8 rounding and the attention GEMVs, the FFN's int8 rounding and the "
+                                    "shared expert's w1 / w3 GEMVs"
+                                  : ", its int8 rounding and the attention GEMVs",
                          ffn_q8 ? "=2" : "");
         }
         return true;
@@ -22280,7 +22292,7 @@ struct Model::Impl {
         else
             hc_mix(d.h, l.hca_fn, H * D, (2 + H) * H, T, g.eps, d.mix, hcs);
         gg::PreQ8 xq8;
-        if (fuse) {
+        if (fuse) {   // (d.xq8 / d.xd8 null without hc_q8: x alone)
             hc_split_pre_norm(
                 hc_args(l, false, d.mix, d.h, d.pre, d.x, d.xq8, d.xd8, d.a_pre, d.a_post, d.a_comb, nullptr), s, T);
             xq8.x = d.x;
@@ -22297,7 +22309,7 @@ struct Model::Impl {
         {
             x3::MvJob j[4];
             const int nj = attn_in_jobs(l, d.x, d.qr, d.kvr, d.ckr, d.cgr, T, j);
-            if (!mv_n(d, j, nj, err, fuse ? &xq8 : nullptr)) return false;
+            if (!mv_n(d, j, nj, err, fuse && hc_q8 ? &xq8 : nullptr)) return false;
         }
         Finish fq;
         fq.w = l.q_norm;
@@ -22379,7 +22391,8 @@ struct Model::Impl {
             hc_mix(d.h, l.hcf_fn, H * D, (2 + H) * H, T, g.eps, d.mix, hcs);
         if (fuse)   // (d.pre's copy of f_pre now: nothing here reads d.pre before the layer's end)
             hc_split_pre_norm(
-                hc_args(l, true, d.mix, d.h, d.a_pre, d.x, hc_fuse_win ? d.xq8 : nullptr, hc_fuse_win ? d.xd8 : nullptr,
+                hc_args(l, true, d.mix, d.h, d.a_pre, d.x, hc_fuse_win && hc_q8 ? d.xq8 : nullptr,
+                        hc_fuse_win && hc_q8 ? d.xd8 : nullptr,
                         d.f_pre, d.f_post, d.f_comb, d.pre),
                 s, T);   // (=2: x rounded for the shared expert's w1 / w3 - xq8 now the FFN's)
         else {
@@ -22388,7 +22401,7 @@ struct Model::Impl {
             if (hs) CK(cudaEventRecord(d.hc_done, d.st2));
             hc_pre_norm(d.h, d.a_pre, l.ffn_norm, D, H, T, g.eps, d.x, s);
         }
-        const gg::PreQ8* ffn_q8 = fuse && hc_fuse_win ? &xq8 : nullptr;   // (the shared expert's w1 / w3 input)
+        const gg::PreQ8* ffn_q8 = fuse && hc_fuse_win && hc_q8 ? &xq8 : nullptr;   // (the shared expert's w1 / w3)
         if (wp.async) {
             // the routing goes to the service thread through the mailbox (a group's lead publishes it, the members
             // make the same plan) while the device runs the shared expert and the VRAM experts (from the plan the
