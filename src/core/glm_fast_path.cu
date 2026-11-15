@@ -3996,6 +3996,19 @@ bool Glm5Model::fast_cpu_lane_setup(std::string& err) {
         for (double* v : {&c_ms, &p_ms, &ps_ms}) *v = std::round(*v * 1e4) / 1e4;
     if (!cal_key.empty()) cal_put(calf, cal_key, cal_vals(c_ms, p_ms, ps_ms, 0.0));
     }
+    // repeatable answers: every plan that splits experts between the CPU lane and PCIe (the decode's lane plan, the
+    // prompts' staged split and prestage) sees the timing in coarse steps - powers of two - so two builds or installs
+    // whose timing of the same CPU and link differs by a few percent (0.1072 vs 0.1112 ms an expert, one build to the
+    // next) plan the same split and give the same answers.  A step's edges lie a factor 1.41 apart from its value; only
+    // a timing within a few percent of an edge can still land either side.  The cache keeps the measured values
+    // (MAYA_GLM_LANE_STEPS=0: the measured values, as before)
+    if (glmfast::repeatable(F->helper.linked()) && glmfast::lane_steps()) {
+        const double c0 = c_ms, p0 = p_ms, s0 = ps_ms;
+        for (double* v : {&c_ms, &p_ms, &ps_ms})
+            if (*v > 0.0) *v = std::exp2(std::round(std::log2(*v)));
+        std::fprintf(stderr, "glm fast: CUDA%d repeatable answers: lane timing in steps %.4f/%.4f/%.4f -> %.4f/%.4f/%.4f "
+                             "ms (MAYA_GLM_LANE_STEPS)\n", dev_, c0, p0, s0, c_ms, p_ms, ps_ms);
+    }
     F->cpu_c_ms = c_ms;   // (the prompt path splits its staged experts by them too)
     F->cpu_p_ms = p_ms;
     F->cpu_ps_ms = ps_ms;
