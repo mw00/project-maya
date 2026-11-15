@@ -441,6 +441,13 @@ void moe_combine_x(long long* acc, const float* y, const int* pos, const float* 
 void moe_x_finish(float* acc, const long long* acc64, size_t n, cudaStream_t s);
 void moe_combine(float* acc, const float* y, const int* pos, const float* w, int T, int k, int r0, int r1, int dim,
                  cudaStream_t s);
+/// (DS4_PROMPT_LIGHT) a chunk's light experts' rows for the helper: hx[p] = x[row_tok[prow[p]]] for p < n (F32 rows
+/// of dim; hx host memory the helper reads)
+void light_gather(float* hx, const float* x, const int* row_tok, const int* prow, int n, int dim, cudaStream_t s);
+/// (DS4_PROMPT_LIGHT) the helper's rows back: acc[t] += w[t][i] * hy[lidx[pos[t][i]]] for each pick of t (in pick order)
+/// whose sorted row is a light expert's (lidx >= 0) - moe_combine's sum, its rows packed by lidx
+void light_add(float* acc, const float* hy, const int* lidx, const int* pos, const float* w, int T, int k, int dim,
+               cudaStream_t s);
 /// rows[t][0] = 1, the rest 0 (the first layer's pre-mix: stream 0).
 void init_pre(float* pre, int T, cudaStream_t s);
 
