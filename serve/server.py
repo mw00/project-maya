@@ -1307,10 +1307,10 @@ class StrataEngine:
         if part:
             self.vram = [part if v.get("dev") == part["dev"] else v for v in self.vram]
 
-    _TAGGED = ("T ", "LP ", "PP ", "DONE ", "ERR ")
+    _TAGGED = ("T ", "LP ", "PP ", "DP ", "DONE ", "ERR ")
 
     def _route(self, line: str) -> bool:
-        """Several conversations at once: a request's own lines (T / LP / PP / DONE / ERR <rid> ...) go to its queue, the
+        """Several conversations at once: a request's own lines (T / LP / PP / DP / DONE / ERR <rid> ...) go to its queue, the
         engine's (STAT, NOTE) are handled here; True when the line was taken."""
         if line.startswith(self._TAGGED):
             f = line.split(None, 2)
@@ -1320,7 +1320,7 @@ class StrataEngine:
                 if q is not None:
                     q.put(line)
                     return True
-                return line.startswith(("T ", "LP ", "PP ", "DONE "))   # a request already gone: dropped
+                return line.startswith(("T ", "LP ", "PP ", "DP ", "DONE "))   # a request already gone: dropped
             return False
         if line.startswith("STAT "):
             self._parse_stat(line)
@@ -1485,6 +1485,47 @@ class StrataEngine:
             self.last.update(drafts_accepted=int(f[6]), drafts_offered=int(f[7]), reused=int(f[8]))
         if len(f) >= 11:                                  # decode hit rate fields
             self.last.update(hits=int(f[9]), lookups=int(f[10]))
+        dp = self.dp                                    # the drafts' split (DP just before this DONE; issue #590)
+        if dp:
+            self.last.update(dp)
+            self.dp = None
+
+    @property
+    def dp(self) -> dict | None:
+        """The DP line's split draft counters, waiting for the DONE that follows it (per request thread in multi)."""
+        if self.multi:
+            return getattr(self._tls, "dp", None)
+        return getattr(self, "_dp", None)
+
+    @dp.setter
+    def dp(self, v):
+        if self.multi:
+            self._tls.dp = v
+        else:
+            self._dp = v
+
+    def _parse_dp(self, line):
+        """DP [rid] kept=N offered=N ds_kept=N ds_offered=N lk_kept=N lk_offered=N rounds=N [pos=1:k/r,...]
+        (maya-ds4: the request's drafts by source - DSpark's and the prompt lookup's, issue #590; the DONE's
+        drafts_accepted/drafts_offered are their sum, as before)."""
+        names = {"kept": "drafts_accepted", "offered": "drafts_offered", "ds_kept": "dspark_accepted",
+                 "ds_offered": "dspark_offered", "lk_kept": "lookup_accepted", "lk_offered": "lookup_offered",
+                 "rounds": "lookup_rounds"}
+        st = {}
+        for kv in line.split()[1:]:
+            k, _, v = kv.partition("=")
+            if k in names:
+                try:
+                    st[names[k]] = int(v)
+                except ValueError:
+                    pass
+            elif k == "pos":
+                try:
+                    st["draft_positions"] = [[int(x) for x in p.split(":")[1].split("/")]
+                                             for p in v.split(",") if ":" in p]
+                except (ValueError, IndexError):
+                    pass
+        self.dp = st
 
     def _asked_end(self) -> int:
         """How many times the server told the engine to cut whatever runs (STOP for all, QUIT, WRAP): a request
@@ -1766,6 +1807,8 @@ class StrataEngine:
                     self._parse_stat(line)
                 elif line.startswith("NOTE "):                # what happens to the kept conversations
                     print("[maya] " + line[5:].strip(), flush=True)
+                elif line.startswith("DP "):                 # the drafts' split, right before this request's DONE
+                    self._parse_dp(line)
                 elif line.startswith("DONE"):
                     self._parse_done(line)
                     done = True
@@ -1819,6 +1862,9 @@ class StrataEngine:
                     if line.startswith("ERR"):
                         self._done_after_err()
                         break
+                    if line.startswith("DP "):
+                        self._parse_dp(line)
+                        continue
                     if line.startswith("DONE"):
                         self._parse_done(line)
                         if said:
@@ -1976,6 +2022,8 @@ class StrataEngine:
                     if cancel.is_set():
                         return
                     yield None
+                elif line.startswith("DP "):
+                    self._parse_dp("DP " + line.split(None, 2)[2])
                 elif line.startswith("DONE "):
                     self._parse_done("DONE " + line.split(None, 2)[2])
                     done = True
@@ -2005,6 +2053,9 @@ class StrataEngine:
                         break
                     if line is None or line.startswith("ERR "):
                         break
+                    if line.startswith("DP "):
+                        self._parse_dp("DP " + line.split(None, 2)[2])
+                        continue
                     if line.startswith("DONE "):
                         self._parse_done("DONE " + line.split(None, 2)[2])
                         break
@@ -4133,6 +4184,15 @@ class Service:
              "Prompts the loop guard left the model's repeats out of (a conversation that repeats itself)",
              guard["collapsed"]),
         ]
+        rows += [(f"maya:{name}", "counter", help_, t[key]) for name, key, help_ in (
+            ("drafts_offered_total", "drafts_offered", "Drafts verified (DSpark and prompt lookup)"),
+            ("drafts_accepted_total", "drafts_accepted", "Drafts kept"),
+            ("dspark_drafts_offered_total", "dspark_offered", "DSpark drafter's drafts verified"),
+            ("dspark_drafts_accepted_total", "dspark_accepted", "DSpark drafter's drafts kept"),
+            ("lookup_drafts_offered_total", "lookup_offered", "Prompt lookup's drafts verified"),
+            ("lookup_drafts_accepted_total", "lookup_accepted", "Prompt lookup's drafts kept"),
+            ("lookup_rounds_total", "lookup_rounds", "Prompt lookup rounds"),
+        ) if t.get(key) is not None]
         rows += [(f"maya:engine_{k}", "counter" if k in self.PROM_STAT_COUNTERS else "gauge", h, stat[k])
                  for k, h in self.PROM_STAT.items()
                  if isinstance(stat.get(k), (int, float)) and not isinstance(stat.get(k), bool)]
@@ -5609,7 +5669,14 @@ class Service:
                         "hit_rate": hit_rate,
                         # the drafts offered and kept (the engine's DONE line; None: it reported none)
                         "drafts_offered": last.get("drafts_offered"), "drafts_accepted": last.get("drafts_accepted"),
+                        "drafts_kept": last.get("drafts_accepted"),   # (issue #590's name for the kept drafts)
                         "spec_off": stat.spec_off,
+                        # the drafts' split, when the engine's DP line reported it (issue #590)
+                        **({dst: last[src] for src, dst in (
+                            ("dspark_accepted", "dspark_kept"), ("dspark_offered", "dspark_offered"),
+                            ("lookup_accepted", "lookup_kept"), ("lookup_offered", "lookup_offered"),
+                            ("lookup_rounds", "lookup_rounds"), ("draft_positions", "draft_positions"))
+                            if src in last}),
                         "loop_guard": guards[0].summary() if guards and guards[0].events else None}
                     self.history.append(row)
                     t = self.totals
@@ -5621,6 +5688,11 @@ class Service:
                     book = (len(ids), last.get("reused") or 0, n)
                     t["prompt_ms"] += last.get("prompt_ms") or 0.0
                     t["decode_ms"] += last.get("decode_ms") or 0.0
+                    # the drafts (their DP split too, when the engine reported it): the stat dashboard reads these
+                    for k in ("drafts_accepted", "drafts_offered", "dspark_accepted", "dspark_offered",
+                              "lookup_accepted", "lookup_offered", "lookup_rounds"):
+                        if last.get(k) is not None:
+                            t[k] = t.get(k, 0) + last[k]
                     fresh = getattr(self.engine, "last", None)
                     if fresh is not None and fresh is not before:      # the engine's clock for THIS request
                         timings = request_timings(len(ids), n, last)
@@ -5655,7 +5727,8 @@ class Service:
                        "timings": timings, "stop_sequence": matched if finish == "stop" else None}
 
 
-CALL_SUMS = ("generated", "decode_ms", "drafts_accepted", "drafts_offered", "hits", "lookups")
+CALL_SUMS = ("generated", "decode_ms", "drafts_accepted", "drafts_offered", "hits", "lookups",
+             "dspark_accepted", "dspark_offered", "lookup_accepted", "lookup_offered", "lookup_rounds")
 
 
 def merge_calls(calls: list[dict]) -> dict:
@@ -5677,6 +5750,7 @@ def merge_calls(calls: list[dict]) -> dict:
         for k in CALL_SUMS:
             if all(k in c for c in calls):
                 merged[k] = sum(c[k] for c in calls)
+        merged.pop("draft_positions", None)   # per-slice arrays do not merge into one request's
     return merged
 
 
