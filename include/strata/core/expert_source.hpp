@@ -534,6 +534,7 @@ private:
 #if defined(_WIN32)
         void* file = nullptr;
         void* mapping = nullptr;
+        void* dfile = nullptr;   ///< the same file opened FILE_FLAG_NO_BUFFERING (nullptr: none) - the misses are read through it
 #else
         int fd = -1;
         int dfd = -1;   ///< the same file opened O_DIRECT (Linux; -1: none) - the misses are read through it

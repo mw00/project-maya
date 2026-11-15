@@ -1498,6 +1498,17 @@ int drive_reads_at_once(int dfd, uint64_t file_bytes, uint64_t piece, std::strin
     return n;
 }
 #endif
+#if defined(_WIN32)
+// Windows' POSIX_FADV_DONTNEED for a read-only file mapping: the pages of [p, p + n) leave this process's working set
+// for the standby list (still cached, but RAM the OS may hand to anyone).  VirtualUnlock on pages that are not
+// locked does exactly that and then fails with ERROR_NOT_LOCKED, which is the expected outcome.
+void release_mapped(const uint8_t* p, uint64_t n) {
+    if (p == nullptr || n == 0) return;
+    const uintptr_t a = (uintptr_t) p & ~uintptr_t{4095};
+    const uintptr_t e = ((uintptr_t) p + (uintptr_t) n + 4095) & ~uintptr_t{4095};
+    (void) VirtualUnlock((LPVOID) a, (SIZE_T) (e - a));
+}
+#endif
 }  // namespace
 
 uint64_t expert_ram_room(uint64_t* avail_out, uint64_t* headroom_out, bool unbuffered) {
@@ -1585,6 +1596,7 @@ void GgufExpertSource::close() {
 #if defined(_WIN32)
         if (m.base != nullptr) UnmapViewOfFile((LPCVOID) m.base);
         if (m.mapping != nullptr) CloseHandle((HANDLE) m.mapping);
+        if (m.dfile != nullptr) CloseHandle((HANDLE) m.dfile);
         if (m.file != nullptr) CloseHandle((HANDLE) m.file);
 #else
         if (m.base != nullptr) munmap((void*) m.base, (size_t) m.bytes);
@@ -1647,6 +1659,31 @@ bool GgufExpertSource::open(const std::string& shard1, int64_t n_layers, int64_t
             m.mapping = h;
             m.base = (const uint8_t*) view;
             m.bytes = (uint64_t) sz.QuadPart;
+            // the misses are read unbuffered, as on Linux (O_DIRECT): through the mapping every miss is a run of 4 KB
+            // page faults whose pages stay in the engine's working set, and a model larger than the RAM grows it
+            // until the machine pages (issue #29: a prefill near 0 B/s at a few MiB of RAM available).
+            // MAYA_EXPERT_DIRECT=0 turns it off; a volume that refuses unbuffered reads keeps the mapping.
+            const char* dv = std::getenv("MAYA_EXPERT_DIRECT");
+            if (dv == nullptr || std::atoi(dv) != 0) {
+                HANDLE d = CreateFileW(wpath.data(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                                       FILE_FLAG_NO_BUFFERING | FILE_FLAG_OVERLAPPED | FILE_FLAG_RANDOM_ACCESS, nullptr);
+                if (d != INVALID_HANDLE_VALUE) {
+                    void* probe = _aligned_malloc(4096, 4096);
+                    HANDLE ev = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+                    bool ok = false;
+                    if (probe != nullptr && ev != nullptr) {
+                        OVERLAPPED ov{};
+                        ov.hEvent = ev;
+                        DWORD got = 0;
+                        if (ReadFile(d, probe, 4096, nullptr, &ov) || GetLastError() == ERROR_IO_PENDING)
+                            ok = GetOverlappedResult(d, &ov, &got, TRUE) && got == 4096;
+                    }
+                    if (ev != nullptr) CloseHandle(ev);
+                    _aligned_free(probe);
+                    if (ok) m.dfile = d;
+                    else CloseHandle(d);
+                }
+            }
 #else
             const int fd = ::open(path.c_str(), O_RDONLY);
             struct stat st{};
@@ -1738,7 +1775,7 @@ bool GgufExpertSource::open(const std::string& shard1, int64_t n_layers, int64_t
 #if !defined(_WIN32)
     for (const Map& m : maps_) if (m.dfd < 0) direct_ = false;
 #else
-    direct_ = false;
+    for (const Map& m : maps_) if (m.dfile == nullptr) direct_ = false;
 #endif
     if (direct_) {   // a sample of experts read both ways must agree, or the mapping stays the way the misses are read
         const auto& lay2 = strata::kernels::cpu::expert_layout();
@@ -1822,6 +1859,55 @@ bool GgufExpertSource::read_part_direct(int64_t layer, int64_t expert, int part,
     while (got < need) {
         const ssize_t r = ::pread(m.dfd, bn.p + got, (size_t) (len - got), (off_t) (a0 + got));
         if (r <= 0) return false;
+        got += (uint64_t) r;
+        if (got < need && (got & 4095) != 0) return false;
+    }
+    std::memcpy(to, bn.p + head, (size_t) bytes[part]);
+    return true;
+#elif defined(_WIN32)
+    const Map& m = maps_[(size_t) map_of_[(size_t) layer]];
+    if (m.dfile == nullptr) return false;
+    const uint8_t* src[3];
+    uint64_t bytes[3], off[3];
+    parts(layer, expert, src, bytes, off);
+    const auto& fm = strata::kernels::cpu::expert_layout().fmt[(size_t) layer];
+    uint8_t* to = part == 0 ? dst : part == 1 ? dst + fm.up_off : dst + fm.down_off;
+    // the read is rounded out to 4 KB (FILE_FLAG_NO_BUFFERING: sector-aligned offset, length and buffer) into this
+    // thread's bounce buffer, then the slice copied out; each thread waits on its own event (the handle is overlapped,
+    // so the stagers' reads run at once)
+    struct Bounce {
+        uint8_t* p = nullptr;
+        size_t cap = 0;
+        HANDLE ev = nullptr;
+        ~Bounce() {
+            _aligned_free(p);
+            if (ev != nullptr) CloseHandle(ev);
+        }
+    };
+    static thread_local Bounce bn;
+    if (bn.ev == nullptr && (bn.ev = CreateEventW(nullptr, TRUE, FALSE, nullptr)) == nullptr) return false;
+    const uint64_t a0 = off[part] & ~uint64_t{4095}, head = off[part] - a0, need = head + bytes[part];
+    const uint64_t len = (need + 4095) & ~uint64_t{4095};
+    if (bn.cap < len) {
+        _aligned_free(bn.p);
+        bn.cap = 0;
+        bn.p = (uint8_t*) _aligned_malloc((size_t) len + (1u << 20), 4096);
+        if (bn.p == nullptr) return false;
+        bn.cap = (size_t) len + (1u << 20);
+    }
+    uint64_t got = 0;
+    while (got < need) {
+        OVERLAPPED ov{};
+        const uint64_t at = a0 + got;
+        ov.Offset = (DWORD) (at & 0xFFFFFFFFull);
+        ov.OffsetHigh = (DWORD) (at >> 32);
+        ov.hEvent = bn.ev;
+        ResetEvent(bn.ev);
+        DWORD r = 0;
+        if (!ReadFile((HANDLE) m.dfile, bn.p + got, (DWORD) (len - got), nullptr, &ov) &&
+            GetLastError() != ERROR_IO_PENDING)
+            return false;
+        if (!GetOverlappedResult((HANDLE) m.dfile, &ov, &r, TRUE) || r == 0) return false;
         got += (uint64_t) r;
         if (got < need && (got & 4095) != 0) return false;
     }
@@ -1947,6 +2033,13 @@ bool GgufExpertSource::make_resident(const std::vector<std::pair<int32_t, int32_
                     parts(l, e, src, bytes, off);
                     const int fd = maps_[(size_t) map_of_[(size_t) l]].fd;
                     for (int r = 0; r < 3; ++r) (void) ::posix_fadvise(fd, (off_t) off[r], (off_t) bytes[r], POSIX_FADV_DONTNEED);
+#else
+                    // the same on Windows: the mapped pages leave the working set (else the whole RAM tier is held
+                    // twice, once pinned and once as file pages, and the machine pages - issue #29)
+                    const uint8_t* src[3];
+                    uint64_t bytes[3], off[3];
+                    parts(l, e, src, bytes, off);
+                    for (int r = 0; r < 3; ++r) release_mapped(src[r], bytes[r]);
 #endif
                 }
             }
@@ -1966,7 +2059,13 @@ bool GgufExpertSource::make_resident(const std::vector<std::pair<int32_t, int32_
         for (int r = 0; r < 3; ++r) (void) ::posix_fadvise(fd, (off_t) off[r], (off_t) bytes[r], POSIX_FADV_DONTNEED);
     }
 #else
-    (void) drop;
+    for (const auto& [l, e] : drop) {
+        if (!valid(l, e)) continue;
+        const uint8_t* src[3];
+        uint64_t bytes[3], off[3];
+        parts(l, e, src, bytes, off);
+        for (int r = 0; r < 3; ++r) release_mapped(src[r], bytes[r]);
+    }
 #endif
     load_seconds_ = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     resident_blobs_ = n;
@@ -2015,6 +2114,7 @@ bool GgufExpertSource::copy_blob(int64_t layer, int64_t expert, uint8_t* dst) {
     const size_t i = (size_t) layer * (size_t) n_expert_ + (size_t) expert;
     const auto& lay = strata::kernels::cpu::expert_layout();
     if (res_off_[i] != kNone) std::memcpy(dst, res_base_ + res_off_[i], (size_t) lay.bytes[(size_t) layer]);
+    else if (direct_) for (int r = 0; r < 3; ++r) assemble_part(layer, expert, r, dst);   // (the prompt path's misses)
     else assemble(layer, expert, dst);
     return true;
 }

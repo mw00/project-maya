@@ -2253,6 +2253,7 @@ Engine options, in the config's `"args"`:
 | Variable | Default | What it does |
 |---|---|---|
 | `MAYA_EXPERT_RAM_GB` | unset (what the RAM allows) | caps the experts' RAM tier, in GB (the dashboard's Models page: Experts in RAM) |
+| `MAYA_EXPERT_DIRECT` | on (Linux: `O_DIRECT`; Windows: `FILE_FLAG_NO_BUFFERING`) | the experts read from the model file when routed are read unbuffered, a slice per read, instead of through the file mapping (whose pages stay in the engine's working set and, with a model larger than the RAM, page the machine); `0`: through the mapping. A volume that refuses unbuffered reads, or a sample expert that reads differently, keeps the mapping |
 | `MAYA_EXPERT_STAGERS` | Linux: the reads at once the model's drive serves fastest (2, 4, 8 or 16, measured in ~1 s at the first start on a drive and kept in `~/.config/project-maya/drive-reads.txt`; `MAYA_EXPERT_DRIVE_PROBE=0` skips the measurement); otherwise a quarter of the CPU threads, 2 to 8 | the threads that read a layer's experts from the file while the CPU prepares the layer (their reads overlap); `0`: read one by one when the CPU needs them |
 
 ## GLM-5.3 (744B)
