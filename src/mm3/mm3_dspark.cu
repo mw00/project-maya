@@ -494,4 +494,26 @@ bool Draft::propose_sampled(int anchor, int pos, int n, const k::SampleArgs& sa,
 }
 size_t Draft::bytes() const { return p->bytes; }
 
+size_t Draft::plan_bytes(const Pack& pk, int max_rows) {
+    // (Impl::load's alloc() calls, in its order - keep the two alike)
+    const size_t D = (size_t) pk.num("hidden_size"), hd = (size_t) pk.num("head_dim");
+    const size_t Q = (size_t) pk.num("num_attention_heads") * hd, KV = (size_t) pk.num("num_key_value_heads") * hd;
+    const size_t V = (size_t) pk.num("vocab_size"), NL = (size_t) pk.num("dspark.num_hidden_layers");
+    const size_t F = (size_t) pk.num("dspark.dspark_ffn_hidden_size"), R = (size_t) pk.num("dspark.dspark_markov_rank");
+    const size_t B = (size_t) pk.num("dspark.dspark_block_size"), NT = pk.ints("dspark.dspark_target_layer_ids").size();
+    const size_t ring = (size_t) pk.num("dspark.dflash.sliding_window", 4096) + 64;
+    const size_t n_rot = (size_t) pk.num("rotary_dim", (double) hd * pk.num("partial_rotary_factor", 1.0));
+    if (NL == 0 || B == 0 || NT == 0 || D == 0) return 0;
+    const size_t Rw = (size_t) std::max(max_rows, 8), M = std::max(D, std::max(Q, F));
+    const auto mx = [](size_t N, size_t K) { return N * K + N * (K / 32); };   // (E4M3 + a scale every 32)
+    size_t b = D * NT * D * 2 + 2 * D * 4 + 2 * V * R * 2 + (D + R) * 4 + 4;   // fc, the norms, Markov, confidence
+    b += NL * (mx(Q, D) + 2 * mx(KV, D) + mx(D, Q) + 2 * mx(F, D) + mx(D, F) + 2 * D * 4 + 2 * hd * 4 +
+               2 * ring * KV * 2);                                              // the layers, their rings
+    b += 16 * 16 * M * 4 + k::attn_part_floats((int) B, (int) (KV / hd), Impl::kSplits) * 4 +
+         k::markov_part_floats() * 4 + n_rot / 2 * 4;
+    b += (2 * Rw * D + B * D + B * Q + 2 * Rw * KV + B * Q + B * D + 2 * B * F + B * D + B * V + V + R + B) * 4;
+    b += (Rw * M + B * D + R) * 2 + (Rw + B + 1 + B) * 4 + D * 4;               // x16 hid16 embb, the ints, maskf
+    return b;
+}
+
 }  // namespace mm3

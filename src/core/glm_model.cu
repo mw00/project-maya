@@ -2079,6 +2079,12 @@ bool Glm5Model::load_pack_place(const std::string& pack_dir, int64_t max_ctx, st
     // its own share of the helper over its own layers (fast_helper_setup): two cards and a Ryzen AI Max APU
     int helper = -1;
     if (const char* h = getenv("MAYA_GLM_EXPERT_HELPER"); h != nullptr && h[0] != '\0') {
+        // =link: the helper is a program of its own (glm_helper_link.hpp), beside one trunk GPU
+        if (strata::core::hlink::wanted()) {
+            if (spec.empty() || spec == "0") return load_pack(pack_dir, max_ctx, err);
+            err = "GLM expert helper link: one trunk GPU only (MAYA_GLM_SPLIT=0)";
+            return false;
+        }
         if (std::strspn(h, "0123456789") != std::strlen(h)) {
             err = "GLM expert helper: give a helper device index";
             return false;

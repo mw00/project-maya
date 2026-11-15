@@ -1758,5 +1758,24 @@ class Drafting(unittest.TestCase):
         self.assertFalse(maya.needs_speed_calibration(c))
 
 
+class FastPrefill(unittest.TestCase):
+    def test_on_off_and_unchanged(self):
+        c = {"args": []}
+        with patch.object(maya, "ok", lambda *a: None):
+            maya.set_fast_prefill(c, None)
+            self.assertNotIn("fast_prefill", c)                 # (not given: unchanged, off by default)
+            maya.set_fast_prefill(c, "on")
+            self.assertIs(c["fast_prefill"], True)
+            maya.set_fast_prefill(c, None)
+            self.assertIs(c["fast_prefill"], True)              # (kept)
+            maya.set_fast_prefill(c, "off")
+            self.assertNotIn("fast_prefill", c)
+
+    def test_the_flag_and_the_setup_keep_it(self):
+        src = Path(maya.__file__).read_text(encoding="utf-8")
+        self.assertIn('ap.add_argument("--fast-prefill", choices=["on", "off"]', src)
+        self.assertEqual(src.count('"mcp_servers", "fast_prefill"'), 1)   # (DeepSeek's setup keeps it; no other)
+
+
 if __name__ == "__main__":
     unittest.main()

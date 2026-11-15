@@ -1841,6 +1841,19 @@ __device__ __forceinline__ void unpack32(const uint8_t* rr, int part, uint4* dst
     dst[2] = make_uint4(o[8], o[9], o[10], o[11]);
     dst[3] = make_uint4(o[12], o[13], o[14], o[15]);
 }
+// unpack32's dst[k] alone (values part * 32 + k * 8 .. + 8) from its 4 code bytes cw = rr[part * 16 + k * 4 ..] and
+// its scale byte sb = rr[256 + part * 2 + k / 2]: the same values, bit for bit
+__device__ __forceinline__ uint4 unpack8(uint32_t cw, uint32_t sb) {
+    const float ks = e4m3_value((uint8_t) sb) * 16384.0f;
+    uint32_t o[4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const uint32_t b = cw >> (8 * i);
+        const float lo = e2m1_val14(b) * ks, hi = e2m1_val14(b >> 4) * ks;
+        o[i] = (__float_as_uint(lo) >> 16) | (__float_as_uint(hi) & 0xffff0000u);
+    }
+    return make_uint4(o[0], o[1], o[2], o[3]);
+}
 
 // a few queries' attention (a decode step, a short window): the rows each query selects decoded once to BF16 rows -
 // out[t * cap + i] = ckv[sel[t][i]] for i < the query's n_sel - for the BF16 kernel reading them in place (once a
@@ -2075,23 +2088,38 @@ __device__ __forceinline__ int attn_wmma_row(int i, int hi) {
     return 2 * i + hi;
 #endif
 }
+// a block's barrier for its shared memory alone (the kernel's global loads are each thread's own: they need not land
+// at it - the next tile's stay in flight under this tile's sums)
+__device__ __forceinline__ void lds_sync() {
+    __builtin_amdgcn_fence(__ATOMIC_RELEASE, "workgroup", "local");
+    __builtin_amdgcn_s_barrier();
+    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "workgroup", "local");
+}
 #endif
 __device__ __forceinline__ uint16_t f2bf_rn(float x) {   // (round to nearest even; no NaN in these values)
     uint32_t u = __float_as_uint(x);
     u += 0x7fffu + ((u >> 16) & 1u);
     return (uint16_t) (u >> 16);
 }
-__global__ void __launch_bounds__(kThreads) sparse_attn_wmma_kernel(const float* __restrict__ q,
-                                                                    const uint16_t* __restrict__ win,
-                                                                    const uint8_t* __restrict__ ckv,
-                                                                    const int* __restrict__ sel, int sel_stride,
-                                                                    AttnRows ar, const float* __restrict__ sink,
-                                                                    int heads, float scale, float* __restrict__ out) {
+// G > 1 (a prompt chunk on gfx11): G of those groups of 16 heads a block (kThreads a group), each tile of rows
+// staged once for all G (a thread a quarter or half of a row part's 32 values, its bytes loaded a tile ahead) - every
+// group's arithmetic the G = 1 kernel's, operation for operation, on the same tile (the same bits).  PAD (gfx11): the
+// tile's rows PAD values apart beyond 512 and the probabilities' rows 4 apart beyond 16, so the dots' 16-byte reads
+// and the weighted sums' reads of 16 heads' probabilities fall on distinct banks (the same values: the same bits)
+template <int G, int PAD = 0>
+__global__ void __launch_bounds__(kThreads * G) sparse_attn_wmma_kernel(const float* __restrict__ q,
+                                                                        const uint16_t* __restrict__ win,
+                                                                        const uint8_t* __restrict__ ckv,
+                                                                        const int* __restrict__ sel, int sel_stride,
+                                                                        AttnRows ar, const float* __restrict__ sink,
+                                                                        int heads, float scale, float* __restrict__ out) {
     pdl_wait();
     pdl_trigger();
 #if defined(DS4_ATTN_WMMA)
-    constexpr int d = 512, R = 16;
-    const int hb = blockIdx.x * R, t = blockIdx.y;
+    static_assert(G == 1 || G == 2 || G == 4, "a row part's 4 x 8 values split over the G groups");
+    constexpr int d = 512, R = 16, DS = d + PAD, PS = PAD ? R + 4 : R;   // (DS, PS: the row strides)
+    const int g = G == 1 ? 0 : (int) (threadIdx.x / kThreads), lt = G == 1 ? (int) threadIdx.x : (int) (threadIdx.x % kThreads);
+    const int hb = (blockIdx.x * G + g) * R, t = blockIdx.y;
     int n_win, n_sel, w0;
     if (ar.gen) {
         const long long ta = ar.t0 + t, pa = ar.p0 + ta;
@@ -2105,12 +2133,15 @@ __global__ void __launch_bounds__(kThreads) sparse_attn_wmma_kernel(const float*
     const uint16_t* wbase = win + (size_t) w0 * d;
     const int* sl = sel + (size_t) t * sel_stride;
     const size_t crow = kv_row_bytes(kKvFp4, d);
-    __shared__ __align__(16) uint16_t tile[R * d];
-    __shared__ float sp[kThreads / 32][R * R];
-    __shared__ float pr[R * R];
+    __shared__ __align__(16) uint16_t tile[R * DS];
+    __shared__ float sp_[G][kThreads / 32][R * R];
+    __shared__ float pr_[G][R * PS];
     __shared__ const uint8_t* rows[R];
-    __shared__ float m_run[R], den[R], tsc[R];
-    const int lane = threadIdx.x & 31, wp = threadIdx.x >> 5, m16 = lane & 15, hi = lane >> 4;
+    __shared__ float m_run_[G][R], den_[G][R], tsc_[G][R];
+    float(*sp)[R * R] = sp_[g];
+    float* pr = pr_[g];
+    float *m_run = m_run_[g], *den = den_[g], *tsc = tsc_[g];
+    const int lane = lt & 31, wp = lt >> 5, m16 = lane & 15, hi = lane >> 4;
     ds4_s16 qa[4], qb[4];   // A of the dots: head hb + m16, dimensions wp * 64 + kk * 16 .. + 15
     {
         const float* qh = q + ((size_t) t * heads + hb + m16) * d + wp * 64;
@@ -2124,24 +2155,58 @@ __global__ void __launch_bounds__(kThreads) sparse_attn_wmma_kernel(const float*
                 qb[kk][e] = (short) f2bf_rn(v - bf16f(h));
             }
     }
-    if (threadIdx.x < R) {
-        m_run[threadIdx.x] = -1e30f;
-        den[threadIdx.x] = 0.0f;
+    if (lt < R) {
+        m_run[lt] = -1e30f;
+        den[lt] = 0.0f;
     }
     ds4_f8 acc[4];
 #pragma unroll
     for (int nt = 0; nt < 4; ++nt) acc[nt] = ds4_f8{};
-    const int sr = threadIdx.x >> 4, part = threadIdx.x & 15;   // the staging: a thread's row and 32 values
+    const int sr = lt >> 4, part = lt & 15;   // the staging: a thread's row and 32 values (G > 1: 32 / G of them)
     const int total = n_win + n_sel;
+    // G > 1: a thread's uint4s k = g * KQ .. + KQ of its row part, their bytes loaded a tile ahead (a window row's
+    // values, or a packed row's code bytes in .x and scale byte in .y; nk: 0 past the rows - zeros -, 1 window, 2 packed)
+    constexpr int KQ = 4 / G;
+    uint4 nx[KQ];
+    int nk = 0;
+    auto fetch = [&](int f0) {
+        const int j = f0 + sr;
+        nk = j >= total ? 0 : j < n_win ? 1 : 2;
+        if (nk == 1) {
+            const uint4* src = (const uint4*) ((const uint8_t*) (wbase + (size_t) j * d) + part * 64);
+#pragma unroll
+            for (int kq = 0; kq < KQ; ++kq) nx[kq] = src[g * KQ + kq];
+        } else if (nk == 2) {
+            const uint8_t* rr = ckv + (size_t) sl[j - n_win] * crow;
+#pragma unroll
+            for (int kq = 0; kq < KQ; ++kq) {
+                const int k = g * KQ + kq;
+                nx[kq].x = *(const uint32_t*) (rr + part * 16 + k * 4);
+                nx[kq].y = rr[256 + part * 2 + (k >> 1)];
+            }
+        }
+    };
+    auto sync = [] {   // (G > 1: shared memory's barrier alone - the next tile's loads stay in flight)
+        if constexpr (G > 1) lds_sync();
+        else __syncthreads();
+    };
+    if constexpr (G > 1) fetch(0);
     for (int t0 = 0; t0 < total; t0 += R) {
         const int n = min(R, total - t0);
-        if (threadIdx.x < n) {
-            const int j = t0 + threadIdx.x;
-            rows[threadIdx.x] = j < n_win ? (const uint8_t*) (wbase + (size_t) j * d) : ckv + (size_t) sl[j - n_win] * crow;
-        }
-        __syncthreads();
-        {
-            uint4* dst = (uint4*) (tile + sr * d + part * 32);
+        if constexpr (G > 1) {   // this tile from the registers (its readers before: done at the loop's last barrier)
+            uint4* dst = (uint4*) (tile + sr * DS + part * 32);
+#pragma unroll
+            for (int kq = 0; kq < KQ; ++kq)
+                dst[g * KQ + kq] = nk == 0 ? make_uint4(0u, 0u, 0u, 0u) : nk == 1 ? nx[kq] : unpack8(nx[kq].x, nx[kq].y);
+            sync();
+            if (t0 + R < total) fetch(t0 + R);   // (the next tile's loads in flight under this one's sums)
+        } else {
+            if (threadIdx.x < n) {
+                const int j = t0 + threadIdx.x;
+                rows[threadIdx.x] = j < n_win ? (const uint8_t*) (wbase + (size_t) j * d) : ckv + (size_t) sl[j - n_win] * crow;
+            }
+            __syncthreads();
+            uint4* dst = (uint4*) (tile + sr * DS + part * 32);
             if (sr >= n) {
                 dst[0] = dst[1] = dst[2] = dst[3] = make_uint4(0u, 0u, 0u, 0u);
             } else if (t0 + sr < n_win) {
@@ -2153,12 +2218,12 @@ __global__ void __launch_bounds__(kThreads) sparse_attn_wmma_kernel(const float*
             } else {
                 unpack32(rows[sr], part, dst);
             }
+            __syncthreads();
         }
-        __syncthreads();
         ds4_f8 s = {};
 #pragma unroll
         for (int kk = 0; kk < 4; ++kk) {   // B: row m16, dimensions wp * 64 + kk * 16 .. + 15
-            const uint4* kr = (const uint4*) (tile + m16 * d + wp * 64 + kk * 16);
+            const uint4* kr = (const uint4*) (tile + m16 * DS + wp * 64 + kk * 16);
             const uint4 x0 = kr[0], x1 = kr[1];
             const uint32_t w[8] = {x0.x, x0.y, x0.z, x0.w, x1.x, x1.y, x1.z, x1.w};
             ds4_s16 kb;
@@ -2172,9 +2237,9 @@ __global__ void __launch_bounds__(kThreads) sparse_attn_wmma_kernel(const float*
         }
 #pragma unroll
         for (int i = 0; i < 8; ++i) sp[wp][attn_wmma_row(i, hi) * R + m16] = s[i];
-        __syncthreads();
+        sync();
         {   // thread (head e / 16, row e % 16): the tile's score, the head's running max and denominator
-            const int e = threadIdx.x, h = e >> 4, r = e & 15;
+            const int e = lt, h = e >> 4, r = e & 15;
             float v = 0.0f;
 #pragma unroll
             for (int w = 0; w < kThreads / 32; ++w) v += sp[w][e];
@@ -2187,7 +2252,7 @@ __global__ void __launch_bounds__(kThreads) sparse_attn_wmma_kernel(const float*
             float sum = p;
 #pragma unroll
             for (int k = 8; k >= 1; k >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, k);
-            pr[e] = p;
+            pr[h * PS + r] = p;
             if (r == 0) {   // (the head's 16 lanes read m_run above, in this same instruction stream)
                 const float ts = expf(m_old - m_new);
                 tsc[h] = ts;
@@ -2195,11 +2260,11 @@ __global__ void __launch_bounds__(kThreads) sparse_attn_wmma_kernel(const float*
                 m_run[h] = m_new;
             }
         }
-        __syncthreads();
+        sync();
         ds4_s16 pa, pb;   // A of the weighted sums: head m16's probabilities of the tile's rows
 #pragma unroll
         for (int r = 0; r < R; ++r) {
-            const float p = pr[m16 * R + r];
+            const float p = pr[m16 * PS + r];
             const uint16_t h = f2bf_rn(p);
             pa[r] = (short) h;
             pb[r] = (short) f2bf_rn(p - bf16f(h));
@@ -2211,11 +2276,11 @@ __global__ void __launch_bounds__(kThreads) sparse_attn_wmma_kernel(const float*
             const uint16_t* vc = tile + wp * 64 + nt * 16 + m16;
             ds4_s16 vb;
 #pragma unroll
-            for (int r = 0; r < R; ++r) vb[r] = (short) vc[r * d];
+            for (int r = 0; r < R; ++r) vb[r] = (short) vc[r * DS];
             acc[nt] = attn_wmma(pa, vb, acc[nt]);
             acc[nt] = attn_wmma(pb, vb, acc[nt]);
         }
-        __syncthreads();
+        sync();
     }
 #pragma unroll
     for (int nt = 0; nt < 4; ++nt)
@@ -4525,6 +4590,34 @@ static bool attn_wmma_now() {
     return false;
 #endif
 }
+// sparse_attn_wmma_kernel's form: 0 the plain one (16 heads a block), 1 its padded rows, 4 the padded rows with 4 groups
+// of 16 heads a block (one staged tile for all 64).  gfx11: 4 from kAttnShareT queries (64 heads), else 1 (Radeon 8065S,
+// Maya-XS at 32K: the kernel's time -41 % with 4, -35 % with 1; the same bits); gfx12: 0 (not measured).
+// DS4_ATTN_SHARE=0|1|4 forces one (the device's arch cached a device)
+constexpr int kAttnShareT = 64;   // (fewer queries: a quarter of the blocks would leave the GPU idle)
+static int attn_wmma_mode(int heads, int T) {
+#if defined(STRATA_USE_HIP)
+    static const int forced = std::getenv("DS4_ATTN_SHARE") != nullptr ? std::atoi(std::getenv("DS4_ATTN_SHARE")) : -1;
+    static std::atomic<int> known[64];   // 0: not asked yet, 1: not gfx11, 2: gfx11
+    int mode = 0, dev = 0;
+    if (forced >= 0) {
+        mode = forced >= 2 ? 4 : forced;
+    } else {
+        if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) return 0;
+        int v = known[dev].load(std::memory_order_relaxed);
+        if (v == 0) {
+            cudaDeviceProp p{};
+            v = cudaGetDeviceProperties(&p, dev) == cudaSuccess && std::strncmp(p.gcnArchName, "gfx11", 5) == 0 ? 2 : 1;
+            known[dev].store(v, std::memory_order_relaxed);
+        }
+        mode = v == 2 ? (T >= kAttnShareT ? 4 : 1) : 0;
+    }
+    return mode == 4 && heads % 64 != 0 ? 1 : mode;
+#else
+    (void) heads, (void) T;
+    return 0;
+#endif
+}
 
 
 // sparse_attn_mma_kernel's device: an Ampere or newer GPU (sm_80+), unless DS4_ATTN_MMA=0 (cached a device; the
@@ -4571,8 +4664,14 @@ void sparse_attn(const float* q, const uint16_t* win, const void* ckv, const int
     if (heads_per_block == kAttnWmma) {   // (a prompt chunk: the matrix cores where there are, else as 0)
         static_assert(kThreads == 256, "the WMMA kernel's softmax: a thread a (head, row) of 16 x 16");
         if (attn_wmma_now() && heads % 16 == 0) {
-            pdl_launch(sparse_attn_wmma_kernel, dim3(heads / 16, T), kThreads, 0, s, q, win, (const uint8_t*) ckv, sel,
-                       sel_stride, a, sink, heads, scale, out);
+            const int mode = attn_wmma_mode(heads, T);
+            auto go = [&](auto kern, int g) {
+                pdl_launch(kern, dim3(heads / (16 * g), T), kThreads * g, 0, s, q, win, (const uint8_t*) ckv, sel, sel_stride, a,
+                           sink, heads, scale, out);
+            };
+            if (mode == 4) go(sparse_attn_wmma_kernel<4, 8>, 4);
+            else if (mode == 1) go(sparse_attn_wmma_kernel<1, 8>, 1);
+            else go(sparse_attn_wmma_kernel<1, 0>, 1);
             return;
         }
 #if !defined(STRATA_USE_HIP)

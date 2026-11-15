@@ -110,11 +110,19 @@ void DraftPolicy::observe(bool lookup, int t, int accepted, int match, double ro
         const int b = bucket(match);
         ok_[b] = kDecay * ok_[b] + accepted;
         bad_[b] = kDecay * bad_[b] + (accepted < t - 1 ? 1.0 : 0.0);
+        win_[b] = kDecay * win_[b] + 1.0;
     } else {
         const double got = accepted + 1.0;
         mtp_tok_[t] = mtp_n_[t] > 0 ? (1.0 - kTokAlpha) * mtp_tok_[t] + kTokAlpha * got : got;
         mtp_n_[t] += 1.0;
     }
+}
+
+bool DraftPolicy::trust(int t_mtp, int lookup_k, int match) const {
+    if (lookup_k < 2 || match < kTrustMatch) return false;
+    const int b = bucket(match);
+    if (win_[b] < kTrustN || lookup_rate(match) < kTrustQ) return false;   // (measured, not the prior)
+    return choose(t_mtp, lookup_k, match).lookup;
 }
 
 // ---- the cost-aware window

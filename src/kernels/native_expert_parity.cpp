@@ -56,21 +56,24 @@ int main(int argc, char** argv) {
         H = (int64_t) t[0]->shape[0], FF = (int64_t) t[0]->shape[1];   // glm-dsa B13.1: the file's geometry
         cpu::NativeFmt f;
         std::string err;
-        if (!cpu::native_fmt((int) t[0]->type, (int) t[2]->type, H, FF, f, err)) {
+        // (a mixed layer - gate and up of two types, Qwen3.8 UD-IQ1_S blk.18 - takes each role's own type)
+        if (!cpu::native_fmt_mixed((int) t[0]->type, (int) t[1]->type, (int) t[2]->type, H, FF, f, err)) {
             std::printf("layer %d: %s\n", l, err.c_str()); ++failures; continue;
         }
         std::vector<uint8_t> blob(f.bytes);
         std::memcpy(blob.data(), gguf.tensor_data(*t[0]) + (size_t) E * f.up_off, f.up_off);
-        std::memcpy(blob.data() + f.up_off, gguf.tensor_data(*t[1]) + (size_t) E * f.up_off, f.up_off);
+        const size_t ub = f.down_off - f.up_off;   // the up rows' bytes (f.up_off unless mixed)
+        std::memcpy(blob.data() + f.up_off, gguf.tensor_data(*t[1]) + (size_t) E * ub, ub);
         std::memcpy(blob.data() + f.down_off, gguf.tensor_data(*t[2]) + (size_t) E * (f.bytes - f.down_off),
                     f.bytes - f.down_off);
         // (a) the float reference
         const auto* tg = ggml_get_type_traits((ggml_type) f.gu_type);
+        const auto* tu = ggml_get_type_traits((ggml_type) f.u_type);
         const auto* td = ggml_get_type_traits((ggml_type) f.d_type);
         std::vector<float> G((size_t) FF * H), U((size_t) FF * H), D((size_t) H * FF);
         for (int64_t r = 0; r < FF; ++r) {
             tg->to_float(blob.data() + r * f.gu_row, G.data() + r * H, H);
-            tg->to_float(blob.data() + f.up_off + r * f.gu_row, U.data() + r * H, H);
+            tu->to_float(blob.data() + f.up_off + r * f.u_row, U.data() + r * H, H);
         }
         for (int64_t r = 0; r < H; ++r) td->to_float(blob.data() + f.down_off + r * f.d_row, D.data() + r * FF, FF);
         std::mt19937 rng(11 + l);
@@ -106,7 +109,24 @@ int main(int argc, char** argv) {
                 ffp[k] = ff[k].data();
             }
             cpu::native_gu_rows(f, blob.data(), a, NT, ffp, 0, (int) FF);
-            if (cpu::iq512_supported(f.gu_type)) {
+            if (f.mixed()) {
+                // (b1) the mixed rows against ggml-cpu's vec_dot per type on the same activations: bit for bit
+                const auto* cg = ggml_get_type_traits_cpu((ggml_type) f.gu_type);
+                const auto* cu = ggml_get_type_traits_cpu((ggml_type) f.u_type);
+                size_t diff = 0;
+                for (int k = 0; k < NT; ++k)
+                    for (int64_t r = 0; r < FF; ++r) {
+                        float g = 0.f, u = 0.f;
+                        cg->vec_dot((int) H, &g, 0, blob.data() + r * f.gu_row, 0, a[k], 0, 1);
+                        cu->vec_dot((int) H, &u, 0, blob.data() + f.up_off + r * f.u_row, 0, a[k], 0, 1);
+                        diff += ff[k][r] != (g / (1.f + std::exp(-g))) * u;
+                    }
+                std::printf("          mixed %s/%s gate/up rows vs ggml vec_dot: %zu of %lld values differ\n",
+                            ggml_type_name((ggml_type) f.gu_type), ggml_type_name((ggml_type) f.u_type), diff,
+                            (long long) (NT * FF));
+                if (diff) ++failures;
+            }
+            if (cpu::iq512_supported(f.gu_type) && !f.mixed()) {
                 // ggml's own vec_dot, same Q8_K activations: the reference for both multi-token kernels
                 // (float-order differences only)
                 const auto* tc = ggml_get_type_traits_cpu((ggml_type) f.gu_type);
@@ -219,7 +239,7 @@ int main(int argc, char** argv) {
         }
         // (c) the GPU: one group holding the NT entries
         {
-            const auto L = strata::kernels::native_expert_layout(f.gu_type, f.d_type, H, FF);
+            const auto L = strata::kernels::native_expert_layout(f.gu_type, f.u_type, f.d_type, H, FF);
             void *dblob, *dx, *dxq, *dscr;
             float* dout;
             unsigned long long* dptr;
@@ -250,13 +270,38 @@ int main(int argc, char** argv) {
             cudaStreamSynchronize(s);
             if (ran) cudaMemcpy(got_g.data(), dout, got_g.size() * 4, cudaMemcpyDeviceToHost);
             else got_g.assign(got_g.size(), NAN);
+            if (f.mixed() && f.n_embd % 256 == 0) {
+                // (c2) the prompt path's FP16 dequant of a mixed layer (rows interleaved gate, up, gate, ...)
+                // against ggml's to_float of each type
+                uint16_t* d16 = nullptr;
+                cudaMalloc((void**) &d16, (size_t) 2 * FF * H * 2);
+                strata::kernels::iq_dequant_gu_f16_mixed(f.gu_type, f.u_type, dblob, (const uint8_t*) dblob + f.up_off,
+                                                         FF, H, d16, s);
+                cudaStreamSynchronize(s);
+                std::vector<uint16_t> h16((size_t) 2 * FF * H);
+                cudaMemcpy(h16.data(), d16, h16.size() * 2, cudaMemcpyDeviceToHost);
+                cudaFree(d16);
+                std::vector<float> got16(h16.size()), want16(h16.size());
+                for (int64_t r = 0; r < FF; ++r)
+                    for (int64_t i = 0; i < H; ++i) {
+                        want16[(size_t) (2 * r) * H + i] = G[(size_t) r * H + i];
+                        want16[(size_t) (2 * r + 1) * H + i] = U[(size_t) r * H + i];
+                    }
+                for (size_t i = 0; i < h16.size(); ++i) got16[i] = ggml_fp16_to_fp32((ggml_fp16_t) h16[i]);
+                const double rd = rel(got16, want16);
+                std::printf("          mixed FP16 dequant vs ggml to_float: rel %.2e\n", rd);
+                if (!(rd < 1e-3)) ++failures;
+            }
             cudaFree(dblob); cudaFree(dx); cudaFree(dxq); cudaFree(dscr); cudaFree(dout); cudaFree(dptr);
             cudaFree(dstart); cudaFree(dn); cudaFree(ddst); cudaFree(dtok);
         }
         const double ec = rel(got_c, ref), eg = rel(got_g, ref), ecg = rel(got_c, got_g);
         const bool ok = ec < 3e-2 && eg < 3e-2 && std::isfinite(ec) && std::isfinite(eg);
+        const std::string gu_name = f.mixed() ? std::string(ggml_type_name((ggml_type) f.gu_type)) + ":" +
+                                                    ggml_type_name((ggml_type) f.u_type)
+                                              : std::string(ggml_type_name((ggml_type) f.gu_type));
         std::printf("layer %2d  %-8s/%-7s blob %8zu  cpu rel %.2e  gpu rel %.2e  cpu-gpu %.2e  %s\n", l,
-                    ggml_type_name((ggml_type) f.gu_type), ggml_type_name((ggml_type) f.d_type), f.bytes, ec, eg, ecg,
+                    gu_name.c_str(), ggml_type_name((ggml_type) f.d_type), f.bytes, ec, eg, ecg,
                     ok ? "ok" : "FAIL");
         if (!ok) ++failures;
     }

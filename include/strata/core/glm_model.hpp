@@ -693,6 +693,9 @@ public:
     // a batched verify window's layer on both window lanes, each distinct expert read once (glm_fast_path.cu)
     void win_cpu_merged(int il, int nb, const strata::kernels::glmf::MoeRequest* const* rq,
                         strata::kernels::glmf::CpuAnswer* const* ans, const unsigned int* seq);
+    // ... the same window on a linked helper (MAYA_GLM_LINK_WIN): one call for its helper experts (glm_fast_path.cu)
+    void win_helper_merged(int il, int nb, const strata::kernels::glmf::MoeRequest* const* rq,
+                           strata::kernels::glmf::CpuAnswer* const* ans, const unsigned int* seq);
     // ---- the NextN (MTP) draft block (the last half carries it; layer index n_layers)
     int mtp_il_ = -1;                                      // its layer index here, -1: not on this half
     int mtp_src_ = -1;                                     // the shard of MAYA_GLM_MTP_GGUF's block, -1: the model's

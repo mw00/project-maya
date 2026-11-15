@@ -93,7 +93,8 @@ int main() {
         require(x == y, "dynamic table or captured plan differs");
         require(count == expected && expected == (uint64_t) step + 1, "replayed request count differs");
     }
-    require(graphs.replays > 0 && graphs.invalidations > 0 && graphs.captures < STEPS, "capture cache not exercised");
+    // (a graph per layer and key is kept: a changed plan captures another graph and invalidates none)
+    require(graphs.replays > 0 && graphs.invalidations == 0 && graphs.captures < STEPS, "capture cache not exercised");
     const uint64_t before = expected;
     bool replayed = false;
     err.clear();

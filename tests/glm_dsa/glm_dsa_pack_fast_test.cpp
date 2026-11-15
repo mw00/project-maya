@@ -147,6 +147,11 @@ void warm_order_check(const fs::path& pack, const strata::core::Glm5Geometry& g,
     }
     setenv("MAYA_GLM_USAGE", usage.string().c_str(), 1);
     setenv("MAYA_GLM_WARM_SUM", "1", 1);   // each part's digest at the end of its warm-up (glmwarm::warm_digest)
+    // the RAM tier holds experts only where the pool cannot: the capped pool (a complete one holds every expert of
+    // this small pack on any GPU), and on the first GPU fewer slots than experts (a unified-memory host's capped pool
+    // holds them all too)
+    setenv("MAYA_GLM_COMPLETE_POOL", "0", 1);
+    setenv("MAYA_GLM_EXPERT_CACHE", std::to_string(((int) g.n_layers - 2) * ((int) g.n_expert - 4)).c_str(), 1);
     const auto load = [&](const char* seq, bool three, gw::Digest& d, gw::Stats& st, std::string& err) {
         setenv("MAYA_GLM_WARM_SEQ", seq, 1);
         gw::stats_reset();
@@ -212,6 +217,8 @@ void warm_order_check(const fs::path& pack, const strata::core::Glm5Geometry& g,
     unsetenv("MAYA_GLM_WARM_SEQ");
     unsetenv("MAYA_GLM_WARM_SUM");
     unsetenv("MAYA_GLM_USAGE");
+    unsetenv("MAYA_GLM_COMPLETE_POOL");
+    unsetenv("MAYA_GLM_EXPERT_CACHE");
     std::error_code ec;
     fs::remove(usage, ec);
 }

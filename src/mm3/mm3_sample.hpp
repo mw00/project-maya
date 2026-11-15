@@ -26,6 +26,8 @@ struct Req {
     int think_end = -1;
     int spec = -1;          // spec=0|1: this request drafts or not (-1: as the engine was started)
     float conf = -1.0f;     // dspark_conf=F: the drafts' confidence floor for this request (-1: the engine's)
+    int lookup = -1;        // suffix_draft=0|1: this request's prompt lookup off / on (-1: as the engine was started)
+    int trust = -1;         // lookup_trust=0|1: its trusted rounds without a draft off / on (-1: MAYA_MM3_LOOKUP_TRUST)
     std::string file;       // GENI: the pictures
     std::vector<int> ids;
     int rid = -1;           // rid=N: the request's id (--parallel: every line it causes carries it)

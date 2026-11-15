@@ -101,7 +101,7 @@ bool lane_first(const Glm5Geometry& g, int rows, double upload_ms, double lane_e
 
 /// Per-layer scratch of a chunk of T tokens (the union's glm-dsa share) and what is kept across layers (64-bit).
 size_t scratch_bytes(const Glm5Geometry& g, size_t T, int64_t max_ctx);
-size_t keep_bytes(const Glm5Geometry& g, size_t T, int64_t max_ctx);
+size_t keep_bytes(const Glm5Geometry& g, size_t T, int64_t max_ctx, bool halves = true);
 
 /// The plain residual read half for the chunk: R += block_out (null: none), x = RMS(R) * norm_w, x16.
 bool res_read(const Io& io, const float* block_out, const float* norm_w, std::string& err);

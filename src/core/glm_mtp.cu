@@ -89,6 +89,9 @@ bool Glm5Model::mtp_decode_wanted(int dev, int n_parts, bool dsa) {
     if (const char* q = getenv("MAYA_GLM_SEQS"); q != nullptr && std::atoi(q) > 1) return false;   // (--parallel)
     if (const char* d = getenv("MAYA_GLM_DFLASH"); d != nullptr && d[0] != '\0') return false;
     if (const char* e = getenv("MAYA_GLM_MTP_DECODE")) return std::atoi(e) != 0 && n_parts == 1;
+    // MAYA_GLM_EXPERT_HELPER=link: the lead (a discrete card) drafts with the MTP block, the glm-dsa models too - with
+    // the helper's experts read in place its decode is faster with MTP (GLM-5.3-Flash +15..18 %, GLM-5.3 744B as well)
+    if (hlink::wanted()) return n_parts == 1;
     if (n_parts != 1 || dsa) return false;
 #if defined(STRATA_USE_HIP)
     // the Strix / Gorgon Halo APUs (gfx1150 / gfx1151 / gfx1152): their memory holds every expert
@@ -512,6 +515,12 @@ int Glm5Model::mtp_choose(int n_cap) {
         return e != nullptr ? std::max(0, std::atoi(e)) : 2;
     }();
     if (forced_n >= 0) return std::min(forced_n, n_cap);
+    // repeatable answers (glmfast::repeatable: a linked helper): the search below picks by measured round times, so
+    // two runs can verify different windows and part - the start length instead, unless MAYA_GLM_MTP_ADAPT=1 (the
+    // setup's speed check runs the search once and keeps its pick as MAYA_GLM_MTP_FIXED, serve/glm_link.py)
+    static const bool adapt_set = getenv("MAYA_GLM_MTP_ADAPT") != nullptr;
+    if (!adapt_set && fast_ != nullptr && glmfast::repeatable(fast_->helper.linked()))
+        return std::min(start_n, n_cap);
     if (n_cap <= 0) return 0;
     if (fixed) return n_cap;
     ++mtp_round_no_;

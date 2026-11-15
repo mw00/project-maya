@@ -311,7 +311,8 @@ class MiniMaxFiles(unittest.TestCase):
         m["files"] = {n: 1000 + i for i, n in enumerate(m["files"])}
         quiet = [patch.object(maya, k, lambda *a, **kw: None) for k in ("ok", "warn", "step")]
         with tempfile.TemporaryDirectory() as d, patch.object(maya, "mm3_gguf_entry", return_value=m), \
-                patch.object(maya, "rotational", return_value=False):
+                patch.object(maya, "rotational", return_value=False), \
+                patch.object(maya, "sha256_checked", return_value=True):   # (empty stand-ins: the names only, #672)
             for p in quiet:
                 p.start()
             try:

@@ -20,6 +20,13 @@ namespace strata::kernels::glmb {
 __device__ __forceinline__ const uint8_t* lat8_rec(const uint16_t* lat, int kv, int cell) {
     return (const uint8_t*) lat + (size_t) (kv + kv / 16) * cell;
 }
+#if defined(STRATA_USE_HIP) && !defined(__gfx942__) && !defined(__gfx950__)
+#define STRATA_LAT8_UNSIGNED_ZEROS 1
+// two FP16 values, a zero without its sign
+__device__ __forceinline__ unsigned lat8_unsigned_zeros(unsigned x) {
+    return x & (0x7FFF7FFFu | (((x & 0x7FFF7FFFu) + 0x7FFF7FFFu) & 0x80008000u));
+}
+#endif
 // four codes (a word, the first in its low byte) times d
 __device__ __forceinline__ uint2 lat8_q4(uint32_t w, __half2 d) {
     const uint32_t u = w ^ 0x80808080u;                                  // q + 128 a byte
@@ -27,14 +34,14 @@ __device__ __forceinline__ uint2 lat8_q4(uint32_t w, __half2 d) {
     const __half2 bias = __halves2half2(__ushort_as_half(0x6480), __ushort_as_half(0x6480));   // 1152
     const __half2 a = __hmul2(__hsub2(*(const __half2*) &lo, bias), d);
     const __half2 b = __hmul2(__hsub2(*(const __half2*) &hi, bias), d);
-#if defined(STRATA_USE_HIP) && !defined(__gfx942__) && !defined(__gfx950__)
+#if defined(STRATA_LAT8_UNSIGNED_ZEROS)
     // a code 0 times a negative scale is -0 in FP16 and +0 through AMD's F32 product: a zero half loses its sign
     // (only a code 0 makes a zero here - a normal scale times any other code is a normal number).  CDNA3 and CDNA4 (gfx942, gfx950)
     // keeps the sign through the F32 product as NVIDIA does, so its FP16 product is already the same bits
-    const auto unsigned_zeros = [](unsigned x) {
-        return x & (0x7FFF7FFFu | (((x & 0x7FFF7FFFu) + 0x7FFF7FFFu) & 0x80008000u));
-    };
-    return make_uint2(unsigned_zeros(*(const unsigned*) &a), unsigned_zeros(*(const unsigned*) &b));
+    // (whether the F32 product itself keeps the sign depends on the compiler and on the code around it - clang 23
+    // folds the int8 x FP16 product one way in one kernel and the other way in the next - so a zero is unsigned here
+    // and in lat8_q4_f32 alike)
+    return make_uint2(lat8_unsigned_zeros(*(const unsigned*) &a), lat8_unsigned_zeros(*(const unsigned*) &b));
 #else
     return make_uint2(*(const unsigned*) &a, *(const unsigned*) &b);
 #endif
@@ -45,7 +52,11 @@ __device__ __forceinline__ uint2 lat8_q4(uint32_t w, __half2 d) {
 __device__ __forceinline__ uint2 lat8_q4_f32(uint32_t w, float d) {
     const __half2 a = __floats2half2_rn((float) (int8_t) w * d, (float) (int8_t) (w >> 8) * d);
     const __half2 b = __floats2half2_rn((float) (int8_t) (w >> 16) * d, (float) (int8_t) (w >> 24) * d);
+#if defined(STRATA_LAT8_UNSIGNED_ZEROS)
+    return make_uint2(lat8_unsigned_zeros(*(const unsigned*) &a), lat8_unsigned_zeros(*(const unsigned*) &b));
+#else
     return make_uint2(*(const unsigned*) &a, *(const unsigned*) &b);
+#endif
 }
 __device__ __forceinline__ bool lat8_normal(__half d) { return (__half_as_ushort(d) & 0x7C00u) != 0; }
 // values [4 c4, 4 c4 + 4) of a record (an FP16 row's uint2 there).  NVIDIA's FP16 multiply keeps subnormals and the

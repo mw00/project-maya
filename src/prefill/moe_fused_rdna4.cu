@@ -483,7 +483,7 @@ native_kernel(const uint8_t* wbase, size_t stride, int ntiles, const int2* tiles
         const int fb = w % NFB, e = tile.x, row0 = tile.y;
         const int nrows = min(kTileRows, bounds[e + 1] - bounds[0] - row0);
         if (nrows <= 0) continue; // uniform for the block; no barriers are skipped by individual lanes
-        const uint8_t* blob = wbase + (size_t) e * stride;
+        const uint8_t* blob = geo.offs != nullptr ? wbase + geo.offs[e] : wbase + (size_t) e * stride;
         const int rbase = fb * NW_ROWS;
         const uint8_t* wrow = GU ? blob + ((ur & 1) ? geo.up_off : geo.gate_off) + (size_t) (fb * (NW_ROWS / 2) + (ur >> 1)) * geo.gu_row
                                  : blob + geo.down_off + (size_t) (rbase + ur) * geo.d_row;
@@ -736,6 +736,10 @@ bool supported(int gu, int down) {
     return available();
 }
 
+bool shape_ok(int n_embd, int n_ff) {
+    return (n_embd == 4096 && n_ff == 2048) || (n_embd == 5120 && n_ff == 2304) || (n_embd == 6144 && n_ff == 2048);
+}
+
 size_t act_bytes(int64_t rows, int64_t cols) { return (size_t) rows * (size_t) (cols / 64) * AB; }
 
 void quantize(const float* x, int64_t rows, int64_t cols, void* xa, void* stream) {
@@ -759,6 +763,7 @@ void run_experts(const uint8_t* wbase, size_t stride, const Geometry& geo, int n
     for (int e = 0; e < ne; ++e) ntiles += (host_bounds[e+1] - host_bounds[e] + 63) / 64;
     if (!ntiles) return;
     const bool ds4 = geo.n_embd == 5120 && geo.n_ff == 2304;   // (DeepSeek-V4.1's experts; else GLM's 4096 / 2048)
+    const bool g61 = geo.n_embd == 6144 && geo.n_ff == 2048;   // (GLM-5.3's experts: a linked helper's prompt rows)
     // blocks a multiprocessor, measured (hip_prefill_fused_bench): GLM's shape on gfx1151 3 for every pair (Radeon
     // 8060S, 9K-token layer, IQ2_XXS/IQ3_XXS: 184 -> 155 ms; 4 and 5 are slower, 6 between them); elsewhere 3 for
     // IQ2_S / IQ2_XS, else 4 - DeepSeek's shape on every GPU as well (a Radeon 8060S, hip_prefill_fused_bench ds4 at
@@ -769,10 +774,11 @@ void run_experts(const uint8_t* wbase, size_t stride, const Geometry& geo, int n
     const unsigned grid_gu = (unsigned) std::min(ntiles * 32, sms * gu_blocks);
     const unsigned grid_dn = (unsigned) std::min(ntiles * 32, sms * dn_blocks);
     const auto s = (cudaStream_t) stream;
-    if (!ds4 && ((geo.n_embd != 0 && geo.n_embd != 4096) || (geo.n_ff != 0 && geo.n_ff != 2048))) std::abort();
+    if (!ds4 && !g61 && ((geo.n_embd != 0 && geo.n_embd != 4096) || (geo.n_ff != 0 && geo.n_ff != 2048))) std::abort();
     auto* tiles = (int2*) tile_scratch;
     make_tiles_kernel<<<1, 256, 0, s>>>(bounds, ne, tiles);
 #define GU(T) (ds4 ? native_kernel<T, true, true, NW_LB, 5120, 2304><<<grid_gu, 256, 0, s>>>(wbase, stride, ntiles, tiles, bounds, geo, (const uint8_t*) xa, src, (uint8_t*) ha, nullptr) \
+                 : g61 ? native_kernel<T, true, true, NW_LB, 6144, 2048><<<grid_gu, 256, 0, s>>>(wbase, stride, ntiles, tiles, bounds, geo, (const uint8_t*) xa, src, (uint8_t*) ha, nullptr) \
                  : native_kernel<T, true, true, NW_LB><<<grid_gu, 256, 0, s>>>(wbase, stride, ntiles, tiles, bounds, geo, (const uint8_t*) xa, src, (uint8_t*) ha, nullptr))
     if (gu) switch (geo.gu_type) {
         case T_IQ2_XXS: GU(T_IQ2_XXS); break;
@@ -786,6 +792,7 @@ void run_experts(const uint8_t* wbase, size_t stride, const Geometry& geo, int n
     }
 #undef GU
 #define DN(T) (ds4 ? native_kernel<T, false, true, NW_LB, 5120, 2304><<<grid_dn, 256, 0, s>>>(wbase, stride, ntiles, tiles, bounds, geo, (const uint8_t*) ha, src, nullptr, out) \
+                 : g61 ? native_kernel<T, false, true, NW_LB, 6144, 2048><<<grid_dn, 256, 0, s>>>(wbase, stride, ntiles, tiles, bounds, geo, (const uint8_t*) ha, src, nullptr, out) \
                  : native_kernel<T, false, true, NW_LB><<<grid_dn, 256, 0, s>>>(wbase, stride, ntiles, tiles, bounds, geo, (const uint8_t*) ha, src, nullptr, out))
     if (!dn) {}
     else if (geo.d_type == T_Q2_0) { DN(T_Q2_0); }

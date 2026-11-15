@@ -601,7 +601,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   # already links `strata_core` - putting `gdn_layer` in core would make the two mutually dependent.  A third
   # library is the honest shape of the dependency graph: core knows about devices and weights, kernels know
   # about arithmetic, and this one knows the ORDER the arithmetic happens in.
-  add_library(strata_engine STATIC src/core/layer.cpp src/core/session.cpp src/core/expert_source.cpp src/core/remote_experts.cpp
+  add_library(strata_engine STATIC src/core/layer.cpp src/core/session.cpp src/core/expert_source.cpp src/core/remote_experts.cpp src/core/glm_helper_link.cpp
     src/core/expert_cache.cpp src/core/native_head.cpp src/core/native_dense.cpp src/core/verify.cpp src/core/mtp.cpp
     src/core/glm_model.cu src/core/glm_fast_path.cu src/core/glm_prefill.cu src/core/glm_multi.cu src/core/glm_rows.cu
     src/core/glm_window.cu src/core/glm_dflash.cu src/core/glm_mtp.cu src/core/glm_mtp_rows.cu src/core/glm_ablate.cu)
@@ -705,7 +705,8 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     add_executable(maya-ds4 src/ds4/ds4_main.cpp src/ds4/ds4_model.cu src/ds4/ds4_kernels.cu src/ds4/ds4_vision.cu
                               src/ds4/ds4_gguf.cu src/ds4/ds4_gguf_cpu.cpp src/ds4/ds4_iq.cu src/ds4/ds4_iq_cpu.cpp
                               src/ds4/ds4_lane_parity.cpp
-                              src/ds4/ds4_lt.cu src/ds4/ds4_host_ar.cpp src/ds4/ds4_packinfo.cpp)
+                              src/ds4/ds4_lt.cu src/ds4/ds4_host_ar.cpp src/ds4/ds4_packinfo.cpp
+                              src/ds4/ds4_part_net.cpp)
     # DS4_LANE_PARITY's CPU rows: each float operation the one written (the device's _rn intrinsics' roundings), so no
     # multiply-add is fused behind the source's back (GCC contracts by default where FMA is on: the AVX2 rows' target)
     if(MSVC)
@@ -861,7 +862,8 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
                             src/mm3/mm3_host.cpp ${_mm3_nv_sources} ${_mm3_gguf_sources} ${_mm3_gguf_cpu_sources})
     target_include_directories(maya-mm3 PRIVATE ${_strata_gpu_include_directories} include src/mm3 third_party/ggml)
     # (the CPU lane: the shared CPU EXL3 kernels, used as they are; ggml-cpu's dots for a GGUF's experts)
-    target_link_libraries(maya-mm3 PRIVATE strata_kernels_cpu ${_strata_gpu_runtime_target} ${_strata_gpu_blas_target})
+    target_link_libraries(maya-mm3 PRIVATE strata_kernels_cpu strata_spec ${_strata_gpu_runtime_target}
+                                           ${_strata_gpu_blas_target})
     # (ds4_iq.cu without the rest of maya-ds4: its dependent launch (src/ds4/ds4_pdl.cuh) and its AMD prompt experts'
     #  MMQ (MAYA_DS4_EXPERT_MMQ) left out - MiniMax's kernels launch as before)
     target_compile_definitions(maya-mm3 PRIVATE MAYA_DS4_IQ_ONLY)
@@ -942,6 +944,10 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
         add_executable(mm3_slots_test tests/mm3_slots_test.cpp)
         target_include_directories(mm3_slots_test PRIVATE src/mm3)
         add_test(NAME mm3_slots_test COMMAND mm3_slots_test)
+        # a router that picked no expert (mm3_wscan.hpp, #672): its input's statistics, the stored weights' NaN / Inf
+        add_executable(mm3_wscan_test tests/mm3_wscan_test.cpp)
+        target_include_directories(mm3_wscan_test PRIVATE src/mm3)
+        add_test(NAME mm3_wscan_test COMMAND mm3_wscan_test)
       endif()
     endif()
     if(_mm3_filter)
@@ -990,6 +996,10 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     target_link_libraries(hip_expert_cache_staging PRIVATE strata_engine)
     add_test(NAME hip_expert_cache_staging COMMAND hip_expert_cache_staging)
     list(APPEND _strata_hip_tests hip_expert_cache_staging)
+    # MAYA_GLM_EXPERT_HELPER=link: the GLM expert helper as a program of its own (a CUDA lead + this AMD GPU, Linux)
+    add_executable(maya-glm-helper src/program/glm_helper_server.cpp)
+    target_include_directories(maya-glm-helper PRIVATE third_party/ggml)
+    target_link_libraries(maya-glm-helper PRIVATE strata_engine strata_prefill)
     add_executable(hip_glm_expert_helper tests/hip/glm_expert_helper.cpp)
     target_include_directories(hip_glm_expert_helper PRIVATE third_party/ggml)
     target_link_libraries(hip_glm_expert_helper PRIVATE strata_engine)
@@ -1500,6 +1510,10 @@ if(STRATA_NATIVE_EXPERTS)
     add_executable(native_split_test src/kernels/cpu/native_split_test.cpp)
     target_link_libraries(native_split_test PRIVATE strata_kernels_cpu)
     add_test(NAME native_split_test COMMAND native_split_test)
+    # a native layer whose gate and up are of two types (Qwen3.8 UD-IQ1_S blk.18): layout, rows vs ggml-cpu, pack index
+    add_executable(native_mixed_test src/kernels/cpu/native_mixed_test.cpp)
+    target_link_libraries(native_mixed_test PRIVATE strata_kernels_cpu)
+    add_test(NAME native_mixed_test COMMAND native_mixed_test)
     # the multi-token expert rows (iq_avx512 / iq_avx2) bit for bit against ggml-cpu's dot, and GLM's split rows for a
     # window of tokens against the same tokens one at a time
     if(STRATA_CPU_X86)   # (#471: x86-only kernels - native rows, the IQ1_S rows without pdep)

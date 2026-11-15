@@ -1074,9 +1074,11 @@ __global__ void __launch_bounds__(kThreads) set_kernel(const SetArgs a) {
 
 #if !defined(STRATA_USE_HIP) || STRATA_HAS_WMMA
 // the same on the tensor cores (sm_70+; AMD: RDNA 3 / 4's, rocWMMA): 8 warps each 16 rows x 32 outputs, the tiles
-// F16 in shared memory
+// F16 in shared memory.  RM > 1: a block takes RM x 64 rows (each warp RM x 16), every weight tile decoded once for
+// all of them - an expert's weights decoded once per 64 * RM of its rows, not once per 64 (the decode is most of the
+// tile's work); each output's sums in the same order (the same MMAs over the same K steps): the same bits
 constexpr int kLdT = 40;
-template <int T, bool GATE_UP, int EPI = 0>
+template <int T, bool GATE_UP, int EPI = 0, int RM = 1>
 __global__ void __launch_bounds__(kThreads) set_tc_kernel(const SetArgs a) {
     pdl_wait();
     pdl_trigger();
@@ -1091,8 +1093,9 @@ __global__ void __launch_bounds__(kThreads) set_tc_kernel(const SetArgs a) {
     using wh = __half;
 #endif
     constexpr bool TWO = GATE_UP && kBoth<EPI>;   // (gate and up in this pass; EPI 2 / 3: one of them, as wg)
+    constexpr int BR = BM * RM;   // (the block's rows)
     struct Tiles {
-        __half x[BM][kLdT], wg[BN][kLdT], wu[TWO ? BN : 1][kLdT];
+        __half x[BR][kLdT], wg[BN][kLdT], wu[TWO ? BN : 1][kLdT];
     };
     // the results leave through a 16 x 16 tile a warp in the tiles' room (the gate's and the up's accumulators hold the
     // same elements, so the SwiGLU runs on them in registers): a block's shared memory is its tiles' alone - 15 KB, not
@@ -1101,28 +1104,31 @@ __global__ void __launch_bounds__(kThreads) set_tc_kernel(const SetArgs a) {
     static_assert(sizeof(Tiles) >= (size_t) (kThreads / 32) * 16 * 16 * sizeof(float), "the warps' output tiles");
     __shared__ __align__(32) unsigned char smem[sizeof(Tiles)];
     __shared__ uint32_t tab[Ty<T>::TAB > 0 ? Ty<T>::TAB : 1];
-    __shared__ int src[BM];
+    __shared__ int src[BR];
     Tiles& Tl = *reinterpret_cast<Tiles*>(smem);
     const int e = blockIdx.z;
     const int lo = a.bounds[e] - a.row0, hi = a.bounds[e + 1] - a.row0;
-    const int r0 = lo + blockIdx.x * BM;
+    const int r0 = lo + blockIdx.x * BR;
     if (r0 >= hi || hi - lo <= a.skip_le) return;   // (uniform; skip_le: the light kernels' experts)
     if (a.skip_ge > 0 && hi - lo >= a.skip_ge) return;   // (the caller's FP16 GEMMs')
     load_tab<T>(tab);
-    const int nr = min(BM, hi - r0);
+    const int nr = min(BR, hi - r0);
+    const int nrm = (nr + BM - 1) / BM;   // (the row groups that hold rows: uniform, the others skipped)
     const int c0 = blockIdx.y * BN;
     const uint8_t* blob = a.wbase + (size_t) e * a.stride;
     const int K = GATE_UP ? a.n_embd : a.n_ff;
     const size_t rb = row_bytes_t<T>(K);
     const int tid = (int) threadIdx.x, warp = tid >> 5;
-    if (tid < BM) src[tid] = tid < nr ? (GATE_UP ? a.idx[r0 + tid] : r0 + tid) : -1;
+    for (int t = tid; t < BR; t += kThreads) src[t] = t < nr ? (GATE_UP ? a.idx[r0 + t] : r0 + t) : -1;
     __syncthreads();
     const int wm_ = warp >> 1, wn = (warp & 1) * 2;
-    wm::fragment<wm::accumulator, 16, 16, 16, float> fg[2], fu[2];
-    for (int j = 0; j < 2; ++j) {
-        wm::fill_fragment(fg[j], 0.0f);
-        wm::fill_fragment(fu[j], 0.0f);
-    }
+    wm::fragment<wm::accumulator, 16, 16, 16, float> fg[RM][2], fu[RM][2];
+#pragma unroll
+    for (int q = 0; q < RM; ++q)
+        for (int j = 0; j < 2; ++j) {
+            wm::fill_fragment(fg[q][j], 0.0f);
+            wm::fill_fragment(fu[q][j], 0.0f);
+        }
     const int tr = tid >> 2, tq = tid & 3;
     for (int kb = 0; kb < K / 32; ++kb) {
         for (int m = 0; m < (TWO ? 2 : 1); ++m) {
@@ -1132,36 +1138,47 @@ __global__ void __launch_bounds__(kThreads) set_tc_kernel(const SetArgs a) {
 #pragma unroll
             for (int j = 0; j < 8; ++j) dst[j] = __float2half_rn(w8[j]);
         }
-        const int sr = src[tr];
-        if (a.xh_vec) {   // FP16 rows, 16-byte aligned: 8 values in one load (gate / up: the caller's rows_f16 of the same F32
-            // rows - __float2half_rn as below, so the same bits - not 36 conversions of them, a block column each)
-            uint4 v = make_uint4(0u, 0u, 0u, 0u);
-            if (sr >= 0) v = *reinterpret_cast<const uint4*>(a.xh + (size_t) sr * a.ldx + (size_t) kb * 32 + tq * 8);
-            *reinterpret_cast<uint4*>(&Tl.x[tr][tq * 8]) = v;
-        } else {
 #pragma unroll
-            for (int j = 0; j < 8; ++j) {
-                __half v = __float2half_rn(0.0f);
-                if (sr >= 0) {
-                    const size_t at = (size_t) sr * a.ldx + (size_t) kb * 32 + tq * 8 + j;
-                    v = GATE_UP ? __float2half_rn(a.xf[at]) : __ushort_as_half(a.xh[at]);
+        for (int q = 0; q < RM; ++q) {
+            if (q >= nrm) break;   // (uniform)
+            const int xr = q * BM + tr;
+            const int sr = src[xr];
+            if (a.xh_vec) {   // FP16 rows, 16-byte aligned: 8 values in one load (gate / up: the caller's rows_f16 of the same
+                // F32 rows - __float2half_rn as below, so the same bits - not 36 conversions of them, a block column each)
+                uint4 v = make_uint4(0u, 0u, 0u, 0u);
+                if (sr >= 0) v = *reinterpret_cast<const uint4*>(a.xh + (size_t) sr * a.ldx + (size_t) kb * 32 + tq * 8);
+                *reinterpret_cast<uint4*>(&Tl.x[xr][tq * 8]) = v;
+            } else {
+#pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    __half v = __float2half_rn(0.0f);
+                    if (sr >= 0) {
+                        const size_t at = (size_t) sr * a.ldx + (size_t) kb * 32 + tq * 8 + j;
+                        v = GATE_UP ? __float2half_rn(a.xf[at]) : __ushort_as_half(a.xh[at]);
+                    }
+                    Tl.x[xr][tq * 8 + j] = v;
                 }
-                Tl.x[tr][tq * 8 + j] = v;
             }
         }
         __syncthreads();
 #pragma unroll
         for (int kk = 0; kk < 32; kk += 16) {
-            wm::fragment<wm::matrix_a, 16, 16, 16, wh, wm::row_major> fa;
-            wm::load_matrix_sync(fa, (const wh*) &Tl.x[wm_ * 16][kk], kLdT);
+            wm::fragment<wm::matrix_a, 16, 16, 16, wh, wm::row_major> fa[RM];
+#pragma unroll
+            for (int q = 0; q < RM; ++q)
+                if (q < nrm) wm::load_matrix_sync(fa[q], (const wh*) &Tl.x[q * BM + wm_ * 16][kk], kLdT);
 #pragma unroll
             for (int j = 0; j < 2; ++j) {
                 wm::fragment<wm::matrix_b, 16, 16, 16, wh, wm::col_major> fb;
                 wm::load_matrix_sync(fb, (const wh*) &Tl.wg[(wn + j) * 16][kk], kLdT);
-                wm::mma_sync(fg[j], fa, fb, fg[j]);
+#pragma unroll
+                for (int q = 0; q < RM; ++q)
+                    if (q < nrm) wm::mma_sync(fg[q][j], fa[q], fb, fg[q][j]);
                 if (TWO) {
                     wm::load_matrix_sync(fb, (const wh*) &Tl.wu[(wn + j) * 16][kk], kLdT);
-                    wm::mma_sync(fu[j], fa, fb, fu[j]);
+#pragma unroll
+                    for (int q = 0; q < RM; ++q)
+                        if (q < nrm) wm::mma_sync(fu[q][j], fa[q], fb, fu[q][j]);
                 }
             }
         }
@@ -1169,14 +1186,17 @@ __global__ void __launch_bounds__(kThreads) set_tc_kernel(const SetArgs a) {
     }
     float* ow = reinterpret_cast<float*>(smem) + (size_t) warp * 16 * 16;   // (the K loop's last barrier: tiles free)
     const int lane = tid & 31;
+#pragma unroll
+    for (int q = 0; q < RM; ++q)
     for (int j = 0; j < 2; ++j) {
+        if (q >= nrm) break;   // (uniform)
         if (TWO)
-            for (int i = 0; i < (int) fg[j].num_elements; ++i)
-                fg[j].x[i] = act_out<EPI>(fg[j].x[i], fu[j].x[i], a.limit);
-        wm::store_matrix_sync(ow, fg[j], 16, wm::mem_row_major);
+            for (int i = 0; i < (int) fg[q][j].num_elements; ++i)
+                fg[q][j].x[i] = act_out<EPI>(fg[q][j].x[i], fu[q][j].x[i], a.limit);
+        wm::store_matrix_sync(ow, fg[q][j], 16, wm::mem_row_major);
         __syncthreads();   // (uniform: every warp stores, then reads its own tile)
         for (int i = lane; i < 16 * 16; i += 32) {
-            const int r = wm_ * 16 + i / 16, c = c0 + (wn + j) * 16 + i % 16;
+            const int r = q * BM + wm_ * 16 + i / 16, c = c0 + (wn + j) * 16 + i % 16;
             if (r >= nr) continue;
             const size_t lr = (size_t) (r0 + r);
             if constexpr (!GATE_UP) a.y[lr * a.ldo + c] = ow[i];
@@ -1578,12 +1598,46 @@ void dn_ne(const Args& a, dim3 grid, int ne, cudaStream_t s) {
     else if (ne <= 8) launch_dn<T, 8>(a, grid, s);
     else launch_dn<T, 16>(a, grid, s);
 }
+static int tc_rows_mult() {   // (set_tc_kernel's RM for this device: DS4_IQ_TC_RM, else 4 on gfx11, else 1)
+    static const int env = [] {
+        const char* v = std::getenv("DS4_IQ_TC_RM");
+        if (v == nullptr) return 0;
+        const int n = std::atoi(v);
+        return n >= 4 ? 4 : n >= 2 ? 2 : 1;
+    }();
+    if (env > 0) return env;
+#if defined(STRATA_USE_HIP)
+    static std::atomic<int> known[64];   // 0: not asked yet, else the answer
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) return 1;
+    int k = known[dev].load(std::memory_order_relaxed);
+    if (k == 0) {
+        cudaDeviceProp prop{};
+        k = cudaGetDeviceProperties(&prop, dev) == cudaSuccess && std::strncmp(prop.gcnArchName, "gfx11", 5) == 0 ? 4 : 1;
+        known[dev].store(k, std::memory_order_relaxed);
+    }
+    return k;
+#else
+    return 1;
+#endif
+}
 template <int T, bool GU, int EPI = 0>
 void launch_set(const SetArgs& a, dim3 grid, cudaStream_t s) {
 #if !defined(STRATA_USE_HIP) || STRATA_HAS_WMMA
     if (tc_ok()) {
         SetArgs b = a;   // (gate / up: FP16 rows when the caller gave them - set_gate_up's x16)
         b.xh_vec = b.xh != nullptr && ((uintptr_t) b.xh & 15) == 0 && (b.ldx & 7) == 0 ? 1 : 0;
+        // a block's rows, 64 x rm, for the sets whose busiest expert has more than 64 rows: 4 on AMD gfx11 (a Radeon
+        // 8065S, Maya-XS's IQ1_S sets: prompts 2K / 8K / 32K +10 / +11 / +10 %, the same tokens), 1 elsewhere (not
+        // measured); DS4_IQ_TC_RM=N (1, 2, 4) sets it
+        const int rm = tc_rows_mult();
+        if (rm > 1 && a.max_rows > BM) {
+            dim3 g2 = grid;
+            g2.x = (unsigned) ((a.max_rows + BM * rm - 1) / (BM * rm));
+            if (rm == 4) pdl_launch(set_tc_kernel<T, GU, EPI, 4>, g2, kThreads, 0, s, b);
+            else pdl_launch(set_tc_kernel<T, GU, EPI, 2>, g2, kThreads, 0, s, b);
+            return;
+        }
         pdl_launch(set_tc_kernel<T, GU, EPI>, grid, kThreads, 0, s, b);
         return;
     }

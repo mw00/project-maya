@@ -57,6 +57,7 @@
 #include <map>
 #include <memory>
 #include <string>
+#include <mutex>
 #include <thread>
 #include <vector>
 #ifdef _WIN32
@@ -75,6 +76,29 @@ namespace mmq = strata::prefill::mmq;
 // GLM-5.3's one (n_embd - glm-dsa writes and reads T x n_embd of R, glm_prefill_dsa.cu).  The split's hand-over copies
 // this many a token; the buffers keep Flash's 4 x n_embd carve (their sizes set the chunk length, so they stay).
 static size_t pf_hop_floats(const Glm5Geometry& g) { return (size_t) (g.mhc() ? 4 : 1) * (size_t) g.n_embd; }
+
+// MAYA_GLM_DET_TRACE (debug): an order-free hash of n floats (a sum of mixed (index, bits) words), synchronous
+__global__ void dt_hash_kernel(const uint32_t* v, int64_t n, unsigned long long* out) {
+    unsigned long long acc = 0;
+    for (int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (int64_t) gridDim.x * blockDim.x) {
+        unsigned long long z = ((unsigned long long) i << 32) ^ v[i];
+        z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ull;
+        z = (z ^ (z >> 27)) * 0x94d049bb133111ebull;
+        acc += z ^ (z >> 31);
+    }
+    atomicAdd(out, acc);
+}
+static unsigned long long dt_hash(const float* d, int64_t n, cudaStream_t s) {
+    static unsigned long long* buf = nullptr;
+    if (buf == nullptr) cudaMallocHost(&buf, sizeof(*buf));
+    static unsigned long long* dv = nullptr;
+    if (dv == nullptr) cudaMalloc(&dv, sizeof(*dv));
+    cudaMemsetAsync(dv, 0, sizeof(*dv), s);
+    dt_hash_kernel<<<256, 256, 0, s>>>((const uint32_t*) d, n, dv);
+    cudaMemcpyAsync(buf, dv, sizeof(*dv), cudaMemcpyDeviceToHost, s);
+    cudaStreamSynchronize(s);
+    return *buf;
+}
 
 namespace {
 
@@ -602,6 +626,42 @@ __global__ void add_f32_kernel(float* __restrict__ y, const float* __restrict__ 
 
 }  // namespace
 
+// The prompt path's EXL3 lane for a caller outside it - the linked helper's prompt products (remote_experts.cpp's
+// pf_run_x3): a BLAS handle on the caller's stream, and one expert's rows through x3_run_blas (the weights decoded
+// once, the GEMMs in FP16): out[r] = the expert over x[row_tok[r]] for r < nrows (rows of E floats; out's rows hold
+// gate/up meanwhile).  w16: FP16 scratch of w16_elems values, at least 2 * nff * E and room for the rows' inputs.
+namespace glmpf {
+void* x3_blas_open(cudaStream_t s) {
+    cublasHandle_t h = nullptr;
+    if (cublasCreate(&h) != CUBLAS_STATUS_SUCCESS) return nullptr;
+    cublasSetStream(h, s);
+    cublasSetMathMode(h, CUBLAS_DEFAULT_MATH);
+    return (void*) h;
+}
+void x3_blas_close(void* blas) {
+    if (blas != nullptr) cublasDestroy((cublasHandle_t) blas);
+}
+void x3_expert_rows(void* blas, cudaStream_t s, uint16_t* w16, int64_t w16_elems, const uint8_t* blob,
+                    const strata::kernels::exl3::ExpertLayout& lay, int E, int nff, float limit, const float* x,
+                    const int* row_tok, int nrows, float* out) {
+    X3Lane L;
+    L.s = s;
+    L.blas = (cublasHandle_t) blas;
+    L.w16 = w16;
+    L.w16_elems = w16_elems;
+    L.x = x;
+    L.row_tok = row_tok;
+    L.OUTP = out;
+    L.W = nrows;
+    L.place = [](int, int) { return 0; };
+    L.lay = &lay;
+    L.E = E;
+    L.nff = nff;
+    L.limit = limit;
+    x3_run_blas(L, blob, 0, nrows, 0);
+}
+}  // namespace glmpf
+
 struct Glm5Model::PrefillState {
     int T = 0;                       // tokens per chunk
     // --prefill: the chunk and its prestage slots for a lend cap (% of the pool's slots), the cap it was sized with,
@@ -818,7 +878,8 @@ struct Glm5Model::PrefillState {
     std::vector<float> c_ff;
     std::vector<float> c_x3;   // EXL3: the CPU rows' inputs, byte sums and down inputs
     uint64_t cpu_experts = 0, cpu_rows = 0;
-    double ms_cpu = 0, row_ms = 0.05;   // row_ms: the host's cost of a row, learned (the split's estimate)
+    static constexpr double kRowMs0 = 0.05;   // row_ms's start (and its value with repeatable answers)
+    double ms_cpu = 0, row_ms = kRowMs0;      // row_ms: the host's cost of a row, learned (the split's estimate)
     // the split's balance, learned: the host's estimates times kappa, nudged each layer by the host's time over the
     // copy stream's (ev_c0 .. ev_c1: the staged copies) - the two lanes should end together
     double kappa = 1.0;
@@ -1253,7 +1314,8 @@ bool Glm5Model::prefill_setup(std::string& err) {
     // there, the pool is the capped one - without a prestage buffer).  MAYA_GLM_COMPLETE_POOL=0: never (on by
     // default on every GPU: complete_pool_on).
     bool complete = false;
-    if (glmfast::complete_pool_on() && !F->unified_memory && has_moe && stride_sum > 0 &&
+    if (glmfast::complete_pool_on() && (!F->unified_memory || glmfast::unified_complete_pool()) && has_moe &&
+        stride_sum > 0 &&
         ceiling > 0) {
         const auto pu = prefill_bytes_for((size_t) ceiling);
         size_t bufs = pu.first + pu.second + (size_t) w16_elems * 2 + (size_t) w32_elems * 4 + ws_bytes + gbuf + 4096;
@@ -2447,9 +2509,50 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
         while (il < l1_ && !F->L[(size_t) il].moe) ++il;
         return il;
     };
+    // MAYA_GLM_EXPERT_HELPER=link with its prompt exchange: a MoE layer's experts the helper owns are computed there
+    // (only the chunk's rows cross the link, never an expert); MAYA_GLM_LINK_PROMPT=0 (or a chunk past the exchange,
+    // or expert types MMQ does not cover) streams them to this GPU as before.  No prestage for such a layer.
+    static const bool link_pf_on = [] {
+        const char* v = getenv("MAYA_GLM_LINK_PROMPT");
+        return v == nullptr || std::atoi(v) != 0;
+    }();
+    // repeatable answers (a linked helper): plans from fixed inputs, never from measured times (the CPU share below)
+    const bool rep = glmfast::repeatable(F->helper.linked());
+    // An EXL3 pack's helper layers: every n-th (il % n == phase) streams its experts to this GPU instead of the helper
+    // computing them - the copy runs while the helper works on the layer before, so both links work at once (Radeon
+    // 8065S + V100, GLM-5.3-Flash EXL3 3.05: 2K prompts 128 tok/s all on the helper, 136 every 4th streamed, 149 every
+    // 2nd; 8K 218 / 264 / 328).  MAYA_GLM_LINK_PF_STREAM=<n>[,<phase>] (default 2,0; 0: all on the helper)
+    static const std::pair<int, int> pf_stream = [] {
+        const char* v = getenv("MAYA_GLM_LINK_PF_STREAM");
+        int n = 2, ph = 0;
+        if (v != nullptr && std::sscanf(v, "%d,%d", &n, &ph) < 1) n = 2;
+        if (n > 0 && v != nullptr)
+            std::fprintf(stderr, "glm prefill: an EXL3 pack's every %d-th layer (phase %d) streams its experts instead "
+                                 "of the helper (MAYA_GLM_LINK_PF_STREAM)\n", n, ph % n);
+        return std::make_pair(std::max(0, n), n > 0 ? ((ph % n) + n) % n : 0);
+    }();
+    // An EXL3 pack's chunk shorter than this streams the helper's experts to this GPU instead: the helper decodes each
+    // expert's whole weights for a call, so a short chunk's few rows an expert cost it more than the copy here (Radeon
+    // 8065S + V100: a 23-token chat prompt 2.7 s through the helper, 1.0 s streamed; 512 tokens 54 vs 92 tok/s, 1K 82
+    // vs 116; 2K 128 through the helper vs 80 streamed).  MAYA_GLM_LINK_PF_X3_MIN
+    static const int pf_x3_min = [] {
+        const char* v = getenv("MAYA_GLM_LINK_PF_X3_MIN");
+        return v != nullptr ? std::max(0, std::atoi(v)) : 1024;
+    }();
+    const auto link_pf_for = [&](int il) {
+        if (!link_pf_on || il < 0 || il >= g.n_layers || !F->helper.linked() || F->helper.pf_cap() < T ||
+            K > hlink::kPfMaxK || g.n_expert > hlink::kPfMaxExperts)
+            return false;
+        const auto& Ly = F->L[(size_t) il];
+        if (Ly.moe && Ly.exl3)   // (an EXL3 pack: the helper's EXL3 prompt lane)
+            return T >= pf_x3_min && !(pf_stream.first > 0 && il % pf_stream.first == pf_stream.second) &&
+                   F->helper.pf_x3_ok();
+        return Ly.moe && !Ly.exl3 && F->helper.pf_pair_ok(Ly.gu_type, Ly.d_type);
+    };
     const auto prestage = [&](int il) {
         S->pre_layer = -1;
         S->pre_e.clear();
+        if (link_pf_for(il)) return;
         if (S->pbuf == nullptr || T < kPreMinT || il >= l1_ || !F->L[(size_t) il].moe || F->layer_rc[(size_t) il] < 0 ||
             (tail_skip && il == g.n_layers - 1))   // the skipped terminal FFN reads no experts
             return;
@@ -2482,7 +2585,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                 if (us > 0.0) sh += F->usage[key] / us, w += 1.0;
                 if (ls > 0.0 && !lc.empty()) sh += lc[(size_t) e] / ls, w += 1.0;
                 const double pred = (w > 0.0 ? sh / w : 1.0 / NE) * (double) T * K;
-                if (pred >= kPreMinRows && !glmpfs::prestage_skip(g.arch == GlmArch::GlmDsa, pred, S->copy_ms, F->cpu_ps_ms, F->cpu_p_ms, F->cpu_c_ms, S->row_ms, F->cpu_pool && F->cpu_p_ms > 2.0 * F->cpu_c_ms && (size_t) il < F->cpu_fmt.size() && F->cpu_fmt[(size_t) il].n_ff > 0 && glmpfs::share_ok(F->tier.get(), il))) cand.push_back(Cand{pred, e, rs});   // glm-dsa B9.9 / B14.7: not what the plan keeps on the lane
+                if (pred >= kPreMinRows && !glmpfs::prestage_skip(g.arch == GlmArch::GlmDsa, pred, rep ? 0.0 : S->copy_ms, F->cpu_ps_ms, F->cpu_p_ms, F->cpu_c_ms, rep ? PrefillState::kRowMs0 : S->row_ms, F->cpu_pool && F->cpu_p_ms > 2.0 * F->cpu_c_ms && (size_t) il < F->cpu_fmt.size() && F->cpu_fmt[(size_t) il].n_ff > 0 && glmpfs::share_ok(F->tier.get(), il))) cand.push_back(Cand{pred, e, rs});   // glm-dsa B9.9 / B14.7: not what the plan keeps on the lane
             }
         }
         // the layer's count: the buffer's, or (MAYA_GLM_PRESTAGE_ADAPT=1) what its mixer's window took before
@@ -2645,11 +2748,132 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
     if (!glmpfs::early_take(this, p0, T)) prestage(next_moe(l0_));   // (the dense layers before the first MoE one run meanwhile)
     if (glmpfs::prestage_only(this)) return true;
     for (auto& t : S->tr) t.on = false;
-    for (int il = l0_; il < l1_; ++il) {
+    // ---- the STAGGERED HALF-CHUNK PIPELINE (a linked helper): the chunk's rows in two halves A / B, staggered by one
+    //      layer - a layer's helper experts for one half run on the helper while this GPU runs the other half's
+    //      attention and its own experts (per layer ~max(this GPU, helper) instead of their sum).  B's attention at
+    //      layer l reads A's cache rows of layer l, written first (the same stream).  Each half's helper call has an
+    //      exchange slot of its own (pf_slot_layout); its sum is added just before that half's next layer.  A layer
+    //      whose plan is not the helper's alone (the CPU lane, prestage, disk) runs whole, the halves joined before.
+    //      MAYA_GLM_PF_PIPE=0: off; MAYA_GLM_PF_PIPE_MIN=<tokens>: the shortest chunk split (default 512).
+    static const int pipe_env = [] {
+        const char* v = getenv("MAYA_GLM_PF_PIPE");
+        return v == nullptr ? -1 : std::atoi(v);
+    }();
+    static const int pipe_min = [] {
+        const char* v = getenv("MAYA_GLM_PF_PIPE_MIN");
+        return v != nullptr ? std::max(256, std::atoi(v)) : 512;
+    }();
+    const int64_t p0_full = p0;
+    const int T_full = T;
+    const int TA = std::max(128, (T_full / 2 + 64) / 128 * 128), TB = T_full - TA;   // (A: whole 128-row tiles)
+    bool pipe = pipe_env != 0 && link_pf_on && F->helper.linked() && T_full >= pipe_min && TB > 0 &&
+                TB <= F->helper.pf_slot_cap() && C == nullptr && !S->trace && l0_ == 0 &&
+                l1_ == g.n_layers && split_next_ == nullptr;
+    const auto pipe_moe = [&](int il) { return link_pf_for(il) && disk_only(il).empty(); };
+    // An EXL3 pack's helper layers run whole unless MAYA_GLM_PF_PIPE=1: the helper decodes each expert's weights for
+    // every call, so two halves decode them twice - measured on a Radeon 8065S + V100, the halves read a 2K prompt
+    // ~30 % slower and an 8K one no faster than whole chunks
+    const auto pipe_x3_whole = [&](int il) { return pipe_env != 1 && F->L[(size_t) il].exl3; };
+    std::vector<char> pipe_l((size_t) std::max(0, l1_), 0);
+    int pipe_n = 0;
+    if (pipe)
+        for (int il = l0_; il < l1_; ++il) {
+            const auto& Ly = F->L[(size_t) il];
+            const int nx = next_moe(il + 1);
+            const auto ok = [&](int l) { return pipe_moe(l) && !pipe_x3_whole(l); };
+            pipe_l[(size_t) il] = !Ly.moe || (ok(il) && (nx >= l1_ || ok(nx)));
+            pipe_n += Ly.moe && pipe_l[(size_t) il];
+        }
+    if (pipe_n == 0) pipe = false;
+    std::string pipe_whole;   // (the MoE layers that run whole: for the start line)
+    if (pipe)
+        for (int il = l0_; il < l1_; ++il)
+            if (F->L[(size_t) il].moe && !pipe_l[(size_t) il])
+                pipe_whole += (pipe_whole.empty() ? "" : ",") + std::to_string(il);
+    // the rows of the chunk (h -1) or of half h (0: A, 1: B): every per-row buffer, T, p0 and the DSA io point there
+    struct RowView { float *R, *x, *mixer, *ffn, *pre, *post, *comb, *ss, *mix; uint16_t* x16; uint8_t* keep; };
+    const RowView rv_full{S->R, S->x, S->mixer, S->ffn, S->pre, S->post, S->comb, S->ss, S->mix, S->x16, pio.keep};
+    const size_t keep_a = pio.keep != nullptr ? glmpf::keep_bytes(g, (size_t) TA, (int64_t) S->max_pools, false) : 0;
+    const auto set_rows = [&](int h) {
+        const size_t t0 = h == 1 ? (size_t) TA : 0, e = (size_t) E;
+        S->R = rv_full.R + t0 * (g.mhc() ? 4 : 1) * e;   // (mHC: 4 streams a row; glm-dsa: the plain residual)
+        S->x = rv_full.x + t0 * e;
+        S->x16 = rv_full.x16 + t0 * e;
+        S->mixer = rv_full.mixer + t0 * e;
+        S->ffn = rv_full.ffn + t0 * e;
+        S->pre = rv_full.pre + t0 * 4;
+        S->post = rv_full.post + t0 * 4;
+        S->comb = rv_full.comb + t0 * 16;
+        S->ss = rv_full.ss + t0;
+        S->mix = rv_full.mix + t0 * 24;
+        T = h < 0 ? T_full : (h == 0 ? TA : TB);
+        p0 = p0_full + (int64_t) t0;
+        pio.x = S->x;
+        pio.x16 = S->x16;
+        pio.mixer = S->mixer;
+        pio.R = S->R;
+        pio.T = T;
+        pio.p0 = p0;
+        pio.keep = rv_full.keep == nullptr ? nullptr : rv_full.keep + (h == 1 ? keep_a : 0);   // (B's selection apart)
+    };
+    // a half's helper call in flight (index 2: the whole chunk's, joined in its layer); its sum added by hlp_finish
+    struct HlpPend {
+        std::thread th;
+        bool ok = true, live = false;
+        std::string err;
+        double ms = 0.0;
+        cudaEvent_t ev = nullptr;   // the call's inputs copied down (on S->xs)
+        float* ffn = nullptr;
+        int64_t n = 0;
+        int nh = 0, nrows = 0, slot = 0;
+        ~HlpPend() {
+            if (th.joinable()) th.join();
+            if (ev != nullptr) cudaEventDestroy(ev);
+        }
+    } hp[3];
+    std::mutex link_mx;   // (one helper call at a time: the control block holds one)
+    double pipe_wait_ms = 0.0, pipe_hlp_ms = 0.0;   // (the pipeline's line: this host's waits on the helper, its time)
+    const auto hlp_finish = [&](int h) -> bool {
+        HlpPend& H = hp[h];
+        if (!H.live) return true;
+        H.live = false;
+        const auto tw = std::chrono::steady_clock::now();
+        if (H.th.joinable()) H.th.join();
+        if (h < 2) {
+            pipe_wait_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tw).count();
+            pipe_hlp_ms += H.ms;
+        }
+        if (!H.ok) {
+            err = H.err.empty() ? "glm prefill: the linked helper's prompt experts failed" : H.err;
+            return false;
+        }
+        add_f32_kernel<<<(unsigned) std::min<int64_t>(4096, (H.n + 255) / 256), 256, 0, s>>>(
+            H.ffn, F->helper.pf_out_dev(H.slot), H.n);
+        S->cpu_experts += (uint64_t) H.nh;
+        S->cpu_rows += (uint64_t) H.nrows;
+        S->ms_cpu += H.ms;
+        S->mark("moe_link", s);
+        return true;
+    };
+    {
+        static bool said = false;
+        if (pipe && !said) {
+            said = true;
+            std::fprintf(stderr, "glm prefill: staggered half-chunk pipeline on (%d MoE layers; whole: %s; halves %d + %d "
+                                 "tokens, MAYA_GLM_PF_PIPE=0: off)\n", pipe_n,
+                         pipe_whole.empty() ? "none" : pipe_whole.c_str(), TA, TB);
+        }
+    }
+    const auto layer_step = [&](const int il, const int hh) -> bool {
         progress_at("the prompt: layer", il);   // a layer is the serve watchdog's heartbeat (issue #40)
         progress_beat();
         const auto& Ly = F->L[(size_t) il];
         const bool skip_output = tail_skip && il == g.n_layers - 1;
+        const int slot = hh < 0 ? 0 : hh + 1;   // (the helper exchange's slot for these rows)
+        HlpPend& H = hp[hh < 0 ? 2 : hh];
+        if (pipe)   // (the union scratch is reused: the other half's routes must have gone down to the helper)
+            for (const auto& q : hp)
+                if (q.ev != nullptr) cudaStreamWaitEvent(s, q.ev, 0);
         if (S->trace) cudaEventRecord(S->tr[(size_t) il].start, s);
         hc_read(il == l0_ ? nullptr : S->ffn, Ly.hc_attn_fn, Ly.hc_attn_scale, Ly.hc_attn_base, Ly.attn_norm);
         S->mark("hc", s);
@@ -2657,12 +2881,14 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
         // out through S->mixer, which this layer's mixer writes only after)
         dflash_capture(il, S->R, T, p0, S->mixer, T, s);
         dump_row("attn_norm-" + std::to_string(il), S->x, E);
+        if (glmfast::dt_on())
+            std::fprintf(stderr, "DT pf %lld/%d l%d x=%016llx\n", (long long) p0, T, il, dt_hash(S->x, (int64_t) T * E, s));
         // KV streaming: the layer's cache before the chunk, from its host copy into the staging copy (whole pages: a
         // chunk starting inside one finds it complete), which the chunk's rows are written into too and the attention
         // reads; the host copy and the resident slots get the chunk's rows as well (dsa_prep)
         uint8_t* const kv_host = !Ly.recr && kv_ != nullptr && g.arch != GlmArch::GlmDsa ? kv_->host[(size_t) il] : nullptr;
         if (kv_host != nullptr && p0 > 0) {
-            if (S->kv_next == il) {   // staged on kv_ss meanwhile
+            if (S->kv_next == il && hh <= 0) {   // staged on kv_ss meanwhile (half B: never - A's rows went in after)
                 if (!glmfast::cuda_ok(cudaStreamWaitEvent(s, S->kv_ready, 0), "glm prefill: the KV stage wait", err))
                     return false;
                 S->kv_next = -1;
@@ -2895,11 +3121,13 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
             // Windows HIP: the sub-batch goes to the GPU while the next one queues (glmfast::submit_queued)
             if (glmfast::prefill_submit()) glmfast::submit_queued(s);
         }
-        if (kv_host != nullptr && !kv_prefetch(kv_dsa_from(il + 1))) return false;   // (the stage is read: the next one's)
+        if (kv_host != nullptr && hh < 0 && !kv_prefetch(kv_dsa_from(il + 1))) return false;   // (the stage is read: the next one's; halves: B copies its prefix itself)
 
         S->mark(Ly.recr ? "kda" : "dsa", s);
-        if (skip_output) continue;   // every KDA/DSA cache update above still ran; these output rows feed nothing
+        if (skip_output) return true;   // every KDA/DSA cache update above still ran; these output rows feed nothing
         dump_row("mixer-" + std::to_string(il), S->mixer, E);
+        if (glmfast::dt_on())
+            std::fprintf(stderr, "DT pf %lld/%d l%d mixer=%016llx\n", (long long) p0, T, il, dt_hash(S->mixer, (int64_t) T * E, s));
         hc_read(S->mixer, Ly.hc_ffn_fn, Ly.hc_ffn_scale, Ly.hc_ffn_base, Ly.ffn_norm);
         S->mark("hc", s);
         dump_row("ffn_norm-" + std::to_string(il), S->x, E);
@@ -2909,7 +3137,20 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
         // (and the other part's, when it computes a share of this layer: there x goes on up, over its link, while this
         // GPU runs the shared expert and the router)
         const bool calc_on = calc_half && Ly.moe && Ly.exl3;
-        if (Ly.moe && (cpu_lane(il) || calc_on)) {
+        const bool link_pf = !calc_on && link_pf_for(il);
+        if (link_pf) {   // (the linked helper's x: straight into the prompt exchange)
+            if (S->xs == nullptr &&
+                !(cudaStreamCreateWithFlags(&S->xs, cudaStreamNonBlocking) == cudaSuccess &&
+                  cudaEventCreateWithFlags(&S->ev_x, cudaEventDisableTiming) == cudaSuccess &&
+                  cudaEventCreateWithFlags(&S->ev_out, cudaEventDisableTiming) == cudaSuccess)) {
+                err = "glm prefill: the linked helper's copy stream did not start";
+                return false;
+            }
+            cudaEventRecord(S->ev_x, s);
+            cudaStreamWaitEvent(S->xs, S->ev_x, 0);
+            cudaMemcpyAsync(F->helper.pf_x(slot), S->x, (size_t) T * E * sizeof(float), cudaMemcpyDeviceToHost, S->xs);
+        }
+        if (Ly.moe && !link_pf && (cpu_lane(il) || calc_on)) {
             if (!cpu_bufs(0)) {
                 err = "glm prefill: the CPU experts' host buffers did not allocate";
                 return false;
@@ -2941,7 +3182,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
             }
             S->mark("dense_ffn", s);
             dump_row("ffn_out-" + std::to_string(il), S->ffn, E);
-            continue;
+            return true;
         }
 
         // ---- MoE: the shared expert (sub-batches, straight into ffn), the routes, the expert groups
@@ -3135,8 +3376,11 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
             static const char* row_env = getenv("MAYA_GLM_PREFILL_CPU_ROW_MS");
             // the planning cost of a row: the env's, else learned from the layers before (their host time less an
             // expert's weights each, over their rows; one 3090 beside 2x Xeon 6152: ~0.056 ms)
-            const double row_ms = row_env != nullptr ? std::atof(row_env) : S->row_ms;
-            if (cpu_lane(il) && glmpfs::share_ok(F->tier.get(), il)) {   // glm-dsa B8.4 / B9.9: split RAM experts take the node-split share
+            // (repeatable answers - glmfast::repeatable: the split is planned from fixed inputs only - a row's start
+            // cost, the cached calibration's copy rate, kappa 1, every prestage copy still owed - since the CPU lane
+            // and this GPU give different bits for an expert, a split learned from measured times parts two runs)
+            const double row_ms = row_env != nullptr ? std::atof(row_env) : rep ? PrefillState::kRowMs0 : S->row_ms;
+            if (!link_pf && cpu_lane(il) && glmpfs::share_ok(F->tier.get(), il)) {   // glm-dsa B8.4 / B9.9: split RAM experts take the node-split share
                 std::vector<size_t> ram_i;
                 int n_pcie = 0;
                 for (size_t i = 0; i < staged.size(); ++i) {
@@ -3149,7 +3393,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                 });
                 // (the streaming rate: the prestage copies', else the calibration's; with the other part computing
                 // its share, this link moves only the rest - the PCIe side's time shrinks by that share)
-                const double p_ms = (S->copy_ms > 0.0 ? S->copy_ms : F->cpu_ps_ms > 0.0 ? F->cpu_ps_ms : F->cpu_p_ms) *
+                const double p_ms = (S->copy_ms > 0.0 && !rep ? S->copy_ms : F->cpu_ps_ms > 0.0 ? F->cpu_ps_ms : F->cpu_p_ms) *
                                     (calc_on ? 1.0 - S->calc_share : 1.0);
                 // the prestage copies the copy stream still owes (a mixer shorter than the buffer's copies): the
                 // staged groups queue behind them
@@ -3157,7 +3401,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                 if (S->pre_layer == il) {
                     const int np = (int) S->pre_e.size();
                     pre_left = np;
-                    for (size_t k = 0; k * PrefillState::kPreEv < (size_t) np; ++k) {
+                    for (size_t k = 0; !rep && k * PrefillState::kPreEv < (size_t) np; ++k) {
                         if (cudaEventQuery(S->ev_pdone[k]) != cudaSuccess) break;
                         pre_left = std::max(0, np - (int) (k + 1) * PrefillState::kPreEv);
                     }
@@ -3170,7 +3414,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                 for (size_t i : ram_i) {
                     // (an expert's fixed cost is about twice the lane's one-token expert: its weights, and the
                     // multi-row kernel's unpacking of every row)
-                    const double c = S->kappa * (2.0 * F->cpu_c_ms + row_ms * S->h_counts[staged[i].e]);
+                    const double c = (rep ? 1.0 : S->kappa) * (2.0 * F->cpu_c_ms + row_ms * S->h_counts[staged[i].e]);
                     if (t_cpu + c > t_pcie - p_ms && !glmpf::lane_first(g, S->h_counts[staged[i].e], p_ms, 2.0 * F->cpu_c_ms, row_ms)) break;   // glm-dsa B14.7
                     if (cpu_rows_taken + S->h_counts[staged[i].e] > cpu_cap) break;
                     cpu_rows_taken += S->h_counts[staged[i].e];
@@ -3204,6 +3448,32 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
             for (size_t i = 0; i < staged.size(); ++i) (give[i] ? calc_set : rest).push_back(staged[i]);
             staged.swap(rest);
         }
+        // THE LINKED HELPER'S SHARE (taken out of staged before its groups; rows assigned after the other part's)
+        std::vector<Staged> hlp_set;
+        if (link_pf) {
+            std::vector<Staged> rest;
+            for (const auto& x : staged)
+                (!x.dev && x.ram != nullptr && hlink::in_shared(x.ram, Ly.blob) ? hlp_set : rest).push_back(x);
+            staged.swap(rest);
+        }
+        if (glmfast::dt_on()) {   // the plan: which lane computes which expert
+            std::vector<int> pl;
+            for (int i = 0; i < n_light; ++i) pl.push_back(h_light[3 * i]);
+            pl.push_back(-1);
+            for (int e = 0; e < NE; ++e) pl.push_back(S->h_counts[e] < 0 ? S->h_base[e] : 0);
+            pl.push_back(-2);
+            if (S->pre_layer == il) for (int e : S->pre_e) pl.push_back(e);
+            pl.push_back(-3);
+            for (const auto& x : staged) pl.push_back(x.e * 4 + (x.dev ? 1 : 0) + (x.ram != nullptr ? 2 : 0));
+            pl.push_back(-4);
+            for (const auto& x : hlp_set) pl.push_back(x.e);
+            pl.push_back(-5);
+            for (const auto& x : cpu_set) pl.push_back(x.e);
+            for (const auto& x : calc_set) pl.push_back(x.e);
+            std::fprintf(stderr, "DT pf %lld/%d l%d plan=%016llx light=%d pre=%d stg=%zu hlp=%zu cpu=%zu\n", (long long) p0,
+                         T, il, (unsigned long long) glmfast::dt_fnv(pl.data(), pl.size() * sizeof(int)), n_light,
+                         pre_n, staged.size(), hlp_set.size(), cpu_set.size());
+        }
         int rows = rows_res + rows_pre;
         struct Group {
             int first, n, r0, nrows, max_rows, b_off;
@@ -3235,6 +3505,14 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
             rows += S->h_counts[cx.e];
         }
         const int calc_nrows = rows - calc_r0;
+        // THE LINKED HELPER'S SHARE: every expert it owns (the RAM tier it reads in place) - their rows go last, never
+        // computed here; its weighted sum of them is added into ffn after the combine
+        const int hlp_r0 = rows;
+        for (const auto& hx : hlp_set) {
+            S->h_base[hx.e] = rows;
+            rows += S->h_counts[hx.e];
+        }
+        const int hlp_nrows = rows - hlp_r0;
         if (rows != T * K) {
             err = "glm prefill: layer " + std::to_string(il) + " planned " + std::to_string(rows) + " of " +
                   std::to_string(T * K) + " routed rows";
@@ -3258,6 +3536,50 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
             cudaStreamWaitEvent(S->xs, S->ev_x, 0);
             if (!x_down) cudaMemcpyAsync(S->x_h, S->x, (size_t) T * E * sizeof(float), cudaMemcpyDeviceToHost, S->xs);
             cudaMemcpyAsync(S->rt_h, M.row_tok + cpu_r0, (size_t) cpu_nrows * sizeof(int), cudaMemcpyDeviceToHost, S->xs);
+        }
+        // the linked helper's layer: its rows' tokens and the routes' positions and weights down after x, then a
+        // thread waits for them and for the helper's sum while this one queues this GPU's experts; joined before the add
+        if (hlp_nrows > 0) {
+            if (H.th.joinable()) H.th.join();   // (a failed earlier call's thread; never live here)
+            H.ok = true;
+            H.err.clear();
+            H.ms = 0.0;
+            if (H.ev == nullptr && cudaEventCreateWithFlags(&H.ev, cudaEventDisableTiming) != cudaSuccess) {
+                err = "glm prefill: the linked helper's event did not create";
+                return false;
+            }
+            cudaEventRecord(S->ev_x, s);   // (the scatter is done up to here)
+            cudaStreamWaitEvent(S->xs, S->ev_x, 0);
+            cudaMemcpyAsync(F->helper.pf_rtok(slot), M.row_tok + hlp_r0, (size_t) hlp_nrows * sizeof(int),
+                            cudaMemcpyDeviceToHost, S->xs);
+            cudaMemcpyAsync(F->helper.pf_pos(slot), M.pos, (size_t) T * K * sizeof(int), cudaMemcpyDeviceToHost, S->xs);
+            cudaMemcpyAsync(F->helper.pf_rw(slot), M.rw, (size_t) T * K * sizeof(float), cudaMemcpyDeviceToHost, S->xs);
+            cudaEventRecord(H.ev, S->xs);
+            uint64_t* hk = F->helper.pf_ptrs(slot);
+            int32_t* hc = F->helper.pf_cnts(slot);
+            for (size_t j = 0; j < hlp_set.size(); ++j) {
+                hk[j] = (uint64_t) (uintptr_t) hlp_set[j].ram;
+                hc[j] = S->h_counts[hlp_set[j].e];
+            }
+            const int nh = (int) hlp_set.size(), dev = dev_;
+            const bool dsa = g.arch == GlmArch::GlmDsa;
+            const int gu = Ly.gu_type, dty = Ly.d_type, Tc = T, nr = hlp_nrows, r0c = hlp_r0, sl = slot;
+            const size_t doff = Ly.down_off;
+            const float lim = g.swiglu_exp;
+            HlpPend* hpp = &H;
+            std::mutex* mx = &link_mx;
+            const strata::kernels::exl3::ExpertLayout* xlp = Ly.exl3 ? &Ly.xl : nullptr;   // (the model's layer: it outlives the call)
+            H.th = std::thread([=] {
+                cudaSetDevice(dev);
+                if (cudaEventSynchronize(hpp->ev) != cudaSuccess) {
+                    hpp->ok = false;
+                    hpp->err = "glm prefill: the linked helper's inputs did not come down";
+                    return;
+                }
+                std::lock_guard<std::mutex> lk(*mx);
+                hpp->ok = F->helper.pf_post(gu, dty, doff, lim, dsa, Tc, K, nh, nr, r0c, hpp->err, sl, xlp) &&
+                          F->helper.pf_wait(hpp->err, &hpp->ms);
+            });
         }
         S->mark("plan", s);
         const double plan_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tp).count();
@@ -4185,6 +4507,22 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
         if (cpu_nrows > 0)
             gb::moe_combine_add(M.OUTPc, cpu_r0, cpu_r0, cpu_r0 + cpu_nrows, M.pos, M.rw, T, K, E, S->ffn, s);
         S->mark("combine", s);
+        if (hlp_nrows > 0) {   // the linked helper's weighted sum, read in place from the exchange (hlp_finish)
+            H.live = true;
+            H.ffn = S->ffn;
+            H.n = (int64_t) T * E;
+            H.nh = (int) hlp_set.size();   // (the chunk line's "cpu" counts: the helper's experts, rows and time)
+            H.nrows = hlp_nrows;
+            H.slot = slot;
+            if (hh < 0) {   // (the whole chunk: now; a half: just before its next layer, the other half's run between)
+                if (glmfast::dt_on()) {
+                    H.th.join();
+                    std::fprintf(stderr, "DT pf %lld/%d l%d lead=%016llx hlp=%016llx\n", (long long) p0, T, il,
+                                 dt_hash(S->ffn, H.n, s), dt_hash(F->helper.pf_out_dev(), H.n, s));
+                }
+                if (!hlp_finish(2)) return false;
+            }
+        }
         if (calc_run) {
             cudaStreamWaitEvent(s, S->ev_cpart, 0);
             // MAYA_GLM_PREFILL_CALC_CHECK=1 (debug, synchronous): this GPU computes the other part's share as well -
@@ -4251,7 +4589,27 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
         if (S->trace) cudaEventRecord(S->tr[(size_t) il].end, s);
         dump_row("ffn_out-" + std::to_string(il), S->ffn, E);
         if (glmfast::prefill_submit()) glmfast::submit_queued(s);   // (Windows HIP: the experts start now)
+        return true;
+    };
+    for (int il = l0_; il < l1_; ++il) {
+        if (pipe && pipe_l[(size_t) il]) {
+            for (int h = 0; h < 2; ++h) {   // (half h's helper sum of the layer before, then its layer)
+                if (!hlp_finish(h)) return false;
+                set_rows(h);
+                if (!layer_step(il, h)) {
+                    set_rows(-1);
+                    return false;
+                }
+            }
+            set_rows(-1);
+        } else {
+            if (!hlp_finish(0) || !hlp_finish(1) || !layer_step(il, -1)) return false;
+        }
     }
+    if (!hlp_finish(0) || !hlp_finish(1)) return false;
+    if (pipe && S->stages)
+        std::fprintf(stderr, "glm prefill: CUDA%d pipeline %d + %d tokens: the helper's halves %.0f ms, this host waited "
+                             "%.0f ms on them\n", dev_, TA, TB, pipe_hlp_ms, pipe_wait_ms);
     // the last layer's write half: R = post x ffn + comb . R
     if (!tail_skip) {
         ablate(S->ffn, (int) T, s);   // (--ablate: the part's last FFN write)

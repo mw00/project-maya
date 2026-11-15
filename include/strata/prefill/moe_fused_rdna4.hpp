@@ -13,12 +13,17 @@ struct Geometry {
     int n_embd = 0, n_ff = 0;   // 0: GLM's 4096 / 2048; DeepSeek-V4.1: 5120 / 2304
     size_t gate_off = 0;        // the gate's rows from the expert's start (GLM: 0)
     size_t h_ld = 0;            // the bytes of an H row (gate / up's output, down's input; 0: packed, act_bytes(1, n_ff))
+    // experts that do not lie a stride apart (a linked helper's, in place in the shared RAM tier): expert e's bytes
+    // from wbase, n_expert entries on the device; null: wbase + e * stride
+    const uint64_t* offs = nullptr;
 };
 
 // Default on only on validated gfx1151 and gfx1100 with compiled WMMA bodies and covered types.
 // MAYA_GLM_PREFILL_FUSED=0 retains MMQ. Other devices always retain MMQ.
 bool available();
 bool supported(int gu_type, int down_type);
+// The kernels are built for this expert shape (GLM 4096 / 2048, DeepSeek-V4.1 5120 / 2304, GLM-5.3 6144 / 2048).
+bool shape_ok(int n_embd, int n_ff);
 size_t act_bytes(int64_t rows, int64_t cols);
 void quantize(const float* x, int64_t rows, int64_t cols, void* xa, void* stream);
 

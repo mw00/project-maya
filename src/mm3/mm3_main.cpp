@@ -35,6 +35,7 @@
 #include <cstring>
 #include <deque>
 #include <map>
+#include <memory>
 #include <fstream>
 #include <mutex>
 #include <random>
@@ -58,6 +59,8 @@
 #include "mm3_sample.hpp"
 #include "mm3_slots.hpp"
 #include "mm3_vision.hpp"
+#include "strata/spec/draft_policy.hpp"
+#include "strata/spec/suffix_drafter.hpp"
 #if defined(_WIN32)
 #include <timeapi.h>
 #pragma comment(lib, "winmm.lib")
@@ -297,6 +300,8 @@ bool parse_gen(const std::string& line, Req& r) {
         else if (k == "think_end") r.think_end = std::atoi(v.c_str());
         else if (k == "spec") r.spec = std::atoi(v.c_str()) != 0;
         else if (k == "dspark_conf" || k == "spec_min_p") r.conf = std::strtof(v.c_str(), nullptr);
+        else if (k == "suffix_draft") r.lookup = std::atoi(v.c_str()) != 0;
+        else if (k == "lookup_trust") r.trust = std::atoi(v.c_str()) != 0;
         else if (k == "rid") r.rid = std::atoi(v.c_str());
         else if (k == "ablate") r.ablate = std::atoi(v.c_str()) != 0;
         // (keys this engine does not use are taken and ignored)
@@ -330,9 +335,46 @@ void serve_header(mm3::Model& m, bool spec_on, const std::string& kv_fmt) {
                     vg->patch, vg->merge, vg->max_pixels, vg->min_pixels);
 }
 
+// Prompt lookup (--suffix-draft N, maya-ds4's): the suffix drafter (strata/spec/suffix_drafter.hpp) proposes the tokens
+// that followed an earlier repeat of the context - a file edit, a tool call's arguments, quoted text - and a round
+// whose proposal starts with DSpark's first draft verifies the lookup's tokens instead where the draft policy
+// (strata/spec/draft_policy.hpp) expects more committed tokens a millisecond from them, from this PC's round times by
+// window size and the lookup drafts' acceptance, both measured as it decodes; a lookup window may run past DSpark's
+// block, up to 16 tokens (the decode window's most).  A proposal the policy trusts (a long match whose windows measured
+// hold) is verified alone, the draft not made that round (the draft's context comes from the target's forwards, so it
+// stays current; the round's time counts with the draft's measured time added, so the policy keeps comparing rounds
+// that drafted).  Without DSpark (off, or a request's spec=0) the lookup's windows are weighed against a plain step.
+// The drafts are verified as DSpark's are (greedy: the target's argmax; sampling: kept with the target's probability
+// of the draft, else drawn without it), so every token is still the target's own.  Not beside MM3_SAMPLED_DRAFTS (its
+// drafts' distributions).  N: the shortest match proposed from (3); 0: off.  A request's suffix_draft=0|1 key turns
+// it off / on for that request (on: with N 3 when the engine started with it off).  MAYA_MM3_LOOKUP_TRUST=0 (a
+// request's lookup_trust=0|1 over it): no trusted rounds, every round with DSpark drafts first.
+struct Lookup {
+    static constexpr int kMaxT = 16;   // (the decode window's tokens at most: kWin in mm3_model.cu / mm3_tp.cu)
+    strata::spec::SuffixDrafter sfx;
+    strata::spec::DraftPolicy policy;   // (over the engine's life: the round times are this PC's)
+    std::vector<int32_t> buf;
+    long long windows = 0, offered = 0, accepted = 0, trusted = 0;   // the lookup's rounds (trusted: no draft), drafts
+    double draft_ms = 0.0;                                           // a draft's time (EMA)
+    int t_mtp = 1;                                                   // the last drafted window's tokens
+    Lookup(int min_match, size_t cap) : sfx(min_match, 64, cap), policy(kMaxT), buf((size_t) kMaxT) {}
+};
+
 int serve(mm3::Model& m, const std::vector<int>& eos, int chunk, bool spec_on, float conf_floor, float draft_cost,
-          const std::string& kv_fmt, const std::string& profile_out) {
+          const std::string& kv_fmt, const std::string& profile_out, int suffix_draft) {
     serve_header(m, spec_on, kv_fmt);
+    // (the prompt lookup: one policy over every request of this run)
+    std::unique_ptr<Lookup> lk;
+    auto lookup_for = [&](const Req& rq) -> Lookup* {
+        const bool on = rq.lookup < 0 ? suffix_draft > 0 : rq.lookup != 0;
+        if (!on) return nullptr;
+        if (!lk) lk = std::make_unique<Lookup>(suffix_draft > 0 ? suffix_draft : 3, (size_t) m.max_ctx() + 4096);
+        return lk.get();
+    };
+    static const bool trust_on = [] {
+        const char* e = ::mm3::env("MM3_LOOKUP_TRUST");
+        return e == nullptr || std::atoi(e) != 0;
+    }();
     const bool abl_default = m.ablating();   // (a GEN without ablate=: as the engine started)
     std::printf("READY %d stop\n", m.max_ctx());
     std::fflush(stdout);
@@ -519,7 +561,15 @@ int serve(mm3::Model& m, const std::vector<int>& eos, int chunk, bool spec_on, f
         ds.top_p = r.top_p;
         ds.min_p = r.min_p;
         ds.top_k = r.top_k > 0 ? std::min(r.top_k, 64) : 64;
-        std::vector<float> lgw(spec ? (size_t) (B + 1) * m.vocab() : 0);
+        Lookup* L = sampled ? nullptr : lookup_for(r);   // (the prompt lookup: its history the state, then each token)
+        if (L != nullptr) {
+            L->sfx.reset();
+            L->sfx.append(state.data(), state.size());
+        }
+        const long long lk_w0 = L ? L->windows : 0, lk_o0 = L ? L->offered : 0, lk_a0 = L ? L->accepted : 0,
+                        lk_t0 = L ? L->trusted : 0;
+        const int wrows = std::max(spec ? B + 1 : 1, L != nullptr ? Lookup::kMaxT : 1);   // (a window's logits rows)
+        std::vector<float> lgw(spec || L != nullptr ? (size_t) wrows * m.vocab() : 0);
         std::vector<int> drafts;
         std::vector<float> confs, draws((size_t) std::max(B, 1));
         std::vector<std::vector<std::pair<int, float>>> qd;
@@ -533,6 +583,7 @@ int serve(mm3::Model& m, const std::vector<int>& eos, int chunk, bool spec_on, f
         auto emit = [&](int t) -> bool {
             std::printf("T %d\n", t);
             ++produced;
+            if (L != nullptr) L->sfx.append(t);
             if (in_think && t == r.think_end) in_think = false;
             if (produced % 8 == 0) stat_line();
             std::fflush(stdout);
@@ -553,11 +604,25 @@ int serve(mm3::Model& m, const std::vector<int>& eos, int chunk, bool spec_on, f
             if (!emit(tok)) break;
             const int pos = (int) state.size();
             int k = 0;
-            if (spec) {   // (the drafts that can still be answer tokens: max_new, the context, the thinking budget)
-                long long room = std::min<long long>(r.max_new - produced, (long long) m.max_ctx() - pos - 1);
-                if (in_think) room = std::min<long long>(room, r.think_budget - produced);
-                if (in_think && in.wrap.load()) room = 0;
+            const double t_round = now() * 1e3;   // (the round's time, the lookup policy's)
+            // (the drafts that can still be answer tokens: max_new, the context, the thinking budget)
+            long long room = std::min<long long>(r.max_new - produced, (long long) m.max_ctx() - pos - 1);
+            if (in_think) room = std::min<long long>(room, r.think_budget - produced);
+            if (in_think && in.wrap.load()) room = 0;
+            int klk = 0, match = 0;   // the lookup's proposal (Lookup, above)
+            bool from_lk = false, trusted = false;
+            if (L != nullptr && room > 0) {
+                klk = L->sfx.propose((int) std::min<long long>(room, Lookup::kMaxT - 1), L->buf.data());
+                match = L->sfx.last_match();
+            }
+            if (spec && klk > 0 && (r.trust < 0 ? trust_on : r.trust != 0) && L->draft_ms > 0.0 &&
+                L->policy.trust(L->t_mtp, klk, match)) {
+                k = L->policy.choose(L->t_mtp, klk, match).t - 1;   // (trusted: verified alone, no draft)
+                drafts.assign(L->buf.begin(), L->buf.begin() + k);
+                from_lk = trusted = true;
+            } else if (spec) {
                 if (room > 0) {
+                    const double td = now() * 1e3;
                     if (sampled) {
                         for (float& u : draws) u = (float) std::uniform_real_distribution<double>(0.0, 1.0)(rng);
                         if (!m.draft_sampled(tok, pos, B, ds, draws, drafts, confs, qd, err)) {
@@ -574,6 +639,26 @@ int serve(mm3::Model& m, const std::vector<int>& eos, int chunk, bool spec_on, f
                         if (draft_cost > 0.0f && surv < draft_cost) break;
                         ++k;
                     }
+                    if (L != nullptr) {   // (a lookup that starts with DSpark's first draft: the window that pays best)
+                        const double dms = now() * 1e3 - td;
+                        L->draft_ms = L->draft_ms > 0.0 ? 0.9 * L->draft_ms + 0.1 * dms : dms;
+                        L->t_mtp = k + 1;
+                        if (klk > 0 && !drafts.empty() && L->buf[0] == drafts[0]) {
+                            const strata::spec::DraftPolicy::Pick pk = L->policy.choose(k + 1, klk, match);
+                            if (pk.lookup) {
+                                k = pk.t - 1;
+                                drafts.assign(L->buf.begin(), L->buf.begin() + k);
+                                from_lk = true;
+                            }
+                        }
+                    }
+                }
+            } else if (klk > 0) {   // (no DSpark: the lookup's window against a plain step)
+                const strata::spec::DraftPolicy::Pick pk = L->policy.choose(1, klk, match);
+                if (pk.lookup && pk.t > 1) {
+                    k = pk.t - 1;
+                    drafts.assign(L->buf.begin(), L->buf.begin() + k);
+                    from_lk = true;
                 }
             }
             std::vector<int> win(1, tok);
@@ -591,8 +676,10 @@ int serve(mm3::Model& m, const std::vector<int>& eos, int chunk, bool spec_on, f
                 state.push_back(tok);
                 tok = draw(use_c ? row_dist(0, state)
                                  : dist(lgw.empty() ? lg.data() : lgw.data(), m.vocab(), r, state), rng);
+                if (L != nullptr) L->policy.observe(false, 1, 0, match, now() * 1e3 - t_round);
                 continue;
             }
+            const long long acc0 = d_acc;
             if (!(use_c ? m.forward_cands(win.data(), k + 1, pos, k + 1, cd, err)
                         : m.forward(win.data(), k + 1, pos, k + 1, lgw.data(), err))) {
                 fail = err;
@@ -632,11 +719,25 @@ int serve(mm3::Model& m, const std::vector<int>& eos, int chunk, bool spec_on, f
                 more = emit(x);
                 state.push_back(x);
             }
+            if (L != nullptr) {   // (the round's window, its kept drafts and its time; a trusted one's as if drafted)
+                const int acc = (int) (d_acc - acc0);
+                L->policy.observe(from_lk, k + 1, acc, match, now() * 1e3 - t_round + (trusted ? L->draft_ms : 0.0));
+                if (from_lk) {
+                    ++L->windows;
+                    L->offered += k;
+                    L->accepted += acc;
+                    if (trusted) ++L->trusted;
+                }
+            }
             if (!more) break;
             tok = next;
         }
         if (spec && d_off > 0)
             std::fprintf(stderr, "maya mm3 serve: DSpark kept %lld of %lld drafts\n", d_acc, d_off);
+        if (L != nullptr && L->windows > lk_w0)
+            std::fprintf(stderr, "maya mm3 serve: prompt lookup: %lld rounds (%lld without a draft), %lld of its %lld "
+                         "drafts kept (in the above)\n", L->windows - lk_w0, L->trusted - lk_t0, L->accepted - lk_a0,
+                         L->offered - lk_o0);
         if (!fail.empty()) {
             std::fprintf(stderr, "mm3: %s\n", fail.c_str());
             std::printf("ERR %s\n", fail.c_str());
@@ -1545,7 +1646,7 @@ int usage() {
                  "                [--tp 1|2|4] [--cache-gb X] [--kv-cache F|K,V (bf16 int8 fp8 fp4; default int8)]\n"
                  "                [--kv-rot on|off] [--kv-streaming on|off] [--expert-profile FILE]\n"
                  "                [--score REF [--write-ref OUT]] [--cpu-threads N] [--dspark on|off]\n"
-                 "                [--kv-resident N] [--tp-chunk N] [--tp-ffn-rows N] [--dspark-cost X]\n"
+                 "                [--kv-resident N] [--tp-chunk N] [--tp-ffn-rows N] [--dspark-cost X] [--suffix-draft N]\n"
                  "                [--prefill-gemm blas|hipblaslt|auto] [--prefill-tune FILE] [--no-prefill-tune]\n"
                  "                [--calibrate-prefill OUT.json [--ids @prompt]] [--calibrate-decode OUT.json] [--verbose]\n"
                  "                [--serve [--parallel N (1-8: conversations at once)]] [--parallel N --rows-check G]\n"
@@ -1584,6 +1685,8 @@ int main(int argc, char** argv) {
     int gen = 0, last = 1, ppl = 0, rows_steps = 0;
     float dspark_conf = 0.7f;   // the drafts' confidence floor: a round verifies the drafts before the first below it
     float dspark_cost = 0.0f;   // (> 0) ... and those before the first whose confidences' product is below it
+    int suffix_draft = 0;       // --suffix-draft N: the prompt lookup (Lookup), its shortest match; 0: off (the setup
+                                //  writes 3 on one GPU)
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         auto val = [&]() -> std::string {
@@ -1685,6 +1788,7 @@ int main(int argc, char** argv) {
         else if (a == "--dump-image") enc_out = val();
         else if (a == "--dspark-conf") dspark_conf = (float) std::atof(val().c_str());
         else if (a == "--dspark-cost") dspark_cost = (float) std::atof(val().c_str());
+        else if (a == "--suffix-draft") suffix_draft = std::max(0, std::atoi(val().c_str()));
         else if (a == "--score") score_path = val();
         else if (a == "--write-ref") ref_out = val();
         else if (a == "--serve") serve_mode = true;
@@ -1825,7 +1929,7 @@ int main(int argc, char** argv) {
         const std::string kvf = o.kv_k == o.kv_v ? std::string(mm3::k::kv_name(o.kv_k))
                                                  : std::string(mm3::k::kv_name(o.kv_k)) + "," + mm3::k::kv_name(o.kv_v);
         if (m.seqs() > 1) return serve_multi(m, eos, o.chunk, kvf, profile_out);
-        return serve(m, eos, o.chunk, o.dspark, dspark_conf, dspark_cost, kvf, profile_out);
+        return serve(m, eos, o.chunk, o.dspark, dspark_conf, dspark_cost, kvf, profile_out, suffix_draft);
     }
     const auto& st = m.stats();
     std::fprintf(stderr, "maya-mm3: loaded in %.1f s, %ld of %ld experts in VRAM, %.1f GB pinned pool\n", st.load_s,

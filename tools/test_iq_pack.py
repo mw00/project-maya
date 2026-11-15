@@ -199,5 +199,47 @@ class CompatibilityTests(unittest.TestCase):
             self.assertEqual(int(row[7]), f3.data_start + off3["blk.0.ffn_down_exps.weight"])
 
 
+    def test_mixed_gate_up_types_get_a_gate_up_column(self):
+        # unsloth's Qwen3.8 UD-IQ1_S: blk.18 keeps gate IQ2_S, up IQ2_XXS.  That row's type column is
+        # "gate:up" and its blob/offsets use each role's own size; a same-type row stays as before.
+        from gguf_reader import GGUFFile
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            root = Path(tmp)
+            exp = np.ones((512, 2, 32), np.float32)
+            src = root / "model.gguf"
+            tensors = [("blk.0.ffn_gate_inp.weight", np.ones((512, 32), np.float32), Q.BF16),
+                       ("blk.1.ffn_gate_inp.weight", np.ones((512, 32), np.float32), Q.BF16),
+                       ("blk.0.hc_attn_down.weight", np.ones((2, 32), np.float32), Q.Q8_0)]
+            for role in ("gate", "up", "down"):
+                tensors.append((f"blk.0.ffn_{role}_exps.weight", exp, Q.Q8_0))
+            tensors += [("blk.1.ffn_gate_exps.weight", exp, Q.Q8_0),
+                        ("blk.1.ffn_up_exps.weight", exp, Q.Q4_0),
+                        ("blk.1.ffn_down_exps.weight", exp, Q.Q8_0)]
+            write_gguf(src, tensors)
+            out = root / "pack"
+            (out / "tokenizer").mkdir(parents=True)
+            for name in ["vocab.json", "chat_template.jinja"]:
+                (out / "tokenizer" / name).touch()
+            log = io.StringIO()
+            with patch.object(sys, "argv", ["iq_pack.py", "--gguf", str(src), "--out", str(out), "--compat-bf16"]):
+                with contextlib.redirect_stdout(log):
+                    self.assertEqual(iq_pack.main(), 0)
+            self.assertIn("layer 1: gate Q8_0, up Q4_0 (mixed types)", log.getvalue())
+            rows = [l.split() for l in (out / "native_experts.txt").read_text().splitlines()
+                    if l and not l.startswith("#")]
+            self.assertEqual(len(rows), 2)
+            q8, q4 = int(Q.Q8_0), int(Q.Q4_0)
+            self.assertEqual(rows[0][1:3], [str(q8), str(q8)])            # the same-type row: one type, as before
+            self.assertEqual(rows[1][1:3], ["%d:%d" % (q8, q4), str(q8)])
+            per_q8, per_q4 = 2 * 34, 2 * 18                                # bytes of one expert's rows
+            self.assertEqual(int(rows[0][4]), 3 * per_q8)
+            self.assertEqual(int(rows[1][4]), per_q8 + per_q4 + per_q8)
+            self.assertEqual(int(rows[1][3]), 512 * 3 * per_q8)            # contiguous after layer 0
+            g = GGUFFile(src)
+            off = {t.name: g.data_start + t.offset for t in g.tensors}
+            self.assertEqual([int(v) for v in rows[1][5:8]],
+                             [off["blk.1.ffn_%s_exps.weight" % r] for r in ("gate", "up", "down")])
+
+
 if __name__ == "__main__":
     unittest.main()

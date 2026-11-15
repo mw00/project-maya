@@ -128,6 +128,29 @@ __device__ __forceinline__ __half2 decode2h(uint32_t s0, uint32_t s1) {
         return __hadd2(lo, hi);
     }
 }
+#if defined(STRATA_USE_HIP)
+// codebook 2's products s 0x83DCD12D (mod 2^32) of two 16-bit states - the LOW halves of s0 and s1, their high halves
+// not read - at full rate (AMD's 32-bit multiply is quarter rate): s 0x83DCD12D = s 0xD12D + (s 0x83DC mod 2^16) 2^16.
+// One byte permute packs the two states, two packed 16-bit multiplies by (0x83DC : 0) give each state's high part
+// already in the high half, and a 16 x 16 multiply-add each adds the low part.  The same products, so the same bits
+__device__ __forceinline__ void mul_3inst2(uint32_t s0, uint32_t s1, uint32_t& x0, uint32_t& x1) {
+    const uint32_t p = __builtin_amdgcn_perm(s1, s0, 0x05040100u);   // s1's low half : s0's low half
+    uint32_t h0, h1;
+    asm("v_pk_mul_lo_u16 %0, %1, %2 op_sel_hi:[0,1]" : "=v"(h0) : "v"(p), "s"(0x83DC0000u));   // s0 0x83DC : 0
+    asm("v_pk_mul_lo_u16 %0, %1, %2" : "=v"(h1) : "v"(p), "s"(0x83DC0000u));                   // s1 0x83DC : 0
+    asm("v_mad_u32_u16 %0, %1, %2, %3" : "=v"(x0) : "v"(p), "s"(0xD12Du), "v"(h0));
+    asm("v_mad_u32_u16 %0, %1, %2, %3 op_sel:[1,0,0,0]" : "=v"(x1) : "v"(p), "s"(0xD12Du), "v"(h1));
+}
+// decode2h<2> through mul_3inst2: the decode GEMV's (block_gemv's) - in the prompt's WMMA kernels it measured slower
+// than v_mul_lo_u32 (exl3_test --bench-set), so they keep decode2h
+__device__ __forceinline__ __half2 decode2h_pk(uint32_t s0, uint32_t s1) {
+    uint32_t x0, x1;
+    mul_3inst2(s0, s1, x0, x1);
+    const uint32_t a = bytesum_plus(x0, 0x6400u), b = bytesum_plus(x1, 0x6400u);
+    const __half2 h = __halves2half2(__ushort_as_half((unsigned short) a), __ushort_as_half((unsigned short) b));
+    return __hfma2(h, __half2half2(__ushort_as_half(0x1eee)), __half2half2(__ushort_as_half(0xc931)));
+}
+#endif
 template <int cb>
 __device__ __forceinline__ float2 decode2(uint32_t s0, uint32_t s1) {
     return __half22float2(decode2h<cb>(s0, s1));
@@ -140,6 +163,14 @@ __device__ __forceinline__ __half2 u2h(uint32_t u) { return *reinterpret_cast<__
 __device__ __forceinline__ uint32_t fsh(uint32_t lo, uint32_t hi, int s) {
     return (uint32_t) ((((uint64_t) hi << 32) | (uint64_t) lo) >> s);
 }
+// the same for 0 <= s < 32: on AMD one funnel shift, v_alignbit_b32 at full rate (RDNA 3's 64-bit shift is half rate)
+__device__ __forceinline__ uint32_t fsh32(uint32_t lo, uint32_t hi, int s) {
+#if defined(STRATA_USE_HIP)
+    return __builtin_amdgcn_alignbit(hi, lo, (uint32_t) s);
+#else
+    return fsh(lo, hi, s);
+#endif
+}
 
 // Step p's state is the 16-bit window ending at bit S(p) of the tile's MSB-first bit stream (w: its 4 K2 words, K2 =
 // 2 K), wrapping around the tile: S(p) = (p + 1) K for an integer K, floor((p + 1) K2 / 2) for exllamav3 1.6's
@@ -148,14 +179,22 @@ __device__ __forceinline__ uint32_t fsh(uint32_t lo, uint32_t hi, int s) {
 // exllamav3's grouping per K (exl3_dq.cuh: dq8_aligned_*bits, dq8, dq4, dq2x2, dq8_half), which the steps' fixed
 // offsets keep within two words.  f[i]: steps 2i, 2i + 1 as FP16 values.
 // Step lane * 8 + j sits at tile row (lane & 3) * 2 + (j & 1) + 8 (j >> 1 & 1), column (lane >> 2) + 8 (j >> 2).
-template <int cb>
+// Pk: codebook 2 through decode2h_pk on AMD (the decode GEMV's; its states unmasked - it reads their low halves only)
+template <int cb, bool Pk = false>
 __device__ __forceinline__ void decode_states(const uint32_t (&s)[8], uint32_t (&f)[4]) {
+#if defined(STRATA_USE_HIP)
+    if constexpr (Pk && cb == 2) {
+#pragma unroll
+        for (int i = 0; i < 4; ++i) f[i] = h2u(decode2h_pk(s[2 * i], s[2 * i + 1]));
+        return;
+    }
+#endif
 #pragma unroll
     for (int i = 0; i < 4; ++i) f[i] = h2u(decode2h<cb>(s[2 * i] & 0xffffu, s[2 * i + 1] & 0xffffu));
 }
 // K = 4: the lane's steps end in its own word b (word lane), the first three reach into a (word lane - 1)
 __device__ __forceinline__ void states4(uint32_t a, uint32_t b, uint32_t (&s)[8]) {
-    const uint32_t x = fsh(b, a, 20);
+    const uint32_t x = fsh32(b, a, 20);
     s[0] = x >> 8;
     s[1] = x >> 4;
     s[2] = x;
@@ -172,11 +211,14 @@ __device__ __forceinline__ void states_group(const uint32_t* w, int p, uint32_t*
     const int b0 = (p + 257) * K - 16, b2 = b0 + (G - 1) * K + 16;
     const int i0 = b0 >> 5, i2 = (b2 - 1) >> 5, s2 = ((i2 + 1) << 5) - b2;
     const uint32_t a = w[i0 % NW], b = w[i2 % NW];
+    // (a : b) >> (s2 + j K): (a : b) >> s2 once (s2 < 32: its low word t, its high word h), then shifts of (h : t) by
+    // j K < 32 - funnel shifts under 32 only, the same words
+    const uint32_t t = fsh32(b, a, s2), h = a >> s2;
 #pragma unroll
-    for (int j = 0; j < G; ++j) s[G - 1 - j] = fsh(b, a, s2 + j * K);
+    for (int j = 0; j < G; ++j) s[G - 1 - j] = j == 0 ? t : fsh32(t, h, j * K);
 }
 // an integer K
-template <int K, int cb>
+template <int K, int cb, bool Pk = false>
 __device__ __forceinline__ void frag8_int(const uint32_t* w, int lane, uint32_t (&f)[4]) {
     const int p = lane * 8;
     uint32_t s[8];
@@ -186,7 +228,7 @@ __device__ __forceinline__ void frag8_int(const uint32_t* w, int lane, uint32_t 
         // the 8 windows overlap in one 32-bit window: steps p + j end 8 - 1 - j K bits apart
         constexpr int NW = 8 * K, per = 32 / (8 * K);   // lanes per word
         const int i1 = lane / per, i0 = (i1 + NW - 1) % NW;
-        const uint32_t b = fsh(w[i1], w[i0], (per - 1 - lane % per) * 8 * K);
+        const uint32_t b = fsh32(w[i1], w[i0], (per - 1 - lane % per) * 8 * K);
 #pragma unroll
         for (int j = 0; j < 8; ++j) s[j] = b >> ((7 - j) * K);
     } else if constexpr (K == 3) {
@@ -195,7 +237,7 @@ __device__ __forceinline__ void frag8_int(const uint32_t* w, int lane, uint32_t 
         const int b1 = (p + 257) * 3, b0 = b1 - 16, b2 = b1 + 21;
         const int i0 = b0 >> 5, i2 = (b2 - 1) >> 5, s2 = ((i2 + 1) << 5) - b2;
         const uint32_t a = w[i0 % NW], b = w[i2 % NW];
-        const uint32_t hi = fsh(b, a, s2), lo = fsh(b, a, s2 + 12);
+        const uint32_t hi = fsh32(b, a, s2), lo = fsh32(hi, a >> s2, 12);   // (s2 < 32; lo: (a : b) >> (s2 + 12))
 #pragma unroll
         for (int j = 0; j < 4; ++j) {
             s[7 - j] = hi >> (3 * j);
@@ -208,12 +250,12 @@ __device__ __forceinline__ void frag8_int(const uint32_t* w, int lane, uint32_t 
         states_group<K, 4>(w, p, s);
         states_group<K, 4>(w, p + 4, s + 4);
     }
-    decode_states<cb>(s, f);
+    decode_states<cb, Pk>(s, f);
 }
 // a half-integer K (K2 = 2 KA + 1, mul1): exllamav3's dq8_half.  The lane's steps start even, so their windows end at
 // S(p + 7) = (p / 2 + 4) K2 and then KA + 1, KA, KA + 1, ... bits earlier; four windows span 18 + 3 KA <= 27 bits, one
 // funnel shift of two words each (steps 4..7 from window 7's end, 0..3 from window 3's, 2 K2 bits earlier)
-template <int K2, int cb>
+template <int K2, int cb, bool Pk = false>
 __device__ __forceinline__ void frag8_half(const uint32_t* w, int lane, uint32_t (&f)[4]) {
     constexpr int KA = K2 / 2, NW = 4 * K2, span = 18 + 3 * KA;
     const int e7 = (lane * 4 + 4) * K2 + 128 * K2;   // one ring on: no negative bit index
@@ -222,22 +264,22 @@ __device__ __forceinline__ void frag8_half(const uint32_t* w, int lane, uint32_t
     for (int g = 0; g < 2; ++g) {
         const int e = e7 - (1 - g) * 2 * K2;
         const int hi = (e - 1) >> 5, lo = (e - span) >> 5, sh = ((hi + 1) << 5) - e;
-        const uint32_t x = fsh(w[hi % NW], w[lo % NW], sh);   // the window ending at e in the low bits
+        const uint32_t x = fsh32(w[hi % NW], w[lo % NW], sh);   // the window ending at e in the low bits (sh < 32)
         s[4 * g + 3] = x;
         s[4 * g + 2] = x >> (KA + 1);
         s[4 * g + 1] = x >> (2 * KA + 1);
         s[4 * g + 0] = x >> (3 * KA + 2);
     }
-    decode_states<cb>(s, f);
+    decode_states<cb, Pk>(s, f);
 }
 // K2 = 2 K: an even K2 is the integer K2 / 2, an odd one a half-integer K (mul1 only: exllamav3 has no other)
-template <int K2, int cb>
+template <int K2, int cb, bool Pk = false>
 __device__ __forceinline__ void frag8(const uint32_t* w, int lane, uint32_t (&f)[4]) {
     if constexpr ((K2 & 1) != 0) {
         static_assert(cb == 2 && K2 >= 3 && K2 <= 7, "a half-integer K: 1.5, 2.5 or 3.5, mul1");
-        frag8_half<K2, cb>(w, lane, f);
+        frag8_half<K2, cb, Pk>(w, lane, f);
     } else {
-        frag8_int<K2 / 2, cb>(w, lane, f);
+        frag8_int<K2 / 2, cb, Pk>(w, lane, f);
     }
 }
 
@@ -396,7 +438,7 @@ __device__ __forceinline__ void load_tiles(const uint32_t* __restrict__ tile0, s
 // one slice's fragment from the lane's words: K = 4 straight from the registers (the lane's steps end in its own word,
 // the first three reach into the previous lane's), other K (a half-integer one too) through the warp's stage (4 K2
 // words)
-template <int K2, int cb, bool Perm = false>
+template <int K2, int cb, bool Perm = false, bool Pk = false>
 __device__ __forceinline__ void slice_frags(const uint32_t (&w)[Words<K2>::R], uint32_t* st, int lane, uint32_t (&f)[4]) {
 #if defined(STRATA_USE_HIP) && (defined(__GFX10__) || defined(__GFX11__) || defined(__GFX12__))
     if constexpr (Perm && K2 == 4) {
@@ -409,7 +451,7 @@ __device__ __forceinline__ void slice_frags(const uint32_t (&w)[Words<K2>::R], u
         const uint32_t b0 = __builtin_amdgcn_permlane16(v, v, 0x221100FFu, 0x66554433u, false, false);
         const uint32_t b1 = __builtin_amdgcn_permlanex16(v, v, 0xAA998877u, 0xEEDDCCBBu, false, false);
         const bool row1 = lane >= 16;
-        const uint32_t b = fsh(row1 ? a1 : a0, row1 ? b1 : b0, (1 - (lane & 1)) * 16);
+        const uint32_t b = fsh32(row1 ? a1 : a0, row1 ? b1 : b0, (1 - (lane & 1)) * 16);
         uint32_t s[8];
 #pragma unroll
         for (int j = 0; j < 8; ++j) s[j] = b >> ((7 - j) * 2);
@@ -429,7 +471,7 @@ __device__ __forceinline__ void slice_frags(const uint32_t (&w)[Words<K2>::R], u
             const int hi = (e - 1) >> 5, lo = (e - span) >> 5, sh = ((hi + 1) << 5) - e;
             const uint32_t whi = (uint32_t) __builtin_amdgcn_ds_bpermute((hi % NW) << 2, v);
             const uint32_t wlo = (uint32_t) __builtin_amdgcn_ds_bpermute((lo % NW) << 2, v);
-            const uint32_t x = fsh(whi, wlo, sh);
+            const uint32_t x = fsh32(whi, wlo, sh);   // (sh < 32)
             s[4 * g + 3] = x;
             s[4 * g + 2] = x >> (KA + 1);
             s[4 * g + 1] = x >> (2 * KA + 1);
@@ -442,7 +484,7 @@ __device__ __forceinline__ void slice_frags(const uint32_t (&w)[Words<K2>::R], u
     if constexpr (K2 == 8) {
         uint32_t s[8];
         states4(__shfl_sync(0xffffffffu, w[0], (lane + 31) & 31), w[0], s);
-        decode_states<cb>(s, f);
+        decode_states<cb, Pk>(s, f);
     } else {
         constexpr int W = Words<K2>::W, R = Words<K2>::R;
         __syncwarp();
@@ -450,7 +492,7 @@ __device__ __forceinline__ void slice_frags(const uint32_t (&w)[Words<K2>::R], u
         for (int r = 0; r < R; ++r)
             if (W % 32 == 0 || lane + 32 * r < W) st[lane + 32 * r] = w[r];
         __syncwarp();
-        frag8<K2, cb>(st, lane, f);
+        frag8<K2, cb, Pk>(st, lane, f);
     }
 }
 
@@ -477,9 +519,10 @@ constexpr int kMinBlocksMv = 2;
 #else
 #define EXL3_BOUNDS(n) __launch_bounds__(kThreads, n)
 #endif
-// HIP: the decode kernels' block_gemv (moe_*, win_*) inlined into the kernel.  Left to the compiler it can stay a call
-// - it did in v1.1.52 - and a call's arguments arrive in vector registers, so the block's activation count reads as
-// per-lane and every `cc < nc` of the token loop is a branch on the lane mask.  The same arithmetic, the same bits.
+// HIP: the decode kernels' block_gemv (moe_*, win_*, and mv_kernel's for the dense matrices) inlined into the kernel.
+// Left to the compiler it can stay a call - it did in v1.1.52, and mv_kernel's still was in v1.1.57 - and a call's
+// arguments arrive in vector registers, so the block's activation count reads as per-lane and every `cc < nc` of the
+// token loop is a branch on the lane mask.  The same arithmetic, the same bits.
 #if defined(STRATA_USE_HIP)
 #define EXL3_DECODE_INLINE [[clang::always_inline]]
 #else
@@ -527,7 +570,7 @@ __device__ void block_gemv(const uint32_t* __restrict__ tr, int ld, int tc0, int
 #pragma unroll
         for (int s = 0; s < 8; ++s) {
             uint32_t f[4];
-            slice_frags<K2, cb>(wc[s], st, lane, f);
+            slice_frags<K2, cb, false, true>(wc[s], st, lane, f);   // (Pk: the decode GEMV's multiply)
 #if defined(EXL3_TC)
             uint32_t b0 = 0u, b1 = 0u;
             if (g < nc) {
@@ -679,7 +722,7 @@ __global__ void EXL3_BOUNDS(kMinBlocksMv<K2>) mv_kernel(const KBatch b) {
         if (J.xf != nullptr) x.f = J.xf + warp * J.xf_cs;
         else x.q = (const Q81*) ((const uint8_t*) J.xq + warp * J.xq_cs);
     }
-    block_gemv<K2, cb>(J.tr, J.ld, g * 8, k0, k1, x, J.suh, nc, sm);
+    EXL3_DECODE_INLINE block_gemv<K2, cb>(J.tr, J.ld, g * 8, k0, k1, x, J.suh, nc, sm);
     const float* bias = J.bias != nullptr ? J.bias + g * kCols : nullptr;
     if (J.S == 1) {
         if (warp < nc)

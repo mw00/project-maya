@@ -58,3 +58,4 @@ build-vision.bat
 *.done
 /third_party/*.zip
 
+/data/glm-link-cpu-cal.txt

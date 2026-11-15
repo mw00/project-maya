@@ -56,7 +56,8 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT))   # run as a script (run-<model>.bat) as well as a module
 from serve import ds4_vision, gpu_map, loop_guard, mm3_vision, model_api, model_pull, models, savings  # noqa: E402
-from serve import attach  # noqa: E402
+from serve import attach, mixed_gpus  # noqa: E402
+from serve import glm_link  # noqa: E402  GLM on an AMD APU + an NVIDIA card ("mixed_gpus")
 
 ENGINE_VISION = (ds4_vision.Vision, mm3_vision.Vision)   # the engines that run their vision tower themselves
 from serve.frontend import (CALL_END, CALL_START, MINIMAX_NS, ChatTemplate, Event, OutputParser,  # noqa: E402
@@ -952,7 +953,7 @@ class StrataEngine:
             self._context_cost(log_start)
         # the engine's stdout on a thread, so a request can wait with a timeout (heartbeats, cancel checks)
         self.lines: queue.Queue = queue.Queue()
-        threading.Thread(target=self._pump, daemon=True).start()
+        threading.Thread(target=self._pump, args=(self.proc, self.lines), daemon=True).start()
 
     def _context_cost(self, offset: int):
         """What this start's context costs in VRAM, from the GLM engine's own start lines ("CUDA0 VRAM before the
@@ -997,8 +998,16 @@ class StrataEngine:
         self.ended = True
         wait_gpu_release(self.proc.pid)
 
-    def _pump(self):
-        for line in self.proc.stdout:
+    def _pump(self, proc=None, lines=None):
+        # This start's process and line queue: a later start (restart) has its own.  An engine's output can close
+        # well after a new one started - GLM's link mode: the AMD GPU's helper program shares the lead's output and
+        # ends a little after it - and that late end must not mark the NEW engine ended (every request then started
+        # the engine again, about a minute each)
+        proc = proc if proc is not None else self.proc
+        lines = lines if lines is not None else self.lines
+        for line in proc.stdout:
+            if proc is not self.proc:                   # replaced: what is left of its output is nobody's
+                continue
             if line.startswith("VRAM "):
                 self._vram_line(line)
                 continue
@@ -1011,9 +1020,11 @@ class StrataEngine:
                 continue
             if self.multi and self._route(line):
                 continue
-            self.lines.put(line)
+            lines.put(line)
+        if proc is not self.proc:                       # an engine already replaced: the running one is not ended
+            return
         self.ended = True                               # its output closed: it is gone, even before the OS says so
-        self.lines.put(None)
+        lines.put(None)
         with self._routes_lock:
             for q in self._routes.values():
                 q.put(None)
@@ -1223,6 +1234,9 @@ class StrataEngine:
             sd = tune.get("suffix_draft")   # the DeepSeek engine's prompt lookup beside DSpark: off (0) / on (1)
             if isinstance(sd, int) and not isinstance(sd, bool) and sd in (0, 1):
                 tune_keys += f" suffix_draft={sd}"
+            lt = tune.get("lookup_trust")   # ... (DeepSeek, MiniMax) its trusted rounds without a draft: off / on
+            if isinstance(lt, int) and not isinstance(lt, bool) and lt in (0, 1):
+                tune_keys += f" lookup_trust={lt}"
             ct = tune.get("cpu_threads")   # the GLM engine's CPU lane threads (more: MAYA_GLM_CPU_LANE_MAX)
             if isinstance(ct, int) and not isinstance(ct, bool) and ct > 0:
                 tune_keys += f" cpu_threads={ct}"
@@ -2031,6 +2045,12 @@ def child_env(cfg: dict) -> dict:
     # engine settings the config carries (AMD: the GEMM tuning table), under BOTH names: env_in left the config with the
     # older STRATA_ one, and some of the engines' settings are read by their MAYA_ name alone (issue #686)
     maya_names.export_env(env, cfg.get("env"))
+    # DeepSeek's fast prompt reading (the config's "fast_prefill", the Models page's switch, --fast-prefill on|off):
+    # the long prompt's skip as a per-layer cone in maya-ds4 (DS4_YOCO_CONE).  Opt-in - the same sums, but a kernel's
+    # choice goes by its row count, so the bits (and an answer) can shift slightly; a config without it: the engine's
+    # default (off)
+    if isinstance(cfg.get("fast_prefill"), bool):
+        env["DS4_YOCO_CONE"] = "1" if cfg["fast_prefill"] else "0"
     dirs = [d for d in cfg.get("lib_dirs") or [] if Path(d).is_dir()]
     if dirs:
         var = "PATH" if os.name == "nt" else "LD_LIBRARY_PATH"
@@ -2596,6 +2616,25 @@ class Service:
                     part.close()
             except Exception as e:  # noqa: BLE001 - ending anyway
                 print(f"[maya] stopping {type(part).__name__}: {e}", flush=True)
+
+    def alone_reason(self, sampling: dict, pictures) -> str | None:
+        """Two GPUs (serve/mixed_gpus.py): why this request runs on the AMD GPU alone - None: on both."""
+        if not hasattr(self.engine, "use"):
+            return None
+        if pictures:
+            return "has pictures"
+        if logprobs_asked(sampling) is not None:
+            return "asks for log-probabilities"
+        if sampling.get("ablate", self.sampling_defaults.get("ablate")) is True:
+            return "uses refusal ablation"
+        return None
+
+    def engine_for(self, alone: str | None):
+        """Two GPUs: the engines for this request (the caller holds the FIFO) - see MixedEngine.use."""
+        use = getattr(self.engine, "use", None)
+        if use is not None:
+            with self._engine_start:
+                use(alone)
 
     def ensure_engine(self):
         """The engine running (the caller holds the FIFO): started again after an idle unload, or after it died in an
@@ -3588,6 +3627,7 @@ class Service:
                 if cancel is not None and cancel.is_set():
                     raise ValueError("image preparation was cancelled")
                 self.ensure_engine()                     # (the encoder borrows the engine's memory: it must run)
+                self.engine_for("has pictures")          # (two GPUs: pictures are read on the AMD GPU alone)
                 with self.vision.active():
                     enc = []
                     for kind, src in media:
@@ -4326,6 +4366,7 @@ class Service:
                 if self.vision is not None and self.vision.owed:   # memory an encode borrowed, not back yet
                     self.vision.settle()
                 self.ensure_engine()   # after an idle unload, or issue #27: it died in an earlier request
+                self.engine_for(self.alone_reason(sampling, emb))   # (two GPUs: what runs on the AMD GPU alone)
                 with self.status_lock:
                     self.status.update(busy=True, phase="reading the prompt", prompt_tokens=len(ids), generated=0,
                                        started=time.time(), tool=None, tail="", max_tokens=max_new)
@@ -7153,9 +7194,15 @@ def main() -> int:
     if glm_dsa:
         print(f"[maya] GLM-5.3 (glm-dsa), text only; chat template: {template.dialect.describe()}", flush=True)
     cfg = checked_config_effort(cfg, template, a.engine == "maya")
+    two_gpus = False
     if a.engine == "maya":
         if not cfg:
             ap.error("--engine maya needs --config")
+        # GLM on an AMD APU with an NVIDIA card beside it ("mixed_gpus": true): the card leads, the APU helps
+        # (serve/glm_link.py; a config without the key starts as before)
+        cfg, link_line = glm_link.at_start(cfg)
+        if link_line:
+            print(link_line, flush=True)
         vision = None
         env = child_env(cfg)
         sampling_defaults = sampling_defaults_from_config(cfg)
@@ -7196,8 +7243,14 @@ def main() -> int:
         if len(gpu_list(cfg)) > 1:
             print(f"[maya] layer split across GPUs {gpu_list(cfg)} ({cfg.get('layer_split') or 'auto'})", flush=True)
         t0 = time.time()
-        engine = StrataEngine(cfg["exe"], engine_args(cfg), cwd=cfg.get("cwd"), log=cfg.get("log"), env=engine_env)
+        mixed = mixed_gpus.config_of(cfg)   # (opt-in: an NVIDIA card beside the AMD GPU runs the first layers)
+        if mixed is not None:
+            engine = mixed_gpus.engine_class(StrataEngine, wait_gpu_release)(
+                cfg["exe"], engine_args(cfg), cwd=cfg.get("cwd"), log=cfg.get("log"), env=engine_env, mixed=mixed)
+        else:
+            engine = StrataEngine(cfg["exe"], engine_args(cfg), cwd=cfg.get("cwd"), log=cfg.get("log"), env=engine_env)
         engine.load_s = round(time.time() - t0, 1)      # (the dashboard's estimate of a reload: this start's time)
+        two_gpus = bool(getattr(engine, "mixed_on", False))   # (DeepSeek on both GPUs: serve/mixed_gpus.py)
         warn_tight_ram(engine.info.get("arena_mib"))
         if vision is None and not vcfg and engine.info.get("vision") == "ds4":
             # DeepSeek-V4.1: the engine's own vision tower (the checkpoint's); the server resizes the pictures
@@ -7285,6 +7338,8 @@ def main() -> int:
         from serve import telemetry
         telemetry.HIP_BIN_DIRS = [d for d in cfg.get("lib_dirs") or [] if Path(d).is_dir()]
     svc.model_label = maya_quants.config_label(cfg)     # (configs of every release: by their installer record)
+    if (cfg.get("mixed_gpus_active") or two_gpus) and svc.model_label:   # (the dashboard shows it: both GPUs on)
+        svc.model_label += " · AMD + NVIDIA"
     if a.config:
         svc.config_path = str(Path(a.config).resolve())  # a context change from the dashboard is saved there
         p = Path(svc.config_path)                        # the tokens it serves, and what its API would have charged
