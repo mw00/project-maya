@@ -1,0 +1,207 @@
+{
+  "date": "2026-11-15",
+  "scope": "Historical evidence imported without rerunning; NOT measurements of this standalone PR head.",
+  "development_base_commit": "4d4db8ec8a5b0cc5f18866d26ff7d6cd8956dbd8",
+  "differences_from_pr": [
+    "Prior development base includes NUMA shared CPU pool and dynamic DFlash overlays; PR excludes them.",
+    "Prior opt-in unset disk fallback was 32 GiB; PR reuses the existing 16 GiB SLOT_GB fallback. Explicit environment budgets override either fallback.",
+    "PR adds compiler portability, two default-setting cases and CI wiring."
+  ],
+  "hardware": {
+    "gpu": "4 x RTX 4090",
+    "gpu_power_limit_w": 255,
+    "host_ram_gib": 251.3,
+    "os": "Ubuntu 24.04.4",
+    "cpu_lane_threads": 144
+  },
+  "model": "GLM-5.3-Flash Maya-L; DFlash2 Q4_K_M drafter; Maya v1.1.63",
+  "engine_settings": {
+    "context": 1048576,
+    "parallel": 4,
+    "prefill_chunk": 5120,
+    "layer_split": "12,24,35",
+    "spec": 8
+  },
+  "pre_fix_negative_control": {
+    "source_sha256": "7971e21f44f64c257f33b46e44f132b09af55822af84515d15f80c8f584895af",
+    "passed": 6,
+    "total": 15,
+    "failed": [
+      "lru",
+      "budget",
+      "zero-budget",
+      "ram-pressure",
+      "failed-put",
+      "flush",
+      "reindex",
+      "cli-reindex",
+      "miss"
+    ]
+  },
+  "post_fix_host_regression": {
+    "source_sha256": "624c2348337b8ebd16489dda9c701523405b64f7c12f0a3def51943a4f4b4e35",
+    "passed": 15,
+    "total": 15,
+    "failed": []
+  },
+  "repaired_deployment": {
+    "source_sha256": "624c2348337b8ebd16489dda9c701523405b64f7c12f0a3def51943a4f4b4e35",
+    "binary_sha256": "f4c2ef2a8a720147a05fdbef783b13414f489d01ef0f2e35db0776efd00ce6b1",
+    "linux_cuda_incremental_link_exit": 0,
+    "explicit_budget_gib": {
+      "ram": 80,
+      "disk": 32
+    },
+    "budget_note": "These were explicit deployment overrides, not constants or defaults introduced by this PR.",
+    "smoke_scope": "Five different prompts, return to the first, then edit its beginning; temperature=0, seed=1729, max_tokens=8, thinking off; natural traffic interleaved.",
+    "smoke_requests": [
+      {
+        "name": "cold-1",
+        "prompt_sha256": "7afe9f705639bac71cad938a398b0494c2136ce35465b23a0b406c16558f941c",
+        "output": "OK",
+        "finish_reason": "stop",
+        "usage": {
+          "prompt_tokens": 1470,
+          "completion_tokens": 2,
+          "total_tokens": 1472,
+          "prompt_tokens_details": {
+            "cached_tokens": 0
+          }
+        }
+      },
+      {
+        "name": "cold-2",
+        "prompt_sha256": "6fab6acad85f0c4460a806af9666e5eb57bf6bfe4571536a73effc9cc2d2154c",
+        "output": "OK",
+        "finish_reason": "stop",
+        "usage": {
+          "prompt_tokens": 1471,
+          "completion_tokens": 2,
+          "total_tokens": 1473,
+          "prompt_tokens_details": {
+            "cached_tokens": 0
+          }
+        }
+      },
+      {
+        "name": "cold-3",
+        "prompt_sha256": "17ee09e4458aefd9f44c799e11998338abd3af7e783986130f1822164ce0140f",
+        "output": "OK",
+        "finish_reason": "stop",
+        "usage": {
+          "prompt_tokens": 1471,
+          "completion_tokens": 2,
+          "total_tokens": 1473,
+          "prompt_tokens_details": {
+            "cached_tokens": 0
+          }
+        }
+      },
+      {
+        "name": "cold-4",
+        "prompt_sha256": "2ca7a9112d21f545c00d9195a4c3bb129b6e26a13380fb45999f5ccdbdb2142f",
+        "output": "OK",
+        "finish_reason": "stop",
+        "usage": {
+          "prompt_tokens": 1470,
+          "completion_tokens": 2,
+          "total_tokens": 1472,
+          "prompt_tokens_details": {
+            "cached_tokens": 0
+          }
+        }
+      },
+      {
+        "name": "cold-5",
+        "prompt_sha256": "cd9567eeaee2bc0c55f5d34fe0efb247ec5172af8034f2d72788cf2f21ad872a",
+        "output": "OK",
+        "finish_reason": "stop",
+        "usage": {
+          "prompt_tokens": 1470,
+          "completion_tokens": 2,
+          "total_tokens": 1472,
+          "prompt_tokens_details": {
+            "cached_tokens": 0
+          }
+        }
+      },
+      {
+        "name": "return-first",
+        "prompt_sha256": "7afe9f705639bac71cad938a398b0494c2136ce35465b23a0b406c16558f941c",
+        "output": "OK",
+        "finish_reason": "stop",
+        "usage": {
+          "prompt_tokens": 1470,
+          "completion_tokens": 2,
+          "total_tokens": 1472,
+          "prompt_tokens_details": {
+            "cached_tokens": 1469
+          }
+        }
+      },
+      {
+        "name": "changed-prefix",
+        "prompt_sha256": "085edad252cf8751533fdf3f3b4013842fb84bd79cb7cc22da92252e68c2f568",
+        "output": "OK",
+        "finish_reason": "stop",
+        "usage": {
+          "prompt_tokens": 1470,
+          "completion_tokens": 2,
+          "total_tokens": 1472,
+          "prompt_tokens_details": {
+            "cached_tokens": 0
+          }
+        }
+      }
+    ],
+    "ram_restore_line": "glm slots: took back a 1469-token conversation from RAM (0.0 s); 1 new tokens to read",
+    "negative_miss_line": "glm slots: miss: diverged at token 10",
+    "min_available_ram_gib": 113.5964584350586,
+    "swap_grew": false,
+    "real_model_disk_overflow_or_restart_tested": false
+  },
+  "pre_fix_capacity_observation": {
+    "scope": "Pre-fix prototype; single synthetic return after nine different conversations, not a production average or new PR-head benchmark. Same binary with opt-in off/on.",
+    "binary_sha256": "70607f638e6e6489ea2185298baad833ebb60ae13dd035b875d9baeb98e25cc9",
+    "opt_in_budget_gib": {
+      "ram": 8,
+      "disk": 32
+    },
+    "return_prompt_tokens": 9236,
+    "rows": [
+      {
+        "name": "A:d1_again",
+        "prompt_tokens": 9236,
+        "cached_tokens": 0,
+        "completion_tokens": 8,
+        "ttft_s": 4.48
+      },
+      {
+        "name": "A:edited",
+        "prompt_tokens": 9230,
+        "cached_tokens": 0,
+        "completion_tokens": 8,
+        "ttft_s": 4.412
+      },
+      {
+        "name": "B:d1_again",
+        "prompt_tokens": 9236,
+        "cached_tokens": 9235,
+        "completion_tokens": 8,
+        "ttft_s": 0.202
+      },
+      {
+        "name": "B:edited",
+        "prompt_tokens": 9230,
+        "cached_tokens": 0,
+        "completion_tokens": 8,
+        "ttft_s": 4.639
+      }
+    ],
+    "caveats": [
+      "Five documents did not exceed the four active contexts plus four legacy slots.",
+      "Long-request client times include interleaved production queuing and are not prefill comparisons.",
+      "Return hit RAM; no real-model forced disk spill/restoration or output-parity claim."
+    ]
+  }
+}
