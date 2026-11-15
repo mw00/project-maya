@@ -73,6 +73,15 @@ inline bool repeatable(bool linked) {
     }();
     return env >= 0 ? env == 1 : linked;
 }
+// repeatable answers: the CPU-lane timing the expert splits plan with in powers of two (MAYA_GLM_LANE_STEPS=0:
+// the measured values - a few percent of timing noise between builds then moves experts and the answers' bits)
+inline bool lane_steps() {
+    static const bool on = [] {
+        const char* v = getenv("MAYA_GLM_LANE_STEPS");
+        return v == nullptr || std::atoi(v) != 0;
+    }();
+    return on;
+}
 // the boundaries a tier move or demotion takes before it goes live (0: as soon as its copy is done - timing)
 inline int fixed_moves(bool linked) {
     static const int env = [] {
