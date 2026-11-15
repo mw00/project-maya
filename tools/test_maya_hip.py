@@ -1077,5 +1077,16 @@ class Vs2026Hint(unittest.TestCase):
         self.assertIn("2022", maya.VS2026_HIP_HINT)
 
 
+class UbuntuRocwmmaNote(unittest.TestCase):
+    """#899: Ubuntu's librocwmma-dev lacks the internal/ headers a WMMA build includes - the AMD doc says so and how
+    to build anyway."""
+
+    def test_the_amd_doc_has_the_note(self):
+        text = (Path(maya.__file__).resolve().parent / "docs" / "AMD_MAYA.md").read_text(encoding="utf-8")
+        for words in ("librocwmma-dev", "internal/accessors.hpp", "ROCm/rocWMMA", "CPLUS_INCLUDE_PATH",
+                      "repo.radeon.com"):
+            self.assertIn(words, text)
+
+
 if __name__ == "__main__":
     unittest.main()
