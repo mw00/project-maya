@@ -27,7 +27,10 @@ class BackgroundResponses(ResponseCase):
         with self.request(path="/v1/responses/" + rid + suffix, headers=headers) as response:
             return response.status, json.load(response)
 
-    def wait(self, rid, status=None, timeout=5):
+    def wait(self, rid, status=None, timeout=60):
+        # (returns the moment the state is reached; the bound only ends a wait that never would.  It was 5 s: the
+        # test tokenizer re-decodes every id per token (no token_bytes, unlike the real ones), so the cursor test's
+        # 800 words took 3.6 s of it on an idle PC and ran out on a loaded one)
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             code, out = self.get(rid)
