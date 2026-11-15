@@ -263,7 +263,7 @@ def main() -> int:
                          (model, ", -of-".join(counts)))
     why = next((w for w in map(_ds4.short, gs) if w), None)
     if why:
-        raise SystemExit("%s: not whole (%s) - a download still running?" % (model, why))
+        raise SystemExit("%s: not whole (%s) - GGUF data is missing or truncated" % (model, why))
     sg = None
     if side is not None:
         sg = Gguf(side)
@@ -282,7 +282,8 @@ def main() -> int:
     for fi, g in enumerate(gs + ([sg] if sg else [])):
         for name, typ, dims, off in g.tensors:
             if typ not in TYPES:
-                raise SystemExit("%s: %s has ggml type %d, which the engine does not read" % (g.path.name, name, typ))
+                kind = "NVFP4 (ggml type 40)" if typ == 40 else "ggml type %d" % typ
+                raise SystemExit("%s: %s has %s, which the MiniMax engine does not read" % (g.path.name, name, kind))
             tname, per, bpb = TYPES[typ]
             nel = 1
             for d in dims:

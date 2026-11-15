@@ -18,11 +18,12 @@ HERE = pathlib.Path(__file__).resolve().parent
 PACK = HERE / "mm3" / "pack_gguf.py"
 
 # ggml type -> (values a block, bytes a block)
-BLOCK = {0: (1, 4), 30: (1, 2), 8: (32, 34), 12: (256, 144), 13: (256, 176), 14: (256, 210), 16: (256, 66), 19: (256, 50)}
+BLOCK = {0: (1, 4), 30: (1, 2), 8: (32, 34), 12: (256, 144), 13: (256, 176), 14: (256, 210),
+         16: (256, 66), 19: (256, 50), 40: (64, 36)}
 D, F, FD, E, NL, LEAD, VOCAB = 256, 256, 512, 4, 3, 1, 8
 
 
-def gguf(path: pathlib.Path, kv: dict, tensors: list):
+def gguf(path: pathlib.Path, kv: dict, tensors: list, *, pad_header: bool = True):
     """A GGUF v3 file: kv {key: (type id, value)}, tensors [(name, ggml type, dims ne0 first)], the data a byte pattern
     a tensor (its index), 32-byte aligned."""
     def s(x: str) -> bytes:
@@ -50,14 +51,16 @@ def gguf(path: pathlib.Path, kv: dict, tensors: list):
         datas.append(bytes([i % 251]) * nb)
         off += (nb + 31) // 32 * 32
     head += infos
-    head += b"\0" * ((32 - len(head) % 32) % 32)
+    if pad_header:
+        head += b"\0" * ((32 - len(head) % 32) % 32)
     with path.open("wb") as f:
         f.write(head)
         for d in datas:
             f.write(d + b"\0" * ((32 - len(d) % 32) % 32))
 
 
-def model(root: pathlib.Path, side: bool = True, side_ext: str = ".bin", scales: bool = False) -> pathlib.Path:
+def model(root: pathlib.Path, side: bool = True, side_ext: str = ".bin", scales: bool = False,
+          metadata_only: bool = False) -> pathlib.Path:
     m = root / "MiniMax-M3.1-Flash-Maya-XS"
     m.mkdir()
     a = "minimax-m3."
@@ -98,8 +101,10 @@ def model(root: pathlib.Path, side: bool = True, side_ext: str = ".bin", scales:
                        (L + "ffn_down.weight", 13, [FD, D])]
     tail = [("output_norm.weight", 0, [D]), ("output.weight", 14, [D, VOCAB])]
     half = len(layers) // 2
-    gguf(m / "MiniMax-M3.1-Flash-Maya-XS-00001-of-00002.gguf", kv, t0 + layers[:half])
-    gguf(m / "MiniMax-M3.1-Flash-Maya-XS-00002-of-00002.gguf", {"split.count": (4, 2)}, layers[half:] + tail)
+    gguf(m / "MiniMax-M3.1-Flash-Maya-XS-00001-of-00002.gguf", kv,
+         [] if metadata_only else t0 + layers[:half], pad_header=not metadata_only)
+    gguf(m / "MiniMax-M3.1-Flash-Maya-XS-00002-of-00002.gguf", {"split.count": (4, 2)},
+         t0 + layers + tail if metadata_only else layers[half:] + tail)
     if side:
         ix = [("blk.%d.%s" % (li, n), t, dims) for li in range(LEAD) for n, t, dims in
               (("indexer.q_proj.weight", 8, [D, 256]), ("indexer.k_proj.weight", 8, [D, 128]),
@@ -185,6 +190,51 @@ def tensors(pack: pathlib.Path) -> tuple[list, dict]:
 
 
 class PackGguf(unittest.TestCase):
+    def test_metadata_only_first_shard_needs_no_alignment_padding(self):
+        from tools.ds4.pack_gguf import Gguf, short
+        with tempfile.TemporaryDirectory() as tmp:
+            m = model(pathlib.Path(tmp), metadata_only=True)
+            first = m / "MiniMax-M3.1-Flash-Maya-XS-00001-of-00002.gguf"
+            g = Gguf(first)
+            self.assertEqual(g.tensors, [])
+            self.assertEqual(first.stat().st_size, g.header_end)
+            self.assertLess(g.header_end, g.data_start)
+            self.assertIsNone(short(g))
+            r = run(m, "--text-only")
+            self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
+            files, ts = tensors(m / "maya-mm3")
+            self.assertEqual(ts["language_model.model.embed_tokens.weight"][1], 1)
+            self.assertEqual(files[0], first.name)
+
+    def test_truncated_metadata_string_is_rejected(self):
+        from tools.ds4.pack_gguf import Gguf
+        with tempfile.TemporaryDirectory() as tmp:
+            p = pathlib.Path(tmp) / "metadata.gguf"
+            gguf(p, {"general.architecture": (8, "minimax-m3")}, [], pad_header=False)
+            p.write_bytes(p.read_bytes()[:-1])
+            with self.assertRaisesRegex(SystemExit, "header ends inside a string"):
+                Gguf(p)
+
+    def test_missing_tensor_data_is_still_rejected(self):
+        from tools.ds4.pack_gguf import Gguf, short
+        with tempfile.TemporaryDirectory() as tmp:
+            p = pathlib.Path(tmp) / "tensor.gguf"
+            gguf(p, {"general.architecture": (8, "minimax-m3")}, [("x", 0, [1])])
+            g = Gguf(p)
+            p.write_bytes(p.read_bytes()[:g.data_start + 2])
+            self.assertIsNotNone(short(Gguf(p)))
+
+    def test_nvfp4_is_reported_as_an_unsupported_format(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            m = pathlib.Path(tmp)
+            gguf(m / "model.gguf", {"general.architecture": (8, "minimax-m3"),
+                                     "minimax-m3.expert_count": (4, E), "minimax-m3.block_count": (4, 1)},
+                 [("blk.0.ffn_gate_exps.weight", 40, [D, F, E])])
+            r = run(m, "--text-only")
+            self.assertNotEqual(r.returncode, 0)
+            self.assertIn("NVFP4 (ggml type 40)", r.stderr)
+            self.assertNotIn("download still running", r.stderr)
+
     def test_selected_gguf_companions_and_expert_scales_keep_their_source_offsets(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = pathlib.Path(tmp)

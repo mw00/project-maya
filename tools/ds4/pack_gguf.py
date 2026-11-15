@@ -71,6 +71,7 @@ class Gguf:
                 self.tensors.append((name, typ, dims, off))
             align = int(self.kv.get("general.alignment", 32))
             pos = f.tell()
+            self.header_end = pos
             self.data_start = (pos + align - 1) // align * align
         del self.f
         self._type43(align)
@@ -95,7 +96,10 @@ class Gguf:
 
     def _str(self):
         n = struct.unpack("<Q", self.f.read(8))[0]
-        return self.f.read(n).decode("utf-8", "replace")
+        data = self.f.read(n)
+        if len(data) != n:
+            raise SystemExit("%s: the GGUF header ends inside a string" % self.path)
+        return data.decode("utf-8", "replace")
 
     def _val(self, t):
         fmt = {0: "B", 1: "b", 2: "H", 3: "h", 4: "I", 5: "i", 6: "f", 7: "?", 10: "Q", 11: "q", 12: "d"}
@@ -353,8 +357,9 @@ def split_ple(g: Gguf, kv: dict):
 
 
 def short(g: Gguf):
-    """Why a GGUF file is shorter than its own tensor directory says (a download still running), or None."""
-    need = g.data_start
+    """Why a GGUF file is shorter than its header/tensor directory says, or None."""
+    # A metadata-only first shard has no data section; its trailing alignment padding is optional.
+    need = g.data_start if g.tensors else g.header_end
     for _, typ, dims, off in g.tensors:
         if typ in TYPES:
             _, per, bpb = TYPES[typ]

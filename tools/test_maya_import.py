@@ -159,6 +159,7 @@ class ImportTests(unittest.TestCase):
         vision = self.put("vision/mmproj-test.gguf", b"GGUF vision")
         with patch.object(maya, "gguf_head", side_effect=lambda p: ("glm5-next", 1) if p in (first, other)
                           else ("dflash", 1) if p == draft else ("clip", 1)), \
+                patch.object(maya, "glm_drafter_kind", return_value="dflash2"), \
                 patch.object(maya, "import_catalog", side_effect=AssertionError("catalog consulted")), \
                 patch.object(maya, "choose", side_effect=[0, 1, 3]), \
                 patch.object(maya, "say"), patch.object(maya, "ok"), patch.object(maya, "warn"):
