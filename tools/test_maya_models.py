@@ -205,6 +205,23 @@ class WholeShards(unittest.TestCase):
         self.assertTrue(self.check(whole[:-1]).startswith("short"))
 
 
+class StartFlagsHelp(unittest.TestCase):
+    """#899: `--config X --context 4096` started X with its own context - a start of an installed config uses the
+    settings saved in it.  The help says so (no change in what a start does)."""
+
+    def test_help_says_setup_flags_are_ignored_on_a_start(self):
+        import contextlib
+        import io
+        out = io.StringIO()
+        with patch.object(maya.sys, "argv", ["maya.py", "--help"]), patch.object(maya, "stop_signals"), \
+                contextlib.redirect_stdout(out), self.assertRaises(SystemExit):
+            maya.main()
+        text = " ".join(out.getvalue().split())
+        self.assertIn("setup flags such as --context or --model are ignored then", text)
+        self.assertIn("add --setup to set up again with them", text)
+        self.assertIn("a start of an installed config keeps its own, see --config", text)
+
+
 class RestartAfterUpdate(unittest.TestCase):
     """The dashboard's Update ends the server with UPDATE_EXIT: maya.py starts the new version - the same model and
     settings, no setup flags, no question - and nothing else (no download, no pack)."""

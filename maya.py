@@ -8181,7 +8181,8 @@ def main() -> int:
     ap.add_argument("--gpu", type=int, help="run on this one GPU (CUDA: nvidia-smi; HIP: KFD topology order, on Windows hipInfo's)")
     ap.add_argument("--gpus", help=f"split the model's layers across these GPUs (up to {MAX_GPUS}), e.g. 0,1 or "
                                    "0,1,2,3")
-    ap.add_argument("--context", type=int, help=f"context length in tokens (default {DEFAULT_CONTEXT})")
+    ap.add_argument("--context", type=int, help=f"context length in tokens (default {DEFAULT_CONTEXT}; a setup flag: "
+                                                 "a start of an installed config keeps its own, see --config)")
     ap.add_argument("--parallel", type=int, choices=range(1, 9), metavar="N",
                     help="GLM-5.3-Flash, DeepSeek-V4.1-Flash and MiniMax-M3.1-Flash: answer up to N requests at once "
                          "(1-8, default 1), kept in the config: they are decoded together, more tokens per second in "
@@ -8237,7 +8238,11 @@ def main() -> int:
     ap.add_argument("--no-speed-calibration", action="store_true",
                     help="the same as --drafting on: draft with the drafter without measuring it")
     ap.add_argument("--config", type=Path, help="the installed JSON config to start (its run-maya-<model>.sh does), or "
-                                              "for --bench or --report (default: most recently used)")
+                                              "for --bench or --report (default: most recently used). Starting an "
+                                              "installed config uses the settings saved in it: setup flags such as "
+                                              "--context or --model are ignored then (only the start's own apply: "
+                                              "--port, --host, --api-key, --gpus, and the few written into the config, "
+                                              "such as --parallel); add --setup to set up again with them")
     a = ap.parse_args()
     why = model_option(a)
     if why:
