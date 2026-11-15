@@ -348,7 +348,7 @@
     int* rh_ppos = nullptr;     // (device: row t's one "pick" is row t - pout added to acc through moe_combine)
     float* rh_pone = nullptr;   // (device: weight 1)
     double rh_pwait_ms = 0, rh_phelp_ms = 0;
-    long long rh_pjobs = 0, rh_prows = 0, rh_pall = 0, rh_plate = 0, rh_pback = 0;   // (rh_pback: experts handed back)
+    long long rh_pjobs = 0, rh_prows = 0, rh_pall = 0, rh_plate = 0;
     // DS4_RHELPER_PSHARE (0.45): the share of a chunk's routed rows the helper takes at most (its experts, busiest
     // first); DS4_RHELPER_PMIN (512): fewer rows a chunk - the lead alone
     double rh_pshare = std::getenv("DS4_RHELPER_PSHARE") ? std::atof(std::getenv("DS4_RHELPER_PSHARE")) : 0.45;
@@ -479,16 +479,6 @@
             err = "a helper in another engine: its prompt sums' device address";
             return false;
         }
-        // the experts it handed back (not resident there now): this GPU's own, as if never given away
-        const uint8_t* take = rh_base + rh_off_ptake;
-        std::vector<char> skip;
-        for (int e = 0; e < L0.n_exp; ++e)
-            if (take[e] == 2) {
-                if (skip.empty()) skip.assign(vt.size(), 1);
-                skip[(size_t) L0.vs_pin[e]] = 0;
-                ++rh_pback;
-            }
-        if (!skip.empty() && !rh_p_lead(d, c, L0, l, b, skip, 0, L0.pv_n, T, err)) return false;
         moe_combine(c.acc, y, rh_ppos, rh_pone, T, 1, 0, T, g.dim, d.st);
         return true;
     }
@@ -510,13 +500,10 @@
             err = "DS4_RHELPER_SERVE: its prompt slots";
             return false;
         }
-        uint8_t* take = rh_base + rh_off_ptake;
+        const uint8_t* take = rh_base + rh_off_ptake;
         rh_pvs_h.assign((size_t) ne, l.pv_n);   // (not its: the last slot, never run)
-        // an expert the lead gave it that is not in its resident slots now (its slots under the prompt buffers - the
-        // lead cannot see those): marked 2, the lead computes it itself once this job's sums are in
         for (int e = 0; e < ne; ++e)
             if (take[e] && l.slot[(size_t) e] >= 0 && l.slot[(size_t) e] < l.pv_n) rh_pvs_h[(size_t) e] = l.slot[(size_t) e];
-            else if (take[e]) take[e] = 2, ++rh_pback;
         const double t0 = now_ms();
         CK(cudaMemcpyAsync(rh_pvs, rh_pvs_h.data(), (size_t) ne * 4, cudaMemcpyHostToDevice, s));
         // DS4_RHELPER_PPIECE=N: the rows in pieces of N, each piece's copy in (stream ci) and its sums out (co) beside
@@ -584,10 +571,8 @@
                      (long long) st.cpu_experts);
         if (rh_pjobs > 0)
             std::fprintf(stderr, "ds4: helper engine: %lld prompt jobs, it took %.1f %% of their routed rows, the lead "
-                                 "waited %.1f ms for it (%lld chunks its sums came after this GPU's own; %lld experts "
-                                 "handed back, not resident there)\n", rh_pjobs,
-                         rh_pall > 0 ? 100.0 * (double) rh_prows / (double) rh_pall : 0.0, rh_pwait_ms, rh_plate,
-                         rh_pback);
+                                 "waited %.1f ms for it (%lld chunks its sums came after this GPU's own)\n", rh_pjobs,
+                         rh_pall > 0 ? 100.0 * (double) rh_prows / (double) rh_pall : 0.0, rh_pwait_ms, rh_plate);
         rh_hdr->quit = 1;
         if (helper_flags != nullptr) *(volatile unsigned*) (helper_flags + 2 * kRing) = 1u;
     }
@@ -756,9 +741,8 @@
                 return false;
             }
         }
-        std::fprintf(stderr, "ds4: helper engine: the lead ended after %lld jobs (%lld prompt chunks', %.1f ms a chunk; "
-                             "%lld prompt experts handed back)\n", jobs, pjobs,
-                     pjobs > 0 ? rh_pserve_ms / (double) pjobs : 0.0, rh_pback);
+        std::fprintf(stderr, "ds4: helper engine: the lead ended after %lld jobs (%lld prompt chunks', %.1f ms a chunk)\n", jobs, pjobs,
+                     pjobs > 0 ? rh_pserve_ms / (double) pjobs : 0.0);
         if (rh_timed > 0)
             std::fprintf(stderr, "ds4: helper engine: a job %.3f ms on its GPU (the sums), %.3f ms between jobs (the next "
                                  "request's wait and take), %lld timed\n", rh_comp_ms / rh_timed, rh_gap_ms / rh_timed,
