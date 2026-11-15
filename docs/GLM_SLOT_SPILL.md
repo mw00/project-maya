@@ -44,6 +44,33 @@ python tools/test_glm_slot_spill.py --receipt glm-slot-spill.json
 
 On Windows, run from an MSVC developer shell. On POSIX, the default compiler is `c++`. `--cxx` or `CXX` selects an executable; no local Visual Studio path is hardcoded. The normal GitHub CPU-only workflow also invokes the harness. Fixture cleanup is confined to its fresh temporary directory.
 
+## Standalone branch: real-model disk restoration
+
+On 2026-11-15, the product source at `082464a8b295304d56c796f0b5984057be3eb0b8` completed a Linux/CUDA final link and a separate native GLM-5.3-Flash Maya-L IQ3_S check. This used four RTX 4090s, a 4096-token context, one active sequence, 1024-token prefill chunks, the upstream shared CPU pool (76 threads observed), and no MTP, DFlash or vision. It did not use the development branch's local overlays. Source, executable, tokenizer and driver hashes are in [the model receipt](testing/glm-slot-spill-model.json); the [frozen token inputs](testing/glm-slot-spill-model-inputs.json) are synthetic.
+
+The isolated slot directory started empty. Its RAM cap was deliberately **0.001 GiB** and its disk cap **2 GiB**, so a real 161,738,820-byte state had to spill. These are fixture settings, not deployment defaults. Two model processes handled exactly four requests, with no separate warm-up request:
+
+| Request | Input tokens | Reused tokens | Result |
+|---|---:|---:|---|
+| Process 1: A, cold | 1228 | 0 | 10 output tokens, normal stop |
+| Process 1: B, different prefix | 1228 | 0 | A's `.bin/.meta` present before shutdown |
+| Process 1: A, again | 1228 | 1227 | Native log confirms disk restore; all 10 output token IDs equal the cold result |
+| Process 2: A, after normal exit/restart | 1228 | 1227 | Startup indexes two retained files; disk restore and all 10 output token IDs still match |
+
+Both processes exited normally with code 0. The A output hash, including its stop token, is `a74c111b571bac5749c085badc7bcef748a04c0f45da51c056b9823182da72d7`. An earlier executable-start attempt failed because `libcudart.so.13` was absent from the test process's library search path; it loaded no model and sent no requests. That failure is retained in the receipt. Supplying the existing runtime libraries and checking the exact native command with `--help` preceded the one corrected attempt.
+
+The [executed Linux fixture](../tools/check_glm_slot_spill_model.py) records inputs before sending, preserves native transcripts, and stops on the first mismatch. It is explicitly scoped to four idle GPUs with at least 20 GiB free each, the split `12,24,35`, and this host's 160 GiB expert-RAM ceiling with 32 GiB headroom. It never stops a service; reserve the test resources separately. `--preflight-only` checks imports, frozen inputs, shared libraries and argument parsing without loading a model, and reports occupied GPUs; an actual run requires them to be free. Use a fresh output directory each time:
+
+```sh
+# Supply LD_LIBRARY_PATH if the built executable needs a private CUDA runtime directory.
+python tools/check_glm_slot_spill_model.py \
+  --repo . --exe /path/to/pr-build/maya \
+  --pack /path/to/pack --tokenizer /path/to/pack/tokenizer \
+  --output /path/to/fresh-results --gpus 0,1,2,3
+```
+
+This verifies file-backed state recovery across processes, not cold-SSD latency or power-loss durability: the OS page cache was not dropped. It is one short synthetic pair and one restart, with tiny budgets. It does not replace a multi-agent benchmark, a full quality suite, long-context checks or other decoding modes.
+
 ## Historical evidence reused, not rerun
 
 The following measurements belong to the earlier v1.1.63 development/deployment build, not this standalone PR head. They used a GLM-5.3-Flash Maya-L pack, four RTX 4090s at 255W each, about 251.3GiB host RAM, 144 CPU lanes, four active contexts, a 1M context limit, 5120-token prefill chunks and layer split `12,24,35`. That branch included separate NUMA/shared-pool and dynamic-DFlash changes. [The historical receipt](testing/glm-slot-spill-prior.json) records exact source/binary identities, explicit test budgets, outputs, and version differences.
@@ -62,6 +89,6 @@ The standalone branch deliberately reuses the existing 16GiB disk fallback inste
 
 ## What remains unverified
 
-No connection to the model host, model load, inference request, benchmark, or production change was performed to prepare this PR. There is no new `tools/agent_bench.py` comparison, decode/prefill throughput claim, full quality suite, exact PR-head token-parity measurement, or PR-head CUDA link. No local WSL was started.
+The initial PR preparation used host checks only. The later isolated check above adds a CUDA link, real-model disk spill/restart and exact output-token equality for the stated input and configuration. There is still no new `tools/agent_bench.py` comparison, decode/prefill throughput claim, or full quality suite. No local WSL was started.
 
-The historical model smoke hit RAM and did not force disk overflow, restart and real-model disk restoration. Full-budget memory pressure, crash recovery, and production-wide multi-agent hit rate/latency remain unmeasured. Host byte tests cover policy and persistence ordering, not those model-level boundaries. The existing deployment was left running while the standalone PR was prepared.
+The historical model smoke hit RAM; the later isolated check supplies the separately identified disk evidence. Full-budget memory pressure, crash recovery, long-context and speculative-decoding parity, and production-wide multi-agent hit rate/latency remain unmeasured. Host byte tests cover policy and persistence ordering, not those remaining model-level boundaries.
