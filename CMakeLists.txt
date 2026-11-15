@@ -337,6 +337,14 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/env_switch_test.cpp")
   target_link_libraries(env_switch_test PRIVATE strata_warnings)
   add_test(NAME env_switch_test COMMAND env_switch_test)
 endif()
+# the drafting decode's stall report (include/strata/platform/stall_watch.hpp, #860); host code only
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/stall_watch_test.cpp")
+  add_executable(stall_watch_test EXCLUDE_FROM_ALL tests/stall_watch_test.cpp)
+  target_include_directories(stall_watch_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+  find_package(Threads REQUIRED)
+  target_link_libraries(stall_watch_test PRIVATE strata_warnings Threads::Threads)
+  add_test(NAME stall_watch_test COMMAND stall_watch_test)
+endif()
 
 # ---- idle_gate_test --------------------------------------------------------
 # The gate an idle engine's service threads sleep on, and a request's line wakes (strata/platform/idle_gate.hpp):

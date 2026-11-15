@@ -39,6 +39,7 @@
 #include "strata/kernels/cpu/exl3_ref.hpp"
 #include "strata/platform/env_switch.hpp"
 #include "strata/platform/idle_gate.hpp"
+#include "strata/platform/stall_watch.hpp"   // #860: the drafting decode's stall report
 
 #include "ggml.h"
 
@@ -1169,6 +1170,15 @@ bool Glm5Model::fast_setup(std::string& err) {
     F->resp_h = (gf::MoeResponse*) hp;
     cudaHostGetDevicePointer(&dp, hp, 0);
     F->md.resp = dp;
+    // the stall report's view of the device's given-up waits (#860); without it the waits only stay unreported
+    if (cudaHostAlloc((void**) &F->wait_diag_h, 8 * sizeof(unsigned int), cudaHostAllocMapped) == cudaSuccess) {
+        std::memset(F->wait_diag_h, 0, 8 * sizeof(unsigned int));
+        void* wd = nullptr;
+        if (cudaHostGetDevicePointer(&wd, F->wait_diag_h, 0) == cudaSuccess) F->md.wait_diag = (unsigned int*) wd;
+    } else {
+        cudaGetLastError();
+        F->wait_diag_h = nullptr;
+    }
     if (cudaHostAlloc((void**) &F->emb_h, (size_t) E * sizeof(float), cudaHostAllocDefault) != cudaSuccess ||
         cudaHostAlloc((void**) &F->hop_h, glmres::res_hop_bytes(g), cudaHostAllocDefault) != cudaSuccess ||
         cudaHostAlloc((void**) &F->tok_h, 64, cudaHostAllocDefault) != cudaSuccess) {
@@ -4686,6 +4696,7 @@ void Glm5Model::fast_destroy() {
     if (F->upd_val_d) cudaFree(F->upd_val_d);
     if (F->ring_h) cudaFreeHost(F->ring_h);
     if (F->resp_h) cudaFreeHost(F->resp_h);
+    if (F->wait_diag_h) cudaFreeHost(F->wait_diag_h);
     if (F->md.route_err_d) cudaFree(F->md.route_err_d);
     if (F->emb_h) cudaFreeHost(F->emb_h);
     if (F->hop_h) cudaFreeHost(F->hop_h);
@@ -5016,6 +5027,7 @@ void Glm5Model::fast_service() {
                 F->processed.fetch_add((uint64_t) (sq - next), std::memory_order_release);
                 next = sq;
             } else {
+                F->svc_phase.store(0, std::memory_order_relaxed);
 #if defined(_WIN32) && defined(STRATA_USE_HIP)
                 // Windows' HIP runtime submits queued launches only when the host waits on the GPU (Linux submits
                 // each): a route the main thread queued can sit there while this thread waits for it.  After 1 ms
@@ -5067,6 +5079,8 @@ void Glm5Model::fast_service() {
             last_route = std::chrono::steady_clock::now();
         }
         std::atomic_thread_fence(std::memory_order_acquire);
+        F->svc_next.store(next, std::memory_order_relaxed);   // (the stall report's view of this thread)
+        F->svc_phase.store(1, std::memory_order_relaxed);
         // MAYA_GLM_PF_CE: this route's prefetch copies first, on the copy engine, then its seq into the flag on the
         // same stream (the flag lands after the experts; the next layer waits for it)
         if (F->pf_ce && rq->error == 0 && rq->pf_n > 0 && rq->layer + 1 < (int) F->layer_rc.size() &&
@@ -5407,6 +5421,7 @@ void Glm5Model::fast_service() {
             continue;
         }
         if (rq->cpu_mask != 0u && F->cpu_ans_h != nullptr) {
+            F->svc_phase.store(2, std::memory_order_relaxed);
             const auto t0 = std::chrono::steady_clock::now();
             const unsigned int cm = rq->cpu_mask;
             int ne = 0;
@@ -7832,6 +7847,40 @@ bool Glm5Model::decode_spec(strata::kernels::SamplerParams& sp, int64_t max_new,
     Glm5Model* hl = spec_head_last();
     Glm5Model* B = hl->split_next_.get();     // the tail group's first part (spec_tail runs from it)
     Glm5Model* TL = spec_tail_last();         // its last: the token, the logits and the draft block live there
+    // #860: a step that stalls past MAYA_GLM_STALL_S seconds (20; 0 = off) says on stderr where each part of the split
+    // is - the device's given-up waits for the host, the service thread's routes and what it does.  Two atomic stores a
+    // phase and a watcher thread that wakes once a second; nothing the decode computes changes
+    strata::platform::StallWatch stall(strata::platform::stall_limit_s(), [this](const char* phase, double sec) {
+        static const char* const svc[3] = {"waiting for a route", "on a route", "in its CPU lane"};
+        static const char* const kinds[6] = {"-", "a route's answer", "the CPU lane's answer", "a deferred CPU answer",
+                                             "a rows step's CPU answer", "a route's answer (wait+fetch)"};
+        std::string line = "glm stall: a drafting step has run " + std::to_string((int) sec) + " s (" + phase + ")";
+        for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
+            FastState* Fm = m->fast_;
+            if (Fm == nullptr) continue;
+            const unsigned int done = Fm->svc_next.load(std::memory_order_relaxed);
+            const int ph = std::min(2, std::max(0, Fm->svc_phase.load(std::memory_order_relaxed)));
+            unsigned int posted = 0u;
+            if (Fm->ring_h != nullptr)
+                posted = ((volatile const gf::MoeRequest*) gf::ring_entry(Fm->ring_h, done + 1u, Fm->md.ring_n,
+                                                                          Fm->md.ring_stride))->seq;
+            const volatile unsigned int* wd = Fm->wait_diag_h;
+            const unsigned int gave = wd != nullptr ? wd[0] : 0u, kind = wd != nullptr ? std::min(5u, (unsigned int) wd[1]) : 0u;
+            char b[400];
+            std::snprintf(b, sizeof(b),
+                          " | CUDA%d layers [%d,%d): the service thread took route %u and is %s; the next entry is "
+                          "%s; routes %llu issued, %llu served; the device gave up %u wait(s) for the host",
+                          m->dev_, m->l0_, m->l1_, done, svc[ph],
+                          posted == done + 1u ? "posted, not taken yet" : "not posted", (unsigned long long) Fm->expected,
+                          (unsigned long long) Fm->processed.load(std::memory_order_relaxed), gave);
+            line += b;
+            if (gave > 0u) {
+                std::snprintf(b, sizeof(b), " (the last: %s, wanted seq %u, saw %u)", kinds[kind], wd[2], wd[3]);
+                line += b;
+            }
+        }
+        std::fprintf(stderr, "%s - MAYA_GLM_STALL_S=0 turns this line off\n", line.c_str());
+    });
     const Glm5Geometry& g = g_;
     for (Glm5Model* m = this; m != hl->split_next_.get(); m = m->split_next_.get()) {
         if (m->spec_hop_h_[0] == nullptr) {
@@ -7992,10 +8041,13 @@ bool Glm5Model::decode_spec(strata::kernels::SamplerParams& sp, int64_t max_new,
     vocab_note(y);
     if (!emit(y) || produced >= max_new || q + 2 >= max_ctx_) return true;
     int d = -1;
+    stall.step("the first draft");
     if (!draft(q, y, d)) return false;
     d = ng.pick(d);   // glm-dsa B14.13
     // the head: position q+1 with the confirmed token, then q+2 with the draft (states saved first)
+    stall.phase("the head's first position");
     if (!spec_head(q + 1, y, err)) return false;
+    stall.phase("the tail's first position");
     if (!B->spec_tail(hl, q + 1, err)) return false;
     cudaSetDevice(dev_);
     if (!kda_all(false)) {
@@ -8003,6 +8055,7 @@ bool Glm5Model::decode_spec(strata::kernels::SamplerParams& sp, int64_t max_new,
         return false;
     }
     if (cancel) fast_->spec_cancellable = true;   // q+2 with the draft: speculative
+    stall.phase("the head's speculative position");
     if (!spec_head(q + 2, d, err)) return false;
     bool ok = true;
     // glm-dsa B11.2 (speed): MAYA_GLM_SPEC_DRAFT_EARLY=1 takes the NextN draft off the tail's critical path - the
@@ -8043,6 +8096,7 @@ bool Glm5Model::decode_spec(strata::kernels::SamplerParams& sp, int64_t max_new,
         // (1) the tail's token for position q+1 -> y (the truth for position q+2)
         int y2 = -1;
         lap(5);
+        stall.step("the tail's token");
         if (!take(y2)) { ok = false; break; }
         lapn(0, early ? 2 : 1);
         ++produced;
@@ -8063,10 +8117,12 @@ bool Glm5Model::decode_spec(strata::kernels::SamplerParams& sp, int64_t max_new,
                 *(volatile int*) fast_->spec_live_h = 0;
                 std::atomic_thread_fence(std::memory_order_seq_cst);
                 kda_all(true);
+                stall.phase("the head's redo");
                 if (!spec_head(q + 2, y2, err)) { ok = false; break; }
                 lap(2);
             }
             // (2) the draft for q+3 from (h_{q+1}, y2), made and waited for
+            stall.phase("the draft");
             if (!draft(q + 1, y2, d2)) { ok = false; break; }
             d2 = draft_ok(ng.pick(d2), y2);   // glm-dsa B14.13 (off: the NextN draft, untouched)
             lap(1);
@@ -8076,10 +8132,12 @@ bool Glm5Model::decode_spec(strata::kernels::SamplerParams& sp, int64_t max_new,
                 ++spec_hits_;
             } else if (!cancel) {
                 kda_all(true);
+                stall.phase("the head's redo");
                 if (!spec_head(q + 2, y2, err)) { ok = false; break; }
             }
             lap(2);
             // (4) the tail's next position goes in first (it waits for the head's hop on the device)
+            stall.phase("the tail's next position");
             if (!B->spec_tail(hl, q + 2, err)) { ok = false; break; }
             lap(3);
             kda_all(false);
@@ -8098,6 +8156,7 @@ bool Glm5Model::decode_spec(strata::kernels::SamplerParams& sp, int64_t max_new,
                 } else {
                     kda_all(true);
                 }
+                stall.phase("the head's redo");
                 if (!spec_head(q + 2, y2, err)) { ok = false; break; }
                 lap(2);
             }
@@ -8109,6 +8168,7 @@ bool Glm5Model::decode_spec(strata::kernels::SamplerParams& sp, int64_t max_new,
             if (!TL->fast_mtp(dp, y2, err)) { ok = false; break; }
             // (4) the tail's next position goes in first: it waits for the head's hop on the device and starts its
             //     layers while the host waits for the draft (and the head group's next enqueue)
+            stall.phase("the tail's next position");
             if (!B->spec_tail(hl, q + 2, err)) { ok = false; break; }
             lap(3);
             kda_all(false);
@@ -8125,6 +8185,7 @@ bool Glm5Model::decode_spec(strata::kernels::SamplerParams& sp, int64_t max_new,
         }
         // (5) the head's next speculative position (its boundary waits for the head's current one)
         cudaSetDevice(dev_);
+        stall.phase("the head's next position");
         if (!spec_head(q + 3, d2, err)) { ok = false; break; }
         lap(4);
         ++np;
@@ -8132,6 +8193,7 @@ bool Glm5Model::decode_spec(strata::kernels::SamplerParams& sp, int64_t max_new,
         ++q;
         d = d2;
     }
+    stall.phase("the drain");
     // drain: both devices idle; the head may stand one or two positions past the tail - a request after this one
     // restores its snapshot or resets, so nothing else reads that state
     for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
