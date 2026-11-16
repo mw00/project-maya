@@ -11,6 +11,7 @@
 #include <cstring>
 
 #include "mm3_kernels.cuh"
+#include "mm3_gguf.cuh"
 
 namespace mm3 {
 namespace x3 = strata::mm3::exl3;
@@ -85,6 +86,7 @@ struct Draft::Impl {
         const uint8_t *w = nullptr, *s = nullptr;
         int N = 0, K = 0;
         bool bf16 = false;
+        x3::Mat gg;
     };
     struct L {
         MX q, k, v, o, g, u, d;
@@ -93,6 +95,7 @@ struct Draft::Impl {
     };
     std::vector<L> L;
     uint16_t *fc = nullptr, *w1 = nullptr, *w2 = nullptr;
+    MX fc_q, w1_q, w2_q;
     // fc's GEMMs in FP16 instead of BF16 where the GPU has no BF16 tensor cores (CUDA before sm_80: cuBLAS took a
     // generic kernel there, ~1.2 ms a tap on a V100) - fc converted once at the load when every value fits FP16
     bool fc16 = false;
@@ -105,6 +108,7 @@ struct Draft::Impl {
     float *ao = nullptr, *gt = nullptr, *up = nullptr, *hid = nullptr, *logit = nullptr, *bias = nullptr;
     float *embf = nullptr, *conf = nullptr;
     float* mxpart = nullptr;   // mx_rows' split partials
+    float* qtmp = nullptr;     // Q8_0's small-row products before residual addition
     uint16_t *x16 = nullptr, *hid16 = nullptr, *embb = nullptr;
     int *pos = nullptr, *lo = nullptr, *prev = nullptr, *out = nullptr;
     int* host = nullptr;   // pinned: drafts then confidences
@@ -174,6 +178,16 @@ struct Draft::Impl {
     // an MXFP8 matrix [N][K] on the device as it is stored (mx_rows reads it)
     bool mx(const Pack& pk, const std::string& pre, int N, int K, MX& m, std::string& err) {
         const Tensor* w = pk.get(pre + ".weight");
+        if (w && w->dtype == "Q8_0" && K % 32 == 0 &&
+            w->shape == std::vector<int64_t>{N, K} && w->bytes == (uint64_t) N * (K / 32) * 34) {
+            uint8_t* raw = nullptr;
+            if (!alloc(raw, w->bytes, err)) return false;
+            DK(cudaMemcpy(raw, pk.data(*w), w->bytes, cudaMemcpyHostToDevice));
+            m.w = raw; m.N = N; m.K = K;
+            m.gg.fmt = gg::kFmtGG; m.gg.gg_type = 8; m.gg.raw = raw; m.gg.n = N; m.gg.k = K;
+            m.gg.ld = (int) gg::row_bytes(8, K);
+            return true;
+        }
         if (w && w->dtype == "BF16" && w->bytes == (uint64_t) N * K * 2) {
             uint16_t* raw = nullptr;
             if (!bf16(pk, pre + ".weight", raw, (size_t) N * K, err)) return false;
@@ -198,6 +212,21 @@ struct Draft::Impl {
     }
     // C [rows][N] F32 = X [rows][K] F32 . W^T (+ beta C), W MXFP8
     bool mxg(const MX& m, const float* X, int rows, int ldx, float* C, int ldc, float beta, std::string& err) {
+        if (m.gg.fmt == gg::kFmtGG) {
+            if (rows <= x3::kMaxMvCols) {
+                x3::MvJob j;
+                j.m = &m.gg; j.xf = X; j.xf_cs = ldx; j.ncol = rows;
+                j.y = beta == 0.0f ? C : qtmp; j.y_cs = beta == 0.0f ? ldc : m.N;
+                if (beta != 0.0f && beta != 1.0f) { err = "dspark: unsupported residual scale"; return false; }
+                if (!gg::mv(&j, 1, s)) { err = "dspark: Q8_0 matrix/vector product"; return false; }
+                if (beta != 0.0f)
+                    for (int r = 0; r < rows; ++r) k::add(C + (size_t) r * ldc, qtmp + (size_t) r * m.N, m.N, s);
+            } else {
+                k::to_f16(X, rows, m.K, ldx, x16, m.K, s);
+                gg::gemm_rows(m.gg, x16, m.K, rows, C, ldc, beta, s);
+            }
+            return true;
+        }
         if (m.bf16) {
             k::to_bf16(X, rows, m.K, ldx, x16, m.K, s);
             return gemm((const uint16_t*) m.w, m.N, m.K, m.K, x16, rows, m.K, C, ldc, beta, err);
@@ -277,11 +306,20 @@ struct Draft::Impl {
         const int D = g.dim, Q = g.n_head * g.hd, KV = g.n_kv * g.hd, F = g.ff, V = g.vocab, R = g.rank;
         const int NT = (int) g.taps.size();
         const float norm_add = pk.num("dspark.norms_plus_one", 0) != 0 ? 0.0f : 1.0f;
-        if (!bf16(pk, DP + "fc.weight", fc, (size_t) D * NT * D, err) ||
-            !vec(pk, DP + "hidden_norm.weight", norm_add, hid1, (size_t) D, err) ||
+        const auto quant = [&](const std::string& pre) {
+            const Tensor* t = pk.get(pre + ".weight"); return t && t->dtype == "Q8_0";
+        };
+        if (quant(DP + "fc")) {
+            if (!mx(pk, DP + "fc", D, NT * D, fc_q, err)) return false;
+        } else if (!bf16(pk, DP + "fc.weight", fc, (size_t) D * NT * D, err)) return false;
+        if (quant(DP + "markov_head.markov_w1")) {
+            if (!mx(pk, DP + "markov_head.markov_w1", V, R, w1_q, err)) return false;
+        } else if (!bf16(pk, DP + "markov_head.markov_w1.weight", w1, (size_t) V * R, err)) return false;
+        if (quant(DP + "markov_head.markov_w2")) {
+            if (!mx(pk, DP + "markov_head.markov_w2", V, R, w2_q, err)) return false;
+        } else if (!bf16(pk, DP + "markov_head.markov_w2.weight", w2, (size_t) V * R, err)) return false;
+        if (!vec(pk, DP + "hidden_norm.weight", norm_add, hid1, (size_t) D, err) ||
             !vec(pk, DP + "final_norm.weight", norm_add, fin1, (size_t) D, err) ||
-            !bf16(pk, DP + "markov_head.markov_w1.weight", w1, (size_t) V * R, err) ||
-            !bf16(pk, DP + "markov_head.markov_w2.weight", w2, (size_t) V * R, err) ||
             !vec(pk, DP + "confidence_head.proj.weight", 0.0f, cw, (size_t) D + R, err) ||
             !vec(pk, DP + "confidence_head.proj.bias", 0.0f, cb, 1, err))
             return false;
@@ -289,7 +327,7 @@ struct Draft::Impl {
         {   // (fc in FP16 where BF16 has no tensor cores; MAYA_MM3_DSPARK_FC16=0 keeps BF16 everywhere)
             cudaDeviceProp pr{};
             const char* fv = std::getenv("MAYA_MM3_DSPARK_FC16");
-            if ((fv == nullptr || std::atoi(fv) != 0) && cudaGetDeviceProperties(&pr, dev) == cudaSuccess &&
+            if (fc && (fv == nullptr || std::atoi(fv) != 0) && cudaGetDeviceProperties(&pr, dev) == cudaSuccess &&
                 pr.major < 8) {
                 const size_t n = (size_t) D * NT * D;
                 uint16_t* h = nullptr;
@@ -327,6 +365,7 @@ struct Draft::Impl {
         k::rope_inv_freq(g.theta, g.n_rot, inv_h.data());
         const int Rw = max_rows, B = g.block;
         if (!alloc(mxpart, (size_t) 16 * 16 * std::max(D, std::max(Q, F)), err)) return false;
+        if (!alloc(qtmp, (size_t) x3::kMaxMvCols * std::max(D, std::max(Q, F)), err)) return false;
         if (!alloc(apart, k::attn_part_floats(B, g.n_kv, kSplits), err) || !alloc(mkpart, k::markov_part_floats(), err))
             return false;
         if (!alloc(inv, inv_h.size(), err) || !alloc(ctx, (size_t) Rw * D, err) || !alloc(xn, (size_t) Rw * D, err) ||
@@ -375,6 +414,12 @@ struct Draft::Impl {
     bool context_tap(int j, const float* rows, int n, std::string& err) {
         const int D = g.dim, NT = (int) g.taps.size();
         cudaSetDevice(dev);
+        if (fc_q.gg.raw) {
+            MX view = fc_q;
+            view.K = view.gg.k = D;
+            view.gg.raw = fc_q.w + gg::row_bytes(8, (int64_t) j * D);
+            return mxg(view, rows, n, D, ctx, D, j == 0 ? 0.0f : 1.0f, err);
+        }
         if (fc16) k::to_f16(rows, n, D, D, x16, D, s);
         else k::to_bf16(rows, n, D, D, x16, D, s);
         return gemm(fc + (size_t) j * D, D, D, NT * D, x16, n, D, ctx, D, j == 0 ? 0.0f : 1.0f, err, fc16);
@@ -445,13 +490,19 @@ struct Draft::Impl {
         for (int i = 0; i < n; ++i) {
             // (greedy: the bias, the argmax and the confidence in two kernels - else the gathered row, the BLAS GEMV
             //  and markov_pick / markov_sample)
-            if (!sa && k::markov_greedy(logit + (size_t) i * V, w2, w1, V, R, prev, out + i, cw, cb, hid + (size_t) i * D,
+            if (!w1_q.gg.raw && !w2_q.gg.raw && !sa && k::markov_greedy(logit + (size_t) i * V, w2, w1, V, R, prev, out + i, cw, cb, hid + (size_t) i * D,
                                         D, conf + i, mkpart, nullptr, s))
                 continue;
-            k::gather_row(w1, R, prev, embb, embf, s);
+            if (w1_q.gg.raw) {
+                if (!gg::gather_q8_row(w1_q.gg, prev, embb, embf, s)) { err = "dspark: Q8_0 Markov gather"; return false; }
+            } else k::gather_row(w1, R, prev, embb, embf, s);
             const float one = 1.0f, zero = 0.0f;
-            DB(cublasGemmEx(blas, CUBLAS_OP_T, CUBLAS_OP_N, V, 1, R, &one, w2, CUDA_R_16BF, R, embb, CUDA_R_16BF, R,
-                            &zero, bias, CUDA_R_32F, V, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
+            if (w2_q.gg.raw) {
+                if (!mxg(w2_q, embf, 1, R, bias, V, 0.0f, err)) return false;
+            } else {
+                DB(cublasGemmEx(blas, CUBLAS_OP_T, CUBLAS_OP_N, V, 1, R, &one, w2, CUDA_R_16BF, R, embb, CUDA_R_16BF, R,
+                                &zero, bias, CUDA_R_32F, V, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
+            }
             if (sa) {
                 k::SampleArgs a = *sa;
                 a.u = u[i];
@@ -522,16 +573,18 @@ size_t Draft::plan_bytes(const Pack& pk, int max_rows) {
     const size_t Rw = (size_t) std::max(max_rows, 8), M = std::max(D, std::max(Q, F));
     const auto mx = [&](const std::string& name, size_t N, size_t K) {
         const Tensor* t = pk.get(name + ".weight");
+        if (t && t->dtype == "Q8_0") return (size_t) t->bytes;
         return t && t->dtype == "BF16" ? N * K * 2 : N * K + N * (K / 32);
     };
-    size_t b = D * NT * D * 2 + 2 * D * 4 + 2 * V * R * 2 + (D + R) * 4 + 4;   // fc, the norms, Markov, confidence
+    size_t b = mx(DP + "fc", D, NT * D) + 2 * D * 4 + mx(DP + "markov_head.markov_w1", V, R) +
+               mx(DP + "markov_head.markov_w2", V, R) + (D + R) * 4 + 4;
     for (size_t i = 0; i < NL; ++i) {
         const std::string p = DP + "layers." + std::to_string(i) + ".decoder_layer.";
         b += mx(p + "self_attn.q_proj", Q, D) + mx(p + "self_attn.k_proj", KV, D) + mx(p + "self_attn.v_proj", KV, D) +
              mx(p + "self_attn.o_proj", D, Q) + mx(p + "mlp.gate_proj", F, D) + mx(p + "mlp.up_proj", F, D) +
              mx(p + "mlp.down_proj", D, F) + 2 * D * 4 + 2 * hd * 4 + 2 * ring * KV * 2;
     }
-    b += 16 * 16 * M * 4 + k::attn_part_floats((int) B, (int) (KV / hd), Impl::kSplits) * 4 +
+    b += (16 * 16 + x3::kMaxMvCols) * M * 4 + k::attn_part_floats((int) B, (int) (KV / hd), Impl::kSplits) * 4 +
          k::markov_part_floats() * 4 + n_rot / 2 * 4;
     b += (2 * Rw * D + B * D + B * Q + 2 * Rw * KV + B * Q + B * D + 2 * B * F + B * D + B * V + V + R + B) * 4;
     b += (Rw * M + B * D + R) * 2 + (Rw + B + 1 + B) * 4 + D * 4;               // x16 hid16 embb, the ints, maskf

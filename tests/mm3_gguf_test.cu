@@ -15,6 +15,8 @@
 #include "../src/mm3/mm3_gguf.cuh"
 #include "../src/mm3/mm3_gguf_host.hpp"
 #include "../src/mm3/mm3_gv.cuh"
+#include "../src/mm3/mm3_dspark.hpp"
+#include "../src/mm3/mm3_pack.hpp"
 #include "../src/ds4/ds4_iq.cuh"
 
 #include "ggml.h"   // (the reference values: ggml's own dequantize_row_*)
@@ -452,6 +454,132 @@ void test_dense(cudaStream_t s) {
     }
 }
 
+// DSpark's context projection uses column slices of a wide Q8_0 matrix, keeping its original row stride.
+void test_q8_draft(cudaStream_t s) {
+    const int k = 512, nt = 5, full = k * nt, n = 93;
+    const auto w = q_rand(iq::kQ8_0, n, full);
+    const auto values = deq(iq::kQ8_0, w, (size_t) n * full);
+    uint8_t* dw = dev(w);
+    for (int tap : {0, 2, 4}) {
+        x3::Mat m;
+        m.fmt = gg::kFmtGG; m.gg_type = iq::kQ8_0; m.k = k; m.n = n;
+        m.ld = (int) iq::row_bytes(iq::kQ8_0, full);
+        m.raw = dw + iq::row_bytes(iq::kQ8_0, tap * k);
+        for (int rows : {3, 33}) {
+            std::vector<float> x((size_t) rows * k);
+            for (auto& v : x) v = frand();
+            std::vector<uint16_t> xh(x.size());
+            for (size_t i = 0; i < x.size(); ++i) xh[i] = f2h(x[i]);
+            float *dx = dev(x), *dy = dev(std::vector<float>((size_t) rows * n));
+            uint16_t* dh = dev(xh);
+            if (rows <= x3::kMaxMvCols) {
+                x3::MvJob j;
+                j.m = &m; j.xf = dx; j.xf_cs = k; j.y = dy; j.y_cs = n; j.ncol = rows;
+                if (!x3::mv(&j, 1, s)) ++g_fail;
+            } else x3::gemm_rows(m, dh, k, rows, dy, n, 0.0f, s);
+            CU(cudaStreamSynchronize(s));
+            const auto y = host(dy, (size_t) rows * n);
+            std::vector<double> ref(y.size());
+            for (int r = 0; r < rows; ++r) {
+                const auto xr = q8_round(x.data() + (size_t) r * k, k);
+                for (int c = 0; c < n; ++c)
+                    for (int i = 0; i < k; ++i) {
+                        const float v = values[(size_t) c * full + tap * k + i];
+                        ref[(size_t) r * n + c] += rows <= x3::kMaxMvCols ? (double) v * xr[i] :
+                            (double) f16r(v) * h2f(xh[(size_t) r * k + i]);
+                    }
+            }
+            char what[96];
+            std::snprintf(what, sizeof what, "Q8_0 DSpark fc slice %d, %d rows", tap, rows);
+            expect(what, y.data(), ref.data(), ref.size(), rows <= x3::kMaxMvCols ? 2e-5 : 1e-4);
+            cudaFree(dx), cudaFree(dy), cudaFree(dh);
+        }
+        for (int index : {0, 41, 92}) {
+            int* di = dev(std::vector<int>{index});
+            float* df = dev(std::vector<float>(k));
+            uint16_t* db = dev(std::vector<uint16_t>(k));
+            if (!gg::gather_q8_row(m, di, db, df, s)) ++g_fail;
+            CU(cudaStreamSynchronize(s));
+            const auto f = host(df, k);
+            const auto b = host(db, k);
+            bool ok = true;
+            for (int i = 0; i < k; ++i) {
+                const float v = values[(size_t) index * full + tap * k + i];
+                const auto bf = ggml_fp32_to_bf16(v);
+                uint16_t bits;
+                std::memcpy(&bits, &bf, 2);
+                ok = ok && f[i] == v && b[i] == bits;
+            }
+            if (!ok) ++g_fail;
+            std::printf("Q8_0 Markov row %d slice %d = ggml: %s\n", index, tap, ok ? "exact" : "FAIL");
+            cudaFree(di), cudaFree(df), cudaFree(db);
+        }
+    }
+    cudaFree(dw);
+}
+
+// A synthetic small pack also exercises proposals; real packs check loading and context ingestion without a target.
+void test_draft_pack(const char* path, cudaStream_t s, bool with_head) {
+    mm3::Pack pk;
+    std::string err;
+    if (!pk.load(path, err)) { std::printf("FAIL draft pack: %s\n", err.c_str()); ++g_fail; return; }
+    const int D = (int) pk.num("hidden_size"), V = (int) pk.num("vocab_size");
+    const bool small = (int64_t) D * V <= 1024 * 1024;
+    float* head = small ? dev(std::vector<float>((size_t) D * V)) : nullptr;
+    x3::Mat hm;
+    hm.fmt = gg::kFmtGG; hm.gg_type = gg::kF32; hm.k = D; hm.n = V; hm.raw = head;
+    if (!small && with_head) {
+        const auto* t = pk.get("language_model.lm_head.weight");
+        if (!t || !gg::dense_type(gg::type_of(t->dtype))) { ++g_fail; return; }
+        CU(cudaMalloc(&head, t->bytes));
+        CU(cudaMemcpy(head, pk.data(*t), t->bytes, cudaMemcpyHostToDevice));
+        hm.gg_type = gg::type_of(t->dtype); hm.raw = head;
+    }
+    cublasHandle_t blas;
+    if (cublasCreate(&blas) != CUBLAS_STATUS_SUCCESS) { ++g_fail; cudaFree(head); return; }
+    cublasSetStream(blas, s);
+    {
+        mm3::Draft draft;
+        const auto* et = pk.get("language_model.model.embed_tokens.weight");
+        draft.set_emb_rows([D, et, &pk](int id, uint16_t* dst) {
+            std::vector<float> row(D, 0.0f);
+            if (et && !gg::host_row(et->dtype, pk.data(*et), D, id, row.data())) ++g_fail;
+            for (int i = 0; i < D; ++i) { const auto b = ggml_fp32_to_bf16(row[i]); std::memcpy(dst + i, &b, 2); }
+        });
+        if (!draft.load(pk, 0, s, blas, head ? &hm : nullptr, nullptr, 40, err)) {
+            std::printf("FAIL loading DSpark: %s\n", err.c_str()); ++g_fail;
+        } else {
+            std::printf("DSpark loaded: %zu bytes, plan %zu bytes, %zu taps\n", draft.bytes(),
+                        mm3::Draft::plan_bytes(pk, 40), draft.geo().taps.size());
+            if (draft.bytes() > mm3::Draft::plan_bytes(pk, 40)) ++g_fail;
+            int pos = 0;
+            for (int rows : {3, 33}) {
+                float* taps = dev(std::vector<float>(draft.geo().taps.size() * (size_t) rows * D, 0.01f));
+                if (!draft.context(taps, rows, pos, err)) { std::printf("FAIL DSpark context: %s\n", err.c_str()); ++g_fail; }
+                CU(cudaStreamSynchronize(s));
+                cudaFree(taps);
+                pos += rows;
+            }
+            if (head) {
+                std::vector<int> ids;
+                std::vector<float> conf;
+                if (!draft.propose(0, pos, draft.geo().block, ids, conf, nullptr, err)) {
+                    std::printf("FAIL DSpark proposal: %s\n", err.c_str()); ++g_fail;
+                } else {
+                    bool ok = !ids.empty() && ids.size() == conf.size();
+                    for (size_t i = 0; i < ids.size(); ++i)
+                        ok = ok && ids[i] >= 0 && ids[i] < V && std::isfinite(conf[i]) && conf[i] >= 0 && conf[i] <= 1;
+                    std::printf("DSpark proposal: %s (%zu tokens)\n", ok ? "ok" : "FAIL", ids.size());
+                    if (!ok) ++g_fail;
+                }
+            }
+            CU(cudaStreamSynchronize(s));
+        }
+    }
+    cudaFree(head);
+    cublasDestroy(blas);
+}
+
 // ---------------------------------------------------------------- the routed experts
 struct QE {
     int D, F, n_exp, ty[3];
@@ -870,6 +998,8 @@ int main(int argc, char** argv) {
     cudaStream_t s;
     CU(cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking));
     const std::string only = argc >= 2 ? argv[1] : "";
+    if (only == "--draft-pack" && argc >= 3) test_draft_pack(argv[2], s, argc >= 4 && std::string(argv[3]) == "--with-head");
+    if (only.empty() || only == "--q8-draft") test_q8_draft(s);
     if (only.empty() || only == "--nvfp4") {
         test_nvfp4_decode(s);
         test_experts(iq::kNVFP4, iq::kNVFP4, iq::kNVFP4, s, true);

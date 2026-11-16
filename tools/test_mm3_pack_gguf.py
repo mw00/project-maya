@@ -153,18 +153,37 @@ def run(m: pathlib.Path, *extra) -> subprocess.CompletedProcess:
     return subprocess.run([sys.executable, str(PACK), "--model", str(m), *extra], capture_output=True, text=True)
 
 
-def gguf_companions(root, standard_vision=False):
+def gguf_companions(root, standard_vision=False, standard_draft=False, quant_draft=False, full_draft=False):
     """Small files in the reported MiniMax GGUF schemas, including split temporal patch weights."""
     draft, vision = root / "draft.gguf", root / "mmproj.gguf"
     cfg = {"num_hidden_layers": 1, "hidden_size": D, "dspark_ffn_hidden_size": 512,
            "dspark_markov_rank": 32, "dspark_block_size": 3, "dspark_noise_token_id": 2,
            "dspark_target_layer_ids": [1], "dflash_config": {"sliding_window": 64}}
-    gguf(draft, {"general.architecture": (8, "dflash"), "dflash.backbone": (8, "minimax-m3"),
-                 "dflash.embedding_length": (4, D), "dflash.minimax.source_config": (8, json.dumps({"text_config": cfg}))},
-         [("fc.weight", 30, [D, D]), ("enc.output_norm.weight", 0, [D]), ("output_norm.weight", 0, [D]),
-          ("conf_proj.weight", 30, [D + 32, 1]), ("conf_proj.bias", 0, [1]),
-          ("markov_w1.weight", 30, [32, VOCAB]), ("markov_w2.weight", 30, [32, VOCAB]),
-          ("blk.0.attn_q.weight", 30, [D, 32 * 128]), ("blk.0.attn_norm.weight", 0, [D])])
+    dt = 8 if quant_draft else 30
+    dkv = {"general.architecture": (8, "dflash"), "dflash.embedding_length": (4, D)}
+    if standard_draft:
+        dkv.update({"dflash.hidden_activation": (8, "swigluoai"), "dflash.has_confidence_head": (7, True),
+                    "dflash.sample_from_anchor": (7, True), "dflash.target_layers": (9, (4, [2])),
+                    "dflash.block_count": (4, 1), "dflash.feed_forward_length": (4, 512),
+                    "dflash.block_size": (4, 3), "dflash.attention.sliding_window": (4, 64),
+                    "dflash.attention.head_count": (4, 32), "dflash.attention.head_count_kv": (4, 2),
+                    "dflash.attention.key_length": (4, 128), "dflash.attention.value_length": (4, 128),
+                    "dflash.rope.dimension_count": (4, 64), "tokenizer.ggml.mask_token_id": (4, 2)})
+    else:
+        dkv.update({"dflash.backbone": (8, "minimax-m3"),
+                    "dflash.minimax.source_config": (8, json.dumps({"text_config": cfg}))})
+    draft_ts = [("fc.weight", dt, [D, D]), ("enc.output_norm.weight", 0, [D]), ("output_norm.weight", 0, [D]),
+                ("conf_proj.weight", 0 if quant_draft else 30, [D + 32, 1]), ("conf_proj.bias", 0, [1]),
+                ("markov_w1.weight", dt, [32, VOCAB]), ("markov_w2.weight", dt, [32, VOCAB]),
+                ("blk.0.attn_q.weight", dt, [D, 32 * 128]), ("blk.0.attn_norm.weight", 0, [D])]
+    if full_draft:
+        draft_ts += [("blk.0." + name, dt, shape) for name, shape in
+                     (("attn_k.weight", [D, 256]), ("attn_v.weight", [D, 256]),
+                      ("attn_output.weight", [4096, D]), ("ffn_gate.weight", [D, 512]),
+                      ("ffn_up.weight", [D, 512]), ("ffn_down.weight", [512, D]))]
+        draft_ts += [("blk.0." + name, 0, shape) for name, shape in
+                     (("ffn_norm.weight", [D]), ("attn_q_norm.weight", [128]), ("attn_k_norm.weight", [128]))]
+    gguf(draft, dkv, draft_ts)
     vc = {"hidden_size": 16, "intermediate_size": 32, "num_hidden_layers": 1, "num_attention_heads": 2,
           "patch_size": 2, "img_token_compression_config": {"spatial_merge_size": 2, "temporal_patch_size": 2}}
     cfg = {"vision_config": vc, "projector_hidden_size": 16, "image_token_index": 6}
@@ -201,6 +220,36 @@ def tensors(pack: pathlib.Path) -> tuple[list, dict]:
 
 
 class PackGguf(unittest.TestCase):
+    def test_standard_q8_dspark_keeps_native_weights_and_converts_target_layer_indices(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            m = model(root)
+            draft, _ = gguf_companions(root, standard_draft=True, quant_draft=True, full_draft=True)
+            r = run(m, "--text-only", "--drafter", str(draft))
+            self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
+            pack = m / "maya-mm3"
+            kv = dict(l.split(" ", 1) for l in (pack / "mm3.txt").read_text().splitlines())
+            for key, value in {"num_hidden_layers": "1", "dspark_target_layer_ids": "1", "dspark_markov_rank": "32",
+                               "dspark_noise_token_id": "2", "dspark_block_size": "3", "norms_plus_one": "1"}.items():
+                self.assertEqual(kv["dspark." + key], value)
+            _, ts = tensors(pack)
+            prefix = "dspark.language_model.model.dspark."
+            for name in ("fc.weight", "markov_head.markov_w1.weight", "markov_head.markov_w2.weight",
+                         "layers.0.decoder_layer.self_attn.q_proj.weight", "layers.0.decoder_layer.mlp.down_proj.weight"):
+                self.assertEqual(ts[prefix + name][0], "Q8_0")
+            self.assertEqual(kv["dspark.dflash.sliding_window"], "64")
+
+    def test_standard_dspark_rejects_invalid_target_layer_indices(self):
+        from tools.ds4.pack_gguf import Gguf, TYPES
+        from tools.mm3.gguf_companions import draft
+        for targets in ([0], [1, 1], [-1]):
+            with self.subTest(targets=targets), tempfile.TemporaryDirectory() as tmp:
+                p, _ = gguf_companions(pathlib.Path(tmp), standard_draft=True, quant_draft=True)
+                g = Gguf(p)
+                g.kv["dflash.target_layers"] = targets
+                with self.assertRaisesRegex(SystemExit, "dflash.target_layers"):
+                    draft(g, TYPES, 0, {}, D)
+
     def test_metadata_only_first_shard_needs_no_alignment_padding(self):
         from tools.ds4.pack_gguf import Gguf, short
         with tempfile.TemporaryDirectory() as tmp:

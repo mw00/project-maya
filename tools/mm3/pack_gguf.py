@@ -349,7 +349,7 @@ def main() -> int:
         if (why := _ds4.short(g)):
             raise SystemExit(f"{src}: incomplete companion ({why})")
         if kind == "drafter":
-            extra, dcfg = gguf_companions.draft(g, TYPES, len(files), LAYER, hidden)
+            extra, dcfg = gguf_companions.draft(g, TYPES, len(files), LAYER, hidden, model_kv=kv)
         else:
             extra, vision = gguf_companions.vision(g, TYPES, len(files), kv["tokenizer.ggml.tokens"], hidden)
         files.append(rel(src))

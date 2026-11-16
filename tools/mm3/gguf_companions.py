@@ -18,11 +18,12 @@ def config(kv, key):
         raise SystemExit(f"the selected GGUF needs valid {key} metadata: {e}") from e
 
 
-def entries(g, types, fi, rename):
+def entries(g, types, fi, rename, allowed=(0, 30)):
     out = []
     for name, typ, dims, off in g.tensors:
-        if typ not in (0, 30):
-            raise SystemExit(f"{g.path.name}: {name}: this companion needs F32/BF16 weights")
+        if typ not in allowed:
+            formats = "/".join(types[t][0] for t in allowed)
+            raise SystemExit(f"{g.path.name}: {name}: this companion needs {formats} weights")
         mapped = rename(name)
         if mapped is None:
             raise SystemExit(f"{g.path.name}: unsupported companion tensor {name}")
@@ -34,13 +35,65 @@ def entries(g, types, fi, rename):
     return out
 
 
-def draft(g, types, fi, layer_map, hidden):
-    if g.kv.get("general.architecture") != "dflash" or g.kv.get("dflash.backbone") != "minimax-m3":
+def is_minimax_draft(meta):
+    if meta.get("general.architecture") != "dflash":
+        return False
+    backbone = meta.get("dflash.backbone")
+    if backbone is not None:
+        return backbone == "minimax-m3"
+    return (meta.get("dflash.hidden_activation") == "swigluoai"
+            and meta.get("dflash.has_confidence_head") is True
+            and meta.get("dflash.sample_from_anchor") is True
+            and isinstance(meta.get("dflash.target_layers"), list)
+            and bool(meta["dflash.target_layers"]))
+
+
+def draft_config(g, hidden, model_kv=None):
+    if "dflash.minimax.source_config" in g.kv:
+        cfg = config(g.kv, "dflash.minimax.source_config")
+        return dict(cfg.get("text_config", cfg))
+    # Standard llama.cpp fields. target_layers names layer inputs; Maya taps the preceding layer's output.
+    kv = g.kv
+    def integer(key, minimum=1):
+        v = kv.get(key)
+        if not isinstance(v, int) or isinstance(v, bool) or v < minimum:
+            raise SystemExit(f"{g.path.name}: missing or invalid {key}")
+        return v
+    targets = kv.get("dflash.target_layers")
+    if not isinstance(targets, list) or not targets or any(type(x) is not int or x < 1 for x in targets):
+        raise SystemExit(f"{g.path.name}: invalid dflash.target_layers (target layer inputs must follow a layer)")
+    if len(set(targets)) != len(targets):
+        raise SystemExit(f"{g.path.name}: duplicate dflash.target_layers")
+    if model_kv:
+        for suffix in ("attention.head_count", "attention.head_count_kv", "attention.key_length",
+                       "attention.value_length", "rope.dimension_count"):
+            value = integer("dflash." + suffix)
+            if model_kv.get("minimax-m3." + suffix) != value:
+                raise SystemExit(f"{g.path.name}: drafter {suffix} does not match the model")
+        if max(targets) > model_kv["minimax-m3.block_count"]:
+            raise SystemExit(f"{g.path.name}: dflash.target_layers exceeds the model's layer count")
+    ts = {name: dims for name, _, dims, _ in g.tensors}
+    markov = ts.get("markov_w1.weight")
+    if not markov or len(markov) != 2 or markov[0] <= 0 or ts.get("markov_w2.weight") != markov:
+        raise SystemExit(f"{g.path.name}: missing or inconsistent DSpark Markov tables")
+    if ts.get("fc.weight") != [len(targets) * hidden, hidden]:
+        raise SystemExit(f"{g.path.name}: fc.weight does not match the target layers and hidden size")
+    if ts.get("conf_proj.weight") != [hidden + markov[0], 1]:
+        raise SystemExit(f"{g.path.name}: confidence head does not match the Markov rank")
+    return {"num_hidden_layers": integer("dflash.block_count"), "hidden_size": hidden,
+            "dspark_ffn_hidden_size": integer("dflash.feed_forward_length"),
+            "dspark_markov_rank": markov[0], "dspark_block_size": integer("dflash.block_size"),
+            "dspark_noise_token_id": integer("tokenizer.ggml.mask_token_id", 0),
+            "dspark_target_layer_ids": [x - 1 for x in targets],
+            "dflash_config": {"sliding_window": integer("dflash.attention.sliding_window")}}
+
+
+def draft(g, types, fi, layer_map, hidden, model_kv=None):
+    if not is_minimax_draft(g.kv):
         raise SystemExit(f"{g.path}: not a MiniMax-M3 DSpark GGUF")
     if g.kv.get("dflash.embedding_length") != hidden:
         raise SystemExit(f"{g.path}: the drafter's hidden size does not match the model")
-    cfg = config(g.kv, "dflash.minimax.source_config")
-    cfg = dict(cfg.get("text_config", cfg))
+    cfg = draft_config(g, hidden, model_kv)
     # The GGUF converter already added one to Gemma-style norm weights.
     cfg["norms_plus_one"] = 1
     names = {"fc.weight": "fc.weight", "enc.output_norm.weight": "hidden_norm.weight",
@@ -56,7 +109,7 @@ def draft(g, types, fi, layer_map, hidden):
             return DP + f"layers.{m[1]}.decoder_layer." + layer_map[m[2]]
         return None
 
-    return entries(g, types, fi, rename), cfg
+    return entries(g, types, fi, rename, allowed=(0, 30, 8)), cfg
 
 
 def vision_config(g):

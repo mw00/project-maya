@@ -76,5 +76,7 @@ unsigned wait_timeouts();
 void act_quant(const float* x, int rows, int k, int8_t* q, float* d, cudaStream_t s);
 /// ... and the dense GEMVs' (a scale a 32).
 void q8_quant(const float* x, size_t ldx, int rows, int k, int8_t* q, float* d, cudaStream_t s);
+/// One Q8_0 embedding row selected on the device (DSpark's Markov table), as F32 and BF16.
+bool gather_q8_row(const x3::Mat& m, const int* index, uint16_t* bf16, float* fp32, cudaStream_t s);
 
 }  // namespace mm3::gg

@@ -3294,8 +3294,12 @@ def link_other_gguf(models: Path, chosen: dict, family: str) -> dict | None:
             from gguf_reader import GGUFFile
             source = chosen[role]["anchor"]
             meta = GGUFFile(source).metadata if source.suffix.lower() == ".gguf" else {}
-            if meta.get("general.architecture") != arch or (meta.get(key) != want if want is not None else
-                                                           not meta.get(key)):
+            valid = meta.get("general.architecture") == arch and (meta.get(key) == want if want is not None else
+                                                                 bool(meta.get(key)))
+            if family == "minimax" and role == "drafter":
+                from tools.mm3.gguf_companions import is_minimax_draft
+                valid = is_minimax_draft(meta)
+            if not valid:
                 warn(f"{source.name}: not a {FAMILY_TITLE[family]} {role} GGUF")
                 return None
     if family == "minimax":

@@ -70,6 +70,25 @@ __global__ void float_f16_rows(const uint8_t* w, size_t ld, int k, int n, uint16
         dst[i] = __half_as_ushort(__float2half_rn(float_value<T>(w + i / k * ld, (int) (i % k))));
 }
 
+__device__ __forceinline__ float q8_value(const uint8_t* row, int i) {
+    const uint8_t* b = row + (size_t) (i / 32) * 34;
+    return __half2float(__ushort_as_half(*(const uint16_t*) b)) * (float) (int8_t) b[2 + (i & 31)];
+}
+__global__ void q8_f16_rows(const uint8_t* w, size_t ld, int k, int n, uint16_t* dst) {
+    for (size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x; i < (size_t) n * k;
+         i += (size_t) gridDim.x * blockDim.x)
+        dst[i] = __half_as_ushort(__float2half_rn(q8_value(w + i / k * ld, (int) (i % k))));
+}
+__global__ void q8_gather(const uint8_t* w, size_t ld, int k, const int* index, uint16_t* bf16, float* fp32) {
+    const uint8_t* row = w + (size_t) *index * ld;
+    for (int i = threadIdx.x; i < k; i += blockDim.x) {
+        const float v = q8_value(row, i);
+        const uint32_t u = __float_as_uint(v);
+        fp32[i] = v;
+        bf16[i] = (uint16_t) ((u + 0x7fff + ((u >> 16) & 1)) >> 16);
+    }
+}
+
 // ---- int8 activations
 // per 32 values (llama.cpp's q8_1 scale, ds4_gguf.cu's q8_quant - the same operations): rows of k F32 values (row r
 // at x + r ldx) -> q[r][k], d[r][k / 32] = max|x| / 127 (a warp a 32-block)
@@ -387,6 +406,15 @@ void q8_quant(const float* x, size_t ldx, int rows, int k, int8_t* q, float* d, 
     check("q8_quant");
 }
 
+bool gather_q8_row(const x3::Mat& m, const int* index, uint16_t* bf16, float* fp32, cudaStream_t s) {
+    if (m.fmt != kFmtGG || m.gg_type != iq::kQ8_0 || !m.raw || m.k <= 0 || m.k % 32) return false;
+    const size_t ld = m.ld > 0 ? (size_t) m.ld : row_bytes(m.gg_type, m.k);
+    if (ld < row_bytes(m.gg_type, m.k)) return false;
+    q8_gather<<<1, 256, 0, s>>>((const uint8_t*) m.raw, ld, m.k, index, bf16, fp32);
+    check("gather_q8_row");
+    return true;
+}
+
 // ---------------------------------------------------------------- dense matrices
 bool mv(const x3::MvJob* jobs, int n, cudaStream_t s) {
     if (n <= 0 || n > x3::kMaxMvJobs) return false;
@@ -508,6 +536,9 @@ void gemm_rows(const x3::Mat& m, const uint16_t* x16, int ldx, int rows, float* 
             else if (m.gg_type == kF16) { FLOAT_F16(kF16); }
             else { FLOAT_F16(kBF16); }
 #undef FLOAT_F16
+        } else if (m.gg_type == iq::kQ8_0 && ld != row_bytes(m.gg_type, m.k)) {
+            const unsigned blocks = (unsigned) std::min<size_t>(65535, ((size_t) nc * m.k + 255) / 256);
+            q8_f16_rows<<<blocks, 256, 0, s>>>(src, ld, m.k, nc, sc->wb);
         } else if (!iq::f16_rows(m.gg_type, src, m.k, nc, sc->wb, m.k, s)) {
             fail("gemm_rows: f16_rows");
             return;

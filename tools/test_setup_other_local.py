@@ -79,6 +79,16 @@ class LocalOther(unittest.TestCase):
             self.assertTrue(linked[role].is_symlink())
             self.assertEqual(linked[role].resolve(), src)
 
+    def test_minimax_links_standard_q8_dspark_without_legacy_backbone(self):
+        from test_mm3_pack_gguf import gguf_companions
+        src, _, chosen = self.source("minimax")
+        drafter, _ = gguf_companions(src, standard_draft=True, quant_draft=True)
+        chosen["drafter"] = maya.review_candidate(drafter, "drafter", [drafter])
+        linked = maya.link_other_gguf(self.models, chosen, "minimax")
+        self.assertIsNotNone(linked)
+        self.assertTrue(linked["drafter"].is_symlink())
+        self.assertEqual(linked["drafter"].resolve(), drafter)
+
     def test_minimax_pack_rebuilds_when_selected_companions_change(self):
         from test_mm3_pack_gguf import model, gguf_companions
         src = model(self.root, scales=True)

@@ -909,6 +909,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
       # the routed experts with swigluoai (gate and up of one type and of two) on the token / window / prompt paths
       # against a double reference and each other, and the CPU lane's GGUF experts against the device's
       add_executable(mm3_gguf_test tests/mm3_gguf_test.cu src/mm3/mm3_exl3.cu src/mm3/mm3_cpu.cpp
+                                   src/mm3/mm3_dspark.cu src/mm3/mm3_kernels.cu src/mm3/mm3_host.cpp
                                    ${_mm3_gguf_sources} ${_mm3_gguf_cpu_sources})
       target_include_directories(mm3_gguf_test PRIVATE ${_strata_gpu_include_directories} include src/mm3 third_party/ggml)
       target_link_libraries(mm3_gguf_test PRIVATE strata_kernels_cpu ${_strata_gpu_runtime_target}
