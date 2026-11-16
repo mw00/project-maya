@@ -5340,6 +5340,13 @@ void Glm5Model::fast_service() {
             unsigned int* sv = F->pfce_seq_h + (sq % gf::kRingSize);
             *sv = sq;
             cudaMemcpyAsync(F->pf_flag_d, sv, sizeof(unsigned int), cudaMemcpyHostToDevice, F->pfce_stream);
+            // Windows' HIP runtime holds queued work until the host waits on or queries its stream (docs/AMD_MAYA.md,
+            // "Kernel submission"), and nothing else touches this one: without the query the flag never lands and the
+            // next layer's moe_pf_wait spins on it ("token N waiting > 10 s" on an RX 7900 XT).  It returns at once;
+            // "not ready" is not an error and is not left behind for the next check.
+#if defined(STRATA_USE_HIP)
+            if (cudaStreamQuery(F->pfce_stream) == cudaErrorNotReady) cudaGetLastError();
+#endif
         }
         // (the lanes are made at the CPU lane's setup, after this thread started; an EXL3 pack's merged rows with them)
         // A batched rows step's group (MAYA_GLM_GROUP_EXPERTS, win_rows) is held the same way and merged on this part's
