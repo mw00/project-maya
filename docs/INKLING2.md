@@ -45,6 +45,11 @@ The conventions a kernel must follow (the conversion folds them in):
 - **An NVFP4 expert tensor has a scale beside it.** `ffn_{gate,up,down}_exps.scale` (F32, one per expert), applied
   after the dot product - to gate and up before the activation. unsloth's requantized experts (IQ1_S, IQ2_XXS,
   IQ3_XXS) keep it for layers 0-39; layers 40-47 have none (the BF16 conversion folded MXFP8's exactly).
+- **An absent `.scale` is 1.0, except beside NVFP4.** The scale only carries information beside NVFP4 experts, whose
+  blocks have a fixed range. A requantized expert (IQ\*, Q\*_K) can fold the amax into its blocks, and some quants do:
+  `peasantsmith/Inkling-2-Small-GGUF` (IQ2_XXS-mix) has 1,140 tensors and no `.scale`, where unsloth's have 1,260
+  (3 x 40 layers more). A reader takes a missing `.scale` beside a non-NVFP4 expert as 1.0 - exact for such a file -
+  and refuses an NVFP4 expert without one (its values would be wrong by its amax).
 - `attn_res_score` (layer l's: the query before layer l's attention; a full layer's three), `ffn_res_score`,
   `output_res_score`: the attention residuals' queries. `exp_probs_b.bias`: the router's selection bias (for the
   pick only, not the weights).
