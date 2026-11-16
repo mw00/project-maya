@@ -5,6 +5,9 @@ the reference - whose log-probabilities must be transformers' within fp32's roun
 
     PYTHONPATH=<transformers main>:<llama.cpp>/gguf-py python tests/inkling2_ref_test.py
 
+Then the scale rules (docs/INKLING2.md): an absent .scale is 1.0 beside a requantized expert, refused beside NVFP4 -
+in the reference and in the converter's --plan --against check.
+
 300 tokens against a window and a relative extent of 64 and a log-scaling floor of 100: every edge of the
 attention crossed; layers 5 and 11 full (the dynamic convs, three residual queries); blocks of 6 (a boundary at 0
 and 6). Skipped (exit 0) without a transformers that has inkling2 (its main from 109a7d19bf, 2026-11-12).
@@ -164,8 +167,41 @@ def main():
     top1 = (got.argmax(-1) == want.argmax(-1)).double().mean().item()
     print(f"[inkling2_ref_test] 300 tokens: max |dlogp| {d:.2e}, max |KL| {kl:.2e}, top-1 {top1 * 100:.1f}%")
     ok = d < 1e-4 and kl < 1e-6 and top1 == 1.0
+    ok &= scale_rules(out)
     print("[inkling2_ref_test]", "ok" if ok else "FAILED")
     return 0 if ok else 1
+
+
+def scale_rules(out):
+    """an absent .scale is 1.0 beside a requantized expert, refused beside NVFP4 (docs/INKLING2.md): the reference
+    refuses an NVFP4 layer whose scales are hidden; --plan --against takes a file of requantized experts and no
+    scales (peasantsmith's layout: the experts re-typed IQ2_XXS, the 3 x N_NV scales gone) as the same layout, and the
+    same file with its experts still NVFP4 as different"""
+    import gguf
+    r = R.Ref(str(out / "tiny.gguf"))
+    real = r.has
+    r.has = lambda n: False if n.startswith("blk.0.") and n.endswith("_exps.scale") else real(n)
+    try:
+        r.forward([1, 2, 3])
+        refused = False
+    except AssertionError as e:
+        refused = "without its .scale" in str(e)
+    t = gguf.GGUFReader(str(out / "tiny.gguf")).tensors
+    nv = int(gguf.GGMLQuantizationType.NVFP4)
+    iq = int(gguf.GGMLQuantizationType.IQ2_XXS)
+    res = {}
+    for name, retype in (("requantized", iq), ("nvfp4", nv)):
+        rows = [[x.name, [int(v) for v in x.shape], retype if int(x.tensor_type) == nv else int(x.tensor_type)]
+                for x in t if not x.name.endswith("_exps.scale")]
+        p = out / f"against.{name}.json"
+        json.dump(rows, open(p, "w"))
+        o = subprocess.run([sys.executable, str(ROOT / "tools" / "inkling2_gguf.py"), "--src", str(out), "--plan",
+                            "--against", str(p)], capture_output=True, text=True)
+        res[name] = (o.returncode, [x for x in o.stdout.splitlines() if x.startswith(("plan:", "absent"))])
+    good = refused and res["requantized"][0] == 0 and res["nvfp4"][0] == 1
+    print(f"[inkling2_ref_test] scales: an NVFP4 expert without one refused: {refused}; against no scales, "
+          f"requantized: {res['requantized'][1]}; NVFP4: {res['nvfp4'][1]}  {'ok' if good else 'FAILED'}")
+    return good
 
 
 if __name__ == "__main__":
