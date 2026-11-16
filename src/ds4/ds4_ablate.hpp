@@ -152,7 +152,11 @@ inline bool load_direction(const std::string& path, int layer, int n_layer, floa
                 return false;
             }
             if (!read_f32(g, path, tname, 0, r, err)) return false;
-            if (scale == 0.0f) scale = 1.0f;
+            if (scale == 0.0f) {   // (a Maya direction file's own strength - maya.ablate.scale - else 1)
+                double s = 1.0;
+                if (!meta_pos(g, path, "maya.ablate.scale", s, err)) return false;
+                scale = (float) s;
+            }
         }
         if (!std::isfinite(scale) || !(scale > 0.0f)) {   // must not reach the GPU
             err = path + ": ablation scale is not a positive finite number";

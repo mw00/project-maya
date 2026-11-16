@@ -1,10 +1,11 @@
 # The models
 
-Maya runs three models, each on an engine built for it. This page has each one's files, what they need and what is
+Maya runs four models, each on an engine built for it. This page has each one's files, what they need and what is
 special about it. Back to the [README](../README.md).
 
 - [How the quants are named](#how-the-quants-are-named)
 - [GLM-5.3-Flash](#glm-53-flash)
+- [GLM-5.3 (744B)](#glm-53-744b)
 - [DeepSeek-V4.1-Flash-1017](#deepseek-v41-flash-1017)
 - [MiniMax-M3.1-Flash](#minimax-m31-flash)
 - [Community quants of GLM-5.3-Flash](#community-quants-of-glm-53-flash)
@@ -12,7 +13,7 @@ special about it. Back to the [README](../README.md).
 ## How the quants are named
 
 Every Maya quant is named after its model first, then its tier - XS, S, M or L, by how many bits its experts keep - so
-"GLM-5.3 · Maya-S" and "MiniMax M3.1 · Maya-S" never get mixed up. The setup asks which one to download; to pick one
+"GLM-5.3-Flash · Maya-S" and "MiniMax M3.1 · Maya-S" never get mixed up. The setup asks which one to download; to pick one
 yourself, give its setup id: `./setup.sh --model glm-maya-s24`. The names used before (`--model Maya-S24`,
 `--ds4-quant maya-xs`, ...) keep working.
 
@@ -26,12 +27,12 @@ the model's MTP block, which drafts tokens ahead.
 
 | Model | Setup id | Size | Made for | Against the FP8 model |
 | --- | --- | ---: | --- | --- |
-| **GLM-5.3 · Maya-S** (default) | `glm-maya-s` | 96.5 GB | PCs with a smaller memory pool (RAM and VRAM together) | 97.9% of its zero-shot accuracy; the same next token 83% of the time |
-| **GLM-5.3 · Maya-S24** | `glm-maya-s24` | 94.7 GB | cards of 24 GB or less: 4-bit attention leaves ~1.5 GB more of the card for experts, decode +14% | 97.7%; 83% |
-| **GLM-5.3 · Maya-XS** | `glm-maya-xs` | 73.4 GB | PCs with 64 GB of RAM and a 24 GB card, at 128K context (int8 KV cache, thinking budget 8192) | - |
-| **GLM-5.3 · Maya-M** | `glm-maya-m` | 116 GB | a bigger memory pool; more bits where they count, calibrated toward tool calls and front-end code | 97.9%; 86% |
-| **GLM-5.3 · Maya-M-Derisked** | `glm-maya-m-derisked` | 116 GB | Maya-M with a weight edit by [Blackfrost_AI](https://x.com/Blackfrost_AI) that reduces blanket refusals ([its repo](https://huggingface.co/peasantsmith/GLM-5.3-Flash-Maya-M-Derisked-IQ2_S-GGUF)); experimental | not measured yet |
-| **GLM-5.3 · Maya-L** | `glm-maya-l` | 156.3 GB | the biggest memory pools | **99.2%**; 90% |
+| **GLM-5.3-Flash · Maya-S** (default) | `glm-maya-s` | 96.5 GB | PCs with a smaller memory pool (RAM and VRAM together) | 97.9% of its zero-shot accuracy; the same next token 83% of the time |
+| **GLM-5.3-Flash · Maya-S24** | `glm-maya-s24` | 94.7 GB | cards of 24 GB or less: 4-bit attention leaves ~1.5 GB more of the card for experts, decode +14% | 97.7%; 83% |
+| **GLM-5.3-Flash · Maya-XS** | `glm-maya-xs` | 73.4 GB | PCs with 64 GB of RAM and a 24 GB card, at 128K context (int8 KV cache, thinking budget 8192) | - |
+| **GLM-5.3-Flash · Maya-M** | `glm-maya-m` | 116 GB | a bigger memory pool; more bits where they count, calibrated toward tool calls and front-end code | 97.9%; 86% |
+| **GLM-5.3-Flash · Maya-M-Derisked** | `glm-maya-m-derisked` | 116 GB | Maya-M with a weight edit by [Blackfrost_AI](https://x.com/Blackfrost_AI) that reduces blanket refusals ([its repo](https://huggingface.co/peasantsmith/GLM-5.3-Flash-Maya-M-Derisked-IQ2_S-GGUF)); experimental | not measured yet |
+| **GLM-5.3-Flash · Maya-L** | `glm-maya-l` | 156.3 GB | the biggest memory pools | **99.2%**; 90% |
 
 The setup recommends one for your PC. How they're made and measured: [MAYA-S](../bench/results/MAYA-S.md),
 [MAYA-S24](../bench/results/MAYA-S24.md), [MAYA-M](../bench/results/MAYA-M.md), [MAYA-L](../bench/results/MAYA-L.md). On
@@ -60,6 +61,19 @@ On AMD, GLM-5.3-Flash reads pictures too: setup builds its image encoder for the
   [speed calibration](SETTINGS.md#the-speed-calibration) measures it on your PC and keeps it only where it is faster.
   The drafter's license is non-commercial (CC BY-NC-ND 4.0).
 
+## GLM-5.3 (744B)
+
+**[GLM-5.3](https://huggingface.co/zai-org/GLM-5.3)** (zai-org; 744 B parameters, about 40 B active per token) runs on the same engine as
+GLM-5.3-Flash, with its own sparse-attention indexer. Text only, up to 1M context (the setup offers what fits).
+
+| Model | Setup id | Size | Made for |
+| --- | --- | ---: | --- |
+| **GLM-5.3 (744B) · Maya-XS** ([Maya's own GGUF](https://huggingface.co/peasantsmith/GLM-5.3-Maya-GGUF)) | `glm-5.3-maya-xs` | 170.0 GB | smaller memory pools (~192 GB of VRAM and RAM together keeps every expert in memory); as close to the original as unsloth's UD-IQ1_S at 78% of its size |
+| **GLM-5.3 (744B) · UD-IQ2_M** ([unsloth's GGUF](https://huggingface.co/unsloth/GLM-5.3-GGUF)) | `GLM-5.3-UD-IQ2_M` | 238.6 GB | the biggest memory pools (~256 GB of VRAM and RAM together keeps every expert in memory); closer to the original |
+
+NVIDIA from the V100 on (CUDA, Linux and Windows) and AMD (HIP, the Strix and Gorgon Halo included); not on Mac.
+Everything about it - setup, context, defaults, APIs: [GLM53.md](GLM53.md).
+
 ## DeepSeek-V4.1-Flash-1017
 
 The setup also offers **[DeepSeek-V4.1-Flash-1017](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017)**
@@ -76,6 +90,7 @@ results. See [the prompt format notes](deepseek-prompt-format.md) for API detail
 | unsloth's [UD-IQ1_M GGUF](https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF) (`--ds4-quant gguf-iq1_m`): for PCs with about 150 GB of VRAM + RAM | 301 GB, with Maya's n-gram tables | the same |
 | unsloth's [UD-IQ3_S GGUF](https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF) (`--ds4-quant gguf-iq3_s`): close to Q8's quality, for PCs with about 270 GB of VRAM + RAM; shares its n-gram tables with Maya's quants | 424 GB, with the n-gram tables | the same |
 | unsloth's [UD-Q8_K_XL GGUF](https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF) (`--ds4-quant gguf-q8`; DeepSeek's own formats): the closest to the original, for PCs with about 310 GB of VRAM + RAM | 467 GB, with Maya's n-gram tables | the same |
+| turboderp's [EXL3 2.25 bpw](https://huggingface.co/turboderp/DeepSeek-V4.1-Flash-1017-exl3/tree/2.25bpw) + the same Engram tables (`--ds4-quant exl3-2.25`: the smallest EXL3, ~160 GB of VRAM + RAM; its vision tower is DeepSeek's own, shared with the GGUFs) | 362 GB | the same |
 | LibertAIDAI's [EXL3 2.9 bpw](https://huggingface.co/LibertAIDAI/DeepSeek-V4.1-Flash-1017-EXL3-2.9bpw) + DeepSeek's Engram tables | 414 GB | NVIDIA from Volta (V100) on; pictures from RTX 30 / A100 on; and AMD |
 | LibertAIDAI's [EXL3 3.5 bpw](https://huggingface.co/LibertAIDAI/DeepSeek-V4.1-Flash-1017-EXL3-3.5bpw) + the same Engram tables (`--ds4-quant exl3-3.5`: closer to the original, ~280 GB of VRAM + RAM) | 461 GB | the same |
 | orcarouter's [Abliterated GGUFs](https://huggingface.co/orcarouter/DeepSeek-V4.1-Flash-1017-abliterated-GGUF), the model with its refusals removed: Mix-128G (`--ds4-quant abliterated-128g`, ~114 GB of VRAM + RAM) or Mix-256G (`abliterated-256g`, ~236 GB); `abliterated` picks the one your PC holds. Their n-gram table is left out and Maya's Q6_K tables are read instead (once for both). A gated repo: accept its terms, then `HF_TOKEN` or `hf auth login` | 275 / 397 GB, with the 161 GB of n-gram tables shared with Maya's DeepSeek quants (downloaded once) | NVIDIA from Volta (V100) on (AMD not tried yet) |

@@ -427,6 +427,7 @@ template<> struct Fmt<13> { static constexpr int qk = 256, ipb = 16, step = 2;  
     __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) { return vec_dot_q5_K_q8_1(v, y, kbx, iqs); } };
 template<> struct Fmt<42> { static constexpr int qk = 64, ipb = 2, step = 1;
     __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) { return vec_dot_q2_0_q8_1(v, y, kbx, iqs); } };
+#include "iq_kquant.cuh"   // glm-dsa B3.5: Fmt<10> .. Fmt<14>, the K-quants (Q2_K .. Q6_K) for native_expert_grouped
 
 __device__ __forceinline__ float warp_sum(float v) {
 #pragma unroll
@@ -556,6 +557,45 @@ __global__ void __launch_bounds__(256) native_gu_kernel(const unsigned long long
     }
 }
 
+// A mixed layer's half (gate: UP = false, up: UP = true) by its own type TG: the same rows, dot and stores as
+// native_gu_kernel's for that half.  native_expert_grouped launches it twice where the gate and up types differ.
+template<int TG, bool UP>
+__global__ void __launch_bounds__(256) native_gu_half_kernel(const unsigned long long* __restrict__ grp_ptr,
+                                                             const int32_t* __restrict__ grp_start,
+                                                             const int32_t* __restrict__ n_groups,
+                                                             const int32_t* __restrict__ ent_tok,
+                                                             const block_q8_1* __restrict__ xq, NativeExpertLayout L,
+                                                             float* __restrict__ dst) {
+    const int g = blockIdx.y;
+    if (g >= *n_groups) return;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int r = blockIdx.x * GU_ROWS + warp;              // 0 .. n_ff
+    if (r >= L.n_ff) return;
+    const uint8_t* blob = (const uint8_t*) grp_ptr[g];
+    const uint8_t* wr = UP ? blob + L.up_off + (size_t) r * L.u_row : blob + (size_t) r * L.gu_row;
+    const int nb = (int) (L.n_embd / Fmt<TG>::qk), xb = (int) (L.n_embd / 32);
+    const int e0 = grp_start[g], e1 = grp_start[g + 1];
+    for (int e = e0; e < e1; ++e) {
+        const float s = row_dot<TG>(wr, xq + (size_t) ent_tok[e] * xb, nb, lane);
+        if (lane == 0) dst[(size_t) e * L.n_ff + r] = s;
+    }
+}
+
+template<bool UP>
+bool launch_gu_half(int ty, dim3 grid, cudaStream_t s, const unsigned long long* grp_ptr, const int32_t* grp_start,
+                    const int32_t* n_groups, const int32_t* ent_tok, const block_q8_1* X, const NativeExpertLayout& L,
+                    float* dst) {
+#define MAYA_GU_HALF(T) case T: native_gu_half_kernel<T, UP><<<grid, 256, 0, s>>>(grp_ptr, grp_start, n_groups, \
+                                                                                  ent_tok, X, L, dst); return true;
+    switch (ty) {
+        MAYA_GU_HALF(10) MAYA_GU_HALF(11) MAYA_GU_HALF(12) MAYA_GU_HALF(13) MAYA_GU_HALF(14)
+        MAYA_GU_HALF(16) MAYA_GU_HALF(17) MAYA_GU_HALF(18) MAYA_GU_HALF(19) MAYA_GU_HALF(20)
+        MAYA_GU_HALF(21) MAYA_GU_HALF(22) MAYA_GU_HALF(23) MAYA_GU_HALF(29)
+        default: return false;
+    }
+#undef MAYA_GU_HALF
+}
+
 __global__ void swiglu_entries_kernel(const float* __restrict__ gate, const float* __restrict__ up, float* __restrict__ h,
                                       float limit, long long n) {
     const long long i = (long long) blockIdx.x * blockDim.x + threadIdx.x;
@@ -606,7 +646,7 @@ __global__ void quantize_q8_1_kernel(const float* __restrict__ x, block_q8_1* __
         amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
         sum += __shfl_xor_sync(0xffffffffu, sum, o);
     }
-    const float d = fminf(amax / 127.0f, 65504.0f);   // finite in FP16 (Strata #1448); below that nothing changes
+    const float d = fminf(amax / 127.0f, 65504.0f);   // finite in FP16 (upstream #1448); below that nothing changes
     const int8_t q = amax == 0.0f ? 0 : fmaxf(-127.0f, fminf(127.0f, roundf(xi / d)));
     const long long ib = i / 32, iqs = i % 32;
     y[ib].qs[iqs] = q;
@@ -925,6 +965,16 @@ __global__ void dequant_gu_kernel(int ty, const void* __restrict__ gate, const v
     dq_dispatch<__half>(ty, parity ? up : gate, i, y + ((2 * r + parity) * per_row + c) * QK_K, threadIdx.x);
 }
 
+// dequant_gu_kernel for a mixed layer: the gate blocks by tg, the up blocks by tu (the same interleaved rows)
+__global__ void dequant_gu2_kernel(int tg, int tu, const void* __restrict__ gate, const void* __restrict__ up,
+                                   int64_t per_row, __half* __restrict__ y) {
+    const int64_t i = blockIdx.x;
+    const int parity = blockIdx.y;
+    const int64_t r = i / per_row, c = i % per_row;
+    dq_dispatch<__half>(parity ? tu : tg, parity ? up : gate, i, y + ((2 * r + parity) * per_row + c) * QK_K,
+                        threadIdx.x);
+}
+
 bool is_iq(int t) { return t == 16 || t == 17 || t == 18 || t == 19 || t == 20 || t == 21 || t == 22 || t == 23 || t == 29 || t == 42 || t == 11; }
 
 }  // namespace
@@ -948,6 +998,7 @@ size_t iq_row_bytes(int t, int64_t n) noexcept {
         case 29: return (size_t) (n / 256) * sizeof(block_iq1_m);
         case 19: return (size_t) (n / 256) * sizeof(block_iq1_s);
         case 23: return (size_t) (n / 256) * sizeof(block_iq4_xs);
+        case 10: return (size_t) (n / 256) * sizeof(block_q2_K);   // glm-dsa B3.5: native_expert_layout's Q2_K rows
         case 11: return (size_t) (n / 256) * sizeof(block_q3_K);
         case 42: return (size_t) (n / 64) * sizeof(block_q2_0);
         default: return 0;
@@ -1034,7 +1085,31 @@ NativeExpertLayout native_expert_layout(int gu_type, int d_type, int64_t n_embd,
     L.up_off = (size_t) n_ff * L.gu_row;
     L.down_off = 2 * L.up_off;
     L.bytes = L.down_off + (size_t) n_embd * L.d_row;
+    L.u_type = gu_type;
+    L.u_row = L.gu_row;
     return L;
+}
+
+NativeExpertLayout native_expert_layout(int gu_type, int up_type, int d_type, int64_t n_embd, int64_t n_ff) {
+    NativeExpertLayout L = native_expert_layout(gu_type, d_type, n_embd, n_ff);
+    if (up_type == gu_type || up_type < 0) return L;
+    L.u_type = up_type;
+    L.u_row = iq_row_bytes(up_type, n_embd);
+    L.down_off = L.up_off + (size_t) n_ff * L.u_row;
+    L.bytes = L.down_off + (size_t) n_embd * L.d_row;
+    return L;
+}
+
+void iq_dequant_gu_f16_mixed(int gate_type, int up_type, const void* gate, const void* up, int64_t n_ff,
+                             int64_t n_embd, uint16_t* dst, void* stream) {
+    if (up_type == gate_type) {
+        iq_dequant_gu_f16(gate_type, gate, up, n_ff, n_embd, dst, stream);
+        return;
+    }
+    const int64_t per_row = n_embd / 256;
+    dequant_gu2_kernel<<<dim3((unsigned) (n_ff * per_row), 2), 32, 0, (cudaStream_t) stream>>>(
+        gate_type, up_type, gate, up, per_row, (__half*) dst);
+    check("iq_dequant_gu_f16_mixed");
 }
 
 size_t native_expert_scratch_bytes(int64_t cap, int64_t n_ff) {
@@ -1042,11 +1117,18 @@ size_t native_expert_scratch_bytes(int64_t cap, int64_t n_ff) {
     return 3 * ((f + 255) & ~(size_t) 255) + (((size_t) cap * (size_t) (n_ff / 32) * sizeof(block_q8_1) + 255) & ~(size_t) 255);
 }
 
-void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long* grp_ptr, const int32_t* grp_start,
+bool native_expert_grouped(const NativeExpertLayout& L, const unsigned long long* grp_ptr, const int32_t* grp_start,
                            const int32_t* n_groups, const int32_t* ent_dst, const int32_t* ent_tok, int64_t cap_groups,
                            int64_t cap_entries, const void* x_q8_1, void* scratch, float* out, void* stream,
                            float swiglu_limit) {
-    if (cap_groups <= 0 || cap_entries <= 0) return;
+    // glm-dsa B3.5: a type with no kernel below (the two switches' cases) is refused before any launch and reported by
+    // the caller; it stopped the process (std::exit) when the K-quants were missing
+    const auto has_kernel = [](int t) { return (t >= 10 && t <= 14) || (t >= 16 && t <= 23) || t == 29 || t == 42; };
+    if (!has_kernel(L.gu_type) || !(has_kernel(L.d_type) || L.d_type == 6)) {   // (down: Maya v1.1.55 Q5_0 too)
+        std::fprintf(stderr, "native_expert_grouped: no kernel for gate/up type %d, down type %d\n", L.gu_type, L.d_type);
+        return false;
+    }
+    if (cap_groups <= 0 || cap_entries <= 0) return true;
     cudaStream_t s = (cudaStream_t) stream;
     const size_t f = (size_t) cap_entries * (size_t) L.n_ff * sizeof(float), fa = (f + 255) & ~(size_t) 255;
     float* gate = (float*) scratch;
@@ -1055,7 +1137,17 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
     block_q8_1* hq = (block_q8_1*) ((uint8_t*) scratch + 3 * fa);
     const auto* X = (const block_q8_1*) x_q8_1;
     const dim3 ggu((unsigned) ((2 * L.n_ff + GU_ROWS - 1) / GU_ROWS), (unsigned) cap_groups);
-    switch (L.gu_type) {
+    if (L.u_type >= 0 && L.u_type != L.gu_type) {
+        // a mixed layer: the gate rows by their type, the up rows by theirs (two launches, the same products)
+        const dim3 gh((unsigned) ((L.n_ff + GU_ROWS - 1) / GU_ROWS), (unsigned) cap_groups);
+        if (!has_kernel(L.u_type) || L.gu_type == 42 || L.u_type == 42 ||
+            !launch_gu_half<false>(L.gu_type, gh, s, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate) ||
+            !launch_gu_half<true>(L.u_type, gh, s, grp_ptr, grp_start, n_groups, ent_tok, X, L, up)) {
+            std::fprintf(stderr, "native_expert_grouped: no kernel for gate type %d with up type %d\n", L.gu_type,
+                         L.u_type);
+            return false;
+        }
+    } else switch (L.gu_type) {
         case 16: native_gu_kernel<16><<<ggu, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
         case 17: native_gu_kernel<17><<<ggu, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
         case 18: native_gu_kernel<18><<<ggu, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
@@ -1065,8 +1157,13 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
         case 29: native_gu_kernel<29><<<ggu, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
         case 19: native_gu_kernel<19><<<ggu, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
         case 42: native_gu_kernel<42><<<ggu, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
+        case 10: native_gu_kernel<10><<<ggu, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
+        case 11: native_gu_kernel<11><<<ggu, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
+        case 12: native_gu_kernel<12><<<ggu, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
         case 13: native_gu_kernel<13><<<ggu, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
-        default: std::fprintf(stderr, "native_expert_grouped: gate/up type %d\n", L.gu_type); std::exit(1);
+        case 14: native_gu_kernel<14><<<ggu, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
+        case 20: native_gu_kernel<20><<<ggu, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
+        default: std::fprintf(stderr, "native_expert_grouped: gate/up type %d\n", L.gu_type); return false;
     }
     check("native_expert_grouped/gu");
     const long long nh = (long long) cap_entries * L.n_ff;
@@ -1074,18 +1171,30 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
     quantize_q8_1_kernel<<<(unsigned) ((nh + 255) / 256), 256, 0, s>>>(h, hq, nh);
     const dim3 gd((unsigned) ((L.n_embd + 7) / 8), (unsigned) cap_groups);
     switch (L.d_type) {
+        case 6: native_down_kernel<6><<<gd, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;
         case 18: native_down_kernel<18><<<gd, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;
         case 20: native_down_kernel<20><<<gd, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;
         case 23: native_down_kernel<23><<<gd, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;
         case 42: native_down_kernel<42><<<gd, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;
-        case 6: native_down_kernel<6><<<gd, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;
-        default: std::fprintf(stderr, "native_expert_grouped: down type %d\n", L.d_type); std::exit(1);
+        case 10: native_down_kernel<10><<<gd, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;
+        case 11: native_down_kernel<11><<<gd, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;
+        case 12: native_down_kernel<12><<<gd, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;
+        case 13: native_down_kernel<13><<<gd, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;
+        case 14: native_down_kernel<14><<<gd, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;
+        case 16: native_down_kernel<16><<<gd, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;
+        case 17: native_down_kernel<17><<<gd, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;
+        case 19: native_down_kernel<19><<<gd, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;
+        case 21: native_down_kernel<21><<<gd, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;
+        case 22: native_down_kernel<22><<<gd, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;
+        case 29: native_down_kernel<29><<<gd, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;
+        default: std::fprintf(stderr, "native_expert_grouped: down type %d\n", L.d_type); return false;
     }
     check("native_expert_grouped/down");
+    return true;   // glm-dsa B3.5: launched
 }
 }  // namespace strata::kernels
 
-// ---- Volta prompt experts (STRATA_PF_WMMA): a group's experts as one launch of FP16 tensor-core tiles, the weights
+// ---- Volta prompt experts (MAYA_PF_WMMA): a group's experts as one launch of FP16 tensor-core tiles, the weights
 // dequantized into shared memory by dq_dispatch (the FP16 path's own formulas), the activations FP16, FP32 sums.
 // Replaces MMQ's dp4a products on sm_70, and the FP16 path's dequantize-to-global + one cuBLAS call per expert.
 #if !defined(__HIPCC__)

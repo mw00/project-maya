@@ -1,10 +1,10 @@
 #pragma once
-// The split decode's groups (STRATA_GLM_SPLIT_ROWS = k): which of the requests ready for a step go through the parts
+// The split decode's groups (MAYA_GLM_SPLIT_ROWS = k): which of the requests ready for a step go through the parts
 // together.  The groups pipeline across the split - while one group's token is on the second GPU, the next one's is
 // on the first - so ONE group leaves every GPU but one idle at any moment.
 //
 // The old rule (greedy) fills groups of k in turn: at k or fewer requests that is one group, and the GPUs take turns
-// (two GPUs, k 4, 4 requests: slower than k 2).  STRATA_GLM_EVEN_GROUPS=1 instead cuts the requests running in all
+// (two GPUs, k 4, 4 requests: slower than k 2).  MAYA_GLM_EVEN_GROUPS=1 instead cuts the requests running in all
 // (`active`) into G = max(2, ceil(active / k)) groups of near-equal size, s = ceil(active / G) at most: k 4 is then
 // two groups of 2 at 4 requests (the pipeline full) and two of 4 at 8.  The size comes from all the running requests,
 // not from the ones ready now: in steady state the ready ones are the group that just came back, and cutting those

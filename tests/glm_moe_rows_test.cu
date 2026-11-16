@@ -1,4 +1,4 @@
-// tests/glm_moe_rows_test.cu - the batched rows' MoE pieces (glm_rows.cu, STRATA_GLM_SKIP_EMPTY / _GROUP_EXPERTS)
+// tests/glm_moe_rows_test.cu - the batched rows' MoE pieces (glm_rows.cu, MAYA_GLM_SKIP_EMPTY / _GROUP_EXPERTS)
 // against what the per-row path runs, on random Q8_0 experts (needs a GPU, no model):
 //  - moe_wait_fetch against moe_wait + moe_fetch: a route with only RAM-tier fetches, and one with a disk miss the host
 //    has answered (its source, table edits and CPU part) - the same slots, tables and parts;

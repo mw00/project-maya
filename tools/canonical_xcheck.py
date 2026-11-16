@@ -25,6 +25,9 @@ import argparse
 import collections
 import mmap
 import os
+import sys as _sys   # (an older STRATA_X counts as MAYA_X: tools/maya_names.py makes it so on import)
+_sys.path.append(os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), '.')))
+import maya_names  # noqa: E402,F401
 import pathlib
 import struct
 import sys
@@ -42,8 +45,8 @@ import gguf_reader as G                                    # noqa: E402
 from gguf_writer import dequantize_q2_0                    # noqa: E402
 from load import _dequant_flat                             # noqa: E402
 
-# default: $STRATA_SHARD1, else the development layout (<Strata>/Q2_0 beside <Strata>/Public/Engine)
-SHARD1 = os.environ.get("STRATA_SHARD1") or os.path.join(os.path.dirname(os.path.dirname(REPO)), "Q2_0",
+# default: $MAYA_SHARD1, else the development layout (<Strata>/Q2_0 beside <Strata>/Public/Engine)
+SHARD1 = os.environ.get("MAYA_SHARD1") or os.path.join(os.path.dirname(os.path.dirname(REPO)), "Q2_0",
                                                           "Qwen3.8-Flash-Next-Q2_0-00001-of-00002.gguf")
 
 QK = 64          # Q2_0 block: 64 elements

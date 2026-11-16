@@ -47,17 +47,17 @@ int main() {
     expect("no", false);
     expect("No", false);
     // from the environment itself
-    set("STRATA_TEST_ENV_SWITCH", "0");
-    if (env_switch("STRATA_TEST_ENV_SWITCH")) {
+    set("MAYA_TEST_ENV_SWITCH", "0");
+    if (env_switch("MAYA_TEST_ENV_SWITCH")) {
         ++failures;
-        std::fprintf(stderr, "FAIL: STRATA_TEST_ENV_SWITCH=0 read as on\n");
+        std::fprintf(stderr, "FAIL: MAYA_TEST_ENV_SWITCH=0 read as on\n");
     }
-    set("STRATA_TEST_ENV_SWITCH", "1");
-    if (!env_switch("STRATA_TEST_ENV_SWITCH")) {
+    set("MAYA_TEST_ENV_SWITCH", "1");
+    if (!env_switch("MAYA_TEST_ENV_SWITCH")) {
         ++failures;
-        std::fprintf(stderr, "FAIL: STRATA_TEST_ENV_SWITCH=1 read as off\n");
+        std::fprintf(stderr, "FAIL: MAYA_TEST_ENV_SWITCH=1 read as off\n");
     }
-    if (env_switch("STRATA_TEST_ENV_SWITCH_NEVER_SET")) {
+    if (env_switch("MAYA_TEST_ENV_SWITCH_NEVER_SET")) {
         ++failures;
         std::fprintf(stderr, "FAIL: an unset switch read as on\n");
     }

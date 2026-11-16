@@ -1,0 +1,49 @@
+{
+ "id": "chinese_06",
+ "group": "chinese",
+ "api": "openai",
+ "request": {
+  "messages": [
+   {
+    "role": "user",
+    "content": "把“我们明天上午十点开会”翻译成英文。"
+   }
+  ],
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "translate",
+     "description": "Translate text into a target language.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "text": {
+        "type": "string"
+       },
+       "target_language": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "text",
+       "target_language"
+      ]
+     }
+    }
+   }
+  ]
+ },
+ "expect": {
+  "calls": [
+   {
+    "name": "translate",
+    "args": {}
+   }
+  ],
+  "min_calls": 1,
+  "max_calls": 3,
+  "no_call": false,
+  "cjk_args": true
+ }
+}

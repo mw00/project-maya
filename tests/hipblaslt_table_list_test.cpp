@@ -1,4 +1,4 @@
-// STRATA_HIPBLASLT_TUNING's table list (src/prefill/hipblaslt_tuning.hpp split_table_list): ':' on Linux, ';' on
+// MAYA_HIPBLASLT_TUNING's table list (src/prefill/hipblaslt_tuning.hpp split_table_list): ':' on Linux, ';' on
 // Windows, where a drive letter's ':' stays in its path. Host code only: no GPU, no hipBLASLt.
 #include "hipblaslt_tuning.hpp"
 

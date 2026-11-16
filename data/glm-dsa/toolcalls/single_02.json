@@ -1,0 +1,81 @@
+{
+ "id": "single_02",
+ "group": "single",
+ "api": "openai",
+ "request": {
+  "messages": [
+   {
+    "role": "user",
+    "content": "How much is 120 euros in Japanese yen?"
+   }
+  ],
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "convert_currency",
+     "description": "Convert an amount of money between two ISO 4217 currencies.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "amount": {
+        "type": "number"
+       },
+       "from": {
+        "type": "string"
+       },
+       "to": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "amount",
+       "from",
+       "to"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "get_weather",
+     "description": "Current weather for a city.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string"
+       },
+       "unit": {
+        "type": "string",
+        "enum": [
+         "celsius",
+         "fahrenheit"
+        ]
+       }
+      },
+      "required": [
+       "city"
+      ]
+     }
+    }
+   }
+  ]
+ },
+ "expect": {
+  "calls": [
+   {
+    "name": "convert_currency",
+    "args": {
+     "amount": 120,
+     "from": "EUR",
+     "to": "JPY"
+    }
+   }
+  ],
+  "min_calls": 1,
+  "max_calls": 3,
+  "no_call": false
+ }
+}

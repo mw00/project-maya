@@ -74,15 +74,15 @@ class Rendering(_CleanToolOrders):
 
     def render_with_setting(self, setting, messages, **options):
         """A render with MAYA_DS4_KEEP_THINKING as a shell or the config's env sets it (`None`: unset)."""
-        saved = os.environ.pop("STRATA_DS4_KEEP_THINKING", None)
+        saved = os.environ.pop("MAYA_DS4_KEEP_THINKING", None)
         try:
             if setting is not None:
-                os.environ["STRATA_DS4_KEEP_THINKING"] = setting
+                os.environ["MAYA_DS4_KEEP_THINKING"] = setting
             return self.render(messages, **options)
         finally:
-            os.environ.pop("STRATA_DS4_KEEP_THINKING", None)
+            os.environ.pop("MAYA_DS4_KEEP_THINKING", None)
             if saved is not None:
-                os.environ["STRATA_DS4_KEEP_THINKING"] = saved
+                os.environ["MAYA_DS4_KEEP_THINKING"] = saved
 
     def test_official_golden_fixtures_byte_for_byte(self):
         for number in range(1, 6):
@@ -738,6 +738,27 @@ class Images(_CleanToolOrders):
             self.assertEqual(ids[start:start + size], [svc.vision.g.image_token] * size)
         self.assertEqual(svc.count_tokens(request), {"tokens": len(ids), "images": 2, "approximate": False,
                                                     "max_context": svc.engine.max_context})
+
+    def test_a_video_is_refused_with_or_without_a_picture(self):
+        """DeepSeek's vision tower reads pictures only: a video part is a clear 400 message, never dropped
+        (with a picture beside it) and never a missing video encoder (without one)."""
+        class NoPictures(ds4_vision.Vision):
+            def __init__(self, image_token):
+                self.g = ds4_vision.Geometry(image_token=image_token)
+                self.dir = ROOT / "serve/fixtures/deepseek_v41"
+
+            def picture(self, source):
+                raise AssertionError("no picture may be prepared for a request with a video")
+
+        svc = ServiceIntegration().service()
+        svc.vision = NoPictures(svc.tok.special_tokens[reference.IMAGE_PLACEHOLDER])
+        video = {"type": "video_url", "video_url": {"url": "data:video/mp4;base64,AAAA"}}
+        picture = {"type": "image_url", "image_url": {"url": "a.png"}}
+        for parts in ([video], [picture, video]):
+            request = {"messages": [{"role": "user", "content": [{"type": "text", "text": "what is in it?"}] + parts}]}
+            messages, tools, kwargs = openai_to_messages(request, deepseek=True)
+            with self.assertRaisesRegex(ValueError, "DeepSeek-V4.1-Flash reads pictures, not videos"):
+                svc.prepare(messages, tools, kwargs, 100)
 
 
 if __name__ == "__main__":

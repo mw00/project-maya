@@ -5,7 +5,8 @@
     st.raw(name), st.f32(name)            -> numpy views / float32 copies
 
 The index's own files come first; any other .safetensors in the directory (the Engram shards 47 / 48 of the base
-repo, model-0004[78]-of-00048.safetensors) only adds names the index does not have.  A name exllamav3 renamed (its
+repo, model-0004[78]-of-00048.safetensors) only adds names the index does not have (its copies of the others are kept
+in .dup: pack.py takes the vision tower from DeepSeek's shard 1 when the quant's own is not BF16).  A name exllamav3 renamed (its
 DeepSeek-V4.1 get_tensor_name_fixes: turboderp's EXL3 quants) is listed under DeepSeek's own (NAME_FIXES).
 """
 from __future__ import annotations
@@ -40,6 +41,7 @@ class SafeTensors:
         others = sorted(p.name for p in self.dir.glob("*.safetensors") if p.name not in primary)
         self.files: list[str] = []
         self.t: dict[str, tuple] = {}
+        self.dup: dict[str, list[tuple]] = {}   # a name's copies in later files (pack.py's BF16 vision tower, #886)
         self.mm: dict[str, np.memmap] = {}
         for fn in primary + others:
             p = self.dir / fn
@@ -52,10 +54,12 @@ class SafeTensors:
                 if k == "__metadata__":
                     continue
                 k = deepseek_name(k)
-                if k in self.t:
-                    continue
                 a, b = v["data_offsets"]
-                self.t[k] = (fn, v["dtype"], tuple(v["shape"]), base + a, b - a)
+                e = (fn, v["dtype"], tuple(v["shape"]), base + a, b - a)
+                if k in self.t:
+                    self.dup.setdefault(k, []).append(e)
+                    continue
+                self.t[k] = e
             self.mm[fn] = np.memmap(p, dtype=np.uint8, mode="r")
 
     def has(self, name: str) -> bool:

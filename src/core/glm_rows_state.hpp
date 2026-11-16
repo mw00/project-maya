@@ -39,13 +39,13 @@ struct Glm5Model::RowsState {
     uint8_t* head_xq = nullptr;
     float* logits = nullptr;
     int* tok = nullptr;
-    // STRATA_GLM_ROWS_BATCH: each row's own copies of the token path's KDA scratch (F->conv, F->g1, F->g2) and hc
+    // MAYA_GLM_ROWS_BATCH: each row's own copies of the token path's KDA scratch (F->conv, F->g1, F->g2) and hc
     // partials / barrier counter (F->part, F->counter)
     float* kconv[3] = {nullptr, nullptr, nullptr};
     float *kg1 = nullptr, *kg2 = nullptr, *hc_part = nullptr;
     uint8_t* hc_ctr = nullptr;
     int64_t hc_part_n = 0;
-    // STRATA_GLM_ROWS_ATTN: the DSA attention of all the rows in one launch (gf::mla_attend_rows) - each row's q_abs and
+    // MAYA_GLM_ROWS_ATTN: the DSA attention of all the rows in one launch (gf::mla_attend_rows) - each row's q_abs and
     // ctx (n_head x kv_lora), its own selection and streamed slot cells (n_sel_max), and the launch's partials
     float *aq = nullptr, *actx = nullptr, *apart = nullptr;
     int *acells = nullptr, *aslot = nullptr;
@@ -67,7 +67,7 @@ struct Glm5Model::RowSeq {
     const float* img = nullptr;
     const KvStream* kv = nullptr;   // KV streaming: that sequence's stream (null: not streamed)
     // the residual pair's base: the sequence's arena start (rows_bind), a verify window's row its own pair
-    // (rows_bind_win, STRATA_GLM_MULTI_MTP) - the embedding goes in there, the last layer leaves the residual there
+    // (rows_bind_win, MAYA_GLM_MULTI_MTP) - the embedding goes in there, the last layer leaves the residual there
     float* res = nullptr;
     float* kin = nullptr;   // a verify window's row: its conversation's KDA input records (null: none kept)
     int kin_t = 0;          // ... the row's index in them

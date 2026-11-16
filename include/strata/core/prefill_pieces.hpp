@@ -1,5 +1,5 @@
 #pragma once
-// STRATA_GLM_PREFILL_INTERLEAVE=<tokens>[,<rounds>[,cut]]: the several-conversation scheduler reads a new request's prompt
+// MAYA_GLM_PREFILL_INTERLEAVE=<tokens>[,<rounds>[,cut]]: the several-conversation scheduler reads a new request's prompt
 // in pieces of <tokens> while other requests decode, and between two pieces gives every running request <rounds>
 // decode steps (1 by default) - instead of stopping them all until the whole prompt is read (Sarathi-Serve's chunked
 // prefill, done as alternating calls here: the prompt path and the decode cannot share a step).  Each piece is one
@@ -23,7 +23,7 @@ struct PrefillInterleave {
     bool exact = true;
 };
 
-/// STRATA_GLM_PREFILL_INTERLEAVE's text (null: unset) -> the setting; a piece is 256 tokens at least.
+/// MAYA_GLM_PREFILL_INTERLEAVE's text (null: unset) -> the setting; a piece is 256 tokens at least.
 inline PrefillInterleave prefill_interleave_parse(const char* v) {
     PrefillInterleave r;
     if (v == nullptr || v[0] == '\0') return r;

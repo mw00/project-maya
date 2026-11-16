@@ -37,6 +37,13 @@ __device__ int block_scan(int v, int* warp_sums, int& total) {
 
 __device__ __forceinline__ void resolve_block(const KvStreamMap& m, const int* __restrict__ cells, int n_sel, int page,
                                               int* __restrict__ slot_cells);
+// L1-6: the live count from the device (glm-dsa's decode graphs), else resolve_kernel's code
+__global__ void __launch_bounds__(RT) resolve_dev_kernel(KvStreamMap m, const int* __restrict__ cells, int n_sel,
+                                                         const int* __restrict__ n_sel_dev, int page,
+                                                         int* __restrict__ slot_cells) {
+    const int n = *n_sel_dev;
+    resolve_block(m, cells, n < n_sel ? n : n_sel, page, slot_cells);
+}
 __device__ __forceinline__ void copy_block(const KvStreamMap& m, const uint8_t* __restrict__ host,
                                            uint8_t* __restrict__ slots, int len, int bx, int nbx);
 __global__ void __launch_bounds__(RT) resolve_kernel(KvStreamMap m, const int* __restrict__ cells, int n_sel, int page,
@@ -172,4 +179,30 @@ void glm_kv_resolve(const KvStreamMap& m, const uint8_t* host, uint8_t* slots, i
     if (e != cudaSuccess) std::fprintf(stderr, "glm kv stream: resolve: %s\n", cudaGetErrorString(e));
 }
 
+void glm_kv_resolve_dev(const KvStreamMap& m, const uint8_t* host, uint8_t* slots, int row_bytes, int page,
+                        const int* cells, int n_sel, const int* n_sel_dev, int* slot_cells, cudaStream_t s) {
+    if (n_sel <= 0) return;
+    resolve_dev_kernel<<<1, RT, 0, s>>>(m, cells, n_sel, n_sel_dev, page, slot_cells);
+    copy_kernel<<<96, 128, 0, s>>>(m, host, slots, page * row_bytes);
+    const cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) std::fprintf(stderr, "glm kv stream: resolve: %s\n", cudaGetErrorString(e));
+}
+namespace {
+__global__ void pull_kernel(uint4* __restrict__ dst, const uint4* __restrict__ src, size_t n) {
+    for (size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (size_t) gridDim.x * blockDim.x)
+        dst[i] = src[i];
+}
+}  // namespace
+void glm_kv_pull(uint8_t* dst, const uint8_t* src_mapped, size_t bytes, cudaStream_t s) {
+    if (bytes < 16) return;
+    pull_kernel<<<320, 256, 0, s>>>((uint4*) dst, (const uint4*) src_mapped, bytes / 16);
+    const cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) std::fprintf(stderr, "glm kv stream: pull: %s\n", cudaGetErrorString(e));
+}
+void glm_kv_copy_misses(const KvStreamMap& m, const uint8_t* host, uint8_t* slots, int row_bytes, int page,
+                        cudaStream_t s) {
+    copy_kernel<<<96, 128, 0, s>>>(m, host, slots, page * row_bytes);
+    const cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) std::fprintf(stderr, "glm kv stream: copy: %s\n", cudaGetErrorString(e));
+}
 }  // namespace strata::kernels::glmf

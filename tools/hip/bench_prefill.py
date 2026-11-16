@@ -7,6 +7,9 @@ between build/configuration arms, and keep model/template/settings identical.
 import argparse
 import json
 import os
+import sys as _sys   # (an older STRATA_X counts as MAYA_X: tools/maya_names.py makes it so on import)
+_sys.path.append(os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..')))
+import maya_names  # noqa: E402,F401
 from pathlib import Path
 import re
 import time
@@ -32,8 +35,8 @@ def main():
                     temperature=0, top_k=1, top_p=1, min_p=0, seed=42,
                     reasoning_effort='none')
         headers = {'Content-Type': 'application/json'}
-        if os.environ.get('STRATA_API_KEY'):
-            headers['Authorization'] = 'Bearer ' + os.environ['STRATA_API_KEY']
+        if os.environ.get('MAYA_API_KEY'):
+            headers['Authorization'] = 'Bearer ' + os.environ['MAYA_API_KEY']
         req = urllib.request.Request(args.url.rstrip('/') + '/v1/chat/completions',
                                      data=json.dumps(body).encode(), headers=headers)
         start = time.monotonic()

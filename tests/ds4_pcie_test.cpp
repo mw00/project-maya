@@ -1,6 +1,7 @@
 #include "../src/ds4/ds4_pcie.hpp"
 
 #include <cstdio>
+#include <initializer_list>
 #include <string>
 #include <vector>
 
@@ -57,6 +58,54 @@ int main() {
     CHECK(!pcie::verdicts_allow(-1, -1, true) && !pcie::verdicts_allow(-1, 1, false));
     CHECK(pcie::verdicts_allow(1, -1, false) && pcie::verdicts_allow(-1, 1, true));
 
+    // decode's checks (#697): a tie keeps streaming; only 3% slower twice in a row turns it off
+    const auto run = [](std::initializer_list<double> gains) {
+        int wins = 0, good = 0, bad = 0, v = 0;
+        for (double g : gains)
+            if ((v = pcie::ab_window(wins, good, bad, g)) != 0) break;
+        return v;
+    };
+    CHECK(run({-0.5}) == 0);                              // (the first window only warms up)
+    CHECK(run({0.0, -0.001, -0.008}) == 1);               // (an RTX 3090's +0.1% / +0.8%: it keeps streaming)
+    CHECK(run({0.0, 0.05, 0.04}) == 1);                   // (faster: as before)
+    CHECK(run({0.0, -0.045, -0.03}) == -1);               // (slower twice in a row: off, as before)
+    CHECK(run({0.0, -0.045, 0.01}) == 0);                 // (not twice in a row yet)
+    CHECK(run({0.0, -0.045, 0.01, -0.04, 0.0, -0.05, 0.02, -0.06, 0.0}) == 1);   // (undecided after 9: keeps it)
+    CHECK(run({0.0, -0.045, 0.01, -0.04, 0.0, -0.05, 0.02, -0.06}) == 0);
+    CHECK(run({0.0, 0.01, -0.04, -0.04}) == -1);          // (a tie, then slower twice: off)
+
+    // #956: a layer split takes the rule before #697 - 3% faster twice in a row keeps streaming, anything else off
+    const auto run_split = [](std::initializer_list<double> gains) {
+        int wins = 0, good = 0, bad = 0, v = 0;
+        for (double g : gains)
+            if ((v = pcie::ab_window(wins, good, bad, g, false)) != 0) break;
+        return v;
+    };
+    CHECK(run_split({-0.5}) == 0);                        // (the first window only warms up)
+    CHECK(run_split({0.0, 0.013, 0.017}) == -1);          // (2x RTX A4000's whole steps, -1.3% / -1.7%: off)
+    CHECK(run_split({0.0, -0.018, 0.022}) == -1);         // (4x RTX 3090: ties both ways, off)
+    CHECK(run_split({0.0, 0.05, 0.04}) == 1);             // (faster: it streams)
+    CHECK(run_split({0.0, 0.05, 0.01, 0.04, 0.03}) == 1); // (a tie between: not twice in a row yet, then faster twice)
+    CHECK(run_split({0.0, -0.045, -0.03}) == -1);         // (slower twice: off)
+    CHECK(run_split({0.0, 0.05, 0.0, 0.05, 0.0, 0.05, 0.0, 0.05, 0.0}) == -1);   // (undecided after 9: off)
+    CHECK(run_split({0.0, 0.05, 0.0, 0.05, 0.0, 0.05, 0.0, 0.05}) == 0);
+    CHECK(run_split({0.0, 0.03, 0.03}) == 1 && run_split({0.0, 0.0299, 0.0299}) == -1);   // (the 3% edge, as before)
+
+    // #920: a one-GPU PC whose CPU lane is far faster than its link for experts in RAM (the reporter's timed costs: an
+    // RTX PRO 5000 over a 7.2 GB/s link, a Ryzen AI Max+ 395): nothing streams warm, only disk reads split - with most
+    // of the CPU lane copied into RAM the one-GPU path ends; mostly in place, or a warm stream: kept as before
+    const pcie::Costs fast_cpu{0.107, 0.037, 1.907, 0.163, 0.006, 3.54};
+    CHECK(!pcie::streams_any(fast_cpu, 16, 6, false));
+    CHECK(pcie::streams_any(fast_cpu, 16, 6, true));   // (the cold split: what kept the path on)
+    CHECK(!pcie::one_gpu_keep(true, false, 9910, 11536));
+    CHECK(!pcie::one_gpu_keep(true, false, 5768, 11536));       // (exactly half copied: still the warm rule)
+    CHECK(pcie::one_gpu_keep(true, false, 5767, 11536));        // (most in place: as before)
+    CHECK(pcie::one_gpu_keep(true, false, 0, 11536) && pcie::one_gpu_keep(true, false, 0, 0));
+    CHECK(pcie::one_gpu_keep(true, true, 9910, 11536));         // (a warm stream: the measured case, kept)
+    CHECK(!pcie::one_gpu_keep(false, true, 9910, 11536) && !pcie::one_gpu_keep(false, false, 0, 11536));
+    CHECK(pcie::one_gpu_keep(true, pcie::streams_any(slow, 8, 6, false), 9910, 11536));
+
     std::puts("DS4 PCIe gates: persisted lane off, no/zero/partial pinning, force and hold cases passed; the warm-only "
-              "decision where no pick can be cold (#551) passed");
+              "decision where no pick can be cold (#551) passed; decode's checks keep streaming on a tie on one GPU "
+              "(#697), a layer split turns a tie off (#956); the one-GPU path's warm rule (#920) passed");
 }

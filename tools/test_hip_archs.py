@@ -1,12 +1,15 @@
 """Exercise CMake's actual architecture parser without enabling a compiler."""
 from pathlib import Path
+import shutil
 import subprocess
 import tempfile
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
+CMAKE = shutil.which("cmake")
 
 
+@unittest.skipIf(CMAKE is None, "CMake is not on PATH: these tests run CMake's own parser (cmake -P)")
 class HipArchitectureTests(unittest.TestCase):
     def probe(self, value):
         # Run the same validation/normalization code used before enable_language.
@@ -15,7 +18,7 @@ class HipArchitectureTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             script = Path(tmp) / "probe.cmake"
             script.write_text("cmake_minimum_required(VERSION 3.24)\n" + source)
-            return subprocess.run(["cmake", f"-DCMAKE_HIP_ARCHITECTURES={value}", "-P", str(script)],
+            return subprocess.run([CMAKE, f"-DCMAKE_HIP_ARCHITECTURES={value}", "-P", str(script)],
                                   capture_output=True, text=True)
 
     def test_single(self):

@@ -31,7 +31,7 @@ These are fresh checks of this patch, separate from earlier custom-build reports
 | Host compiler | GCC 13.3.0 |
 | CMake | 3.28.3 |
 
-Upstream accepts `gfx906` at configure time via #505. This pull request adds direct peer-to-peer PCIe transfers (`MAYA_GLM_P2P`), enables opt-in tuned IQ2_S expert dispatch on gfx906 (`STRATA_GLM_GU22_TUNED`), enables `DS4_IQ_STRICT_FP` on `gfx906` in `src/ds4/ds4_iq.cu`, and restores the wave64 64-lane logical-warp regression probe in `tests/hip/intrinsics.cpp`. Every gfx906 code path is guarded behind strict architecture checks (`#if defined(STRATA_USE_HIP)` and `enable_gfx906_peer_cached` / `allow_gfx906 && gfx906` / `__gfx906__`), leaving non-gfx906 GPUs completely unchanged.
+Upstream accepts `gfx906` at configure time via #505. This pull request adds direct peer-to-peer PCIe transfers (`MAYA_GLM_P2P`), enables opt-in tuned IQ2_S expert dispatch on gfx906 (`MAYA_GLM_GU22_TUNED`), enables `DS4_IQ_STRICT_FP` on `gfx906` in `src/ds4/ds4_iq.cu`, and restores the wave64 64-lane logical-warp regression probe in `tests/hip/intrinsics.cpp`. Every gfx906 code path is guarded behind strict architecture checks (`#if defined(STRATA_USE_HIP)` and `enable_gfx906_peer_cached` / `allow_gfx906 && gfx906` / `__gfx906__`), leaving non-gfx906 GPUs completely unchanged.
 
 The source build used HIP for `gfx906`, disabled CUDA, enabled tests, prefill MMQ, and native experts, and used the pinned GGML checkout. The build produced Maya and the applicable HIP parity targets. Sections 2–6 report the GLM-5.3 server benchmark suite; `ds4_gguf_test` kernel and quant parity for `src/ds4/ds4_iq.cu` is reported in Section 7.
 
@@ -119,14 +119,14 @@ The recorded control and candidate configuration used the same meaningful engine
 --layer-split auto --split-device 1,2,3
 --expert-profile <project>/data/expert-profile-glm.bin
 
-STRATA_GLM_WARM_PROMPT=1
-STRATA_GLM_COMPLETE_POOL=0
-STRATA_GLM_PREFILL_MB=2048
-STRATA_GLM_PREFILL_SUB=1024
-STRATA_GLM_RESERVE_MB=1024
-STRATA_GLM_SLOT_KEEP=0
-STRATA_GLM_VRAM_EVICT=least
-STRATA_GLM_SLOT_DIR=<writable-per-run-directory>
+MAYA_GLM_WARM_PROMPT=1
+MAYA_GLM_COMPLETE_POOL=0
+MAYA_GLM_PREFILL_MB=2048
+MAYA_GLM_PREFILL_SUB=1024
+MAYA_GLM_RESERVE_MB=1024
+MAYA_GLM_SLOT_KEEP=0
+MAYA_GLM_VRAM_EVICT=least
+MAYA_GLM_SLOT_DIR=<writable-per-run-directory>
 
 HIP_VISIBLE_DEVICES=0,1,2,3
 CUDA_VISIBLE_DEVICES=0,1,2,3
@@ -227,7 +227,7 @@ benchmark corpus manifest SHA-256: 70fc3af400dda4c270b1742153999480efe6c91ce8f8b
    - Wrapping `sub_dot`, `gate_up_kernel`, `down_kernel`, and `lanes_sum` reductions in explicit `#pragma clang fp contract(off)` helpers with `asm volatile` register barriers (`fadd_no_fma`, `fsub_no_fma`, `fmul_no_fma`, `fma_no_contract`) preserves 100% bit-for-bit identity between token and window paths on both `gfx906` and `gfx1201`.
 2. **GLM-5.3 HIP Microbenchmarks (`gfx906` MI50 & `gfx1201` R9700)**:
    - `hip_intrinsics`: **PASS** (100% parity on signed `sdot4`/overflow, 65,536 packed-byte pairs, wave32/64 shuffles, ballot, sleep).
-   - `hip_expert_kernel_bench --parity-only`: **PASS** (`bit_identical=yes` across all 6 production quantization pairs including `gu=21/down=17` `IQ3_S/IQ2_XS` and `gu=22/down=22` with `hip_fast_signs` and `STRATA_GLM_GU22_TUNED=1`).
+   - `hip_expert_kernel_bench --parity-only`: **PASS** (`bit_identical=yes` across all 6 production quantization pairs including `gu=21/down=17` `IQ3_S/IQ2_XS` and `gu=22/down=22` with `hip_fast_signs` and `MAYA_GLM_GU22_TUNED=1`).
    - `glm_attn_bench`: **PASS** (100% bit-exact parity on all `dsa_score` and `mla_attend` shapes with hardware intra-lane butterfly reductions `ds_swizzle` + DPP `quad_perm` on `gfx906` and `v_permlanex16` + `row_xmask` on `gfx1201`).
    - `glm_mv_bench --parity-only`: **PASS** (`differ=0 max_abs=0.000e+00` across all `router_shexp`, `dense_gu`, `dense_down`, and `head` variants).
 

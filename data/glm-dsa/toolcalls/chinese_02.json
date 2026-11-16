@@ -1,0 +1,55 @@
+{
+ "id": "chinese_02",
+ "group": "chinese",
+ "api": "openai",
+ "request": {
+  "messages": [
+   {
+    "role": "user",
+    "content": "帮我把 500 人民币换算成美元。"
+   }
+  ],
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "convert_currency",
+     "description": "Convert an amount of money between two ISO 4217 currencies.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "amount": {
+        "type": "number"
+       },
+       "from": {
+        "type": "string"
+       },
+       "to": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "amount",
+       "from",
+       "to"
+      ]
+     }
+    }
+   }
+  ]
+ },
+ "expect": {
+  "calls": [
+   {
+    "name": "convert_currency",
+    "args": {
+     "amount": 500
+    }
+   }
+  ],
+  "min_calls": 1,
+  "max_calls": 3,
+  "no_call": false,
+  "cjk_args": false
+ }
+}

@@ -110,7 +110,7 @@ bool mla_wmma2_default();
 #endif
 /// One decode token's absorbed MLA attention on Volta's tensor cores (mla_attn_v70_kernel in cell splits, then their
 /// merge): ctx[h] = softmax(q_abs[h] . lat_c * scale) . lat_c over its n_sel cells.  part holds part_cap splits of
-/// n_head x (kv_lora + 2) floats.  False (nothing launched) off Volta, for other shapes, or with STRATA_GLM_MLA_V70=0.
+/// n_head x (kv_lora + 2) floats.  False (nothing launched) off Volta, for other shapes, or with MAYA_GLM_MLA_V70=0.
 bool mla_decode_v70(const float* q_abs, const uint16_t* lat, const int* cells, int n_sel, int n_head, int kv_lora,
                     float scale, float* ctx, float* part, int part_cap, cudaStream_t s, bool lat_q8 = false);
 /// Absorbed MLA attention per token and head over the token's cells: ctx[t][h] = softmax(q_abs[t][h] . lat_c *
@@ -123,7 +123,8 @@ void head_rows(const float* R, const float* w, float eps, int T, int n_embd, flo
 /// out16[t] = [rms(emb[t]) * enorm, rms(h[t]) * hnorm] in FP16 (eh_proj's input, 2 n_embd per row).
 void mtp_in_rows(const float* emb, const float* h, const float* enorm, const float* hnorm, float eps, int T, int n_embd,
                  void* out16, cudaStream_t s);
-/// x[t] = rms(in[t]) * w as F32 and FP16.  n_embd <= 4096, a multiple of 256.
+/// x[t] = rms(in[t]) * w as F32 and FP16.  n_embd <= 8192 (kMaxEmbd), a multiple of 256 (head_rows and mtp_in_rows
+/// too); any other width is refused and counted in launch_errors.
 void rms_rows(const float* in, const float* w, float eps, int T, int n_embd, float* x, void* x16, cudaStream_t s);
 
 /// The router per token (router_sigmoid's arithmetic: sigmoid, bias selection, stable top-k, normalised weights).

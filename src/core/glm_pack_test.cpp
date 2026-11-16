@@ -33,8 +33,8 @@ int main(int argc, char** argv) {
     const size_t V = (size_t) model.geometry().n_vocab;
     std::fprintf(stderr, "glm_pack_test: loaded (vocab %zu, layers %d)\n", V, model.geometry().n_layers);
 
-    if (getenv("STRATA_GLM_TEST_PIPE")) {
-        // ONE forward for all tokens: with STRATA_GLM_SPLIT this exercises the cross-token pipeline,
+    if (getenv("MAYA_GLM_TEST_PIPE")) {
+        // ONE forward for all tokens: with MAYA_GLM_SPLIT this exercises the cross-token pipeline,
         // and the single output row must be BITWISE equal to the serial run's LAST row
         std::vector<int32_t> all((size_t) n_tok);
         for (int t = 0; t < n_tok; ++t) all[(size_t) t] = (int32_t) ((t % 511) + 1);
@@ -142,7 +142,7 @@ int main(int argc, char** argv) {
         std::printf("pos %d tok %d argmax %d (%.6f)\n", t, tok, am, lg[(size_t) am]);
     }
     // GLM_TEST_TIME=<n>: then n more tokens token by token, twice: the time a token costs (with and without a DFlash
-    // drafter loaded, STRATA_GLM_DFLASH, the same forward)
+    // drafter loaded, MAYA_GLM_DFLASH, the same forward)
     if (const char* tv = getenv("GLM_TEST_TIME")) {
         const int nt = std::max(1, std::atoi(tv));
         int at = (int) model.position();
@@ -165,7 +165,7 @@ int main(int argc, char** argv) {
         }
     }
     // GLM_TEST_WINDOW=T: the same ids again through verify windows of T tokens (Glm5Model::window), every window
-    // position's pick against the token-at-a-time argmax recorded above - with the CPU lane off (STRATA_GLM_CPU_LANE=0:
+    // position's pick against the token-at-a-time argmax recorded above - with the CPU lane off (MAYA_GLM_CPU_LANE=0:
     // the CPU's experts are not the GPU's arithmetic) they must agree bit for bit.  The commits keep 1, 2, .. T tokens in
     // turn, so the rejected-token path (the recurrent state restored and the kept tokens replayed) runs as often as the
     // full one; the next window starts after the kept ones.
@@ -301,7 +301,7 @@ int main(int argc, char** argv) {
                          v.insert(v.end(), tws.begin(), tws.end());
                          return v;
                      }()) {
-                    model.win_prof_report();   // (the per-layer split of the window segments below, STRATA_GLM_WIN_PROF)
+                    model.win_prof_report();   // (the per-layer split of the window segments below, MAYA_GLM_WIN_PROF)
                     if (!seg(Tw)) {
                         std::fprintf(stderr, "glm_pack_test: timed: %s\n", err.c_str());
                         return 1;

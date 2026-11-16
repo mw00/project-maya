@@ -61,7 +61,7 @@ public:
     /// free yet, or a read failed: `err`).  True when nothing is lent.
     bool reclaim_experts(std::string& err);
     bool experts_lent() const { return experts_arena_.lent(); }
-    /// The draft layer's K/V state (read-only: --serve's STRATA_STATE_HASH check hashes it)
+    /// The draft layer's K/V state (read-only: --serve's MAYA_STATE_HASH check hashes it)
     const QsaState& kv_state() const { return st_; }
     /// KV streaming: refill the ring of the drafter's window from its host copy for a sequence that continues at
     /// `upto` (a conversation-cache resume). No-op unless the drafter's K/V is a ring.

@@ -21,6 +21,15 @@ refused by default; `MAYA_HIP_ALLOW_ROCM6=1` lets setup go on with a warning. Th
 `HIPBLAS_V2` API and skips `hipblasSetWorkspace` (absent before hipBLAS 3). Measured that way on Debian sid
 (ROCm 6.4.3, hipBLAS 2.4) with an MI50 + MI100 layer split and a CPU without AVX2 - see the pull request.
 
+**Ubuntu's own ROCm packages: the rocWMMA headers.** Ubuntu's `librocwmma-dev` (seen with 7.1.0-0ubuntu1) ships
+`rocwmma.hpp` but not the `internal/` headers it includes, so the HIP build for a card with matrix cores (`gfx1100`,
+`gfx1201`, `gfx1151`) stops at `internal/accessors.hpp`, and no other Ubuntu package has that file. rocWMMA is
+headers only: take the header tree of the same version from AMD's `ROCm/rocWMMA` repository (the tag that matches the
+package, e.g. `rocm-7.1.0`), put it in `~/.local/include/rocwmma`, and run the setup with
+`CPLUS_INCLUDE_PATH=~/.local/include` set (for example `CPLUS_INCLUDE_PATH=$HOME/.local/include ./maya.sh --backend hip
+...`); a user's build compiled cleanly that way. The other way is ROCm from AMD's own repository (repo.radeon.com)
+instead of Ubuntu's packages, with rocWMMA's development package from there.
+
 ```sh
 ./maya.sh --backend hip --gpu 0 --check
 ./maya.sh --backend hip --gpu 0 --context 8192 --no-vision --yes \
@@ -341,13 +350,13 @@ table keeps only the rows that were at least 2% faster.
 - Fixed the KDA parity fixture to initialize its recurrence state explicitly;
   its numerical tolerance is unchanged.
 - The HIP post-store system fences in both shared doorbell kernels and Maya's
-  fused routing signal (backported from Strata) arrived separately in v1.0.7
+  fused routing signal (backported from the upstream engine) arrived separately in v1.0.7
   (#2); the validation below includes them.
 
-Upstream Strata was inspected at `d5ea713` (0.1.40.3). Its AMD backend documents
+The upstream engine was inspected at `d5ea713` (0.1.40.3). Its AMD backend documents
 runtime selection, memory limits, desktop VRAM headroom, and newer packed-byte
-optimizations. Maya's GLM engine is separate from Strata's current Qwen engine,
-so Strata's model benchmarks do not establish Maya performance.
+optimizations. Maya's GLM engine is separate from the upstream engine's current Qwen engine,
+so its model benchmarks do not establish Maya performance.
 
 ## Validation
 

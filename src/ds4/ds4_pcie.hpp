@@ -95,6 +95,41 @@ inline bool verdicts_allow(int warm, int cold, bool cold_possible) {
     return warm >= 0 || (cold_possible && cold >= 0);
 }
 
+/// Decode's checks of streaming (LaneAB over one layer's lanes, TokAB over whole steps): one window's gain (1 - the
+/// split's time / the CPU lane's alone) into the verdict - 1: it keeps streaming, -1: off (the times file keeps that),
+/// 0: still measuring.  The first window only warms up.  Streaming is the choice being measured, and a tie keeps it:
+/// only a split measured 3% slower twice in a row turns it off; twice in a row not slower (faster, or within 3%)
+/// keeps it, and so does a check still undecided after 9 windows.  (Ties went the other way - 3% faster or off - and an
+/// RTX 3090 that measured +0.1% had streaming written off, and the next start turned off more than was measured; every
+/// later start kept it: #697)
+/// tie_keeps false: the rule before #697 - 3% faster twice in a row keeps streaming, anything else twice in a row (a
+/// tie included) or undecided after 9 windows turns it off.  A layer split (several GPUs) takes that rule (#956: on
+/// 2x RTX A4000 and 4x RTX 3090 the whole-step check measured ties while a start with the lane off decoded 4-5%
+/// faster - the lane's cost when nothing much streams falls on both of the check's turns, so it reads as a tie); one
+/// GPU keeps #697's
+inline int ab_window(int& wins, int& good, int& bad, double gain, bool tie_keeps = true) {
+    if (++wins == 1) return 0;
+    if (tie_keeps ? gain <= -0.03 : gain < 0.03) {
+        good = 0;
+        if (++bad >= 2) return -1;
+    } else {
+        bad = 0;
+        if (++good >= 2) return 1;
+    }
+    return wins >= 9 ? (tie_keeps ? 1 : -1) : 0;
+}
+
+/// Whether the one-GPU decode path (landings, its recent slots, verify windows streamed) stays on after the lane's
+/// timing (#920).  streams: some layer's split streams for some request, warm or cold; warm: some class streams a pick
+/// count with every pick in RAM (and decode's warm check has not measured it slower); held / cpu_lane: the CPU lane's
+/// experts copied into RAM / all of them.  Where the copies hold at least half of them (cold picks a minority), a split
+/// of disk reads alone does not pay for the recent slots' VRAM - the path needs a warm stream; where most are read in
+/// place, any stream keeps it, as before
+inline bool one_gpu_keep(bool streams, bool warm, long long held, long long cpu_lane) {
+    const bool copies_most = cpu_lane > 0 && 2 * held >= cpu_lane;
+    return streams && (warm || !copies_most);
+}
+
 /// The pre-placement allocation always follows the persisted baseline decision; experimental ZC settings cannot
 /// override it and thereby change expert placement. Forced routing keeps its existing explicit override.
 inline bool baseline_lane_off(const std::string& forced, const std::string& persisted) {

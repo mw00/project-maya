@@ -106,6 +106,16 @@ int main() {
         CHECK(d::uma_free(55 * GiB, tot, 5 * GiB, head) == 55 * GiB);      // (less than the headroom)
         CHECK(d::uma_free(55 * GiB, 100 * GiB, 200 * GiB, head) == 100 * GiB);
     }
+    {   // #794: the pin took a GPU's room - near empty after it, or its free read failed after a good one
+        CHECK(d::pin_took_vram(1412, 0, 256));       // (the reports: ~1.4 GB free without the pin, 0 with it)
+        CHECK(d::pin_took_vram(1412, -1, 256));      // (the read failed after the pin)
+        CHECK(d::pin_took_vram(256, 255, 256));
+        CHECK(!d::pin_took_vram(1412, 1400, 256));   // (a few MiB less: not the failure)
+        CHECK(!d::pin_took_vram(1412, 300, 256));
+        CHECK(!d::pin_took_vram(200, 0, 256));       // (already near empty before: not the pin's doing)
+        CHECK(!d::pin_took_vram(-1, 0, 256));        // (nothing to compare with)
+        CHECK(!d::pin_took_vram(1412, 0, 0));        // (the check off)
+    }
     if (fails == 0) std::printf("ds4 prompt / memory rules: ok\n");
     return fails == 0 ? 0 : 1;
 }

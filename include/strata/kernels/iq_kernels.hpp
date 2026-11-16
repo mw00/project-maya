@@ -35,7 +35,7 @@ void iq_embed_rows(int ggml_type, const void* table, size_t row_bytes, const int
 void iq_dequant_gu_f16(int ggml_type, const void* gate, const void* up, int64_t n_ff, int64_t n_embd, uint16_t* dst,
                        void* stream);
 
-/// The grouped WMMA launches' by-value weight table (the Volta prompt experts, STRATA_PF_WMMA): expert e's gate/up
+/// The grouped WMMA launches' by-value weight table (the Volta prompt experts, MAYA_PF_WMMA): expert e's gate/up
 /// matrix at gu[e], its down matrix at dn[e].  The prompt path's group size (16) is the table's capacity.
 constexpr int kGroupedWeightTableMax = 16;
 struct GroupedWeightTable {
@@ -67,8 +67,15 @@ struct NativeExpertLayout {
     size_t gu_row = 0, d_row = 0;       // bytes per row
     size_t up_off = 0, down_off = 0;    // byte offsets inside the blob
     size_t bytes = 0;                   // the whole blob
+    int u_type = -1;                    // the up rows' type: gu_type except on a mixed layer (gate:up in the pack)
+    size_t u_row = 0;
 };
 NativeExpertLayout native_expert_layout(int gu_type, int d_type, int64_t n_embd, int64_t n_ff);
+/// The same for a layer whose up rows have their own type (up_type == gu_type: exactly the call above).
+NativeExpertLayout native_expert_layout(int gu_type, int up_type, int d_type, int64_t n_embd, int64_t n_ff);
+/// iq_dequant_gu_f16 with the gate and the up rows of two types (a mixed layer).
+void iq_dequant_gu_f16_mixed(int gate_type, int up_type, const void* gate, const void* up, int64_t n_ff,
+                             int64_t n_embd, uint16_t* dst, void* stream);
 
 /// Bytes of scratch `native_expert_grouped` needs for `cap_entries` entries.
 size_t native_expert_scratch_bytes(int64_t cap_entries, int64_t n_ff);
@@ -77,7 +84,9 @@ size_t native_expert_scratch_bytes(int64_t cap_entries, int64_t n_ff);
 /// [grp_start[g], grp_start[g+1]) read token ent_tok[e]'s q8_1 activation (n_embd/32 blocks per token in x_q8_1)
 /// and write row ent_dst[e] of `out` (n_embd floats).  Counts are read on the device.  swiglu_limit
 /// = +infinity (default) keeps the plain unclamped silu*up; a finite limit is GLM's clamped swiglu.
-void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long* grp_ptr, const int32_t* grp_start,
+/// glm-dsa B3.5: false (a line on stderr, nothing launched) when L.gu_type or L.d_type has no kernel - the i-quants,
+/// Q2_0 and the K-quants Q2_K .. Q6_K have one in both roles; the caller reports it.
+bool native_expert_grouped(const NativeExpertLayout& L, const unsigned long long* grp_ptr, const int32_t* grp_start,
                            const int32_t* n_groups, const int32_t* ent_dst, const int32_t* ent_tok, int64_t cap_groups,
                            int64_t cap_entries, const void* x_q8_1, void* scratch, float* out, void* stream,
                            float swiglu_limit = std::numeric_limits<float>::infinity());

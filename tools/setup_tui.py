@@ -228,6 +228,9 @@ class SetupApp(App):
         out.write(styled(kind, text), width=width if width > 20 else None)
         self.written, self.flow = self.written + 1, width
 
+    def ev_model(self, name: str) -> None:
+        self.query_one("#splash", Static).update(splash(name))
+
     def ev_say(self, msg: str) -> None:
         line = msg.strip()
         if line.endswith("..."):                        # "Compiling the engine for sm_86 (...) ...": what runs now

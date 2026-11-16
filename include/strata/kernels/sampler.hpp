@@ -51,7 +51,7 @@ void sample_tokens(const float* logits, int n_tokens, int n_vocab, const int* hi
                    const SamplerParams& p, int* out, void* stream);
 
 // SPECULATIVE SAMPLING (Leviathan et al. 2023, Chen et al. 2023) for the pipelined NextN decode - opt-in
-// (STRATA_GLM_SPEC_SAMPLE=1).  The draft is DRAWN from the draft block's own distribution q (this chain on its logits,
+// (MAYA_GLM_SPEC_SAMPLE=1).  The draft is DRAWN from the draft block's own distribution q (this chain on its logits,
 // a Philox stream of its own) and its kept list is stored; the model's token is then the draft with probability
 // min(1, p(d) / q(d)), else a draw from the residual max(0, p - q) renormalised - so it is distributed exactly as the
 // plain draw from p, and a draft stands whenever the token is the draft (sum over x of min(p(x), q(x)) of the time

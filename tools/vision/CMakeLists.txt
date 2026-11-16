@@ -7,7 +7,7 @@
 cmake_minimum_required(VERSION 3.21)
 project(strata_vision C CXX)
 
-# Maya's build options by the names its docs give them: -DMAYA_X=... sets STRATA_X, the name this file reads
+# Maya's build options by the names its docs give them: -DMAYA_X=... sets MAYA_X, the name this file reads
 get_cmake_property(_maya_cache CACHE_VARIABLES)
 foreach(_v IN LISTS _maya_cache)
   if(_v MATCHES "^MAYA_(.+)$")

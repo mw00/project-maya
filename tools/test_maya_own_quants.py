@@ -177,7 +177,7 @@ class ProfileOfAnotherSize(Tmp):
             self.skipTest("llama.cpp's gguf-py (pip: gguf) is not installed")
         src = self.root / "synth" / "GLM-5.3-Flash-synth12.gguf"
         src.parent.mkdir()
-        env = dict(os.environ, STRATA_GGUF_PY=str(Path(gguf_py.__file__).resolve().parents[1]))
+        env = dict(os.environ, MAYA_GGUF_PY=str(Path(gguf_py.__file__).resolve().parents[1]))
         subprocess.run([sys.executable, str(ROOT / "tools" / "glm_synth_gguf.py"), "--out", str(src), "--vocab"],
                        check=True, capture_output=True, env=env)
         pk = src.parent / "pack"

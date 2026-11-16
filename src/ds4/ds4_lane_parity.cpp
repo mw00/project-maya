@@ -495,7 +495,7 @@ std::vector<uint8_t> rand_rows(int type, int n, int k, std::mt19937& rng) {
 void pick_form() {
 #if defined(PAR_X86)
     init_ksx();
-    const char* f = std::getenv("STRATA_DS4_LANE_PARITY_SCALAR");
+    const char* f = std::getenv("MAYA_DS4_LANE_PARITY_SCALAR");
     if (f == nullptr) f = std::getenv("DS4_LANE_PARITY_SCALAR");
     if ((f != nullptr && std::atoi(f) != 0) || !cpu_avx2()) return;
     std::mt19937 rng(0x644u);

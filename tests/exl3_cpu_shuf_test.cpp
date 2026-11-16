@@ -1,4 +1,4 @@
-// tests/exl3_cpu_shuf_test.cpp - STRATA_EXL3_AVX2_SHUF: the AVX2 tier's byte-aligned windows taken by byte shuffles,
+// tests/exl3_cpu_shuf_test.cpp - MAYA_EXL3_AVX2_SHUF: the AVX2 tier's byte-aligned windows taken by byte shuffles,
 // against the same tier's shifts and against the scalar tier, bit for bit (no GPU, no model).
 //
 //   exl3_cpu_shuf_test [--env]
@@ -14,9 +14,9 @@
 //    rounding order): every path, off and on, against the scalar tier;
 //  - random F32 activations: on against off (the scalar tier rounds otherwise: it has no FMA).
 // The rows and the GEMM run on the lane's tier (exl3_cpu_tier()), which must be 1 (AVX2): the ctest entries set
-// STRATA_FORCE_AVX2=1 so an AVX-512 CPU runs it too. A CPU without AVX2 (or a build for another architecture) is
+// MAYA_FORCE_AVX2=1 so an AVX-512 CPU runs it too. A CPU without AVX2 (or a build for another architecture) is
 // told so and the test exits 77 (ctest: skipped).
-// --env: run with STRATA_EXL3_AVX2_SHUF=1 - the switch must be on at the start (the kernels' own start check
+// --env: run with MAYA_EXL3_AVX2_SHUF=1 - the switch must be on at the start (the kernels' own start check
 // passed), the ctest entry exl3_cpu_shuf_test_env. Without --env and without that variable it must be off (the
 // default).
 #include "strata/kernels/cpu/exl3_cpu.hpp"
@@ -164,17 +164,17 @@ int main(int argc, char** argv) {
     const int tier = kc::exl3_cpu_tier();
     std::printf("exl3_cpu_shuf_test: the lane's EXL3 CPU tier %d (%s)\n", tier, tier_name(tier));
     int fail = 0;
-    // the switch: on at the start with STRATA_EXL3_AVX2_SHUF=1 (the start check passed), off by default
-    const char* ev = std::getenv("STRATA_EXL3_AVX2_SHUF");
+    // the switch: on at the start with MAYA_EXL3_AVX2_SHUF=1 (the start check passed), off by default
+    const char* ev = std::getenv("MAYA_EXL3_AVX2_SHUF");
     const bool at_start = kc::exl3_cpu_avx2_shuf();
     if (env_mode && tier == 1 && !at_start) {
-        std::printf("  STRATA_EXL3_AVX2_SHUF=%s: off at the start  FAIL\n", ev ? ev : "(unset)");
+        std::printf("  MAYA_EXL3_AVX2_SHUF=%s: off at the start  FAIL\n", ev ? ev : "(unset)");
         ++fail;
     } else if (!env_mode && ev == nullptr && at_start) {
-        std::printf("  STRATA_EXL3_AVX2_SHUF unset: on at the start  FAIL (it must be off by default)\n");
+        std::printf("  MAYA_EXL3_AVX2_SHUF unset: on at the start  FAIL (it must be off by default)\n");
         ++fail;
     } else {
-        std::printf("  switch at the start: %s (STRATA_EXL3_AVX2_SHUF=%s)  ok\n", at_start ? "on" : "off",
+        std::printf("  switch at the start: %s (MAYA_EXL3_AVX2_SHUF=%s)  ok\n", at_start ? "on" : "off",
                     ev ? ev : "unset");
     }
     for (int s = 1; s >= 0; --s) {
@@ -186,7 +186,7 @@ int main(int argc, char** argv) {
     }
     if (tier != 1) {
         std::printf("exl3_cpu_shuf_test: SKIPPED - the AVX2 tier is not the lane's here (tier %d; an AVX-512 CPU needs "
-                    "STRATA_FORCE_AVX2=1, a CPU without AVX2 or another architecture cannot run it)\n", tier);
+                    "MAYA_FORCE_AVX2=1, a CPU without AVX2 or another architecture cannot run it)\n", tier);
         return fail != 0 ? 1 : 77;
     }
     std::vector<float> wcb(kc::exl3_cpu_gemm_scratch() + 16);

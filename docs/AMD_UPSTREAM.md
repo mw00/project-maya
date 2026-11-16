@@ -1,13 +1,13 @@
 # Shared AMD backport audit
 
-Compared Maya v1.0.4 (`70e0746`) plus this branch's GLM HIP port with Strata
+Compared Maya v1.0.4 (`70e0746`) plus this branch's GLM HIP port with the upstream engine
 [`d5ea713`](https://github.com/Niko1221/Strata/tree/d5ea7133741e67743c0e886bb426c0ce8d69cf6c).
 The publication fixes below were merged in v1.0.7 (#2). Broader backend
 updates require their own GLM validation.
 
 ## Publication fixes applied
 
-Strata [issue #697](https://github.com/Niko1221/Strata/issues/697) reports that
+Upstream [issue #697](https://github.com/Niko1221/Strata/issues/697) reports that
 the mapped-memory doorbell store can remain invisible to the CPU until stream
 synchronization on gfx1201. Upstream uses a volatile ring store and a HIP-only
 `__threadfence_system()` after the store in both shared doorbell kernels.
@@ -59,13 +59,13 @@ with them.
 
 ## Compiler and model boundaries
 
-Strata [issue #1180](https://github.com/Niko1221/Strata/issues/1180) concerns
+Upstream [issue #1180](https://github.com/Niko1221/Strata/issues/1180) concerns
 its fused native expert prompt kernel and `waves_per_eu(8)`. That source is
 absent from Maya, and no such setting was found in Maya's source tree. It is
 not a reason to disable Maya's different GLM kernels without evidence.
 The synthetic GPU checks do not establish full-model quantized-expert
 or draft verification correctness. The first real request remains necessary.
 
-Strata [issue #1389](https://github.com/Niko1221/Strata/issues/1389) measures
+Upstream [issue #1389](https://github.com/Niko1221/Strata/issues/1389) measures
 Qwen prompt performance. Its profiling and tuning method is useful once GLM
 runs; its token rates are not Maya benchmarks.

@@ -15,7 +15,8 @@
 namespace strata::kernels::cpu {
 
 /// Bytes of the largest quantized activation any native layer uses.  qwen4exp: 2560 values as
-/// Q8_K (10 x 292 = 2604); glm5-next: 4096 values as Q8_K (16 x 260 = 4164).
+/// Q8_K (10 x 292 = 2604); glm5-next: 4096 values as Q8_K (16 x 260 = 4164); glm-dsa: 6144 values as Q8_K
+/// (24 x 292 = 7008, fits; 8192 would need 9344 and native_fmt refuses it).
 inline constexpr size_t kNativeActBytes = 8192;
 /// Bytes of the largest quantized down activation.  qwen4exp: 640 values as Q8_0/Q8_K (1024);
 /// glm5-next: 2048 values as Q8_K (8 x 260 = 2084).
@@ -30,12 +31,21 @@ struct NativeFmt {
     size_t up_off = 0, down_off = 0;    ///< inside the blob
     size_t bytes = 0;                   ///< the whole blob
     size_t act_bytes = 0, h_bytes = 0;  ///< quantized activation sizes (n_embd of gu_act, n_ff of d_act)
+    /// The up rows' type and row bytes: gu_type / gu_row except on a mixed layer (native_fmt_mixed: unsloth's
+    /// Qwen3.8 UD-IQ1_S keeps blk.18's gate IQ2_S, its up IQ2_XXS).  The up rows then take down_off - up_off bytes.
+    int u_type = -1;
+    size_t u_row = 0;
+    bool mixed() const { return u_type >= 0 && u_type != gu_type; }
 };
 
 /// Whether this build has the ggml-cpu path.
 bool native_experts_available() noexcept;
 /// Fills `f` for a layer; false (with a reason) when ggml-cpu has no dot product for a type.
 bool native_fmt(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, NativeFmt& f, std::string& err);
+/// The same for a layer whose gate and up types differ (up_type == gate_type: exactly native_fmt).  Both must share
+/// one activation format (vec_dot_type), so one quantized activation serves the two; Q2_0 cannot be mixed.
+bool native_fmt_mixed(int gate_type, int up_type, int d_type, int64_t n_embd, int64_t n_ff, NativeFmt& f,
+                      std::string& err);
 
 /// x (n_embd floats) -> the gate/up activation (act_bytes).
 void native_quant_act(const NativeFmt& f, const float* x, void* dst);
@@ -50,7 +60,7 @@ void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* 
 /// Several tokens (a verify window's tokens sharing an expert, a prompt's CPU rows): the
 /// multi-token kernels (iq_avx512 / iq_avx2: IQ2_*, IQ3_*, IQ4_XS, Q4_K, Q5_K) when they give
 /// ggml's results bit for bit - checked once per type (native_multi_rows_exact) - so a window
-/// computes exactly what its tokens one at a time would; STRATA_GLM_CPU_MT=0 keeps ggml's
+/// computes exactly what its tokens one at a time would; MAYA_GLM_CPU_MT=0 keeps ggml's
 /// dots.  swiglu_limit is GLM's swiglu clamp (gate clamped above, up both sides; +infinity =
 /// qwen4exp's plain path) - the same semantics as the device grouped path, so the two agree.
 void native_gu_rows_split(const NativeFmt& f, const uint8_t* gate_base, const uint8_t* up_base,

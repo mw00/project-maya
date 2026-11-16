@@ -26,8 +26,8 @@ int main(int argc, char** argv) {
     const fs::path out = fs::absolute(argv[3]);
     fs::create_directories(out / "active");
     env("GLM_CB_DIR", (out / "active").string());
-    env("STRATA_GLM_PREFILL", "auto");
-    env("STRATA_GLM_CPU_LANE", "0");
+    env("MAYA_GLM_PREFILL", "auto");
+    env("MAYA_GLM_CPU_LANE", "0");
     std::ifstream input(argv[2]);
     std::string csv((std::istreambuf_iterator<char>(input)), {});
     std::replace(csv.begin(), csv.end(), ',', ' ');

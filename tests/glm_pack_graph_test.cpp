@@ -10,9 +10,9 @@
 
 static void graph_mode(bool on) {
 #ifdef _WIN32
-    _putenv_s("STRATA_GLM_KDA_GRAPH", on ? "1" : "0");
+    _putenv_s("MAYA_GLM_KDA_GRAPH", on ? "1" : "0");
 #else
-    setenv("STRATA_GLM_KDA_GRAPH", on ? "1" : "0", 1);
+    setenv("MAYA_GLM_KDA_GRAPH", on ? "1" : "0", 1);
 #endif
 }
 static void require(bool ok, const std::string& msg) {

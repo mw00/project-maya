@@ -1,0 +1,41 @@
+The quick brown fox jumps over the lazy dog.
+I'm sure you're right; we've seen it, they'll agree, he'd know, it's done. DON'T panic, WON'T stop, CAN'T say.
+Numbers: 1 12 123 1234 12345 123456 1234567 3.14159 2.718 1,000,000 0.000001 -42 +7 1e-5 6.02e23
+Dates and times: 2026-10-12, 12/10/2026, 12:34:56, Monday 12 October 2026, 9am, 21:00 UTC.
+Money: $1,299.99, EUR 45, 3.5% APR, GBP 0.99, 1/3 of the cost, 50-50 split.
+Versions: v1.0.34, CUDA 12.9, sm_70, Python 3.12.4, gcc-13.3, R580.95.05.
+Paths: /usr/local/cuda-12.9/bin/nvcc, ~/project-maya/docs/maya/gpu/setup.md, C:\Users\maya\models\file.gguf
+URLs: https://example.com/a/b?c=1&d=two#frag and http://127.0.0.1:8090/v1/chat/completions
+Email: someone@example.org, first.last+tag@sub.example.co.uk
+Markdown: **bold**, *italic*, `code`, ~~strike~~, [link](https://example.com), > quote, - item, 1. item
+Headings follow.
+# Title
+## Section 2.3
+### Sub-section (with parentheses) and [brackets] and {braces}
+Punctuation runs: ... !!! ??? ?!? --- ___ *** ### @@@ $$$ %%% ^^^ &&& ((( ))) [[[ ]]] {{{ }}} <<< >>> ||| \\\ ///
+Quotes: "double", 'single', `back`, “curly double”, ‘curly single’, «guillemets», „low-high“.
+Dashes: a-b, a–b, a—b, a―b, minus − sign.
+Ellipsis… and bullets • ◦ ‣ and arrows → ← ↑ ↓ ⇒ and math ∑ ∫ √ ∞ ≤ ≥ ≠ ± × ÷.
+Accented: café, naïve, résumé, coöperate, Ångström, Øresund, smørrebrød, Straße, Ελληνικά, русский язык.
+CamelCase and snake_case and kebab-case and SCREAMING_SNAKE_CASE and mixedUP_with-Everything.
+A very long word: pneumonoultramicroscopicsilicovolcanoconiosis and supercalifragilisticexpialidocious.
+Repeated letters: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa bbbbbbbbbbbbbbbb zzzzzzzz.
+Repeated words: the the the the the the the the the the the the.
+Leading spaces on the next lines:
+ one space
+  two spaces
+    four spaces
+	a tab
+		two tabs
+Trailing spaces follow   
+Trailing tab follows	
+Mixed 	 whitespace 	 runs 	 here.
+
+Blank line above and below.
+
+Emoji: 😀 😃 🚀 🇵🇹 🇺🇸 👍🏽 👩‍💻 ❤️ ✅ ⚠️ 🧪
+Sentences with abbreviations: e.g. this, i.e. that, etc., Dr. Smith, U.S.A., a.m., p.m., No. 7.
+Contractions after quotes: "Isn't it?" she asked. 'Tis the season. Rock 'n' roll. O'Neill's.
+Hyphenated numbers: twenty-one, 3-4 days, 10-15%, pages 112-118, ISO-8601.
+Code words in prose: call fast_layers() then moe_route(); set MAYA_GLM_SPLIT=26,54 before --max-context 65536.
+A long sentence that goes on and on, with commas, clauses, and asides (which, as everyone knows, are the bane of every tokenizer's existence), until it finally, mercifully, ends.

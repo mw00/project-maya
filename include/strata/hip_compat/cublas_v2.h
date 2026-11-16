@@ -29,6 +29,8 @@
 #define cublasCreate hipblasCreate
 #define cublasDestroy hipblasDestroy
 #define cublasGemmEx hipblasGemmEx
+// (the same argument order: hipDataType operands, hipblasStride strides, hipblasComputeType_t; glm-dsa's prompt MLA)
+#define cublasGemmStridedBatchedEx hipblasGemmStridedBatchedEx
 #define cublasSgemm hipblasSgemm
 #define cublasSgemmStridedBatched hipblasSgemmStridedBatched
 #define cublasHandle_t hipblasHandle_t

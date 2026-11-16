@@ -26,8 +26,8 @@ routed experts of every layer and position are written).  Point the model config
 
 GLM-5.3-Flash (`--glm`: 46 layers - the 45 decoder layers, then the NextN block - of 288 experts; the base and the
 output default to data/expert-profile-glm.bin, which setup passes to every GLM config).  Besides `--dump-routing`
-traces it reads the GLM engine's text records: a usage file (`STRATA_GLM_USAGE`, a pack's expert_usage.txt:
-"layer e:count ..."), a pack's expert_counts.txt ("layer c0 c1 ... c287") and STRATA_GLM_TRACE lines ("layer
+traces it reads the GLM engine's text records: a usage file (`MAYA_GLM_USAGE`, a pack's expert_usage.txt:
+"layer e:count ..."), a pack's expert_counts.txt ("layer c0 c1 ... c287") and MAYA_GLM_TRACE lines ("layer
 expert").  `--equal` weighs every input the same (each one's routes scaled to the same total) instead of summing
 their counts, so one long session does not decide the order alone:
 
@@ -73,7 +73,7 @@ def read_trace(path, n_expert=N_EXPERT, n_layer=N_LAYER):
 
 
 def is_text(path):
-    """A GLM engine text record (usage, counts, STRATA_GLM_TRACE) rather than a binary --dump-routing trace."""
+    """A GLM engine text record (usage, counts, MAYA_GLM_TRACE) rather than a binary --dump-routing trace."""
     head = Path(path).read_bytes()[:4096]
     return bool(head) and all(c in b"0123456789 :#\t\r\n.-abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ()_,/"
                               for c in head)
@@ -81,7 +81,7 @@ def is_text(path):
 
 def read_text(path, n_expert=N_EXPERT, n_layer=N_LAYER):
     """Routes per (layer, expert) from a GLM text record: "layer e:count ..." (a usage file), "layer c0 c1 ..." (a
-    pack's expert_counts.txt: one count per expert id) or "layer expert" (STRATA_GLM_TRACE, one route a line)."""
+    pack's expert_counts.txt: one count per expert id) or "layer expert" (MAYA_GLM_TRACE, one route a line)."""
     freq = defaultdict(float)
     for line in Path(path).read_text(encoding="utf-8").splitlines():
         t = line.split()
@@ -144,7 +144,7 @@ def rank_profile(base_pairs, trace_freq, n_expert=N_EXPERT, no_base=False, reord
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("traces", nargs="*", help="routing traces from --dump-routing (with --glm also the GLM engine's "
-                                              "usage files, expert_counts.txt and STRATA_GLM_TRACE records)")
+                                              "usage files, expert_counts.txt and MAYA_GLM_TRACE records)")
     ap.add_argument("--glm", action="store_true",
                     help=f"GLM-5.3-Flash: {GLM_LAYER} layers of {GLM_EXPERT} experts, data/expert-profile-glm.bin")
     ap.add_argument("--base", default=None, help="ranking to keep first (default: the shipped profile)")

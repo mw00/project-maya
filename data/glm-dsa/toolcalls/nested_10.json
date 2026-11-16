@@ -1,0 +1,101 @@
+{
+ "id": "nested_10",
+ "group": "nested",
+ "api": "openai",
+ "request": {
+  "messages": [
+   {
+    "role": "user",
+    "content": "Walk me through three points: Tower (51.5081, -0.0759), Bridge (51.5055, -0.0754), Market (51.5054, -0.0910)."
+   }
+  ],
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "plan_route",
+     "description": "Plan a route through waypoints.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "waypoints": {
+        "type": "array",
+        "items": {
+         "type": "object",
+         "properties": {
+          "lat": {
+           "type": "number"
+          },
+          "lon": {
+           "type": "number"
+          },
+          "name": {
+           "type": "string"
+          }
+         },
+         "required": [
+          "lat",
+          "lon"
+         ]
+        }
+       },
+       "mode": {
+        "type": "string",
+        "enum": [
+         "driving",
+         "walking",
+         "cycling"
+        ]
+       },
+       "avoid": {
+        "type": "array",
+        "items": {
+         "type": "string"
+        }
+       }
+      },
+      "required": [
+       "waypoints"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "get_weather",
+     "description": "Current weather for a city.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string"
+       },
+       "unit": {
+        "type": "string",
+        "enum": [
+         "celsius",
+         "fahrenheit"
+        ]
+       }
+      },
+      "required": [
+       "city"
+      ]
+     }
+    }
+   }
+  ]
+ },
+ "expect": {
+  "calls": [
+   {
+    "name": "plan_route",
+    "args": {}
+   }
+  ],
+  "min_calls": 1,
+  "max_calls": 3,
+  "no_call": false
+ }
+}

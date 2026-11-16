@@ -1,4 +1,4 @@
-// tests/glm_rows_kernels_test.cu - the batched rows' one-launch kernels (glm_rows.cu, STRATA_GLM_ROWS_BATCH) against
+// tests/glm_rows_kernels_test.cu - the batched rows' one-launch kernels (glm_rows.cu, MAYA_GLM_ROWS_BATCH) against
 // the per-row kernels the rows take without it, on random inputs (needs a GPU, no model), compared bitwise:
 //  - hc_rows over n rows (each its own args, partials and counter) against hc() for each row alone: R_new, pre, post,
 //    comb, x and xq, with and without a previous block's output to fold in;

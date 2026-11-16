@@ -22,7 +22,7 @@ int main() {
         { std::ofstream f(name, std::ios::binary); std::string bytes(4096 * 16 + 17, 'x'); f.write(bytes.data(), bytes.size()); }
         DirectFile f;
         std::string error;
-        setenv("STRATA_IO_THREADS", "4", 1);   // the pool's size (out-of-range values are clamped to 1..64)
+        setenv("MAYA_IO_THREADS", "4", 1);   // the pool's size (out-of-range values are clamped to 1..64)
         check(f.open(name, error), error.c_str());
         check(!f.submit(1, memory, 4096, 0, error), "unaligned request accepted");
         for (unsigned i = 0; i < 17; ++i)

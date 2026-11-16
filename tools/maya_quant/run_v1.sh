@@ -24,7 +24,7 @@ G1=$(ls $OUT/GLM-5.3-Flash-Maya-S-IQ2_XXS*00001-of-*.gguf 2>/dev/null || ls $OUT
 if [ ! -f $OUT/pack/index.txt ]; then
   echo "$(date +%T) packing $G1"
   cd $SRC
-  STRATA_GGUF_PY=$SRC/build/_deps/strata_llamacpp-src/gguf-py $PY tools/iq_pack.py --gguf $G1 --out $OUT/pack --compat-bf16 \
+  MAYA_GGUF_PY=$SRC/build/_deps/strata_llamacpp-src/gguf-py $PY tools/iq_pack.py --gguf $G1 --out $OUT/pack --compat-bf16 \
       || { echo "$(date +%T) pack failed"; exit 1; }
   for f in expert_prior.txt expert_counts.txt; do   # this machine's routing profile (any quant of the model)
     cp /mnt/nvme/maya/models/glm53-iq1s/pack/$f $OUT/pack/ 2>/dev/null

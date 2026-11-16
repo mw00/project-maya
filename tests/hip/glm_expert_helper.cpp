@@ -114,9 +114,9 @@ static int two_helpers(int helper_device) {
         for (int i = 0; i < K; ++i)
             if (!part[p].insert(i, host[p] + size_t(i) * blob_bytes, blob_bytes, blob_bytes, err)) return 31;
         // the path it SELECTED: zero-copy exactly when the helper is integrated and the setting is not 0
-        const char* zc = std::getenv("STRATA_GLM_HELPER_ZEROCOPY");
+        const char* zc = std::getenv("MAYA_GLM_HELPER_ZEROCOPY");
         const bool want = part[p].integrated() && !(zc != nullptr && zc[0] == '0');
-        if (part[p].zero_copy() != want || part[p].profiling() != (std::getenv("STRATA_GLM_PROF") != nullptr)) return 36;
+        if (part[p].zero_copy() != want || part[p].profiling() != (std::getenv("MAYA_GLM_PROF") != nullptr)) return 36;
     }
     void *dev_blobs[2] = {nullptr, nullptr}, *dxq = nullptr, *dhq = nullptr;
     float *dx = nullptr, *dout = nullptr;
@@ -245,16 +245,16 @@ int main() {
     }
     CHECK(hipSetDevice(0));
     if (int status = helper_routing()) return status;
-    // both call paths (zero-copy - an integrated helper's default - and the copies, STRATA_GLM_HELPER_ZEROCOPY=0), each
-    // with the per-call profile off and on (STRATA_GLM_PROF: its line at each helper's close)
+    // both call paths (zero-copy - an integrated helper's default - and the copies, MAYA_GLM_HELPER_ZEROCOPY=0), each
+    // with the per-call profile off and on (MAYA_GLM_PROF: its line at each helper's close)
     for (const char* zc : {"1", "0"})
         for (const bool prof : {false, true}) {
-            setenv("STRATA_GLM_HELPER_ZEROCOPY", zc, 1);
-            if (prof) setenv("STRATA_GLM_PROF", "0", 1);
-            else unsetenv("STRATA_GLM_PROF");
+            setenv("MAYA_GLM_HELPER_ZEROCOPY", zc, 1);
+            if (prof) setenv("MAYA_GLM_PROF", "0", 1);
+            else unsetenv("MAYA_GLM_PROF");
             if (int status = two_helpers(helper_device)) return status;
         }
-    unsetenv("STRATA_GLM_PROF");
+    unsetenv("MAYA_GLM_PROF");
     std::mt19937 rng(47);
     std::vector<float> x(E), reference(E), actual(E);
     float weights[K];
@@ -271,7 +271,7 @@ int main() {
         }
     };
     for (const char* zc : {"1", "0"}) {   // the quant types on both call paths (a discrete helper copies on both)
-    setenv("STRATA_GLM_HELPER_ZEROCOPY", zc, 1);
+    setenv("MAYA_GLM_HELPER_ZEROCOPY", zc, 1);
     for (const auto [gu_type, d_type] : {std::pair{16, 22}, std::pair{18, 22}, std::pair{16, 18}, std::pair{10, 11}}) {
         const size_t gu_block = block_bytes(gu_type), d_block = block_bytes(d_type);
         const size_t gu_bytes = size_t(2) * FF * E / 256 * gu_block;
@@ -395,7 +395,7 @@ int main() {
         CHECK(hipHostFree(host));
     }
     }
-    unsetenv("STRATA_GLM_HELPER_ZEROCOPY");
+    unsetenv("MAYA_GLM_HELPER_ZEROCOPY");
     if (int status = memory_probe(helper_device)) return status;   // (print only)
     std::puts("GLM expert helper ownership, adaptation and parity passed (both call paths)");
 }

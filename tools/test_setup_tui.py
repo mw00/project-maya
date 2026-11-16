@@ -147,6 +147,75 @@ class PlainSetup(unittest.TestCase):
         self.assertTrue(all(p.name.endswith("-py3-none-any.whl") for p in maya.TUI_WHEELS.glob("*.whl")))
 
 
+class ModelName(unittest.TestCase):
+    """The line under the screen's logo names the model being set up once it is known - it said GLM-5.3-Flash
+    whichever model was picked."""
+
+    def tearDown(self):
+        S.UI = None
+
+    def test_every_model_has_its_name_and_qwen_never_shows_its_id(self):
+        self.assertEqual(set(maya.FAMILY_TITLE), set(maya.FAMILIES))
+        self.assertEqual(maya.FAMILY_TITLE["qwen"], "Qwen-3.8-Flash-Next")
+        self.assertNotIn(maya.QWEN, maya.FAMILY_TITLE.values())
+
+    def test_a_glm_dsa_config_is_named_glm53(self):
+        cfg = {"args": ["--glm-pack", "x"]}
+        with patch.object(maya.G53, "config_is_glm_dsa", return_value=True), \
+                patch.object(maya, "config_family", return_value="glm"):
+            self.assertEqual(maya.setup_title(cfg), "GLM-5.3")
+        with patch.object(maya.G53, "config_is_glm_dsa", return_value=False), \
+                patch.object(maya, "config_family", return_value="glm"):
+            self.assertEqual(maya.setup_title(cfg), maya.FAMILY_TITLE["glm"])
+
+    def test_the_bridge_hands_the_name_to_the_screen_and_nothing_to_the_log(self):
+        with tempfile.TemporaryDirectory() as d:
+            b = Bridge(Path(d) / "setup.log")
+            b.thread = threading.current_thread()       # (the caller is the setup's thread here)
+            S.UI = b
+            S.model_named("MiniMax-M3.1-Flash")
+            b.log.close()
+            self.assertEqual(events(b), [("model", "MiniMax-M3.1-Flash")])
+            self.assertEqual((b.entries, (Path(d) / "setup.log").read_text(encoding="utf-8")), ([], ""))
+
+    def test_nothing_is_printed_without_the_screen(self):
+        with patch("sys.stdout", new=io.StringIO()) as out:
+            S.model_named("GLM-5.3-Flash")
+            S.UI = SimpleNamespace(say=lambda msg: False)   # (a screen without the method: nothing either)
+            S.model_named("GLM-5.3-Flash")
+        self.assertEqual(out.getvalue(), "")
+
+    def test_the_setup_names_the_model_before_its_steps(self):
+        for family in maya.FAMILIES:
+            with self.subTest(family=family), patch.object(maya, "choose_family", return_value=family), \
+                    patch.object(maya, "set_up_ds4", return_value=None), \
+                    patch.object(maya, "set_up_mm3", return_value=None), \
+                    patch.object(maya, "set_up_qwen", return_value=None), \
+                    patch.object(maya, "check_pc", side_effect=KeyboardInterrupt), \
+                    patch.object(maya, "configs", return_value=[]), patch.object(S, "model_named") as named:
+                try:
+                    maya.set_up(SimpleNamespace(parallel=None, backend="cuda"), {})
+                except KeyboardInterrupt:                # (GLM's step 1: the test stops there)
+                    pass
+                named.assert_called_once_with(maya.FAMILY_TITLE[family])
+
+    def test_a_start_names_its_configs_model(self):
+        with tempfile.TemporaryDirectory() as d:
+            cfg = Path(d) / "maya-mm3.json"
+            cfg.write_text('{"exe": "maya-mm3", "args": []}', encoding="utf-8")
+            with patch.object(maya, "server_command", side_effect=KeyboardInterrupt), \
+                    patch.object(S, "model_named") as named:
+                with self.assertRaises(KeyboardInterrupt):
+                    maya.serve_on_screen(cfg, SimpleNamespace())
+            named.assert_called_once_with("MiniMax-M3.1-Flash")
+
+    @needs_textual
+    def test_the_splash_names_no_model_until_it_is_known(self):
+        self.assertIn("Set up your model on your own GPUs.", L.splash().plain)
+        self.assertNotIn("GLM", L.splash().plain)
+        self.assertIn("Set up DeepSeek-V4.1-Flash-1017 on your own GPUs.", L.splash("DeepSeek-V4.1-Flash-1017").plain)
+
+
 @needs_textual
 class Screen(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
@@ -189,6 +258,21 @@ class Screen(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(end, ("done", (2, 1, "y")))
         self.assertEqual([t for _, k, t in bridge.entries if k == "answer"],
                          ["  Context? 3) 64K tokens", "  Model? 2) Maya-L", "  Download them now? y"])
+
+    async def test_the_line_under_the_logo_names_the_model_once_it_is_known(self):
+        seen, real = [], T.splash
+
+        def spy(model=None):
+            seen.append(model)
+            return real(model)
+
+        def body():
+            S.model_named("DeepSeek-V4.1-Flash-1017")
+            return S.ask("Download them now?", ["y", "n"], "n", False)
+        with patch.object(T, "splash", spy):
+            end, _, _ = await self.drive(body, ["y"])
+        self.assertEqual(end, ("done", "y"))
+        self.assertEqual(seen, [None, "DeepSeek-V4.1-Flash-1017"])     # (first no model, then the one picked)
 
     async def test_enter_takes_the_default_and_a_download_defaults_to_no(self):
         end, _, _ = await self.drive(lambda: S.ask("Download about 95 GB now?", ["y", "n"], "n", False), ["enter"])

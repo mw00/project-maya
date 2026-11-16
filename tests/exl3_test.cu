@@ -9,7 +9,7 @@
 //                                 tiles (data/exl3-exllamav3) - the same states and W' bit for bit
 //   exl3_test --expect <dir>      a model's matrices against exllamav3's decode of them (the tool's --model files)
 //   exl3_test --dump-legacy <f>   fixed-seed cases at v1.1.8's kernels' geometry, every output float to <f> (binary)
-//                                 and its hash: STRATA_GLM_EXL3_DECODE=legacy and =legacy-f32 must write the same bytes
+//                                 and its hash: MAYA_GLM_EXL3_DECODE=legacy and =legacy-f32 must write the same bytes
 #include "strata/kernels/cpu/exl3_cpu.hpp"
 #include "strata/kernels/cpu/exl3_ref.hpp"
 #include "strata/kernels/exl3.hpp"
@@ -162,7 +162,7 @@ bool legacy_f32_built(std::string* sm = nullptr) {
     return p.major < 7;
 }
 
-// v1.1.8's kernels' FP32 weight decode (STRATA_GLM_EXL3_DECODE=legacy-f32) against their FP16 one: every state (s0 = s,
+// v1.1.8's kernels' FP32 weight decode (MAYA_GLM_EXL3_DECODE=legacy-f32) against their FP16 one: every state (s0 = s,
 // s1 = s ^ 0xffff) and codebook, bit for bit.  The FP16 table against the CPU reference too (informational: a
 // difference there counts only where the FP32 table differs as well).  sm_70+: f32 = true is the FP16 decode too, so
 // there this checks only that it writes the FP16 table - the output lines say so
@@ -217,13 +217,13 @@ void test_legacy_decode_exhaustive() {
     CK(cudaFree(d32));
 }
 
-// legacy_f32() follows STRATA_GLM_EXL3_DECODE<dev> when it names a decode (legacy / new / legacy-f32), else
-// STRATA_GLM_EXL3_DECODE (an unknown <dev> value falls back to it): true under legacy-f32 where the FP32 decode is built
+// legacy_f32() follows MAYA_GLM_EXL3_DECODE<dev> when it names a decode (legacy / new / legacy-f32), else
+// MAYA_GLM_EXL3_DECODE (an unknown <dev> value falls back to it): true under legacy-f32 where the FP32 decode is built
 // (sm_6x), false on sm_70+ (legacy-f32 accepted there: the FP16 kernels, the same bits) and unset / legacy / new
 void test_legacy_choice() {
     int dev = 0;
     CK(cudaGetDevice(&dev));
-    const std::string own = "STRATA_GLM_EXL3_DECODE" + std::to_string(dev);
+    const std::string own = "MAYA_GLM_EXL3_DECODE" + std::to_string(dev);
     const char* v = std::getenv(own.c_str());
     const auto named = [](const char* c) {
         return c != nullptr && (std::strcmp(c, "legacy") == 0 || std::strcmp(c, "new") == 0 ||
@@ -232,9 +232,9 @@ void test_legacy_choice() {
     const char* which = own.c_str();
     if (!named(v)) {
         if (v != nullptr)
-            std::printf("  (%s=%s names no decode: STRATA_GLM_EXL3_DECODE applies)\n", own.c_str(), v);
-        v = std::getenv("STRATA_GLM_EXL3_DECODE");
-        which = "STRATA_GLM_EXL3_DECODE";
+            std::printf("  (%s=%s names no decode: MAYA_GLM_EXL3_DECODE applies)\n", own.c_str(), v);
+        v = std::getenv("MAYA_GLM_EXL3_DECODE");
+        which = "MAYA_GLM_EXL3_DECODE";
     }
     const std::string s = v != nullptr ? v : "";
     const bool f32 = ex::legacy_f32();
@@ -652,25 +652,25 @@ struct ScalarRowsSetting {
     bool present;
     std::string saved;
     ScalarRowsSetting() {
-        const char* v = std::getenv("STRATA_EXL3_HIP_SCALAR_ROWS");
+        const char* v = std::getenv("MAYA_EXL3_HIP_SCALAR_ROWS");
         present = v != nullptr;
         if (v) saved = v;
         set("0");
     }
     static void set(const char* v) {
 #if defined(_WIN32)
-        _putenv_s("STRATA_EXL3_HIP_SCALAR_ROWS", v);
+        _putenv_s("MAYA_EXL3_HIP_SCALAR_ROWS", v);
 #else
-        setenv("STRATA_EXL3_HIP_SCALAR_ROWS", v, 1);
+        setenv("MAYA_EXL3_HIP_SCALAR_ROWS", v, 1);
 #endif
     }
     ~ScalarRowsSetting() {
         if (present) set(saved.c_str());
         else {
 #if defined(_WIN32)
-            _putenv_s("STRATA_EXL3_HIP_SCALAR_ROWS", "");
+            _putenv_s("MAYA_EXL3_HIP_SCALAR_ROWS", "");
 #else
-            unsetenv("STRATA_EXL3_HIP_SCALAR_ROWS");
+            unsetenv("MAYA_EXL3_HIP_SCALAR_ROWS");
 #endif
         }
     }
@@ -1825,7 +1825,7 @@ void test_expect(const std::string& dir) {
 // Fixed-seed cases at v1.1.8's kernels' geometry - GLM-5.3-Flash's routed experts (4096 -> 2048 -> 4096: exl3.cu takes
 // the legacy kernels for n_embd and n_ff <= 4096) through moe_gate_up + moe_down, dense GEMVs up to 4096 through mv -
 // every output float written to <file> in case order, a hash a case and of the whole.  Under
-// STRATA_GLM_EXL3_DECODE=legacy and =legacy-f32 the two files must be the same bytes (tests/exl3_dump_compare.cmake).
+// MAYA_GLM_EXL3_DECODE=legacy and =legacy-f32 the two files must be the same bytes (tests/exl3_dump_compare.cmake).
 
 int g_dump_outputs = 0;
 

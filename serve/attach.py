@@ -452,20 +452,22 @@ def _result(text: str, fmt: str, text_limit: int) -> dict:
     return out
 
 
-def extract(name: str, data: bytes, *, want_images: bool, text_limit: int) -> dict:
-    """Any attached file -> the chat page's attachment (see the module's doc)."""
+def extract(name: str, data: bytes, *, want_images: bool, text_limit: int, text_only: str | None = None) -> dict:
+    """Any attached file -> the chat page's attachment (see the module's doc).  text_only: the name of a model with
+    no vision tower at all (GLM-5.3): its errors say it reads text only, never "when its images are on"."""
     try:
-        return _extract(name, data, want_images=want_images, text_limit=text_limit)
+        return _extract(name, data, want_images=want_images, text_limit=text_limit, text_only=text_only)
     except Unreadable as e:
         return {"error": {"message": str(e)}}
     except (zipfile.BadZipFile, NotImplementedError, RuntimeError, OSError, EOFError) as e:
         return {"error": {"message": f"the file could not be read ({e})"}}
 
 
-def _extract(name: str, data: bytes, *, want_images: bool, text_limit: int) -> dict:
+def _extract(name: str, data: bytes, *, want_images: bool, text_limit: int, text_only: str | None = None) -> dict:
     ext = _ext(name)
     if data.lstrip()[:5] == b"%PDF-" or (ext == "pdf" and b"%PDF-" in data[:1024]):
-        out = pdf.extract(data[data.find(b"%PDF-"):], want_images=want_images, text_limit=text_limit)
+        out = pdf.extract(data[data.find(b"%PDF-"):], want_images=want_images, text_limit=text_limit,
+                          **({"text_only": text_only} if text_only else {}))
         if "error" not in out:
             out["format"] = "PDF"
         return out
@@ -482,14 +484,19 @@ def _extract(name: str, data: bytes, *, want_images: bool, text_limit: int) -> d
             raise Unreadable(f"{name or 'this file'} is {what}: {instead}")
     if data[4:8] == b"ftyp" or data.startswith((b"\x1a\x45\xdf\xa3", b"RIFF")):
         if data.startswith(b"RIFF") and data[8:12] == b"WEBP":
+            if text_only:
+                raise Unreadable(f"{name or 'this file'} is a picture, and {text_only} reads text only: it has no "
+                                 "vision tower to read it - describe the picture in text instead")
             raise Unreadable(f"{name or 'this file'} is a picture: attach it as one (the model reads pictures only "
                              "when its images are on)")
+        if text_only:
+            raise Unreadable(f"{name or 'this file'} is a video or audio file, and {text_only} reads text only")
         raise Unreadable(f"{name or 'this file'} is a video or audio file: videos go to the models that read them "
                          "(attach them as videos), and none of the models hear audio")
     text = as_text(data)
     if text is None:
         raise Unreadable(f"{name or 'this file'} is not a kind of file Maya reads ({'.' + ext if ext else 'binary'})"
-                         f" - attach {READS}, or pictures")
+                         f" - attach {READS}{'' if text_only else ', or pictures'}")
     return _result(text, "text file", text_limit)
 
 
@@ -561,9 +568,10 @@ def _image_part(api: str, url: str) -> dict:
     return {"type": "image_url", "image_url": {"url": url}}
 
 
-def expand_content(content, api: str, *, want_images: bool, text_limit: int):
+def expand_content(content, api: str, *, want_images: bool, text_limit: int, text_only: str | None = None):
     """A message's content with every file part replaced by its text part (and a scanned PDF's page pictures);
-    content without file parts comes back as it was.  An unreadable file is a ValueError (the request's 400)."""
+    content without file parts comes back as it was.  An unreadable file is a ValueError (the request's 400).
+    text_only: as extract's (GLM-5.3: the errors say it reads text only)."""
     if not isinstance(content, list) or not any(isinstance(p, dict) and p.get("type") in FILE_PARTS
                                                 for p in content):
         return content
@@ -575,7 +583,8 @@ def expand_content(content, api: str, *, want_images: bool, text_limit: int):
             continue
         name, raw, text = _part_file(part)
         if raw is not None:
-            got = extract(name, raw, want_images=want_images, text_limit=text_limit)
+            got = extract(name, raw, want_images=want_images, text_limit=text_limit,
+                          **({"text_only": text_only} if text_only else {}))
             if "error" in got:
                 raise ValueError(f"the attached file {name}: {got['error']['message']}")
             if got["kind"] == "images":
@@ -587,8 +596,9 @@ def expand_content(content, api: str, *, want_images: bool, text_limit: int):
     return out
 
 
-def expand_request(req: dict, api: str, *, want_images: bool, text_limit: int) -> None:
-    """Every message's file parts read in place (chat completions and Anthropic: messages; Responses: input)."""
+def expand_request(req: dict, api: str, *, want_images: bool, text_limit: int, text_only: str | None = None) -> None:
+    """Every message's file parts read in place (chat completions and Anthropic: messages; Responses: input).
+    text_only: as extract's."""
     if not isinstance(req, dict):
         return
     items = req.get("input") if api == "responses" else req.get("messages")
@@ -596,4 +606,5 @@ def expand_request(req: dict, api: str, *, want_images: bool, text_limit: int) -
         return
     for m in items:
         if isinstance(m, dict) and isinstance(m.get("content"), list):
-            m["content"] = expand_content(m["content"], api, want_images=want_images, text_limit=text_limit)
+            m["content"] = expand_content(m["content"], api, want_images=want_images, text_limit=text_limit,
+                                          **({"text_only": text_only} if text_only else {}))

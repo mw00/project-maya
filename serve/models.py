@@ -27,6 +27,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 import maya_names  # noqa: E402  (tools/) a setting under either of its names
 import maya_quants  # noqa: E402  (tools/) the quants' names users see, and each config's family
+from serve import glm_dsa_product as G53  # noqa: E402  GLM-5.3 (744B, glm-dsa): what its engine serves today
 
 SWITCH_FILE = ".maya-switch.json"           # the server's note to maya.py: start this config next (a switch)
 DELETE_FILE = ".maya-delete.json"           # ... and to the next server: delete this config (it was the one running)
@@ -54,7 +55,7 @@ ENV_LOADER = re.compile(r"^(?:LD_\w*|DYLD_\w*|PYTHON\w*|PATH|PATHEXT|BASH_ENV|EN
 GLM_KEYS = ("context", "images", "gpus", "reserve_mib", "env", "parallel", "draft", "expert_cache", "prefill",
             "kv_streaming", "kv_resident")
 DS4_KEYS = ("context", "images", "gpus", "reserve_mib", "env", "parallel", "draft", "tp", "mmap", "prefill_chunk",
-            "cpu_threads", "prompt_lookup", "dspark_conf")
+            "cpu_threads", "prompt_lookup", "dspark_conf", "fast_prefill")
 MM3_KEYS = ("context", "images", "gpus", "env", "parallel", "draft", "tp", "kv_cache", "kv_streaming", "kv_resident",
             "cpu_threads", "reserve_gb", "prefill_chunk", "cache_gb", "dspark_conf")
 QWEN_KEYS = ("context", "images", "gpus", "reserve_mib", "env", "draft", "expert_cache", "prefill", "kv", "ram_gb")
@@ -244,8 +245,69 @@ def mm3_pack_has(cfg: dict, key: str) -> bool:
         return False
 
 
+# ------------------------------------------------------------------ refusal ablation (an optional direction file)
+# The engines that project a direction out per request (GEN ablate=1; loaded with --ablate FILE --ablate-default off):
+# maya-ds4, maya-mm3 and the `maya` engine's GLM models (GLM-5.3-Flash, GLM-5.3; not on the Mac engine).  Qwen
+# (CYBER-FROST) has none; without a direction file the dashboard shows no switch.
+ABLATE_FAMILIES = ("deepseek", "minimax", "glm")
+# a model repo's direction file (phase 2: fitted and shipped by us): <Model>-refusal-direction.gguf - a control vector
+# GGUF (general.architecture "controlvector", direction.1 F32 [n_embd]) with maya.ablate.scale / .fit_layer / .model
+# / .fitted_on / .version metadata; the setup downloads it with the model and records it as cfg["ablate"]["file"]
+ABLATE_SUFFIX = "-refusal-direction.gguf"
+
+
+def ablate_file(cfg: dict) -> Path | None:
+    """The config's direction file (cfg["ablate"]["file"], else an --ablate FILE in its args) when it is on disk."""
+    a = cfg.get("ablate") if isinstance(cfg.get("ablate"), dict) else {}
+    f = a.get("file") or flag(cfg.get("args") or [], "--ablate")
+    p = Path(str(f)).expanduser() if f else None
+    return p if p is not None and p.is_file() else None
+
+
+def ablate_choice(cfg: dict) -> dict:
+    """{"available": bool, "why": the reason when not} - the Models page's and the Chat's switch (hidden without)."""
+    fam = family(cfg)
+    if fam not in ABLATE_FAMILIES or (fam == "glm" and cfg.get("backend") == "metal"):
+        return {"available": False, "why": "not available for this model"}
+    if ablate_file(cfg) is None:
+        return {"available": False, "why": "no refusal direction file for this model (its repo ships none yet)"}
+    if fam == "minimax" and (_int(flag(cfg.get("args") or [], "--tp"), 0) or 0) > 0:
+        return {"available": False, "why": "not with the tensor-parallel split (Tensor parallel: 0 offers it)"}
+    return {"available": True, "why": ""}
+
+
+def ablate_default(cfg: dict) -> bool:
+    """The Models page's default for requests that leave `ablate` out: cfg["ablate"]["default"] (off unless set), or
+    the config's sampling.ablate."""
+    a = cfg.get("ablate") if isinstance(cfg.get("ablate"), dict) else {}
+    return a.get("default") is True or (cfg.get("sampling") or {}).get("ablate") is True
+
+
+def ablate_args(cfg: dict, args: list) -> list:
+    """args with the direction loaded, off by default (--ablate FILE --ablate-default off), where it can be; without
+    a direction file (or on an engine without the projection) none of the three flags - the command as before."""
+    for f in ("--ablate", "--ablate-default", "--ablate-layer", "--ablate-scale"):
+        args = drop_flag(args, f)
+    p = ablate_file(cfg)
+    if p is None or family(cfg) not in ABLATE_FAMILIES or (family(cfg) == "glm" and cfg.get("backend") == "metal"):
+        return args
+    a = cfg.get("ablate") if isinstance(cfg.get("ablate"), dict) else {}
+    args = set_flag(args, "--ablate", str(p))
+    args = set_flag(args, "--ablate-default", "off")
+    if a.get("scale") is not None:   # (the file's own maya.ablate.scale otherwise)
+        args = set_flag(args, "--ablate-scale", a["scale"])
+    return args
+
+
 def choices(cfg: dict) -> dict:
-    """What this config can be set to beyond what it is: a drafter and an image encoder that exist on this PC."""
+    """What this config can be set to beyond what it is: a drafter and an image encoder that exist on this PC, and the
+    refusal-ablation switch (ablate_choice)."""
+    out = _choices(cfg)
+    out["ablate"] = ablate_choice(cfg)
+    return out
+
+
+def _choices(cfg: dict) -> dict:
     if family(cfg) == "minimax":
         return {"draft": ["dspark", "none"] if mm3_pack_has(cfg, "dspark.num_hidden_layers") else ["none"],
                 "images": mm3_pack_has(cfg, "vision.hidden_size")}
@@ -255,6 +317,11 @@ def choices(cfg: dict) -> dict:
     if family(cfg) == "qwen":                          # (images: the setup's maya-vision entry, on or kept off)
         return {"draft": ["mtp", "none"] if qwen_mtp(cfg) is not None else ["none"],
                 "images": bool(cfg.get("vision") or cfg.get("vision_off"))}
+    if G53.config_is_glm_dsa(cfg):
+        # GLM-5.3 (744B): text only (no vision tower), its NextN block drafts (DFlash2's drafter is GLM-5.3-Flash's),
+        # and what its engine serves today - KV streaming, answers at once decoded together (glm_dsa_product)
+        return {"draft": ["mtp"], "images": False, "text_only": True, "dflash2": False,
+                "kv_streaming": G53.KV_STREAMING, "batched": G53.BATCHED_ROWS}
     f = dflash_file(cfg)
     return {"draft": ["mtp", "dflash2"] if f is not None else ["mtp"],
             "images": bool(cfg.get("vision") or cfg.get("vision_off"))}
@@ -264,7 +331,9 @@ def choices(cfg: dict) -> dict:
 def settings_of(cfg: dict) -> dict:
     args = cfg.get("args") or []
     env = {str(k): str(v) for k, v in (cfg.get("env") or {}).items()}
-    out = {"context": _int(flag(args, "--max-context"), 32768), "gpus": gpus_of(cfg), "env": env}
+    out = {"context": _int(flag(args, "--max-context"), 32768), "gpus": gpus_of(cfg), "env": env,
+           # (refusal ablation: the default for requests that leave `ablate` out - ablate_default)
+           "ablate": ablate_default(cfg)}
     if family(cfg) == "minimax":                       # (maya-mm3's own defaults where the config names none)
         vision, kvs = flag(args, "--vision"), flag(args, "--kv-streaming")
         out.update(images=vision == "on" or (vision is None and mm3_pack_has(cfg, "vision.hidden_size")),
@@ -293,7 +362,10 @@ def settings_of(cfg: dict) -> dict:
                    prefill_chunk=_int(flag(args, "--prefill-chunk")), cpu_threads=_int(flag(args, "--cpu-threads")),
                    # (--suffix-draft: the prompt lookup's shortest match, 3 by the engine; 0 off)
                    prompt_lookup=_int(flag(args, "--suffix-draft"), 3) != 0,
-                   dspark_conf=_float(flag(args, "--dspark-conf")))
+                   dspark_conf=_float(flag(args, "--dspark-conf")),
+                   # (fast prompt reading: the long prompt's skip as a per-layer cone, DS4_YOCO_CONE=1 in the engine's
+                   #  environment - serve/server.py's child_env; off by default, answers can shift slightly)
+                   fast_prefill=cfg.get("fast_prefill") is True)
         if out["mmap"] not in ("auto", "on", "off"):
             out["mmap"] = "auto"
         return out
@@ -302,7 +374,22 @@ def settings_of(cfg: dict) -> dict:
                parallel=_int(flag(args, "--parallel"), 1), draft="dflash2" if flag(args, "--dflash") else "mtp",
                expert_cache=None if ec == "auto" else _int(ec), prefill=None if pf == "auto" else _int(pf),
                kv_streaming=glm_streams(cfg), kv_resident=_int(flag(args, "--kv-resident")))
+    if not G53.KV_STREAMING and G53.config_is_glm_dsa(cfg):   # (GLM-5.3: its whole cache in VRAM - apply() writes it)
+        out.update(kv_streaming=False, kv_resident=None)
     return out
+
+
+def glm53_kv_bytes(cfg: dict) -> int | None:
+    """A GLM-5.3 (glm-dsa) config's cache bytes a context token (glm_dsa_product.kv_bytes_per_token) with the formats
+    its engine runs: the INT8 latent unless --kv fp16 or MAYA_GLM_KV_INT8=0 says FP16 (the environment wins, as in the
+    engine), the index keys FP32 unless MAYA_GLM_IDX_FP16=1.  None for any other config."""
+    if not G53.config_is_glm_dsa(cfg):
+        return None
+    env = {str(k): str(v) for k, v in (cfg.get("env") or {}).items()}
+    int8 = maya_names.lookup(env, "MAYA_GLM_KV_INT8")
+    int8 = int8.strip() != "0" if int8 is not None else flag(cfg.get("args") or [], "--kv") in (None, "int8")
+    return G53.kv_bytes_per_token(G53.config_pack(cfg), int8,
+                                  str(maya_names.lookup(env, "MAYA_GLM_IDX_FP16", "")).strip() == "1")
 
 
 def glm_streams(cfg: dict) -> bool:
@@ -350,13 +437,26 @@ def apply(cfg: dict, settings: dict) -> dict:
         raise ValueError("the settings must be a JSON object")
     fam = family(cfg)
     ds4 = fam == "deepseek"
-    known = {"minimax": MM3_KEYS, "deepseek": DS4_KEYS, "qwen": QWEN_KEYS}.get(fam, GLM_KEYS)
+    known = {"minimax": MM3_KEYS, "deepseek": DS4_KEYS, "qwen": QWEN_KEYS}.get(fam, GLM_KEYS) + ("ablate",)
     unknown = sorted(set(settings) - set(known))
     if unknown:
         raise ValueError(f"not a setting of this model: {', '.join(unknown)}")
     s = {**settings_of(cfg), **settings}
     can = choices(cfg)
     out = copy.deepcopy(cfg)
+    # refusal ablation's default (cfg["ablate"]["default"]: requests without `ablate` take it; not an engine setting -
+    # no restart, the direction stays loaded and each request asks); on only where the switch is (ablate_choice)
+    if not isinstance(s.get("ablate"), bool):
+        raise ValueError("Refusal ablation: on or off")
+    if s["ablate"] and settings.get("ablate") is True and not can["ablate"]["available"]:
+        raise ValueError("Refusal ablation: " + can["ablate"]["why"])
+    if isinstance(out.get("ablate"), dict):
+        if s["ablate"]:
+            out["ablate"]["default"] = True
+        else:
+            out["ablate"].pop("default", None)
+    if not s["ablate"] and isinstance(out.get("sampling"), dict):
+        out["sampling"].pop("ablate", None)
     args = [str(a) for a in out.get("args") or []]
     args = set_flag(args, "--max-context", _num(s, "context", 1024, 1048576, "Context size", none_ok=False))
 
@@ -502,16 +602,26 @@ def apply(cfg: dict, settings: dict) -> dict:
             args = drop_flag(args, "--suffix-draft")
         conf = _dec(s, "dspark_conf", 0, 1, "Draft confidence")
         args = set_flag(args, "--dspark-conf", f"{conf:g}") if conf is not None else drop_flag(args, "--dspark-conf")
+        if not isinstance(s.get("fast_prefill"), bool):
+            raise ValueError("Fast prompt reading: on or off")
+        if s["fast_prefill"]:
+            out["fast_prefill"] = True
+        else:
+            out.pop("fast_prefill", None)               # (off: the engine's default, nothing in the config)
     else:
+        dsa = G53.config_is_glm_dsa(cfg)                # GLM-5.3 (744B): what its engine takes (choices)
         par = _num(s, "parallel", 1, 8, "Answers at once", none_ok=False)
         args = set_flag(args, "--parallel", par) if par > 1 or "--parallel" in args else args
         if s.get("draft") not in can["draft"]:
-            raise ValueError("Drafting: the DFlash2 drafter is not on this PC (the setup's --draft dflash2 downloads "
+            raise ValueError("Drafting: GLM-5.3 drafts with its own MTP (NextN) block" if dsa else
+                             "Drafting: the DFlash2 drafter is not on this PC (the setup's --draft dflash2 downloads "
                              "it)" if s.get("draft") == "dflash2" else "Drafting: MTP or DFlash2")
         if s["draft"] == "dflash2":
             args = set_flag(args, "--dflash", dflash_file(cfg))
         else:
             args = drop_flag(args, "--dflash")
+        if dsa and s.get("images"):
+            raise ValueError("Images: GLM-5.3 reads text only (the model has no vision tower)")
         if s.get("images") and not out.get("vision"):
             if not out.get("vision_off"):
                 raise ValueError("Images: this model was set up without its image encoder (the setup adds it)")
@@ -528,11 +638,23 @@ def apply(cfg: dict, settings: dict) -> dict:
         pf = _num(s, "prefill", 64, 65536, "Prompt chunk")
         if pf is not None or "--prefill" in args:
             args = set_flag(args, "--prefill", "auto" if pf is None else pf)
-        if "--kv-streaming" in args or bool(s.get("kv_streaming")) != glm_streams(cfg):
-            args = set_flag(args, "--kv-streaming", "on" if s.get("kv_streaming") else "off")
-        kr = _num(s, "kv_resident", 1024, 1048576, "Positions kept in VRAM")
-        args = set_flag(args, "--kv-resident", kr) if kr is not None and s.get("kv_streaming") else \
-            drop_flag(args, "--kv-resident")
+        if dsa and not G53.KV_STREAMING:
+            # GLM-5.3: the engine keeps its whole cache in VRAM for now (a window below the context does not start) -
+            # asked for, a clear no; a config with it (an older setup's "on", a window) gets it off, so every context
+            # starts
+            if settings.get("kv_streaming") or (_int(settings.get("kv_resident"), 0) or 0) > 0:
+                raise ValueError("KV streaming: not served on GLM-5.3 yet - its whole attention cache stays in VRAM")
+            if "--kv-streaming" in args or glm_streams(cfg):
+                args = set_flag(args, "--kv-streaming", "off")
+            args = drop_flag(args, "--kv-resident")
+        else:
+            if "--kv-streaming" in args or bool(s.get("kv_streaming")) != glm_streams(cfg):
+                args = set_flag(args, "--kv-streaming", "on" if s.get("kv_streaming") else "off")
+            kr = _num(s, "kv_resident", 1024, 1048576, "Positions kept in VRAM")
+            args = set_flag(args, "--kv-resident", kr) if kr is not None and s.get("kv_streaming") else \
+                drop_flag(args, "--kv-resident")
+    if isinstance(out.get("ablate"), dict):   # (a direction the setup recorded: loaded, off by default)
+        args = ablate_args(out, args)
     out["args"] = args
     return out
 
@@ -598,6 +720,8 @@ def quant_label(cfg: dict, path: Path) -> str:
     """The files a config runs, as shown after the model's name ("Maya-XS", "UD-Q8_K_XL", "EXL3 3.5 bpw" - the setup's
     names, maya_quants); else its installer key, or the config's own name for one the setup did not write."""
     fam, key = family(cfg), maya_quants.config_key(cfg)
+    if maya_quants.is_glm53(cfg):                      # (GLM-5.3, 744B: "UD-IQ2_M" after its own name)
+        return str(maya_quants.glm53_quant(key) or path.stem.removeprefix("maya-").removesuffix("-hip"))
     what = maya_quants.tier(fam, key) or maya_quants.OTHERS.get((fam, key)) or OTHER_QUANTS.get((fam, str(key).lower()))
     what = maya_quants.exl3_bits(cfg) or what          # (an EXL3 quant set up by hand: its folder's bits, maya_quants)
     return str(what or key or path.stem.removeprefix("maya-").removesuffix("-hip"))
@@ -628,7 +752,10 @@ def describe(path: Path, running: str | None) -> dict:
     cur = shown_settings(cfg)
     setup = dict(inst.get("as_set_up") or cur)
     setup["env"] = shown_env(setup.get("env"))
-    return {"file": path.name, "path": str(path), "model": cfg.get("model_name") or "", "family": family(cfg),
+    # GLM-5.3 (744B): its name on screen beside the quant, and its cache's bytes a context token for the Context size's
+    # line (the page's GLM_KV_BYTES is GLM-5.3-Flash's) - keys only its configs have
+    own = {"shown": G53.LABEL, "kv_bytes": glm53_kv_bytes(cfg)} if G53.config_is_glm_dsa(cfg) else {}
+    return {**own, "file": path.name, "path": str(path), "model": cfg.get("model_name") or "", "family": family(cfg),
             "quant": quant_label(cfg, path), "backend": cfg.get("backend") or "cuda", "written": inst.get("written"),
             "used": used, "running": running is not None and str(path.resolve()) == str(Path(running).resolve()),
             "port": cfg.get("port"), "script": script, "folder": str(pack.parent) if pack else None,
@@ -747,6 +874,12 @@ TURBO_CONTEXT_FAMILIES = ("glm", "minimax")         # ... DeepSeek's context is 
 # of its 8 (33.2 -> 38.8; 3 gave a page with a duplicate import and slower drafts).
 TURBO_ENV = {"glm": {"MAYA_GLM_MISS_SKIP_W": "0.16", "MAYA_GLM_MISS_SKIP_FROM": "23", "MAYA_GLM_RESIDENT_TOPK": "4"},
              "deepseek": {"MAYA_DS4_RAM_SKIP_W": "0.14", "MAYA_DS4_DSPARK_CUM": "0.3", "MAYA_DS4_RESIDENT_TOPK": "3"}}
+# GLM-5.3 (744B, glm-dsa) has its own: TURBO_ENV's GLM values were tuned on GLM-5.3-Flash's 45 layers.  Measured on
+# GLM-5.3 Maya-XS (greedy, 512 tokens): MAYA_GLM_ROUTE_AFFINITY (added to a VRAM-resident expert's selection score, so
+# more of a token's experts are ones VRAM holds) at 0.2 decodes 22-25% faster, KL 0.20 against the exact route, the loop
+# test and a 20K-token document question as without it; 0.5 and up drifted into echoing the prompt, and
+# MAYA_GLM_RESIDENT_TOPK 6 to 4 broke the code answers (not used).
+TURBO_ENV_G53 = {"MAYA_GLM_ROUTE_AFFINITY": "0.2"}
 # the drafter that goes fastest where the pack has it: DSpark (DeepSeek, MiniMax), MTP (Qwen).  GLM keeps the drafter the
 # setup measured for this PC (MTP or DFlash2: which is faster depends on the GPUs).
 TURBO_DRAFT = {"deepseek": "dspark", "minimax": "dspark", "qwen": "mtp"}
@@ -782,7 +915,7 @@ def turbo_patch(cfg: dict) -> dict:
         patch["dspark_conf"] = TURBO_DSPARK_CONF
     if fam == "deepseek" and cur.get("prompt_lookup") is False:
         patch["prompt_lookup"] = True
-    env = TURBO_ENV.get(fam)
+    env = TURBO_ENV_G53 if G53.config_is_glm_dsa(cfg) else TURBO_ENV.get(fam)
     if env and turbo_smallest_quant(cfg):              # (no expert cap on the 1-2 bit quants: see TURBO_NO_TOPK)
         env = {k: v for k, v in env.items() if not k.endswith("_RESIDENT_TOPK")}
     if env and any(cur["env"].get(k) != v for k, v in env.items()):

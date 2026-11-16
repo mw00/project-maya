@@ -1,6 +1,6 @@
 #pragma once
 // The chunks a prompt-path call is cut into (Glm5Model::prefill, prefill_chunk_for), and
-// STRATA_GLM_PREFILL_MIN_CHUNKS=<n>[,<min tokens>]: on a split, every call is cut into n chunks at least (none shorter
+// MAYA_GLM_PREFILL_MIN_CHUNKS=<n>[,<min tokens>]: on a split, every call is cut into n chunks at least (none shorter
 // than <min tokens>, 512 by default).  The parts of a split pipeline a call's chunks (part 1 on chunk c while part 0 is
 // on c + 1), but a call that fits in one chunk - most reads of a long conversation: a turn appended to a restored one -
 // runs on one GPU after the other, each idle half the time.  In n chunks each part works n / (n + parts - 1) of the
@@ -17,7 +17,7 @@ struct PrefillMinChunks {
     int min_tokens = 512;   // no chunk of a cut call shorter (a call under 2 x this stays whole)
 };
 
-/// STRATA_GLM_PREFILL_MIN_CHUNKS's text (null: unset) -> the setting; n is 1..8, a chunk 256 tokens at least.
+/// MAYA_GLM_PREFILL_MIN_CHUNKS's text (null: unset) -> the setting; n is 1..8, a chunk 256 tokens at least.
 inline PrefillMinChunks prefill_min_chunks_parse(const char* v) {
     PrefillMinChunks r;
     if (v == nullptr || v[0] == '\0') return r;

@@ -18,7 +18,7 @@ compilers and keeps its cache in Docker's build cache on the machine that builds
 ## What the image holds
 
 - **The three engines**, compiled the way `maya.py`'s setup compiles them, where the setup puts them:
-  `build/maya` (GLM-5.3-Flash and Qwen-3.8-Flash-Next), `build/maya-ds4` (DeepSeek-V4.1-Flash-1017) and `build/maya-mm3`
+  `build/maya` (GLM-5.3, GLM-5.3-Flash and Qwen-3.8-Flash-Next), `build/maya-ds4` (DeepSeek-V4.1-Flash-1017) and `build/maya-mm3`
   (MiniMax-M3.1-Flash).
 - **The release's tree** in `/opt/maya`: the server (`serve/server.py`), the pack builders (`tools/iq_pack.py`,
   `tools/ds4/pack_gguf.py`, `tools/mm3/pack_gguf.py`) and the data files they use (the expert profiles, MiniMax's chat

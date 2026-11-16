@@ -14,7 +14,7 @@ S.turbo = {on: false, engine: false, plan: {}, env: {}, restarts: false, busy: f
 export async function loadTurbo() {
   try {
     const t = await api("api/turbo");
-    S.turbo = {...S.turbo, ...t, busy: S.turbo.busy};
+    S.turbo = {...S.turbo, hidden: false, ...t, busy: S.turbo.busy};   // (hidden: only while the server says so)
   } catch (e) { S.turbo = {...S.turbo, unavailable: true}; }   // (an older server: no Turbo)
   emit();
   return S.turbo;
@@ -106,7 +106,7 @@ export async function setTurbo(on) {
 // the button: a small flame that burns while Turbo is on (turbo.css)
 export function TurboButton() {
   const t = S.turbo;
-  if (t.unavailable) return null;
+  if (t.unavailable || t.hidden) return null;   // (hidden: GLM-5.3 (744B), until Turbo's values are measured on it)
   const tip = t.on ? "Turbo ON: trades quality for maximum speed (greedy decoding, no thinking, expert skipping, aggressive drafting). Click to put your settings back."
                    : "Turbo: trades quality for maximum speed, for benchmarks and playing with the engine. Your own settings come back when you switch it off.";
   return html`<button type="button" class=${`turbo${t.on ? " turbo--on" : ""}${t.busy ? " turbo--busy" : ""}`} aria-pressed=${t.on ? "true" : "false"}

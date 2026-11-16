@@ -1,5 +1,5 @@
-// exl3_mma_rows (STRATA_GLM_EXL3_MMA_ROWS_SHORT): the parse, and the rows an expert takes through the tensor-core
-// kernels by chunk length - the base (STRATA_GLM_EXL3_MMA_ROWS) unless the chunk is short and the setting is on.
+// exl3_mma_rows (MAYA_GLM_EXL3_MMA_ROWS_SHORT): the parse, and the rows an expert takes through the tensor-core
+// kernels by chunk length - the base (MAYA_GLM_EXL3_MMA_ROWS) unless the chunk is short and the setting is on.
 // CPU only.
 #include "strata/core/exl3_mma_rows.hpp"
 

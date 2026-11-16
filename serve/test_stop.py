@@ -69,10 +69,19 @@ def server_cmd(cfg: Path, port: int) -> list:
     return [sys.executable, str(ROOT / "serve" / "server.py"), *engine, "--port", str(port)]
 
 
+def hup_default() -> None:
+    """(a child's preexec_fn) SIGHUP at its default, as in a terminal: under nohup (a release run's `setsid nohup`)
+    the tests inherit it ignored, and the server and maya.py keep an ignored SIGHUP ignored (by design) - the SIGHUP
+    tests then waited 60 s for an end that never came."""
+    signal.signal(signal.SIGHUP, signal.SIG_DFL)
+
+
 class Proc:
     """A process with its output read line by line (until() waits for a line)."""
 
     def __init__(self, cmd, **kw):
+        if not WIN:
+            kw.setdefault("preexec_fn", hup_default)
         self.p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
                                   encoding="utf-8", errors="replace", bufsize=1, **kw)
         self.lines: queue.Queue = queue.Queue()
@@ -175,6 +184,32 @@ class WatchParent(unittest.TestCase):
         SV.request_stop(stop, "b")
         self.assertTrue(stop.is_set())
 
+    def test_the_main_wait_never_holds_the_events_lock(self):
+        """main()'s wait polls the flag: Event.wait held the Event's lock while a signal handler (same thread) called
+        stop.set() on it - a SIGTERM / Ctrl+C at that moment hung the server for good."""
+        class NoWait(threading.Event):
+            def wait(self, timeout=None):
+                raise AssertionError("main()'s stop wait must not call Event.wait")
+        stop = NoWait()
+        threading.Timer(0.05, lambda: SV.request_stop(stop, "test")).start()
+        t0 = time.monotonic()
+        SV.wait_for_stop(stop, step=0.01)
+        self.assertTrue(stop.is_set())
+        self.assertLess(time.monotonic() - t0, 2.0)
+
+    @unittest.skipIf(WIN, "POSIX signals")
+    def test_a_signal_handler_stops_the_main_wait(self):
+        """The real handler path: SIGALRM's handler calls request_stop on the main thread while it waits."""
+        stop = threading.Event()
+        old = signal.signal(signal.SIGALRM, lambda s, f: SV.request_stop(stop, "SIGALRM"))
+        self.addCleanup(signal.signal, signal.SIGALRM, old)
+        signal.setitimer(signal.ITIMER_REAL, 0.05)
+        self.addCleanup(signal.setitimer, signal.ITIMER_REAL, 0)
+        t0 = time.monotonic()
+        SV.wait_for_stop(stop, step=0.01)
+        self.assertTrue(stop.is_set())
+        self.assertLess(time.monotonic() - t0, 2.0)
+
 
 @unittest.skipIf(psutil is None, "psutil is not installed")
 class ServerStops(unittest.TestCase):
@@ -186,11 +221,20 @@ class ServerStops(unittest.TestCase):
         self.cfg = fake_config(Path(self.tmp.name))
 
     def start(self, extra=(), **kw) -> Proc:
-        p = Proc(server_cmd(self.cfg, free_port()) + list(extra), **kw)
+        p = self.serve(server_cmd(self.cfg, free_port()) + list(extra), **kw)
+        self.assertTrue(self.engine or not FAKE_ENGINE, "no engine process")
+        return p
+
+    def serve(self, cmd, **kw) -> Proc:
+        """The server, started and ready; self.engine: its engine's processes."""
+        p = Proc(cmd, **kw)
+        # (after p.close, before the folder goes: a server the test leaves running is killed there, and its engine -
+        # no QUIT then - ends only on its input's EOF a moment later; on Windows it still held engine.log)
+        self.engine = []
+        self.addCleanup(lambda: (kill_all(self.engine), gone(self.engine, 15)))
         self.addCleanup(p.close)
         self.assertTrue(p.until("ready:"), "the server did not start:\n" + "\n".join(p.seen))
         self.engine = descendants(p.p.pid)
-        self.assertTrue(self.engine or not FAKE_ENGINE, "no engine process")
         return p
 
     def ended(self, p: Proc, why: str):
@@ -204,10 +248,8 @@ class ServerStops(unittest.TestCase):
         """--engine strata (the old name, in older run scripts) starts the configured engine, not the mock one."""
         cmd = server_cmd(self.cfg, free_port())
         cmd[cmd.index("maya")] = "strata"
-        p = Proc(cmd, stdin=subprocess.DEVNULL)
-        self.addCleanup(p.close)
-        self.assertTrue(p.until("ready:"), "the server did not start:\n" + "\n".join(p.seen))
-        self.assertTrue(descendants(p.p.pid), "no engine process: --engine strata ran the mock engine")
+        self.serve(cmd, stdin=subprocess.DEVNULL)
+        self.assertTrue(self.engine, "no engine process: --engine strata ran the mock engine")
 
     def test_parent_pipe_closed(self):
         p = self.start(["--parent-pipe"], stdin=subprocess.PIPE)
@@ -231,6 +273,16 @@ class ServerStops(unittest.TestCase):
         p = self.start(stdin=subprocess.DEVNULL)
         p.p.send_signal(signal.SIGHUP)
         self.ended(p, "SIGHUP")
+
+    @unittest.skipIf(WIN, "POSIX signals")
+    def test_sighup_under_nohup_is_ignored(self):
+        """A server started under nohup (SIGHUP ignored) keeps running on SIGHUP; SIGTERM still stops it."""
+        p = self.start(stdin=subprocess.DEVNULL, preexec_fn=lambda: signal.signal(signal.SIGHUP, signal.SIG_IGN))
+        p.p.send_signal(signal.SIGHUP)
+        time.sleep(2)
+        self.assertIsNone(p.p.poll())
+        p.p.send_signal(signal.SIGTERM)
+        self.ended(p, "SIGTERM")
 
 
 DRIVER = """
@@ -263,6 +315,7 @@ class MayaStops(unittest.TestCase):
     def cleanup(self):
         kill_all([self.maya.p.pid] + self.tree)
         self.maya.close()
+        gone(self.tree, 15)                             # (they let go of engine.log before the folder goes)
 
     @unittest.skipIf(WIN, "POSIX signals")
     def test_sigterm_to_maya_alone(self):

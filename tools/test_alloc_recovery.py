@@ -7,9 +7,9 @@ again.  Now the failure ends the request with an error and the engine lives.
 
 Two test hooks make the failures happen on purpose:
 
-  STRATA_MMQ_POOL_FAIL=<n>        the prompt path's MMQ scratch pool cannot allocate the first n times (the case
+  MAYA_MMQ_POOL_FAIL=<n>        the prompt path's MMQ scratch pool cannot allocate the first n times (the case
                                   that used to abort the engine mid-prompt)
-  STRATA_PREALLOC_FAIL=<tokens> the prompt path's layout of a request's chunk bigger than <tokens> does not fit
+  MAYA_PREALLOC_FAIL=<tokens> the prompt path's layout of a request's chunk bigger than <tokens> does not fit
                                   (the case the recovery retries with a smaller chunk)
 
 The test needs the installed model and a GPU; without them it skips.
@@ -148,7 +148,7 @@ class AllocRecovery(unittest.TestCase):
 
     def test_the_scratch_pool_runs_out_and_the_engine_lives(self):
         """The MMQ scratch pool cannot allocate: the request ends with an error, the engine answers the next one."""
-        e = self.engine({"STRATA_MMQ_POOL_FAIL": "1"})
+        e = self.engine({"MAYA_MMQ_POOL_FAIL": "1"})
         out = e.gen(self.ids, 8)
         self.assertTrue(any(line.startswith("ERR") for line in out),
                         f"the request should have failed with an error, not an answer: {out}")
@@ -159,7 +159,7 @@ class AllocRecovery(unittest.TestCase):
 
     def test_a_chunk_that_does_not_fit_is_read_again_smaller(self):
         """A layout that does not fit: the request is read again with a smaller chunk and answered."""
-        e = self.engine({"STRATA_PREALLOC_FAIL": str(PROMPT_TOKENS // 2)})
+        e = self.engine({"MAYA_PREALLOC_FAIL": str(PROMPT_TOKENS // 2)})
         out = e.gen(self.ids, 8)
         self.assertTrue(any(line.startswith("DONE") for line in out),
                         f"the request should have been read with a smaller chunk: {out}")

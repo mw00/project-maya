@@ -638,8 +638,8 @@ bool MtpDrafter::prefill(const float* R_rows, const int32_t* next_tokens, int64_
     // E-4: every group's token / step / position records uploaded at once; each group is then device copies and a
     // graph on the one stream, with a single sync at the end (a group of <= max_t rows used to be staged in mapped
     // memory and synced before the next: ~5,500 host round trips on a 32K prompt).  The same work in the same
-    // order.  STRATA_MTP_PREFILL_SYNC=1 keeps the old loop.
-    static const bool per_group_sync = std::getenv("STRATA_MTP_PREFILL_SYNC") != nullptr;
+    // order.  MAYA_MTP_PREFILL_SYNC=1 keeps the old loop.
+    static const bool per_group_sync = std::getenv("MAYA_MTP_PREFILL_SYNC") != nullptr;
     const int64_t NHp = g_->n_head, per_row = 1 + 4 + NHp;
     if (!per_group_sync && n > 0) {
         if (pf_cap_ < n * per_row) {

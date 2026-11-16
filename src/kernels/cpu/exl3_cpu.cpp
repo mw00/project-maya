@@ -382,7 +382,7 @@ EXL3_AVX2_INLINE Avx2Consts avx2_consts() {
     return {_mm256_set1_epi32((int) kMul1), _mm256_set1_epi8(1), _mm256_set1_epi16(1), _mm256_set1_epi32(0xffff)};
 }
 
-// STRATA_EXL3_AVX2_SHUF (the kernels' S = true): a window whose right shift is a whole number of bytes taken by byte
+// MAYA_EXL3_AVX2_SHUF (the kernels' S = true): a window whose right shift is a whole number of bytes taken by byte
 // moves.  Haswell and Broadwell run every vector shift on port 0 alone - beside vpmulld (2 uops), vpmaddubsw and
 // vpmaddwd, the port this loop is bound by there - and vpshufb / vpblendw on port 5.  (b >> 8) & 0xffff and b >> 16
 // are one vpshufb (bytes 1-2 or 2-3 of each lane to bytes 0-1, zeros above); ((b >> 24) | (a << 8)) & 0xffff is one
@@ -405,7 +405,7 @@ EXL3_AVX2_INLINE __m256i avx2_bytes3(__m256i a, __m256i b) {   // ((b >> 24) | (
                                                 11, 8, z, z, 15, 12, z, z));
 }
 
-// row R's half H: its 8 states (16 bits in each 32-bit lane); S: STRATA_EXL3_AVX2_SHUF's byte moves
+// row R's half H: its 8 states (16 bits in each 32-bit lane); S: MAYA_EXL3_AVX2_SHUF's byte moves
 template <int K, int R, int H, bool S = false>
 EXL3_AVX2_INLINE __m256i avx2_states(const __m256i (&C)[K], const Avx2Consts& k) {
     constexpr const Avx2Tab<K>& T = kAvx2Tab<K>;
@@ -459,7 +459,7 @@ EXL3_AVX2_INLINE __m256 avx2_sums(const __m256i (&C)[K], const Avx2Consts& k) {
 
 // A tile as the row kernels below read it: load() once a tile, then sums<R, H>() - row R's half H as 8 F32 byte sums,
 // the columns in order - or sums2<R>() both halves through avx2_bsum2.  An integer K: the K class registers above.
-// S: STRATA_EXL3_AVX2_SHUF's byte moves.
+// S: MAYA_EXL3_AVX2_SHUF's byte moves.
 template <int K, bool S = false>
 struct Avx2TileInt {
     static_assert(kAvx2Tab<K>.ok, "EXL3 tile layout: a half row's words must share a residue class and a shift");
@@ -972,7 +972,7 @@ EXL3_AVX2 void band_out_avx2(const float* acc, float ki, float kz, const uint16_
     }
 }
 
-// the AVX2 kernels for n activations (1..kExl3CpuMaxN), S0 as STRATA_EXL3_AVX2_SHUF: the switch's path (S0 true) and
+// the AVX2 kernels for n activations (1..kExl3CpuMaxN), S0 as MAYA_EXL3_AVX2_SHUF: the switch's path (S0 true) and
 // its start check (both); S0 at a bitrate S changes nothing takes the default kernels
 template <int K2, bool S0, bool S = S0 && avx2_shuf_any<K2>()>
 void band_avx2_any(const Exl3Part& m, const float* const* xh, int n, int tc0, int ks0, int ks1, float* const* acc) {
@@ -1001,7 +1001,7 @@ void rows_avx2_any(const Exl3Part& m, const float* const* xh, int n, int ks0, in
         default: rows_avx2_n<K2, 8, false, S>(m, xh, ks0, ks1, t0, t1, acc); return;
     }
 }
-// STRATA_EXL3_AVX2_SHUF's start check for one bitrate: random tile words (8 slices x 128 columns), 1..8 activations,
+// MAYA_EXL3_AVX2_SHUF's start check for one bitrate: random tile words (8 slices x 128 columns), 1..8 activations,
 // the band, the split-K rows and the band GEMM with the byte moves against the shifts - the outputs that differ
 // (memcmp; each side's buffer poisoned with its own NaN first, so a side that skips one differs too) and compared
 template <int K2>
@@ -1053,7 +1053,7 @@ void avx2_shuf_check(size_t& differ, size_t& compared) {
         }
 }
 
-// AVX-512 F and BW with FMA, the OS saving the state (STRATA_FORCE_AVX2 is the tier choice's, below)
+// AVX-512 F and BW with FMA, the OS saving the state (MAYA_FORCE_AVX2 is the tier choice's, below)
 bool cpu_avx512_exl3() {
     unsigned r[4] = {0, 0, 0, 0};
     auto cpuid = [&](unsigned leaf, unsigned sub) {
@@ -1112,7 +1112,7 @@ constexpr int kTierW16 = 4;
 std::atomic<bool> g_w16{false};
 
 // the tiers this CPU runs (bit t: tier t - 0 scalar, 1 AVX2 + FMA + F16C, 2 AVX-512 F/BW, 3 AVX-512 VNNI, 4 tier 1
-// with the 16-bit lanes), and the one the lane takes: the widest, but AVX2 on an AVX-512 CPU with STRATA_FORCE_AVX2=1
+// with the 16-bit lanes), and the one the lane takes: the widest, but AVX2 on an AVX-512 CPU with MAYA_FORCE_AVX2=1
 // (to compare the vector tiers)
 int tier_mask() {
     static const int mask = [] {
@@ -1129,12 +1129,12 @@ int tier_mask() {
 }
 int detect_tier() {
     const int t = tier_mask();
-    const char* f = std::getenv("STRATA_FORCE_AVX2");
+    const char* f = std::getenv("MAYA_FORCE_AVX2");
     if ((t & 4) && !(f != nullptr && f[0] == '1')) return (t & 8) ? 3 : 2;
     return (t & 2) ? 1 : 0;
 }
 
-bool avx2_shuf();   // STRATA_EXL3_AVX2_SHUF (below)
+bool avx2_shuf();   // MAYA_EXL3_AVX2_SHUF (below)
 
 template <int K2>
 void band_on(int tier, const Exl3Part& m, const float* xh, int tc0, int ks0, int ks1, float* acc) {
@@ -1275,12 +1275,12 @@ void rows_on_n(int tier, const Exl3Part& m, const float* const* xh, int n, int k
 // every bitrate the lane takes (exl3_cpu_k2_ok): K 1..8 and the half-integer 1.5 / 2.5 / 3.5
 #define EXL3_LANE_K2(X) X(2) X(3) X(4) X(5) X(6) X(7) X(8) X(10) X(12) X(14) X(16)
 
-// STRATA_EXL3_AVX2_SHUF: -1 until the first AVX2 call reads it (avx2_shuf), then 0 or 1; exl3_cpu_set_avx2_shuf sets it
+// MAYA_EXL3_AVX2_SHUF: -1 until the first AVX2 call reads it (avx2_shuf), then 0 or 1; exl3_cpu_set_avx2_shuf sets it
 std::atomic<int> g_avx2_shuf{-1};
 // the variable, read once: 1 (its first character) on a CPU with the AVX2 tier turns the byte moves on if every
 // bitrate's start check finds no output differing (else they stay off); one line on stderr whenever it is set
 int avx2_shuf_env() {
-    const char* v = std::getenv("STRATA_EXL3_AVX2_SHUF");
+    const char* v = std::getenv("MAYA_EXL3_AVX2_SHUF");
     if (v == nullptr || v[0] != '1') return 0;
 #if defined(EXL3_X86)
     if ((tier_mask() & 2) != 0) {
@@ -1288,13 +1288,13 @@ int avx2_shuf_env() {
 #define EXL3_CASE(K2) avx2_shuf_check<K2>(differ, compared);
         EXL3_LANE_K2(EXL3_CASE)
 #undef EXL3_CASE
-        std::fprintf(stderr, "EXL3 CPU lane: STRATA_EXL3_AVX2_SHUF=1, the AVX2 tier's byte-aligned windows by byte "
+        std::fprintf(stderr, "EXL3 CPU lane: MAYA_EXL3_AVX2_SHUF=1, the AVX2 tier's byte-aligned windows by byte "
                              "shuffles: start check %zu of %zu outputs differ - %s%s\n", differ, compared,
                      differ == 0 ? "on" : "left off", detect_tier() == 1 ? "" : " (the lane runs another tier)");
         return differ == 0 ? 1 : 0;
     }
 #endif
-    std::fprintf(stderr, "EXL3 CPU lane: STRATA_EXL3_AVX2_SHUF=1 has no effect here (no AVX2 tier)\n");
+    std::fprintf(stderr, "EXL3 CPU lane: MAYA_EXL3_AVX2_SHUF=1 has no effect here (no AVX2 tier)\n");
     return 0;
 }
 bool avx2_shuf() {

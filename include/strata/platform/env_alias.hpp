@@ -1,6 +1,7 @@
-// include/strata/platform/env_alias.hpp - Maya's settings by the names its docs give them: every MAYA_X in the
-// environment also sets the older STRATA_X, the name the code still reads (over an older value: MAYA_X counts) - so a
-// setting works under either name.  Each program calls it first thing in main().
+// include/strata/platform/env_alias.hpp - Maya's settings are MAYA_X; the older STRATA_X still works as a fallback: every
+// STRATA_X in the environment that has no MAYA_X also sets MAYA_X (the name the code reads; MAYA_X wins when both are
+// set) - so a setting works under either name.  Each program calls it first thing in main(); a header that includes this
+// one also runs it once at program start (the inline variable below), for the programs that never call it.
 #pragma once
 
 #include <cstdlib>
@@ -9,7 +10,9 @@
 #include <utility>
 #include <vector>
 
-#if !defined(_WIN32)
+#if defined(__APPLE__)
+#include <crt_externs.h>   // (macOS: the environment table is reached through _NSGetEnviron)
+#elif !defined(_WIN32)
 #include <unistd.h>
 extern "C" char** environ;   // (POSIX's; declared again with the C linkage unistd.h gives it)
 #endif
@@ -19,6 +22,8 @@ namespace strata::platform {
 inline void env_aliases() {
 #if defined(_WIN32)
     char** env = _environ;
+#elif defined(__APPLE__)
+    char** env = *_NSGetEnviron();
 #else
     char** env = environ;
 #endif
@@ -27,8 +32,10 @@ inline void env_aliases() {
     for (char** e = env; *e != nullptr; ++e) {
         const char* s = *e;
         const char* eq = std::strchr(s, '=');
-        if (std::strncmp(s, "MAYA_", 5) != 0 || eq == nullptr) continue;
-        add.emplace_back("STRATA_" + std::string(s + 5, eq), std::string(eq + 1));
+        if (std::strncmp(s, "STRATA_", 7) != 0 || eq == nullptr || eq <= s + 7) continue;
+        const std::string key = "MAYA_" + std::string(s + 7, eq);
+        if (std::getenv(key.c_str()) != nullptr) continue;   // (MAYA_X is set: it counts)
+        add.emplace_back(key, std::string(eq + 1));
     }
     for (const auto& kv : add) {
 #if defined(_WIN32)
@@ -38,5 +45,7 @@ inline void env_aliases() {
 #endif
     }
 }
+
+inline const bool env_aliases_at_start = (env_aliases(), true);   // (C++17 inline variable: one per program)
 
 }  // namespace strata::platform

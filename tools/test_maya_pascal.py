@@ -34,6 +34,18 @@ class PascalSetupTests(unittest.TestCase):
         p40 = gpu(1, "61", "Tesla P40", 24)
         self.assertEqual(maya.choose_gpus(self.a, [m40, p40]), [p40])
 
+    def test_a_tiny_card_is_left_out_of_the_automatic_pick(self):
+        v100s = [gpu(i, "70", "Tesla V100-PCIE-32GB", 32) for i in range(3)]
+        p400 = gpu(3, "61", "Quadro P400", 2)
+        a = SimpleNamespace(gpu=None, gpus=None, yes=True, check=False)
+        self.assertEqual(maya.choose_gpus(a, v100s + [p400]), v100s)
+        self.assertEqual(maya.choose_gpus(a, [v100s[0], p400]), [v100s[0]])
+        a.gpus = "0,1,2,3"                               # asked for by name: still taken
+        self.assertEqual(maya.choose_gpus(a, v100s + [p400]), v100s + [p400])
+        mixed = [gpu(0, "86", "RTX 3090", 24), gpu(1, "86", "RTX 3060", 12)]
+        a.gpus = None                                    # half the VRAM is not "tiny": both offered
+        self.assertEqual(maya.choose_gpus(a, mixed), mixed)
+
     def test_pascal_builds_like_volta(self):
         self.assertEqual(maya.arch_setting([61]), "61")
         self.assertEqual(maya.nvcc_range([61]), ((12, 0), (13, 0)))

@@ -27,10 +27,10 @@ namespace strata::platform {
 /// The bytes Windows' page files may still grow by: a page file Windows manages (PagingFiles "?:\pagefile.sys", or a
 /// file's sizes "0 0") up to 3x the RAM Windows sees (4 GiB at least) and an eighth of its volume, a set one up to
 /// its maximum - each within its volume's free space less a tenth of the volume.  0 off Windows, without a page file,
-/// or when the settings cannot be read.  STRATA_COMMIT_GROWTH=0: 0 (as v1.1.17 counted).
+/// or when the settings cannot be read.  MAYA_COMMIT_GROWTH=0: 0 (as v1.1.17 counted).
 inline uint64_t commit_growth(uint64_t ram_total) {
 #if defined(_WIN32)
-    if (const char* v = std::getenv("STRATA_COMMIT_GROWTH"); v != nullptr && std::atoi(v) == 0) return 0;
+    if (const char* v = std::getenv("MAYA_COMMIT_GROWTH"); v != nullptr && std::atoi(v) == 0) return 0;
     // the setting, through advapi32 as loaded (RegGetValueW), so no program links it for this
     using Get = LONG(WINAPI*)(HKEY, LPCWSTR, LPCWSTR, DWORD, LPDWORD, PVOID, LPDWORD);
     HMODULE m = LoadLibraryA("advapi32.dll");

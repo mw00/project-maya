@@ -1,4 +1,4 @@
-// tests/glm_rows_attn_test.cu - the batched rows' DSA attention and selection (glm_rows.cu, STRATA_GLM_ROWS_ATTN) against
+// tests/glm_rows_attn_test.cu - the batched rows' DSA attention and selection (glm_rows.cu, MAYA_GLM_ROWS_ATTN) against
 // the per-row path the rows take without it, on random inputs (needs an NVIDIA GPU of compute capability 8.0+, no model), compared
 // bitwise:
 //   per row (the reference): gf::mla(q_i, ...) over that row's own latent cache - resident, or a streamed layer's slot
@@ -9,7 +9,7 @@
 // 2..16 rows, each its own conversation with its own context length (from a few positions, where the selection is
 // every pool, to ~60K), resident and streamed caches mixed, some rows later positions of the row before's conversation
 // (a verify window's rows; streamed: one resolve over the run's cells, as the engine), FP16 rows and INT8 records, and launches of fewer tokens than rows (part_tokens).  And the
-// rows' selections in one launch (gf::dsa_select_rows) against dsa_select a row, cell for cell; and STRATA_GLM_ROWS_SMALL's
+// rows' selections in one launch (gf::dsa_select_rows) against dsa_select a row, cell for cell; and MAYA_GLM_ROWS_SMALL's
 // pieces: the rows' scores (dsa_score_rows), KV resolves (glm_kv_resolve_rows: each selected cell reads its position's
 // bytes, as glm_kv_resolve's) and the experts' grouping with a thread an entry, against the one-a-row / one-thread
 // kernels.
@@ -329,7 +329,7 @@ void run_select(int n, uint32_t seed, cudaStream_t s) {
     }
 }
 
-// STRATA_GLM_ROWS_SMALL: the rows' scores in one launch (gf::dsa_score_rows) against dsa_score a row
+// MAYA_GLM_ROWS_SMALL: the rows' scores in one launch (gf::dsa_score_rows) against dsa_score a row
 void run_score(int n, uint32_t seed, cudaStream_t s) {
     constexpr int kKey = 128, kIdxHeads = 32;
     std::mt19937 rng(seed);
@@ -374,7 +374,7 @@ void run_score(int n, uint32_t seed, cudaStream_t s) {
     for (float* b : bufs) cudaFree(b);
 }
 
-// STRATA_GLM_ROWS_SMALL: n sequences' resolves in one launch (gf::glm_kv_resolve_rows) against glm_kv_resolve a row, on
+// MAYA_GLM_ROWS_SMALL: n sequences' resolves in one launch (gf::glm_kv_resolve_rows) against glm_kv_resolve a row, on
 // twin copies of every sequence's map and slots, over several steps (so slots get evicted).  A resolve places its misses
 // in the order its threads claim them (atomics), so which slot a block lands in - and from there the clock's later
 // victims - differs from run to run with either kernel; what the attention reads may not: for every selected cell, the
@@ -495,7 +495,7 @@ void run_resolve(int n, bool q8, uint32_t seed, cudaStream_t s) {
     }
 }
 
-// STRATA_GLM_ROWS_SMALL: the experts' grouping with a thread an entry against the one-thread kernel, value for value
+// MAYA_GLM_ROWS_SMALL: the experts' grouping with a thread an entry against the one-thread kernel, value for value
 void run_group(int T, uint32_t seed, cudaStream_t s) {
     std::mt19937 rng(seed);
     std::uniform_int_distribution<int> pick(0, 3 * T + 4);

@@ -890,7 +890,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     if (native && d.nact_multi.size() < (size_t) MAXT * kNativeActBytes) d.nact_multi.resize((size_t) MAXT * kNativeActBytes);
     if (d.job_of.size() != (size_t) d.n_expert) d.job_of.assign((size_t) d.n_expert, (int16_t) -1);
     if (d.jobs_multi.size() < (size_t) (n_tok * k)) d.jobs_multi.resize((size_t) (MAXT * k));
-    static const bool ptrace = std::getenv("STRATA_POOL_TRACE") != nullptr;
+    static const bool ptrace = std::getenv("MAYA_POOL_TRACE") != nullptr;
     auto pt = [&](const char* what, long long a = -1) {
         if (ptrace) { std::fprintf(stderr, "pool trace: layer %lld %s %lld\n", (long long) d.layers, what, a); std::fflush(stderr); }
     };
@@ -1227,7 +1227,7 @@ LoadStats load_experts_gguf(const std::string& gguf, uint8_t* dst, const strata:
             }
             const auto& fm = lay.fmt[(size_t) l];
             const uint64_t blob = lay.bytes[(size_t) l];
-            const uint64_t per[3] = {fm.up_off, fm.up_off, blob - fm.down_off};
+            const uint64_t per[3] = {fm.up_off, fm.down_off - fm.up_off, blob - fm.down_off};   // (gate and up differ on a mixed layer)
             const uint64_t at[3] = {0, fm.up_off, fm.down_off};
             for (int r = 0; r < 3; ++r) {
                 const uint64_t src = lay.gguf_off[(size_t) (3 * l + r)];
@@ -1686,7 +1686,7 @@ bool GgufExpertSource::open(const std::string& shard1, int64_t n_layers, int64_t
         // every slice of this layer inside its file: refused at open rather than faulting at token 4000
         const auto& fm = lay.fmt[(size_t) l];
         const uint64_t blob = lay.bytes[(size_t) l];
-        const uint64_t per[3] = {fm.up_off, fm.up_off, blob - fm.down_off};
+        const uint64_t per[3] = {fm.up_off, fm.down_off - fm.up_off, blob - fm.down_off};   // (gate and up differ on a mixed layer)
         for (int r = 0; r < 3; ++r) {
             const uint64_t off = lay.gguf_off[(size_t) (3 * l + r)], need = per[r] * (uint64_t) n_expert;
             if (off == 0 || per[r] == 0 || off > maps_[(size_t) at].bytes || need > maps_[(size_t) at].bytes - off) {
@@ -1772,7 +1772,7 @@ void GgufExpertSource::parts(int64_t layer, int64_t expert, const uint8_t* src[3
     const auto& fm = lay.fmt[(size_t) layer];
     const uint64_t blob = lay.bytes[(size_t) layer];
     bytes[0] = fm.up_off;
-    bytes[1] = fm.up_off;
+    bytes[1] = fm.down_off - fm.up_off;   // (the up rows: not the gate's size on a mixed layer)
     bytes[2] = blob - fm.down_off;
     const Map& m = maps_[(size_t) map_of_[(size_t) layer]];
     for (int r = 0; r < 3; ++r) {

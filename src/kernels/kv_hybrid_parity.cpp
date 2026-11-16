@@ -325,17 +325,34 @@ int main() {
     // dequantized from its q4_0 blocks to fp16 at gather. Its summation order differs from the old kernel's
     // (accuracy-level, not bitwise - qsa_prompt_attn.hpp says the same of its int8 mode), so: tolerance check
     // against the SAME dequant reference, output un-rotated exactly as prefill.cpp does.
+    // glm-dsa B0.5: its MMA and cp.async need sm_80, so below that it refuses by design (the compute-capability gate in
+    // qsa_prompt_attn.cu) and the old kernel runs, the one [3/3] and [4/4] check. There the refusal is the expected
+    // result and a launch is a FAIL (the device code is a trap below sm_80); on sm_80+ a refusal stays a FAIL and a
+    // launch is checked against the dequant reference as before.
     {
         float* d_at4 = dalloc<float>((size_t) QH * D);
+        int dev = 0, cc_major = 0;   // glm-dsa B0.5: the device the gate reads
+        ck(cudaGetDevice(&dev), "device");
+        ck(cudaDeviceGetAttribute(&cc_major, cudaDevAttrComputeCapabilityMajor, dev), "compute capability");
         const bool took = k::qsa_prompt_attn_batch(d_q, pools, d_ids, d_step, cells, s, d_at4, 1, nullptr);
         if (!took) {
 #if defined(STRATA_USE_HIP)
             // AMD: the tensor-core prompt path is CUDA-only, so it refuses every pool and the old kernel runs
             std::printf("[5/5] qsa_prompt_attn mode 3: PASS (refused on HIP - the old kernel runs)\n");
 #else
-            std::printf("[5/5] qsa_prompt_attn mode 3: FAIL (refused the hybrid pools)\n");
-            g_fail = 1;
+            if (cc_major < 8) {   // glm-dsa B0.5: a V100 (sm_70) refuses by design
+                std::printf("[5/5] qsa_prompt_attn mode 3: PASS (refused on compute capability %d.x, below sm_80 - "
+                            "the old kernel runs)\n", cc_major);
+            } else {
+                std::printf("[5/5] qsa_prompt_attn mode 3: FAIL (refused the hybrid pools on compute capability "
+                            "%d.x)\n", cc_major);
+                g_fail = 1;
+            }
 #endif
+        } else if (cc_major < 8) {   // glm-dsa B0.5: launched past the sm_80 gate
+            std::printf("[5/5] qsa_prompt_attn mode 3: FAIL (launched on compute capability %d.x, below sm_80)\n",
+                        cc_major);
+            g_fail = 1;
         } else {
             k::fwht256_inplace_cuda(d_at4, QH, nullptr);
             ck(cudaDeviceSynchronize(), "at4 sync");

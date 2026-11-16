@@ -153,7 +153,8 @@ class Dashboard(unittest.TestCase):
         from serve import models as M
         with tempfile.TemporaryDirectory() as t:
             cfg = qwen_cfg(Path(t))
-            self.assertEqual(M.choices(cfg), {"draft": ["mtp", "none"], "images": False})
+            self.assertEqual(M.choices(cfg), {"draft": ["mtp", "none"], "images": False,   # (Qwen: no ablation)
+                                              "ablate": {"available": False, "why": "not available for this model"}})
             s = M.settings_of(cfg)
             self.assertEqual((s["draft"], s["kv"], s["expert_cache"]), ("none", "fp16", None))
             out = M.apply(cfg, {"draft": "mtp", "kv": "int8", "ram_gb": 40, "context": 131072})

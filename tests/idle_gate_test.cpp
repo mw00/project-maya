@@ -92,7 +92,7 @@ int main() {
     }
     // the deep idle's settings: one that is not set is the fallback
     {
-        check(strata::platform::idle_env("STRATA_IDLE_GATE_TEST_UNSET_VARIABLE", 60) == 60, "an unset setting is the fallback");
+        check(strata::platform::idle_env("MAYA_IDLE_GATE_TEST_UNSET_VARIABLE", 60) == 60, "an unset setting is the fallback");
     }
     if (failures == 0) std::printf("idle_gate_test: ok\n");
     return failures == 0 ? 0 : 1;
