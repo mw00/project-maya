@@ -3952,6 +3952,7 @@ struct RouteArgs {
                                 // (0: all); the top-1 always runs, the kept weights are renormalised when the model's are
     int norm_mode;              // glm-dsa B5.1: kRouteNormClamp (Maya, llama.cpp) or kRouteNormHf (glm-dsa, + 1e-20)
     unsigned long long rand_seed = 0;   // glm-dsa B15.7: MAYA_GLM_RANDOM_ROUTING's seed (0: the router's own ids)
+    float ahead_min_w = 0.0f;           // MAYA_GLM_AHEAD_MIN_W: a predicted expert below this share is not named
 };
 
 // kExt: the glm-dsa additions to the route - the HF weight normalisation (norm_mode, B5.1) and the bench mode's random
@@ -4049,6 +4050,7 @@ __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const STRATA_G
         const float* lg = a.ahead_logits + (size_t) w * E;
         const float* bs = a.ahead_bias[w];
         float v[16];
+        float ahp[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};   // the picks' own probabilities (lane 0)
 #pragma unroll
         for (int j = 0; j < 16; ++j) {
             const int e = lane + 32 * j;
@@ -4085,7 +4087,16 @@ __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const STRATA_G
                 const bool valid = bi >= 0 && bi < E && isfinite(bv);
                 s_ah[w][r] = (short) (valid ? bi : -1);
                 if (!valid) atomicMax(&bad, 3);
+                if (valid && r < 8) ahp[r] = 1.0f / (1.0f + expf(-lg[bi]));
             }
+        }
+        // MAYA_GLM_AHEAD_MIN_W, with the disk skip by weight: a pick whose predicted share is below the bar would be left
+        // out by its own route when it is not held, so it is not named for a read ahead (rank 0 always is)
+        if (lane == 0 && a.ahead_min_w > 0.0f) {
+            float sum = 0.0f;
+            for (int r = 0; r < a.k && r < 8; ++r) sum += ahp[r];
+            for (int r = 1; r < a.k && r < 8; ++r)
+                if (ahp[r] < a.ahead_min_w * sum) s_ah[w][r] = (short) -1;
         }
     }
     // the routed experts' VRAM and RAM-tier table entries, loaded at once (thread 0's plan below read them one after
@@ -6695,6 +6706,11 @@ void moe_route(const float* logits, const float* bias, int n_expert, int k, floa
     }();
     a.res_w = resident_ok ? res_w : 0.0f;
     a.res_k = resident_ok ? res_k : 0;
+    static const float ahead_min_w = [] {   // MAYA_GLM_AHEAD_MIN_W (default 0: every pick, as before)
+        const char* v = getenv("MAYA_GLM_AHEAD_MIN_W");
+        return v ? std::max(0.0f, (float) std::atof(v)) : 0.0f;
+    }();
+    a.ahead_min_w = ahead_min_w;
     // MAYA_GLM_ROUTE_RANK=0: the selections by topk_warp's serial rounds again (A/B); topk_rank needs whole warps of
     // experts that one block's threads cover and at most 8 picks
     static const bool rank_on = [] {
