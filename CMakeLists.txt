@@ -1732,6 +1732,16 @@ if(STRATA_BUILD_TESTS)
     target_link_libraries(dequant_bf16_test PRIVATE strata_kernels strata_artifact ${_strata_gpu_runtime_target})
   endif()
 
+  # The Q5_1 gate on the native MMVQ path and the BF16 dequant: the capability queries, the
+  # group32<7> branch and the small_q8_dot<Q51Block> dot.  It runs as the script and not as an
+  # add_executable because native_mmvq.cu and dequant_bf16.cu carry CUDA launch syntax that g++
+  # cannot parse; the script strips the launch configs into tests/../<build>/gen first, then builds
+  # the test against tests/cpu_cuda_shim and runs it.  Needs no CUDA, no ROCm and no model.
+  add_test(NAME q51_native_test
+           COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/q51_native_cpu_test.sh
+                   ${CMAKE_CURRENT_BINARY_DIR}/q51_native_ctest q51_native_ctest)
+  set_tests_properties(q51_native_test PROPERTIES TIMEOUT 600)
+
   add_executable(expert_multi_test src/kernels/cpu/expert_multi_test.cpp)
   target_link_libraries(expert_multi_test PRIVATE strata_kernels_cpu)
   add_test(NAME expert_multi_test COMMAND expert_multi_test)
