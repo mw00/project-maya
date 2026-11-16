@@ -2261,8 +2261,11 @@ bool Glm5Model::fast_setup(std::string& err) {
             F->rload.emplace_back(new std::atomic<uint64_t>[(size_t) R.n]);
             for (int s = 0; s < R.n; ++s) F->rload.back()[(size_t) s].store(0);
         }
-        if (F->ahead_read)
-            for (int i = 0; i < 2; ++i) F->ah_th.emplace_back([this] { fast_ahead_reader(); });
+        if (F->ahead_read) {
+            const char* aht = getenv("MAYA_GLM_AHEAD_THREADS");   // the look-ahead's reader threads (default 2)
+            const int n_aht = aht ? std::max(1, std::min(16, std::atoi(aht))) : 2;
+            for (int i = 0; i < n_aht; ++i) F->ah_th.emplace_back([this] { fast_ahead_reader(); });
+        }
         const char* wv = getenv("MAYA_GLM_WARM");
         if ((wv == nullptr || std::atoi(wv) != 0) && !fast_warm(err)) return false;
 #ifdef _WIN32
@@ -5839,7 +5842,10 @@ void Glm5Model::fast_ahead_route(int il, const int* ids, unsigned int miss, cons
         for (int i = 0; i < 8; ++i) F->ah_pred[(size_t) la][(size_t) d][(size_t) i] = ahead[d][i];
     }
     if (!F->ahead_read) return;
-    constexpr int kMaxInflight = 4;
+    static const int kMaxInflight = [] {   // MAYA_GLM_AHEAD_INFLIGHT (default 4)
+        const char* v = getenv("MAYA_GLM_AHEAD_INFLIGHT");
+        return v ? std::max(1, std::min(64, std::atoi(v))) : 4;
+    }();
     bool queued = false;
     for (int d = 0; d < F->n_ahead; ++d) {   // the nearest layer first: its reads are the most urgent
         const int la = il + 1 + d;
@@ -5900,7 +5906,24 @@ void Glm5Model::fast_ahead_reader() {
         uint64_t want = j.tag << 2;
         if (ld.compare_exchange_strong(want, (j.tag << 2) | 1u, std::memory_order_acq_rel)) {
             uint8_t* blob = F->rc[(size_t) j.rclass].slot((size_t) j.rslot);
-            for (int role = 0; role < 3; ++role) fast_read_part(j.il, j.e, role, blob);
+            // MAYA_GLM_AHEAD_CHUNKS: the expert in pieces read at once, as a route's own misses are (one thread's read of
+            // an EXL3 expert took about 4 ms here, longer than the layer of lead the prediction gives); default 1
+            static const int nch = [] {
+                const char* v = std::getenv("MAYA_GLM_AHEAD_CHUNKS");
+                return v ? std::max(1, std::min(16, std::atoi(v))) : 1;
+            }();
+            if (nch <= 1) {
+                for (int role = 0; role < 3; ++role) fast_read_part(j.il, j.e, role, blob);
+            } else {
+                std::vector<std::thread> th;
+                th.reserve((size_t) nch - 1);
+                const auto part = [&](int c) {
+                    for (int role = 0; role < 3; ++role) fast_read_part(j.il, j.e, role, blob, c, nch);
+                };
+                for (int c = 1; c < nch; ++c) th.emplace_back(part, c);
+                part(0);
+                for (auto& t : th) t.join();
+            }
             ld.store((j.tag << 2) | 2u, std::memory_order_release);
         }
         F->ah_inflight.fetch_sub(1, std::memory_order_relaxed);
