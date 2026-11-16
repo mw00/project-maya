@@ -632,6 +632,10 @@ struct Dev {
     TopkScratch tks;                                   // a window's indexer top k over long rows (topk's segments)
     unsigned long long* plan_ptr = nullptr;           // the decode path's VRAM experts (0: on the CPU lane)
     int* cpu_any = nullptr;                           // the window's routing has a CPU-lane pick (route_publish's)
+    // the expert profile's routes of the host-free layers this device leads ([nl + n_mtp][n_exp], route_publish's
+    // count): such a layer's picks never reach the host, where the profile is counted (issue #501: the DSpark blocks,
+    // every expert of theirs in VRAM, were never counted); added to the profile when it is saved
+    unsigned* rcnt = nullptr;
     uint8_t* eg_rows = nullptr;
     uint16_t *emb_rows = nullptr, *ext = nullptr;   // the window's embedding rows; the window attention's rows
     AttnScratch attn_scr;   // a few queries' selected compressed rows decoded (sparse_attn)
@@ -4380,7 +4384,8 @@ struct Model::Impl {
                       dalloc(d, d.tok, 16, err) && dalloc(d, d.emb_rows, W * D, err) &&
                       dalloc(d, d.ext, ((size_t) g.win + W) * g.hd, err) && dalloc(d, d.xe, P * D, err) &&
                       dalloc(d, d.xg, P * g.ff, err) && dalloc(d, d.xu, P * g.ff, err) && dalloc(d, d.xhh, P * g.ff, err) &&
-                      dalloc(d, d.ed, P * D, err) && dalloc(d, d.plan_ptr, P, err) && dalloc(d, d.cpu_any, 1, err);
+                      dalloc(d, d.ed, P * D, err) && dalloc(d, d.plan_ptr, P, err) && dalloc(d, d.cpu_any, 1, err) &&
+                      dalloc(d, d.rcnt, (size_t) (g.nl + g.n_mtp) * g.n_exp, err);
             if (!ok) return false;
             CK(cudaMemset(d.cpu_any, 0, sizeof(int)));
             d.attn_scr.max_t = kAttnScratchT;
@@ -22428,7 +22433,7 @@ struct Model::Impl {
                 route_publish(d.glog, l.gate_bias, l.n_exp, l.k_exp, T, g.route_scale, rh_vtab(l), d.x, D, d.ridx, d.rw,
                               d.plan_ptr, lead ? preq : nullptr, sq, s, l.gate_bias_vl, l.mtp ? 0u : wp.vl,
                               na[0], na[1], lead && self_answer ? resps + slot : nullptr, d.cpu_any,
-                              lane_done);
+                              lane_done, mi == 0 && sq == 0 && host_free(l) ? dev_count(d, l.il) : nullptr);
             }
             if (rh_lead && lead && !rh_req_out(slot, T, s, err)) return false;
             {
@@ -23122,13 +23127,39 @@ struct Model::Impl {
             // never moved on and only .tmp files were left)
             if (!ok || !os::replace_file(tmp, path)) std::remove(tmp.c_str());
         };
+        if (o.profile_out.empty() && (o.profile.empty() || o.profile_readonly)) return;
+        // (the host's counts and the devices' - the host-free layers' routes, issue #501)
+        std::vector<uint32_t> all = prof;
+        add_dev_counts(all);
         if (!o.profile_out.empty()) {   // (--profile-out: this run's routing alone - the counts only ever grow)
-            std::vector<uint32_t> run(prof.size());
-            for (size_t i = 0; i < prof.size(); ++i) run[i] = prof[i] - (i < prof_load.size() ? prof_load[i] : 0u);
+            std::vector<uint32_t> run(all.size());
+            for (size_t i = 0; i < all.size(); ++i) run[i] = all[i] - (i < prof_load.size() ? prof_load[i] : 0u);
             write(o.profile_out, run);
         }
         if (o.profile.empty() || o.profile_readonly) return;
-        write(o.profile, prof);
+        write(o.profile, all);
+    }
+    // a host-free layer's device counts (route_publish's count): layer il's row of the device's rcnt
+    unsigned* dev_count(Dev& d, int il) const {
+        return d.rcnt != nullptr && il >= 0 && il < g.nl + g.n_mtp ? d.rcnt + (size_t) il * g.n_exp : nullptr;
+    }
+    // every device's counts since the load added to v (the profile's [nl + n_mtp][n_exp]) - at a save, between
+    // requests: each device's stream has finished the routings it counts
+    void add_dev_counts(std::vector<uint32_t>& v) const {
+        const size_t n = (size_t) (g.nl + g.n_mtp) * g.n_exp;
+        if (v.size() < n) return;
+        std::vector<uint32_t> h(n);
+        int cur = 0;
+        cudaGetDevice(&cur);
+        for (const Dev& d : devs) {
+            if (d.rcnt == nullptr) continue;
+            cudaSetDevice(d.id);
+            if (cudaMemcpyAsync(h.data(), d.rcnt, n * sizeof(unsigned), cudaMemcpyDeviceToHost, d.st) != cudaSuccess ||
+                cudaStreamSynchronize(d.st) != cudaSuccess)
+                continue;
+            for (size_t i = 0; i < n; ++i) v[i] += h[i];
+        }
+        cudaSetDevice(cur);
     }
 
     std::vector<std::string> info_lines() const {

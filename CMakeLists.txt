@@ -819,6 +819,13 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     if(STRATA_ENABLE_HIP)
       target_link_libraries(ds4_gguf_test PRIVATE strata_mmq)
     endif()
+    # route_publish's count (issue #501): a host-free layer's routes counted on the device, the picks bit for bit as
+    # without it (needs a GPU, no model)
+    add_executable(ds4_route_count_test tests/ds4_route_count_test.cu src/ds4/ds4_kernels.cu src/ds4/ds4_host_ar.cpp)
+    target_include_directories(ds4_route_count_test PRIVATE ${_strata_gpu_include_directories} include)
+    target_link_libraries(ds4_route_count_test PRIVATE ${_strata_gpu_runtime_target})
+    add_test(NAME ds4_route_count COMMAND ds4_route_count_test)
+    set_tests_properties(ds4_route_count PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
     # DS4_MULTI_ATTN: a multi step's attention for all its rows in one launch a step against each conversation's run
     # alone (attn_core's launches), bit for bit on random rings and caches - decode rows, verify windows, drafter
     # blocks (needs a GPU, no model; built by name)
