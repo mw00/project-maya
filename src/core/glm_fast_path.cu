@@ -821,6 +821,8 @@ void read_slice(const Glm5Model::Shard& sh, uint64_t off, size_t len, uint8_t* d
 
 using glmfast::read_slice;
 
+static bool xbin_layer_on(int il);   // MAYA_GLM_XSTREAM: this layer's experts come from the experts file
+
 namespace {   // MAYA_GLM_EXPERTS_BIN's layout, defined with the experts file below
 void xbin_layout(const std::vector<size_t>& blob, std::vector<uint64_t>& base, std::vector<uint64_t>& stride, uint64_t& total,
                  int n_expert);
@@ -5436,7 +5438,26 @@ void Glm5Model::fast_service() {
                     const char* v = getenv("MAYA_GLM_STREAM_FETCH");
                     return v == nullptr || std::atoi(v) != 0;
                 }();
-                const bool stream = stream_env && nr > 0 && 3 * rch <= 32 && pack_layers_[(size_t) il].x_cb < 0;
+                // MAYA_GLM_XSTREAM=1: an EXL3 layer streams too when its experts come from MAYA_GLM_EXPERTS_BIN (the
+                // whole expert one aligned run, cut into 3 x rch equal pieces as fast_read_part reads it)
+                static const bool xstream_env = [] {
+                    const char* v = getenv("MAYA_GLM_XSTREAM");
+                    return v != nullptr && std::atoi(v) != 0;
+                }();
+                const bool x_layout = pack_layers_[(size_t) il].x_cb >= 0;
+                const bool x_ok = x_layout && xstream_env && xbin_layer_on(il);   // (opened by the warm-up's reads)
+                const bool stream = stream_env && nr > 0 && 3 * rch <= 32 && (!x_layout || x_ok);
+                // MAYA_GLM_AHEAD_YIELD=1: while this route reads its misses the look-ahead's other reads stand back
+                static const bool ah_yield = [] {
+                    const char* v = getenv("MAYA_GLM_AHEAD_YIELD");
+                    return v != nullptr && std::atoi(v) != 0;
+                }();
+                const bool rd_mark = ah_yield && (nr > 0 || nw > 0);
+                if (rd_mark) {
+                    for (int i = 0; i < 8; ++i)
+                        F->rd_want[i].store(i < nw ? ((long long) cls << 32) | (long long) wt[i] : -1ll, std::memory_order_release);
+                    F->rd_busy.fetch_add(1, std::memory_order_release);
+                }
                 gf::MoeResponse* Rp = F->resp_h;
                 if (stream) {
                     static bool said = false;
@@ -5451,9 +5472,9 @@ void Glm5Model::fast_service() {
                     Rp->n_upd = 0;
                     Rp->cpu = 0;
                     Rp->stream_mask = 0;
-                    Rp->s_gu = (unsigned long long) Lys.gu_bytes;
-                    Rp->s_dn = (unsigned long long) Lys.dn_bytes;
-                    Rp->s_chunks = rch;
+                    Rp->s_gu = x_layout ? (unsigned long long) Lys.blob : (unsigned long long) Lys.gu_bytes;
+                    Rp->s_dn = x_layout ? 0ull : (unsigned long long) Lys.dn_bytes;
+                    Rp->s_chunks = x_layout ? -rch : rch;   // (negative: the experts file's equal pieces)
                     for (int m = 0; m < nm; ++m) {
                         Rp->ptr[mi[m]] = (unsigned long long) dst[m];
                         Rp->ptr_mask |= 1u << mi[m];
@@ -5491,6 +5512,10 @@ void Glm5Model::fast_service() {
                     }
                     std::atomic_thread_fence(std::memory_order_release);
                     Rp->seq = next;
+                }
+                if (rd_mark) {   // MAYA_GLM_AHEAD_YIELD: this route's reads are in
+                    F->rd_busy.fetch_sub(1, std::memory_order_release);
+                    for (int i = 0; i < 8; ++i) F->rd_want[i].store(-1ll, std::memory_order_release);
                 }
                 const uint64_t us = (uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(
                                         std::chrono::steady_clock::now() - t0).count();
@@ -5703,6 +5728,10 @@ void xbin_open(const std::vector<size_t>& blob, int n_expert) {
 }
 }  // namespace
 
+static bool xbin_layer_on(int il) {   // this layer's experts come from the experts file
+    return g_xbin.on && il >= 0 && (size_t) il < g_xbin.stride.size() && g_xbin.stride[(size_t) il] != 0;
+}
+
 #define XBIN_ONCE()                                                                                          \
     std::call_once(g_xbin_once, [&] {                                                                        \
         std::vector<size_t> xb(fast_->L.size(), 0);                                                          \
@@ -5903,6 +5932,24 @@ void Glm5Model::fast_ahead_reader() {
             F->ah_q.erase(F->ah_q.begin());
         }
         auto& ld = F->rload[(size_t) j.rclass][(size_t) j.rslot];
+        // MAYA_GLM_AHEAD_YIELD: a route's own reads go first.  A queued job waits here un-started (the route can still
+        // take it over); one in hand pauses between its pieces unless the route is waiting for it
+        static const bool yield_on = [] {
+            const char* v = getenv("MAYA_GLM_AHEAD_YIELD");
+            return v != nullptr && std::atoi(v) != 0;
+        }();
+        const long long my = ((long long) j.rclass << 32) | (long long) j.rslot;
+        const auto stand_back = [&](bool in_hand) {
+            while (yield_on && F->rd_busy.load(std::memory_order_acquire) > 0 && !F->ah_quit) {
+                if (in_hand) {
+                    bool wanted = false;
+                    for (int i = 0; i < 8; ++i) wanted |= F->rd_want[i].load(std::memory_order_acquire) == my;
+                    if (wanted) break;
+                }
+                std::this_thread::yield();
+            }
+        };
+        stand_back(false);
         uint64_t want = j.tag << 2;
         if (ld.compare_exchange_strong(want, (j.tag << 2) | 1u, std::memory_order_acq_rel)) {
             uint8_t* blob = F->rc[(size_t) j.rclass].slot((size_t) j.rslot);
@@ -5918,7 +5965,10 @@ void Glm5Model::fast_ahead_reader() {
                 std::vector<std::thread> th;
                 th.reserve((size_t) nch - 1);
                 const auto part = [&](int c) {
-                    for (int role = 0; role < 3; ++role) fast_read_part(j.il, j.e, role, blob, c, nch);
+                    for (int role = 0; role < 3; ++role) {
+                        stand_back(true);
+                        fast_read_part(j.il, j.e, role, blob, c, nch);
+                    }
                 };
                 for (int c = 1; c < nch; ++c) th.emplace_back(part, c);
                 part(0);

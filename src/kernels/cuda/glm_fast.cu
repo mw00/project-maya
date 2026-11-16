@@ -4619,7 +4619,8 @@ __device__ unsigned int moe_stream_mask(const MoeDev& d) {
 // block's path is the same for all its threads: the __syncthreads below are reached by all or none.)
 __device__ void moe_stream_copy(const MoeDev& d, int i, const uint8_t* s, uint8_t* t) {
     const volatile MoeResponse* r = (const volatile MoeResponse*) d.resp;
-    const int rch = r->s_chunks;
+    const bool xl = r->s_chunks < 0;   // MAYA_GLM_XSTREAM: the experts file - 3 x chunks equal pieces of s_gu bytes
+    const int rch = xl ? -r->s_chunks : r->s_chunks;
     const unsigned long long gu = r->s_gu, dn = r->s_dn;
     const int nb = 3 * rch, G = (int) gridDim.x, b = (int) blockIdx.x;
     const bool split = G >= nb;
@@ -4627,9 +4628,10 @@ __device__ void moe_stream_copy(const MoeDev& d, int i, const uint8_t* s, uint8_
     if (nb <= 0 || sub >= nsub) return;
     for (int bit = split ? b % nb : b; bit < nb; bit += split ? nb : G) {
         const int part = bit / rch, c = bit % rch;
-        const unsigned long long len = part == 2 ? dn : gu;
-        const unsigned long long piece = ((len + (unsigned long long) rch - 1) / rch + 4095ull) & ~4095ull;
-        const unsigned long long c0 = min(len, (unsigned long long) c * piece), c1 = min(len, c0 + piece);
+        const unsigned long long len = xl ? gu : part == 2 ? dn : gu;
+        const unsigned long long piece = xl ? ((len + (unsigned long long) nb - 1) / nb + 4095ull) & ~4095ull
+                                            : ((len + (unsigned long long) rch - 1) / rch + 4095ull) & ~4095ull;
+        const unsigned long long c0 = min(len, (unsigned long long) (xl ? bit : c) * piece), c1 = min(len, c0 + piece);
         if (c1 <= c0) continue;
         const unsigned long long n = c1 - c0, per = ((n + nsub - 1) / nsub + 15ull) & ~15ull;
         const unsigned long long a0 = min(n, (unsigned long long) sub * per), a1 = min(n, a0 + per);
@@ -4645,7 +4647,7 @@ __device__ void moe_stream_copy(const MoeDev& d, int i, const uint8_t* s, uint8_
             __threadfence_system();
         }
         __syncthreads();
-        const unsigned long long off = (part == 0 ? 0ull : part == 1 ? gu : 2ull * gu) + c0 + a0;
+        const unsigned long long off = (xl || part == 0 ? 0ull : part == 1 ? gu : 2ull * gu) + c0 + a0;
         const uint8_t* sp = s + off;
         uint8_t* tp = t + off;
         const size_t nbytes = (size_t) (a1 - a0);

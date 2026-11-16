@@ -510,6 +510,10 @@ struct Glm5Model::FastState {
     std::vector<std::thread> ah_th;
     bool ah_quit = false;
     std::atomic<int> ah_inflight{0};
+    // MAYA_GLM_AHEAD_YIELD: a route is reading its misses (rd_busy), and the look-ahead reads it waits for (rd_want:
+    // class << 32 | slot, -1 none) - the look-ahead's other reads stand back meanwhile
+    std::atomic<int> rd_busy{0};
+    std::atomic<long long> rd_want[8] = {{-1}, {-1}, {-1}, {-1}, {-1}, {-1}, {-1}, {-1}};
     // per RAM class and slot, for kRLoad slots: tag << 2 | phase (0 queued, 1 reading, 2 landed) - a job reads only while
     // the tag it carries is current (a slot freed and reused under it gets a new tag)
     std::vector<std::unique_ptr<std::atomic<uint64_t>[]>> rload;
