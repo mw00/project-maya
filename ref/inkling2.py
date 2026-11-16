@@ -27,7 +27,7 @@ The forward, a layer (L: sliding but every 6th, layers 5, 11, .. full):
   m     = shortconv_mlp(moe(ffn_norm(attn_res(blocks, r) with ffn_res_score)))
   h     = r + m
   the MoE: sigmoid(router logits); the top 8 by score + exp_probs_b, their weights the scores normalized x 8;
-          an expert: g = W_g x * s_g[e], u = W_u x * s_u[e] (the NVFP4 scale; 1 without one),
+          an expert: g = W_g x * s_g[e], u = W_u x * s_u[e] (the NVFP4 scale; 1 without one - never beside NVFP4),
           W_d (4 tanh(g / 4) sigmoid(g) 25 tanh(u / 25)) * s_d[e]
   at the end: output_norm(attn_res(blocks, h) with output_res_score) -> output -> 30 tanh(l / 30), the first
           unpadded_vocab_size logits
@@ -172,8 +172,14 @@ class Ref:
         wts = wts / (wts.sum(-1, keepdim=True) + 1e-20) * c.route_scale
         self.cb(b + "picks", pick.sort(-1).values.to(DT))
         out = torch.zeros_like(x)
-        sc = {nm: (self.w(f"{b}ffn_{nm}_exps.scale") if self.has(f"{b}ffn_{nm}_exps.scale") else None)
-              for nm in ("gate", "up", "down")}
+        sc = {}
+        for nm in ("gate", "up", "down"):   # (an absent scale is 1.0, except beside NVFP4: docs/INKLING2.md)
+            if self.has(f"{b}ffn_{nm}_exps.scale"):
+                sc[nm] = self.w(f"{b}ffn_{nm}_exps.scale")
+            else:
+                assert self.g.info(f"{b}ffn_{nm}_exps.weight").type_name != "NVFP4", \
+                    f"{b}ffn_{nm}_exps: an NVFP4 expert without its .scale"
+                sc[nm] = None
         for e in pick.unique().tolist():
             tok, j = torch.where(pick == e)
             W = {nm: torch.from_numpy(self.g.expert(f"{b}ffn_{nm}_exps.weight", e)).to(DT) for nm in ("gate", "up", "down")}

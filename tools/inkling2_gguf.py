@@ -381,10 +381,16 @@ def compare(P, tc, a):
     if a.against:
         theirs = {n: d for n, d, _ in json.load(open(a.against))}
         t_types = {n: t for n, _, t in json.load(open(a.against))}
+        unit = 0   # (their scales absent beside requantized experts: 1.0, docs/INKLING2.md - not a difference)
         for n in sorted(set(ours) | set(theirs)):
+            if n.endswith("_exps.scale") and n not in theirs and t_types.get(n[:-len("scale")] + "weight") not in (None, NVFP4):
+                unit += 1
+                continue
             if n not in theirs or n not in ours or ours[n] != theirs[n]:
                 bad += 1
                 print(f"DIFF {n}: ours {ours.get(n)} theirs {theirs.get(n)}")
+        if unit:
+            print(f"absent .scale beside requantized experts, taken as 1.0: {unit}")
         # (a quantized file keeps F32 where the converter wrote F32: ours F32 must be theirs F32 and back)
         for n in sorted(set(ours) & set(theirs)):
             if (n in f32) != (t_types[n] == 0):
