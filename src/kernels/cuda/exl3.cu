@@ -527,6 +527,10 @@ struct BlockSmem {
     float out[Tokens * kCols];
 };
 
+// The next chunk's input is loaded before its tile words: a wave's loads complete in issue order for its waits
+// (vmcnt), so the rotating warp's wait for its input - before the chunk store and the barrier every warp waits at -
+// no longer waits for its 8 slices of tile words too; those are needed only by the products after the barrier.
+// The same loads, the same bits
 // (kTag 1: the mixed kernels' own copy - sharing one with them changes how AMD compiles the others' arithmetic)
 template <int K2, int cb, class Input = Xin, int kTag = 0, int Tokens = kTok>
 __device__ void block_gemv(const uint32_t* __restrict__ tr, int ld, int tc0, int k0, int k1, const Input& x,
@@ -540,8 +544,8 @@ __device__ void block_gemv(const uint32_t* __restrict__ tr, int ld, int tc0, int
     const int nq = (k1 - k0) / kCols;
     uint32_t wc[8][R], wn[8][R];
     float xv[4], xs4[4];
+    if (rot) chunk_load(x, suh, k0, lane, xv, xs4);   // (the input's loads first: block_gemv's note on their order)
     load_tiles<K2>(tile, sstride, lane, wc);
-    if (rot) chunk_load(x, suh, k0, lane, xv, xs4);
 #if defined(EXL3_TC)
     float c[4] = {0.0f, 0.0f, 0.0f, 0.0f};
 #else
@@ -554,8 +558,8 @@ __device__ void block_gemv(const uint32_t* __restrict__ tr, int ld, int tc0, int
         if (rot) chunk_store(xv, xs4, lane, xq + warp * kCols);
         __syncthreads();
         if (q + 1 < nq) {
-            load_tiles<K2>(tile + (size_t) (q + 1) * 8 * sstride, sstride, lane, wn);
             if (rot) chunk_load(x, suh, k0 + (q + 1) * kCols, lane, xv, xs4);
+            load_tiles<K2>(tile + (size_t) (q + 1) * 8 * sstride, sstride, lane, wn);
         }
 #pragma unroll
         for (int s = 0; s < 8; ++s) {
@@ -1844,9 +1848,9 @@ __device__ void hip_scalar_gemv(const uint32_t* __restrict__ tr, int ld, int tc0
     const int nq = (k1 - k0) / kCols;
     uint32_t wc[8][R], wn[8][R];
     float xv[(NR + 7) / 8][4], xs4[(NR + 7) / 8][4];
-    load_tiles<K2>(tile, sstride, lane, wc);
-    for (int j = 0; j < (NR + 7) / 8; ++j)
+    for (int j = 0; j < (NR + 7) / 8; ++j)   // (the input's loads first: block_gemv's note on their order)
         if (warp + j * 8 < nc) chunk_load(x[j], suh, k0, lane, xv[j], xs4[j]);
+    load_tiles<K2>(tile, sstride, lane, wc);
     float acc[NR][2];
 #pragma unroll
     for (int cc = 0; cc < NR; ++cc) acc[cc][0] = acc[cc][1] = 0.0f;
@@ -1857,9 +1861,9 @@ __device__ void hip_scalar_gemv(const uint32_t* __restrict__ tr, int ld, int tc0
             if (warp + j * 8 < nc) chunk_store(xv[j], xs4[j], lane, xq + (warp + j * 8) * kCols);
         __syncthreads();
         if (q + 1 < nq) {
-            load_tiles<K2>(tile + (size_t) (q + 1) * 8 * sstride, sstride, lane, wn);
             for (int j = 0; j < (NR + 7) / 8; ++j)
                 if (warp + j * 8 < nc) chunk_load(x[j], suh, k0 + (q + 1) * kCols, lane, xv[j], xs4[j]);
+            load_tiles<K2>(tile + (size_t) (q + 1) * 8 * sstride, sstride, lane, wn);
         }
 #pragma unroll
         for (int s = 0; s < 8; ++s) {
