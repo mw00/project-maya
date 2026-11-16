@@ -6559,7 +6559,16 @@ bool Glm5Model::fast_moe_experts(int il, const MoeIo& io, bool pred, int n_ah, c
     // fetch as one launch (gf::moe_wait_fetch): a batched step makes these launches once a row and layer, mostly empty
     const bool skip_empty = rows && glmfast::skip_empty_on();
     const bool empty = F->all_resident || (skip_empty && F->layer_resident(il));
-    if (!empty && skip_empty) {
+    // MAYA_GLM_FETCH_EARLY=1 (the token path): the RAM tier's experts are pulled while the host still reads the disk
+    // misses, then the wait, then only those (gf::moe_early_wait_fetch); 0 (the default): the wait first, as before
+    static const bool fetch_early = [] {
+        const char* v = getenv("MAYA_GLM_FETCH_EARLY");
+        return v != nullptr && std::atoi(v) != 0;
+    }();
+    if (!empty && fetch_early && !rows) {
+        gf::moe_early_wait_fetch(md, g.n_embd, g.n_exp_used, Ly.blob, s);
+        if (F->prof_on) F->mark("moe_fetch");
+    } else if (!empty && skip_empty) {
         gf::moe_wait_fetch(md, g.n_embd, g.n_exp_used, Ly.blob, s);
     } else if (!empty) {
         gf::moe_wait(md, g.n_embd, s);

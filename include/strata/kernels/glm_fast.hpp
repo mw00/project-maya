@@ -479,6 +479,9 @@ void moe_fetch(const MoeDev& d, int k, size_t blob_bytes, cudaStream_t s);
 /// moe_wait then moe_fetch as ONE launch (the same effects; MAYA_GLM_SKIP_EMPTY's batched rows): a route with no
 /// disk miss and nothing to fetch costs one near-empty launch instead of two.
 void moe_wait_fetch(const MoeDev& d, int n_embd, int k, size_t blob_bytes, cudaStream_t s);
+/// MAYA_GLM_FETCH_EARLY (the token path): moe_wait_fetch with the entries that have a source already (the RAM tier's)
+/// pulled before the wait for the host's disk reads; then only the host's sources.  The same effects.
+void moe_early_wait_fetch(const MoeDev& d, int n_embd, int k, size_t blob_bytes, cudaStream_t s);
 /// moe_cpu_wait for the n rows of a batched step in one launch: row r waits for the answer *seq[r] names (0: none) in
 /// the host-mapped CpuAnswer ans[r] and adds it to out[r].
 struct CpuWaitRows {
