@@ -720,6 +720,13 @@ the SSD, and the threads are its queue: on Linux the default is twice the hardwa
 (a 16-thread host read real-text prompts about 21 % faster with 32 threads than with 8); on Windows 64. Rows already
 in RAM need few threads, so it matters most for Engram tables on an SSD.
 
+A prompt of one chunk (up to `--prefill-chunk` tokens: every short follow-up read) waits for all its Engram rows - both
+tables, about 35 rows a token past the row cache - before its first layer runs. `DS4_EG_LATE=1` starts the layers at
+once: the reader puts each table's rows out as soon as they are read, the first Engram layer's table first, and each
+Engram layer waits for its own. The layers before an Engram layer run while its rows are read, and the second table's
+rows arrive behind the layers in between. The same rows go in, so the answers are bit for bit the same; it pays where
+the rows come from the SSD. Off (the default): unchanged.
+
 
 ## Drafting with DFlash2
 
