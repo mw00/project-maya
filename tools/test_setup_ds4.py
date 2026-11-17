@@ -1838,5 +1838,120 @@ class FastPrefill(unittest.TestCase):
         self.assertEqual(src.count('"mcp_servers", "fast_prefill"'), 1)   # (DeepSeek's setup keeps it; no other)
 
 
+class TwoSizes(unittest.TestCase):
+    """Two DeepSeek quants side by side (Maya-XS and Maya-S in DeepSeek-V4.1-Flash-1017-GGUF/): each a config of its
+    own, so the Models page lists both, neither one's files are "files no model uses", and one is removed without the
+    files the other reads.  Fake small files; the setup's last step (write_config_ds4) against the page's own listing."""
+
+    def setUp(self):
+        from serve import models as M, model_pull as P
+        self.M, self.P = M, P
+        self.root = Path(tempfile.mkdtemp()).resolve()
+        self.addCleanup(shutil.rmtree, self.root, True)
+        self.models = self.root / "models"
+        self.base = self.models / "DeepSeek-V4.1-Flash-1017-GGUF"
+        for name in ("dspark/dspark.gguf", "vision/vision.bin", "Engram/tables-q6_k.gguf"):   # (what the quants share)
+            (self.base / name).parent.mkdir(parents=True, exist_ok=True)
+            (self.base / name).write_bytes(b"s" * 2000)
+        for p in [patch.object(maya, "ROOT", self.root), patch.object(M, "LEFTOVER_MIN", 500)] + \
+                [patch.object(maya, k, lambda *a, **kw: None) for k in ("ok", "say", "step", "warn")]:
+            p.start()
+            self.addCleanup(p.stop)
+
+    def quant(self, key: str) -> Path:
+        """The quant's folder as the setup leaves it: its shard and its pack (which reads the shared files too)."""
+        d = self.base / maya.DS4_QUANTS[key]
+        pack = d / "maya-ds4"
+        (pack / "tokenizer").mkdir(parents=True, exist_ok=True)
+        (d / f"{key}-00001-of-00001.gguf").write_bytes(b"x" * 3000)
+        (pack / "ds4.txt").write_text(f"model_dir {d}\nhidden 4096\n")
+        (pack / "tensors.txt").write_text(f"file 0 {key}-00001-of-00001.gguf\nfile 1 ../Engram/tables-q6_k.gguf\n"
+                                          "file 2 ../dspark/dspark.gguf\nfile 3 ../vision/vision.bin\nt blk.0.x\n")
+        return d
+
+    def setup(self, key: str, **kw) -> Path:
+        d = self.quant(key)
+        return maya.write_config_ds4(args(**kw), {"gpus": [{"index": 0}]}, {}, d / "maya-ds4", 65536, self.models, d, key)
+
+    def listed(self) -> dict:
+        return {m["quant"]: m["file"] for m in self.M.listing(self.root, None)["models"]}
+
+    def installed(self) -> set:
+        cat = self.P.catalog(self.root, {}, {"backend": "cuda"}, [86], other_sizes={})
+        return {m["id"] for m in cat if m["installed"]}
+
+    def test_one_size_keeps_the_name_it_always_had(self):
+        p = self.setup("maya-xs")
+        self.assertEqual(p.name, "maya-ds4.json")
+        self.assertEqual(self.setup("maya-xs").name, "maya-ds4.json")      # (a setup again: the same config)
+        self.assertEqual(self.listed(), {"Maya-XS": "maya-ds4.json"})
+
+    def test_the_second_size_does_not_displace_the_first(self):
+        xs = self.setup("maya-xs", host="0.0.0.0", api_key="k")
+        before = xs.read_text()
+        s = self.setup("maya-s")
+        self.assertNotEqual(s, xs)
+        self.assertEqual(xs.read_text(), before)                           # (the first one's config as it was)
+        self.assertEqual(set(self.listed()), {"Maya-XS", "Maya-S"})
+        self.assertEqual(self.installed() & {"deepseek-maya-xs", "deepseek-maya-s", "deepseek-maya-m"},
+                         {"deepseek-maya-xs", "deepseek-maya-s"})
+        self.assertEqual(self.M.leftovers(self.root)["items"], [])         # (no "files no model uses")
+        c = json.loads(s.read_text())
+        self.assertEqual((c["host"], c["api_key"]), ("0.0.0.0", "k"))      # (where the server listens, its key: kept)
+        self.assertEqual(c["installer"]["ds4_quant"], "maya-s")
+        self.assertIn(str(self.base / "Maya-S" / "maya-ds4"), c["args"])
+        self.assertTrue(c["log"].endswith(s.stem + ".log"))                # (a log of its own)
+        # each set up again: its own config, never a third and never the other's
+        self.assertEqual(self.setup("maya-s"), s)
+        self.assertEqual(self.setup("maya-xs"), xs)
+        self.assertEqual(len(self.M.config_paths(self.root)), 2)
+        self.assertEqual(json.loads(xs.read_text())["installer"]["ds4_quant"], "maya-xs")
+
+    def test_after_the_displacement_both_come_back_without_a_download(self):
+        """An install the bug already hit: maya-ds4.json is Maya-S's, Maya-XS's files are still on the disk."""
+        self.setup("maya-s")
+        self.quant("maya-xs")
+        self.assertEqual([Path(i["path"]).name for i in self.M.leftovers(self.root)["items"]], ["Maya-XS"])
+        p = self.setup("maya-xs")                                          # (the page's Download: its files are whole)
+        self.assertNotEqual(p.name, "maya-ds4.json")
+        self.assertEqual(self.listed()["Maya-S"], "maya-ds4.json")
+        self.assertEqual(set(self.listed()), {"Maya-XS", "Maya-S"})
+        self.assertEqual(self.M.leftovers(self.root)["items"], [])
+
+    def test_amd_configs_side_by_side(self):
+        hip = {"gpus": [{"index": 0}], "backend": "hip"}
+        got = []
+        with patch.object(maya, "hip_reserve_mib", return_value=1024), patch.object(maya, "nvidia_beside", return_value=False):
+            for key in ("maya-xs", "maya-s"):
+                d = self.quant(key)
+                got.append(maya.write_config_ds4(args(backend="hip"), hip, {}, d / "maya-ds4", 65536, self.models, d, key))
+        self.assertEqual(got[0].name, "maya-ds4-hip.json")
+        self.assertTrue(got[1].name.endswith("-hip.json") and got[1] != got[0])
+        self.assertEqual(set(self.listed()), {"Maya-XS", "Maya-S"})
+
+    def test_removing_one_keeps_what_the_other_reads(self):
+        xs, s = self.setup("maya-xs"), self.setup("maya-s")
+        plan = self.M.delete_plan(self.root, s)
+        self.assertTrue(plan["ok"], plan["why"])
+        going = [Path(i["path"]) for i in plan["items"]]
+        for g in going:                                                    # (nothing of Maya-XS's, nothing shared)
+            self.assertTrue(self.M._within(g, self.base / "Maya-S"), g)
+        self.M.delete(self.root, s, files=True)
+        self.assertFalse((self.base / "Maya-S" / "maya-s-00001-of-00001.gguf").exists())
+        for keep in ("Maya-XS/maya-xs-00001-of-00001.gguf", "Maya-XS/maya-ds4/tensors.txt", "dspark/dspark.gguf",
+                     "vision/vision.bin", "Engram/tables-q6_k.gguf"):
+            self.assertTrue((self.base / keep).exists(), keep)
+        self.assertEqual(self.listed(), {"Maya-XS": xs.name})
+        self.assertEqual(self.M.leftovers(self.root)["items"], [])
+        # ... and the one in maya-ds4.json removed instead: the other stays, under its own name
+        s = self.setup("maya-s")
+        self.M.delete(self.root, xs, files=True)
+        self.assertEqual(self.listed(), {"Maya-S": s.name})
+        for keep in ("Maya-S/maya-s-00001-of-00001.gguf", "dspark/dspark.gguf", "vision/vision.bin",
+                     "Engram/tables-q6_k.gguf"):
+            self.assertTrue((self.base / keep).exists(), keep)
+        self.assertEqual(self.setup("maya-s"), s)                          # (set up again: still its own config)
+
+
 if __name__ == "__main__":
     unittest.main()

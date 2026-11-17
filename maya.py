@@ -6880,16 +6880,33 @@ def ds4_pack_step(a, d: Path, gguf: bool = False, announce: bool = True, engram:
     return pack
 
 
+def ds4_config_path(pc: dict, quant: str) -> Path:
+    """The config write_config_ds4 writes for `quant` on this PC's backend: maya-ds4.json (maya-ds4-hip.json on AMD),
+    the name it always had - unless that config is another DeepSeek quant's, which stays as it is: then one of this
+    quant's own (maya-deepseek-maya-s.json: maya-<its setup id>, as MiniMax's), so the quants are installed side by
+    side (two used to share the one name, and the second's setup took the first off the Models page - its files then
+    "files no model uses").  A quant that has a config of its own keeps it."""
+    suffix = "-hip" if pc.get("backend") == "hip" else ""
+    legacy = ROOT / f"maya-ds4{suffix}.json"
+    own = ROOT / f"maya-{Q.setup_id('deepseek', quant) or 'deepseek-' + quant}{suffix}.json"
+    if own.exists():
+        return own
+    # (a config without the setup's record - written by hand - is no other quant's: the setup writes it, as before)
+    return own if legacy.exists() and Q.config_key(read_json(legacy)) not in (None, quant) else legacy
+
+
 def write_config_ds4(a, pc: dict, meta: dict, pack: Path, ctx: int, models: Path, d: Path,
                      quant: str = "exl3", vision: bool | None = None) -> Path:
-    """maya-ds4.json and run-maya-ds4.sh.  A setup again keeps what the config before says that this one does not
-    ask: the engine settings below, the thinking level and sampling, where the server listens and its key.  vision:
-    whether the engine runs the vision tower (default: the EXL3 quant's own; a GGUF's when its pack has one)."""
+    """maya-ds4.json and run-maya-ds4.sh (a second quant beside it: a config of its own - ds4_config_path).  A setup
+    again keeps what the config before says that this one does not ask: the engine settings below, the thinking level
+    and sampling, where the server listens and its key - a quant's first config beside another's takes them from that
+    one, as it did when it replaced it.  vision: whether the engine runs the vision tower (default: the EXL3 quant's
+    own; a GGUF's when its pack has one)."""
     step(8, "the configuration and the start script")
     port = a.port or 8080
     hip = pc.get("backend") == "hip"
-    cfg_path = ROOT / ("maya-ds4-hip.json" if hip else "maya-ds4.json")
-    old = read_json(cfg_path)
+    cfg_path = ds4_config_path(pc, quant)
+    old = read_json(cfg_path if cfg_path.exists() else ROOT / ("maya-ds4-hip.json" if hip else "maya-ds4.json"))
     # --tp is the tensor-parallel group: two equal GPUs per group (a GPU without an equal neighbour runs
     # its layers alone).  On one GPU that group must be the GPU itself: with --tp 2 the prompt path falls
     # back to 16-token windows, and the chunked path (--threads on there) is what makes prompts fast.
@@ -6992,10 +7009,13 @@ def write_config_ds4(a, pc: dict, meta: dict, pack: Path, ctx: int, models: Path
 def set_up_ds4(a, prev: dict) -> Path | None:
     """DeepSeek-V4.1-Flash-1017's steps 1-8: the PC (Linux, RTX 30 / A100 or newer, the memory), the context, its
     engine (build/maya-ds4), the files, the pack, the config.  No tuning: the engine balances its own split."""
+    quant = choose_ds4_quant(a, prev)
+    if prev and Q.config_key(prev) != quant:           # (quants side by side: this quant's own config's answers, if any)
+        prev = next((c for c in map(read_json, configs()) if config_family(c) == "deepseek" and
+                     c.get("backend", "cuda") == prev.get("backend", "cuda") and Q.config_key(c) == quant), prev)
     inst = prev.get("installer") or {}
     prev_args = prev.get("args") or []
     prev_ctx = int(prev_args[prev_args.index("--max-context") + 1]) if "--max-context" in prev_args[:-1] else None
-    quant = choose_ds4_quant(a, prev)
     gguf = quant not in DS4_EXL3
     pc = check_pc(a, "deepseek", gguf, quant)          # 1
     step(2, "your choices")                            # 2
