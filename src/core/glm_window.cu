@@ -147,8 +147,12 @@ bool win_hc_rows() {
 // read every dense weight twice a layer (once a group); one pass reads them once and waits more.  Which one wins
 // depends on the device's memory speed against the lane's - a Tesla V100 whose lane is a helper GPU decodes 9% faster
 // in one pass, a slow CPU lane wants the groups.  auto: the first windows of each size alternate the two (kStagTrial
-// of each), then the faster stays; every window's answers are the same either way.  Unset: auto on compute capability
-// 7.0 (the one measured), 1 elsewhere (as before).
+// of each), then the faster stays.  The two orders give the same answers only while every expert the window can route
+// is in VRAM or the linked helper's own (FastState::window_orders_agree); with experts in the RAM tier or on disk they
+// can differ.  So auto times and chooses ONLY in windows where that holds (window() asks at each window's boundary);
+// every other window runs staggered, as 1 does, and is no sample - auto's answers are 1's on every machine, and the
+// timing can not move them.  0 is the explicit choice of one pass everywhere (answers may differ from 1's when
+// experts are not all in VRAM).  Unset: auto on compute capability 7.0 (the one measured), 1 elsewhere (as before).
 enum { kStagOff = 0, kStagOn = 1, kStagAuto = 2 };
 constexpr int kStagTrial = 12;
 int win_stagger_mode() {
@@ -994,7 +998,12 @@ bool Glm5Model::fast_window_layers(int64_t p0, int T, std::string& err) {
         // (--ablate: the window's rows are the bound conversation's - their writes lose the direction first)
         if (!attn) ablate(W.mixer + (size_t) t0 * E, n, s);
         else if (il != l0_) ablate(W.ffn + (size_t) t0 * E, n, s);
-        const bool one = n > 1 && n <= gf::kMaxMvNt && W.hc_part != nullptr && win_hc_rows();
+        // (n == T: only when the window runs in one pass.  In the two staggered groups a group's fused launch gave
+        //  answers that changed run to run on one Tesla V100 32 GB with a CPU lane on a 2-socket Xeon - 3 starts, 3
+        //  answers, MAYA_GLM_REPEATABLE=1 - and with one launch a token there the answers are the old ones.  The cause
+        //  is not found: the same build, model and switches on another V100 with a CPU lane repeated its ids in every
+        //  start, fused or not.  Until it is, the groups keep one launch a token, as released.)
+        const bool one = n > 1 && n == T && n <= gf::kMaxMvNt && W.hc_part != nullptr && win_hc_rows();
         gf::HcArgs hb[gf::kMaxMvNt];
         for (int t = t0; t < t0 + n; ++t) {
             gf::HcArgs h;
@@ -1198,7 +1207,18 @@ bool Glm5Model::window(const int32_t* tokens, int T, int32_t* out, std::string& 
     {
         const int smode = win_stagger_mode();
         bool stag = smode != kStagOff;
-        if (smode == kStagAuto && T >= 2) {
+        // auto chooses only where both orders give the same answers: every part's experts in VRAM or the helper's as
+        // of this window's boundary (above).  Else staggered, the order 1 runs - and the window is no sample
+        bool agree = smode == kStagAuto && T >= 2;
+        for (Glm5Model* m = this; agree && m != nullptr; m = m->split_next_.get())
+            agree = m->fast_->window_orders_agree(m->l0_, m->l1_, g.n_expert);
+        if (smode == kStagAuto && T >= 2 && !agree) {
+            static std::atomic<bool> said{false};
+            if (!said.exchange(true))
+                std::fprintf(stderr, "glm window: experts outside VRAM - windows run as two staggered groups, no timed "
+                                     "choice (MAYA_GLM_WIN_STAGGER=0: one pass, answers may differ) - said once\n");
+        }
+        if (agree) {
             auto& st = WH.stag[T];
             if (st.pick >= 0) {
                 stag = st.pick != 0;
