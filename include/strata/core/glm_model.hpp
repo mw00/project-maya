@@ -238,13 +238,19 @@ public:
     /// Conversation slots: the snapshot (its KDA states) and every DSA cache's rows up to its position, every half,
     /// written to a file; slot_load puts them back as the live state and the snapshot, so a conversation set aside
     /// while others ran continues where it was.  The bytes written, or 0 + err.
-    uint64_t slot_save(const std::string& path, std::string& err);
-    bool slot_load(const std::string& path, int64_t n_pos, std::string& err);
+    uint64_t slot_save(const std::string& path, std::string& err, bool bounded_buffer = false);
+    bool slot_load(const std::string& path, int64_t n_pos, std::string& err, bool bounded_buffer = false);
     /// The same, in host RAM: the exact bytes the file version writes, in a caller-held buffer whose
     /// lifetime is the conversation's (engine-side: the run's).  Nothing reaches the disk.  The bytes
     /// written, or 0 + err (out of RAM, no snapshot).  slot_load takes the buffer back as the live
     /// state and the snapshot; false + err on a mismatch or a truncated buffer.
     uint64_t slot_save(std::vector<uint8_t>& data, std::string& err);
+    // The Flash v2 wire size and a streaming save of a completed live boundary.
+    // The caller admits the entire state and copy buffer before calling slot_save_live.
+    uint64_t slot_flash_bytes(int64_t n) const;
+    static constexpr size_t slot_live_copy_bytes = 4u << 20;
+    static constexpr size_t slot_file_copy_bytes = 64u << 20;
+    bool slot_save_live(int64_t n, const std::function<bool(const void*, size_t)>& put, std::string& err);
     bool slot_load(const std::vector<uint8_t>& data, int64_t n_pos, std::string& err);
     bool slot_load_prefix(const std::string& path, int64_t n_file, int64_t n_use, std::string& err);   // glm-dsa B14.14
     std::string pcache_identity() const;   // glm-dsa B14.14 (src/core/glm_prompt_cache_model.cu)

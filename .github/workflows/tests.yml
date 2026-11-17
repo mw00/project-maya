@@ -45,7 +45,9 @@ jobs:
           "$RUNNER_TEMP/ds4_cpu_prepare_stub_test"
       - name: Server tests
         run: '"$RUNNER_TEMP/venv/bin/python" -m unittest discover -s serve -p "test_*.py" -t .'
-      - name: GLM conversation-slot policy (CPU only)
-        run: '"$RUNNER_TEMP/venv/bin/python" tools/test_glm_slot_spill.py --receipt "$RUNNER_TEMP/glm-slot-spill.json"'
+      - name: GLM prefix helpers (CPU only)
+        run: '"$RUNNER_TEMP/venv/bin/python" tools/test_glm_prefix_cache_host.py --receipt "$RUNNER_TEMP/glm-prefix-helpers.json"'
+      - name: GLM learned-prefix and conversation-slot policy (CPU only)
+        run: '"$RUNNER_TEMP/venv/bin/python" tools/test_glm_prefix_slots.py --receipt "$RUNNER_TEMP/glm-prefix-slots.json"'
       - name: Installer and tools tests
         run: '"$RUNNER_TEMP/venv/bin/python" -m unittest discover -s tools -p "test_*.py"'

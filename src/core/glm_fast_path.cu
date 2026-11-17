@@ -8632,7 +8632,82 @@ std::vector<std::pair<float*, int64_t>> slot_dsa_runs(const GlmStateLayout& lay,
 }
 }  // namespace
 
-uint64_t Glm5Model::slot_save(const std::string& path, std::string& err) {
+uint64_t Glm5Model::slot_flash_bytes(int64_t n) const {
+    if (!fast_ || lay_.glm_dsa() || has_mtp() || n <= 0 || n > max_ctx_) return 0;
+    uint64_t total = 20;
+    for (auto* m = this; m; m = m->split_next_.get()) {
+        if (!m->fast_ || m->mtp_il_ >= 0) return 0;
+        const auto runs = slot_dsa_runs(m->lay_, m->g_, m->fast_mode_, m->lat_q8_, m->l0_, m->l1_, m->mtp_il_,
+                                        m->state_, m->kv_ ? &m->kv_->host : nullptr, m->dsa_lat_, m->dsa_ik_,
+                                        m->dsa_ig_, m->dsa_pool_, n, m->kv_);
+        uint64_t words = m->lay_.snap_pool_floats();
+        for (int il = m->l0_; il < m->l1_; ++il)
+            if (m->g_.is_recr(il)) words += m->lay_.kda_run();
+        for (const auto& r : runs) words += r.second;
+        total += 24 + 8 * runs.size() + words * sizeof(float);
+    }
+    return total;
+}
+
+bool Glm5Model::slot_save_live(int64_t n, const std::function<bool(const void*, size_t)>& put, std::string& err) {
+    if (position() != n || !slot_flash_bytes(n)) return false;
+    uint32_t halves = 0;
+    for (auto* m = this; m; m = m->split_next_.get()) {
+        if (m->pos_ != n) return false;
+        ++halves;
+    }
+    if (!put(&kSlotMagic, 8) || !put(&halves, 4) || !put(&n, 8)) return false;
+    std::vector<float> scratch(slot_live_copy_bytes / sizeof(float));
+    // All work is on the bound sequence. Restore the caller's device even on a failed copy.
+    struct DeviceScope { int device; ~DeviceScope() { cudaSetDevice(device); } } device{dev_};
+    const auto copy = [&](const float* p, int64_t words) {
+        for (int64_t i = 0; i < words;) {
+            const int64_t count = std::min<int64_t>(words - i, scratch.size());
+            const size_t bytes = count * sizeof(float);
+            if (cudaMemcpy(scratch.data(), p + i, bytes, cudaMemcpyDefault) != cudaSuccess) {
+                cudaGetLastError();
+                err = "the live prefix state did not copy back";
+                return false;
+            }
+            if (!put(scratch.data(), bytes)) return false;
+            i += count;
+        }
+        return true;
+    };
+    for (auto* m = this; m; m = m->split_next_.get()) {
+        if (cudaSetDevice(m->dev_) != cudaSuccess || cudaStreamSynchronize(m->fast_->cs) != cudaSuccess) {
+            cudaGetLastError();
+            err = "the live prefix boundary did not settle";
+            return false;
+        }
+        const auto& g = m->g_;
+        const int64_t run = m->lay_.kda_run();
+        const auto runs = slot_dsa_runs(m->lay_, g, m->fast_mode_, m->lat_q8_, m->l0_, m->l1_, m->mtp_il_,
+                                        m->state_, m->kv_ ? &m->kv_->host : nullptr, m->dsa_lat_, m->dsa_ik_,
+                                        m->dsa_ig_, m->dsa_pool_, n, m->kv_);
+        int32_t recurrent = 0;
+        for (int il = m->l0_; il < m->l1_; ++il) recurrent += g.is_recr(il);
+        const int32_t header[] = {m->l0_, m->l1_, recurrent, (int32_t) runs.size()};
+        if (!put(header, sizeof(header)) || !put(&run, 8)) return false;
+        for (const auto& r : runs)
+            if (!put(&r.second, 8)) return false;
+        for (int il = m->l0_; il < m->l1_; ++il)
+            if (g.is_recr(il) && !copy(m->state_ + m->kda_S_[(size_t) il], run)) return false;
+        const int64_t rows = m->lay_.open_rows();
+        if (rows > 0) {
+            if (m->ik_ring_ <= 0) return false;
+            const int64_t at = (int64_t) g.idx_key * ((n - n % g.idx_kpool) % m->ik_ring_);
+            for (int il : m->dsa_layers())
+                if (!copy(m->state_ + m->dsa_ik_[(size_t) il] + at, rows) ||
+                    !copy(m->state_ + m->dsa_ig_[(size_t) il] + at, rows)) return false;
+        }
+        for (const auto& r : runs)
+            if (!copy(r.first, r.second)) return false;
+    }
+    return true;
+}
+
+uint64_t Glm5Model::slot_save(const std::string& path, std::string& err, bool bounded_buffer) {
     std::vector<Glm5Model*> halves;
     for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
         if (m->fast_ == nullptr || m->snap_pos_ < 0 || m->snap_pos_ != snap_pos_) {
@@ -8658,6 +8733,7 @@ uint64_t Glm5Model::slot_save(const std::string& path, std::string& err) {
     put(&nh, 4);
     put(&n, 8);
     std::vector<float> buf;
+    if (bounded_buffer) buf.reserve(slot_file_copy_bytes / sizeof(float));
     double t_sync = 0, t_copy = 0, t_write = 0;
     for (Glm5Model* m : halves) {
         const Glm5Geometry& g = m->g_;
@@ -8714,7 +8790,7 @@ uint64_t Glm5Model::slot_save(const std::string& path, std::string& err) {
     return (uint64_t) f.tellp();
 }
 
-bool Glm5Model::slot_load(const std::string& path, int64_t n_pos, std::string& err) {
+bool Glm5Model::slot_load(const std::string& path, int64_t n_pos, std::string& err, bool bounded_buffer) {
     ckpt_join();   // (ckpt_save_snapshot reads snap_ / snap_pool_)
     dflash_reset();   // another conversation's state: the drafter's cached positions are not its
     std::ifstream f(path, std::ios::binary);
@@ -8737,6 +8813,7 @@ bool Glm5Model::slot_load(const std::string& path, int64_t n_pos, std::string& e
         return false;
     }
     std::vector<float> buf;
+    if (bounded_buffer) buf.reserve(slot_file_copy_bytes / sizeof(float));
     for (Glm5Model* m : halves) {
         if (m->fast_ == nullptr) {
             err = "no fast path";
