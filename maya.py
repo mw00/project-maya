@@ -1831,6 +1831,11 @@ def check_parallel(a, family: str) -> None:
              "remove --parallel; saved conversations do not enable simultaneous decoding")
 
 
+def g53_offered() -> list:
+    """GLM-5.3 (744B)'s downloads the setup offers (the ones GLM's download list holds)."""
+    return [q for q in G53_MODELS if q in glm_downloads()]
+
+
 def choose_family(a, prev: dict) -> str:
     """"glm" or "deepseek": what the options say (--model, --gguf-dir, --draft), else asked - the model set up before
     is the default."""
@@ -1853,6 +1858,12 @@ def choose_family(a, prev: dict) -> str:
              "Z.ai's GLM-5.3-Flash in Project Maya's GGUF quants (GLM-5.3-Flash-Maya-S to -Maya-L, 95-156 GB) or "
              "turboderp's EXL3 quants: from one GPU up, the experts that do not fit in VRAM from RAM and the SSD; "
              "NVIDIA and AMD; pictures with its vision encoder."),
+            (G53.LABEL, None,
+             f"Z.ai's full {G53.SHOWN} (744B) on the engine GLM-5.3-Flash runs on"
+             + (": " + ", ".join(f"{Q.glm53_quant(q)} ({G53_MODELS[q]['download_gb']:.0f} GB)" for q in g53_offered())
+                if g53_offered() else "") +
+             "; or its GGUF files you already have (--gguf-dir); NVIDIA and AMD, the experts that do not fit in VRAM "
+             "from RAM and the SSD; text only."),
             (DS4, None,
              "DeepSeek's DeepSeek-V4.1-Flash-1017 (748B) on its own engine: unsloth's GGUF (UD-Q8_K_XL, 508 GB; "
              "NVIDIA from V100 on or AMD, Linux or Windows), orcarouter's abliterated one (Mix-128G or "
@@ -1875,8 +1886,13 @@ def choose_family(a, prev: dict) -> str:
              f"experts in about {qwen_entry()['memory_gb']:.0f} GB of VRAM and RAM together{here}, with less the others "
              "read from the SSD; tool calls, its three reasoning efforts, MTP drafting, up to a 256K context; text only. "
              f"Or the base model itself in unsloth's UD-IQ2_XS GGUF ({qwen_entry(QWEN_UD)['download_gb']:.0f} GB).")]
-    pick = choose("Model?", ["Which model to set up:"], rows, FAMILIES.index(default), a.yes)
-    return FAMILIES[pick]
+    keys = ("glm", "glm53") + FAMILIES[1:]             # (the rows: GLM-5.3 (744B) is its own row of the "glm" family)
+    was53 = default == "glm" and bool(prev) and G53.config_is_glm_dsa(prev)
+    pick = keys[choose("Model?", ["Which model to set up:"], rows, keys.index("glm53" if was53 else default), a.yes)]
+    if pick in ("glm", "glm53"):
+        a.glm_part = "glm53" if pick == "glm53" else "flash"   # (choose_model lists that model's files only)
+        return "glm"
+    return pick
 
 
 # The quant the setup's lists recommend (fit_recommendation): RAM the engines leave the OS (MAYA_GLM_RAM_HEADROOM_GB's
@@ -1974,6 +1990,11 @@ def choose_model(a, models: Path, inst: dict) -> tuple:
              (q != "Maya-S24" and not is_exl3(q))}
     rec = fit_recommendation(sizes, gpus, ram, DEFAULT_CONTEXT * G53.KV_BYTES / 2**30, top)
     default = inst["quant"] if inst.get("quant") in MODELS or inst.get("quant") in g53 else rec
+    part = getattr(a, "glm_part", None)                # (the model menu's row: "flash" or "glm53"; None: not asked)
+    if part == "glm53":                                # (each row of the model menu lists its own model's files)
+        opts = []
+    elif part == "flash":
+        g53 = []
     rows = []
     for q in opts:
         m, d = MODELS[q], download_dir(models, q)
@@ -1994,10 +2015,15 @@ def choose_model(a, models: Path, inst: dict) -> tuple:
                      (f"downloaded, in {d}" if have else f"download {m['download_gb']:.1f} GB from Hugging Face"),
                      f"recommended for {G53.SHOWN}" if q == rec53 else None,
                      f"{m['about']}; {g53_memory_note(quant=q)}"))
-    rows.append((f"{G53.SHOWN} (744B, text only): GGUF files you already have", None,   # GLM-5.3 (744B, glm-dsa)
-                 "Z.ai's GLM-5.3 on the same engine; set up from its GGUF folder with --gguf-dir <folder>"))
-    pick = choose("Which GLM-5.3-Flash?", ["The model to download (GLM-5.3-Flash GGUF files you already have: "
-                                           "--gguf-dir <file or folder>):"], rows, (opts + g53).index(default), a.yes)
+    if part != "flash":
+        rows.append((f"{G53.SHOWN} (744B, text only): GGUF files you already have", None,   # GLM-5.3 (744B, glm-dsa)
+                     "Z.ai's GLM-5.3 on the same engine; set up from its GGUF folder with --gguf-dir <folder>"))
+    if default not in opts + g53:                      # (the other model's file was the default: this model's own)
+        default = (rec53 or g53[0]) if part == "glm53" and g53 else rec
+    name = G53.LABEL if part == "glm53" else "GLM-5.3-Flash"
+    pick = choose(f"Which {name}?", [f"The model to download ({name} GGUF files you already have: "
+                                     "--gguf-dir <file or folder>):"], rows,
+                  (opts + g53).index(default) if default in opts + g53 else 0, a.yes)
     if pick >= len(opts) + len(g53):
         fail(f"{G53.SHOWN} is set up from its GGUF files", f"{ME} --setup --gguf-dir <the folder of its .gguf files>")
     return "download", (opts + g53)[pick]

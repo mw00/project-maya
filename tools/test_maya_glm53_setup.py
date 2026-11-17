@@ -379,6 +379,38 @@ class Download(unittest.TestCase):
                                                     yes=True), Path(t), {})
         return got, seen["rows"], seen["default"]
 
+    def part_rows(self, part: str) -> tuple:
+        seen = {}
+
+        def choose(title, intro, rows, default, yes):
+            seen.update(title=title, rows=rows, default=default)
+            return default
+
+        with tempfile.TemporaryDirectory() as t,                 patch.object(maya, "choose", side_effect=choose), patch.object(maya.S, "gpus", return_value=[]),                 patch.object(maya, "mem_gb", return_value=(512.0, 500.0)):
+            got = maya.choose_model(SimpleNamespace(backend="cuda", model_dir=None, gguf_dir=None, model=None,
+                                                    yes=True, glm_part=part), Path(t), {})
+        return got, seen
+
+    def test_the_model_menus_two_rows(self):
+        """The model menu has a row of its own for GLM-5.3 (744B); each row's next question lists that model's files
+        only, and defaults to one of them."""
+        got, seen = self.part_rows("glm53")
+        self.assertEqual(seen["title"], "Which GLM-5.3 (744B)?")
+        self.assertTrue(all("744B" in r[0] for r in seen["rows"]), [r[0] for r in seen["rows"]])
+        self.assertEqual(got[0], "download")
+        self.assertIn(got[1], maya.G53_MODELS)
+        got, seen = self.part_rows("flash")
+        self.assertEqual(seen["title"], "Which GLM-5.3-Flash?")
+        self.assertFalse(any("744B" in r[0] for r in seen["rows"]))
+        self.assertIn(got[1], maya.MODELS)
+        rows = []
+        a = SimpleNamespace(model=None, gguf_dir=None, draft=None, model_dir=None, yes=True)
+        with patch.object(maya, "choose", side_effect=lambda t, i, o, d, y, *x: rows.extend(o) or 1),                 patch.object(maya.S, "gpus", return_value=[]):
+            self.assertEqual(maya.choose_family(a, {}), "glm")                      # (row 2: GLM-5.3 (744B))
+        self.assertEqual(a.glm_part, "glm53")
+        self.assertEqual([r[0] for r in rows][:2], ["GLM-5.3-Flash", "GLM-5.3 (744B)"])
+        self.assertIn("Maya-XS (170 GB)", rows[1][2])
+
     def test_the_list(self):
         flash = [q for q in maya.MODELS if q not in maya.MODELS_BY_HAND]
         got, on, default = self.rows()
