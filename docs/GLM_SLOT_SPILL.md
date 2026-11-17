@@ -71,6 +71,53 @@ python tools/check_glm_slot_spill_model.py \
 
 This verifies file-backed state recovery across processes, not cold-SSD latency or power-loss durability: the OS page cache was not dropped. It is one short synthetic pair and one restart, with tiny budgets. It does not replace a multi-agent benchmark, a full quality suite, long-context checks or other decoding modes.
 
+## Independent two-CMP example (same PR source)
+
+Example and reused test evidence contributed by [mercant1982](https://github.com/mercant1982); [original gist](https://gist.github.com/mercant1982/1dca5f922c56b5c8226541d40ddb2f53).
+
+The independent two-GPU check used this PR head
+`fe3ba47d9596224dfdf89a0595185ffc9236827e`, two CMP 170HX cards with
+64 GiB VRAM each, and the GLM-5.3-Flash Maya-L IQ3_S pack. The layer split
+and RAM ceilings below are that tested configuration, not defaults for
+other GPUs or models. Use an isolated build, idle test GPUs, a fresh private
+slot directory, and a shell without inherited `MAYA_*` / `STRATA_*` overrides.
+Set `MAYA_EXE` and `MAYA_PACK` to that build and pack, and `MAYA_RESULTS` to
+a fresh writable directory. Supply `LD_LIBRARY_PATH` if needed by the build.
+
+```sh
+env CUDA_VISIBLE_DEVICES=0,1 \
+  MAYA_GLM_SLOTS=1 MAYA_GLM_SLOT_SPILL=1 \
+  MAYA_GLM_SLOT_RAM_GB=0.001 MAYA_GLM_SLOT_GB=8 \
+  MAYA_GLM_SLOT_MIN=1024 MAYA_GLM_SLOT_DIR="$MAYA_RESULTS/slots" \
+  MAYA_GLM_SLOT_KEEP=1 MAYA_GLM_CKPTS=0 MAYA_GLM_CKPT_EVERY=0 \
+  MAYA_GLM_PREFIX_CUT=0 MAYA_GLM_MULTI_CKPTS=0 MAYA_GLM_NO_MTP=1 \
+  MAYA_GLM_RAM_GB=160 MAYA_GLM_RAM_HEADROOM_GB=32 MAYA_GLM_CPU_LANE=6 \
+  MAYA_GLM_USAGE="$MAYA_RESULTS/usage.bin" \
+  "$MAYA_EXE" --glm-pack "$MAYA_PACK" --max-context 40960 --parallel 1 \
+  --prefill 1024 --layer-split 23 --glm-ram-resident \
+  --seed 1729 --greedy --temperature 0 --serve
+```
+
+`--serve` here is the native stdin/stdout protocol, not an HTTP endpoint.
+The [complete C1 driver, inputs, token IDs and native logs](https://gist.github.com/mercant1982/1dca5f922c56b5c8226541d40ddb2f53)
+are in `worker.py`, `protocol_2gpu.py`, `bench-fixtures.json` and
+`C1-README.md`. The worker defines the eight-request study; do not invoke
+the protocol library's older four-request `main` as that study. Preserve the
+same fresh slot directory across the two native processes and exit each
+normally with `QUIT`.
+
+Actual prompt sizes were 3,276/3,280 and 26,191/26,185 tokens, with at most
+16 output tokens per request. Each length used A cold, B cold, A from disk,
+then A after restart: eight requests in two processes. All four restored A
+outputs matched their cold controls exactly, including finish reasons.
+
+The same evidence also records a separate `--parallel 8`, 8192-context,
+1-GiB disk-capacity study and matched cache-off controls. Output differences
+occurred in both conditions. C1 parity does not establish C8 output
+equivalence, a cache-specific cause, general answer quality, throughput,
+cold-SSD latency or power-loss durability. No new model run is implied by
+this documentation example.
+
 ## Historical evidence reused, not rerun
 
 The following measurements belong to the earlier v1.1.63 development/deployment build, not this standalone PR head. They used a GLM-5.3-Flash Maya-L pack, four RTX 4090s at 255W each, about 251.3GiB host RAM, 144 CPU lanes, four active contexts, a 1M context limit, 5120-token prefill chunks and layer split `12,24,35`. That branch included separate NUMA/shared-pool and dynamic-DFlash changes. [The historical receipt](testing/glm-slot-spill-prior.json) records exact source/binary identities, explicit test budgets, outputs, and version differences.
