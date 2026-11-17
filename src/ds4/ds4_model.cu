@@ -12687,7 +12687,7 @@ struct Model::Impl {
     // DS4_SETTLE_POOL_PROMPT=<n> (with DS4_SETTLE_POOL; unset / 0: off): a prompt read's picks, scaled to n a layer in
     // all, go into a heat of the pool's leg alone (pool_ph, halved at each read) - an expert the reads keep picking
     // enters the helper's pool, where a light prompt row is computed in place instead of copied whole from its file.
-    // VRAM's exchanges and the decode moves never see it (raw prompt heat in VRAM's rule lost in 288)
+    // VRAM's exchanges never see it (raw prompt heat in VRAM's rule made the decode slower)
     static double settle_pool_prompt() {
         static const double v = std::max(0.0, (double) env_f("DS4_SETTLE_POOL_PROMPT", 0.0f));
         return v;
