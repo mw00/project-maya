@@ -321,6 +321,7 @@ int main(int argc, char** argv) {
         case hl::kOpen:
             ok = h.open(dev, (int) c->a, (int) c->b, regions, err, c->x3_on != 0);
             n_embd = (int) c->a;
+            c->caps = ok && h.win_ready() ? hl::kCapWin : 0u;   // (the window call: kComputeWin)
             if (ok && xchg != nullptr && !h.pf_attach(xchg, (size_t) xbytes, xcap, err)) {
                 std::fprintf(stderr, "maya-glm-helper: %s (prompt calls will fail)\n", err.c_str());
                 err.clear();
@@ -390,6 +391,14 @@ int main(int argc, char** argv) {
         case hl::kCompute:
             ok = h.compute(c->gu_type, c->d_type, (size_t) c->down_off, c->limit, c->ne, c->keys, c->w, c->x, c->out, err);
             break;
+        case hl::kComputeWin: {   // a verify window's layer: the header and the rows in the stage
+            const auto w0 = std::chrono::steady_clock::now();
+            auto* wc = (hl::WinCall*) c->stage;
+            ok = h.win_run(c->gu_type, c->d_type, (size_t) c->down_off, c->limit, *wc,
+                           (const float*) (c->stage + hl::win_x_off()), (float*) (c->stage + hl::win_out_off()), err);
+            wc->gpu_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - w0).count();
+            break;
+        }
         case hl::kComputeX3: {   // an EXL3 pack's experts: the layer's blob layout came with the call
             strata::kernels::exl3::ExpertLayout lay;
             for (int r = 0; r < 3; ++r) {

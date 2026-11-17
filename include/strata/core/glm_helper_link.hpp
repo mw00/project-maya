@@ -28,7 +28,7 @@ constexpr uint32_t kMagic = 0x4d474c4bu;   // "MGLK"
 constexpr int kMaxEmbd = 8192;
 constexpr size_t kStage = (size_t) 64 << 20;   // a replacement's bytes when they are not in the shared tier
 
-enum Op : int32_t { kOpen = 1, kReserve = 2, kInsert = 3, kReplace = 4, kCompute = 5, kQuit = 6, kPfOpen = 7, kPrompt = 8, kComputeX3 = 9, kPromptX3 = 10 };
+enum Op : int32_t { kOpen = 1, kReserve = 2, kInsert = 3, kReplace = 4, kCompute = 5, kQuit = 6, kPfOpen = 7, kPrompt = 8, kComputeX3 = 9, kPromptX3 = 10, kComputeWin = 11 };
 
 // The prompt exchange (a second memfd): one MoE layer of a prompt chunk at a time.  The lead writes the chunk's FFN
 // input x (T rows), the sorted rows' positions and weights (pos/rw, T x K) and, for the rows of the experts the helper
@@ -77,6 +77,24 @@ inline size_t pf_exchange_bytes(size_t cap_tokens, size_t n_embd) {
     return one > two ? one : two;
 }
 
+// kComputeWin: a verify window's layer in ONE call - every token's own plan (its keys and weights, in its route's
+// order), input row and result row; the helper runs the token path's kernels for all of them in one gate/up and one
+// down launch (kernels::glmf::moe_experts_multi), so each token's sum is kCompute's for it, bit for bit.  The call
+// lives in Ctl::stage (which only a kReplace uses otherwise, never beside a call): the header at 0, the input rows at
+// win_x_off(), the result rows at win_out_off(), a row every kMaxEmbd floats.  Ctl::caps says whether the helper
+// program has it (kCapWin, kOpen's answer; a helper built before it leaves 0 there).
+constexpr uint32_t kCapWin = 1u;
+constexpr int kWinTokens = 16;
+struct WinCall {
+    int32_t T, k;                    // the tokens; the widest plan among them (ne[t] <= k <= 8)
+    int32_t ne[kWinTokens];
+    int32_t keys[kWinTokens][8];
+    float w[kWinTokens][8];
+    double gpu_ms;                   // the helper's answer: its time for the call (host clock, ms)
+};
+constexpr size_t win_x_off() { return 4096; }
+constexpr size_t win_out_off() { return win_x_off() + (size_t) kWinTokens * kMaxEmbd * sizeof(float); }
+
 struct alignas(64) Ctl {
     uint32_t magic;
     uint32_t ready;                 // the helper program set it once its regions are mapped and registered
@@ -85,7 +103,8 @@ struct alignas(64) Ctl {
     char pad1[60];
     std::atomic<uint32_t> rep;      // the helper: the sequence it answered (written last)
     int32_t status;                 // 0: done; else err holds why
-    char pad2[56];
+    uint32_t caps;                  // kOpen's answer: what this helper program can do beyond the first calls (kCapWin)
+    char pad2[52];
     int32_t op, ne, gu_type, d_type;
     uint64_t down_off;
     float limit;

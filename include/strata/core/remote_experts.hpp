@@ -65,6 +65,20 @@ public:
                       const int* keys, const float* weights, const float* x,
                       float* out, std::string& err);
     bool wait(std::string& err);
+    /// A verify window's layer in one call (a linked helper whose program has it - glm_helper_link.hpp kComputeWin):
+    /// T tokens (<= win_cap()), token t with ne[t] experts (0: none), its keys and weights at keys / w + 8 t in its
+    /// route's order, its input row x[t].  win_post sends the call, win_wait waits for it and copies each token's
+    /// sum into out[t] (tokens with ne[t] == 0: left alone) - compute()'s result for that token, bit for bit (the
+    /// same kernels; every token's arithmetic its own).  One call at a time, as enqueue / wait.
+    int win_cap() const { return link_ && ctl_ != nullptr && (ctl_->caps & hlink::kCapWin) ? hlink::kWinTokens : 0; }
+    bool win_post(int gu_type, int d_type, size_t down_off, float limit, int T, const int* ne, const int* keys,
+                  const float* w, const float* const* x, std::string& err);
+    bool win_wait(int T, const int* ne, float* const* out, std::string& err);
+    /// helper program: whether this device has the window call (an integrated AMD device's zero-copy path), and the
+    /// call itself over the header and rows the lead wrote (gpu_ms: with MAYA_GLM_PROF, the launches' time)
+    bool win_ready() const { return win_z_ != nullptr; }
+    bool win_run(int gu_type, int d_type, size_t down_off, float limit, const hlink::WinCall& c, const float* x,
+                 float* out, std::string& err);
     bool pending() const { return pending_.load(std::memory_order_acquire); }
     /// the last waited call's GPU time (its stages' events, ms) with MAYA_GLM_PROF, else -1
     double last_gpu_ms() const { return last_gpu_ms_; }
@@ -194,6 +208,14 @@ private:
     float* plan_w_h_ = nullptr;
     float *x_z_ = nullptr, *out_z_ = nullptr;   // the same, as the helper's device sees them
     strata::kernels::glmf::MoeDev zplan_;
+    // the window call (win_run): kWinTokens tokens' [x | out | plan pointers | plan weights] in mapped pinned memory
+    // (host side, and as the device sees it), their activation and h quants in device memory
+    uint8_t* win_h_ = nullptr;
+    uint8_t* win_z_ = nullptr;
+    uint8_t* win_q_ = nullptr;
+    unsigned long long win_calls_ = 0, win_tokens_ = 0, win_experts_ = 0, win_distinct_ = 0, win_bytes_ = 0;
+    double win_ms_ = 0, win_post_ms_ = 0;
+    std::chrono::steady_clock::time_point win_t0_{};
     // MAYA_GLM_PROF: each call's host time and its stages' GPU time, summed; printed when the helper closes
     bool prof_ = false;
     cudaEvent_t ev_[6] = {};

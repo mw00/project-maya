@@ -740,6 +740,31 @@ bool Glm5Model::fast_moe_window(int il, int t0, int T, int part, int gid, std::s
             }
             return mt;
         };
+        // the lane's answers for the group's tokens.  With a linked helper (MAYA_GLM_EXPERT_HELPER=link) one launch,
+        // a block a token (gf::moe_cpu_wait_rows - moe_cpu_wait's spin and its one add per value, for each token):
+        // an answer is 16 KB of host-mapped memory, which a kernel reads over the link - on a slow link (a V100 behind
+        // USB4: ~40 us an answer) the tokens' reads then overlap instead of following each other.
+        // MAYA_GLM_WIN_WAIT_ROWS=1 / 0: that launch with any lane / a launch a token, as before
+        static const int wait_rows_env = [] {
+            const char* v = getenv("MAYA_GLM_WIN_WAIT_ROWS");
+            return v == nullptr || v[0] == '\0' ? -1 : std::atoi(v) != 0 ? 1 : 0;
+        }();
+        const auto lane_wait = [&] {
+            const bool rows = (wait_rows_env >= 0 ? wait_rows_env == 1 : F->helper.linked()) && T > 1 &&
+                              T <= gf::kMaxMvNt && md.cpu_seq != nullptr;
+            if (!rows) {
+                for (int t = t0; t < t0 + T; ++t) gf::moe_cpu_wait(tok_dev(t), E, W.ffn + (size_t) t * E, s);
+                return;
+            }
+            gf::CpuWaitRows cw;
+            for (int t = t0; t < t0 + T; ++t) {
+                const gf::MoeDev mt = tok_dev(t);
+                cw.seq[t - t0] = mt.cpu_seq;
+                cw.ans[t - t0] = mt.cpu_ans;
+                cw.out[t - t0] = W.ffn + (size_t) t * E;
+            }
+            gf::moe_cpu_wait_rows(cw, T, E, s);
+        };
         // this layer's scratch claims (word 1 stays sticky): all 8 slots free, or the group's 4 (words 8 / 9 hold the
         // claim words that leave a group only its own slots free)
         unsigned int* scr = W.scr + (gid == 1 ? 2 : 0);
@@ -797,8 +822,7 @@ bool Glm5Model::fast_moe_window(int il, int t0, int T, int part, int gid, std::s
                 }
             }
             if (prof_b) W.mark("moe_experts", s);
-            if (lane)
-                for (int t = t0; t < t0 + T; ++t) gf::moe_cpu_wait(tok_dev(t), E, W.ffn + (size_t) t * E, s);
+            if (lane) lane_wait();
             if (prof_b) W.mark("moe_cpu_wait", s);
             return true;
         }
@@ -892,8 +916,7 @@ bool Glm5Model::fast_moe_window(int il, int t0, int T, int part, int gid, std::s
             }
         }
         if (prof_b) W.mark("moe_experts", s);
-        if (lane)
-            for (int t = t0; t < t0 + T; ++t) gf::moe_cpu_wait(tok_dev(t), E, W.ffn + (size_t) t * E, s);
+        if (lane) lane_wait();
         if (prof_b) W.mark("moe_cpu_wait", s);
         return true;
     }

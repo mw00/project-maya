@@ -3219,6 +3219,85 @@ void Glm5Model::win_helper_merged(int il, int nb, const gf::MoeRequest* const* r
     }
 }
 
+// A verify window's layer on the linked helper in one call of the token path's kernels (MAYA_GLM_LINK_MULTI;
+// GlmExpertHelper::win_post / win_wait): each token's helper experts as its own plan, in its route's order - what the
+// call a token sends, for all the tokens at once.  The experts the helper does not own run on this thread's CPU lane
+// meanwhile and are added after the helper's sum, as the call a token adds them: every answer is that path's bit for
+// bit.  A call that cannot go (or fails) is answered as that path answers a failed call: no helper part, the helper
+// marked failed.
+void Glm5Model::win_helper_multi(int il, int nb, const gf::MoeRequest* const* rq, gf::CpuAnswer* const* ans,
+                                 const unsigned int* seq) {
+    FastState* F = fast_;
+    const Glm5Geometry& g = g_;
+    const auto& ly = F->L[(size_t) il];
+    const int K = g.n_exp_used, E = g.n_embd, NE = g.n_expert;
+    const auto t0 = std::chrono::steady_clock::now();
+    int hn[kWinMax] = {}, hkeys[kWinMax * 8];
+    float hw[kWinMax * 8];
+    const float* hx[kWinMax];
+    float* hout[kWinMax];
+    int cn[kWinMax] = {};
+    const uint8_t* cblob[kWinMax][8];
+    float cw[kWinMax][8];
+    int rows = 0;
+    for (int j = 0; j < nb; ++j) {
+        hx[j] = rq[j]->x;
+        hout[j] = ans[j]->part;
+        for (int i = 0; i < K; ++i) {
+            if (!((rq[j]->cpu_mask >> i) & 1u)) continue;
+            const int key = il * NE + rq[j]->ids[i];
+            if (F->helper.owns(key)) {
+                hkeys[8 * j + hn[j]] = key;
+                hw[8 * j + hn[j]++] = rq[j]->w[i];
+                ++rows;
+            } else {   // the CPU lane's: its RAM-tier blob, as the call a token takes it
+                cblob[j][cn[j]] = (const uint8_t*) rq[j]->cpu_src[i];
+                cw[j][cn[j]++] = rq[j]->w[i];
+            }
+        }
+    }
+    bool posted = false;
+    if (rows > 0 && !F->helper_failed.load(std::memory_order_acquire)) {
+        posted = F->helper.win_post(ly.gu_type, ly.d_type, ly.down_off, g.swiglu_exp, nb, hn, hkeys, hw, hx,
+                                    F->helper_error);
+        if (!posted) F->helper_failed.store(true, std::memory_order_release);
+    }
+    // the CPU lane's experts meanwhile (each token's own, in its plan order)
+    static thread_local std::vector<float> cpu_buf;
+    if (cpu_buf.size() < (size_t) kWinMax * E) cpu_buf.assign((size_t) kWinMax * E, 0.0f);
+    const auto cpu_part = [&](int j) { return cpu_buf.data() + (size_t) j * E; };
+    int cpu_ne = 0;
+    for (int j = 0; j < nb; ++j)
+        if (cn[j] > 0) {
+            fast_cpu_experts(il, cn[j], cblob[j], cw[j], rq[j]->x, cpu_part(j));
+            cpu_ne += cn[j];
+        }
+    // (tokens without a helper expert keep a zero part, as the call a token leaves it; a failed call zeroes all)
+    for (int j = 0; j < nb; ++j)
+        if (hn[j] == 0) std::fill_n(ans[j]->part, E, 0.0f);
+    bool got = posted;
+    if (posted && !F->helper.win_wait(nb, hn, hout, F->helper_error)) {
+        got = false;
+        F->helper_failed.store(true, std::memory_order_release);
+    }
+    for (int j = 0; j < nb; ++j) {
+        float* p = ans[j]->part;
+        if (!got && hn[j] > 0) std::fill_n(p, E, 0.0f);
+        if (cn[j] > 0)
+            for (int e = 0; e < E; ++e) p[e] += cpu_part(j)[e];
+    }
+    std::atomic_thread_fence(std::memory_order_release);
+    for (int j = 0; j < nb; ++j) ans[j]->seq = seq[j];
+    F->helper_experts.fetch_add((uint64_t) rows, std::memory_order_relaxed);
+    F->helper_routes.fetch_add(rows > 0, std::memory_order_relaxed);
+    F->helper_us.fetch_add((uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(
+                               std::chrono::steady_clock::now() - t0).count(), std::memory_order_relaxed);
+    if (cpu_ne > 0) {
+        F->cpu_experts.fetch_add((uint64_t) cpu_ne, std::memory_order_relaxed);
+        F->cpu_routes.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
 void Glm5Model::win_cpu_merged(int il, int nb, const gf::MoeRequest* const* rq, gf::CpuAnswer* const* ans,
                                const unsigned int* seq) {
     FastState* F = fast_;
@@ -5045,11 +5124,82 @@ void Glm5Model::fast_service() {
         const char* v = getenv("MAYA_GLM_LINK_WIN");
         return v != nullptr && std::atoi(v) != 0;
     }();
+    // MAYA_GLM_LINK_MULTI (a linked helper whose program has the window call - GlmExpertHelper::win_cap): a verify
+    // window's routes are held until the layer's last token routed, then all the tokens' helper experts go to the
+    // helper in ONE call (win_helper_multi) - each token with its own plan on the token path's kernels, so every
+    // answer is the call-a-token's bit for bit, and an expert several tokens route is read from RAM once instead of
+    // once a token.  auto (the default): both ways are timed on this machine - the time from a layer's first route
+    // reaching this thread to its last answer, kMultiBlock layers at a time in turn, kMultiBlocks blocks each, the
+    // slowest block of each dropped - and the faster one stays; said once.  1 / 0 force.  The choice moves no bit of
+    // any answer.
+    static const int multi_env = [] {
+        const char* v = getenv("MAYA_GLM_LINK_MULTI");
+        if (v == nullptr || v[0] == '\0' || std::string(v) == "auto") return -1;
+        return std::atoi(v) != 0 ? 1 : 0;
+    }();
+    constexpr int kMultiBlock = 32, kMultiBlocks = 8, kMultiShapes = 6;
+    // (a layer's shape: its first token and the window's end - a whole window's layer, or one staggered group's; each
+    // shape is measured and decided for itself, so a window layout that changes meanwhile mixes nothing)
+    struct MShape {
+        int key = -1, mode = -1, layers = 0;   // mode: -1 measuring, 0 a call a token, 1 one call a layer
+        double blk[2][kMultiBlocks] = {};      // each way's blocks, ms
+    };
+    MShape m_sh[kMultiShapes];
+    MShape* m_s = nullptr;                  // the open layer's shape (null: none left - a call a token)
+    const int m_mode = multi_env;           // -1 measured a shape, 0 a call a token, 1 one call a layer
+    bool m_cur = multi_env == 1;            // this layer's way (set at its first route)
+    bool m_open = false, w_multi = false;   // inside a layer's routes; the held window goes to win_helper_multi
+    int m_layer = -1;                       // the open layer
+    std::chrono::steady_clock::time_point m_t0{}, m_t1{};   // the layer's first route here; its last route here
+    // MAYA_GLM_PROF: each way's layers, and their time from the first route to the last route and from there to the
+    // last answer (printed when this thread ends)
+    const bool m_prof = getenv("MAYA_GLM_PROF") != nullptr;
+    unsigned long long m_pn[2] = {};
+    double m_pr[2] = {}, m_pa[2] = {};
+    const auto multi_open = [&](int first, int end) {   // a layer's first route: its shape and its way
+        m_open = true;
+        m_s = nullptr;
+        const int key = first * 64 + end;
+        for (auto& sh : m_sh) {
+            if (sh.key < 0) sh.key = key;
+            if (sh.key == key) { m_s = &sh; break; }
+        }
+        const int mode = m_mode >= 0 ? m_mode : m_s != nullptr ? m_s->mode : 0;
+        m_cur = mode == 1 || (mode < 0 && ((m_s->layers / kMultiBlock) & 1) != 0);
+        m_t0 = std::chrono::steady_clock::now();
+    };
+    const auto multi_done = [&] {           // a layer's last answer is out
+        if (!m_open) return;
+        m_open = false;
+        const auto now = std::chrono::steady_clock::now();
+        if (m_prof) {
+            ++m_pn[m_cur];
+            m_pr[m_cur] += std::chrono::duration<double, std::milli>(m_t1 - m_t0).count();
+            m_pa[m_cur] += std::chrono::duration<double, std::milli>(now - m_t1).count();
+        }
+        if (m_mode >= 0 || m_s == nullptr || m_s->mode >= 0) return;
+        MShape& sh = *m_s;
+        const int b = sh.layers / kMultiBlock;
+        sh.blk[b & 1][b >> 1] += std::chrono::duration<double, std::milli>(now - m_t0).count();
+        if (++sh.layers < 2 * kMultiBlock * kMultiBlocks) return;
+        double sum[2] = {}, worst[2] = {};
+        for (int w = 0; w < 2; ++w)
+            for (int i = 0; i < kMultiBlocks; ++i) sum[w] += sh.blk[w][i], worst[w] = std::max(worst[w], sh.blk[w][i]);
+        const double per = (double) (kMultiBlock * (kMultiBlocks - 1));
+        const double one = (sum[0] - worst[0]) / per, all = (sum[1] - worst[1]) / per;
+        sh.mode = all < one ? 1 : 0;
+        std::fprintf(stderr, "glm helper link: a window layer's helper experts measured (tokens %d to %d) - a call a token "
+                             "%.3f ms, one call a layer %.3f ms (first route to last answer) -> %s "
+                             "(MAYA_GLM_LINK_MULTI=1 / 0 force)\n", sh.key / 64, sh.key % 64 - 1, one, all,
+                     sh.mode == 1 ? "one call a layer" : "a call a token");
+    };
     const auto win_flush = [&] {
-        if (w_n > 0 && w_link) win_helper_merged(w_rq[0]->layer, w_n, w_rq, w_ans, w_seq);
+        if (w_n > 0 && w_multi) win_helper_multi(w_rq[0]->layer, w_n, w_rq, w_ans, w_seq);
+        else if (w_n > 0 && w_link) win_helper_merged(w_rq[0]->layer, w_n, w_rq, w_ans, w_seq);
         else if (w_n > 0) win_cpu_merged(w_rq[0]->layer, w_n, w_rq, w_ans, w_seq);
         F->processed.fetch_add((uint64_t) w_held, std::memory_order_release);
         w_n = w_held = 0;
+        multi_done();
     };
     unsigned int polls = 0;
     const unsigned int ring_n = F->md.ring_n, ring_stride = F->md.ring_stride;   // (fast_setup: the ring's shape)
@@ -5146,18 +5296,32 @@ void Glm5Model::fast_service() {
                            F->helper.pf_cap() >= kWinMax && !F->L[(size_t) rq->layer].exl3 &&
                            F->helper.pf_pair_ok(F->L[(size_t) rq->layer].gu_type, F->L[(size_t) rq->layer].d_type) &&
                            !F->helper_failed.load(std::memory_order_acquire);
-        const bool held = lheld ||
+        // the window call's layers (above): a window of several tokens, native experts, the helper's program has the
+        // call.  A layer keeps one way from its first route to its last answer
+        const bool m_ok = !lheld && (m_mode != 0 || m_prof) && rq->win_n > 1 && rq->win_rows == 0 &&
+                          F->cpu_ans_h != nullptr && F->helper.win_cap() >= kWinMax &&
+                          !F->L[(size_t) rq->layer].exl3 && !F->helper_failed.load(std::memory_order_acquire);
+        if (m_open && w_held == 0 && rq->layer != m_layer) m_open = false;   // (a layer that never ended: not measured)
+        if (m_ok && !m_open && rq->win_n - rq->win >= 2) {   // (two tokens or more)
+            multi_open(rq->win, rq->win_n);
+            m_layer = rq->layer;
+        }
+        const bool mheld = (m_ok && m_open && m_cur) || (w_held > 0 && w_multi);   // (a layer begun held ends held)
+        const bool m_last = m_open && rq->win >= rq->win_n - 1;   // (a call a token: the layer ends at this route)
+        if (m_last) m_t1 = std::chrono::steady_clock::now();
+        const bool held = lheld || mheld ||
                           (win_merge && rq->win_n > 0 && F->cpu_ans_h != nullptr && !F->cpu_win.dn.empty() &&
                            (!exl3_ || !F->cpu_win.x3.empty()) &&
                            (rq->win_rows != 0 ? F->cpu_pool != nullptr && F->helper.device() < 0
                                               : F->win_lane[0] != nullptr && F->win_lane[1] != nullptr));
-        if (held && w_held == 0) w_link = lheld;
+        if (held && w_held == 0) w_link = lheld, w_multi = mheld;
         if (rq->error != 0) {
             if (held) {   // a window token's invalid route: nothing to compute, but it may be the layer's last
                 ++w_held;
                 if (rq->win >= rq->win_n - 1 || w_held >= kWinMax) win_flush();
             } else {
                 F->processed.fetch_add(1, std::memory_order_release);
+                if (m_last) multi_done();
             }
             ++next;
             continue;
@@ -5585,8 +5749,16 @@ void Glm5Model::fast_service() {
             }
         }
         F->processed.fetch_add(1, std::memory_order_release);
+        if (m_last) multi_done();
         ++next;
     }
+    if (m_prof && m_pn[0] + m_pn[1] > 0)
+        for (int w = 0; w < 2; ++w)
+            if (m_pn[w] > 0)
+                std::fprintf(stderr, "glm helper link prof: %llu window layers with %s - first route to last route %.3f "
+                                     "ms, last route to last answer %.3f ms a layer (this thread's clock)\n", m_pn[w],
+                             w == 1 ? "one call a layer" : "a call a token", m_pr[w] / (double) m_pn[w],
+                             m_pa[w] / (double) m_pn[w]);
 }
 
 // a whole EXL3 expert into its blob: the nine pieces sorted by file offset, those less than 64 KB apart read as one
