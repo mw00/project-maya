@@ -444,6 +444,9 @@ void moe_combine(float* acc, const float* y, const int* pos, const float* w, int
 /// (DS4_PROMPT_LIGHT) a chunk's light experts' rows for the helper: hx[p] = x[row_tok[prow[p]]] for p < n (F32 rows
 /// of dim; hx host memory the helper reads)
 void light_gather(float* hx, const float* x, const int* row_tok, const int* prow, int n, int dim, cudaStream_t s);
+/// (DS4_LIGHT_X_ONCE) the light rows' tokens instead of their rows: xtok[p] = row_tok[prow[p]] for p < n (xtok host
+/// memory the helper reads: packed row p's input is the chunk's row xtok[p], each token's row sent once)
+void light_xtok(int* xtok, const int* row_tok, const int* prow, int n, cudaStream_t s);
 /// (DS4_PROMPT_LIGHT) the helper's rows back: acc[t] += w[t][i] * hy[lidx[pos[t][i]]] for each pick of t (in pick order)
 /// whose sorted row is a light expert's (lidx >= 0) - moe_combine's sum, its rows packed by lidx
 void light_add(float* acc, const float* hy, const int* lidx, const int* pos, const float* w, int T, int k, int dim,

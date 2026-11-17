@@ -4050,6 +4050,13 @@ void moe_combine(float* acc, const float* y, const int* pos, const float* w, int
 void light_gather(float* hx, const float* x, const int* row_tok, const int* prow, int n, int dim, cudaStream_t s) {
     if (n > 0) light_gather_kernel<<<dim3(cdiv(dim, kThreads * 4), n), kThreads, 0, s>>>(hx, x, row_tok, prow, dim);
 }
+__global__ void light_xtok_kernel(int* xtok, const int* __restrict__ row_tok, const int* __restrict__ prow, int n) {
+    const int p = blockIdx.x * blockDim.x + threadIdx.x;
+    if (p < n) xtok[p] = row_tok[prow[p]];
+}
+void light_xtok(int* xtok, const int* row_tok, const int* prow, int n, cudaStream_t s) {
+    if (n > 0) light_xtok_kernel<<<cdiv(n, kThreads), kThreads, 0, s>>>(xtok, row_tok, prow, n);
+}
 void light_add(float* acc, const float* hy, const int* lidx, const int* pos, const float* w, int T, int k, int dim,
                cudaStream_t s) {
     if (T > 0) light_add_kernel<<<dim3(cdiv(dim, kThreads), T), kThreads, 0, s>>>(acc, hy, lidx, pos, w, k, dim);
