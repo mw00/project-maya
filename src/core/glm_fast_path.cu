@@ -5009,6 +5009,19 @@ void Glm5Model::fast_service() {
     }();
     static const int kDeepS = strata::platform::idle_env("MAYA_GLM_SERVICE_DEEP_S", 60);
     static const int kDeepMs = std::max(1, strata::platform::idle_env("MAYA_GLM_SERVICE_DEEP_MS", 100));
+    // the two sleeps' lengths (issue #951): MAYA_GLM_SERVICE_NAP_US (100; Windows 1000) and
+    // MAYA_GLM_SERVICE_SLEEP_MS (2) - longer sleeps wake an idle engine less, the first route after a quiet spell
+    // waits up to one of them
+    static const int kNapUs = strata::platform::idle_sleep_setting(
+        getenv("MAYA_GLM_SERVICE_NAP_US"),
+#ifdef _WIN32
+        1000,
+#else
+        100,
+#endif
+        strata::platform::kIdleNapUsMin, strata::platform::kIdleNapUsMax);
+    static const int kSleepMs = strata::platform::idle_sleep_setting(
+        getenv("MAYA_GLM_SERVICE_SLEEP_MS"), 2, strata::platform::kIdleSleepMsMin, strata::platform::kIdleSleepMsMax);
     strata::platform::IdleGate& gate = strata::platform::idle_gate();
     uint64_t gate_seen = 0;
     auto last_route = std::chrono::steady_clock::now();
@@ -5084,13 +5097,9 @@ void Glm5Model::fast_service() {
                     if (kDeepS > 0 && std::chrono::steady_clock::now() - last_route > std::chrono::seconds(kDeepS))
                         idle = 3;
                     else
-                        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                        std::this_thread::sleep_for(std::chrono::milliseconds(kSleepMs));
                 } else if (idle == 1) {
-#ifdef _WIN32
-                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
-#else
-                    std::this_thread::sleep_for(std::chrono::microseconds(100));
-#endif
+                    std::this_thread::sleep_for(std::chrono::microseconds(kNapUs));
                     if ((++polls & 255u) == 0 &&
                         std::chrono::steady_clock::now() - last_route > std::chrono::milliseconds(10 * kIdleMs))
                         idle = 2;

@@ -15536,6 +15536,11 @@ struct Model::Impl {
             const char* v = ds4_env("DS4_SERVICE_DEEP_MS");
             return v ? std::max(1, std::atoi(v)) : 100;
         }();
+        // the two sleeps' lengths (issue #951): MAYA_DS4_SERVICE_NAP_US (100) and MAYA_DS4_SERVICE_SLEEP_MS (2)
+        static const int kNapUs = strata::platform::idle_sleep_setting(
+            ds4_env("DS4_SERVICE_NAP_US"), 100, strata::platform::kIdleNapUsMin, strata::platform::kIdleNapUsMax);
+        static const int kSleepMs = strata::platform::idle_sleep_setting(
+            ds4_env("DS4_SERVICE_SLEEP_MS"), 2, strata::platform::kIdleSleepMsMin, strata::platform::kIdleSleepMsMax);
         strata::platform::IdleGate& gate = strata::platform::idle_gate();
         uint64_t gate_seen = 0;
         bool deep = false;
@@ -15554,9 +15559,9 @@ struct Model::Impl {
                             last = std::chrono::steady_clock::now();
                         }
                     } else if (quiet > std::chrono::milliseconds(10 * (int64_t) kIdleMs)) {
-                        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                        std::this_thread::sleep_for(std::chrono::milliseconds(kSleepMs));
                     } else {
-                        std::this_thread::sleep_for(std::chrono::microseconds(100));
+                        std::this_thread::sleep_for(std::chrono::microseconds(kNapUs));
                     }
                     continue;
                 }
