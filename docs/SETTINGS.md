@@ -2959,6 +2959,7 @@ every level ([the model's page](GLM53.md#its-defaults)). Its own:
 | Setting | Default | What it does |
 |---|---|---|
 | `MAYA_GLM_KV_INT8` | on (1) | its latent cache in INT8: 64,352 bytes a token; `0` (or `--kv fp16`): FP16, 102,272 bytes a token |
+| `--kv-streaming on`, `--kv-resident N` | off (the setup) | opt-in on GLM-5.3: the latent and k_pe caches (53,088 bytes a token) in pinned RAM with N positions of each layer in VRAM (20,480 at least); the indexer's keys (11,264 bytes a token) stay in VRAM. `on` without a window streams only when the whole cache does not fit beside the expert pools. The Models page takes both, and a setup again keeps them ([the model's page](GLM53.md#context-and-memory)) |
 | `MAYA_GLM_IDX_FP16` | off | `1`: the indexer's keys in FP16 instead of F32 (58,720 bytes a token with the INT8 latent); the indexer picks from FP16 scores, so the answers can differ |
 | `MAYA_GLM_DSA_GRAPHS` | off | `1`: a token's attention steps run as GPU graphs (fewer launches a token). A request can turn them off for itself (`"graphs": false`, below) |
 | `MAYA_GLM_LANE_ROW4` | on | `0`: off. On, the CPU lane computes four rows of an expert's matrix at once (x86-64 CPUs with AVX2, FMA and F16C; other CPUs ignore it), with the same results bit for bit; a request can switch it (`lane_row4`) |
