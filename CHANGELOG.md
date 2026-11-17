@@ -6,14 +6,23 @@ only what changed and starts; the model is not downloaded again.
 
 ## v1.1.66 - 2026-11-17
 
-GLM decodes about 20% faster on an AMD APU + NVIDIA GPU pair with the same answers, two DeepSeek sizes can be installed side by side, DeepSeek's drafter experts are placed by how much they are used, and the idle sleeps are settings.
+GLM decodes about 19% faster on an AMD APU + NVIDIA GPU pair with the same answers, two DeepSeek sizes can be installed side by side, DeepSeek's drafter experts are placed by how much they are used, and the idle sleeps are settings.
 
-- **Faster GLM decode on the AMD APU + NVIDIA GPU pair:** about +20% decode with a Tesla V100 beside the APU, measured as an A/B on the same PC (GLM-5.3-Flash Maya-S). The NVIDIA card reads each weight once per layer instead of twice while it checks drafted tokens, and the pair exchanges a whole layer of that check in one call instead of one call per token. Maya times both ways on your PC during the first answers and keeps the faster one, and it only makes that choice where both ways give the same answers (every expert in VRAM or on the helper GPU); everywhere else it keeps the order used so far. Every answer is bit for bit the same as before.
+- **Faster GLM decode on the AMD APU + NVIDIA GPU pair:** about +19% decode with a Tesla V100 beside the APU, measured as an A/B on the same PC (GLM-5.3-Flash Maya-S). The NVIDIA card reads each weight once per layer instead of twice while it checks drafted tokens, and the pair exchanges a whole layer of that check in one call instead of one call per token. Maya times both ways on your PC during the first answers and keeps the faster one, and it only makes that choice where both ways give the same answers (every expert in VRAM or on the helper GPU); everywhere else it keeps the order used so far. Every answer is bit for bit the same as before.
 - **Fix: two DeepSeek sizes side by side:** setting up a second DeepSeek size (for example Maya-S beside Maya-XS) replaced the first one's config, so the Models page showed only one of them and listed the other's files under "Files no model uses". Each size now gets its own config and both stay on the Models page. If you already hit this: after updating, click Download once on the missing size - Maya finds its files complete, downloads nothing again and only writes its config.
 - **DeepSeek: the drafter's experts count in the expert profile (#501, @noonghunna):** experts used by DeepSeek's drafter were never counted, so they were placed wherever room was left, and VRAM could stay unused on a second GPU. They are now counted like all the others. The profile fills in as you use the model: once a start uses the new profile, which experts sit in VRAM can change, and with that DeepSeek's answers can differ slightly from v1.1.65.
 - **Idle CPU use: the idle sleeps are settings (#951, @vbooka1):** how long an idle engine sleeps between looks for work can now be set at run time: `MAYA_GLM_SERVICE_NAP_US` and `MAYA_GLM_SERVICE_SLEEP_MS` for GLM, `MAYA_DS4_SERVICE_NAP_US` and `MAYA_DS4_SERVICE_SLEEP_MS` for DeepSeek. Longer sleeps lower the CPU use of a waiting server; the first token after a pause can wait up to one sleep. The defaults are the lengths used so far, so nothing changes unless you set one (docs/SETTINGS.md).
 - **Finding a GLM prompt fault on many GPUs (#1004, @GravelRashNZ):** when a GPU fault stops GLM while it reads a prompt, the error now names the GPU and the layer. `MAYA_GLM_PREFILL_CHECK=1` (off by default, a diagnostic that slows prompts down) also names the step that failed. It only reports.
-- **README:** speed rows from community reports (#978 thanks @wairentiun, #997 thanks @atollerus-tm, #999 thanks @kai-r, #1005 thanks @Andrey0710), in all four languages.
+- **Community fixes:**
+  - Web chat: Enter that confirms a Japanese or Chinese input conversion in Safari no longer sends the message (#927, @takahiro-blab).
+  - Setup: the vision files of a DeepSeek GGUF placed directly in the models folder stay inside that folder (#973, fixes #972, @mercant1982).
+  - Setup: AMD cards count in the model recommendation, and a card reporting 19.98 GB is treated as a 20 GB card (#923, @Mqrius).
+  - DeepSeek: stopping an answer during a shared start no longer disturbs the next request (#906, @markrussi).
+  - Server: `MAYA_PAR_MAX` caps a config's `--parallel` before the engine starts, opt-in (#880, @pietroMastro92).
+  - DeepSeek EXL3: `tools/ds4/reorder.py` reorders third-party shards into the order Maya reads fastest (#929, @gopinath87607).
+  - Docs: uneven GGUF splitting over PCIe can make prompt reading much slower (#940, @mercant1982).
+  - Tests: one test no longer leaves a global setting changed (#982, @mercant1982).
+- **README:** new speed rows from community reports (#938 @oscarlius, #978 @wairentiun, #997 @atollerus-tm, #999 @kai-r, #1005 @Andrey0710) and bench results for `--parallel` on three V100s (#989, @noahark), in all four languages.
 
 ## v1.1.65 - 2026-11-16
 
