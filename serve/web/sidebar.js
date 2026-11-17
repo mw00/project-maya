@@ -2,7 +2,7 @@
 // the model's status and what it saved against its API), a chat's ⋯ menu, and the search dialog.
 import {html, useEffect, useLayoutEffect, useMemo, useRef, useState} from "./preact.js";
 import {MOD, SUPPORT_URL, api, ctxfmt, dayGroup, fmt, isPhone, modelName, relTime, store} from "./lib.js";
-import {S, confirmDialog, emit, toast} from "./state.js";
+import {S, confirmDialog, emit, isAdmin, toast} from "./state.js";
 import {chatInstructions, chatTitle, deleteChat, exportChat, moveToFolder, newChat, newFolder, openChat, pinChat,
         renameChat, renameFolder, deleteFolder, toggleFolder} from "./chats.js";
 import {Icon, Kbd, MayaMark, Menu, MenuItem, MenuLabel, MenuSep, ModelLogo, trapTab, useDismiss} from "./ui.js";
@@ -174,7 +174,7 @@ function SavedBody({r, setR, close, sheet}) {
       ? html`<details class="saved-pop__how"><summary>How it is counted<${Icon} name="chevron" sm cls="chev"/></summary>
           <div class="saved-pop__prices"><span class="saved-pop__h">Per 1M tokens: input · cached input · output</span>${prices}</div></details>`
       : html`<div class="saved-pop__prices"><span class="saved-pop__h">The prices, per 1M tokens: input · cached input · output</span>${prices}</div>`}
-    ${sheet
+    ${!isAdmin() ? null   /* (the prices and the count are the server's: an admin's to change) */ : sheet
       ? html`<div class="saved-sheet__acts"><button type="button" class="btn btn--secondary" onClick=${change}>Change the prices</button>
           <button type="button" class="btn btn--danger" onClick=${reset}>Start over</button></div>`
       : html`<div class="saved-pop__foot">
@@ -268,7 +268,12 @@ function StatusCard() {
   const st = status(S.view === "monitor");
   // the model with its files when the setup wrote the config ("MiniMax M3.1 · Maya-XS": the server's model_label)
   const name = S.health.model_label || modelName(S.health.model);
+  const u = S.me.users && S.me.user;               // (a server with users: who is signed in, and the way to the account)
   return html`<div class="side__foot">
+    ${u ? html`<button type="button" class="nav-item side__me" title=${u.id != null ? "Your account" : "This page uses the server's own API key"}
+        onClick=${() => openSettings(u.id != null ? "account" : "users")}>
+      <${Icon} name="user"/><span>${u.name || "Server API key"}</span>
+      ${u.role === "admin" ? html`<i class="badge badge--accent">Admin</i>` : null}</button>` : null}
     <${SavedLine}/>
     <div class="status-row">
     <button type="button" class="status-card" onClick=${() => showView("monitor")} aria-label=${`${name}, ${st.text}. Open the Monitor`}>
@@ -309,8 +314,8 @@ export function Sidebar({drawer, open}) {
     <button type="button" class="nav-item" onClick=${newChat}><${Icon} name="new-chat"/><span>New chat</span><${Kbd} k=${`${MOD} ⇧ O`}/></button>
     <button type="button" class="nav-item" onClick=${() => { S.search = true; S.drawer = false; emit(); }}>
       <${Icon} name="search"/><span>Search chats</span><${Kbd} k=${`${MOD} K`}/></button>
-    <button type="button" class=${`nav-item${S.view === "models" ? " is-current" : ""}`} aria-current=${S.view === "models" ? "page" : undefined}
-      onClick=${() => showView("models")}><${Icon} name="boxes"/><span>Models</span></button>
+    ${isAdmin() ? html`<button type="button" class=${`nav-item${S.view === "models" ? " is-current" : ""}`} aria-current=${S.view === "models" ? "page" : undefined}
+      onClick=${() => showView("models")}><${Icon} name="boxes"/><span>Models</span></button>` : null}
     <button type="button" class=${`nav-item${S.view === "monitor" ? " is-current" : ""}`} aria-current=${S.view === "monitor" ? "page" : undefined}
       onClick=${() => showView("monitor")}><${Icon} name="activity"/><span>Monitor</span></button>
     <button type="button" class="nav-item" onClick=${() => openSettings(newer ? "about" : "general")}>

@@ -3,8 +3,9 @@
 // in chats.js.
 import {html, render, useEffect, useRef, useState} from "./preact.js";
 import {isPhone} from "./lib.js";
-import {S, applyScheme, applyTheme, closeDialog, emit, useStore} from "./state.js";
-import {loadHealth, loadMcp, loadUpdate, poll, whenHealth} from "./server.js";
+import {S, applyScheme, applyTheme, closeDialog, emit, isAdmin, useStore} from "./state.js";
+import {loadHealth, loadMcp, loadUpdate, poll, whenHealth, whenSignedOut} from "./server.js";
+import {Login, loadMe, needsSignIn, recheckMe} from "./account.js";
 import {cancelEdit, chatView, focusInput, loadChats, newChat, newChatObj, openChat, resumePending, send, stopAnswer,
         updateCtxMeter} from "./chats.js";
 import {DialogHost, Toasts, trapTab} from "./ui.js";
@@ -26,6 +27,9 @@ function App() {
     const want = S.view === "monitor" ? "#monitor" : S.view === "models" ? "#models" : S.settings ? "#settings" : "";
     if (location.hash !== want) history.replaceState(null, "", want || location.pathname + location.search);
   });
+  // a server with users, and nobody signed in on this browser: the sign-in, nothing else (account.js)
+  if (needsSignIn()) return html`<${Login}/><${Toasts}/>`;
+  if (S.view === "models" && !isAdmin()) S.view = "chat";   // (the Models page: an admin's)
   const page = S.view === "monitor" ? html`<${MonitorPage}/>` : S.view === "models" ? html`<${ModelsPage}/>` : html`<${ChatPage}/>`;
   return html`<div class=${`shell${S.sideOpen && !phone ? "" : " shell--closed"}`}>
     ${phone ? html`<${PhonePush} page=${page}/>` : S.sideOpen ? html`<${Sidebar}/>` : null}
@@ -76,6 +80,7 @@ function PhonePush({page}) {
 
 // ------------------------------------------------------------------ the keyboard
 document.addEventListener("keydown", (e) => {
+  if (needsSignIn()) return;                       // (the sign-in: no chat to drive)
   const mod = e.ctrlKey || e.metaKey;
   if (mod && e.shiftKey && (e.key === "O" || e.key === "o")) { e.preventDefault(); newChat(); return; }
   if (mod && !e.shiftKey && (e.key === "k" || e.key === "K")) { e.preventDefault(); S.search = !S.search; emit(); return; }
@@ -112,15 +117,20 @@ S.current = newChatObj();
 render(html`<${App}/>`, document.getElementById("app"));
 route();
 whenHealth(() => updateCtxMeter());
-loadChats().then(() => { if (S.view === "chat" && !S.settings) focusInput(); return loadHealth(); }).then(loadMcp).then(() => {
-  loadTurbo();                                     // (the Turbo button: on or off)
-  loadUpdate();                                    // (Settings' dot when a new version is out)
-  resumePending(true);
-  if (startQuestion) {
-    if (S.current.messages.length) openChat(newChatObj());
-    S.draft = startQuestion;
-    send();
-  }
+whenSignedOut(recheckMe);
+// who this page is, first (a server with users: the sign-in until someone is; signing in loads the page again)
+loadMe().then(() => loadChats()).then(() => { if (S.view === "chat" && !S.settings && !needsSignIn()) focusInput(); return loadHealth(); }).then(() => {
+  if (needsSignIn()) return;                       // (nothing more to ask until signed in)
+  loadMcp().then(() => {
+    loadTurbo();                                   // (the Turbo button: on or off)
+    loadUpdate();                                  // (Settings' dot when a new version is out)
+    resumePending(true);
+    if (startQuestion) {
+      if (S.current.messages.length) openChat(newChatObj());
+      S.draft = startQuestion;
+      send();
+    }
+  });
 });
 poll();
 window.maya = {S, chatView};   // for a look from the browser's console

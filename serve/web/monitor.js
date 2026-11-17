@@ -2,7 +2,7 @@
 // GPU, the hardware, and the recent requests - all from the server's /metrics (every second) and the engine's STAT lines.
 import {html, useRef, useState} from "./preact.js";
 import {GIB, ago, ctxfmt, fmt, gb, isPhone, kfmt, rate, store} from "./lib.js";
-import {S, copyText, emit, toast} from "./state.js";
+import {S, copyText, emit, isAdmin, toast} from "./state.js";
 import {fetchReport, reqAll, speculationView, tierShares} from "./server.js";
 import {newChat} from "./chats.js";
 import {setSide, status} from "./sidebar.js";
@@ -560,8 +560,10 @@ function totalsLine(t, lg = {}) {
 function Requests({m}) {
   const requests = m.requests || [], kept = m.requests_kept == null ? requests.length : m.requests_kept;
   const rows = requests.slice(0, reqAll.on ? requests.length : 12);
+  // a standard user of a server with users sees their own requests (the server sends no others); an admin everyone's
+  const own = S.me.users && !isAdmin() ? S.me.user : null;
   return html`<section class="card" aria-label="Recent requests">
-    <div class="card__head"><span class="card__title">Recent requests</span>
+    <div class="card__head"><span class="card__title">${own ? "Your recent requests" : "Recent requests"}</span>
       ${kept > 12 ? html`<button type="button" class="btn btn--secondary btn--sm" onClick=${() => { reqAll.on = !reqAll.on; emit(); }}>
         ${reqAll.on ? "Show fewer" : `Show all ${kept}`}</button>` : null}</div>
     <div class=${`table-wrap${reqAll.on ? " is-all" : ""}`}><table class="table num">
@@ -575,6 +577,7 @@ function Requests({m}) {
           : r.prompt_ms > 0 && r.prompt_tokens > (r.reused || 0) ? (r.prompt_tokens - (r.reused || 0)) / (r.prompt_ms / 1000) : null;
         return html`<tr><td class="l">${t}</td><td class="l nowrap"><span class=${`badge badge--${tone}`}>${text}</span>
             ${r.api ? html` <span class="muted small">${API_NAMES[r.api] || r.api}</span>` : null}
+            ${r.user && own == null ? html` <span class="muted small">· ${r.user}</span>` : null /* (a server with users: whose) */}
             ${r.loop_guard && r.loop_guard.length   /* (what the loop guard did in this answer: on hover) */
               ? html` <span class="badge badge--warn" title=${r.loop_guard.join("\n")}>Loop guard</span>` : null}</td>
           <td>${fmt(r.prompt_tokens)}</td><td>${fmt(r.reused)}</td><td>${fmt(pre)}</td><td>${fmt(r.output_tokens)}</td>
@@ -610,7 +613,7 @@ export function MonitorPage() {
       <div class="mon__head">
         <div><h1>Monitor</h1><p>The model, its experts and this machine, live.</p></div>
         <div class="mon__acts"><span class=${`pill pill--${st.tone}`} role="status"><i class="status__dot"></i>${st.text}</span>
-          <button type="button" class="btn btn--secondary btn--sm" onClick=${copy}><${Icon} name="report" sm/>Copy report</button></div>
+          ${isAdmin() ? html`<button type="button" class="btn btn--secondary btn--sm" onClick=${copy}><${Icon} name="report" sm/>Copy report</button>` : null}</div>
       </div>
       ${m ? html`
         <${Banners} m=${m}/>

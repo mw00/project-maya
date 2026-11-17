@@ -67,10 +67,11 @@ export const db = (() => {
   };
 })();
 
-// the server: relative addresses (the page also works behind a proxy under a path), and the API key when it has one
+// the server: relative addresses (the page also works behind a proxy under a path), and who asks: the session of a
+// signed-in user (a server with users: account.js), else the API key when the page has one
 export function headers(json = false) {
   const h = {};
-  const key = store.get("apikey", "");
+  const key = store.get("session", "") || store.get("apikey", "");
   if (key) h.Authorization = "Bearer " + key;
   if (json) h["Content-Type"] = "application/json";
   return h;
@@ -82,7 +83,11 @@ export async function api(path, {method = "GET", body, signal} = {}) {
   if (!r.ok) {
     let msg = `HTTP ${r.status}`;
     try { const e = (await r.json()).error; msg = (e && e.message) || (typeof e === "string" && e) || msg; } catch (e) { /* not json */ }
-    if (r.status === 401) msg = "This server needs its API key: add it in Settings › Connect your tools.";
+    // (signing in says itself what was wrong; a server with users asks to sign in, not for "its" key)
+    if (r.status === 401 && !path.startsWith("auth/")) {
+      msg = store.get("me", {}).users ? "You are signed out: reload the page and sign in again."
+                                      : "This server needs its API key: add it in Settings › Connect your tools.";
+    }
     const err = new Error(msg);
     err.status = r.status;
     throw err;

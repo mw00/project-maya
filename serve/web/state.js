@@ -16,6 +16,9 @@ export const S = {
   updateWatch: null,        // {to, down}: an update in progress
   reload: null,             // {to}: a context reload in progress (the composer waits)
   shared: {on: false, now: null},   // GET /settings: these settings as every API client's defaults
+  // GET /auth/me (account.js): whether the server has users, and who this page is ({id, name, role, via}, or null: the
+  // sign-in is shown).  The last answer is kept, so the page opens as it was: signed in, or on the sign-in
+  me: store.get("me", {users: false, available: false, user: null}),
 
   // the view
   view: "chat",             // "chat", "monitor" or "models"
@@ -51,6 +54,9 @@ export function useStore() {
   return S;
 }
 export const set = (patch) => { Object.assign(S, patch); emit(); };
+// what changes the server for everyone (models, the context size, the port, updates, the users) is shown to an admin
+// alone; a server without users has no roles: everyone who gets in is one.  (The server checks it too: serve/users.py)
+export const isAdmin = () => !S.me.users || !!(S.me.user && S.me.user.role === "admin");
 
 // ------------------------------------------------------------------ toasts
 let toastId = 0;
