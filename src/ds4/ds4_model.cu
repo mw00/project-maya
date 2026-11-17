@@ -947,6 +947,7 @@ struct Layer {
     std::vector<int> last_picks;                // the picks of a run's last rows through the layer, kPicks a row (warm_after)
     std::array<uint8_t*, 4> spare_host = {nullptr, nullptr, nullptr, nullptr};
     std::vector<float> heat;
+    std::vector<float> pool_ph;   // (DS4_SETTLE_POOL_PROMPT: recent prompt reads' picks, the files' leg ranks by heat + it)
     std::vector<int> cpu_hits;                  // CPU-lane experts used since the cache last looked
     bool swap_pending = false;
     int sw_in = -1;                             // the expert a pending swap brings in (the recent slots leave it be)
@@ -12683,6 +12684,30 @@ struct Model::Impl {
     }
     bool settle_on() const { return settle_ms() > 0.0 && o.expert_cache && !cache_ths.empty(); }
     std::vector<uint32_t> prof_run0;   // (the profile before the run)
+    // DS4_SETTLE_POOL_PROMPT=<n> (with DS4_SETTLE_POOL; unset / 0: off): a prompt read's picks, scaled to n a layer in
+    // all, go into a heat of the pool's leg alone (pool_ph, halved at each read) - an expert the reads keep picking
+    // enters the helper's pool, where a light prompt row is computed in place instead of copied whole from its file.
+    // VRAM's exchanges and the decode moves never see it (raw prompt heat in VRAM's rule lost in 288)
+    static double settle_pool_prompt() {
+        static const double v = std::max(0.0, (double) env_f("DS4_SETTLE_POOL_PROMPT", 0.0f));
+        return v;
+    }
+    void settle_learn_pool() {
+        if (prof_run0.size() != prof.size()) return;
+        for (Layer& l : L) {
+            if (l.mtp || l.heat.size() < (size_t) l.n_exp) continue;
+            if (l.pool_ph.size() != (size_t) l.n_exp) l.pool_ph.assign((size_t) l.n_exp, 0.0f);
+            const size_t o0 = (size_t) l.il * g.n_exp;
+            double sum = 0;
+            for (int e = 0; e < l.n_exp; ++e) sum += (double) (prof[o0 + (size_t) e] - prof_run0[o0 + (size_t) e]);
+            if (sum <= 0) continue;
+            const double sc = settle_pool_prompt() / sum;
+            for (int e = 0; e < l.n_exp; ++e) {
+                const uint32_t dn = prof[o0 + (size_t) e] - prof_run0[o0 + (size_t) e];
+                l.pool_ph[(size_t) e] = 0.5f * l.pool_ph[(size_t) e] + (float) (dn * sc);
+            }
+        }
+    }
     void settle_learn() {
         if (prof_run0.size() != prof.size()) return;
         for (Layer& l : L) {
@@ -12827,16 +12852,18 @@ struct Model::Impl {
         for (const Layer& l : L) {
             if (!xch_layer(l) || l.swap_pending) continue;
             int hot = -1, cold = -1;
+            const bool ph = l.pool_ph.size() == (size_t) l.n_exp;   // (DS4_SETTLE_POOL_PROMPT: + the reads' heat)
+            auto H = [&](int e) { return l.heat[(size_t) e] + (ph ? l.pool_ph[(size_t) e] : 0.0f); };
             for (int e = 0; e < l.n_exp; ++e) {
-                const float h = l.heat[(size_t) e];
+                const float h = H(e);
                 if (l.helper[(size_t) e] != nullptr) {
-                    if (cold < 0 || h < l.heat[(size_t) cold]) cold = e;
-                } else if (l.slot[(size_t) e] < 0 && !held_out(l, e) && (hot < 0 || h > l.heat[(size_t) hot])) {
+                    if (cold < 0 || h < H(cold)) cold = e;
+                } else if (l.slot[(size_t) e] < 0 && !held_out(l, e) && (hot < 0 || h > H(hot))) {
                     hot = e;
                 }
             }
-            if (hot >= 0 && cold >= 0 && l.heat[(size_t) hot] > l.heat[(size_t) cold] * c_margin + c_bonus)
-                c.push_back({l.heat[(size_t) hot] - l.heat[(size_t) cold], l.il, hot, cold});
+            if (hot >= 0 && cold >= 0 && H(hot) > H(cold) * c_margin + c_bonus)
+                c.push_back({H(hot) - H(cold), l.il, hot, cold});
         }
         std::sort(c.begin(), c.end(), [](const Cand& a, const Cand& b) { return a.gain > b.gain; });
         const double t0 = now_ms();
@@ -21226,7 +21253,8 @@ struct Model::Impl {
         warm_end();   // (the last prompt's warm-up: this one streams what it needs)
         // (DS4_SETTLE_MS: the profile's counts before the run - what the run picked is the difference)
         const bool settle = settle_on();
-        if (settle) prof_run0 = prof;
+        const bool pool_learn = !settle && settle_pool_on() && settle_pool_prompt() > 0;   // (DS4_SETTLE_POOL_PROMPT)
+        if (settle || pool_learn) prof_run0 = prof;
         // (a prompt read in parts that kept its room: its next part finds it lent already - the same plan, the same
         //  chunk; any other run hands it back first)
         const bool cont = lend_held.load(std::memory_order_relaxed) && whole != nullptr && sq_bound == held_seq &&
@@ -21633,6 +21661,7 @@ struct Model::Impl {
         st.tokens += took;
         const double trc_head = now_ms();
         if (settle) settle_learn();
+        else if (pool_learn) settle_learn_pool();
         cache_tick(took);
         const double trc_tick = now_ms();
         // (a part with more to come: the next part reads on, and the last one seeds the drafter - its last chunk's
