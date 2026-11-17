@@ -13013,6 +13013,16 @@ struct Model::Impl {
     // before a request: the exchanges under way waited for and switched in while still idle (a few ms at most)
     void settle_idle_end() {
         if (xch_inflight <= 0) {
+            if (settle_pool_on() && xch_t0 > 0) {   // (DS4_SETTLE_POOL keeps a spell going with no exchange under
+                if (xch_done != xch_said)              //  way: the spell's lines and its clock end here)
+                    std::fprintf(stderr, "ds4: idle settle: %lld experts moved from the helper's pool into VRAM in %.0f "
+                                         "ms (%lld in all, DS4_SETTLE_IDLE_MS)\n",
+                                 (long long) (xch_done - xch_said), now_ms() - xch_t0, (long long) xch_done);
+                pool_said_line();
+                xch_said = xch_done;
+                xch_t0 = 0;
+                return;
+            }
             pool_said_line();   // (the files' leg has nothing under way: its moves are synchronous)
             return;
         }
