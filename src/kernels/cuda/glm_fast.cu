@@ -4496,6 +4496,18 @@ __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const STRATA_G
 #undef ROUTE_MARK
 }
 
+// a bounded wait for the host's answer gave up (MoeDev::wait_diag, read by the host's stall report): one thread
+__device__ inline void wait_gave_up(unsigned int* diag, unsigned int kind, unsigned int need, unsigned int saw) {
+    if (diag == nullptr) return;
+    volatile unsigned int* v = diag;
+    v[1] = kind;
+    v[2] = need;
+    v[3] = saw;
+    __threadfence_system();
+    v[0] = v[0] + 1u;
+    __threadfence_system();
+}
+
 __global__ void moe_wait_kernel(MoeDev d, int n_embd) {
     __shared__ unsigned int s_need;
     const int tid = threadIdx.x;
@@ -4507,7 +4519,7 @@ __global__ void moe_wait_kernel(MoeDev d, int n_embd) {
         // spin on the host's answer (bounded: a dead host must not hang the GPU forever - ~60 s)
         const long long t0 = clock64();
         while (r->seq != s_need) {
-            if (clock64() - t0 > (1ll << 36)) break;
+            if (clock64() - t0 > (1ll << 36)) { wait_gave_up(d.wait_diag, 1u, s_need, r->seq); break; }
         }
         __threadfence_system();
     }
@@ -4536,7 +4548,7 @@ __global__ void moe_cpu_wait_kernel(MoeDev d, int n_embd, float* out) {
     if (tid == 0) {
         const long long t0 = clock64();   // bounded like moe_wait (~60 s)
         while (r->seq != s_need) {
-            if (clock64() - t0 > (1ll << 36)) break;
+            if (clock64() - t0 > (1ll << 36)) { wait_gave_up(d.wait_diag, 2u, s_need, r->seq); break; }
         }
         __threadfence_system();
     }
@@ -4558,7 +4570,7 @@ __global__ void moe_cpu_wait_streams_kernel(MoeDev d, int n_embd, const float* p
     if (tid == 0) {
         const long long t0 = clock64();
         while (r->seq != s_need) {
-            if (clock64() - t0 > (1ll << 36)) break;
+            if (clock64() - t0 > (1ll << 36)) { wait_gave_up(d.wait_diag, 3u, s_need, r->seq); break; }
         }
         __threadfence_system();
     }
@@ -4676,7 +4688,10 @@ __global__ void __launch_bounds__(256) moe_wait_fetch_kernel(MoeDev d, int n_emb
             if (tid == 0) {
                 const long long t0 = clock64();   // bounded like moe_wait (~60 s)
                 while (((volatile const MoeResponse*) r)->seq != s_need) {
-                    if (clock64() - t0 > (1ll << 36)) break;
+                    if (clock64() - t0 > (1ll << 36)) {
+                        wait_gave_up(d.wait_diag, 5u, s_need, ((volatile const MoeResponse*) r)->seq);
+                        break;
+                    }
                 }
                 __threadfence_system();
             }
@@ -4698,7 +4713,7 @@ __global__ void __launch_bounds__(256) moe_wait_fetch_kernel(MoeDev d, int n_emb
             // the grid is one block an SM, all resident at once: block 0 runs while the others spin
             const long long t0 = clock64();
             while (*(volatile unsigned int*) d.wait_seq == s_need) {
-                if (clock64() - t0 > (1ll << 36)) break;
+                if (clock64() - t0 > (1ll << 36)) { wait_gave_up(d.wait_diag, 5u, s_need, 0u); break; }
             }
             __threadfence();
         }

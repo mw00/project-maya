@@ -450,6 +450,8 @@ const MmqPlan& mmq_plan() {
             //  leaves it out, so the GLM / DeepSeek prompt paths take the same route as before for every pack)
             const auto ok = [](int t) { return mmq::supported(t) || t == 6; };   // 6: GGML_TYPE_Q5_0
             if (!ok(gt) || !ok(dt)) { p.fallback = true; continue; }
+            // a mixed layer (gate and up of two types: one MMQ product cannot read both) takes the FP16 route
+            if (lay.native && lay.fmt[(size_t) l].mixed()) { p.fallback = true; continue; }
             p.layer[(size_t) l] = 1;
             p.any = true;
             p.gu_max = std::max(p.gu_max, mmq::matrix_bytes(gt, 1280, N));
@@ -1784,8 +1786,12 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                         if (lay.native) {
                             // plan v0.3 P6: a native pack's layer, dequantized by llama.cpp's own formulas
                             const auto& f = lay.fmt[(size_t) l];
-                            strata::kernels::iq_dequant_gu_f16(f.gu_type, blob_dev, blob_dev + f.up_off, f.n_ff, f.n_embd,
-                                                               m.dq_gu[q], m.cs);
+                            if (f.mixed())
+                                strata::kernels::iq_dequant_gu_f16_mixed(f.gu_type, f.u_type, blob_dev, blob_dev + f.up_off,
+                                                                         f.n_ff, f.n_embd, m.dq_gu[q], m.cs);
+                            else
+                                strata::kernels::iq_dequant_gu_f16(f.gu_type, blob_dev, blob_dev + f.up_off, f.n_ff, f.n_embd,
+                                                                   m.dq_gu[q], m.cs);
                             strata::kernels::iq_dequant_f16(f.d_type, blob_dev + f.down_off, f.n_embd * f.n_ff, m.dq_d[q], m.cs);
                         } else {
                             blob_dequant_f16(blob_dev, m.dq_gu[q], m.dq_d[q], m.cs);

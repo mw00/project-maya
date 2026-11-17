@@ -111,8 +111,10 @@ DeviceInfo device_info(int ordinal) {
     check(cudaDriverGetVersion(&d.driver_version), "cudaDriverGetVersion");
     check(cudaRuntimeGetVersion(&d.runtime_version), "cudaRuntimeGetVersion");
 
-    // The engine supports compute capability 7.5 and newer (Turing: the QSA scorer's tf32 mma has a portable
-    // fp32-FMA fallback below sm_80, the tensor-core prompt kernels refuse and fall back).  Compiling for a
+    // The engine supports compute capability 6.0 and newer - the floor CMake and maya.py's MIN_CC hold (Pascal
+    // experimental, Volta / V100, RTX 20 and newer; the QSA scorer's tf32 mma has a portable fp32-FMA fallback below
+    // sm_80, the tensor-core prompt kernels refuse and fall back).  This said 7.5 after Volta and Pascal became
+    // supported, so strata-device (cuda_device_selftest) refused the V100s the engine runs on.  Compiling for a
     // supported arch is enforced by CMake; RUNNING on an older card is caught here, because a binary can be carried
     // to a machine with an older card and would otherwise silently take whatever path the driver chose.  The HIP
     // backend checks the compiled architecture list and requires wave32 (wave64 gfx908 runs through the
@@ -121,10 +123,11 @@ DeviceInfo device_info(int ordinal) {
     d.arch = base_arch(p.gcnArchName);
     if (const std::string why = arch_problem(p, ordinal); !why.empty()) throw CudaError(why, -1);
 #else
-    if (d.cc_major * 10 + d.cc_minor < 75) {
+    if (d.cc_major * 10 + d.cc_minor < 60) {
         throw CudaError("device " + d.name + " reports compute capability " + std::to_string(d.cc_major) +
                             "." + std::to_string(d.cc_minor) +
-                            "; this engine needs compute capability 7.5 or newer (RTX 20 / 30 / 40 / 50 series)",
+                            "; this engine needs compute capability 6.0 or newer (Pascal experimental, Volta / V100, "
+                            "RTX 20 / 30 / 40 / 50 series)",
                         -1);
     }
 #endif

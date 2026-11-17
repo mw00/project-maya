@@ -57,6 +57,20 @@ class GlmLinkTest(unittest.TestCase):
         self.assertEqual(e["MAYA_GLM_RESERVE_MB"], "1024")
 
     @unittest.skipIf(not Path("/proc").exists(), "Linux only")
+    def test_exl3_pack_opts_in(self):
+        pack = Path(self.tmp.name) / "pack"
+        pack.mkdir()
+        c = config(self.exe, mixed_gpus=True)
+        c["args"][1] = str(pack)
+        with mock.patch.object(GL, "nvidia_cards", return_value=[0]):
+            out, _ = GL.at_start(dict(c))
+            self.assertNotIn("MAYA_GLM_HELPER_EXL3", out["env"])   # (a GGUF pack: as before)
+            (pack / "exl3.txt").write_text("# maya exl3 pack v1")
+            out, line = GL.at_start(dict(c))
+        self.assertIn("both GPUs ON", line)
+        self.assertEqual(out["env"]["MAYA_GLM_HELPER_EXL3"], "1")
+
+    @unittest.skipIf(not Path("/proc").exists(), "Linux only")
     def test_falls_back(self):
         with mock.patch.object(GL, "nvidia_cards", return_value=[]):
             out, line = GL.at_start(config(self.exe, mixed_gpus=True))

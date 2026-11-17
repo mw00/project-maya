@@ -23,6 +23,128 @@
 
 namespace hl = strata::core::hlink;
 
+#if defined(__linux__) && defined(STRATA_USE_HIP) && __has_include(<linux/udmabuf.h>) && __has_include(<linux/kfd_ioctl.h>)
+#include <fcntl.h>
+#include <sys/ioctl.h>
+#include <sys/stat.h>
+#include <linux/kfd_ioctl.h>
+#include <linux/udmabuf.h>
+#define MAYA_HELPER_DMABUF 1
+namespace {
+// An AMD helper maps a shared block as buffers of its own (MAYA_GLM_HELPER_DMABUF, default on; 0: the host
+// registration below, as before): the memfd's pages are wrapped in dma-bufs (/dev/udmabuf, pieces of the module's
+// size limit) and imported into the GPU's address space at one reserved, contiguous range.  A host registration is
+// a user-pointer range the AMD driver tracks: whenever the kernel tries to move one of its pages (memory compaction
+// keeps retrying these pages, the NVIDIA lead pins them) the driver stops this program's queues and re-validates the
+// registration - seconds to minutes on a 137 GB tier.  Imported pages are pinned buffers with no such tracking, so
+// compaction no longer stops the queues.  Same pages, same bytes: the experts' maths does not change.
+// Any step that fails undoes what it did and returns false (the caller registers the block as before).
+uint32_t kfd_gpu_id(int dev) {
+    hipDeviceProp_t pr{};
+    if (hipGetDeviceProperties(&pr, dev) != hipSuccess) return 0;
+    for (int n = 0; n < 64; ++n) {
+        const std::string base = "/sys/class/kfd/kfd/topology/nodes/" + std::to_string(n);
+        FILE* f = std::fopen((base + "/properties").c_str(), "r");
+        if (f == nullptr) break;
+        char key[64];
+        unsigned long long v = 0, loc = ~0ull, dom = ~0ull;
+        while (std::fscanf(f, "%63s %llu", key, &v) == 2) {
+            if (std::strcmp(key, "location_id") == 0) loc = v;
+            else if (std::strcmp(key, "domain") == 0) dom = v;
+        }
+        std::fclose(f);
+        if (loc == ~0ull || (int) (loc >> 8) != pr.pciBusID || (int) ((loc >> 3) & 31) != pr.pciDeviceID ||
+            (dom != ~0ull && (int) dom != pr.pciDomainID)) continue;
+        f = std::fopen((base + "/gpu_id").c_str(), "r");
+        unsigned id = 0;
+        if (f != nullptr) {
+            if (std::fscanf(f, "%u", &id) != 1) id = 0;
+            std::fclose(f);
+        }
+        return id;
+    }
+    return 0;
+}
+
+bool import_block(int memfd, size_t bytes, int dev, uint8_t*& gpu, size_t& pieces, std::string& why) {
+    static int kfd = -1, ub = -1;
+    static uint32_t gpu_id = 0;
+    static size_t piece = 0;
+    if (const char* v = std::getenv("MAYA_GLM_HELPER_DMABUF"); v != nullptr && std::strcmp(v, "0") == 0) {
+        why = "off (MAYA_GLM_HELPER_DMABUF=0)";
+        return false;
+    }
+    if (piece == 0) {
+        size_t mb = 64;   // (the udmabuf module's default size limit)
+        if (FILE* f = std::fopen("/sys/module/udmabuf/parameters/size_limit_mb", "r")) {
+            unsigned long long m = 0;
+            if (std::fscanf(f, "%llu", &m) == 1 && m > 0) mb = (size_t) m;
+            std::fclose(f);
+        }
+        piece = mb << 20;
+        ub = open("/dev/udmabuf", O_RDWR | O_CLOEXEC);
+        kfd = open("/dev/kfd", O_RDWR | O_CLOEXEC);   // (the same driver process as the runtime's own handle)
+        gpu_id = kfd_gpu_id(dev);
+    }
+    if (ub < 0) { why = "no /dev/udmabuf access"; return false; }
+    if (kfd < 0 || gpu_id == 0) { why = "the GPU's driver id was not found"; return false; }
+    const size_t span = (bytes + 4095) & ~(size_t) 4095;
+    struct stat st{};
+    if (fstat(memfd, &st) != 0 || (size_t) st.st_size < span) { why = "the block is not a whole number of pages"; return false; }
+    if (fcntl(memfd, F_ADD_SEALS, F_SEAL_SHRINK) != 0) { why = "the block cannot be sealed"; return false; }
+    void* va = nullptr;
+    if (hipMemAddressReserve(&va, span, (size_t) 2 << 20, nullptr, 0) != hipSuccess || va == nullptr) {
+        hipGetLastError();
+        why = "no GPU address range";
+        return false;
+    }
+    std::vector<uint64_t> handles;
+    const auto undo = [&](const char* w) {
+        for (uint64_t h : handles) {
+            kfd_ioctl_unmap_memory_from_gpu_args u{};
+            u.handle = h;
+            u.device_ids_array_ptr = (uint64_t) (uintptr_t) &gpu_id;
+            u.n_devices = 1;
+            ioctl(kfd, AMDKFD_IOC_UNMAP_MEMORY_FROM_GPU, &u);
+            kfd_ioctl_free_memory_of_gpu_args fr{};
+            fr.handle = h;
+            ioctl(kfd, AMDKFD_IOC_FREE_MEMORY_OF_GPU, &fr);
+        }
+        hipMemAddressFree(va, span);
+        hipGetLastError();
+        why = w;
+        return false;
+    };
+    for (size_t off = 0; off < span; off += piece) {
+        udmabuf_create c{};
+        c.memfd = (uint32_t) memfd;
+        c.flags = UDMABUF_FLAGS_CLOEXEC;
+        c.offset = off;
+        c.size = std::min(piece, span - off);
+        const int b = ioctl(ub, UDMABUF_CREATE, &c);
+        if (b < 0) return undo("a dma-buf was refused");
+        kfd_ioctl_import_dmabuf_args ia{};
+        ia.va_addr = (uint64_t) (uintptr_t) va + off;
+        ia.gpu_id = gpu_id;
+        ia.dmabuf_fd = (uint32_t) b;
+        const bool imported = ioctl(kfd, AMDKFD_IOC_IMPORT_DMABUF, &ia) == 0;
+        ::close(b);   // (the imported buffer holds its own reference)
+        if (!imported) return undo("the driver did not import a dma-buf");
+        handles.push_back(ia.handle);
+        kfd_ioctl_map_memory_to_gpu_args ma{};
+        ma.handle = ia.handle;
+        ma.device_ids_array_ptr = (uint64_t) (uintptr_t) &gpu_id;
+        ma.n_devices = 1;
+        if (ioctl(kfd, AMDKFD_IOC_MAP_MEMORY_TO_GPU, &ma) != 0 || ma.n_success != 1)
+            return undo("the driver did not map a dma-buf");
+    }
+    gpu = (uint8_t*) va;
+    pieces = handles.size();
+    return true;
+}
+}  // namespace
+#endif
+
 int main(int argc, char** argv) {
 #ifndef __linux__
     std::fprintf(stderr, "maya-glm-helper: Linux only\n");
@@ -79,6 +201,45 @@ int main(int argc, char** argv) {
     const auto t0 = std::chrono::steady_clock::now();
     double gb = 0;
     std::vector<std::pair<void*, size_t>> regions;
+    // A RAM-tier block registered in pieces (MAYA_GLM_HELPER_REG_GB, default 1; 0: whole) when this GPU maps them
+    // back to back: the kernel moving one page (memory compaction - the NVIDIA lead pins these pages, so it retries
+    // them) stops this program's queues until the AMD driver re-validates the registration that holds the page - one
+    // piece instead of the whole tier (a 96 GB block: 30-70 s a time on a Radeon 8065S, measured; a 1 GB piece well
+    // under a second).  Not back to back (or a piece fails): the block registered whole, as before.
+    static const size_t reg_piece = [] {
+        const char* v = std::getenv("MAYA_GLM_HELPER_REG_GB");
+        const double g = v != nullptr ? std::atof(v) : 1.0;
+        return g > 0 ? ((size_t) (g * 1073741824.0) + 4095) & ~(size_t) 4095 : (size_t) 0;
+    }();
+    const auto register_pieces = [&](void* p, size_t bytes) -> bool {
+        if (reg_piece == 0 || bytes <= reg_piece) return false;
+        uint8_t* b = (uint8_t*) p;
+        std::vector<uint8_t*> done;
+        bool ok = true;
+        uint8_t* d0 = nullptr;
+        for (size_t off = 0; off < bytes && ok; off += reg_piece) {
+            const size_t n = std::min(reg_piece, bytes - off);
+            if (cudaHostRegister(b + off, n, cudaHostRegisterPortable | cudaHostRegisterMapped) != cudaSuccess) {
+                cudaGetLastError();
+                ok = false;
+                break;
+            }
+            done.push_back(b + off);
+            void* d = nullptr;
+            ok = cudaHostGetDevicePointer(&d, b + off, 0) == cudaSuccess;
+            if (ok && off == 0) d0 = (uint8_t*) d;
+            ok = ok && (uint8_t*) d == d0 + off;
+        }
+        if (!ok) {
+            for (uint8_t* q : done) cudaHostUnregister(q);
+            cudaGetLastError();
+            std::fprintf(stderr, "maya-glm-helper: the RAM tier registered whole (its pieces did not map back to back)\n");
+            return false;
+        }
+        std::fprintf(stderr, "maya-glm-helper: a %.2f GB RAM-tier block registered in %zu pieces of %.2f GB "
+                             "(MAYA_GLM_HELPER_REG_GB)\n", bytes / 1073741824.0, done.size(), reg_piece / 1073741824.0);
+        return true;
+    };
     for (auto& r : rs) {
         void* p = mmap(nullptr, r.bytes, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_POPULATE, r.fd, 0);
         if (p == MAP_FAILED) {
@@ -86,7 +247,25 @@ int main(int argc, char** argv) {
             return 5;
         }
         madvise(p, r.bytes, MADV_HUGEPAGE);
-        if (cudaHostRegister(p, r.bytes, cudaHostRegisterPortable | cudaHostRegisterMapped) != cudaSuccess) {
+        bool imported = false;
+#ifdef MAYA_HELPER_DMABUF
+        {
+            uint8_t* g = nullptr;
+            size_t np = 0;
+            std::string why;
+            imported = import_block(r.fd, r.bytes, dev, g, np, why);
+            if (imported) {
+                hl::add_device_view(p, r.bytes, g);
+                std::fprintf(stderr, "maya-glm-helper: a %.2f GB RAM-tier block imported as %zu GPU buffers (not "
+                                     "registered; MAYA_GLM_HELPER_DMABUF=0: registered as before)\n",
+                             r.bytes / 1073741824.0, np);
+            } else {
+                std::fprintf(stderr, "maya-glm-helper: RAM-tier block import: %s - registered instead\n", why.c_str());
+            }
+        }
+#endif
+        if (!imported && !register_pieces(p, r.bytes) &&
+            cudaHostRegister(p, r.bytes, cudaHostRegisterPortable | cudaHostRegisterMapped) != cudaSuccess) {
             std::fprintf(stderr, "maya-glm-helper: GPU %d could not register a RAM-tier block (%.2f GB): %s\n", dev,
                          r.bytes / 1073741824.0, cudaGetErrorString(cudaGetLastError()));
             return 6;
@@ -101,6 +280,8 @@ int main(int argc, char** argv) {
     uint8_t* xchg = nullptr;
     if (xfd >= 0 && xbytes > 0) {
         void* p = mmap(nullptr, (size_t) xbytes, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_POPULATE, xfd, 0);
+        // (registered, not imported: the prompt path's runtime calls take its addresses, which an imported range
+        // the runtime does not know would refuse)
         if (p != MAP_FAILED && cudaHostRegister(p, (size_t) xbytes, cudaHostRegisterPortable | cudaHostRegisterMapped) ==
                                    cudaSuccess)
             xchg = (uint8_t*) p;
@@ -138,7 +319,7 @@ int main(int argc, char** argv) {
         bool ok = true;
         switch (c->op) {
         case hl::kOpen:
-            ok = h.open(dev, (int) c->a, (int) c->b, regions, err);
+            ok = h.open(dev, (int) c->a, (int) c->b, regions, err, c->x3_on != 0);
             n_embd = (int) c->a;
             if (ok && xchg != nullptr && !h.pf_attach(xchg, (size_t) xbytes, xcap, err)) {
                 std::fprintf(stderr, "maya-glm-helper: %s (prompt calls will fail)\n", err.c_str());
@@ -146,9 +327,18 @@ int main(int argc, char** argv) {
             } else if (ok && xchg != nullptr) {
                 for (int t = 0; t < 64; ++t)
                     c->pf_types[t] = (uint8_t) h.pf_type_bits(t);
+#ifdef STRATA_USE_HIP
+                c->x3_pf = c->x3_on != 0 ? 1 : 0;   // (an EXL3 pack: its experts' prompt rows through pf_run_x3)
+                if (c->x3_on != 0 && !h.pf_x3_init(err)) {   // (its scratch now, not in the first prompt)
+                    std::fprintf(stderr, "maya-glm-helper: %s (EXL3 prompt calls will fail)\n", err.c_str());
+                    err.clear();
+                    c->x3_pf = 0;
+                }
+#endif
             }
             break;
-        case hl::kPrompt: {
+        case hl::kPrompt:
+        case hl::kPromptX3: {
             const auto p0 = std::chrono::steady_clock::now();
             // the experts' blobs: lead addresses in the shared tier, as this program maps them
             static std::vector<const uint8_t*> blobs;
@@ -160,9 +350,24 @@ int main(int argc, char** argv) {
                 const uint64_t* lp = (const uint64_t*) (xchg + sb + sl.keys);
                 for (int j = 0; j < pn; ++j) blobs[(size_t) j] = mine(lp[j], 1);
             }
-            ok = xchg != nullptr && h.pf_run(c->gu_type, c->d_type, (size_t) c->down_off, c->limit, c->pf_dsa != 0,
-                                             c->pf_T, c->pf_K, pn, c->pf_rows, c->pf_r0, blobs.data(), err,
-                                             c->pf_slot);
+            if (c->op == hl::kPromptX3) {   // an EXL3 pack's experts: the layer's blob layout came with the call
+                strata::kernels::exl3::ExpertLayout lay;
+                for (int r = 0; r < 3; ++r) {
+                    lay.suh[r] = (size_t) c->x3_suh[r];
+                    lay.svh[r] = (size_t) c->x3_svh[r];
+                    lay.trellis[r] = (size_t) c->x3_trellis[r];
+                    lay.k2[r] = c->x3_k2[r];
+                    lay.gg_type[r] = c->x3_gg[r];
+                }
+                lay.cb = c->x3_cb;
+                lay.fmt = c->x3_fmt;
+                ok = xchg != nullptr && h.pf_run_x3(lay, c->limit, c->pf_T, c->pf_K, pn, c->pf_rows, c->pf_r0,
+                                                    blobs.data(), err, c->pf_slot);
+            } else {
+                ok = xchg != nullptr && h.pf_run(c->gu_type, c->d_type, (size_t) c->down_off, c->limit,
+                                                 c->pf_dsa != 0, c->pf_T, c->pf_K, pn, c->pf_rows, c->pf_r0,
+                                                 blobs.data(), err, c->pf_slot);
+            }
             if (xchg == nullptr) err = "no prompt exchange";
             c->pf_gpu_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - p0).count();
             break;
@@ -185,6 +390,20 @@ int main(int argc, char** argv) {
         case hl::kCompute:
             ok = h.compute(c->gu_type, c->d_type, (size_t) c->down_off, c->limit, c->ne, c->keys, c->w, c->x, c->out, err);
             break;
+        case hl::kComputeX3: {   // an EXL3 pack's experts: the layer's blob layout came with the call
+            strata::kernels::exl3::ExpertLayout lay;
+            for (int r = 0; r < 3; ++r) {
+                lay.suh[r] = (size_t) c->x3_suh[r];
+                lay.svh[r] = (size_t) c->x3_svh[r];
+                lay.trellis[r] = (size_t) c->x3_trellis[r];
+                lay.k2[r] = c->x3_k2[r];
+                lay.gg_type[r] = c->x3_gg[r];
+            }
+            lay.cb = c->x3_cb;
+            lay.fmt = c->x3_fmt;
+            ok = h.compute_exl3(lay, c->limit, c->ne, c->keys, c->w, c->x, c->out, err);
+            break;
+        }
         case hl::kQuit:
             h.close();
             c->status = 0;

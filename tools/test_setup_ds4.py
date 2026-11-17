@@ -516,9 +516,31 @@ class Calibrate(unittest.TestCase):
         self.assertIn("effective TP per GPU: 1/1/1", output.call_args.args[0])
 
     def test_busy_gpus(self):
-        with patch.object(maya, "busy_gpus", return_value=[(0, 15000)]), patch.object(maya.CAL4, "run") as run:
+        with patch.object(maya, "busy_gpus", return_value=[(0, 15000)]), \
+                patch.object(maya, "maya_engines_on", return_value=[]), patch.object(maya.CAL4, "run") as run:
             self.assertFalse(maya.calibrate_config(self.cfg))
         run.assert_not_called()
+
+    def test_another_maya_model_loaded_refuses(self):
+        with patch.object(maya, "busy_gpus", return_value=[(0, 1200)]), \
+                patch.object(maya, "maya_engines_on", return_value=[(0, "maya-ds4", "4242")]), \
+                patch.object(maya.CAL4, "run") as run, patch.object(maya, "warn") as warn:
+            self.assertFalse(maya.calibrate_config(self.cfg))
+        run.assert_not_called()
+        self.assertIn("another Maya model is loaded there (maya-ds4 on GPU 0, PID 4242)", warn.call_args.args[0])
+
+    def test_a_display_does_not_hold_it_back(self):
+        # (#794: --calibrate is always asked for - a GPU that drives a display holds some memory; the tuning runs
+        #  anyway, and says how much is in use)
+        res = {"args": {"--tp": 8, "--cpu-threads": None},
+               "report": {"tok_s": 151.0, "own_tok_s": 103.0, "prompt_tok_s": 607}}
+        with patch.object(maya, "busy_gpus", return_value=[(0, 1500)]), \
+                patch.object(maya, "maya_engines_on", return_value=[]), \
+                patch.object(maya.CAL4, "run", return_value=res) as run, patch.object(maya, "warn") as warn:
+            self.assertTrue(maya.calibrate_config(self.cfg))
+        run.assert_called_once()
+        self.assertIn("GPU 0 has 1500 MiB in use", warn.call_args_list[0].args[0])
+        self.assertIn("measures anyway, as asked", warn.call_args_list[0].args[0])
 
     def test_failed_keeps_the_config(self):
         before = self.cfg.read_text()
@@ -1243,6 +1265,42 @@ class Vision(unittest.TestCase):
         self.assertEqual(self.v, self.models / "DeepSeek-V4.1-Flash-1017-GGUF" / "vision")
         self.assertEqual(maya.ds4_vision_dir(self.d.parent / "UD-Q4_K_XL"), self.v)
 
+    def test_setup_keeps_flat_model_vision_inside_models_dir(self):
+        """A retained pack directly in --models-dir must not download vision on its parent disk."""
+        shard = self.models / "model.gguf"
+        shard.write_bytes(b"g")
+        pack = self.models / "maya-ds4"
+        previous = {"args": ["--pack", str(pack)], "installer": {"ds4_quant": "maya-s"}}
+        with patch.object(maya, "check_pc", return_value={"gpus": [{"index": 0}]}), \
+                patch.object(maya, "choose_context", return_value=65536), \
+                patch.object(maya, "tools_step", return_value=None), patch.object(maya, "build_step", return_value={}), \
+                patch.object(maya, "ds4_earlier", return_value=None), \
+                patch.object(maya, "ds4_upgrade_from", return_value=None), \
+                patch.object(maya, "ds4_shared_tables", return_value=None), \
+                patch.object(maya, "ds4_model_step", return_value=[shard]), \
+                patch.object(maya, "ds4_unused"), patch.object(maya, "ds4_drafter_step", return_value=False), \
+                patch.object(maya, "ds4_vision_step", return_value=True) as vision, \
+                patch.object(maya, "ds4_pack_step", return_value=pack) as packs, \
+                patch.object(maya, "ds4_pack_has_vision", return_value=False), \
+                patch.object(maya, "write_config_ds4", return_value=self.models / "maya-ds4.json"), \
+                patch.object(maya.CDS, "has_drafter", return_value=False):
+            maya.set_up_ds4(args(ds4_quant="maya-s", models_dir=str(self.models)), previous)
+        self.assertEqual(vision.call_args.kwargs.get("v"), self.models / "vision")
+        self.assertEqual(len(packs.call_args_list), 2)
+        for call in packs.call_args_list:
+            self.assertEqual(call.kwargs.get("vision_dir"), self.models / "vision")
+
+    def test_explicit_vision_dir_is_passed_to_gguf_pack(self):
+        pack = self.d / "maya-ds4"
+        (pack / "tokenizer").mkdir(parents=True)
+        for f in ("ds4.txt", "tensors.txt", "engram.bin", "tokenizer/vocab.json", "tokenizer/chat_template.jinja"):
+            (pack / f).write_text("hidden_size 4096\n")
+        target = self.d / "vision"
+        with patch.object(maya, "run") as run:
+            maya.ds4_pack_step(args(repack=True), self.d, gguf=True, vision_dir=target)
+        command = run.call_args.args[0]
+        self.assertEqual(command[command.index("--vision") + 1], str(target))
+
     def test_no_vision_downloads_nothing(self):
         with patch.object(maya, "offer_download", side_effect=AssertionError("asked")):
             self.assertFalse(maya.ds4_vision_step(args(no_vision=True), {}, self.d))
@@ -1392,8 +1450,11 @@ class MayaQuants(unittest.TestCase):
                 maya.ds4_gguf_model("maya-s")
 
     def test_published(self):
+        # (a PC that holds Maya-S: its RAM and its GPU both set here - the test host's own GPUs picked Maya-XS on a
+        # 32 GB card, where Maya-S has under FIT_MIN_VRAM_SHARE of it in VRAM)
         with self.published(), patch.object(maya.S, "UI", None), \
-                patch.object(maya, "mem_gb", return_value=(512.0, 500.0)):   # (a PC that holds Maya-S)
+                patch.object(maya, "mem_gb", return_value=(512.0, 500.0)), \
+                patch.object(maya.S, "gpus", return_value=[{"index": 0, "arch": 90, "name": "test GPU", "vram_gb": 80.0}]):
             self.assertTrue(maya.ds4_maya_published("maya-s"))
             self.assertFalse(maya.ds4_maya_published("maya-m"))
             self.assertEqual(maya.choose_ds4_quant(args(ds4_quant=None), {}), "maya-s")   # (recommended)

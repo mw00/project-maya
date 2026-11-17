@@ -29,6 +29,12 @@ ROOT = HERE.parent
 sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(ROOT / "ref"))
 
+from _paths import add_gguf_py  # noqa: E402
+try:                            # (the fixtures need llama.cpp's gguf-py: without it this file skips, instead of
+    add_gguf_py()               #  a SystemExit in its setup ending the whole test run)
+except SystemExit as e:
+    raise unittest.SkipTest(str(e))
+
 try:
     import glm_dsa_synth_gguf as synth  # noqa: E402
     from glm_dsa import GlmDsa, Options, kl_top_rest, load_hidden, parse_positions, slice_gate  # noqa: E402

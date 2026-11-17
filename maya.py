@@ -1956,6 +1956,11 @@ def choose_model(a, models: Path, inst: dict) -> tuple:
         cards = [g for g in S.gpus() if g.get("vram_gb")]
     except Exception:  # noqa: BLE001 - no NVIDIA tools (AMD): no card-based recommendation
         cards = []
+    if not cards:   # AMD: the same recommendation, from the cards ROCm or Windows lists
+        try:
+            cards = [g for g in S.amd_gpus() if g.get("vram_gb")]
+        except Exception:  # noqa: BLE001 - no card-based recommendation
+            cards = []
     top = "Maya-S24" if cards and all(g["vram_gb"] <= 24.5 for g in cards) and "Maya-S24" in MODELS else opts[0]
     # by this PC's VRAM + RAM (fit_recommendation): no larger than that one, Maya-S24 only where it is that one (its
     # 4-bit attention is for small cards); the cache at the default context sized as GLM-5.3's (G53.KV_BYTES: its
@@ -3953,7 +3958,7 @@ def write_config(a, pc, meta, pack: Path, quant: str, ctx: int, models: Path, vi
                 total_ram += sum(g.get("vram_gb", 0) for g in gpus)
             hip_env.update({"MAYA_GLM_PREFILL_SUB": "1024",
                             "MAYA_GLM_PREFILL_MB": "6144" if total_ram >= 96 else "4096"})
-        elif min(g.get("vram_gb", 0) for g in gpus) >= 20:
+        elif min(g.get("vram_gb", 0) for g in gpus) >= 19.5:   # (an RX 7900 XT reports 19.98)
             hip_env.update({"MAYA_GLM_PREFILL_SUB": "1024", "MAYA_GLM_PREFILL_MB": "4096"})
         # Pass every available version per architecture: the engine's existing header guard selects the
         # table matching each card and its installed hipBLASLt, or keeps plain hipBLAS when none matches.
@@ -4365,6 +4370,68 @@ def busy_gpus(cfg: dict) -> list:
     return [(i, used[i]) for i in cfg.get("gpu") or [] if used.get(i, 0) > 1024]
 
 
+# The most a GPU's memory in use can be and still be a display's and the desktop's (#794): 1.5 GiB.  More, and a
+# measurement asked for by name still refuses, as it does for a Maya engine on the GPU
+DISPLAY_MIB = 1536
+
+# Maya's engines as the GPU's process list names them (and the names they had before the rename)
+ENGINE_PROCESSES = ("maya", "maya-ds4", "maya-mm3", "maya-glm-helper", "strata", "strata-ds4")
+
+
+def maya_engines_on(cfg: dict) -> list:
+    """The Maya engines holding memory on the config's GPUs: [(index, process name, pid)] (nvidia-smi's process list;
+    [] where it has none, as on AMD)."""
+    def query(what):
+        try:
+            return subprocess.run(["nvidia-smi", f"--query-{what}", "--format=csv,noheader,nounits"],
+                                  capture_output=True, text=True, timeout=30).stdout
+        except (OSError, subprocess.SubprocessError):
+            return ""
+    index = {}
+    for line in query("gpu=index,uuid").splitlines():
+        i, _, uuid = (s.strip() for s in line.partition(","))
+        if i.isdigit():
+            index[uuid] = int(i)
+    mine, out = set(cfg.get("gpu") or []), []
+    for line in query("compute-apps=gpu_uuid,pid,process_name").splitlines():
+        parts = [s.strip() for s in line.split(",", 2)]
+        if len(parts) < 3:
+            continue
+        exe = re.split(r"[\\/]", parts[2])[-1].lower()
+        exe = exe[:-4] if exe.endswith(".exe") else exe
+        if exe in ENGINE_PROCESSES and index.get(parts[0]) in mine:
+            out.append((index[parts[0]], exe, parts[1]))
+    return out
+
+
+def busy_skip(cfg: dict, asked: bool, name: str, gpus: str, tail: str) -> bool:
+    """A measurement's look at the config's GPUs before it loads the model: True = skip it (the warning says why).
+    A GPU that drives a display already holds some memory, and read as another model loaded (#794): a measurement
+    asked for by name (--speed-calibration, --calibrate) runs anyway when what is in use can be a display's (at most
+    DISPLAY_MIB a GPU, and no Maya engine on it), with a warning that says how much; another Maya model loaded there,
+    or more memory in use, still refuses.  The automatic ones (a setup's or a start's own) skip on a busy GPU, as
+    before."""
+    busy = busy_gpus(cfg)
+    if not busy:
+        return False
+    used = ", ".join(f"GPU {i} has {m} MiB in use" for i, m in busy)
+    if asked:
+        engines = maya_engines_on(cfg)
+        if engines:
+            warn(f"{name} needs {gpus} to itself: {used} - another Maya model is loaded there (" +
+                 ", ".join(f"{exe} on GPU {i}, PID {pid}" for i, exe, pid in engines) + "): stop it, then ask again")
+            return True
+        if any(m > DISPLAY_MIB for _, m in busy):
+            warn(f"{name} needs {gpus} to itself: {used} - more than a display uses (at most {DISPLAY_MIB} MiB a GPU): "
+                 "stop what holds it (a model server still running?), then ask again")
+            return True
+        warn(f"{name} runs although {used} - no more than a display and the desktop use, so it measures anyway, as "
+             "asked (the speeds can read a little lower than on a GPU with nothing else on it)")
+        return False
+    warn(f"{name} needs {gpus} to itself: {used}{tail}")
+    return True
+
+
 def calibrate_config(cfg_path: Path) -> bool:
     """Tune the CPU lane on this PC (tools/calibrate_glm.py): the result goes into the config's env and into
     CAL_STORE for this PC, model and context (a setup again applies it)."""
@@ -4383,10 +4450,8 @@ def calibrate_config(cfg_path: Path) -> bool:
     if cfg.get("backend") == "metal":
         warn("the tuning measures the CUDA engine's CPU lane: it does not apply to the Metal engine")
         return False
-    busy = busy_gpus(cfg)
-    if busy:
-        warn("the tuning needs the GPU(s) to itself: " + ", ".join(f"GPU {i} has {m} MiB in use" for i, m in busy) +
-             " (a model server still running?) - stop it, then run ./maya.sh --calibrate")
+    if busy_skip(cfg, True, "the tuning", "the GPU(s)",          # (always asked for: --calibrate, or a yes at the setup)
+                 " (a model server still running?) - stop it, then run ./maya.sh --calibrate"):
         return False
     say()
     say("  Tuning Maya for this PC: the output speed is measured with a few splits of the work between the CPU and")
@@ -4441,10 +4506,8 @@ def calibrate_ds4_config(cfg_path: Path) -> bool:
     """Tune maya-ds4 on this PC (tools/calibrate_ds4_tp.py): --tp and --cpu-threads go into the config's args and
     into CAL_STORE for this PC, quant and context (a setup again applies them where the config before had none)."""
     cfg = read_json(cfg_path)
-    busy = busy_gpus(cfg)
-    if busy:
-        warn("the tuning needs the GPU(s) to itself: " + ", ".join(f"GPU {i} has {m} MiB in use" for i, m in busy) +
-             " (a model server still running?) - stop it, then run ./maya.sh --calibrate")
+    if busy_skip(cfg, True, "the tuning", "the GPU(s)",          # (always asked for: --calibrate, or a yes at the setup)
+                 " (a model server still running?) - stop it, then run ./maya.sh --calibrate"):
         return False
     found = {g["index"]: g for g in S.gpus() or []}
     vram = [found[i]["vram_gb"] for i in cfg.get("gpu") or [] if i in found]
@@ -4576,11 +4639,8 @@ def speed_calibration(cfg_path: Path, why: str = "") -> bool:
         return False
     one = len(cfg.get("gpu") or [0]) < 2
     other = "no drafting" if one else "the MTP block"
-    busy = busy_gpus(cfg)
-    if busy:
-        warn("the speed calibration needs the GPU(s) to itself: " +
-             ", ".join(f"GPU {i} has {m} MiB in use" for i, m in busy) +
-             f" (a model server still running?) - it runs at the next start, or: {ME} --speed-calibration")
+    if busy_skip(cfg, why == "asked for", "the speed calibration", "the GPU(s)",
+                 f" (a model server still running?) - it runs at the next start, or: {ME} --speed-calibration"):
         return False
     without = CD.without_dflash(cfg)
     cal = saved_calibration(without)                   # the CPU lane tuned on this PC without DFlash2: that side as so
@@ -4651,11 +4711,8 @@ def speed_calibration_g53(cfg_path: Path, cfg: dict, why: str = "") -> bool:
     """GLM-5.3 on one APU: its sustained decode speed with one-GPU drafting (the MTP block drafts, one verify pass
     checks: the same tokens) and without, measured here as tools/calibrate_draft.py measures DFlash2.  The faster is
     kept; within G53_DRAFT_TIE the setup's own default (installer.one_gpu_drafting) stays.  False: not measured."""
-    busy = busy_gpus(cfg)
-    if busy:
-        warn("the speed calibration needs the GPU to itself: " +
-             ", ".join(f"GPU {i} has {m} MiB in use" for i, m in busy) +
-             f" (a model server still running?) - it runs at the next start, or: {ME} --speed-calibration")
+    if busy_skip(cfg, why == "asked for", "the speed calibration", "the GPU",
+                 f" (a model server still running?) - it runs at the next start, or: {ME} --speed-calibration"):
         return False
     fallback = bool(((cfg.get("installer") or {}).get("one_gpu_drafting") or {}).get("on"))
     off, on = g53_with_drafting(cfg, False), g53_with_drafting(cfg, True)
@@ -4828,10 +4885,8 @@ def link_calibration(cfg_path: Path, why: str = "") -> bool:
     if reason:
         warn(f"both GPUs: not measured ({reason})")
         return False
-    busy = busy_gpus(cfg)
-    if busy:
-        warn("the both-GPU measurement needs the GPU to itself: " +
-             ", ".join(f"GPU {i} has {m} MiB in use" for i, m in busy) + f" - {ME} --speed-calibration tries again")
+    if busy_skip(cfg, why == "asked for", "the both-GPU measurement", "the GPU",
+                 f" - {ME} --speed-calibration tries again"):
         return False
     glm = mixed_family(cfg) == "glm"
     alone = {**json.loads(json.dumps(cfg)), "mixed_gpus": False}
@@ -4921,11 +4976,8 @@ def prefill_calibration(cfg_path: Path, why: str = "") -> bool:
     every start); the result also in the config (installer.prefill_calibration).  False: not measured (the reason is
     shown; the engine then reads prompts with its defaults)."""
     cfg = read_json(cfg_path)
-    busy = busy_gpus(cfg)
-    if busy:
-        warn("the prefill calibration needs the GPU(s) to itself: " +
-             ", ".join(f"GPU {i} has {m} MiB in use" for i, m in busy) +
-             f" (a model server still running?) - {ME} --calibrate measures it later")
+    if busy_skip(cfg, why == "asked for", "the prefill calibration", "the GPU(s)",
+                 f" (a model server still running?) - {ME} --calibrate measures it later"):
         return False
     say()
     say(f"  Prefill calibration: how this PC reads prompts fastest" + (f" ({why})" if why else ""))
@@ -4971,11 +5023,8 @@ def speed_calibration_ds4(cfg_path: Path, cfg: dict, why: str = "") -> bool:
         warn(f"the speed calibration compares the model's DSpark drafter with no drafting, and this pack has no "
              f"drafter: {ME} --setup downloads it")
         return False
-    busy = busy_gpus(cfg)
-    if busy:
-        warn("the speed calibration needs the GPU(s) to itself: " +
-             ", ".join(f"GPU {i} has {m} MiB in use" for i, m in busy) +
-             f" (a model server still running?) - it runs at the next start, or: {ME} --speed-calibration")
+    if busy_skip(cfg, why == "asked for", "the speed calibration", "the GPU(s)",
+                 f" (a model server still running?) - it runs at the next start, or: {ME} --speed-calibration"):
         return False
     say()
     say("  Speed calibration: the DSpark drafter or none?" + (f" ({why})" if why else ""))
@@ -5082,6 +5131,12 @@ def set_ds4_mixed_gpus(cfg: dict, value: str | None) -> None:
     if not exe.is_file():
         warn(f"two GPUs: no CUDA build of maya-ds4 at {exe} - {ME} --setup builds it (or set mixed_exe in the "
              "config); until then the model runs on the AMD GPU alone")
+
+
+def measure_asked(a) -> str:
+    """A setup's speed calibration asked for by name (--speed-calibration, or --drafting measure): "asked for" - it
+    then runs on a GPU that already holds some memory (a display, #794) - else "" (the setup's own: it skips there)."""
+    return "asked for" if getattr(a, "speed_calibration", False) or getattr(a, "drafting", None) == "measure" else ""
 
 
 def drafting_choice(a, drafter: str, minutes: str) -> str:
@@ -5892,7 +5947,7 @@ def set_up(a, prev: dict) -> Path | None:
         else:
             if S.UI is not None:                       # (the screen shows it in the tuning's tab)
                 S.UI.step(9, "speed calibration: DFlash2 or the MTP block")
-            speed_calibration(cfg_path)
+            speed_calibration(cfg_path, measure_asked(a))
     elif g53_one_gpu_drafting(read_json(cfg_path)):    # GLM-5.3 on one APU: drafting kept only where it is faster
         fallback = bool(read_json(cfg_path)["installer"]["one_gpu_drafting"].get("on"))
         how = "on" if fallback else "off"
@@ -5903,7 +5958,7 @@ def set_up(a, prev: dict) -> Path | None:
         else:
             if S.UI is not None:
                 S.UI.step(9, "speed calibration: drafting or not")
-            speed_calibration(cfg_path)
+            speed_calibration(cfg_path, measure_asked(a))
     # the tuning: asked for (--calibrate), or offered when nothing was tuned for this PC and model yet and someone
     # answers (--yes and --no-start setups are not held up by it)
     tuned = None
@@ -6208,9 +6263,9 @@ def ds4_vision_model(mmproj: bool = False) -> dict:
             "download_gb": sum(v[0] for v in man["files"].values()) / 1e9}
 
 
-def ds4_vision_dir(d: Path) -> Path:
-    """The vision tower's folder: beside the GGUFs' folders (as the drafter's), shared by every quant there."""
-    return d.parent / "vision"
+def ds4_vision_dir(d: Path, models: Path | None = None) -> Path:
+    """The shared vision folder; a model directly in --models-dir keeps it inside that folder."""
+    return (d if models is not None and d == models else d.parent) / "vision"
 
 
 def ds4_pack_has_vision(pack: Path) -> bool:
@@ -6795,7 +6850,9 @@ def ds4_pack_step(a, d: Path, gguf: bool = False, announce: bool = True, engram:
         shards += sorted(engram.glob("*.gguf"))
     drafter_new = gguf and (drafter or d.parent / "dspark" / "dspark.json").is_file() and not CDS.has_drafter(
         {"args": ["--pack", str(pack)]})               # (the drafter arrived after the pack was built)
-    vision_new = (gguf and (ds4_vision_dir(d) / "vision.json").is_file() and not ds4_pack_has_vision(pack)) or (
+    if gguf and vision_dir is None:
+        vision_dir = ds4_vision_dir(d)
+    vision_new = (gguf and (vision_dir / "vision.json").is_file() and not ds4_pack_has_vision(pack)) or (
         not gguf and vision_dir is not None and not ds4_pack_tower(pack))
     if not a.repack and read_json(pack / PACK_SOURCES).get("tools") == tools and not drafter_new and \
             not vision_new and all((pack / f).exists() for f in need) and pack_stale(pack, shards) is None:
@@ -6807,8 +6864,7 @@ def ds4_pack_step(a, d: Path, gguf: bool = False, announce: bool = True, engram:
         "Engram hash tables and the")
     say("  tokenizer (about a minute) ...")
     run([sys.executable, str(ROOT / "tools" / "ds4" / ("pack_gguf.py" if gguf else "pack.py")), "--model", str(d),
-         "--out", str(pack)] + (["--vision", str(ds4_vision_dir(d))] if gguf else
-                                ["--vision", str(vision_dir)] if vision_dir is not None else []) +
+         "--out", str(pack)] + (["--vision", str(vision_dir)] if vision_dir is not None else []) +
         (["--engram", str(engram)] if gguf and engram is not None else []) +
         (["--drafter", str(drafter)] if gguf and drafter is not None else []) +
         (["--shards"] + [Path(f).name for f in files] if gguf and files else []) +
@@ -7008,13 +7064,14 @@ def set_up_ds4(a, prev: dict) -> Path | None:
     own = ds4_quant_drafter(quant) if gguf else None   # (Maya-XS: its own drafter beside the shared one)
     dj = d.parent / "dspark" / own["json"] if own is not None and drafter else None
     tower = None if gguf or a.no_vision else DS4_EXL3[quant].get("tower")   # (DeepSeek's BF16 tower for the quant's own)
-    vdir = ds4_exl3_vision_dir(models) if tower else None
+    vdir = ds4_vision_dir(d, models) if gguf else ds4_exl3_vision_dir(models) if tower else None
     pack = ds4_pack_step(a, d, gguf, engram=engram, files=files, drafter=dj, without=without,
-                         vision_dir=vdir if vdir is not None and (vdir / "vision.bin").is_file() else None)   # 6
+                         vision_dir=vdir if gguf or vdir is not None and (vdir / "vision.bin").is_file() else None)   # 6
     if gguf:                                           # 7 (DeepSeek's checkpoint's tower, added to the pack)
-        vision = ds4_vision_step(a, pc, d, mmproj=quant in DS4_UD)   # (UD quants: unsloth's mmproj, the same tower)
+        vision = ds4_vision_step(a, pc, d, mmproj=quant in DS4_UD, v=vdir)   # (UD quants: unsloth's mmproj, the same tower)
         if vision and not ds4_pack_has_vision(pack):
-            pack = ds4_pack_step(a, d, gguf, announce=False, engram=engram, files=files, drafter=dj, without=without)
+            pack = ds4_pack_step(a, d, gguf, announce=False, engram=engram, files=files, drafter=dj, without=without,
+                                 vision_dir=vdir)
         vision = vision and ds4_pack_has_vision(pack)
     elif tower:                                        # 7 (the quant's own tower is EXL3: DeepSeek's BF16 one instead)
         vision = ds4_vision_step(a, pc, d, v=vdir)
@@ -7044,7 +7101,7 @@ def set_up_ds4(a, prev: dict) -> Path | None:
         else:
             if S.UI is not None:
                 S.UI.step(9, "speed calibration: the DSpark drafter or none")
-            speed_calibration(cfg_path)
+            speed_calibration(cfg_path, measure_asked(a))
     return cfg_path
 
 
@@ -7288,6 +7345,12 @@ def mm3_gguf_model_step(a, d: Path, quant: str) -> list | None:
         return None
     if not mm3_gguf_published(quant):
         warn(f"{name} is not published yet: the files in {d} are taken by their sizes (no published sha256 to check)")
+    else:   # (files already there - copied, or downloaded some other way - by sha256 too: checked once, then remembered;
+            #  a damaged file keeps its size and the engine then fails on NaN weights, #672)
+        for f, want in zip(files, m["sha256"].values()):
+            if not sha256_checked(f, want):
+                fail(f"{f}: the sha256 does not match the published one - the file is damaged (its size is right)",
+                     f"delete it and run {ME} --setup again: the setup downloads it again")
     ok(f"{name}: {len(files)} files, {sum(f.stat().st_size for f in files) / 1e9:.1f} GB in {d}")
     if rotational(d):
         warn(f"{d} is on a spinning hard disk: loading reads all {m['download_gb']:.0f} GB from it - use an NVMe SSD "
@@ -7611,7 +7674,7 @@ def set_up_mm3(a, prev: dict) -> Path | None:
         else:
             if S.UI is not None:
                 S.UI.step(9, "speed calibration: the DSpark drafter or none")
-            speed_calibration(cfg_path)
+            speed_calibration(cfg_path, measure_asked(a))
     return cfg_path
 
 
@@ -8175,7 +8238,8 @@ def main() -> int:
     ap.add_argument("--gpu", type=int, help="run on this one GPU (CUDA: nvidia-smi; HIP: KFD topology order, on Windows hipInfo's)")
     ap.add_argument("--gpus", help=f"split the model's layers across these GPUs (up to {MAX_GPUS}), e.g. 0,1 or "
                                    "0,1,2,3")
-    ap.add_argument("--context", type=int, help=f"context length in tokens (default {DEFAULT_CONTEXT})")
+    ap.add_argument("--context", type=int, help=f"context length in tokens (default {DEFAULT_CONTEXT}; a setup flag: "
+                                                 "a start of an installed config keeps its own, see --config)")
     ap.add_argument("--parallel", type=int, choices=range(1, 9), metavar="N",
                     help="GLM-5.3-Flash, DeepSeek-V4.1-Flash and MiniMax-M3.1-Flash: answer up to N requests at once "
                          "(1-8, default 1), kept in the config: they are decoded together, more tokens per second in "
@@ -8231,7 +8295,11 @@ def main() -> int:
     ap.add_argument("--no-speed-calibration", action="store_true",
                     help="the same as --drafting on: draft with the drafter without measuring it")
     ap.add_argument("--config", type=Path, help="the installed JSON config to start (its run-maya-<model>.sh does), or "
-                                              "for --bench or --report (default: most recently used)")
+                                              "for --bench or --report (default: most recently used). Starting an "
+                                              "installed config uses the settings saved in it: setup flags such as "
+                                              "--context or --model are ignored then (only the start's own apply: "
+                                              "--port, --host, --api-key, --gpus, and the few written into the config, "
+                                              "such as --parallel); add --setup to set up again with them")
     a = ap.parse_args()
     why = model_option(a)
     if why:

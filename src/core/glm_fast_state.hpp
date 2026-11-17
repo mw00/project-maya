@@ -73,6 +73,15 @@ inline bool repeatable(bool linked) {
     }();
     return env >= 0 ? env == 1 : linked;
 }
+// repeatable answers: the CPU-lane timing the expert splits plan with in powers of two (MAYA_GLM_LANE_STEPS=0:
+// the measured values - a few percent of timing noise between builds then moves experts and the answers' bits)
+inline bool lane_steps() {
+    static const bool on = [] {
+        const char* v = getenv("MAYA_GLM_LANE_STEPS");
+        return v == nullptr || std::atoi(v) != 0;
+    }();
+    return on;
+}
 // the boundaries a tier move or demotion takes before it goes live (0: as soon as its copy is done - timing)
 inline int fixed_moves(bool linked) {
     static const int env = [] {
@@ -550,6 +559,11 @@ struct Glm5Model::FastState {
     unsigned long long* tab = nullptr;
     gf::MoeRequest* ring_h = nullptr;
     gf::MoeResponse* resp_h = nullptr;
+    // the stall report (glm_fast_path.cu, StallWatch): the device's given-up waits (MoeDev::wait_diag, host-mapped [8]),
+    // the service thread's next ring entry and what it is doing (0 polling, 1 a route, 2 its CPU-lane experts)
+    unsigned int* wait_diag_h = nullptr;
+    std::atomic<unsigned int> svc_next{1};
+    std::atomic<int> svc_phase{0};
     float* emb_h = nullptr;     // pinned
     float* hop_h = nullptr;     // pinned, hc * n_embd
     int* tok_h = nullptr;       // pinned

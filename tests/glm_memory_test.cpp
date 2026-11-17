@@ -158,6 +158,16 @@ int main() {
     assert(pool_reserve(2 * G + 299 * M, R, false, false, 2 * G, S) == std::make_pair(R, false));    // short anyway
     assert(pool_reserve(2 * G + 500 * M, R, true, false, 2 * G, S) == std::make_pair(R, false));     // given
     assert(pool_reserve(2 * G + 500 * M, R, false, true, 2 * G, S) == std::make_pair(R, false));     // --expert-cache N
+    // #899: the "no room" error names a smaller hand-set reserve only where it can make the room; a budget of 0 (the
+    // free VRAM read no more than the reserve) or more short than the whole reserve says it cannot; a default: nothing
+    using strata::core::glmfast::reserve_hint;
+    using strata::core::glmfast::ReserveHint;
+    assert(reserve_hint(true, 2 * G, 600 * M, 3072 * M) == ReserveHint::smaller);
+    assert(reserve_hint(true, 2 * G, 3072 * M, 3072 * M) == ReserveHint::smaller);
+    assert(reserve_hint(true, 0, 600 * M, 3072 * M) == ReserveHint::budget_zero);                   // (#899's case)
+    assert(reserve_hint(true, 2 * G, 4 * G, 3072 * M) == ReserveHint::short_beyond);
+    assert(reserve_hint(false, 0, 600 * M, R) == ReserveHint::none);
+    assert(reserve_hint(false, 2 * G, 600 * M, R) == ReserveHint::none);
     // The written budget's check (20 GiB asked, 700 MiB reserve): free as planned gives nothing back; 200 MiB free
     // gives back the 500 short + 64; nearly nothing free 1 GiB twice, then a quarter; a refused piece what it refused
     using strata::core::glmfast::pool_give_back;
@@ -172,6 +182,36 @@ int main() {
     assert(pool_give_back(20 * G, 18 * G, 2 * G, R, zr) == 2 * G);
     assert(pool_give_back(20 * G, 18 * G, 100 * M, R, zr) == 2 * G + 664 * M);
     assert(pool_give_back(G, 0, 0, R, zr) == G);   // never more than was asked
+    // #899 (2x RX 9070 16 GB, Linux HIP, Maya-S24, layers [0,12) on the head card, reserve 512 MiB): 1.93 of 15.92 GB
+    // in use before the check, so it wrote 15.92 - 1.93 - 0.5 = 13.49 GB.  Read right after its frees, the free VRAM
+    // was still 0.50 GB ("other 13.75 GB"): the pool's budget 0, 0 slots a layer.  Waiting for the frees gives the
+    // budget back (13.49 GB, the working run's pool); a card whose frees land at once (CUDA) reads no pause at all;
+    // frees that never land stop at the limit with the last read.
+    {
+        using strata::core::glmfast::await_check_frees;
+        using strata::core::glmfast::expert_pool_budget;
+        const double GB = 1073741824.0;
+        const size_t total = (size_t) (15.92 * GB), before = total - (size_t) (1.93 * GB), rsv = 512 * M;
+        const size_t held = total - (size_t) (15.42 * GB);   // 15.42 of 15.92 GB in use: the reserve's 0.50 GB free
+        assert(expert_pool_budget(false, held, 0, rsv, 0, 0) == 0);   // the failure: no budget at all
+        std::vector<size_t> reads = {held, held, held, before};
+        size_t at = 0;
+        int polls = -1, pauses = 0;
+        const size_t fr = await_check_frees(before, 256 * M, 2000, [&] { return reads[std::min(at++, reads.size() - 1)]; },
+                                            [&] { ++pauses; }, polls);
+        assert(fr == before && polls == 3 && pauses == 3);
+        const size_t budget = expert_pool_budget(false, fr, 0, rsv, 0, 0);
+        assert(budget > (size_t) (13.4 * GB) && budget < (size_t) (13.6 * GB));   // the working run's 13.49 GB pool
+        // frees already landed (CUDA, a V100): the first read, no pause - the budget exactly as before the fix
+        at = 0;
+        reads = {before - 4 * M};
+        assert(await_check_frees(before, 256 * M, 2000, [&] { return reads[0]; }, [&] { ++pauses; }, polls) ==
+                   before - 4 * M && polls == 0);
+        // never landing: at most max_polls pauses, then the last read (the start reports it)
+        assert(await_check_frees(before, 256 * M, 7, [&] { return held; }, [] {}, polls) == held && polls == 7);
+        // max_polls 0 (MAYA_GLM_POOL_CHECK_WAIT_MS=0): one read, no wait
+        assert(await_check_frees(before, 256 * M, 0, [&] { return held; }, [] {}, polls) == held && polls == 0);
+    }
     // Windows' commit on an APU (128 GiB RAM: 12.8 GiB kept for the other programs).  A 140 GiB budget, a pool that can
     // take at most 120 GiB, 4 GiB its floor: 100 GiB of commit left caps it at 87.2 GiB and keeps 32.8 off the GPU;
     // with 150 GiB left it is capped to 137.2, still above all the pool takes, so nothing stays off; with 130 it is

@@ -87,13 +87,25 @@ void run_type(int type, int N, int K) {
     const size_t stride = (blob + 1000 + a - 1) / a * a;
     std::mt19937 rng(type * 13 + N);
     std::normal_distribution<float> nd(0.0f, 1.0f);
-    std::vector<uint8_t> wq(blob * n_exp);
-    std::vector<float> wf((size_t) N * K), imat((size_t) K, 1.0f);
-    ggml_quantize_init(t);
-    for (int e = 0; e < n_exp; ++e) {
-        for (auto& v : wf) v = nd(rng) * 0.05f;
-        ggml_quantize_chunk(t, wf.data(), wq.data() + e * blob, 0, N, K, ggml_quantize_requires_imatrix(t) ? imat.data() : nullptr);
+    // 4 distinct experts without quantizing 4 x N x K weights on the CPU: the i-quants' quantizers are slow, and the 14
+    // cases' 4 x 25M weights each took the test past 6 minutes on a 2 GHz Xeon (quantization, not MMQ).  R rows are
+    // quantized once and each expert's N rows are its own walk through them (i * 7 + e * 131, mod R): rows quantize
+    // independently, so every expert is a valid matrix of the type, and no two experts are the same (a product that
+    // read a slot at the wrong offset still differs).
+    const size_t row = ggml_row_size(t, K);
+    if (blob != (size_t) N * row) {
+        expect(false, "matrix_bytes is N rows of ggml_row_size (this test builds its experts row by row)");
+        return;
     }
+    const int R = 512;
+    std::vector<uint8_t> wq(blob * n_exp), rq(row * R);
+    std::vector<float> wf((size_t) R * K), imat((size_t) K, 1.0f);
+    ggml_quantize_init(t);
+    for (auto& v : wf) v = nd(rng) * 0.05f;
+    ggml_quantize_chunk(t, wf.data(), rq.data(), 0, R, K, ggml_quantize_requires_imatrix(t) ? imat.data() : nullptr);
+    for (int e = 0; e < n_exp; ++e)
+        for (int i = 0; i < N; ++i)
+            std::memcpy(wq.data() + e * blob + (size_t) i * row, rq.data() + (size_t) ((i * 7 + e * 131) % R) * row, row);
     std::vector<int> bounds = {0, 37, 37 + 1, 37 + 1 + 129, 37 + 1 + 129 + 64};   // rows per expert 37 / 1 / 129 / 64
     const int rows = bounds.back(), max_rows = 129;
     std::vector<float> x((size_t) rows * K);

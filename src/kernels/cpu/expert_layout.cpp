@@ -152,6 +152,10 @@ void act_quant_any(const float* x, int n, ActQ& a) {
 // Without ggml-cpu no native pack loads (expert_layout_load refuses), so these are never reached.
 bool native_experts_available() noexcept { return false; }
 bool native_fmt(int, int, int64_t, int64_t, NativeFmt&, std::string& err) { err = "built without native experts"; return false; }
+bool native_fmt_mixed(int, int, int, int64_t, int64_t, NativeFmt&, std::string& err) {
+    err = "built without native experts";
+    return false;
+}
 void native_quant_act(const NativeFmt&, const float*, void*) { std::abort(); }
 void native_quant_h(const NativeFmt&, const float*, void*) { std::abort(); }
 void native_gu_rows(const NativeFmt&, const uint8_t*, const void* const*, int, float* const*, int, int) { std::abort(); }
@@ -190,14 +194,29 @@ bool expert_layout_load(const std::string& pack_dir, int64_t n_layers, int64_t n
             continue;
         }
         std::istringstream ss(line);
-        long long l = -1, gt = -1, dt = -1;
+        long long l = -1, gt = -1, ut = -1, dt = -1;
         unsigned long long off = 0, blob = 0, go = 0, uo = 0, dox = 0;
-        if (!(ss >> l >> gt >> dt >> off >> blob) || l < 0 || l >= n_layers) {
+        // the type column: one gate/up type, or "gate:up" on a mixed layer (unsloth's Qwen3.8 UD-IQ1_S blk.18)
+        std::string gu;
+        bool gu_ok = false;
+        if (ss >> l >> gu) {
+            char* end = nullptr;
+            gt = std::strtoll(gu.c_str(), &end, 10);
+            ut = gt;
+            if (end != gu.c_str() && *end == ':') {
+                const char* u0 = end + 1;
+                ut = std::strtoll(u0, &end, 10);
+                gu_ok = end != u0 && *end == 0;
+            } else {
+                gu_ok = end != gu.c_str() && *end == 0;
+            }
+        }
+        if (!gu_ok || !(ss >> dt >> off >> blob) || l < 0 || l >= n_layers) {
             err = "native_experts.txt: a malformed line: " + line;
             return false;
         }
         NativeFmt f;
-        if (!native_fmt((int) gt, (int) dt, H, FF, f, err)) return false;
+        if (!native_fmt_mixed((int) gt, (int) ut, (int) dt, H, FF, f, err)) return false;
         if (f.bytes != blob) {
             err = "native_experts.txt: layer " + std::to_string(l) + " blob is " + std::to_string(blob) +
                   " B but its formats make " + std::to_string(f.bytes);

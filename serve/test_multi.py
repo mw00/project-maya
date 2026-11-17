@@ -5,6 +5,7 @@ scripted engine (serve/fake_multi_engine.py), and the service's FIFO with n plac
 """
 from __future__ import annotations
 
+import os
 import shutil
 import sys
 import tempfile
@@ -17,11 +18,26 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from serve.server import FairLock, StrataEngine  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
+FAKE = ROOT / "serve/fake_multi_engine.py"
+_BATS: list = []
+
+
+def script_exe(script: Path) -> str:
+    """A Python script as an engine exe, started as StrataEngine starts a real engine: the script itself (its #! line)
+    on POSIX; Windows runs no script by its #! line, so there a .bat starts it with this Python (as serve/test_stop.py
+    and serve/test_glm_dsa_serve.py do)."""
+    if os.name != "nt":
+        return str(script)
+    if not _BATS:
+        _BATS.append(tempfile.TemporaryDirectory(prefix="maya-test-engines-"))
+    bat = Path(_BATS[0].name) / (Path(script).stem + ".bat")
+    bat.write_text(f'@"{sys.executable}" "{script}" %*\r\n', encoding="utf-8")
+    return str(bat)
 
 
 class Engine(unittest.TestCase):
     def setUp(self):
-        self.engine = StrataEngine(str(ROOT / "serve/fake_multi_engine.py"), ["3"])
+        self.engine = StrataEngine(script_exe(FAKE), ["3"])
 
     def tearDown(self):
         self.engine.close()
@@ -116,7 +132,7 @@ class Interleaved(unittest.TestCase):
         import os
         os.environ["FAKE_MULTI_INTERLEAVE"] = "20"
         try:
-            self.engine = StrataEngine(str(ROOT / "serve/fake_multi_engine.py"), ["3"])
+            self.engine = StrataEngine(script_exe(FAKE), ["3"])
         finally:
             del os.environ["FAKE_MULTI_INTERLEAVE"]
 
@@ -271,7 +287,7 @@ class AWedgedRequest(unittest.TestCase):
         self.path = Path(tempfile.mkdtemp()) / "silent-engine.py"
         self.path.write_text(SILENT_ENGINE)
         self.path.chmod(0o755)
-        self.engine = StrataEngine(str(self.path), [])
+        self.engine = StrataEngine(script_exe(self.path), [])
 
     def tearDown(self):
         self.srv.REQUEST_QUIET_S, self.srv.DRAIN_S = self.old
@@ -345,7 +361,7 @@ class AStoppedLongPrompt(unittest.TestCase):
         self.path = Path(tempfile.mkdtemp()) / "slow-stop-engine.py"
         self.path.write_text(SLOW_STOP_ENGINE)
         self.path.chmod(0o755)
-        self.engine = StrataEngine(str(self.path), [])
+        self.engine = StrataEngine(script_exe(self.path), [])
 
     def tearDown(self):
         self.srv.DRAIN_S = self.old
@@ -368,7 +384,7 @@ class AStoppedLongPrompt(unittest.TestCase):
         self.engine.close()
         self.path.write_text(SLOW_STOP_ENGINE.replace(
             "time.sleep(1.5)", "for _ in range(15):\n        out('PP 1 %d' % len(ids)); time.sleep(0.1)"))
-        self.engine = StrataEngine(str(self.path), [])
+        self.engine = StrataEngine(script_exe(self.path), [])
         self.srv.DRAIN_S = 0.3
         said = io.StringIO()
         gen = self.engine.generate([7, 8, 9], 3, {}, threading.Event())

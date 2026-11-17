@@ -36,6 +36,18 @@ foreach(_t IN LISTS _strata_maya_gpu_tests)
   endif()
 endforeach()
 
+# The tests whose synthetic GGUFs and packs come from tests/glm_dsa/glm_dsa_fixtures.hpp share one fixture folder
+# ($MAYA_GLMD_FIXTURES, else <tmp>/glm_dsa_fixtures) that each of them may regenerate in place (a stale or missing
+# GGUF, a pack older than its GGUF: removed and rebuilt): under ctest -j one test rebuilt a file another was reading
+# (glm_dsa_prefill_decode_test_native32: garbage cache rows under -j4, a pass alone).  One at a time.
+foreach(_t glm_dsa_model_test glm_dsa_pack_fast_test glmd_layer_parity glm_dsa_pack9_slow_test
+           glm_dsa_prefill_decode_test glm_dsa_prefill_decode_test_fp16 glm_dsa_prefill_decode_test_volta
+           glm_dsa_prefill_decode_test_native32 glm_dsa_prefill_decode_test_iq1m glm_dsa_prefill_decode_test_iq1m_rows)
+  if(TEST ${_t})
+    set_property(TEST ${_t} APPEND PROPERTY RESOURCE_LOCK glm_dsa_fixtures)
+  endif()
+endforeach()
+
 # Maya's CPU expert-kernel test needs AVX512-VNNI and AVX512-VBMI (Ice Lake / Zen 4) and exits with "this CPU cannot
 # run the expert kernel" without them: on the test PC's Xeon Gold 6138 (AVX-512F, no VNNI/VBMI) and on some GitHub runners.
 # There it is reported as skipped, not failed; where the CPU has them it runs and must pass.  glm-dsa never calls that

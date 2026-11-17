@@ -33,7 +33,11 @@ class HipSetupTests(unittest.TestCase):
             patch.object(maya, "EXE", self.root / "build/maya"),
             patch.object(maya, "STAMP", self.root / "build/MAYA-BUILD.json"),
             patch.object(maya, "WIN", False),
-            patch.dict(os.environ, {"ROCM_PATH": str(self.rocm)}),
+            # a Linux PC on any test host (Windows' own HIP setup: WindowsHipSetupTests): the platform check reads
+            # sys.platform beside WIN, and MAYA_SH keeps main() from re-starting itself through ./maya.sh (/bin/sh)
+            # when the tests run on a Python outside a venv
+            patch.object(maya.sys, "platform", "linux"),
+            patch.dict(os.environ, {"ROCM_PATH": str(self.rocm), "MAYA_SH": "1"}),
             patch.object(maya.S, "amd_gpus", return_value=self.gpus),
             patch.object(maya.S, "gpus", side_effect=AssertionError("HIP must not query NVIDIA")),
             patch.object(maya.S, "is_wsl", return_value=False),
@@ -476,7 +480,8 @@ class HipSetupTests(unittest.TestCase):
         self.assertNotIn("CUDA_DEVICE_ORDER", env)
         self.assertEqual(env["MAYA_GLM_PREFILL_SUB"], "512")
         self.assertEqual(env["MAYA_GLM_RAM_GB"], "60")
-        self.assertEqual(env["LD_LIBRARY_PATH"], str(self.rocm / "lib"))
+        # (the server's child_env: the library folders go on the loader's search path of the OS the tests run on)
+        self.assertEqual(env["PATH" if os.name == "nt" else "LD_LIBRARY_PATH"], str(self.rocm / "lib"))
         self.assertIn("GPUs: R9700 32 GB, RX 7900 XT 20 GB", text)
         self.assertIn("GPUs [1, 0]", text)
 
@@ -1075,6 +1080,17 @@ class Vs2026Hint(unittest.TestCase):
         self.assertFalse(maya.vs_2026(vs.format("2019")))
         self.assertFalse(maya.vs_2026(None))
         self.assertIn("2022", maya.VS2026_HIP_HINT)
+
+
+class UbuntuRocwmmaNote(unittest.TestCase):
+    """#899: Ubuntu's librocwmma-dev lacks the internal/ headers a WMMA build includes - the AMD doc says so and how
+    to build anyway."""
+
+    def test_the_amd_doc_has_the_note(self):
+        text = (Path(maya.__file__).resolve().parent / "docs" / "AMD_MAYA.md").read_text(encoding="utf-8")
+        for words in ("librocwmma-dev", "internal/accessors.hpp", "ROCm/rocWMMA", "CPLUS_INCLUDE_PATH",
+                      "repo.radeon.com"):
+            self.assertIn(words, text)
 
 
 if __name__ == "__main__":

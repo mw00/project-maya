@@ -528,6 +528,13 @@ def response_events(model, req, run, prompt_tokens=0, persist=None, response_id=
         response["status"] = "failed"
         response["store"] = False
         response["error"] = {"code": "server_error", "message": str(exc)}
+        if getattr(exc, "engine_fault", False):          # (#827: the engine stopped the answer on an error)
+            def written(kind):
+                return "".join(part.get("text") or "" for item in response["output"] if item.get("type") == kind
+                               for part in item.get("content") or [])
+            response["error"]["partial_text"] = written("message")
+            if written("reasoning"):
+                response["error"]["partial_reasoning"] = written("reasoning")
         if isinstance(exc, OutputValidationError) and exc.done:
             response["usage"] = response_usage(exc.done, prompt_tokens)
         yield event("response.failed", response=response)

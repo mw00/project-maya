@@ -28,7 +28,7 @@ constexpr uint32_t kMagic = 0x4d474c4bu;   // "MGLK"
 constexpr int kMaxEmbd = 8192;
 constexpr size_t kStage = (size_t) 64 << 20;   // a replacement's bytes when they are not in the shared tier
 
-enum Op : int32_t { kOpen = 1, kReserve = 2, kInsert = 3, kReplace = 4, kCompute = 5, kQuit = 6, kPfOpen = 7, kPrompt = 8 };
+enum Op : int32_t { kOpen = 1, kReserve = 2, kInsert = 3, kReplace = 4, kCompute = 5, kQuit = 6, kPfOpen = 7, kPrompt = 8, kComputeX3 = 9, kPromptX3 = 10 };
 
 // The prompt exchange (a second memfd): one MoE layer of a prompt chunk at a time.  The lead writes the chunk's FFN
 // input x (T rows), the sorted rows' positions and weights (pos/rw, T x K) and, for the rows of the experts the helper
@@ -96,6 +96,11 @@ struct alignas(64) Ctl {
     int32_t pf_T, pf_K, pf_n, pf_rows, pf_r0, pf_dsa, pf_nff, pf_slot;   // kPrompt: the layer's chunk (PfLayout; pf_slot: pf_slot_layout)
     double pf_gpu_ms;               // kPrompt: the helper's time for it (host clock, ms)
     uint8_t pf_types[64];           // kOpen's answer: the helper's prompt products by ggml type (kPfMmq | kPfFusedGu | kPfFusedDown)
+    // kOpen: x3_on = 1 for an EXL3 pack's experts (the helper makes its EXL3 kernels' scratch), its answer x3_pf = 1
+    // when the helper's prompt products cover EXL3 experts; kComputeX3 / kPromptX3: the layer's blob layout
+    // (kernels::exl3::ExpertLayout, field by field) - the call is kCompute's / kPrompt's otherwise
+    int32_t x3_on, x3_cb, x3_fmt, x3_k2[3], x3_gg[3], x3_pf;
+    uint64_t x3_suh[3], x3_svh[3], x3_trellis[3];
     char err[512];
     float x[kMaxEmbd];
     float out[kMaxEmbd];
@@ -114,5 +119,10 @@ Ctl* ctl_alloc(int& fd);
 bool in_shared(const void* p, size_t bytes);
 /// lead side: the prompt exchange block (memfd, mapped, faulted in; not in blocks()); nullptr on failure
 void* xchg_alloc(size_t bytes, int& fd);
+/// helper side: [host, host + bytes) is a block this process's GPU reads at its own address `dev` (the block's pages
+/// imported as buffers, not a registration of the host range); device_view: the GPU address standing for host
+/// pointer p, nullptr when p lies in no such block (the caller then asks its runtime, as before)
+void add_device_view(const void* host, size_t bytes, void* dev);
+void* device_view(const void* p);
 
 }  // namespace strata::core::hlink

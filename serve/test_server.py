@@ -21,7 +21,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from serve.frontend import ChatTemplate  # noqa: E402
-from serve.server import CTX_SLACK, ByteTokenizer, carry_embeddings, EngineDied, MockEngine, RequestStat, Service, StrataEngine, parse_cors_origins, request_timings, serve  # noqa: E402
+from serve.server import CTX_SLACK, ByteTokenizer, carry_embeddings, died_text, EngineDied, EngineFault, MockEngine, RequestStat, Service, StrataEngine, parse_cors_origins, request_timings, serve  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 CTX = 4096
@@ -950,7 +950,8 @@ class NonFiniteEngine(MockEngine):
 
 class NonFiniteRetry(unittest.TestCase):
     """A NaN in the engine's numbers: nothing sent yet - the request runs once more (the engine has dropped that
-    conversation's state); an answer under way ends there as "length"; a second failure is an error."""
+    conversation's state); an answer under way ends there as an error (#827: it was "length"); a second failure is an
+    error."""
 
     def answer(self, fail):
         tok = ByteTokenizer()
@@ -971,9 +972,22 @@ class NonFiniteRetry(unittest.TestCase):
         out, done, err, calls = self.answer([0])
         self.assertEqual((out, done["finish"], err, calls), ("all good, and then some", "stop", None, 2))
 
-    def test_answer_under_way_ends_as_length(self):
-        out, done, err, calls = self.answer([8])
-        self.assertEqual((out, done["finish"], err, calls), ("all good", "length", None, 1))
+    def test_answer_under_way_ends_as_an_error(self):
+        # (#827: it ended as "length", which a client reads as max_tokens reached; what was sent still stands)
+        tok = ByteTokenizer()
+        eng = NonFiniteEngine(tok, "all good, and then some", [8])
+        svc = Service(eng, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        out, done = "", None
+        with self.assertRaises(EngineFault) as cm:
+            for kind, v in svc.run(tok.encode("hi"), False, None, 200, {}, threading.Event()):
+                if kind == "event":
+                    out += v.text
+                elif kind == "done":
+                    done = v
+        self.assertEqual((out, done, eng.calls), ("all good", None, 1))
+        self.assertIn("non-finite", str(cm.exception))
+        self.assertFalse(cm.exception.restarts)
+        self.assertEqual(svc.metrics()["requests"][0]["finish"], "error")
 
     def test_twice_is_an_error(self):
         out, done, err, calls = self.answer([0, 0])
@@ -1117,6 +1131,226 @@ class EngineDeath(unittest.TestCase):
                 self.assertIn("illegal memory access", text, path)
                 self.assertNotIn("HTTP/1", text, path)
                 self.assertEqual(svc.metrics()["requests"][0]["finish"], "error")
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+
+
+class EngineEndsItself(unittest.TestCase):
+    """#827: maya-ds4 ends an answer itself when a decode step, a sample or a GPU fails - its DONE says "cancel" with
+    nothing asking it to stop, and the reason goes to its log.  The server reported that as "length" (max_tokens
+    reached).  It is the request's error now (EngineFault), on every API; "length" and "stop" stay as they were, and
+    a stop the server asked for (STOP, PAUSE, a cancel) is not an error."""
+
+    def engine(self, lines):
+        import io
+        import queue
+        from types import SimpleNamespace
+        eng = StrataEngine.__new__(StrataEngine)
+        eng.proc = SimpleNamespace(stdin=io.StringIO(), poll=lambda: None)
+        eng.lines = queue.Queue()
+        eng.can_stop = True
+        eng.max_context = CTX
+        for line in lines:
+            eng.lines.put(line)
+        return eng
+
+    def run_svc(self, lines):
+        eng = self.engine(lines)
+        tok = ByteTokenizer()
+        svc = Service(eng, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        out, done, err = "", None, None
+        try:
+            for kind, v in svc.run(tok.encode("hi"), False, None, 200, {}, threading.Event()):
+                if kind == "event":
+                    out += v.text
+                elif kind == "done":
+                    done = v
+        except EngineFault as e:
+            err = e
+        return out, done, err, svc
+
+    def test_own_cancel_is_an_error(self):
+        out, done, err, svc = self.run_svc(["T 104\n", "T 105\n", "DONE 2 3 1.0 1.0 cancel 0 0 0 0 0\n"])
+        self.assertEqual((out, done), ("hi", None))         # (what was sent stands; no "length" end)
+        self.assertIsNotNone(err)
+        self.assertIn("because of an error after 2 tokens", str(err))
+        self.assertFalse(err.restarts)
+        self.assertNotIn("restarts it", died_text(err))
+        self.assertEqual(svc.metrics()["requests"][0]["finish"], "error")
+
+    def test_gpu_fault_says_it_restarts(self):
+        eng = self.engine(["T 104\n", "DONE 1 3 1.0 1.0 cancel 0 0 0 0 0\n"])
+        eng.ended = True                                    # (its END line, ahead of the DONE: _pump marks it ended)
+        with self.assertRaises(EngineFault) as cm:
+            list(eng.generate([1, 2, 3], 16, {}, threading.Event()))
+        err = cm.exception
+        self.assertTrue(err.restarts)
+        self.assertIn("a GPU's state is unknown", str(err))
+        self.assertTrue(died_text(err).endswith("the next request restarts it"))
+
+    WHY = ("cudaMemcpyAsync(d, s, n, kind, stream): an illegal memory access was encountered - after 7 tokens, at "
+           "position 1031 of a 65536-token context, a round of up to 4 tokens with drafts")
+
+    def fault_after_end(self, reason, log="C:/maya/ds4.log"):
+        """The EngineFault a request gets when maya-ds4's END line (with `reason`, or none) came ahead of its DONE."""
+        eng = self.engine(["T 104\n", "DONE 7 3 1.0 1.0 cancel 0 0 0 0 0\n"])
+        eng.ended, eng.end_reason, eng.log_path = True, reason, log
+        with self.assertRaises(EngineFault) as cm:
+            list(eng.generate([1, 2, 3], 16, {}, threading.Event()))
+        return cm.exception
+
+    def test_the_end_lines_reason_is_the_errors(self):
+        # (#827) the END line's reason - the failed call, the position - is in the request's error itself; the log is
+        # named as where more is
+        err = self.fault_after_end(self.WHY)
+        self.assertTrue(err.restarts)
+        self.assertIn("a GPU's state is unknown after it - " + self.WHY, str(err))
+        self.assertIn("more in the engine's log (C:/maya/ds4.log)", str(err))
+        self.assertNotIn("the reason is in the engine's log", str(err))
+        # no reason on the END line (an older engine, another fault): the log, as before
+        err = self.fault_after_end("")
+        self.assertIn("a GPU's state is unknown after it; the reason is in the engine's log (C:/maya/ds4.log)",
+                      str(err))
+        self.assertTrue(str(self.fault_after_end("", log=None)).endswith("a GPU's state is unknown after it"))
+
+    def test_the_end_lines_reason_reaches_every_api(self):
+        fault = self.fault_after_end(self.WHY)
+
+        class FaultEngine(MockEngine):
+            def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+                for i, t in enumerate(super().generate(ids, max_new, sampling, cancel, embeddings)):
+                    if i == 50:
+                        raise EngineFault(str(fault), restarts=fault.restarts)
+                    yield t
+
+        tok = ByteTokenizer()
+        svc = Service(FaultEngine(tok, ANSWER, max_context=CTX), tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        svc.model_management = True                         # (Maya's model API: /api/chat)
+        httpd = serve(svc, port=0)
+        base = f"http://127.0.0.1:{httpd.server_address[1]}"
+        msgs = [{"role": "user", "content": "hi"}]
+        cases = [("/v1/chat/completions", {"model": "m", "max_tokens": 400, "messages": msgs}),
+                 ("/v1/messages", {"model": "m", "max_tokens": 400, "messages": msgs}),
+                 ("/v1/responses", {"model": "m", "max_output_tokens": 400, "input": "hi"}),
+                 ("/api/chat", {"model": "m", "messages": msgs, "options": {"num_predict": 400}})]
+        try:
+            for path, body in cases:
+                for stream in (True, False):
+                    req = urllib.request.Request(base + path, data=json.dumps({**body, "stream": stream}).encode(),
+                                                 headers={"Content-Type": "application/json"})
+                    try:
+                        with urllib.request.urlopen(req, timeout=30) as r:
+                            code, text = r.status, r.read().decode()
+                    except urllib.error.HTTPError as e:
+                        with e:
+                            code, text = e.code, e.read().decode()
+                    what = f"{path} stream={stream}"
+                    self.assertEqual(code, 200 if stream else 422, what)
+                    self.assertIn("at position 1031 of a 65536-token context", text, what)
+                    self.assertIn("an illegal memory access was encountered", text, what)
+                    self.assertNotIn("the reason is in the engine's log", text, what)
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+
+    def test_length_and_stop_unchanged(self):
+        for finish in ("length", "stop"):
+            out, done, err, _ = self.run_svc(["T 104\n", "T 105\n", f"DONE 2 3 1.0 1.0 {finish} 0 0 0 0 0\n"])
+            self.assertIsNone(err, finish)
+            self.assertEqual((out, done["finish"]), ("hi", "length"), finish)   # (no end token: the server's length)
+
+    def test_asked_stops_are_not_errors(self):
+        for how in ("stop", "pause", "cancel"):
+            eng = self.engine(["T 104\n", "T 105\n", "DONE 2 3 1.0 1.0 cancel 0 0 0 0 0\n"])
+            cancel = threading.Event()
+            got = []
+            for t in eng.generate([1, 2, 3], 16, {}, cancel):
+                got.append(t)
+                if len(got) == 1:
+                    {"stop": eng.stop, "pause": eng.pause, "cancel": cancel.set}[how]()
+            self.assertEqual(eng.last.get("finish") if how != "cancel" else "cancel", "cancel", how)
+            # a pause is per request: the next one's own "cancel" is an error again
+            if how == "pause":
+                eng.lines.put("DONE 0 3 1.0 1.0 cancel 0 0 0 0 0\n")
+                with self.assertRaises(EngineFault):
+                    list(eng.generate([1, 2, 3], 16, {}, threading.Event()))
+
+    def test_the_error_carries_what_was_written(self):
+        from serve.server import anthropic_texts, engine_error_body, openai_texts, with_partial
+
+        def chunks():
+            yield {"choices": [{"delta": {"reasoning_content": "hmm "}}]}
+            yield None
+            yield {"choices": [{"delta": {"content": "Hello"}}]}
+            yield {"choices": [{"delta": {"content": " there"}}]}
+            raise EngineFault("the engine stopped this answer itself because of an error after 4 tokens")
+
+        with self.assertRaises(EngineFault) as cm:
+            list(with_partial(chunks(), openai_texts))
+        body = engine_error_body(cm.exception)
+        self.assertEqual((body["error"]["partial_text"], body["error"]["partial_reasoning"]), ("Hello there", "hmm "))
+        self.assertEqual((body["error"]["type"], body["error"]["code"]), ("engine_error", "engine_error"))
+
+        def events():
+            yield "content_block_delta", {"delta": {"type": "text_delta", "text": "Hi"}}
+            yield "message_start", {"message": {}}
+            raise EngineFault("x")
+
+        with self.assertRaises(EngineFault) as cm:
+            list(with_partial(events(), anthropic_texts))
+        body = engine_error_body(cm.exception, anthropic=True)
+        self.assertEqual((body["type"], body["error"]["type"], body["error"]["partial_text"]),
+                         ("error", "engine_error", "Hi"))
+
+    def test_every_api_reports_an_error(self):
+        class FaultEngine(MockEngine):
+            def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+                for i, t in enumerate(super().generate(ids, max_new, sampling, cancel, embeddings)):
+                    if i == 300:
+                        raise EngineFault("the engine stopped this answer itself because of an error after 300 tokens "
+                                          "(not the token limit)")
+                    yield t
+
+        tok = ByteTokenizer()
+        svc = Service(FaultEngine(tok, ANSWER, max_context=CTX), tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        svc.model_management = True                         # (Maya's model API: /api/chat)
+        httpd = serve(svc, port=0)
+        base = f"http://127.0.0.1:{httpd.server_address[1]}"
+        msgs = [{"role": "user", "content": "hi"}]
+        cases = [("/v1/chat/completions", {"model": "m", "max_tokens": 400, "messages": msgs}),
+                 ("/v1/messages", {"model": "m", "max_tokens": 400, "messages": msgs}),
+                 ("/v1/responses", {"model": "m", "max_output_tokens": 400, "input": "hi"}),
+                 ("/api/chat", {"model": "m", "messages": msgs, "options": {"num_predict": 400}})]
+        try:
+            for path, body in cases:
+                for stream in (True, False):
+                    req = urllib.request.Request(base + path, data=json.dumps({**body, "stream": stream}).encode(),
+                                                 headers={"Content-Type": "application/json"})
+                    try:
+                        with urllib.request.urlopen(req, timeout=30) as r:
+                            code, text = r.status, r.read().decode()
+                    except urllib.error.HTTPError as e:
+                        with e:
+                            code, text = e.code, e.read().decode()
+                    what = f"{path} stream={stream}"
+                    self.assertIn("because of an error after 300 tokens", text, what)
+                    for word in ('"length"', ': "max_tokens"', '"reason": "max_output_tokens"', '"end_turn"'):
+                        self.assertNotIn(word, text, what)
+                    if stream:
+                        self.assertEqual(code, 200, what)
+                    else:
+                        # not streamed: 422 "engine_error" (no 5xx / 408 / 409 / 429, which the OpenAI and Anthropic
+                        # SDKs send again by themselves) with the text written before the error
+                        self.assertEqual(code, 422, what)
+                        body = json.loads(text)
+                        err = body["error"] if isinstance(body.get("error"), dict) else body
+                        self.assertIn("engine_error", (err.get("type"), err.get("code"), err.get("error_type")), what)
+                        got = err["partial_text"] + (err.get("partial_reasoning") or err.get("partial_thinking") or "")
+                        self.assertTrue(len(got) > 100 and ANSWER[:300].startswith(got), (what, got))   # (the guard holds a tail)
+                        if path == "/v1/messages":
+                            self.assertEqual(body["type"], "error")
+                    self.assertEqual(svc.metrics()["requests"][0]["finish"], "error", what)
         finally:
             httpd.shutdown()
             httpd.server_close()
@@ -2805,6 +3039,18 @@ class EngineEndTests(unittest.TestCase):
         self.assertEqual(got, ["ERR", "DONE"])           # END is the server's, not the request's
         self.assertTrue(e.ended)
         self.assertFalse(e.alive())                      # (the process may still be exiting: the next request restarts)
+        self.assertEqual(e.end_reason, "")               # (an END line without a reason: the log names it)
+        # #827: the END line carries the decode's reason (it can hold parentheses itself); _pump keeps it for the error
+        e.proc = SimpleNamespace(stdout=io.StringIO("END a GPU's state is unknown after this request (cudaMemcpyAsync"
+                                                    "(...): an illegal memory access was encountered - after 7 tokens, "
+                                                    "at position 1031 of a 65536-token context) - the engine ends "
+                                                    "(exit 3); the next request starts a fresh one\n"),
+                                 poll=lambda: None)
+        e.lines, e.ended = queue.Queue(), False
+        e._pump()
+        self.assertTrue(e.ended)
+        self.assertEqual(e.end_reason, "cudaMemcpyAsync(...): an illegal memory access was encountered - after 7 "
+                                       "tokens, at position 1031 of a 65536-token context")
 
     def test_a_replaced_engines_late_end_leaves_the_new_one_running(self):
         # GLM link mode: the AMD GPU's helper shares the lead's output and ends after it, so the old engine's output

@@ -9100,10 +9100,52 @@ struct Model::Impl {
     // tp 8 (orcarouter's Mix-256G), the 72 readers ~33 GB/s together, the prompt's limit (nsys: each member's thread
     // staging ~20 of 38 s).  All or none (DS4_COPY_PIN=0: none - the staging, as before); zc_pin's chunks count
     bool cp_dma = false;
+#if defined(_WIN32) && !defined(STRATA_USE_HIP)
+    // #794 (Windows, NVIDIA): every GPU's free VRAM in MiB now (-1: the driver's read failed), the current device kept
+    std::vector<long long> free_mib_all() const {
+        int cur = 0;
+        if (cudaGetDevice(&cur) != cudaSuccess) (void) cudaGetLastError();
+        std::vector<long long> v;
+        for (const Dev& d : devs) {
+            size_t fr = 0, tot = 0;
+            long long m = -1;
+            if (cudaSetDevice(d.id) == cudaSuccess && mem_info(&fr, &tot) == cudaSuccess)
+                m = (long long) (fr >> 20);
+            else
+                (void) cudaGetLastError();
+            v.push_back(m);
+        }
+        cudaSetDevice(cur);
+        return v;
+    }
+    // the log's numbers: "CUDA0 1412 -> 0, CUDA1 ..." (MiB free before -> after the pin; ? a failed read)
+    std::string free_pair_text(const std::vector<long long>& pre, const std::vector<long long>& post) const {
+        std::string s;
+        for (size_t i = 0; i < devs.size() && i < pre.size() && i < post.size(); ++i) {
+            if (!s.empty()) s += ", ";
+            s += "CUDA" + std::to_string(devs[i].id) + " " + (pre[i] < 0 ? std::string("?") : std::to_string(pre[i])) +
+                 " -> " + (post[i] < 0 ? std::string("?") : std::to_string(post[i]));
+        }
+        return s;
+    }
+    // the GPU whose room the pin took (pin_took_vram; -1: none).  MAYA_DS4_PIN_VRAM_FLOOR_MIB: the floor (256; 0: off)
+    int pin_hurt_dev(const std::vector<long long>& pre, const std::vector<long long>& post) const {
+        static const long long floor_mib = [] {
+            const char* v = ds4_env("DS4_PIN_VRAM_FLOOR_MIB");
+            return v != nullptr && v[0] != '\0' ? std::atoll(v) : 256LL;
+        }();
+        for (size_t i = 0; i < pre.size() && i < post.size(); ++i)
+            if (pin_took_vram(pre[i], post[i], floor_mib)) return (int) i;
+        return -1;
+    }
+#endif
     void cp_pin() {
         if (!copy_mode || chunk <= 0 || ram_chunks.empty()) return;
         if (const char* v = std::getenv("DS4_COPY_PIN"); v != nullptr && std::atoi(v) == 0) return;
         const double t0 = now_ms();
+#if defined(_WIN32) && !defined(STRATA_USE_HIP)
+        const std::vector<long long> pre = free_mib_all();   // (#794: what the pin does to every GPU's free VRAM)
+#endif
         const size_t nc = ram_chunks.size();
         zc_chunk.resize(nc, 0);
         std::vector<char> mine(nc, 0);   // (1: this call pinned it, 2: it failed)
@@ -9128,6 +9170,17 @@ struct Model::Impl {
             for (size_t c = 0; c < nc; ++c)
                 if (mine[c] == 1) cudaHostUnregister(ram_chunks[c]);
             std::fprintf(stderr, "ds4: pinning the copied experts (%.1f GB) failed - the prompt path stages them as before\n", gb);
+#if defined(_WIN32) && !defined(STRATA_USE_HIP)
+            {   // (#794: a failed pin, given back, that still left a GPU near empty - said with the numbers)
+                const std::vector<long long> post = free_mib_all();
+                const int h = pin_hurt_dev(pre, post);
+                std::fprintf(stderr, "ds4: free VRAM (MiB) before -> after the failed pin: %s%s\n",
+                             free_pair_text(pre, post).c_str(),
+                             h < 0 ? ""
+                                   : " - WARNING: a GPU is left near empty and requests can fail with out of memory; "
+                                     "set DS4_COPY_PIN=0 in the config's \"env\" (#794)");
+            }
+#endif
             return;
         }
         // (pinned last: the room the engine's later pinned buffers need must still be there - else these pins go back)
@@ -9140,6 +9193,28 @@ struct Model::Impl {
                          gb, pin_room_gb());
             return;
         }
+#if defined(_WIN32) && !defined(STRATA_USE_HIP)
+        // #794: on Windows with several NVIDIA GPUs the pin left every GPU at "0 MiB free" and the first request failed
+        // with out of memory (DS4_COPY_PIN=0 ran).  A pin that leaves a GPU near empty goes back - the staging, as
+        // when the pin fails - and the log has the numbers either way
+        {
+            const std::vector<long long> post = free_mib_all();
+            const int h = pin_hurt_dev(pre, post);
+            std::fprintf(stderr, "ds4: free VRAM (MiB) before -> after pinning the copied experts: %s\n",
+                         free_pair_text(pre, post).c_str());
+            if (h >= 0) {
+                for (size_t c = 0; c < nc; ++c)
+                    if (mine[c] == 1) cudaHostUnregister(ram_chunks[c]);
+                cudaGetLastError();
+                const std::vector<long long> back = free_mib_all();
+                std::fprintf(stderr, "ds4: pinning the copied experts (%.1f GB) left CUDA%d near empty - given back, the "
+                                     "prompt path stages them as before (DS4_COPY_PIN=0 skips the pin; "
+                                     "MAYA_DS4_PIN_VRAM_FLOOR_MIB=0 keeps it); free VRAM (MiB) after giving it back: %s\n",
+                             gb, devs[(size_t) h].id, free_pair_text(pre, back).c_str());
+                return;
+            }
+        }
+#endif
         for (size_t c = 0; c < nc; ++c)
             if (mine[c] == 1) zc_chunk[c] = 1;
         cp_dma = true;
@@ -9405,7 +9480,14 @@ struct Model::Impl {
                     }
             size_t fr = 0, tot = 0;
             cudaSetDevice(d.id);
-            mem_info(&fr, &tot);
+            // (#794: a failed read printed "0 MiB free" - the driver's reason instead; a good read prints as before)
+            const cudaError_t fe = mem_info(&fr, &tot);
+            if (fe != cudaSuccess) (void) cudaGetLastError();
+            char frs[96];
+            if (fe == cudaSuccess)
+                std::snprintf(frs, sizeof frs, "%.0f MiB free", fr / 1048576.0);
+            else
+                std::snprintf(frs, sizeof frs, "free VRAM unknown (%s)", cudaGetErrorString(fe));
             const size_t gsz = groups.empty() ? 1 : groups[(size_t) d.grp].mem.size();
             char tp[64] = "";
             if (gsz > 1) std::snprintf(tp, sizeof tp, " (tensor parallel %zu, part %d)", gsz, d.mi);
@@ -9420,9 +9502,9 @@ struct Model::Impl {
             char line[384];
             std::snprintf(line, sizeof line,
                           "ds4: CUDA%d layers [%d, %d]%s%s%s: weights %.2f GB, experts %.2f GB (%d of %d in VRAM), caches "
-                          "%.2f GB, %.0f MiB free\n",
+                          "%.2f GB, %s\n",
                           d.id, a, b, tp, (int) di == head_dev ? " + head" : "", dr, d.weights / 1e9, d.experts / 1e9, ev, et,
-                          d.caches / 1e9, fr / 1048576.0);
+                          d.caches / 1e9, frs);
             s << line;
         }
         int nh = 0;
@@ -16227,7 +16309,20 @@ struct Model::Impl {
     // decode's check that streaming pays (LaneAB): a window's mean time with the split against the CPU lane alone;
     // the first window only warms up; 3% slower twice in a row: off (this kind of request streams nothing from then
     // on), twice not slower - faster or a tie: it keeps streaming, as it does when still undecided after 9 windows
-    // (pcie::ab_window, #697).  The times file keeps the verdict for the next start
+    // (pcie::ab_window, #697); a layer split: a tie turns it off (ab_tie_keeps).  The times file keeps the verdict for
+    // the next start
+    // one GPU: a tie in decode's checks keeps streaming (#697: there the lane's slots also carry the one-GPU decode
+    // path, which a written-off tie took away); several GPUs: the rule before #697 - 3% faster, else off (#956: on
+    // 2x RTX A4000 and 4x RTX 3090 a start with the lane off decoded 4-5% faster where the checks measured ties: the
+    // lane's cost when little streams falls on both of a check's turns).  DS4_STREAM_TIE=keep / off: either rule on
+    // any PC (A/B tests)
+    bool ab_tie_keeps() const {
+        static const int forced = [] {
+            const char* v = std::getenv("DS4_STREAM_TIE");
+            return v == nullptr ? -1 : std::strcmp(v, "keep") == 0 ? 1 : std::strcmp(v, "off") == 0 ? 0 : -1;
+        }();
+        return forced >= 0 ? forced == 1 : devs.size() <= 1;
+    }
     void lane_ab(LaneCls& C, int kind, bool split, double ms) {
         LaneAB& A = C.ab[kind];
         if (A.verdict != 0 || !(ms >= 0.0)) return;
@@ -16237,7 +16332,7 @@ struct Model::Impl {
         const double m0 = A.ms[0] / A.n[0], m1 = A.ms[1] / A.n[1], gain = 1.0 - m1 / m0;
         A.ms[0] = A.ms[1] = 0;
         A.n[0] = A.n[1] = 0;
-        A.verdict = pcie::ab_window(A.wins, A.good, A.bad, gain);   // (a tie keeps streaming: #697)
+        A.verdict = pcie::ab_window(A.wins, A.good, A.bad, gain, ab_tie_keeps());   // (see ab_tie_keeps)
         if (A.verdict == 0) return;
         std::fprintf(stderr, "ds4: PCIe lane: CUDA%d %s: decode measured the split against the CPU lane alone on "
                              "requests with %s: %.2f against %.2f ms (%+.1f%%) -> %s\n",
@@ -16258,7 +16353,8 @@ struct Model::Impl {
     // streaming allowed, or none (decoded tokens: the lane serves T == 1 steps only) - and their time a token decides with lane_ab's rule over windows of 64 tokens of each:
     // 3% slower twice in a row: none from then on, and the times file keeps it for the next start; twice not slower
     // (faster or a tie), or undecided after 9 windows: streaming stays (lane_ab decides the rest) - a tie is not written
-    // as off (pcie::ab_window, #697).  DS4_STREAM_TOKEN_AB=0: off (A/B tests)
+    // as off (pcie::ab_window, #697) on one GPU; a layer split: 3% faster or off, as before #697 (ab_tie_keeps, #956).
+    // DS4_STREAM_TOKEN_AB=0: off (A/B tests)
     struct TokAB {
         double ms[2] = {0, 0};
         int64_t n[2] = {0, 0};
@@ -16303,7 +16399,7 @@ struct Model::Impl {
         const double m0 = A.ms[0] / (double) A.n[0], m1 = A.ms[1] / (double) A.n[1], gain = 1.0 - m1 / m0;
         A.ms[0] = A.ms[1] = 0;
         A.n[0] = A.n[1] = 0;
-        A.verdict = pcie::ab_window(A.wins, A.good, A.bad, gain);   // (the first window warms up; a tie keeps it: #697)
+        A.verdict = pcie::ab_window(A.wins, A.good, A.bad, gain, ab_tie_keeps());   // (see ab_tie_keeps)
         if (A.verdict == 0) return;
         std::fprintf(stderr, "ds4: PCIe lane: decode measured whole steps with the split against the CPU lane alone: "
                              "%.2f against %.2f ms a token (%+.1f%%) -> %s\n", m1, m0, -100.0 * gain,

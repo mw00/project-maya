@@ -446,6 +446,31 @@ class Gguf(unittest.TestCase):
             self.assertTrue((d / ix).is_file())
             self.assertFalse((d / ix.replace(".bin", ".gguf")).exists())
 
+    def test_published_files_in_place_by_sha256(self):
+        """Published: files already there are taken by their sha256 too, not their sizes alone - a damaged file of the
+        right size stops the setup (#672: NaN weights, the router then picks no expert); a good one is read once."""
+        import hashlib
+        m = maya.mm3_gguf_entry("gguf-xs")
+        body = {n: bytes([i + 1]) * (1000 + i) for i, n in enumerate(m["files"])}
+        m["files"] = {n: len(b) for n, b in body.items()}
+        m["sha256"] = {n: hashlib.sha256(b).hexdigest() for n, b in body.items()}
+        m["revision"] = "0" * 40
+        with tempfile.TemporaryDirectory() as d, patch.object(maya, "fail", fail), \
+                patch.object(maya, "step", lambda *a: None), patch.object(maya, "warn", lambda *a: None), \
+                patch.object(maya, "ok", lambda *a: None), patch.object(maya, "say", lambda *a: None), \
+                patch.object(maya, "rotational", return_value=False), \
+                patch.object(maya, "mm3_gguf_entry", return_value=m):
+            d = Path(d)
+            for n, b in body.items():
+                (d / n).write_bytes(b)
+            first = next(iter(body))
+            (d / first).write_bytes(b"\xff" + body[first][1:])   # (one byte changed, the size kept)
+            with self.assertRaisesRegex(Failed, "sha256 does not match"):
+                maya.mm3_gguf_model_step(args(), d, "gguf-xs")
+            (d / first).write_bytes(body[first])
+            self.assertEqual(len(maya.mm3_gguf_model_step(args(), d, "gguf-xs")), 3)
+            self.assertEqual(set(json.loads((d / maya.VERIFIED).read_text())), set(body))   # (remembered)
+
 
 if __name__ == "__main__":
     unittest.main()
