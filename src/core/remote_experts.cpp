@@ -109,6 +109,92 @@ GlmExpertHelper::~GlmExpertHelper() {
     }
 }
 
+// MAYA_GLM_HELPER_WARM (auto / 1 / 0): while window calls keep arriving, a side stream runs keep_busy (one wave that
+// only counts) so the helper GPU does not drop its clocks in the gaps between a layer's calls - a Radeon 8065S idles
+// about half of a paired verify window, and its calls then start on a clock that is still ramping.  It stops by itself
+// 20 ms after the last window call.  No result changes: the side stream touches no buffer of any call.
+namespace {
+struct HelperWarm {
+    std::atomic<long long> until_ns{0};
+    std::atomic<int> state{0};   // 0 not started, 1 running, 2 asked to stop, 3 stopped
+    static long long now_ns() {
+        return std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+    }
+    // -1 auto (default): window calls are timed with it off, on, off, on (kPhase calls each, the first kSkip of a
+    // phase left out) and it stays on only when the calls are at least 2 % faster with it; 0 off; 1 on; 2 = A/B, this
+    // thread busy without the GPU
+    static int mode() {
+        static const int m = [] {
+            const char* v = std::getenv("MAYA_GLM_HELPER_WARM");
+            return v == nullptr || v[0] == 'a' ? -1 : std::atoi(v);
+        }();
+        return m;
+    }
+    static constexpr int kPhase = 512, kSkip = 96;
+    int calls = 0, choice = -1;
+    double sum_ms[2] = {0.0, 0.0}, sum_ex[2] = {0.0, 0.0};
+    bool wanted() const { return mode() > 0 || (mode() < 0 && (choice < 0 ? (calls / kPhase) % 2 == 1 : choice == 1)); }
+    void sample(double ms, int experts) {
+        if (mode() >= 0 || choice >= 0 || experts <= 0) return;
+        const int on = (calls / kPhase) % 2;
+        if (calls % kPhase >= kSkip) sum_ms[on] += ms, sum_ex[on] += (double) experts;
+        if (++calls < 4 * kPhase) return;
+        const double off_us = sum_ms[0] / sum_ex[0] * 1e3, on_us = sum_ms[1] / sum_ex[1] * 1e3;
+        choice = on_us < 0.98 * off_us ? 1 : 0;
+        std::fprintf(stderr, "glm helper: window calls measured with the GPU left to idle between them %.1f us an "
+                             "expert-token, kept busy %.1f us -> %s (MAYA_GLM_HELPER_WARM=1 / 0 force)\n",
+                     off_us, on_us, choice ? "kept busy while window calls arrive" : "left to idle");
+    }
+    void touch(int device) {
+        if (!wanted()) return;
+        until_ns.store(now_ns() + 20000000ll, std::memory_order_relaxed);
+        int s0 = 0;
+        if (state.compare_exchange_strong(s0, 1)) std::thread([this, device] { run(device); }).detach();
+    }
+    void run(int device) {
+        namespace gf = strata::kernels::glmf;
+        cudaStream_t st = nullptr;
+        unsigned* sink = nullptr;
+        if (cudaSetDevice(device) != cudaSuccess || cudaStreamCreateWithFlags(&st, cudaStreamNonBlocking) != cudaSuccess ||
+            cudaMalloc((void**) &sink, 64) != cudaSuccess) {
+            (void) cudaGetLastError();
+            state.store(3);
+            return;
+        }
+        unsigned n = 20000;
+        unsigned long long launches = 0;
+        while (state.load(std::memory_order_relaxed) == 1) {
+            if (now_ns() >= until_ns.load(std::memory_order_relaxed)) {
+                std::this_thread::sleep_for(std::chrono::microseconds(200));
+                continue;
+            }
+            const long long t0 = now_ns();
+            if (mode() == 2) {   // (A/B: this thread busy, the GPU left alone)
+                while (now_ns() - t0 < 300000ll) {}
+                ++launches;
+                continue;
+            }
+            gf::keep_busy(n, sink, st);
+            if (cudaStreamSynchronize(st) != cudaSuccess) break;
+            const double us = (double) (now_ns() - t0) * 1e-3;
+            // (aim at ~300 us a launch: short enough to stop quickly, long enough that launches are not the load)
+            if (++launches <= 64 && us > 1.0) n = (unsigned) std::min(4.0e6, std::max(2000.0, (double) n * 300.0 / us));
+        }
+        std::fprintf(stderr, "glm helper: keep-warm side stream ran %llu launches (MAYA_GLM_HELPER_WARM)\n", launches);
+        cudaFree(sink);
+        cudaStreamDestroy(st);
+        state.store(3);
+    }
+    void stop() {
+        int s1 = 1;
+        if (!state.compare_exchange_strong(s1, 2)) return;
+        for (int i = 0; i < 2000 && state.load() != 3; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+};
+HelperWarm g_warm;
+}  // namespace
+
 bool GlmExpertHelper::open(int device, int n_embd, int n_ff,
                            const std::vector<std::pair<void*, size_t>>& regions, std::string& err, bool exl3) {
     close();
@@ -491,6 +577,7 @@ bool GlmExpertHelper::win_run(int gu_type, int d_type, size_t down_off, float li
     auto* wh = (float*) (win_h_ + o_w);
     size_t bytes = 0;
     int experts = 0, distinct = 0;
+    bool twice = false;   // a token's plan names an expert twice (never from a route): no unpack-once launch
     for (int t = 0; t < T; ++t) {
         if (c.ne[t] < 0 || c.ne[t] > c.k) {
             err = "GLM expert helper: a window token's route width";
@@ -509,11 +596,13 @@ bool GlmExpertHelper::win_run(int gu_type, int d_type, size_t down_off, float li
             wh[8 * t + i] = c.w[t][i];
             bool seen = false;
             for (int j = 0; j < 8 * t + i && !seen; ++j) seen = ph[j] == ph[8 * t + i];
+            for (int j = 8 * t; j < 8 * t + i; ++j) twice = twice || ph[j] == ph[8 * t + i];
             if (!seen) bytes += slots_[(size_t) key].bytes, ++distinct;
             ++experts;
         }
         if (c.ne[t] > 0) std::memcpy(win_h_ + (size_t) t * xb, x + (size_t) t * hlink::kMaxEmbd, xb);
     }
+    g_warm.touch(device_);
     DeviceScope scope(device_);
     if (!scope.ok) { err = scope.error(device_); return false; }
     const auto t0 = std::chrono::steady_clock::now();
@@ -529,6 +618,20 @@ bool GlmExpertHelper::win_run(int gu_type, int d_type, size_t down_off, float li
     mm.mt_sh_hq_s = 0;
     mm.mt_out_s = (unsigned int) E;
     mm.mt_cpu_s = 0;
+    // MAYA_GLM_WIN_ONCE=1: an expert several tokens routed is unpacked once for all of them (the same bits per token).
+    // auto: this window size's calls that share an expert run both ways in turn, the faster stays.  Off by default: on
+    // a Radeon 8065S it only wins when most experts are shared (a 3-token window measured 40.0 us an expert-token
+    // against 36.2)
+    static const int once_env = [] {
+        const char* v = std::getenv("MAYA_GLM_WIN_ONCE");
+        return v == nullptr ? 0 : v[0] == 'a' ? -1 : std::atoi(v) != 0 ? 1 : 0;
+    }();
+    const bool once_can = !twice && distinct < experts && T < (int) (sizeof(win_once_) / sizeof(win_once_[0])) &&
+                          gf::win_dedup_shape(gu_type, d_type, T, c.k);
+    WinOnce* wo = once_can && once_env < 0 && win_once_[T].choice < 0 ? &win_once_[T] : nullptr;
+    const int way = !once_can ? 0 : once_env >= 0 ? once_env : wo != nullptr ? (wo->n[0] > wo->n[1] ? 1 : 0)
+                                                                            : win_once_[T].choice;
+    mm.mt_dedup = way;
     const bool launched = gf::moe_experts_multi(gu_type, d_type, mm, c.k, E, n_ff_, limit, down_off, win_q_,
                                                 win_q_ + (size_t) WT * xqb, nullptr, 0, nullptr, 0, nullptr,
                                                 (float*) (win_z_ + o_out), stream_);
@@ -539,9 +642,37 @@ bool GlmExpertHelper::win_run(int gu_type, int d_type, size_t down_off, float li
         err = "GLM expert helper: the window kernels do not take these expert types";
         return false;
     }
+    if (wo != nullptr) {
+        constexpr int kBlk = 32, kBlocks = 6;
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        const int b = wo->n[way] / kBlk;
+        wo->blk_ms[way][b] += ms;
+        wo->blk_ex[way][b] += (double) experts;
+        ++wo->n[way];
+        if (wo->n[0] >= kBlk * kBlocks && wo->n[1] >= kBlk * kBlocks) {
+            double per[2];
+            for (int v = 0; v < 2; ++v) {   // (the slowest block dropped: a stall is not the kernels)
+                double sm = 0.0, se = 0.0, worst = -1.0;
+                int wb = 0;
+                for (int i = 0; i < kBlocks; ++i) {
+                    const double r = wo->blk_ms[v][i] / wo->blk_ex[v][i];
+                    if (r > worst) worst = r, wb = i;
+                }
+                for (int i = 0; i < kBlocks; ++i)
+                    if (i != wb) sm += wo->blk_ms[v][i], se += wo->blk_ex[v][i];
+                per[v] = sm / se;
+            }
+            wo->choice = per[1] < per[0] ? 1 : 0;
+            std::fprintf(stderr, "glm helper: a window layer's shared experts measured (%d tokens) - unpacked per token "
+                                 "%.1f us an expert-token, once %.1f us -> %s (MAYA_GLM_WIN_ONCE=1 / 0 force)\n",
+                         T, per[0] * 1e3, per[1] * 1e3, wo->choice ? "once" : "per token");
+        }
+    }
+    g_warm.sample(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(), experts);
     for (int t = 0; t < T; ++t)
         if (c.ne[t] > 0) std::memcpy(out + (size_t) t * hlink::kMaxEmbd, win_h_ + o_out + (size_t) t * xb, xb);
     if (prof_) {
+        if (way) ++win_once_calls_;
         win_ms_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
         ++win_calls_;
         win_tokens_ += (unsigned long long) T;
@@ -774,6 +905,7 @@ bool GlmExpertHelper::finish(std::string& err, bool split) {
 }
 
 void GlmExpertHelper::close() {
+    g_warm.stop();
     if (device_ < 0) return;
     if (link_) {
         if (prof_ && win_calls_ > 0)
@@ -833,6 +965,9 @@ void GlmExpertHelper::close() {
                          device_, win_calls_, (double) win_tokens_ / (double) win_calls_,
                          (double) win_experts_ / (double) win_calls_, (double) win_distinct_ / (double) win_calls_,
                          win_ms_ / (double) win_calls_, win_ms_ > 0.0 ? (double) win_bytes_ / (win_ms_ * 1e6) : 0.0);
+        if (win_once_calls_ > 0)
+            std::fprintf(stderr, "glm helper prof CUDA%d: %llu of the window calls unpacked their shared experts once\n",
+                         device_, win_once_calls_);
         if (split_calls_ > 0)   // (enqueue / wait: the caller's own work ran between the two halves)
             std::fprintf(stderr, "glm helper prof CUDA%d: %llu of the calls split (enqueue, the caller's work, wait): %.3f ms "
                                  "a split call between the two halves\n",

@@ -214,6 +214,17 @@ private:
     uint8_t* win_z_ = nullptr;
     uint8_t* win_q_ = nullptr;
     unsigned long long win_calls_ = 0, win_tokens_ = 0, win_experts_ = 0, win_distinct_ = 0, win_bytes_ = 0;
+    // win_run's shared experts unpacked once (MoeDev::mt_dedup; MAYA_GLM_WIN_ONCE auto / 1 / 0): per window size, the
+    // calls with a shared expert are timed both ways in turn and the faster way stays - the same bits either way
+    struct WinOnce {
+        int choice = -1;                 // -1 measuring, 0 per token, 1 once
+        int n[2] = {0, 0};               // calls measured per way
+        double blk_ms[2][8] = {};        // ... their time and expert-tokens, in blocks of 32 calls
+        double blk_ex[2][8] = {};
+    };
+    WinOnce win_once_[5];
+    int win_once_mode_ = -1;
+    unsigned long long win_once_calls_ = 0;
     double win_ms_ = 0, win_post_ms_ = 0;
     std::chrono::steady_clock::time_point win_t0_{};
     // MAYA_GLM_PROF: each call's host time and its stages' GPU time, summed; printed when the helper closes

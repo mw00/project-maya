@@ -320,6 +320,10 @@ struct MoeDev {
     // strides (q8_1 blocks: its FFN input, its h, its shared expert's h; floats: its output, its CPU part)
     int mt_T = 1;
     unsigned int mt_xq_s = 0, mt_hq_s = 0, mt_sh_hq_s = 0, mt_out_s = 0, mt_cpu_s = 0;
+    // moe_experts_multi: 1 = an expert several of the window's tokens routed is unpacked once for all of them (the
+    // same bits per token; IQ2_XXS / IQ3_XXS / IQ2_S experts, mt_T <= 4, mt_T * k <= 32 - otherwise ignored).  The
+    // caller's promise: no token's plan names an expert twice
+    int mt_dedup = 0;
     // the routing ring's shape (ring_entry below): ring_n entries (a power of two) of ring_stride bytes; 0, 0: kRingSize
     // entries of sizeof(MoeRequest)
     unsigned int ring_n = 0, ring_stride = 0;
@@ -499,6 +503,11 @@ void moe_down(int d_type, const MoeDev& d, int k, int n_embd, int n_ff, size_t d
 /// rows at d's mt_ strides): every token's arithmetic is its moe_gate_up / moe_down's, the blocks of all the tokens for
 /// a chunk of rows issued together - an expert two tokens route reads its rows once from DRAM.  AMD builds only (the
 /// token path's RDNA3 kernels); false: not here, nothing launched (the caller runs the tokens one by one).
+/// One wave counting n steps into *sink (device memory): keeps a GPU's clocks up between short bursts of work (an
+/// integrated GPU's power management drops them within a millisecond of idling).  No effect on any result.
+void keep_busy(unsigned n, unsigned* sink, cudaStream_t s);
+/// win_dedup_shape: whether MoeDev::mt_dedup would be honoured for these types and this window (AMD builds).
+bool win_dedup_shape(int gu_type, int d_type, int T, int k);
 bool moe_experts_multi(int gu_type, int d_type, const MoeDev& d, int k, int n_embd, int n_ff, float limit,
                        size_t down_off, const void* xq, void* hq, const void* sh_down, int sh_type, const void* sh_hq,
                        int n_ff_sh, float* sh_out, float* out, cudaStream_t s);

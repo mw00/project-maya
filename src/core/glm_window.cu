@@ -806,6 +806,14 @@ bool Glm5Model::fast_moe_window(int il, int t0, int T, int part, int gid, std::s
             mm.mt_sh_hq_s = (unsigned int) (W.sh_hq_s / q8);
             mm.mt_out_s = (unsigned int) E;
             mm.mt_cpu_s = (unsigned int) E;
+            // MAYA_GLM_WIN_ONCE=1: an expert several of the tokens routed is unpacked once for all of them (the same
+            // bits per token; a route's plan never names an expert twice).  Off here unless asked: this path has no
+            // timed choice (a linked helper's window call measures it - remote_experts.cpp win_run)
+            static const bool once_env = [] {
+                const char* v = getenv("MAYA_GLM_WIN_ONCE");
+                return v != nullptr && v[0] != 'a' && std::atoi(v) != 0;
+            }();
+            mm.mt_dedup = once_env ? 1 : 0;
             const size_t hq_t = 8 * ((size_t) g.n_ff_exp / 32) * q8;
             const bool sh = Ly.sh_down.q != nullptr;
             if (!gf::moe_experts_multi(Ly.gu_type, Ly.d_type, mm, g.n_exp_used, E, g.n_ff_exp, g.swiglu_exp,

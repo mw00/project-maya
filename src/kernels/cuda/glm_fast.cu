@@ -5005,6 +5005,302 @@ __global__ void __launch_bounds__(256) moe_down_kernel(MoeDev d, int k, int n_em
     }
 }
 
+#if defined(STRATA_USE_HIP)
+// ---------------------------------------------------------------- a verify window's SHARED experts, unpacked once
+// moe_experts_multi with MoeDev::mt_dedup: an expert that several tokens of the window routed has each 32-value
+// sub-block of its rows unpacked ONCE and dotted with every such token's activation (the unpack - grid and sign
+// lookups, the scale - is most of an i-quant dot on RDNA3; v_dot4 is one instruction).  Each token's sums are its own
+// kernel's, bit for bit: the unpacked bytes are the same integers, a token's integer dot, its float product and its
+// accumulation over the sub-blocks (lane by lane, then the wave's reduction) keep moe_gate_up_kernel's /
+// moe_down_kernel's order, and the combine runs in the token's plan order.  IQ2_XXS / IQ3_XXS / IQ2_S only (dw<T> and
+// dw_rdna<T> give the same integers for them on HIP: hip_fast_signs == direct_signs).
+constexpr int WD_MU = 4;   // the tokens one unpack serves (a window of up to WD_MU tokens)
+struct DecH {
+    int g[8];
+    int l0, l1;
+    float d;
+};
+template<int T>
+__device__ __forceinline__ void dec_hip(const uint8_t* row, int kbx, int iqs, const uint32_t* tab, DecH& o) {
+    if constexpr (T == 16) {
+        const block_iq2_xxs* bq2 = (const block_iq2_xxs*) row + kbx;
+        const int q2 = get_int_b2(bq2->qs, iqs);
+        const uint8_t* aux8 = (const uint8_t*) &q2;
+        const uint32_t aux32 = get_int_b2(bq2->qs, iqs + 1);
+#pragma unroll
+        for (int k0 = 0; k0 < 8; k0 += 2) {
+            const uint2 grid_pos = ((const uint2*) tab)[aux8[k0 / 2]];
+            const uint4 signs = direct_signs(aux32 >> (7 * k0 / 2), true);
+            o.g[k0] = (int) ((grid_pos.x ^ signs.x) + signs.y);
+            o.g[k0 + 1] = (int) ((grid_pos.y ^ signs.z) + signs.w);
+        }
+        o.l0 = aux32 >> 27 | 1;
+        o.l1 = 0;
+        o.d = __half2float(bq2->d);
+    } else if constexpr (T == 18) {
+        const block_iq3_xxs* bq3 = (const block_iq3_xxs*) row + kbx;
+        const int2 q3_packed = make_int2(get_int_b2(bq3->qs, iqs), get_int_b2(bq3->qs, iqs + 1));
+        const uint8_t* q3 = (const uint8_t*) &q3_packed;
+        const uint32_t aux32 = get_int_b2(bq3->qs, QK_K / 16 + iqs / 2);
+#pragma unroll
+        for (int l0 = 0; l0 < 8; l0 += 2) {
+            const int2 grid_pos = make_int2(tab[q3[l0 + 0]], tab[q3[l0 + 1]]);
+            const uint4 signs = direct_signs(aux32 >> (7 * l0 / 2), true);
+            o.g[l0] = (int) ((grid_pos.x ^ signs.x) + signs.y);
+            o.g[l0 + 1] = (int) ((grid_pos.y ^ signs.z) + signs.w);
+        }
+        o.l0 = aux32 >> 28;
+        o.l1 = 0;
+        o.d = __half2float(bq3->d);
+    } else {   // 22: IQ2_S
+        const block_iq2_s* bq2 = (const block_iq2_s*) row + kbx;
+        const int qs_packed = get_int_b2(bq2->qs, iqs / 2);
+        const uint8_t* qs = (const uint8_t*) &qs_packed;
+        const int qh = bq2->qh[iqs / 2];
+        const int signs_packed_32 = get_int_b2(bq2->qs, QK_K / 32 + iqs / 2);
+        const uint8_t* signs_packed_8 = (const uint8_t*) &signs_packed_32;
+#pragma unroll
+        for (int l0 = 0; l0 < 8; l0 += 2) {
+            const uint2 grid_pos = ((const uint2*) tab)[qs[l0 / 2] | ((qh << (8 - l0)) & 0x300)];
+            const uint4 signs = direct_signs(signs_packed_8[l0 / 2], false);
+            o.g[l0] = (int) ((grid_pos.x ^ signs.x) + signs.y);
+            o.g[l0 + 1] = (int) ((grid_pos.y ^ signs.z) + signs.w);
+        }
+        o.l0 = bq2->scales[iqs / 2] & 0x0F;
+        o.l1 = bq2->scales[iqs / 2] >> 4;
+        o.d = __half2float(bq2->d);
+    }
+}
+template<int T>
+__device__ __forceinline__ float dot_hip(const DecH& o, const XV& x) {
+    if constexpr (T == 22) {
+        int sumi0 = 0, sumi1 = 0;
+#pragma unroll
+        for (int i = 0; i < 4; ++i) sumi0 = __dp4a(o.g[i], x.u[i], sumi0);
+#pragma unroll
+        for (int i = 4; i < 8; ++i) sumi1 = __dp4a(o.g[i], x.u[i], sumi1);
+        const int sumi = (sumi0 * o.l0 + sumi1 * o.l1 + (sumi0 + sumi1) / 2) / 4;
+        return o.d * x.d * sumi;
+    } else {
+        int sumi = 0;
+#pragma unroll
+        for (int i = 0; i < 8; ++i) sumi = __dp4a(o.g[i], x.u[i], sumi);
+        if constexpr (T == 18) sumi = (o.l0 * sumi + sumi / 2) / 2;
+        else sumi = sumi * o.l0 / 8;
+        return o.d * x.d * sumi;
+    }
+}
+// NR weight rows x nu activations (xs[u], u < nu <= WD_MU): rows_dot's / rows_dot_rdna's loop with every sub-block
+// unpacked once; s[r][u] = token u's rows_dot sum for row r
+template<int T, int NR, int NU>
+__device__ __forceinline__ void rows_dot_users_n(const uint8_t* const* rows, const block_q8_1* const* xs, int n_in,
+                                                 int lane, const uint32_t* tab, float (&s)[NR][WD_MU]) {
+    float acc[NR][NU];
+#pragma unroll
+    for (int r = 0; r < NR; ++r)
+#pragma unroll
+        for (int u = 0; u < NU; ++u) acc[r][u] = 0.0f;
+    for (int k = lane; k < n_in / 32; k += 32) {
+        DecH dr[NR];
+#pragma unroll
+        for (int r = 0; r < NR; ++r) dec_hip<T>(rows[r], k / 8, 2 * (k % 8), tab, dr[r]);
+#pragma unroll
+        for (int u = 0; u < NU; ++u) {
+            const XV xv = load_xv(xs[u] + k);
+#pragma unroll
+            for (int r = 0; r < NR; ++r) acc[r][u] += dot_hip<T>(dr[r], xv);
+        }
+    }
+#pragma unroll
+    for (int u = 0; u < NU; ++u)
+#pragma unroll
+        for (int r = 0; r < NR; ++r) s[r][u] = warp_sum(acc[r][u]);
+}
+// (a copy of the loop per user count: an expert one token routed - most of them - runs rows_dot's own shape)
+template<int T, int NR>
+__device__ __forceinline__ void rows_dot_users(const uint8_t* const* rows, const block_q8_1* const* xs, int nu, int n_in,
+                                               int lane, const uint32_t* tab, float (&s)[NR][WD_MU]) {
+    if (nu == 1) rows_dot_users_n<T, NR, 1>(rows, xs, n_in, lane, tab, s);
+    else if (nu == 2) rows_dot_users_n<T, NR, 2>(rows, xs, n_in, lane, tab, s);
+    else if (nu == 3) rows_dot_users_n<T, NR, 3>(rows, xs, n_in, lane, tab, s);
+    else rows_dot_users_n<T, NR, 4>(rows, xs, n_in, lane, tab, s);
+}
+template<int T> constexpr bool win_dedup_type = T == 16 || T == 18 || T == 22;
+template<int T> __device__ __forceinline__ const uint32_t* global_tab() {
+    return T == 16 ? (const uint32_t*) iq2xxs_grid : T == 18 ? (const uint32_t*) iq3xxs_grid : (const uint32_t*) iq2s_grid;
+}
+
+// gate/up: moe_experts_multi's grid (x = (expert slot, token) with the token fastest, y = the chunk of GU_ROWS rows).
+// The block of the FIRST token that routed an expert computes the chunk for every token of the window that routed
+// it (each into its own h, at its own slot); the later tokens' blocks for that expert return.  A token's plan must
+// not name an expert twice (a route's top-k never does).
+template<int TG>
+__global__ void __launch_bounds__(GU_WARPS * 32)
+moe_gate_up_win_kernel(MoeDev d, int k, int n_embd, int n_ff, float limit, const block_q8_1* __restrict__ xq,
+                       block_q8_1* __restrict__ hq, const uint8_t* __restrict__ sh_down, int sh_type,
+                       const block_q8_1* __restrict__ sh_hq, int n_ff_sh, float* __restrict__ sh_out) {
+    if (d.skip != nullptr && *d.skip) return;
+    constexpr int NW = GU_WARPS;
+    const int T = d.mt_T;
+    const int t = (int) blockIdx.x % T, ei = (int) blockIdx.x / T, chunk = blockIdx.y, n_chunks = (int) gridDim.y;
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    if (ei == k) {   // the shared expert's down rows, per token (moe_gate_up_kernel's)
+        if (sh_hq != nullptr) sh_hq += (size_t) t * d.mt_sh_hq_s;
+        if (sh_out != nullptr) sh_out += (size_t) t * d.mt_out_s;
+        const int per = (n_embd + n_chunks - 1) / n_chunks;
+        const int r1 = min(n_embd, (chunk + 1) * per);
+        for (int r = chunk * per + warp; r < r1; r += NW) {
+            const float v = any_row_dot(sh_type, sh_down, r, sh_hq, nullptr, n_ff_sh, lane);
+            if (lane == 0) sh_out[r] = v;
+        }
+        return;
+    }
+    const unsigned long long ptr = d.plan_ptr[8 * t + ei];
+    if (ptr == 0ull) return;
+    __shared__ int s_nu, s_ut[WD_MU], s_ui[WD_MU];
+    __shared__ float sg[WD_MU][GU_ROWS], su[WD_MU][GU_ROWS];
+    __shared__ uint32_t s_tab[TabWords<TG>::n > 0 ? TabWords<TG>::n : 1];
+    if (threadIdx.x == 0) {
+        const int kr = min(k, (int) gridDim.x / T);   // the plans' width (k is one more without a shared expert)
+        int nu = 1;
+        bool first = true;
+        s_ut[0] = t;
+        s_ui[0] = ei;
+        for (int t2 = 0; t2 < T; ++t2) {
+            if (t2 == t) continue;
+            for (int i2 = 0; i2 < kr; ++i2) {
+                if (d.plan_ptr[8 * t2 + i2] != ptr) continue;
+                if (t2 < t) first = false;
+                else if (nu < WD_MU) {
+                    s_ut[nu] = t2;
+                    s_ui[nu] = i2;
+                    ++nu;
+                }
+                break;
+            }
+        }
+        s_nu = first ? nu : 0;
+    }
+    load_tab<TG>(s_tab);
+    __syncthreads();
+    const int nu = s_nu;
+    if (nu == 0) return;
+    const size_t rb = rbytes<TG>(n_embd);
+    const uint8_t* blob = (const uint8_t*) ptr;
+    constexpr int RPW = GU_ROWS / NW;
+    const uint8_t* rows[2 * RPW];
+#pragma unroll
+    for (int j = 0; j < RPW; ++j) {
+        const int r = chunk * GU_ROWS + warp * RPW + j;
+        rows[j] = blob + (size_t) r * rb;
+        rows[RPW + j] = blob + (size_t) n_ff * rb + (size_t) r * rb;
+    }
+    const block_q8_1* xs[WD_MU];
+#pragma unroll
+    for (int u = 0; u < WD_MU; ++u) xs[u] = xq + (size_t) s_ut[u < nu ? u : 0] * d.mt_xq_s;
+    float s[2 * RPW][WD_MU];
+    rows_dot_users<TG, 2 * RPW>(rows, xs, nu, n_embd, lane, s_tab, s);
+    if (lane == 0) {
+#pragma unroll
+        for (int u = 0; u < WD_MU; ++u) {
+            if (u >= nu) break;
+#pragma unroll
+            for (int j = 0; j < RPW; ++j) {
+                sg[u][warp * RPW + j] = s[j][u];
+                su[u][warp * RPW + j] = s[RPW + j][u];
+            }
+        }
+    }
+    __syncthreads();
+    if (warp < nu) {   // wave u: token s_ut[u]'s h block for this chunk (moe_gate_up_kernel's wave 0)
+        const float g = fminf(sg[warp][lane], limit);
+        const float u = fminf(fmaxf(su[warp][lane], -limit), limit);
+        q8_1_store_warp((g / (1.0f + expf(-g))) * u,
+                        hq + (size_t) s_ut[warp] * d.mt_hq_s + (size_t) s_ui[warp] * (n_ff / 32) + chunk, lane);
+    }
+}
+
+// down: one block per NR output rows for the WHOLE window, a wave per (token, plan slot) - blockDim = T * k waves.
+// The wave of the first token that routed an expert computes its rows for every token that routed it; then each
+// token's combine in its plan order (moe_down_kernel's).
+template<int TD, int NR, bool GLOBAL>
+__global__ void __launch_bounds__(1024)
+moe_down_win_kernel(MoeDev d, int k, int n_embd, int n_ff, size_t down_off, const block_q8_1* __restrict__ hq,
+                    const float* __restrict__ sh_out, float* __restrict__ out) {
+    if (d.skip != nullptr && *d.skip) return;
+    const int T = d.mt_T, nw = T * k;
+    __shared__ unsigned long long s_ptr[32];
+    __shared__ float s_w[32];
+    __shared__ float s_part[32][NR];
+    __shared__ int s_nu[32], s_us[32][WD_MU];
+    __shared__ uint32_t s_tab[TabWords<TD>::n > 0 ? TabWords<TD>::n : 1];
+    if constexpr (!GLOBAL) load_tab<TD>(s_tab);
+    if ((int) threadIdx.x < nw) {
+        const int t = (int) threadIdx.x / k, i = (int) threadIdx.x % k;
+        s_ptr[threadIdx.x] = d.plan_ptr[8 * t + i];
+        s_w[threadIdx.x] = d.plan_w[8 * t + i];
+    }
+    __syncthreads();
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const int wt = warp / k;
+    const unsigned long long ptr = s_ptr[warp];
+    if (lane == 0) {
+        int nu = 0;
+        if (ptr != 0ull) {
+            bool first = true;
+            nu = 1;
+            s_us[warp][0] = warp;
+            for (int w2 = 0; w2 < nw; ++w2) {
+                const int t2 = w2 / k;
+                if (t2 == wt || s_ptr[w2] != ptr) continue;
+                if (t2 < wt) first = false;
+                else if (nu < WD_MU && (nu == 1 || s_us[warp][nu - 1] / k != t2)) s_us[warp][nu++] = w2;
+            }
+            if (!first) nu = 0;
+        } else {
+#pragma unroll
+            for (int j = 0; j < NR; ++j) s_part[warp][j] = 0.0f;
+        }
+        s_nu[warp] = nu;
+    }
+    __syncthreads();
+    const int nu = s_nu[warp];
+    const int r0 = (int) blockIdx.x * NR;
+    if (nu > 0) {
+        const size_t drb = rbytes<TD>(n_ff);
+        const uint8_t* rows[NR];
+#pragma unroll
+        for (int j = 0; j < NR; ++j) rows[j] = (const uint8_t*) ptr + down_off + (size_t) (r0 + j) * drb;
+        const block_q8_1* xs[WD_MU];
+#pragma unroll
+        for (int u = 0; u < WD_MU; ++u) {
+            const int w2 = s_us[warp][u < nu ? u : 0];
+            xs[u] = hq + (size_t) (w2 / k) * d.mt_hq_s + (size_t) (w2 % k) * (n_ff / 32);
+        }
+        const uint32_t* tab = s_tab;
+        if constexpr (GLOBAL) tab = global_tab<TD>();
+        float s[NR][WD_MU];
+        rows_dot_users<TD, NR>(rows, xs, nu, n_ff, lane, tab, s);
+        if (lane == 0) {
+#pragma unroll
+            for (int u = 0; u < WD_MU; ++u) {
+                if (u >= nu) break;
+#pragma unroll
+                for (int j = 0; j < NR; ++j) s_part[s_us[warp][u]][j] = s[j][u];
+            }
+        }
+    }
+    __syncthreads();
+    if ((int) threadIdx.x < NR * T) {
+        const int t = (int) threadIdx.x / NR, j = (int) threadIdx.x % NR, r = r0 + j;
+        float m = 0.0f;
+        for (int i = 0; i < k; ++i) m += s_w[t * k + i] * s_part[t * k + i][j];
+        if (d.cpu_flag[t]) m += d.cpu_part[(size_t) t * d.mt_cpu_s + r];
+        out[(size_t) t * d.mt_out_s + r] = m + (sh_out != nullptr ? sh_out[(size_t) t * d.mt_out_s + r] : 0.0f);
+    }
+}
+#endif
+
 // ---------------------------------------------------------------- the prompt path's lightly routed experts
 // An expert with a few rows (tokens) of a prompt chunk: its weights read ONCE, each 32-value sub-block decoded once
 // and dotted with up to LR_MT tokens at a time (MMQ computes tiles of 64-128 tokens - mostly empty at ~10 rows an
@@ -7119,6 +7415,27 @@ void moe_down(int d_type, const MoeDev& d_in, int k, int n_embd, int n_ff, size_
     launch_check("moe_down");
 }
 
+// keep_busy: one wave that only counts (n steps, a few hundred us) - no memory traffic, no result anyone reads
+__global__ void keep_busy_kernel(unsigned n, unsigned* sink) {
+    unsigned v = threadIdx.x + 1u;
+    for (unsigned i = 0; i < n; ++i) v = v * 1664525u + 1013904223u;
+    if (threadIdx.x == 0) *sink = v;
+}
+void keep_busy(unsigned n, unsigned* sink, cudaStream_t s) {
+    keep_busy_kernel<<<1, 32, 0, s>>>(n, sink);
+    launch_check("keep_busy");
+}
+
+bool win_dedup_shape(int gu_type, int d_type, int T, int k) {
+#if defined(STRATA_USE_HIP)
+    const auto ok = [](int t) { return t == 16 || t == 18 || t == 22; };
+    return ok(gu_type) && ok(d_type) && T >= 2 && T <= WD_MU && k >= 1 && k <= 8 && T * k <= 32;
+#else
+    (void) gu_type, (void) d_type, (void) T, (void) k;
+    return false;
+#endif
+}
+
 bool moe_experts_multi(int gu_type, int d_type, const MoeDev& d_in, int k, int n_embd, int n_ff, float limit,
                        size_t down_off, const void* xq, void* hq, const void* sh_down, int sh_type, const void* sh_hq,
                        int n_ff_sh, float* sh_out, float* out, cudaStream_t s) {
@@ -7135,6 +7452,36 @@ bool moe_experts_multi(int gu_type, int d_type, const MoeDev& d_in, int k, int n
     const auto* SH = (const block_q8_1*) sh_hq;
     // gate/up: moe_gate_up's kernel for the type, the (expert, token) blocks of a chunk side by side
     const dim3 ggu((unsigned) ((k + (sh ? 1 : 0)) * T), (unsigned) (n_ff / GU_ROWS));
+    if (d.mt_dedup != 0 && win_dedup_shape(gu_type, d_type, T, k)) {
+        // shared experts unpacked once (moe_gate_up_win_kernel / moe_down_win_kernel): the same bits per token
+        switch (gu_type) {
+#define GLMF_GUW(TT)             case TT: moe_gate_up_win_kernel<TT><<<ggu, GU_WARPS * 32, 0, s>>>(                 d, kk, n_embd, n_ff, limit, X, H, SD, sh_type, SH, n_ff_sh, sh_out); break;
+            GLMF_GUW(16) GLMF_GUW(18) GLMF_GUW(22)
+#undef GLMF_GUW
+            default: return false;
+        }
+        const auto* HW = (const block_q8_1*) hq;
+        const unsigned wthreads = (unsigned) (T * k * 32);
+        if ((d_type == 22 || d_type == 18) && n_embd == 4096 && n_ff == 2048 && rdna3_expert_device(d_type == 22)) {
+            // (the token path's shapes there: two rows a block, IQ2_S's grid read from global memory)
+            if (d_type == 22)
+                moe_down_win_kernel<22, 2, true><<<(unsigned) (n_embd / 2), wthreads, 0, s>>>(
+                    d, k, n_embd, n_ff, down_off, HW, sh_out, out);
+            else
+                moe_down_win_kernel<18, 2, false><<<(unsigned) (n_embd / 2), wthreads, 0, s>>>(
+                    d, k, n_embd, n_ff, down_off, HW, sh_out, out);
+        } else {
+            const unsigned blocks = (unsigned) (n_embd / DOWN_ROWS);
+            switch (d_type) {
+#define GLMF_DNW(TT)                 case TT: moe_down_win_kernel<TT, DOWN_ROWS, false><<<blocks, wthreads, 0, s>>>(                     d, k, n_embd, n_ff, down_off, HW, sh_out, out); break;
+                GLMF_DNW(16) GLMF_DNW(18) GLMF_DNW(22)
+#undef GLMF_DNW
+                default: return false;
+            }
+        }
+        launch_check("moe_experts_multi dedup");
+        return true;
+    }
     const bool tuned = (gu_type == 16 || (gu_type == 22 && gu22_tuned())) && n_embd == 4096 && n_ff == 2048 && rdna3_expert_device(true, gu_type == 22 && gu22_tuned());
     if (gu_type == 22) note_gu22(tuned, 1);
     if (tuned) {
