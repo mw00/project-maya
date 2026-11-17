@@ -873,6 +873,15 @@ struct Glm5Model::FastState {
         float* wh = nullptr;                // EXL3: [tmax * 8][n_ff] each entry's h (F32)
         unsigned long long* grp_ptr = nullptr;
         int *grp_start = nullptr, *grp_ent = nullptr, *n_groups = nullptr;
+        float* hc_part = nullptr;           // [tmax][hc_part_n]: each token's own hc partials (win_hc_rows: the
+        size_t hc_part_n = 0;               // window's tokens' hyper-connections in one launch, gf::hc_rows)
+        uint8_t* hc_ctr = nullptr;          // [tmax] barrier counters 64 bytes apart, zeroed once
+        bool stagger_now = true;            // this window: two staggered groups (window() sets it: win_stagger_mode)
+        struct StagTrial {                  // MAYA_GLM_WIN_STAGGER=auto, per window size: [0] one pass, [1] staggered
+            int n[2] = {0, 0};
+            double sum[2] = {0.0, 0.0}, mx[2] = {0.0, 0.0};
+            int pick = -1;                  // -1: still measuring
+        } stag[17];                         // (Glm5Model::kWinMax + 1)
         unsigned int* scr = nullptr;        // [0] the layer's scratch claims, [1] sticky: a slot taken twice
         unsigned int* scr_h = nullptr;      // pinned: [1] read after the window
         unsigned int* cpu_seq_w = nullptr;  // [tmax] seq words 64 bytes apart

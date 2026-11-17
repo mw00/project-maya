@@ -1907,8 +1907,43 @@ __global__ void __launch_bounds__(256) mvc_kernel_t(const STRATA_GRID_CONSTANT M
         }
 }
 
+// The kernels above are compiled for 2 / 4 / 8 / 16 columns, so a window of 3 or 5 tokens computes padding columns it
+// never stores: at 3 columns a quarter of the dot work.  mvc_exact_cols: this device takes a kernel compiled for
+// exactly 3 / 5 columns instead - the same rows a warp as its 4 / 8-column kernel (so mv()'s blocks do not change) and
+// the same arithmetic per (row, column), so every sum is bit for bit the padded kernel's.  Tesla V100, one 8192 x 4096
+// GEMV, us (padded -> exact): 3 columns Q6_K 74 -> 62, Q4_K 61 -> 48, Q8_0 78 -> 63; 5 columns Q6_K 138 -> 133, Q4_K
+// 129 -> 72, Q8_0 140 -> 122.  6 and 7 columns keep the 8-column kernel (exact kernels measured there: Q6_K 6 columns
+// 140 -> 190, the rest within noise or mixed).  On by default on compute capability 7.0 only (the one measured);
+// MAYA_GLM_MV_EXACT_COLS=1 turns it on on any NVIDIA card, =0 off (A/B).  Not compiled for AMD.
+bool mvc_exact_cols() {
+#if defined(STRATA_USE_HIP)
+    return false;
+#else
+    static int cache[64];
+    int dev = 0;
+    cudaGetDevice(&dev);
+    if (dev < 0 || dev >= 64) return false;
+    if (cache[dev] == 0) {
+        int major = 0, minor = 0;
+        cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
+        cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev);
+        const char* v = getenv("MAYA_GLM_MV_EXACT_COLS");
+        const bool on = v != nullptr ? std::atoi(v) != 0 : (major == 7 && minor == 0);
+        cache[dev] = on ? 1 : 2;
+    }
+    return cache[dev] == 1;
+#endif
+}
+
 template<int T>
 void mvc_launch(const MvBatch& b, int blocks, int nc, cudaStream_t s) {
+#if !defined(STRATA_USE_HIP)
+    if ((nc == 3 || nc == 5) && mvc_exact_cols()) {
+        if (nc == 3) mvc_kernel_t<T, 3, mvc_rows(T, 4)><<<blocks, 256, 0, s>>>(b);
+        else mvc_kernel_t<T, 5, mvc_rows(T, 8)><<<blocks, 256, 0, s>>>(b);
+        return;
+    }
+#endif
     if (nc <= 2) mvc_kernel_t<T, 2><<<blocks, 256, 0, s>>>(b);
     else if (nc <= 4) mvc_kernel_t<T, 4><<<blocks, 256, 0, s>>>(b);
     else if (nc <= 8) mvc_kernel_t<T, 8><<<blocks, 256, 0, s>>>(b);
