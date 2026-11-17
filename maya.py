@@ -1861,7 +1861,7 @@ def choose_family(a, prev: dict) -> str:
              "pictures from RTX 30 / A100 on); "
              f"fast with about {DS4_MEMORY_GB} GB of VRAM and RAM together{here}, with less the experts that do not "
              "fit are read from the SSD; tensor parallel across pairs of equal GPUs, a 256K context."),
-            (MM3, "new",
+            (MM3, None,
              "MiniMax's MiniMax-M3.1-Flash (428B, 23B active per token) on its own engine: Mia-AiLab's EXL3 quant at "
              f"3.5 bits (197 GB); NVIDIA {mm3_gpus()}{' on Linux and Windows (Windows: new)' if MM3_ALL_PLATFORMS else ' on Linux'}; about "
              f"{MM3_MEMORY_GB} GB of VRAM and RAM together{here}; the layers split across the GPUs, the experts that "
@@ -1869,8 +1869,8 @@ def choose_family(a, prev: dict) -> str:
              "up to a 1M context" + ("; or Maya's own GGUF quants (MiniMax-M3.1-Flash-Maya-XS ~93 GB, -Maya-S ~122 "
                                      "GB: NVIDIA from V100 on and AMD)"
                                      if any(map(mm3_gguf_published, ("gguf-xs", "gguf-s"))) else "") + "."),
-            (Q.shown("qwen", "q5_k_m", qwen_entry()["download_gb"]), "new",
-             f"{QWEN_SHOWN}: 180B, 10 of 512 experts a token; Blackfrost-AI's cybersecurity fine-tune of Qwen3.8-Flash-Next "
+            (Q.shown("qwen", "q5_k_m", qwen_entry()["download_gb"]).replace(" (CYBER-FROST)", ""), None,
+             "Qwen-3.8-Flash-Next: 180B, 10 of 512 experts a token; Blackfrost-AI's cybersecurity fine-tune of Qwen3.8-Flash-Next "
              "in peasantsmith's GGUF, on Maya's own Qwen path; NVIDIA from V100 on or AMD, Linux or Windows; all its "
              f"experts in about {qwen_entry()['memory_gb']:.0f} GB of VRAM and RAM together{here}, with less the others "
              "read from the SSD; tool calls, its three reasoning efforts, MTP drafting, up to a 256K context; text only. "
@@ -8069,7 +8069,7 @@ def choose_qwen_quant(a, prev: dict) -> str:
     rows = []
     for q in QWEN_QUANTS:
         m = qwen_entry(q)
-        rows.append((Q.shown("qwen", q, m["download_gb"]), "new" if q == QWEN_UD else None,
+        rows.append((Q.shown("qwen", q, m["download_gb"]), None,
                      "Qwen3.8-Flash-Next itself in unsloth's UD-IQ2_XS GGUF (its n-gram table from Maya's repo, its MTP "
                      f"head, the experts in about {m['memory_gb']:.0f} GB of VRAM and RAM together)" if q == QWEN_UD else
                      "Blackfrost-AI's cybersecurity fine-tune in peasantsmith's GGUF (Q5_K experts, all of them in about "
