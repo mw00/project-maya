@@ -74,7 +74,7 @@ class Names(unittest.TestCase):
         self.assertEqual(rows[1][0], "GLM-5.3 (744B)")    # (its own row, after GLM-5.3-Flash)
         self.assertIn("text only", rows[1][2])
         (label, note, about) = rows[4]
-        self.assertEqual(label, "Qwen-3.8-Flash-Next · Q5_K_M (113 GB)")
+        self.assertEqual(label, "Qwen-3.8-Flash-Next")
         self.assertIsNone(note)
         self.assertIsNone(rows[3][1])                     # (MiniMax: no "new" either)
         self.assertTrue(about.startswith("Qwen-3.8-Flash-Next: 180B"), about)
