@@ -4,6 +4,14 @@ Every release is on GitHub (Releases) with these notes; every published change m
 page's Settings › About and updates (About > Update before the redesign; from v1.0.18), or `git pull`, then `./setup.sh` (Windows: `START-MAYA.bat`) - it recompiles
 only what changed and starts; the model is not downloaded again.
 
+## v1.1.67 - 2026-11-18
+
+A correctness fix for GLM on PCs where the experts do not all fit in VRAM, and more exact wording about drafting.
+
+- **Fix: GLM could compute an expert with another expert's weights:** on a PC where some of GLM's experts sit in RAM, Maya moves experts between RAM and VRAM while it writes. An expert could be moved into VRAM twice at the same moment; once both copies had left again, Maya could still look for it in a place in RAM that by then held a different expert, and used that one's weights under its name. There was no error, only answers that were slightly off, and how often it happened grew with the share of the experts kept in RAM. An expert is now in VRAM only once, and a place in RAM is never reused while anything still points at it. Who is affected: GLM (GLM-5.3-Flash and GLM-5.3) on PCs where part of the experts sit in RAM; a PC whose VRAM holds every expert is not. On an affected PC answers can differ from v1.1.66, because they are now correct. Speed is unchanged.
+- **What drafting guarantees, said exactly:** with drafting (the MTP block or a DFlash2 drafter) the model checks every drafted token, so Maya only writes tokens the model itself would pick. The docs and the setup text said "the same answers" as without drafting, which was too strong: a drafter takes VRAM, so on a PC where the experts do not all fit, other experts sit in VRAM, and answers can differ from a run without the drafter. The docs and the setup text now say this.
+- **For developers:** `MAYA_GLM_TIER_VERIFY=1` (off by default, a diagnostic) checks GLM's expert tables after every token and reports an entry that points at the wrong place. It only reports.
+
 ## v1.1.66 - 2026-11-17
 
 GLM decodes about 19% faster on an AMD APU + NVIDIA GPU pair with the same answers, two DeepSeek sizes can be installed side by side, DeepSeek's drafter experts are placed by how much they are used, and the idle sleeps are settings.
