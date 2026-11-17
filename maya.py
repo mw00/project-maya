@@ -1789,9 +1789,9 @@ def choose_draft(a, pc: dict, inst: dict) -> str:
     rows = [("the model's MTP block", "default",
              "The model's own draft block guesses the next token, which the model then checks." + mtp_where),
             (f"a DFlash2 drafter (download {DFLASH['bytes'] / 1e9:.1f} GB from Hugging Face)", None,
-             "A small drafter made for GLM-5.3-Flash drafts up to 7 tokens a round, which the model then checks: the "
-             + ("same answers either way. Not measured on a Mac: which one is faster is yours to try. " if metal else
-             "same answers, faster. Maya-L: +44% on nine GPUs and +12% on two against the MTP block, +19% on one RTX 3090. A speed "
+             "A small drafter made for GLM-5.3-Flash drafts up to 7 tokens a round, which the model then checks"
+             + (", so every token is the model's own pick. Not measured on a Mac: which one is faster is yours to try. " if metal else
+             ": every token is the model's own pick, faster. Maya-L: +44% on nine GPUs and +12% on two against the MTP block, +19% on one RTX 3090. A speed "
              "calibration then measures it against the MTP block on this PC (5-20 minutes) and keeps it only if it "
              "is faster here. ") + f"The drafter's license is {DFLASH['license']}: non-commercial use only.")]
     pick = choose("Drafting?", ["How the model drafts tokens ahead (the answers are the same either way):"], rows,
@@ -4620,7 +4620,7 @@ def speed_calibration(cfg_path: Path, why: str = "") -> bool:
     changed, and a failure is recorded so that a start does not try again by itself)."""
     cfg = read_json(cfg_path)
     if cfg.get("backend") == "metal":
-        warn("no speed calibration on Metal: MTP and DFlash2 are both exact, which is faster here is your choice "
+        warn("no speed calibration on Metal: MTP and DFlash2 both write only tokens the model checks; which is faster here is your choice "
              f"({ME} --setup --draft mtp|dflash2)")
         return False
     if config_family(cfg) == "qwen":                   # (CYBER-FROST: its MTP drafter or none)
@@ -4718,7 +4718,7 @@ def speed_calibration_g53(cfg_path: Path, cfg: dict, why: str = "") -> bool:
     off, on = g53_with_drafting(cfg, False), g53_with_drafting(cfg, True)
     say()
     say("  Speed calibration: drafting with the MTP block on this GPU, or not?" + (f" ({why})" if why else ""))
-    say("  Drafting writes the same answers; whether it is faster depends on how much of the model the GPU holds.")
+    say("  The model checks every drafted token; whether drafting is faster depends on how much of the model the GPU holds.")
     say(f"  Maya loads the model twice (no drafting, then drafting); each time it writes about "
         f"{G53_DRAFT_PROBE['tokens']} tokens of")
     say("  short answers (code, an explanation, plain text, thinking) after a warm-up, and the speeds are compared.")
@@ -5938,7 +5938,7 @@ def set_up(a, prev: dict) -> Path | None:
     if not metal:                                      # (the Mac engine does not project a direction)
         ablate_step(cfg_path, "glm-dsa" if dsa else "glm", models)
     if dflash is not None and metal:                   # (the speed calibration is CUDA's: on a Mac the choice is yours)
-        ok("DFlash2 drafts on this Mac, not measured against the MTP block (both are exact): "
+        ok("DFlash2 drafts on this Mac, not measured against the MTP block (the model checks both): "
            f"{ME} --setup --draft mtp goes back")
     elif dflash is not None:                           # DFlash2: kept only if it makes THIS PC faster (measured)
         how = drafting_choice(a, "DFlash2", "5-20")
@@ -7980,7 +7980,7 @@ def qwen_draft_calibration(cfg_path: Path) -> bool | None:
             del args[i:i + 2]
     args += ["--mtp", str(mtp)]
     say()
-    say("  Measuring the MTP drafter on this PC: the same answer written with and without it (the model loads twice,")
+    say("  Measuring the MTP drafter on this PC: one answer written with and without it (the model loads twice,")
     say("  a few minutes) ...")
     with open(ROOT / "maya-mtp-calibration.log", "w", encoding="utf-8") as log:
         off = qwen_decode_rate(dict(cfg, args=args), ids, ["--mtp-max-t", "1"], log)

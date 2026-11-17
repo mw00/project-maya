@@ -291,7 +291,7 @@ class InTheSetup(unittest.TestCase):
         with patch.object(maya, "choose", side_effect=lambda q, intro, rows, d, y: shown.extend(rows) or 0):
             maya.choose_draft(args, {"backend": "cuda", "archs": [86]}, {})
         text = shown[1][2]
-        self.assertIn("the same answers, faster", text)
+        self.assertIn("every token is the model's own pick, faster", text)
         self.assertIn("speed calibration", text)
         self.assertNotIn("measure yours", text)
 
