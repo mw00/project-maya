@@ -4004,9 +4004,9 @@ def write_config(a, pc, meta, pack: Path, quant: str, ctx: int, models: Path, vi
         cfg["args"] += ["--expert-profile", str(PROFILE)]
     if cfg_path.exists():
         old = old_cfg.get("args") or []
-        # (GLM-5.3 without KV streaming: an older config's --kv-streaming on / --kv-resident is not kept - with them a
-        #  context above the window does not start)
-        kv_kept = () if dsa and not G53.KV_STREAMING else ("--kv-streaming", "--kv-resident")
+        # (GLM-5.3: KV streaming is opt-in - a config that has --kv-streaming on / --kv-resident, set by hand or on the
+        #  Models page, keeps them (G53.kv_streaming_taken); with that gate closed they are not kept)
+        kv_kept = () if dsa and not G53.kv_streaming_taken() else ("--kv-streaming", "--kv-resident")
         kept = keep_args(old, cfg["args"],
                          ("--expert-cache", "--vram-reserve-mib", "--vram-reserve-later-mib", "--prefill",
                           "--parallel", "--expert-profile-save", "--expert-profile-save-every") + kv_kept)
