@@ -4,6 +4,17 @@ Every release is on GitHub (Releases) with these notes; every published change m
 page's Settings › About and updates (About > Update before the redesign; from v1.0.18), or `git pull`, then `./setup.sh` (Windows: `START-MAYA.bat`) - it recompiles
 only what changed and starts; the model is not downloaded again.
 
+## v1.1.66 - 2026-11-17
+
+GLM decodes about 20% faster on an AMD APU + NVIDIA GPU pair with the same answers, two DeepSeek sizes can be installed side by side, DeepSeek's drafter experts are placed by how much they are used, and the idle sleeps are settings.
+
+- **Faster GLM decode on the AMD APU + NVIDIA GPU pair:** about +20% decode with a Tesla V100 beside the APU, measured as an A/B on the same PC (GLM-5.3-Flash Maya-S). The NVIDIA card reads each weight once per layer instead of twice while it checks drafted tokens, and the pair exchanges a whole layer of that check in one call instead of one call per token. Maya times both ways on your PC during the first answers and keeps the faster one. Every answer is bit for bit the same as before.
+- **Fix: two DeepSeek sizes side by side:** setting up a second DeepSeek size (for example Maya-S beside Maya-XS) replaced the first one's config, so the Models page showed only one of them and listed the other's files under "Files no model uses". Each size now gets its own config and both stay on the Models page. If you already hit this: after updating, click Download once on the missing size - Maya finds its files complete, downloads nothing again and only writes its config.
+- **DeepSeek: the drafter's experts count in the expert profile (#501, @noonghunna):** experts used by DeepSeek's drafter were never counted, so they were placed wherever room was left, and VRAM could stay unused on a second GPU. They are now counted like all the others. The profile fills in as you use the model: once a start uses the new profile, which experts sit in VRAM can change, and with that DeepSeek's answers can differ slightly from v1.1.65.
+- **Idle CPU use: the idle sleeps are settings (#951, @vbooka1):** how long an idle engine sleeps between looks for work can now be set at run time: `MAYA_GLM_SERVICE_NAP_US` and `MAYA_GLM_SERVICE_SLEEP_MS` for GLM, `MAYA_DS4_SERVICE_NAP_US` and `MAYA_DS4_SERVICE_SLEEP_MS` for DeepSeek. Longer sleeps lower the CPU use of a waiting server; the first token after a pause can wait up to one sleep. The defaults are the lengths used so far, so nothing changes unless you set one (docs/SETTINGS.md).
+- **Finding a GLM prompt fault on many GPUs (#1004, @GravelRashNZ):** when a GPU fault stops GLM while it reads a prompt, the error now names the GPU and the layer. `MAYA_GLM_PREFILL_CHECK=1` (off by default, a diagnostic that slows prompts down) also names the step that failed. It only reports.
+- **README:** speed rows from community reports (#978 thanks @wairentiun, #997 thanks @atollerus-tm, #999 thanks @kai-r, #1005 thanks @Andrey0710), in all four languages.
+
 ## v1.1.65 - 2026-11-16
 
 A stability release: fixes for start-up and loading failures on AMD and Windows, a steadier AMD + NVIDIA pairing, clearer errors when the engine fails, and a test suite where a red test always means something.
