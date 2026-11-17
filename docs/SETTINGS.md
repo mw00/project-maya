@@ -1009,7 +1009,10 @@ Two costs of a turn in a long conversation that are not the model's work:
 `MAYA_TURN_TRACE=1` (server) and `DS4_TURN_TRACE=1` (engine) print one line a request with its clock marks (prompt
 preparation, first token, the engine's run; read them with one request at a time - with `--parallel` the server's
 marks of several requests mix), and `DS4_RUN_POLL_MS` sets how often the engine looks whether the GPUs are
-done with a prompt run (50 ms, the progress line keeps its 50 ms).
+done with a prompt run (50 ms, the progress line keeps its 50 ms). `DS4_HC_MIX_ROWS=1` computes a prompt chunk's
+hyper-connection mixes in one kernel - blocks of 1-4 tokens, each token's sums in the decode path's `hc_mix` order -
+instead of an F32 GEMM whose 24 x 16,384 shape keeps a few workgroups busy (about 0.7-0.9 ms a call at 129-513 rows,
+twice a layer on every GPU).
 
 | Setting | Default | |
 | --- | --- | --- |
@@ -1019,6 +1022,7 @@ done with a prompt run (50 ms, the progress line keeps its 50 ms).
 | `MAYA_TURN_TRACE` | off | `1`: a line a request with the server's clock marks |
 | `DS4_TURN_TRACE` | off | `1`: a line a request with the engine's clock marks |
 | `DS4_RUN_POLL_MS` | 50 | 1-50: how often the engine looks whether a prompt run's GPUs are done |
+| `DS4_HC_MIX_ROWS` | off | `1`: a prompt chunk's mHC mixes in one kernel, not cuBLAS SGEMM (the decode path's arithmetic; not bit for bit with the GEMM) |
 
 ## DeepSeek: choosing the drafter GPU group (experimental)
 

@@ -115,6 +115,9 @@ void project_out(float* y, const float* r, float scale, int dim, int T, cudaStre
 /// A chunk's hc_mix: the dots of each row with the n_mix weights already in mixes (a GEMM's, rows 32 apart), times
 /// rsqrt(mean(h_row^2) + eps) - hc_mix's value up to the dots' summation order.
 void hc_mix_scale(const float* h, int hcdim, int n_mix, int T, float eps, float* mixes, cudaStream_t s);
+/// (DS4_HC_MIX_ROWS) a chunk's hc_mix in one launch, a block a token (its row of h read once for its mixes): hc_mix's
+/// bits, rows 32 apart.  false: not this shape (n_mix 24 only) - the caller's GEMM path then
+bool hc_mix_rows(const float* h, const float* fn, int hcdim, int n_mix, int T, float eps, float* mixes, cudaStream_t s);
 
 /// y[t][r] = alpha * sum_k W[r][k] x[t][k], W F16 bits [n][k] (the indexer's weights_proj).
 void gemv_f16(const uint16_t* W, const float* x, int n, int k, int T, float alpha, float* y, cudaStream_t s);
