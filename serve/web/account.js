@@ -10,6 +10,7 @@ import {Icon, MayaMark, Menu, MenuItem, MenuSep, Seg} from "./ui.js";
 // ------------------------------------------------------------------ who this page is
 function setMe(me) {
   S.me = {users: !!me.users, available: !!me.available, user: me.user || null};
+  S.meKnown = true;
   store.set("me", S.me);                           // (a name and a role, never a key: the page opens as it was)
   emit();
 }
@@ -33,6 +34,7 @@ export async function loadMe() {
     if (was.users && was.user && me.users && !me.user) location.reload();
   } catch (e) {
     setTimeout(loadMe, 2000);                      // (the server is starting: it says who we are when it is up)
+    if (!S.meKnown) { S.meKnown = true; emit(); }  // (a first visit: the page meanwhile, with its "Connecting…")
   }
   return S.me;
 }

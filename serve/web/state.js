@@ -19,6 +19,8 @@ export const S = {
   // GET /auth/me (account.js): whether the server has users, and who this page is ({id, name, role, via}, or null: the
   // sign-in is shown).  The last answer is kept, so the page opens as it was: signed in, or on the sign-in
   me: store.get("me", {users: false, available: false, user: null}),
+  // a browser's first visit: nothing is drawn until the server said whether it has users (no page before the sign-in)
+  meKnown: store.get("me", null) !== null,
 
   // the view
   view: "chat",             // "chat", "monitor" or "models"

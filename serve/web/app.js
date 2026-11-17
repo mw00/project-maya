@@ -29,6 +29,7 @@ function App() {
   });
   // a server with users, and nobody signed in on this browser: the sign-in, nothing else (account.js)
   if (needsSignIn()) return html`<${Login}/><${Toasts}/>`;
+  if (!S.meKnown) return html`<${Toasts}/>`;       // (a first visit: a moment, until the server said who may come in)
   if (S.view === "models" && !isAdmin()) S.view = "chat";   // (the Models page: an admin's)
   const page = S.view === "monitor" ? html`<${MonitorPage}/>` : S.view === "models" ? html`<${ModelsPage}/>` : html`<${ChatPage}/>`;
   return html`<div class=${`shell${S.sideOpen && !phone ? "" : " shell--closed"}`}>
