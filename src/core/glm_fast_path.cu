@@ -5362,6 +5362,24 @@ void Glm5Model::fast_service() {
                 if (++F->usage[(size_t) key] >= (1u << 30))
                     for (auto& u : F->usage) u >>= 1;
                 const bool resident = (((miss | fetch | cpu | skip) >> i) & 1u) == 0;
+                if (!F->tv_stale.empty()) {   // MAYA_GLM_TIER_VERIFY (debug): did this route read a stale RAM entry?
+                    if ((miss >> i) & 1u) F->tv_taint[(size_t) key] = 0;   // (read from disk again: its own bytes)
+                    const int ss = F->tv_stale[(size_t) key];
+                    if (ss >= 0 && (((fetch | cpu) >> i) & 1u)) {
+                        // a slot freed and not written since still has this expert's bytes; any other holds another's
+                        if (ss < R.n && R.st[(size_t) ss] == FastState::kRFree) {
+                            F->tv_use_same.fetch_add(1, std::memory_order_relaxed);
+                        } else {
+                            F->tv_use_wrong.fetch_add(1, std::memory_order_relaxed);
+                            if ((promo >> i) & 1u) {
+                                F->tv_taint[(size_t) key] = 1;
+                                F->tv_promo_wrong.fetch_add(1, std::memory_order_relaxed);
+                            }
+                        }
+                    } else if (resident && F->tv_taint[(size_t) key] != 0) {
+                        F->tv_taint_use.fetch_add(1, std::memory_order_relaxed);
+                    }
+                }
                 if (resident) {
                     const int s = F->slot_of[(size_t) key];
                     if (s >= 0) P.tick[(size_t) s] = F->clock;
@@ -6465,6 +6483,118 @@ bool Glm5Model::fast_boundary(std::string& err) {
                      (unsigned long long) F->bnd_seq, (unsigned long long) hs, (unsigned long long) hr,
                      (unsigned long long) hc, (unsigned long long) hv, (unsigned long long) ho, F->bg.size(),
                      F->draining.size(), (unsigned long long) F->helper_swaps);
+    }
+    // MAYA_GLM_TIER_VERIFY=1 (debug, off by default): the tables as the next token's routes find them, the device's
+    // read back (the flush above ended with the stream idle) and checked against the host's - glm_fast_state.hpp
+    static const bool tier_verify = [] {
+        const char* v = getenv("MAYA_GLM_TIER_VERIFY");
+        return v != nullptr && std::atoi(v) != 0;
+    }();
+    if (tier_verify && ok) {
+        const size_t N = (size_t) F->n_keys;
+        const int NE = g.n_expert;
+        if (F->tv_tab.empty()) {
+            F->tv_tab.assign(2 * N, 0ull);
+            F->tv_flag.assign(N, 0);
+            F->tv_taint.assign(N, 0);
+            F->tv_rmap.resize(F->rc.size());
+            for (size_t c = 0; c < F->rc.size(); ++c)
+                for (int s = 0; s < F->rc[c].n; ++s) F->tv_rmap[c][(unsigned long long) F->rc[c].slot((size_t) s)] = s;
+            F->tv_stale.assign(N, -1);
+        }
+        if (!glmfast::cuda_ok(cudaMemcpy(F->tv_tab.data(), F->tab, 2 * N * sizeof(unsigned long long),
+                                         cudaMemcpyDeviceToHost), "glm tier verify", err))
+            return false;
+        ++F->tv_n;
+        int stale_now = 0, dup_now = 0, split_now = 0, vbad_now = 0;
+        bool news = false;
+        std::vector<int> first((size_t) NE);
+        std::vector<uint8_t> two((size_t) NE);
+        const auto flag = [&](size_t k, uint8_t bit, bool on, uint64_t& total) {
+            const bool was = (F->tv_flag[k] & bit) != 0;
+            if (on) F->tv_flag[k] |= bit;
+            else F->tv_flag[k] &= (uint8_t) ~bit;
+            if (on && !was) ++total;
+            return on && !was && F->tv_lines < 200;
+        };
+        for (int il = l0_; il < lt_; ++il) {
+            if (!F->L[(size_t) il].moe || F->layer_rc[(size_t) il] < 0) continue;
+            const auto& P = F->lp[(size_t) il];
+            const size_t c = (size_t) F->layer_rc[(size_t) il];
+            const auto& R = F->rc[c];
+            two.assign((size_t) NE, 0);
+            first.assign((size_t) NE, -1);
+            for (int s = 0; s < P.n; ++s) {
+                if (P.st[(size_t) s] != FastState::kResident || P.key[(size_t) s] < 0 || P.key[(size_t) s] >= NE) continue;
+                const int e = P.key[(size_t) s];
+                if (first[(size_t) e] < 0) {
+                    first[(size_t) e] = s;
+                    continue;
+                }
+                two[(size_t) e] = 1;
+                if (flag((size_t) il * NE + e, 1, true, F->tv_dup_new)) {
+                    ++F->tv_lines;
+                    news = true;
+                    std::fprintf(stderr, "glm tier verify CUDA%d boundary %llu: TWO SLOTS layer %d expert %d: VRAM slots %d "
+                                         "and %d (the host's table: %d)\n", dev_, (unsigned long long) F->bnd_seq, il, e,
+                                 first[(size_t) e], s, F->slot_of[(size_t) il * NE + e]);
+                }
+            }
+            for (int e = 0; e < NE; ++e) {
+                const size_t k = (size_t) il * NE + e;
+                if (two[(size_t) e] == 0) flag(k, 1, false, F->tv_dup_new);
+                dup_now += two[(size_t) e];
+                const unsigned long long v = F->tv_tab[k], r = F->tv_tab[N + k];
+                bool vbad = false;
+                if (v != 0ull) {
+                    const int s = P.slot_index(v);
+                    vbad = s < 0 || !(P.st[(size_t) s] == FastState::kDraining ||
+                                      (P.st[(size_t) s] == FastState::kResident && P.key[(size_t) s] == e));
+                }
+                vbad_now += vbad;
+                if (flag(k, 4, vbad, F->tv_vbad_new)) {
+                    ++F->tv_lines;
+                    news = true;
+                    std::fprintf(stderr, "glm tier verify CUDA%d boundary %llu: VRAM ENTRY layer %d expert %d: points at "
+                                         "slot %d, which does not hold it\n", dev_, (unsigned long long) F->bnd_seq, il, e,
+                                 P.slot_index(v));
+                }
+                int stale = -1;
+                bool split = false;
+                if (r != 0ull) {
+                    const auto it = F->tv_rmap[c].find(r);
+                    const int s = it == F->tv_rmap[c].end() ? R.n : it->second;
+                    if (s >= R.n || R.key[(size_t) s] != (int) k || R.st[(size_t) s] == FastState::kRFree) stale = s;
+                    else split = F->ram_of[k] != s;
+                }
+                split_now += split;
+                if (flag(k, 2, split, F->tv_split_new)) news = true;
+                if (stale >= 0) {
+                    ++stale_now;
+                    if (F->tv_stale[k] < 0) {
+                        ++F->tv_stale_new;
+                        news = true;
+                        if (F->tv_lines++ < 200) {
+                            const int held = stale < R.n ? R.key[(size_t) stale] : -1;
+                            std::fprintf(stderr, "glm tier verify CUDA%d boundary %llu: STALE layer %d expert %d: the device's "
+                                                 "RAM entry points at slot %d, which holds key %d (state %d; the host's "
+                                                 "table: %d)\n", dev_, (unsigned long long) F->bnd_seq, il, e, stale, held,
+                                         stale < R.n ? (int) R.st[(size_t) stale] : -1, F->ram_of[k]);
+                        }
+                    }
+                }
+                F->tv_stale[k] = stale;
+            }
+        }
+        if (news || F->tv_n % 64 == 0)
+            std::fprintf(stderr, "glm tier verify CUDA%d: %llu boundaries | stale RAM entries %llu (now %d) | experts in two "
+                                 "VRAM slots %llu (now %d) | entry-host splits %llu (now %d) | VRAM entries off %llu (now %d) "
+                                 "| routes through a stale entry: %llu same bytes, %llu another expert's (%llu promoted) | "
+                                 "routes on such a promoted copy %llu\n", dev_, (unsigned long long) F->tv_n,
+                         (unsigned long long) F->tv_stale_new, stale_now, (unsigned long long) F->tv_dup_new, dup_now,
+                         (unsigned long long) F->tv_split_new, split_now, (unsigned long long) F->tv_vbad_new, vbad_now,
+                         (unsigned long long) F->tv_use_same.load(), (unsigned long long) F->tv_use_wrong.load(),
+                         (unsigned long long) F->tv_promo_wrong.load(), (unsigned long long) F->tv_taint_use.load());
     }
     F->check_resident(l0_, lt_, g.n_expert);   // (the tables as the next token's routes find them)
     static const bool diag = getenv("MAYA_GLM_TIER_DIAG") != nullptr;
