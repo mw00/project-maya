@@ -6072,6 +6072,13 @@ bool Glm5Model::fast_boundary(std::string& err) {
                 if (key >= 0 && (ro == s || ro < 0)) {
                     upd(F->rtab_key(key), 0ull);
                     if (ro == s) F->ram_of[(size_t) key] = -1;
+                } else if (key >= 0) {
+                    // the expert's copy is another RAM slot (ro): the device's entry may still be THIS slot, which is
+                    // free from here on - the next expert written into it would be read as this one.  The entry goes to
+                    // the other slot where that one is live, else it is cleared (its own landing sets it)
+                    const char rst = R.st[(size_t) ro];
+                    upd(F->rtab_key(key), rst == FastState::kRHold || rst == FastState::kRPin
+                                              ? (unsigned long long) (R.slot((size_t) ro)) : 0ull);
                 }
                 R.key[(size_t) s] = -1;
                 R.st[(size_t) s] = FastState::kRFree;
@@ -6271,7 +6278,23 @@ bool Glm5Model::fast_boundary(std::string& err) {
             }
             auto& P = F->lp[(size_t) m.il];
             auto& R = F->rc[(size_t) m.rclass];
-            if (m.up) {
+            if (m.up && F->slot_of[(size_t) m.key] >= 0 && F->slot_of[(size_t) m.key] != m.vslot) {
+                // a route fetched the expert from its RAM slot and kept it in a spare while this copy was on its way:
+                // that slot is the resident one (the device's table says so) and this one is free again.  Taking this
+                // one too left the expert in two slots under one key - evicted one after the other, each took the
+                // table's entry with it and each left a RAM copy, and the RAM slot freed first was still the entry
+                // the device read: the next expert written there was then computed under this one's name
+                if (P.st[(size_t) m.vslot] == FastState::kLanding) {
+                    P.st[(size_t) m.vslot] = FastState::kFree;
+                    P.key[(size_t) m.vslot] = -1;
+                }
+                if (R.st[(size_t) m.rslot] == FastState::kRPin) {
+                    R.st[(size_t) m.rslot] = FastState::kRFree;
+                    R.key[(size_t) m.rslot] = -1;
+                }
+                if (F->ram_of[(size_t) m.key] == m.rslot) F->ram_of[(size_t) m.key] = -1;
+                upd(F->rtab_key((size_t) m.key), 0ull);
+            } else if (m.up) {
                 P.st[(size_t) m.vslot] = FastState::kResident;
                 P.key[(size_t) m.vslot] = m.key % NE;
                 P.tick[(size_t) m.vslot] = F->clock;
