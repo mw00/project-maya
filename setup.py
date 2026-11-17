@@ -595,6 +595,18 @@ def check_shards(shards):
                  "delete it and run setup again (or copy the whole file into --gguf-dir)")
 
 
+def long_path(p: Path) -> Path:
+    """p in Windows' extended form (two backslashes, a question mark, a backslash, then the drive), which a path longer
+    than 260 characters needs; p itself on other systems."""
+    if os.name != "nt":
+        return p
+    s = os.path.abspath(str(p))
+    ext = "\\\\?\\"
+    if s.startswith(ext):
+        return Path(s)
+    return Path(ext + "UNC" + s[1:] if s.startswith("\\\\") else ext + s)
+
+
 def get_llama_cpp():
     """llama.cpp at the pinned commit (ggml for the build, gguf-py for the tools, mtmd for images), as a zip: no git."""
     llama = ROOT / "third_party" / "llama.cpp"
@@ -605,7 +617,11 @@ def get_llama_cpp():
              f"check out llama.cpp {LLAMA_CPP_COMMIT[:7]} there, or move the folder away")
     z = ROOT / "third_party" / f"llama.cpp-{LLAMA_CPP_COMMIT[:7]}.zip"
     download(LLAMA_CPP_ZIP, z, "llama.cpp source")
-    tmp = ROOT / "third_party" / "_unpack"
+    # Windows: llama.cpp's longest file name is 161 characters, and under third_party/_unpack/llama.cpp-<40 hex>/ the
+    # whole path passes Windows' 260 from a folder as short as a 6-letter user's project-maya (FileNotFoundError in the
+    # middle of the unpack).  The unpack, its move and its clean-up use Windows' extended form, which has no such limit.
+    tmp = long_path(ROOT / "third_party" / "_unpack")
+    llama_to = long_path(llama)
     shutil.rmtree(tmp, ignore_errors=True)
     try:
         with zipfile.ZipFile(z) as f:
@@ -615,18 +631,18 @@ def get_llama_cpp():
         z.with_name(z.name + ".done").unlink(missing_ok=True)
         fail(f"{z.name} is damaged (the download was cut short)", "run the setup again: it downloads it anew")
     top = next(tmp.iterdir())
-    shutil.rmtree(llama, ignore_errors=True)
+    shutil.rmtree(llama_to, ignore_errors=True)
     # PR #63: on Windows a rename can fail with PermissionError while an antivirus scanner still holds a file of the
     # fresh unpack; shutil.move falls back to copy-and-delete, and a few retries let the scanner finish.  The target
     # is `llama` itself - moving into its parent would keep the zip's `llama.cpp-<sha>` folder name.
     for attempt in range(5):
         try:
-            shutil.move(str(top), str(llama))
+            shutil.move(str(top), str(llama_to))
             break
         except PermissionError:
             if attempt == 4:
                 raise
-            shutil.rmtree(llama, ignore_errors=True)   # a partial copy from the failed attempt
+            shutil.rmtree(llama_to, ignore_errors=True)   # a partial copy from the failed attempt
             time.sleep(2)
     shutil.rmtree(tmp, ignore_errors=True)
     z.unlink(missing_ok=True)
