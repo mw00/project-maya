@@ -6699,6 +6699,20 @@ struct Model::Impl {
         }();
         return r;
     }
+    // DS4_PROMPT_LIGHT_SMALL=<r> (opt-in; with DS4_PROMPT_LIGHT): a chunk of at most DS4_PROMPT_LIGHT_SMALL_MAX
+    // (1024) tokens takes the light cut r - its experts of more than r rows copied to the members, not computed on
+    // the helper (in a small read the helper is the expert stage's critical path; in a large one the copies are)
+    static int prompt_light_for(int T) {
+        static const int r = [] {
+            const char* v = ds4_env("DS4_PROMPT_LIGHT_SMALL");
+            return v != nullptr ? std::max(0, std::atoi(v)) : 0;
+        }();
+        static const int n = [] {
+            const char* v = ds4_env("DS4_PROMPT_LIGHT_SMALL_MAX");
+            return v != nullptr ? std::max(1, std::atoi(v)) : 1024;
+        }();
+        return r > 0 && T <= n ? std::min(r, prompt_light()) : prompt_light();
+    }
     static int light_cap() {
         static const int n = [] {
             const char* v = ds4_env("DS4_PROMPT_LIGHT_CAP");
@@ -18354,7 +18368,7 @@ struct Model::Impl {
         std::vector<char> lmask;
         std::vector<int> lv;   // their virtual slots, in slot order
         if (light_ok(L0) && S.skips(wp.k) && !S.spec(wp.k) && !xsum) {
-            const int R = prompt_light(), cap = light_cap();
+            const int R = prompt_light_for(T), cap = light_cap();
             int rows = 0;
             for (size_t j = 0; j < L0.host_list.size(); ++j) {
                 const int v = L0.pv_n + (int) j, n = b[(size_t) v + 1] - b[(size_t) v];
