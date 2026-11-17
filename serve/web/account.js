@@ -120,7 +120,9 @@ export function accountPages() {
   const me = S.me, u = me.user;
   if (!me.available) return [];                    // (a server that keeps no users: nothing to show)
   const pages = [];
-  if (u && u.id != null) pages.push({id: "account", label: "Your account", icon: "user"}, {id: "keys", label: "API keys", icon: "key"});
+  // (a page let in by the server's own key has no user: it can sign out, to sign in by name and have keys of its own)
+  if (me.users && u) pages.push({id: "account", label: "Your account", icon: "user"});
+  if (u && u.id != null) pages.push({id: "keys", label: "API keys", icon: "key"});
   if (isAdmin()) pages.push({id: "users", label: "Users", icon: "users"});
   return pages;
 }
@@ -147,14 +149,17 @@ export function AccountPage({ui: {Head, Group, Row}}) {
   const out = async () => {
     if (await confirmDialog("Sign out?", "<p>This browser forgets who you are. Your chats stay in this browser, and your API keys keep working.</p>", "Sign out")) signOut();
   };
+  const named = u.id != null;                      // (not the server's own key: a user, with a password and keys)
   return html`<${Head} title="Your account" intro="Who you are on this server."/>
     <${Group}>
-      <${Row} label=${u.name} sub=${u.role === "admin" ? "An admin: everything, including the models, the server's settings and the users."
-                                                      : "A standard user: the chat, the APIs and your own API keys. The models and the server's settings are an admin's."}>
+      <${Row} label=${named ? u.name : "Server API key"}
+              sub=${!named ? "This page uses the key in the server's config: an admin's, and nobody's by name. Sign out, then sign in with your name to make API keys of your own."
+                    : u.role === "admin" ? "An admin: everything, including the models, the server's settings and the users."
+                    : "A standard user: the chat, the APIs and your own API keys. The models and the server's settings are an admin's."}>
         <${RoleBadge} role=${u.role}/><//>
       <${Row} label="Sign out" sub=${u.via === "session" ? "On this browser only." : "This page is let in by an API key: it forgets the key."}>
         <button type="button" class="btn btn--secondary btn--sm" onClick=${out}><${Icon} name="log-out" sm/>Sign out</button><//><//>
-    <${Group} cap="Change your password"><form class="set-block" onSubmit=${save}>
+    ${!named ? null : html`<${Group} cap="Change your password"><form class="set-block" onSubmit=${save}>
       <input type="text" name="username" autocomplete="username" value=${u.name} hidden readonly/>
       <label class="field"><span class="field__label">Current password</span>
         <input class="input acct__pw" type="password" autocomplete="current-password" value=${cur} onInput=${(e) => setCur(e.target.value)}/></label>
@@ -166,7 +171,7 @@ export function AccountPage({ui: {Head, Group, Row}}) {
       </div>
       <span class="set-row__sub" role=${bad ? "alert" : undefined}>${bad || PW_NOTE}</span>
       <div><button type="submit" class="btn btn--primary btn--sm" disabled=${busy || !cur || pw.length < 8 || pw !== again}>Change password</button></div>
-    </form><//>`;
+    </form><//>`}`;
 }
 
 // ------------------------------------------------------------------ API keys

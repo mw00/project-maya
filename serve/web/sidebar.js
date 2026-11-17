@@ -271,7 +271,7 @@ function StatusCard() {
   const u = S.me.users && S.me.user;               // (a server with users: who is signed in, and the way to the account)
   return html`<div class="side__foot">
     ${u ? html`<button type="button" class="nav-item side__me" title=${u.id != null ? "Your account" : "This page uses the server's own API key"}
-        onClick=${() => openSettings(u.id != null ? "account" : "users")}>
+        onClick=${() => openSettings("account")}>
       <${Icon} name="user"/><span>${u.name || "Server API key"}</span>
       ${u.role === "admin" ? html`<i class="badge badge--accent">Admin</i>` : null}</button>` : null}
     <${SavedLine}/>
