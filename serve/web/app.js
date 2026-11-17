@@ -120,7 +120,7 @@ route();
 whenHealth(() => updateCtxMeter());
 whenSignedOut(recheckMe);
 // who this page is, first (a server with users: the sign-in until someone is; signing in loads the page again)
-loadMe().then(() => loadChats()).then(() => { if (S.view === "chat" && !S.settings && !needsSignIn()) focusInput(); return loadHealth(); }).then(() => {
+loadMe().then(() => (needsSignIn() ? null : loadChats())).then(() => { if (S.view === "chat" && !S.settings && !needsSignIn()) focusInput(); return loadHealth(); }).then(() => {
   if (needsSignIn()) return;                       // (nothing more to ask until signed in)
   loadMcp().then(() => {
     loadTurbo();                                   // (the Turbo button: on or off)

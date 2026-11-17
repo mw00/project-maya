@@ -3,7 +3,7 @@
 import {html, useEffect, useLayoutEffect, useMemo, useRef, useState} from "./preact.js";
 import {MOD, SUPPORT_URL, api, ctxfmt, dayGroup, fmt, isPhone, modelName, relTime, store} from "./lib.js";
 import {S, confirmDialog, emit, isAdmin, toast} from "./state.js";
-import {chatInstructions, chatTitle, deleteChat, exportChat, moveToFolder, newChat, newFolder, openChat, pinChat,
+import {ACCOUNT, chatInstructions, chatTitle, deleteChat, exportChat, moveToFolder, newChat, newFolder, openChat, pinChat,
         renameChat, renameFolder, deleteFolder, toggleFolder} from "./chats.js";
 import {Icon, Kbd, MayaMark, Menu, MenuItem, MenuLabel, MenuSep, ModelLogo, trapTab, useDismiss} from "./ui.js";
 
@@ -117,7 +117,7 @@ function ChatList() {
                                              : html`<div class="side__note side__note--in">Empty. Move a chat here from its ⋯ menu.</div>`) : null}`;
     })}
     ${groups.map((g) => html`<div class="side__label">${g.label}</div>${g.chats.map((c) => html`<${ChatRow} key=${c.id} c=${c}/>`)}`)}
-    ${chats.length ? null : html`<div class="side__note">Your chats appear here. They stay in this browser.</div>`}
+    ${chats.length ? null : html`<div class="side__note">${ACCOUNT ? "Your chats appear here. They are kept in your account: yours alone, on every device." : "Your chats appear here. They stay in this browser."}</div>`}
   </div>`;
 }
 

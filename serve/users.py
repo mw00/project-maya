@@ -8,6 +8,10 @@ keys; what changes the server for everyone (models, the context size, the port, 
 needs an admin.  `may()` is the one list of what a standard user may call: a route it does not name is an admin's, so
 a route added later is closed to them until it is listed.
 
+A user's chats and folders are kept here too (GET/POST /api/chats, /api/workspace): each user's own, whatever their
+role - an admin does not read another's - and the same on every device they sign in on.  The page of a server without
+users (or one let in by the config's key, which is nobody by name) keeps its chats in the browser, as before.
+
 No secret is stored: a password as scrypt with its salt, a key or a session as its SHA-256 (each is 240 random bits,
 so a fast hash is enough).  A key is shown once, when it is made.
 
@@ -27,6 +31,7 @@ import sqlite3
 import threading
 import time
 from pathlib import Path
+from urllib.parse import parse_qs
 
 FILE = "maya-users.db"
 ROLES = ("admin", "user")
@@ -65,7 +70,31 @@ CREATE TABLE IF NOT EXISTS sessions (
   user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   created REAL NOT NULL,
   expires REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS chats (
+  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  id TEXT NOT NULL,
+  updated REAL NOT NULL,
+  size INTEGER NOT NULL,
+  body TEXT NOT NULL,
+  PRIMARY KEY (user_id, id));
+CREATE TABLE IF NOT EXISTS workspaces (
+  user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+  updated REAL NOT NULL,
+  body TEXT NOT NULL);
 """
+CHAT_ID_RE = re.compile(r"[A-Za-z0-9_-]{1,64}")
+MAX_CHATS = 10000                 # a user's chats at most
+WORKSPACE_MAX = 256 << 10         # a user's folders (JSON) at most
+
+
+def chats_quota() -> int:
+    """What one user's chats may take in the users' file (their pictures and attached files are in them):
+    MAYA_CHATS_QUOTA_MIB, or 2 GiB."""
+    try:
+        mib = int(os.environ.get("MAYA_CHATS_QUOTA_MIB", "0"))
+    except ValueError:
+        mib = 0
+    return (mib if mib > 0 else 2048) << 20
 
 
 class UserError(ValueError):
@@ -96,7 +125,7 @@ class Caller:
 
 # ------------------------------------------------------------------------------------------------ what a user may call
 USER_GET = frozenset({
-    "/auth/me", "/api/keys",
+    "/auth/me", "/api/keys", "/api/chats", "/api/workspace",
     "/v1/models", "/models", "/models/sse", "/props", "/slots", "/v1/status", "/status", "/v1/strata/stream",
     "/api/tags", "/api/ps", "/api/version",
     # the page: the model's state, its defaults and what the chat shows of them (reading only).  Not /mcp: the MCP
@@ -104,6 +133,7 @@ USER_GET = frozenset({
     "/metrics", "/settings", "/api/context", "/api/thinking-budget", "/api/turbo", "/api/savings", "/api/update"})
 USER_POST = frozenset({
     "/auth/logout", "/auth/password", "/api/keys", "/api/keys/delete",
+    "/api/chats", "/api/chats/delete", "/api/workspace",
     "/v1/chat/completions", "/v1/responses", "/v1/messages", "/api/chat", "/api/generate", "/api/show",
     "/api/tokens", "/tokenize", "/detokenize", "/attach", "/pdf", "/v1/strata/cancel"})
 USER_PREFIXES = ("/v1/responses/",)     # a stored response: its owner's alone (the server checks the owner)
@@ -400,6 +430,74 @@ class UserStore:
             if not cur.rowcount:
                 raise UserError("no such key", 404)
 
+    # -------------------------------------------------------------------------------------------- chats
+    # A signed-in user's chats and folders are kept here, not in the browser: theirs alone, on every device they sign
+    # in on.  A chat is the page's own JSON (its messages, pictures and attached files), stored whole.
+    def chat_index(self, user_id) -> list[dict]:
+        with self.lock:
+            rows = self.db.execute("SELECT id, updated FROM chats WHERE user_id = ? ORDER BY updated DESC",
+                                   (user_id,)).fetchall()
+        return [{"id": r["id"], "updated": r["updated"]} for r in rows]
+
+    def chats_json(self, user_id) -> bytes:
+        """Every chat of the user as one JSON document, {"chats": [...]}: the stored texts joined, not parsed."""
+        with self.lock:
+            rows = self.db.execute("SELECT body FROM chats WHERE user_id = ? ORDER BY updated DESC",
+                                   (user_id,)).fetchall()
+        return b'{"chats":[' + b",".join(r["body"].encode() for r in rows) + b"]}"
+
+    def chat_json(self, user_id, chat_id) -> bytes | None:
+        with self.lock:
+            r = self.db.execute("SELECT body FROM chats WHERE user_id = ? AND id = ?",
+                                (user_id, str(chat_id))).fetchone()
+        return None if r is None else b'{"chat":' + r["body"].encode() + b"}"
+
+    def put_chat(self, user_id, chat: dict) -> None:
+        """Add the chat, or replace the one with its id (the last save wins)."""
+        cid, updated = chat.get("id"), chat.get("updated")
+        if not isinstance(cid, str) or not CHAT_ID_RE.fullmatch(cid):
+            raise UserError('a chat has an "id": 1 to 64 letters, digits, "_" or "-"')
+        if isinstance(updated, bool) or not isinstance(updated, (int, float)):
+            raise UserError('a chat has an "updated" time (a number)')
+        if not isinstance(chat.get("messages"), list):
+            raise UserError('a chat has "messages" (a list)')
+        # (ASCII: a text cut inside an emoji has half a pair in it, which UTF-8 cannot hold and JSON's \\ud83d can)
+        body = json.dumps(chat, separators=(",", ":"))
+        size = len(body)
+        with self._tx() as db:
+            n, used = db.execute("SELECT COUNT(*), COALESCE(SUM(size), 0) FROM chats WHERE user_id = ? AND id != ?",
+                                 (user_id, cid)).fetchone()
+            if n >= MAX_CHATS:
+                raise UserError(f"an account keeps {MAX_CHATS} chats at most: delete some first", 413)
+            if used + size > chats_quota():
+                raise UserError(f"your chats would take more than {chats_quota() >> 20} MiB on the server: delete "
+                                "some (those with pictures or videos take the most) first", 413)
+            db.execute("INSERT INTO chats (user_id, id, updated, size, body) VALUES (?, ?, ?, ?, ?) "
+                       "ON CONFLICT (user_id, id) DO UPDATE SET updated = excluded.updated, size = excluded.size, "
+                       "body = excluded.body", (user_id, cid, float(updated), size, body))
+
+    def delete_chat(self, user_id, chat_id) -> None:
+        with self._tx() as db:
+            db.execute("DELETE FROM chats WHERE user_id = ? AND id = ?", (user_id, str(chat_id)))
+
+    def clear_chats(self, user_id) -> int:
+        with self._tx() as db:
+            return db.execute("DELETE FROM chats WHERE user_id = ?", (user_id,)).rowcount
+
+    def workspace(self, user_id) -> dict | None:
+        """The user's folders as the page saved them ({"folders": [...], "folderOpen": {...}}), or None: none yet."""
+        with self.lock:
+            r = self.db.execute("SELECT body FROM workspaces WHERE user_id = ?", (user_id,)).fetchone()
+        return None if r is None else json.loads(r["body"])
+
+    def set_workspace(self, user_id, body: dict) -> None:
+        text = json.dumps(body, separators=(",", ":"))
+        if len(text) > WORKSPACE_MAX:
+            raise UserError(f"the folders take more than {WORKSPACE_MAX >> 10} KB", 413)
+        with self._tx() as db:
+            db.execute("INSERT INTO workspaces (user_id, updated, body) VALUES (?, ?, ?) ON CONFLICT (user_id) "
+                       "DO UPDATE SET updated = excluded.updated, body = excluded.body", (user_id, time.time(), text))
+
 
 def store_path(config=None, env=None) -> Path | None:
     """Where the users are kept: beside the run config, or MAYA_USERS_DB (a file; "off", "none" or "0": no users on
@@ -473,6 +571,20 @@ def handle_get(h, svc, path: str) -> None:
         store = _need_store(svc)
         if path == "/api/users":
             h._json(200, {"users": store.users()})
+        elif path == "/api/chats":
+            # the caller's own chats: all of them; ?index=1: their ids and times; ?id=: one
+            uid, q = _account(h), parse_qs(h.path.partition("?")[2])
+            if q.get("index"):
+                h._json(200, {"index": store.chat_index(uid)})
+            elif q.get("id"):
+                body = store.chat_json(uid, q["id"][0])
+                if body is None:
+                    raise UserError("no such chat", 404)
+                _send_json(h, body)
+            else:
+                _send_json(h, store.chats_json(uid))
+        elif path == "/api/workspace":
+            h._json(200, {"workspace": store.workspace(_account(h))})
         elif "all=1" in h.path.partition("?")[2]:
             if not h.caller.admin:
                 raise UserError("every user's keys are an admin's to see", 403)
@@ -487,6 +599,28 @@ def _id(value) -> int:
     if isinstance(value, bool) or not isinstance(value, int):
         raise UserError('"id" is the number of a user or a key')
     return value
+
+
+def _account(h) -> int:
+    """The signed-in user's id; the config's API key (or a server without users) is nobody: its page keeps its chats
+    in the browser."""
+    who = getattr(h, "caller", None)
+    if who is None or who.id is None:
+        raise UserError("chats are kept on the server for a signed-in user; this page keeps its own in the browser")
+    # ?as=<id>: who the page takes itself for.  Another tab signed in as someone else since (the browser's session is
+    # one for all its tabs): this page's chats are the earlier user's, and must not land in the new one's account.
+    said = parse_qs(h.path.partition("?")[2]).get("as")
+    if said and said[0] != str(who.id):
+        raise UserError("this page was opened by another user: reload it", 409)
+    return who.id
+
+
+def _send_json(h, body: bytes) -> None:
+    h.send_response(200)
+    h.send_header("Content-Type", "application/json")
+    h.send_header("Content-Length", str(len(body)))
+    h.end_headers()
+    h.wfile.write(body)
 
 
 def handle_post(h, svc, path: str) -> None:
@@ -543,6 +677,18 @@ def handle_post(h, svc, path: str) -> None:
             if who.id is not None and req.get("id") == who.id:
                 raise UserError("ask another admin: you cannot delete yourself", 409)
             store.delete_user(_id(req.get("id")))
+            h._json(200, {"ok": True})
+        elif path == "/api/chats":                       # the body: one chat, as the page keeps it
+            store.put_chat(_account(h), req)
+            h._json(200, {"ok": True})
+        elif path == "/api/chats/delete":                # {"id": ...}, or {"all": true}
+            if req.get("all") is True:
+                h._json(200, {"ok": True, "deleted": store.clear_chats(_account(h))})
+            else:
+                store.delete_chat(_account(h), req.get("id"))
+                h._json(200, {"ok": True})
+        elif path == "/api/workspace":
+            store.set_workspace(_account(h), req)
             h._json(200, {"ok": True})
         else:
             h._json(404, {"error": {"message": "not found"}})

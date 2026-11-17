@@ -6114,7 +6114,7 @@ def make_handler(svc: Service):
             if path == "/models/sse":
                 self._models_sse()
                 return
-            if path in ("/auth/me", "/api/keys", "/api/users"):
+            if path in ("/auth/me", "/api/keys", "/api/users", "/api/chats", "/api/workspace"):
                 users.handle_get(self, svc, path)               # the server's users (serve/users.py)
                 return
             if path in ("/api/tags", "/api/ps", "/api/version", "/api/catalog", "/api/pull/status"):
@@ -6353,7 +6353,8 @@ def make_handler(svc: Service):
             if not self._authorized() or self._foreign_page():
                 return
             if path.startswith("/auth/") or path in ("/api/keys", "/api/keys/delete", "/api/users",
-                                                     "/api/users/update", "/api/users/delete"):
+                                                     "/api/users/update", "/api/users/delete", "/api/chats",
+                                                     "/api/chats/delete", "/api/workspace"):
                 users.handle_post(self, svc, path)       # the server's users (serve/users.py)
                 return
             try:

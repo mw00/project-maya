@@ -13,7 +13,8 @@ import {AccountPage, KeysPage, UsersPage, accountPages} from "./account.js";
 import {usd} from "./sidebar.js";
 import {GLM_KV_BYTES, confirmContext, confirmPort, ctxEstimate, ctxHint, ctxStops, fetchReport, loadCtxInfo, loadMcp, loadPortInfo, loadShared,
         budgetError, loadThinkBudget, saveThinkBudget, loadTime, loadUpdate, saveShared, startUpdate, syncShared} from "./server.js";
-import {ablateOf, chatInstructions, clearBrowser, estimateTokens, setAblate, updateCtxMeter} from "./chats.js";
+import {ACCOUNT, ablateOf, adoptBrowserChats, browserChats, chatInstructions, clearBrowser, deleteBrowserChats, estimateTokens, setAblate,
+        updateCtxMeter} from "./chats.js";
 import {codeBlock, onCodeClick} from "./md.js";
 import {openModelSheet} from "./models.js";
 import {TurboButton} from "./turbo.js";
@@ -323,6 +324,20 @@ function Connect() {
 // ------------------------------------------------------------------ Data
 function Data() {
   const n = S.chats.length;
+  const [old, setOld] = useState(0), [busy, setBusy] = useState(false);
+  const count = () => browserChats().then((cs) => setOld(cs.length));
+  useEffect(() => { count(); }, []);
+  if (ACCOUNT) {
+    const u = S.me.user || {};
+    const move = async () => { setBusy(true); try { await adoptBrowserChats(); } finally { setBusy(false); count(); } };
+    return html`<${Head} title="Data and privacy" intro=${`Your chats, their images and attached files are kept in your account on this server (${fmt(n)} chat${n === 1 ? "" : "s"} now): yours alone, and the same on every device you sign in on. The other users do not see them, and you do not see theirs.`}/>
+      <${Group}>
+      ${old ? html`<${Row} label=${`${fmt(old)} earlier chat${old === 1 ? "" : "s"} in this browser`} sub=${`From before ${u.name || "you"} signed in: kept in this browser, where everyone who uses it could read them. Move them into your account, or delete them.`}>
+        <button type="button" class="btn btn--secondary btn--sm" disabled=${busy} onClick=${move}>${busy ? "Moving…" : "Move to my account"}</button>
+        <button type="button" class="btn btn--ghost btn--sm" disabled=${busy} onClick=${() => deleteBrowserChats().then(count)}>Delete</button><//>` : null}
+      <${Row} label="Delete my chats and settings" sub="Every chat and folder in your account, on every device, and your chat settings in this browser. Your account and your API keys stay.">
+        <button type="button" class="btn btn--danger" onClick=${clearBrowser}>Delete</button><//><//>`;
+  }
   return html`<${Head} title="Data and privacy" intro=${`Chats, images and attached files are kept in this browser only (${fmt(n)} chat${n === 1 ? "" : "s"} now). The server keeps none of them. Model files are managed on Models.`}/>
     <${Group}>
     <${Row} label="Clear chats and settings" sub="Every chat and folder, these settings and the API key in this browser. The model, its files and the server's own settings are not touched.">

@@ -3,7 +3,7 @@
 // signing out), API keys (each user's own; an admin sees everyone's) and Users (an admin's: add, role, disable, delete).
 // What a standard user may not do is hidden with state.js' isAdmin(); the server refuses it whatever the page shows.
 import {html, useEffect, useRef, useState} from "./preact.js";
-import {api, fmt, headers, relTime, store} from "./lib.js";
+import {UID, api, fmt, headers, relTime, store} from "./lib.js";
 import {S, confirmDialog, copyText, emit, isAdmin, promptDialog, toast} from "./state.js";
 import {Icon, MayaMark, Menu, MenuItem, MenuSep, Seg} from "./ui.js";
 
@@ -32,6 +32,11 @@ export async function loadMe() {
     setMe(me);
     // signed out while the page was open (the session ended, the user was disabled): start again at the sign-in
     if (was.users && was.user && me.users && !me.user) location.reload();
+    // not who this page was loaded as (lib.js' UID: whose chats and settings it shows): load it again, as them
+    else if (accountOf(me) !== UID && accountOf(store.get("me", null)) === accountOf(me)) {
+      location.reload();
+      return new Promise(() => {});                // (nothing more of this page)
+    }
   } catch (e) {
     setTimeout(loadMe, 2000);                      // (the server is starting: it says who we are when it is up)
     if (!S.meKnown) { S.meKnown = true; emit(); }  // (a first visit: the page meanwhile, with its "Connecting…")
@@ -39,6 +44,16 @@ export async function loadMe() {
   return S.me;
 }
 export const needsSignIn = () => S.me.users && !S.me.user;
+const accountOf = (me) => (me && me.users && me.user && me.user.id != null ? me.user.id : null);
+// another tab of this browser signed out, or in as someone else: this one follows (its chats are the account's)
+if (typeof globalThis.addEventListener === "function") {
+  globalThis.addEventListener("storage", (e) => {
+    if (e.key !== "maya.me" || !e.newValue) return;
+    let now;
+    try { now = accountOf(JSON.parse(e.newValue)); } catch (e2) { return; }
+    if (now !== UID) location.reload();
+  });
+}
 // the server said 401 to a page that was let in: ask again who we are (at most every few seconds)
 let asked = 0;
 export function recheckMe() {
@@ -147,7 +162,9 @@ export function AccountPage({ui: {Head, Group, Row}}) {
     setBusy(false);
   };
   const out = async () => {
-    if (await confirmDialog("Sign out?", "<p>This browser forgets who you are. Your chats stay in this browser, and your API keys keep working.</p>", "Sign out")) signOut();
+    const kept = u.id != null ? "Your chats are kept in your account: they are there when you sign in again, here or on another device. Your API keys keep working."
+                              : "The chats made on this page stay in this browser.";
+    if (await confirmDialog("Sign out?", `<p>This browser forgets who you are. ${kept}</p>`, "Sign out")) signOut();
   };
   const named = u.id != null;                      // (not the server's own key: a user, with a password and keys)
   return html`<${Head} title="Your account" intro="Who you are on this server."/>

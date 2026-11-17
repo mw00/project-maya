@@ -262,8 +262,7 @@ export function newModelCheck() {
   store.set("model", id);
   ownKeyOnce(GLM53_KEY);                          // (the 744B's own first: a switch away from it clears what it chose)
   if (!S.health.model || was === null || was === id) return false;
-  let keys = [];                                  // (every model's stored settings: "maya.sampling", "maya.sampling_<family>")
-  try { keys = Object.keys(localStorage).filter((k) => k.startsWith("maya.sampling")).map((k) => k.slice(5)); } catch (e) { /* none */ }
+  const keys = store.keys("sampling");            // (every model's stored settings: "maya.sampling", "maya.sampling_<family>")
   for (const key of new Set([prefsKey(), ...keys])) {
     const own = {...(store.get(key, {}) || {})};
     for (const k of CHOSEN) delete own[k];

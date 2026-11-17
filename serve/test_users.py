@@ -6,6 +6,7 @@ what a standard user may call, and the routes on a running server.  Against the 
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import sys
 import tempfile
@@ -520,6 +521,123 @@ class KeyedServer(Routes):
         self.assertEqual((s, j["key"]["user"]), (200, "bob"))   # ... but it makes one for a user
         self.assertEqual(self.chat("wrong")[0], 401)
         self.assertEqual(self.chat()[0], 401)
+
+
+class Chats(Routes):
+    """A signed-in user's chats and folders are kept on the server: theirs alone, on every device."""
+    CONFIG_KEY = "config-key"
+
+    @staticmethod
+    def a_chat(cid="c1", text="hello", updated=1000.0):
+        return {"id": cid, "title": text, "created": 1.0, "updated": updated,
+                "messages": [{"id": "m1", "role": "user", "text": text}]}
+
+    def test_each_users_chats_are_their_own(self):
+        admin, user, key, bob_id = self.people()
+        self.assertEqual(self.req("GET", "/api/chats", key=user), (200, {"chats": []}))
+        self.assertEqual(self.req("POST", "/api/chats", self.a_chat("c1", "bob's"), key=user)[0], 200)
+        self.assertEqual(self.req("POST", "/api/chats", self.a_chat("c1", "alice's"), key=admin)[0], 200)   # (same id)
+        self.assertEqual(self.req("POST", "/api/chats", self.a_chat("c2", "alice's other", 2000.0), key=admin)[0], 200)
+        s, j = self.req("GET", "/api/chats", key=user)
+        self.assertEqual([c["title"] for c in j["chats"]], ["bob's"])
+        s, j = self.req("GET", "/api/chats", key=admin)             # an admin too: their own, not everyone's
+        self.assertEqual([c["title"] for c in j["chats"]], ["alice's other", "alice's"])   # (the newest first)
+        self.assertEqual(self.req("GET", "/api/chats?index=1", key=admin)[1],
+                         {"index": [{"id": "c2", "updated": 2000.0}, {"id": "c1", "updated": 1000.0}]})
+        self.assertEqual(self.req("GET", "/api/chats?id=c2", key=admin)[1]["chat"]["title"], "alice's other")
+        self.assertEqual(self.req("GET", "/api/chats?id=c2", key=user)[0], 404)
+        # the user's API key is the user too
+        self.assertEqual([c["title"] for c in self.req("GET", "/api/chats", key=key)[1]["chats"]], ["bob's"])
+        # a save replaces the chat (the last one wins); a delete is the caller's own
+        self.assertEqual(self.req("POST", "/api/chats", self.a_chat("c1", "bob's, longer", 3000.0), key=user)[0], 200)
+        self.assertEqual(self.req("GET", "/api/chats", key=user)[1]["chats"][0]["title"], "bob's, longer")
+        self.assertEqual(self.req("POST", "/api/chats/delete", {"id": "c1"}, key=user)[0], 200)
+        self.assertEqual(self.req("GET", "/api/chats", key=user)[1]["chats"], [])
+        self.assertEqual(len(self.req("GET", "/api/chats", key=admin)[1]["chats"]), 2)
+        self.assertEqual(self.req("POST", "/api/chats/delete", {"all": True}, key=admin)[1]["deleted"], 2)
+        self.assertEqual(self.req("GET", "/api/chats", key=admin)[1]["chats"], [])
+
+    def test_a_chat_comes_back_as_it_was_sent(self):
+        admin, user, key, bob_id = self.people()
+        chat = self.a_chat("k9-Zx_1", "héllo 世界 \U0001F600")
+        chat["messages"].append({"id": "m2", "role": "assistant", "text": "cut inside an emoji: \ud83d",   # half a pair
+                                 "images": [{"name": "a.png", "url": "data:image/png;base64," + "A" * 4000}]})
+        self.assertEqual(self.req("POST", "/api/chats", chat, key=user)[0], 200)
+        self.assertEqual(self.req("GET", "/api/chats", key=user)[1]["chats"], [chat])
+        self.assertEqual(self.req("GET", "/api/chats?id=k9-Zx_1", key=user)[1]["chat"], chat)
+
+    def test_what_is_not_a_chat_is_refused(self):
+        admin, user, key, bob_id = self.people()
+        for bad in ({"updated": 1, "messages": []}, {"id": "a b", "updated": 1, "messages": []},
+                    {"id": "x" * 65, "updated": 1, "messages": []}, {"id": 7, "updated": 1, "messages": []},
+                    {"id": "c1", "messages": []}, {"id": "c1", "updated": "now", "messages": []},
+                    {"id": "c1", "updated": True, "messages": []}, {"id": "c1", "updated": 1}):
+            self.assertEqual(self.req("POST", "/api/chats", bad, key=user)[0], 400, bad)
+        self.assertEqual(self.req("POST", "/api/chats", [self.a_chat()], key=user)[0], 400)
+        self.assertEqual(self.req("GET", "/api/chats", key=user)[1]["chats"], [])
+        # nobody is not asked in, and the config's key is no user: its page keeps its chats in the browser
+        self.assertEqual(self.req("GET", "/api/chats")[0], 401)
+        self.assertEqual(self.req("POST", "/api/chats", self.a_chat())[0], 401)
+        self.assertEqual(self.req("GET", "/api/chats", key=self.CONFIG_KEY)[0], 400)
+        self.assertEqual(self.req("POST", "/api/chats", self.a_chat(), key=self.CONFIG_KEY)[0], 400)
+        self.assertEqual(self.req("GET", "/api/workspace", key=self.CONFIG_KEY)[0], 400)
+        # another site's page cannot write them
+        self.assertEqual(self.req("POST", "/api/chats", self.a_chat(), key=user,
+                                  headers={"Origin": "http://evil.example"})[0], 403)
+        # a page opened by one user, the browser since signed in as another: its chats are not the new one's
+        self.assertEqual(self.req("POST", f"/api/chats?as={bob_id}", self.a_chat(), key=user)[0], 200)
+        self.assertEqual(self.req("POST", f"/api/chats?as={bob_id}", self.a_chat("c2"), key=admin)[0], 409)
+        self.assertEqual(self.req("GET", f"/api/chats?as={bob_id}", key=admin)[0], 409)
+        self.assertEqual(self.req("POST", f"/api/chats/delete?as={bob_id}", {"all": True}, key=admin)[0], 409)
+        self.assertEqual(self.req("POST", f"/api/workspace?as={bob_id}", {"folders": []}, key=admin)[0], 409)
+        self.assertEqual(self.req("GET", "/api/chats", key=admin)[1]["chats"], [])
+        self.assertEqual(len(self.req("GET", f"/api/chats?as={bob_id}", key=user)[1]["chats"]), 1)
+
+    def test_an_account_has_a_size(self):
+        admin, user, key, bob_id = self.people()
+        os.environ["MAYA_CHATS_QUOTA_MIB"] = "1"
+        try:
+            big = {**self.a_chat("big", "x" * (700 << 10)), "title": "big"}
+            self.assertEqual(self.req("POST", "/api/chats", big, key=user)[0], 200)
+            s, j = self.req("POST", "/api/chats", {**big, "id": "big2"}, key=user)
+            self.assertEqual(s, 413)
+            self.assertIn("1 MiB", j["error"]["message"])
+            self.assertEqual(self.req("POST", "/api/chats", big, key=user)[0], 200)        # (itself again: replaced)
+            self.assertEqual(self.req("POST", "/api/chats", {**big, "id": "big2"}, key=admin)[0], 200)   # (alice's own room)
+        finally:
+            del os.environ["MAYA_CHATS_QUOTA_MIB"]
+
+    def test_folders(self):
+        admin, user, key, bob_id = self.people()
+        self.assertEqual(self.req("GET", "/api/workspace", key=user), (200, {"workspace": None}))
+        w = {"folders": [{"id": "f1", "name": "Work"}], "folderOpen": {"f1": True}}
+        self.assertEqual(self.req("POST", "/api/workspace", w, key=user)[0], 200)
+        self.assertEqual(self.req("GET", "/api/workspace", key=user)[1]["workspace"], w)
+        self.assertEqual(self.req("GET", "/api/workspace", key=admin)[1]["workspace"], None)
+        self.assertEqual(self.req("POST", "/api/workspace", {"folders": []}, key=user)[0], 200)
+        self.assertEqual(self.req("GET", "/api/workspace", key=user)[1]["workspace"], {"folders": []})
+        self.assertEqual(self.req("POST", "/api/workspace", {"folders": ["x" * (300 << 10)]}, key=user)[0], 413)
+
+    def test_a_deleted_user_takes_their_chats_along(self):
+        admin, user, key, bob_id = self.people()
+        self.req("POST", "/api/chats", self.a_chat(), key=user)
+        self.req("POST", "/api/workspace", {"folders": []}, key=user)
+        self.assertEqual(self.req("POST", "/api/users/delete", {"id": bob_id}, key=admin)[0], 200)
+        db = self.svc.users.db
+        self.assertEqual(db.execute("SELECT COUNT(*) FROM chats").fetchone()[0], 0)
+        self.assertEqual(db.execute("SELECT COUNT(*) FROM workspaces").fetchone()[0], 0)
+
+    def test_a_users_file_from_before_gets_the_tables(self):
+        with tempfile.TemporaryDirectory() as d:
+            con = sqlite3.connect(str(Path(d) / "u.db"))
+            con.executescript(users.SCHEMA.split("CREATE TABLE IF NOT EXISTS chats")[0])
+            con.execute("INSERT INTO users (name, password, role, created) VALUES ('old', 'x', 'admin', 0)")
+            con.commit()
+            con.close()
+            s = users.UserStore(Path(d) / "u.db")
+            s.put_chat(1, self.a_chat())
+            self.assertEqual(s.chat_index(1), [{"id": "c1", "updated": 1000.0}])
+            s.close()
 
 
 class NoStore(Routes):
