@@ -12,6 +12,8 @@
 
 #include <algorithm>
 #include <atomic>
+#include <condition_variable>
+#include <mutex>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -117,6 +119,9 @@ namespace {
 struct HelperWarm {
     std::atomic<long long> until_ns{0};
     std::atomic<int> state{0};   // 0 not started, 1 running, 2 asked to stop, 3 stopped
+    std::atomic<bool> asleep{false};
+    std::mutex mu;
+    std::condition_variable cv;
     static long long now_ns() {
         return std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::steady_clock::now().time_since_epoch()).count();
@@ -148,9 +153,10 @@ struct HelperWarm {
     }
     void touch(int device) {
         if (!wanted()) return;
-        until_ns.store(now_ns() + 20000000ll, std::memory_order_relaxed);
+        until_ns.store(now_ns() + 20000000ll);
         int s0 = 0;
         if (state.compare_exchange_strong(s0, 1)) std::thread([this, device] { run(device); }).detach();
+        else if (asleep.load()) cv.notify_one();
     }
     void run(int device) {
         namespace gf = strata::kernels::glmf;
@@ -166,7 +172,12 @@ struct HelperWarm {
         unsigned long long launches = 0;
         while (state.load(std::memory_order_relaxed) == 1) {
             if (now_ns() >= until_ns.load(std::memory_order_relaxed)) {
-                std::this_thread::sleep_for(std::chrono::microseconds(200));
+                // (nothing to keep warm: asleep until the next window call - no polling beside a prompt's work)
+                std::unique_lock<std::mutex> lk(mu);
+                asleep.store(true);
+                // (a call that came in between sees asleep or is seen here: one of the two orders always holds)
+                if (now_ns() >= until_ns.load()) cv.wait_for(lk, std::chrono::milliseconds(100));
+                asleep.store(false);
                 continue;
             }
             const long long t0 = now_ns();
