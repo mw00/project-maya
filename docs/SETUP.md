@@ -191,6 +191,7 @@ WantedBy=multi-user.target
 | `--gpu N` / `--gpus 0,1,2,3` | one GPU, or several (up to 16) that split the model's layers |
 | `--context N` | context length in tokens: 8192, 32768 (default), 65536, 131072; DeepSeek: 32768, 65536, 131072, 262144, 524288, 1048576 (the default 262144 where VRAM + RAM hold the model, else 65536); MiniMax: the same, the default by this PC's memory |
 | `--vram-reserve-mib N` | VRAM in MiB the expert pool leaves free on each GPU (default 700), kept in the config - more where the desktop or other programs on the GPU need room ([the expert pool's size](SETTINGS.md#the-expert-pools-size)) |
+| `--force-fit` | GLM-5.3-Flash on one NVIDIA card: the setup works out, before any download, whether the quant can start on the card (its dense weights, the context, the engine's working memory and the smallest expert pool against the card's VRAM less what is in use on it now) where the card cannot hold the experts but the model still starts (experts in RAM, computed on the CPU) it says the model will run slowly and goes on; where it cannot start at all it stops, and this sets it up anyway |
 | `--port N`, `--host 0.0.0.0 --api-key KEY` | another port; reachable from your network (always set a key; several: `KEY1,KEY2`) |
 | `--env KEY=VALUE` | an engine setting kept in the config (see [Tuning](SETTINGS.md)) |
 | `--host-compiler g++-12` | when your g++ is newer than your CUDA accepts ("unsupported GNU version") |

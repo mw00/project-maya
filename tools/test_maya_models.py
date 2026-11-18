@@ -2,6 +2,7 @@
 24 GB recommendation, the EXL3 model on NVIDIA only) and that every download names a hash per file.  No GPU, no
 network."""
 from pathlib import Path
+import os
 import shlex
 import sys
 import tempfile
@@ -205,6 +206,23 @@ class WholeShards(unittest.TestCase):
         self.assertTrue(self.check(whole[:-1]).startswith("short"))
 
 
+class StartFlagsHelp(unittest.TestCase):
+    """#899: `--config X --context 4096` started X with its own context - a start of an installed config uses the
+    settings saved in it.  The help says so (no change in what a start does)."""
+
+    def test_help_says_setup_flags_are_ignored_on_a_start(self):
+        import contextlib
+        import io
+        out = io.StringIO()
+        with patch.object(maya.sys, "argv", ["maya.py", "--help"]), patch.object(maya, "stop_signals"), \
+                contextlib.redirect_stdout(out), self.assertRaises(SystemExit):
+            maya.main()
+        text = " ".join(out.getvalue().split())
+        self.assertIn("setup flags such as --context or --model are ignored then", text)
+        self.assertIn("add --setup to set up again with them", text)
+        self.assertIn("a start of an installed config keeps its own, see --config", text)
+
+
 class RestartAfterUpdate(unittest.TestCase):
     """The dashboard's Update ends the server with UPDATE_EXIT: maya.py starts the new version - the same model and
     settings, no setup flags, no question - and nothing else (no download, no pack)."""
@@ -271,8 +289,9 @@ class RestartAfterUpdate(unittest.TestCase):
         self.assertFalse(left)                          # (read once: a later port change is not a switch)
 
     def test_an_old_note_is_not_followed(self):
-        got, _, left = self.after({"why": "switch", "port": 8123, "time": 0}, config=Path("/x/maya-maya-m.json"))
-        self.assertEqual(got, {"--config": "/x/maya-maya-m.json", "--backend": "cuda"})
+        config = Path("/x/maya-maya-m.json")
+        got, _, left = self.after({"why": "switch", "port": 8123, "time": 0}, config=config)
+        self.assertEqual(got, {"--config": str(config), "--backend": "cuda"})   # (as the OS writes the path)
         self.assertFalse(left)
 
 
@@ -294,7 +313,10 @@ class RunScript(unittest.TestCase):
             mine, other = Path(d) / "maya-maya-l.json", Path(d) / "maya-maya-s.json"
             for p in (mine, other):
                 p.write_text("{}")
+            # (MAYA_SH: a POSIX Python outside a venv would re-start main() through ./maya.sh - an exec that ended
+            # the whole test run there without a word)
             with patch.object(maya, "configs", return_value=[other, mine]), patch.object(maya, "say"), \
+                    patch.dict(os.environ, MAYA_SH="1"), \
                     patch.object(maya.sys, "argv", ["maya.py", "--config", str(mine), "--port", "8091"]), \
                     patch.object(maya, "ask", side_effect=AssertionError("no question: --config names it")), \
                     patch.object(maya, "start", return_value=0) as start:

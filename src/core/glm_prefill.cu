@@ -844,7 +844,30 @@ struct Glm5Model::PrefillState {
     std::vector<const char*> pname;
     size_t pn = 0;
     std::map<std::string, double> pacc;
+    // MAYA_GLM_PREFILL_CHECK=1 (diagnostic, off by default): the compute stream is synchronised after every stage of
+    // a layer and the first stage that ends with a CUDA error is named - with the device and the layer - once.  A
+    // fault inside a layer otherwise surfaces at the layer's first host sync (the route/count sync), whatever stage
+    // caused it.  Off, nothing below runs (the products and their order are the same either way; on, only the
+    // stream waits are added).
+    bool check = false;
+    bool check_said = false;
+    int check_dev = -1, check_il = -1, check_last_il = -1;
+    const char* check_last = "the chunk's start";
+    void check_stage(const char* nm, cudaStream_t st) {
+        if (!check || check_said) return;
+        const cudaError_t e = cudaStreamSynchronize(st);
+        if (e == cudaSuccess) {
+            check_last = nm;
+            check_last_il = check_il;
+            return;
+        }
+        check_said = true;
+        std::fprintf(stderr, "glm prefill check: CUDA%d layer %d: \"%s\" after the stage %s (the last clean stage: %s "
+                             "of layer %d) (MAYA_GLM_PREFILL_CHECK)\n",
+                     check_dev, check_il, cudaGetErrorString(e), nm, check_last, check_last_il);
+    }
     void mark(const char* nm, cudaStream_t st) {
+        check_stage(nm, st);
         if (!prof) return;
         if (pn >= pev.size()) {
             cudaEvent_t e = nullptr;
@@ -1242,6 +1265,12 @@ bool Glm5Model::prefill_setup(std::string& err) {
     if (const char* v = getenv("MAYA_GLM_PREFILL_SUB"))
         S->sub_env = std::clamp(std::atoi(v), 16, 8192);
     S->prof = getenv("MAYA_GLM_PREFILL_PROF") != nullptr;
+    if (const char* v = getenv("MAYA_GLM_PREFILL_CHECK"); v != nullptr && std::atoi(v) != 0) {
+        S->check = true;
+        S->check_dev = dev_;
+        std::fprintf(stderr, "glm prefill: CUDA%d MAYA_GLM_PREFILL_CHECK is on: every stage of a prompt layer is "
+                             "checked (slower prompts; a diagnostic)\n", dev_);
+    }
     S->gstride = gstride;
 
     // ---- sizes: the chunk T from the budget (per device)
@@ -2871,6 +2900,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
         const bool skip_output = tail_skip && il == g.n_layers - 1;
         const int slot = hh < 0 ? 0 : hh + 1;   // (the helper exchange's slot for these rows)
         HlpPend& H = hp[hh < 0 ? 2 : hh];
+        S->check_il = il;   // (MAYA_GLM_PREFILL_CHECK's layer)
         if (pipe)   // (the union scratch is reused: the other half's routes must have gone down to the helper)
             for (const auto& q : hp)
                 if (q.ev != nullptr) cudaStreamWaitEvent(s, q.ev, 0);
@@ -3209,7 +3239,13 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
             gb::copy_i32((const int*) M.rw, (int*) S->crw_h, T * K, s);
         }
         S->mark("route", s);
-        if (!glmfast::cuda_ok(cudaStreamSynchronize(s), "glm prompt route/count sync", err)) return false;
+        if (const cudaError_t se = cudaStreamSynchronize(s); se != cudaSuccess) {
+            // (the device and the layer in the message: a fault from any earlier stage of the layer lands here)
+            const std::string what = "glm prompt route/count sync (CUDA" + std::to_string(dev_) + ", layer " +
+                                     std::to_string(il) + ")";
+            glmfast::cuda_ok(se, what.c_str(), err);
+            return false;
+        }
         int counted = 0;
         for (int e = 0; e < NE; ++e) counted += S->h_counts[e];
         if (counted != T * K) {
@@ -3933,8 +3969,10 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                             gb::swiglu_rows(GU, GU, nrows, nff, g.swiglu_exp, s, 2 * nff);   // (in place: no T x K x n_ff buffer)
                         }
                     }
+                    S->check_stage(f16_gu ? "experts gate/up (FP16)" : "experts gate/up (MMQ)", s);   // (off: nothing)
                     if (f16_dn) {
                         f16_down(wbase, i0, i1, stride, hb, a, GU, GU);   // (the window rows MMQ's down writes: OUTP + o)
+                        S->check_stage("experts down (FP16)", s);
                         i0 = i1;
                         continue;
                     }
@@ -3955,6 +3993,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                     dn.dst = M.OUTP + (size_t) (o - a) * E;
                     dn.ld_dst = E;
                     S->mq->run(dn, s);
+                    S->check_stage("experts down (MMQ)", s);
                 }
                 i0 = i1;
             }

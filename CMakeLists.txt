@@ -337,6 +337,14 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/env_switch_test.cpp")
   target_link_libraries(env_switch_test PRIVATE strata_warnings)
   add_test(NAME env_switch_test COMMAND env_switch_test)
 endif()
+# the drafting decode's stall report (include/strata/platform/stall_watch.hpp, #860); host code only
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/stall_watch_test.cpp")
+  add_executable(stall_watch_test EXCLUDE_FROM_ALL tests/stall_watch_test.cpp)
+  target_include_directories(stall_watch_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+  find_package(Threads REQUIRED)
+  target_link_libraries(stall_watch_test PRIVATE strata_warnings Threads::Threads)
+  add_test(NAME stall_watch_test COMMAND stall_watch_test)
+endif()
 
 # ---- idle_gate_test --------------------------------------------------------
 # The gate an idle engine's service threads sleep on, and a request's line wakes (strata/platform/idle_gate.hpp):
@@ -541,7 +549,9 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     target_include_directories(pf_wmma_parity PRIVATE ${_strata_gpu_include_directories})
     target_link_libraries(pf_wmma_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
     add_test(NAME pf_wmma_parity COMMAND pf_wmma_parity)
-    set_tests_properties(pf_wmma_parity PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77)
+    # (its double reference is the long part: ~1 min on a 3 GHz desktop CPU since it reads the FP16 values once;
+    # the bound leaves room for a slower CPU under ctest -j)
+    set_tests_properties(pf_wmma_parity PROPERTIES TIMEOUT 600 SKIP_RETURN_CODE 77)
   endif()
   # plan v0.3 P6: llama.cpp's block layouts and codebook grids for the i-quant formats (MIT, third_party/ggml)
   target_include_directories(strata_kernels PRIVATE third_party/ggml)
@@ -658,7 +668,9 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     target_include_directories(expert_cache_lend_test PRIVATE ${_strata_gpu_include_directories})
     target_link_libraries(expert_cache_lend_test PRIVATE strata_engine ${_strata_gpu_runtime_target})
     add_test(NAME expert_cache_lend_test COMMAND expert_cache_lend_test)
-    set_tests_properties(expert_cache_lend_test PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
+    # RUN_SERIAL: it checks the card's free VRAM (cudaMemGetInfo) before and after each lend, which any other test on
+    # the GPU moves - under ctest -j4 "the free VRAM is back where it was" failed on another test's allocations
+    set_tests_properties(expert_cache_lend_test PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
   endif()
   # --expert-profile-save's profile (rank_learned_profile, write_expert_profile) and the profile header's version
   # (a version other than 1 is refused by its number); the split decode's groups (split_groups); the EXL3 prompt
@@ -807,6 +819,13 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     if(STRATA_ENABLE_HIP)
       target_link_libraries(ds4_gguf_test PRIVATE strata_mmq)
     endif()
+    # route_publish's count (issue #501): a host-free layer's routes counted on the device, the picks bit for bit as
+    # without it (needs a GPU, no model)
+    add_executable(ds4_route_count_test tests/ds4_route_count_test.cu src/ds4/ds4_kernels.cu src/ds4/ds4_host_ar.cpp)
+    target_include_directories(ds4_route_count_test PRIVATE ${_strata_gpu_include_directories} include)
+    target_link_libraries(ds4_route_count_test PRIVATE ${_strata_gpu_runtime_target})
+    add_test(NAME ds4_route_count COMMAND ds4_route_count_test)
+    set_tests_properties(ds4_route_count PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
     # DS4_MULTI_ATTN: a multi step's attention for all its rows in one launch a step against each conversation's run
     # alone (attn_core's launches), bit for bit on random rings and caches - decode rows, verify windows, drafter
     # blocks (needs a GPU, no model; built by name)
@@ -1234,9 +1253,9 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   # splitting them across two libraries would only add a layer.
   #
   # The pack, the original GGUF and the ggml capture are all REQUIRED inputs: this test's oracles are real
-  # artifacts, so the working directory is pinned to the source tree and a missing input is a hard error
-  # INSIDE the test.  A test that passes by finding nothing to compare is the failure mode this project keeps
-  # re-learning.
+  # artifacts, so the working directory is pinned to the source tree and a missing input is checked INSIDE the
+  # test: an absent file makes it a SKIP that names the file (exit 77), a truncated or incompatible one a failure.
+  # A test that passes by finding nothing to compare is the failure mode this project keeps re-learning.
   add_executable(ple_parity src/kernels/ple_parity.cpp)
   target_include_directories(ple_parity PRIVATE ${_strata_gpu_include_directories})
   target_link_libraries(ple_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
@@ -1245,6 +1264,8 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   add_test(NAME ple_parity COMMAND ple_parity --selftest
     --in "${STRATA_PLE_FIXTURE_DIR}/ple_in.bin" --out "${STRATA_PLE_FIXTURE_DIR}/ple_out.bin"
     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+  # an input that is not on the PC: skipped (77, the missing file named - never a pass); a broken one still fails
+  set_tests_properties(ple_parity PROPERTIES SKIP_RETURN_CODE 77)
 
   # Plan v0.3 P7: INT8 KV storage vs a host reference and vs the FP16 path (GPU, synthetic, no model).
   add_executable(kv_q8_parity src/kernels/kv_q8_parity.cpp)
@@ -1718,13 +1739,15 @@ if(STRATA_BUILD_TESTS)
   add_executable(expert_parity src/kernels/cpu/expert_parity.cpp)
   target_link_libraries(expert_parity PRIVATE strata_kernels_cpu)
   # The pack is a REQUIRED input, not an optional one: this test compares against a real expert blob, and a
-  # missing file would otherwise be reported as a pass by a test that skipped everything.
+  # missing file must never be reported as a pass by a test that skipped everything.  Not on the PC (it is not in
+  # the repo), or a CPU without the VNNI kernel's features: exit 77, a SKIP that says why; a short pack fails.
   add_test(NAME expert_parity COMMAND expert_parity --selftest
            WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
 
   add_executable(pool_test src/kernels/cpu/pool_test.cpp)
   target_link_libraries(pool_test PRIVATE strata_kernels_cpu)
   add_test(NAME pool_test COMMAND pool_test --selftest WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+  set_tests_properties(expert_parity pool_test PROPERTIES SKIP_RETURN_CODE 77)   # (the same pack, the same rule)
   # issue #29: tiny batches with sleeping workers, as on a big-VRAM card; a hang fails it
   add_executable(pool_stress src/kernels/cpu/pool_stress.cpp)
   target_link_libraries(pool_stress PRIVATE strata_kernels_cpu)

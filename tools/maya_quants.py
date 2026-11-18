@@ -230,7 +230,7 @@ def shown(family: str, key: str | None = None, gb: float | None = None) -> str:
 def config_stem(family: str, key: str | None) -> str | None:
     """A Maya quant's config name under the scheme (maya-minimax-maya-xs), or None where the config keeps the name it
     always had (GLM's maya-<download>.json, DeepSeek's maya-ds4.json, MiniMax's EXL3 maya-mm3.json - installs and
-    their run scripts point at them).  MiniMax's GGUFs, new with the scheme, are the first named by it."""
+    their run scripts point at them; a second DeepSeek quant beside the first: maya.ds4_config_path's own name).  MiniMax's GGUFs, new with the scheme, are the first named by it."""
     if family == "qwen":
         return "maya-qwen-ud-iq2_xs" if key == "ud-iq2_xs" else "maya-cyber-frost"
     return f"maya-{setup_id(family, key)}" if family == "minimax" and setup_id(family, key) else None

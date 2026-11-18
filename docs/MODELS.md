@@ -54,7 +54,7 @@ On AMD, GLM-5.3-Flash reads pictures too: setup builds its image encoder for the
   (`--kv-streaming on`; `./maya.sh --setup` adds it to an existing config), so the VRAM holds more experts - at 512K
   on an RTX 3090, prompts 4-9x faster and decode +5%; 1M context fits one 3090 ([how](SETTINGS.md)).
 - **Faster answers with a DFlash2 drafter:** `./maya.sh --setup --draft dflash2` (NVIDIA RTX 30 / A100 and newer,
-  and one AMD Ryzen AI Max APU) downloads a small drafter that drafts up to 7 tokens a round and gives the same answers
+  and one AMD Ryzen AI Max APU) downloads a small drafter that drafts up to 7 tokens a round; the model checks every drafted token, so it only writes tokens it would pick itself
   - Maya-L +44% on nine GPUs and +12% on two (against the MTP block), +19% on one RTX 3090, +9% on a Radeon 8060S
   with unsloth's UD-IQ2_XXS ([how](SETTINGS.md#drafting-with-dflash2)). How much
   it gains depends on the PC: on one GPU that reads much of the model from RAM it is often slower. So a
@@ -113,7 +113,9 @@ results. See [the prompt format notes](deepseek-prompt-format.md) for API detail
   is read as it is. Engram tables a quant stored in its own INT4 layout (`U8` + `embed.scale`, as in the quants derived
   from Diffbot's mixed 3 bpw) are not read: the tables are DeepSeek's own and the quant leaves them unchanged, so put
   DeepSeek's FP8 shards 47 / 48 of deepseek-ai/DeepSeek-V4.1-Flash-1017 in their place. Shards that write their
-  tensors grouped by type instead of expert by expert stop the pack with that reason: rewrite them in expert order.
+  tensors grouped by type instead of expert by expert stop the pack with that reason: rewrite them in expert order
+  in place with `tools/ds4/reorder.py --model <model folder>` - the same tensors and bytes, each tensor's SHA-256
+  checked ([type-ordered shards, and Diffbot's 3 bpw](ds4-exl3-packs.md)).
 
 ### DeepSeek's options
 

@@ -16,6 +16,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -272,8 +273,8 @@ bool Glm5Model::fast_window_layers_plain(int64_t p0, int T, std::string& err) {
     mark("start");
     // (fast_window_layers' staggered row groups and their switches)
     static const bool stagger_env = [] {
-        const char* v = getenv("MAYA_GLM_WIN_STAGGER");
-        return v == nullptr || std::atoi(v) != 0;
+        const char* v = getenv("MAYA_GLM_WIN_STAGGER");   // (auto - glm_window.cu's measured choice - is 1 here)
+        return v == nullptr || std::strcmp(v, "auto") == 0 || std::atoi(v) != 0;
     }();
     static const bool batch_env = glmfast::off_by_default_on_amd("MAYA_GLM_WIN_BATCH");
     const bool stagger = stagger_env && batch_env && T >= 2 && !W.per_token && W.mplan_ptr != nullptr;

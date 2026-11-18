@@ -1571,8 +1571,26 @@ def check_pc(a, family: str = "glm", gguf: bool = False, ds4_quant: str = "exl3"
         say("  the GPU's memory is the system's RAM: the engine fills it with the most-used experts and leaves the "
             "rest to the RAM tier and the SSD, so the free RAM at the start is what the pool can take")
     if vram < 23 and not ds4 and not mm3 and family != "qwen":
-        say(f"  {vram:.0f} GB of VRAM in total: the engine fills it with the most-used experts and serves the rest from "
-            "RAM and the SSD - give it a try (more VRAM is faster; tell us your speed)")
+        # one small card: can any GLM-5.3-Flash quant start on it at all (glm_fit_verdict)?  Where none can, say so
+        # here - the model's choice (step 2) then stops before any download
+        try:
+            small = {"backend": "cuda", "gpus": chosen}
+            fits = [glm_fit_verdict(q, small, used=u) for u in [gpu_used_mib() if glm_fit_card(small, {}) else {}]
+                    for q in GLM_FIT if q in MODELS]
+        except Exception:  # noqa: BLE001 - the card does not read: the usual line
+            fits = []
+        slow = fits and all(v and v["verdict"] in ("no", "slow") for v in fits)
+        if slow and any(v["verdict"] == "slow" for v in fits) and getattr(a, "glm_part", None) != "glm53":
+            say(f"  {vram:.0f} GB of VRAM on one card is too little to hold GLM-5.3-Flash's experts: it starts, with "
+                "the experts in RAM and computed on the CPU - much slower than on a card of 12 GB or more")
+        elif slow and getattr(a, "glm_part", None) != "glm53":
+            least = min(fits, key=lambda v: v["at"]["need"])["at"]
+            warn(f"{vram:.0f} GB of VRAM on one card is too little for GLM-5.3-Flash: its smallest quant needs about "
+                 f"{least['need'] / 1024:.1f} GB on the card before any expert is cached, and this card has "
+                 f"{least['have'] / 1024:.1f} GB free now (step 2 says what is short for the quant you pick)")
+        else:
+            say(f"  {vram:.0f} GB of VRAM in total: the engine fills it with the most-used experts and serves the rest "
+                "from RAM and the SSD - give it a try (more VRAM is faster; tell us your speed)")
     if min(archs) < VALIDATED_CC:
         warn("Pascal (compute capability 6.x) is experimental: the engine builds for it with its portable kernels "
              "(the prompt attention on the F32 cores) and caches global loads in L1 there, but Maya has not been "
@@ -1789,9 +1807,9 @@ def choose_draft(a, pc: dict, inst: dict) -> str:
     rows = [("the model's MTP block", "default",
              "The model's own draft block guesses the next token, which the model then checks." + mtp_where),
             (f"a DFlash2 drafter (download {DFLASH['bytes'] / 1e9:.1f} GB from Hugging Face)", None,
-             "A small drafter made for GLM-5.3-Flash drafts up to 7 tokens a round, which the model then checks: the "
-             + ("same answers either way. Not measured on a Mac: which one is faster is yours to try. " if metal else
-             "same answers, faster. Maya-L: +44% on nine GPUs and +12% on two against the MTP block, +19% on one RTX 3090. A speed "
+             "A small drafter made for GLM-5.3-Flash drafts up to 7 tokens a round, which the model then checks"
+             + (", so every token is the model's own pick. Not measured on a Mac: which one is faster is yours to try. " if metal else
+             ": every token is the model's own pick, faster. Maya-L: +44% on nine GPUs and +12% on two against the MTP block, +19% on one RTX 3090. A speed "
              "calibration then measures it against the MTP block on this PC (5-20 minutes) and keeps it only if it "
              "is faster here. ") + f"The drafter's license is {DFLASH['license']}: non-commercial use only.")]
     pick = choose("Drafting?", ["How the model drafts tokens ahead (the answers are the same either way):"], rows,
@@ -1831,6 +1849,11 @@ def check_parallel(a, family: str) -> None:
              "remove --parallel; saved conversations do not enable simultaneous decoding")
 
 
+def g53_offered() -> list:
+    """GLM-5.3 (744B)'s downloads the setup offers (the ones GLM's download list holds)."""
+    return [q for q in G53_MODELS if q in glm_downloads()]
+
+
 def choose_family(a, prev: dict) -> str:
     """"glm" or "deepseek": what the options say (--model, --gguf-dir, --draft), else asked - the model set up before
     is the default."""
@@ -1853,6 +1876,12 @@ def choose_family(a, prev: dict) -> str:
              "Z.ai's GLM-5.3-Flash in Project Maya's GGUF quants (GLM-5.3-Flash-Maya-S to -Maya-L, 95-156 GB) or "
              "turboderp's EXL3 quants: from one GPU up, the experts that do not fit in VRAM from RAM and the SSD; "
              "NVIDIA and AMD; pictures with its vision encoder."),
+            (G53.LABEL, None,
+             f"Z.ai's full {G53.SHOWN} (744B) on the engine GLM-5.3-Flash runs on"
+             + (": " + ", ".join(f"{Q.glm53_quant(q)} ({G53_MODELS[q]['download_gb']:.0f} GB)" for q in g53_offered())
+                if g53_offered() else "") +
+             "; or its GGUF files you already have (--gguf-dir); NVIDIA and AMD, the experts that do not fit in VRAM "
+             "from RAM and the SSD; text only."),
             (DS4, None,
              "DeepSeek's DeepSeek-V4.1-Flash-1017 (748B) on its own engine: unsloth's GGUF (UD-Q8_K_XL, 508 GB; "
              "NVIDIA from V100 on or AMD, Linux or Windows), orcarouter's abliterated one (Mix-128G or "
@@ -1861,7 +1890,7 @@ def choose_family(a, prev: dict) -> str:
              "pictures from RTX 30 / A100 on); "
              f"fast with about {DS4_MEMORY_GB} GB of VRAM and RAM together{here}, with less the experts that do not "
              "fit are read from the SSD; tensor parallel across pairs of equal GPUs, a 256K context."),
-            (MM3, "new",
+            (MM3, None,
              "MiniMax's MiniMax-M3.1-Flash (428B, 23B active per token) on its own engine: Mia-AiLab's EXL3 quant at "
              f"3.5 bits (197 GB); NVIDIA {mm3_gpus()}{' on Linux and Windows (Windows: new)' if MM3_ALL_PLATFORMS else ' on Linux'}; about "
              f"{MM3_MEMORY_GB} GB of VRAM and RAM together{here}; the layers split across the GPUs, the experts that "
@@ -1869,14 +1898,19 @@ def choose_family(a, prev: dict) -> str:
              "up to a 1M context" + ("; or Maya's own GGUF quants (MiniMax-M3.1-Flash-Maya-XS ~93 GB, -Maya-S ~122 "
                                      "GB: NVIDIA from V100 on and AMD)"
                                      if any(map(mm3_gguf_published, ("gguf-xs", "gguf-s"))) else "") + "."),
-            (Q.shown("qwen", "q5_k_m", qwen_entry()["download_gb"]), "new",
-             f"{QWEN_SHOWN}: 180B, 10 of 512 experts a token; Blackfrost-AI's cybersecurity fine-tune of Qwen3.8-Flash-Next "
+            ("Qwen-3.8-Flash-Next", None,
+             "Qwen-3.8-Flash-Next: 180B, 10 of 512 experts a token; Blackfrost-AI's cybersecurity fine-tune of Qwen3.8-Flash-Next "
              "in peasantsmith's GGUF, on Maya's own Qwen path; NVIDIA from V100 on or AMD, Linux or Windows; all its "
              f"experts in about {qwen_entry()['memory_gb']:.0f} GB of VRAM and RAM together{here}, with less the others "
              "read from the SSD; tool calls, its three reasoning efforts, MTP drafting, up to a 256K context; text only. "
              f"Or the base model itself in unsloth's UD-IQ2_XS GGUF ({qwen_entry(QWEN_UD)['download_gb']:.0f} GB).")]
-    pick = choose("Model?", ["Which model to set up:"], rows, FAMILIES.index(default), a.yes)
-    return FAMILIES[pick]
+    keys = ("glm", "glm53") + FAMILIES[1:]             # (the rows: GLM-5.3 (744B) is its own row of the "glm" family)
+    was53 = default == "glm" and bool(prev) and G53.config_is_glm_dsa(prev)
+    pick = keys[choose("Model?", ["Which model to set up:"], rows, keys.index("glm53" if was53 else default), a.yes)]
+    if pick in ("glm", "glm53"):
+        a.glm_part = "glm53" if pick == "glm53" else "flash"   # (choose_model lists that model's files only)
+        return "glm"
+    return pick
 
 
 # The quant the setup's lists recommend (fit_recommendation): RAM the engines leave the OS (MAYA_GLM_RAM_HEADROOM_GB's
@@ -1926,10 +1960,211 @@ def setup_gpus(a) -> list:
         return []
 
 
-def choose_model(a, models: Path, inst: dict) -> tuple:
+# Can a GLM-5.3-Flash GGUF quant start on this PC's one NVIDIA card?  Worked out before the download (glm_fit): the
+# engine refuses to start when, after everything that must sit on the card, the expert pool has no room for a route's
+# experts in every layer ("no room for the expert pool": src/core/glm_fast_path.cu) - an 8 GB card that also drives
+# the desktop found that out after 73 GB (2026-11-18).  Per quant, from its GGUF header on Hugging Face (the tensor
+# table of every shard, peasantsmith/GLM-5.3-Flash-Maya-GGUF at MODELS' revision; block 45 is the MTP block):
+#   "dense_mib": the weights the card always holds.  Maya-XS: the engine's own start line on an RTX 3050 ("dense weights
+#     5.24" GiB); Maya-S24 has the same non-expert tensors, byte for byte (5759 MiB), so the same figure.  The others
+#     ("computed"): their non-expert tensors less the token embedding (7445 - 496 MiB), times the 1.02 by which the
+#     same sum falls short of the engine's figure on Maya-XS (5263 against 5366 MiB)
+#   "slot_mib": one routed expert (gate + up + down) of each of the 45 layers, the pool's unit - Maya-XS 217.9 MiB by
+#     the header, 218.3 by the engine's message (1,747 MiB for 8)
+GLM_FIT = {
+    "Maya-XS-IQ1_S": {"dense_mib": 5366, "slot_mib": 217.9},
+    "Maya-S24": {"dense_mib": 5366, "slot_mib": 284.9},
+    "Maya-S-v2-IQ2_XXS": {"dense_mib": 7088, "slot_mib": 284.9, "computed": True},
+    "Maya-M": {"dense_mib": 7088, "slot_mib": 346.9, "computed": True},
+    "Maya-M-Derisked": {"dense_mib": 7088, "slot_mib": 346.9, "computed": True},   # (Maya-M's tensors, edited)
+    "Maya-L": {"dense_mib": 7088, "slot_mib": 477.2, "computed": True},
+}
+GLM_FIT_EXPERTS = 8                                # a route's experts (the header's expert_used_count): the pool's least
+# the context's state on the card, from the engine's start line on that card with the INT8 cache (0.28 GiB at 8K,
+# 0.45 at 32K): a fixed part and a part a position - with FP16 latents docs/GLM5-FLASH.md's 11.3 KB a position.  KV
+# streaming keeps KV_RESIDENT positions on the card, so a longer context is counted as that one (never more)
+GLM_FIT_STATE_MIB = 229
+GLM_FIT_KV_BYTES = {"int8": 7427, "fp16": 11571}
+GLM_FIT_KV_RESIDENT = 32768
+# the engine's working memory on the card - the CUDA context, the MTP block, scratch, the prompt path, activations:
+# that start line's "other" and "activations" (1.13 GiB) less the ~0.5 GiB the Windows desktop held (620-700 MiB over
+# three starts; drafting off and --prefill 0 did not lower it)
+GLM_FIT_WORK_MIB = 650
+GLM_FIT_RESERVE_MIB = 300                          # the least the engine's automatic reserve goes to (pool_reserve)
+# what the estimate can be off by: within it the setup warns and goes on (more for a quant whose dense figure is
+# computed, not read from an engine start)
+GLM_FIT_MARGIN_MIB = 300
+GLM_FIT_MARGIN_COMPUTED_MIB = 500
+# VRAM in use on the card now that counts against a model: the desktop's.  More than this is taken for a program
+# that can be closed (another engine: busy_gpus' 1 GiB) - said, never a reason to refuse
+GLM_FIT_USED_CAP_MIB = 1024
+
+
+def gpu_used_mib() -> dict:
+    """{GPU index: MiB of VRAM in use now} by nvidia-smi (the desktop and every program on the card); {} when it does
+    not answer."""
+    try:
+        txt = subprocess.run(["nvidia-smi", "--query-gpu=index,memory.used", "--format=csv,noheader,nounits"],
+                             capture_output=True, text=True, timeout=30).stdout
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    used = {}
+    for line in txt.splitlines():
+        i, _, m = line.partition(",")
+        try:
+            used[int(i)] = int(float(m))
+        except ValueError:
+            pass
+    return used
+
+
+def glm_fit_state_mib(ctx: int, kv: str | None = None) -> float:
+    """The VRAM a context's state takes on the leading card, MiB (GLM_FIT_STATE_MIB and GLM_FIT_KV_BYTES)."""
+    per = GLM_FIT_KV_BYTES["int8" if kv == "int8" else "fp16"]
+    return GLM_FIT_STATE_MIB + min(int(ctx), GLM_FIT_KV_RESIDENT) * per / 2**20
+
+
+def glm_fit(quant: str, total_mib: float, used_mib: float, ctx: int = DEFAULT_CONTEXT,
+            reserve_mib: int = GLM_FIT_RESERVE_MIB) -> dict | None:
+    """What GLM-5.3-Flash quant `quant` needs on one card of `total_mib` with `used_mib` already in use, at a context
+    of `ctx`, before it can start - each term in MiB: "dense", "state", "work" (GLM_FIT_WORK_MIB), "pool" (a route's
+    experts in every layer: GLM_FIT_EXPERTS slots), "reserve" (the VRAM kept free; the engine's automatic reserve goes
+    down to 300 MiB, its default is 700), their sum "need", the card's "have" (total less in use) and "short" (need
+    less have: above 0 the engine has no room for its expert pool).  None: a quant with no figures (GLM_FIT)."""
+    f = GLM_FIT.get(quant)
+    if not f:
+        return None
+    t = {"dense": float(f["dense_mib"]), "state": glm_fit_state_mib(ctx, MODELS.get(quant, {}).get("kv")),
+         "work": float(GLM_FIT_WORK_MIB), "pool": GLM_FIT_EXPERTS * f["slot_mib"], "reserve": float(reserve_mib)}
+    t["need"] = sum(t.values())
+    t["have"] = float(total_mib) - float(used_mib)
+    t["short"] = t["need"] - t["have"]
+    t.update(total=float(total_mib), used=float(used_mib), ctx=int(ctx),
+             margin=GLM_FIT_MARGIN_COMPUTED_MIB if f.get("computed") else GLM_FIT_MARGIN_MIB)
+    return t
+
+
+def glm_fit_card(pc: dict | None, used: dict | None = None) -> tuple | None:
+    """(the card, its VRAM in MiB, the MiB in use on it now) where glm_fit's figures hold: a setup on ONE NVIDIA card
+    with its own VRAM.  None anywhere else - two GPUs or more (the layers are split, each card holds a part), AMD
+    (HIP: its figures are not measured), a unified-memory GPU, Metal, a card whose VRAM does not read."""
+    gpus = (pc or {}).get("gpus") or []
+    if (pc or {}).get("backend", "cuda") != "cuda" or len(gpus) != 1:
+        return None
+    g = gpus[0]
+    if g.get("vendor") in ("amd", "apple") or g.get("unified_memory") or not g.get("vram_gb") or "index" not in g:
+        return None
+    used = gpu_used_mib() if used is None else used
+    return g, float(g["vram_gb"]) * 1024.0, float(used.get(g["index"], 0))
+
+
+def glm_fit_verdict(quant: str, pc: dict | None, contexts: list | None = None, used: dict | None = None) -> dict | None:
+    """Whether GLM-5.3-Flash quant `quant` can start on this PC's one card (glm_fit_card), None where that is not
+    known.  "verdict": "no" - short by more than the margin even at the smallest context the setup offers, and
+    without an expert pool too; "slow" - short there, but the engine starts without an expert pool (the experts stay
+    in RAM and are computed on the CPU: much slower); "tight" - within the margin there; "fits".  "contexts": the offered contexts that fit (within the margin), "at": glm_fit at
+    the smallest context, "card": the GPU, "in_use": all the VRAM in use now (of it at most GLM_FIT_USED_CAP_MIB
+    counts: more is a program that can be closed)."""
+    card = glm_fit_card(pc, used)
+    if card is None or quant not in GLM_FIT:
+        return None
+    g, total, in_use = card
+    counted = min(in_use, GLM_FIT_USED_CAP_MIB)
+    contexts = sorted(contexts or CONTEXTS)
+    fits = {c: glm_fit(quant, total, counted, c) for c in contexts}
+    at = fits[contexts[0]]
+    verdict = ("no" if at["short"] - at["pool"] > at["margin"] else "slow" if at["short"] > at["margin"] else
+               "tight" if at["short"] > -at["margin"] else "fits")
+    return {"verdict": verdict, "at": at, "card": g, "in_use": in_use, "quant": quant,
+            "contexts": [c for c in contexts if fits[c]["short"] <= fits[c]["margin"]],
+            "by_context": fits}
+
+
+def glm_fit_card_name(g: dict) -> str:
+    return f"{g.get('name') or 'card'} ({float(g['vram_gb']):.0f} GB)"
+
+
+def glm_fit_message(v: dict, others: list = ()) -> tuple:
+    """(what is short, what to do) for a quant that cannot start (glm_fit_verdict "no"): the terms, the card's room,
+    and the GLM-5.3-Flash quants that do fit this card (`others`)."""
+    t, G = v["at"], 1024.0
+    name = Q.shown("glm", v["quant"])
+    used = (f"{t['total'] / G:.1f} less the {t['used'] / G:.1f} GB the desktop and other programs use on it now"
+            if t["used"] >= 50 else "nothing else is on it")
+    what = (f"{name} cannot start on this PC's {glm_fit_card_name(v['card'])}: before any expert is cached it needs "
+            f"about {t['need'] / G:.1f} GB of VRAM at the smallest context ({context_label(t['ctx'])}) - dense weights "
+            f"{t['dense'] / G:.1f}, the context's state {t['state'] / G:.1f}, the engine's working memory "
+            f"{t['work'] / G:.1f}, the smallest expert pool {t['pool'] / G:.1f}, kept free {t['reserve'] / G:.1f} - "
+            f"and the card has {t['have'] / G:.1f} GB ({used}): about {t['short'] / G:.1f} GB short")
+    alone = t["short"] - t["used"]
+    how = ("with nothing else on the card it would be " + ("a tight fit" if alone > -t["margin"] else "enough")
+           + " (the desktop on another GPU or the CPU's graphics); " if t["used"] >= 50 and alone <= t["margin"] else "")
+    how += (("these GLM-5.3-Flash quants fit this card: " + ", ".join(Q.shown("glm", q) for q in others)) if others
+            else "no GLM-5.3-Flash quant fits this card") + \
+           "; the other models' memory needs: docs/MEMORY.md. Nothing was downloaded. To try anyway: --force-fit"
+    return what, how
+
+
+def glm_fit_gate(a, quant: str, pc: dict | None, used: dict | None = None) -> dict | None:
+    """The check before the download: a quant that cannot start on this card ends the setup here with what is short
+    (--force-fit: a warning, and on); one that starts only without an expert pool ("slow") and a tight one are said.
+    The verdict, or None where the check does not apply."""
+    v = glm_fit_verdict(quant, pc, used=used)
+    if v is None:
+        return None
+    if v["in_use"] > GLM_FIT_USED_CAP_MIB:
+        warn(f"{v['in_use'] / 1024:.1f} GB of this card's VRAM is in use now (another program, or a model that is "
+             "running): the engine gets what is free when it starts")
+    others = [] if v["verdict"] not in ("no", "slow") else [
+        q for q in GLM_FIT if q != quant and q in MODELS and q not in MODELS_BY_HAND
+        and (glm_fit_verdict(q, pc, used=used) or {}).get("verdict") in ("fits", "tight")]
+    if v["verdict"] == "no":
+        what, how = glm_fit_message(v, others)
+        if getattr(a, "force_fit", False):
+            warn(what + " - going on (--force-fit)")
+            return v
+        fail(what, how)
+    if v["verdict"] == "slow":
+        t = v["at"]
+        warn(f"{Q.shown('glm', quant)} will run slowly on this PC's {glm_fit_card_name(v['card'])}: the card has "
+             f"about {t['have'] / 1024:.1f} GB free and holding the model's experts takes about "
+             f"{t['need'] / 1024:.1f} GB, so Maya starts without an expert pool - the experts stay in RAM and are "
+             "computed on the CPU. The answers are the same; writing and reading prompts are much slower than on a "
+             "card that holds the experts"
+             + ("; these GLM-5.3-Flash quants fit this card: " + ", ".join(Q.shown("glm", q) for q in others)
+                if others else ""))
+    if v["verdict"] == "tight":
+        t = v["at"]
+        warn(f"{Q.shown('glm', quant)} is a tight fit on this PC's {glm_fit_card_name(v['card'])}: by the setup's "
+             f"estimate it needs about {t['need'] / 1024:.1f} GB of the card's {t['have'] / 1024:.1f} GB free at a "
+             f"{context_label(t['ctx'])} context, and the estimate can be off by {t['margin']} MiB. If the engine says "
+             "it has no room for the expert pool: close programs that use the card, or a lower --vram-reserve-mib")
+    return v
+
+
+def glm_fit_context(a, v: dict | None, ctx_wanted: int | None) -> list | None:
+    """The contexts to offer for a checked quant (glm_fit_gate's verdict): all of them where all fit or nothing is
+    known (None), else the ones that fit, said.  A --context that does not fit ends the setup (--force-fit: on)."""
+    if v is None or v["verdict"] in ("no", "slow") or len(v["contexts"]) == len(v["by_context"]):
+        return None
+    fit = v["contexts"] or [min(v["by_context"])]
+    big = v["by_context"][max(v["by_context"])]
+    line = (f"{Q.shown('glm', v['quant'])} starts on this card with a context of up to {context_label(max(fit))}: a "
+            f"longer one needs about {big['short'] / 1024:.1f} GB more VRAM than the card has free")
+    if ctx_wanted and ctx_wanted > max(fit):
+        if not getattr(a, "force_fit", False):
+            fail(line, f"--context {max(fit)} (or leave --context out); to try anyway: --force-fit")
+        warn(line + " - going on (--force-fit)")
+        return None
+    warn(line)
+    return fit
+
+
+def choose_model(a, models: Path, inst: dict, pc: dict | None = None) -> tuple:
     """("download", one of MODELS) or ("local", the model's first .gguf file): --gguf-dir, --model, else asked among
     the downloads - the earlier download is the default.  ("exl3", the folder): --model-dir naming an EXL3 folder of
-    GLM-5.3-Flash."""
+    GLM-5.3-Flash.  `pc` (check_pc's): the rows of quants that cannot start on its one card say so (glm_fit_verdict),
+    and the recommendation is one that can."""
     metal = getattr(a, "backend", None) == "metal"
     if getattr(a, "model_dir", None) and exl3_folder_family(a.model_dir) == "glm":
         if metal:
@@ -1956,6 +2191,11 @@ def choose_model(a, models: Path, inst: dict) -> tuple:
         cards = [g for g in S.gpus() if g.get("vram_gb")]
     except Exception:  # noqa: BLE001 - no NVIDIA tools (AMD): no card-based recommendation
         cards = []
+    if not cards:   # AMD: the same recommendation, from the cards ROCm or Windows lists
+        try:
+            cards = [g for g in S.amd_gpus() if g.get("vram_gb")]
+        except Exception:  # noqa: BLE001 - no card-based recommendation
+            cards = []
     top = "Maya-S24" if cards and all(g["vram_gb"] <= 24.5 for g in cards) and "Maya-S24" in MODELS else opts[0]
     # by this PC's VRAM + RAM (fit_recommendation): no larger than that one, Maya-S24 only where it is that one (its
     # 4-bit attention is for small cards); the cache at the default context sized as GLM-5.3's (G53.KV_BYTES: its
@@ -1968,13 +2208,33 @@ def choose_model(a, models: Path, inst: dict) -> tuple:
     sizes = {q: MODELS[q]["download_gb"] for q in opts if q in (top, "Maya-XS-IQ1_S") or
              (q != "Maya-S24" and not is_exl3(q))}
     rec = fit_recommendation(sizes, gpus, ram, DEFAULT_CONTEXT * G53.KV_BYTES / 2**30, top)
-    default = inst["quant"] if inst.get("quant") in MODELS or inst.get("quant") in g53 else rec
+    # the quants that cannot start on this PC's one card (glm_fit_verdict): marked, and never the recommendation
+    # where a smaller one can
+    try:
+        used = gpu_used_mib() if glm_fit_card(pc, {}) else {}
+        nofit = {q: v for q in opts for v in [glm_fit_verdict(q, pc, used=used)]
+                 if v and v["verdict"] in ("no", "slow")}
+    except Exception:  # noqa: BLE001 - the card does not read: no marks
+        nofit = {}
+    if rec in nofit:
+        rec = next((q for q in sorted(sizes, key=lambda q: -sizes[q]) if q not in nofit and sizes[q] <= sizes[rec]),
+                   rec)
+    default =inst["quant"] if inst.get("quant") in MODELS or inst.get("quant") in g53 else rec
+    part = getattr(a, "glm_part", None)                # (the model menu's row: "flash" or "glm53"; None: not asked)
+    if part == "glm53":                                # (each row of the model menu lists its own model's files)
+        opts = []
+    elif part == "flash":
+        g53 = []
     rows = []
     for q in opts:
         m, d = MODELS[q], download_dir(models, q)
         have = all(p.exists() for p in local_shards(m, d))
         rows.append((f"{Q.shown('glm', q)}: " + (f"downloaded, in {d}" if have else
                                                  f"download {m['download_gb']:.1f} GB from Hugging Face"),
+                     (f"does not fit this PC's {nofit[q]['card']['vram_gb']:.0f} GB card"
+                      if nofit[q]["verdict"] == "no" else
+                      f"runs slowly on this PC's {nofit[q]['card']['vram_gb']:.0f} GB card (experts on the CPU)")
+                     if q in nofit else
                      ("recommended for cards of 24 GB or less" if q == "Maya-S24" else "recommended") if q == rec
                      else None, m["about"]))
     # GLM-5.3 (744B)'s own recommendation where it lists more than one (fit_recommendation by g53_figures' memory),
@@ -1989,10 +2249,15 @@ def choose_model(a, models: Path, inst: dict) -> tuple:
                      (f"downloaded, in {d}" if have else f"download {m['download_gb']:.1f} GB from Hugging Face"),
                      f"recommended for {G53.SHOWN}" if q == rec53 else None,
                      f"{m['about']}; {g53_memory_note(quant=q)}"))
-    rows.append((f"{G53.SHOWN} (744B, text only): GGUF files you already have", None,   # GLM-5.3 (744B, glm-dsa)
-                 "Z.ai's GLM-5.3 on the same engine; set up from its GGUF folder with --gguf-dir <folder>"))
-    pick = choose("Which GLM-5.3-Flash?", ["The model to download (GLM-5.3-Flash GGUF files you already have: "
-                                           "--gguf-dir <file or folder>):"], rows, (opts + g53).index(default), a.yes)
+    if part != "flash":
+        rows.append((f"{G53.SHOWN} (744B, text only): GGUF files you already have", None,   # GLM-5.3 (744B, glm-dsa)
+                     "Z.ai's GLM-5.3 on the same engine; set up from its GGUF folder with --gguf-dir <folder>"))
+    if default not in opts + g53:                      # (the other model's file was the default: this model's own)
+        default = (rec53 or g53[0]) if part == "glm53" and g53 else rec
+    name = G53.LABEL if part == "glm53" else "GLM-5.3-Flash"
+    pick = choose(f"Which {name}?", [f"The model to download ({name} GGUF files you already have: "
+                                     "--gguf-dir <file or folder>):"], rows,
+                  (opts + g53).index(default) if default in opts + g53 else 0, a.yes)
     if pick >= len(opts) + len(g53):
         fail(f"{G53.SHOWN} is set up from its GGUF files", f"{ME} --setup --gguf-dir <the folder of its .gguf files>")
     return "download", (opts + g53)[pick]
@@ -3953,7 +4218,7 @@ def write_config(a, pc, meta, pack: Path, quant: str, ctx: int, models: Path, vi
                 total_ram += sum(g.get("vram_gb", 0) for g in gpus)
             hip_env.update({"MAYA_GLM_PREFILL_SUB": "1024",
                             "MAYA_GLM_PREFILL_MB": "6144" if total_ram >= 96 else "4096"})
-        elif min(g.get("vram_gb", 0) for g in gpus) >= 20:
+        elif min(g.get("vram_gb", 0) for g in gpus) >= 19.5:   # (an RX 7900 XT reports 19.98)
             hip_env.update({"MAYA_GLM_PREFILL_SUB": "1024", "MAYA_GLM_PREFILL_MB": "4096"})
         # Pass every available version per architecture: the engine's existing header guard selects the
         # table matching each card and its installed hipBLASLt, or keeps plain hipBLAS when none matches.
@@ -4350,19 +4615,70 @@ def stale_tuning(cfg: dict) -> str | None:
 
 def busy_gpus(cfg: dict) -> list:
     """The config's GPUs with more than 1 GiB of VRAM in use (another engine on them): [(index, MiB)]."""
-    try:
-        txt = subprocess.run(["nvidia-smi", "--query-gpu=index,memory.used", "--format=csv,noheader,nounits"],
-                             capture_output=True, text=True, timeout=30).stdout
-    except (OSError, subprocess.SubprocessError):
-        return []
-    used = {}
-    for line in txt.splitlines():
-        i, _, m = line.partition(",")
-        try:
-            used[int(i)] = int(float(m))
-        except ValueError:
-            pass
+    used = gpu_used_mib()
     return [(i, used[i]) for i in cfg.get("gpu") or [] if used.get(i, 0) > 1024]
+
+
+# The most a GPU's memory in use can be and still be a display's and the desktop's (#794): 1.5 GiB.  More, and a
+# measurement asked for by name still refuses, as it does for a Maya engine on the GPU
+DISPLAY_MIB = 1536
+
+# Maya's engines as the GPU's process list names them (and the names they had before the rename)
+ENGINE_PROCESSES = ("maya", "maya-ds4", "maya-mm3", "maya-glm-helper", "strata", "strata-ds4")
+
+
+def maya_engines_on(cfg: dict) -> list:
+    """The Maya engines holding memory on the config's GPUs: [(index, process name, pid)] (nvidia-smi's process list;
+    [] where it has none, as on AMD)."""
+    def query(what):
+        try:
+            return subprocess.run(["nvidia-smi", f"--query-{what}", "--format=csv,noheader,nounits"],
+                                  capture_output=True, text=True, timeout=30).stdout
+        except (OSError, subprocess.SubprocessError):
+            return ""
+    index = {}
+    for line in query("gpu=index,uuid").splitlines():
+        i, _, uuid = (s.strip() for s in line.partition(","))
+        if i.isdigit():
+            index[uuid] = int(i)
+    mine, out = set(cfg.get("gpu") or []), []
+    for line in query("compute-apps=gpu_uuid,pid,process_name").splitlines():
+        parts = [s.strip() for s in line.split(",", 2)]
+        if len(parts) < 3:
+            continue
+        exe = re.split(r"[\\/]", parts[2])[-1].lower()
+        exe = exe[:-4] if exe.endswith(".exe") else exe
+        if exe in ENGINE_PROCESSES and index.get(parts[0]) in mine:
+            out.append((index[parts[0]], exe, parts[1]))
+    return out
+
+
+def busy_skip(cfg: dict, asked: bool, name: str, gpus: str, tail: str) -> bool:
+    """A measurement's look at the config's GPUs before it loads the model: True = skip it (the warning says why).
+    A GPU that drives a display already holds some memory, and read as another model loaded (#794): a measurement
+    asked for by name (--speed-calibration, --calibrate) runs anyway when what is in use can be a display's (at most
+    DISPLAY_MIB a GPU, and no Maya engine on it), with a warning that says how much; another Maya model loaded there,
+    or more memory in use, still refuses.  The automatic ones (a setup's or a start's own) skip on a busy GPU, as
+    before."""
+    busy = busy_gpus(cfg)
+    if not busy:
+        return False
+    used = ", ".join(f"GPU {i} has {m} MiB in use" for i, m in busy)
+    if asked:
+        engines = maya_engines_on(cfg)
+        if engines:
+            warn(f"{name} needs {gpus} to itself: {used} - another Maya model is loaded there (" +
+                 ", ".join(f"{exe} on GPU {i}, PID {pid}" for i, exe, pid in engines) + "): stop it, then ask again")
+            return True
+        if any(m > DISPLAY_MIB for _, m in busy):
+            warn(f"{name} needs {gpus} to itself: {used} - more than a display uses (at most {DISPLAY_MIB} MiB a GPU): "
+                 "stop what holds it (a model server still running?), then ask again")
+            return True
+        warn(f"{name} runs although {used} - no more than a display and the desktop use, so it measures anyway, as "
+             "asked (the speeds can read a little lower than on a GPU with nothing else on it)")
+        return False
+    warn(f"{name} needs {gpus} to itself: {used}{tail}")
+    return True
 
 
 def calibrate_config(cfg_path: Path) -> bool:
@@ -4383,10 +4699,8 @@ def calibrate_config(cfg_path: Path) -> bool:
     if cfg.get("backend") == "metal":
         warn("the tuning measures the CUDA engine's CPU lane: it does not apply to the Metal engine")
         return False
-    busy = busy_gpus(cfg)
-    if busy:
-        warn("the tuning needs the GPU(s) to itself: " + ", ".join(f"GPU {i} has {m} MiB in use" for i, m in busy) +
-             " (a model server still running?) - stop it, then run ./maya.sh --calibrate")
+    if busy_skip(cfg, True, "the tuning", "the GPU(s)",          # (always asked for: --calibrate, or a yes at the setup)
+                 " (a model server still running?) - stop it, then run ./maya.sh --calibrate"):
         return False
     say()
     say("  Tuning Maya for this PC: the output speed is measured with a few splits of the work between the CPU and")
@@ -4441,10 +4755,8 @@ def calibrate_ds4_config(cfg_path: Path) -> bool:
     """Tune maya-ds4 on this PC (tools/calibrate_ds4_tp.py): --tp and --cpu-threads go into the config's args and
     into CAL_STORE for this PC, quant and context (a setup again applies them where the config before had none)."""
     cfg = read_json(cfg_path)
-    busy = busy_gpus(cfg)
-    if busy:
-        warn("the tuning needs the GPU(s) to itself: " + ", ".join(f"GPU {i} has {m} MiB in use" for i, m in busy) +
-             " (a model server still running?) - stop it, then run ./maya.sh --calibrate")
+    if busy_skip(cfg, True, "the tuning", "the GPU(s)",          # (always asked for: --calibrate, or a yes at the setup)
+                 " (a model server still running?) - stop it, then run ./maya.sh --calibrate"):
         return False
     found = {g["index"]: g for g in S.gpus() or []}
     vram = [found[i]["vram_gb"] for i in cfg.get("gpu") or [] if i in found]
@@ -4557,7 +4869,7 @@ def speed_calibration(cfg_path: Path, why: str = "") -> bool:
     changed, and a failure is recorded so that a start does not try again by itself)."""
     cfg = read_json(cfg_path)
     if cfg.get("backend") == "metal":
-        warn("no speed calibration on Metal: MTP and DFlash2 are both exact, which is faster here is your choice "
+        warn("no speed calibration on Metal: MTP and DFlash2 both write only tokens the model checks; which is faster here is your choice "
              f"({ME} --setup --draft mtp|dflash2)")
         return False
     if config_family(cfg) == "qwen":                   # (CYBER-FROST: its MTP drafter or none)
@@ -4576,11 +4888,8 @@ def speed_calibration(cfg_path: Path, why: str = "") -> bool:
         return False
     one = len(cfg.get("gpu") or [0]) < 2
     other = "no drafting" if one else "the MTP block"
-    busy = busy_gpus(cfg)
-    if busy:
-        warn("the speed calibration needs the GPU(s) to itself: " +
-             ", ".join(f"GPU {i} has {m} MiB in use" for i, m in busy) +
-             f" (a model server still running?) - it runs at the next start, or: {ME} --speed-calibration")
+    if busy_skip(cfg, why == "asked for", "the speed calibration", "the GPU(s)",
+                 f" (a model server still running?) - it runs at the next start, or: {ME} --speed-calibration"):
         return False
     without = CD.without_dflash(cfg)
     cal = saved_calibration(without)                   # the CPU lane tuned on this PC without DFlash2: that side as so
@@ -4651,17 +4960,14 @@ def speed_calibration_g53(cfg_path: Path, cfg: dict, why: str = "") -> bool:
     """GLM-5.3 on one APU: its sustained decode speed with one-GPU drafting (the MTP block drafts, one verify pass
     checks: the same tokens) and without, measured here as tools/calibrate_draft.py measures DFlash2.  The faster is
     kept; within G53_DRAFT_TIE the setup's own default (installer.one_gpu_drafting) stays.  False: not measured."""
-    busy = busy_gpus(cfg)
-    if busy:
-        warn("the speed calibration needs the GPU to itself: " +
-             ", ".join(f"GPU {i} has {m} MiB in use" for i, m in busy) +
-             f" (a model server still running?) - it runs at the next start, or: {ME} --speed-calibration")
+    if busy_skip(cfg, why == "asked for", "the speed calibration", "the GPU",
+                 f" (a model server still running?) - it runs at the next start, or: {ME} --speed-calibration"):
         return False
     fallback = bool(((cfg.get("installer") or {}).get("one_gpu_drafting") or {}).get("on"))
     off, on = g53_with_drafting(cfg, False), g53_with_drafting(cfg, True)
     say()
     say("  Speed calibration: drafting with the MTP block on this GPU, or not?" + (f" ({why})" if why else ""))
-    say("  Drafting writes the same answers; whether it is faster depends on how much of the model the GPU holds.")
+    say("  The model checks every drafted token; whether drafting is faster depends on how much of the model the GPU holds.")
     say(f"  Maya loads the model twice (no drafting, then drafting); each time it writes about "
         f"{G53_DRAFT_PROBE['tokens']} tokens of")
     say("  short answers (code, an explanation, plain text, thinking) after a warm-up, and the speeds are compared.")
@@ -4828,10 +5134,8 @@ def link_calibration(cfg_path: Path, why: str = "") -> bool:
     if reason:
         warn(f"both GPUs: not measured ({reason})")
         return False
-    busy = busy_gpus(cfg)
-    if busy:
-        warn("the both-GPU measurement needs the GPU to itself: " +
-             ", ".join(f"GPU {i} has {m} MiB in use" for i, m in busy) + f" - {ME} --speed-calibration tries again")
+    if busy_skip(cfg, why == "asked for", "the both-GPU measurement", "the GPU",
+                 f" - {ME} --speed-calibration tries again"):
         return False
     glm = mixed_family(cfg) == "glm"
     alone = {**json.loads(json.dumps(cfg)), "mixed_gpus": False}
@@ -4921,11 +5225,8 @@ def prefill_calibration(cfg_path: Path, why: str = "") -> bool:
     every start); the result also in the config (installer.prefill_calibration).  False: not measured (the reason is
     shown; the engine then reads prompts with its defaults)."""
     cfg = read_json(cfg_path)
-    busy = busy_gpus(cfg)
-    if busy:
-        warn("the prefill calibration needs the GPU(s) to itself: " +
-             ", ".join(f"GPU {i} has {m} MiB in use" for i, m in busy) +
-             f" (a model server still running?) - {ME} --calibrate measures it later")
+    if busy_skip(cfg, why == "asked for", "the prefill calibration", "the GPU(s)",
+                 f" (a model server still running?) - {ME} --calibrate measures it later"):
         return False
     say()
     say(f"  Prefill calibration: how this PC reads prompts fastest" + (f" ({why})" if why else ""))
@@ -4971,11 +5272,8 @@ def speed_calibration_ds4(cfg_path: Path, cfg: dict, why: str = "") -> bool:
         warn(f"the speed calibration compares the model's DSpark drafter with no drafting, and this pack has no "
              f"drafter: {ME} --setup downloads it")
         return False
-    busy = busy_gpus(cfg)
-    if busy:
-        warn("the speed calibration needs the GPU(s) to itself: " +
-             ", ".join(f"GPU {i} has {m} MiB in use" for i, m in busy) +
-             f" (a model server still running?) - it runs at the next start, or: {ME} --speed-calibration")
+    if busy_skip(cfg, why == "asked for", "the speed calibration", "the GPU(s)",
+                 f" (a model server still running?) - it runs at the next start, or: {ME} --speed-calibration"):
         return False
     say()
     say("  Speed calibration: the DSpark drafter or none?" + (f" ({why})" if why else ""))
@@ -5082,6 +5380,12 @@ def set_ds4_mixed_gpus(cfg: dict, value: str | None) -> None:
     if not exe.is_file():
         warn(f"two GPUs: no CUDA build of maya-ds4 at {exe} - {ME} --setup builds it (or set mixed_exe in the "
              "config); until then the model runs on the AMD GPU alone")
+
+
+def measure_asked(a) -> str:
+    """A setup's speed calibration asked for by name (--speed-calibration, or --drafting measure): "asked for" - it
+    then runs on a GPU that already holds some memory (a display, #794) - else "" (the setup's own: it skips there)."""
+    return "asked for" if getattr(a, "speed_calibration", False) or getattr(a, "drafting", None) == "measure" else ""
 
 
 def drafting_choice(a, drafter: str, minutes: str) -> str:
@@ -5831,7 +6135,10 @@ def set_up(a, prev: dict) -> Path | None:
     models = (Path(a.models_dir).expanduser().resolve() if a.models_dir else
               Path(inst["models_dir"]) if inst.get("models_dir") else
               Path(inst["data_dir"]) / "models" if inst.get("data_dir") else ROOT.parent / "Maya-data" / "models")
-    choice = choose_model(a, models, inst)
+    choice = choose_model(a, models, inst, pc)
+    # a GLM-5.3-Flash quant that cannot start on this PC's one card: said here, before the tools, the build and the
+    # download (glm_fit_gate; --force-fit goes on)
+    fit = glm_fit_gate(a, choice[1], pc) if choice[0] == "download" and choice[1] in GLM_FIT else None
     if choice[0] == "download" and choice[1] in G53_MODELS:   # (GLM-5.3: "GLM-5.3 (744B) · UD-IQ2_M")
         ok(f"model: {G53.LABEL} · {Q.glm53_quant(choice[1])}, in {download_dir(models, choice[1])}")
     elif choice[0] == "download":
@@ -5851,7 +6158,12 @@ def set_up(a, prev: dict) -> Path | None:
             warn(f"a {context_label(ctx)} context's cache pushes experts to the SSD on this PC; "
                  f"{context_label(rec)} keeps the whole model in memory")
     else:
-        ctx = choose_context(a, prev_ctx, recommended=recommended_context(choice, pc))
+        rec_ctx = recommended_context(choice, pc)
+        fit_ctx = glm_fit_context(a, fit, getattr(a, "context", None))   # (the contexts that start on this card)
+        if fit_ctx:
+            ctx = choose_context(a, prev_ctx, fit_ctx, rec_ctx if rec_ctx in fit_ctx else fit_ctx[-1])
+        else:
+            ctx = choose_context(a, prev_ctx, recommended=rec_ctx)
     ok(f"context: {ctx} tokens")
     draft = choose_draft(a, pc, inst)
     ok("drafting: " + ("a DFlash2 drafter (downloaded with the model)" if draft == "dflash2" else "the MTP block"))
@@ -5883,7 +6195,7 @@ def set_up(a, prev: dict) -> Path | None:
     if not metal:                                      # (the Mac engine does not project a direction)
         ablate_step(cfg_path, "glm-dsa" if dsa else "glm", models)
     if dflash is not None and metal:                   # (the speed calibration is CUDA's: on a Mac the choice is yours)
-        ok("DFlash2 drafts on this Mac, not measured against the MTP block (both are exact): "
+        ok("DFlash2 drafts on this Mac, not measured against the MTP block (the model checks both): "
            f"{ME} --setup --draft mtp goes back")
     elif dflash is not None:                           # DFlash2: kept only if it makes THIS PC faster (measured)
         how = drafting_choice(a, "DFlash2", "5-20")
@@ -5892,7 +6204,7 @@ def set_up(a, prev: dict) -> Path | None:
         else:
             if S.UI is not None:                       # (the screen shows it in the tuning's tab)
                 S.UI.step(9, "speed calibration: DFlash2 or the MTP block")
-            speed_calibration(cfg_path)
+            speed_calibration(cfg_path, measure_asked(a))
     elif g53_one_gpu_drafting(read_json(cfg_path)):    # GLM-5.3 on one APU: drafting kept only where it is faster
         fallback = bool(read_json(cfg_path)["installer"]["one_gpu_drafting"].get("on"))
         how = "on" if fallback else "off"
@@ -5903,7 +6215,7 @@ def set_up(a, prev: dict) -> Path | None:
         else:
             if S.UI is not None:
                 S.UI.step(9, "speed calibration: drafting or not")
-            speed_calibration(cfg_path)
+            speed_calibration(cfg_path, measure_asked(a))
     # the tuning: asked for (--calibrate), or offered when nothing was tuned for this PC and model yet and someone
     # answers (--yes and --no-start setups are not held up by it)
     tuned = None
@@ -6208,9 +6520,9 @@ def ds4_vision_model(mmproj: bool = False) -> dict:
             "download_gb": sum(v[0] for v in man["files"].values()) / 1e9}
 
 
-def ds4_vision_dir(d: Path) -> Path:
-    """The vision tower's folder: beside the GGUFs' folders (as the drafter's), shared by every quant there."""
-    return d.parent / "vision"
+def ds4_vision_dir(d: Path, models: Path | None = None) -> Path:
+    """The shared vision folder; a model directly in --models-dir keeps it inside that folder."""
+    return (d if models is not None and d == models else d.parent) / "vision"
 
 
 def ds4_pack_has_vision(pack: Path) -> bool:
@@ -6795,7 +7107,9 @@ def ds4_pack_step(a, d: Path, gguf: bool = False, announce: bool = True, engram:
         shards += sorted(engram.glob("*.gguf"))
     drafter_new = gguf and (drafter or d.parent / "dspark" / "dspark.json").is_file() and not CDS.has_drafter(
         {"args": ["--pack", str(pack)]})               # (the drafter arrived after the pack was built)
-    vision_new = (gguf and (ds4_vision_dir(d) / "vision.json").is_file() and not ds4_pack_has_vision(pack)) or (
+    if gguf and vision_dir is None:
+        vision_dir = ds4_vision_dir(d)
+    vision_new = (gguf and (vision_dir / "vision.json").is_file() and not ds4_pack_has_vision(pack)) or (
         not gguf and vision_dir is not None and not ds4_pack_tower(pack))
     if not a.repack and read_json(pack / PACK_SOURCES).get("tools") == tools and not drafter_new and \
             not vision_new and all((pack / f).exists() for f in need) and pack_stale(pack, shards) is None:
@@ -6807,8 +7121,7 @@ def ds4_pack_step(a, d: Path, gguf: bool = False, announce: bool = True, engram:
         "Engram hash tables and the")
     say("  tokenizer (about a minute) ...")
     run([sys.executable, str(ROOT / "tools" / "ds4" / ("pack_gguf.py" if gguf else "pack.py")), "--model", str(d),
-         "--out", str(pack)] + (["--vision", str(ds4_vision_dir(d))] if gguf else
-                                ["--vision", str(vision_dir)] if vision_dir is not None else []) +
+         "--out", str(pack)] + (["--vision", str(vision_dir)] if vision_dir is not None else []) +
         (["--engram", str(engram)] if gguf and engram is not None else []) +
         (["--drafter", str(drafter)] if gguf and drafter is not None else []) +
         (["--shards"] + [Path(f).name for f in files] if gguf and files else []) +
@@ -6824,16 +7137,33 @@ def ds4_pack_step(a, d: Path, gguf: bool = False, announce: bool = True, engram:
     return pack
 
 
+def ds4_config_path(pc: dict, quant: str) -> Path:
+    """The config write_config_ds4 writes for `quant` on this PC's backend: maya-ds4.json (maya-ds4-hip.json on AMD),
+    the name it always had - unless that config is another DeepSeek quant's, which stays as it is: then one of this
+    quant's own (maya-deepseek-maya-s.json: maya-<its setup id>, as MiniMax's), so the quants are installed side by
+    side (two used to share the one name, and the second's setup took the first off the Models page - its files then
+    "files no model uses").  A quant that has a config of its own keeps it."""
+    suffix = "-hip" if pc.get("backend") == "hip" else ""
+    legacy = ROOT / f"maya-ds4{suffix}.json"
+    own = ROOT / f"maya-{Q.setup_id('deepseek', quant) or 'deepseek-' + quant}{suffix}.json"
+    if own.exists():
+        return own
+    # (a config without the setup's record - written by hand - is no other quant's: the setup writes it, as before)
+    return own if legacy.exists() and Q.config_key(read_json(legacy)) not in (None, quant) else legacy
+
+
 def write_config_ds4(a, pc: dict, meta: dict, pack: Path, ctx: int, models: Path, d: Path,
                      quant: str = "exl3", vision: bool | None = None) -> Path:
-    """maya-ds4.json and run-maya-ds4.sh.  A setup again keeps what the config before says that this one does not
-    ask: the engine settings below, the thinking level and sampling, where the server listens and its key.  vision:
-    whether the engine runs the vision tower (default: the EXL3 quant's own; a GGUF's when its pack has one)."""
+    """maya-ds4.json and run-maya-ds4.sh (a second quant beside it: a config of its own - ds4_config_path).  A setup
+    again keeps what the config before says that this one does not ask: the engine settings below, the thinking level
+    and sampling, where the server listens and its key - a quant's first config beside another's takes them from that
+    one, as it did when it replaced it.  vision: whether the engine runs the vision tower (default: the EXL3 quant's
+    own; a GGUF's when its pack has one)."""
     step(8, "the configuration and the start script")
     port = a.port or 8080
     hip = pc.get("backend") == "hip"
-    cfg_path = ROOT / ("maya-ds4-hip.json" if hip else "maya-ds4.json")
-    old = read_json(cfg_path)
+    cfg_path = ds4_config_path(pc, quant)
+    old = read_json(cfg_path if cfg_path.exists() else ROOT / ("maya-ds4-hip.json" if hip else "maya-ds4.json"))
     # --tp is the tensor-parallel group: two equal GPUs per group (a GPU without an equal neighbour runs
     # its layers alone).  On one GPU that group must be the GPU itself: with --tp 2 the prompt path falls
     # back to 16-token windows, and the chunked path (--threads on there) is what makes prompts fast.
@@ -6936,10 +7266,13 @@ def write_config_ds4(a, pc: dict, meta: dict, pack: Path, ctx: int, models: Path
 def set_up_ds4(a, prev: dict) -> Path | None:
     """DeepSeek-V4.1-Flash-1017's steps 1-8: the PC (Linux, RTX 30 / A100 or newer, the memory), the context, its
     engine (build/maya-ds4), the files, the pack, the config.  No tuning: the engine balances its own split."""
+    quant = choose_ds4_quant(a, prev)
+    if prev and Q.config_key(prev) != quant:           # (quants side by side: this quant's own config's answers, if any)
+        prev = next((c for c in map(read_json, configs()) if config_family(c) == "deepseek" and
+                     c.get("backend", "cuda") == prev.get("backend", "cuda") and Q.config_key(c) == quant), prev)
     inst = prev.get("installer") or {}
     prev_args = prev.get("args") or []
     prev_ctx = int(prev_args[prev_args.index("--max-context") + 1]) if "--max-context" in prev_args[:-1] else None
-    quant = choose_ds4_quant(a, prev)
     gguf = quant not in DS4_EXL3
     pc = check_pc(a, "deepseek", gguf, quant)          # 1
     step(2, "your choices")                            # 2
@@ -7008,13 +7341,14 @@ def set_up_ds4(a, prev: dict) -> Path | None:
     own = ds4_quant_drafter(quant) if gguf else None   # (Maya-XS: its own drafter beside the shared one)
     dj = d.parent / "dspark" / own["json"] if own is not None and drafter else None
     tower = None if gguf or a.no_vision else DS4_EXL3[quant].get("tower")   # (DeepSeek's BF16 tower for the quant's own)
-    vdir = ds4_exl3_vision_dir(models) if tower else None
+    vdir = ds4_vision_dir(d, models) if gguf else ds4_exl3_vision_dir(models) if tower else None
     pack = ds4_pack_step(a, d, gguf, engram=engram, files=files, drafter=dj, without=without,
-                         vision_dir=vdir if vdir is not None and (vdir / "vision.bin").is_file() else None)   # 6
+                         vision_dir=vdir if gguf or vdir is not None and (vdir / "vision.bin").is_file() else None)   # 6
     if gguf:                                           # 7 (DeepSeek's checkpoint's tower, added to the pack)
-        vision = ds4_vision_step(a, pc, d, mmproj=quant in DS4_UD)   # (UD quants: unsloth's mmproj, the same tower)
+        vision = ds4_vision_step(a, pc, d, mmproj=quant in DS4_UD, v=vdir)   # (UD quants: unsloth's mmproj, the same tower)
         if vision and not ds4_pack_has_vision(pack):
-            pack = ds4_pack_step(a, d, gguf, announce=False, engram=engram, files=files, drafter=dj, without=without)
+            pack = ds4_pack_step(a, d, gguf, announce=False, engram=engram, files=files, drafter=dj, without=without,
+                                 vision_dir=vdir)
         vision = vision and ds4_pack_has_vision(pack)
     elif tower:                                        # 7 (the quant's own tower is EXL3: DeepSeek's BF16 one instead)
         vision = ds4_vision_step(a, pc, d, v=vdir)
@@ -7044,7 +7378,7 @@ def set_up_ds4(a, prev: dict) -> Path | None:
         else:
             if S.UI is not None:
                 S.UI.step(9, "speed calibration: the DSpark drafter or none")
-            speed_calibration(cfg_path)
+            speed_calibration(cfg_path, measure_asked(a))
     return cfg_path
 
 
@@ -7617,7 +7951,7 @@ def set_up_mm3(a, prev: dict) -> Path | None:
         else:
             if S.UI is not None:
                 S.UI.step(9, "speed calibration: the DSpark drafter or none")
-            speed_calibration(cfg_path)
+            speed_calibration(cfg_path, measure_asked(a))
     return cfg_path
 
 
@@ -7903,7 +8237,7 @@ def qwen_draft_calibration(cfg_path: Path) -> bool | None:
             del args[i:i + 2]
     args += ["--mtp", str(mtp)]
     say()
-    say("  Measuring the MTP drafter on this PC: the same answer written with and without it (the model loads twice,")
+    say("  Measuring the MTP drafter on this PC: one answer written with and without it (the model loads twice,")
     say("  a few minutes) ...")
     with open(ROOT / "maya-mtp-calibration.log", "w", encoding="utf-8") as log:
         off = qwen_decode_rate(dict(cfg, args=args), ids, ["--mtp-max-t", "1"], log)
@@ -7992,7 +8326,7 @@ def choose_qwen_quant(a, prev: dict) -> str:
     rows = []
     for q in QWEN_QUANTS:
         m = qwen_entry(q)
-        rows.append((Q.shown("qwen", q, m["download_gb"]), "new" if q == QWEN_UD else None,
+        rows.append((Q.shown("qwen", q, m["download_gb"]), None,
                      "Qwen3.8-Flash-Next itself in unsloth's UD-IQ2_XS GGUF (its n-gram table from Maya's repo, its MTP "
                      f"head, the experts in about {m['memory_gb']:.0f} GB of VRAM and RAM together)" if q == QWEN_UD else
                      "Blackfrost-AI's cybersecurity fine-tune in peasantsmith's GGUF (Q5_K experts, all of them in about "
@@ -8181,12 +8515,17 @@ def main() -> int:
     ap.add_argument("--gpu", type=int, help="run on this one GPU (CUDA: nvidia-smi; HIP: KFD topology order, on Windows hipInfo's)")
     ap.add_argument("--gpus", help=f"split the model's layers across these GPUs (up to {MAX_GPUS}), e.g. 0,1 or "
                                    "0,1,2,3")
-    ap.add_argument("--context", type=int, help=f"context length in tokens (default {DEFAULT_CONTEXT})")
+    ap.add_argument("--context", type=int, help=f"context length in tokens (default {DEFAULT_CONTEXT}; a setup flag: "
+                                                 "a start of an installed config keeps its own, see --config)")
     ap.add_argument("--parallel", type=int, choices=range(1, 9), metavar="N",
                     help="GLM-5.3-Flash, DeepSeek-V4.1-Flash and MiniMax-M3.1-Flash: answer up to N requests at once "
                          "(1-8, default 1), kept in the config: they are decoded together, more tokens per second in "
                          "all; each extra conversation keeps its own context in VRAM, which the expert cache gives "
                          "up (MiniMax: no KV streaming and no DSpark while N is above 1)")
+    ap.add_argument("--force-fit", action="store_true",
+                    help="GLM-5.3-Flash: set up a quant even where the setup works out that it cannot start on this "
+                         "PC's one NVIDIA card, not even with its experts on the CPU (it then warns instead of "
+                         "stopping before the download)")
     ap.add_argument("--vram-reserve-mib", type=int, metavar="N",
                     help="VRAM in MiB the expert pool leaves free on each GPU for the driver, the desktop and other "
                          "programs (default 700), kept in the config")
@@ -8237,7 +8576,11 @@ def main() -> int:
     ap.add_argument("--no-speed-calibration", action="store_true",
                     help="the same as --drafting on: draft with the drafter without measuring it")
     ap.add_argument("--config", type=Path, help="the installed JSON config to start (its run-maya-<model>.sh does), or "
-                                              "for --bench or --report (default: most recently used)")
+                                              "for --bench or --report (default: most recently used). Starting an "
+                                              "installed config uses the settings saved in it: setup flags such as "
+                                              "--context or --model are ignored then (only the start's own apply: "
+                                              "--port, --host, --api-key, --gpus, and the few written into the config, "
+                                              "such as --parallel); add --setup to set up again with them")
     a = ap.parse_args()
     why = model_option(a)
     if why:

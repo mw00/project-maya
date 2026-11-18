@@ -94,6 +94,20 @@ int main() {
     {
         check(strata::platform::idle_env("MAYA_IDLE_GATE_TEST_UNSET_VARIABLE", 60) == 60, "an unset setting is the fallback");
     }
+    // the idle sleeps' lengths (#951): unset / empty / not a number is the engine's own length, a number is kept
+    // inside its range
+    {
+        using strata::platform::idle_sleep_setting;
+        check(idle_sleep_setting(nullptr, 100, 1, 10000) == 100, "an unset sleep is the fallback");
+        check(idle_sleep_setting("", 100, 1, 10000) == 100, "an empty sleep is the fallback");
+        check(idle_sleep_setting("500", 100, 1, 10000) == 500, "a sleep in range is taken");
+        check(idle_sleep_setting("20", 2, 1, 1000) == 20, "a long sleep in range is taken");
+        check(idle_sleep_setting("0", 100, 1, 10000) == 1, "a sleep below the range is its low end");
+        check(idle_sleep_setting("-5", 2, 1, 1000) == 1, "a negative sleep is the low end");
+        check(idle_sleep_setting("99999999", 100, 1, 10000) == 10000, "a sleep above the range is its high end");
+        check(idle_sleep_setting("fast", 100, 1, 10000) == 100, "a word is the fallback");
+        check(idle_sleep_setting("5ms", 2, 1, 1000) == 2, "a number with a unit is the fallback");
+    }
     if (failures == 0) std::printf("idle_gate_test: ok\n");
     return failures == 0 ? 0 : 1;
 }

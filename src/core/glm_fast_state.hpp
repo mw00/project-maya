@@ -73,6 +73,15 @@ inline bool repeatable(bool linked) {
     }();
     return env >= 0 ? env == 1 : linked;
 }
+// repeatable answers: the CPU-lane timing the expert splits plan with in powers of two (MAYA_GLM_LANE_STEPS=0:
+// the measured values - a few percent of timing noise between builds then moves experts and the answers' bits)
+inline bool lane_steps() {
+    static const bool on = [] {
+        const char* v = getenv("MAYA_GLM_LANE_STEPS");
+        return v == nullptr || std::atoi(v) != 0;
+    }();
+    return on;
+}
 // the boundaries a tier move or demotion takes before it goes live (0: as soon as its copy is done - timing)
 inline int fixed_moves(bool linked) {
     static const int env = [] {
@@ -550,6 +559,11 @@ struct Glm5Model::FastState {
     unsigned long long* tab = nullptr;
     gf::MoeRequest* ring_h = nullptr;
     gf::MoeResponse* resp_h = nullptr;
+    // the stall report (glm_fast_path.cu, StallWatch): the device's given-up waits (MoeDev::wait_diag, host-mapped [8]),
+    // the service thread's next ring entry and what it is doing (0 polling, 1 a route, 2 its CPU-lane experts)
+    unsigned int* wait_diag_h = nullptr;
+    std::atomic<unsigned int> svc_next{1};
+    std::atomic<int> svc_phase{0};
     float* emb_h = nullptr;     // pinned
     float* hop_h = nullptr;     // pinned, hc * n_embd
     int* tok_h = nullptr;       // pinned
@@ -655,6 +669,22 @@ struct Glm5Model::FastState {
         all_in_vram = all;
         all_resident = on && all;
     }
+    // Every expert a verify window's routes can pick in layers [l0, l1) is, as of the last boundary, in this device's
+    // VRAM or the linked helper's own: a route then only looks its experts up - no spare or scratch slot, no fetch, no
+    // CPU-lane split, no miss - so nothing a token's route does depends on what another token's route did before it,
+    // and the window's two orders (staggered groups / one pass) give the same answers and leave the same tables.
+    // With one expert elsewhere (the RAM tier, disk, on its way between tiers) that no longer holds: the groups have 4
+    // scratch slots each where one pass has 8 for the layer, so one order can run a window again token by token
+    // (window(): the scratch clash) where the other does not, and the routes it repeats move the counts and the tiers.
+    bool window_orders_agree(int l0, int l1, int n_expert) const {
+        for (int il = l0; il < l1; ++il) {
+            if (!L[(size_t) il].moe) continue;
+            const int* so = slot_of.data() + (size_t) il * n_expert;
+            for (int e = 0; e < n_expert; ++e)
+                if (so[e] < 0 && !helper.owns(il * n_expert + e)) return false;
+        }
+        return true;
+    }
     std::vector<uint32_t> cnt;   // il * n_expert + e -> LFU count (aged), over both tiers
     // ... and the long memory: routes per key across sessions (expert_usage.txt), halved when one passes 2^30 -
     // the warm-up fills the tiers in its order (this user's experts first)
@@ -716,6 +746,17 @@ struct Glm5Model::FastState {
     uint64_t diag_resident_skip = 0;   // RAM-resident mode: spare refills skipped (no free RAM slot, no drop)
     std::atomic<uint64_t> ring_laps{0};   // B2.5: times the service thread found the device a whole ring ahead
     uint64_t diag_dup = 0, diag_adopt = 0;   // the boundary's clean-up: duplicate RAM copies freed, lost ones adopted
+    // MAYA_GLM_TIER_VERIFY=1 (debug, off by default; fast_boundary): after every boundary the device's own tables are
+    // read back and checked against the host's - a RAM entry that points at a slot which no longer holds the expert
+    // ("stale": the next expert written there would be computed under this one's name), an expert resident in two
+    // VRAM slots, a VRAM entry whose slot holds another expert - and the routes count how often a stale entry was read
+    std::vector<unsigned long long> tv_tab;   // the device's table as read back (empty: the check is off)
+    std::vector<int> tv_stale;                // key -> the RAM slot its stale entry points at (the class's n: outside), -1
+    std::vector<uint8_t> tv_flag, tv_taint;   // key -> 1 in two VRAM slots | 2 entry and host disagree | 4 VRAM entry off;
+                                              // key -> a stale entry's bytes were promoted into VRAM under its name
+    std::vector<std::map<unsigned long long, int>> tv_rmap;   // per RAM class: slot pointer -> slot
+    uint64_t tv_n = 0, tv_stale_new = 0, tv_dup_new = 0, tv_split_new = 0, tv_vbad_new = 0, tv_lines = 0;
+    std::atomic<uint64_t> tv_use_same{0}, tv_use_wrong{0}, tv_promo_wrong{0}, tv_taint_use{0};
     size_t ram_bytes = 0;
     size_t all_bytes = 0;   // the bytes of every routed expert of this part's layers (the Monitor's tiers)
     // ---- demotions VRAM -> RAM (copy stream, D2H) of the victims that make room for spares
@@ -859,6 +900,15 @@ struct Glm5Model::FastState {
         float* wh = nullptr;                // EXL3: [tmax * 8][n_ff] each entry's h (F32)
         unsigned long long* grp_ptr = nullptr;
         int *grp_start = nullptr, *grp_ent = nullptr, *n_groups = nullptr;
+        float* hc_part = nullptr;           // [tmax][hc_part_n]: each token's own hc partials (win_hc_rows: the
+        size_t hc_part_n = 0;               // window's tokens' hyper-connections in one launch, gf::hc_rows)
+        uint8_t* hc_ctr = nullptr;          // [tmax] barrier counters 64 bytes apart, zeroed once
+        bool stagger_now = true;            // this window: two staggered groups (window() sets it: win_stagger_mode)
+        struct StagTrial {                  // MAYA_GLM_WIN_STAGGER=auto, per window size: [0] one pass, [1] staggered
+            int n[2] = {0, 0};
+            double sum[2] = {0.0, 0.0}, mx[2] = {0.0, 0.0};
+            int pick = -1;                  // -1: still measuring
+        } stag[17];                         // (Glm5Model::kWinMax + 1)
         unsigned int* scr = nullptr;        // [0] the layer's scratch claims, [1] sticky: a slot taken twice
         unsigned int* scr_h = nullptr;      // pinned: [1] read after the window
         unsigned int* cpu_seq_w = nullptr;  // [tmax] seq words 64 bytes apart

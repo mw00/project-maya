@@ -102,7 +102,16 @@ int main(int argc, char** argv) {
         std::printf("      the VNNI path cannot run here; only the scalar oracle can be exercised.\n");
         std::printf("      P2.S3's kernel check is SKIPPED, not passed.\n");
         std::printf("\nexpert_parity: 0 failures, 1 SKIPPED\n");
-        return 0;
+        return 77;                                      // (ctest's SKIP_RETURN_CODE: reported as skipped, not passed)
+    }
+
+    // ---- the pack is not in the repo: not on this PC, the test is SKIPPED with the file named (exit 77) - never a
+    //      pass; a pack that is there but too short still fails below
+    if (std::FILE* f = std::fopen(path, "rb")) {
+        std::fclose(f);
+    } else {
+        std::printf("expert_parity: SKIPPED, the pack is not on this PC: %s (give it with --file)\n", path);
+        return 77;
     }
 
     // ---- a real blob out of the pack: layer stride is 512 experts

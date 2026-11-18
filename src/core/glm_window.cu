@@ -115,6 +115,71 @@ static bool enable_peer_cached(int dst_dev, int src_dev) {
     return ok;
 }
 
+// A window's hyper-connections: one launch for all of a layer half's tokens (gf::hc_rows - each token the one-token
+// kernel's block function on its own rows, partials and barrier counter, so its values are hc()'s bit for bit) instead
+// of one launch a token.  The tokens of a half are independent (each reads and writes its own rows), and the
+// one-token launch is latency-bound (32 blocks, two grid barriers: ~20 us for under 1 MB of weights - 270 launches in a
+// 3-token window of 45 layers).  On by default on compute capability 7.0 (Tesla V100, the one measured);
+// MAYA_GLM_WIN_HC_ROWS=1 turns it on on any NVIDIA card, =0 off (A/B).  Not on AMD.
+bool win_hc_rows() {
+#if defined(STRATA_USE_HIP)
+    return false;
+#else
+    static std::atomic<int> cache[64];
+    int dev = 0;
+    cudaGetDevice(&dev);
+    if (dev < 0 || dev >= 64) return false;
+    int c = cache[dev].load(std::memory_order_relaxed);
+    if (c == 0) {
+        int major = 0, minor = 0;
+        cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
+        cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev);
+        const char* v = getenv("MAYA_GLM_WIN_HC_ROWS");
+        c = (v != nullptr ? std::atoi(v) != 0 : (major == 7 && minor == 0)) ? 1 : 2;
+        cache[dev].store(c, std::memory_order_relaxed);
+    }
+    return c == 1;
+#endif
+}
+
+// MAYA_GLM_WIN_STAGGER: a window's tokens in two interleaved groups (1), all a layer at a time (0), or whichever this
+// machine runs faster (auto).  The two groups overlap one group's attention with the other's CPU-lane answers, but
+// read every dense weight twice a layer (once a group); one pass reads them once and waits more.  Which one wins
+// depends on the device's memory speed against the lane's - a Tesla V100 whose lane is a helper GPU decodes 9% faster
+// in one pass, a slow CPU lane wants the groups.  auto: the first windows of each size alternate the two (kStagTrial
+// of each), then the faster stays.  The two orders give the same answers only while every expert the window can route
+// is in VRAM or the linked helper's own (FastState::window_orders_agree); with experts in the RAM tier or on disk they
+// can differ.  So auto times and chooses ONLY in windows where that holds (window() asks at each window's boundary);
+// every other window runs staggered, as 1 does, and is no sample - auto's answers are 1's on every machine, and the
+// timing can not move them.  0 is the explicit choice of one pass everywhere (answers may differ from 1's when
+// experts are not all in VRAM).  Unset: auto on compute capability 7.0 (the one measured), 1 elsewhere (as before).
+enum { kStagOff = 0, kStagOn = 1, kStagAuto = 2 };
+constexpr int kStagTrial = 12;
+int win_stagger_mode() {
+    static std::atomic<int> cache[64];
+    int dev = 0;
+    cudaGetDevice(&dev);
+    if (dev < 0 || dev >= 64) return kStagOn;
+    int c = cache[dev].load(std::memory_order_relaxed);
+    if (c == 0) {
+        const char* v = getenv("MAYA_GLM_WIN_STAGGER");
+        int mode = kStagOn;
+        if (v != nullptr) {
+            mode = std::strcmp(v, "auto") == 0 ? kStagAuto : std::atoi(v) != 0 ? kStagOn : kStagOff;
+        } else {
+#if !defined(STRATA_USE_HIP)
+            int major = 0, minor = 0;
+            cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
+            cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev);
+            if (major == 7 && minor == 0) mode = kStagAuto;
+#endif
+        }
+        c = mode + 1;
+        cache[dev].store(c, std::memory_order_relaxed);
+    }
+    return c - 1;
+}
+
 KdaIn kda_in(const Glm5Geometry& g, float* base, int tmax, int t) {
     const size_t DI = (size_t) g.d_inner(), T = (size_t) tmax;
     KdaIn k;
@@ -218,6 +283,7 @@ bool Glm5Model::win_alloc(int tmax, std::string& err) {
                         2 * al(T * 8 * 8) + 2 * al(T * 8 * f4) + al(T * E * f4) + al(T * f4) +
                         al(T * ((size_t) FF / 32 * q8)) + al(T * E * f4) + al(T * 8 * ((size_t) g.n_ff_exp / 32 * q8)) +
                         al(T * 8 * E * f4) + al(T * 8 * 8) + 3 * al((T * 8 + 1) * f4) + al(64) + al(T * 64) +
+                        al(T * ((4 * E / 512) * 26 + 64) * f4) + al(T * 64) +   // each token's hc partials and counter
                         (exl3_ ? al(T * 8 * (size_t) g.n_ff_exp * f4) : 0);
     if (cudaMalloc(&W.arena, need) != cudaSuccess) {
         cudaGetLastError();
@@ -277,6 +343,10 @@ bool Glm5Model::win_alloc(int tmax, std::string& err) {
     W.n_groups = (int*) take_b(at, (T * 8 + 1) * f4);
     W.scr = (unsigned int*) take_b(at, 64);
     W.cpu_seq_w = (unsigned int*) take_b(at, T * 64);
+    W.hc_part_n = (4 * E / 512) * 26 + 64;   // (as the token path's F->part)
+    W.hc_part = take_f(at, T * W.hc_part_n);
+    W.hc_ctr = (uint8_t*) take_b(at, T * 64);
+    cudaMemset(W.hc_ctr, 0, T * 64);
     if (exl3_) W.wh = take_f(at, T * 8 * (size_t) g.n_ff_exp);
     cudaMemset(W.cpu_seq_w, 0, T * 64);
     cudaMemset(W.mcpu_flag, 0, T * f4);
@@ -674,6 +744,31 @@ bool Glm5Model::fast_moe_window(int il, int t0, int T, int part, int gid, std::s
             }
             return mt;
         };
+        // the lane's answers for the group's tokens.  With a linked helper (MAYA_GLM_EXPERT_HELPER=link) one launch,
+        // a block a token (gf::moe_cpu_wait_rows - moe_cpu_wait's spin and its one add per value, for each token):
+        // an answer is 16 KB of host-mapped memory, which a kernel reads over the link - on a slow link (a V100 behind
+        // USB4: ~40 us an answer) the tokens' reads then overlap instead of following each other.
+        // MAYA_GLM_WIN_WAIT_ROWS=1 / 0: that launch with any lane / a launch a token, as before
+        static const int wait_rows_env = [] {
+            const char* v = getenv("MAYA_GLM_WIN_WAIT_ROWS");
+            return v == nullptr || v[0] == '\0' ? -1 : std::atoi(v) != 0 ? 1 : 0;
+        }();
+        const auto lane_wait = [&] {
+            const bool rows = (wait_rows_env >= 0 ? wait_rows_env == 1 : F->helper.linked()) && T > 1 &&
+                              T <= gf::kMaxMvNt && md.cpu_seq != nullptr;
+            if (!rows) {
+                for (int t = t0; t < t0 + T; ++t) gf::moe_cpu_wait(tok_dev(t), E, W.ffn + (size_t) t * E, s);
+                return;
+            }
+            gf::CpuWaitRows cw;
+            for (int t = t0; t < t0 + T; ++t) {
+                const gf::MoeDev mt = tok_dev(t);
+                cw.seq[t - t0] = mt.cpu_seq;
+                cw.ans[t - t0] = mt.cpu_ans;
+                cw.out[t - t0] = W.ffn + (size_t) t * E;
+            }
+            gf::moe_cpu_wait_rows(cw, T, E, s);
+        };
         // this layer's scratch claims (word 1 stays sticky): all 8 slots free, or the group's 4 (words 8 / 9 hold the
         // claim words that leave a group only its own slots free)
         unsigned int* scr = W.scr + (gid == 1 ? 2 : 0);
@@ -711,6 +806,14 @@ bool Glm5Model::fast_moe_window(int il, int t0, int T, int part, int gid, std::s
             mm.mt_sh_hq_s = (unsigned int) (W.sh_hq_s / q8);
             mm.mt_out_s = (unsigned int) E;
             mm.mt_cpu_s = (unsigned int) E;
+            // MAYA_GLM_WIN_ONCE=1: an expert several of the tokens routed is unpacked once for all of them (the same
+            // bits per token; a route's plan never names an expert twice).  Off here unless asked: this path has no
+            // timed choice (a linked helper's window call measures it - remote_experts.cpp win_run)
+            static const bool once_env = [] {
+                const char* v = getenv("MAYA_GLM_WIN_ONCE");
+                return v != nullptr && v[0] != 'a' && std::atoi(v) != 0;
+            }();
+            mm.mt_dedup = once_env ? 1 : 0;
             const size_t hq_t = 8 * ((size_t) g.n_ff_exp / 32) * q8;
             const bool sh = Ly.sh_down.q != nullptr;
             if (!gf::moe_experts_multi(Ly.gu_type, Ly.d_type, mm, g.n_exp_used, E, g.n_ff_exp, g.swiglu_exp,
@@ -731,8 +834,7 @@ bool Glm5Model::fast_moe_window(int il, int t0, int T, int part, int gid, std::s
                 }
             }
             if (prof_b) W.mark("moe_experts", s);
-            if (lane)
-                for (int t = t0; t < t0 + T; ++t) gf::moe_cpu_wait(tok_dev(t), E, W.ffn + (size_t) t * E, s);
+            if (lane) lane_wait();
             if (prof_b) W.mark("moe_cpu_wait", s);
             return true;
         }
@@ -826,8 +928,7 @@ bool Glm5Model::fast_moe_window(int il, int t0, int T, int part, int gid, std::s
             }
         }
         if (prof_b) W.mark("moe_experts", s);
-        if (lane)
-            for (int t = t0; t < t0 + T; ++t) gf::moe_cpu_wait(tok_dev(t), E, W.ffn + (size_t) t * E, s);
+        if (lane) lane_wait();
         if (prof_b) W.mark("moe_cpu_wait", s);
         return true;
     }
@@ -905,6 +1006,13 @@ bool Glm5Model::fast_window_layers(int64_t p0, int T, std::string& err) {
         // (--ablate: the window's rows are the bound conversation's - their writes lose the direction first)
         if (!attn) ablate(W.mixer + (size_t) t0 * E, n, s);
         else if (il != l0_) ablate(W.ffn + (size_t) t0 * E, n, s);
+        // (n == T: only when the window runs in one pass.  In the two staggered groups a group's fused launch gave
+        //  answers that changed run to run on one Tesla V100 32 GB with a CPU lane on a 2-socket Xeon - 3 starts, 3
+        //  answers, MAYA_GLM_REPEATABLE=1 - and with one launch a token there the answers are the old ones.  The cause
+        //  is not found: the same build, model and switches on another V100 with a CPU lane repeated its ids in every
+        //  start, fused or not.  Until it is, the groups keep one launch a token, as released.)
+        const bool one = n > 1 && n == T && n <= gf::kMaxMvNt && W.hc_part != nullptr && win_hc_rows();
+        gf::HcArgs hb[gf::kMaxMvNt];
         for (int t = t0; t < t0 + n; ++t) {
             gf::HcArgs h;
             h.block_out = attn ? (il == l0_ ? nullptr : W.ffn + (size_t) t * E) : W.mixer + (size_t) t * E;
@@ -927,8 +1035,15 @@ bool Glm5Model::fast_window_layers(int64_t p0, int T, std::string& err) {
             h.xq = (uint8_t*) W.xq + (size_t) t * W.xq_s;
             h.part = F->part;
             h.counter = F->counter;
-            gf::hc(h, s);
+            if (!one) {
+                gf::hc(h, s);
+                continue;
+            }
+            h.part = W.hc_part + (size_t) t * W.hc_part_n;
+            h.counter = (unsigned int*) (W.hc_ctr + (size_t) t * 64);
+            hb[t - t0] = h;
         }
+        if (one) gf::hc_rows(hb, n, s);
     };
     static const bool prof = getenv("MAYA_GLM_WIN_PROF") != nullptr;
     const auto mark = [&](const char* nm) {
@@ -1008,13 +1123,9 @@ bool Glm5Model::fast_window_layers(int64_t p0, int T, std::string& err) {
     // answers one group's experts the device runs the other group's attention and routes, where it used to wait.
     // One stream: the order alone keeps every dependency (B's attention reads A's caches and recurrent state at the
     // layer; the routes reach the host in order A(l), B(l), A(l + 1), ..), and each token's arithmetic is the same.
-    // MAYA_GLM_WIN_STAGGER=0: all the tokens a layer at a time (A/B)
-    static const bool stagger_env = [] {
-        const char* v = getenv("MAYA_GLM_WIN_STAGGER");
-        return v == nullptr || std::atoi(v) != 0;
-    }();
+    // MAYA_GLM_WIN_STAGGER=0: all the tokens a layer at a time; auto: window()'s measured choice (win_stagger_mode)
     static const bool batch_env = glmfast::off_by_default_on_amd("MAYA_GLM_WIN_BATCH");   // (fast_moe_window's)
-    const bool stagger = stagger_env && batch_env && T >= 2 && !W.per_token && W.mplan_ptr != nullptr;
+    const bool stagger = W.stagger_now && batch_env && T >= 2 && !W.per_token && W.mplan_ptr != nullptr;
     if (stagger) {
         const int ka = (T + 1) / 2, kb = T - ka;
         if (!pre(l0_, 0, ka, 1, 0) || !pre(l0_, ka, kb, 1, 1)) return false;
@@ -1098,6 +1209,35 @@ bool Glm5Model::window(const int32_t* tokens, int T, int32_t* out, std::string& 
     }
     cudaSetDevice(dev_);
     hlap(WH.h_setup);
+    // staggered or one pass (win_stagger_mode; the lead's device decides for every part): auto times kStagTrial windows
+    // of each for this window size, then keeps the faster
+    int stag_trial = -1;
+    {
+        const int smode = win_stagger_mode();
+        bool stag = smode != kStagOff;
+        // auto chooses only where both orders give the same answers: every part's experts in VRAM or the helper's as
+        // of this window's boundary (above).  Else staggered, the order 1 runs - and the window is no sample
+        bool agree = smode == kStagAuto && T >= 2;
+        for (Glm5Model* m = this; agree && m != nullptr; m = m->split_next_.get())
+            agree = m->fast_->window_orders_agree(m->l0_, m->l1_, g.n_expert);
+        if (smode == kStagAuto && T >= 2 && !agree) {
+            static std::atomic<bool> said{false};
+            if (!said.exchange(true))
+                std::fprintf(stderr, "glm window: experts outside VRAM - windows run as two staggered groups, no timed "
+                                     "choice (MAYA_GLM_WIN_STAGGER=0: one pass, answers may differ) - said once\n");
+        }
+        if (agree) {
+            auto& st = WH.stag[T];
+            if (st.pick >= 0) {
+                stag = st.pick != 0;
+            } else {
+                stag_trial = st.n[1] <= st.n[0] ? 1 : 0;
+                stag = stag_trial != 0;
+            }
+        }
+        for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) m->fast_->win.stagger_now = stag;
+    }
+    const auto stag_t0 = hclk::now();
     // a batched pass whose tokens took more scratch slots than a layer has runs again token by token (rare: the tiers
     // land a fetched expert in a spare slot first)
     for (int attempt = 0;; ++attempt) {
@@ -1216,6 +1356,21 @@ bool Glm5Model::window(const int32_t* tokens, int T, int32_t* out, std::string& 
         return false;
     }
     hlap(WH.h_wait);
+    if (stag_trial >= 0 && !WH.per_token) {   // (a window that ran again token by token is not a sample)
+        auto& st = WH.stag[T];
+        const double ms = std::chrono::duration<double, std::milli>(hclk::now() - stag_t0).count();
+        st.sum[stag_trial] += ms;
+        st.mx[stag_trial] = std::max(st.mx[stag_trial], ms);
+        ++st.n[stag_trial];
+        if (st.n[0] >= kStagTrial && st.n[1] >= kStagTrial) {
+            // each side's mean without its slowest window (a fetch or a first touch)
+            const double one = (st.sum[0] - st.mx[0]) / (st.n[0] - 1), two = (st.sum[1] - st.mx[1]) / (st.n[1] - 1);
+            st.pick = two <= one ? 1 : 0;
+            std::fprintf(stderr, "glm window: %d-token windows measured - two staggered groups %.1f ms, one pass %.1f ms "
+                                 "(%d windows each): %s from here (MAYA_GLM_WIN_STAGGER=1 / 0 forces one)\n",
+                         T, two, one, kStagTrial, st.pick ? "staggered" : "one pass");
+        }
+    }
     {
         const Glm5Model* last = this;
         while (last->split_next_) last = last->split_next_.get();

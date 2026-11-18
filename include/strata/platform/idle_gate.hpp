@@ -65,4 +65,18 @@ inline int idle_env(const char* name, int fallback) {
     return v != nullptr && *v != '\0' ? std::max(0, std::atoi(v)) : fallback;
 }
 
+// The lengths of the two idle sleeps before the deep idle (issue #951): the short one right after the spin
+// (MAYA_<prefix>_SERVICE_NAP_US, microseconds, 1..10000) and the long one after 10x the idle time
+// (MAYA_<prefix>_SERVICE_SLEEP_MS, milliseconds, 1..1000).  `text` is the setting's value: unset, empty or not a
+// whole number is the fallback (the engine's own length), a number outside lo..hi is brought to the nearer end.
+inline int idle_sleep_setting(const char* text, int fallback, int lo, int hi) {
+    if (text == nullptr || *text == '\0') return fallback;
+    char* end = nullptr;
+    const long v = std::strtol(text, &end, 10);
+    if (end == text || *end != '\0') return fallback;
+    return (int) std::min<long>(std::max<long>(v, (long) lo), (long) hi);
+}
+constexpr int kIdleNapUsMin = 1, kIdleNapUsMax = 10000;
+constexpr int kIdleSleepMsMin = 1, kIdleSleepMsMax = 1000;
+
 }  // namespace strata::platform

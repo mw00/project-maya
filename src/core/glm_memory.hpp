@@ -75,6 +75,17 @@ inline std::pair<size_t, bool> pool_reserve(size_t device_free, size_t reserve, 
     return {device_free - floor, true};
 }
 
+// What the "no room for the expert pool" error says about a reserve set by hand (#899): a smaller one is named only
+// where it can make the room - the pool's budget measured more than 0 and what is short fits in the reserve.  A budget
+// of 0 means the free VRAM read was no more than the reserve: something else holds the VRAM, and a smaller reserve
+// only moves that figure.  A default reserve is not named (the start already lowers it where that helps).
+enum class ReserveHint { none, smaller, budget_zero, short_beyond };
+inline ReserveHint reserve_hint(bool given, size_t budget, size_t short_bytes, size_t reserve) {
+    if (!given) return ReserveHint::none;
+    if (budget == 0) return ReserveHint::budget_zero;
+    return short_bytes <= reserve ? ReserveHint::smaller : ReserveHint::short_beyond;
+}
+
 // The check of a written budget: the bytes it gives back once `have` of the `asked` bytes were allocated and touched
 // and `free_after` was read - what the driver refused, plus what the reserve is short by and 64 MiB.  A read of
 // nearly nothing free (under 16 MiB) only says "at least": the first two give back 1 GiB each, later ones a quarter.
@@ -87,6 +98,24 @@ inline size_t pool_give_back(size_t asked, size_t have, size_t free_after, size_
         give += g;
     }
     return std::min(give, asked);
+}
+
+// The written budget's frees, back as free VRAM (#899).  On Linux HIP (two RX 9070s) the free figure read right after
+// the check freed its pieces still counted them as in use - the card's free VRAM less the reserve, all of it - so the
+// pool sized next found 0 slots a layer while the split had planned 74.  `read` gives the free VRAM now, `pause` waits
+// a little between reads: the figure is read until it is back within `slack` of `free_before` (the free VRAM read
+// before the budget was written), at most `max_polls` pauses.  Returns the last read; `polls` the pauses it took.
+template <class Read, class Pause>
+inline size_t await_check_frees(size_t free_before, size_t slack, int max_polls, Read&& read, Pause&& pause,
+                                int& polls) {
+    polls = 0;
+    size_t fr = read();
+    while (fr + slack < free_before && polls < max_polls) {
+        pause();
+        ++polls;
+        fr = read();
+    }
+    return fr;
 }
 
 inline bool minimal_ram_tier(bool unified, bool all_experts_fit, bool explicit_budget) {

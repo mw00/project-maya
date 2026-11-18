@@ -2926,7 +2926,8 @@ __global__ void __launch_bounds__(512) route_publish_kernel(const float* __restr
                                                             const float* __restrict__ x, int dim, int* idx, float* w,
                                                             unsigned long long* plan_ptr, Req* req,
                                                             const float* __restrict__ bias_vl, unsigned vl,
-                                                            int* cpu_any, float rs_w, int rs_k) {
+                                                            int* cpu_any, float rs_w, int rs_k,
+                                                            unsigned* count) {
     pdl_wait();
     pdl_trigger();
     __shared__ float sc[1024], bs[1024];
@@ -2980,6 +2981,7 @@ __global__ void __launch_bounds__(512) route_publish_kernel(const float* __restr
             w[(size_t) t * kPicks + r] = wv;
             plan_ptr[(size_t) t * kPicks + r] = kept ? vram[pick[r]] : 0ull;
             cpu |= kept && vram[pick[r]] == 0ull;
+            if (count != nullptr && kept) atomicAdd(count + pick[r], 1u);   // (the profile's routes: the lane's rule)
             if (req != nullptr) {
                 req->ids[t][r] = kept ? pick[r] : -1;
                 req->w[t][r] = wv;
@@ -3873,12 +3875,13 @@ ResidentSkip resident_skip() {
 void route_publish(const float* logits, const float* bias, int n, int k, int T, float route_scale,
                    const unsigned long long* vram, const float* x, int dim, int* idx, float* w,
                    unsigned long long* plan_ptr, Req* req, unsigned seq, cudaStream_t s, const float* bias_vl,
-                   unsigned vl, int na0, int na1, Resp* resp, int* cpu_any, const unsigned* host_done) {
+                   unsigned vl, int na0, int na1, Resp* resp, int* cpu_any, const unsigned* host_done,
+                   unsigned* count) {
     if (req == nullptr || host_done == nullptr) resp = nullptr;
     if (resp == nullptr) cpu_any = nullptr;
     const ResidentSkip rs = resident_skip();
     pdl_launch(route_publish_kernel, T, 512, 0, s, logits, bias, n, k, route_scale, vram, x, dim, idx, w, plan_ptr, req,
-               vl != 0 ? bias_vl : nullptr, vl, cpu_any, rs.w, rs.k);
+               vl != 0 ? bias_vl : nullptr, vl, cpu_any, rs.w, rs.k, count);
     if (req != nullptr) pdl_launch(publish_kernel, 1, 1, 0, s, req, T, seq, na0, na1, resp, cpu_any, host_done);
 }
 void route_ahead(const float* logits, const float* bias, int n, int m, int T, Req* req, int off, cudaStream_t s) {
