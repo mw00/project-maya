@@ -152,10 +152,18 @@ class Setup(unittest.TestCase):
         self.assertEqual([g["index"] for g in got], [0, 1, 2])
         self.assertTrue(seen[0].startswith("Hy4-flash runs best on all of them"), seen)
 
-    def test_linux_nvidia_only(self):
-        a = type("A", (), {"backend": "hip"})()
+    def test_not_on_metal(self):
+        a = type("A", (), {"backend": "metal"})()
         with patch.object(maya, "step"), self.assertRaises(SystemExit):
             maya.check_pc(a, "hy4")
+
+    def test_amd_on_linux_goes_to_the_hip_check(self):
+        a = type("A", (), {"backend": "hip"})()
+        with patch.object(maya, "step"), patch.object(maya, "WIN", False), \
+                patch.object(maya.sys, "platform", "linux"), \
+                patch.object(maya, "check_hip_pc", return_value={"backend": "hip"}) as hip:
+            self.assertEqual(maya.check_pc(a, "hy4"), {"backend": "hip"})
+        hip.assert_called_once_with(a, text_only=True)
 
 
 class Dashboard(unittest.TestCase):

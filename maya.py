@@ -779,7 +779,7 @@ QWEN_UD_MODEL_NAME = "qwen3.8-flash-next"
 QWEN_QUANTS = ("q5_k_m", QWEN_UD)
 # Hy4-flash (v1.1.68): Tencent's tencent/Hy4-flash (hy_v4_flash: 42 layers and an MTP block, MLA attention with a
 # sliding window and 12 indexed layers, 512 experts, 16 a token, 4 hyper-connection streams, Engram) in AngelSlim's
-# Q4_K_M GGUF (tools/hy4/download.json: pinned, sha256-checked), on its own engine maya-hy4 (NVIDIA, Linux): tensor
+# Q4_K_M GGUF (tools/hy4/download.json: pinned, sha256-checked), on its own engine maya-hy4 (NVIDIA or AMD, Linux): tensor
 # parallel over the equal GPUs (the fastest GPU holds the head and the drafts), else the layers split; the experts VRAM
 # does not hold computed on the CPU.  Its template thinks at one level (high) or not at all (no_think); its sampling
 # is its generation_config.json's (maya_quants.MODEL_DEFAULTS["hy4"]).  Text only.
@@ -1552,9 +1552,10 @@ def check_pc(a, family: str = "glm", gguf: bool = False, ds4_quant: str = "exl3"
     step(1, "checking this PC")
     ds4 = family == "deepseek"
     mm3 = family == "minimax"
-    if family == "hy4" and (WIN or a.backend in ("hip", "metal") or not sys.platform.startswith("linux")):
-        fail(f"{HY4}'s engine (maya-hy4) runs on Linux with NVIDIA GPUs only for now",
-             f"set it up on a Linux PC with an NVIDIA GPU, RTX 30 / A100 or newer ({ME} --setup --model hy4-flash)")
+    if family == "hy4" and (WIN or a.backend == "metal" or not sys.platform.startswith("linux")):
+        fail(f"{HY4}'s engine (maya-hy4) runs on Linux only for now",
+             f"set it up on a Linux PC with an NVIDIA GPU (RTX 30 / A100 or newer) or an AMD one (RX 7900 class) "
+             f"({ME} --setup --model hy4-flash)")
     if mm3 and WIN and not MM3_ALL_PLATFORMS:
         fail(f"{MM3}'s engine (maya-mm3) runs on Linux only for now (its Windows build is on the way)",
              f"set it up on a Linux PC with an NVIDIA GPU ({mm3_gpus()})")
@@ -1937,7 +1938,7 @@ def choose_family(a, prev: dict) -> str:
              f"Or the base model itself in unsloth's UD-IQ2_XS GGUF ({qwen_entry(QWEN_UD)['download_gb']:.0f} GB)."),
             (HY4, None,
              f"Tencent's Hy4-flash (512 experts, 16 a token) on its own engine: AngelSlim's Q4_K_M GGUF "
-             f"({hy4_entry()['download_gb']:.0f} GB); NVIDIA RTX 30 / A100 and newer, Linux; about "
+             f"({hy4_entry()['download_gb']:.0f} GB); NVIDIA RTX 30 / A100 and newer or AMD, Linux; about "
              f"{hy4_entry()['memory_gb']:.0f} GB of VRAM and RAM together{here}; tensor parallel across equal GPUs "
              "(the fastest one holds the head and the drafts), the experts that do not fit computed on the CPU; tool "
              "calls, thinking on or off, MTP drafting, up to a 128K context; text only.")]
@@ -8576,7 +8577,7 @@ def write_config_hy4(a, pc: dict, meta: dict, pack: Path, ctx: int, models: Path
 
 
 def set_up_hy4(a, prev: dict) -> Path | None:
-    """Hy4-flash's steps: the PC (NVIDIA RTX 30 / A100 or newer, Linux), the context (recommended by the smallest GPU's
+    """Hy4-flash's steps: the PC (Linux; NVIDIA RTX 30 / A100 or newer, or AMD), the context (recommended by the smallest GPU's
     VRAM) and drafting, the engine (build/maya-hy4), the files (pinned, sha256-checked), the pack, the config."""
     prev_args = [str(x) for x in prev.get("args") or []]
     prev_ctx = int(prev_args[prev_args.index("--max-context") + 1]) if "--max-context" in prev_args[:-1] else None

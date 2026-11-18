@@ -185,7 +185,7 @@ Its engine settings: [SETTINGS.md](SETTINGS.md#minimax-m31-flash).
 ## Hy4-flash
 
 **[Hy4-flash](https://huggingface.co/tencent/Hy4-flash)** (Tencent; 512 experts, 16 a token, up to 1 M tokens) runs
-on an engine of its own (`maya-hy4`, NVIDIA) from [AngelSlim's GGUF](https://huggingface.co/AngelSlim/Hy4-flash-GGUF)
+on an engine of its own (`maya-hy4`, NVIDIA and AMD) from [AngelSlim's GGUF](https://huggingface.co/AngelSlim/Hy4-flash-GGUF)
 (the download's license file, `License_AngelSlim_model_and_dataset.txt`, and Tencent's model card give the terms).
 
 **Set up:** `./maya.sh --setup --model hy4-flash` (or pick Hy4-flash in the setup's model list) checks the PC, builds
@@ -194,7 +194,7 @@ pack and `maya-hy4-flash.json`; `./maya.sh` starts it. `--drafting off` sets it 
 
 | Files | Size | Runs on |
 | --- | ---: | --- |
-| AngelSlim's **Q4_K_M** (`Hy4-flash-Q4_K_M-0000N-of-00002.gguf`): Q4_K experts (Q6_K downs on 19 layers), Q8_0 elsewhere | 157 GiB | NVIDIA, Linux |
+| AngelSlim's **Q4_K_M** (`Hy4-flash-Q4_K_M-0000N-of-00002.gguf`): Q4_K experts (Q6_K downs on 19 layers), Q8_0 elsewhere | 157 GiB | NVIDIA, AMD, Linux |
 
 - **Tensor parallel:** where two or more GPUs are of one kind, every layer runs on all of them at once (about twice
   the layer split's decode speed on eight RTX 5060 Ti); the fastest GPU holds the head and the drafter and computes a

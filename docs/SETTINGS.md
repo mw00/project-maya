@@ -2327,7 +2327,7 @@ Engine options, in the config's `"args"`:
 ## Hy4-flash
 
 Tencent's [Hy4-flash](https://huggingface.co/tencent/Hy4-flash) runs on an engine of its own, `maya-hy4` (NVIDIA;
-run on RTX 30 and RTX 50 cards), from [AngelSlim's GGUF set](https://huggingface.co/AngelSlim/Hy4-flash-GGUF) in place: 42 layers and
+run on RTX 30 and RTX 50 cards; AMD: run on RX 7900 XT, gfx1100), from [AngelSlim's GGUF set](https://huggingface.co/AngelSlim/Hy4-flash-GGUF) in place: 42 layers and
 an MTP block; 512 routed experts, 16 a token, and a shared one; MLA attention - 30 sliding-window layers of 512
 positions and 12 whose indexer picks 2048 positions in groups of 4 out of the whole context (up to 1M); four
 hyper-connection streams; and an n-gram (Engram) table read at 4 layers.
@@ -2408,6 +2408,17 @@ Measured on a 9-GPU NVIDIA PC (an RTX 3090 and eight RTX 5060 Ti on PCIe 3, two 
 
 Tensor parallel there fits up to 128K of context (the 3090 holding a share of the experts frees the others' VRAM);
 with `--chunk 2048` (the prompts' speed above) at 128K it needs `--reserve-gb 0.6`.
+
+On AMD: four RX 7900 XT (gfx1100, 20 GB; PCIe 3, one of them at x4), two Xeon sockets, 1 TB of RAM, Q4_K_M, `--mtp`.
+Tensor parallel cannot take these cards (a member holds its slice of every routed expert: about 40 GB), so the layer
+split runs, the rest of the experts on the CPU lane:
+
+| Context | Experts in VRAM | Decode, tok/s | Prompt, tok/s |
+|---|---:|---:|---:|
+| 128K | 61% | 28-33 (short prompts), 20 after a 4.4K prompt | 158 (4.4K) |
+| 512K, `--chunk 2048` | 50% | 25-30, 18 after a 4.4K prompt | 171 (4.4K) |
+
+The AMD build of the tensor-parallel path compiles but has not been run.
 
 **A prompt with tensor parallel.** A chunk's rows go through each layer in two staggered halves - one half's sums
 through the host while the other half computes - and the sums travel by blocks of rows, in F16 with a power-of-two
