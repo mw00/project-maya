@@ -294,7 +294,7 @@ token by token at the decode's speed (the batched prompt path needs pool room), 
 start - the log says both. It needs RAM for the experts to be of use: with less RAM than the experts' size the SSD
 serves the rest, slower again. Nothing changes on a card whose pool holds a route. It does not apply (the start
 stops as before, and the message says which) with the model split over several GPUs, with a DFlash drafter, with
-`--parallel` above 1 or on an APU; `MAYA_GLM_NO_POOL=0` keeps the old stop everywhere.
+`--parallel` above 1, on an APU, and for now with EXL3 files and with GLM-5.3 (744B); `MAYA_GLM_NO_POOL=0` keeps the old stop everywhere.
 
 At start the engine log says how much VRAM each GPU has free with everything loaded (`maya serve: CUDA0: ... MiB of
 VRAM free with everything loaded`). Under 256 MiB (512 on a split's later GPUs) it adds `LOW` and the reserve that would

@@ -1445,7 +1445,8 @@ bool Glm5Model::fast_setup(std::string& err) {
         // borrow (token by token) and the one-GPU MTP decode's verify rows would each cost their experts in full
         // (off).  Only where the start would stop: a pool that holds a route starts as before.  Not on a layer split,
         // with a DFlash drafter or with --parallel (their windows and rows share the scratch slots; untested), nor
-        // on unified memory (its pool is RAM: none left means none for the RAM tier either): those keep the refusal.
+        // on unified memory (its pool is RAM: none left means none for the RAM tier either), nor - until one is tested -
+        // an EXL3 pack or a glm-dsa model: those keep the refusal.
         // MAYA_GLM_NO_POOL=0 keeps the refusal everywhere.
         bool no_pool = false;
         std::string np_note;   // the refusal's: why the start without a pool is not taken
@@ -1456,6 +1457,8 @@ bool Glm5Model::fast_setup(std::string& err) {
                                        : dflash_on_        ? "a DFlash drafter is loaded - start without it"
                                        : seq_count() > 1   ? "--parallel is above 1 - start with --parallel 1"
                                        : F->unified_memory ? "this GPU's memory is the system's RAM"
+                                       : exl3_             ? "it is not tested with EXL3 packs yet"
+                                       : g_.arch == GlmArch::GlmDsa ? "it is not tested with GLM-5.3 (744B) yet"
                                                            : nullptr;
             no_pool = np_why == nullptr;
             if (!no_pool)
@@ -1468,7 +1471,7 @@ bool Glm5Model::fast_setup(std::string& err) {
             std::fprintf(stderr, "glm fast: CUDA%d: no room for an expert pool (%d slots a layer fit, a route needs %d - "
                                  "about %zu MiB short; the budget was %zu MiB, the free VRAM less the %zu MiB reserve): "
                                  "starting WITHOUT one - every expert is computed on the CPU from RAM or streamed to "
-                                 "the GPU for its token. Answers are the same; decoding and prompt reading are much "
+                                 "the GPU for its token. The model is the same; decoding and prompt reading are much "
                                  "slower than on a card that holds a pool\n",
                          dev_, per, g.n_exp_used, short_mib, avail >> 20, reserve >> 20);
             if (mtp_dec_) {
