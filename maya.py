@@ -1571,8 +1571,26 @@ def check_pc(a, family: str = "glm", gguf: bool = False, ds4_quant: str = "exl3"
         say("  the GPU's memory is the system's RAM: the engine fills it with the most-used experts and leaves the "
             "rest to the RAM tier and the SSD, so the free RAM at the start is what the pool can take")
     if vram < 23 and not ds4 and not mm3 and family != "qwen":
-        say(f"  {vram:.0f} GB of VRAM in total: the engine fills it with the most-used experts and serves the rest from "
-            "RAM and the SSD - give it a try (more VRAM is faster; tell us your speed)")
+        # one small card: can any GLM-5.3-Flash quant start on it at all (glm_fit_verdict)?  Where none can, say so
+        # here - the model's choice (step 2) then stops before any download
+        try:
+            small = {"backend": "cuda", "gpus": chosen}
+            fits = [glm_fit_verdict(q, small, used=u) for u in [gpu_used_mib() if glm_fit_card(small, {}) else {}]
+                    for q in GLM_FIT if q in MODELS]
+        except Exception:  # noqa: BLE001 - the card does not read: the usual line
+            fits = []
+        slow = fits and all(v and v["verdict"] in ("no", "slow") for v in fits)
+        if slow and any(v["verdict"] == "slow" for v in fits) and getattr(a, "glm_part", None) != "glm53":
+            say(f"  {vram:.0f} GB of VRAM on one card is too little to hold GLM-5.3-Flash's experts: it starts, with "
+                "the experts in RAM and computed on the CPU - much slower than on a card of 12 GB or more")
+        elif slow and getattr(a, "glm_part", None) != "glm53":
+            least = min(fits, key=lambda v: v["at"]["need"])["at"]
+            warn(f"{vram:.0f} GB of VRAM on one card is too little for GLM-5.3-Flash: its smallest quant needs about "
+                 f"{least['need'] / 1024:.1f} GB on the card before any expert is cached, and this card has "
+                 f"{least['have'] / 1024:.1f} GB free now (step 2 says what is short for the quant you pick)")
+        else:
+            say(f"  {vram:.0f} GB of VRAM in total: the engine fills it with the most-used experts and serves the rest "
+                "from RAM and the SSD - give it a try (more VRAM is faster; tell us your speed)")
     if min(archs) < VALIDATED_CC:
         warn("Pascal (compute capability 6.x) is experimental: the engine builds for it with its portable kernels "
              "(the prompt attention on the F32 cores) and caches global loads in L1 there, but Maya has not been "
@@ -1942,10 +1960,211 @@ def setup_gpus(a) -> list:
         return []
 
 
-def choose_model(a, models: Path, inst: dict) -> tuple:
+# Can a GLM-5.3-Flash GGUF quant start on this PC's one NVIDIA card?  Worked out before the download (glm_fit): the
+# engine refuses to start when, after everything that must sit on the card, the expert pool has no room for a route's
+# experts in every layer ("no room for the expert pool": src/core/glm_fast_path.cu) - an 8 GB card that also drives
+# the desktop found that out after 73 GB (2026-11-18).  Per quant, from its GGUF header on Hugging Face (the tensor
+# table of every shard, peasantsmith/GLM-5.3-Flash-Maya-GGUF at MODELS' revision; block 45 is the MTP block):
+#   "dense_mib": the weights the card always holds.  Maya-XS: the engine's own start line on an RTX 3050 ("dense weights
+#     5.24" GiB); Maya-S24 has the same non-expert tensors, byte for byte (5759 MiB), so the same figure.  The others
+#     ("computed"): their non-expert tensors less the token embedding (7445 - 496 MiB), times the 1.02 by which the
+#     same sum falls short of the engine's figure on Maya-XS (5263 against 5366 MiB)
+#   "slot_mib": one routed expert (gate + up + down) of each of the 45 layers, the pool's unit - Maya-XS 217.9 MiB by
+#     the header, 218.3 by the engine's message (1,747 MiB for 8)
+GLM_FIT = {
+    "Maya-XS-IQ1_S": {"dense_mib": 5366, "slot_mib": 217.9},
+    "Maya-S24": {"dense_mib": 5366, "slot_mib": 284.9},
+    "Maya-S-v2-IQ2_XXS": {"dense_mib": 7088, "slot_mib": 284.9, "computed": True},
+    "Maya-M": {"dense_mib": 7088, "slot_mib": 346.9, "computed": True},
+    "Maya-M-Derisked": {"dense_mib": 7088, "slot_mib": 346.9, "computed": True},   # (Maya-M's tensors, edited)
+    "Maya-L": {"dense_mib": 7088, "slot_mib": 477.2, "computed": True},
+}
+GLM_FIT_EXPERTS = 8                                # a route's experts (the header's expert_used_count): the pool's least
+# the context's state on the card, from the engine's start line on that card with the INT8 cache (0.28 GiB at 8K,
+# 0.45 at 32K): a fixed part and a part a position - with FP16 latents docs/GLM5-FLASH.md's 11.3 KB a position.  KV
+# streaming keeps KV_RESIDENT positions on the card, so a longer context is counted as that one (never more)
+GLM_FIT_STATE_MIB = 229
+GLM_FIT_KV_BYTES = {"int8": 7427, "fp16": 11571}
+GLM_FIT_KV_RESIDENT = 32768
+# the engine's working memory on the card - the CUDA context, the MTP block, scratch, the prompt path, activations:
+# that start line's "other" and "activations" (1.13 GiB) less the ~0.5 GiB the Windows desktop held (620-700 MiB over
+# three starts; drafting off and --prefill 0 did not lower it)
+GLM_FIT_WORK_MIB = 650
+GLM_FIT_RESERVE_MIB = 300                          # the least the engine's automatic reserve goes to (pool_reserve)
+# what the estimate can be off by: within it the setup warns and goes on (more for a quant whose dense figure is
+# computed, not read from an engine start)
+GLM_FIT_MARGIN_MIB = 300
+GLM_FIT_MARGIN_COMPUTED_MIB = 500
+# VRAM in use on the card now that counts against a model: the desktop's.  More than this is taken for a program
+# that can be closed (another engine: busy_gpus' 1 GiB) - said, never a reason to refuse
+GLM_FIT_USED_CAP_MIB = 1024
+
+
+def gpu_used_mib() -> dict:
+    """{GPU index: MiB of VRAM in use now} by nvidia-smi (the desktop and every program on the card); {} when it does
+    not answer."""
+    try:
+        txt = subprocess.run(["nvidia-smi", "--query-gpu=index,memory.used", "--format=csv,noheader,nounits"],
+                             capture_output=True, text=True, timeout=30).stdout
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    used = {}
+    for line in txt.splitlines():
+        i, _, m = line.partition(",")
+        try:
+            used[int(i)] = int(float(m))
+        except ValueError:
+            pass
+    return used
+
+
+def glm_fit_state_mib(ctx: int, kv: str | None = None) -> float:
+    """The VRAM a context's state takes on the leading card, MiB (GLM_FIT_STATE_MIB and GLM_FIT_KV_BYTES)."""
+    per = GLM_FIT_KV_BYTES["int8" if kv == "int8" else "fp16"]
+    return GLM_FIT_STATE_MIB + min(int(ctx), GLM_FIT_KV_RESIDENT) * per / 2**20
+
+
+def glm_fit(quant: str, total_mib: float, used_mib: float, ctx: int = DEFAULT_CONTEXT,
+            reserve_mib: int = GLM_FIT_RESERVE_MIB) -> dict | None:
+    """What GLM-5.3-Flash quant `quant` needs on one card of `total_mib` with `used_mib` already in use, at a context
+    of `ctx`, before it can start - each term in MiB: "dense", "state", "work" (GLM_FIT_WORK_MIB), "pool" (a route's
+    experts in every layer: GLM_FIT_EXPERTS slots), "reserve" (the VRAM kept free; the engine's automatic reserve goes
+    down to 300 MiB, its default is 700), their sum "need", the card's "have" (total less in use) and "short" (need
+    less have: above 0 the engine has no room for its expert pool).  None: a quant with no figures (GLM_FIT)."""
+    f = GLM_FIT.get(quant)
+    if not f:
+        return None
+    t = {"dense": float(f["dense_mib"]), "state": glm_fit_state_mib(ctx, MODELS.get(quant, {}).get("kv")),
+         "work": float(GLM_FIT_WORK_MIB), "pool": GLM_FIT_EXPERTS * f["slot_mib"], "reserve": float(reserve_mib)}
+    t["need"] = sum(t.values())
+    t["have"] = float(total_mib) - float(used_mib)
+    t["short"] = t["need"] - t["have"]
+    t.update(total=float(total_mib), used=float(used_mib), ctx=int(ctx),
+             margin=GLM_FIT_MARGIN_COMPUTED_MIB if f.get("computed") else GLM_FIT_MARGIN_MIB)
+    return t
+
+
+def glm_fit_card(pc: dict | None, used: dict | None = None) -> tuple | None:
+    """(the card, its VRAM in MiB, the MiB in use on it now) where glm_fit's figures hold: a setup on ONE NVIDIA card
+    with its own VRAM.  None anywhere else - two GPUs or more (the layers are split, each card holds a part), AMD
+    (HIP: its figures are not measured), a unified-memory GPU, Metal, a card whose VRAM does not read."""
+    gpus = (pc or {}).get("gpus") or []
+    if (pc or {}).get("backend", "cuda") != "cuda" or len(gpus) != 1:
+        return None
+    g = gpus[0]
+    if g.get("vendor") in ("amd", "apple") or g.get("unified_memory") or not g.get("vram_gb") or "index" not in g:
+        return None
+    used = gpu_used_mib() if used is None else used
+    return g, float(g["vram_gb"]) * 1024.0, float(used.get(g["index"], 0))
+
+
+def glm_fit_verdict(quant: str, pc: dict | None, contexts: list | None = None, used: dict | None = None) -> dict | None:
+    """Whether GLM-5.3-Flash quant `quant` can start on this PC's one card (glm_fit_card), None where that is not
+    known.  "verdict": "no" - short by more than the margin even at the smallest context the setup offers, and
+    without an expert pool too; "slow" - short there, but the engine starts without an expert pool (the experts stay
+    in RAM and are computed on the CPU: much slower); "tight" - within the margin there; "fits".  "contexts": the offered contexts that fit (within the margin), "at": glm_fit at
+    the smallest context, "card": the GPU, "in_use": all the VRAM in use now (of it at most GLM_FIT_USED_CAP_MIB
+    counts: more is a program that can be closed)."""
+    card = glm_fit_card(pc, used)
+    if card is None or quant not in GLM_FIT:
+        return None
+    g, total, in_use = card
+    counted = min(in_use, GLM_FIT_USED_CAP_MIB)
+    contexts = sorted(contexts or CONTEXTS)
+    fits = {c: glm_fit(quant, total, counted, c) for c in contexts}
+    at = fits[contexts[0]]
+    verdict = ("no" if at["short"] - at["pool"] > at["margin"] else "slow" if at["short"] > at["margin"] else
+               "tight" if at["short"] > -at["margin"] else "fits")
+    return {"verdict": verdict, "at": at, "card": g, "in_use": in_use, "quant": quant,
+            "contexts": [c for c in contexts if fits[c]["short"] <= fits[c]["margin"]],
+            "by_context": fits}
+
+
+def glm_fit_card_name(g: dict) -> str:
+    return f"{g.get('name') or 'card'} ({float(g['vram_gb']):.0f} GB)"
+
+
+def glm_fit_message(v: dict, others: list = ()) -> tuple:
+    """(what is short, what to do) for a quant that cannot start (glm_fit_verdict "no"): the terms, the card's room,
+    and the GLM-5.3-Flash quants that do fit this card (`others`)."""
+    t, G = v["at"], 1024.0
+    name = Q.shown("glm", v["quant"])
+    used = (f"{t['total'] / G:.1f} less the {t['used'] / G:.1f} GB the desktop and other programs use on it now"
+            if t["used"] >= 50 else "nothing else is on it")
+    what = (f"{name} cannot start on this PC's {glm_fit_card_name(v['card'])}: before any expert is cached it needs "
+            f"about {t['need'] / G:.1f} GB of VRAM at the smallest context ({context_label(t['ctx'])}) - dense weights "
+            f"{t['dense'] / G:.1f}, the context's state {t['state'] / G:.1f}, the engine's working memory "
+            f"{t['work'] / G:.1f}, the smallest expert pool {t['pool'] / G:.1f}, kept free {t['reserve'] / G:.1f} - "
+            f"and the card has {t['have'] / G:.1f} GB ({used}): about {t['short'] / G:.1f} GB short")
+    alone = t["short"] - t["used"]
+    how = ("with nothing else on the card it would be " + ("a tight fit" if alone > -t["margin"] else "enough")
+           + " (the desktop on another GPU or the CPU's graphics); " if t["used"] >= 50 and alone <= t["margin"] else "")
+    how += (("these GLM-5.3-Flash quants fit this card: " + ", ".join(Q.shown("glm", q) for q in others)) if others
+            else "no GLM-5.3-Flash quant fits this card") + \
+           "; the other models' memory needs: docs/MEMORY.md. Nothing was downloaded. To try anyway: --force-fit"
+    return what, how
+
+
+def glm_fit_gate(a, quant: str, pc: dict | None, used: dict | None = None) -> dict | None:
+    """The check before the download: a quant that cannot start on this card ends the setup here with what is short
+    (--force-fit: a warning, and on); one that starts only without an expert pool ("slow") and a tight one are said.
+    The verdict, or None where the check does not apply."""
+    v = glm_fit_verdict(quant, pc, used=used)
+    if v is None:
+        return None
+    if v["in_use"] > GLM_FIT_USED_CAP_MIB:
+        warn(f"{v['in_use'] / 1024:.1f} GB of this card's VRAM is in use now (another program, or a model that is "
+             "running): the engine gets what is free when it starts")
+    others = [] if v["verdict"] not in ("no", "slow") else [
+        q for q in GLM_FIT if q != quant and q in MODELS and q not in MODELS_BY_HAND
+        and (glm_fit_verdict(q, pc, used=used) or {}).get("verdict") in ("fits", "tight")]
+    if v["verdict"] == "no":
+        what, how = glm_fit_message(v, others)
+        if getattr(a, "force_fit", False):
+            warn(what + " - going on (--force-fit)")
+            return v
+        fail(what, how)
+    if v["verdict"] == "slow":
+        t = v["at"]
+        warn(f"{Q.shown('glm', quant)} will run slowly on this PC's {glm_fit_card_name(v['card'])}: the card has "
+             f"about {t['have'] / 1024:.1f} GB free and holding the model's experts takes about "
+             f"{t['need'] / 1024:.1f} GB, so Maya starts without an expert pool - the experts stay in RAM and are "
+             "computed on the CPU. The answers are the same; writing and reading prompts are much slower than on a "
+             "card that holds the experts"
+             + ("; these GLM-5.3-Flash quants fit this card: " + ", ".join(Q.shown("glm", q) for q in others)
+                if others else ""))
+    if v["verdict"] == "tight":
+        t = v["at"]
+        warn(f"{Q.shown('glm', quant)} is a tight fit on this PC's {glm_fit_card_name(v['card'])}: by the setup's "
+             f"estimate it needs about {t['need'] / 1024:.1f} GB of the card's {t['have'] / 1024:.1f} GB free at a "
+             f"{context_label(t['ctx'])} context, and the estimate can be off by {t['margin']} MiB. If the engine says "
+             "it has no room for the expert pool: close programs that use the card, or a lower --vram-reserve-mib")
+    return v
+
+
+def glm_fit_context(a, v: dict | None, ctx_wanted: int | None) -> list | None:
+    """The contexts to offer for a checked quant (glm_fit_gate's verdict): all of them where all fit or nothing is
+    known (None), else the ones that fit, said.  A --context that does not fit ends the setup (--force-fit: on)."""
+    if v is None or v["verdict"] in ("no", "slow") or len(v["contexts"]) == len(v["by_context"]):
+        return None
+    fit = v["contexts"] or [min(v["by_context"])]
+    big = v["by_context"][max(v["by_context"])]
+    line = (f"{Q.shown('glm', v['quant'])} starts on this card with a context of up to {context_label(max(fit))}: a "
+            f"longer one needs about {big['short'] / 1024:.1f} GB more VRAM than the card has free")
+    if ctx_wanted and ctx_wanted > max(fit):
+        if not getattr(a, "force_fit", False):
+            fail(line, f"--context {max(fit)} (or leave --context out); to try anyway: --force-fit")
+        warn(line + " - going on (--force-fit)")
+        return None
+    warn(line)
+    return fit
+
+
+def choose_model(a, models: Path, inst: dict, pc: dict | None = None) -> tuple:
     """("download", one of MODELS) or ("local", the model's first .gguf file): --gguf-dir, --model, else asked among
     the downloads - the earlier download is the default.  ("exl3", the folder): --model-dir naming an EXL3 folder of
-    GLM-5.3-Flash."""
+    GLM-5.3-Flash.  `pc` (check_pc's): the rows of quants that cannot start on its one card say so (glm_fit_verdict),
+    and the recommendation is one that can."""
     metal = getattr(a, "backend", None) == "metal"
     if getattr(a, "model_dir", None) and exl3_folder_family(a.model_dir) == "glm":
         if metal:
@@ -1989,7 +2208,18 @@ def choose_model(a, models: Path, inst: dict) -> tuple:
     sizes = {q: MODELS[q]["download_gb"] for q in opts if q in (top, "Maya-XS-IQ1_S") or
              (q != "Maya-S24" and not is_exl3(q))}
     rec = fit_recommendation(sizes, gpus, ram, DEFAULT_CONTEXT * G53.KV_BYTES / 2**30, top)
-    default = inst["quant"] if inst.get("quant") in MODELS or inst.get("quant") in g53 else rec
+    # the quants that cannot start on this PC's one card (glm_fit_verdict): marked, and never the recommendation
+    # where a smaller one can
+    try:
+        used = gpu_used_mib() if glm_fit_card(pc, {}) else {}
+        nofit = {q: v for q in opts for v in [glm_fit_verdict(q, pc, used=used)]
+                 if v and v["verdict"] in ("no", "slow")}
+    except Exception:  # noqa: BLE001 - the card does not read: no marks
+        nofit = {}
+    if rec in nofit:
+        rec = next((q for q in sorted(sizes, key=lambda q: -sizes[q]) if q not in nofit and sizes[q] <= sizes[rec]),
+                   rec)
+    default =inst["quant"] if inst.get("quant") in MODELS or inst.get("quant") in g53 else rec
     part = getattr(a, "glm_part", None)                # (the model menu's row: "flash" or "glm53"; None: not asked)
     if part == "glm53":                                # (each row of the model menu lists its own model's files)
         opts = []
@@ -2001,6 +2231,10 @@ def choose_model(a, models: Path, inst: dict) -> tuple:
         have = all(p.exists() for p in local_shards(m, d))
         rows.append((f"{Q.shown('glm', q)}: " + (f"downloaded, in {d}" if have else
                                                  f"download {m['download_gb']:.1f} GB from Hugging Face"),
+                     (f"does not fit this PC's {nofit[q]['card']['vram_gb']:.0f} GB card"
+                      if nofit[q]["verdict"] == "no" else
+                      f"runs slowly on this PC's {nofit[q]['card']['vram_gb']:.0f} GB card (experts on the CPU)")
+                     if q in nofit else
                      ("recommended for cards of 24 GB or less" if q == "Maya-S24" else "recommended") if q == rec
                      else None, m["about"]))
     # GLM-5.3 (744B)'s own recommendation where it lists more than one (fit_recommendation by g53_figures' memory),
@@ -4381,18 +4615,7 @@ def stale_tuning(cfg: dict) -> str | None:
 
 def busy_gpus(cfg: dict) -> list:
     """The config's GPUs with more than 1 GiB of VRAM in use (another engine on them): [(index, MiB)]."""
-    try:
-        txt = subprocess.run(["nvidia-smi", "--query-gpu=index,memory.used", "--format=csv,noheader,nounits"],
-                             capture_output=True, text=True, timeout=30).stdout
-    except (OSError, subprocess.SubprocessError):
-        return []
-    used = {}
-    for line in txt.splitlines():
-        i, _, m = line.partition(",")
-        try:
-            used[int(i)] = int(float(m))
-        except ValueError:
-            pass
+    used = gpu_used_mib()
     return [(i, used[i]) for i in cfg.get("gpu") or [] if used.get(i, 0) > 1024]
 
 
@@ -5912,7 +6135,10 @@ def set_up(a, prev: dict) -> Path | None:
     models = (Path(a.models_dir).expanduser().resolve() if a.models_dir else
               Path(inst["models_dir"]) if inst.get("models_dir") else
               Path(inst["data_dir"]) / "models" if inst.get("data_dir") else ROOT.parent / "Maya-data" / "models")
-    choice = choose_model(a, models, inst)
+    choice = choose_model(a, models, inst, pc)
+    # a GLM-5.3-Flash quant that cannot start on this PC's one card: said here, before the tools, the build and the
+    # download (glm_fit_gate; --force-fit goes on)
+    fit = glm_fit_gate(a, choice[1], pc) if choice[0] == "download" and choice[1] in GLM_FIT else None
     if choice[0] == "download" and choice[1] in G53_MODELS:   # (GLM-5.3: "GLM-5.3 (744B) · UD-IQ2_M")
         ok(f"model: {G53.LABEL} · {Q.glm53_quant(choice[1])}, in {download_dir(models, choice[1])}")
     elif choice[0] == "download":
@@ -5932,7 +6158,12 @@ def set_up(a, prev: dict) -> Path | None:
             warn(f"a {context_label(ctx)} context's cache pushes experts to the SSD on this PC; "
                  f"{context_label(rec)} keeps the whole model in memory")
     else:
-        ctx = choose_context(a, prev_ctx, recommended=recommended_context(choice, pc))
+        rec_ctx = recommended_context(choice, pc)
+        fit_ctx = glm_fit_context(a, fit, getattr(a, "context", None))   # (the contexts that start on this card)
+        if fit_ctx:
+            ctx = choose_context(a, prev_ctx, fit_ctx, rec_ctx if rec_ctx in fit_ctx else fit_ctx[-1])
+        else:
+            ctx = choose_context(a, prev_ctx, recommended=rec_ctx)
     ok(f"context: {ctx} tokens")
     draft = choose_draft(a, pc, inst)
     ok("drafting: " + ("a DFlash2 drafter (downloaded with the model)" if draft == "dflash2" else "the MTP block"))
@@ -8291,6 +8522,10 @@ def main() -> int:
                          "(1-8, default 1), kept in the config: they are decoded together, more tokens per second in "
                          "all; each extra conversation keeps its own context in VRAM, which the expert cache gives "
                          "up (MiniMax: no KV streaming and no DSpark while N is above 1)")
+    ap.add_argument("--force-fit", action="store_true",
+                    help="GLM-5.3-Flash: set up a quant even where the setup works out that it cannot start on this "
+                         "PC's one NVIDIA card, not even with its experts on the CPU (it then warns instead of "
+                         "stopping before the download)")
     ap.add_argument("--vram-reserve-mib", type=int, metavar="N",
                     help="VRAM in MiB the expert pool leaves free on each GPU for the driver, the desktop and other "
                          "programs (default 700), kept in the config")
