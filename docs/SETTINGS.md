@@ -2324,6 +2324,135 @@ Engine options, in the config's `"args"`:
 | `MAYA_EXPERT_RAM_GB` | unset (what the RAM allows) | caps the experts' RAM tier, in GB (the dashboard's Models page: Experts in RAM) |
 | `MAYA_EXPERT_STAGERS` | Linux: the reads at once the model's drive serves fastest (2, 4, 8 or 16, measured in ~1 s at the first start on a drive and kept in `~/.config/project-maya/drive-reads.txt`; `MAYA_EXPERT_DRIVE_PROBE=0` skips the measurement); otherwise a quarter of the CPU threads, 2 to 8 | the threads that read a layer's experts from the file while the CPU prepares the layer (their reads overlap); `0`: read one by one when the CPU needs them |
 
+## Hy4-flash
+
+Tencent's [Hy4-flash](https://huggingface.co/tencent/Hy4-flash) runs on an engine of its own, `maya-hy4` (NVIDIA;
+run on RTX 30 and RTX 50 cards), from [AngelSlim's GGUF set](https://huggingface.co/AngelSlim/Hy4-flash-GGUF) in place: 42 layers and
+an MTP block; 512 routed experts, 16 a token, and a shared one; MLA attention - 30 sliding-window layers of 512
+positions and 12 whose indexer picks 2048 positions in groups of 4 out of the whole context (up to 1M); four
+hyper-connection streams; and an n-gram (Engram) table read at 4 layers.
+
+**The pack.** `python tools/hy4/pack_gguf.py --model <folder>` writes `<folder>/maya-hy4/`: the geometry
+(`hy4.txt`), the index of the set's tensors (`tensors.txt`: names, types, offsets - no weights are copied), the
+n-gram hash (`engram.bin`) and the tokenizer with the GGUF's own chat template. It checks the whole set before it
+writes anything; a set still downloading, another architecture or a type the engine does not read is refused.
+Q4_K_M is the build run end to end. Q3_K and IQ2-AH use types the same kernels read but have not been run; the
+SPARK-4Bit builds (NVFP4) are refused.
+
+**The answers.** Greedy answers are the reference build's (AngelSlim's) token for token on the prompts compared; over
+its perplexity tool's logits the KL divergence is the size of the reference's own difference between two batch sizes
+(the model is unusually sensitive to rounding). The prompt is the GGUF's template; the levels:
+
+| `reasoning_effort` | The prompt |
+|---|---|
+| unset (Auto) | the template's default (`high`) |
+| `low`, `high`, `max` | that `reasoning_effort` |
+| thinking off | `no_think` |
+
+Tool calls work as GLM's do: every tag token of Hy4's (`<think:..>`, `<tool_call:..>`, `<arg_key:..>`, ...) carries
+the template's suffix, and the pack's tokenizer names each by GLM's spelling, so the server reads its answers with
+GLM's parser; a turn ends at `<｜hy_end:..｜>`.
+
+**Tensor parallel.** Where two or more GPUs are of one kind (`--tp auto`, the default), every layer runs on all of
+them at once: each holds its share of the attention heads, of the dense and shared FFNs' width and a slice of every
+routed expert (a block of its width, so the slices of an expert add up to it), and a copy of the small matrices and
+the caches. A layer's two partial sums (its attention's, its FFN's) go through pinned host memory, where the host
+adds them in a fixed order, so every GPU's copy of the model's state stays the same bit for bit. The main GPU - the
+fastest memory, measured at the load (`--main-gpu` names another) - holds the output head and the MTP block; where it
+is not of the group's kind it also computes a share of every layer's routed experts, by its memory's speed against
+the others' and as its VRAM allows, from the routing the first member hands it. Where the group cannot hold the
+model (or the context's caches - every member keeps a copy), the layer split runs instead, and an INFO line says
+why.
+
+**Where the experts live.** All of them in VRAM where they fit (about 108 GB with Q4_K_M), on tensor parallel or a
+layer split over the GPUs (the head and the MTP block on the main GPU either way). Where they do not, each layer keeps the same share of its experts in VRAM and the others are computed on
+the CPU from the model's file (the page cache) while the GPU computes its own - the CPU lane, a thread a physical
+core. On a PC of several NUMA nodes each expert's work goes to one node's threads, and a background thread moves
+that expert's pages to the node's memory after the load. A prompt chunk's experts that are not in VRAM go either to
+the CPU lane or are copied to the GPU, whichever the engine measures faster on this PC (its PCIe against its CPU).
+With an expert profile (`--profile`) each layer keeps its most routed experts in VRAM.
+
+**The context.** Only the 12 indexed layers (and the MTP block) keep every position: about 17 KB a token in VRAM
+(F16 latent rows and the indexer's pooled keys), so 128K takes ~2.2 GB and 1M ~17 GB - on every member with tensor
+parallel. The sliding-window layers keep a ring of their 512 positions and 16K more.
+
+**Drafting.** `--mtp` loads the GGUF's MTP block (its BF16 weights rounded to Q8_0 at load; its copy of the output
+head for the drafts' top token in Q4_K - only how often a draft holds depends on it) and drafts up to
+`--draft` tokens a step; the model checks them in one window, so the tokens are the model's own: greedy answers are
+the same with and without it on the same placement, and with sampling a draft is kept with the model's probability of
+it. (The MTP block's VRAM can move a layer, or a share of the experts, to another GPU, which rounds a little
+differently: a near-tie can then go the other way.)
+
+Measured on a 9-GPU NVIDIA PC (an RTX 3090 and eight RTX 5060 Ti on PCIe 3, two Xeon sockets), Q4_K_M:
+
+| Experts in VRAM | Decode, tok/s | Prompt, tok/s |
+|---|---:|---:|
+| all, tensor parallel over the eight 5060 Ti (the 3090: head, drafts, a share of the experts), no drafts | 72 | a little above `--mtp`'s |
+| ... `--mtp`, greedy (code / chat) | 156 / 119-129 | 1980-1990 (8K) / 1680 (16K) |
+| ... `--mtp`, sampled at 0.9 (code / chat) | 141-150 / 116 | the same |
+| all, layer split (`--tp 0`), no drafts | 33.7 | 450-580 |
+| ... `--mtp` (code / prose) | 66 / 55 | the same |
+| 75% (layer split) | 24.5 | - |
+| 50% (with a profile) | 22.5 | 166 |
+| none | 16-17 | 97 |
+
+Tensor parallel there fits up to 128K of context (the 3090 holding a share of the experts frees the others' VRAM);
+with `--chunk 2048` (the prompts' speed above) at 128K it needs `--reserve-gb 0.6`.
+
+**A prompt with tensor parallel.** A chunk's rows go through each layer in two staggered halves - one half's sums
+through the host while the other half computes - and the sums travel by blocks of rows, in F16 with a power-of-two
+factor a row (no overflow; half the bytes over PCIe and through the host's memory; the decode's sums stay F32), the
+host adding the parts in F32 in a fixed order on threads of the GPUs' NUMA node, whose memory holds them. The KL
+divergence against the reference moves from 0.181 to 0.192 (`HY4_TP_F32=1`: the F32 sums). The MTP block's pass over a
+chunk runs on its own scratch and stream of the main GPU, beside the next chunk. After the load the engine runs a
+prompt chunk, a token window and a draft once (about 2 s), so the first request does not pay the GPUs' first
+launches.
+
+Engine options, in the config's `"args"`:
+
+| Option | Default | What it does |
+|---|---|---|
+| `--pack` | - | the pack's folder (`<model folder>/maya-hy4`) |
+| `--max-context` | 32768 | the context, in tokens (rounded up to a group of 4); `0`: the model's 1M |
+| `--gpus` | every GPU the config gives | the GPUs, in order |
+| `--tp` | `auto` | tensor parallel over this many GPUs of one kind; `auto`: the largest group of one kind when it holds the model and the context, else the layer split; `0`: the layer split |
+| `--main-gpu` | the fastest (measured) | the GPU for the output head and the MTP block, an index into `--gpus` |
+| `--layer-split` | `auto` | the layer split: the layers a GPU holds, comma-separated (`auto`: by each GPU's free VRAM) |
+| `--reserve-gb` | 0.75 | VRAM each GPU keeps free beyond the plan |
+| `--chunk` | 1024 | prompt tokens a forward takes at most |
+| `--vram-experts` | 1 (as many as fit) | the share of each layer's routed experts kept in VRAM, 0 to 1; the rest run on the CPU lane |
+| `--cpu-threads` | one a physical core but the first | the CPU lane's threads besides the calling one |
+| `--profile` | - | an expert profile (uint32 routings, [layers][experts]): each layer's most routed experts are the ones in VRAM |
+| `--profile-out` | - | where the routings counted in this run (with `--profile`'s) are written, after each request |
+| `--mtp` | off | the MTP block drafts tokens, the model checks them (the same tokens) |
+| `--draft` | 3 | with `--mtp`: drafts a step at most |
+| `--draft-floor` | 0.55 | with `--mtp`: the drafts end at one the block gives less than this probability |
+| `--eos` | the GGUF's | the token ids that end an answer |
+
+A request's `spec` (0 / 1) turns the drafts off or on for it.
+
+| Variable | Default | What it does |
+|---|---|---|
+| `HY4_LANE_NT` | 32 | the CPU lane: a prompt's tokens an expert's weights are read once for (1-64) |
+| `HY4_TP_HELPER` | by speed | tensor parallel: `0` no expert share for the GPUs outside the group; `k`: k slices each (as their VRAM allows) |
+| `HY4_TP_MIXED` | off | tensor parallel over GPUs of different kinds (their copies of the state may drift apart) |
+| `HY4_TP_CHECK` | off | debugging: after each forward, every member's copy of the state compared |
+| `HY4_TP_PROF` | off | debugging: the host's waits and sums a token window |
+| `HY4_TP_LATENT_SUM` | off | tensor parallel: the FFN's partials summed in the latent space, projected up after the sum (a third more to send) |
+| `HY4_TP_EV`, `HY4_TP_EV_M` | off | debugging: a member's GPU time by part of each layer (events), member 0 or the one named |
+| `HY4_TP_F32` | off | tensor parallel: a prompt chunk's sums in F32 (twice the bytes; the earlier numbers) |
+| `HY4_MTP_SYNC` | off | the MTP block's pass over a prompt chunk in line, after the chunk, on the head's own scratch |
+| `HY4_NO_WARMUP` | off | no warm-up after the load (the first request then pays the first launches: ~1 s on a long prompt) |
+| `HY4_TP_NO_STAGGER`, `HY4_TP_ONE_BLOCK`, `HY4_TP_PULL_MAIN` | off | A/B: a chunk in one piece, its sums in one block, read back on the main stream (each slower) |
+| `HY4_TP_SKIP_SUM`, `HY4_TP_SKIP_COPY` | off | debugging only (the answers are no longer the model's): the host's sums, or the copies, left out - what each costs |
+| `HY4_EG_POPULATE` | on | the Engram table's pages mapped into the engine in the background after the load (`0`: each looked-up page faults in at its first use) |
+| `HY4_DRAFT_HEAD` | `q4k` | `q8`: the drafts' head in Q8_0 |
+| `HY4_GEMV_OLD`, `HY4_GROUP_SERIAL`, `HY4_TOP1_ONE`, `HY4_HC_ONE`, `HY4_ROUTER_WARP`, `HY4_TP_SUM_EACH`, `HY4_TP_HAND0`, `HY4_TP_HAND_INLINE`, `HY4_MTP_EAGER`, `HY4_EG_SERIAL` | off | A/B switches: the earlier kernels and paths these replaced (the same results, slower) |
+| `HY4_ROUTER_SORT` | off | the router's earlier block-wide sort instead of the warp's picks (the same picks) |
+| `HY4_PROF` | off | debugging: each forward's GPU time by part |
+| `HY4_DUMP` | off | debugging: each layer's sums |
+| `HY4_INJECT`, `HY4_INJECT_FROM`, `HY4_SAVE` | off | debugging: a layer's inputs taken from a reference dump to compare one layer at a time |
+
 ## GLM-5.3 (744B)
 
 GLM-5.3 ([the model's page](GLM53.md)) runs on the same engine as GLM-5.3-Flash, so the GLM settings above apply to it

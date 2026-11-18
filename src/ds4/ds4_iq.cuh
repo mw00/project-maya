@@ -35,6 +35,10 @@ constexpr float kOaiAlpha = 1.702f;
 
 /// Whether the routed experts' kernels take this ggml type.
 bool supported(int type);
+/// Whether the experts' kernels take it with the clamped SwiGLU (kActSwiglu: gate_up, down, the light and the set
+/// forms): the experts' types, Q6_K and Q8_0 (maya-hy4's); down_supported: the same
+bool expert_supported(int type);
+bool down_supported(int type);
 /// Whether the GEMVs and FP16 rows take it (the experts' types and the dense ones: Q8_0, Q6_K).
 bool mv_supported(int type);
 /// Values a block of the type (32: Q8_0, IQ4_NL; 256: the others).

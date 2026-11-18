@@ -1,6 +1,6 @@
 # The models
 
-Maya runs four models, each on an engine built for it. This page has each one's files, what they need and what is
+Maya runs five models, each on an engine built for it. This page has each one's files, what they need and what is
 special about it. Back to the [README](../README.md).
 
 - [How the quants are named](#how-the-quants-are-named)
@@ -8,6 +8,7 @@ special about it. Back to the [README](../README.md).
 - [GLM-5.3 (744B)](#glm-53-744b)
 - [DeepSeek-V4.1-Flash-1017](#deepseek-v41-flash-1017)
 - [MiniMax-M3.1-Flash](#minimax-m31-flash)
+- [Hy4-flash](#hy4-flash)
 - [Community quants of GLM-5.3-Flash](#community-quants-of-glm-53-flash)
 
 ## How the quants are named
@@ -180,6 +181,30 @@ pictures and drafting, on NVIDIA and AMD alike.
   own numbers in the monitor.
 
 Its engine settings: [SETTINGS.md](SETTINGS.md#minimax-m31-flash).
+
+## Hy4-flash
+
+**[Hy4-flash](https://huggingface.co/tencent/Hy4-flash)** (Tencent; 512 experts, 16 a token, up to 1 M tokens) runs
+on an engine of its own (`maya-hy4`, NVIDIA) from [AngelSlim's GGUF](https://huggingface.co/AngelSlim/Hy4-flash-GGUF)
+(the download's license file, `License_AngelSlim_model_and_dataset.txt`, and Tencent's model card give the terms).
+
+| Files | Size | Runs on |
+| --- | ---: | --- |
+| AngelSlim's **Q4_K_M** (`Hy4-flash-Q4_K_M-0000N-of-00002.gguf`): Q4_K experts (Q6_K downs on 19 layers), Q8_0 elsewhere | 157 GiB | NVIDIA, Linux |
+
+- **Tensor parallel:** where two or more GPUs are of one kind, every layer runs on all of them at once (about twice
+  the layer split's decode speed on eight RTX 5060 Ti); the fastest GPU holds the head and the drafter and computes a
+  share of the experts.
+- **Where the experts live:** all of them in VRAM where they fit (about 108 GB); where they do not, each layer keeps
+  a share of its experts in VRAM (its most used, with an expert profile) and the CPU computes the others from the
+  model's file.
+- **Drafting:** the model's own MTP block proposes up to three tokens a step and the model checks them - nearly twice
+  the decode speed on code, the same answers.
+- **Thinking and tools:** the GGUF's own template, with its levels Low, High and Max and thinking off; chat, thinking
+  and tool calls through Maya's OpenAI-compatible server.
+- **The pack:** `python tools/hy4/pack_gguf.py --model <folder>` indexes the GGUF set (no weights copied).
+
+Its engine settings: [SETTINGS.md](SETTINGS.md#hy4-flash).
 
 ## Community quants of GLM-5.3-Flash
 

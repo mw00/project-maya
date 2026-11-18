@@ -2581,7 +2581,11 @@ class Service:
                             # DeepSeek-V4.1 ends a turn with its EOS (and would start the next with <｜User｜>)
                             _special_ids("<｜end▁of▁sentence｜>") + _special_ids("<｜User｜>") +
                             # MiniMax-M3.1 with [e~[ (and would start the next turn with ]~b])
-                            _special_ids("[e~[") + _special_ids("]~b]"))
+                            _special_ids("[e~[") + _special_ids("]~b]") +
+                            # Hy4-flash with <｜hy_end:..｜> (and would start the next turn with <｜hy_start:..｜>)
+                            (_special_ids("<｜hy_end%s｜>" % template.hy4_tag) +
+                             _special_ids("<｜hy_start%s｜>" % template.hy4_tag)
+                             if getattr(template, "hy4", False) else []))
         # DeepSeek's turn openers: where its last user turn starts and its system prompt ends (MAYA_DS4_RESTORE_POINTS)
         self.ds_user_id = (_special_ids("<｜User｜>") or [None])[0]
         self.ds_system_id = (_special_ids("<｜System｜>") or [None])[0]
@@ -2599,7 +2603,9 @@ class Service:
         # same budget at every level (every other model)
         self.think_budget_max = 0
         # (MiniMax-M3.1 closes its reasoning with </mm:think>; its vocabulary may hold a plain "</think>" too)
-        end = _special_ids("</mm:think>") if getattr(template, "minimax", False) else _special_ids("</think>")
+        # (Hy4-flash with its suffixed </think:..>, which the pack's tokenizer names </think> in what the server reads)
+        end = _special_ids("</mm:think>") if getattr(template, "minimax", False) else \
+            _special_ids("</think%s>" % template.hy4_tag) if getattr(template, "hy4", False) else _special_ids("</think>")
         self.think_end_id = end[0] if end else None
         # the tokens the engine itself ends a request at, whatever the server does (see THINK_RESTARTS): a pack
         # tokenizer that names its "eos" (DeepSeek's, MiniMax's: their engines' --eos default) ends there only; the

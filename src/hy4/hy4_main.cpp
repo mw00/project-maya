@@ -1,0 +1,877 @@
+// src/hy4/hy4_main.cpp - maya-hy4: Tencent's Hy4-flash (a GGUF set) on NVIDIA GPUs.
+//
+//   maya-hy4 --pack <model>/maya-hy4 --serve [--gpus 0,1,...] [--max-context N] [--chunk N] [--eos id,id,...]
+//            [--mtp [--draft N] [--draft-floor P]] [--vram-experts F] [--cpu-threads N] [--profile F] [--profile-out F]
+//            [--tp N|auto] [--main-gpu I]
+//
+// The routed experts that do not fit in VRAM (or beyond --vram-experts, the share of each layer's kept there) run on
+// the CPU lane from the model's file, --cpu-threads workers (default: a physical core each but the first); a prompt's
+// chunk sends them to the GPU instead where this PC's PCIe is measured faster than its CPU.  --profile: an expert
+// profile (uint32 [layers][experts] routings) - each layer's most routed experts are the ones kept in VRAM;
+// --profile-out: where the routings this run counts (with the profile's) are written, after each request when serving
+// and at the end otherwise.
+//
+// --mtp: the GGUF's MTP block drafts up to --draft tokens (3) a step, each verified by the model in one window with the
+// token before it; a draft below --draft-floor (0.4: the block's probability of its own pick) ends the drafts.  Greedy:
+// the drafts the model's argmax agrees with are kept; sampling: a draft d is kept with the model's probability of d,
+// else the token is drawn from the model's distribution without d - every token is still the model's own sample.  A
+// request's spec=0|1 turns the drafts off / on for it.
+//
+// --serve speaks what serve/server.py's StrataEngine expects (maya-mm3's protocol, one conversation): INFO lines, then
+// `READY <context> stop`; per request `GEN <max_new> [key=value ...] <id,id,...>` answered by `PP <read> <total> <ms>
+// <tok/s> <reused>` while the prompt is read, `T <id>` lines, `STAT ...` every 8 tokens and `DONE <generated> <prompt>
+// <prompt ms> <decode ms> <stop|length|cancel> 0 0 <reused> 0 0`; `STOP` ends a request early, `WRAP` closes a
+// thinking block still open, `QUIT` the engine.  A prompt that shares a start with the state (the last conversation)
+// reads only the rest, when the sliding-window caches still hold the window before it (else all of it).  Keys:
+// temperature, top_p, top_k, min_p, seed, penalty_last_n / _repeat / _freq / _present, think_budget + think_end.
+//
+//   maya-hy4 --pack <model>/maya-hy4 --ids @prompt.txt [--gen N] [--gpus 0,1,...] [--max-context N] [--chunk N]
+//
+// --ids: comma- or whitespace-separated token ids, or @FILE holding them; --gen: greedy tokens after the prompt (their
+// ids printed, and the top 5 of each step's logits with --top).
+//
+//   maya-hy4 --pack <model>/maya-hy4 --kld ref.kld [--chunks N]
+//
+// The model against a reference's logits: ref.kld is a perplexity tool's --kl-divergence-base file (AngelSlim's
+// hy4-flash build); each chunk's tokens are fed from position 0 and every position the file scores compared - the mean
+// KL divergence (reference || this), how often the two pick the same top token, and both perplexities.
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <fstream>
+#include <sstream>
+#include <string>
+#include <vector>
+
+#include <atomic>
+#include <condition_variable>
+#include <csignal>
+#include <deque>
+#include <mutex>
+#include <random>
+#include <thread>
+
+#include "hy4_kernels.cuh"
+#include "hy4_lane.hpp"
+#include "hy4_model.hpp"
+#include "hy4_pack.hpp"
+#include "mm3_os.hpp"
+#include "mm3_sample.hpp"
+
+namespace {
+
+using mm3::sample::Req;
+
+std::vector<int> parse_ids(const std::string& a) {
+    std::string src = a;
+    if (!a.empty() && a[0] == '@') {
+        std::ifstream f(a.substr(1));
+        std::stringstream ss;
+        ss << f.rdbuf();
+        src = ss.str();
+    }
+    for (char& c : src)
+        if (c == ',' || c == '[' || c == ']') c = ' ';
+    std::vector<int> v;
+    std::istringstream is(src);
+    for (long x; is >> x;) v.push_back((int) x);
+    return v;
+}
+std::vector<int> parse_list(const std::string& a) {
+    std::vector<int> v;
+    std::istringstream is(a);
+    for (std::string x; std::getline(is, x, ',');)
+        if (!x.empty()) v.push_back(std::atoi(x.c_str()));
+    return v;
+}
+double now() {
+    return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+int argmax(const float* r, int n) {
+    int b = 0;
+    for (int i = 1; i < n; ++i)
+        if (r[i] > r[b]) b = i;
+    return b;
+}
+// log_softmax of a row into lp (double sums)
+void log_softmax(const float* r, int n, std::vector<double>& lp) {
+    double mx = r[0];
+    for (int i = 1; i < n; ++i) mx = std::max(mx, (double) r[i]);
+    double s = 0;
+    for (int i = 0; i < n; ++i) s += std::exp((double) r[i] - mx);
+    const double l = mx + std::log(s);
+    lp.resize((size_t) n);
+    for (int i = 0; i < n; ++i) lp[(size_t) i] = (double) r[i] - l;
+}
+
+int run_kld(hy4::Model& m, const std::string& path, int chunks) {
+    std::ifstream f(path, std::ios::binary);
+    char magic[8];
+    int32_t n_ctx = 0, n_vocab = 0, n_chunk = 0;
+    if (!f.read(magic, 8) || std::memcmp(magic, "_logits_", 8) != 0 || !f.read((char*) &n_ctx, 4) ||
+        !f.read((char*) &n_vocab, 4) || !f.read((char*) &n_chunk, 4)) {
+        std::fprintf(stderr, "%s: not a --kl-divergence-base logits file\n", path.c_str());
+        return 1;
+    }
+    if (n_vocab != m.vocab()) {
+        std::fprintf(stderr, "%s: vocabulary %d, the model's %d\n", path.c_str(), n_vocab, m.vocab());
+        return 1;
+    }
+    std::vector<int32_t> tokens((size_t) n_chunk * n_ctx);
+    f.read((char*) tokens.data(), (std::streamsize) (tokens.size() * 4));
+    const int first = n_ctx / 2, nrow = n_ctx - 1 - first, nv = 2 * ((n_vocab + 1) / 2) + 4;
+    chunks = chunks > 0 ? std::min(chunks, n_chunk) : n_chunk;
+    std::vector<uint16_t> ref((size_t) nrow * nv);
+    std::vector<float> logits((size_t) hy4::k::kMaxWin * n_vocab);
+    std::vector<double> lp;
+    double kl = 0, nll_me = 0, nll_ref = 0;
+    long n = 0, same = 0;
+    std::vector<double> kls;
+    for (int c = 0; c < chunks; ++c) {
+        if (!f.read((char*) ref.data(), (std::streamsize) (ref.size() * 2))) {
+            std::fprintf(stderr, "%s: chunk %d cut short\n", path.c_str(), c);
+            return 1;
+        }
+        const int* ids = tokens.data() + (size_t) c * n_ctx;
+        const double t0 = now();
+        // the prompt up to `first` in one call, then windows of kMaxWin with every row's logits
+        std::string err;
+        if (!m.forward(ids, first, 0, 0, nullptr, err)) {
+            std::fprintf(stderr, "forward: %s\n", err.c_str());
+            return 1;
+        }
+        const double t1 = now();
+        for (int p = first; p < n_ctx - 1; p += hy4::k::kMaxWin) {
+            const int T = std::min(hy4::k::kMaxWin, n_ctx - 1 - p);
+            if (!m.forward(ids + p, T, p, T, logits.data(), err)) {
+                std::fprintf(stderr, "forward at %d: %s\n", p, err.c_str());
+                return 1;
+            }
+            for (int t = 0; t < T; ++t) {
+                const int row = p + t - first;
+                const float* me = logits.data() + (size_t) t * n_vocab;
+                const uint16_t* rr = ref.data() + (size_t) row * nv;
+                float scale, minlp;
+                std::memcpy(&scale, rr, 4);
+                std::memcpy(&minlp, rr + 2, 4);
+                const uint16_t* q = rr + 4;
+                log_softmax(me, n_vocab, lp);
+                double k = 0;
+                int ra = 0;
+                for (int i = 0; i < n_vocab; ++i) {
+                    const double lr = (double) minlp + (double) scale * q[i];
+                    const double pr = std::exp(lr);
+                    k += pr * (lr - lp[(size_t) i]);
+                    if (q[i] > q[ra]) ra = i;
+                }
+                const int tok = ids[p + t + 1];
+                nll_me -= lp[(size_t) tok];
+                nll_ref -= (double) minlp + (double) scale * q[tok];
+                kl += k;
+                kls.push_back(k);
+                same += argmax(me, n_vocab) == ra;
+                ++n;
+            }
+        }
+        const double t2 = now();
+        std::printf("chunk %d: prompt %d tokens %.1f s (%.0f tok/s), %d scored in %.1f s; running KL %.5f, top-1 same "
+                    "%.2f%%\n",
+                    c, first, t1 - t0, first / (t1 - t0), nrow, t2 - t1, kl / n, 100.0 * same / n);
+        std::fflush(stdout);
+    }
+    std::sort(kls.begin(), kls.end());
+    std::printf("KLD over %ld positions: mean %.6f, median %.6f, p99 %.6f, max %.6f\n", n, kl / n, kls[kls.size() / 2],
+                kls[(size_t) (kls.size() * 0.99)], kls.back());
+    std::printf("top-1 same: %.3f%%;  PPL this %.4f, reference %.4f\n", 100.0 * same / n, std::exp(nll_me / n),
+                std::exp(nll_ref / n));
+    return 0;
+}
+
+// stdin's lines on a thread of their own: STOP / WRAP are seen while a request runs
+struct Lines {
+    std::mutex mu;
+    std::condition_variable cv;
+    std::deque<std::string> q;
+    bool eof = false;
+    std::atomic<bool> stop{false}, wrap{false};
+    void start() {
+        std::thread([this] {
+            std::string buf;
+            char chunk[4096];
+            for (;;) {
+                const long n = mm3::os::read_stdin(chunk, sizeof chunk);
+                if (n <= 0) break;
+                buf.append(chunk, (size_t) n);
+                for (size_t nl; (nl = buf.find('\n')) != std::string::npos;) {
+                    std::string l = buf.substr(0, nl);
+                    buf.erase(0, nl + 1);
+                    if (!l.empty() && l.back() == '\r') l.pop_back();
+                    if (l == "STOP" || l.rfind("STOP ", 0) == 0) {
+                        stop.store(true);
+                        continue;
+                    }
+                    if (l == "WRAP") {
+                        wrap.store(true);
+                        continue;
+                    }
+                    std::lock_guard<std::mutex> lk(mu);
+                    q.push_back(std::move(l));
+                    cv.notify_one();
+                }
+            }
+            std::lock_guard<std::mutex> lk(mu);
+            eof = true;
+            cv.notify_one();
+        }).detach();
+    }
+    bool next(std::string& out) {
+        std::unique_lock<std::mutex> lk(mu);
+        cv.wait(lk, [&] { return !q.empty() || eof; });
+        if (q.empty()) return false;
+        out = std::move(q.front());
+        q.pop_front();
+        return true;
+    }
+};
+
+bool parse_gen(const std::string& line, Req& r) {
+    std::istringstream is(line.substr(4));
+    if (!(is >> r.max_new)) return false;
+    for (std::string tok; is >> tok;) {
+        const size_t eq = tok.find('=');
+        if (eq == std::string::npos) {
+            r.ids = parse_ids(tok);
+            break;
+        }
+        const std::string k = tok.substr(0, eq), v = tok.substr(eq + 1);
+        if (k == "temperature") r.temperature = std::strtof(v.c_str(), nullptr);
+        else if (k == "top_p") r.top_p = std::strtof(v.c_str(), nullptr);
+        else if (k == "top_k") r.top_k = std::atoi(v.c_str());
+        else if (k == "min_p") r.min_p = std::strtof(v.c_str(), nullptr);
+        else if (k == "seed") r.seed = std::strtoull(v.c_str(), nullptr, 10);
+        else if (k == "penalty_last_n") r.pen_n = std::atoi(v.c_str());
+        else if (k == "penalty_repeat") r.pen_repeat = std::strtof(v.c_str(), nullptr);
+        else if (k == "penalty_freq") r.pen_freq = std::strtof(v.c_str(), nullptr);
+        else if (k == "penalty_present") r.pen_present = std::strtof(v.c_str(), nullptr);
+        else if (k == "think_budget") r.think_budget = std::atoll(v.c_str());
+        else if (k == "think_end") r.think_end = std::atoi(v.c_str());
+        else if (k == "spec") r.spec = std::atoi(v.c_str()) != 0;
+        else if (k == "dspark_conf" || k == "spec_min_p") r.conf = std::strtof(v.c_str(), nullptr);
+        // (keys this engine does not use are taken and ignored)
+    }
+    return !r.ids.empty();
+}
+
+// A row's next-token distribution, as mm3::sample::dist gives it, without a copy of the whole row where it is not
+// needed: greedy without penalties is the row's argmax (ties: the lower id); sampling without penalties takes the
+// tokens within 40 nats of the top (temperature-scaled) - the rest hold under 1e-12 of the mass - to mm3's candidate
+// form.  Penalties: the whole row, as before.
+std::vector<std::pair<int, double>> row_dist(const float* row, int V, const mm3::sample::Req& r,
+                                             const std::vector<int>& hist) {
+    if (mm3::sample::penalised(r)) return mm3::sample::dist(row, V, r, hist);
+    int b = 0;
+    for (int i = 1; i < V; ++i)
+        if (row[i] > row[b]) b = i;
+    if (!(r.temperature > 0.0f)) return {{b, 1.0}};
+    if (r.top_k > 0 && r.top_k < V) {
+        // top_k: the k largest (ties: the lower id, as dist_c's sort) without sorting the row - every block of 1024's
+        // largest value (a pass), the k-th largest of those a floor the k largest are all at or above (k distinct
+        // values reach it), the values at or above it (a second pass: a few hundred) to dist_c
+        const int bs = 1024, nb = (V + bs - 1) / bs;
+        const size_t k = (size_t) r.top_k;
+        if ((size_t) nb >= k) {
+            std::vector<float> bm((size_t) nb);
+            for (int q = 0; q < nb; ++q) {
+                const int a0 = q * bs, a1 = std::min(V, a0 + bs);
+                float mx = row[a0];
+                for (int i = a0 + 1; i < a1; ++i) mx = row[i] > mx ? row[i] : mx;
+                bm[(size_t) q] = mx;
+            }
+            std::nth_element(bm.begin(), bm.begin() + (long) (k - 1), bm.end(), std::greater<float>());
+            const float floor_v = bm[k - 1];
+            std::vector<std::pair<int, float>> c;
+            for (int i = 0; i < V; ++i)
+                if (row[i] >= floor_v) c.push_back({i, row[i]});
+            return mm3::sample::dist_c(std::move(c), {}, {}, r, hist);
+        }
+    }
+    const float cut = row[b] - 40.0f * r.temperature;
+    if (!(r.top_k > 0) && !(r.top_p < 1.0f) && !(r.min_p > 0.0f)) {
+        // plain sampling: the softmax itself, nothing to cut or sort - the top first, the others by id (a draw from
+        // them is a draw from the distribution, whatever their order)
+        std::vector<std::pair<int, double>> d;
+        d.push_back({b, 1.0});
+        double z = 1.0;
+        const double inv_t = 1.0 / r.temperature;
+        for (int i = 0; i < V; ++i)
+            if (i != b && row[i] >= cut) {
+                const double q = std::exp((double) (row[i] - row[b]) * inv_t);
+                d.push_back({i, q});
+                z += q;
+            }
+        for (auto& e : d) e.second /= z;
+        return d;
+    }
+    std::vector<std::pair<int, float>> c;
+    for (int i = 0; i < V; ++i)
+        if (row[i] >= cut) c.push_back({i, row[i]});
+    return mm3::sample::dist_c(std::move(c), {}, {}, r, hist);
+}
+
+// Plain sampling (a temperature, no penalties, no top_k / top_p / min_p): a row's weights e[i] = exp((x_i - max) / T)
+// in float (a polynomial on [-0.5, 0.5] after the power of two, ~1e-7 relative - a loop the compiler vectorizes), their
+// sum, and a walk over them only for a draw: a round's few rows cost a pass each, not a sorted copy of the vocabulary
+inline float exp_neg(float x) {   // x <= 0
+    x = x < -87.0f ? -87.0f : x;
+    const float t = x * 1.44269504f;
+    const float n = (t + 12582912.0f) - 12582912.0f;   // (round to nearest)
+    const float f = t - n;
+    const float p =
+        1.0f + f * (0.693147182f + f * (0.240226507f + f * (0.0555041087f + f * (0.00961812911f +
+                                                                                   f * (0.00133335581f + f * 0.000154035304f)))));
+    int32_t bits;
+    std::memcpy(&bits, &p, 4);
+    bits += (int32_t) n << 23;
+    float r;
+    std::memcpy(&r, &bits, 4);
+    return r;
+}
+struct Weights {
+    int top = 0;
+    double z = 0;
+    std::vector<float> e;
+    void of(const float* row, int V, float temperature) {
+        top = 0;
+        for (int i = 1; i < V; ++i)
+            if (row[i] > row[top]) top = i;
+        e.resize((size_t) V);
+        const float m = row[top], it = 1.0f / temperature;
+        float* w = e.data();
+        for (int i = 0; i < V; ++i) w[i] = exp_neg((row[i] - m) * it);
+        float part[16] = {0};
+        int i = 0;
+        for (; i + 16 <= V; i += 16)
+            for (int j = 0; j < 16; ++j) part[j] += w[i + j];
+        double sz = 0;
+        for (int j = 0; j < 16; ++j) sz += part[j];
+        for (; i < V; ++i) sz += w[i];
+        z = sz;
+    }
+    double p(int t) const { return e[(size_t) t] / z; }
+    // a draw (u in [0, 1)), without `skip` (renormalised; -1: none)
+    int draw(double u, int skip = -1) const {
+        double tot = z - (skip >= 0 ? e[(size_t) skip] : 0.0);
+        if (!(tot > 0)) return top;
+        double target = u * tot, acc = 0;
+        int last = top;
+        for (int i = 0; i < (int) e.size(); ++i) {
+            if (i == skip) continue;
+            acc += e[(size_t) i];
+            last = i;
+            if (acc > target) return i;
+        }
+        return last;
+    }
+};
+inline bool plain_sampling(const mm3::sample::Req& r) {
+    return r.temperature > 0.0f && !mm3::sample::penalised(r) && !(r.top_k > 0) && !(r.top_p < 1.0f) &&
+           !(r.min_p > 0.0f);
+}
+
+int serve(hy4::Model& m, const std::vector<int>& eos, int n_draft, float floor0) {
+    for (const auto& l : m.info_lines()) std::printf("NOTE %s\n", l.c_str());
+    const auto& st0 = m.stats();
+    std::printf("INFO engine=hy4 engine_kind=hy4 model=Hy4-flash ctx=%lld vram_gb=%.2f dspark=0 mtp=%d\n",
+                (long long) m.max_ctx(), st0.vram_gb, m.has_mtp() && n_draft > 0 ? 1 : 0);
+    std::printf("READY %lld stop\n", (long long) m.max_ctx());
+    std::fflush(stdout);
+    std::fprintf(stderr, "maya hy4 serve: GEN <max_new> [keys] <ids>; STOP, WRAP, QUIT\n");
+#if defined(SIGPIPE)
+    std::signal(SIGPIPE, SIG_IGN);
+#endif
+    Lines in;
+    in.start();
+    std::vector<int> state;   // the tokens in the caches, positions 0 ..
+    struct Unpin {   // (a pinned buffer unpinned before its vector frees it)
+        void* p;
+        bool on;
+        ~Unpin() {
+            if (on) hy4::Model::unpin(p);
+        }
+    };
+    std::vector<float> lg((size_t) m.vocab());
+    Unpin lg_unpin{lg.data(), hy4::Model::pin(lg.data(), lg.size() * sizeof(float))};
+    unsigned long long counter = 0;
+    std::string line, err;
+    auto done_cancel = [&](size_t n_ids) {
+        std::printf("DONE 0 %zu 0.0 0.0 cancel 0 0 0 0 0\n", n_ids);
+        std::fflush(stdout);
+    };
+    while (in.next(line)) {
+        if (line == "QUIT") break;
+        if (line.rfind("GEN ", 0) != 0) {
+            std::printf("ERR unsupported command '%s' (GEN, STOP, WRAP and QUIT)\n", line.substr(0, line.find(' ')).c_str());
+            std::fflush(stdout);
+            continue;
+        }
+        in.stop.store(false);
+        in.wrap.store(false);
+        Req r;
+        if (!parse_gen(line, r)) {
+            std::printf("ERR expected: GEN <max_new> [keys] <id,id,...>\n");
+            done_cancel(r.ids.size());
+            continue;
+        }
+        if ((long long) r.ids.size() + std::max(0LL, r.max_new) > m.max_ctx()) {
+            std::printf("ERR the prompt (%zu tokens) and max_new %lld are more than the context %lld\n", r.ids.size(),
+                        r.max_new, (long long) m.max_ctx());
+            done_cancel(r.ids.size());
+            continue;
+        }
+        const double t0 = now() * 1e3;
+        // the state's shared start (the prompt's last token is always read again: its logits are the first token's)
+        size_t from = 0;
+        while (from < state.size() && from + 1 < r.ids.size() && state[from] == r.ids[from]) ++from;
+        if (from > 0 && !m.resumable((int64_t) from)) from = 0;   // (the windows before it gone: read it all again)
+        state.resize(from);
+        bool ok = true, cancel = false;
+        const int C = std::max(1, m.chunk());
+        for (size_t a = from; a < r.ids.size();) {
+            const int T = (int) std::min<size_t>((size_t) C, r.ids.size() - a);
+            const bool last = a + (size_t) T == r.ids.size();
+            if (!m.forward(r.ids.data() + a, T, (int64_t) a, last ? 1 : 0, last ? lg.data() : nullptr, err)) {
+                ok = false;
+                break;
+            }
+            state.insert(state.end(), r.ids.begin() + (long) a, r.ids.begin() + (long) a + T);
+            a += (size_t) T;
+            const double ms = now() * 1e3 - t0;
+            std::printf("PP %zu %zu %.1f %.1f %zu\n", a, r.ids.size(), ms, ms > 0 ? 1000.0 * (double) (a - from) / ms : 0.0,
+                        from);
+            std::fflush(stdout);
+            if (in.stop.load() && !last) {
+                cancel = true;
+                break;
+            }
+        }
+        const double t1 = now() * 1e3;
+        if (!ok) {
+            std::printf("ERR %s\n", err.c_str());
+            done_cancel(r.ids.size());
+            state.clear();
+            continue;
+        }
+        if (cancel) {
+            std::printf("DONE 0 %zu %.1f 0.0 cancel 0 0 %zu 0 0\n", r.ids.size(), t1 - t0, from);
+            std::fflush(stdout);
+            continue;
+        }
+        ++counter;
+        std::mt19937_64 rng(r.seed != 0 ? r.seed : 0x9E3779B97F4A7C15ull * counter);
+        long long produced = 0;
+        const char* finish = "length";
+        bool in_think = r.think_budget > 0 && r.think_end >= 0;
+        int tok = mm3::sample::draw(row_dist(lg.data(), m.vocab(), r, state), rng);
+        long long d_off = 0, d_acc = 0;
+        auto stat_line = [&]() {
+            const double ms = now() * 1e3 - t1;
+            std::printf("STAT tok_s=%.2f ms_tok=%.2f vram_hit=1.0000 cpu=0.000", ms > 0 ? 1000.0 * (double) produced / ms : 0.0,
+                        produced > 0 ? ms / (double) produced : 0.0);
+            if (d_off > 0) std::printf(" drafts=%.3f draft_acc=%lld draft_off=%lld", (double) d_acc / (double) d_off, d_acc,
+                                       d_off);
+            std::printf("\n");
+        };
+        const bool spec = m.has_mtp() && n_draft > 0 && (r.spec < 0 || r.spec != 0);
+        const float floor = r.conf >= 0.0f ? r.conf : floor0;
+        std::vector<int> drafts;
+        Weights wts;   // (plain sampling's rows)
+        std::vector<float> confs;
+        std::vector<float> lgw(spec ? (size_t) (n_draft + 1) * m.vocab() : 0);
+        Unpin lgw_unpin{lgw.data(), hy4::Model::pin(lgw.data(), lgw.size() * sizeof(float))};
+        std::string fail;
+        // one token out: false when the answer ends with it (an end token, max_new, the context)
+        auto emit = [&](int t) -> bool {
+            std::printf("T %d\n", t);
+            ++produced;
+            if (in_think && t == r.think_end) in_think = false;
+            if (produced % 8 == 0) stat_line();
+            std::fflush(stdout);
+            if (std::find(eos.begin(), eos.end(), t) != eos.end()) {
+                finish = "stop";
+                return false;
+            }
+            return produced < r.max_new && (int64_t) state.size() + 2 < m.max_ctx();
+        };
+        for (;;) {
+            if (in.stop.load()) {
+                finish = "cancel";
+                break;
+            }
+            if (in_think && (produced >= r.think_budget || in.wrap.load()) && tok != r.think_end) tok = r.think_end;
+            if (!emit(tok)) break;
+            const int64_t pos = (int64_t) state.size();
+            // the drafts that can still be answer tokens (max_new, the context, the thinking budget)
+            long long room = std::min<long long>(r.max_new - produced, m.max_ctx() - pos - 2);
+            if (in_think) room = std::min<long long>(room, r.think_budget - produced);
+            if (in_think && in.wrap.load()) room = 0;
+            int k = 0;
+            if (spec && room > 0) {
+                if (!m.draft(tok, pos, (int) std::min<long long>(room, n_draft), floor, drafts, confs, err)) {
+                    fail = err;
+                    break;
+                }
+                while (k < (int) drafts.size() && confs[(size_t) k] >= floor) ++k;
+            }
+            if (k == 0) {
+                if (!m.forward(&tok, 1, pos, 1, lg.data(), err)) {
+                    fail = err;
+                    break;
+                }
+                state.push_back(tok);
+                if (plain_sampling(r)) {
+                    wts.of(lg.data(), m.vocab(), r.temperature);
+                    tok = wts.draw(std::uniform_real_distribution<double>(0.0, 1.0)(rng));
+                } else {
+                    tok = mm3::sample::draw(row_dist(lg.data(), m.vocab(), r, state), rng);
+                }
+                continue;
+            }
+            std::vector<int> win(1, tok);
+            win.insert(win.end(), drafts.begin(), drafts.begin() + k);
+            if (!m.forward(win.data(), k + 1, pos, k + 1, lgw.data(), err)) {
+                fail = err;
+                break;
+            }
+            state.push_back(tok);
+            d_off += k;
+            bool more = true;
+            int next = -1;
+            const bool plain = plain_sampling(r);
+            for (int i = 0; i <= k && more && plain; ++i) {   // (plain sampling: the rows' weights, no copies)
+                wts.of(lgw.data() + (size_t) i * m.vocab(), m.vocab(), r.temperature);
+                std::uniform_real_distribution<double> u01(0.0, 1.0);
+                if (i == k) {
+                    next = wts.draw(u01(rng));
+                    break;
+                }
+                const int x = drafts[(size_t) i];
+                if (!(u01(rng) < wts.p(x))) {
+                    next = wts.draw(u01(rng), x);
+                    break;
+                }
+                ++d_acc;
+                if (in.stop.load()) {
+                    finish = "cancel";
+                    more = false;
+                    break;
+                }
+                if (in_think && x == r.think_end) in_think = false;
+                more = emit(x);
+                state.push_back(x);
+            }
+            for (int i = 0; i <= k && more && !plain; ++i) {
+                const auto d = row_dist(lgw.data() + (size_t) i * m.vocab(), m.vocab(), r, state);
+                if (i == k) {   // every draft kept: the model's token after them
+                    next = mm3::sample::draw(d, rng);
+                    break;
+                }
+                const int x = drafts[(size_t) i];
+                double px = 0;
+                for (const auto& [t, q] : d)
+                    if (t == x) px = q;
+                const bool keep = r.temperature > 0.0f ? std::uniform_real_distribution<double>(0.0, 1.0)(rng) < px
+                                                       : d[0].first == x;
+                if (!keep) {
+                    next = r.temperature > 0.0f ? mm3::sample::draw(d, rng, x) : d[0].first;
+                    break;
+                }
+                ++d_acc;
+                if (in.stop.load()) {
+                    finish = "cancel";
+                    more = false;
+                    break;
+                }
+                if (in_think && x == r.think_end) in_think = false;
+                more = emit(x);
+                state.push_back(x);
+            }
+            if (!more) break;
+            tok = next;
+        }
+        if (!fail.empty()) {
+            std::printf("ERR %s\n", fail.c_str());
+            std::fprintf(stderr, "hy4: %s\n", fail.c_str());
+            finish = "cancel";
+            state.clear();
+        }
+        if (spec && d_off > 0) std::fprintf(stderr, "maya hy4 serve: MTP kept %lld of %lld drafts\n", d_acc, d_off);
+        stat_line();
+        const double t2 = now() * 1e3;
+        std::printf("DONE %lld %zu %.1f %.1f %s %lld %lld %zu 0 0\n", produced, r.ids.size(), t1 - t0, t2 - t1, finish,
+                    d_acc, d_off, from);
+        std::fflush(stdout);
+        {
+            std::string perr;
+            if (!m.save_profile(perr)) std::fprintf(stderr, "hy4: the expert profile: %s\n", perr.c_str());
+        }
+        std::fprintf(stderr,
+                     "maya hy4 serve: prompt %zu tokens = %zu reused + %zu read in %.0f ms (%.1f tok/s), %lld generated "
+                     "in %.0f ms (%.2f tok/s)\n",
+                     r.ids.size(), from, r.ids.size() - from, t1 - t0,
+                     t1 > t0 ? 1000.0 * (double) (r.ids.size() - from) / (t1 - t0) : 0.0, produced, t2 - t1,
+                     t2 > t1 ? 1000.0 * (double) produced / (t2 - t1) : 0.0);
+    }
+    return 0;
+}
+
+// --bench-lane (no GPU): the CPU lane's routed experts of one layer, n experts a call for one token, at several thread
+// counts - each call's experts picked at random, every expert read once first (the page cache)
+int bench_lane(const std::string& pack_dir, int il, int n_exp_call, int n_tok) {
+    hy4::Pack pk;
+    std::string err;
+    if (!pk.load(pack_dir, err)) {
+        std::fprintf(stderr, "%s\n", err.c_str());
+        return 1;
+    }
+    const std::string p = "blk." + std::to_string(il) + ".";
+    const hy4::Tensor *tg = pk.get(p + "ffn_gate_exps.weight"), *tu = pk.get(p + "ffn_up_exps.weight"),
+                      *td = pk.get(p + "ffn_down_exps.weight");
+    if (!tg || !tu || !td) {
+        std::fprintf(stderr, "layer %d has no routed experts\n", il);
+        return 1;
+    }
+    auto tid = [](const std::string& t) { return t == "Q4_K" ? 12 : t == "Q6_K" ? 14 : t == "Q8_0" ? 8 : -1; };
+    hy4::CpuExperts ex;
+    if (!ex.init(tid(tg->type), tid(td->type), pk.g.n_lat, pk.g.n_ff_exp, err)) {
+        std::fprintf(stderr, "%s\n", err.c_str());
+        return 1;
+    }
+    ex.gate = pk.data(*tg);
+    ex.up = pk.data(*tu);
+    ex.down = pk.data(*td);
+    ex.limit = 10.0f;
+    const int E = pk.g.n_lat, NE = pk.g.n_expert;
+    std::vector<float> x((size_t) E * n_tok), out((size_t) E * n_tok);
+    std::mt19937 rng(1);
+    for (float& v : x) v = std::normal_distribution<float>(0.0f, 1.0f)(rng);
+    volatile uint8_t sink = 0;   // (every expert's bytes touched once: the page cache)
+    for (int e = 0; e < NE; ++e) {
+        for (size_t b = 0; b < ex.g_stride; b += 4096) sink ^= ex.gate[(size_t) e * ex.g_stride + b] ^ ex.up[(size_t) e * ex.g_stride + b];
+        for (size_t b = 0; b < ex.d_stride; b += 4096) sink ^= ex.down[(size_t) e * ex.d_stride + b];
+    }
+    {
+        hy4::Lane probe(0);
+        int hist[4] = {0, 0, 0, 0};
+        for (int e = 0; e < NE; ++e) {
+            const int q = hy4::Lane::node_of_page(ex.gate + (size_t) e * ex.g_stride);
+            ++hist[q < 0 ? 3 : std::min(q, 2)];
+        }
+        std::printf("lane nodes %d; experts' gate pages: node0 %d, node1 %d, other %d, unknown %d\n", probe.nodes(),
+                    hist[0], hist[1], hist[2], hist[3]);
+    }
+    const double mb = (2.0 * ex.g_stride + ex.d_stride) / 1e6;
+    std::printf("layer %d: %s / %s experts, %.2f MB each; %d a token, %d tokens a call\n", il, tg->type.c_str(),
+                td->type.c_str(), mb, n_exp_call, n_tok);
+    for (int th : {0, 3, 7, 15, 21, 31, 43}) {
+        hy4::Lane lane(th);
+        std::vector<hy4::CpuEntry> ent;
+        const int reps = n_tok > 1 ? 4 : 40;
+        double tsum = 0;
+        for (int r = 0; r < reps + 3; ++r) {
+            ent.clear();
+            std::vector<int> pick(NE);
+            for (int e = 0; e < NE; ++e) pick[(size_t) e] = e;
+            for (int t = 0; t < n_tok; ++t) {
+                std::shuffle(pick.begin(), pick.end(), rng);
+                for (int j = 0; j < n_exp_call; ++j) ent.push_back({t, pick[(size_t) j], 0.25f});
+            }
+            const double t0 = now();
+            hy4::cpu_experts(lane, ex, ent, x.data(), n_tok, out.data());
+            if (r >= 3) tsum += now() - t0;
+        }
+        const double ms = 1e3 * tsum / reps;
+        std::printf("  %2d threads: %.3f ms a call, %.3f ms an expert-token, %.1f tokens/s\n", th + 1, ms,
+                    ms / ((double) n_exp_call * n_tok), 1000.0 * n_tok / ms);
+    }
+    return 0;
+}
+
+}  // namespace
+
+int main(int argc, char** argv) {
+    hy4::Options o;
+    std::string ids_arg, kld;
+    int gen = 0, chunks = 0;
+    bool top = false, serving = false;
+    int bench_layer = -1, bench_n = 16, bench_t = 1;
+    std::vector<int> eos;
+    int n_draft = 3;
+    float floor = 0.55f;
+    for (int i = 1; i < argc; ++i) {
+        const std::string a = argv[i];
+        auto next = [&]() -> std::string {
+            if (i + 1 >= argc) {
+                std::fprintf(stderr, "%s needs a value\n", a.c_str());
+                std::exit(2);
+            }
+            return argv[++i];
+        };
+        if (a == "--pack") o.pack = next();
+        else if (a == "--ids") ids_arg = next();
+        else if (a == "--gen") gen = std::atoi(next().c_str());
+        else if (a == "--gpus") o.gpus = parse_list(next());
+        else if (a == "--max-context") o.max_ctx = std::atoll(next().c_str());
+        else if (a == "--layer-split") {   // (the server's "auto": each GPU filled in turn)
+            const std::string v = next();
+            o.layer_split = v == "auto" ? std::vector<int>{} : parse_list(v);
+        }
+        else if (a == "--reserve-gb") o.reserve_gb = std::atof(next().c_str());
+        else if (a == "--chunk") o.prefill_chunk = std::atoi(next().c_str());
+        else if (a == "--vram-experts") o.vram_experts = std::atof(next().c_str());
+        else if (a == "--cpu-threads") o.cpu_threads = std::atoi(next().c_str());
+        else if (a == "--profile") o.profile = next();
+        else if (a == "--tp") {
+            const std::string v = next();
+            o.tp = v == "auto" ? -1 : std::atoi(v.c_str());
+        }
+        else if (a == "--main-gpu") o.main_gpu = std::atoi(next().c_str());
+        else if (a == "--profile-out") o.profile_out = next();
+        else if (a == "--kld") kld = next();
+        else if (a == "--chunks") chunks = std::atoi(next().c_str());
+        else if (a == "--top") top = true;
+        else if (a == "--serve") serving = true;
+        else if (a == "--bench-lane") bench_layer = std::atoi(next().c_str());
+        else if (a == "--bench-experts") bench_n = std::atoi(next().c_str());
+        else if (a == "--bench-tokens") bench_t = std::atoi(next().c_str());
+        else if (a == "--mtp") o.mtp = true;
+        else if (a == "--draft") n_draft = std::atoi(next().c_str());
+        else if (a == "--draft-floor") floor = (float) std::atof(next().c_str());
+        else if (a == "--eos") eos = parse_list(next());
+        else if (a == "-v" || a == "--verbose") o.verbose = true;
+        else {
+            std::fprintf(stderr, "unknown argument %s\n", a.c_str());
+            return 2;
+        }
+    }
+    if (o.pack.empty()) {
+        std::fprintf(stderr, "usage: maya-hy4 --pack <model>/maya-hy4 (--ids @file [--gen N] | --kld ref.kld)\n");
+        return 2;
+    }
+    if (bench_layer >= 0) return bench_lane(o.pack, bench_layer, bench_n, bench_t);
+    hy4::Model m;
+    std::string err;
+    if (!m.load(o, err)) {
+        std::fprintf(stderr, "maya-hy4: %s\n", err.c_str());
+        return 1;
+    }
+    for (const auto& l : m.info_lines()) std::fprintf(stderr, "%s\n", l.c_str());
+    if (eos.empty()) eos.push_back(m.eos());
+    if (serving) return serve(m, eos, n_draft, floor);
+    if (!kld.empty()) return run_kld(m, kld, chunks);
+    std::vector<int> ids = parse_ids(ids_arg);
+    if (ids.empty()) {
+        std::fprintf(stderr, "maya-hy4: no prompt (--ids)\n");
+        return 2;
+    }
+    std::vector<float> logits((size_t) m.vocab());
+    const double t0 = now();
+    if (!m.forward(ids.data(), (int) ids.size(), 0, 1, logits.data(), err)) {
+        std::fprintf(stderr, "maya-hy4: %s\n", err.c_str());
+        return 1;
+    }
+    const double t1 = now();
+    std::fprintf(stderr, "prompt: %zu tokens in %.2f s (%.1f tok/s)", ids.size(), t1 - t0, ids.size() / (t1 - t0));
+    if (m.stats().streamed > 0)
+        std::fprintf(stderr, "; %lld experts streamed, %.0f ms of copies into the bounce", (long long) m.stats().streamed,
+                     m.stats().stream_ms);
+    std::fprintf(stderr, "\n");
+    std::vector<int> out;
+    int64_t pos = (int64_t) ids.size();
+    if (m.has_mtp() && n_draft > 0 && gen > 0) {   // greedy with the MTP block's drafts
+        std::vector<float> lw((size_t) (n_draft + 1) * m.vocab());
+        std::vector<int> drafts;
+        std::vector<float> confs;
+        long long off = 0, acc = 0, rounds = 0;
+        double t_draft = 0, t_verify = 0;
+        int tok = argmax(logits.data(), m.vocab());
+        while ((int) out.size() < gen) {
+            out.push_back(tok);
+            if (tok == m.eos() || (int) out.size() >= gen) break;
+            const double ta = now();
+            if (!m.draft(tok, pos, std::min(n_draft, gen - (int) out.size()), floor, drafts, confs, err)) {
+                std::fprintf(stderr, "maya-hy4: %s\n", err.c_str());
+                return 1;
+            }
+            t_draft += now() - ta;
+            int k = 0;
+            while (k < (int) drafts.size() && confs[(size_t) k] >= floor) ++k;
+            std::vector<int> win(1, tok);
+            win.insert(win.end(), drafts.begin(), drafts.begin() + k);
+            const double tb = now();
+            if (!m.forward(win.data(), k + 1, pos, k + 1, lw.data(), err)) {
+                std::fprintf(stderr, "maya-hy4: %s\n", err.c_str());
+                return 1;
+            }
+            t_verify += now() - tb;
+            ++rounds;
+            off += k;
+            pos += 1;
+            int i = 0;
+            for (; i < k; ++i) {
+                if (argmax(lw.data() + (size_t) i * m.vocab(), m.vocab()) != drafts[(size_t) i]) break;
+                out.push_back(drafts[(size_t) i]);
+                ++acc;
+                ++pos;
+                if (drafts[(size_t) i] == m.eos() || (int) out.size() >= gen) break;
+            }
+            if (out.back() == m.eos() || (int) out.size() >= gen) break;
+            tok = argmax(lw.data() + (size_t) i * m.vocab(), m.vocab());
+        }
+        const double t2 = now();
+        for (size_t i = 0; i < out.size(); ++i) std::printf("%s%d", i ? "," : "", out[i]);
+        std::printf("\n");
+        std::fprintf(stderr, "decode: %zu tokens in %.2f s (%.2f tok/s); %lld rounds, MTP kept %lld of %lld drafts "
+                     "(%.1f tokens a round); a round: drafts %.1f ms, verify %.1f ms\n", out.size(), t2 - t1,
+                     out.size() / (t2 - t1), rounds, acc, off, rounds ? (double) out.size() / rounds : 0.0,
+                     rounds ? 1e3 * t_draft / rounds : 0.0, rounds ? 1e3 * t_verify / rounds : 0.0);
+        return 0;
+    }
+    for (int i = 0; i < gen; ++i) {
+        const int next = argmax(logits.data(), m.vocab());
+        if (top) {
+            std::vector<int> ix((size_t) m.vocab());
+            for (int j = 0; j < m.vocab(); ++j) ix[(size_t) j] = j;
+            std::partial_sort(ix.begin(), ix.begin() + 5, ix.end(),
+                              [&](int a, int b) { return logits[(size_t) a] > logits[(size_t) b]; });
+            std::fprintf(stderr, "step %d:", i);
+            for (int j = 0; j < 5; ++j) std::fprintf(stderr, " %d(%.3f)", ix[(size_t) j], logits[(size_t) ix[(size_t) j]]);
+            std::fprintf(stderr, "\n");
+        }
+        out.push_back(next);
+        if (next == m.eos()) break;
+        if (!m.forward(&next, 1, pos, 1, logits.data(), err)) {
+            std::fprintf(stderr, "maya-hy4: %s\n", err.c_str());
+            return 1;
+        }
+        ++pos;
+    }
+    const double t2 = now();
+    for (size_t i = 0; i < out.size(); ++i) std::printf("%s%d", i ? "," : "", out[i]);
+    std::printf("\n");
+    {
+        std::string perr;
+        if (!m.save_profile(perr)) std::fprintf(stderr, "maya-hy4: the expert profile: %s\n", perr.c_str());
+    }
+    if (!out.empty()) {
+        const auto& st = m.stats();
+        std::fprintf(stderr, "decode: %zu tokens in %.2f s (%.2f tok/s)", out.size(), t2 - t1, out.size() / (t2 - t1));
+        if (st.cpu_experts > 0)
+            std::fprintf(stderr, "; CPU lane %.1f%% of the experts, %.1f ms of the run", 100.0 * st.cpu_experts / st.experts,
+                         st.cpu_ms);
+        std::fprintf(stderr, "\n");
+    }
+    return 0;
+}

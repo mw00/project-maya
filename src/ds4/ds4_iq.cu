@@ -1450,6 +1450,14 @@ bool tc_ok() {
         case kQ8_0: F(kQ8_0); break;       \
         default: DS4_IQ_SWITCH(t, F)       \
     }
+// ... and the experts' roles with the clamped SwiGLU (kActSwiglu), which also take Q6_K and Q8_0: the Q4_K_M quants'
+// recipe gives Q6_K to some layers' down, and maya-hy4 rounds Hy4-flash's BF16 MTP experts to Q8_0 (expert_supported)
+#define DS4_IQ_SWITCH_EXP(t, F)            \
+    switch (t) {                           \
+        case kQ6_K: F(kQ6_K); break;       \
+        case kQ8_0: F(kQ8_0); break;       \
+        default: DS4_IQ_SWITCH(t, F)       \
+    }
 
 // IQ1's token / window kernels: RP rows passes a block (1 or 4), AH the loads a step ahead - measured per platform
 // (ds4_gguf_test --bench-q), the defaults below; DS4_IQ_RP=1|4 and DS4_IQ_AHEAD=0|1 choose (the same sums either way)
@@ -1733,7 +1741,7 @@ bool light_set(const SetArgs& a, bool gu, cudaStream_t s) {
             return true;
         }
 #define LG_(T) launch_light<T, true>(a, *b, s)
-        DS4_IQ_SWITCH(a.tg, LG_)
+        DS4_IQ_SWITCH_EXP(a.tg, LG_)
 #undef LG_
     } else {
         if (a.td == kMXFP4) {
@@ -1741,7 +1749,7 @@ bool light_set(const SetArgs& a, bool gu, cudaStream_t s) {
             return true;
         }
 #define LD_(T) launch_light<T, false>(a, *b, s)
-        DS4_IQ_SWITCH(a.td, LD_)
+        DS4_IQ_SWITCH_EXP(a.td, LD_)
 #undef LD_
     }
     return true;
@@ -1758,6 +1766,8 @@ void mv_nc(const Jobs& J, int nj, int max_n, int max_c, cudaStream_t s) {
 }  // namespace
 
 bool supported(int t) { return t != kQ6_K && t != kQ8_0 && block_bytes(t) > 0; }
+bool down_supported(int t) { return expert_supported(t); }
+bool expert_supported(int t) { return t == kQ6_K || t == kQ8_0 || supported(t); }
 bool mv_supported(int t) { return block_bytes(t) > 0; }
 
 int block_bytes(int t) {
@@ -1821,7 +1831,7 @@ bool gate_up(const Args& a, int groups, int ne_max, cudaStream_t s) {
         return true;
     }
 #define GU_(T) gu_ne<T>(a, grid, ne_max, s)
-    DS4_IQ_SWITCH(a.tg, GU_)
+    DS4_IQ_SWITCH_EXP(a.tg, GU_)
 #undef GU_
     return true;
 }
@@ -1830,7 +1840,7 @@ bool down(const Args& a, int groups, int ne_max, cudaStream_t s) {
     if (a.n_ff % block_values(a.td) != 0 || a.n_embd % (kWarps * kDnRW) != 0) return false;
     const dim3 grid((unsigned) (a.n_embd / (kWarps * kDnRW)), (unsigned) groups);
 #define DN_(T) dn_ne<T>(a, grid, ne_max, s)
-    DS4_IQ_SWITCH(a.td, DN_)
+    DS4_IQ_SWITCH_EXP(a.td, DN_)
 #undef DN_
     return true;
 }
@@ -2298,7 +2308,7 @@ bool set_gate_up(const SetArgs& a, cudaStream_t s) {
         return true;
     }
 #define SG_(T) launch_set<T, true>(t, grid, s)
-    DS4_IQ_SWITCH(a.tg, SG_)
+    DS4_IQ_SWITCH_EXP(a.tg, SG_)
 #undef SG_
     return true;
 }
@@ -2327,7 +2337,7 @@ bool set_down(const SetArgs& a, cudaStream_t s) {
     }
     const dim3 grid((unsigned) ((a.max_rows + BM - 1) / BM), (unsigned) (a.n_embd / BN), (unsigned) a.n_exp);
 #define SD_(T) launch_set<T, false>(t, grid, s)
-    DS4_IQ_SWITCH(a.td, SD_)
+    DS4_IQ_SWITCH_EXP(a.td, SD_)
 #undef SD_
     return true;
 }

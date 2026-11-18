@@ -79,6 +79,14 @@ class ChatTemplate:
         # gets the nearest level it knows.  Every other model renders exactly as before.
         self.glm_dsa = bool(glm_dsa)
         self.dialect = effort_dialect(self.source)
+        # Hy4-flash (Tencent's own template, the GGUF's): every tag carries the template's suffix (HYTK, ':6124c78e' -
+        # <think:6124c78e>, <tool_call:6124c78e>, <｜hy_end:6124c78e｜>), reasoning_effort no_think / low / high / max
+        # beside a reasoning_mode token, tool calls in GLM's form (NAME<arg_key>K</arg_key><arg_value>V...) inside a
+        # <tool_calls> wrapper.  The pack's tokenizer names each suffixed tag token by GLM's spelling (its aliases), so
+        # the parser reads Hy4's answers as GLM's.
+        hytk = re.search(r"set\s+HYTK\s*=\s*'([^']*)'", self.source)
+        self.hy4 = bool(hytk) and "reasoning_mode" in self.source and "hy_start" in self.source
+        self.hy4_tag = hytk.group(1) if hytk else ""
 
     def render(self, messages: list[dict], tools: list[dict] | None = None, add_generation_prompt: bool = True,
                **kwargs) -> str:
@@ -127,6 +135,19 @@ class ChatTemplate:
             elif level in EFFORT_NAMES:
                 kwargs["reasoning_effort"] = level
             # (its template reads tool.function: the server's flat tools go back into OpenAI's form)
+            tools = [t if "function" in t else {"type": "function", "function": t} for t in tools or []] or None
+            return self.template.render(messages=messages, tools=tools, add_generation_prompt=add_generation_prompt,
+                                        **kwargs)
+        if self.hy4:
+            # Hy4-flash's levels are the server's own (low / high / max) and no_think for off; none named (Auto) is its
+            # template's default (high).  Its template reads tool['function'] where a tool has one.
+            off = kwargs.pop("enable_thinking", None) is False
+            level = kwargs.pop("reasoning_effort", None)
+            kwargs.pop("thinking_mode", None)
+            if off:
+                kwargs["reasoning_effort"] = "no_think"
+            elif level in ("low", "high", "max"):
+                kwargs["reasoning_effort"] = level
             tools = [t if "function" in t else {"type": "function", "function": t} for t in tools or []] or None
             return self.template.render(messages=messages, tools=tools, add_generation_prompt=add_generation_prompt,
                                         **kwargs)
