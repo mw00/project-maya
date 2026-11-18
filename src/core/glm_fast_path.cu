@@ -2145,7 +2145,12 @@ bool Glm5Model::fast_setup(std::string& err) {
                                             strata::platform::kHugeInterleave, huge_nodes);
             if (e == cudaSuccess && huge && backing != strata::core::PinnedBacking::HugeTlb && !huge_warned) {
                 std::fprintf(stderr, "glm fast: CUDA%d RAM tier asked for 2 MB huge pages (%.2f GB block), but the pool "
+#ifdef STRATA_USE_HIP
+                                     "could not hold it, registration was refused or a GPU maps the block at another "
+                                     "address than the host's: ordinary pinned memory; enlarge "
+#else
                                      "could not hold it or registration was refused: ordinary pinned memory; enlarge "
+#endif
                                      "the pool with sysctl vm.nr_hugepages=N (reserved) or "
                                      "sysctl vm.nr_overcommit_hugepages=N (on demand)\n",
                              dev_, (double) bytes / 1073741824.0);

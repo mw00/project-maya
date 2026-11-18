@@ -147,7 +147,17 @@ int main() {
         if (cuda_ok(c::pinned_host_alloc(&host, bytes, cudaHostAllocPortable | cudaHostAllocMapped, true,
                                          c::PinnedHostAccess::HostAddress, &backing),
                     "mapped huge pinned_host_alloc")) {
-            CHECK(backing == (pool_holds && mapped_usable ? c::PinnedBacking::HugeTlb : c::PinnedBacking::CudaHostAlloc));
+#ifdef STRATA_USE_HIP
+            const bool address_checked = true;   // (HIP: a 0 attribute is checked against the block's device address)
+#else
+            const bool address_checked = false;
+#endif
+            if (pool_holds && mapped_usable)
+                CHECK(backing == c::PinnedBacking::HugeTlb);
+            else if (pool_holds && address_checked)   // either outcome; a huge block must alias its host address
+                CHECK(backing == c::PinnedBacking::HugeTlb || backing == c::PinnedBacking::CudaHostAlloc);
+            else
+                CHECK(backing == c::PinnedBacking::CudaHostAlloc);
             void* alias = nullptr;
             CHECK(cuda_ok(cudaHostGetDevicePointer(&alias, host, 0), "mapped cudaHostGetDevicePointer"));
             if (backing == c::PinnedBacking::HugeTlb) CHECK(alias == host);
