@@ -134,6 +134,15 @@ struct GpuOps {
     glmd::DecodePolicy pol;
     int64_t p = 0;                 // the token's position (the policy's n = p + 1)
     void* topk_work = nullptr;
+    // MAYA_GLM_PROF_DSA=1 (with MAYA_GLM_PROF): a profile mark after each step of the mixer, so the part's table splits
+    // "dsa_glm" into the projections, the prep, the rope, the indexer's score and top-k, KV streaming's resolve and
+    // the attention (null: one "dsa_glm" mark a layer, as before)
+    void (*mark)(void* ctx, const char* name) = nullptr;
+    void* mark_ctx = nullptr;
+    bool done(bool ok, const char* name) const {
+        if (mark != nullptr) mark(mark_ctx, name);
+        return ok;
+    }
     const WSlot* slot(int il, Proj w) const {
         const GlmDsaLayerW& W = X->L[(size_t) il];
         switch (w) {
@@ -163,15 +172,15 @@ struct GpuOps {
             m[i].xf_cstride = j[i].xf_cs;
             m[i].y_cstride = j[i].y_cs;
         }
-        return mv(X, m, n, s);
+        return done(mv(X, m, n, s), "dsa_proj");
     }
-    bool prep(const glmd::DsaPrep& a) { return glmd::dsa_prep(a, s); }
-    bool rope_q(const glmd::DsaRopeQ& a) { return glmd::dsa_rope_q(a, s); }
-    bool score(const glmd::IdxScore& a) { return glmd::decode_score(pol, a, p, s); }
+    bool prep(const glmd::DsaPrep& a) { return done(glmd::dsa_prep(a, s), "dsa_prep"); }
+    bool rope_q(const glmd::DsaRopeQ& a) { return done(glmd::dsa_rope_q(a, s), "dsa_rope"); }
+    bool score(const glmd::IdxScore& a) { return done(glmd::decode_score(pol, a, p, s), "dsa_score"); }
     bool topk(const float* score, int ld, int n_kv, const int* pos, int top_k, int* sel) {
-        return glmd::decode_topk(pol, score, ld, n_kv, pos, p, top_k, sel, topk_work, s);
+        return done(glmd::decode_topk(pol, score, ld, n_kv, pos, p, top_k, sel, topk_work, s), "dsa_topk");
     }
-    bool mla2(const glmd::Mla2& a) { return glmd::decode_mla(pol, a, s); }
+    bool mla2(const glmd::Mla2& a) { return done(glmd::decode_mla(pol, a, s), "dsa_mla"); }
     void set_pos(int64_t q) { p = q; }   // (L1-4 mixer_rows: each row's own position)
 };
 
@@ -422,6 +431,8 @@ struct DsaKvCtx {
     const uint8_t* kpe_host = nullptr;
     const uint8_t* kpe_slots = nullptr;
     int lat_row = 0, kpe_row = 0;
+    void (*mark)(void* ctx, const char* name) = nullptr;   // MAYA_GLM_PROF_DSA: "dsa_kv" after the resolve's launches
+    void* mark_ctx = nullptr;
 };
 const int* dsa_kv_resolve(void* ctx, const int* cells, int n_cap, const int* n_sel_dev) {
     const DsaKvCtx& k = *(const DsaKvCtx*) ctx;
@@ -438,6 +449,7 @@ const int* dsa_kv_resolve(void* ctx, const int* cells, int n_cap, const int* n_s
             }
         }
         rows = k.slot_cells;
+        if (k.mark != nullptr) k.mark(k.mark_ctx, "dsa_kv");
     }
     if (k.dbg != nullptr) {
         const int* sc = k.mode == DsaKvCtx::kIdentity ? nullptr : k.slot_cells;
@@ -601,6 +613,13 @@ bool Glm5Model::fast_dsa_glm(int il, int64_t p, std::string& err) {
     ops.pol = d.pol;
     ops.p = p;
     ops.topk_work = M.topk_work;
+    static const bool prof_steps = strata::glmenv::env_flag("MAYA_GLM_PROF_DSA", false);
+    if (prof_steps && F->prof_on) {
+        ops.mark = [](void* f, const char* name) { ((FastState*) f)->mark(name); };
+        ops.mark_ctx = F;
+        kctx.mark = ops.mark;
+        kctx.mark_ctx = F;
+    }
     if (!glmdsa::mixer_layer(ops, d, b, c, w, il, p, M.dense, M.st, err)) return false;
     X.n_sel_last = M.st.n_sel_last;
     X.sel_layer = M.st.layer;
