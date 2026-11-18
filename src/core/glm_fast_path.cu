@@ -22,6 +22,7 @@
 #include "strata/core/expert_cache.hpp"
 #include "strata/core/glm_helper_link.hpp"
 #include "strata/core/glm_model.hpp"
+#include "strata/core/pinned_host.hpp"
 #include "strata/core/glm_dsa_split.hpp"   // glm-dsa B6.3
 #include "strata/core/glm_dsa_spec.hpp"   // glm-dsa B11.2 / B11.3
 #include "strata/core/glm_ngram_draft.hpp"   // glm-dsa B14.13
@@ -648,15 +649,18 @@ static void numa_pinned_free(void* p, size_t bytes) {
 // The RAM tier's sizing pins through these: MAYA_GLM_PIN_CAP_MB=<MB> (tests) refuses what would take the bytes they
 // hold past it - a Windows pinning cap where there is none.  (The parts of a split pin one after another.)
 static int64_t g_pin_held = 0;
-static cudaError_t pin_alloc(void** p, size_t bytes, unsigned flags) {
+static cudaError_t pin_alloc(void** p, size_t bytes, unsigned flags, bool huge = false,
+                             strata::core::PinnedBacking* backing = nullptr, int node = -1, int nodes = 1) {
     static const int64_t cap = getenv("MAYA_GLM_PIN_CAP_MB") ? std::atoll(getenv("MAYA_GLM_PIN_CAP_MB")) << 20 : -1;
     if (cap >= 0 && g_pin_held + (int64_t) bytes > cap) return cudaErrorMemoryAllocation;
-    const cudaError_t e = cudaHostAlloc(p, bytes, flags);
+    const cudaError_t e = strata::core::pinned_host_alloc(p, bytes, flags, huge,
+                                                        strata::core::PinnedHostAccess::HostAddress,
+                                                        backing, node, nodes);
     if (e == cudaSuccess) g_pin_held += (int64_t) bytes;
     return e;
 }
 static void pin_free(void* p, size_t bytes) {
-    cudaFreeHost(p);
+    strata::core::pinned_host_free(p);
     g_pin_held -= (int64_t) bytes;
 }
 constexpr size_t kPinRoom = (size_t) 512 << 20;   // what a tier leaves pinnable above it (the driver's own buffers)
@@ -2126,16 +2130,39 @@ bool Glm5Model::fast_setup(std::string& err) {
 #else
                                                                           : 0;
 #endif
+        uint64_t planned_total = 0;
+        for (size_t c = 0; c < cls_n.size(); ++c) planned_total += (uint64_t) cls_n[c] * cls_stride[c];
+        const int huge_env = strata::core::pinned_huge_env(getenv("MAYA_GLM_PIN_HUGETLB"));
+        const int huge_nodes = (int) numa_nodes().size();
+        // Automatic mode keeps the existing interleaving and row-halves policies on NUMA hosts.
+        const bool huge = (huge_nodes < 2 || huge_env == 1) &&
+                          strata::core::pinned_huge_wanted(huge_env, planned_total);
+        bool huge_warned = false;
+        const auto pin_block = [&](void** p, size_t bytes) {
+            strata::core::PinnedBacking backing = strata::core::PinnedBacking::None;
+            // Keep the tier's Portable fallback; fetch kernels read the RAM tier at its host address.
+            const cudaError_t e = pin_alloc(p, bytes, cudaHostAllocPortable, huge, &backing,
+                                            strata::platform::kHugeInterleave, huge_nodes);
+            if (e == cudaSuccess && huge && backing != strata::core::PinnedBacking::HugeTlb && !huge_warned) {
+                std::fprintf(stderr, "glm fast: CUDA%d RAM tier asked for 2 MB huge pages (%.2f GB block), but the pool "
+                                     "could not hold it or registration was refused: ordinary pinned memory; enlarge "
+                                     "the pool with sysctl vm.nr_hugepages=N (reserved) or "
+                                     "sysctl vm.nr_overcommit_hugepages=N (on demand)\n",
+                             dev_, (double) bytes / 1073741824.0);
+                huge_warned = true;
+            }
+            return e;
+        };
         const auto pin_tier = [&](FastState::RamClass& R, int64_t n) -> void* {
             if (R.per_part <= 0) {
                 void* q = nullptr;
-                return pin_alloc(&q, (size_t) n * R.stride, cudaHostAllocPortable) == cudaSuccess ? q : nullptr;
+                return pin_block(&q, (size_t) n * R.stride) == cudaSuccess ? q : nullptr;
             }
             R.parts.clear();
             for (int64_t s = 0; s < n; s += R.per_part) {
                 void* q = nullptr;
                 const size_t bytes = (size_t) std::min<int64_t>(R.per_part, n - s) * R.stride;
-                if (pin_alloc(&q, bytes, cudaHostAllocPortable) != cudaSuccess) {
+                if (pin_block(&q, bytes) != cudaSuccess) {
                     for (size_t i = 0; i < R.parts.size(); ++i)
                         pin_free(R.parts[i], (size_t) std::min<int64_t>(R.per_part, n - (int64_t) i * R.per_part) * R.stride);
                     R.parts.clear();
@@ -2186,7 +2213,7 @@ bool Glm5Model::fast_setup(std::string& err) {
                     err = "glm helper link: the shared RAM tier did not allocate or register";
                     return false;
                 }
-                if ((p = numa_pinned((size_t) n * R.stride, rl.gu > 0 ? &rl : nullptr)) != nullptr) {   // (over every socket: numa_pinned)
+                if (!huge && (p = numa_pinned((size_t) n * R.stride, rl.gu > 0 ? &rl : nullptr)) != nullptr) {   // (over every socket: numa_pinned)
                     R.registered = true;
                     R.per_part = 0;   // (one mapping)
                     break;
@@ -2283,9 +2310,22 @@ bool Glm5Model::fast_setup(std::string& err) {
                              (double) unseen_pf / 1073741824.0);
         }
         int64_t ram_slots = 0;
-        for (auto& R : F->rc) ram_slots += R.n;
-        std::fprintf(stderr, "glm fast: CUDA%d RAM tier %.2f GB pinned, %lld slots\n", dev_,
-                     (double) F->ram_bytes / 1073741824.0, (long long) ram_slots);
+        uint64_t huge_bytes = 0;
+        for (const auto& R : F->rc) {
+            ram_slots += R.n;
+            for (size_t i = 0; i < R.n_parts(); ++i)
+                if (strata::core::pinned_host_backing(R.part(i)) == strata::core::PinnedBacking::HugeTlb)
+                    huge_bytes += R.part_slots(i) * R.stride;
+        }
+        if (huge_bytes > 0 && huge_bytes == F->ram_bytes)
+            std::fprintf(stderr, "glm fast: CUDA%d RAM tier %.2f GB pinned on 2 MB huge pages, %lld slots\n", dev_,
+                         (double) F->ram_bytes / 1073741824.0, (long long) ram_slots);
+        else if (huge_bytes > 0)
+            std::fprintf(stderr, "glm fast: CUDA%d RAM tier %.2f GB pinned (%.2f GB on 2 MB huge pages), %lld slots\n", dev_,
+                         (double) F->ram_bytes / 1073741824.0, (double) huge_bytes / 1073741824.0, (long long) ram_slots);
+        else
+            std::fprintf(stderr, "glm fast: CUDA%d RAM tier %.2f GB pinned, %lld slots\n", dev_,
+                         (double) F->ram_bytes / 1073741824.0, (long long) ram_slots);
         if (F->ram_resident) {
             if (balanced_ram)
                 std::fprintf(stderr, "glm fast: CUDA%d RAM-resident mode: mandatory lending/spares reserved; "
@@ -4906,7 +4946,7 @@ void Glm5Model::fast_destroy() {
     for (auto& R : F->rc)
         if (R.base && R.registered) numa_pinned_free(R.base, (size_t) R.n * R.stride);
         else
-            for (size_t i = 0; i < R.n_parts(); ++i) cudaFreeHost(R.part(i));
+            for (size_t i = 0; i < R.n_parts(); ++i) strata::core::pinned_host_free(R.part(i));
     for (auto& d : F->draining) cudaEventDestroy(d.ev);
     for (auto& m : F->bg) cudaEventDestroy(m.ev);
     for (auto e : F->ev_free) cudaEventDestroy(e);
