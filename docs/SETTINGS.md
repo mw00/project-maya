@@ -2032,15 +2032,22 @@ in one reservation instead of pieces. A failed huge-page allocation or GPU regis
 path. GLM's landing ring and MiniMax's pinned pool use GPU copies, not GPU access at the host address.
 MiniMax's KV-streaming cache uses each GPU's mapped device address. These paths do not require the GPU to
 support reading registered memory at its host address (including discrete AMD cards reporting that it cannot).
-GLM's RAM tier is also read directly by GPU fetch kernels, so it still requires that support on every GPU.
+GLM's RAM tier is also read directly by GPU fetch kernels, so it still requires that support on every GPU. An
+AMD (HIP) build that is told a card cannot (discrete cards say so) asks for the registered block's device address
+on every GPU instead, and keeps the huge pages only where it is the host address; otherwise the tier is ordinary
+pinned memory (one log line). Measured on a Radeon AI PRO R9700 (ROCm 7.2.3): the addresses matched, and an 88 GB
+tier went on 2 MB pages.
 
 On PCs with two or more NUMA nodes GLM keeps its interleaved NUMA RAM tier in automatic mode; `1` puts it on huge
-pages interleaved over nodes 0 to n-1 (a PC whose node numbers have gaps leaves the missing ones out), and what
-the pool cannot hold is then ordinary pinned memory, not interleaved. On a glm-dsa PC with a NUMA-bound prompt
-landing ring (`MAYA_GLM_STAGE_NUMA`),
+pages interleaved over nodes 0 to n-1 (a PC whose node numbers have gaps leaves the missing ones out) in place of
+that tier and of `MAYA_GLM_ROW_HALVES`' placement, and what the pool cannot hold is then ordinary pinned memory,
+not interleaved. An on-demand pool takes a page from another node when one has no free 2 MB block left (measured
+on two nodes: about 70/30); a pool reserved per node
+(`/sys/devices/system/node/node*/hugepages/hugepages-2048kB/nr_hugepages`) holds the same number on each. On a
+glm-dsa PC with a NUMA-bound prompt landing ring (`MAYA_GLM_STAGE_NUMA`),
 that ring keeps its node-bound mapping whatever the setting. GLM's link mode (the RAM tier shared with a helper
 program) keeps its shared memory, which an anonymous huge-page block cannot replace. AMD (HIP) builds need an
-explicit `1` (untested there). On Windows and macOS these settings have no effect.
+explicit `1` (measured on one card model only). On Windows and macOS these settings have no effect.
 
 | Setting | Default | |
 | --- | --- | --- |

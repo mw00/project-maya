@@ -1,6 +1,7 @@
 // include/strata/core/pinned_host.hpp - large page-locked host blocks on explicit 2 MB pages when asked and
 // available.  Huge blocks are always registered Mapped.  Unless the caller copies or translates the pointer,
-// every visible GPU must read them at their host address.  A refused huge path takes cudaHostAlloc unchanged.
+// every visible GPU must read them at their host address (HIP: where the attribute says 0, the registered block's
+// own device address decides).  A refused huge path takes cudaHostAlloc unchanged.
 #pragma once
 
 #include "strata/platform/huge_pages.hpp"
@@ -32,7 +33,7 @@ inline bool pinned_huge_wanted(int env, uint64_t need) {
     if (env == 0 || need == 0) return false;
     if (env == 1) return true;
 #ifdef STRATA_USE_HIP
-    return false;   // AMD's registered huge pages are untested: explicit opt-in only
+    return false;   // AMD: measured on one card model (Radeon AI PRO R9700) only: explicit opt-in
 #else
     return need >= kPinnedHugeMin && platform::huge_on(-1, platform::huge_pool_2m(), need);
 #endif
@@ -63,6 +64,45 @@ inline cudaError_t release(void* m, size_t got) {
     if (err == cudaSuccess) platform::huge_free(m, got);
     return err;
 }
+#ifdef STRATA_USE_HIP
+// Discrete AMD GPUs report 0 for CanUseHostPointerForRegisteredMem, yet a registered block may still be visible at
+// its host address.  Check the block's actual device address on every GPU; the current device is left as it was.
+// A lookup that fails is an answer (*same false).  A current device that cannot be put back is an error: the
+// caller must not go on, or allocate its fallback, with another GPU current.
+inline cudaError_t same_address_everywhere(void* m, size_t got, int count, bool* same_out) {
+    *same_out = false;
+    int cur = 0;
+    if (cudaGetDevice(&cur) != cudaSuccess) {
+        cudaGetLastError();   // Clear only the failed query.
+        return cudaSuccess;
+    }
+    bool same = true;
+    char* const last = (char*) m + (got - platform::kHugePage2M);   // (the block's last huge page too)
+    for (int dev = 0; same && dev < count; ++dev) {
+        if (cudaSetDevice(dev) != cudaSuccess) {
+            cudaGetLastError();
+            same = false;
+            break;
+        }
+        for (char* h : {(char*) m, last}) {
+            void* d = nullptr;
+            if (cudaHostGetDevicePointer(&d, h, 0) != cudaSuccess) {
+                cudaGetLastError();   // Clear only the failed lookup.
+                same = false;
+                break;
+            }
+            if (d != (void*) h) {
+                same = false;
+                break;
+            }
+        }
+    }
+    const cudaError_t restored = cudaSetDevice(cur);
+    if (restored != cudaSuccess) return restored;
+    *same_out = same;
+    return cudaSuccess;
+}
+#endif
 }  // namespace pinned_host_detail
 
 inline cudaError_t pinned_host_alloc(void** p, size_t bytes, unsigned flags, bool huge,
@@ -72,8 +112,11 @@ inline cudaError_t pinned_host_alloc(void** p, size_t bytes, unsigned flags, boo
     if (huge && p != nullptr && (flags & ~(cudaHostAllocPortable | cudaHostAllocMapped)) == 0) {
         // Preserve cudaHostAlloc's host-address access unless the caller does not need it.
         bool usable = true;
+#ifdef STRATA_USE_HIP
+        bool check_address = false;   // (the attribute said 0; the address is checked after registration)
+#endif
+        int count = 0;
         if (access == PinnedHostAccess::HostAddress) {
-            int count = 0;
             if (cudaGetDeviceCount(&count) != cudaSuccess) {
                 cudaGetLastError();   // Clear only the failed CUDA call made here.
                 usable = false;
@@ -83,7 +126,13 @@ inline cudaError_t pinned_host_alloc(void** p, size_t bytes, unsigned flags, boo
                 if (cudaDeviceGetAttribute(&ok, cudaDevAttrCanUseHostPointerForRegisteredMem, dev) != cudaSuccess) {
                     cudaGetLastError();   // Clear only the failed attribute query.
                     usable = false;
-                } else if (!ok) usable = false;
+                } else if (!ok) {
+#ifdef STRATA_USE_HIP
+                    check_address = true;
+#else
+                    usable = false;
+#endif
+                }
             }
         }
         size_t got = 0;
@@ -92,7 +141,25 @@ inline cudaError_t pinned_host_alloc(void** p, size_t bytes, unsigned flags, boo
             for (size_t off = 0; off < got; off += platform::kHugePage2M) ((volatile char*) m)[off] = 0;
             unsigned reg = cudaHostRegisterMapped;
             if ((flags & cudaHostAllocPortable) != 0) reg |= cudaHostRegisterPortable;
-            if (cudaHostRegister(m, got, reg) == cudaSuccess) {
+            bool registered = cudaHostRegister(m, got, reg) == cudaSuccess;
+            if (!registered) {
+                cudaGetLastError();   // Clear only the failed registration.
+                platform::huge_free(m, got);
+            }
+#ifdef STRATA_USE_HIP
+            if (registered && check_address) {
+                bool same = false;
+                const cudaError_t restored = pinned_host_detail::same_address_everywhere(m, got, count, &same);
+                cudaError_t released = cudaSuccess;
+                if (!same) {
+                    released = pinned_host_detail::release(m, got);
+                    registered = false;
+                }
+                if (restored != cudaSuccess) return restored;
+                if (released != cudaSuccess) return released;   // (no second block beside one that is lost)
+            }
+#endif
+            if (registered) {
                 try {
                     auto& r = pinned_host_detail::registry();
                     std::lock_guard<std::mutex> lk(r.mutex);
@@ -106,9 +173,6 @@ inline cudaError_t pinned_host_alloc(void** p, size_t bytes, unsigned flags, boo
                     const cudaError_t released = pinned_host_detail::release(m, got);
                     if (released != cudaSuccess) return released;
                 }
-            } else {
-                cudaGetLastError();   // Clear only the failed registration.
-                platform::huge_free(m, got);
             }
         }
     }
