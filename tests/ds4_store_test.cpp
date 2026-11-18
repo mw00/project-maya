@@ -1019,6 +1019,30 @@ void test_hold_refilled(const Model& m) {
     EXPECT(a.size() == 1 && a[0] == ExpertStore::kMiss && !st.has(3, 1));
 }
 
+// a window released before it looks again, its failed slot refilled and pinned by another since: the release leaves
+// the other's pin alone
+void test_release_refilled(const Model& m) {
+    Mk k;
+    k.slots = 1;
+    k.chunk = 1;
+    ExpertStore st;
+    EXPECT(make_store(m, k, st));
+    const int d = 1;
+    ExpertStore::Hold h;
+    st.begin(3, &d, 1, h);   // (layer 3's reads fail)
+    EXPECT(wait_for([&] {
+        st.watch();
+        return st.counts().failed.load() == 1;
+    }));
+    EXPECT(st.put(3, 1, Mem(m, 2, 1).p));
+    const int s = st.acquire(3, 1);   // (the other's pin on the refilled slot)
+    EXPECT(s >= 0);
+    st.release(h);
+    const std::vector<uint8_t> a = ask(st, m, 0, {0});   // (still pinned: nothing to give up)
+    EXPECT(a.size() == 1 && a[0] == ExpertStore::kNone && st.has(3, 1));
+    if (s >= 0) st.unpin(s);
+}
+
 // a demand read that fails in a store of two sizes: read in place, its slot back on its own size's list and taken by
 // that size's next miss with no new chunk, the other size untouched
 void test_demand_fail_class(const Model& m) {
@@ -1262,6 +1286,7 @@ int main(int argc, char** argv) {
     test_floor_regiven(m);
     test_ram_room(m);
     test_hold_refilled(m);
+    test_release_refilled(m);
     test_demand_fail_class(m);
     test_guess_cancel_class(m);
     test_asked_guess_fail(m);
