@@ -1436,7 +1436,49 @@ bool Glm5Model::fast_setup(std::string& err) {
             if (tot <= avail) break;
             --per;
         }
+        // NO POOL (a small card: the VRAM left after the dense weights and the state holds fewer slots a layer than a
+        // route has experts): the start used to stop here.  It goes on without a pool instead - no expert is resident
+        // in VRAM, none is promoted, and every routed expert of every token is served the way a miss already is: the
+        // CPU lane computes it from the RAM tier, or it crosses PCIe into the device's 8 scratch slots (the lane's own
+        // measured split; a disk-only one through the staging buffers) - the same kernels and the same bytes as any
+        // other start's misses, only for all of them.  Slower, never wrong.  The batched prompt path has no tail to
+        // borrow (token by token) and the one-GPU MTP decode's verify rows would each cost their experts in full
+        // (off).  Only where the start would stop: a pool that holds a route starts as before.  Not on a layer split,
+        // with a DFlash drafter or with --parallel (their windows and rows share the scratch slots; untested), nor
+        // on unified memory (its pool is RAM: none left means none for the RAM tier either): those keep the refusal.
+        // MAYA_GLM_NO_POOL=0 keeps the refusal everywhere.
+        bool no_pool = false;
+        std::string np_note;   // the refusal's: why the start without a pool is not taken
         if (per < g.n_exp_used) {
+            const char* const np_env = getenv("MAYA_GLM_NO_POOL");
+            const char* const np_why = np_env != nullptr && std::atoi(np_env) == 0 ? "MAYA_GLM_NO_POOL=0 is set"
+                                       : n_parts_ != 1     ? "the model is split over several GPUs"
+                                       : dflash_on_        ? "a DFlash drafter is loaded - start without it"
+                                       : seq_count() > 1   ? "--parallel is above 1 - start with --parallel 1"
+                                       : F->unified_memory ? "this GPU's memory is the system's RAM"
+                                                           : nullptr;
+            no_pool = np_why == nullptr;
+            if (!no_pool)
+                np_note = std::string(". The start without an expert pool (every expert from RAM, slower) is not "
+                                      "available here: ") + np_why;
+        }
+        if (no_pool) {
+            const size_t need = (size_t) g.n_exp_used * stride_sum;
+            const size_t short_mib = ((need > avail ? need - avail : 0) >> 20) + 1;
+            std::fprintf(stderr, "glm fast: CUDA%d: no room for an expert pool (%d slots a layer fit, a route needs %d - "
+                                 "about %zu MiB short; the budget was %zu MiB, the free VRAM less the %zu MiB reserve): "
+                                 "starting WITHOUT one - every expert is computed on the CPU from RAM or streamed to "
+                                 "the GPU for its token. Answers are the same; decoding and prompt reading are much "
+                                 "slower than on a card that holds a pool\n",
+                         dev_, per, g.n_exp_used, short_mib, avail >> 20, reserve >> 20);
+            if (mtp_dec_) {
+                mtp_dec_ = false;
+                std::fprintf(stderr, "glm fast: CUDA%d: no expert pool - MTP drafting is off (a verify row would cost "
+                                     "its experts in full)\n", dev_);
+            }
+            per = 0;
+            avail = 0;
+        } else if (per < g.n_exp_used) {
             // what is short, and what makes room
             const size_t need = (size_t) g.n_exp_used * stride_sum;
             const size_t short_mib = ((need > avail ? need - avail : 0) >> 20) + 1;
@@ -1468,6 +1510,7 @@ bool Glm5Model::fast_setup(std::string& err) {
                                          : "more is short than the whole " + std::to_string(res_mib) + " MiB reserve") +
                              "; " + by_hand
                        : std::string());
+            err += np_note;
             return false;
         }
         // the prompt path borrows the pool's TAIL: the last k slots of every layer, laid out as one region after all
@@ -1495,7 +1538,7 @@ bool Glm5Model::fast_setup(std::string& err) {
             if (const char* v = getenv("MAYA_GLM_VISION_LEND_MB"); v != nullptr && dev_ == 0)
                 k_full = std::max(k_full, tail_slots((size_t) std::max(0LL, std::atoll(v)) << 20));
             const bool uni = F->unified_memory;
-            const int full = glmfast::complete_pool_on() && (!uni || glmfast::unified_complete_pool())
+            const int full = !no_pool && glmfast::complete_pool_on() && (!uni || glmfast::unified_complete_pool())
                                  ? glmfast::complete_pool_slots(uni ? room_u : avail, stride_sum, g.n_expert,
                                                                 gf::kSpares, k_full)
                                  : 0;
@@ -1510,6 +1553,9 @@ bool Glm5Model::fast_setup(std::string& err) {
                 }
             }
         }
+        if (no_pool)   // (whether prefill_setup above sized a chunk or not)
+            std::fprintf(stderr, "glm prefill: CUDA%d no expert pool - the batched prompt path is off, prompts are read "
+                                 "token by token\n", dev_);
         if (pf_ != nullptr) {
             k_extra = tail_slots(prefill_borrow_bytes());
             // (the prestage buffer is the part that can shrink: to what the pool can lend, else none)
@@ -1518,9 +1564,10 @@ bool Glm5Model::fast_setup(std::string& err) {
             if (k_extra > k_max && k_max > 0) k_extra = tail_slots(prefill_trim_prestage((size_t) k_max * stride_sum));
             // (a prompt runs alone - no decode beside it, unlike the vision encoder's lending below - so its main
             // slots need little more than one route's experts and the spares)
-            if (per - k_extra < k_keep) {
+            if (!no_pool && per - k_extra < k_keep)
                 std::fprintf(stderr, "glm prefill: CUDA%d the pool (%d slots/layer) cannot lend %zu MB - token by token\n",
                              dev_, per, prefill_borrow_bytes() >> 20);
+            if (no_pool || per - k_extra < k_keep) {
                 prefill_destroy();
                 k_extra = 0;
             }
@@ -1561,7 +1608,7 @@ bool Glm5Model::fast_setup(std::string& err) {
         // layer rather than spending the capped budget on uneven partitions/spares
         // (a complete pool likewise: every layer already holds all of its experts).
         if (getenv("MAYA_GLM_UNIFORM_SLOTS") == nullptr && !(F->unified_memory && per == g.n_expert) &&
-            !F->complete) {
+            !F->complete && !no_pool) {
             std::vector<std::vector<double>> share((size_t) NL);
             // a profile's ranking as shares: each layer's experts in profile order, valued 1 / (1 + their rank in
             // the whole profile) - the split below then gives the next slot to the layer whose next expert ranks
@@ -1667,7 +1714,9 @@ bool Glm5Model::fast_setup(std::string& err) {
         std::vector<uint8_t*> segs;
         std::vector<int> seg_of((size_t) NL, 0);
         const size_t main_bytes = tot - xtot;
-        if (uint8_t* one = nullptr; glmd::mmq_malloc((void**) &one, main_bytes) == 0) {   // glm-dsa B15.2: zeroed, 512-B tail
+        if (no_pool) {
+            segs.push_back(nullptr);   // (no slots: nothing to allocate - P.base stays null and P.n 0 in every layer)
+        } else if (uint8_t* one = nullptr; glmd::mmq_malloc((void**) &one, main_bytes) == 0) {   // glm-dsa B15.2: zeroed, 512-B tail
             segs.push_back(one);
         } else {
             cudaGetLastError();
