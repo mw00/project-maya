@@ -107,6 +107,45 @@ void log_softmax(const float* r, int n, std::vector<double>& lp) {
     for (int i = 0; i < n; ++i) lp[(size_t) i] = (double) r[i] - l;
 }
 
+// --trace <from> (tests): the model's 5 likeliest next tokens after each position >= from of the prompt, one line a
+// position on stdout: `<position> <id>:<logprob> x5` - a quant's own reference compares its top tokens with them.
+// The prompt up to `from` in one call (the prompt path), then windows with every row's logits (as run_kld)
+int run_trace(hy4::Model& m, const std::vector<int>& ids, int from) {
+    const int n = (int) ids.size(), nv = m.vocab();
+    from = std::max(1, std::min(from, n));
+    std::vector<float> logits((size_t) hy4::k::kMaxWin * nv);
+    std::vector<double> lp;
+    std::vector<int> ix((size_t) nv);
+    std::string err;
+    const double t0 = now();
+    if (from > 1 && !m.forward(ids.data(), from - 1, 0, 0, nullptr, err)) {
+        std::fprintf(stderr, "forward: %s\n", err.c_str());
+        return 1;
+    }
+    const double t1 = now();
+    for (int p = from - 1; p < n; p += hy4::k::kMaxWin) {
+        const int T = std::min(hy4::k::kMaxWin, n - p);
+        if (!m.forward(ids.data() + p, T, p, T, logits.data(), err)) {
+            std::fprintf(stderr, "forward at %d: %s\n", p, err.c_str());
+            return 1;
+        }
+        for (int t = 0; t < T; ++t) {
+            const float* me = logits.data() + (size_t) t * nv;
+            log_softmax(me, nv, lp);
+            for (int j = 0; j < nv; ++j) ix[(size_t) j] = j;
+            std::partial_sort(ix.begin(), ix.begin() + 5, ix.end(), [&](int a, int b) { return me[a] > me[b]; });
+            std::printf("%d", p + t);
+            for (int j = 0; j < 5; ++j) std::printf(" %d:%.4f", ix[(size_t) j], lp[(size_t) ix[(size_t) j]]);
+            std::printf("\n");
+        }
+    }
+    const double t2 = now();
+    std::fprintf(stderr, "trace: prompt %d tokens in %.2f s (%.1f tok/s), %d positions in windows in %.2f s (%.1f tok/s)\n",
+                 from - 1, t1 - t0, from > 1 ? (from - 1) / (t1 - t0) : 0.0, n - from + 1, t2 - t1,
+                 (n - from + 1) / (t2 - t1));
+    return 0;
+}
+
 int run_kld(hy4::Model& m, const std::string& path, int chunks) {
     std::ifstream f(path, std::ios::binary);
     char magic[8];
@@ -706,6 +745,7 @@ int main(int argc, char** argv) {
     std::string ids_arg, kld;
     int gen = 0, chunks = 0;
     bool top = false, serving = false;
+    int trace = 0;
     int bench_layer = -1, bench_n = 16, bench_t = 1;
     std::vector<int> eos;
     int n_draft = 3;
@@ -742,6 +782,7 @@ int main(int argc, char** argv) {
         else if (a == "--kld") kld = next();
         else if (a == "--chunks") chunks = std::atoi(next().c_str());
         else if (a == "--top") top = true;
+        else if (a == "--trace") trace = std::atoi(next().c_str());
         else if (a == "--serve") serving = true;
         else if (a == "--bench-lane") bench_layer = std::atoi(next().c_str());
         else if (a == "--bench-experts") bench_n = std::atoi(next().c_str());
@@ -776,6 +817,7 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "maya-hy4: no prompt (--ids)\n");
         return 2;
     }
+    if (trace > 0) return run_trace(m, ids, trace);
     std::vector<float> logits((size_t) m.vocab());
     const double t0 = now();
     if (!m.forward(ids.data(), (int) ids.size(), 0, 1, logits.data(), err)) {
