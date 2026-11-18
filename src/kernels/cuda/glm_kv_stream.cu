@@ -218,15 +218,14 @@ __global__ void copy_set_kernel(KvStreamMap m, const KvCopySet set) {
         for (int i = threadIdx.x; i < len; i += blockDim.x) dst[i] = src[i];
     }
 }
-// one warp a cell: its row in the slots against its row of the host copy, 16 B a lane and step
+// a thread a cell: its row in the slots against its row of the host copy, 16 B a step
 __global__ void check_kernel(const uint8_t* __restrict__ host, const uint8_t* __restrict__ slots, int row_bytes,
                              const int* __restrict__ cells, const int* __restrict__ slot_cells, int n_sel,
                              const int* __restrict__ n_sel_dev, int tag, int* __restrict__ dbg) {
     int n = n_sel;
     if (n_sel_dev != nullptr && *n_sel_dev < n) n = *n_sel_dev;
-    const int warp = (blockIdx.x * blockDim.x + threadIdx.x) >> 5, lane = threadIdx.x & 31;
-    const int n_warps = gridDim.x * blockDim.x >> 5, units = row_bytes / 16;
-    for (int i = warp; i < n; i += n_warps) {
+    const int units = row_bytes / 16, stride = gridDim.x * blockDim.x;
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += stride) {
         const int c = cells[i];
         if (c < 0) continue;
         const int r = slot_cells != nullptr ? slot_cells[i] : c;
@@ -234,13 +233,11 @@ __global__ void check_kernel(const uint8_t* __restrict__ host, const uint8_t* __
         if (!bad) {
             const uint4* a = reinterpret_cast<const uint4*>(host + (long long) c * row_bytes);
             const uint4* b = reinterpret_cast<const uint4*>(slots + (long long) r * row_bytes);
-            for (int u = lane; u < units; u += 32) {
+            for (int u = 0; u < units; ++u) {
                 const uint4 x = a[u], y = b[u];
                 bad = bad || x.x != y.x || x.y != y.y || x.z != y.z || x.w != y.w;
             }
         }
-        bad = __any_sync(0xffffffffu, bad) != 0;
-        if (lane != 0) continue;
         if (dbg[0] < 0x7fffffff) atomicAdd(&dbg[0], 1);
         if (bad) {
             if (dbg[1] < 0x7fffffff) atomicAdd(&dbg[1], 1);
