@@ -8614,13 +8614,14 @@ struct Model::Impl {
         if (const char* v = std::getenv("DS4_COPY_NUMA"))   // (0 / 1: one part; 2-4: that many, a node each; more
             nh = std::max(1, std::min(kMaxNH, std::atoi(v)));   // than the host's nodes: a test on fewer)
         if (g.ff % nh != 0 || g.dim % nh != 0) nh = 1;
-        // DS4_COPY_HUGETLB: the copies on explicit 2 MB pages out of the kernel's reserved pool (`sysctl
-        // vm.nr_hugepages=N`), so a pin of them (cp_pin, zc_pin) registers 2 MB pages - a transparent-huge-page arena
-        // pinned is registered in 4 KB pages, the DMA's translations 512 times as many.  Unset: on only when the
-        // pool already holds every copy (each layer's NUMA parts rounded up to whole pages) - no pool reserved, the
-        // ordinary arena as before; 0: the ordinary arena; 1: from the pool as far as it goes.  MemAvailable does not
-        // count the pool: the RAM the copies may take adds its free bytes
-        const uint64_t pool = os::huge2m_free();
+        // DS4_COPY_HUGETLB: the copies on explicit 2 MB pages out of the kernel's reserved (`sysctl
+        // vm.nr_hugepages=N`) or on-demand (`sysctl vm.nr_overcommit_hugepages=N`) pool, so a pin of them (cp_pin,
+        // zc_pin) registers 2 MB pages - a transparent-huge-page arena pinned is registered in 4 KB pages, the DMA's
+        // translations 512 times as many.  Unset: on only when the pool holds every copy (each layer's NUMA parts
+        // rounded up to whole pages) - no pool configured, the ordinary arena as before; 0: the ordinary arena;
+        // 1: from the pool as far as it goes.  Only reserved-free pages add RAM room: MemAvailable already counts
+        // the RAM the on-demand pages will take
+        const auto pool = os::huge2m_pool();
         uint64_t huge_need = 0;
         {
             std::vector<int> cnt(L.size(), 0);
@@ -8634,12 +8635,12 @@ struct Model::Impl {
             }
         }
         const int huge_env = tri_of(ds4_env("DS4_COPY_HUGETLB"));
-        const bool huge = copy_hugetlb_on(huge_env, pool, huge_need);
+        const bool huge = copy_hugetlb_on(huge_env, pool.total(), huge_need);
         const uint64_t avail = ram_room();
         // (Windows: the copies are committed memory, within what its commit still has beside the other programs' margin)
         const double can = std::min(avail == ~uint64_t{0} ? 1e300
                                                           : std::max(0.0, (double) avail - (double) ram_margin()) +
-                                                                (huge ? (double) pool : 0.0),
+                                                                (double) copy_room_extra(huge, pool.reserved_free),
                                     commit_room());
         // (auto: all or none - a part copied cost decode speed on 64 GB and on 32 GB of RAM, but every expert in RAM
         // keeps the SSD out of the decode: #339's reports)
@@ -8680,9 +8681,9 @@ struct Model::Impl {
             return true;
         }
         if (huge && huge_env < 0)
-            std::fprintf(stderr, "ds4: the reserved 2 MB huge-page pool (%.1f GB free) holds the copies (%.1f GB): they go "
-                                 "on 2 MB pages (DS4_COPY_HUGETLB=0 keeps the ordinary arena)\n",
-                         (double) pool / 1e9, (double) huge_need / 1e9);
+            std::fprintf(stderr, "ds4: the 2 MB huge-page pool (%.1f GB reserved free, %.1f GB on demand) holds the copies "
+                                 "(%.1f GB): they go on 2 MB pages (DS4_COPY_HUGETLB=0 keeps the ordinary arena)\n",
+                         (double) pool.reserved_free / 1e9, (double) pool.on_demand / 1e9, (double) huge_need / 1e9);
         NH = nh;
         cp_lay.assign(L.size(), {0, 0, 0, 0});
         for (const Layer& l : L) {
@@ -8727,10 +8728,14 @@ struct Model::Impl {
                 base[(size_t) X] = huge ? (uint8_t*) os::huge_alloc(bytes, X, NH, &got) : nullptr;
                 if (huge && base[(size_t) X] == nullptr && !huge_short) {
                     std::fprintf(stderr, "ds4: the 2 MB huge-page pool cannot hold more of the copies (reserve more: sysctl "
-                                         "vm.nr_hugepages=N) - the rest in the ordinary arena\n");
+                                         "vm.nr_hugepages=N, or on demand: sysctl vm.nr_overcommit_hugepages=N) - the rest "
+                                         "in the ordinary arena\n");
                     huge_short = true;
                 }
-                if (base[(size_t) X] == nullptr) base[(size_t) X] = (uint8_t*) node_map(bytes, X, NH, arena_thp);
+                if (base[(size_t) X] == nullptr) {
+                    got = bytes;   // (a failed huge allocation may have cleared got)
+                    base[(size_t) X] = (uint8_t*) node_map(bytes, X, NH, arena_thp);
+                }
                 else huge_got += (double) got;
                 ok = base[(size_t) X] != nullptr;
                 if (ok) {
