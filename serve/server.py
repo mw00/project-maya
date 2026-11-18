@@ -1897,7 +1897,7 @@ class Vision:
 
     def __init__(self, cfg: dict, log=None, env: dict | None = None, start: bool = True):
         args = [cfg["exe"], "--mmproj", cfg["mmproj"], "--model", cfg["model"]]
-        if cfg.get("gpu"):
+        if cfg.get("gpu") is True or isinstance(cfg.get("gpu"), int):   # "gpu": <n> means GPU <n>: still --gpu
             args.append("--gpu")
         if cfg.get("threads"):
             args += ["--threads", str(cfg["threads"])]
@@ -7498,12 +7498,23 @@ def main() -> int:
         vcfg = cfg.get("vision") or None
         vlog = (open(cfg["log"], "a", encoding="utf-8") if cfg.get("log") else None) if vcfg else None
         venv = dict(env)
-        if vcfg and vcfg.get("gpu") and gpu_list(cfg) and cfg.get("backend") not in ("hip", "metal"):
-            venv["CUDA_VISIBLE_DEVICES"] = str(gpu_list(cfg)[0])   # the encoder on the first GPU only
+        # the encoder's GPU: "gpu": true is the engine's first card as before, "gpu": <n> pins it to card n
+        # (nvidia-smi's number): on a second card the encoder's ~2 GB come off that card instead of off the
+        # expert pool of the model's own card (where VLEND would have to empty its tail for every picture)
+        vgpu = vcfg.get("gpu") if vcfg else None
+        vdev = vgpu if isinstance(vgpu, int) and not isinstance(vgpu, bool) else None
+        if vcfg and (vdev is not None or vgpu) and cfg.get("backend") != "metal":
+            vis = vdev if vdev is not None else (gpu_list(cfg) or [None])[0]
+            if vis is not None:   # CUDA_DEVICE_ORDER=PCI_BUS_ID in child_env keeps nvidia-smi's numbering
+                venv["HIP_VISIBLE_DEVICES" if cfg.get("backend") == "hip" else "CUDA_VISIBLE_DEVICES"] = str(vis)
         # the GLM engine lends the encoder the tail of its expert cache while it encodes, sized by what the encoder
         # measured on this GPU ("resident": true keeps the encoder running beside the model, holding its VRAM)
         # (Metal: one memory shared with the engine, which answers ERR to VLEND / VRECLAIM: the encoder stays resident)
-        on_demand = bool(vcfg) and vcfg.get("gpu") and not vcfg.get("resident") and cfg.get("backend") != "metal"
+        # (a pinned card: the lending frees the pool on the engine's own card, which the encoder does not run on
+        # there, so a pinned encoder is resident; pinned to the engine's first card, it still lends as before)
+        on_demand = (bool(vcfg) and (vdev is not None or vgpu) and not vcfg.get("resident")
+                     and cfg.get("backend") != "metal"
+                     and (vdev is None or vdev == (gpu_list(cfg) or [None])[0]))
         engine_env = env
         if on_demand:
             fp = vision_footprint(vcfg, venv, Path(a.config).resolve().with_name("vision-memory.json"),
@@ -7518,7 +7529,8 @@ def main() -> int:
                 print(f"[maya] images: the vision encoder needs {fp[1] / 2**30:.2f} GB on this GPU at up to {fp[0]} "
                       "image tokens", flush=True)
         if vcfg and not on_demand:
-            print("loading the vision encoder ...", flush=True)
+            print("loading the vision encoder ..." + (f" (GPU {vdev}, resident)" if vdev is not None else ""),
+                  flush=True)
             vision = Vision(vcfg, log=vlog, env=venv)
         print("loading the model (the first start takes a minute or two) ...", flush=True)
         if len(gpu_list(cfg)) > 1:

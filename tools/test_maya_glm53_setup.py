@@ -123,6 +123,31 @@ class Setup(unittest.TestCase):
         self.assertEqual((xs["sampling"], xs["thinking_budget"]),
                          ({"temperature": 0.7, "top_p": 0.95, "min_p": 0.05}, 8192))   # (Flash Maya-XS's own)
 
+    def test_vision_settings_survive_a_setup_again(self):
+        """A pinned encoder card ("gpu": <n>, serve/server.py) and its settings survive a setup again: the entry
+        vision_step brings is fresh, the config before's gpu / max_tokens win - the user's choice, not the
+        installer's.  Card 0 counts: the kept value must survive as the falsy number it is."""
+        vnew = {"exe": "/bin/maya-vision", "mmproj": "/m/mmproj.gguf", "model": "/m/vocab.gguf", "gpu": True}
+        with Quiet():
+            cfg = json.loads(maya.write_config(self.a, self.pc, {}, self.flash, "Maya-M", 131072,
+                                               self.root / "models", dict(vnew), ("download", "Maya-M")).read_text())
+        self.assertEqual(cfg["vision"], vnew)                                   # (a first setup: the fresh entry)
+        p = self.root / "maya-maya-m.json"
+        old = json.loads(p.read_text())
+        old["vision"] = {**old["vision"], "gpu": 0, "max_tokens": 2048}         # (pinned to the second card)
+        p.write_text(json.dumps(old))
+        with Quiet():
+            again = json.loads(maya.write_config(self.a, self.pc, {}, self.flash, "Maya-M", 131072,
+                                                 self.root / "models", dict(vnew), ("download", "Maya-M")).read_text())
+        self.assertEqual(again["vision"], {**vnew, "gpu": 0, "max_tokens": 2048})   # (kept, both)
+        off = json.loads(p.read_text())                                         # (Images off: the Models page)
+        off["vision_off"] = off.pop("vision")
+        p.write_text(json.dumps(off))
+        with Quiet():
+            back = json.loads(maya.write_config(self.a, self.pc, {}, self.flash, "Maya-M", 131072,
+                                                self.root / "models", dict(vnew), ("download", "Maya-M")).read_text())
+        self.assertEqual((back["vision"]["gpu"], back["vision"]["max_tokens"]), (0, 2048))   # (vision_off too)
+
     def test_glm53_defaults_never_flash_quant_values(self):
         sampling, effort = maya.g53_defaults(("download", "Maya-XS-IQ1_S"), "Maya-XS-IQ1_S")   # (a tier Flash tuned)
         self.assertEqual((sampling, effort), ({"temperature": 1.0, "top_p": 0.95}, "max"))
