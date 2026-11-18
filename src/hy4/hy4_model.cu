@@ -43,6 +43,10 @@ namespace hy4 {
 namespace iq = strata::ds4::gguf::iq;
 
 extern "C" void quantize_row_q4_K_ref(const float* x, void* y, int64_t k);   // (ggml-quants: ggml's own Q4_K rounding)
+// (ggml-quants' row decoders: a token's embedding row in the K types - the host reads one row a token)
+extern "C" void dequantize_row_q4_K(const void* x, float* y, int64_t k);
+extern "C" void dequantize_row_q5_K(const void* x, float* y, int64_t k);
+extern "C" void dequantize_row_q6_K(const void* x, float* y, int64_t k);
 
 namespace {
 
@@ -92,6 +96,41 @@ float half_to_float(uint16_t h) {
     float r;
     std::memcpy(&r, &f, 4);
     return r;
+}
+// A token's embedding row (k values) from the file's bytes: Q8_0 as it always was read (d * q, block by block), the K
+// types by ggml's own decoders, F32 / BF16 / F16 as they are.  false: a type the host does not decode
+bool tok_type_ok(int type) { return type == 8 || type == 12 || type == 13 || type == 14 || type == 0 || type == 30 || type == 1; }
+void tok_row(int type, const uint8_t* row, int k, float* dst) {
+    if (type == 8) {
+        for (int b = 0; b < k / 32; ++b) {
+            uint16_t dh;
+            std::memcpy(&dh, row + (size_t) b * 34, 2);
+            const float d = half_to_float(dh);
+            const int8_t* qv = (const int8_t*) (row + (size_t) b * 34 + 2);
+            for (int i = 0; i < 32; ++i) dst[b * 32 + i] = d * (float) qv[i];
+        }
+    } else if (type == 12) {
+        dequantize_row_q4_K(row, dst, k);
+    } else if (type == 13) {
+        dequantize_row_q5_K(row, dst, k);
+    } else if (type == 14) {
+        dequantize_row_q6_K(row, dst, k);
+    } else if (type == 0) {
+        std::memcpy(dst, row, (size_t) k * 4);
+    } else if (type == 30) {
+        for (int i = 0; i < k; ++i) {
+            uint16_t h;
+            std::memcpy(&h, row + (size_t) i * 2, 2);
+            const uint32_t u = (uint32_t) h << 16;
+            std::memcpy(&dst[i], &u, 4);
+        }
+    } else {
+        for (int i = 0; i < k; ++i) {
+            uint16_t h;
+            std::memcpy(&h, row + (size_t) i * 2, 2);
+            dst[i] = half_to_float(h);
+        }
+    }
 }
 
 // ggml's quantize_row_q8_0_ref over rows of k BF16 values (k % 32 == 0), on `threads` threads: the MTP block's BF16
@@ -380,7 +419,7 @@ struct Model::Impl {
     unsigned* tp_froute = nullptr;
     float* tp_route2 = nullptr;      // (a staggered chunk's second half's routing, and its counter)
     unsigned* tp_froute2 = nullptr;
-    const uint8_t* tok_embd = nullptr;   // (host: the file's Q8_0 rows)
+    const uint8_t* tok_embd = nullptr;   // (host: the file's rows, decoded a token at a time - tok_row)
     int tok_type = -1;
     size_t tok_ld = 0;
     const uint8_t* eg_table = nullptr;   // (host: the Engram table's F8 rows)
@@ -1545,8 +1584,9 @@ struct Model::Impl {
         if (!te) return false;
         tok_type = type_id(te->type);
         tok_ld = row_bytes(tok_type, g.n_embd);
-        if (tok_type != 8 || te->n(0) != g.n_embd || te->n(1) < g.n_vocab) {
-            err = "token_embd: " + te->type + " (maya-hy4 reads Q8_0 embeddings)";
+        if (!tok_type_ok(tok_type) || tok_ld == 0 || te->n(0) != g.n_embd || te->n(1) < g.n_vocab ||
+            tok_ld * (size_t) te->n(1) != te->bytes) {
+            err = "token_embd: " + te->type + " (maya-hy4 reads Q8_0, Q4_K, Q5_K, Q6_K, F32, BF16 or F16 embeddings)";
             return false;
         }
         tok_embd = pk.data(*te);
@@ -2512,14 +2552,7 @@ struct Model::Impl {
         }
         for (int t = 0; t < T; ++t) {   // (the embeddings, host-dequantised as the trunk's)
             const uint8_t* row = tok_embd + (size_t) ids[t] * tok_ld;
-            float* dst = h_emb + (size_t) t * E;
-            for (int b = 0; b < E / 32; ++b) {
-                uint16_t dh;
-                std::memcpy(&dh, row + (size_t) b * 34, 2);
-                const float d = half_to_float(dh);
-                const int8_t* qv = (const int8_t*) (row + (size_t) b * 34 + 2);
-                for (int i = 0; i < 32; ++i) dst[b * 32 + i] = d * (float) qv[i];
-            }
+            tok_row(tok_type, row, E, h_emb + (size_t) t * E);
         }
         CK(cudaMemcpyAsync(mtp_cur, h_emb, sizeof(float) * T * E, cudaMemcpyHostToDevice, s));
         if (on == &hm) {
@@ -2668,14 +2701,7 @@ struct Model::Impl {
                 return false;
             }
             const uint8_t* row = tok_embd + (size_t) id * tok_ld;
-            float* dst = h_x + (size_t) t * E;   // ([T][E]: the GPUs copy each row into the hc streams)
-            for (int b = 0; b < E / 32; ++b) {
-                uint16_t dh;
-                std::memcpy(&dh, row + (size_t) b * 34, 2);
-                const float d = half_to_float(dh);
-                const int8_t* qv = (const int8_t*) (row + (size_t) b * 34 + 2);
-                for (int i = 0; i < 32; ++i) dst[b * 32 + i] = d * (float) qv[i];
-            }
+            tok_row(tok_type, row, E, h_x + (size_t) t * E);   // ([T][E]: the GPUs copy each row into the hc streams)
         }
         const double te = now_s();
         const int n_look = pk.eg.modules * T;
