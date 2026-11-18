@@ -188,6 +188,10 @@ Its engine settings: [SETTINGS.md](SETTINGS.md#minimax-m31-flash).
 on an engine of its own (`maya-hy4`, NVIDIA) from [AngelSlim's GGUF](https://huggingface.co/AngelSlim/Hy4-flash-GGUF)
 (the download's license file, `License_AngelSlim_model_and_dataset.txt`, and Tencent's model card give the terms).
 
+**Set up:** `./maya.sh --setup --model hy4-flash` (or pick Hy4-flash in the setup's model list) checks the PC, builds
+`maya-hy4`, downloads the two files (pinned, sha256-checked; `--model-dir <folder>` uses the ones you have), writes the
+pack and `maya-hy4-flash.json`; `./maya.sh` starts it. `--drafting off` sets it up without MTP drafting.
+
 | Files | Size | Runs on |
 | --- | ---: | --- |
 | AngelSlim's **Q4_K_M** (`Hy4-flash-Q4_K_M-0000N-of-00002.gguf`): Q4_K experts (Q6_K downs on 19 layers), Q8_0 elsewhere | 157 GiB | NVIDIA, Linux |
@@ -200,8 +204,9 @@ on an engine of its own (`maya-hy4`, NVIDIA) from [AngelSlim's GGUF](https://hug
   model's file.
 - **Drafting:** the model's own MTP block proposes up to three tokens a step and the model checks them - nearly twice
   the decode speed on code, the same answers.
-- **Thinking and tools:** the GGUF's own template, with its levels Low, High and Max and thinking off; chat, thinking
-  and tool calls through Maya's OpenAI-compatible server.
+- **Thinking and tools:** the GGUF's own template; the model thinks at High (its default) or not at all (Off), so those
+  are the two levels offered - a request for another level runs at High. Chat, thinking and tool calls through Maya's
+  OpenAI-compatible server.
 - **The pack:** `python tools/hy4/pack_gguf.py --model <folder>` indexes the GGUF set (no weights copied).
 
 Its engine settings: [SETTINGS.md](SETTINGS.md#hy4-flash).

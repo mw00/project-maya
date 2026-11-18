@@ -1,0 +1,14 @@
+{
+ "_": "Hy4-flash: Tencent's tencent/Hy4-flash (architecture hy_v4_flash: 42 layers and an MTP block, 512 experts, 16 a token, Engram) in AngelSlim's GGUF - Q4_K_M, two shards: routed experts Q4_K gate/up and Q6_K or Q4_K down, Q8_0 elsewhere, the Engram table F8. maya-hy4 runs it from the files in place (tools/hy4/pack_gguf.py indexes them). \"revision\" is the commit the files are pinned at and each file has its sha256: the setup checks them against it.",
+ "name": "Hy4-flash",
+ "repo": "AngelSlim/Hy4-flash-GGUF",
+ "revision": "ecd803c859a36bdf9f3614dbd7c548165df74c30",
+ "license": "the repo's LICENSE (AngelSlim's model and dataset license) and Tencent's terms for Hy4-flash",
+ "about": "Q4_K_M: Q4_K experts (Q6_K downs on 19 layers), Q8_0 elsewhere, 512 experts, 16 a token",
+ "memory_gb": 170,
+ "engram_gb": 63,
+ "files": {
+  "Hy4-flash-Q4_K_M-00001-of-00002.gguf": [104986517504, "d6f76e5620f949bb50b23d0104786a4d091c487b6bee331facbeb996445ebe14"],
+  "Hy4-flash-Q4_K_M-00002-of-00002.gguf": [63360616128, "ecd6a0ecd7f258b1ee9211bf566261ae33efc1743ad40f58cb5004cf7b051839"]
+ }
+}

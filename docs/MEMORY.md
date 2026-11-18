@@ -40,10 +40,13 @@ adds room for the system and the default context.
 | | EXL3 3.5 bpw (Mia-AiLab) | 197 | 250 | **256** | NVIDIA, AMD |
 | **Qwen-3.8-Flash-Next** | UD-IQ2_XS (unsloth) | 80 ² | 47 | **64** | NVIDIA, AMD |
 | | CYBER-FROST Q5_K_M | 113 ² | 84 | **96** | NVIDIA, AMD |
+| **Hy4-flash**, text only | Q4_K_M (AngelSlim) | 168 ³ | ~108 | **192** | NVIDIA (RTX 30 / A100 and newer), Linux |
 
 \* Mac (Apple Silicon) support is experimental, GLM-5.3-Flash's GGUF quants only.
 ¹ DeepSeek's download includes its n-gram (Engram) tables, which always stay on the SSD and never count toward memory.
 ² Qwen's n-gram table also stays on the SSD.
+³ Hy4-flash's n-gram (Engram) table, 63 GB of its download, is read from the files: the engine keeps it in RAM where RAM
+allows (192 GB holds it and the model), else reads its rows from the SSD.
 
 ## Examples
 

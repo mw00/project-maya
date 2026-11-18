@@ -2332,6 +2332,15 @@ an MTP block; 512 routed experts, 16 a token, and a shared one; MLA attention - 
 positions and 12 whose indexer picks 2048 positions in groups of 4 out of the whole context (up to 1M); four
 hyper-connection streams; and an n-gram (Engram) table read at 4 layers.
 
+**The setup.** `./maya.sh --setup --model hy4-flash` (Linux, NVIDIA RTX 30 / A100 and newer) builds `maya-hy4`,
+downloads AngelSlim's Q4_K_M (`tools/hy4/download.json`: pinned to a commit, each file's sha256 checked; `--model-dir`
+takes the files you have), builds the pack and writes `maya-hy4-flash.json`: `--pack`, `--max-context` (32K, 64K or
+128K - recommended by the smallest GPU's VRAM, since tensor parallel keeps the whole cache on every GPU of the group:
+about 16 KB a token) and `--mtp` (`--drafting off`: without). The engine's other settings keep their defaults; ones
+added by hand (`--chunk`, `--reserve-gb`, `--tp` ...) are kept by a setup again. Its sampling is Tencent's
+(`generation_config.json`: temperature 0.9, top-p 1), its level High. The dashboard's Models page sets drafting,
+tensor parallel (Auto or Off), the VRAM kept free and the prompt chunk.
+
 **The pack.** `python tools/hy4/pack_gguf.py --model <folder>` writes `<folder>/maya-hy4/`: the geometry
 (`hy4.txt`), the index of the set's tensors (`tensors.txt`: names, types, offsets - no weights are copied), the
 n-gram hash (`engram.bin`) and the tokenizer with the GGUF's own chat template. It checks the whole set before it
@@ -2343,11 +2352,12 @@ SPARK-4Bit builds (NVFP4) are refused.
 its perplexity tool's logits the KL divergence is the size of the reference's own difference between two batch sizes
 (the model is unusually sensitive to rounding). The prompt is the GGUF's template; the levels:
 
+Hy4-flash thinks at one level or not at all, so the dashboard offers High and Off only:
+
 | `reasoning_effort` | The prompt |
 |---|---|
-| unset (Auto) | the template's default (`high`) |
-| `low`, `high`, `max` | that `reasoning_effort` |
-| thinking off | `no_think` |
+| unset, `high`, or any other level (`low`, `max` ...) | `high` |
+| thinking off (`none`) | `no_think` |
 
 Tool calls work as GLM's do: every tag token of Hy4's (`<think:..>`, `<tool_call:..>`, `<arg_key:..>`, ...) carries
 the template's suffix, and the pack's tokenizer names each by GLM's spelling, so the server reads its answers with

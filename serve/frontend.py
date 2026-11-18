@@ -139,15 +139,13 @@ class ChatTemplate:
             return self.template.render(messages=messages, tools=tools, add_generation_prompt=add_generation_prompt,
                                         **kwargs)
         if self.hy4:
-            # Hy4-flash's levels are the server's own (low / high / max) and no_think for off; none named (Auto) is its
-            # template's default (high).  Its template reads tool['function'] where a tool has one.
+            # Hy4-flash thinks at one level, high, or not at all (no_think): thinking off is no_think, every other level
+            # (low, max ... - the template would take them, the model is not made for them) and none named are high.
+            # Its template reads tool['function'] where a tool has one.
             off = kwargs.pop("enable_thinking", None) is False
             level = kwargs.pop("reasoning_effort", None)
             kwargs.pop("thinking_mode", None)
-            if off:
-                kwargs["reasoning_effort"] = "no_think"
-            elif level in ("low", "high", "max"):
-                kwargs["reasoning_effort"] = level
+            kwargs["reasoning_effort"] = "no_think" if off or level in ("none", "no_think") else "high"
             tools = [t if "function" in t else {"type": "function", "function": t} for t in tools or []] or None
             return self.template.render(messages=messages, tools=tools, add_generation_prompt=add_generation_prompt,
                                         **kwargs)

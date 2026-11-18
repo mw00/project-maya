@@ -144,9 +144,11 @@ export const DEFAULTS = {thinking: "high", temperature: 0.6, top_p: 0.95, top_k:
 export const PENALTIES = ["repetition_penalty", "frequency_penalty", "presence_penalty"];
 // CYBER-FROST-3.8-PS (Qwen3.8's template, thinking always on): Off (the think block closed the way its Qwen base writes
 // thinking off - frontend.ChatTemplate) and its three reasoning efforts, low / medium / xhigh
+// Hy4-flash (Tencent's template): High, or Off (its no_think) - the only two it is made for
 const THINK_LEVELS = {glm: ["none", "low", "high", "max"], deepseek: ["none", "low", "high", "max"],
-                      minimax: ["none", "auto", "low", "medium", "high", "xhigh", "max"], qwen: ["none", "low", "medium", "xhigh"]};
-const THINK_DEFAULT = {glm: "max", deepseek: "high", minimax: "auto", qwen: "xhigh"};   // (the run config's level wins: loadHealth)
+                      minimax: ["none", "auto", "low", "medium", "high", "xhigh", "max"], qwen: ["none", "low", "medium", "xhigh"],
+                      hy4: ["none", "high"]};
+const THINK_DEFAULT = {glm: "max", deepseek: "high", minimax: "auto", qwen: "xhigh", hy4: "high"};   // (the run config's level wins: loadHealth)
 const LEVEL = {none: ["Off", "Answers right away"], auto: ["Auto", "It decides whether to think"], low: ["Low", "A short think"],
                medium: ["Medium", "A moderate think"], high: ["High", "Thinks it through"], xhigh: ["XHigh", "Thinks hard"],
                max: ["Max", "The most thorough, and the longest"]};
@@ -162,13 +164,14 @@ export const THINK_TITLES = {
             high: "Effort high: it decides whether to think, and thinks it through",
             xhigh: "Effort extra-high: it decides whether to think, and thinks hard",
             max: "Effort max: it decides whether to think - the most thorough, and the longest"},
+  hy4: {none: "No thinking: it answers right away (Hy4's no_think)", high: "Hy4's High: thinks it through (its default)"},
   qwen: {none: "No thinking: it answers right away", low: "Reasoning effort low: a short think", medium: "Reasoning effort medium: thinks it through",
          xhigh: "Reasoning effort xhigh (its default): checks its assumptions and alternatives - the most thorough"},
 };
 // the running model's family, its thinking levels (THINKING, LEVELS: live bindings) and their titles
 export const familyOf = (model = S.health.model) =>
   (/deepseek/i.test(model || "") ? "deepseek" : /minimax/i.test(model || "") ? "minimax"
-    : /cyber-frost|qwen/i.test(model || "") ? "qwen" : "glm");
+    : /cyber-frost|qwen/i.test(model || "") ? "qwen" : /hy4/i.test(model || "") ? "hy4" : "glm");
 export let THINKING = THINK_LEVELS.glm;
 export let LEVELS = [];
 export function setFamily(model) {
@@ -219,7 +222,7 @@ function ownKeyOnce(key) {
   return key;
 }
 export const prefsKey = () => ownKeyOnce(isGlm53() ? GLM53_KEY
-  : {deepseek: "sampling_deepseek", minimax: "sampling_minimax", qwen: "sampling_qwen"}[familyOf()] || "sampling");
+  : {deepseek: "sampling_deepseek", minimax: "sampling_minimax", qwen: "sampling_qwen", hy4: "sampling_hy4"}[familyOf()] || "sampling");
 export let P = null;                     // the running model's chat settings: its defaults, then its user's own choices
 // stored: only what the user chose (a preset, a slider, a level) - the model's own defaults fill the rest, so they apply
 // until its user picks something.  Before (prefs_v 3) a change saved every value as it was then, the defaults too:

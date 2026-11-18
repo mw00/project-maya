@@ -225,11 +225,11 @@ class PackTest(unittest.TestCase):
         self.assertTrue(ct.hy4)
         self.assertEqual(ct.hy4_tag, TAG)
         msgs = [{"role": "user", "content": "hi"}]
+        # Hy4-flash thinks at high or not at all: off (and "none") is no_think, every other level and none named high
         self.assertIn("reasoning_mode=no_think", ct.render(msgs, enable_thinking=False))
-        self.assertIn("reasoning_mode=max", ct.render(msgs, reasoning_effort="max"))
-        self.assertIn("reasoning_mode=low", ct.render(msgs, reasoning_effort="low"))
-        self.assertIn("reasoning_mode=high", ct.render(msgs))   # (Auto: the template's default)
-        self.assertIn("reasoning_mode=high", ct.render(msgs, reasoning_effort="medium"))
+        self.assertIn("reasoning_mode=no_think", ct.render(msgs, reasoning_effort="none"))
+        for level in ("max", "low", "medium", "xhigh", "high", None):
+            self.assertIn("reasoning_mode=high", ct.render(msgs, **({"reasoning_effort": level} if level else {})))
         out = ct.render(msgs, tools=[{"name": "f", "parameters": {}}])   # (a bare function: wrapped)
         self.assertIn("[tools:f]", out)
 

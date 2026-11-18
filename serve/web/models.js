@@ -366,6 +366,7 @@ function fieldsOf(m, d) {
     <${Num} label="VRAM kept free" value=${d.reserve_mib} ph=${glm ? "700" : "default"} unit="MiB / GPU" on=${(v) => setDraft({reserve_mib: v})}/><//>`;
   if (m.family === "minimax") return mm3Fields(m, d, s, ch, images, gpus);
   if (m.family === "qwen") return qwenFields(m, d, s, ch, gpus);
+  if (m.family === "hy4") return hy4Fields(m, d, s, ch, gpus);
   if (glm) {
     const ec = AutoOr({label: "Expert cache", k: "expert_cache", d, dflt: 1200, unit: "experts", subLabel: "Experts in the first GPU's pool"});
     const pf = AutoOr({label: "Prompt chunk", k: "prefill", d, dflt: 8192, unit: "tokens", subLabel: "Tokens a prompt is read in at a time"});
@@ -547,6 +548,38 @@ function qwenFields(m, d, s, ch, gpus) {
         hint="The attention cache's format: INT8 the setup's (the model card's own), FP16 exact, K8 V4 and Q4_0 smaller - more VRAM for experts at long contexts.">
         <${Seg} label="KV cache" value=${kv.id} options=${QWEN_KV.map((f) => ({id: f.id, label: f.label}))}
           onChange=${(v) => setDraft({kv: v})}/><//>`]},
+  ];
+}
+
+// Hy4-flash's (maya-hy4: it stops at a flag it does not know, so only its own are offered; text only).  Its cache's VRAM a
+// context token, on each GPU of a tensor-parallel group: 13 layers keep every position (maya.py's HY4_KV_BYTES)
+const HY4_KV_BYTES = 16640;
+function hy4Fields(m, d, s, ch, gpus) {
+  const mtp = m.choices.draft.includes("mtp");
+  const tpIds = [...new Set(["auto", 0].concat([s.tp, d.tp].filter((t) => t !== "auto" && t != null).map(Number)))];
+  return [
+    {label: "Model", rows: [
+      contextRow(m, d, ch, {vram: HY4_KV_BYTES}),
+      html`<${Row} label="Drafting" flag="--mtp" changed=${ch("draft")}
+        hint=${mtp ? "The model's own MTP block drafts a few tokens for the model to check: the same answers, about twice as fast on code. Off decodes token by token."
+          : "This pack names no MTP block."}>
+        <${Seg} label="Drafting" value=${d.draft} options=${[...(mtp ? [{id: "mtp", label: "MTP"}] : []), {id: "none", label: "Off"}]}
+          onChange=${(v) => setDraft({draft: v})}/><//>`]},
+    {label: "GPUs and memory", rows: [gpus,
+      html`<${Row} label="Tensor parallel" flag="--tp" changed=${ch("tp")}
+        hint="Auto: every layer shared by the largest group of equal GPUs, the fastest GPU holding the head and the drafts; where no group fits, the layers split across the GPUs. Off always splits the layers."
+        warn=${typeof d.tp === "number" && d.tp > d.gpus.length ? `A group of ${d.tp} needs at least ${d.tp} GPUs picked.` : null}>
+        <${Seg} label="Tensor parallel" value=${d.tp} options=${tpIds.map((t) => ({id: t, label: t === "auto" ? "Auto" : t ? String(t) : "Off"}))}
+          onChange=${(v) => setDraft({tp: v})}/><//>`,
+      html`<${Row} label="VRAM kept free" flag="--reserve-gb" changed=${ch("reserve_gb")}
+        hint="Per GPU, beyond the engine's plan: for the driver, the desktop and other programs. Empty: the engine's own."
+        warn=${decimal(d.reserve_gb) ? null : "A number of GB, or empty for the default."}>
+        <${Dec} label="VRAM kept free" value=${d.reserve_gb} ph="default" unit="GB / GPU" on=${(v) => setDraft({reserve_gb: v})}/><//>`]},
+    {label: "Speed", rows: [
+      html`<${Row} label="Prompt chunk" flag="--chunk" changed=${ch("prefill_chunk")}
+        hint="The prompt tokens one pass reads at most: larger reads long prompts faster and takes more VRAM. Empty: the engine's own."
+        warn=${whole(d.prefill_chunk) ? null : "A whole number, or empty."}>
+        <${Num} label="Prompt chunk" value=${d.prefill_chunk} ph="auto" unit="tokens" on=${(v) => setDraft({prefill_chunk: v})}/><//>`]},
   ];
 }
 
