@@ -62,7 +62,25 @@ def find_shards(model: pathlib.Path, names: list | None) -> list:
     paths = [model / n for n in names] if names else sorted(model.glob("*.gguf"))
     if not paths:
         raise SystemExit("%s: no .gguf files" % model)
-    gs = [Gguf(p) for p in paths]
+    if names:
+        gs = [Gguf(p) for p in paths]
+    else:
+        # the folder's other files (a vision projector: another architecture; a drafter: general.type "drafter") are
+        # not the set's shards - left alone, said once; the set's own count is still checked below
+        gs = []
+        for p in paths:
+            try:
+                g = Gguf(p)
+            except (Exception, SystemExit) as e:  # noqa: BLE001 - a file that is no GGUF this reader takes: not a shard
+                print("%s: not read (%s), left out of the set" % (p.name, e))
+                continue
+            arch, kind = g.kv.get("general.architecture"), g.kv.get("general.type")
+            if (arch is None or arch == ARCH) and kind in (None, "model"):
+                gs.append(g)
+            else:
+                print("%s: %s / %s, not a shard of the model, left out" % (p.name, arch, kind))
+        if not gs:
+            raise SystemExit("%s: no %s model .gguf files" % (model, ARCH))
     first = [g for g in gs if g.kv.get("general.architecture")]
     if not first or first[0].kv["general.architecture"] != ARCH:
         raise SystemExit("%s: not a %s GGUF (general.architecture %r)" %

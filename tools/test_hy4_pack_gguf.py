@@ -147,6 +147,20 @@ class PackTest(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
+    def test_other_files_in_the_folder(self):
+        # a vision projector and a drafter beside the set: the pack is the set's alone
+        gguf(self.root / "mmproj-x.gguf", {"general.architecture": (8, "clip"), "general.type": (8, "mmproj")},
+             [("v.blk.0.attn_q.weight", 0, [D, D])])
+        gguf(self.root / "x-drafter.gguf", {"general.architecture": (8, "hy_v4_flash"), "general.type": (8, "drafter")},
+             [("model.dfly_layers.0.w", 0, [D, D])])
+        (self.root / "junk.gguf").write_bytes(b"not a gguf")
+        r = pack(self.root)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("left out", r.stdout)
+        lines = (self.root / "maya-hy4" / "tensors.txt").read_text().splitlines()
+        self.assertEqual(len([ln for ln in lines if ln.startswith("file ")]), 2)
+        self.assertEqual(len([ln for ln in lines if ln.startswith("t ")]), 8)
+
     def test_geometry_and_tensors(self):
         r = pack(self.root)
         self.assertEqual(r.returncode, 0, r.stderr)
