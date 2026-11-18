@@ -46,6 +46,7 @@
 #define hipHostMallocPortable cudaHostAllocPortable
 #define hipHostFree cudaFreeHost
 #define hipDeviceMallocFinegrained 0u
+#define hipDeviceMallocUncached 0u
 // CUDA: %globaltimer counts nanoseconds -> a wall-clock rate of 1,000,000 kHz
 #define hipDeviceAttributeWallClockRate (-4242)
 static inline cudaError_t hipDeviceGetAttribute(int* v, int attr, int dev) {

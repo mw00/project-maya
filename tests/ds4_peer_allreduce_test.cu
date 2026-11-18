@@ -96,8 +96,8 @@ int main() {
         CK(hipMalloc(&r.counter, sizeof(unsigned)));
         CK(hipMalloc(&r.peer.error, 4 * sizeof(unsigned)));
         CK(hipMalloc(&r.peer.failure, sizeof(PeerArFailure)));
-        CK(hipExtMallocWithFlags((void**) &r.peer.recv, 2ull * kCapacity * sizeof(float), hipDeviceMallocFinegrained));
-        CK(hipExtMallocWithFlags((void**) &r.peer.flags, flag_count * sizeof(unsigned), hipDeviceMallocFinegrained));
+        CK(hipExtMallocWithFlags((void**) &r.peer.recv, 2ull * kCapacity * sizeof(float), hipDeviceMallocUncached));
+        CK(hipExtMallocWithFlags((void**) &r.peer.flags, flag_count * sizeof(unsigned), hipDeviceMallocUncached));
         r.peer.stride = kCapacity;
         r.peer.timeout_ticks = uint64_t(r.wall_clock_khz) * 2000;
 #if defined(STRATA_USE_HIP)
