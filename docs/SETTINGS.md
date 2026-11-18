@@ -283,6 +283,19 @@ there, and the reserves below, go there too, and a setup again keeps them (`MAYA
 | `--vram-reserve-mib N` | the VRAM left free beside the pool: 700 MiB by default (1024 on a Ryzen AI Max APU under Linux). On a small card where that would leave the pool less than a route's experts and the spares in every layer, `auto` lowers it as far as 300 MiB and says so; a number set here is kept. The setup takes it too (`--vram-reserve-mib N`) |
 | `--vram-reserve-later-mib N` | the same on a split's later GPUs (default: `--vram-reserve-mib`'s) - a card that drives no display needs less |
 
+**A card with no room for a pool (GLM, one GPU).** The smallest pool holds one route's experts (8) in every layer.
+Where the VRAM left after the dense weights and the context state is less than that - GLM-5.3-Flash on an 8 GB card
+that also drives the desktop - the engine no longer stops with "no room for the expert pool": it starts without a
+pool and says so in the log (`glm fast: CUDA0: no room for an expert pool (...): starting WITHOUT one`). No expert
+stays in VRAM then; for every token each routed expert is computed on the CPU from RAM (the CPU lane) or copied to
+the GPU for that token, split as the lane measures it, and one that RAM does not hold is read from the SSD. The
+answers are the model's as on any other start; decode is several times slower than with a pool, prompts are read
+token by token at the decode's speed (the batched prompt path needs pool room), and MTP drafting is off on that
+start - the log says both. It needs RAM for the experts to be of use: with less RAM than the experts' size the SSD
+serves the rest, slower again. Nothing changes on a card whose pool holds a route. It does not apply (the start
+stops as before, and the message says which) with the model split over several GPUs, with a DFlash drafter, with
+`--parallel` above 1 or on an APU; `MAYA_GLM_NO_POOL=0` keeps the old stop everywhere.
+
 At start the engine log says how much VRAM each GPU has free with everything loaded (`maya serve: CUDA0: ... MiB of
 VRAM free with everything loaded`). Under 256 MiB (512 on a split's later GPUs) it adds `LOW` and the reserve that would
 leave room - except on an integrated GPU (an APU), where what is allocated after the expert
