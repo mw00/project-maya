@@ -133,6 +133,15 @@ void tok_row(int type, const uint8_t* row, int k, float* dst) {
     }
 }
 
+// BF16 values as F32 (exact: a BF16 is an F32's upper half)
+void bf16_to_f32(const uint16_t* src, size_t n, float* dst) {
+    for (size_t i = 0; i < n; ++i) {
+        uint16_t h;
+        std::memcpy(&h, (const uint8_t*) src + i * 2, 2);
+        const uint32_t u = (uint32_t) h << 16;
+        std::memcpy(dst + i, &u, 4);
+    }
+}
 // ggml's quantize_row_q8_0_ref over rows of k BF16 values (k % 32 == 0), on `threads` threads: the MTP block's BF16
 // matrices and experts as the GEMVs and the experts' kernels read them (Q8_0: 34 bytes a 32 values)
 void bf16_to_q8_0(const uint16_t* src, size_t rows, int k, uint8_t* dst, int threads = 16) {
@@ -544,6 +553,20 @@ struct Model::Impl {
                   std::to_string(batch) + "] in a type maya-hy4 reads";
             return false;
         }
+        // a BF16 matrix (not the output head, which has its own BF16 paths): the same values as F32 in VRAM - the token
+        // path's GEMV sums them in the same order, and the prompt path's GEMM takes F32 weights (BF16 it does not)
+        if (m.type == kBF16 && n != "output.weight") {
+            const size_t nv = (size_t) m.k * (size_t) m.n * (size_t) m.batch;
+            std::vector<float> f(nv);
+            bf16_to_f32((const uint16_t*) pk.data(*t), nv, f.data());
+            float* d = nullptr;
+            if (!gp.alloc(d, nv, err)) return false;
+            CK(cudaMemcpy(d, f.data(), nv * 4, cudaMemcpyHostToDevice));
+            m.w = (const uint8_t*) d;
+            m.type = kF32;
+            m.ld = (size_t) m.k * 4;
+            return true;
+        }
         void* v = nullptr;
         if (!upload(gp, *t, v, err)) return false;
         m.w = (const uint8_t*) v;
@@ -578,14 +601,26 @@ struct Model::Impl {
             for (int r = r0; r < r1; ++r)
                 std::memcpy(h.data() + ((size_t) (b - b0) * (r1 - r0) + (size_t) (r - r0)) * w,
                             src + ((size_t) b * nout + (size_t) r) * ld + o0, w);
+        m.k = c1 - c0;
+        m.n = r1 - r0;
+        m.batch = b1 - b0;
+        if (type == kBF16) {   // (as mat(): a BF16 matrix's part as F32 in VRAM)
+            const size_t nv = h.size() / 2;
+            std::vector<float> f(nv);
+            bf16_to_f32((const uint16_t*) h.data(), nv, f.data());
+            float* d = nullptr;
+            if (!gp.alloc(d, nv, err)) return false;
+            CK(cudaMemcpy(d, f.data(), nv * 4, cudaMemcpyHostToDevice));
+            m.w = (const uint8_t*) d;
+            m.type = kF32;
+            m.ld = (size_t) m.k * 4;
+            return true;
+        }
         uint8_t* d = nullptr;
         if (!gp.alloc(d, h.size(), err)) return false;
         CK(cudaMemcpy(d, h.data(), h.size(), cudaMemcpyHostToDevice));
         m.w = d;
         m.type = type;
-        m.k = c1 - c0;
-        m.n = r1 - r0;
-        m.batch = b1 - b0;
         m.ld = w;
         return true;
     }
@@ -632,7 +667,11 @@ struct Model::Impl {
         size_t b = 0;
         const std::string pre = "blk." + std::to_string(il) + ".";
         for (const auto& [n, t] : pk.t)
-            if (n.compare(0, pre.size(), pre) == 0) b += t.bytes + 256;
+            if (n.compare(0, pre.size(), pre) == 0) {
+                b += t.bytes + 256;
+                // (a trunk layer's BF16 matrices sit in VRAM as F32 - mat(); the MTP block's are rounded to Q8_0)
+                if (il < g.n_layer && t.type == "BF16" && n.find("_exps.") == std::string::npos) b += t.bytes;
+            }
         // caches
         if (g.swa[(size_t) il]) b += (size_t) ring * g.kv_row() * 2;
         else
@@ -1280,7 +1319,7 @@ struct Model::Impl {
             return false;
         for (const Mat* m : {&l.q_a, &l.q_b, &l.kv_a, &l.k_b, &l.v_b, &l.wo, &l.gate})
             if (m->type == kF32 || m->type == kBF16 || m->type == kF16 || m->type == kF8) {
-                err = p + ": an attention matrix in " + std::to_string(m->type) + " (maya-hy4 runs ggml's block types)";
+                err = p + ": an attention matrix in F32 / BF16 / F16 (maya-hy4 runs ggml's block types there)";
                 return false;
             }
         if (l.mtp && (!f32(gp, p + "nextn.enorm.weight", l.enorm, err, E) ||
