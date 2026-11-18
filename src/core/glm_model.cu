@@ -22,6 +22,7 @@
 #include "strata/core/glm_pool_classes.hpp"   // glm-dsa B3.7
 #include "strata/core/glm_cpu_affinity.hpp"   // glm-dsa B15.5
 #include "strata/core/glm_env.hpp"
+#include "strata/core/glm_kv_groups.hpp"
 
 #include "strata/kernels/glm_dsa.hpp"
 #include "strata/kernels/glm_fast.hpp"
@@ -927,23 +928,9 @@ Glm5Model::KvStream* Glm5Model::kv_stream_make(int64_t cells, int64_t ctx, std::
     K->window = dsa && strata::glmenv::env_flag("MAYA_GLM_KV_WINDOW", true);
     const bool debug = dsa && strata::glmenv::env_flag("MAYA_GLM_KV_DEBUG", false);
     size_t n_maps = ls.size();
-    if (dsa) {
-        K->lead.assign((size_t) g_.n_layers + 1, -1);
-        const int per_set = k::glmf::kKvCopySetMax / (K->kpe_row_bytes > 0 ? 2 : 1);
-        n_maps = 0;
-        int cur = -1, members = 0;
-        for (const int il : ls) {   // (the NextN block first, then the part's layers in order)
-            const bool own = !grouped || il >= g_.n_layers || g_.idx_full(il) || cur < 0 || cur >= g_.n_layers ||
-                             members >= per_set;
-            if (own) {
-                cur = il;
-                members = 0;
-                ++n_maps;
-            }
-            K->lead[(size_t) il] = cur;
-            ++members;
-        }
-    }
+    if (dsa)
+        K->lead = glm_kv_leads(ls, g_.n_layers, [&](int il) { return g_.idx_full(il); }, grouped,
+                               k::glmf::kKvCopySetMax / (K->kpe_row_bytes > 0 ? 2 : 1), n_maps);
     const auto a16 = [](uint64_t n) { return (n + 15) & ~(uint64_t) 15; };
     const uint64_t per = a16((uint64_t) K->n_blocks * 4) + 5 * a16((uint64_t) K->slots * 4) + a16(k::kKvCtlInts * 4);
     if (cudaMalloc(&K->map_arena, per * n_maps + 64) != cudaSuccess) {
@@ -1042,7 +1029,7 @@ void Glm5Model::kv_stream_reset_maps(bool identity) {
 // compute stream (the copies are queued, not waited for: whatever reads the slots next is queued behind them).
 bool Glm5Model::kv_stream_prime(int64_t n, std::string& err) {
     if (kv_ == nullptr) return true;
-    const bool ident = kv_->window && n <= kv_->window_cells() && fast_ != nullptr;
+    const bool ident = glm_kv_window_load(kv_->window, n, kv_->window_cells()) && fast_ != nullptr;
     kv_stream_reset_maps(ident);
     if (!ident || n <= 0) return true;
     cudaSetDevice(dev_);

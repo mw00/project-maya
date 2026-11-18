@@ -1725,7 +1725,7 @@ bool Glm5Model::prefill_carve(int Tn, int64_t end) {
         const int64_t pg = kv_->page, rows = std::min<int64_t>((int64_t) kv_->n_blocks * pg, (end + pg - 1) / pg * pg);
         stage = std::min(stage, (size_t) rows * (size_t) (kv_->row_bytes + kv_->kpe_row_bytes));
         // glm-dsa: a prompt that ends inside the identity window runs on the VRAM positions themselves - no stage
-        if (g.arch == GlmArch::GlmDsa && kv_->ident && end <= kv_->window_cells()) stage = 0;
+        if (g.arch == GlmArch::GlmDsa && glm_kv_window_chunk(kv_->ident, 0, end, kv_->window_cells())) stage = 0;
     }
     S->kv_stage_rows = kv_ != nullptr && stage > 0 ? (int64_t) (stage / (size_t) (kv_->row_bytes + kv_->kpe_row_bytes)) : 0;
     const auto [pers, uni] = prefill_bytes_for(T, stage);
@@ -2286,7 +2286,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
     if (g.arch == GlmArch::GlmDsa && kv_ != nullptr) {
         // inside the identity window the chunk runs on the VRAM positions (and writes the host copies too); past it,
         // on the stage - and its layers reset their maps, which ends the window for this conversation
-        pkv.window = kv_->ident && p0 + (int64_t) T <= kv_->window_cells();
+        pkv.window = glm_kv_window_chunk(kv_->ident, p0, T, kv_->window_cells());
         if (!pkv.window) {
             if (S->kv_stage == nullptr) {
                 err = "glm prefill: KV streaming without a stage";

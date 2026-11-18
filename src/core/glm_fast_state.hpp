@@ -7,6 +7,7 @@
 #include "strata/core/remote_experts.hpp"
 #include "strata/kernels/glm_fast.hpp"
 #include "strata/kernels/glm_kv_stream.hpp"
+#include "strata/core/glm_kv_groups.hpp"
 #include "strata/kernels/cpu/native_expert.hpp"
 #include "glm_memory.hpp"
 #include "glm_layer_graphs.hpp"
@@ -1091,7 +1092,7 @@ struct Glm5Model::KvStream {
 // resolve, which moves blocks) until the maps are reset again.  Not streamed: true.
 inline bool kv_window_hit(Glm5Model::KvStream* K, int64_t p_hi) {
     if (K == nullptr) return true;
-    if (K->ident && p_hi < K->window_cells()) return true;
+    if (glm_kv_window_serves(K->ident, p_hi, K->window_cells())) return true;
     K->ident = false;
     return false;
 }
