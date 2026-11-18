@@ -8436,6 +8436,8 @@ struct Model::Impl {
         const bool spare = store_env("DS4_STORE_SPARE", 1) != 0;
         size_t lane = 0, smin = ~(size_t) 0, smax = 0;   // (the in-place CPU-lane experts; the smallest, largest slot)
         uint64_t cap = 0;   // (every expert it may hold, at its own size: the lane's, and VRAM's with DS4_STORE_SPARE)
+        std::map<size_t, int> none_in;   // (without DS4_STORE_SPARE: a slot size none of whose experts the lane reads
+                                         // at load - its experts, for the first chunk the store keeps for it)
         for (const Layer& l : L) {
             if (l.mtp || l.il < 0 || l.il >= g.nl || l.lay.fmt != gg::kFmtMXFP4 || l.packed_host) continue;
             ExpertStore::Geo& gl = geo[(size_t) l.il];
@@ -8453,7 +8455,13 @@ struct Model::Impl {
             smax = std::max(smax, sb);
             lane += (size_t) in;
             cap += (uint64_t) sb * (uint64_t) (spare ? l.n_exp : in);
+            if (!spare) {
+                auto it = none_in.emplace(sb, 0).first;
+                it->second = in > 0 || it->second < 0 ? -1 : it->second + l.n_exp;
+            }
         }
+        for (const auto& x : none_in)   // (the room kept for it comes on top of the lane's experts, not out of them)
+            if (x.second > 0) cap += (uint64_t) x.first * (uint64_t) std::min(ExpertStore::Cfg{}.chunk_slots, (size_t) x.second);
         if (lane == 0) return off(copy_mode ? "every CPU-lane expert is copied into RAM" : "no expert is read in place");
         const double req = store_request();
         uint64_t bytes = 0;

@@ -757,7 +757,7 @@ void test_preload_sizes(const Model& m) {
 }
 
 // a size takes no more slots than its layers have experts (chunks of 3 for layer 4's 8 make 3 + 3 + 2), or than they
-// may hold (n_hold: the CPU lane's, the VRAM's never coming in) - so a budget of every holdable expert holds them all
+// may hold (n_hold) - so a budget of every holdable expert holds them all
 void test_class_cap(const Model& m) {
     Mk k;
     k.from = 4;
