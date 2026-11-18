@@ -664,7 +664,8 @@ struct Model::Impl {
         size_t b = 0;
         const std::string pre = "blk." + std::to_string(il) + ".";
         for (const auto& [n, t] : pk.t)
-            if (n.compare(0, pre.size(), pre) == 0 && n.find("_exps.") == std::string::npos) b += t.bytes + 256;
+            if (n.compare(0, pre.size(), pre) == 0 && n.find("_exps.") == std::string::npos)
+                b += t.bytes + 256 + (il < g.n_layer && t.type == "BF16" ? t.bytes : 0);   // (BF16: F32 in VRAM, mat())
         if (g.swa[(size_t) il]) b += (size_t) ring * g.kv_row() * 2;
         else
             b += (size_t) o.max_ctx * g.kv_row() * 2 + (size_t) (o.max_ctx / g.ix_kpool + 1) * g.ix_dim * 4 +
