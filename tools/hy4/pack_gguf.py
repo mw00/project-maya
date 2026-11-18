@@ -163,6 +163,17 @@ def geometry(kv: dict) -> dict:
     return geo
 
 
+def engram_scales(model: pathlib.Path, rows: int):
+    """The Engram table's row scales beside the set (a table of per-row scaled codes: <name>.engram-scales.bf16, one
+    BF16 a row) - its name, or None.  A file of another size is not this table's: refused."""
+    found = sorted(model.glob("*.engram-scales.bf16"))
+    if not found:
+        return None
+    if len(found) > 1 or found[0].stat().st_size != rows * 2:
+        raise SystemExit("engram: %s is not the table's row scales (%d rows of BF16 expected)" % (found[0].name, rows))
+    return found[0].name
+
+
 def geometry_text(geo: dict, model: pathlib.Path) -> str:
     lines = []
     for k, v in geo.items():
@@ -247,6 +258,8 @@ def main() -> int:
     ap.add_argument("--model", required=True, help="the folder of the GGUF set")
     ap.add_argument("--files", nargs="*", help="the set's shards (default: every .gguf in the folder)")
     ap.add_argument("--out", help="the pack's folder (default: <model>/maya-hy4)")
+    ap.add_argument("--engram-eps", type=float, help="the Engram norms' eps (default: the engine's, FP32's machine "
+                    "epsilon; 0.0078125: the release run in BF16)")
     a = ap.parse_args()
     model = pathlib.Path(a.model).expanduser().resolve()
     out = pathlib.Path(a.out).expanduser().resolve() if a.out else model / "maya-hy4"
@@ -281,7 +294,16 @@ def main() -> int:
         (out / "engram.bin").write_bytes(engram)
     elif (out / "engram.bin").exists():
         (out / "engram.bin").unlink()
-    (out / "hy4.txt").write_text(geometry_text(geo, model))
+    extra = ""
+    if engram is not None:
+        sc = engram_scales(model, tensors["per_layer_token_embd.weight"][1][1])
+        if sc:
+            extra += "engram_scales %s\n" % sc
+        if a.engram_eps is not None:
+            if not 0.0 < a.engram_eps <= 1.0:
+                raise SystemExit("--engram-eps %r" % a.engram_eps)
+            extra += "engram_eps %r\n" % a.engram_eps
+    (out / "hy4.txt").write_text(geometry_text(geo, model) + extra)
     (out / "tensors.txt").write_text("\n".join(lines) + "\n")
     print("%s: %d tensors from %d files, %d layers (+%d MTP), %d Engram layers" %
           (out, len(tensors), len(gs), geo["n_layer"], geo["n_mtp"], ne))

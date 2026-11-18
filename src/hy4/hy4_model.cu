@@ -36,6 +36,7 @@
 #include <array>
 #include <fstream>
 #include <map>
+#include <mutex>
 #include <thread>
 
 namespace hy4 {
@@ -290,6 +291,7 @@ struct Gpu {
     // Engram
     uint8_t* eg_rows = nullptr;
     float *eg_valid = nullptr, *eg_r = nullptr, *eg_kvo = nullptr;
+    float* eg_sc = nullptr;   // (the rows' scales [T][cols]: only with a scales file)
     // the head
     float *hcur = nullptr, *logits = nullptr;
     float* route = nullptr;     // (tensor parallel: member 0's and the helpers' routing rows [lat | ids | weights])
@@ -447,6 +449,17 @@ struct Model::Impl {
     float* h_x = nullptr;                // pinned [Tc][hc][E]
     uint8_t* h_eg = nullptr;             // pinned [modules][Tc][cols][dim]
     float* h_valid = nullptr;            // pinned [Tc]
+    // The Engram norms' eps.  The reference graph's norms have none set and take the machine epsilon of the type they run
+    // in: FP32's 1.1920929e-07 (AngelSlim's runtime, the default here), BF16's 0.0078125 when the release runs in BF16
+    // (hy4.txt's engram_eps, or HY4_ENGRAM_EPS)
+    float eg_eps = 1.1920929e-07f;
+    // The table's row scales (optional): a table of per-row scaled codes, e4m3(x / s) with s = max|row| / 448, has its
+    // BF16 s a row in a file beside it (hy4.txt's engram_scales); the rows' values are then the release's own.  Read
+    // from the disk a looked-up row at a time, as the table
+    const uint8_t* eg_scale = nullptr;
+    float* h_egs = nullptr;              // pinned [modules][Tc][cols]
+    std::FILE* eg_dump = nullptr;        // (HY4_EG_DUMP=<file>, tests: every looked-up row - see engram_row)
+    std::mutex eg_dump_mu;
     int* h_pos = nullptr;                // pinned [3][Tc]: pos, lo, nk
 
     ~Impl() {
@@ -479,6 +492,8 @@ struct Model::Impl {
         if (h_x) cudaFreeHost(h_x);
         if (h_eg) cudaFreeHost(h_eg);
         if (h_valid) cudaFreeHost(h_valid);
+        if (h_egs) cudaFreeHost(h_egs);
+        if (eg_dump) std::fclose(eg_dump);
         if (h_pos) cudaFreeHost(h_pos);
         if (h_emb) cudaFreeHost(h_emb);
         if (h_ids) cudaFreeHost(h_ids);
@@ -1593,6 +1608,7 @@ struct Model::Impl {
                gp.alloc(gp.ivt, T * 2 * g.ix_dim, err) && gp.alloc(gp.wt, T * g.ix_heads, err) &&
                gp.alloc(gp.score, (size_t) kSub * npool, err) && gp.alloc(gp.eg_rows, T * egc, err) &&
                gp.alloc(gp.eg_valid, T, err) && gp.alloc(gp.eg_r, T * egc, err) &&
+               (eg_scale == nullptr || gp.alloc(gp.eg_sc, T * (size_t) std::max(1, pk.eg.cols()), err)) &&
                gp.alloc(gp.eg_kvo, T * (hc + 1) * E, err) && gp.alloc(gp.hcur, T * E, err) &&
                gp.alloc(gp.xh16, T * qk, err) && gp.alloc(gp.wband, kBand, err) && gp.alloc(gp.sh16, 16 * T * ffe, err) &&
                gp.alloc(gp.sy, 16 * T * lat, err) && gp.alloc(gp.cpo, T * lat, err) && gp.alloc(gp.bounds, 1025, err) && gp.alloc(gp.stok, 16 * T, err) &&
@@ -1638,6 +1654,31 @@ struct Model::Impl {
             }
             eg_table = pk.data(*tt);
             eg_bytes = tt->bytes;
+            if (pk.has("engram_eps")) eg_eps = (float) pk.num("engram_eps");
+            if (const char* ee = std::getenv("HY4_ENGRAM_EPS")) eg_eps = (float) std::atof(ee);
+            if (!(eg_eps > 0.0f) || eg_eps > 1.0f) {
+                err = "the Engram norms' eps " + std::to_string(eg_eps) + " (engram_eps / HY4_ENGRAM_EPS)";
+                return false;
+            }
+            const char* es = std::getenv("HY4_ENGRAM_SCALES");
+            if (pk.has("engram_scales") && !(es && std::atoi(es) == 0)) {
+                const std::string sp0 = pk.str("engram_scales");
+                const std::string sp = !sp0.empty() && sp0[0] == '/' ? sp0 : pk.model_dir + "/" + sp0;
+                size_t sz = 0;
+                eg_scale = mm3::os::map_file(sp, sz);
+                if (eg_scale == nullptr || sz < (size_t) tt->n(1) * 2) {
+                    err = sp + ": not the Engram table's row scales (BF16, one a row)";
+                    return false;
+                }
+                CK(cudaMallocHost(&h_egs, sizeof(float) * (size_t) pk.eg.modules * Tc * pk.eg.cols()));
+            }
+            if (const char* ed = std::getenv("HY4_EG_DUMP")) eg_dump = std::fopen(ed, "wb");
+            {
+                char buf[200];
+                std::snprintf(buf, sizeof buf, "INFO Engram: %d layers, the table read from the disk a row at a time; "
+                              "norm eps %.9g; row scales %s", pk.eg.modules, (double) eg_eps, eg_scale ? "on" : "none");
+                info.push_back(buf);
+            }
             // its pages mapped into this process in the background (MADV_POPULATE_READ, else a read a page): a
             // window's lookups land on random pages of tens of GB, and each first touch is a page fault - faults that
             // queue on the process's memory map.  Off unless asked (HY4_EG_POPULATE=1): the table stays on the disk and
@@ -2552,6 +2593,20 @@ struct Model::Impl {
                     const int col = (oo - 1) * eg.heads + h;
                     const uint64_t row = rolling % primes[col] + offs[col];
                     std::memcpy(dst + ((size_t) t * cols + col) * hd, eg_table + row * (uint64_t) hd, (size_t) hd);
+                    float sc = 1.0f;
+                    if (eg_scale != nullptr) {
+                        uint16_t sb;
+                        std::memcpy(&sb, eg_scale + row * 2, 2);
+                        bf16_to_f32(&sb, 1, &sc);
+                        h_egs[((size_t) e * Tc + (size_t) t) * cols + col] = sc;
+                    }
+                    if (eg_dump != nullptr) {   // (int64 module, position, column, row; float scale; the row's bytes)
+                        std::lock_guard<std::mutex> lk(eg_dump_mu);
+                        const int64_t rec[4] = {e, p, col, (int64_t) row};
+                        std::fwrite(rec, 8, 4, eg_dump);
+                        std::fwrite(&sc, 4, 1, eg_dump);
+                        std::fwrite(eg_table + row * (uint64_t) hd, 1, (size_t) hd, eg_dump);
+                    }
                 }
             }
             if (e == 0) h_valid[t] = dead ? 0.0f : 1.0f;
@@ -2567,8 +2622,11 @@ struct Model::Impl {
         CK(cudaMemcpyAsync(gp.eg_rows, h_eg + ((size_t) l.eg * Tc + (size_t) r0) * cols * hd, (size_t) T * cols * hd,
                            cudaMemcpyHostToDevice, s));
         CK(cudaMemcpyAsync(gp.eg_valid, h_valid + r0, sizeof(float) * T, cudaMemcpyHostToDevice, s));
-        const float eps = 1.1920929e-07f;   // (the reference's RMSNorms with eps unset: FP32's machine epsilon)
-        k::engram_rows(gp.eg_rows, gp.eg_valid, T, cols, hd, l.eg_lookup, eps, gp.eg_r, s);
+        const float eps = eg_eps;
+        if (eg_scale != nullptr)
+            CK(cudaMemcpyAsync(gp.eg_sc, h_egs + ((size_t) l.eg * Tc + (size_t) r0) * cols, sizeof(float) * T * cols,
+                               cudaMemcpyHostToDevice, s));
+        k::engram_rows(gp.eg_rows, gp.eg_valid, T, cols, hd, l.eg_lookup, eps, gp.eg_r, s, eg_scale ? gp.eg_sc : nullptr);
         dbg("engram_rows_normed", l.il, gp, gp.eg_r, T, (size_t) cols * hd);
         if (!mm(gp, l.eg_kv, gp.eg_r, (size_t) cols * hd, T, gp.eg_kvo, (size_t) (g.hc + 1) * E)) {
             err = "engram_kv: a GEMV the kernels do not take";
@@ -3047,6 +3105,7 @@ struct Model::Impl {
         v.wt += r * (size_t) g.ix_heads;
         v.eg_rows += r * egc;
         v.eg_valid += r;
+        if (v.eg_sc) v.eg_sc += r * (size_t) pk.eg.cols();
         v.eg_r += r * egc;
         v.eg_kvo += r * (hc + 1) * E;
         if (v.h16) {

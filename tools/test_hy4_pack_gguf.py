@@ -161,6 +161,22 @@ class PackTest(unittest.TestCase):
         self.assertEqual(len([ln for ln in lines if ln.startswith("file ")]), 2)
         self.assertEqual(len([ln for ln in lines if ln.startswith("t ")]), 8)
 
+    def test_engram_scales_and_eps(self):
+        r = pack(self.root)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        text = (self.root / "maya-hy4" / "hy4.txt").read_text()
+        self.assertNotIn("engram_scales", text)
+        self.assertNotIn("engram_eps", text)
+        (self.root / "x.engram-scales.bf16").write_bytes(b"\0" * (2 * ROWS))
+        r = subprocess.run([sys.executable, str(PACK), "--model", str(self.root), "--engram-eps", "0.0078125"],
+                           capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        geo = dict(line.split(" ", 1) for line in (self.root / "maya-hy4" / "hy4.txt").read_text().splitlines())
+        self.assertEqual(geo["engram_scales"], "x.engram-scales.bf16")
+        self.assertEqual(float(geo["engram_eps"]), 0.0078125)
+        (self.root / "x.engram-scales.bf16").write_bytes(b"\0" * (2 * ROWS - 2))
+        self.assertNotEqual(pack(self.root).returncode, 0)
+
     def test_geometry_and_tensors(self):
         r = pack(self.root)
         self.assertEqual(r.returncode, 0, r.stderr)
