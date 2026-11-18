@@ -16,8 +16,8 @@
 //    (pinned) or one still being read.  A class keeps the share of the budget it took (at load: by the preload's
 //    order), until a give-back moves it; while a class holds no slots, the room for its first chunk stays kept for it
 //    (floor_ slots: chunk_slots, or what the budget gives every class, at most its hold), in the budget and in the RAM
-//    the others grow into, and that chunk needs only `floor` of RAM free beside it - so a class that asks late, or
-//    whose chunks were given back, still gets slots
+//    the others grow into, and that chunk needs only halfway from `floor` to `grow_room` of RAM free beside it - so a
+//    class that asks late, or whose chunks were given back, still gets slots, and not one given back again at once
 //  - reads queue by kind: a demand read (the CPU lane waits for it) always before a guess (the lookahead's); a guess
 //    asked for becomes a demand read, and a guess still queued once the token is past its layer is dropped unread
 //  - the slots come in chunks (a class's) as they are first needed, while `grow_room` of RAM stays free beside them;
@@ -38,6 +38,7 @@
 #include <cstring>
 #include <deque>
 #include <functional>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -84,7 +85,7 @@ public:
         size_t budget = 0;                     // bytes at most (the chunks of every class)
         size_t floor = (size_t) 4 << 30;       // free RAM below this: watch() gives chunks back
         size_t grow_room = (size_t) 8 << 30;   // a new chunk only while this much RAM stays free beside it (a
-                                               // class's first: `floor`)
+                                               // class's first: halfway from `floor` to this)
         size_t chunk_slots = 32;               // slots a chunk (the unit of growing and of giving back)
         Policy policy = kLru;
         int readers = 8;                       // reading threads
@@ -112,7 +113,7 @@ public:
         std::vector<int> e, slot;
         std::vector<uint8_t> st;
         std::vector<char> given;   // (next) handed out already
-        std::vector<unsigned> gen;   // (its slots' gen at begin(): the slot holds its expert while they match)
+        std::vector<uint64_t> gen;   // (its slots' gen at begin(): the slot holds its expert while they match)
     };
 
     ExpertStore() = default;
@@ -205,16 +206,21 @@ public:
         return true;
     }
 
+    /// (the preload's tail) the experts of `in` (count, expert) into `out`, the lowest count first and those of equal
+    /// count across the layers in turn: layer by layer (no profile: every count 0) the first layers' slot sizes would
+    /// take the budget's tail, and each size keeps the share it takes at load
+    static void by_count(const std::vector<std::pair<uint32_t, std::pair<int, int>>>& in,
+                         std::vector<std::pair<int, int>>& out) {
+        std::map<std::pair<int, uint32_t>, int> seen;   // ((layer, count): its experts so far)
+        std::vector<std::pair<std::pair<uint32_t, int>, std::pair<int, int>>> v;   // ((count, rank in its layer), expert)
+        for (const auto& x : in) v.push_back({{x.first, seen[{x.second.first, x.first}]++}, x.second});
+        std::stable_sort(v.begin(), v.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+        for (const auto& x : v) out.push_back(x.second);
+    }
     /// a slot's bytes for `layer`'s experts (0: a layer it does not cover)
     size_t slot_bytes(int layer) const { return covers(layer) ? cls_[(size_t) lay_[(size_t) layer].cls].bytes : 0; }
-    /// the experts it can hold: its slots, and what the budget not yet spent buys at the smallest size, at most what
-    /// the classes may still hold
-    size_t slots_max() const {
-        std::lock_guard<std::mutex> lk(mu_);
-        size_t room = 0;
-        for (const Class& k : cls_) room += k.hold - k.slots;
-        return nalloc_ + std::min(room, (cfg_.budget - alloc_) / least_);
-    }
+    /// the slots it could ever have (the budget at the smallest size, at most every expert it may hold)
+    size_t slots_max() const { return nmax_; }
     /// (the log) each class's slot bytes and the experts it holds
     std::vector<std::pair<size_t, size_t>> classes() const {
         std::lock_guard<std::mutex> lk(mu_);
@@ -533,7 +539,7 @@ public:
 
     /// The free RAM looked at: below `floor` chunks are given back from the end (stopping at one with a slot in use -
     /// pinned or reading) until it is back above it; a new chunk is allowed again once grow_room beside it is free (a
-    /// class's first: floor).
+    /// class's first: halfway from floor to grow_room).
     /// Returns the chunks given back.
     size_t watch() {
         const uint64_t av = cfg_.ram_avail ? cfg_.ram_avail() : ~uint64_t{0};
@@ -576,7 +582,7 @@ private:
         int prev = -1, next = -1;           // its class's order (oldest first): every slot not free
         std::atomic<int> left{0};           // its matrices' reads still to land
         std::atomic<bool> bad{false};       // a read failed
-        unsigned gen = 0;                   // (drop()s so far)
+        uint64_t gen = 0;                   // (drop()s so far)
     };
     struct Job {
         int slot = -1, layer = -1, e = -1, r = 0, file = -1;
@@ -727,10 +733,12 @@ private:
         return std::min({chunk_slots_, unspent > kept ? (unspent - kept) / c.bytes : 0, c.hold - c.slots});
     }
     // the free RAM a new chunk of class k (`bytes`) needs: grow_room beside it and the room kept for the classes that
-    // hold none - or, its first chunk, only `floor` beside it (mu_ held)
+    // hold none - or, its first chunk, only halfway from `floor` to grow_room beside it: room above floor, so the
+    // give-back below floor does not take it again at once (mu_ held)
     uint64_t ram_need(int k, size_t bytes) const {
         const Class& c = cls_[(size_t) k];
-        return (uint64_t) bytes + (c.slots > 0 ? (uint64_t) cfg_.grow_room + kept_for(k) : (uint64_t) cfg_.floor);
+        const uint64_t first = std::max<uint64_t>(cfg_.floor, ((uint64_t) cfg_.floor + cfg_.grow_room) / 2);
+        return (uint64_t) bytes + (c.slots > 0 ? (uint64_t) cfg_.grow_room + kept_for(k) : first);
     }
     // a chunk more for class k (chunk_n's slots) while the free RAM allows (ram_need) (mu_ held)
     bool grow(int k) {

@@ -8448,7 +8448,6 @@ struct Model::Impl {
             }
             int in = 0;
             for (int e = 0; e < l.n_exp; ++e) in += file_read(l, e) ? 1 : 0;
-            if (!spare) gl.n_hold = in;   // (VRAM's never come in: the lane keeps as many as it has)
             const size_t sb = ExpertStore::slot_layout(gl);
             smin = std::min(smin, sb);
             smax = std::max(smax, sb);
@@ -8510,28 +8509,18 @@ struct Model::Impl {
             for (const auto& x : hot)
                 if (store->covers(x.first)) list.push_back(x);
             const size_t n_hot = list.size();
-            // then the VRAM experts (the profile's least counted first), then the ones it has not seen - experts of
-            // equal count across the layers in turn: each slot size keeps the share it takes here, and layer by layer
-            // (no profile: every count 0) the first layers' sizes would take the budget's tail
-            std::vector<std::pair<std::pair<uint32_t, int>, std::pair<int, int>>> v[2];   // ((count, its rank among
-                                                                                         // its layer's of that count), expert)
+            // then the VRAM experts (the profile's least counted first), then the ones it has not seen (by_count:
+            // experts of equal count across the layers in turn)
+            std::vector<std::pair<uint32_t, std::pair<int, int>>> vram, fresh;
             if (spare)
                 for (const Layer& l : L)
-                    if (store->covers(l.il) && !l.mtp) {
-                        std::map<uint32_t, int> rank;
+                    if (store->covers(l.il) && !l.mtp)
                         for (int e = 0; e < l.n_exp; ++e)
-                            if (l.slot[(size_t) e] >= 0) {
-                                const uint32_t c = prof[(size_t) l.il * g.n_exp + e];
-                                v[0].push_back({{c, rank[c]++}, {l.il, e}});
-                            }
-                    }
-            std::map<int, int> at;
+                            if (l.slot[(size_t) e] >= 0) vram.push_back({prof[(size_t) l.il * g.n_exp + e], {l.il, e}});
             for (const auto& x : unseen)
-                if (store->covers(x.first)) v[1].push_back({{0u, at[x.first]++}, x});
-            for (auto& w : v) {
-                std::stable_sort(w.begin(), w.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
-                for (const auto& x : w) list.push_back(x.second);
-            }
+                if (store->covers(x.first)) fresh.push_back({0u, x});
+            ExpertStore::by_count(vram, list);
+            ExpertStore::by_count(fresh, list);
             const double t0 = now_ms();
             const size_t n = store->preload(list, 0);
             size_t hot_in = 0;   // (preload passes over an expert whose class is full: a later one may come in)

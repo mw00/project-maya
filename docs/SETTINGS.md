@@ -1131,8 +1131,8 @@ any other I/O. `--ssd-cache` gives that RAM to a store of whole experts instead:
   asked for lately (its count decays), among the experts of the same slot size; never one a token is computing. Each
   slot size keeps the share of the store it took (at load: in the order below) until RAM is given back, and while a
   slot size holds no slots, room for its first ones stays kept for it, in the store and in the RAM the others grow
-  into (those first ones need only 4 GB of RAM free beside them), so a layer read late, or one whose RAM was given
-  back, still gets some;
+  into (those first ones need only 6 GB of RAM free beside them, halfway from `DS4_STORE_FLOOR_GB` to
+  `DS4_STORE_GROW_GB`), so a layer read late, or one whose RAM was given back, still gets some;
 - at load it is filled with the profile's hottest CPU-lane experts, then (`DS4_STORE_SPARE`) with the VRAM experts the
   profile counts least - the ones the expert cache gives back to the CPU lane first - then with the CPU-lane experts
   the profile has not seen, experts of equal count across the layers in turn; an expert that leaves VRAM is copied into
@@ -1159,7 +1159,7 @@ The `DS4_STORE_*` settings go in a config's `"env"`, or as `MAYA_DS4_STORE_*` in
 | `--ssd-policy lru\|lfu` (or `DS4_STORE_POLICY`) | `lru` | which expert gives way when it is full |
 | `DS4_STORE_ROOM_GB` | 12 | `auto` leaves this much of the free RAM to the system and the owner's programs |
 | `DS4_STORE_FLOOR_GB` | 4 | below this much free RAM the store gives chunks back |
-| `DS4_STORE_GROW_GB` | 8 | a new chunk only while this much RAM stays free beside it (a slot size's first: `DS4_STORE_FLOOR_GB`) |
+| `DS4_STORE_GROW_GB` | 8 | a new chunk only while this much RAM stays free beside it (a slot size's first: halfway from `DS4_STORE_FLOOR_GB` to this) |
 | `DS4_STORE_THREADS` | 8 | its reading threads |
 | `DS4_STORE_PRELOAD` | 1 | `0`: nothing read at load; the first tokens fill it |
 | `DS4_STORE_SPARE` | 1 | `0`: no VRAM experts in the slots the CPU lane's leave over |

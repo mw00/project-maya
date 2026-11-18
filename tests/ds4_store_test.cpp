@@ -609,7 +609,7 @@ void test_capacity(const Model& m) {
     }
     EXPECT(st.preload(list, 0) == 8);
     EXPECT(st.held() == 8 && st.held_bytes() == k.budget);
-    EXPECT(st.slots_max() == 8);   // (the budget spent)
+    EXPECT(st.slots_now() == 8);   // (the budget spent)
     for (int e = 0; e < 4; ++e) EXPECT(st.has(4, e) && st.has(5, e));
     EXPECT(!st.has(4, 4) && !st.has(5, 4));
     const std::vector<uint8_t> a = ask(st, m, 4, {0, 1, 2, 3});   // (same(): the bytes, at their page offset)
@@ -987,12 +987,24 @@ void test_ram_room(const Model& m) {
     EXPECT(st.watch() == 0);
     const std::vector<uint8_t> c = ask(st, m, 5, {2});
     EXPECT(c.size() == 1 && c[0] == ExpertStore::kNone && st.slots_now() == 2);
-    avail = 4 * G + 2 * kSlot5;   // (floor and 5's first chunk, far below grow_room)
+    avail = 6 * G + 2 * kSlot5 - 1;   // (5's first chunk and just under halfway from floor to grow_room)
+    EXPECT(st.watch() == 0);
+    const std::vector<uint8_t> c2 = ask(st, m, 5, {4});
+    EXPECT(c2.size() == 1 && c2[0] == ExpertStore::kNone && st.slots_now() == 2);
+    avail = 6 * G + 2 * kSlot5;   // (halfway: room above floor, so the give-back does not take it again at once)
     EXPECT(st.watch() == 0);
     ask(st, m, 4, {3});   // (4 holds slots: still no chunk for it)
     EXPECT(st.slots_now() == 2);
     const std::vector<uint8_t> d = ask(st, m, 5, {3});
     EXPECT(d.size() == 1 && d[0] == ExpertStore::kMiss && st.slots_now() == 4);
+}
+
+// the preload's tail: the lowest count first, experts of equal count across the layers in turn
+void test_by_count() {
+    std::vector<std::pair<int, int>> out;
+    ExpertStore::by_count({{0, {4, 0}}, {0, {4, 1}}, {0, {5, 0}}, {0, {5, 1}}, {1, {4, 2}}, {0, {6, 0}}}, out);
+    const std::vector<std::pair<int, int>> want = {{4, 0}, {5, 0}, {6, 0}, {4, 1}, {5, 1}, {4, 2}};
+    EXPECT(out == want);
 }
 
 // a read that fails and its slot refilled for the same expert (put) before the window looks again: the window reads
@@ -1285,6 +1297,7 @@ int main(int argc, char** argv) {
     test_floor_hold(m);
     test_floor_regiven(m);
     test_ram_room(m);
+    test_by_count();
     test_hold_refilled(m);
     test_release_refilled(m);
     test_demand_fail_class(m);
