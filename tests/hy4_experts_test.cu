@@ -59,11 +59,13 @@ void random_k(int type, int k, uint8_t* out, std::mt19937& rng) {
         uint8_t* p = out + b * bb;
         for (int i = 0; i < bb; ++i) p[i] = (uint8_t) byte(rng);
         const uint16_t d = f2h(0.002f), dm = f2h(0.001f);
-        if (type == iq::kQ4_K) {
+        if (type == iq::kQ4_K || type == iq::kQ5_K) {
             std::memcpy(p, &d, 2);
             std::memcpy(p + 2, &dm, 2);
-        } else {   // Q6_K: d at the end
+        } else if (type == iq::kQ6_K) {   // d at the end
             std::memcpy(p + bb - 2, &d, 2);
+        } else {   // (the IQ types: the block's scale first, every other byte a valid code)
+            std::memcpy(p, &d, 2);
         }
     }
 }
@@ -499,6 +501,11 @@ int main() {
         for (int F : {256, 512})
             if (F % iq::block_values(tt[1]) == 0)
                 for (int T : {1, 5}) run_case(tt[0], tt[1], 24, T, rng, F);
+    }
+    // the lower-bit types (gate = up = down a layer): the same three forms
+    for (int ty : {iq::kIQ2_XXS, iq::kIQ2_S, iq::kIQ3_XXS, iq::kIQ4_XS, iq::kQ5_K}) {
+        CHECK(iq::expert_supported(ty));
+        for (int T : {1, 5, 16, 80}) run_case(ty, ty, 24, T, rng);
     }
     std::printf("hy4_experts_test: %s\n", fails ? "FAILED" : "ok");
     return fails ? 1 : 0;
