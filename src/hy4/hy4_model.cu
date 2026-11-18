@@ -1640,9 +1640,10 @@ struct Model::Impl {
             eg_bytes = tt->bytes;
             // its pages mapped into this process in the background (MADV_POPULATE_READ, else a read a page): a
             // window's lookups land on random pages of tens of GB, and each first touch is a page fault - faults that
-            // queue on the process's memory map (HY4_EG_POPULATE=0: none)
+            // queue on the process's memory map.  Off unless asked (HY4_EG_POPULATE=1): the table stays on the disk and
+            // a looked-up row's page is read at its first use - Maya never pulls an n-gram table into RAM by itself
             const char* ep = std::getenv("HY4_EG_POPULATE");
-            if (!(ep && std::atoi(ep) == 0)) {
+            if (ep && std::atoi(ep) != 0) {
                 eg_populator = std::thread([this] {
 #if defined(__linux__)
                     (void) nice(10);

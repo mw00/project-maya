@@ -2445,7 +2445,7 @@ A request's `spec` (0 / 1) turns the drafts off or on for it.
 | `HY4_NO_WARMUP` | off | no warm-up after the load (the first request then pays the first launches: ~1 s on a long prompt) |
 | `HY4_TP_NO_STAGGER`, `HY4_TP_ONE_BLOCK`, `HY4_TP_PULL_MAIN` | off | A/B: a chunk in one piece, its sums in one block, read back on the main stream (each slower) |
 | `HY4_TP_SKIP_SUM`, `HY4_TP_SKIP_COPY` | off | debugging only (the answers are no longer the model's): the host's sums, or the copies, left out - what each costs |
-| `HY4_EG_POPULATE` | on | the Engram table's pages mapped into the engine in the background after the load (`0`: each looked-up page faults in at its first use) |
+| `HY4_EG_POPULATE` | off | `1`: the Engram table's pages are mapped into the engine in the background after the load (the whole table goes through the page cache); off, the table stays on the disk and each looked-up page is read at its first use |
 | `HY4_DRAFT_HEAD` | `q4k` | `q8`: the drafts' head in Q8_0 |
 | `HY4_GEMV_OLD`, `HY4_GROUP_SERIAL`, `HY4_TOP1_ONE`, `HY4_HC_ONE`, `HY4_ROUTER_WARP`, `HY4_TP_SUM_EACH`, `HY4_TP_HAND0`, `HY4_TP_HAND_INLINE`, `HY4_MTP_EAGER`, `HY4_EG_SERIAL` | off | A/B switches: the earlier kernels and paths these replaced (the same results, slower) |
 | `HY4_ROUTER_SORT` | off | the router's earlier block-wide sort instead of the warp's picks (the same picks) |
