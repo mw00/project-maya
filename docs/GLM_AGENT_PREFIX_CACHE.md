@@ -63,8 +63,11 @@ requires an 8 GiB filesystem free-space floor. It does not create or partition a
 subquota is 2 GiB and 16 states, not an extra allocation outside those totals.
 Saving or publishing a new entry can be declined when resources are insufficient.
 Learned-state replacement retires its old victim only after successful new
-publication. The ordinary prompt-snapshot disk fallback does not yet provide
-that same failure-atomic guarantee; see the remaining Draft limitations below.
+publication. With learned-prefix mode enabled, ordinary prompt snapshots also
+require enough space to stage the new file without evicting an existing disk
+slot first. A tight budget can therefore decline a new snapshot rather than
+risk losing a reusable or context-bound state on serialization/publication failure.
+This does not change the legacy lifecycle when learned-prefix mode is disabled.
 
 With learned-prefix caching disabled, the underlying slot disk default remains
 16 GiB. See [SETTINGS.md](SETTINGS.md) for all controls, including learned quotas
@@ -116,19 +119,33 @@ operation, and completion-tail cross-context/SSD-restart quality remain outside
 that narrow historical diagnostic. A host fixture cannot close these gaps.
 Enabling this experimental feature is not a recommendation to deploy it broadly.
 
-### Remaining Draft lifecycle limitations
+### Lifecycle fixes and remaining Ready gates
 
-- When a normal prompt snapshot falls back to disk under a tight budget, its
-  existing eviction path can remove an older slot before serialization or
-  metadata publication succeeds. A failed new save may therefore lose reusable
-  cache entries. This is not the learned-state replacement transaction, and
-  consistent context-bound eviction protection remains a Ready/merge gate.
-- If learned quotas are reduced across a restart, startup admission currently
-  applies those quotas in directory enumeration order before its recency sort.
-  It can discard a hot entry rather than the coldest one. Runtime learned LRU
-  replacement does not establish startup LRU behavior under a changed quota.
-- With explicitly lowered thresholds, a completion whose entire saved key is
-  shorter than 1024 tokens can enter RAM while learned metadata refuses to
-  persist it. Such an entry has no SSD/restart guarantee. Admission and
-  persistence minima must be reconciled before Ready; this is not the default
-  completion policy's behavior.
+Host regressions cover the learned-enabled ordinary snapshot's capacity rejection,
+payload failure and metadata publication failure without losing the previous slot.
+Startup now orders lightweight file metadata by recency before reading/admitting
+learned token keys, so reduced count/byte/token quotas favor the newest entries
+that fit while retaining the existing aggregate token bound. This is not a model
+or performance validation.
+
+Explicitly lowered completion thresholds can produce a nonempty total key below
+1024 tokens. Metadata now accepts the same nonempty bounded key in RAM, on SSD
+and after restart. The learned-discovery minimum and default completion increment
+remain 1024; allowing short metadata does not lower those default admission gates.
+
+**Weight content identity remains unresolved and blocks Ready.** Existing identity
+uses paths, geometry and file metadata, not the bytes actually consumed by every
+loader input. Reopening paths to hash them after loading does not fix this: a
+replacement can bind loaded A to file B, and directory suffix enumeration need
+not match actual shards, companion files, EXL3 or external MTP inputs. No such
+partial hash or process-random namespace is shipped here; existing restart
+behavior has not been removed. Use a fresh private slot directory per immutable
+model revision. An actual loader-bound immutable content identity is still needed.
+The unresolved limitation has separate local evidence; it is not counted as a
+passing regression or replaced with a weaker identity scheme.
+
+The other three lifecycle fixes are host-code regressions only. Native/CUDA
+serialization, actual short-key completion SSD/restart numerical correctness,
+default-1024 model behavior and operational quality/performance still require
+separate acceptance. Neither passing host checks nor those three fixes makes
+this Draft PR Ready.

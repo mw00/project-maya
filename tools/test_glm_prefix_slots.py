@@ -19,6 +19,7 @@ import test_glm_slot_spill as legacy
 ROOT = Path(__file__).resolve().parents[1]
 CASES = ("lru", "budget", "zero-budget", "ram-pressure", "failed-put", "flush", "reindex", "mixed-flush",
          "mixed-reindex", "cli", "cli-reindex", "write-failure", "miss", "off-disk", "off-ram", "off-unset", "default-budgets",
+         "branch-ready-serialize", "branch-ready-write", "branch-ready-publish", "branch-ready-seed", "branch-ready-reindex", "branch-ready-short", "branch-ready-short-disk", "branch-ready-short-reindex",
          "branch-learn", "branch-position", "branch-save-fail", "branch-direct-disk", "branch-flush", "branch-reindex",
          "branch-corrupt", "branch-supersede", "branch-low-memory", "branch-peak-disk", "branch-peak-reject", "branch-load-memory",
          "branch-disk-floor", "branch-write-fail", "branch-atomic", "branch-budget64", "branch-budget-cap", "branch-zero-budget",
@@ -32,7 +33,7 @@ CASES = ("lru", "budget", "zero-budget", "ram-pressure", "failed-put", "flush", 
          "completion-gap", "completion-single", "completion-threshold", "completion-default-min",
          "completion-image-text", "completion-text-image", "completion-image-text-gap",
          "completion-text-image-gap")
-PAIRS = {"reindex": "flush", "mixed-reindex": "mixed-flush", "cli-reindex": "cli",
+PAIRS = {"branch-ready-reindex": "branch-ready-seed", "branch-ready-short-reindex": "branch-ready-short-disk", "reindex": "flush", "mixed-reindex": "mixed-flush", "cli-reindex": "cli",
          "branch-reindex": "branch-flush", "branch-legacy-reindex": "branch-legacy-meta", "branch-lru-reindex": "branch-lru-disk"}
 INCLUDES = r'''
 #include <array>
@@ -56,7 +57,7 @@ struct FakeModel {
   uint64_t snap_state = 987654321;
   int live_saves = 0, vector_saves = 0, file_saves = 0, snapshot_saves = 0, loads = 0;
   bool fail_live = false, shards_agree = true;
-  bool fail_metadata = false;
+  bool fail_metadata = false, fail_file = false;
   uint64_t declared_state_bytes = 8;
   static constexpr size_t slot_live_copy_bytes = 4u << 20, slot_file_copy_bytes = 64u << 20;
   bool fast() const { return true; } bool has_mtp() const { return false; }
@@ -68,7 +69,13 @@ struct FakeModel {
   bool snapshot_save() { ++snapshot_saves; snap_pos = live_pos; snap_state = uint64_t(context); return true; }
   uint64_t slot_flash_bytes(int64_t n) const { return n > 0 ? declared_state_bytes : 0; }
   uint64_t slot_save(std::vector<uint8_t>& out, std::string&) { ++vector_saves; out.assign(8, 0x5a); return 8; }
-  uint64_t slot_save(const std::string& p, std::string&, bool = false) { ++file_saves; std::ofstream f(p, std::ios::binary); const std::string b(8,'Z'); f.write(b.data(),8); return f?8:0; }
+  uint64_t slot_save(const std::string& p, std::string&, bool = false) {
+    ++file_saves; if (fail_file) return 0;
+    std::ofstream f(p, std::ios::binary); const std::string b(8,'Z'); f.write(b.data(),8); f.close();
+    if (fail_metadata && p.ends_with(".bin.tmp"))
+      std::filesystem::create_directory(p.substr(0,p.size()-8)+".meta.tmp");
+    return f?8:0;
+  }
   bool slot_save_live(int64_t n, const std::function<bool(const void*,size_t)>& put, std::string&) {
     ++live_saves; const uint32_t record[2] = {uint32_t(n), uint32_t(context)};
     if (live_pos != n || !shards_agree || !put(record, sizeof record)) return false;
@@ -100,7 +107,7 @@ using Glm5Model = FakeModel;
 namespace strata::core { using Glm5Model = ::FakeModel; }
 '''
 SETUP = r'''
-  const bool completion_case = which.rfind("completion-", 0)==0;
+  const bool completion_case = which.rfind("completion-", 0)==0 || which.rfind("branch-ready-short", 0)==0;
   set_env("MAYA_GLM_LEARNED_PREFIX", which.rfind("branch-", 0)==0 || completion_case ? "1" : "");
   set_env("MAYA_GLM_COMPLETION_CACHE", completion_case && which!="completion-off" ? "1" : "");
   set_env("MAYA_GLM_COMPLETION_MIN_TOKENS", which=="completion-default-min" ? "" : which=="completion-threshold" ? "3" : "1");
@@ -115,6 +122,9 @@ SETUP = r'''
   }
   if (which=="branch-direct-disk" || which=="branch-disk-floor" || which=="branch-write-fail" || which=="branch-zero-budget" || which=="completion-publish-fail")
     set_env("MAYA_GLM_SLOT_RAM_GB", "0");
+  if (which=="branch-ready-serialize" || which=="branch-ready-write" || which=="branch-ready-publish" || which=="branch-ready-short-disk" || which=="branch-ready-short-reindex") set_env("MAYA_GLM_SLOT_RAM_GB", "0");
+  if (which=="branch-ready-write") set_env("MAYA_GLM_SLOT_GB", "0.000014");
+  if (which=="branch-ready-reindex") set_env("MAYA_GLM_LEARNED_STATES", "1");
   if (which=="branch-budget64") set_env("MAYA_GLM_SLOT_GB", "");
   if (which=="branch-budget-cap") set_env("MAYA_GLM_SLOT_GB", "128");
   if (which=="branch-zero-budget") set_env("MAYA_GLM_SLOT_GB", "0");
@@ -147,7 +157,7 @@ def fixture(source: str) -> str:
     cpp = cpp[:fa] + FAKE + cpp[fb:]
     ga, gb = source.index("template <typename F>\nstatic bool guarded"), source.index("// Whether the CUDA context itself is broken")
     cpp = cpp.replace("int main(int argc, char** argv) {", source[ga:gb] + "\nint main(int argc, char** argv) {")
-    cpp = cpp.replace('which != "cli-reindex")', 'which != "cli-reindex" && which != "branch-reindex" && which != "branch-legacy-reindex" && which != "branch-lru-reindex")')
+    cpp = cpp.replace('which != "cli-reindex")', 'which != "cli-reindex" && which != "branch-reindex" && which != "branch-legacy-reindex" && which != "branch-lru-reindex" && which != "branch-ready-reindex" && which != "branch-ready-short-reindex")')
     cpp = cpp.replace('std::ofstream(root / "pack" / n).put(\'x\');', 'if (!std::filesystem::exists(root / "pack" / n)) std::ofstream(root / "pack" / n).put(\'x\');')
     cpp = cpp.replace("  Options o;", SETUP + "\n  Options o;")
     extra = (ROOT / "tests/core/glm_prefix_slot_cases.inc").read_text(encoding="utf-8")

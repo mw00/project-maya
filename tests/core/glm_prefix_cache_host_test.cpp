@@ -180,8 +180,15 @@ int main(int argc, char** argv) {
         expect(!pa::write_metadata(invalid, "", tokens, payload.size(), checksum) && invalid.str().empty(),
                "H3 invalid identity rejected before writing");
         std::ostringstream short_tokens;
-        expect(!pa::write_metadata(short_tokens, identity, std::span(tokens).first(1023), payload.size(), checksum),
-               "H5 short learned prefix cannot be persisted");
+        expect(pa::write_metadata(short_tokens, identity, std::span(tokens).first(12), payload.size(), checksum),
+               "H5 explicit low threshold short key can be persisted");
+        std::istringstream short_input(short_tokens.str(), std::ios::binary);
+        pa::Metadata short_entry;
+        expect(pa::read_metadata(short_input, identity, 12, short_entry) && short_entry.tokens.size() == 12,
+               "H5 short key roundtrips independently of default admission threshold");
+        std::ostringstream empty_tokens;
+        expect(!pa::write_metadata(empty_tokens, identity, {}, payload.size(), checksum),
+               "H5 empty state key cannot be persisted");
         std::istringstream data(payload, std::ios::binary);
         expect(pa::check_payload(data, payload.size(), checksum), "H3 payload stream checksum crosses 64KiB chunk");
         std::istringstream bad(payload, std::ios::binary);

@@ -1582,19 +1582,27 @@ static int glm_pack_generate(const Options& o) {
         uint64_t branch_bytes = 0;
         size_t branch_tokens = 0;
         size_t refused = 0;
-        for (const auto& de : std::filesystem::directory_iterator(slot_dir, ec)) {   // a previous run's slots
-            const std::string fn = de.path().filename().string(), p = de.path().string();
+        // Sort lightweight directory metadata before reading token vectors: a
+        // reduced quota must prefer recent entries without retaining unbounded keys.
+        std::vector<std::pair<fs::file_time_type, fs::path>> entries;
+        for (const auto& de : fs::directory_iterator(slot_dir, ec))
+            entries.emplace_back(fs::last_write_time(de.path(), ec), de.path());
+        std::sort(entries.begin(), entries.end(), [](const auto& a, const auto& b) {
+            return a.first != b.first ? a.first > b.first : a.second < b.second;
+        });
+        for (const auto& [stamp, entry] : entries) {   // newest metadata first
+            const std::string fn = entry.filename().string(), p = entry.string();
             const bool learned = fn.rfind("branch-", 0) == 0;
             if (fn.rfind("slot-", 0) != 0 && (!branch_enabled || !learned)) continue;
             const bool is_bin = fn.size() > 9 && fn.compare(fn.size() - 4, 4, ".bin") == 0;
             const bool is_meta = fn.size() > 10 && fn.compare(fn.size() - 5, 5, ".meta") == 0;
             if (!slot_keep || (!is_bin && !is_meta)) {   // not kept, or a .tmp an interrupted write left
-                std::filesystem::remove(de.path(), ec);
+                std::filesystem::remove(entry, ec);
                 continue;
             }
             if (!is_meta) continue;                      // a .bin is judged by its .meta
             const std::string bin = p.substr(0, p.size() - 5) + ".bin";
-            Found fd{bin, {}, 0, fs::last_write_time(de.path(), ec), kNoImages};
+            Found fd{bin, {}, 0, stamp, kNoImages};
             const uint64_t have = fs::exists(bin, ec) ? (uint64_t) fs::file_size(bin, ec) : 0;
             bool valid = false;
             if (learned && !branch_identity.empty() && memory_permits(branch::max_state_tokens * sizeof(int32_t))) {
@@ -1617,7 +1625,7 @@ static int glm_pack_generate(const Options& o) {
             if (valid && have == fd.bytes && fd.bytes > 0 && slot_age_days(p) <= slot_days &&
                 (!learned || (branch_count < learned_max &&
                     cache_memory::permits(learned_budget, branch_bytes, fd.bytes) &&
-                    fd.toks.size() <= branch::retained_token_budget - branch_tokens))) {
+                    cache_memory::permits(branch::retained_token_budget, branch_tokens, fd.toks.size())))) {
                 if (learned) {
                     ++branch_count;
                     branch_bytes += fd.bytes;
@@ -1638,7 +1646,9 @@ static int glm_pack_generate(const Options& o) {
                     !fs::exists(meta_of(p), ec))
                     std::filesystem::remove(de.path(), ec);
             }
-        std::sort(found.begin(), found.end(), [](const Found& a, const Found& b) { return a.t < b.t; });
+        std::sort(found.begin(), found.end(), [](const Found& a, const Found& b) {
+            return a.t != b.t ? a.t < b.t : a.bin > b.bin;
+        });
         uint64_t total = 0;
         for (auto& fd : found) {
             total += fd.bytes;
@@ -1710,7 +1720,7 @@ static int glm_pack_generate(const Options& o) {
         return s.bytes + (s.branch_id ? branch_identity.size() + 48 : slot_identity.size() + 48) +
                s.tokens.size() * sizeof(int32_t);
     };
-    const auto disk_fits = [&](const Slot& s, bool evict = false) {
+    const auto disk_fits = [&](const Slot& s) {
         if (!branch_index_complete) return false;
         if (s.bytes > slot_disk_budget) return false;
         const auto need = disk_need(s);
@@ -1718,16 +1728,9 @@ static int glm_pack_generate(const Options& o) {
         std::error_code ec;
         const auto space = fs::space(slot_dir, ec);
         if (ec || !cache_memory::permits(space.available, uint64_t{8} << 30, need)) return false;
-        while (!cache_memory::permits(slot_disk_budget, slot_disk_bytes(), need)) {
-            if (!evict) return false;
-            size_t oldest = SIZE_MAX;
-            for (size_t i = 0; i < slots.size(); ++i)
-                if (!slots[i].data && (oldest == SIZE_MAX || slots[i].used < slots[oldest].used)) oldest = i;
-            if (oldest == SIZE_MAX) return false;
-            slot_drop(oldest);
-            if (!branch_index_complete) return false;
-        }
-        return true;
+        // Staging needs its own space. Reject rather than destroy a usable (or
+        // context-bound) state before either payload or metadata can be published.
+        return cache_memory::permits(slot_disk_budget, slot_disk_bytes(), need);
     };
     const auto publish_files = [&](Slot& s, const auto& write_payload) {
         const auto stamp = std::chrono::duration_cast<std::chrono::microseconds>(
@@ -1895,7 +1898,7 @@ static int glm_pack_generate(const Options& o) {
                                         2 * snap_tokens.size() * sizeof(int32_t) + (1u << 20))) return;
                     Slot disk{snap_tokens, "", bytes, ++slot_clock};
                     disk.img = snap_img_hash;
-                    if (!disk_fits(disk, true)) return;
+                    if (!disk_fits(disk)) return;
                     if (!publish_files(disk, [&](const std::string& path) {
                             return model.slot_save(path, e, true) == bytes;
                         })) return;

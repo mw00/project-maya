@@ -8,7 +8,41 @@
       for (const auto& e : std::filesystem::directory_iterator(slot_dir, ec)) ++n;
       return n;
     };
-    if (which == "branch-learn") {
+    if (which == "branch-ready-write" || which == "branch-ready-publish" || which == "branch-ready-serialize") {
+      seed();
+      if (slots.size()!=1 || slots[0].data) fail("disk seed missing");
+      const auto old_path = slots[0].path;
+      const auto old_tokens = slots[0].tokens;
+      snap_tokens.assign(3000, 29); snap_in_slot = false;
+      if (which != "branch-ready-publish") model.fail_file = true;
+      else model.fail_metadata = true;
+      const auto writes = model.file_saves;
+      slot_put("");
+      if (which == "branch-ready-write" ? model.file_saves != writes : model.file_saves != writes+1)
+        fail("ordinary failure test did not reach the intended capacity/serialization/publication phase");
+      if (snap_in_slot || slots.size()!=1 || slots[0].path!=old_path || slots[0].tokens!=old_tokens ||
+          !std::filesystem::exists(old_path) || slot_take(c, 0, true)!=1883)
+        fail("failed ordinary snapshot destroyed the previous usable disk slot");
+    } else if (which == "branch-ready-seed") {
+      seed(); if (!slot_write_file(0)) fail("cold seed spill failed");
+      b[0] = c[0] = 31; seed(); if (!slot_write_file(1)) fail("hot seed spill failed");
+      const auto now = std::filesystem::file_time_type::clock::now();
+      std::filesystem::last_write_time(meta_of(slots[0].path), now - std::chrono::hours(1));
+      std::filesystem::last_write_time(meta_of(slots[1].path), now);
+    } else if (which == "branch-ready-reindex") {
+      c[0] = 31;
+      if (slots.size()!=1 || slot_take(c, 0, true)!=1883) fail("reduced restart quota discarded hottest state");
+    } else if (which == "branch-ready-short" || which == "branch-ready-short-disk" || which == "branch-ready-short-reindex") {
+      auto short_key = std::vector<int32_t>(12, 41);
+      if (which != "branch-ready-short-reindex") {
+        const auto prompt = std::vector<int32_t>(10, 41);
+        const auto emitted = std::vector<int32_t>(2, 41);
+        model.live_pos=12;
+        completion_save(prompt, emitted, "stop", false);
+      }
+      short_key.push_back(42);
+      if (slots.size()!=1 || slot_take(short_key,0,true)!=12) fail("short-key RAM/disk/restart semantics disagree");
+    } else if (which == "branch-learn") {
       if (prefix_admission.observe(a, 0) != 0 || slot_take(a, 0, true) != 0) fail("first request falsely hit");
       const size_t p = prefix_admission.observe(b, 0);
       if (p != 1883 || slot_take(b, 0, true) != 0) fail("metadata-only second request falsely hit");

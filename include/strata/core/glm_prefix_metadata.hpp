@@ -29,7 +29,7 @@ inline bool write_metadata(std::ostream& out, const std::string& identity, std::
                            uint64_t bytes, uint64_t checksum) {
     const uint64_t fields[] = {metadata_magic, identity.size(), bytes, tokens.size(), checksum};
     if (identity.empty() || identity.size() > max_identity_bytes ||
-        !bytes || bytes > state_budget || tokens.size() < min_tokens || tokens.size() > max_state_tokens) return false;
+        !bytes || bytes > state_budget || tokens.empty() || tokens.size() > max_state_tokens) return false;
     const uint64_t tag = hash_bytes(hash_bytes(hash_bytes(hash_start, fields, sizeof(fields)),
                                                 identity.data(), identity.size()),
                                     tokens.data(), tokens.size() * sizeof(int32_t));
@@ -44,7 +44,7 @@ inline bool read_metadata(std::istream& in, const std::string& identity, size_t 
     uint64_t fields[5]{};
     if (!in.read(reinterpret_cast<char*>(fields), sizeof(fields)) || fields[0] != metadata_magic ||
         !fields[1] || fields[1] != identity.size() || fields[1] > max_identity_bytes ||
-        !fields[2] || fields[2] > state_budget || fields[3] < min_tokens ||
+        !fields[2] || fields[2] > state_budget || !fields[3] ||
         fields[3] > std::min(token_limit, max_state_tokens)) return false;
     std::string stored(identity.size(), '\0');
     if (!in.read(stored.data(), stored.size()) || stored != identity) return false;
