@@ -103,7 +103,11 @@ bool Glm5Model::slot_load_prefix(const std::string& path, int64_t n_file, int64_
                 return false;
             }
         }
-        m->kv_stream_reset_maps();   // L1-6 KV streaming: the slots held the other conversation's rows
+        // L1-6 KV streaming: the slots held the other conversation's rows (this one's go into the identity window)
+        if (!m->kv_stream_prime(n_use, err)) {
+            cudaSetDevice(dev_);
+            return false;
+        }
         m->snap_pos_ = n_use;
     }
     // B15.3: the MTP1 carrier trailer holds h_{n_file - 1}: it stands only for a whole-entry restore

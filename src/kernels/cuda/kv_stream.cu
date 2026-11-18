@@ -181,6 +181,17 @@ __global__ void reset_kernel(KvStreamMap m) {
     if (i0 < kKvCtlInts) m.ctl[i0] = 0;
 }
 
+__global__ void reset_ident_kernel(KvStreamMap m) {
+    const long long i0 = (long long) blockIdx.x * blockDim.x + threadIdx.x, st = (long long) gridDim.x * blockDim.x;
+    for (long long i = i0; i < m.n_blocks; i += st) m.page_table[i] = i < m.n_slots ? (int32_t) i : -1;
+    for (long long i = i0; i < m.n_slots; i += st) {
+        m.slot_block[i] = i < m.n_blocks ? (int32_t) i : -1;
+        m.slot_stamp[i] = -1;
+        m.slot_ref[i] = 0;
+    }
+    if (i0 < kKvCtlInts) m.ctl[i0] = 0;
+}
+
 __global__ void ring_kernel(int32_t* table, long long n_blocks, long long n_slots) {
     for (long long i = (long long) blockIdx.x * blockDim.x + threadIdx.x; i < n_blocks;
          i += (long long) gridDim.x * blockDim.x)
@@ -199,6 +210,11 @@ uint64_t kv_block_bytes(const QsaShapes& s, int fmt) {
 void kv_stream_reset(const KvStreamMap& m, void* stream) {
     reset_kernel<<<128, 256, 0, (cudaStream_t) stream>>>(m);
     check("reset");
+}
+
+void kv_stream_reset_ident(const KvStreamMap& m, void* stream) {
+    reset_ident_kernel<<<128, 256, 0, (cudaStream_t) stream>>>(m);
+    check("reset ident");
 }
 
 void kv_stream_resolve(const KvStreamMap& m, const QsaAttnPools& slots, const KvHostPools& host, int fmt,

@@ -41,6 +41,10 @@ struct KvIo {
     int lat_row = 0, kpe_row = 0;         // bytes a position
     uint8_t* stage = nullptr;
     int64_t stage_rows = 0;
+    // The identity window (KvStream::ident) holds the whole chunk: every block below the chunk's end sits in its own
+    // slot, so the layers run on the arena's slots as on a resident cache - no stage, no prefix from the host copies -
+    // and the chunk's rows go to the host copies too; the maps stay as they are.
+    bool window = false;
 };
 
 struct Io {

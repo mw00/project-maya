@@ -1072,7 +1072,29 @@ struct Glm5Model::KvStream {
     uint8_t* host_arena = nullptr;                       // pinned: every layer's host copy
     void* map_arena = nullptr;                           // device: every layer's map
     uint64_t host_bytes = 0;
+    // glm-dsa (GLM-5.3 744B), kv_stream_make:
+    // lead[il]: the layer whose residency map layer il uses - itself, or (MAYA_GLM_KV_GROUP, on) the full-indexer layer
+    // whose selection it reuses: the layers of one indexer group read the same cells token after token, so one map
+    // serves them all and map[il] is a copy of map[lead[il]]'s pointers.  -1: not a streamed layer.  Empty on Flash.
+    std::vector<int> lead;
+    // The identity window (MAYA_GLM_KV_WINDOW, on): after a reset every block below `slots` sits in its own slot, and
+    // while that still holds (`ident`) and every position read lies inside the window, the attention reads its cells
+    // as slot rows with no resolve (kv_window_hit).  A resolve, or a prompt chunk that runs on the stage, ends it; a
+    // reset or a conversation loaded from a slot (kv_stream_prime) starts it again.
+    bool window = false;
+    bool ident = false;
+    int32_t* dbg = nullptr;                              // MAYA_GLM_KV_DEBUG: glm_kv_check's 4 counters (device)
+    int64_t window_cells() const { return slots * page; }
 };
+
+// The identity window serves positions [0, p_hi]: no resolve.  A false answer ends the window (the caller queues a
+// resolve, which moves blocks) until the maps are reset again.  Not streamed: true.
+inline bool kv_window_hit(Glm5Model::KvStream* K, int64_t p_hi) {
+    if (K == nullptr) return true;
+    if (K->ident && p_hi < K->window_cells()) return true;
+    K->ident = false;
+    return false;
+}
 
 // KV streaming's two hooks for a DSA attention at decode (the token path, the verify window, the rows of several
 // sequences), for layer il of a sequence whose stream is K (null: not streamed) and whose latent run is `lat` (a

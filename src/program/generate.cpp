@@ -2555,6 +2555,16 @@ static int glm_pack_generate(const Options& o) {
                              (unsigned long long) kv.lookups,
                              (double) kv.misses * kv.block_bytes / 1048576.0,
                              kv.overflow ? " - OVERFLOW (too few resident positions)" : "");
+                if (kv.dbg_on) {   // MAYA_GLM_KV_DEBUG: every row an attention read against the host copy
+                    if (kv.dbg_bad == 0)
+                        std::fprintf(stderr, "glm kv debug: %llu rows read by the attentions since the start, all equal "
+                                             "to the host copy\n", (unsigned long long) kv.dbg_rows);
+                    else
+                        std::fprintf(stderr, "glm kv debug: MISMATCH - %llu of %llu rows read by the attentions differ "
+                                             "from the host copy (the first: position %lld, layer %d)\n",
+                                     (unsigned long long) kv.dbg_bad, (unsigned long long) kv.dbg_rows,
+                                     (long long) kv.dbg_cell, kv.dbg_layer);
+                }
             }
         }
         model.set_follow({});

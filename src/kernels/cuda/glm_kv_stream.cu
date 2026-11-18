@@ -205,4 +205,70 @@ void glm_kv_copy_misses(const KvStreamMap& m, const uint8_t* host, uint8_t* slot
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) std::fprintf(stderr, "glm kv stream: copy: %s\n", cudaGetErrorString(e));
 }
+namespace {
+// a group's caches in one launch: blockIdx.y the cache, blockIdx.x strides the missed blocks; 16 B a thread
+__global__ void copy_set_kernel(KvStreamMap m, const KvCopySet set) {
+    const int need = m.ctl[2], j = blockIdx.y, len = set.len[j] / 16;
+    const uint8_t* __restrict__ host = set.host[j];
+    uint8_t* __restrict__ slots = set.slots[j];
+    for (int k = blockIdx.x; k < need; k += gridDim.x) {
+        const long long b = m.miss_block[k], sl = m.miss_slot[k];
+        const uint4* src = reinterpret_cast<const uint4*>(host + b * (long long) set.len[j]);
+        uint4* dst = reinterpret_cast<uint4*>(slots + sl * (long long) set.len[j]);
+        for (int i = threadIdx.x; i < len; i += blockDim.x) dst[i] = src[i];
+    }
+}
+// one warp a cell: its row in the slots against its row of the host copy, 16 B a lane and step
+__global__ void check_kernel(const uint8_t* __restrict__ host, const uint8_t* __restrict__ slots, int row_bytes,
+                             const int* __restrict__ cells, const int* __restrict__ slot_cells, int n_sel,
+                             const int* __restrict__ n_sel_dev, int tag, int* __restrict__ dbg) {
+    int n = n_sel;
+    if (n_sel_dev != nullptr && *n_sel_dev < n) n = *n_sel_dev;
+    const int warp = (blockIdx.x * blockDim.x + threadIdx.x) >> 5, lane = threadIdx.x & 31;
+    const int n_warps = gridDim.x * blockDim.x >> 5, units = row_bytes / 16;
+    for (int i = warp; i < n; i += n_warps) {
+        const int c = cells[i];
+        if (c < 0) continue;
+        const int r = slot_cells != nullptr ? slot_cells[i] : c;
+        bool bad = r < 0;
+        if (!bad) {
+            const uint4* a = reinterpret_cast<const uint4*>(host + (long long) c * row_bytes);
+            const uint4* b = reinterpret_cast<const uint4*>(slots + (long long) r * row_bytes);
+            for (int u = lane; u < units; u += 32) {
+                const uint4 x = a[u], y = b[u];
+                bad = bad || x.x != y.x || x.y != y.y || x.z != y.z || x.w != y.w;
+            }
+        }
+        bad = __any_sync(0xffffffffu, bad) != 0;
+        if (lane != 0) continue;
+        if (dbg[0] < 0x7fffffff) atomicAdd(&dbg[0], 1);
+        if (bad) {
+            if (dbg[1] < 0x7fffffff) atomicAdd(&dbg[1], 1);
+            if (atomicCAS(&dbg[2], 0, c + 1) == 0) dbg[3] = tag + 1;
+        }
+    }
+}
+}  // namespace
+void glm_kv_copy_set(const KvStreamMap& m, const KvCopySet& set, cudaStream_t s) {
+    if (set.n < 1) return;
+    copy_set_kernel<<<dim3(96, (unsigned) set.n), 64, 0, s>>>(m, set);
+    const cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) std::fprintf(stderr, "glm kv stream: copy set: %s\n", cudaGetErrorString(e));
+}
+void glm_kv_resolve_set(const KvStreamMap& m, const KvCopySet& set, int page, const int* cells, int n_sel,
+                        const int* n_sel_dev, int* slot_cells, cudaStream_t s) {
+    if (n_sel <= 0) return;
+    if (n_sel_dev != nullptr) resolve_dev_kernel<<<1, RT, 0, s>>>(m, cells, n_sel, n_sel_dev, page, slot_cells);
+    else resolve_kernel<<<1, RT, 0, s>>>(m, cells, n_sel, page, slot_cells);
+    const cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) std::fprintf(stderr, "glm kv stream: resolve set: %s\n", cudaGetErrorString(e));
+    glm_kv_copy_set(m, set, s);
+}
+void glm_kv_check(const uint8_t* host, const uint8_t* slots, int row_bytes, const int* cells, const int* slot_cells,
+                  int n_sel, const int* n_sel_dev, int tag, int* dbg, cudaStream_t s) {
+    if (n_sel <= 0 || dbg == nullptr || row_bytes < 16) return;
+    check_kernel<<<64, 256, 0, s>>>(host, slots, row_bytes, cells, slot_cells, n_sel, n_sel_dev, tag, dbg);
+    const cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) std::fprintf(stderr, "glm kv stream: check: %s\n", cudaGetErrorString(e));
+}
 }  // namespace strata::kernels::glmf

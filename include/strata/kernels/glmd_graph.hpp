@@ -102,10 +102,12 @@ struct GraphKey {
     int64_t n_cap = 0;                 // graph_n_cap()
     uint64_t gen = 0;                  // B15.6: graph_generation() at capture
     bool abl = false;                  // --ablate: the bound conversation projects (its launches are in the graph)
+    bool kv = false;                   // KV streaming: the part's attentions resolve their selections (false: the
+                                       // identity window, or no streaming - the cells are read as they are)
     bool operator==(const GraphKey& b) const {
         return part == b.part && l0 == b.l0 && l1 == b.l1 && cpu_plan == b.cpu_plan && residual == b.residual &&
                arena == b.arena && state == b.state && bits == b.bits && regime == b.regime && n_cap == b.n_cap &&
-               gen == b.gen && abl == b.abl;
+               gen == b.gen && abl == b.abl && kv == b.kv;
     }
     bool operator!=(const GraphKey& b) const { return !(*this == b); }
 };
