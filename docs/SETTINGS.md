@@ -1806,6 +1806,7 @@ by default.
 | `MAYA_DS4_LOAD_INTERLEAVE` | on (1) | the files round-robin - the first expert of each file, then the second, ... - so the threads read several files at once (a pack split over two drives streams both; the same bytes; a Gorgon Halo's EXL3 2.9 load 109 -> 75 s); `0`: file by file, as before v1.1.55 |
 | `MAYA_DS4_INPLACE_TRIM_GB` | 6 on Windows, 0 elsewhere | the in-place experts' pages the working set may hold above the load's own: over it a trimmer demotes the oldest noted ranges to the standby list (`VirtualUnlock`), where they count as available and soft-fault back unchanged; `0` disables the trimmer |
 | `MAYA_DS4_INPLACE_TRIM_MS` | 250 | the trimmer's pass interval, in milliseconds (minimum 50) |
+| `MAYA_DS4_ARENA_THP` | off (0) | Linux: `1` asks for transparent huge pages (`MADV_HUGEPAGE`) for the RAM arena the CPU lane's experts are copied into. With THP defrag `madvise`, each fault in that arena compacts memory while the copy fills the page cache, and the copy runs several times slower; the reserved 2 MB pool (`DS4_COPY_HUGETLB`) is a separate setting |
 
 ### The pages are dropped as the bytes are copied
 

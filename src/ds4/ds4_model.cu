@@ -260,8 +260,8 @@ std::vector<std::vector<os::Core>> node_threads() {
     }
     return nodes;
 }
-// anonymous memory on one NUMA node (node < 0: wherever the first touch puts it), transparent huge pages
-void* node_map(size_t bytes, int node, int n_nodes) { return os::anon_alloc(bytes, node, n_nodes); }
+// anonymous memory on one NUMA node (node < 0: wherever the first touch puts it), transparent huge pages when `thp` asks
+void* node_map(size_t bytes, int node, int n_nodes, bool thp = true) { return os::anon_alloc(bytes, node, n_nodes, thp); }
 void pin_self(int cpu) { os::pin_self(cpu); }
 // ZFS's reclaimable ARC is omitted from Linux MemAvailable (as in Maya's GLM path).
 // Count only bytes above its floor; the cgroup limits below still cap the result.
@@ -8662,6 +8662,11 @@ struct Model::Impl {
             used += add;
             ++n_copy[(size_t) l.il];
         }
+        // transparent huge pages for the arena only with MAYA_DS4_ARENA_THP=1: with the page cache full, each fault
+        // in a huge-page arena compacts memory while the copy fills the cache, which slows the copy several times
+        const bool arena_thp = tri_of(ds4_env("DS4_ARENA_THP")) == 1;
+        std::fprintf(stderr, "ds4: copy arena: transparent huge pages %s\n",
+                     arena_thp ? "requested (MAYA_DS4_ARENA_THP=1)" : "not requested (MAYA_DS4_ARENA_THP=1 requests them)");
         // each layer's slots: one block per node of (copies + spare) parts
         bool huge_short = false;   // (the pool ran out: said once)
         double huge_got = 0;       // (the bytes on huge pages)
@@ -8683,7 +8688,7 @@ struct Model::Impl {
                                          "vm.nr_hugepages=N) - the rest in the ordinary arena\n");
                     huge_short = true;
                 }
-                if (base[(size_t) X] == nullptr) base[(size_t) X] = (uint8_t*) node_map(bytes, X, NH);
+                if (base[(size_t) X] == nullptr) base[(size_t) X] = (uint8_t*) node_map(bytes, X, NH, arena_thp);
                 else huge_got += (double) got;
                 ok = base[(size_t) X] != nullptr;
                 if (ok) {
