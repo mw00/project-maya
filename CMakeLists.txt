@@ -1771,8 +1771,8 @@ if(STRATA_BUILD_TESTS)
     add_test(NAME direct_file_async_test COMMAND direct_file_async_test)
   endif()
   # maya-ds4's RAM expert store (--ssd-cache, src/ds4/ds4_store.hpp) over files of fake experts written in the build
-  # directory (~1 MB, removed): reads, where they land, eviction, the read queue, giving RAM back, preload, the miss
-  # split's order, put - host code only, no GPU
+  # directory (~2 MB, removed): reads, where they land, eviction, the read queue, giving RAM back, preload, the miss
+  # split's order, put, slots of each layer's own size - host code only, no GPU
   add_executable(ds4_store_test tests/ds4_store_test.cpp)
   target_include_directories(ds4_store_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/ds4)
   if(WIN32)

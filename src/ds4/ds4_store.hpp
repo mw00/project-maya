@@ -6,12 +6,22 @@
 //    files past the page cache (Linux: O_DIRECT - Pack's dfds; elsewhere, or where the file system refuses it, through
 //    the buffered handles), so each read lands its matrix at the region's start + (file offset % 4096): nothing is moved
 //    after the read, and a matrix lies at the page offset the file's mapping has it at
+//  - a slot is its layer's own size: each region the span of that matrix's aligned read at any page offset (its bytes
+//    rounded up to whole pages, and the page its file offset may start into), so an expert takes its own bytes, not
+//    the largest layer's (a GGUF quantizes its layers differently), and layers of one quantization take one size.  The
+//    layers whose slots are of one size share a class, its slots packed at that size in chunks of its own; the budget
+//    counts the bytes of every class's chunks
 //  - which expert gives way: lru (the least recently asked for) or lfu (the lowest heat - its asks, decayed layer by
-//    layer), never one a window is computing (pinned) or one still being read
+//    layer) among its own class's experts (a slot of another size cannot take it), never one a window is computing
+//    (pinned) or one still being read.  A class keeps the share of the budget it took (at load: by the preload's
+//    order), until a give-back moves it; while a class holds no slots, the room for its first chunk stays kept for it
+//    (floor_ slots: chunk_slots, or what the budget gives every class, at most its hold), in the budget and in the RAM
+//    the others grow into, and that chunk needs only `floor` of RAM free beside it - so a class that asks late, or
+//    whose chunks were given back, still gets slots
 //  - reads queue by kind: a demand read (the CPU lane waits for it) always before a guess (the lookahead's); a guess
 //    asked for becomes a demand read, and a guess still queued once the token is past its layer is dropped unread
-//  - the slots come in chunks as they are first needed, while `grow_room` of RAM stays free beside them; watch() gives
-//    chunks back from the end when the free RAM falls below `floor`
+//  - the slots come in chunks (a class's) as they are first needed, while `grow_room` of RAM stays free beside them;
+//    watch() gives chunks back from the end (the newest first, of any class) when the free RAM falls below `floor`
 //  - put(): an expert whose bytes are in memory already (one the VRAM cache gives back to the CPU lane) copied into a
 //    slot - no read
 // Host code only (no GPU runtime): tests/ds4_store_test.cpp runs it over a file of fake experts.
@@ -49,9 +59,10 @@ class ExpertStore {
 public:
     static constexpr uint64_t kAlign = os::kDirectAlign;
     /// a layer's experts in the files: expert e's matrix r (0 gate, 1 up, 2 down) is bytes[r] at off[r] + e stride[r]
-    /// of file file[r] (n_exp 0: a layer the store does not cover)
+    /// of file file[r] (n_exp 0: a layer the store does not cover); n_hold: how many of them it holds at once at most
+    /// (-1: n_exp) - the CPU lane's, where the VRAM's never come in; a class has no more slots than its layers' sum
     struct Geo {
-        int n_exp = 0;
+        int n_exp = 0, n_hold = -1;
         int file[3] = {-1, -1, -1};
         uint64_t off[3] = {0, 0, 0}, stride[3] = {0, 0, 0}, bytes[3] = {0, 0, 0};
     };
@@ -70,9 +81,10 @@ public:
         uint64_t off, len;
     };
     struct Cfg {
-        size_t budget = 0;                     // bytes at most (whole slots)
+        size_t budget = 0;                     // bytes at most (the chunks of every class)
         size_t floor = (size_t) 4 << 30;       // free RAM below this: watch() gives chunks back
-        size_t grow_room = (size_t) 8 << 30;   // a new chunk only while this much RAM stays free beside it
+        size_t grow_room = (size_t) 8 << 30;   // a new chunk only while this much RAM stays free beside it (a
+                                               // class's first: `floor`)
         size_t chunk_slots = 32;               // slots a chunk (the unit of growing and of giving back)
         Policy policy = kLru;
         int readers = 8;                       // reading threads
@@ -100,6 +112,7 @@ public:
         std::vector<int> e, slot;
         std::vector<uint8_t> st;
         std::vector<char> given;   // (next) handed out already
+        std::vector<unsigned> gen;   // (its slots' gen at begin(): the slot holds its expert while they match)
     };
 
     ExpertStore() = default;
@@ -120,19 +133,18 @@ public:
         }
         q_cv_.notify_all();
         for (std::thread& t : th_) t.join();   // (a read under way ends first: it writes into a chunk)
-        for (const auto& c : chunks_) os::anon_free(c.first, c.second);
+        for (const Chunk& c : chunks_) os::anon_free(c.p, c.bytes);
     }
 
-    /// a slot's bytes for these layers, and where matrix r's region starts in it (tr): each region holds the aligned
-    /// read's span of the layers' largest matrix r - the matrix and its lead, whole pages
-    static size_t slot_layout(const std::vector<Geo>& geo, size_t* tr = nullptr) {
+    /// a slot's bytes for layer g's experts (0: a layer the store does not cover), and where matrix r's region starts
+    /// in it (tr): each region the span of matrix r's aligned read at any lead - the matrix and up to a page before it,
+    /// whole pages (so a layer's slot follows its matrices' sizes, not where they sit in the files)
+    static size_t slot_layout(const Geo& g, size_t* tr = nullptr) {
+        if (g.n_exp <= 0) return 0;
         size_t off = 0;
         for (int r = 0; r < 3; ++r) {
-            size_t room = 0;
-            for (const Geo& g : geo)
-                if (g.n_exp > 0) room = std::max<size_t>(room, (size_t) ((g.bytes[r] + 2 * kAlign - 1) / kAlign * kAlign));
             if (tr != nullptr) tr[r] = off;
-            off += room;
+            off += (size_t) ((g.bytes[r] + 2 * kAlign - 1) / kAlign * kAlign);
         }
         return off;
     }
@@ -147,17 +159,38 @@ public:
                     err = "the RAM store: a layer's expert matrix in no file";
                     return false;
                 }
-        slot_bytes_ = slot_layout(geo_, tr_);
-        if (slot_bytes_ == 0) {
+        lay_.assign(geo_.size(), Lay{});
+        size_t hold = 0;
+        for (size_t l = 0; l < geo_.size(); ++l) {
+            const Geo& g = geo_[l];
+            const size_t b = slot_layout(g, lay_[l].tr);
+            if (b == 0) continue;
+            size_t k = 0;
+            while (k < cls_.size() && cls_[k].bytes != b) ++k;
+            if (k == cls_.size()) cls_.emplace_back();
+            const size_t h = (size_t) (g.n_hold >= 0 ? std::min(g.n_hold, g.n_exp) : g.n_exp);
+            cls_[k].bytes = b;
+            cls_[k].hold += h;
+            lay_[l].cls = (int) k;
+            hold += h;
+        }
+        if (cls_.empty()) {
             err = "the RAM store: no layer of experts to hold";
             return false;
         }
-        nmax_ = cfg_.budget / slot_bytes_;
+        size_t one = 0;   // (a slot of every class that holds any)
+        for (const Class& k : cls_) {
+            if (k.hold == 0) continue;
+            least_ = least_ == 0 ? k.bytes : std::min(least_, k.bytes);
+            one += k.bytes;
+        }
+        nmax_ = least_ == 0 ? 0 : std::min(hold, cfg_.budget / least_);   // (the slots it could ever have)
         if (nmax_ == 0) {
             err = "the RAM store: its size holds no expert";
             return false;
         }
         chunk_slots_ = std::max<size_t>(1, cfg_.chunk_slots);
+        floor_ = std::min(chunk_slots_, cfg_.budget / one);
         no_direct_.reset(new std::atomic<bool>[files_.buf.size() + 1]);
         for (size_t i = 0; i <= files_.buf.size(); ++i) no_direct_[i].store(false, std::memory_order_relaxed);
         slots_.reset(new Slot[nmax_]);
@@ -172,15 +205,36 @@ public:
         return true;
     }
 
-    size_t slot_bytes() const { return slot_bytes_; }
-    size_t slots_max() const { return nmax_; }
+    /// a slot's bytes for `layer`'s experts (0: a layer it does not cover)
+    size_t slot_bytes(int layer) const { return covers(layer) ? cls_[(size_t) lay_[(size_t) layer].cls].bytes : 0; }
+    /// the experts it can hold: its slots, and what the budget not yet spent buys at the smallest size, at most what
+    /// the classes may still hold
+    size_t slots_max() const {
+        std::lock_guard<std::mutex> lk(mu_);
+        size_t room = 0;
+        for (const Class& k : cls_) room += k.hold - k.slots;
+        return nalloc_ + std::min(room, (cfg_.budget - alloc_) / least_);
+    }
+    /// (the log) each class's slot bytes and the experts it holds
+    std::vector<std::pair<size_t, size_t>> classes() const {
+        std::lock_guard<std::mutex> lk(mu_);
+        std::vector<std::pair<size_t, size_t>> v;
+        for (const Class& k : cls_) v.push_back({k.bytes, k.slots - k.free.size()});
+        return v;
+    }
     size_t slots_now() const {   // (allocated)
         std::lock_guard<std::mutex> lk(mu_);
         return nalloc_;
     }
     size_t held() const {   // (slots holding an expert, or reading one)
         std::lock_guard<std::mutex> lk(mu_);
-        return nalloc_ - free_.size();
+        size_t n = 0;
+        for (const Class& k : cls_) n += k.slots - k.free.size();
+        return n;
+    }
+    size_t held_bytes() const {   // (their bytes)
+        std::lock_guard<std::mutex> lk(mu_);
+        return held_bytes_locked();
     }
     const Counts& counts() const { return counts_; }
     bool covers(int layer) const { return layer >= 0 && layer < (int) geo_.size() && geo_[(size_t) layer].n_exp > 0; }
@@ -199,6 +253,7 @@ public:
         h.slot.assign((size_t) n, -1);
         h.st.assign((size_t) n, kNone);
         h.given.assign((size_t) n, 0);
+        h.gen.assign((size_t) n, 0);
         if (!covers(layer)) return;
         std::lock_guard<std::mutex> lk(mu_);
         for (int i = 0; i < n; ++i) {
@@ -223,17 +278,19 @@ public:
                 unlink(s);
                 link_back(s);
                 h.slot[(size_t) i] = s;
+                h.gen[(size_t) i] = sp.gen;
                 h.st[(size_t) i] = sp.state == kReady ? kHit : kMiss;
                 continue;
             }
             counts_.misses.fetch_add(1, std::memory_order_relaxed);
-            s = take_slot(true);
+            s = take_slot(layer, true);
             if (s < 0) {
                 counts_.no_slot.fetch_add(1, std::memory_order_relaxed);
                 continue;
             }
             fill(s, layer, e, false, 1, false);
             h.slot[(size_t) i] = s;
+            h.gen[(size_t) i] = slots_[(size_t) s].gen;
             h.st[(size_t) i] = kMiss;
         }
     }
@@ -263,9 +320,9 @@ public:
                             continue;
                         }
                         settle(s);
-                        if (sp.state == kReady && sp.layer == h.layer && sp.e == h.e[i]) {
+                        if (sp.state == kReady && sp.gen == h.gen[i]) {
                             h.st[i] = kHit;
-                        } else {   // (failed: its slot went)
+                        } else {   // (failed: its slot went - taken since by another, maybe for the same expert)
                             h.st[i] = kNone;
                             h.slot[i] = -1;
                         }
@@ -291,7 +348,7 @@ public:
     /// expert i's matrix r in its slot (kHit), else null (read it in place)
     const uint8_t* mat(const Hold& h, int i, int r) const {
         if (h.st[(size_t) i] != kHit) return nullptr;
-        return slots_[(size_t) h.slot[(size_t) i]].base + tr_[r] + lead(h.layer, h.e[(size_t) i], r);
+        return slots_[(size_t) h.slot[(size_t) i]].base + lay_[(size_t) h.layer].tr[r] + lead(h.layer, h.e[(size_t) i], r);
     }
     void release(Hold& h) {
         if (!covers(h.layer)) return;
@@ -300,7 +357,7 @@ public:
             const int s = h.slot[i];
             if (s < 0) continue;
             Slot& sp = slots_[(size_t) s];
-            if (sp.layer == h.layer && sp.e == h.e[i] && sp.pin > 0) --sp.pin;
+            if (sp.gen == h.gen[i] && sp.pin > 0) --sp.pin;
             h.slot[i] = -1;
         }
     }
@@ -310,7 +367,7 @@ public:
         if (!covers(layer) || e < 0 || e >= geo_[(size_t) layer].n_exp) return false;
         std::lock_guard<std::mutex> lk(mu_);
         if (where_[(size_t) layer][(size_t) e] >= 0) return false;
-        const int s = take_slot(true);
+        const int s = take_slot(layer, true);
         if (s < 0) return false;
         fill(s, layer, e, true, 0, false);
         counts_.guesses.fetch_add(1, std::memory_order_relaxed);
@@ -354,21 +411,26 @@ public:
     }
 
     /// Reads the experts of `list` (layer, expert; hottest first) into free slots - none given up for them - and
-    /// returns once they are in: the first ones that fit, `leave` slots left over.  Each later one is put before the
-    /// earlier ones in the policy's order, so the coldest is the first to give way.  Returns how many were read.
+    /// returns once they are in: the first ones that fit, `leave` bytes of the budget left over (one whose class has no
+    /// room left is passed over: a later one's may have).  Each later one is put before the earlier ones in the
+    /// policy's order, so the coldest is the first to give way.  Returns how many were read.
     size_t preload(const std::vector<std::pair<int, int>>& list, size_t leave) {
         std::vector<int> mine;
         {
             std::lock_guard<std::mutex> lk(mu_);
-            const size_t room = nmax_ > leave ? nmax_ - leave : 0;
-            for (size_t k = 0; k < list.size() && mine.size() < room; ++k) {
-                const int layer = list[k].first, e = list[k].second;
+            const size_t room = cfg_.budget > leave ? cfg_.budget - leave : 0;
+            size_t held = held_bytes_locked();
+            for (const auto& x : list) {
+                const int layer = x.first, e = x.second;
                 if (!covers(layer) || e < 0 || e >= geo_[(size_t) layer].n_exp) continue;
                 if (where_[(size_t) layer][(size_t) e] >= 0) continue;
-                const int s = take_slot(false);
-                if (s < 0) break;
+                const size_t b = slot_bytes(layer);
+                if (held + b > room) continue;
+                const int s = take_slot(layer, false);
+                if (s < 0) continue;
                 fill(s, layer, e, false, 0, true);
                 mine.push_back(s);
+                held += b;
             }
         }
         for (;;) {
@@ -400,7 +462,7 @@ public:
         {
             std::lock_guard<std::mutex> lk(mu_);
             if (where_[(size_t) layer][(size_t) e] >= 0) return false;
-            s = take_slot(true);
+            s = take_slot(layer, true);
             if (s < 0) return false;
             Slot& sp = slots_[(size_t) s];   // (loading, pinned: nothing takes it while the copy runs)
             sp.layer = layer;
@@ -414,7 +476,8 @@ public:
             link_back(s);
         }
         const Geo& g = geo_[(size_t) layer];
-        for (int r = 0; r < 3; ++r) std::memcpy(slots_[(size_t) s].base + tr_[r] + lead(layer, e, r), src[r], (size_t) g.bytes[r]);
+        for (int r = 0; r < 3; ++r)
+            std::memcpy(slots_[(size_t) s].base + lay_[(size_t) layer].tr[r] + lead(layer, e, r), src[r], (size_t) g.bytes[r]);
         {
             std::lock_guard<std::mutex> lk(mu_);
             Slot& sp = slots_[(size_t) s];
@@ -451,7 +514,7 @@ public:
     }
     const uint8_t* mat_of(int s, int r) const {
         const Slot& sp = slots_[(size_t) s];
-        return sp.base + tr_[r] + lead(sp.layer, sp.e, r);
+        return sp.base + lay_[(size_t) sp.layer].tr[r] + lead(sp.layer, sp.e, r);
     }
     void unpin(int s) {
         std::lock_guard<std::mutex> lk(mu_);
@@ -469,25 +532,22 @@ public:
     }
 
     /// The free RAM looked at: below `floor` chunks are given back from the end (stopping at one with a slot in use -
-    /// pinned or reading) until it is back above it; a new chunk is allowed again once grow_room beside it is free.
+    /// pinned or reading) until it is back above it; a new chunk is allowed again once grow_room beside it is free (a
+    /// class's first: floor).
     /// Returns the chunks given back.
     size_t watch() {
         const uint64_t av = cfg_.ram_avail ? cfg_.ram_avail() : ~uint64_t{0};
         std::lock_guard<std::mutex> lk(mu_);
-        for (int s = head_; s >= 0;) {   // (the reads that landed: a failed one's slot back)
-            const int nx = slots_[(size_t) s].next;
-            settle(s);
-            s = nx;
-        }
+        for (size_t k = 0; k < cls_.size(); ++k)   // (the reads that landed: a failed one's slot back)
+            for (int s = cls_[k].head; s >= 0;) {
+                const int nx = slots_[(size_t) s].next;
+                settle(s);
+                s = nx;
+            }
         if (av == ~uint64_t{0}) return 0;
-        const size_t cb = chunk_slots_ * slot_bytes_;
-        size_t gave = 0;
-        if (av < cfg_.floor) {
-            gave = shrink((size_t) ((cfg_.floor - av + cb - 1) / cb));
-            grow_ok_ = false;
-        } else {
-            grow_ok_ = av >= (uint64_t) cfg_.grow_room + cb;
-        }
+        const size_t gave = av < cfg_.floor ? shrink((size_t) (cfg_.floor - av)) : 0;
+        for (size_t k = 0; k < cls_.size(); ++k)
+            cls_[k].grow_ok = av >= cfg_.floor && av >= ram_need((int) k, chunk_n((int) k) * cls_[k].bytes);
         return gave;
     }
 
@@ -510,11 +570,13 @@ private:
     struct Slot {
         uint8_t* base = nullptr;            // (page-aligned; null: its chunk is not allocated)
         int layer = -1, e = -1, pin = 0;
+        int cls = -1;                       // its chunk's class
         uint8_t state = kFree;              // (mu_)
         bool guess = false;                 // read on a guess, not asked for since
-        int prev = -1, next = -1;           // the policy's order (oldest first): every slot not free
+        int prev = -1, next = -1;           // its class's order (oldest first): every slot not free
         std::atomic<int> left{0};           // its matrices' reads still to land
         std::atomic<bool> bad{false};       // a read failed
+        unsigned gen = 0;                   // (drop()s so far)
     };
     struct Job {
         int slot = -1, layer = -1, e = -1, r = 0, file = -1;
@@ -522,35 +584,59 @@ private:
         uint8_t* dst = nullptr;
         bool guess = false;
     };
+    struct Class {   // the layers whose slots are of one size
+        size_t bytes = 0;           // a slot's
+        size_t hold = 0;            // the most experts its layers hold (a slot more would hold nothing)
+        size_t slots = 0;           // allocated
+        std::vector<int> free;      // its slots holding no expert
+        int head = -1, tail = -1;   // the others, in the policy's order (oldest first)
+        bool grow_ok = true;        // a new chunk allowed (the free RAM watch() last saw)
+    };
+    struct Lay {
+        int cls = -1;
+        size_t tr[3] = {0, 0, 0};   // matrix r's region in a slot
+    };
+    struct Chunk {
+        uint8_t* p = nullptr;
+        size_t bytes = 0, first = 0;   // (its slots: first up to the next chunk's)
+    };
 
-    void link_back(int s) {
+    void link_back(int s) {   // (its class's order)
         Slot& sp = slots_[(size_t) s];
-        sp.prev = tail_;
+        Class& c = cls_[(size_t) sp.cls];
+        sp.prev = c.tail;
         sp.next = -1;
-        if (tail_ >= 0) slots_[(size_t) tail_].next = s;
-        else head_ = s;
-        tail_ = s;
+        if (c.tail >= 0) slots_[(size_t) c.tail].next = s;
+        else c.head = s;
+        c.tail = s;
     }
     void link_front(int s) {
         Slot& sp = slots_[(size_t) s];
-        sp.next = head_;
+        Class& c = cls_[(size_t) sp.cls];
+        sp.next = c.head;
         sp.prev = -1;
-        if (head_ >= 0) slots_[(size_t) head_].prev = s;
-        else tail_ = s;
-        head_ = s;
+        if (c.head >= 0) slots_[(size_t) c.head].prev = s;
+        else c.tail = s;
+        c.head = s;
     }
     void unlink(int s) {
         Slot& sp = slots_[(size_t) s];
+        Class& c = cls_[(size_t) sp.cls];
         if (sp.prev >= 0) slots_[(size_t) sp.prev].next = sp.next;
-        else if (head_ == s) head_ = sp.next;
+        else if (c.head == s) c.head = sp.next;
         if (sp.next >= 0) slots_[(size_t) sp.next].prev = sp.prev;
-        else if (tail_ == s) tail_ = sp.prev;
+        else if (c.tail == s) c.tail = sp.prev;
         sp.prev = sp.next = -1;
     }
     void ask(int layer, int e) {   // (lfu's heat)
         heat_[(size_t) layer][(size_t) e] += 1.0f;
         if (cfg_.policy == kLfu && cfg_.decay_every > 0 && ++asks_[(size_t) layer] % (uint64_t) cfg_.decay_every == 0)
             for (float& x : heat_[(size_t) layer]) x *= cfg_.decay;
+    }
+    size_t held_bytes_locked() const {   // (mu_ held)
+        size_t b = 0;
+        for (const Class& k : cls_) b += (k.slots - k.free.size()) * k.bytes;
+        return b;
     }
     // the slot empty again (its expert forgotten, its place in the order gone)
     void drop(int s) {
@@ -562,7 +648,8 @@ private:
         sp.pin = 0;
         sp.guess = false;
         sp.state = kFree;
-        free_.push_back(s);
+        ++sp.gen;
+        cls_[(size_t) sp.cls].free.push_back(s);
     }
     // a slot whose reads have all landed: read (whole) or empty again (a read failed)
     void settle(int s) {
@@ -617,7 +704,7 @@ private:
                 j.file = g.file[r];
                 j.off = g.off[r] + (uint64_t) e * g.stride[r];
                 j.len = g.bytes[r];
-                j.dst = sp.base + tr_[r];
+                j.dst = sp.base + lay_[(size_t) layer].tr[r];
                 j.guess = guess;
                 (guess ? guess_q_ : demand_q_).push_back(j);
             }
@@ -625,39 +712,65 @@ private:
         q_cv_.notify_all();
         counts_.bytes.fetch_add((int64_t) (g.bytes[0] + g.bytes[1] + g.bytes[2]), std::memory_order_relaxed);
     }
-    // a chunk more, while the budget and the free RAM allow (mu_ held)
-    bool grow() {
-        if (!grow_ok_ || nalloc_ >= nmax_) return false;
-        const size_t n = std::min(chunk_slots_, nmax_ - nalloc_), bytes = n * slot_bytes_;
+    // the room kept for the classes other than k that hold no slots: their first chunks (mu_ held)
+    size_t kept_for(int k) const {
+        size_t b = 0;
+        for (size_t o = 0; o < cls_.size(); ++o)
+            if ((int) o != k && cls_[o].slots == 0) b += std::min(floor_, cls_[o].hold) * cls_[o].bytes;
+        return b;
+    }
+    // the slots a new chunk of class k takes: as many as the budget has left beside the room kept for the classes that
+    // hold none (each one's first chunk, at most its hold) - at most chunk_slots, and no more than it holds (mu_ held)
+    size_t chunk_n(int k) const {
+        const Class& c = cls_[(size_t) k];
+        const size_t kept = kept_for(k), unspent = cfg_.budget - alloc_;
+        return std::min({chunk_slots_, unspent > kept ? (unspent - kept) / c.bytes : 0, c.hold - c.slots});
+    }
+    // the free RAM a new chunk of class k (`bytes`) needs: grow_room beside it and the room kept for the classes that
+    // hold none - or, its first chunk, only `floor` beside it (mu_ held)
+    uint64_t ram_need(int k, size_t bytes) const {
+        const Class& c = cls_[(size_t) k];
+        return (uint64_t) bytes + (c.slots > 0 ? (uint64_t) cfg_.grow_room + kept_for(k) : (uint64_t) cfg_.floor);
+    }
+    // a chunk more for class k (chunk_n's slots) while the free RAM allows (ram_need) (mu_ held)
+    bool grow(int k) {
+        Class& c = cls_[(size_t) k];
+        if (!c.grow_ok) return false;
+        const size_t n = chunk_n(k), bytes = n * c.bytes;
+        if (n == 0) return false;
         const uint64_t av = cfg_.ram_avail ? cfg_.ram_avail() : ~uint64_t{0};
-        if (av != ~uint64_t{0} && av < (uint64_t) bytes + cfg_.grow_room) {
-            grow_ok_ = false;   // (until watch() sees the room)
+        if (av != ~uint64_t{0} && av < ram_need(k, bytes)) {
+            c.grow_ok = false;   // (until watch() sees the room)
             return false;
         }
         uint8_t* p = (uint8_t*) os::anon_alloc(bytes, -1, 1);
         if (p == nullptr) {
-            grow_ok_ = false;
+            c.grow_ok = false;
             return false;
         }
-        chunks_.push_back({p, bytes});
-        for (size_t i = n; i-- > 0;) {   // (the lowest first out of free_)
-            slots_[nalloc_ + i].base = p + i * slot_bytes_;
-            free_.push_back((int) (nalloc_ + i));
+        chunks_.push_back({p, bytes, nalloc_});
+        for (size_t i = n; i-- > 0;) {   // (the lowest first out of the free list)
+            Slot& sp = slots_[nalloc_ + i];
+            sp.base = p + i * c.bytes;
+            sp.cls = k;
+            c.free.push_back((int) (nalloc_ + i));
         }
         nalloc_ += n;
+        c.slots += n;
+        alloc_ += bytes;
         return true;
     }
-    // the slot to give up: the oldest unpinned read one (lru), or of those the lowest heat, the oldest of equals (lfu).
-    // -1: none - or a landed read failed on the way and freed its slot (mu_ held)
-    int victim() {
+    // the slot of class k to give up: its oldest unpinned read one (lru), or of those the lowest heat, the oldest of
+    // equals (lfu).  -1: none - or a landed read of the class failed on the way and freed its slot (mu_ held)
+    int victim(int k) {
         int best = -1;
         float bh = 0.0f;
-        for (int s = head_; s >= 0;) {
+        for (int s = cls_[(size_t) k].head; s >= 0;) {
             Slot& sp = slots_[(size_t) s];
             const int nx = sp.next;
             if (sp.state == kLoading) {
                 settle(s);
-                if (!free_.empty()) return -1;
+                if (!cls_[(size_t) k].free.empty()) return -1;
             }
             if (sp.state == kReady && sp.pin == 0) {
                 if (cfg_.policy == kLru) return s;
@@ -671,43 +784,51 @@ private:
         }
         return best;
     }
-    // a slot for a new expert: a free one, a new chunk's, or (evict) one given up (mu_ held); -1: none
-    int take_slot(bool evict) {
-        if (free_.empty()) grow();
-        if (free_.empty() && evict) {
-            const int v = victim();
+    // a slot for a new expert of `layer`: a free one of its class, a new chunk's, or (evict) one of its class given up
+    // (mu_ held); -1: none
+    int take_slot(int layer, bool evict) {
+        const int k = lay_[(size_t) layer].cls;
+        std::vector<int>& fr = cls_[(size_t) k].free;
+        if (fr.empty()) grow(k);
+        if (fr.empty() && evict) {
+            const int v = victim(k);
             if (v >= 0) {
                 if (slots_[(size_t) v].guess) counts_.guess_wasted.fetch_add(1, std::memory_order_relaxed);
                 counts_.evicted.fetch_add(1, std::memory_order_relaxed);
                 drop(v);
             }
         }
-        if (free_.empty()) return -1;
-        const int s = free_.back();
-        free_.pop_back();
+        if (fr.empty()) return -1;
+        const int s = fr.back();
+        fr.pop_back();
         return s;
     }
-    // up to `want` chunks given back from the end (mu_ held)
+    // chunks given back from the end until `want` bytes are (mu_ held); returns how many
     size_t shrink(size_t want) {
-        size_t done = 0;
-        while (done < want && !chunks_.empty()) {
-            const size_t c = chunks_.size() - 1, first = c * chunk_slots_;
+        size_t done = 0, gave = 0;
+        while (gave < want && !chunks_.empty()) {
+            const Chunk ch = chunks_.back();
             bool busy = false;
-            for (size_t i = first; i < nalloc_ && !busy; ++i) {
+            for (size_t i = ch.first; i < nalloc_ && !busy; ++i) {
                 settle((int) i);
                 busy = slots_[i].state == kLoading || slots_[i].pin > 0;
             }
             if (busy) break;
-            for (size_t i = first; i < nalloc_; ++i)
+            for (size_t i = ch.first; i < nalloc_; ++i)
                 if (slots_[i].state != kFree) {
                     counts_.evicted.fetch_add(1, std::memory_order_relaxed);
                     drop((int) i);
                 }
-            free_.erase(std::remove_if(free_.begin(), free_.end(), [&](int s) { return (size_t) s >= first; }), free_.end());
-            for (size_t i = first; i < nalloc_; ++i) slots_[i].base = nullptr;
-            os::anon_free(chunks_[c].first, chunks_[c].second);
+            Class& c = cls_[(size_t) slots_[ch.first].cls];
+            c.free.erase(std::remove_if(c.free.begin(), c.free.end(), [&](int s) { return (size_t) s >= ch.first; }),
+                         c.free.end());
+            c.slots -= nalloc_ - ch.first;
+            for (size_t i = ch.first; i < nalloc_; ++i) slots_[i].base = nullptr;
+            os::anon_free(ch.p, ch.bytes);
             chunks_.pop_back();
-            nalloc_ = first;
+            nalloc_ = ch.first;
+            alloc_ -= ch.bytes;
+            gave += ch.bytes;
             ++done;
             counts_.shrunk.fetch_add(1, std::memory_order_relaxed);
         }
@@ -781,16 +902,16 @@ private:
     Cfg cfg_;
     std::vector<Geo> geo_;
     Files files_;
-    size_t tr_[3] = {0, 0, 0};   // matrix r's region in a slot
-    size_t slot_bytes_ = 0, nmax_ = 0, nalloc_ = 0, chunk_slots_ = 1;
+    std::vector<Lay> lay_;      // [layer]: its class, its regions
+    std::vector<Class> cls_;
+    size_t least_ = 0;   // the smallest slot (of the classes that hold any)
+    size_t floor_ = 0;   // the room kept for a class that holds no slots: this many, at most its hold
+    size_t nmax_ = 0, nalloc_ = 0, alloc_ = 0, chunk_slots_ = 1;   // (alloc_: the chunks' bytes, at most the budget)
     std::unique_ptr<Slot[]> slots_;
-    std::vector<std::pair<uint8_t*, size_t>> chunks_;
-    std::vector<int> free_;
+    std::vector<Chunk> chunks_;   // (in the order allocated: their slots in that order too)
     std::vector<std::vector<int>> where_;   // [layer][e]: its slot, -1
     std::vector<std::vector<float>> heat_;
     std::vector<uint64_t> asks_;
-    int head_ = -1, tail_ = -1;
-    bool grow_ok_ = true;
     mutable std::mutex mu_;   // (the slots' bookkeeping; before q_mu_ when both)
     std::mutex q_mu_;
     std::condition_variable q_cv_;
