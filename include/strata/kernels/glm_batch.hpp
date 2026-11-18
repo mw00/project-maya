@@ -50,19 +50,23 @@ void kda_conv(const float* const proj[3], const float* const conv_w[3], const fl
               int T, int d_inner, int d_conv, cudaStream_t s);
 /// The history slides to the chunk's last d_conv - 1 inputs.
 void kda_conv_state(const float* const proj[3], float* conv_state, int T, int d_inner, int d_conv, cudaStream_t s);
+void kda_conv_checkpoint(const float* const proj[3], const float* conv_state, float* checkpoint,
+                         int after, int d_inner, int d_conv, cudaStream_t s);
 /// The gated delta recurrence over the chunk, per head with its state in registers: q/k l2-normalised,
 /// g1 = lb * sigmoid(-(g1_raw + dt_bias) * ssm_a[h]), beta = sigmoid(beta_raw), the output gate
 /// rms_norm(o) * norm_w * sigmoid(g2_raw) -> out16 (FP16, T x d_inner).  head_dim 128.
 void kda_rec(const float* q, const float* k, const float* v, const float* g1_raw, const float* dt_bias,
              const float* ssm_a, float lower_bound, const float* beta_raw, float* state, const float* g2_raw,
-             const float* norm_w, float eps, int n_head, int T, void* out16, cudaStream_t s);
+             const float* norm_w, float eps, int n_head, int T, void* out16, cudaStream_t s,
+             float* checkpoint = nullptr, int checkpoint_after = 0);
 /// The same in three parts: q/k's l2 norms and the decay over every (token, head) at once (in place: q, k and g1_raw
 /// become the normalised q, k and the decay), the recurrence with each head's value columns over kv_split blocks (a
 /// column's state, delta and output need only its column; the key dims are shared) - its raw output over v - and the
 /// output gate.  kv_split 4 or 8 (0: 4).  Equal to kda_rec up to float summation order.
 void kda_rec_split(float* q, float* k, float* v, float* g1_raw, const float* dt_bias, const float* ssm_a,
                    float lower_bound, const float* beta_raw, float* state, const float* g2_raw, const float* norm_w,
-                   float eps, int n_head, int T, void* out16, cudaStream_t s, int kv_split = 0);
+                   float eps, int n_head, int T, void* out16, cudaStream_t s, int kv_split = 0,
+                   float* checkpoint = nullptr, int checkpoint_after = 0);
 
 /// DSA after the first projections, per token t at position p0 + t: q_a norm (-> qr F32 + FP16), kv_a norm into the
 /// latent cache, the indexer key's layer norm and the compressor gate into their caches.
@@ -81,6 +85,9 @@ struct DsaPrepArgs {
     int ring = 1 << 30;   // the ik / ig caches hold positions modulo ring (a multiple of kpool)
     int p0 = 0, T = 0;
     float eps = 1e-5f;
+    float* checkpoint_ik = nullptr;
+    float* checkpoint_ig = nullptr;
+    int checkpoint_start = 0, checkpoint_end = 0, checkpoint_rows = 0;
 };
 void dsa_prep(const DsaPrepArgs& a, cudaStream_t s);
 /// The pooled keys of pools [pool0, pool0 + n) (their cells all in the caches, positions modulo ring).

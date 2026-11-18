@@ -55,7 +55,7 @@ from urllib.parse import parse_qs, unquote, urlsplit
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT))   # run as a script (run-<model>.bat) as well as a module
-from serve import ds4_vision, gpu_map, loop_guard, mm3_vision, model_api, model_pull, models, savings  # noqa: E402
+from serve import ds4_vision, gpu_map, loop_guard, mm3_vision, model_api, model_pull, models, savings, state_cache  # noqa: E402
 from serve import attach, mixed_gpus  # noqa: E402
 from serve import glm_link  # noqa: E402  GLM on an AMD APU + an NVIDIA card ("mixed_gpus")
 
@@ -1081,6 +1081,11 @@ class StrataEngine:
         lines = lines if lines is not None else self.lines
         for line in proc.stdout:
             if proc is not self.proc:                   # replaced: what is left of its output is nobody's
+                continue
+            if line.startswith("STATE "):
+                reading = state_cache.parse(line)
+                if reading:
+                    self.state_cache = reading
                 continue
             if line.startswith("VRAM "):
                 self._vram_line(line)
@@ -2430,9 +2435,16 @@ class Detokenizer:
     every generated id cost 2 ms per token after 8K tokens and 4 ms after 16K (perf-review F-1).  A tokenizer
     without `token_bytes` (the tests' byte tokenizer) keeps the re-decode."""
 
-    def __init__(self, tok):
+    def __init__(self, tok, prompt=()):
         self.tok, self.ids, self.sent = tok, [], 0
         self.inc = codecs.getincrementaldecoder("utf-8")(errors="replace") if hasattr(tok, "token_bytes") else None
+        context = list(prompt[-16:])
+        if self.inc is not None:
+            for token in context:
+                self.inc.decode(self.tok.token_bytes(token))
+        elif context:
+            self.ids = context
+            self.sent = len(self.tok.decode(context).rstrip("\ufffd"))
 
     def push(self, t: int) -> str:
         if self.inc is not None:
@@ -3499,6 +3511,7 @@ class Service:
         hw = dict(tel["now"])
         cards = hw.pop("vram", None)                      # (each card's processes: for the GPU map only)
         return {"engine": engine, "live": live, "tiers": tiers, "gpu_map": self._gpu_map(cards),
+                "state_cache": getattr(self.engine, "state_cache", None),
                 "requests": hist[::-1][:None if all_requests else 12],
                 "requests_kept": len(hist), "totals": totals, "loop_guard": guard, "hardware": hw,
                 "hardware_static":
@@ -3595,6 +3608,7 @@ class Service:
         rows += [(f"maya:engine_{k}", "counter" if k in self.PROM_STAT_COUNTERS else "gauge", h, stat[k])
                  for k, h in self.PROM_STAT.items()
                  if isinstance(stat.get(k), (int, float)) and not isinstance(stat.get(k), bool)]
+        rows += state_cache.metrics(getattr(self.engine, "state_cache", None) or {})
         for category, values in (("cache", self.responses.stats()), ("jobs", self.response_jobs.stats())):
             gauges = {"entries", "blocks", "bytes", "inflight_bytes", "peak_inflight_bytes", "max_entries",
                       "max_bytes", "ttl_s", "records", "running", "queued", "event_bytes", "readers"}
@@ -4436,7 +4450,13 @@ class Service:
         seg = {"prompt": ids, "ids": [], "next": None}   # this engine call's prompt and tokens; the next one's
         prefill = (sampling or {}).get("_prefill") or ""   # the call's opening, already in the prompt (prepare)
         pre_events = parser.feed(prefill) if prefill else []
-        detok, n, finish = Detokenizer(self.tok), 0, "length"
+        # a resumed answer: detokenized from the prompt's last tokens, so its first characters join them right
+        prime_suffix = os.environ.get("MAYA_GLM_STATE_CACHE") == "1"
+
+        def make_detokenizer(prompt):
+            return Detokenizer(self.tok, prompt if prime_suffix else ())
+
+        detok, n, finish = make_detokenizer(ids), 0, "length"
         reasoning_tokens = 0
         held = ""                                       # text that may be the start of a stop marker (stop_texts)
         # the client's own stop strings (OpenAI "stop", Anthropic "stop_sequences"): the answer ends before one.  They
@@ -4668,7 +4688,7 @@ class Service:
                             ids_k, thinks = think_resume
                             steer = self.tok.encode(loop_guard.keep_steer(think_restarts)) if thinks else []
                             seg["next"] = list(seg["prompt"]) + seg["ids"] + ids_k + steer
-                            parser, detok, held, said[:] = new_parser(thinks), Detokenizer(self.tok), "", []
+                            parser, detok, held, said[:] = new_parser(thinks), make_detokenizer(seg["next"]), "", []
                             in_think = thinks and bool(thinking) and self.think_end_id is not None
                             continue
                         # a marker the model wrote as its answer's text - quoted, in a code fence, a tool call's body - is
@@ -4696,7 +4716,7 @@ class Service:
                                 steer = self.tok.encode(loop_guard.keep_steer(kept)) if thinks else []
                                 seg["next"] = list(seg["prompt"]) + seg["ids"] + ids_k + steer
                                 sampling = loop_guard.block_sampling(sampling, kept)
-                                parser, detok, held, said[:] = new_parser(thinks), Detokenizer(self.tok), "", []
+                                parser, detok, held, said[:] = new_parser(thinks), make_detokenizer(seg["next"]), "", []
                                 in_think = thinks and bool(thinking) and self.think_end_id is not None
                                 continue
                             if key is None:
@@ -4712,7 +4732,7 @@ class Service:
                             steer = self.tok.encode(loop_guard.block_steer(rep, key[1], tries[key])) if thinks else []
                             seg["next"] = list(seg["prompt"]) + seg["ids"] + suffix + steer
                             sampling = loop_guard.block_sampling(sampling, tries[key])
-                            parser, detok, held, said[:] = new_parser(), Detokenizer(self.tok), "", []
+                            parser, detok, held, said[:] = new_parser(), make_detokenizer(seg["next"]), "", []
                             in_think = bool(thinking) and self.think_end_id is not None
                             continue
                         seg["ids"].append(t)
@@ -6898,7 +6918,7 @@ class Server(ThreadingHTTPServer):
 SERVER_ENV = ("MAYA_ENGINE_STALL_S", "MAYA_REQUEST_QUIET_S", "MAYA_DRAIN_S", "MAYA_HTTP_BACKLOG",
               "MAYA_MAX_BODY_MIB", "MAYA_FAIR_SLICE_S", "MAYA_DS4_KEEP_THINKING",
               "MAYA_SERVER_LOG", "MAYA_GLM_THINK_RESERVE", "MAYA_LOOP_GUARD", "MAYA_QUEUE_PING_S",
-              "MAYA_UPDATE_CHECK", "MAYA_PACK_TEMPLATE") + RESPONSE_ENV_KEYS + \
+              "MAYA_UPDATE_CHECK", "MAYA_PACK_TEMPLATE", "MAYA_GLM_STATE_CACHE") + RESPONSE_ENV_KEYS + \
     tuple(maya_names.read_as(k) for k in ("MAYA_DS4_RESTORE_POINTS", "MAYA_DS4_RESTORE_TAIL"))
 
 

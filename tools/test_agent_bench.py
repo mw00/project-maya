@@ -47,6 +47,17 @@ class PlanTest(unittest.TestCase):
 
 
 class TextsTest(unittest.TestCase):
+    def test_answer_fed_history_keeps_actual_completed_prefix(self):
+        p = ab.plan(2, 1, 300); texts = ab.Texts(p, CORPUS)
+        initial = ab.messages(texts, p, 0, 0, 0, answers={})
+        answer = 'actual model answer, including whitespace\n'
+        following = ab.messages(texts, p, 0, 1, 0, answers={0: answer})
+        self.assertEqual(following[:len(initial)], initial)
+        self.assertEqual(following[len(initial)], {'role': 'assistant', 'content': answer})
+        self.assertEqual(following[-1]['content'], texts.turn[0][1])
+        compact = ab.messages(texts, p, 0, 2, 1, start=2, answers={0: answer})
+        self.assertNotIn(answer, [m['content'] for m in compact])
+
     def test_texts_are_fixed_and_restarts_share_only_the_system_prompt(self):
         p = ab.plan(2, 3, 300)
         t1, t2 = ab.Texts(p, CORPUS), ab.Texts(p, CORPUS)

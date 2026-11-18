@@ -663,6 +663,28 @@ void x3_expert_rows(void* blas, cudaStream_t s, uint16_t* w16, int64_t w16_elems
 }  // namespace glmpf
 
 struct Glm5Model::PrefillState {
+    int checkpoint_slot = -1;
+    int64_t checkpoint_at = -1;
+    float* checkpoint_gpu = nullptr;
+    float* checkpoint_host = nullptr;
+    size_t checkpoint_run = 0, checkpoint_rec = 0, checkpoint_pool = 0;
+    std::vector<int> checkpoint_layers;
+    std::vector<uint8_t> checkpoint_written, checkpoint_pool_written;
+    void export_pool(int il, gb::DsaPrepArgs& args, bool nextn = false) {
+        if (checkpoint_at < 0 || checkpoint_pool == 0) return;
+        const auto found = std::find(checkpoint_layers.begin(), checkpoint_layers.end(), il);
+        if (found == checkpoint_layers.end()) return;
+        const size_t index = (size_t) (found - checkpoint_layers.begin());
+        const size_t rows = checkpoint_pool / checkpoint_layers.size() / 2;
+        args.checkpoint_ik = checkpoint_gpu + checkpoint_run + index * 2 * rows;
+        args.checkpoint_ig = args.checkpoint_ik + rows;
+        args.checkpoint_rows = (int) (rows / (size_t) args.idx_key);
+        const int64_t end = checkpoint_at - (nextn ? 1 : 0);
+        args.checkpoint_start = (int) end - (int) end % (args.checkpoint_rows + 1);
+        args.checkpoint_end = (int) end;
+        if (args.p0 <= end && (int64_t) args.p0 + args.T >= end)
+            checkpoint_pool_written[index] = 1;
+    }
     int T = 0;                       // tokens per chunk
     // --prefill: the chunk and its prestage slots for a lend cap (% of the pool's slots), the cap it was sized with,
     // whether the measured pinned share may still lower it (prefill_settle), and how it reads in the log
@@ -2088,6 +2110,8 @@ void Glm5Model::prefill_destroy() {
     cudaSetDevice(dev_);
     if (fast_ && fast_->cs) cudaStreamSynchronize(fast_->cs);
     if (fast_ && fast_->copy) cudaStreamSynchronize(fast_->copy);
+    if (S->checkpoint_gpu) cudaFree(S->checkpoint_gpu);
+    if (S->checkpoint_host) cudaFreeHost(S->checkpoint_host);
     if (S->prof && !S->pacc.empty()) {
         double tot = 0;
         for (auto& kv : S->pacc) tot += kv.second;
@@ -2159,6 +2183,86 @@ void Glm5Model::prefill_destroy() {
     if (S->h_bounds) cudaFreeHost(S->h_bounds);
     delete S;
     pf_ = nullptr;
+}
+
+bool Glm5Model::prefill_export_prepare(int slot, int64_t at, std::string& err) {
+    ckpt_join();
+    size_t bytes = 0;
+    const char* limit = getenv("MAYA_GLM_STATE_STAGING_MB");
+    const double mb = limit ? std::atof(limit) : 256;
+    for (Glm5Model* m = this; m; m = m->split_next_.get()) {
+        if (!m->pf_ || !m->fast_ || m->g_.arch != GlmArch::Glm5Next || m->g_.kda_head_dim != 128 ||
+            slot < 0 || at <= m->pos_ || at > m->max_ctx_) {
+            err = "state cache: exporter unavailable at " + std::to_string(at) +
+                  " (position " + std::to_string(m->pos_) + ", KDA head " + std::to_string(m->g_.kda_head_dim) +
+                  ", prefill " + std::to_string(bool(m->pf_)) + ")";
+            return false;
+        }
+        size_t count = 0;
+        for (int il = m->l0_; il < m->l1_; ++il) count += m->g_.is_recr(il);
+        bytes += ((count + 1) * (size_t) m->lay_.kda_run() + 2 * (size_t) m->lay_.snap_pool_floats()) * sizeof(float);
+    }
+    if (!std::isfinite(mb) || mb <= 0 || (double) bytes > mb * 1048576.) return false;
+    for (Glm5Model* m = this; m; m = m->split_next_.get()) {
+        PrefillState* S = m->pf_;
+        S->checkpoint_at = -1;
+        cudaSetDevice(m->dev_);
+        size_t count = 0;
+        for (int il = m->l0_; il < m->l1_; ++il) count += m->g_.is_recr(il);
+        S->checkpoint_run = (size_t) m->lay_.kda_run();
+        S->checkpoint_rec = count * S->checkpoint_run;
+        S->checkpoint_pool = (size_t) m->lay_.snap_pool_floats();
+        const size_t host = S->checkpoint_rec + S->checkpoint_pool;
+        const size_t gpu = S->checkpoint_run + S->checkpoint_pool;
+        cudaError_t alloc = cudaSuccess;
+        if (!S->checkpoint_host && host) alloc = cudaMallocHost(&S->checkpoint_host, host * sizeof(float));
+        const bool host_failed = alloc != cudaSuccess;
+        if (alloc == cudaSuccess && !S->checkpoint_gpu && gpu) alloc = cudaMalloc(&S->checkpoint_gpu, gpu * sizeof(float));
+        if (alloc != cudaSuccess) {
+            err = std::string("state cache: ") + (host_failed ? "pinned host" : "GPU") +
+                  " export staging does not fit: " + cudaGetErrorString(alloc);
+            for (Glm5Model* x = this; x; x = x->split_next_.get()) x->pf_->checkpoint_at = -1;
+            cudaGetLastError(); cudaSetDevice(dev_); return false;
+        }
+        S->checkpoint_layers = m->dsa_layers();
+        S->checkpoint_written.assign((size_t) m->g_.n_layers, 0);
+        S->checkpoint_pool_written.assign(S->checkpoint_layers.size(), 0);
+        if (S->checkpoint_pool) {
+            m->ckpt_pool_copy(at, S->checkpoint_host + S->checkpoint_rec, false);
+            cudaMemcpyAsync(S->checkpoint_gpu + S->checkpoint_run, S->checkpoint_host + S->checkpoint_rec,
+                            S->checkpoint_pool * sizeof(float), cudaMemcpyHostToDevice, m->fast_->cs);
+        }
+        S->checkpoint_slot = slot;
+        S->checkpoint_at = at;
+    }
+    cudaSetDevice(dev_); return true;
+}
+
+bool Glm5Model::prefill_export_collect(int slot, int64_t at, std::string& err) {
+    for (Glm5Model* m = this; m; m = m->split_next_.get()) {
+        PrefillState* S = m->pf_;
+        if (!S || S->checkpoint_slot != slot || S->checkpoint_at != at || m->pos_ < at) return false;
+        for (int il = m->l0_; il < m->l1_; ++il)
+            if (m->g_.is_recr(il) && !S->checkpoint_written[(size_t) il]) return false;
+        for (uint8_t written : S->checkpoint_pool_written) if (!written) return false;
+    }
+    for (Glm5Model* m = this; m; m = m->split_next_.get()) {
+        PrefillState* S = m->pf_;
+        cudaSetDevice(m->dev_);
+        if (S->checkpoint_pool)
+            cudaMemcpyAsync(S->checkpoint_host + S->checkpoint_rec, S->checkpoint_gpu + S->checkpoint_run,
+                            S->checkpoint_pool * sizeof(float), cudaMemcpyDeviceToHost, m->fast_->cs);
+        if (cudaStreamSynchronize(m->fast_->cs) != cudaSuccess) {
+            err = "state cache: prefill export completion failed"; cudaSetDevice(dev_); return false;
+        }
+        if ((size_t) slot >= m->ckpt_buf_.size()) {
+            m->ckpt_buf_.resize((size_t) slot + 1); m->ckpt_pos_.resize((size_t) slot + 1, -1);
+        }
+        m->ckpt_buf_[(size_t) slot].assign(S->checkpoint_host, S->checkpoint_host + S->checkpoint_rec + S->checkpoint_pool);
+        m->ckpt_pos_[(size_t) slot] = at;
+        S->checkpoint_at = -1;
+    }
+    cudaSetDevice(dev_); return true;
 }
 
 // ---------------------------------------------------------------- one half's layers over a chunk
@@ -2952,6 +3056,12 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                 float* cv[3] = {B.conv[0], B.conv[1], B.conv[2]};
                 float* cst = state_ + kda_conv_[(size_t) il];
                 gb::kda_conv(pr, Ly.conv, cst, cv, tn, DI, g.d_conv, s);
+                const int checkpoint_after = (int) (S->checkpoint_at - p0 - t0);
+                const bool exporting = S->checkpoint_at >= 0 && checkpoint_after > 0 && checkpoint_after <= tn;
+                float* checkpoint = exporting ? S->checkpoint_gpu : nullptr;
+                if (exporting)
+                    gb::kda_conv_checkpoint(pr, cst, checkpoint + (size_t) g.n_head * 128 * 128,
+                                             checkpoint_after, DI, g.d_conv, s);
                 gb::kda_conv_state(pr, cst, tn, DI, g.d_conv, s);
                 sgemm_bf16(Ly.f_b, DI, HD, B.fa, HD, B.g1, DI, tn, 1.0f);
                 sgemm_bf16(Ly.g_b, DI, HD, B.ga, HD, B.g2, DI, tn, 1.0f);
@@ -2978,7 +3088,8 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                                     B.g2, Ly.ssm_norm, g.norm_eps, g.n_head, tn, ro, s);
                     }
                     gb::kda_rec_split(B.conv[0], B.conv[1], B.conv[2], B.g1, Ly.dt_bias, Ly.ssm_a, g.kda_lb, B.beta, Sl,
-                                      B.g2, Ly.ssm_norm, g.norm_eps, g.n_head, tn, B.out16, s, kda_split);
+                                      B.g2, Ly.ssm_norm, g.norm_eps, g.n_head, tn, B.out16, s, kda_split,
+                                      checkpoint, checkpoint_after);
                     if (rs != nullptr && ro != nullptr) {
                         std::vector<float> a1(sn), a2(sn);
                         std::vector<__half> o1(on), o2(on);
@@ -3001,7 +3112,14 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                     if (ro) cudaFree(ro);
                 } else {
                     gb::kda_rec(B.conv[0], B.conv[1], B.conv[2], B.g1, Ly.dt_bias, Ly.ssm_a, g.kda_lb, B.beta, Sl, B.g2,
-                                Ly.ssm_norm, g.norm_eps, g.n_head, tn, B.out16, s);
+                                Ly.ssm_norm, g.norm_eps, g.n_head, tn, B.out16, s, checkpoint, checkpoint_after);
+                }
+                if (exporting) {
+                    size_t rec = 0;
+                    for (int l = l0_; l < il; ++l) rec += g.is_recr(l);
+                    cudaMemcpyAsync(S->checkpoint_host + rec * S->checkpoint_run, checkpoint,
+                                    S->checkpoint_run * sizeof(float), cudaMemcpyDeviceToHost, s);
+                    S->checkpoint_written[(size_t) il] = 1;
                 }
                 S->mark("kda_rec", s);
                 if (!skip_output) hgemm_q(Ly.out, E, DI, B.out16, DI, mixer, E, tn, 0.0f);
@@ -3043,6 +3161,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                 d.p0 = pt;
                 d.T = tn;
                 d.eps = g.norm_eps;
+                S->export_pool(il, d);
                 gb::dsa_prep(d, s);
                 if (g_.arch == GlmArch::GlmDsa) glmd::f16_guard_rows(B.qr, g.q_lora, 0, 1, g.q_lora, tn, B.qr16, s);   // glm-dsa B15.1
                 // the pools completed inside this sub-batch: pool pi ends at position (pi + 1) * kpool - 1
@@ -4734,6 +4853,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                 d.ig_raw = ig + (size_t) t0 * g.idx_key;
                 d.p0 = (int) p0 + t0;
                 d.T = tn;
+                S->export_pool(mtp_il_, d, true);
                 gb::dsa_prep(d, s);
                 const int pool_lo = (int) ((p0 + t0 + kp) / kp - 1), pool_hi = (int) ((p0 + t0 + tn) / kp - 1);
                 if (pool_hi >= pool_lo)

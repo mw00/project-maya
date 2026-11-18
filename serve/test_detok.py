@@ -42,6 +42,33 @@ class OldDetokenizer:
         return delta
 
 
+class PromptSuffix(unittest.TestCase):
+    class ByteTokenizer:
+        def token_bytes(self, token):
+            return bytes([token])
+
+    def test_character_split_across_prompt_and_generation(self):
+        d = Detokenizer(self.ByteTokenizer(), list("prefix €".encode()[:-1]))
+        self.assertEqual(d.push("€".encode()[-1]), "€")
+        self.assertEqual(d.push(ord("!")), "!")
+
+    def test_prompt_is_not_emitted(self):
+        d = Detokenizer(self.ByteTokenizer(), list(b"earlier conversation\n"))
+        self.assertEqual("".join(d.push(t) for t in b"answer"), "answer")
+
+    def test_context_sensitive_fallback(self):
+        class Tokens:
+            def decode(self, ids):
+                return " ".join(chr(t) for t in ids)
+        d = Detokenizer(Tokens(), [ord("a")])
+        self.assertEqual(d.push(ord("b")), " b")
+        self.assertEqual(d.push(ord("c")), " c")
+
+    def test_no_context_preserves_generated_only_decode(self):
+        d = Detokenizer(self.ByteTokenizer())
+        self.assertEqual("".join(d.push(t) for t in "你好".encode()), "你好")
+
+
 @unittest.skipIf(find_tokenizer() is None, "no pack tokenizer here")
 class Detok(unittest.TestCase):
     @classmethod

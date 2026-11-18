@@ -1112,6 +1112,66 @@ void GlmDflash::reset(int64_t from) {
     cudaSetDevice(cur);
 }
 
+namespace {
+std::vector<statecache::MemoryRegion> dflash_regions(GlmDflash::Impl& m, const std::vector<int64_t>& positions) {
+    std::vector<statecache::MemoryRegion> regions;
+    const size_t row = size_t(m.n_kv)*kHeadDim;
+    for (int layer = 0; layer < m.n_layer; ++layer) {
+        for (int role = 0; role < 2; ++role) {
+            statecache::MemoryRegion region{"dflash/"+std::to_string(layer)+(role ? "/value" : "/key"), {}};
+            auto* base = (role ? m.Vr : m.Kr) + size_t(layer)*m.ring*row;
+            for (size_t slot = 0; slot < positions.size(); ++slot) if (positions[slot] >= 0)
+                region.segments.push_back({base+slot*row, row*sizeof(__half)});
+            regions.push_back(std::move(region));
+        }
+    }
+    return regions;
+}
+}
+
+bool GlmDflash::state_sources(int64_t n, const std::shared_ptr<statecache::MemoryTransfer>& transfer,
+                              std::vector<statecache::RegionSource>& out, std::string& error) {
+    auto& m = *d_;
+    int before = 0; cudaGetDevice(&before); cudaSetDevice(m.dev);
+    bool ok = ck(cudaDeviceSynchronize(), "capture completion", error);
+    auto s = stream();
+    if (ok) ok = s && inject(std::max<int64_t>(0, n-m.ring), n, s, error) && ck(cudaDeviceSynchronize(), "capture injection", error);
+    if (ok) {
+        auto positions = m.kv_pos_h;
+        for (auto& p : positions) if (p < std::max<int64_t>(0, n-m.window) || p >= n) p = -1;
+        statecache::Bytes tags(positions.size()*sizeof(int64_t));
+        std::memcpy(tags.data(), positions.data(), tags.size());
+        out.push_back(statecache::bytes_source("dflash/positions", std::move(tags)));
+        ok = statecache::memory_sources(dflash_regions(m, positions), m.dev, transfer, out, error);
+    }
+    cudaSetDevice(before); return ok;
+}
+
+bool GlmDflash::state_targets(int64_t n, statecache::StateCache& cache, const statecache::StateCache::Lease& lease,
+                              const std::shared_ptr<statecache::MemoryTransfer>& transfer,
+                              std::vector<statecache::RegionTarget>& out, std::string& error) {
+    auto& m = *d_;
+    statecache::Bytes tags;
+    const size_t size = size_t(m.ring)*sizeof(int64_t);
+    if (!cache.read_region(lease, "dflash/positions", tags, error, size) || tags.size() != size) return false;
+    std::vector<int64_t> positions(size_t(m.ring), -1);
+    std::memcpy(positions.data(), tags.data(), size);
+    for (size_t slot = 0; slot < positions.size(); ++slot) {
+        const auto p = positions[slot];
+        if (p != -1 && (p < std::max<int64_t>(0, n-m.window) || p >= n || size_t(p%m.ring) != slot)) {
+            error = "invalid DFlash recovery position"; return false;
+        }
+    }
+    reset();
+    out.push_back(statecache::check_region("dflash/positions", std::move(tags)));
+    if (!statecache::memory_targets(dflash_regions(m, positions), m.dev, transfer, out, error)) return false;
+    int before = 0; cudaGetDevice(&before); cudaSetDevice(m.dev);
+    const bool ok = ck(cudaMemcpy(m.kv_pos, positions.data(), size, cudaMemcpyHostToDevice), "restore positions", error) &&
+                    ck(cudaDeviceSynchronize(), "restore positions completion", error);
+    if (ok) { m.kv_pos_h = std::move(positions); m.inj_pending = false; m.pend_n = 0; }
+    cudaSetDevice(before); return ok;
+}
+
 // The float rows a GEMV of these weights reads besides the q8_1 ones: F32 / BF16 weights read the floats (gf::MvJob's
 // xf), the quantized types only the q8_1 (xf stays nullptr there).  The drafter's GEMVs gave none, so a BF16 drafter
 // (the published GLM-5.3-Flash-DFlash2-bf16.gguf) read from address 0 at its first draft (issue #173).

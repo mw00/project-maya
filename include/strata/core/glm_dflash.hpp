@@ -12,6 +12,7 @@
 #pragma once
 
 #include <cuda_runtime.h>
+#include "strata/core/state_io.hpp"
 
 #include <cstdint>
 #include <cstdlib>
@@ -89,6 +90,11 @@ public:
     /// Forget every cached position at or past `from` (0: a new sequence, or a state loaded from elsewhere; else the
     /// sequence went back to `from` and the positions after it will hold other tokens).
     void reset(int64_t from = 0);
+    bool state_sources(int64_t n, const std::shared_ptr<statecache::MemoryTransfer>& transfer,
+                       std::vector<statecache::RegionSource>& out, std::string& error);
+    bool state_targets(int64_t n, statecache::StateCache& cache, const statecache::StateCache::Lease& lease,
+                       const std::shared_ptr<statecache::MemoryTransfer>& transfer,
+                       std::vector<statecache::RegionTarget>& out, std::string& error);
     /// The last draft's mask rows (tests): their final normed hidden states (n x hidden), their candidates and logits
     /// (n x top_k), the walk's picks and confidences (n).
     bool last_rows(int n, std::vector<float>& hidden, std::vector<int>& cand, std::vector<float>& logit,

@@ -22,6 +22,7 @@
 #include "strata/core/expert_cache.hpp"
 #include "strata/core/glm_helper_link.hpp"
 #include "strata/core/glm_model.hpp"
+#include "strata/core/state_io.hpp"
 #include "strata/core/glm_dsa_split.hpp"   // glm-dsa B6.3
 #include "strata/core/glm_dsa_spec.hpp"   // glm-dsa B11.2 / B11.3
 #include "strata/core/glm_ngram_draft.hpp"   // glm-dsa B14.13
@@ -8717,8 +8718,9 @@ void Glm5Model::snap_pool_copy(bool restore) {
         snap_pool_ = nullptr;
         return;
     }
-    const int64_t at = (int64_t) g.idx_key * ((snap_pos_ - snap_pos_ % g.idx_kpool) % ik_ring_);
     for (size_t i = 0; i < ls.size(); ++i) {
+        const int64_t end = !lay_.glm_dsa() && ls[i] == mtp_il_ ? std::max<int64_t>(0, snap_pos_-1) : snap_pos_;
+        const int64_t at = int64_t(g.idx_key)*((end-end%g.idx_kpool)%ik_ring_);
         float* ring[2] = {state_ + dsa_ik_[(size_t) ls[i]] + at, state_ + dsa_ig_[(size_t) ls[i]] + at};
         for (int c = 0; c < 2; ++c) {
             float* keep = snap_pool_ + (i * 2 + (size_t) c) * rows;
@@ -8750,6 +8752,14 @@ bool Glm5Model::snapshot_save() {
                 cudaMemcpyAsync(m->snap_ + (size_t) k++ * run, m->state_ + m->kda_S_[(size_t) il], run * sizeof(float),
                                 cudaMemcpyDeviceToDevice, m->fast_->cs);
         m->snap_pos_ = pos_;
+        m->snap_hidden_.clear();
+        if (pos_ > 0 && !m->lay_.glm_dsa() && m->mtp_il_ >= 0 && m->mtp_hx_pos_ == pos_-1) {
+            m->snap_hidden_.resize(size_t(g.n_embd));
+            if (cudaMemcpyAsync(m->snap_hidden_.data(), m->fast_->head_x, size_t(g.n_embd)*sizeof(float),
+                                cudaMemcpyDeviceToHost, m->fast_->cs) != cudaSuccess) {
+                m->snap_hidden_.clear(); cudaSetDevice(dev_); return false;
+            }
+        }
         m->mtp_carry_snapshot(false);   // glm-dsa B15.3: the NextN carrier's copy
         m->snap_pool_copy(false);
         cudaStreamSynchronize(m->fast_->cs);
@@ -8778,7 +8788,14 @@ bool Glm5Model::snapshot_restore() {
         m->mtp_carry_snapshot(true);   // glm-dsa B15.3: the NextN carrier's copy
         cudaStreamSynchronize(m->fast_->cs);
         m->pos_ = m->snap_pos_;
-        m->mtp_hx_pos_ = -1;   // (head_x is the continuation's, not the snapshot's)
+        m->mtp_hx_pos_ = -1;
+        if (m->snap_hidden_.size() == size_t(g.n_embd)) {
+            if (cudaMemcpyAsync(m->fast_->head_x, m->snap_hidden_.data(), size_t(g.n_embd)*sizeof(float), cudaMemcpyHostToDevice, m->fast_->cs) != cudaSuccess ||
+                cudaStreamSynchronize(m->fast_->cs) != cudaSuccess) {
+                cudaSetDevice(dev_); return false;
+            }
+            m->mtp_hx_pos_ = m->snap_pos_-1;
+        }
     }
     // the drafter's positions from here on belong to the previous continuation
     if (cap_d_ != nullptr) cap_d_->reset(pos_);
@@ -8796,8 +8813,9 @@ void Glm5Model::ckpt_pool_copy(int64_t pos, float* host, bool restore) {
     const std::vector<int> ls = dsa_layers();
     const int64_t rows = (int64_t) (g.idx_kpool - 1) * g.idx_key;   // floats per cache
     if (ls.empty() || rows <= 0 || ik_ring_ <= 0) return;
-    const int64_t at = (int64_t) g.idx_key * ((pos - pos % g.idx_kpool) % ik_ring_);
     for (size_t i = 0; i < ls.size(); ++i) {
+        const int64_t end = !lay_.glm_dsa() && ls[i] == mtp_il_ ? std::max<int64_t>(0, pos-1) : pos;
+        const int64_t at = int64_t(g.idx_key)*((end-end%g.idx_kpool)%ik_ring_);
         float* ring[2] = {state_ + dsa_ik_[(size_t) ls[i]] + at, state_ + dsa_ig_[(size_t) ls[i]] + at};
         for (int c = 0; c < 2; ++c) {
             float* keep = host + (i * 2 + (size_t) c) * rows;
@@ -8899,6 +8917,10 @@ bool Glm5Model::ckpt_save_at(int slot, int64_t at, std::string& err) {
             err = "checkpoint: needs the fast path";
             return false;
         }
+    if (at >= 0 && !ckpt_positional()) {
+        if (prefill_export_collect(slot, at, err)) return true;
+        if (at == pos_) at = -1;
+    }
     if (at >= 0 && (at > pos_ || !ckpt_positional())) {
         err = "checkpoint: no state at position " + std::to_string(at) + " (now " + std::to_string(pos_) + ")";
         return false;
@@ -8993,7 +9015,7 @@ std::vector<std::pair<float*, int64_t>> slot_dsa_runs(const GlmStateLayout& lay,
                                                       int mtp_il, float* state, const std::vector<uint8_t*>* kv_host,
                                                       const std::vector<int64_t>& lat, const std::vector<int64_t>& ik,
                                                       const std::vector<int64_t>& ig, const std::vector<int64_t>& pool,
-                                                      int64_t n, const Glm5Model::KvStream* kv = nullptr) {
+                                                      int64_t n, const Glm5Model::KvStream* kv = nullptr, bool written_only = false) {
     std::vector<std::pair<float*, int64_t>> r;
     if (lay.glm_dsa()) {   // glm-dsa B4.1 / B4.2: the descriptor's runs (MAYALST3); L1-6: streamed ones in the host copy
         for (const auto& [off, floats] : lay.slot_runs(n)) r.push_back({dsa_run_ptr(lay, kv, state, off), floats});
@@ -9003,10 +9025,11 @@ std::vector<std::pair<float*, int64_t>> slot_dsa_runs(const GlmStateLayout& lay,
     const int64_t lat_pp = lat_q8      ? (int64_t) gf::lat8_rec_bytes(g.kv_lora) / 4
                            : fast_mode ? g.kv_lora / 2
                                        : g.kv_lora;
-    const int64_t pools = (n + g.idx_kpool - 1) / g.idx_kpool;
     const auto dsa = [&](size_t il) {
+        const int64_t end = written_only && int(il) == mtp_il ? std::max<int64_t>(0, n-1) : n;
+        const int64_t pools = written_only ? end/g.idx_kpool : (end+g.idx_kpool-1)/g.idx_kpool;
         const bool host = kv_host != nullptr && (*kv_host)[il] != nullptr;
-        r.push_back({host ? (float*) (*kv_host)[il] : state + lat[il], n * lat_pp});
+        r.push_back({host ? (float*) (*kv_host)[il] : state + lat[il], end * lat_pp});
         r.push_back({state + pool[il], pools * g.idx_key});   // (ik / ig: the open pool's rows, in snap_pool_)
         (void) ik;
         (void) ig;
@@ -9017,6 +9040,173 @@ std::vector<std::pair<float*, int64_t>> slot_dsa_runs(const GlmStateLayout& lay,
     return r;
 }
 }  // namespace
+
+bool Glm5Model::state_sources(const statecache::Prefix& prefix, int checkpoint,
+                              std::vector<statecache::RegionSource>& sources, std::string& err) {
+    ckpt_join(); sources.clear();
+    int caller = dev_;
+    cudaGetDevice(&caller);   // (restored on return: a publish can run between decode steps)
+    const int64_t n = int64_t(prefix.tokens.size());
+    if (n <= 0) { err = "state cache: empty GLM prefix"; return false; }
+    const auto fp = state_fp();
+    std::vector<int64_t> layout(fp.begin(), fp.end());
+    for (Glm5Model* m = this; m; m = m->split_next_.get()) {
+        layout.push_back(m->l0_); layout.push_back(m->l1_); layout.push_back(m->mtp_il_);
+    }
+    statecache::Bytes identity(layout.size()*sizeof(int64_t));
+    std::memcpy(identity.data(), layout.data(), identity.size());
+    sources.push_back(statecache::bytes_source("layout", std::move(identity)));
+    auto transfer = statecache::memory_transfer();
+    size_t half = 0;
+    for (Glm5Model* m = this; m; m = m->split_next_.get(), ++half) {
+        if (!m->fast_ || n > m->max_ctx_ ||
+            (checkpoint < 0 ? m->snap_pos_ != n
+                            : size_t(checkpoint) >= m->ckpt_pos_.size() || m->ckpt_pos_[size_t(checkpoint)] != n)) {
+            err = "state cache: GLM checkpoint is not materialized at the requested position";
+            cudaSetDevice(caller); return false;
+        }
+        cudaSetDevice(m->dev_);
+        if (cudaStreamSynchronize(m->fast_->cs) != cudaSuccess) {
+            err = "state cache: GLM capture stream failed"; cudaSetDevice(caller); return false;
+        }
+        const auto& g = m->g_;
+        const size_t run = size_t(m->lay_.kda_run());
+        size_t recurrent = 0;
+        for (int il = m->l0_; il < m->l1_; ++il) recurrent += g.is_recr(il);
+        const size_t pool_bytes = size_t(m->lay_.snap_pool_floats())*sizeof(float);
+        const float* saved = checkpoint < 0 ? m->snap_ : m->ckpt_buf_[size_t(checkpoint)].data();
+        const float* pool = checkpoint < 0 ? m->snap_pool_ : (saved ? saved+recurrent*run : nullptr);
+        const std::string base = "part-" + std::to_string(half) + "/";
+        statecache::Bytes hidden(checkpoint < 0 ? m->snap_hidden_.size()*sizeof(float) : 0);
+        if (!hidden.empty()) std::memcpy(hidden.data(), m->snap_hidden_.data(), hidden.size());
+        sources.push_back(statecache::bytes_source(base+"nextn-hidden", std::move(hidden)));
+        std::vector<statecache::MemoryRegion> memory{
+            {base+"recurrent", {{const_cast<float*>(saved), recurrent*run*sizeof(float)}}},
+            {base+"open-pool", {{const_cast<float*>(pool), pool_bytes}}}};
+        if (!statecache::memory_sources(memory, m->dev_, transfer, sources, err)) { cudaSetDevice(caller); return false; }
+        if (pool_bytes && !m->lay_.glm_dsa()) {
+            auto read = sources.back().read;
+            const size_t rows = size_t(g.idx_kpool-1)*g.idx_key;
+            const size_t valid = size_t(n%g.idx_kpool)*g.idx_key;
+            const size_t nextn_valid = size_t(std::max<int64_t>(0, n-1)%g.idx_kpool)*g.idx_key;
+            const bool nextn = m->mtp_il_ >= 0;
+            sources.back().host = nullptr;   // (the rows past the open pool's end are zeroed on every read)
+            sources.back().read = [read, rows, valid, nextn_valid, nextn](uint64_t at, uint8_t* dst, size_t count, std::string& error) {
+                if (!read(at, dst, count, error)) return false;
+                for (size_t i = 0; i < count; ++i) {
+                    const size_t f = size_t((at+i)/sizeof(float));
+                    if (f%rows >= (nextn && f/rows < 2 ? nextn_valid : valid)) dst[i] = 0;
+                }
+                return true;
+            };
+        }
+        const auto runs = slot_dsa_runs(m->lay_, g, m->fast_mode_, m->lat_q8_, m->l0_, m->l1_, m->mtp_il_, m->state_,
+            m->kv_ ? &m->kv_->host : nullptr, m->dsa_lat_, m->dsa_ik_, m->dsa_ig_, m->dsa_pool_, n, m->kv_, true);
+        memory.clear();
+        for (size_t i = 0; i < runs.size(); ++i)
+            memory.push_back({base+"attention-"+std::to_string(i), {{runs[i].first, size_t(runs[i].second)*sizeof(float)}}, true});
+        if (!statecache::memory_sources(memory, m->dev_, transfer, sources, err)) { cudaSetDevice(caller); return false; }
+    }
+    cudaSetDevice(dev_);   // (the NextN carrier and the drafter run on the chain's first device)
+    struct Restore { int device; ~Restore() { cudaSetDevice(device); } } restore{caller};
+    std::ostringstream carrier(std::ios::binary);
+    if (checkpoint < 0 && lay_.glm_dsa() && !mtp_slot_put(carrier, err)) return false;
+    const auto bytes = carrier.str();
+    sources.push_back(statecache::bytes_source("mtp-carrier", statecache::Bytes(bytes.begin(), bytes.end())));
+    if (cap_d_ && !cap_d_->state_sources(n, transfer, sources, err)) return false;
+    return true;
+}
+
+bool Glm5Model::state_capture(statecache::Capture& out, const statecache::Prefix& prefix, int checkpoint,
+                              std::string& err) {
+    out = {};
+    std::vector<statecache::RegionSource> sources;
+    if (!state_sources(prefix, checkpoint, sources, err)) return false;
+    uint64_t budget = statecache::Config::environment({}, "GLM").ram_bytes;
+    for (const auto& source : sources) {
+        if (source.bytes > budget) { err = "state cache: GLM capture exceeds host budget"; return false; }
+        budget -= source.bytes;
+    }
+    statecache::Capture result; result.prefix = prefix;
+    for (const auto& source : sources) {
+        statecache::Region region{source.name, statecache::Bytes(size_t(source.bytes))};
+        if (source.bytes && !source.read(0, region.bytes.data(), region.bytes.size(), err)) return false;
+        result.regions.push_back(std::move(region));
+    }
+    out = std::move(result); return true;
+}
+
+bool Glm5Model::state_load(statecache::StateCache& cache, const statecache::StateCache::Lease& lease, std::string& err) {
+    ckpt_join();
+    const int64_t n = int64_t(lease.tokens());
+    const auto fp = state_fp();
+    std::vector<int64_t> fingerprint(fp.begin(), fp.end());
+    for (Glm5Model* m = this; m; m = m->split_next_.get()) {
+        if (!m->fast_ || n <= 0 || n > m->max_ctx_) { err = "state cache: GLM state does not fit this sequence"; return false; }
+        fingerprint.push_back(m->l0_); fingerprint.push_back(m->l1_); fingerprint.push_back(m->mtp_il_);
+    }
+    statecache::Bytes expected(fingerprint.size()*sizeof(int64_t)), layout, carrier;
+    std::memcpy(expected.data(), fingerprint.data(), expected.size());
+    if (!cache.read_region(lease, "layout", layout, err, expected.size()) || layout != expected) {
+        if (err.empty()) err = "state cache: GLM layout fingerprint mismatch";
+        return false;
+    }
+    if (!cache.read_region(lease, "mtp-carrier", carrier, err, 16 << 20)) return false;
+    if (!snapshot_save()) { err = "state cache: GLM snapshot allocation failed"; return false; }
+    auto transfer = statecache::memory_transfer();
+    std::vector<statecache::RegionTarget> targets;
+    targets.push_back(statecache::check_region("layout", std::move(expected)));
+    targets.push_back(statecache::check_region("mtp-carrier", carrier));
+    size_t half = 0;
+    for (Glm5Model* m = this; m; m = m->split_next_.get(), ++half) {
+        size_t recurrent = 0;
+        for (int il = m->l0_; il < m->l1_; ++il) recurrent += m->g_.is_recr(il);
+        const std::string base = "part-" + std::to_string(half) + "/";
+        statecache::Bytes hidden;
+        if (!cache.read_region(lease, base+"nextn-hidden", hidden, err, size_t(m->g_.n_embd)*sizeof(float)) ||
+            (!hidden.empty() && (m->lay_.glm_dsa() || m->mtp_il_ < 0 || hidden.size() != size_t(m->g_.n_embd)*sizeof(float)))) {
+            if (err.empty()) err = "invalid GLM NextN endpoint row";
+            reset(); return false;
+        }
+        m->snap_hidden_.resize(hidden.size()/sizeof(float));
+        if (!hidden.empty()) std::memcpy(m->snap_hidden_.data(), hidden.data(), hidden.size());
+        targets.push_back(statecache::check_region(base+"nextn-hidden", std::move(hidden)));
+        std::vector<statecache::MemoryRegion> memory{
+            {base+"recurrent", {{m->snap_, recurrent*size_t(m->lay_.kda_run())*sizeof(float)}}},
+            {base+"open-pool", {{m->snap_pool_, size_t(m->lay_.snap_pool_floats())*sizeof(float)}}}};
+        const auto runs = slot_dsa_runs(m->lay_, m->g_, m->fast_mode_, m->lat_q8_, m->l0_, m->l1_, m->mtp_il_, m->state_,
+            m->kv_ ? &m->kv_->host : nullptr, m->dsa_lat_, m->dsa_ik_, m->dsa_ig_, m->dsa_pool_, n, m->kv_, true);
+        for (size_t i = 0; i < runs.size(); ++i)
+            memory.push_back({base+"attention-"+std::to_string(i), {{runs[i].first, size_t(runs[i].second)*sizeof(float)}}});
+        if (!statecache::memory_targets(memory, m->dev_, transfer, targets, err)) { reset(); return false; }
+    }
+    if (cap_d_ && !cap_d_->state_targets(n, cache, lease, transfer, targets, err)) { reset(); return false; }
+    if (!cache.restore(lease, targets, err)) { reset(); return false; }
+    for (Glm5Model* m = this; m; m = m->split_next_.get()) {
+        cudaSetDevice(m->dev_); m->snap_pos_ = n; m->mtp_carry_reset(); m->kv_stream_reset_maps();
+    }
+    if (!carrier.empty()) {
+        std::istringstream input(std::string(carrier.begin(), carrier.end()), std::ios::binary);
+        mtp_slot_get(input, n, true);
+    }
+    cudaSetDevice(dev_);
+    if (!snapshot_restore()) { err = "state cache: GLM restored snapshot invalid"; reset(); return false; }
+    return true;
+}
+
+bool Glm5Model::state_restore(const statecache::Prefix& prefix, const std::vector<statecache::Region>& regions,
+                              std::string& err) {
+    statecache::Config config; config.ram_bytes = 0; config.disk_bytes = 0; config.max_units = 1;
+    for (const auto& region : regions) {
+        if (region.bytes.size() > UINT64_MAX-config.ram_bytes) { err = "GLM owned state size overflow"; return false; }
+        config.ram_bytes += region.bytes.size();
+    }
+    statecache::StateCache cache(config);
+    statecache::Capture capture; capture.prefix = prefix; capture.regions = regions;
+    if (!cache.publish(std::move(capture), err)) return false;
+    auto lease = cache.find_resume(prefix, false);
+    return lease && state_load(cache, lease, err);
+}
 
 uint64_t Glm5Model::slot_save(const std::string& path, std::string& err) {
     std::vector<Glm5Model*> halves;

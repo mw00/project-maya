@@ -15,12 +15,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import glm_synth_gguf as S  # noqa: E402
 
 
-def build(seed: int = 99):
-    g = S.BIG
+def build(seed: int = 99, native_small: bool = False, embd: int = 1024):
+    g = dict(S.BIG, n_embd=embd) if native_small else S.BIG
     e, v = g["n_embd"], g["n_vocab"]
     n_layer, n_head, n_head_kv, hd, ff = 2, 2, 1, 128, 512
     taps, group, rank, top_k, block, window = 2, 16, 32, 8, 8, 64
-    targets = [3, 15, 30, 44]
+    targets = [0, 1] if native_small else [3, 15, 30, 44]
     rng = np.random.default_rng(seed)
 
     def w(*shape, scale=0.05):
@@ -87,8 +87,10 @@ def build(seed: int = 99):
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--out", required=True)
+    ap.add_argument("--native-small", action="store_true", help="fit tools/glm_state_fixture.py")
+    ap.add_argument("--embd", type=int, default=1024, choices=[512, 1024], help="native target embedding width")
     a = ap.parse_args()
-    md, ts = build()
+    md, ts = build(native_small=a.native_small, embd=a.embd)
     S.write_gguf(Path(a.out), md, ts)
     print(f"wrote {a.out} ({Path(a.out).stat().st_size / 1e6:.1f} MB)")
     return 0

@@ -286,17 +286,18 @@ __global__ void __launch_bounds__(256) kda_conv_kernel(Ptr3 proj, Ptr3 w, const 
     }
 }
 
-__global__ void kda_conv_state_kernel(Ptr3 proj, float* __restrict__ conv_state, int T, int DI, int dconv) {
+__global__ void kda_conv_state_kernel(Ptr3 proj, const float* conv_state, float* checkpoint, int T, int DI, int dconv) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= 3 * DI) return;
     const int role = i / DI, c = i - role * DI;
     const int hist = dconv - 1;
-    float* st = conv_state + (size_t) role * DI * hist + (size_t) hist * c;
+    const float* st = conv_state + (size_t) role * DI * hist + (size_t) hist * c;
+    float* dst = checkpoint + (size_t) role * DI * hist + (size_t) hist * c;
     float old[8];
     for (int j = 0; j < hist && j < 8; ++j) old[j] = st[j];
     for (int j = 0; j < hist && j < 8; ++j) {
         const int tt = T - hist + j;
-        st[j] = tt >= 0 ? proj.p[role][(size_t) tt * DI + c] : old[hist + tt];
+        dst[j] = tt >= 0 ? proj.p[role][(size_t) tt * DI + c] : old[hist + tt];
     }
 }
 
@@ -306,7 +307,7 @@ __global__ void __launch_bounds__(256) kda_rec_kernel(const float* __restrict__ 
                                                       float lb, const float* __restrict__ beta_raw,
                                                       float* __restrict__ state, const float* __restrict__ g2_raw,
                                                       const float* __restrict__ norm_w, float eps, int n_head, int T,
-                                                      __half* __restrict__ out) {
+                                                      __half* __restrict__ out, float* checkpoint, int checkpoint_after) {
     constexpr int HD = 128;
     const int h = blockIdx.x, t = threadIdx.x, j = t & (HD - 1), half = t >> 7;
     const int DI = n_head * HD;
@@ -368,6 +369,9 @@ __global__ void __launch_bounds__(256) kda_rec_kernel(const float* __restrict__ 
         ss = block_sum(ss, sred);
         const float inv = rsqrtf(ss / (float) HD + eps);
         if (half == 0) out[base + j] = __float2half(o * inv * nw * dsigmoid(g2));
+        if (checkpoint && tok + 1 == checkpoint_after)
+            for (int ii = 0; ii < 64; ++ii)
+                checkpoint[(size_t) h * HD * HD + (half * 64 + ii) * HD + j] = reg[ii];
     }
 #pragma unroll
     for (int ii = 0; ii < 64; ++ii) Sh[(half * 64 + ii) * HD + j] = reg[ii];
@@ -394,7 +398,8 @@ template <int KJ>
 __global__ void __launch_bounds__(256) kda_rec_split_kernel(const float* __restrict__ qn, const float* __restrict__ kn,
                                                             float* v, const float* __restrict__ dec,
                                                             const float* __restrict__ beta_raw,
-                                                            float* __restrict__ state, int n_head, int T) {
+                                                            float* __restrict__ state, int n_head, int T,
+                                                            float* checkpoint, int checkpoint_after) {
     constexpr int HD = 128, NG = 256 / KJ, IPT = HD / NG;   // NG groups of IPT key dims, a thread a column of each
     const int h = blockIdx.x, t = threadIdx.x, jj = t % KJ, gi = t / KJ;
     const int j = blockIdx.y * KJ + jj;
@@ -457,6 +462,9 @@ __global__ void __launch_bounds__(256) kda_rec_split_kernel(const float* __restr
             for (int g = 0; g < NG; ++g) Ot += sO[g][jj];
             v[base + j] = Ot;
         }
+        if (checkpoint && tok + 1 == checkpoint_after)
+            for (int ii = 0; ii < IPT; ++ii)
+                checkpoint[(size_t) h * HD * HD + (gi * IPT + ii) * HD + j] = reg[ii];
     }
 #pragma unroll
     for (int ii = 0; ii < IPT; ++ii) Sh[(gi * IPT + ii) * HD + j] = reg[ii];
@@ -535,8 +543,15 @@ __global__ void __launch_bounds__(512) dsa_prep_kernel(const DsaPrepArgs a) {
     const float mu = s1 / (float) K;
     const float inv = rsqrtf(s2 / (float) K - mu * mu + a.eps);
     if (tid < K) {
-        a.ik_cache[(size_t) K * (p % a.ring) + tid] = (v - mu) * inv * a.k_norm_w[tid] + a.k_norm_b[tid];
-        a.ig_cache[(size_t) K * (p % a.ring) + tid] = a.ig_raw[(size_t) t * K + tid];
+        const float key = (v - mu) * inv * a.k_norm_w[tid] + a.k_norm_b[tid];
+        const float gate = a.ig_raw[(size_t) t * K + tid];
+        a.ik_cache[(size_t) K * (p % a.ring) + tid] = key;
+        a.ig_cache[(size_t) K * (p % a.ring) + tid] = gate;
+        const int row = (p % a.ring - a.checkpoint_start % a.ring + a.ring) % a.ring;
+        if (a.checkpoint_ik && p < a.checkpoint_end && row < a.checkpoint_rows) {
+            a.checkpoint_ik[(size_t) row * K + tid] = key;
+            a.checkpoint_ig[(size_t) row * K + tid] = gate;
+        }
     }
 }
 
@@ -2283,29 +2298,39 @@ void kda_conv(const float* const proj[3], const float* const conv_w[3], const fl
 void kda_conv_state(const float* const proj[3], float* conv_state, int T, int d_inner, int d_conv, cudaStream_t s) {
     if (T <= 0) return;
     Ptr3 p{{proj[0], proj[1], proj[2]}};
-    kda_conv_state_kernel<<<nblk(3 * (int64_t) d_inner), 256, 0, s>>>(p, conv_state, T, d_inner, d_conv);
+    kda_conv_state_kernel<<<nblk(3 * (int64_t) d_inner), 256, 0, s>>>(p, conv_state, conv_state, T, d_inner, d_conv);
     check("kda_conv_state");
+}
+
+void kda_conv_checkpoint(const float* const proj[3], const float* conv_state, float* checkpoint,
+                         int after, int d_inner, int d_conv, cudaStream_t s) {
+    if (!checkpoint || after < 0) return;
+    Ptr3 p{{proj[0], proj[1], proj[2]}};
+    kda_conv_state_kernel<<<nblk(3 * (int64_t) d_inner), 256, 0, s>>>(p, conv_state, checkpoint, after, d_inner, d_conv);
+    check("kda_conv_checkpoint");
 }
 
 void kda_rec(const float* q, const float* k, const float* v, const float* g1_raw, const float* dt_bias,
              const float* ssm_a, float lower_bound, const float* beta_raw, float* state, const float* g2_raw,
-             const float* norm_w, float eps, int n_head, int T, void* out16, cudaStream_t s) {
+             const float* norm_w, float eps, int n_head, int T, void* out16, cudaStream_t s,
+             float* checkpoint, int checkpoint_after) {
     if (T <= 0) return;
     kda_rec_kernel<<<n_head, 256, 0, s>>>(q, k, v, g1_raw, dt_bias, ssm_a, lower_bound, beta_raw, state, g2_raw,
-                                          norm_w, eps, n_head, T, (__half*) out16);
+                                          norm_w, eps, n_head, T, (__half*) out16, checkpoint, checkpoint_after);
     check("kda_rec");
 }
 
 void kda_rec_split(float* q, float* k, float* v, float* g1_raw, const float* dt_bias, const float* ssm_a,
                    float lower_bound, const float* beta_raw, float* state, const float* g2_raw, const float* norm_w,
-                   float eps, int n_head, int T, void* out16, cudaStream_t s, int kv_split) {
+                   float eps, int n_head, int T, void* out16, cudaStream_t s, int kv_split,
+                   float* checkpoint, int checkpoint_after) {
     if (T <= 0) return;
     kda_prep_kernel<<<dim3((unsigned) T, (unsigned) n_head), 128, 0, s>>>(q, k, g1_raw, dt_bias, ssm_a, lower_bound,
                                                                          n_head);
     if (kv_split == 8)
-        kda_rec_split_kernel<16><<<dim3((unsigned) n_head, 8), 256, 0, s>>>(q, k, v, g1_raw, beta_raw, state, n_head, T);
+        kda_rec_split_kernel<16><<<dim3((unsigned) n_head, 8), 256, 0, s>>>(q, k, v, g1_raw, beta_raw, state, n_head, T, checkpoint, checkpoint_after);
     else
-        kda_rec_split_kernel<32><<<dim3((unsigned) n_head, 4), 256, 0, s>>>(q, k, v, g1_raw, beta_raw, state, n_head, T);
+        kda_rec_split_kernel<32><<<dim3((unsigned) n_head, 4), 256, 0, s>>>(q, k, v, g1_raw, beta_raw, state, n_head, T, checkpoint, checkpoint_after);
     kda_out_kernel<<<dim3((unsigned) T, (unsigned) n_head), 128, 0, s>>>(v, g2_raw, norm_w, eps, n_head, (__half*) out16);
     check("kda_rec_split");
 }

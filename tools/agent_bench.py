@@ -19,8 +19,9 @@ two machines - send exactly the same requests:
   nothing reusable past the system prompt, as after an agent restart;
 - a conversation that outgrows --max-context starts a new one from its latest turn, as an agent compacts.
 
-The texts are slices of this repository's files (--corpus: another folder). The model's answers are not fed back:
-the next turn sends the scripted history, so every run sends the same prompts whatever the model wrote. Requests are
+The texts are slices of this repository's files (--corpus: another folder). By default the next turn sends scripted
+history, so every run sends the same prompts. With --answer-fed, each completed answer becomes the assistant message
+of the next turn, exercising exact completed-answer frontiers. That mode depends on the model's output. Requests are
 greedy (temperature 0, thinking off) and ban the model's end tokens (--ban; `auto` knows GLM-5.3-Flash by the served
 model's name), so every request writes its whole max_tokens.
 
@@ -165,17 +166,17 @@ class Texts:
         self.restart = [f"(conversation {i + 1})\n" for i in range(len(p["bursts"]) + 64)]
 
 
-def messages(texts: Texts, p: dict, c: int, upto: int, restarts: int, start: int = 0) -> list:
+def messages(texts: Texts, p: dict, c: int, upto: int, restarts: int, start: int = 0,
+             answers: dict[int, str] | None = None) -> list:
     """Conversation c's request for turn `upto`: its system prompt, its first message (marked by how often it started
     over, so a restart shares nothing past the system prompt with the reads before), turns start..upto-1 with the
     scripted replies, then turn upto's new text.  (start > 0: compacted there.)"""
     m = [{"role": "system", "content": texts.sys[p["clients"][c]["sys"]]},
          {"role": "user", "content": texts.restart[min(restarts, len(texts.restart) - 1)] + texts.first[c]}]
-    for k in range(start, upto):
-        m.append({"role": "assistant", "content": texts.reply[c][k]})
+    for k in range(start, upto + 1):
+        reply = answers.get(k-1, texts.reply[c][k]) if answers is not None and k > start else texts.reply[c][k]
+        m.append({"role": "assistant", "content": reply})
         m.append({"role": "user", "content": texts.turn[c][k]})
-    m.append({"role": "assistant", "content": texts.reply[c][upto]})
-    m.append({"role": "user", "content": texts.turn[c][upto]})
     return m
 
 
@@ -338,7 +339,7 @@ def stream_request(base: str, body: dict, timeout: float, key: str | None, t0: f
         headers["Authorization"] = f"Bearer {key}"
     req = urllib.request.Request(base + "/v1/chat/completions", data=json.dumps(body).encode(), headers=headers)
     rec = {"t_send": time.time() - t0, "t_first": None}
-    usage, timings = {}, None
+    usage, timings, answer = {}, None, []
     with urllib.request.urlopen(req, timeout=timeout) as r:
         for raw in r:
             line = raw.decode("utf-8", errors="replace").strip()
@@ -353,11 +354,13 @@ def stream_request(base: str, body: dict, timeout: float, key: str | None, t0: f
                 continue
             for ch in c.get("choices") or []:
                 d = ch.get("delta") or {}
+                if isinstance(d.get("content"), str): answer.append(d["content"])
                 if rec["t_first"] is None and (d.get("content") or d.get("reasoning_content")):
                     rec["t_first"] = time.time() - t0
             usage = c.get("usage") or usage
             timings = c.get("timings") or timings
     rec["t_done"] = time.time() - t0
+    rec["answer"] = "".join(answer)
     rec["prompt_tokens"] = usage.get("prompt_tokens")
     rec["output_tokens"] = usage.get("completion_tokens")
     rec["cached"] = ((usage.get("prompt_tokens_details") or {}).get("cached_tokens") or
@@ -394,9 +397,11 @@ def run(a) -> int:
         rec.update({"kind": kind, "client": c})
         with lock:
             reqs.append(rec)
+        return rec
 
     def client(c):
         restarts, k, start = 0, 0, 0
+        answers = {} if a.answer_fed else None
         turns = p["clients"][c]["turns"]
         burst_at = [b["at"] for b in p["bursts"] if c in b["clients"]]
         while k < len(turns) and not stop.is_set():
@@ -408,12 +413,14 @@ def run(a) -> int:
                 burst_at.pop(0)
                 restarts += 1
                 kind = "cold"
-            msgs = messages(texts, p, c, k, restarts, start)
+            msgs = messages(texts, p, c, k, restarts, start, answers)
             if sum(len(m["content"]) for m in msgs) / CHARS_PER_TOKEN > max_context:
                 restarts, start = restarts + 1, k        # compacted: a new conversation from this turn
-                msgs = messages(texts, p, c, k, restarts, start)
+                msgs = messages(texts, p, c, k, restarts, start, answers)
                 kind = "compact"
-            post(msgs, turns[k]["max_tokens"], kind, c)
+            record = post(msgs, turns[k]["max_tokens"], kind, c)
+            if answers is not None and not record.get("error"):
+                answers[k] = record.get("answer", "")
             stop.wait(turns[k]["think"])
             k += 1
 
@@ -455,7 +462,7 @@ def run(a) -> int:
         done = sorted(reqs, key=lambda r: r["t_send"])
     summary = summarize(done, a.warmup, a.duration, server)
     out = {"label": a.label, "rep": a.rep, "seed": a.seed, "clients": a.clients, "duration": a.duration,
-           "warmup": a.warmup, "started": t0, "model": model, "max_context": max_context, "url": base,
+           "warmup": a.warmup, "answer_fed": a.answer_fed, "started": t0, "model": model, "max_context": max_context, "url": base,
            "summary": summary, "requests": done,
            "server_records": [r for r in records if (r.get("time") or 0) >= t0],
            "tiers": [[round(t, 1), n] for t, n in tiers]}
@@ -488,6 +495,7 @@ def main(argv=None) -> int:
     r.add_argument("--warmup", type=float, default=180, help="seconds left out of the summary (default 180)")
     r.add_argument("--poll", type=float, default=10, help="seconds between two reads of a Maya server's /metrics")
     r.add_argument("--timeout", type=float, default=3600)
+    r.add_argument("--answer-fed", action="store_true", help="feed real completed answers into each conversation's next turn")
     r.add_argument("--drain", type=float, default=120, help="seconds to wait for the answers in flight at the end")
     r.add_argument("--ban", default="auto", help="end tokens banned so every answer writes its max_tokens: auto "
                                                  "(known by the model's name: GLM), none, or token ids")

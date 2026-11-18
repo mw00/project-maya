@@ -207,6 +207,24 @@ function ContextCard({m}) {
   </section>`;
 }
 
+function ConversationCache({cache}) {
+  if (!cache) return null;
+  const errors = (cache.read_failures || 0) + (cache.write_failures || 0);
+  const values = [
+    ["Saved states", fmt(cache.units || 0)],
+    ["RAM", `${fmt((cache.ram_bytes || 0) / GIB, 2)} GB`],
+    ["SSD", `${fmt((cache.disk_bytes || 0) / GIB, 2)} GB`],
+    ["Prefix hits", fmt(cache.hits || 0)],
+  ];
+  return html`<section class="card" aria-label="Conversation cache">
+    <div class="card__head"><span class="card__title">Conversation cache</span>
+      <span class="card__sub">${fmt(cache.pending_writes || 0)} writes pending</span></div>
+    <div class="tiles tiles--4">${values.map(([label, value]) => html`<div class="tile">
+      <span class="stat__label">${label}</span><${Num} v=${value}/></div>`)}</div>
+    ${errors ? html`<p class="card__note">${fmt(errors)} storage errors · affected states are read again.</p>` : null}
+  </section>`;
+}
+
 // ------------------------------------------------------------------ where the experts live (the engine's STAT lines)
 // GLM's engine: where each routed expert came from while the model writes; DeepSeek's (maya-ds4): the experts the CPU lane
 // computed, what the storage read, the cache's moves and the n-gram memory (Engram) a token; MiniMax's (maya-mm3): the
@@ -616,6 +634,7 @@ export function MonitorPage() {
         <${Banners} m=${m}/>
         <div class="mon__top"><${Throughput} m=${m}/><${RightNow} m=${m}/></div>
         <${ContextCard} m=${m}/>
+        <${ConversationCache} cache=${m.state_cache}/>
         <${Tiers} t=${m.tiers} eng=${m.engine || {}}/>
         <${GpuMap} m=${m}/>
         <${Hardware} m=${m} gpuEach=${gpuEach}/>

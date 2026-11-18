@@ -21,7 +21,7 @@ Everything is fixed by `--seed`, so every run sends the same requests:
   nothing reusable past the system prompt, as after an agent restarts.
 - A conversation that grows past `--max-context` starts a new one from its latest turn, as an agent compacts.
 
-The model's answers are not fed back: the next turn sends the scripted history, so the prompts do not depend on what
+By default the model's answers are not fed back: the next turn sends the scripted history, so the prompts do not depend on what
 the model wrote. Requests are greedy with thinking off and ban the model's end tokens (`--ban auto` knows
 GLM-5.3-Flash by the served model's name; `--ban none` or token ids otherwise), so every answer writes its whole
 max_tokens and every run writes the same number of tokens. The texts are slices of this repository's files
@@ -35,6 +35,11 @@ Start the server the way you use it (`./maya.sh` with your config, `--parallel` 
 python tools/agent_bench.py run --url http://127.0.0.1:8080 --clients 4 --label mine --out runs/mine-1.json
 python tools/agent_bench.py plan --clients 4          # what it would send, without a server
 ```
+
+To exercise reuse of completed answers, add `--answer-fed`. Each client's actual
+completed output becomes the assistant message in its next turn, preserving the
+conversation prefix. The resulting prompts depend on model output; compare runs
+using the same mode. The original scripted mode remains the default.
 
 A run takes `--duration` (900 s) plus the answers in flight. The first `--warmup` seconds (180) are left out of the
 summary: the server's caches fill with the conversations then. For an A/B, restart the server before each run (a run

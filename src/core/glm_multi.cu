@@ -23,12 +23,14 @@ namespace strata::core {
 void Glm5Model::seq_bind(int s) {
     ckpt_join();   // (ckpt_save_snapshot reads snap_ / snap_pool_)
     if (seq_.empty() || s == cur_seq_ || s < 0 || s >= (int) seq_.size()) return;
+    mtp_hx_pos_ = -1;  // head_x is shared scratch; it belongs to the previous bound sequence
     SeqCtx& o = seq_[(size_t) cur_seq_];
     o.state = state_;
     o.pos = pos_;
     o.snap = snap_;
     o.snap_pool = snap_pool_;
     o.snap_pos = snap_pos_;
+    o.snap_hidden = std::move(snap_hidden_);
     o.kda_bak = kda_bak_;
     o.last_tok = last_tok_;
     o.img_pos = std::move(img_pos_);
@@ -50,6 +52,7 @@ void Glm5Model::seq_bind(int s) {
     snap_ = n.snap;
     snap_pool_ = n.snap_pool;
     snap_pos_ = n.snap_pos;
+    snap_hidden_ = std::move(n.snap_hidden);
     kda_bak_ = n.kda_bak;
     last_tok_ = n.last_tok;
     img_pos_ = std::move(n.img_pos);
