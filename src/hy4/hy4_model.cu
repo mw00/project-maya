@@ -1735,6 +1735,9 @@ struct Model::Impl {
                           now_s() - tm);
             info.push_back(buf);
         }
+        if (g.n_mtp == 0)   // (a set without the MTP block - the public release's layout: every token by the model itself)
+            info.push_back(std::string("INFO no MTP draft block in this model's files: decoding without drafts") +
+                           (o.mtp ? " (--mtp has nothing to load)" : ""));
         if (out.type != kBF16 && out.type != kF32 && !iq::mv_supported(out.type)) {
             err = "output.weight: a type maya-hy4 does not read";
             return false;
