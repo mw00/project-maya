@@ -92,15 +92,20 @@ class Setup(unittest.TestCase):
         self.assertNotIn("--kv-resident", cfg["args"])
         self.assertEqual((cfg["model_name"], cfg["sampling"], cfg["reasoning_effort"]),
                          ("glm-5.3", {"temperature": 1.0, "top_p": 0.95}, "max"))
-        # a setup again over a config with streaming on and a window (an older setup, or by hand): not kept
+        # a setup again over a config with streaming on and a window (by hand, or the Models page): kept - opt-in
         p = self.root / "maya-glm-5.3-ud-iq2_m.json"
         old = json.loads(p.read_text())
         old["args"] = [("on" if a == "off" else a) for a in old["args"]] + ["--kv-resident", "32768", "--parallel", "2"]
         p.write_text(json.dumps(old))
         again = self.write(self.dsa, "GLM-5.3-UD-IQ2_M", ("download", "GLM-5.3-UD-IQ2_M"))
+        self.assertEqual((maya.flag_value(again["args"], "--kv-streaming"), maya.flag_value(again["args"], "--kv-resident")),
+                         ("on", "32768"))
+        self.assertEqual(maya.flag_value(again["args"], "--parallel"), "2")        # (the rest kept as before)
+        with patch.object(maya.G53, "KV_STREAMING_BY_HAND", False):                # (the gate closed: not kept)
+            p.write_text(json.dumps(old))
+            again = self.write(self.dsa, "GLM-5.3-UD-IQ2_M", ("download", "GLM-5.3-UD-IQ2_M"))
         self.assertEqual(maya.flag_value(again["args"], "--kv-streaming"), "off")
         self.assertNotIn("--kv-resident", again["args"])
-        self.assertEqual(maya.flag_value(again["args"], "--parallel"), "2")        # (the rest kept as before)
 
     def test_flash_as_before(self):
         with Quiet() as q:
