@@ -15,9 +15,11 @@ import subprocess
 import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
-INPUTS = ("include/strata/core/glm_prefix_admission.hpp", "include/strata/core/glm_cache_memory.hpp",
+INPUTS = ("include/strata/artifact/gguf_reader.hpp", "src/core/glm_model.cu",
+          "include/strata/core/glm_prefix_admission.hpp", "include/strata/core/glm_cache_memory.hpp",
           "include/strata/core/glm_prefix_metadata.hpp", "include/strata/core/glm_slot_directory_scan.hpp",
-          "include/strata/core/regular_file_stream.hpp",
+          "include/strata/core/regular_file_stream.hpp", "include/strata/core/glm_state_layout.hpp",
+          "include/strata/core/glm_model.hpp", "src/core/glm_pack_identity.cu",
           "tests/core/glm_prefix_cache_host_test.cpp", "tools/test_glm_prefix_cache_host.py")
 
 
@@ -44,9 +46,10 @@ def main() -> int:
             exe = td / ("fixture.exe" if os.name == "nt" else "fixture")
             if Path(cxx).stem.lower() in ("cl", "clang-cl"):
                 cmd = [cxx, "/nologo", "/std:c++20", "/EHsc", "/W4", "/D_CRT_SECURE_NO_WARNINGS", f"/I{ROOT / 'include'}",
-                       f"/Fo{td / 'fixture.obj'}", str(source), f"/Fe:{exe}"]
+                       f"/I{ROOT / 'src/core'}", f"/Fo{td / 'fixture.obj'}", str(source), f"/Fe:{exe}"]
             else:
-                cmd = [cxx, "-std=c++20", "-O0", "-Wall", "-Wextra", "-I", str(ROOT / "include"), str(source), "-o", str(exe)]
+                cmd = [cxx, "-std=c++20", "-O0", "-Wall", "-Wextra", "-I", str(ROOT / "include"),
+                       "-I", str(ROOT / "src/core"), str(source), "-o", str(exe)]
             built = subprocess.run(cmd, cwd=td, text=True, capture_output=True, timeout=60)
             receipt["compile"] = {"exit_code": built.returncode, "stdout": built.stdout, "stderr": built.stderr}
             print(built.stdout, end=""); print(built.stderr, end="")

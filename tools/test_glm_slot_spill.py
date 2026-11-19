@@ -49,6 +49,7 @@ def fixture(block: str, cli_tail: str) -> str:
 #include <thread>
 #include <vector>
 #define STRATA_VERSION "host-fixture"
+static std::string fixture_pack_identity;   // set in main before the model is used
 static void set_env(const char* name, const char* value) {
 #ifdef _WIN32
   _putenv_s(name, value);
@@ -66,6 +67,7 @@ struct FakeModel {
   bool fast() const { return true; } bool has_mtp() const { return false; }
   bool ablating() const { return false; } bool ablate_loaded() const { return false; }
   struct G { int n_embd = 1; }; G geometry() const { return {}; }
+  std::string pack_identity() const { return "host-fixture fp=same"; }
   uint64_t slot_save(std::vector<uint8_t>& out, std::string&) { out.assign(8, 0x5a); return out.size(); }
   uint64_t slot_save(const std::string& p, std::string&) { std::ofstream f(p, std::ios::binary); const std::string b(8, 'Z'); f.write(b.data(), 8); return f ? 8 : 0; }
   bool slot_load(const std::vector<uint8_t>& b, int64_t, std::string&) { return b == std::vector<uint8_t>(8, 0x5a); }
@@ -74,7 +76,7 @@ struct FakeModel {
 static void fail(const char* m) { std::fprintf(stderr, "FAIL: %s\n", m); std::exit(2); }
 int main(int argc, char** argv) {
   if (argc != 3) return 64; const std::string which = argv[1]; const std::filesystem::path root = argv[2];
-  std::error_code clean_ec; if (which != "reindex" && which != "mixed-reindex" && which != "cli-reindex") std::filesystem::remove_all(root, clean_ec); std::filesystem::create_directories(root / "pack");
+  std::error_code clean_ec; if (which != "reindex" && which != "branch-pack-identity-reindex" && which != "branch-pack-identity-other" && which != "mixed-reindex" && which != "cli-reindex") std::filesystem::remove_all(root, clean_ec); std::filesystem::create_directories(root / "pack");
   for (const char* n: {"index.txt", "dense.bin", "native_experts.txt"}) std::ofstream(root / "pack" / n).put('x');
   const bool off = which == "off-disk" || which == "off-ram" || which == "off-unset";
   set_env("MAYA_GLM_NO_REUSE", ""); set_env("MAYA_GLM_SLOT_KEEP", "0"); set_env("MAYA_GLM_SLOT_DAYS", "7");
@@ -86,7 +88,9 @@ int main(int argc, char** argv) {
   if (which == "default-budgets") {
     set_env("MAYA_GLM_SLOT_RAM_GB", ""); set_env("MAYA_GLM_SLOT_GB", "");
   }
+  fixture_pack_identity = std::string("host-fixture fp=") + (which=="branch-pack-identity-other" ? "other" : "same");
   Options o; o.glm_pack = (root / "pack").string(); FakeModel model;
+  // The slot key ends in pack_identity(): same content in both cases, other content only in the "other" case.
   std::vector<int32_t> snap_tokens; uint64_t snap_img_hash = 1469598103934665603ull;
   std::vector<int> cur_img_pos; std::vector<float> cur_img_rows;
   const auto img_hash = [&](size_t) { return uint64_t{1469598103934665603ull}; };

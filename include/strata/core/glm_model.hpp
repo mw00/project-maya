@@ -94,6 +94,13 @@ struct Glm5Geometry : GlmArchExt<Glm5Geometry> {   // glm-dsa: arch + glm-dsa fi
     static bool from_gguf(const strata::GgufFile& g, Glm5Geometry& out, std::string& err);
 };
 
+struct PackShardDigests {
+    std::mutex mu;
+    std::map<std::pair<std::string, uint64_t>, std::string> entries;
+    size_t hash_count = 0;
+    std::string digest(const std::string& file_id, uint64_t size, const void* base);
+};
+
 class Glm5Model {
 public:
     Glm5Model() = default;
@@ -401,6 +408,7 @@ public:
     // (wait_pin / pass_pin); CPU lane setup waits until all have loaded
     struct SplitLoad {
         std::mutex mu;
+        PackShardDigests digests;
         std::condition_variable cv;
         std::vector<bool> passed, pinned;
         int turn = 0, pin_turn = 0;
@@ -448,6 +456,7 @@ public:
         }
     };
     SplitLoad* split_load_ = nullptr;
+    PackShardDigests* pack_digests_ = nullptr;
     bool defer_lane_ = false;
     std::vector<float> hop_;                               // the boundary residual staging buffer
     int* d_tok_ = nullptr;                                 // the sampler's one-int output, on dev_
@@ -469,6 +478,7 @@ public:
     bool pack_ = false;
     struct Shard {
         std::string path;
+        std::string file_id;                         // identity of the descriptor used to create this view
         uint8_t* base = nullptr;
         uint64_t size = 0, data_start = 0;
         int fd = -1;                                   // kept open for posix_fadvise reads (prefetch)
@@ -1196,6 +1206,18 @@ private:
     std::shared_ptr<void> dsa_ref_;
     bool dsa_ref_setup(std::string& err);
     bool step_layers_dsa(int64_t p, std::string& err);
+    // ---- the identity of what this part's pack load mapped (src/core/glm_pack_identity.cu).  The digest covers the
+    // mapped bytes themselves, not a path re-read; slots and prompt-cache entries carry pack_identity().
+    std::string pack_content_identity(PackShardDigests& digests) const;
+    std::string pack_metadata_bytes_; // exact metadata lines parsed by this part, captured during load
+    std::string pack_exl3_metadata_bytes_; // first EXL3 parse, checked against the MTP parse
+    std::string pack_content_digest_;   // frozen while the mapped bytes are still available
+public:
+    static std::string pack_identity_of(const Glm5Model& part);   // the same for this part and every split part
+    /// What a retained slot or prompt-cache entry must match to be restored by this load: the state layout's words,
+    /// the parts' layer ranges and each part's content digest (the GGUF shards, MAYA_GLM_MTP_GGUF's draft block and an
+    /// EXL3 pack's safetensors).  Empty before a pack load.
+    std::string pack_identity() const;
 };
 
 /// What a part with these layer kinds lends the prompt path for a chunk of T tokens, its prestage buffer aside

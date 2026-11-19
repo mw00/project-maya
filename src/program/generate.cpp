@@ -1513,6 +1513,9 @@ static int glm_pack_generate(const Options& o) {
     };
     // what a kept slot must match: the session format, the engine version, the pack and the model's shards (names and
     // sizes) and whether the draft block is loaded.  The split itself is checked by slot_load (each part's layers).
+    // The content digest of what the load actually mapped (pack_identity) follows, so retained state written over
+    // other bytes under the same names and sizes is refused; it is empty only before a pack load, and then no slot is
+    // written or read.
     const std::string slot_identity = [&] {
         std::ostringstream id;
         id << "maya-session-2 engine=" << STRATA_VERSION << " mtp=" << (model.has_mtp() ? 1 : 0);
@@ -1525,6 +1528,7 @@ static int glm_pack_generate(const Options& o) {
                 shards.push_back(de.path().filename().string() + ":" + std::to_string(de.file_size(ec)));
         std::sort(shards.begin(), shards.end());
         for (const auto& s : shards) id << " " << s;
+        id << " pack=" << model.pack_identity();
         return id.str();
     }();
     constexpr uint64_t kMetaMagic = 0x3153534559414d47ull;   // "GMAYESS1"

@@ -47,13 +47,15 @@ export MAYA_GLM_COMPLETION_CACHE=1
 export MAYA_GLM_COMPLETION_MIN_TOKENS=1024
 ```
 
-Persistent identity currently checks pack path, state layout and file metadata,
-not a cryptographic digest of every loaded weight. Replacing weights in place
-while preserving their names, sizes and relevant metadata can leave an old state
-apparently compatible. **Use a fresh private slot directory after any model or
-pack change; do not carry retained states across weight revisions.** Binding
-persistent state to a verified immutable weight manifest remains a Ready/merge
-gate, not a guarantee provided by this experimental patch.
+Persistent slot and prompt-cache keys include SHA-256 digests of the weight
+shards mapped by the loader, together with the parsed expert routing and split
+layout. A weight change between loads gives the pack a different key. Entries
+created before this key format require a fresh prefill.
+
+Keep model files immutable throughout loading and inference. Install a new
+revision in a separate directory and use a private slot directory. Hashing
+reads each distinct mapped shard during loading, including when learned-prefix
+caching is disabled.
 
 Choose RAM and disk budgets for the machine, not by copying the example blindly.
 The learned path checks available memory with a default 32 GiB reserve, bounds
@@ -172,19 +174,15 @@ the failure and stops new admissions that rely on the incomplete accounting.
 This is not a crash journal: after an interruption, startup rebuilds the index rather
 than replaying an exact list of victims.
 
-**Weight content identity remains unresolved and blocks Ready.** Existing identity
-uses paths, geometry and file metadata, not the bytes actually consumed by every
-loader input. Reopening paths to hash them after loading does not fix this: a
-replacement can bind loaded A to file B, and directory suffix enumeration need
-not match actual shards, companion files, EXL3 or external MTP inputs. No such
-partial hash or process-random namespace is shipped here; existing restart
-behavior has not been removed. Use a fresh private slot directory per immutable
-model revision. An actual loader-bound immutable content identity is still needed.
-The unresolved limitation has separate local evidence; it is not counted as a
-passing regression or replaced with a weaker identity scheme.
+During a split load, parts that map the same file object and length share its
+digest. GGUF parsing and direct reads are checked against the mapped object.
+An in-place write or truncation violates the immutable-input requirement above.
+Host tests cover content changes and rejection of slots with a different pack
+identity. A four-GPU GLM Flash run with the same weights restored 1,227 of 1,228
+prompt tokens from an ordinary disk slot after process restart and matched all
+10 cold output token IDs and the stop reason. Changed weights were exercised
+only in host fixtures.
 
-The other three lifecycle fixes are host-code regressions only. Native/CUDA
-serialization, actual short-key completion SSD/restart numerical correctness,
-default-1024 model behavior and operational quality/performance still require
-separate acceptance. Neither passing host checks nor those three fixes makes
-this Draft PR Ready.
+Separate model-level checks are still needed for completion-tail restoration
+across contexts and process restarts, the default 1024-token threshold, and
+quality and performance under a multi-agent workload.

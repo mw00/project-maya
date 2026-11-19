@@ -18,11 +18,14 @@
 #include "strata/core/glm_cache_memory.hpp"
 #include "strata/core/glm_slot_directory_scan.hpp"
 #include "strata/core/regular_file_stream.hpp"
+#include "strata/artifact/gguf_reader.hpp"
 
 namespace fs = std::filesystem;
 namespace pm = strata::core::glm_cache_memory;
 namespace pa = strata::core::glm_prefix;
 static int checks = 0, failures = 0;
+#include "glm_pack_identity.cu"   // tools/test_glm_prefix_cache_host.py passes src/core on the include path; the digest
+                                  // has no CUDA calls, so a host build can check it against the published vectors
 static void expect(bool ok, const char* name) {
     ++checks;
     std::printf("%s %s\n", ok ? "PASS" : "FAIL", name);
@@ -341,10 +344,120 @@ struct CgroupFixture {
     }
     std::optional<uint64_t> read() const { return pm::linux_available(dir / "meminfo", dir / "membership", root); }
 };
+static std::string digest_of(const std::string& text) {
+    strata::core::Sha256 s;   // the pack identity's own digest, checked against the published FIPS 180-4 vectors
+    s.feed(text.data(), text.size());
+    return s.hex();
+}
+static void pack_identity_checks(const fs::path& root) {
+    expect(digest_of("") == "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+           "PACK_DIGEST empty input matches the published SHA-256 vector");
+    expect(digest_of("abc") == "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+           "PACK_DIGEST short input matches the published SHA-256 vector");
+    expect(digest_of("abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq") ==
+               "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1",
+           "PACK_DIGEST two-block input matches the published SHA-256 vector");
+    // A message ending exactly at a block boundary exercises the pad's own extra block; a long one crosses many.
+    expect(digest_of(std::string(64, 'a')) == "ffe054fe7ae0cb6dc65c3af9b61d5209f439851db43d0ba5997337df154668eb",
+           "PACK_DIGEST input filling one block exactly matches the published SHA-256 vector");
+    const std::string million(1000000, 'a');
+    expect(digest_of(million) == "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0",
+           "PACK_DIGEST million-byte input matches the published SHA-256 vector");
+    strata::core::PackShardDigests shared;
+    const std::string a = shared.digest("physical-A", 8, "weight-A");
+    expect(a == shared.digest("physical-A", 8, "weight-A") && shared.hash_count == 1,
+           "PACK_DIGEST four split mappings hash one physical file only once");
+    shared.digest("physical-A", 8, "weight-A");
+    shared.digest("physical-A", 8, "weight-A");
+    expect(shared.hash_count == 1, "PACK_DIGEST four parts reuse the physical shard digest");
+    expect(a != shared.digest("physical-B", 8, "weight-B") && shared.hash_count == 2,
+           "PACK_DIGEST equal paths and sizes cannot alias distinct mapped files");
+    expect(shared.digest("physical-A", 8, "weight-A") == a && shared.hash_count == 2,
+           "PACK_DIGEST another part retains its own metadata binding without rehashing");
+    // Independent mappings cannot borrow one another's content identity merely because paths and sizes agree.
+    const auto shard_digest = [](std::string_view path, std::string_view bytes) {
+        strata::core::Sha256 s;
+        s.feed("shard:", 6);
+        s.feed(path.data(), path.size());
+        s.feed(":", 1);
+        const uint64_t size = bytes.size();
+        s.feed(&size, sizeof size);
+        s.feed(bytes.data(), bytes.size());
+        return s.hex();
+    };
+    expect(shard_digest("same.gguf", "weight-A") != shard_digest("same.gguf", "weight-B"),
+           "PACK_DIGEST equal path and size with different mapped bytes must differ");
+    expect(shard_digest("first.gguf", "weight-A") != shard_digest("second.gguf", "weight-A"),
+           "PACK_DIGEST mapped shard path contributes to identity");
+    const auto metadata_digest = [](const std::string& native, const std::string& exl3) {
+        strata::core::Sha256 s;
+        strata::core::feed_pack_metadata(s, native + (exl3.empty() ? "" : "exl3:\n" + exl3));
+        return s.hex();
+    };
+    const auto original = metadata_digest("# shard\n0 2 2 0 64 10 20 30\n", "file 0 expert.safetensors\n");
+    expect(original == metadata_digest("# shard\n0 2 2 0 64 10 20 30\n", "file 0 expert.safetensors\n"),
+           "PACK_METADATA identical parsed native and EXL3 lines retain identity");
+    expect(original != metadata_digest("# shard\n0 2 2 0 64 10 20 31\n", "file 0 expert.safetensors\n"),
+           "PACK_METADATA changed native expert offset invalidates identity");
+    expect(original != metadata_digest("# shard\n0 2 2 0 64 10 20 30\n", "file 0 replacement.safetensors\n"),
+           "PACK_METADATA changed EXL3 routing invalidates identity");
+    expect(original != metadata_digest("# shard\n0 2 2 0 64 10 20 30\n", ""),
+           "PACK_METADATA missing EXL3 routing invalidates identity");
+    // A mapping and a delayed direct descriptor must refer to the same file even when their path is reused.
+    const fs::path first = root / "mapped.tmp";
+    const fs::path second = root / "direct.tmp";
+    put(first, "mapped");
+    put(second, "direct");
+    expect(!fs::equivalent(first, second), "PACK_FILE distinct files must not share direct-read identity");
+    expect(fs::equivalent(first, first), "PACK_FILE same mapped file preserves direct-read identity");
+    // A minimal metadata-only GGUF exercises the reader's open-object identity on both platforms.
+    const std::string header("GGUF\x03\0\0\0" "\0\0\0\0\0\0\0\0" "\0\0\0\0\0\0\0\0", 24);
+    const fs::path gguf_path = root / "parsed.gguf";
+    put(gguf_path, header);
+    {
+        strata::GgufFile parsed(gguf_path.string());
+#ifdef _WIN32
+        HANDLE h = CreateFileA(gguf_path.string().c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                               FILE_ATTRIBUTE_NORMAL, nullptr);
+        BY_HANDLE_FILE_INFORMATION info{};
+        const bool identified = h != INVALID_HANDLE_VALUE && GetFileInformationByHandle(h, &info);
+        const std::string id = identified ? std::to_string(info.dwVolumeSerialNumber) + ":" +
+            std::to_string(info.nFileIndexHigh) + ":" + std::to_string(info.nFileIndexLow) : "";
+        if (h != INVALID_HANDLE_VALUE) CloseHandle(h);
+#else
+        struct stat info{};
+        const bool identified = stat(gguf_path.string().c_str(), &info) == 0;
+        const std::string id = identified ? std::to_string((uint64_t) info.st_dev) + ":" +
+            std::to_string((uint64_t) info.st_ino) : "";
+#endif
+        expect(identified && parsed.matches_file_id(id), "PACK_FILE parsed and mapped same object accepted");
+#ifdef _WIN32
+        HANDLE other = CreateFileA(second.string().c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+                                   OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        BY_HANDLE_FILE_INFORMATION other_info{};
+        const bool other_identified = other != INVALID_HANDLE_VALUE && GetFileInformationByHandle(other, &other_info);
+        const std::string other_id = other_identified ? std::to_string(other_info.dwVolumeSerialNumber) + ":" +
+            std::to_string(other_info.nFileIndexHigh) + ":" + std::to_string(other_info.nFileIndexLow) : "";
+        if (other != INVALID_HANDLE_VALUE) CloseHandle(other);
+#else
+        struct stat other_info{};
+        const bool other_identified = stat(second.string().c_str(), &other_info) == 0;
+        const std::string other_id = other_identified ? std::to_string((uint64_t) other_info.st_dev) + ":" +
+            std::to_string((uint64_t) other_info.st_ino) : "";
+#endif
+        expect(other_identified && !parsed.matches_file_id(other_id),
+               "PACK_FILE different mapped object rejected");
+        expect(!parsed.matches_file_id("missing:file:identity"), "PACK_FILE unavailable mapped identity rejected");
+    }
+    fs::remove(gguf_path);
+    fs::remove(first);
+    fs::remove(second);
+}
 int main(int argc, char** argv) {
     if (argc != 2) return 64; // The runner owns this fresh temporary directory.
     const fs::path root(argv[1]);
     scan_checks(root);
+    pack_identity_checks(root / "pack-identity");
     regular_stream_checks(root / "regular-streams");
     {
         pa::Admission a;

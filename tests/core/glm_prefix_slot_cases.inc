@@ -417,5 +417,14 @@
         fail("old metadata no longer roundtrips while candidate enabled");
     } else if (which == "branch-legacy-reindex") {
       if (slots.size() != 1 || slots[0].branch_id || slots[0].tokens != a) fail("restart rejected compatible old metadata");
+    } else if (which == "branch-pack-identity") {
+      seed();
+      if (slots.size() != 1 || !slot_write_file(0)) fail("pack identity fixture seed failed");
+    } else if (which == "branch-pack-identity-reindex") {
+      if (slots.size() != 1 || slots[0].branch_id == 0 || slot_take(c, 0, true) != 1883 || model.loads != 1)
+        fail("same pack identity did not restore the persisted state after restart");
+    } else if (which == "branch-pack-identity-other") {
+      if (!slots.empty() || slot_take(c, 0, true) != 0 || model.loads != 0)
+        fail("different pack identity admitted the previous process's slot");
     } else return 64;
   }

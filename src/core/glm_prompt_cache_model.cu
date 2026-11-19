@@ -138,6 +138,7 @@ std::string Glm5Model::pcache_identity() const {
             shards.push_back(de.path().filename().string() + ":" + std::to_string(de.file_size(ec)));
     std::sort(shards.begin(), shards.end());
     for (const auto& s : shards) id << " " << s;
+    id << " pack=" << pack_identity();   // what the load mapped, not just the names and sizes
     return id.str();
 }
 

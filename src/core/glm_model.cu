@@ -157,12 +157,14 @@ bool exl3_k2_field(const std::string& tok, int& k2) {
 std::string exl3_k_name(int k2) { return (k2 & 1) ? std::to_string(k2 / 2) + ".5" : std::to_string(k2 / 2); }
 }  // namespace
 
-static bool exl3_table(const std::string& pack_dir, Exl3Table& t, std::string& err, int n_expert = 0) {
+static bool exl3_table(const std::string& pack_dir, Exl3Table& t, std::string& err, int n_expert = 0,
+                       std::string* parsed_lines = nullptr) {
     err.clear();
     std::ifstream f(pack_dir + "/exl3.txt");
     if (!f) return false;
     std::string line;
     while (std::getline(f, line)) {
+        if (parsed_lines) { parsed_lines->append(line); parsed_lines->push_back('\n'); }
         if (line.empty() || line[0] == '#') continue;
         std::istringstream ss(line);
         std::string what;
@@ -1278,6 +1280,7 @@ bool Glm5Model::load_pack_split(const std::string& pack_dir, int64_t max_ctx, co
             p->part_ = i;
             p->split_devs_ = devs;
             p->split_load_ = &sl;
+            p->pack_digests_ = &sl.digests;
             p->defer_lane_ = true;
             p->dflash_path_ = dflash_path_;   // the drafter: the part with the head loads it, every part sizes for it
             p->profile_path_ = profile_path_;   // every part reads the same profile
@@ -1292,6 +1295,7 @@ bool Glm5Model::load_pack_split(const std::string& pack_dir, int64_t max_ctx, co
         for (auto& t : th) t.join();
         for (int i = 0; i < n; ++i) {
             parts[(size_t) i]->split_load_ = nullptr;
+            parts[(size_t) i]->pack_digests_ = nullptr;
             parts[(size_t) i]->defer_lane_ = false;
         }
         for (int i = 0; i < n; ++i)
@@ -1315,6 +1319,7 @@ bool Glm5Model::load_pack_split(const std::string& pack_dir, int64_t max_ctx, co
         }
         ram_left_check();
     } else {
+    SplitLoad sl(n);
     Glm5Model* prev = nullptr;
     Glm5Model* m = this;
     for (int i = 0; i < n; ++i) {
@@ -1329,7 +1334,10 @@ bool Glm5Model::load_pack_split(const std::string& pack_dir, int64_t max_ctx, co
         m->dflash_path_ = dflash_path_;
         m->profile_path_ = profile_path_;   // every part reads the same profile
         m->head_half_ = i == helper;
-        if (!m->load_pack(pack_dir, max_ctx, err, devs[(size_t) i], l0, l1)) {
+        m->pack_digests_ = &sl.digests;
+        const bool loaded = m->load_pack(pack_dir, max_ctx, err, devs[(size_t) i], l0, l1);
+        m->pack_digests_ = nullptr;
+        if (!loaded) {
             if (prev != nullptr) prev->split_next_.reset();
             return false;
         }
@@ -2907,16 +2915,40 @@ static bool pack_shard_mmap(const std::string& path, strata::core::Glm5Model::Sh
     HANDLE m = CreateFileMappingA(h, nullptr, PAGE_READONLY, 0, 0, nullptr);
     void* v = m ? MapViewOfFile(m, FILE_MAP_READ, 0, 0, 0) : nullptr;
     if (m) CloseHandle(m);   // the view keeps the mapping
-    CloseHandle(h);
     if (v == nullptr) {
+        CloseHandle(h);
         err = "pack: mapping failed for " + path;
         return false;
     }
     s.base = (uint8_t*) v;
     s.path = path;
     s.data_start = data_start;
+    BY_HANDLE_FILE_INFORMATION mapped{};
+    if (!GetFileInformationByHandle(h, &mapped)) {
+        CloseHandle(h);
+        UnmapViewOfFile(v);
+        s.base = nullptr;
+        err = "pack: mapped file identity unavailable for " + path;
+        return false;
+    }
+    s.file_id = std::to_string(mapped.dwVolumeSerialNumber) + ":" +
+                std::to_string(mapped.nFileIndexHigh) + ":" + std::to_string(mapped.nFileIndexLow);
     HANDLE hd = CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
                             FILE_FLAG_NO_BUFFERING | FILE_FLAG_OVERLAPPED | FILE_FLAG_RANDOM_ACCESS, nullptr);
+    if (hd != INVALID_HANDLE_VALUE) {
+        BY_HANDLE_FILE_INFORMATION direct{};
+        if (!GetFileInformationByHandle(hd, &direct) ||
+            mapped.dwVolumeSerialNumber != direct.dwVolumeSerialNumber ||
+            mapped.nFileIndexHigh != direct.nFileIndexHigh || mapped.nFileIndexLow != direct.nFileIndexLow) {
+            CloseHandle(hd);
+            CloseHandle(h);
+            UnmapViewOfFile(v);
+            s.base = nullptr;
+            err = "pack: direct handle differs from mapped file " + path;
+            return false;
+        }
+    }
+    CloseHandle(h);
     s.h_direct = hd == INVALID_HANDLE_VALUE ? nullptr : (void*) hd;
     return true;
 #else
@@ -2932,6 +2964,7 @@ static bool pack_shard_mmap(const std::string& path, strata::core::Glm5Model::Sh
         return false;
     }
     s.size = (uint64_t) st.st_size;
+    s.file_id = std::to_string((uint64_t) st.st_dev) + ":" + std::to_string((uint64_t) st.st_ino);
     void* m = mmap(nullptr, s.size, PROT_READ, MAP_PRIVATE, fd, 0);
     if (m == MAP_FAILED) {
         close(fd);
@@ -2945,6 +2978,19 @@ static bool pack_shard_mmap(const std::string& path, strata::core::Glm5Model::Sh
     // the fast path reads experts with O_DIRECT (no page cache: on a host whose RAM is mostly the pinned
     // expert tier, buffered reads pushed the system into swap); absent where the filesystem refuses it
     s.fd_direct = open(path.c_str(), O_RDONLY | O_DIRECT);
+    if (s.fd_direct >= 0) {
+        struct stat direct{};
+        if (fstat(s.fd_direct, &direct) != 0 || st.st_dev != direct.st_dev || st.st_ino != direct.st_ino) {
+            close(s.fd_direct);
+            s.fd_direct = -1;
+            munmap(s.base, s.size);
+            s.base = nullptr;
+            close(s.fd);
+            s.fd = -1;
+            err = "pack: direct descriptor differs from mapped file " + path;
+            return false;
+        }
+    }
     return true;
 #endif
 }
@@ -3015,6 +3061,11 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
         Shard s;
         if (!pack_shard_mmap(dir2 + "/" + n, s, gfs.back()->data_start(), err)) return false;
         pack_shards_.push_back(s);
+        if (!gfs.back()->matches_file_id(s.file_id) || gfs.back()->file_size() != s.size ||
+            (&n == &shard_names.front() && (!gguf.matches_file_id(s.file_id) || gguf.file_size() != s.size))) {
+            err = "pack: parsed GGUF differs from mapped shard " + s.path;
+            return false;
+        }
     }
     const auto find_tensor = [&](const std::string& name) -> const strata::TensorInfo* {
         for (const auto& gf : gfs) {
@@ -3037,11 +3088,15 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
     glmd::mmq_pad_enable(g_.arch == GlmArch::GlmDsa);   // glm-dsa B15.2: the MMQ tail pad (off: Maya's buffers)
 
     // 3. native_experts.txt: per MoE layer, the expert types and blob offsets
+    pack_metadata_bytes_.clear();
+    pack_exl3_metadata_bytes_.clear();
     pack_layers_.assign((size_t) g_.n_layers, NativeLayer{});
     {
         std::ifstream ne(pack_dir + "/native_experts.txt");
         std::string line;
         while (std::getline(ne, line)) {
+            pack_metadata_bytes_.append(line);
+            pack_metadata_bytes_.push_back('\n');
             if (line.empty() || line[0] == '#') continue;
             std::istringstream ss(line);
             int layer = -1, gu = -1, dty = -1;
@@ -3112,7 +3167,10 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
     Exl3Table xt;
     {
         std::string xe;
-        if (exl3_table(pack_dir, xt, xe, g_.n_expert)) {
+        std::string exl3_lines;
+        if (exl3_table(pack_dir, xt, xe, g_.n_expert, &exl3_lines)) {
+            pack_exl3_metadata_bytes_ = exl3_lines;
+            pack_metadata_bytes_ += "exl3:\n" + exl3_lines;
             if (!glm_exl3_ok(g_.arch, err)) return false;   // glm-dsa W10: EXL3 serves GLM-5.3-Flash only
             exl3_ = true;
             exl3_shard0_ = (int) pack_shards_.size();
@@ -3506,6 +3564,10 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
         mtp_src_ = (int) gfs.size();
         gfs.push_back(std::move(extra));   // after the model's own shards: only the draft block is looked up in it
         pack_shards_.push_back(s);
+        if (!gfs.back()->matches_file_id(s.file_id) || gfs.back()->file_size() != s.size) {
+            err = "pack: parsed MTP GGUF differs from mapped shard " + s.path;
+            return false;
+        }
         mtp_extra = true;
         std::fprintf(stderr, "glm mtp: CUDA%d the draft block from %s%s\n", dev_, mtp_gguf,
                      own ? " (instead of the model's own)" : "");
@@ -3754,6 +3816,12 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
     host_dn_.resize((size_t) g_.n_embd);
     host_act_.resize(strata::kernels::cpu::kNativeActBytes);
     host_hq_.resize(strata::kernels::cpu::kNativeHBytes);
+    PackShardDigests single_load_digests;
+    pack_content_digest_ = pack_content_identity(pack_digests_ != nullptr ? *pack_digests_ : single_load_digests);
+    if (pack_content_digest_.empty() || pack_shards_.empty()) {
+        err = "pack: cannot identify mapped weight bytes";
+        return false;
+    }
     pack_ = true;
     loaded_ = true;
     if (fast_mode_) pack_release_views();   // before fast_setup: its RAM tier sees the embedding's heap copy
@@ -3798,9 +3866,13 @@ bool strata::core::Glm5Model::load_mtp(const std::vector<std::unique_ptr<strata:
     // an EXL3 pack: the block's quantized projections and routed experts are in exl3.txt (its floats in the GGUF)
     Exl3Table xt;
     if (exl3_) {
-        std::string xe;
-        if (!exl3_table(pack_dir_, xt, xe, g_.n_expert)) {
+        std::string xe, exl3_lines;
+        if (!exl3_table(pack_dir_, xt, xe, g_.n_expert, &exl3_lines)) {
             err = "mtp: " + (xe.empty() ? std::string("exl3.txt is gone") : xe);
+            return false;
+        }
+        if (exl3_lines != pack_exl3_metadata_bytes_) {
+            err = "mtp: exl3.txt changed since pack load";
             return false;
         }
         if (xt.mats.count(P + "nextn.eh_proj.weight") == 0) return true;   // packed without the draft block

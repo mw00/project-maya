@@ -44,11 +44,11 @@ CASES = ("branch-policy-completion", "branch-policy-slot", "branch-policy-disabl
          "completion-memory", "completion-save-fail", "completion-publish-fail", "completion-context",
          "completion-gap", "completion-single", "completion-threshold", "completion-default-min",
          "completion-image-text", "completion-text-image", "completion-image-text-gap",
-         "completion-text-image-gap")
+         "completion-text-image-gap", "branch-pack-identity", "branch-pack-identity-reindex", "branch-pack-identity-other")
 PAIRS = {"branch-ready-reindex": "branch-ready-seed", "branch-ready-short-reindex": "branch-ready-short-disk", "reindex": "flush", "mixed-reindex": "mixed-flush", "cli-reindex": "cli",
          "branch-reindex": "branch-flush", "branch-legacy-reindex": "branch-legacy-meta", "branch-lru-reindex": "branch-lru-disk",
          "branch-lru-staging-reindex": "branch-lru-staging", "branch-cleanup-restart": "branch-cleanup-rollback",
-         "branch-cleanup-retire-restart": "branch-cleanup-retire-meta"}
+         "branch-cleanup-retire-restart": "branch-cleanup-retire-meta", "branch-pack-identity-reindex": "branch-pack-identity", "branch-pack-identity-other": "branch-pack-identity"}
 INCLUDES = r'''
 #include <array>
 #include <atomic>
@@ -122,6 +122,7 @@ struct FakeModel {
   bool ablating() const { return false; } bool ablate_loaded() const { return false; }
   struct G { int n_embd = 1; }; G geometry() const { return {}; }
   std::array<uint64_t, 4> state_fp() const { return {1,2,3,4}; }
+  std::string pack_identity() const { return fixture_pack_identity; }
   int64_t position() const { return live_pos; }
   int64_t snapshot_pos() const { return snap_pos; }
   bool snapshot_save() { ++snapshot_saves; snap_pos = live_pos; snap_state = uint64_t(context); return true; }
@@ -175,6 +176,7 @@ using Glm5Model = FakeModel;
 namespace strata::core { using Glm5Model = ::FakeModel; }
 '''
 SETUP = r'''
+  fixture_pack_identity = std::string("host-fixture fp=") + (which=="branch-pack-identity-other" ? "other" : "same");
   const bool completion_case = which.rfind("branch-policy-", 0)==0 || which.rfind("completion-", 0)==0 || which.rfind("branch-ready-short", 0)==0;
   set_env("MAYA_GLM_LEARNED_PREFIX", which.rfind("branch-", 0)==0 || completion_case ? "1" : "");
   set_env("MAYA_GLM_COMPLETION_CACHE", completion_case && which!="completion-off" ? "1" : "");
@@ -301,6 +303,7 @@ def fixture(source: str) -> str:
     cpp = cpp.replace('which != "cli-reindex" &&', 'which != "branch-lru-staging-reindex" && which != "cli-reindex" &&')
     cpp = cpp.replace('which != "cli-reindex" &&', 'which != "branch-cleanup-restart" && which != "cli-reindex" &&')
     cpp = cpp.replace('which != "cli-reindex" &&', 'which != "branch-cleanup-retire-restart" && which != "cli-reindex" &&')
+    cpp = cpp.replace('which != "cli-reindex" &&', 'which != "branch-pack-identity-reindex" && which != "branch-pack-identity-other" && which != "cli-reindex" &&')
     cpp = cpp.replace('which != "cli-reindex" &&', 'which.rfind("branch-scan-", 0) != 0 && which != "cli-reindex" &&')
     cpp = cpp.replace('which != "cli-reindex" &&', 'which.rfind("branch-types-", 0) != 0 && which != "cli-reindex" &&')
     cpp = cpp.replace('std::ofstream(root / "pack" / n).put(\'x\');', 'if (!std::filesystem::exists(root / "pack" / n)) std::ofstream(root / "pack" / n).put(\'x\');')
@@ -354,7 +357,8 @@ def main() -> int:
               "include/strata/core/glm_slot_directory_scan.hpp", "include/strata/core/regular_file_stream.hpp",
               "tests/core/glm_prefix_slot_cases.inc",
               "tools/test_glm_slot_spill.py", "tools/test_glm_prefix_slots.py",
-              "tests/core/glm_completion_slot_cases.inc"]
+              "tests/core/glm_completion_slot_cases.inc",
+              "include/strata/core/glm_model.hpp", "src/core/glm_pack_identity.cu"]
     hashes = lambda: {name: hashlib.sha256((ROOT / name).read_bytes()).hexdigest() for name in inputs}
     receipt = {
         "scope": (
