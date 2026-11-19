@@ -817,6 +817,9 @@ HY4_TESTED_CONTEXT = 32768                         # (a Maya quant past it: not 
 HY4_Q4_CONTEXTS = [32768, 65536, 131072, 262144]
 HY4_Q4_LONG = [524288, 1048576]
 HY4_Q4_LONG_SHARE = 0.25                           # (the cache in 8-bit rows: at most this share of the smallest GPU's VRAM)
+# (Maya's sizes draft with Tencent's MTP block from a file of its own - download.json's "mtp": the engine rounds its BF16
+#  matrices to Q8_0, HY4_MTP_VRAM of the file's bytes, always in VRAM, and keeps a prompt chunk of rows beside it)
+HY4_MTP_VRAM = 0.56
 HY4_VISION_GIB = 0.81                              # (the engine's room for its largest picture, 2048 x 2048: 828 MB of the main GPU)
 # (... and for the smallest picture budget it takes, a sixteenth of the largest: 512 x 512 - src/hy4/hy4_vision.cu's
 #  layout: the weights' two slots, the attention's scores, cuBLAS's workspace and the patches' rows)
@@ -4994,8 +4997,8 @@ def speed_calibration(cfg_path: Path, why: str = "") -> bool:
             warn(f"no speed calibration for {HY4} yet: it drafts with its MTP block unless set up with --drafting off "
                  f"({ME} --setup --model hy4-flash-q4_k_m --drafting on|off)")
         else:
-            ok(f"{HY4}: no speed calibration - drafting is not available for Maya's sizes yet, so there is nothing "
-               "to compare")
+            ok(f"{HY4}: no speed calibration yet - a Maya size drafts with the MTP block where the setup found room "
+               f"for it ({ME} --setup --drafting on|off)")
         return False
     if config_family(cfg) in ("deepseek", "minimax"):
         return speed_calibration_ds4(cfg_path, cfg, why)
@@ -8302,12 +8305,13 @@ def hy4_kv_rows(need_f16: float, need_q8: float, usable: float, kv: str | None =
 
 
 def hy4_config_need_gib(quant: str, layout: str, ctx: int, chunk: int | None = None,
-                        reserve_gb: float | None = None, q8: bool = False) -> float | None:
+                        reserve_gb: float | None = None, q8: bool = False, mtp: bool = False) -> float | None:
     """The VRAM (GiB) a size already set up needs at a context, as hy4_fit counts it (the dashboard's Models page
     asks before it writes a context into a config - serve/models.py's hy4_room): its layout's plan
     (hy4_fit_need_gib), a prompt chunk above the plan's as hy4_fit doubles it (HY4_CHUNK_UP_GIB), and a --reserve-gb
     other than the plan's by the difference.  q8: with the latent cache in 8-bit rows (what the engine's --kv auto
-    takes where F16 rows do not fit).  None for a size or a layout the manifest has no plan for."""
+    takes where F16 rows do not fit).  mtp: a Maya size that drafts (--mtp) - with its draft block's VRAM
+    (hy4_mtp_gib).  None for a size or a layout the manifest has no plan for."""
     plan = (hy4_layouts(hy4_quant_table(quant)).get(layout or HY4_STANDARD) or {}).get("plan") or {}
     if not plan.get("need_gib"):
         return None
@@ -8316,6 +8320,8 @@ def hy4_config_need_gib(quant: str, layout: str, ctx: int, chunk: int | None = N
         need += HY4_CHUNK_UP_GIB
     if reserve_gb is not None and "reserve_gb" in plan:
         need += float(reserve_gb) - float(plan["reserve_gb"])
+    if mtp and quant != HY4_Q4:
+        need += hy4_mtp_gib(int(chunk or plan.get("chunk") or 1024))
     return need
 
 
@@ -8655,26 +8661,96 @@ def hy4_vision_step(a, d: Path, quant: str, models: Path | None = None) -> Path 
     return have
 
 
-def hy4_pack_step(a, d: Path, files: list, vis: Path | None = None) -> Path:
+def hy4_mtp_entry() -> dict | None:
+    """The draft block of Maya's sizes - Tencent's MTP block in a file of its own (download.json's "mtp": one file
+    for every size, in Maya's repo) - as a MODELS entry (offer_download's form).  "name": the file's here (a
+    ".gguf_file" of the Hub saved as ".gguf"); "published": the table names the commit the file is at
+    ("mtp_revision") - before that only a copy already on this PC is taken.  None: the table has none."""
+    man = read_json(HY4_MANIFEST)
+    src = man.get("mtp") or {}
+    if not src or not man.get("repo"):
+        return None
+    path, (size, sha) = next(iter(src.items()))
+    name, folder = hy4_local_name(path), Path(path).parent.as_posix()
+    e = {"about": f"{HY4}'s MTP draft block (Tencent's, BF16, as in AngelSlim's GGUF); "
+                  f"{man.get('license', 'Tencent Hy License')}",
+         "format": "hy4-gguf", "repo": man["repo"], "revision": man.get("mtp_revision") or "main",
+         "folder": "" if folder == "." else folder, "files": {name: size}, "sha256": {name: sha},
+         "download_gb": size / 1e9, "name": name, "published": bool(man.get("mtp_revision"))}
+    if name != Path(path).name:
+        e["hub_names"] = {name: Path(path).name}
+    return e
+
+
+def hy4_mtp_gib(chunk: int = 1024) -> float:
+    """The VRAM (GiB) the draft block of Maya's sizes takes on the main GPU, as the engine counts it: its matrices
+    rounded to Q8_0 and a prompt chunk of its rows.  0 where the table has no block."""
+    e = hy4_mtp_entry()
+    if e is None:
+        return 0.0
+    return (e["files"][e["name"]] * HY4_MTP_VRAM + int(chunk or 1024) * 3072 * 16) / 2**30
+
+
+def hy4_pack_mtp_file(pack: Path) -> str | None:
+    """The name of the MTP block's own file a pack reads (tensors.txt's `file` lines), or None (a set with the block
+    inside, or without one)."""
+    e = hy4_mtp_entry()
+    if e is None:
+        return None
+    try:
+        with (pack / "tensors.txt").open(encoding="utf-8") as f:
+            for ln in f:
+                if not ln.startswith("file "):
+                    break
+                if Path(ln.split(None, 2)[2].strip()).name == e["name"]:
+                    return e["name"]
+    except (OSError, IndexError):
+        pass
+    return None
+
+
+def hy4_mtp_step(a, d: Path, quant: str, models: Path | None = None) -> Path | None:
+    """The draft block's file in d for a Maya size, or None (no drafts: said in step 7).  A file the folder has is
+    taken; else it is hard-linked from another Hy4-Flash folder here that has it (one file for every size), else
+    downloaded once it is published (asked like the model).  Checked against its sha256 (once, then remembered)."""
+    e = hy4_mtp_entry()
+    if e is None or quant == HY4_Q4:
+        return None
+    f = d / e["name"]
+    if file_incomplete(e, f) and models is not None:
+        link_published(f, e["files"][f.name], e["sha256"][f.name], hy4_places(models, f.name))
+    if file_incomplete(e, f) and e["published"]:
+        offer_download(a, f"{HY4}'s draft block ({e['download_gb']:.1f} GB, one file for every size)", d, [f], e)
+    if file_incomplete(e, f):
+        return None
+    if not sha256_checked(f, e["sha256"][f.name]):
+        fail(f"{f}: the sha256 does not match the published one - the file is damaged (its size is right)",
+             f"delete it and run {ME} --setup again")
+    return f
+
+
+def hy4_pack_step(a, d: Path, files: list, vis: Path | None = None, mtp: Path | None = None) -> Path:
     """tools/hy4/pack_gguf.py's pack in <model>/maya-hy4: the geometry, where every tensor sits in the two GGUF files
-    (read in place) - the vision tower's mmproj file's too (vis) -, the n-gram table's small parts and the tokenizer
-    with the GGUF's chat template - built again when its tools or the model's files changed, or the vision tower came
-    or went."""
+    (read in place) - the vision tower's mmproj file's too (vis), and the draft block's of a Maya size (mtp: Tencent's
+    MTP block in its own file) -, the n-gram table's small parts and the tokenizer with the GGUF's chat template -
+    built again when its tools or the model's files changed, or the vision tower or the draft block came or went."""
     step(6, "the pack (the engine's index of the model files)")
     pack = d / HY4_PACK
     tools = S.source_hash(HY4_PACK_TOOLS)
     need = ("hy4.txt", "tensors.txt", "engram.bin", "tokenizer/vocab.json", "tokenizer/chat_template.jinja")
-    every = list(files) + ([vis] if vis is not None else [])
+    every = list(files) + ([mtp] if mtp is not None else []) + ([vis] if vis is not None else [])
     if not a.repack and read_json(pack / PACK_SOURCES).get("tools") == tools and \
             all((pack / f).exists() for f in need) and pack_stale(pack, every) is None and \
-            hy4_pack_has_vision(pack) == (vis is not None):
+            hy4_pack_has_vision(pack) == (vis is not None) and \
+            hy4_pack_mtp_file(pack) == (mtp.name if mtp is not None else None):
         ok(f"pack already built: {pack}")
         return pack
     if not os.access(d, os.W_OK):
         fail(f"{d} is not writable: the pack is written inside the model's folder")
     say("  Indexing every tensor of the GGUF files (the weights stay where they are) and the tokenizer ...")
     run([sys.executable, str(ROOT / "tools" / "hy4" / "pack_gguf.py"), "--model", str(d), "--out", str(pack),
-         "--mmproj", vis.name if vis is not None else "none", "--files"] + [f.name for f in files])
+         "--mmproj", vis.name if vis is not None else "none", "--mtp", mtp.name if mtp is not None else "none",
+         "--files"] + [f.name for f in files])
     missing = [f for f in need if not (pack / f).exists()]
     if missing:
         fail(f"the pack builder did not write {pack / missing[0]}", "the reason is in the messages above")
@@ -8717,6 +8793,8 @@ def write_config_hy4(a, pc: dict, meta: dict, pack: Path, ctx: int, models: Path
                      (("--chunk", "--reserve-gb", "--vram-experts") if standard else ()))
     inst = {"family": "hy4", "hy4_quant": quant, "quant": HY4_QUANTS.get(quant, HY4), "layout": fit["layout"],
             "drafting": "on" if drafting else "off"}
+    if quant != HY4_Q4 and hy4_pack_mtp_file(pack):    # (a Maya size with the draft block: "off" is then a choice)
+        inst["draft_block"] = True
     sampling, effort = Q.model_defaults({"installer": inst})   # (the model's own, every setup: its card's)
     cfg = {"exe": str(HY4_EXE), "args": args, "cwd": str(ROOT), "tokenizer": str(pack / "tokenizer"),
            "model_name": HY4_MODEL_NAME, "gpu": [g["index"] for g in pc["gpus"]],
@@ -8796,7 +8874,9 @@ def set_up_hy4(a, prev: dict) -> Path | None:
     """Hy4-Flash's steps 1-8: the files (Maya's sizes, or Tencent's own Q4_K_M), the PC (NVIDIA from V100 on), the
     context - a Maya size: with the layout that fits its VRAM, worked out before any download; the Q4_K_M: recommended
     by the smallest GPU's VRAM, and its drafting - the engine (build/maya-hy4), the files (pinned, sha256-checked), the
-    pack, the config.  Nothing to measure yet."""
+    pack, the config.  A Maya size drafts with Tencent's MTP block from its own file (hy4_mtp_step: one for every
+    size) where the block fits in the VRAM beside the model's own parts (hy4_mtp_gib) - on by default, --drafting off
+    or a setup before that chose off: without.  Nothing to measure yet."""
     inst = prev.get("installer") or {}
     prev_args = [str(x) for x in prev.get("args") or []]
     quant = choose_hy4_quant(a, prev)
@@ -8853,7 +8933,23 @@ def set_up_hy4(a, prev: dict) -> Path | None:
     if files is None:
         return None
     vis = hy4_vision_step(a, d, quant, models)
-    pack = hy4_pack_step(a, d, files, vis)             # 6
+    # a Maya size's drafts: the block where it fits on the main GPU beside the model's own parts at this context (and
+    # a picture's room where pictures are on) - a small-card layout has no room for it, and it is not fetched there
+    mtp, mtp_why = None, ""
+    if quant != HY4_Q4 and hy4_mtp_entry() is not None:
+        room = float(fit.get("need") or 0) + hy4_mtp_gib(int(fit.get("chunk") or 1024)) + \
+            (HY4_VISION_GIB if fit.get("vision") and not fit.get("vision_small") and not a.no_vision else
+             HY4_VISION_MIN_GIB if fit.get("vision") and not a.no_vision else 0.0)
+        if fit["layout"] != HY4_STANDARD or room > float(fit.get("usable") or 0):
+            mtp_why = (f"the draft block needs about {hy4_mtp_gib():.1f} GB of VRAM beside the model's own parts "
+                       f"({room:.1f} GB with it at this context, {float(fit.get('usable') or 0):.1f} GB free on "
+                       "this PC's cards)")
+        else:
+            mtp = hy4_mtp_step(a, d, quant, models)
+            if mtp is None:
+                mtp_why = ("the draft block's file is not in the model's folder" +
+                           ("" if hy4_mtp_entry()["published"] else " (it is not published yet)"))
+    pack = hy4_pack_step(a, d, files, vis, mtp)        # 6
     step(7, "images (the vision tower)")               # 7
     pictures = hy4_pack_has_vision(pack) and not a.no_vision and bool(fit.get("vision", True))
     if not hy4_pack_has_vision(pack):
@@ -8878,7 +8974,18 @@ def set_up_hy4(a, prev: dict) -> Path | None:
            "the file (RAM as the page cache), a picture's room (under 1 GB) is kept free on the main GPU; the server "
            "resizes the pictures, the Chat's picture button is shown")
     if quant != HY4_Q4:
-        ok("drafting: not available for these files yet (Tencent's own Q4_K_M has it: --model hy4-flash-q4_k_m)")
+        how = getattr(a, "drafting", None)
+        if mtp is None:
+            (warn if how in ("on", "measure") else ok)(f"drafting: off - {mtp_why or 'no draft block for these files'}")
+        else:
+            if how == "measure":
+                warn(f"no speed calibration for {HY4} yet: it drafts with the MTP block (--drafting off: without)")
+            chose_off = same and inst.get("draft_block") and inst.get("drafting") == "off"
+            drafting = how != "off" if how else not chose_off
+            ok("drafting: Tencent's MTP block drafts tokens and the model checks every one - only tokens the model "
+               f"itself would pick are written; about {hy4_mtp_gib(int(fit.get('chunk') or 1024)):.1f} GB of the main "
+               "GPU's VRAM" if drafting else
+               "drafting: off (--drafting on, or Drafting on the Models page, drafts with the MTP block)")
     return write_config_hy4(a, pc, meta, pack, fit["context"], models, d, drafting, quant, fit, pictures)   # 8
 
 

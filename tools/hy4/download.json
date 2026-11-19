@@ -8,6 +8,11 @@
  "vision": {
   "Maya-XS/mmproj-Hy4-Flash-Maya-XS.gguf": [784524096, "6884c0317a4e3e781eef4a535706e47ae1423742ffe8341adf6e50497a7338be"]
  },
+ "_mtp": "the draft block of Maya's sizes: Tencent's MTP block (the model's block 42, BF16) as in AngelSlim/Hy4-flash-GGUF, its tensors unchanged in a file of their own (tools/hy4/mtp_gguf.py) - one file for every size, on the Hub as .gguf_file (not in the Hub's size list), saved as .gguf; the pack takes it from the model's folder and maya-hy4 drafts with it (--mtp). \"mtp_revision\": the commit of Maya's repo the file is at - empty until it is uploaded: the setup then takes only a copy already on the PC.",
+ "mtp": {
+  "mtp/Hy4-Flash-mtp-BF16.gguf_file": [7486183072, "a49e5ae439de9a51c680b9110563106743e8d579d91e4d4cb514a527fa908908"]
+ },
+ "mtp_revision": "",
  "ngram": {
   "Maya-XS/Hy4-Flash-Maya-XS-IQ2_XXS-00002-of-00002.gguf": [63360616160, "5819578b52eb1cda0945a716e0575331406d976b6eebc74db8544b3d478ad244"]
  },

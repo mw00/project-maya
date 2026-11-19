@@ -3,7 +3,8 @@
 before any download, the n-gram table shared between its folders, its pack and its config.  No GPU, no network (the
 one question the setup asks Hugging Face - is a layout's file uploaded: maya.hy4_on_hub - is answered here); its
 vision tower (the mmproj file: downloaded with the model unless --no-vision, packed when it is in the folder, off
-where the VRAM has no room for a picture; Images on the Models page).
+where the VRAM has no room for a picture; Images on the Models page); the draft block of Maya's sizes (Tencent's MTP
+block in a file of its own, one for every size: taken where it fits in the VRAM beside the model, packed, --mtp).
 
     python -m unittest tools.test_setup_hy4 -v
 """
@@ -1009,7 +1010,7 @@ class Files(unittest.TestCase):
             self.assertEqual(pack, d / "maya-hy4")
             cmd = ran[0]
             self.assertEqual(cmd[1:], [str(maya.ROOT / "tools" / "hy4" / "pack_gguf.py"), "--model", str(d), "--out",
-                                       str(pack), "--mmproj", "none", "--files", TRUNK, NGRAM])
+                                       str(pack), "--mmproj", "none", "--mtp", "none", "--files", TRUNK, NGRAM])
             self.assertNotIn("--engram-eps", cmd)
             self.assertEqual(json.loads((pack / maya.PACK_SOURCES).read_text())["tools"],
                              maya.S.source_hash(maya.HY4_PACK_TOOLS))
@@ -1159,7 +1160,7 @@ class Steps(unittest.TestCase):
             self.assertEqual(c["args"][4:], ["--chunk", "512", "--reserve-gb", "0.5", "--vram-experts", "0"])
         text = "\n".join(map(str, said))
         self.assertIn("the model reads text only", text)              # (no mmproj file in the folder: said)
-        self.assertIn("drafting: not available for these files yet", text)
+        self.assertIn("drafting: off - the draft block needs about", text)   # (a small-card layout: no room for it)
         self.assertIn("slower: parts of the model are then read from the SSD", text)   # (24 + 16 GB against 52)
         self.assertNotIn("Ollama", text)
 
@@ -1202,6 +1203,179 @@ class Steps(unittest.TestCase):
 #  smallest GPU's VRAM, the config the setup writes, the engine target, the Models page's settings, the two thinking levels)
 SHARDS = ("Hy4-flash-Q4_K_M-00001-of-00002.gguf", "Hy4-flash-Q4_K_M-00002-of-00002.gguf")
 MMPROJ = "mmproj-Hy4-flash-bf16.gguf"
+
+
+MTP_HUB = "mtp/Hy4-Flash-mtp-BF16.gguf_file"
+MTP_FILE = "Hy4-Flash-mtp-BF16.gguf"
+
+
+class Drafts(unittest.TestCase):
+    """A Maya size drafts with Tencent's MTP block from its own file: the table's entry, its VRAM, the setup's choice
+    (on where the block fits beside the model's own parts and a picture's room; --drafting off, and a setup again
+    after it, without), the pack's command and the config."""
+
+    def test_the_table(self):
+        self.assertEqual(TABLE["mtp"], {MTP_HUB: [7486183072, "a49e5ae439de9a51c680b9110563106743e8d579d91e4d4cb514a"
+                                                                "527fa908908"]})
+        e = maya.hy4_mtp_entry()
+        self.assertEqual((e["name"], e["folder"], e["hub_names"], e["repo"]),
+                         (MTP_FILE, "mtp", {MTP_FILE: "Hy4-Flash-mtp-BF16.gguf_file"}, TABLE["repo"]))
+        self.assertEqual(e["published"], bool(TABLE.get("mtp_revision")))
+        if TABLE.get("mtp_revision"):
+            self.assertRegex(TABLE["mtp_revision"], r"^[0-9a-f]{40}$")
+            self.assertEqual(maya.file_url(e, MTP_FILE),
+                             f"https://huggingface.co/{TABLE['repo']}/resolve/{TABLE['mtp_revision']}/{MTP_HUB}")
+        with with_manifest({k: v for k, v in TABLE.items() if k != "mtp"}):
+            self.assertIsNone(maya.hy4_mtp_entry())
+            self.assertEqual(maya.hy4_mtp_gib(), 0.0)
+
+    def test_vram(self):
+        # the engine's own count: the BF16 block rounded to Q8_0 (0.56 of its bytes) and a prompt chunk of rows
+        self.assertAlmostEqual(maya.hy4_mtp_gib(), (7486183072 * 0.56 + 1024 * 3072 * 16) / 2**30, places=6)
+        self.assertTrue(3.9 < maya.hy4_mtp_gib() < 4.0)
+        base = maya.hy4_config_need_gib("maya-xs", "standard", 32768)
+        self.assertAlmostEqual(maya.hy4_config_need_gib("maya-xs", "standard", 32768, mtp=True),
+                               base + maya.hy4_mtp_gib(), places=6)
+        self.assertEqual(maya.hy4_config_need_gib("maya-xs", "standard", 32768, mtp=False), base)
+
+    def test_the_packs_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            pack = Path(tmp)
+            self.assertIsNone(maya.hy4_pack_mtp_file(pack))
+            (pack / "tensors.txt").write_text("file 0 a.gguf\nfile 1 b.gguf\nt x F32 0 0 4 1\n")
+            self.assertIsNone(maya.hy4_pack_mtp_file(pack))
+            (pack / "tensors.txt").write_text("file 0 a.gguf\nfile 1 b.gguf\nfile 2 %s\nt x F32 0 0 4 1\n" % MTP_FILE)
+            self.assertEqual(maya.hy4_pack_mtp_file(pack), MTP_FILE)
+
+    def set_up(self, gib, block=True, published=False, prev=None, downloads=None, **kw):
+        """One setup of Maya-XS from a folder with stand-in files on a card of `gib`: (config, what was said, the
+        pack's command)."""
+        man, body = stand_ins()
+        blob = b"m" * 777
+        man["mtp"] = {MTP_HUB: [len(blob), hashlib.sha256(blob).hexdigest()]}
+        man["mtp_revision"] = "d" * 40 if published else ""
+        xs = man["quants"]["Hy4-Flash-Maya-XS"]
+        said, ran = [], []
+        root, d = Path(self.tmp.name) / "maya", Path(self.tmp.name) / "mine"
+        root.mkdir(exist_ok=True)
+        d.mkdir(exist_ok=True)
+        (d / TRUNK).write_bytes(body[list(xs["files"])[0]])
+        (d / NGRAM).write_bytes(body[list(man["ngram"])[0]])
+        if block:
+            (d / MTP_FILE).write_bytes(blob)
+
+        def run(cmd, *a, **k):
+            ran.append(cmd)
+            pack = Path(cmd[cmd.index("--out") + 1])
+            (pack / "tokenizer").mkdir(parents=True, exist_ok=True)
+            for n in ("hy4.txt", "engram.bin", "tokenizer/vocab.json", "tokenizer/chat_template.jinja"):
+                (pack / n).write_text("x")
+            m = cmd[cmd.index("--mtp") + 1]
+            (pack / "tensors.txt").write_text("file 0 a\nfile 1 b\n" + ("" if m == "none" else "file 2 %s\n" % m))
+
+        def offer(a, what, dd, files, m):
+            (downloads if downloads is not None else []).append((what, [f.name for f in files], maya.file_url(m, files[0].name)))
+            if downloads is None:
+                raise AssertionError("no download")
+            files[0].write_bytes(blob)
+            return True
+        pc = {"backend": "cuda", "gpus": [card(gib)], "archs": [86], "nvcc": "nvcc"}
+        with with_manifest(man), patch.object(maya, "ROOT", root), patch.object(maya, "fail", fail), \
+                patch.object(maya, "step", lambda *a: None), patch.object(maya, "say", lambda *a: said.extend(a)), \
+                patch.object(maya, "ok", said.append), patch.object(maya, "warn", said.append), \
+                patch.object(maya, "check_pc", lambda a, fam: pc), \
+                patch.object(maya, "gpu_used_mib", return_value={0: 300}), \
+                patch.object(maya, "mem_gb", return_value=(64.0, 60.0)), \
+                patch.object(maya, "tools_step", lambda a: Path("llama")), \
+                patch.object(maya, "build_step", lambda a, pc, llama, target: {"lib_dirs": []}), \
+                patch.object(maya, "rotational", return_value=False), patch.object(maya, "configs", return_value=[]), \
+                patch.object(maya, "run", run), patch.object(maya, "write_run_script", lambda p, port: "run"), \
+                patch.object(maya, "hy4_mtp_gib", lambda chunk=1024: 3.95),                 patch.object(maya, "offer_download", offer):
+            a = args(model="hy4-flash-maya-xs", model_dir=str(d), no_vision=True, **kw)
+            maya.model_option(a)
+            c = json.loads(maya.set_up_hy4(a, prev or {}).read_text())
+        return c, "\n".join(map(str, said)), ran[-1] if ran else None
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_on_where_the_block_fits(self):
+        c, text, cmd = self.set_up(32)
+        self.assertEqual(cmd[cmd.index("--mtp") + 1], MTP_FILE)
+        self.assertIn("--mtp", c["args"])
+        self.assertEqual((c["installer"]["drafting"], c["installer"]["draft_block"], c["installer"]["layout"]),
+                         ("on", True, "standard"))
+        self.assertIn("drafting: Tencent's MTP block drafts tokens and the model checks every one", text)
+        self.assertNotIn("the same answers", text)
+        self.assertNotIn("--draft", [x for x in c["args"] if x != "--mtp"])   # (the engine's own draft length)
+        # --drafting off: the block stays in the pack (the Models page's switch), no --mtp; a setup again keeps the
+        # choice; --drafting on drafts again
+        c, text, cmd = self.set_up(32, prev=c, drafting="off")
+        self.assertEqual(cmd[cmd.index("--mtp") + 1], MTP_FILE) if cmd else None
+        self.assertNotIn("--mtp", c["args"])
+        self.assertEqual((c["installer"]["drafting"], c["installer"]["draft_block"]), ("off", True))
+        self.assertIn("drafting: off (--drafting on", text)
+        c, text, _ = self.set_up(32, prev=c)
+        self.assertNotIn("--mtp", c["args"])
+        c, text, _ = self.set_up(32, prev=c, drafting="on")
+        self.assertIn("--mtp", c["args"])
+
+    def test_a_config_from_before_the_block(self):
+        # (a config written when these files had no drafting: its "off" was no choice)
+        prev = {"args": ["--pack", "/p", "--max-context", "32768"],
+                "installer": {"family": "hy4", "hy4_quant": "maya-xs", "layout": "standard", "drafting": "off"}}
+        c, _, _ = self.set_up(32, prev=prev)
+        self.assertIn("--mtp", c["args"])
+
+    def test_off_where_it_does_not_fit(self):
+        # a 12 GB card: the model's own parts at 32K and the block together are more than the card has - the block is
+        # neither asked for nor packed
+        c, text, cmd = self.set_up(12, published=True)
+        self.assertEqual(cmd[cmd.index("--mtp") + 1], "none")
+        self.assertNotIn("--mtp", c["args"])
+        self.assertEqual(c["installer"]["drafting"], "off")
+        self.assertNotIn("draft_block", c["installer"])
+        self.assertIn("drafting: off - the draft block needs about", text)
+        self.assertIn("GB free on this PC's cards", text)
+
+    def test_the_file(self):
+        # not uploaded yet and not in the folder: no download, said; uploaded: asked from Maya's repo at its commit,
+        # under its name there, saved under the name the pack reads
+        c, text, cmd = self.set_up(32, block=False)
+        self.assertEqual(cmd[cmd.index("--mtp") + 1], "none")
+        self.assertNotIn("--mtp", c["args"])
+        self.assertIn("the draft block's file is not in the model's folder (it is not published yet)", text)
+        got = []
+        c, text, cmd = self.set_up(32, block=False, published=True, downloads=got)
+        self.assertEqual(len(got), 1)
+        self.assertEqual(got[0][1], [MTP_FILE])
+        self.assertEqual(got[0][2], f"https://huggingface.co/{TABLE['repo']}/resolve/{'d' * 40}/{MTP_HUB}")
+        self.assertIn("one file for every size", got[0][0])
+        self.assertEqual(cmd[cmd.index("--mtp") + 1], MTP_FILE)
+        self.assertIn("--mtp", c["args"])
+
+    def test_linked_from_another_size(self):
+        man, _ = stand_ins()
+        blob = b"m" * 777
+        man["mtp"] = {MTP_HUB: [len(blob), hashlib.sha256(blob).hexdigest()]}
+        models = Path(self.tmp.name) / "models"
+        (models / "Hy4-Flash-Maya-XS").mkdir(parents=True)
+        (models / "Hy4-Flash-Maya-XS" / MTP_FILE).write_bytes(blob)
+        d = models / "Hy4-Flash-Maya-L"
+        d.mkdir()
+        with with_manifest(man), patch.object(maya, "fail", fail), patch.object(maya, "ok", lambda *a: None), \
+                patch.object(maya, "say", lambda *a: None), patch.object(maya, "configs", return_value=[]), \
+                patch.object(maya, "offer_download", side_effect=AssertionError("no download")):
+            f = maya.hy4_mtp_step(args(), d, "maya-l", models)
+            self.assertEqual(f, d / MTP_FILE)
+            self.assertEqual(f.read_bytes(), blob)
+            self.assertIsNone(maya.hy4_mtp_step(args(), d, maya.HY4_Q4, models))   # (Tencent's own set: its block inside)
+            (d / MTP_FILE).write_bytes(b"x" * 777)                                 # (damaged: the size is right)
+            with self.assertRaises(Failed):
+                maya.hy4_mtp_step(args(), d, "maya-l", models)
 
 
 def hy4_cfg(d: Path, mtp: bool = True, n_mtp: int = 1, vision: bool = False) -> dict:

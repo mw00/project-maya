@@ -952,7 +952,8 @@ def hy4_room(cfg: dict) -> dict | None:
         def one(ctx: int, q8: bool):
             return maya.hy4_config_need_gib(inst.get("hy4_quant") or "", inst.get("layout") or maya.HY4_STANDARD, ctx,
                                             chunk=_int(flag(args, "--chunk")) if own or ctx == cur else None,
-                                            reserve_gb=_float(flag(args, "--reserve-gb")), q8=q8)
+                                            reserve_gb=_float(flag(args, "--reserve-gb")), q8=q8,
+                                            mtp="--mtp" in [str(x) for x in args])
 
         def need(ctx: int):
             if kv in ("f16", "q8") or one(ctx, False) is None:

@@ -233,13 +233,19 @@ the [model card](https://huggingface.co/peasantsmith/Hy4-Flash-Maya-GGUF).
   off: the setup says so, text works as before, a picture sent is refused in plain words and a picture in a tool
   result becomes a short note. Pictures up to 2048 x 2048 pixels (larger ones are scaled down), a square one 4,160 tokens of the context. Pictures only, no videos. Images on the Models page
   turns them on or off.
+- **Drafting:** Maya's sizes draft with Tencent's MTP block, the same block Tencent's own GGUF files carry. It is
+  one extra file for every size (7.5 GB, in Maya's repo; the setup downloads it once and links it into each size's
+  folder). The block guesses the next tokens and the model checks every one, so Maya only writes tokens the model
+  itself would pick. It takes about 4 GB of VRAM on the main GPU, so the setup turns it on where that fits beside
+  the model's own parts (cards from about 16 GB at a 32K context) and leaves it off, saying so, on smaller cards.
+  `--drafting off` sets a size up without it; Drafting on the Models page switches it. Because the block takes VRAM
+  that would hold experts, other experts sit in VRAM than without it, and an answer can differ from a run without
+  the block.
 - **In llama.cpp:** the files also load there with its Hy4-flash pull request
   ([ggml-org/llama.cpp #32517](https://github.com/ggml-org/llama.cpp/pull/32517), not merged yet).
 
 Not available for Hy4-Flash yet (the dashboard offers no switch for them):
 
-- **Drafting with Maya's sizes:** the release's drafter is not read by the engine yet. Tencent's own Q4_K_M (below)
-  carries the model's MTP block and drafts with it.
 - **Several requests at once:** no `--parallel`; one request at a time for now.
 - **AMD and Mac:** NVIDIA only.
 
