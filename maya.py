@@ -8118,6 +8118,29 @@ def hy4_need_gib(plan: dict, ctx: int) -> float:
     return table[base] + (hy4_cache_bytes(ctx, chunk) - hy4_cache_bytes(base, chunk)) / 2**30
 
 
+def hy4_fit_need_gib(plan: dict, ctx: int) -> float:
+    """hy4_need_gib as the fit counts it: a context the plan's table does not list (worked out, not measured on a
+    card) with HY4_FIT_MARGIN_GIB on top."""
+    return hy4_need_gib(plan, ctx) + (0.0 if str(ctx) in (plan.get("need_gib") or {}) else HY4_FIT_MARGIN_GIB)
+
+
+def hy4_config_need_gib(quant: str, layout: str, ctx: int, chunk: int | None = None,
+                        reserve_gb: float | None = None) -> float | None:
+    """The VRAM (GiB) a size already set up needs at a context, as hy4_fit counts it (the dashboard's Models page
+    asks before it writes a context into a config - serve/models.py's hy4_room): its layout's plan
+    (hy4_fit_need_gib), a prompt chunk above the plan's as hy4_fit doubles it (HY4_CHUNK_UP_GIB), and a --reserve-gb
+    other than the plan's by the difference.  None for a size or a layout the manifest has no plan for."""
+    plan = (hy4_layouts(hy4_quant_table(quant)).get(layout or HY4_STANDARD) or {}).get("plan") or {}
+    if not plan.get("need_gib"):
+        return None
+    need = hy4_fit_need_gib(plan, int(ctx))
+    if chunk and int(plan.get("chunk") or 0) and int(chunk) > int(plan["chunk"]):
+        need += HY4_CHUNK_UP_GIB
+    if reserve_gb is not None and "reserve_gb" in plan:
+        need += float(reserve_gb) - float(plan["reserve_gb"])
+    return need
+
+
 def hy4_usable_gib(gpus: list, used: dict | None = None) -> float:
     """The VRAM (GiB) the chosen cards have for the model: their total less what is in use on each now (nvidia-smi;
     at most HY4_FIT_USED_CAP_GIB a card counts - more is a program that can be closed).  No reading: one card is
@@ -8144,9 +8167,7 @@ def hy4_fit(q: dict, gpus: list, ctx_wanted: int | None = None, used: dict | Non
         lays = {k: v for k, v in lays.items() if k == layout}
     usable = hy4_usable_gib(gpus, used)
 
-    def need(plan: dict, ctx: int) -> float:           # (a context the table does not list: not measured on a card)
-        return hy4_need_gib(plan, ctx) + (0.0 if str(ctx) in (plan.get("need_gib") or {}) else HY4_FIT_MARGIN_GIB)
-
+    need = hy4_fit_need_gib                            # (a context the table does not list: not measured on a card)
     least = HY4_CONTEXTS[0]
     cards = f"{len(gpus)} cards together have" if len(gpus or []) > 1 else "this card has"
     fits = {k: [c for c in HY4_CONTEXTS if need(v["plan"], c) <= usable] for k, v in lays.items()}
