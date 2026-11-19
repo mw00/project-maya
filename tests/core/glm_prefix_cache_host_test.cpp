@@ -63,7 +63,14 @@ static void scan_checks(const fs::path& root) {
             Scan scan(dir, true);
             std::error_code ec;
             size_t batches = 0, peak = 0;
-            for (auto batch = scan.next(ec); !batch.empty(); batch = scan.next(ec)) {
+            expect(scan.all_entries().empty(), "SCAN_ATOMIC no catalogue is public before enumeration");
+            auto first = scan.next(ec);
+            expect(scan.visited_entries() == count && scan.candidate_entries() == expected.size(),
+                   "SCAN_SINGLE_PASS first next completes exact visit and candidate counts");
+            expect(scan.all_entries().size() == expected.size() &&
+                   std::equal(scan.all_entries().begin(), scan.all_entries().end(), expected.begin()),
+                   "SCAN_ATOMIC first next exposes only the complete sorted catalogue");
+            for (auto batch = first; !batch.empty(); batch = scan.next(ec)) {
                 ++batches;
                 peak = std::max(peak, batch.size());
                 for (const auto& item : batch) {
@@ -74,6 +81,8 @@ static void scan_checks(const fs::path& root) {
             std::printf("SCAN_CASE count=%zu candidates=%zu delete=%d batches=%zu peak=%zu\n",
                         count, expected.size(), int(deleting), batches, peak);
             expect(!ec, "scan normal mixed directory has no filesystem errors");
+            expect(scan.visited_entries() == count && scan.candidate_entries() == expected.size(),
+                   "SCAN_SINGLE_PASS returning later windows never enumerates again");
             expect(peak <= 64, "scan batch never exceeds 64 entries");
             expect(batches == (expected.size() + 63) / 64, "scan crosses all candidate batch boundaries without empty gaps");
             expect(visited == expected, "scan preserves all timestamp/path ordering including deleted cursors");
@@ -83,6 +92,49 @@ static void scan_checks(const fs::path& root) {
             expect(count < 3 || fs::exists(dir / "unrelated-2.bin"), "scan leaves unrelated mixed items untouched");
         }
     }
+    const auto budget_dir = root / "scan-small-budgets";
+    for (const char* name : {"slot-a.meta", "branch-b.bin", "slot-c.tmp"}) put(budget_dir / name, "fixture");
+    Scan exact(budget_dir, true, 3, 3);
+    std::error_code ec;
+    expect(exact.next(ec).size() == 3 && !ec && exact.visited_entries() == 3 && exact.candidate_entries() == 3,
+           "SCAN_BUDGET exact small visit and candidate limits complete at end");
+    put(budget_dir / "slot-later.meta", "fixture");
+    expect(exact.next(ec).empty() && !ec && exact.all_entries().size() == 3 && exact.visited_entries() == 3,
+           "SCAN_SINGLE_PASS entries added after first next do not trigger another enumeration");
+    fs::remove(budget_dir / "slot-later.meta");
+    Scan visit_limited(budget_dir, true, 2, 3);
+    expect(visit_limited.next(ec).empty() && ec == std::errc::no_buffer_space &&
+           visit_limited.visited_entries() == 2 && visit_limited.candidate_entries() == 2 &&
+           visit_limited.all_entries().empty(),
+           "SCAN_BUDGET small visit limit fails atomically before processing an extra item");
+    ec.clear();
+    expect(visit_limited.next(ec).empty() && ec == std::errc::no_buffer_space &&
+           visit_limited.visited_entries() == 2 && visit_limited.all_entries().empty(),
+           "SCAN_BUDGET failed enumeration is sticky and never exposes partial items");
+    Scan candidate_limited(budget_dir, true, 3, 2);
+    expect(candidate_limited.next(ec).empty() && ec == std::errc::no_buffer_space &&
+           candidate_limited.visited_entries() == 3 && candidate_limited.candidate_entries() == 2 &&
+           candidate_limited.all_entries().empty(),
+           "SCAN_BUDGET small candidate limit fails before reading or retaining an extra candidate");
+    Scan zero_visits(budget_dir, true, 0, 3);
+    expect(zero_visits.next(ec).empty() && ec == std::errc::no_buffer_space &&
+           zero_visits.visited_entries() == 0 && zero_visits.candidate_entries() == 0,
+           "SCAN_BUDGET zero visits rejects a nonempty directory without processing items");
+    const auto irrelevant_dir = root / "scan-small-unrelated";
+    put(irrelevant_dir / "notes.txt", "fixture");
+    put(irrelevant_dir / "other.bin", "fixture");
+    Scan no_candidates(irrelevant_dir, true, 2, 0);
+    expect(no_candidates.next(ec).empty() && !ec && no_candidates.visited_entries() == 2 &&
+           no_candidates.candidate_entries() == 0 && no_candidates.all_entries().empty(),
+           "SCAN_BUDGET unrelated entries count as visits but require no candidate allowance");
+    const auto empty_dir = root / "scan-small-empty";
+    fs::create_directory(empty_dir);
+    Scan empty(empty_dir, true, 0, 0);
+    expect(empty.next(ec).empty() && !ec && empty.visited_entries() == 0 && empty.candidate_entries() == 0,
+           "SCAN_BUDGET empty directory succeeds with zero limits and no error");
+    Scan clamped(empty_dir, true, std::numeric_limits<size_t>::max(), std::numeric_limits<size_t>::max());
+    expect(clamped.visit_limit() == Scan::max_visits && clamped.candidate_limit() == Scan::max_candidates,
+           "SCAN_BUDGET explicit limits cannot enlarge production bounds");
 }
 struct CgroupFixture {
     fs::path dir, root;

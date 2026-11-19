@@ -1467,15 +1467,18 @@ static int glm_pack_generate(const Options& o) {
     namespace fs = std::filesystem;
     std::filesystem::path slot_dir;
     bool branch_index_complete = true;
+    bool slot_disk_writable = true;
     const auto slot_io_failure = [&](const fs::path& path, const std::error_code& ec) {
         branch_index_complete = false;
-        std::fprintf(stderr, "glm slots: I/O failed for %s (%s); cache writes disabled until restart\n",
+        slot_disk_writable = false;
+        std::fprintf(stderr, "glm slots: I/O failed for %s (%s); disk cache writes disabled until restart; cleanup disabled\n",
                      path.string().c_str(), ec.message().c_str());
     };
     const auto slot_remove_file = [&](const fs::path& path) {
+        if (!slot_disk_writable) return false;
         std::error_code ec;
         fs::remove(path, ec);
-        if (ec && branch_enabled) slot_io_failure(path, ec);
+        if (ec) slot_io_failure(path, ec);
         return !ec;
     };
     // what a kept slot must match: the session format, the engine version, the pack and the model's shards (names and
@@ -1587,6 +1590,7 @@ static int glm_pack_generate(const Options& o) {
                                                  : std::filesystem::path(o.glm_pack) / "slots";
         std::error_code ec;
         std::filesystem::create_directories(slot_dir, ec);
+        if (ec) slot_io_failure(slot_dir, ec);
         struct Found {
             std::string bin;
             std::vector<int32_t> toks;
@@ -1600,10 +1604,12 @@ static int glm_pack_generate(const Options& o) {
         uint64_t branch_bytes = 0;
         size_t branch_tokens = 0;
         size_t refused = 0;
-        // Shared fixed-storage ordering preserves newest-first quota selection.
+        // The first next() completes the bounded scan before exposing any files
+        // for recovery or cleanup. Budget/scan failure cannot partially recover.
         strata::core::SlotDirectoryScan scan(slot_dir, branch_enabled);
-        for (auto entries = scan.next(ec); !entries.empty(); entries = scan.next(ec)) {
+        for (auto entries = scan.next(ec); slot_disk_writable && !entries.empty(); entries = scan.next(ec)) {
             for (const auto& [stamp, entry] : entries) {   // newest metadata first
+                if (!slot_disk_writable) break;
                 const std::string fn = entry.filename().string(), p = entry.string();
                 const bool learned = fn.rfind("branch-", 0) == 0;
                 if (fn.rfind("slot-", 0) != 0 && (!branch_enabled || !learned)) continue;
@@ -1617,6 +1623,10 @@ static int glm_pack_generate(const Options& o) {
                 const std::string bin = p.substr(0, p.size() - 5) + ".bin";
                 Found fd{bin, {}, 0, stamp, kNoImages};
                 const uint64_t have = fs::exists(bin, ec) ? (uint64_t) fs::file_size(bin, ec) : 0;
+                if (ec) {
+                    slot_io_failure(bin, ec);
+                    break;
+                }
                 bool valid = false;
                 if (learned && !branch_identity.empty() && memory_permits(branch::max_state_tokens * sizeof(int32_t))) {
                     std::ifstream f(p, std::ios::binary);
@@ -1652,26 +1662,23 @@ static int glm_pack_generate(const Options& o) {
                 }
             }
         }
-        if (ec && branch_enabled) slot_io_failure(slot_dir, ec);
-        if (slot_keep) {   // a .bin without its .meta was never completed
-            fs::directory_iterator orphan(slot_dir, ec), end;
-            if (ec && branch_enabled) slot_io_failure(slot_dir, ec);
-            while (!ec && orphan != end) {
-                const auto path = orphan->path();
+        if (ec) slot_io_failure(slot_dir, ec);
+        if (slot_keep && slot_disk_writable) {   // reuse the one successful scan for orphan cleanup
+            for (const auto& [stamp, path] : scan.all_entries()) {
+                if (!slot_disk_writable) break;
                 const std::string p = path.string(), fn = path.filename().string();
                 if ((fn.rfind("slot-", 0) == 0 || (branch_enabled && fn.rfind("branch-", 0) == 0)) &&
                     fn.size() > 9 && fn.compare(fn.size() - 4, 4, ".bin") == 0) {
                     const bool has_meta = fs::exists(meta_of(p), ec);
                     if (ec) {
-                        if (branch_enabled) slot_io_failure(meta_of(p), ec);
+                        slot_io_failure(meta_of(p), ec);
                         break;   // unknown metadata is not proof of an orphan
                     }
                     if (!has_meta) slot_remove_file(path);
                 }
-                orphan.increment(ec);
-                if (ec && branch_enabled) slot_io_failure(slot_dir, ec);
             }
         }
+        if (!slot_disk_writable) found.clear();
         std::sort(found.begin(), found.end(), [](const Found& a, const Found& b) {
             return a.t != b.t ? a.t < b.t : a.bin > b.bin;
         });
@@ -1715,7 +1722,7 @@ static int glm_pack_generate(const Options& o) {
     const auto slot_touch = [&](Slot& s) {
         s.used = ++slot_clock;
         s.used_at = fs::file_time_type::clock::now();
-        if (slot_keep && !s.data && (!branch_enabled || branch_index_complete)) {
+        if (slot_keep && !s.data && slot_disk_writable) {
             std::error_code ec;
             fs::last_write_time(meta_of(s.path), s.used_at, ec);
         }
@@ -1748,7 +1755,7 @@ static int glm_pack_generate(const Options& o) {
                s.tokens.size() * sizeof(int32_t);
     };
     const auto disk_fits = [&](const Slot& s) {
-        if (!branch_index_complete) return false;
+        if (!slot_disk_writable || !branch_index_complete) return false;
         if (s.bytes > slot_disk_budget) return false;
         const auto need = disk_need(s);
         if (need > slot_disk_budget) return false;
@@ -1760,7 +1767,7 @@ static int glm_pack_generate(const Options& o) {
         return cache_memory::permits(slot_disk_budget, slot_disk_bytes(), need);
     };
     const auto publish_files = [&](Slot& s, const auto& write_payload) {
-        if (branch_enabled && !branch_index_complete) return false;
+        if (!slot_disk_writable || (branch_enabled && !branch_index_complete)) return false;
         const auto stamp = std::chrono::duration_cast<std::chrono::microseconds>(
             std::chrono::system_clock::now().time_since_epoch()).count();
         const std::string path = (slot_dir / ((s.branch_id ? "branch-" : "slot-") + std::to_string(stamp) +
@@ -1794,7 +1801,8 @@ static int glm_pack_generate(const Options& o) {
     };
     // Moving a cold RAM slot to disk is not a use: it must remain eligible for eviction ahead of hotter files.
     const auto slot_trim_disk = [&]() {
-        while (slot_disk_bytes() > slot_disk_budget) {
+        if (!slot_disk_writable) return;
+        while (slot_disk_bytes() > slot_disk_budget && slot_disk_writable) {
             size_t lru = SIZE_MAX;
             for (size_t i = 0; i < slots.size(); ++i)
                 if (!slots[i].data &&
@@ -1810,6 +1818,7 @@ static int glm_pack_generate(const Options& o) {
     };
     // a RAM slot into the folder (its bytes, then its .meta). false: not written
     const auto slot_write_file = [&](size_t i) -> bool {
+        if (!slot_disk_writable) return false;
         if (branch_enabled) {
             auto& s = slots[i];
             if (!memory_permits(1u << 20) || !disk_fits(s)) return false;
@@ -1844,7 +1853,7 @@ static int glm_pack_generate(const Options& o) {
             f.write((const char*) slots[i].data->data(), (std::streamsize) slots[i].data->size());
             f.flush();
             if (!f) {
-                std::filesystem::remove(path + ".tmp", ec);
+                slot_remove_file(path + ".tmp");
                 std::fprintf(stderr, "glm slots: writing %s.tmp failed\n", path.c_str());
                 return false;
             }
@@ -1853,10 +1862,10 @@ static int glm_pack_generate(const Options& o) {
         const bool written = !ec && meta_write(meta_of(path), slots[i].tokens, slots[i].bytes, slots[i].img);
         if (written) fs::last_write_time(meta_of(path), slots[i].used_at, ec);
         if (!written || ec) {
-            std::filesystem::remove(path + ".tmp", ec);
-            std::filesystem::remove(path, ec);
-            std::filesystem::remove(meta_of(path), ec);
-            std::filesystem::remove(meta_of(path) + ".tmp", ec);
+            slot_remove_file(path + ".tmp");
+            slot_remove_file(path);
+            slot_remove_file(meta_of(path));
+            slot_remove_file(meta_of(path) + ".tmp");
             std::fprintf(stderr, "glm slots: writing %s failed\n", path.c_str());
             return false;
         }
@@ -1890,6 +1899,7 @@ static int glm_pack_generate(const Options& o) {
     if (slot_spill) slot_trim_disk();
     // the conversation in the model (its snapshot, snap_tokens) into a slot
     const auto slot_put = [&](const char* why) {
+        if (!slot_ram && !slot_spill && !slot_disk_writable) return;
         if (branch_enabled && !branch_index_complete) return;
         if (slot_max <= 0 || snap_in_slot || snap_tokens.size() < slot_min) return;
         if (model.ablating()) return;   // (--ablate: a projected conversation is not kept - it is read again)
@@ -2010,6 +2020,7 @@ static int glm_pack_generate(const Options& o) {
             note(m);
             return;
         }
+        if (!slot_disk_writable) return;
         std::error_code ec;
         const auto space = std::filesystem::space(slot_dir, ec);
         if (!ec && space.available < (uint64_t) 8 << 30) {
@@ -2026,8 +2037,10 @@ static int glm_pack_generate(const Options& o) {
         const uint64_t bytes = model.slot_save(path + ".tmp", e);
         if (bytes == 0 || (std::filesystem::rename(path + ".tmp", path, ec), ec) ||
             !meta_write(meta_of(path), snap_tokens, bytes, snap_img_hash)) {
-            std::filesystem::remove(path + ".tmp", ec);
-            std::filesystem::remove(path, ec);
+            slot_remove_file(path + ".tmp");
+            slot_remove_file(path);
+            slot_remove_file(meta_of(path));
+            slot_remove_file(meta_of(path) + ".tmp");
             std::fprintf(stderr, "glm slots: setting the conversation aside failed (%s)\n",
                          e.empty() ? "writing its files" : e.c_str());
             return;

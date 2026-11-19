@@ -1,5 +1,5 @@
   else if (which.rfind("branch-", 0) == 0) {
-    if (!branch_enabled) fail("candidate did not enable in fixture");
+    if (!branch_enabled && which.rfind("branch-scan-",0)!=0) fail("candidate did not enable in fixture");
     auto a = std::vector<int32_t>(4000, 17), b = a, c = a;
     b[1883] = 19; c[1883] = 23;
     auto seed = [&] { model.live_pos = 1883; branch_save(b, 1883); };
@@ -8,7 +8,25 @@
       for (const auto& e : std::filesystem::directory_iterator(slot_dir, ec)) ++n;
       return n;
     };
-    if (which.rfind("branch-cleanup-", 0)==0) {
+    if (which.rfind("branch-scan-",0)==0) {
+      const bool legacy = which.ends_with("-legacy");
+      if (branch_enabled==legacy || slot_disk_writable || !slots.empty() || count_files()!=4)
+        fail("bounded scan failure deleted files or partially restored the catalogue");
+      const auto pending = slot_dir / "slot-scan-pending.tmp";
+      if (slot_remove_file(pending) || !std::filesystem::exists(pending))
+        fail("failed scan left disk cleanup enabled");
+      snap_tokens=a; snap_in_slot=false;
+      slot_put("");
+      if (legacy && slot_spill && (!snap_in_slot || model.vector_saves!=1))
+        fail("disk scan failure disabled normal RAM caching");
+      if (legacy && !slot_spill && (snap_in_slot || model.file_saves))
+        fail("failed scan admitted an ordinary direct-disk save");
+      Slot fresh{{51}, "", 8, ++slot_clock}; fresh.data=ram();
+      slots.push_back(std::move(fresh));
+      if (slot_write_file(slots.size()-1) || model.file_saves || count_files()!=4)
+        fail("failed scan left ordinary disk writes enabled");
+      slot_flush_on_exit.enabled=false;
+    } else if (which.rfind("branch-cleanup-", 0)==0) {
       auto family = [&](int32_t id) { auto p = b; p[0] = id; return p; };
       auto put = [&](int32_t id) { model.live_pos=1883; branch_save(family(id),1883); };
       if (which=="branch-cleanup-restart" || which=="branch-cleanup-retire-restart") {

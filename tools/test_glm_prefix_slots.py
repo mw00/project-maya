@@ -29,6 +29,8 @@ CASES = ("branch-policy-completion", "branch-policy-slot", "branch-policy-disabl
          "branch-lru-pressure", "branch-lru-staging", "branch-lru-staging-room",
          "branch-lru-staging-save-fail", "branch-lru-staging-meta-fail", "branch-lru-staging-bound",
          "branch-lru-staging-pressure", "branch-lru-staging-reindex",
+         "branch-scan-visit", "branch-scan-candidate", "branch-scan-visit-legacy", "branch-scan-candidate-legacy",
+         "branch-scan-visit-direct-legacy", "branch-scan-visit-cleanup-legacy",
          "branch-cleanup-start-tmp", "branch-cleanup-start-meta", "branch-cleanup-start-bin",
          "branch-cleanup-start-iter", "branch-cleanup-start-exists",
          "branch-cleanup-rollback", "branch-cleanup-retire", "branch-cleanup-restart",
@@ -59,12 +61,14 @@ static std::filesystem::path fixture_slot_dir;
 static std::string fixture_remove_failure;
 static int fixture_io_errors = 0;
 static bool fixture_orphan_iter_fail = false, fixture_orphan_exists_fail = false;
-static auto fixture_orphan_iterator(const std::filesystem::path& path, std::error_code& ec) {
+static std::size_t fixture_scan_visits = strata::core::SlotDirectoryScan::max_visits;
+static std::size_t fixture_scan_candidates = strata::core::SlotDirectoryScan::max_candidates;
+static std::filesystem::path fixture_scan_directory(const std::filesystem::path& path) {
   if (fixture_orphan_iter_fail) {
-    ++fixture_io_errors; ec = std::make_error_code(std::errc::permission_denied);
-    return std::filesystem::directory_iterator{};
+    ++fixture_io_errors;
+    return path / "missing-directory";
   }
-  return std::filesystem::directory_iterator(path, ec);
+  return path;
 }
 static bool fixture_orphan_exists(const std::filesystem::path& path, std::error_code& ec) {
   if (fixture_orphan_exists_fail) {
@@ -190,6 +194,17 @@ SETUP = r'''
   }
   if (which=="branch-lru-staging-room") set_env("MAYA_GLM_LEARNED_STATES", "16");
   if (which.rfind("branch-cleanup-", 0)==0) set_env("MAYA_GLM_SLOT_RAM_GB", "0");
+  if (which.rfind("branch-scan-", 0)==0) {
+    if (which.ends_with("-legacy")) set_env("MAYA_GLM_LEARNED_PREFIX", "");
+    if (which.find("-direct-")!=std::string::npos || which.find("-cleanup-")!=std::string::npos) {
+      set_env("MAYA_GLM_SLOT_SPILL", "0"); set_env("MAYA_GLM_SLOT_RAM_GB", "0");
+      set_env("MAYA_GLM_SLOT_KEEP", which.find("-cleanup-")!=std::string::npos ? "0" : "1");
+    }
+    fixture_scan_visits = which.find("-visit")!=std::string::npos ? 2 : strata::core::SlotDirectoryScan::max_visits;
+    fixture_scan_candidates = which.find("-candidate")!=std::string::npos ? 2 : strata::core::SlotDirectoryScan::max_candidates;
+    std::ofstream(fixture_slot_dir / "slot-scan-pending.tmp").put('p');
+    std::ofstream(fixture_slot_dir / "unrelated.txt").put('u');
+  }
 '''
 
 
@@ -200,8 +215,9 @@ def fixture(source: str) -> str:
     # every cache policy branch remains extracted from production.
     block = block.replace("std::filesystem::remove(", "fixture_remove(")
     block = block.replace("fs::remove(", "fixture_remove(")
-    block = block.replace("fs::directory_iterator orphan(slot_dir, ec), end;",
-                          "auto orphan = fixture_orphan_iterator(slot_dir, ec); fs::directory_iterator end;")
+    block = block.replace("strata::core::SlotDirectoryScan scan(slot_dir, branch_enabled);",
+                          "strata::core::SlotDirectoryScan scan(fixture_scan_directory(slot_dir), branch_enabled, "
+                          "fixture_scan_visits, fixture_scan_candidates);")
     block = block.replace("const bool has_meta = fs::exists(meta_of(p), ec);",
                           "const bool has_meta = fixture_orphan_exists(meta_of(p), ec);")
     if block.count("cache_memory::available_bytes()") != 1:
@@ -222,6 +238,7 @@ def fixture(source: str) -> str:
     cpp = cpp.replace('which != "cli-reindex" &&', 'which != "branch-lru-staging-reindex" && which != "cli-reindex" &&')
     cpp = cpp.replace('which != "cli-reindex" &&', 'which != "branch-cleanup-restart" && which != "cli-reindex" &&')
     cpp = cpp.replace('which != "cli-reindex" &&', 'which != "branch-cleanup-retire-restart" && which != "cli-reindex" &&')
+    cpp = cpp.replace('which != "cli-reindex" &&', 'which.rfind("branch-scan-", 0) != 0 && which != "cli-reindex" &&')
     cpp = cpp.replace('std::ofstream(root / "pack" / n).put(\'x\');', 'if (!std::filesystem::exists(root / "pack" / n)) std::ofstream(root / "pack" / n).put(\'x\');')
     cpp = cpp.replace("  Options o;", SETUP + "\n  Options o;")
     extra = (ROOT / "tests/core/glm_prefix_slot_cases.inc").read_text(encoding="utf-8")
@@ -321,13 +338,14 @@ def main() -> int:
                 for case in args.cases or CASES:
                     case_root = (td / PAIRS.get(case, case)).resolve()
                     if not case_root.is_relative_to(td): raise RuntimeError("case path escaped temporary directory")
-                    if case.startswith("branch-policy-"):
-                        seeded = subprocess.run([str(exe), "branch-ready-short-disk", str(case_root)], cwd=td,
+                    if case.startswith(("branch-policy-", "branch-scan-")):
+                        seed_case = "branch-legacy-meta" if case.startswith("branch-scan-") else "branch-ready-short-disk"
+                        seeded = subprocess.run([str(exe), seed_case, str(case_root)], cwd=td,
                                                 capture_output=True, text=True, timeout=15)
                         receipt[case + "-seed"] = {"exit_code": seeded.returncode, "stdout": seeded.stdout,
                                                    "stderr": seeded.stderr}
                         if seeded.returncode:
-                            raise RuntimeError(f"policy seed failed: {case}")
+                            raise RuntimeError(f"fixture seed failed: {case}")
                     ran = subprocess.run([str(exe), case, str(case_root)], cwd=td, capture_output=True, text=True, timeout=15)
                     assertion_error = ""
                     if case == "miss":

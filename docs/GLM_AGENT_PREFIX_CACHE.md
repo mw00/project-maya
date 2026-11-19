@@ -125,11 +125,13 @@ Host regressions cover the learned-enabled ordinary snapshot's capacity rejectio
 payload failure and metadata publication failure without losing the previous slot.
 Startup now orders lightweight file metadata by recency before reading/admitting
 learned token keys, so reduced count/byte/token quotas favor the newest entries
-that fit while retaining the existing aggregate token bound. Each directory pass
-keeps up to 64 path/timestamp records plus its cursor and current candidate.
-This bounds temporary ordering records, not the full index or its byte size.
-The tradeoff is repeated directory traversal; large-directory startup time has
-not been benchmarked.
+that fit while retaining the existing aggregate token bound. Startup enumerates
+the directory once, allowing at most 8192 visited directory entries and 1024
+candidate records. It sorts candidates only after the whole scan succeeds and uses that
+same list for orphan checks. Exceeding either limit leaves the directory alone:
+no partial index is restored and new disk writes are disabled for the run.
+These limits apply to scan work and temporary records, not to the byte size of
+the full slot index.
 
 Explicitly lowered completion thresholds can produce a nonempty total key below
 1024 tokens. Metadata now accepts the same nonempty bounded key in RAM, on SSD
