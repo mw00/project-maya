@@ -1,4 +1,4 @@
-// src/hy4/hy4_main.cpp - maya-hy4: Tencent's Hy4-flash (a GGUF set) on NVIDIA GPUs.
+// src/hy4/hy4_main.cpp - maya-hy4: Tencent's Hy4-flash (a GGUF set) on NVIDIA GPUs (CUDA) and AMD GPUs (HIP, Linux).
 //
 //   maya-hy4 --pack <model>/maya-hy4 --serve [--gpus 0,1,...] [--max-context N] [--chunk N] [--eos id,id,...]
 //            [--mtp [--draft N] [--draft-floor P]] [--vram-experts F] [--cpu-threads N] [--profile F] [--profile-out F]

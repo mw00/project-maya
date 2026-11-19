@@ -852,6 +852,31 @@ struct Model::Impl {
             CK(cudaEventCreateWithFlags(&G[i].ev, cudaEventDisableTiming | cudaEventBlockingSync));
             size_t fr = 0, tot = 0;
             CK(cudaMemGetInfo(&fr, &tot));
+#if !defined(_WIN32)
+            // a unified-memory GPU (an APU: Strix Halo / Gorgon Halo): its memory is the system's RAM, so what the
+            // model may take is what the RAM has (MemAvailable: the model's own file cache counts as available - the
+            // kernel drops it as the weights are copied in, the file is never held twice) less a headroom for the
+            // system and the other programs, max(8 GiB, a tenth of the RAM) - HY4_RAM_HEADROOM_GB: another one
+            int integrated = 0;
+            if (cudaDeviceGetAttribute(&integrated, cudaDevAttrIntegrated, devs[i]) != cudaSuccess) {
+                cudaGetLastError();
+                integrated = 0;
+            }
+            if (integrated != 0) {
+                const uint64_t avail = ram_available(), ram = ram_total();
+                double head = std::max(8.0 * 1073741824.0, 0.1 * (double) ram);
+                if (const char* h = std::getenv("HY4_RAM_HEADROOM_GB")) head = std::max(0.0, std::atof(h)) * 1073741824.0;
+                if (avail > 0) {
+                    const double room = std::max(0.0, (double) avail - head);
+                    char ub[256];
+                    std::snprintf(ub, sizeof ub, "INFO GPU%zu shares the system's memory: %.1f GB of it available, %.1f GB "
+                                  "kept free for the system, %.1f GB for the model", i, (double) avail / 1e9, head / 1e9,
+                                  std::min(room, (double) fr) / 1e9);
+                    info.push_back(ub);
+                    if (room < (double) fr) fr = (size_t) room;
+                }
+            }
+#endif
             free_b[i] = (double) fr - o.reserve_gb * 1e9 - (double) scratch_bytes();
             G[i].bw = measure_bw(err);
             if (G[i].bw <= 0) return false;

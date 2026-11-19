@@ -1007,6 +1007,24 @@ __global__ void __launch_bounds__(1024) moe_sort_kernel(const int* __restrict__ 
         tok[r] = i / n_used;
         row_of[i] = r;
     }
+#if defined(STRATA_USE_HIP)
+    // AMD: the scatter's order within an expert is the order its threads' atomics land in, which differs from one
+    // run to the next there - and the expert kernels' sums of a row depend a little on the rows beside it (their
+    // tiles), so two starts gave two answers.  Each expert's rows put in token order (a token routes to an expert
+    // once: its rank among the expert's tokens is its row) - the same rows every run
+    __syncthreads();
+    for (int i = threadIdx.x; i < n_ent; i += blockDim.x) {
+        const int s = slot ? slot[ids[i]] : ids[i];
+        if (s < 0) continue;
+        const int t = i / n_used, b0 = bounds[s], b1 = cnt[s];   // (cnt: each expert's end after the scatter)
+        int rank = 0;
+        for (int r = b0; r < b1; ++r) rank += tok[r] < t ? 1 : 0;
+        row_of[i] = b0 + rank;
+    }
+    __syncthreads();
+    for (int i = threadIdx.x; i < n_ent; i += blockDim.x)
+        if (row_of[i] >= 0) tok[row_of[i]] = i / n_used;
+#endif
 }
 __global__ void moe_combine_kernel(const float* __restrict__ y, const int* __restrict__ row_of,
                                    const float* __restrict__ w, int n_used, int n, float* __restrict__ out, int acc) {

@@ -365,6 +365,18 @@ uint64_t ram_available() {
 #endif
 }
 
+uint64_t ram_total() {
+#if defined(_WIN32)
+    MEMORYSTATUSEX s{};
+    s.dwLength = sizeof(s);
+    return GlobalMemoryStatusEx(&s) ? (uint64_t) s.ullTotalPhys : 0;
+#else
+    const std::string m = read_file("/proc/meminfo");
+    const size_t at = m.find("MemTotal:");
+    return at == std::string::npos ? 0 : (uint64_t) std::strtoull(m.c_str() + at + 9, nullptr, 10) * 1024;
+#endif
+}
+
 void cpu_experts(Lane& lane, const CpuExperts& ex, const std::vector<CpuEntry>& entries, const float* x, int T,
                  float* out) {
     const iqc::IqCpu& f = ex.f;

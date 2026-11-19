@@ -92,6 +92,8 @@ void place_experts(const CpuExperts& ex, const std::vector<int>& experts, int no
 /// a page, or the disk.  ram_available: the RAM the system can still give, file cache included (0: not known).
 void warm_experts(const CpuExperts& ex, const std::vector<int>& experts, const std::atomic<bool>& stop);
 uint64_t ram_available();
+/// the system's RAM (0: not known)
+uint64_t ram_total();
 
 /// out [T][n_embd] = each token's weighted sum of its entries' experts (rows with no entry: 0), x [T][n_embd]; the
 /// experts' weights read once for up to 8 of their tokens.  Scratch is the lane's own (grown as needed).
