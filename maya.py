@@ -791,8 +791,9 @@ QWEN_QUANTS = ("q5_k_m", QWEN_UD)
 # every set, from Maya's repo: downloaded once, hard-linked) is read from the SSD page by page, never loaded into RAM.
 # Pictures: the model's vision tower (the mmproj file beside the set - Maya's own Q8_0 one for every Maya size,
 # AngelSlim's BF16 for the Q4_K_M; not with --no-vision) runs in the engine a picture at a time: its weights stay in the
-# file, a picture's room (HY4_VISION_GIB) is kept free on the main GPU - where the model leaves none (8 GB cards) the
-# setup turns pictures off and says so.  It thinks at one level (high) or not at all (no_think); its sampling is its
+# file, a picture's room (HY4_VISION_GIB; a smaller picture's where the VRAM holds no more - the engine says the size,
+# the server resizes to it) is kept free on the main GPU - where the model leaves none the setup turns pictures off
+# and says so.  It thinks at one level (high) or not at all (no_think); its sampling is its
 # generation_config.json's (maya_quants.MODEL_DEFAULTS["hy4"]); one request at a time.  Each Maya size in <models
 # folder>/<its full name> (a layout of it: <name>-8GB), its config maya-hy4-flash-maya-xs.json; the Q4_K_M in <models
 # folder>/Hy4-flash, its config maya-hy4-flash.json.
@@ -806,12 +807,20 @@ HY4_QUANTS = {k: Q.full_name("hy4", k) for f, k, _, _ in Q.QUANTS if f == "hy4"}
 HY4_Q4 = "q4_k_m"                                  # Tencent's own Q4_K_M (AngelSlim): the table's "others"
 HY4_MIN_CC = 70                                    # (built and run on V100 sm_70, RTX 30 and RTX 50)
 HY4_Q4_TESTED_CC = 80                              # (the Q4_K_M with its drafts has run on RTX 30 and RTX 50 cards: Ampere on)
-HY4_CONTEXTS = [4096, 8192, 16384, 32768, 65536, 131072]
+# (a Maya quant: every context up to the model's own reach, 1M, that fits the cards' VRAM - hy4_fit; the cache has no
+#  RAM path in this engine yet, so a context is VRAM alone)
+HY4_CONTEXTS = [4096, 8192, 16384, 32768, 65536, 131072, 262144, 524288, 1048576]
 HY4_TESTED_CONTEXT = 32768                         # (a Maya quant past it: not run end to end yet - said; the setup recommends up to it)
 # (the Q4_K_M: run end to end up to 256K - above what F16 rows fit, the engine's --kv auto keeps a tensor-parallel
-#  group's cache in 8-bit rows; the model's own reach: 1M)
+#  group's cache in 8-bit rows; the model's own reach: 1M - HY4_Q4_LONG, offered where the smallest GPU is large
+#  enough for the cache: hy4_q4_contexts)
 HY4_Q4_CONTEXTS = [32768, 65536, 131072, 262144]
+HY4_Q4_LONG = [524288, 1048576]
+HY4_Q4_LONG_SHARE = 0.25                           # (the cache in 8-bit rows: at most this share of the smallest GPU's VRAM)
 HY4_VISION_GIB = 0.81                              # (the engine's room for its largest picture, 2048 x 2048: 828 MB of the main GPU)
+# (... and for the smallest picture budget it takes, a sixteenth of the largest: 512 x 512 - src/hy4/hy4_vision.cu's
+#  layout: the weights' two slots, the attention's scores, cuBLAS's workspace and the patches' rows)
+HY4_VISION_MIN_GIB = 0.21
 HY4_DEFAULT_CONTEXT = 65536
 # its cache a context token: the 13 layers that keep every position (the 12 indexed ones and the MTP block) - the latent
 # (512 + 64 rope, F16) and the indexer's pooled keys (128 F32 every 4 positions); the sliding-window layers keep a ring
@@ -1782,17 +1791,13 @@ def context_label(n: int) -> str:
     return f"{n // 1048576}M" if n % 1048576 == 0 else f"{n // 1024}K"
 
 
-def choose_context(a, prev_ctx, contexts=CONTEXTS, recommended=DEFAULT_CONTEXT, notes: dict | None = None) -> int:
-    """notes: {context: a word said beside it} (Hy4-Flash: where its cache is kept in 8 bits)."""
+def choose_context(a, prev_ctx, contexts=CONTEXTS, recommended=DEFAULT_CONTEXT) -> int:
     if a.context:
         return a.context
     default = prev_ctx if prev_ctx in contexts else recommended
-    notes = notes or {}
     pick = choose("Context?", ["Context length = how much text the model sees at once (the chat, files, tool output). "
                                "A longer one takes", "VRAM from the expert cache, so answers get a little slower:"],
-                  [(f"{context_label(c)} tokens",
-                    ", ".join(x for x in ("recommended" if c == recommended else None, notes.get(c)) if x) or None, None)
-                   for c in contexts],
+                  [(f"{context_label(c)} tokens", "recommended" if c == recommended else None, None) for c in contexts],
                   contexts.index(default), a.yes)
     return contexts[pick]
 
@@ -8237,6 +8242,16 @@ def hy4_recommended_context(pc: dict) -> int:
     return max(fits) if fits else HY4_Q4_CONTEXTS[0]
 
 
+def hy4_q4_contexts(gpus: list) -> list:
+    """The contexts offered for Tencent's own Q4_K_M (no VRAM plan in the table: the engine works the fit out at its
+    start and says what does not fit): HY4_Q4_CONTEXTS, and those of HY4_Q4_LONG - up to the model's 1M - whose cache
+    in 8-bit rows (what the engine's --kv auto takes where F16 rows do not fit; every GPU of a tensor-parallel group
+    holds all of it) is at most HY4_Q4_LONG_SHARE of the smallest GPU's VRAM."""
+    vram = min((float(g.get("vram_gb") or 0) for g in gpus or []), default=0.0)
+    per = 13 * (HY4_KV_Q8_ROW + 128 * 2 // 4)
+    return HY4_Q4_CONTEXTS + [c for c in HY4_Q4_LONG if c * per / 2**30 <= HY4_Q4_LONG_SHARE * vram]
+
+
 def hy4_cache_bytes(ctx: int, chunk: int, q8: bool = False) -> int:
     """The bytes of maya-hy4's caches in VRAM at a context (src/hy4/hy4_model.cu's plan): the window layers' ring of
     latents (the newest 512 + max(16384, chunk) positions), the global layers' latents and pooled keys for every
@@ -8321,11 +8336,11 @@ def hy4_fit(q: dict, gpus: list, ctx_wanted: int | None = None, used: dict | Non
     {"layout": "standard" where its plan fits the VRAM (hy4_usable_gib) at the context - else a small-card layout the
     size has; "context": ctx_wanted, else "recommended" - the largest of HY4_CONTEXTS that fits, up to
     HY4_TESTED_CONTEXT; "contexts": all that fit; "kv": the latent cache's rows the engine's --kv auto takes at the
-    context - "f16", or "q8" (8-bit rows) where it fits only with them (hy4_kv_rows; "contexts_q8": those of
-    "contexts"); "chunk" and "args": the layout's own engine flags (none for "standard": the engine's defaults - it
-    fills the VRAM left with the most-routed experts itself; never --kv: the engine's auto); "usable", "need" (GiB,
-    with the rows of "kv")}.  A small-card layout reads prompts in chunks twice its plan's where that still fits
-    (HY4_CHUNK_UP_GIB).
+    context - "f16" or "q8" (8-bit rows; never said on screen: the engine chooses at every start); "vision": a
+    picture's room fits ("vision_small": a smaller picture's only); "chunk" and "args": the layout's own engine flags
+    (none for "standard": the engine's defaults - it fills the VRAM left with the most-routed experts itself; never
+    --kv: the engine's auto); "usable", "need" (GiB, with the rows of "kv")}.  A small-card layout reads prompts in
+    chunks twice its plan's where that still fits (HY4_CHUNK_UP_GIB).
     Nothing fits: {"error": why, "hint": what to do, "usable", "need"}.  layout: only this one (the files of a folder
     are that layout's)."""
     lays = hy4_layouts(q)
@@ -8371,12 +8386,20 @@ def hy4_fit(q: dict, gpus: list, ctx_wanted: int | None = None, used: dict | Non
         args = (["--chunk", str(chunk)] if chunk else []) + \
             [x for k, flag in (("reserve_gb", "--reserve-gb"), ("vram_experts", "--vram-experts")) if k in plan
              for x in (flag, f"{float(plan[k]):g}")]
-    # (pictures: the engine keeps a picture's room free on the main GPU - on where it fits beside the plan as worked
-    #  out for text: neither the context nor the prompt chunk is made smaller for it, and the cache's rows stay the
-    #  text plan's - the engine gives a picture's room up before it takes 8-bit rows)
+    # (pictures: the engine keeps a picture's room free on the main GPU - neither the context nor the prompt chunk is
+    #  made smaller for it.  Its order, src/hy4/hy4_plan.hpp's kv_pick - pictures before the cache's rows: F16 rows
+    #  and the largest picture's room, 8-bit rows and that room, F16 then 8-bit rows and a smaller picture's room
+    #  (HY4_VISION_MIN_GIB at least: the engine then says the pictures' size and the server resizes to it), and only
+    #  then text only, with the rows worked out above)
+    vision, small = False, False
+    for q8, room in ((False, HY4_VISION_GIB), (True, HY4_VISION_GIB), (False, HY4_VISION_MIN_GIB),
+                     (True, HY4_VISION_MIN_GIB)):
+        if hy4_fit_need_gib(plan, ctx, q8) + more + room <= usable:
+            kv, vision, small = "q8" if q8 else "f16", True, room < HY4_VISION_GIB
+            takes = hy4_fit_need_gib(plan, ctx, q8)
+            break
     return {"layout": pick, "context": ctx, "recommended": rec, "contexts": fits[pick], "chunk": chunk, "args": args,
-            "kv": kv, "contexts_q8": [c for c in fits[pick] if rows(plan, c) == "q8"],
-            "usable": usable, "need": takes, "vision": takes + more + HY4_VISION_GIB <= usable}
+            "kv": kv, "usable": usable, "need": takes, "vision": vision, "vision_small": small}
 
 
 def hy4_layout_in(d: Path, quant: str) -> str | None:
@@ -8682,8 +8705,7 @@ def hy4_fit_step(a, pc: dict, quant: str, prev_ctx: int | None = None, have=None
                  f"run {ME} --setup again later: the file is used by itself once it is on Hugging Face (no update "
                  "needed); a card with about 10 GB of VRAM or more runs the standard file now")
     if "error" not in fit and not a.context and not getattr(a, "check", False):
-        ctx = choose_context(a, prev_ctx, fit["contexts"], fit["recommended"],
-                             {c: "the cache in 8 bits" for c in fit["contexts_q8"]})
+        ctx = choose_context(a, prev_ctx, fit["contexts"], fit["recommended"])
         fit = hy4_fit(q, pc["gpus"], ctx, layout=fit["layout"])
     if "error" in fit:
         fail(fit["error"] + (f" (the files in {a.model_dir} are the {forced} layout's)" if forced else ""), fit["hint"])
@@ -8694,9 +8716,11 @@ def hy4_fit_step(a, pc: dict, quant: str, prev_ctx: int | None = None, have=None
         ok(f"{name} in its {fit['layout']} layout ({hy4_layouts(q)[fit['layout']]['about']}): about "
            f"{fit['need']:.1f} GB of the {fit['usable']:.1f} GB of VRAM for what must sit there; the routed experts "
            f"are computed on the CPU, prompts are read in chunks of {fit['chunk']} tokens")
-    ok(f"context: {fit['context']} tokens" + (" (recommended for this VRAM)" if fit["context"] == fit["recommended"] else "") +
-       ("; its cache is kept in 8 bits here - with 16-bit rows this context does not fit in this VRAM (the engine "
-        "chooses by itself: --kv auto)" if fit.get("kv") == "q8" else ""))
+    ok(f"context: {fit['context']} tokens" + (" (recommended for this VRAM)" if fit["context"] == fit["recommended"] else ""))
+    if max(fit["contexts"]) < HY4_CONTEXTS[-1]:        # (the model reaches 1M: what keeps this PC below it, said once)
+        ok(f"a context above {context_label(max(fit['contexts']))} needs more VRAM than "
+           f"{'these cards have' if len(pc['gpus']) > 1 else 'this card has'} free (the model's own reach: "
+           f"{context_label(HY4_CONTEXTS[-1])})")
     if fit["context"] > HY4_TESTED_CONTEXT:
         warn(f"past {context_label(HY4_TESTED_CONTEXT)} the engine has not been run end to end yet")
     return fit
@@ -8733,9 +8757,15 @@ def set_up_hy4(a, prev: dict) -> Path | None:
             warn(f"{vram:.0f} GB of VRAM and {total:.0f} GB of RAM: below the ~{need:.0f} GB that hold all of {name} - "
                  "slower: parts of the model are then read from the SSD")
         rec = hy4_recommended_context(pc)
-        ctx = choose_context(a, prev_ctx, HY4_Q4_CONTEXTS, rec)
+        q4_ctxs = hy4_q4_contexts(pc.get("gpus") or [])
+        ctx = choose_context(a, prev_ctx, q4_ctxs, rec)
         ok(f"context: {ctx} tokens" + (" (recommended for this PC's VRAM)" if ctx == rec else "") +
-           f"; its cache: {hy4_kv_gb(ctx):.1f} GB of VRAM (on each GPU of a tensor-parallel group)")
+           f"; its cache: up to {hy4_kv_gb(ctx):.1f} GB of VRAM (on each GPU of a tensor-parallel group)")
+        if q4_ctxs[-1] < HY4_Q4_LONG[-1]:
+            ok(f"a context above {context_label(q4_ctxs[-1])} needs more VRAM on each card (the model's own reach: "
+               f"{context_label(HY4_Q4_LONG[-1])})")
+        if ctx > HY4_Q4_CONTEXTS[-1]:
+            warn(f"past {context_label(HY4_Q4_CONTEXTS[-1])} these files have not been run end to end yet")
         how = getattr(a, "drafting", None)
         if how == "measure":
             warn(f"no speed calibration for {HY4} yet: it drafts with its MTP block (--drafting off: without)")
@@ -8768,9 +8798,15 @@ def set_up_hy4(a, prev: dict) -> Path | None:
         ok("pictures: off (--no-vision; the pack has the vision tower: Images on the Models page turns them on)")
     elif not pictures:
         warn(f"pictures: OFF on this PC - at a context of {fit['context']} tokens the model leaves no room in the VRAM "
-             f"for a picture (about {HY4_VISION_GIB:.1f} GB while one is read; {fit.get('usable', 0):.1f} GB free, the "
-             f"model's own parts {fit.get('need', 0):.1f} GB): text works as before, a picture sent is refused in plain "
-             "words; a card with more VRAM reads pictures")
+             f"for a picture (about {HY4_VISION_MIN_GIB:.1f} GB while a small one is read, {HY4_VISION_GIB:.1f} GB for "
+             f"the largest; {fit.get('usable', 0):.1f} GB free, the model's own parts {fit.get('need', 0):.1f} GB): "
+             "text works as before, a picture sent is refused in plain words; a smaller context or a card with more "
+             "VRAM reads pictures")
+    elif fit.get("vision_small"):
+        ok("pictures: ON - the model's own vision tower runs in the engine, a picture at a time: its weights stay in "
+           "the file (RAM as the page cache). The VRAM beside the model holds a smaller picture than the tower's "
+           "largest here, so the server makes big pictures smaller before the model reads them (the engine's start "
+           "line says the size; fine print in a big picture may be lost - a card with more VRAM reads it whole)")
     else:
         ok("pictures: ON - the model's own vision tower runs in the engine, a picture at a time: its weights stay in "
            "the file (RAM as the page cache), a picture's room (under 1 GB) is kept free on the main GPU; the server "

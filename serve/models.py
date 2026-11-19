@@ -39,7 +39,7 @@ CONTEXTS = [8192, 32768, 65536, 131072]       # the setup's choices (a config's 
 DS4_CONTEXTS = [32768, 65536, 131072, 262144, 524288, 1048576]   # ... for DeepSeek (maya.py's DS4_CONTEXTS)
 MM3_CONTEXTS = DS4_CONTEXTS                                       # ... and MiniMax (maya.py's MM3_CONTEXTS)
 QWEN_CONTEXTS = [32768, 65536, 131072, 262144]                    # ... and CYBER-FROST (maya.py's QWEN_CONTEXTS)
-HY4_CONTEXTS = [4096, 8192, 16384, 32768, 65536, 131072]          # ... and Hy4-Flash (maya.py's HY4_CONTEXTS)
+HY4_CONTEXTS = [4096, 8192, 16384, 32768, 65536, 131072, 262144, 524288, 1048576]          # ... and Hy4-Flash (maya.py's HY4_CONTEXTS)
 CONTEXT_MIN = 4096          # the dashboard's Context size: the smallest it offers ...
 CONTEXT_FALLBACK_MAX = 262144   # ... and the largest when the model file does not say what it was trained for
 # the largest context the dashboard offers without an "untested" warning, by engine: maya-ds4 its model's own 1M; the
@@ -68,6 +68,10 @@ QWEN_KEYS = ("context", "images", "gpus", "reserve_mib", "env", "draft", "expert
 HY4_KEYS = ("context", "images", "gpus", "env", "draft", "tp", "reserve_gb", "prefill_chunk", "cpu_threads")
 HY4_KV_BYTES = 13 * (2 * (512 + 64) + 128 * 4 // 4)   # (maya.py's: its cache a context token, on each GPU of a group)
 HY4_Q4_CONTEXTS = [32768, 65536, 131072, 262144]   # AngelSlim's Q4_K_M: the setup's choices for it (maya.py's HY4_Q4_CONTEXTS)
+# (... and its longer ones, up to the model's 1M, where the cache in the engine's smaller rows is at most this share of
+#  the smallest card's VRAM - maya.py's HY4_Q4_LONG, HY4_Q4_LONG_SHARE, hy4_q4_contexts)
+HY4_Q4_LONG, HY4_Q4_LONG_SHARE = [524288, 1048576], 0.25
+HY4_KV_Q8_BYTES = 13 * (512 + 512 // 32 * 2 + 64 * 2 + 128 * 2 // 4)
 # what maya-hy4 does not have yet, said in plain words when a client asks for it (apply; each one's "off" - HY4_OFF,
 # or nothing - is taken as it is: the page sends back what it was shown)
 HY4_OFF = {"parallel": 1, "kv_streaming": False}
@@ -848,8 +852,12 @@ def describe(path: Path, running: str | None) -> dict:
     # GLM-5.3 (744B): its name on screen beside the quant, and its cache's bytes a context token for the Context size's
     # line (the page's GLM_KV_BYTES is GLM-5.3-Flash's) - keys only its configs have
     own = {"shown": G53.LABEL, "kv_bytes": glm53_kv_bytes(cfg)} if G53.config_is_glm_dsa(cfg) else {}
-    if family(cfg) == "hy4" and not hy4_plain(cfg):    # (the contexts whose cache the engine keeps in 8 bits: said)
-        own["contexts_8bit"] = (hy4_room(cfg) or {}).get("contexts_q8") or []
+    if family(cfg) == "hy4":
+        # (never said on the page: from which context the engine keeps its cache in the smaller rows - the Context
+        #  size's GB figure counts them; and whether a context above the largest offered needs more VRAM - one line)
+        small = [] if hy4_plain(cfg) else (hy4_room(cfg) or {}).get("contexts_q8") or []
+        own.update(kv_small_from=min(small) if small else None,
+                   context_more=bool(hy4_fits) and max(hy4_fits) < (HY4_Q4_LONG if hy4_plain(cfg) else HY4_CONTEXTS)[-1])
     return {**own, "file": path.name, "path": str(path), "model": cfg.get("model_name") or "", "family": family(cfg),
             "quant": quant_label(cfg, path), "backend": cfg.get("backend") or "cuda", "written": inst.get("written"),
             "used": used, "running": running is not None and str(path.resolve()) == str(Path(running).resolve()),
@@ -917,7 +925,11 @@ def hy4_contexts(cfg: dict) -> list:
     """The contexts the Models page offers for Hy4-Flash's config: those of HY4_CONTEXTS that fit its cards
     (hy4_room) and those up to the one it has (the setup worked that one out); no VRAM figure: only the latter."""
     if hy4_plain(cfg):
-        return list(HY4_Q4_CONTEXTS)
+        # (no VRAM plan: the setup's own list, and up to the model's 1M where the smallest card is large enough for the
+        #  cache - maya.py's hy4_q4_contexts; the one the config has stays offered)
+        cards, cur = {g["index"]: g for g in machine_gpus("cuda")}, settings_of(cfg)["context"]
+        vram = min((float((cards.get(i) or {}).get("vram_gb") or 0) for i in gpus_of(cfg)), default=0.0)
+        return HY4_Q4_CONTEXTS + [c for c in HY4_Q4_LONG if c <= cur or c * HY4_KV_Q8_BYTES / 2**30 <= HY4_Q4_LONG_SHARE * vram]
     cur, room = settings_of(cfg)["context"], hy4_room(cfg)
     return [c for c in HY4_CONTEXTS if c <= cur or (room is not None and c in room["contexts"])]
 

@@ -409,8 +409,11 @@ class Settings(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "could not be read"):
                 M.apply(small, {"gpus": [0, 1], "context": 32768})   # (a card this PC does not list adds no VRAM)
             row = M.listing(self.d, None)["models"][0]
-            self.assertEqual((row["contexts"], row["context_range"]["max"], row["contexts_8bit"]),
-                             ([4096, 8192, 16384], 16384, [16384]))
+            self.assertEqual((row["contexts"], row["context_range"]["max"]), ([4096, 8192, 16384], 16384))
+            # (the page never names the cache's rows: it gets where the smaller ones start, for its GB figure, and
+            #  whether a larger context needs more VRAM - one line under the slider)
+            self.assertEqual((row["kv_small_from"], row["context_more"]), (16384, True))
+            self.assertNotIn("contexts_8bit", row)
         with cards(8.0, 8.0):                          # a second card: room for more
             self.assertEqual(M.flag(M.apply(small, {"gpus": [0, 1], "context": 32768})["args"], "--max-context"), "32768")
         with cards(4.0, 4.0):
@@ -422,7 +425,8 @@ class Settings(unittest.TestCase):
             for c in M.HY4_CONTEXTS:
                 self.assertEqual(M.flag(M.apply(big, {"context": c})["args"], "--max-context"), str(c))
             row = M.listing(self.d, None)["models"][0]
-            self.assertEqual((row["contexts"], row["context_range"]["max"]), (M.HY4_CONTEXTS, 131072))
+            self.assertEqual((row["contexts"], row["context_range"]["max"]), (M.HY4_CONTEXTS, 1048576))   # (the model's 1M)
+            self.assertEqual((row["kv_small_from"], row["context_more"]), (None, False))
         with cards(10.0):                              # ... and on a 10 GB one: up to what its plan fits
             with self.assertRaisesRegex(ValueError, r"at 65536 tokens; this card has 9\.0 GB for them"):
                 M.apply(big, {"context": 65536})

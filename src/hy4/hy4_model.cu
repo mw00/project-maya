@@ -965,34 +965,57 @@ struct Model::Impl {
             for (int il = 0; il < g.n_layer; ++il) eb = std::max(eb, (double) expert_bytes(il));
             for (double& f : free_b) f -= eb * kStage;
         }
-        // what the model's own parts fit with (hy4_plan.hpp's kv_pick): as asked - else, in turn, without a picture's
-        // room (pictures not asked for by name), with the cache in 8-bit rows (--kv auto), with both.  A start that
-        // fits with F16 rows is the same start as before
+        // what the model's own parts fit with (hy4_plan.hpp's kv_pick): as asked - else, in turn, with the cache in
+        // 8-bit rows (--kv auto) and a picture's room kept, with the room of a smaller picture (F16 rows, then 8-bit:
+        // as many patches as this VRAM holds, a sixteenth of the tower's largest picture at least - the server makes
+        // the pictures that size), with F16 rows and no picture's room (pictures not asked for by name), with 8-bit
+        // rows and no room.  Pictures go before the rows' precision
         const double vr = vis_room;
-        const KvPick pick = kv_pick([&](bool q8, bool vis) {
+        const long long vis_n = vr > 0 ? (long long) vgeo.max_pixels / ((long long) vgeo.patch * vgeo.patch) : 0;
+        auto vis_bytes = [&](long long n) {
+            VisionGeo vg = vgeo;
+            vg.max_pixels = (int) (n * vgeo.patch * vgeo.patch);
+            return (double) Vision::room_for(vg);
+        };
+        const KvPick pick = kv_pick([&](bool q8, double room) {
             const bool was = kv_q8;
             kv_q8 = q8;
-            if (!vis) free_b[(size_t) main_gi] += vr;
+            free_b[(size_t) main_gi] += vr - room;
             const bool fit = place(rho, false) || place(0.0, false);
-            if (!vis) free_b[(size_t) main_gi] -= vr;
+            free_b[(size_t) main_gi] -= vr - room;
             kv_q8 = was;
             return fit;
-        }, kv_q8, o.kv < 0 && kv_q8_rows(), vr > 0, o.vision_auto);
+        }, kv_q8, o.kv < 0 && kv_q8_rows(), vr > 0, o.vision_auto, vis_n,
+           std::max<long long>(vis_n / 16, (long long) vgeo.min_pixels / ((long long) vgeo.patch * vgeo.patch) + 1), vis_bytes);
+        if (pick.fits && pick.vision && pick.patches < vis_n) {
+            // (a picture's room for fewer patches than the tower's largest: the engine says the size, the server
+            //  resizes to it - `INFO vision=hy4 ... vision_max_pixels`)
+            vgeo.max_pixels = (int) (pick.patches * vgeo.patch * vgeo.patch);
+            vis_room = vis_bytes(pick.patches);
+            free_b[(size_t) main_gi] += vr - vis_room;
+            char sb[320];
+            std::snprintf(sb, sizeof sb, "INFO pictures up to %d pixels on this GPU (the tower's largest: %lld): CUDA%d "
+                          "has %.0f MB for a picture beside the model's dense parts and caches at this context, the "
+                          "largest takes %.0f MB", vgeo.max_pixels, vis_n * vgeo.patch * vgeo.patch,
+                          G[(size_t) main_gi].dev, vis_room / 1048576.0, vr / 1048576.0);
+            info.push_back(sb);
+        }
         if (pick.q8 && !kv_q8) {
-            char qb[320];
+            char qb[360];
             std::snprintf(qb, sizeof qb, "INFO the latent cache in 8-bit rows (--kv auto): with F16 rows a context of %lld "
-                          "tokens does not fit in the VRAM beside the model's dense parts (the cache: %.2f GB in 8-bit "
-                          "rows, %.2f GB in F16)", (long long) o.max_ctx, cache_gb(true), cache_gb(false));
+                          "tokens does not fit in the VRAM beside the model's dense parts%s (the cache: %.2f GB in 8-bit "
+                          "rows, %.2f GB in F16)", (long long) o.max_ctx, pick.vision ? " and a picture's room" : "",
+                          cache_gb(true), cache_gb(false));
             info.push_back(qb);
             kv_q8 = true;
         }
         if (vr > 0 && !pick.vision) {
             // (a card the model's own parts fill: no room kept for a picture - text only, said, rather than no start;
             //  --vision on asks for the tower by name and gets the error below)
-            char vb[240];
-            std::snprintf(vb, sizeof vb, "NOTE vision off: CUDA%d has no room for a picture (%.0f MB) beside the model's "
-                          "dense parts and caches at this context - text only", G[(size_t) main_gi].dev,
-                          vis_room / 1048576.0);
+            char vb[360];
+            std::snprintf(vb, sizeof vb, "NOTE vision off: CUDA%d has no room for a picture (%.0f MB, %.0f MB for the "
+                          "smallest it would take) beside the model's dense parts and caches at this context - text only",
+                          G[(size_t) main_gi].dev, vis_room / 1048576.0, vis_bytes(std::max(1LL, vis_n / 16)) / 1048576.0);
             info.push_back(vb);
             free_b[(size_t) main_gi] += vis_room;
             vis_room = 0;

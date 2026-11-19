@@ -313,12 +313,12 @@ function AutoOr({label, k, d, dflt, unit, subLabel}) {
 // trained for: GET /api/models' context_range), with the same line under it (server.js' ctxHint). `cost`: the cache's
 // bytes per token as the draft sets it (ctxHint's win / whole / ram / vram); `keys`: the settings that change it - while
 // none does, the running model's line is the engine's own measurement, as in Settings
-function contextRow(m, d, ch, cost, keys = [], extra = null) {
+function contextRow(m, d, ch, cost, keys = [], extra = null, note = null) {
   const s = m.settings, r = m.context_range || {min: 4096, max: 262144, tested: 262144};
   const n = Number(d.context), now = Number(s.context), stops = ctxStopsIn(r, now, n);
   const warn = [n !== now && n > r.tested ? `Beyond ${ctxfmt(r.tested)} is untested on this engine.` : null, extra].filter(Boolean).join(" ");
   return html`<${Row} label="Context size" flag="--max-context" changed=${ch("context")} warn=${warn || null}
-    hint=${m.running ? "The same setting as Settings › Chat defaults › Context size: changed alone, the model reloads with it in place." : null}
+    hint=${[m.running ? "The same setting as Settings › Chat defaults › Context size: changed alone, the model reloads with it in place." : null, note].filter(Boolean).join(" ") || null}
     below=${html`<${CtxSlider} id=${`mdl-ctx-${m.file}`} label="" value=${n} now=${now} stops=${stops}
       hint=${ctxHint(n, {live: m.running && !ch(...keys), now, ...cost})} onChange=${(v) => setDraft({context: v})}/>`}/>`;
 }
@@ -553,16 +553,15 @@ function qwenFields(m, d, s, ch, gpus) {
 
 // Hy4-flash's (maya-hy4: it stops at a flag it does not know, so only its own are offered; text only).  Its cache's VRAM a
 // context token, on each GPU of a tensor-parallel group: 13 layers keep every position (maya.py's HY4_KV_BYTES)
-const HY4_KV_BYTES = 16640;
+// (... and in the smaller rows the engine takes by itself where these do not fit: serve/models.py's kv_small_from)
+const HY4_KV_BYTES = 16640, HY4_KV_SMALL_BYTES = 9568;
 function hy4Fields(m, d, s, ch, images, gpus) {
   const mtp = m.choices.draft.includes("mtp");
   const tpIds = [...new Set(["auto", 0].concat([s.tp, d.tp].filter((t) => t !== "auto" && t != null).map(Number)))];
   return [
     {label: "Model", rows: [
-      contextRow(m, d, ch, {vram: HY4_KV_BYTES}, [], (m.contexts_8bit || []).includes(Number(d.context))
-        ? "With 16-bit rows this context does not fit in this VRAM: the engine keeps the cache in 8 bits, about 60% of the memory shown."
-        : Number(d.context) > 131072
-        ? "Where 16-bit rows do not fit in the VRAM, the engine keeps the cache in 8 bits, about 60% of the memory shown." : null),
+      contextRow(m, d, ch, {vram: m.kv_small_from && Number(d.context) >= m.kv_small_from ? HY4_KV_SMALL_BYTES : HY4_KV_BYTES}, [], null,
+        m.context_more ? "A larger context needs more VRAM than this model's GPUs have." : null),
       html`<${Row} label="Drafting" flag="--mtp" changed=${ch("draft")}
         hint=${mtp ? "The model's own MTP block drafts a few tokens for the model to check: the same answers, about twice as fast on code. Off decodes token by token."
           : "This pack names no MTP block."}>
