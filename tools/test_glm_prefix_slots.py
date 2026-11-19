@@ -30,6 +30,7 @@ CASES = ("branch-policy-completion", "branch-policy-slot", "branch-policy-disabl
          "branch-lru-pressure", "branch-lru-staging", "branch-lru-staging-room",
          "branch-lru-staging-save-fail", "branch-lru-staging-meta-fail", "branch-lru-staging-bound",
          "branch-lru-staging-pressure", "branch-lru-staging-reindex",
+         "branch-log-text",
          "branch-types-mixed", "branch-types-missing", "branch-types-sidecar", "branch-types-sidecar-legacy", "branch-types-unknown",
          "branch-scan-visit", "branch-scan-candidate", "branch-scan-visit-legacy", "branch-scan-candidate-legacy",
          "branch-scan-visit-direct-legacy", "branch-scan-visit-cleanup-legacy",
@@ -270,7 +271,7 @@ def fixture(source: str) -> str:
     cpp = cpp.replace('which != "cli-reindex" &&', 'which.rfind("branch-scan-", 0) != 0 && which != "cli-reindex" &&')
     cpp = cpp.replace('which != "cli-reindex" &&', 'which.rfind("branch-types-", 0) != 0 && which != "cli-reindex" &&')
     cpp = cpp.replace('std::ofstream(root / "pack" / n).put(\'x\');', 'if (!std::filesystem::exists(root / "pack" / n)) std::ofstream(root / "pack" / n).put(\'x\');')
-    cpp = cpp.replace("  Options o;", SETUP + "\n  Options o;")
+    cpp = cpp.replace("  Options o;", SETUP + '\n  Options o; o.serve = which.rfind("branch-types-sidecar", 0)==0;')
     extra = (ROOT / "tests/core/glm_prefix_slot_cases.inc").read_text(encoding="utf-8")
     completion = (ROOT / "tests/core/glm_completion_slot_cases.inc").read_text(encoding="utf-8")
     if "const auto completion_save =" not in block:
@@ -389,6 +390,23 @@ def main() -> int:
                     if case.startswith(("branch-cleanup-", "branch-scan-")) and not case.endswith("restart"):
                         if "cache writes disabled" not in ran.stderr:
                             assertion_error = "cache failure lacks explicit fail-closed diagnostic"
+                    if case in ("branch-types-sidecar", "branch-types-sidecar-legacy"):
+                        expected_note = ("NOTE sessions: unsupported sidecar; disk cache writes disabled until restart; "
+                                         "cleanup disabled")
+                        if ran.stdout.splitlines().count(expected_note) != 1:
+                            assertion_error += "unsupported sidecar must emit exactly one fixed stdout NOTE; "
+                        forbidden = (str(case_root), case_root.as_posix(), str(case_root).replace("\\", "\\\\"),
+                                     "slot-held.bin", "slot-held.meta")
+                        if any(text in ran.stdout for text in forbidden):
+                            assertion_error += "unsupported sidecar stdout disclosed a fixture path; "
+                        payload_bytes = str(case_root / "slots" / "slot-held.bin").encode("utf-8")
+                        escaped_payload = "".join(
+                            "\\\\" if byte == 92 else chr(byte) if 32 <= byte <= 126 else f"\\x{byte:02X}"
+                            for byte in payload_bytes
+                        )
+                        if (escaped_payload not in ran.stderr or "unsupported sidecar" not in ran.stderr or
+                                "disk cache writes disabled until restart; cleanup disabled" not in ran.stderr):
+                            assertion_error += "unsupported sidecar lacks escaped-path stderr diagnostic; "
                     receipt["cases"].append({"name": case, "exit_code": ran.returncode, "stdout": ran.stdout,
                                              "stderr": ran.stderr, "assertion_error": assertion_error})
                     print(f"{case}: rc={ran.returncode}")

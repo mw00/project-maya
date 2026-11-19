@@ -130,7 +130,11 @@ the directory once, allowing at most 8192 visited directory entries and 1024
 candidate records. In a stable, private cache directory, only regular files
 participate in recovery. Link and other unsupported entry types are not opened
 as metadata or payloads; an indeterminate type is an I/O failure, not proof of
-absence. This is not protection against concurrent replacement of pathnames.
+absence. Use a stable, private directory with a single writer. Temporary files
+are not exclusively created across all save paths; the native snapshot API
+accepts pathnames, so verification and loading do not share one open handle.
+Concurrent or untrusted writers are unsupported. These remain open Draft gates,
+not properties established by the file-type checks.
 Startup sorts candidates only after the whole scan succeeds and uses that
 same list for orphan checks. Exceeding either limit leaves the directory alone:
 no partial index is restored and new disk writes are disabled for the run.

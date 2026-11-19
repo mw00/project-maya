@@ -9,7 +9,18 @@
       for (const auto& e : std::filesystem::directory_iterator(slot_dir, ec)) ++n;
       return n;
     };
-    if (which.rfind("branch-types-",0)==0) {
+    if (which=="branch-log-text") {
+      if (slot_log_text("slot-data_01.meta")!="slot-data_01.meta" ||
+          slot_log_text("branch-prefix.bin.tmp")!="branch-prefix.bin.tmp" || slot_log_text(" ~")!=" ~")
+        fail("normal printable filename diagnostic changed");
+      if (slot_log_text(R"(cache\slot-data.meta)")!=R"(cache\\slot-data.meta)")
+        fail("diagnostic backslash is not escaped");
+      std::string controls;
+      for (const unsigned byte : {0u, 9u, 10u, 13u, 31u, 127u, 128u, 255u})
+        controls.push_back(static_cast<char>(byte));
+      if (slot_log_text(controls)!=R"(\x00\x09\x0A\x0D\x1F\x7F\x80\xFF)")
+        fail("generic diagnostic bytes must use uppercase hexadecimal escapes");
+    } else if (which.rfind("branch-types-",0)==0) {
       if (which=="branch-types-unknown") {
         if (slot_disk_writable || slot_recovery_complete || !slots.empty() || !fixture_io_errors || count_files()!=4)
           fail("unknown nofollow stat did not stop writes and discard partial recovery");

@@ -1469,12 +1469,27 @@ static int glm_pack_generate(const Options& o) {
     bool branch_index_complete = true;
     bool slot_disk_writable = true;
     bool slot_recovery_complete = true;
+    // Filesystem diagnostics stay on stderr and occupy exactly one text line.
+    const auto slot_log_text = [](std::string_view text) {
+        constexpr char hex[] = "0123456789ABCDEF";
+        std::string escaped;
+        for (unsigned char c : text) {
+            if (c == '\\') escaped += "\\\\";
+            else if (c >= 0x20 && c <= 0x7e) escaped += static_cast<char>(c);
+            else {
+                escaped += "\\x";
+                escaped += hex[c >> 4];
+                escaped += hex[c & 15];
+            }
+        }
+        return escaped;
+    };
     const auto slot_io_failure = [&](const fs::path& path, const std::error_code& ec) {
         branch_index_complete = false;
         slot_recovery_complete = false;
         slot_disk_writable = false;
         std::fprintf(stderr, "glm slots: I/O failed for %s (%s); disk cache writes disabled until restart; cleanup disabled\n",
-                     path.string().c_str(), ec.message().c_str());
+                     slot_log_text(path.string()).c_str(), slot_log_text(ec.message()).c_str());
     };
     const auto slot_remove_file = [&](const fs::path& path) {
         if (!slot_disk_writable) return false;
@@ -1705,7 +1720,8 @@ static int glm_pack_generate(const Options& o) {
                         // partial disk ledger. Independently valid slots survive.
                         slot_disk_writable = false;
                         branch_index_complete = false;
-                        note("unsupported sidecar for " + p + "; disk cache writes disabled until restart; cleanup disabled");
+                        std::fprintf(stderr, "glm slots: unsupported sidecar for %s\n", slot_log_text(p).c_str());
+                        note("unsupported sidecar; disk cache writes disabled until restart; cleanup disabled");
                     }
                 }
             }
@@ -1728,20 +1744,20 @@ static int glm_pack_generate(const Options& o) {
         }
         if (slot_keep) {
             std::ostringstream m;
-            m << "folder " << slot_dir.string() << ": " << slots.size() << " conversation(s) kept from earlier runs ("
+            m << slots.size() << " conversation(s) kept from earlier runs ("
               << gb(total) << ")";
             if (refused) m << ", " << refused << " not this model's or incomplete - cleanup attempted";
             note(m.str());
         }
         if (!std::filesystem::is_directory(slot_dir, ec)) {
             std::fprintf(stderr, "glm slots: %s is not writable - conversations are not set aside\n",
-                         slot_dir.string().c_str());
+                         slot_log_text(slot_dir.string()).c_str());
             slot_max = 0;
         }
     }
     if (slot_max > 0 && slot_spill)
         note("two-tier slots: RAM " + gb(slot_ram_budget) + " max, disk " + gb(slot_disk_budget) +
-             " in " + slot_dir.string() + "; kept across runs");
+             "; kept across runs");
     const auto slot_drop = [&](size_t i) {
         if (slots[i].data)                       // a RAM slot: its buffer simply dies
             slots[i].data.reset();
@@ -1873,7 +1889,7 @@ static int glm_pack_generate(const Options& o) {
         const auto space = std::filesystem::space(slot_dir, ec);
         if (!ec && space.available < ((uint64_t) 8 << 30)) {
             std::fprintf(stderr, "glm slots: under 8 GB free in %s - the conversation is not written\n",
-                         slot_dir.string().c_str());
+                         slot_log_text(slot_dir.string()).c_str());
             return false;
         }
         const auto stamp = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -1886,7 +1902,7 @@ static int glm_pack_generate(const Options& o) {
             f.flush();
             if (!f) {
                 slot_remove_file(path + ".tmp");
-                std::fprintf(stderr, "glm slots: writing %s.tmp failed\n", path.c_str());
+                std::fprintf(stderr, "glm slots: writing %s.tmp failed\n", slot_log_text(path).c_str());
                 return false;
             }
         }
@@ -1898,7 +1914,7 @@ static int glm_pack_generate(const Options& o) {
             slot_remove_file(path);
             slot_remove_file(meta_of(path));
             slot_remove_file(meta_of(path) + ".tmp");
-            std::fprintf(stderr, "glm slots: writing %s failed\n", path.c_str());
+            std::fprintf(stderr, "glm slots: writing %s failed\n", slot_log_text(path).c_str());
             return false;
         }
         slots[i].path = path;
@@ -1923,8 +1939,8 @@ static int glm_pack_generate(const Options& o) {
             if (!enabled) return;
             try {
                 flush();
-            } catch (const std::exception& e) {
-                std::fprintf(stderr, "glm slots: flushing RAM on exit failed (%s)\n", e.what());
+            } catch (const std::exception&) {
+                std::fprintf(stderr, "glm slots: flushing RAM on exit failed\n");
             }
         }
     } slot_flush_on_exit{slot_spill, slot_flush_ram};
@@ -1983,8 +1999,8 @@ static int glm_pack_generate(const Options& o) {
             if (!branch_enabled) buf->reserve(1 << 20);
             const uint64_t bytes = model.slot_save(*buf, e);
             if (bytes == 0) {
-                note("setting the conversation aside in RAM failed (" + (e.empty() ? std::string("it did not copy") : e) +
-                     ") - it is not parked and will be read from token 0 when it comes back");
+                if (!e.empty()) std::fprintf(stderr, "glm slots: RAM save: %s\n", slot_log_text(e).c_str());
+                note("setting the conversation aside in RAM failed - it is not parked and will be read from token 0 when it comes back");
                 return;
             }
             const uint64_t saved_at = ++slot_clock;
@@ -2027,8 +2043,8 @@ static int glm_pack_generate(const Options& o) {
             buf->reserve(1 << 20);
             const uint64_t bytes = model.slot_save(*buf, e);
             if (bytes == 0) {
-                note("setting the conversation aside in RAM failed (" + (e.empty() ? std::string("it did not copy") : e) +
-                     ") - it is not parked and will be read from token 0 when it comes back");
+                if (!e.empty()) std::fprintf(stderr, "glm slots: RAM save: %s\n", slot_log_text(e).c_str());
+                note("setting the conversation aside in RAM failed - it is not parked and will be read from token 0 when it comes back");
                 return;
             }
             slots.push_back({snap_tokens, "", bytes, ++slot_clock});
@@ -2057,7 +2073,7 @@ static int glm_pack_generate(const Options& o) {
         const auto space = std::filesystem::space(slot_dir, ec);
         if (!ec && space.available < (uint64_t) 8 << 30) {
             std::fprintf(stderr, "glm slots: under 8 GB free in %s - the conversation is not set aside\n",
-                         slot_dir.string().c_str());
+                         slot_log_text(slot_dir.string()).c_str());
             return;
         }
         const auto t0 = std::chrono::steady_clock::now();
@@ -2074,7 +2090,7 @@ static int glm_pack_generate(const Options& o) {
             slot_remove_file(meta_of(path));
             slot_remove_file(meta_of(path) + ".tmp");
             std::fprintf(stderr, "glm slots: setting the conversation aside failed (%s)\n",
-                         e.empty() ? "writing its files" : e.c_str());
+                         e.empty() ? "writing its files" : slot_log_text(e).c_str());
             return;
         }
         slots.push_back({snap_tokens, path, bytes, ++slot_clock});
@@ -2348,7 +2364,8 @@ static int glm_pack_generate(const Options& o) {
         const bool back = branch_enabled
             ? guarded(load, e) && model.position() == (int64_t) len : load();
         if (!back) {
-            note("taking a conversation back failed (" + e + ") - trying the next slot or checkpoint");
+            if (!e.empty()) std::fprintf(stderr, "glm slots: load: %s\n", slot_log_text(e).c_str());
+            note("taking a conversation back failed - trying the next slot or checkpoint");
             slot_drop(best);
             snap_tokens.clear();
             continue;
