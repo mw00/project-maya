@@ -39,6 +39,8 @@ adds room for the system and the default context.
 | | Maya-S | 122 | 130 | **160** | NVIDIA, AMD |
 | | EXL3 3.5 bpw (Mia-AiLab) | 197 | 250 | **256** | NVIDIA, AMD |
 | **Hy4-Flash** | Maya-XS | 108 ³ | 45, plus 4-8 for the context | **56-64** | NVIDIA (V100 and newer) |
+| | Maya-M | 132 ³ | 68, plus 4-8 for the context | **80-96** | NVIDIA (V100 and newer; cards from 12 GB) |
+| | Maya-L | 153 ³ | 90, plus 4-8 for the context | **104-128** | NVIDIA (V100 and newer; cards from 12 GB) |
 | **Qwen-3.8-Flash-Next** | UD-IQ2_XS (unsloth) | 80 ² | 47 | **64** | NVIDIA, AMD |
 | | CYBER-FROST Q5_K_M | 113 ² | 84 | **96** | NVIDIA, AMD |
 | | Q4_K_M (Tencent's own, AngelSlim) | 168 ³ | ~108 | **192** | NVIDIA; run on RTX 30 / A100 and newer, Linux |
@@ -46,8 +48,8 @@ adds room for the system and the default context.
 \* Mac (Apple Silicon) support is experimental, GLM-5.3-Flash's GGUF quants only.
 ¹ DeepSeek's download includes its n-gram (Engram) tables, which always stay on the SSD and never count toward memory.
 ² Qwen's n-gram table also stays on the SSD.
-³ Hy4-Flash's download is the model file (44.8 GB) and one n-gram table (63.4 GB) that every size shares; the table
-stays on the SSD, is read page by page and never counts toward memory. About 110 GB of disk in all. Tencent's own
+³ Hy4-Flash's download is the model file (44.8 GB for Maya-XS, 68.4 GB for Maya-M, 89.5 GB for Maya-L) and one n-gram table (63.4 GB) that every size shares; the table
+stays on the SSD, is read page by page and never counts toward memory. About 110 GB of disk in all for Maya-XS. Tencent's own
 Q4_K_M (AngelSlim) is a 105 GB model file with the same table; all of its experts fit in about 108 GB of VRAM.
 
 ### Hy4-Flash · Maya-XS

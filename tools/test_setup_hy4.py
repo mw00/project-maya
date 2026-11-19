@@ -68,10 +68,17 @@ def card(gib, index=0):
     return {"index": index, "name": "GPU", "arch": "86", "vram_gb": float(gib)}
 
 
-def manifest(revision="0" * 40, **quants):
-    """The table as it is, with a revision (published) and other sizes' entries replaced."""
+def manifest(revision="0" * 40, hub=True, only=("Hy4-Flash-Maya-XS",), **quants):
+    """The table with a revision (published) and other sizes' entries replaced - as the tests of the table's switches
+    want it unless they say otherwise: only Maya-XS with files (only=None: every size as committed), its 8 GB-card
+    layout one that is asked from the Hub (hub; as committed it is at the table's revision)."""
     man = json.loads(json.dumps(MANIFEST))
     man["revision"] = revision
+    for name in man["quants"]:
+        if only is not None and name not in only:
+            man["quants"][name] = {"files": {}}
+    if hub:
+        man["quants"]["Hy4-Flash-Maya-XS"]["layouts"]["8gb"]["published"] = "hub"
     man["quants"].update(quants)
     return man
 
@@ -157,19 +164,85 @@ class Published(unittest.TestCase):
             self.assertEqual([k for k in maya.HY4_QUANTS if maya.hy4_published(k)], [])
 
     def test_as_committed(self):
-        """The table of this release: Maya-XS on, at a pinned commit of the repo; S switched off; M and L listed
-        without files (not offered); the 8 GB-card layout asked from the Hub."""
+        """The table of this release: Maya-XS, M and L on, at one pinned commit of the repo; S listed and switched
+        off; the 8 GB-card layout at the same commit (the Hub is not asked)."""
         self.assertRegex(TABLE["revision"], r"^[0-9a-f]{40}$")
-        self.assertEqual([k for k in maya.HY4_QUANTS if maya.hy4_published(k)], ["maya-xs"])
+        self.assertEqual([k for k in maya.HY4_QUANTS if maya.hy4_published(k)], ["maya-xs", "maya-m", "maya-l"])
         q = TABLE["quants"]
         self.assertIs(q["Hy4-Flash-Maya-S"]["published"], False)
-        self.assertEqual([q[n]["files"] for n in ("Hy4-Flash-Maya-M", "Hy4-Flash-Maya-L")], [{}, {}])
-        self.assertEqual(q["Hy4-Flash-Maya-XS"]["layouts"]["8gb"]["published"], "hub")
+        self.assertEqual(list(q["Hy4-Flash-Maya-S"]["files"]), ["Maya-S/Hy4-Flash-Maya-S-IQ2_S-00001-of-00002.gguf"])
+        self.assertEqual({n[-1]: list(q["Hy4-Flash-Maya-" + n]["files"].items()) for n in ("M", "L")}, {
+            "M": [("Maya-M/Hy4-Flash-Maya-M-IQ3_XXS-00001-of-00002.gguf",
+                   [68391812128, "9ef12ab340a06b631069f99b9faccc9e99b686cf9d98b74bb872c4923e4732af"])],
+            "L": [("Maya-L/Hy4-Flash-Maya-L-IQ4_XS-00001-of-00002.gguf",
+                   [89512229920, "5f47ce10c0cb6186ec34036cd5eae47b662b780933abca9f1db0db2770799c17"])]})
+        self.assertEqual(TABLE["ngram"], {"Maya-XS/" + NGRAM: [
+            63360616160, "5819578b52eb1cda0945a716e0575331406d976b6eebc74db8544b3d478ad244"]})
+        # the memory they are for, as the model card says it, and the VRAM + RAM that hold each (the recommendation's)
+        self.assertEqual([(q["Hy4-Flash-Maya-" + n]["for_gb"], q["Hy4-Flash-Maya-" + n]["memory_gb"]) for n in ("XS", "M", "L")],
+                         [([56, 64], 52), ([80, 96], 76), ([104, 128], 100)])
+        # each size's plan: the engine's defaults, more VRAM for the parts that are not routed experts as the size grows
+        plans = [q["Hy4-Flash-Maya-" + n]["plan"] for n in ("XS", "M", "L")]
+        for plan in plans:
+            self.assertEqual((plan["chunk"], plan["reserve_gb"], sorted(map(int, plan["need_gib"]))),
+                             (1024, 0.75, [4096, 8192, 32768]))
+        for c in ("4096", "8192", "32768"):
+            xs, m, l = (plan["need_gib"][c] for plan in plans)
+            self.assertTrue(xs < m < l < xs + 1.5, c)
+        self.assertEqual(plans[1]["need_gib"], {"4096": 9.84, "8192": 10.13, "32768": 10.99})
+        self.assertEqual(plans[2]["need_gib"], {"4096": 9.97, "8192": 10.26, "32768": 11.12})
+        self.assertNotIn("published", q["Hy4-Flash-Maya-XS"]["layouts"]["8gb"])
+        with patch.object(maya, "hy4_on_hub", side_effect=AssertionError("the Hub was asked")):
+            self.assertTrue(maya.hy4_published("maya-xs", "8gb"))
+            small = maya.hy4_entry("maya-xs", "8gb")
+        base = f"https://huggingface.co/peasantsmith/Hy4-Flash-Maya-GGUF/resolve/{TABLE['revision']}/"
+        self.assertEqual(maya.file_url(small, SMALL), base + "Maya-XS-8GB/" + SMALL_HUB)   # (saved as SMALL: a .gguf)
+        self.assertEqual(maya.file_url(small, NGRAM), base + "Maya-XS/" + NGRAM)
+        for key, folder, trunk in (("maya-m", "Maya-M", "Hy4-Flash-Maya-M-IQ3_XXS-00001-of-00002.gguf"),
+                                   ("maya-l", "Maya-L", "Hy4-Flash-Maya-L-IQ4_XS-00001-of-00002.gguf")):
+            e = maya.hy4_entry(key)
+            self.assertEqual((list(e["files"]), e["dir"], e["layout"]), ([trunk, NGRAM], "Hy4-Flash-" + folder, "standard"))
+            self.assertEqual(maya.file_url(e, trunk), base + folder + "/" + trunk)
+            self.assertEqual(maya.file_url(e, NGRAM), base + "Maya-XS/" + NGRAM)   # (ONE table: the XS folder's)
+            self.assertEqual(e["earlier"][trunk], [trunk.replace("-IQ3_XXS", "").replace("-IQ4_XS", "")])
+            self.assertEqual(maya.hy4_vision_entry(key)["name"], "mmproj-Hy4-Flash-Maya-XS.gguf")
+            self.assertEqual(list(maya.hy4_layouts(q["Hy4-Flash-" + folder])), ["standard"])   # (no small-card layout)
+        self.assertAlmostEqual(maya.hy4_entry("maya-m")["download_gb"], 131.75, places=1)
+        self.assertAlmostEqual(maya.hy4_entry("maya-l")["download_gb"], 152.87, places=1)
+        # a folder filled from the repo's own M or L set has the table under that set's name: taken, not downloaded
+        for was in ("Hy4-Flash-Maya-M-IQ3_XXS-00002-of-00002.gguf", "Hy4-Flash-Maya-L-IQ4_XS-00002-of-00002.gguf",
+                    "Hy4-Flash-Maya-S-IQ2_S-00002-of-00002.gguf"):
+            self.assertIn(was, TABLE["was"][NGRAM])
         m = maya.hy4_entry("maya-xs")
         self.assertEqual(maya.file_url(m, TRUNK), f"https://huggingface.co/peasantsmith/Hy4-Flash-Maya-GGUF/resolve/"
                                                   f"{TABLE['revision']}/Maya-XS/{TRUNK}")
         self.assertEqual(maya.file_url(m, NGRAM), f"https://huggingface.co/peasantsmith/Hy4-Flash-Maya-GGUF/resolve/"
                                                   f"{TABLE['revision']}/Maya-XS/{NGRAM}")
+
+    def test_maya_s_is_one_entry_away(self):
+        """Maya-S as committed: listed, switched off, not offered.  Its switch: the trunk's size and sha256, its plan,
+        no "published": false, and the revision."""
+        s = json.loads(json.dumps(TABLE["quants"]["Hy4-Flash-Maya-S"]))
+        self.assertEqual((s["published"], list(s["files"].values()), s["plan"]["need_gib"]), (False, [[0, ""]], {}))
+        self.assertFalse(maya.hy4_published("maya-s"))
+        with patch.object(maya, "fail", fail), self.assertRaisesRegex(Failed, "Maya-S is not available yet"):
+            maya.hy4_entry("maya-s")
+        del s["published"]
+        with with_manifest(manifest(only=None, hub=False, **{"Hy4-Flash-Maya-S": s})):
+            self.assertFalse(maya.hy4_published("maya-s"))            # (no size and sha256 yet)
+        rel = next(iter(s["files"]))
+        s["files"][rel] = [53 * 10**9, "b" * 64]
+        s["plan"]["need_gib"] = {"4096": 9.0, "8192": 9.3, "32768": 10.2}
+        with with_manifest(manifest("d" * 40, only=None, hub=False, **{"Hy4-Flash-Maya-S": s})):
+            self.assertEqual([k for k in maya.HY4_QUANTS if maya.hy4_published(k)],
+                             ["maya-xs", "maya-s", "maya-m", "maya-l"])
+            e = maya.hy4_entry("maya-s")
+            trunk = "Hy4-Flash-Maya-S-IQ2_S-00001-of-00002.gguf"
+            self.assertEqual((list(e["files"]), e["dir"]), ([trunk, NGRAM], "Hy4-Flash-Maya-S"))
+            self.assertEqual(maya.file_url(e, trunk), "https://huggingface.co/peasantsmith/Hy4-Flash-Maya-GGUF/resolve/"
+                                                      + "d" * 40 + "/Maya-S/" + trunk)
+            self.assertEqual(e["earlier"][trunk], ["Hy4-Flash-Maya-S-00001-of-00002.gguf"])
+            self.assertEqual(maya.hy4_fit(s, [card(16)], used={0: 400})["layout"], "standard")
 
     def test_switched_off_whatever_it_lists(self):
         s = {"published": False, "about": "x", "memory_gb": 80,
@@ -271,6 +344,23 @@ class Published(unittest.TestCase):
             self.assertEqual(Q.shown("hy4", picked), f"Hy4-Flash · {want}")
             self.assertEqual(seen["rows"][0][1], "recommended")
             self.assertTrue(all(r[0].startswith("Hy4-Flash · ") for r in seen["rows"]))
+        # the table as committed: XS, M and L, the one recommended by this PC's RAM + VRAM first; each row says the
+        # PCs the size is for as the model card does (no speeds; Maya-S: not listed until it is switched on)
+        for ram, vram, want in ((32.0, 8, "XS"), (64.0, 8, "XS"), (64.0, 16, "XS"), (64.0, 24, "M"), (96.0, 16, "M"),
+                                (96.0, 24, "L"), (128.0, 32, "L"), (128.0, 8, "XS")):
+            with with_manifest(TABLE), patch.object(maya, "choose", choose), \
+                    patch.object(maya, "mem_gb", return_value=(ram, ram)), \
+                    patch.object(maya.S, "gpus", return_value=[card(vram)]):
+                picked = maya.choose_hy4_quant(a, {})
+            self.assertEqual(picked, "maya-" + want.lower(), (ram, vram))
+            rows = {r[0].split(" (")[0]: r for r in seen["rows"]}
+            self.assertEqual(sorted(rows), ["Hy4-Flash · Maya-L", "Hy4-Flash · Maya-M", "Hy4-Flash · Maya-XS", "Hy4-Flash · Q4_K_M"])
+            self.assertEqual(seen["rows"][0][:2], (Q.shown("hy4", picked, maya.hy4_entry(picked)["download_gb"]), "recommended"))
+            self.assertIn("for PCs with 56-64 GB of RAM + VRAM", rows["Hy4-Flash · Maya-XS"][2])
+            self.assertIn("IQ3_XXS (3 bits)", rows["Hy4-Flash · Maya-M"][2])
+            self.assertIn("for PCs with 80-96 GB of RAM + VRAM", rows["Hy4-Flash · Maya-M"][2])
+            self.assertIn("for PCs with 104-128 GB of RAM + VRAM", rows["Hy4-Flash · Maya-L"][2])
+            self.assertFalse(any("tok/s" in r[2] or "tokens/s" in r[2] for r in seen["rows"]))
 
 
 class Picker(unittest.TestCase):
@@ -402,6 +492,44 @@ class Need(unittest.TestCase):
         self.assertAlmostEqual(maya.hy4_need_gib(only(plan, 8192), 32768), 9.83, delta=0.02)
         self.assertAlmostEqual(maya.hy4_need_gib(only(small, 4096), 8192), 6.8, delta=0.02)
         self.assertAlmostEqual(maya.hy4_need_gib(only(plan, 8192), 4096), 8.68, delta=0.02)   # (below the table: back)
+
+    def test_in_use_without_a_loaded_engines_own(self):
+        """hy4_used_mib (the Models page's reading): the setup's own (gpu_used_mib), less what a Maya engine loaded
+        now holds itself - by nvidia-smi's figure for it, else the reading from before its start, else as it reads."""
+        used = {0: 7400, 1: 300}
+        self.assertEqual(maya.hy4_used_mib(used=used, own={}), used)                      # (no engine: the setup's)
+        self.assertEqual(maya.hy4_used_mib(used=used, own={0: 6800.0}), {0: 600.0, 1: 300})
+        self.assertEqual(maya.hy4_used_mib(used=used, own={0: 9000.0}), {0: 0, 1: 300})
+        self.assertEqual(maya.hy4_used_mib({0: 571}, used=used, own={0: None}), {0: 571, 1: 300})   # (Windows)
+        self.assertEqual(maya.hy4_used_mib({0: 9999}, used=used, own={0: None}), {0: 7400, 1: 300})
+        self.assertEqual(maya.hy4_used_mib(None, used=used, own={0: None}), used)         # (neither: capped later)
+        self.assertEqual(maya.hy4_used_mib(used={}, own={0: 5.0}), {})                    # (no reading at all)
+        with patch.object(maya, "gpu_used_mib", return_value={0: 7000}), \
+                patch.object(maya, "maya_engine_mib", return_value={0: 6500.0}):
+            self.assertEqual(maya.hy4_used_mib(), {0: 500.0})
+        # the same sum as the setup's from there on: at most 1 GB a card counts
+        self.assertAlmostEqual(maya.hy4_usable_gib([card(8)], maya.hy4_used_mib({0: 571}, used={0: 7400}, own={0: None})),
+                               8 - 571 / 1024)
+        self.assertAlmostEqual(maya.hy4_usable_gib([card(8)], maya.hy4_used_mib(used={0: 7400}, own={0: None})), 7.0)
+
+    def test_the_engines_own_vram(self):
+        """maya_engine_mib: Maya's engines in nvidia-smi's process list, by card; None where it gives no figure."""
+        def smi(out):
+            def run(cmd, **k):
+                what = cmd[1]
+                return SimpleNamespace(stdout=out["gpu" if what.startswith("--query-gpu") else "apps"])
+            return patch.object(maya.subprocess, "run", run)
+        gpus = "0, GPU-aaa\n1, GPU-bbb\n"
+        with smi({"gpu": gpus, "apps": "GPU-aaa, 11, 6500, /opt/maya/build/maya-hy4\nGPU-aaa, 12, 300, /usr/bin/Xorg\n"
+                                       "GPU-bbb, 13, 1000, /opt/maya/build/maya-hy4\nGPU-bbb, 14, 200, maya-glm-helper\n"}):
+            self.assertEqual(maya.maya_engine_mib(), {0: 6500.0, 1: 1200.0})
+        with smi({"gpu": gpus, "apps": "GPU-aaa, 11, [N/A], C:\\Maya, v1\\build\\maya-hy4.exe\n"
+                                       "GPU-aaa, 12, [N/A], C:\\Windows\\explorer.exe\n"}):
+            self.assertEqual(maya.maya_engine_mib(), {0: None})
+        with smi({"gpu": gpus, "apps": "GPU-aaa, 12, 300, firefox\n"}):
+            self.assertEqual(maya.maya_engine_mib(), {})
+        with patch.object(maya.subprocess, "run", side_effect=OSError("no nvidia-smi")):
+            self.assertEqual(maya.maya_engine_mib(), {})
 
     def test_grows_with_the_context(self):
         for plan in (XS["plan"], XS["layouts"]["8gb"]["plan"]):
@@ -603,6 +731,19 @@ class Fit(unittest.TestCase):
             (Path(d) / SMALL).write_bytes(body[next(iter(xs["layouts"]["8gb"]["files"]))])   # (under today's name)
             self.assertEqual(maya.hy4_layout_in(Path(d), "maya-xs"), "8gb")
 
+    def test_m_and_l_as_committed(self):
+        """Maya-M and Maya-L: the standard layout by their own plans - on a card from 12 GB, the contexts that fit;
+        a card of 8 GB is told so before any download (they have no small-card layout)."""
+        for name, at4k in (("M", 9.84), ("L", 9.97)):
+            q = TABLE["quants"]["Hy4-Flash-Maya-" + name]
+            fit = maya.hy4_fit(q, [card(12)], used={0: 400})
+            self.assertEqual((fit["layout"], fit["args"], fit["context"], fit["vision"]), ("standard", [], 32768, True))
+            self.assertAlmostEqual(maya.hy4_fit(q, [card(12)], 4096, used={0: 400})["need"], at4k)
+            self.assertEqual(maya.hy4_fit(q, [card(32)], used={0: 0})["contexts"][-1], 1048576)
+            small = maya.hy4_fit(q, [card(8)], used={0: 400})
+            self.assertRegex(small["error"], rf"needs about {at4k:.1f} GB of free VRAM .* this card has 7\.6 GB free")
+            self.assertGreater(maya.hy4_fit(q, [card(8), card(8, 1)], used={0: 400, 1: 0})["context"], 4096)
+
     def test_a_size_without_a_small_layout(self):
         q = {"files": XS["files"], "plan": XS["plan"]}
         self.assertIn("needs about 8.7 GB", maya.hy4_fit(q, [card(8)], used={0: 0})["error"])
@@ -802,8 +943,9 @@ class Files(unittest.TestCase):
         man, body = stand_ins(manifest())
         xs = man["quants"]["Hy4-Flash-Maya-XS"]
         trunk, small, ngram = list(xs["files"])[0], list(xs["layouts"]["8gb"]["files"])[0], list(man["ngram"])[0]
-        self.assertEqual(man["was"], {TRUNK: [OLD_TRUNK], SMALL: [SMALL_WAS, OLD_TRUNK], NGRAM: [OLD_NGRAM,
-                         "Hy4-Flash-Maya-M-00002-of-00002.gguf", "Hy4-Flash-Maya-L-00002-of-00002.gguf"]})
+        self.assertEqual((man["was"][TRUNK], man["was"][SMALL], man["was"][NGRAM][:3]),
+                         ([OLD_TRUNK], [SMALL_WAS, OLD_TRUNK], [OLD_NGRAM, "Hy4-Flash-Maya-M-00002-of-00002.gguf",
+                                                                "Hy4-Flash-Maya-L-00002-of-00002.gguf"]))
         std, low = self.models / "Hy4-Flash-Maya-XS", self.models / "Hy4-Flash-Maya-XS-8GB"
         for d, t in ((std, trunk), (low, small)):
             d.mkdir(parents=True)

@@ -8330,6 +8330,63 @@ def hy4_usable_gib(gpus: list, used: dict | None = None) -> float:
     return max(total - sum(min(float(used.get(g.get("index"), 0)) / 1024.0, HY4_FIT_USED_CAP_GIB) for g in gpus), 0.0)
 
 
+def maya_engine_mib() -> dict:
+    """{GPU index: the MiB of VRAM Maya's engines running now hold on it} by nvidia-smi's process list - None for a
+    card where it names an engine without its memory (Windows gives none per program); {} where no engine runs, or
+    it does not answer."""
+    def query(what):
+        try:
+            return subprocess.run(["nvidia-smi", f"--query-{what}", "--format=csv,noheader,nounits"],
+                                  capture_output=True, text=True, timeout=30).stdout
+        except (OSError, subprocess.SubprocessError):
+            return ""
+    index = {}
+    for line in query("gpu=index,uuid").splitlines():
+        i, _, uuid = (s.strip() for s in line.partition(","))
+        if i.isdigit():
+            index[uuid] = int(i)
+    out = {}
+    for line in query("compute-apps=gpu_uuid,pid,used_memory,process_name").splitlines():
+        parts = [s.strip() for s in line.split(",", 3)]
+        if len(parts) < 4 or parts[0] not in index:
+            continue
+        exe = re.split(r"[\\/]", parts[3])[-1].lower()
+        exe = exe[:-4] if exe.endswith(".exe") else exe
+        if exe not in ENGINE_PROCESSES:
+            continue
+        i = index[parts[0]]
+        try:
+            mib = float(parts[2])
+        except ValueError:
+            mib = None
+        out[i] = None if mib is None or out.get(i, 0) is None else out.get(i, 0) + mib
+    return out
+
+
+def hy4_used_mib(before: dict | None = None, used: dict | None = None, own: dict | None = None) -> dict:
+    """The setup's reading of the VRAM in use on each card (gpu_used_mib) for a PC whose model may be loaded now (the
+    dashboard's Models page - serve/models.py's hy4_used): what a Maya engine holds there itself is not "in use" - it
+    is the model the page sets up, or one that stops when that one starts.  A card with an engine on it: the reading
+    less the engine's own (maya_engine_mib); where nvidia-smi does not say how much that is (Windows), the reading
+    taken before the engine started (`before`: {index: MiB}, the server's) - and with neither, the reading as it is
+    (hy4_usable_gib counts at most HY4_FIT_USED_CAP_GIB of it).  {} when nvidia-smi does not answer."""
+    used = gpu_used_mib() if used is None else used
+    if not used:
+        return {}
+    own = maya_engine_mib() if own is None else own
+    out = {}
+    for i, m in used.items():
+        if i not in own:
+            out[i] = m
+        elif own[i] is not None:
+            out[i] = max(m - own[i], 0)
+        elif before and i in before:
+            out[i] = min(before[i], m)
+        else:
+            out[i] = m
+    return out
+
+
 def hy4_fit(q: dict, gpus: list, ctx_wanted: int | None = None, used: dict | None = None,
             layout: str | None = None, pictures: bool = True) -> dict:
     """How a size of Hy4-Flash (q: its entry in the manifest) runs on these cards, worked out before any download:
@@ -8417,6 +8474,13 @@ def hy4_layout_in(d: Path, quant: str) -> str | None:
     return None
 
 
+def hy4_for_pcs(quant: str, memory_gb: float) -> str:
+    """A size's memory line in the setup's list: the PCs it is meant for as the model card says it (the table's
+    "for_gb": RAM + VRAM), else the VRAM + RAM that hold it."""
+    lo, hi = (list(hy4_quant_table(quant).get("for_gb") or []) + [0, 0])[:2]
+    return f"for PCs with {lo:g}-{hi:g} GB of RAM + VRAM" if lo and hi else f"about {memory_gb:.0f} GB of VRAM and RAM together"
+
+
 def choose_hy4_quant(a, prev: dict) -> str:
     """--hy4-quant (--model hy4-flash-maya-xs, hy4-flash-q4_k_m), else asked: Maya's sizes that are uploaded first - by
     this PC's memory the one recommended (fit_recommendation) - then Tencent's own Q4_K_M (AngelSlim).  Nothing to
@@ -8436,8 +8500,8 @@ def choose_hy4_quant(a, prev: dict) -> str:
     order = sorted(keys, key=lambda k: k != rec) + others
     default = before if before in order else rec if rec in order else order[0]
     rows = [(Q.shown("hy4", k, m[k]["download_gb"]), "recommended" if k == rec else None,
-             f"Maya's quant: {hy4_quant_table(k).get('about', 'GGUF')}; about {m[k]['memory_gb']:.0f} GB of VRAM "
-             "and RAM together") for k in order if k != HY4_Q4]
+             f"Maya's quant: {hy4_quant_table(k).get('about', 'GGUF')}; " + hy4_for_pcs(k, m[k]["memory_gb"]))
+            for k in order if k != HY4_Q4]
     rows += [(Q.shown("hy4", k, m[k]["download_gb"]), None,
               f"Tencent's own Q4_K_M (AngelSlim): {hy4_quant_table(k).get('about', 'GGUF')}; about "
               f"{m[k]['memory_gb']:.0f} GB of VRAM and RAM together; with MTP drafting - run on NVIDIA RTX 30 / A100 "

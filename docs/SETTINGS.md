@@ -2330,7 +2330,8 @@ Engine options, in the config's `"args"`:
 "Hy4-Flash" in the setup's model list) sets up Tencent's [Hy4-Flash](https://huggingface.co/tencent/Hy4-flash) from
 Project Maya's own GGUF quants,
 [peasantsmith/Hy4-Flash-Maya-GGUF](https://huggingface.co/peasantsmith/Hy4-Flash-Maya-GGUF): Hy4-Flash · Maya-XS now
-(the model file 44.8 GB, the routed experts in 2 bits), more sizes when they are published. It checks the PC, picks
+(the model file 44.8 GB, the routed experts in 2 bits), Maya-M (68.4 GB, 3 bits) and Maya-L (89.5 GB, 4 bits) - the
+setup recommends one by the PC's RAM + VRAM; Maya-S when it is published. It checks the PC, picks
 the layout and the context that fit the card (4K to 1M: every one that fits its VRAM), downloads the model file and the n-gram
 table, builds the pack and the engine by itself and writes `maya-hy4-flash-maya-xs.json`. `--model-dir <folder>` uses
 files you already have (checked by size and sha256). The model runs on an engine of its own, `maya-hy4`

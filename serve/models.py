@@ -885,6 +885,44 @@ def hy4_plain(cfg: dict) -> bool:
     return maya_quants.config_key(cfg) == "q4_k_m"
 
 
+_HY4_BEFORE = {}                                    # {GPU index: MiB in use before this server started its engine}
+_hy4_used_cache = {}
+
+
+def hy4_note_before_start():
+    """The server's, just before it starts Hy4-Flash's engine: the VRAM in use on each card then (the setup's reading,
+    maya.py's gpu_used_mib) - what hy4_used falls back on while the engine runs on a PC whose nvidia-smi does not say
+    how much of a card's VRAM a program holds (Windows).  Nothing kept where nvidia-smi does not answer."""
+    try:
+        root = str(Path(__file__).resolve().parents[1])
+        if root not in sys.path:
+            sys.path.insert(0, root)
+        import maya
+        got = maya.gpu_used_mib()
+    except Exception:  # noqa: BLE001 - no reading: hy4_used counts the card as it reads now
+        got = {}
+    _HY4_BEFORE.clear()
+    _HY4_BEFORE.update(got)
+    _hy4_used_cache.clear()
+
+
+def hy4_used(gpus: list) -> dict:
+    """{GPU index: MiB of VRAM in use} on a config's cards as the setup reads it (maya.py's gpu_used_mib, the same
+    nvidia-smi figure; hy4_usable_gib then counts at most HY4_FIT_USED_CAP_GIB a card, as for the setup) - less what
+    a Maya engine loaded now holds there itself (maya.py's hy4_used_mib: the model this page sets up, or one that
+    stops when it starts, is not "in use"; else the page would refuse the config that is running).  Asked at most
+    every 10 s.  {} when nvidia-smi does not answer: the setup's sum for a PC with no reading."""
+    now = time.time()
+    hit = _hy4_used_cache.get("used")
+    if not hit or now - hit[0] >= 10:
+        root = str(Path(__file__).resolve().parents[1])
+        if root not in sys.path:
+            sys.path.insert(0, root)
+        import maya
+        hit = _hy4_used_cache["used"] = (now, maya.hy4_used_mib(before=dict(_HY4_BEFORE)))
+    return {i: hit[1][i] for i in gpus if i in hit[1]} if hit[1] else {}
+
+
 def hy4_room(cfg: dict) -> dict | None:
     """What Hy4-Flash's config has in VRAM for a context, worked out as the setup does it (maya.py's
     hy4_config_need_gib and hy4_usable_gib: the plan of its size and layout - installer.hy4_quant / layout - in
@@ -892,9 +930,10 @@ def hy4_room(cfg: dict) -> dict | None:
     function: the least it takes - with the latent cache in F16 rows, or in the 8-bit rows the engine's --kv auto
     takes where F16 does not fit; a config's own --kv f16 / q8: that one's), "contexts": those of HY4_CONTEXTS that
     fit, "contexts_q8": those of them that fit only in 8-bit rows, "cards": how many}.  The parts counted have no RAM
-    fallback: the engine stops at its start where they do not fit.  Each card is taken as the setup takes one with a
-    desktop and programs on it (HY4_FIT_USED_CAP_GIB: the engine's own use now says nothing).  None where it cannot
-    be worked out: a card of the config this PC does not list with its VRAM, a size the table has no plan for."""
+    fallback: the engine stops at its start where they do not fit.  Each card's VRAM in use is the setup's own
+    reading (hy4_used: nvidia-smi's figure now, at most HY4_FIT_USED_CAP_GIB of it counted, a loaded Maya engine's own
+    VRAM left out), so the page and the setup offer the same contexts.  None where it cannot be worked out: a card of
+    the config this PC does not list with its VRAM, a size the table has no plan for."""
     inst, args, gpus = cfg.get("installer") or {}, cfg.get("args") or [], gpus_of(cfg)
     cards = {g["index"]: g for g in machine_gpus("cuda")}
     if not gpus or any(not (cards.get(i) or {}).get("vram_gb") for i in gpus):
@@ -921,8 +960,8 @@ def hy4_room(cfg: dict) -> dict | None:
             return min(one(ctx, False), one(ctx, True))
         if need(HY4_CONTEXTS[0]) is None:
             return None
-        usable = maya.hy4_usable_gib([cards[i] for i in gpus], {i: maya.HY4_FIT_USED_CAP_GIB * 1024 for i in gpus})
-        rows = {c: maya.hy4_kv_rows(one(c, False), one(c, True), usable, kv) for c in HY4_CONTEXTS}
+        usable = maya.hy4_usable_gib([cards[i] for i in gpus], hy4_used(gpus))
+        rows ={c: maya.hy4_kv_rows(one(c, False), one(c, True), usable, kv) for c in HY4_CONTEXTS}
     except Exception:  # noqa: BLE001 - no plan to read: the page keeps to the context the setup wrote
         return None
     return {"usable": usable, "need": need, "contexts": [c for c in HY4_CONTEXTS if rows[c]],
@@ -962,7 +1001,7 @@ def hy4_chunk_by_hand(cfg: dict) -> bool:
 
 def hy4_refit(new: dict) -> dict | None:
     """The setup's choice (maya.py's hy4_fit: pictures first, then the larger prompt chunk) for Hy4-Flash's config
-    `new` at its context, in its layout, on its cards as hy4_room takes them (HY4_FIT_USED_CAP_GIB in use on each);
+    `new` at its context, in its layout, on its cards as hy4_room takes them (hy4_used: the setup's own reading);
     pictures switched off (--vision off, or a pack without the tower) are not counted, as with the setup's
     --no-vision.  None where it cannot be worked out, or where the context does not fit (hy4_context_check says so)."""
     inst, args, gpus = new.get("installer") or {}, new.get("args") or [], gpus_of(new)
@@ -975,7 +1014,7 @@ def hy4_refit(new: dict) -> dict | None:
             return None
         fit = maya.hy4_fit(maya.hy4_quant_table(inst.get("hy4_quant") or ""), [cards[i] for i in gpus],
                            _int(flag(args, "--max-context"), 32768),
-                           used={i: maya.HY4_FIT_USED_CAP_GIB * 1024 for i in gpus},
+                           used=hy4_used(gpus),
                            layout=inst.get("layout") or maya.HY4_STANDARD,
                            pictures=flag(args, "--vision") != "off" and hy4_has_vision(new))
     except Exception:  # noqa: BLE001

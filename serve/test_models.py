@@ -6,6 +6,7 @@ engine, no GPU.
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import sys
@@ -98,8 +99,12 @@ class Settings(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.d = Path(self.tmp.name)
+        # (Hy4-Flash's cards: 1 GB or more in use on each - the most the setup counts - unless a test reads its own)
+        self.used = mock.patch.object(M, "hy4_used", side_effect=lambda gpus: {i: 1024 for i in gpus})
+        self.used.start()
 
     def tearDown(self):
+        self.used.stop()
         self.tmp.cleanup()
 
     def test_glm_read(self):
@@ -461,6 +466,78 @@ class Settings(unittest.TestCase):
                     new = M.apply(big, {**M.settings_of(big), "context": ctx})
                     self.assertEqual(new["args"], M.set_flag(big["args"], "--max-context", ctx))
                     self.assertEqual(new["installer"], big["installer"])
+
+    def test_hy4_page_reads_the_vram_in_use_as_the_setup_does(self):
+        """The Models page offers the contexts the setup offers: the cards' VRAM in use is the setup's own reading
+        (nvidia-smi's figure now, at most 1 GB a card counted) - and a loaded Maya engine's own VRAM is not "in use",
+        else the page would refuse the config that is running."""
+        import maya
+        p = hy4_cfg(self.d)
+        c = json.loads(p.read_text())
+        c.update(args=["--pack", M.flag(c["args"], "--pack"), "--max-context", "16384", "--chunk", "256",
+                       "--reserve-gb", "0.5", "--vram-experts", "0"], gpu=[0])
+        c["installer"]["layout"] = "8gb"
+        p.write_text(json.dumps(c, indent=1))
+        small = M.read(p)
+        xs = maya.hy4_quant_table("maya-xs")
+        asked = []
+
+        def pc(used, own=None, before=None):
+            """nvidia-smi's answers: MiB in use on the card, of it a Maya engine's (None: not said), the reading the
+            server took before it started the engine (None: none taken)."""
+            M._hy4_used_cache.clear()
+            M._HY4_BEFORE.clear()
+            st = contextlib.ExitStack()
+            st.enter_context(mock.patch.object(maya, "gpu_used_mib", side_effect=lambda: asked.append(1) or dict(used)))
+            st.enter_context(mock.patch.object(maya, "maya_engine_mib", return_value=own or {}))
+            st.enter_context(mock.patch.object(M, "machine_gpus", return_value=[{"index": 0, "name": "x", "vram_gb": 8.0}]))
+            if before is not None:
+                with mock.patch.object(maya, "gpu_used_mib", return_value=before):
+                    M.hy4_note_before_start()
+            return st
+        refused = r"need about 7\.1 GB of VRAM at 32768 tokens; this card has 7\.0 GB for them"
+        self.used.stop()
+        try:
+            # the owner's 8 GB card: 571 MiB in use - the setup offers 32K, and so does the page
+            with pc({0: 571}):
+                fit = maya.hy4_fit(xs, [{"index": 0, "vram_gb": 8.0}], used={0: 571}, layout="8gb")
+                self.assertEqual(fit["contexts"], [4096, 8192, 16384, 32768])
+                self.assertEqual(M.hy4_room(small)["contexts"], fit["contexts"])
+                self.assertAlmostEqual(M.hy4_room(small)["usable"], fit["usable"])
+                self.assertEqual(M.flag(M.apply(small, {"context": 32768})["args"], "--max-context"), "32768")
+                row = M.listing(self.d, None)["models"][0]
+                self.assertEqual((row["contexts"], row["context_range"]["max"]), (fit["contexts"], 32768))
+                self.assertEqual(len(asked), 1)                       # (one reading for all of it: kept for 10 s)
+            for used in ({0: 1024}, {0: 3000}):                       # (1 GB or more in use: at most 1 GB counts)
+                with pc(used):
+                    self.assertEqual(M.hy4_room(small)["contexts"],
+                                     maya.hy4_fit(xs, [{"index": 0, "vram_gb": 8.0}], used=used, layout="8gb")["contexts"])
+                    with self.assertRaisesRegex(ValueError, refused):
+                        M.apply(small, {"context": 32768})
+            # the model is loaded on the card (7.4 GB in use, most of it the engine's own): not counted
+            with pc({0: 7400}, own={0: 6829.0}):                      # (nvidia-smi says how much is the engine's)
+                self.assertEqual(M.flag(M.apply(small, {"context": 32768})["args"], "--max-context"), "32768")
+                self.assertAlmostEqual(M.hy4_room(small)["usable"], 8 - 571 / 1024)
+            with pc({0: 7400}, own={0: None}, before={0: 571}):       # (Windows: the reading from before its start)
+                self.assertEqual(M.flag(M.apply(small, {"context": 32768})["args"], "--max-context"), "32768")
+                self.assertAlmostEqual(M.hy4_room(small)["usable"], 8 - 571 / 1024)
+            with pc({0: 7400}, own={0: None}):                        # (neither: the card as it reads, 1 GB counted)
+                with self.assertRaisesRegex(ValueError, refused):
+                    M.apply(small, {"context": 32768})
+            with pc({}):                                              # (no reading: the setup's sum without one)
+                self.assertAlmostEqual(M.hy4_room(small)["usable"], maya.hy4_usable_gib([{"index": 0, "vram_gb": 8.0}], {}))
+            # the server notes the reading just before it starts Hy4-Flash's engine (no other engine's start asks)
+            for exe, noted in (("/b/maya-hy4", {0: 571}), ("C:/b/maya-hy4.exe", {0: 571}), ("/b/maya", {}), ("/b/maya-mm3", {})):
+                M._HY4_BEFORE.clear()
+                with mock.patch.object(maya, "gpu_used_mib", return_value={0: 571}), \
+                        mock.patch.object(SV.subprocess, "Popen", side_effect=OSError("not started")):
+                    with self.assertRaises(OSError):
+                        SV.StrataEngine(exe, ["--pack", "x"])
+                self.assertEqual(M._HY4_BEFORE, noted, exe)
+        finally:
+            M._hy4_used_cache.clear()
+            M._HY4_BEFORE.clear()
+            self.used.start()
 
     def test_hy4_contexts_that_fit(self):
         """Hy4-Flash's context on the Models page: only what fits the config's cards by its layout's plan, as the

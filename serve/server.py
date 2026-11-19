@@ -996,6 +996,8 @@ class StrataEngine:
         if log:
             threading.Thread(target=narrate_start, args=(log, log_start, args, loading),
                              daemon=True).start()
+        if Path(str(exe)).stem.lower() == "maya-hy4":   # (the Models page: the cards' VRAM in use without the engine's own)
+            models.hy4_note_before_start()
         self.proc = subprocess.Popen([exe, "--serve", *args], cwd=cwd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                      stderr=self.log, text=True, encoding="utf-8", bufsize=1, env=env)
         self.max_context = 0
