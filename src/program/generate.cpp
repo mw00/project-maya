@@ -1468,8 +1468,10 @@ static int glm_pack_generate(const Options& o) {
     std::filesystem::path slot_dir;
     bool branch_index_complete = true;
     bool slot_disk_writable = true;
+    bool slot_recovery_complete = true;
     const auto slot_io_failure = [&](const fs::path& path, const std::error_code& ec) {
         branch_index_complete = false;
+        slot_recovery_complete = false;
         slot_disk_writable = false;
         std::fprintf(stderr, "glm slots: I/O failed for %s (%s); disk cache writes disabled until restart; cleanup disabled\n",
                      path.string().c_str(), ec.message().c_str());
@@ -1480,6 +1482,18 @@ static int glm_pack_generate(const Options& o) {
         fs::remove(path, ec);
         if (ec) slot_io_failure(path, ec);
         return !ec;
+    };
+    // Recovery assumes a stable private directory, not concurrent path replacement.
+    // Unlike an entry disappearing during enumeration, an absent paired file is
+    // an ordinary incomplete write. Never follow a link to classify either side.
+    const auto slot_file_type = [&](const fs::path& path, std::error_code& ec) {
+        const auto type = fs::symlink_status(path, ec).type();
+        if (type == fs::file_type::not_found && (!ec || ec == std::errc::no_such_file_or_directory)) {
+            ec.clear();
+            return type;
+        }
+        if (!ec) strata::core::SlotDirectoryScan::accepts_type(type, ec);
+        return type;
     };
     // what a kept slot must match: the session format, the engine version, the pack and the model's shards (names and
     // sizes) and whether the draft block is loaded.  The split itself is checked by slot_load (each part's layers).
@@ -1622,7 +1636,17 @@ static int glm_pack_generate(const Options& o) {
                 if (!is_meta) continue;                      // a .bin is judged by its .meta
                 const std::string bin = p.substr(0, p.size() - 5) + ".bin";
                 Found fd{bin, {}, 0, stamp, kNoImages};
-                const uint64_t have = fs::exists(bin, ec) ? (uint64_t) fs::file_size(bin, ec) : 0;
+                const auto payload_type = slot_file_type(bin, ec);
+                if (ec) {
+                    slot_io_failure(bin, ec);
+                    break;
+                }
+                if (payload_type != fs::file_type::regular && payload_type != fs::file_type::not_found) {
+                    ++refused;
+                    slot_remove_file(p);   // only this known-regular metadata, never the unsupported payload
+                    continue;
+                }
+                const uint64_t have = payload_type == fs::file_type::regular ? (uint64_t) fs::file_size(bin, ec) : 0;
                 if (ec) {
                     slot_io_failure(bin, ec);
                     break;
@@ -1669,16 +1693,24 @@ static int glm_pack_generate(const Options& o) {
                 const std::string p = path.string(), fn = path.filename().string();
                 if ((fn.rfind("slot-", 0) == 0 || (branch_enabled && fn.rfind("branch-", 0) == 0)) &&
                     fn.size() > 9 && fn.compare(fn.size() - 4, 4, ".bin") == 0) {
-                    const bool has_meta = fs::exists(meta_of(p), ec);
+                    const auto metadata_type = slot_file_type(meta_of(p), ec);
                     if (ec) {
                         slot_io_failure(meta_of(p), ec);
                         break;   // unknown metadata is not proof of an orphan
                     }
-                    if (!has_meta) slot_remove_file(path);
+                    if (metadata_type == fs::file_type::not_found) slot_remove_file(path);
+                    else if (metadata_type != fs::file_type::regular) {
+                        // A known unsupported sidecar cannot account for this
+                        // regular payload. Keep it, but do not write against a
+                        // partial disk ledger. Independently valid slots survive.
+                        slot_disk_writable = false;
+                        branch_index_complete = false;
+                        note("unsupported sidecar for " + p + "; disk cache writes disabled until restart; cleanup disabled");
+                    }
                 }
             }
         }
-        if (!slot_disk_writable) found.clear();
+        if (!slot_recovery_complete) found.clear();
         std::sort(found.begin(), found.end(), [](const Found& a, const Found& b) {
             return a.t != b.t ? a.t < b.t : a.bin > b.bin;
         });

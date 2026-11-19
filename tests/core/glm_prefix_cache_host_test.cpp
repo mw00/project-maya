@@ -43,6 +43,19 @@ static void scan_checks(const fs::path& root) {
            "SCAN_NAME_CONTRACT incomplete ordinary names remain available for cleanup");
     expect(Scan::accepts_name("branch-session.meta.tmp", true) && !Scan::accepts_name("branch-session.meta", false),
            "SCAN_NAME_CONTRACT learned names follow enabled policy including cleanup items");
+    std::error_code type_error;
+    expect(Scan::accepts_type(fs::file_type::regular, type_error) && !type_error,
+           "SCAN_TYPE regular file is an accepted candidate");
+    for (const auto type : {fs::file_type::directory, fs::file_type::symlink, fs::file_type::block,
+                            fs::file_type::character, fs::file_type::fifo, fs::file_type::socket}) {
+        type_error = std::make_error_code(std::errc::io_error);
+        expect(!Scan::accepts_type(type, type_error) && !type_error,
+               "SCAN_TYPE known unsupported type is skipped without following or opening it");
+    }
+    for (const auto type : {fs::file_type::none, fs::file_type::not_found, fs::file_type::unknown}) {
+        expect(!Scan::accepts_type(type, type_error) && type_error == std::errc::io_error,
+               "SCAN_TYPE unknown or disappeared enumerated type fails closed");
+    }
     for (const size_t count : {size_t{0}, size_t{1}, size_t{64}, size_t{65}, size_t{197}}) {
         for (const bool deleting : {false, true}) {
             const auto dir = root / ("scan-" + std::to_string(count) + (deleting ? "-delete" : "-keep"));
@@ -52,10 +65,10 @@ static void scan_checks(const fs::path& root) {
             for (size_t i = 0; i < count; ++i) {
                 const char* prefix = i % 3 == 0 ? "slot-" : i % 3 == 1 ? "branch-" : "unrelated-";
                 const auto path = dir / (prefix + std::to_string(i) + (i % 2 ? ".meta" : ".bin"));
-                if (i % 7 == 0) fs::create_directory(path);
+                if (i % 67 == 0) fs::create_directory(path);
                 else put(path, "fixture");
                 fs::last_write_time(path, now - std::chrono::seconds(i % 3));
-                if (i % 3 != 2) expected.emplace_back(fs::last_write_time(path), path);
+                if (i % 3 != 2 && i % 67 != 0) expected.emplace_back(fs::last_write_time(path), path);
             }
             std::sort(expected.begin(), expected.end(), [](const auto& a, const auto& b) {
                 return a.first != b.first ? a.first > b.first : a.second < b.second;
@@ -90,6 +103,8 @@ static void scan_checks(const fs::path& root) {
                 return !fs::exists(item.second);
             }), "scan visits and removes every candidate item exactly once");
             expect(count < 3 || fs::exists(dir / "unrelated-2.bin"), "scan leaves unrelated mixed items untouched");
+            expect(count == 0 || fs::is_directory(dir / "slot-0.bin"),
+                   "SCAN_TYPE candidate-named ordinary directory is left untouched");
         }
     }
     const auto budget_dir = root / "scan-small-budgets";
@@ -102,6 +117,26 @@ static void scan_checks(const fs::path& root) {
     expect(exact.next(ec).empty() && !ec && exact.all_entries().size() == 3 && exact.visited_entries() == 3,
            "SCAN_SINGLE_PASS entries added after first next do not trigger another enumeration");
     fs::remove(budget_dir / "slot-later.meta");
+    const auto mixed_type_dir = root / "scan-small-types";
+    fs::create_directories(mixed_type_dir / "slot-directory.meta");
+    fs::create_directory(mixed_type_dir / "branch-directory.bin");
+    put(mixed_type_dir / "slot-valid.meta", "fixture");
+    expect(!Scan::is_regular_entry(mixed_type_dir / "slot-directory.meta", ec) && !ec &&
+           Scan::is_regular_entry(mixed_type_dir / "slot-valid.meta", ec) && !ec,
+           "SCAN_TYPE real ordinary directory is skipped and regular file accepted without following links");
+    Scan mixed_types(mixed_type_dir, true, 3, 1);
+    const auto mixed_batch = mixed_types.next(ec);
+    expect(!ec && mixed_batch.size() == 1 && mixed_batch.front().second.filename() == "slot-valid.meta" &&
+           mixed_types.visited_entries() == 3 && mixed_types.candidate_entries() == 1,
+           "SCAN_TYPE ordinary directories cannot consume candidate allowance or block valid files");
+    expect(mixed_types.next(ec).empty() && !ec && mixed_types.all_entries().size() == 1,
+           "SCAN_TYPE exact regular candidate limit succeeds despite unsupported mixed directories");
+    const auto directory_only = root / "scan-directory-only";
+    fs::create_directories(directory_only / "slot-directory.tmp");
+    Scan unsupported_only(directory_only, true, 1, 0);
+    expect(unsupported_only.next(ec).empty() && !ec && unsupported_only.visited_entries() == 1 &&
+           unsupported_only.candidate_entries() == 0,
+           "SCAN_TYPE known directory succeeds with zero regular candidate allowance");
     Scan visit_limited(budget_dir, true, 2, 3);
     expect(visit_limited.next(ec).empty() && ec == std::errc::no_buffer_space &&
            visit_limited.visited_entries() == 2 && visit_limited.candidate_entries() == 2 &&

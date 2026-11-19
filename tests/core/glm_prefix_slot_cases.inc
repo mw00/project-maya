@@ -1,5 +1,6 @@
   else if (which.rfind("branch-", 0) == 0) {
-    if (!branch_enabled && which.rfind("branch-scan-",0)!=0) fail("candidate did not enable in fixture");
+    if (!branch_enabled && which.rfind("branch-scan-",0)!=0 && which.rfind("branch-types-",0)!=0)
+      fail("candidate did not enable in fixture");
     auto a = std::vector<int32_t>(4000, 17), b = a, c = a;
     b[1883] = 19; c[1883] = 23;
     auto seed = [&] { model.live_pos = 1883; branch_save(b, 1883); };
@@ -8,7 +9,34 @@
       for (const auto& e : std::filesystem::directory_iterator(slot_dir, ec)) ++n;
       return n;
     };
-    if (which.rfind("branch-scan-",0)==0) {
+    if (which.rfind("branch-types-",0)==0) {
+      if (which=="branch-types-unknown") {
+        if (slot_disk_writable || slot_recovery_complete || !slots.empty() || !fixture_io_errors || count_files()!=4)
+          fail("unknown nofollow stat did not stop writes and discard partial recovery");
+      } else {
+        if (slots.size()!=1 || slots[0].tokens!=a)
+          fail("mixed directory types lost valid recovery or restored unsupported state");
+        if (which=="branch-types-mixed") {
+          if (!slot_disk_writable || std::filesystem::exists(slot_dir / "slot-directory.meta") ||
+              std::ifstream(slot_dir / "slot-directory.bin" / "marker").get()!='d' ||
+              std::ifstream(slot_dir / "slot-directory-only" / "marker").get()!='m')
+            fail("unsupported payload cleanup touched directories or disabled valid cache");
+        } else if (which=="branch-types-missing") {
+          if (!slot_disk_writable || std::filesystem::exists(slot_dir / "slot-missing.meta") || count_files()!=2)
+            fail("ordinary missing payload was treated as unknown stat failure");
+        } else {
+          if (slot_disk_writable || !slot_recovery_complete ||
+              std::filesystem::file_size(slot_dir / "slot-held.bin")!=8 ||
+              std::ifstream(slot_dir / "slot-held.meta" / "marker").get()!='s')
+            fail("unsupported sidecar lost payload, valid recovery or disk write gate");
+          Slot fresh{{51}, "", 8, ++slot_clock}; fresh.data=ram();
+          slots.push_back(std::move(fresh));
+          if (slot_write_file(slots.size()-1) || model.file_saves)
+            fail("unsupported sidecar allowed writes against partial disk accounting");
+        }
+      }
+      slot_flush_on_exit.enabled=false;
+    } else if (which.rfind("branch-scan-",0)==0) {
       const bool legacy = which.ends_with("-legacy");
       if (branch_enabled==legacy || slot_disk_writable || !slots.empty() || count_files()!=4)
         fail("bounded scan failure deleted files or partially restored the catalogue");

@@ -127,7 +127,11 @@ Startup now orders lightweight file metadata by recency before reading/admitting
 learned token keys, so reduced count/byte/token quotas favor the newest entries
 that fit while retaining the existing aggregate token bound. Startup enumerates
 the directory once, allowing at most 8192 visited directory entries and 1024
-candidate records. It sorts candidates only after the whole scan succeeds and uses that
+candidate records. In a stable, private cache directory, only regular files
+participate in recovery. Link and other unsupported entry types are not opened
+as metadata or payloads; an indeterminate type is an I/O failure, not proof of
+absence. This is not protection against concurrent replacement of pathnames.
+Startup sorts candidates only after the whole scan succeeds and uses that
 same list for orphan checks. Exceeding either limit leaves the directory alone:
 no partial index is restored and new disk writes are disabled for the run.
 These limits apply to scan work and temporary records, not to the byte size of

@@ -33,6 +33,32 @@ public:
         return name.rfind("slot-", 0) == 0 || (include_learned && name.rfind("branch-", 0) == 0);
     }
 
+    // Only regular files participate. Known unsupported kinds are harmless skips;
+    // an absent or indeterminate enumerated item cannot establish a complete scan.
+    static bool accepts_type(std::filesystem::file_type type, std::error_code& ec) {
+        ec.clear();
+        switch (type) {
+        case std::filesystem::file_type::regular:
+            return true;
+        case std::filesystem::file_type::directory:
+        case std::filesystem::file_type::symlink:
+        case std::filesystem::file_type::block:
+        case std::filesystem::file_type::character:
+        case std::filesystem::file_type::fifo:
+        case std::filesystem::file_type::socket:
+            return false;
+        default:
+            ec = std::make_error_code(std::errc::io_error);
+            return false;
+        }
+    }
+
+    static bool is_regular_entry(const std::filesystem::path& path, std::error_code& ec) {
+        const auto status = std::filesystem::symlink_status(path, ec);
+        if (ec) return false;
+        return accepts_type(status.type(), ec);
+    }
+
     // The first call must reach directory end successfully before any view is
     // published. Later calls only slice memory; deleting visited files is safe.
     // Every view remains valid for this object's lifetime. This is not a snapshot
@@ -73,6 +99,10 @@ private:
             }
             ++visited_;
             if (!accepts_name(it->path(), include_learned_)) continue;
+            if (!is_regular_entry(it->path(), error_)) {
+                if (error_) break;
+                continue;
+            }
             if (candidates_ == candidate_limit_) {
                 error_ = std::make_error_code(std::errc::no_buffer_space);
                 break;

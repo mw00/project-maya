@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Extract actual candidate Slot/lambdas; fake only model bytes and OS capacity.
+"""Extract actual candidate Slot/lambdas with bounded host-only fault fixtures.
 
 Reuses the existing 17-scenario fixture without editing it, including the
-16GiB legacy spill default. Only model bytes and OS capacities are simulated.
+16GiB legacy spill default. Simulates model bytes, OS capacities, ordinary
+filesystem I/O failures and small directory scan budgets.
 """
 from __future__ import annotations
 import argparse
@@ -29,6 +30,7 @@ CASES = ("branch-policy-completion", "branch-policy-slot", "branch-policy-disabl
          "branch-lru-pressure", "branch-lru-staging", "branch-lru-staging-room",
          "branch-lru-staging-save-fail", "branch-lru-staging-meta-fail", "branch-lru-staging-bound",
          "branch-lru-staging-pressure", "branch-lru-staging-reindex",
+         "branch-types-mixed", "branch-types-missing", "branch-types-sidecar", "branch-types-sidecar-legacy", "branch-types-unknown",
          "branch-scan-visit", "branch-scan-candidate", "branch-scan-visit-legacy", "branch-scan-candidate-legacy",
          "branch-scan-visit-direct-legacy", "branch-scan-visit-cleanup-legacy",
          "branch-cleanup-start-tmp", "branch-cleanup-start-meta", "branch-cleanup-start-bin",
@@ -58,7 +60,7 @@ INCLUDES = r'''
 static uint64_t fixture_available = uint64_t{128} << 30;
 static uint64_t fixture_disk_available = uint64_t{256} << 30;
 static std::filesystem::path fixture_slot_dir;
-static std::string fixture_remove_failure;
+static std::string fixture_remove_failure, fixture_status_failure;
 static int fixture_io_errors = 0;
 static bool fixture_orphan_iter_fail = false, fixture_orphan_exists_fail = false;
 static std::size_t fixture_scan_visits = strata::core::SlotDirectoryScan::max_visits;
@@ -70,11 +72,13 @@ static std::filesystem::path fixture_scan_directory(const std::filesystem::path&
   }
   return path;
 }
-static bool fixture_orphan_exists(const std::filesystem::path& path, std::error_code& ec) {
-  if (fixture_orphan_exists_fail) {
-    ++fixture_io_errors; ec = std::make_error_code(std::errc::permission_denied); return false;
+static auto fixture_symlink_status(const std::filesystem::path& path, std::error_code& ec) {
+  if ((fixture_orphan_exists_fail && path.extension()==".meta") ||
+      (!fixture_status_failure.empty() && path.filename()==fixture_status_failure)) {
+    ++fixture_io_errors; ec = std::make_error_code(std::errc::permission_denied);
+    return std::filesystem::file_status(std::filesystem::file_type::none);
   }
-  return std::filesystem::exists(path, ec);
+  return std::filesystem::symlink_status(path, ec);
 }
 static bool fixture_remove(const std::filesystem::path& path, std::error_code& ec) {
   if (!fixture_remove_failure.empty() && path.string().ends_with(fixture_remove_failure)) {
@@ -194,6 +198,32 @@ SETUP = r'''
   }
   if (which=="branch-lru-staging-room") set_env("MAYA_GLM_LEARNED_STATES", "16");
   if (which.rfind("branch-cleanup-", 0)==0) set_env("MAYA_GLM_SLOT_RAM_GB", "0");
+  if (which.rfind("branch-types-",0)==0) {
+    if (which.ends_with("-legacy")) set_env("MAYA_GLM_LEARNED_PREFIX", "");
+    std::filesystem::path metadata;
+    for (const auto& e : std::filesystem::directory_iterator(fixture_slot_dir))
+      if (e.path().extension()==".meta") { metadata=e.path(); break; }
+    if (metadata.empty()) fail("type fixture missing valid seed metadata");
+    if (which=="branch-types-mixed") {
+      std::filesystem::create_directory(fixture_slot_dir / "slot-directory.bin");
+      std::ofstream(fixture_slot_dir / "slot-directory.bin" / "marker").put('d');
+      std::filesystem::copy_file(metadata, fixture_slot_dir / "slot-directory.meta");
+      std::filesystem::create_directory(fixture_slot_dir / "slot-directory-only");
+      std::ofstream(fixture_slot_dir / "slot-directory-only" / "marker").put('m');
+    } else if (which=="branch-types-missing") {
+      std::filesystem::copy_file(metadata, fixture_slot_dir / "slot-missing.meta");
+    } else if (which.rfind("branch-types-sidecar",0)==0) {
+      std::ofstream(fixture_slot_dir / "slot-held.bin", std::ios::binary).write("payload!",8);
+      std::filesystem::create_directory(fixture_slot_dir / "slot-held.meta");
+      std::ofstream(fixture_slot_dir / "slot-held.meta" / "marker").put('s');
+    } else if (which=="branch-types-unknown") {
+      std::ofstream(fixture_slot_dir / "slot-unknown.bin", std::ios::binary).write("payload!",8);
+      std::filesystem::copy_file(metadata, fixture_slot_dir / "slot-unknown.meta");
+      std::filesystem::last_write_time(fixture_slot_dir / "slot-unknown.meta",
+        std::filesystem::file_time_type::clock::now() - std::chrono::hours(1));
+      fixture_status_failure="slot-unknown.bin";
+    }
+  }
   if (which.rfind("branch-scan-", 0)==0) {
     if (which.ends_with("-legacy")) set_env("MAYA_GLM_LEARNED_PREFIX", "");
     if (which.find("-direct-")!=std::string::npos || which.find("-cleanup-")!=std::string::npos) {
@@ -218,8 +248,7 @@ def fixture(source: str) -> str:
     block = block.replace("strata::core::SlotDirectoryScan scan(slot_dir, branch_enabled);",
                           "strata::core::SlotDirectoryScan scan(fixture_scan_directory(slot_dir), branch_enabled, "
                           "fixture_scan_visits, fixture_scan_candidates);")
-    block = block.replace("const bool has_meta = fs::exists(meta_of(p), ec);",
-                          "const bool has_meta = fixture_orphan_exists(meta_of(p), ec);")
+    block = block.replace("fs::symlink_status(path, ec)", "fixture_symlink_status(path, ec)")
     if block.count("cache_memory::available_bytes()") != 1:
         raise RuntimeError("memory probe extraction changed")
     block = block.replace("cache_memory::available_bytes()", "fixture_available")
@@ -239,6 +268,7 @@ def fixture(source: str) -> str:
     cpp = cpp.replace('which != "cli-reindex" &&', 'which != "branch-cleanup-restart" && which != "cli-reindex" &&')
     cpp = cpp.replace('which != "cli-reindex" &&', 'which != "branch-cleanup-retire-restart" && which != "cli-reindex" &&')
     cpp = cpp.replace('which != "cli-reindex" &&', 'which.rfind("branch-scan-", 0) != 0 && which != "cli-reindex" &&')
+    cpp = cpp.replace('which != "cli-reindex" &&', 'which.rfind("branch-types-", 0) != 0 && which != "cli-reindex" &&')
     cpp = cpp.replace('std::ofstream(root / "pack" / n).put(\'x\');', 'if (!std::filesystem::exists(root / "pack" / n)) std::ofstream(root / "pack" / n).put(\'x\');')
     cpp = cpp.replace("  Options o;", SETUP + "\n  Options o;")
     extra = (ROOT / "tests/core/glm_prefix_slot_cases.inc").read_text(encoding="utf-8")
@@ -299,7 +329,7 @@ def main() -> int:
         ),
         "command": [sys.executable, *sys.argv],
         "fixture_changes": [
-            "replace memory and disk probes only in slot policy",
+            "replace memory/disk capacity probes; inject ordinary filesystem I/O errors and small scan budgets",
             "unchanged legacy default16 from PR #994",
             "position/context aware fake model; shard rejection is simulated, not CUDA validation",
             "extract single/multi completion routes and deferred queue verbatim; "
@@ -338,8 +368,8 @@ def main() -> int:
                 for case in args.cases or CASES:
                     case_root = (td / PAIRS.get(case, case)).resolve()
                     if not case_root.is_relative_to(td): raise RuntimeError("case path escaped temporary directory")
-                    if case.startswith(("branch-policy-", "branch-scan-")):
-                        seed_case = "branch-legacy-meta" if case.startswith("branch-scan-") else "branch-ready-short-disk"
+                    if case.startswith(("branch-policy-", "branch-scan-", "branch-types-")):
+                        seed_case = "branch-ready-short-disk" if case.startswith("branch-policy-") else "branch-legacy-meta"
                         seeded = subprocess.run([str(exe), seed_case, str(case_root)], cwd=td,
                                                 capture_output=True, text=True, timeout=15)
                         receipt[case + "-seed"] = {"exit_code": seeded.returncode, "stdout": seeded.stdout,
@@ -356,9 +386,9 @@ def main() -> int:
                                     "miss: diverged at token 1", "miss: token prefix matches but images differ"]
                         if reasons != expected:
                             assertion_error = f"wrong runtime miss reasons: {reasons!r}"
-                    if case.startswith("branch-cleanup-") and not case.endswith("restart"):
+                    if case.startswith(("branch-cleanup-", "branch-scan-")) and not case.endswith("restart"):
                         if "cache writes disabled" not in ran.stderr:
-                            assertion_error = "cleanup failure lacks explicit fail-closed diagnostic"
+                            assertion_error = "cache failure lacks explicit fail-closed diagnostic"
                     receipt["cases"].append({"name": case, "exit_code": ran.returncode, "stdout": ran.stdout,
                                              "stderr": ran.stderr, "assertion_error": assertion_error})
                     print(f"{case}: rc={ran.returncode}")
