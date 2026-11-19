@@ -22,6 +22,7 @@
 #include "strata/artifact/gguf_reader.hpp"
 #include "strata/core/glm_arch.hpp"
 #include "strata/core/glm_dflash.hpp"
+#include "strata/core/glm_pack_digest.hpp"
 #include "strata/core/glm_state_layout.hpp"   // glm-dsa B4.1
 #include "strata/kernels/cpu/native_expert.hpp"
 #include "strata/kernels/exl3.hpp"
@@ -92,13 +93,6 @@ struct Glm5Geometry : GlmArchExt<Glm5Geometry> {   // glm-dsa: arch + glm-dsa fi
     bool is_recr(int il) const { return n_head_kv[(size_t) il] == 0; }
 
     static bool from_gguf(const strata::GgufFile& g, Glm5Geometry& out, std::string& err);
-};
-
-struct PackShardDigests {
-    std::mutex mu;
-    std::map<std::pair<std::string, uint64_t>, std::string> entries;
-    size_t hash_count = 0;
-    std::string digest(const std::string& file_id, uint64_t size, const void* base);
 };
 
 class Glm5Model {

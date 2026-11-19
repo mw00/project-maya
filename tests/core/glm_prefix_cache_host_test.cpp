@@ -19,13 +19,12 @@
 #include "strata/core/glm_slot_directory_scan.hpp"
 #include "strata/core/regular_file_stream.hpp"
 #include "strata/artifact/gguf_reader.hpp"
+#include "strata/core/glm_pack_digest.hpp"
 
 namespace fs = std::filesystem;
 namespace pm = strata::core::glm_cache_memory;
 namespace pa = strata::core::glm_prefix;
 static int checks = 0, failures = 0;
-#include "glm_pack_identity.cu"   // tools/test_glm_prefix_cache_host.py passes src/core on the include path; the digest
-                                  // has no CUDA calls, so a host build can check it against the published vectors
 static void expect(bool ok, const char* name) {
     ++checks;
     std::printf("%s %s\n", ok ? "PASS" : "FAIL", name);
