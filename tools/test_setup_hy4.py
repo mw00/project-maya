@@ -659,6 +659,32 @@ class Fit(unittest.TestCase):
         gpus = gib if isinstance(gib, list) else [card(gib)]
         return maya.hy4_fit(XS, gpus, used={g["index"]: used for g in gpus}, **kw)
 
+    def test_kv_streaming_offers_longer_contexts_where_the_ram_holds_the_rows(self):
+        for gib in (8, 12, 16, 24, 32):                    # (no RAM figure: the VRAM alone, as before)
+            f = self.fit(gib, 0)
+            self.assertNotIn("streamed", f)
+            self.assertNotIn("--kv-streaming", f["args"])
+            # ... and what fitted without streaming is never streamed, whatever the RAM
+            r = self.fit(gib, 0, ram_gb=128)
+            self.assertEqual([c for c in r["contexts"] if c not in r.get("streamed", [])], f["contexts"], gib)
+            self.assertEqual(self.fit(gib, 0, ram_gb=32).get("streamed"), None, gib)   # (a small RAM: no rows there)
+        f = self.fit(8, ram_gb=64)                         # (an 8 GB card: 32K before; 1M's pooled keys do not fit)
+        self.assertEqual((f["layout"], f["streamed"], f["context"]), ("8gb", [65536, 131072, 262144, 524288], 32768))
+        self.assertIn("error", self.fit(8, ram_gb=64, ctx_wanted=1048576))
+        f = self.fit(8, ram_gb=64, ctx_wanted=262144)
+        self.assertEqual((f["kv_streaming"], f["kv"], f["args"][-2:]), (True, "q8", ["--kv-streaming", "auto"]))
+        self.assertAlmostEqual(f["kv_ram"], 13 * 262144 * 672 / 2**30, places=3)
+        self.assertLessEqual(f["need"], f["usable"])
+        f = self.fit(16, 0, ram_gb=64, ctx_wanted=1048576)  # (a 16 GB card: the model's whole reach, F16 rows in RAM)
+        self.assertEqual((f["layout"], f["kv_streaming"], f["kv"], f["args"]), ("standard", True, "f16", ["--kv-streaming", "auto"]))
+        self.assertAlmostEqual(f["kv_ram"], 13 * 1048576 * 1152 / 2**30, places=3)
+        f = self.fit(32, 0, ram_gb=64, ctx_wanted=1048576)  # (a card that holds it all: not streamed)
+        self.assertNotIn("kv_streaming", f)
+        # the streamed cache: a ring of the global layers' rows instead of every position's
+        full, st = maya.hy4_cache_bytes(1048576, 1024), maya.hy4_cache_bytes(1048576, 1024, resident=32768)
+        self.assertEqual(full - st, 13 * ((1048576 - 32768) * 1152 - 32768 * 4) - (64 * 2052 * 1160 + 1048576 * 4 + 1024))
+        self.assertEqual(maya.hy4_cache_bytes(32768, 1024, resident=32768), maya.hy4_cache_bytes(32768, 1024))
+
     def test_8gb_card(self):
         f = self.fit(8)                                               # (a card that also drives the desktop)
         # (16K and 32K fit with the cache in 8-bit rows - the engine's --kv auto takes them by itself: no --kv)
