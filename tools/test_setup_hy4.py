@@ -404,10 +404,10 @@ class Picker(unittest.TestCase):
         self.assertNotIn("Maya-S", about)                             # (only the sizes that are uploaded)
         self.assertIn("or AMD on Linux (Strix Halo / Gorgon Halo, Radeon cards)", about)
         self.assertNotIn("Mac", about)
-        with patch.object(maya, "WIN", False):                        # (AMD: Linux only so far)
-            self.assertIn("Hy4-Flash", self.rows(args(model=None, backend="hip"), man=manifest())["rows"])
-        with patch.object(maya, "WIN", True):
-            self.assertNotIn("Hy4-Flash", self.rows(args(model=None, backend="hip"), man=manifest())["rows"])
+        self.assertIn("under Windows experimental", about)
+        for win in (False, True):                                     # (AMD: Linux, and Windows - experimental)
+            with patch.object(maya, "WIN", win):
+                self.assertIn("Hy4-Flash", self.rows(args(model=None, backend="hip"), man=manifest())["rows"])
 
     def test_the_setup_before(self):
         prev = {"exe": "/b/maya-hy4", "args": ["--pack", "/p"], "installer": {"family": "hy4"}}
@@ -475,12 +475,15 @@ class Gate(unittest.TestCase):
         self.assertEqual(why, "")
         self.assertEqual(said, [("hip", {"text_only": False})])       # (pictures: the tower runs on HIP too)
 
-    def test_amd_on_windows_not_yet(self):
+    def test_amd_on_windows_experimental(self):
+        """Windows + AMD: said once to be experimental, then the AMD check as on Linux (no stop, no extra question)."""
         why, said = self.check("hip", win=True)
-        self.assertIn("runs on AMD GPUs on Linux only for now: with an AMD GPU on Windows it has not been tested yet",
-                      why)
-        self.assertIn("set it up on Linux on this PC, or on a PC with an NVIDIA GPU (V100 or newer", why)
-        self.assertEqual(said, [])
+        self.assertEqual(why, "")
+        self.assertEqual(len(said), 2)
+        self.assertIn("Hy4-Flash on an AMD GPU under Windows is experimental: Maya's team has not tested it there",
+                      said[0])
+        self.assertIn("docs/AMD_MAYA.md", said[0])
+        self.assertEqual(said[1], ("hip", {"text_only": False}))
 
     def test_mac(self):
         why, _ = self.check("metal")
@@ -574,6 +577,21 @@ class Amd(unittest.TestCase):
             fit = maya.hy4_fit(XS, [radeon()])
         self.assertEqual((fit["layout"], fit["vision"]), ("standard", True))
         self.assertAlmostEqual(fit["usable"], 17.0)
+
+    def test_windows_apu_is_its_share(self):
+        """Windows: the GPU's share (HIP's figure) less the desktop's 3 GB - not the share and the RAM together: the
+        engine keeps within the dedicated memory there."""
+        win_halo = dict(halo(), vram_gb=96.0)
+        with contextlib.ExitStack() as stack:
+            for p in self.pc(31, win=True):
+                stack.enter_context(p)
+            self.assertAlmostEqual(maya.hy4_usable_gib([win_halo]), 93.0)
+            fits, line = maya.hy4_apu_note([win_halo], TABLE["quants"]["Hy4-Flash-Maya-M"], "Hy4-Flash-Maya-M")
+            self.assertTrue(fits, line)
+            fits, line = maya.hy4_apu_note([dict(win_halo, vram_gb=64.0)], TABLE["quants"]["Hy4-Flash-Maya-L"],
+                                           "Hy4-Flash-Maya-L")
+        self.assertFalse(fits)
+        self.assertIn("Windows gives the GPU 61 GB of this PC's memory", line)
 
     def test_limit_read_from_sysfs(self):
         with patch.object(maya.sys, "platform", "win32"):
