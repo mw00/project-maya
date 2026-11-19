@@ -5555,7 +5555,9 @@ void Glm5Model::fast_service() {
                         bool draining = false;
                         for (const auto& d : F->draining)
                             if (d.rclass == cls && d.rslot == rs) {
+                                F->svc_phase.store(4, std::memory_order_relaxed);   // (#860: the stall line's phase)
                                 cudaEventSynchronize(d.ev);
+                                F->svc_phase.store(1, std::memory_order_relaxed);
                                 draining = true;
                                 break;
                             }
@@ -5592,9 +5594,11 @@ void Glm5Model::fast_service() {
                 const int rch = F->read_chunks > 0 ? F->read_chunks : rch_env;
                 const auto wait_ahead = [&] {   // the lookahead's reads in flight for this route land outside its jobs
                     const auto tw = std::chrono::steady_clock::now();
+                    F->svc_phase.store(3, std::memory_order_relaxed);   // (#860: the stall line's phase)
                     for (int i = 0; i < nw; ++i)
                         while ((F->rload[(size_t) cls][(size_t) wt[i]].load(std::memory_order_acquire) & 3u) != 2u)
                             cpu_relax();
+                    F->svc_phase.store(1, std::memory_order_relaxed);
                     F->ah_waited += (uint64_t) nw;
                     F->ah_wait_us.fetch_add((uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(
                                                 std::chrono::steady_clock::now() - tw).count(),
@@ -8309,7 +8313,11 @@ bool Glm5Model::decode_spec(strata::kernels::SamplerParams& sp, int64_t max_new,
     // is - the device's given-up waits for the host, the service thread's routes and what it does.  Two atomic stores a
     // phase and a watcher thread that wakes once a second; nothing the decode computes changes
     strata::platform::StallWatch stall(strata::platform::stall_limit_s(), [this](const char* phase, double sec) {
-        static const char* const svc[3] = {"waiting for a route", "on a route", "in its CPU lane"};
+        // (3, 4: the two places a route's service waits on something else - a look-ahead read another thread has in
+        //  hand, the copy of an expert demoted at the last boundary)
+        static const char* const svc[5] = {"waiting for a route", "on a route", "in its CPU lane",
+                                           "on a route, waiting for a look-ahead read to land",
+                                           "on a route, waiting for a demoted expert's copy"};
         static const char* const kinds[6] = {"-", "a route's answer", "the CPU lane's answer", "a deferred CPU answer",
                                              "a rows step's CPU answer", "a route's answer (wait+fetch)"};
         std::string line = "glm stall: a drafting step has run " + std::to_string((int) sec) + " s (" + phase + ")";
@@ -8317,7 +8325,7 @@ bool Glm5Model::decode_spec(strata::kernels::SamplerParams& sp, int64_t max_new,
             FastState* Fm = m->fast_;
             if (Fm == nullptr) continue;
             const unsigned int done = Fm->svc_next.load(std::memory_order_relaxed);
-            const int ph = std::min(2, std::max(0, Fm->svc_phase.load(std::memory_order_relaxed)));
+            const int ph = std::min(4, std::max(0, Fm->svc_phase.load(std::memory_order_relaxed)));
             unsigned int posted = 0u;
             if (Fm->ring_h != nullptr)
                 posted = ((volatile const gf::MoeRequest*) gf::ring_entry(Fm->ring_h, done + 1u, Fm->md.ring_n,
