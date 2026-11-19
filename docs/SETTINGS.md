@@ -596,7 +596,7 @@ with `"loop_guard": false` (or `true`) beside its sampling fields (Chat Completi
 ## Several requests at once
 
 This is a setting of **GLM-5.3-Flash**, **DeepSeek-V4.1-Flash** ([DeepSeek's below](#deepseek-v41-flash-several-requests-at-once))
-and **MiniMax-M3.1-Flash**. A saved conversation slot reuses earlier state; it does not decode requests at the same time.
+and **MiniMax-M3.1-Flash** (not of Hy4-Flash, which answers one request at a time). A saved conversation slot reuses earlier state; it does not decode requests at the same time.
 
 **MiniMax-M3.1-Flash:** `maya-mm3 --parallel N` (the setup and `START-MAYA.bat --parallel 4` write it into the config)
 gives every conversation its own KV cache, always in VRAM: KV streaming and the DSpark drafter are off while N is above
@@ -2324,30 +2324,61 @@ Engine options, in the config's `"args"`:
 | `MAYA_EXPERT_RAM_GB` | unset (what the RAM allows) | caps the experts' RAM tier, in GB (the dashboard's Models page: Experts in RAM) |
 | `MAYA_EXPERT_STAGERS` | Linux: the reads at once the model's drive serves fastest (2, 4, 8 or 16, measured in ~1 s at the first start on a drive and kept in `~/.config/project-maya/drive-reads.txt`; `MAYA_EXPERT_DRIVE_PROBE=0` skips the measurement); otherwise a quarter of the CPU threads, 2 to 8 | the threads that read a layer's experts from the file while the CPU prepares the layer (their reads overlap); `0`: read one by one when the CPU needs them |
 
-## Hy4-flash
+## Hy4-Flash
 
-Tencent's [Hy4-flash](https://huggingface.co/tencent/Hy4-flash) runs on an engine of its own, `maya-hy4` (NVIDIA;
-run on RTX 30 and RTX 50 cards), from [AngelSlim's GGUF set](https://huggingface.co/AngelSlim/Hy4-flash-GGUF) in place: 42 layers and
-an MTP block; 512 routed experts, 16 a token, and a shared one; MLA attention - 30 sliding-window layers of 512
-positions and 12 whose indexer picks 2048 positions in groups of 4 out of the whole context (up to 1M); four
-hyper-connection streams; and an n-gram (Engram) table read at 4 layers.
+`./maya.sh --setup --model hy4-flash-maya-xs` (or `--hy4-quant maya-xs`; Windows: `START-MAYA.bat`, or pick
+"Hy4-Flash" in the setup's model list) sets up Tencent's [Hy4-Flash](https://huggingface.co/tencent/Hy4-flash) from
+Project Maya's own GGUF quants,
+[peasantsmith/Hy4-Flash-Maya-GGUF](https://huggingface.co/peasantsmith/Hy4-Flash-Maya-GGUF): Hy4-Flash · Maya-XS now
+(the model file 44.8 GB, the routed experts in 2 bits), more sizes when they are published. It checks the PC, picks
+the layout and the context that fit the card (4K, 8K, 16K, 32K, 64K or 128K), downloads the model file and the n-gram
+table, builds the pack and the engine by itself and writes `maya-hy4-flash-maya-xs.json`. `--model-dir <folder>` uses
+files you already have (checked by size and sha256). The model runs on an engine of its own, `maya-hy4`
+(contributed by [@needmorevram](https://github.com/needmorevram), #1040): NVIDIA GPUs (CUDA) from the V100 on, Linux
+and Windows.
 
-**The pack.** `python tools/hy4/pack_gguf.py --model <folder>` writes `<folder>/maya-hy4/`: the geometry
-(`hy4.txt`), the index of the set's tensors (`tensors.txt`: names, types, offsets - no weights are copied), the
-n-gram hash (`engram.bin`) and the tokenizer with the GGUF's own chat template. It checks the whole set before it
-writes anything; a set still downloading, another architecture or a type the engine does not read is refused.
-Q4_K_M is the build run end to end. Q3_K and IQ2-AH use types the same kernels read but have not been run; the
-SPARK-4Bit builds (NVFP4) are refused.
-
-**The answers.** Greedy answers are the reference build's (AngelSlim's) token for token on the prompts compared; over
-its perplexity tool's logits the KL divergence is the size of the reference's own difference between two batch sizes
-(the model is unusually sensitive to rounding). The prompt is the GGUF's template; the levels:
+**Defaults from Tencent's release**: temperature 0.9, top-p 1.0, no top-k; the thinking budget is 32768 tokens; the
+prompt is the release's own chat template (inside the GGUF). The loop guard is on, as for every model. The thinking
+levels the model has:
 
 | `reasoning_effort` | The prompt |
 |---|---|
-| unset (Auto) | the template's default (`high`) |
-| `low`, `high`, `max` | that `reasoning_effort` |
-| thinking off | `no_think` |
+| unset, `high` (default) | High |
+| `low`, `medium` | High as well (the model has no lower level) |
+| `max` | Max |
+| thinking off | `no_think` (`chat_template_kwargs: {"reasoning_effort": "no_think"}` works as on the model card) |
+
+**The n-gram table.** Every size shares one file (63.4 GB, Tencent's FP8 table value for value). It stays on the SSD
+and is read page by page; it is not mapped into memory in the background (`HY4_EG_POPULATE`, below) and never loaded
+into RAM whole. Keep it on an SSD / NVMe, never a hard disk.
+
+**VRAM.** Everything but the routed experts has to fit in VRAM; the experts that do not fit run on the CPU from RAM.
+Maya-XS needs about 8.7 / 9.0 / 9.8 GiB of free VRAM at 4K / 8K / 32K context. For a card under about 10 GB the
+setup picks the "8 GB" layout by itself (a second model file with smaller attention weights, 43.6 GB; slightly lower
+quality): about 6.5 / 6.8 GiB at 4K / 8K. A card with less than about 7 GB cannot run it.
+
+**Not available for Hy4-Flash yet** (the dashboard offers no switch for them): pictures (text only; the repo's
+vision file is for llama.cpp); drafting (the release's drafter is not read by the engine yet, and `--mtp` below only
+applies to GGUF sets that carry an MTP block, which Maya's do not); `--parallel` (one request at a time); AMD (HIP)
+and Mac.
+
+The rest of this section describes the engine itself, as contributed, and what it does with a GGUF set that carries
+the model's MTP block ([AngelSlim's](https://huggingface.co/AngelSlim/Hy4-flash-GGUF), which the setup does not
+offer): 42 layers; 512 routed experts, 16 a token, and a shared one; MLA attention - 30 sliding-window layers of 512
+positions and 12 whose indexer picks 2048 positions in groups of 4 out of the whole context (up to 1M); four
+hyper-connection streams; and an n-gram (Engram) table read at 4 layers.
+
+**The pack.** The setup builds it by itself. By hand, `python tools/hy4/pack_gguf.py --model <folder>` writes
+`<folder>/maya-hy4/`: the geometry
+(`hy4.txt`), the index of the set's tensors (`tensors.txt`: names, types, offsets - no weights are copied), the
+n-gram hash (`engram.bin`) and the tokenizer with the GGUF's own chat template. It checks the whole set before it
+writes anything; a set still downloading, another architecture or a type the engine does not read is refused.
+Of AngelSlim's sets, Q4_K_M is the build run end to end. Q3_K and IQ2-AH use types the same kernels read but have
+not been run; the SPARK-4Bit builds (NVFP4) are refused.
+
+**The answers.** With AngelSlim's Q4_K_M, greedy answers are the reference build's token for token on the prompts
+compared; over its perplexity tool's logits the KL divergence is the size of the reference's own difference between
+two batch sizes (the model is unusually sensitive to rounding).
 
 Tool calls work as GLM's do: every tag token of Hy4's (`<think:..>`, `<tool_call:..>`, `<arg_key:..>`, ...) carries
 the template's suffix, and the pack's tokenizer names each by GLM's spelling, so the server reads its answers with
@@ -2376,14 +2407,15 @@ With an expert profile (`--profile`) each layer keeps its most routed experts in
 (F16 latent rows and the indexer's pooled keys), so 128K takes ~2.2 GB and 1M ~17 GB - on every member with tensor
 parallel. The sliding-window layers keep a ring of their 512 positions and 16K more.
 
-**Drafting.** `--mtp` loads the GGUF's MTP block (its BF16 weights rounded to Q8_0 at load; its copy of the output
+**Drafting** (only GGUF sets with an MTP block; not Maya's files). `--mtp` loads the GGUF's MTP block (its BF16 weights rounded to Q8_0 at load; its copy of the output
 head for the drafts' top token in Q4_K - only how often a draft holds depends on it) and drafts up to
 `--draft` tokens a step; the model checks them in one window, so the tokens are the model's own: greedy answers are
 the same with and without it on the same placement, and with sampling a draft is kept with the model's probability of
 it. (The MTP block's VRAM can move a layer, or a share of the experts, to another GPU, which rounds a little
 differently: a near-tie can then go the other way.)
 
-Measured on a 9-GPU NVIDIA PC (an RTX 3090 and eight RTX 5060 Ti on PCIe 3, two Xeon sockets), Q4_K_M:
+Measured by the engine's contributor (@needmorevram) on his own PC, with AngelSlim's Q4_K_M set, not with Maya's
+files - a 9-GPU NVIDIA PC (an RTX 3090 and eight RTX 5060 Ti on PCIe 3, two Xeon sockets):
 
 | Experts in VRAM | Decode, tok/s | Prompt, tok/s |
 |---|---:|---:|
