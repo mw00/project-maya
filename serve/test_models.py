@@ -102,8 +102,12 @@ class Settings(unittest.TestCase):
         # (Hy4-Flash's cards: 1 GB or more in use on each - the most the setup counts - unless a test reads its own)
         self.used = mock.patch.object(M, "hy4_used", side_effect=lambda gpus: {i: 1024 for i in gpus})
         self.used.start()
+        # (... and no RAM figure - the VRAM alone, no KV streaming - unless a test gives one)
+        self.ram = mock.patch.object(M, "hy4_ram_gb", return_value=None)
+        self.ram.start()
 
     def tearDown(self):
+        self.ram.stop()
         self.used.stop()
         self.tmp.cleanup()
 
@@ -347,8 +351,8 @@ class Settings(unittest.TestCase):
         # what the engine does not have yet: a plain no, nothing written
         for key, value, why in (("parallel", 2, "one request at a time"), ("draft", "mtp", "this pack has no MTP block"),
                                 ("images", True, "this pack has no vision tower"), ("kv_cache", "fp8", "one cache format"),
-                                ("kv", "int8", "one cache format"), ("kv_streaming", True, "KV streaming: not available"),
-                                ("kv_resident", 8192, "KV streaming: not available"),
+                                ("kv", "int8", "one cache format"), ("kv_streaming", True, "KV streaming: .* by itself"),
+                                ("kv_resident", 8192, "KV streaming: .* by itself"),
                                 ("ablate", True, "Refusal ablation: not available for this model")):
             with self.assertRaisesRegex(ValueError, why):
                 M.apply(cfg, {key: value})
@@ -497,6 +501,42 @@ class Settings(unittest.TestCase):
         finally:
             M._gpu_cache.clear()
             M._hy4_used_cache.clear()
+
+    def test_hy4_page_offers_the_streamed_contexts_the_setup_offers(self):
+        """KV streaming (maya-hy4 --kv-streaming auto): with this PC's RAM read, the Models page offers the longer
+        contexts the setup's hy4_fit offers - those the VRAM holds only with the global layers' older rows in RAM -
+        and a config moved to one gets --kv-streaming auto; one that fits without it, or a config with streaming off
+        by hand, is as before."""
+        import maya
+        p = hy4_cfg(self.d)
+        c = json.loads(p.read_text())
+        c.update(args=["--pack", M.flag(c["args"], "--pack"), "--max-context", "16384", "--chunk", "256",
+                       "--reserve-gb", "0.5", "--vram-experts", "0"], gpu=[0])
+        c["installer"]["layout"] = "8gb"
+        p.write_text(json.dumps(c, indent=1))
+        small = M.read(p)
+        xs = maya.hy4_quant_table("maya-xs")
+        card = [{"index": 0, "vram_gb": 8.0}]
+        with mock.patch.object(M, "machine_gpus", return_value=[{"index": 0, "name": "x", "vram_gb": 8.0}]):
+            before = M.hy4_room(small)["contexts"]
+            with mock.patch.object(M, "hy4_ram_gb", return_value=64.0):
+                fit = maya.hy4_fit(xs, card, used={0: 1024}, layout="8gb", ram_gb=64.0)
+                room = M.hy4_room(small)
+                self.assertEqual(room["contexts"], fit["contexts"])
+                self.assertGreater(len(fit["streamed"]), 0)
+                self.assertEqual([x for x in room["contexts"] if x not in fit["streamed"]], before)
+                longest = max(fit["streamed"])
+                a = M.apply(small, {"context": longest})["args"]
+                self.assertEqual((M.flag(a, "--max-context"), M.flag(a, "--kv-streaming")), (str(longest), "auto"))
+                self.assertIsNone(M.flag(M.apply(small, {"context": max(before)})["args"], "--kv-streaming"))
+                with self.assertRaisesRegex(ValueError, f"the largest that fits is {longest}"):
+                    M.apply(small, {"context": 1048576})          # (1M: the pooled keys alone do not fit 8 GB)
+                off = dict(small, args=small["args"] + ["--kv-streaming", "off"])
+                self.assertEqual(M.hy4_room(off)["contexts"], before)
+                with self.assertRaisesRegex(ValueError, f"the largest that fits is {max(before)}"):
+                    M.apply(off, {"context": longest})
+            with mock.patch.object(M, "hy4_ram_gb", return_value=16.0):   # (a small RAM: no room for the rows)
+                self.assertEqual(M.hy4_room(small)["contexts"], before)
 
     def test_hy4_page_reads_the_vram_in_use_as_the_setup_does(self):
         """The Models page offers the contexts the setup offers: the cards' VRAM in use is the setup's own reading

@@ -8308,6 +8308,35 @@ def hy4_stream_rows(plan: dict, ctx: int, usable: float, ram_gib: float | None) 
     return None
 
 
+def hy4_ram_for_rows(q: dict, usable: float, ram_gb: float | None) -> float | None:
+    """The RAM (GiB) KV streaming's rows may take on this PC: its RAM less the system's headroom (8 GiB or a tenth)
+    and the size's experts outside the VRAM (the CPU lane reads them from the file cache); None: no RAM figure."""
+    if not ram_gb:
+        return None
+    return float(ram_gb) - max(8.0, 0.1 * float(ram_gb)) - max(0.0, float(q.get("memory_gb") or 0) - usable)
+
+
+def hy4_config_stream(quant: str, layout: str, ctx: int, usable: float, ram_gib: float | None,
+                      chunk: int | None = None, reserve_gb: float | None = None, mtp: bool = False,
+                      kv: str | None = None) -> tuple | None:
+    """hy4_stream_rows for a size already set up, counted as hy4_config_need_gib counts it (the Models page's
+    serve/models.py hy4_room): (rows, ring, VRAM GiB) where the context fits its cards only with KV streaming and the
+    RAM left for the rows (ram_gib: hy4_ram_for_rows) holds them; kv "f16" / "q8": the config's own rows only."""
+    if ram_gib is None:
+        return None
+    plan = (hy4_layouts(hy4_quant_table(quant)).get(layout or HY4_STANDARD) or {}).get("plan") or {}
+    ch = int(chunk or plan.get("chunk") or 1024)
+    for res in (HY4_KV_RESIDENT, 1):
+        for q8 in ((kv == "q8",) if kv in ("f16", "q8") else (False, True)):
+            base = hy4_config_need_gib(quant, layout, ctx, chunk=chunk, reserve_gb=reserve_gb, q8=q8, mtp=mtp)
+            if base is None:
+                return None
+            need = base - (hy4_cache_bytes(ctx, ch, q8) - hy4_cache_bytes(ctx, ch, q8, res)) / 2**30
+            if need <= usable:
+                return ("q8" if q8 else "f16", res, need) if hy4_stream_ram_gib(ctx, q8) <= ram_gib else None
+    return None
+
+
 def hy4_need_gib(plan: dict, ctx: int, q8: bool = False) -> float:
     """The VRAM (GiB, its reserve included) maya-hy4 needs at a context for everything that is not a routed expert -
     these parts have no RAM fallback.  From the plan's table ("need_gib", by context); a context it does not list:
@@ -8526,9 +8555,7 @@ def hy4_fit(q: dict, gpus: list, ctx_wanted: int | None = None, used: dict | Non
     def need(plan: dict, c: int) -> float:             # (the least a context takes: with F16 rows, or with 8-bit rows)
         return min(hy4_fit_need_gib(plan, c), hy4_fit_need_gib(plan, c, True))
 
-    ram_rows = None                                    # (the RAM left for streamed rows)
-    if ram_gb:
-        ram_rows = float(ram_gb) - max(8.0, 0.1 * float(ram_gb)) - max(0.0, float(q.get("memory_gb") or 0) - usable)
+    ram_rows = hy4_ram_for_rows(q, usable, ram_gb)     # (the RAM left for streamed rows)
 
     def stream(plan: dict, c: int) -> tuple | None:
         return hy4_stream_rows(plan, c, usable, ram_rows)
