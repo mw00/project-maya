@@ -902,7 +902,9 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
                                                   third_party/ggml)
       target_link_libraries(maya-hy4 PRIVATE strata_kernels_cpu ${_strata_gpu_runtime_target} ${_strata_gpu_blas_target}
                                              Threads::Threads)
-      target_compile_definitions(maya-hy4 PRIVATE MAYA_DS4_IQ_ONLY)
+      # (DS4_IQ_MIN_FORMS: on AMD the K-quants' minimum term rounded one way in the token and the window kernels -
+      #  ds4_iq.cu's kMinG ..; a verify window's rows are then the rows the tokens get one at a time)
+      target_compile_definitions(maya-hy4 PRIVATE MAYA_DS4_IQ_ONLY DS4_IQ_MIN_FORMS)
       if(STRATA_BUILD_TESTS)
         # maya-hy4's routed experts (no model): the token, window and prompt forms on ds4_iq's kernels against
         # per-matrix GEMVs, in Hy4-flash's types (Q4_K / Q6_K, and the MTP block's Q8_0)
@@ -911,7 +913,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
         target_include_directories(hy4_experts_test PRIVATE ${_strata_gpu_include_directories} include src/hy4
                                                            third_party/ggml)
         target_link_libraries(hy4_experts_test PRIVATE strata_kernels_cpu ${_strata_gpu_runtime_target})
-        target_compile_definitions(hy4_experts_test PRIVATE MAYA_DS4_IQ_ONLY)
+        target_compile_definitions(hy4_experts_test PRIVATE MAYA_DS4_IQ_ONLY DS4_IQ_MIN_FORMS)
         add_test(NAME hy4_experts_test COMMAND hy4_experts_test)
         # maya-hy4's own kernels (no model): hyper-connections, the latent cache and MLA attention with sinks, the
         # router, the indexer's pools / scores / picks, Engram - against double-precision host references
