@@ -867,7 +867,14 @@ struct Model::Impl {
                 double head = std::max(8.0 * 1073741824.0, 0.1 * (double) ram);
                 if (const char* h = std::getenv("HY4_RAM_HEADROOM_GB")) head = std::max(0.0, std::atof(h)) * 1073741824.0;
                 if (avail > 0) {
-                    const double room = std::max(0.0, (double) avail - head);
+                    // (the GPU's own share - an APU's BIOS carve-out - is not RAM the system counts: on top)
+                    cudaDeviceProp pr{};
+                    double own = 0.0;
+                    if (cudaGetDeviceProperties(&pr, devs[i]) == cudaSuccess)
+                        own = (double) gpu_own_free(pr.pciDomainID, pr.pciBusID, pr.pciDeviceID);
+                    else
+                        cudaGetLastError();
+                    const double room = std::max(0.0, (double) avail - head) + own;
                     char ub[256];
                     std::snprintf(ub, sizeof ub, "INFO GPU%zu shares the system's memory: %.1f GB of it available, %.1f GB "
                                   "kept free for the system, %.1f GB for the model", i, (double) avail / 1e9, head / 1e9,

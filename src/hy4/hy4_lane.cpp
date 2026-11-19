@@ -365,6 +365,22 @@ uint64_t ram_available() {
 #endif
 }
 
+uint64_t gpu_own_free(int domain, int bus, int dev) {
+#if defined(__linux__)
+    char p[96];
+    std::snprintf(p, sizeof p, "/sys/bus/pci/devices/%04x:%02x:%02x.0/mem_info_vram_", domain, bus, dev);
+    const std::string tot = read_file(std::string(p) + "total"), used = read_file(std::string(p) + "used");
+    if (tot.empty() || used.empty()) return 0;
+    const uint64_t t = std::strtoull(tot.c_str(), nullptr, 10), u = std::strtoull(used.c_str(), nullptr, 10);
+    return t > u ? t - u : 0;
+#else
+    (void) domain;
+    (void) bus;
+    (void) dev;
+    return 0;
+#endif
+}
+
 uint64_t ram_total() {
 #if defined(_WIN32)
     MEMORYSTATUSEX s{};

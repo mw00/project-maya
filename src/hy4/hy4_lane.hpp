@@ -94,6 +94,9 @@ void warm_experts(const CpuExperts& ex, const std::vector<int>& experts, const s
 uint64_t ram_available();
 /// the system's RAM (0: not known)
 uint64_t ram_total();
+/// Linux, an AMD GPU at this PCI address: the free bytes of the memory that is the GPU's own (on an APU the BIOS's
+/// share, which the system does not count as RAM) - 0 where the driver does not say
+uint64_t gpu_own_free(int domain, int bus, int dev);
 
 /// out [T][n_embd] = each token's weighted sum of its entries' experts (rows with no entry: 0), x [T][n_embd]; the
 /// experts' weights read once for up to 8 of their tokens.  Scratch is the lane's own (grown as needed).
