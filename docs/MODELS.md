@@ -194,10 +194,11 @@ model-as-a-service providers) on an engine of its own (`maya-hy4`, contributed b
 | Files | Size | Runs on |
 | --- | ---: | --- |
 | **[Hy4-Flash · Maya-XS](https://huggingface.co/peasantsmith/Hy4-Flash-Maya-GGUF)** (`hy4-flash-maya-xs`), Project Maya's own quant: the routed experts in 2 bits - for PCs with about 56-64 GB of RAM + VRAM | 44.8 GB, and the n-gram table (63.4 GB, on the SSD); about 110 GB of disk in all | NVIDIA from the V100 on (CUDA); Linux and Windows |
+| **[Hy4-Flash · Maya-S](https://huggingface.co/peasantsmith/Hy4-Flash-Maya-GGUF)** (`hy4-flash-maya-s`): the routed experts in 2 bits on layers 1-23 and 3 bits on layers 24-41 - for PCs with about 68-80 GB of RAM + VRAM | 53.0 GB, and the same n-gram table; about 116 GB of disk in all | NVIDIA from the V100 on, cards from 12 GB; Linux and Windows |
 | **[Hy4-Flash · Maya-M](https://huggingface.co/peasantsmith/Hy4-Flash-Maya-GGUF)** (`hy4-flash-maya-m`): the routed experts in 3 bits (4 bits on 7 layers) - for PCs with about 80-96 GB of RAM + VRAM | 68.4 GB, and the same n-gram table; about 132 GB of disk in all | NVIDIA from the V100 on, cards from 12 GB; Linux and Windows |
 | **[Hy4-Flash · Maya-L](https://huggingface.co/peasantsmith/Hy4-Flash-Maya-GGUF)** (`hy4-flash-maya-l`): the routed experts in 4 bits (5 bits on 5 layers) - for PCs with about 104-128 GB of RAM + VRAM | 89.5 GB, and the same n-gram table; about 153 GB of disk in all | NVIDIA from the V100 on, cards from 12 GB; Linux and Windows |
 
-Maya-S follows: the setup lists it when it is published. The setup recommends a size by the PC's RAM + VRAM. Quality figures are on
+The setup recommends a size by the PC's RAM + VRAM. Quality figures are on
 the [model card](https://huggingface.co/peasantsmith/Hy4-Flash-Maya-GGUF).
 
 - **One n-gram table for every size:** Tencent's FP8 table, value for value (63.4 GB). It is downloaded once, stays

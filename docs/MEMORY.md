@@ -39,6 +39,7 @@ adds room for the system and the default context.
 | | Maya-S | 122 | 130 | **160** | NVIDIA, AMD |
 | | EXL3 3.5 bpw (Mia-AiLab) | 197 | 250 | **256** | NVIDIA, AMD |
 | **Hy4-Flash** | Maya-XS | 108 ³ | 45, plus 4-8 for the context | **56-64** | NVIDIA (V100 and newer), AMD on Linux ⁴ |
+| | Maya-S | 116 ³ | 53, plus 4-8 for the context | **68-80** | NVIDIA (V100 and newer; cards from 12 GB), AMD on Linux ⁴ |
 | | Maya-M | 132 ³ | 68, plus 4-8 for the context | **80-96** | NVIDIA (V100 and newer; cards from 12 GB), AMD on Linux ⁴ |
 | | Maya-L | 153 ³ | 90, plus 4-8 for the context | **104-128** | NVIDIA (V100 and newer; cards from 12 GB), AMD on Linux ⁴ |
 | **Qwen-3.8-Flash-Next** | UD-IQ2_XS (unsloth) | 80 ² | 47 | **64** | NVIDIA, AMD |
