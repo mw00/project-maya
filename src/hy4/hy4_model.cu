@@ -379,7 +379,7 @@ struct Model::Impl {
     int* h_ids = nullptr;
     float *h_w = nullptr, *h_lat = nullptr, *h_cpu = nullptr;
     uint8_t* h_stage = nullptr;   // (pinned: a pass of streamed experts, kStage blobs)
-    const double ev_poll_s = std::getenv("HY4_EV_POLL_US") ? std::atof(std::getenv("HY4_EV_POLL_US")) * 1e-6 : 2e-3;
+    const double ev_poll_s = (double) lane_waits().ev_poll_us * 1e-6;   // (0: asleep on the event at once)
     double cpu_us_et = 15.0;      // the CPU lane's microseconds an expert-token on a prompt chunk (measured, EMA)
     // the expert profile: uint32 [n_layer][n_expert] routings - read (Options::profile: the most routed stay in VRAM),
     // counted where the routes reach the host (the CPU lane's layers, every layer with Options::profile_out) and

@@ -8,7 +8,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <map>
 #include <random>
+#include <string>
 #include <vector>
 
 #include <cuda_fp16.h>
@@ -486,9 +488,38 @@ void mv_columns(int type, std::mt19937& rng) {
     cudaFree(dd);
 }
 
+// The CPU lane's waits by system and environment (no GPU needed): the measured set on Windows, the plain one
+// elsewhere, HY4_LANE_WAITS for the set, each variable alone for its own.
+void lane_waits_cases() {
+    using Env = std::map<std::string, std::string>;
+    auto waits = [](bool windows, const Env& env) {
+        return hy4::lane_waits(windows, [&env](const char* k) -> const char* {
+            const auto it = env.find(k);
+            return it == env.end() ? nullptr : it->second.c_str();
+        });
+    };
+    hy4::LaneWaits w = waits(true, {});
+    CHECK(w.spin_measured && w.spin_us == 3000 && w.ev_poll_us == 2000 && w.pin_caller);
+    w = waits(false, {});
+    CHECK(!w.spin_measured && w.spin_us == 3000 && w.ev_poll_us == 0 && !w.pin_caller);
+    w = waits(false, {{"HY4_LANE_WAITS", "1"}});
+    CHECK(w.spin_measured && w.spin_us == 3000 && w.ev_poll_us == 2000 && w.pin_caller);
+    w = waits(true, {{"HY4_LANE_WAITS", "0"}});
+    CHECK(!w.spin_measured && w.spin_us == 3000 && w.ev_poll_us == 0 && !w.pin_caller);
+    w = waits(true, {{"HY4_LANE_SPIN_US", "0"}, {"HY4_EV_POLL_US", "0"}, {"HY4_LANE_PIN_CALLER", "0"}});
+    CHECK(!w.spin_measured && w.spin_us == 0 && w.ev_poll_us == 0 && !w.pin_caller);
+    w = waits(false, {{"HY4_LANE_SPIN_US", "500"}, {"HY4_EV_POLL_US", "750"}, {"HY4_LANE_PIN_CALLER", "1"}});
+    CHECK(!w.spin_measured && w.spin_us == 500 && w.ev_poll_us == 750 && w.pin_caller);
+    w = waits(false, {{"HY4_LANE_WAITS", "1"}, {"HY4_EV_POLL_US", "-5"}});
+    CHECK(w.spin_measured && w.ev_poll_us == 0 && w.pin_caller);
+    std::printf("  CPU lane's waits by system and environment: %s\n", fails ? "FAILED" : "ok");
+}
+
 int main() {
+    lane_waits_cases();
     int n = 0;
     if (cudaGetDeviceCount(&n) != cudaSuccess || n == 0) {
+        if (fails) return 1;
         std::printf("hy4_experts_test: no GPU, skipped\n");
         return 0;
     }

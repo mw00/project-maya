@@ -155,13 +155,37 @@ struct Lane::Impl {
     }
 };
 
+LaneWaits lane_waits(bool windows, const std::function<const char*(const char*)>& env) {
+    LaneWaits w;
+    const char* all = env("HY4_LANE_WAITS");
+    const bool on = all ? std::atoi(all) != 0 : windows;
+    w.spin_measured = on;
+    w.ev_poll_us = on ? 2000 : 0;
+    w.pin_caller = on;
+    if (const char* e = env("HY4_LANE_SPIN_US")) {
+        w.spin_us = std::max(0, std::atoi(e));
+        w.spin_measured = false;
+    }
+    if (const char* e = env("HY4_EV_POLL_US")) w.ev_poll_us = std::max(0, std::atoi(e));
+    if (const char* e = env("HY4_LANE_PIN_CALLER")) w.pin_caller = std::atoi(e) != 0;
+    return w;
+}
+
+LaneWaits lane_waits() {
+#if defined(_WIN32)
+    const bool windows = true;
+#else
+    const bool windows = false;
+#endif
+    return lane_waits(windows, [](const char* k) -> const char* { return std::getenv(k); });
+}
+
 Lane::Lane(int threads) : p(new Impl) {
     const std::vector<std::vector<int>> nodes = node_cores();
     p->n_nodes = std::max(1, std::min((int) nodes.size(), Impl::kMaxNodes));
-    if (const char* e = std::getenv("HY4_LANE_SPIN_US")) {
-        p->spin_us.store(std::max(0, std::atoi(e)));
-        p->spin_fixed = true;
-    }
+    const LaneWaits lw = lane_waits();
+    p->spin_us.store(lw.spin_us);
+    p->spin_fixed = !lw.spin_measured;
     for (int q = 0; q < Impl::kMaxNodes; ++q) p->next[q].store(0);
     // every node's cores but the first core of node 0 (the caller's), round-robin over the nodes so a smaller lane
     // still spans them all
@@ -172,10 +196,9 @@ Lane::Lane(int threads) : p(new Impl) {
         for (int q = 0; q < p->n_nodes; ++q)
             if (i < nodes[(size_t) q].size() && !(q == 0 && i == 0)) order.push_back({nodes[(size_t) q][i], q});
     if (threads < 0) threads = (int) order.size();
-    // the caller's core: node 0's first, the one no worker takes (HY4_LANE_PIN_CALLER=0: the caller left where the
-    // system runs it - beside a worker, on its core's second thread, when it comes back from a wait)
-    const char* pc = std::getenv("HY4_LANE_PIN_CALLER");
-    if (threads > 0 && !nodes[0].empty() && !(pc && std::atoi(pc) == 0)) p->caller_core = nodes[0][0];
+    // the caller's core: node 0's first, the one no worker takes (not pinned: the caller left where the system runs
+    // it - beside a worker, on its core's second thread, when it comes back from a wait)
+    if (threads > 0 && !nodes[0].empty() && lw.pin_caller) p->caller_core = nodes[0][0];
     for (int i = 0; i < threads; ++i) {
         const int core = i < (int) order.size() ? order[(size_t) i].first : -1;
         const int node = i < (int) order.size() ? order[(size_t) i].second : 0;

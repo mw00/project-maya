@@ -2465,10 +2465,11 @@ A request's `spec` (0 / 1) turns the drafts off or on for it.
 
 | Variable | Default | What it does |
 |---|---|---|
-| `HY4_LANE_SPIN_US` | measured | the CPU lane: how long its threads spin for the next layer before they sleep, in microseconds - by default 3 ms at least and twice the longest gap between two layers seen lately (a sleeping thread comes back late on some PCs); `0`: asleep at once |
+| `HY4_LANE_WAITS` | on for Windows | the CPU lane's waits as a set: `1` the measured ones (the three variables below at their Windows defaults), `0` the plain ones (a 3 ms spin, no polling, the engine's thread not pinned). On by default on Windows, where a sleeping thread comes back late; on Linux `1` gives a few percent of decode speed and keeps the lane's cores busy through a whole answer (a hotter CPU) |
+| `HY4_LANE_SPIN_US` | measured on Windows, 3000 elsewhere | the CPU lane: how long its threads spin for the next layer before they sleep, in microseconds - measured: 3 ms at least and twice the longest gap between two layers seen lately (a sleeping thread comes back late on some PCs); `0`: asleep at once |
 | `HY4_LANE_WARM` | off | `1`: the CPU lane on a PC of one NUMA node - after the load a background thread reads the lane's experts into the engine's memory when the free RAM (file cache included) holds them all, so later answers do not pay each expert's first read (or the disk after a cold start); it takes a minute or two and slows an answer beside it a little meanwhile |
-| `HY4_LANE_PIN_CALLER` | on | the CPU lane: the engine's own thread stays on the core the lane's threads leave free; `0`: wherever the system runs it |
-| `HY4_EV_POLL_US` | 2000 | the CPU lane: how long the engine polls for a layer's routes before it sleeps on the GPU's event; `0`: asleep at once |
+| `HY4_LANE_PIN_CALLER` | on for Windows | the CPU lane: the engine's own thread stays on the core the lane's threads leave free; `0`: wherever the system runs it |
+| `HY4_EV_POLL_US` | 2000 on Windows, 0 elsewhere | the CPU lane: how long the engine polls for a layer's routes before it sleeps on the GPU's event; `0`: asleep at once |
 | `HY4_LANE_NT` | 32 | the CPU lane: a prompt's tokens an expert's weights are read once for (1-64) |
 | `HY4_TP_HELPER` | by speed | tensor parallel: `0` no expert share for the GPUs outside the group; `k`: k slices each (as their VRAM allows) |
 | `HY4_TP_MIXED` | off | tensor parallel over GPUs of different kinds (their copies of the state may drift apart) |

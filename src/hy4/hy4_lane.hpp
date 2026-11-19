@@ -40,6 +40,23 @@ private:
     std::unique_ptr<Impl> p;
 };
 
+/// How the lane and the thread that feeds it wait through a decode's gaps.  Windows: the measured waits (a thread that
+/// sleeps comes back milliseconds late there, and every lane job after it pays that).  Elsewhere the plain ones: on
+/// Linux a sleeping thread is back much sooner, so the measured waits give a few percent of decode speed and keep the
+/// lane's cores busy through a whole answer (far hotter on a CPU near its thermal limit) - left to the user.
+/// HY4_LANE_WAITS=1 / 0 picks the set on any system; each
+/// variable alone (HY4_LANE_SPIN_US, HY4_EV_POLL_US, HY4_LANE_PIN_CALLER) then decides its own.
+struct LaneWaits {
+    int64_t spin_us = 3000;       // the workers spin this long for the next job before they sleep ...
+    bool spin_measured = false;   // ... or twice the longest gap seen lately between two jobs, spin_us at least
+    int64_t ev_poll_us = 0;       // a layer's routes: the GPU's event polled this long before the blocking wait
+    bool pin_caller = false;      // the thread that brings the jobs stays on the core the workers leave free
+};
+/// windows: the system's kind; env: getenv (both parameters for the tests)
+LaneWaits lane_waits(bool windows, const std::function<const char*(const char*)>& env);
+/// This system, the process's environment
+LaneWaits lane_waits();
+
 /// A layer's routed experts in host memory: each role's tensor (the GGUF's stacked [n_exp][rows][row bytes]) and the
 /// layer's format (ds4's IqCpu: the types, the row bytes, the activations' types).
 struct CpuExperts {
