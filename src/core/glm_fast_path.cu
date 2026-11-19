@@ -3023,6 +3023,17 @@ void Glm5Model::lane_experts(glmfast::Workers& pool, uint8_t* act, uint8_t* hq, 
         // job j of a queue covers its flattened rows [tot * j / J, tot * (j + 1) / J)
         const auto phase = [&](int R, const auto& rows_fn) {
             const int half = R / 2, tot = ne * half;
+            if (pool.fast_concurrent()) {
+                pool.run_numa(n0, J, J, [&](int h, int j) {
+                    const int q1 = (int) ((int64_t) tot * (j + 1) / J);
+                    for (int q = (int) ((int64_t) tot * j / J); q < q1;) {
+                        const int i = q / half, r0 = q % half, r1 = std::min(half, r0 + (q1 - q));
+                        rows_fn(i, h * half + r0, h * half + r1);
+                        q += r1 - r0;
+                    }
+                });
+                return;
+            }
             alignas(64) std::atomic<int> qp[2];
             qp[0].store(0, std::memory_order_relaxed);
             qp[1].store(0, std::memory_order_relaxed);
@@ -3680,6 +3691,8 @@ static std::shared_ptr<glmfast::Workers> shared_cpu_pool(int threads) {
     if (p == nullptr || p->size() != threads) {
         const std::vector<int> cpus = cpu_list_env("MAYA_GLM_POOL_CPUS");
         p = std::make_shared<glmfast::Workers>(threads - 1, 20000, cpus, concurrent, !cpus.empty());
+        if (p->fast_concurrent())
+            std::fprintf(stderr, "glm fast: shared CPU pool using MAYA_GLM_WORKERS_FAST=1 (NUMA-isolated slots, %d threads)\n", threads);
         held = p;
     }
     return p;

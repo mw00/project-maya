@@ -199,9 +199,15 @@ public:
     // (one_to_one: worker i on cpus[i] alone, the rest on all of them)
     explicit Workers(int n, int spin_us = 300, const std::vector<int>& cpus = {}, bool concurrent = false,
                      bool one_to_one = false)
-        : spin_us_(spin_us), active_(n + 1), concurrent_(concurrent) {
+        : spin_us_(spin_us), active_(n + 1), concurrent_(concurrent),
+          fast_c_(concurrent && fast_workers_env()) {
         for (int i = 0; i < n; ++i) {
-            th_.emplace_back([this, i] { concurrent_ ? loop_c(i) : loop(i); });
+            const int pinned_nd = (one_to_one && i < (int) cpus.size()) ? node_of_cpu(cpus[(size_t) i]) : -1;
+            th_.emplace_back([this, i, pinned_nd] {
+                if (fast_c_) loop_fast(i, pinned_nd);
+                else if (concurrent_) loop_c(i);
+                else loop(i);
+            });
             pin_thread(th_.back().native_handle(),
                        one_to_one && i < (int) cpus.size() ? std::vector<int>{cpus[(size_t) i]} : cpus);
         }
@@ -215,8 +221,13 @@ public:
         idle_cv_.notify_all();
         for (auto& t : th_) t.join();
     }
+    bool fast_concurrent() const noexcept { return fast_c_; }
     void run(int n, const std::function<void(int)>& fn) {
         if (n <= 0) return;
+        if (fast_c_) {
+            run_fast(false, 0, n, 0, &fn, nullptr);
+            return;
+        }
         if (concurrent_) {
             run_c(n, fn);
             return;
@@ -240,6 +251,20 @@ public:
         }
         work(g);
         while (done_.load(std::memory_order_acquire) < n) cpu_relax();
+    }
+    // NUMA-aware two-half run: J0 jobs for half 0 (NUMA node n0) and J1 jobs for half 1 (other node),
+    // calling fn(h, j) with h in {0, 1}, j in [0, Jh).  Each socket's threads claim from their own
+    // cache-line-isolated ticket first, then steal from the other socket.
+    void run_numa(int n0, int J0, int J1, const std::function<void(int, int)>& fn) {
+        if (J0 + J1 <= 0) return;
+        if (fast_c_) {
+            run_fast(true, n0, J0, J1, nullptr, &fn);
+            return;
+        }
+        run(J0 + J1, [&](int idx) {
+            if (idx < J0) fn(0, idx);
+            else fn(1, idx - J0);
+        });
     }
     int size() const { return (int) th_.size() + 1; }
     // only the caller and the first n - 1 workers take jobs (fewer threads without a restart: setup's calibration);
@@ -395,6 +420,221 @@ private:
             }
         }
     }
+    // ---- MAYA_GLM_WORKERS_FAST=1: cache-line-isolated, NUMA-aware concurrent pool
+    static bool fast_workers_env() {
+        const char* v = std::getenv("MAYA_GLM_WORKERS_FAST");
+        return v != nullptr && std::atoi(v) != 0;
+    }
+    static int node_of_cpu(int cpu) {
+#ifdef __linux__
+        static const std::vector<int> tbl = [] {
+            std::vector<int> t(CPU_SETSIZE, 0);
+            for (int nd = 0; nd < 8; ++nd) {
+                char path[128];
+                std::snprintf(path, sizeof path, "/sys/devices/system/node/node%d/cpulist", nd);
+                FILE* fp = std::fopen(path, "r");
+                if (fp == nullptr) continue;
+                char buf[512];
+                if (std::fgets(buf, sizeof buf, fp) != nullptr) {
+                    const char* p = buf;
+                    while (*p) {
+                        while (*p == ',' || *p == ' ' || *p == '\n' || *p == '\r') ++p;
+                        if (!*p) break;
+                        char* end = nullptr;
+                        int a = (int) std::strtol(p, &end, 10);
+                        int b = a;
+                        if (end && *end == '-') b = (int) std::strtol(end + 1, &end, 10);
+                        for (int c = a; c <= b && c >= 0 && c < CPU_SETSIZE; ++c) t[(size_t) c] = nd;
+                        if (end == p) break;
+                        p = end;
+                    }
+                }
+                std::fclose(fp);
+            }
+            return t;
+        }();
+        return (cpu >= 0 && cpu < CPU_SETSIZE) ? tbl[(size_t) cpu] : 0;
+#else
+        (void) cpu;
+        return 0;
+#endif
+    }
+    static int current_node() {
+#ifdef __linux__
+        return node_of_cpu(sched_getcpu());
+#else
+        return 0;
+#endif
+    }
+    struct alignas(64) PadU64 {
+        std::atomic<uint64_t> v{kClosed};
+    };
+    struct alignas(64) PadInt {
+        std::atomic<int> v{0};
+    };
+    struct alignas(64) FastSlot {
+        PadU64 ticket[2];
+        PadInt done[2];
+        alignas(64) std::atomic<const std::function<void(int)>*> fn1{nullptr};
+        std::atomic<const std::function<void(int, int)>*> fn2{nullptr};
+        std::atomic<int> total[2]{{0}, {0}};
+        std::atomic<int> n0{0}, prio{0};
+        std::atomic<bool> numa{false}, busy{false};
+        uint64_t gen = 0;   // owner-only
+    };
+    void run_fast(bool numa, int n0, int J0, int J1, const std::function<void(int)>* fn1,
+                  const std::function<void(int, int)>* fn2) {
+        int s = 0;
+        for (bool got = false; !got;)
+            for (s = 0; s < kSlots && !got; ++s) {
+                bool f = false;
+                got = fslots_[s].busy.compare_exchange_strong(f, true, std::memory_order_acq_rel);
+                if (got) break;
+            }
+        FastSlot& S = fslots_[s];
+        const uint64_t g = ++S.gen & 0xffffffffu;
+        S.ticket[0].v.store((g << 32) | kClosed, std::memory_order_seq_cst);
+        S.ticket[1].v.store((g << 32) | kClosed, std::memory_order_seq_cst);
+        S.fn1.store(fn1, std::memory_order_relaxed);
+        S.fn2.store(fn2, std::memory_order_relaxed);
+        S.numa.store(numa, std::memory_order_relaxed);
+        S.n0.store(n0, std::memory_order_relaxed);
+        S.prio.store(tl_prio(), std::memory_order_relaxed);
+        S.total[0].store(J0, std::memory_order_relaxed);
+        S.total[1].store(J1, std::memory_order_relaxed);
+        S.done[0].v.store(0, std::memory_order_relaxed);
+        S.done[1].v.store(0, std::memory_order_relaxed);
+        S.ticket[0].v.store(g << 32, std::memory_order_release);
+        S.ticket[1].v.store(numa ? (g << 32) : ((g << 32) | kClosed), std::memory_order_release);
+        open_mask_.fetch_or(1u << s, std::memory_order_seq_cst);
+        if (sleeping_.load(std::memory_order_seq_cst) > 0) {
+            epoch_.fetch_add(1, std::memory_order_seq_cst);
+            std::lock_guard<std::mutex> lk(mu_);
+            cv_.notify_all();
+        }
+        const int my_nd = current_node();
+        drain_fast(s, S, g, my_nd, S.prio.load(std::memory_order_relaxed), /*caller=*/true);
+        const int tot = J0 + J1;
+        while (S.done[0].v.load(std::memory_order_acquire) + S.done[1].v.load(std::memory_order_acquire) < tot)
+            cpu_relax();
+        S.ticket[0].v.store((g << 32) | kClosed, std::memory_order_release);
+        S.ticket[1].v.store((g << 32) | kClosed, std::memory_order_release);
+        open_mask_.fetch_and(~(1u << s), std::memory_order_release);
+        S.busy.store(false, std::memory_order_release);
+    }
+    bool has_higher_open(uint32_t m, int my_prio) const {
+        while (m) {
+            const int o = __builtin_ctz(m);
+            m &= m - 1;
+            if (fslots_[o].prio.load(std::memory_order_relaxed) > my_prio) return true;
+        }
+        return false;
+    }
+    void drain_fast(int s, FastSlot& S, uint64_t g, int my_nd, int my_prio, bool caller) {
+        const bool is_numa = S.numa.load(std::memory_order_relaxed);
+        const int pref = is_numa ? (my_nd == S.n0.load(std::memory_order_relaxed) ? 0 : 1) : 0;
+        const int n_pass = is_numa ? 2 : 1;
+        const auto* f1 = S.fn1.load(std::memory_order_relaxed);
+        const auto* f2 = S.fn2.load(std::memory_order_relaxed);
+        int did = 0;
+        for (int pass = 0; pass < n_pass; ++pass) {
+            const int h = pass == 0 ? pref : (1 - pref);
+            const int lim = S.total[h].load(std::memory_order_relaxed);
+            for (;;) {
+                uint64_t t = S.ticket[h].v.load(std::memory_order_acquire);
+                if ((t >> 32) != g) goto done_out;
+                const int idx = (int) (t & 0xffffffffu);
+                if (idx >= lim) break;
+                if (!S.ticket[h].v.compare_exchange_weak(t, t + 1, std::memory_order_acq_rel)) continue;
+                if (is_numa) (*f2)(h, idx);
+                else (*f1)(idx);
+                ++did;
+                // Only yield back to pick_fast when another open slot has STRICTLY HIGHER priority
+                if (!caller) {
+                    const uint32_t om = open_mask_.load(std::memory_order_relaxed) & ~(1u << s);
+                    if (om != 0 && has_higher_open(om, my_prio)) goto done_out;
+                }
+            }
+        }
+    done_out:
+        if (did) S.done[pref].v.fetch_add(did, std::memory_order_release);
+    }
+    int pick_fast(uint32_t m, int my_nd, uint64_t& bg, int& bp_out) {
+        int best = -1, bp = -1000000;
+        while (m) {
+            const int s = __builtin_ctz(m);
+            m &= m - 1;
+            FastSlot& S = fslots_[s];
+            const int p = S.prio.load(std::memory_order_relaxed);
+            if (best >= 0 && p <= bp) continue;
+            const bool is_numa = S.numa.load(std::memory_order_relaxed);
+            const int pref = is_numa ? (my_nd == S.n0.load(std::memory_order_relaxed) ? 0 : 1) : 0;
+            // Check LOCAL socket ticket FIRST so workers avoid cross-socket QPI loads while local jobs remain
+            const uint64_t tl = S.ticket[pref].v.load(std::memory_order_acquire);
+            const uint32_t il = (uint32_t) tl;
+            if (il != kClosed && (int) il < S.total[pref].load(std::memory_order_relaxed)) {
+                best = s, bp = p, bg = tl >> 32;
+                continue;
+            }
+            if (!is_numa) continue;
+            const int rem = 1 - pref;
+            const uint64_t tr = S.ticket[rem].v.load(std::memory_order_acquire);
+            const uint32_t ir = (uint32_t) tr;
+            if (ir != kClosed && (int) ir < S.total[rem].load(std::memory_order_relaxed))
+                best = s, bp = p, bg = tr >> 32;
+        }
+        bp_out = bp;
+        return best;
+    }
+    void loop_fast(int id, int pinned_nd) {
+        bool have_t0 = false;
+        std::chrono::steady_clock::time_point t0{};
+        int spins = 0;
+        for (;;) {
+            if (id + 1 >= active_.load(std::memory_order_acquire)) {
+                std::unique_lock<std::mutex> lk(mu_);
+                idle_cv_.wait(lk, [&] { return quit_.load() || id + 1 < active_.load(std::memory_order_acquire); });
+                if (quit_.load()) return;
+                have_t0 = false;
+                spins = 0;
+                continue;
+            }
+            const uint32_t m = open_mask_.load(std::memory_order_acquire);
+            if (m != 0) {
+                const int nd = pinned_nd >= 0 ? pinned_nd : current_node();
+                uint64_t g = 0;
+                int bp = 0;
+                const int s = pick_fast(m, nd, g, bp);
+                if (s >= 0) {
+                    drain_fast(s, fslots_[s], g, nd, bp, /*caller=*/false);
+                    have_t0 = false;
+                    spins = 0;
+                    continue;
+                }
+            }
+            if (quit_.load(std::memory_order_relaxed)) return;
+            cpu_relax();
+            if ((++spins & 255) == 0) {
+                const auto now = std::chrono::steady_clock::now();
+                if (!have_t0) {
+                    t0 = now;
+                    have_t0 = true;
+                } else if (now - t0 > std::chrono::microseconds(spin_us_)) {
+                    const uint64_t e = epoch_.load(std::memory_order_seq_cst);
+                    std::unique_lock<std::mutex> lk(mu_);
+                    sleeping_.fetch_add(1, std::memory_order_seq_cst);
+                    cv_.wait(lk, [&] {
+                        return quit_.load() || open_mask_.load(std::memory_order_seq_cst) != 0 ||
+                               epoch_.load(std::memory_order_seq_cst) != e ||
+                               id + 1 >= active_.load(std::memory_order_acquire);
+                    });
+                    sleeping_.fetch_sub(1, std::memory_order_relaxed);
+                    have_t0 = false;
+                    spins = 0;
+                }
+            }
+        }
+    }
     int spin_us_;
     std::vector<std::thread> th_;
     std::mutex mu_, run_mu_;
@@ -404,8 +644,11 @@ private:
     std::atomic<uint64_t> ticket_{0}, gen_{0};
     std::atomic<bool> quit_{false};
     const bool concurrent_;
+    const bool fast_c_;
     Slot slots_[kSlots];
-    std::atomic<uint64_t> epoch_{0};
+    alignas(64) std::atomic<uint32_t> open_mask_{0};
+    alignas(64) std::atomic<uint64_t> epoch_{0};
+    FastSlot fslots_[kSlots];
 };
 
 // [off, off + len) of a shard into dst (O_DIRECT when the shard has a direct fd; see glm_fast_path.cu)
