@@ -561,8 +561,8 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     add_test(NAME dp4a_sm60_test COMMAND dp4a_sm60_test)
     set_tests_properties(dp4a_sm60_test PROPERTIES TIMEOUT 60)
   endif()
-  # Ordinary pinned allocation and explicit 2 MB registration through a real GPU copy (CUDA only).
-  if(STRATA_BUILD_TESTS AND STRATA_ENABLE_CUDA)
+  # Ordinary pinned allocation and explicit 2 MB registration through a real GPU copy (CUDA and HIP).
+  if(STRATA_BUILD_TESTS AND (STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP))
     add_executable(pinned_host_test tests/pinned_host_test.cu)
     target_include_directories(pinned_host_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
     find_package(Threads REQUIRED)

@@ -2047,7 +2047,13 @@ on two nodes: about 70/30); a pool reserved per node
 glm-dsa PC with a NUMA-bound prompt landing ring (`MAYA_GLM_STAGE_NUMA`),
 that ring keeps its node-bound mapping whatever the setting. GLM's link mode (the RAM tier shared with a helper
 program) keeps its shared memory, which an anonymous huge-page block cannot replace. AMD (HIP) builds need an
-explicit `1` (measured on one card model only). On Windows and macOS these settings have no effect.
+explicit `1` (measured on one card model only). On AMD, reserve the pool before the engine starts: building
+on-demand pages compacts memory inside `hugetlbfs_fallocate`, which moves the engine's own registered memory and
+the model file's pages, and each move makes the driver stop the GPU's queues (measured on a Radeon AI PRO R9700:
+117 KFD queue evictions while one 88 GB tier loaded from an on-demand pool). Reserving 45,700 pages with no GPU
+process running evicted nothing and split them evenly over two nodes. GLM sizes its tier from MemAvailable, which
+leaves reserved pages out, so with a reserved pool set `MAYA_GLM_RAM_GB` to the tier's size. On Windows and macOS
+these settings have no effect.
 
 | Setting | Default | |
 | --- | --- | --- |
