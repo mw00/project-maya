@@ -60,7 +60,7 @@ function saidDeleted(x) {
 // (m.shown: the server's own name for a model whose API id does not say it all - GLM-5.3 (744B); others: from the id)
 const shownOf = (m) => m.shown || modelName(m.model);
 const titleOf = (m) => `${shownOf(m)} ${m.quant}`;
-const DRAFTS = {mtp: "MTP", dflash2: "DFlash2", dspark: "DSpark", none: "off"};
+const DRAFTS = {mtp: "MTP", dflash2: "DFlash2", dspark: "DSpark", dfly2: "DFly2", none: "off"};
 const size = (b) => (b >= 1e8 ? `${fmt(b / 1e9, b < 1e10 ? 1 : 0)} GB` : null);
 const setUpOn = (w) => {
   const d = w ? new Date(String(w).replace(" ", "T")) : null;
@@ -556,16 +556,18 @@ function qwenFields(m, d, s, ch, gpus) {
 // (... and in the smaller rows the engine takes by itself where these do not fit: serve/models.py's kv_small_from)
 const HY4_KV_BYTES = 16640, HY4_KV_SMALL_BYTES = 9568;
 function hy4Fields(m, d, s, ch, images, gpus) {
-  const mtp = m.choices.draft.includes("mtp");
+  const mtp = m.choices.draft.includes("mtp"), dfly = m.choices.draft.includes("dfly2");
   const tpIds = [...new Set(["auto", 0].concat([s.tp, d.tp].filter((t) => t !== "auto" && t != null).map(Number)))];
   return [
     {label: "Model", rows: [
       contextRow(m, d, ch, {vram: m.kv_small_from && Number(d.context) >= m.kv_small_from ? HY4_KV_SMALL_BYTES : HY4_KV_BYTES}, [], null,
         m.context_more ? "A larger context needs more VRAM than this model's GPUs have." : null),
-      html`<${Row} label="Drafting" flag="--mtp" changed=${ch("draft")}
-        hint=${mtp ? "The model's own MTP block drafts a few tokens for the model to check: the same answers, about twice as fast on code. Off decodes token by token."
+      html`<${Row} label="Drafting" flag=${d.draft === "dfly2" ? "--dfly2" : "--mtp"} changed=${ch("draft")}
+        hint=${mtp || dfly ? (mtp ? "The model's own MTP block drafts a few tokens for the model to check: the same answers, about twice as fast on code. " : "") +
+            (dfly ? "DFly2, the model's small drafter (under 1 GB of VRAM, one GPU), drafts several tokens in one pass for the model to check: the same answers. " : "") +
+            "Off decodes token by token."
           : "This pack names no MTP block."}>
-        <${Seg} label="Drafting" value=${d.draft} options=${[...(mtp ? [{id: "mtp", label: "MTP"}] : []), {id: "none", label: "Off"}]}
+        <${Seg} label="Drafting" value=${d.draft} options=${[...(mtp ? [{id: "mtp", label: "MTP"}] : []), ...(dfly ? [{id: "dfly2", label: "DFly2"}] : []), {id: "none", label: "Off"}]}
           onChange=${(v) => setDraft({draft: v})}/><//>`,
       images,
       html`<${Row} label="Answers at once" hint="Coming soon: Hy4-Flash answers one request at a time for now."/>`]},

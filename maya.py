@@ -821,6 +821,9 @@ HY4_Q4_LONG_SHARE = 0.25                           # (the cache in 8-bit rows: a
 # (Maya's sizes draft with Tencent's MTP block from a file of its own - download.json's "mtp": the engine rounds its BF16
 #  matrices to Q8_0, HY4_MTP_VRAM of the file's bytes, always in VRAM, and keeps a prompt chunk of rows beside it)
 HY4_MTP_VRAM = 0.56
+# (... and where the block does not fit, with the size's DFly2 drafter - its "drafter": its matrices as they are in the
+#  file, beside them its lists and rows, under HY4_DFLY2_EXTRA bytes)
+HY4_DFLY2_EXTRA = 32 << 20
 HY4_VISION_GIB = 0.81                              # (the engine's room for its largest picture, 2048 x 2048: 828 MB of the main GPU)
 # (... and for the smallest picture budget it takes, a sixteenth of the largest: 512 x 512 - src/hy4/hy4_vision.cu's
 #  layout: the weights' two slots, the attention's scores, cuBLAS's workspace and the patches' rows)
@@ -5525,7 +5528,7 @@ def drafting_choice(a, drafter: str, minutes: str) -> str:
     measuring - "on" (draft with it) or "off".  --drafting, or --no-speed-calibration (= on), else asked; --yes
     measures."""
     if getattr(a, "drafting", None):
-        return a.drafting
+        return "on" if a.drafting in ("mtp", "dfly2") else a.drafting   # (Hy4-Flash's drafter by name: elsewhere on)
     if getattr(a, "no_speed_calibration", False):
         return "on"
     say()
@@ -8311,13 +8314,15 @@ def hy4_kv_rows(need_f16: float, need_q8: float, usable: float, kv: str | None =
 
 
 def hy4_config_need_gib(quant: str, layout: str, ctx: int, chunk: int | None = None,
-                        reserve_gb: float | None = None, q8: bool = False, mtp: bool = False) -> float | None:
+                        reserve_gb: float | None = None, q8: bool = False, mtp: bool = False,
+                        dfly2: bool = False) -> float | None:
     """The VRAM (GiB) a size already set up needs at a context, as hy4_fit counts it (the dashboard's Models page
     asks before it writes a context into a config - serve/models.py's hy4_room): its layout's plan
     (hy4_fit_need_gib), a prompt chunk above the plan's as hy4_fit doubles it (HY4_CHUNK_UP_GIB), and a --reserve-gb
     other than the plan's by the difference.  q8: with the latent cache in 8-bit rows (what the engine's --kv auto
     takes where F16 rows do not fit).  mtp: a Maya size that drafts (--mtp) - with its draft block's VRAM
-    (hy4_mtp_gib).  None for a size or a layout the manifest has no plan for."""
+    (hy4_mtp_gib); dfly2: one that drafts with its DFly2 drafter (--dfly2: hy4_dfly2_gib).  None for a size or a
+    layout the manifest has no plan for."""
     plan = (hy4_layouts(hy4_quant_table(quant)).get(layout or HY4_STANDARD) or {}).get("plan") or {}
     if not plan.get("need_gib"):
         return None
@@ -8328,6 +8333,8 @@ def hy4_config_need_gib(quant: str, layout: str, ctx: int, chunk: int | None = N
         need += float(reserve_gb) - float(plan["reserve_gb"])
     if mtp and quant != HY4_Q4:
         need += hy4_mtp_gib(int(chunk or plan.get("chunk") or 1024))
+    if dfly2:
+        need += hy4_dfly2_gib(quant)
     return need
 
 
@@ -8798,20 +8805,88 @@ def hy4_mtp_step(a, d: Path, quant: str, models: Path | None = None) -> Path | N
     return f
 
 
-def hy4_pack_step(a, d: Path, files: list, vis: Path | None = None, mtp: Path | None = None) -> Path:
+def hy4_dfly2_entry(quant: str) -> dict | None:
+    """A Maya size's DFly2 drafter - its size entry's "drafter" in download.json: Tencent's draft layers in a GGUF
+    named .dfly2 on the Hub, kept under that name (the pack finds it in the model's folder) - as a MODELS entry
+    (offer_download's form), from Maya's repo at the table's commit.  None: the size has none (Tencent's own Q4_K_M
+    drafts with its MTP block)."""
+    if quant == HY4_Q4:
+        return None
+    man = read_json(HY4_MANIFEST)
+    src = hy4_quant_table(quant).get("drafter") or {}
+    if not src or not man.get("repo"):
+        return None
+    path, (size, sha) = next(iter(src.items()))
+    name, folder = Path(path).name, Path(path).parent.as_posix()
+    return {"about": f"{HY4}'s DFly2 drafter for {Q.shown('hy4', quant)}; {man.get('license', 'Tencent Hy License')}",
+            "format": "hy4-gguf", "repo": man["repo"], "revision": man.get("revision") or "main",
+            "folder": "" if folder == "." else folder, "files": {name: size}, "sha256": {name: sha},
+            "download_gb": size / 1e9, "name": name, "published": bool(man.get("revision"))}
+
+
+def hy4_dfly2_gib(quant: str) -> float:
+    """The VRAM (GiB) a size's DFly2 drafter takes on the main GPU, as the engine counts it (src/hy4/hy4_plan.hpp's
+    dfly_bytes): its matrices as they are in the file, its small scratch and lists (HY4_DFLY2_EXTRA).  0 where the size
+    has none."""
+    e = hy4_dfly2_entry(quant)
+    return 0.0 if e is None else (e["files"][e["name"]] + HY4_DFLY2_EXTRA) / 2**30
+
+
+def hy4_pack_dfly2_file(pack: Path) -> str | None:
+    """The name of the DFly2 drafter's file a pack reads (hy4.txt has dfly_layers; tensors.txt's `file` line of the
+    file that is no trunk shard, MTP block or mmproj), or None."""
+    try:
+        if not any(ln.split()[:1] == ["dfly_layers"] for ln in (pack / "hy4.txt").read_text(encoding="utf-8").splitlines()):
+            return None
+        with (pack / "tensors.txt").open(encoding="utf-8") as f:
+            for ln in f:
+                if not ln.startswith("file "):
+                    break
+                n = Path(ln.split(None, 2)[2].strip()).name
+                if n.endswith(".dfly2") or "drafter" in n.lower():
+                    return n
+    except (OSError, IndexError):
+        pass
+    return None
+
+
+def hy4_dfly2_step(a, d: Path, quant: str, models: Path | None = None) -> Path | None:
+    """A Maya size's DFly2 drafter file in d, or None (no drafts: said in step 7).  A file the folder has is taken;
+    else it is hard-linked from another folder of this size here (its other layout's), else downloaded (asked like
+    the model).  Checked against its sha256 (once, then remembered)."""
+    e = hy4_dfly2_entry(quant)
+    if e is None:
+        return None
+    f = d / e["name"]
+    if file_incomplete(e, f) and models is not None:
+        link_published(f, e["files"][f.name], e["sha256"][f.name], hy4_places(models, f.name))
+    if file_incomplete(e, f) and e["published"]:
+        offer_download(a, f"{HY4}'s DFly2 drafter for this size ({e['download_gb']:.1f} GB)", d, [f], e)
+    if file_incomplete(e, f):
+        return None
+    if not sha256_checked(f, e["sha256"][f.name]):
+        fail(f"{f}: the sha256 does not match the published one - the file is damaged (its size is right)",
+             f"delete it and run {ME} --setup again")
+    return f
+
+
+def hy4_pack_step(a, d: Path, files: list, vis: Path | None = None, mtp: Path | None = None,
+                  dfly: Path | None = None) -> Path:
     """tools/hy4/pack_gguf.py's pack in <model>/maya-hy4: the geometry, where every tensor sits in the two GGUF files
-    (read in place) - the vision tower's mmproj file's too (vis), and the draft block's of a Maya size (mtp: Tencent's
-    MTP block in its own file) -, the n-gram table's small parts and the tokenizer with the GGUF's chat template -
-    built again when its tools or the model's files changed, or the vision tower or the draft block came or went."""
+    (read in place) - the vision tower's mmproj file's too (vis), and the drafter's of a Maya size (mtp: Tencent's
+    MTP block in its own file; dfly: the size's DFly2 drafter) -, the n-gram table's small parts and the tokenizer with
+    the GGUF's chat template - built again when its tools or the model's files changed, or the vision tower or a
+    drafter came or went."""
     step(6, "the pack (the engine's index of the model files)")
     pack = d / HY4_PACK
     tools = S.source_hash(HY4_PACK_TOOLS)
     need = ("hy4.txt", "tensors.txt", "engram.bin", "tokenizer/vocab.json", "tokenizer/chat_template.jinja")
-    every = list(files) + ([mtp] if mtp is not None else []) + ([vis] if vis is not None else [])
+    every = list(files) + [f for f in (mtp, dfly, vis) if f is not None]
     if not a.repack and read_json(pack / PACK_SOURCES).get("tools") == tools and \
             all((pack / f).exists() for f in need) and pack_stale(pack, every) is None and \
             hy4_pack_has_vision(pack) == (vis is not None) and \
-            hy4_pack_mtp_file(pack) == (mtp.name if mtp is not None else None):
+            hy4_pack_mtp_file(pack) == (mtp.name if mtp is not None else None) and \
+            hy4_pack_dfly2_file(pack) == (dfly.name if dfly is not None else None):
         ok(f"pack already built: {pack}")
         return pack
     if not os.access(d, os.W_OK):
@@ -8819,7 +8894,7 @@ def hy4_pack_step(a, d: Path, files: list, vis: Path | None = None, mtp: Path | 
     say("  Indexing every tensor of the GGUF files (the weights stay where they are) and the tokenizer ...")
     run([sys.executable, str(ROOT / "tools" / "hy4" / "pack_gguf.py"), "--model", str(d), "--out", str(pack),
          "--mmproj", vis.name if vis is not None else "none", "--mtp", mtp.name if mtp is not None else "none",
-         "--files"] + [f.name for f in files])
+         "--drafter", dfly.name if dfly is not None else "none", "--files"] + [f.name for f in files])
     missing = [f for f in need if not (pack / f).exists()]
     if missing:
         fail(f"the pack builder did not write {pack / missing[0]}", "the reason is in the messages above")
@@ -8832,11 +8907,11 @@ def hy4_pack_step(a, d: Path, files: list, vis: Path | None = None, mtp: Path | 
 
 
 def write_config_hy4(a, pc: dict, meta: dict, pack: Path, ctx: int, models: Path, d: Path, drafting: bool = False,
-                     quant: str = HY4_Q4, fit: dict | None = None, vision: bool = True) -> Path:
+                     quant: str = HY4_Q4, fit: dict | None = None, vision: bool = True, drafter: str = "mtp") -> Path:
     """A set's config and its start script: maya-hy4-flash-maya-xs.json for a Maya size (maya_quants.config_stem: one
     config a size, whichever layout), maya-hy4-flash.json for Tencent's own Q4_K_M (--mtp: drafting with its MTP
-    block).  The model's own sampling and thinking level are written at every setup; a setup again keeps what the
-    config before says that this one does not ask - where the server listens, its key, the env, and the engine's
+    block; a Maya size drafts with the block, or with its DFly2 drafter - drafter "dfly2": --dfly2).  The model's own
+    sampling and thinking level are written at every setup; a setup again keeps what the config before says that this one does not ask - where the server listens, its key, the env, and the engine's
     settings set by hand or on the Models page (tensor parallel, the CPU lane's threads, an expert profile, the
     drafts; in the standard layout the prompt chunk and the VRAM kept free too).  A layout's own flags (hy4_fit's
     "args") are worked out again every time.  maya-hy4 stops at a flag it does not know: only its own are written."""
@@ -8848,7 +8923,8 @@ def write_config_hy4(a, pc: dict, meta: dict, pack: Path, ctx: int, models: Path
     # (--tp auto, the engine's default: tensor parallel over the largest group of equal GPUs, the fastest GPU holding
     #  the head and the drafts; the layers split where no group fits.  No --gpus: the server shows the engine only the
     #  config's "gpu" cards, and it takes all it sees)
-    args = ["--pack", str(pack), "--max-context", str(ctx)] + list(fit["args"]) + (["--mtp"] if drafting else [])
+    args = ["--pack", str(pack), "--max-context", str(ctx)] + list(fit["args"]) + \
+        ([("--dfly2" if drafter == "dfly2" else "--mtp")] if drafting else [])
     if quant != HY4_Q4 and HY4_PROFILE.exists():
         args += ["--profile", str(HY4_PROFILE)]
     # pictures: on whenever the pack has the vision tower (the engine's default - no flag; a setup again turns them
@@ -8864,6 +8940,8 @@ def write_config_hy4(a, pc: dict, meta: dict, pack: Path, ctx: int, models: Path
             "drafting": "on" if drafting else "off"}
     if quant != HY4_Q4 and hy4_pack_mtp_file(pack):    # (a Maya size with the draft block: "off" is then a choice)
         inst["draft_block"] = True
+    if quant != HY4_Q4 and hy4_pack_dfly2_file(pack):  # (... with the DFly2 drafter: the same)
+        inst["dfly2"] = True
     sampling, effort = Q.model_defaults({"installer": inst})   # (the model's own, every setup: its card's)
     cfg = {"exe": str(HY4_EXE), "args": args, "cwd": str(ROOT), "tokenizer": str(pack / "tokenizer"),
            "model_name": HY4_MODEL_NAME, "gpu": [g["index"] for g in pc["gpus"]],
@@ -9014,22 +9092,38 @@ def set_up_hy4(a, prev: dict) -> Path | None:
         return None
     vis = hy4_vision_step(a, d, quant, models)
     # a Maya size's drafts: the block where it fits on the main GPU beside the model's own parts at this context (and
-    # a picture's room where pictures are on) - a small-card layout has no room for it, and it is not fetched there
-    mtp, mtp_why = None, ""
-    if quant != HY4_Q4 and hy4_mtp_entry() is not None:
-        room = float(fit.get("need") or 0) + hy4_mtp_gib(int(fit.get("chunk") or 1024)) + \
-            (HY4_VISION_GIB if fit.get("vision") and not fit.get("vision_small") and not a.no_vision else
-             HY4_VISION_MIN_GIB if fit.get("vision") and not a.no_vision else 0.0)
-        if fit["layout"] != HY4_STANDARD or room > float(fit.get("usable") or 0):
+    # a picture's room where pictures are on) - a small-card layout has no room for it, and it is not fetched there;
+    # where it does not fit (or --drafting dfly2), the size's DFly2 drafter where that fits - on one GPU (the engine
+    # runs it with the layers it reads and the head on one card)
+    how = getattr(a, "drafting", None) if quant != HY4_Q4 else None
+    mtp, mtp_why, dfly, dfly_why = None, "", None, ""
+    base = float(fit.get("need") or 0) + \
+        (HY4_VISION_GIB if fit.get("vision") and not fit.get("vision_small") and not a.no_vision else
+         HY4_VISION_MIN_GIB if fit.get("vision") and not a.no_vision else 0.0)
+    usable = float(fit.get("usable") or 0)
+    if quant != HY4_Q4 and hy4_mtp_entry() is not None and how != "dfly2":
+        room = base + hy4_mtp_gib(int(fit.get("chunk") or 1024))
+        if fit["layout"] != HY4_STANDARD or room > usable:
             mtp_why = (f"the draft block needs about {hy4_mtp_gib():.1f} GB of VRAM beside the model's own parts "
-                       f"({room:.1f} GB with it at this context, {float(fit.get('usable') or 0):.1f} GB free on "
-                       "this PC's cards)")
+                       f"({room:.1f} GB with it at this context, {usable:.1f} GB free on this PC's cards)")
         else:
             mtp = hy4_mtp_step(a, d, quant, models)
             if mtp is None:
                 mtp_why = ("the draft block's file is not in the model's folder" +
                            ("" if hy4_mtp_entry()["published"] else " (it is not published yet)"))
-    pack = hy4_pack_step(a, d, files, vis, mtp)        # 6
+    if mtp is None and how != "mtp" and hy4_dfly2_entry(quant) is not None:
+        room = base + hy4_dfly2_gib(quant)
+        if len(pc["gpus"]) > 1:
+            dfly_why = f"the DFly2 drafter runs on one GPU for now (this PC: {len(pc['gpus'])})"
+        elif room > usable:
+            dfly_why = (f"the DFly2 drafter needs about {hy4_dfly2_gib(quant):.1f} GB ({room:.1f} GB with it, "
+                        f"{usable:.1f} GB free)")
+        else:
+            dfly = hy4_dfly2_step(a, d, quant, models)
+            if dfly is None:
+                dfly_why = ("the DFly2 drafter's file is not in the model's folder" +
+                            ("" if hy4_dfly2_entry(quant)["published"] else " (it is not published yet)"))
+    pack = hy4_pack_step(a, d, files, vis, mtp, dfly)  # 6
     step(7, "images (the vision tower)")               # 7
     pictures = hy4_pack_has_vision(pack) and not a.no_vision and bool(fit.get("vision", True))
     if not hy4_pack_has_vision(pack):
@@ -9053,20 +9147,31 @@ def set_up_hy4(a, prev: dict) -> Path | None:
         ok("pictures: ON - the model's own vision tower runs in the engine, a picture at a time: its weights stay in "
            "the file (RAM as the page cache), a picture's room (under 1 GB) is kept free on the main GPU; the server "
            "resizes the pictures, the Chat's picture button is shown")
+    drafter = "dfly2" if dfly is not None else "mtp"
     if quant != HY4_Q4:
-        how = getattr(a, "drafting", None)
-        if mtp is None:
-            (warn if how in ("on", "measure") else ok)(f"drafting: off - {mtp_why or 'no draft block for these files'}")
+        if mtp is None and dfly is None:
+            (warn if how in ("on", "measure", "mtp", "dfly2") else ok)(
+                f"drafting: off - {mtp_why or ('no draft block for these files' if how != 'dfly2' else '--drafting dfly2')}"
+                + (f"; {dfly_why}" if dfly_why else ""))
         else:
+            what = "the MTP block" if dfly is None else "the DFly2 drafter"
             if how == "measure":
-                warn(f"no speed calibration for {HY4} yet: it drafts with the MTP block (--drafting off: without)")
-            chose_off = same and inst.get("draft_block") and inst.get("drafting") == "off"
+                warn(f"no speed calibration for {HY4} yet: it drafts with {what} (--drafting off: without)")
+            had = inst.get("draft_block") if dfly is None else inst.get("dfly2")
+            chose_off = same and had and inst.get("drafting") == "off"
             drafting = how != "off" if how else not chose_off
-            ok("drafting: Tencent's MTP block drafts tokens and the model checks every one - only tokens the model "
-               f"itself would pick are written; about {hy4_mtp_gib(int(fit.get('chunk') or 1024)):.1f} GB of the main "
-               "GPU's VRAM" if drafting else
-               "drafting: off (--drafting on, or Drafting on the Models page, drafts with the MTP block)")
-    return write_config_hy4(a, pc, meta, pack, fit["context"], models, d, drafting, quant, fit, pictures)   # 8
+            if dfly is None:
+                ok("drafting: Tencent's MTP block drafts tokens and the model checks every one - only tokens the "
+                   f"model itself would pick are written; about {hy4_mtp_gib(int(fit.get('chunk') or 1024)):.1f} GB "
+                   "of the main GPU's VRAM" if drafting else
+                   "drafting: off (--drafting on, or Drafting on the Models page, drafts with the MTP block)")
+            else:
+                ok("drafting: Tencent's DFly2 drafter drafts tokens and the model checks every one - only tokens the "
+                   f"model itself would pick are written; about {hy4_dfly2_gib(quant):.1f} GB of the GPU's VRAM" +
+                   (f" (the MTP block: {mtp_why})" if mtp_why else "") if drafting else
+                   "drafting: off (--drafting on, or Drafting on the Models page, drafts with the DFly2 drafter)")
+    return write_config_hy4(a, pc, meta, pack, fit["context"], models, d, drafting, quant, fit, pictures,
+                            drafter)   # 8
 
 
 # ------------------------------------------------------------------------------------------------ CYBER-FROST-3.8-PS
@@ -9691,10 +9796,12 @@ def main() -> int:
                          "without it (sustained speed, ~5-30 minutes, the model loaded twice) and keep the faster; "
                          "then start the model "
                          "(with --no-start: only measure)")
-    ap.add_argument("--drafting", choices=("measure", "on", "off"),
+    ap.add_argument("--drafting", choices=("measure", "on", "off", "mtp", "dfly2"),
                     help="the drafter (DFlash2 with --draft dflash2, DeepSeek's DSpark): measure = the speed "
                          "calibration keeps it only if it is faster on this PC (the default with --yes; asked "
-                         "otherwise), on = draft with it, off = without it - both skip the measuring")
+                         "otherwise), on = draft with it, off = without it - both skip the measuring.  Hy4-Flash's "
+                         "sizes: on = the MTP block where it fits in the VRAM, else the size's DFly2 drafter; mtp / "
+                         "dfly2 = that one alone (another model: the same as on)")
     ap.add_argument("--no-speed-calibration", action="store_true",
                     help="the same as --drafting on: draft with the drafter without measuring it")
     ap.add_argument("--config", type=Path, help="the installed JSON config to start (its run-maya-<model>.sh does), or "
