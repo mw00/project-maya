@@ -582,7 +582,7 @@ function hy4Fields(m, d, s, ch, images, gpus) {
       html`<${Row} label="KV cache" hint="Hy4-Flash's engine has one cache format: no choice of format and no KV streaming yet."/>`]},
     {label: "Speed", rows: [
       html`<${Row} label="Prompt chunk" flag="--chunk" changed=${ch("prefill_chunk")}
-        hint="The prompt tokens one pass reads at most: larger reads long prompts faster and takes more VRAM. Empty: the engine's own."
+        hint="The prompt tokens one pass reads at most: larger reads long prompts faster and takes more VRAM. Empty: the engine's own. On a small card, a new context size puts the setup's own chunk back unless you changed it here."
         warn=${whole(d.prefill_chunk) ? null : "A whole number, or empty."}>
         <${Num} label="Prompt chunk" value=${d.prefill_chunk} ph="auto" unit="tokens" on=${(v) => setDraft({prefill_chunk: v})}/><//>`,
       html`<${Row} label="CPU threads" flag="--cpu-threads" changed=${ch("cpu_threads")} hint="The CPU lane's threads, which compute the experts VRAM does not hold. Empty: the engine picks."

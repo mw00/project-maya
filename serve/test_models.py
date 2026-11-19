@@ -365,6 +365,103 @@ class Settings(unittest.TestCase):
         self.assertEqual((row["family"], row["quant"], row["contexts"]), ("hy4", "Maya-XS", [4096, 8192, 16384, 32768]))
         self.assertEqual(row["context_range"], {"min": 4096, "max": 32768, "trained": 1048576, "tested": 32768})
 
+    def test_hy4_a_new_context_gets_the_setups_chunk_again(self):
+        """A small-card layout's prompt chunk is the setup's choice for one context (maya.py's hy4_fit: a picture's
+        room first, the larger chunk only beside the largest picture's).  A context changed on the Models page gets
+        that choice again, so the larger chunk never takes a picture's room there - unless the chunk is its user's."""
+        def cfg_with(ctx, chunk, layout="8gb", extra=(), name="maya-hy4-flash-maya-xs.json"):
+            p = hy4_cfg(self.d, name)
+            c = json.loads(p.read_text())
+            pack = Path(M.flag(c["args"], "--pack"))
+            (pack / "hy4.txt").write_text((pack / "hy4.txt").read_text().split("vision.")[0] + "vision.dim 1152\n")
+            a = ["--pack", str(pack), "--max-context", str(ctx)] + (["--chunk", str(chunk)] if chunk else [])
+            a += ["--reserve-gb", "0.5", "--vram-experts", "0"] if layout == "8gb" else []
+            c.update(args=a + list(extra), gpu=[0])
+            c["installer"]["layout"] = layout
+            p.write_text(json.dumps(c, indent=1))
+            return M.read(p)
+
+        def cards(gb):
+            return mock.patch.object(M, "machine_gpus", return_value=[{"index": 0, "name": "x", "vram_gb": gb}])
+
+        def chunk(c):
+            return M.flag(c["args"], "--chunk")
+
+        def by_hand(c):
+            return c["installer"].get("chunk_by_hand")
+        wide = cfg_with(4096, 512)                     # (the setup's on a card with room for both at 4K)
+        self.assertTrue(M.settings_of(wide)["images"])
+        with cards(9.5):                               # 8.5 GB for the model: 6.5 + 0.81 + 0.95 at 4K
+            self.assertEqual(M.apply(wide, M.settings_of(wide)), wide)      # (a save that changes nothing)
+            self.assertEqual(chunk(M.apply(wide, {"cpu_threads": 8})), "512")
+            for ctx in (8192, 16384, 32768):           # (8K: 6.8 + 0.81 + 0.95 is more than there is)
+                new = M.apply(wide, {**M.settings_of(wide), "context": ctx})   # (the page sends all it shows)
+                self.assertEqual((M.flag(new["args"], "--max-context"), chunk(new), by_hand(new)), (str(ctx), "256", None))
+                fit = M.hy4_refit(new)                 # ... and the largest picture's room is there
+                self.assertEqual((fit["vision"], fit["vision_small"], fit["chunk"]), (True, False, 256), ctx)
+                self.assertNotIn("--kv", new["args"])
+            at32 = M.apply(wide, {"context": 32768})
+            self.assertEqual(M.hy4_refit(at32)["kv"], "q8")
+            # back at 4K: the larger chunk again, as the setup writes it there
+            self.assertEqual(chunk(M.apply(at32, {"context": 4096})), "512")
+            # pictures switched off: the room is the chunk's (the setup's --no-vision)
+            self.assertEqual(chunk(M.apply(at32, {"context": 8192, "images": False})), "512")
+            self.assertEqual(chunk(M.apply(at32, {"context": 8192})), "256")
+            # another VRAM kept free than the layout's: the sums are not for it - the layout's own chunk
+            self.assertEqual(chunk(M.apply(at32, {"context": 4096, "reserve_gb": 0.25})), "256")
+            # a chunk set by hand stays: one that is not the layout's ...
+            hand = cfg_with(4096, 384)
+            self.assertTrue(M.hy4_chunk_by_hand(hand))
+            self.assertEqual(chunk(M.apply(hand, {"context": 32768})), "384")
+            none = cfg_with(4096, None)
+            self.assertNotIn("--chunk", M.apply(none, {"context": 32768})["args"])
+            # ... and one the page's user changes: kept at every context from then on
+            at32 = M.apply(cfg_with(4096, 512), {"context": 32768})
+            mine = M.apply(at32, {**M.settings_of(at32), "prefill_chunk": 512})
+            self.assertEqual((chunk(mine), by_hand(mine)), ("512", True))
+            for ctx in (4096, 8192, 32768):
+                new = M.apply(mine, {**M.settings_of(mine), "context": ctx})
+                self.assertEqual((chunk(new), by_hand(new)), ("512", True), ctx)
+            with self.assertRaisesRegex(ValueError, r"at 65536 tokens; this card has 8\.5 GB for them"):
+                M.apply(mine, {"context": 65536})      # (what fits is counted with the chunk that stays)
+            both = M.apply(at32, {"context": 8192, "prefill_chunk": 512})   # (changed with the context: the user's)
+            self.assertEqual((chunk(both), by_hand(both)), ("512", True))
+            # put back to the layout's choice by its user: the layout's again
+            back = M.apply(mine, {"prefill_chunk": 256})
+            self.assertEqual((chunk(back), by_hand(back)), ("256", None))
+            self.assertEqual(chunk(M.apply(back, {"context": 4096})), "512")
+        tight = cfg_with(4096, 512)
+        with cards(8.4):                               # 7.4 GB: at 32K the room left is a smaller picture's
+            new = M.apply(tight, {"context": 32768})
+            fit = M.hy4_refit(new)
+            self.assertEqual((chunk(new), fit["kv"], fit["vision"], fit["vision_small"]), ("256", "q8", True, True))
+            # the page's Reset (what the setup wrote, its chunk with its context): not a chunk set by hand
+            new["installer"]["as_set_up"] = M.settings_of(tight)
+            reset = M.apply(new, new["installer"]["as_set_up"])
+            self.assertEqual((M.flag(reset["args"], "--max-context"), chunk(reset), by_hand(reset)), ("4096", "512", None))
+        with cards(8.0):                               # an 8 GB card taken to have 1 GB in use: 7.0 GB
+            # (the contexts offered count the chunk the page would write, not the 512 of the context it has)
+            self.assertEqual(M.listing(self.d, None)["models"][0]["contexts"], [4096, 8192, 16384])
+            for ctx in (8192, 16384):
+                self.assertEqual(chunk(M.apply(tight, {"context": ctx})), "256")
+            with self.assertRaisesRegex(ValueError, "largest that fits is 16384"):
+                M.apply(tight, {"context": 32768})
+            # a chunk of its user's: only the contexts that fit with it are offered, and taken
+            mine = dict(tight, installer={**tight["installer"], "chunk_by_hand": True})
+            self.assertEqual(M.hy4_contexts(mine), [4096])
+            with self.assertRaisesRegex(ValueError, r"need about 7\.8 GB of VRAM at 8192 tokens"):
+                M.apply(mine, {"context": 8192})
+            row = M.listing(self.d, None)["models"][0]
+            self.assertFalse([k for k in row if "8bit" in k or "q8" in k])
+        # a large card, the standard layout: the engine's own chunk - none written, one found kept
+        for extra in ((), ("--chunk", "2048")):
+            big = cfg_with(32768, None, "standard", extra)
+            with cards(24.0):
+                for ctx in (4096, 65536):
+                    new = M.apply(big, {**M.settings_of(big), "context": ctx})
+                    self.assertEqual(new["args"], M.set_flag(big["args"], "--max-context", ctx))
+                    self.assertEqual(new["installer"], big["installer"])
+
     def test_hy4_contexts_that_fit(self):
         """Hy4-Flash's context on the Models page: only what fits the config's cards by its layout's plan, as the
         setup works it out (maya.py's hy4_fit) - the engine has no RAM fallback for these parts and stops at its

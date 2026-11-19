@@ -618,6 +618,11 @@ def apply(cfg: dict, settings: dict) -> dict:
             args = drop_flag(args, "--vision")
         elif can["images"] or "--vision" in args:
             args = set_flag(args, "--vision", "off")
+        args, by_hand = hy4_chunk_again(cfg, {**out, "args": args})
+        if by_hand != bool((out.get("installer") or {}).get(HY4_CHUNK_BY_HAND)):
+            out["installer"] = {k: v for k, v in (out.get("installer") or {}).items() if k != HY4_CHUNK_BY_HAND}
+            if by_hand:
+                out["installer"][HY4_CHUNK_BY_HAND] = True
         hy4_context_check(cfg, {**out, "args": args})
     elif fam == "minimax":
         # (maya-mm3 --parallel: n conversations at once - each its own KV cache in VRAM, so no KV streaming and no DSpark
@@ -901,11 +906,14 @@ def hy4_room(cfg: dict) -> dict | None:
         import maya                                    # (the setup's own plan and sums; nothing runs on import)
 
         kv = flag(args, "--kv")
+        # (the prompt chunk: the config's own at the context it has; at another one the page writes the layout's
+        #  choice again - hy4_chunk_again - so only a chunk set by hand counts there)
+        cur, own = _int(flag(args, "--max-context"), 32768), hy4_chunk_by_hand(cfg)
 
         def one(ctx: int, q8: bool):
             return maya.hy4_config_need_gib(inst.get("hy4_quant") or "", inst.get("layout") or maya.HY4_STANDARD, ctx,
-                                            chunk=_int(flag(args, "--chunk")), reserve_gb=_float(flag(args, "--reserve-gb")),
-                                            q8=q8)
+                                            chunk=_int(flag(args, "--chunk")) if own or ctx == cur else None,
+                                            reserve_gb=_float(flag(args, "--reserve-gb")), q8=q8)
 
         def need(ctx: int):
             if kv in ("f16", "q8") or one(ctx, False) is None:
@@ -919,6 +927,99 @@ def hy4_room(cfg: dict) -> dict | None:
         return None
     return {"usable": usable, "need": need, "contexts": [c for c in HY4_CONTEXTS if rows[c]],
             "contexts_q8": [c for c in HY4_CONTEXTS if rows[c] == "q8"], "cards": len(gpus)}
+
+
+HY4_CHUNK_BY_HAND = "chunk_by_hand"                 # (installer's: the page's Prompt chunk was changed by its user)
+
+
+def _hy4_plan(cfg: dict):
+    """(maya.py, the plan of the config's size and layout in tools/hy4/download.json) - the plan {} where the table
+    has none."""
+    root = str(Path(__file__).resolve().parents[1])
+    if root not in sys.path:
+        sys.path.insert(0, root)
+    import maya                                        # (the setup's own plan and sums; nothing runs on import)
+    inst = cfg.get("installer") or {}
+    lay = maya.hy4_layouts(maya.hy4_quant_table(inst.get("hy4_quant") or "")).get(inst.get("layout") or maya.HY4_STANDARD)
+    return maya, (lay or {}).get("plan") or {}
+
+
+def hy4_chunk_by_hand(cfg: dict) -> bool:
+    """Whether Hy4-Flash's config has a prompt chunk of its user's, which a change of context leaves alone, as a setup
+    again leaves the flags set by hand: every --chunk of the standard layout (the engine's own choice there: the setup
+    writes none and keeps one it finds); in a small-card layout one the page's user changed (installer.chunk_by_hand),
+    or one that is not the layout's (its plan's chunk, or twice that: hy4_fit's two), or none at all."""
+    try:
+        maya, plan = _hy4_plan(cfg)
+    except Exception:  # noqa: BLE001 - no plan to read: the chunk stays as it is
+        return True
+    inst, chunk = cfg.get("installer") or {}, _int(flag(cfg.get("args") or [], "--chunk"))
+    base = int(plan.get("chunk") or 0)
+    if (inst.get("layout") or maya.HY4_STANDARD) == maya.HY4_STANDARD or not base:
+        return True
+    return bool(inst.get(HY4_CHUNK_BY_HAND)) or chunk not in (base, 2 * base)
+
+
+def hy4_refit(new: dict) -> dict | None:
+    """The setup's choice (maya.py's hy4_fit: pictures first, then the larger prompt chunk) for Hy4-Flash's config
+    `new` at its context, in its layout, on its cards as hy4_room takes them (HY4_FIT_USED_CAP_GIB in use on each);
+    pictures switched off (--vision off, or a pack without the tower) are not counted, as with the setup's
+    --no-vision.  None where it cannot be worked out, or where the context does not fit (hy4_context_check says so)."""
+    inst, args, gpus = new.get("installer") or {}, new.get("args") or [], gpus_of(new)
+    cards = {g["index"]: g for g in machine_gpus("cuda")}
+    if hy4_plain(new) or not gpus or any(not (cards.get(i) or {}).get("vram_gb") for i in gpus):
+        return None
+    try:
+        maya, plan = _hy4_plan(new)
+        if not plan.get("need_gib"):
+            return None
+        fit = maya.hy4_fit(maya.hy4_quant_table(inst.get("hy4_quant") or ""), [cards[i] for i in gpus],
+                           _int(flag(args, "--max-context"), 32768),
+                           used={i: maya.HY4_FIT_USED_CAP_GIB * 1024 for i in gpus},
+                           layout=inst.get("layout") or maya.HY4_STANDARD,
+                           pictures=flag(args, "--vision") != "off" and hy4_has_vision(new))
+    except Exception:  # noqa: BLE001
+        return None
+    return None if fit.get("error") else fit
+
+
+def hy4_chunk_again(cfg: dict, new: dict) -> tuple:
+    """apply's: (the arguments of Hy4-Flash's config `new` - cfg with the page's settings - with the prompt chunk the
+    setup would choose at its context, whether the chunk is its user's).  A small-card layout's chunk is the setup's
+    choice for one context (hy4_fit: a picture's room first, the larger chunk only beside the largest picture's), so
+    a config whose context the page changes gets that choice again for the new one: the larger chunk never takes a
+    picture's room there.  Left as they are: a chunk set by hand - one this save changes, or hy4_chunk_by_hand -
+    the standard layout, a save that keeps the context, and what cannot be worked out.  The larger chunk only with
+    the layout's own VRAM kept free and the engine's own choice of rows (the sums of hy4_fit are for those)."""
+    args = list(new.get("args") or [])
+    if hy4_plain(cfg):
+        return args, False
+    marked = bool((cfg.get("installer") or {}).get(HY4_CHUNK_BY_HAND))
+    try:
+        maya, plan = _hy4_plan(new)
+    except Exception:  # noqa: BLE001
+        return args, marked
+    base = int(plan.get("chunk") or 0)
+    if ((new.get("installer") or {}).get("layout") or maya.HY4_STANDARD) == maya.HY4_STANDARD or not base:
+        return args, False
+    was, chunk = _int(flag(cfg.get("args") or [], "--chunk")), _int(flag(args, "--chunk"))
+    ctx, cur = _int(flag(args, "--max-context"), 32768), settings_of(cfg)["context"]
+    fit = hy4_refit(new)
+    own = base
+    if fit and fit.get("chunk"):
+        plain = flag(args, "--kv") is None and _float(flag(args, "--reserve-gb")) == float(plan.get("reserve_gb", -1))
+        own = int(fit["chunk"]) if plain else base
+    if chunk != was:
+        # (changed in this save: its user's from now on - unless it is the very one the setup would write here, or
+        #  the one it did write: the page's Reset)
+        setup = (cfg.get("installer") or {}).get("as_set_up") or {}
+        back = chunk is not None and chunk == setup.get("prefill_chunk") and ctx == setup.get("context")
+        return args, not (back or (fit is not None and chunk == own))
+    if hy4_chunk_by_hand(cfg):
+        return args, marked
+    if ctx == cur or fit is None:
+        return args, False
+    return set_flag(args, "--chunk", own), False
 
 
 def hy4_contexts(cfg: dict) -> list:
