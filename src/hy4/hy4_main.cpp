@@ -17,13 +17,13 @@
 // and at the end otherwise.
 //
 // --mtp: the GGUF's MTP block drafts up to --draft tokens (3) a step, each verified by the model in one window with the
-// token before it; a draft below --draft-floor (0.4: the block's probability of its own pick) ends the drafts.  Greedy:
+// token before it; a draft below --draft-floor (0.55: the block's probability of its own pick) ends the drafts.  Greedy:
 // the drafts the model's argmax agrees with are kept; sampling: a draft d is kept with the model's probability of d,
 // else the token is drawn from the model's distribution without d - every token is still the model's own sample.  A
 // request's spec=0|1 turns the drafts off / on for it.
 // --dfly2: the pack's DFly2 drafter instead (a few dense layers over the trunk's own caches: about a quarter of the MTP
-// block's VRAM and nothing added to a prompt's read) - up to --draft tokens (the drafter's own count, 5) from one pass,
-// verified and kept by the same rules.  One drafter at a time; one GPU's layout for now.
+// block's VRAM and nothing added to a prompt's read) - up to --draft tokens (the drafter's own count, 5; its floor 0.8)
+// from one pass, verified and kept by the same rules.  One drafter at a time; one GPU's layout for now.
 //
 // --serve speaks what serve/server.py's StrataEngine expects (maya-mm3's protocol, one conversation): INFO lines, then
 // `READY <context> stop`; per request `GEN <max_new> [key=value ...] <id,id,...>` answered by `PP <read> <total> <ms>
@@ -1043,7 +1043,7 @@ int main(int argc, char** argv) {
     int bench_layer = -1, bench_n = 16, bench_t = 1;
     std::vector<int> eos;
     int n_draft = -1;   // (the loaded drafter's own: 3 with the MTP block, the DFly2 drafter's count)
-    float floor = 0.55f;
+    float floor = -1.0f;   // (the loaded drafter's own: 0.55 with the MTP block, 0.8 with the DFly2 drafter)
     std::string images, enc_rgb, enc_size, enc_out, kld_save;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -1134,6 +1134,9 @@ int main(int argc, char** argv) {
     if (eos.empty()) eos.push_back(m.eos());
     if (n_draft < 0) n_draft = m.draft_default();
     if (m.has_dfly2()) n_draft = std::min(n_draft, m.draft_max());
+    // (DFly2: 0.8 - its later drafts are kept less often than the block's and each costs a verified row; measured on a V100
+    //  from 0 to all routed experts in VRAM: as fast as 0.55 with most experts in VRAM, 4-30% faster with few)
+    if (floor < 0) floor = m.has_dfly2() ? 0.8f : 0.55f;
     if (serving) return serve(m, eos, n_draft, floor);
     if (!kld.empty()) return run_kld(m, kld, chunks, kld_save);
     std::vector<int> ids = parse_ids(ids_arg);

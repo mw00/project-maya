@@ -2545,7 +2545,7 @@ Engine options, in the config's `"args"`:
 | `--mtp` | off | the MTP block drafts tokens, the model checks them (the same tokens) |
 | `--dfly2` | off | the pack's DFly2 drafter drafts tokens instead (one pass a round, one GPU), the model checks them (the same tokens) |
 | `--draft` | 3 (`--dfly2`: 5) | drafts a step at most |
-| `--draft-floor` | 0.55 | the drafts end at one the drafter gives less than this probability |
+| `--draft-floor` | 0.55 (`--dfly2`: 0.8) | the drafts end at one the drafter gives less than this probability |
 | `--eos` | the GGUF's | the token ids that end an answer |
 | `--kv` | `auto` | the latent cache's rows: `f16`, `q8` (8 bits: 58% of the VRAM a position), or `auto` - F16 where the context fits in VRAM with it, the 8-bit rows where it fits only with them (any layout: one GPU, the layer split, tensor parallel) |
 | `--vision` | on when the pack has the tower | `off`: text only, and no room kept for pictures on the main GPU; `on`: an error when the pack has no tower |
