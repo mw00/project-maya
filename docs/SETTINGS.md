@@ -2524,7 +2524,7 @@ Engine options, in the config's `"args"`:
 | `--main-gpu` | the fastest (measured) | the GPU for the output head and the MTP block, an index into `--gpus` |
 | `--layer-split` | `auto` | the layer split: the layers a GPU holds, comma-separated (`auto`: by each GPU's free VRAM) |
 | `--reserve-gb` | 0.75 | VRAM each GPU keeps free beyond the plan |
-| `--chunk` | 1024 | prompt tokens a forward takes at most |
+| `--chunk` | `auto` | prompt tokens a forward takes at most. `auto` (no `--chunk`): the engine's plan takes the largest of 4096, 2048 and 1024 at every start whose plan comes to what 1024's does - the same layout (tensor parallel stays tensor parallel), the same rows of the cache, pictures as large; where a larger chunk would cost one of these, the next smaller is taken (`INFO prompt chunk: N tokens`). Larger chunks read long prompts faster: a chunk has a fixed cost, and the experts that are not in VRAM are sent to the GPU once a chunk. What it costs: about 1.2 GB of VRAM for every 1024 tokens of chunk on each GPU that runs layers (about 3.5 GB more at 4096 than at 1024; with `--mtp` on tensor parallel as much again on the head's GPU for the block's own pass, where that fits - else the pass runs in line, said). On a PC whose routed experts do not all fit in VRAM that room holds fewer of them, so more are computed on the CPU while the model answers. `--chunk N` sets one by hand (the setup and the Models page keep it); a chunk given by hand that tensor parallel cannot hold falls to the layer split, as before. The chunk changes the prompt's rounding (as `--prefill N` does for GLM): the same chunk gives the same answers, another chunk can give another greedy answer |
 | `--vram-experts` | 1 (as many as fit) | the share of each layer's routed experts kept in VRAM, 0 to 1; the rest run on the CPU lane |
 | `--cpu-threads` | one a physical core but the first | the CPU lane's threads besides the calling one |
 | `--profile` | - | an expert profile (uint32 routings, [layers][experts]): each layer's most routed experts are the ones in VRAM |
@@ -2555,7 +2555,7 @@ A request's `spec` (0 / 1) turns the drafts off or on for it.
 | `HY4_TP_LATENT_SUM` | off | tensor parallel: the FFN's partials summed in the latent space, projected up after the sum (a third more to send) |
 | `HY4_TP_EV`, `HY4_TP_EV_M` | off | debugging: a member's GPU time by part of each layer (events), member 0 or the one named |
 | `HY4_TP_F32` | off | tensor parallel: a prompt chunk's sums in F32 (twice the bytes; the earlier numbers) |
-| `HY4_MTP_SYNC` | off | the MTP block's pass over a prompt chunk in line, after the chunk, on the head's own scratch |
+| `HY4_MTP_SYNC` | off | the MTP block's pass over a prompt chunk in line, after the chunk, on the head's own scratch (tensor parallel takes this by itself, with an INFO line, where the pass's own scratch - a whole chunk's buffers on the head's GPU - is not in a member's plan) |
 | `HY4_NO_WARMUP` | off | no warm-up after the load (the first request then pays the first launches: ~1 s on a long prompt) |
 | `HY4_TP_NO_STAGGER`, `HY4_TP_ONE_BLOCK`, `HY4_TP_PULL_MAIN` | off | A/B: a chunk in one piece, its sums in one block, read back on the main stream (each slower) |
 | `HY4_TP_SKIP_SUM`, `HY4_TP_SKIP_COPY` | off | debugging only (the answers are no longer the model's): the host's sums, or the copies, left out - what each costs |

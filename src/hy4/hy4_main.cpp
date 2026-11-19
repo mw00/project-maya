@@ -1060,7 +1060,10 @@ int main(int argc, char** argv) {
             o.layer_split = v == "auto" ? std::vector<int>{} : parse_list(v);
         }
         else if (a == "--reserve-gb") o.reserve_gb = std::atof(next().c_str());
-        else if (a == "--chunk") o.prefill_chunk = std::atoi(next().c_str());
+        else if (a == "--chunk") {   // (auto, the default: the engine's plan picks it)
+            const std::string v = next();
+            o.prefill_chunk = v == "auto" ? 0 : std::atoi(v.c_str());
+        }
         else if (a == "--vram-experts") o.vram_experts = std::atof(next().c_str());
         else if (a == "--cpu-threads") o.cpu_threads = std::atoi(next().c_str());
         else if (a == "--profile") o.profile = next();

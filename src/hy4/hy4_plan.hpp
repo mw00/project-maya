@@ -50,4 +50,35 @@ KvPick kv_pick(Fits&& fits, bool q8, bool may_q8, bool vision, bool vision_auto,
     return {false, q8, false, 0};
 }
 
+/// What a start's plan comes to with one prompt chunk: whether it fits at all, the GPUs in tensor parallel (0: the
+/// layer split), the cache's rows, a picture's room and the largest picture it holds.
+struct ChunkTry {
+    bool ok = false;
+    int tp = 0;
+    bool q8 = false;
+    bool vision = false;
+    long long pixels = 0;
+};
+
+/// The prompt chunk of a start that names none (--chunk auto): the largest of `cands` (largest first) whose plan
+/// `plan_at(chunk)` comes to what the plan at `base` comes to in everything that goes before the prompts' speed - the
+/// same layout (tensor parallel over as many GPUs, or the layer split), the same rows of the cache, pictures as large.
+/// A larger chunk never costs a picture, a context or tensor parallel: where it would, the next smaller one is tried,
+/// and `base` stays where none does (or where the plan at `base` does not fit: that start's own error).
+template <class PlanAt, class Cands>
+int chunk_pick(PlanAt&& plan_at, const Cands& cands, int base) {
+    const ChunkTry ref = plan_at(base);
+    if (!ref.ok) return base;
+    for (int c : cands) {
+        if (c <= base) continue;
+        const ChunkTry t = plan_at(c);
+        if (t.ok && t.tp == ref.tp && t.q8 == ref.q8 && t.vision == ref.vision && t.pixels >= ref.pixels) return c;
+    }
+    return base;
+}
+
+/// The bytes of the MTP block's own rows for a prompt chunk of `chunk` tokens of `n_embd` values: its input (two
+/// states a token), its residual, the hidden states it reads and its output - five F32 rows a token.
+inline double mtp_rows_bytes(long long chunk, long long n_embd) { return (double) chunk * (double) n_embd * 5 * 4; }
+
 }  // namespace hy4

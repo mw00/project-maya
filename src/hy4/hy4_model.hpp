@@ -27,7 +27,8 @@ struct Options {
     int ring_slack = 16384;       // positions a sliding-window ring keeps beyond its window (how far a rewind may go
                                   // without starting over)
     double reserve_gb = 0.75;     // VRAM each GPU keeps free beyond the plan
-    int prefill_chunk = 1024;     // a prompt's tokens a forward takes at once (more than k::kMaxWin: the GEMMs)
+    int prefill_chunk = 0;        // a prompt's tokens a forward takes at once (more than k::kMaxWin: the GEMMs); 0: auto -
+                                  // 4096, 2048 or 1024, the largest the VRAM holds beside the model and the pictures
     double vram_experts = 1.0;    // the share of each layer's routed experts kept in VRAM at most (the plan takes less
                                   // when they do not fit; the rest run on the CPU lane)
     int cpu_threads = -1;         // the CPU lane's workers besides the caller (-1: one a physical core but the first)

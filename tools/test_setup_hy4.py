@@ -1231,7 +1231,7 @@ class Drafts(unittest.TestCase):
 
     def test_vram(self):
         # the engine's own count: the BF16 block rounded to Q8_0 (0.56 of its bytes) and a prompt chunk of rows
-        self.assertAlmostEqual(maya.hy4_mtp_gib(), (7486183072 * 0.56 + 1024 * 3072 * 16) / 2**30, places=6)
+        self.assertAlmostEqual(maya.hy4_mtp_gib(), (7486183072 * 0.56 + 1024 * 3072 * 20) / 2**30, places=6)
         self.assertTrue(3.9 < maya.hy4_mtp_gib() < 4.0)
         base = maya.hy4_config_need_gib("maya-xs", "standard", 32768)
         self.assertAlmostEqual(maya.hy4_config_need_gib("maya-xs", "standard", 32768, mtp=True),

@@ -8401,8 +8401,11 @@ def hy4_fit(q: dict, gpus: list, ctx_wanted: int | None = None, used: dict | Non
     HY4_TESTED_CONTEXT; "contexts": all that fit; "kv": the latent cache's rows the engine's --kv auto takes at the
     context - "f16" or "q8" (8-bit rows; never said on screen: the engine chooses at every start); "vision": a
     picture's room fits ("vision_small": a smaller picture's only); "chunk" and "args": the layout's own engine flags
-    (none for "standard": the engine's defaults - it fills the VRAM left with the most-routed experts itself; never
-    --kv: the engine's auto); "usable", "need" (GiB, with the rows of "kv")}.  Pictures go before the prompts' speed:
+    (none for "standard": the engine's defaults - it fills the VRAM left with the most-routed experts itself, and its
+    own plan takes the prompt chunk at every start: the largest of 4096 / 2048 / 1024 tokens that these cards hold
+    beside the model, its cache and the pictures' room - pictures first there too, src/hy4/hy4_plan.hpp's chunk_pick -
+    so no --chunk is written and none can be one the engine would refuse; never --kv: the engine's auto); "usable",
+    "need" (GiB, with the rows of "kv")}.  Pictures go before the prompts' speed:
     a small-card layout reads prompts in chunks twice its plan's (HY4_CHUNK_UP_GIB) only where that fits beside the
     largest picture's room - VRAM that holds one of the two goes to the picture, and where only a smaller picture
     fits, all the room there is goes to it.  pictures False (--no-vision: no picture is ever read): the chunk is
@@ -8684,11 +8687,12 @@ def hy4_mtp_entry() -> dict | None:
 
 def hy4_mtp_gib(chunk: int = 1024) -> float:
     """The VRAM (GiB) the draft block of Maya's sizes takes on the main GPU, as the engine counts it: its matrices
-    rounded to Q8_0 and a prompt chunk of its rows.  0 where the table has no block."""
+    rounded to Q8_0 and a prompt chunk of its rows (five F32 rows a token: src/hy4/hy4_plan.hpp's mtp_rows_bytes).
+    0 where the table has no block."""
     e = hy4_mtp_entry()
     if e is None:
         return 0.0
-    return (e["files"][e["name"]] * HY4_MTP_VRAM + int(chunk or 1024) * 3072 * 16) / 2**30
+    return (e["files"][e["name"]] * HY4_MTP_VRAM + int(chunk or 1024) * 3072 * 20) / 2**30
 
 
 def hy4_pack_mtp_file(pack: Path) -> str | None:
@@ -8855,7 +8859,9 @@ def hy4_fit_step(a, pc: dict, quant: str, prev_ctx: int | None = None, have=None
         fail(fit["error"] + (f" (the files in {a.model_dir} are the {forced} layout's)" if forced else ""), fit["hint"])
     if fit["layout"] == HY4_STANDARD:
         ok(f"{name} fits: about {fit['need']:.1f} GB of the {fit['usable']:.1f} GB of VRAM for what must sit there; "
-           "the engine fills the rest with the most-routed experts and computes the others on the CPU")
+           "the engine fills the rest with the most-routed experts and computes the others on the CPU; it reads "
+           "prompts in the largest chunk these cards hold beside the model and the pictures (up to 4096 tokens - its "
+           "start line says which)")
     else:
         ok(f"{name} in its {fit['layout']} layout ({hy4_layouts(q)[fit['layout']]['about']}): about "
            f"{fit['need']:.1f} GB of the {fit['usable']:.1f} GB of VRAM for what must sit there; the routed experts "
