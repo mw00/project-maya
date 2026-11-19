@@ -130,11 +130,14 @@ the directory once, allowing at most 8192 visited directory entries and 1024
 candidate records. In a stable, private cache directory, only regular files
 participate in recovery. Link and other unsupported entry types are not opened
 as metadata or payloads; an indeterminate type is an I/O failure, not proof of
-absence. Use a stable, private directory with a single writer. Temporary files
-are not exclusively created across all save paths; the native snapshot API
-accepts pathnames, so verification and loading do not share one open handle.
-Concurrent or untrusted writers are unsupported. These remain open Draft gates,
-not properties established by the file-type checks.
+absence. Use a stable, private directory with a single writer. Slot publication
+creates payload and metadata staging files exclusively. It publishes each without
+replacing an existing name using a hard link in the same directory; on a file
+system without hard-link support the save is declined. On restore, a learned
+payload is opened once: checksum verification reads the opened object and the
+native loader reads the same stream after rewind. The legacy native pathname
+API remains available for other callers. This does not make an open file's
+contents immutable or support concurrent or untrusted writers.
 Startup sorts candidates only after the whole scan succeeds and uses that
 same list for orphan checks. Exceeding either limit leaves the directory alone:
 no partial index is restored and new disk writes are disabled for the run.

@@ -21,7 +21,10 @@
       if (slot_log_text(controls)!=R"(\x00\x09\x0A\x0D\x1F\x7F\x80\xFF)")
         fail("generic diagnostic bytes must use uppercase hexadecimal escapes");
     } else if (which.rfind("branch-types-",0)==0) {
-      if (which=="branch-types-unknown") {
+      if (which.rfind("branch-types-meta-",0)==0) {
+        if (slot_disk_writable || slot_recovery_complete || !slots.empty() || !fixture_io_errors || count_files()!=2)
+          fail("metadata I/O failure deleted files or partially recovered catalogue");
+      } else if (which=="branch-types-unknown") {
         if (slot_disk_writable || slot_recovery_complete || !slots.empty() || !fixture_io_errors || count_files()!=4)
           fail("unknown nofollow stat did not stop writes and discard partial recovery");
       } else {
@@ -84,6 +87,7 @@
                                    which=="branch-cleanup-retire-meta" ? meta_of(slots[0].path) : slots[0].path;
           model.fail_live = which=="branch-cleanup-rollback";
           model.fail_metadata = which=="branch-cleanup-rollback-meta";
+          fixture_fail_metadata_write = model.fail_metadata;
           put(3);
         }
         if (!fixture_io_errors || branch_index_complete)
@@ -218,20 +222,63 @@
     } else if (which == "branch-write-fail") {
       const auto bad = root / "bad-directory"; std::ofstream(bad).put('x'); slot_dir = bad;
       seed(); if (!slots.empty()) fail("unwritable disk published state");
+    } else if (which=="branch-load-fail" || which=="branch-load-close-fail") {
+      seed();
+      if (slots.size()!=1 || !slot_write_file(0)) fail("load failure fixture seed failed");
+      model.fail_load=true;
+      fixture_fail_metadata_close=which=="branch-load-close-fail";
+      if (slot_take(c,0,true)!=0 || model.loads!=1) fail("native load failure fixture did not reject state");
+      if (fixture_fail_metadata_close) {
+        if (slot_disk_writable || slots.size()!=1 || count_files()!=2 || !fixture_io_errors)
+          fail("close error deleted the rejected state or left disk writes enabled");
+      } else if (!slots.empty() || count_files()) {
+        fail("native rejection did not close its handle before deleting the state");
+      }
+      slot_flush_on_exit.enabled=false;
     } else if (which == "branch-atomic") {
       seed(); if (slots.size() != 1 || !slots[0].data) fail("atomic fixture seed failed");
       const auto saved = slots[0].data;
       const auto bytes = *saved;
-      if (publish_files(slots[0], [&](const std::string& tmp) {
-            std::ofstream f(tmp, std::ios::binary); f.write("1234", 4); return false;
+      if (publish_files(slots[0], [&](std::ostream& f) {
+            f.write("1234", 4); return false;
           }) || slots[0].data != saved || *slots[0].data != bytes || !slots[0].path.empty() || count_files())
         fail("failed partial write destroyed old RAM state or left publish residue");
-      if (publish_files(slots[0], [&](const std::string& tmp) {
-            std::ofstream f(tmp, std::ios::binary); f.write(reinterpret_cast<const char*>(saved->data()), saved->size()); f.close();
-            std::filesystem::create_directory(meta_of(tmp.substr(0, tmp.size() - 4)) + ".tmp");
+      std::filesystem::path blocked_metadata;
+      if (publish_files(slots[0], [&](std::ostream& f) {
+            f.write(reinterpret_cast<const char*>(saved->data()), saved->size());
+            for (const auto& e : std::filesystem::directory_iterator(slot_dir)) {
+              const auto tmp = e.path().string();
+              if (tmp.ends_with(".bin.tmp")) {
+                blocked_metadata = meta_of(tmp.substr(0, tmp.size() - 4)) + ".tmp";
+                std::filesystem::create_directory(blocked_metadata);
+              }
+            }
             return true;
-          }) || slots[0].data != saved || !slots[0].path.empty() || count_files())
-        fail("metadata publish failure destroyed old state or left residue");
+          }) || slots[0].data != saved || !slots[0].path.empty() || count_files()!=1 ||
+          !std::filesystem::is_directory(blocked_metadata))
+        fail("metadata create failure destroyed old state or removed an unowned object");
+      std::filesystem::remove(blocked_metadata);
+      for (const bool metadata_collision : {false, true}) {
+        std::filesystem::path existing;
+        if (publish_files(slots[0], [&](std::ostream& f) {
+              f.write(reinterpret_cast<const char*>(saved->data()), saved->size());
+              for (const auto& e : std::filesystem::directory_iterator(slot_dir)) {
+                const auto tmp = e.path().string();
+                if (tmp.ends_with(".bin.tmp")) {
+                  const auto final = tmp.substr(0, tmp.size()-4);
+                  existing = metadata_collision ? meta_of(final) : final;
+                  std::ofstream(existing, std::ios::binary).write("original", 8);
+                }
+              }
+              return true;
+            }) || slots[0].data!=saved || !slots[0].path.empty() || count_files()!=1)
+          fail("final-name conflict published or removed an unowned file");
+        std::ifstream input(existing, std::ios::binary);
+        const std::string original((std::istreambuf_iterator<char>(input)), {});
+        input.close();
+        if (original!="original") fail("final-name conflict modified the original object");
+        std::filesystem::remove(existing);
+      }
     } else if (which == "branch-budget64") {
       if (slot_disk_budget != (uint64_t{64} << 30)) fail("candidate default disk budget is not 64GiB");
       Slot synthetic{{1}, "", 0, 1};
@@ -305,7 +352,8 @@
           if (find_family(1)->branch_id!=hot_id || find_family(2)->branch_id!=cold_id ||
               find_family(1)->data!=hot_data || find_family(2)->data!=cold_data)
             fail("failed replacement changed original state identity or buffers");
-          if (which=="branch-lru-meta-fail" && count_files()!=4) fail("metadata failure left partial replacement files");
+          if (which=="branch-lru-meta-fail" && count_files()!=5)
+            fail("metadata create failure did not retain the fixture-owned blocker alongside old files");
           if (slot_take(family(1),0,true)!=1883 || slot_take(family(2),0,true)!=1883 || slot_take(family(3),0,true)!=0)
             fail("failure recovery did not preserve old states and reject the new state");
         } else if (which=="branch-lru-oversized") {
@@ -333,7 +381,7 @@
           if (model.fail_live || model.fail_metadata || which=="branch-lru-staging-bound" || which=="branch-lru-staging-pressure") {
             require_old_pair();
             const int expected_saves = model.fail_live || model.fail_metadata ? 3 : 2;
-            if (model.live_saves!=expected_saves || count_files()!=4 ||
+            if (model.live_saves!=expected_saves || count_files()!=(model.fail_metadata ? 5u : 4u) ||
                 find_family(1)->branch_id!=hot_id || find_family(2)->branch_id!=cold_id)
               fail("full-quota failure changed old state or left staged files");
             if (slot_take(family(1),0,true)!=1883 || slot_take(family(2),0,true)!=1883 || slot_take(family(3),0,true)!=0)

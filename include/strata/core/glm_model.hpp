@@ -240,6 +240,11 @@ public:
     /// while others ran continues where it was.  The bytes written, or 0 + err.
     uint64_t slot_save(const std::string& path, std::string& err, bool bounded_buffer = false);
     bool slot_load(const std::string& path, int64_t n_pos, std::string& err, bool bounded_buffer = false);
+    /// Caller-owned seekable binary streams, starting at their current position (no reopen or rewind).
+    /// Output must not be in append mode. Leave stream exceptions disabled for status/error returns;
+    /// exceptions requested by the caller propagate. Save flushes and reports bytes; the owner checks close.
+    uint64_t slot_save(std::ostream& out, std::string& err, bool bounded_buffer = false);
+    bool slot_load(std::istream& in, int64_t n_pos, std::string& err, bool bounded_buffer = false);
     /// The same, in host RAM: the exact bytes the file version writes, in a caller-held buffer whose
     /// lifetime is the conversation's (engine-side: the run's).  Nothing reaches the disk.  The bytes
     /// written, or 0 + err (out of RAM, no snapshot).  slot_load takes the buffer back as the live

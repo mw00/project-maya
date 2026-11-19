@@ -23,7 +23,7 @@ CASES = ("branch-policy-completion", "branch-policy-slot", "branch-policy-disabl
          "branch-ready-serialize", "branch-ready-write", "branch-ready-publish", "branch-ready-seed", "branch-ready-reindex", "branch-ready-short", "branch-ready-short-disk", "branch-ready-short-reindex",
          "branch-learn", "branch-position", "branch-save-fail", "branch-direct-disk", "branch-flush", "branch-reindex",
          "branch-corrupt", "branch-supersede", "branch-low-memory", "branch-peak-disk", "branch-peak-reject", "branch-load-memory",
-         "branch-disk-floor", "branch-write-fail", "branch-atomic", "branch-budget64", "branch-budget-cap", "branch-zero-budget",
+         "branch-disk-floor", "branch-write-fail", "branch-load-fail", "branch-load-close-fail", "branch-atomic", "branch-budget64", "branch-budget-cap", "branch-zero-budget",
          "branch-count", "branch-ordinary-low", "branch-legacy-meta", "branch-legacy-reindex",
          "branch-lru-ram", "branch-lru-disk", "branch-lru-reindex", "branch-lru-bytes", "branch-lru-tokens",
          "branch-lru-bound", "branch-lru-oversized", "branch-lru-save-fail", "branch-lru-meta-fail",
@@ -32,6 +32,7 @@ CASES = ("branch-policy-completion", "branch-policy-slot", "branch-policy-disabl
          "branch-lru-staging-pressure", "branch-lru-staging-reindex",
          "branch-log-text",
          "branch-types-mixed", "branch-types-missing", "branch-types-sidecar", "branch-types-sidecar-legacy", "branch-types-unknown",
+         "branch-types-meta-open", "branch-types-meta-open-legacy", "branch-types-meta-close", "branch-types-meta-close-legacy",
          "branch-scan-visit", "branch-scan-candidate", "branch-scan-visit-legacy", "branch-scan-candidate-legacy",
          "branch-scan-visit-direct-legacy", "branch-scan-visit-cleanup-legacy",
          "branch-cleanup-start-tmp", "branch-cleanup-start-meta", "branch-cleanup-start-bin",
@@ -57,6 +58,7 @@ INCLUDES = r'''
 #include "strata/core/glm_prefix_admission.hpp"
 #include "strata/core/glm_prefix_metadata.hpp"
 #include "strata/core/glm_slot_directory_scan.hpp"
+#include "strata/core/regular_file_stream.hpp"
 #include "strata/core/glm_cache_memory.hpp"
 static uint64_t fixture_available = uint64_t{128} << 30;
 static uint64_t fixture_disk_available = uint64_t{256} << 30;
@@ -64,6 +66,22 @@ static std::filesystem::path fixture_slot_dir;
 static std::string fixture_remove_failure, fixture_status_failure;
 static int fixture_io_errors = 0;
 static bool fixture_orphan_iter_fail = false, fixture_orphan_exists_fail = false;
+static bool fixture_fail_metadata_write = false;
+static bool fixture_fail_metadata_open = false, fixture_fail_metadata_close = false;
+static auto fixture_open_read(const std::filesystem::path& path, uint64_t limit, std::error_code& ec) {
+  if (fixture_fail_metadata_open && path.extension()==".meta") {
+    ++fixture_io_errors; ec=std::make_error_code(std::errc::permission_denied);
+    return std::unique_ptr<strata::core::RegularFileStream>{};
+  }
+  return strata::core::RegularFileStream::open_read(path,limit,ec);
+}
+static bool fixture_close_read(strata::core::RegularFileStream& file, std::error_code& ec) {
+  const bool closed=file.close(ec);
+  if (fixture_fail_metadata_close) {
+    ++fixture_io_errors; ec=std::make_error_code(std::errc::io_error); return false;
+  }
+  return closed;
+}
 static std::size_t fixture_scan_visits = strata::core::SlotDirectoryScan::max_visits;
 static std::size_t fixture_scan_candidates = strata::core::SlotDirectoryScan::max_candidates;
 static std::filesystem::path fixture_scan_directory(const std::filesystem::path& path) {
@@ -97,7 +115,7 @@ struct FakeModel {
   uint64_t snap_state = 987654321;
   int live_saves = 0, vector_saves = 0, file_saves = 0, snapshot_saves = 0, loads = 0;
   bool fail_live = false, shards_agree = true;
-  bool fail_metadata = false, fail_file = false;
+  bool fail_metadata = false, fail_file = false, fail_load = false;
   uint64_t declared_state_bytes = 8;
   static constexpr size_t slot_live_copy_bytes = 4u << 20, slot_file_copy_bytes = 64u << 20;
   bool fast() const { return true; } bool has_mtp() const { return false; }
@@ -109,17 +127,22 @@ struct FakeModel {
   bool snapshot_save() { ++snapshot_saves; snap_pos = live_pos; snap_state = uint64_t(context); return true; }
   uint64_t slot_flash_bytes(int64_t n) const { return n > 0 ? declared_state_bytes : 0; }
   uint64_t slot_save(std::vector<uint8_t>& out, std::string&) { ++vector_saves; out.assign(8, 0x5a); return 8; }
-  uint64_t slot_save(const std::string& p, std::string&, bool = false) {
+  uint64_t slot_save(std::ostream& f, std::string&, bool = false) {
     ++file_saves; if (fail_file) return 0;
-    std::ofstream f(p, std::ios::binary); const std::string b(8,'Z'); f.write(b.data(),8); f.close();
-    if (fail_metadata && p.ends_with(".bin.tmp"))
-      std::filesystem::create_directory(p.substr(0,p.size()-8)+".meta.tmp");
+    const std::string b(8,'Z'); f.write(b.data(),8);
+    if (fail_metadata) {
+      for (const auto& e : std::filesystem::directory_iterator(fixture_slot_dir)) {
+        const auto p = e.path().string();
+        if (p.ends_with(".bin.tmp"))
+          std::filesystem::create_directory(p.substr(0,p.size()-8)+".meta.tmp");
+      }
+    }
     return f?8:0;
   }
   bool slot_save_live(int64_t n, const std::function<bool(const void*,size_t)>& put, std::string&) {
     ++live_saves; const uint32_t record[2] = {uint32_t(n), uint32_t(context)};
     if (live_pos != n || !shards_agree || !put(record, sizeof record)) return false;
-    if (fail_metadata) {
+    if (fail_metadata && !fixture_fail_metadata_write) {
       // Simulate a real filesystem failure at sidecar publication without
       // changing the extracted policy or the old state files.
       for (const auto& e : std::filesystem::directory_iterator(fixture_slot_dir)) {
@@ -131,16 +154,21 @@ struct FakeModel {
     return !fail_live;
   }
   bool slot_load(const std::vector<uint8_t>& data, int64_t n, std::string&) {
-    ++loads; if (data.size()!=8) return false;
+    ++loads; if (fail_load || data.size()!=8) return false;
     if (data != std::vector<uint8_t>(8,0x5a)) {
       uint32_t record[2]{}; std::memcpy(record,data.data(),8);
       if (record[0] != n) return false; loaded_origin = int(record[1]);
     }
     live_pos = n; snap_pos = n; return true;
   }
-  bool slot_load(const std::string& path, int64_t n, std::string& err, bool = false) {
-    std::ifstream f(path,std::ios::binary); std::vector<uint8_t> data((std::istreambuf_iterator<char>(f)),{});
+  bool slot_load(std::istream& f, int64_t n, std::string& err, bool = false) {
+    std::vector<uint8_t> data((std::istreambuf_iterator<char>(f)),{});
     return slot_load(data,n,err);
+  }
+  bool slot_load(const std::string& path, int64_t n, std::string& err, bool bounded = false) {
+    std::error_code ec;
+    auto file = strata::core::RegularFileStream::open_read(path, uint64_t{INT64_MAX}, ec);
+    return file && slot_load(file->input(), n, err, bounded);
   }
 };
 using Glm5Model = FakeModel;
@@ -201,6 +229,8 @@ SETUP = r'''
   if (which.rfind("branch-cleanup-", 0)==0) set_env("MAYA_GLM_SLOT_RAM_GB", "0");
   if (which.rfind("branch-types-",0)==0) {
     if (which.ends_with("-legacy")) set_env("MAYA_GLM_LEARNED_PREFIX", "");
+    fixture_fail_metadata_open = which.rfind("branch-types-meta-open",0)==0;
+    fixture_fail_metadata_close = which.rfind("branch-types-meta-close",0)==0;
     std::filesystem::path metadata;
     for (const auto& e : std::filesystem::directory_iterator(fixture_slot_dir))
       if (e.path().extension()==".meta") { metadata=e.path(); break; }
@@ -244,6 +274,9 @@ def fixture(source: str) -> str:
     block = source[a:b]
     # Replace external capacity probes and inject ordinary remove I/O errors;
     # every cache policy branch remains extracted from production.
+    block = block.replace("SlotFile::open_read(", "fixture_open_read(")
+    block = block.replace("file.close(ec)", "fixture_close_read(file, ec)")
+    block = block.replace("return branch::write_metadata(f,", "return !fixture_fail_metadata_write && branch::write_metadata(f,")
     block = block.replace("std::filesystem::remove(", "fixture_remove(")
     block = block.replace("fs::remove(", "fixture_remove(")
     block = block.replace("strata::core::SlotDirectoryScan scan(slot_dir, branch_enabled);",
@@ -318,7 +351,7 @@ def main() -> int:
     with args.receipt.open("x", encoding="utf-8") as f: f.write('{"status":"started"}\n')
     inputs = ["src/program/generate.cpp", "include/strata/core/glm_prefix_admission.hpp",
               "include/strata/core/glm_prefix_metadata.hpp", "include/strata/core/glm_cache_memory.hpp",
-              "include/strata/core/glm_slot_directory_scan.hpp",
+              "include/strata/core/glm_slot_directory_scan.hpp", "include/strata/core/regular_file_stream.hpp",
               "tests/core/glm_prefix_slot_cases.inc",
               "tools/test_glm_slot_spill.py", "tools/test_glm_prefix_slots.py",
               "tests/core/glm_completion_slot_cases.inc"]

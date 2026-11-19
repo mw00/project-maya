@@ -17,6 +17,7 @@
 #include "strata/core/glm_prefix_metadata.hpp"
 #include "strata/core/glm_cache_memory.hpp"
 #include "strata/core/glm_slot_directory_scan.hpp"
+#include "strata/core/regular_file_stream.hpp"
 
 namespace fs = std::filesystem;
 namespace pm = strata::core::glm_cache_memory;
@@ -32,6 +33,92 @@ static void put(const fs::path& path, const std::string& value) {
     fs::create_directories(path.parent_path());
     std::ofstream f(path); f << value;
     if (!f) throw std::runtime_error("fixture write failed");
+}
+static void regular_stream_checks(const fs::path& root) {
+    using File = strata::core::RegularFileStream;
+    fs::create_directories(root);
+    const auto path = root / "regular-roundtrip.bin";
+    std::error_code ec;
+    auto writer = File::create_exclusive(path, 8, ec);
+    expect(writer && !ec, "REGULAR_STREAM exclusive create owns a new normal file");
+    if (!writer) return;
+    writer->output().write("abcdefgh", 8);
+    expect(writer->output().good() && writer->output().tellp() == 8,
+           "REGULAR_STREAM writing exactly the limit preserves the full payload");
+    writer->output().seekp(9);
+    expect(!writer->output() && !writer->last_error(),
+           "REGULAR_STREAM out-of-range output seek is recoverable without native I/O failure");
+    writer->output().clear();
+    writer->output().seekp(2);
+    writer->output().write("XY", 2);
+    expect(writer->output().good() && writer->size() == 8 && writer->flush(ec) && !ec,
+           "REGULAR_STREAM bounded output seek overwrites without truncation and flush succeeds");
+    expect(writer->close(ec) && !ec && writer->size() == 8 && fs::file_size(path) == 8,
+           "REGULAR_STREAM explicit close succeeds and retains measured size");
+    auto existing = File::create_exclusive(path, 8, ec);
+    expect(!existing && bool(ec) && fs::file_size(path) == 8,
+           "REGULAR_STREAM failed exclusive create cannot truncate or remove an existing object");
+    auto reader = File::open_read(path, 8, ec);
+    expect(reader && !ec && reader->size() == 8, "REGULAR_STREAM normal file opens for bounded input");
+    if (!reader) return;
+    auto& input = reader->input();
+    expect(input.peek() == 'a' && input.tellg() == 0 && input.get() == 'a',
+           "REGULAR_STREAM peek and tell do not consume input bytes");
+    input.unget();
+    char bytes[8]{};
+    input.read(bytes, 8);
+    expect(input.good() && std::string(bytes, 8) == "abXYefgh" && input.get() == std::char_traits<char>::eof(),
+           "REGULAR_STREAM complete normal payload roundtrips and reaches EOF");
+    input.clear();
+    input.seekg(0);
+    input.read(bytes, 8);
+    expect(input.good() && std::string(bytes, 8) == "abXYefgh",
+           "REGULAR_STREAM same owned handle rewinds after reading to EOF");
+    input.seekg(9);
+    expect(!input && !reader->last_error(), "REGULAR_STREAM out-of-range input seek only sets stream fail state");
+    input.clear();
+    input.seekg(2);
+    expect(input.get() == 'X', "REGULAR_STREAM clear plus valid seek recovers the same owned input handle");
+    input.seekg(-2, std::ios::end);
+    expect(input.get() == 'g' && input.get() == 'h' && reader->close(ec) && !ec,
+           "REGULAR_STREAM input end-relative seek and explicit close succeed");
+    auto too_small = File::open_read(path, 7, ec);
+    expect(!too_small && bool(ec) && fs::file_size(path) == 8,
+           "REGULAR_STREAM input size limit rejects an ordinary larger file without modifying it");
+    const auto bounded_path = root / "regular-bound.bin";
+    auto bounded = File::create_exclusive(bounded_path, 8, ec);
+    expect(bounded && !ec, "REGULAR_STREAM small bounded writer is created");
+    if (bounded) {
+        bounded->output().write("12345678", 8);
+        bounded->output().put('9');
+        expect(!bounded->output() && bool(bounded->last_error()) && bounded->size() == 8,
+               "REGULAR_STREAM extra byte is rejected without changing the full payload");
+        expect(!bounded->close(ec) && bool(ec) && fs::file_size(bounded_path) == 8,
+               "REGULAR_STREAM explicit close reports prior output failure while closing ownership");
+        auto intact = File::open_read(bounded_path, 8, ec);
+        expect(bool(intact) && !ec, "REGULAR_STREAM bound failure leaves the ordinary payload readable");
+        if (intact) {
+            intact->input().read(bytes, 8);
+            expect(std::string(bytes, 8) == "12345678" && intact->close(ec) && !ec,
+                   "REGULAR_STREAM rejected extra output never truncates existing bytes");
+        }
+    }
+    const auto directory = root / "ordinary-directory";
+    fs::create_directory(directory);
+    expect(!File::open_read(directory, 8, ec) && bool(ec) && fs::is_directory(directory),
+           "REGULAR_STREAM ordinary directory is rejected before stream use");
+    expect(!File::create_exclusive(directory, 8, ec) && bool(ec) && fs::is_directory(directory),
+           "REGULAR_STREAM create collision leaves an ordinary directory untouched");
+    const auto automatic_path = root / "regular-owned-close.bin";
+    {
+        auto automatic = File::create_exclusive(automatic_path, uint64_t{1} << 40, ec);
+        expect(automatic && !ec, "REGULAR_STREAM large byte ceiling does not preallocate ceiling-sized memory");
+        if (automatic) automatic->output().write("end", 3);
+    }
+    auto automatic_read = File::open_read(automatic_path, 3, ec);
+    expect(automatic_read && !ec && automatic_read->size() == 3,
+           "REGULAR_STREAM RAII closes a tiny normal file when explicit close is omitted");
+    if (automatic_read) expect(automatic_read->close(ec) && !ec, "REGULAR_STREAM RAII roundtrip input closes cleanly");
 }
 static void scan_checks(const fs::path& root) {
     using Scan = strata::core::SlotDirectoryScan;
@@ -190,6 +277,7 @@ int main(int argc, char** argv) {
     if (argc != 2) return 64; // The runner owns this fresh temporary directory.
     const fs::path root(argv[1]);
     scan_checks(root);
+    regular_stream_checks(root / "regular-streams");
     {
         pa::Admission a;
         auto first = prompt(4000), second = first, third = first;

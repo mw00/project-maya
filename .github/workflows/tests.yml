@@ -11,6 +11,24 @@ permissions:
   contents: read
 
 jobs:
+  windows-host:
+    if: github.event_name == 'pull_request'
+    runs-on: windows-2022
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: GLM host file and cache contracts (MSVC)
+        shell: cmd
+        run: |
+          call "%ProgramFiles%\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat" || exit /b 1
+          python tools/test_glm_prefix_cache_host.py --receipt "%RUNNER_TEMP%\glm-prefix-helpers.json" || exit /b 1
+          python tools/test_glm_prefix_slots.py --receipt "%RUNNER_TEMP%\glm-prefix-slots.json"
+
   python:
     runs-on: ubuntu-latest
     timeout-minutes: 20

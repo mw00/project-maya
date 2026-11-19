@@ -17,6 +17,7 @@ import tempfile
 ROOT = Path(__file__).resolve().parents[1]
 INPUTS = ("include/strata/core/glm_prefix_admission.hpp", "include/strata/core/glm_cache_memory.hpp",
           "include/strata/core/glm_prefix_metadata.hpp", "include/strata/core/glm_slot_directory_scan.hpp",
+          "include/strata/core/regular_file_stream.hpp",
           "tests/core/glm_prefix_cache_host_test.cpp", "tools/test_glm_prefix_cache_host.py")
 
 

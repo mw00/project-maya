@@ -8708,6 +8708,29 @@ bool Glm5Model::slot_save_live(int64_t n, const std::function<bool(const void*, 
 }
 
 uint64_t Glm5Model::slot_save(const std::string& path, std::string& err, bool bounded_buffer) {
+    // Preserve the path API's pre-open validation: an invalid snapshot must not
+    // truncate an existing destination. The stream API validates independently.
+    for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
+        if (m->fast_ == nullptr || m->snap_pos_ < 0 || m->snap_pos_ != snap_pos_) {
+            err = "no snapshot to save";
+            return 0;
+        }
+    }
+    std::ofstream f(path, std::ios::binary | std::ios::trunc);
+    if (!f) {
+        err = "cannot write " + path;
+        return 0;
+    }
+    const uint64_t bytes = slot_save(f, err, bounded_buffer);
+    f.close();
+    if ((bytes && !f) || (!bytes && err == "writing the slot stream failed (disk full?)")) {
+        err = "writing " + path + " failed (disk full?)";
+        return 0;
+    }
+    return bytes;
+}
+
+uint64_t Glm5Model::slot_save(std::ostream& f, std::string& err, bool bounded_buffer) {
     std::vector<Glm5Model*> halves;
     for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
         if (m->fast_ == nullptr || m->snap_pos_ < 0 || m->snap_pos_ != snap_pos_) {
@@ -8716,9 +8739,9 @@ uint64_t Glm5Model::slot_save(const std::string& path, std::string& err, bool bo
         }
         halves.push_back(m);
     }
-    std::ofstream f(path, std::ios::binary | std::ios::trunc);
-    if (!f) {
-        err = "cannot write " + path;
+    const auto start = f.tellp();
+    if (start == std::streampos(-1) || !f.seekp(start)) {
+        err = "the slot output stream is not seekable";
         return 0;
     }
     const int64_t n = snap_pos_;
@@ -8783,19 +8806,31 @@ uint64_t Glm5Model::slot_save(const std::string& path, std::string& err, bool bo
         std::fprintf(stderr, "glm slots: save %lld positions - sync %.0f ms, copy %.0f ms, write %.0f ms\n",
                      (long long) n, t_sync, t_copy, t_write);
     f.flush();
-    if (!f) {
-        err = "writing " + path + " failed (disk full?)";
+    const auto end = f.tellp();
+    if (!f || end == std::streampos(-1) || end < start) {
+        err = "writing the slot stream failed (disk full?)";
         return 0;
     }
-    return (uint64_t) f.tellp();
+    return (uint64_t) (end - start);
 }
 
 bool Glm5Model::slot_load(const std::string& path, int64_t n_pos, std::string& err, bool bounded_buffer) {
-    ckpt_join();   // (ckpt_save_snapshot reads snap_ / snap_pool_)
-    dflash_reset();   // another conversation's state: the drafter's cached positions are not its
     std::ifstream f(path, std::ios::binary);
     if (!f) {
+        ckpt_join();
+        dflash_reset();
         err = "cannot read " + path;
+        return false;
+    }
+    return slot_load(f, n_pos, err, bounded_buffer);
+}
+
+bool Glm5Model::slot_load(std::istream& f, int64_t n_pos, std::string& err, bool bounded_buffer) {
+    ckpt_join();   // (ckpt_save_snapshot reads snap_ / snap_pool_)
+    dflash_reset();   // another conversation's state: the drafter's cached positions are not its
+    const auto start = f.tellg();
+    if (start == std::streampos(-1) || !f.seekg(start)) {
+        err = "the slot input stream is not seekable";
         return false;
     }
     const auto get = [&](void* p, size_t bytes) { return (bool) f.read((char*) p, (std::streamsize) bytes); };
