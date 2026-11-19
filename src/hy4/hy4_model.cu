@@ -741,10 +741,20 @@ struct Model::Impl {
     static constexpr int kChunkBase = 1024;
     static constexpr int kChunks[2] = {4096, 2048};
     static constexpr int kStage = 128;   // (a prompt's streamed experts a pass)
-    static constexpr int kDenseMax = 8192;   // (the indexed layers' keys a dense sub-batch spans at most)
+    // The indexed layers' keys a dense (tensor-core) prompt sub-batch spans at most: beyond, the gathering kernel.
+    // Both read the indexer's same picks (the dense one masks every other key out), so the limit moves no pick - only
+    // which kernel sums a token's attention.  The dense path's time grows with the span, the gathering kernel's does
+    // not: on V100s (one, and three in tensor parallel) they cross at 23-24 thousand positions.  kDenseBase: what every
+    // start's plan holds (the limit before v1.1.68); kDense: the spans tried above it, largest first, taken where the
+    // GPUs have tensor cores and the plan keeps what it comes to at kDenseBase (hy4_plan.hpp's dense_pick) - the
+    // buffers cost ~75 MB a GPU per 8192 positions more.  HY4_DENSE_MAX=N: that span alone tried (8192: as before).
+    static constexpr int kDenseBase = 8192;
+    static constexpr int kDense[2] = {24576, 16384};
+    static constexpr int kDenseTop = 65536;   // (HY4_DENSE_MAX's most)
+    int dense_max = kDenseBase;
     // the prompt path's F16 rows of the cache a layer's dense sub-batches read (kbuf): a window's and a chunk's, or an
-    // indexed layer's up to kDenseMax (an 8-bit cache dequantized there; F16's read in place but where a ring wraps)
-    size_t deq_rows() const { return std::max((size_t) g.n_swa + Tc, (size_t) kDenseMax + kSub); }
+    // indexed layer's up to dense_max (an 8-bit cache dequantized there; F16's read in place but where a ring wraps)
+    size_t deq_rows() const { return dense_kbuf_rows((size_t) g.n_swa, (size_t) Tc, (size_t) dense_max, kSub); }
     static constexpr size_t kBand = 32u << 20;   // (values: a dense matrix decoded to F16 this much at a time)
     // (H, ff: the most heads and the widest dense / shared FFN a layer gives the GPU - a tensor-parallel member's share)
     size_t scratch_floats(size_t& f16, size_t& ints, size_t H = 64, size_t ff = 0) const {
@@ -768,8 +778,8 @@ struct Model::Impl {
     size_t scratch_bytes(size_t H = 64, size_t ff = 0) const {
         size_t f16 = 0, ints = 0;
         const size_t f = scratch_floats(f16, ints, H, ff);
-        const size_t att = std::max((size_t) kSub * H * ((size_t) g.n_swa + kSub + 8), (size_t) kSub * std::min<size_t>(H, 32) * kDenseMax);
-        return f * 4 + f16 * 2 + ints * 4 + att * 6 + (size_t) kSub * kDenseMax * 4 + deq_rows() * g.kv_row() * 2 +
+        const size_t att = dense_att_values(kSub, H, (size_t) g.n_swa, (size_t) dense_max);
+        return f * 4 + f16 * 2 + ints * 4 + att * 6 + (size_t) kSub * dense_max * 4 + deq_rows() * g.kv_row() * 2 +
                (96u << 20);
     }
 
@@ -1772,8 +1782,7 @@ struct Model::Impl {
         const size_t egc = (size_t) std::max(1, pk.eg.cols()) * std::max(1, pk.eg.head_dim);
         const size_t qk = std::max({H * (size_t) g.v_mla, ff, H * (size_t) g.kv_lora, (size_t) g.q_lora, egc, E});
         const size_t npool = (size_t) (o.max_ctx / g.ix_kpool + 1);
-        const size_t att = std::max((size_t) kSub * H * ((size_t) g.n_swa + kSub + 8),
-                                    (size_t) kSub * std::min<size_t>(H, 32) * kDenseMax);
+        const size_t att = dense_att_values(kSub, H, (size_t) g.n_swa, (size_t) dense_max);
         if (cublasCreate(&gp.blas) != CUBLAS_STATUS_SUCCESS || cublasSetStream(gp.blas, gp.s) != CUBLAS_STATUS_SUCCESS) {
             err = "GPU " + std::to_string(gp.dev) + ": cuBLAS did not start";
             return false;
@@ -1805,7 +1814,7 @@ struct Model::Impl {
                gp.alloc(gp.xh16, T * qk, err) && gp.alloc(gp.wband, kBand, err) && gp.alloc(gp.sh16, 16 * T * ffe, err) &&
                gp.alloc(gp.sy, 16 * T * lat, err) && gp.alloc(gp.cpo, T * lat, err) && gp.alloc(gp.bounds, 1025, err) && gp.alloc(gp.stok, 16 * T, err) &&
                gp.alloc(gp.srow, 16 * T, err) && gp.alloc(gp.sS, att, err) && gp.alloc(gp.sP, att, err) &&
-               gp.alloc(gp.dmask, (size_t) kSub * kDenseMax, err) &&
+               gp.alloc(gp.dmask, (size_t) kSub * dense_max, err) &&
                gp.alloc(gp.kbuf, deq_rows() * g.kv_row(), err) &&
                (gp.lo = gp.pos + T, gp.nk = gp.pos + 2 * T, true);
     }
@@ -1855,15 +1864,20 @@ struct Model::Impl {
         } else {
             o.vision = false;
         }
-        if (chunk_auto) {
+        {
+            // The plan, tried more than once: each try is the whole plan against the same readings of the VRAM, from
+            // the state before it.
             // --chunk auto (no --chunk): the largest of kChunks whose plan keeps what the plan at kChunkBase comes to -
-            // the layout, the cache's rows, the pictures (hy4_plan.hpp's chunk_pick).  Each try is the whole plan
-            // against the same readings of the VRAM, from the state before it
+            // the layout, the cache's rows, the pictures (hy4_plan.hpp's chunk_pick).
+            // Then the dense prompt path's span (dense_max, above): the largest of kDense whose plan keeps what the
+            // plan at kDenseBase comes to with that chunk (dense_pick) - so the span costs no chunk, no picture, no
+            // layout, no routed expert its place in VRAM (so a card that holds a part of the experts keeps kDenseBase,
+            // its decoding and its answers as they were), and never a start.
             const VisionGeo vgeo0 = vgeo;
             const double room0 = vis_room;
             const bool vision0 = o.vision;
             const size_t info0 = info.size();
-            auto again = [&](int c) {
+            auto again = [&](int c, int d) {
                 tp = 0;
                 mtp_own = false;
                 mem.clear();
@@ -1880,10 +1894,11 @@ struct Model::Impl {
                 o.vision = vision0;
                 if (vision0 && vis_tok >= 0) pk.eg.token_map[(size_t) vis_tok] = -1;
                 info.resize(info0);
+                dense_max = d;
                 set_chunk(c);
             };
-            const int c = chunk_pick([&](int ch) {
-                again(ch);
+            auto plan_at = [&](int ch, int d) {
+                again(ch, d);
                 std::string e;
                 ChunkTry t;
                 t.ok = plan(e);
@@ -1891,17 +1906,53 @@ struct Model::Impl {
                 t.q8 = kv_q8;
                 t.vision = o.vision;
                 t.pixels = o.vision ? vgeo.max_pixels : 0;
+                t.own = mtp_own;
+                for (const Layer& l : L) t.res += l.n_res;   // (the layer split's; tensor parallel holds them all)
                 return t;
-            }, kChunks, kChunkBase);
-            again(c);
-            if (!plan(err)) return false;
-            char cb[200];
-            std::snprintf(cb, sizeof cb, "INFO prompt chunk: %d tokens (auto: the largest of %d / %d / %d this VRAM holds "
-                          "beside the model, its cache and the pictures; --chunk N sets one)", c, kChunks[0], kChunks[1],
-                          kChunkBase);
-            info.push_back(cb);
-        } else if (!plan(err)) {
-            return false;
+            };
+            const int c = !chunk_auto ? o.prefill_chunk
+                                      : chunk_pick([&](int ch) { return plan_at(ch, kDenseBase); }, kChunks, kChunkBase);
+            again(c, kDenseBase);
+            if (!plan(err)) return false;   // (the start as it was before the span: its own error)
+            // the spans tried: kDense on GPUs with tensor cores (compute capability 7.0 and later: on the others the
+            // F16 products of a longer span were not measured against the gathering kernel), or HY4_DENSE_MAX's own
+            std::vector<int> spans;
+            const char* de = std::getenv("HY4_DENSE_MAX");
+            if (de) {
+                const int d = std::min(kDenseTop, std::atoi(de)) / 8 * 8;
+                if (d > kDenseBase) spans.push_back(d);
+            } else {
+                bool tensor_cores = !G.empty();
+                for (Gpu& gp : G) {
+                    cudaDeviceProp pi{};
+                    CK(cudaGetDeviceProperties(&pi, gp.dev));
+                    tensor_cores = tensor_cores && pi.major >= 7;
+                }
+                if (tensor_cores) spans.assign(std::begin(kDense), std::end(kDense));
+            }
+            if (!spans.empty()) {
+                // (HY4_DENSE_MAX names a span: taken where the plan holds it, at the price of experts too)
+                const int d = dense_pick([&](int dd) {
+                    ChunkTry t = plan_at(c, dd);
+                    if (de) t.res = 0;
+                    return t;
+                }, spans, kDenseBase);
+                again(c, d);
+                if (!plan(err)) return false;
+            }
+            char cb[320];
+            if (chunk_auto) {
+                std::snprintf(cb, sizeof cb, "INFO prompt chunk: %d tokens (auto: the largest of %d / %d / %d this VRAM "
+                              "holds beside the model, its cache and the pictures; --chunk N sets one)", c, kChunks[0],
+                              kChunks[1], kChunkBase);
+                info.push_back(cb);
+            }
+            if (dense_max != kDenseBase || de) {
+                std::snprintf(cb, sizeof cb, "INFO prompts: the indexed layers' attention on the tensor cores up to %d "
+                              "positions%s", dense_max,
+                              dense_max != kDenseBase ? "" : " (a longer span does not fit beside this start's plan)");
+                info.push_back(cb);
+            }
         }
         if (o.kv == 1) info.push_back("INFO the latent cache in 8-bit rows (--kv q8)");
         if (!o.profile.empty()) {
@@ -2431,7 +2482,7 @@ struct Model::Impl {
     // A prompt sub-batch's attention (tokens t0 .. t0 + ts - 1 of the chunk) on the tensor cores: S = Q K^T over every
     // key position the sub-batch may see, the softmax over each token's own (its window, or the indexer's picks:
     // `all` - every position up to it, as long as the picks are every pool), O = P V.  false: an indexed layer whose
-    // keys span more than kDenseMax positions (the caller's gathering kernel instead).
+    // keys span more than dense_max positions (the caller's gathering kernel instead).
     // (an 8-bit cache: the rows [base, hi) of a layer's call dequantized in gp.kbuf so far - each sub-batch adds the
     //  rows it needs beyond them, so a chunk's rows are dequantized once a layer)
     struct Deq {
@@ -2442,7 +2493,7 @@ struct Model::Impl {
         const int64_t P0 = p0 + t0, k1 = P0 + ts;
         const int64_t k0 = l.swa ? std::max<int64_t>(0, P0 - g.n_swa + 1) : 0;
         const int nkr = (int) (k1 - k0);
-        if (!l.swa && !all && nkr > kDenseMax) return false;
+        if (!l.swa && !all && nkr > dense_max) return false;
         const int window = l.swa ? g.n_swa : all ? (1 << 30) : 0;
         const uint16_t* K = l.kv + (size_t) (l.ring > 0 ? k0 % l.ring : k0) * KR;
         if (kv_q8) {
@@ -2465,9 +2516,9 @@ struct Model::Impl {
                          CUBLAS_GEMM_DEFAULT) != CUBLAS_STATUS_SUCCESS)
             return false;
         if (!l.swa && !all)
-            k::dsa_mask(gp.keys + (size_t) t0 * maxk, maxk, gp.knk + t0, ts, (int) k0, nkr, gp.dmask, kDenseMax,
+            k::dsa_mask(gp.keys + (size_t) t0 * maxk, maxk, gp.knk + t0, ts, (int) k0, nkr, gp.dmask, (size_t) dense_max,
                         gp.s);
-        k::attn_softmax(gp.sS, ldS, ts, H, nkr, (int) k0, gp.pos + t0, window, gp.dmask, kDenseMax, scale, l.sinks,
+        k::attn_softmax(gp.sS, ldS, ts, H, nkr, (int) k0, gp.pos + t0, window, gp.dmask, (size_t) dense_max, scale, l.sinks,
                         gp.sP, ldS, gp.s);
         return cublasGemmEx(gp.blas, CUBLAS_OP_N, CUBLAS_OP_N, KL, ts * H, nkr, &one, K, CUDA_R_16F, KR, gp.sP,
                             CUDA_R_16F, ldS, &zero, gp.o + (size_t) t0 * H * KL, CUDA_R_32F, KL, CUBLAS_COMPUTE_32F,

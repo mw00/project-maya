@@ -4,6 +4,9 @@
 // largest picture (or with F16 rows where pictures are off) is never changed.
 #pragma once
 
+#include <algorithm>
+#include <cstddef>
+
 namespace hy4 {
 
 struct KvPick {
@@ -58,6 +61,8 @@ struct ChunkTry {
     bool q8 = false;
     bool vision = false;
     long long pixels = 0;
+    bool own = false;        // tensor parallel: the MTP block's pass on a scratch of its own (dense_pick's alone)
+    long long res = 0;       // the routed experts the plan keeps in VRAM, over the layers (dense_pick's alone)
 };
 
 /// The prompt chunk of a start that names none (--chunk auto): the largest of `cands` (largest first) whose plan
@@ -80,5 +85,45 @@ int chunk_pick(PlanAt&& plan_at, const Cands& cands, int base) {
 /// The bytes of the MTP block's own rows for a prompt chunk of `chunk` tokens of `n_embd` values: its input (two
 /// states a token), its residual, the hidden states it reads and its output - five F32 rows a token.
 inline double mtp_rows_bytes(long long chunk, long long n_embd) { return (double) chunk * (double) n_embd * 5 * 4; }
+
+/// The indexed layers' dense prompt path (S = Q K^T over every key a sub-batch of `sub` tokens may see, on the tensor
+/// cores, the indexer's picks kept by a mask): what its buffers come to for a span of `dense` key positions at most.
+/// The engine's plan counts them and its scratch allocates them from these same three, so a span the plan took is a
+/// span the GPUs hold.
+/// - the scores and the probabilities (an F32 and an F16 value each): the sub-batch's rows (a token's `H` heads, 32
+///   counted at most as before) times the keys - a window layer's (`n_swa` + the sub-batch) or the span's;
+inline size_t dense_att_values(size_t sub, size_t H, size_t n_swa, size_t dense) {
+    return std::max(sub * H * (n_swa + sub + 8), sub * std::min<size_t>(H, 32) * dense);
+}
+/// - the cache's F16 rows a layer's sub-batches read in order (an 8-bit cache's dequantized there): a window's and a
+///   chunk's, or the span's and a sub-batch's;
+inline size_t dense_kbuf_rows(size_t n_swa, size_t chunk, size_t dense, size_t sub) {
+    return std::max(n_swa + chunk, dense + sub);
+}
+/// - and the mask (an F32 a key a token).  All of it, in bytes, for a latent row of `kv_row` values:
+inline size_t dense_bytes(size_t sub, size_t H, size_t n_swa, size_t chunk, size_t dense, size_t kv_row) {
+    return dense_att_values(sub, H, n_swa, dense) * 6 + sub * dense * 4 + dense_kbuf_rows(n_swa, chunk, dense, sub) * kv_row * 2;
+}
+
+/// The span of the dense prompt path a start takes: the largest of `cands` (largest first) whose plan `plan_at(span)`
+/// comes to what the plan at `base` comes to - the same layout, the same rows of the cache, pictures as large, and
+/// in tensor parallel the MTP block's pass still on its own scratch, and as many routed experts in VRAM (a card that
+/// holds a part of the experts would give some up for the span's buffers: other experts on the CPU lane, so slower
+/// decoding and other rounding in every answer - there `base` stays).  A longer span only makes prompts between
+/// `base` and it faster, so it never costs any of those, and never a start: `base` stays where no candidate keeps
+/// them (or where the plan at `base` does not fit: that start's own error).
+template <class PlanAt, class Cands>
+int dense_pick(PlanAt&& plan_at, const Cands& cands, int base) {
+    const ChunkTry ref = plan_at(base);
+    if (!ref.ok) return base;
+    for (int d : cands) {
+        if (d <= base) continue;
+        const ChunkTry t = plan_at(d);
+        if (t.ok && t.tp == ref.tp && t.q8 == ref.q8 && t.vision == ref.vision && t.pixels >= ref.pixels &&
+            t.own == ref.own && t.res >= ref.res)
+            return d;
+    }
+    return base;
+}
 
 }  // namespace hy4
