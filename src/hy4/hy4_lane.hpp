@@ -58,9 +58,24 @@ struct CpuEntry {
     float w = 0.0f;
 };
 
+/// (tests, HY4_PROF) cpu_experts' time by part, summed while `on`: the grouping, the gate / up pass, the down pass, the
+/// tokens' sums
+struct LaneProf {
+    bool on = false;
+    double prep_s = 0, gate_up_s = 0, down_s = 0, sum_s = 0;
+    long long calls = 0, entries = 0;
+};
+LaneProf& lane_prof();
+
 /// The pages of these experts moved to node e % nodes (their work's node in cpu_experts), the ones there already passed
 /// over; returns early when stop is set.  For a background thread: the model's CPU-lane experts after the load.
 void place_experts(const CpuExperts& ex, const std::vector<int>& experts, int nodes, const std::atomic<bool>& stop);
+/// These experts' pages read into this process (a byte a page; returns early when stop is set), for a background
+/// thread after the load: a decode then finds them mapped - its first touch of an expert otherwise pays a page fault
+/// a page, or the disk.  ram_available: the RAM the system can still give, file cache included (0: not known).
+void warm_experts(const CpuExperts& ex, const std::vector<int>& experts, const std::atomic<bool>& stop);
+uint64_t ram_available();
+
 /// out [T][n_embd] = each token's weighted sum of its entries' experts (rows with no entry: 0), x [T][n_embd]; the
 /// experts' weights read once for up to 8 of their tokens.  Scratch is the lane's own (grown as needed).
 void cpu_experts(Lane& lane, const CpuExperts& ex, const std::vector<CpuEntry>& entries, const float* x, int T,

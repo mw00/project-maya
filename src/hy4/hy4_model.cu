@@ -379,6 +379,7 @@ struct Model::Impl {
     int* h_ids = nullptr;
     float *h_w = nullptr, *h_lat = nullptr, *h_cpu = nullptr;
     uint8_t* h_stage = nullptr;   // (pinned: a pass of streamed experts, kStage blobs)
+    const double ev_poll_s = std::getenv("HY4_EV_POLL_US") ? std::atof(std::getenv("HY4_EV_POLL_US")) * 1e-6 : 2e-3;
     double cpu_us_et = 15.0;      // the CPU lane's microseconds an expert-token on a prompt chunk (measured, EMA)
     // the expert profile: uint32 [n_layer][n_expert] routings - read (Options::profile: the most routed stay in VRAM),
     // counted where the routes reach the host (the CPU lane's layers, every layer with Options::profile_out) and
@@ -1842,6 +1843,32 @@ struct Model::Impl {
                         place_experts(l.cex, cpu, nodes, placer_stop);
                     }
                 });
+            } else {
+                // one node: the lane's experts read into this process in the background when the RAM holds them
+                // all (file cache included) - a decode's first touch of an expert then pays no page fault a page,
+                // nor the disk after a cold start.  Asked for (HY4_LANE_WARM=1): the thread takes a
+                // minute or two a 40 GB of experts on Windows and slows a decode beside it a little meanwhile
+                uint64_t lane_bytes = 0;
+                for (const Layer& l : L)
+                    if (l.partial())
+                        lane_bytes += (uint64_t) (g.n_expert - l.n_res) * (2 * l.cex.g_stride + l.cex.d_stride);
+                const char* we = std::getenv("HY4_LANE_WARM");
+                const uint64_t avail = ram_available();
+                if (we && std::atoi(we) != 0 && avail > 0 && (double) avail > 1.1 * (double) lane_bytes + 2e9) {
+                    info.push_back("INFO CPU lane: its experts are read into memory in the background");
+                    placer = std::thread([this] {
+#if defined(__linux__)
+                        (void) nice(10);
+#endif
+                        for (const Layer& l : L) {
+                            if (!l.partial()) continue;
+                            std::vector<int> cpu;
+                            for (int e = 0; e < (int) l.slot_of.size(); ++e)
+                                if (l.slot_of[(size_t) e] < 0) cpu.push_back(e);
+                            warm_experts(l.cex, cpu, placer_stop);
+                        }
+                    });
+                }
             }
         }
         st.experts_vram = n_res;
@@ -1900,13 +1927,19 @@ struct Model::Impl {
     // HY4_INJECT_FROM=<pos>: only the windows from that position are measured, the per-name sums printed at the end
     // of each forward (inject_report); one window prompts print every comparison as it is made.
     const char* inject = std::getenv("HY4_INJECT");
-    const bool prof = std::getenv("HY4_PROF") != nullptr;   // (tests: the layers' time by kind, synced at each step)
+    // (tests: the layers' time by kind, synced at each step; the names with a leading space are parts of "ffn, experts")
+    const bool prof = (lane_prof().on = std::getenv("HY4_PROF") != nullptr);
     std::map<std::string, double> prof_acc;
     void prof_report() {
         double all = 0;
-        for (const auto& [k2, v] : prof_acc) all += v;
         for (const auto& [k2, v] : prof_acc)
-            std::fprintf(stderr, "PROF %-30s %8.3f s  %5.1f%%\n", k2.c_str(), v, 100.0 * v / std::max(all, 1e-9));
+            if (k2[0] != ' ') all += v;
+        for (const auto& [k2, v] : prof_acc)
+            std::fprintf(stderr, "PROF %-36s %8.3f s  %5.1f%%\n", k2.c_str(), v, 100.0 * v / std::max(all, 1e-9));
+        const LaneProf& lp = lane_prof();
+        if (lp.calls > 0)
+            std::fprintf(stderr, "PROF lane calls %lld, entries %lld: grouping %.3f s, gate/up %.3f s, down %.3f s, sums %.3f s\n",
+                         lp.calls, lp.entries, lp.prep_s, lp.gate_up_s, lp.down_s, lp.sum_s);
     }
     int64_t cur_p0 = 0;
     std::map<std::string, std::vector<float>> ref_cache;
@@ -2471,7 +2504,20 @@ struct Model::Impl {
                 if (T <= W)
                     ok = ok && mm_multi(gp, {{&l.sh_gate, gp.gu, (size_t) sf}, {&l.sh_up, gp.gu + (size_t) T * sf,
                                                                                 (size_t) sf}}, gp.xf, E, T);
-                CK(cudaEventSynchronize(gp.ev));
+                const double tw = now_s();
+                // (a token's copies are there within a millisecond or two: polled that long - a thread that sleeps on
+                //  the event comes back late on some hosts, and the lane's threads wait for it - then, a prompt
+                //  chunk's long wait, asleep on the event.  HY4_EV_POLL_US: the polled time, 0 = asleep at once)
+                for (cudaError_t q;;) {
+                    if (ev_poll_s <= 0.0 || (q = cudaEventQuery(gp.ev)) == cudaErrorNotReady) {
+                        if (ev_poll_s > 0.0 && now_s() - tw < ev_poll_s) continue;
+                        CK(cudaEventSynchronize(gp.ev));
+                        break;
+                    }
+                    CK(q);
+                    break;
+                }
+                if (prof) prof_acc[T > W ? " lane: wait for the routes (prompt)" : " lane: wait for the routes (token)"] += now_s() - tw;
             }
             const int* slot = lane_on || l.tpm >= 0 ? l.slot_d : nullptr;
             bool streamed = false;
@@ -2516,6 +2562,7 @@ struct Model::Impl {
                 cpu_experts(*lane, l.cex, lane_entries, h_lat, T, h_cpu);
                 const double ms = (now_s() - tc) * 1e3;
                 st.cpu_ms += ms;
+                if (prof) prof_acc[T > W ? " lane: the CPU's experts (prompt)" : " lane: the CPU's experts (token)"] += ms * 1e-3;
                 if (T > W && !lane_entries.empty())   // (the prompt chunks' rate: what the route choice weighs)
                     cpu_us_et = 0.8 * cpu_us_et + 0.2 * (ms * 1e3 / (double) lane_entries.size());
                 st.cpu_experts += (int64_t) lane_entries.size();
