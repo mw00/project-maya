@@ -75,6 +75,9 @@ const char* mx_tier_name(int t);
 /// without VBMI - ds4_iq512_kern.inc, DS4_IQ512: ggml-cpu's numbers bit for bit, checked against its dot on first use;
 /// DS4_IQ_OWN=0 turns them off) rather than ggml's / the GLM lane's.
 bool iq_cpu_own_rows(int type);
+/// Whether the rows of `type` are the AVX-512 ones of ds4_iq512_kern.inc (IQ2_XS / IQ1_M / IQ3_XXS by DS4_IQ512, IQ1_S
+/// by DS4_IQ1S512=1), checked against ggml-cpu's dot (iq_cpu_own_rows's check) - false where that check failed.
+bool iq_cpu_x512_rows(int type);
 /// Load-time preparation of the same guarded one/multi CPU row selection/parity checks.
 void iq_cpu_prepare_rows(int type);
 /// IQ1_S's own multi-token rows (the same bits as ggml-cpu's dot): allowed by default; the engine turns them off where
