@@ -16,6 +16,8 @@
 #include <string>
 #include <vector>
 
+#include "hy4_vision.hpp"
+
 namespace hy4 {
 
 struct Options {
@@ -36,6 +38,11 @@ struct Options {
     std::string profile_out;      // where save_profile writes it (the read one's counts with this run's)
     bool mtp = false;             // load the MTP block (the GGUF's nextn layer, its BF16 rounded to Q8_0) for drafts
     std::vector<int> layer_split; // the first layer of each GPU after the first (empty: fill each GPU in turn)
+    int kv = -1;                  // the latent cache's rows: 0 F16, 1 8-bit (the latent int8 in blocks of 32 with F16
+                                  // scales, the rotated part F16; the indexer's rows F16: about 58% of the VRAM), -1
+                                  // auto - F16 unless tensor parallel needs 8-bit rows to hold the context
+    bool vision = true;           // the vision tower (the pack's mmproj file) on the main GPU, its room kept free there
+    bool vision_auto = true;      // (not asked for by name: a pack without one runs text only, no error)
     bool verbose = false;
 };
 
@@ -88,6 +95,18 @@ public:
     int eos() const;
     const Stats& stats() const;
     std::vector<std::string> info_lines() const;
+
+    /// Pictures (Options::vision): the tower's geometry (nullptr: none loaded); a picture's rows, F32 [tokens][n_embd]
+    /// (VisionGeo::tokens of them); and the request's pictures - each one's image tokens, the positions start ..
+    /// start + rows - 1, take its rows instead of their embedding (the MTP block's too) and have no Engram lookups.
+    /// Kept until set_images({}) at the request's end (the drafts' first step may read rows of the prompt).
+    struct Image {
+        int64_t start = 0;
+        std::vector<float> rows;
+    };
+    const VisionGeo* vision() const;
+    bool encode_image(const uint8_t* rgb, int width, int height, std::vector<float>& rows, std::string& err);
+    void set_images(std::vector<Image> images);
 
 private:
     struct Impl;

@@ -1,7 +1,8 @@
 """tools/hy4/pack_gguf.py on a synthetic Hy4-flash GGUF set (the GGUF's hy_v4_flash layout, two shards, tiny
 dimensions): the geometry, the tensors at their bytes, the Engram hash file, the tokenizer with its tag aliases - read
-back by the server's tokenizer and chat template - and the refusals (a shard missing, another pre-tokenizer, Engram
-buckets outside the table, a sliding-window layer with an indexer).
+back by the server's tokenizer and chat template -, the vision tower's mmproj file beside the set (found and indexed,
+left out with --mmproj none, another projector's ignored) and the refusals (a shard missing, another pre-tokenizer,
+Engram buckets outside the table, a sliding-window layer with an indexer, a vision tower for another model's width).
 
     python -m unittest tools.test_hy4_pack_gguf
 """
@@ -21,12 +22,14 @@ PACK = HERE / "hy4" / "pack_gguf.py"
 ARCH = "hy_v4_flash"
 
 # ggml type -> (values a block, bytes a block)
-BLOCK = {0: (1, 4), 8: (32, 34), 12: (256, 144), 43: (1, 1)}
+BLOCK = {0: (1, 4), 8: (32, 34), 12: (256, 144), 30: (1, 2), 43: (1, 1)}
 TAG = ":6124c78e"
 D, NL, ROWS, HD = 256, 3, 64, 32
 SPECIAL = ["<｜hy_start%s｜>" % TAG, "<｜hy_end%s｜>" % TAG, "<think%s>" % TAG, "</think%s>" % TAG,
            "<tool_calls%s>" % TAG, "</tool_calls%s>" % TAG, "<tool_call%s>" % TAG, "<arg_key%s>" % TAG,
+           "<｜hy_image▁start%s｜>" % TAG, "<｜hy_image▁end%s｜>" % TAG, "<｜hy_image▁pad%s｜>" % TAG,
            "<think:abc>"]   # (the last one a normal token: not aliased)
+DV, NLV = 64, 2   # (the vision tower's width and layers)
 TEMPLATE = ("{%- set HYTK = '" + TAG + "' -%}\n"
             "{%- set effort = reasoning_effort | default('high') -%}\n"
             "<｜hy_start{{ HYTK }}｜>reasoning_mode={{ effort }}\n"
@@ -135,8 +138,25 @@ def model(root: pathlib.Path, **over) -> pathlib.Path:
     return root
 
 
-def pack(root: pathlib.Path) -> subprocess.CompletedProcess:
-    return subprocess.run([sys.executable, str(PACK), "--model", str(root)], capture_output=True, text=True)
+def mmproj(path: pathlib.Path, projector: str = ARCH, out_dim: int = D) -> pathlib.Path:
+    """A 2-layer vision tower of DV in the mmproj layout (clip.*, v.* and mm.* tensors), a 4 x 4 position grid."""
+    c = lambda k: "clip.vision." + k  # noqa: E731
+    kv = {"general.architecture": (8, "clip"), "general.type": (8, "mmproj"), "clip.projector_type": (8, projector),
+          c("embedding_length"): (4, DV), c("feed_forward_length"): (4, 128), c("block_count"): (4, NLV),
+          c("attention.head_count"): (4, 4), c("patch_size"): (4, 16), c("projection_dim"): (4, out_dim),
+          c("spatial_merge_size"): (4, 2), c("attention.layer_norm_epsilon"): (6, 1e-5),
+          c("image_min_pixels"): (4, 4096), c("image_max_pixels"): (4, 1 << 20),
+          c("image_mean"): (9, (6, [0.5, 0.5, 0.5])), c("image_std"): (9, (6, [0.5, 0.5, 0.5]))}
+    t = [("v.patch_embd.weight", 0, [16, 16, 3, DV]), ("v.position_embd.weight", 0, [DV, 16]),
+         ("v.image_newline", 0, [out_dim]), ("mm.0.weight", 0, [2, 2, DV, 4 * DV]), ("mm.2.weight", 0, [1, 1, 4 * DV, out_dim])]
+    for i in range(NLV):
+        t += [("v.blk.%d.attn_q.weight" % i, 30, [DV, DV]), ("v.blk.%d.ffn_down.weight" % i, 30, [128, DV])]
+    gguf(path, kv, t)
+    return path
+
+
+def pack(root: pathlib.Path, *more: str) -> subprocess.CompletedProcess:
+    return subprocess.run([sys.executable, str(PACK), "--model", str(root), *more], capture_output=True, text=True)
 
 
 class PackTest(unittest.TestCase):
@@ -232,6 +252,65 @@ class PackTest(unittest.TestCase):
             self.assertIn("reasoning_mode=high", ct.render(msgs, **({"reasoning_effort": level} if level else {})))
         out = ct.render(msgs, tools=[{"name": "f", "parameters": {}}])   # (a bare function: wrapped)
         self.assertIn("[tools:f]", out)
+
+
+class VisionTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = model(pathlib.Path(self.tmp.name) / "m")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def geo(self) -> dict:
+        return dict(line.split(" ", 1) for line in (self.root / "maya-hy4" / "hy4.txt").read_text().splitlines())
+
+    def files(self) -> list:
+        return [ln.split()[2] for ln in (self.root / "maya-hy4" / "tensors.txt").read_text().splitlines()
+                if ln.startswith("file ")]
+
+    def test_found_beside_the_set(self):
+        """The folder's mmproj file of this projector: not a third shard, its tensors indexed as the last file, its
+        geometry and the vocabulary's image tokens in hy4.txt."""
+        mmproj(self.root / "mmproj-Hy4-flash-bf16.gguf")
+        r = pack(self.root)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("the vision tower (mmproj-Hy4-flash-bf16.gguf)", r.stdout)
+        self.assertEqual(self.files()[2:], ["mmproj-Hy4-flash-bf16.gguf"])
+        g = self.geo()
+        ids = {s: str(256 + i) for i, s in enumerate(SPECIAL)}
+        self.assertEqual((g["vision.dim"], g["vision.heads"], g["vision.ff"], g["vision.layers"], g["vision.grid"],
+                          g["vision.out_dim"], g["vision.patch"], g["vision.merge"], g["vision.max_pixels"]),
+                         (str(DV), "4", "128", str(NLV), "4", str(D), "16", "2", str(1 << 20)))
+        self.assertEqual((g["vision.image_token"], g["vision.image_start"], g["vision.image_end"]),
+                         (ids["<｜hy_image▁pad%s｜>" % TAG], ids["<｜hy_image▁start%s｜>" % TAG],
+                          ids["<｜hy_image▁end%s｜>" % TAG]))
+        self.assertEqual(g["vision.mean"], "0.5,0.5,0.5")
+        t = {ln.split()[1]: ln.split()[2:] for ln in (self.root / "maya-hy4" / "tensors.txt").read_text().splitlines()
+             if ln.startswith("t ")}
+        self.assertEqual(t["mm.0.weight"][:2], ["F32", "2"])
+        self.assertEqual(t["v.blk.1.attn_q.weight"][0], "BF16")
+
+    def test_text_only(self):
+        """--mmproj none, or a folder without one, or another model's projector beside it: the set alone."""
+        mmproj(self.root / "mmproj-other.gguf", projector="qwen2vl")
+        r = pack(self.root)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("text only", r.stdout)
+        self.assertNotIn("vision.dim", self.geo())
+        self.assertEqual(len(self.files()), 2)
+        mmproj(self.root / "mmproj-Hy4-flash-bf16.gguf")
+        self.assertEqual(pack(self.root, "--mmproj", "none").returncode, 0)
+        self.assertNotIn("vision.dim", self.geo())
+        r = pack(self.root, "--mmproj", "mmproj-other.gguf")   # (named: refused, not ignored)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("not hy_v4_flash", r.stderr)
+
+    def test_another_width(self):
+        mmproj(self.root / "mmproj-Hy4-flash-bf16.gguf", out_dim=2 * D)
+        r = pack(self.root)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("a vision geometry maya-hy4 does not run", r.stderr)
 
 
 class RefusalTest(unittest.TestCase):

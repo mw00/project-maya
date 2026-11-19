@@ -2335,11 +2335,13 @@ hyper-connection streams; and an n-gram (Engram) table read at 4 layers.
 **The setup.** `./maya.sh --setup --model hy4-flash` (Linux, NVIDIA RTX 30 / A100 and newer) builds `maya-hy4`,
 downloads AngelSlim's Q4_K_M (`tools/hy4/download.json`: pinned to a commit, each file's sha256 checked; `--model-dir`
 takes the files you have), builds the pack and writes `maya-hy4-flash.json`: `--pack`, `--max-context` (32K, 64K or
-128K - recommended by the smallest GPU's VRAM, since tensor parallel keeps the whole cache on every GPU of the group:
-about 16 KB a token) and `--mtp` (`--drafting off`: without). The engine's other settings keep their defaults; ones
+128K or 256K - recommended by the smallest GPU's VRAM, since tensor parallel keeps the whole cache on every GPU of the
+group: about 16 KB a token, 9.6 KB in 8 bits) and `--mtp` (`--drafting off`: without). The engine's other settings keep their defaults; ones
 added by hand (`--chunk`, `--reserve-gb`, `--tp` ...) are kept by a setup again. Its sampling is Tencent's
-(`generation_config.json`: temperature 0.9, top-p 1), its level High. The dashboard's Models page sets drafting,
-tensor parallel (Auto or Off), the VRAM kept free and the prompt chunk.
+(`generation_config.json`: temperature 0.9, top-p 1), its level High. The download includes the vision tower
+(AngelSlim's `mmproj-Hy4-flash-bf16.gguf`, 1 GB; `--no-vision`: not downloaded, or `--vision off` when it is already
+there). The dashboard's Models page sets drafting, images, tensor parallel (Auto or Off), the VRAM kept free and the
+prompt chunk.
 
 **The pack.** `python tools/hy4/pack_gguf.py --model <folder>` writes `<folder>/maya-hy4/`: the geometry
 (`hy4.txt`), the index of the set's tensors (`tensors.txt`: names, types, offsets - no weights are copied), the
@@ -2384,7 +2386,17 @@ With an expert profile (`--profile`) each layer keeps its most routed experts in
 
 **The context.** Only the 12 indexed layers (and the MTP block) keep every position: about 17 KB a token in VRAM
 (F16 latent rows and the indexer's pooled keys), so 128K takes ~2.2 GB and 1M ~17 GB - on every member with tensor
-parallel. The sliding-window layers keep a ring of their 512 positions and 16K more.
+parallel. The sliding-window layers keep a ring of their 512 positions and 16K more. `--kv q8` keeps them in 8 bits
+instead: the latent's 512 values as int8 in blocks of 32 with an F16 scale and the rotated 64 in F16 (672 bytes a row
+against 1152), the indexer's per-position rows and pooled keys in F16 (the reference's own cache type) - about 9.6 KB
+a token, the sliding-window rings too. `--kv auto`, the default, takes F16 unless tensor parallel does not hold the
+context with it, then the 8-bit rows (an INFO line says so): on eight 16 GB members 256K fits only so. The prompt path
+dequantizes the rows a layer's chunk reads into an F16 scratch once; the token path's attention reads the 8-bit rows
+directly. Their KL divergence against the reference, F16 rows / 8-bit rows: 0.143 / 0.140 (512-token chunks), 0.200 /
+0.193 (2048), 0.239 / 0.256 (4096) - the model moves about this much with any small change of its arithmetic (F32
+instead of F16 tensor-parallel sums: 0.10-0.13 against the F16 run itself; the 8-bit rows 0.11-0.15). The rotated
+part in 8 bits as well (624 bytes a row) measured 0.223 / 0.260 on the 2048 / 4096 files, so it stays F16. Decode and
+prompt speed are the same either way.
 
 **Drafting.** `--mtp` loads the GGUF's MTP block (its BF16 weights rounded to Q8_0 at load; its copy of the output
 head for the drafts' top token in Q4_K - only how often a draft holds depends on it) and drafts up to
@@ -2418,6 +2430,24 @@ chunk runs on its own scratch and stream of the main GPU, beside the next chunk.
 prompt chunk, a token window and a draft once (about 2 s), so the first request does not pay the GPUs' first
 launches.
 
+**Pictures.** The pack indexes the vision tower's file when it is in the model's folder (the folder's mmproj GGUF of
+this projector, or `--mmproj FILE`; `--mmproj none`: text only), and the engine runs it on the main GPU (`INFO
+vision=hy4`). The tower: a SigLIP-shaped encoder (16 x 16 patches, the learned 128 x 128 position grid resampled
+bilinearly to the picture's, 27 pre-LayerNorm layers of 1152, 16 heads, tanh-GELU MLPs of 4304), then an RMSNorm, each
+2 x 2 block of patches through a strided convolution (4608), an exact GELU and a 1 x 1 convolution to the model's 3072,
+and a learned newline row after each row of blocks: a picture of h x w pixels (sides multiples of 32, 4096 to 4,194,304
+pixels - the server resizes it, Lanczos, aspect kept) is (h / 32) x (w / 32 + 1) image tokens between its start and end
+of image tokens. The weights stay in host memory (the pack's mapping); a picture copies them in a layer at a time and
+takes up to 0.8 GB of the main GPU while it is read, which the plan keeps free (the expert share there is sized
+without it). Attention runs in blocks of query rows (128 MB of scores at a time), its products in TF32
+(`HY4_VISION_F32=1`: F32), the MLP 4096 rows at a time. Against the reference build's encoder (on the CPU) the rows
+differ by about 0.4% (relative), cosine 0.99999. An image token's position takes its picture's row instead of the
+token's embedding (the MTP block's too) and has no Engram lookup (a later token's n-gram pads it), as in the reference.
+The state is shared with the next request only where the same picture sits at the same place. On an RTX 3090:
+1024 x 768 (792 tokens) in about 0.25 s, 2048 x 2048 (4,160 tokens) in about 5.4 s - there attention over all 16,384
+patches is most of it. `maya-hy4 --pack <pack> --encode-image FILE.rgb --size WxH --dump-image OUT [--gpus I]` runs
+the tower alone (raw RGB in, F32 rows out).
+
 Engine options, in the config's `"args"`:
 
 | Option | Default | What it does |
@@ -2438,12 +2468,16 @@ Engine options, in the config's `"args"`:
 | `--draft` | 3 | with `--mtp`: drafts a step at most |
 | `--draft-floor` | 0.55 | with `--mtp`: the drafts end at one the block gives less than this probability |
 | `--eos` | the GGUF's | the token ids that end an answer |
+| `--kv` | `auto` | the latent cache's rows: `f16`, `q8` (8 bits: 58% of the VRAM a position), or `auto` - F16 unless tensor parallel needs the 8-bit rows to hold the context |
+| `--vision` | on when the pack has the tower | `off`: text only, and no room kept for pictures on the main GPU; `on`: an error when the pack has no tower |
+| `--images` | - | with `--ids`: a pictures file (the server's GENI file, `MMI1`) for the prompt's image spans |
 
 A request's `spec` (0 / 1) turns the drafts off or on for it.
 
 | Variable | Default | What it does |
 |---|---|---|
 | `HY4_LANE_NT` | 32 | the CPU lane: a prompt's tokens an expert's weights are read once for (1-64) |
+| `HY4_VISION_F32` | off | the vision tower's attention products in F32 instead of TF32 (a little slower where TF32 is faster) |
 | `HY4_TP_HELPER` | by speed | tensor parallel: `0` no expert share for the GPUs outside the group; `k`: k slices each (as their VRAM allows) |
 | `HY4_TP_MIXED` | off | tensor parallel over GPUs of different kinds (their copies of the state may drift apart) |
 | `HY4_TP_CHECK` | off | debugging: after each forward, every member's copy of the state compared |

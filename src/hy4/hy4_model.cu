@@ -393,6 +393,21 @@ struct Model::Impl {
     // the next draft's first step, which makes them together with its own: one MTP forward a round, not two)
     int64_t mtp_done = 0;
     std::vector<int> tokens;             // the sequence so far (Engram's n-gram history)
+    std::unique_ptr<Vision> vis;         // the vision tower (Options::vision)
+    VisionGeo vgeo;
+    double vis_room = 0;                 // its room for the largest picture, kept free on the main GPU
+    std::vector<Model::Image> imgs;      // the request's pictures (their positions' rows)
+    // the embeddings of positions p0 .. p0 + T - 1 that are a picture's image tokens: its rows (dst [T][E])
+    void image_rows(int64_t p0, int T, float* dst) const {
+        const int E = g.n_embd;
+        for (const Model::Image& im : imgs) {
+            const int64_t n = (int64_t) (im.rows.size() / (size_t) E);
+            const int64_t a = std::max(p0, im.start), b = std::min(p0 + T, im.start + n);
+            if (a < b)
+                std::memcpy(dst + (size_t) (a - p0) * E, im.rows.data() + (size_t) (a - im.start) * E,
+                            sizeof(float) * (size_t) (b - a) * E);
+        }
+    }
     Stats st;
     std::vector<std::string> info;
     // host staging
@@ -570,16 +585,23 @@ struct Model::Impl {
         f1 = (int) ((int64_t) nb * (m + 1) / N) * bv;
     }
 
+    // the latent cache: 8-bit rows (Options::kv: the latent int8 in blocks of 32 with F16 scales, the rotated part F16)
+    // or F16, its bytes a position
+    bool kv_q8 = false;
+    size_t kv_rb() const { return kv_q8 ? k::kv_q8_row_bytes(g.kv_lora, g.rope) : (size_t) g.kv_row() * 2; }
+    // (the indexer's pooled keys and its value | gate ring: F16 with 8-bit rows - the reference's own cache type -,
+    //  else F32)
+    size_t pool_b() const { return kv_q8 ? 2 : 4; }
     // a layer's VRAM without its routed experts (its dense matrices and caches), and an expert's (its blob)
     size_t dense_bytes(int il) const {
         size_t b = 0;
         const std::string pre = "blk." + std::to_string(il) + ".";
         for (const auto& [n, t] : pk.t)
             if (n.compare(0, pre.size(), pre) == 0 && n.find("_exps.") == std::string::npos) b += t.bytes + 256;
-        if (g.swa[(size_t) il]) b += (size_t) ring * g.kv_row() * 2;
+        if (g.swa[(size_t) il]) b += (size_t) ring * kv_rb();
         else
-            b += (size_t) o.max_ctx * g.kv_row() * 2 + (size_t) (o.max_ctx / g.ix_kpool + 1) * g.ix_dim * 4 +
-                 (size_t) ring * 2 * g.ix_dim * 4;
+            b += (size_t) o.max_ctx * kv_rb() + (size_t) (o.max_ctx / g.ix_kpool + 1) * g.ix_dim * pool_b() +
+                 (size_t) ring * 2 * g.ix_dim * pool_b();
         return b;
     }
     size_t expert_bytes(int il) const {
@@ -595,10 +617,10 @@ struct Model::Impl {
         for (const auto& [n, t] : pk.t)
             if (n.compare(0, pre.size(), pre) == 0) b += t.bytes + 256;
         // caches
-        if (g.swa[(size_t) il]) b += (size_t) ring * g.kv_row() * 2;
+        if (g.swa[(size_t) il]) b += (size_t) ring * kv_rb();
         else
-            b += (size_t) o.max_ctx * g.kv_row() * 2 + (size_t) (o.max_ctx / g.ix_kpool + 1) * g.ix_dim * 4 +
-                 (size_t) ring * 2 * g.ix_dim * 4;
+            b += (size_t) o.max_ctx * kv_rb() + (size_t) (o.max_ctx / g.ix_kpool + 1) * g.ix_dim * pool_b() +
+                 (size_t) ring * 2 * g.ix_dim * pool_b();
         return b;
     }
     // the buffers a GPU allocates for a forward (scratch()): the chunk's activations (Tc rows), the token path's int8
@@ -606,6 +628,9 @@ struct Model::Impl {
     static constexpr int kSub = 64;
     static constexpr int kStage = 128;   // (a prompt's streamed experts a pass)
     static constexpr int kDenseMax = 8192;   // (the indexed layers' keys a dense sub-batch spans at most)
+    // the prompt path's F16 rows of the cache a layer's dense sub-batches read (kbuf): a window's and a chunk's, or an
+    // indexed layer's up to kDenseMax (an 8-bit cache dequantized there; F16's read in place but where a ring wraps)
+    size_t deq_rows() const { return std::max((size_t) g.n_swa + Tc, (size_t) kDenseMax + kSub); }
     static constexpr size_t kBand = 32u << 20;   // (values: a dense matrix decoded to F16 this much at a time)
     // (H, ff: the most heads and the widest dense / shared FFN a layer gives the GPU - a tensor-parallel member's share)
     size_t scratch_floats(size_t& f16, size_t& ints, size_t H = 64, size_t ff = 0) const {
@@ -630,8 +655,8 @@ struct Model::Impl {
         size_t f16 = 0, ints = 0;
         const size_t f = scratch_floats(f16, ints, H, ff);
         const size_t att = std::max((size_t) kSub * H * ((size_t) g.n_swa + kSub + 8), (size_t) kSub * std::min<size_t>(H, 32) * kDenseMax);
-        return f * 4 + f16 * 2 + ints * 4 + att * 6 + (size_t) kSub * kDenseMax * 4 +
-               ((size_t) g.n_swa + kSub) * g.kv_row() * 2 + (96u << 20);
+        return f * 4 + f16 * 2 + ints * 4 + att * 6 + (size_t) kSub * kDenseMax * 4 + deq_rows() * g.kv_row() * 2 +
+               (96u << 20);
     }
 
     int main_gi = 0;
@@ -735,6 +760,7 @@ struct Model::Impl {
                     (G[i].bw > G[(size_t) main_gi].bw / 1.15 && free_b[i] > free_b[(size_t) main_gi] + 1e9))
                     main_gi = (int) i;
         }
+        free_b[(size_t) main_gi] -= vis_room;   // (the vision tower's room for a picture: free between pictures)
         // tensor parallel: --tp N, or auto (-1): over the largest group of GPUs of one kind when it holds everything -
         // the layer split otherwise (an INFO line says why)
         if (o.tp != 0 && o.tp != 1) {
@@ -748,21 +774,38 @@ struct Model::Impl {
                 }
             }
             if (N >= 2) {
+                auto undo = [&] {
+                    tp = 0;
+                    mem.clear();
+                    hel.clear();
+                    TL.clear();
+                    for (Gpu& gp : G) {
+                        gp.sH = 64;
+                        gp.sFF = 0;
+                    }
+                };
                 std::vector<double> fb = free_b;
                 std::string terr;
                 if (tensor_split(ndev, devs, fb, terr, N)) return true;
+                // (--kv auto: every member holds the whole cache - in 8-bit rows, 58% of its VRAM, when F16 does not fit)
+                if (o.kv < 0 && !kv_q8) {
+                    undo();
+                    kv_q8 = true;
+                    fb = free_b;
+                    std::string t8;
+                    if (tensor_split(ndev, devs, fb, t8, N)) {
+                        info.push_back("INFO the latent cache in 8-bit rows (--kv auto): with F16 rows tensor parallel "
+                                       "does not hold this context (" + terr + ")");
+                        return true;
+                    }
+                    kv_q8 = false;
+                    terr += "; in 8-bit rows: " + t8;
+                }
                 if (o.tp > 0) {
                     err = terr;
                     return false;
                 }
-                tp = 0;
-                mem.clear();
-                hel.clear();
-                TL.clear();
-                for (Gpu& gp : G) {
-                    gp.sH = 64;
-                    gp.sFF = 0;
-                }
+                undo();
                 info.push_back("INFO tensor parallel not taken (" + terr + "): the layers split over the GPUs");
             }
         }
@@ -951,10 +994,10 @@ struct Model::Impl {
                 for (const char* x : split) sp |= rest == x;
                 b += ex ? (double) t.bytes / U * 1.02 + 4096 : sp ? (double) t.bytes / N * 1.02 + 4096 : (double) t.bytes + 256;
             }
-            if (g.swa[(size_t) il]) b += (double) ring * g.kv_row() * 2;
+            if (g.swa[(size_t) il]) b += (double) ring * kv_rb();
             else
-                b += (double) o.max_ctx * g.kv_row() * 2 + (double) (o.max_ctx / g.ix_kpool + 1) * g.ix_dim * 4 +
-                     (double) ring * 2 * g.ix_dim * 4;
+                b += (double) o.max_ctx * kv_rb() + (double) (o.max_ctx / g.ix_kpool + 1) * g.ix_dim * pool_b() +
+                     (double) ring * 2 * g.ix_dim * pool_b();
             return b;
         };
         double need = 0;
@@ -967,12 +1010,20 @@ struct Model::Impl {
             const double have = free_b[(size_t) i] - (i == head_gpu ? head_b : 0.0);
             if (need > have) {
                 char buf[320];
-                std::snprintf(buf, sizeof buf, "--tp %d: a member needs %.1f GB of VRAM, GPU %d has %.1f GB free beyond "
+                std::snprintf(buf, sizeof buf, "--tp %d: a member needs %.2f GB of VRAM, GPU %d has %.2f GB free beyond "
                               "the reserve (a smaller --max-context, or the layer split: --tp 0)", N, need / 1e9,
                               devs[(size_t) i], have / 1e9);
                 err = buf;
                 return false;
             }
+        }
+        {
+            double have = 1e30;
+            for (int i : mem) have = std::min(have, free_b[(size_t) i] - (i == head_gpu ? head_b : 0.0));
+            char buf[200];
+            std::snprintf(buf, sizeof buf, "INFO tensor parallel: a member's plan %.2f GB of the %.2f GB free beyond the "
+                          "reserve (the fullest member)", need / 1e9, have / 1e9);
+            info.push_back(buf);
         }
         if (head_gpu != mem[0] && head_b > free_b[(size_t) head_gpu]) {
             err = "--tp: the head's GPU " + std::to_string(devs[(size_t) head_gpu]) + " has too little VRAM free";
@@ -1385,14 +1436,14 @@ struct Model::Impl {
     bool caches(Layer& l, Gpu& gp, std::string& err) {
         if (l.swa) {
             l.ring = ring;
-            if (!gp.alloc(l.kv, (size_t) ring * g.kv_row(), err)) return false;
+            if (!gp.alloc(l.kv, (size_t) ring * kv_rb() / 2, err)) return false;
         } else {
             l.ring = 0;
-            if (!gp.alloc(l.kv, (size_t) o.max_ctx * g.kv_row(), err) ||
-                !gp.alloc(l.pooled, (size_t) (o.max_ctx / g.ix_kpool + 1) * g.ix_dim, err) ||
-                !gp.alloc(l.ivg, (size_t) ring * 2 * g.ix_dim, err))
+            if (!gp.alloc(l.kv, (size_t) o.max_ctx * kv_rb() / 2, err) ||
+                !gp.alloc(l.pooled, (size_t) (o.max_ctx / g.ix_kpool + 1) * g.ix_dim * pool_b() / 4, err) ||
+                !gp.alloc(l.ivg, (size_t) ring * 2 * g.ix_dim * pool_b() / 4, err))
                 return false;
-            CK(cudaMemset(l.pooled, 0, (size_t) (o.max_ctx / g.ix_kpool + 1) * g.ix_dim * 4));
+            CK(cudaMemset(l.pooled, 0, (size_t) (o.max_ctx / g.ix_kpool + 1) * g.ix_dim * pool_b()));
         }
         return true;
     }
@@ -1520,7 +1571,7 @@ struct Model::Impl {
                gp.alloc(gp.sy, 16 * T * lat, err) && gp.alloc(gp.cpo, T * lat, err) && gp.alloc(gp.bounds, 1025, err) && gp.alloc(gp.stok, 16 * T, err) &&
                gp.alloc(gp.srow, 16 * T, err) && gp.alloc(gp.sS, att, err) && gp.alloc(gp.sP, att, err) &&
                gp.alloc(gp.dmask, (size_t) kSub * kDenseMax, err) &&
-               gp.alloc(gp.kbuf, ((size_t) g.n_swa + kSub) * g.kv_row(), err) &&
+               gp.alloc(gp.kbuf, deq_rows() * g.kv_row(), err) &&
                (gp.lo = gp.pos + T, gp.nk = gp.pos + 2 * T, true);
     }
 
@@ -1533,7 +1584,36 @@ struct Model::Impl {
         o.max_ctx = (o.max_ctx + g.ix_kpool - 1) / g.ix_kpool * g.ix_kpool;
         Tc = std::max(W, o.prefill_chunk);
         ring = (int) std::min<int64_t>(o.max_ctx, (int64_t) g.n_swa + std::max(o.ring_slack, Tc));
+        kv_q8 = o.kv == 1;
+        if (kv_q8 && (g.kv_lora % 32 || g.kv_lora != 512 || g.rope != 64)) {
+            err = "--kv q8: a latent row of " + std::to_string(g.kv_lora) + " + " + std::to_string(g.rope) +
+                  " values (the 8-bit rows take 512 + 64)";
+            return false;
+        }
+        // the vision tower's geometry (its room is planned on the main GPU; it loads after the model)
+        if (o.vision && Vision::in_pack(pk)) {
+            std::string verr;
+            if (Vision::geometry(pk, vgeo, verr)) {
+                vis_room = (double) Vision::room_for(vgeo);
+                // an image token's position has no n-gram (Engram's reference masks it, and a later token's history
+                // pads it): its id maps to none
+                if (pk.eg.modules > 0 && vgeo.image_token < pk.eg.vocab) pk.eg.token_map[(size_t) vgeo.image_token] = -1;
+            } else if (!o.vision_auto) {
+                err = verr;
+                return false;
+            } else {
+                info.push_back("NOTE vision off: " + verr + " - text only");
+                o.vision = false;
+            }
+        } else if (o.vision && !o.vision_auto) {
+            err = "--vision on: the pack has no vision tower (pack the model again with its mmproj file: "
+                  "tools/hy4/pack_gguf.py)";
+            return false;
+        } else {
+            o.vision = false;
+        }
         if (!plan(err)) return false;
+        if (o.kv == 1) info.push_back("INFO the latent cache in 8-bit rows (--kv q8)");
         if (!o.profile.empty()) {
             std::ifstream f(o.profile, std::ios::binary);
             std::vector<uint32_t> v((size_t) g.n_layer * g.n_expert);
@@ -1729,6 +1809,30 @@ struct Model::Impl {
                 cudaSetDevice(G[i + 1].dev);
                 (void) cudaDeviceEnablePeerAccess(G[i].dev, 0);
                 (void) cudaGetLastError();
+            }
+        }
+        if (o.vision) {   // the vision tower: host memory (the pack's mapping), a picture's room on the main GPU
+            vis = std::make_unique<Vision>();
+            std::string verr;
+            const int vdev = G[(size_t) head_gpu].dev;
+            if (!vis->load(pk, vdev, verr)) {
+                if (!o.vision_auto) {
+                    err = verr;
+                    return false;
+                }
+                info.push_back("NOTE vision off: the tower did not load on CUDA" + std::to_string(vdev) + " (" + verr +
+                               ") - text only");
+                vis.reset();
+                cudaGetLastError();
+            } else {
+                char vb[320];
+                std::snprintf(vb, sizeof vb, "INFO vision tower: %zu MB in host memory (the pack's mapping), a picture "
+                              "at a time on CUDA%d (up to %.0f MB, kept free there between pictures), up to %d pixels "
+                              "a picture (a square one: %d image tokens)", vis->host_bytes() >> 20, vdev,
+                              vis_room / 1048576.0, vgeo.max_pixels,
+                              vgeo.tokens((int) std::sqrt((double) vgeo.max_pixels) / vgeo.factor() * vgeo.factor(),
+                                          (int) std::sqrt((double) vgeo.max_pixels) / vgeo.factor() * vgeo.factor()));
+                info.push_back(vb);
             }
         }
         for (auto& gp : G) st.vram_gb += (double) gp.used / 1e9;
@@ -1969,7 +2073,12 @@ struct Model::Impl {
     // key position the sub-batch may see, the softmax over each token's own (its window, or the indexer's picks:
     // `all` - every position up to it, as long as the picks are every pool), O = P V.  false: an indexed layer whose
     // keys span more than kDenseMax positions (the caller's gathering kernel instead).
-    bool attn_prompt(Layer& l, Gpu& gp, int t0, int ts, int64_t p0, bool all, float scale) {
+    // (an 8-bit cache: the rows [base, hi) of a layer's call dequantized in gp.kbuf so far - each sub-batch adds the
+    //  rows it needs beyond them, so a chunk's rows are dequantized once a layer)
+    struct Deq {
+        int64_t base = -1, hi = 0;
+    };
+    bool attn_prompt(Layer& l, Gpu& gp, int t0, int ts, int64_t p0, bool all, float scale, Deq& dq) {
         const int H = l.H, KR = g.kv_row(), KL = g.kv_lora, maxk = g.ix_top_k + g.ix_kpool;
         const int64_t P0 = p0 + t0, k1 = P0 + ts;
         const int64_t k0 = l.swa ? std::max<int64_t>(0, P0 - g.n_swa + 1) : 0;
@@ -1977,7 +2086,15 @@ struct Model::Impl {
         if (!l.swa && !all && nkr > kDenseMax) return false;
         const int window = l.swa ? g.n_swa : all ? (1 << 30) : 0;
         const uint16_t* K = l.kv + (size_t) (l.ring > 0 ? k0 % l.ring : k0) * KR;
-        if (l.ring > 0 && k0 % l.ring + nkr > l.ring) {   // (the window wraps round the ring: its rows in order)
+        if (kv_q8) {
+            if (dq.base < 0 || k0 < dq.base || k1 - dq.base > (int64_t) deq_rows()) dq.base = dq.hi = k0;
+            if (k1 > dq.hi) {
+                k::kv_deq(l.kv, l.ring, KL, g.rope, (int) dq.hi, (int) (k1 - dq.hi),
+                          gp.kbuf + (size_t) (dq.hi - dq.base) * KR, gp.s);
+                dq.hi = k1;
+            }
+            K = gp.kbuf + (size_t) (k0 - dq.base) * KR;
+        } else if (l.ring > 0 && k0 % l.ring + nkr > l.ring) {   // (the window wraps round the ring: its rows in order)
             k::kv_gather(l.kv, l.ring, KR, (int) k0, nkr, gp.kbuf, gp.s);
             K = gp.kbuf;
         }
@@ -2039,7 +2156,8 @@ struct Model::Impl {
         dbg("q_resid", l.il, gp, gp.qr, T, g.q_lora);
         if (inject) ref_cmp("q_resid", l.il, gp, gp.qr, (size_t) T * g.q_lora, T);
         ok = ok && mm(gp, l.q_b, gp.qr, g.q_lora, T, gp.q, (size_t) H * g.k_mla);
-        k::kv_store(gp.kvr, T, KL, R, l.kv_a_norm, g.eps, gp.pos, l.base, l.kv, l.ring, s);
+        k::kv_store(gp.kvr, T, KL, R, l.kv_a_norm, g.eps, gp.pos, l.base, l.kv, l.ring, s, kv_q8);
+        Deq dq;
         // q: q_pe rotated in place, q_nope into the latent space through k_b, both side by side in qcat
         k::rope(gp.q, T, H, g.k_mla, (size_t) H * g.k_mla, nope, R, gp.pos, l.base, s);
         dbg("q_pe", l.il, gp, gp.q, (size_t) T * H, g.k_mla, R, nope);
@@ -2057,15 +2175,15 @@ struct Model::Impl {
                                 D, T);
             dbg("indexer_gate", l.il, gp, gp.ivt, T, 2 * D, D, D);
             dbg("indexer_q", l.il, gp, gp.iq, T, (size_t) IH * D);
-            k::store_rows(gp.ivt, T, 2 * D, l.ivg, ring, gp.pos, s);
+            k::store_rows(gp.ivt, T, 2 * D, l.ivg, ring, gp.pos, s, kv_q8);
             // the groups whose last member is in the window: [p0 / KP, (last + 1) / KP)
             const int64_t last = p0 + T - 1, g0 = p0 / KP, g1 = (last + 1) / KP;
             if (g1 > g0)
                 k::ix_pool(l.ivg, ring, (int) g0, (int) (g1 - g0), KP, D, l.ix_ape, l.ix_pnorm, g.eps, R, l.base,
-                           l.pooled, s);
+                           l.pooled, s, kv_q8);
             ok = ok && mm(gp, l.ix_proj, gp.xa, E, T, gp.wt, IH, 1.0f / std::sqrt((float) D * IH));
             dbg("indexer_weights", l.il, gp, gp.wt, T, IH);
-            dbg("indexer_pool_k", l.il, gp, l.pooled, (size_t) g1, D);
+            if (!kv_q8) dbg("indexer_pool_k", l.il, gp, l.pooled, (size_t) g1, D);
             const int npool_ld = (int) (o.max_ctx / KP + 1), maxk = g.ix_top_k + KP;
             const int top = g.ix_top_k / KP - 1;
             for (int t0 = 0; t0 < T; t0 += kSub) {   // (the scores of kSub tokens at a time)
@@ -2073,21 +2191,21 @@ struct Model::Impl {
                 const int n_pool = (int) ((p0 + t0 + ts - 1) / KP);
                 // the picks are every pool the tokens see until a token sees more than `top` of them
                 const bool all = n_pool <= top;
-                if (T > W && all && attn_prompt(l, gp, t0, ts, p0, true, scale)) continue;
+                if (T > W && all && attn_prompt(l, gp, t0, ts, p0, true, scale, dq)) continue;
                 k::ix_score(gp.iq + (size_t) t0 * IH * D, gp.wt + (size_t) t0 * IH, ts, IH, D, l.pooled, gp.pos + t0,
-                            KP, n_pool, gp.score, npool_ld, s);
+                            KP, n_pool, gp.score, npool_ld, s, kv_q8);
                 k::ix_select(gp.score, npool_ld, ts, gp.pos + t0, KP, top, gp.keys + (size_t) t0 * maxk, maxk,
                              gp.knk + t0, s);
-                if (T > W && attn_prompt(l, gp, t0, ts, p0, false, scale)) continue;
+                if (T > W && attn_prompt(l, gp, t0, ts, p0, false, scale, dq)) continue;
                 k::attention(gp.qcat + (size_t) t0 * H * KR, ts, H, KL, R, l.kv, 0, gp.keys + (size_t) t0 * maxk, maxk,
-                             nullptr, gp.knk + t0, maxk, scale, l.sinks, gp.ws, gp.o + (size_t) t0 * H * KL, s);
+                             nullptr, gp.knk + t0, maxk, scale, l.sinks, gp.ws, gp.o + (size_t) t0 * H * KL, s, kv_q8);
             }
         } else {
             for (int t0 = 0; t0 < T; t0 += kSub) {
                 const int ts = std::min(kSub, T - t0);
-                if (T > W && attn_prompt(l, gp, t0, ts, p0, false, scale)) continue;
+                if (T > W && attn_prompt(l, gp, t0, ts, p0, false, scale, dq)) continue;
                 k::attention(gp.qcat + (size_t) t0 * H * KR, ts, H, KL, R, l.kv, l.ring, nullptr, 0, gp.lo + t0,
-                             gp.nk + t0, g.n_swa, scale, l.sinks, gp.ws, gp.o + (size_t) t0 * H * KL, s);
+                             gp.nk + t0, g.n_swa, scale, l.sinks, gp.ws, gp.o + (size_t) t0 * H * KL, s, kv_q8);
             }
         }
         ok = ok && mm_heads(gp, l.v_b, gp.o, (size_t) H * KL, KL, T, H, gp.ob, (size_t) H * g.v_mla, g.v_mla);
@@ -2505,7 +2623,6 @@ struct Model::Impl {
         Gpu& hg = on ? *on : G[(size_t) head_gpu];
         const int E = g.n_embd;
         cudaStream_t s = hg.s;
-        (void) p0;
         if (emb_pending) {   // (h_emb free: the queued pass's copy of it done - once, after such a pass)
             CK(cudaEventSynchronize(ev_emb));
             emb_pending = false;
@@ -2521,6 +2638,7 @@ struct Model::Impl {
                 for (int i = 0; i < 32; ++i) dst[b * 32 + i] = d * (float) qv[i];
             }
         }
+        if (!imgs.empty()) image_rows(p0, T, h_emb);   // (a picture's image tokens: its rows, as the trunk's)
         CK(cudaMemcpyAsync(mtp_cur, h_emb, sizeof(float) * T * E, cudaMemcpyHostToDevice, s));
         if (on == &hm) {
             CK(cudaEventRecord(ev_emb, s));
@@ -2677,6 +2795,7 @@ struct Model::Impl {
                 for (int i = 0; i < 32; ++i) dst[b * 32 + i] = d * (float) qv[i];
             }
         }
+        if (!imgs.empty()) image_rows(p0, T, h_x);   // (a picture's image tokens: its rows)
         const double te = now_s();
         const int n_look = pk.eg.modules * T;
         if (n_look >= 8 && !std::getenv("HY4_EG_SERIAL")) {   // (a window's rows on the lookup threads)
@@ -3382,6 +3501,12 @@ bool Model::load(const Options& o, std::string& err) {
         std::vector<float> c;
         ok = draft(ids[0], T + 4, 3, 0.0f, d, c, err);
     }
+    if (ok && m->vis) {   // (the tower's kernels and cuBLAS's start, and its weights read once: a small grey picture)
+        const int f = m->vgeo.factor() * 2;
+        std::vector<uint8_t> px((size_t) f * f * 3, 128);
+        std::vector<float> rows;
+        ok = encode_image(px.data(), f, f, rows, err);
+    }
     m->tokens.clear();
     m->end = 0;
     m->mtp_done = 0;
@@ -3392,7 +3517,8 @@ bool Model::load(const Options& o, std::string& err) {
     }
     const double t1 = std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
     char buf[160];
-    std::snprintf(buf, sizeof buf, "INFO warmed up in %.1f s (a prompt chunk, a token window, a draft)", t1 - t0);
+    std::snprintf(buf, sizeof buf, "INFO warmed up in %.1f s (a prompt chunk, a token window, a draft%s)", t1 - t0,
+                  m->vis ? ", a picture" : "");
     m->info.push_back(buf);
     return true;
 }
@@ -3480,6 +3606,24 @@ bool Model::save_profile(std::string& err) const {
     return true;
 }
 int Model::eos() const { return m->g.eos; }
+const VisionGeo* Model::vision() const { return m->vis ? &m->vgeo : nullptr; }
+bool Model::encode_image(const uint8_t* rgb, int width, int height, std::vector<float>& rows, std::string& err) {
+    if (!m->vis) {
+        err = "no vision tower loaded (--vision on, and a pack with the mmproj file)";
+        return false;
+    }
+    if (!m->vis->encode(rgb, width, height, rows, err)) return false;
+    if (rows.size() != (size_t) m->vgeo.tokens(width, height) * (size_t) m->g.n_embd) {
+        err = "vision: the tower gave " + std::to_string(rows.size()) + " values for a picture's " +
+              std::to_string(m->vgeo.tokens(width, height)) + " rows";
+        return false;
+    }
+    return true;
+}
+void Model::set_images(std::vector<Image> images) {
+    m->mtp_settle();   // (a queued MTP pass may still read the pictures' rows)
+    m->imgs = std::move(images);
+}
 const Stats& Model::stats() const { return m->st; }
 std::vector<std::string> Model::info_lines() const { return m->info; }
 

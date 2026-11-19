@@ -189,12 +189,14 @@ on an engine of its own (`maya-hy4`, NVIDIA) from [AngelSlim's GGUF](https://hug
 (the download's license file, `License_AngelSlim_model_and_dataset.txt`, and Tencent's model card give the terms).
 
 **Set up:** `./maya.sh --setup --model hy4-flash` (or pick Hy4-flash in the setup's model list) checks the PC, builds
-`maya-hy4`, downloads the two files (pinned, sha256-checked; `--model-dir <folder>` uses the ones you have), writes the
-pack and `maya-hy4-flash.json`; `./maya.sh` starts it. `--drafting off` sets it up without MTP drafting.
+`maya-hy4`, downloads the two files and the vision tower's (pinned, sha256-checked; `--model-dir <folder>` uses the
+ones you have), writes the pack and `maya-hy4-flash.json`; `./maya.sh` starts it. `--drafting off` sets it up without
+MTP drafting, `--no-vision` without pictures.
 
 | Files | Size | Runs on |
 | --- | ---: | --- |
 | AngelSlim's **Q4_K_M** (`Hy4-flash-Q4_K_M-0000N-of-00002.gguf`): Q4_K experts (Q6_K downs on 19 layers), Q8_0 elsewhere | 157 GiB | NVIDIA, Linux |
+| its vision tower (`mmproj-Hy4-flash-bf16.gguf`, BF16) | 1 GiB | with the model |
 
 - **Tensor parallel:** where two or more GPUs are of one kind, every layer runs on all of them at once (about twice
   the layer split's decode speed on eight RTX 5060 Ti); the fastest GPU holds the head and the drafter and computes a
@@ -202,12 +204,19 @@ pack and `maya-hy4-flash.json`; `./maya.sh` starts it. `--drafting off` sets it 
 - **Where the experts live:** all of them in VRAM where they fit (about 108 GB); where they do not, each layer keeps
   a share of its experts in VRAM (its most used, with an expert profile) and the CPU computes the others from the
   model's file.
+- **Context:** up to 256K (the setup offers 32K to 256K). With tensor parallel every GPU of the group holds the
+  whole cache, so where 16-bit rows do not fit (256K on 16 GB cards) the engine keeps them in 8 bits.
 - **Drafting:** the model's own MTP block proposes up to three tokens a step and the model checks them - nearly twice
   the decode speed on code, the same answers.
 - **Thinking and tools:** the GGUF's own template; the model thinks at High (its default) or not at all (Off), so those
   are the two levels offered - a request for another level runs at High. Chat, thinking and tool calls through Maya's
   OpenAI-compatible server.
-- **The pack:** `python tools/hy4/pack_gguf.py --model <folder>` indexes the GGUF set (no weights copied).
+- **Pictures:** the model's own vision tower runs in the engine on the main GPU (its weights stay in RAM; a picture
+  takes up to 0.8 GB there while it is read, kept free for it). Pictures up to 2048 x 2048 pixels (larger ones are
+  scaled down), a square one 4,160 tokens of the context; 1024 x 768 is read in about 0.25 s, the largest in about
+  5 s on an RTX 3090. Pictures only, no videos. Images on the Models page turns them off.
+- **The pack:** `python tools/hy4/pack_gguf.py --model <folder>` indexes the GGUF set and the vision tower's file
+  beside it (no weights copied).
 
 Its engine settings: [SETTINGS.md](SETTINGS.md#hy4-flash).
 

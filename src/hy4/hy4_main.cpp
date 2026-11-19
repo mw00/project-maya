@@ -2,8 +2,12 @@
 //
 //   maya-hy4 --pack <model>/maya-hy4 --serve [--gpus 0,1,...] [--max-context N] [--chunk N] [--eos id,id,...]
 //            [--mtp [--draft N] [--draft-floor P]] [--vram-experts F] [--cpu-threads N] [--profile F] [--profile-out F]
-//            [--tp N|auto] [--main-gpu I]
+//            [--tp N|auto] [--main-gpu I] [--vision on|off] [--kv auto|f16|q8]
 //
+// --kv: the latent cache's rows - F16, or q8: the latent's 512 values int8 in blocks of 32 with an F16 scale, the
+// rotated part's 64 F16 (672 bytes a row against 1152), the indexer's per-position and pooled rows F16 (the reference's
+// own cache type) - about 58% of the VRAM a position; auto (the default) takes F16 unless tensor parallel - every
+// member holding the whole cache - needs the 8-bit rows to hold the context.
 // The routed experts that do not fit in VRAM (or beyond --vram-experts, the share of each layer's kept there) run on
 // the CPU lane from the model's file, --cpu-threads workers (default: a physical core each but the first); a prompt's
 // chunk sends them to the GPU instead where this PC's PCIe is measured faster than its CPU.  --profile: an expert
@@ -25,16 +29,25 @@
 // reads only the rest, when the sliding-window caches still hold the window before it (else all of it).  Keys:
 // temperature, top_p, top_k, min_p, seed, penalty_last_n / _repeat / _freq / _present, think_budget + think_end.
 //
+// Pictures (the pack's vision tower: on unless --vision off, `INFO vision=hy4 ...` then): `GENI <max_new> [keys] <file>
+// <ids>` - the file holds the prompt's pictures (see read_pics), each one's image tokens between its start and end of
+// image tokens taking its rows; the state is shared only where the same picture sits at the same place.
+//
 //   maya-hy4 --pack <model>/maya-hy4 --ids @prompt.txt [--gen N] [--gpus 0,1,...] [--max-context N] [--chunk N]
 //
 // --ids: comma- or whitespace-separated token ids, or @FILE holding them; --gen: greedy tokens after the prompt (their
-// ids printed, and the top 5 of each step's logits with --top).
+// ids printed, and the top 5 of each step's logits with --top); --images FILE: the prompt's pictures (GENI's file).
 //
-//   maya-hy4 --pack <model>/maya-hy4 --kld ref.kld [--chunks N]
+//   maya-hy4 --pack <model>/maya-hy4 --encode-image FILE.rgb --size WxH --dump-image OUT [--gpus I]
+//
+// The vision tower alone (no model loaded): a picture's raw RGB bytes -> its rows, F32 [tokens][3072], into OUT.
+//
+//   maya-hy4 --pack <model>/maya-hy4 --kld ref.kld [--chunks N] [--kld-save OUT]
 //
 // The model against a reference's logits: ref.kld is a perplexity tool's --kl-divergence-base file (AngelSlim's
 // hy4-flash build); each chunk's tokens are fed from position 0 and every position the file scores compared - the mean
-// KL divergence (reference || this), how often the two pick the same top token, and both perplexities.
+// KL divergence (reference || this), how often the two pick the same top token, and both perplexities.  --kld-save
+// OUT: this run's own log-probabilities in the same format, a base for another setting's --kld.
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -107,7 +120,9 @@ void log_softmax(const float* r, int n, std::vector<double>& lp) {
     for (int i = 0; i < n; ++i) lp[(size_t) i] = (double) r[i] - l;
 }
 
-int run_kld(hy4::Model& m, const std::string& path, int chunks) {
+// (save: this run's own log-probabilities written in the same format - a base for another run's --kld, so two
+//  settings of this engine are compared with each other, the reference's own noise left out)
+int run_kld(hy4::Model& m, const std::string& path, int chunks, const std::string& save = "") {
     std::ifstream f(path, std::ios::binary);
     char magic[8];
     int32_t n_ctx = 0, n_vocab = 0, n_chunk = 0;
@@ -126,6 +141,19 @@ int run_kld(hy4::Model& m, const std::string& path, int chunks) {
     chunks = chunks > 0 ? std::min(chunks, n_chunk) : n_chunk;
     std::vector<uint16_t> ref((size_t) nrow * nv);
     std::vector<float> logits((size_t) hy4::k::kMaxWin * n_vocab);
+    std::ofstream out;
+    if (!save.empty()) {
+        out.open(save, std::ios::binary);
+        const int32_t hd[3] = {n_ctx, n_vocab, chunks};
+        out.write("_logits_", 8);
+        out.write((const char*) hd, sizeof hd);
+        out.write((const char*) tokens.data(), (std::streamsize) ((size_t) chunks * n_ctx * 4));
+        if (!out) {
+            std::fprintf(stderr, "%s: not written\n", save.c_str());
+            return 1;
+        }
+    }
+    std::vector<uint16_t> mine(save.empty() ? 0 : (size_t) nv);
     std::vector<double> lp;
     double kl = 0, nll_me = 0, nll_ref = 0;
     long n = 0, same = 0;
@@ -159,6 +187,20 @@ int run_kld(hy4::Model& m, const std::string& path, int chunks) {
                 std::memcpy(&minlp, rr + 2, 4);
                 const uint16_t* q = rr + 4;
                 log_softmax(me, n_vocab, lp);
+                if (out.is_open()) {   // (the row: scale, min, then 65535 steps from min to max)
+                    double lo = lp[0], hi = lp[0];
+                    for (int i = 1; i < n_vocab; ++i) {
+                        lo = std::min(lo, lp[(size_t) i]);
+                        hi = std::max(hi, lp[(size_t) i]);
+                    }
+                    const float sc = (float) ((hi - lo) / 65535.0), mn = (float) lo;
+                    std::memcpy(mine.data(), &sc, 4);
+                    std::memcpy(mine.data() + 2, &mn, 4);
+                    for (int i = 0; i < n_vocab; ++i)
+                        mine[(size_t) 4 + i] = (uint16_t) std::lround(std::min(65535.0, std::max(0.0, (lp[(size_t) i] - mn) / sc)));
+                    for (int i = n_vocab + 4; i < nv; ++i) mine[(size_t) i] = 0;
+                    out.write((const char*) mine.data(), (std::streamsize) (mine.size() * 2));
+                }
                 double k = 0;
                 int ra = 0;
                 for (int i = 0; i < n_vocab; ++i) {
@@ -238,11 +280,16 @@ struct Lines {
 };
 
 bool parse_gen(const std::string& line, Req& r) {
-    std::istringstream is(line.substr(4));
+    const bool geni = line.rfind("GENI ", 0) == 0;
+    std::istringstream is(line.substr(geni ? 5 : 4));
     if (!(is >> r.max_new)) return false;
     for (std::string tok; is >> tok;) {
         const size_t eq = tok.find('=');
         if (eq == std::string::npos) {
+            if (geni && r.file.empty()) {
+                r.file = tok;
+                continue;
+            }
             r.ids = parse_ids(tok);
             break;
         }
@@ -263,6 +310,102 @@ bool parse_gen(const std::string& line, Req& r) {
         // (keys this engine does not use are taken and ignored)
     }
     return !r.ids.empty();
+}
+
+// GENI's file (serve/hy4_vision.py, maya-mm3's format): int32 'MMI1', int32 count, then per picture int64 start (the
+// position of its first image token), int32 width, int32 height, height x width x 3 RGB bytes
+struct Pic {
+    long long start = 0;
+    int width = 0, height = 0;
+    std::vector<uint8_t> rgb;
+    uint64_t hash = 0;   // (FNV-1a over its size and pixels: the state's pictures told apart)
+};
+
+bool read_pics(const std::string& path, std::vector<Pic>& v, std::string& err) {
+    v.clear();
+    std::ifstream f(path, std::ios::binary);
+    char magic[4];
+    int32_t n = 0;
+    if (!f.read(magic, 4) || std::memcmp(magic, "MMI1", 4) != 0 || !f.read((char*) &n, 4) || n < 0 || n > 4096) {
+        err = path + ": not a pictures file (MMI1)";
+        return false;
+    }
+    for (int i = 0; i < n; ++i) {
+        Pic q;
+        int64_t st = 0;
+        int32_t wh[2] = {0, 0};
+        if (!f.read((char*) &st, 8) || !f.read((char*) wh, 8) || wh[0] <= 0 || wh[1] <= 0 ||
+            (long long) wh[0] * wh[1] > (1LL << 26)) {
+            err = path + ": picture " + std::to_string(i) + " is cut short";
+            return false;
+        }
+        q.start = st;
+        q.width = wh[0];
+        q.height = wh[1];
+        q.rgb.resize((size_t) wh[0] * wh[1] * 3);
+        if (!f.read((char*) q.rgb.data(), (std::streamsize) q.rgb.size())) {
+            err = path + ": picture " + std::to_string(i) + " is cut short";
+            return false;
+        }
+        uint64_t h = 1469598103934665603ull;
+        auto mix = [&](const uint8_t* b, size_t k) {
+            for (size_t j = 0; j < k; ++j) h = (h ^ b[j]) * 1099511628211ull;
+        };
+        mix((const uint8_t*) wh, 8);
+        mix(q.rgb.data(), q.rgb.size());
+        q.hash = h;
+        v.push_back(std::move(q));
+    }
+    return true;
+}
+
+// the pictures' spans in ids: the start of image token, its image tokens ((height / 32) * (width / 32 + 1) of them),
+// the end of image token - and no image token outside one; their rows for those that end at or after position `from`
+// (the others' positions are the state's already)
+bool picture_rows(hy4::Model& m, const std::vector<Pic>& pics, const std::vector<int>& ids, size_t from,
+                  std::vector<hy4::Model::Image>& out, std::string& err) {
+    out.clear();
+    const hy4::VisionGeo* vg = m.vision();
+    if (!vg) {
+        err = "this engine has no vision tower (a pack with the mmproj file, --vision on), so it cannot read pictures";
+        return false;
+    }
+    std::vector<char> covered(ids.size(), 0);
+    for (size_t i = 0; i < pics.size(); ++i) {
+        const Pic& q = pics[i];
+        const long long n = vg->tokens(q.width, q.height);
+        if (n == 0) {
+            err = "picture " + std::to_string(i) + ": " + std::to_string(q.width) + " x " + std::to_string(q.height) +
+                  " pixels (sides multiples of " + std::to_string(vg->factor()) + ", at most " +
+                  std::to_string(vg->max_pixels) + " pixels)";
+            return false;
+        }
+        if (q.start < 1 || q.start + n >= (long long) ids.size() || ids[(size_t) q.start - 1] != vg->image_start ||
+            ids[(size_t) (q.start + n)] != vg->image_end) {
+            err = "picture " + std::to_string(i) + "'s span (" + std::to_string(n) + " image tokens at " +
+                  std::to_string(q.start) + ") is not between the prompt's start and end of image tokens";
+            return false;
+        }
+        for (long long k = q.start; k < q.start + n; ++k) {
+            if (ids[(size_t) k] != vg->image_token || covered[(size_t) k]) {
+                err = "picture " + std::to_string(i) + "'s span is not a run of image tokens of its own";
+                return false;
+            }
+            covered[(size_t) k] = 1;
+        }
+        if (q.start + n > (long long) from) {
+            hy4::Model::Image im;
+            im.start = q.start;
+            if (!m.encode_image(q.rgb.data(), q.width, q.height, im.rows, err)) return false;
+            out.push_back(std::move(im));
+        }
+    }
+    for (size_t k = 0; k < ids.size(); ++k)
+        if (ids[k] == vg->image_token && !covered[k]) {
+            err = "an image token at " + std::to_string(k) + " without its picture";
+            return false;
+        }
+    return true;
 }
 
 // A row's next-token distribution, as mm3::sample::dist gives it, without a copy of the whole row where it is not
@@ -386,15 +529,31 @@ int serve(hy4::Model& m, const std::vector<int>& eos, int n_draft, float floor0)
     const auto& st0 = m.stats();
     std::printf("INFO engine=hy4 engine_kind=hy4 model=Hy4-flash ctx=%lld vram_gb=%.2f dspark=0 mtp=%d\n",
                 (long long) m.max_ctx(), st0.vram_gb, m.has_mtp() && n_draft > 0 ? 1 : 0);
+    if (const hy4::VisionGeo* vg = m.vision())   // (serve/hy4_vision.py's Geometry.from_info)
+        std::printf("INFO vision=hy4 image_token=%d image_start=%d image_end=%d vision_patch=%d vision_merge=%d "
+                    "vision_max_pixels=%d vision_min_pixels=%d\n", vg->image_token, vg->image_start, vg->image_end,
+                    vg->patch, vg->merge, vg->max_pixels, vg->min_pixels);
+    else
+        for (const auto& l : m.info_lines())
+            if (l.rfind("NOTE vision off", 0) == 0) {   // (a tower that did not load: the dashboard says why)
+                std::printf("INFO vision=off\n");
+                break;
+            }
     std::printf("READY %lld stop\n", (long long) m.max_ctx());
     std::fflush(stdout);
-    std::fprintf(stderr, "maya hy4 serve: GEN <max_new> [keys] <ids>; STOP, WRAP, QUIT\n");
+    std::fprintf(stderr, "maya hy4 serve: GEN <max_new> [keys] <ids>; GENI <max_new> [keys] <file> <ids>; STOP, WRAP, "
+                         "QUIT\n");
 #if defined(SIGPIPE)
     std::signal(SIGPIPE, SIG_IGN);
 #endif
     Lines in;
     in.start();
     std::vector<int> state;   // the tokens in the caches, positions 0 ..
+    struct Held {
+        long long start;
+        uint64_t hash;
+    };
+    std::vector<Held> held;   // the pictures in the caches (their first image token's position, their pixels' hash)
     struct Unpin {   // (a pinned buffer unpinned before its vector frees it)
         void* p;
         bool on;
@@ -412,16 +571,23 @@ int serve(hy4::Model& m, const std::vector<int>& eos, int n_draft, float floor0)
     };
     while (in.next(line)) {
         if (line == "QUIT") break;
-        if (line.rfind("GEN ", 0) != 0) {
-            std::printf("ERR unsupported command '%s' (GEN, STOP, WRAP and QUIT)\n", line.substr(0, line.find(' ')).c_str());
+        if (line.rfind("GEN ", 0) != 0 && line.rfind("GENI ", 0) != 0) {
+            std::printf("ERR unsupported command '%s' (GEN, GENI, STOP, WRAP and QUIT)\n",
+                        line.substr(0, line.find(' ')).c_str());
             std::fflush(stdout);
             continue;
         }
         in.stop.store(false);
         in.wrap.store(false);
         Req r;
-        if (!parse_gen(line, r)) {
-            std::printf("ERR expected: GEN <max_new> [keys] <id,id,...>\n");
+        if (!parse_gen(line, r) || (line.rfind("GENI ", 0) == 0 && r.file.empty())) {
+            std::printf("ERR expected: GEN <max_new> [keys] <id,id,...> (GENI: the pictures' file before the ids)\n");
+            done_cancel(r.ids.size());
+            continue;
+        }
+        std::vector<Pic> pics;
+        if (!r.file.empty() && !read_pics(r.file, pics, err)) {
+            std::printf("ERR %s\n", err.c_str());
             done_cancel(r.ids.size());
             continue;
         }
@@ -435,8 +601,31 @@ int serve(hy4::Model& m, const std::vector<int>& eos, int n_draft, float floor0)
         // the state's shared start (the prompt's last token is always read again: its logits are the first token's)
         size_t from = 0;
         while (from < state.size() && from + 1 < r.ids.size() && state[from] == r.ids[from]) ++from;
+        // (a picture before `from` in either the state or the request must be in both, at the same place)
+        for (const Held& q : held)
+            if (q.start < (long long) from &&
+                std::none_of(pics.begin(), pics.end(), [&](const Pic& x) { return x.start == q.start && x.hash == q.hash; }))
+                from = (size_t) q.start;
+        for (const Pic& x : pics)
+            if (x.start < (long long) from &&
+                std::none_of(held.begin(), held.end(), [&](const Held& q) { return x.start == q.start && x.hash == q.hash; }))
+                from = (size_t) x.start;
         if (from > 0 && !m.resumable((int64_t) from)) from = 0;   // (the windows before it gone: read it all again)
         state.resize(from);
+        held.clear();
+        {
+            std::vector<hy4::Model::Image> rows;
+            const int itok = m.vision() ? m.vision()->image_token : -1;
+            const bool any = !pics.empty() || (itok >= 0 && std::find(r.ids.begin(), r.ids.end(), itok) != r.ids.end());
+            if (any && !picture_rows(m, pics, r.ids, from, rows, err)) {
+                std::printf("ERR %s\n", err.c_str());
+                done_cancel(r.ids.size());
+                state.clear();   // (the caches' pictures are no longer known)
+                continue;
+            }
+            for (const Pic& x : pics) held.push_back({x.start, x.hash});
+            m.set_images(std::move(rows));
+        }
         bool ok = true, cancel = false;
         const int C = std::max(1, m.chunk());
         for (size_t a = from; a < r.ids.size();) {
@@ -462,11 +651,14 @@ int serve(hy4::Model& m, const std::vector<int>& eos, int n_draft, float floor0)
             std::printf("ERR %s\n", err.c_str());
             done_cancel(r.ids.size());
             state.clear();
+            held.clear();
+            m.set_images({});
             continue;
         }
         if (cancel) {
             std::printf("DONE 0 %zu %.1f 0.0 cancel 0 0 %zu 0 0\n", r.ids.size(), t1 - t0, from);
             std::fflush(stdout);
+            m.set_images({});
             continue;
         }
         ++counter;
@@ -601,11 +793,13 @@ int serve(hy4::Model& m, const std::vector<int>& eos, int n_draft, float floor0)
             if (!more) break;
             tok = next;
         }
+        m.set_images({});
         if (!fail.empty()) {
             std::printf("ERR %s\n", fail.c_str());
             std::fprintf(stderr, "hy4: %s\n", fail.c_str());
             finish = "cancel";
             state.clear();
+            held.clear();
         }
         if (spec && d_off > 0) std::fprintf(stderr, "maya hy4 serve: MTP kept %lld of %lld drafts\n", d_acc, d_off);
         stat_line();
@@ -701,6 +895,55 @@ int bench_lane(const std::string& pack_dir, int il, int n_exp_call, int n_tok) {
 
 }  // namespace
 
+// --encode-image: the vision tower alone - the pack's mmproj tensors on one GPU (--gpus' first, else 0), a picture's raw
+// RGB bytes (width x height x 3) -> its rows (F32 [tokens][3072]) into --dump-image, twice (the second time warm)
+int encode_alone(const hy4::Options& o, const std::string& rgb_path, const std::string& size, const std::string& out) {
+    int w = 0, h = 0;
+    if (std::sscanf(size.c_str(), "%dx%d", &w, &h) != 2 || w <= 0 || h <= 0 || out.empty()) {
+        std::fprintf(stderr, "--encode-image needs --size WxH and --dump-image OUT\n");
+        return 2;
+    }
+    std::ifstream f(rgb_path, std::ios::binary);
+    std::vector<uint8_t> px((size_t) w * h * 3);
+    if (!f.read((char*) px.data(), (std::streamsize) px.size())) {
+        std::fprintf(stderr, "%s: not %d x %d x 3 bytes\n", rgb_path.c_str(), w, h);
+        return 1;
+    }
+    hy4::Pack pk;
+    std::string err;
+    if (!pk.load(o.pack, err)) {
+        std::fprintf(stderr, "%s\n", err.c_str());
+        return 1;
+    }
+    if (!hy4::Vision::in_pack(pk)) {
+        std::fprintf(stderr, "maya-hy4: the pack has no vision tower (pack the model again with its mmproj file)\n");
+        return 1;
+    }
+    const int dev = o.gpus.empty() ? 0 : o.gpus[0];
+    hy4::Vision v;
+    if (!v.load(pk, dev, err)) {
+        std::fprintf(stderr, "maya-hy4: %s\n", err.c_str());
+        return 1;
+    }
+    std::vector<float> rows;
+    for (int pass = 0; pass < 2; ++pass) {
+        const double t0 = now();
+        if (!v.encode(px.data(), w, h, rows, err)) {
+            std::fprintf(stderr, "maya-hy4: %s\n", err.c_str());
+            return 1;
+        }
+        std::fprintf(stderr, "vision: %d x %d pixels -> %zu rows in %.0f ms (%zu MB of CUDA%d during it; the largest "
+                     "picture's room %zu MB)\n", w, h, rows.size() / (size_t) v.geo().out_dim, 1e3 * (now() - t0),
+                     v.last_bytes() >> 20, dev, v.room_bytes() >> 20);
+    }
+    std::ofstream of(out, std::ios::binary);
+    if (!of.write((const char*) rows.data(), (std::streamsize) (rows.size() * 4))) {
+        std::fprintf(stderr, "%s: not written\n", out.c_str());
+        return 1;
+    }
+    return 0;
+}
+
 int main(int argc, char** argv) {
     hy4::Options o;
     std::string ids_arg, kld;
@@ -710,6 +953,7 @@ int main(int argc, char** argv) {
     std::vector<int> eos;
     int n_draft = 3;
     float floor = 0.55f;
+    std::string images, enc_rgb, enc_size, enc_out, kld_save;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         auto next = [&]() -> std::string {
@@ -750,6 +994,24 @@ int main(int argc, char** argv) {
         else if (a == "--draft") n_draft = std::atoi(next().c_str());
         else if (a == "--draft-floor") floor = (float) std::atof(next().c_str());
         else if (a == "--eos") eos = parse_list(next());
+        else if (a == "--vision") {   // (on by default when the pack has the tower; --vision on: it must)
+            const std::string v = next();
+            o.vision = v != "off";
+            o.vision_auto = false;
+        }
+        else if (a == "--images") images = next();
+        else if (a == "--kld-save") kld_save = next();
+        else if (a == "--kv") {
+            const std::string v = next();
+            if (v != "auto" && v != "f16" && v != "q8") {
+                std::fprintf(stderr, "--kv: auto, f16 or q8\n");
+                return 2;
+            }
+            o.kv = v == "auto" ? -1 : v == "q8" ? 1 : 0;
+        }
+        else if (a == "--encode-image") enc_rgb = next();
+        else if (a == "--size") enc_size = next();
+        else if (a == "--dump-image") enc_out = next();
         else if (a == "-v" || a == "--verbose") o.verbose = true;
         else {
             std::fprintf(stderr, "unknown argument %s\n", a.c_str());
@@ -761,6 +1023,11 @@ int main(int argc, char** argv) {
         return 2;
     }
     if (bench_layer >= 0) return bench_lane(o.pack, bench_layer, bench_n, bench_t);
+    if (!enc_rgb.empty()) return encode_alone(o, enc_rgb, enc_size, enc_out);
+    if (!images.empty()) {
+        o.vision = true;
+        o.vision_auto = false;
+    }
     hy4::Model m;
     std::string err;
     if (!m.load(o, err)) {
@@ -770,11 +1037,22 @@ int main(int argc, char** argv) {
     for (const auto& l : m.info_lines()) std::fprintf(stderr, "%s\n", l.c_str());
     if (eos.empty()) eos.push_back(m.eos());
     if (serving) return serve(m, eos, n_draft, floor);
-    if (!kld.empty()) return run_kld(m, kld, chunks);
+    if (!kld.empty()) return run_kld(m, kld, chunks, kld_save);
     std::vector<int> ids = parse_ids(ids_arg);
     if (ids.empty()) {
         std::fprintf(stderr, "maya-hy4: no prompt (--ids)\n");
         return 2;
+    }
+    if (!images.empty()) {   // --images: a GENI file's pictures, for the prompt's spans
+        std::vector<Pic> pics;
+        std::vector<hy4::Model::Image> rows;
+        const double ti = now();
+        if (!read_pics(images, pics, err) || !picture_rows(m, pics, ids, 0, rows, err)) {
+            std::fprintf(stderr, "maya-hy4: %s\n", err.c_str());
+            return 1;
+        }
+        std::fprintf(stderr, "pictures: %zu encoded in %.0f ms\n", pics.size(), 1e3 * (now() - ti));
+        m.set_images(std::move(rows));
     }
     std::vector<float> logits((size_t) m.vocab());
     const double t0 = now();

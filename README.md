@@ -79,7 +79,7 @@ turboderp's and LibertAIDAI's EXL3 quants of DeepSeek, orcarouter's abliterated 
 turboderp's EXL3 quants of GLM, Qwen-3.8-Flash-Next (CYBER-FROST) as its Q5_K_M GGUF and Qwen-3.8-Flash-Next
 itself as unsloth's UD-IQ2_XS GGUF, both with pictures
 ([its settings](docs/SETTINGS.md#qwen-38-flash-next-cyber-frost)), and Tencent's Hy4-flash as AngelSlim's Q4_K_M GGUF
-on an engine of its own (NVIDIA RTX 30 / A100 and newer, Linux, text only: `./maya.sh --setup --model hy4-flash`;
+on an engine of its own (NVIDIA RTX 30 / A100 and newer, Linux, with pictures: `./maya.sh --setup --model hy4-flash`;
 [its settings](docs/SETTINGS.md#hy4-flash)). **Each model's files, drafters, pictures and options:
 [docs/MODELS.md](docs/MODELS.md).**
 

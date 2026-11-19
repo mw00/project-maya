@@ -262,6 +262,108 @@ void test_attention() {
         cudaFree(dk);
         cudaFree(dnk);
     }
+    {   // the 8-bit cache (--kv q8): the latent within half a step of its values, the rotated part F16's, read back by
+        // kv_deq; the attention over them the reference's over the dequantized rows (window ring and key list), and
+        // near the F16 cache's
+        const size_t rb = hy4::k::kv_q8_row_bytes(KL, R);
+        CHECK(rb == 672);
+        uint16_t *q8r, *q8f, *deq;
+        cudaMalloc(&q8r, rb * ring);
+        cudaMalloc(&q8f, rb * (size_t) (p0 + T));
+        cudaMalloc(&deq, sizeof(uint16_t) * (size_t) n_all * KR);
+        hy4::k::kv_store(dkv, n_all, KL, R, dw, eps, dpos_all, base, q8r, ring, 0, true);
+        hy4::k::kv_store(dkv, n_all, KL, R, dw, eps, dpos_all, base, q8f, 0, 0, true);
+        // the ring's rows (the last `ring` positions) and the full cache's, as F16
+        const int nr = std::min(ring, n_all), r0 = first + n_all - nr;
+        hy4::k::kv_deq(q8r, ring, KL, R, r0, nr, deq, 0);
+        std::vector<uint16_t> dr = host(deq, (size_t) nr * KR);
+        hy4::k::kv_deq(q8f, 0, KL, R, first, n_all, deq, 0);
+        std::vector<uint16_t> df = host(deq, (size_t) n_all * KR);
+        std::vector<double> rows8((size_t) n_all * KR);
+        double worst = 0, same = 0, rope = 0;
+        for (int i = 0; i < n_all; ++i)
+            for (int b = 0; b < KR / 32; ++b) {
+                double am = 0;
+                for (int d = 32 * b; d < 32 * b + 32; ++d) am = std::max(am, std::fabs(rows[(size_t) i * KR + d]));
+                for (int d = 32 * b; d < 32 * b + 32; ++d) {
+                    __half hv;
+                    std::memcpy(&hv, &df[(size_t) i * KR + d], 2);
+                    rows8[(size_t) i * KR + d] = h2f(hv);
+                    if (d >= KL) rope = std::max(rope, std::fabs(h2f(hv) - rows[(size_t) i * KR + d]));
+                    // (the F16 reference row's own rounding: a 2^-11 of the value more)
+                    worst = std::max(worst, std::fabs(h2f(hv) - rows[(size_t) i * KR + d]) /
+                                                (am / 127.0 * 0.5 + std::fabs(rows[(size_t) i * KR + d]) / 1024.0 + 1e-6));
+                    if (i >= n_all - nr) {
+                        __half hr;
+                        std::memcpy(&hr, &dr[(size_t) (i - (n_all - nr)) * KR + d], 2);
+                        same = std::max(same, std::fabs((double) h2f(hr) - h2f(hv)));
+                    }
+                }
+            }
+        std::printf("  kv_store q8: worst %.2f of half a step; the rotated part F16's (max diff %.1e); ring rows = full "
+                    "rows (max diff %.1e)\n", worst, rope, same);
+        CHECK(worst <= 1.05 && rope < 2e-3 && same == 0.0);
+        auto ref8 = [&](const std::vector<std::vector<int>>& keys) {
+            std::vector<double> o((size_t) T * H * KL, 0.0);
+            for (int t = 0; t < T; ++t)
+                for (int h = 0; h < H; ++h) {
+                    const float* qh = q.data() + ((size_t) t * H + h) * KR;
+                    std::vector<double> sc;
+                    for (int p : keys[(size_t) t]) {
+                        const double* row = rows8.data() + (size_t) (p - first) * KR;
+                        double v = 0;
+                        for (int d = 0; d < KR; ++d) v += qh[d] * row[d];
+                        sc.push_back(v * scale);
+                    }
+                    double m = sinks[(size_t) h];
+                    for (double v : sc) m = std::max(m, v);
+                    double den = std::exp(sinks[(size_t) h] - m);
+                    for (double v : sc) den += std::exp(v - m);
+                    for (size_t k = 0; k < sc.size(); ++k) {
+                        const double pk = std::exp(sc[k] - m) / den;
+                        const double* row = rows8.data() + (size_t) (keys[(size_t) t][k] - first) * KR;
+                        for (int d = 0; d < KL; ++d) o[((size_t) t * H + h) * KL + d] += pk * row[d];
+                    }
+                }
+            return o;
+        };
+        std::vector<int> lo(T), nk(T);
+        std::vector<std::vector<int>> keys(T);
+        for (int t = 0; t < T; ++t) {
+            lo[(size_t) t] = std::max(0, pos[(size_t) t] - n_swa + 1);
+            nk[(size_t) t] = pos[(size_t) t] - lo[(size_t) t] + 1;
+            for (int p = lo[(size_t) t]; p <= pos[(size_t) t]; ++p) keys[(size_t) t].push_back(p);
+        }
+        int *dlo = dev(lo), *dnk = dev(nk);
+        hy4::k::attention(dq, T, H, KL, R, q8r, ring, nullptr, 0, dlo, dnk, n_swa, scale, dsink, ws, out, 0, true);
+        const auto got = host(out, (size_t) T * H * KL);
+        const double e8 = rel(got, ref8(keys)), e16 = rel(got, ref(keys));
+        std::printf("  attention q8, window ring: rel %.2e to its rows, %.2e to the F16 cache's\n", e8, e16);
+        CHECK(e8 < 1e-5 && e16 < 2e-2);
+        const int ldk = n_all;   // (a key list: every second position of the full cache)
+        std::vector<int> kl((size_t) T * ldk, 0), nk2(T);
+        std::vector<std::vector<int>> keys2(T);
+        for (int t = 0; t < T; ++t) {
+            for (int p = first + (t & 1); p <= pos[(size_t) t]; p += 2) keys2[(size_t) t].push_back(p);
+            nk2[(size_t) t] = (int) keys2[(size_t) t].size();
+            for (size_t k = 0; k < keys2[(size_t) t].size(); ++k) kl[(size_t) t * ldk + k] = keys2[(size_t) t][k];
+        }
+        int *dk = dev(kl), *dnk2 = dev(nk2);
+        float* ws2;
+        cudaMalloc(&ws2, sizeof(float) * hy4::k::attn_ws_floats(T, H, KL, ldk));
+        hy4::k::attention(dq, T, H, KL, R, q8f, 0, dk, ldk, nullptr, dnk2, ldk, scale, dsink, ws2, out, 0, true);
+        const double ek = rel(host(out, (size_t) T * H * KL), ref8(keys2));
+        std::printf("  attention q8, key list: rel %.2e\n", ek);
+        CHECK(ek < 1e-5);
+        cudaFree(ws2);
+        cudaFree(dk);
+        cudaFree(dnk2);
+        cudaFree(dlo);
+        cudaFree(dnk);
+        cudaFree(q8r);
+        cudaFree(q8f);
+        cudaFree(deq);
+    }
     cudaFree(cache);
     cudaFree(dkv);
     cudaFree(dw);
@@ -402,6 +504,39 @@ void test_indexer() {
         }
     std::printf("  ix_score: max rel diff %.2e\n", emax);
     CHECK(emax < 1e-4);
+    {   // --kv q8's F16 rows (value | gate ring, pooled keys): the pooled values within F16's rounding, the scores
+        // within its effect on them
+        float *p16, *s16, *iv16;
+        cudaMalloc(&p16, sizeof(uint16_t) * (n_pos / KP) * D);
+        cudaMalloc(&s16, sizeof(float) * T * ld);
+        cudaMalloc(&iv16, sizeof(uint16_t) * (size_t) n_pos * 2 * D);
+        std::vector<int> all_p((size_t) n_pos);
+        for (int i = 0; i < n_pos; ++i) all_p[(size_t) i] = i;
+        int* dall = dev(all_p);
+        hy4::k::store_rows(divg, n_pos, 2 * D, iv16, n_pos, dall, 0, true);   // (the F32 rows as the ring's F16)
+        hy4::k::ix_pool(iv16, n_pos, 0, n_pos / KP, KP, D, dape, dw, eps, R, base, p16, 0, true);
+        hy4::k::ix_score(dq, dwt, T, IH, D, p16, dpos, KP, n_pool, s16, ld, 0, true);
+        const std::vector<uint16_t> h16 = host((const uint16_t*) p16, (size_t) (n_pos / KP) * D);
+        std::vector<float> pf(h16.size());
+        for (size_t i = 0; i < h16.size(); ++i) {
+            __half hv;
+            std::memcpy(&hv, &h16[i], 2);
+            pf[i] = h2f(hv);
+        }
+        const std::vector<float> s2 = host(s16, (size_t) T * ld);
+        double es = 0;
+        for (int t = 0; t < T; ++t)
+            for (int gi = 0; gi < pos[(size_t) t] / KP; ++gi)
+                es = std::max(es, (double) std::fabs(s2[(size_t) t * ld + gi] - sc[(size_t) t * ld + gi]) /
+                                      std::max(1.0, (double) std::fabs(sc[(size_t) t * ld + gi])));
+        const double e16 = rel(pf, rp);
+        std::printf("  ix_pool f16: rel %.2e; ix_score over them: max rel diff %.2e\n", e16, es);
+        CHECK(e16 < 2e-3 && es < 1e-2);
+        cudaFree(p16);
+        cudaFree(s16);
+        cudaFree(iv16);
+        cudaFree(dall);
+    }
     // ties: the second token's first 20 scores copied to pools 100 .. 119 (equal scores, some near the threshold)
     for (int gi = 0; gi < 20; ++gi) sc[(size_t) 1 * ld + gi + 100] = sc[(size_t) 1 * ld + gi];
     cudaMemcpy(score, sc.data(), sc.size() * sizeof(float), cudaMemcpyHostToDevice);

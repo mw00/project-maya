@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Project Maya - set up and start GLM-5.3 (744B), GLM-5.3-Flash, DeepSeek-V4.1-Flash-1017, MiniMax-M3.1-Flash or Qwen-3.8-Flash-Next
 (CYBER-FROST) on your own GPU(s).  Qwen-3.8-Flash-Next (CYBER-FROST): CUDA from V100 on and HIP, Linux and Windows, pictures too.
-Hy4-flash: CUDA from RTX 30 / A100 on, Linux, text only.
+Hy4-flash: CUDA from RTX 30 / A100 on, Linux, pictures too.
 GLM-5.3-Flash: CUDA on Linux and Windows; HIP: gfx1100/gfx1201/gfx1151 (gfx1030: experimental, not
 validated), Linux and Windows, text only; Metal: experimental, macOS on Apple Silicon, GLM-5.3-Flash only, text only,
 one conversation at a time.  DeepSeek-V4.1-Flash-1017 and MiniMax-M3.1-Flash: CUDA from V100 on, Linux
@@ -782,14 +782,17 @@ QWEN_QUANTS = ("q5_k_m", QWEN_UD)
 # Q4_K_M GGUF (tools/hy4/download.json: pinned, sha256-checked), on its own engine maya-hy4 (NVIDIA, Linux): tensor
 # parallel over the equal GPUs (the fastest GPU holds the head and the drafts), else the layers split; the experts VRAM
 # does not hold computed on the CPU.  Its template thinks at one level (high) or not at all (no_think); its sampling
-# is its generation_config.json's (maya_quants.MODEL_DEFAULTS["hy4"]).  Text only.
+# is its generation_config.json's (maya_quants.MODEL_DEFAULTS["hy4"]).  Pictures: its vision tower (AngelSlim's
+# mmproj file, downloaded with the model unless --no-vision) runs in the engine on the main GPU.
 HY4 = "Hy4-flash"                                  # (its id: the folder, the installer record, --model)
 HY4_SHOWN = Q.SHOWN["hy4"]
 HY4_MANIFEST = ROOT / "tools" / "hy4" / "download.json"
 HY4_PACK_TOOLS = ("tools/hy4/pack_gguf.py", "tools/ds4/pack_gguf.py", "tools/strata_tokenizer.py")
 HY4_PACK = "maya-hy4"                              # (the pack's folder in the model's: hy4.txt, tensors.txt, tokenizer/)
 HY4_MODEL_NAME = "hy4-flash"
-HY4_CONTEXTS = [32768, 65536, 131072]              # (run end to end up to 128K; the model's own reach: 1M)
+# (run end to end up to 256K - above what F16 rows fit, the engine's --kv auto keeps a tensor-parallel group's cache in
+#  Q8_0 rows; the model's own reach: 1M)
+HY4_CONTEXTS = [32768, 65536, 131072, 262144]
 HY4_DEFAULT_CONTEXT = 65536
 HY4_MIN_CC = 80                                    # (maya-hy4 has run on RTX 30 and RTX 50 cards: Ampere on)
 # its cache a context token: the 13 layers that keep every position (the 12 indexed ones and the MTP block) - the latent
@@ -1940,7 +1943,8 @@ def choose_family(a, prev: dict) -> str:
              f"({hy4_entry()['download_gb']:.0f} GB); NVIDIA RTX 30 / A100 and newer, Linux; about "
              f"{hy4_entry()['memory_gb']:.0f} GB of VRAM and RAM together{here}; tensor parallel across equal GPUs "
              "(the fastest one holds the head and the drafts), the experts that do not fit computed on the CPU; tool "
-             "calls, thinking on or off, MTP drafting, up to a 128K context; text only.")]
+             "calls, thinking on or off, MTP drafting, up to a 256K context; pictures (its vision tower, "
+             f"{hy4_entry()['vision_gb']:.0f} GB more; --no-vision: text only).")]
     keys = ("glm", "glm53") + FAMILIES[1:]             # (the rows: GLM-5.3 (744B) is its own row of the "glm" family)
     was53 = default == "glm" and bool(prev) and G53.config_is_glm_dsa(prev)
     pick = keys[choose("Model?", ["Which model to set up:"], rows, keys.index("glm53" if was53 else default), a.yes)]
@@ -8448,16 +8452,21 @@ def set_up_qwen(a, prev: dict) -> Path | None:
 
 
 # ------------------------------------------------------------------------------------------------ Hy4-flash
-def hy4_entry() -> dict:
-    """Hy4-flash's download (tools/hy4/download.json) as a MODELS entry (offer_download's form)."""
+def hy4_entry(vision: bool = True) -> dict:
+    """Hy4-flash's download (tools/hy4/download.json) as a MODELS entry (offer_download's form): the model's shards,
+    and its vision tower's mmproj file unless `vision` is False ("vision": that file's names)."""
     man = read_json(HY4_MANIFEST)
     if not man.get("files") or not man.get("revision"):
         fail(f"{HY4_MANIFEST} is missing or damaged", "restore it (git checkout tools/hy4/download.json)")
-    return {"about": f"{HY4} in AngelSlim's GGUF ({man.get('about', 'Q4_K_M')}); "
-                     f"{man.get('license', 'the repo license applies')}",
+    vis = dict(man.get("vision") or {}) if vision else {}
+    files = {**man["files"], **vis}
+    return {"about": f"{HY4} in AngelSlim's GGUF ({man.get('about', 'Q4_K_M')})" +
+                     (", and its vision tower (mmproj, BF16)" if vis else "") +
+                     f"; {man.get('license', 'the repo license applies')}",
             "format": "hy4-gguf", "repo": man["repo"], "revision": man["revision"], "folder": "",
-            "files": {k: v[0] for k, v in man["files"].items()}, "sha256": {k: v[1] for k, v in man["files"].items()},
-            "download_gb": sum(v[0] for v in man["files"].values()) / 1e9,
+            "files": {k: v[0] for k, v in files.items()}, "sha256": {k: v[1] for k, v in files.items()},
+            "download_gb": sum(v[0] for v in files.values()) / 1e9, "vision": list(vis),
+            "vision_gb": sum(v[0] for v in (man.get("vision") or {}).values()) / 1e9,
             "engram_gb": float(man.get("engram_gb") or 63),
             "memory_gb": float(man.get("memory_gb") or 170)}
 
@@ -8487,10 +8496,11 @@ def hy4_dir(a, models: Path, prev: dict) -> Path:
 
 
 def hy4_model_step(a, d: Path) -> list | None:
-    """The model's two GGUF shards in d (downloaded when they are not there, then checked against their published
-    sha256 - once a file), or None when nothing was downloaded."""
+    """The model's two GGUF shards in d and its vision tower's mmproj file (not with --no-vision) - downloaded when
+    they are not there, then checked against their published sha256 (once a file) - or None when nothing was
+    downloaded."""
     step(5, f"the model ({Q.shown('hy4', 'q4_k_m')})")
-    m = hy4_entry()
+    m = hy4_entry(not a.no_vision)
     files = [d / n for n in m["files"]]
     missing = [f for f in files if file_incomplete(m, f)]
     if missing and not offer_download(a, Q.shown("hy4", "q4_k_m", m["download_gb"]), d, files, m):
@@ -8499,23 +8509,44 @@ def hy4_model_step(a, d: Path) -> list | None:
         if not sha256_checked(f, m["sha256"][f.name]):
             fail(f"{f.name}: the sha256 does not match the published one - still being downloaded, or damaged",
                  f"let the download finish, or delete the file and run {ME} --setup --model hy4-flash --download-model")
-    ok(f"{Q.shown('hy4', 'q4_k_m')}: {sum(f.stat().st_size for f in files) / 1e9:.1f} GB in {d}")
+    ok(f"{Q.shown('hy4', 'q4_k_m')}: {sum(f.stat().st_size for f in files) / 1e9:.1f} GB in {d}" +
+       (" (with the vision tower)" if m["vision"] else ""))
     if rotational(d):
         warn(f"{d} is on a spinning hard disk: the engine reads the Engram table ({m['engram_gb']:.0f} GB) from the "
              "files on every token where RAM does not hold it - use an NVMe SSD (--models-dir)")
     return files
 
 
+def hy4_vision_file(d: Path) -> Path | None:
+    """The vision tower's mmproj file in the model's folder (download.json's), or None."""
+    for n in hy4_entry()["vision"]:
+        if (d / n).is_file():
+            return d / n
+    return None
+
+
+def hy4_pack_has_vision(pack: Path) -> bool:
+    """The pack indexes the vision tower (hy4.txt's vision.* keys)."""
+    try:
+        return any(ln.startswith("vision.dim ") for ln in (pack / "hy4.txt").read_text(encoding="utf-8").splitlines())
+    except OSError:
+        return False
+
+
 def hy4_pack_step(a, d: Path, files: list) -> Path:
     """tools/hy4/pack_gguf.py's pack in <model>/maya-hy4: the geometry (hy4.txt), where every tensor sits in the files
-    (tensors.txt), the Engram hash table and the tokenizer with the GGUF's chat template - built again when its tools
-    or the model files changed."""
+    (tensors.txt) - the vision tower's mmproj file's too when it is in the folder -, the Engram hash table and the
+    tokenizer with the GGUF's chat template - built again when its tools or the model files changed."""
     step(6, "the pack (the engine's index of the model files)")
     pack = d / HY4_PACK
     tools = S.source_hash(HY4_PACK_TOOLS)
     need = ("hy4.txt", "tensors.txt", "tokenizer/vocab.json", "tokenizer/chat_template.jinja")
+    vis = hy4_vision_file(d)
+    shards = [f for f in files if vis is None or f != vis]
+    every = shards + ([vis] if vis is not None else [])
     if not a.repack and read_json(pack / PACK_SOURCES).get("tools") == tools and \
-            all((pack / f).exists() for f in need) and pack_stale(pack, files) is None:
+            all((pack / f).exists() for f in need) and pack_stale(pack, every) is None and \
+            hy4_pack_has_vision(pack) == (vis is not None):
         ok(f"pack already built: {pack}")
         return pack
     if not os.access(d, os.W_OK):
@@ -8523,11 +8554,11 @@ def hy4_pack_step(a, d: Path, files: list) -> Path:
     say("  Writing the index of every tensor, the Engram hash table and the tokenizer; the weights stay in the GGUF")
     say("  files (a minute or two) ...")
     run([sys.executable, str(ROOT / "tools" / "hy4" / "pack_gguf.py"), "--model", str(d),
-         "--files", *[f.name for f in files], "--out", str(pack)])
+         "--files", *[f.name for f in shards], "--mmproj", vis.name if vis is not None else "none", "--out", str(pack)])
     missing = [f for f in need if not (pack / f).exists()]
     if missing:
         fail(f"the pack builder did not write {pack / missing[0]}", "the reason is in the messages above")
-    stamp_pack(pack, files)
+    stamp_pack(pack, every)
     rec = read_json(pack / PACK_SOURCES)
     rec["tools"] = tools
     (pack / PACK_SOURCES).write_text(json.dumps(rec, indent=1), encoding="utf-8")
@@ -8548,6 +8579,10 @@ def write_config_hy4(a, pc: dict, meta: dict, pack: Path, ctx: int, models: Path
     args = ["--pack", str(pack), "--max-context", str(ctx)] + (["--mtp"] if drafting else [])
     kept = keep_args(old.get("args") or [], args, ("--tp", "--main-gpu", "--chunk", "--reserve-gb", "--vram-experts",
                                                    "--profile", "--draft", "--draft-floor"))
+    # pictures: on whenever the pack has the vision tower (the engine's default - no flag); a setup again turns them on
+    # (a config's --vision off is not kept), --no-vision writes --vision off (its room on the main GPU to the model)
+    if a.no_vision and hy4_pack_has_vision(pack):
+        args += ["--vision", "off"]
     inst = {"family": "hy4", "quant": HY4, "hy4_quant": "q4_k_m", "drafting": "on" if drafting else "off"}
     sampling, effort = Q.model_defaults({"installer": inst})   # (the model's own, every setup: its card's)
     cfg = {"exe": str(HY4_EXE), "args": args, "cwd": str(ROOT), "tokenizer": str(pack / "tokenizer"),
@@ -8612,8 +8647,16 @@ def set_up_hy4(a, prev: dict) -> Path | None:
     if files is None:
         return None
     pack = hy4_pack_step(a, d, files)                  # 6
-    step(7, "pictures")                                # 7
-    ok(f"{HY4} reads text only: no image encoder to set up")
+    step(7, "images (the vision tower)")               # 7
+    if not hy4_pack_has_vision(pack):
+        ok("pictures: off (--no-vision): the model reads text only" if a.no_vision else
+           "no vision tower in this pack: the model reads text only")
+    elif a.no_vision:
+        ok("pictures: off (--no-vision; the pack has the vision tower: Images on the Models page turns them on)")
+    else:
+        ok("pictures: ON - the model's own vision tower runs in the engine on the main GPU; its weights stay in RAM, a "
+           "picture's room (under 1 GB) is kept free there; the server resizes the pictures, the Chat's picture button "
+           "is shown")
     return write_config_hy4(a, pc, meta, pack, ctx, models, d, drafting)   # 8
 
 

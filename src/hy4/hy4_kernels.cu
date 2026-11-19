@@ -82,11 +82,12 @@ __global__ void copy_cols_kernel(const float* __restrict__ src, size_t lds, floa
     const size_t r = i / n, c = i % n;
     dst[r * ldd + c] = src[r * lds + c];
 }
-__global__ void store_rows_kernel(const float* __restrict__ src, int n, float* __restrict__ ring, int R,
+template <typename D>
+__global__ void store_rows_kernel(const float* __restrict__ src, int n, D* __restrict__ ring, int R,
                                   const int* __restrict__ pos) {
     const int t = blockIdx.y;
     for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x)
-        ring[(size_t) (pos[t] % R) * n + i] = src[(size_t) t * n + i];
+        ring[(size_t) (pos[t] % R) * n + i] = (D) src[(size_t) t * n + i];
 }
 
 // ---------------------------------------------------------------- F32 / BF16 GEMV: a warp a row, up to 8 columns a pass
@@ -454,16 +455,59 @@ __global__ void kv_store_kernel(const float* __restrict__ kv, int kv_lora, int n
     }
 }
 
+// ... in Q8_0 rows (kv_q8_row_bytes): the row's values staged in shared memory, then each block of 32 of the latent by
+// a warp - its largest magnitude / 127 the F16 scale, every value rounded to an int8 of it (ggml's Q8_0 rounding; the
+// values the F16 kernel stores, before their F16 rounding); the rotated part as F16 after the scales
+__global__ void kv_store_q8_kernel(const float* __restrict__ kv, int kv_lora, int n_rot, const float* __restrict__ w,
+                                   float eps, const int* __restrict__ pos, float base, uint8_t* __restrict__ cache,
+                                   int ring, int rb) {
+    __shared__ float v[1024];
+    const int t = blockIdx.x, row = kv_lora + n_rot;
+    const float* x = kv + (size_t) t * row;
+    const int p = pos[t];
+    uint8_t* dst = cache + (size_t) (ring > 0 ? p % ring : p) * rb;
+    float ss = 0.0f;
+    for (int i = threadIdx.x; i < kv_lora; i += blockDim.x) ss += x[i] * x[i];
+    ss = block_sum(ss);
+    const float r = 1.0f / sqrtf(ss / (float) kv_lora + eps);
+    for (int i = threadIdx.x; i < kv_lora; i += blockDim.x) v[i] = x[i] * r * w[i];
+    for (int i = threadIdx.x; i < n_rot / 2; i += blockDim.x) {
+        float a = x[kv_lora + 2 * i], b = x[kv_lora + 2 * i + 1];
+        rope_pair(a, b, (float) p, i, n_rot, base);
+        v[kv_lora + 2 * i] = a;
+        v[kv_lora + 2 * i + 1] = b;
+    }
+    __syncthreads();
+    const int wp = threadIdx.x >> 5, lane = threadIdx.x & 31, nw = blockDim.x >> 5;
+    __half* sc = (__half*) (dst + kv_lora);
+    __half* rp = sc + kv_lora / 32;
+    for (int i = threadIdx.x; i < n_rot; i += blockDim.x) rp[i] = __float2half_rn(v[kv_lora + i]);
+    for (int b = wp; b < kv_lora / 32; b += nw) {
+        const float x0 = v[32 * b + lane];
+        float am = fabsf(x0);
+        for (int o = 16; o > 0; o >>= 1) am = fmaxf(am, __shfl_xor_sync(0xffffffffu, am, o));
+        const __half dh = __float2half_rn(am / 127.0f);
+        const float d = __half2float(dh);
+        const int q = d > 0.0f ? max(-127, min(127, __float2int_rn(x0 / d))) : 0;
+        dst[32 * b + lane] = (uint8_t) (int8_t) q;
+        if (lane == 0) sc[b] = dh;
+    }
+    for (int i = kv_lora + kv_lora / 16 + 2 * n_rot + threadIdx.x; i < rb; i += blockDim.x) dst[i] = 0;   // (its pad)
+}
+
 // ---------------------------------------------------------------- MLA attention over the latent cache
 // grid (chunks, ceil(H / 8), T); a warp a head, the chunk's keys in tiles of 32 rows through shared memory.  A row is
 // 576 F16 = 288 words; lane l reads the words l + 32 i (bank l: no conflicts): q's dims 2 (l + 32 i) and the next, the
 // value's (i < 8) the same.  Partial (m, l, acc[512]) a (t, head, chunk) -> attn_combine.
 constexpr int kKC = 128, kKCmin = 32, kTile = 32;   // (a chunk's keys: kKC, or kKCmin for a few tokens - decode)
 constexpr int kRowW = 288;   // words a row (kv_lora 512 + rope 64, F16)
-__global__ void __launch_bounds__(256) attn_kernel(const float* __restrict__ q, int H, const __half2* __restrict__ cache,
+// (Q8: the cache's Q8_0 rows of rb bytes - the latent's int8 values, its 16 blocks' F16 scales, the rotated part's F16
+// values -, dequantized to F16 as the tile is loaded: the same arithmetic after it)
+template <bool Q8>
+__global__ void __launch_bounds__(256) attn_kernel(const float* __restrict__ q, int H, const void* __restrict__ cache_v,
                                                    int ring, const int* __restrict__ keys, int ldk,
                                                    const int* __restrict__ lo, const int* __restrict__ nk, float scale,
-                                                   int nchunk, int kc, float* __restrict__ ws) {
+                                                   int nchunk, int kc, float* __restrict__ ws, int rb) {
     __shared__ __half2 tile[kTile][kRowW];
     __shared__ int rows[kTile];
     const int c = blockIdx.x, t = blockIdx.z, w = threadIdx.x >> 5, lane = threadIdx.x & 31;
@@ -491,7 +535,18 @@ __global__ void __launch_bounds__(256) attn_kernel(const float* __restrict__ q, 
         __syncthreads();
         for (int i = threadIdx.x; i < nt * kRowW; i += blockDim.x) {
             const int r = i / kRowW, col = i % kRowW;
-            tile[r][col] = cache[(size_t) rows[r] * kRowW + col];
+            if (Q8) {
+                const uint8_t* rp = (const uint8_t*) cache_v + (size_t) rows[r] * rb;
+                if (col < 256) {
+                    const char2 qv = *(const char2*) (rp + 2 * col);
+                    const float d = __half2float(*(const __half*) (rp + 512 + 2 * (col >> 4)));
+                    tile[r][col] = __floats2half2_rn(d * (float) qv.x, d * (float) qv.y);
+                } else {
+                    tile[r][col] = *(const __half2*) (rp + 544 + 4 * (col - 256));
+                }
+            } else {
+                tile[r][col] = ((const __half2*) cache_v)[(size_t) rows[r] * kRowW + col];
+            }
         }
         __syncthreads();
         if (h >= H) continue;
@@ -881,6 +936,23 @@ __global__ void dsa_mask_kernel(const int* __restrict__ keys, int ldk, const int
         if (j >= 0 && j < nkr) mr[j] = 0.0f;
     }
 }
+// Q8_0 rows (rb bytes) -> F16 rows of kv_lora + n_rot values, a thread a value pair
+__global__ void kv_deq_kernel(const uint8_t* __restrict__ cache, int ring, int kv_lora, int n_rot, int rb, int k0, int n,
+                              __half2* __restrict__ dst) {
+    const size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
+    const int half_row = (kv_lora + n_rot) / 2;
+    if (i >= (size_t) n * half_row) return;
+    const int j = (int) (i / half_row), c = (int) (i % half_row);
+    const int q = k0 + j;
+    const uint8_t* rp = cache + (size_t) (ring > 0 ? q % ring : q) * rb;
+    if (2 * c < kv_lora) {
+        const char2 qv = *(const char2*) (rp + 2 * c);
+        const float d = __half2float(*(const __half*) (rp + kv_lora + 2 * (c >> 4)));
+        dst[i] = __floats2half2_rn(d * (float) qv.x, d * (float) qv.y);
+    } else {
+        dst[i] = *(const __half2*) (rp + kv_lora + kv_lora / 16 + 2 * (2 * c - kv_lora));
+    }
+}
 __global__ void kv_gather_kernel(const uint4* __restrict__ cache, int ring, int row16, int k0, int n,
                                  uint4* __restrict__ dst) {
     const size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
@@ -1104,15 +1176,16 @@ __global__ void engram_mix_kernel(float* __restrict__ x, const float* __restrict
 
 // ---------------------------------------------------------------- the indexer
 // a block (dim threads) a new group
-__global__ void ix_pool_kernel(const float* __restrict__ ivg, int ring, int g0, int kpool, int dim,
+template <typename P, typename V>   // (the pooled keys' and the value | gate ring's types: float, or __half with --kv q8)
+__global__ void ix_pool_kernel(const V* __restrict__ ivg, int ring, int g0, int kpool, int dim,
                                const float* __restrict__ ape, const float* __restrict__ w, float eps, int n_rot,
-                               float base, float* __restrict__ pooled) {
+                               float base, P* __restrict__ pooled) {
     __shared__ float sv[1024];
     const int g = g0 + blockIdx.x, c = threadIdx.x;
     float lg[8], mx = -INFINITY;
     for (int k = 0; k < kpool; ++k) {
         const int p = g * kpool + k;
-        lg[k] = ivg[(size_t) (p % ring) * 2 * dim + dim + c] + ape[(size_t) k * dim + c];
+        lg[k] = (float) ivg[(size_t) (p % ring) * 2 * dim + dim + c] + ape[(size_t) k * dim + c];
         mx = fmaxf(mx, lg[k]);
     }
     float den = 0.0f, num = 0.0f;
@@ -1120,7 +1193,7 @@ __global__ void ix_pool_kernel(const float* __restrict__ ivg, int ring, int g0, 
         const int p = g * kpool + k;
         const float e = expf(lg[k] - mx);
         den += e;
-        num += e * ivg[(size_t) (p % ring) * 2 * dim + c];
+        num += e * (float) ivg[(size_t) (p % ring) * 2 * dim + c];
     }
     const float v = num / den;
     const float ss = block_sum(v * v);
@@ -1134,11 +1207,18 @@ __global__ void ix_pool_kernel(const float* __restrict__ ivg, int ring, int g0, 
         sv[c + 1] = b;
     }
     __syncthreads();
-    pooled[(size_t) g * dim + c] = sv[c];
+    pooled[(size_t) g * dim + c] = (P) sv[c];
 }
 // grid (ceil(n_pool / 256), T): a thread a pool
+__device__ __forceinline__ float4 pooled4(const float* p, int i) { return ((const float4*) p)[i]; }
+__device__ __forceinline__ float4 pooled4(const __half* p, int i) {
+    const uint2 u = ((const uint2*) p)[i];
+    const float2 a = __half22float2(*(const __half2*) &u.x), b = __half22float2(*(const __half2*) &u.y);
+    return make_float4(a.x, a.y, b.x, b.y);
+}
+template <typename P>
 __global__ void __launch_bounds__(256) ix_score_kernel(const float* __restrict__ q, const float* __restrict__ wt,
-                                                       int heads, int dim, const float* __restrict__ pooled,
+                                                       int heads, int dim, const P* __restrict__ pooled,
                                                        const int* __restrict__ pos, int kpool, int n_pool,
                                                        float* __restrict__ score, size_t ld) {
     extern __shared__ float sq[];   // [heads][dim], then wt[heads]
@@ -1153,9 +1233,9 @@ __global__ void __launch_bounds__(256) ix_score_kernel(const float* __restrict__
         float acc[16];
 #pragma unroll
         for (int h = 0; h < 16; ++h) acc[h] = 0.0f;
-        const float4* pk = (const float4*) (pooled + (size_t) g * dim);
+        const P* pk = pooled + (size_t) g * dim;
         for (int i = 0; i < dim / 4; ++i) {
-            const float4 kk = pk[i];
+            const float4 kk = pooled4(pk, i);
 #pragma unroll
             for (int h = 0; h < 16; ++h)
                 if (h < heads) {
@@ -1290,9 +1370,13 @@ void copy_cols(const float* src, size_t lds, float* dst, size_t ldd, int rows, i
     copy_cols_kernel<<<(unsigned) ((total + 255) / 256), 256, 0, s>>>(src, lds, dst, ldd, n, total);
     check("copy_cols");
 }
-void store_rows(const float* src, int T, int n, float* ring, int R, const int* pos, cudaStream_t s) {
+void store_rows(const float* src, int T, int n, float* ring, int R, const int* pos, cudaStream_t s, bool f16) {
     if (T <= 0) return;
-    store_rows_kernel<<<dim3((unsigned) ((n + 255) / 256), (unsigned) T), 256, 0, s>>>(src, n, ring, R, pos);
+    if (f16)
+        store_rows_kernel<__half><<<dim3((unsigned) ((n + 255) / 256), (unsigned) T), 256, 0, s>>>(src, n, (__half*) ring,
+                                                                                                R, pos);
+    else
+        store_rows_kernel<float><<<dim3((unsigned) ((n + 255) / 256), (unsigned) T), 256, 0, s>>>(src, n, ring, R, pos);
     check("store_rows");
 }
 void gemv_f32w(const float* W, size_t ld, int k, int n, const float* x, size_t ldx, int ncol, float* y, size_t ldy,
@@ -1362,9 +1446,23 @@ void rope(float* x, int T, int nh, size_t ld, size_t ldt, int off, int n_rot, co
     rope_kernel<<<dim3((unsigned) ((n + 255) / 256), (unsigned) T), 256, 0, s>>>(x, nh, ld, ldt, off, n_rot, pos, base);
     check("rope");
 }
+size_t kv_q8_row_bytes(int kv_lora, int n_rot) {
+    return ((size_t) kv_lora + (size_t) kv_lora / 16 + 2 * (size_t) n_rot + 15) / 16 * 16;
+}
 void kv_store(const float* kv, int T, int kv_lora, int n_rot, const float* w, float eps, const int* pos, float base,
-              uint16_t* cache, int ring, cudaStream_t s) {
-    kv_store_kernel<<<T, 256, 0, s>>>(kv, kv_lora, n_rot, w, eps, pos, base, (__half*) cache, ring);
+              uint16_t* cache, int ring, cudaStream_t s, bool q8) {
+    const int row = kv_lora + n_rot;
+    if (q8 && (kv_lora % 32 || n_rot % 2 || row > 1024)) {
+        std::fprintf(stderr, "maya-hy4 kv_store: a Q8_0 row of %d + %d values (whole blocks of 32, at most 1024)\n",
+                     kv_lora, n_rot);
+        g_err.fetch_add(1);
+        return;
+    }
+    if (q8)
+        kv_store_q8_kernel<<<T, 256, 0, s>>>(kv, kv_lora, n_rot, w, eps, pos, base, (uint8_t*) cache, ring,
+                                             (int) kv_q8_row_bytes(kv_lora, n_rot));
+    else
+        kv_store_kernel<<<T, 256, 0, s>>>(kv, kv_lora, n_rot, w, eps, pos, base, (__half*) cache, ring);
     check("kv_store");
 }
 size_t attn_ws_floats(int T, int H, int kv_lora, int max_keys) {
@@ -1374,7 +1472,7 @@ size_t attn_ws_floats(int T, int H, int kv_lora, int max_keys) {
 }
 void attention(const float* q, int T, int H, int kv_lora, int n_rot, const uint16_t* cache, int ring, const int* keys,
                int ldk, const int* lo, const int* nk, int max_keys, float scale, const float* sinks, float* ws,
-               float* out, cudaStream_t s) {
+               float* out, cudaStream_t s, bool q8) {
     if (kv_lora != 512 || n_rot != 64) {
         std::fprintf(stderr, "maya-hy4 attention: kv_lora %d + rope %d (512 + 64 only)\n", kv_lora, n_rot);
         g_err.fetch_add(1);
@@ -1383,8 +1481,12 @@ void attention(const float* q, int T, int H, int kv_lora, int n_rot, const uint1
     // (every window of the token path - a decode step, a draft's verify window - in chunks of kKCmin: a token's sums are
     // the same whichever window it is in, so drafting does not change a greedy answer)
     const int kc = T <= kMaxWin ? kKCmin : kKC, nchunk = (max_keys + kc - 1) / kc;
-    attn_kernel<<<dim3((unsigned) nchunk, (unsigned) ((H + 7) / 8), (unsigned) T), 256, 0, s>>>(
-        q, H, (const __half2*) cache, ring, keys, ldk, lo, nk, scale, nchunk, kc, ws);
+    const dim3 grid((unsigned) nchunk, (unsigned) ((H + 7) / 8), (unsigned) T);
+    if (q8)
+        attn_kernel<true><<<grid, 256, 0, s>>>(q, H, cache, ring, keys, ldk, lo, nk, scale, nchunk, kc, ws,
+                                               (int) kv_q8_row_bytes(kv_lora, n_rot));
+    else
+        attn_kernel<false><<<grid, 256, 0, s>>>(q, H, cache, ring, keys, ldk, lo, nk, scale, nchunk, kc, ws, 0);
     check("attention");
     attn_combine_kernel<<<dim3((unsigned) H, (unsigned) T), 512, 0, s>>>(H, nchunk, kc, nk, sinks, ws, out);
     check("attn_combine");
@@ -1458,17 +1560,25 @@ void engram_mix(float* x, const float* kv, const float* kv_b, int T, int hc, int
     check("engram_mix");
 }
 void ix_pool(const float* ivg, int ring, int g0, int n, int kpool, int dim, const float* ape, const float* w, float eps,
-             int n_rot, float base, float* pooled, cudaStream_t s) {
+             int n_rot, float base, float* pooled, cudaStream_t s, bool f16) {
     if (n <= 0) return;
-    ix_pool_kernel<<<n, dim, 0, s>>>(ivg, ring, g0, kpool, dim, ape, w, eps, n_rot, base, pooled);
+    if (f16)
+        ix_pool_kernel<__half, __half><<<n, dim, 0, s>>>((const __half*) ivg, ring, g0, kpool, dim, ape, w, eps, n_rot,
+                                                         base, (__half*) pooled);
+    else
+        ix_pool_kernel<float, float><<<n, dim, 0, s>>>(ivg, ring, g0, kpool, dim, ape, w, eps, n_rot, base, pooled);
     check("ix_pool");
 }
 void ix_score(const float* q, const float* wt, int T, int heads, int dim, const float* pooled, const int* pos, int kpool,
-              int n_pool, float* score, size_t ld, cudaStream_t s) {
+              int n_pool, float* score, size_t ld, cudaStream_t s, bool f16) {
     if (n_pool <= 0) return;
     const size_t sh = (size_t) (heads * dim + heads) * sizeof(float);
-    ix_score_kernel<<<dim3((unsigned) ((n_pool + 255) / 256), (unsigned) T), 256, sh, s>>>(q, wt, heads, dim, pooled,
-                                                                                         pos, kpool, n_pool, score, ld);
+    const dim3 grid((unsigned) ((n_pool + 255) / 256), (unsigned) T);
+    if (f16)
+        ix_score_kernel<__half><<<grid, 256, sh, s>>>(q, wt, heads, dim, (const __half*) pooled, pos, kpool, n_pool,
+                                                      score, ld);
+    else
+        ix_score_kernel<float><<<grid, 256, sh, s>>>(q, wt, heads, dim, pooled, pos, kpool, n_pool, score, ld);
     check("ix_score");
 }
 void ix_select(const float* score, size_t ld, int T, const int* pos, int kpool, int top, int* keys, int ldk, int* nk,
@@ -1488,6 +1598,14 @@ void dsa_mask(const int* keys, int ldk, const int* nk, int T, int k0, int nkr, f
     if (T <= 0) return;
     dsa_mask_kernel<<<T, 256, 0, s>>>(keys, ldk, nk, k0, nkr, mask, ldm);
     check("dsa_mask");
+}
+void kv_deq(const uint16_t* cache, int ring, int kv_lora, int n_rot, int k0, int n, uint16_t* dst, cudaStream_t s) {
+    const size_t total = (size_t) n * ((kv_lora + n_rot) / 2);
+    if (total == 0) return;
+    kv_deq_kernel<<<(unsigned) ((total + 255) / 256), 256, 0, s>>>((const uint8_t*) cache, ring, kv_lora, n_rot,
+                                                                 (int) kv_q8_row_bytes(kv_lora, n_rot), k0, n,
+                                                                 (__half2*) dst);
+    check("kv_deq");
 }
 void kv_gather(const uint16_t* cache, int ring, int row, int k0, int n, uint16_t* dst, cudaStream_t s) {
     const int row16 = row * 2 / 16;   // (uint4s a row: 576 F16 = 72)

@@ -366,7 +366,7 @@ function fieldsOf(m, d) {
     <${Num} label="VRAM kept free" value=${d.reserve_mib} ph=${glm ? "700" : "default"} unit="MiB / GPU" on=${(v) => setDraft({reserve_mib: v})}/><//>`;
   if (m.family === "minimax") return mm3Fields(m, d, s, ch, images, gpus);
   if (m.family === "qwen") return qwenFields(m, d, s, ch, gpus);
-  if (m.family === "hy4") return hy4Fields(m, d, s, ch, gpus);
+  if (m.family === "hy4") return hy4Fields(m, d, s, ch, images, gpus);
   if (glm) {
     const ec = AutoOr({label: "Expert cache", k: "expert_cache", d, dflt: 1200, unit: "experts", subLabel: "Experts in the first GPU's pool"});
     const pf = AutoOr({label: "Prompt chunk", k: "prefill", d, dflt: 8192, unit: "tokens", subLabel: "Tokens a prompt is read in at a time"});
@@ -554,17 +554,19 @@ function qwenFields(m, d, s, ch, gpus) {
 // Hy4-flash's (maya-hy4: it stops at a flag it does not know, so only its own are offered; text only).  Its cache's VRAM a
 // context token, on each GPU of a tensor-parallel group: 13 layers keep every position (maya.py's HY4_KV_BYTES)
 const HY4_KV_BYTES = 16640;
-function hy4Fields(m, d, s, ch, gpus) {
+function hy4Fields(m, d, s, ch, images, gpus) {
   const mtp = m.choices.draft.includes("mtp");
   const tpIds = [...new Set(["auto", 0].concat([s.tp, d.tp].filter((t) => t !== "auto" && t != null).map(Number)))];
   return [
     {label: "Model", rows: [
-      contextRow(m, d, ch, {vram: HY4_KV_BYTES}),
+      contextRow(m, d, ch, {vram: HY4_KV_BYTES}, [], Number(d.context) > 131072
+        ? "Where F16 does not fit every GPU of the tensor-parallel group, the engine keeps the cache in 8 bits, about 60% of the memory shown." : null),
       html`<${Row} label="Drafting" flag="--mtp" changed=${ch("draft")}
         hint=${mtp ? "The model's own MTP block drafts a few tokens for the model to check: the same answers, about twice as fast on code. Off decodes token by token."
           : "This pack names no MTP block."}>
         <${Seg} label="Drafting" value=${d.draft} options=${[...(mtp ? [{id: "mtp", label: "MTP"}] : []), {id: "none", label: "Off"}]}
-          onChange=${(v) => setDraft({draft: v})}/><//>`]},
+          onChange=${(v) => setDraft({draft: v})}/><//>`,
+      images]},
     {label: "GPUs and memory", rows: [gpus,
       html`<${Row} label="Tensor parallel" flag="--tp" changed=${ch("tp")}
         hint="Auto: every layer shared by the largest group of equal GPUs, the fastest GPU holding the head and the drafts; where no group fits, the layers split across the GPUs. Off always splits the layers."

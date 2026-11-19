@@ -19,7 +19,8 @@ void q8_heads(const float* x, size_t ldt, size_t ldh, int T, int H, int k, int8_
 /// dst[r * ldd + i] = src[r * lds + i], i < n (rows r < rows)
 void copy_cols(const float* src, size_t lds, float* dst, size_t ldd, int rows, int n, cudaStream_t s);
 /// ring[pos[t] % R] = src[t] (rows of n floats)
-void store_rows(const float* src, int T, int n, float* ring, int R, const int* pos, cudaStream_t s);
+/// (f16: the ring holds F16 values - --kv q8's indexer rows -, n / 2 floats a row)
+void store_rows(const float* src, int T, int n, float* ring, int R, const int* pos, cudaStream_t s, bool f16 = false);
 /// y[c * ldy + r] = sum_i W[r][i] x[c * ldx + i], W F32 or BF16 rows of k (ld elements apart),
 /// c < ncol (any), r < n
 void gemv_f32w(const float* W, size_t ld, int k, int n, const float* x, size_t ldx, int ncol, float* y, size_t ldy,
@@ -52,18 +53,22 @@ void hc_post_norm(float* x, int T, int hc, int E, const float* y, const float* p
 void rope(float* x, int T, int nh, size_t ld, size_t ldt, int off, int n_rot, const int* pos, float base, cudaStream_t s);
 
 /// The latent cache rows of a window: kv [T][kv_lora + rope] (the kv_a output) -> cache row slot(pos) as F16: the first
-/// kv_lora normed (w, eps), the rest rotated at pos (base); slot = pos % ring (ring 0: pos)
+/// kv_lora normed (w, eps), the rest rotated at pos (base); slot = pos % ring (ring 0: pos).  q8: the row in 8 bits
+/// instead - the kv_lora values as int8 in blocks of 32 (ggml's Q8_0 rounding), the blocks' F16 scales, then the
+/// rotated part's values in F16 - kv_q8_row_bytes a row (512 + 64 values: 672 bytes, against F16's 1152)
+size_t kv_q8_row_bytes(int kv_lora, int n_rot);
 void kv_store(const float* kv, int T, int kv_lora, int n_rot, const float* w, float eps, const int* pos, float base,
-              uint16_t* cache, int ring, cudaStream_t s);
+              uint16_t* cache, int ring, cudaStream_t s, bool q8 = false);
 
 /// MLA attention of a window over the latent cache: q [T][H][kv_lora + rope] (the absorbed q_nope, then the rotated
 /// q_pe), the keys of token t either the positions keys[t][0 .. nk[t]) (keys non-null, ldk apart) or the range
 /// [lo[t], lo[t] + nk[t]); cache row of position p: p % ring (ring 0: p).  out [T][H][kv_lora] = softmax(scale q.k,
 /// with the head's sink) . v (v the row's first kv_lora values).  ws: the partial results' scratch (attn_ws_floats).
 size_t attn_ws_floats(int T, int H, int kv_lora, int max_keys);
+/// (q8: the cache's rows are kv_store's Q8_0 rows, dequantized as they are read)
 void attention(const float* q, int T, int H, int kv_lora, int n_rot, const uint16_t* cache, int ring, const int* keys,
                int ldk, const int* lo, const int* nk, int max_keys, float scale, const float* sinks, float* ws,
-               float* out, cudaStream_t s);
+               float* out, cudaStream_t s, bool q8 = false);
 
 /// x *= sigmoid(g), n values
 void sigmoid_mul(float* x, const float* g, size_t n, cudaStream_t s);
@@ -104,12 +109,13 @@ void engram_mix(float* x, const float* kv, const float* kv_b, int T, int hc, int
 
 /// The indexer's pooled keys.  ivg ring [R][2 dim] (each token's value | gate row at slot pos % R): the groups g of
 /// [g0, g0 + n) -> pooled[g] = rope(rmsnorm(sum_k softmax_k(gate_k + ape[k]) value_k) w) at position kpool g
+/// (f16: pooled and the ivg ring hold F16 values - --kv q8's -, their rows half as many floats apart)
 void ix_pool(const float* ivg, int ring, int g0, int n, int kpool, int dim, const float* ape, const float* w, float eps,
-             int n_rot, float base, float* pooled, cudaStream_t s);
+             int n_rot, float base, float* pooled, cudaStream_t s, bool f16 = false);
 /// Each token's scores over the pools it sees (g < nv[t] = pos[t] / kpool): score[t][g] = sum_h relu(q[t][h] . pk[g])
 /// wt[t][h]; -inf beyond.  q [T][heads][dim], wt [T][heads]; score rows ld apart, n_pool columns
 void ix_score(const float* q, const float* wt, int T, int heads, int dim, const float* pooled, const int* pos, int kpool,
-              int n_pool, float* score, size_t ld, cudaStream_t s);
+              int n_pool, float* score, size_t ld, cudaStream_t s, bool f16 = false);
 /// The attention keys of each token: the top min(nv, top) of its scores' pools (their kpool positions each), then its
 /// own group's positions up to itself -> keys[t][0 .. nk[t]), ldk apart
 void ix_select(const float* score, size_t ld, int T, const int* pos, int kpool, int top, int* keys, int ldk, int* nk,
@@ -126,6 +132,8 @@ void attn_softmax(const float* S, size_t ldS, int T, int H, int nkr, int k0, con
 void dsa_mask(const int* keys, int ldk, const int* nk, int T, int k0, int nkr, float* mask, size_t ldm, cudaStream_t s);
 /// dst[j] = the latent cache row of position k0 + j (row p % ring), j < n: a ring's rows in position order
 void kv_gather(const uint16_t* cache, int ring, int row, int k0, int n, uint16_t* dst, cudaStream_t s);
+/// ... from a q8 cache (kv_store's 8-bit rows): dst[j] the F16 row of position k0 + j
+void kv_deq(const uint16_t* cache, int ring, int kv_lora, int n_rot, int k0, int n, uint16_t* dst, cudaStream_t s);
 /// The prompt path.  dst[r][i] = F16(src[r * lds + i]), i < n
 void to_f16(const float* src, size_t lds, int rows, int n, uint16_t* dst, size_t ldd, cudaStream_t s);
 /// A chunk's expert entries sorted by expert for ds4_iq's sets: entry e = t n_used + j of ids; bounds[x .. x + 1] the

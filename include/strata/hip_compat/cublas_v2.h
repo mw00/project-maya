@@ -12,6 +12,9 @@
 #endif
 #include <hipblas/hipblas.h>
 #define CUBLAS_COMPUTE_32F HIPBLAS_COMPUTE_32F
+// (F32 products in TF32 where the GPU has it - maya-hy4's vision attention; on AMD plain F32, the same or better)
+#define CUBLAS_COMPUTE_32F_FAST_TF32 HIPBLAS_COMPUTE_32F
+#define cublasComputeType_t hipblasComputeType_t
 #define CUBLAS_DEFAULT_MATH HIPBLAS_DEFAULT_MATH
 // cuBLAS' pedantic mode keeps F32 GEMMs in F32 (no TF32); hipBLAS' default math already does (XF32 is opt-in), and
 // HIPBLAS_DEFAULT_MATH exists in every hipBLAS the build supports.

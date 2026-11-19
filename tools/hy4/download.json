@@ -10,5 +10,9 @@
  "files": {
   "Hy4-flash-Q4_K_M-00001-of-00002.gguf": [104986517504, "d6f76e5620f949bb50b23d0104786a4d091c487b6bee331facbeb996445ebe14"],
   "Hy4-flash-Q4_K_M-00002-of-00002.gguf": [63360616128, "ecd6a0ecd7f258b1ee9211bf566261ae33efc1743ad40f58cb5004cf7b051839"]
+ },
+ "_vision": "the vision tower (clip.projector_type hy_v4_flash, BF16): downloaded with the model unless --no-vision; maya-hy4 runs it on the main GPU",
+ "vision": {
+  "mmproj-Hy4-flash-bf16.gguf": [1044397440, "8c33a48ef57480abf4854126964058a2015b5da3b773b14c847c995cf8899bda"]
  }
 }

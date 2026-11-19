@@ -11,7 +11,8 @@ A config's settings, as the page shows them (None: the engine's own default, or 
              draft ("mtp" | "none"), expert_cache, prefill, kv ("fp16" | "int8" |
              "k8v4" | "q4_0"), ram_gb (the experts' RAM tier, MAYA_EXPERT_RAM_GB); no images (text only)
   Hy4-flash (maya-hy4: it stops at a flag it does not know - only its own are written): draft ("mtp" | "none"), tp
-             ("auto" | 0: the layers split | a group's size), reserve_gb, prefill_chunk; no images (text only)
+             ("auto" | 0: the layers split | a group's size), reserve_gb, prefill_chunk; images (the pack's mmproj
+             file: --vision off when off)
 apply() writes them back into the config's "args", "env", "gpu" and "vision" - its other keys as they are."""
 from __future__ import annotations
 
@@ -37,13 +38,13 @@ CONTEXTS = [8192, 32768, 65536, 131072]       # the setup's choices (a config's 
 DS4_CONTEXTS = [32768, 65536, 131072, 262144, 524288, 1048576]   # ... for DeepSeek (maya.py's DS4_CONTEXTS)
 MM3_CONTEXTS = DS4_CONTEXTS                                       # ... and MiniMax (maya.py's MM3_CONTEXTS)
 QWEN_CONTEXTS = [32768, 65536, 131072, 262144]                    # ... and CYBER-FROST (maya.py's QWEN_CONTEXTS)
-HY4_CONTEXTS = [32768, 65536, 131072]                             # ... and Hy4-flash (maya.py's HY4_CONTEXTS)
+HY4_CONTEXTS = [32768, 65536, 131072, 262144]                     # ... and Hy4-flash (maya.py's HY4_CONTEXTS)
 CONTEXT_MIN = 4096          # the dashboard's Context size: the smallest it offers ...
 CONTEXT_FALLBACK_MAX = 262144   # ... and the largest when the model file does not say what it was trained for
 # the largest context the dashboard offers without an "untested" warning, by engine: maya-ds4 its model's own 1M; the
 # GLM engine's 256K, and maya-mm3's 256K (MiniMax-M3.1 is offered up to its 1M; past 256K it has not been run end to
 # end yet)
-CONTEXT_TESTED = {"ds4": 1048576, "mm3": 262144, "hy4": 131072}   # (maya-hy4: run end to end up to 128K)
+CONTEXT_TESTED = {"ds4": 1048576, "mm3": 262144, "hy4": 262144}   # (maya-hy4: run end to end up to 256K)
 CONTEXT_TESTED_DEFAULT = 262144
 QWEN_KV =("fp16", "int8", "k8v4", "q4_0")                        # the Qwen path's --kv
 MM3_KV = ("bf16", "int8", "fp8", "fp4")                           # maya-mm3 --kv-cache (one format for K and V)
@@ -62,7 +63,7 @@ DS4_KEYS = ("context", "images", "gpus", "reserve_mib", "env", "parallel", "draf
 MM3_KEYS = ("context", "images", "gpus", "env", "parallel", "draft", "tp", "kv_cache", "kv_streaming", "kv_resident",
             "cpu_threads", "reserve_gb", "prefill_chunk", "cache_gb", "dspark_conf")
 QWEN_KEYS = ("context", "images", "gpus", "reserve_mib", "env", "draft", "expert_cache", "prefill", "kv", "ram_gb")
-HY4_KEYS = ("context", "gpus", "env", "draft", "tp", "reserve_gb", "prefill_chunk")
+HY4_KEYS = ("context", "images", "gpus", "env", "draft", "tp", "reserve_gb", "prefill_chunk")
 HY4_KV_BYTES = 13 * (2 * (512 + 64) + 128 * 4 // 4)   # (maya.py's: its cache a context token, on each GPU of a group)
 
 
@@ -251,6 +252,16 @@ def hy4_has_mtp(cfg: dict) -> bool:
         return False
 
 
+def hy4_has_vision(cfg: dict) -> bool:
+    """Hy4-flash's pack has the vision tower (hy4.txt's vision.* keys: tools/hy4/pack_gguf.py with the mmproj file)."""
+    pack = pack_of(cfg)
+    try:
+        return any(line.startswith("vision.dim ")
+                   for line in (pack / "hy4.txt").read_text(encoding="utf-8", errors="replace").splitlines())
+    except (OSError, TypeError):
+        return False
+
+
 def mm3_pack_has(cfg: dict, key: str) -> bool:
     """MiniMax's pack indexes `key` (mm3.txt: "dspark.num_hidden_layers" its drafter, "vision.hidden_size" its vision
     tower - maya.py's checks)."""
@@ -331,8 +342,8 @@ def _choices(cfg: dict) -> dict:
     if family(cfg) == "deepseek":
         return {"draft": ["dspark", "none"] if ds4_has_drafter(cfg) else ["none"],
                 "images": ds4_has_vision(cfg) or "--vision" not in (cfg.get("args") or [])}
-    if family(cfg) == "hy4":                           # (text only: the model has no vision tower)
-        return {"draft": ["mtp", "none"] if hy4_has_mtp(cfg) else ["none"], "images": False, "text_only": True}
+    if family(cfg) == "hy4":                           # (images: the pack's mmproj file)
+        return {"draft": ["mtp", "none"] if hy4_has_mtp(cfg) else ["none"], "images": hy4_has_vision(cfg)}
     if family(cfg) == "qwen":                          # (images: the setup's maya-vision entry, on or kept off)
         return {"draft": ["mtp", "none"] if qwen_mtp(cfg) is not None else ["none"],
                 "images": bool(cfg.get("vision") or cfg.get("vision_off"))}
@@ -366,7 +377,8 @@ def settings_of(cfg: dict) -> dict:
         return out
     if family(cfg) == "hy4":                           # (maya-hy4's own defaults where the config names none)
         tp = flag(args, "--tp", "auto")
-        out.update(images=False, draft="mtp" if "--mtp" in [str(a) for a in args] else "none",
+        out.update(images=flag(args, "--vision") != "off" and hy4_has_vision(cfg),
+                   draft="mtp" if "--mtp" in [str(a) for a in args] else "none",
                    tp="auto" if tp == "auto" else _int(tp, "auto"), reserve_gb=_float(flag(args, "--reserve-gb")),
                    prefill_chunk=_int(flag(args, "--chunk")))
         return out
@@ -529,6 +541,14 @@ def apply(cfg: dict, settings: dict) -> dict:
         args = set_flag(args, "--reserve-gb", f"{v:g}") if v is not None else drop_flag(args, "--reserve-gb")
         ch = _num(s, "prefill_chunk", 64, 65536, "Prompt chunk")
         args = set_flag(args, "--chunk", ch) if ch is not None else drop_flag(args, "--chunk")
+        # (images: on is the engine's default when the pack has the tower - no flag; off keeps its room free)
+        if s.get("images"):
+            if not can["images"]:
+                raise ValueError("Images: this pack has no vision tower (the setup packs the model with its mmproj "
+                                 "file)")
+            args = drop_flag(args, "--vision")
+        elif can["images"] or "--vision" in args:
+            args = set_flag(args, "--vision", "off")
     elif fam == "qwen":
         if s.get("draft") not in can["draft"]:
             raise ValueError("Drafting: this pack has no MTP drafter (the setup builds it)" if s.get("draft") == "mtp"

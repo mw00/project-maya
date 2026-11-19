@@ -1,8 +1,9 @@
 """tools/test_setup_hy4.py - Hy4-flash in the setup, the launcher and the dashboard: its name and setup ids, its configs
 recognised (maya-hy4's --pack is not DeepSeek's), the pinned download manifest, the context recommended by the
-smallest GPU's VRAM, the config the setup writes (maya-hy4's own flags only, the model's own sampling and level), the
-engine target the launcher builds and starts, the Models page's settings, and its two thinking levels (High, Off) in
-the template and the web app.  No GPU, no network.
+smallest GPU's VRAM, the config the setup writes (maya-hy4's own flags only, the model's own sampling and level), its
+vision tower (downloaded with the model unless --no-vision, packed when it is in the folder, Images on the Models
+page), the engine target the launcher builds and starts, the Models page's settings, and its two thinking levels
+(High, Off) in the template and the web app.  No GPU, no network.
 
     python -m unittest tools.test_setup_hy4 -v
 """
@@ -21,13 +22,14 @@ import maya  # noqa: E402
 import maya_quants as Q  # noqa: E402
 
 SHARDS = ("Hy4-flash-Q4_K_M-00001-of-00002.gguf", "Hy4-flash-Q4_K_M-00002-of-00002.gguf")
+MMPROJ = "mmproj-Hy4-flash-bf16.gguf"
 
 
-def hy4_cfg(d: Path, mtp: bool = True, n_mtp: int = 1) -> dict:
+def hy4_cfg(d: Path, mtp: bool = True, n_mtp: int = 1, vision: bool = False) -> dict:
     pack = d / "Hy4-flash" / "maya-hy4"
     (pack / "tokenizer").mkdir(parents=True, exist_ok=True)
     (pack / "hy4.txt").write_text(f"arch hy_v4_flash\nn_layer 42\nn_mtp {n_mtp}\ncontext_length 1048576\n"
-                                  f"model_dir {pack.parent}\n")
+                                  f"model_dir {pack.parent}\n" + ("vision.dim 1152\n" if vision else ""))
     (pack / "tensors.txt").write_text("".join(f"file {i} {n}\n" for i, n in enumerate(SHARDS)) + "t x F32 0 0 4 1\n")
     return {"exe": "/b/build/maya-hy4", "args": ["--pack", str(pack), "--max-context", "65536"] + (["--mtp"] if mtp else []),
             "model_name": "hy4-flash", "gpu": [0, 1], "tokenizer": str(pack / "tokenizer"),
@@ -74,20 +76,63 @@ class Names(unittest.TestCase):
         label, note, about = rows[-1]
         self.assertEqual(label, "Hy4-flash")
         self.assertIn("Q4_K_M", about)
-        self.assertIn("text only", about)
+        self.assertIn("pictures", about)
         self.assertEqual(maya.FAMILY_TITLE["hy4"], "Hy4-flash")
 
 
 class Setup(unittest.TestCase):
     def test_manifest_pinned(self):
+        """The shards and the vision tower's file, pinned with their sha256; --no-vision's download: the shards."""
         m = maya.hy4_entry()
         self.assertEqual(m["repo"], "AngelSlim/Hy4-flash-GGUF")
         self.assertEqual(len(m["revision"]), 40)
-        self.assertEqual(sorted(m["files"]), list(SHARDS))
+        self.assertEqual(sorted(m["files"]), list(SHARDS) + [MMPROJ])
+        self.assertEqual(m["vision"], [MMPROJ])
         for name, sha in m["sha256"].items():
             self.assertRegex(sha, r"^[0-9a-f]{64}$", name)
-            self.assertGreater(m["files"][name], 50e9)
-        self.assertAlmostEqual(m["download_gb"], 168.35, delta=0.1)
+            self.assertGreater(m["files"][name], 50e9 if name in SHARDS else 1e9)
+        self.assertAlmostEqual(m["download_gb"], 169.39, delta=0.1)
+        self.assertAlmostEqual(m["vision_gb"], 1.04, delta=0.01)
+        t = maya.hy4_entry(vision=False)
+        self.assertEqual((sorted(t["files"]), t["vision"]), (list(SHARDS), []))
+        self.assertAlmostEqual(t["download_gb"], 168.35, delta=0.1)
+
+    def test_pack_with_the_vision_tower(self):
+        """The pack step indexes the folder's mmproj file (--mmproj), stamps it with the shards, and is built again
+        when the file comes or goes; without it, --mmproj none."""
+        with tempfile.TemporaryDirectory() as t:
+            d = Path(t) / "Hy4-flash"
+            d.mkdir()
+            files = [d / n for n in SHARDS]
+            for f in files:
+                f.write_bytes(b"x")
+            runs = []
+
+            def fake_run(cmd, *x, **k):
+                runs.append(cmd)
+                out = Path(cmd[cmd.index("--out") + 1])
+                (out / "tokenizer").mkdir(parents=True, exist_ok=True)
+                for n in ("tensors.txt", "tokenizer/vocab.json", "tokenizer/chat_template.jinja"):
+                    (out / n).write_text("x")
+                (out / "hy4.txt").write_text("arch hy_v4_flash\n" +
+                                             ("vision.dim 1152\n" if cmd[cmd.index("--mmproj") + 1] != "none" else ""))
+            a = type("A", (), {"repack": False})()
+            with patch.object(maya, "run", fake_run), patch.object(maya, "step"), patch.object(maya, "ok"), \
+                    patch.object(maya, "say"):
+                pack = maya.hy4_pack_step(a, d, files)
+                self.assertEqual(runs[-1][runs[-1].index("--mmproj") + 1], "none")
+                self.assertFalse(maya.hy4_pack_has_vision(pack))
+                (d / MMPROJ).write_bytes(b"v")         # (downloaded later: the pack is built again with it)
+                maya.hy4_pack_step(a, d, files + [d / MMPROJ])
+                self.assertEqual(len(runs), 2)
+                cmd = runs[-1]
+                self.assertEqual(cmd[cmd.index("--mmproj") + 1], MMPROJ)
+                self.assertEqual(cmd[cmd.index("--files") + 1:cmd.index("--mmproj")], list(SHARDS))
+                self.assertTrue(maya.hy4_pack_has_vision(pack))
+                stamped = [r["name"] for r in json.loads((pack / maya.PACK_SOURCES).read_text())["files"]]
+                self.assertEqual(stamped, list(SHARDS) + [MMPROJ])
+                maya.hy4_pack_step(a, d, files + [d / MMPROJ])   # (nothing changed: kept)
+                self.assertEqual(len(runs), 2)
 
     def test_context_by_vram(self):
         """The cache sits on every GPU of a tensor-parallel group: the smallest GPU decides."""
@@ -97,6 +142,8 @@ class Setup(unittest.TestCase):
         self.assertEqual(maya.hy4_recommended_context(gpus(24, 6)), 32768)
         self.assertEqual(maya.hy4_recommended_context({"gpus": []}), 32768)
         self.assertIn(maya.HY4_DEFAULT_CONTEXT, maya.HY4_CONTEXTS)
+        self.assertEqual(maya.HY4_CONTEXTS[-1], 262144)                            # (256K: offered)
+        self.assertEqual(maya.hy4_recommended_context(gpus(32, 32)), 262144)       # (4.4 GB in F16 rows)
 
     def test_config(self):
         """maya-hy4's own flags only (it stops at one it does not know), the model's sampling and level, its engine;
@@ -105,7 +152,7 @@ class Setup(unittest.TestCase):
             t = Path(t)
             pack = t / "Hy4-flash" / "maya-hy4"
             (pack / "tokenizer").mkdir(parents=True)
-            a = type("A", (), dict(port=None, env=[], host=None, api_key=None))()
+            a = type("A", (), dict(port=None, env=[], host=None, api_key=None, no_vision=False))()
             with patch.object(maya, "ROOT", t), patch.object(maya, "write_run_script", lambda *x: t / "run"), \
                     patch.object(maya, "ok"), patch.object(maya, "say"):
                 p = maya.write_config_hy4(a, {"gpus": [{"index": 0}, {"index": 3}]}, {"lib_dirs": ["/cuda"]}, pack,
@@ -126,6 +173,19 @@ class Setup(unittest.TestCase):
             self.assertEqual(c["args"], ["--pack", str(pack), "--max-context", "65536", "--chunk", "2048",
                                          "--reserve-gb", "0.6"])
             self.assertEqual((c["host"], c["lib_dirs"], c["installer"]["drafting"]), ("0.0.0.0", ["/cuda"], "off"))
+            # --no-vision with the tower in the pack: --vision off (the Models page's Images turns it on); a setup
+            # again without it does not keep the off
+            (pack / "hy4.txt").write_text("arch hy_v4_flash\nvision.dim 1152\n")
+            a.no_vision = True
+            with patch.object(maya, "ROOT", t), patch.object(maya, "write_run_script", lambda *x: t / "run"), \
+                    patch.object(maya, "ok"), patch.object(maya, "say"):
+                c = json.loads(maya.write_config_hy4(a, {"gpus": [{"index": 0}]}, {}, pack, 65536, t, pack.parent,
+                                                     False).read_text())
+                self.assertEqual(c["args"][-2:], ["--vision", "off"])
+                a.no_vision = False
+                c = json.loads(maya.write_config_hy4(a, {"gpus": [{"index": 0}]}, {}, pack, 65536, t, pack.parent,
+                                                     False).read_text())
+                self.assertNotIn("--vision", c["args"])
 
     def test_the_engine_target(self):
         """The launcher builds and starts maya-hy4 for it, and the GPU list knows the engine's process."""
@@ -163,15 +223,18 @@ class Dashboard(unittest.TestCase):
         from serve import models as M
         with tempfile.TemporaryDirectory() as t:
             cfg = hy4_cfg(Path(t))
-            self.assertEqual(M.choices(cfg), {"draft": ["mtp", "none"], "images": False, "text_only": True,
+            self.assertEqual(M.choices(cfg), {"draft": ["mtp", "none"], "images": False,
                                               "ablate": {"available": False, "why": "not available for this model"}})
             s = M.settings_of(cfg)
-            self.assertEqual((s["draft"], s["tp"], s["reserve_gb"], s["prefill_chunk"]), ("mtp", "auto", None, None))
+            self.assertEqual((s["draft"], s["tp"], s["reserve_gb"], s["prefill_chunk"], s["images"]),
+                             ("mtp", "auto", None, None, False))
             self.assertEqual(M.trained_context_ds4(M.pack_of(cfg)), 1048576)
             self.assertEqual(M.pack_reads(M.pack_of(cfg)), [Path(t) / "Hy4-flash" / n for n in SHARDS])
             out = M.apply(cfg, {"draft": "none", "tp": 0, "reserve_gb": 0.6, "prefill_chunk": 2048, "context": 131072})
             self.assertEqual(out["args"], ["--pack", str(M.pack_of(cfg)), "--max-context", "131072", "--tp", "0",
                                            "--reserve-gb", "0.6", "--chunk", "2048"])
+            self.assertEqual(M.apply(cfg, {"context": 262144})["args"][:4],
+                             ["--pack", str(M.pack_of(cfg)), "--max-context", "262144"])
             back = M.apply(out, {"draft": "mtp", "tp": "auto", "reserve_gb": None, "prefill_chunk": None})
             self.assertEqual(back["args"], ["--pack", str(M.pack_of(cfg)), "--max-context", "131072", "--mtp"])
             for bad in ({"kv": "int8"}, {"parallel": 2}, {"images": True}, {"expert_cache": 100}):
@@ -179,6 +242,20 @@ class Dashboard(unittest.TestCase):
                     M.apply(cfg, bad)
             with self.assertRaises(ValueError):
                 M.apply(hy4_cfg(Path(t) / "b", n_mtp=0), {"draft": "mtp"})
+
+    def test_models_page_images(self):
+        """A pack with the vision tower: Images on by default (no flag), off writes --vision off, on drops it."""
+        from serve import models as M
+        with tempfile.TemporaryDirectory() as t:
+            cfg = hy4_cfg(Path(t), vision=True)
+            self.assertTrue(M.choices(cfg)["images"])
+            self.assertTrue(M.settings_of(cfg)["images"])
+            off = M.apply(cfg, {"images": False})
+            self.assertEqual(off["args"][-2:], ["--vision", "off"])
+            self.assertFalse(M.settings_of(off)["images"])
+            on = M.apply(off, {"images": True})
+            self.assertNotIn("--vision", on["args"])
+            self.assertTrue(M.settings_of(on)["images"])
 
     @unittest.skipUnless(shutil.which("node"), "node is not installed")
     def test_the_web_apps_levels(self):

@@ -1,19 +1,25 @@
 """tools/hy4/pack_gguf.py - maya-hy4's pack for a Hy4-flash GGUF set (Tencent's Hy4-flash, the GGUF's `hy_v4_flash`
 layout: AngelSlim's Q4_K_M / Q3_K / IQ2 builds), beside the model's files (no weights copied).
 
-    python tools/hy4/pack_gguf.py --model ~/models/Hy4-flash-GGUF
+    python tools/hy4/pack_gguf.py --model ~/models/Hy4-flash-GGUF [--mmproj FILE|none]
 
 writes <model>/maya-hy4/:
-  hy4.txt       the geometry, one `key value` a line (lists comma-separated), from the GGUF's hy_v4_flash.* keys
+  hy4.txt       the geometry, one `key value` a line (lists comma-separated), from the GGUF's hy_v4_flash.* keys; with
+                the vision tower, its vision.* keys (from the mmproj file's clip.* keys, and the vocabulary's image
+                start / end / pad tokens)
   tensors.txt   `file <i> <path>` lines (relative to the model's folder, model_dir in hy4.txt), then `t <name> <type> <file> <offset> <bytes> <ne0> <ne1> ...` a tensor: the
                 GGUF's own names and dims (ne0 innermost, as ggml counts them), type ggml's name (Q4_K, Q8_0, BF16,
-                F32, F8_E4M3 ...), offset absolute in its file
+                F32, F8_E4M3 ...), offset absolute in its file; the mmproj file (the vision tower: v.* and mm.*
+                tensors) is the last file when there is one
   engram.bin    the Engram n-gram hash ('HYE1'): int32 vocab, modules, ngram, heads_per_ngram, head_dim, pad (the token
                 map's value of the pad token), table_rows; int32 token_map[vocab]; int32 layers[modules]; uint64
                 multipliers[modules][ngram], primes[modules][cols], offsets[modules][cols] (cols = (ngram - 1)
                 heads_per_ngram; the offsets index the one table, per_layer_token_embd)
   tokenizer/    the server's tokenizer from the GGUF's vocabulary and merges (pre "hy_v4") and the model's own chat
                 template (tokenizer.chat_template)
+
+The vision tower: AngelSlim's mmproj-Hy4-flash-*.gguf (clip.projector_type hy_v4_flash) in the model's folder, found
+there unless --mmproj names one (or `none`: text only).  The model's shards are the folder's other .gguf files.
 """
 from __future__ import annotations
 
@@ -58,11 +64,16 @@ def nbytes(typ: int, dims: list) -> int:
     return dims[0] // per * bpb * n
 
 
+def is_mmproj(g: Gguf) -> bool:
+    return g.kv.get("general.type") == "mmproj" or g.kv.get("general.architecture") == "clip"
+
+
 def find_shards(model: pathlib.Path, names: list | None) -> list:
     paths = [model / n for n in names] if names else sorted(model.glob("*.gguf"))
     if not paths:
         raise SystemExit("%s: no .gguf files" % model)
     gs = [Gguf(p) for p in paths]
+    gs = [g for g in gs if not is_mmproj(g)]   # (a vision tower's file beside the set: find_mmproj's)
     first = [g for g in gs if g.kv.get("general.architecture")]
     if not first or first[0].kv["general.architecture"] != ARCH:
         raise SystemExit("%s: not a %s GGUF (general.architecture %r)" %
@@ -193,6 +204,73 @@ def engram_bytes(kv: dict, tensors: dict, vocab: int) -> tuple:
     return nm, b
 
 
+def find_mmproj(model: pathlib.Path, arg: str | None) -> Gguf | None:
+    """The vision tower's file: --mmproj's, else the folder's one mmproj GGUF of this projector (None: text only)."""
+    if arg == "none":
+        return None
+    if arg:
+        p = pathlib.Path(arg).expanduser()
+        p = p if p.is_absolute() else (model / p if (model / p).exists() else p.resolve())
+        cands = [Gguf(p)]
+    else:
+        cands = [g for g in (Gguf(p) for p in sorted(model.glob("*.gguf")) if "mmproj" in p.name.lower())
+                 if is_mmproj(g)]
+    cands = [g for g in cands if is_mmproj(g)]
+    if arg and not cands:
+        raise SystemExit("%s: not an mmproj GGUF" % arg)
+    mine = [g for g in cands if g.kv.get("clip.projector_type") == ARCH]
+    if arg and not mine:
+        raise SystemExit("%s: clip.projector_type %r, not %s" % (arg, cands[0].kv.get("clip.projector_type"), ARCH))
+    if len(mine) > 1:
+        raise SystemExit("%s: %d mmproj files of %s (name one with --mmproj)" % (model, len(mine), ARCH))
+    if not mine:
+        return None
+    why = short(mine[0])
+    if why:
+        raise SystemExit("not whole yet: " + why)
+    return mine[0]
+
+
+def vision_geometry(g: Gguf, tokens: list, n_embd: int) -> dict:
+    """hy4.txt's vision.* keys from the mmproj's clip.* keys and the model's vocabulary."""
+    kv = g.kv
+    c = lambda k, d=None: kv.get("clip.vision." + k, kv.get("clip." + k, d))  # noqa: E731
+    t = {name: (typ, dims) for name, typ, dims, _ in g.tensors}
+    pos = t.get("v.position_embd.weight")
+    if pos is None or "v.patch_embd.weight" not in t or "mm.0.weight" not in t or "v.image_newline" not in t:
+        raise SystemExit("%s: not the hy_v4_flash vision tower's tensors" % g.path.name)
+    grid = int(round(pos[1][1] ** 0.5))
+    if grid * grid != pos[1][1]:
+        raise SystemExit("%s: a position grid of %d rows is not square" % (g.path.name, pos[1][1]))
+
+    def tok(prefix):
+        ids = [i for i, s in enumerate(tokens) if s.startswith(prefix)]
+        if len(ids) != 1:
+            raise SystemExit("the vocabulary has %d tokens starting %s" % (len(ids), prefix))
+        return ids[0]
+
+    geo = {
+        "vision.dim": int(c("embedding_length")), "vision.heads": int(c("attention.head_count")),
+        "vision.ff": int(c("feed_forward_length")), "vision.layers": int(c("block_count")),
+        "vision.patch": int(c("patch_size")), "vision.merge": int(c("spatial_merge_size", 2)),
+        "vision.grid": grid, "vision.out_dim": int(c("projection_dim")),
+        "vision.eps": float(c("attention.layer_norm_epsilon", 1e-5)),
+        "vision.min_pixels": int(c("image_min_pixels", 4096)), "vision.max_pixels": int(c("image_max_pixels", 4194304)),
+        "vision.mean": [float(x) for x in c("image_mean", [0.5] * 3)],
+        "vision.std": [float(x) for x in c("image_std", [0.5] * 3)],
+        "vision.image_token": tok("<｜hy_image▁pad"), "vision.image_start": tok("<｜hy_image▁start"),
+        "vision.image_end": tok("<｜hy_image▁end"),
+    }
+    if geo["vision.out_dim"] != n_embd or geo["vision.merge"] != 2 or geo["vision.dim"] % geo["vision.heads"]:
+        raise SystemExit("%s: a vision geometry maya-hy4 does not run (projection %d for a model of %d, merge %d)" %
+                         (g.path.name, geo["vision.out_dim"], n_embd, geo["vision.merge"]))
+    missing = ["v.blk.%d.%s" % (i, n) for i in range(geo["vision.layers"])
+               for n in ("attn_q.weight", "ffn_down.weight") if "v.blk.%d.%s" % (i, n) not in t]
+    if missing:
+        raise SystemExit("%s: lacks %s" % (g.path.name, ", ".join(missing[:3])))
+    return geo
+
+
 def tokenizer_files(kv: dict) -> dict:
     """{file name: text} of the pack's tokenizer/ folder"""
     tokens = kv["tokenizer.ggml.tokens"]
@@ -229,17 +307,22 @@ def main() -> int:
     ap.add_argument("--model", required=True, help="the folder of the GGUF set")
     ap.add_argument("--files", nargs="*", help="the set's shards (default: every .gguf in the folder)")
     ap.add_argument("--out", help="the pack's folder (default: <model>/maya-hy4)")
+    ap.add_argument("--mmproj", help="the vision tower's GGUF (default: the folder's mmproj file of Hy4-flash; "
+                                     "none: text only)")
     a = ap.parse_args()
     model = pathlib.Path(a.model).expanduser().resolve()
     out = pathlib.Path(a.out).expanduser().resolve() if a.out else model / "maya-hy4"
     gs = find_shards(model, a.files)
+    vis = find_mmproj(model, a.mmproj)
     kv = {}
     for g in gs:
         for k, v in g.kv.items():
             kv.setdefault(k, v)
     geo = geometry(kv)
+    if vis is not None:
+        geo.update(vision_geometry(vis, kv["tokenizer.ggml.tokens"], geo["n_embd"]))
     tensors, lines = {}, []
-    for i, g in enumerate(gs):
+    for i, g in enumerate(gs + ([vis] if vis is not None else [])):
         lines.append("file %d %s" % (i, os.path.relpath(g.path, model)))
         for name, typ, dims, off in g.tensors:
             if name in tensors:
@@ -265,8 +348,9 @@ def main() -> int:
         (out / "engram.bin").unlink()
     (out / "hy4.txt").write_text(geometry_text(geo, model))
     (out / "tensors.txt").write_text("\n".join(lines) + "\n")
-    print("%s: %d tensors from %d files, %d layers (+%d MTP), %d Engram layers" %
-          (out, len(tensors), len(gs), geo["n_layer"], geo["n_mtp"], ne))
+    print("%s: %d tensors from %d files, %d layers (+%d MTP), %d Engram layers, %s" %
+          (out, len(tensors), len(gs), geo["n_layer"], geo["n_mtp"], ne,
+           "the vision tower (%s)" % vis.path.name if vis is not None else "text only"))
     return 0
 
 
