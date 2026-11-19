@@ -684,6 +684,110 @@ void test_engram() {
 
 }  // namespace
 
+// KV streaming: a VRAM ring with tags and every row in (mapped) host memory read as the cache with every row in VRAM -
+// the rows themselves, the spans in order, the picked rows (side by side, and each once), the attention over them:
+// the same bits, F16 rows and 8-bit rows
+void test_kv_streaming() {
+    const int n = 200, H = 32, KL = 512, R = 64, KR = KL + R, ring = 48, T = 5, ldk = 24;
+    const float eps = 1e-5f, base = 1e4f, scale = 1.0f / 16.0f;
+    auto kv = randn((size_t) n * KR), w = randn(KL, 0.2f), q = randn((size_t) T * H * KR), sink = randn(H);
+    std::vector<int> all((size_t) n);
+    std::iota(all.begin(), all.end(), 0);
+    float *dkv = dev(kv), *dw = dev(w), *dq = dev(q), *dsink = dev(sink);
+    int* dall = dev(all);
+    // the keys: scattered positions, most of them out of the ring by the end (the newest 48 are in it)
+    std::vector<int> kl((size_t) T * ldk, 0), nk(T);
+    std::uniform_int_distribution<int> pick(0, n - 1);
+    for (int t = 0; t < T; ++t) {
+        std::vector<int> v;
+        for (int k = 0; k < 16 + t; ++k) v.push_back(pick(rng));
+        v.push_back(n - 1 - t);
+        v.push_back(7);   // (a position every token picks)
+        std::sort(v.begin(), v.end());
+        v.erase(std::unique(v.begin(), v.end()), v.end());
+        nk[(size_t) t] = (int) v.size();
+        for (size_t k = 0; k < v.size(); ++k) kl[(size_t) t * ldk + k] = v[k];
+    }
+    int *dk = dev(kl), *dnk = dev(nk);
+    std::vector<int> lo(T), minus((size_t) n, -1);
+    for (int t = 0; t < T; ++t) lo[(size_t) t] = t * ldk;
+    int *dlo = dev(lo), *slot = dev(minus), *count, *list, *keys2;
+    cudaMalloc(&count, sizeof(int));
+    cudaMalloc(&list, sizeof(int) * T * ldk);
+    cudaMalloc(&keys2, sizeof(int) * T * ldk);
+    float *ws, *out;
+    cudaMalloc(&ws, sizeof(float) * hy4::k::attn_ws_floats(T, H, KL, ldk));
+    cudaMalloc(&out, sizeof(float) * T * H * KL);
+    for (int q8 = 0; q8 < 2; ++q8) {
+        const size_t rb = q8 ? hy4::k::kv_q8_row_bytes(KL, R) : (size_t) KR * 2;
+        uint16_t *full, *rc, *hrows, *picked, *span, *span0;
+        int* tag;
+        cudaMalloc(&full, rb * n);
+        cudaMalloc(&rc, rb * ring);
+        cudaMalloc(&tag, sizeof(int) * ring);
+        cudaMalloc(&picked, rb * T * ldk);
+        cudaMalloc(&span, sizeof(uint16_t) * n * KR);
+        cudaMalloc(&span0, sizeof(uint16_t) * n * KR);
+        cudaMemset(tag, 0xff, sizeof(int) * ring);
+        CHECK(cudaHostAlloc((void**) &hrows, rb * n, cudaHostAllocMapped | cudaHostAllocPortable) == cudaSuccess);
+        std::memset(hrows, 0x5a, rb * n);
+        const hy4::k::KvHost hs{tag, hrows};
+        hy4::k::kv_store(dkv, n, KL, R, dw, eps, dall, base, full, 0, 0, q8 != 0);
+        for (int p0 = 0; p0 < n; p0 += 40)   // (windows of 40 positions: the ring of 48 wraps four times)
+            hy4::k::kv_store(dkv + (size_t) p0 * KR, std::min(40, n - p0), KL, R, dw, eps, dall + p0, base, rc, ring, 0,
+                             q8 != 0, hs);
+        cudaDeviceSynchronize();
+        const auto hf = host((const uint8_t*) full, rb * n);
+        const bool rows_same = std::memcmp(hf.data(), hrows, rb * n) == 0;
+        const auto tg = host(tag, (size_t) ring);
+        bool tags_ok = true;
+        for (int p = n - ring; p < n; ++p) tags_ok = tags_ok && tg[(size_t) (p % ring)] == p;
+        // a span in order (the prompt path's dense read): [0, n) from the ring and the host = from the full cache
+        if (q8) {
+            hy4::k::kv_deq(rc, ring, KL, R, 0, n, span, 0, hs);
+            hy4::k::kv_deq(full, 0, KL, R, 0, n, span0, 0);
+        } else {
+            hy4::k::kv_gather(rc, ring, KR, 0, n, span, 0, hs);
+            hy4::k::kv_gather(full, 0, KR, 0, n, span0, 0);
+        }
+        const bool span_same = host(span, (size_t) n * KR) == host(span0, (size_t) n * KR);
+        // the attention over the key list: the full cache's, the picked rows', the rows' picked once
+        hy4::k::attention(dq, T, H, KL, R, full, 0, dk, ldk, nullptr, dnk, ldk, scale, dsink, ws, out, 0, q8 != 0);
+        const auto o0 = host(out, (size_t) T * H * KL);
+        hy4::k::kv_pick(rc, ring, rb, dk, ldk, dnk, T, picked, 0, hs);
+        hy4::k::attention(dq, T, H, KL, R, picked, 0, nullptr, 0, dlo, dnk, ldk, scale, dsink, ws, out, 0, q8 != 0);
+        const auto o1 = host(out, (size_t) T * H * KL);
+        cudaMemset(picked, 0, rb * T * ldk);
+        hy4::k::kv_pick_union(rc, ring, rb, dk, ldk, dnk, T, slot, count, list, keys2, picked, 0, hs);
+        const int n_union = host(count, 1)[0];
+        std::vector<int> seen;
+        for (int t = 0; t < T; ++t)
+            for (int k = 0; k < nk[(size_t) t]; ++k) seen.push_back(kl[(size_t) t * ldk + k]);
+        std::sort(seen.begin(), seen.end());
+        seen.erase(std::unique(seen.begin(), seen.end()), seen.end());
+        hy4::k::attention(dq, T, H, KL, R, picked, 0, keys2, ldk, nullptr, dnk, ldk, scale, dsink, ws, out, 0, q8 != 0);
+        const auto o2 = host(out, (size_t) T * H * KL);
+        const bool slot_clean = host(slot, (size_t) n) == minus;
+        const bool a1 = std::memcmp(o0.data(), o1.data(), sizeof(float) * o0.size()) == 0;
+        const bool a2 = std::memcmp(o0.data(), o2.data(), sizeof(float) * o0.size()) == 0;
+        std::printf("  kv streaming, %s rows: host rows %s, tags %s, span %s, picked attention %s, union (%d rows of %zu "
+                    "picks) %s, slots %s\n", q8 ? "8-bit" : "F16", rows_same ? "same" : "DIFFER", tags_ok ? "ok" : "BAD",
+                    span_same ? "same" : "DIFFERS", a1 ? "same bits" : "DIFFERS", n_union, seen.size(),
+                    a2 ? "same bits" : "DIFFERS", slot_clean ? "clean" : "LEFT");
+        CHECK(rows_same && tags_ok && span_same && a1 && a2 && slot_clean && n_union == (int) seen.size());
+        cudaFree(full);
+        cudaFree(rc);
+        cudaFree(tag);
+        cudaFree(picked);
+        cudaFree(span);
+        cudaFree(span0);
+        cudaFreeHost(hrows);
+    }
+    for (void* d : {(void*) dkv, (void*) dw, (void*) dq, (void*) dsink, (void*) dall, (void*) dk, (void*) dnk, (void*) dlo,
+                    (void*) slot, (void*) count, (void*) list, (void*) keys2, (void*) ws, (void*) out})
+        cudaFree(d);
+}
+
 int main() {
     int n = 0;
     if (cudaGetDeviceCount(&n) != cudaSuccess || n == 0) {
@@ -692,6 +796,7 @@ int main() {
     }
     test_hc();
     test_attention();
+    test_kv_streaming();
     test_router();
     test_indexer();
     test_engram();

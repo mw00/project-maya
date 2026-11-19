@@ -3,6 +3,7 @@
 //   maya-hy4 --pack <model>/maya-hy4 --serve [--gpus 0,1,...] [--max-context N] [--chunk N] [--eos id,id,...]
 //            [--mtp [--draft N] [--draft-floor P]] [--vram-experts F] [--cpu-threads N] [--profile F] [--profile-out F]
 //            [--tp N|auto] [--main-gpu I] [--vision on|off] [--kv auto|f16|q8]
+//            [--kv-streaming on|off|auto] [--kv-resident N]
 //
 // --kv: the latent cache's rows - F16, or q8: the latent's 512 values int8 in blocks of 32 with an F16 scale, the
 // rotated part's 64 F16 (672 bytes a row against 1152), the indexer's per-position and pooled rows F16 (the reference's
@@ -1041,6 +1042,8 @@ int main(int argc, char** argv) {
     int n_draft = 3;
     float floor = 0.55f;
     std::string images, enc_rgb, enc_size, enc_out, kld_save;
+    int kv_stream = 0;   // --kv-streaming on: the indexed layers' rows beyond --kv-resident positions in host memory
+    long long kv_res_arg = 0;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         auto next = [&]() -> std::string {
@@ -1092,6 +1095,15 @@ int main(int argc, char** argv) {
         }
         else if (a == "--images") images = next();
         else if (a == "--kld-save") kld_save = next();
+        else if (a == "--kv-streaming") {
+            const std::string v = next();
+            if (v != "on" && v != "off" && v != "auto") {
+                std::fprintf(stderr, "--kv-streaming: on, off or auto\n");
+                return 2;
+            }
+            kv_stream = v == "on" ? 1 : v == "auto" ? -1 : 0;
+        }
+        else if (a == "--kv-resident") kv_res_arg = std::atoll(next().c_str());
         else if (a == "--kv") {
             const std::string v = next();
             if (v != "auto" && v != "f16" && v != "q8") {
@@ -1121,6 +1133,8 @@ int main(int argc, char** argv) {
     }
     hy4::Model m;
     std::string err;
+    o.kv_streaming = kv_stream;
+    o.kv_resident = kv_stream != 0 ? (kv_res_arg > 0 ? kv_res_arg : 32768) : 0;
     if (!m.load(o, err)) {
         std::fprintf(stderr, "maya-hy4: %s\n", err.c_str());
         return 1;

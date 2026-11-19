@@ -259,6 +259,15 @@ struct Layer {
     Mat eh_proj;
     uint16_t* kv = nullptr;      // the latent cache: rows of kv_lora + rope F16
     int ring = 0;                // its rows (0: a row a position)
+    // KV streaming (an indexed layer, Options::kv_resident): kv a ring of res rows with a tag a slot, every position's
+    // row in the host's rows as well; hi: one past the last position ever stored (hi <= res: the ring has not wrapped,
+    // slot p is position p - read as without streaming)
+    int res = 0;
+    int* tag = nullptr;
+    uint16_t* hrows = nullptr;
+    int64_t hi = 0;
+    bool wrapped() const { return res > 0 && hi > res; }
+    k::KvHost hs() const { return res > 0 ? k::KvHost{tag, hrows} : k::KvHost{}; }
     float* pooled = nullptr;     // the indexer's pooled keys [max_ctx / kpool][ix_dim]
     float* ivg = nullptr;        // ... and each position's value | gate [ring][2 ix_dim]
     size_t bytes = 0;            // (the plan: its VRAM)
@@ -321,6 +330,10 @@ struct Gpu {
     // ... and its attention as GEMMs: the scores, the probabilities (F16), a ring's keys in order, the picks' mask
     float *sS = nullptr, *dmask = nullptr;
     uint16_t *sP = nullptr, *kbuf = nullptr;
+    uint16_t* kpick = nullptr;   // (KV streaming) a sub-batch's picked rows side by side [kSub][top_k + kpool]
+    int* plo = nullptr;          // ... and where each token's start there [kSub]
+    // (several tokens: each picked position's row once - kv_pick_union's slot [max_ctx], count, list and keys)
+    int *pslot = nullptr, *pcount = nullptr, *plist = nullptr, *pkeys = nullptr;
 
     template <typename T>
     bool alloc(T*& p, size_t n, std::string& err) {
@@ -522,6 +535,8 @@ struct Model::Impl {
         if (h_cpu) cudaFreeHost(h_cpu);
         if (h_stage) cudaFreeHost(h_stage);
         if (h_pmap) cudaFreeHost(h_pmap);
+        for (uint16_t* p : kv_host)
+            if (p) cudaFreeHost(p);
         crew.reset();
         summer.reset();
         for (void* p : {(void*) tp_part, (void*) tp_sum, (void*) tp_xo, (void*) tp_fout, (void*) tp_fin, (void*) tp_fx,
@@ -683,6 +698,36 @@ struct Model::Impl {
     // or F16, its bytes a position
     bool kv_q8 = false;
     size_t kv_rb() const { return kv_q8 ? k::kv_q8_row_bytes(g.kv_lora, g.rope) : (size_t) g.kv_row() * 2; }
+    // KV streaming: the indexed layers' rows in VRAM (0: every position's - off, or a context no larger), and what an
+    // indexed layer's rows take there (rb bytes a row; a ring's tags with it)
+    int kv_res() const {
+        const int64_t r = std::max<int64_t>(o.kv_resident, Tc);
+        return o.kv_resident > 0 && o.max_ctx > r ? (int) r : 0;
+    }
+    size_t ix_rows_bytes(size_t rb) const {
+        const int r = kv_res();
+        return r > 0 ? (size_t) r * (rb + 4) : (size_t) o.max_ctx * rb;
+    }
+    size_t ix_rows_bytes() const { return ix_rows_bytes(kv_rb()); }
+    // ... and the picked rows' buffer of a sub-batch (scratch)
+    size_t pick_bytes() const {
+        return kv_res() > 0 ? (size_t) kSub * (g.ix_top_k + g.ix_kpool) * (kv_rb() + 8) + (size_t) o.max_ctx * 4 + 1024 : 0;
+    }
+    std::vector<uint16_t*> kv_host;   // the host's rows, a layer (shared by its tensor-parallel members)
+    bool kv_said = false;
+    // (--kv-streaming auto: the ring asked for, and whether this plan took streaming - o.kv_resident is then its ring)
+    int64_t kv_auto_n = 0;
+    bool kv_auto_set = false;
+    void kv_auto_reset() {
+        if (kv_auto_set) o.kv_resident = 0;
+        kv_auto_set = false;
+    }
+    // the host's rows of every indexed layer (and the MTP block's) at this context, with the rows' current format
+    double kv_host_bytes() const {
+        int nix = 1;
+        for (int il = 0; il < g.n_layer; ++il) nix += g.swa[(size_t) il] ? 0 : 1;
+        return (double) nix * (double) o.max_ctx * (double) kv_rb();
+    }
     // (the indexer's pooled keys and its value | gate ring: F16 with 8-bit rows - the reference's own cache type -,
     //  else F32)
     size_t pool_b() const { return kv_q8 ? 2 : 4; }
@@ -694,7 +739,7 @@ struct Model::Impl {
         double b = 0;
         for (int il = 0; il < g.n_layer; ++il)
             b += g.swa[(size_t) il] ? ring * rb
-                                    : o.max_ctx * rb + (double) (o.max_ctx / g.ix_kpool + 1) * g.ix_dim * pb +
+                                    : (double) ix_rows_bytes((size_t) rb) + (double) (o.max_ctx / g.ix_kpool + 1) * g.ix_dim * pb +
                                           (double) ring * 2 * g.ix_dim * pb;
         return b / 1e9;
     }
@@ -707,7 +752,7 @@ struct Model::Impl {
                 b += t.bytes + 256 + (il < g.n_layer && t.type == "BF16" ? t.bytes : 0);   // (BF16: F32 in VRAM, mat())
         if (g.swa[(size_t) il]) b += (size_t) ring * kv_rb();
         else
-            b += (size_t) o.max_ctx * kv_rb() + (size_t) (o.max_ctx / g.ix_kpool + 1) * g.ix_dim * pool_b() +
+            b += ix_rows_bytes() + (size_t) (o.max_ctx / g.ix_kpool + 1) * g.ix_dim * pool_b() +
                  (size_t) ring * 2 * g.ix_dim * pool_b();
         return b;
     }
@@ -730,7 +775,7 @@ struct Model::Impl {
         // caches
         if (g.swa[(size_t) il]) b += (size_t) ring * kv_rb();
         else
-            b += (size_t) o.max_ctx * kv_rb() + (size_t) (o.max_ctx / g.ix_kpool + 1) * g.ix_dim * pool_b() +
+            b += ix_rows_bytes() + (size_t) (o.max_ctx / g.ix_kpool + 1) * g.ix_dim * pool_b() +
                  (size_t) ring * 2 * g.ix_dim * pool_b();
         return b;
     }
@@ -780,7 +825,7 @@ struct Model::Impl {
         const size_t f = scratch_floats(f16, ints, H, ff);
         const size_t att = dense_att_values(kSub, H, (size_t) g.n_swa, (size_t) dense_max);
         return f * 4 + f16 * 2 + ints * 4 + att * 6 + (size_t) kSub * dense_max * 4 + deq_rows() * g.kv_row() * 2 +
-               (96u << 20);
+               pick_bytes() + (96u << 20);
     }
 
     int main_gi = 0;
@@ -907,6 +952,7 @@ struct Model::Impl {
                 if (G[i].bw <= 0) return false;
             }
         }
+        kv_auto_reset();
         std::vector<double> free_b(devs.size());
         for (size_t i = 0; i < devs.size(); ++i) free_b[i] = free0[i] - o.reserve_gb * 1e9 - (double) scratch_bytes();
         // the main GPU: the head's, the drafts', the window's coordination - the fastest memory (then the most VRAM)
@@ -1050,7 +1096,7 @@ struct Model::Impl {
             vg.max_pixels = (int) (n * vgeo.patch * vgeo.patch);
             return (double) Vision::room_for(vg);
         };
-        const KvPick pick = kv_pick([&](bool q8, double room) {
+        auto do_pick = [&]() { return kv_pick([&](bool q8, double room) {
             const bool was = kv_q8;
             kv_q8 = q8;
             free_b[(size_t) main_gi] += vr - room;
@@ -1059,7 +1105,45 @@ struct Model::Impl {
             kv_q8 = was;
             return fit;
         }, kv_q8, o.kv < 0 && kv_q8_rows(), vr > 0, o.vision_auto, vis_n,
-           std::max<long long>(vis_n / 16, (long long) vgeo.min_pixels / ((long long) vgeo.patch * vgeo.patch) + 1), vis_bytes);
+           std::max<long long>(vis_n / 16, (long long) vgeo.min_pixels / ((long long) vgeo.patch * vgeo.patch) + 1), vis_bytes); };
+        KvPick pick = do_pick();
+        if (!pick.fits && o.kv_streaming < 0 && o.kv_resident == 0) {
+            // --kv-streaming auto: nothing above fits - the indexed layers' rows beyond a ring in host memory (the
+            // ring asked for, then a chunk's), where the RAM holds them beside its headroom
+            for (const int64_t n : {kv_auto_n, (int64_t) 1}) {
+                o.kv_resident = n;
+                const double pb = (double) pick_bytes();
+                if (kv_res() == 0) continue;
+                for (double& f : free_b) f -= pb;
+                const KvPick sp = do_pick();
+                bool ram_ok = sp.fits;
+                if (sp.fits) {
+                    const bool was = kv_q8;
+                    kv_q8 = sp.q8;
+                    const double host = kv_host_bytes();
+                    kv_q8 = was;
+                    const uint64_t avail = ram_available(), ram = ram_total();
+                    double head = std::max(8.0 * 1073741824.0, 0.1 * (double) ram);
+                    if (const char* h = std::getenv("HY4_RAM_HEADROOM_GB")) head = std::max(0.0, std::atof(h)) * 1073741824.0;
+                    ram_ok = avail == 0 || (double) avail - head >= host;
+                    if (!ram_ok) {
+                        char nb[320];
+                        std::snprintf(nb, sizeof nb, "NOTE KV streaming not taken: the rows of a context of %lld tokens "
+                                      "need %.1f GB of RAM, %.1f GB are available beside the system's headroom",
+                                      (long long) o.max_ctx, host / 1e9, std::max(0.0, (double) avail - head) / 1e9);
+                        info.push_back(nb);
+                    }
+                }
+                if (ram_ok) {
+                    pick = sp;
+                    kv_auto_set = true;
+                    break;
+                }
+                for (double& f : free_b) f += pb;
+                if (sp.fits) break;   // (the RAM, not the VRAM: a smaller ring does not help)
+            }
+            if (!kv_auto_set) o.kv_resident = 0;
+        }
         if (pick.fits && pick.vision && pick.patches < vis_n) {
             // (a picture's room for fewer patches than the tower's largest: the engine says the size, the server
             //  resizes to it - `INFO vision=hy4 ... vision_max_pixels`)
@@ -1238,7 +1322,7 @@ struct Model::Impl {
             }
             if (g.swa[(size_t) il]) b += (double) ring * kv_rb();
             else
-                b += (double) o.max_ctx * kv_rb() + (double) (o.max_ctx / g.ix_kpool + 1) * g.ix_dim * pool_b() +
+                b += (double) ix_rows_bytes() + (double) (o.max_ctx / g.ix_kpool + 1) * g.ix_dim * pool_b() +
                      (double) ring * 2 * g.ix_dim * pool_b();
             return b;
         };
@@ -1677,10 +1761,54 @@ struct Model::Impl {
         }
         return caches(l, gp, err);
     }
+    bool pick_starts(Gpu& gp, int maxk, std::string& err) {
+        std::vector<int> lo((size_t) kSub);
+        for (int t = 0; t < kSub; ++t) lo[(size_t) t] = t * maxk;
+        CK(cudaMemcpy(gp.plo, lo.data(), sizeof(int) * kSub, cudaMemcpyHostToDevice));
+        CK(cudaMemset(gp.pslot, 0xff, sizeof(int) * (size_t) o.max_ctx));
+        return true;
+    }
+    // (KV streaming) a layer's rows in host memory: pinned and mapped for every GPU, one buffer a layer
+    bool kv_host_rows(Layer& l, std::string& err) {
+        if (kv_host.empty()) kv_host.assign((size_t) g.n_layer + 2, nullptr);
+        uint16_t*& h = kv_host[(size_t) std::min(l.il, g.n_layer + 1)];
+        const size_t b = (size_t) o.max_ctx * kv_rb();
+        if (!h && cudaHostAlloc((void**) &h, b, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess) {
+            h = nullptr;
+            cudaGetLastError();
+            char eb[256];
+            std::snprintf(eb, sizeof eb, "KV streaming: no %.1f GB of pinned memory for layer %d's rows at a context of "
+                          "%lld tokens (a smaller context, or 8-bit rows: --kv q8)", b / 1e9, l.il, (long long) o.max_ctx);
+            err = eb;
+            return false;
+        }
+        l.hrows = h;
+        return true;
+    }
     bool caches(Layer& l, Gpu& gp, std::string& err) {
         if (l.swa) {
             l.ring = ring;
             if (!gp.alloc(l.kv, (size_t) ring * kv_rb() / 2, err)) return false;
+        } else if (kv_res() > 0) {
+            l.ring = 0;
+            l.res = kv_res();
+            l.hi = 0;
+            if (!gp.alloc(l.kv, (size_t) l.res * kv_rb() / 2, err) || !gp.alloc(l.tag, (size_t) l.res, err) ||
+                !gp.alloc(l.pooled, (size_t) (o.max_ctx / g.ix_kpool + 1) * g.ix_dim * pool_b() / 4, err) ||
+                !gp.alloc(l.ivg, (size_t) ring * 2 * g.ix_dim * pool_b() / 4, err) || !kv_host_rows(l, err))
+                return false;
+            CK(cudaMemset(l.tag, 0xff, sizeof(int) * (size_t) l.res));
+            CK(cudaMemset(l.pooled, 0, (size_t) (o.max_ctx / g.ix_kpool + 1) * g.ix_dim * pool_b()));
+            if (!kv_said) {
+                kv_said = true;
+                int nix = 1;   // (the MTP block's rows with the trunk's indexed layers')
+                for (int il = 0; il < g.n_layer; ++il) nix += g.swa[(size_t) il] ? 0 : 1;
+                char sb[320];
+                std::snprintf(sb, sizeof sb, "INFO kv_streaming=on kv_resident=%d kv_host_gb=%.2f (the indexed layers' "
+                              "rows: the newest %d positions in VRAM, every position in pinned memory)", l.res,
+                              (double) nix * o.max_ctx * kv_rb() / 1e9, l.res);
+                info.push_back(sb);
+            }
         } else {
             l.ring = 0;
             if (!gp.alloc(l.kv, (size_t) o.max_ctx * kv_rb() / 2, err) ||
@@ -1816,6 +1944,10 @@ struct Model::Impl {
                gp.alloc(gp.srow, 16 * T, err) && gp.alloc(gp.sS, att, err) && gp.alloc(gp.sP, att, err) &&
                gp.alloc(gp.dmask, (size_t) kSub * dense_max, err) &&
                gp.alloc(gp.kbuf, deq_rows() * g.kv_row(), err) &&
+               (kv_res() == 0 || (gp.alloc(gp.kpick, (size_t) kSub * maxk * kv_rb() / 2, err) &&
+                                  gp.alloc(gp.plo, (size_t) kSub, err) && gp.alloc(gp.pslot, (size_t) o.max_ctx, err) &&
+                                  gp.alloc(gp.pcount, 1, err) && gp.alloc(gp.plist, (size_t) kSub * maxk, err) &&
+                                  gp.alloc(gp.pkeys, (size_t) kSub * maxk, err) && pick_starts(gp, (int) maxk, err))) &&
                (gp.lo = gp.pos + T, gp.nk = gp.pos + 2 * T, true);
     }
 
@@ -1826,7 +1958,16 @@ struct Model::Impl {
         g = pk.g;
         if (o.max_ctx <= 0 || o.max_ctx > g.context) o.max_ctx = g.context;
         o.max_ctx = (o.max_ctx + g.ix_kpool - 1) / g.ix_kpool * g.ix_kpool;
+        if (o.kv_streaming < 0) {
+            kv_auto_n = o.kv_resident > 0 ? o.kv_resident : 32768;
+            o.kv_resident = 0;
+        } else if (o.kv_streaming == 0) {
+            o.kv_resident = 0;
+        } else if (o.kv_resident <= 0) {
+            o.kv_resident = 32768;
+        }
         auto set_chunk = [&](int c) {
+            kv_auto_reset();
             Tc = std::max(W, c);
             ring = (int) std::min<int64_t>(o.max_ctx, (int64_t) g.n_swa + std::max(o.ring_slack, Tc));
         };
@@ -2499,11 +2640,18 @@ struct Model::Impl {
         if (!l.swa && !all && nkr > dense_max) return false;
         const int window = l.swa ? g.n_swa : all ? (1 << 30) : 0;
         const uint16_t* K = l.kv + (size_t) (l.ring > 0 ? k0 % l.ring : k0) * KR;
-        if (kv_q8) {
+        // (KV streaming, once the layer's ring has wrapped: the span's rows from the ring or the host, in order, each
+        //  once a layer's call - as the 8-bit rows are dequantized)
+        const bool st = l.wrapped();
+        if (kv_q8 || st) {
             if (dq.base < 0 || k0 < dq.base || k1 - dq.base > (int64_t) deq_rows()) dq.base = dq.hi = k0;
             if (k1 > dq.hi) {
-                k::kv_deq(l.kv, l.ring, KL, g.rope, (int) dq.hi, (int) (k1 - dq.hi),
-                          gp.kbuf + (size_t) (dq.hi - dq.base) * KR, gp.s);
+                if (kv_q8)
+                    k::kv_deq(l.kv, st ? l.res : l.ring, KL, g.rope, (int) dq.hi, (int) (k1 - dq.hi),
+                              gp.kbuf + (size_t) (dq.hi - dq.base) * KR, gp.s, st ? l.hs() : k::KvHost{});
+                else
+                    k::kv_gather(l.kv, l.res, KR, (int) dq.hi, (int) (k1 - dq.hi),
+                                 gp.kbuf + (size_t) (dq.hi - dq.base) * KR, gp.s, l.hs());
                 dq.hi = k1;
             }
             K = gp.kbuf + (size_t) (k0 - dq.base) * KR;
@@ -2569,7 +2717,9 @@ struct Model::Impl {
         dbg("q_resid", l.il, gp, gp.qr, T, g.q_lora);
         if (inject) ref_cmp("q_resid", l.il, gp, gp.qr, (size_t) T * g.q_lora, T);
         ok = ok && mm(gp, l.q_b, gp.qr, g.q_lora, T, gp.q, (size_t) H * g.k_mla);
-        k::kv_store(gp.kvr, T, KL, R, l.kv_a_norm, g.eps, gp.pos, l.base, l.kv, l.ring, s, kv_q8);
+        k::kv_store(gp.kvr, T, KL, R, l.kv_a_norm, g.eps, gp.pos, l.base, l.kv, l.res > 0 ? l.res : l.ring, s, kv_q8,
+                    l.hs());
+        if (l.res > 0) l.hi = std::max(l.hi, p0 + T);
         Deq dq;
         // q: q_pe rotated in place, q_nope into the latent space through k_b, both side by side in qcat
         k::rope(gp.q, T, H, g.k_mla, (size_t) H * g.k_mla, nope, R, gp.pos, l.base, s);
@@ -2610,6 +2760,23 @@ struct Model::Impl {
                 k::ix_select(gp.score, npool_ld, ts, gp.pos + t0, KP, top, gp.keys + (size_t) t0 * maxk, maxk,
                              gp.knk + t0, s);
                 if (T > W && attn_prompt(l, gp, t0, ts, p0, false, scale, dq)) continue;
+                if (l.wrapped() && ts > 1) {
+                    // (KV streaming, several tokens: each picked position's row fetched once - the ring's or the
+                    //  host's -, the same kernel over them through the keys' rows there, in the same order)
+                    k::kv_pick_union(l.kv, l.res, kv_rb(), gp.keys + (size_t) t0 * maxk, maxk, gp.knk + t0, ts, gp.pslot,
+                                     gp.pcount, gp.plist, gp.pkeys, gp.kpick, s, l.hs());
+                    k::attention(gp.qcat + (size_t) t0 * H * KR, ts, H, KL, R, gp.kpick, 0, gp.pkeys, maxk, nullptr,
+                                 gp.knk + t0, maxk, scale, l.sinks, gp.ws, gp.o + (size_t) t0 * H * KL, s, kv_q8);
+                    continue;
+                }
+                if (l.wrapped()) {
+                    // (one token: its picked rows side by side)
+                    k::kv_pick(l.kv, l.res, kv_rb(), gp.keys + (size_t) t0 * maxk, maxk, gp.knk + t0, ts, gp.kpick, s,
+                               l.hs());
+                    k::attention(gp.qcat + (size_t) t0 * H * KR, ts, H, KL, R, gp.kpick, 0, nullptr, 0, gp.plo,
+                                 gp.knk + t0, maxk, scale, l.sinks, gp.ws, gp.o + (size_t) t0 * H * KL, s, kv_q8);
+                    continue;
+                }
                 k::attention(gp.qcat + (size_t) t0 * H * KR, ts, H, KL, R, l.kv, 0, gp.keys + (size_t) t0 * maxk, maxk,
                              nullptr, gp.knk + t0, maxk, scale, l.sinks, gp.ws, gp.o + (size_t) t0 * H * KL, s, kv_q8);
             }
