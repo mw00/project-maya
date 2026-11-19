@@ -73,16 +73,34 @@ static void regular_security_checks(const fs::path& path) {
     const bool readable = queried && user->User.Sid && IsValidSid(user->User.Sid) && GetAce(dacl, 0, &raw_ace);
     expect(readable, "REGULAR_SECURITY effective caller identity and actual ACE are readable");
     if (!readable) return;
+    const bool bounded_ace = strata::core::regular_file_detail::read_caller_ace(
+        dacl, raw_ace, user->User.Sid, descriptor ? LocalSize(descriptor) : 0);
+    expect(bounded_ace, "REGULAR_SECURITY actual ACE passes the production bounded caller check");
+    if (!bounded_ace) return;
     const auto ace = static_cast<const ACCESS_ALLOWED_ACE*>(raw_ace);
+    const auto sid_length = static_cast<std::size_t>(GetLengthSid(user->User.Sid));
+    const auto descriptor_start = reinterpret_cast<std::uintptr_t>(descriptor);
+    const auto owner_start = reinterpret_cast<std::uintptr_t>(owner);
+    const bool bounded_owner = owner && owner_start >= descriptor_start &&
+        strata::core::regular_file_detail::fits_range(GetSecurityDescriptorLength(descriptor),
+                                                      owner_start - descriptor_start, sid_length);
     expect(ace->Header.AceType == ACCESS_ALLOWED_ACE_TYPE && ace->Header.AceFlags == 0 &&
-           ace->Mask == FILE_ALL_ACCESS && IsValidSid(const_cast<DWORD*>(&ace->SidStart)) &&
-           EqualSid(const_cast<DWORD*>(&ace->SidStart), user->User.Sid) && owner &&
-           IsValidSid(owner) && EqualSid(owner, user->User.Sid),
+           ace->Mask == FILE_ALL_ACCESS && std::memcmp(&ace->SidStart, user->User.Sid, sid_length) == 0 &&
+           bounded_owner && std::memcmp(owner, user->User.Sid, sid_length) == 0,
            "REGULAR_SECURITY actual non-inherited allow ACE and owner identify only the effective caller");
 }
 #endif
 static void regular_stream_checks(const fs::path& root) {
     using File = strata::core::RegularFileStream;
+    using strata::core::regular_file_detail::fits_range;
+    expect(fits_range(8, 2, 6), "REGULAR_RANGE exact remaining byte count fits");
+    expect(fits_range(8, 2, 5), "REGULAR_RANGE one byte below remaining count fits");
+    expect(!fits_range(8, 2, 7), "REGULAR_RANGE one byte beyond remaining count fails");
+    expect(fits_range(8, 8, 0) && fits_range(0, 0, 0), "REGULAR_RANGE empty range at end fits");
+    expect(!fits_range(8, 9, 0), "REGULAR_RANGE offset beyond end fails even for zero length");
+    const auto count_max = (std::numeric_limits<std::size_t>::max)();
+    expect(fits_range(count_max, count_max - 1, 1) && !fits_range(count_max, count_max - 1, 2) &&
+           !fits_range(8, 1, count_max), "REGULAR_RANGE maximum counts cannot wrap into a fitting range");
     fs::create_directories(root);
     const auto path = root / "regular-roundtrip.bin";
     std::error_code ec;

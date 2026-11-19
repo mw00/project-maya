@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <filesystem>
 #include <iostream>
 #include <limits>
@@ -29,6 +30,37 @@
 #endif
 
 namespace strata::core {
+
+namespace regular_file_detail {
+constexpr bool fits_range(std::size_t total, std::size_t offset, std::size_t length) {
+    return offset <= total && length <= total - offset;
+}
+#ifdef _WIN32
+static_assert(sizeof(ACE_HEADER) <= offsetof(ACCESS_ALLOWED_ACE, Mask));
+static_assert(offsetof(ACE_HEADER, AceSize) + sizeof(DWORD) <= offsetof(ACCESS_ALLOWED_ACE, SidStart));
+// acl_limit bounds the allocation holding acl; expected is our validated local token SID.
+inline bool read_caller_ace(PACL acl, const void* raw, PSID expected, std::size_t acl_limit) {
+    if (!acl || !raw || !expected || !fits_range(acl_limit, 0, sizeof(ACL))) return false;
+    const auto base = reinterpret_cast<std::uintptr_t>(acl), address = reinterpret_cast<std::uintptr_t>(raw);
+    if (address < base || address - base < sizeof(ACL)) return false;
+    const auto offset = address - base;
+    ACL_SIZE_INFORMATION size{};
+    if (!GetAclInformation(acl, &size, sizeof size, AclSizeInformation) ||
+        size.AclBytesInUse > acl->AclSize || size.AclBytesInUse > acl_limit || size.AceCount != 1) return false;
+    if (!fits_range(size.AclBytesInUse, offset, sizeof(ACE_HEADER))) return false;
+    ACE_HEADER header{};
+    std::memcpy(&header, raw, sizeof header);
+    constexpr auto sid_offset = offsetof(ACCESS_ALLOWED_ACE, SidStart);
+    const auto sid_size = GetLengthSid(expected);
+    if (!fits_range(size.AclBytesInUse, offset, header.AceSize) || header.AceSize < sid_offset ||
+        header.AceSize - sid_offset != sid_size || header.AceType != ACCESS_ALLOWED_ACE_TYPE || header.AceFlags) return false;
+    const auto* bytes = static_cast<const unsigned char*>(raw);
+    ACCESS_MASK mask{};
+    std::memcpy(&mask, bytes + offsetof(ACCESS_ALLOWED_ACE, Mask), sizeof mask);
+    return mask == FILE_ALL_ACCESS && std::memcmp(bytes + sid_offset, expected, sid_size) == 0;
+}
+#endif
+} // namespace regular_file_detail
 
 // Owns one regular-file handle; stream operations never reopen its path.
 // Final-component no-follow checks still require private, stable parent directories.
@@ -281,17 +313,26 @@ inline bool RegularFileStream::Buffer::CreationSecurity::verify(HANDLE file, std
     SECURITY_DESCRIPTOR_CONTROL control = 0;
     DWORD revision = 0;
     void* raw_ace = nullptr;
-    if (!actual || !IsValidSecurityDescriptor(actual) || !owner || !IsValidSid(owner) ||
-        !EqualSid(owner, sid.data()) || !dacl || !IsValidAcl(dacl) || dacl->AceCount != 1 ||
+    // LocalSize bounds what LocalAlloc handed out; the header's length bounds what the ACL claims.
+    const auto allocation = actual ? LocalSize(actual) : 0;
+    const auto descriptor_size = actual && IsValidSecurityDescriptor(actual) ? GetSecurityDescriptorLength(actual) : 0;
+    const auto within = [&](const void* part, std::size_t length, std::size_t limit) {
+        const auto base = reinterpret_cast<std::uintptr_t>(actual), address = reinterpret_cast<std::uintptr_t>(part);
+        return part && address >= base && regular_file_detail::fits_range(limit, address - base, length);
+    };
+    const auto contains = [&](const void* part, std::size_t length) { return within(part, length, allocation); };
+    const auto sid_size = GetLengthSid(sid.data());
+    if (!actual || !IsValidSecurityDescriptor(actual) || !within(owner, sid_size, descriptor_size) ||
+        std::memcmp(owner, sid.data(), sid_size) != 0 || !contains(dacl, sizeof(ACL)) ||
+        !within(dacl, sizeof(ACL), descriptor_size) || !IsValidAcl(dacl) ||
+        !within(dacl, dacl->AclSize, descriptor_size) || !contains(dacl, dacl->AclSize) ||
+        dacl->AceCount != 1 ||
         !GetSecurityDescriptorControl(actual, &control, &revision) ||
         (control & (SE_DACL_PRESENT | SE_DACL_PROTECTED)) != (SE_DACL_PRESENT | SE_DACL_PROTECTED) ||
         !GetAce(dacl, 0, &raw_ace)) {
         ec = std::make_error_code(std::errc::permission_denied); return false;
     }
-    const auto ace = static_cast<const ACCESS_ALLOWED_ACE*>(raw_ace);
-    if (ace->Header.AceType != ACCESS_ALLOWED_ACE_TYPE || ace->Header.AceFlags != 0 ||
-        ace->Mask != FILE_ALL_ACCESS || !IsValidSid(const_cast<DWORD*>(&ace->SidStart)) ||
-        !EqualSid(const_cast<DWORD*>(&ace->SidStart), sid.data())) {
+    if (!regular_file_detail::read_caller_ace(dacl, raw_ace, sid.data(), allocation)) {
         ec = std::make_error_code(std::errc::permission_denied); return false;
     }
     return true;
