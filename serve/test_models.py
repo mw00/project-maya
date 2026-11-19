@@ -467,6 +467,37 @@ class Settings(unittest.TestCase):
                     self.assertEqual(new["args"], M.set_flag(big["args"], "--max-context", ctx))
                     self.assertEqual(new["installer"], big["installer"])
 
+    def test_hy4_page_on_an_amd_apu_counts_the_pcs_memory(self):
+        """An AMD config ("backend": "hip") asks for the AMD cards, which keep what says they are AMD: the page then
+        counts a unified-memory APU's memory as the setup does (the PC's, not the BIOS's 0.5 GB of VRAM; nvidia-smi's
+        reading of another card is not its)."""
+        import maya
+        import setup as SU
+        p = hy4_cfg(self.d)
+        c = json.loads(p.read_text())
+        c.update(args=["--pack", M.flag(c["args"], "--pack"), "--max-context", "32768"], gpu=[0], backend="hip")
+        p.write_text(json.dumps(c, indent=1))
+        cfg = M.read(p)
+        halo = [{"index": 0, "name": "AMD Radeon (gfx1151)", "vram_gb": 0.5, "arch": "gfx1151", "vendor": "amd"}]
+        M._gpu_cache.clear()
+        M._hy4_used_cache.clear()
+        asked = []
+        try:
+            with mock.patch.object(SU, "amd_gpus", side_effect=lambda *a: asked.append("amd") or halo), \
+                    mock.patch.object(SU, "gpus", side_effect=AssertionError("the NVIDIA list is not this config's")), \
+                    mock.patch.object(maya, "mem_gb", return_value=(61.0, 57.0)), mock.patch.object(maya, "WIN", False), \
+                    mock.patch.object(maya, "amd_gpu_limit_gib", return_value=None), \
+                    mock.patch.object(maya, "gpu_used_mib", return_value={0: 31000}), \
+                    mock.patch.object(maya, "maya_engine_mib", return_value={}):
+                self.assertEqual(M.machine_gpus("hip"), halo)
+                room = M.hy4_room(cfg)
+            self.assertEqual(asked, ["amd"])
+            self.assertAlmostEqual(room["usable"], 53.0)               # (61 GB less the 8 GB kept for the system)
+            self.assertEqual(room["contexts"], M.HY4_CONTEXTS)
+        finally:
+            M._gpu_cache.clear()
+            M._hy4_used_cache.clear()
+
     def test_hy4_page_reads_the_vram_in_use_as_the_setup_does(self):
         """The Models page offers the contexts the setup offers: the cards' VRAM in use is the setup's own reading
         (nvidia-smi's figure now, at most 1 GB a card counted) - and a loaded Maya engine's own VRAM is not "in use",

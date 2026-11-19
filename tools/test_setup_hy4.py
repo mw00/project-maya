@@ -1,5 +1,5 @@
 """tools/test_setup_hy4.py - the setup's Hy4-Flash (maya.py): the one table that switches its sizes on
-(tools/hy4/download.json), where it is offered (NVIDIA only), the layout and the context worked out from the VRAM
+(tools/hy4/download.json), where it is offered (NVIDIA; AMD on Linux), the layout and the context worked out from the VRAM
 before any download, the n-gram table shared between its folders, its pack and its config.  No GPU, no network (the
 one question the setup asks Hugging Face - is a layout's file uploaded: maya.hy4_on_hub - is answered here); its
 vision tower (the mmproj file: downloaded with the model unless --no-vision, packed when it is in the folder, off
@@ -392,9 +392,12 @@ class Picker(unittest.TestCase):
             self.assertIn(part, about)
         self.assertNotIn("Max", about)
         self.assertNotIn("Maya-S", about)                             # (only the sizes that are uploaded)
-        self.assertNotIn("AMD", about)
+        self.assertIn("or AMD on Linux (Strix Halo / Gorgon Halo, Radeon cards)", about)
         self.assertNotIn("Mac", about)
-        self.assertNotIn("Hy4-Flash", self.rows(args(model=None, backend="hip"), man=manifest())["rows"])
+        with patch.object(maya, "WIN", False):                        # (AMD: Linux only so far)
+            self.assertIn("Hy4-Flash", self.rows(args(model=None, backend="hip"), man=manifest())["rows"])
+        with patch.object(maya, "WIN", True):
+            self.assertNotIn("Hy4-Flash", self.rows(args(model=None, backend="hip"), man=manifest())["rows"])
 
     def test_the_setup_before(self):
         prev = {"exe": "/b/maya-hy4", "args": ["--pack", "/p"], "installer": {"family": "hy4"}}
@@ -439,7 +442,7 @@ class Picker(unittest.TestCase):
 
 
 class Gate(unittest.TestCase):
-    """NVIDIA (CUDA) on Linux and Windows, V100 on; no AMD and no Mac engine yet."""
+    """NVIDIA (CUDA) on Linux and Windows, V100 on; AMD (HIP) on Linux; no Mac engine yet."""
 
     def check(self, backend="cuda", gpus=None, win=False):
         said = []
@@ -447,7 +450,8 @@ class Gate(unittest.TestCase):
                 patch.object(maya.sys, "platform", "win32" if win else "linux"), \
                 patch.object(maya.S, "gpus", return_value=gpus or []), patch.object(maya, "say", said.append), \
                 patch.object(maya, "warn", said.append), patch.object(maya.S, "is_wsl", return_value=False), \
-                patch.object(maya, "check_hip_pc", side_effect=AssertionError("no AMD check for Hy4-Flash")), \
+                patch.object(maya, "check_hip_pc", side_effect=lambda a, **k: said.append(("hip", k)) or
+                             {"backend": "hip", "gpus": []}), \
                 patch.object(maya, "check_metal_pc", side_effect=AssertionError("no Mac check for Hy4-Flash")), \
                 patch.object(maya, "choose_gpus", side_effect=lambda a, found, cc, fam: said.append(cc) or fail("stop")):
             try:
@@ -456,10 +460,17 @@ class Gate(unittest.TestCase):
                 return str(e), said
         return "", said
 
-    def test_amd(self):
-        why, _ = self.check("hip")
-        self.assertIn("Hy4-Flash's engine (maya-hy4) runs on NVIDIA GPUs only for now: there is no AMD (HIP) build yet", why)
-        self.assertIn("V100 or newer", why)
+    def test_amd_on_linux_goes_to_the_amd_check(self):
+        why, said = self.check("hip")
+        self.assertEqual(why, "")
+        self.assertEqual(said, [("hip", {"text_only": False})])       # (pictures: the tower runs on HIP too)
+
+    def test_amd_on_windows_not_yet(self):
+        why, said = self.check("hip", win=True)
+        self.assertIn("runs on AMD GPUs on Linux only for now: with an AMD GPU on Windows it has not been tested yet",
+                      why)
+        self.assertIn("set it up on Linux on this PC, or on a PC with an NVIDIA GPU (V100 or newer", why)
+        self.assertEqual(said, [])
 
     def test_mac(self):
         why, _ = self.check("metal")
@@ -472,10 +483,91 @@ class Gate(unittest.TestCase):
             self.assertIn(70, said)                                    # (min_cc: V100 on)
             self.assertTrue(any("too old" in str(s) for s in said))    # (the Pascal card)
 
-    def test_cmake_builds_it_for_cuda_only(self):
+    def test_cmake_builds_it_for_cuda_and_hip(self):
         text = (ROOT / "CMakeLists.txt").read_text(encoding="utf-8")
         at = text.index("add_executable(maya-hy4 ")
-        self.assertIn("if(STRATA_ENABLE_CUDA)", text[at - 400:at])
+        self.assertIn("if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)", text[at - 60:at])
+        # (its vision tower's BF16 type on HIP: the compat header, not CUDA's own)
+        self.assertTrue((ROOT / "include" / "strata" / "hip_compat" / "cuda_bf16.h").exists())
+
+
+def halo(index=0):
+    """A Strix Halo / Gorgon Halo's Radeon as setup's amd_gpus lists it on Linux (its VRAM: the BIOS's small share)."""
+    return {"index": index, "name": "AMD Radeon (gfx1151)", "vram_gb": 0.5, "arch": "gfx1151", "vendor": "amd"}
+
+
+def radeon(gib=20.0, index=0):
+    return {"index": index, "name": "AMD Radeon RX 7900 XT", "vram_gb": float(gib), "arch": "gfx1100", "vendor": "amd"}
+
+
+class Amd(unittest.TestCase):
+    """AMD cards: no nvidia-smi reading; a unified-memory APU's memory is the PC's, counted once, less the system's
+    share - and no more than Linux lets the GPU take."""
+
+    def pc(self, ram, limit=None, win=False):
+        return [patch.object(maya, "mem_gb", return_value=(float(ram), float(ram) - 4)), patch.object(maya, "WIN", win),
+                patch.object(maya, "amd_gpu_limit_gib", return_value=limit),
+                patch.object(maya, "gpu_used_mib", side_effect=AssertionError("nvidia-smi is not these cards'"))]
+
+    def on(self, ram, limit=None):
+        stack = contextlib.ExitStack()
+        for p in self.pc(ram, limit):
+            stack.enter_context(p)
+        return stack
+
+    def test_cards(self):
+        self.assertTrue(maya.hy4_amd([halo()]))
+        self.assertTrue(maya.hy4_amd([{"index": 0, "arch": "gfx1100", "vram_gb": 20.0}]))
+        self.assertFalse(maya.hy4_amd([card(32)]))
+        self.assertFalse(maya.hy4_amd([]))
+
+    def test_radeon_cards(self):
+        with self.on(64):
+            self.assertAlmostEqual(maya.hy4_usable_gib([radeon()]), 17.0)             # (3 GB a card left to the desktop)
+            self.assertAlmostEqual(maya.hy4_usable_gib([radeon(index=i) for i in range(4)], {0: 9000}), 68.0)
+            self.assertIsNone(maya.hy4_apu_note([radeon()], XS, "Hy4-Flash-Maya-XS"))
+
+    def test_apu_memory_is_the_pcs(self):
+        with self.on(187):                                             # (a 192 GB Gorgon Halo as Linux counts it)
+            self.assertAlmostEqual(maya.hy4_usable_gib([halo()]), 187 - 18.7)
+        with self.on(61):                                              # (a 64 GB one: 8 GB kept free at least)
+            self.assertAlmostEqual(maya.hy4_usable_gib([halo()]), 53.0)
+        with self.on(123, limit=62.0):                                 # (Linux's own limit for the GPU, where lower)
+            self.assertAlmostEqual(maya.hy4_usable_gib([halo()]), 62.0)
+        with self.on(123, limit=180.0):
+            self.assertAlmostEqual(maya.hy4_usable_gib([halo()]), 123 - 12.3)
+
+    def test_which_sizes_a_halo_holds_whole(self):
+        q = TABLE["quants"]
+        sizes = ("Hy4-Flash-Maya-XS", "Hy4-Flash-Maya-M", "Hy4-Flash-Maya-L")
+        for ram, whole in ((61, 1), (92, 2), (123, 3), (187, 3)):      # (64 / 96 / 128 / 192 GB PCs as Linux counts them)
+            with self.on(ram):
+                got = [maya.hy4_apu_note([halo()], q[n], n) for n in sizes]
+            self.assertEqual([g[0] for g in got], [i < whole for i in range(3)], ram)
+            for (fits, line), n in zip(got, sizes):
+                self.assertIn(n, line)
+                self.assertIn("no expert is computed on the CPU" if fits else "computes the others on the CPU", line)
+
+    def test_linux_limit_said(self):
+        with self.on(123, limit=62.0):
+            fits, line = maya.hy4_apu_note([halo()], TABLE["quants"]["Hy4-Flash-Maya-L"], "Hy4-Flash-Maya-L")
+        self.assertFalse(fits)
+        self.assertIn("Linux lets the GPU take 62 GB of this PC's memory", line)
+        self.assertIn("ttm.pages_limit", line)
+
+    def test_fit(self):
+        with self.on(61):
+            fit = maya.hy4_fit(XS, [halo()])
+        self.assertEqual((fit["layout"], fit["context"], fit["vision"], fit["args"]), ("standard", 32768, True, []))
+        self.assertAlmostEqual(fit["usable"], 53.0)
+        with self.on(64):                                              # (a 20 GB Radeon: the standard layout, pictures)
+            fit = maya.hy4_fit(XS, [radeon()])
+        self.assertEqual((fit["layout"], fit["vision"]), ("standard", True))
+        self.assertAlmostEqual(fit["usable"], 17.0)
+
+    def test_limit_read_from_sysfs(self):
+        with patch.object(maya.sys, "platform", "win32"):
+            self.assertIsNone(maya.amd_gpu_limit_gib())
 
 
 class Need(unittest.TestCase):
@@ -1038,18 +1130,23 @@ class Config(unittest.TestCase):
         for p in self.patches:
             p.stop()
 
-    def write(self, a=None, old=None, gpus=(0,), fit=None, ctx=32768):
+    def write(self, a=None, old=None, gpus=(0,), fit=None, ctx=32768, backend=None):
         path = self.root / "maya-hy4-flash-maya-xs.json"
         if old is not None:
             path.write_text(json.dumps(old))
-        pc = {"gpus": [{"index": i} for i in gpus]}
+        pc = {"gpus": [{"index": i} for i in gpus], **({"backend": backend} if backend else {})}
         p = maya.write_config_hy4(a or args(), pc, {"lib_dirs": ["/cuda/lib"]}, self.pack, ctx, Path("/models"),
                                   self.pack.parent, quant="maya-xs", fit=fit)
         self.assertEqual(p, path)                                     # (maya_quants.config_stem: one config a size)
         return json.loads(p.read_text())
 
+    def test_amd_config_says_its_backend(self):
+        self.assertEqual(self.write(backend="hip")["backend"], "hip")
+        self.assertNotIn("backend", self.write(backend="cuda"))
+
     def test_fresh(self):
         c = self.write()
+        self.assertNotIn("backend", c)
         self.assertEqual(c["args"], ["--pack", str(self.pack), "--max-context", "32768"])
         self.assertEqual((c["sampling"], c["reasoning_effort"]), ({"temperature": 0.9, "top_p": 1.0}, "high"))
         self.assertEqual((c["model_name"], c["gpu"], c["port"]), ("hy4-flash", [0], 8080))
@@ -1448,10 +1545,18 @@ class Setup(unittest.TestCase):
         self.assertEqual([g["index"] for g in got], [0, 1, 2])
         self.assertTrue(seen[0].startswith("Hy4-Flash runs best on all of them"), seen)
 
-    def test_linux_nvidia_only(self):
-        a = type("A", (), {"backend": "hip"})()
+    def test_not_on_metal(self):
+        a = type("A", (), {"backend": "metal"})()
         with patch.object(maya, "step"), self.assertRaises(SystemExit):
             maya.check_pc(a, "hy4")
+
+    def test_amd_on_linux_goes_to_the_hip_check(self):
+        a = type("A", (), {"backend": "hip"})()
+        with patch.object(maya, "step"), patch.object(maya, "WIN", False), \
+                patch.object(maya.sys, "platform", "linux"), \
+                patch.object(maya, "check_hip_pc", return_value={"backend": "hip"}) as hip:
+            self.assertEqual(maya.check_pc(a, "hy4"), {"backend": "hip"})
+        hip.assert_called_once_with(a, text_only=False)
 
 
 class Dashboard(unittest.TestCase):

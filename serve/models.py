@@ -935,7 +935,7 @@ def hy4_room(cfg: dict) -> dict | None:
     VRAM left out), so the page and the setup offer the same contexts.  None where it cannot be worked out: a card of
     the config this PC does not list with its VRAM, a size the table has no plan for."""
     inst, args, gpus = cfg.get("installer") or {}, cfg.get("args") or [], gpus_of(cfg)
-    cards = {g["index"]: g for g in machine_gpus("cuda")}
+    cards = {g["index"]: g for g in machine_gpus(cfg.get("backend") or "cuda")}
     if not gpus or any(not (cards.get(i) or {}).get("vram_gb") for i in gpus):
         return None
     try:
@@ -1005,7 +1005,7 @@ def hy4_refit(new: dict) -> dict | None:
     pictures switched off (--vision off, or a pack without the tower) are not counted, as with the setup's
     --no-vision.  None where it cannot be worked out, or where the context does not fit (hy4_context_check says so)."""
     inst, args, gpus = new.get("installer") or {}, new.get("args") or [], gpus_of(new)
-    cards = {g["index"]: g for g in machine_gpus("cuda")}
+    cards = {g["index"]: g for g in machine_gpus(new.get("backend") or "cuda")}
     if hy4_plain(new) or not gpus or any(not (cards.get(i) or {}).get("vram_gb") for i in gpus):
         return None
     try:
@@ -1067,7 +1067,7 @@ def hy4_contexts(cfg: dict) -> list:
     if hy4_plain(cfg):
         # (no VRAM plan: the setup's own list, and up to the model's 1M where the smallest card is large enough for the
         #  cache - maya.py's hy4_q4_contexts; the one the config has stays offered)
-        cards, cur = {g["index"]: g for g in machine_gpus("cuda")}, settings_of(cfg)["context"]
+        cards, cur = {g["index"]: g for g in machine_gpus(cfg.get("backend") or "cuda")}, settings_of(cfg)["context"]
         vram = min((float((cards.get(i) or {}).get("vram_gb") or 0) for i in gpus_of(cfg)), default=0.0)
         return HY4_Q4_CONTEXTS + [c for c in HY4_Q4_LONG if c <= cur or c * HY4_KV_Q8_BYTES / 2**30 <= HY4_Q4_LONG_SHARE * vram]
     cur, room = settings_of(cfg)["context"], hy4_room(cfg)
@@ -1109,7 +1109,10 @@ def machine_gpus(backend: str = "cuda") -> list:
     try:
         import setup as SU                              # (the project's setup.py: nvidia-smi / the KFD topology)
         raw = SU.amd_gpus() if backend == "hip" else SU.gpus()
-        found = [{"index": int(g["index"]), "name": g.get("name"), "vram_gb": g.get("vram_gb")} for g in raw or []]
+        # (an AMD card keeps what says so: maya.py's hy4_usable_gib counts its memory another way - a unified-memory
+        #  APU's is the PC's)
+        found = [{"index": int(g["index"]), "name": g.get("name"), "vram_gb": g.get("vram_gb"),
+                  **({"arch": g.get("arch"), "vendor": "amd"} if backend == "hip" else {})} for g in raw or []]
     except (ImportError, OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError):
         found = []
     _gpu_cache[backend] = (now, found)

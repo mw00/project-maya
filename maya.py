@@ -780,7 +780,8 @@ QWEN_UD_MODEL_NAME = "qwen3.8-flash-next"
 QWEN_QUANTS = ("q5_k_m", QWEN_UD)
 # Hy4-Flash (v1.1.68): Tencent's tencent/Hy4-flash (hy_v4_flash, 220B with its n-gram tables: 42 layers and an MTP
 # block, MLA attention with a sliding window and 12 indexed layers, 512 experts, 16 a token, 4 hyper-connection streams,
-# Engram) on its own engine maya-hy4 (src/hy4; NVIDIA: CUDA, Linux and Windows, V100 on - no AMD or Mac engine yet),
+# Engram) on its own engine maya-hy4 (src/hy4; NVIDIA: CUDA, Linux and Windows, V100 on; AMD: HIP, Linux - a
+# unified-memory APU (Strix Halo / Gorgon Halo) or Radeon cards; no Mac engine yet),
 # which reads GGUF sets in place (packed by tools/hy4/pack_gguf.py).  tools/hy4/download.json is the one table of its
 # files: Project Maya's own quants ("quants": which sizes are uploaded) and Tencent's own Q4_K_M from AngelSlim
 # ("others": pinned, sha256-checked - the one set with the MTP block, so the one that drafts: --mtp; run on RTX 30 /
@@ -1602,11 +1603,14 @@ def check_pc(a, family: str = "glm", gguf: bool = False, ds4_quant: str = "exl3"
         fail(f"{MM3}'s engine (maya-mm3) runs on Linux only for now (its Windows build is on the way)",
              f"set it up on a Linux PC with an NVIDIA GPU ({mm3_gpus()})")
     hy4 = family == "hy4"
-    if hy4 and a.backend == "hip":
-        fail(f"{HY4}'s engine (maya-hy4) runs on NVIDIA GPUs only for now: there is no AMD (HIP) build yet",
-             "set it up on a PC with an NVIDIA GPU (V100 or newer)")
+    if hy4 and a.backend == "hip" and (WIN or not sys.platform.startswith("linux")):
+        # (maya-hy4's AMD build: built and run on Linux - a Gorgon Halo's Radeon 8065S, and RX 7900 XT cards by its
+        #  contributor; on Windows with an AMD GPU it has not been built or run yet)
+        fail(f"{HY4}'s engine (maya-hy4) runs on AMD GPUs on Linux only for now: with an AMD GPU on Windows it has not "
+             "been tested yet",
+             "set it up on Linux on this PC, or on a PC with an NVIDIA GPU (V100 or newer; Linux or Windows)")
     if a.backend == "hip":
-        return check_hip_pc(a, text_only=not mm3)
+        return check_hip_pc(a, text_only=not (mm3 or hy4))
     if a.backend == "metal":
         if family != "glm":
             fail(f"Maya's setup runs GLM-5.3-Flash only on a Mac (not {ds4 and DS4 or mm3 and MM3 or hy4 and HY4 or QWEN_SHOWN})",
@@ -1991,13 +1995,15 @@ def choose_family(a, prev: dict) -> str:
     # sizes that are uploaded (hy4_published), then Tencent's own Q4_K_M; --model / --hy4-quant name it either way
     hy4s = [k for k in HY4_QUANTS if hy4_published(k)]
     q4 = hy4_entry() if hy4_published(HY4_Q4) else None
-    if default == "hy4" or ((hy4s or q4) and getattr(a, "backend", None) != "hip"):
+    amd = getattr(a, "backend", None) == "hip"         # (AMD: Linux only so far - check_pc says why on Windows)
+    if default == "hy4" or ((hy4s or q4) and not (amd and WIN)):
         rows.append((HY4, None,
                      "Tencent's Hy4-flash (220B with its n-gram tables; 512 experts, 16 a token) on its own engine"
                      + (", in Maya's own GGUF quants: " +
                         ", ".join(f"{HY4_QUANTS[k]} ({hy4_entry(k)['download_gb']:.0f} GB)" for k in hy4s)
                         if hy4s else "") +
-                     "; NVIDIA from V100 on, Linux or Windows; what is not a routed expert in VRAM, the experts that do "
+                     "; NVIDIA from V100 on, Linux or Windows, or AMD on Linux (Strix Halo / Gorgon Halo, Radeon "
+                     "cards); what is not a routed expert in VRAM, the experts that do "
                      "not fit computed on the CPU, the n-gram table read from the SSD; tool calls, thinking High or "
                      "Off; pictures (its vision tower, where the VRAM has room for one beside the model)." +
                      (f" Or Tencent's own Q4_K_M (AngelSlim; {q4['download_gb']:.0f} GB, about {q4['memory_gb']:.0f} GB "
@@ -8319,12 +8325,71 @@ def hy4_config_need_gib(quant: str, layout: str, ctx: int, chunk: int | None = N
     return need
 
 
+def hy4_amd(gpus: list) -> bool:
+    """These are AMD cards (the HIP backend's: setup's amd_gpus entries, arch gfx...)."""
+    return any(g.get("vendor") == "amd" or str(g.get("arch") or "").startswith("gfx") for g in gpus or [])
+
+
+def amd_gpu_limit_gib() -> float | None:
+    """Linux: the memory the amdgpu driver lets programs take on a GPU - its VRAM and its share of the RAM (GTT: on
+    an APU nearly all of what the engine uses; half the RAM unless the kernel was told more, e.g.
+    ttm.pages_limit) - the largest card's, from sysfs; None where it does not say."""
+    best = None
+    for d in sorted(Path("/sys/class/drm").glob("card[0-9]*/device")) if sys.platform.startswith("linux") else ():
+        try:
+            if (d / "vendor").read_text().strip().lower() != "0x1002":
+                continue
+            b = int((d / "mem_info_gtt_total").read_text()) + int((d / "mem_info_vram_total").read_text())
+        except (OSError, ValueError):
+            continue
+        best = max(best or 0.0, b / 2**30)
+    return best
+
+
+def hy4_apu_gib(gpus: list) -> float:
+    """The memory (GiB) a unified-memory APU (hip_unified_memory: Strix Halo / Gorgon Halo) has for the model on its
+    GPU: the PC's one memory (apu_memory) less what the engine keeps free for the system and the other programs
+    (apu_margin_gb, as src/hy4's own headroom) - and on Linux no more than the driver lets the GPU take
+    (amd_gpu_limit_gib)."""
+    ram, _ = mem_gb()
+    pool = apu_memory(sum(float(g.get("vram_gb") or 0) for g in gpus or []), ram, not WIN) - apu_margin_gb(ram)
+    lim = None if WIN else amd_gpu_limit_gib()
+    return max(min(pool, lim) if lim else pool, 0.0)
+
+
+def hy4_apu_note(gpus: list, q: dict, name: str) -> tuple | None:
+    """On a unified-memory APU: (True, line) where its memory holds all of a size - every routed expert sits in the
+    GPU's memory, none is computed on the CPU - else (False, line): what the GPU's share does not hold is computed on
+    the CPU from the same memory, or read from the SSD.  None on other PCs, or with no figure for the size."""
+    if not hy4_amd(gpus) or not any(hip_unified_memory(g) for g in gpus):
+        return None
+    need, have = float(q.get("memory_gb") or 0), hy4_apu_gib(gpus)
+    if need <= 0:
+        return None
+    if have >= need:
+        return True, (f"unified memory: all of {name} (about {need:.0f} GB with its caches) sits in the GPU's memory - "
+                      f"{have:.0f} GB of this PC's memory are the model's to take; no expert is computed on the CPU")
+    ram, _ = mem_gb()
+    lim = None if WIN else amd_gpu_limit_gib()
+    why = (f"Linux lets the GPU take {lim:.0f} GB of this PC's memory (the kernel's limit for it: ttm.pages_limit, "
+           "see docs/AMD_MAYA.md)" if lim and lim < apu_memory(0.0, ram, not WIN) - apu_margin_gb(ram) - 0.5 else
+           f"this PC's memory leaves {have:.0f} GB for the model")
+    return False, (f"unified memory: {name} takes about {need:.0f} GB with its caches and {why}: the engine keeps the "
+                   "most-routed experts in the GPU's memory and computes the others on the CPU - slower; a smaller "
+                   "size sits in the GPU's memory whole")
+
+
 def hy4_usable_gib(gpus: list, used: dict | None = None) -> float:
     """The VRAM (GiB) the chosen cards have for the model: their total less what is in use on each now (nvidia-smi;
     at most HY4_FIT_USED_CAP_GIB a card counts - more is a program that can be closed).  No reading: one card is
-    taken to drive a desktop (HY4_FIT_DISPLAY_GIB)."""
-    used = gpu_used_mib() if used is None else used
+    taken to drive a desktop (HY4_FIT_DISPLAY_GIB).  AMD cards (nvidia-smi does not read them): their VRAM less what
+    the engines leave the desktop on each (hip_reserve_mib); a unified-memory APU: hy4_apu_gib."""
     total = sum(float(g.get("vram_gb") or 0) for g in gpus or [])
+    if hy4_amd(gpus):
+        if any(hip_unified_memory(g) for g in gpus):
+            return hy4_apu_gib(gpus)
+        return max(total - len(gpus) * hip_reserve_mib(gpus) / 1024.0, 0.0)
+    used = gpu_used_mib() if used is None else used
     if not used:
         return max(total - (HY4_FIT_DISPLAY_GIB if gpus else 0.0), 0.0)
     return max(total - sum(min(float(used.get(g.get("index"), 0)) / 1024.0, HY4_FIT_USED_CAP_GIB) for g in gpus), 0.0)
@@ -8506,7 +8571,7 @@ def choose_hy4_quant(a, prev: dict) -> str:
               f"Tencent's own Q4_K_M (AngelSlim): {hy4_quant_table(k).get('about', 'GGUF')}; about "
               f"{m[k]['memory_gb']:.0f} GB of VRAM and RAM together; with MTP drafting - run on NVIDIA RTX 30 / A100 "
               "and newer, Linux") for k in others]
-    pick = choose(f"Which files of {HY4}?", ["Maya's GGUF quants of it, on NVIDIA from V100 on, and Tencent's own:"],
+    pick = choose(f"Which files of {HY4}?", ["Maya's GGUF quants of it, on NVIDIA from V100 on or AMD (Linux), and Tencent's own:"],
                   rows, order.index(default), a.yes or getattr(a, "check", False))
     return order[pick]
 
@@ -8721,7 +8786,8 @@ def write_config_hy4(a, pc: dict, meta: dict, pack: Path, ctx: int, models: Path
     cfg = {"exe": str(HY4_EXE), "args": args, "cwd": str(ROOT), "tokenizer": str(pack / "tokenizer"),
            "model_name": HY4_MODEL_NAME, "gpu": [g["index"] for g in pc["gpus"]],
            "sampling": sampling, "reasoning_effort": effort,
-           "lib_dirs": meta.get("lib_dirs") or old.get("lib_dirs") or [], "port": port}
+           "lib_dirs": meta.get("lib_dirs") or old.get("lib_dirs") or [], "port": port,
+           **({"backend": "hip"} if pc.get("backend") == "hip" else {})}
     for k in ("host", "api_key", "cors_origins", "mcp_servers"):
         if old.get(k) is not None:
             cfg[k] = old[k]
@@ -8775,7 +8841,11 @@ def hy4_fit_step(a, pc: dict, quant: str, prev_ctx: int | None = None, have=None
         fit = hy4_fit(q, pc["gpus"], ctx, layout=fit["layout"], pictures=not a.no_vision)
     if "error" in fit:
         fail(fit["error"] + (f" (the files in {a.model_dir} are the {forced} layout's)" if forced else ""), fit["hint"])
-    if fit["layout"] == HY4_STANDARD:
+    if fit["layout"] == HY4_STANDARD and hy4_amd(pc["gpus"]) and any(hip_unified_memory(g) for g in pc["gpus"]):
+        # (a unified-memory APU: the next line - set_up_hy4's hy4_apu_note - says whether the experts all sit there)
+        ok(f"{name} fits: about {fit['need']:.1f} GB for what must sit on the GPU, of the {fit['usable']:.1f} GB of "
+           "this PC's memory the GPU can take")
+    elif fit["layout"] == HY4_STANDARD:
         ok(f"{name} fits: about {fit['need']:.1f} GB of the {fit['usable']:.1f} GB of VRAM for what must sit there; "
            "the engine fills the rest with the most-routed experts and computes the others on the CPU")
     else:
@@ -8793,7 +8863,8 @@ def hy4_fit_step(a, pc: dict, quant: str, prev_ctx: int | None = None, have=None
 
 
 def set_up_hy4(a, prev: dict) -> Path | None:
-    """Hy4-Flash's steps 1-8: the files (Maya's sizes, or Tencent's own Q4_K_M), the PC (NVIDIA from V100 on), the
+    """Hy4-Flash's steps 1-8: the files (Maya's sizes, or Tencent's own Q4_K_M), the PC (NVIDIA from V100 on; AMD on
+    Linux: hy4_usable_gib counts a unified-memory APU's one memory, hy4_apu_note says what it holds), the
     context - a Maya size: with the layout that fits its VRAM, worked out before any download; the Q4_K_M: recommended
     by the smallest GPU's VRAM, and its drafting - the engine (build/maya-hy4), the files (pinned, sha256-checked), the
     pack, the config.  Nothing to measure yet."""
@@ -8842,7 +8913,10 @@ def set_up_hy4(a, prev: dict) -> Path | None:
     else:
         ok(f"files: {name} (Maya's quant)")
         fit = hy4_fit_step(a, pc, quant, prev_ctx, lambda lay: hy4_dir(a, models, prev, quant, lay))
-        if total > 0 and vram + total < need:
+        note = hy4_apu_note(pc["gpus"], hy4_quant_table(quant), name)
+        if note:
+            (ok if note[0] else warn)(note[1])
+        elif total > 0 and vram + total < need:
             warn(f"{vram:.0f} GB of VRAM and {total:.0f} GB of RAM: below the ~{need:.0f} GB that hold all of {name} - "
                  "slower: parts of the model are then read from the SSD")
     d = hy4_dir(a, models, prev, quant, fit["layout"])
@@ -9424,7 +9498,7 @@ def main() -> int:
                          "from V100 on and on AMD; with --model-dir: the files you have (the same as --model "
                          "minimax-maya-xs / minimax-maya-s)")
     ap.add_argument("--hy4-quant", choices=list(HY4_QUANTS) + [HY4_Q4],
-                    help=f"{HY4}'s files, Maya's own GGUF quants of it (NVIDIA from V100 on, Linux or Windows; text "
+                    help=f"{HY4}'s files, Maya's own GGUF quants of it (NVIDIA from V100 on, Linux or Windows; AMD on Linux; text "
                          "only for now): maya-xs = Hy4-Flash-Maya-XS (routed experts in 2 bits), maya-s / maya-m / "
                          "maya-l once they are published; q4_k_m = Tencent's own Q4_K_M from AngelSlim, with MTP "
                          "drafting (--drafting off: without; run on RTX 30 / A100 and newer, Linux); with "
