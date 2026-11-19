@@ -12,7 +12,7 @@
  "mtp": {
   "mtp/Hy4-Flash-mtp-BF16.gguf_file": [7486183072, "a49e5ae439de9a51c680b9110563106743e8d579d91e4d4cb514a527fa908908"]
  },
- "mtp_revision": "",
+ "mtp_revision": "8027c703f9b49924e610d900edf8bdba2d82d12a",
  "ngram": {
   "Maya-XS/Hy4-Flash-Maya-XS-IQ2_XXS-00002-of-00002.gguf": [63360616160, "5819578b52eb1cda0945a716e0575331406d976b6eebc74db8544b3d478ad244"]
  },
