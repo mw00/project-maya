@@ -16,6 +16,13 @@ struct KvPick {
     long long patches = 0;   // ... for a picture of this many patches at most (the tower's largest, or fewer)
 };
 
+/// The VRAM a start gives up on the main GPU for a picture whose encode takes `room` bytes: none where the head
+/// GPU's prompt buffers (`lend` bytes of scratch in one block, idle while a picture is read - a picture comes before
+/// its prompt) hold it - the tower works in them and nothing of the plan is given up for pictures; where they are
+/// smaller, only what is missing (the block is made that much longer).  kv_pick's `room` is this: with every
+/// picture's room lent, its steps with a picture are its steps without one.
+inline double vision_keep(double room, double lend) { return room <= lend ? 0.0 : room - lend; }
+
 /// What is tried, in order, and the first that fits taken - `fits(q8, room)`: the model's own parts fit in VRAM with
 /// the cache in 8-bit rows (or F16) and `room` bytes kept free on the main GPU for a picture (0: none).  Pictures go
 /// before the rows' precision, a picture of the tower's largest size before a smaller one:

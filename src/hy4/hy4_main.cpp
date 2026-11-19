@@ -573,8 +573,9 @@ int serve(hy4::Model& m, const std::vector<int>& eos, int n_draft, float floor0)
                 st0.experts_vram);
     if (const hy4::VisionGeo* vg = m.vision())   // (serve/hy4_vision.py's Geometry.from_info)
         std::printf("INFO vision=hy4 image_token=%d image_start=%d image_end=%d vision_patch=%d vision_merge=%d "
-                    "vision_max_pixels=%d vision_min_pixels=%d\n", vg->image_token, vg->image_start, vg->image_end,
-                    vg->patch, vg->merge, vg->max_pixels, vg->min_pixels);
+                    "vision_max_pixels=%d vision_min_pixels=%d vision_room=%s vision_room_mib=%zu\n", vg->image_token,
+                    vg->image_start, vg->image_end, vg->patch, vg->merge, vg->max_pixels, vg->min_pixels,
+                    m.vision_room(), m.vision_room_bytes() >> 20);
     else
         for (const auto& l : m.info_lines())
             if (l.rfind("NOTE vision off", 0) == 0) {   // (a tower that did not load: the dashboard says why)
@@ -1142,7 +1143,10 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "maya-hy4: %s\n", err.c_str());
             return 1;
         }
-        std::fprintf(stderr, "pictures: %zu encoded in %.0f ms\n", pics.size(), 1e3 * (now() - ti));
+        long long lent = 0, own = 0;
+        m.vision_reads(lent, own);   // (the warm-up's picture is one of them)
+        std::fprintf(stderr, "pictures: %zu encoded in %.0f ms (so far %lld in the prompt buffers, %lld in room of "
+                     "their own)\n", pics.size(), 1e3 * (now() - ti), lent, own);
         m.set_images(std::move(rows));
     }
     if (trace > 0) return run_trace(m, ids, trace);

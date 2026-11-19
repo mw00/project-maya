@@ -792,9 +792,9 @@ QWEN_QUANTS = ("q5_k_m", QWEN_UD)
 # every set, from Maya's repo: downloaded once, hard-linked) is read from the SSD page by page, never loaded into RAM.
 # Pictures: the model's vision tower (the mmproj file beside the set - Maya's own Q8_0 one for every Maya size,
 # AngelSlim's BF16 for the Q4_K_M; not with --no-vision) runs in the engine a picture at a time: its weights stay in the
-# file, a picture's room (HY4_VISION_GIB; a smaller picture's where the VRAM holds no more - the engine says the size,
-# the server resizes to it) is kept free on the main GPU - where the model leaves none the setup turns pictures off
-# and says so.  It thinks at one level (high) or not at all (no_think); its sampling is its
+# file, and a picture's room (HY4_VISION_GIB while it is read) is lent by the engine's prompt buffers, idle then -
+# no VRAM is kept for pictures, so every card that runs the model reads them at full size (an 8 GB card's buffers at
+# its 256-token chunk: 1.0 GB).  It thinks at one level (high) or not at all (no_think); its sampling is its
 # generation_config.json's (maya_quants.MODEL_DEFAULTS["hy4"]); one request at a time.  Each Maya size in <models
 # folder>/<its full name> (a layout of it: <name>-8GB), its config maya-hy4-flash-maya-xs.json; the Q4_K_M in <models
 # folder>/Hy4-flash, its config maya-hy4-flash.json.
@@ -821,10 +821,9 @@ HY4_Q4_LONG_SHARE = 0.25                           # (the cache in 8-bit rows: a
 # (Maya's sizes draft with Tencent's MTP block from a file of its own - download.json's "mtp": the engine rounds its BF16
 #  matrices to Q8_0, HY4_MTP_VRAM of the file's bytes, always in VRAM, and keeps a prompt chunk of rows beside it)
 HY4_MTP_VRAM = 0.56
-HY4_VISION_GIB = 0.81                              # (the engine's room for its largest picture, 2048 x 2048: 828 MB of the main GPU)
-# (... and for the smallest picture budget it takes, a sixteenth of the largest: 512 x 512 - src/hy4/hy4_vision.cu's
-#  layout: the weights' two slots, the attention's scores, cuBLAS's workspace and the patches' rows)
-HY4_VISION_MIN_GIB = 0.21
+HY4_VISION_GIB = 0.81                              # (the engine's room for its largest picture, 2048 x 2048: 828 MB of the main GPU while it is read)
+# (lent by the prompt buffers - src/hy4/hy4_model.cu's vis_encode: no VRAM of its own; the 8 GB layout's buffers at its
+#  256-token chunk come to 1013 MB on an RTX 3050 at 4K-32K, so the fit counts nothing for pictures)
 HY4_DEFAULT_CONTEXT = 65536
 # its cache a context token: the 13 layers that keep every position (the 12 indexed ones and the MTP block) - the latent
 # (512 + 64 rope, F16) and the indexer's pooled keys (128 F32 every 4 positions); the sliding-window layers keep a ring
@@ -8464,17 +8463,17 @@ def hy4_fit(q: dict, gpus: list, ctx_wanted: int | None = None, used: dict | Non
     {"layout": "standard" where its plan fits the VRAM (hy4_usable_gib) at the context - else a small-card layout the
     size has; "context": ctx_wanted, else "recommended" - the largest of HY4_CONTEXTS that fits, up to
     HY4_TESTED_CONTEXT; "contexts": all that fit; "kv": the latent cache's rows the engine's --kv auto takes at the
-    context - "f16" or "q8" (8-bit rows; never said on screen: the engine chooses at every start); "vision": a
-    picture's room fits ("vision_small": a smaller picture's only); "chunk" and "args": the layout's own engine flags
+    context - "f16" or "q8" (8-bit rows; never said on screen: the engine chooses at every start); "vision":
+    pictures are read ("vision_small": smaller ones than the tower's largest); "chunk" and "args": the layout's own engine flags
     (none for "standard": the engine's defaults - it fills the VRAM left with the most-routed experts itself, and its
     own plan takes the prompt chunk at every start: the largest of 4096 / 2048 / 1024 tokens that these cards hold
     beside the model, its cache and the pictures' room - pictures first there too, src/hy4/hy4_plan.hpp's chunk_pick -
     so no --chunk is written and none can be one the engine would refuse; never --kv: the engine's auto); "usable",
-    "need" (GiB, with the rows of "kv")}.  Pictures go before the prompts' speed:
-    a small-card layout reads prompts in chunks twice its plan's (HY4_CHUNK_UP_GIB) only where that fits beside the
-    largest picture's room - VRAM that holds one of the two goes to the picture, and where only a smaller picture
-    fits, all the room there is goes to it.  pictures False (--no-vision: no picture is ever read): the chunk is
-    doubled where it fits beside the model's own parts alone.
+    "need" (GiB, with the rows of "kv")}.  Pictures take no VRAM of their own (the engine lends a picture's room
+    from its prompt buffers), so they are on wherever the model runs, at full size, and cost no context and no
+    row's precision ("vision_small" is always False now, kept for the callers); a small-card layout reads prompts in
+    chunks twice its plan's (HY4_CHUNK_UP_GIB) where that fits beside the model's own parts - with or without
+    pictures.
     Nothing fits: {"error": why, "hint": what to do, "usable", "need"}.  layout: only this one (the files of a folder
     are that layout's)."""
     lays = hy4_layouts(q)
@@ -8512,22 +8511,13 @@ def hy4_fit(q: dict, gpus: list, ctx_wanted: int | None = None, used: dict | Non
     kv = rows(plan, ctx)
     takes = hy4_fit_need_gib(plan, ctx, kv == "q8")
     chunk, args = int(plan.get("chunk") or 0), []
-    # (pictures: the engine keeps a picture's room free on the main GPU - the context is never made smaller for it.
-    #  Its order, src/hy4/hy4_plan.hpp's kv_pick - pictures before the cache's rows: F16 rows and the largest
-    #  picture's room, 8-bit rows and that room, F16 then 8-bit rows and a smaller picture's room (HY4_VISION_MIN_GIB
-    #  at least: the engine then says the pictures' size and the server resizes to it), and only then text only, with
-    #  the rows worked out above)
-    vision, small = False, False
-    for q8, room in ((False, HY4_VISION_GIB), (True, HY4_VISION_GIB), (False, HY4_VISION_MIN_GIB),
-                     (True, HY4_VISION_MIN_GIB)) if pictures else ():
-        if hy4_fit_need_gib(plan, ctx, q8) + room <= usable:
-            kv, vision, small = "q8" if q8 else "f16", True, room < HY4_VISION_GIB
-            takes = hy4_fit_need_gib(plan, ctx, q8)
-            break
+    # (pictures: their room is lent by the engine's prompt buffers - no VRAM kept, so the rows and the context
+    #  worked out above stand and the largest picture is read on every layout)
+    vision, small = bool(pictures), False
     if pick != HY4_STANDARD:
-        # (the chunk after the pictures: doubled only where that leaves the picture chosen above as it is - beside
-        #  the largest picture's room with the same rows; a smaller picture already takes all the room there is)
-        if chunk and not small and takes + (HY4_VISION_GIB if vision else 0.0) + HY4_CHUNK_UP_GIB <= usable:
+        # (the chunk: doubled where that fits beside the model's own parts with the rows chosen above - the larger
+        #  chunk's buffers hold the largest picture by themselves, so pictures and the chunk no longer compete)
+        if chunk and takes + HY4_CHUNK_UP_GIB <= usable:
             chunk *= 2
         args = (["--chunk", str(chunk)] if chunk else []) +             [x for k, flag in (("reserve_gb", "--reserve-gb"), ("vram_experts", "--vram-experts")) if k in plan
              for x in (flag, f"{float(plan[k]):g}")]
@@ -9013,13 +9003,11 @@ def set_up_hy4(a, prev: dict) -> Path | None:
     if files is None:
         return None
     vis = hy4_vision_step(a, d, quant, models)
-    # a Maya size's drafts: the block where it fits on the main GPU beside the model's own parts at this context (and
-    # a picture's room where pictures are on) - a small-card layout has no room for it, and it is not fetched there
+    # a Maya size's drafts: the block where it fits on the main GPU beside the model's own parts at this context
+    # (pictures take no VRAM of their own) - a small-card layout has no room for it, and it is not fetched there
     mtp, mtp_why = None, ""
     if quant != HY4_Q4 and hy4_mtp_entry() is not None:
-        room = float(fit.get("need") or 0) + hy4_mtp_gib(int(fit.get("chunk") or 1024)) + \
-            (HY4_VISION_GIB if fit.get("vision") and not fit.get("vision_small") and not a.no_vision else
-             HY4_VISION_MIN_GIB if fit.get("vision") and not a.no_vision else 0.0)
+        room = float(fit.get("need") or 0) + hy4_mtp_gib(int(fit.get("chunk") or 1024))
         if fit["layout"] != HY4_STANDARD or room > float(fit.get("usable") or 0):
             mtp_why = (f"the draft block needs about {hy4_mtp_gib():.1f} GB of VRAM beside the model's own parts "
                        f"({room:.1f} GB with it at this context, {float(fit.get('usable') or 0):.1f} GB free on "
@@ -9039,20 +9027,19 @@ def set_up_hy4(a, prev: dict) -> Path | None:
     elif a.no_vision:
         ok("pictures: off (--no-vision; the pack has the vision tower: Images on the Models page turns them on)")
     elif not pictures:
-        warn(f"pictures: OFF on this PC - at a context of {fit['context']} tokens the model leaves no room in the VRAM "
-             f"for a picture (about {HY4_VISION_MIN_GIB:.1f} GB while a small one is read, {HY4_VISION_GIB:.1f} GB for "
-             f"the largest; {fit.get('usable', 0):.1f} GB free, the model's own parts {fit.get('need', 0):.1f} GB): "
-             "text works as before, a picture sent is refused in plain words; a smaller context or a card with more "
-             "VRAM reads pictures")
+        warn(f"pictures: OFF on this PC - at a context of {fit['context']} tokens the model's own parts fill the VRAM "
+             f"({fit.get('usable', 0):.1f} GB free, the model's own parts {fit.get('need', 0):.1f} GB): text works as "
+             "before, a picture sent is refused in plain words")
     elif fit.get("vision_small"):
         ok("pictures: ON - the model's own vision tower runs in the engine, a picture at a time: its weights stay in "
-           "the file (RAM as the page cache). The VRAM beside the model holds a smaller picture than the tower's "
-           "largest here, so the server makes big pictures smaller before the model reads them (the engine's start "
-           "line says the size; fine print in a big picture may be lost - a card with more VRAM reads it whole)")
+           "the file (RAM as the page cache) and no VRAM is kept for pictures. At this context the card is a little "
+           "short of the tower's largest picture, so the server makes very big pictures slightly smaller before the "
+           "model reads them (the engine's start line says the size)")
     else:
         ok("pictures: ON - the model's own vision tower runs in the engine, a picture at a time: its weights stay in "
-           "the file (RAM as the page cache), a picture's room (under 1 GB) is kept free on the main GPU; the server "
-           "resizes the pictures, the Chat's picture button is shown")
+           "the file (RAM as the page cache) and no VRAM is kept for pictures (a picture's room, under 1 GB, is lent "
+           "by the prompt buffers while it is read); the server resizes the pictures, the Chat's picture button is "
+           "shown")
     if quant != HY4_Q4:
         how = getattr(a, "drafting", None)
         if mtp is None:

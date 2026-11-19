@@ -43,7 +43,8 @@ struct Options {
                                   // scales, the rotated part F16; the indexer's rows F16: about 58% of the VRAM), -1
                                   // auto - F16 where the context fits in VRAM with it, 8-bit rows where it fits
                                   // only with them (any layout: one GPU, the layer split, tensor parallel)
-    bool vision = true;           // the vision tower (the pack's mmproj file) on the main GPU, its room kept free there
+    bool vision = true;           // the vision tower (the pack's mmproj file) on the main GPU: a picture's room is lent by
+                                  // the prompt buffers while it is read (made longer by what they lack of it, if anything)
     bool vision_auto = true;      // (not asked for by name: a pack without one runs text only, no error)
     bool verbose = false;
 };
@@ -107,6 +108,12 @@ public:
         std::vector<float> rows;
     };
     const VisionGeo* vision() const;
+    /// Where a picture's room comes from: "chunk" - lent by the head GPU's prompt buffers (idle while a picture is
+    /// read; no VRAM kept for pictures), "free" - kept free between pictures (HY4_VISION_LEND=0);
+    /// nullptr: no tower.  Its bytes for the largest picture this start reads; the pictures read so far each way.
+    const char* vision_room() const;
+    size_t vision_room_bytes() const;
+    void vision_reads(long long& lent, long long& own) const;
     bool encode_image(const uint8_t* rgb, int width, int height, std::vector<float>& rows, std::string& err);
     void set_images(std::vector<Image> images);
 

@@ -2362,21 +2362,18 @@ The context's cache sits in VRAM alone in this engine, so the setup and the Mode
 model's 1M that fits the cards (Maya-XS at 1M: about 19 GiB, a 24 GB card), never one that does not, and say in one
 line when a larger one needs more VRAM. A card with less than about 7 GB cannot run it.
 
-**Pictures** are on where the card has room for one beside the model (the setup downloads Maya's vision file,
-0.8 GB, unless `--no-vision`): 0.8 GB of VRAM for the tower's largest picture, kept free on the main GPU. Where the
-card has less, the engine keeps the room of a smaller picture (0.2 GB at least) and the server makes big pictures
-that size before the model reads them - an 8 GB card with a desktop on it reads pictures of up to about 1.8 million
-pixels at 8K and 512 x 512 at 32K (the engine's start line says the size; fine print in a big picture may be lost).
-Pictures go before the cache's precision: the engine takes the 8-bit cache rows to keep a picture's room before it
-gives pictures up. Only where not even a small picture's room is left does the setup write `--vision off` and say
-so. Images on the Models page turns them on or off; the details are under "Pictures" below.
+**Pictures** are on wherever the model runs (the setup downloads Maya's vision file, 0.8 GB, unless
+`--no-vision`), at the tower's full size (2048 x 2048), 8 GB cards included. The tower's weights stay in the file and
+the room a picture takes while it is read (up to 0.8 GB) is lent by the engine's prompt buffers, which are idle
+then: no VRAM is kept for pictures, so they cost no context, no cache precision and no expert its place in VRAM
+(the engine's start line says `lent by the prompt buffers`). Images on the Models page turns them on or off; the details are under "Pictures" below.
 
 **Drafting with Maya's sizes:** they draft with Tencent's MTP block through the same `--mtp` as below. The sets made
 from the public release do not carry the block, so it comes as a file of its own (`Hy4-Flash-mtp-BF16.gguf`, 7.5 GB,
 one for every size, from Maya's repo: the block as in AngelSlim's GGUF, its weights unchanged). The setup puts it in
 the model's folder and the pack (`tools/hy4/pack_gguf.py`, `--mtp FILE|none`) indexes it as one more file; the engine
 then finds the block as it does in a set that carries it. It takes about 4 GB of VRAM on the main GPU: the setup
-turns drafting on where that fits beside the model's own parts and a picture's room, and leaves it off (and the block
+turns drafting on where that fits beside the model's own parts, and leaves it off (and the block
 out of the pack) on smaller cards and in the 8 GB-card layout. `--drafting on|off` at the setup, or Drafting on the
 Models page, changes it. On AMD an answer written with drafting can differ from the same answer without it from a
 token on (seen with Maya-L on a Radeon; Maya-XS gave the same tokens with and without). `--drafting off`, or the
@@ -2444,10 +2441,11 @@ instead: the latent's 512 values as int8 in blocks of 32 with an F16 scale and t
 against 1152), the indexer's per-position rows and pooled keys in F16 (the reference's own cache type) - about 9.6 KB
 a token, the sliding-window rings too. `--kv auto`, the default, takes F16 wherever the context fits in VRAM with it
 and the 8-bit rows where it fits only with them (an INFO line says so) - on one GPU, on the layer split and on tensor
-parallel alike: on eight 16 GB members 256K fits only so, on an 8 GB card 16K and 32K. Pictures go before the rows'
-precision. The order, the first that fits: F16 rows and the largest picture's room; 8-bit rows and that room; F16,
-then 8-bit rows and a smaller picture's room; F16 rows text only; 8-bit rows text only (the last two only where
-pictures were not asked for by name). A start that fits with F16 rows and the largest picture's room is never
+parallel alike: on eight 16 GB members 256K fits only so, on an 8 GB card 16K and 32K. Pictures take no part in
+it: their room is lent by the prompt buffers (see "Pictures" below), so the rows are those of a start without
+pictures. (Only where a hand-set tiny `--chunk` leaves buffers smaller than a picture's room does the engine add
+what is missing, and then pictures go before the rows' precision: F16 rows and the largest picture; 8-bit rows and
+it; F16, then 8-bit rows and a smaller picture.) A start that fits with F16 rows is never
 changed; `--kv f16` and `--kv q8` force one. The setup's fit and the Models page count on the same choice and do not
 name it: it is the engine's, said in its log. The prompt path
 dequantizes the rows a layer's chunk reads into an F16 scratch once; the token path's attention reads the 8-bit rows
@@ -2509,13 +2507,17 @@ The state is shared with the next request only where the same picture sits at th
 patches is most of it. `maya-hy4 --pack <pack> --encode-image FILE.rgb --size WxH --dump-image OUT [--gpus I]` runs
 the tower alone (raw RGB in, F32 rows out). A quantized mmproj file is read too (Maya's: the layers' matrices in Q8_0,
 F16 where a row is no multiple of 32): those matrices are made BF16 as a layer is copied in, and its rows are within
-cosine 0.99996 of the BF16 file's. Where the main GPU has no room for the tower's largest picture beside the model's
-own parts, the engine keeps the room of a smaller one - as many patches as fit, a sixteenth of the largest at least
-(512 x 512) - and says the size (`INFO pictures up to N pixels on this GPU`, and `vision_max_pixels` to the server,
-which resizes to it). On an RTX 3050 8 GB with a desktop on it: the largest picture at 4K, 1.77 million pixels at 8K,
-0.71 million at 16K, 512 x 512 at 32K. Where not even that fits the engine starts text only and says so (`NOTE vision
-off`); `--vision on` asks for the tower by name and stops with the error instead. Keeping the picture's room free leaves a little less VRAM for routed experts (on a 32 GB V100
-with Maya-XS: 59% of them in VRAM instead of 61%, decode about 3% slower); `--vision off` gives it back.
+cosine 0.99996 of the BF16 file's. A picture's room is never resident: a picture is read before its prompt, when the head GPU's prompt buffers are idle,
+so the tower works in them (one allocation: 1.0 GB at the 8 GB layout's 256-token chunk, 3.6 GB at 1,024 tokens; the
+largest picture takes 0.83 GB) and the bytes it used are zeroed afterwards. Nothing is kept free for pictures, the
+experts are placed as with `--vision off`, and text answers are the same with pictures on or off. On an RTX 3050
+8 GB with a desktop on it the largest picture (2048 x 2048) is read at every context from 4K to 32K (before: scaled
+down to 1.77 million pixels at 8K and 512 x 512 at 32K). Where buffers are smaller than a picture's room (a hand-set
+tiny `--chunk`) the engine makes them longer by what is missing, or reads the largest picture they hold and says
+the size (`INFO pictures up to N pixels on this GPU`, and `vision_max_pixels` to the server, which resizes to it).
+`INFO vision=hy4 ... vision_room=chunk vision_room_mib=N` tells the server where the room comes from. `--vision
+off` loads no tower; `--vision on` asks for it by name and stops with an error where it does not load.
+`HY4_VISION_LEND=0` keeps the room free between pictures instead (the earlier behaviour).
 
 Engine options, in the config's `"args"`:
 
@@ -2556,6 +2558,8 @@ A request's `spec` (0 / 1) turns the drafts off or on for it.
 | `HY4_TP_HELPER` | by speed | tensor parallel: `0` no expert share for the GPUs outside the group; `k`: k slices each (as their VRAM allows) |
 | `HY4_TP_MIXED` | off | tensor parallel over GPUs of different kinds (their copies of the state may drift apart) |
 | `HY4_DENSE_MAX` | picked at the start | prompts: up to how many earlier positions the 12 indexed layers' attention runs on the tensor cores (one FP16 product over every earlier key, the indexer's picks kept by a mask) before it goes to the gathering kernel the token path uses. Both read the indexer's same picks, so the limit moves no pick - only how a token's attention is summed (answers can differ in the last bits, as between two prompt chunks). The tensor-core path's time grows with the positions, the gathering kernel's does not: on Tesla V100s they cross at about 24,000. At every start the engine takes the largest of 24576 / 16384 whose buffers (about 215 MB a GPU for 24576, a third of that on a tensor-parallel member) fit the plan without costing the layout, the cache's rows, the pictures, the MTP pass's own scratch or a routed expert its place in VRAM, on GPUs with tensor cores (compute capability 7.0 and later), and 8192 otherwise; its start line says which (`INFO prompts: the indexed layers' attention on the tensor cores up to N positions`). So GPUs that hold every expert (tensor parallel, a layer split with room) take a longer span, and a card that holds a part of the experts beside the CPU lane keeps 8192 - its decoding and its answers stay as they were. `HY4_DENSE_MAX=N` tries N alone (up to 65536; it is taken where the plan holds it, also where it moves some experts from the VRAM to the CPU lane: on one Tesla V100 a 16K prompt read 7% faster with 24576, with 1.5% fewer experts in VRAM); `HY4_DENSE_MAX=8192`: as before v1.1.68 |
+| `HY4_VISION_LEND` | on | `0`: a picture's room is not lent by the prompt buffers - it is kept free on the main GPU between pictures and allocated for each (the earlier behaviour; for comparisons) |
+| `HY4_ROUTE` | by the measured rates | debugging, a PC whose routed experts are not all in VRAM: `stream` or `lane` pins where a prompt chunk's other experts are computed (streamed to the GPU / the CPU lane). The engine picks per layer and chunk by its own timings, and the two routes sum a token's experts in another order, so two starts can differ in the last bit and a long greedy answer can part ways; pinned, runs and builds compare token for token |
 | `HY4_TP_CHECK` | off | debugging: after each forward, every member's copy of the state compared |
 | `HY4_TP_PROF` | off | debugging: the host's waits and sums a token window |
 | `HY4_TP_LATENT_SUM` | off | tensor parallel: the FFN's partials summed in the latent space, projected up after the sum (a third more to send) |
