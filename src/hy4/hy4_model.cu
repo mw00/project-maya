@@ -360,6 +360,8 @@ struct Model::Impl {
     // copied (HY4_MTP_SYNC=1: in line, as before)
     Gpu hm;
     bool mtp_async = false;
+    bool mtp_own = false;                // (the plan's: that scratch is counted on the head's GPU - tensor_split)
+    std::vector<double> free0;           // each GPU's free VRAM as the plan first read it (a plan run again: the same)
     std::atomic<bool> emb_pending{false};   // (a queued pass's copy of h_emb maybe still in flight)
     cudaEvent_t ev_hin = nullptr, ev_mtp = nullptr, ev_emb = nullptr;
     std::unique_ptr<Crew> mtp_crew;
@@ -735,6 +737,9 @@ struct Model::Impl {
     // the buffers a GPU allocates for a forward (scratch()): the chunk's activations (Tc rows), the token path's int8
     // inputs and experts (W rows), the attention / indexer sub-batches' (kSub rows) and the GEMMs' weight band
     static constexpr int kSub = 64;
+    // --chunk auto: the chunks tried above kChunkBase, largest first (hy4_plan.hpp's chunk_pick)
+    static constexpr int kChunkBase = 1024;
+    static constexpr int kChunks[2] = {4096, 2048};
     static constexpr int kStage = 128;   // (a prompt's streamed experts a pass)
     static constexpr int kDenseMax = 8192;   // (the indexed layers' keys a dense sub-batch spans at most)
     // the prompt path's F16 rows of the cache a layer's dense sub-batches read (kbuf): a window's and a chunk's, or an
@@ -843,51 +848,57 @@ struct Model::Impl {
                 err = "--gpus " + std::to_string(d) + ": " + std::to_string(ndev) + " GPUs visible";
                 return false;
             }
-        G.resize(devs.size());
-        std::vector<double> free_b(devs.size());
-        for (size_t i = 0; i < devs.size(); ++i) {
-            G[i].dev = devs[i];
-            CK(cudaSetDevice(devs[i]));
-            CK(cudaStreamCreateWithFlags(&G[i].s, cudaStreamNonBlocking));
-            CK(cudaEventCreateWithFlags(&G[i].ev, cudaEventDisableTiming | cudaEventBlockingSync));
-            size_t fr = 0, tot = 0;
-            CK(cudaMemGetInfo(&fr, &tot));
+        // (the GPUs' streams, their free VRAM and their memory's speed: read once - --chunk auto plans several chunks
+        //  against the same readings)
+        if (G.empty()) {
+            G.resize(devs.size());
+            free0.assign(devs.size(), 0.0);
+            for (size_t i = 0; i < devs.size(); ++i) {
+                G[i].dev = devs[i];
+                CK(cudaSetDevice(devs[i]));
+                CK(cudaStreamCreateWithFlags(&G[i].s, cudaStreamNonBlocking));
+                CK(cudaEventCreateWithFlags(&G[i].ev, cudaEventDisableTiming | cudaEventBlockingSync));
+                size_t fr = 0, tot = 0;
+                CK(cudaMemGetInfo(&fr, &tot));
 #if !defined(_WIN32)
-            // a unified-memory GPU (an APU: Strix Halo / Gorgon Halo): its memory is the system's RAM, so what the
-            // model may take is what the RAM has (MemAvailable: the model's own file cache counts as available - the
-            // kernel drops it as the weights are copied in, the file is never held twice) less a headroom for the
-            // system and the other programs, max(8 GiB, a tenth of the RAM) - HY4_RAM_HEADROOM_GB: another one
-            int integrated = 0;
-            if (cudaDeviceGetAttribute(&integrated, cudaDevAttrIntegrated, devs[i]) != cudaSuccess) {
-                cudaGetLastError();
-                integrated = 0;
-            }
-            if (integrated != 0) {
-                const uint64_t avail = ram_available(), ram = ram_total();
-                double head = std::max(8.0 * 1073741824.0, 0.1 * (double) ram);
-                if (const char* h = std::getenv("HY4_RAM_HEADROOM_GB")) head = std::max(0.0, std::atof(h)) * 1073741824.0;
-                if (avail > 0) {
-                    // (the GPU's own share - an APU's BIOS carve-out - is not RAM the system counts: on top)
-                    cudaDeviceProp pr{};
-                    double own = 0.0;
-                    if (cudaGetDeviceProperties(&pr, devs[i]) == cudaSuccess)
-                        own = (double) gpu_own_free(pr.pciDomainID, pr.pciBusID, pr.pciDeviceID);
-                    else
-                        cudaGetLastError();
-                    const double room = std::max(0.0, (double) avail - head) + own;
-                    char ub[256];
-                    std::snprintf(ub, sizeof ub, "INFO GPU%zu shares the system's memory: %.1f GB of it available, %.1f GB "
-                                  "kept free for the system, %.1f GB for the model", i, (double) avail / 1e9, head / 1e9,
-                                  std::min(room, (double) fr) / 1e9);
-                    info.push_back(ub);
-                    if (room < (double) fr) fr = (size_t) room;
+                // a unified-memory GPU (an APU: Strix Halo / Gorgon Halo): its memory is the system's RAM, so what the
+                // model may take is what the RAM has (MemAvailable: the model's own file cache counts as available - the
+                // kernel drops it as the weights are copied in, the file is never held twice) less a headroom for the
+                // system and the other programs, max(8 GiB, a tenth of the RAM) - HY4_RAM_HEADROOM_GB: another one
+                int integrated = 0;
+                if (cudaDeviceGetAttribute(&integrated, cudaDevAttrIntegrated, devs[i]) != cudaSuccess) {
+                    cudaGetLastError();
+                    integrated = 0;
                 }
-            }
+                if (integrated != 0) {
+                    const uint64_t avail = ram_available(), ram = ram_total();
+                    double head = std::max(8.0 * 1073741824.0, 0.1 * (double) ram);
+                    if (const char* h = std::getenv("HY4_RAM_HEADROOM_GB")) head = std::max(0.0, std::atof(h)) * 1073741824.0;
+                    if (avail > 0) {
+                        // (the GPU's own share - an APU's BIOS carve-out - is not RAM the system counts: on top)
+                        cudaDeviceProp pr{};
+                        double own = 0.0;
+                        if (cudaGetDeviceProperties(&pr, devs[i]) == cudaSuccess)
+                            own = (double) gpu_own_free(pr.pciDomainID, pr.pciBusID, pr.pciDeviceID);
+                        else
+                            cudaGetLastError();
+                        const double room = std::max(0.0, (double) avail - head) + own;
+                        char ub[256];
+                        std::snprintf(ub, sizeof ub, "INFO GPU%zu shares the system's memory: %.1f GB of it available, %.1f GB "
+                                      "kept free for the system, %.1f GB for the model", i, (double) avail / 1e9, head / 1e9,
+                                      std::min(room, (double) fr) / 1e9);
+                        info.push_back(ub);
+                        if (room < (double) fr) fr = (size_t) room;
+                    }
+                }
 #endif
-            free_b[i] = (double) fr - o.reserve_gb * 1e9 - (double) scratch_bytes();
-            G[i].bw = measure_bw(err);
-            if (G[i].bw <= 0) return false;
+                free0[i] = (double) fr;
+                G[i].bw = measure_bw(err);
+                if (G[i].bw <= 0) return false;
+            }
         }
+        std::vector<double> free_b(devs.size());
+        for (size_t i = 0; i < devs.size(); ++i) free_b[i] = free0[i] - o.reserve_gb * 1e9 - (double) scratch_bytes();
         // the main GPU: the head's, the drafts', the window's coordination - the fastest memory (then the most VRAM)
         if (o.main_gpu >= (int) devs.size()) {
             err = "--main-gpu " + std::to_string(o.main_gpu) + ": " + std::to_string(devs.size()) + " GPUs given";
@@ -917,6 +928,7 @@ struct Model::Impl {
             if (N >= 2) {
                 auto undo = [&] {
                     tp = 0;
+                    mtp_own = false;
                     mem.clear();
                     hel.clear();
                     TL.clear();
@@ -925,16 +937,35 @@ struct Model::Impl {
                         gp.sFF = 0;
                     }
                 };
-                std::vector<double> fb = free_b;
+                // the MTP block's pass over a prompt chunk beside the next chunk: on a scratch of its own on the head's
+                // GPU, counted here - where a member's plan does not hold it, the pass runs in line on the head's
+                // scratch (said), and tensor parallel stays
+                const bool want_own = o.mtp && g.n_mtp > 0 && !std::getenv("HY4_MTP_SYNC");
+                std::vector<double> fb;
+                auto split = [&](std::string& e) {
+                    for (int own = want_own ? 1 : 0; own >= 0; --own) {
+                        undo();
+                        fb = free_b;
+                        e.clear();
+                        if (!tensor_split(ndev, devs, fb, e, N, own == 1)) continue;
+                        if (want_own && !own) {
+                            char mb[240];
+                            std::snprintf(mb, sizeof mb, "INFO the MTP block's pass in line with the prompt's chunks: its "
+                                          "own scratch (%.2f GB at a chunk of %d tokens) does not fit beside a member's "
+                                          "plan on the head's GPU", (double) scratch_bytes() / 1e9, Tc);
+                            info.push_back(mb);
+                        }
+                        return true;
+                    }
+                    return false;
+                };
                 std::string terr;
-                if (tensor_split(ndev, devs, fb, terr, N)) return true;
+                if (split(terr)) return true;
                 // (--kv auto: every member holds the whole cache - in 8-bit rows, 58% of its VRAM, when F16 does not fit)
                 if (o.kv < 0 && !kv_q8 && kv_q8_rows()) {
-                    undo();
                     kv_q8 = true;
-                    fb = free_b;
                     std::string t8;
-                    if (tensor_split(ndev, devs, fb, t8, N)) {
+                    if (split(t8)) {
                         info.push_back("INFO the latent cache in 8-bit rows (--kv auto): with F16 rows tensor parallel "
                                        "does not hold this context (" + terr + ")");
                         return true;
@@ -953,7 +984,7 @@ struct Model::Impl {
         const Tensor* ot = pk.get("output.weight");
         double head_b = (ot ? (double) ot->bytes : 0) + (double) g.n_vocab * W * 4 + (64u << 20) +
                         (double) ring * g.n_embd * 4;   // (the states' ring)
-        if (o.mtp && g.n_mtp > 0) head_b += (double) layer_bytes(g.n_layer) * 0.56 + (double) Tc * g.n_embd * 16;
+        if (o.mtp && g.n_mtp > 0) head_b += (double) layer_bytes(g.n_layer) * 0.56 + mtp_rows_bytes(Tc, g.n_embd);
         L.resize((size_t) g.n_layer);
         free_b[(size_t) main_gi] -= head_b;   // (the head and the MTP block on the main GPU)
         // the layers over the GPUs in order, each with `rho` of its routed experts in VRAM (the others on the CPU
@@ -1076,7 +1107,8 @@ struct Model::Impl {
     // Tensor parallel's plan: the last `tp` GPUs the members (of one kind: their copies of the residual must stay the
     // same bit for bit), the first other GPU the head's (the output head, the MTP block) - member 0's when there is none;
     // each member's VRAM checked against its share of every layer
-    bool tensor_split(int ndev_all, const std::vector<int>& devs, std::vector<double>& free_b, std::string& err, int n_tp) {
+    bool tensor_split(int ndev_all, const std::vector<int>& devs, std::vector<double>& free_b, std::string& err, int n_tp,
+                      bool own = false) {
         (void) ndev_all;
         const int N = std::min<int>(n_tp, (int) devs.size());
         if (N < 2) {
@@ -1141,7 +1173,8 @@ struct Model::Impl {
         const Tensor* ot0 = pk.get("output.weight");
         double head_b0 = (ot0 ? (double) ot0->bytes : 0) + (double) g.n_vocab * W * 4 + (64u << 20) +
                          (double) ring * g.n_embd * 4;
-        if (o.mtp && g.n_mtp > 0) head_b0 += (double) layer_bytes(g.n_layer) * 0.56 + (double) Tc * g.n_embd * 16;
+        if (o.mtp && g.n_mtp > 0) head_b0 += (double) layer_bytes(g.n_layer) * 0.56 + mtp_rows_bytes(Tc, g.n_embd);
+        if (own) head_b0 += (double) scratch_bytes();   // (the MTP pass's own scratch: a whole chunk's buffers)
         double exp_all = 0;   // (every routed expert's bytes)
         for (const auto& [n, t] : pk.t)
             if (n.find("_exps.") != std::string::npos && n.compare(0, 4, "blk.") == 0 &&
@@ -1204,7 +1237,8 @@ struct Model::Impl {
         const Tensor* ot = pk.get("output.weight");
         double head_b = (ot ? (double) ot->bytes : 0) + (double) g.n_vocab * W * 4 + (64u << 20) +
                         (double) ring * g.n_embd * 4;
-        if (o.mtp && g.n_mtp > 0) head_b += (double) layer_bytes(g.n_layer) * 0.56 + (double) Tc * g.n_embd * 16;
+        if (o.mtp && g.n_mtp > 0) head_b += (double) layer_bytes(g.n_layer) * 0.56 + mtp_rows_bytes(Tc, g.n_embd);
+        if (own) head_b += (double) scratch_bytes();
         for (int i : mem) {
             const double have = free_b[(size_t) i] - (i == head_gpu ? head_b : 0.0);
             if (need > have) {
@@ -1228,6 +1262,7 @@ struct Model::Impl {
             err = "--tp: the head's GPU " + std::to_string(devs[(size_t) head_gpu]) + " has too little VRAM free";
             return false;
         }
+        mtp_own = own;
         L.assign((size_t) g.n_layer, Layer());
         for (int il = 0; il < g.n_layer; ++il) {
             L[(size_t) il].il = il;
@@ -1782,8 +1817,12 @@ struct Model::Impl {
         g = pk.g;
         if (o.max_ctx <= 0 || o.max_ctx > g.context) o.max_ctx = g.context;
         o.max_ctx = (o.max_ctx + g.ix_kpool - 1) / g.ix_kpool * g.ix_kpool;
-        Tc = std::max(W, o.prefill_chunk);
-        ring = (int) std::min<int64_t>(o.max_ctx, (int64_t) g.n_swa + std::max(o.ring_slack, Tc));
+        auto set_chunk = [&](int c) {
+            Tc = std::max(W, c);
+            ring = (int) std::min<int64_t>(o.max_ctx, (int64_t) g.n_swa + std::max(o.ring_slack, Tc));
+        };
+        const bool chunk_auto = o.prefill_chunk <= 0;
+        set_chunk(chunk_auto ? kChunkBase : o.prefill_chunk);
         kv_q8 = o.kv == 1;
         if (kv_q8 && (g.kv_lora % 32 || g.kv_lora != 512 || g.rope != 64)) {
             err = "--kv q8: a latent row of " + std::to_string(g.kv_lora) + " + " + std::to_string(g.rope) +
@@ -1816,7 +1855,54 @@ struct Model::Impl {
         } else {
             o.vision = false;
         }
-        if (!plan(err)) return false;
+        if (chunk_auto) {
+            // --chunk auto (no --chunk): the largest of kChunks whose plan keeps what the plan at kChunkBase comes to -
+            // the layout, the cache's rows, the pictures (hy4_plan.hpp's chunk_pick).  Each try is the whole plan
+            // against the same readings of the VRAM, from the state before it
+            const VisionGeo vgeo0 = vgeo;
+            const double room0 = vis_room;
+            const bool vision0 = o.vision;
+            const size_t info0 = info.size();
+            auto again = [&](int c) {
+                tp = 0;
+                mtp_own = false;
+                mem.clear();
+                hel.clear();
+                TL.clear();
+                L.clear();
+                for (Gpu& gp : G) {
+                    gp.sH = 64;
+                    gp.sFF = 0;
+                }
+                kv_q8 = o.kv == 1;
+                vgeo = vgeo0;
+                vis_room = room0;
+                o.vision = vision0;
+                if (vision0 && vis_tok >= 0) pk.eg.token_map[(size_t) vis_tok] = -1;
+                info.resize(info0);
+                set_chunk(c);
+            };
+            const int c = chunk_pick([&](int ch) {
+                again(ch);
+                std::string e;
+                ChunkTry t;
+                t.ok = plan(e);
+                t.tp = tp;
+                t.q8 = kv_q8;
+                t.vision = o.vision;
+                t.pixels = o.vision ? vgeo.max_pixels : 0;
+                return t;
+            }, kChunks, kChunkBase);
+            again(c);
+            if (!plan(err)) return false;
+            char cb[200];
+            std::snprintf(cb, sizeof cb, "INFO prompt chunk: %d tokens (auto: the largest of %d / %d / %d this VRAM holds "
+                          "beside the model, its cache and the pictures; --chunk N sets one)", c, kChunks[0], kChunks[1],
+                          kChunkBase);
+            info.push_back(cb);
+        } else if (!plan(err)) {
+            return false;
+        }
         if (o.kv == 1) info.push_back("INFO the latent cache in 8-bit rows (--kv q8)");
         if (!o.profile.empty()) {
             std::ifstream f(o.profile, std::ios::binary);
@@ -1943,7 +2029,7 @@ struct Model::Impl {
                 !hg.alloc(mtp_out, T * E, err) || !hg.alloc(mtp_top, 2, err))
                 return false;
             CK(cudaMallocHost(&h_emb, sizeof(float) * T * E));
-            if (tp > 1 && !std::getenv("HY4_MTP_SYNC")) {   // (the prompt chunks' MTP pass beside the next chunk)
+            if (tp > 1 && mtp_own) {   // (the prompt chunks' MTP pass beside the next chunk: the plan counted its scratch)
                 hm.dev = hg.dev;
                 CK(cudaStreamCreateWithFlags(&hm.s, cudaStreamNonBlocking));
                 std::string e2;
@@ -1959,6 +2045,13 @@ struct Model::Impl {
                     info.push_back("INFO the MTP block's pass in line with the chunks (no VRAM for its own scratch: " +
                                    e2 + ")");
                     (void) cudaGetLastError();
+                    // (what it did get goes back: a part of a scratch must not take the room the kernels' own
+                    //  buffers are allocated from at the warm-up)
+                    for (void* p : hm.allocs) cudaFree(p);
+                    hm.allocs.clear();
+                    hm.used = 0;
+                    if (hm.blas) cublasDestroy(hm.blas);
+                    hm.blas = nullptr;
                 }
             }
             char buf[160];

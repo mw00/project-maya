@@ -124,6 +124,77 @@ int main() {
         CHECK(!p.fits && !p.q8 && !p.vision);
         CHECK(c.tried == "fVqVf-q-");
     }
+    // --chunk auto (chunk_pick): the largest chunk whose plan keeps the layout, the cache's rows and the pictures of
+    // the plan at the base chunk.  A rig in GB: every card `vram` free beyond the reserve; a tensor-parallel member
+    // needs `member`, the head's GPU the head and the MTP block (`head`), a picture's room and a chunk's scratch
+    // (`per_k` GB a 1024 tokens) - twice where the block's pass has a scratch of its own, once where it runs in line
+    // (the plan's two tries); where a member does not fit: the layer split (it holds everything here), with 8-bit
+    // rows above `q8_above` tokens a chunk and a smaller picture above `small_above`
+    struct Rig {
+        double vram, member, head, vis, per_k;
+        int cards, q8_above, small_above;
+        std::string tried;
+        bool own = false;
+        hy4::ChunkTry operator()(int chunk) {
+            tried += std::to_string(chunk) + " ";
+            const double s = per_k * chunk / 1024.0, rows = hy4::mtp_rows_bytes(chunk, 3072) / 1e9;
+            hy4::ChunkTry t;
+            t.ok = vram >= head + rows + vis + s;                 // (the layer split's main GPU)
+            t.q8 = chunk > q8_above;
+            t.vision = vis > 0;
+            t.pixels = !t.vision ? 0 : chunk > small_above ? 1 << 20 : 4 << 20;
+            own = false;
+            if (cards >= 2) {
+                own = member + head + rows + vis + 2 * s <= vram;
+                if (own || member + head + rows + vis + s <= vram) t.tp = cards, t.ok = true;
+            }
+            return t;
+        }
+    };
+    const int kCands[2] = {4096, 2048};
+    CHECK(hy4::mtp_rows_bytes(1024, 3072) == 1024.0 * 3072 * 20);
+    {   // three roomy cards: 4096, tensor parallel, the pass on its own scratch - asked for the base, then the largest
+        Rig r{32.0, 17.0, 4.6, 0.83, 1.15, 3, 1 << 30, 1 << 30, ""};
+        CHECK(hy4::chunk_pick(r, kCands, 1024) == 4096);
+        CHECK(r.tried == "1024 4096 " && r.own);
+    }
+    {   // two cards with the block (Jupiter's failing start): 4096 would cost tensor parallel - 2048, the pass in line
+        Rig r{31.0, 22.5, 4.6, 0.83, 1.15, 2, 1 << 30, 1 << 30, ""};
+        CHECK(r(1024).tp == 2 && r.own);                          // (the own scratch is in the plan at 1024 alone)
+        CHECK(r(2048).tp == 2 && !r.own);
+        CHECK(r(4096).tp == 0 && r(4096).ok);                     // (the layer split holds it: not taken for a chunk)
+        r.tried.clear();
+        CHECK(hy4::chunk_pick(r, kCands, 1024) == 2048);
+        CHECK(r.tried == "1024 4096 2048 ");
+    }
+    {   // one card: the largest chunk the model's own parts leave room for
+        Rig r{9.0, 0, 4.6, 0.83, 1.15, 1, 1 << 30, 1 << 30, ""};
+        CHECK(hy4::chunk_pick(r, kCands, 1024) == 2048);
+        Rig big{31.0, 0, 4.6, 0.83, 1.15, 1, 1 << 30, 1 << 30, ""};
+        CHECK(hy4::chunk_pick(big, kCands, 1024) == 4096);
+    }
+    {   // pictures and the cache's rows go first: a chunk that would make the pictures smaller, or the rows 8-bit, is
+        //  not taken; one that keeps them is
+        Rig r{31.0, 0, 4.6, 0.83, 1.15, 1, 1 << 30, 2048, ""};
+        CHECK(hy4::chunk_pick(r, kCands, 1024) == 2048);
+        Rig q{31.0, 0, 4.6, 0.83, 1.15, 1, 1024, 1 << 30, ""};
+        CHECK(hy4::chunk_pick(q, kCands, 1024) == 1024);
+        Rig both{31.0, 0, 4.6, 0.83, 1.15, 1, 512, 512, ""};     // (already so at the base: nothing lost by 4096)
+        CHECK(hy4::chunk_pick(both, kCands, 1024) == 4096);
+        Rig off{31.0, 0, 4.6, 0.0, 1.15, 1, 1 << 30, 1 << 30, ""};   // (pictures off: the chunk alone)
+        CHECK(hy4::chunk_pick(off, kCands, 1024) == 4096);
+    }
+    {   // nothing above the base fits: the base; the base does not fit either: the base, asked once (its own error)
+        Rig r{7.0, 0, 4.6, 0.83, 1.15, 1, 1 << 30, 1 << 30, ""};
+        CHECK(hy4::chunk_pick(r, kCands, 1024) == 1024);
+        CHECK(r.tried == "1024 4096 2048 ");
+        Rig none{5.0, 0, 4.6, 0.83, 1.15, 1, 1 << 30, 1 << 30, ""};
+        CHECK(hy4::chunk_pick(none, kCands, 1024) == 1024);
+        CHECK(none.tried == "1024 ");
+        Rig low{31.0, 0, 4.6, 0.83, 1.15, 1, 1 << 30, 1 << 30, ""};   // (a base above a candidate: never below it)
+        CHECK(hy4::chunk_pick(low, kCands, 2048) == 4096);
+        CHECK(low.tried == "2048 4096 ");
+    }
     std::puts("hy4_plan_test: ok");
     return 0;
 }
