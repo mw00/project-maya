@@ -210,8 +210,8 @@ the [model card](https://huggingface.co/peasantsmith/Hy4-Flash-Maya-GGUF).
   model file with smaller attention weights (43.6 GB; slightly lower quality) that needs about 6.5 / 6.8 GiB of free
   VRAM at 4K / 8K context, and about 7.0 / 7.1 GiB at 16K / 32K, where the engine keeps the context's cache in 8
   bits by itself (the setup says so). A card with less than about 7 GB cannot run it.
-- **Set up for your PC:** the setup checks the PC, picks the layout and the context that fit the card (4K to 128K
-  are offered; run end to end up to 32K so far - the model itself is trained for 1M), downloads the model file and
+- **Set up for your PC:** the setup checks the PC, picks the layout and the context that fit the card (4K to 1M,
+  each offered where it fits the card's VRAM; run end to end up to 32K so far), downloads the model file and
   the n-gram table from Maya's repo, builds the engine's index of them (the pack) and the engine, and writes
   `maya-hy4-flash-maya-xs.json`. `--model-dir <folder>` uses files you already have (checked by size and sha256).
 - **Tencent's own settings:** temperature 0.9, top-p 1.0, no top-k, with the release's own chat template (inside the
@@ -225,10 +225,11 @@ the [model card](https://huggingface.co/peasantsmith/Hy4-Flash-Maya-GGUF).
 - **Pictures:** the model's own vision tower runs in the engine (contributed by
   [@needmorevram](https://github.com/needmorevram), #1051). The setup downloads Maya's vision file with the model
   (0.8 GB, one for every size; `--no-vision` skips it). Its weights stay in the file; a picture takes up to 0.8 GB of
-  VRAM while it is read, which the engine keeps free on the main GPU - so pictures are on where the card has that room
-  beside the model, and **off on 8 GB cards**: the setup says so, text works as before, a picture sent is refused in
-  plain words and a picture in a tool result becomes a short note. Pictures up to 2048 x 2048 pixels (larger ones
-  are scaled down), a square one 4,160 tokens of the context. Pictures only, no videos. Images on the Models page
+  VRAM while it is read, which the engine keeps free on the main GPU. A card with less room beside the model (8 GB
+  cards) reads smaller pictures: the engine keeps what room there is and big pictures are scaled down to it (about
+  1.8 million pixels at an 8K context on an 8 GB card, 512 x 512 at 32K). Only where not even that fits are pictures
+  off: the setup says so, text works as before, a picture sent is refused in plain words and a picture in a tool
+  result becomes a short note. Pictures up to 2048 x 2048 pixels (larger ones are scaled down), a square one 4,160 tokens of the context. Pictures only, no videos. Images on the Models page
   turns them on or off.
 - **In llama.cpp:** the files also load there with its Hy4-flash pull request
   ([ggml-org/llama.cpp #32517](https://github.com/ggml-org/llama.cpp/pull/32517), not merged yet).
@@ -264,7 +265,7 @@ without pictures.
 - **Where the experts live:** all of them in VRAM where they fit (about 108 GB); where they do not, each layer keeps
   a share of its experts in VRAM (its most used, with an expert profile) and the CPU computes the others from the
   model's file.
-- **Context:** up to 256K (the setup offers 32K to 256K). With tensor parallel every GPU of the group holds the
+- **Context:** up to 256K tested (the setup offers 32K to 256K, and 512K / 1M on cards of 20 / 40 GB and more). With tensor parallel every GPU of the group holds the
   whole cache, so where 16-bit rows do not fit (256K on 16 GB cards) the engine keeps them in 8 bits.
 - **Drafting:** the model's own MTP block proposes up to three tokens a step and the model checks them - nearly twice
   the decode speed on code, the same answers.

@@ -84,7 +84,7 @@ Q4_K_M (AngelSlim) is a 105 GB model file with the same table; all of its expert
   change the numbers above.
 - **DeepSeek, MiniMax and Qwen** default to 64K. Longer contexts need more memory; the setup only offers the ones your PC
   can hold.
-- **Hy4-Flash** needs more VRAM the longer the context: the setup picks the context that fits the card (4K to 128K).
+- **Hy4-Flash** needs more VRAM the longer the context: the setup picks the context that fits the card (4K to 1M).
 
 Each model's options are in [docs/MODELS.md](MODELS.md) and [docs/SETTINGS.md](SETTINGS.md).
 
