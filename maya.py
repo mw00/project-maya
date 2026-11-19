@@ -775,7 +775,37 @@ QWEN_UD_DIR = "Qwen3.8-Flash-Next-UD-IQ2_XS"       # (its folder in the models f
 QWEN_UD_MANIFEST = ROOT / "tools" / "qwen" / "download_unsloth.json"
 QWEN_UD_MODEL_NAME = "qwen3.8-flash-next"
 QWEN_QUANTS = ("q5_k_m", QWEN_UD)
-FAMILIES = ("glm", "deepseek", "minimax", "qwen")
+# Hy4-Flash (Tencent's Hy4-flash, 220B with its n-gram tables): its own engine (src/hy4, build/maya-hy4) reads Project
+# Maya's GGUF quants of it in place (tools/hy4/download.json: the one table that says which sizes are uploaded, packed by
+# tools/hy4/pack_gguf.py).  NVIDIA only so far (CUDA; Linux and Windows, V100 on) - no AMD or Mac engine yet.  What is
+# not a routed expert sits in VRAM (the manifest's "plan": hy4_fit works out before any download whether it fits, and
+# for which context); the engine fills the VRAM left with the most-routed experts and computes the others on its CPU
+# lane straight from the memory-mapped file (RAM as the page cache).  The n-gram table (63 GB, one file for every size
+# and layout: downloaded once, hard-linked) is read from the SSD page by page, never loaded into RAM.  Text only for
+# now; its template's thinking levels Off / High / Max; one request at a time.  Each size in <models folder>/<its full
+# name> (a layout of it: <name>-8GB), its config maya-hy4-flash-maya-xs.json.
+HY4 = Q.MODEL["hy4"]                               # "Hy4-Flash"
+HY4_EXE = BUILD / ("maya-hy4.exe" if WIN else "maya-hy4")
+HY4_MANIFEST = ROOT / "tools" / "hy4" / "download.json"
+HY4_PACK_TOOLS = ("tools/hy4/pack_gguf.py", "tools/ds4/pack_gguf.py", "tools/strata_tokenizer.py")
+HY4_QUANTS = {k: Q.full_name("hy4", k) for f, k, _, _ in Q.QUANTS if f == "hy4"}   # "maya-xs": "Hy4-Flash-Maya-XS" ...
+HY4_MIN_CC = 70                                    # (built and run on V100 sm_70, RTX 30 and RTX 50)
+HY4_CONTEXTS = [4096, 8192, 16384, 32768, 65536, 131072]
+HY4_TESTED_CONTEXT = 32768                         # (past it: not run end to end yet - said; the setup recommends up to it)
+HY4_MODEL_NAME = "hy4-flash"
+HY4_SAMPLING, HY4_EFFORT = Q.MODEL_DEFAULTS["hy4"]  # (Tencent's card: temperature 0.9, top-p 1.0; its template's High)
+HY4_PROFILE = ROOT / "data" / "expert-profile-hy4.bin"
+HY4_STANDARD = "standard"                          # the layout a size's own "files" and "plan" are
+# VRAM in use on a card now that counts against the model (the desktop's; more is a program that can be closed - as
+# GLM_FIT_USED_CAP_MIB), what a card that may drive a desktop is taken to hold when nvidia-smi gives no reading, and
+# what a context the manifest does not list (worked out by hy4_need_gib, not measured on a card) may be off by
+HY4_FIT_USED_CAP_GIB = 1.0
+HY4_FIT_DISPLAY_GIB = 0.4
+HY4_FIT_MARGIN_GIB = 0.25
+# a small-card layout's prompt chunk doubled where it fits: the prompt scratch grows by about 0.9 GiB from 256 to 512
+# tokens (an 8 GB card at 4K: measured) - counted as 0.95, conservatively
+HY4_CHUNK_UP_GIB = 0.95
+FAMILIES = ("glm", "deepseek", "minimax", "qwen", "hy4")
 SHARD_RE = re.compile(r"-(\d{5})-of-(\d{5})\.gguf$")
 
 
@@ -784,7 +814,7 @@ def exe_for_target(target: str) -> Path:
     fresh on every call since select_build_backend() reassigns EXE/DS4_EXE once the backend (cuda/hip) is known."""
     if target == "maya-glm-helper":                    # (GLM's AMD helper program for the two-GPU mode: mixed_builds)
         return BUILD / ("maya-glm-helper.exe" if WIN else "maya-glm-helper")
-    return {"maya": EXE, "maya-ds4": DS4_EXE, "maya-mm3": MM3_EXE}[target]
+    return {"maya": EXE, "maya-ds4": DS4_EXE, "maya-mm3": MM3_EXE, "maya-hy4": HY4_EXE}[target]
 GLM_ARCHS = ("glm5-next", "glm5next")             # llama.cpp's spelling and unsloth's
 
 
@@ -987,11 +1017,12 @@ def fix_config_names(cfg: dict) -> bool:
 
 def select_build_backend(backend: str) -> None:
     """Separate build folders and stamps prevent reusing a binary from the other backend."""
-    global BUILD, EXE, STAMP, DS4_EXE, MM3_EXE
+    global BUILD, EXE, STAMP, DS4_EXE, MM3_EXE, HY4_EXE
     BUILD = ROOT / {"hip": "build-hip", "metal": "build-metal"}.get(backend, "build")
     EXE = BUILD / ("maya-metal" if backend == "metal" else "maya.exe" if WIN else "maya")
     DS4_EXE = BUILD / ("maya-ds4.exe" if WIN else "maya-ds4")
     MM3_EXE = BUILD / ("maya-mm3.exe" if WIN else "maya-mm3")
+    HY4_EXE = BUILD / ("maya-hy4.exe" if WIN else "maya-hy4")
     STAMP = BUILD / "MAYA-BUILD.json"
 
 
@@ -1501,6 +1532,9 @@ def choose_gpus(a, found, min_cc: int = MIN_CC, family: str = "") -> list:
     intro = (["MiniMax-M3.1-Flash runs best on all of them: the GPUs share the layers (or split them in groups where",
               "that measures faster), and the more VRAM, the fewer experts the CPU computes."]
              if family == "minimax" else
+             [f"{HY4} runs on one GPU, or splits its layers across several: what must sit in VRAM is shared, and the",
+              "more VRAM, the fewer experts the CPU computes."]
+             if family == "hy4" else
              ["DeepSeek-V4.1-Flash runs best on all of them: pairs of equal GPUs split each of their layers (tensor",
               "parallel), the pairs take the layers in turn, and the more VRAM, the fewer experts the CPU computes."]
              if min_cc >= DS4_MIN_CC else
@@ -1530,11 +1564,15 @@ def check_pc(a, family: str = "glm", gguf: bool = False, ds4_quant: str = "exl3"
     if mm3 and WIN and not MM3_ALL_PLATFORMS:
         fail(f"{MM3}'s engine (maya-mm3) runs on Linux only for now (its Windows build is on the way)",
              f"set it up on a Linux PC with an NVIDIA GPU ({mm3_gpus()})")
+    hy4 = family == "hy4"
+    if hy4 and a.backend == "hip":
+        fail(f"{HY4}'s engine (maya-hy4) runs on NVIDIA GPUs only for now: there is no AMD (HIP) build yet",
+             "set it up on a PC with an NVIDIA GPU (V100 or newer)")
     if a.backend == "hip":
         return check_hip_pc(a, text_only=not mm3)
     if a.backend == "metal":
         if family != "glm":
-            fail(f"Maya's setup runs GLM-5.3-Flash only on a Mac (not {ds4 and DS4 or mm3 and MM3 or QWEN_SHOWN})",
+            fail(f"Maya's setup runs GLM-5.3-Flash only on a Mac (not {ds4 and DS4 or mm3 and MM3 or hy4 and HY4 or QWEN_SHOWN})",
                  (f"{MM3} has an experimental Metal engine (maya-metal-mm3) that you build and start by hand: "
                   "see docs/METAL.md; " if mm3 else "")
                  + "other models: an NVIDIA or AMD GPU (--backend cuda / --backend hip)")
@@ -1548,7 +1586,7 @@ def check_pc(a, family: str = "glm", gguf: bool = False, ds4_quant: str = "exl3"
         fail("Project Maya runs on Linux and Windows (and on Apple Silicon: --backend metal)",
              "the engine needs an NVIDIA GPU and CUDA")
     min_cc = ((DS4_GGUF_MIN_CC if gguf else DS4_MIN_CC) if ds4 else (MM3_GGUF_MIN_CC if gguf else mm3_min_cc()) if mm3
-              else QWEN_MIN_CC if family == "qwen" else MIN_CC)
+              else QWEN_MIN_CC if family == "qwen" else HY4_MIN_CC if hy4 else MIN_CC)
     if S.is_wsl():
         warn("this is WSL2, which Maya does not support: WSL2's driver pins only about 1 GB of "
              "RAM for the GPU, and Maya's RAM tier pins tens of GB. Use a native Linux install.")
@@ -1570,7 +1608,7 @@ def check_pc(a, family: str = "glm", gguf: bool = False, ds4_quant: str = "exl3"
     if any(g.get("unified_memory") for g in chosen):
         say("  the GPU's memory is the system's RAM: the engine fills it with the most-used experts and leaves the "
             "rest to the RAM tier and the SSD, so the free RAM at the start is what the pool can take")
-    if vram < 23 and not ds4 and not mm3 and family != "qwen":
+    if vram < 23 and not ds4 and not mm3 and family not in ("qwen", "hy4"):
         # one small card: can any GLM-5.3-Flash quant start on it at all (glm_fit_verdict)?  Where none can, say so
         # here - the model's choice (step 2) then stops before any download
         try:
@@ -1668,6 +1706,8 @@ def check_pc(a, family: str = "glm", gguf: bool = False, ds4_quant: str = "exl3"
             ok(msg + f"; with {vram:.0f} GB of VRAM that holds {DS4} at {DS4_EXL3.get(ds4_quant, DS4_EXL3['exl3'])['bits']} bits")
         if len(chosen) % 2 or len({round(g["vram_gb"]) for g in chosen}) > 1:
             ok("tensor parallel pairs equal GPUs: a GPU without an equal neighbour runs its layers alone")
+    elif hy4:   # (its routed experts that are not in VRAM: read in place - RAM as the page cache)
+        ok(msg)
     else:
         ok(msg + ("" if total >= 60 else " - it runs with 32 GB; more RAM keeps more experts close and is faster"))
     pf = S.page_file_gb()
@@ -1843,7 +1883,7 @@ PARALLEL_FAMILIES = ("glm", "deepseek", "minimax")
 
 def check_parallel(a, family: str) -> None:
     if getattr(a, "parallel", None) is not None and family not in PARALLEL_FAMILIES:
-        model = DS4 if family == "deepseek" else MM3 if family == "minimax" else QWEN_SHOWN
+        model = DS4 if family == "deepseek" else MM3 if family == "minimax" else HY4 if family == "hy4" else QWEN_SHOWN
         fail(f"--parallel is supported by GLM-5.3-Flash, DeepSeek-V4.1-Flash and MiniMax-M3.1-Flash; {model} serves "
              "one request at a time",
              "remove --parallel; saved conversations do not enable simultaneous decoding")
@@ -1858,9 +1898,12 @@ def choose_family(a, prev: dict) -> str:
     """"glm" or "deepseek": what the options say (--model, --gguf-dir, --draft), else asked - the model set up before
     is the default."""
     if a.model:
-        return "deepseek" if a.model == DS4 else "minimax" if a.model == MM3 else "qwen" if a.model == QWEN else "glm"
+        return "deepseek" if a.model == DS4 else "minimax" if a.model == MM3 else "qwen" if a.model == QWEN else \
+            "hy4" if a.model == HY4 else "glm"
     if getattr(a, "qwen_quant", None):                 # (--qwen-quant alone: Qwen's files named)
         return "qwen"
+    if getattr(a, "hy4_quant", None):                  # (--hy4-quant alone: Hy4-Flash's)
+        return "hy4"
     metal = getattr(a, "backend", None) == "metal"
     if a.gguf_dir or a.draft or (metal and not a.model_dir):     # (Metal runs GLM only: no question)
         return "glm"
@@ -1905,6 +1948,19 @@ def choose_family(a, prev: dict) -> str:
              "read from the SSD; tool calls, its three reasoning efforts, MTP drafting, up to a 256K context; text only. "
              f"Or the base model itself in unsloth's UD-IQ2_XS GGUF ({qwen_entry(QWEN_UD)['download_gb']:.0f} GB).")]
     keys = ("glm", "glm53") + FAMILIES[1:]             # (the rows: GLM-5.3 (744B) is its own row of the "glm" family)
+    # Hy4-Flash: listed once a size of it is uploaded (hy4_published; not on AMD - no engine there yet), or when it is
+    # the model set up before; --model / --hy4-quant name it either way
+    hy4s = [k for k in HY4_QUANTS if hy4_published(k)]
+    if default == "hy4" or (hy4s and getattr(a, "backend", None) != "hip"):
+        rows.append((HY4, None,
+                     "Tencent's Hy4-flash (220B with its n-gram tables) on its own engine, in Maya's own GGUF quants"
+                     + (": " + ", ".join(f"{HY4_QUANTS[k]} ({hy4_entry(k)['download_gb']:.0f} GB)" for k in hy4s)
+                        if hy4s else "") +
+                     "; NVIDIA from V100 on, Linux or Windows; what is not a routed expert in VRAM, the experts that do "
+                     "not fit computed on the CPU, the n-gram table read from the SSD; tool calls, thinking Off / High "
+                     "/ Max; text only for now."))
+    else:
+        keys = tuple(k for k in keys if k != "hy4")
     was53 = default == "glm" and bool(prev) and G53.config_is_glm_dsa(prev)
     pick = keys[choose("Model?", ["Which model to set up:"], rows, keys.index("glm53" if was53 else default), a.yes)]
     if pick in ("glm", "glm53"):
@@ -2832,7 +2888,7 @@ def mixed_builds(a, pc, llama: Path, target: str, quiet: bool = False) -> None:
     and, for GLM, the AMD GPU's helper program (build-hip/maya-glm-helper).  A build that stops does not stop the setup
     or the start: the model then runs on the AMD GPU alone.  Elsewhere (Windows, no NVIDIA card, a CUDA or Metal
     setup): nothing, not a line.  quiet (a start): a line only when something is compiled."""
-    global BUILD, STAMP, EXE, DS4_EXE, MM3_EXE
+    global BUILD, STAMP, EXE, DS4_EXE, MM3_EXE, HY4_EXE
     if WIN or pc.get("backend") != "hip" or target not in ("maya", "maya-ds4"):
         return
     try:
@@ -2867,9 +2923,9 @@ def mixed_builds(a, pc, llama: Path, target: str, quiet: bool = False) -> None:
             return
     if not need_cuda:
         return
-    old = (BUILD, STAMP, EXE, DS4_EXE, MM3_EXE)
+    old = (BUILD, STAMP, EXE, DS4_EXE, MM3_EXE, HY4_EXE)
     BUILD, STAMP = cuda_dir, cuda_dir / "MAYA-BUILD.json"
-    EXE, DS4_EXE, MM3_EXE = BUILD / "maya", BUILD / "maya-ds4", BUILD / "maya-mm3"
+    EXE, DS4_EXE, MM3_EXE, HY4_EXE = BUILD / "maya", BUILD / "maya-ds4", BUILD / "maya-mm3", BUILD / "maya-hy4"
     try:
         nvcc, hc = toolchain_for(archs, (a.nvcc if a else None) or cuda_meta.get("nvcc"),
                                  (a.host_compiler if a else None) or cuda_meta.get("host_compiler"))
@@ -2882,7 +2938,7 @@ def mixed_builds(a, pc, llama: Path, target: str, quiet: bool = False) -> None:
     except SystemExit:
         warn("the NVIDIA card's engine did not compile (the reason is above): the model runs on the AMD GPU alone")
     finally:
-        BUILD, STAMP, EXE, DS4_EXE, MM3_EXE = old
+        BUILD, STAMP, EXE, DS4_EXE, MM3_EXE, HY4_EXE = old
 
 
 def refresh_mixed_builds(cfg: dict) -> None:
@@ -2906,8 +2962,9 @@ def refresh_engine(cfg: dict) -> None:
     (the targets share one stamp), so this one is still the old build."""
     meta = read_json(STAMP)
     exe = Path(cfg["exe"]).resolve()
-    target = "maya-ds4" if exe == DS4_EXE.resolve() else "maya-mm3" if exe == MM3_EXE.resolve() else "maya"
-    if not meta or exe not in (EXE.resolve(), DS4_EXE.resolve(), MM3_EXE.resolve()):
+    target = "maya-ds4" if exe == DS4_EXE.resolve() else "maya-mm3" if exe == MM3_EXE.resolve() else \
+        "maya-hy4" if exe == HY4_EXE.resolve() else "maya"
+    if not meta or exe not in (EXE.resolve(), DS4_EXE.resolve(), MM3_EXE.resolve(), HY4_EXE.resolve()):
         return
     src = S.source_hash(S.ENGINE_SOURCES)
     if meta.get("src") == src and target in (meta.get("targets") or ["maya"]):
@@ -3164,6 +3221,10 @@ def import_catalog(models: Path) -> list:
         m = tolerant(mm3_gguf_entry, quant) if quant != "exl3" else None
         if m and m.get("files") and all(m["sha256"].values()):
             entry(shown, shown, m)
+    for quant in HY4_QUANTS:                           # (the sizes that are uploaded: the trunk and the n-gram table)
+        m = tolerant(hy4_entry, quant) if hy4_published(quant) else None
+        if m:
+            entry(m["dir"], m["dir"], m)
     q = tolerant(qwen_entry)
     if q:
         entry(QWEN, QWEN, q)
@@ -4624,7 +4685,7 @@ def busy_gpus(cfg: dict) -> list:
 DISPLAY_MIB = 1536
 
 # Maya's engines as the GPU's process list names them (and the names they had before the rename)
-ENGINE_PROCESSES = ("maya", "maya-ds4", "maya-mm3", "maya-glm-helper", "strata", "strata-ds4")
+ENGINE_PROCESSES = ("maya", "maya-ds4", "maya-mm3", "maya-hy4", "maya-glm-helper", "strata", "strata-ds4")
 
 
 def maya_engines_on(cfg: dict) -> list:
@@ -4693,6 +4754,9 @@ def calibrate_config(cfg_path: Path) -> bool:
     if config_family(cfg) == "qwen":      # (the Qwen path sizes its CPU pool and its prompt chunks itself; what can be
         #  measured is its drafter)
         return bool(qwen_draft_calibration(cfg_path) is not None)
+    if config_family(cfg) == "hy4":       # (maya-hy4 sizes its CPU lane and its expert pool by this PC at every start)
+        ok(f"{HY4}: nothing to tune - its engine sizes its CPU lane and its expert pool by this PC at every start")
+        return True
     if cfg.get("backend") == "hip":
         warn("the tuning measures the CUDA engine's CPU lane (NVIDIA GPUs): the HIP port keeps its own settings")
         return False
@@ -4851,8 +4915,8 @@ def needs_speed_calibration(cfg: dict) -> bool:
     args = cfg.get("args") or []
     if cfg.get("backend") == "metal":                  # (CUDA's measurement: on a Mac MTP or DFlash2 is the user's choice)
         return False
-    if config_family(cfg) == "qwen":                   # (CYBER-FROST: measured at its setup, or --speed-calibration)
-        return False
+    if config_family(cfg) in ("qwen", "hy4"):          # (CYBER-FROST: measured at its setup, or --speed-calibration;
+        return False                                   #  Hy4-Flash: no drafter for its files yet)
     if config_family(cfg) in ("deepseek", "minimax"):  # (their DSpark drafter: measured once too)
         return CDS.has_drafter(cfg) and "speed_calibration" not in (cfg.get("installer") or {}) and             not (config_family(cfg) == "minimax" and parallel_of(cfg) > 1)   # (maya-mm3 --parallel: no drafting)
     if g53_one_gpu_drafting(cfg):                      # (GLM-5.3 on one APU: drafting on or off, measured once)
@@ -4874,6 +4938,9 @@ def speed_calibration(cfg_path: Path, why: str = "") -> bool:
         return False
     if config_family(cfg) == "qwen":                   # (CYBER-FROST: its MTP drafter or none)
         return bool(qwen_draft_calibration(cfg_path) is not None)
+    if config_family(cfg) == "hy4":
+        ok(f"{HY4}: no speed calibration - drafting is not available for its files yet, so there is nothing to compare")
+        return False
     if config_family(cfg) in ("deepseek", "minimax"):
         return speed_calibration_ds4(cfg_path, cfg, why)
     if g53_one_gpu_drafting(cfg):
@@ -5576,6 +5643,10 @@ def server_command(cfg_path: Path, a) -> tuple:
     if config_family(cfg) == "minimax":
         say("  Loading takes a few minutes: the engine places the experts in VRAM by how often they are used and keeps")
         say("  the rest in pinned RAM for its CPU lane - the first answers are the slowest.")
+    elif config_family(cfg) == "hy4":
+        say("  Loading takes a minute or a few: the engine places what must sit in VRAM and as many of the most-routed")
+        say("  experts as fit beside it; the others are computed on the CPU from the model file (RAM as the page cache),")
+        say("  the n-gram table is read from the SSD - the first answers are the slowest.")
     elif config_family(cfg) == "qwen":
         say("  Loading takes a few minutes: the engine places the most-used experts in VRAM, the next ones in RAM as far")
         say("  as the free RAM goes (MAYA_EXPERT_RAM_GB caps it) and reads the rest from the SSD when they are routed.")
@@ -5726,7 +5797,7 @@ REPORT_LINES = re.compile(r"glm fast:|glm prefill: (?:CUDA|HIP)|glm split|glm st
                           r"^ds4: (?!copying experts |experts \d+ / |loading \d)|^ds4 (?:slots|cache):|^maya-ds4:|"
                           r"^(?:prompt|decode): \d+ tokens in |^decode per token:|^decode (?:reads|left out)|^dspark|"
                           # maya-mm3's: where the model went (its --serve start) and each answer's prompt / decode speed
-                          r"^maya-mm3:|^maya mm3 serve: (?:prompt|DSpark) ",
+                          r"^maya-mm3:|^maya mm3 serve: (?:prompt|DSpark) |^maya-hy4:",
                           re.I)
 STAT_DECODE = re.compile(r"glm stat: decode ([\d.]+) ms/tok")
 
@@ -5913,7 +5984,7 @@ BENCH_TOPICS = [
 def bench_exe(cfg: dict) -> Path:
     """Which engine binary a HIP config's --bench should relaunch - config_family(cfg)'s target, through the same
     exe_for_target every build step uses, so this can't drift out of sync with either."""
-    return exe_for_target({"deepseek": "maya-ds4", "minimax": "maya-mm3"}.get(config_family(cfg), "maya"))
+    return exe_for_target({"deepseek": "maya-ds4", "minimax": "maya-mm3", "hy4": "maya-hy4"}.get(config_family(cfg), "maya"))
 
 
 BENCH_MIN_ANSWER = 64   # an answer shorter than this (the model stopped early) is listed, not in the decode mean (#549)
@@ -5928,6 +5999,13 @@ def bench_chat(family: str, tokenizer_dir: Path):
         from serve.frontend import ChatTemplate
         path = Path(tokenizer_dir) / "chat_template.jinja"
         tpl = ChatTemplate(path if path.exists() else ROOT / "tools" / "mm3" / "chat_template.jinja")
+        return lambda q: tpl.render([{"role": "user", "content": q}], enable_thinking=False)
+    if family == "hy4":        # (the GGUF's own template, in the pack: its thinking off)
+        from serve.frontend import ChatTemplate
+        path = Path(tokenizer_dir) / "chat_template.jinja"
+        if not path.exists():
+            fail(f"the model's chat template is missing ({path})", f"run {ME} --setup --repack to build the pack again")
+        tpl = ChatTemplate(path)
         return lambda q: tpl.render([{"role": "user", "content": q}], enable_thinking=False)
     if family == "qwen":       # (Qwen's turns, the think block closed: the answer itself)
         return "<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n".format
@@ -6124,6 +6202,8 @@ def set_up(a, prev: dict) -> Path | None:
         return set_up_mm3(a, prev)
     if family == "qwen":
         return set_up_qwen(a, prev)
+    if family == "hy4":
+        return set_up_hy4(a, prev)
     inst = prev.get("installer") or {}
     prev_args = prev.get("args") or []
     prev_ctx = int(prev_args[prev_args.index("--max-context") + 1]) if "--max-context" in prev_args[:-1] else None
@@ -7956,6 +8036,380 @@ def set_up_mm3(a, prev: dict) -> Path | None:
 
 
 # ------------------------------------------------------------------------------------------------ CYBER-FROST-3.8-PS
+def hy4_layouts(q: dict) -> dict:
+    """A size's layouts as the manifest lists them, {name: {"files", "plan", "about"}}: its own ("standard") first,
+    then its "layouts" (another trunk for cards the standard one does not fit) - only those with files."""
+    out = {}
+    if q.get("files"):
+        out[HY4_STANDARD] = {"files": q["files"], "plan": q.get("plan") or {}, "about": ""}
+    for k, v in (q.get("layouts") or {}).items():
+        if v.get("files"):
+            out[k] = {"files": v["files"], "plan": v.get("plan") or {}, "about": v.get("about", "")}
+    return out
+
+
+def hy4_quant_table(quant: str) -> dict:
+    """The manifest's entry of a size ("maya-xs" -> its "Hy4-Flash-Maya-XS"); {} for one it does not list."""
+    return (read_json(HY4_MANIFEST).get("quants") or {}).get(HY4_QUANTS.get(quant, "")) or {}
+
+
+def hy4_published(quant: str, layout: str = HY4_STANDARD) -> bool:
+    """Whether a size's files are uploaded: download.json names the repo's commit ("revision") and the size has files
+    with their sizes and sha256 (the n-gram table's too) - the one switch for the setup's list and the dashboard's."""
+    man = read_json(HY4_MANIFEST)
+    lay = hy4_layouts(hy4_quant_table(quant)).get(layout)
+    files = list((lay or {}).get("files", {}).values()) + list((man.get("ngram") or {}).values())
+    return bool(man.get("revision")) and bool(lay) and bool(man.get("ngram")) and \
+        all(isinstance(v, list) and len(v) == 2 and v[0] and v[1] for v in files)
+
+
+def hy4_entry(quant: str, layout: str = HY4_STANDARD) -> dict:
+    """A size of Hy4-Flash (download.json) as a MODELS entry (offer_download's form): its trunk and the n-gram table,
+    their sizes and sha256, the repo's folder, the VRAM + RAM that hold it (memory_gb), its "plan" (hy4_fit), the
+    name of its folder in the models folder ("dir") - a layout's: that layout's trunk, in a folder of its own, the
+    n-gram table from the size's own folder of the repo ("sources")."""
+    man = read_json(HY4_MANIFEST)
+    if not isinstance(man.get("quants"), dict) or not man.get("repo") or not man.get("ngram"):
+        fail(f"{HY4_MANIFEST} is missing or damaged", "restore it (git checkout tools/hy4/download.json)")
+    q = man["quants"].get(HY4_QUANTS[quant]) or {}
+    lay = hy4_layouts(q).get(layout)
+    if not lay:
+        offered = [Q.setup_id("hy4", k) for k in HY4_QUANTS if hy4_layouts(hy4_quant_table(k))]
+        fail(f"{Q.shown('hy4', quant)} is not available yet" + ("" if layout == HY4_STANDARD else f" in its {layout} layout"),
+             "the sizes there are now: " + (", ".join(offered) or "none"))
+    files = {Path(k).name: v for k, v in lay["files"].items()}
+    folder = Path(next(iter(lay["files"]))).parent.as_posix()
+    npath, nfile = next(iter(man["ngram"].items()))
+    nname, nfolder = Path(npath).name, Path(npath).parent.as_posix()
+    files[nname] = nfile                               # (the trunk first, the n-gram table last: the set's order)
+    rev = man.get("revision") or ""
+    about = q.get("about", "GGUF") + (f"; {lay['about']}" if lay["about"] else "")
+    m = {"about": f"Maya's quant of {HY4} ({about}); {man.get('license', 'Tencent Hy License')}",
+         "format": "hy4-gguf", "repo": man["repo"], "revision": rev, "folder": "" if folder == "." else folder,
+         "files": {k: v[0] for k, v in files.items()}, "sha256": {k: v[1] for k, v in files.items()},
+         "ngram": nname, "ngram_gb": nfile[0] / 1e9, "download_gb": sum(v[0] for v in files.values()) / 1e9,
+         "memory_gb": float(q.get("memory_gb") or 0), "plan": dict(lay["plan"]), "layout": layout,
+         "dir": HY4_QUANTS[quant] + ("" if layout == HY4_STANDARD else f"-{layout.upper()}")}
+    if nfolder != folder:                              # (a layout's folder of the repo has its trunk only)
+        m["sources"] = {nname: (man["repo"], rev)}
+        m["source_folders"] = {nname: "" if nfolder == "." else nfolder}
+    return m
+
+
+def hy4_cache_bytes(ctx: int, chunk: int) -> int:
+    """The bytes of maya-hy4's caches in VRAM at a context (src/hy4/hy4_model.cu's plan): the window layers' ring of
+    latents (the newest 512 + max(16384, chunk) positions), the global layers' latents and pooled keys for every
+    position, and the ring's hidden states."""
+    ring = min(ctx, 512 + max(16384, chunk))
+    return 29 * ring * 576 * 2 + 13 * (ctx * 576 * 2 + (ctx // 4 + 1) * 128 * 4 + ring * 2 * 128 * 4) + ring * 3072 * 4
+
+
+def hy4_need_gib(plan: dict, ctx: int) -> float:
+    """The VRAM (GiB, its reserve included) maya-hy4 needs at a context for everything that is not a routed expert -
+    these parts have no RAM fallback.  From the plan's table ("need_gib", by context); a context it does not list:
+    the nearest one below it (else its smallest) plus what the caches grow by (hy4_cache_bytes)."""
+    table = {int(k): float(v) for k, v in (plan.get("need_gib") or {}).items()}
+    if not table:
+        return 0.0
+    if ctx in table:
+        return table[ctx]
+    base = max((c for c in table if c <= ctx), default=min(table))
+    chunk = int(plan.get("chunk") or 1024)
+    return table[base] + (hy4_cache_bytes(ctx, chunk) - hy4_cache_bytes(base, chunk)) / 2**30
+
+
+def hy4_usable_gib(gpus: list, used: dict | None = None) -> float:
+    """The VRAM (GiB) the chosen cards have for the model: their total less what is in use on each now (nvidia-smi;
+    at most HY4_FIT_USED_CAP_GIB a card counts - more is a program that can be closed).  No reading: one card is
+    taken to drive a desktop (HY4_FIT_DISPLAY_GIB)."""
+    used = gpu_used_mib() if used is None else used
+    total = sum(float(g.get("vram_gb") or 0) for g in gpus or [])
+    if not used:
+        return max(total - (HY4_FIT_DISPLAY_GIB if gpus else 0.0), 0.0)
+    return max(total - sum(min(float(used.get(g.get("index"), 0)) / 1024.0, HY4_FIT_USED_CAP_GIB) for g in gpus), 0.0)
+
+
+def hy4_fit(q: dict, gpus: list, ctx_wanted: int | None = None, used: dict | None = None,
+            layout: str | None = None) -> dict:
+    """How a size of Hy4-Flash (q: its entry in the manifest) runs on these cards, worked out before any download:
+    {"layout": "standard" where its plan fits the VRAM (hy4_usable_gib) at the context - else a small-card layout the
+    size has; "context": ctx_wanted, else "recommended" - the largest of HY4_CONTEXTS that fits, up to
+    HY4_TESTED_CONTEXT; "contexts": all that fit; "chunk" and "args": the layout's own engine flags (none for
+    "standard": the engine's defaults - it fills the VRAM left with the most-routed experts itself); "usable", "need"
+    (GiB)}.  A small-card layout reads prompts in chunks twice its plan's where that still fits (HY4_CHUNK_UP_GIB).
+    Nothing fits: {"error": why, "hint": what to do, "usable", "need"}.  layout: only this one (the files of a folder
+    are that layout's)."""
+    lays = hy4_layouts(q)
+    if layout is not None:
+        lays = {k: v for k, v in lays.items() if k == layout}
+    usable = hy4_usable_gib(gpus, used)
+
+    def need(plan: dict, ctx: int) -> float:           # (a context the table does not list: not measured on a card)
+        return hy4_need_gib(plan, ctx) + (0.0 if str(ctx) in (plan.get("need_gib") or {}) else HY4_FIT_MARGIN_GIB)
+
+    least = HY4_CONTEXTS[0]
+    cards = f"{len(gpus)} cards together have" if len(gpus or []) > 1 else "this card has"
+    fits = {k: [c for c in HY4_CONTEXTS if need(v["plan"], c) <= usable] for k, v in lays.items()}
+    if not any(fits.values()):
+        smallest = min((need(v["plan"], least) for v in lays.values()), default=0.0)
+        return {"error": f"{HY4} needs about {smallest:.1f} GB of free VRAM for the parts of the model that must sit "
+                         f"on the GPU (at its smallest context, {context_label(least)}; the engine has no RAM "
+                         f"fallback for them), and {cards} {usable:.1f} GB free",
+                "hint": "a card with more VRAM (or more cards: --gpus), or close the programs that use this one",
+                "usable": usable, "need": smallest}
+    want = int(ctx_wanted) if ctx_wanted else least
+    pick = next((k for k in lays if need(lays[k]["plan"], want) <= usable), None)
+    if pick is None:                                   # (the context asked for fits no layout)
+        most = max(max(v) for v in fits.values() if v)
+        return {"error": f"a context of {want} tokens needs about "
+                         f"{min(need(v['plan'], want) for v in lays.values()):.1f} GB of free VRAM for {HY4}, and "
+                         f"{cards} {usable:.1f} GB free",
+                "hint": f"the largest context that fits here: --context {most}",
+                "usable": usable, "need": min(need(v["plan"], want) for v in lays.values())}
+    plan = lays[pick]["plan"]
+    rec = max([c for c in fits[pick] if c <= HY4_TESTED_CONTEXT] or [least])
+    ctx = int(ctx_wanted) if ctx_wanted else rec
+    chunk, args = int(plan.get("chunk") or 0), []
+    if pick != HY4_STANDARD:
+        if chunk and need(plan, ctx) + HY4_CHUNK_UP_GIB <= usable:
+            chunk *= 2
+        args = (["--chunk", str(chunk)] if chunk else []) + \
+            [x for k, flag in (("reserve_gb", "--reserve-gb"), ("vram_experts", "--vram-experts")) if k in plan
+             for x in (flag, f"{float(plan[k]):g}")]
+    return {"layout": pick, "context": ctx, "recommended": rec, "contexts": fits[pick], "chunk": chunk, "args": args,
+            "usable": usable, "need": need(plan, ctx)}
+
+
+def hy4_layout_in(d: Path, quant: str) -> str | None:
+    """The layout whose trunk is in a folder (both layouts' trunks have the same name: by its size), or None."""
+    for name, lay in hy4_layouts(hy4_quant_table(quant)).items():
+        for rel, (size, _) in lay["files"].items():
+            f = Path(d) / Path(rel).name
+            if f.is_file() and f.stat().st_size == size:
+                return name
+    return None
+
+
+def choose_hy4_quant(a, prev: dict) -> str:
+    """--hy4-quant (--model hy4-flash-maya-xs), else asked among the sizes that are uploaded - by this PC's memory
+    the one recommended (fit_recommendation); none uploaded yet: the one set up before, else the smallest (with
+    --model-dir: its files)."""
+    if getattr(a, "hy4_quant", None):
+        return a.hy4_quant
+    keys = [k for k in HY4_QUANTS if hy4_published(k)]
+    before = (prev.get("installer") or {}).get("hy4_quant")
+    if not keys:
+        return before if before in HY4_QUANTS else next(iter(HY4_QUANTS))
+    if len(keys) == 1:
+        return keys[0]
+    total, _ = mem_gb()
+    m = {k: hy4_entry(k) for k in keys}
+    rec = fit_recommendation({k: m[k]["memory_gb"] for k in keys}, setup_gpus(a), total)
+    order = sorted(keys, key=lambda k: k != rec)
+    default = before if before in order else rec
+    pick = choose(f"Which files of {HY4}?", ["Maya's GGUF quants of it, on NVIDIA from V100 on:"],
+                  [(Q.shown("hy4", k, m[k]["download_gb"]), "recommended" if k == rec else None,
+                    f"Maya's quant: {hy4_quant_table(k).get('about', 'GGUF')}; about {m[k]['memory_gb']:.0f} GB of VRAM "
+                    "and RAM together") for k in order],
+                  order.index(default), a.yes or getattr(a, "check", False))
+    return order[pick]
+
+
+def hy4_dir(a, models: Path, prev: dict, quant: str, layout: str = HY4_STANDARD) -> Path:
+    """The model's folder: --model-dir, else the folder of the Hy4-Flash setup before when it holds the same size and
+    layout (its pack is inside it), else <models folder>/Hy4-Flash-Maya-XS (a layout: ...-8GB)."""
+    if a.model_dir:
+        return Path(a.model_dir).expanduser().resolve()
+    inst = prev.get("installer") or {}
+    if inst.get("hy4_quant") == quant and inst.get("layout", HY4_STANDARD) == layout and inst.get("model_dir") and \
+            Path(inst["model_dir"]).is_dir():
+        return Path(inst["model_dir"])
+    return models / hy4_entry(quant, layout)["dir"]
+
+
+def hy4_places(models: Path, name: str) -> list:
+    """Where another Hy4-Flash setup here keeps the file `name` (the n-gram table: one file for every size and
+    layout): each size's and layout's default folder in the models folder, and the folders of the Hy4 configs."""
+    dirs = []
+    for k, full in HY4_QUANTS.items():
+        dirs += [models / full] + [models / f"{full}-{lay.upper()}" for lay in hy4_quant_table(k).get("layouts") or {}]
+    for c in configs():
+        cfg = read_json(c)
+        if config_family(cfg) == "hy4" and (cfg.get("installer") or {}).get("model_dir"):
+            dirs.append(Path(cfg["installer"]["model_dir"]))
+    return [x / name for x in dirs]
+
+
+def hy4_model_step(a, d: Path, quant: str, layout: str = HY4_STANDARD, models: Path | None = None) -> list | None:
+    """A size's files in d - [its trunk, the n-gram table] - or None when nothing was downloaded.  The n-gram table is
+    one file for every size and layout: where another Hy4-Flash folder here has it (the same size and sha256) it is
+    hard-linked, not downloaded again.  Missing files are downloaded once the size is published; before that, the
+    files already in d (--model-dir) are taken.  Either way each is checked against its sha256 (once, then
+    remembered).  The repo's mmproj and drafter files are not fetched: the engine reads neither yet."""
+    name = Q.shown("hy4", quant)
+    step(5, f"the model ({name})")
+    m = hy4_entry(quant, layout)
+    files = [d / n for n in m["files"]]
+    ngram = d / m["ngram"]
+    if not ngram.exists() and models is not None:
+        link_published(ngram, m["files"][ngram.name], m["sha256"][ngram.name], hy4_places(models, ngram.name))
+    missing = [f for f in files if file_incomplete(m, f)]
+    if missing and not hy4_published(quant, layout):
+        fail(f"{name} is not published yet (and {missing[0]} is {file_incomplete(m, missing[0])})",
+             f"with its files in a folder: {ME} --setup --model {Q.setup_id('hy4', quant)} --model-dir <folder>")
+    if missing and not offer_download(a, Q.shown("hy4", quant, m["download_gb"]), d, files, m):
+        return None
+    for f in files:   # (downloaded, copied or linked: by sha256 too - a damaged file keeps its size)
+        if not sha256_checked(f, m["sha256"][f.name]):
+            fail(f"{f}: the sha256 does not match the published one - the file is damaged (its size is right)",
+                 f"delete it and run {ME} --setup again" + (": the setup downloads it again"
+                                                           if hy4_published(quant, layout) else ""))
+    ok(f"{name}: {len(files)} files, {sum(f.stat().st_size for f in files) / 1e9:.1f} GB in {d}")
+    say(f"  the n-gram table ({m['ngram_gb']:.0f} GB) is read from the SSD page by page while the model answers - it "
+        "is never loaded into RAM")
+    if rotational(d):
+        warn(f"{d} is on a spinning hard disk: the engine reads the n-gram table ({m['ngram_gb']:.0f} GB) from it on "
+             "every token, and the experts that are not in VRAM - use an NVMe SSD (--models-dir)")
+    return files
+
+
+def hy4_pack_step(a, d: Path, files: list) -> Path:
+    """tools/hy4/pack_gguf.py's pack in <model>/maya-hy4: the geometry, where every tensor sits in the two GGUF files
+    (read in place), the n-gram table's small parts and the tokenizer with the GGUF's chat template - built again when
+    its tools or the model's files changed."""
+    step(6, "the pack (the engine's index of the model files)")
+    pack = d / "maya-hy4"
+    tools = S.source_hash(HY4_PACK_TOOLS)
+    need = ("hy4.txt", "tensors.txt", "engram.bin", "tokenizer/vocab.json", "tokenizer/chat_template.jinja")
+    if not a.repack and read_json(pack / PACK_SOURCES).get("tools") == tools and \
+            all((pack / f).exists() for f in need) and pack_stale(pack, files) is None:
+        ok(f"pack already built: {pack}")
+        return pack
+    if not os.access(d, os.W_OK):
+        fail(f"{d} is not writable: the pack is written inside the model's folder")
+    say("  Indexing every tensor of the GGUF files (the weights stay where they are) and the tokenizer ...")
+    run([sys.executable, str(ROOT / "tools" / "hy4" / "pack_gguf.py"), "--model", str(d), "--out", str(pack),
+         "--files"] + [f.name for f in files])
+    missing = [f for f in need if not (pack / f).exists()]
+    if missing:
+        fail(f"the pack builder did not write {pack / missing[0]}", "the reason is in the messages above")
+    stamp_pack(pack, files)
+    rec = read_json(pack / PACK_SOURCES)
+    rec["tools"] = tools
+    (pack / PACK_SOURCES).write_text(json.dumps(rec, indent=1), encoding="utf-8")
+    ok(f"pack: {pack}")
+    return pack
+
+
+def write_config_hy4(a, pc: dict, meta: dict, pack: Path, ctx: int, models: Path, d: Path, quant: str,
+                     fit: dict | None = None) -> Path:
+    """maya-hy4-flash-maya-xs.json (maya_quants.config_stem: one config a size, whichever layout) and its start
+    script.  The model's own sampling and thinking level are written at every setup; a setup again keeps what the
+    config before says that this one does not ask - where the server listens, its key, the env, the CPU lane's
+    threads, an expert profile, and (the standard layout) the VRAM kept free.  A layout's own flags (hy4_fit's
+    "args") are worked out again every time."""
+    step(8, "the configuration and the start script")
+    port = a.port or 8080
+    fit = fit or {"layout": HY4_STANDARD, "args": []}
+    cfg_path = ROOT / f"{Q.config_stem('hy4', quant)}.json"
+    old = read_json(cfg_path) if cfg_path.exists() else {}
+    args = ["--pack", str(pack), "--max-context", str(ctx)] + list(fit["args"])
+    if HY4_PROFILE.exists():
+        args += ["--profile", str(HY4_PROFILE)]
+    kept = keep_args(old.get("args") or [], args, ("--cpu-threads", "--profile") +
+                     (("--reserve-gb",) if fit["layout"] == HY4_STANDARD and
+                      (old.get("installer") or {}).get("layout", HY4_STANDARD) == HY4_STANDARD else ()))
+    gpus = [g["index"] for g in pc["gpus"]]
+    if len(gpus) > 1:   # (the server shows the engine only the config's "gpu" cards: --gpus counts them, in their order)
+        args += ["--gpus", ",".join(str(i) for i in range(len(gpus)))]
+    cfg = {"exe": str(HY4_EXE), "args": args, "cwd": str(ROOT), "tokenizer": str(pack / "tokenizer"),
+           "model_name": HY4_MODEL_NAME, "gpu": gpus,
+           "sampling": dict(HY4_SAMPLING), "reasoning_effort": HY4_EFFORT,   # (the model's own, every setup)
+           "lib_dirs": meta.get("lib_dirs") or old.get("lib_dirs") or [], "port": port}
+    for k in ("host", "api_key", "cors_origins", "mcp_servers"):
+        if old.get(k) is not None:
+            cfg[k] = old[k]
+            kept.append(k)
+    env = {**(old.get("env") or {}), **parse_env(a.env)}
+    if env:
+        cfg["env"] = env
+    if a.host:
+        cfg["host"] = a.host
+    if a.api_key:
+        cfg["api_key"] = a.api_key
+    if kept:
+        ok("kept from the config before: " + ", ".join(kept))
+    cfg["log"] = str(cfg_path.with_suffix(".log"))
+    cfg["installer"] = {"family": "hy4", "hy4_quant": quant, "quant": HY4_QUANTS[quant], "layout": fit["layout"],
+                        "models_dir": str(models), "model_dir": str(d), "written": time.strftime("%Y-%m-%d %H:%M")}
+    cfg_path.write_text(json.dumps(N.env_out(cfg), indent=1), encoding="utf-8")
+    ok(f"config: {cfg_path}")
+    ok(f"start script: {write_run_script(cfg_path, port)}")
+    return cfg_path
+
+
+def hy4_fit_step(a, pc: dict, quant: str, prev_ctx: int | None = None) -> dict:
+    """The layout and the context of a size on the cards chosen (hy4_fit), said; what does not fit stops the setup
+    here, before any download.  --model-dir: the layout of the trunk in that folder.  The context: --context, else
+    asked among those that fit (the one set up before, else the recommended one)."""
+    q = hy4_quant_table(quant)
+    name = Q.shown("hy4", quant)
+    if not hy4_layouts(q):
+        hy4_entry(quant)                               # (a size with no files yet: its own message)
+    forced = hy4_layout_in(Path(a.model_dir).expanduser(), quant) if a.model_dir else None
+    fit = hy4_fit(q, pc["gpus"], a.context, layout=forced)
+    if "error" not in fit and not a.context and not getattr(a, "check", False):
+        ctx = choose_context(a, prev_ctx, fit["contexts"], fit["recommended"])
+        fit = hy4_fit(q, pc["gpus"], ctx, layout=fit["layout"])
+    if "error" in fit:
+        fail(fit["error"] + (f" (the files in {a.model_dir} are the {forced} layout's)" if forced else ""), fit["hint"])
+    if fit["layout"] == HY4_STANDARD:
+        ok(f"{name} fits: about {fit['need']:.1f} GB of the {fit['usable']:.1f} GB of VRAM for what must sit there; "
+           "the engine fills the rest with the most-routed experts and computes the others on the CPU")
+    else:
+        ok(f"{name} in its {fit['layout']} layout ({hy4_layouts(q)[fit['layout']]['about']}): about "
+           f"{fit['need']:.1f} GB of the {fit['usable']:.1f} GB of VRAM for what must sit there; the routed experts "
+           f"are computed on the CPU, prompts are read in chunks of {fit['chunk']} tokens")
+    ok(f"context: {fit['context']} tokens" + (" (recommended for this VRAM)" if fit["context"] == fit["recommended"] else ""))
+    if fit["context"] > HY4_TESTED_CONTEXT:
+        warn(f"past {context_label(HY4_TESTED_CONTEXT)} the engine has not been run end to end yet")
+    return fit
+
+
+def set_up_hy4(a, prev: dict) -> Path | None:
+    """Hy4-Flash's steps 1-8: the size, the PC (NVIDIA from V100 on), the layout and the context that fit its VRAM
+    (before any download), its engine (build/maya-hy4), the files, the pack, the config.  Nothing to measure yet."""
+    inst = prev.get("installer") or {}
+    prev_args = prev.get("args") or []
+    prev_ctx = int(prev_args[prev_args.index("--max-context") + 1]) if "--max-context" in prev_args[:-1] else None
+    quant = choose_hy4_quant(a, prev)
+    name = Q.shown("hy4", quant)
+    pc = check_pc(a, "hy4")                            # 1
+    step(2, "your choices")                            # 2
+    ok(f"files: {name} (Maya's quant)")
+    fit = hy4_fit_step(a, pc, quant, prev_ctx)
+    total, _ = mem_gb()
+    vram = sum(g["vram_gb"] for g in pc["gpus"])
+    need = float(hy4_quant_table(quant).get("memory_gb") or 0)
+    if total > 0 and vram + total < need:
+        warn(f"{vram:.0f} GB of VRAM and {total:.0f} GB of RAM: below the ~{need:.0f} GB that hold all of {name} - "
+             "slower: parts of the model are then read from the SSD")
+    models = (Path(a.models_dir).expanduser().resolve() if a.models_dir else
+              Path(inst["models_dir"]) if inst.get("models_dir") else ROOT.parent / "Maya-data" / "models")
+    d = hy4_dir(a, models, prev, quant, fit["layout"])
+    ok(f"model folder: {d}")
+    llama = tools_step(a)                              # 3
+    meta = build_step(a, pc, llama, "maya-hy4")        # 4
+    files = hy4_model_step(a, d, quant, fit["layout"], models)   # 5
+    if files is None:
+        return None
+    pack = hy4_pack_step(a, d, files)                  # 6
+    step(7, "images (the vision tower)")
+    ok(f"pictures: not available for {HY4} yet (text only)")
+    ok("drafting: not available for these files yet")
+    return write_config_hy4(a, pc, meta, pack, fit["context"], models, d, quant, fit)   # 8
+
+
 def qwen_entry(quant: str = "q5_k_m") -> dict:
     """CYBER-FROST-3.8-PS's download (tools/qwen/download.json) as a MODELS entry (offer_download's form); quant
     QWEN_UD: unsloth's UD-IQ2_XS of Qwen3.8-Flash-Next (tools/qwen/download_unsloth.json: its n-gram shard from Maya's
@@ -8405,7 +8859,7 @@ def maya_version() -> str:
 
 def model_option(a) -> str | None:
     """--model as typed -> what the setup reads (in place): a.model a GLM download (a MODELS key), DS4 or MM3, and a
-    DeepSeek / MiniMax quant's files as --ds4-quant / --mm3-quant.  It takes a setup id (glm-maya-s, deepseek-maya-xs,
+    DeepSeek / MiniMax / Hy4-Flash quant's files as --ds4-quant / --mm3-quant / --hy4-quant.  It takes a setup id (glm-maya-s, deepseek-maya-xs,
     minimax-maya-xs ...), a quant's full name (MiniMax-M3.1-Flash-Maya-XS) or any name it took before (Maya-S24,
     EXL3-3.05bpw, DeepSeek-V4.1-Flash-1017 ...; --mm3-quant gguf-xs as maya-xs).  The error for a name it does not
     know, or for a quant --ds4-quant / --mm3-quant names otherwise; else None."""
@@ -8416,7 +8870,7 @@ def model_option(a) -> str | None:
     hit = Q.resolve(a.model, list(glm_downloads()))   # (GLM-5.3's downloads included)
     if hit is None:
         return (f"--model {a.model}: not a model Maya knows - one of " + ", ".join(i for _, _, _, i in Q.QUANTS) +
-                f", {DS4}, {MM3}, cyber-frost = {QWEN_SHOWN}, or a GLM-5.3-Flash download: " + ", ".join(MODELS))
+                f", {DS4}, {MM3}, {HY4}, cyber-frost = {QWEN_SHOWN}, or a GLM-5.3-Flash download: " + ", ".join(MODELS))
     family, key = hit
     if family == "glm":
         a.model = key
@@ -8429,7 +8883,7 @@ def model_option(a) -> str | None:
         if key is not None:
             a.qwen_quant = key
         return None
-    a.model, flag = (DS4, "ds4_quant") if family == "deepseek" else (MM3, "mm3_quant")
+    a.model, flag = {"deepseek": (DS4, "ds4_quant"), "hy4": (HY4, "hy4_quant")}.get(family, (MM3, "mm3_quant"))
     if key is not None:
         given = getattr(a, flag, None)
         if given and given != key:
@@ -8465,10 +8919,11 @@ def main() -> int:
     ap.add_argument("--model", metavar="MODEL",
                     help="which model and files (default: asked): a Maya quant - "
                          + ", ".join(i for _, _, _, i in Q.QUANTS) +
-                         f" - or {DS4} / {MM3} (their files asked, or --ds4-quant / --mm3-quant), cyber-frost = {QWEN_SHOWN},"
+                         f" - or {DS4} / {MM3} / {HY4} (their files asked, or --ds4-quant / --mm3-quant / --hy4-quant), "
+                         f"cyber-frost = {QWEN_SHOWN},"
                          " or a GLM-5.3-Flash "
                          "download by its name (" + ", ".join(MODELS) + "; every name used before still works)")
-    ap.add_argument("--model-dir", help=f"use the files you already have of {DS4}, MiniMax or {QWEN_SHOWN}: their "
+    ap.add_argument("--model-dir", help=f"use the files you already have of {DS4}, MiniMax, {HY4} or {QWEN_SHOWN}: their "
                                         "folder (a GGUF's shards, or the EXL3 quant's files and the Engram shards 47 / "
                                         "48 of DeepSeek's repo), or an EXL3 folder of GLM-5.3-Flash or "
                                         "MiniMax-M3.1-Flash at any bit rate (whole by its own index; its own sampling "
@@ -8495,6 +8950,11 @@ def main() -> int:
                          "PC), maya-s (gguf-s) = MiniMax-M3.1-Flash-Maya-S (~2.1 bits, ~122 GB) - the GGUFs on NVIDIA "
                          "from V100 on and on AMD; with --model-dir: the files you have (the same as --model "
                          "minimax-maya-xs / minimax-maya-s)")
+    ap.add_argument("--hy4-quant", choices=list(HY4_QUANTS),
+                    help=f"{HY4}'s files, Maya's own GGUF quants of it (NVIDIA from V100 on, Linux or Windows; text "
+                         "only for now): maya-xs = Hy4-Flash-Maya-XS (routed experts in 2 bits), maya-s / maya-m / "
+                         "maya-l once they are published; with --model-dir: the files you have (the same as --model "
+                         "hy4-flash-maya-xs ...)")
     ap.add_argument("--qwen-quant", choices=list(QWEN_QUANTS),
                     help=f"Qwen3.8-Flash-Next's files: q5_k_m = {Q.shown('qwen', 'q5_k_m')} (peasantsmith's GGUF), "
                          f"{QWEN_UD} = Qwen3.8-Flash-Next in unsloth's UD-IQ2_XS GGUF (~81 GB with its vision tower; the same as --model "
@@ -8521,7 +8981,8 @@ def main() -> int:
                     help="GLM-5.3-Flash, DeepSeek-V4.1-Flash and MiniMax-M3.1-Flash: answer up to N requests at once "
                          "(1-8, default 1), kept in the config: they are decoded together, more tokens per second in "
                          "all; each extra conversation keeps its own context in VRAM, which the expert cache gives "
-                         "up (MiniMax: no KV streaming and no DSpark while N is above 1)")
+                         "up (MiniMax: no KV streaming and no DSpark while N is above 1); Qwen-3.8-Flash-Next and "
+                         "Hy4-Flash serve one request at a time")
     ap.add_argument("--force-fit", action="store_true",
                     help="GLM-5.3-Flash: set up a quant even where the setup works out that it cannot start on this "
                          "PC's one NVIDIA card, not even with its experts on the CPU (it then warns instead of "
@@ -8599,7 +9060,7 @@ def main() -> int:
         sys.stdout.flush()
         os.execve("/bin/sh", ["/bin/sh", str(HERE / "maya.sh"), *sys.argv[1:]], dict(os.environ, MAYA_SH="1"))
     version = maya_version()
-    say(f"Project Maya v{version} - GLM-5.3-Flash, {DS4} or {MM3} on your own GPU(s).")
+    say(f"Project Maya v{version} - GLM-5.3-Flash, {DS4}, {MM3} or {HY4} on your own GPU(s).")
     if a.report:
         return report(version, a.backend, a.config)
     if a.import_model:
@@ -8682,9 +9143,12 @@ def main() -> int:
         say("Nothing is set up yet: the setup runs first, then the tuning.")
     prev = read_json(have[0]) if have else {}
     if a.check:
-        ds4 = a.model == DS4 or bool(a.model_dir) and exl3_folder_family(a.model_dir) is None
+        hy4 = a.model == HY4 or bool(getattr(a, "hy4_quant", None))
+        ds4 = not hy4 and (a.model == DS4 or bool(a.model_dir) and exl3_folder_family(a.model_dir) is None)
         quant = choose_ds4_quant(a, prev) if ds4 else None
-        pc = check_pc(a, "deepseek" if ds4 else "glm", gguf=ds4 and quant != "exl3")
+        pc = check_pc(a, "hy4" if hy4 else "deepseek" if ds4 else "glm", gguf=ds4 and quant != "exl3")
+        if hy4:                                        # (the layout and the context that fit this VRAM, or why none does)
+            hy4_fit_step(a, pc, choose_hy4_quant(a, prev if config_family(prev) == "hy4" else {}))
         say()
         if a.backend == "metal":
             say(f"This Mac can run Maya on Metal (experimental). Run {ME} without --check to set it up.")
