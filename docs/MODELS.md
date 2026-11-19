@@ -203,6 +203,7 @@ the [model card](https://huggingface.co/peasantsmith/Hy4-Flash-Maya-GGUF).
 - **One n-gram table for every size:** Tencent's FP8 table, value for value (63.4 GB). It is downloaded once, stays
   on the SSD and is read page by page while the model answers: it does not need to fit in memory and is never loaded
   into RAM whole. Keep it on an SSD / NVMe, never a hard disk.
+- **AMD (Linux):** `./maya.sh --setup --backend hip --model hy4-flash-maya-xs`. Run by us on a Gorgon Halo (Radeon 8065S, `gfx1151`, ROCm 7.14) with the Radeon alone: Maya-XS and Maya-L with every expert in the GPU's memory, pictures, tool calls and both thinking levels. On a Strix Halo / Gorgon Halo the setup says whether the size sits in the GPU's memory whole ([MEMORY.md](MEMORY.md): 64 GB - Maya-XS, 96 GB - Maya-M, 128 GB - Maya-L). Radeon cards (`gfx1100`): the engine's AMD build was contributed by [@Cass67](https://github.com/Cass67), who ran Tencent's own Q4_K_M on four RX 7900 XT; we have not run such cards ourselves. With an AMD GPU on Windows it has not been tested yet: the setup does not offer it there.
 - **Memory:** RAM + VRAM of about 56-64 GB for Maya-XS (a rule of thumb: the model file plus 4-8 GB for the context).
   With less it still runs, slower ([MEMORY.md](MEMORY.md)).
 - **VRAM:** everything but the routed experts has to fit in VRAM; the experts that do not fit are computed on the CPU

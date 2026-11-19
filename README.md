@@ -71,12 +71,12 @@ recommends one for your PC; to pick one yourself, give its setup id: `./setup.sh
 | | Maya-XS (v2) · `deepseek-maya-xs` | 277 GB | the whole model in a 128 GB PC's memory (the Engram tables stay on the SSD); v2 is about 12% closer to the original and about 20% faster at writing than v1 - running the setup again offers the update |
 | **[MiniMax-M3.1-Flash](https://huggingface.co/MiniMaxAI/MiniMax-M3.1-Flash)**<br><sub>MiniMax · [MiniMax Community License](LICENSE.minimax-m31) · 428 B, 23 B active · up to 1M context</sub> | Maya-XS · `minimax-maya-xs` | 93 GB | the whole model in a 128 GB PC's memory |
 | | Maya-S · `minimax-maya-s` | 122 GB | closer to the original |
-| **[Hy4-Flash](https://huggingface.co/tencent/Hy4-flash)**<br><sub>Tencent · [Tencent Hy License](LICENSE.hy4-flash) · 220 B · reads pictures · NVIDIA only</sub> | Maya-XS · `hy4-flash-maya-xs`<br>Maya-M · `hy4-flash-maya-m`<br>Maya-L · `hy4-flash-maya-l` | 44.8 GB<br>68.4 GB<br>89.5 GB<br>each + one 63.4 GB n-gram table | PCs with about 56-64 GB (Maya-XS; cards from 8 GB), 80-96 GB (Maya-M) or 104-128 GB (Maya-L) of RAM + VRAM; Maya-M and Maya-L on cards from 12 GB; the n-gram table stays on the SSD; Maya-S follows |
+| **[Hy4-Flash](https://huggingface.co/tencent/Hy4-flash)**<br><sub>Tencent · [Tencent Hy License](LICENSE.hy4-flash) · 220 B · reads pictures · NVIDIA, AMD on Linux</sub> | Maya-XS · `hy4-flash-maya-xs`<br>Maya-M · `hy4-flash-maya-m`<br>Maya-L · `hy4-flash-maya-l` | 44.8 GB<br>68.4 GB<br>89.5 GB<br>each + one 63.4 GB n-gram table | PCs with about 56-64 GB (Maya-XS; cards from 8 GB), 80-96 GB (Maya-M) or 104-128 GB (Maya-L) of RAM + VRAM; Maya-M and Maya-L on cards from 12 GB; the n-gram table stays on the SSD; Maya-S follows |
 
 **Which model fits your PC?** See [docs/MEMORY.md](docs/MEMORY.md) for each model's recommended memory (VRAM + RAM together).
 
 All of them run on NVIDIA from the V100 / RTX 20 on, and on AMD and Windows (see
-[What you need](#what-you-need)); Hy4-Flash runs on NVIDIA only for now (Linux and Windows) and reads pictures where the card has room for one beside the model (8 GB cards: text only). DeepSeek's sizes include its Engram tables. The setup also offers unsloth's GGUF and
+[What you need](#what-you-need)); Hy4-Flash runs on NVIDIA (Linux and Windows) and on AMD on Linux (Strix Halo / Gorgon Halo, Radeon cards) and reads pictures where the card has room for one beside the model (8 GB cards: text only). DeepSeek's sizes include its Engram tables. The setup also offers unsloth's GGUF and
 turboderp's and LibertAIDAI's EXL3 quants of DeepSeek, orcarouter's abliterated DeepSeek, Mia-AiLab's EXL3 quant of MiniMax,
 turboderp's EXL3 quants of GLM, Qwen-3.8-Flash-Next (CYBER-FROST) as its Q5_K_M GGUF and Qwen-3.8-Flash-Next
 itself as unsloth's UD-IQ2_XS GGUF, both with pictures

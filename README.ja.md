@@ -62,11 +62,11 @@ Maya の量子化はすべて、モデル名のあとに階層 (XS、S、M、L�
 | | Maya-XS (v2) · `deepseek-maya-xs` | 277 GB | 128 GB の PC のメモリにモデル全体を載せる (Engram テーブルは SSD に置く); v2 は v1 より元のモデルに約 12% 近く、書き出しが約 20% 速い - セットアップを再実行すると更新を案内します |
 | **[MiniMax-M3.1-Flash](https://huggingface.co/MiniMaxAI/MiniMax-M3.1-Flash)**<br><sub>MiniMax · [MiniMax Community License](LICENSE.minimax-m31) · 428 B、アクティブ 23 B · 最大 1M コンテキスト</sub> | Maya-XS · `minimax-maya-xs` | 93 GB | 128 GB の PC のメモリにモデル全体を載せる |
 | | Maya-S · `minimax-maya-s` | 122 GB | 元のモデルにより近い |
-| **[Hy4-Flash](https://huggingface.co/tencent/Hy4-flash)**<br><sub>Tencent · [Tencent Hy License](LICENSE.hy4-flash) · 220 B · 画像対応 · NVIDIA のみ</sub> | Maya-XS · `hy4-flash-maya-xs` | 44.8 GB + n-gram テーブル 63.4 GB | RAM と VRAM の合計が約 56-64 GB の PC、8 GB 以上のカード。n-gram テーブルは SSD に置いたまま。ほかのサイズは順次追加 |
+| **[Hy4-Flash](https://huggingface.co/tencent/Hy4-flash)**<br><sub>Tencent · [Tencent Hy License](LICENSE.hy4-flash) · 220 B · 画像対応 · NVIDIA、AMD (Linux)</sub> | Maya-XS · `hy4-flash-maya-xs` | 44.8 GB + n-gram テーブル 63.4 GB | RAM と VRAM の合計が約 56-64 GB の PC、8 GB 以上のカード。n-gram テーブルは SSD に置いたまま。ほかのサイズは順次追加 |
 
 **どのモデルがあなたの PC に合う?** 各モデルの推奨メモリ (VRAM と RAM の合計) は [docs/MEMORY.md](docs/MEMORY.md) を見てください。
 
-いずれも NVIDIA の V100 / RTX 20 以降、および AMD と Windows ([必要なもの](#what-you-need)を参照) で動きます。Hy4-Flash は今のところ NVIDIA のみ (Linux と Windows) で、画像は VRAM に余裕のあるカードで読めます (8 GB のカードではテキストのみ)。DeepSeek のサイズには Engram テーブルが含まれます。セットアップでは、unsloth の GGUF と turboderp および LibertAIDAI の DeepSeek 用 EXL3 量子化、orcarouter の abliterated 版 DeepSeek、Mia-AiLab の MiniMax 用 EXL3 量子化、turboderp の GLM 用 EXL3 量子化、画像対応の Q5_K_M GGUF としての Qwen-3.8-Flash-Next (CYBER-FROST)、そして同じく画像対応の unsloth の UD-IQ2_XS GGUF としての Qwen-3.8-Flash-Next 本体 ([その設定](docs/SETTINGS.md#qwen-38-flash-next-cyber-frost)) も選べます。**各モデルのファイル、ドラフター、画像、オプション: [docs/MODELS.md](docs/MODELS.md)。**
+いずれも NVIDIA の V100 / RTX 20 以降、および AMD と Windows ([必要なもの](#what-you-need)を参照) で動きます。Hy4-Flash は NVIDIA (Linux と Windows) と Linux 上の AMD (Strix Halo / Gorgon Halo、Radeon カード) で動き、画像は VRAM に余裕のあるカードで読めます (8 GB のカードではテキストのみ)。DeepSeek のサイズには Engram テーブルが含まれます。セットアップでは、unsloth の GGUF と turboderp および LibertAIDAI の DeepSeek 用 EXL3 量子化、orcarouter の abliterated 版 DeepSeek、Mia-AiLab の MiniMax 用 EXL3 量子化、turboderp の GLM 用 EXL3 量子化、画像対応の Q5_K_M GGUF としての Qwen-3.8-Flash-Next (CYBER-FROST)、そして同じく画像対応の unsloth の UD-IQ2_XS GGUF としての Qwen-3.8-Flash-Next 本体 ([その設定](docs/SETTINGS.md#qwen-38-flash-next-cyber-frost)) も選べます。**各モデルのファイル、ドラフター、画像、オプション: [docs/MODELS.md](docs/MODELS.md)。**
 
 ## <a name="quality"></a>品質
 

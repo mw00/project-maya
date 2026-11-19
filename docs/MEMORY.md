@@ -38,9 +38,9 @@ adds room for the system and the default context.
 | **MiniMax-M3.1-Flash** | Maya-XS | 93 | 100 | **128** | NVIDIA, AMD |
 | | Maya-S | 122 | 130 | **160** | NVIDIA, AMD |
 | | EXL3 3.5 bpw (Mia-AiLab) | 197 | 250 | **256** | NVIDIA, AMD |
-| **Hy4-Flash** | Maya-XS | 108 ³ | 45, plus 4-8 for the context | **56-64** | NVIDIA (V100 and newer) |
-| | Maya-M | 132 ³ | 68, plus 4-8 for the context | **80-96** | NVIDIA (V100 and newer; cards from 12 GB) |
-| | Maya-L | 153 ³ | 90, plus 4-8 for the context | **104-128** | NVIDIA (V100 and newer; cards from 12 GB) |
+| **Hy4-Flash** | Maya-XS | 108 ³ | 45, plus 4-8 for the context | **56-64** | NVIDIA (V100 and newer), AMD on Linux ⁴ |
+| | Maya-M | 132 ³ | 68, plus 4-8 for the context | **80-96** | NVIDIA (V100 and newer; cards from 12 GB), AMD on Linux ⁴ |
+| | Maya-L | 153 ³ | 90, plus 4-8 for the context | **104-128** | NVIDIA (V100 and newer; cards from 12 GB), AMD on Linux ⁴ |
 | **Qwen-3.8-Flash-Next** | UD-IQ2_XS (unsloth) | 80 ² | 47 | **64** | NVIDIA, AMD |
 | | CYBER-FROST Q5_K_M | 113 ² | 84 | **96** | NVIDIA, AMD |
 | | Q4_K_M (Tencent's own, AngelSlim) | 168 ³ | ~108 | **192** | NVIDIA; run on RTX 30 / A100 and newer, Linux |
@@ -48,6 +48,7 @@ adds room for the system and the default context.
 \* Mac (Apple Silicon) support is experimental, GLM-5.3-Flash's GGUF quants only.
 ¹ DeepSeek's download includes its n-gram (Engram) tables, which always stay on the SSD and never count toward memory.
 ² Qwen's n-gram table also stays on the SSD.
+⁴ Hy4-Flash on AMD: Linux only for now - a Strix Halo / Gorgon Halo (below), or Radeon cards; with an AMD GPU on Windows it has not been tested yet and the setup does not offer it.
 ³ Hy4-Flash's download is the model file (44.8 GB for Maya-XS, 68.4 GB for Maya-M, 89.5 GB for Maya-L) and one n-gram table (63.4 GB) that every size shares; the table
 stays on the SSD, is read page by page and never counts toward memory. About 110 GB of disk in all for Maya-XS. Tencent's own
 Q4_K_M (AngelSlim) is a 105 GB model file with the same table; all of its experts fit in about 108 GB of VRAM.
@@ -87,6 +88,7 @@ Q4_K_M (AngelSlim) is a 105 GB model file with the same table; all of its expert
 - **DeepSeek, MiniMax and Qwen** default to 64K. Longer contexts need more memory; the setup only offers the ones your PC
   can hold.
 - **Hy4-Flash** needs more VRAM the longer the context: the setup picks the context that fits the card (4K to 1M).
+- **Hy4-Flash on a Strix Halo / Gorgon Halo (Linux):** the memory is one, so a size that fits it sits in the GPU's memory whole and no expert is computed on the CPU. The engine keeps 8 GB (or a tenth of the memory, if that is more) free for the system: a **64 GB** Halo holds **Maya-XS** whole, a **96 GB** one **Maya-M**, a **128 GB** one **Maya-L** (each up to a 256K context; the 128 GB one holds Maya-L to 1M), a 192 GB one every size at every context. A larger size still runs: the experts the memory does not hold are computed on the CPU or read from the SSD, slower. Linux must let the GPU take that much of the memory: see [AMD_MAYA.md](AMD_MAYA.md#hy4-flash-on-a-strix-halo--gorgon-halo).
 
 Each model's options are in [docs/MODELS.md](MODELS.md) and [docs/SETTINGS.md](SETTINGS.md).
 

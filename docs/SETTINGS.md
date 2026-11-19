@@ -2336,7 +2336,9 @@ the layout and the context that fit the card (4K to 1M: every one that fits its 
 table, builds the pack and the engine by itself and writes `maya-hy4-flash-maya-xs.json`. `--model-dir <folder>` uses
 files you already have (checked by size and sha256). The model runs on an engine of its own, `maya-hy4`
 (contributed by [@needmorevram](https://github.com/needmorevram), #1040): NVIDIA GPUs (CUDA) from the V100 on, Linux
-and Windows.
+and Windows, and AMD GPUs (HIP; its AMD build contributed by [@Cass67](https://github.com/Cass67)) on Linux.
+
+**On AMD.** `--backend hip` builds `build-hip/maya-hy4`. On a GPU that shares the PC's memory (Strix Halo / Gorgon Halo) the engine takes what the RAM has available less a headroom for the system - 8 GB, or a tenth of the RAM if that is more (`HY4_RAM_HEADROOM_GB`) - says the figures in one line at its start, and keeps every routed expert in the GPU's memory where the size fits: the model file is not held twice (its file cache is given back as the weights are copied in), and the n-gram table stays on the SSD. Run on a Gorgon Halo (Radeon 8065S, `gfx1151`); Radeon cards (`gfx1100`) by the contributor, with Tencent's Q4_K_M. Tensor parallel on AMD compiles but has not been run. Windows with an AMD GPU: not tested, not offered by the setup.
 
 **Defaults from Tencent's release**: temperature 0.9, top-p 1.0, no top-k; the thinking budget is 32768 tokens; the
 prompt is the release's own chat template (inside the GGUF). The loop guard is on, as for every model. The model
@@ -2538,6 +2540,7 @@ A request's `spec` (0 / 1) turns the drafts off or on for it.
 | `HY4_LANE_PIN_CALLER` | on | the CPU lane: the engine's own thread stays on the core the lane's threads leave free; `0`: wherever the system runs it |
 | `HY4_EV_POLL_US` | 2000 | the CPU lane: how long the engine polls for a layer's routes before it sleeps on the GPU's event; `0`: asleep at once |
 | `HY4_LANE_NT` | 32 | the CPU lane: a prompt's tokens an expert's weights are read once for (1-64) |
+| `HY4_RAM_HEADROOM_GB` | max(8, a tenth of the RAM) | a GPU that shares the PC's memory (Strix Halo / Gorgon Halo, Linux): the memory (GB) the engine leaves the system and the other programs - what the RAM has available beyond it is the model's |
 | `HY4_VISION_F32` | off | the vision tower's attention products in F32 instead of TF32 (a little slower where TF32 is faster) |
 | `HY4_TP_HELPER` | by speed | tensor parallel: `0` no expert share for the GPUs outside the group; `k`: k slices each (as their VRAM allows) |
 | `HY4_TP_MIXED` | off | tensor parallel over GPUs of different kinds (their copies of the state may drift apart) |

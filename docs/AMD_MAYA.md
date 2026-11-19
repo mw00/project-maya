@@ -218,6 +218,12 @@ text (`MAYA_GLM_MTP_DECODE`, on by default on `gfx115x` only). On the Gorgon Hal
 3K- and 8K-token prompts, against 18.4-19.7 without it; 3K- and 8K-token prompts read at 271 and 278 tokens/s
 (the fused prompt experts and the `wmma2` attention, both on by default on `gfx1151`).
 
+### Hy4-Flash on a Strix Halo / Gorgon Halo
+
+`./maya.sh --setup --backend hip --model hy4-flash-maya-xs` (Linux). Hy4-Flash's engine (`maya-hy4`) keeps a whole size in the GPU's memory where the PC's memory holds it - a 64 GB Halo Maya-XS, a 96 GB one Maya-M, a 128 GB one Maya-L ([MEMORY.md](MEMORY.md)) - and then computes no expert on the CPU. It takes what the RAM has available less 8 GB (or a tenth of the RAM, if more) for the system; the model file is not held twice, and the n-gram table is read from the SSD.
+
+Linux limits how much of the RAM a GPU may take (by default about half). The setup reads the limit and says so when a size does not fit under it; the engine then keeps the most-routed experts on the GPU and computes the rest on the CPU, slower. To let the GPU take more, set the kernel parameter `ttm.pages_limit` (in 4 KiB pages: GiB x 262144) and restart - for example `ttm.pages_limit=14680064` (56 GiB) on a 64 GB PC. Older kernels take `amdgpu.gttsize` (in MiB). Run on a 192 GB Gorgon Halo (Radeon 8065S, Ubuntu 26.04, kernel 7.0, ROCm 7.14) with `ttm.pages_limit=46137344`; the kernel's default limit has not been run. Windows on a Halo: not tested for Hy4-Flash yet.
+
 ## Instinct MI300X / MI325X
 
 AMD Instinct MI300X / MI325X (`gfx942`, CDNA3) is accepted as experimental, on one GPU. Like the MI100 it is a wave64

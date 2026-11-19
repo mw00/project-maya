@@ -60,11 +60,11 @@ git clone https://github.com/mw00/project-maya.git && cd project-maya
 | | Maya-XS (v2) · `deepseek-maya-xs` | 277 GB | 整个模型装进 128 GB 电脑的内存 (Engram 表留在固态硬盘上)；v2 比 v1 更接近原版约 12%，写作速度快约 20% - 再次运行安装程序会提示更新 |
 | **[MiniMax-M3.1-Flash](https://huggingface.co/MiniMaxAI/MiniMax-M3.1-Flash)**<br><sub>MiniMax · [MiniMax Community License](LICENSE.minimax-m31) · 428 B，激活 23 B · 最高 1M 上下文</sub> | Maya-XS · `minimax-maya-xs` | 93 GB | 整个模型装进 128 GB 电脑的内存 |
 | | Maya-S · `minimax-maya-s` | 122 GB | 更接近原版 |
-| **[Hy4-Flash](https://huggingface.co/tencent/Hy4-flash)**<br><sub>腾讯 · [Tencent Hy License](LICENSE.hy4-flash) · 220 B · 支持图片 · 仅 NVIDIA</sub> | Maya-XS · `hy4-flash-maya-xs` | 44.8 GB + 63.4 GB 的 n-gram 表 | 内存与显存合计约 56-64 GB 的电脑，8 GB 及以上的显卡；n-gram 表留在固态硬盘上；更多大小陆续提供 |
+| **[Hy4-Flash](https://huggingface.co/tencent/Hy4-flash)**<br><sub>腾讯 · [Tencent Hy License](LICENSE.hy4-flash) · 220 B · 支持图片 · NVIDIA、AMD (Linux)</sub> | Maya-XS · `hy4-flash-maya-xs` | 44.8 GB + 63.4 GB 的 n-gram 表 | 内存与显存合计约 56-64 GB 的电脑，8 GB 及以上的显卡；n-gram 表留在固态硬盘上；更多大小陆续提供 |
 
 **哪个模型适合你的电脑？** 请看 [docs/MEMORY.md](docs/MEMORY.md)，里面有每个模型的推荐内存（VRAM 与 RAM 合计）。
 
-它们都能在 V100 / RTX 20 及更新的 NVIDIA 显卡上运行，也支持 AMD 和 Windows (见[你需要什么](#what-you-need))；Hy4-Flash 目前只支持 NVIDIA (Linux 和 Windows)，在显存有余量的显卡上可读取图片 (8 GB 显卡仅文本)。DeepSeek 的大小包含其 Engram 表。安装程序还提供 unsloth 的 GGUF、turboderp 和 LibertAIDAI 的 DeepSeek EXL3 量化、orcarouter 的 abliterated DeepSeek、Mia-AiLab 的 MiniMax EXL3 量化、turboderp 的 GLM EXL3 量化，以 Q5_K_M GGUF 提供的 Qwen-3.8-Flash-Next (CYBER-FROST)，以及以 unsloth 的 UD-IQ2_XS GGUF 提供的 Qwen-3.8-Flash-Next 本身 (两者都支持图片) ([其设置](docs/SETTINGS.md#qwen-38-flash-next-cyber-frost))。**每个模型的文件、草稿模型、图片和选项：[docs/MODELS.md](docs/MODELS.md)。**
+它们都能在 V100 / RTX 20 及更新的 NVIDIA 显卡上运行，也支持 AMD 和 Windows (见[你需要什么](#what-you-need))；Hy4-Flash 支持 NVIDIA (Linux 和 Windows) 以及 Linux 上的 AMD (Strix Halo / Gorgon Halo、Radeon 显卡)，在显存有余量的显卡上可读取图片 (8 GB 显卡仅文本)。DeepSeek 的大小包含其 Engram 表。安装程序还提供 unsloth 的 GGUF、turboderp 和 LibertAIDAI 的 DeepSeek EXL3 量化、orcarouter 的 abliterated DeepSeek、Mia-AiLab 的 MiniMax EXL3 量化、turboderp 的 GLM EXL3 量化，以 Q5_K_M GGUF 提供的 Qwen-3.8-Flash-Next (CYBER-FROST)，以及以 unsloth 的 UD-IQ2_XS GGUF 提供的 Qwen-3.8-Flash-Next 本身 (两者都支持图片) ([其设置](docs/SETTINGS.md#qwen-38-flash-next-cyber-frost))。**每个模型的文件、草稿模型、图片和选项：[docs/MODELS.md](docs/MODELS.md)。**
 
 ## <a name="quality"></a>质量
 
