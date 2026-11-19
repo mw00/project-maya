@@ -894,8 +894,8 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
       target_link_libraries(maya-mm3 PRIVATE roc::hipblaslt)
     endif()
     # Tencent's Hy4-flash (a GGUF set, tools/hy4/pack_gguf.py): its own engine (src/hy4) on maya-ds4's ggml block-type
-    # kernels (src/ds4/ds4_iq) and maya-mm3's OS helpers; NVIDIA only so far
-    if(STRATA_ENABLE_CUDA)
+    # kernels (src/ds4/ds4_iq) and maya-mm3's OS helpers; NVIDIA, and AMD on Linux
+    if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
       add_executable(maya-hy4 src/hy4/hy4_main.cpp src/hy4/hy4_model.cu src/hy4/hy4_vision.cu src/hy4/hy4_kernels.cu src/hy4/hy4_lane.cpp src/hy4/hy4_tp.cpp
                               src/ds4/ds4_iq.cu src/ds4/ds4_iq_cpu.cpp src/ds4/ds4_gguf_cpu.cpp)
       target_include_directories(maya-hy4 PRIVATE ${_strata_gpu_include_directories} include src/hy4 src/mm3

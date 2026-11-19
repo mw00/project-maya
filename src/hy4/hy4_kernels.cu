@@ -2,6 +2,7 @@
 // CUDA cores, the latent cache in F16 as the reference keeps it; the reference is AngelSlim's hy4-flash graph
 // (src/models/hy-v4-flash.cpp of their hy4-flash patch).
 #include "hy4_kernels.cuh"
+#include "strata/kernels/fresh_load.hpp"
 
 #include <cuda_fp16.h>
 
@@ -271,7 +272,8 @@ __device__ __forceinline__ void hc_fin_body(int t, const float* __restrict__ x, 
     const int nm = HEAD ? hc : 2 * hc, HE = hc * E;
     if ((int) threadIdx.x <= kMaxM) {
         float v = 0.0f;
-        for (int b = 0; b < kHcBlocks; ++b) v += __ldcg(part + ((size_t) t * kHcBlocks + b) * (kMaxM + 1) + threadIdx.x);
+        for (int b = 0; b < kHcBlocks; ++b)
+            v += strata::kernels::ld_l2(part + ((size_t) t * kHcBlocks + b) * (kMaxM + 1) + threadIdx.x);
         s_mix[threadIdx.x] = v;
     }
     __syncthreads();
@@ -1643,19 +1645,14 @@ void moe_combine(const float* y, const int* row_of, const float* w, int T, int n
 }
 namespace {
 constexpr unsigned long long kWaitLimitNs = 60ull * 1000000000ull;
-__device__ __forceinline__ unsigned long long gtimer() {
-    unsigned long long t;
-    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
-    return t;
-}
 __device__ unsigned g_wait_timeouts = 0;
 // thread 0 of the block waits for *flag >= v (wrapping); every thread after it
 __device__ __forceinline__ void wait_for(const unsigned* flag, unsigned v) {
     if (threadIdx.x == 0) {
-        const unsigned long long t0 = gtimer();
+        const unsigned long long t0 = strata::kernels::clock_ns();
         while ((int) (*(volatile const unsigned*) flag - v) < 0) {
             __nanosleep(64);
-            if (gtimer() - t0 > kWaitLimitNs) {
+            if (strata::kernels::clock_ns() - t0 > kWaitLimitNs) {
                 atomicAdd(&g_wait_timeouts, 1u);
                 break;
             }
@@ -1685,7 +1682,7 @@ __global__ void wait_pull_kernel(const unsigned* flag, unsigned v, float4* __res
                                  size_t n4) {
     wait_for(flag, v);
     for (size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x; i < n4; i += (size_t) gridDim.x * blockDim.x)
-        dst[i] = __ldcv(src + i);
+        dst[i] = strata::kernels::ld_fresh_v(src + i);
 }
 __global__ void wait_flag_kernel(const unsigned* flag, unsigned v) { wait_for(flag, v); }
 __global__ void set_flag_kernel(unsigned* flag, unsigned v) {
