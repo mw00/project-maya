@@ -8458,7 +8458,7 @@ def hy4_used_mib(before: dict | None = None, used: dict | None = None, own: dict
 
 
 def hy4_fit(q: dict, gpus: list, ctx_wanted: int | None = None, used: dict | None = None,
-            layout: str | None = None, pictures: bool = True) -> dict:
+            layout: str | None = None, pictures: bool = True, name: str | None = None) -> dict:
     """How a size of Hy4-Flash (q: its entry in the manifest) runs on these cards, worked out before any download:
     {"layout": "standard" where its plan fits the VRAM (hy4_usable_gib) at the context - else a small-card layout the
     size has; "context": ctx_wanted, else "recommended" - the largest of HY4_CONTEXTS that fits, up to
@@ -8474,8 +8474,9 @@ def hy4_fit(q: dict, gpus: list, ctx_wanted: int | None = None, used: dict | Non
     row's precision ("vision_small" is always False now, kept for the callers); a small-card layout reads prompts in
     chunks twice its plan's (HY4_CHUNK_UP_GIB) where that fits beside the model's own parts - with or without
     pictures.
-    Nothing fits: {"error": why, "hint": what to do, "usable", "need"}.  layout: only this one (the files of a folder
-    are that layout's)."""
+    Nothing fits: {"error": why, "hint": what to do, "usable", "need"} ("too_big": not even at the smallest context -
+    the size itself; name: the size's on-screen name for the line, else the model's).  layout: only this one (the
+    files of a folder are that layout's)."""
     lays = hy4_layouts(q)
     if layout is not None:
         lays = {k: v for k, v in lays.items() if k == layout}
@@ -8491,11 +8492,11 @@ def hy4_fit(q: dict, gpus: list, ctx_wanted: int | None = None, used: dict | Non
     fits = {k: [c for c in HY4_CONTEXTS if rows(v["plan"], c)] for k, v in lays.items()}
     if not any(fits.values()):
         smallest = min((need(v["plan"], least) for v in lays.values()), default=0.0)
-        return {"error": f"{HY4} needs about {smallest:.1f} GB of free VRAM for the parts of the model that must sit "
-                         f"on the GPU (at its smallest context, {context_label(least)}; the engine has no RAM "
+        return {"error": f"{name or HY4} needs about {smallest:.1f} GB of free VRAM for the parts of the model that "
+                         f"must sit on the GPU (at its smallest context, {context_label(least)}; the engine has no RAM "
                          f"fallback for them), and {cards} {usable:.1f} GB free",
                 "hint": "a card with more VRAM (or more cards: --gpus), or close the programs that use this one",
-                "usable": usable, "need": smallest}
+                "usable": usable, "need": smallest, "too_big": True}
     want = int(ctx_wanted) if ctx_wanted else least
     pick = next((k for k in lays if rows(lays[k]["plan"], want)), None)
     if pick is None:                                   # (the context asked for fits no layout)
@@ -8881,6 +8882,21 @@ def write_config_hy4(a, pc: dict, meta: dict, pack: Path, ctx: int, models: Path
     return cfg_path
 
 
+def hy4_smaller_fit(quant: str, gpus: list, pictures: bool = True) -> tuple[str, str] | None:
+    """Where `quant` does not fit these cards even at its smallest context: the largest smaller Maya size that does
+    (hy4_fit) and that the setup offers - its files published, the layout it takes there too: (key, layout), or None.
+    Another set of files (Tencent's Q4_K_M): any Maya size."""
+    keys = list(HY4_QUANTS)
+    for k in reversed(keys[:keys.index(quant)] if quant in keys else keys):
+        q = hy4_quant_table(k)
+        if not hy4_layouts(q) or not hy4_published(k):
+            continue
+        f = hy4_fit(q, gpus, pictures=pictures)
+        if "error" not in f and hy4_published(k, f["layout"]):
+            return k, f["layout"]
+    return None
+
+
 def hy4_fit_step(a, pc: dict, quant: str, prev_ctx: int | None = None, have=None) -> dict:
     """The layout and the context of a size on the cards chosen (hy4_fit), said; what does not fit stops the setup
     here, before any download.  --model-dir: the layout of the trunk in that folder.  The context: --context, else
@@ -8892,7 +8908,7 @@ def hy4_fit_step(a, pc: dict, quant: str, prev_ctx: int | None = None, have=None
     if not hy4_layouts(q):
         hy4_entry(quant)                               # (a size with no files yet: its own message)
     forced = hy4_layout_in(Path(a.model_dir).expanduser(), quant) if a.model_dir else None
-    fit = hy4_fit(q, pc["gpus"], a.context, layout=forced, pictures=not a.no_vision)
+    fit = hy4_fit(q, pc["gpus"], a.context, layout=forced, pictures=not a.no_vision, name=name)
     if "error" not in fit and hy4_layouts(q)[fit["layout"]].get("published") == "hub" and not forced and \
             read_json(HY4_MANIFEST).get("revision") and \
             not (have and hy4_layout_in(have(fit["layout"]), quant) == fit["layout"]):
@@ -8912,7 +8928,14 @@ def hy4_fit_step(a, pc: dict, quant: str, prev_ctx: int | None = None, have=None
         ctx = choose_context(a, prev_ctx, fit["contexts"], fit["recommended"])
         fit = hy4_fit(q, pc["gpus"], ctx, layout=fit["layout"], pictures=not a.no_vision)
     if "error" in fit:
-        fail(fit["error"] + (f" (the files in {a.model_dir} are the {forced} layout's)" if forced else ""), fit["hint"])
+        hint = fit["hint"]
+        alt = hy4_smaller_fit(quant, pc["gpus"], not a.no_vision) if fit.get("too_big") and not forced else None
+        if alt:                                        # (a smaller size runs here: said, with its command)
+            k, lay = alt
+            where = "these cards" if len(pc["gpus"] or []) > 1 else "this card"
+            hint = (f"the smaller {Q.shown('hy4', k)} fits {where}" + (" (its 8 GB-card file)" if lay == "8gb" else "")
+                    + f": {ME} --setup --model {Q.setup_id('hy4', k)} - or {hint}")
+        fail(fit["error"] + (f" (the files in {a.model_dir} are the {forced} layout's)" if forced else ""), hint)
     if fit["layout"] == HY4_STANDARD and hy4_amd(pc["gpus"]) and any(hip_unified_memory(g) for g in pc["gpus"]):
         # (a unified-memory APU: the next line - set_up_hy4's hy4_apu_note - says whether the experts all sit there)
         ok(f"{name} fits: about {fit['need']:.1f} GB for what must sit on the GPU, of the {fit['usable']:.1f} GB of "

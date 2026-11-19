@@ -879,6 +879,31 @@ class Fit(unittest.TestCase):
             with with_manifest(manifest()), self.assertRaisesRegex(Failed, "not available yet"):
                 maya.hy4_fit_step(args(), {"gpus": [card(24)]}, "maya-s")
 
+    def test_a_size_too_big_names_itself_and_the_smaller_one(self):
+        """A size the card does not hold even at 4K: the line names the size, and the hint the largest smaller size
+        that runs there with its exact command (none where no smaller one fits, or for the smallest)."""
+        with patch.object(maya, "fail", fail), patch.object(maya, "ok", lambda *a: None), \
+                patch.object(maya, "warn", lambda *a: None), patch.object(maya, "say", lambda *a: None), \
+                patch.object(maya, "gpu_used_mib", return_value={0: 400}):
+            with self.assertRaises(Failed) as e:
+                maya.hy4_fit_step(args(), {"gpus": [card(8)]}, "maya-s")
+            said = str(e.exception)
+            self.assertIn("Hy4-Flash · Maya-S needs about", said)
+            self.assertIn("this card has 7.6 GB free", said)
+            self.assertIn("the smaller Hy4-Flash · Maya-XS fits this card (its 8 GB-card file): "
+                          f"{maya.ME} --setup --model hy4-flash-maya-xs - or a card with more VRAM", said)
+            self.assertEqual(maya.hy4_smaller_fit("maya-l", [card(8)]), ("maya-xs", "8gb"))
+            self.assertIsNone(maya.hy4_smaller_fit("maya-xs", [card(8)]))          # (the smallest: none smaller)
+            for quant in ("maya-s", "maya-xs"):                # (a card no size fits: the plain hint alone)
+                with self.assertRaises(Failed) as e:
+                    maya.hy4_fit_step(args(), {"gpus": [card(6)]}, quant)
+                self.assertNotIn("the smaller", str(e.exception))
+                self.assertIn("a card with more VRAM", str(e.exception))
+            with with_manifest(manifest(revision="", only=None, hub=False)), self.assertRaises(Failed) as e:
+                maya.hy4_fit_step(args(), {"gpus": [card(8)]}, "maya-l")      # (nothing uploaded: none offered)
+            self.assertIn("Hy4-Flash · Maya-L needs about", str(e.exception))
+            self.assertNotIn("the smaller", str(e.exception))
+
     def test_the_8gb_file_on_the_hub_or_not(self):
         """Both ways by the Hub's answer alone: there - used (from the commit the Hub named); not there - a plain
         line for a small card, before any build or download; a larger card is never asked; nor a folder with it."""
