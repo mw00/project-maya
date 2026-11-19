@@ -60,6 +60,7 @@ from serve import attach, mixed_gpus  # noqa: E402
 from serve import glm_link  # noqa: E402  GLM on an AMD APU + an NVIDIA card ("mixed_gpus")
 
 ENGINE_VISION = (ds4_vision.Vision, mm3_vision.Vision)   # the engines that run their vision tower themselves
+HY4_TEXT_ONLY = "Hy4-Flash on Maya"                       # (its engine has no vision tower yet: the errors' name for it)
 from serve.frontend import (CALL_END, CALL_START, MINIMAX_NS, ChatTemplate, Event, OutputParser,  # noqa: E402
                             EFFORT_WORDS, QWEN_EFFORT, anthropic_to_messages, config_effort, deepseek_effort_kwargs,
                             deepseek_images,
@@ -2605,7 +2606,8 @@ class Service:
         # (MiniMax-M3.1 closes its reasoning with </mm:think>; its vocabulary may hold a plain "</think>" too)
         # (Hy4-flash with its suffixed </think:..>, which the pack's tokenizer names </think> in what the server reads)
         end = _special_ids("</mm:think>") if getattr(template, "minimax", False) else \
-            _special_ids("</think%s>" % template.hy4_tag) if getattr(template, "hy4", False) else _special_ids("</think>")
+            (_special_ids("</think%s>" % template.hy4_tag) or _special_ids("</think>")) \
+            if getattr(template, "hy4", False) else _special_ids("</think>")
         self.think_end_id = end[0] if end else None
         # the tokens the engine itself ends a request at, whatever the server does (see THINK_RESTARTS): a pack
         # tokenizer that names its "eos" (DeepSeek's, MiniMax's: their engines' --eos default) ends there only; the
@@ -2960,8 +2962,11 @@ class Service:
 
     def text_only(self) -> str | None:
         """GLM-5.3 (glm-dsa) has no vision tower at all: its name for the words of the attachments and the page ("...
-        reads text only"); None for every other model (images there are a setup's or a setting's choice)."""
+        reads text only"); None for every other model (images there are a setup's or a setting's choice).  Hy4-Flash
+        the same while its engine reads text alone (no setting turns pictures on)."""
         tpl = getattr(self, "template", None)
+        if getattr(self, "vision", None) is None and getattr(tpl, "hy4", False):
+            return HY4_TEXT_ONLY
         if getattr(self, "vision", None) is None and getattr(tpl, "glm_dsa", False) and not reads_images(tpl.source):
             return glm_dsa_product.LABEL
         return None
@@ -3703,6 +3708,10 @@ class Service:
             else:
                 prefill = CALL_START + (force if glm_calls else "\n" + (f"<function={force}>\n" if force else ""))
         given["_prefill"] = prefill
+        if prefill and getattr(self.template, "hy4", False):
+            # Hy4-flash: GLM's form under its own suffixed tags, inside its <tool_calls:..> wrapper.  The prompt gets
+            # the opening as its template writes it; the parser reads it in GLM's spelling, as it reads the answer
+            given["_prefill"], prefill = CALL_START + (force or ""), self.template.hy4_call_open(force)
         given["_blocked"] = self._block_suffixes(blocked, tools, kwargs) if blocked and force is None else None
         if looping and tools and force is None and not loop_guard.answers_user(asked):   # (an answer to the user ends)
             keep = self._keep_suffix(tools, kwargs)
@@ -3711,7 +3720,8 @@ class Service:
         ids = self._as_written(self.render_ids(messages, tools, kwargs, prefill))   # (Qwen3.x: the model's own ids)
         self.embeddings.path = None
         media = media_of(messages)
-        if media and self.text_only() and not media_of([m for m in messages if m.get("role") != "tool"]):
+        if media and self.text_only() and getattr(self.template, "glm_dsa", False) and \
+                not media_of([m for m in messages if m.get("role") != "tool"]):
             # GLM-5.3 (glm-dsa, text only): pictures in tool results alone (an agent read an image file, a tool took a
             # screenshot) - its template already wrote its own note in their place ("You are unable to process this
             # image ..."), so the agent's turn goes on instead of failing every retry; a user's picture is the 400 below
@@ -3741,6 +3751,10 @@ class Service:
                 # GLM-5.3 (glm-dsa) has no vision tower: say so plainly - there is no encoder to choose
                 raise ValueError(f"{self.model} reads text only, so it cannot read images: send the request without "
                                  "the image parts (describe the picture in text instead)")
+            if self.vision is None and getattr(self.template, "hy4", False):
+                # Hy4-Flash: its engine reads text alone for now - no setup choice turns pictures on
+                raise ValueError(f"{HY4_TEXT_ONLY} reads text only for now, so it cannot read images or videos: send "
+                                 "the request without them (describe the picture in text instead)")
             if self.vision is None:
                 raise ValueError("this server was started without the vision encoder (run setup again and choose "
                                  "'vision'), so it cannot read images or videos")
@@ -4135,6 +4149,8 @@ class Service:
             # The parser rewrites DSML into CALL_END internally; the prompt and generated token IDs still use
             # the original DSML. Slice after the outer block, not an invoke or a legacy tag inside an argument.
             call_end = f"</{dsml_token}{tool_calls_block_name}>"
+        elif getattr(self.template, "hy4", False):   # (Hy4-flash: the end of its wrapper, after the last call's own)
+            call_end = "</tool_calls%s>" % self.template.hy4_tag
         out = {}
         for key, rep in blocked.items():
             call = {"id": "call_loop_guard", "type": "function",
@@ -4153,7 +4169,7 @@ class Service:
             if not f.startswith(p) or call_end not in p:
                 return None
             out[key] = (rep, self.tok.encode(p[p.rindex(call_end) + len(call_end):] + f[len(p):], parse_special=True),
-                        f.rstrip().endswith("<think>"))
+                        self._opens_thinking(f))
         return out
 
     def _keep_suffix(self, tools, kwargs, note=loop_guard.KEEP_NOTE):
@@ -4179,7 +4195,12 @@ class Service:
         tail = f[f.rindex(mark) + len(mark):]
         if not tail:
             return None
-        return (self.tok.encode(tail, parse_special=True), f.rstrip().endswith("<think>"))
+        return (self.tok.encode(tail, parse_special=True), self._opens_thinking(f))
+
+    def _opens_thinking(self, prompt: str) -> bool:
+        """Whether a rendered prompt ends in an open thinking block (Hy4-flash's is its suffixed <think:..>)."""
+        opens = getattr(self.template, "opens_thinking", None)
+        return bool(opens(prompt)) if callable(opens) else prompt.rstrip().endswith("<think>")
 
     def _collapse(self, messages):
         """A conversation that carries a loop across turns (loop_guard.collapse): its prompt without what the model
@@ -6181,6 +6202,11 @@ def make_handler(svc: Service):
                         svc.default_effort) or svc.default_effort
                     if getattr(svc.template, "forced_thinking", False):
                         rec["reasoning_effort"] = QWEN_EFFORT.get(rec["reasoning_effort"], rec["reasoning_effort"])
+                    if getattr(svc.template, "hy4", False):   # (Hy4-flash: a level its template has, none / high / max)
+                        rec["reasoning_effort"] = svc.template.effort_shown(svc.default_effort) or \
+                            rec["reasoning_effort"]
+                # Hy4-flash alone: the levels its template takes (the page offers these and no others)
+                levels = svc.template.thinking_levels() if getattr(svc.template, "hy4", False) else None
                 self._json(200, {"status": "updating" if svc.updater.busy() else
                                            "reloading" if svc.reloading() else "ok",
                                  "max_context": svc.engine.max_context, "model": svc.model,
@@ -6200,6 +6226,7 @@ def make_handler(svc: Service):
                                  # GLM-5.3 (glm-dsa) alone: no vision tower at all - the page's attachments say so
                                  # (not "images are off": no setting turns them on)
                                  **({"text_only": True} if svc.text_only() else {}),
+                                 **({"thinking_levels": levels} if levels else {}),
                                  # GLM-5.3 alone, while its budget is the default: the most a Max its user picks may
                                  # think (the page then marks a level left at the default: strata_level_default)
                                  **({"thinking_budget_max": svc.think_budget_max}
@@ -7472,6 +7499,8 @@ def main() -> int:
                                                      else "none")
         if getattr(svc.template, "forced_thinking", False):   # (CYBER-FROST: Qwen's words, low / medium / xhigh)
             level = QWEN_EFFORT.get(level, level)
+        if getattr(svc.template, "hy4", False):               # (Hy4-flash: the nearest level its template takes)
+            level = svc.template.effort_shown(svc.default_effort) or level
         print(f"[maya] thinking level when a request names none: {level}"
               f"{'' if level in (svc.default_effort, f'{svc.default_effort} of 100') else f' (the config says {svc.default_effort})'}",
               flush=True)

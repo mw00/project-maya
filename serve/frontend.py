@@ -87,6 +87,56 @@ class ChatTemplate:
         hytk = re.search(r"set\s+HYTK\s*=\s*'([^']*)'", self.source)
         self.hy4 = bool(hytk) and "reasoning_mode" in self.source and "hy_start" in self.source
         self.hy4_tag = hytk.group(1) if hytk else ""
+        # ... and the levels are the ones the template itself takes: Tencent's public one (HYTK ':opensource') raises on
+        # anything but max / high / no_think, an earlier one also took low.  Read from its own check
+        # (`reasoning_effort not in [...]`), so render() never names a level this template refuses; a template without
+        # such a list is taken to have all four.
+        took = re.search(r"reasoning_effort\s+not\s+in\s+\[([^\]]*)\]", self.source)
+        named = tuple(re.findall(r"'([^']+)'", took.group(1))) if took else ()
+        self.hy4_levels = (named or HY4_LEVELS) if self.hy4 else ()
+
+    def hy4_word(self, level, name=None, off: bool = False) -> str | None:
+        """Hy4-flash: the template's own word for a thinking level of the server's (low / high / max; `name`: the
+        client's own word where it has one, medium / xhigh; `off`: thinking off) - the nearest the template has: off is
+        no_think, low and medium are low where it has one and high where not, xhigh and max are max.  None: no level
+        named (or auto) - the template is told nothing and uses its default, high."""
+        has = self.hy4_levels
+        if off or level == "no_think":
+            return "no_think" if "no_think" in has else None
+        if level == "low" or name == "medium":
+            return "low" if "low" in has else "high" if "high" in has else None
+        if level == "max":
+            return "max" if "max" in has else "high" if "high" in has else None
+        return "high" if level == "high" and "high" in has else None
+
+    def effort_shown(self, value) -> str | None:
+        """Hy4-flash: a thinking level as given (a config's, a client's) -> the level this model really runs it at, in
+        the server's words (none / low / high / max; auto is the template's default, high) - what /health and the
+        start's line report.  None for another model's template, or a value that is no level."""
+        level = effort_level(value) if self.hy4 else None
+        if level is None:
+            return None
+        if level == "none":
+            return "none"
+        return self.hy4_word(None if level == AUTO else level, effort_name(value)) or "high"
+
+    def thinking_levels(self) -> list | None:
+        """Hy4-flash: the levels its template takes, in the server's words and in order (Tencent's public template:
+        none / high / max) - /health's "thinking_levels", the page's choices.  None for every other model."""
+        if not self.hy4:
+            return None
+        return [n for n, w in (("none", "no_think"), ("low", "low"), ("high", "high"), ("max", "max"))
+                if w in self.hy4_levels]
+
+    def opens_thinking(self, prompt: str) -> bool:
+        """Whether a rendered prompt ends in an open thinking block (Hy4-flash: its suffixed <think:..>)."""
+        end = prompt.rstrip()
+        return end.endswith("<think>") or (self.hy4 and end.endswith("<think%s>" % self.hy4_tag))
+
+    def hy4_call_open(self, name: str = "") -> str:
+        """Hy4-flash: a tool call's opening as its template writes one (the wrapper, the call, the tool's name) - what
+        a required call's prompt ends with.  (The parser reads the same opening in GLM's spelling, CALL_START + name.)"""
+        return "<tool_calls%s><tool_call%s>%s" % (self.hy4_tag, self.hy4_tag, name or "")
 
     def render(self, messages: list[dict], tools: list[dict] | None = None, add_generation_prompt: bool = True,
                **kwargs) -> str:
@@ -139,15 +189,14 @@ class ChatTemplate:
             return self.template.render(messages=messages, tools=tools, add_generation_prompt=add_generation_prompt,
                                         **kwargs)
         if self.hy4:
-            # Hy4-flash's levels are the server's own (low / high / max) and no_think for off; none named (Auto) is its
-            # template's default (high).  Its template reads tool['function'] where a tool has one.
+            # Hy4-flash: the level in the template's own words, only one it takes (hy4_word - its public template
+            # raises on "low"); none named (Auto) is its default (high).  Its template reads tool['function'] where a
+            # tool has one.
             off = kwargs.pop("enable_thinking", None) is False
-            level = kwargs.pop("reasoning_effort", None)
+            word = self.hy4_word(kwargs.pop("reasoning_effort", None), name, off)
             kwargs.pop("thinking_mode", None)
-            if off:
-                kwargs["reasoning_effort"] = "no_think"
-            elif level in ("low", "high", "max"):
-                kwargs["reasoning_effort"] = level
+            if word:
+                kwargs["reasoning_effort"] = word
             tools = [t if "function" in t else {"type": "function", "function": t} for t in tools or []] or None
             return self.template.render(messages=messages, tools=tools, add_generation_prompt=add_generation_prompt,
                                         **kwargs)
@@ -211,7 +260,8 @@ VIDEO_PARTS = ("video_url", "input_video", "video")
 # "auto" (or "default") is the model's own default: the template is told no level at all (MiniMax-M3.1's adaptive
 # thinking with no effort named, GLM's Max, DeepSeek's encoder default).
 AUTO = "auto"
-EFFORT = {"none": None, "off": None, "minimal": None, "disabled": None, "false": None,
+# ("no_think" is Hy4-flash's own word for off, the one its card sets in chat_template_kwargs.)
+EFFORT = {"none": None, "off": None, "minimal": None, "disabled": None, "false": None, "no_think": None,
           "low": "low", "medium": "high", "high": "high", "xhigh": "max", "max": "max", "maximum": "max",
           "auto": AUTO, "default": AUTO}
 QWEN_EFFORT = {"low": "low", "high": "medium", "max": "xhigh"}   # the same levels in a Qwen3.x template's words
@@ -219,6 +269,7 @@ QWEN_EFFORT = {"low": "low", "high": "medium", "max": "xhigh"}   # the same leve
 # (effort_kwargs' "effort_name"), the other templates get the four above
 EFFORT_NAMES = ("low", "medium", "high", "xhigh", "max")
 EFFORT_WORDS = "none, auto, low, medium, high, xhigh or max"
+HY4_LEVELS = ("no_think", "low", "high", "max")   # a Hy4-flash template that does not list its levels: all four
 
 
 def effort_level(value) -> str | None:
