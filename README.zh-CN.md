@@ -28,7 +28,7 @@
 - **接近原版：** Maya 自己的 GLM-5.3-Flash 量化版本保留了 FP8 模型零样本准确率的 97.7-99.2%；DeepSeek V4.1 · Maya-S 与原版选择相同下一个 token 的概率为 92.6%，MiniMax M3.1 · Maya-S 为 87.6% (各类别平均值)。
 - **接入你的工具：** 兼容 OpenAI 和 Anthropic 的 API，支持工具调用，可直接用于编程智能体。
 - **同时处理多个请求：** GLM-5.3-Flash、DeepSeek-V4.1-Flash 和 MiniMax-M3.1-Flash 最多可同时回答 8 个请求，适合运行多个会话的智能体，或多人共用一台电脑。
-- **开箱即用：** 浏览器里的聊天和实时监控、所有模型都支持图片、思考级别、可下载 / 加载 / 删除模型的 Models 页面、Turbo 按钮，以及一条命令完成的安装。
+- **开箱即用：** 浏览器里的聊天和实时监控、能读图的模型都支持图片、思考级别、可下载 / 加载 / 删除模型的 Models 页面、Turbo 按钮，以及一条命令完成的安装。
 
 ## <a name="quick-start"></a>快速开始
 
@@ -219,7 +219,7 @@ Maya 的量化版本由各模型公开发布的权重制作，并与原版对比
 - **模型 API：** `/api/tags`、`/api/ps`、`/api/show`、`/api/chat`、`/api/generate`、`/api/pull` 和 `/api/delete` 可让任何应用或脚本列出、加载、下载和删除模型。请求一个尚未加载的模型会切换到它，`keep_alive` 会在空闲时卸载它。`/models/load`、`/models/unload` 和 `/models/sse` 也默认开启 (`"model_management": false` 可关闭)。
 - **思考：** Off、Low、High (默认) 或 Max，可在设置中或按请求指定；还有一个**思考预算**字段，设置模型在回答前最多可以思考多少个 token。
 - **循环防护：** 默认开启 - 当智能体用同样的结果反复发出同一个工具调用时，会被引导走出循环。
-- **图片：** 在聊天中附加，或通过任一 API 发送图片内容。每个模型都能读取图片 (各模型的安装细节：[docs/MODELS.md](docs/MODELS.md))。
+- **图片：** 在聊天中附加，或通过任一 API 发送图片内容。除 GLM-5.3 和 Hy4-Flash 仅文本外，每个模型都能读取图片 (各模型的安装细节：[docs/MODELS.md](docs/MODELS.md))。
 - **MCP 工具：** 在配置中列出 MCP 服务器 (`"mcp_servers"`；Claude Desktop 的 `mcpServers` 块可原样使用)，网页聊天中的模型就能调用它们的工具。聊天的 **+** 菜单里有开关。具体行为见 [serve/mcp.py](serve/mcp.py)。
 - **Docker：** 没有官方镜像。[docs/DOCKER.md](docs/DOCKER.md) 是基于某个发布版本构建镜像的方法。
 - **从其他设备访问：** `./maya.sh --setup --host 0.0.0.0 --api-key <secret>`。务必设置密钥。

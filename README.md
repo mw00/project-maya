@@ -36,8 +36,8 @@ them as you chat. It measures your GPUs, CPU, RAM and SSD and tunes itself to th
 - **Plugs into your tools:** OpenAI- and Anthropic-compatible API with tool calls, ready for coding agents.
 - **Several requests at once:** up to 8 answered together with GLM-5.3-Flash, DeepSeek-V4.1-Flash and
   MiniMax-M3.1-Flash - for agents that run several sessions, or several people on one PC.
-- **Everything in the box:** a chat and a live monitor in the browser, pictures on every model, thinking levels, a
-  Models page that downloads, loads and deletes models, a Turbo button, a one-command setup.
+- **Everything in the box:** a chat and a live monitor in the browser, pictures on the models that read them, thinking
+  levels, a Models page that downloads, loads and deletes models, a Turbo button, a one-command setup.
 
 ## Quick start
 
@@ -263,8 +263,9 @@ slowest while the caches fill with what you use.
 - **Thinking:** Off, Low, High (the default) or Max, in Settings or per request, and a **thinking budget** field that
   sets how many tokens the model may think before it answers.
 - **Loop guard:** on by default - an agent that repeats the same tool call with the same result is steered off it.
-- **Pictures:** attach one in the chat, or send image parts through either API. Every model reads them (setup details per
-  model: [docs/MODELS.md](docs/MODELS.md)). Videos too, for the models that read them.
+- **Pictures:** attach one in the chat, or send image parts through either API. Every model reads them except
+  GLM-5.3 and Hy4-Flash, which are text only (setup details per model: [docs/MODELS.md](docs/MODELS.md)). Videos too,
+  for the models that read them.
 - **Files:** attach any file in the chat. Text and code go in as they are; **PDFs** as their text, or a scanned one's
   first pages as pictures; Word, Excel, PowerPoint, OpenDocument, EPUB and RTF files as their text. Anything Maya can't
   read says why. The same works through the APIs: OpenAI `file` / `input_file` parts and Anthropic `document` blocks

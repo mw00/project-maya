@@ -28,7 +28,7 @@ Modelos desse tamanho costumam precisar de um datacenter. O Maya roda cinco dele
 - **Perto do original:** as quantizações próprias do Maya do GLM-5.3-Flash mantêm 97,7-99,2% da precisão zero-shot do modelo FP8; o DeepSeek V4.1 · Maya-S escolhe o mesmo próximo token que o original em 92,6% das vezes, e o MiniMax M3.1 · Maya-S em 87,6% (a média das suas categorias).
 - **Se conecta às suas ferramentas:** API compatível com OpenAI e Anthropic, com chamadas de ferramentas, pronta para agentes de programação.
 - **Várias requisições ao mesmo tempo:** até 8 respondidas juntas com GLM-5.3-Flash, DeepSeek-V4.1-Flash e MiniMax-M3.1-Flash - para agentes que rodam várias sessões, ou várias pessoas em um só PC.
-- **Tudo incluído:** um chat e um monitor ao vivo no navegador, imagens em todos os modelos, níveis de raciocínio, uma página Models que baixa, carrega e apaga modelos, um botão Turbo e uma instalação com um só comando.
+- **Tudo incluído:** um chat e um monitor ao vivo no navegador, imagens nos modelos que as leem, níveis de raciocínio, uma página Models que baixa, carrega e apaga modelos, um botão Turbo e uma instalação com um só comando.
 
 ## <a name="quick-start"></a>Início rápido
 
@@ -219,7 +219,7 @@ Um token equivale a cerca de ¾ de uma palavra. A velocidade se mantém conforme
 - **API de modelos:** `/api/tags`, `/api/ps`, `/api/show`, `/api/chat`, `/api/generate`, `/api/pull` e `/api/delete` listam, carregam, baixam e apagam modelos a partir de qualquer app ou script. Uma requisição a um modelo que não está carregado troca para ele, e `keep_alive` o descarrega quando fica ocioso. `/models/load`, `/models/unload` e `/models/sse` também vêm ligados por padrão (`"model_management": false` os desliga).
 - **Raciocínio:** Off, Low, High (o padrão) ou Max, em Settings ou por requisição, e um campo de **orçamento de raciocínio** que define quantos tokens o modelo pode usar pensando antes de responder.
 - **Guarda contra loops:** ligada por padrão - um agente que repete a mesma chamada de ferramenta com o mesmo resultado é conduzido para fora disso.
-- **Imagens:** anexe uma no chat, ou envie partes de imagem por qualquer uma das APIs. Todos os modelos leem imagens (detalhes da instalação por modelo: [docs/MODELS.md](docs/MODELS.md)).
+- **Imagens:** anexe uma no chat, ou envie partes de imagem por qualquer uma das APIs. Todos os modelos leem imagens, menos o GLM-5.3 e o Hy4-Flash, que são só texto (detalhes da instalação por modelo: [docs/MODELS.md](docs/MODELS.md)).
 - **Ferramentas MCP:** liste servidores MCP na configuração (`"mcp_servers"`; o bloco `mcpServers` do Claude Desktop funciona como está) e o modelo do chat na web pode chamar as ferramentas deles. Um interruptor no menu **+** do chat liga e desliga. O que ele faz: [serve/mcp.py](serve/mcp.py).
 - **Docker:** não há imagem oficial. [docs/DOCKER.md](docs/DOCKER.md) é uma receita para montar uma a partir de uma versão.
 - **De outro dispositivo:** `./maya.sh --setup --host 0.0.0.0 --api-key <secret>`. Sempre defina uma chave.
