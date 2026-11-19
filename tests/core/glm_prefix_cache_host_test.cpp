@@ -16,6 +16,7 @@
 #include "strata/core/glm_prefix_admission.hpp"
 #include "strata/core/glm_prefix_metadata.hpp"
 #include "strata/core/glm_cache_memory.hpp"
+#include "strata/core/glm_slot_directory_scan.hpp"
 
 namespace fs = std::filesystem;
 namespace pm = strata::core::glm_cache_memory;
@@ -31,6 +32,57 @@ static void put(const fs::path& path, const std::string& value) {
     fs::create_directories(path.parent_path());
     std::ofstream f(path); f << value;
     if (!f) throw std::runtime_error("fixture write failed");
+}
+static void scan_checks(const fs::path& root) {
+    using Scan = strata::core::SlotDirectoryScan;
+    static_assert(Scan::batch_capacity == 64);
+    // These are names only, not filesystem objects: classification requires no attributes.
+    expect(!Scan::accepts_name("notes.meta", true) && !Scan::accepts_name("unrelated.bin", false),
+           "SCAN_NAME_CONTRACT unrelated names are rejected without filesystem attributes");
+    expect(Scan::accepts_name("slot-session.bin.tmp", false) && Scan::accepts_name("slot-incomplete", true),
+           "SCAN_NAME_CONTRACT incomplete ordinary names remain available for cleanup");
+    expect(Scan::accepts_name("branch-session.meta.tmp", true) && !Scan::accepts_name("branch-session.meta", false),
+           "SCAN_NAME_CONTRACT learned names follow enabled policy including cleanup items");
+    for (const size_t count : {size_t{0}, size_t{1}, size_t{64}, size_t{65}, size_t{197}}) {
+        for (const bool deleting : {false, true}) {
+            const auto dir = root / ("scan-" + std::to_string(count) + (deleting ? "-delete" : "-keep"));
+            fs::create_directories(dir);
+            std::vector<Scan::Entry> expected, visited;
+            const auto now = fs::file_time_type::clock::now();
+            for (size_t i = 0; i < count; ++i) {
+                const char* prefix = i % 3 == 0 ? "slot-" : i % 3 == 1 ? "branch-" : "unrelated-";
+                const auto path = dir / (prefix + std::to_string(i) + (i % 2 ? ".meta" : ".bin"));
+                if (i % 7 == 0) fs::create_directory(path);
+                else put(path, "fixture");
+                fs::last_write_time(path, now - std::chrono::seconds(i % 3));
+                if (i % 3 != 2) expected.emplace_back(fs::last_write_time(path), path);
+            }
+            std::sort(expected.begin(), expected.end(), [](const auto& a, const auto& b) {
+                return a.first != b.first ? a.first > b.first : a.second < b.second;
+            });
+            Scan scan(dir, true);
+            std::error_code ec;
+            size_t batches = 0, peak = 0;
+            for (auto batch = scan.next(ec); !batch.empty(); batch = scan.next(ec)) {
+                ++batches;
+                peak = std::max(peak, batch.size());
+                for (const auto& item : batch) {
+                    visited.push_back(item);
+                    if (deleting) fs::remove(item.second);
+                }
+            }
+            std::printf("SCAN_CASE count=%zu candidates=%zu delete=%d batches=%zu peak=%zu\n",
+                        count, expected.size(), int(deleting), batches, peak);
+            expect(!ec, "scan normal mixed directory has no filesystem errors");
+            expect(peak <= 64, "scan batch never exceeds 64 entries");
+            expect(batches == (expected.size() + 63) / 64, "scan crosses all candidate batch boundaries without empty gaps");
+            expect(visited == expected, "scan preserves all timestamp/path ordering including deleted cursors");
+            expect(!deleting || std::all_of(expected.begin(), expected.end(), [](const auto& item) {
+                return !fs::exists(item.second);
+            }), "scan visits and removes every candidate item exactly once");
+            expect(count < 3 || fs::exists(dir / "unrelated-2.bin"), "scan leaves unrelated mixed items untouched");
+        }
+    }
 }
 struct CgroupFixture {
     fs::path dir, root;
@@ -50,6 +102,7 @@ struct CgroupFixture {
 int main(int argc, char** argv) {
     if (argc != 2) return 64; // The runner owns this fresh temporary directory.
     const fs::path root(argv[1]);
+    scan_checks(root);
     {
         pa::Admission a;
         auto first = prompt(4000), second = first, third = first;

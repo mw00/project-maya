@@ -17,7 +17,7 @@ import tempfile
 import test_glm_slot_spill as legacy
 
 ROOT = Path(__file__).resolve().parents[1]
-CASES = ("lru", "budget", "zero-budget", "ram-pressure", "failed-put", "flush", "reindex", "mixed-flush",
+CASES = ("branch-policy-completion", "branch-policy-slot", "branch-policy-disabled", "branch-policy-zero", "lru", "budget", "zero-budget", "ram-pressure", "failed-put", "flush", "reindex", "mixed-flush",
          "mixed-reindex", "cli", "cli-reindex", "write-failure", "miss", "off-disk", "off-ram", "off-unset", "default-budgets",
          "branch-ready-serialize", "branch-ready-write", "branch-ready-publish", "branch-ready-seed", "branch-ready-reindex", "branch-ready-short", "branch-ready-short-disk", "branch-ready-short-reindex",
          "branch-learn", "branch-position", "branch-save-fail", "branch-direct-disk", "branch-flush", "branch-reindex",
@@ -26,7 +26,13 @@ CASES = ("lru", "budget", "zero-budget", "ram-pressure", "failed-put", "flush", 
          "branch-count", "branch-ordinary-low", "branch-legacy-meta", "branch-legacy-reindex",
          "branch-lru-ram", "branch-lru-disk", "branch-lru-reindex", "branch-lru-bytes", "branch-lru-tokens",
          "branch-lru-bound", "branch-lru-oversized", "branch-lru-save-fail", "branch-lru-meta-fail",
-         "branch-lru-pressure", "branch-lru-staging",
+         "branch-lru-pressure", "branch-lru-staging", "branch-lru-staging-room",
+         "branch-lru-staging-save-fail", "branch-lru-staging-meta-fail", "branch-lru-staging-bound",
+         "branch-lru-staging-pressure", "branch-lru-staging-reindex",
+         "branch-cleanup-start-tmp", "branch-cleanup-start-meta", "branch-cleanup-start-bin",
+         "branch-cleanup-start-iter", "branch-cleanup-start-exists",
+         "branch-cleanup-rollback", "branch-cleanup-retire", "branch-cleanup-restart",
+         "branch-cleanup-rollback-meta", "branch-cleanup-retire-meta", "branch-cleanup-retire-restart",
          "completion-off", "completion-length", "completion-stop", "completion-full", "completion-empty",
          "completion-position", "completion-cancel", "completion-shards", "completion-dflash",
          "completion-memory", "completion-save-fail", "completion-publish-fail", "completion-context",
@@ -34,7 +40,9 @@ CASES = ("lru", "budget", "zero-budget", "ram-pressure", "failed-put", "flush", 
          "completion-image-text", "completion-text-image", "completion-image-text-gap",
          "completion-text-image-gap")
 PAIRS = {"branch-ready-reindex": "branch-ready-seed", "branch-ready-short-reindex": "branch-ready-short-disk", "reindex": "flush", "mixed-reindex": "mixed-flush", "cli-reindex": "cli",
-         "branch-reindex": "branch-flush", "branch-legacy-reindex": "branch-legacy-meta", "branch-lru-reindex": "branch-lru-disk"}
+         "branch-reindex": "branch-flush", "branch-legacy-reindex": "branch-legacy-meta", "branch-lru-reindex": "branch-lru-disk",
+         "branch-lru-staging-reindex": "branch-lru-staging", "branch-cleanup-restart": "branch-cleanup-rollback",
+         "branch-cleanup-retire-restart": "branch-cleanup-retire-meta"}
 INCLUDES = r'''
 #include <array>
 #include <atomic>
@@ -43,10 +51,33 @@ INCLUDES = r'''
 #include <functional>
 #include "strata/core/glm_prefix_admission.hpp"
 #include "strata/core/glm_prefix_metadata.hpp"
+#include "strata/core/glm_slot_directory_scan.hpp"
 #include "strata/core/glm_cache_memory.hpp"
 static uint64_t fixture_available = uint64_t{128} << 30;
 static uint64_t fixture_disk_available = uint64_t{256} << 30;
 static std::filesystem::path fixture_slot_dir;
+static std::string fixture_remove_failure;
+static int fixture_io_errors = 0;
+static bool fixture_orphan_iter_fail = false, fixture_orphan_exists_fail = false;
+static auto fixture_orphan_iterator(const std::filesystem::path& path, std::error_code& ec) {
+  if (fixture_orphan_iter_fail) {
+    ++fixture_io_errors; ec = std::make_error_code(std::errc::permission_denied);
+    return std::filesystem::directory_iterator{};
+  }
+  return std::filesystem::directory_iterator(path, ec);
+}
+static bool fixture_orphan_exists(const std::filesystem::path& path, std::error_code& ec) {
+  if (fixture_orphan_exists_fail) {
+    ++fixture_io_errors; ec = std::make_error_code(std::errc::permission_denied); return false;
+  }
+  return std::filesystem::exists(path, ec);
+}
+static bool fixture_remove(const std::filesystem::path& path, std::error_code& ec) {
+  if (!fixture_remove_failure.empty() && path.string().ends_with(fixture_remove_failure)) {
+    ++fixture_io_errors; ec = std::make_error_code(std::errc::permission_denied); return false;
+  }
+  return std::filesystem::remove(path, ec);
+}
 static auto fixture_space(const std::filesystem::path&, std::error_code& ec) {
   ec.clear(); return std::filesystem::space_info{fixture_disk_available, fixture_disk_available, fixture_disk_available};
 }
@@ -107,7 +138,7 @@ using Glm5Model = FakeModel;
 namespace strata::core { using Glm5Model = ::FakeModel; }
 '''
 SETUP = r'''
-  const bool completion_case = which.rfind("completion-", 0)==0 || which.rfind("branch-ready-short", 0)==0;
+  const bool completion_case = which.rfind("branch-policy-", 0)==0 || which.rfind("completion-", 0)==0 || which.rfind("branch-ready-short", 0)==0;
   set_env("MAYA_GLM_LEARNED_PREFIX", which.rfind("branch-", 0)==0 || completion_case ? "1" : "");
   set_env("MAYA_GLM_COMPLETION_CACHE", completion_case && which!="completion-off" ? "1" : "");
   set_env("MAYA_GLM_COMPLETION_MIN_TOKENS", which=="completion-default-min" ? "" : which=="completion-threshold" ? "3" : "1");
@@ -115,7 +146,24 @@ SETUP = r'''
   set_env("MAYA_GLM_LEARNED_GIB", "2");
   set_env("MAYA_GLM_LEARNED_STATES", "16");
   set_env("MAYA_GLM_SLOT_ROUNDTRIP", "");
+  if (which=="branch-policy-completion") set_env("MAYA_GLM_COMPLETION_MIN_TOKENS", "3");
+  if (which=="branch-policy-slot") set_env("MAYA_GLM_SLOT_MIN", "2048");
+  if (which=="branch-policy-disabled") set_env("MAYA_GLM_COMPLETION_CACHE", "");
+  if (which=="branch-policy-zero") set_env("MAYA_GLM_COMPLETION_MIN_TOKENS", "0");
   fixture_slot_dir = root / "slots";
+  if (which.rfind("branch-cleanup-", 0)==0) {
+    set_env("MAYA_GLM_LEARNED_STATES", "2");
+    if (which.rfind("branch-cleanup-start-", 0)==0) {
+      std::filesystem::create_directories(fixture_slot_dir);
+      const std::string suffix = which=="branch-cleanup-start-tmp" ? ".tmp" :
+                                 which=="branch-cleanup-start-meta" ? ".meta" : ".bin";
+      const std::string pending = "branch-cleanup" + suffix;
+      std::ofstream(fixture_slot_dir / pending).put('x');
+      fixture_orphan_iter_fail = which=="branch-cleanup-start-iter";
+      fixture_orphan_exists_fail = which=="branch-cleanup-start-exists";
+      if (!fixture_orphan_iter_fail && !fixture_orphan_exists_fail) fixture_remove_failure = pending;
+    }
+  }
   if (which.rfind("branch-", 0)==0 || completion_case) {
     set_env("MAYA_GLM_SLOT_RAM_GB", "0.001"); set_env("MAYA_GLM_SLOT_GB", "0.001");
     set_env("MAYA_GLM_SLOTS", "64");
@@ -136,14 +184,26 @@ SETUP = r'''
   if (which=="branch-lru-tokens") set_env("MAYA_GLM_LEARNED_STATES", "16");
   if (which=="branch-lru-disk" || which=="branch-lru-reindex" || which=="branch-lru-meta-fail" ||
       which=="branch-lru-pressure" || which=="branch-lru-staging") set_env("MAYA_GLM_SLOT_RAM_GB", "0");
-  if (which=="branch-lru-staging") set_env("MAYA_GLM_SLOT_GB", "0.0000186264514923095703125"); // 20000 bytes
+  if (which.rfind("branch-lru-staging", 0)==0) {
+    set_env("MAYA_GLM_SLOT_RAM_GB", "0");
+    set_env("MAYA_GLM_SLOT_GB", "0.0000186264514923095703125"); // 20000 bytes
+  }
+  if (which=="branch-lru-staging-room") set_env("MAYA_GLM_LEARNED_STATES", "16");
+  if (which.rfind("branch-cleanup-", 0)==0) set_env("MAYA_GLM_SLOT_RAM_GB", "0");
 '''
 
 
 def fixture(source: str) -> str:
     a, b = source.index(legacy.START), source.index(legacy.END)
     block = source[a:b]
-    # Only two external probes are replaced. Every policy branch remains verbatim.
+    # Replace external capacity probes and inject ordinary remove I/O errors;
+    # every cache policy branch remains extracted from production.
+    block = block.replace("std::filesystem::remove(", "fixture_remove(")
+    block = block.replace("fs::remove(", "fixture_remove(")
+    block = block.replace("fs::directory_iterator orphan(slot_dir, ec), end;",
+                          "auto orphan = fixture_orphan_iterator(slot_dir, ec); fs::directory_iterator end;")
+    block = block.replace("const bool has_meta = fs::exists(meta_of(p), ec);",
+                          "const bool has_meta = fixture_orphan_exists(meta_of(p), ec);")
     if block.count("cache_memory::available_bytes()") != 1:
         raise RuntimeError("memory probe extraction changed")
     block = block.replace("cache_memory::available_bytes()", "fixture_available")
@@ -158,6 +218,10 @@ def fixture(source: str) -> str:
     ga, gb = source.index("template <typename F>\nstatic bool guarded"), source.index("// Whether the CUDA context itself is broken")
     cpp = cpp.replace("int main(int argc, char** argv) {", source[ga:gb] + "\nint main(int argc, char** argv) {")
     cpp = cpp.replace('which != "cli-reindex")', 'which != "cli-reindex" && which != "branch-reindex" && which != "branch-legacy-reindex" && which != "branch-lru-reindex" && which != "branch-ready-reindex" && which != "branch-ready-short-reindex")')
+    cpp = cpp.replace('which != "cli-reindex" &&', 'which.rfind("branch-policy-", 0) != 0 && which != "cli-reindex" &&')
+    cpp = cpp.replace('which != "cli-reindex" &&', 'which != "branch-lru-staging-reindex" && which != "cli-reindex" &&')
+    cpp = cpp.replace('which != "cli-reindex" &&', 'which != "branch-cleanup-restart" && which != "cli-reindex" &&')
+    cpp = cpp.replace('which != "cli-reindex" &&', 'which != "branch-cleanup-retire-restart" && which != "cli-reindex" &&')
     cpp = cpp.replace('std::ofstream(root / "pack" / n).put(\'x\');', 'if (!std::filesystem::exists(root / "pack" / n)) std::ofstream(root / "pack" / n).put(\'x\');')
     cpp = cpp.replace("  Options o;", SETUP + "\n  Options o;")
     extra = (ROOT / "tests/core/glm_prefix_slot_cases.inc").read_text(encoding="utf-8")
@@ -206,6 +270,7 @@ def main() -> int:
     with args.receipt.open("x", encoding="utf-8") as f: f.write('{"status":"started"}\n')
     inputs = ["src/program/generate.cpp", "include/strata/core/glm_prefix_admission.hpp",
               "include/strata/core/glm_prefix_metadata.hpp", "include/strata/core/glm_cache_memory.hpp",
+              "include/strata/core/glm_slot_directory_scan.hpp",
               "tests/core/glm_prefix_slot_cases.inc",
               "tools/test_glm_slot_spill.py", "tools/test_glm_prefix_slots.py",
               "tests/core/glm_completion_slot_cases.inc"]
@@ -256,6 +321,13 @@ def main() -> int:
                 for case in args.cases or CASES:
                     case_root = (td / PAIRS.get(case, case)).resolve()
                     if not case_root.is_relative_to(td): raise RuntimeError("case path escaped temporary directory")
+                    if case.startswith("branch-policy-"):
+                        seeded = subprocess.run([str(exe), "branch-ready-short-disk", str(case_root)], cwd=td,
+                                                capture_output=True, text=True, timeout=15)
+                        receipt[case + "-seed"] = {"exit_code": seeded.returncode, "stdout": seeded.stdout,
+                                                   "stderr": seeded.stderr}
+                        if seeded.returncode:
+                            raise RuntimeError(f"policy seed failed: {case}")
                     ran = subprocess.run([str(exe), case, str(case_root)], cwd=td, capture_output=True, text=True, timeout=15)
                     assertion_error = ""
                     if case == "miss":
@@ -266,6 +338,9 @@ def main() -> int:
                                     "miss: diverged at token 1", "miss: token prefix matches but images differ"]
                         if reasons != expected:
                             assertion_error = f"wrong runtime miss reasons: {reasons!r}"
+                    if case.startswith("branch-cleanup-") and not case.endswith("restart"):
+                        if "cache writes disabled" not in ran.stderr:
+                            assertion_error = "cleanup failure lacks explicit fail-closed diagnostic"
                     receipt["cases"].append({"name": case, "exit_code": ran.returncode, "stdout": ran.stdout,
                                              "stderr": ran.stderr, "assertion_error": assertion_error})
                     print(f"{case}: rc={ran.returncode}")

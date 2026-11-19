@@ -63,6 +63,7 @@
 #include "strata/program/conv_cache.hpp"
 #include "strata/core/glm_cache_memory.hpp"
 #include "strata/core/glm_prefix_metadata.hpp"
+#include "strata/core/glm_slot_directory_scan.hpp"
 #include "strata/spec/draft_policy.hpp"
 #include "strata/spec/suffix_drafter.hpp"
 #include "strata/kernels/cvec.hpp"
@@ -1466,6 +1467,17 @@ static int glm_pack_generate(const Options& o) {
     namespace fs = std::filesystem;
     std::filesystem::path slot_dir;
     bool branch_index_complete = true;
+    const auto slot_io_failure = [&](const fs::path& path, const std::error_code& ec) {
+        branch_index_complete = false;
+        std::fprintf(stderr, "glm slots: I/O failed for %s (%s); cache writes disabled until restart\n",
+                     path.string().c_str(), ec.message().c_str());
+    };
+    const auto slot_remove_file = [&](const fs::path& path) {
+        std::error_code ec;
+        fs::remove(path, ec);
+        if (ec && branch_enabled) slot_io_failure(path, ec);
+        return !ec;
+    };
     // what a kept slot must match: the session format, the engine version, the pack and the model's shards (names and
     // sizes) and whether the draft block is loaded.  The split itself is checked by slot_load (each part's layers).
     const std::string slot_identity = [&] {
@@ -1491,6 +1503,12 @@ static int glm_pack_generate(const Options& o) {
         if (ec) return std::string{};
         std::ostringstream id;
         id << slot_identity << " learned-flash-v1 " << pack.generic_string();
+        // Persist admission semantics with the key: a short completion accepted
+        // under an earlier threshold must not bypass the current policy on restart.
+        id << " admission-v1 slot-min=" << slot_min << " learned-min=" << branch::min_tokens
+           << " completion=" << completion_enabled << " completion-min=";
+        if (completion_min_tokens) id << *completion_min_tokens;
+        else id << "invalid";
         for (auto word : model.state_fp()) id << ' ' << word;
         for (const char* name : {"index.txt", "dense.bin", "native_experts.txt"}) {
             const auto stamp = fs::last_write_time(pack / name, ec);
@@ -1582,70 +1600,78 @@ static int glm_pack_generate(const Options& o) {
         uint64_t branch_bytes = 0;
         size_t branch_tokens = 0;
         size_t refused = 0;
-        // Sort lightweight directory metadata before reading token vectors: a
-        // reduced quota must prefer recent entries without retaining unbounded keys.
-        std::vector<std::pair<fs::file_time_type, fs::path>> entries;
-        for (const auto& de : fs::directory_iterator(slot_dir, ec))
-            entries.emplace_back(fs::last_write_time(de.path(), ec), de.path());
-        std::sort(entries.begin(), entries.end(), [](const auto& a, const auto& b) {
-            return a.first != b.first ? a.first > b.first : a.second < b.second;
-        });
-        for (const auto& [stamp, entry] : entries) {   // newest metadata first
-            const std::string fn = entry.filename().string(), p = entry.string();
-            const bool learned = fn.rfind("branch-", 0) == 0;
-            if (fn.rfind("slot-", 0) != 0 && (!branch_enabled || !learned)) continue;
-            const bool is_bin = fn.size() > 9 && fn.compare(fn.size() - 4, 4, ".bin") == 0;
-            const bool is_meta = fn.size() > 10 && fn.compare(fn.size() - 5, 5, ".meta") == 0;
-            if (!slot_keep || (!is_bin && !is_meta)) {   // not kept, or a .tmp an interrupted write left
-                std::filesystem::remove(entry, ec);
-                continue;
-            }
-            if (!is_meta) continue;                      // a .bin is judged by its .meta
-            const std::string bin = p.substr(0, p.size() - 5) + ".bin";
-            Found fd{bin, {}, 0, stamp, kNoImages};
-            const uint64_t have = fs::exists(bin, ec) ? (uint64_t) fs::file_size(bin, ec) : 0;
-            bool valid = false;
-            if (learned && !branch_identity.empty() && memory_permits(branch::max_state_tokens * sizeof(int32_t))) {
-                std::ifstream f(p, std::ios::binary);
-                branch::Metadata entry;
-                if (branch::read_metadata(f, branch_identity, o.max_context, entry) && have == entry.bytes &&
-                    model.slot_flash_bytes(entry.tokens.size()) == have) {
-                    fd.toks = std::move(entry.tokens);
-                    fd.bytes = entry.bytes;
-                    fd.branch_checksum = entry.checksum;
-                    fd.branch_id = ++branch_seq;
-                    valid = true;
+        // Shared fixed-storage ordering preserves newest-first quota selection.
+        strata::core::SlotDirectoryScan scan(slot_dir, branch_enabled);
+        for (auto entries = scan.next(ec); !entries.empty(); entries = scan.next(ec)) {
+            for (const auto& [stamp, entry] : entries) {   // newest metadata first
+                const std::string fn = entry.filename().string(), p = entry.string();
+                const bool learned = fn.rfind("branch-", 0) == 0;
+                if (fn.rfind("slot-", 0) != 0 && (!branch_enabled || !learned)) continue;
+                const bool is_bin = fn.size() > 9 && fn.compare(fn.size() - 4, 4, ".bin") == 0;
+                const bool is_meta = fn.size() > 10 && fn.compare(fn.size() - 5, 5, ".meta") == 0;
+                if (!slot_keep || (!is_bin && !is_meta)) {   // not kept, or a .tmp an interrupted write left
+                    slot_remove_file(entry);
+                    continue;
                 }
-            } else if (!learned) {
-                valid = meta_read(p, fd.toks, fd.bytes, fd.img);
-            } else {
-                branch_index_complete = false;
-                continue;   // insufficient memory to read the metadata
-            }
-            if (valid && have == fd.bytes && fd.bytes > 0 && slot_age_days(p) <= slot_days &&
-                (!learned || (branch_count < learned_max &&
-                    cache_memory::permits(learned_budget, branch_bytes, fd.bytes) &&
-                    cache_memory::permits(branch::retained_token_budget, branch_tokens, fd.toks.size())))) {
-                if (learned) {
-                    ++branch_count;
-                    branch_bytes += fd.bytes;
-                    branch_tokens += fd.toks.size();
+                if (!is_meta) continue;                      // a .bin is judged by its .meta
+                const std::string bin = p.substr(0, p.size() - 5) + ".bin";
+                Found fd{bin, {}, 0, stamp, kNoImages};
+                const uint64_t have = fs::exists(bin, ec) ? (uint64_t) fs::file_size(bin, ec) : 0;
+                bool valid = false;
+                if (learned && !branch_identity.empty() && memory_permits(branch::max_state_tokens * sizeof(int32_t))) {
+                    std::ifstream f(p, std::ios::binary);
+                    branch::Metadata entry;
+                    if (branch::read_metadata(f, branch_identity, o.max_context, entry) && have == entry.bytes &&
+                        model.slot_flash_bytes(entry.tokens.size()) == have) {
+                        fd.toks = std::move(entry.tokens);
+                        fd.bytes = entry.bytes;
+                        fd.branch_checksum = entry.checksum;
+                        fd.branch_id = ++branch_seq;
+                        valid = true;
+                    }
+                } else if (!learned) {
+                    valid = meta_read(p, fd.toks, fd.bytes, fd.img);
+                } else {
+                    branch_index_complete = false;
+                    continue;   // insufficient memory to read the metadata
                 }
-                found.push_back(std::move(fd));
-            } else {
-                ++refused;
-                std::filesystem::remove(p, ec);
-                std::filesystem::remove(bin, ec);
+                if (valid && have == fd.bytes && fd.bytes > 0 && slot_age_days(p) <= slot_days &&
+                    (!learned || (branch_count < learned_max &&
+                        cache_memory::permits(learned_budget, branch_bytes, fd.bytes) &&
+                        cache_memory::permits(branch::retained_token_budget, branch_tokens, fd.toks.size())))) {
+                    if (learned) {
+                        ++branch_count;
+                        branch_bytes += fd.bytes;
+                        branch_tokens += fd.toks.size();
+                    }
+                    found.push_back(std::move(fd));
+                } else {
+                    ++refused;
+                    slot_remove_file(p);
+                    slot_remove_file(bin);
+                }
             }
         }
-        if (slot_keep)                                   // a .bin without its .meta was never completed
-            for (const auto& de : std::filesystem::directory_iterator(slot_dir, ec)) {
-                const std::string p = de.path().string(), fn = de.path().filename().string();
+        if (ec && branch_enabled) slot_io_failure(slot_dir, ec);
+        if (slot_keep) {   // a .bin without its .meta was never completed
+            fs::directory_iterator orphan(slot_dir, ec), end;
+            if (ec && branch_enabled) slot_io_failure(slot_dir, ec);
+            while (!ec && orphan != end) {
+                const auto path = orphan->path();
+                const std::string p = path.string(), fn = path.filename().string();
                 if ((fn.rfind("slot-", 0) == 0 || (branch_enabled && fn.rfind("branch-", 0) == 0)) &&
-                    fn.size() > 9 && fn.compare(fn.size() - 4, 4, ".bin") == 0 &&
-                    !fs::exists(meta_of(p), ec))
-                    std::filesystem::remove(de.path(), ec);
+                    fn.size() > 9 && fn.compare(fn.size() - 4, 4, ".bin") == 0) {
+                    const bool has_meta = fs::exists(meta_of(p), ec);
+                    if (ec) {
+                        if (branch_enabled) slot_io_failure(meta_of(p), ec);
+                        break;   // unknown metadata is not proof of an orphan
+                    }
+                    if (!has_meta) slot_remove_file(path);
+                }
+                orphan.increment(ec);
+                if (ec && branch_enabled) slot_io_failure(slot_dir, ec);
             }
+        }
         std::sort(found.begin(), found.end(), [](const Found& a, const Found& b) {
             return a.t != b.t ? a.t < b.t : a.bin > b.bin;
         });
@@ -1665,7 +1691,7 @@ static int glm_pack_generate(const Options& o) {
             std::ostringstream m;
             m << "folder " << slot_dir.string() << ": " << slots.size() << " conversation(s) kept from earlier runs ("
               << gb(total) << ")";
-            if (refused) m << ", " << refused << " not this model's or incomplete - removed";
+            if (refused) m << ", " << refused << " not this model's or incomplete - cleanup attempted";
             note(m.str());
         }
         if (!std::filesystem::is_directory(slot_dir, ec)) {
@@ -1681,18 +1707,15 @@ static int glm_pack_generate(const Options& o) {
         if (slots[i].data)                       // a RAM slot: its buffer simply dies
             slots[i].data.reset();
         else {
-            std::error_code ec;
-            std::filesystem::remove(slots[i].path, ec);
-            if (ec && branch_enabled) branch_index_complete = false;
-            std::filesystem::remove(meta_of(slots[i].path), ec);
-            if (ec && branch_enabled) branch_index_complete = false;
+            slot_remove_file(slots[i].path);
+            slot_remove_file(meta_of(slots[i].path));
         }
         slots.erase(slots.begin() + (long) i);
     };
     const auto slot_touch = [&](Slot& s) {
         s.used = ++slot_clock;
         s.used_at = fs::file_time_type::clock::now();
-        if (slot_keep && !s.data) {
+        if (slot_keep && !s.data && (!branch_enabled || branch_index_complete)) {
             std::error_code ec;
             fs::last_write_time(meta_of(s.path), s.used_at, ec);
         }
@@ -1711,7 +1734,11 @@ static int glm_pack_generate(const Options& o) {
                 if (branch_enabled) {
                     std::error_code ec;
                     const auto size = fs::file_size(meta_of(s.path), ec);
-                    if (!ec) total += size;
+                    if (ec) {
+                        slot_io_failure(meta_of(s.path), ec);
+                        return UINT64_MAX;   // unknown bytes must never create admission headroom
+                    }
+                    total += size;
                 }
             }
         return total;
@@ -1733,6 +1760,7 @@ static int glm_pack_generate(const Options& o) {
         return cache_memory::permits(slot_disk_budget, slot_disk_bytes(), need);
     };
     const auto publish_files = [&](Slot& s, const auto& write_payload) {
+        if (branch_enabled && !branch_index_complete) return false;
         const auto stamp = std::chrono::duration_cast<std::chrono::microseconds>(
             std::chrono::system_clock::now().time_since_epoch()).count();
         const std::string path = (slot_dir / ((s.branch_id ? "branch-" : "slot-") + std::to_string(stamp) +
@@ -1741,10 +1769,10 @@ static int glm_pack_generate(const Options& o) {
         std::error_code ec;
         if (fs::exists(path, ec) || fs::exists(meta, ec) || fs::exists(tmp, ec) || ec) return false;
         const auto cleanup = [&] {
-            fs::remove(tmp, ec);
-            fs::remove(path, ec);
-            fs::remove(meta, ec);
-            fs::remove(meta + ".tmp", ec);
+            slot_remove_file(tmp);
+            slot_remove_file(path);
+            slot_remove_file(meta);
+            slot_remove_file(meta + ".tmp");
         };
         try {
             if (write_payload(tmp) && fs::file_size(tmp, ec) == s.bytes && !ec) {
@@ -1862,6 +1890,7 @@ static int glm_pack_generate(const Options& o) {
     if (slot_spill) slot_trim_disk();
     // the conversation in the model (its snapshot, snap_tokens) into a slot
     const auto slot_put = [&](const char* why) {
+        if (branch_enabled && !branch_index_complete) return;
         if (slot_max <= 0 || snap_in_slot || snap_tokens.size() < slot_min) return;
         if (model.ablating()) return;   // (--ablate: a projected conversation is not kept - it is read again)
         // an earlier state of this conversation is superseded (the same pictures: the same tokens with other
@@ -2083,12 +2112,44 @@ static int glm_pack_generate(const Options& o) {
             // Physical headroom includes the full replacement until the old slots are retired.
             const bool in_ram = cache_memory::permits(slot_ram_budget, ram, bytes) && memory_permits(bytes + temporary);
             if (!in_ram) {
-                // Count existing files during staging, even those planned for retirement.
                 const uint64_t need = bytes + branch_identity.size() + 48 + cut * sizeof(int32_t);
                 std::error_code ec;
                 const auto space = fs::space(slot_dir, ec);
-                if (ec || !cache_memory::permits(space.available, uint64_t{8} << 30, need) ||
-                    !cache_memory::permits(slot_disk_budget, slot_disk_bytes(), need)) return false;
+                // Physical staging retains every old file and the 8 GiB reserve.
+                if (ec || need > slot_disk_budget ||
+                    !cache_memory::permits(space.available, uint64_t{8} << 30, need)) return false;
+                uint64_t retained = slot_disk_bytes();
+                const auto retire_disk = [&](size_t i) {
+                    const auto& s = slots[i];
+                    if (s.data) return true;
+                    const auto metadata = fs::file_size(meta_of(s.path), ec);
+                    if (ec || s.bytes > retained || metadata > retained - s.bytes) return false;
+                    retained -= s.bytes + metadata;
+                    return true;
+                };
+                for (size_t i : victims) if (!retire_disk(i)) return false;
+                if (!cache_memory::permits(slot_disk_budget, retained, need)) {
+                    std::vector<size_t> disk_victims;
+                    for (size_t i = 0; i < slots.size(); ++i) {
+                        const auto& s = slots[i];
+                        if (s.data || !s.branch_id || std::find(victims.begin(), victims.end(), i) != victims.end() ||
+                            (snap_img_hash == kNoImages && s.tokens == snap_tokens) ||
+                            (branch_bound_elsewhere && branch_bound_elsewhere(s.tokens))) continue;
+                        disk_victims.push_back(i);
+                    }
+                    std::sort(disk_victims.begin(), disk_victims.end(), [&](size_t a, size_t b) {
+                        return slots[a].used < slots[b].used;
+                    });
+                    for (size_t i : disk_victims) {
+                        if (cache_memory::permits(slot_disk_budget, retained, need)) break;
+                        if (!retire_disk(i)) return false;
+                        victims.push_back(i);
+                    }
+                    if (!cache_memory::permits(slot_disk_budget, retained, need)) return false;
+                    std::sort(victims.begin(), victims.end(), std::greater<size_t>{});
+                }
+                // Only this one staged entry may exceed the logical disk cap;
+                // its planned post-publication catalogue must fit the cap.
             }
             plan = {bytes, in_ram, std::move(victims)};
             return true;
@@ -2122,7 +2183,13 @@ static int glm_pack_generate(const Options& o) {
                         return true;
                     })) return;
             } else {
-                if (!disk_fits(entry) || !publish_files(entry, [&](const std::string& path) {
+                // branch_plan accounts for the final catalogue, while staging
+                // must still fit the actual volume without deleting old states.
+                std::error_code ec;
+                const auto space = fs::space(slot_dir, ec);
+                if (ec || !branch_index_complete ||
+                    !cache_memory::permits(space.available, uint64_t{8} << 30, disk_need(entry)) ||
+                    !publish_files(entry, [&](const std::string& path) {
                         std::ofstream f(path, std::ios::binary | std::ios::trunc);
                         if (!f || !save([&](const void* data, size_t n) {
                                 f.write(static_cast<const char*>(data), n);

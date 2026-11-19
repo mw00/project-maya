@@ -8,7 +8,52 @@
       for (const auto& e : std::filesystem::directory_iterator(slot_dir, ec)) ++n;
       return n;
     };
-    if (which == "branch-ready-write" || which == "branch-ready-publish" || which == "branch-ready-serialize") {
+    if (which.rfind("branch-cleanup-", 0)==0) {
+      auto family = [&](int32_t id) { auto p = b; p[0] = id; return p; };
+      auto put = [&](int32_t id) { model.live_pos=1883; branch_save(family(id),1883); };
+      if (which=="branch-cleanup-restart" || which=="branch-cleanup-retire-restart") {
+        const bool retired = which=="branch-cleanup-retire-restart";
+        if (!branch_index_complete || slots.size()!=2 || count_files()!=4 ||
+            slot_take(family(retired ? 3 : 1),0,true)!=1883 || slot_take(family(2),0,true)!=1883)
+          fail("restart did not clean pending transaction files and restore valid states");
+        put(4);
+        if (model.live_saves!=1 || slots.size()!=2) fail("clean restart did not resume admission");
+      } else {
+        if (which.rfind("branch-cleanup-rollback",0)==0 || which.rfind("branch-cleanup-retire",0)==0) {
+          put(1); put(2);
+          if (slots.size()!=2) fail("cleanup fixture could not seed old states");
+          fixture_remove_failure = which=="branch-cleanup-rollback" ? ".bin.tmp" :
+                                   which=="branch-cleanup-rollback-meta" ? ".meta.tmp" :
+                                   which=="branch-cleanup-retire-meta" ? meta_of(slots[0].path) : slots[0].path;
+          model.fail_live = which=="branch-cleanup-rollback";
+          model.fail_metadata = which=="branch-cleanup-rollback-meta";
+          put(3);
+        }
+        if (!fixture_io_errors || branch_index_complete)
+          fail("cleanup I/O error did not disable cache admission");
+        if ((fixture_orphan_iter_fail || fixture_orphan_exists_fail) &&
+            !std::filesystem::exists(fixture_slot_dir / "branch-cleanup.bin"))
+          fail("unknown directory or metadata status deleted the payload");
+        if (!slots.empty()) {
+          const auto meta = meta_of(slots.back().path);
+          const auto before = std::filesystem::file_time_type::clock::now() - std::chrono::hours(24);
+          std::filesystem::last_write_time(meta, before);
+          const auto stored = std::filesystem::last_write_time(meta);
+          slot_touch(slots.back());
+          if (std::filesystem::last_write_time(meta)!=stored)
+            fail("disabled cache writes still touched persistent metadata");
+        }
+        const int saves = model.live_saves;
+        fixture_remove_failure.clear(); model.fail_live=false;
+        put(4);
+        if (model.live_saves!=saves) fail("cache continued writing with unaccounted files");
+      }
+    } else if (which.rfind("branch-policy-", 0) == 0) {
+      auto short_key = std::vector<int32_t>(13, 41);
+      short_key.back() = 42;
+      if (!slots.empty() || slot_take(short_key, 0, true) != 0 || model.loads != 0)
+        fail("changed admission policy restored a historical short key");
+    } else if (which == "branch-ready-write" || which == "branch-ready-publish" || which == "branch-ready-serialize") {
       seed();
       if (slots.size()!=1 || slots[0].data) fail("disk seed missing");
       const auto old_path = slots[0].path;
@@ -160,7 +205,7 @@
         for (const auto& s : slots) if (!s.data && (!std::filesystem::exists(s.path) || !std::filesystem::exists(meta_of(s.path))))
           fail("failed replacement removed old payload or metadata");
       };
-      if (which == "branch-lru-reindex") {
+      if (which == "branch-lru-reindex" || which == "branch-lru-staging-reindex") {
         if (slots.size()!=2 || find_family(1)==slots.end() || find_family(2)!=slots.end() || find_family(3)==slots.end() || count_files()!=4)
           fail("restart recovered retired branch or lost replacement");
         for (const auto& s : slots) if (!s.branch_id || s.data) fail("restart lost learned disk classification");
@@ -214,10 +259,35 @@
           fixture_available=uint64_t{128}<<30; fixture_disk_available=uint64_t{8}<<30;
           put_family(3); require_old_pair();
           if (model.live_saves!=2 || count_files()!=4) fail("resource shortage staged or retired a state");
-        } else if (which=="branch-lru-staging") {
-          if (slot_disk_budget!=20000 || slot_disk_bytes()>slot_disk_budget) fail("staging fixture budget invalid");
-          put_family(3); require_old_pair();
-          if (model.live_saves!=2 || count_files()!=4) fail("replacement ignored old files during disk staging");
+        } else if (which.rfind("branch-lru-staging", 0)==0) {
+          if (slot_disk_budget!=20000 || slot_disk_bytes()>slot_disk_budget)
+            fail("staging fixture budget invalid");
+          if (disk_need(*find_family(1)) <= slot_disk_budget - slot_disk_bytes())
+            fail("staging fixture does not require replacement");
+          if (which=="branch-lru-staging-bound") {
+            snap_tokens = find_family(1)->tokens;
+            const auto other_tokens = find_family(2)->tokens;
+            branch_bound_elsewhere = [other_tokens](const auto& t) { return t == other_tokens; };
+          }
+          model.fail_live = which=="branch-lru-staging-save-fail";
+          model.fail_metadata = which=="branch-lru-staging-meta-fail";
+          if (which=="branch-lru-staging-pressure") fixture_disk_available=uint64_t{8}<<30;
+          put_family(3);
+          if (model.fail_live || model.fail_metadata || which=="branch-lru-staging-bound" || which=="branch-lru-staging-pressure") {
+            require_old_pair();
+            const int expected_saves = model.fail_live || model.fail_metadata ? 3 : 2;
+            if (model.live_saves!=expected_saves || count_files()!=4 ||
+                find_family(1)->branch_id!=hot_id || find_family(2)->branch_id!=cold_id)
+              fail("full-quota failure changed old state or left staged files");
+            if (slot_take(family(1),0,true)!=1883 || slot_take(family(2),0,true)!=1883 || slot_take(family(3),0,true)!=0)
+              fail("full-quota failure did not preserve restorable old states");
+          } else if (slots.size()!=2 || find_family(1)==slots.end() || find_family(2)!=slots.end() ||
+                     find_family(3)==slots.end() || model.live_saves!=3 || count_files()!=4 ||
+                     slot_disk_bytes()>slot_disk_budget || std::filesystem::exists(cold_path) ||
+                     std::filesystem::exists(meta_of(cold_path)) || !std::filesystem::exists(hot_path) ||
+                     slot_take(family(3),0,true)!=1883 || slot_take(family(2),0,true)!=0) {
+            fail("full-quota transaction did not replace only cold state within final budget");
+          }
         } else {
           put_family(3);
           if (slots.size()!=2 || find_family(1)==slots.end() || find_family(2)!=slots.end() || find_family(3)==slots.end() ||

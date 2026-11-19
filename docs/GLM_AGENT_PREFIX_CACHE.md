@@ -125,13 +125,28 @@ Host regressions cover the learned-enabled ordinary snapshot's capacity rejectio
 payload failure and metadata publication failure without losing the previous slot.
 Startup now orders lightweight file metadata by recency before reading/admitting
 learned token keys, so reduced count/byte/token quotas favor the newest entries
-that fit while retaining the existing aggregate token bound. This is not a model
-or performance validation.
+that fit while retaining the existing aggregate token bound. Each directory pass
+keeps up to 64 path/timestamp records plus its cursor and current candidate.
+This bounds temporary ordering records, not the full index or its byte size.
+The tradeoff is repeated directory traversal; large-directory startup time has
+not been benchmarked.
 
 Explicitly lowered completion thresholds can produce a nonempty total key below
 1024 tokens. Metadata now accepts the same nonempty bounded key in RAM, on SSD
 and after restart. The learned-discovery minimum and default completion increment
 remain 1024; allowing short metadata does not lower those default admission gates.
+Learned metadata now carries the admission policy version, token thresholds and
+completion setting. Matching policy settings preserve restart reuse; changing
+them invalidates earlier learned entries. Entries predating this policy tag
+also require a one-time refill.
+
+For a single engine, a learned SSD replacement may stage one additional entry
+while preserving the old one. Logical quota applies to the post-replacement
+set; physical free space must cover staging plus the existing reserve. If file
+cleanup fails, residual files can still consume disk space. The engine reports
+the failure and stops new admissions that rely on the incomplete accounting.
+This is not a crash journal: after an interruption, startup rebuilds the index rather
+than replaying an exact list of victims.
 
 **Weight content identity remains unresolved and blocks Ready.** Existing identity
 uses paths, geometry and file metadata, not the bytes actually consumed by every
