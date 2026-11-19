@@ -8331,7 +8331,7 @@ def hy4_usable_gib(gpus: list, used: dict | None = None) -> float:
 
 
 def hy4_fit(q: dict, gpus: list, ctx_wanted: int | None = None, used: dict | None = None,
-            layout: str | None = None) -> dict:
+            layout: str | None = None, pictures: bool = True) -> dict:
     """How a size of Hy4-Flash (q: its entry in the manifest) runs on these cards, worked out before any download:
     {"layout": "standard" where its plan fits the VRAM (hy4_usable_gib) at the context - else a small-card layout the
     size has; "context": ctx_wanted, else "recommended" - the largest of HY4_CONTEXTS that fits, up to
@@ -8339,8 +8339,11 @@ def hy4_fit(q: dict, gpus: list, ctx_wanted: int | None = None, used: dict | Non
     context - "f16" or "q8" (8-bit rows; never said on screen: the engine chooses at every start); "vision": a
     picture's room fits ("vision_small": a smaller picture's only); "chunk" and "args": the layout's own engine flags
     (none for "standard": the engine's defaults - it fills the VRAM left with the most-routed experts itself; never
-    --kv: the engine's auto); "usable", "need" (GiB, with the rows of "kv")}.  A small-card layout reads prompts in
-    chunks twice its plan's where that still fits (HY4_CHUNK_UP_GIB).
+    --kv: the engine's auto); "usable", "need" (GiB, with the rows of "kv")}.  Pictures go before the prompts' speed:
+    a small-card layout reads prompts in chunks twice its plan's (HY4_CHUNK_UP_GIB) only where that fits beside the
+    largest picture's room - VRAM that holds one of the two goes to the picture, and where only a smaller picture
+    fits, all the room there is goes to it.  pictures False (--no-vision: no picture is ever read): the chunk is
+    doubled where it fits beside the model's own parts alone.
     Nothing fits: {"error": why, "hint": what to do, "usable", "need"}.  layout: only this one (the files of a folder
     are that layout's)."""
     lays = hy4_layouts(q)
@@ -8378,26 +8381,25 @@ def hy4_fit(q: dict, gpus: list, ctx_wanted: int | None = None, used: dict | Non
     kv = rows(plan, ctx)
     takes = hy4_fit_need_gib(plan, ctx, kv == "q8")
     chunk, args = int(plan.get("chunk") or 0), []
-    more = 0.0
-    if pick != HY4_STANDARD:
-        if chunk and takes + HY4_CHUNK_UP_GIB <= usable:
-            chunk *= 2
-            more = HY4_CHUNK_UP_GIB
-        args = (["--chunk", str(chunk)] if chunk else []) + \
-            [x for k, flag in (("reserve_gb", "--reserve-gb"), ("vram_experts", "--vram-experts")) if k in plan
-             for x in (flag, f"{float(plan[k]):g}")]
-    # (pictures: the engine keeps a picture's room free on the main GPU - neither the context nor the prompt chunk is
-    #  made smaller for it.  Its order, src/hy4/hy4_plan.hpp's kv_pick - pictures before the cache's rows: F16 rows
-    #  and the largest picture's room, 8-bit rows and that room, F16 then 8-bit rows and a smaller picture's room
-    #  (HY4_VISION_MIN_GIB at least: the engine then says the pictures' size and the server resizes to it), and only
-    #  then text only, with the rows worked out above)
+    # (pictures: the engine keeps a picture's room free on the main GPU - the context is never made smaller for it.
+    #  Its order, src/hy4/hy4_plan.hpp's kv_pick - pictures before the cache's rows: F16 rows and the largest
+    #  picture's room, 8-bit rows and that room, F16 then 8-bit rows and a smaller picture's room (HY4_VISION_MIN_GIB
+    #  at least: the engine then says the pictures' size and the server resizes to it), and only then text only, with
+    #  the rows worked out above)
     vision, small = False, False
     for q8, room in ((False, HY4_VISION_GIB), (True, HY4_VISION_GIB), (False, HY4_VISION_MIN_GIB),
-                     (True, HY4_VISION_MIN_GIB)):
-        if hy4_fit_need_gib(plan, ctx, q8) + more + room <= usable:
+                     (True, HY4_VISION_MIN_GIB)) if pictures else ():
+        if hy4_fit_need_gib(plan, ctx, q8) + room <= usable:
             kv, vision, small = "q8" if q8 else "f16", True, room < HY4_VISION_GIB
             takes = hy4_fit_need_gib(plan, ctx, q8)
             break
+    if pick != HY4_STANDARD:
+        # (the chunk after the pictures: doubled only where that leaves the picture chosen above as it is - beside
+        #  the largest picture's room with the same rows; a smaller picture already takes all the room there is)
+        if chunk and not small and takes + (HY4_VISION_GIB if vision else 0.0) + HY4_CHUNK_UP_GIB <= usable:
+            chunk *= 2
+        args = (["--chunk", str(chunk)] if chunk else []) +             [x for k, flag in (("reserve_gb", "--reserve-gb"), ("vram_experts", "--vram-experts")) if k in plan
+             for x in (flag, f"{float(plan[k]):g}")]
     return {"layout": pick, "context": ctx, "recommended": rec, "contexts": fits[pick], "chunk": chunk, "args": args,
             "kv": kv, "usable": usable, "need": takes, "vision": vision, "vision_small": small}
 
@@ -8688,7 +8690,7 @@ def hy4_fit_step(a, pc: dict, quant: str, prev_ctx: int | None = None, have=None
     if not hy4_layouts(q):
         hy4_entry(quant)                               # (a size with no files yet: its own message)
     forced = hy4_layout_in(Path(a.model_dir).expanduser(), quant) if a.model_dir else None
-    fit = hy4_fit(q, pc["gpus"], a.context, layout=forced)
+    fit = hy4_fit(q, pc["gpus"], a.context, layout=forced, pictures=not a.no_vision)
     if "error" not in fit and hy4_layouts(q)[fit["layout"]].get("published") == "hub" and not forced and \
             read_json(HY4_MANIFEST).get("revision") and \
             not (have and hy4_layout_in(have(fit["layout"]), quant) == fit["layout"]):
@@ -8706,7 +8708,7 @@ def hy4_fit_step(a, pc: dict, quant: str, prev_ctx: int | None = None, have=None
                  "needed); a card with about 10 GB of VRAM or more runs the standard file now")
     if "error" not in fit and not a.context and not getattr(a, "check", False):
         ctx = choose_context(a, prev_ctx, fit["contexts"], fit["recommended"])
-        fit = hy4_fit(q, pc["gpus"], ctx, layout=fit["layout"])
+        fit = hy4_fit(q, pc["gpus"], ctx, layout=fit["layout"], pictures=not a.no_vision)
     if "error" in fit:
         fail(fit["error"] + (f" (the files in {a.model_dir} are the {forced} layout's)" if forced else ""), fit["hint"])
     if fit["layout"] == HY4_STANDARD:

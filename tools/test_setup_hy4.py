@@ -492,7 +492,7 @@ class Fit(unittest.TestCase):
         """A picture's room on the main GPU beside the plan at the context chosen, pictures before the cache's rows
         (the engine's order, src/hy4/hy4_plan.hpp): F16 rows + the largest picture's room (HY4_VISION_GIB), 8-bit
         rows + that room, F16 then 8-bit rows + a smaller picture's room (HY4_VISION_MIN_GIB), then text only.  The
-        context and the prompt chunk are never made smaller for it."""
+        context is never made smaller for it; the prompt chunk is doubled only with what the picture leaves."""
         f = self.fit(8, 400)                               # (7.6 GB: 7.1 at 32K + a small picture's room)
         self.assertEqual((f["layout"], f["context"], f["kv"], f["vision"], f["vision_small"]), ("8gb", 32768, "q8", True, True))
         f = self.fit(8, 400, ctx_wanted=8192)              # (6.8 + 0.81 does not fit: F16 rows and a smaller picture)
@@ -507,29 +507,55 @@ class Fit(unittest.TestCase):
         self.assertEqual((f["layout"], f["kv"], f["vision"], f["vision_small"]), ("standard", "q8", True, False))
         f = self.fit(12, 800, ctx_wanted=131072)
         self.assertEqual((f["layout"], f["kv"], f["vision"], f["vision_small"]), ("standard", "q8", True, True))
-        self.assertFalse(self.fit(8, 400, ctx_wanted=4096)["vision"])     # (6.5 + 0.95 for the chunk + 0.21 of 7.6 GB)
-        f = self.fit(9, 500, ctx_wanted=8192)                             # (8.5 GB: the chunk doubled, as for text)
-        self.assertEqual((f["chunk"], f["kv"], f["vision"], f["vision_small"]), (512, "f16", True, True))
+        # (VRAM for the larger chunk or for the picture, not both: the picture - 6.5 + 0.81 of 7.6 GB, 6.8 + 0.81 of 8.5)
+        f = self.fit(8, 400, ctx_wanted=4096)
+        self.assertEqual((f["chunk"], f["kv"], f["vision"], f["vision_small"]), (256, "f16", True, False))
+        f = self.fit(9, 500, ctx_wanted=8192)
+        self.assertEqual((f["chunk"], f["kv"], f["vision"], f["vision_small"]), (256, "f16", True, False))
         f = self.fit(11, 300, ctx_wanted=8192, layout="8gb")
         self.assertEqual((f["kv"], f["vision"], f["vision_small"]), ("f16", True, False))
         for gib in (12, 16, 24, 32):                       # (F16 rows and the largest picture: as before)
             f = self.fit(gib, 400)
             self.assertEqual((f["layout"], f["kv"], f["vision"], f["vision_small"]), ("standard", "f16", True, False), gib)
 
-    def test_chunk_512_only_where_it_fits(self):
-        small = XS["layouts"]["8gb"]["plan"]
+    def test_chunk_512_only_after_the_pictures(self):
+        """The chunk is doubled only where that fits beside the largest picture's room, with the rows the picture
+        was chosen with; never where only a smaller picture fits (it takes all the room there is)."""
+        small, up, big = XS["layouts"]["8gb"]["plan"], maya.HY4_CHUNK_UP_GIB, maya.HY4_VISION_GIB
+        seen = set()
         for gib, used, ctx in ((8, 400, None), (8, 400, 4096), (8.5, 300, None), (9, 500, None), (9, 500, 8192),
-                               (8, 0, None), (9.5, 900, 4096)):
-            f = self.fit(gib, used, ctx_wanted=ctx)
-            self.assertEqual(f["layout"], "8gb", (gib, used))
-            # (the chunk is the text plan's: its rows are 8-bit only where F16 rows do not fit)
-            text = maya.hy4_kv_rows(maya.hy4_fit_need_gib(small, f["context"]),
-                                    maya.hy4_fit_need_gib(small, f["context"], True), f["usable"])
-            fits = maya.hy4_fit_need_gib(small, f["context"], text == "q8") + maya.HY4_CHUNK_UP_GIB <= f["usable"]
-            self.assertEqual(f["chunk"], 512 if fits else 256, (gib, used, ctx))
+                               (8, 0, None), (9.5, 900, 4096), (8, 0, 4096), (9.5, 0, 4096), (10, 0, 8192),
+                               (11, 300, 8192), (11, 300, 32768), (12, 0, 32768)):
+            f = self.fit(gib, used, ctx_wanted=ctx, layout="8gb")
+            need = maya.hy4_fit_need_gib(small, f["context"], f["kv"] == "q8")
+            both = f["vision"] and not f["vision_small"] and need + big + up <= f["usable"]
+            self.assertEqual(f["chunk"], 512 if both else 256, (gib, used, ctx))
             self.assertEqual(f["args"][:2], ["--chunk", str(f["chunk"])])
-        self.assertEqual(self.fit(9, 500, ctx_wanted=8192)["chunk"], 512)   # (8.5 GB free: 6.8 + 0.95 fits)
-        self.assertEqual(self.fit(8, 400)["chunk"], 256)                    # (7.6 GB free: it does not)
+            if f["chunk"] == 512:                          # (the picture is the one the plan's own chunk gets)
+                self.assertEqual((f["kv"], f["vision"], f["vision_small"]), ("f16", True, False), (gib, used, ctx))
+            if need + up <= f["usable"]:                   # (room for the larger chunk: never taken from a picture)
+                self.assertTrue(f["vision"] and not f["vision_small"], (gib, used, ctx))
+            seen.add(f["chunk"])
+        self.assertEqual(seen, {256, 512})
+        # (an 8 GB card with nothing on it at 4K: 6.5 + 0.95 fits and 6.5 + 0.81 fits, both do not - the picture)
+        f = self.fit(8, 0, ctx_wanted=4096)
+        self.assertEqual((f["chunk"], f["kv"], f["vision"], f["vision_small"]), (256, "f16", True, False))
+        # (both fit: both - 6.5 + 0.81 + 0.95 of 9.5 GB)
+        f = self.fit(9.5, 0, ctx_wanted=4096, layout="8gb")
+        self.assertEqual((f["chunk"], f["kv"], f["vision"], f["vision_small"]), (512, "f16", True, False))
+        # (the larger chunk never moves the rows to 8-bit or the picture to a smaller one: 8.1 + 0.81 of 9.3 GB at 32K)
+        f = self.fit(9.5, 200, ctx_wanted=32768, layout="8gb")
+        self.assertEqual((f["chunk"], f["kv"], f["vision"], f["vision_small"]), (256, "f16", True, False))
+        self.assertEqual(self.fit(8, 400)["chunk"], 256)   # (32K with a smaller picture: all the room is its)
+
+    def test_chunk_512_with_no_pictures_asked(self):
+        """--no-vision: no picture is ever read, so the room goes to the chunk as it did."""
+        f = self.fit(9, 500, ctx_wanted=8192, pictures=False)             # (8.5 GB free: 6.8 + 0.95 fits)
+        self.assertEqual((f["chunk"], f["kv"], f["vision"], f["vision_small"]), (512, "f16", False, False))
+        f = self.fit(8, 400, pictures=False)                              # (7.6 GB free at 32K: it does not)
+        self.assertEqual((f["chunk"], f["kv"], f["vision"]), (256, "q8", False))
+        for gib in (12, 24):                               # (a large card: the engine's own chunk either way)
+            self.assertEqual(self.fit(gib, pictures=False)["chunk"], self.fit(gib)["chunk"])
 
     def test_larger_cards(self):
         for gib in (12, 16, 24, 32):
