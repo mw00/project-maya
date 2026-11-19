@@ -1,8 +1,8 @@
 {
- "_": "Project Maya's quants of tencent/Hy4-flash (GGUF sets; tools/hy4/pack_gguf.py packs them for maya-hy4), named as every Maya quant (tools/maya_quants.py): one repo for the model, a folder per size. A set is two shards: 00001 the model (its trunk), 00002 the n-gram table alone - \"ngram\": ONE file, the same for every size and layout, downloaded once and hard-linked into the other folders. This table is the one switch: a size is offered by the setup and the dashboard once \"revision\" names the repo's commit and the size has \"files\" with their sizes and sha256 (until then: --model hy4-flash-maya-xs --model-dir <folder with the files>, checked against the sizes and sha256 here). \"memory_gb\": the VRAM + RAM that hold the whole set. \"plan\": what maya-hy4 needs in VRAM for everything that is not a routed expert, GiB by context with its \"reserve_gb\" (\"need_gib\"; the engine has no RAM fallback for these parts - a context not listed is worked out from the nearest one below it, maya.py's hy4_need_gib), and the \"chunk\" a prompt is read in. \"layouts\": the same size with another trunk for cards the standard one does not fit (\"8gb\": attention Q4_K, run with --chunk 256 --reserve-gb 0.5 --vram-experts 0), in a folder of its own beside the size's. The repo's mmproj and drafter files are not listed: maya-hy4 reads neither yet.",
+ "_": "Project Maya's quants of tencent/Hy4-flash (GGUF sets; tools/hy4/pack_gguf.py packs them for maya-hy4), named as every Maya quant (tools/maya_quants.py): one repo for the model, a folder per size. A set is two shards: 00001 the model (its trunk), 00002 the n-gram table alone - \"ngram\": ONE file, the same for every size and layout, downloaded once and hard-linked into the other folders. This table is the one switch: a size is offered by the setup and the dashboard once \"revision\" names the repo's commit and the size has \"files\" with their sizes and sha256 (until then: --model hy4-flash-maya-xs --model-dir <folder with the files>, checked against the sizes and sha256 here). \"memory_gb\": the VRAM + RAM that hold the whole set. \"plan\": what maya-hy4 needs in VRAM for everything that is not a routed expert, GiB by context with its \"reserve_gb\" (\"need_gib\"; the engine has no RAM fallback for these parts - a context not listed is worked out from the nearest one below it, maya.py's hy4_need_gib), and the \"chunk\" a prompt is read in. \"layouts\": the same size with another trunk for cards the standard one does not fit (\"8gb\": attention Q4_K, run with --chunk 256 --reserve-gb 0.5 --vram-experts 0), in a folder of its own beside the size's. \"published\": false switches a size or a layout off whatever else it lists; \"hub\" on a layout: its file may be uploaded after a release, at a later commit than \"revision\" - the setup asks Hugging Face whether it is there (same size and sha256 as here) when no folder on the PC has it, uses it if so, and says plainly that it is not published yet if not. A size with empty \"files\" is not offered: to switch one on, fill its \"files\", \"memory_gb\", \"about\" and \"plan\" and move \"revision\" to the commit that has them. The repo's mmproj and drafter files are not listed: maya-hy4 reads neither yet.",
  "name": "Hy4-Flash",
  "repo": "peasantsmith/Hy4-Flash-Maya-GGUF",
- "revision": "",
+ "revision": "98856f535c70c18d49778a50668b2b28d8516097",
  "license": "Tencent Hy License (LICENSE.hy4-flash)",
  "ngram": {
   "Maya-XS/Hy4-Flash-Maya-XS-00002-of-00002.gguf": [63360616160, "5819578b52eb1cda0945a716e0575331406d976b6eebc74db8544b3d478ad244"]
@@ -18,6 +18,7 @@
    "layouts": {
     "8gb": {
      "about": "attention Q4_K: for cards under about 10 GB",
+     "published": "hub",
      "files": {
       "Maya-XS-8GB/Hy4-Flash-Maya-XS-00001-of-00002.gguf": [43565100064, "307bf551cf92a9567b72e1ba1795ff3a526141b791ae7ea9a04af910754e4c8a"]
      },
@@ -25,7 +26,7 @@
     }
    }
   },
-  "Hy4-Flash-Maya-S": {"files": {}},
+  "Hy4-Flash-Maya-S": {"published": false, "files": {}},
   "Hy4-Flash-Maya-M": {"files": {}},
   "Hy4-Flash-Maya-L": {"files": {}}
  }

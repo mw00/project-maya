@@ -1,6 +1,7 @@
 """tools/test_setup_hy4.py - the setup's Hy4-Flash (maya.py): the one table that switches its sizes on
 (tools/hy4/download.json), where it is offered (NVIDIA only), the layout and the context worked out from the VRAM
-before any download, the n-gram table shared between its folders, its pack and its config.  No GPU, no network.
+before any download, the n-gram table shared between its folders, its pack and its config.  No GPU, no network (the
+one question the setup asks Hugging Face - is a layout's file uploaded: maya.hy4_on_hub - is answered here).
 
     python -m unittest tools.test_setup_hy4 -v
 """
@@ -20,8 +21,19 @@ import maya  # noqa: E402
 import maya_quants as Q  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
-MANIFEST = json.loads((ROOT / "tools" / "hy4" / "download.json").read_text(encoding="utf-8"))
+TABLE = json.loads((ROOT / "tools" / "hy4" / "download.json").read_text(encoding="utf-8"))   # (as committed)
+MANIFEST = dict(TABLE, revision="")                # the table before anything is uploaded: no revision
 XS = MANIFEST["quants"]["Hy4-Flash-Maya-XS"]
+HUB_COMMIT = "c" * 40
+_hub = patch.object(maya, "hy4_on_hub", lambda *a, **k: HUB_COMMIT)   # (the 8 GB-card file: uploaded, unless a test says)
+
+
+def setUpModule():
+    _hub.start()
+
+
+def tearDownModule():
+    _hub.stop()
 TRUNK = "Hy4-Flash-Maya-XS-00001-of-00002.gguf"
 NGRAM = "Hy4-Flash-Maya-XS-00002-of-00002.gguf"
 
@@ -113,7 +125,7 @@ class Manifest(unittest.TestCase):
         with with_manifest(manifest("abc")):
             small = maya.hy4_entry("maya-xs", "8gb")
             self.assertEqual(maya.file_url(small, TRUNK), "https://huggingface.co/peasantsmith/Hy4-Flash-Maya-GGUF/"
-                                                          f"resolve/abc/Maya-XS-8GB/{TRUNK}")
+                                                          f"resolve/main/Maya-XS-8GB/{TRUNK}")   # (or the commit the Hub named: Fit)
             self.assertEqual(maya.file_url(small, NGRAM), "https://huggingface.co/peasantsmith/Hy4-Flash-Maya-GGUF/"
                                                           f"resolve/abc/Maya-XS/{NGRAM}")
         with patch.object(maya, "fail", fail), self.assertRaisesRegex(Failed, "not available yet"):
@@ -124,8 +136,81 @@ class Published(unittest.TestCase):
     """One table switches the sizes on: a size is offered once "revision" is set and it has files with sha256."""
 
     def test_nothing_until_the_revision_is_pinned(self):
-        self.assertEqual(MANIFEST["revision"], "")                    # (as committed: the repo is still being uploaded)
-        self.assertEqual([k for k in maya.HY4_QUANTS if maya.hy4_published(k)], [])
+        with with_manifest(MANIFEST):
+            self.assertEqual([k for k in maya.HY4_QUANTS if maya.hy4_published(k)], [])
+
+    def test_as_committed(self):
+        """The table of this release: Maya-XS on, at a pinned commit of the repo; S switched off; M and L listed
+        without files (not offered); the 8 GB-card layout asked from the Hub."""
+        self.assertRegex(TABLE["revision"], r"^[0-9a-f]{40}$")
+        self.assertEqual([k for k in maya.HY4_QUANTS if maya.hy4_published(k)], ["maya-xs"])
+        q = TABLE["quants"]
+        self.assertIs(q["Hy4-Flash-Maya-S"]["published"], False)
+        self.assertEqual([q[n]["files"] for n in ("Hy4-Flash-Maya-M", "Hy4-Flash-Maya-L")], [{}, {}])
+        self.assertEqual(q["Hy4-Flash-Maya-XS"]["layouts"]["8gb"]["published"], "hub")
+        m = maya.hy4_entry("maya-xs")
+        self.assertEqual(maya.file_url(m, TRUNK), f"https://huggingface.co/peasantsmith/Hy4-Flash-Maya-GGUF/resolve/"
+                                                  f"{TABLE['revision']}/Maya-XS/{TRUNK}")
+        self.assertEqual(maya.file_url(m, NGRAM), f"https://huggingface.co/peasantsmith/Hy4-Flash-Maya-GGUF/resolve/"
+                                                  f"{TABLE['revision']}/Maya-XS/{NGRAM}")
+
+    def test_switched_off_whatever_it_lists(self):
+        s = {"published": False, "about": "x", "memory_gb": 80,
+             "files": {"Maya-S/Hy4-Flash-Maya-S-00001-of-00002.gguf": [7, "a" * 64]}}
+        with with_manifest(manifest(**{"Hy4-Flash-Maya-S": s})):
+            self.assertFalse(maya.hy4_published("maya-s"))
+            self.assertEqual(maya.hy4_layouts(s), {})
+        s["published"] = True                                         # (the one-line switch)
+        with with_manifest(manifest(**{"Hy4-Flash-Maya-S": s})):
+            self.assertTrue(maya.hy4_published("maya-s"))
+
+    def test_a_layout_asked_from_the_hub(self):
+        with with_manifest(manifest()):
+            self.assertTrue(maya.hy4_published("maya-xs", "8gb"))     # (there)
+            for answer in (False, None):                              # (not there; no answer)
+                with patch.object(maya, "hy4_on_hub", lambda *a, **k: answer):
+                    self.assertFalse(maya.hy4_published("maya-xs", "8gb"))
+                    self.assertTrue(maya.hy4_published("maya-xs"))    # (the size itself: by the table alone)
+        asked = []
+        with with_manifest(MANIFEST), patch.object(maya, "hy4_on_hub", lambda *a, **k: asked.append(a)):
+            self.assertFalse(maya.hy4_published("maya-xs", "8gb"))    # (nothing uploaded: the Hub is not asked)
+        self.assertEqual(asked, [])
+
+    def test_the_hubs_answer(self):
+        """hy4_on_hub: one HEAD request, the redirect's headers against the table's size and sha256."""
+        import email.message
+        import urllib.error
+        import urllib.request
+        _hub.stop()
+        try:
+            rel, (size, sha) = next(iter(XS["layouts"]["8gb"]["files"].items()))
+
+            def answer(code, **headers):
+                msg = email.message.Message()
+                for k, v in headers.items():
+                    msg[k.replace("_", "-")] = v
+
+                class Opener:
+                    def open(self, req, timeout=None):
+                        seen.append((req.get_method(), req.full_url))
+                        if code is None:
+                            raise OSError("no route")
+                        raise urllib.error.HTTPError(req.full_url, code, "x", msg, None)
+                return patch.object(urllib.request, "build_opener", lambda *a: Opener())
+            for want, how in ((HUB_COMMIT, answer(302, X_Linked_Size=str(size), X_Linked_Etag=f'"{sha}"',
+                                                  X_Repo_Commit=HUB_COMMIT)),
+                              (False, answer(302, X_Linked_Size=str(size + 1), X_Linked_Etag=f'"{sha}"')),
+                              (False, answer(302, X_Linked_Size=str(size), X_Linked_Etag='"' + "0" * 64 + '"')),
+                              (False, answer(404)), (None, answer(503)), (None, answer(None))):
+                seen = []
+                maya._HY4_HUB.clear()
+                with how:
+                    self.assertEqual(maya.hy4_on_hub("o/r", rel, size, sha), want)
+                    self.assertEqual(maya.hy4_on_hub("o/r", rel, size, sha), want)
+                self.assertEqual(seen, [("HEAD", f"https://huggingface.co/o/r/resolve/main/{rel}")])   # (asked once)
+        finally:
+            maya._HY4_HUB.clear()
+            _hub.start()
 
     def test_with_a_revision(self):
         with with_manifest(manifest()):
@@ -150,8 +235,9 @@ class Published(unittest.TestCase):
     def test_choice(self):
         a = args()
         self.assertEqual(maya.choose_hy4_quant(args(hy4_quant="maya-m"), {}), "maya-m")
-        self.assertEqual(maya.choose_hy4_quant(a, {}), "maya-xs")     # (none uploaded: the smallest, with --model-dir)
-        self.assertEqual(maya.choose_hy4_quant(a, {"installer": {"hy4_quant": "maya-s"}}), "maya-s")
+        with with_manifest(MANIFEST):                                 # (none uploaded: the smallest, with --model-dir)
+            self.assertEqual(maya.choose_hy4_quant(a, {}), "maya-xs")
+            self.assertEqual(maya.choose_hy4_quant(a, {"installer": {"hy4_quant": "maya-s"}}), "maya-s")
         with with_manifest(manifest()):
             self.assertEqual(maya.choose_hy4_quant(a, {}), "maya-xs")  # (one uploaded: no question)
         s = {"about": "experts 3 bits", "memory_gb": 80, "files": {"Maya-S/s-00001-of-00002.gguf": [70 * 10**9, "a" * 64]}}
@@ -415,6 +501,54 @@ class Fit(unittest.TestCase):
             with self.assertRaisesRegex(Failed, "not available yet"):
                 maya.hy4_fit_step(args(), {"gpus": [card(24)]}, "maya-s")
 
+    def test_the_8gb_file_on_the_hub_or_not(self):
+        """Both ways by the Hub's answer alone: there - used (from the commit the Hub named); not there - a plain
+        line for a small card, before any build or download; a larger card is never asked; nor a folder with it."""
+        said, asked = [], []
+        note = lambda *a: said.append(" ".join(map(str, a)))   # noqa: E731
+        man, body = stand_ins(manifest(revision="abc"))
+
+        def hub(answer):
+            def on_hub(repo, rel, size, sha, revision="main"):
+                asked.append(rel)
+                maya._HY4_HUB[(repo, rel, revision)] = answer
+                return answer
+            return patch.object(maya, "hy4_on_hub", on_hub)
+        with contextlib.ExitStack() as st, tempfile.TemporaryDirectory() as tmp:
+            for p in (patch.object(maya, "fail", fail), patch.object(maya, "ok", note), patch.object(maya, "warn", note),
+                      patch.object(maya, "say", note), patch.object(maya, "gpu_used_mib", return_value={0: 400}),
+                      with_manifest(man)):
+                st.enter_context(p)
+            st.callback(maya._HY4_HUB.clear)
+            small, large = {"gpus": [card(8)]}, {"gpus": [card(24)]}
+            with hub(False):
+                with self.assertRaisesRegex(Failed, "the 8 GB-card file is not published yet .*7.6 GB of free VRAM.*"
+                                                    "about 8.7 GB.*used by itself once it is on Hugging Face"):
+                    maya.hy4_fit_step(args(), small, "maya-xs")
+                self.assertEqual(asked, ["Maya-XS-8GB/" + TRUNK])
+                self.assertEqual(maya.hy4_fit_step(args(), large, "maya-xs")["layout"], "standard")
+                self.assertEqual(len(asked), 1)                       # (a card the standard file fits: not asked)
+                d = Path(tmp) / "x"                                   # (a folder that has the 8 GB-card trunk)
+                d.mkdir()
+                (d / TRUNK).write_bytes(body["Maya-XS-8GB/" + TRUNK])
+                self.assertEqual(maya.hy4_fit_step(args(model_dir=str(d)), small, "maya-xs")["layout"], "8gb")
+                self.assertEqual(maya.hy4_fit_step(args(), small, "maya-xs", have=lambda lay: d)["layout"], "8gb")
+                self.assertEqual(len(asked), 1)
+            with hub(None), self.assertRaisesRegex(Failed, "Hugging Face did not answer"):
+                maya.hy4_fit_step(args(), small, "maya-xs")
+            with hub(HUB_COMMIT):
+                self.assertEqual(maya.hy4_fit_step(args(), small, "maya-xs")["layout"], "8gb")
+                m = maya.hy4_entry("maya-xs", "8gb")
+                self.assertEqual(maya.file_url(m, TRUNK), "https://huggingface.co/peasantsmith/Hy4-Flash-Maya-GGUF/"
+                                                          f"resolve/{HUB_COMMIT}/Maya-XS-8GB/{TRUNK}")
+                self.assertEqual(maya.file_url(m, NGRAM), "https://huggingface.co/peasantsmith/Hy4-Flash-Maya-GGUF/"
+                                                          f"resolve/abc/Maya-XS/{NGRAM}")
+        with with_manifest(MANIFEST), hub(False), patch.object(maya, "fail", fail), patch.object(maya, "ok", note), \
+                patch.object(maya, "gpu_used_mib", return_value={0: 400}):
+            n = len(asked)                                            # (nothing uploaded at all: --model-dir's way)
+            self.assertEqual(maya.hy4_fit_step(args(), {"gpus": [card(8)]}, "maya-xs")["layout"], "8gb")
+            self.assertEqual(len(asked), n)
+
 
 def stand_ins(man=None):
     """The table with small stand-ins for the files (the same names): (the manifest, {repo path: bytes})."""
@@ -518,7 +652,7 @@ class Files(unittest.TestCase):
             quant, missing, urls = asked.pop()
             self.assertEqual(missing, [TRUNK])
             self.assertEqual([u.split("/resolve/")[1] for u in urls],
-                             ["0" * 40 + "/Maya-XS-8GB/" + TRUNK, "0" * 40 + "/Maya-XS/" + NGRAM])
+                             ["main/Maya-XS-8GB/" + TRUNK, "0" * 40 + "/Maya-XS/" + NGRAM])
             self.assertTrue((low / NGRAM).samefile(std / NGRAM))      # (one copy on the disk)
             self.assertTrue(any("linked from" in s for s in self.said))
             self.put(low, body, small)

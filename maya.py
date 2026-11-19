@@ -8038,14 +8038,57 @@ def set_up_mm3(a, prev: dict) -> Path | None:
 # ------------------------------------------------------------------------------------------------ CYBER-FROST-3.8-PS
 def hy4_layouts(q: dict) -> dict:
     """A size's layouts as the manifest lists them, {name: {"files", "plan", "about"}}: its own ("standard") first,
-    then its "layouts" (another trunk for cards the standard one does not fit) - only those with files."""
+    then its "layouts" (another trunk for cards the standard one does not fit) - only those with files.  "published":
+    false switches a size or a layout off whatever else it lists; "hub" (a layout whose file may be uploaded after a
+    release): the setup asks Hugging Face whether the file is there when no folder here has it (hy4_on_hub)."""
     out = {}
+    if q.get("published", True) is False:
+        return out
     if q.get("files"):
-        out[HY4_STANDARD] = {"files": q["files"], "plan": q.get("plan") or {}, "about": ""}
+        out[HY4_STANDARD] = {"files": q["files"], "plan": q.get("plan") or {}, "about": "", "published": True}
     for k, v in (q.get("layouts") or {}).items():
-        if v.get("files"):
-            out[k] = {"files": v["files"], "plan": v.get("plan") or {}, "about": v.get("about", "")}
+        if v.get("files") and v.get("published", True) is not False:
+            out[k] = {"files": v["files"], "plan": v.get("plan") or {}, "about": v.get("about", ""),
+                      "published": v.get("published", True)}
     return out
+
+
+_HY4_HUB = {}
+
+
+def hy4_on_hub(repo: str, rel: str, size: int, sha: str, revision: str = "main"):
+    """Whether Hugging Face has the file `rel` of a repo with this size and sha256 (one HEAD request, not followed to
+    the CDN; asked once per run): the commit it is at (a str), False (not there, or another file), None (no answer)."""
+    import urllib.error
+    import urllib.request
+    key = (repo, rel, revision)
+    if key not in _HY4_HUB:
+        class NoRedirect(urllib.request.HTTPRedirectHandler):
+            def redirect_request(self, *a, **k):
+                return None
+        url = HF.format(repo=repo, revision=revision, path=rel)
+        try:
+            urllib.request.build_opener(NoRedirect).open(urllib.request.Request(url, method="HEAD"), timeout=20)
+            got = False                                # (a plain file, not an LFS one: not a model file)
+        except urllib.error.HTTPError as e:
+            h = e.headers
+            if e.code in (301, 302, 303, 307, 308) and h.get("X-Linked-Size"):
+                same = int(h["X-Linked-Size"]) == int(size) and (h.get("X-Linked-Etag") or "").strip('"') == sha
+                got = (h.get("X-Repo-Commit") or revision) if same else False
+            else:
+                got = False if e.code in (401, 403, 404) else None
+        except (OSError, ValueError):
+            got = None
+        _HY4_HUB[key] = got
+    return _HY4_HUB[key]
+
+
+def hy4_layout_hub(quant: str, layout: str):
+    """hy4_on_hub for the trunk of a layout the table marks "published": "hub"."""
+    man = read_json(HY4_MANIFEST)
+    lay = hy4_layouts(hy4_quant_table(quant)).get(layout) or {}
+    rel, (size, sha) = next(iter(lay["files"].items()))
+    return hy4_on_hub(man.get("repo", ""), rel, size, sha)
 
 
 def hy4_quant_table(quant: str) -> dict:
@@ -8060,7 +8103,8 @@ def hy4_published(quant: str, layout: str = HY4_STANDARD) -> bool:
     lay = hy4_layouts(hy4_quant_table(quant)).get(layout)
     files = list((lay or {}).get("files", {}).values()) + list((man.get("ngram") or {}).values())
     return bool(man.get("revision")) and bool(lay) and bool(man.get("ngram")) and \
-        all(isinstance(v, list) and len(v) == 2 and v[0] and v[1] for v in files)
+        all(isinstance(v, list) and len(v) == 2 and v[0] and v[1] for v in files) and \
+        (lay.get("published") != "hub" or bool(hy4_layout_hub(quant, layout)))
 
 
 def hy4_entry(quant: str, layout: str = HY4_STANDARD) -> dict:
@@ -8083,9 +8127,13 @@ def hy4_entry(quant: str, layout: str = HY4_STANDARD) -> dict:
     nname, nfolder = Path(npath).name, Path(npath).parent.as_posix()
     files[nname] = nfile                               # (the trunk first, the n-gram table last: the set's order)
     rev = man.get("revision") or ""
+    # (a layout uploaded after the release is at a later commit than the table's: the one the Hub answered with,
+    #  its file still checked against the table's sha256)
+    trunk_rev = (_HY4_HUB.get((man["repo"], next(iter(lay["files"])), "main")) or "main") \
+        if rev and lay.get("published") == "hub" else rev
     about = q.get("about", "GGUF") + (f"; {lay['about']}" if lay["about"] else "")
     m = {"about": f"Maya's quant of {HY4} ({about}); {man.get('license', 'Tencent Hy License')}",
-         "format": "hy4-gguf", "repo": man["repo"], "revision": rev, "folder": "" if folder == "." else folder,
+         "format": "hy4-gguf", "repo": man["repo"], "revision": trunk_rev, "folder": "" if folder == "." else folder,
          "files": {k: v[0] for k, v in files.items()}, "sha256": {k: v[1] for k, v in files.items()},
          "ngram": nname, "ngram_gb": nfile[0] / 1e9, "download_gb": sum(v[0] for v in files.values()) / 1e9,
          "memory_gb": float(q.get("memory_gb") or 0), "plan": dict(lay["plan"]), "layout": layout,
@@ -8377,16 +8425,33 @@ def write_config_hy4(a, pc: dict, meta: dict, pack: Path, ctx: int, models: Path
     return cfg_path
 
 
-def hy4_fit_step(a, pc: dict, quant: str, prev_ctx: int | None = None) -> dict:
+def hy4_fit_step(a, pc: dict, quant: str, prev_ctx: int | None = None, have=None) -> dict:
     """The layout and the context of a size on the cards chosen (hy4_fit), said; what does not fit stops the setup
     here, before any download.  --model-dir: the layout of the trunk in that folder.  The context: --context, else
-    asked among those that fit (the one set up before, else the recommended one)."""
+    asked among those that fit (the one set up before, else the recommended one).  A layout the table marks
+    "published": "hub" must be in a folder here already (--model-dir, or have(layout): the folder the setup would
+    use) or on Hugging Face now - else the setup stops with a plain line, before any build or download."""
     q = hy4_quant_table(quant)
     name = Q.shown("hy4", quant)
     if not hy4_layouts(q):
         hy4_entry(quant)                               # (a size with no files yet: its own message)
     forced = hy4_layout_in(Path(a.model_dir).expanduser(), quant) if a.model_dir else None
     fit = hy4_fit(q, pc["gpus"], a.context, layout=forced)
+    if "error" not in fit and hy4_layouts(q)[fit["layout"]].get("published") == "hub" and not forced and \
+            read_json(HY4_MANIFEST).get("revision") and \
+            not (have and hy4_layout_in(have(fit["layout"]), quant) == fit["layout"]):
+        hub = hy4_layout_hub(quant, fit["layout"])     # (no folder here has this layout's file: is it uploaded?)
+        std = hy4_layouts(q).get(HY4_STANDARD)
+        what = "8 GB-card" if fit["layout"] == "8gb" else f"{fit['layout']}-layout"
+        if hub is None:
+            fail(f"{name}: Hugging Face did not answer, so the setup cannot tell whether the {what} file is there",
+                 f"check the connection and run {ME} --setup again")
+        if not hub:
+            fail(f"{name}: the {what} file is not published yet" +
+                 (f" (this PC has {fit['usable']:.1f} GB of free VRAM; the standard file needs about "
+                  f"{hy4_fit_need_gib(std['plan'], HY4_CONTEXTS[0]):.1f} GB there)" if std else ""),
+                 f"run {ME} --setup again later: the file is used by itself once it is on Hugging Face (no update "
+                 "needed); a card with about 10 GB of VRAM or more runs the standard file now")
     if "error" not in fit and not a.context and not getattr(a, "check", False):
         ctx = choose_context(a, prev_ctx, fit["contexts"], fit["recommended"])
         fit = hy4_fit(q, pc["gpus"], ctx, layout=fit["layout"])
@@ -8416,15 +8481,15 @@ def set_up_hy4(a, prev: dict) -> Path | None:
     pc = check_pc(a, "hy4")                            # 1
     step(2, "your choices")                            # 2
     ok(f"files: {name} (Maya's quant)")
-    fit = hy4_fit_step(a, pc, quant, prev_ctx)
+    models = (Path(a.models_dir).expanduser().resolve() if a.models_dir else
+              Path(inst["models_dir"]) if inst.get("models_dir") else ROOT.parent / "Maya-data" / "models")
+    fit = hy4_fit_step(a, pc, quant, prev_ctx, lambda lay: hy4_dir(a, models, prev, quant, lay))
     total, _ = mem_gb()
     vram = sum(g["vram_gb"] for g in pc["gpus"])
     need = float(hy4_quant_table(quant).get("memory_gb") or 0)
     if total > 0 and vram + total < need:
         warn(f"{vram:.0f} GB of VRAM and {total:.0f} GB of RAM: below the ~{need:.0f} GB that hold all of {name} - "
              "slower: parts of the model are then read from the SSD")
-    models = (Path(a.models_dir).expanduser().resolve() if a.models_dir else
-              Path(inst["models_dir"]) if inst.get("models_dir") else ROOT.parent / "Maya-data" / "models")
     d = hy4_dir(a, models, prev, quant, fit["layout"])
     ok(f"model folder: {d}")
     llama = tools_step(a)                              # 3
