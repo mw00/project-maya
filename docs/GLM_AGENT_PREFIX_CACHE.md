@@ -115,11 +115,61 @@ source or binary**. An earlier completion window failed its quality gate; a
 later startup-format failure completed no candidate loads or test requests.
 Those outcomes are not retroactively converted into passes.
 
-No speedup is claimed here. The default 1024-token completion threshold, default
-speculative completion behavior, real agent workloads, P99, long multi-user
-operation, and completion-tail cross-context/SSD-restart quality remain outside
-that narrow historical diagnostic. A host fixture cannot close these gaps.
-Enabling this experimental feature is not a recommendation to deploy it broadly.
+### Repeated GPU measurements at `094d8d5`
+
+Both comparisons used GLM-5.3-Flash-Maya-L on four RTX 4090 GPUs at 255 W.
+Each run started a fresh engine with an empty slot directory. Ordinary RAM
+(80 GiB) and disk (32 GiB) slots were enabled throughout. The two experimental
+settings were switched together at their default 1024-token completion threshold.
+MTP and DFlash were disabled.
+
+The upstream `agent_bench` workload ran for 300 seconds with two clients, twice
+per setting. Across the 27 inputs common to all four runs, each run reused
+187,208 of 239,108 input tokens (78.29%) and generated 6,279 tokens. Neither
+enabled run saved or restored a learned entry. The longest answer was 816 tokens,
+and the benchmark supplied scripted history on the following turn. Enabling the
+features reduced mean end-to-end latency by 4.89% in one repeat and increased it
+by 2.21% in the other. Outputs matched token for token on 1/27 and 2/27 paired
+requests; repeating the same setting matched on 2/27 in each case.
+
+AIPerf 0.11.0 replayed four branches sharing 5,129 prompt tokens via streaming
+Chat Completions. Two branches generated long answers and carried the complete
+response text into their next requests. The client ran six requests in each
+fresh engine, twice per setting. Temperature was zero, thinking was disabled,
+and the same seed was used throughout.
+
+| Turn | Mean TTFT, off / on (s) | Mean end-to-end, off / on (s) | End-to-end saving (s) |
+|---|---:|---:|---:|
+| First short branch | 3.16 / 3.06 | 3.21 / 3.10 | +0.10 |
+| Second short branch | 2.77 / 3.58 | 2.84 / 3.64 | -0.80 |
+| Free-form answer | 2.88 / 0.54 | 36.72 / 33.77 | +2.95 |
+| Follow-up using that answer | 1.37 / 0.96 | 2.15 / 1.68 | +0.46 |
+| Structured list | 3.50 / 1.80 | 28.80 / 27.13 | +1.67 |
+| Follow-up using that list | 0.89 / 1.12 | 0.98 / 1.20 | -0.22 |
+
+Six-turn wall time fell from 75.81 to 71.18 s and from 73.93 to 70.25 s. The
+mean saving was 4.16 s (5.55%). Wall time includes intervals between requests
+and excludes model loading and shutdown.
+
+Each enabled run restored the 5,129-token shared prefix twice and restored
+both completion tails from RAM. The long turns generated 1,152 and 1,026 tokens.
+The next prompts contained each full answer and restored 1,151 and 1,025
+committed output tokens respectively (6,327 and 7,791 total cached tokens).
+The native restore messages, persisted token keys, HTTP usage and generated
+token IDs agreed on all eight feature hits. Ordinary slots supplied the only
+four hits in the disabled runs. Total input-token reuse rose from 23,880 to
+48,752 out of 72,758 tokens (32.82% to 67.01%).
+
+In each paired comparison, five requests had identical inputs. Four of those
+matched on output IDs, visible text and finish reason, including the structured
+list and its follow-up. The free-form answer first differed at output token 14,
+including when repeating the same setting. Its follow-up therefore received
+different inputs. The 0.46 s average reduction on that follow-up also includes
+a 30-token response in one enabled run versus 32 tokens in the other three.
+The structured follow-up matched on input and output in all four runs but took
+0.22 s longer on average with the completion hit. This sample measures a
+single-client branching workload; it cannot establish general output parity
+or a throughput improvement for other workloads.
 
 ### Lifecycle fixes and remaining Ready gates
 
@@ -183,6 +233,6 @@ prompt tokens from an ordinary disk slot after process restart and matched all
 10 cold output token IDs and the stop reason. Changed weights were exercised
 only in host fixtures.
 
-Separate model-level checks are still needed for completion-tail restoration
-across contexts and process restarts, the default 1024-token threshold, and
-quality and performance under a multi-agent workload.
+The scope of these measurements leaves open numerical equivalence across
+workloads, speculative completion, completion-tail restoration across context
+switches and SSD restarts, and sustained multi-user latency including P99.
