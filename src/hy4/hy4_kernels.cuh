@@ -76,6 +76,8 @@ void sigmoid_mul(float* x, const float* g, size_t n, cudaStream_t s);
 void swiglu(const float* g, const float* u, size_t ldg, int rows, int n, float* h, size_t ldh, cudaStream_t s);
 /// y += x, n values
 void add(float* y, const float* x, size_t n, cudaStream_t s);
+/// y += x w (each value by its own weight), n values
+void addmul(float* y, const float* x, const float* w, size_t n, cudaStream_t s);
 
 /// The router: logits [T][n_exp] -> sigmoid, top n_used by sigmoid + bias (bias may be null), weights = the picks'
 /// sigmoids (/ their sum when norm) * scale -> ids [T][n_used], w [T][n_used]

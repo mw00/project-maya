@@ -620,6 +620,10 @@ __global__ void add_kernel(float* y, const float* x, size_t n) {
     const size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) y[i] += x[i];
 }
+__global__ void addmul_kernel(float* y, const float* x, const float* w, size_t n) {
+    const size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) y[i] += x[i] * w[i];
+}
 
 // ---------------------------------------------------------------- the router and the experts' bookkeeping
 // a block (1024 threads) a token: n_exp <= 1024 candidates (sigmoid + bias, the index) bitonic-sorted in shared memory
@@ -1525,6 +1529,10 @@ void swiglu(const float* g, const float* u, size_t ldg, int rows, int n, float* 
 void add(float* y, const float* x, size_t n, cudaStream_t s) {
     add_kernel<<<(unsigned) ((n + 255) / 256), 256, 0, s>>>(y, x, n);
     check("add");
+}
+void addmul(float* y, const float* x, const float* w, size_t n, cudaStream_t s) {
+    addmul_kernel<<<(unsigned) ((n + 255) / 256), 256, 0, s>>>(y, x, w, n);
+    check("addmul");
 }
 void router(const float* logits, int T, int n_exp, const float* bias, int n_used, bool norm, float scale, int* ids,
             float* w, cudaStream_t s) {

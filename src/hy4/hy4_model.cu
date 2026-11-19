@@ -146,16 +146,21 @@ void bf16_to_f32(const uint16_t* src, size_t n, float* dst) {
 }
 // ggml's quantize_row_q8_0_ref over rows of k BF16 values (k % 32 == 0), on `threads` threads: the MTP block's BF16
 // matrices and experts as the GEMVs and the experts' kernels read them (Q8_0: 34 bytes a 32 values)
-void bf16_to_q8_0(const uint16_t* src, size_t rows, int k, uint8_t* dst, int threads = 16) {
+// (fsrc: the rows as F32 instead - the same rounding)
+void bf16_to_q8_0(const uint16_t* src, size_t rows, int k, uint8_t* dst, int threads = 16, const float* fsrc = nullptr) {
     auto work = [&](size_t r0, size_t r1) {
         float v[32];
         for (size_t r = r0; r < r1; ++r)
             for (int b = 0; b < k / 32; ++b) {
-                const uint16_t* x = src + r * (size_t) k + (size_t) b * 32;
+                const size_t at = r * (size_t) k + (size_t) b * 32;
                 float am = 0.0f;
                 for (int i = 0; i < 32; ++i) {
-                    const uint32_t u = (uint32_t) x[i] << 16;
-                    std::memcpy(&v[i], &u, 4);
+                    if (fsrc) {
+                        v[i] = fsrc[at + (size_t) i];
+                    } else {
+                        const uint32_t u = (uint32_t) src[at + (size_t) i] << 16;
+                        std::memcpy(&v[i], &u, 4);
+                    }
                     am = std::max(am, std::fabs(v[i]));
                 }
                 const float d = am / 127.0f, id = d != 0.0f ? 1.0f / d : 0.0f;
@@ -255,6 +260,8 @@ struct Layer {
     bool partial() const { return tpm < 0 && !dense && !mtp && n_res < (int) slot_of.size(); }
     // the MTP block (il == n_layer): its input norms and projection, and its output's norm (no hyper-connections)
     bool mtp = false;
+    // a DFly2 draft layer: no indexer and no cache of its own - kv is its trunk layer's, the keys the drafter's lists
+    bool ext = false;
     float *enorm = nullptr, *hnorm = nullptr, *head_norm = nullptr;
     Mat eh_proj;
     uint16_t* kv = nullptr;      // the latent cache: rows of kv_lora + rope F16
@@ -375,6 +382,39 @@ struct Model::Impl {
         cudaSetDevice(G[(size_t) head_gpu].dev);
         cudaStreamWaitEvent(G[(size_t) head_gpu].s, ev_mtp, 0);
     }
+    // The DFly2 drafter (Options::dfly2; the pack's dfly_* lines and model.dfly_layers.* tensors), on the head's GPU:
+    // n dense layers, layer i reading trunk layer tgt[i]'s latent cache and the picks that layer's indexer made for the
+    // last accepted position; the fusion of the trunk's last state into the query block's first row, the final norm
+    // and the hidden correction before the head.  One pass proposes up to W - 1 tokens.
+    struct Dfly {
+        bool on = false;
+        int n = 0, H = 0, mask = -1, n_def = 5, ff = 0, ldk = 0;
+        std::vector<int> tgt;
+        std::vector<Layer> L;
+        float *enorm = nullptr, *hnorm = nullptr, *fgate = nullptr, *fin_norm = nullptr, *c_hnorm = nullptr,
+              *c_enorm = nullptr;
+        Mat eh_proj, c_gate, c_up, c_down;
+        // the block's rows [W][E] (x), its first row's embedding (e0), a 2 E input row (in), a row (t), the normed
+        // states [W][E] (h), the correction's gate | up (cg) and product (ch), the FFN's own scratch (gu, hd), top1's
+        float *x = nullptr, *e0 = nullptr, *in = nullptr, *t = nullptr, *h = nullptr, *cg = nullptr, *ch = nullptr,
+              *gu = nullptr, *hd = nullptr, *top = nullptr;
+        float* ws = nullptr;                    // (the attention's partial sums, when the GPU's own is too small)
+        float* h_emb = nullptr;                 // pinned [W][E]
+        // each trunk layer's picks of its last window's rows [n][W][maxk] and their counts [n][W] (device), the
+        // window's first position and rows (a prompt chunk: its last row alone); the query block's lists (device)
+        int *snap = nullptr, *snap_nk = nullptr, *keys = nullptr, *nk = nullptr;
+        int64_t snap_p0 = -1;
+        int snap_T = 0;
+        const int *cur_keys = nullptr, *cur_nk = nullptr;   // (the layer in flight: attn_core's external keys)
+        size_t vram = 0;
+        long long rounds = 0;
+        int slot(int il) const {
+            for (int i = 0; i < n; ++i)
+                if (tgt[(size_t) i] == il) return i;
+            return -1;
+        }
+    } df;
+    const char* dfly_dump = std::getenv("HY4_DFLY_DUMP");   // (tests: one draft round's inputs and states, dfly_draft)
     // the CPU lane (the plan put some experts there): its threads, and the pinned rows the FFNs hand it
     std::unique_ptr<Lane> lane;
     std::thread placer;               // (place_experts in the background: the CPU lane's experts over the NUMA nodes)
@@ -516,6 +556,7 @@ struct Model::Impl {
         if (eg_dump) std::fclose(eg_dump);
         if (h_pos) cudaFreeHost(h_pos);
         if (h_emb) cudaFreeHost(h_emb);
+        if (df.h_emb) cudaFreeHost(df.h_emb);
         if (h_ids) cudaFreeHost(h_ids);
         if (h_w) cudaFreeHost(h_w);
         if (h_lat) cudaFreeHost(h_lat);
@@ -847,6 +888,19 @@ struct Model::Impl {
         cudaFree(c);
         return best;
     }
+    // the DFly2 drafter's VRAM on the head's GPU (Options::dfly2 and a pack that has it; else 0): hy4_plan.hpp's
+    // dfly_bytes over the pack's tensors
+    double dfly_plan_bytes() const {
+        if (!o.dfly2 || pk.num("dfly_layers") < 1) return 0;
+        double file = 0;
+        const std::string pre = "model.dfly_layers.";
+        for (const auto& [n, t] : pk.t)
+            if (n.compare(0, pre.size(), pre) == 0) file += (double) t.bytes + 256;
+        const Tensor* ot = pk.get("output.weight");
+        const double head = ot && ot->type == "BF16" ? (double) g.n_vocab * (double) iq::row_bytes(iq::kQ4_K, g.n_embd) : 0;
+        return dfly_bytes(file, head, (long long) pk.num("dfly_layers"), W, g.ix_top_k + g.ix_kpool, g.n_embd,
+                          (long long) pk.num("dfly_ff"));
+    }
     bool plan(std::string& err) {
         int ndev = 0;
         CK(cudaGetDeviceCount(&ndev));
@@ -995,6 +1049,7 @@ struct Model::Impl {
         double head_b = (ot ? (double) ot->bytes : 0) + (double) g.n_vocab * W * 4 + (64u << 20) +
                         (double) ring * g.n_embd * 4;   // (the states' ring)
         if (o.mtp && g.n_mtp > 0) head_b += (double) layer_bytes(g.n_layer) * 0.56 + mtp_rows_bytes(Tc, g.n_embd);
+        head_b += dfly_plan_bytes();
         L.resize((size_t) g.n_layer);
         free_b[(size_t) main_gi] -= head_b;   // (the head and the MTP block on the main GPU)
         // the layers over the GPUs in order, each with `rho` of its routed experts in VRAM (the others on the CPU
@@ -1184,6 +1239,7 @@ struct Model::Impl {
         double head_b0 = (ot0 ? (double) ot0->bytes : 0) + (double) g.n_vocab * W * 4 + (64u << 20) +
                          (double) ring * g.n_embd * 4;
         if (o.mtp && g.n_mtp > 0) head_b0 += (double) layer_bytes(g.n_layer) * 0.56 + mtp_rows_bytes(Tc, g.n_embd);
+        head_b0 += dfly_plan_bytes();
         if (own) head_b0 += (double) scratch_bytes();   // (the MTP pass's own scratch: a whole chunk's buffers)
         double exp_all = 0;   // (every routed expert's bytes)
         for (const auto& [n, t] : pk.t)
@@ -1248,6 +1304,7 @@ struct Model::Impl {
         double head_b = (ot ? (double) ot->bytes : 0) + (double) g.n_vocab * W * 4 + (64u << 20) +
                         (double) ring * g.n_embd * 4;
         if (o.mtp && g.n_mtp > 0) head_b += (double) layer_bytes(g.n_layer) * 0.56 + mtp_rows_bytes(Tc, g.n_embd);
+        head_b += dfly_plan_bytes();
         if (own) head_b += (double) scratch_bytes();
         for (int i : mem) {
             const double have = free_b[(size_t) i] - (i == head_gpu ? head_b : 0.0);
@@ -1822,6 +1879,10 @@ struct Model::Impl {
     bool load(const Options& opt, std::string& err) {
         const double t0 = now_s();
         o = opt;
+        if (o.mtp && o.dfly2) {
+            err = "--mtp and --dfly2: one drafter at a time (the MTP block, or the DFly2 drafter)";
+            return false;
+        }
         if (!pk.load(o.pack, err)) return false;
         g = pk.g;
         if (o.max_ctx <= 0 || o.max_ctx > g.context) o.max_ctx = g.context;
@@ -2113,7 +2174,8 @@ struct Model::Impl {
                           now_s() - tm);
             info.push_back(buf);
         }
-        if (g.n_mtp == 0)   // (a set without the MTP block - the public release's layout: every token by the model itself)
+        if (o.dfly2 && !dfly_load(err)) return false;
+        if (g.n_mtp == 0 && !o.dfly2)   // (a set without the MTP block - the public release's layout: every token by the model itself)
             info.push_back(std::string("INFO no MTP draft block in this model's files: decoding without drafts") +
                            (o.mtp ? " (--mtp has nothing to load)" : ""));
         if (out.type != kBF16 && out.type != kF32 && !iq::mv_supported(out.type)) {
@@ -2604,15 +2666,31 @@ struct Model::Impl {
                 const int n_pool = (int) ((p0 + t0 + ts - 1) / KP);
                 // the picks are every pool the tokens see until a token sees more than `top` of them
                 const bool all = n_pool <= top;
-                if (T > W && all && attn_prompt(l, gp, t0, ts, p0, true, scale, dq)) continue;
+                // (the DFly2 drafter reads this layer's picks of the last accepted position: a token window's rows, a
+                //  prompt chunk's last - made there too where the dense path needs none)
+                const int dsl = df.on && (T <= W || t0 + ts == T) ? df.slot(l.il) : -1;
+                if (T > W && all && attn_prompt(l, gp, t0, ts, p0, true, scale, dq)) {
+                    if (dsl >= 0) {
+                        k::ix_score(gp.iq + (size_t) t0 * IH * D, gp.wt + (size_t) t0 * IH, ts, IH, D, l.pooled,
+                                    gp.pos + t0, KP, n_pool, gp.score, npool_ld, s, kv_q8);
+                        k::ix_select(gp.score, npool_ld, ts, gp.pos + t0, KP, top, gp.keys + (size_t) t0 * maxk, maxk,
+                                     gp.knk + t0, s);
+                        ok = ok && dfly_snap(dsl, gp, T, p0, err);
+                    }
+                    continue;
+                }
                 k::ix_score(gp.iq + (size_t) t0 * IH * D, gp.wt + (size_t) t0 * IH, ts, IH, D, l.pooled, gp.pos + t0,
                             KP, n_pool, gp.score, npool_ld, s, kv_q8);
                 k::ix_select(gp.score, npool_ld, ts, gp.pos + t0, KP, top, gp.keys + (size_t) t0 * maxk, maxk,
                              gp.knk + t0, s);
+                if (dsl >= 0) ok = ok && dfly_snap(dsl, gp, T, p0, err);
                 if (T > W && attn_prompt(l, gp, t0, ts, p0, false, scale, dq)) continue;
                 k::attention(gp.qcat + (size_t) t0 * H * KR, ts, H, KL, R, l.kv, 0, gp.keys + (size_t) t0 * maxk, maxk,
                              nullptr, gp.knk + t0, maxk, scale, l.sinks, gp.ws, gp.o + (size_t) t0 * H * KL, s, kv_q8);
             }
+        } else if (l.ext) {   // (a DFly2 draft layer: the drafter's lists over its trunk layer's cache; T <= W)
+            k::attention(gp.qcat, T, H, KL, R, l.kv, 0, df.cur_keys, df.ldk, nullptr, df.cur_nk, df.ldk, scale, l.sinks,
+                         df.ws ? df.ws : gp.ws, gp.o, s, kv_q8);
         } else {
             for (int t0 = 0; t0 < T; t0 += kSub) {
                 const int ts = std::min(kSub, T - t0);
@@ -2910,7 +2988,10 @@ struct Model::Impl {
                     for (char c : used) n_u += c;
                     const double est_cpu = n_ent * cpu_us_et * 1e-3;   // (ms)
                     const double est_stream = (double) n_u * l.blob * (1.0 / (gp.h2d_gbs * 1e6) + 1.0 / (copy_gbs * 1e6));
-                    if (est_stream < est_cpu) {
+                    // (tests, HY4_STREAM=1 / 0: always / never - the choice is by measured times, so two runs of one
+                    //  prompt may differ in which path summed an expert: the same ids only with it fixed)
+                    static const char* fs = std::getenv("HY4_STREAM");
+                    if (fs ? fs[0] == '1' : est_stream < est_cpu) {
                         const double ts = now_s();
                         const double c0 = st.stream_ms;
                         ok = ok && experts_streamed(l, gp, T, err);
@@ -3203,6 +3284,354 @@ struct Model::Impl {
             cur = id;
             const int last_row = i == 0 ? (int) ((rows.size() - 1) % (size_t) Tc) : 0;   // (the first step's last row)
             CK(cudaMemcpyAsync(mtp_hin, mtp_out + (size_t) last_row * g.n_embd, rb, cudaMemcpyDeviceToDevice, hg.s));
+        }
+        if (k::errors()) {
+            err = "a kernel failed (above)";
+            return false;
+        }
+        return true;
+    }
+
+    // ------------------------------------------------------------ the DFly2 drafter
+    // A trunk layer's picks kept for the drafter (slot i; gp.keys / gp.knk hold the window's): a token window's rows, a
+    // prompt chunk's last row
+    bool dfly_snap(int i, Gpu& gp, int T, int64_t p0, std::string& err) {
+        const size_t maxk = (size_t) g.ix_top_k + g.ix_kpool;
+        int *sk = df.snap + (size_t) i * W * maxk, *sn = df.snap_nk + (size_t) i * W;
+        const int r0 = T <= W ? 0 : T - 1, nr = T <= W ? T : 1;
+        CK(cudaMemcpyAsync(sk, gp.keys + (size_t) r0 * maxk, sizeof(int) * nr * maxk, cudaMemcpyDeviceToDevice, gp.s));
+        CK(cudaMemcpyAsync(sn, gp.knk + r0, sizeof(int) * nr, cudaMemcpyDeviceToDevice, gp.s));
+        df.snap_p0 = p0 + r0;
+        df.snap_T = nr;
+        return true;
+    }
+    bool dfly_load(std::string& err) {
+        Gpu& hg = G[(size_t) head_gpu];
+        CK(cudaSetDevice(hg.dev));
+        const size_t used0 = hg.used;
+        const int E = g.n_embd, KL = g.kv_lora, KR = g.kv_row(), nope = g.nope(), km = g.k_mla, vm = g.v_mla;
+        const size_t maxk = (size_t) g.ix_top_k + g.ix_kpool;
+        df.n = (int) pk.num("dfly_layers");
+        df.H = (int) pk.num("dfly_heads");
+        df.mask = (int) pk.num("dfly_mask", -1);
+        df.n_def = std::max(1, std::min(W - 1, (int) pk.num("dfly_tokens", 5)));
+        df.ff = (int) pk.num("dfly_ff");
+        df.tgt = pk.ints("dfly_targets");
+        if (df.n < 1) {
+            err = "--dfly2: this pack has no DFly2 drafter (the drafter's file - a GGUF of general.type drafter - beside "
+                  "the model's, then tools/hy4/pack_gguf.py again)";
+            return false;
+        }
+        const size_t sff = (size_t) (hg.sFF ? hg.sFF : g.n_ff);
+        const size_t qk = std::max({(size_t) hg.sH * vm, sff, (size_t) hg.sH * KL, (size_t) g.q_lora, (size_t) E});
+        if ((int) df.tgt.size() != df.n || df.H < 1 || df.H > hg.sH || df.mask < 0 || df.mask >= g.n_vocab ||
+            df.ff < 256 || df.ff % 256 || (size_t) df.ff > qk || (size_t) 2 * E > qk) {
+            err = "--dfly2: a drafter geometry maya-hy4 does not run (the pack's dfly_* lines)";
+            return false;
+        }
+        // (a layout the drafter does not run in yet: no drafts, said so - the model itself is unchanged)
+        std::string why;
+        if (tp > 1) why = "tensor parallel";
+        for (int i = 0; i < df.n; ++i) {
+            const int il = df.tgt[(size_t) i];
+            if (il < 0 || il >= g.n_layer || !L[(size_t) il].ix || L[(size_t) il].ring != 0 || df.slot(il) != i) {
+                err = "--dfly2: the drafter reads layer " + std::to_string(il) + ", which is no indexed layer of this model";
+                return false;
+            }
+            if (why.empty() && L[(size_t) il].gpu != head_gpu)
+                why = "layer " + std::to_string(il) + " on GPU " + std::to_string(G[(size_t) L[(size_t) il].gpu].dev) +
+                      ", the head on GPU " + std::to_string(hg.dev);
+        }
+        if (!why.empty()) {
+            info.push_back("INFO the DFly2 drafter runs with the layers it reads (" + pk.str("dfly_targets") +
+                           ") and the head on one GPU, without tensor parallel (here: " + why +
+                           "): decoding without drafts");
+            return true;
+        }
+        const std::string top = "model.dfly_layers.";
+        t_round_bf16 = true;   // (a BF16 drafter: its matrices rounded to Q8_0, as the MTP block's)
+        struct Unround {
+            ~Unround() { t_round_bf16 = false; }
+        } unround;
+        df.L.resize((size_t) df.n);
+        for (int i = 0; i < df.n; ++i) {
+            Layer& l = df.L[(size_t) i];
+            const std::string p = top + std::to_string(i) + ".", a = p + "self_attn.";
+            l.il = g.n_layer + 1 + i;
+            l.gpu = head_gpu;
+            l.H = df.H;
+            l.ext = l.dense = true;
+            l.base = L[(size_t) df.tgt[(size_t) i]].base;   // (its trunk layer's RoPE: its rows sit in that cache)
+            l.kv = L[(size_t) df.tgt[(size_t) i]].kv;
+            l.ring = 0;
+            if (!f32(hg, p + "input_layernorm.weight", l.attn_norm, err, E) ||
+                !f32(hg, p + "post_attention_layernorm.weight", l.ffn_norm, err, E) ||
+                !f32(hg, a + "post_proj_norm.weight", l.post_attn, err, E) ||
+                !f32(hg, a + "q_a_layernorm.weight", l.q_a_norm, err, g.q_lora) ||
+                !f32(hg, a + "kv_a_layernorm.weight", l.kv_a_norm, err, KL) ||
+                !f32(hg, a + "learnable_sink_param", l.sinks, err, df.H) ||
+                !mat(hg, a + "q_a_proj.weight", l.q_a, err, E, g.q_lora) ||
+                !mat(hg, a + "q_b_proj.weight", l.q_b, err, g.q_lora, df.H * km) ||
+                !mat(hg, a + "kv_a_proj_with_mqa.weight", l.kv_a, err, E, KR) ||
+                !mat(hg, a + "linear_gate.weight", l.gate, err, E, df.H * vm) ||
+                !mat(hg, a + "o_proj.weight", l.wo, err, df.H * vm, E) ||
+                !mat(hg, p + "mlp.gate_proj.weight", l.ffn_gate, err, E, df.ff) ||
+                !mat(hg, p + "mlp.up_proj.weight", l.ffn_up, err, E, df.ff) ||
+                !mat(hg, p + "mlp.down_proj.weight", l.ffn_down, err, df.ff, E))
+                return false;
+            // kv_b_proj [H (nope + v)][kv_lora]: a head's value rows as they are (v_b), its key rows transposed into
+            // the engine's k_b form [kv_lora][nope] (a query's nope part into the latent space) and rounded to Q8_0
+            const Tensor* t = need(a + "kv_b_proj.weight", err);
+            if (!t) return false;
+            const int type = type_id(t->type);
+            const size_t ld = row_bytes(type, KL);
+            if (!tok_type_ok(type) || type == kF32 || type == kF16 || ld == 0 || t->n(0) != KL ||
+                t->n(1) != (int64_t) df.H * (nope + vm) || ld * (size_t) t->n(1) != t->bytes || nope % 32) {
+                err = a + "kv_b_proj.weight: " + t->type + ", not a shape or type maya-hy4 reads there";
+                return false;
+            }
+            const uint8_t* src = pk.data(*t);
+            const bool bf = type == kBF16;
+            const size_t vld = bf ? row_bytes(8, KL) : ld;
+            std::vector<uint8_t> hv((size_t) df.H * vm * vld), hk((size_t) df.H * KL * row_bytes(8, nope));
+            std::vector<float> kf((size_t) nope * KL), tf((size_t) df.H * KL * nope);
+            for (int h = 0; h < df.H; ++h) {
+                const uint8_t* v0 = src + dfly_kvb_v_row(h, 0, nope, vm) * ld;
+                if (bf) bf16_to_q8_0((const uint16_t*) v0, (size_t) vm, KL, hv.data() + (size_t) h * vm * vld);
+                else std::memcpy(hv.data() + (size_t) h * vm * vld, v0, (size_t) vm * ld);
+                for (int r = 0; r < nope; ++r) tok_row(type, src + dfly_kvb_k_row(h, r, nope, vm) * ld, KL, kf.data() + (size_t) r * KL);
+                dfly_k_b(kf.data(), nope, KL, tf.data() + (size_t) h * KL * nope);
+            }
+            bf16_to_q8_0(nullptr, (size_t) df.H * KL, nope, hk.data(), 16, tf.data());
+            uint8_t *dv = nullptr, *dk = nullptr;
+            if (!hg.alloc(dv, hv.size(), err) || !hg.alloc(dk, hk.size(), err)) return false;
+            CK(cudaMemcpy(dv, hv.data(), hv.size(), cudaMemcpyHostToDevice));
+            CK(cudaMemcpy(dk, hk.data(), hk.size(), cudaMemcpyHostToDevice));
+            l.v_b.w = dv, l.v_b.type = bf ? 8 : type, l.v_b.k = KL, l.v_b.n = vm, l.v_b.batch = df.H, l.v_b.ld = vld;
+            l.k_b.w = dk, l.k_b.type = 8, l.k_b.k = nope, l.k_b.n = KL, l.k_b.batch = df.H, l.k_b.ld = row_bytes(8, nope);
+            for (const Mat* m : {&l.q_a, &l.q_b, &l.kv_a, &l.v_b, &l.wo, &l.gate, &l.ffn_gate, &l.ffn_up, &l.ffn_down})
+                if (!iq::mv_supported(m->type)) {
+                    err = p + ": a matrix type the drafter's kernels do not take (ggml's block types, or BF16)";
+                    return false;
+                }
+        }
+        if (!f32(hg, top + "mtp_fusion.enorm.weight", df.enorm, err, E) ||
+            !f32(hg, top + "mtp_fusion.hnorm.weight", df.hnorm, err, E) ||
+            !f32(hg, top + "mtp_fusion.gate", df.fgate, err, E) ||
+            !f32(hg, top + "final_norm.weight", df.fin_norm, err, E) ||
+            !f32(hg, top + "hidden_correction.hidden_norm.weight", df.c_hnorm, err, E) ||
+            !f32(hg, top + "hidden_correction.embed_norm.weight", df.c_enorm, err, E) ||
+            !mat(hg, top + "mtp_fusion.eh_proj.weight", df.eh_proj, err, 2 * E, E) ||
+            !mat(hg, top + "hidden_correction.gate_proj.weight", df.c_gate, err, 2 * E) ||
+            !mat(hg, top + "hidden_correction.up_proj.weight", df.c_up, err, 2 * E, df.c_gate.n) ||
+            !mat(hg, top + "hidden_correction.down_proj.weight", df.c_down, err, df.c_gate.n, E))
+            return false;
+        const int ci = df.c_gate.n;
+        if (ci % 32 || (size_t) ci > qk || !iq::mv_supported(df.eh_proj.type) || !iq::mv_supported(df.c_gate.type) ||
+            !iq::mv_supported(df.c_up.type) || !iq::mv_supported(df.c_down.type)) {
+            err = "--dfly2: the drafter's fusion / correction matrices are not ones maya-hy4 runs";
+            return false;
+        }
+        // the drafts' head: as the MTP block's (the model's BF16 head rounded to Q4_K; HY4_DRAFT_HEAD=q8: Q8_0)
+        const char* dh = std::getenv("HY4_DRAFT_HEAD");
+        if (out.type == kBF16 && !(dh && std::string(dh) == "q8")) {
+            if (!draft_head_q4k(hg, err)) return false;
+        } else if (out.type == kBF16) {
+            if (!mat(hg, "output.weight", out_draft, err, g.n_embd, g.n_vocab)) return false;
+        }
+        if (!out_draft) out_draft = out;
+        df.ldk = (int) maxk + W;
+        const size_t e = (size_t) E, w = (size_t) W;
+        if (!hg.alloc(df.x, w * e, err) || !hg.alloc(df.e0, e, err) || !hg.alloc(df.in, 2 * e, err) ||
+            !hg.alloc(df.t, e, err) || !hg.alloc(df.h, w * e, err) || !hg.alloc(df.cg, 2 * (size_t) ci, err) ||
+            !hg.alloc(df.ch, (size_t) ci, err) || !hg.alloc(df.gu, w * 2 * df.ff, err) ||
+            !hg.alloc(df.hd, w * df.ff, err) || !hg.alloc(df.top, 2, err) ||
+            !hg.alloc(df.snap, (size_t) df.n * w * maxk, err) || !hg.alloc(df.snap_nk, (size_t) df.n * w, err) ||
+            !hg.alloc(df.keys, (size_t) df.n * w * df.ldk, err) || !hg.alloc(df.nk, (size_t) df.n * w, err))
+            return false;
+        if (k::attn_ws_floats(W, df.H, KL, df.ldk) > k::attn_ws_floats(kSub, hg.sH, KL, (int) maxk) &&
+            !hg.alloc(df.ws, k::attn_ws_floats(W, df.H, KL, df.ldk), err))
+            return false;
+        CK(cudaMallocHost(&df.h_emb, sizeof(float) * w * e));
+        df.vram = hg.used - used0;
+        df.on = true;
+        char buf[240];
+        std::snprintf(buf, sizeof buf, "INFO the DFly2 drafter (drafts): %d layers over the caches of the trunk's layers %s, "
+                      "%.2f GB on GPU %d (up to %d tokens a pass)", df.n, pk.str("dfly_targets").c_str(),
+                      (double) df.vram / 1e9, hg.dev, W - 1);
+        info.push_back(buf);
+        return true;
+    }
+    // (tests, HY4_DFLY_DUMP=<dir>: n bytes at a device pointer - or a host one - into <dir>/<name>)
+    void dfly_file(const std::string& name, const void* p, size_t n, bool device, cudaStream_t s) {
+        std::vector<uint8_t> h(n);
+        if (device) {
+            cudaStreamSynchronize(s);
+            cudaMemcpy(h.data(), p, n, cudaMemcpyDeviceToHost);
+        } else {
+            std::memcpy(h.data(), p, n);
+        }
+        std::FILE* f = std::fopen((std::string(dfly_dump) + "/" + name).c_str(), "wb");
+        if (!f) return;
+        std::fwrite(h.data(), 1, n, f);
+        std::fclose(f);
+    }
+    // (... a trunk layer's cache rows [p0, p0 + n) as F16 [n][kv_row], an 8-bit cache's dequantized)
+    void dfly_cache_file(const std::string& name, const uint16_t* kv, int64_t p0, int64_t n, Gpu& hg) {
+        const size_t KR = (size_t) g.kv_row();
+        std::vector<uint16_t> h((size_t) n * KR);
+        cudaStreamSynchronize(hg.s);
+        if (!kv_q8) {
+            cudaMemcpy(h.data(), kv + (size_t) p0 * KR, h.size() * 2, cudaMemcpyDeviceToHost);
+        } else {
+            const int64_t cap = (int64_t) deq_rows();
+            for (int64_t a = 0; a < n; a += cap) {
+                const int64_t m = std::min(cap, n - a);
+                k::kv_deq(kv, 0, g.kv_lora, g.rope, (int) (p0 + a), (int) m, hg.kbuf, hg.s);
+                cudaStreamSynchronize(hg.s);
+                cudaMemcpy(h.data() + (size_t) a * KR, hg.kbuf, (size_t) m * KR * 2, cudaMemcpyDeviceToHost);
+            }
+        }
+        dfly_file(name, h.data(), h.size() * 2, false, hg.s);
+    }
+    // Up to n drafts after `tok` at position pos (the caches hold every position before it, the picks kept are those
+    // of the window that held pos - 1): one pass over the query block [tok, mask x n] at pos .. pos + n, then each
+    // draft from its row's state, corrected by the token before it; stops after a draft below `floor`.  The block's
+    // latent rows go into the trunk layers' caches at pos .. pos + n: the trunk rewrites a position's row before it
+    // reads it, so they are never read by it.
+    std::vector<int> df_pk, df_hk, df_hn;
+    bool dfly_draft(int tok, int64_t pos, int n, float floor, std::vector<int>& d, std::vector<float>& conf,
+                    std::string& err) {
+        d.clear();
+        conf.clear();
+        if (!df.on || n <= 0 || pos < 1) return true;
+        n = std::min(n, W - 1);
+        if (pos + n >= o.max_ctx) n = (int) std::max<int64_t>(0, o.max_ctx - pos - 1);
+        const int64_t row = pos - 1 - df.snap_p0;
+        if (n <= 0 || df.snap_p0 < 0 || row < 0 || row >= df.snap_T) return true;   // (no picks of pos - 1: no drafts)
+        if (tok < 0 || tok >= g.n_vocab) {
+            err = "token id " + std::to_string(tok) + " outside the vocabulary";
+            return false;
+        }
+        Gpu& hg = G[(size_t) head_gpu];
+        CK(cudaSetDevice(hg.dev));
+        cudaStream_t s = hg.s;
+        const int E = g.n_embd, T = n + 1, maxk = g.ix_top_k + g.ix_kpool, ci = df.c_gate.n;
+        const size_t rb = sizeof(float) * (size_t) E;
+        const bool dmp = dfly_dump != nullptr && df.rounds == (std::getenv("HY4_DFLY_DUMP_ROUND") ? std::atoll(std::getenv("HY4_DFLY_DUMP_ROUND")) : 0);
+        ++df.rounds;
+        // the picks of pos - 1 to the host, each layer's lists made there
+        df_pk.resize((size_t) df.n * maxk);
+        df_hk.resize((size_t) df.n * W * df.ldk);
+        df_hn.resize((size_t) df.n * (W + 1));
+        for (int i = 0; i < df.n; ++i) {
+            CK(cudaMemcpyAsync(df_pk.data() + (size_t) i * maxk, df.snap + ((size_t) i * W + (size_t) row) * maxk,
+                               sizeof(int) * maxk, cudaMemcpyDeviceToHost, s));
+            CK(cudaMemcpyAsync(df_hn.data() + (size_t) df.n * W + i, df.snap_nk + (size_t) i * W + row, sizeof(int),
+                               cudaMemcpyDeviceToHost, s));
+        }
+        CK(cudaStreamSynchronize(s));
+        for (int i = 0; i < df.n; ++i) {
+            const int np = df_hn[(size_t) df.n * W + i];
+            int* hk = df_hk.data() + (size_t) i * W * df.ldk;
+            if (np < 0 || np > maxk || !dfly_keys(df_pk.data() + (size_t) i * maxk, np, pos, T, hk, df.ldk, df_hn.data() + (size_t) i * W)) {
+                err = "the DFly2 drafter: a trunk layer's picks do not fit its lists";
+                return false;
+            }
+            CK(cudaMemcpyAsync(df.keys + (size_t) i * W * df.ldk, hk, sizeof(int) * (size_t) T * df.ldk, cudaMemcpyHostToDevice, s));
+            CK(cudaMemcpyAsync(df.nk + (size_t) i * W, df_hn.data() + (size_t) i * W, sizeof(int) * T, cudaMemcpyHostToDevice, s));
+        }
+        // the block: the token's embedding, then the mask's
+        tok_row(tok_type, tok_embd + (size_t) tok * tok_ld, E, df.h_emb);
+        tok_row(tok_type, tok_embd + (size_t) df.mask * tok_ld, E, df.h_emb + E);
+        for (int t = 2; t < T; ++t) std::memcpy(df.h_emb + (size_t) t * E, df.h_emb + E, rb);
+        CK(cudaMemcpyAsync(df.x, df.h_emb, rb * T, cudaMemcpyHostToDevice, s));
+        CK(cudaMemcpyAsync(df.e0, df.x, rb, cudaMemcpyDeviceToDevice, s));
+        for (int t = 0; t < T; ++t) h_pos[t] = (int) (pos + t);
+        CK(cudaMemcpyAsync(hg.pos, h_pos, sizeof(int) * T, cudaMemcpyHostToDevice, s));
+        // the trunk's state at pos - 1 into the first row
+        const float* hl = hring + (size_t) ((pos - 1) % ring) * E;
+        k::rmsnorm(df.x, E, 1, E, df.enorm, g.eps, df.in, 2 * (size_t) E, s);
+        k::rmsnorm(hl, E, 1, E, df.hnorm, g.eps, df.in + E, 2 * (size_t) E, s);
+        bool ok = mm(hg, df.eh_proj, df.in, 2 * (size_t) E, 1, df.t, E);
+        k::addmul(df.x, df.t, df.fgate, (size_t) E, s);
+        if (dmp) {
+            dfly_file("h_last.f32", hl, rb, true, s);
+            dfly_file("emb.f32", df.h_emb, rb * 2, false, s);
+            dfly_file("x0.f32", df.x, rb * T, true, s);
+        }
+        std::swap(hg.gu, df.gu);   // (the FFN's width is the drafter's own)
+        std::swap(hg.hd, df.hd);
+        for (int i = 0; ok && i < df.n; ++i) {
+            Layer& l = df.L[(size_t) i];
+            df.cur_keys = df.keys + (size_t) i * W * df.ldk;
+            df.cur_nk = df.nk + (size_t) i * W;
+            if (dmp) {
+                const std::string si = std::to_string(i);
+                dfly_file("keys_" + si + ".i32", df_hk.data() + ((size_t) i * W + (size_t) (T - 1)) * df.ldk,
+                          sizeof(int) * (size_t) df_hn[(size_t) i * W + (size_t) (T - 1)], false, s);
+                dfly_cache_file("cache_" + si + ".f16", l.kv, 0, pos, hg);
+            }
+            k::rmsnorm(df.x, E, T, E, l.attn_norm, g.eps, hg.xa, E, s);
+            ok = attn_core(l, hg, T, pos, err);
+            k::rmsnorm(hg.y, E, T, E, l.post_attn, g.eps, hg.y, E, s);
+            k::add(df.x, hg.y, (size_t) T * E, s);
+            k::rmsnorm(df.x, E, T, E, l.ffn_norm, g.eps, hg.xf, E, s);
+            ok = ok && ffn_core(l, hg, T, err);
+            if (dmp) dfly_file("a" + std::to_string(i) + "_ffn.f32", hg.y, rb * T, true, s);
+            k::add(df.x, hg.y, (size_t) T * E, s);
+            if (dmp) {
+                dfly_file("x" + std::to_string(i + 1) + ".f32", df.x, rb * T, true, s);
+                dfly_cache_file("qrows_" + std::to_string(i) + ".f16", l.kv, pos, T, hg);
+            }
+        }
+        std::swap(hg.gu, df.gu);
+        std::swap(hg.hd, df.hd);
+        if (!ok) {
+            if (err.empty()) err = "the DFly2 drafter: a GEMV the kernels do not take";
+            return false;
+        }
+        k::rmsnorm(df.x, E, T, E, df.fin_norm, g.eps, df.h, E, s);
+        if (dmp) dfly_file("h.f32", df.h, rb * T, true, s);
+        // each draft: its row's state corrected by the token before it, then the head
+        for (int i = 0; i < n; ++i) {
+            const float* hrow = df.h + (size_t) (i + 1) * E;
+            const float* prev = df.e0;
+            if (i > 0) {
+                tok_row(tok_type, tok_embd + (size_t) d.back() * tok_ld, E, df.h_emb);
+                CK(cudaMemcpyAsync(df.t, df.h_emb, rb, cudaMemcpyHostToDevice, s));
+                prev = df.t;
+            }
+            k::rmsnorm(hrow, E, 1, E, df.c_hnorm, g.eps, df.in, 2 * (size_t) E, s);
+            k::rmsnorm(prev, E, 1, E, df.c_enorm, g.eps, df.in + E, 2 * (size_t) E, s);
+            ok = mm_multi(hg, {{&df.c_gate, df.cg, (size_t) ci}, {&df.c_up, df.cg + ci, (size_t) ci}}, df.in, 2 * (size_t) E, 1);
+            k::swiglu(df.cg, df.cg + ci, (size_t) ci, 1, ci, df.ch, (size_t) ci, s);
+            ok = ok && mm(hg, df.c_down, df.ch, (size_t) ci, 1, df.t, E);
+            k::add(df.t, hrow, (size_t) E, s);
+            ok = ok && mm(hg, out_draft, df.t, E, 1, hg.logits, g.n_vocab);
+            if (!ok) {
+                err = "the DFly2 drafter's correction / head: a GEMV the kernels do not take";
+                return false;
+            }
+            k::top1(hg.logits, g.n_vocab, df.top, s);
+            float r[2];
+            CK(cudaMemcpyAsync(r, df.top, sizeof r, cudaMemcpyDeviceToHost, s));
+            CK(cudaStreamSynchronize(s));
+            if (dmp) dfly_file("hc_" + std::to_string(i) + ".f32", df.t, rb, true, s);
+            int id;
+            std::memcpy(&id, &r[0], 4);
+            d.push_back(id);
+            conf.push_back(r[1]);
+            if (r[1] < floor) break;
+        }
+        if (dmp) {
+            std::string m = "tok " + std::to_string(tok) + "\npos " + std::to_string(pos) + "\nn " + std::to_string(n) +
+                            "\nq8 " + std::to_string(kv_q8 ? 1 : 0) + "\nmask " + std::to_string(df.mask) + "\ndrafts";
+            for (int x : d) m += " " + std::to_string(x);
+            m += "\nconf";
+            for (float x : conf) m += " " + std::to_string(x);
+            m += "\n";
+            dfly_file("meta.txt", m.data(), m.size(), false, s);
         }
         if (k::errors()) {
             err = "a kernel failed (above)";
@@ -4002,9 +4431,12 @@ int64_t Model::max_ctx() const { return m->o.max_ctx; }
 int Model::chunk() const { return m->Tc; }
 bool Model::draft(int tok, int64_t pos, int n, float floor, std::vector<int>& d, std::vector<float>& c,
                   std::string& err) {
-    return m->draft(tok, pos, n, floor, d, c, err);
+    return m->df.on ? m->dfly_draft(tok, pos, n, floor, d, c, err) : m->draft(tok, pos, n, floor, d, c, err);
 }
 bool Model::has_mtp() const { return m->M.mtp; }
+bool Model::has_dfly2() const { return m->df.on; }
+int Model::draft_default() const { return m->df.on ? m->df.n_def : 3; }
+int Model::draft_max() const { return W - 1; }
 bool Model::pin(void* p, size_t bytes) {
     if (p == nullptr || bytes == 0) return false;
     if (cudaHostRegister(p, bytes, cudaHostRegisterPortable) != cudaSuccess) {
