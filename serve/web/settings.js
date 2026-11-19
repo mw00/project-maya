@@ -45,7 +45,8 @@ const Row = ({label, sub, children, htmlFor, cls = ""}) => html`<div class=${`se
   <span class="set-row__ctl">${children}</span></div>`;
 
 // the engines by their INFO engine_kind
-const ENGINES = {"glm-fast": "GLM fast path", ds4: "DeepSeek-V4.1 (maya-ds4)", mm3: "MiniMax-M3.1 (maya-mm3)"};
+const ENGINES = {"glm-fast": "GLM fast path", ds4: "DeepSeek-V4.1 (maya-ds4)", mm3: "MiniMax-M3.1 (maya-mm3)",
+                 hy4: "Hy4-Flash (maya-hy4)"};
 
 // ------------------------------------------------------------------ General
 function General() {
@@ -459,10 +460,15 @@ function facts() {
     ["Context", eng.max_context ? `${fmt(eng.max_context)} tokens` : null],
     ["Trained for", eng.trained_context ? `up to ${fmt(eng.trained_context)} tokens` : null],
     ["KV cache", kv],
-    ["Experts", eng.experts ? `${fmt(eng.experts)} routed; room for ${fmt(eng.expert_slots || 0)} in VRAM` +
+    // (maya-hy4: the experts in VRAM, the others computed on the CPU from RAM - none read from the SSD)
+    ["Experts", eng.experts && eng.engine_kind === "hy4"
+                ? `${fmt(eng.experts)} routed; ${+eng.vram_slots >= +eng.experts ? "all of them in VRAM"
+                    : `${fmt(+eng.vram_slots || 0)} in VRAM, the others computed on the CPU from RAM`}`
+                : eng.experts ? `${fmt(eng.experts)} routed; room for ${fmt(eng.expert_slots || 0)} in VRAM` +
                  `${eng.ram_slots ? ` and ${fmt(eng.ram_slots)} in RAM` : ""}` +
                  `${+eng.expert_slots + (+eng.ram_slots || 0) >= +eng.experts ? "" : ", the rest read from the SSD"}` : null],
-    ["Speculation", eng.dspark != null
+    ["Speculation", eng.engine_kind === "hy4" && !+eng.dspark && !+eng.mtp ? "off: drafting is not available for Hy4-Flash's files yet"
+                  : eng.dspark != null && !(eng.engine_kind === "hy4" && +eng.mtp)
                   ? (+eng.dspark ? "DSpark: its drafter proposes a few tokens at a time, the full model checks them" +
                                   (m.tiers && m.tiers.now && m.tiers.now.drafts != null ? ` (${fmt(100 * m.tiers.now.drafts)}% of them kept in the last answer)` : "")
                                 : "off (the config's --dspark, or no DSpark drafter in this pack)")

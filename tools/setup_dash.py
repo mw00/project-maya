@@ -39,6 +39,9 @@ TIERS_DS4 = (("cpu", "On the CPU", INFO_TEXT, "/tok"), ("disk_mb", "Disk reads",
 # MiniMax's (maya-mm3): GLM's keys, but the experts VRAM does not hold are computed on the CPU from pinned RAM
 TIERS_MM3 = (("ram_fetch", "On the CPU", INFO_TEXT, "/tok"), ("disk", "From SSD", WARN, "/tok"),
              ("promo", "Promoted", ACCENT, "/tok"))
+# Hy4-Flash's (maya-hy4): the experts VRAM does not hold are computed on the CPU from RAM, and its n-gram table's read
+# time (DeepSeek's key names; no RAM tier, no promotions)
+TIERS_HY4 = (("cpu", "On the CPU", INFO_TEXT, "/tok"), ("engram_ms", "N-gram memory", ACCENT, " ms/tok"))
 TIPS = {   # the Monitor's advice under the tiers, said shorter as the box narrows (one line: the longest that fits)
     "disk": ("Many experts are read from the SSD for every token: more RAM, a smaller model or a shorter context "
              "makes answers faster.", "Many experts come from the SSD: more RAM or a shorter context is faster.",
@@ -196,8 +199,13 @@ def tiers(m: dict, width: int):
     if not n:
         return Text("The engine tells where its experts live while it writes an answer.", f"italic {MUTED}")
     ds4 = eng.get("engine_kind") == "ds4"
+    hy4 = eng.get("engine_kind") == "hy4"
     tier = ds4 and int(eng.get("ram_experts") or 0) > 0
-    if ds4:   # DeepSeek: the VRAM slots, the RAM tier's (when on), the rest read in place from the model's files
+    if hy4:   # Hy4-Flash: the experts in VRAM (INFO vram_slots), the others in RAM for the CPU lane - none on the SSD
+        vu = int(eng.get("vram_slots") or 0)
+        total = max(1, int(eng.get("experts") or 0), vu)
+        ru, disk = total - vu, 0
+    elif ds4:   # DeepSeek: the VRAM slots, the RAM tier's (when on), the rest read in place from the model's files
         vu = int(eng.get("expert_slots") or 0)
         ru = int(eng.get("ram_experts") or 0) if tier else int(eng.get("cpu_experts") or 0)
         disk = max(0, int(eng.get("cpu_experts") or 0) - ru) if tier else 0
@@ -211,7 +219,8 @@ def tiers(m: dict, width: int):
     cols.append(min(width - cols[0], round(width * ru / whole)))
     line = Text.assemble(gradient("█" * cols[0]), ("█" * cols[1], INFO_TEXT), ("█" * max(0, width - sum(cols)), WARN))
     legend = Table.grid(padding=(0, 1))
-    parts = (((ACCENT, "VRAM", vu, ""), (INFO_TEXT, "Pinned RAM", ru, ""), (WARN, "SSD only", disk, "")) if tier else
+    parts = ((ACCENT, "VRAM", vu, ""), (INFO_TEXT, "RAM (run on the CPU)", ru, "")) if hy4 else \
+        (((ACCENT, "VRAM", vu, ""), (INFO_TEXT, "Pinned RAM", ru, ""), (WARN, "SSD only", disk, "")) if tier else
              ((ACCENT, "VRAM", vu, ""), (INFO_TEXT, "RAM cache / SSD (in place)", ru, ""))) if ds4 else \
         ((ACCENT, "VRAM", vu, f" · {fmt(n.get('vram_gb'), 1)} GB"),
          (INFO_TEXT, "Pinned RAM", ru, f" · {fmt(n.get('ram_gb'), 1)} GB"), (WARN, "SSD only", disk, ""))
@@ -219,11 +228,13 @@ def tiers(m: dict, width: int):
         legend.add_row(Text("■", color), Text(what, MUTED), Text(fmt(k), f"bold {INK}"), Text("experts" + extra, MUTED))
     rows = Table.grid(padding=(0, 2))
     mm3 = eng.get("engine_kind") in ("mm3", "qwen")   # (CYBER-FROST's Qwen path too: the CPU computes the others)
-    for key, name, color, unit in TIERS_DS4 if ds4 else TIERS_MM3 if mm3 else TIERS:
+    for key, name, color, unit in TIERS_HY4 if hy4 else TIERS_DS4 if ds4 else TIERS_MM3 if mm3 else TIERS:
         rows.add_row(Text(name, MUTED), Text.assemble((fmt(n.get(key), 2), f"bold {INK}"), (unit, MUTED)),
                      spark(h.get(key), max(8, width - 32), color=color))
     stale = time.time() - (n.get("time") or 0) > 30
-    if ds4:
+    if hy4:
+        tips = () if stale or (n.get("vram_hit") or 1) >= 0.5 else TIPS["ds4_cpu"]
+    elif ds4:
         tips = () if stale else TIPS["ds4_disk"] if (n.get("disk_mb") or 0) >= 500 else \
             TIPS["ds4_cpu"] if (n.get("vram_hit") or 1) < 0.5 else ()
     elif mm3:

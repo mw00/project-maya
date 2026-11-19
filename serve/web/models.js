@@ -366,6 +366,7 @@ function fieldsOf(m, d) {
     <${Num} label="VRAM kept free" value=${d.reserve_mib} ph=${glm ? "700" : "default"} unit="MiB / GPU" on=${(v) => setDraft({reserve_mib: v})}/><//>`;
   if (m.family === "minimax") return mm3Fields(m, d, s, ch, images, gpus);
   if (m.family === "qwen") return qwenFields(m, d, s, ch, gpus);
+  if (m.family === "hy4") return hy4Fields(m, d, ch, gpus);
   if (glm) {
     const ec = AutoOr({label: "Expert cache", k: "expert_cache", d, dflt: 1200, unit: "experts", subLabel: "Experts in the first GPU's pool"});
     const pf = AutoOr({label: "Prompt chunk", k: "prefill", d, dflt: 8192, unit: "tokens", subLabel: "Tokens a prompt is read in at a time"});
@@ -503,6 +504,28 @@ function mm3Fields(m, d, s, ch, images, gpus) {
         warn=${whole(d.prefill_chunk) ? null : "A whole number, or empty."}>
         <${Num} label="Prompt chunk" value=${d.prefill_chunk} ph="auto" unit="tokens" on=${(v) => setDraft({prefill_chunk: v})}/><//>`,
       draftConf(d, ch, 0.7)].filter(Boolean)},
+  ];
+}
+
+// Hy4-Flash's (maya-hy4: it stops at a flag it does not know, so only its own are offered).  What its engine does not
+// have yet is a line that says so, without a control
+function hy4Fields(m, d, ch, gpus) {
+  return [
+    {label: "Model", rows: [
+      contextRow(m, d, ch, {}),
+      html`<${Row} label="Images" hint="Not available yet: Hy4-Flash reads text only on Maya for now."/>`,
+      html`<${Row} label="Drafting" hint="Drafting is not available for Hy4-Flash's files yet."/>`,
+      html`<${Row} label="Answers at once" hint="Not available yet: Hy4-Flash answers one request at a time."/>`]},
+    {label: "GPUs and memory", rows: [gpus,
+      html`<${Row} label="VRAM kept free" flag="--reserve-gb" changed=${ch("reserve_gb")}
+        hint="Per GPU, for the driver, the desktop and other programs. Empty: the engine's own."
+        warn=${decimal(d.reserve_gb) ? null : "A number of GB, or empty for the default."}>
+        <${Dec} label="VRAM kept free" value=${d.reserve_gb} ph="default" unit="GB / GPU" on=${(v) => setDraft({reserve_gb: v})}/><//>`,
+      html`<${Row} label="KV cache" hint="Hy4-Flash's engine has one cache format: no choice of format and no KV streaming yet."/>`]},
+    {label: "Speed", rows: [
+      html`<${Row} label="CPU threads" flag="--cpu-threads" changed=${ch("cpu_threads")} hint="The CPU lane's threads, which compute the experts VRAM does not hold. Empty: the engine picks."
+        warn=${whole(d.cpu_threads) ? null : "A whole number, or empty."}>
+        <${Num} label="CPU threads" value=${d.cpu_threads} ph="auto" unit="threads" on=${(v) => setDraft({cpu_threads: v})}/><//>`]},
   ];
 }
 

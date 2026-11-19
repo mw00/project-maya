@@ -104,6 +104,10 @@ export function speculationView(m, now = Date.now() / 1000) {
 // "Where the experts live": the experts in VRAM, in RAM and on the SSD only, each with its bytes (the engine's
 // vram_gb / ram_gb / disk_gb; a count alone when an engine reports no bytes)
 export function tierShares(n, eng = {}) {
+  if (eng.engine_kind === "hy4") {   // (maya-hy4's INFO: its routed experts and those in VRAM; the others in RAM, for the CPU)
+    const total = Math.max(1, +eng.experts || 0), vu = Math.min(total, +eng.vram_slots || 0);
+    return {vu, ru: total - vu, total, disk: 0, vramGb: null, ramGb: null, diskGb: null};
+  }
   const ds4 = eng.engine_kind === "ds4";
   const vu = n.vram_used || 0, ru = n.ram_used || 0;
   const total = (ds4 ? vu + (n.cpu_n != null ? n.cpu_n : +eng.cpu_experts || 0) : eng.experts) || Math.max(1, vu + ru);

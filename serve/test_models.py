@@ -56,6 +56,25 @@ def ds4_cfg(d: Path, name="maya-gguf-q8.json", drafter=True, vision=False, quant
     return p
 
 
+def hy4_cfg(d: Path, name="maya-hy4-flash-maya-xs.json") -> Path:
+    """Hy4-Flash's config as maya.py's setup writes it."""
+    model = d / "Hy4-Flash-Maya-XS"
+    pack = model / "maya-hy4"
+    pack.mkdir(parents=True, exist_ok=True)
+    (pack / "hy4.txt").write_text(f"n_layer 32\ncontext_length 1048576\nmodel_dir {model}\n")
+    (pack / "tensors.txt").write_text("file 0 Hy4-Flash-Maya-XS-00001-of-00002.gguf\n"
+                                      "file 1 Hy4-Flash-Maya-XS-00002-of-00002.gguf\nt token_embd.weight 1 0 0 8 2 4\n")
+    args = ["--pack", str(pack), "--max-context", "32768", "--gpus", "0,1", "--cpu-threads", "12", "--reserve-gb", "0.5",
+            "--chunk", "256", "--vram-experts", "0", "--profile", "/m/hy4.profile"]
+    cfg = {"exe": "/b/maya-hy4", "args": args, "tokenizer": str(pack / "tokenizer"), "model_name": "hy4-flash",
+           "gpu": [0, 1], "sampling": {"temperature": 0.9, "top_p": 1.0}, "reasoning_effort": "high",
+           "installer": {"family": "hy4", "hy4_quant": "maya-xs", "quant": "Hy4-Flash-Maya-XS", "layout": "standard",
+                         "models_dir": str(d), "model_dir": str(model), "written": "2026-11-19 10:00"}}
+    p = d / name
+    p.write_text(json.dumps(cfg, indent=1))
+    return p
+
+
 def mm3_cfg(d: Path, name="maya-mm3.json", drafter=True, vision=True) -> Path:
     """MiniMax's config as maya.py's write_config_mm3 writes it."""
     pack = d / "MiniMax-M3.1-Flash-EXL3-3.5bpw" / "pack"
@@ -285,6 +304,60 @@ class Settings(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "no DSpark drafter"):
             M.apply(bare, {"draft": "dspark"})
         self.assertEqual(M.quant_label(cfg, Path("maya-mm3.json")), "EXL3 3.5 bpw")
+
+    def test_hy4_read_and_written_with_its_own_flags(self):
+        cfg = M.read(hy4_cfg(self.d))
+        self.assertEqual(M.family(cfg), "hy4")
+        self.assertEqual(M.family({"exe": "C:/b/maya-hy4.exe", "args": ["--pack", "/p"]}), "hy4")   # (no installer)
+        self.assertEqual(M.settings_of(cfg), {"context": 32768, "gpus": [0, 1], "env": {}, "ablate": False,
+                                              "images": False, "draft": "none", "cpu_threads": 12, "reserve_gb": 0.5})
+        self.assertEqual(M.choices(cfg), {"draft": ["none"], "images": False, "text_only": True,
+                                          "ablate": {"available": False, "why": "not available for this model"}})
+        self.assertEqual(M.quant_label(cfg, Path("maya-hy4-flash-maya-xs.json")), "Maya-XS")
+        before = list(cfg["args"])
+        self.assertEqual(M.apply(cfg, {})["args"], before)                      # (a save that changes nothing)
+        self.assertEqual(M.apply(cfg, M.settings_of(cfg)), cfg)                 # (the page's: what it was shown, back)
+        self.assertEqual(M.apply(cfg, {"parallel": 1, "kv_streaming": False, "kv_resident": None})["args"], before)
+        new = M.apply(cfg, {"context": 16384, "cpu_threads": 24, "reserve_gb": 1.5, "env": {"MAYA_X": "1"}})
+        a = new["args"]
+        for f, v in (("--max-context", "16384"), ("--cpu-threads", "24"), ("--reserve-gb", "1.5"), ("--gpus", "0,1"),
+                     ("--chunk", "256"), ("--vram-experts", "0"), ("--profile", "/m/hy4.profile")):
+            self.assertEqual(M.flag(a, f), v, f)
+        self.assertEqual(new["env"], {"MAYA_X": "1"})
+        # maya-hy4 stops at a flag it does not know: none of the other engines' are written
+        self.assertEqual({x for x in a if x.startswith("--")}, {x for x in before if x.startswith("--")})
+        # empty: the engine's own (the flag goes)
+        bare = M.apply(cfg, {"cpu_threads": None, "reserve_gb": ""})["args"]
+        self.assertEqual(("--cpu-threads" in bare, "--reserve-gb" in bare), (False, False))
+        # the GPUs: the config's list, and --gpus counting the cards picked (one card: no flag)
+        one = M.apply(cfg, {"gpus": [1]})
+        self.assertEqual((one["gpu"], "--gpus" in one["args"]), ([1], False))
+        three = M.apply(cfg, {"gpus": [0, 2, 3]})
+        self.assertEqual((three["gpu"], M.flag(three["args"], "--gpus")), ([0, 2, 3], "0,1,2"))
+        # what the engine does not have yet: a plain no, nothing written
+        for key, value, why in (("parallel", 2, "one request at a time"), ("draft", "mtp", "Drafting is not available"),
+                                ("images", True, "text only"), ("kv_cache", "fp8", "one cache format"),
+                                ("kv", "int8", "one cache format"), ("kv_streaming", True, "KV streaming: not available"),
+                                ("kv_resident", 8192, "KV streaming: not available"),
+                                ("ablate", True, "Refusal ablation: not available for this model")):
+            with self.assertRaisesRegex(ValueError, why):
+                M.apply(cfg, {key: value})
+        for key in ("tp", "mmap", "prefill_chunk", "reserve_mib", "expert_cache", "dspark_conf", "cache_gb"):
+            with self.assertRaisesRegex(ValueError, "not a setting of this model: " + key):
+                M.apply(cfg, {key: 1})
+        with self.assertRaisesRegex(ValueError, "CPU threads"):
+            M.apply(cfg, {"cpu_threads": 0})
+        self.assertEqual(M.turbo_patch(cfg), {})                                # (Turbo: nothing of the engine's)
+        # its pack: the context the model was trained for, the files it reads (delete, sizes)
+        M._trained.clear()
+        self.assertEqual(M.trained_context_of(cfg), 1048576)
+        pack = M.pack_of(cfg)
+        self.assertEqual(M.pack_reads(pack), [pack.parent / "Hy4-Flash-Maya-XS-00001-of-00002.gguf",
+                                              pack.parent / "Hy4-Flash-Maya-XS-00002-of-00002.gguf"])
+        with mock.patch.object(M, "machine_gpus", return_value=[]):
+            row = M.listing(self.d, None)["models"][0]
+        self.assertEqual((row["family"], row["quant"], row["contexts"]), ("hy4", "Maya-XS", M.HY4_CONTEXTS))
+        self.assertEqual(row["context_range"], {"min": 4096, "max": 1048576, "trained": 1048576, "tested": 32768})
 
     def test_exl3_label_from_the_folder(self):
         """A DeepSeek EXL3 quant set up by hand under the "exl3" key (turboderp's 2.25 bpw): its folder says its bits,

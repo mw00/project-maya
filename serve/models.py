@@ -10,6 +10,8 @@ A config's settings, as the page shows them (None: the engine's own default, or 
   CYBER-FROST (the `maya` engine's Qwen path; its server always loads the MTP drafter - "none" is --mtp-max-t 1):
              draft ("mtp" | "none"), expert_cache, prefill, kv ("fp16" | "int8" |
              "k8v4" | "q4_0"), ram_gb (the experts' RAM tier, MAYA_EXPERT_RAM_GB); no images (text only)
+  Hy4-Flash: cpu_threads, reserve_gb (maya-hy4 stops at a flag it does not know: only its own are written; text only,
+             one answer at a time, no drafting and no KV cache choice yet)
 apply() writes them back into the config's "args", "env", "gpu" and "vision" - its other keys as they are."""
 from __future__ import annotations
 
@@ -35,12 +37,13 @@ CONTEXTS = [8192, 32768, 65536, 131072]       # the setup's choices (a config's 
 DS4_CONTEXTS = [32768, 65536, 131072, 262144, 524288, 1048576]   # ... for DeepSeek (maya.py's DS4_CONTEXTS)
 MM3_CONTEXTS = DS4_CONTEXTS                                       # ... and MiniMax (maya.py's MM3_CONTEXTS)
 QWEN_CONTEXTS = [32768, 65536, 131072, 262144]                    # ... and CYBER-FROST (maya.py's QWEN_CONTEXTS)
+HY4_CONTEXTS = [4096, 8192, 16384, 32768, 65536, 131072]          # ... and Hy4-Flash (maya.py's HY4_CONTEXTS)
 CONTEXT_MIN = 4096          # the dashboard's Context size: the smallest it offers ...
 CONTEXT_FALLBACK_MAX = 262144   # ... and the largest when the model file does not say what it was trained for
 # the largest context the dashboard offers without an "untested" warning, by engine: maya-ds4 its model's own 1M; the
 # GLM engine's 256K, and maya-mm3's 256K (MiniMax-M3.1 is offered up to its 1M; past 256K it has not been run end to
-# end yet)
-CONTEXT_TESTED = {"ds4": 1048576, "mm3": 262144}
+# end yet), maya-hy4's 32K (Hy4-Flash is trained for 1M; past 32K it has not been run end to end yet)
+CONTEXT_TESTED = {"ds4": 1048576, "mm3": 262144, "hy4": 32768}
 CONTEXT_TESTED_DEFAULT = 262144
 QWEN_KV =("fp16", "int8", "k8v4", "q4_0")                        # the Qwen path's --kv
 MM3_KV = ("bf16", "int8", "fp8", "fp4")                           # maya-mm3 --kv-cache (one format for K and V)
@@ -59,6 +62,17 @@ DS4_KEYS = ("context", "images", "gpus", "reserve_mib", "env", "parallel", "draf
 MM3_KEYS = ("context", "images", "gpus", "env", "parallel", "draft", "tp", "kv_cache", "kv_streaming", "kv_resident",
             "cpu_threads", "reserve_gb", "prefill_chunk", "cache_gb", "dspark_conf")
 QWEN_KEYS = ("context", "images", "gpus", "reserve_mib", "env", "draft", "expert_cache", "prefill", "kv", "ram_gb")
+HY4_KEYS = ("context", "gpus", "env", "cpu_threads", "reserve_gb")
+# what maya-hy4 does not have yet, said in plain words when a client asks for it (apply; each one's "off" - HY4_OFF,
+# or nothing - is taken as it is: the page sends back what it was shown)
+HY4_OFF = {"images": False, "parallel": 1, "draft": "none", "kv_streaming": False}
+HY4_NOT_YET = {"images": "Images: Hy4-Flash reads text only on Maya for now",
+               "parallel": "Answers at once: Hy4-Flash answers one request at a time for now",
+               "draft": "Drafting is not available for Hy4-Flash's files yet",
+               "kv_cache": "KV cache: Hy4-Flash's engine has one cache format",
+               "kv": "KV cache: Hy4-Flash's engine has one cache format",
+               "kv_streaming": "KV streaming: not available for Hy4-Flash yet",
+               "kv_resident": "KV streaming: not available for Hy4-Flash yet"}
 
 
 # ------------------------------------------------------------------ the engine's arguments
@@ -105,7 +119,7 @@ def _float(v, default=None):
 
 
 def family(cfg: dict) -> str:
-    """"minimax", "deepseek", "qwen" or "glm" (maya_quants.family_of, as maya.py and the server read it)."""
+    """"minimax", "hy4", "deepseek", "qwen" or "glm" (maya_quants.family_of, as maya.py and the server read it)."""
     return maya_quants.family_of(cfg)
 
 
@@ -145,13 +159,14 @@ def trained_context(model_dir) -> int | None:
 def trained_context_ds4(pack) -> int | None:
     """DeepSeek's and MiniMax's: the context its pack says the model was trained for (ds4.txt's / mm3.txt's
     max_position_embeddings, from the model's config.json or a GGUF's context_length; V4.1-Flash and M3.1-Flash:
-    1,048,576, their native reach), the top of the dashboard's Context size.  None when the pack does not say."""
-    for name in ("ds4.txt", "mm3.txt"):
+    1,048,576, their native reach), the top of the dashboard's Context size; Hy4-Flash's: hy4.txt's context_length.
+    None when the pack does not say."""
+    for name in ("ds4.txt", "mm3.txt", "hy4.txt"):
         try:
             with open(Path(pack) / name, encoding="utf-8", errors="replace") as f:
                 for line in f:
                     k, _, v = line.strip().partition(" ")
-                    if k == "max_position_embeddings":
+                    if k == ("context_length" if name == "hy4.txt" else "max_position_embeddings"):
                         n = int(v.split()[0])
                         return n if n > 0 else None
         except (OSError, ValueError, IndexError):
@@ -308,6 +323,8 @@ def choices(cfg: dict) -> dict:
 
 
 def _choices(cfg: dict) -> dict:
+    if family(cfg) == "hy4":                           # (maya-hy4: no drafter, no vision tower, one answer at a time)
+        return {"draft": ["none"], "images": False, "text_only": True}
     if family(cfg) == "minimax":
         return {"draft": ["dspark", "none"] if mm3_pack_has(cfg, "dspark.num_hidden_layers") else ["none"],
                 "images": mm3_pack_has(cfg, "vision.hidden_size")}
@@ -334,6 +351,10 @@ def settings_of(cfg: dict) -> dict:
     out = {"context": _int(flag(args, "--max-context"), 32768), "gpus": gpus_of(cfg), "env": env,
            # (refusal ablation: the default for requests that leave `ablate` out - ablate_default)
            "ablate": ablate_default(cfg)}
+    if family(cfg) == "hy4":                           # (maya-hy4: what the page may change, nothing else)
+        out.update(images=False, draft="none", cpu_threads=_int(flag(args, "--cpu-threads")),
+                   reserve_gb=_float(flag(args, "--reserve-gb")))
+        return out
     if family(cfg) == "minimax":                       # (maya-mm3's own defaults where the config names none)
         vision, kvs = flag(args, "--vision"), flag(args, "--kv-streaming")
         out.update(images=vision == "on" or (vision is None and mm3_pack_has(cfg, "vision.hidden_size")),
@@ -437,7 +458,14 @@ def apply(cfg: dict, settings: dict) -> dict:
         raise ValueError("the settings must be a JSON object")
     fam = family(cfg)
     ds4 = fam == "deepseek"
-    known = {"minimax": MM3_KEYS, "deepseek": DS4_KEYS, "qwen": QWEN_KEYS}.get(fam, GLM_KEYS) + ("ablate",)
+    known = {"minimax": MM3_KEYS, "deepseek": DS4_KEYS, "qwen": QWEN_KEYS, "hy4": HY4_KEYS}.get(fam, GLM_KEYS)
+    known += ("ablate",)
+    if fam == "hy4":
+        not_yet = sorted(k for k in set(settings) & set(HY4_NOT_YET)
+                         if settings[k] not in (None, "") and settings[k] != HY4_OFF.get(k))
+        if not_yet:
+            raise ValueError(HY4_NOT_YET[not_yet[0]])
+        known += tuple(HY4_NOT_YET)
     unknown = sorted(set(settings) - set(known))
     if unknown:
         raise ValueError(f"not a setting of this model: {', '.join(unknown)}")
@@ -488,7 +516,7 @@ def apply(cfg: dict, settings: dict) -> dict:
     else:
         out.pop("env", None)
 
-    reserve = _num(s, "reserve_mib", 0, 65536, "VRAM kept free") if fam != "minimax" else None
+    reserve = _num(s, "reserve_mib", 0, 65536, "VRAM kept free") if fam not in ("minimax", "hy4") else None
     if fam == "qwen":
         if s.get("draft") not in can["draft"]:
             raise ValueError("Drafting: this pack has no MTP drafter (the setup builds it)" if s.get("draft") == "mtp"
@@ -528,6 +556,16 @@ def apply(cfg: dict, settings: dict) -> dict:
             out["env"] = env2
         else:
             out.pop("env", None)
+    elif fam == "hy4":
+        # (maya-hy4: --max-context above, the GPUs, the CPU lane's threads and the VRAM kept free - empty: the engine's
+        #  own.  --gpus counts the cards the config picks, in their order: the server shows the engine only those)
+        if gpus != gpus_of(cfg):
+            n = len(set(gpus))
+            args = set_flag(args, "--gpus", ",".join(str(i) for i in range(n))) if n > 1 else drop_flag(args, "--gpus")
+        ct = _num(s, "cpu_threads", 1, 512, "CPU threads")
+        args = set_flag(args, "--cpu-threads", ct) if ct is not None else drop_flag(args, "--cpu-threads")
+        v = _dec(s, "reserve_gb", 0, 64, "VRAM kept free")
+        args = set_flag(args, "--reserve-gb", f"{v:g}") if v is not None else drop_flag(args, "--reserve-gb")
     elif fam == "minimax":
         # (maya-mm3 --parallel: n conversations at once - each its own KV cache in VRAM, so no KV streaming and no DSpark
         #  while it is above 1; those two settings stay as chosen for the day it is 1 again; written where it changes)
@@ -761,11 +799,11 @@ def describe(path: Path, running: str | None) -> dict:
             "port": cfg.get("port"), "script": script, "folder": str(pack.parent) if pack else None,
             "size": folder_size(pack), "ok": why is None, "missing": why,
             "settings": cur, "setup": setup, "choices": choices(cfg), "command": command(cfg),
-            "contexts": {"deepseek": DS4_CONTEXTS, "minimax": MM3_CONTEXTS, "qwen": QWEN_CONTEXTS}.get(family(cfg),
-                                                                                                       CONTEXTS),
+            "contexts": {"deepseek": DS4_CONTEXTS, "minimax": MM3_CONTEXTS, "qwen": QWEN_CONTEXTS,
+                         "hy4": HY4_CONTEXTS}.get(family(cfg), CONTEXTS),
             # (the Engine settings' Context size slider: the same range as Settings > Model's for this model)
             "context_range": context_range(trained_context_of(cfg), cur.get("context"),
-                                           {"deepseek": "ds4", "minimax": "mm3"}.get(family(cfg), ""))}
+                                           {"deepseek": "ds4", "minimax": "mm3", "hy4": "hy4"}.get(family(cfg), ""))}
 
 
 _gpu_cache: dict = {}
@@ -1041,11 +1079,12 @@ def pack_shards(pack: Path) -> list:
 
 
 def pack_reads(pack: Path) -> list:
-    """The files a DeepSeek or MiniMax pack reads: its tensors.txt's `file <i> <path>` lines (they come first: read up to
-    the first tensor only), each relative to the model_dir its ds4.txt / mm3.txt names - the model's own shards, and
+    """The files a DeepSeek, MiniMax or Hy4-Flash pack reads: its tensors.txt's `file <i> <path>` lines (they come
+    first: read up to the first tensor only), each relative to the model_dir its ds4.txt / mm3.txt / hy4.txt names -
+    the model's own shards, and
     what it takes from other folders: the Engram tables of a GGUF set beside it, the DSpark drafter, the vision tower."""
     model = None
-    for name in ("ds4.txt", "mm3.txt"):
+    for name in ("ds4.txt", "mm3.txt", "hy4.txt"):
         try:
             with open(pack / name, encoding="utf-8", errors="replace") as f:
                 model = next((ln[len("model_dir "):].strip() for ln in f if ln.startswith("model_dir ")), None)
@@ -1312,7 +1351,7 @@ def delete(root: Path, path: Path, files: bool = False) -> dict:
 # its vision tower in another's).  Never a hidden one, the project or the home folder.  Maya may not have downloaded it: the page says what is in it, and
 # deletes one at a time.
 LEFTOVER_MIN = 10 ** 8
-PACK_MARKS = ("sources.json", "tensors.txt", "mm3.txt", "ds4.txt", "native_experts.txt", "index.txt")
+PACK_MARKS = ("sources.json", "tensors.txt", "mm3.txt", "ds4.txt", "hy4.txt", "native_experts.txt", "index.txt")
 
 
 def models_dirs(root: Path) -> list:
