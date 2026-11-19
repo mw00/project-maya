@@ -161,6 +161,64 @@ int blocks_for(size_t n) { return (int) std::min<size_t>((n + 255) / 256, 65535)
 
 size_t al(size_t n) { return (n + 255) & ~(size_t) 255; }
 
+// A layer's matrices in the file's other types (a quantized mmproj: Q8_0 blocks - an F16 scale and 32 int8 -, F16 where
+// a row is no multiple of 32) are made BF16 as a stage is gathered for its copy: the file stays the only copy in host
+// memory, the GPU's side is the same for every type.
+enum : int { kRaw = 0, kF16 = 1, kQ8 = 2 };
+
+inline float half_f32(uint16_t h) {
+    const uint32_t s = (uint32_t) (h & 0x8000u) << 16, e = (h >> 10) & 0x1fu, m = h & 0x3ffu;
+    uint32_t u;
+    if (e == 0) {
+        if (m == 0) {
+            u = s;
+        } else {   // (subnormal)
+            int sh = 0;
+            uint32_t mm = m;
+            while (!(mm & 0x400u)) {
+                mm <<= 1;
+                ++sh;
+            }
+            u = s | ((uint32_t) (113 - sh) << 23) | ((mm & 0x3ffu) << 13);
+        }
+    } else if (e == 31) {
+        u = s | 0x7f800000u | (m << 13);
+    } else {
+        u = s | ((e + 112) << 23) | (m << 13);
+    }
+    float f;
+    std::memcpy(&f, &u, 4);
+    return f;
+}
+
+inline uint16_t f32_bf16(float f) {   // (round to nearest, ties to even)
+    uint32_t u;
+    std::memcpy(&u, &f, 4);
+    return (uint16_t) ((u + 0x7fffu + ((u >> 16) & 1u)) >> 16);
+}
+
+// n values of src (kF16: n F16; kQ8: n / 32 blocks of 34 bytes) -> BF16
+void to_bf16_host(const uint8_t* src, int kind, size_t n, uint8_t* dst8) {
+    uint16_t* dst = (uint16_t*) dst8;
+    if (kind == kF16) {
+        for (size_t i = 0; i < n; ++i) {
+            uint16_t h;
+            std::memcpy(&h, src + 2 * i, 2);
+            dst[i] = f32_bf16(half_f32(h));
+        }
+        return;
+    }
+    for (size_t b = 0; b < n / 32; ++b) {
+        const uint8_t* blk = src + b * 34;
+        uint16_t h;
+        std::memcpy(&h, blk, 2);
+        const float d = half_f32(h);
+        const int8_t* q = (const int8_t*) (blk + 2);
+        uint16_t* o = dst + b * 32;
+        for (int j = 0; j < 32; ++j) o[j] = f32_bf16(d * (float) q[j]);
+    }
+}
+
 }  // namespace
 
 int VisionGeo::tokens(int w, int h) const {
@@ -182,6 +240,7 @@ struct Vision::Impl {
     struct Piece {
         const uint8_t* src;
         size_t bytes, off;
+        int kind;   // (kRaw: copied; kF16, kQ8: made BF16 - bytes is the BF16's)
     };
     struct Stage {
         std::vector<Piece> pc;
@@ -236,6 +295,26 @@ struct Vision::Impl {
         return pk.data(*t);
     }
 
+    // a layer's matrix: BF16 (copied as it is), or F16 / Q8_0 (a quantized mmproj file: made BF16 at each copy) - its
+    // element count checked against its type's bytes
+    const uint8_t* mat16(const Pack& pk, const std::string& n, size_t elems, int& kind, std::string& err) {
+        const Tensor* t = pk.get(n);
+        if (!t) {
+            err = "vision: " + n + " missing (pack the model again with its mmproj file)";
+            return nullptr;
+        }
+        if (t->type == "BF16" && t->bytes == elems * 2) kind = kRaw;
+        else if (t->type == "F16" && t->bytes == elems * 2) kind = kF16;
+        else if (t->type == "Q8_0" && elems % 32 == 0 && t->n(0) % 32 == 0 && t->bytes == elems / 32 * 34) kind = kQ8;
+        else {
+            err = "vision: " + n + " is " + t->type + " of " + std::to_string(t->bytes) + " bytes, not " +
+                  std::to_string(elems) + " BF16, F16 or Q8_0 values";
+            return nullptr;
+        }
+        host_b += t->bytes;
+        return pk.data(*t);
+    }
+
     // an F32 tensor whose values are BF16 values (the file's convolutions) -> BF16 here (exact; refused otherwise)
     const uint8_t* bf16_of_f32(const Pack& pk, const std::string& n, size_t elems, std::string& err) {
         const uint8_t* src = need(pk, n, "F32", elems, err);
@@ -255,10 +334,10 @@ struct Vision::Impl {
         return (const uint8_t*) v.data();
     }
 
-    static size_t add(Stage& S, const uint8_t* src, size_t bytes, bool align = true) {
+    static size_t add(Stage& S, const uint8_t* src, size_t bytes, bool align = true, int kind = kRaw) {
         if (align) S.bytes = al(S.bytes);
         const size_t off = S.bytes;
-        S.pc.push_back({src, bytes, off});
+        S.pc.push_back({src, bytes, off, kind});
         S.bytes += bytes;
         return off;
     }
@@ -305,20 +384,21 @@ struct Vision::Impl {
         for (int i = 0; i < g.layers; ++i) {
             const std::string N = "v.blk." + std::to_string(i) + ".";
             const uint8_t* a[16] = {};
+            int kd[16] = {};
             int k = 0;
             for (const char* n : {"ln1.weight", "ln1.bias", "ln2.weight", "ln2.bias"})
                 if (!(a[k++] = need(pk, N + n, "F32", D, err))) return false;
-            if (!(a[4] = need(pk, N + "attn_q.weight", "BF16", DD, err)) ||
-                !(a[5] = need(pk, N + "attn_k.weight", "BF16", DD, err)) ||
-                !(a[6] = need(pk, N + "attn_v.weight", "BF16", DD, err)) ||
+            if (!(a[4] = mat16(pk, N + "attn_q.weight", DD, kd[4], err)) ||
+                !(a[5] = mat16(pk, N + "attn_k.weight", DD, kd[5], err)) ||
+                !(a[6] = mat16(pk, N + "attn_v.weight", DD, kd[6], err)) ||
                 !(a[7] = need(pk, N + "attn_q.bias", "F32", D, err)) ||
                 !(a[8] = need(pk, N + "attn_k.bias", "F32", D, err)) ||
                 !(a[9] = need(pk, N + "attn_v.bias", "F32", D, err)) ||
-                !(a[10] = need(pk, N + "attn_out.weight", "BF16", DD, err)) ||
+                !(a[10] = mat16(pk, N + "attn_out.weight", DD, kd[10], err)) ||
                 !(a[11] = need(pk, N + "attn_out.bias", "F32", D, err)) ||
-                !(a[12] = need(pk, N + "ffn_up.weight", "BF16", (size_t) F * D, err)) ||
+                !(a[12] = mat16(pk, N + "ffn_up.weight", (size_t) F * D, kd[12], err)) ||
                 !(a[13] = need(pk, N + "ffn_up.bias", "F32", F, err)) ||
-                !(a[14] = need(pk, N + "ffn_down.weight", "BF16", (size_t) D * F, err)) ||
+                !(a[14] = mat16(pk, N + "ffn_down.weight", (size_t) D * F, kd[14], err)) ||
                 !(a[15] = need(pk, N + "ffn_down.bias", "F32", D, err)))
                 return false;
             Stage S;
@@ -327,17 +407,17 @@ struct Vision::Impl {
             f.ln1b = add(S, a[1], D * 4);
             f.ln2w = add(S, a[2], D * 4);
             f.ln2b = add(S, a[3], D * 4);
-            f.wqkv = add(S, a[4], DD * 2);   // (q, k and v one [3D][D] matrix)
-            add(S, a[5], DD * 2, false);
-            add(S, a[6], DD * 2, false);
+            f.wqkv = add(S, a[4], DD * 2, true, kd[4]);   // (q, k and v one [3D][D] matrix)
+            add(S, a[5], DD * 2, false, kd[5]);
+            add(S, a[6], DD * 2, false, kd[6]);
             f.bqkv = add(S, a[7], D * 4);
             add(S, a[8], D * 4, false);
             add(S, a[9], D * 4, false);
-            f.wo = add(S, a[10], DD * 2);
+            f.wo = add(S, a[10], DD * 2, true, kd[10]);
             f.bo = add(S, a[11], D * 4);
-            f.w1 = add(S, a[12], (size_t) F * D * 2);
+            f.w1 = add(S, a[12], (size_t) F * D * 2, true, kd[12]);
             f.b1 = add(S, a[13], (size_t) F * 4);
-            f.w2 = add(S, a[14], (size_t) D * F * 2);
+            f.w2 = add(S, a[14], (size_t) D * F * 2, true, kd[14]);
             f.b2 = add(S, a[15], D * 4);
             if (al(S.bytes) > slot) {
                 err = "vision: layer " + std::to_string(i) + "'s weights are more than a slot";
@@ -515,7 +595,10 @@ struct Vision::Impl {
             const int b = k & 1;
             const Stage& S = st[(size_t) k];
             VK(cudaEventSynchronize(ev_up[b]));
-            for (const Piece& q : S.pc) std::memcpy(bounce[b] + q.off, q.src, q.bytes);
+            for (const Piece& q : S.pc) {
+                if (q.kind == kRaw) std::memcpy(bounce[b] + q.off, q.src, q.bytes);
+                else to_bf16_host(q.src, q.kind, q.bytes / 2, bounce[b] + q.off);
+            }
             VK(cudaStreamWaitEvent(cs, ev_free[b], 0));
             VK(cudaMemcpyAsync(sl[b], bounce[b], S.bytes, cudaMemcpyHostToDevice, cs));
             VK(cudaEventRecord(ev_up[b], cs));
