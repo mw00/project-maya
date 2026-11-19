@@ -1223,5 +1223,42 @@ class ThinkingMarkers(unittest.TestCase):
         self.assertNotIn("y = 2", text)
 
 
+
+class Hy4(unittest.TestCase):
+    """Hy4-Flash (its public template, its tags one token each as its pack's tokenizer has them): the guard is on for it
+    as for every model, and its thinking is closed with the template's own suffixed </think:..> token."""
+
+    def service(self, engine):
+        from serve.test_hy4_frontend import PUBLIC
+        return Service(engine, engine.tok, ChatTemplate(PUBLIC))
+
+    def test_a_loop_in_the_answer_is_dropped_and_penalised(self):
+        from serve.test_hy4_frontend import Hy4Tok
+        eng = LoopingEngine(Hy4Tok(), HEAD, BLOCK, escape=ESCAPE)
+        svc = self.service(eng)
+        self.assertTrue(svc.loop_guard)
+        _, content, done, _ = run(svc, sampling={"temperature": 0})
+        kept_block(self, content, after=ESCAPE)
+        self.assertEqual((done["finish"], len(eng.calls)), ("stop", 2))
+        self.assertEqual(eng.calls[1][2]["repetition_penalty"], LG.LOOP_PENALTY)
+        self.assertEqual({k: svc.loop_guard_counts[k] for k in ("detected", "penalised", "stopped")},
+                         {"detected": 1, "penalised": 1, "stopped": 0})
+
+    def test_a_third_loop_in_the_thinking_closes_it(self):
+        from serve.test_hy4_frontend import CLOSE, Hy4Tok
+        tok = Hy4Tok()
+        think_end = tok.special_tokens[CLOSE]
+        eng = LoopingEngine(tok, "I need to list them:\n", BLOCK, answer="\n\nThe numbers: 1017, 245, 26.",
+                            think_end=think_end)
+        svc = self.service(eng)
+        self.assertEqual(svc.think_end_id, think_end)
+        reasoning, content, done, _ = run(svc, thinking=True)
+        kept_block(self, reasoning, head="I need to list them:\n")
+        self.assertEqual(content.strip(), "The numbers: 1017, 245, 26.")
+        self.assertEqual(done["finish"], "stop")
+        self.assertEqual(eng.calls[-1][0][-1], think_end)          # the thinking closed by the model's own token
+        self.assertEqual(svc.loop_guard_counts["thinking_closed"], 1)
+
+
 if __name__ == "__main__":
     unittest.main()

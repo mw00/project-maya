@@ -354,6 +354,47 @@ class OtherQuantsTest(unittest.TestCase):
                 self.assertIn(a.mm3_quant, maya.MM3_QUANTS)
             self.assertIsNone(maya.model_option(a), ident)
 
+    def test_hy4_only_its_published_sizes_on_nvidia(self):
+        """Hy4-Flash: a size is listed once its files are uploaded (the setup's data), on NVIDIA from V100 on - not on
+        AMD or a Mac; pulled by its setup id."""
+        hy4 = lambda rows: {m["id"]: m for m in rows if m["family"] == "hy4"}   # noqa: E731
+        with mock.patch.object(model_pull, "_hy4_downloads", return_value={}):
+            self.assertEqual(hy4(self.cat()), {})                              # (nothing uploaded: nothing offered)
+            with self.assertRaises(ValueError):
+                model_pull.Puller(self.root, lambda i, c: []).start("hy4-flash-maya-xs", None)
+        up = {"maya-xs": {"download_gb": 78.44, "memory_gb": 84, "files": {"a.gguf": 1}, "sha256": {"a.gguf": "0" * 64},
+                          "repo": "peasantsmith/Hy4-Flash-Maya-GGUF", "revision": "abc"}}
+        with mock.patch.object(model_pull, "_hy4_downloads", return_value=up):
+            got = hy4(self.cat())
+            self.assertEqual(list(got), ["hy4-flash-maya-xs"])                 # (S, M, L: not uploaded)
+            self.assertEqual(got["hy4-flash-maya-xs"], {
+                "id": "hy4-flash-maya-xs", "family": "hy4", "name": "Hy4-Flash · Maya-XS", "group": "maya", "by": "Maya",
+                "note": "text only", "installed": False, "size_gb": 78.4})
+            self.assertIn("hy4-flash-maya-xs", hy4(self.cat(ccs=(70,))))
+            self.assertIn("hy4-flash-maya-xs", hy4(self.cat(ccs=())))          # (no GPU readable: the setup's check says)
+            self.assertEqual(hy4(self.cat(ccs=(61,))), {})                     # (Pascal: before maya-hy4's kernels)
+            self.assertEqual(hy4(self.cat("hip", ())), {})
+            self.assertEqual(hy4(self.cat("metal", ())), {})
+            (self.root / "maya-hy4-flash-maya-xs.json").write_text(json.dumps(
+                {"exe": "maya-hy4", "args": ["--pack", "p"], "installer": {"family": "hy4", "hy4_quant": "maya-xs"}}))
+            self.assertTrue(hy4(self.cat())["hy4-flash-maya-xs"]["installed"])
+        cmd = model_pull.setup_command("hy4-flash-maya-xs", {"installer": {"models_dir": "/m"}})
+        self.assertEqual(cmd[cmd.index("--model"):cmd.index("--download-model")], ["--model", "hy4-flash-maya-xs"])
+
+    def test_hy4_downloads_read_from_the_setup(self):
+        """_hy4_downloads: maya.py's own table - the published sizes only; a setup without it offers none."""
+        sys.path.insert(0, str(model_pull.ROOT))
+        import maya
+        entry = {"download_gb": 78.4, "memory_gb": 84, "files": {}, "sha256": {}, "repo": "r", "revision": "c"}
+        with mock.patch.object(maya, "HY4_QUANTS", {"maya-xs": "Hy4-Flash-Maya-XS", "maya-s": "Hy4-Flash-Maya-S"},
+                               create=True), \
+                mock.patch.object(maya, "hy4_published", lambda k: k == "maya-xs", create=True), \
+                mock.patch.object(maya, "hy4_entry", lambda k: dict(entry, key=k), create=True):
+            self.assertEqual(model_pull._hy4_downloads(), {"maya-xs": dict(entry, key="maya-xs")})
+        with mock.patch.object(maya, "HY4_QUANTS", {"maya-xs": "x"}, create=True), \
+                mock.patch.object(maya, "hy4_published", mock.Mock(side_effect=SystemExit(1)), create=True):
+            self.assertEqual(model_pull._hy4_downloads(), {})
+
     def test_pull_takes_an_other_id(self):
         slot = model_pull.Puller(self.root, lambda ident, cfg: [sys.executable, "-c", "print('ok')"])
         p = slot.start("deepseek-exl3", {"backend": "cuda"})

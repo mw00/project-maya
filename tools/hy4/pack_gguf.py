@@ -72,8 +72,25 @@ def find_shards(model: pathlib.Path, names: list | None) -> list:
     paths = [model / n for n in names] if names else sorted(model.glob("*.gguf"))
     if not paths:
         raise SystemExit("%s: no .gguf files" % model)
-    gs = [Gguf(p) for p in paths]
-    gs = [g for g in gs if not is_mmproj(g)]   # (a vision tower's file beside the set: find_mmproj's)
+    if names:
+        gs = [Gguf(p) for p in paths]
+    else:
+        # the folder's other files (a vision projector: another architecture; a drafter: general.type "drafter") are
+        # not the set's shards - left alone, said once; the set's own count is still checked below
+        gs = []
+        for p in paths:
+            try:
+                g = Gguf(p)
+            except (Exception, SystemExit) as e:  # noqa: BLE001 - a file that is no GGUF this reader takes: not a shard
+                print("%s: not read (%s), left out of the set" % (p.name, e))
+                continue
+            arch, kind = g.kv.get("general.architecture"), g.kv.get("general.type")
+            if (arch is None or arch == ARCH) and kind in (None, "model"):
+                gs.append(g)
+            else:
+                print("%s: %s / %s, not a shard of the model, left out" % (p.name, arch, kind))
+        if not gs:
+            raise SystemExit("%s: no %s model .gguf files" % (model, ARCH))
     first = [g for g in gs if g.kv.get("general.architecture")]
     if not first or first[0].kv["general.architecture"] != ARCH:
         raise SystemExit("%s: not a %s GGUF (general.architecture %r)" %
@@ -154,6 +171,17 @@ def geometry(kv: dict) -> dict:
         raise SystemExit("an attention geometry maya-hy4 does not run: %s" %
                          {k: geo[k] for k in ("k_mla", "rope_dim", "kv_lora", "ix_top_k", "ix_kpool")})
     return geo
+
+
+def engram_scales(model: pathlib.Path, rows: int):
+    """The Engram table's row scales beside the set (a table of per-row scaled codes: <name>.engram-scales.bf16, one
+    BF16 a row) - its name, or None.  A file of another size is not this table's: refused."""
+    found = sorted(model.glob("*.engram-scales.bf16"))
+    if not found:
+        return None
+    if len(found) > 1 or found[0].stat().st_size != rows * 2:
+        raise SystemExit("engram: %s is not the table's row scales (%d rows of BF16 expected)" % (found[0].name, rows))
+    return found[0].name
 
 
 def geometry_text(geo: dict, model: pathlib.Path) -> str:
@@ -309,6 +337,8 @@ def main() -> int:
     ap.add_argument("--out", help="the pack's folder (default: <model>/maya-hy4)")
     ap.add_argument("--mmproj", help="the vision tower's GGUF (default: the folder's mmproj file of Hy4-flash; "
                                      "none: text only)")
+    ap.add_argument("--engram-eps", type=float, help="the Engram norms' eps (default: the engine's, FP32's machine "
+                    "epsilon; 0.0078125: the release run in BF16)")
     a = ap.parse_args()
     model = pathlib.Path(a.model).expanduser().resolve()
     out = pathlib.Path(a.out).expanduser().resolve() if a.out else model / "maya-hy4"
@@ -346,7 +376,16 @@ def main() -> int:
         (out / "engram.bin").write_bytes(engram)
     elif (out / "engram.bin").exists():
         (out / "engram.bin").unlink()
-    (out / "hy4.txt").write_text(geometry_text(geo, model))
+    extra = ""
+    if engram is not None:
+        sc = engram_scales(model, tensors["per_layer_token_embd.weight"][1][1])
+        if sc:
+            extra += "engram_scales %s\n" % sc
+        if a.engram_eps is not None:
+            if not 0.0 < a.engram_eps <= 1.0:
+                raise SystemExit("--engram-eps %r" % a.engram_eps)
+            extra += "engram_eps %r\n" % a.engram_eps
+    (out / "hy4.txt").write_text(geometry_text(geo, model) + extra)
     (out / "tensors.txt").write_text("\n".join(lines) + "\n")
     print("%s: %d tensors from %d files, %d layers (+%d MTP), %d Engram layers, %s" %
           (out, len(tensors), len(gs), geo["n_layer"], geo["n_mtp"], ne,

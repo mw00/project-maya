@@ -1126,9 +1126,11 @@ __device__ __forceinline__ float f8e4m3(uint8_t x) {
 }
 // a block (dim threads, dim <= 1024) a (column, token)
 __global__ void engram_rows_kernel(const uint8_t* __restrict__ rows, const float* __restrict__ valid, int cols, int dim,
-                                   const float* __restrict__ ln, float eps, float* __restrict__ r) {
+                                   const float* __restrict__ ln, float eps, float* __restrict__ r,
+                                   const float* __restrict__ scale) {
     const int col = blockIdx.x, t = blockIdx.y, i = threadIdx.x;
-    const float v = i < dim ? f8e4m3(rows[((size_t) t * cols + col) * dim + i]) : 0.0f;
+    float v = i < dim ? f8e4m3(rows[((size_t) t * cols + col) * dim + i]) : 0.0f;
+    if (scale != nullptr) v *= scale[(size_t) t * cols + col];
     const float ss = block_sum(v * v);
     const float rr = 1.0f / sqrtf(ss / (float) dim + eps);
     if (i < dim) r[((size_t) t * cols + col) * dim + i] = v * rr * ln[(size_t) col * dim + i] * valid[t];
@@ -1549,9 +1551,10 @@ void dup_rows_q8(const int8_t* q, const float* d, int rows, int k, int8_t* q2, f
     check("dup_rows_q8");
 }
 void engram_rows(const uint8_t* rows, const float* valid, int T, int cols, int dim, const float* lookup_norm, float eps,
-                 float* r, cudaStream_t s) {
+                 float* r, cudaStream_t s, const float* scale) {
     const int th = (dim + 31) / 32 * 32;
-    engram_rows_kernel<<<dim3((unsigned) cols, (unsigned) T), th, 0, s>>>(rows, valid, cols, dim, lookup_norm, eps, r);
+    engram_rows_kernel<<<dim3((unsigned) cols, (unsigned) T), th, 0, s>>>(rows, valid, cols, dim, lookup_norm, eps, r,
+                                                                         scale);
     check("engram_rows");
 }
 void engram_mix(float* x, const float* kv, const float* kv_b, int T, int hc, int E, const float* egate,

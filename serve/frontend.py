@@ -88,6 +88,30 @@ class ChatTemplate:
         self.hy4 = bool(hytk) and "reasoning_mode" in self.source and "hy_start" in self.source
         self.hy4_tag = hytk.group(1) if hytk else ""
 
+    def effort_shown(self, value) -> str | None:
+        """Hy4-flash: a thinking level as given (a config's, a client's) -> the level this model really runs it at, in
+        the server's words: "none", or "high" for every other level (render's rule) - what /health and the start's
+        line report.  None for another model's template, or a value that is no level."""
+        level = effort_level(value) if self.hy4 else None
+        if level is None:
+            return None
+        return "none" if level == "none" else "high"
+
+    def thinking_levels(self) -> list | None:
+        """Hy4-flash: the two levels it is made for, in the server's words (none / high) - /health's
+        "thinking_levels".  None for every other model."""
+        return ["none", "high"] if self.hy4 else None
+
+    def opens_thinking(self, prompt: str) -> bool:
+        """Whether a rendered prompt ends in an open thinking block (Hy4-flash: its suffixed <think:..>)."""
+        end = prompt.rstrip()
+        return end.endswith("<think>") or (self.hy4 and end.endswith("<think%s>" % self.hy4_tag))
+
+    def hy4_call_open(self, name: str = "") -> str:
+        """Hy4-flash: a tool call's opening as its template writes one (the wrapper, the call, the tool's name) - what
+        a required call's prompt ends with.  (The parser reads the same opening in GLM's spelling, CALL_START + name.)"""
+        return "<tool_calls%s><tool_call%s>%s" % (self.hy4_tag, self.hy4_tag, name or "")
+
     def render(self, messages: list[dict], tools: list[dict] | None = None, add_generation_prompt: bool = True,
                **kwargs) -> str:
         name = kwargs.pop("effort_name", None)   # (effort_kwargs: the client's level where it is not GLM's - MiniMax's)
@@ -209,7 +233,8 @@ VIDEO_PARTS = ("video_url", "input_video", "video")
 # "auto" (or "default") is the model's own default: the template is told no level at all (MiniMax-M3.1's adaptive
 # thinking with no effort named, GLM's Max, DeepSeek's encoder default).
 AUTO = "auto"
-EFFORT = {"none": None, "off": None, "minimal": None, "disabled": None, "false": None,
+# ("no_think" is Hy4-flash's own word for off, the one its card sets in chat_template_kwargs.)
+EFFORT = {"none": None, "off": None, "minimal": None, "disabled": None, "false": None, "no_think": None,
           "low": "low", "medium": "high", "high": "high", "xhigh": "max", "max": "max", "maximum": "max",
           "auto": AUTO, "default": AUTO}
 QWEN_EFFORT = {"low": "low", "high": "medium", "max": "xhigh"}   # the same levels in a Qwen3.x template's words

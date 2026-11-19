@@ -31,12 +31,15 @@ PROMPT_TOKENS = 2048
 
 
 def config_path() -> pathlib.Path | None:
-    """The installed config (the newest one), with its engine and tokenizer."""
+    """The installed GLM config (the newest one), with its engine and tokenizer - the hooks these tests use are in the
+    GLM engine's prefill alone: another model's config (no --glm-pack in its args) is not taken."""
     found = sorted(ROOT.glob("maya-*.json"))
     for path in reversed(found):
         try:
             cfg = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
+            continue
+        if "--glm-pack" not in [str(a) for a in cfg.get("args") or []]:
             continue
         if cfg.get("exe") and pathlib.Path(cfg["exe"]).exists():
             return path

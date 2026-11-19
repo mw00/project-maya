@@ -622,6 +622,28 @@ void test_engram() {
     const double e1 = rel(host(r, rr.size()), rr);
     std::printf("  engram_rows: rel %.2e\n", e1);
     CHECK(e1 < 1e-6);
+    {   // the rows' own scales (a table of per-row scaled codes), at the BF16 run's eps: values = codes * scale
+        const float eps2 = 0.0078125f;
+        std::vector<float> sc((size_t) T * cols);
+        std::uniform_real_distribution<float> us(1e-5f, 3e-4f);
+        for (float& v : sc) v = us(rng);
+        float* dsc = dev(sc);
+        hy4::k::engram_rows(drows, dvalid, T, cols, dim, dln, eps2, r, 0, dsc);
+        std::vector<double> rs((size_t) T * cols * dim);
+        for (int t = 0; t < T; ++t)
+            for (int c = 0; c < cols; ++c) {
+                const size_t b = ((size_t) t * cols + c) * dim;
+                const double sv = sc[(size_t) t * cols + c];
+                double ss = 0;
+                for (int i = 0; i < dim; ++i) ss += f8(rows[b + i]) * sv * f8(rows[b + i]) * sv;
+                const double s = 1.0 / std::sqrt(ss / dim + eps2);
+                for (int i = 0; i < dim; ++i) rs[b + i] = f8(rows[b + i]) * sv * s * ln[(size_t) c * dim + i] * valid[(size_t) t];
+            }
+        const double e1s = rel(host(r, rs.size()), rs);
+        std::printf("  engram_rows (row scales, eps %g): rel %.2e\n", (double) eps2, e1s);
+        CHECK(e1s < 1e-6);
+        cudaFree(dsc);
+    }
     // the mix
     auto x = randn((size_t) T * hc * E), kv = randn((size_t) T * (hc + 1) * E), kvb = randn((size_t) (hc + 1) * E, 0.1f),
          eg = randn((size_t) hc * E, 0.5f), gam = randn(E, 0.3f), hcs = randn((size_t) hc * E, 0.1f);

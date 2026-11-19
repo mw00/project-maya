@@ -7,6 +7,12 @@
 #include <atomic>
 #include <fstream>
 #include <sstream>
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 #if defined(__linux__)
 #include <sched.h>
 #include <sys/syscall.h>
@@ -91,11 +97,19 @@ inline void cpu_relax() {
 // come every few hundred microseconds), then sleep on the condition variable until the next one.  Its items are split
 // by node: a worker drains its node's list, then the others'.
 struct Lane::Impl {
-    static constexpr auto kSpin = std::chrono::microseconds(3000);
+    // (the spin: 3 ms at least, and twice the longest gap seen lately between two jobs - a decode's are the GPU's
+    //  share of a layer and, once a token, its head and first layers; a worker that sleeps through one comes back
+    //  late (Windows: milliseconds), every job after it paying that.  Gaps over kIdle are a pause between requests,
+    //  not counted; HY4_LANE_SPIN_US: a fixed spin instead, 0 = asleep at once)
+    static constexpr int64_t kSpinMin = 3000, kSpinMax = 100000, kIdle = 250000;   // us
+    std::atomic<int64_t> spin_us{kSpinMin};
+    bool spin_fixed = false;
+    double gap_us = 0.0;   // (the caller's: the recent gaps' decaying maximum)
+    std::chrono::steady_clock::time_point last_end{};
     static constexpr int kMaxNodes = 8;
     std::vector<std::thread> th;
     std::vector<int> wnode;   // each worker's node
-    int n_nodes = 1, caller_node = 0;
+    int n_nodes = 1, caller_node = 0, caller_core = -1;
     std::mutex mu;
     std::condition_variable cv;
     const std::function<void(int)>* f = nullptr;
@@ -124,7 +138,8 @@ struct Lane::Impl {
                 g = gen.load(std::memory_order_acquire);
                 if (g != seen || quit.load(std::memory_order_relaxed)) break;
                 cpu_relax();
-                if ((k & 1023) == 1023 && std::chrono::steady_clock::now() - t0 > kSpin) {
+                if ((k & 1023) == 1023 && std::chrono::steady_clock::now() - t0 >
+                                              std::chrono::microseconds(spin_us.load(std::memory_order_relaxed))) {
                     std::unique_lock<std::mutex> lk(mu);
                     sleepers.fetch_add(1);
                     cv.wait(lk, [&] { return gen.load() != seen || quit.load(); });
@@ -140,9 +155,38 @@ struct Lane::Impl {
     }
 };
 
+LaneWaits lane_waits(bool windows, const std::function<const char*(const char*)>& env) {
+    LaneWaits w;
+    const char* all = env("HY4_LANE_WAITS");
+    (void)windows;   // (the same default on every system; a sleeping thread comes back latest on Windows)
+    const bool on = all ? std::atoi(all) != 0 : true;
+    w.spin_measured = on;
+    w.ev_poll_us = on ? 2000 : 0;
+    w.pin_caller = on;
+    if (const char* e = env("HY4_LANE_SPIN_US")) {
+        w.spin_us = std::max(0, std::atoi(e));
+        w.spin_measured = false;
+    }
+    if (const char* e = env("HY4_EV_POLL_US")) w.ev_poll_us = std::max(0, std::atoi(e));
+    if (const char* e = env("HY4_LANE_PIN_CALLER")) w.pin_caller = std::atoi(e) != 0;
+    return w;
+}
+
+LaneWaits lane_waits() {
+#if defined(_WIN32)
+    const bool windows = true;
+#else
+    const bool windows = false;
+#endif
+    return lane_waits(windows, [](const char* k) -> const char* { return std::getenv(k); });
+}
+
 Lane::Lane(int threads) : p(new Impl) {
     const std::vector<std::vector<int>> nodes = node_cores();
     p->n_nodes = std::max(1, std::min((int) nodes.size(), Impl::kMaxNodes));
+    const LaneWaits lw = lane_waits();
+    p->spin_us.store(lw.spin_us);
+    p->spin_fixed = !lw.spin_measured;
     for (int q = 0; q < Impl::kMaxNodes; ++q) p->next[q].store(0);
     // every node's cores but the first core of node 0 (the caller's), round-robin over the nodes so a smaller lane
     // still spans them all
@@ -153,6 +197,9 @@ Lane::Lane(int threads) : p(new Impl) {
         for (int q = 0; q < p->n_nodes; ++q)
             if (i < nodes[(size_t) q].size() && !(q == 0 && i == 0)) order.push_back({nodes[(size_t) q][i], q});
     if (threads < 0) threads = (int) order.size();
+    // the caller's core: node 0's first, the one no worker takes (not pinned: the caller left where the system runs
+    // it - beside a worker, on its core's second thread, when it comes back from a wait)
+    if (threads > 0 && !nodes[0].empty() && lw.pin_caller) p->caller_core = nodes[0][0];
     for (int i = 0; i < threads; ++i) {
         const int core = i < (int) order.size() ? order[(size_t) i].first : -1;
         const int node = i < (int) order.size() ? order[(size_t) i].second : 0;
@@ -213,6 +260,22 @@ void Lane::parallel_for(int n, const std::function<void(int)>& f, const std::vec
         const int q = node_of && (*node_of)[(size_t) i] >= 0 ? (*node_of)[(size_t) i] % p->n_nodes : i % p->n_nodes;
         p->items[q].push_back(i);
     }
+    if (p->caller_core >= 0) {   // (the thread that brings the jobs: pinned once)
+        thread_local const Impl* pinned_for = nullptr;
+        if (pinned_for != p.get()) {
+            strata::kernels::cpu::pin_current_thread(p->caller_core);
+            pinned_for = p.get();
+        }
+    }
+    if (!p->spin_fixed) {
+        const auto t = std::chrono::steady_clock::now();
+        const double gap = std::chrono::duration<double, std::micro>(t - p->last_end).count();
+        if (p->last_end != std::chrono::steady_clock::time_point{} && gap < (double) Impl::kIdle) {
+            p->gap_us = std::max(gap, p->gap_us * 0.995);
+            p->spin_us.store(std::max(Impl::kSpinMin, std::min(Impl::kSpinMax, (int64_t) (2.0 * p->gap_us))),
+                             std::memory_order_relaxed);
+        }
+    }
     p->f = &f;
     p->busy.store((int) p->th.size(), std::memory_order_relaxed);
     {
@@ -223,6 +286,7 @@ void Lane::parallel_for(int n, const std::function<void(int)>& f, const std::vec
     p->work(p->caller_node);
     while (p->busy.load(std::memory_order_acquire) > 0) cpu_relax();
     p->f = nullptr;
+    if (!p->spin_fixed) p->last_end = std::chrono::steady_clock::now();
 }
 
 // ---------------------------------------------------------------- the experts
@@ -252,6 +316,11 @@ struct Scratch {
 
 }  // namespace
 
+LaneProf& lane_prof() {
+    static LaneProf p;
+    return p;
+}
+
 // Two passes (each a parallel_for): gate / up (each item its tokens' activations quantized itself - a few
 // microseconds, saved a barrier), then down (each item its entries' h quantized itself).
 void place_experts(const CpuExperts& ex, const std::vector<int>& experts, int nodes, const std::atomic<bool>& stop) {
@@ -272,12 +341,41 @@ void place_experts(const CpuExperts& ex, const std::vector<int>& experts, int no
     }
 }
 
+void warm_experts(const CpuExperts& ex, const std::vector<int>& experts, const std::atomic<bool>& stop) {
+    volatile uint8_t sink = 0;
+    for (int e : experts) {
+        if (stop.load(std::memory_order_relaxed)) return;
+        const uint8_t* g = ex.gate + (size_t) e * ex.g_stride;
+        const uint8_t* u = ex.up + (size_t) e * ex.g_stride;
+        const uint8_t* d = ex.down + (size_t) e * ex.d_stride;
+        for (size_t b = 0; b < ex.g_stride; b += 4096) sink = sink ^ g[b] ^ u[b];
+        for (size_t b = 0; b < ex.d_stride; b += 4096) sink = sink ^ d[b];
+    }
+}
+
+uint64_t ram_available() {
+#if defined(_WIN32)
+    MEMORYSTATUSEX s{};
+    s.dwLength = sizeof(s);
+    return GlobalMemoryStatusEx(&s) ? (uint64_t) s.ullAvailPhys : 0;
+#else
+    const std::string m = read_file("/proc/meminfo");
+    const size_t at = m.find("MemAvailable:");
+    return at == std::string::npos ? 0 : (uint64_t) std::strtoull(m.c_str() + at + 13, nullptr, 10) * 1024;
+#endif
+}
+
 void cpu_experts(Lane& lane, const CpuExperts& ex, const std::vector<CpuEntry>& entries, const float* x, int T,
                  float* out) {
     const iqc::IqCpu& f = ex.f;
     const int E = f.n_embd, F = f.n_ff, n = (int) entries.size();
     std::fill(out, out + (size_t) T * E, 0.0f);
     if (n == 0) return;
+    LaneProf& lp = lane_prof();
+    auto clk = [&] {
+        return lp.on ? std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count() : 0.0;
+    };
+    const double tp0 = clk();
     thread_local Scratch tls;
     Scratch& sc = tls;   // (the caller's: the workers use it through this reference, never their own thread_local)
     sc.h.resize((size_t) n * F);
@@ -299,6 +397,7 @@ void cpu_experts(Lane& lane, const CpuExperts& ex, const std::vector<CpuEntry>& 
             for (int c = 0; c < gu_chunks; ++c) gu_node.push_back(q);
             for (int c = 0; c < dn_chunks; ++c) dn_node.push_back(q);
         }
+    const double tp1 = clk();
     lane.parallel_for((int) groups.size() * gu_chunks, [&](int it) {
         const auto& [e, ids] = groups[(size_t) (it / gu_chunks)];
         const int r0 = (it % gu_chunks) * kRowChunk, r1 = std::min(F, r0 + kRowChunk);
@@ -315,6 +414,7 @@ void cpu_experts(Lane& lane, const CpuExperts& ex, const std::vector<CpuEntry>& 
         iqc::iq_cpu_gate_up(f, ex.gate + (size_t) e * ex.g_stride, ex.up + (size_t) e * ex.g_stride, act,
                             (int) ids.size(), ff, r0, r1, ex.limit);
     }, gu_node.empty() ? nullptr : &gu_node);
+    const double tp2 = clk();
     lane.parallel_for((int) groups.size() * dn_chunks, [&](int it) {
         const auto& [e, ids] = groups[(size_t) (it / dn_chunks)];
         const int r0 = (it % dn_chunks) * kRowChunk, r1 = std::min(E, r0 + kRowChunk);
@@ -330,12 +430,21 @@ void cpu_experts(Lane& lane, const CpuExperts& ex, const std::vector<CpuEntry>& 
         }
         iqc::iq_cpu_down(f, ex.down + (size_t) e * ex.d_stride, hq, (int) ids.size(), y, r0, r1);
     }, dn_node.empty() ? nullptr : &dn_node);
+    const double tp3 = clk();
     // each token's weighted sum, in its entries' order
     for (int i = 0; i < n; ++i) {
         const CpuEntry& e = entries[(size_t) i];
         float* o = out + (size_t) e.t * E;
         const float* y = sc.y.data() + (size_t) i * E;
         for (int d = 0; d < E; ++d) o[d] += e.w * y[d];
+    }
+    if (lp.on) {
+        lp.prep_s += tp1 - tp0;
+        lp.gate_up_s += tp2 - tp1;
+        lp.down_s += tp3 - tp2;
+        lp.sum_s += clk() - tp3;
+        ++lp.calls;
+        lp.entries += n;
     }
 }
 

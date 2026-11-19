@@ -144,6 +144,7 @@ class Dashboard(unittest.TestCase):
             ({"engine_kind": "qwen", "mtp": 0, "lookup": 0}, {}, []),
             ({"engine_kind": "mm3", "dspark": 1}, {}, ["DSpark"]),
             ({"engine_kind": "mm3", "dspark": 0}, {}, []),
+            ({"engine_kind": "hy4", "dspark": 0, "mtp": 0}, {}, []),                   # (maya-hy4: no drafting yet)
             ({"engine_kind": "ds4"}, {"dspark": True, "lookup": True}, ["DSpark", "Lookup"]),
             ({"engine_kind": "ds4"}, {"dspark": False, "lookup": True}, ["Lookup"]),
             ({"engine_kind": "ds4"}, {"dspark": False, "lookup": False}, []),
@@ -878,6 +879,45 @@ console.log(JSON.stringify({set: m.tierSet(q).find((x) => x.key === "disk"), glm
         self.assertTrue(got["glm"].startswith("Many experts are read from the SSD"))
         self.assertEqual(got["stale"], "")
         self.assertTrue(got["cfCpu"].startswith("Most experts run on the CPU"))
+
+    def test_hy4_its_two_levels_its_own_settings_and_its_monitor_tiers(self):
+        # Hy4-Flash ("hy4-flash", maya-hy4): the two levels it is made for (High, Off), High the default; chat settings of
+        # its own; a level of another model's goes to High; the Monitor: the CPU lane and the n-gram table's
+        # read, the experts in VRAM from its INFO line - no SSD tier, no promotions
+        got = self.node("""
+const m = await import(web + "/monitor.js"), lib = await import(web + "/lib.js"), tc = await import(web + "/turbo-core.js");
+const out = {family: st.familyOf("hy4-flash"), others: ["glm-5.3-flash", "glm-5.3", "deepseek-v4.1-flash", "minimax-m3.1-flash",
+  "cyber-frost-3.8-ps", "qwen3.8-flash-next", ""].map((x) => st.familyOf(x))};
+st.setFamily("hy4-flash");
+st.S.health = {model: "hy4-flash"};
+out.levels = st.LEVELS; out.dflt = st.DEFAULTS.thinking; out.titles = st.thinkTitles(); out.key = st.prefsKey();
+out.nearest = ["none", "auto", "low", "medium", "high", "xhigh", "max"].map((l) => st.levelFor(l));
+out.pills = st.LEVELS.map((l) => st.thinkPill(l.id).i);
+out.fastest = tc.fastestThinking(st.THINKING);
+out.name = lib.modelName("hy4-flash"); out.logo = lib.modelLogo("hy4-flash"); out.catalogLogo = lib.modelLogo("Hy4-Flash · Maya-XS");
+const eng = {engine_kind: "hy4", experts: "6144", vram_slots: "1900"}, n = {vram_hit: 0.31, cpu: 5.52, engram_ms: 0.42};
+out.set = m.tierSet(eng).map((x) => [x.key, x.label]); out.shares = sv.tierShares(n, eng);
+out.tip = m.tierTip(n, eng, {disk: 0}); out.calm = m.tierTip({...n, vram_hit: 0.9}, eng, {disk: 0});
+out.sets = ["ds4", "mm3", "qwen", "glm-fast"].map((k) => m.tierSet({engine_kind: k}).map((x) => x.key).join());
+console.log(JSON.stringify(out));""")
+        self.assertEqual(got["family"], "hy4")
+        self.assertEqual(got["others"], ["glm", "glm", "deepseek", "minimax", "qwen", "qwen", "glm"])   # (as before)
+        self.assertEqual([(lv["id"], lv["name"]) for lv in got["levels"]], [("none", "Off"), ("high", "High")])
+        self.assertEqual((got["dflt"], got["key"], got["fastest"]), ("high", "sampling_hy4", "none"))
+        self.assertEqual(sorted(got["titles"]), ["high", "none"])
+        self.assertEqual(got["titles"]["none"], "No thinking: it answers right away (Hy4's no_think)")
+        self.assertEqual(got["nearest"], ["none", None, None, "high", "high", "high", "high"])   # (None: its default, High)
+        self.assertEqual(len(got["pills"]), 2)
+        self.assertEqual((got["name"], got["logo"], got["catalogLogo"]),
+                         ("Hy4 Flash", {"src": "web/logo-hy4.svg", "mono": False}, {"src": "web/logo-hy4.svg", "mono": False}))
+        self.assertTrue((ROOT / "serve" / "web" / "logo-hy4.svg").is_file())
+        self.assertEqual(got["set"], [["cpu", "On the CPU"], ["engram_ms", "N-gram memory"]])
+        self.assertEqual(got["shares"], {"vu": 1900, "ru": 4244, "total": 6144, "disk": 0, "vramGb": None, "ramGb": None,
+                                         "diskGb": None})
+        self.assertTrue(got["tip"].startswith("Most experts run on the CPU"))
+        self.assertEqual(got["calm"], "")
+        self.assertEqual(got["sets"], ["ram_fetch,disk,promo,engram_ms", "ram_fetch,disk,promo", "ram_fetch,disk",
+                                       "ram_fetch,disk,promo"])                   # (the other engines': unchanged)
 
     def test_about_has_the_support_line_always_and_the_update_card_none(self):
         # owner 2026-11-05: one line on About (always, also while an update shows), its link on "supporting me" in bold

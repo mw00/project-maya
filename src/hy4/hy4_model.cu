@@ -36,6 +36,7 @@
 #include <array>
 #include <fstream>
 #include <map>
+#include <mutex>
 #include <thread>
 
 namespace hy4 {
@@ -43,6 +44,10 @@ namespace hy4 {
 namespace iq = strata::ds4::gguf::iq;
 
 extern "C" void quantize_row_q4_K_ref(const float* x, void* y, int64_t k);   // (ggml-quants: ggml's own Q4_K rounding)
+// (ggml-quants' row decoders: a token's embedding row in the K types - the host reads one row a token)
+extern "C" void dequantize_row_q4_K(const void* x, float* y, int64_t k);
+extern "C" void dequantize_row_q5_K(const void* x, float* y, int64_t k);
+extern "C" void dequantize_row_q6_K(const void* x, float* y, int64_t k);
 
 namespace {
 
@@ -93,7 +98,51 @@ float half_to_float(uint16_t h) {
     std::memcpy(&r, &f, 4);
     return r;
 }
+// A token's embedding row (k values) from the file's bytes: Q8_0 as it always was read (d * q, block by block), the K
+// types by ggml's own decoders, F32 / BF16 / F16 as they are.  false: a type the host does not decode
+bool tok_type_ok(int type) { return type == 8 || type == 12 || type == 13 || type == 14 || type == 0 || type == 30 || type == 1; }
+void tok_row(int type, const uint8_t* row, int k, float* dst) {
+    if (type == 8) {
+        for (int b = 0; b < k / 32; ++b) {
+            uint16_t dh;
+            std::memcpy(&dh, row + (size_t) b * 34, 2);
+            const float d = half_to_float(dh);
+            const int8_t* qv = (const int8_t*) (row + (size_t) b * 34 + 2);
+            for (int i = 0; i < 32; ++i) dst[b * 32 + i] = d * (float) qv[i];
+        }
+    } else if (type == 12) {
+        dequantize_row_q4_K(row, dst, k);
+    } else if (type == 13) {
+        dequantize_row_q5_K(row, dst, k);
+    } else if (type == 14) {
+        dequantize_row_q6_K(row, dst, k);
+    } else if (type == 0) {
+        std::memcpy(dst, row, (size_t) k * 4);
+    } else if (type == 30) {
+        for (int i = 0; i < k; ++i) {
+            uint16_t h;
+            std::memcpy(&h, row + (size_t) i * 2, 2);
+            const uint32_t u = (uint32_t) h << 16;
+            std::memcpy(&dst[i], &u, 4);
+        }
+    } else {
+        for (int i = 0; i < k; ++i) {
+            uint16_t h;
+            std::memcpy(&h, row + (size_t) i * 2, 2);
+            dst[i] = half_to_float(h);
+        }
+    }
+}
 
+// BF16 values as F32 (exact: a BF16 is an F32's upper half)
+void bf16_to_f32(const uint16_t* src, size_t n, float* dst) {
+    for (size_t i = 0; i < n; ++i) {
+        uint16_t h;
+        std::memcpy(&h, (const uint8_t*) src + i * 2, 2);
+        const uint32_t u = (uint32_t) h << 16;
+        std::memcpy(dst + i, &u, 4);
+    }
+}
 // ggml's quantize_row_q8_0_ref over rows of k BF16 values (k % 32 == 0), on `threads` threads: the MTP block's BF16
 // matrices and experts as the GEMVs and the experts' kernels read them (Q8_0: 34 bytes a 32 values)
 void bf16_to_q8_0(const uint16_t* src, size_t rows, int k, uint8_t* dst, int threads = 16) {
@@ -242,6 +291,7 @@ struct Gpu {
     // Engram
     uint8_t* eg_rows = nullptr;
     float *eg_valid = nullptr, *eg_r = nullptr, *eg_kvo = nullptr;
+    float* eg_sc = nullptr;   // (the rows' scales [T][cols]: only with a scales file)
     // the head
     float *hcur = nullptr, *logits = nullptr;
     float* route = nullptr;     // (tensor parallel: member 0's and the helpers' routing rows [lat | ids | weights])
@@ -329,6 +379,7 @@ struct Model::Impl {
     int* h_ids = nullptr;
     float *h_w = nullptr, *h_lat = nullptr, *h_cpu = nullptr;
     uint8_t* h_stage = nullptr;   // (pinned: a pass of streamed experts, kStage blobs)
+    const double ev_poll_s = (double) lane_waits().ev_poll_us * 1e-6;   // (0: asleep on the event at once)
     double cpu_us_et = 15.0;      // the CPU lane's microseconds an expert-token on a prompt chunk (measured, EMA)
     // the expert profile: uint32 [n_layer][n_expert] routings - read (Options::profile: the most routed stay in VRAM),
     // counted where the routes reach the host (the CPU lane's layers, every layer with Options::profile_out) and
@@ -380,7 +431,7 @@ struct Model::Impl {
     unsigned* tp_froute = nullptr;
     float* tp_route2 = nullptr;      // (a staggered chunk's second half's routing, and its counter)
     unsigned* tp_froute2 = nullptr;
-    const uint8_t* tok_embd = nullptr;   // (host: the file's Q8_0 rows)
+    const uint8_t* tok_embd = nullptr;   // (host: the file's rows, decoded a token at a time - tok_row)
     int tok_type = -1;
     size_t tok_ld = 0;
     const uint8_t* eg_table = nullptr;   // (host: the Engram table's F8 rows)
@@ -396,6 +447,7 @@ struct Model::Impl {
     std::unique_ptr<Vision> vis;         // the vision tower (Options::vision)
     VisionGeo vgeo;
     double vis_room = 0;                 // its room for the largest picture, kept free on the main GPU
+    int vis_tok = -1, vis_tok_map = -1;  // (the image token's n-gram map entry before the tower took it)
     std::vector<Model::Image> imgs;      // the request's pictures (their positions' rows)
     // the embeddings of positions p0 .. p0 + T - 1 that are a picture's image tokens: its rows (dst [T][E])
     void image_rows(int64_t p0, int T, float* dst) const {
@@ -414,6 +466,17 @@ struct Model::Impl {
     float* h_x = nullptr;                // pinned [Tc][hc][E]
     uint8_t* h_eg = nullptr;             // pinned [modules][Tc][cols][dim]
     float* h_valid = nullptr;            // pinned [Tc]
+    // The Engram norms' eps.  The reference graph's norms have none set and take the machine epsilon of the type they run
+    // in: FP32's 1.1920929e-07 (AngelSlim's runtime, the default here), BF16's 0.0078125 when the release runs in BF16
+    // (hy4.txt's engram_eps, or HY4_ENGRAM_EPS)
+    float eg_eps = 1.1920929e-07f;
+    // The table's row scales (optional): a table of per-row scaled codes, e4m3(x / s) with s = max|row| / 448, has its
+    // BF16 s a row in a file beside it (hy4.txt's engram_scales); the rows' values are then the release's own.  Read
+    // from the disk a looked-up row at a time, as the table
+    const uint8_t* eg_scale = nullptr;
+    float* h_egs = nullptr;              // pinned [modules][Tc][cols]
+    std::FILE* eg_dump = nullptr;        // (HY4_EG_DUMP=<file>, tests: every looked-up row - see engram_row)
+    std::mutex eg_dump_mu;
     int* h_pos = nullptr;                // pinned [3][Tc]: pos, lo, nk
 
     ~Impl() {
@@ -446,6 +509,8 @@ struct Model::Impl {
         if (h_x) cudaFreeHost(h_x);
         if (h_eg) cudaFreeHost(h_eg);
         if (h_valid) cudaFreeHost(h_valid);
+        if (h_egs) cudaFreeHost(h_egs);
+        if (eg_dump) std::fclose(eg_dump);
         if (h_pos) cudaFreeHost(h_pos);
         if (h_emb) cudaFreeHost(h_emb);
         if (h_ids) cudaFreeHost(h_ids);
@@ -520,6 +585,20 @@ struct Model::Impl {
                   std::to_string(batch) + "] in a type maya-hy4 reads";
             return false;
         }
+        // a BF16 matrix (not the output head, which has its own BF16 paths): the same values as F32 in VRAM - the token
+        // path's GEMV sums them in the same order, and the prompt path's GEMM takes F32 weights (BF16 it does not)
+        if (m.type == kBF16 && n != "output.weight") {
+            const size_t nv = (size_t) m.k * (size_t) m.n * (size_t) m.batch;
+            std::vector<float> f(nv);
+            bf16_to_f32((const uint16_t*) pk.data(*t), nv, f.data());
+            float* d = nullptr;
+            if (!gp.alloc(d, nv, err)) return false;
+            CK(cudaMemcpy(d, f.data(), nv * 4, cudaMemcpyHostToDevice));
+            m.w = (const uint8_t*) d;
+            m.type = kF32;
+            m.ld = (size_t) m.k * 4;
+            return true;
+        }
         void* v = nullptr;
         if (!upload(gp, *t, v, err)) return false;
         m.w = (const uint8_t*) v;
@@ -554,14 +633,26 @@ struct Model::Impl {
             for (int r = r0; r < r1; ++r)
                 std::memcpy(h.data() + ((size_t) (b - b0) * (r1 - r0) + (size_t) (r - r0)) * w,
                             src + ((size_t) b * nout + (size_t) r) * ld + o0, w);
+        m.k = c1 - c0;
+        m.n = r1 - r0;
+        m.batch = b1 - b0;
+        if (type == kBF16) {   // (as mat(): a BF16 matrix's part as F32 in VRAM)
+            const size_t nv = h.size() / 2;
+            std::vector<float> f(nv);
+            bf16_to_f32((const uint16_t*) h.data(), nv, f.data());
+            float* d = nullptr;
+            if (!gp.alloc(d, nv, err)) return false;
+            CK(cudaMemcpy(d, f.data(), nv * 4, cudaMemcpyHostToDevice));
+            m.w = (const uint8_t*) d;
+            m.type = kF32;
+            m.ld = (size_t) m.k * 4;
+            return true;
+        }
         uint8_t* d = nullptr;
         if (!gp.alloc(d, h.size(), err)) return false;
         CK(cudaMemcpy(d, h.data(), h.size(), cudaMemcpyHostToDevice));
         m.w = d;
         m.type = type;
-        m.k = c1 - c0;
-        m.n = r1 - r0;
-        m.batch = b1 - b0;
         m.ld = w;
         return true;
     }
@@ -597,7 +688,8 @@ struct Model::Impl {
         size_t b = 0;
         const std::string pre = "blk." + std::to_string(il) + ".";
         for (const auto& [n, t] : pk.t)
-            if (n.compare(0, pre.size(), pre) == 0 && n.find("_exps.") == std::string::npos) b += t.bytes + 256;
+            if (n.compare(0, pre.size(), pre) == 0 && n.find("_exps.") == std::string::npos)
+                b += t.bytes + 256 + (il < g.n_layer && t.type == "BF16" ? t.bytes : 0);   // (BF16: F32 in VRAM, mat())
         if (g.swa[(size_t) il]) b += (size_t) ring * kv_rb();
         else
             b += (size_t) o.max_ctx * kv_rb() + (size_t) (o.max_ctx / g.ix_kpool + 1) * g.ix_dim * pool_b() +
@@ -615,7 +707,11 @@ struct Model::Impl {
         size_t b = 0;
         const std::string pre = "blk." + std::to_string(il) + ".";
         for (const auto& [n, t] : pk.t)
-            if (n.compare(0, pre.size(), pre) == 0) b += t.bytes + 256;
+            if (n.compare(0, pre.size(), pre) == 0) {
+                b += t.bytes + 256;
+                // (a trunk layer's BF16 matrices sit in VRAM as F32 - mat(); the MTP block's are rounded to Q8_0)
+                if (il < g.n_layer && t.type == "BF16" && n.find("_exps.") == std::string::npos) b += t.bytes;
+            }
         // caches
         if (g.swa[(size_t) il]) b += (size_t) ring * kv_rb();
         else
@@ -855,6 +951,19 @@ struct Model::Impl {
             double eb = 0;
             for (int il = 0; il < g.n_layer; ++il) eb = std::max(eb, (double) expert_bytes(il));
             for (double& f : free_b) f -= eb * kStage;
+        }
+        if (vis_room > 0 && o.vision_auto && !place(rho, false) && !place(0.0, false)) {
+            // (a card the model's own parts fill: no room kept for a picture - text only, said, rather than no start;
+            //  --vision on asks for the tower by name and gets the error below)
+            char vb[240];
+            std::snprintf(vb, sizeof vb, "NOTE vision off: CUDA%d has no room for a picture (%.0f MB) beside the model's "
+                          "dense parts and caches at this context - text only", G[(size_t) main_gi].dev,
+                          vis_room / 1048576.0);
+            info.push_back(vb);
+            free_b[(size_t) main_gi] += vis_room;
+            vis_room = 0;
+            o.vision = false;
+            if (vis_tok >= 0) pk.eg.token_map[(size_t) vis_tok] = vis_tok_map;
         }
         if (!place(rho, false)) {
             double lo = 0.0, hi = rho;
@@ -1292,7 +1401,7 @@ struct Model::Impl {
             return false;
         for (const Mat* m : {&l.q_a, &l.q_b, &l.kv_a, &l.k_b, &l.v_b, &l.wo, &l.gate})
             if (m->type == kF32 || m->type == kBF16 || m->type == kF16 || m->type == kF8) {
-                err = p + ": an attention matrix in " + std::to_string(m->type) + " (maya-hy4 runs ggml's block types)";
+                err = p + ": an attention matrix in F32 / BF16 / F16 (maya-hy4 runs ggml's block types there)";
                 return false;
             }
         if (l.mtp && (!f32(gp, p + "nextn.enorm.weight", l.enorm, err, E) ||
@@ -1566,6 +1675,7 @@ struct Model::Impl {
                gp.alloc(gp.ivt, T * 2 * g.ix_dim, err) && gp.alloc(gp.wt, T * g.ix_heads, err) &&
                gp.alloc(gp.score, (size_t) kSub * npool, err) && gp.alloc(gp.eg_rows, T * egc, err) &&
                gp.alloc(gp.eg_valid, T, err) && gp.alloc(gp.eg_r, T * egc, err) &&
+               (eg_scale == nullptr || gp.alloc(gp.eg_sc, T * (size_t) std::max(1, pk.eg.cols()), err)) &&
                gp.alloc(gp.eg_kvo, T * (hc + 1) * E, err) && gp.alloc(gp.hcur, T * E, err) &&
                gp.alloc(gp.xh16, T * qk, err) && gp.alloc(gp.wband, kBand, err) && gp.alloc(gp.sh16, 16 * T * ffe, err) &&
                gp.alloc(gp.sy, 16 * T * lat, err) && gp.alloc(gp.cpo, T * lat, err) && gp.alloc(gp.bounds, 1025, err) && gp.alloc(gp.stok, 16 * T, err) &&
@@ -1597,7 +1707,11 @@ struct Model::Impl {
                 vis_room = (double) Vision::room_for(vgeo);
                 // an image token's position has no n-gram (Engram's reference masks it, and a later token's history
                 // pads it): its id maps to none
-                if (pk.eg.modules > 0 && vgeo.image_token < pk.eg.vocab) pk.eg.token_map[(size_t) vgeo.image_token] = -1;
+                if (pk.eg.modules > 0 && vgeo.image_token < pk.eg.vocab) {
+                    vis_tok = vgeo.image_token;
+                    vis_tok_map = pk.eg.token_map[(size_t) vis_tok];
+                    pk.eg.token_map[(size_t) vis_tok] = -1;
+                }
             } else if (!o.vision_auto) {
                 err = verr;
                 return false;
@@ -1625,8 +1739,9 @@ struct Model::Impl {
         if (!te) return false;
         tok_type = type_id(te->type);
         tok_ld = row_bytes(tok_type, g.n_embd);
-        if (tok_type != 8 || te->n(0) != g.n_embd || te->n(1) < g.n_vocab) {
-            err = "token_embd: " + te->type + " (maya-hy4 reads Q8_0 embeddings)";
+        if (!tok_type_ok(tok_type) || tok_ld == 0 || te->n(0) != g.n_embd || te->n(1) < g.n_vocab ||
+            tok_ld * (size_t) te->n(1) != te->bytes) {
+            err = "token_embd: " + te->type + " (maya-hy4 reads Q8_0, Q4_K, Q5_K, Q6_K, F32, BF16 or F16 embeddings)";
             return false;
         }
         tok_embd = pk.data(*te);
@@ -1639,11 +1754,37 @@ struct Model::Impl {
             }
             eg_table = pk.data(*tt);
             eg_bytes = tt->bytes;
+            if (pk.has("engram_eps")) eg_eps = (float) pk.num("engram_eps");
+            if (const char* ee = std::getenv("HY4_ENGRAM_EPS")) eg_eps = (float) std::atof(ee);
+            if (!(eg_eps > 0.0f) || eg_eps > 1.0f) {
+                err = "the Engram norms' eps " + std::to_string(eg_eps) + " (engram_eps / HY4_ENGRAM_EPS)";
+                return false;
+            }
+            const char* es = std::getenv("HY4_ENGRAM_SCALES");
+            if (pk.has("engram_scales") && !(es && std::atoi(es) == 0)) {
+                const std::string sp0 = pk.str("engram_scales");
+                const std::string sp = !sp0.empty() && sp0[0] == '/' ? sp0 : pk.model_dir + "/" + sp0;
+                size_t sz = 0;
+                eg_scale = mm3::os::map_file(sp, sz);
+                if (eg_scale == nullptr || sz < (size_t) tt->n(1) * 2) {
+                    err = sp + ": not the Engram table's row scales (BF16, one a row)";
+                    return false;
+                }
+                CK(cudaMallocHost(&h_egs, sizeof(float) * (size_t) pk.eg.modules * Tc * pk.eg.cols()));
+            }
+            if (const char* ed = std::getenv("HY4_EG_DUMP")) eg_dump = std::fopen(ed, "wb");
+            {
+                char buf[200];
+                std::snprintf(buf, sizeof buf, "INFO Engram: %d layers, the table read from the disk a row at a time; "
+                              "norm eps %.9g; row scales %s", pk.eg.modules, (double) eg_eps, eg_scale ? "on" : "none");
+                info.push_back(buf);
+            }
             // its pages mapped into this process in the background (MADV_POPULATE_READ, else a read a page): a
             // window's lookups land on random pages of tens of GB, and each first touch is a page fault - faults that
-            // queue on the process's memory map (HY4_EG_POPULATE=0: none)
+            // queue on the process's memory map.  Off unless asked (HY4_EG_POPULATE=1): the table stays on the disk and
+            // a looked-up row's page is read at its first use - Maya never pulls an n-gram table into RAM by itself
             const char* ep = std::getenv("HY4_EG_POPULATE");
-            if (!(ep && std::atoi(ep) == 0)) {
+            if (ep && std::atoi(ep) != 0) {
                 eg_populator = std::thread([this] {
 #if defined(__linux__)
                     (void) nice(10);
@@ -1735,6 +1876,9 @@ struct Model::Impl {
                           now_s() - tm);
             info.push_back(buf);
         }
+        if (g.n_mtp == 0)   // (a set without the MTP block - the public release's layout: every token by the model itself)
+            info.push_back(std::string("INFO no MTP draft block in this model's files: decoding without drafts") +
+                           (o.mtp ? " (--mtp has nothing to load)" : ""));
         if (out.type != kBF16 && out.type != kF32 && !iq::mv_supported(out.type)) {
             err = "output.weight: a type maya-hy4 does not read";
             return false;
@@ -1797,6 +1941,32 @@ struct Model::Impl {
                         place_experts(l.cex, cpu, nodes, placer_stop);
                     }
                 });
+            } else {
+                // one node: the lane's experts read into this process in the background when the RAM holds them
+                // all (file cache included) - a decode's first touch of an expert then pays no page fault a page,
+                // nor the disk after a cold start.  Asked for (HY4_LANE_WARM=1): the thread takes a
+                // minute or two a 40 GB of experts on Windows and slows a decode beside it a little meanwhile
+                uint64_t lane_bytes = 0;
+                for (const Layer& l : L)
+                    if (l.partial())
+                        lane_bytes += (uint64_t) (g.n_expert - l.n_res) * (2 * l.cex.g_stride + l.cex.d_stride);
+                const char* we = std::getenv("HY4_LANE_WARM");
+                const uint64_t avail = ram_available();
+                if (we && std::atoi(we) != 0 && avail > 0 && (double) avail > 1.1 * (double) lane_bytes + 2e9) {
+                    info.push_back("INFO CPU lane: its experts are read into memory in the background");
+                    placer = std::thread([this] {
+#if defined(__linux__)
+                        (void) nice(10);
+#endif
+                        for (const Layer& l : L) {
+                            if (!l.partial()) continue;
+                            std::vector<int> cpu;
+                            for (int e = 0; e < (int) l.slot_of.size(); ++e)
+                                if (l.slot_of[(size_t) e] < 0) cpu.push_back(e);
+                            warm_experts(l.cex, cpu, placer_stop);
+                        }
+                    });
+                }
             }
         }
         st.experts_vram = n_res;
@@ -1879,13 +2049,19 @@ struct Model::Impl {
     // HY4_INJECT_FROM=<pos>: only the windows from that position are measured, the per-name sums printed at the end
     // of each forward (inject_report); one window prompts print every comparison as it is made.
     const char* inject = std::getenv("HY4_INJECT");
-    const bool prof = std::getenv("HY4_PROF") != nullptr;   // (tests: the layers' time by kind, synced at each step)
+    // (tests: the layers' time by kind, synced at each step; the names with a leading space are parts of "ffn, experts")
+    const bool prof = (lane_prof().on = std::getenv("HY4_PROF") != nullptr);
     std::map<std::string, double> prof_acc;
     void prof_report() {
         double all = 0;
-        for (const auto& [k2, v] : prof_acc) all += v;
         for (const auto& [k2, v] : prof_acc)
-            std::fprintf(stderr, "PROF %-30s %8.3f s  %5.1f%%\n", k2.c_str(), v, 100.0 * v / std::max(all, 1e-9));
+            if (k2[0] != ' ') all += v;
+        for (const auto& [k2, v] : prof_acc)
+            std::fprintf(stderr, "PROF %-36s %8.3f s  %5.1f%%\n", k2.c_str(), v, 100.0 * v / std::max(all, 1e-9));
+        const LaneProf& lp = lane_prof();
+        if (lp.calls > 0)
+            std::fprintf(stderr, "PROF lane calls %lld, entries %lld: grouping %.3f s, gate/up %.3f s, down %.3f s, sums %.3f s\n",
+                         lp.calls, lp.entries, lp.prep_s, lp.gate_up_s, lp.down_s, lp.sum_s);
     }
     int64_t cur_p0 = 0;
     std::map<std::string, std::vector<float>> ref_cache;
@@ -2464,7 +2640,20 @@ struct Model::Impl {
                 if (T <= W)
                     ok = ok && mm_multi(gp, {{&l.sh_gate, gp.gu, (size_t) sf}, {&l.sh_up, gp.gu + (size_t) T * sf,
                                                                                 (size_t) sf}}, gp.xf, E, T);
-                CK(cudaEventSynchronize(gp.ev));
+                const double tw = now_s();
+                // (a token's copies are there within a millisecond or two: polled that long - a thread that sleeps on
+                //  the event comes back late on some hosts, and the lane's threads wait for it - then, a prompt
+                //  chunk's long wait, asleep on the event.  HY4_EV_POLL_US: the polled time, 0 = asleep at once)
+                for (cudaError_t q;;) {
+                    if (ev_poll_s <= 0.0 || (q = cudaEventQuery(gp.ev)) == cudaErrorNotReady) {
+                        if (ev_poll_s > 0.0 && now_s() - tw < ev_poll_s) continue;
+                        CK(cudaEventSynchronize(gp.ev));
+                        break;
+                    }
+                    CK(q);
+                    break;
+                }
+                if (prof) prof_acc[T > W ? " lane: wait for the routes (prompt)" : " lane: wait for the routes (token)"] += now_s() - tw;
             }
             const int* slot = lane_on || l.tpm >= 0 ? l.slot_d : nullptr;
             bool streamed = false;
@@ -2509,6 +2698,7 @@ struct Model::Impl {
                 cpu_experts(*lane, l.cex, lane_entries, h_lat, T, h_cpu);
                 const double ms = (now_s() - tc) * 1e3;
                 st.cpu_ms += ms;
+                if (prof) prof_acc[T > W ? " lane: the CPU's experts (prompt)" : " lane: the CPU's experts (token)"] += ms * 1e-3;
                 if (T > W && !lane_entries.empty())   // (the prompt chunks' rate: what the route choice weighs)
                     cpu_us_et = 0.8 * cpu_us_et + 0.2 * (ms * 1e3 / (double) lane_entries.size());
                 st.cpu_experts += (int64_t) lane_entries.size();
@@ -2587,6 +2777,20 @@ struct Model::Impl {
                     const int col = (oo - 1) * eg.heads + h;
                     const uint64_t row = rolling % primes[col] + offs[col];
                     std::memcpy(dst + ((size_t) t * cols + col) * hd, eg_table + row * (uint64_t) hd, (size_t) hd);
+                    float sc = 1.0f;
+                    if (eg_scale != nullptr) {
+                        uint16_t sb;
+                        std::memcpy(&sb, eg_scale + row * 2, 2);
+                        bf16_to_f32(&sb, 1, &sc);
+                        h_egs[((size_t) e * Tc + (size_t) t) * cols + col] = sc;
+                    }
+                    if (eg_dump != nullptr) {   // (int64 module, position, column, row; float scale; the row's bytes)
+                        std::lock_guard<std::mutex> lk(eg_dump_mu);
+                        const int64_t rec[4] = {e, p, col, (int64_t) row};
+                        std::fwrite(rec, 8, 4, eg_dump);
+                        std::fwrite(&sc, 4, 1, eg_dump);
+                        std::fwrite(eg_table + row * (uint64_t) hd, 1, (size_t) hd, eg_dump);
+                    }
                 }
             }
             if (e == 0) h_valid[t] = dead ? 0.0f : 1.0f;
@@ -2602,8 +2806,11 @@ struct Model::Impl {
         CK(cudaMemcpyAsync(gp.eg_rows, h_eg + ((size_t) l.eg * Tc + (size_t) r0) * cols * hd, (size_t) T * cols * hd,
                            cudaMemcpyHostToDevice, s));
         CK(cudaMemcpyAsync(gp.eg_valid, h_valid + r0, sizeof(float) * T, cudaMemcpyHostToDevice, s));
-        const float eps = 1.1920929e-07f;   // (the reference's RMSNorms with eps unset: FP32's machine epsilon)
-        k::engram_rows(gp.eg_rows, gp.eg_valid, T, cols, hd, l.eg_lookup, eps, gp.eg_r, s);
+        const float eps = eg_eps;
+        if (eg_scale != nullptr)
+            CK(cudaMemcpyAsync(gp.eg_sc, h_egs + ((size_t) l.eg * Tc + (size_t) r0) * cols, sizeof(float) * T * cols,
+                               cudaMemcpyHostToDevice, s));
+        k::engram_rows(gp.eg_rows, gp.eg_valid, T, cols, hd, l.eg_lookup, eps, gp.eg_r, s, eg_scale ? gp.eg_sc : nullptr);
         dbg("engram_rows_normed", l.il, gp, gp.eg_r, T, (size_t) cols * hd);
         if (!mm(gp, l.eg_kv, gp.eg_r, (size_t) cols * hd, T, gp.eg_kvo, (size_t) (g.hc + 1) * E)) {
             err = "engram_kv: a GEMV the kernels do not take";
@@ -2629,14 +2836,7 @@ struct Model::Impl {
         }
         for (int t = 0; t < T; ++t) {   // (the embeddings, host-dequantised as the trunk's)
             const uint8_t* row = tok_embd + (size_t) ids[t] * tok_ld;
-            float* dst = h_emb + (size_t) t * E;
-            for (int b = 0; b < E / 32; ++b) {
-                uint16_t dh;
-                std::memcpy(&dh, row + (size_t) b * 34, 2);
-                const float d = half_to_float(dh);
-                const int8_t* qv = (const int8_t*) (row + (size_t) b * 34 + 2);
-                for (int i = 0; i < 32; ++i) dst[b * 32 + i] = d * (float) qv[i];
-            }
+            tok_row(tok_type, row, E, h_emb + (size_t) t * E);
         }
         if (!imgs.empty()) image_rows(p0, T, h_emb);   // (a picture's image tokens: its rows, as the trunk's)
         CK(cudaMemcpyAsync(mtp_cur, h_emb, sizeof(float) * T * E, cudaMemcpyHostToDevice, s));
@@ -2786,14 +2986,7 @@ struct Model::Impl {
                 return false;
             }
             const uint8_t* row = tok_embd + (size_t) id * tok_ld;
-            float* dst = h_x + (size_t) t * E;   // ([T][E]: the GPUs copy each row into the hc streams)
-            for (int b = 0; b < E / 32; ++b) {
-                uint16_t dh;
-                std::memcpy(&dh, row + (size_t) b * 34, 2);
-                const float d = half_to_float(dh);
-                const int8_t* qv = (const int8_t*) (row + (size_t) b * 34 + 2);
-                for (int i = 0; i < 32; ++i) dst[b * 32 + i] = d * (float) qv[i];
-            }
+            tok_row(tok_type, row, E, h_x + (size_t) t * E);   // ([T][E]: the GPUs copy each row into the hc streams)
         }
         if (!imgs.empty()) image_rows(p0, T, h_x);   // (a picture's image tokens: its rows)
         const double te = now_s();
@@ -3097,6 +3290,7 @@ struct Model::Impl {
         v.wt += r * (size_t) g.ix_heads;
         v.eg_rows += r * egc;
         v.eg_valid += r;
+        if (v.eg_sc) v.eg_sc += r * (size_t) pk.eg.cols();
         v.eg_r += r * egc;
         v.eg_kvo += r * (hc + 1) * E;
         if (v.h16) {

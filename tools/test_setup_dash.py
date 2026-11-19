@@ -76,6 +76,19 @@ class Boxes(unittest.TestCase):
         self.assertIn("live · 19,456 routed experts", D.tiers_sub(METRICS).plain)
         self.assertIn("while it writes", text(D.tiers({"engine": {}}, 56)))    # (the mock engine: no tiers)
 
+    def test_hy4_its_cpu_lane_and_ngram_row(self):   # (maya-hy4: VRAM or the CPU lane from RAM, the n-gram table's read)
+        now = {"tok_s": 9.1, "ms_tok": 110.0, "vram_hit": 0.31, "cpu": 5.52, "engram_ms": 0.42, "time": time.time()}
+        m = {"engine": {"engine_kind": "hy4", "experts": "6144", "vram_slots": "1900"},   # (its INFO line: text)
+             "tiers": {"now": now, "history": {"cpu": [5.0, 5.52], "engram_ms": [0.4, 0.42]}}}
+        out = text(D.tiers(m, 120), 122)
+        for want in ("VRAM", "1,900", "RAM (run on the CPU)", "4,244", "On the CPU", "5.52", "N-gram memory", "0.42",
+                     D.TIPS["ds4_cpu"][0]):
+            self.assertIn(want, out)
+        for other in ("SSD", "Promoted", "From RAM", "Disk reads", "Pinned RAM"):   # (tiers the engine does not have)
+            self.assertNotIn(other, out)
+        calm = {**m, "tiers": {**m["tiers"], "now": {**now, "vram_hit": 0.9}}}
+        self.assertNotIn(D.TIPS["ds4_cpu"][0], text(D.tiers(calm, 120), 122))
+
     def test_the_tiers_bar_fits_when_the_tiers_overlap(self):   # (Maya-L on 9 GPUs: 10,813 + 1,571 of 12,096)
         now = {**METRICS["tiers"]["now"], "vram_used": 10813, "ram_used": 1571}
         m = {**METRICS, "engine": {**METRICS["engine"], "experts": 12096}, "tiers": {**METRICS["tiers"], "now": now}}

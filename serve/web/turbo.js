@@ -5,7 +5,7 @@
 // the engine's is in the run config (serve/models.py).
 import {html} from "./preact.js";
 import {api, esc, store} from "./lib.js";
-import {S, THINKING, P, confirmDialog, emit, loadPrefs, prefsKey, toast} from "./state.js";
+import {S, THINKING, P, confirmDialog, emit, familyOf, loadPrefs, prefsKey, toast} from "./state.js";
 import {loadTime} from "./server.js";
 import {turboEnter, turboLeave} from "./turbo-core.js";
 
@@ -107,7 +107,8 @@ export async function setTurbo(on) {
 export function TurboButton() {
   const t = S.turbo;
   if (t.unavailable || t.hidden) return null;   // (hidden: GLM-5.3 (744B), until Turbo's values are measured on it)
-  const tip = t.on ? "Turbo ON: trades quality for maximum speed (greedy decoding, no thinking, expert skipping, aggressive drafting). Click to put your settings back."
+  // (Hy4-Flash: its engine has no expert skipping and no drafting yet - Turbo is the request's half alone)
+  const tip = t.on ? `Turbo ON: trades quality for maximum speed (greedy decoding, no thinking${familyOf() === "hy4" ? "" : ", expert skipping, aggressive drafting"}). Click to put your settings back.`
                    : "Turbo: trades quality for maximum speed, for benchmarks and playing with the engine. Your own settings come back when you switch it off.";
   return html`<button type="button" class=${`turbo${t.on ? " turbo--on" : ""}${t.busy ? " turbo--busy" : ""}`} aria-pressed=${t.on ? "true" : "false"}
       title=${tip} disabled=${t.busy} onClick=${() => setTurbo(!t.on)}>

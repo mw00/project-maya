@@ -4,6 +4,20 @@ Every release is on GitHub (Releases) with these notes; every published change m
 page's Settings › About and updates (About > Update before the redesign; from v1.0.18), or `git pull`, then `./setup.sh` (Windows: `START-MAYA.bat`) - it recompiles
 only what changed and starts; the model is not downloaded again.
 
+## v1.1.68 - draft, not released
+
+A new model: Hy4-Flash, Tencent's 220 B model, on an engine of its own, with Maya's own quant for PCs with about 56-64 GB of RAM + VRAM and cards from 8 GB.
+
+- **New model: Hy4-Flash:** Tencent's [Hy4-flash](https://huggingface.co/tencent/Hy4-flash) (220 B parameters; the Tencent Hy License) runs on a new engine, `maya-hy4`, contributed by @needmorevram (#1040). Set it up with `./maya.sh --setup --model hy4-flash-maya-xs` (Windows: `START-MAYA.bat`), or pick "Hy4-Flash" in the setup's model list.
+- **Maya's own quants of it:** [Hy4-Flash · Maya-XS](https://huggingface.co/peasantsmith/Hy4-Flash-Maya-GGUF) is available now (a model file of 44.8 GB, the routed experts in 2 bits), more sizes to follow. Every size shares one n-gram table (63.4 GB, Tencent's own values): it is downloaded once, stays on the SSD and is read from there while the model answers, so it does not need to fit in memory. About 110 GB of disk in all; keep it on an SSD / NVMe, not a hard disk.
+- **Setup and model picker:** the setup checks the PC and picks the layout and the context that fit the card by itself (4K to 128K). For a card of 8 GB it picks a layout of Maya-XS made for small cards (slightly lower quality); a card with less than about 7 GB of free VRAM cannot run the model, and the setup says so. It downloads the files from Maya's repo, builds the engine's index of them and writes the config. `--model-dir <folder>` uses files you already have.
+- **Tencent's own Q4_K_M, with drafting:** the same setup also offers Tencent's own Q4_K_M (AngelSlim's GGUF) after Maya's sizes, or directly with `--model hy4-flash-q4_k_m`: it carries the model's MTP block, so it drafts (`--drafting off` turns that off). It needs about 170 GB of RAM + VRAM and was run on Linux with NVIDIA RTX 30 / A100 and newer cards. Contributed by @needmorevram (#1040).
+- **The model's own defaults:** Tencent's sampling (temperature 0.9, top-p 1.0), the release's own chat template, and its two thinking levels: High (the default) and Off; any other level asked for runs at High. Tool calls work, and the loop guard is on as for every model.
+- **Dashboard:** Hy4-Flash has its entry on the Models page (load, unload, delete; context, GPUs, tensor parallel, prompt chunk, CPU threads, VRAM kept free), the chat offers its thinking levels High and Off, and the Monitor shows the experts on the GPU against those computed on the CPU and the n-gram table's read time.
+- **Engine work for our files and small cards:** the engine reads the token embeddings and matrices in the types Maya's files use, keeps the n-gram table on the disk instead of mapping it into memory in the background (`HY4_EG_POPULATE=1` restores that), and the pack ignores the model's other files. The CPU threads that compute the experts outside VRAM stay busy through an answer instead of sleeping between layers: decoding is faster, and the CPU runs hotter while the model answers (`HY4_LANE_WAITS=0` turns that off; docs/SETTINGS.md).
+- **Known limits:** NVIDIA on Linux and Windows only (not AMD, not Mac); text only for now and one request at a time (no `--parallel`): vision and concurrency are coming soon; no drafting on Maya's sizes yet.
+- **Docs:** Hy4-Flash in the README (all four languages), docs/MODELS.md, docs/SETUP.md, docs/MEMORY.md and docs/SETTINGS.md.
+
 ## v1.1.67 - 2026-11-18
 
 A correctness fix for GLM on PCs where the experts do not all fit in VRAM, GLM now starts on a small graphics card instead of refusing, a fix for fresh installs on Windows, a little more GLM speed on the AMD + NVIDIA pair, and more exact wording about drafting.
