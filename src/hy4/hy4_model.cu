@@ -1145,9 +1145,15 @@ struct Model::Impl {
         if (!place(rho, false)) {
             double lo = 0.0, hi = rho;
             if (!place(0.0, false)) {
+                // (what helps: a smaller context only above the smallest one offered - the setup's 4K, maya.py's
+                //  HY4_CONTEXTS - else a smaller size of the model or more VRAM)
+                constexpr long long kLeastCtx = 4096;
                 err = std::string("the model's dense parts and caches do not fit in the GPUs' VRAM even with every routed "
                                   "expert on the CPU") + (o.kv < 0 && kv_q8_rows() ? " and the latent cache in 8-bit rows" : "") +
-                      " (--max-context smaller, or more GPUs)";
+                      ((long long) o.max_ctx > kLeastCtx
+                           ? " (--max-context smaller, a smaller size of the model, or more GPUs)"
+                           : " (at the smallest context, 4096 tokens: a smaller size of the model, a card with more VRAM, "
+                             "or more GPUs)");
                 return false;
             }
             for (int it = 0; it < 30; ++it) {
