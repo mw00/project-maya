@@ -62,6 +62,7 @@ struct ChunkTry {
     bool vision = false;
     long long pixels = 0;
     bool own = false;        // tensor parallel: the MTP block's pass on a scratch of its own (dense_pick's alone)
+    bool head = false;       // tensor parallel: the output head's rows over the members too (dense_pick's alone)
     long long res = 0;       // the routed experts the plan keeps in VRAM, over the layers (dense_pick's alone)
 };
 
@@ -107,7 +108,8 @@ inline size_t dense_bytes(size_t sub, size_t H, size_t n_swa, size_t chunk, size
 
 /// The span of the dense prompt path a start takes: the largest of `cands` (largest first) whose plan `plan_at(span)`
 /// comes to what the plan at `base` comes to - the same layout, the same rows of the cache, pictures as large, and
-/// in tensor parallel the MTP block's pass still on its own scratch, and as many routed experts in VRAM (a card that
+/// in tensor parallel the MTP block's pass still on its own scratch and the output head still over the members (each
+/// token's head otherwise on the head's GPU alone: slower decoding), and as many routed experts in VRAM (a card that
 /// holds a part of the experts would give some up for the span's buffers: other experts on the CPU lane, so slower
 /// decoding and other rounding in every answer - there `base` stays).  A longer span only makes prompts between
 /// `base` and it faster, so it never costs any of those, and never a start: `base` stays where no candidate keeps
@@ -120,7 +122,7 @@ int dense_pick(PlanAt&& plan_at, const Cands& cands, int base) {
         if (d <= base) continue;
         const ChunkTry t = plan_at(d);
         if (t.ok && t.tp == ref.tp && t.q8 == ref.q8 && t.vision == ref.vision && t.pixels >= ref.pixels &&
-            t.own == ref.own && t.res >= ref.res)
+            t.own == ref.own && t.head == ref.head && t.res >= ref.res)
             return d;
     }
     return base;

@@ -75,8 +75,9 @@ public:
     /// before it), each MTP step's top token and its probability, stopping after one below `floor`.  A forward keeps
     /// the block's caches in step with the trunk's (every forward runs it over its tokens), so the drafts after an
     /// accepted prefix need nothing else.  has_mtp(): the block is loaded.
+    /// (base >= 0: the drafts after the first `base` only while every draft so far has a probability of at least `sure`)
     bool draft(int tok, int64_t pos, int n, float floor, std::vector<int>& drafts, std::vector<float>& conf,
-               std::string& err);
+               std::string& err, int base = -1, float sure = 0.0f);
     bool has_mtp() const;
     /// The routings counted (with the profile read at the load) to Options::profile_out; no file named: nothing
     bool save_profile(std::string& err) const;
@@ -90,6 +91,10 @@ public:
     int64_t end() const;
 
     int vocab() const;
+    /// Row r of the last forward's logits: its largest value's index (of equals the lowest - the host's argmax), found
+    /// by the GPUs that computed the row's parts (tensor parallel with the head over the members); -1: not known, the
+    /// caller's own walk over the row
+    int row_top(int r) const;
     int64_t max_ctx() const;
     /// the most tokens a forward reads at once (the prompt path's chunk): a prompt in calls of this many reports its
     /// progress between them

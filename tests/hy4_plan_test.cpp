@@ -255,6 +255,20 @@ int main() {
         own.tried.clear();
         CHECK(hy4::dense_pick(own, kSpans, 8192) == 16384);
         CHECK(own.tried == "8192 24576 16384 ");
+        // ... or the output head's rows over the members (a slice a member, `head_gb`): the span that keeps them
+        struct Head : Span {
+            double head_gb;
+            hy4::ChunkTry operator()(int d) {
+                hy4::ChunkTry t = Span::operator()(d);
+                t.head = t.tp > 0 && need + per_8k * d / 8192.0 + head_gb <= vram;
+                return t;
+            }
+        };
+        Head head{{14.3, 14.0, 0.075, true, false, 1 << 30, 1 << 30, ""}, 0.11};
+        CHECK(head(8192).head && head(24576).tp == 3 && !head(24576).head && head(16384).head);
+        head.tried.clear();
+        CHECK(hy4::dense_pick(head, kSpans, 8192) == 16384);
+        CHECK(head.tried == "8192 24576 16384 ");
         // any longer span would cost tensor parallel (the layer split would hold it): the base
         Span tight{14.1, 14.0, 0.075, true, false, 1 << 30, 1 << 30, ""};
         CHECK(tight(16384).ok && tight(16384).tp == 0);

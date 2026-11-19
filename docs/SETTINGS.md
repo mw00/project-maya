@@ -2470,9 +2470,9 @@ files - a 9-GPU NVIDIA PC (an RTX 3090 and eight RTX 5060 Ti on PCIe 3, two Xeon
 
 | Experts in VRAM | Decode, tok/s | Prompt, tok/s |
 |---|---:|---:|
-| all, tensor parallel over the eight 5060 Ti (the 3090: head, drafts, a share of the experts), no drafts | 72 | a little above `--mtp`'s |
-| ... `--mtp`, greedy (code / chat) | 156 / 119-129 | 1980-1990 (8K) / 1680 (16K) |
-| ... `--mtp`, sampled at 0.9 (code / chat) | 141-150 / 116 | the same |
+| all, tensor parallel over the eight 5060 Ti (the 3090: head, drafts, a share of the experts), no drafts | 86 | a little above `--mtp`'s |
+| ... `--mtp`, greedy (code / chat) | 201-203 / 163 | 1980-1990 (8K) / 1680 (16K) |
+| ... `--mtp`, sampled at 0.9 (code / chat) | 182-197 / 142-151 | the same |
 | all, layer split (`--tp 0`), no drafts | 33.7 | 450-580 |
 | ... `--mtp` (code / prose) | 66 / 55 | the same |
 | 75% (layer split) | 24.5 | - |
@@ -2534,8 +2534,11 @@ Engine options, in the config's `"args"`:
 | `--profile` | - | an expert profile (uint32 routings, [layers][experts]): each layer's most routed experts are the ones in VRAM |
 | `--profile-out` | - | where the routings counted in this run (with `--profile`'s) are written, after each request |
 | `--mtp` | off | the MTP block drafts tokens, the model checks them (the same tokens) |
-| `--draft` | 3 | with `--mtp`: drafts a step at most |
+| `--draft` | 3 | with `--mtp`: drafts a step at most (`--draft-more` may add to them) |
 | `--draft-floor` | 0.55 | with `--mtp`: the drafts end at one the block gives less than this probability |
+| `--draft-more` | 1 | with `--mtp`: drafts a step may add beyond `--draft` - one for every `--draft-streak` steps in a row before it whose drafts were all kept, while every draft of the step so far and the added one are at least `--draft-sure` sure. Where the added drafts stop being kept (fewer than half of the recent ones), they are left out for a while, twice as long each time. `0`: `--draft` at most |
+| `--draft-sure` | 0.8 | with `--draft-more`: the block's probability each draft of the step needs before one more is drafted |
+| `--draft-streak` | 1 | with `--draft-more`: the steps in a row with all their drafts kept that an added draft needs (`0`: none) |
 | `--eos` | the GGUF's | the token ids that end an answer |
 | `--kv` | `auto` | the latent cache's rows: `f16`, `q8` (8 bits: 58% of the VRAM a position), or `auto` - F16 where the context fits in VRAM with it, the 8-bit rows where it fits only with them (any layout: one GPU, the layer split, tensor parallel) |
 | `--vision` | on when the pack has the tower | `off`: text only, and no room kept for pictures on the main GPU; `on`: an error when the pack has no tower |
@@ -2555,11 +2558,23 @@ A request's `spec` (0 / 1) turns the drafts off or on for it.
 | `HY4_VISION_F32` | off | the vision tower's attention products in F32 instead of TF32 (a little slower where TF32 is faster) |
 | `HY4_TP_HELPER` | by speed | tensor parallel: `0` no expert share for the GPUs outside the group; `k`: k slices each (as their VRAM allows) |
 | `HY4_TP_MIXED` | off | tensor parallel over GPUs of different kinds (their copies of the state may drift apart) |
-| `HY4_DENSE_MAX` | picked at the start | prompts: up to how many earlier positions the 12 indexed layers' attention runs on the tensor cores (one FP16 product over every earlier key, the indexer's picks kept by a mask) before it goes to the gathering kernel the token path uses. Both read the indexer's same picks, so the limit moves no pick - only how a token's attention is summed (answers can differ in the last bits, as between two prompt chunks). The tensor-core path's time grows with the positions, the gathering kernel's does not: on Tesla V100s they cross at about 24,000. At every start the engine takes the largest of 24576 / 16384 whose buffers (about 215 MB a GPU for 24576, a third of that on a tensor-parallel member) fit the plan without costing the layout, the cache's rows, the pictures, the MTP pass's own scratch or a routed expert its place in VRAM, on GPUs with tensor cores (compute capability 7.0 and later), and 8192 otherwise; its start line says which (`INFO prompts: the indexed layers' attention on the tensor cores up to N positions`). So GPUs that hold every expert (tensor parallel, a layer split with room) take a longer span, and a card that holds a part of the experts beside the CPU lane keeps 8192 - its decoding and its answers stay as they were. `HY4_DENSE_MAX=N` tries N alone (up to 65536; it is taken where the plan holds it, also where it moves some experts from the VRAM to the CPU lane: on one Tesla V100 a 16K prompt read 7% faster with 24576, with 1.5% fewer experts in VRAM); `HY4_DENSE_MAX=8192`: as before v1.1.68 |
+| `HY4_DENSE_MAX` | picked at the start | prompts: up to how many earlier positions the 12 indexed layers' attention runs on the tensor cores (one FP16 product over every earlier key, the indexer's picks kept by a mask) before it goes to the gathering kernel the token path uses. Both read the indexer's same picks, so the limit moves no pick - only how a token's attention is summed (answers can differ in the last bits, as between two prompt chunks). The tensor-core path's time grows with the positions, the gathering kernel's does not: on Tesla V100s they cross at about 24,000. At every start the engine takes the largest of 24576 / 16384 whose buffers (about 215 MB a GPU for 24576, a third of that on a tensor-parallel member) fit the plan without costing the layout, the cache's rows, the pictures, the MTP pass's own scratch, the output head's rows over the members (`HY4_TP_HEAD`) or a routed expert its place in VRAM, on GPUs with tensor cores (compute capability 7.0 and later), and 8192 otherwise; its start line says which (`INFO prompts: the indexed layers' attention on the tensor cores up to N positions`). So GPUs that hold every expert (tensor parallel, a layer split with room) take a longer span, and a card that holds a part of the experts beside the CPU lane keeps 8192 - its decoding and its answers stay as they were. `HY4_DENSE_MAX=N` tries N alone (up to 65536; it is taken where the plan holds it, also where it moves some experts from the VRAM to the CPU lane: on one Tesla V100 a 16K prompt read 7% faster with 24576, with 1.5% fewer experts in VRAM); `HY4_DENSE_MAX=8192`: as before v1.1.68 |
 | `HY4_TP_CHECK` | off | debugging: after each forward, every member's copy of the state compared |
+| `HY4_TP_HEAD` | on | tensor parallel with a BF16 output head: each member computes its share of the head's rows (the main GPU one share) from its own copy of the final state and copies its logits straight to the host; `0`: the main GPU alone |
+| `HY4_TP_HEAD_UNITS` | 1 | with `HY4_TP_HEAD`: the main GPU's share of the head's rows, in members' shares |
+| `HY4_TP_DRAFT_HEAD` | on | with `HY4_TP_HEAD`: the drafts' Q4_K head over the members too (each finds the top token of its rows, the host the top of those); `0`: on the main GPU alone |
+| `HY4_MTP_FULL` | off | the MTP block's pass over a token window computes its FFN and head for every row, as before, instead of only for the rows a draft starts from (none: the cache's rows alone) |
+| `HY4_IX_FORK`, `HY4_ATTN_FORK` | on | the token path: an indexed layer's indexer, and a window layer's cache row and gate, on a second stream of the GPU beside the query's chain; `0`: in line |
+| `HY4_NARROW` | on | an F32 matrix whose every value is a BF16 (the router's) kept as BF16 in VRAM: half the bytes a token reads, the same sums (a prompt chunk turns it back to F32); `0`: F32 |
+| `HY4_EG_ASYNC` | on | tensor parallel: a token window's Engram rows are looked up on a thread of their own while the GPUs queue the window's layers, and each member waits at an Engram layer for that module's rows alone. With the table left on the disk (`HY4_EG_POPULATE` off) each row is a page fault at its first touch - about 0.7 ms a window of four tokens - so in line it holds up every GPU; `0`: in line, before the window |
+| `HY4_ROW_TOP_HOST` | off | `1`: the top token of each row of logits found by the engine's host loop, a walk over the whole row (about 0.1 ms a row), instead of by the GPUs that computed the row's parts, with the head over the members (`HY4_TP_HEAD`) - greedy decoding, and the largest value sampling starts from; the same tokens either way |
+| `HY4_CREW_SPIN_MS` | 25 | tensor parallel: how long a member's host thread watches for the next token window before it sleeps, in ms |
+| `HY4_SUM_PER` | 2048 | tensor parallel: the fewest values of a sum a host thread takes (fewer threads join a smaller sum) |
+| `MAYA_IQ_MV8` | on | the quantized GEMV kernel's own form for windows of 5 to 8 tokens (the same sums); `0`: the 16-token form, as before |
 | `HY4_TP_PROF` | off | debugging: the host's waits and sums a token window |
 | `HY4_TP_LATENT_SUM` | off | tensor parallel: the FFN's partials summed in the latent space, projected up after the sum (a third more to send) |
-| `HY4_TP_EV`, `HY4_TP_EV_M` | off | debugging: a member's GPU time by part of each layer (events), member 0 or the one named |
+| `HY4_TP_EV`, `HY4_TP_EV_M` | off | debugging: a member's GPU time by part of each layer (events), member 0 or the one named; `HY4_TP_EV=all`: every member's, by window size |
+| `HY4_DRAFT_PROF` | off | debugging: a draft step's launches and its time to the token on the host |
 | `HY4_TP_F32` | off | tensor parallel: a prompt chunk's sums in F32 (twice the bytes; the earlier numbers) |
 | `HY4_MTP_SYNC` | off | the MTP block's pass over a prompt chunk in line, after the chunk, on the head's own scratch (tensor parallel takes this by itself, with an INFO line, where the pass's own scratch - a whole chunk's buffers on the head's GPU - is not in a member's plan) |
 | `HY4_NO_WARMUP` | off | no warm-up after the load (the first request then pays the first launches: ~1 s on a long prompt) |
@@ -2569,7 +2584,7 @@ A request's `spec` (0 / 1) turns the drafts off or on for it.
 | `HY4_ENGRAM_SCALES` | on when the set has them | `0`: the Engram table's row scales (`*.engram-scales.bf16` beside a table of per-row scaled codes) are not applied |
 | `HY4_EG_POPULATE` | off | `1`: the Engram table's pages are mapped into the engine in the background after the load (the whole table goes through the page cache); off, the table stays on the disk and each looked-up page is read at its first use |
 | `HY4_DRAFT_HEAD` | `q4k` | `q8`: the drafts' head in Q8_0 |
-| `HY4_GEMV_OLD`, `HY4_GROUP_SERIAL`, `HY4_TOP1_ONE`, `HY4_HC_ONE`, `HY4_ROUTER_WARP`, `HY4_TP_SUM_EACH`, `HY4_TP_HAND0`, `HY4_TP_HAND_INLINE`, `HY4_MTP_EAGER`, `HY4_EG_SERIAL` | off | A/B switches: the earlier kernels and paths these replaced (the same results, slower) |
+| `HY4_GEMV_OLD`, `HY4_GROUP_SERIAL`, `HY4_TOP1_ONE`, `HY4_HC_ONE`, `HY4_ROUTER_WARP`, `HY4_TP_SUM_EACH`, `HY4_TP_HAND0`, `HY4_TP_HAND_INLINE`, `HY4_MTP_EAGER`, `HY4_EG_SERIAL`, `HY4_ATTN_OLD`, `HY4_HC_ROWS` | off | A/B switches: the earlier kernels and paths these replaced (the same results, slower) |
 | `HY4_ROUTER_SORT` | off | the router's earlier block-wide sort instead of the warp's picks (the same picks) |
 | `HY4_PROF` | off | debugging: each forward's GPU time by part |
 | `HY4_DUMP` | off | debugging: each layer's sums |
