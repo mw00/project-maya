@@ -221,12 +221,19 @@ the [model card](https://huggingface.co/peasantsmith/Hy4-Flash-Maya-GGUF).
   free), and in the Monitor the
   experts on the GPU against those computed on the CPU and the n-gram table's read time. The loop guard is on, as for
   every model.
+- **Pictures:** the model's own vision tower runs in the engine (contributed by
+  [@needmorevram](https://github.com/needmorevram), #1051). The setup downloads Maya's vision file with the model
+  (0.8 GB, one for every size; `--no-vision` skips it). Its weights stay in the file; a picture takes up to 0.8 GB of
+  VRAM while it is read, which the engine keeps free on the main GPU - so pictures are on where the card has that room
+  beside the model, and **off on 8 GB cards**: the setup says so, text works as before, a picture sent is refused in
+  plain words and a picture in a tool result becomes a short note. Pictures up to 2048 x 2048 pixels (larger ones
+  are scaled down), a square one 4,160 tokens of the context. Pictures only, no videos. Images on the Models page
+  turns them on or off.
 - **In llama.cpp:** the files also load there with its Hy4-flash pull request
   ([ggml-org/llama.cpp #32517](https://github.com/ggml-org/llama.cpp/pull/32517), not merged yet).
 
 Not available for Hy4-Flash yet (the dashboard offers no switch for them):
 
-- **Pictures:** text only for now. The repo's vision file is for llama.cpp.
 - **Drafting with Maya's sizes:** the release's drafter is not read by the engine yet. Tencent's own Q4_K_M (below)
   carries the model's MTP block and drafts with it.
 - **Several requests at once:** no `--parallel`; one request at a time for now.
@@ -241,9 +248,10 @@ contributed with the engine by [@needmorevram](https://github.com/needmorevram) 
 NVIDIA RTX 30 / A100 and newer cards.
 
 **Set up:** `./maya.sh --setup --model hy4-flash-q4_k_m` (or pick Hy4-Flash in the setup's model list, then
-"Q4_K_M") checks the PC, builds `maya-hy4`, downloads the two files (pinned, sha256-checked; `--model-dir <folder>`
-uses the ones you have), writes the pack and `maya-hy4-flash.json`; `./maya.sh` starts it. `--drafting off` sets it
-up without MTP drafting.
+"Q4_K_M") checks the PC, builds `maya-hy4`, downloads the two files and the vision tower's (AngelSlim's
+`mmproj-Hy4-flash-bf16.gguf`, 1 GB; pinned, sha256-checked; `--model-dir <folder>` uses the ones you have), writes the
+pack and `maya-hy4-flash.json`; `./maya.sh` starts it. `--drafting off` sets it up without MTP drafting, `--no-vision`
+without pictures.
 
 | Files | Size | Runs on |
 | --- | ---: | --- |

@@ -2355,8 +2355,12 @@ Maya-XS needs about 8.7 / 9.0 / 9.8 GiB of free VRAM at 4K / 8K / 32K context. F
 setup picks the "8 GB" layout by itself (a second model file with smaller attention weights, 43.6 GB; slightly lower
 quality): about 6.5 / 6.8 GiB at 4K / 8K. A card with less than about 7 GB cannot run it.
 
-**Not available for Hy4-Flash yet** (the dashboard offers no switch for them): pictures (text only for now; the
-repo's vision file is for llama.cpp); drafting with Maya's sizes (the release's drafter is not read by the engine
+**Pictures** are on where the card has room for one beside the model (0.8 GB of VRAM while a picture is read, kept
+free on the main GPU; the setup downloads Maya's vision file, 0.8 GB, unless `--no-vision`) and off on 8 GB cards,
+where the model fills the card: the setup writes `--vision off` and says so. Images on the Models page turns them on
+or off; the details are under "Pictures" below.
+
+**Not available for Hy4-Flash yet** (the dashboard offers no switch for them): drafting with Maya's sizes (the release's drafter is not read by the engine
 yet, and `--mtp` below only applies to GGUF sets that carry an MTP block - Tencent's own Q4_K_M, which the setup
 offers after Maya's sizes); `--parallel` (one request at a time for now); AMD (HIP) and Mac.
 
@@ -2369,12 +2373,13 @@ hyper-connection streams; and an n-gram (Engram) table read at 4 layers.
 **The setup of Tencent's own Q4_K_M.** `./maya.sh --setup --model hy4-flash-q4_k_m` (run on Linux with NVIDIA RTX 30 /
 A100 and newer) builds `maya-hy4`, downloads AngelSlim's Q4_K_M (`tools/hy4/download.json`: pinned to a commit, each
 file's sha256 checked; `--model-dir` takes the files you have), builds the pack and writes `maya-hy4-flash.json`:
-`--pack`, `--max-context` (32K, 64K or 128K - recommended by the smallest GPU's VRAM, since tensor parallel keeps the
-whole cache on every GPU of the group: about 16 KB a token) and `--mtp` (`--drafting off`: without). The engine's
+`--pack`, `--max-context` (32K, 64K, 128K or 256K - recommended by the smallest GPU's VRAM, since tensor parallel
+keeps the whole cache on every GPU of the group: about 16 KB a token, 9.6 KB in 8 bits) and `--mtp` (`--drafting off`: without). The engine's
 other settings keep their defaults; ones added by hand (`--chunk`, `--reserve-gb`, `--tp` ...) are kept by a setup
-again. Its sampling is Tencent's (`generation_config.json`: temperature 0.9, top-p 1), its level High. The
-dashboard's Models page sets drafting, tensor parallel (Auto or Off), the VRAM kept free, the prompt chunk and the
-CPU lane's threads.
+again. Its sampling is Tencent's (`generation_config.json`: temperature 0.9, top-p 1), its level High. The download
+includes the vision tower (AngelSlim's `mmproj-Hy4-flash-bf16.gguf`, 1 GB; `--no-vision`: not downloaded, or
+`--vision off` when it is already there). The dashboard's Models page sets drafting, images, tensor parallel (Auto or
+Off), the VRAM kept free, the prompt chunk and the CPU lane's threads.
 
 **The pack.** The setup builds it by itself. By hand, `python tools/hy4/pack_gguf.py --model <folder>` writes
 `<folder>/maya-hy4/`: the geometry
@@ -2474,7 +2479,12 @@ token's embedding (the MTP block's too) and has no Engram lookup (a later token'
 The state is shared with the next request only where the same picture sits at the same place. On an RTX 3090:
 1024 x 768 (792 tokens) in about 0.25 s, 2048 x 2048 (4,160 tokens) in about 5.4 s - there attention over all 16,384
 patches is most of it. `maya-hy4 --pack <pack> --encode-image FILE.rgb --size WxH --dump-image OUT [--gpus I]` runs
-the tower alone (raw RGB in, F32 rows out).
+the tower alone (raw RGB in, F32 rows out). A quantized mmproj file is read too (Maya's: the layers' matrices in Q8_0,
+F16 where a row is no multiple of 32): those matrices are made BF16 as a layer is copied in, and its rows are within
+cosine 0.99996 of the BF16 file's. Where the model's own parts leave no room for a picture on the main GPU (8 GB
+cards) the engine starts text only and says so (`NOTE vision off`); `--vision on` asks for the tower by name and stops
+with the error instead. Keeping the picture's room free leaves a little less VRAM for routed experts (on a 32 GB V100
+with Maya-XS: 59% of them in VRAM instead of 61%, decode about 3% slower); `--vision off` gives it back.
 
 Engine options, in the config's `"args"`:
 

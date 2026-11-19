@@ -38,7 +38,7 @@ adds room for the system and the default context.
 | **MiniMax-M3.1-Flash** | Maya-XS | 93 | 100 | **128** | NVIDIA, AMD |
 | | Maya-S | 122 | 130 | **160** | NVIDIA, AMD |
 | | EXL3 3.5 bpw (Mia-AiLab) | 197 | 250 | **256** | NVIDIA, AMD |
-| **Hy4-Flash**, text only | Maya-XS | 108 ³ | 45, plus 4-8 for the context | **56-64** | NVIDIA (V100 and newer) |
+| **Hy4-Flash** | Maya-XS | 108 ³ | 45, plus 4-8 for the context | **56-64** | NVIDIA (V100 and newer) |
 | **Qwen-3.8-Flash-Next** | UD-IQ2_XS (unsloth) | 80 ² | 47 | **64** | NVIDIA, AMD |
 | | CYBER-FROST Q5_K_M | 113 ² | 84 | **96** | NVIDIA, AMD |
 | | Q4_K_M (Tencent's own, AngelSlim) | 168 ³ | ~108 | **192** | NVIDIA; run on RTX 30 / A100 and newer, Linux |
@@ -61,6 +61,9 @@ Q4_K_M (AngelSlim) is a 105 GB model file with the same table; all of its expert
   attention weights, 43.6 GB; slightly lower quality): about 6.5 / 6.8 GiB of free VRAM at 4K / 8K context. A card
   with less than about 7 GB cannot run it.
 - **The n-gram table:** on an SSD / NVMe, never a hard disk. It does not need to fit in memory.
+- **Pictures:** the vision tower's file (0.8 GB) stays on the SSD (RAM as the page cache); a picture takes up to
+  0.8 GB of VRAM while it is read, which the engine keeps free on the main GPU. Pictures are on where the card has
+  that room beside the model; on 8 GB cards the model fills the card, so they are off there (text only).
 
 ## Examples
 

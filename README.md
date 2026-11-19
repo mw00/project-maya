@@ -71,12 +71,12 @@ recommends one for your PC; to pick one yourself, give its setup id: `./setup.sh
 | | Maya-XS (v2) · `deepseek-maya-xs` | 277 GB | the whole model in a 128 GB PC's memory (the Engram tables stay on the SSD); v2 is about 12% closer to the original and about 20% faster at writing than v1 - running the setup again offers the update |
 | **[MiniMax-M3.1-Flash](https://huggingface.co/MiniMaxAI/MiniMax-M3.1-Flash)**<br><sub>MiniMax · [MiniMax Community License](LICENSE.minimax-m31) · 428 B, 23 B active · up to 1M context</sub> | Maya-XS · `minimax-maya-xs` | 93 GB | the whole model in a 128 GB PC's memory |
 | | Maya-S · `minimax-maya-s` | 122 GB | closer to the original |
-| **[Hy4-Flash](https://huggingface.co/tencent/Hy4-flash)**<br><sub>Tencent · [Tencent Hy License](LICENSE.hy4-flash) · 220 B · text only · NVIDIA only</sub> | Maya-XS · `hy4-flash-maya-xs` | 44.8 GB + a 63.4 GB n-gram table | PCs with about 56-64 GB of RAM + VRAM, cards from 8 GB; the n-gram table stays on the SSD; more sizes follow |
+| **[Hy4-Flash](https://huggingface.co/tencent/Hy4-flash)**<br><sub>Tencent · [Tencent Hy License](LICENSE.hy4-flash) · 220 B · reads pictures · NVIDIA only</sub> | Maya-XS · `hy4-flash-maya-xs` | 44.8 GB + a 63.4 GB n-gram table | PCs with about 56-64 GB of RAM + VRAM, cards from 8 GB; the n-gram table stays on the SSD; more sizes follow |
 
 **Which model fits your PC?** See [docs/MEMORY.md](docs/MEMORY.md) for each model's recommended memory (VRAM + RAM together).
 
 All of them run on NVIDIA from the V100 / RTX 20 on, and on AMD and Windows (see
-[What you need](#what-you-need)); Hy4-Flash runs on NVIDIA only for now (Linux and Windows), text only. DeepSeek's sizes include its Engram tables. The setup also offers unsloth's GGUF and
+[What you need](#what-you-need)); Hy4-Flash runs on NVIDIA only for now (Linux and Windows) and reads pictures where the card has room for one beside the model (8 GB cards: text only). DeepSeek's sizes include its Engram tables. The setup also offers unsloth's GGUF and
 turboderp's and LibertAIDAI's EXL3 quants of DeepSeek, orcarouter's abliterated DeepSeek, Mia-AiLab's EXL3 quant of MiniMax,
 turboderp's EXL3 quants of GLM, Qwen-3.8-Flash-Next (CYBER-FROST) as its Q5_K_M GGUF and Qwen-3.8-Flash-Next
 itself as unsloth's UD-IQ2_XS GGUF, both with pictures
@@ -267,7 +267,7 @@ slowest while the caches fill with what you use.
   sets how many tokens the model may think before it answers.
 - **Loop guard:** on by default - an agent that repeats the same tool call with the same result is steered off it.
 - **Pictures:** attach one in the chat, or send image parts through either API. Every model reads them except
-  GLM-5.3 and Hy4-Flash, which are text only (setup details per model: [docs/MODELS.md](docs/MODELS.md)). Videos too,
+  GLM-5.3, which is text only - and Hy4-Flash on 8 GB cards (setup details per model: [docs/MODELS.md](docs/MODELS.md)). Videos too,
   for the models that read them.
 - **Files:** attach any file in the chat. Text and code go in as they are; **PDFs** as their text, or a scanned one's
   first pages as pictures; Word, Excel, PowerPoint, OpenDocument, EPUB and RTF files as their text. Anything Maya can't

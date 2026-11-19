@@ -62,11 +62,11 @@ Maya の量子化はすべて、モデル名のあとに階層 (XS、S、M、L�
 | | Maya-XS (v2) · `deepseek-maya-xs` | 277 GB | 128 GB の PC のメモリにモデル全体を載せる (Engram テーブルは SSD に置く); v2 は v1 より元のモデルに約 12% 近く、書き出しが約 20% 速い - セットアップを再実行すると更新を案内します |
 | **[MiniMax-M3.1-Flash](https://huggingface.co/MiniMaxAI/MiniMax-M3.1-Flash)**<br><sub>MiniMax · [MiniMax Community License](LICENSE.minimax-m31) · 428 B、アクティブ 23 B · 最大 1M コンテキスト</sub> | Maya-XS · `minimax-maya-xs` | 93 GB | 128 GB の PC のメモリにモデル全体を載せる |
 | | Maya-S · `minimax-maya-s` | 122 GB | 元のモデルにより近い |
-| **[Hy4-Flash](https://huggingface.co/tencent/Hy4-flash)**<br><sub>Tencent · [Tencent Hy License](LICENSE.hy4-flash) · 220 B · テキストのみ · NVIDIA のみ</sub> | Maya-XS · `hy4-flash-maya-xs` | 44.8 GB + n-gram テーブル 63.4 GB | RAM と VRAM の合計が約 56-64 GB の PC、8 GB 以上のカード。n-gram テーブルは SSD に置いたまま。ほかのサイズは順次追加 |
+| **[Hy4-Flash](https://huggingface.co/tencent/Hy4-flash)**<br><sub>Tencent · [Tencent Hy License](LICENSE.hy4-flash) · 220 B · 画像対応 · NVIDIA のみ</sub> | Maya-XS · `hy4-flash-maya-xs` | 44.8 GB + n-gram テーブル 63.4 GB | RAM と VRAM の合計が約 56-64 GB の PC、8 GB 以上のカード。n-gram テーブルは SSD に置いたまま。ほかのサイズは順次追加 |
 
 **どのモデルがあなたの PC に合う?** 各モデルの推奨メモリ (VRAM と RAM の合計) は [docs/MEMORY.md](docs/MEMORY.md) を見てください。
 
-いずれも NVIDIA の V100 / RTX 20 以降、および AMD と Windows ([必要なもの](#what-you-need)を参照) で動きます。Hy4-Flash は今のところ NVIDIA のみ (Linux と Windows)、テキストのみです。DeepSeek のサイズには Engram テーブルが含まれます。セットアップでは、unsloth の GGUF と turboderp および LibertAIDAI の DeepSeek 用 EXL3 量子化、orcarouter の abliterated 版 DeepSeek、Mia-AiLab の MiniMax 用 EXL3 量子化、turboderp の GLM 用 EXL3 量子化、画像対応の Q5_K_M GGUF としての Qwen-3.8-Flash-Next (CYBER-FROST)、そして同じく画像対応の unsloth の UD-IQ2_XS GGUF としての Qwen-3.8-Flash-Next 本体 ([その設定](docs/SETTINGS.md#qwen-38-flash-next-cyber-frost)) も選べます。**各モデルのファイル、ドラフター、画像、オプション: [docs/MODELS.md](docs/MODELS.md)。**
+いずれも NVIDIA の V100 / RTX 20 以降、および AMD と Windows ([必要なもの](#what-you-need)を参照) で動きます。Hy4-Flash は今のところ NVIDIA のみ (Linux と Windows) で、画像は VRAM に余裕のあるカードで読めます (8 GB のカードではテキストのみ)。DeepSeek のサイズには Engram テーブルが含まれます。セットアップでは、unsloth の GGUF と turboderp および LibertAIDAI の DeepSeek 用 EXL3 量子化、orcarouter の abliterated 版 DeepSeek、Mia-AiLab の MiniMax 用 EXL3 量子化、turboderp の GLM 用 EXL3 量子化、画像対応の Q5_K_M GGUF としての Qwen-3.8-Flash-Next (CYBER-FROST)、そして同じく画像対応の unsloth の UD-IQ2_XS GGUF としての Qwen-3.8-Flash-Next 本体 ([その設定](docs/SETTINGS.md#qwen-38-flash-next-cyber-frost)) も選べます。**各モデルのファイル、ドラフター、画像、オプション: [docs/MODELS.md](docs/MODELS.md)。**
 
 ## <a name="quality"></a>品質
 
@@ -222,7 +222,7 @@ Maya の量子化は、各モデルの公開された重みから作られ、元
 - **モデル API:** `/api/tags`、`/api/ps`、`/api/show`、`/api/chat`、`/api/generate`、`/api/pull`、`/api/delete` で、あらゆるアプリやスクリプトからモデルの一覧、読み込み、ダウンロード、削除ができます。読み込まれていないモデルへのリクエストはそのモデルに切り替わり、`keep_alive` を指定すると、アイドル時にアンロードされます。`/models/load`、`/models/unload`、`/models/sse` もデフォルトで有効です (`"model_management": false` で無効にできます)。
 - **思考:** Off、Low、High (デフォルト)、Max を、設定またはリクエストごとに指定できます。さらに**思考予算**の欄で、モデルが回答の前に思考に使えるトークン数を設定できます。
 - **ループガード:** デフォルトで有効です。同じツール呼び出しを同じ結果で繰り返すエージェントを、その繰り返しから外へ誘導します。
-- **画像:** チャットに添付するか、どちらの API でも画像パートを送ります。テキストのみの GLM-5.3 と Hy4-Flash を除き、すべてのモデルが画像を読めます (モデルごとのセットアップの詳細: [docs/MODELS.md](docs/MODELS.md))。
+- **画像:** チャットに添付するか、どちらの API でも画像パートを送ります。テキストのみの GLM-5.3 を除き、すべてのモデルが画像を読めます (Hy4-Flash は 8 GB のカードではテキストのみ) (モデルごとのセットアップの詳細: [docs/MODELS.md](docs/MODELS.md))。
 - **MCP ツール:** 設定に MCP サーバーを書くと (`"mcp_servers"`。Claude Desktop の `mcpServers` ブロックはそのまま使えます)、Web チャットのモデルがそのツールを呼び出せます。チャットの **+** メニューのスイッチでオン・オフできます。動作の詳細: [serve/mcp.py](serve/mcp.py)。
 - **Docker:** 公式イメージはありません。[docs/DOCKER.md](docs/DOCKER.md) は、リリースからイメージをビルドするための手順です。
 - **ほかのデバイスから:** `./maya.sh --setup --host 0.0.0.0 --api-key <secret>`。キーは必ず設定してください。
