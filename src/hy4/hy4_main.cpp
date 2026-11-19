@@ -423,8 +423,10 @@ inline bool plain_sampling(const mm3::sample::Req& r) {
 int serve(hy4::Model& m, const std::vector<int>& eos, int n_draft, float floor0) {
     for (const auto& l : m.info_lines()) std::printf("NOTE %s\n", l.c_str());
     const auto& st0 = m.stats();
-    std::printf("INFO engine=hy4 engine_kind=hy4 model=Hy4-flash ctx=%lld vram_gb=%.2f dspark=0 mtp=%d\n",
-                (long long) m.max_ctx(), st0.vram_gb, m.has_mtp() && n_draft > 0 ? 1 : 0);
+    std::printf("INFO engine=hy4 engine_kind=hy4 model=Hy4-flash ctx=%lld vram_gb=%.2f dspark=0 mtp=%d experts=%d "
+                "vram_slots=%d\n",
+                (long long) m.max_ctx(), st0.vram_gb, m.has_mtp() && n_draft > 0 ? 1 : 0, st0.experts_all,
+                st0.experts_vram);
     std::printf("READY %lld stop\n", (long long) m.max_ctx());
     std::fflush(stdout);
     std::fprintf(stderr, "maya hy4 serve: GEN <max_new> [keys] <ids>; STOP, WRAP, QUIT\n");
@@ -515,13 +517,22 @@ int serve(hy4::Model& m, const std::vector<int>& eos, int n_draft, float floor0)
         bool in_think = r.think_budget > 0 && r.think_end >= 0;
         int tok = mm3::sample::draw(row_dist(lg.data(), m.vocab(), r, state), rng);
         long long d_off = 0, d_acc = 0;
+        // the decode's own counts (the model's totals less what they were once the prompt was read): the routed
+        // experts run, those of them on the CPU lane, the host's n-gram gathers
+        const long long ex0 = (long long) m.stats().experts, cpu0 = (long long) m.stats().cpu_experts;
+        const double eg0 = m.stats().engram_ms;
         auto stat_line = [&]() {
             const double ms = now() * 1e3 - t1;
-            std::printf("STAT tok_s=%.2f ms_tok=%.2f vram_hit=1.0000 cpu=0.000", ms > 0 ? 1000.0 * (double) produced / ms : 0.0,
-                        produced > 0 ? ms / (double) produced : 0.0);
+            const long long d_ex = (long long) m.stats().experts - ex0;
+            const long long d_cpu = (long long) m.stats().cpu_experts - cpu0;
+            const double d_eg = m.stats().engram_ms - eg0;
+            std::printf("STAT tok_s=%.2f ms_tok=%.2f vram_hit=%.4f cpu=%.3f", ms > 0 ? 1000.0 * (double) produced / ms : 0.0,
+                        produced > 0 ? ms / (double) produced : 0.0,
+                        d_ex > 0 ? 1.0 - (double) d_cpu / (double) d_ex : 1.0,
+                        produced > 0 ? (double) d_cpu / (double) produced : 0.0);
             if (d_off > 0) std::printf(" drafts=%.3f draft_acc=%lld draft_off=%lld", (double) d_acc / (double) d_off, d_acc,
                                        d_off);
-            std::printf("\n");
+            std::printf(" engram_ms=%.3f\n", produced > 0 ? d_eg / (double) produced : 0.0);
         };
         const bool spec = m.has_mtp() && n_draft > 0 && (r.spec < 0 || r.spec != 0);
         const float floor = r.conf >= 0.0f ? r.conf : floor0;
