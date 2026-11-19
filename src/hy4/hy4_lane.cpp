@@ -23,7 +23,6 @@
 #include <condition_variable>
 #include <cstdlib>
 #include <cstring>
-#include <map>
 #include <mutex>
 #include <thread>
 #if defined(__x86_64__) || defined(_M_X64)
@@ -331,8 +330,14 @@ int group_nt() {                 // (HY4_LANE_NT: a group's tokens, 1 .. kMaxNt;
 }
 constexpr int kRowChunk = 128;   // rows a work item
 
+struct Grp {
+    int e, a, c;   // the expert, its first entry in Scratch::order, how many
+};
 struct Scratch {
-    std::vector<float> h, y;   // the entries' h and down outputs
+    std::vector<Grp> groups;          // the entries by expert, a group up to kMaxNt of them
+    std::vector<float> h, y;          // the entries' h and down outputs
+    std::vector<uint8_t> xq, hq;      // the tokens' quantized activations, the entries' quantized h
+    std::vector<int> toks, order;     // the tokens that have entries; the entries by expert
 };
 
 }  // namespace
@@ -342,8 +347,6 @@ LaneProf& lane_prof() {
     return p;
 }
 
-// Two passes (each a parallel_for): gate / up (each item its tokens' activations quantized itself - a few
-// microseconds, saved a barrier), then down (each item its entries' h quantized itself).
 void place_experts(const CpuExperts& ex, const std::vector<int>& experts, int nodes, const std::atomic<bool>& stop) {
     if (nodes < 2) return;
     for (int e : experts) {
@@ -429,55 +432,89 @@ void cpu_experts(Lane& lane, const CpuExperts& ex, const std::vector<CpuEntry>& 
     Scratch& sc = tls;   // (the caller's: the workers use it through this reference, never their own thread_local)
     sc.h.resize((size_t) n * F);
     sc.y.resize((size_t) n * E);
-    // the entries grouped by expert, a group up to kMaxNt of them (an expert's rows read once for its tokens)
-    std::map<int, std::vector<int>> by;
-    for (int i = 0; i < n; ++i) by[entries[(size_t) i].e].push_back(i);
-    std::vector<std::pair<int, std::vector<int>>> groups;
-    const size_t gn = (size_t) group_nt();
-    for (auto& [e, v] : by)
-        for (size_t a = 0; a < v.size(); a += gn)
-            groups.push_back({e, std::vector<int>(v.begin() + (long) a, v.begin() + (long) std::min(v.size(), a + gn))});
+    // each token's activations quantized once - the same bytes for all of its experts (each work item quantized its
+    // own tokens' before: a decode's 16 experts did a token 12 times over, a row chunk each) - few tokens on the
+    // caller, more over the lane
+    sc.xq.resize((size_t) T * f.act_bytes);
+    sc.toks.clear();
+    {
+        thread_local std::vector<char> seen;
+        seen.assign((size_t) T, 0);
+        for (const CpuEntry& c : entries)
+            if (!seen[(size_t) c.t]) {
+                seen[(size_t) c.t] = 1;
+                sc.toks.push_back(c.t);
+            }
+    }
+    const auto qx = [&](int i) {
+        const int t = sc.toks[(size_t) i];
+        iqc::iq_cpu_quant(f.gu_act, x + (size_t) t * E, E, sc.xq.data() + (size_t) t * f.act_bytes);
+    };
+    const int nq = (int) sc.toks.size();
+    if (nq <= 2)
+        for (int i = 0; i < nq; ++i) qx(i);
+    else
+        lane.parallel_for(nq, qx);
+    // the entries grouped by expert (ascending; in each, the entries' order), a group up to kMaxNt of them: an
+    // expert's rows read once for its tokens
+    std::vector<Grp>& groups = sc.groups;   // (the caller's, as sc: a worker's own thread_local would be another)
+    groups.clear();
+    sc.order.resize((size_t) n);
+    for (int i = 0; i < n; ++i) sc.order[(size_t) i] = i;
+    std::stable_sort(sc.order.begin(), sc.order.end(),
+                     [&](int i, int j) { return entries[(size_t) i].e < entries[(size_t) j].e; });
+    const int gn = group_nt();
+    for (int i = 0; i < n;) {
+        const int e = entries[(size_t) sc.order[(size_t) i]].e;
+        int j = i;
+        while (j < n && entries[(size_t) sc.order[(size_t) j]].e == e) ++j;
+        for (int a = i; a < j; a += gn) groups.push_back({e, a, std::min(gn, j - a)});
+        i = j;
+    }
     const int gu_chunks = (F + kRowChunk - 1) / kRowChunk, dn_chunks = (E + kRowChunk - 1) / kRowChunk;
     // each group's expert's NUMA node - e % nodes, where place_experts puts its pages - the work items routed by it
     std::vector<int> gu_node, dn_node;
     if (lane.nodes() > 1)
-        for (const auto& [e, ids] : groups) {
-            const int q = e % lane.nodes();
+        for (const Grp& gr : groups) {
+            const int q = gr.e % lane.nodes();
             for (int c = 0; c < gu_chunks; ++c) gu_node.push_back(q);
             for (int c = 0; c < dn_chunks; ++c) dn_node.push_back(q);
         }
     const double tp1 = clk();
     lane.parallel_for((int) groups.size() * gu_chunks, [&](int it) {
-        const auto& [e, ids] = groups[(size_t) (it / gu_chunks)];
+        const Grp& gr = groups[(size_t) (it / gu_chunks)];
         const int r0 = (it % gu_chunks) * kRowChunk, r1 = std::min(F, r0 + kRowChunk);
-        thread_local std::vector<uint8_t> abuf;
-        abuf.resize((size_t) kMaxNt * f.act_bytes);
         const void* act[kMaxNt];
         float* ff[kMaxNt];
-        for (size_t k = 0; k < ids.size(); ++k) {
-            uint8_t* a = abuf.data() + k * f.act_bytes;
-            iqc::iq_cpu_quant(f.gu_act, x + (size_t) entries[(size_t) ids[k]].t * E, E, a);
-            act[k] = a;
-            ff[k] = sc.h.data() + (size_t) ids[k] * F;
+        for (int k = 0; k < gr.c; ++k) {
+            const int id = sc.order[(size_t) (gr.a + k)];
+            act[k] = sc.xq.data() + (size_t) entries[(size_t) id].t * f.act_bytes;
+            ff[k] = sc.h.data() + (size_t) id * F;
         }
-        iqc::iq_cpu_gate_up(f, ex.gate + (size_t) e * ex.g_stride, ex.up + (size_t) e * ex.g_stride, act,
-                            (int) ids.size(), ff, r0, r1, ex.limit);
+        iqc::iq_cpu_gate_up(f, ex.gate + (size_t) gr.e * ex.g_stride, ex.up + (size_t) gr.e * ex.g_stride, act, gr.c,
+                            ff, r0, r1, ex.limit);
     }, gu_node.empty() ? nullptr : &gu_node);
+    // each entry's h quantized once (each down item quantized its entries' h before: 12 times over in a decode)
+    sc.hq.resize((size_t) n * f.h_bytes);
+    const auto qh = [&](int i) {
+        iqc::iq_cpu_quant(f.d_act, sc.h.data() + (size_t) i * F, F, sc.hq.data() + (size_t) i * f.h_bytes);
+    };
+    if (n <= 2)
+        for (int i = 0; i < n; ++i) qh(i);
+    else
+        lane.parallel_for(n, qh);
     const double tp2 = clk();
     lane.parallel_for((int) groups.size() * dn_chunks, [&](int it) {
-        const auto& [e, ids] = groups[(size_t) (it / dn_chunks)];
+        const Grp& gr = groups[(size_t) (it / dn_chunks)];
         const int r0 = (it % dn_chunks) * kRowChunk, r1 = std::min(E, r0 + kRowChunk);
-        thread_local std::vector<uint8_t> hbuf;
-        hbuf.resize((size_t) kMaxNt * f.h_bytes);
         const void* hq[kMaxNt];
         float* y[kMaxNt];
-        for (size_t k = 0; k < ids.size(); ++k) {
-            uint8_t* h = hbuf.data() + k * f.h_bytes;
-            iqc::iq_cpu_quant(f.d_act, sc.h.data() + (size_t) ids[k] * F, F, h);
-            hq[k] = h;
-            y[k] = sc.y.data() + (size_t) ids[k] * E;
+        for (int k = 0; k < gr.c; ++k) {
+            const int id = sc.order[(size_t) (gr.a + k)];
+            hq[k] = sc.hq.data() + (size_t) id * f.h_bytes;
+            y[k] = sc.y.data() + (size_t) id * E;
         }
-        iqc::iq_cpu_down(f, ex.down + (size_t) e * ex.d_stride, hq, (int) ids.size(), y, r0, r1);
+        iqc::iq_cpu_down(f, ex.down + (size_t) gr.e * ex.d_stride, hq, gr.c, y, r0, r1);
     }, dn_node.empty() ? nullptr : &dn_node);
     const double tp3 = clk();
     // each token's weighted sum, in its entries' order
