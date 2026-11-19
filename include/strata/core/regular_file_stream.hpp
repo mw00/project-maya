@@ -1,9 +1,11 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
 #include <cerrno>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <filesystem>
 #include <iostream>
 #include <limits>
@@ -16,6 +18,10 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include <aclapi.h>
+#ifdef _MSC_VER
+#pragma comment(lib, "Advapi32.lib")
+#endif
 #else
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -164,6 +170,15 @@ class RegularFileStream {
         bool native_flush();
         void native_close();
 #ifdef _WIN32
+        struct CreationSecurity {
+            bool initialize(std::error_code& ec);
+            bool verify(HANDLE file, std::error_code& ec);
+            SECURITY_ATTRIBUTES attributes{sizeof(SECURITY_ATTRIBUTES), nullptr, FALSE};
+            SECURITY_DESCRIPTOR descriptor{};
+            alignas(SID) std::array<std::byte, SECURITY_MAX_SID_SIZE> sid{};
+            alignas(ACL) std::array<std::byte, sizeof(ACL) + sizeof(ACCESS_ALLOWED_ACE) - sizeof(DWORD) +
+                                                  SECURITY_MAX_SID_SIZE> acl{};
+        };
         bool is_open() const { return handle_ != INVALID_HANDLE_VALUE; }
         HANDLE handle_ = INVALID_HANDLE_VALUE;
 #else
@@ -212,6 +227,75 @@ private:
 
 // Native implementation.
 #ifdef _WIN32
+// Microsoft: CreateFileW defaults inherit parent ACLs when no SD is supplied.
+// SetSecurityDescriptorDacl(TRUE, nonnull, FALSE) and SE_DACL_PROTECTED avoid
+// both NULL-DACL grants and inherited ACEs. No existing object's ACL is changed.
+inline bool RegularFileStream::Buffer::CreationSecurity::initialize(std::error_code& ec) {
+    HANDLE token = nullptr;
+    if (!OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, TRUE, &token)) {
+        const auto error = GetLastError();
+        if (error != ERROR_NO_TOKEN) {
+            ec = std::error_code(static_cast<int>(error), std::system_category()); return false;
+        }
+        if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) {
+            ec = std::error_code(static_cast<int>(GetLastError()), std::system_category()); return false;
+        }
+    }
+    alignas(TOKEN_USER) std::array<std::byte, sizeof(TOKEN_USER) + SECURITY_MAX_SID_SIZE> user_buffer{};
+    DWORD needed = 0, error = ERROR_SUCCESS;
+    if (!GetTokenInformation(token, TokenUser, user_buffer.data(), static_cast<DWORD>(user_buffer.size()), &needed))
+        error = GetLastError();
+    if (!CloseHandle(token) && error == ERROR_SUCCESS) error = GetLastError();
+    if (error != ERROR_SUCCESS) { ec = std::error_code(static_cast<int>(error), std::system_category()); return false; }
+    if (needed < sizeof(TOKEN_USER) || needed > user_buffer.size()) {
+        ec = std::make_error_code(std::errc::invalid_argument); return false;
+    }
+    const auto user = reinterpret_cast<const TOKEN_USER*>(user_buffer.data());
+    if (!IsValidSid(user->User.Sid) || GetLengthSid(user->User.Sid) > sid.size()) {
+        ec = std::make_error_code(std::errc::invalid_argument); return false;
+    }
+    const auto caller = static_cast<PSID>(sid.data());
+    const auto dacl = reinterpret_cast<PACL>(acl.data());
+    if (!CopySid(static_cast<DWORD>(sid.size()), caller, user->User.Sid) ||
+        !InitializeAcl(dacl, static_cast<DWORD>(acl.size()), ACL_REVISION) ||
+        !AddAccessAllowedAceEx(dacl, ACL_REVISION, 0, FILE_ALL_ACCESS, caller) ||
+        !InitializeSecurityDescriptor(&descriptor, SECURITY_DESCRIPTOR_REVISION) ||
+        !SetSecurityDescriptorOwner(&descriptor, caller, FALSE) ||
+        !SetSecurityDescriptorDacl(&descriptor, TRUE, dacl, FALSE) ||
+        !SetSecurityDescriptorControl(&descriptor, SE_DACL_PROTECTED, SE_DACL_PROTECTED)) {
+        ec = std::error_code(static_cast<int>(GetLastError()), std::system_category()); return false;
+    }
+    attributes.lpSecurityDescriptor = &descriptor;
+    return true;
+}
+inline bool RegularFileStream::Buffer::CreationSecurity::verify(HANDLE file, std::error_code& ec) {
+    PSECURITY_DESCRIPTOR actual = nullptr;
+    PACL dacl = nullptr;
+    PSID owner = nullptr;
+    const DWORD result = GetSecurityInfo(file, SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+                                         &owner, nullptr, &dacl, nullptr, &actual);
+    std::unique_ptr<void, decltype(&LocalFree)> release(actual, &LocalFree);
+    if (result != ERROR_SUCCESS) {
+        ec = std::error_code(static_cast<int>(result), std::system_category()); return false;
+    }
+    SECURITY_DESCRIPTOR_CONTROL control = 0;
+    DWORD revision = 0;
+    void* raw_ace = nullptr;
+    if (!actual || !IsValidSecurityDescriptor(actual) || !owner || !IsValidSid(owner) ||
+        !EqualSid(owner, sid.data()) || !dacl || !IsValidAcl(dacl) || dacl->AceCount != 1 ||
+        !GetSecurityDescriptorControl(actual, &control, &revision) ||
+        (control & (SE_DACL_PRESENT | SE_DACL_PROTECTED)) != (SE_DACL_PRESENT | SE_DACL_PROTECTED) ||
+        !GetAce(dacl, 0, &raw_ace)) {
+        ec = std::make_error_code(std::errc::permission_denied); return false;
+    }
+    const auto ace = static_cast<const ACCESS_ALLOWED_ACE*>(raw_ace);
+    if (ace->Header.AceType != ACCESS_ALLOWED_ACE_TYPE || ace->Header.AceFlags != 0 ||
+        ace->Mask != FILE_ALL_ACCESS || !IsValidSid(const_cast<DWORD*>(&ace->SidStart)) ||
+        !EqualSid(const_cast<DWORD*>(&ace->SidStart), sid.data())) {
+        ec = std::make_error_code(std::errc::permission_denied); return false;
+    }
+    return true;
+}
 inline void RegularFileStream::Buffer::fail_native() {
     if (!error_) error_ = std::error_code(static_cast<int>(GetLastError()), std::system_category());
 }
@@ -248,23 +332,43 @@ inline bool RegularFileStream::Buffer::native_open(const std::filesystem::path& 
     } else if (attributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DEVICE)) {
         ec = std::make_error_code(std::errc::operation_not_supported); return false;
     }
-    handle_ = CreateFileW(name.c_str(), writable_ ? GENERIC_WRITE | FILE_READ_ATTRIBUTES : GENERIC_READ, FILE_SHARE_READ, nullptr,
+    CreationSecurity security;
+    if (writable_ && !security.initialize(ec)) return false;
+    const DWORD access = writable_ ? GENERIC_WRITE | FILE_READ_ATTRIBUTES | READ_CONTROL | DELETE : GENERIC_READ;
+    handle_ = CreateFileW(name.c_str(), access, FILE_SHARE_READ, writable_ ? &security.attributes : nullptr,
                           writable_ ? CREATE_NEW : OPEN_EXISTING,
                           FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
     if (!is_open()) { ec = std::error_code(static_cast<int>(GetLastError()), std::system_category()); return false; }
+    const auto reject_created = [&]() {
+        if (writable_) {
+            // Delete only our CREATE_NEW object through its handle, never by path.
+            // If the FS rejects disposition, report that failure; no payload was written.
+            FILE_DISPOSITION_INFO remove{TRUE};
+            if (!SetFileInformationByHandle(handle_, FileDispositionInfo, &remove, sizeof remove)) {
+                const auto cleanup_error = GetLastError();
+                std::fprintf(stderr, "regular file creation rejected (%d); disposition failed (%lu)\n",
+                             ec.value(), static_cast<unsigned long>(cleanup_error));
+            }
+        }
+        native_close();
+        if (error_) std::fprintf(stderr, "regular file creation rejected (%d); close failed (%d)\n",
+                                 ec.value(), error_.value());
+        return false;
+    };
     FILE_ATTRIBUTE_TAG_INFO info{};
     LARGE_INTEGER length{};
     if (GetFileType(handle_) != FILE_TYPE_DISK) {
-        ec = std::make_error_code(std::errc::operation_not_supported); return false;
+        ec = std::make_error_code(std::errc::operation_not_supported); return reject_created();
     }
     if (!GetFileInformationByHandleEx(handle_, FileAttributeTagInfo, &info, sizeof info) ||
         !GetFileSizeEx(handle_, &length)) {
-        ec = std::error_code(static_cast<int>(GetLastError()), std::system_category()); return false;
+        ec = std::error_code(static_cast<int>(GetLastError()), std::system_category()); return reject_created();
     }
     if ((info.FileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DEVICE)) ||
         length.QuadPart < 0 || static_cast<uint64_t>(length.QuadPart) > limit_) {
-        ec = std::make_error_code(std::errc::value_too_large); return false;
+        ec = std::make_error_code(std::errc::value_too_large); return reject_created();
     }
+    if (writable_ && !security.verify(handle_, ec)) return reject_created();
     size_ = static_cast<uint64_t>(length.QuadPart);
     return true;
 }

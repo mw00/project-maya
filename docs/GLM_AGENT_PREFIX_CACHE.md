@@ -131,13 +131,24 @@ candidate records. In a stable, private cache directory, only regular files
 participate in recovery. Link and other unsupported entry types are not opened
 as metadata or payloads; an indeterminate type is an I/O failure, not proof of
 absence. Use a stable, private directory with a single writer. Slot publication
-creates payload and metadata staging files exclusively. It publishes each without
+creates payload and metadata staging files exclusively. On Windows it supplies
+a protected DACL permitting the effective caller SID and checks the actual
+owner and DACL on the created handle before writing any payload. If verification
+fails it refuses the write and attempts removal through that handle; a filesystem
+that refuses removal may leave an empty staging file. Existing directory ACLs
+are not changed. It publishes each file without
 replacing an existing name using a hard link in the same directory; on a file
 system without hard-link support the save is declined. On restore, a learned
 payload is opened once: checksum verification reads the opened object and the
 native loader reads the same stream after rewind. The legacy native pathname
 API remains available for other callers. This does not make an open file's
-contents immutable or support concurrent or untrusted writers.
+contents immutable or support concurrent or untrusted writers. The engine does
+not verify directory ownership, permissions on every ancestor, or exclusive
+writer access. These are operator prerequisites, not a startup guarantee. On
+POSIX the reader checks the path type before opening and checks the resulting
+descriptor again before reading. The latter check cannot prevent an open of a
+non-regular object if the path changes between those operations. Do not enable
+persistent slots in directories that another process may modify concurrently.
 Startup sorts candidates only after the whole scan succeeds and uses that
 same list for orphan checks. Exceeding either limit leaves the directory alone:
 no partial index is restored and new disk writes are disabled for the run.

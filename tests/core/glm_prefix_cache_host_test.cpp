@@ -34,6 +34,53 @@ static void put(const fs::path& path, const std::string& value) {
     std::ofstream f(path); f << value;
     if (!f) throw std::runtime_error("fixture write failed");
 }
+#ifdef _WIN32
+static void regular_security_checks(const fs::path& path) {
+    // Independent readback of the actual ordinary file; never changes its ACL.
+    HANDLE file = CreateFileW(path.c_str(), READ_CONTROL, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                              nullptr, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+    expect(file != INVALID_HANDLE_VALUE, "REGULAR_SECURITY ordinary created file permits read-only descriptor inspection");
+    if (file == INVALID_HANDLE_VALUE) return;
+    PSECURITY_DESCRIPTOR descriptor = nullptr;
+    PACL dacl = nullptr;
+    PSID owner = nullptr;
+    const DWORD result = GetSecurityInfo(file, SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+                                         &owner, nullptr, &dacl, nullptr, &descriptor);
+    expect(CloseHandle(file) != FALSE, "REGULAR_SECURITY descriptor inspection handle closes");
+    std::unique_ptr<void, decltype(&LocalFree)> release(descriptor, &LocalFree);
+    SECURITY_DESCRIPTOR_CONTROL control = 0;
+    DWORD revision = 0;
+    const bool protected_dacl = result == ERROR_SUCCESS && descriptor && IsValidSecurityDescriptor(descriptor) &&
+        GetSecurityDescriptorControl(descriptor, &control, &revision) &&
+        (control & (SE_DACL_PRESENT | SE_DACL_PROTECTED)) == (SE_DACL_PRESENT | SE_DACL_PROTECTED) &&
+        dacl && IsValidAcl(dacl) && dacl->AceCount == 1;
+    expect(protected_dacl, "REGULAR_SECURITY actual DACL is present nonnull protected and has exactly one ACE");
+    if (!protected_dacl) return;
+    HANDLE token = nullptr;
+    bool token_ok = OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, TRUE, &token) != FALSE;
+    if (!token_ok && GetLastError() == ERROR_NO_TOKEN)
+        token_ok = OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token) != FALSE;
+    expect(token_ok, "REGULAR_SECURITY effective caller token is queryable");
+    if (!token_ok) return;
+    DWORD needed = 0;
+    const bool measured = !GetTokenInformation(token, TokenUser, nullptr, 0, &needed) &&
+        GetLastError() == ERROR_INSUFFICIENT_BUFFER && needed >= sizeof(TOKEN_USER);
+    std::vector<std::byte> user_bytes(measured ? needed : sizeof(TOKEN_USER));
+    const bool queried = measured && GetTokenInformation(token, TokenUser, user_bytes.data(), needed, &needed);
+    expect(CloseHandle(token) != FALSE, "REGULAR_SECURITY token handle closes");
+    const auto user = reinterpret_cast<const TOKEN_USER*>(user_bytes.data());
+    void* raw_ace = nullptr;
+    const bool readable = queried && user->User.Sid && IsValidSid(user->User.Sid) && GetAce(dacl, 0, &raw_ace);
+    expect(readable, "REGULAR_SECURITY effective caller identity and actual ACE are readable");
+    if (!readable) return;
+    const auto ace = static_cast<const ACCESS_ALLOWED_ACE*>(raw_ace);
+    expect(ace->Header.AceType == ACCESS_ALLOWED_ACE_TYPE && ace->Header.AceFlags == 0 &&
+           ace->Mask == FILE_ALL_ACCESS && IsValidSid(const_cast<DWORD*>(&ace->SidStart)) &&
+           EqualSid(const_cast<DWORD*>(&ace->SidStart), user->User.Sid) && owner &&
+           IsValidSid(owner) && EqualSid(owner, user->User.Sid),
+           "REGULAR_SECURITY actual non-inherited allow ACE and owner identify only the effective caller");
+}
+#endif
 static void regular_stream_checks(const fs::path& root) {
     using File = strata::core::RegularFileStream;
     fs::create_directories(root);
@@ -55,6 +102,9 @@ static void regular_stream_checks(const fs::path& root) {
            "REGULAR_STREAM bounded output seek overwrites without truncation and flush succeeds");
     expect(writer->close(ec) && !ec && writer->size() == 8 && fs::file_size(path) == 8,
            "REGULAR_STREAM explicit close succeeds and retains measured size");
+#ifdef _WIN32
+    regular_security_checks(path);
+#endif
     auto existing = File::create_exclusive(path, 8, ec);
     expect(!existing && bool(ec) && fs::file_size(path) == 8,
            "REGULAR_STREAM failed exclusive create cannot truncate or remove an existing object");
