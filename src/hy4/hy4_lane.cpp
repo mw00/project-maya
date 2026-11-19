@@ -14,6 +14,7 @@
 #include <windows.h>
 #endif
 #if defined(__linux__)
+#include <pthread.h>
 #include <sched.h>
 #include <sys/syscall.h>
 #include <unistd.h>
@@ -52,14 +53,28 @@ std::vector<int> cpu_list(const std::string& s) {   // "0-3,8,10-11"
     }
     return v;
 }
+#if defined(__linux__)
+// the CPUs this process may run on, read once - at the first lane, before its caller pins itself: on Linux
+// sched_getaffinity(0) reads the calling thread's own mask, and the caller's is one core after its first job (a lane
+// made after that saw that one core: every worker unpinned on it, beside the caller - and a thread the caller starts
+// inherits the mask, so a worker left unpinned takes this one instead)
+bool process_mask(cpu_set_t& out) {
+    static cpu_set_t m;
+    static const bool ok = [] {
+        CPU_ZERO(&m);
+        return sched_getaffinity(0, sizeof m, &m) == 0;
+    }();
+    out = m;
+    return ok;
+}
+#endif
 // each NUMA node's physical cores (their first logical CPU), only those this process may run on; one node of every
 // core when the host has no NUMA information
 std::vector<std::vector<int>> node_cores() {
     std::vector<std::vector<int>> nodes;
 #if defined(__linux__)
     cpu_set_t allowed;
-    CPU_ZERO(&allowed);
-    const bool mask = sched_getaffinity(0, sizeof allowed, &allowed) == 0;
+    const bool mask = process_mask(allowed);
     auto ok = [&](int c) { return c >= 0 && (!mask || (c < CPU_SETSIZE && CPU_ISSET(c, &allowed))); };
     for (int n = 0; n < 64; ++n) {
         const std::string cl = read_file("/sys/devices/system/node/node" + std::to_string(n) + "/cpulist");
@@ -130,6 +145,12 @@ struct Lane::Impl {
     }
     void loop(int core, int node) {
         if (core >= 0) strata::kernels::cpu::pin_current_thread(core);
+#if defined(__linux__)
+        else {   // (a worker beyond the cores: the process's CPUs, not the mask of the thread that started it)
+            cpu_set_t all;
+            if (process_mask(all)) pthread_setaffinity_np(pthread_self(), sizeof all, &all);
+        }
+#endif
         uint64_t seen = 0;
         for (;;) {
             auto t0 = std::chrono::steady_clock::now();
