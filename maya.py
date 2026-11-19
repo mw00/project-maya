@@ -8320,8 +8320,9 @@ def hy4_config_stream(quant: str, layout: str, ctx: int, usable: float, ram_gib:
                       chunk: int | None = None, reserve_gb: float | None = None, mtp: bool = False,
                       kv: str | None = None) -> tuple | None:
     """hy4_stream_rows for a size already set up, counted as hy4_config_need_gib counts it (the Models page's
-    serve/models.py hy4_room): (rows, ring, VRAM GiB) where the context fits its cards only with KV streaming and the
-    RAM left for the rows (ram_gib: hy4_ram_for_rows) holds them; kv "f16" / "q8": the config's own rows only."""
+    serve/models.py hy4_room): (rows, positions kept in VRAM, VRAM GiB) where the context fits its cards only with KV
+    streaming and the RAM left for the rows (ram_gib: hy4_ram_for_rows) holds them; kv "f16" / "q8": the config's own
+    rows only."""
     if ram_gib is None:
         return None
     plan = (hy4_layouts(hy4_quant_table(quant)).get(layout or HY4_STANDARD) or {}).get("plan") or {}
@@ -8333,7 +8334,7 @@ def hy4_config_stream(quant: str, layout: str, ctx: int, usable: float, ram_gib:
                 return None
             need = base - (hy4_cache_bytes(ctx, ch, q8) - hy4_cache_bytes(ctx, ch, q8, res)) / 2**30
             if need <= usable:
-                return ("q8" if q8 else "f16", res, need) if hy4_stream_ram_gib(ctx, q8) <= ram_gib else None
+                return ("q8" if q8 else "f16", max(res, ch), need) if hy4_stream_ram_gib(ctx, q8) <= ram_gib else None
     return None
 
 

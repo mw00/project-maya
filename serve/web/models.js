@@ -553,14 +553,16 @@ function qwenFields(m, d, s, ch, gpus) {
 
 // Hy4-flash's (maya-hy4: it stops at a flag it does not know, so only its own are offered; text only).  Its cache's VRAM a
 // context token, on each GPU of a tensor-parallel group: 13 layers keep every position (maya.py's HY4_KV_BYTES)
-// (... and in the smaller rows the engine takes by itself where these do not fit: serve/models.py's kv_small_from)
+// (... and in the smaller rows the engine takes by itself where these do not fit: serve/models.py's kv_small_from;
+//  at a context KV streaming takes - kv_streamed: {ram: bytes a token, win: positions in VRAM} - the line counts RAM)
 const HY4_KV_BYTES = 16640, HY4_KV_SMALL_BYTES = 9568;
 function hy4Fields(m, d, s, ch, images, gpus) {
   const mtp = m.choices.draft.includes("mtp");
   const tpIds = [...new Set(["auto", 0].concat([s.tp, d.tp].filter((t) => t !== "auto" && t != null).map(Number)))];
   return [
     {label: "Model", rows: [
-      contextRow(m, d, ch, {vram: m.kv_small_from && Number(d.context) >= m.kv_small_from ? HY4_KV_SMALL_BYTES : HY4_KV_BYTES}, [], null,
+      contextRow(m, d, ch, (m.kv_streamed || {})[String(d.context)] ||
+        {vram: m.kv_small_from && Number(d.context) >= m.kv_small_from ? HY4_KV_SMALL_BYTES : HY4_KV_BYTES}, [], null,
         m.context_more ? "A larger context needs more VRAM than this model's GPUs have." : null),
       html`<${Row} label="Drafting" flag="--mtp" changed=${ch("draft")}
         hint=${mtp ? "The model's own MTP block drafts a few tokens for the model to check: the same answers, about twice as fast on code. Off decodes token by token."

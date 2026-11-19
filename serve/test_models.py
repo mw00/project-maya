@@ -529,6 +529,11 @@ class Settings(unittest.TestCase):
                 a = M.apply(small, {"context": longest})["args"]
                 self.assertEqual((M.flag(a, "--max-context"), M.flag(a, "--kv-streaming")), (str(longest), "auto"))
                 self.assertIsNone(M.flag(M.apply(small, {"context": max(before)})["args"], "--kv-streaming"))
+                # (the page's Context size line: RAM a token and the positions in VRAM at the streamed contexts)
+                row = M.listing(self.d, None)["models"][0]
+                self.assertEqual(sorted(int(x) for x in row["kv_streamed"]), fit["streamed"])
+                self.assertIn(row["kv_streamed"][str(longest)]["ram"], (13 * 1152, 13 * 672))
+                self.assertGreaterEqual(row["kv_streamed"][str(longest)]["win"], 256)
                 with self.assertRaisesRegex(ValueError, f"the largest that fits is {longest}"):
                     M.apply(small, {"context": 1048576})          # (1M: the pooled keys alone do not fit 8 GB)
                 off = dict(small, args=small["args"] + ["--kv-streaming", "off"])

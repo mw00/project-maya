@@ -72,6 +72,8 @@ HY4_Q4_CONTEXTS = [32768, 65536, 131072, 262144]   # AngelSlim's Q4_K_M: the set
 #  the smallest card's VRAM - maya.py's HY4_Q4_LONG, HY4_Q4_LONG_SHARE, hy4_q4_contexts)
 HY4_Q4_LONG, HY4_Q4_LONG_SHARE = [524288, 1048576], 0.25
 HY4_KV_Q8_BYTES = 13 * (512 + 512 // 32 * 2 + 64 * 2 + 128 * 2 // 4)
+# (KV streaming: the RAM a context token takes - the 13 global layers' rows, F16 or 8-bit - maya.py's hy4_stream_ram_gib)
+HY4_STREAM_RAM_BYTES = {"f16": 13 * (512 + 64) * 2, "q8": 13 * (512 + 512 // 32 * 2 + 64 * 2)}
 # what maya-hy4 does not have yet, said in plain words when a client asks for it (apply; each one's "off" - HY4_OFF,
 # or nothing - is taken as it is: the page sends back what it was shown)
 HY4_OFF = {"parallel": 1, "kv_streaming": False}
@@ -861,7 +863,13 @@ def describe(path: Path, running: str | None) -> dict:
     if family(cfg) == "hy4":
         # (never said on the page: from which context the engine keeps its cache in the smaller rows - the Context
         #  size's GB figure counts them; and whether a context above the largest offered needs more VRAM - one line)
-        small = [] if hy4_plain(cfg) else (hy4_room(cfg) or {}).get("contexts_q8") or []
+        room = None if hy4_plain(cfg) else hy4_room(cfg)
+        small = (room or {}).get("contexts_q8") or []
+        # (... and the contexts KV streaming takes: their rows' RAM a token and the positions kept in VRAM - the
+        #  Context size's line then counts RAM, not VRAM)
+        st = {c: room["streamed"](c) for c in room["contexts"]} if room else {}
+        own.update(kv_streamed={str(c): {"ram": HY4_STREAM_RAM_BYTES[v[0]], "win": v[1]}
+                                for c, v in st.items() if v} or None)
         own.update(kv_small_from=min(small) if small else None,
                    context_more=bool(hy4_fits) and max(hy4_fits) < (HY4_Q4_LONG if hy4_plain(cfg) else HY4_CONTEXTS)[-1])
     return {**own, "file": path.name, "path": str(path), "model": cfg.get("model_name") or "", "family": family(cfg),
@@ -942,9 +950,9 @@ def hy4_room(cfg: dict) -> dict | None:
     tools/hy4/download.json, its --chunk and --reserve-gb): {"usable": GiB on its cards, "need": GiB by context (a
     function: the least it takes - with the latent cache in F16 rows, or in the 8-bit rows the engine's --kv auto
     takes where F16 does not fit; a config's own --kv f16 / q8: that one's), "contexts": those of HY4_CONTEXTS that
-    fit, "contexts_q8": those of them that fit only in 8-bit rows, "cards": how many, "streamed": a function - whether
-    a context fits only with KV streaming (the global layers' older rows in RAM, where this PC's RAM holds them: the
-    engine's --kv-streaming auto; "need" is then that VRAM)}.  The other parts counted have no RAM fallback: the
+    fit, "contexts_q8": those of them that fit only in 8-bit rows, "cards": how many, "streamed": a function - for a
+    context that fits only with KV streaming (the global layers' older rows in RAM, where this PC's RAM holds them:
+    the engine's --kv-streaming auto; "need" is then that VRAM) maya.hy4_config_stream's (rows, ring, GiB), else None}.  The other parts counted have no RAM fallback: the
     engine stops at its start where they do not fit.  Each card's VRAM in use is the setup's own
     reading (hy4_used: nvidia-smi's figure now, at most HY4_FIT_USED_CAP_GIB of it counted, a loaded Maya engine's own
     VRAM left out), so the page and the setup offer the same contexts.  None where it cannot be worked out: a card of
@@ -1003,7 +1011,7 @@ def hy4_room(cfg: dict) -> dict | None:
         return None
     return {"usable": usable, "need": need, "contexts": [c for c in HY4_CONTEXTS if rows[c] or streamed.get(c)],
             "contexts_q8": [c for c in HY4_CONTEXTS if rows[c] == "q8"], "cards": len(gpus),
-            "streamed": lambda ctx: bool(need_vram(ctx) is not None and need_vram(ctx) > usable and stream(ctx))}
+            "streamed": lambda ctx: stream(ctx) if need_vram(ctx) is not None and need_vram(ctx) > usable else None}
 
 
 HY4_CHUNK_BY_HAND = "chunk_by_hand"                 # (installer's: the page's Prompt chunk was changed by its user)
@@ -1130,7 +1138,7 @@ def hy4_context_check(cfg: dict, new: dict):
                              f"the {cur} tokens its setup worked out")
         return False
     if room["need"](ctx) <= room["usable"]:
-        return room["streamed"](ctx)
+        return bool(room["streamed"](ctx))
     fits = [c for c in room["contexts"] if c < ctx] + ([cur] if same else [])
     cards = f"these {room['cards']} cards have" if room["cards"] > 1 else "this card has"
     raise ValueError(f"Context: Hy4-Flash's parts that must sit on the GPU need about {room['need'](ctx):.1f} GB of VRAM "
