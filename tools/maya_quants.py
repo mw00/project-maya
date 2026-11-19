@@ -16,12 +16,12 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-FAMILIES = ("glm", "deepseek", "minimax", "qwen")
+FAMILIES = ("glm", "deepseek", "minimax", "qwen", "hy4")
 # ("qwen": CYBER-FROST-3.8-PS, the Qwen3.8-Flash-Next fine-tune - qwen4exp, on the `maya` engine's own Qwen path)
 MODEL = {"glm": "GLM-5.3-Flash", "deepseek": "DeepSeek-V4.1-Flash-1017", "minimax": "MiniMax-M3.1-Flash",
-         "qwen": "CYBER-FROST-3.8-PS"}
+         "qwen": "CYBER-FROST-3.8-PS", "hy4": "Hy4-Flash"}   # ("hy4": Tencent's Hy4-flash, on maya-hy4)
 SHOWN = {"glm": "GLM-5.3-Flash", "deepseek": "DeepSeek V4.1", "minimax": "MiniMax M3.1",
-         "qwen": "Qwen-3.8-Flash-Next (CYBER-FROST)"}   # the model's name on screen (the chat header: serve/web/lib.js's
+         "qwen": "Qwen-3.8-Flash-Next (CYBER-FROST)", "hy4": "Hy4-Flash"}   # the model's name on screen (the chat header: serve/web/lib.js's
                                                          # modelName(id, true), "Qwen-3.8-Flash-Next"); its ids stay
 SEP = " · "
 
@@ -41,6 +41,9 @@ MODEL_DEFAULTS = {
     # CYBER-FROST-3.8-PS: Blackfrost-AI/CYBER-FROST-3.8-BF16 generation_config.json and card - temperature 1.0, top_p
     # 0.95, top_k 20; thinking on, its template's default effort xhigh
     "qwen": ({"temperature": 1.0, "top_p": 0.95, "top_k": 20}, "xhigh"),
+    # Hy4-flash: tencent/Hy4-flash generation_config.json and card ("Recommended sampling parameters") - temperature
+    # 0.9, top_p 1.0, no top-k (its -1); reasoning_effort high its template's default (no_think: direct answers)
+    "hy4": ({"temperature": 0.9, "top_p": 1.0}, "high"),
     # GLM-5.3 (744B, glm-dsa: model_key "glm53", serve/glm_dsa_product.py): zai-org/GLM-5.3's
     # generation_config.json and card - temperature 1.0, top_p 0.95 (no top-k, min-p or penalties); reasoning_effort
     # low / high / max, max its default.  Its own entry, so that no quant of it takes GLM-5.3-Flash's tuned values
@@ -178,6 +181,10 @@ QUANTS = (
     ("deepseek", "maya-m", "Maya-M", "deepseek-maya-m"),
     ("minimax", "gguf-xs", "Maya-XS", "minimax-maya-xs"),
     ("minimax", "gguf-s", "Maya-S", "minimax-maya-s"),
+    ("hy4", "maya-xs", "Maya-XS", "hy4-flash-maya-xs"),
+    ("hy4", "maya-s", "Maya-S", "hy4-flash-maya-s"),
+    ("hy4", "maya-m", "Maya-M", "hy4-flash-maya-m"),
+    ("hy4", "maya-l", "Maya-L", "hy4-flash-maya-l"),
 )
 # the other files the setup offers, as shown after the model's name (a GLM download not listed: its own name); also
 # the ones an install can still have though the list no longer offers them (DeepSeek's UD-Q4_K_XL: maya.DS4_BY_HAND)
@@ -233,7 +240,7 @@ def config_stem(family: str, key: str | None) -> str | None:
     their run scripts point at them; a second DeepSeek quant beside the first: maya.ds4_config_path's own name).  MiniMax's GGUFs, new with the scheme, are the first named by it."""
     if family == "qwen":
         return "maya-qwen-ud-iq2_xs" if key == "ud-iq2_xs" else "maya-cyber-frost"
-    return f"maya-{setup_id(family, key)}" if family == "minimax" and setup_id(family, key) else None
+    return f"maya-{setup_id(family, key)}" if family in ("minimax", "hy4") and setup_id(family, key) else None
 
 
 def resolve(name: str, glm_downloads=()) -> tuple | None:
@@ -253,20 +260,22 @@ def resolve(name: str, glm_downloads=()) -> tuple | None:
         return "qwen", "q5_k_m"
     if low in QWEN_UD_IDS:
         return "qwen", "ud-iq2_xs"
-    for f in ("deepseek", "minimax", "qwen"):
+    for f in ("deepseek", "minimax", "qwen", "hy4"):
         if low == MODEL[f].lower():
             return f, None
     return None
 
 
 def family_of(cfg: dict) -> str:
-    """"minimax" for a MiniMax-M3.1-Flash config (maya-mm3), "qwen" for CYBER-FROST-3.8-PS (the `maya` engine with its
+    """"minimax" for a MiniMax-M3.1-Flash config (maya-mm3), "hy4" for a Hy4-Flash one (maya-hy4), "qwen" for CYBER-FROST-3.8-PS (the `maya` engine with its
     n-gram table, --ple-gguf), "deepseek" for a DeepSeek-V4.1-Flash config (maya-ds4's --pack: also the configs from
     before the programs' names of v1.1.16), else "glm"."""
     inst = cfg.get("installer") or {}
     exe = Path(str(cfg.get("exe", ""))).name
     if inst.get("family") == "minimax" or exe.startswith("maya-mm3"):
         return "minimax"
+    if inst.get("family") == "hy4" or exe.startswith("maya-hy4"):   # (Hy4-flash: its own engine, a --pack too)
+        return "hy4"
     args = cfg.get("args") or []
     if inst.get("family") == "qwen" or "--ple-gguf" in args[:-1]:
         return "qwen"
@@ -285,6 +294,8 @@ def config_key(cfg: dict) -> str | None:
         return inst.get("ds4_quant") or "exl3"
     if fam == "minimax":
         return inst.get("mm3_quant") or "exl3"
+    if fam == "hy4":
+        return inst.get("hy4_quant") or "maya-xs"
     if fam == "qwen":   # (its keys are lower case: a hand-edited "UD-IQ2_XS" is the same files and the same name)
         return str(inst.get("qwen_quant") or "q5_k_m").lower()
     return inst.get("quant")
