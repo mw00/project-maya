@@ -68,6 +68,9 @@ Q4_K_M (AngelSlim) is a 105 GB model file with the same table; all of its expert
 - **Pictures:** the vision tower's file (0.8 GB) stays on the SSD (RAM as the page cache); a picture takes up to
   0.8 GB of VRAM while it is read, which the engine keeps free on the main GPU. Pictures are on where the card has
   that room beside the model; on 8 GB cards the model fills the card, so they are off there (text only).
+- **Drafting:** the draft block's file (7.5 GB on the SSD, one for every size) takes about 4 GB of VRAM on the main
+  GPU, rounded to 8 bits when the engine starts. The setup turns drafting on where that fits beside the parts above
+  and a picture's room (Maya-XS at a 32K context: about 14.6 GB in all), and leaves it off on smaller cards.
 
 ## Examples
 

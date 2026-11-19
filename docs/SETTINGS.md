@@ -2371,9 +2371,17 @@ Pictures go before the cache's precision: the engine takes the 8-bit cache rows 
 gives pictures up. Only where not even a small picture's room is left does the setup write `--vision off` and say
 so. Images on the Models page turns them on or off; the details are under "Pictures" below.
 
-**Not available for Hy4-Flash yet** (the dashboard offers no switch for them): drafting with Maya's sizes (the release's drafter is not read by the engine
-yet, and `--mtp` below only applies to GGUF sets that carry an MTP block - Tencent's own Q4_K_M, which the setup
-offers after Maya's sizes); `--parallel` (one request at a time for now); AMD (HIP) and Mac.
+**Drafting with Maya's sizes:** they draft with Tencent's MTP block through the same `--mtp` as below. The sets made
+from the public release do not carry the block, so it comes as a file of its own (`Hy4-Flash-mtp-BF16.gguf`, 7.5 GB,
+one for every size, from Maya's repo: the block as in AngelSlim's GGUF, its weights unchanged). The setup puts it in
+the model's folder and the pack (`tools/hy4/pack_gguf.py`, `--mtp FILE|none`) indexes it as one more file; the engine
+then finds the block as it does in a set that carries it. It takes about 4 GB of VRAM on the main GPU: the setup
+turns drafting on where that fits beside the model's own parts and a picture's room, and leaves it off (and the block
+out of the pack) on smaller cards and in the 8 GB-card layout. `--drafting on|off` at the setup, or Drafting on the
+Models page, changes it.
+
+**Not available for Hy4-Flash yet** (the dashboard offers no switch for them): `--parallel` (one request at a time
+for now); AMD (HIP) and Mac.
 
 The rest of this section describes the engine itself, as contributed, and what it does with a GGUF set that carries
 the model's MTP block (Tencent's own Q4_K_M from [AngelSlim](https://huggingface.co/AngelSlim/Hy4-flash-GGUF),
@@ -2447,7 +2455,8 @@ instead of F16 tensor-parallel sums: 0.10-0.13 against the F16 run itself; the 8
 part in 8 bits as well (624 bytes a row) measured 0.223 / 0.260 on the 2048 / 4096 files, so it stays F16. Decode and
 prompt speed are the same either way.
 
-**Drafting** (only GGUF sets with an MTP block - Tencent's own Q4_K_M; not Maya's sizes). `--mtp` loads the GGUF's MTP block (its BF16 weights rounded to Q8_0 at load; its copy of the output
+**Drafting** (GGUF sets with an MTP block - Tencent's own Q4_K_M - and Maya's sizes with the block's own file
+beside them). `--mtp` loads the GGUF's MTP block (its BF16 weights rounded to Q8_0 at load; its copy of the output
 head for the drafts' top token in Q4_K - only how often a draft holds depends on it) and drafts up to
 `--draft` tokens a step; the model checks them in one window, so the tokens are the model's own: greedy answers are
 the same with and without it on the same placement, and with sampling a draft is kept with the model's probability of

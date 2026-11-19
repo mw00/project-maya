@@ -1,7 +1,7 @@
 """tools/hy4/pack_gguf.py - maya-hy4's pack for a Hy4-flash GGUF set (Tencent's Hy4-flash, the GGUF's `hy_v4_flash`
 layout: AngelSlim's Q4_K_M / Q3_K / IQ2 builds), beside the model's files (no weights copied).
 
-    python tools/hy4/pack_gguf.py --model ~/models/Hy4-flash-GGUF [--mmproj FILE|none]
+    python tools/hy4/pack_gguf.py --model ~/models/Hy4-flash-GGUF [--mmproj FILE|none] [--mtp FILE|none]
 
 writes <model>/maya-hy4/:
   hy4.txt       the geometry, one `key value` a line (lists comma-separated), from the GGUF's hy_v4_flash.* keys; with
@@ -20,6 +20,11 @@ writes <model>/maya-hy4/:
 
 The vision tower: AngelSlim's mmproj-Hy4-flash-*.gguf (clip.projector_type hy_v4_flash) in the model's folder, found
 there unless --mmproj names one (or `none`: text only).  The model's shards are the folder's other .gguf files.
+
+The MTP draft block (maya-hy4's --mtp): in the set itself (AngelSlim's builds: hy_v4_flash.nextn_predict_layers 1), or -
+for a set made from the public release, which has none - in a file of its own in the model's folder (general.type
+"mtp": tools/hy4/mtp_gguf.py writes it from a set that has the block), found there unless --mtp names one (or `none`).
+Its tensors join the pack as one more file and the geometry gains the block (n_mtp 1); a set with its own block keeps it.
 """
 from __future__ import annotations
 
@@ -68,6 +73,10 @@ def is_mmproj(g: Gguf) -> bool:
     return g.kv.get("general.type") == "mmproj" or g.kv.get("general.architecture") == "clip"
 
 
+def is_mtp(g: Gguf) -> bool:
+    return g.kv.get("general.type") == "mtp" and g.kv.get("general.architecture") == ARCH
+
+
 def find_shards(model: pathlib.Path, names: list | None) -> list:
     paths = [model / n for n in names] if names else sorted(model.glob("*.gguf"))
     if not paths:
@@ -87,7 +96,7 @@ def find_shards(model: pathlib.Path, names: list | None) -> list:
             arch, kind = g.kv.get("general.architecture"), g.kv.get("general.type")
             if (arch is None or arch == ARCH) and kind in (None, "model"):
                 gs.append(g)
-            else:
+            elif not is_mtp(g):                    # (the MTP block's own file: find_mtp's)
                 print("%s: %s / %s, not a shard of the model, left out" % (p.name, arch, kind))
         if not gs:
             raise SystemExit("%s: no %s model .gguf files" % (model, ARCH))
@@ -259,6 +268,79 @@ def find_mmproj(model: pathlib.Path, arg: str | None) -> Gguf | None:
     return mine[0]
 
 
+def find_mtp(model: pathlib.Path, arg: str | None) -> Gguf | None:
+    """The MTP block's own file: --mtp's, else the folder's one GGUF of general.type "mtp" (None: there is none)."""
+    if arg == "none":
+        return None
+    if arg:
+        p = pathlib.Path(arg).expanduser()
+        p = p if p.is_absolute() else (model / p if (model / p).exists() else p.resolve())
+        cands = [Gguf(p)]
+        if not is_mtp(cands[0]):
+            raise SystemExit("%s: not a %s MTP block's file (general.type %r)" %
+                             (arg, ARCH, cands[0].kv.get("general.type")))
+    else:
+        cands = []
+        for p in sorted(model.glob("*.gguf")):
+            try:
+                g = Gguf(p)
+            except (Exception, SystemExit):  # noqa: BLE001 - not a GGUF this reader takes: not the block's file
+                continue
+            if is_mtp(g):
+                cands.append(g)
+    if len(cands) > 1:
+        raise SystemExit("%s: %d MTP block files (name one with --mtp)" % (model, len(cands)))
+    if not cands:
+        return None
+    why = short(cands[0])
+    if why:
+        raise SystemExit("not whole yet: " + why)
+    return cands[0]
+
+
+# the keys a trunk and its MTP block must agree on (the block's matrices have the trunk's shapes), and the per-block ones
+MTP_SAME = ("embedding_length", "vocab_size", "expert_count", "expert_used_count", "expert_feed_forward_length",
+            "expert_latent_length", "expert_shared_count", "expert_gating_func", "attention.q_lora_rank",
+            "attention.kv_lora_rank", "attention.key_length_mla", "attention.value_length_mla", "rope.dimension_count",
+            "attention.indexer.head_count", "attention.indexer.key_length", "attention.layer_norm_rms_epsilon")
+MTP_PER_BLOCK = ("attention.head_count", "swiglu_clamp_exp")
+
+
+def with_mtp(kv: dict, m: Gguf) -> dict:
+    """The set's keys with the block of the MTP file `m` after the trunk's last: block_count and nextn_predict_layers
+    the file's, the per-block lists one entry longer (the file's own value for its block).  Refused when the file's
+    block is not this trunk's next one, or its geometry another model's."""
+    a = ARCH + "."
+    n = int(kv[a + "block_count"])
+    n_all, mtp = int(m.kv.get(a + "block_count", 0)), int(m.kv.get(a + "nextn_predict_layers", 0))
+    if mtp != 1 or n_all - mtp != n:
+        raise SystemExit("%s: the MTP block of a model of %d blocks, this set has %d" % (m.path.name, n_all - mtp, n))
+    for k in MTP_SAME:
+        if a + k in kv and a + k in m.kv and kv[a + k] != m.kv[a + k]:
+            raise SystemExit("%s: %s %r, the set's is %r - not this model's MTP block" %
+                             (m.path.name, k, m.kv[a + k], kv[a + k]))
+    prefix = "blk.%d." % n
+    odd = [name for name, _, _, _ in m.tensors if not name.startswith(prefix)]
+    if odd or prefix + "nextn.eh_proj.weight" not in {t[0] for t in m.tensors}:
+        raise SystemExit("%s: not block %d alone (%s)" % (m.path.name, n, odd[0] if odd else "no nextn.eh_proj"))
+    out = dict(kv)
+    out[a + "block_count"], out[a + "nextn_predict_layers"] = n_all, mtp
+    for k in MTP_PER_BLOCK:
+        v, mv = kv.get(a + k), m.kv.get(a + k)
+        if mv is None:
+            continue
+        tail = list(mv)[n:n_all] if isinstance(mv, list) else [mv]
+        if len(tail) != 1:
+            raise SystemExit("%s: %s has %d values for %d blocks" % (m.path.name, k, len(mv), n_all))
+        if isinstance(v, list):
+            if len(v) != n:
+                raise SystemExit("%s: %d values for %d blocks" % (k, len(v), n))
+            out[a + k] = list(v) + tail
+        elif v is not None and v != tail[0]:
+            out[a + k] = [v] * n + tail
+    return out
+
+
 def vision_geometry(g: Gguf, tokens: list, n_embd: int) -> dict:
     """hy4.txt's vision.* keys from the mmproj's clip.* keys and the model's vocabulary."""
     kv = g.kv
@@ -337,6 +419,8 @@ def main() -> int:
     ap.add_argument("--out", help="the pack's folder (default: <model>/maya-hy4)")
     ap.add_argument("--mmproj", help="the vision tower's GGUF (default: the folder's mmproj file of Hy4-flash; "
                                      "none: text only)")
+    ap.add_argument("--mtp", help="the MTP draft block's own GGUF, for a set without the block (default: the folder's "
+                                  "file of general.type mtp; none: no drafts)")
     ap.add_argument("--engram-eps", type=float, help="the Engram norms' eps (default: the engine's, FP32's machine "
                     "epsilon; 0.0078125: the release run in BF16)")
     a = ap.parse_args()
@@ -348,11 +432,18 @@ def main() -> int:
     for g in gs:
         for k, v in g.kv.items():
             kv.setdefault(k, v)
+    mtp = None
+    if int(kv.get("%s.nextn_predict_layers" % ARCH, 0)) == 0:
+        mtp = find_mtp(model, a.mtp)
+        if mtp is not None:
+            kv = with_mtp(kv, mtp)
+    elif a.mtp and a.mtp != "none":   # (a set with its own block keeps it; a block's file in its folder is not read)
+        raise SystemExit("--mtp %s: the set has its own MTP block" % a.mtp)
     geo = geometry(kv)
     if vis is not None:
         geo.update(vision_geometry(vis, kv["tokenizer.ggml.tokens"], geo["n_embd"]))
     tensors, lines = {}, []
-    for i, g in enumerate(gs + ([vis] if vis is not None else [])):
+    for i, g in enumerate(gs + ([mtp] if mtp is not None else []) + ([vis] if vis is not None else [])):
         lines.append("file %d %s" % (i, os.path.relpath(g.path, model)))
         for name, typ, dims, off in g.tensors:
             if name in tensors:
@@ -387,8 +478,9 @@ def main() -> int:
             extra += "engram_eps %r\n" % a.engram_eps
     (out / "hy4.txt").write_text(geometry_text(geo, model) + extra)
     (out / "tensors.txt").write_text("\n".join(lines) + "\n")
-    print("%s: %d tensors from %d files, %d layers (+%d MTP), %d Engram layers, %s" %
-          (out, len(tensors), len(gs), geo["n_layer"], geo["n_mtp"], ne,
+    print("%s: %d tensors from %d files, %d layers (+%d MTP%s), %d Engram layers, %s" %
+          (out, len(tensors), len(gs), geo["n_layer"], geo["n_mtp"],
+           ": %s" % mtp.path.name if mtp is not None else "", ne,
            "the vision tower (%s)" % vis.path.name if vis is not None else "text only"))
     return 0
 
