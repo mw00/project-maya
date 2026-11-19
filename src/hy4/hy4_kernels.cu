@@ -1708,7 +1708,23 @@ __global__ void set_flag_kernel(unsigned* flag, unsigned v) {
     *(volatile unsigned*) flag = v;
     __threadfence_system();
 }
-// (a few tokens' rows go through the kernels; a prompt chunk's through the copy engines, the flag after them)
+void submit(cudaStream_t s) {
+#if defined(_WIN32) && defined(STRATA_USE_HIP)
+    static const bool on = [] {
+        const char* v = std::getenv("HY4_WIN_SUBMIT");
+        return v == nullptr || std::atoi(v) != 0;
+    }();
+    if (on) {
+        (void) cudaStreamQuery(s);
+        (void) cudaGetLastError();   // (cudaErrorNotReady: the work is queued, not an error)
+    }
+#else
+    (void) s;
+#endif
+}
+// (a few tokens' rows go through the kernels; a prompt chunk's through the copy engines, the flag after them.  Both
+//  end with submit: the host's summing threads and the other GPUs spin on the flag - #303's hang on maya-ds4 was a
+//  flag whose writer had never been submitted)
 constexpr size_t kViaKernel = 64 * 1024;
 void publish(const float* src, float* dst, size_t n, unsigned* counter, unsigned* flag, unsigned v, cudaStream_t s) {
     if (n % 4) {
@@ -1724,12 +1740,14 @@ void publish(const float* src, float* dst, size_t n, unsigned* counter, unsigned
         }
         set_flag_kernel<<<1, 1, 0, s>>>(flag, v);
         check("publish");
+        submit(s);
         return;
     }
     const size_t n4 = n / 4;
     const int blocks = (int) std::max<size_t>(1, std::min<size_t>(16, (n4 + 255) / 256));
     publish_kernel<<<blocks, 256, 0, s>>>((const float4*) src, (float4*) dst, n4, counter, flag, v);
     check("publish");
+    submit(s);
 }
 void wait_pull(const unsigned* flag, unsigned v, float* dst, const float* src, size_t n, cudaStream_t s) {
     if (n % 4) {
@@ -1758,6 +1776,7 @@ void wait_flag(const unsigned* flag, unsigned v, cudaStream_t s) {
 void set_flag(unsigned* flag, unsigned v, cudaStream_t s) {
     set_flag_kernel<<<1, 1, 0, s>>>(flag, v);
     check("set_flag");
+    submit(s);   // (the host's summing threads spin on it)
 }
 __global__ void pack3_kernel(const unsigned* a, size_t na, const unsigned* b, size_t nb, const unsigned* c, size_t nc,
                              unsigned* dst, int split) {

@@ -152,6 +152,11 @@ void moe_combine(const float* y, const int* row_of, const float* w, int T, int n
 /// wait_flag: the wait alone; set_flag: *flag = v after the stream's work before it.  The waits give up after a minute
 /// (an error: errors() counts it), so no device spins for good.
 void publish(const float* src, float* dst, size_t n, unsigned* counter, unsigned* flag, unsigned v, cudaStream_t s);
+/// AMD under Windows (HIP): the runtime holds queued launches and copies back until the host waits on the GPU - the
+/// work queued on `s` submitted now (cudaStreamQuery, which does not wait), as maya-ds4's and maya-mm3's own.  Where
+/// the host or another GPU waits for a flag this stream sets, or the host works beside the GPU, the work must not sit
+/// in the queue.  Elsewhere (Linux, and NVIDIA on Windows) nothing.  HY4_WIN_SUBMIT=0: off (A/B tests)
+void submit(cudaStream_t s);
 void wait_pull(const unsigned* flag, unsigned v, float* dst, const float* src, size_t n, cudaStream_t s);
 void wait_flag(const unsigned* flag, unsigned v, cudaStream_t s);
 void set_flag(unsigned* flag, unsigned v, cudaStream_t s);

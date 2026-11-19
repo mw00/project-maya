@@ -5,6 +5,8 @@
 
 #include <algorithm>
 #include <atomic>
+#include <string>
+#include <vector>
 #include <fstream>
 #include <sstream>
 #if defined(_WIN32)
@@ -25,6 +27,9 @@
 #include <map>
 #include <mutex>
 #include <thread>
+
+#include "strata/platform/commit.hpp"
+#include "strata/platform/dedicated.hpp"
 #if defined(__x86_64__) || defined(_M_X64)
 #include <immintrin.h>
 #endif
@@ -377,6 +382,20 @@ uint64_t gpu_own_free(int domain, int bus, int dev) {
     (void) domain;
     (void) bus;
     (void) dev;
+    return 0;
+#endif
+}
+
+uint64_t gpu_dedicated(const void* luid) { return strata::platform::dedicated_bytes(luid); }
+
+uint64_t commit_available() {
+#if defined(_WIN32)
+    MEMORYSTATUSEX s{};
+    s.dwLength = sizeof(s);
+    return GlobalMemoryStatusEx(&s)
+               ? (uint64_t) s.ullAvailPageFile + strata::platform::commit_growth((uint64_t) s.ullTotalPhys)
+               : 0;
+#else
     return 0;
 #endif
 }

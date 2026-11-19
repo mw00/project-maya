@@ -97,6 +97,12 @@ uint64_t ram_total();
 /// Linux, an AMD GPU at this PCI address: the free bytes of the memory that is the GPU's own (on an APU the BIOS's
 /// share, which the system does not count as RAM) - 0 where the driver does not say
 uint64_t gpu_own_free(int domain, int bus, int dev);
+/// Windows: the dedicated memory DXGI reports for the adapter with this LUID (a device property's luid: an APU's
+/// carve-out; strata/platform/dedicated.hpp) - 0 where unknown, and off Windows
+uint64_t gpu_dedicated(const void* luid);
+/// Windows: what this process can still commit (RAM + page file, with what a page file Windows manages may still
+/// grow by; strata/platform/commit.hpp) - every allocation on an APU's GPU is charged to it; 0 off Windows
+uint64_t commit_available();
 
 /// out [T][n_embd] = each token's weighted sum of its entries' experts (rows with no entry: 0), x [T][n_embd]; the
 /// experts' weights read once for up to 8 of their tokens.  Scratch is the lane's own (grown as needed).
