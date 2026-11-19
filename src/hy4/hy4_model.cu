@@ -1928,6 +1928,9 @@ struct Model::Impl {
                     CK(cudaGetDeviceProperties(&pi, gp.dev));
                     tensor_cores = tensor_cores && pi.major >= 7;
                 }
+#if defined(STRATA_USE_HIP)
+                tensor_cores = false;   // (AMD: measured slower past kDenseBase on a 16K prompt - the span stays)
+#endif
                 if (tensor_cores) spans.assign(std::begin(kDense), std::end(kDense));
             }
             if (!spans.empty()) {

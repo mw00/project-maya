@@ -187,7 +187,7 @@ Its engine settings: [SETTINGS.md](SETTINGS.md#minimax-m31-flash).
 The setup also offers **[Hy4-Flash](https://huggingface.co/tencent/Hy4-flash)** (Tencent's Hy4-flash; 220 B
 parameters: a 155.5 B language backbone with 512 experts a layer, 63.5 B of n-gram "Engram" tables, a vision encoder
 and a drafter; the [Tencent Hy License](../LICENSE.hy4-flash): based on Apache-2.0, with extra commercial terms for large
-model-as-a-service providers) on an engine of its own (`maya-hy4`, contributed by
+model-as-a-service providers) on an engine of its own (`maya-hy4`; base NVIDIA engine contributed by
 [@needmorevram](https://github.com/needmorevram), #1040): `./maya.sh --setup` and pick "Hy4-Flash", or
 `./maya.sh --setup --model hy4-flash-maya-xs` (also `--hy4-quant maya-xs`; Windows: `START-MAYA.bat`).
 
