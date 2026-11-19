@@ -476,6 +476,12 @@ class Files(unittest.TestCase):
         with with_manifest(man):
             with self.assertRaisesRegex(Failed, "not published yet .*--model hy4-flash-maya-xs --model-dir"):
                 maya.hy4_model_step(args(), d, "maya-xs", "standard", self.models)
+            # the trunk alone: the file that is missing and its size, not the command just run
+            self.put(d, body, trunk)
+            with self.assertRaises(Failed) as e:
+                maya.hy4_model_step(args(), d, "maya-xs", "standard", self.models)
+            self.assertIn("missing: the n-gram table " + Path(ngram).name + " (", str(e.exception))
+            self.assertNotIn("--model-dir", str(e.exception))
             self.put(d, body, trunk, ngram)
             files = maya.hy4_model_step(args(), d, "maya-xs", "standard", self.models)
             self.assertEqual([f.name for f in files], [TRUNK, NGRAM])

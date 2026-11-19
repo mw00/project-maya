@@ -8276,6 +8276,14 @@ def hy4_model_step(a, d: Path, quant: str, layout: str = HY4_STANDARD, models: P
         link_published(ngram, m["files"][ngram.name], m["sha256"][ngram.name], hy4_places(models, ngram.name))
     missing = [f for f in files if file_incomplete(m, f)]
     if missing and not hy4_published(quant, layout):
+        if len(missing) < len(files):                  # (a folder with a part of the set: which file, and its size)
+            what = ", ".join(("the n-gram table " if f == ngram else "") + f"{f.name} ({m['files'][f.name] / 1e9:.1f} GB)"
+                             + ("" if file_incomplete(m, f) == "missing" else f": {file_incomplete(m, f)}")
+                             for f in missing)
+            fail(f"{name} is not published yet, and {d} does not have all of its files - missing: {what}",
+                 f"both files must be in the folder ({', '.join(f.name for f in files)}); the n-gram table is the "
+                 f"same file for every size: a copy another {HY4} folder under the models folder has is linked by "
+                 "itself (--models-dir <that models folder>)")
         fail(f"{name} is not published yet (and {missing[0]} is {file_incomplete(m, missing[0])})",
              f"with its files in a folder: {ME} --setup --model {Q.setup_id('hy4', quant)} --model-dir <folder>")
     if missing and not offer_download(a, Q.shown("hy4", quant, m["download_gb"]), d, files, m):
