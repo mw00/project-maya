@@ -208,7 +208,8 @@ the [model card](https://huggingface.co/peasantsmith/Hy4-Flash-Maya-GGUF).
   experts on the GPU, which is faster.
 - **Cards of 8 GB:** for a card under about 10 GB the setup picks an "8 GB" layout of Maya-XS by itself - a second
   model file with smaller attention weights (43.6 GB; slightly lower quality) that needs about 6.5 / 6.8 GiB of free
-  VRAM at 4K / 8K context. A card with less than about 7 GB cannot run it.
+  VRAM at 4K / 8K context, and about 7.0 / 7.1 GiB at 16K / 32K, where the engine keeps the context's cache in 8
+  bits by itself (the setup says so). A card with less than about 7 GB cannot run it.
 - **Set up for your PC:** the setup checks the PC, picks the layout and the context that fit the card (4K to 128K
   are offered; run end to end up to 32K so far - the model itself is trained for 1M), downloads the model file and
   the n-gram table from Maya's repo, builds the engine's index of them (the pack) and the engine, and writes

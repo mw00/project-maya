@@ -848,6 +848,8 @@ def describe(path: Path, running: str | None) -> dict:
     # GLM-5.3 (744B): its name on screen beside the quant, and its cache's bytes a context token for the Context size's
     # line (the page's GLM_KV_BYTES is GLM-5.3-Flash's) - keys only its configs have
     own = {"shown": G53.LABEL, "kv_bytes": glm53_kv_bytes(cfg)} if G53.config_is_glm_dsa(cfg) else {}
+    if family(cfg) == "hy4" and not hy4_plain(cfg):    # (the contexts whose cache the engine keeps in 8 bits: said)
+        own["contexts_8bit"] = (hy4_room(cfg) or {}).get("contexts_q8") or []
     return {**own, "file": path.name, "path": str(path), "model": cfg.get("model_name") or "", "family": family(cfg),
             "quant": quant_label(cfg, path), "backend": cfg.get("backend") or "cuda", "written": inst.get("written"),
             "used": used, "running": running is not None and str(path.resolve()) == str(Path(running).resolve()),
@@ -874,7 +876,9 @@ def hy4_room(cfg: dict) -> dict | None:
     """What Hy4-Flash's config has in VRAM for a context, worked out as the setup does it (maya.py's
     hy4_config_need_gib and hy4_usable_gib: the plan of its size and layout - installer.hy4_quant / layout - in
     tools/hy4/download.json, its --chunk and --reserve-gb): {"usable": GiB on its cards, "need": GiB by context (a
-    function), "contexts": those of HY4_CONTEXTS that fit, "cards": how many}.  The parts counted have no RAM
+    function: the least it takes - with the latent cache in F16 rows, or in the 8-bit rows the engine's --kv auto
+    takes where F16 does not fit; a config's own --kv f16 / q8: that one's), "contexts": those of HY4_CONTEXTS that
+    fit, "contexts_q8": those of them that fit only in 8-bit rows, "cards": how many}.  The parts counted have no RAM
     fallback: the engine stops at its start where they do not fit.  Each card is taken as the setup takes one with a
     desktop and programs on it (HY4_FIT_USED_CAP_GIB: the engine's own use now says nothing).  None where it cannot
     be worked out: a card of the config this PC does not list with its VRAM, a size the table has no plan for."""
@@ -888,16 +892,25 @@ def hy4_room(cfg: dict) -> dict | None:
             sys.path.insert(0, root)
         import maya                                    # (the setup's own plan and sums; nothing runs on import)
 
-        def need(ctx: int):
+        kv = flag(args, "--kv")
+
+        def one(ctx: int, q8: bool):
             return maya.hy4_config_need_gib(inst.get("hy4_quant") or "", inst.get("layout") or maya.HY4_STANDARD, ctx,
-                                            chunk=_int(flag(args, "--chunk")), reserve_gb=_float(flag(args, "--reserve-gb")))
+                                            chunk=_int(flag(args, "--chunk")), reserve_gb=_float(flag(args, "--reserve-gb")),
+                                            q8=q8)
+
+        def need(ctx: int):
+            if kv in ("f16", "q8") or one(ctx, False) is None:
+                return one(ctx, kv == "q8")
+            return min(one(ctx, False), one(ctx, True))
         if need(HY4_CONTEXTS[0]) is None:
             return None
         usable = maya.hy4_usable_gib([cards[i] for i in gpus], {i: maya.HY4_FIT_USED_CAP_GIB * 1024 for i in gpus})
+        rows = {c: maya.hy4_kv_rows(one(c, False), one(c, True), usable, kv) for c in HY4_CONTEXTS}
     except Exception:  # noqa: BLE001 - no plan to read: the page keeps to the context the setup wrote
         return None
-    return {"usable": usable, "need": need, "contexts": [c for c in HY4_CONTEXTS if need(c) <= usable],
-            "cards": len(gpus)}
+    return {"usable": usable, "need": need, "contexts": [c for c in HY4_CONTEXTS if rows[c]],
+            "contexts_q8": [c for c in HY4_CONTEXTS if rows[c] == "q8"], "cards": len(gpus)}
 
 
 def hy4_contexts(cfg: dict) -> list:

@@ -386,12 +386,21 @@ class Settings(unittest.TestCase):
                                                                       for i, v in enumerate(gb)])
         small = cfg_with("8gb", 8192, [0], "maya-hy4-flash-maya-xs.json")
         with cards(8.0):                               # an 8 GB card, the 8 GB layout at 8K (the Uranus tester's)
+            # (16K fits with the latent cache in 8-bit rows - the engine's --kv auto takes them by itself; 32K: not
+            #  on a card taken to have 1 GB in use)
+            self.assertEqual(M.flag(M.apply(small, {"context": 16384})["args"], "--max-context"), "16384")
+            self.assertNotIn("--kv", M.apply(small, {"context": 16384})["args"])
             with self.assertRaisesRegex(ValueError, r"Context: Hy4-Flash's parts that must sit on the GPU need about "
-                                                    r"7\.6 GB of VRAM at 16384 tokens; this card has 7\.0 GB for them - "
-                                                    r"the largest that fits is 8192"):
-                M.apply(small, {"context": 16384})
-            with self.assertRaisesRegex(ValueError, "largest that fits is 8192"):
+                                                    r"7\.1 GB of VRAM at 32768 tokens; this card has 7\.0 GB for them - "
+                                                    r"the largest that fits is 16384"):
+                M.apply(small, {"context": 32768})
+            with self.assertRaisesRegex(ValueError, "largest that fits is 16384"):
                 M.apply(small, {"context": 131072})
+            f16 = dict(small, args=small["args"] + ["--kv", "f16"])   # (F16 rows by name: only what fits with them)
+            with self.assertRaisesRegex(ValueError, r"need about 7\.6 GB of VRAM at 16384 tokens; this card has 7\.0 GB "
+                                                    r"for them - the largest that fits is 8192"):
+                M.apply(f16, {"context": 16384})
+            self.assertEqual((M.hy4_room(small)["contexts_q8"], M.hy4_room(f16)["contexts_q8"]), ([16384], []))
             self.assertEqual(M.flag(M.apply(small, {"context": 8192})["args"], "--max-context"), "8192")
             self.assertEqual(M.flag(M.apply(small, {"context": 4096})["args"], "--max-context"), "4096")
             self.assertEqual(M.apply(small, M.settings_of(small)), small)
@@ -400,7 +409,8 @@ class Settings(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "could not be read"):
                 M.apply(small, {"gpus": [0, 1], "context": 32768})   # (a card this PC does not list adds no VRAM)
             row = M.listing(self.d, None)["models"][0]
-            self.assertEqual((row["contexts"], row["context_range"]["max"]), ([4096, 8192], 8192))
+            self.assertEqual((row["contexts"], row["context_range"]["max"], row["contexts_8bit"]),
+                             ([4096, 8192, 16384], 16384, [16384]))
         with cards(8.0, 8.0):                          # a second card: room for more
             self.assertEqual(M.flag(M.apply(small, {"gpus": [0, 1], "context": 32768})["args"], "--max-context"), "32768")
         with cards(4.0, 4.0):

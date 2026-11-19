@@ -817,6 +817,8 @@ HY4_DEFAULT_CONTEXT = 65536
 # (512 + 64 rope, F16) and the indexer's pooled keys (128 F32 every 4 positions); the sliding-window layers keep a ring
 # of fixed size.  With tensor parallel every GPU of the group holds all of it
 HY4_KV_BYTES = 13 * (2 * (512 + 64) + 128 * 4 // 4)
+# (a latent row in the engine's 8-bit rows: the 512 values int8 in blocks of 32 with an F16 scale, the rope part F16)
+HY4_KV_Q8_ROW = 512 + 512 // 32 * 2 + 64 * 2
 HY4_MODEL_NAME = "hy4-flash"
 HY4_SAMPLING, HY4_EFFORT = Q.MODEL_DEFAULTS["hy4"]  # (Tencent's card: temperature 0.9, top-p 1.0; its template's High)
 HY4_PROFILE = ROOT / "data" / "expert-profile-hy4.bin"
@@ -1780,13 +1782,17 @@ def context_label(n: int) -> str:
     return f"{n // 1048576}M" if n % 1048576 == 0 else f"{n // 1024}K"
 
 
-def choose_context(a, prev_ctx, contexts=CONTEXTS, recommended=DEFAULT_CONTEXT) -> int:
+def choose_context(a, prev_ctx, contexts=CONTEXTS, recommended=DEFAULT_CONTEXT, notes: dict | None = None) -> int:
+    """notes: {context: a word said beside it} (Hy4-Flash: where its cache is kept in 8 bits)."""
     if a.context:
         return a.context
     default = prev_ctx if prev_ctx in contexts else recommended
+    notes = notes or {}
     pick = choose("Context?", ["Context length = how much text the model sees at once (the chat, files, tool output). "
                                "A longer one takes", "VRAM from the expert cache, so answers get a little slower:"],
-                  [(f"{context_label(c)} tokens", "recommended" if c == recommended else None, None) for c in contexts],
+                  [(f"{context_label(c)} tokens",
+                    ", ".join(x for x in ("recommended" if c == recommended else None, notes.get(c)) if x) or None, None)
+                   for c in contexts],
                   contexts.index(default), a.yes)
     return contexts[pick]
 
@@ -8231,44 +8237,66 @@ def hy4_recommended_context(pc: dict) -> int:
     return max(fits) if fits else HY4_Q4_CONTEXTS[0]
 
 
-def hy4_cache_bytes(ctx: int, chunk: int) -> int:
+def hy4_cache_bytes(ctx: int, chunk: int, q8: bool = False) -> int:
     """The bytes of maya-hy4's caches in VRAM at a context (src/hy4/hy4_model.cu's plan): the window layers' ring of
     latents (the newest 512 + max(16384, chunk) positions), the global layers' latents and pooled keys for every
-    position, and the ring's hidden states."""
+    position, and the ring's hidden states.  q8: with the latent cache in 8-bit rows (the engine's --kv q8, and its
+    --kv auto where F16 rows do not fit: 672 bytes a row against 1152, the indexer's rows F16 against F32)."""
     ring = min(ctx, 512 + max(16384, chunk))
-    return 29 * ring * 576 * 2 + 13 * (ctx * 576 * 2 + (ctx // 4 + 1) * 128 * 4 + ring * 2 * 128 * 4) + ring * 3072 * 4
+    row, pool = (HY4_KV_Q8_ROW, 2) if q8 else (576 * 2, 4)
+    return 29 * ring * row + 13 * (ctx * row + (ctx // 4 + 1) * 128 * pool + ring * 2 * 128 * pool) + ring * 3072 * 4
 
 
-def hy4_need_gib(plan: dict, ctx: int) -> float:
+def hy4_need_gib(plan: dict, ctx: int, q8: bool = False) -> float:
     """The VRAM (GiB, its reserve included) maya-hy4 needs at a context for everything that is not a routed expert -
     these parts have no RAM fallback.  From the plan's table ("need_gib", by context); a context it does not list:
-    the nearest one below it (else its smallest) plus what the caches grow by (hy4_cache_bytes)."""
+    the nearest one below it (else its smallest) plus what the caches grow by (hy4_cache_bytes).  q8: with the
+    latent cache in 8-bit rows - the plan's own table for them ("need_gib_q8": measured on a card), else the F16
+    figure less what the 8-bit rows save at that context."""
     table = {int(k): float(v) for k, v in (plan.get("need_gib") or {}).items()}
     if not table:
         return 0.0
+    chunk = int(plan.get("chunk") or 1024)
+    if q8:
+        table8 = {int(k): float(v) for k, v in (plan.get("need_gib_q8") or {}).items()}
+        if ctx in table8:
+            return table8[ctx]
+        return hy4_need_gib(plan, ctx) - (hy4_cache_bytes(ctx, chunk) - hy4_cache_bytes(ctx, chunk, True)) / 2**30
     if ctx in table:
         return table[ctx]
     base = max((c for c in table if c <= ctx), default=min(table))
-    chunk = int(plan.get("chunk") or 1024)
     return table[base] + (hy4_cache_bytes(ctx, chunk) - hy4_cache_bytes(base, chunk)) / 2**30
 
 
-def hy4_fit_need_gib(plan: dict, ctx: int) -> float:
+def hy4_fit_need_gib(plan: dict, ctx: int, q8: bool = False) -> float:
     """hy4_need_gib as the fit counts it: a context the plan's table does not list (worked out, not measured on a
     card) with HY4_FIT_MARGIN_GIB on top."""
-    return hy4_need_gib(plan, ctx) + (0.0 if str(ctx) in (plan.get("need_gib") or {}) else HY4_FIT_MARGIN_GIB)
+    listed = plan.get("need_gib_q8" if q8 else "need_gib") or {}
+    return hy4_need_gib(plan, ctx, q8) + (0.0 if str(ctx) in listed else HY4_FIT_MARGIN_GIB)
+
+
+def hy4_kv_rows(need_f16: float, need_q8: float, usable: float, kv: str | None = None) -> str | None:
+    """The latent cache's rows the engine takes at a context, as its --kv auto does it on every layout: "f16" where
+    the context fits in the VRAM with F16 rows, "q8" (8-bit rows) where it fits only with them, None where it fits
+    neither way.  kv: a config's own --kv ("f16" / "q8": only that one)."""
+    if kv != "q8" and need_f16 <= usable:
+        return "f16"
+    if kv != "f16" and need_q8 <= usable:
+        return "q8"
+    return None
 
 
 def hy4_config_need_gib(quant: str, layout: str, ctx: int, chunk: int | None = None,
-                        reserve_gb: float | None = None) -> float | None:
+                        reserve_gb: float | None = None, q8: bool = False) -> float | None:
     """The VRAM (GiB) a size already set up needs at a context, as hy4_fit counts it (the dashboard's Models page
     asks before it writes a context into a config - serve/models.py's hy4_room): its layout's plan
     (hy4_fit_need_gib), a prompt chunk above the plan's as hy4_fit doubles it (HY4_CHUNK_UP_GIB), and a --reserve-gb
-    other than the plan's by the difference.  None for a size or a layout the manifest has no plan for."""
+    other than the plan's by the difference.  q8: with the latent cache in 8-bit rows (what the engine's --kv auto
+    takes where F16 rows do not fit).  None for a size or a layout the manifest has no plan for."""
     plan = (hy4_layouts(hy4_quant_table(quant)).get(layout or HY4_STANDARD) or {}).get("plan") or {}
     if not plan.get("need_gib"):
         return None
-    need = hy4_fit_need_gib(plan, int(ctx))
+    need = hy4_fit_need_gib(plan, int(ctx), q8)
     if chunk and int(plan.get("chunk") or 0) and int(chunk) > int(plan["chunk"]):
         need += HY4_CHUNK_UP_GIB
     if reserve_gb is not None and "reserve_gb" in plan:
@@ -8292,9 +8320,12 @@ def hy4_fit(q: dict, gpus: list, ctx_wanted: int | None = None, used: dict | Non
     """How a size of Hy4-Flash (q: its entry in the manifest) runs on these cards, worked out before any download:
     {"layout": "standard" where its plan fits the VRAM (hy4_usable_gib) at the context - else a small-card layout the
     size has; "context": ctx_wanted, else "recommended" - the largest of HY4_CONTEXTS that fits, up to
-    HY4_TESTED_CONTEXT; "contexts": all that fit; "chunk" and "args": the layout's own engine flags (none for
-    "standard": the engine's defaults - it fills the VRAM left with the most-routed experts itself); "usable", "need"
-    (GiB)}.  A small-card layout reads prompts in chunks twice its plan's where that still fits (HY4_CHUNK_UP_GIB).
+    HY4_TESTED_CONTEXT; "contexts": all that fit; "kv": the latent cache's rows the engine's --kv auto takes at the
+    context - "f16", or "q8" (8-bit rows) where it fits only with them (hy4_kv_rows; "contexts_q8": those of
+    "contexts"); "chunk" and "args": the layout's own engine flags (none for "standard": the engine's defaults - it
+    fills the VRAM left with the most-routed experts itself; never --kv: the engine's auto); "usable", "need" (GiB,
+    with the rows of "kv")}.  A small-card layout reads prompts in chunks twice its plan's where that still fits
+    (HY4_CHUNK_UP_GIB).
     Nothing fits: {"error": why, "hint": what to do, "usable", "need"}.  layout: only this one (the files of a folder
     are that layout's)."""
     lays = hy4_layouts(q)
@@ -8302,10 +8333,14 @@ def hy4_fit(q: dict, gpus: list, ctx_wanted: int | None = None, used: dict | Non
         lays = {k: v for k, v in lays.items() if k == layout}
     usable = hy4_usable_gib(gpus, used)
 
-    need = hy4_fit_need_gib                            # (a context the table does not list: not measured on a card)
+    def need(plan: dict, c: int) -> float:             # (the least a context takes: with F16 rows, or with 8-bit rows)
+        return min(hy4_fit_need_gib(plan, c), hy4_fit_need_gib(plan, c, True))
+
+    def rows(plan: dict, c: int) -> str | None:        # (a context the table does not list: not measured on a card)
+        return hy4_kv_rows(hy4_fit_need_gib(plan, c), hy4_fit_need_gib(plan, c, True), usable)
     least = HY4_CONTEXTS[0]
     cards = f"{len(gpus)} cards together have" if len(gpus or []) > 1 else "this card has"
-    fits = {k: [c for c in HY4_CONTEXTS if need(v["plan"], c) <= usable] for k, v in lays.items()}
+    fits = {k: [c for c in HY4_CONTEXTS if rows(v["plan"], c)] for k, v in lays.items()}
     if not any(fits.values()):
         smallest = min((need(v["plan"], least) for v in lays.values()), default=0.0)
         return {"error": f"{HY4} needs about {smallest:.1f} GB of free VRAM for the parts of the model that must sit "
@@ -8314,7 +8349,7 @@ def hy4_fit(q: dict, gpus: list, ctx_wanted: int | None = None, used: dict | Non
                 "hint": "a card with more VRAM (or more cards: --gpus), or close the programs that use this one",
                 "usable": usable, "need": smallest}
     want = int(ctx_wanted) if ctx_wanted else least
-    pick = next((k for k in lays if need(lays[k]["plan"], want) <= usable), None)
+    pick = next((k for k in lays if rows(lays[k]["plan"], want)), None)
     if pick is None:                                   # (the context asked for fits no layout)
         most = max(max(v) for v in fits.values() if v)
         return {"error": f"a context of {want} tokens needs about "
@@ -8325,19 +8360,23 @@ def hy4_fit(q: dict, gpus: list, ctx_wanted: int | None = None, used: dict | Non
     plan = lays[pick]["plan"]
     rec = max([c for c in fits[pick] if c <= HY4_TESTED_CONTEXT] or [least])
     ctx = int(ctx_wanted) if ctx_wanted else rec
+    kv = rows(plan, ctx)
+    takes = hy4_fit_need_gib(plan, ctx, kv == "q8")
     chunk, args = int(plan.get("chunk") or 0), []
     more = 0.0
     if pick != HY4_STANDARD:
-        if chunk and need(plan, ctx) + HY4_CHUNK_UP_GIB <= usable:
+        if chunk and takes + HY4_CHUNK_UP_GIB <= usable:
             chunk *= 2
             more = HY4_CHUNK_UP_GIB
         args = (["--chunk", str(chunk)] if chunk else []) + \
             [x for k, flag in (("reserve_gb", "--reserve-gb"), ("vram_experts", "--vram-experts")) if k in plan
              for x in (flag, f"{float(plan[k]):g}")]
     # (pictures: the engine keeps a picture's room free on the main GPU - on where it fits beside the plan as worked
-    #  out for text: neither the context nor the prompt chunk is made smaller for it)
+    #  out for text: neither the context nor the prompt chunk is made smaller for it, and the cache's rows stay the
+    #  text plan's - the engine gives a picture's room up before it takes 8-bit rows)
     return {"layout": pick, "context": ctx, "recommended": rec, "contexts": fits[pick], "chunk": chunk, "args": args,
-            "usable": usable, "need": need(plan, ctx), "vision": need(plan, ctx) + more + HY4_VISION_GIB <= usable}
+            "kv": kv, "contexts_q8": [c for c in fits[pick] if rows(plan, c) == "q8"],
+            "usable": usable, "need": takes, "vision": takes + more + HY4_VISION_GIB <= usable}
 
 
 def hy4_layout_in(d: Path, quant: str) -> str | None:
@@ -8643,7 +8682,8 @@ def hy4_fit_step(a, pc: dict, quant: str, prev_ctx: int | None = None, have=None
                  f"run {ME} --setup again later: the file is used by itself once it is on Hugging Face (no update "
                  "needed); a card with about 10 GB of VRAM or more runs the standard file now")
     if "error" not in fit and not a.context and not getattr(a, "check", False):
-        ctx = choose_context(a, prev_ctx, fit["contexts"], fit["recommended"])
+        ctx = choose_context(a, prev_ctx, fit["contexts"], fit["recommended"],
+                             {c: "the cache in 8 bits" for c in fit["contexts_q8"]})
         fit = hy4_fit(q, pc["gpus"], ctx, layout=fit["layout"])
     if "error" in fit:
         fail(fit["error"] + (f" (the files in {a.model_dir} are the {forced} layout's)" if forced else ""), fit["hint"])
@@ -8654,7 +8694,9 @@ def hy4_fit_step(a, pc: dict, quant: str, prev_ctx: int | None = None, have=None
         ok(f"{name} in its {fit['layout']} layout ({hy4_layouts(q)[fit['layout']]['about']}): about "
            f"{fit['need']:.1f} GB of the {fit['usable']:.1f} GB of VRAM for what must sit there; the routed experts "
            f"are computed on the CPU, prompts are read in chunks of {fit['chunk']} tokens")
-    ok(f"context: {fit['context']} tokens" + (" (recommended for this VRAM)" if fit["context"] == fit["recommended"] else ""))
+    ok(f"context: {fit['context']} tokens" + (" (recommended for this VRAM)" if fit["context"] == fit["recommended"] else "") +
+       ("; its cache is kept in 8 bits here - with 16-bit rows this context does not fit in this VRAM (the engine "
+        "chooses by itself: --kv auto)" if fit.get("kv") == "q8" else ""))
     if fit["context"] > HY4_TESTED_CONTEXT:
         warn(f"past {context_label(HY4_TESTED_CONTEXT)} the engine has not been run end to end yet")
     return fit

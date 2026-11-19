@@ -429,17 +429,78 @@ class Fit(unittest.TestCase):
 
     def test_8gb_card(self):
         f = self.fit(8)                                               # (a card that also drives the desktop)
-        self.assertEqual((f["layout"], f["context"], f["recommended"], f["chunk"]), ("8gb", 8192, 8192, 256))
+        # (16K and 32K fit with the cache in 8-bit rows - the engine's --kv auto takes them by itself: no --kv)
+        self.assertEqual((f["layout"], f["context"], f["recommended"], f["chunk"], f["kv"]),
+                         ("8gb", 32768, 32768, 256, "q8"))
         self.assertEqual(f["args"], ["--chunk", "256", "--reserve-gb", "0.5", "--vram-experts", "0"])
-        self.assertEqual(f["contexts"], [4096, 8192])
+        self.assertEqual((f["contexts"], f["contexts_q8"]), ([4096, 8192, 16384, 32768], [16384, 32768]))
         f = maya.hy4_fit(XS, [card(8)], used={})                      # (nvidia-smi gave no reading)
-        self.assertEqual((f["layout"], f["context"], f["chunk"]), ("8gb", 8192, 256))
+        self.assertEqual((f["layout"], f["context"], f["chunk"]), ("8gb", 32768, 256))
+
+    def test_the_cache_rows_as_the_engine_chooses_them(self):
+        """--kv auto on every layout: F16 rows where the context fits with them, 8-bit rows where it fits only with
+        them, nothing where it fits neither way."""
+        rows = maya.hy4_kv_rows
+        self.assertEqual((rows(6.8, 6.6, 7.3), rows(7.6, 7.0, 7.3), rows(7.9, 7.4, 7.3)), ("f16", "q8", None))
+        self.assertEqual((rows(7.6, 7.0, 7.3, "f16"), rows(6.8, 6.6, 7.3, "q8"), rows(7.6, 7.4, 7.3, "q8")),
+                         (None, "q8", None))               # (a config's own --kv: only that one)
+        self.assertEqual(maya.HY4_KV_Q8_ROW, 672)          # (the engine's kv_q8_row_bytes(512, 64))
+        small = XS["layouts"]["8gb"]["plan"]
+        # measured on an 8 GB card (dry starts of the engine); a context the table does not list: the F16 figure
+        # less what the 8-bit rows save - which gives the measured ones back
+        self.assertEqual([maya.hy4_need_gib(small, c, True) for c in (16384, 32768)], [7.0, 7.1])
+        f16_only = {k: v for k, v in small.items() if k != "need_gib_q8"}
+        self.assertAlmostEqual(maya.hy4_need_gib(f16_only, 16384, True), 7.0, delta=0.06)
+        self.assertAlmostEqual(maya.hy4_need_gib(f16_only, 32768, True), 7.1, delta=0.06)
+        self.assertAlmostEqual(maya.hy4_need_gib(small, 8192, True), 6.8 - 0.21, delta=0.02)
+        for c in maya.HY4_CONTEXTS:                        # (8-bit rows never take more than F16, at any context)
+            for plan in (small, XS["plan"]):
+                self.assertLess(maya.hy4_need_gib(plan, c, True), maya.hy4_need_gib(plan, c))
+        self.assertEqual(maya.hy4_fit_need_gib(small, 32768, True), 7.1)                       # (measured: no margin)
+        self.assertAlmostEqual(maya.hy4_fit_need_gib(small, 65536, True) - maya.hy4_need_gib(small, 65536, True),
+                               maya.HY4_FIT_MARGIN_GIB)
+
+    def test_contexts_count_on_8_bit_rows_only_where_f16_does_not_fit(self):
+        f = self.fit(8, ctx_wanted=8192)                   # (fits with F16 rows: the plan it had, nothing changes)
+        self.assertEqual((f["kv"], f["need"], f["chunk"]), ("f16", 6.8, 256))
+        self.assertEqual(self.fit(8, ctx_wanted=4096)["kv"], "f16")
+        f = self.fit(8, ctx_wanted=16384)
+        self.assertEqual((f["layout"], f["kv"], f["need"], f["vision"]), ("8gb", "q8", 7.0, False))
+        f = self.fit(8, 1024)                              # (a desktop with 1 GB in use: 16K, not 32K)
+        self.assertEqual((f["context"], f["contexts"], f["contexts_q8"]), (16384, [4096, 8192, 16384], [16384]))
+        self.assertIn("error", self.fit(8, 1024, ctx_wanted=32768))
+        for gib in (12, 16, 24, 32):                       # (cards every context fits with F16 rows: as before)
+            f = self.fit(gib)
+            self.assertEqual((f["kv"], f["contexts_q8"], f["need"]), ("f16", [], 9.83), gib)
+        f = self.fit(10)                                   # (the standard layout on a 10 GB card: 8K was its largest)
+        self.assertEqual((f["layout"], f["contexts"], f["contexts_q8"]),
+                         ("standard", [4096, 8192, 16384, 32768], [16384, 32768]))
+        # never a context that fits neither way; never 8-bit rows where F16 rows fit
+        for gib in (6.5, 7, 8, 9, 10, 11, 12, 16):
+            for used in (0, 400, 1024):
+                f = self.fit(gib, used)
+                if "error" in f:
+                    continue
+                plan = (XS["layouts"][f["layout"]] if f["layout"] != "standard" else XS)["plan"]
+                for c in maya.HY4_CONTEXTS:
+                    f16, q8 = maya.hy4_fit_need_gib(plan, c) <= f["usable"], maya.hy4_fit_need_gib(plan, c, True) <= f["usable"]
+                    self.assertEqual(c in f["contexts"], f16 or q8, (gib, used, c))
+                    self.assertEqual(c in f["contexts_q8"], q8 and not f16, (gib, used, c))
 
     def test_pictures_only_where_their_room_fits(self):
         """A picture's room (HY4_VISION_GIB on the main GPU) beside the plan at the context chosen: off on an 8 GB
         card - its context stays as it was -, on where the VRAM has it."""
         f = self.fit(8, 400)
-        self.assertEqual((f["layout"], f["context"], f["vision"]), ("8gb", 8192, False))
+        self.assertEqual((f["layout"], f["context"], f["vision"]), ("8gb", 32768, False))
+        self.assertFalse(self.fit(8, 400, ctx_wanted=8192)["vision"])
+        # (F16 rows without a picture's room go before 8-bit rows with it, as in the engine: 8.1 GB at 32K)
+        f = self.fit(8.5, 400, ctx_wanted=32768, layout="8gb")
+        self.assertEqual((f["kv"], f["vision"]), ("f16", False))
+        # (a context in 8-bit rows: a picture's room is counted beside the 8-bit plan, as it is beside the F16 one)
+        f = self.fit(12, 500, ctx_wanted=131072)
+        self.assertEqual((f["layout"], f["kv"], f["vision"]), ("standard", "q8", True))
+        f = self.fit(12, 800, ctx_wanted=131072)
+        self.assertEqual((f["layout"], f["kv"], f["vision"]), ("standard", "q8", False))
         self.assertFalse(self.fit(8, 400, ctx_wanted=4096)["vision"])     # (6.5 + 0.95 for the chunk + 0.81 of 7.6 GB)
         f = self.fit(9, 500, ctx_wanted=8192)                             # (8.5 GB: the chunk doubled, as for text)
         self.assertEqual((f["chunk"], f["vision"]), (512, False))
@@ -454,8 +515,7 @@ class Fit(unittest.TestCase):
                                (8, 0, None), (9.5, 900, 4096)):
             f = self.fit(gib, used, ctx_wanted=ctx)
             self.assertEqual(f["layout"], "8gb", (gib, used))
-            fits = maya.hy4_need_gib(small, f["context"]) + maya.HY4_CHUNK_UP_GIB + \
-                (0 if str(f["context"]) in small["need_gib"] else maya.HY4_FIT_MARGIN_GIB) <= f["usable"]
+            fits = maya.hy4_fit_need_gib(small, f["context"], f["kv"] == "q8") + maya.HY4_CHUNK_UP_GIB <= f["usable"]
             self.assertEqual(f["chunk"], 512 if fits else 256, (gib, used, ctx))
             self.assertEqual(f["args"][:2], ["--chunk", str(f["chunk"])])
         self.assertEqual(self.fit(9, 500, ctx_wanted=8192)["chunk"], 512)   # (8.5 GB free: 6.8 + 0.95 fits)
@@ -486,7 +546,7 @@ class Fit(unittest.TestCase):
         self.assertEqual((f["layout"], f["context"], f["recommended"]), ("standard", 131072, 32768))
         f = self.fit(8, ctx_wanted=65536)                             # (does not fit: the largest that does)
         self.assertIn("a context of 65536 tokens needs about", f["error"])
-        self.assertEqual(f["hint"], "the largest context that fits here: --context 8192")
+        self.assertEqual(f["hint"], "the largest context that fits here: --context 32768")
         f = self.fit(9, 0)                                            # (the standard layout fits at 4K / 8K ...)
         self.assertEqual((f["layout"], f["context"]), ("standard", 8192))
         f = self.fit(9, 0, ctx_wanted=32768)                          # (... a longer context: the small-card layout)
@@ -521,16 +581,20 @@ class Fit(unittest.TestCase):
                 st.enter_context(p)
             st.enter_context(patch.object(maya, "gpu_used_mib", return_value={0: 400}))
             f = maya.hy4_fit_step(args(), {"gpus": [card(8)]}, "maya-xs")
-            self.assertEqual((f["layout"], f["context"]), ("8gb", 8192))
+            self.assertEqual((f["layout"], f["context"]), ("8gb", 32768))
             self.assertTrue(any("8gb layout" in s and "chunks of 256" in s for s in said))
+            # (a context that fits only with the cache in 8-bit rows: said in the context's line)
+            self.assertTrue(any(s.startswith("context: 32768 tokens") and "kept in 8 bits" in s for s in said))
+            del said[:]
             f = maya.hy4_fit_step(args(), {"gpus": [card(8)]}, "maya-xs", prev_ctx=4096)   # (the setup before's)
             self.assertEqual(f["context"], 4096)
+            self.assertTrue(any(s.startswith("context: 4096 tokens") and "8 bits" not in s for s in said))
             f = maya.hy4_fit_step(args(context=65536), {"gpus": [card(24)]}, "maya-xs")
             self.assertEqual((f["layout"], f["context"]), ("standard", 65536))
             self.assertTrue(any("not been run end to end yet" in s for s in said))
             with self.assertRaisesRegex(Failed, "needs about 6.5 GB of free VRAM"):
                 maya.hy4_fit_step(args(), {"gpus": [card(6)]}, "maya-xs")
-            with self.assertRaisesRegex(Failed, "--context 8192"):
+            with self.assertRaisesRegex(Failed, "--context 32768"):
                 maya.hy4_fit_step(args(context=131072), {"gpus": [card(8)]}, "maya-xs")
             with self.assertRaisesRegex(Failed, "not available yet"):
                 maya.hy4_fit_step(args(), {"gpus": [card(24)]}, "maya-s")
@@ -825,8 +889,8 @@ class Config(unittest.TestCase):
     def test_small_card_layout(self):
         fit = maya.hy4_fit(XS, [card(8)], used={0: 400})
         c = self.write(fit=fit, ctx=fit["context"])
-        self.assertEqual(c["args"], ["--pack", str(self.pack), "--max-context", "8192", "--chunk", "256",
-                                     "--reserve-gb", "0.5", "--vram-experts", "0"])
+        self.assertEqual(c["args"], ["--pack", str(self.pack), "--max-context", "32768", "--chunk", "256",
+                                     "--reserve-gb", "0.5", "--vram-experts", "0"])   # (no --kv: the engine's auto)
         self.assertEqual(c["installer"]["layout"], "8gb")
 
     def test_several_gpus_as_the_server_numbers_them(self):

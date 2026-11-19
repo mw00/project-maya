@@ -58,8 +58,9 @@ Q4_K_M (AngelSlim) is a 105 GB model file with the same table; all of its expert
   CPU from RAM. About 8.7 / 9.0 / 9.8 GiB of free VRAM at 4K / 8K / 32K context. More VRAM puts more experts on the
   GPU, which is faster.
 - **Cards under about 10 GB:** the setup picks the "8 GB" layout by itself (a second model file with smaller
-  attention weights, 43.6 GB; slightly lower quality): about 6.5 / 6.8 GiB of free VRAM at 4K / 8K context. A card
-  with less than about 7 GB cannot run it.
+  attention weights, 43.6 GB; slightly lower quality): about 6.5 / 6.8 GiB of free VRAM at 4K / 8K context, and about
+  7.0 / 7.1 GiB at 16K / 32K, where the engine keeps the context's cache in 8 bits by itself. A card with less than
+  about 7 GB cannot run it.
 - **The n-gram table:** on an SSD / NVMe, never a hard disk. It does not need to fit in memory.
 - **Pictures:** the vision tower's file (0.8 GB) stays on the SSD (RAM as the page cache); a picture takes up to
   0.8 GB of VRAM while it is read, which the engine keeps free on the main GPU. Pictures are on where the card has

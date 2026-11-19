@@ -40,7 +40,8 @@ struct Options {
     std::vector<int> layer_split; // the first layer of each GPU after the first (empty: fill each GPU in turn)
     int kv = -1;                  // the latent cache's rows: 0 F16, 1 8-bit (the latent int8 in blocks of 32 with F16
                                   // scales, the rotated part F16; the indexer's rows F16: about 58% of the VRAM), -1
-                                  // auto - F16 unless tensor parallel needs 8-bit rows to hold the context
+                                  // auto - F16 where the context fits in VRAM with it, 8-bit rows where it fits
+                                  // only with them (any layout: one GPU, the layer split, tensor parallel)
     bool vision = true;           // the vision tower (the pack's mmproj file) on the main GPU, its room kept free there
     bool vision_auto = true;      // (not asked for by name: a pack without one runs text only, no error)
     bool verbose = false;

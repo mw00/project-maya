@@ -2353,7 +2353,10 @@ into RAM whole. Keep it on an SSD / NVMe, never a hard disk.
 **VRAM.** Everything but the routed experts has to fit in VRAM; the experts that do not fit run on the CPU from RAM.
 Maya-XS needs about 8.7 / 9.0 / 9.8 GiB of free VRAM at 4K / 8K / 32K context. For a card under about 10 GB the
 setup picks the "8 GB" layout by itself (a second model file with smaller attention weights, 43.6 GB; slightly lower
-quality): about 6.5 / 6.8 GiB at 4K / 8K. A card with less than about 7 GB cannot run it.
+quality): about 6.5 / 6.8 GiB at 4K / 8K, and about 7.0 / 7.1 GiB at 16K / 32K, where the engine keeps the context's
+cache in 8 bits (below: `--kv auto`). So an 8 GB card that also drives a desktop is offered up to 32K; the setup says
+in its context line where the cache is in 8 bits, and never offers a context that fits neither way. A card with less
+than about 7 GB cannot run it.
 
 **Pictures** are on where the card has room for one beside the model (0.8 GB of VRAM while a picture is read, kept
 free on the main GPU; the setup downloads Maya's vision file, 0.8 GB, unless `--no-vision`) and off on 8 GB cards,
@@ -2421,8 +2424,11 @@ With an expert profile (`--profile`) each layer keeps its most routed experts in
 parallel. The sliding-window layers keep a ring of their 512 positions and 16K more. `--kv q8` keeps them in 8 bits
 instead: the latent's 512 values as int8 in blocks of 32 with an F16 scale and the rotated 64 in F16 (672 bytes a row
 against 1152), the indexer's per-position rows and pooled keys in F16 (the reference's own cache type) - about 9.6 KB
-a token, the sliding-window rings too. `--kv auto`, the default, takes F16 unless tensor parallel does not hold the
-context with it, then the 8-bit rows (an INFO line says so): on eight 16 GB members 256K fits only so. The prompt path
+a token, the sliding-window rings too. `--kv auto`, the default, takes F16 wherever the context fits in VRAM with it
+and the 8-bit rows where it fits only with them (an INFO line says so) - on one GPU, on the layer split and on tensor
+parallel alike: on eight 16 GB members 256K fits only so, on an 8 GB card 16K and 32K. A start that fits with F16 rows
+is never changed (where pictures are on by default, the engine gives a picture's room up before it takes 8-bit
+rows); `--kv f16` and `--kv q8` force one. The setup's fit and the Models page count on the same choice. The prompt path
 dequantizes the rows a layer's chunk reads into an F16 scratch once; the token path's attention reads the 8-bit rows
 directly. Their KL divergence against the reference, F16 rows / 8-bit rows: 0.143 / 0.140 (512-token chunks), 0.200 /
 0.193 (2048), 0.239 / 0.256 (4096) - the model moves about this much with any small change of its arithmetic (F32
@@ -2506,7 +2512,7 @@ Engine options, in the config's `"args"`:
 | `--draft` | 3 | with `--mtp`: drafts a step at most |
 | `--draft-floor` | 0.55 | with `--mtp`: the drafts end at one the block gives less than this probability |
 | `--eos` | the GGUF's | the token ids that end an answer |
-| `--kv` | `auto` | the latent cache's rows: `f16`, `q8` (8 bits: 58% of the VRAM a position), or `auto` - F16 unless tensor parallel needs the 8-bit rows to hold the context |
+| `--kv` | `auto` | the latent cache's rows: `f16`, `q8` (8 bits: 58% of the VRAM a position), or `auto` - F16 where the context fits in VRAM with it, the 8-bit rows where it fits only with them (any layout: one GPU, the layer split, tensor parallel) |
 | `--vision` | on when the pack has the tower | `off`: text only, and no room kept for pictures on the main GPU; `on`: an error when the pack has no tower |
 | `--images` | - | with `--ids`: a pictures file (the server's GENI file, `MMI1`) for the prompt's image spans |
 

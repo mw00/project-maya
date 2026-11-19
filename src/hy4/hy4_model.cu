@@ -18,6 +18,7 @@
 #include "hy4_lane.hpp"
 #include "hy4_tp.hpp"
 #include "hy4_pack.hpp"
+#include "hy4_plan.hpp"
 #include "../ds4/ds4_iq.cuh"
 
 #include <cublas_v2.h>
@@ -683,6 +684,18 @@ struct Model::Impl {
     // (the indexer's pooled keys and its value | gate ring: F16 with 8-bit rows - the reference's own cache type -,
     //  else F32)
     size_t pool_b() const { return kv_q8 ? 2 : 4; }
+    // (the 8-bit rows' kernels take a latent of 512 + 64 values)
+    bool kv_q8_rows() const { return g.kv_lora == 512 && g.rope == 64; }
+    // every layer's caches at this context, in GB, in 8-bit rows or F16 (the plan's INFO line)
+    double cache_gb(bool q8) const {
+        const double rb = q8 ? (double) k::kv_q8_row_bytes(g.kv_lora, g.rope) : (double) g.kv_row() * 2, pb = q8 ? 2 : 4;
+        double b = 0;
+        for (int il = 0; il < g.n_layer; ++il)
+            b += g.swa[(size_t) il] ? ring * rb
+                                    : o.max_ctx * rb + (double) (o.max_ctx / g.ix_kpool + 1) * g.ix_dim * pb +
+                                          (double) ring * 2 * g.ix_dim * pb;
+        return b / 1e9;
+    }
     // a layer's VRAM without its routed experts (its dense matrices and caches), and an expert's (its blob)
     size_t dense_bytes(int il) const {
         size_t b = 0;
@@ -884,7 +897,7 @@ struct Model::Impl {
                 std::string terr;
                 if (tensor_split(ndev, devs, fb, terr, N)) return true;
                 // (--kv auto: every member holds the whole cache - in 8-bit rows, 58% of its VRAM, when F16 does not fit)
-                if (o.kv < 0 && !kv_q8) {
+                if (o.kv < 0 && !kv_q8 && kv_q8_rows()) {
                     undo();
                     kv_q8 = true;
                     fb = free_b;
@@ -952,7 +965,28 @@ struct Model::Impl {
             for (int il = 0; il < g.n_layer; ++il) eb = std::max(eb, (double) expert_bytes(il));
             for (double& f : free_b) f -= eb * kStage;
         }
-        if (vis_room > 0 && o.vision_auto && !place(rho, false) && !place(0.0, false)) {
+        // what the model's own parts fit with (hy4_plan.hpp's kv_pick): as asked - else, in turn, without a picture's
+        // room (pictures not asked for by name), with the cache in 8-bit rows (--kv auto), with both.  A start that
+        // fits with F16 rows is the same start as before
+        const double vr = vis_room;
+        const KvPick pick = kv_pick([&](bool q8, bool vis) {
+            const bool was = kv_q8;
+            kv_q8 = q8;
+            if (!vis) free_b[(size_t) main_gi] += vr;
+            const bool fit = place(rho, false) || place(0.0, false);
+            if (!vis) free_b[(size_t) main_gi] -= vr;
+            kv_q8 = was;
+            return fit;
+        }, kv_q8, o.kv < 0 && kv_q8_rows(), vr > 0, o.vision_auto);
+        if (pick.q8 && !kv_q8) {
+            char qb[320];
+            std::snprintf(qb, sizeof qb, "INFO the latent cache in 8-bit rows (--kv auto): with F16 rows a context of %lld "
+                          "tokens does not fit in the VRAM beside the model's dense parts (the cache: %.2f GB in 8-bit "
+                          "rows, %.2f GB in F16)", (long long) o.max_ctx, cache_gb(true), cache_gb(false));
+            info.push_back(qb);
+            kv_q8 = true;
+        }
+        if (vr > 0 && !pick.vision) {
             // (a card the model's own parts fill: no room kept for a picture - text only, said, rather than no start;
             //  --vision on asks for the tower by name and gets the error below)
             char vb[240];
@@ -968,8 +1002,9 @@ struct Model::Impl {
         if (!place(rho, false)) {
             double lo = 0.0, hi = rho;
             if (!place(0.0, false)) {
-                err = "the model's dense parts and caches do not fit in the GPUs' VRAM even with every routed expert on "
-                      "the CPU (--max-context smaller, or more GPUs)";
+                err = std::string("the model's dense parts and caches do not fit in the GPUs' VRAM even with every routed "
+                                  "expert on the CPU") + (o.kv < 0 && kv_q8_rows() ? " and the latent cache in 8-bit rows" : "") +
+                      " (--max-context smaller, or more GPUs)";
                 return false;
             }
             for (int it = 0; it < 30; ++it) {

@@ -6,8 +6,9 @@
 //
 // --kv: the latent cache's rows - F16, or q8: the latent's 512 values int8 in blocks of 32 with an F16 scale, the
 // rotated part's 64 F16 (672 bytes a row against 1152), the indexer's per-position and pooled rows F16 (the reference's
-// own cache type) - about 58% of the VRAM a position; auto (the default) takes F16 unless tensor parallel - every
-// member holding the whole cache - needs the 8-bit rows to hold the context.
+// own cache type) - about 58% of the VRAM a position; auto (the default) takes F16 wherever the context fits in VRAM
+// with it and the 8-bit rows where it fits only with them - on one GPU, the layer split and tensor parallel (every
+// member holding the whole cache) alike; an INFO line says so.
 // The routed experts that do not fit in VRAM (or beyond --vram-experts, the share of each layer's kept there) run on
 // the CPU lane from the model's file, --cpu-threads workers (default: a physical core each but the first); a prompt's
 // chunk sends them to the GPU instead where this PC's PCIe is measured faster than its CPU.  --profile: an expert

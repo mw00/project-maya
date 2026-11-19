@@ -559,8 +559,10 @@ function hy4Fields(m, d, s, ch, images, gpus) {
   const tpIds = [...new Set(["auto", 0].concat([s.tp, d.tp].filter((t) => t !== "auto" && t != null).map(Number)))];
   return [
     {label: "Model", rows: [
-      contextRow(m, d, ch, {vram: HY4_KV_BYTES}, [], Number(d.context) > 131072
-        ? "Where F16 does not fit every GPU of the tensor-parallel group, the engine keeps the cache in 8 bits, about 60% of the memory shown." : null),
+      contextRow(m, d, ch, {vram: HY4_KV_BYTES}, [], (m.contexts_8bit || []).includes(Number(d.context))
+        ? "With 16-bit rows this context does not fit in this VRAM: the engine keeps the cache in 8 bits, about 60% of the memory shown."
+        : Number(d.context) > 131072
+        ? "Where 16-bit rows do not fit in the VRAM, the engine keeps the cache in 8 bits, about 60% of the memory shown." : null),
       html`<${Row} label="Drafting" flag="--mtp" changed=${ch("draft")}
         hint=${mtp ? "The model's own MTP block drafts a few tokens for the model to check: the same answers, about twice as fast on code. Off decodes token by token."
           : "This pack names no MTP block."}>
