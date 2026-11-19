@@ -682,7 +682,15 @@ int bench_lane(const std::string& pack_dir, int il, int n_exp_call, int n_tok) {
         std::fprintf(stderr, "layer %d has no routed experts\n", il);
         return 1;
     }
-    auto tid = [](const std::string& t) { return t == "Q4_K" ? 12 : t == "Q6_K" ? 14 : t == "Q8_0" ? 8 : -1; };
+    auto tid = [](const std::string& t) {   // (ggml's type numbers: every block type the lane's rows take)
+        static const std::pair<const char*, int> names[] = {
+            {"Q8_0", 8},    {"Q2_K", 10},   {"Q3_K", 11},  {"Q4_K", 12},   {"Q5_K", 13},  {"Q6_K", 14},  {"IQ2_XXS", 16},
+            {"IQ2_XS", 17}, {"IQ3_XXS", 18}, {"IQ1_S", 19}, {"IQ4_NL", 20}, {"IQ3_S", 21}, {"IQ2_S", 22}, {"IQ4_XS", 23},
+            {"IQ1_M", 29}};
+        for (const auto& [n, i] : names)
+            if (t == n) return i;
+        return -1;
+    };
     hy4::CpuExperts ex;
     if (!ex.init(tid(tg->type), tid(td->type), pk.g.n_lat, pk.g.n_ff_exp, err)) {
         std::fprintf(stderr, "%s\n", err.c_str());
@@ -714,26 +722,53 @@ int bench_lane(const std::string& pack_dir, int il, int n_exp_call, int n_tok) {
     const double mb = (2.0 * ex.g_stride + ex.d_stride) / 1e6;
     std::printf("layer %d: %s / %s experts, %.2f MB each; %d a token, %d tokens a call\n", il, tg->type.c_str(),
                 td->type.c_str(), mb, n_exp_call, n_tok);
-    for (int th : {0, 3, 7, 15, 21, 31, 43}) {
-        hy4::Lane lane(th);
+    // the thread counts: this host's (1, 2, 4 ... its physical cores, its logical CPUs).  Two rates each: the experts
+    // picked at random (the weights from memory), and one small set every call (the weights in the CPU's caches) -
+    // the gap is what the memory costs.  The sum printed is the first call's output bits (two builds compared by it)
+    const int logical = std::max(1u, std::thread::hardware_concurrency());
+    const int gap_us = std::getenv("HY4_BENCH_GAP_US") ? std::atoi(std::getenv("HY4_BENCH_GAP_US")) : 0;   // (a pause before each call)
+    const int phys = (int) hy4::Lane(-1).threads() + 1;
+    std::vector<int> counts;
+    for (int c = 1; c < phys; c *= 2) counts.push_back(c);
+    for (int c : {phys - 2, phys, phys + phys / 2, logical}) counts.push_back(c);
+    std::sort(counts.begin(), counts.end());
+    counts.erase(std::unique(counts.begin(), counts.end()), counts.end());
+    for (int c : counts) {
+        if (c < 1 || c > logical) continue;
+        hy4::Lane lane(c - 1);
         std::vector<hy4::CpuEntry> ent;
-        const int reps = n_tok > 1 ? 4 : 40;
-        double tsum = 0;
-        for (int r = 0; r < reps + 3; ++r) {
-            ent.clear();
-            std::vector<int> pick(NE);
-            for (int e = 0; e < NE; ++e) pick[(size_t) e] = e;
-            for (int t = 0; t < n_tok; ++t) {
-                std::shuffle(pick.begin(), pick.end(), rng);
-                for (int j = 0; j < n_exp_call; ++j) ent.push_back({t, pick[(size_t) j], 0.25f});
+        const int reps = n_tok > 1 ? 4 : 60;
+        double ms2[2] = {0, 0};
+        uint64_t bits = 1469598103934665603ull;
+        for (int same = 0; same < 2; ++same) {
+            std::mt19937 r2(7);
+            double tsum = 0;
+            for (int r = 0; r < reps + 3; ++r) {
+                if (r == 0 || !same) {
+                    ent.clear();
+                    std::vector<int> pick(NE);
+                    for (int e = 0; e < NE; ++e) pick[(size_t) e] = e;
+                    for (int t = 0; t < n_tok; ++t) {
+                        std::shuffle(pick.begin(), pick.end(), r2);
+                        for (int j = 0; j < n_exp_call; ++j) ent.push_back({t, pick[(size_t) j], 0.25f});
+                    }
+                }
+                if (gap_us > 0) std::this_thread::sleep_for(std::chrono::microseconds(gap_us));
+                const double t0 = now();
+                hy4::cpu_experts(lane, ex, ent, x.data(), n_tok, out.data());
+                if (r >= 3) tsum += now() - t0;
+                if (r == 0 && !same)
+                    for (float v : out) {
+                        uint32_t u;
+                        std::memcpy(&u, &v, 4);
+                        bits = (bits ^ u) * 1099511628211ull;
+                    }
             }
-            const double t0 = now();
-            hy4::cpu_experts(lane, ex, ent, x.data(), n_tok, out.data());
-            if (r >= 3) tsum += now() - t0;
+            ms2[same] = 1e3 * tsum / reps;
         }
-        const double ms = 1e3 * tsum / reps;
-        std::printf("  %2d threads: %.3f ms a call, %.3f ms an expert-token, %.1f tokens/s\n", th + 1, ms,
-                    ms / ((double) n_exp_call * n_tok), 1000.0 * n_tok / ms);
+        std::printf("  %2d threads: %.3f ms a call, %.3f ms an expert-token, %.1f tokens/s; the same experts every call "
+                    "%.3f ms; sum %016llx\n", c, ms2[0], ms2[0] / ((double) n_exp_call * n_tok), 1000.0 * n_tok / ms2[0],
+                    ms2[1], (unsigned long long) bits);
     }
     return 0;
 }
