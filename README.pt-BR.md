@@ -4,7 +4,7 @@
 
 <h1 align="center">Project Maya</h1>
 
-<p align="center"><b>GLM-5.3 (744 B), GLM-5.3-Flash (321 B), DeepSeek-V4.1-Flash-1017 (748 B) e MiniMax-M3.1-Flash (428 B) na sua própria GPU</b><br>
+<p align="center"><b>GLM-5.3 (744 B), GLM-5.3-Flash (321 B), DeepSeek-V4.1-Flash-1017 (748 B), MiniMax-M3.1-Flash (428 B) e Hy4-Flash (220 B) na sua própria GPU</b><br>
 privado e rápido · de uma a 16 GPUs NVIDIA · AMD e Windows · chat, imagens, API compatível com OpenAI e Anthropic · várias requisições ao mesmo tempo</p>
 
 <p align="center">
@@ -21,8 +21,8 @@ privado e rápido · de uma a 16 GPUs NVIDIA · AMD e Windows · chat, imagens, 
 <a href="https://buymeacoffee.com/peasantsmith"><img src="https://img.shields.io/badge/Buy_me_a_coffee-FFDD00?logo=buymeacoffee&logoColor=black&style=for-the-badge" alt="Buy Me A Coffee" height="32"></a><br>
 <sub>O Project Maya é gratuito. Se ele roda bem no seu PC, patrocinar ajuda a pagar o hardware de testes e o trabalho no projeto.</sub></p>
 
-Modelos desse tamanho costumam precisar de um datacenter. O Maya roda quatro deles no hardware que você já tem:
-**GLM-5.3**, **GLM-5.3-Flash**, **DeepSeek-V4.1-Flash-1017** e **MiniMax-M3.1-Flash**. Cada modelo tem um motor feito para ele. O motor mantém na GPU os especialistas (experts) que a sua conversa mais usa, os próximos na RAM e o resto no seu SSD NVMe, e os move conforme você conversa. Ele mede suas GPUs, CPU, RAM e SSD e se ajusta a eles. Nada sai da sua máquina.
+Modelos desse tamanho costumam precisar de um datacenter. O Maya roda cinco deles no hardware que você já tem:
+**GLM-5.3**, **GLM-5.3-Flash**, **DeepSeek-V4.1-Flash-1017**, **MiniMax-M3.1-Flash** e **Hy4-Flash**. Cada modelo tem um motor feito para ele. O motor mantém na GPU os especialistas (experts) que a sua conversa mais usa, os próximos na RAM e o resto no seu SSD NVMe, e os move conforme você conversa. Ele mede suas GPUs, CPU, RAM e SSD e se ajusta a eles. Nada sai da sua máquina.
 
 - **Rápido:** até 149 tokens/s com duas RTX 5090 e uma RTX 4090, 124 com duas H100, 118 com quatro RTX 4090, 81 com uma RTX PRO 6000, mais de 30 com uma única RTX 5090. [Números reais de usuários reais](#how-fast-is-it).
 - **Perto do original:** as quantizações próprias do Maya do GLM-5.3-Flash mantêm 97,7-99,2% da precisão zero-shot do modelo FP8; o DeepSeek V4.1 · Maya-S escolhe o mesmo próximo token que o original em 92,6% das vezes, e o MiniMax M3.1 · Maya-S em 87,6% (a média das suas categorias).
@@ -59,10 +59,11 @@ Toda quantização do Maya tem o nome do modelo seguido do nível - XS, S, M ou 
 | | Maya-XS (v2) · `deepseek-maya-xs` | 277 GB | o modelo inteiro na memória de um PC de 128 GB (as tabelas Engram ficam no SSD); a v2 é cerca de 12% mais próxima do original e cerca de 20% mais rápida para escrever que a v1 - rodar a instalação de novo oferece a atualização |
 | **[MiniMax-M3.1-Flash](https://huggingface.co/MiniMaxAI/MiniMax-M3.1-Flash)**<br><sub>MiniMax · [MiniMax Community License](LICENSE.minimax-m31) · 428 B, 23 B ativos · até 1M de contexto</sub> | Maya-XS · `minimax-maya-xs` | 93 GB | o modelo inteiro na memória de um PC de 128 GB |
 | | Maya-S · `minimax-maya-s` | 122 GB | mais próximo do original |
+| **[Hy4-Flash](https://huggingface.co/tencent/Hy4-flash)**<br><sub>Tencent · [Tencent Hy License](LICENSE.hy4-flash) · 220 B · só texto · só NVIDIA</sub> | Maya-XS · `hy4-flash-maya-xs` | 44,8 GB + uma tabela n-gram de 63,4 GB | PCs com cerca de 56-64 GB de RAM + VRAM, placas a partir de 8 GB; a tabela n-gram fica no SSD; mais tamanhos em seguida |
 
 **Qual modelo cabe no seu PC?** Veja em [docs/MEMORY.md](docs/MEMORY.md) a memória recomendada de cada modelo (VRAM + RAM somadas).
 
-Todos rodam em NVIDIA a partir da V100 / RTX 20, e em AMD e Windows (veja [O que você precisa](#what-you-need)). Os tamanhos do DeepSeek incluem as tabelas Engram. A instalação também oferece os GGUFs da unsloth e as quantizações EXL3 da turboderp e da LibertAIDAI do DeepSeek, o DeepSeek abliterated da orcarouter, a quantização EXL3 do MiniMax da Mia-AiLab, as quantizações EXL3 do GLM da turboderp o Qwen-3.8-Flash-Next (CYBER-FROST) como GGUF Q5_K_M e o próprio Qwen-3.8-Flash-Next como GGUF UD-IQ2_XS da unsloth, ambos com imagens ([suas configurações](docs/SETTINGS.md#qwen-38-flash-next-cyber-frost)). **Arquivos, drafters, imagens e opções de cada modelo: [docs/MODELS.md](docs/MODELS.md).**
+Todos rodam em NVIDIA a partir da V100 / RTX 20, e em AMD e Windows (veja [O que você precisa](#what-you-need)); o Hy4-Flash roda só em NVIDIA por enquanto (Linux e Windows), só texto. Os tamanhos do DeepSeek incluem as tabelas Engram. A instalação também oferece os GGUFs da unsloth e as quantizações EXL3 da turboderp e da LibertAIDAI do DeepSeek, o DeepSeek abliterated da orcarouter, a quantização EXL3 do MiniMax da Mia-AiLab, as quantizações EXL3 do GLM da turboderp o Qwen-3.8-Flash-Next (CYBER-FROST) como GGUF Q5_K_M e o próprio Qwen-3.8-Flash-Next como GGUF UD-IQ2_XS da unsloth, ambos com imagens ([suas configurações](docs/SETTINGS.md#qwen-38-flash-next-cyber-frost)). **Arquivos, drafters, imagens e opções de cada modelo: [docs/MODELS.md](docs/MODELS.md).**
 
 ## <a name="quality"></a>Qualidade
 
@@ -231,7 +232,7 @@ Um token equivale a cerca de ¾ de uma palavra. A velocidade se mantém conforme
 | --- | --- |
 | **GPU** | NVIDIA, compute capability 7.0 ou superior (V100, RTX 20 e mais novas): uma, ou até 16 que dividem o modelo. Mais VRAM é mais rápido. Pascal (Tesla P40 / P100, GTX 10) é experimental, ainda não validada. **AMD:** RX 7900 XT / XTX, Radeon AI PRO R9700 / RX 9070, Strix Halo e Gorgon Halo (Radeon 8060S / 8065S); RX 6800 / 6900 e Radeon PRO V620 / W6800 ainda não validadas; GLM-5.3-Flash e DeepSeek-V4.1-Flash-1017 leem imagens lá também - [docs/AMD_MAYA.md](docs/AMD_MAYA.md) |
 | **RAM** | 32 GB já roda. Mais RAM mantém mais especialistas por perto e é mais rápido |
-| **Disco** | **Um SSD NVMe rápido** com espaço para o modelo (~75 GB para GLM-5.3-Flash · Maya-XS, ~100 GB para GLM-5.3-Flash · Maya-S, ~160 GB para GLM-5.3-Flash · Maya-L, ~350 GB para DeepSeek V4.1 · Maya-S, ~470 GB para o GGUF Q8 da unsloth dele, ~95 GB para MiniMax M3.1 · Maya-XS, ~200 GB para a quantização EXL3 do MiniMax-M3.1-Flash) e o codificador de imagens (1,1 GB). Não um HD |
+| **Disco** | **Um SSD NVMe rápido** com espaço para o modelo (~75 GB para GLM-5.3-Flash · Maya-XS, ~100 GB para GLM-5.3-Flash · Maya-S, ~160 GB para GLM-5.3-Flash · Maya-L, ~350 GB para DeepSeek V4.1 · Maya-S, ~470 GB para o GGUF Q8 da unsloth dele, ~95 GB para MiniMax M3.1 · Maya-XS, ~110 GB para Hy4-Flash · Maya-XS, ~200 GB para a quantização EXL3 do MiniMax-M3.1-Flash) e o codificador de imagens (1,1 GB). Não um HD |
 | **Sistema** | Linux (x86-64; uma CPU com AVX2 é o ideal), o driver NVIDIA, CUDA 12.x (o CUDA 13 funciona para RTX 20 e mais novas, não para a V100 nem Pascal), g++, Python 3.10+. Windows 10/11: [docs/WINDOWS.md](docs/WINDOWS.md). Não WSL2. AMD: ROCm 7 |
 
 A instalação verifica tudo isso, mostra o comando exato para o que faltar e não instala nada no sistema inteiro.
