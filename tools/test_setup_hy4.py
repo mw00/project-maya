@@ -34,8 +34,10 @@ def setUpModule():
 
 def tearDownModule():
     _hub.stop()
-TRUNK = "Hy4-Flash-Maya-XS-00001-of-00002.gguf"
-NGRAM = "Hy4-Flash-Maya-XS-00002-of-00002.gguf"
+TRUNK = "Hy4-Flash-Maya-XS-IQ2_XXS-00001-of-00002.gguf"
+SMALL = "Hy4-Flash-Maya-XS-8GB-IQ2_XXS_S-00001-of-00002.gguf"   # (the 8 GB-card trunk)
+OLD_TRUNK, OLD_NGRAM = "Hy4-Flash-Maya-XS-00001-of-00002.gguf", "Hy4-Flash-Maya-XS-00002-of-00002.gguf"
+NGRAM = "Hy4-Flash-Maya-XS-IQ2_XXS-00002-of-00002.gguf"
 
 
 class Failed(Exception):
@@ -120,12 +122,12 @@ class Manifest(unittest.TestCase):
         self.assertEqual(m["memory_gb"], 52)
         small = maya.hy4_entry("maya-xs", "8gb")
         self.assertEqual((small["folder"], small["dir"]), ("Maya-XS-8GB", "Hy4-Flash-Maya-XS-8GB"))
-        self.assertEqual(small["files"][TRUNK], 43565100064)
+        self.assertEqual(small["files"][SMALL], 43565100064)
         self.assertEqual(small["source_folders"], {NGRAM: "Maya-XS"})   # (the table from the size's own folder)
         with with_manifest(manifest("abc")):
             small = maya.hy4_entry("maya-xs", "8gb")
-            self.assertEqual(maya.file_url(small, TRUNK), "https://huggingface.co/peasantsmith/Hy4-Flash-Maya-GGUF/"
-                                                          f"resolve/main/Maya-XS-8GB/{TRUNK}")   # (or the commit the Hub named: Fit)
+            self.assertEqual(maya.file_url(small, SMALL), "https://huggingface.co/peasantsmith/Hy4-Flash-Maya-GGUF/"
+                                                          f"resolve/main/Maya-XS-8GB/{SMALL}")   # (or the commit the Hub named: Fit)
             self.assertEqual(maya.file_url(small, NGRAM), "https://huggingface.co/peasantsmith/Hy4-Flash-Maya-GGUF/"
                                                           f"resolve/abc/Maya-XS/{NGRAM}")
         with patch.object(maya, "fail", fail), self.assertRaisesRegex(Failed, "not available yet"):
@@ -470,8 +472,11 @@ class Fit(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d, with_manifest(man):
             self.assertIsNone(maya.hy4_layout_in(Path(d), "maya-xs"))
             for layout, files in (("standard", xs["files"]), ("8gb", xs["layouts"]["8gb"]["files"])):
-                (Path(d) / TRUNK).write_bytes(body[next(iter(files))])   # (the same name: told apart by the size)
+                (Path(d) / OLD_TRUNK).write_bytes(body[next(iter(files))])   # (the name both had: told apart by the size)
                 self.assertEqual(maya.hy4_layout_in(Path(d), "maya-xs"), layout)
+            (Path(d) / OLD_TRUNK).unlink()
+            (Path(d) / SMALL).write_bytes(body[next(iter(xs["layouts"]["8gb"]["files"]))])   # (under today's name)
+            self.assertEqual(maya.hy4_layout_in(Path(d), "maya-xs"), "8gb")
 
     def test_a_size_without_a_small_layout(self):
         q = {"files": XS["files"], "plan": XS["plan"]}
@@ -525,12 +530,12 @@ class Fit(unittest.TestCase):
                 with self.assertRaisesRegex(Failed, "the 8 GB-card file is not published yet .*7.6 GB of free VRAM.*"
                                                     "about 8.7 GB.*used by itself once it is on Hugging Face"):
                     maya.hy4_fit_step(args(), small, "maya-xs")
-                self.assertEqual(asked, ["Maya-XS-8GB/" + TRUNK])
+                self.assertEqual(asked, ["Maya-XS-8GB/" + SMALL])
                 self.assertEqual(maya.hy4_fit_step(args(), large, "maya-xs")["layout"], "standard")
                 self.assertEqual(len(asked), 1)                       # (a card the standard file fits: not asked)
                 d = Path(tmp) / "x"                                   # (a folder that has the 8 GB-card trunk)
                 d.mkdir()
-                (d / TRUNK).write_bytes(body["Maya-XS-8GB/" + TRUNK])
+                (d / SMALL).write_bytes(body["Maya-XS-8GB/" + SMALL])
                 self.assertEqual(maya.hy4_fit_step(args(model_dir=str(d)), small, "maya-xs")["layout"], "8gb")
                 self.assertEqual(maya.hy4_fit_step(args(), small, "maya-xs", have=lambda lay: d)["layout"], "8gb")
                 self.assertEqual(len(asked), 1)
@@ -539,8 +544,8 @@ class Fit(unittest.TestCase):
             with hub(HUB_COMMIT):
                 self.assertEqual(maya.hy4_fit_step(args(), small, "maya-xs")["layout"], "8gb")
                 m = maya.hy4_entry("maya-xs", "8gb")
-                self.assertEqual(maya.file_url(m, TRUNK), "https://huggingface.co/peasantsmith/Hy4-Flash-Maya-GGUF/"
-                                                          f"resolve/{HUB_COMMIT}/Maya-XS-8GB/{TRUNK}")
+                self.assertEqual(maya.file_url(m, SMALL), "https://huggingface.co/peasantsmith/Hy4-Flash-Maya-GGUF/"
+                                                          f"resolve/{HUB_COMMIT}/Maya-XS-8GB/{SMALL}")
                 self.assertEqual(maya.file_url(m, NGRAM), "https://huggingface.co/peasantsmith/Hy4-Flash-Maya-GGUF/"
                                                           f"resolve/abc/Maya-XS/{NGRAM}")
         with with_manifest(MANIFEST), hub(False), patch.object(maya, "fail", fail), patch.object(maya, "ok", note), \
@@ -650,14 +655,44 @@ class Files(unittest.TestCase):
             low = self.models / "Hy4-Flash-Maya-XS-8GB"
             self.assertIsNone(maya.hy4_model_step(args(), low, "maya-xs", "8gb", self.models))
             quant, missing, urls = asked.pop()
-            self.assertEqual(missing, [TRUNK])
+            self.assertEqual(missing, [SMALL])
             self.assertEqual([u.split("/resolve/")[1] for u in urls],
-                             ["main/Maya-XS-8GB/" + TRUNK, "0" * 40 + "/Maya-XS/" + NGRAM])
+                             ["main/Maya-XS-8GB/" + SMALL, "0" * 40 + "/Maya-XS/" + NGRAM])
             self.assertTrue((low / NGRAM).samefile(std / NGRAM))      # (one copy on the disk)
             self.assertTrue(any("linked from" in s for s in self.said))
             self.put(low, body, small)
             self.assertEqual(len(maya.hy4_model_step(args(), low, "maya-xs", "8gb", self.models)), 2)
             self.assertEqual(asked, [])
+
+    def test_files_under_their_earlier_names(self):
+        # a folder filled before the names carried the quant type: linked to today's names by size and sha256, no download
+        man, body = stand_ins(manifest())
+        xs = man["quants"]["Hy4-Flash-Maya-XS"]
+        trunk, small, ngram = list(xs["files"])[0], list(xs["layouts"]["8gb"]["files"])[0], list(man["ngram"])[0]
+        self.assertEqual(man["was"], {TRUNK: [OLD_TRUNK], SMALL: [OLD_TRUNK], NGRAM: [OLD_NGRAM,
+                         "Hy4-Flash-Maya-M-00002-of-00002.gguf", "Hy4-Flash-Maya-L-00002-of-00002.gguf"]})
+        std, low = self.models / "Hy4-Flash-Maya-XS", self.models / "Hy4-Flash-Maya-XS-8GB"
+        for d, t in ((std, trunk), (low, small)):
+            d.mkdir(parents=True)
+            (d / OLD_TRUNK).write_bytes(body[t])
+        (std / OLD_NGRAM).write_bytes(body[ngram])
+        with with_manifest(man), patch.object(maya, "offer_download", side_effect=AssertionError("asked to download")):
+            files = maya.hy4_model_step(args(), std, "maya-xs", "standard", self.models)
+            self.assertEqual([f.name for f in files], [TRUNK, NGRAM])
+            self.assertTrue((std / TRUNK).samefile(std / OLD_TRUNK) and (std / NGRAM).samefile(std / OLD_NGRAM))
+            # the 8 GB-card folder: its own trunk under the old name (the standard one's name: told apart by size),
+            # the n-gram table from the standard folder under either name
+            files = maya.hy4_model_step(args(), low, "maya-xs", "8gb", self.models)
+            self.assertEqual([f.name for f in files], [SMALL, NGRAM])
+            self.assertTrue((low / SMALL).samefile(low / OLD_TRUNK) and (low / NGRAM).samefile(std / OLD_NGRAM))
+            self.assertEqual(maya.hy4_layout_in(low, "maya-xs"), "8gb")
+        # a file of another size under the old name is not taken
+        other = Path(self.tmp.name) / "other"
+        other.mkdir()
+        (other / OLD_TRUNK).write_bytes(body[small])
+        with with_manifest(man), patch.object(maya, "offer_download", return_value=False):
+            self.assertIsNone(maya.hy4_model_step(args(), other, "maya-xs", "standard", None))
+        self.assertFalse((other / TRUNK).exists())
 
     def test_ngram_from_another_configs_folder(self):
         man, body = stand_ins(manifest())
@@ -813,7 +848,7 @@ class Steps(unittest.TestCase):
             root, d = Path(tmp) / "maya", Path(tmp) / "mine"
             root.mkdir()
             d.mkdir()
-            (d / TRUNK).write_bytes(body[list(xs["layouts"]["8gb"]["files"])[0]])   # (the 8 GB layout's trunk)
+            (d / OLD_TRUNK).write_bytes(body[list(xs["layouts"]["8gb"]["files"])[0]])   # (the 8 GB layout's trunk, under the name it had before)
             (d / NGRAM).write_bytes(body[list(man["ngram"])[0]])
 
             def run(cmd, *a, **kw):

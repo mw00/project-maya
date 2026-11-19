@@ -62,8 +62,8 @@ def hy4_cfg(d: Path, name="maya-hy4-flash-maya-xs.json") -> Path:
     pack = model / "maya-hy4"
     pack.mkdir(parents=True, exist_ok=True)
     (pack / "hy4.txt").write_text(f"n_layer 32\ncontext_length 1048576\nmodel_dir {model}\n")
-    (pack / "tensors.txt").write_text("file 0 Hy4-Flash-Maya-XS-00001-of-00002.gguf\n"
-                                      "file 1 Hy4-Flash-Maya-XS-00002-of-00002.gguf\nt token_embd.weight 1 0 0 8 2 4\n")
+    (pack / "tensors.txt").write_text("file 0 Hy4-Flash-Maya-XS-IQ2_XXS-00001-of-00002.gguf\n"
+                                      "file 1 Hy4-Flash-Maya-XS-IQ2_XXS-00002-of-00002.gguf\nt token_embd.weight 1 0 0 8 2 4\n")
     args = ["--pack", str(pack), "--max-context", "32768", "--gpus", "0,1", "--cpu-threads", "12", "--reserve-gb", "0.5",
             "--chunk", "256", "--vram-experts", "0", "--profile", "/m/hy4.profile"]
     cfg = {"exe": "/b/maya-hy4", "args": args, "tokenizer": str(pack / "tokenizer"), "model_name": "hy4-flash",
@@ -356,8 +356,8 @@ class Settings(unittest.TestCase):
         M._trained.clear()
         self.assertEqual(M.trained_context_of(cfg), 1048576)
         pack = M.pack_of(cfg)
-        self.assertEqual(M.pack_reads(pack), [pack.parent / "Hy4-Flash-Maya-XS-00001-of-00002.gguf",
-                                              pack.parent / "Hy4-Flash-Maya-XS-00002-of-00002.gguf"])
+        self.assertEqual(M.pack_reads(pack), [pack.parent / "Hy4-Flash-Maya-XS-IQ2_XXS-00001-of-00002.gguf",
+                                              pack.parent / "Hy4-Flash-Maya-XS-IQ2_XXS-00002-of-00002.gguf"])
         with mock.patch.object(M, "machine_gpus", return_value=[]):
             row = M.listing(self.d, None)["models"][0]
         # (no VRAM figure: the contexts up to the one the setup wrote - test_hy4_contexts_that_fit)

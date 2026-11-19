@@ -8137,6 +8137,7 @@ def hy4_entry(quant: str, layout: str = HY4_STANDARD) -> dict:
          "files": {k: v[0] for k, v in files.items()}, "sha256": {k: v[1] for k, v in files.items()},
          "ngram": nname, "ngram_gb": nfile[0] / 1e9, "download_gb": sum(v[0] for v in files.values()) / 1e9,
          "memory_gb": float(q.get("memory_gb") or 0), "plan": dict(lay["plan"]), "layout": layout,
+         "earlier": {k: list(v) for k, v in (man.get("was") or {}).items() if k in files},
          "dir": HY4_QUANTS[quant] + ("" if layout == HY4_STANDARD else f"-{layout.upper()}")}
     if nfolder != folder:                              # (a layout's folder of the repo has its trunk only)
         m["sources"] = {nname: (man["repo"], rev)}
@@ -8250,12 +8251,15 @@ def hy4_fit(q: dict, gpus: list, ctx_wanted: int | None = None, used: dict | Non
 
 
 def hy4_layout_in(d: Path, quant: str) -> str | None:
-    """The layout whose trunk is in a folder (both layouts' trunks have the same name: by its size), or None."""
+    """The layout whose trunk is in a folder - under its name, or one it had before (the table's "was": both layouts'
+    trunks had the same name then) - by its size, or None."""
+    was = read_json(HY4_MANIFEST).get("was") or {}
     for name, lay in hy4_layouts(hy4_quant_table(quant)).items():
         for rel, (size, _) in lay["files"].items():
-            f = Path(d) / Path(rel).name
-            if f.is_file() and f.stat().st_size == size:
-                return name
+            for n in [Path(rel).name] + list(was.get(Path(rel).name) or []):
+                f = Path(d) / n
+                if f.is_file() and f.stat().st_size == size:
+                    return name
     return None
 
 
@@ -8320,8 +8324,13 @@ def hy4_model_step(a, d: Path, quant: str, layout: str = HY4_STANDARD, models: P
     m = hy4_entry(quant, layout)
     files = [d / n for n in m["files"]]
     ngram = d / m["ngram"]
+    was = m.get("earlier") or {}
+    for f in files:   # (a folder filled before the files' names carried their quant type: the same file, linked)
+        if not f.exists() and was.get(f.name):
+            link_published(f, m["files"][f.name], m["sha256"][f.name], [d / o for o in was[f.name]])
     if not ngram.exists() and models is not None:
-        link_published(ngram, m["files"][ngram.name], m["sha256"][ngram.name], hy4_places(models, ngram.name))
+        link_published(ngram, m["files"][ngram.name], m["sha256"][ngram.name],
+                       [p for n in [ngram.name] + was.get(ngram.name, []) for p in hy4_places(models, n)])
     missing = [f for f in files if file_incomplete(m, f)]
     if missing and not hy4_published(quant, layout):
         if len(missing) < len(files):                  # (a folder with a part of the set: which file, and its size)
