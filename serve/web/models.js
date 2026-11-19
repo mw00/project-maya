@@ -564,7 +564,10 @@ function hy4Fields(m, d, s, ch, gpus) {
         hint=${mtp ? "The model's own MTP block drafts a few tokens for the model to check: the same answers, about twice as fast on code. Off decodes token by token."
           : "This pack names no MTP block."}>
         <${Seg} label="Drafting" value=${d.draft} options=${[...(mtp ? [{id: "mtp", label: "MTP"}] : []), {id: "none", label: "Off"}]}
-          onChange=${(v) => setDraft({draft: v})}/><//>`]},
+          onChange=${(v) => setDraft({draft: v})}/><//>`,
+      // (what its engine does not have yet: a line that says so, without a control)
+      html`<${Row} label="Images" hint="Coming soon: Hy4-Flash reads text only on Maya for now."/>`,
+      html`<${Row} label="Answers at once" hint="Coming soon: Hy4-Flash answers one request at a time for now."/>`]},
     {label: "GPUs and memory", rows: [gpus,
       html`<${Row} label="Tensor parallel" flag="--tp" changed=${ch("tp")}
         hint="Auto: every layer shared by the largest group of equal GPUs, the fastest GPU holding the head and the drafts; where no group fits, the layers split across the GPUs. Off always splits the layers."
@@ -574,12 +577,16 @@ function hy4Fields(m, d, s, ch, gpus) {
       html`<${Row} label="VRAM kept free" flag="--reserve-gb" changed=${ch("reserve_gb")}
         hint="Per GPU, beyond the engine's plan: for the driver, the desktop and other programs. Empty: the engine's own."
         warn=${decimal(d.reserve_gb) ? null : "A number of GB, or empty for the default."}>
-        <${Dec} label="VRAM kept free" value=${d.reserve_gb} ph="default" unit="GB / GPU" on=${(v) => setDraft({reserve_gb: v})}/><//>`]},
+        <${Dec} label="VRAM kept free" value=${d.reserve_gb} ph="default" unit="GB / GPU" on=${(v) => setDraft({reserve_gb: v})}/><//>`,
+      html`<${Row} label="KV cache" hint="Hy4-Flash's engine has one cache format: no choice of format and no KV streaming yet."/>`]},
     {label: "Speed", rows: [
       html`<${Row} label="Prompt chunk" flag="--chunk" changed=${ch("prefill_chunk")}
         hint="The prompt tokens one pass reads at most: larger reads long prompts faster and takes more VRAM. Empty: the engine's own."
         warn=${whole(d.prefill_chunk) ? null : "A whole number, or empty."}>
-        <${Num} label="Prompt chunk" value=${d.prefill_chunk} ph="auto" unit="tokens" on=${(v) => setDraft({prefill_chunk: v})}/><//>`]},
+        <${Num} label="Prompt chunk" value=${d.prefill_chunk} ph="auto" unit="tokens" on=${(v) => setDraft({prefill_chunk: v})}/><//>`,
+      html`<${Row} label="CPU threads" flag="--cpu-threads" changed=${ch("cpu_threads")} hint="The CPU lane's threads, which compute the experts VRAM does not hold. Empty: the engine picks."
+        warn=${whole(d.cpu_threads) ? null : "A whole number, or empty."}>
+        <${Num} label="CPU threads" value=${d.cpu_threads} ph="auto" unit="threads" on=${(v) => setDraft({cpu_threads: v})}/><//>`]},
   ];
 }
 

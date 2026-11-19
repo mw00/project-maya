@@ -191,6 +191,7 @@ class ModelName(unittest.TestCase):
                     patch.object(maya, "set_up_ds4", return_value=None), \
                     patch.object(maya, "set_up_mm3", return_value=None), \
                     patch.object(maya, "set_up_qwen", return_value=None), \
+                    patch.object(maya, "set_up_hy4", return_value=None), \
                     patch.object(maya, "check_pc", side_effect=KeyboardInterrupt), \
                     patch.object(maya, "configs", return_value=[]), patch.object(S, "model_named") as named:
                 try:

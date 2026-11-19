@@ -93,9 +93,10 @@ void moe_sum(const float* part, int T, int n_used, int n, const float* w, float*
 void dup_rows_q8(const int8_t* q, const float* d, int rows, int k, int8_t* q2, float* d2, cudaStream_t s);
 
 /// Engram.  rows: the window's looked-up rows, F8 E4M3 [T][cols][dim]; valid[t] 0 / 1 -> r [T][cols dim] = each row
-/// RMS-normed (eps) times lookup_norm [cols][dim], times valid
+/// RMS-normed (eps) times lookup_norm [cols][dim], times valid.  scale [T][cols] (or none): each row's own scale, its
+/// values the codes times it (a table of per-row scaled codes with its scales beside it)
 void engram_rows(const uint8_t* rows, const float* valid, int T, int cols, int dim, const float* lookup_norm, float eps,
-                 float* r, cudaStream_t s);
+                 float* r, cudaStream_t s, const float* scale = nullptr);
 /// kv [T][(hc + 1) E] (the fused key / value projection, without its bias kv_b [(hc + 1) E]) -> x[t][s] += delta, for
 /// the tokens with valid[t]: delta[s][d] = rms(value + b)[d] gamma[d] (gate[s] + hc_scale[s][d]),
 /// gate[s] = sigmoid(sign(dot) sqrt(max(|dot|, 1e-6))), dot = sum_d rms(x[s])[d] rms(key[s])[d] egate[s][d] / sqrt(E)

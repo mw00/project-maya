@@ -107,6 +107,45 @@ void log_softmax(const float* r, int n, std::vector<double>& lp) {
     for (int i = 0; i < n; ++i) lp[(size_t) i] = (double) r[i] - l;
 }
 
+// --trace <from> (tests): the model's 5 likeliest next tokens after each position >= from of the prompt, one line a
+// position on stdout: `<position> <id>:<logprob> x5` - a quant's own reference compares its top tokens with them.
+// The prompt up to `from` in one call (the prompt path), then windows with every row's logits (as run_kld)
+int run_trace(hy4::Model& m, const std::vector<int>& ids, int from) {
+    const int n = (int) ids.size(), nv = m.vocab();
+    from = std::max(1, std::min(from, n));
+    std::vector<float> logits((size_t) hy4::k::kMaxWin * nv);
+    std::vector<double> lp;
+    std::vector<int> ix((size_t) nv);
+    std::string err;
+    const double t0 = now();
+    if (from > 1 && !m.forward(ids.data(), from - 1, 0, 0, nullptr, err)) {
+        std::fprintf(stderr, "forward: %s\n", err.c_str());
+        return 1;
+    }
+    const double t1 = now();
+    for (int p = from - 1; p < n; p += hy4::k::kMaxWin) {
+        const int T = std::min(hy4::k::kMaxWin, n - p);
+        if (!m.forward(ids.data() + p, T, p, T, logits.data(), err)) {
+            std::fprintf(stderr, "forward at %d: %s\n", p, err.c_str());
+            return 1;
+        }
+        for (int t = 0; t < T; ++t) {
+            const float* me = logits.data() + (size_t) t * nv;
+            log_softmax(me, nv, lp);
+            for (int j = 0; j < nv; ++j) ix[(size_t) j] = j;
+            std::partial_sort(ix.begin(), ix.begin() + 5, ix.end(), [&](int a, int b) { return me[a] > me[b]; });
+            std::printf("%d", p + t);
+            for (int j = 0; j < 5; ++j) std::printf(" %d:%.4f", ix[(size_t) j], lp[(size_t) ix[(size_t) j]]);
+            std::printf("\n");
+        }
+    }
+    const double t2 = now();
+    std::fprintf(stderr, "trace: prompt %d tokens in %.2f s (%.1f tok/s), %d positions in windows in %.2f s (%.1f tok/s)\n",
+                 from - 1, t1 - t0, from > 1 ? (from - 1) / (t1 - t0) : 0.0, n - from + 1, t2 - t1,
+                 (n - from + 1) / (t2 - t1));
+    return 0;
+}
+
 int run_kld(hy4::Model& m, const std::string& path, int chunks) {
     std::ifstream f(path, std::ios::binary);
     char magic[8];
@@ -384,8 +423,10 @@ inline bool plain_sampling(const mm3::sample::Req& r) {
 int serve(hy4::Model& m, const std::vector<int>& eos, int n_draft, float floor0) {
     for (const auto& l : m.info_lines()) std::printf("NOTE %s\n", l.c_str());
     const auto& st0 = m.stats();
-    std::printf("INFO engine=hy4 engine_kind=hy4 model=Hy4-flash ctx=%lld vram_gb=%.2f dspark=0 mtp=%d\n",
-                (long long) m.max_ctx(), st0.vram_gb, m.has_mtp() && n_draft > 0 ? 1 : 0);
+    std::printf("INFO engine=hy4 engine_kind=hy4 model=Hy4-flash ctx=%lld vram_gb=%.2f dspark=0 mtp=%d experts=%d "
+                "vram_slots=%d\n",
+                (long long) m.max_ctx(), st0.vram_gb, m.has_mtp() && n_draft > 0 ? 1 : 0, st0.experts_all,
+                st0.experts_vram);
     std::printf("READY %lld stop\n", (long long) m.max_ctx());
     std::fflush(stdout);
     std::fprintf(stderr, "maya hy4 serve: GEN <max_new> [keys] <ids>; STOP, WRAP, QUIT\n");
@@ -476,13 +517,22 @@ int serve(hy4::Model& m, const std::vector<int>& eos, int n_draft, float floor0)
         bool in_think = r.think_budget > 0 && r.think_end >= 0;
         int tok = mm3::sample::draw(row_dist(lg.data(), m.vocab(), r, state), rng);
         long long d_off = 0, d_acc = 0;
+        // the decode's own counts (the model's totals less what they were once the prompt was read): the routed
+        // experts run, those of them on the CPU lane, the host's n-gram gathers
+        const long long ex0 = (long long) m.stats().experts, cpu0 = (long long) m.stats().cpu_experts;
+        const double eg0 = m.stats().engram_ms;
         auto stat_line = [&]() {
             const double ms = now() * 1e3 - t1;
-            std::printf("STAT tok_s=%.2f ms_tok=%.2f vram_hit=1.0000 cpu=0.000", ms > 0 ? 1000.0 * (double) produced / ms : 0.0,
-                        produced > 0 ? ms / (double) produced : 0.0);
+            const long long d_ex = (long long) m.stats().experts - ex0;
+            const long long d_cpu = (long long) m.stats().cpu_experts - cpu0;
+            const double d_eg = m.stats().engram_ms - eg0;
+            std::printf("STAT tok_s=%.2f ms_tok=%.2f vram_hit=%.4f cpu=%.3f", ms > 0 ? 1000.0 * (double) produced / ms : 0.0,
+                        produced > 0 ? ms / (double) produced : 0.0,
+                        d_ex > 0 ? 1.0 - (double) d_cpu / (double) d_ex : 1.0,
+                        produced > 0 ? (double) d_cpu / (double) produced : 0.0);
             if (d_off > 0) std::printf(" drafts=%.3f draft_acc=%lld draft_off=%lld", (double) d_acc / (double) d_off, d_acc,
                                        d_off);
-            std::printf("\n");
+            std::printf(" engram_ms=%.3f\n", produced > 0 ? d_eg / (double) produced : 0.0);
         };
         const bool spec = m.has_mtp() && n_draft > 0 && (r.spec < 0 || r.spec != 0);
         const float floor = r.conf >= 0.0f ? r.conf : floor0;
@@ -643,7 +693,15 @@ int bench_lane(const std::string& pack_dir, int il, int n_exp_call, int n_tok) {
         std::fprintf(stderr, "layer %d has no routed experts\n", il);
         return 1;
     }
-    auto tid = [](const std::string& t) { return t == "Q4_K" ? 12 : t == "Q6_K" ? 14 : t == "Q8_0" ? 8 : -1; };
+    auto tid = [](const std::string& t) {   // (ggml's type numbers: every block type the lane's rows take)
+        static const std::pair<const char*, int> names[] = {
+            {"Q8_0", 8},    {"Q2_K", 10},   {"Q3_K", 11},  {"Q4_K", 12},   {"Q5_K", 13},  {"Q6_K", 14},  {"IQ2_XXS", 16},
+            {"IQ2_XS", 17}, {"IQ3_XXS", 18}, {"IQ1_S", 19}, {"IQ4_NL", 20}, {"IQ3_S", 21}, {"IQ2_S", 22}, {"IQ4_XS", 23},
+            {"IQ1_M", 29}};
+        for (const auto& [n, i] : names)
+            if (t == n) return i;
+        return -1;
+    };
     hy4::CpuExperts ex;
     if (!ex.init(tid(tg->type), tid(td->type), pk.g.n_lat, pk.g.n_ff_exp, err)) {
         std::fprintf(stderr, "%s\n", err.c_str());
@@ -675,26 +733,53 @@ int bench_lane(const std::string& pack_dir, int il, int n_exp_call, int n_tok) {
     const double mb = (2.0 * ex.g_stride + ex.d_stride) / 1e6;
     std::printf("layer %d: %s / %s experts, %.2f MB each; %d a token, %d tokens a call\n", il, tg->type.c_str(),
                 td->type.c_str(), mb, n_exp_call, n_tok);
-    for (int th : {0, 3, 7, 15, 21, 31, 43}) {
-        hy4::Lane lane(th);
+    // the thread counts: this host's (1, 2, 4 ... its physical cores, its logical CPUs).  Two rates each: the experts
+    // picked at random (the weights from memory), and one small set every call (the weights in the CPU's caches) -
+    // the gap is what the memory costs.  The sum printed is the first call's output bits (two builds compared by it)
+    const int logical = std::max(1u, std::thread::hardware_concurrency());
+    const int gap_us = std::getenv("HY4_BENCH_GAP_US") ? std::atoi(std::getenv("HY4_BENCH_GAP_US")) : 0;   // (a pause before each call)
+    const int phys = (int) hy4::Lane(-1).threads() + 1;
+    std::vector<int> counts;
+    for (int c = 1; c < phys; c *= 2) counts.push_back(c);
+    for (int c : {phys - 2, phys, phys + phys / 2, logical}) counts.push_back(c);
+    std::sort(counts.begin(), counts.end());
+    counts.erase(std::unique(counts.begin(), counts.end()), counts.end());
+    for (int c : counts) {
+        if (c < 1 || c > logical) continue;
+        hy4::Lane lane(c - 1);
         std::vector<hy4::CpuEntry> ent;
-        const int reps = n_tok > 1 ? 4 : 40;
-        double tsum = 0;
-        for (int r = 0; r < reps + 3; ++r) {
-            ent.clear();
-            std::vector<int> pick(NE);
-            for (int e = 0; e < NE; ++e) pick[(size_t) e] = e;
-            for (int t = 0; t < n_tok; ++t) {
-                std::shuffle(pick.begin(), pick.end(), rng);
-                for (int j = 0; j < n_exp_call; ++j) ent.push_back({t, pick[(size_t) j], 0.25f});
+        const int reps = n_tok > 1 ? 4 : 60;
+        double ms2[2] = {0, 0};
+        uint64_t bits = 1469598103934665603ull;
+        for (int same = 0; same < 2; ++same) {
+            std::mt19937 r2(7);
+            double tsum = 0;
+            for (int r = 0; r < reps + 3; ++r) {
+                if (r == 0 || !same) {
+                    ent.clear();
+                    std::vector<int> pick(NE);
+                    for (int e = 0; e < NE; ++e) pick[(size_t) e] = e;
+                    for (int t = 0; t < n_tok; ++t) {
+                        std::shuffle(pick.begin(), pick.end(), r2);
+                        for (int j = 0; j < n_exp_call; ++j) ent.push_back({t, pick[(size_t) j], 0.25f});
+                    }
+                }
+                if (gap_us > 0) std::this_thread::sleep_for(std::chrono::microseconds(gap_us));
+                const double t0 = now();
+                hy4::cpu_experts(lane, ex, ent, x.data(), n_tok, out.data());
+                if (r >= 3) tsum += now() - t0;
+                if (r == 0 && !same)
+                    for (float v : out) {
+                        uint32_t u;
+                        std::memcpy(&u, &v, 4);
+                        bits = (bits ^ u) * 1099511628211ull;
+                    }
             }
-            const double t0 = now();
-            hy4::cpu_experts(lane, ex, ent, x.data(), n_tok, out.data());
-            if (r >= 3) tsum += now() - t0;
+            ms2[same] = 1e3 * tsum / reps;
         }
-        const double ms = 1e3 * tsum / reps;
-        std::printf("  %2d threads: %.3f ms a call, %.3f ms an expert-token, %.1f tokens/s\n", th + 1, ms,
-                    ms / ((double) n_exp_call * n_tok), 1000.0 * n_tok / ms);
+        std::printf("  %2d threads: %.3f ms a call, %.3f ms an expert-token, %.1f tokens/s; the same experts every call "
+                    "%.3f ms; sum %016llx\n", c, ms2[0], ms2[0] / ((double) n_exp_call * n_tok), 1000.0 * n_tok / ms2[0],
+                    ms2[1], (unsigned long long) bits);
     }
     return 0;
 }
@@ -706,6 +791,7 @@ int main(int argc, char** argv) {
     std::string ids_arg, kld;
     int gen = 0, chunks = 0;
     bool top = false, serving = false;
+    int trace = 0;
     int bench_layer = -1, bench_n = 16, bench_t = 1;
     std::vector<int> eos;
     int n_draft = 3;
@@ -742,6 +828,7 @@ int main(int argc, char** argv) {
         else if (a == "--kld") kld = next();
         else if (a == "--chunks") chunks = std::atoi(next().c_str());
         else if (a == "--top") top = true;
+        else if (a == "--trace") trace = std::atoi(next().c_str());
         else if (a == "--serve") serving = true;
         else if (a == "--bench-lane") bench_layer = std::atoi(next().c_str());
         else if (a == "--bench-experts") bench_n = std::atoi(next().c_str());
@@ -776,6 +863,7 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "maya-hy4: no prompt (--ids)\n");
         return 2;
     }
+    if (trace > 0) return run_trace(m, ids, trace);
     std::vector<float> logits((size_t) m.vocab());
     const double t0 = now();
     if (!m.forward(ids.data(), (int) ids.size(), 0, 1, logits.data(), err)) {

@@ -40,6 +40,23 @@ private:
     std::unique_ptr<Impl> p;
 };
 
+/// How the lane and the thread that feeds it wait through a decode's gaps.  The measured waits by default on every
+/// system: a thread that sleeps comes back late (milliseconds on Windows, less on Linux), and every lane job after
+/// it pays that - the waits keep the lane's cores busy through a whole answer instead, which is faster and makes the
+/// CPU hotter while the model answers.  HY4_LANE_WAITS=0 picks the plain ones (a 3 ms spin, no polling, no pinned
+/// caller), =1 the measured set; each
+/// variable alone (HY4_LANE_SPIN_US, HY4_EV_POLL_US, HY4_LANE_PIN_CALLER) then decides its own.
+struct LaneWaits {
+    int64_t spin_us = 3000;       // the workers spin this long for the next job before they sleep ...
+    bool spin_measured = false;   // ... or twice the longest gap seen lately between two jobs, spin_us at least
+    int64_t ev_poll_us = 0;       // a layer's routes: the GPU's event polled this long before the blocking wait
+    bool pin_caller = false;      // the thread that brings the jobs stays on the core the workers leave free
+};
+/// windows: the system's kind; env: getenv (both parameters for the tests)
+LaneWaits lane_waits(bool windows, const std::function<const char*(const char*)>& env);
+/// This system, the process's environment
+LaneWaits lane_waits();
+
 /// A layer's routed experts in host memory: each role's tensor (the GGUF's stacked [n_exp][rows][row bytes]) and the
 /// layer's format (ds4's IqCpu: the types, the row bytes, the activations' types).
 struct CpuExperts {
@@ -58,9 +75,24 @@ struct CpuEntry {
     float w = 0.0f;
 };
 
+/// (tests, HY4_PROF) cpu_experts' time by part, summed while `on`: the grouping, the gate / up pass, the down pass, the
+/// tokens' sums
+struct LaneProf {
+    bool on = false;
+    double prep_s = 0, gate_up_s = 0, down_s = 0, sum_s = 0;
+    long long calls = 0, entries = 0;
+};
+LaneProf& lane_prof();
+
 /// The pages of these experts moved to node e % nodes (their work's node in cpu_experts), the ones there already passed
 /// over; returns early when stop is set.  For a background thread: the model's CPU-lane experts after the load.
 void place_experts(const CpuExperts& ex, const std::vector<int>& experts, int nodes, const std::atomic<bool>& stop);
+/// These experts' pages read into this process (a byte a page; returns early when stop is set), for a background
+/// thread after the load: a decode then finds them mapped - its first touch of an expert otherwise pays a page fault
+/// a page, or the disk.  ram_available: the RAM the system can still give, file cache included (0: not known).
+void warm_experts(const CpuExperts& ex, const std::vector<int>& experts, const std::atomic<bool>& stop);
+uint64_t ram_available();
+
 /// out [T][n_embd] = each token's weighted sum of its entries' experts (rows with no entry: 0), x [T][n_embd]; the
 /// experts' weights read once for up to 8 of their tokens.  Scratch is the lane's own (grown as needed).
 void cpu_experts(Lane& lane, const CpuExperts& ex, const std::vector<CpuEntry>& entries, const float* x, int T,

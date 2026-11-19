@@ -8,7 +8,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <map>
 #include <random>
+#include <string>
 #include <vector>
 
 #include <cuda_fp16.h>
@@ -59,11 +61,13 @@ void random_k(int type, int k, uint8_t* out, std::mt19937& rng) {
         uint8_t* p = out + b * bb;
         for (int i = 0; i < bb; ++i) p[i] = (uint8_t) byte(rng);
         const uint16_t d = f2h(0.002f), dm = f2h(0.001f);
-        if (type == iq::kQ4_K) {
+        if (type == iq::kQ4_K || type == iq::kQ5_K) {
             std::memcpy(p, &d, 2);
             std::memcpy(p + 2, &dm, 2);
-        } else {   // Q6_K: d at the end
+        } else if (type == iq::kQ6_K) {   // d at the end
             std::memcpy(p + bb - 2, &d, 2);
+        } else {   // (the IQ types: the block's scale first, every other byte a valid code)
+            std::memcpy(p, &d, 2);
         }
     }
 }
@@ -350,7 +354,9 @@ void run_case(int tg, int td, int n_exp, int T, std::mt19937& rng, int F = 1536)
         const double r = rel(out);
         std::printf("  prompt form, types %s/%s, %d tokens (%d rows an expert at most): rel %.2e\n", iq::name(tg),
                     iq::name(td), T, mr, r);
-        CHECK(r < 1e-2);   // (F32 inputs and F16 h on the tiles: not the token form's int8 sums)
+        // (F32 inputs and F16 h on the tiles: not the token form's int8 sums; random IQ4_XS blocks come out at 1.15e-2
+        // on an RTX 3050 (sm_86), under 1e-2 on a V100 - IQ4_XS / Q5_K get the room, the other types stay at 1e-2)
+        CHECK(r < (tg == iq::kIQ4_XS || tg == iq::kQ5_K ? 2e-2 : 1e-2));
         cudaFree(bounds);
         cudaFree(tok);
         cudaFree(row_of);
@@ -381,7 +387,9 @@ void run_case(int tg, int td, int n_exp, int T, std::mt19937& rng, int F = 1536)
         std::printf("  CPU lane, types %s/%s, %d tokens: rel %.2e\n", iq::name(tg), iq::name(td), T, r);
         // ggml-cpu's activations for the K-quants are Q8_K - a scale a 256 values, the device's a 32 - rounded twice (x,
         // then h): ~1.5% on these Gaussian rows; Q8_0's are Q8_0 (a scale a 32, as the device's)
-        CHECK(r < (tg == iq::kQ8_0 ? 5e-3 : 3e-2));
+        // (the lane's own rounding of the activations: random IQ4_XS / Q5_K blocks come out at 3.1e-2 .. 3.4e-2, the
+        // other types under 2.5e-2)
+        CHECK(r < (tg == iq::kQ8_0 ? 5e-3 : tg == iq::kIQ4_XS || tg == iq::kQ5_K ? 4e-2 : 3e-2));
     }
     CHECK(hy4::k::errors() == 0);
     cudaFree(dw);
@@ -480,9 +488,41 @@ void mv_columns(int type, std::mt19937& rng) {
     cudaFree(dd);
 }
 
+// The CPU lane's waits by system and environment (no GPU needed): the measured set on every system, HY4_LANE_WAITS=0
+// for the plain one, each variable alone for its own.
+void lane_waits_cases() {
+    using Env = std::map<std::string, std::string>;
+    auto waits = [](bool windows, const Env& env) {
+        return hy4::lane_waits(windows, [&env](const char* k) -> const char* {
+            const auto it = env.find(k);
+            return it == env.end() ? nullptr : it->second.c_str();
+        });
+    };
+    hy4::LaneWaits w = waits(true, {});
+    CHECK(w.spin_measured && w.spin_us == 3000 && w.ev_poll_us == 2000 && w.pin_caller);
+    w = waits(false, {});
+    CHECK(w.spin_measured && w.spin_us == 3000 && w.ev_poll_us == 2000 && w.pin_caller);
+    w = waits(false, {{"HY4_LANE_WAITS", "0"}});
+    CHECK(!w.spin_measured && w.spin_us == 3000 && w.ev_poll_us == 0 && !w.pin_caller);
+    w = waits(false, {{"HY4_LANE_WAITS", "1"}});
+    CHECK(w.spin_measured && w.spin_us == 3000 && w.ev_poll_us == 2000 && w.pin_caller);
+    w = waits(true, {{"HY4_LANE_WAITS", "0"}});
+    CHECK(!w.spin_measured && w.spin_us == 3000 && w.ev_poll_us == 0 && !w.pin_caller);
+    w = waits(true, {{"HY4_LANE_SPIN_US", "0"}, {"HY4_EV_POLL_US", "0"}, {"HY4_LANE_PIN_CALLER", "0"}});
+    CHECK(!w.spin_measured && w.spin_us == 0 && w.ev_poll_us == 0 && !w.pin_caller);
+    w = waits(false, {{"HY4_LANE_WAITS", "0"}, {"HY4_LANE_SPIN_US", "500"}, {"HY4_EV_POLL_US", "750"},
+                      {"HY4_LANE_PIN_CALLER", "1"}});
+    CHECK(!w.spin_measured && w.spin_us == 500 && w.ev_poll_us == 750 && w.pin_caller);
+    w = waits(false, {{"HY4_LANE_WAITS", "1"}, {"HY4_EV_POLL_US", "-5"}});
+    CHECK(w.spin_measured && w.ev_poll_us == 0 && w.pin_caller);
+    std::printf("  CPU lane's waits by system and environment: %s\n", fails ? "FAILED" : "ok");
+}
+
 int main() {
+    lane_waits_cases();
     int n = 0;
     if (cudaGetDeviceCount(&n) != cudaSuccess || n == 0) {
+        if (fails) return 1;
         std::printf("hy4_experts_test: no GPU, skipped\n");
         return 0;
     }
@@ -499,6 +539,11 @@ int main() {
         for (int F : {256, 512})
             if (F % iq::block_values(tt[1]) == 0)
                 for (int T : {1, 5}) run_case(tt[0], tt[1], 24, T, rng, F);
+    }
+    // the lower-bit types (gate = up = down a layer): the same three forms
+    for (int ty : {iq::kIQ2_XXS, iq::kIQ2_S, iq::kIQ3_XXS, iq::kIQ4_XS, iq::kQ5_K}) {
+        CHECK(iq::expert_supported(ty));
+        for (int T : {1, 5, 16, 80}) run_case(ty, ty, 24, T, rng);
     }
     std::printf("hy4_experts_test: %s\n", fails ? "FAILED" : "ok");
     return fails ? 1 : 0;

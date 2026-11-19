@@ -210,7 +210,8 @@ function ContextCard({m}) {
 // ------------------------------------------------------------------ where the experts live (the engine's STAT lines)
 // GLM's engine: where each routed expert came from while the model writes; DeepSeek's (maya-ds4): the experts the CPU lane
 // computed, what the storage read, the cache's moves and the n-gram memory (Engram) a token; MiniMax's (maya-mm3): the
-// experts its CPU lane computed from the pinned pool
+// experts its CPU lane computed from the pinned pool; Hy4-Flash's (maya-hy4): the experts its CPU lane computed from RAM
+// and its n-gram table's read time (DeepSeek's key names; no RAM tier to promote from, nothing read from the SSD)
 const TIER_SETS = {
   glm: [
     {key: "ram_fetch", label: "From RAM", unit: "/tok", digits: 2, tone: "info", sub: "experts pulled over PCIe from RAM"},
@@ -228,6 +229,10 @@ const TIER_SETS = {
     {key: "disk", label: "From SSD", unit: "/tok", digits: 2, tone: "warn", sub: "experts read from the SSD"},
     {key: "promo", label: "Promoted", unit: "/tok", digits: 2, sub: "experts copied into the VRAM cache"},
   ],
+  hy4: [
+    {key: "cpu", label: "On the CPU", unit: "/tok", digits: 2, tone: "info", sub: "experts the CPU computed from RAM"},
+    {key: "engram_ms", label: "N-gram memory", unit: " ms/tok", digits: 2, sub: "the n-gram table's read time"},
+  ],
   // the maya engine's Qwen path (CYBER-FROST, Qwen3.8-Flash-Next): the CPU computes the experts VRAM does not hold, from
   // RAM or read from the model file - its "disk" counts every expert read from the file, through the page cache or from
   // the SSD (the engine cannot tell which); the drafts' windows count too
@@ -238,13 +243,14 @@ const TIER_SETS = {
   ],
 };
 export const tierSet = (eng) => TIER_SETS[eng && eng.engine_kind === "ds4" ? "ds4" : eng && eng.engine_kind === "mm3" ? "mm3"
-                                           : eng && eng.engine_kind === "qwen" ? "qwen" : "glm"];
+                                           : eng && eng.engine_kind === "qwen" ? "qwen"
+                                           : eng && eng.engine_kind === "hy4" ? "hy4" : "glm"];
 // the card's advice, from the live reading n (stale: the last answer's), the SSD-only share (disk: experts with no home
 // in VRAM or RAM) and the helper pool.  The "more RAM" advice only where experts really live on the SSD alone: a model
 // read from its file (Qwen) can count file reads while every expert has a home in VRAM or RAM
 export function tierTip(n, eng, {stale = false, disk = 0, helper = false} = {}) {
   const ds4 = !!(eng && eng.engine_kind === "ds4"), mm3 = !!(eng && eng.engine_kind === "mm3");
-  const qwen = !!(eng && eng.engine_kind === "qwen");
+  const qwen = !!(eng && eng.engine_kind === "qwen"), hy4 = !!(eng && eng.engine_kind === "hy4");
   if (stale) return "";
   if (ds4) {
     if (n.disk_mb != null && n.disk_mb >= 500) return "Much of every token is read from the SSD: more RAM keeps more of the model's experts cached, and answers get faster.";
@@ -255,7 +261,7 @@ export function tierTip(n, eng, {stale = false, disk = 0, helper = false} = {}) 
   }
   if (n.disk != null && n.disk >= 3 && disk > 0)
     return "Many experts are read from the SSD for every token: more RAM, a smaller model or a shorter context makes answers faster.";
-  if (mm3 || qwen) {   // (MiniMax, Qwen: the CPU computes the experts VRAM does not hold)
+  if (mm3 || qwen || hy4) {   // (MiniMax, Qwen, Hy4: the CPU computes the experts VRAM does not hold)
     return n.vram_hit != null && n.vram_hit < 0.5 ? "Most experts run on the CPU: more VRAM (or a second GPU) keeps more of them on the card." : "";
   }
   if (n.vram_hit != null && n.vram_hit < 0.85 && (n.ram_fetch || 0) >= 4)
@@ -264,7 +270,7 @@ export function tierTip(n, eng, {stale = false, disk = 0, helper = false} = {}) 
 }
 function Tiers({t, eng}) {
   if (!t || !t.now) return null;
-  const ds4 = !!(eng && eng.engine_kind === "ds4");
+  const ds4 = !!(eng && eng.engine_kind === "ds4"), hy4 = !!(eng && eng.engine_kind === "hy4");
   const set = tierSet(eng);
   const n = t.now, h = t.history || {};
   const helper = ds4 && ((n.helper_held || 0) > 0 || (n.helper || 0) > 0 || +eng.helper_allocated_bytes > 0);
@@ -278,13 +284,16 @@ function Tiers({t, eng}) {
   return html`<section class=${`card${stale ? " is-stale" : ""}`} aria-label="Where the experts live">
     <div class="card__head"><span class="card__title">${helper ? "Primary cache and RAM backing" : "Where the experts live"}</span>
       <span class="card__sub">${age == null ? "" : stale ? `last reading ${ago(age)} ago, from the last answer` : `live · ${fmt(total)} routed experts`}</span></div>
-    <div class="tierbar" role="img" aria-label=${`${fmt(pc(vu), 0)}% of the experts in VRAM, ${fmt(pc(ru), 0)}% in ${ds4 ? "RAM" : "pinned RAM"}, ${fmt(pc(disk), 0)}% on the SSD only`}>
+    <div class="tierbar" role="img" aria-label=${hy4 ? `${fmt(pc(vu), 0)}% of the experts in VRAM, ${fmt(pc(ru), 0)}% in RAM, computed on the CPU`
+      : `${fmt(pc(vu), 0)}% of the experts in VRAM, ${fmt(pc(ru), 0)}% in ${ds4 ? "RAM" : "pinned RAM"}, ${fmt(pc(disk), 0)}% on the SSD only`}>
       <span class="tierbar__vram" style=${`flex-grow:${vu}`}></span><span class="tierbar__ram" style=${`flex-grow:${ru}`}></span>
       <span class="tierbar__disk" style=${`flex-grow:${disk}`}></span></div>
-    <div class="legend">
+    ${hy4 ? html`<div class="legend">
+      <span><i class="sw sw--vram"></i>VRAM <b class="num">${fmt(vu)}</b></span>
+      <span><i class="sw sw--ram"></i>RAM, computed on the CPU <b class="num">${fmt(ru)}</b></span></div>` : html`<div class="legend">
       <span><i class="sw sw--vram"></i>${helper ? "Primary VRAM" : "VRAM"} <b class="num">${fmt(vu)} · ${fmt(vramGb, 1)} GB</b></span>
       <span><i class="sw sw--ram"></i>${ds4 ? "RAM" : "Pinned RAM"} <b class="num">${fmt(ru)} · ${fmt(ramGb, 1)} GB</b></span>
-      <span><i class="sw sw--disk"></i>SSD only <b class="num">${fmt(disk)}${diskGb == null ? "" : ` · ${fmt(diskGb, 1)} GB`}</b></span></div>
+      <span><i class="sw sw--disk"></i>SSD only <b class="num">${fmt(disk)}${diskGb == null ? "" : ` · ${fmt(diskGb, 1)} GB`}</b></span></div>`}
     <div class=${`tiles${set.length === 4 ? " tiles--4" : ""}`}>
       ${set.map((x) => {
         const v = n[x.key];
