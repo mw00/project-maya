@@ -2378,10 +2378,12 @@ the model's folder and the pack (`tools/hy4/pack_gguf.py`, `--mtp FILE|none`) in
 then finds the block as it does in a set that carries it. It takes about 4 GB of VRAM on the main GPU: the setup
 turns drafting on where that fits beside the model's own parts and a picture's room, and leaves it off (and the block
 out of the pack) on smaller cards and in the 8 GB-card layout. `--drafting on|off` at the setup, or Drafting on the
-Models page, changes it.
+Models page, changes it. On AMD an answer written with drafting can differ from the same answer without it from a
+token on (seen with Maya-L on a Radeon; Maya-XS gave the same tokens with and without). `--drafting off`, or the
+Models page's switch, turns drafting off.
 
 **Not available for Hy4-Flash yet** (the dashboard offers no switch for them): `--parallel` (one request at a time
-for now); AMD (HIP) and Mac.
+for now); Mac, and AMD on Windows.
 
 The rest of this section describes the engine itself, as contributed, and what it does with a GGUF set that carries
 the model's MTP block (Tencent's own Q4_K_M from [AngelSlim](https://huggingface.co/AngelSlim/Hy4-flash-GGUF),
