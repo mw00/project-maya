@@ -374,6 +374,7 @@ class Download(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as t, \
                 patch.object(maya, "choose", side_effect=choose), patch.object(maya.S, "gpus", return_value=[]), \
+                patch.object(maya.S, "amd_gpus", return_value=[]), \
                 patch.object(maya, "mem_gb", return_value=(512.0, 500.0)):
             got = maya.choose_model(SimpleNamespace(backend=backend, model_dir=None, gguf_dir=None, model=None,
                                                     yes=True), Path(t), {})
