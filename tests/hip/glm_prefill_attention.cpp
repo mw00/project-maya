@@ -180,7 +180,24 @@ int main() {
 
     // The wave32 WMMA kernel (F32 Q, FP16 high/residual) against the F32 kernel: random data, partial 16/32-cell
     // chunks, masked cells, multiple head groups, and zero/tiny/large queries
-    if (!strata::kernels::glmb::mla_wmma2_supported()) {
+    {   // CDNA3/4 (gfx942/gfx950) must take the MFMA twin, not skip to the F32 kernel
+        hipDeviceProp_t prop{};
+        int dev = 0;
+        CHECK(hipGetDevice(&dev));
+        CHECK(hipGetDeviceProperties(&prop, dev));
+        const bool cdna_mfma = std::strncmp(prop.gcnArchName, "gfx950", 6) == 0 || std::strncmp(prop.gcnArchName, "gfx942", 6) == 0;
+        if (cdna_mfma && !strata::kernels::glmb::mla_mfma_supported()) {
+            std::fprintf(stderr, "GLM prefill WMMA2 attention: %s has MFMA but no opt-in MFMA path\n", prop.gcnArchName);
+            return 8;
+        }
+        // The MFMA twin is opt-in: the default selection on CDNA is unchanged (no wmma2, no f16q).
+        if (cdna_mfma && (strata::kernels::glmb::mla_wmma2_supported() || strata::kernels::glmb::mla_wmma2_default())) {
+            std::fprintf(stderr, "GLM prefill WMMA2 attention: %s reports a default wmma2 path; the MFMA twin must be opt-in\n", prop.gcnArchName);
+            return 9;
+        }
+    }
+    // mla_attn_wmma2 itself runs the MFMA kernel on CDNA (what MAYA_GLM_PREFILL_ATTN=mfma selects)
+    if (!strata::kernels::glmb::mla_wmma2_supported() && !strata::kernels::glmb::mla_mfma_supported()) {
         std::puts("GLM prefill WMMA2 attention: skipped (unsupported architecture)");
     } else {
         constexpr int T3 = 12, H3 = 32, rows3 = 256, stride3 = 70;

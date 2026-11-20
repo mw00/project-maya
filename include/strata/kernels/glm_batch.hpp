@@ -107,6 +107,9 @@ void mla_attn_wmma2(const float* q_abs, const uint16_t* lat, const int* cells, c
 /// where the prompt path prefers it over mla_attn_f16q.
 bool mla_wmma2_supported();
 bool mla_wmma2_default();
+/// True on CDNA3/4 (gfx942/gfx950), where mla_attn_wmma2 runs the MFMA twin.  It is opt-in there
+/// (MAYA_GLM_PREFILL_ATTN=mfma): mla_wmma2_supported() and mla_wmma2_default() stay false on those cards.
+bool mla_mfma_supported();
 #endif
 /// One decode token's absorbed MLA attention on Volta's tensor cores (mla_attn_v70_kernel in cell splits, then their
 /// merge): ctx[h] = softmax(q_abs[h] . lat_c * scale) . lat_c over its n_sel cells.  part holds part_cap splits of
