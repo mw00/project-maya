@@ -2456,10 +2456,9 @@ GLM's parser; a turn ends at `<｜hy_end:..｜>`.
 them at once: each holds its share of the attention heads, of the dense and shared FFNs' width and a slice of every
 routed expert (a block of its width, so the slices of an expert add up to it), and a copy of the small matrices and
 the caches. Where the blocks do not go round the GPUs evenly (an expert of Q4_K, Q3_K or IQ2 is 6 blocks, so 4 GPUs
-would each hold 2 blocks of every expert for 1.5 used, a third more VRAM and work, and 5 GPUs two thirds more) an
-INFO line says so; with `HY4_TP_EXPERTS=auto` each expert then stays unsplit on one GPU instead, the layer's experts
-dealt round the GPUs from the most routed down (the profile's counts) - less VRAM, an expert's sum rounded
-differently, so other answers than the slices' (off by default). A layer's two partial sums (its attention's, its FFN's) go through pinned host memory, where the host
+would each hold 2 blocks of every expert for 1.5 used, a third more VRAM and work, and 5 GPUs two thirds more) each
+expert stays unsplit on one GPU instead, the layer's experts dealt round the GPUs from the most routed down (the
+profile's counts), and an INFO line says so. A layer's two partial sums (its attention's, its FFN's) go through pinned host memory, where the host
 adds them in a fixed order, so every GPU's copy of the model's state stays the same bit for bit. The main GPU - the
 fastest memory, measured at the load (`--main-gpu` names another) - holds the output head and the MTP block; where it
 is not of the group's kind it also computes a share of every layer's routed experts, by its memory's speed against
@@ -2467,10 +2466,9 @@ the others' and as its VRAM allows, from the routing the first member hands it. 
 routed expert, each of its GPUs keeps as many of every layer's experts as its VRAM takes (unsplit, the most routed
 first by the profile's counts, so a GPU with less room holds fewer) and the others go the CPU lane's way: for a token
 the first member's thread computes them on the CPU, and for a prompt chunk of 256 rows or more every member sends its
-share of them over PCIe to its own GPU, once for both halves of the chunk. This is asked for (off by default: `--tp
-auto` keeps the layer split there, its layout and answers, and its INFO line says what the group would hold):
-`--tp N` takes it wherever the members' own parts fit, `HY4_TP_LANE=1` has `--tp auto` take it where the group
-holds half of the experts or more; the cache is then in 8-bit rows
+share of them over PCIe to its own GPU, once for both halves of the chunk. `--tp auto` takes this where the group
+holds half of the experts or more, `--tp N` wherever the members' own parts fit (`HY4_TP_LANE=0`: `--tp auto`
+keeps the layer split there, and its INFO line says what the group would hold); the cache is then in 8-bit rows
 where `--kv auto` allows and the MTP block's pass runs in line. With `HY4_HOT=1` such a group places its experts at
 the start by the routing its earlier answers left in the file and trades none during answers. Where the group cannot hold the model's own parts
 and the context's caches (every member keeps a copy), the layer split runs instead, and an INFO line says why.
@@ -2611,8 +2609,8 @@ A request's `spec` (0 / 1) turns the drafts off or on for it.
 | `HY4_RAM_HEADROOM_GB` | max(8, a tenth of the RAM) | a GPU that shares the PC's memory (Strix Halo / Gorgon Halo, Linux): the memory (GB) the engine leaves the system and the other programs - what the RAM has available beyond it is the model's |
 | `HY4_VISION_F32` | off | the vision tower's attention products in F32 instead of TF32 (a little slower where TF32 is faster) |
 | `HY4_TP_HELPER` | by speed | tensor parallel: `0` no expert share for the GPUs outside the group; `k`: k slices each (as their VRAM allows) |
-| `HY4_TP_EXPERTS` | slices | tensor parallel: `unsplit` every routed expert on one GPU, `slices` a slice of every expert on each GPU (also: never the CPU lane's tensor parallel); `auto`: unsplit where the slices would hold a tenth or more of zero blocks (4 or 5 GPUs with 256-value blocks; less VRAM, other answers) |
-| `HY4_TP_LANE` | off | `1`: `--tp auto` takes tensor parallel with the CPU lane where the group holds half of the routed experts or more (else the layer split; the cache in 8-bit rows where `--kv auto` allows, other answers than the layer split's) |
+| `HY4_TP_EXPERTS` | by the blocks | tensor parallel: `unsplit` every routed expert on one GPU, `slices` a slice of every expert on each GPU; unset: unsplit where the slices would hold a tenth or more of zero blocks (4 or 5 GPUs with 256-value blocks) |
+| `HY4_TP_LANE` | on | `0`: `--tp auto` keeps the layer split where the group cannot hold every routed expert, instead of tensor parallel with the CPU lane (which it takes where the group holds half of the routed experts or more) |
 | `HY4_TP_MIXED` | off | tensor parallel over GPUs of different kinds (their copies of the state may drift apart) |
 | `HY4_DENSE_MAX` | picked at the start | prompts: up to how many earlier positions the 12 indexed layers' attention runs on the tensor cores (one FP16 product over every earlier key, the indexer's picks kept by a mask) before it goes to the gathering kernel the token path uses. Both read the indexer's same picks, so the limit moves no pick - only how a token's attention is summed (answers can differ in the last bits, as between two prompt chunks). The tensor-core path's time grows with the positions, the gathering kernel's does not: on Tesla V100s they cross at about 24,000. At every start the engine takes the largest of 24576 / 16384 whose buffers (about 215 MB a GPU for 24576, a third of that on a tensor-parallel member) fit the plan without costing the layout, the cache's rows, the pictures, the MTP pass's own scratch, the output head's rows over the members (`HY4_TP_HEAD`) or a routed expert its place in VRAM, on GPUs with tensor cores (compute capability 7.0 and later), and 8192 otherwise; its start line says which (`INFO prompts: the indexed layers' attention on the tensor cores up to N positions`). So GPUs that hold every expert (tensor parallel, a layer split with room) take a longer span, and a card that holds a part of the experts beside the CPU lane keeps 8192 - its decoding and its answers stay as they were. `HY4_DENSE_MAX=N` tries N alone (up to 65536; it is taken where the plan holds it, also where it moves some experts from the VRAM to the CPU lane: on one Tesla V100 a 16K prompt read 7% faster with 24576, with 1.5% fewer experts in VRAM); `HY4_DENSE_MAX=8192`: as before v1.1.68 |
 | `HY4_VISION_LEND` | on | `0`: a picture's room is not lent by the prompt buffers - it is kept free on the main GPU between pictures and allocated for each (the earlier behaviour; for comparisons) |

@@ -609,20 +609,15 @@ struct Model::Impl {
         B = bv > 0 ? g.n_ff_exp / bv : 0;
         return B > 0 && U > 0 ? (U >= B ? 1 : (B + U - 1) / U) : 0;
     }
-    // (unset: slices everywhere, the layout and answers as before - unsplit sums an expert on one GPU, so its rounding
-    //  differs; HY4_TP_EXPERTS=auto: unsplit where slices pad.  tp_pad: the layers where auto would take unsplit)
-    int tp_pad = 0;
     void pick_unsplit_experts() {
         const char* e = std::getenv("HY4_TP_EXPERTS");
         tp_unsplit.assign((size_t) g.n_layer, 0);
-        tp_pad = 0;
         for (int il = g.n_dense_lead; il < g.n_layer; ++il) {
             int B = 0;
             const int c = slice_blocks(il, B);
             if (c == 0) continue;
             const bool pad = U < B && c * U * 10 >= B * 11;
-            tp_pad += pad;
-            tp_unsplit[(size_t) il] = e && !std::strcmp(e, "unsplit") ? 1 : e && !std::strcmp(e, "auto") ? pad : 0;
+            tp_unsplit[(size_t) il] = e && !std::strcmp(e, "unsplit") ? 1 : e && !std::strcmp(e, "slices") ? 0 : pad;
         }
     }
     // a unit's share of layer il's routed experts' bytes, w units side by side
@@ -669,19 +664,7 @@ struct Model::Impl {
             if (first < 0) first = il;
             ++n;
         }
-        if (n == 0) {
-            if (tp_pad > 0 && tp > 1) {
-                int il = g.n_dense_lead, B = 0, c = 0;
-                for (; il < g.n_layer && (c = slice_blocks(il, B)) == 0; ++il) {}
-                char buf[320];
-                std::snprintf(buf, sizeof buf, "INFO tensor parallel: the routed experts in slices, %d of an expert's %d "
-                              "blocks each over %d GPUs (%.0f%% more VRAM and work); HY4_TP_EXPERTS=auto keeps each "
-                              "expert on one GPU there (less VRAM, its sums rounded differently)", c, B, U,
-                              100.0 * c * U / std::max(1, B) - 100.0);
-                info.push_back(buf);
-            }
-            return;
-        }
+        if (n == 0) return;
         int B = 0;
         const int c = slice_blocks(first, B);
         char buf[320], why[160] = "";
@@ -1544,11 +1527,10 @@ struct Model::Impl {
                 // The group does not hold every routed expert: each member takes as many of every layer's as its VRAM
                 // holds (unsplit, the most routed first) and the others are the CPU lane's, as on the layer split: the
                 // cache in 8-bit rows where --kv auto allows (more experts in VRAM), the MTP block's pass in line
-                // (asked for: --tp N, or HY4_TP_LANE=1 for --tp auto.  Unasked, --tp auto keeps the layer split - its
-                //  layout and answers as before - and the INFO line says what the group would hold)
+                // (HY4_TP_LANE=0: --tp auto keeps the layer split here, and the INFO line says what the group would hold)
                 {
                     const char* le = std::getenv("HY4_TP_LANE");
-                    const bool asked = o.tp > 0 || (le && std::atoi(le) != 0);
+                    const bool asked = o.tp > 0 || !(le && *le && std::atoi(le) == 0);
                     const bool was = kv_q8;
                     if (o.kv < 0 && kv_q8_rows()) kv_q8 = true;
                     undo();
@@ -1560,8 +1542,8 @@ struct Model::Impl {
                     const double pct = 100.0 * (double) std::min<long long>(held, g.n_expert) / g.n_expert;
                     if (fit_l && !asked) {
                         char lb[200];
-                        std::snprintf(lb, sizeof lb, "the group would hold %.0f%% of the routed experts (HY4_TP_LANE=1 "
-                                      "or --tp %d takes it)", pct, N);
+                        std::snprintf(lb, sizeof lb, "HY4_TP_LANE=0 - the group would hold %.0f%% of the routed experts "
+                                      "(unset or --tp %d takes it)", pct, N);
                         tl = lb;
                         undo();
                     } else if (fit_l) {
