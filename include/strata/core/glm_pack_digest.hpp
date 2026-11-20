@@ -2,6 +2,7 @@
 #pragma once
 
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <map>
 #include <mutex>
@@ -9,6 +10,18 @@
 #include <utility>
 
 namespace strata::core {
+
+inline bool pack_identity_required() {
+    if (std::getenv("MAYA_GLM_NO_REUSE") != nullptr) return false;
+    if (const char* learned = std::getenv("MAYA_GLM_LEARNED_PREFIX"))
+        if (std::strcmp(learned, "1") == 0) return true;
+    for (const char* name : {"MAYA_GLM_SLOT_SPILL", "MAYA_GLM_SLOT_KEEP"}) {
+        if (const char* value = std::getenv(name))
+            if (std::atoi(value) != 0) return true;
+    }
+    const char* prompt_cache = std::getenv("MAYA_GLM_PROMPT_CACHE_DIR");
+    return prompt_cache != nullptr && prompt_cache[0] != '\0';
+}
 
 // SHA-256, FIPS 180-4.  Written out here rather than taken from a library so the identity is the same bytes on every
 // platform this engine builds for (no OpenSSL or BCrypt dependency in the build).

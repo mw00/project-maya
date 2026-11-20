@@ -3816,9 +3816,11 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
     host_dn_.resize((size_t) g_.n_embd);
     host_act_.resize(strata::kernels::cpu::kNativeActBytes);
     host_hq_.resize(strata::kernels::cpu::kNativeHBytes);
+    const bool identity_required = pack_identity_required();
     PackShardDigests single_load_digests;
-    pack_content_digest_ = pack_content_identity(pack_digests_ != nullptr ? *pack_digests_ : single_load_digests);
-    if (pack_content_digest_.empty() || pack_shards_.empty()) {
+    pack_content_digest_ = identity_required
+        ? pack_content_identity(pack_digests_ != nullptr ? *pack_digests_ : single_load_digests) : std::string{};
+    if (pack_shards_.empty() || (identity_required && pack_content_digest_.empty())) {
         err = "pack: cannot identify mapped weight bytes";
         return false;
     }
