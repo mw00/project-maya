@@ -9733,7 +9733,7 @@ def hy4_dfly2_need_gib(quant: str, fit: dict) -> float:
 def hy4_mtp_need_gib(quant: str, fit: dict) -> float:
     """hy4_drafter_need_gib for the MTP block (hy4_mtp_gib at the fit's prompt chunk) beside the start hy4_fit worked
     out for a size - the engine counts the block's room as the DFly2 drafter's (with drafting on and off; where it
-    would change the cache's rows, the prompt chunk or KV streaming, the block is not loaded).  With both drafters in
+    would change the cache's rows or KV streaming, the block is not loaded).  With both drafters in
     a pack the engine counts the larger room once (one drafter at a time): the block's."""
     plan = (hy4_layouts(hy4_quant_table(quant)).get(fit.get("layout") or HY4_STANDARD) or {}).get("plan") or {}
     return hy4_drafter_need_gib(plan, fit, hy4_mtp_gib(int(fit.get("chunk") or plan.get("chunk") or 1024)))
@@ -10153,7 +10153,7 @@ def set_up_hy4(a, prev: dict) -> Path | None:
     f0 = plain_fit or fit
     usable = float(fit.get("usable") or 0)
     # (the engine loads the block only where its room leaves the start as it is but for the experts' places - the
-    #  cache's rows, the prompt chunk, KV streaming - and counts that room with drafting off too: hy4_mtp_need_gib)
+    #  cache's rows, KV streaming - and counts that room with drafting off too: hy4_mtp_need_gib)
     if quant != HY4_Q4 and hy4_mtp_entry() is not None and how != "dfly2":
         room = hy4_mtp_need_gib(quant, f0)
         if f0["layout"] != HY4_STANDARD:
@@ -10165,7 +10165,7 @@ def set_up_hy4(a, prev: dict) -> Path | None:
                         if f0.get("kv_streaming") else
                         f"({room:.1f} GB with it at this context, {usable:.1f} GB free on this PC's cards)") +
                        ": the engine loads it only where it leaves the rest of the start as it is (the cache's rows, "
-                       "the prompt chunk), so the answers with drafts are those without")
+                       "KV streaming), so the answers with drafts are those without")
             q, used, ram = hy4_quant_table(quant), gpu_used_mib(), mem_gb()[0]
             for c in sorted((c for c in f0.get("contexts") or [] if c < f0["context"]), reverse=True):
                 f = hy4_fit(q, pc["gpus"], c, used=used, layout=f0["layout"], pictures=bool(f0.get("vision", True)),

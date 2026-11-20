@@ -2523,8 +2523,9 @@ head for the drafts' top token in Q4_K - only how often a draft holds depends on
 the same with and without it, and with sampling a draft is kept with the model's probability of it. The VRAM plan
 counts the room of the drafters the pack holds (the MTP block, the DFly2 drafter: the larger one's, as one runs at a
 time) with drafting on and off alike, so turning drafting on or off, or one drafter for the other, moves no expert
-and keeps the answers. Where a drafter's room would change more than that - the cache's rows, the prompt chunk, KV
-streaming, the GPUs' layout - the start leaves it out and says so ("INFO the MTP block is not loaded: ..."), and
+and keeps the answers (a start's own prompt chunk is then the one beside that room). Where a drafter's room would
+change more than that - the cache's rows, the dense prompt span, KV streaming, the GPUs' layout - the start leaves it
+out and says so ("INFO the MTP block is not loaded: ..."), and
 decodes without drafts; `--kv q8` (the 8-bit rows by hand) gives it room on a card where F16 rows and the block do
 not fit together.
 

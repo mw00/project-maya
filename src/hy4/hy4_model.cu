@@ -2986,9 +2986,12 @@ struct Model::Impl {
             // larger one's: draft_plan_bytes) is counted in the plan with drafting on and off alike, with either of
             // them on, so turning drafting on or off, or the one for the other, moves no routed expert between the
             // VRAM and the CPU lane - the answers keep their bits (the drafts are checked token by token: a verify
-            // window's rows are the one-token pass's bits).  Where counting a drafter changes more than the experts'
-            // places - the cache's rows (F16 or 8-bit), the pictures' size, the prompt chunk or span, KV streaming,
-            // the GPUs' layout, or whether the start fits - its room is not counted and it is not loaded: with its
+            // window's rows are the one-token pass's bits).  The prompt chunk an auto start takes is the one beside the
+            // drafters' room, with drafting on and off alike (the block's 3.95 GB is more than a step of the chunk's
+            // buffers: leaving it out for a chunk would take drafting from every card that holds it only beside a
+            // smaller chunk).  Where counting a drafter changes more than that and the experts' places - the cache's
+            // rows (F16 or 8-bit), the pictures' size, the dense prompt span, KV streaming, the GPUs' layout, or
+            // whether the start fits - its room is not counted and it is not loaded: with its
             // drafts the answers would differ from without (an 8 GB card at 8K: the DFly2 drafter's 0.7 GB put the
             // cache in 8-bit rows; the MTP block's 3.95 GB did so on larger cards).  Both first, then the DFly2 drafter
             // alone (the smaller), then none - the same order whichever is asked, so the plan stays the same.  The MTP
@@ -2999,9 +3002,9 @@ struct Model::Impl {
                 bool q8, vision, head, own;
                 long long pixels, kvres;
                 // (not the MTP pass's own scratch under tensor parallel: a part of the block's room, it moves no
-                //  part of the trunk)
+                //  part of the trunk; not the auto chunk: the one beside the drafters' room, on and off)
                 bool same(const Sum& b) const {
-                    return ok == b.ok && tp == b.tp && chunk == b.chunk && span == b.span && q8 == b.q8 &&
+                    return ok == b.ok && tp == b.tp && span == b.span && q8 == b.q8 &&
                            vision == b.vision && head == b.head && pixels == b.pixels && kvres == b.kvres;
                 }
             };
@@ -3014,7 +3017,7 @@ struct Model::Impl {
                        : s1.q8 != s0.q8 ? "beside it the latent cache would be in 8-bit rows (F16 without it)"
                        : s1.vision != s0.vision || s1.pixels != s0.pixels ? "beside it pictures would be read smaller"
                        : s1.kvres != s0.kvres ? "beside it the latent cache would stream from the RAM"
-                       : s1.chunk != s0.chunk || s1.span != s0.span ? "beside it prompts would be read in shorter pieces"
+                       : s1.span != s0.span ? "beside it long prompts would be read on a shorter dense span"
                                                                    : "beside it the GPUs would be shared otherwise";
             };
             int n_gpu = 0;
