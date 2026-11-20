@@ -583,6 +583,11 @@ struct Req {
     // ablate=0|1 (the server's per-request switch, INFO ablate=1): this request's passes project the --ablate direction
     // out or not; -1: as the engine started (--ablate-default).  Without a direction: ignored
     int ablate = -1;
+    // cold=1: the prompt is read from its first token - nothing kept is taken back (the state in the model, its
+    // checkpoints, the conversation slots, a kept shared start); the experts' placement and heat stay as they are.
+    // For measuring a prompt read again (a repeated prompt is otherwise taken back, not read).  One conversation
+    // only; without it, as before
+    bool cold = false;
 };
 
 // A prompt's picture: where its span starts, its pixels (the server's resize: RGB rows, both sides multiples of the
@@ -709,6 +714,7 @@ bool parse_gen(const std::string& line, Req& r, bool geni) {
         else if (k == "think_dig") { for (int x : parse_ids(v)) r.soft_dig.insert(x); }
         else if (k == "rid") r.rid = std::atoll(v.c_str());
         else if (k == "ablate") r.ablate = std::atoi(v.c_str()) != 0;
+        else if (k == "cold") r.cold = std::atoi(v.c_str()) != 0;
         else if (k == "marks") {
             for (int x : parse_ids(v))
                 if (x > 0) r.marks.push_back(x);
@@ -1546,7 +1552,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         // slot_put / prefix_keep, so none is taken back either)
         const bool abl = m.ablate_loaded() && (r.ablate >= 0 ? r.ablate != 0 : abl_default);
         const bool abl_flip = m.ablate_loaded() && abl != m.ablating();
-        if (abl_flip) c = 0;
+        if (abl_flip || r.cold) c = 0;   // (cold=1: nothing shared with the state)
         size_t from = 0;
         bool continued = false;
         // a kept shared start is no conversation: prefix_take leaves it in the model when a prompt that begins with it
@@ -1577,9 +1583,10 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             bool whole = false;
             // (a kept shared start, when it covers more than the state itself can go back to; a kept conversation
             //  only when it covers more than either)
-            const int pi = abl ? -1 : prefix_find(r.ids, pics, rs > 0 ? (size_t) rs : 0);
+            const int pi = abl || r.cold ? -1 : prefix_find(r.ids, pics, rs > 0 ? (size_t) rs : 0);
             const size_t plen = pi >= 0 ? prefixes[(size_t) pi].tokens.size() : 0;
-            const size_t back = abl ? 0 : slot_take(r.ids, pics, std::max(rs > 0 ? (size_t) rs : 0, plen), whole);
+            const size_t back =
+                abl || r.cold ? 0 : slot_take(r.ids, pics, std::max(rs > 0 ? (size_t) rs : 0, plen), whole);
             beat();
             if (back > 0) {
                 from = back;
@@ -1587,7 +1594,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             } else if (pi >= 0 && prefix_take(pi)) {
                 from = plen;
                 held.clear();
-            } else if (rs >= 0 && m.restore(limit))
+            } else if (!r.cold && rs >= 0 && m.restore(limit))
                 from = (size_t) m.pos();
             else m.reset();
         }
@@ -2649,11 +2656,18 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                 settle();
             }, kTurn);
         };
-        // after every event: a STOP of a prompt waiting for its turn (ended now, the conversation before it kept), the
-        // requests ended (their conversations to the requests waiting), then the next turn - or, none running, idle
-        settle = [&] {
+        // the requests the server stopped, ended: a prompt waiting for its turn there (the conversation before it kept)
+        // and - `answers` - an answer before its next token (as round_turn ends it); then every ended request's
+        // conversation given back.  True: one was
+        const auto reap = [&](bool answers) -> bool {
             for (auto& ap : acts)
-                if (ap->reading && !ap->done && in.stopped(ap->r.rid)) read_turn(*ap, 0, false);
+                if (!ap->done && in.stopped(ap->r.rid)) {
+                    if (ap->reading) read_turn(*ap, 0, false);
+                    else if (answers) {
+                        ap->finish = "cancel";
+                        ap->done = true;
+                    }
+                }
             bool freed = false;
             for (size_t i = 0; i < acts.size();) {
                 if (!acts[i]->done) {
@@ -2668,7 +2682,12 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                 freed = true;
             }
             if (freed) end_if_broken();   // (the other conversations' state is the same GPUs': lost with it)
-            if (freed) admit_waiting();
+            return freed;
+        };
+        // after every event: the stopped prompts and the ended requests (their conversations to the requests waiting),
+        // then the next turn - or, none running, idle
+        settle = [&] {
+            if (reap(false)) admit_waiting();
             if (!acts.empty()) {
                 queue_turn();
                 return;
@@ -2692,6 +2711,10 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                 quit = true;
                 in.stop_all.store(true);
             } else if (ln.rfind("GEN ", 0) == 0 || ln.rfind("GENI ", 0) == 0) {
+                // the requests whose STOP came before this line end first: a conversation they held is then idle for
+                // it - often the same conversation sent again after the client gave up on the last one.  Placed
+                // before them, it took another conversation and read its prompt from the shared start (#1057)
+                reap(true);
                 waiting.push_back(ln);
                 admit_waiting();
             } else {

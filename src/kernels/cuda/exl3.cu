@@ -98,13 +98,23 @@ __device__ __forceinline__ uint32_t bytesum_plus(uint32_t x, uint32_t acc) {
 #endif
 }
 
+// codebook 2's two products -> the half2 (0x6400 + bytes of x0, 0x6400 + bytes of x1): on AMD the second byte sum goes
+// straight into the high half (v_sad_hi_u8: its sum << 16 onto the first's 0x6400 + sum : 0x6400) - no mask, no pack,
+// the same bits (a sum of 4 bytes is at most 1020: nothing carries into the high half)
+__device__ __forceinline__ __half2 bytesum2h(uint32_t x0, uint32_t x1) {
+#if defined(STRATA_USE_HIP)
+    const uint32_t pk = __builtin_amdgcn_sad_hi_u8(x1, 0u, __builtin_amdgcn_sad_u8(x0, 0u, 0x64006400u));
+    return *reinterpret_cast<const __half2*>(&pk);
+#else
+    const uint32_t a = bytesum_plus(x0, 0x6400u), b = bytesum_plus(x1, 0x6400u);
+    return __halves2half2(__ushort_as_half((unsigned short) a), __ushort_as_half((unsigned short) b));
+#endif
+}
 // two states -> two values, FP16 arithmetic as exllamav3's decode_3inst_2 (the tensor-core kernels take the half2)
 template <int cb>
 __device__ __forceinline__ __half2 decode2h(uint32_t s0, uint32_t s1) {
     if constexpr (cb == 2) {
-        const uint32_t a = bytesum_plus(s0 * 0x83DCD12Du, 0x6400u);
-        const uint32_t b = bytesum_plus(s1 * 0x83DCD12Du, 0x6400u);
-        const __half2 h = __halves2half2(__ushort_as_half((unsigned short) a), __ushort_as_half((unsigned short) b));
+        const __half2 h = bytesum2h(s0 * 0x83DCD12Du, s1 * 0x83DCD12Du);
         return __hfma2(h, __half2half2(__ushort_as_half(0x1eee)), __half2half2(__ushort_as_half(0xc931)));
     } else {
         uint32_t x0 = cb == 1 ? s0 * 0xCBAC1FEDu : s0 * 89226354u + 64248484u;
@@ -136,8 +146,7 @@ __device__ __forceinline__ void mul_3inst2(uint32_t s0, uint32_t s1, uint32_t& x
 __device__ __forceinline__ __half2 decode2h_pk(uint32_t s0, uint32_t s1) {
     uint32_t x0, x1;
     mul_3inst2(s0, s1, x0, x1);
-    const uint32_t a = bytesum_plus(x0, 0x6400u), b = bytesum_plus(x1, 0x6400u);
-    const __half2 h = __halves2half2(__ushort_as_half((unsigned short) a), __ushort_as_half((unsigned short) b));
+    const __half2 h = bytesum2h(x0, x1);   // (v_sad_hi_u8: no mask, no pack - the same bits)
     return __hfma2(h, __half2half2(__ushort_as_half(0x1eee)), __half2half2(__ushort_as_half(0xc931)));
 }
 #endif
@@ -288,25 +297,64 @@ __device__ __forceinline__ void decode8(const uint32_t* w, int lane, float* v) {
 
 // ---------------------------------------------------------------- the rotation
 // the 128-point transform of the 128 values a warp holds 4 per lane (value lane * 4 + i), over sqrt(128)
+// a lane's value from lane ^ M (32-lane waves): on RDNA (gfx10 and later) in registers - DPP for 1 and 2 (quad_perm)
+// and 4 and 8 (row_xmask), v_permlanex16 for 16 - instead of ds_bpermute's LDS round trip each.  The same value moved,
+// so the same bits.  EXL3_XOR_BPERMUTE: the shuffle, as before
+template <int M>
+__device__ __forceinline__ float xor_lane(float v) {
+#if defined(STRATA_USE_HIP) && !defined(STRATA_HIP_WAVE64) && !defined(EXL3_XOR_BPERMUTE) &&                          \
+    (defined(__GFX10__) || defined(__GFX11__) || defined(__GFX12__))
+    const int x = __builtin_bit_cast(int, v);
+    int r;
+    if constexpr (M == 1) r = __builtin_amdgcn_update_dpp(0, x, 0xB1, 0xF, 0xF, false);         // quad_perm [1,0,3,2]
+    else if constexpr (M == 2) r = __builtin_amdgcn_update_dpp(0, x, 0x4E, 0xF, 0xF, false);    // quad_perm [2,3,0,1]
+    else if constexpr (M == 4) r = __builtin_amdgcn_update_dpp(0, x, 0x164, 0xF, 0xF, false);   // row_xmask:4
+    else if constexpr (M == 8) r = __builtin_amdgcn_update_dpp(0, x, 0x168, 0xF, 0xF, false);   // row_xmask:8
+    else {
+        static_assert(M == 16, "xor_lane: 1, 2, 4, 8 or 16");
+        r = (int) __builtin_amdgcn_permlanex16((unsigned) x, (unsigned) x, 0x76543210u, 0xFEDCBA98u, false, false);
+    }
+    return __builtin_bit_cast(float, r);
+#else
+    return __shfl_xor_sync(0xffffffffu, v, M);
+#endif
+}
+template <int M>
+__device__ __forceinline__ void had_stage(float* v, int lane) {
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const float o = xor_lane<M>(v[i]);
+        v[i] = (lane & M) ? o - v[i] : v[i] + o;
+    }
+}
 __device__ __forceinline__ void had128(float* v, int lane) {
     const float s0 = v[0] + v[1], d0 = v[0] - v[1], s1 = v[2] + v[3], d1 = v[2] - v[3];
     v[0] = s0 + s1;
     v[1] = d0 + d1;
     v[2] = s0 - s1;
     v[3] = d0 - d1;
-#pragma unroll
-    for (int m = 1; m < 32; m <<= 1) {
-#pragma unroll
-        for (int i = 0; i < 4; ++i) {
-            const float o = __shfl_xor_sync(0xffffffffu, v[i], m);
-            v[i] = (lane & m) ? o - v[i] : v[i] + o;
-        }
-    }
+    had_stage<1>(v, lane);
+    had_stage<2>(v, lane);
+    had_stage<4>(v, lane);
+    had_stage<8>(v, lane);
+    had_stage<16>(v, lane);
 #pragma unroll
     for (int i = 0; i < 4; ++i) v[i] *= kHad;
 }
 
 __device__ __forceinline__ float h2f(uint16_t b) { return __half2float(__ushort_as_half(b)); }
+
+// an expert's blob from its address in the plan / group / expert tables (an integer) - on AMD straight into the global
+// address space, then generic: the loads through it stay global (vmcnt).  From a plain integer cast they were flat
+// loads, which count on lgkmcnt too, so every LDS wait of block_gemv's slice loop also waited for the next chunk's tile
+// loads it had issued ahead.  Expert blobs are never LDS or scratch: the same addresses, the same bits
+__device__ __forceinline__ const uint8_t* blob_at(unsigned long long v) {
+#if defined(STRATA_USE_HIP)
+    return (const uint8_t*) (const __attribute__((address_space(1))) uint8_t*) v;
+#else
+    return (const uint8_t*) v;
+#endif
+}
 
 // the activation a warp rotates into its block's FP16 chunks: F32 (f) or the engine's q8_1 blocks (q)
 struct Xin {
@@ -421,7 +469,13 @@ __device__ __forceinline__ void load_tiles(const uint32_t* __restrict__ tile0, s
 #pragma unroll
         for (int r = 0; r < R; ++r) {
             const int i = lane + 32 * r;
+#if defined(STRATA_USE_HIP)
+            // (AMD: every lane loads - a lane past the tile's words its last word again, a value no path reads - so no
+            //  exec mask around each load and no select after it)
+            w[s][r] = __ldg(tile0 + (size_t) s * sstride + ((W % 32 == 0 || i < W) ? i : W - 1));
+#else
             w[s][r] = (W % 32 == 0 || i < W) ? __ldg(tile0 + (size_t) s * sstride + i) : 0u;
+#endif
         }
 }
 
@@ -527,12 +581,25 @@ struct BlockSmem {
     float out[Tokens * kCols];
 };
 
+// the block's warp index - on AMD with 32-lane waves the wave's, read into a scalar register: block_gemv's tile
+// addresses (tc0 + warp) are then the wave's too, a slice's load a scalar base and the lane's word offset instead of a
+// 64-bit vector address each, and `warp < nc` a scalar branch.  The same values: the same bits
+#if defined(STRATA_USE_HIP) && !defined(STRATA_HIP_WAVE64)
+#define EXL3_WARP() __builtin_amdgcn_readfirstlane((int) (threadIdx.x >> 5))
+#else
+#define EXL3_WARP() ((int) (threadIdx.x >> 5))
+#endif
+
+// The next chunk's input is loaded before its tile words: a wave's loads complete in issue order for its waits
+// (vmcnt), so the rotating warp's wait for its input - before the chunk store and the barrier every warp waits at -
+// no longer waits for its 8 slices of tile words too; those are needed only by the products after the barrier.
+// The same loads, the same bits
 // (kTag 1: the mixed kernels' own copy - sharing one with them changes how AMD compiles the others' arithmetic)
 template <int K2, int cb, class Input = Xin, int kTag = 0, int Tokens = kTok>
 __device__ void block_gemv(const uint32_t* __restrict__ tr, int ld, int tc0, int k0, int k1, const Input& x,
                            const uint16_t* __restrict__ suh, int nc, BlockSmem<K2, Tokens>& sm) {
     constexpr int W = Words<K2>::W, R = Words<K2>::R;
-    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, g = lane >> 2, t = lane & 3;
+    const int lane = threadIdx.x & 31, warp = EXL3_WARP(), g = lane >> 2, t = lane & 3;
     const size_t sstride = (size_t) ld * W;
     const uint32_t* tile = tr + ((size_t) (k0 / 16) * ld + tc0 + warp) * W;
     uint32_t* st = sm.stage + warp * W;
@@ -540,8 +607,8 @@ __device__ void block_gemv(const uint32_t* __restrict__ tr, int ld, int tc0, int
     const int nq = (k1 - k0) / kCols;
     uint32_t wc[8][R], wn[8][R];
     float xv[4], xs4[4];
+    if (rot) chunk_load(x, suh, k0, lane, xv, xs4);   // (the input's loads first: block_gemv's note on their order)
     load_tiles<K2>(tile, sstride, lane, wc);
-    if (rot) chunk_load(x, suh, k0, lane, xv, xs4);
 #if defined(EXL3_TC)
     float c[4] = {0.0f, 0.0f, 0.0f, 0.0f};
 #else
@@ -554,8 +621,8 @@ __device__ void block_gemv(const uint32_t* __restrict__ tr, int ld, int tc0, int
         if (rot) chunk_store(xv, xs4, lane, xq + warp * kCols);
         __syncthreads();
         if (q + 1 < nq) {
-            load_tiles<K2>(tile + (size_t) (q + 1) * 8 * sstride, sstride, lane, wn);
             if (rot) chunk_load(x, suh, k0 + (q + 1) * kCols, lane, xv, xs4);
+            load_tiles<K2>(tile + (size_t) (q + 1) * 8 * sstride, sstride, lane, wn);
         }
 #pragma unroll
         for (int s = 0; s < 8; ++s) {
@@ -631,8 +698,8 @@ __device__ void block_gemv(const uint32_t* __restrict__ tr, int ld, int tc0, int
         if (cc < nc) {
 #pragma unroll
             for (int h = 0; h < 2; ++h) {
-                acc[cc][h] += __shfl_xor_sync(0xffffffffu, acc[cc][h], 1);
-                acc[cc][h] += __shfl_xor_sync(0xffffffffu, acc[cc][h], 2);
+                acc[cc][h] += xor_lane<1>(acc[cc][h]);
+                acc[cc][h] += xor_lane<2>(acc[cc][h]);
             }
             if (t == 0) {
                 sm.out[cc * kCols + o] = acc[cc][0];
@@ -896,7 +963,7 @@ __global__ void EXL3_BOUNDS(kMinBlocksX<K2>) moe_gate_up_kernel(const KMoe a) {
     const unsigned long long ptr = a.plan_ptr[ei];
     if (ptr == 0ull) return;
     if (a.skip != nullptr && *a.skip) return;   // a skipped token (set_skip, as mv_kernel)
-    const uint8_t* blob = (const uint8_t*) ptr;
+    const uint8_t* blob = blob_at(ptr);
     const int warp = threadIdx.x >> 5;
     Xin x;
     x.f = a.x;
@@ -935,7 +1002,7 @@ __global__ void EXL3_BOUNDS(kMinBlocksX<K2>) moe_down_kernel(const KMoe a) {
     if (a.dS > 1 && ptr == 0ull) return;        // (moe_down_red_kernel writes its zeros)
 #endif
     if (ptr != 0ull) {
-        const uint8_t* blob = (const uint8_t*) ptr;
+        const uint8_t* blob = blob_at(ptr);
         Xin x;
         x.f = a.h + (size_t) ei * a.n_ff;
 #if defined(EXL3_SEP_DEV)
@@ -1005,9 +1072,9 @@ struct KWin {
 
 // grid (n_ff / 128, groups at most, 2): group blockIdx.y's gate (z 0, into h) or up (z 1, into u) for 128 h values of
 // each of its entries, kTok entries a pass; the pair's second block to finish turns them into the clamped swiglu
-template <int K2, int cb>
+template <int K2, int cb, int Tok = kTok>
 __global__ void EXL3_BOUNDS(kMinBlocksX<K2>) win_gu_kernel(const KWin a) {
-    __shared__ __align__(16) BlockSmem<K2> sm;
+    __shared__ __align__(16) BlockSmem<K2, Tok> sm;
     __shared__ int last;
 #if defined(EXL3_SEP_DEV)
     const int grp = blockIdx.y, g = blockIdx.x, r = (int) blockIdx.z / a.gS, sp = (int) blockIdx.z % a.gS;
@@ -1015,16 +1082,16 @@ __global__ void EXL3_BOUNDS(kMinBlocksX<K2>) win_gu_kernel(const KWin a) {
     const int grp = blockIdx.y, g = blockIdx.x, r = blockIdx.z;
 #endif
     if (grp >= *a.n_groups) return;
-    const uint8_t* blob = (const uint8_t*) a.grp_ptr[grp];
+    const uint8_t* blob = blob_at(a.grp_ptr[grp]);
     const int warp = threadIdx.x >> 5;
     const int m0 = a.grp_start[grp], m1 = a.grp_start[grp + 1];
     float* dst = r == 0 ? a.h : a.u;
-    for (int mm = m0; mm < m1; mm += kTok) {
-        const int nc = min(kTok, m1 - mm);
+    for (int mm = m0; mm < m1; mm += Tok) {
+        const int nc = min(Tok, m1 - mm);
         Xin x;
         if (warp < nc) x.f = a.x + (size_t) (a.grp_ent[mm + warp] >> 3) * a.x_stride;
 #if defined(EXL3_SEP_DEV)
-        block_gemv<K2, cb>((const uint32_t*) (blob + a.tr[r]), a.n_ff / 16, g * 8, sp * a.gkr,
+        block_gemv<K2, cb, Xin, 0, Tok>((const uint32_t*) (blob + a.tr[r]), a.n_ff / 16, g * 8, sp * a.gkr,
                           min(a.n_embd, (sp + 1) * a.gkr), x, (const uint16_t*) (blob + a.suh[r]), nc, sm);
         if (a.gS > 1)   // (win_gu_red_kernel)
             split_store(sm.out, nc, [&](int c) {
@@ -1032,7 +1099,7 @@ __global__ void EXL3_BOUNDS(kMinBlocksX<K2>) win_gu_kernel(const KWin a) {
             });
         else if (warp < nc)
 #else
-        EXL3_DECODE_INLINE block_gemv<K2, cb>((const uint32_t*) (blob + a.tr[r]), a.n_ff / 16, g * 8, 0, a.n_embd, x,
+        EXL3_DECODE_INLINE block_gemv<K2, cb, Xin, 0, Tok>((const uint32_t*) (blob + a.tr[r]), a.n_ff / 16, g * 8, 0, a.n_embd, x,
                                              (const uint16_t*) (blob + a.suh[r]), nc, sm);
         if (warp < nc)
 #endif
@@ -1049,23 +1116,23 @@ __global__ void EXL3_BOUNDS(kMinBlocksX<K2>) win_gu_kernel(const KWin a) {
 }
 
 // grid (n_embd / 128, groups at most): group blockIdx.y's down rows for 128 outputs of each entry into its part rows
-template <int K2, int cb>
+template <int K2, int cb, int Tok = kTok>
 __global__ void EXL3_BOUNDS(kMinBlocksX<K2>) win_down_kernel(const KWin a) {
-    __shared__ __align__(16) BlockSmem<K2> sm;
+    __shared__ __align__(16) BlockSmem<K2, Tok> sm;
     const int grp = blockIdx.y, g = blockIdx.x;
 #if defined(EXL3_SEP_DEV)
     const int sp = blockIdx.z;
 #endif
     if (grp >= *a.n_groups) return;
-    const uint8_t* blob = (const uint8_t*) a.grp_ptr[grp];
+    const uint8_t* blob = blob_at(a.grp_ptr[grp]);
     const int warp = threadIdx.x >> 5;
     const int m0 = a.grp_start[grp], m1 = a.grp_start[grp + 1];
-    for (int mm = m0; mm < m1; mm += kTok) {
-        const int nc = min(kTok, m1 - mm);
+    for (int mm = m0; mm < m1; mm += Tok) {
+        const int nc = min(Tok, m1 - mm);
         Xin x;
         if (warp < nc) x.f = a.h + (size_t) a.grp_ent[mm + warp] * a.n_ff;
 #if defined(EXL3_SEP_DEV)
-        block_gemv<K2, cb>((const uint32_t*) (blob + a.tr[2]), a.n_embd / 16, g * 8, sp * a.dkr,
+        block_gemv<K2, cb, Xin, 0, Tok>((const uint32_t*) (blob + a.tr[2]), a.n_embd / 16, g * 8, sp * a.dkr,
                           min(a.n_ff, (sp + 1) * a.dkr), x, (const uint16_t*) (blob + a.suh[2]), nc, sm);
         if (a.dS > 1)   // (win_down_red_kernel)
             split_store(sm.out, nc, [&](int c) {
@@ -1073,7 +1140,7 @@ __global__ void EXL3_BOUNDS(kMinBlocksX<K2>) win_down_kernel(const KWin a) {
             });
         else if (warp < nc)
 #else
-        EXL3_DECODE_INLINE block_gemv<K2, cb>((const uint32_t*) (blob + a.tr[2]), a.n_embd / 16, g * 8, 0, a.n_ff, x,
+        EXL3_DECODE_INLINE block_gemv<K2, cb, Xin, 0, Tok>((const uint32_t*) (blob + a.tr[2]), a.n_embd / 16, g * 8, 0, a.n_ff, x,
                                              (const uint16_t*) (blob + a.suh[2]), nc, sm);
         if (warp < nc)
 #endif
@@ -1165,7 +1232,7 @@ __global__ void __launch_bounds__(kCols) moe_gu_red_kernel(const KMoe a) {
         red[r][threadIdx.x] =
             split_sum(a.xp + ((size_t) ei * 2 + r) * a.gS * a.n_ff + g * kCols + threadIdx.x, a.gS, a.n_ff);
     __syncthreads();
-    const uint8_t* blob = (const uint8_t*) ptr;
+    const uint8_t* blob = blob_at(ptr);
     if (warp < 2)
         block_out(red[warp], (const uint16_t*) (blob + a.svh[warp]) + g * kCols,
                   (warp == 0 ? a.h : a.u) + (size_t) ei * a.n_ff + g * kCols);
@@ -1183,14 +1250,14 @@ __global__ void __launch_bounds__(kCols) moe_down_red_kernel(const KMoe a) {
     }
     red[threadIdx.x] = split_sum(a.xp + (size_t) ei * a.dS * a.n_embd + g * kCols + threadIdx.x, a.dS, a.n_embd);
     __syncthreads();
-    if (threadIdx.x < 32) block_out(red, (const uint16_t*) ((const uint8_t*) ptr + a.svh[2]) + g * kCols, part);
+    if (threadIdx.x < 32) block_out(red, (const uint16_t*) (blob_at(ptr) + a.svh[2]) + g * kCols, part);
 }
 // grid (n_ff / 128, groups at most): win_gu_kernel's, each entry of the group
 __global__ void __launch_bounds__(kCols) win_gu_red_kernel(const KWin a) {
     __shared__ float red[2][kCols];
     const int grp = blockIdx.y, g = blockIdx.x, warp = threadIdx.x >> 5;
     if (grp >= *a.n_groups) return;
-    const uint8_t* blob = (const uint8_t*) a.grp_ptr[grp];
+    const uint8_t* blob = blob_at(a.grp_ptr[grp]);
     for (int m = a.grp_start[grp]; m < a.grp_start[grp + 1]; ++m) {
         const size_t e = (size_t) a.grp_ent[m];
         for (int r = 0; r < 2; ++r)
@@ -1207,7 +1274,7 @@ __global__ void __launch_bounds__(kCols) win_down_red_kernel(const KWin a) {
     __shared__ float red[kCols];
     const int grp = blockIdx.y, g = blockIdx.x;
     if (grp >= *a.n_groups) return;
-    const uint8_t* blob = (const uint8_t*) a.grp_ptr[grp];
+    const uint8_t* blob = blob_at(a.grp_ptr[grp]);
     for (int m = a.grp_start[grp]; m < a.grp_start[grp + 1]; ++m) {
         const size_t e = (size_t) a.grp_ent[m];
         red[threadIdx.x] = split_sum(a.xp + e * a.dS * a.n_embd + g * kCols + threadIdx.x, a.dS, a.n_embd);
@@ -1280,7 +1347,7 @@ __global__ void EXL3_BOUNDS(2) moe_gate_up_mix_kernel(const KMoe a, const KMix m
     if (ptr == 0ull) return;
     if (a.skip != nullptr && *a.skip) return;
     const int c = mix_cls(mx, ptr), k2 = mx.k2[c][r];
-    const uint8_t* blob = (const uint8_t*) ptr;
+    const uint8_t* blob = blob_at(ptr);
     const int warp = threadIdx.x >> 5;
     Xin x;
     x.f = a.x;
@@ -1306,7 +1373,7 @@ __global__ void EXL3_BOUNDS(2) moe_down_mix_kernel(const KMoe a, const KMix mx) 
     if (a.skip != nullptr && *a.skip) return;
     if (ptr != 0ull) {
         const int c = mix_cls(mx, ptr), k2 = mx.k2[c][2];
-        const uint8_t* blob = (const uint8_t*) ptr;
+        const uint8_t* blob = blob_at(ptr);
         Xin x;
         x.f = a.h + (size_t) ei * a.n_ff;
         mix_gemv<cb>(k2, (const uint32_t*) (blob + mx.tr[c][2]), a.n_embd / 16, g * 8, 0, a.n_ff, x,
@@ -1343,7 +1410,7 @@ __global__ void EXL3_BOUNDS(2) win_gu_mix_kernel(const KWin a, const KMix mx) {
     if (grp >= *a.n_groups) return;
     const unsigned long long ptr = a.grp_ptr[grp];
     const int c = mix_cls(mx, ptr), k2 = mx.k2[c][r];
-    const uint8_t* blob = (const uint8_t*) ptr;
+    const uint8_t* blob = blob_at(ptr);
     const int warp = threadIdx.x >> 5;
     const int m0 = a.grp_start[grp], m1 = a.grp_start[grp + 1];
     float* dst = r == 0 ? a.h : a.u;
@@ -1372,7 +1439,7 @@ __global__ void EXL3_BOUNDS(2) win_down_mix_kernel(const KWin a, const KMix mx) 
     if (grp >= *a.n_groups) return;
     const unsigned long long ptr = a.grp_ptr[grp];
     const int c = mix_cls(mx, ptr), k2 = mx.k2[c][2];
-    const uint8_t* blob = (const uint8_t*) ptr;
+    const uint8_t* blob = blob_at(ptr);
     const int warp = threadIdx.x >> 5;
     const int m0 = a.grp_start[grp], m1 = a.grp_start[grp + 1];
     for (int mm = m0; mm < m1; mm += kTok) {
@@ -1844,9 +1911,9 @@ __device__ void hip_scalar_gemv(const uint32_t* __restrict__ tr, int ld, int tc0
     const int nq = (k1 - k0) / kCols;
     uint32_t wc[8][R], wn[8][R];
     float xv[(NR + 7) / 8][4], xs4[(NR + 7) / 8][4];
-    load_tiles<K2>(tile, sstride, lane, wc);
-    for (int j = 0; j < (NR + 7) / 8; ++j)
+    for (int j = 0; j < (NR + 7) / 8; ++j)   // (the input's loads first: block_gemv's note on their order)
         if (warp + j * 8 < nc) chunk_load(x[j], suh, k0, lane, xv[j], xs4[j]);
+    load_tiles<K2>(tile, sstride, lane, wc);
     float acc[NR][2];
 #pragma unroll
     for (int cc = 0; cc < NR; ++cc) acc[cc][0] = acc[cc][1] = 0.0f;
@@ -1857,9 +1924,9 @@ __device__ void hip_scalar_gemv(const uint32_t* __restrict__ tr, int ld, int tc0
             if (warp + j * 8 < nc) chunk_store(xv[j], xs4[j], lane, xq + (warp + j * 8) * kCols);
         __syncthreads();
         if (q + 1 < nq) {
-            load_tiles<K2>(tile + (size_t) (q + 1) * 8 * sstride, sstride, lane, wn);
             for (int j = 0; j < (NR + 7) / 8; ++j)
                 if (warp + j * 8 < nc) chunk_load(x[j], suh, k0 + (q + 1) * kCols, lane, xv[j], xs4[j]);
+            load_tiles<K2>(tile + (size_t) (q + 1) * 8 * sstride, sstride, lane, wn);
         }
 #pragma unroll
         for (int s = 0; s < 8; ++s) {
@@ -1907,8 +1974,8 @@ __device__ void hip_scalar_gemv(const uint32_t* __restrict__ tr, int ld, int tc0
         if (cc < nc) {
 #pragma unroll
             for (int h = 0; h < 2; ++h) {
-                acc[cc][h] += __shfl_xor_sync(0xffffffffu, acc[cc][h], 1);
-                acc[cc][h] += __shfl_xor_sync(0xffffffffu, acc[cc][h], 2);
+                acc[cc][h] += xor_lane<1>(acc[cc][h]);
+                acc[cc][h] += xor_lane<2>(acc[cc][h]);
             }
             if (t == 0) {
                 sm.out[cc * kCols + o] = acc[cc][0];
@@ -2001,7 +2068,7 @@ __global__ void __launch_bounds__(kThreads) set_mix_kernel(const KSetMix a, KMix
     const int nc = min(kTok, end - start - (int) blockIdx.x * kTok);
     if (nc <= 0) return;
     const unsigned long long ptr = a.eptr[e];
-    const uint8_t* blob = (const uint8_t*) ptr;
+    const uint8_t* blob = blob_at(ptr);
     const int c = mix_cls(mx, ptr);
     if constexpr (gate_up) {
         Xin in;
@@ -2529,7 +2596,7 @@ __global__ void __launch_bounds__(kThreads) wmma_set_mix_kernel(SetArgs a, KMix 
     const int nc = min(NR, end - start - (int) blockIdx.x * NR);
     if (nc <= 0) return;
     const unsigned long long ptr = a.eptr[e];
-    const uint8_t* blob = (const uint8_t*) ptr;
+    const uint8_t* blob = blob_at(ptr);
     const int c = mix_cls(mx, ptr);
     auto gemm = [&](int r, const auto& in) -> const float* {
         const int ld = r < 2 ? a.n_ff / 16 : a.n_embd / 16, k1 = r < 2 ? a.n_embd : a.n_ff;
@@ -2687,16 +2754,32 @@ template <int K2, int cb> struct RunMv {
 #define EXL3_XS(n) 1u
 #define EXL3_XS_RED(on, kernel, grid, a, s) (void) 0
 #endif
+// (HIP) a window's groups hold at most its T entries: blocks sized for 2 or 4 activations when T is that small - the
+// unrolled per-activation code and its registers for 8 go unused otherwise (the same arithmetic each, the same bits)
+template <int K2, int cb, class F> void win_tok(int T, F&& f) {
+#if defined(STRATA_USE_HIP)
+    if (T <= 2) return f(std::integral_constant<int, 2>{});
+    if (T <= 4) return f(std::integral_constant<int, 4>{});
+#endif
+    (void) T;
+    f(std::integral_constant<int, kTok>{});
+}
 template <int K2, int cb> struct RunWin {
     static void run(const KWin& a, int groups, cudaStream_t s) {
-        win_gu_kernel<K2, cb><<<dim3((unsigned) (a.n_ff / kCols), (unsigned) groups, 2u * EXL3_XS(a.gS)), kThreads, 0, s>>>(a);
+        win_tok<K2, cb>(groups / a.k, [&](auto tk) {
+            win_gu_kernel<K2, cb, decltype(tk)::value>
+                <<<dim3((unsigned) (a.n_ff / kCols), (unsigned) groups, 2u * EXL3_XS(a.gS)), kThreads, 0, s>>>(a);
+        });
         EXL3_XS_RED(a.gS > 1, win_gu_red_kernel, dim3((unsigned) (a.n_ff / kCols), (unsigned) groups), a, s);
         EXL3_WIN_SWIGLU(a, groups, s);
     }
 };
 template <int K2, int cb> struct RunWinDown {
     static void run(const KWin& a, int groups, cudaStream_t s) {
-        win_down_kernel<K2, cb><<<dim3((unsigned) (a.n_embd / kCols), (unsigned) groups, EXL3_XS((unsigned) a.dS)), kThreads, 0, s>>>(a);
+        win_tok<K2, cb>(groups / a.k, [&](auto tk) {
+            win_down_kernel<K2, cb, decltype(tk)::value>
+                <<<dim3((unsigned) (a.n_embd / kCols), (unsigned) groups, EXL3_XS((unsigned) a.dS)), kThreads, 0, s>>>(a);
+        });
         EXL3_XS_RED(a.dS > 1, win_down_red_kernel, dim3((unsigned) (a.n_embd / kCols), (unsigned) groups), a, s);
     }
 };

@@ -60,11 +60,11 @@ git clone https://github.com/mw00/project-maya.git && cd project-maya
 | | Maya-XS (v2) · `deepseek-maya-xs` | 277 GB | 整个模型装进 128 GB 电脑的内存 (Engram 表留在固态硬盘上)；v2 比 v1 更接近原版约 12%，写作速度快约 20% - 再次运行安装程序会提示更新 |
 | **[MiniMax-M3.1-Flash](https://huggingface.co/MiniMaxAI/MiniMax-M3.1-Flash)**<br><sub>MiniMax · [MiniMax Community License](LICENSE.minimax-m31) · 428 B，激活 23 B · 最高 1M 上下文</sub> | Maya-XS · `minimax-maya-xs` | 93 GB | 整个模型装进 128 GB 电脑的内存 |
 | | Maya-S · `minimax-maya-s` | 122 GB | 更接近原版 |
-| **[Hy4-Flash](https://huggingface.co/tencent/Hy4-flash)**<br><sub>腾讯 · [Tencent Hy License](LICENSE.hy4-flash) · 220 B · 支持图片 · NVIDIA、AMD (Linux)</sub> | Maya-XS · `hy4-flash-maya-xs` | 44.8 GB + 63.4 GB 的 n-gram 表 | 内存与显存合计约 56-64 GB 的电脑，8 GB 及以上的显卡；n-gram 表留在固态硬盘上；更多大小陆续提供 |
+| **[Hy4-Flash](https://huggingface.co/tencent/Hy4-flash)**<br><sub>腾讯 · [Tencent Hy License](LICENSE.hy4-flash) · 220 B · 最长 1M 上下文 · 支持图片 · NVIDIA、AMD (Linux)</sub> | Maya-XS · `hy4-flash-maya-xs`<br>Maya-S · `hy4-flash-maya-s`<br>Maya-M · `hy4-flash-maya-m`<br>Maya-L · `hy4-flash-maya-l` | 44.8 GB<br>53.0 GB<br>68.4 GB<br>89.5 GB<br>各加一个共用的 63.4 GB n-gram 表 | 内存与显存合计约 56-64 GB (Maya-XS，8 GB 及以上的显卡)、68-80 GB (Maya-S)、80-96 GB (Maya-M) 或 104-128 GB (Maya-L) 的电脑；Maya-S、Maya-M 和 Maya-L 需要 12 GB 及以上的显卡；n-gram 表留在固态硬盘上 |
 
 **哪个模型适合你的电脑？** 请看 [docs/MEMORY.md](docs/MEMORY.md)，里面有每个模型的推荐内存（VRAM 与 RAM 合计）。
 
-它们都能在 V100 / RTX 20 及更新的 NVIDIA 显卡上运行，也支持 AMD 和 Windows (见[你需要什么](#what-you-need))；Hy4-Flash 支持 NVIDIA (Linux 和 Windows) 以及 Linux 上的 AMD (Strix Halo / Gorgon Halo、Radeon 显卡)，在显存有余量的显卡上可读取图片 (8 GB 显卡仅文本)。DeepSeek 的大小包含其 Engram 表。安装程序还提供 unsloth 的 GGUF、turboderp 和 LibertAIDAI 的 DeepSeek EXL3 量化、orcarouter 的 abliterated DeepSeek、Mia-AiLab 的 MiniMax EXL3 量化、turboderp 的 GLM EXL3 量化，以 Q5_K_M GGUF 提供的 Qwen-3.8-Flash-Next (CYBER-FROST)，以及以 unsloth 的 UD-IQ2_XS GGUF 提供的 Qwen-3.8-Flash-Next 本身 (两者都支持图片) ([其设置](docs/SETTINGS.md#qwen-38-flash-next-cyber-frost))。**每个模型的文件、草稿模型、图片和选项：[docs/MODELS.md](docs/MODELS.md)。**
+它们都能在 V100 / RTX 20 及更新的 NVIDIA 显卡上运行，也支持 AMD 和 Windows (见[你需要什么](#what-you-need))；Hy4-Flash 支持 NVIDIA (Linux 和 Windows) 以及 Linux 上的 AMD (Strix Halo / Gorgon Halo、Radeon 显卡)，在能运行它的每块显卡上都能读取图片 (包括 8 GB 显卡)。DeepSeek 的大小包含其 Engram 表。安装程序还提供 unsloth 的 GGUF、turboderp 和 LibertAIDAI 的 DeepSeek EXL3 量化、orcarouter 的 abliterated DeepSeek、Mia-AiLab 的 MiniMax EXL3 量化、turboderp 的 GLM EXL3 量化，以 Q5_K_M GGUF 提供的 Qwen-3.8-Flash-Next (CYBER-FROST)，以及以 unsloth 的 UD-IQ2_XS GGUF 提供的 Qwen-3.8-Flash-Next 本身 (两者都支持图片) ([其设置](docs/SETTINGS.md#qwen-38-flash-next-cyber-frost))。**每个模型的文件、草稿模型、图片和选项：[docs/MODELS.md](docs/MODELS.md)。**
 
 ## <a name="quality"></a>质量
 
@@ -73,6 +73,7 @@ Maya 的量化版本由各模型公开发布的权重制作，并与原版对比
 - **GLM-5.3-Flash · Maya 量化**保留了 FP8 模型零样本准确率的 97.7-99.2%，下一个 token 与原版一致的比例为 83-90% (Maya-L：99.2%，90%)。制作与测量方法：[MAYA-S](bench/results/MAYA-S.md)、[MAYA-S24](bench/results/MAYA-S24.md)、[MAYA-M](bench/results/MAYA-M.md)、[MAYA-L](bench/results/MAYA-L.md)。
 - **DeepSeek V4.1 · Maya-S** 与原版选择相同下一个 token 的概率为 92.6%。
 - **MiniMax M3.1 · Maya-S** 为 87.6% (各类别平均值)。
+- **Hy4-Flash · Maya 量化** 为 88.5% (Maya-XS) 到 96.6% (Maya-L)，KL 散度从 0.16 降到 0.012；与腾讯自己的 GGUF 的对比图见[模型卡](https://huggingface.co/peasantsmith/Hy4-Flash-Maya-GGUF)。
 
 更多内容见各模型在 [Hugging Face](https://huggingface.co/peasantsmith) 上的模型卡。
 
@@ -207,6 +208,15 @@ Maya 的量化版本由各模型公开发布的权重制作，并与原版对比
 
 </details>
 
+<details><summary><b>Hy4-Flash 速度基准</b></summary>
+
+| 机器 | 模型 | 解码 (写出回答) | 预填充 (读取提示) | 提交者 |
+| --- | --- | ---: | ---: | --- |
+| **3x Tesla V100 32 GB** (各 PCIe 3.0 x16)、2x Xeon Gold 6138、183 GB 内存 | Maya-XS / Maya-S，32K 上下文，MTP 草稿 | **88.7 / 84.2 tokens/s** | 1607 / 1566 tokens/s | 维护者 (v1.1.68) |
+| **3x RX 7900 XTX 24 GB** (PCIe 3.0 x8/x16/x8)、i9-10980XE、188 GB 内存、Linux | Maya-S，32K 上下文，3 卡张量并行 | 43.9-48.2 tokens/s | 1053 tokens/s | @Antero128 (v1.1.68, #1055) |
+
+</details>
+
 一个 token 约等于 ¾ 个英文单词。随着对话变长，速度保持不变；启动后的最初几次回答最慢，因为缓存还在根据你的使用内容逐步填充。
 
 ## <a name="using-it"></a>使用方式
@@ -220,7 +230,7 @@ Maya 的量化版本由各模型公开发布的权重制作，并与原版对比
 - **模型 API：** `/api/tags`、`/api/ps`、`/api/show`、`/api/chat`、`/api/generate`、`/api/pull` 和 `/api/delete` 可让任何应用或脚本列出、加载、下载和删除模型。请求一个尚未加载的模型会切换到它，`keep_alive` 会在空闲时卸载它。`/models/load`、`/models/unload` 和 `/models/sse` 也默认开启 (`"model_management": false` 可关闭)。
 - **思考：** Off、Low、High (默认) 或 Max，可在设置中或按请求指定；还有一个**思考预算**字段，设置模型在回答前最多可以思考多少个 token。
 - **循环防护：** 默认开启 - 当智能体用同样的结果反复发出同一个工具调用时，会被引导走出循环。
-- **图片：** 在聊天中附加，或通过任一 API 发送图片内容。除 GLM-5.3 仅文本外，每个模型都能读取图片 (Hy4-Flash 在 8 GB 显卡上仅文本) (各模型的安装细节：[docs/MODELS.md](docs/MODELS.md))。
+- **图片：** 在聊天中附加，或通过任一 API 发送图片内容。除 GLM-5.3 仅文本外，每个模型都能读取图片 (各模型的安装细节：[docs/MODELS.md](docs/MODELS.md))。
 - **MCP 工具：** 在配置中列出 MCP 服务器 (`"mcp_servers"`；Claude Desktop 的 `mcpServers` 块可原样使用)，网页聊天中的模型就能调用它们的工具。聊天的 **+** 菜单里有开关。具体行为见 [serve/mcp.py](serve/mcp.py)。
 - **Docker：** 没有官方镜像。[docs/DOCKER.md](docs/DOCKER.md) 是基于某个发布版本构建镜像的方法。
 - **从其他设备访问：** `./maya.sh --setup --host 0.0.0.0 --api-key <secret>`。务必设置密钥。
@@ -231,7 +241,7 @@ Maya 的量化版本由各模型公开发布的权重制作，并与原版对比
 
 | | |
 | --- | --- |
-| **GPU** | NVIDIA，计算能力 7.0 或更高 (V100、RTX 20 及更新)：1 块，或最多 16 块共同承载模型。显存越大越快。Pascal (Tesla P40 / P100、GTX 10) 为实验性，尚未验证。**AMD：** RX 7900 XT / XTX、Radeon AI PRO R9700 / RX 9070、Strix Halo 和 Gorgon Halo (Radeon 8060S / 8065S)；RX 6800 / 6900 和 Radeon PRO V620 / W6800 尚未验证；GLM-5.3-Flash 和 DeepSeek-V4.1-Flash-1017 在 AMD 上也能读取图片 - [docs/AMD_MAYA.md](docs/AMD_MAYA.md) |
+| **GPU** | NVIDIA，计算能力 7.0 或更高 (V100、RTX 20 及更新)：1 块，或最多 16 块共同承载模型。显存越大越快。Pascal (Tesla P40 / P100、GTX 10) 为实验性，尚未验证。**AMD：** RX 7900 XT / XTX、Radeon AI PRO R9700 / RX 9070、Strix Halo 和 Gorgon Halo (Radeon 8060S / 8065S)；RX 6800 / 6900 和 Radeon PRO V620 / W6800 尚未验证；GLM-5.3-Flash、DeepSeek-V4.1-Flash-1017 和 Hy4-Flash 在 AMD 上也能读取图片 - [docs/AMD_MAYA.md](docs/AMD_MAYA.md) |
 | **内存** | 32 GB 即可运行。内存越多，能让更多专家就近存放，速度也越快 |
 | **磁盘** | **一块高速 NVMe 固态硬盘**，空间足够放下模型 (GLM-5.3-Flash · Maya-XS 约 75 GB、GLM-5.3-Flash · Maya-S 约 100 GB、GLM-5.3-Flash · Maya-L 约 160 GB、DeepSeek V4.1 · Maya-S 约 350 GB、其 unsloth Q8 GGUF 约 470 GB、MiniMax M3.1 · Maya-XS 约 95 GB、Hy4-Flash · Maya-XS 约 110 GB、MiniMax-M3.1-Flash 的 EXL3 量化约 200 GB)，外加它的图片编码器 (1.1 GB)。不能用机械硬盘 |
 | **系统** | Linux (x86-64；最好带 AVX2 的 CPU)、NVIDIA 驱动、CUDA 12.x (CUDA 13 适用于 RTX 20 及更新，不适用于 V100 或 Pascal)、g++、Python 3.10+。Windows 10/11：[docs/WINDOWS.md](docs/WINDOWS.md)。不支持 WSL2。AMD：ROCm 7 |

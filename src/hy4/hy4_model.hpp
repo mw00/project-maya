@@ -38,13 +38,26 @@ struct Options {
     std::string profile;          // an expert profile (uint32 [layers][experts] routings): the most routed in VRAM
     std::string profile_out;      // where save_profile writes it (the read one's counts with this run's)
     bool mtp = false;             // load the MTP block (the GGUF's nextn layer, its BF16 rounded to Q8_0) for drafts
+    bool dfly2 = false;           // load the DFly2 drafter (the pack's model.dfly_layers.* tensors) for drafts: a few
+                                  // dense layers over the trunk's own caches, several tokens a pass (not with mtp)
     std::vector<int> layer_split; // the first layer of each GPU after the first (empty: fill each GPU in turn)
     int kv = -1;                  // the latent cache's rows: 0 F16, 1 8-bit (the latent int8 in blocks of 32 with F16
                                   // scales, the rotated part F16; the indexer's rows F16: about 58% of the VRAM), -1
                                   // auto - F16 where the context fits in VRAM with it, 8-bit rows where it fits
                                   // only with them (any layout: one GPU, the layer split, tensor parallel)
-    bool vision = true;           // the vision tower (the pack's mmproj file) on the main GPU, its room kept free there
+    int kv_streaming = 0;         // KV streaming: 0 off, 1 on, -1 auto - on only where the context does not fit in the
+                                  // VRAM without it (after 8-bit rows and no picture's room: a start that failed
+                                  // before) and the RAM holds the rows; kv_resident then the ring tried first
+    int64_t kv_resident = 0;      // KV streaming: the indexed layers' cache rows kept in VRAM - a ring of the newest
+                                  // positions (a chunk's at least); every position's row in pinned host memory, the
+                                  // picked rows outside the ring read from there (the same bits: the same answers).
+                                  // 0: off - every row in VRAM.  Off as well where the context is no larger
+                                  // than the ring.
+    bool vision = true;           // the vision tower (the pack's mmproj file) on the main GPU: a picture's room is lent by
+                                  // the prompt buffers while it is read (made longer by what they lack of it, if anything)
     bool vision_auto = true;      // (not asked for by name: a pack without one runs text only, no error)
+    bool room_report = false;     // --room-report: say how much less free VRAM each GPU could have had with this start's
+                                  // choices unchanged (Model::room_report; the plan only - the start is the same)
     bool verbose = false;
 };
 
@@ -75,11 +88,24 @@ public:
     /// before it), each MTP step's top token and its probability, stopping after one below `floor`.  A forward keeps
     /// the block's caches in step with the trunk's (every forward runs it over its tokens), so the drafts after an
     /// accepted prefix need nothing else.  has_mtp(): the block is loaded.
+    /// (base >= 0: the drafts after the first `base` only while every draft so far has a probability of at least `sure`)
     bool draft(int tok, int64_t pos, int n, float floor, std::vector<int>& drafts, std::vector<float>& conf,
-               std::string& err);
+               std::string& err, int base = -1, float sure = 0.0f);
     bool has_mtp() const;
-    /// The routings counted (with the profile read at the load) to Options::profile_out; no file named: nothing
+    /// The DFly2 drafter is loaded (Options::dfly2): draft() is then its pass - up to n tokens after `tok` from one
+    /// pass over the trunk's caches (nothing to keep in step: a forward leaves it what it needs).  has_draft(): either
+    /// drafter; draft_default(): the drafts a round the loaded one is made for (3: the MTP block; the drafter's own
+    /// count), draft_max() the most a round takes.
+    bool has_dfly2() const;
+    bool has_draft() const { return has_mtp() || has_dfly2(); }
+    int draft_default() const;
+    int draft_max() const;
+    /// The routings counted (with the profile read at the load) to Options::profile_out; no file named: nothing.
+    /// HY4_HOT=1: its experts' scores to its file as well
     bool save_profile(std::string& err) const;
+    /// Between requests: HY4_HOT=1's larger round of swaps (the experts in VRAM following the answers' routing);
+    /// nothing without it
+    void idle();
     /// Page-lock a host buffer the logits go to (the copies then run at the link's speed, not through the driver's
     /// staging); unpin it before it is freed.  false: left as it was
     static bool pin(void* p, size_t bytes);
@@ -90,6 +116,10 @@ public:
     int64_t end() const;
 
     int vocab() const;
+    /// Row r of the last forward's logits: its largest value's index (of equals the lowest - the host's argmax), found
+    /// by the GPUs that computed the row's parts (tensor parallel with the head over the members); -1: not known, the
+    /// caller's own walk over the row
+    int row_top(int r) const;
     int64_t max_ctx() const;
     /// the most tokens a forward reads at once (the prompt path's chunk): a prompt in calls of this many reports its
     /// progress between them
@@ -97,6 +127,11 @@ public:
     int eos() const;
     const Stats& stats() const;
     std::vector<std::string> info_lines() const;
+    /// --room-report's measurement, the server's INFO keys (empty: not asked, or the start did not fit):
+    /// "room_rows=f16|q8 room_drafter=0|1 room_streamed=0|1 room_gpus=<PCI bus id>,<free>,<slack>;..." - each GPU's
+    /// free VRAM as the plan read it at the start (bytes) and how much less of it the start's choices hold with: the
+    /// latent cache's rows, KV streaming, the drafter's room, the pictures, the GPUs' layout, that it starts at all
+    std::string room_report() const;
 
     /// Pictures (Options::vision): the tower's geometry (nullptr: none loaded); a picture's rows, F32 [tokens][n_embd]
     /// (VisionGeo::tokens of them); and the request's pictures - each one's image tokens, the positions start ..
@@ -107,6 +142,12 @@ public:
         std::vector<float> rows;
     };
     const VisionGeo* vision() const;
+    /// Where a picture's room comes from: "chunk" - lent by the head GPU's prompt buffers (idle while a picture is
+    /// read; no VRAM kept for pictures), "free" - kept free between pictures (HY4_VISION_LEND=0);
+    /// nullptr: no tower.  Its bytes for the largest picture this start reads; the pictures read so far each way.
+    const char* vision_room() const;
+    size_t vision_room_bytes() const;
+    void vision_reads(long long& lent, long long& own) const;
     bool encode_image(const uint8_t* rgb, int width, int height, std::vector<float>& rows, std::string& err);
     void set_images(std::vector<Image> images);
 

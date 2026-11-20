@@ -7,6 +7,7 @@ engine, no GPU.
 from __future__ import annotations
 
 import contextlib
+import io
 import json
 import os
 import sys
@@ -102,8 +103,12 @@ class Settings(unittest.TestCase):
         # (Hy4-Flash's cards: 1 GB or more in use on each - the most the setup counts - unless a test reads its own)
         self.used = mock.patch.object(M, "hy4_used", side_effect=lambda gpus: {i: 1024 for i in gpus})
         self.used.start()
+        # (... and no RAM figure - the VRAM alone, no KV streaming - unless a test gives one)
+        self.ram = mock.patch.object(M, "hy4_ram_gb", return_value=None)
+        self.ram.start()
 
     def tearDown(self):
+        self.ram.stop()
         self.used.stop()
         self.tmp.cleanup()
 
@@ -320,7 +325,7 @@ class Settings(unittest.TestCase):
         self.assertEqual(M.family({"exe": "C:/b/maya-hy4.exe", "args": ["--pack", "/p"]}), "hy4")   # (no installer)
         self.assertEqual(M.settings_of(cfg), {"context": 32768, "gpus": [0, 1], "env": {}, "ablate": False,
                                               "images": False, "draft": "none", "tp": "auto", "cpu_threads": 12,
-                                              "reserve_gb": 0.5, "prefill_chunk": 256})
+                                              "reserve_gb": 0.5, "prefill_chunk": 256, "kv": "auto"})
         self.assertEqual(M.choices(cfg), {"draft": ["none"], "images": False,
                                           "ablate": {"available": False, "why": "not available for this model"}})
         self.assertEqual(M.quant_label(cfg, Path("maya-hy4-flash-maya-xs.json")), "Maya-XS")
@@ -344,11 +349,23 @@ class Settings(unittest.TestCase):
         self.assertEqual((one["gpu"], "--gpus" in one["args"]), ([1], False))
         three = M.apply(cfg, {"gpus": [0, 2, 3]})
         self.assertEqual((three["gpu"], M.flag(three["args"], "--gpus")), ([0, 2, 3], "0,1,2"))
+        # KV cache: auto (no flag, the default) or 8-bit rows (--kv q8: the setup's opt-in faster drafting) - another
+        # setting left as it is; a config's own --kv f16 stays offered, other formats are refused
+        q8 = M.apply(cfg, {"kv": "q8"})
+        self.assertEqual((M.flag(q8["args"], "--kv"), M.settings_of(q8)["kv"]), ("q8", "q8"))
+        self.assertEqual([x for x in q8["args"] if x not in ("--kv", "q8")], before)
+        self.assertEqual(M.apply(M.apply(q8, {"draft": "none"}), {})["args"], q8["args"])   # (drafting: rows kept)
+        self.assertEqual(M.apply(q8, {"kv": "auto"})["args"], before)
+        f16 = {**cfg, "args": before + ["--kv", "f16"]}
+        self.assertEqual(M.flag(M.apply(f16, M.settings_of(f16))["args"], "--kv"), "f16")
+        for bad in ("f16", "int8"):
+            with self.assertRaisesRegex(ValueError, "KV cache: auto or 8-bit"):
+                M.apply(cfg, {"kv": bad})
         # what the engine does not have yet: a plain no, nothing written
         for key, value, why in (("parallel", 2, "one request at a time"), ("draft", "mtp", "this pack has no MTP block"),
-                                ("images", True, "this pack has no vision tower"), ("kv_cache", "fp8", "one cache format"),
-                                ("kv", "int8", "one cache format"), ("kv_streaming", True, "KV streaming: not available"),
-                                ("kv_resident", 8192, "KV streaming: not available"),
+                                ("images", True, "this pack has no vision tower"), ("kv_cache", "fp8", "auto or 8-bit"),
+                                ("kv_streaming", True, "KV streaming: .* by itself"),
+                                ("kv_resident", 8192, "KV streaming: .* by itself"),
                                 ("ablate", True, "Refusal ablation: not available for this model")):
             with self.assertRaisesRegex(ValueError, why):
                 M.apply(cfg, {key: value})
@@ -396,22 +413,24 @@ class Settings(unittest.TestCase):
             return c["installer"].get("chunk_by_hand")
         wide = cfg_with(4096, 512)                     # (the setup's on a card with room for both at 4K)
         self.assertTrue(M.settings_of(wide)["images"])
-        with cards(9.5):                               # 8.5 GB for the model: 6.5 + 0.81 + 0.95 at 4K
+        with cards(9.5):                               # 8.5 GB for the model: 6.5 + 0.95 at 4K (pictures take none)
             self.assertEqual(M.apply(wide, M.settings_of(wide)), wide)      # (a save that changes nothing)
             self.assertEqual(chunk(M.apply(wide, {"cpu_threads": 8})), "512")
-            for ctx in (8192, 16384, 32768):           # (8K: 6.8 + 0.81 + 0.95 is more than there is)
+            # (8K: 6.8 + 0.95 fits; 16K and 32K: 7.6 / 7.9 in F16 rows + 0.95 is more than there is)
+            for ctx, want in ((8192, "512"), (16384, "256"), (32768, "256")):
                 new = M.apply(wide, {**M.settings_of(wide), "context": ctx})   # (the page sends all it shows)
-                self.assertEqual((M.flag(new["args"], "--max-context"), chunk(new), by_hand(new)), (str(ctx), "256", None))
-                fit = M.hy4_refit(new)                 # ... and the largest picture's room is there
-                self.assertEqual((fit["vision"], fit["vision_small"], fit["chunk"]), (True, False, 256), ctx)
+                self.assertEqual((M.flag(new["args"], "--max-context"), chunk(new), by_hand(new)), (str(ctx), want, None))
+                fit = M.hy4_refit(new)                 # ... and the largest picture is read either way
+                self.assertEqual((fit["vision"], fit["vision_small"], fit["chunk"]), (True, False, int(want)), ctx)
                 self.assertNotIn("--kv", new["args"])
             at32 = M.apply(wide, {"context": 32768})
-            self.assertEqual(M.hy4_refit(at32)["kv"], "q8")
+            self.assertEqual(M.hy4_refit(at32)["kv"], "f16")   # (no 8-bit rows for a picture's sake)
             # back at 4K: the larger chunk again, as the setup writes it there
             self.assertEqual(chunk(M.apply(at32, {"context": 4096})), "512")
-            # pictures switched off: the room is the chunk's (the setup's --no-vision)
+            # pictures on or off: the same chunk (they take no VRAM of their own)
             self.assertEqual(chunk(M.apply(at32, {"context": 8192, "images": False})), "512")
-            self.assertEqual(chunk(M.apply(at32, {"context": 8192})), "256")
+            self.assertEqual(chunk(M.apply(at32, {"context": 8192})), "512")
+            self.assertEqual(chunk(M.apply(at32, {"context": 16384, "images": False})), "256")
             # another VRAM kept free than the layout's: the sums are not for it - the layout's own chunk
             self.assertEqual(chunk(M.apply(at32, {"context": 4096, "reserve_gb": 0.25})), "256")
             # a chunk set by hand stays: one that is not the layout's ...
@@ -429,17 +448,17 @@ class Settings(unittest.TestCase):
                 self.assertEqual((chunk(new), by_hand(new)), ("512", True), ctx)
             with self.assertRaisesRegex(ValueError, r"at 65536 tokens; this card has 8\.5 GB for them"):
                 M.apply(mine, {"context": 65536})      # (what fits is counted with the chunk that stays)
-            both = M.apply(at32, {"context": 8192, "prefill_chunk": 512})   # (changed with the context: the user's)
+            both = M.apply(at32, {"context": 16384, "prefill_chunk": 512})  # (changed with the context: the user's)
             self.assertEqual((chunk(both), by_hand(both)), ("512", True))
             # put back to the layout's choice by its user: the layout's again
             back = M.apply(mine, {"prefill_chunk": 256})
             self.assertEqual((chunk(back), by_hand(back)), ("256", None))
             self.assertEqual(chunk(M.apply(back, {"context": 4096})), "512")
         tight = cfg_with(4096, 512)
-        with cards(8.4):                               # 7.4 GB: at 32K the room left is a smaller picture's
+        with cards(8.4):                               # 7.4 GB: 32K in 8-bit rows - the largest picture all the same
             new = M.apply(tight, {"context": 32768})
             fit = M.hy4_refit(new)
-            self.assertEqual((chunk(new), fit["kv"], fit["vision"], fit["vision_small"]), ("256", "q8", True, True))
+            self.assertEqual((chunk(new), fit["kv"], fit["vision"], fit["vision_small"]), ("256", "q8", True, False))
             # the page's Reset (what the setup wrote, its chunk with its context): not a chunk set by hand
             new["installer"]["as_set_up"] = M.settings_of(tight)
             reset = M.apply(new, new["installer"]["as_set_up"])
@@ -497,6 +516,47 @@ class Settings(unittest.TestCase):
         finally:
             M._gpu_cache.clear()
             M._hy4_used_cache.clear()
+
+    def test_hy4_page_offers_the_streamed_contexts_the_setup_offers(self):
+        """KV streaming (maya-hy4 --kv-streaming auto): with this PC's RAM read, the Models page offers the longer
+        contexts the setup's hy4_fit offers - those the VRAM holds only with the global layers' older rows in RAM -
+        and a config moved to one gets --kv-streaming auto; one that fits without it, or a config with streaming off
+        by hand, is as before."""
+        import maya
+        p = hy4_cfg(self.d)
+        c = json.loads(p.read_text())
+        c.update(args=["--pack", M.flag(c["args"], "--pack"), "--max-context", "16384", "--chunk", "256",
+                       "--reserve-gb", "0.5", "--vram-experts", "0"], gpu=[0])
+        c["installer"]["layout"] = "8gb"
+        p.write_text(json.dumps(c, indent=1))
+        small = M.read(p)
+        xs = maya.hy4_quant_table("maya-xs")
+        card = [{"index": 0, "vram_gb": 8.0}]
+        with mock.patch.object(M, "machine_gpus", return_value=[{"index": 0, "name": "x", "vram_gb": 8.0}]):
+            before = M.hy4_room(small)["contexts"]
+            with mock.patch.object(M, "hy4_ram_gb", return_value=64.0):
+                fit = maya.hy4_fit(xs, card, used={0: 1024}, layout="8gb", ram_gb=64.0)
+                room = M.hy4_room(small)
+                self.assertEqual(room["contexts"], fit["contexts"])
+                self.assertGreater(len(fit["streamed"]), 0)
+                self.assertEqual([x for x in room["contexts"] if x not in fit["streamed"]], before)
+                longest = max(fit["streamed"])
+                a = M.apply(small, {"context": longest})["args"]
+                self.assertEqual((M.flag(a, "--max-context"), M.flag(a, "--kv-streaming")), (str(longest), "auto"))
+                self.assertIsNone(M.flag(M.apply(small, {"context": max(before)})["args"], "--kv-streaming"))
+                # (the page's Context size line: RAM a token and the positions in VRAM at the streamed contexts)
+                row = M.listing(self.d, None)["models"][0]
+                self.assertEqual(sorted(int(x) for x in row["kv_streamed"]), fit["streamed"])
+                self.assertIn(row["kv_streamed"][str(longest)]["ram"], (13 * 1152, 13 * 672))
+                self.assertGreaterEqual(row["kv_streamed"][str(longest)]["win"], 256)
+                with self.assertRaisesRegex(ValueError, f"the largest that fits is {longest}"):
+                    M.apply(small, {"context": 1048576})          # (1M: the pooled keys alone do not fit 8 GB)
+                off = dict(small, args=small["args"] + ["--kv-streaming", "off"])
+                self.assertEqual(M.hy4_room(off)["contexts"], before)
+                with self.assertRaisesRegex(ValueError, f"the largest that fits is {max(before)}"):
+                    M.apply(off, {"context": longest})
+            with mock.patch.object(M, "hy4_ram_gb", return_value=16.0):   # (a small RAM: no room for the rows)
+                self.assertEqual(M.hy4_room(small)["contexts"], before)
 
     def test_hy4_page_reads_the_vram_in_use_as_the_setup_does(self):
         """The Models page offers the contexts the setup offers: the cards' VRAM in use is the setup's own reading
@@ -569,6 +629,65 @@ class Settings(unittest.TestCase):
             M._hy4_used_cache.clear()
             M._HY4_BEFORE.clear()
             self.used.start()
+
+    def test_hy4_page_counts_the_vram_windows_gives_the_engine(self):
+        """Windows keeps part of every card from the programs on it: the setup measured what the engine's CUDA gets
+        (maya.py's hy4_engine_room, kept in the config with the card's VRAM) and the page counts no more than that -
+        on the card it was measured on; a config without it, or another card now: as before."""
+        import maya
+        p = hy4_cfg(self.d)
+        c = json.loads(p.read_text())
+        c.update(args=["--pack", M.flag(c["args"], "--pack"), "--max-context", "8192", "--chunk", "256",
+                       "--reserve-gb", "0.5", "--vram-experts", "0", "--dfly2"], gpu=[0])
+        c["installer"].update(layout="8gb", hy4_quant="maya-xs", engine_room_gb={"0": [7.48, 8.0]})
+        p.write_text(json.dumps(c, indent=1))
+        cfg = M.read(p)
+        for vram, usable in ((8.0, 7.48), (12.0, 12.0 - 76 / 1024)):    # (76 MiB in use, nvidia-smi's reading)
+            with mock.patch.object(M, "machine_gpus", return_value=[{"index": 0, "name": "x", "vram_gb": vram}]), \
+                    mock.patch.object(M, "hy4_used", side_effect=lambda gpus: {i: 76 for i in gpus}):
+                self.assertAlmostEqual(M.hy4_room(cfg)["usable"], usable)
+                self.assertEqual(M.hy4_cards(cfg, M.machine_gpus())[0].get("engine_room_gb"),
+                                 7.48 if vram == 8.0 else None)
+                fit = M.hy4_refit(cfg)
+                self.assertAlmostEqual(fit["usable"], usable)
+        self.assertEqual(M.hy4_cards({"installer": {"engine_room_gb": {"0": "x", "a": [1, 2]}}},
+                                     [{"index": 0, "vram_gb": 8.0}]), {0: {"index": 0, "vram_gb": 8.0}})
+        self.assertEqual(maya.hy4_usable_gib([{"index": 0, "vram_gb": 8.0}], {0: 1024}), 7.0)
+
+    def test_hy4_page_counts_the_share_the_engine_measured(self):
+        """The setup kept CUDA's reading beside the room (its first guess for CUDA's own share): once the engine has
+        measured the share on that card (maya.py's HY4_ROOM_STORE, this PC, card and driver), the page counts the
+        reading with it, as the next setup does; no record, or a config without the reading: the setup's figure."""
+        import maya
+        cfg = {"installer": {"engine_room_gb": {"0": [7.537, 8.0, 7.037]}}}
+        gl = [{"index": 0, "name": "x", "vram_gb": 8.0}]
+        M._gpu_cache.pop("room_own", None)
+        self.addCleanup(M._gpu_cache.pop, "room_own", None)
+        for own, room in (({0: 0.42}, 7.457), ({}, 7.537)):
+            with mock.patch.object(M, "hy4_room_own", return_value=own):
+                self.assertAlmostEqual(M.hy4_cards(cfg, gl)[0]["engine_room_gb"], room)
+        with mock.patch.object(M, "hy4_room_own", side_effect=AssertionError("not asked")):
+            self.assertAlmostEqual(M.hy4_cards({"installer": {"engine_room_gb": {"0": [7.48, 8.0]}}}, gl)[0]
+                                   ["engine_room_gb"], 7.48)
+        # the record for this PC's card and driver, by the setup's own key (setup.py's list: its PCI id and driver)
+        raw = [{"index": 0, "name": "x", "vram_gb": 8.0, "pci": "00000000:01:00.0", "driver": "610.88"}]
+        with mock.patch.object(maya, "hy4_room_load", return_value={maya.hy4_room_key(raw[0]): {"own_gib": 0.42}}), \
+                mock.patch.object(maya.S, "gpus", return_value=raw):
+            self.assertEqual(M.hy4_room_own(), {0: 0.42})
+            M._gpu_cache.pop("room_own", None)
+            with mock.patch.object(maya.S, "gpus", return_value=[dict(raw[0], driver="615.10")]):
+                self.assertEqual(M.hy4_room_own(), {})
+        # the server's start: the card to measure, and the figure said once kept
+        with mock.patch.object(maya, "hy4_room_due", return_value={"index": 0}):
+            self.assertEqual(M.hy4_room_due({}), {"index": 0})
+        with mock.patch.object(maya, "hy4_room_due", side_effect=OSError("no driver")):
+            self.assertIsNone(M.hy4_room_due({}))
+        with mock.patch.object(maya, "hy4_room_measure", return_value={"own_gib": 0.42}), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(M.hy4_room_measured({}, {"name": "RTX"}, {}), {"own_gib": 0.42})
+        self.assertIn("0.42 GB", out.getvalue())
+        with mock.patch.object(maya, "hy4_room_measure", side_effect=ValueError):
+            self.assertIsNone(M.hy4_room_measured({}, {}, {}))
 
     def test_hy4_contexts_that_fit(self):
         """Hy4-Flash's context on the Models page: only what fits the config's cards by its layout's plan, as the

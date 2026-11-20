@@ -63,6 +63,7 @@ from serve import glm_link  # noqa: E402  GLM on an AMD APU + an NVIDIA card ("m
 ENGINE_VISION = (ds4_vision.Vision, mm3_vision.Vision)   # the engines that run their vision tower themselves
 #                                                          (hy4_vision.Vision is an mm3_vision.Vision)
 HY4_TEXT_ONLY = "Hy4-Flash with its pictures off"         # (no vision tower loaded: the errors' name for it)
+HY4_LANE_FILE = ROOT / "data" / "hy4-cpu-lane.txt"        # (maya-hy4's 4-bit copies' verdict on this PC: child_env)
 # (... and what stands for a picture in a tool result then: the agent's turn goes on)
 HY4_PICTURE_NOTE = "[a picture was here; pictures are off on this server, so it was not read]"
 
@@ -853,6 +854,7 @@ def _drain_seconds() -> float:
 
 
 DRAIN_S = _drain_seconds()
+CANCEL_POLL_S = 0.2         # --parallel: how often a request waiting for its engine's next line looks at its cancel
 STALL_CPU_SHARE = 0.02      # the engine may use 2% of one core over the window and still count as stuck: its idle
                             # threads' polls (the GLM service threads sleep 2 ms at a time when quiet); work is cores
 STALL_IO_EPS_B = 1 << 20    # bytes it may read or write in that window
@@ -1159,7 +1161,7 @@ class StrataEngine:
 
     def death_note(self) -> str:
         """Why the engine most likely ended, from the end of its log: its own watchdog (issue #29), a GPU's fault it
-        caught after a request (exit 3), else RAM."""
+        caught after a request (exit 3), a signal from outside, an abort (a failed check, its log line), else RAM."""
         tail = ""
         try:
             with open(self.log_path, "rb") as f:
@@ -1177,9 +1179,17 @@ class StrataEngine:
                         "the like), after which that GPU's state is lost; a fresh engine starts with the next request. "
                         "Its log line: " + line.strip() + " - the lines above it name the GPU and the error; please "
                         "report it at github.com/mw00/project-maya/issues.")
-        if getattr(getattr(self, "proc", None), "returncode", None) in (-2, -15):   # (#539: read as a lack of RAM)
+        rc = getattr(getattr(self, "proc", None), "returncode", None)
+        if rc in (-2, -15):   # (#539: read as a lack of RAM)
             return ("A signal from outside ended it (SIGINT or SIGTERM: Ctrl+C, kill, a service manager), not a lack "
                     "of RAM.")
+        if rc == -6:   # (#1007: SIGABRT is a check that failed - Linux's out-of-memory killer sends SIGKILL, -9)
+            hit = next((ln.strip() for ln in reversed(tail.splitlines())
+                        if any(k in ln for k in ("Assertion", "terminate called", "what():", "GGML_ASSERT"))), "")
+            return ("The engine aborted (SIGABRT): a check inside it or inside a library it calls (the GPU's runtime) "
+                    "failed - not a lack of RAM; a fresh engine starts with the next request. "
+                    + (f"Its log line: {hit[:600]} - please" if hit else "The lines above in its log name it; please")
+                    + " report it at github.com/mw00/project-maya/issues.")
         return ("The usual cause is running out of RAM: Linux then ends the biggest program (check: sudo dmesg | "
                 "grep -i -E 'killed process|out of memory'); Windows slows down instead. Close other programs or use a "
                 "smaller model (Q2_0 / IQ2_XS).")
@@ -1708,10 +1718,18 @@ class StrataEngine:
             # less when MAYA_REQUEST_QUIET_S is set low (so a test - or a tuned server - sees it in its own time)
             poll_s = 10.0 if REQUEST_QUIET_S <= 0 else min(10.0, max(0.2, REQUEST_QUIET_S / 2))
             want_lp, lp_wait = logprobs_asked(sampling) is not None, None   # (as generate(): a token waits for its LP)
+            # the wait goes in short steps, so a client gone away (cancel) sends this request's STOP at once: a long
+            # one-piece prompt read writes no line of it until it ends, and the STOP then waited for poll_s - while
+            # the next request (often the same conversation sent again) was placed beside the stopped one, in another
+            # conversation, and read its prompt from the shared start (#1057).  The checks below keep poll_s.
+            step, waited_from = min(poll_s, CANCEL_POLL_S), time.monotonic()
             while True:
                 try:
-                    line = q.get(timeout=poll_s)
+                    line = q.get(timeout=step)
                 except queue.Empty:
+                    if time.monotonic() - waited_from < poll_s and not cancel.is_set():
+                        continue
+                    waited_from = time.monotonic()
                     if lp_wait is not None:
                         t, lp_wait = lp_wait, None
                         yield t
@@ -1743,7 +1761,7 @@ class StrataEngine:
                 if line is None:
                     done = True
                     raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})")
-                heard = time.monotonic()
+                heard = waited_from = time.monotonic()
                 stall.clear()
                 f = line.split()
                 if lp_wait is not None and not line.startswith("LP "):
@@ -2205,6 +2223,11 @@ def child_env(cfg: dict) -> dict:
     # default (off)
     if isinstance(cfg.get("fast_prefill"), bool):
         env["DS4_YOCO_CONE"] = "1" if cfg["fast_prefill"] else "0"
+    # Hy4-flash's CPU lane: whether its 4-bit expert copies pay is measured once on this PC (the engine's timed turns,
+    # once its experts are warm) and remembered in the data folder beside the expert profiles - per PC, model and
+    # lane kernels (maya --speed-calibration measures again)
+    if models.family(cfg) == "hy4":
+        env.setdefault("HY4_Q4X_FILE", str(HY4_LANE_FILE))
     dirs = [d for d in cfg.get("lib_dirs") or [] if Path(d).is_dir()]
     if dirs:
         var = "PATH" if os.name == "nt" else "LD_LIBRARY_PATH"
@@ -2484,6 +2507,8 @@ def speculation_modes(info: dict, dspark=None, lookup=None) -> list:
         modes.append("DFlash2")
     elif on(info.get("mtp")):
         modes.append("MTP")
+    elif on(info.get("dfly2")):                        # (maya-hy4's DFly2 drafter: its INFO dfly2=)
+        modes.append("DFly2")
     lk = lookup if lookup is not None else info.get("lookup")
     if on(lk):
         modes.append("Lookup")
@@ -4450,12 +4475,7 @@ class Service:
             cur, left = list(ids) + produced, max_new - len(produced)
             smp = self._resumed_sampling(sampling, produced)   # (the thinking budget counts from where it got to)
         if len(segments) > 1:                           # the request's figures, over all its slices
-            first, last = segments[0], segments[-1]
-            merged = dict(last, prompt_tokens=first.get("prompt_tokens"), reused=first.get("reused"))
-            for k in ("generated", "prompt_ms", "decode_ms", "drafts_accepted", "drafts_offered", "hits", "lookups"):
-                if all(k in sg for sg in segments):
-                    merged[k] = sum(sg[k] for sg in segments)
-            self.engine.last = merged
+            self.engine.last = merge_calls(segments)
         lastd = getattr(self.engine, "last", None)
         if isinstance(lastd, dict) and (lastd.get("prompt_tokens") or 0) > len(ids):
             self.engine.last = own_prompt_figures(lastd, len(ids))   # (the first call's DONE was not seen)
@@ -4537,6 +4557,7 @@ class Service:
         # Identity token: only a DONE line replaces engine.last, so a request that died, errored or was
         # disconnected must not have the PREVIOUS request's decode figures recorded as its own.
         engine_last0 = getattr(self.engine, "last", None)
+        calls: list[dict] = []                          # each finished engine call's DONE (segments()), merged at the end
         counted, my_started, my_first, queued = False, time.time(), None, False
         stat = RequestStat()                            # this request's live figures
         stat.spec_off = request_spec_off(sampling)
@@ -4617,11 +4638,15 @@ class Service:
                             if stops:
                                 sampling["_think_stops"] = stops
                 # MAYA_DS4_RESTORE_POINTS: where the DeepSeek engine keeps restore points for this prompt (never a
-                # client's own `_restore`; not with pictures, whose spans the engine reads whole)
+                # client's own `_restore`).  Pictures too: the engine reads a span whole, so it moves a point inside
+                # one to the span's start, and a prompt with another picture there goes back no further than that
+                # place (the points past it are given up).  Without them a client that sends only its newest picture
+                # - the one before gone from the history, a few hundred tokens from the end - had the whole
+                # conversation read again from token 0 on every picture (#1007)
                 if sampling and "_restore" in sampling:
                     sampling = {k: v for k, v in sampling.items() if k != "_restore"}
                 on, tail = restore_point_settings()
-                if on and not emb and getattr(self.template, "deepseek", False):
+                if on and getattr(self.template, "deepseek", False):
                     pts = (deepseek_restore_points_fast if prompt_memo_on() and isinstance(ids, list)
                            else deepseek_restore_points)(ids, self.ds_user_id, self.ds_system_id, tail)
                     if pts:
@@ -4656,7 +4681,11 @@ class Service:
                     engine rejected prompt + max_new + CTX_SLACK > context)."""
                     while True:
                         room = self.engine.max_context - CTX_SLACK - len(seg["prompt"])
+                        l0 = getattr(self.engine, "last", None)
                         yield from attempts(seg["prompt"], max(1, min(max_new - n, room)))
+                        got = getattr(self.engine, "last", None)
+                        if got is not None and got is not l0:   # (its DONE: the request's figures merge every call's)
+                            calls.append(got)
                         if seg["next"] is None or cancel.is_set() or self.stopping:
                             return
                         seg["prompt"], seg["next"], seg["ids"] = seg["next"], None, []
@@ -4904,9 +4933,15 @@ class Service:
             with self.status_lock:
                 self.current_requests.discard(stat)
                 if counted:
-                    # only this request's DONE counts: same object means no DONE arrived (death, error, disconnect)
-                    last = dict(getattr(self.engine, "last", {}) or {}) \
-                        if getattr(self.engine, "last", None) is not engine_last0 else {}
+                    # only this request's DONE counts: same object means no DONE arrived (death, error, disconnect);
+                    # over all its engine calls (#1058: a continuation's DONE alone read the whole answer as cached)
+                    last_obj, last = getattr(self.engine, "last", None), {}
+                    if last_obj is not engine_last0:
+                        if last_obj is not None and (not calls or calls[-1] is not last_obj):
+                            calls.append(last_obj)      # (the last call, closed before segments() saw its end)
+                        last = merge_calls(calls) if calls else dict(last_obj or {})
+                        if (last.get("prompt_tokens") or 0) > len(ids):
+                            last = own_prompt_figures(last, len(ids))
                     started = my_started
                     loaded = str((getattr(self.engine, "info", {}) or {}).get("cvec", 0)) not in ("0", "", "None")
                     hit_rate = round(last["hits"] / last["lookups"], 3) if last.get("lookups") else None
@@ -4969,6 +5004,31 @@ class Service:
         yield "done", {"finish": finish, "completion_tokens": n, "reasoning_tokens": reasoning_tokens,
                        "reused": (timings or {}).get("cache_n", 0),
                        "timings": timings, "stop_sequence": matched if finish == "stop" else None}
+
+
+CALL_SUMS = ("generated", "decode_ms", "drafts_accepted", "drafts_offered", "hits", "lookups")
+
+
+def merge_calls(calls: list[dict]) -> dict:
+    """One request's figures over its engine calls (its DONE lines, in order): fair slices, the loop guard's and the
+    thinking budget's continuations, and the calls after a blocked tool call, a keep or a thinking resume (#1058) - each
+    later call's prompt is the request's prompt plus what was written, all of it in the conversation cache, and its
+    DONE counts only its own tokens.  The prompt's figures are the first call's (prompt_tokens, reused and prompt_ms:
+    the request's own prompt read, so prefill_tok_s and the timings keep one scope); the tokens written, the decode
+    time, the drafts and the expert-cache lookups are summed (a key only when every call reported it)."""
+    if not calls:
+        return {}
+    first, merged = calls[0], dict(calls[-1])
+    for k in ("prompt_tokens", "reused", "prompt_ms"):
+        if k in first:
+            merged[k] = first[k]
+        else:
+            merged.pop(k, None)
+    if len(calls) > 1:
+        for k in CALL_SUMS:
+            if all(k in c for c in calls):
+                merged[k] = sum(c[k] for c in calls)
+    return merged
 
 
 def own_prompt_figures(last: dict, n_prompt: int) -> dict:
@@ -7481,7 +7541,16 @@ def main() -> int:
             engine = mixed_gpus.engine_class(StrataEngine, wait_gpu_release)(
                 cfg["exe"], engine_args(cfg), cwd=cfg.get("cwd"), log=cfg.get("log"), env=engine_env, mixed=mixed)
         else:
-            engine = StrataEngine(cfg["exe"], engine_args(cfg), cwd=cfg.get("cwd"), log=cfg.get("log"), env=engine_env)
+            # (Hy4-Flash under Windows, a card whose CUDA share is not measured yet for this PC and driver: the engine
+            #  says at this start how much less free VRAM its choices hold with - the setup and the Models page count
+            #  the figure from then on; the start itself is the same)
+            room_card = models.hy4_room_due(cfg)
+            eargs = engine_args(cfg) + (["--room-report"] if room_card else [])
+            engine = StrataEngine(cfg["exe"], eargs, cwd=cfg.get("cwd"), log=cfg.get("log"), env=engine_env)
+            if room_card:
+                exe_, args_, *rest = engine.spawn             # (a start again: as without the flag)
+                engine.spawn = (exe_, [x for x in args_ if x != "--room-report"], *rest)
+                models.hy4_room_measured(cfg, room_card, engine.info)
         engine.load_s = round(time.time() - t0, 1)      # (the dashboard's estimate of a reload: this start's time)
         two_gpus = bool(getattr(engine, "mixed_on", False))   # (DeepSeek on both GPUs: serve/mixed_gpus.py)
         warn_tight_ram(engine.info.get("arena_mib"))
@@ -7499,8 +7568,11 @@ def main() -> int:
             # Hy4-flash: the engine's own vision tower (the mmproj file in its pack); the server resizes the pictures
             vision = hy4_vision.Vision(hy4_vision.Geometry.from_info(engine.info),
                                        Path(tempfile.mkdtemp(prefix="maya-hy4-pictures-")), Vision.load)
+            # (where a picture's room comes from - the engine's `vision_room`: "chunk" = lent by its prompt buffers)
+            where = (f"; no VRAM kept for pictures (~{engine.info.get('vision_room_mib')} MiB while one is read, lent "
+                     "by the prompt buffers)" if engine.info.get("vision_room") == "chunk" else "")
             print(f"[maya] images: the model's vision tower runs in the engine, up to {vision.g.max_pixels} pixels "
-                  f"({vision.g.max_tokens} tokens for a square one) a picture", flush=True)
+                  f"({vision.g.max_tokens} tokens for a square one) a picture{where}", flush=True)
         elif vision is None and not vcfg and engine.info.get("vision") == "mm3":
             # MiniMax-M3.1-Flash: the engine's own vision tower; the server resizes the pictures
             vision = mm3_vision.Vision(mm3_vision.Geometry.from_info(engine.info),

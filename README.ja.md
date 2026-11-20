@@ -62,11 +62,11 @@ Maya の量子化はすべて、モデル名のあとに階層 (XS、S、M、L�
 | | Maya-XS (v2) · `deepseek-maya-xs` | 277 GB | 128 GB の PC のメモリにモデル全体を載せる (Engram テーブルは SSD に置く); v2 は v1 より元のモデルに約 12% 近く、書き出しが約 20% 速い - セットアップを再実行すると更新を案内します |
 | **[MiniMax-M3.1-Flash](https://huggingface.co/MiniMaxAI/MiniMax-M3.1-Flash)**<br><sub>MiniMax · [MiniMax Community License](LICENSE.minimax-m31) · 428 B、アクティブ 23 B · 最大 1M コンテキスト</sub> | Maya-XS · `minimax-maya-xs` | 93 GB | 128 GB の PC のメモリにモデル全体を載せる |
 | | Maya-S · `minimax-maya-s` | 122 GB | 元のモデルにより近い |
-| **[Hy4-Flash](https://huggingface.co/tencent/Hy4-flash)**<br><sub>Tencent · [Tencent Hy License](LICENSE.hy4-flash) · 220 B · 画像対応 · NVIDIA、AMD (Linux)</sub> | Maya-XS · `hy4-flash-maya-xs` | 44.8 GB + n-gram テーブル 63.4 GB | RAM と VRAM の合計が約 56-64 GB の PC、8 GB 以上のカード。n-gram テーブルは SSD に置いたまま。ほかのサイズは順次追加 |
+| **[Hy4-Flash](https://huggingface.co/tencent/Hy4-flash)**<br><sub>Tencent · [Tencent Hy License](LICENSE.hy4-flash) · 220 B · 最大 1M コンテキスト · 画像対応 · NVIDIA、AMD (Linux)</sub> | Maya-XS · `hy4-flash-maya-xs`<br>Maya-S · `hy4-flash-maya-s`<br>Maya-M · `hy4-flash-maya-m`<br>Maya-L · `hy4-flash-maya-l` | 44.8 GB<br>53.0 GB<br>68.4 GB<br>89.5 GB<br>それぞれ + 共通の n-gram テーブル 63.4 GB | RAM と VRAM の合計が約 56-64 GB (Maya-XS、8 GB 以上のカード)、68-80 GB (Maya-S)、80-96 GB (Maya-M)、104-128 GB (Maya-L) の PC。Maya-S、Maya-M、Maya-L は 12 GB 以上のカード。n-gram テーブルは SSD に置いたまま |
 
 **どのモデルがあなたの PC に合う?** 各モデルの推奨メモリ (VRAM と RAM の合計) は [docs/MEMORY.md](docs/MEMORY.md) を見てください。
 
-いずれも NVIDIA の V100 / RTX 20 以降、および AMD と Windows ([必要なもの](#what-you-need)を参照) で動きます。Hy4-Flash は NVIDIA (Linux と Windows) と Linux 上の AMD (Strix Halo / Gorgon Halo、Radeon カード) で動き、画像は VRAM に余裕のあるカードで読めます (8 GB のカードではテキストのみ)。DeepSeek のサイズには Engram テーブルが含まれます。セットアップでは、unsloth の GGUF と turboderp および LibertAIDAI の DeepSeek 用 EXL3 量子化、orcarouter の abliterated 版 DeepSeek、Mia-AiLab の MiniMax 用 EXL3 量子化、turboderp の GLM 用 EXL3 量子化、画像対応の Q5_K_M GGUF としての Qwen-3.8-Flash-Next (CYBER-FROST)、そして同じく画像対応の unsloth の UD-IQ2_XS GGUF としての Qwen-3.8-Flash-Next 本体 ([その設定](docs/SETTINGS.md#qwen-38-flash-next-cyber-frost)) も選べます。**各モデルのファイル、ドラフター、画像、オプション: [docs/MODELS.md](docs/MODELS.md)。**
+いずれも NVIDIA の V100 / RTX 20 以降、および AMD と Windows ([必要なもの](#what-you-need)を参照) で動きます。Hy4-Flash は NVIDIA (Linux と Windows) と Linux 上の AMD (Strix Halo / Gorgon Halo、Radeon カード) で動き、動くすべてのカードで画像も読めます (8 GB のカードを含む)。DeepSeek のサイズには Engram テーブルが含まれます。セットアップでは、unsloth の GGUF と turboderp および LibertAIDAI の DeepSeek 用 EXL3 量子化、orcarouter の abliterated 版 DeepSeek、Mia-AiLab の MiniMax 用 EXL3 量子化、turboderp の GLM 用 EXL3 量子化、画像対応の Q5_K_M GGUF としての Qwen-3.8-Flash-Next (CYBER-FROST)、そして同じく画像対応の unsloth の UD-IQ2_XS GGUF としての Qwen-3.8-Flash-Next 本体 ([その設定](docs/SETTINGS.md#qwen-38-flash-next-cyber-frost)) も選べます。**各モデルのファイル、ドラフター、画像、オプション: [docs/MODELS.md](docs/MODELS.md)。**
 
 ## <a name="quality"></a>品質
 
@@ -75,6 +75,7 @@ Maya の量子化は、各モデルの公開された重みから作られ、元
 - **GLM-5.3-Flash · Maya の量子化**は FP8 モデルのゼロショット精度の 97.7-99.2% を保ち、次トークンを 83-90% の確率で一致させます (Maya-L: 99.2%、90%)。作り方と測定方法: [MAYA-S](bench/results/MAYA-S.md)、[MAYA-S24](bench/results/MAYA-S24.md)、[MAYA-M](bench/results/MAYA-M.md)、[MAYA-L](bench/results/MAYA-L.md)。
 - **DeepSeek V4.1 · Maya-S** は元のモデルと同じ次トークンを 92.6% の確率で選びます。
 - **MiniMax M3.1 · Maya-S** は 87.6% です (カテゴリ平均)。
+- **Hy4-Flash · Maya 量子化** は 88.5% (Maya-XS) から 96.6% (Maya-L)、KL ダイバージェンスは 0.16 から 0.012 です。Tencent 自身の GGUF との比較グラフは[モデルカード](https://huggingface.co/peasantsmith/Hy4-Flash-Maya-GGUF)にあります。
 
 各モデルの詳細は [Hugging Face](https://huggingface.co/peasantsmith) のモデルカードにあります。
 
@@ -209,6 +210,15 @@ Maya の量子化は、各モデルの公開された重みから作られ、元
 
 </details>
 
+<details><summary><b>Hy4-Flash の速度ベンチマーク</b></summary>
+
+| マシン | モデル | デコード (回答の書き出し) | プリフィル (プロンプトの読み込み) | 報告者 |
+| --- | --- | ---: | ---: | --- |
+| **3x Tesla V100 32 GB** (各 PCIe 3.0 x16)、2x Xeon Gold 6138、RAM 183 GB | Maya-XS / Maya-S、32K コンテキスト、MTP ドラフト | **88.7 / 84.2 トークン/秒** | 1607 / 1566 トークン/秒 | メンテナー (v1.1.68) |
+| **3x RX 7900 XTX 24 GB** (PCIe 3.0 x8/x16/x8)、i9-10980XE、RAM 188 GB、Linux | Maya-S、32K コンテキスト、3 GPU テンソル並列 | 43.9-48.2 トークン/秒 | 1053 トークン/秒 | @Antero128 (v1.1.68, #1055) |
+
+</details>
+
 1 トークンはおよそ単語の ¾ です。会話が長くなっても速度は保たれます。起動直後の最初の回答は、使うものでキャッシュが埋まるまで最も遅くなります。
 
 ## <a name="using-it"></a>使い方
@@ -222,7 +232,7 @@ Maya の量子化は、各モデルの公開された重みから作られ、元
 - **モデル API:** `/api/tags`、`/api/ps`、`/api/show`、`/api/chat`、`/api/generate`、`/api/pull`、`/api/delete` で、あらゆるアプリやスクリプトからモデルの一覧、読み込み、ダウンロード、削除ができます。読み込まれていないモデルへのリクエストはそのモデルに切り替わり、`keep_alive` を指定すると、アイドル時にアンロードされます。`/models/load`、`/models/unload`、`/models/sse` もデフォルトで有効です (`"model_management": false` で無効にできます)。
 - **思考:** Off、Low、High (デフォルト)、Max を、設定またはリクエストごとに指定できます。さらに**思考予算**の欄で、モデルが回答の前に思考に使えるトークン数を設定できます。
 - **ループガード:** デフォルトで有効です。同じツール呼び出しを同じ結果で繰り返すエージェントを、その繰り返しから外へ誘導します。
-- **画像:** チャットに添付するか、どちらの API でも画像パートを送ります。テキストのみの GLM-5.3 を除き、すべてのモデルが画像を読めます (Hy4-Flash は 8 GB のカードではテキストのみ) (モデルごとのセットアップの詳細: [docs/MODELS.md](docs/MODELS.md))。
+- **画像:** チャットに添付するか、どちらの API でも画像パートを送ります。テキストのみの GLM-5.3 を除き、すべてのモデルが画像を読めます (モデルごとのセットアップの詳細: [docs/MODELS.md](docs/MODELS.md))。
 - **MCP ツール:** 設定に MCP サーバーを書くと (`"mcp_servers"`。Claude Desktop の `mcpServers` ブロックはそのまま使えます)、Web チャットのモデルがそのツールを呼び出せます。チャットの **+** メニューのスイッチでオン・オフできます。動作の詳細: [serve/mcp.py](serve/mcp.py)。
 - **Docker:** 公式イメージはありません。[docs/DOCKER.md](docs/DOCKER.md) は、リリースからイメージをビルドするための手順です。
 - **ほかのデバイスから:** `./maya.sh --setup --host 0.0.0.0 --api-key <secret>`。キーは必ず設定してください。
@@ -233,7 +243,7 @@ Maya の量子化は、各モデルの公開された重みから作られ、元
 
 | | |
 | --- | --- |
-| **GPU** | NVIDIA、compute capability 7.0 以上 (V100、RTX 20 以降): 1 枚、またはモデルを分け合う最大 16 枚。VRAM が多いほど速くなります。Pascal (Tesla P40 / P100、GTX 10) は実験的で、まだ検証されていません。**AMD:** RX 7900 XT / XTX、Radeon AI PRO R9700 / RX 9070、Strix Halo と Gorgon Halo (Radeon 8060S / 8065S); RX 6800 / 6900 と Radeon PRO V620 / W6800 はまだ検証されていません; GLM-5.3-Flash と DeepSeek-V4.1-Flash-1017 は AMD でも画像を読めます - [docs/AMD_MAYA.md](docs/AMD_MAYA.md) |
+| **GPU** | NVIDIA、compute capability 7.0 以上 (V100、RTX 20 以降): 1 枚、またはモデルを分け合う最大 16 枚。VRAM が多いほど速くなります。Pascal (Tesla P40 / P100、GTX 10) は実験的で、まだ検証されていません。**AMD:** RX 7900 XT / XTX、Radeon AI PRO R9700 / RX 9070、Strix Halo と Gorgon Halo (Radeon 8060S / 8065S); RX 6800 / 6900 と Radeon PRO V620 / W6800 はまだ検証されていません; GLM-5.3-Flash、DeepSeek-V4.1-Flash-1017、Hy4-Flash は AMD でも画像を読めます - [docs/AMD_MAYA.md](docs/AMD_MAYA.md) |
 | **RAM** | 32 GB で動きます。RAM が多いほど多くのエキスパートを近くに置け、速くなります |
 | **ディスク** | モデルが入る空きのある**高速な NVMe SSD** (GLM-5.3-Flash · Maya-XS で約 75 GB、GLM-5.3-Flash · Maya-S で約 100 GB、GLM-5.3-Flash · Maya-L で約 160 GB、DeepSeek V4.1 · Maya-S で約 350 GB、その unsloth の Q8 GGUF で約 470 GB、MiniMax M3.1 · Maya-XS で約 95 GB、Hy4-Flash · Maya-XS で約 110 GB、MiniMax-M3.1-Flash の EXL3 量子化で約 200 GB) と、画像エンコーダー (1.1 GB)。ハードディスクは不可 |
 | **システム** | Linux (x86-64; AVX2 対応 CPU が最適)、NVIDIA ドライバー、CUDA 12.x (CUDA 13 は RTX 20 以降で動作し、V100 と Pascal では動作しません)、g++、Python 3.10+。Windows 10/11: [docs/WINDOWS.md](docs/WINDOWS.md)。WSL2 は不可。AMD: ROCm 7 |

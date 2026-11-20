@@ -1,11 +1,13 @@
 // src/hy4/hy4_tp.cpp - maya-hy4's tensor parallel: the host's threads (see hy4_tp.hpp).
 #include "hy4_tp.hpp"
+#include "hy4_lane.hpp"
 
 #include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <vector>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <sstream>
@@ -32,29 +34,48 @@
 namespace hy4 {
 
 // ---------------------------------------------------------------- Crew
-Crew::Crew(int n) {
+Crew::Crew(int n, double spin_s) {
+    if (const char* se = std::getenv("HY4_CREW_SPIN_MS")) spin_s = std::atof(se) * 1e-3;
     for (int i = 0; i < n; ++i)
-        th_.emplace_back([this, i] {
+        th_.emplace_back([this, i, spin_s] {
+            unpin_this_thread();   // (not the lane caller's one core, when it starts the crew)
             unsigned seen = 0;
             for (;;) {
-                std::function<void(int)> f;
-                {
-                    std::unique_lock<std::mutex> lk(mu_);
-                    cv_.wait(lk, [&] { return quit_ || gen_ != seen; });
-                    if (quit_) return;
-                    seen = gen_;
-                    f = f_;
+                // (a start soon after the last: seen while spinning - no sleep, and no lock every thread would queue
+                //  for at once; f_ is whole before gen_ moves, and is not written again until every thread is done)
+                bool got = false;
+                if (spin_s > 0) {
+                    const auto t0 = std::chrono::steady_clock::now();
+                    for (;;) {
+                        if (quit_.load(std::memory_order_relaxed)) return;
+                        const unsigned gg = gen_.load(std::memory_order_acquire);
+                        if (gg != seen) {
+                            seen = gg;
+                            got = true;
+                            break;
+                        }
+                        if (std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() >= spin_s) break;
+                        for (int k = 0; k < 16; ++k) HY4_PAUSE();
+                    }
                 }
-                f(i);
-                std::lock_guard<std::mutex> lk(mu_);
-                if (--left_ == 0) done_cv_.notify_all();
+                if (!got) {
+                    std::unique_lock<std::mutex> lk(mu_);
+                    cv_.wait(lk, [&] { return quit_.load() || gen_.load() != seen; });
+                    if (quit_.load()) return;
+                    seen = gen_.load();
+                }
+                f_(i);
+                if (left_.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+                    std::lock_guard<std::mutex> lk(mu_);   // (no waiter between its check and its sleep)
+                    done_cv_.notify_all();
+                }
             }
         });
 }
 Crew::~Crew() {
     {
         std::lock_guard<std::mutex> lk(mu_);
-        quit_ = true;
+        quit_.store(true);
     }
     cv_.notify_all();
     for (auto& t : th_) t.join();
@@ -63,20 +84,27 @@ void Crew::start(const std::function<void(int)>& f) {
     {
         std::lock_guard<std::mutex> lk(mu_);
         f_ = f;
-        left_ = (int) th_.size();
-        ++gen_;
+        left_.store((int) th_.size(), std::memory_order_release);
+        gen_.fetch_add(1, std::memory_order_release);
     }
     cv_.notify_all();
 }
 void Crew::wait() {
+    for (int k = 0; k < 4096; ++k) {   // (most waits: the threads done, or about to be)
+        if (left_.load(std::memory_order_acquire) == 0) return;
+        HY4_PAUSE();
+    }
     std::unique_lock<std::mutex> lk(mu_);
-    done_cv_.wait(lk, [&] { return left_ == 0; });
+    done_cv_.wait(lk, [&] { return left_.load() == 0; });
 }
 
 // ---------------------------------------------------------------- Summer
 namespace {
 constexpr size_t kTile = 1024;   // (values a pass of the parts: an accumulator in L1)
-constexpr size_t kPerThread = 2048;   // (values a thread takes at least: below it fewer threads join)
+const size_t kPerThread = [] {   // (values a thread takes at least: below it fewer threads join)
+    const char* e = std::getenv("HY4_SUM_PER");
+    return e ? (size_t) std::atol(e) : (size_t) 2048;
+}();
 constexpr double kSpinS = 0.005;      // (a helper spins this long after its last sum, then sleeps)
 constexpr size_t kAddTeam = 65536;    // (add(): values from which the helpers join)
 }  // namespace

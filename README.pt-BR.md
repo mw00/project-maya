@@ -60,11 +60,11 @@ Toda quantização do Maya tem o nome do modelo seguido do nível - XS, S, M ou 
 | | Maya-XS (v2) · `deepseek-maya-xs` | 277 GB | o modelo inteiro na memória de um PC de 128 GB (as tabelas Engram ficam no SSD); a v2 é cerca de 12% mais próxima do original e cerca de 20% mais rápida para escrever que a v1 - rodar a instalação de novo oferece a atualização |
 | **[MiniMax-M3.1-Flash](https://huggingface.co/MiniMaxAI/MiniMax-M3.1-Flash)**<br><sub>MiniMax · [MiniMax Community License](LICENSE.minimax-m31) · 428 B, 23 B ativos · até 1M de contexto</sub> | Maya-XS · `minimax-maya-xs` | 93 GB | o modelo inteiro na memória de um PC de 128 GB |
 | | Maya-S · `minimax-maya-s` | 122 GB | mais próximo do original |
-| **[Hy4-Flash](https://huggingface.co/tencent/Hy4-flash)**<br><sub>Tencent · [Tencent Hy License](LICENSE.hy4-flash) · 220 B · lê imagens · NVIDIA, AMD no Linux</sub> | Maya-XS · `hy4-flash-maya-xs` | 44,8 GB + uma tabela n-gram de 63,4 GB | PCs com cerca de 56-64 GB de RAM + VRAM, placas a partir de 8 GB; a tabela n-gram fica no SSD; mais tamanhos em seguida |
+| **[Hy4-Flash](https://huggingface.co/tencent/Hy4-flash)**<br><sub>Tencent · [Tencent Hy License](LICENSE.hy4-flash) · 220 B · até 1M de contexto · lê imagens · NVIDIA, AMD no Linux</sub> | Maya-XS · `hy4-flash-maya-xs`<br>Maya-S · `hy4-flash-maya-s`<br>Maya-M · `hy4-flash-maya-m`<br>Maya-L · `hy4-flash-maya-l` | 44,8 GB<br>53,0 GB<br>68,4 GB<br>89,5 GB<br>cada um + uma tabela n-gram de 63,4 GB em comum | PCs com cerca de 56-64 GB (Maya-XS; placas a partir de 8 GB), 68-80 GB (Maya-S), 80-96 GB (Maya-M) ou 104-128 GB (Maya-L) de RAM + VRAM; Maya-S, Maya-M e Maya-L em placas a partir de 12 GB; a tabela n-gram fica no SSD |
 
 **Qual modelo cabe no seu PC?** Veja em [docs/MEMORY.md](docs/MEMORY.md) a memória recomendada de cada modelo (VRAM + RAM somadas).
 
-Todos rodam em NVIDIA a partir da V100 / RTX 20, e em AMD e Windows (veja [O que você precisa](#what-you-need)); o Hy4-Flash roda em NVIDIA (Linux e Windows) e em AMD no Linux (Strix Halo / Gorgon Halo, placas Radeon) e lê imagens onde a placa tem VRAM livre para isso (em placas de 8 GB, só texto). Os tamanhos do DeepSeek incluem as tabelas Engram. A instalação também oferece os GGUFs da unsloth e as quantizações EXL3 da turboderp e da LibertAIDAI do DeepSeek, o DeepSeek abliterated da orcarouter, a quantização EXL3 do MiniMax da Mia-AiLab, as quantizações EXL3 do GLM da turboderp o Qwen-3.8-Flash-Next (CYBER-FROST) como GGUF Q5_K_M e o próprio Qwen-3.8-Flash-Next como GGUF UD-IQ2_XS da unsloth, ambos com imagens ([suas configurações](docs/SETTINGS.md#qwen-38-flash-next-cyber-frost)). **Arquivos, drafters, imagens e opções de cada modelo: [docs/MODELS.md](docs/MODELS.md).**
+Todos rodam em NVIDIA a partir da V100 / RTX 20, e em AMD e Windows (veja [O que você precisa](#what-you-need)); o Hy4-Flash roda em NVIDIA (Linux e Windows) e em AMD no Linux (Strix Halo / Gorgon Halo, placas Radeon) e lê imagens em toda placa que o roda (placas de 8 GB incluídas). Os tamanhos do DeepSeek incluem as tabelas Engram. A instalação também oferece os GGUFs da unsloth e as quantizações EXL3 da turboderp e da LibertAIDAI do DeepSeek, o DeepSeek abliterated da orcarouter, a quantização EXL3 do MiniMax da Mia-AiLab, as quantizações EXL3 do GLM da turboderp o Qwen-3.8-Flash-Next (CYBER-FROST) como GGUF Q5_K_M e o próprio Qwen-3.8-Flash-Next como GGUF UD-IQ2_XS da unsloth, ambos com imagens ([suas configurações](docs/SETTINGS.md#qwen-38-flash-next-cyber-frost)). **Arquivos, drafters, imagens e opções de cada modelo: [docs/MODELS.md](docs/MODELS.md).**
 
 ## <a name="quality"></a>Qualidade
 
@@ -73,6 +73,8 @@ As quantizações do Maya são feitas a partir dos pesos divulgados de cada mode
 - **GLM-5.3-Flash · quantizações Maya** mantêm 97,7-99,2% da precisão zero-shot do modelo FP8 e acertam o próximo token dele em 83-90% das vezes (Maya-L: 99,2%, 90%). Como são feitas e medidas: [MAYA-S](bench/results/MAYA-S.md), [MAYA-S24](bench/results/MAYA-S24.md), [MAYA-M](bench/results/MAYA-M.md), [MAYA-L](bench/results/MAYA-L.md).
 - **DeepSeek V4.1 · Maya-S** escolhe o mesmo próximo token que o original em 92,6% das vezes.
 - **MiniMax M3.1 · Maya-S** em 87,6% das vezes (a média das suas categorias).
+- **Hy4-Flash · quantizações Maya** em 88,5% (Maya-XS) a 96,6% (Maya-L) das vezes, com divergência KL de 0,16 até
+  0,012 - gráficos contra os GGUFs da própria Tencent no [cartão do modelo](https://huggingface.co/peasantsmith/Hy4-Flash-Maya-GGUF).
 
 Mais na página de cada modelo no [Hugging Face](https://huggingface.co/peasantsmith).
 
@@ -207,6 +209,15 @@ Máquinas reais medidas por nossos usuários, a maioria com `./maya.sh --bench` 
 
 </details>
 
+<details><summary><b>Benchmarks de velocidade do Hy4-Flash</b></summary>
+
+| Máquina | Modelo | Decodificação (escrevendo a resposta) | Prefill (lendo o seu prompt) | Por |
+| --- | --- | ---: | ---: | --- |
+| **3x Tesla V100 32 GB** (PCIe 3.0 x16 cada), 2x Xeon Gold 6138, 183 GB de RAM | Maya-XS / Maya-S, contexto de 32K, drafting MTP | **88,7 / 84,2 tokens/s** | 1607 / 1566 tokens/s | mantenedor (v1.1.68) |
+| **3x RX 7900 XTX 24 GB** (PCIe 3.0 x8/x16/x8), i9-10980XE, 188 GB de RAM, Linux | Maya-S, contexto de 32K, tensor parallel em 3 GPUs | 43,9-48,2 tokens/s | 1053 tokens/s | @Antero128 (v1.1.68, #1055) |
+
+</details>
+
 Um token equivale a cerca de ¾ de uma palavra. A velocidade se mantém conforme a conversa cresce, e as primeiras respostas depois de iniciar são as mais lentas, enquanto os caches se enchem com o que você usa.
 
 ## <a name="using-it"></a>Como usar
@@ -220,7 +231,7 @@ Um token equivale a cerca de ¾ de uma palavra. A velocidade se mantém conforme
 - **API de modelos:** `/api/tags`, `/api/ps`, `/api/show`, `/api/chat`, `/api/generate`, `/api/pull` e `/api/delete` listam, carregam, baixam e apagam modelos a partir de qualquer app ou script. Uma requisição a um modelo que não está carregado troca para ele, e `keep_alive` o descarrega quando fica ocioso. `/models/load`, `/models/unload` e `/models/sse` também vêm ligados por padrão (`"model_management": false` os desliga).
 - **Raciocínio:** Off, Low, High (o padrão) ou Max, em Settings ou por requisição, e um campo de **orçamento de raciocínio** que define quantos tokens o modelo pode usar pensando antes de responder.
 - **Guarda contra loops:** ligada por padrão - um agente que repete a mesma chamada de ferramenta com o mesmo resultado é conduzido para fora disso.
-- **Imagens:** anexe uma no chat, ou envie partes de imagem por qualquer uma das APIs. Todos os modelos leem imagens, menos o GLM-5.3, que é só texto (o Hy4-Flash é só texto em placas de 8 GB) (detalhes da instalação por modelo: [docs/MODELS.md](docs/MODELS.md)).
+- **Imagens:** anexe uma no chat, ou envie partes de imagem por qualquer uma das APIs. Todos os modelos leem imagens, menos o GLM-5.3, que é só texto (detalhes da instalação por modelo: [docs/MODELS.md](docs/MODELS.md)).
 - **Ferramentas MCP:** liste servidores MCP na configuração (`"mcp_servers"`; o bloco `mcpServers` do Claude Desktop funciona como está) e o modelo do chat na web pode chamar as ferramentas deles. Um interruptor no menu **+** do chat liga e desliga. O que ele faz: [serve/mcp.py](serve/mcp.py).
 - **Docker:** não há imagem oficial. [docs/DOCKER.md](docs/DOCKER.md) é uma receita para montar uma a partir de uma versão.
 - **De outro dispositivo:** `./maya.sh --setup --host 0.0.0.0 --api-key <secret>`. Sempre defina uma chave.
@@ -231,7 +242,7 @@ Um token equivale a cerca de ¾ de uma palavra. A velocidade se mantém conforme
 
 | | |
 | --- | --- |
-| **GPU** | NVIDIA, compute capability 7.0 ou superior (V100, RTX 20 e mais novas): uma, ou até 16 que dividem o modelo. Mais VRAM é mais rápido. Pascal (Tesla P40 / P100, GTX 10) é experimental, ainda não validada. **AMD:** RX 7900 XT / XTX, Radeon AI PRO R9700 / RX 9070, Strix Halo e Gorgon Halo (Radeon 8060S / 8065S); RX 6800 / 6900 e Radeon PRO V620 / W6800 ainda não validadas; GLM-5.3-Flash e DeepSeek-V4.1-Flash-1017 leem imagens lá também - [docs/AMD_MAYA.md](docs/AMD_MAYA.md) |
+| **GPU** | NVIDIA, compute capability 7.0 ou superior (V100, RTX 20 e mais novas): uma, ou até 16 que dividem o modelo. Mais VRAM é mais rápido. Pascal (Tesla P40 / P100, GTX 10) é experimental, ainda não validada. **AMD:** RX 7900 XT / XTX, Radeon AI PRO R9700 / RX 9070, Strix Halo e Gorgon Halo (Radeon 8060S / 8065S); RX 6800 / 6900 e Radeon PRO V620 / W6800 ainda não validadas; GLM-5.3-Flash, DeepSeek-V4.1-Flash-1017 e Hy4-Flash leem imagens lá também - [docs/AMD_MAYA.md](docs/AMD_MAYA.md) |
 | **RAM** | 32 GB já roda. Mais RAM mantém mais especialistas por perto e é mais rápido |
 | **Disco** | **Um SSD NVMe rápido** com espaço para o modelo (~75 GB para GLM-5.3-Flash · Maya-XS, ~100 GB para GLM-5.3-Flash · Maya-S, ~160 GB para GLM-5.3-Flash · Maya-L, ~350 GB para DeepSeek V4.1 · Maya-S, ~470 GB para o GGUF Q8 da unsloth dele, ~95 GB para MiniMax M3.1 · Maya-XS, ~110 GB para Hy4-Flash · Maya-XS, ~200 GB para a quantização EXL3 do MiniMax-M3.1-Flash) e o codificador de imagens (1,1 GB). Não um HD |
 | **Sistema** | Linux (x86-64; uma CPU com AVX2 é o ideal), o driver NVIDIA, CUDA 12.x (o CUDA 13 funciona para RTX 20 e mais novas, não para a V100 nem Pascal), g++, Python 3.10+. Windows 10/11: [docs/WINDOWS.md](docs/WINDOWS.md). Não WSL2. AMD: ROCm 7 |

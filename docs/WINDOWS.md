@@ -73,3 +73,7 @@ and measured on Linux; on Windows 11 a user runs Maya-L on an RTX 4090, built wi
   ([docs/AMD_MAYA.md](AMD_MAYA.md#windows)).
   `tools\hip\build_maya_windows.bat` builds it by hand (an RX 7900 XTX,
   [#54](https://github.com/mw00/project-maya/pull/54)).
+- Hy4-Flash on an AMD GPU (a Strix Halo / Gorgon Halo, or a Radeon card) is **experimental** on Windows: the setup
+  builds and offers it as on Linux and says once that we have not tested it here. If it does not start, hangs or
+  answers wrongly, please report it with the engine's log; meanwhile use drafting off, Linux, or another model
+  ([AMD_MAYA.md](AMD_MAYA.md#hy4-flash-under-windows-experimental)).

@@ -704,6 +704,8 @@ Glm5Model::~Glm5Model() {
         if (e) cudaEventDestroy(e), e = nullptr;
     for (cudaEvent_t& e : ht_ev_)
         if (e) cudaEventDestroy(e), e = nullptr;
+    if (slot_bounce_) (void) cudaFreeHost(slot_bounce_);
+    slot_bounce_ = nullptr;
     if (ht_x_h_) cudaFreeHost(ht_x_h_);
     if (ht_lg_h_) cudaFreeHost(ht_lg_h_);
     if (ht_pair_h_) cudaFreeHost(ht_pair_h_);

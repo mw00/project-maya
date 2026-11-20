@@ -2,6 +2,7 @@
 layout: AngelSlim's Q4_K_M / Q3_K / IQ2 builds), beside the model's files (no weights copied).
 
     python tools/hy4/pack_gguf.py --model ~/models/Hy4-flash-GGUF [--mmproj FILE|none] [--mtp FILE|none]
+                                  [--drafter FILE|none]
 
 writes <model>/maya-hy4/:
   hy4.txt       the geometry, one `key value` a line (lists comma-separated), from the GGUF's hy_v4_flash.* keys; with
@@ -25,6 +26,13 @@ The MTP draft block (maya-hy4's --mtp): in the set itself (AngelSlim's builds: h
 for a set made from the public release, which has none - in a file of its own in the model's folder (general.type
 "mtp": tools/hy4/mtp_gguf.py writes it from a set that has the block), found there unless --mtp names one (or `none`).
 Its tensors join the pack as one more file and the geometry gains the block (n_mtp 1); a set with its own block keeps it.
+
+The DFly2 drafter (maya-hy4's --dfly2): the model's folder's GGUF (.gguf, or .dfly2 as on the Hub) of general.type
+"drafter" (architecture hy_v4_flash_dfly: the release's draft layers under their own names, model.dfly_layers.*, in
+ggml's block types or BF16), found there unless --drafter names one (or `none`).  Read as it is: its tensors join the pack as one more file, and the
+geometry gains the dfly_* lines - dfly_layers, dfly_heads, dfly_ff (its FFN's width), dfly_targets (the trunk layer
+whose cache and indexer picks each draft layer reads), dfly_mask (the query block's mask token), dfly_tokens (the
+drafts a pass it was made for).
 """
 from __future__ import annotations
 
@@ -77,6 +85,14 @@ def is_mtp(g: Gguf) -> bool:
     return g.kv.get("general.type") == "mtp" and g.kv.get("general.architecture") == ARCH
 
 
+DFLY_ARCH = ARCH + "_dfly"
+DFLY_PREFIX = "model.dfly_layers."
+
+
+def is_drafter(g: Gguf) -> bool:
+    return g.kv.get("general.type") == "drafter" and g.kv.get("general.architecture") == DFLY_ARCH
+
+
 def find_shards(model: pathlib.Path, names: list | None) -> list:
     paths = [model / n for n in names] if names else sorted(model.glob("*.gguf"))
     if not paths:
@@ -96,7 +112,7 @@ def find_shards(model: pathlib.Path, names: list | None) -> list:
             arch, kind = g.kv.get("general.architecture"), g.kv.get("general.type")
             if (arch is None or arch == ARCH) and kind in (None, "model"):
                 gs.append(g)
-            elif not is_mtp(g):                    # (the MTP block's own file: find_mtp's)
+            elif not is_mtp(g) and not is_drafter(g):   # (the MTP block's own file, the drafter's: find_mtp's, find_drafter's)
                 print("%s: %s / %s, not a shard of the model, left out" % (p.name, arch, kind))
         if not gs:
             raise SystemExit("%s: no %s model .gguf files" % (model, ARCH))
@@ -298,6 +314,93 @@ def find_mtp(model: pathlib.Path, arg: str | None) -> Gguf | None:
     return cands[0]
 
 
+def find_drafter(model: pathlib.Path, arg: str | None) -> Gguf | None:
+    """The DFly2 drafter's file: --drafter's, else the folder's one GGUF of general.type "drafter" (None: none)."""
+    if arg == "none":
+        return None
+    if arg:
+        p = pathlib.Path(arg).expanduser()
+        p = p if p.is_absolute() else (model / p if (model / p).exists() else p.resolve())
+        cands = [Gguf(p)]
+        if not is_drafter(cands[0]):
+            raise SystemExit("%s: not a %s drafter's file (general.type %r, general.architecture %r)" %
+                             (arg, ARCH, cands[0].kv.get("general.type"), cands[0].kv.get("general.architecture")))
+    else:
+        cands = []
+        for p in sorted(list(model.glob("*.gguf")) + list(model.glob("*.dfly2"))):   # (the Hub's name: .dfly2)
+            try:
+                g = Gguf(p)
+            except (Exception, SystemExit):  # noqa: BLE001 - not a GGUF this reader takes: not the drafter's file
+                continue
+            if is_drafter(g):
+                cands.append(g)
+    if len(cands) > 1:
+        raise SystemExit("%s: %d drafter files (name one with --drafter)" % (model, len(cands)))
+    if not cands:
+        return None
+    why = short(cands[0])
+    if why:
+        raise SystemExit("not whole yet: " + why)
+    return cands[0]
+
+
+def drafter_geometry(d: Gguf, geo: dict) -> dict:
+    """hy4.txt's dfly_* lines from the drafter's keys and tensors.  Refused: a drafter of another model's shapes, one
+    whose layers do not each read an indexed trunk layer's cache and picks, or of a layout maya-hy4 does not run."""
+    a, name = DFLY_ARCH + ".", d.path.name
+    kv = d.kv
+    t = {n: (typ, dims) for n, typ, dims, _ in d.tensors}
+    odd = [n for n in t if not n.startswith(DFLY_PREFIX)]
+    if odd:
+        raise SystemExit("%s: %s is no drafter tensor (%s*)" % (name, odd[0], DFLY_PREFIX))
+    n = int(kv.get(a + "block_count", 0))
+    targets = [int(x) for x in (kv.get(a + "target_kv_layers") or [])]
+    index = [int(x) for x in (kv.get(a + "target_index_layers") or targets)]
+    heads = int(kv.get(a + "attention.head_count", 0))
+    for k, want in (("embedding_length", geo["n_embd"]), ("attention.kv_lora_rank", geo["kv_lora"]),
+                    ("attention.q_lora_rank", geo["q_lora"])):
+        if int(kv.get(a + k, want)) != want:
+            raise SystemExit("%s: %s %r, the model's is %r - not this model's drafter" % (name, k, kv[a + k], want))
+    if n < 1 or len(targets) != n or index != targets or len(set(targets)) != n:
+        raise SystemExit("%s: %d draft layers reading the caches of layers %s and the picks of layers %s - maya-hy4 "
+                         "runs a drafter whose layers each read one trunk layer's cache and picks" %
+                         (name, n, targets, index))
+    for il in targets:
+        if not 0 <= il < geo["n_layer"] or geo["swa"][il] or not geo["indexer"][il]:
+            raise SystemExit("%s: its target layer %d is no indexed layer of this model" % (name, il))
+    if kv.get(a + "mtp_fusion", "slot0") != "slot0" or not kv.get(a + "hidden_correction", True):
+        raise SystemExit("%s: mtp_fusion %r / hidden_correction %r - maya-hy4 runs the slot0 fusion with the hidden "
+                         "correction" % (name, kv.get(a + "mtp_fusion"), kv.get(a + "hidden_correction")))
+    E, km, vm = geo["n_embd"], geo["k_mla"], geo["v_mla"]
+    nope = km - geo["rope_dim"]
+    ff = None
+    for i in range(n):
+        p = "%s%d." % (DFLY_PREFIX, i)
+        want = {p + "self_attn.q_a_proj.weight": [E, geo["q_lora"]],
+                p + "self_attn.q_b_proj.weight": [geo["q_lora"], heads * km],
+                p + "self_attn.kv_a_proj_with_mqa.weight": [E, geo["kv_lora"] + geo["rope_dim"]],
+                p + "self_attn.kv_b_proj.weight": [geo["kv_lora"], heads * (nope + vm)],
+                p + "self_attn.linear_gate.weight": [E, heads * vm],
+                p + "self_attn.o_proj.weight": [heads * vm, E],
+                p + "self_attn.learnable_sink_param": [heads]}
+        for tn, dims in want.items():
+            if tn not in t or list(t[tn][1]) != dims:
+                raise SystemExit("%s: %s is %s, %s expected" % (name, tn, list(t[tn][1]) if tn in t else "missing", dims))
+        up = t.get(p + "mlp.up_proj.weight")
+        if up is None or list(up[1])[:1] != [E] or (ff is not None and up[1][1] != ff):
+            raise SystemExit("%s: %smlp.up_proj.weight is %s" % (name, p, list(up[1]) if up else "missing"))
+        ff = int(up[1][1])
+    for tn in ("mtp_fusion.eh_proj.weight", "mtp_fusion.gate", "final_norm.weight", "hidden_correction.gate_proj.weight",
+               "hidden_correction.down_proj.weight"):
+        if DFLY_PREFIX + tn not in t:
+            raise SystemExit("%s: lacks %s%s" % (name, DFLY_PREFIX, tn))
+    mask = int(kv.get(a + "mask_token_id", -1))
+    if not 0 <= mask < geo["n_vocab"] or heads < 1 or ff % 256:
+        raise SystemExit("%s: mask token %d, %d heads, an FFN of %d - not a drafter maya-hy4 runs" % (name, mask, heads, ff))
+    return {"dfly_layers": n, "dfly_heads": heads, "dfly_ff": ff, "dfly_targets": targets, "dfly_mask": mask,
+            "dfly_tokens": int(kv.get(a + "num_speculative_tokens", 5))}
+
+
 # the keys a trunk and its MTP block must agree on (the block's matrices have the trunk's shapes), and the per-block ones
 MTP_SAME = ("embedding_length", "vocab_size", "expert_count", "expert_used_count", "expert_feed_forward_length",
             "expert_latent_length", "expert_shared_count", "expert_gating_func", "attention.q_lora_rank",
@@ -421,6 +524,8 @@ def main() -> int:
                                      "none: text only)")
     ap.add_argument("--mtp", help="the MTP draft block's own GGUF, for a set without the block (default: the folder's "
                                   "file of general.type mtp; none: no drafts)")
+    ap.add_argument("--drafter", help="the DFly2 drafter's GGUF (default: the folder's file of general.type drafter; "
+                                      "none: left out)")
     ap.add_argument("--engram-eps", type=float, help="the Engram norms' eps (default: the engine's, FP32's machine "
                     "epsilon; 0.0078125: the release run in BF16)")
     a = ap.parse_args()
@@ -442,8 +547,12 @@ def main() -> int:
     geo = geometry(kv)
     if vis is not None:
         geo.update(vision_geometry(vis, kv["tokenizer.ggml.tokens"], geo["n_embd"]))
+    dfly = find_drafter(model, a.drafter)
+    if dfly is not None:
+        geo.update(drafter_geometry(dfly, geo))
     tensors, lines = {}, []
-    for i, g in enumerate(gs + ([mtp] if mtp is not None else []) + ([vis] if vis is not None else [])):
+    for i, g in enumerate(gs + ([mtp] if mtp is not None else []) + ([dfly] if dfly is not None else []) +
+                          ([vis] if vis is not None else [])):
         lines.append("file %d %s" % (i, os.path.relpath(g.path, model)))
         for name, typ, dims, off in g.tensors:
             if name in tensors:
@@ -478,9 +587,10 @@ def main() -> int:
             extra += "engram_eps %r\n" % a.engram_eps
     (out / "hy4.txt").write_text(geometry_text(geo, model) + extra)
     (out / "tensors.txt").write_text("\n".join(lines) + "\n")
-    print("%s: %d tensors from %d files, %d layers (+%d MTP%s), %d Engram layers, %s" %
+    print("%s: %d tensors from %d files, %d layers (+%d MTP%s%s), %d Engram layers, %s" %
           (out, len(tensors), len(gs), geo["n_layer"], geo["n_mtp"],
-           ": %s" % mtp.path.name if mtp is not None else "", ne,
+           ": %s" % mtp.path.name if mtp is not None else "",
+           "; the DFly2 drafter: %s" % dfly.path.name if dfly is not None else "", ne,
            "the vision tower (%s)" % vis.path.name if vis is not None else "text only"))
     return 0
 

@@ -52,8 +52,9 @@ class _Reader:
     TIMEOUT = 20.0
     INIT_TIMEOUT = 120.0
     MAX_CRASHES = 5
+    MAX_ERRORS = 64
 
-    def __init__(self, argv=None):
+    def __init__(self, argv=None, quiet=False):
         self.argv = list(argv) if argv else [sys.executable, "-I", "-u", os.path.abspath(__file__), "--nvml-child"]
         self.lock = threading.Lock()
         self.skip: set = set()        # the calls that crashed or hung a reader
@@ -62,6 +63,18 @@ class _Reader:
         self.proc = None
         self.lines = None
         self.pump = None
+        self.err_pump = None
+        self.tail: collections.deque = collections.deque(maxlen=40)   # the reader's stderr: its last words
+        self.errors: list = []        # the readings that raised in the reader ({gpu, name, reading, error}), said once
+        self._said: set = set()
+        self.quiet = quiet            # (--report's own reader: its lines kept in self.notes, not printed)
+        self.notes: list = []
+
+    def _say(self, msg):
+        if self.quiet:
+            self.notes.append(msg)
+        else:
+            print(msg, flush=True)
 
     def call(self, req: dict):
         """The reader's answer (a dict) to `req`, or None: no NVML, or the reader crashed on it."""
@@ -77,9 +90,10 @@ class _Reader:
                 except (OSError, ValueError) as e:
                     if self.proc is None:             # (it could not be started at all)
                         self.off = True
-                        print(f"[maya] the GPU readings are off: their NVML reader did not start ({e})", flush=True)
+                        self._say(f"[maya] the GPU readings are off: their NVML reader did not start ({e})")
                         return None
-                    rep, culprit, why = None, None, f"its pipe broke ({e})"
+                    # (it ended between two requests - with no call open: how it ended says why)
+                    rep, culprit, why = None, None, f"its pipe broke ({e}): it had ended, {_ended(self._exit_code())}"
                 else:
                     rep, culprit, why = self._answer()
                 if rep is not None:
@@ -87,16 +101,41 @@ class _Reader:
                         self.off = True
                         self._stop()
                         return None
+                    self._failed(rep.pop("errors", None))
                     return rep
                 self._crashed(culprit, why)
+            return None
+
+    def _failed(self, errors):
+        """The readings the reader left out because they raised: each said once ("a GPU reading failed on GPU 1
+        (Tesla P4): power - TypeError: ... - left out") and kept for --report."""
+        for e in errors or []:
+            if not isinstance(e, dict):
+                continue
+            key = (e.get("gpu"), e.get("reading"), e.get("error"))
+            if key in self._said:
+                continue
+            self._said.add(key)
+            if len(self.errors) < self.MAX_ERRORS:
+                self.errors.append(e)
+            where = "" if e.get("gpu") is None else f" on GPU {e['gpu']}" + (f" ({e['name']})" if e.get("name") else "")
+            self._say(f"[maya] a GPU reading failed{where}: {e.get('reading')} - {e.get('error')} - left out, the "
+                      "other readings go on")
+
+    def _exit_code(self):
+        try:
+            code = self.proc.poll()
+            return code if code is not None else self.proc.wait(timeout=2)
+        except (OSError, subprocess.TimeoutExpired):
             return None
 
     def _start(self):
         args = self.argv + (["--skip", ",".join(sorted(self.skip))] if self.skip else [])
         kw = {"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0)} if os.name == "nt" else {}
-        self.proc = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        self.proc = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                      text=True, encoding="utf-8", errors="replace", bufsize=1, **kw)
         q: queue.Queue = queue.Queue()
+        self.tail.clear()
 
         def pump(f=self.proc.stdout):
             try:
@@ -105,8 +144,17 @@ class _Reader:
             except (OSError, ValueError):
                 pass
             q.put(None)
+
+        def pump_err(f=self.proc.stderr, tail=self.tail):    # (always drained: a full pipe would stall the reader)
+            try:
+                for line in f:
+                    tail.append(line.rstrip("\r\n"))
+            except (OSError, ValueError):
+                pass
         self.pump = threading.Thread(target=pump, name="nvml-reader", daemon=True)
         self.pump.start()
+        self.err_pump = threading.Thread(target=pump_err, name="nvml-reader-err", daemon=True)
+        self.err_pump.start()
         self.lines = q
 
     def _answer(self):
@@ -133,9 +181,11 @@ class _Reader:
                 deadline = time.monotonic() + wait
             else:
                 try:
-                    return json.loads(line), None, None
+                    rep = json.loads(line)
                 except ValueError:
                     continue
+                if isinstance(rep, dict):            # (anything else on its stdout - a library's own print - is not it)
+                    return rep, None, None
 
     def _stop(self):
         p, self.proc = self.proc, None
@@ -146,27 +196,72 @@ class _Reader:
             p.wait(timeout=5)
         except (OSError, subprocess.TimeoutExpired):
             pass
-        self.pump.join(timeout=2)                    # (its pipe's end once the process is gone)
-        for f in (p.stdin, p.stdout):
+        for t in (self.pump, self.err_pump):         # (their pipes' ends once the process is gone)
+            if t is not None:
+                t.join(timeout=2)
+        for f in (p.stdin, p.stdout, p.stderr):
             try:
-                f.close()
+                if f is not None:
+                    f.close()
             except (OSError, ValueError):
                 pass
 
     def _crashed(self, culprit, why):
         self._stop()
+        words = _last_words(list(self.tail))
+        if words:
+            why = f"{why}; its last words: {words}"
         self.crashes += 1
         if culprit:
             self.skip.add(culprit)
         if self.crashes >= self.MAX_CRASHES:
             self.off = True
-            print(f"[maya] the GPU readings are off: their NVML reader crashed {self.crashes} times ({why}) - the "
-                  "server goes on without them", flush=True)
+            self._say(f"[maya] the GPU readings are off: their NVML reader crashed {self.crashes} times ({why}) - the "
+                      "server goes on without them")
         elif culprit:
-            print(f"[maya] the GPU readings' NVML call {culprit} crashed their reader ({why}): that reading is left "
-                  "out from now on - the server goes on", flush=True)
+            self._say(f"[maya] the GPU readings' NVML call {culprit} crashed their reader ({why}): that reading is "
+                      "left out from now on - the server goes on")
         else:
-            print(f"[maya] the GPU readings' NVML reader stopped ({why}); starting it again", flush=True)
+            self._say(f"[maya] the GPU readings' NVML reader stopped ({why}); starting it again")
+
+
+def _ended(code) -> str:
+    """How a reader process ended, in words: its exit code, the signal that ended it (Linux), a crash (Windows)."""
+    if code is None:
+        return "its exit code not known"
+    if code < 0 and os.name != "nt":
+        try:
+            import signal
+            return f"killed by {signal.Signals(-code).name}" + (" (the system's out-of-memory killer, or another "
+                                                                 "program)" if -code == 9 else "")
+        except ValueError:
+            return f"killed by signal {-code}"
+    if os.name == "nt" and code & 0xFFFFFFFF >= 0xC0000000:
+        return f"a crash (0x{code & 0xFFFFFFFF:08X})"
+    return f"exit code {code}"
+
+
+def _last_words(lines) -> str:
+    """What a reader printed on stderr as it ended, in one line: a Python error (its last line, and where - the
+    innermost frame), a native crash's fatal error (faulthandler: the frame it was in), else its last line."""
+    lines = [s for s in lines if s.strip()]
+    if not lines:
+        return ""
+    frame = re.compile(r'File "([^"]+)", line (\d+),? in (\S+)')    # (a traceback's frame; faulthandler's: no comma)
+
+    def where(found):
+        return f" (in {found.group(3)}, {os.path.basename(found.group(1))} line {found.group(2)})" if found else ""
+    fatal = next((i for i, s in enumerate(lines) if s.startswith(("Fatal Python error", "Windows fatal exception"))),
+                 None)
+    if fatal is not None:                            # (faulthandler: the current thread's frames, innermost first)
+        found = next((m for m in (frame.search(s) for s in lines[fatal + 1:]) if m), None)
+        return lines[fatal].strip() + where(found)
+    if any(s.startswith("Traceback") for s in lines):
+        found = None
+        for s in lines:
+            found = frame.search(s) or found
+        return lines[-1].strip()[:300] + where(found)
+    return lines[-1].strip()[:300]
 
 
 _READER = None
@@ -204,6 +299,7 @@ class _Nvml:
 
     def __init__(self, lib, index=0):
         self.lib, self.dev = lib, None
+        self.errors: list = []        # [(reading, "Type: message")]: the readings that raised, for the server (safe())
         if lib is None:
             return
         h = ctypes.c_void_p()
@@ -213,9 +309,25 @@ class _Nvml:
                 self.dev = h
         except (AttributeError, OSError):
             pass
+        except Exception as e:  # noqa: BLE001 - no handle: this GPU is not read (the error goes to the server)
+            self._failed("the card's handle", e)
 
     def ok(self):
         return self.lib is not None and self.dev is not None
+
+    def _failed(self, reading, e):
+        self.errors.append((reading, f"{type(e).__name__}: {e}"[:300]))
+
+    def safe(self, reading, fn, *args, default=None):
+        """fn(*args) - one reading - or `default` when it raises (a TypeError from ctypes, a value it cannot convert,
+        ...): that value is left out, the error kept in self.errors for the server, and the reader goes on.  Without
+        this a Python error after an NVML call had returned ended the reader with no call open: the server could not
+        tell what to leave out, started it again, and the same reading ended it again (a report's Tesla P4 + V100)."""
+        try:
+            return fn(*args)
+        except Exception as e:  # noqa: BLE001 - one reading's failure must not end the others
+            self._failed(reading, e)
+            return default
 
     def _uint(self, fn, *args):
         v = ctypes.c_uint()
@@ -223,6 +335,10 @@ class _Nvml:
             return v.value if getattr(self.lib, fn)(self.dev, *args, ctypes.byref(v)) == 0 else None
         except (AttributeError, OSError):
             return None
+
+    def _scaled(self, fn, scale, *args):
+        v = self._uint(fn, *args)
+        return v / scale if v is not None else None
 
     def procs(self):
         """{pid: bytes it holds on this GPU (None: NVML can't say, as on Windows)} of the processes with a compute
@@ -237,7 +353,8 @@ class _Nvml:
             n, buf = ctypes.c_uint(256), (st * 512)()
             try:
                 if f(self.dev, ctypes.byref(n), buf) == 0:      # (NVML_VALUE_NOT_AVAILABLE: all ones)
-                    return {buf[i].pid: None if buf[i].used >= 2**63 else buf[i].used for i in range(min(n.value, 256))}
+                    return {int(buf[i].pid): None if buf[i].used >= 2**63 else int(buf[i].used)
+                            for i in range(min(int(n.value), 256))}
             except OSError:
                 pass
         return None
@@ -268,32 +385,45 @@ class _Nvml:
             pass
         return None
 
-    def read(self):
-        out = {}
+    def _util(self):
         u = self.Util()
         try:
-            if self.lib.nvmlDeviceGetUtilizationRates(self.dev, ctypes.byref(u)) == 0:
-                out["util"] = u.gpu
+            return int(u.gpu) if self.lib.nvmlDeviceGetUtilizationRates(self.dev, ctypes.byref(u)) == 0 else None
         except (AttributeError, OSError):
-            pass
+            return None
+
+    def _mem(self):
         m = self.Mem()
         try:
             if self.lib.nvmlDeviceGetMemoryInfo(self.dev, ctypes.byref(m)) == 0:
-                out["mem_used"], out["mem_total"] = m.used, m.total
+                return int(m.used), int(m.total)
         except (AttributeError, OSError):
             pass
-        out["temp"] = self._uint("nvmlDeviceGetTemperature", ctypes.c_uint(0))          # NVML_TEMPERATURE_GPU
-        mw = self._uint("nvmlDeviceGetPowerUsage")
-        out["power"] = mw / 1000.0 if mw is not None else None
-        lim = self._uint("nvmlDeviceGetEnforcedPowerLimit")
-        out["power_limit"] = lim / 1000.0 if lim is not None else None
-        out["pcie_gen"] = self._uint("nvmlDeviceGetCurrPcieLinkGeneration")        # drops at idle (power saving)
-        out["pcie_gen_max"] = self._uint("nvmlDeviceGetMaxPcieLinkGeneration")
-        out["pcie_width"] = self._uint("nvmlDeviceGetCurrPcieLinkWidth")
-        rx = self._uint("nvmlDeviceGetPcieThroughput", ctypes.c_uint(1))                 # NVML_PCIE_UTIL_RX_BYTES, KB/s
-        tx = self._uint("nvmlDeviceGetPcieThroughput", ctypes.c_uint(0))
-        out["pcie_rx_mb"] = rx / 1024.0 if rx is not None else None
-        out["pcie_tx_mb"] = tx / 1024.0 if tx is not None else None
+        return None
+
+    # the readings: (key, how) - each read on its own (safe): one that raises is None, the rest are read
+    # (a passively cooled Tesla has no fan to read - not asked here; its power, PCIe link and throughput calls can be
+    #  missing or answer NOT_SUPPORTED on an old board: None, as any call that does not answer 0)
+    def _readings(self):
+        return (("temp", lambda: self._uint("nvmlDeviceGetTemperature", ctypes.c_uint(0))),        # NVML_TEMPERATURE_GPU
+                ("power", lambda: self._scaled("nvmlDeviceGetPowerUsage", 1000.0)),
+                ("power_limit", lambda: self._scaled("nvmlDeviceGetEnforcedPowerLimit", 1000.0)),
+                ("pcie_gen", lambda: self._uint("nvmlDeviceGetCurrPcieLinkGeneration")),        # drops at idle
+                ("pcie_gen_max", lambda: self._uint("nvmlDeviceGetMaxPcieLinkGeneration")),
+                ("pcie_width", lambda: self._uint("nvmlDeviceGetCurrPcieLinkWidth")),
+                ("pcie_rx_mb", lambda: self._scaled("nvmlDeviceGetPcieThroughput", 1024.0, ctypes.c_uint(1))),  # KB/s
+                ("pcie_tx_mb", lambda: self._scaled("nvmlDeviceGetPcieThroughput", 1024.0, ctypes.c_uint(0))))
+
+    def read(self):
+        out = {}
+        util = self.safe("util", self._util)
+        if util is not None:
+            out["util"] = util
+        mem = self.safe("mem", self._mem)
+        if mem is not None:
+            out["mem_used"], out["mem_total"] = mem
+        for key, how in self._readings():
+            out[key] = self.safe(key, how)
         return out
 
 
@@ -377,6 +507,11 @@ def _child_main(args, lib=None):
             ctypes.windll.kernel32.SetErrorMode(0x0001 | 0x0002 | 0x8000)
         except (AttributeError, OSError):
             pass
+    try:                      # a native crash here prints where it was (the server keeps the reader's last words)
+        import faulthandler
+        faulthandler.enable(file=sys.stderr)
+    except (ImportError, OSError, ValueError, AttributeError, RuntimeError):
+        pass
     out = sys.stdout
     real = lib if lib is not None else _open_nvml()
     nv = _Marked(real, skip, out) if real is not None else None
@@ -388,35 +523,88 @@ def _child_main(args, lib=None):
         except (AttributeError, OSError):
             ok = False
     devs: dict = {}
+    names: dict = {}
+    sent: set = set()          # (each reading's error once per reader; the server says it once per server)
+    errors: list = []
 
     def dev(i):
         if i not in devs:
             devs[i] = _Nvml(nv, i)
         return devs[i]
 
-    def reading(d):
+    def name(i):
+        if i not in names:
+            names[i] = dev(i).safe("name", dev(i).name) if dev(i).ok() else None
+        return names[i]
+
+    def take(i):
+        """GPU i's new reading errors into `errors` (with the card's name)."""
+        d = devs.get(i)
+        if d is None or not d.errors:
+            return
+        nm = name(i)                           # (read first: its own error, if any, joins the list)
+        got, d.errors = d.errors, []
+        for reading, err in got:
+            if (i, reading, err) not in sent:
+                sent.add((i, reading, err))
+                errors.append({"gpu": i, "name": nm, "reading": reading, "error": err})
+
+    def reading(i):
+        d = dev(i)
         if not d.ok():
             return None
         r = d.read()
-        p = d.procs()
+        p = d.safe("procs", d.procs)
         r["procs"] = None if p is None else [[pid, used] for pid, used in p.items()]
         return r
 
-    def all_pids():
-        count = ctypes.c_uint()
+    def info(i):
+        d = dev(i)
+        return {"index": i, "ok": d.ok(), "pci": d.safe("pci", d.pci) if d.ok() else None, "name": name(i)}
+
+    def count():
+        n = ctypes.c_uint()
         try:
             fn = getattr(nv, "nvmlDeviceGetCount_v2", None) or nv.nvmlDeviceGetCount
-            if fn(ctypes.byref(count)) != 0:
-                return None
+            return int(n.value) if fn(ctypes.byref(n)) == 0 else None
         except (AttributeError, OSError):
             return None
+
+    def all_pids():
+        n = count()
+        if n is None:
+            return None
         pids = set()
-        for i in range(count.value):
-            p = dev(i).pids() if dev(i).ok() else None
+        for i in range(n):
+            p = dev(i).safe("procs", dev(i).pids) if dev(i).ok() else None
             if p is None:
                 return None
             pids |= p
         return sorted(pids)
+
+    def probe():
+        """--report: every GPU's readings, each one's value (None: not given) - the errors come with the answer."""
+        return [dict(info(i), values=reading(i)) for i in range(count() or 0)]
+
+    def answer(op, idx):
+        if not ok:
+            return {"ok": False}
+        if op == "info":
+            return {"ok": True, "gpus": [per_gpu(i, info) for i in idx]}
+        if op == "read":
+            return {"ok": True, "gpus": [per_gpu(i, reading) for i in idx]}
+        if op == "pids":
+            return {"ok": True, "pids": all_pids()}
+        if op == "probe":
+            return {"ok": True, "gpus": probe()}
+        return {"ok": True}
+
+    def per_gpu(i, how):
+        try:
+            return how(i)
+        except Exception as e:  # noqa: BLE001 - this GPU's answer empty, the others go on
+            dev(i)._failed(f"its {how.__name__}", e)
+            return None
 
     while True:
         line = sys.stdin.readline()
@@ -424,21 +612,24 @@ def _child_main(args, lib=None):
             return
         try:
             req = json.loads(line)
-        except ValueError:
+            op, idx = req.get("op"), [int(i) for i in req.get("idx") or []]
+        except (ValueError, TypeError, AttributeError):
             continue
-        op, idx = req.get("op"), [int(i) for i in req.get("idx") or []]
-        if not ok:
-            rep = {"ok": False}
-        elif op == "info":
-            rep = {"ok": True, "gpus": [{"index": i, "ok": dev(i).ok(), "pci": dev(i).pci() if dev(i).ok() else None,
-                                         "name": dev(i).name() if dev(i).ok() else None} for i in idx]}
-        elif op == "read":
-            rep = {"ok": True, "gpus": [reading(dev(i)) for i in idx]}
-        elif op == "pids":
-            rep = {"ok": True, "pids": all_pids()}
-        else:
+        try:
+            rep = answer(op, idx)
+        except Exception as e:  # noqa: BLE001 - the request's own failure: an empty answer, never the reader's end
             rep = {"ok": True}
-        out.write(json.dumps(rep) + "\n")
+            errors.append({"gpu": None, "name": None, "reading": f"the {op} request", "error": f"{type(e).__name__}: {e}"[:300]})
+        for i in list(devs):
+            take(i)
+        if errors:
+            rep["errors"], errors = errors, []
+        try:
+            text = json.dumps(rep)
+        except (TypeError, ValueError) as e:     # (a value JSON can't write: the answer without its readings)
+            text = json.dumps({"ok": rep.get("ok", True), "errors": (rep.get("errors") or []) + [
+                {"gpu": None, "name": None, "reading": f"the {op} answer", "error": f"{type(e).__name__}: {e}"[:300]}]})
+        out.write(text + "\n")
         out.flush()
 
 
@@ -865,6 +1056,43 @@ def free_vram_mib(index=0, amd=False):
     if r.get("mem_total") is None or r.get("mem_used") is None:
         return None
     return int((r["mem_total"] - r["mem_used"]) >> 20)
+
+
+# the Monitor's readings of a card, as the reader gives them (mem: mem_used and mem_total; procs: the processes on it)
+READINGS = ("util", "mem_used", "temp", "power", "power_limit", "pcie_gen", "pcie_gen_max", "pcie_width",
+            "pcie_rx_mb", "pcie_tx_mb", "procs")
+
+
+def readings_report(reader: _Reader | None = None) -> str:
+    """--report: what the Monitor's NVML reader gives on every NVIDIA GPU here - a reader of its own (the server's
+    may be running), each GPU's readings given or not, and any reading that failed or crashed the reader, with the
+    error - so a report names the reading behind a reader that kept stopping."""
+    r = reader or _Reader()
+    r.quiet = True
+    try:
+        rep = r.call({"op": "probe"})
+    finally:
+        r._stop()
+    lines = []
+    if rep is None and not r.notes:
+        return "no NVML here (no NVIDIA driver): nothing to read"
+    for g in (rep or {}).get("gpus") or []:
+        vals = g.get("values") or {}
+        i = g.get("index")
+        head = f"GPU {i} {g.get('name') or '?'}" + (f" ({g['pci']})" if g.get("pci") else "")
+        if not g.get("ok"):
+            lines.append(f"{head}: no NVML handle - not read")
+            continue
+        missing = [k for k in READINGS if vals.get(k) is None]
+        failed = [f"{e.get('reading')} ({e.get('error')})" for e in r.errors if e.get("gpu") == i]
+        lines.append(f"{head}: {len(READINGS) - len(missing)} of {len(READINGS)} readings given" +
+                     (f"; not given: {', '.join(missing)}" if missing else "") +
+                     (f"; FAILED: {'; '.join(failed)}" if failed else ""))
+    lines += [f"{e.get('reading')}: {e.get('error')}" for e in r.errors if e.get("gpu") is None]
+    lines += [n.replace("[maya] ", "") for n in r.notes if "a GPU reading failed" not in n]
+    if r.skip:
+        lines.append("left out by the reader (crashed or hung it): " + ", ".join(sorted(r.skip)))
+    return "\n".join(lines) or "the reader gave no GPU"
 
 
 # ------------------------------------------------------------------------------------------------ CPU / RAM

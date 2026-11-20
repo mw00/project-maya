@@ -6,6 +6,7 @@
 
 #include <cstdio>
 #include <string>
+#include <vector>
 
 #define CHECK(expr) do { if (!(expr)) { std::fprintf(stderr, "line %d: %s\n", __LINE__, #expr); return 1; } } while (0)
 
@@ -124,6 +125,39 @@ int main() {
         CHECK(!p.fits && !p.q8 && !p.vision);
         CHECK(c.tried == "fVqVf-q-");
     }
+    // a picture's room lent by the prompt buffers (vision_keep): nothing kept free, so a card the model's own parts
+    // fill reads the largest picture with the rows a text-only start has - no 8-bit rows, no smaller picture, no
+    // pictures turned off for the room
+    {
+        CHECK(hy4::vision_keep(0.8, 0.9) == 0.0 && hy4::vision_keep(0.8, 0.8) == 0.0);
+        CHECK(hy4::vision_keep(0.75, 0.5) == 0.25 && hy4::vision_keep(0.8, 0.0) == 0.8);
+        auto lent = [](Card& c, double lend, int kv, bool vision_auto) {
+            return hy4::kv_pick(c, kv == 1, kv < 0, true, vision_auto, kMax, 1024,
+                                [&](long long n) { return hy4::vision_keep(c.room(n), lend); });
+        };
+        Card a{7.0, 6.0, 1.0, 0.8, ""};   // (no room for a picture beside F16 rows: before, pictures off - 8-bit rows)
+        const hy4::KvPick p = lent(a, 0.9, -1, true);
+        CHECK(p.fits && !p.q8 && p.vision && p.patches == kMax);
+        CHECK(a.tried == "f-");
+        Card b{7.0, 6.0, 1.5, 0.8, ""};   // (8-bit rows for the context alone, as a text-only start: the picture whole)
+        const hy4::KvPick q = lent(b, 0.9, -1, true);
+        CHECK(q.fits && q.q8 && q.vision && q.patches == kMax);
+        CHECK(b.tried == "f-q-");
+        // buffers smaller than the largest picture's room (a small chunk): only what they lack is counted ...
+        Card c{7.35, 6.0, 1.0, 0.8, ""};   // (0.5 lent: 0.3 more - before, 0.8 did not fit beside F16 rows)
+        const hy4::KvPick r = lent(c, 0.5, -1, true);
+        CHECK(r.fits && !r.q8 && r.vision && r.patches == kMax);
+        CHECK(c.tried == "fv");
+        // ... and where that does not fit with the rows asked for (--kv f16), the largest picture the buffers hold
+        Card d{7.0, 6.0, 1.0, 0.8, ""};
+        const hy4::KvPick s = lent(d, 0.5, 0, true);
+        CHECK(s.fits && !s.q8 && s.vision && s.patches >= 1024 && s.patches < kMax);
+        CHECK(d.room(s.patches) <= 0.5 + 1e-9 && d.room(s.patches + 64) > 0.5);
+        // nothing lent at all (HY4_VISION_LEND=0): the plan as before
+        Card e{7.3, 6.0, 1.0, 0.8, ""}, f{7.3, 6.0, 1.0, 0.8, ""};
+        const hy4::KvPick t = lent(e, 0.0, -1, true), u = pick(f, -1, true, true, 1024);
+        CHECK(t.fits == u.fits && t.q8 == u.q8 && t.vision == u.vision && t.patches == u.patches && e.tried == f.tried);
+    }
     // --chunk auto (chunk_pick): the largest chunk whose plan keeps the layout, the cache's rows and the pictures of
     // the plan at the base chunk.  A rig in GB: every card `vram` free beyond the reserve; a tensor-parallel member
     // needs `member`, the head's GPU the head and the MTP block (`head`), a picture's room and a chunk's scratch
@@ -166,6 +200,22 @@ int main() {
         r.tried.clear();
         CHECK(hy4::chunk_pick(r, kCands, 1024) == 2048);
         CHECK(r.tried == "1024 4096 2048 ");
+    }
+    {   // a group that holds every expert at the base and a part of them (the CPU lane's the others) above it: a chunk
+        //  never costs an expert its place in the group's VRAM; a group that holds a part at the base takes the chunk
+        struct Lane {
+            int all_up_to;
+            hy4::ChunkTry operator()(int chunk) {
+                hy4::ChunkTry t;
+                t.ok = true;
+                t.tp = 4;
+                t.lane = chunk > all_up_to;
+                return t;
+            }
+        };
+        Lane full{2048}, part{0};
+        CHECK(hy4::chunk_pick(full, kCands, 1024) == 2048);
+        CHECK(hy4::chunk_pick(part, kCands, 1024) == 4096);
     }
     {   // one card: the largest chunk the model's own parts leave room for
         Rig r{9.0, 0, 4.6, 0.83, 1.15, 1, 1 << 30, 1 << 30, ""};
@@ -255,6 +305,20 @@ int main() {
         own.tried.clear();
         CHECK(hy4::dense_pick(own, kSpans, 8192) == 16384);
         CHECK(own.tried == "8192 24576 16384 ");
+        // ... or the output head's rows over the members (a slice a member, `head_gb`): the span that keeps them
+        struct Head : Span {
+            double head_gb;
+            hy4::ChunkTry operator()(int d) {
+                hy4::ChunkTry t = Span::operator()(d);
+                t.head = t.tp > 0 && need + per_8k * d / 8192.0 + head_gb <= vram;
+                return t;
+            }
+        };
+        Head head{{14.3, 14.0, 0.075, true, false, 1 << 30, 1 << 30, ""}, 0.11};
+        CHECK(head(8192).head && head(24576).tp == 3 && !head(24576).head && head(16384).head);
+        head.tried.clear();
+        CHECK(hy4::dense_pick(head, kSpans, 8192) == 16384);
+        CHECK(head.tried == "8192 24576 16384 ");
         // any longer span would cost tensor parallel (the layer split would hold it): the base
         Span tight{14.1, 14.0, 0.075, true, false, 1 << 30, 1 << 30, ""};
         CHECK(tight(16384).ok && tight(16384).tp == 0);
@@ -284,6 +348,52 @@ int main() {
         CHECK(hy4::dense_pick(named, one, 8192) == 32768);
         Span named_tight{14.2, 14.0, 0.075, true, false, 1 << 30, 1 << 30, ""};
         CHECK(hy4::dense_pick(named_tight, one, 8192) == 8192);
+    }
+    {   // the DFly2 drafter's key lists: the picks below pos in their order, then the block's own rows up to each
+        const int picks[6] = {8, 9, 0, 1, 12, -1};
+        int keys[3 * 8], nk[3];
+        CHECK(hy4::dfly_keys(picks, 6, 12, 3, keys, 8, nk) == 7);
+        CHECK(nk[0] == 5 && nk[1] == 6 && nk[2] == 7);
+        const int want2[7] = {8, 9, 0, 1, 12, 13, 14};
+        for (int i = 0; i < 7; ++i) CHECK(keys[2 * 8 + i] == want2[i]);
+        CHECK(keys[0 * 8 + 4] == 12 && keys[1 * 8 + 5] == 13);
+        CHECK(hy4::dfly_keys(picks, 6, 13, 3, keys, 8, nk) == 8 && keys[4] == 12 && keys[5] == 13 && nk[2] == 8);
+        CHECK(hy4::dfly_keys(picks, 6, 13, 4, keys, 8, nk) == 0);   // (too narrow: refused)
+        CHECK(hy4::dfly_keys(picks, 0, 0, 2, keys, 8, nk) == 2 && nk[0] == 1 && keys[8 + 1] == 1);
+        // its kv_b rows: a head's 2 key rows, then its 3 value rows; the key matrix transposed
+        CHECK(hy4::dfly_kvb_k_row(0, 1, 2, 3) == 1 && hy4::dfly_kvb_k_row(2, 0, 2, 3) == 10);
+        CHECK(hy4::dfly_kvb_v_row(0, 0, 2, 3) == 2 && hy4::dfly_kvb_v_row(1, 2, 2, 3) == 9);
+        const float k[2 * 4] = {1, 2, 3, 4, 5, 6, 7, 8};
+        float o[4 * 2];
+        hy4::dfly_k_b(k, 2, 4, o);
+        CHECK(o[0] == 1 && o[1] == 5 && o[2] == 2 && o[3] == 6 && o[6] == 4 && o[7] == 8);
+        CHECK(hy4::dfly_bytes(1e9, 2e8, 5, 16, 2112, 3072, 9216) > 1.2e9 &&
+              hy4::dfly_bytes(1e9, 2e8, 5, 16, 2112, 3072, 9216) < 1.25e9);
+    }
+    // the experts in VRAM (INFO vram_slots): the layer split's own map; tensor parallel's members' and helpers' maps,
+    // an expert held when any of them holds a slice of it (its blocks round the members: every expert on some member)
+    {
+        const std::vector<int> split = {0, -1, 1, -1, -1, 2, -1, -1};   // (3 of 8 in VRAM, 5 on the CPU lane)
+        CHECK(hy4::experts_held(8, {&split}) == 3);
+        const std::vector<int> all = {0, 1, 2, 3, 4, 5, 6, 7};
+        CHECK(hy4::experts_held(8, {&all}) == 8);
+        // two members, an expert of one block on member 0 or 1 only: each half, together all
+        const std::vector<int> m0 = {0, -1, 1, -1, 2, -1, 3, -1}, m1 = {-1, 0, -1, 1, -1, 2, -1, 3};
+        CHECK(hy4::experts_held(8, {&m0}) == 4);
+        CHECK(hy4::experts_held(8, {&m0, &m1}) == 8);
+        // three members and a helper's units: an expert held twice counts once
+        const std::vector<int> t0 = {0, 1, -1, -1, 2, -1, -1, -1}, t1 = {-1, 0, 1, -1, -1, 2, -1, -1},
+                               t2 = {-1, -1, 0, 1, -1, -1, 2, -1}, hp = {-1, -1, -1, 0, -1, -1, 1, 2};
+        CHECK(hy4::experts_held(8, {&t0, &t1, &t2, &hp}) == 8);
+        CHECK(hy4::experts_held(8, {&t0, &t1, &t2}) == 7);   // (expert 7: the helper's alone)
+        // the old count's case: the head's placeholder layer (no map) holds none - the members hold them all
+        const std::vector<int> none;
+        CHECK(hy4::experts_held(8, {&none}) == 0);
+        CHECK(hy4::experts_held(8, {&none, &m0, &m1}) == 8);
+        CHECK(hy4::experts_held(8, {nullptr, &m0}) == 4);
+        const std::vector<int> short_map = {0, 1};   // (past a map's end: not held there)
+        CHECK(hy4::experts_held(8, {&short_map}) == 2);
+        CHECK(hy4::experts_held(0, {&all}) == 0);
     }
     std::puts("hy4_plan_test: ok");
     return 0;

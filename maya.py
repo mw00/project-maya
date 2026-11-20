@@ -781,7 +781,8 @@ QWEN_QUANTS = ("q5_k_m", QWEN_UD)
 # Hy4-Flash (v1.1.68): Tencent's tencent/Hy4-flash (hy_v4_flash, 220B with its n-gram tables: 42 layers and an MTP
 # block, MLA attention with a sliding window and 12 indexed layers, 512 experts, 16 a token, 4 hyper-connection streams,
 # Engram) on its own engine maya-hy4 (src/hy4; NVIDIA: CUDA, Linux and Windows, V100 on; AMD: HIP, Linux - a
-# unified-memory APU (Strix Halo / Gorgon Halo) or Radeon cards; no Mac engine yet),
+# unified-memory APU (Strix Halo / Gorgon Halo) or Radeon cards - and Windows, experimental (not run by us yet); no Mac
+# engine yet),
 # which reads GGUF sets in place (packed by tools/hy4/pack_gguf.py).  tools/hy4/download.json is the one table of its
 # files: Project Maya's own quants ("quants": which sizes are uploaded) and Tencent's own Q4_K_M from AngelSlim
 # ("others": pinned, sha256-checked - the one set with the MTP block, so the one that drafts: --mtp; run on RTX 30 /
@@ -792,9 +793,9 @@ QWEN_QUANTS = ("q5_k_m", QWEN_UD)
 # every set, from Maya's repo: downloaded once, hard-linked) is read from the SSD page by page, never loaded into RAM.
 # Pictures: the model's vision tower (the mmproj file beside the set - Maya's own Q8_0 one for every Maya size,
 # AngelSlim's BF16 for the Q4_K_M; not with --no-vision) runs in the engine a picture at a time: its weights stay in the
-# file, a picture's room (HY4_VISION_GIB; a smaller picture's where the VRAM holds no more - the engine says the size,
-# the server resizes to it) is kept free on the main GPU - where the model leaves none the setup turns pictures off
-# and says so.  It thinks at one level (high) or not at all (no_think); its sampling is its
+# file, and a picture's room (HY4_VISION_GIB while it is read) is lent by the engine's prompt buffers, idle then -
+# no VRAM is kept for pictures, so every card that runs the model reads them at full size (an 8 GB card's buffers at
+# its 256-token chunk: 1.0 GB).  It thinks at one level (high) or not at all (no_think); its sampling is its
 # generation_config.json's (maya_quants.MODEL_DEFAULTS["hy4"]); one request at a time.  Each Maya size in <models
 # folder>/<its full name> (a layout of it: <name>-8GB), its config maya-hy4-flash-maya-xs.json; the Q4_K_M in <models
 # folder>/Hy4-flash, its config maya-hy4-flash.json.
@@ -821,10 +822,19 @@ HY4_Q4_LONG_SHARE = 0.25                           # (the cache in 8-bit rows: a
 # (Maya's sizes draft with Tencent's MTP block from a file of its own - download.json's "mtp": the engine rounds its BF16
 #  matrices to Q8_0, HY4_MTP_VRAM of the file's bytes, always in VRAM, and keeps a prompt chunk of rows beside it)
 HY4_MTP_VRAM = 0.56
-HY4_VISION_GIB = 0.81                              # (the engine's room for its largest picture, 2048 x 2048: 828 MB of the main GPU)
-# (... and for the smallest picture budget it takes, a sixteenth of the largest: 512 x 512 - src/hy4/hy4_vision.cu's
-#  layout: the weights' two slots, the attention's scores, cuBLAS's workspace and the patches' rows)
-HY4_VISION_MIN_GIB = 0.21
+# (... and where the block does not fit, with the size's DFly2 drafter - its "drafter": its matrices as they are in the
+#  file, beside them its lists and rows, under HY4_DFLY2_EXTRA bytes)
+HY4_DFLY2_EXTRA = 32 << 20
+# (where both fit, which drafts is measured on the PC - speed_calibration_hy4: a short A/B, the faster kept unless
+#  within HY4_DRAFT_TIE, where this rule stays; until it runs, the rule: the faster for the size on the V100 measured
+#  (32 and 16 GB, server answers of code and chat, greedy and sampled): XS DFly2 (+10-20% over the block), S the block
+#  (+5-35% on chat), L a tie (DFly2 ahead on greedy code, the block on sampled chat: the block kept); M not measured)
+HY4_DRAFT_RULE = {"maya-xs": "dfly2", "maya-s": "mtp", "maya-m": "mtp", "maya-l": "mtp"}
+HY4_DRAFT_TIE = 0.02
+HY4_DRAFT_PROBE = {"mixed": True, "tokens": 512, "answer": 128, "warm": 32}
+HY4_VISION_GIB = 0.81                              # (the engine's room for its largest picture, 2048 x 2048: 828 MB of the main GPU while it is read)
+# (lent by the prompt buffers - src/hy4/hy4_model.cu's vis_encode: no VRAM of its own; the 8 GB layout's buffers at its
+#  256-token chunk come to 1013 MB on an RTX 3050 at 4K-32K, so the fit counts nothing for pictures)
 HY4_DEFAULT_CONTEXT = 65536
 # its cache a context token: the 13 layers that keep every position (the 12 indexed ones and the MTP block) - the latent
 # (512 + 64 rope, F16) and the indexer's pooled keys (128 F32 every 4 positions); the sliding-window layers keep a ring
@@ -842,6 +852,17 @@ HY4_STANDARD = "standard"                          # the layout a size's own "fi
 HY4_FIT_USED_CAP_GIB = 1.0
 HY4_FIT_DISPLAY_GIB = 0.4
 HY4_FIT_MARGIN_GIB = 0.25
+# what a CUDA start takes of a card beside the free VRAM the engine plans with (cudaMemGetInfo) - its context and the
+# driver's share - which nvidia-smi's free figure still holds under Linux, where the sums above were measured (0.57 GiB
+# on a V100 32 GB: a context 308 MiB, the driver 274); under Windows CUDA's own figure has it out already (the display
+# driver keeps it in its budget: a context shows as 68 MiB on an RTX 3050, whose engine draws its DFly2 line 0.48-0.53
+# GiB above CUDA's figure) - hy4_engine_room adds this much back, or what this PC shows of it where that is more: the
+# first guess only, until the engine's first start on the PC measures the figure for its card (HY4_ROOM_STORE)
+HY4_FIT_CUDA_OWN_GIB = 0.5
+# (Windows: CUDA's own share of each card in the setup's terms, as the engine measured it at its first start on this PC
+#  - hy4_room_measure - by PC, card and driver; the setup and the Models page count it from then on)
+HY4_ROOM_STORE = ROOT / "data" / "vram-room.json"
+HY4_KV_RESIDENT = 32768                            # (KV streaming: the global layers' newest positions kept in VRAM)
 # a small-card layout's prompt chunk doubled where it fits: the prompt scratch grows by about 0.9 GiB from 256 to 512
 # tokens (an 8 GB card at 4K: measured) - counted as 0.95, conservatively
 HY4_CHUNK_UP_GIB = 0.95
@@ -1606,12 +1627,13 @@ def check_pc(a, family: str = "glm", gguf: bool = False, ds4_quant: str = "exl3"
         fail(f"{MM3}'s engine (maya-mm3) runs on Linux only for now (its Windows build is on the way)",
              f"set it up on a Linux PC with an NVIDIA GPU ({mm3_gpus()})")
     hy4 = family == "hy4"
-    if hy4 and a.backend == "hip" and (WIN or not sys.platform.startswith("linux")):
+    if hy4 and a.backend == "hip" and WIN:
         # (maya-hy4's AMD build: built and run on Linux - a Gorgon Halo's Radeon 8065S, and RX 7900 XT cards by its
-        #  contributor; on Windows with an AMD GPU it has not been built or run yet)
-        fail(f"{HY4}'s engine (maya-hy4) runs on AMD GPUs on Linux only for now: with an AMD GPU on Windows it has not "
-             "been tested yet",
-             "set it up on Linux on this PC, or on a PC with an NVIDIA GPU (V100 or newer; Linux or Windows)")
+        #  contributor; under Windows it builds as the other engines' HIP builds do, with Windows' own waits and memory
+        #  rules, but no one has run it there yet: experimental, said once, and the setup goes on)
+        warn(f"{HY4} on an AMD GPU under Windows is experimental: Maya's team has not tested it there (it runs on "
+             "Linux) - if it does not start or its answers look wrong, docs/AMD_MAYA.md says how to report it and "
+             "what to use instead")
     if a.backend == "hip":
         return check_hip_pc(a, text_only=not (mm3 or hy4))
     if a.backend == "metal":
@@ -1994,19 +2016,18 @@ def choose_family(a, prev: dict) -> str:
              "read from the SSD; tool calls, its three reasoning efforts, MTP drafting, up to a 256K context; text only. "
              f"Or the base model itself in unsloth's UD-IQ2_XS GGUF ({qwen_entry(QWEN_UD)['download_gb']:.0f} GB).")]
     keys = ("glm", "glm53") + FAMILIES[1:]             # (the rows: GLM-5.3 (744B) is its own row of the "glm" family)
-    # Hy4-Flash, the last row (not on AMD - no engine there yet - unless it is the model set up before): Maya's own
-    # sizes that are uploaded (hy4_published), then Tencent's own Q4_K_M; --model / --hy4-quant name it either way
+    # Hy4-Flash, the last row: Maya's own sizes that are uploaded (hy4_published), then Tencent's own Q4_K_M;
+    # --model / --hy4-quant name it either way (AMD under Windows: experimental - check_pc says so)
     hy4s = [k for k in HY4_QUANTS if hy4_published(k)]
     q4 = hy4_entry() if hy4_published(HY4_Q4) else None
-    amd = getattr(a, "backend", None) == "hip"         # (AMD: Linux only so far - check_pc says why on Windows)
-    if default == "hy4" or ((hy4s or q4) and not (amd and WIN)):
+    if default == "hy4" or hy4s or q4:
         rows.append((HY4, None,
                      "Tencent's Hy4-flash (220B with its n-gram tables; 512 experts, 16 a token) on its own engine"
                      + (", in Maya's own GGUF quants: " +
                         ", ".join(f"{HY4_QUANTS[k]} ({hy4_entry(k)['download_gb']:.0f} GB)" for k in hy4s)
                         if hy4s else "") +
                      "; NVIDIA from V100 on, Linux or Windows, or AMD on Linux (Strix Halo / Gorgon Halo, Radeon "
-                     "cards); what is not a routed expert in VRAM, the experts that do "
+                     "cards) - under Windows experimental; what is not a routed expert in VRAM, the experts that do "
                      "not fit computed on the CPU, the n-gram table read from the SSD; tool calls, thinking High or "
                      "Off; pictures (its vision tower, where the VRAM has room for one beside the model)." +
                      (f" Or Tencent's own Q4_K_M (AngelSlim; {q4['download_gb']:.0f} GB, about {q4['memory_gb']:.0f} GB "
@@ -2126,6 +2147,48 @@ def gpu_used_mib() -> dict:
         except ValueError:
             pass
     return used
+
+
+# (run by cuda_room_bytes in a process of its own - the setup itself never holds a CUDA context: each NVIDIA device's
+#  free VRAM as CUDA's driver says it with one context held - the engine's own reading at its start, cudaMemGetInfo -
+#  then with a second context beside it, and its total; {PCI bus id: [free, free with two, total]} in bytes)
+CUDA_ROOM_PROBE = r"""
+import ctypes, json, sys
+cu = ctypes.WinDLL("nvcuda.dll") if sys.platform == "win32" else ctypes.CDLL("libcuda.so.1")
+out = {}
+n = ctypes.c_int(0)
+if cu.cuInit(0) == 0 and cu.cuDeviceGetCount(ctypes.byref(n)) == 0:
+    for i in range(n.value):
+        dev, bus, p, c = ctypes.c_int(0), ctypes.create_string_buffer(32), ctypes.c_void_p(), ctypes.c_void_p()
+        if cu.cuDeviceGet(ctypes.byref(dev), i) or cu.cuDeviceGetPCIBusId(bus, 32, dev) or \
+                cu.cuDevicePrimaryCtxRetain(ctypes.byref(p), dev):
+            continue
+        one, two, tot = ctypes.c_size_t(0), ctypes.c_size_t(0), ctypes.c_size_t(0)
+        ok = cu.cuCtxSetCurrent(p) == 0 and cu.cuMemGetInfo_v2(ctypes.byref(one), ctypes.byref(tot)) == 0
+        if ok and cu.cuCtxCreate_v2(ctypes.byref(c), 0, dev) == 0:
+            ok = cu.cuMemGetInfo_v2(ctypes.byref(two), ctypes.byref(tot)) == 0
+            cu.cuCtxDestroy_v2(c)
+        else:
+            ok = False
+        cu.cuCtxSetCurrent(None)
+        cu.cuDevicePrimaryCtxRelease_v2(dev)
+        if ok:
+            out[bus.value.decode("ascii", "replace")] = [one.value, two.value, tot.value]
+print(json.dumps(out))
+"""
+
+
+def cuda_room_bytes() -> dict:
+    """{PCI id (setup.py's _pci_key form): (free, free with a second context, total) in bytes} - what CUDA's driver
+    says of each NVIDIA device's VRAM with a context held (CUDA_ROOM_PROBE, in a process of its own); {} where it
+    cannot be asked (no driver, a failing call, a timeout)."""
+    try:
+        txt = subprocess.run([sys.executable, "-I", "-c", CUDA_ROOM_PROBE], capture_output=True, text=True,
+                             timeout=60).stdout
+        got = json.loads(txt.strip().splitlines()[-1]) if txt.strip() else {}
+        return {S._pci_key(k): tuple(int(x) for x in v) for k, v in got.items() if len(v) == 3}
+    except (OSError, subprocess.SubprocessError, ValueError, TypeError, IndexError):
+        return {}
 
 
 def glm_fit_state_mib(ctx: int, kv: str | None = None) -> float:
@@ -4966,6 +5029,131 @@ def skip_start_calibrations(cfg_path: Path, cfg: dict, why: str) -> None:
                                                       for name, flag in todo))
 
 
+HY4_Q4X_ENV = "HY4_Q4X"                            # maya-hy4's 4-bit expert copies: 2 / unset measured, 1 on, 0 off
+
+
+def q4x_config_migrate(cfg_path: Path, cfg: dict) -> dict:
+    """A Hy4-Flash config whose env still carries the HY4_Q4X an earlier start's CPU lane check wrote (1.1.69 and
+    before, installer.q4x_calibration "on" / "off" - often measured on cold experts, so starts flipped): that value
+    dropped.  maya-hy4 now measures its 4-bit copies once its lane's experts are warm and remembers the verdict itself
+    (the data folder's hy4-cpu-lane.txt: a line a PC, model and lane-kernel build), so a start never loads the model
+    an extra time for it.  A value set by hand (no installer.q4x_calibration, or another value) stays."""
+    inst, env = cfg.get("installer") or {}, cfg.get("env") or {}
+    res = (inst.get("q4x_calibration") or {}).get("result")
+    if config_family(cfg) != "hy4" or res not in ("on", "off") or \
+            str(env.get(HY4_Q4X_ENV)) != ("1" if res == "on" else "0"):
+        return cfg
+    env.pop(HY4_Q4X_ENV, None)
+    inst.pop("q4x_calibration", None)
+    cfg_path.write_text(json.dumps(N.env_out(cfg), indent=1), encoding="utf-8")
+    return read_json(cfg_path)
+
+
+def q4x_verdict(log_text: str) -> str | None:
+    """maya-hy4's own verdict on the 4-bit copies in its log (HY4_Q4X=2): "on", "off", "unmeasured" (copies made, the
+    answers too short for the timed turns), or None - no CPU lane of IQ2_XXS experts, nothing to decide."""
+    if "the 4-bit copies kept" in log_text:
+        return "on"
+    if ("the 4-bit copies dropped" in log_text or "the file's rows kept" in log_text
+            or "no 4-bit copies of its experts" in log_text):
+        return "off"
+    return "unmeasured" if "4-bit copies" in log_text else None
+
+
+Q4X_ANSWERS = 12                                   # (--speed-calibration's CPU lane check: answers at most for a verdict)
+Q4X_BUILD_WAIT_S = 120                             # (... and the wait for the copies, made between answers)
+
+
+def q4x_calibration(cfg_path: Path, why: str = "") -> bool | None:
+    """maya-hy4's 4-bit copies of the CPU lane's most routed experts, measured again on this PC (--speed-calibration):
+    the engine's own check (HY4_Q4X=2 with HY4_Q4X_MEASURE=1 - a probe at its start, then, once the copies are made and
+    the lane's experts warm, the answers' lane calls timed in turns with and without them until two windows agree; the
+    same tokens either way, the copies giving the file's bits) over a warm-up answer and as many more as it takes (up
+    to Q4X_ANSWERS).  The engine remembers the verdict itself (the data folder's hy4-cpu-lane.txt), so the next starts
+    do not measure; installer.q4x_calibration keeps the result for the record (the config's env is left as it is).
+    True / False: on / off; None: nothing to decide here (no CPU lane, no IQ2_XXS experts) or not measured (said)."""
+    cfg = read_json(cfg_path)
+    tdir = Path(cfg.get("tokenizer") or "")
+    if not cfg.get("exe") or not cfg.get("tokenizer") or not (tdir / "chat_template.jinja").exists():
+        warn("the CPU lane check needs the config's engine and tokenizer (with its chat template): its 4-bit expert "
+             f"copies are measured at each start instead ({ME} --setup writes them again)")
+        return None
+    if busy_skip(cfg, why == "asked for", "the CPU lane check", "the GPU(s)",
+                 f" (a model server still running?) - it runs at the next start, or: {ME} --speed-calibration"):
+        return None
+    sys.path.insert(0, str(ROOT))
+    sys.path.insert(0, str(ROOT / "tools"))
+    import serve.server as SV
+    import strata_tokenizer as ST
+    ids = ST.Tokenizer.from_dir(tdir).encode(bench_chat("hy4", tdir)(BENCH_TOPICS[0]), parse_special=True)
+    env = SV.child_env(cfg)
+    env[HY4_Q4X_ENV] = "2"
+    env["HY4_Q4X_MEASURE"] = "1"                       # (measured again: the verdict remembered before is not used)
+    say()
+    say(f"  Checking the CPU lane's 4-bit expert copies on this PC{f' ({why})' if why else ''}: a few answers, the model")
+    say("  loads once (a few minutes) ...")
+    log_path = ROOT / "maya-q4x-calibration.log"
+    done = False
+
+    def said() -> str:
+        return log_path.read_text(encoding="utf-8", errors="replace") if log_path.exists() else ""
+    with open(log_path, "w", encoding="utf-8") as log:
+        try:
+            p = subprocess.Popen([cfg["exe"], "--serve"] + SV.engine_args(cfg), stdin=subprocess.PIPE,
+                                 stdout=subprocess.PIPE, stderr=log, text=True, env=env,
+                                 cwd=cfg.get("cwd") or str(ROOT), bufsize=1)
+        except OSError as e:
+            warn(f"the CPU lane check could not start the engine ({e}): its copies are measured at each start instead")
+            return None
+
+        def gen(n_new: int) -> bool:
+            p.stdin.write(f"GEN {n_new} temperature=0 " + ",".join(map(str, ids)) + "\n")
+            p.stdin.flush()
+            for line in p.stdout:
+                if line.startswith(("DONE", "ERR")):
+                    return line.startswith("DONE")
+            return False
+
+        try:
+            for line in p.stdout:
+                if line.startswith("READY"):
+                    # (the warm-up answer gives the routing counts the copies are made by - between answers, so the
+                    #  engine is left idle until it times them - then answers until its verdict: the one-token calls
+                    #  timed in turns with and without them, window by window, until two agree)
+                    done = gen(64)
+                    for _ in range(Q4X_BUILD_WAIT_S // 5):
+                        if not done or q4x_verdict(said()) != "unmeasured" or "timing the answers" in said():
+                            break
+                        time.sleep(5)
+                    for _ in range(Q4X_ANSWERS):
+                        if not done or q4x_verdict(said()) != "unmeasured":
+                            break
+                        done = gen(256)
+                        time.sleep(2)                  # (the verdict's line reaches the log)
+                    break
+            p.stdin.write("QUIT\n")
+            p.stdin.flush()
+            p.wait(timeout=120)
+        except (OSError, ValueError, subprocess.TimeoutExpired):
+            p.kill()
+    verdict = q4x_verdict(log_path.read_text(encoding="utf-8", errors="replace"))
+    if not done or verdict == "unmeasured":
+        warn(f"the CPU lane check did not finish ({log_path.name} says why): the engine measures its copies while it "
+             f"answers instead, once its experts are warm, and remembers it ({ME} --speed-calibration tries again)")
+        cfg.setdefault("installer", {})["q4x_calibration"] = {"result": "unmeasured", "date": time.strftime("%Y-%m-%d")}
+        cfg_path.write_text(json.dumps(N.env_out(cfg), indent=1), encoding="utf-8")
+        return None
+    # (the verdict is the engine's to remember - per PC, model and lane kernels; the config only records it)
+    cfg.setdefault("installer", {})["q4x_calibration"] = {"result": verdict or "n/a", "date": time.strftime("%Y-%m-%d")}
+    cfg_path.write_text(json.dumps(N.env_out(cfg), indent=1), encoding="utf-8")
+    if verdict is None:
+        ok("CPU lane check: nothing to decide on this PC (no CPU lane of IQ2_XXS experts)")
+        return None
+    ok(f"the CPU lane's 4-bit expert copies: {'ON - faster' if verdict == 'on' else 'off - not faster'} on this PC "
+       "(the same answers either way)")
+    return verdict == "on"
+
+
 def needs_speed_calibration(cfg: dict) -> bool:
     """A config that drafts with DFlash2 but has no speed calibration yet (set up before there was one, or its
     calibration could not run then - the GPUs were busy): its next start measures first.  Not with --parallel above 1:
@@ -4974,8 +5162,12 @@ def needs_speed_calibration(cfg: dict) -> bool:
     if cfg.get("backend") == "metal":                  # (CUDA's measurement: on a Mac MTP or DFlash2 is the user's choice)
         return False
     # (CYBER-FROST: measured at its setup, or --speed-calibration; Hy4-flash: Tencent's Q4_K_M drafts with its MTP block
-    #  or not, chosen - its drafts doubled code answers on the GPUs it ran on; Maya's sizes have no drafter yet)
-    if config_family(cfg) in ("qwen", "hy4"):
+    #  or not, chosen - its drafts doubled code answers on the GPUs it ran on; a Maya size where the MTP block and the
+    #  DFly2 drafter both fit: which of the two, measured once - hy4_both_drafters)
+    if config_family(cfg) == "hy4":
+        return hy4_both_drafters(cfg) and (cfg.get("installer") or {}).get("drafting") == "on" and \
+            "speed_calibration" not in (cfg.get("installer") or {})
+    if config_family(cfg) == "qwen":
         return False
     if config_family(cfg) in ("deepseek", "minimax"):  # (their DSpark drafter: measured once too)
         return CDS.has_drafter(cfg) and "speed_calibration" not in (cfg.get("installer") or {}) and             not (config_family(cfg) == "minimax" and parallel_of(cfg) > 1)   # (maya-mm3 --parallel: no drafting)
@@ -4999,12 +5191,24 @@ def speed_calibration(cfg_path: Path, why: str = "") -> bool:
     if config_family(cfg) == "qwen":                   # (CYBER-FROST: its MTP drafter or none)
         return bool(qwen_draft_calibration(cfg_path) is not None)
     if config_family(cfg) == "hy4":
+        if hy4_both_drafters(cfg):                     # (a Maya size with both drafters: which is faster here)
+            return speed_calibration_hy4(cfg_path, cfg, why)
         if Q.config_key(cfg) == HY4_Q4:                # (Tencent's own Q4_K_M: the one set with the MTP block)
             warn(f"no speed calibration for {HY4} yet: it drafts with its MTP block unless set up with --drafting off "
                  f"({ME} --setup --model hy4-flash-q4_k_m --drafting on|off)")
         else:
-            ok(f"{HY4}: no speed calibration yet - a Maya size drafts with the MTP block where the setup found room "
-               f"for it ({ME} --setup --drafting on|off)")
+            ok(f"{HY4}: no speed calibration here - a Maya size measures which drafter is faster where the MTP block "
+               f"and the DFly2 drafter both fit; here the setup found room for one of them or none ({ME} --setup "
+               "--drafting on|off|mtp|dfly2)")
+            inst, env = cfg.setdefault("installer", {}), cfg.get("env") or {}
+            if HY4_Q4X_ENV in env and "q4x_calibration" not in inst:   # (set by hand: the user's choice stays)
+                ok(f"the CPU lane's 4-bit expert copies: {HY4_Q4X_ENV}={env[HY4_Q4X_ENV]} in the config's env - kept, "
+                   "not measured")
+                return False
+            if inst.pop("q4x_calibration", None) is not None:   # (measured again, as asked)
+                env.pop(HY4_Q4X_ENV, None)
+                cfg_path.write_text(json.dumps(N.env_out(cfg), indent=1), encoding="utf-8")
+            return q4x_calibration(cfg_path, why) is not None
         return False
     if config_family(cfg) in ("deepseek", "minimax"):
         return speed_calibration_ds4(cfg_path, cfg, why)
@@ -5072,6 +5276,73 @@ def speed_calibration(cfg_path: Path, why: str = "") -> bool:
            "Maya " + ("decodes without drafting" if one else "drafts with the MTP block"))
         say(f"       (saved in {cfg_path.name}; to draft with DFlash2 anyway: {ME} --setup --draft dflash2 "
             "--no-speed-calibration)")
+    return True
+
+
+def hy4_both_drafters(cfg: dict) -> bool:
+    """A Maya size of Hy4-Flash set up where its MTP block and its DFly2 drafter both fit (installer.draft_choice
+    "auto": both in the pack, one GPU): which of the two drafts is the speed calibration's to measure."""
+    inst = cfg.get("installer") or {}
+    return config_family(cfg) == "hy4" and Q.config_key(cfg) != HY4_Q4 and inst.get("draft_choice") == "auto" and \
+        bool(inst.get("draft_block")) and bool(inst.get("dfly2")) and len(cfg.get("gpu") or [0]) < 2
+
+
+def hy4_with_drafter(cfg: dict, drafter: str) -> dict:
+    """A copy of a Hy4-Flash config that drafts with `drafter` ("mtp": --mtp, "dfly2": --dfly2) - the other's flag
+    out."""
+    out = json.loads(json.dumps(cfg))
+    args = [x for x in (out.get("args") or []) if x not in ("--mtp", "--dfly2")]
+    out["args"] = args + ["--dfly2" if drafter == "dfly2" else "--mtp"]
+    out.setdefault("installer", {})["drafter"] = drafter
+    return out
+
+
+def speed_calibration_hy4(cfg_path: Path, cfg: dict, why: str = "") -> bool:
+    """A Maya size of Hy4-Flash where both drafters fit: its sustained decode speed with the MTP block and with the
+    DFly2 drafter (both write only tokens the model checks: the same answers), a short probe each as
+    tools/calibrate_draft.py measures (HY4_DRAFT_PROBE: code, an explanation, plain text, thinking).  The faster is
+    kept; within HY4_DRAFT_TIE the size's rule (HY4_DRAFT_RULE) stays.  False: not measured (nothing changed)."""
+    if busy_skip(cfg, why == "asked for", "the speed calibration", "the GPU",
+                 f" (a model server still running?) - it runs at the next start, or: {ME} --speed-calibration"):
+        return False
+    quant = Q.config_key(cfg)
+    rule = HY4_DRAFT_RULE.get(quant, "mtp")
+    mtp, dfly = hy4_with_drafter(cfg, "mtp"), hy4_with_drafter(cfg, "dfly2")
+    say()
+    say("  Speed calibration: the MTP block or the DFly2 drafter?" + (f" ({why})" if why else ""))
+    say("  Both fit on this GPU and the model checks every drafted token; which drafts faster depends on how much of")
+    say(f"  the model the GPU holds beside it. Maya loads the model twice (the MTP block, then DFly2); each time it "
+        f"writes about {HY4_DRAFT_PROBE['tokens']} tokens of")
+    say("  short answers (code, an explanation, plain text, thinking) after a warm-up, and the speeds are compared.")
+    say("  The PC is busy meanwhile.")
+    log = cfg.get("log")
+    since = os.path.getsize(log) if log and os.path.isfile(log) else 0
+    now = (cfg.get("installer") or {}).get("drafter") or ("dfly2" if "--dfly2" in (cfg.get("args") or []) else "mtp")
+    try:
+        res = CD.run(mtp, dfly, say=say, other_label="the MTP block", draft_label="DFly2", size=HY4_DRAFT_PROBE)
+    except Exception as e:                             # never stops a setup or a start: the config stays as it was
+        warn(f"the speed calibration did not finish ({e}): nothing changed - Maya keeps "
+             f"{'DFly2' if now == 'dfly2' else 'the MTP block'}; {ME} --speed-calibration tries again")
+        why_not = CAL.engine_error(log, since)
+        if why_not:
+            say(f"       the engine said: {why_not}")
+        cfg.setdefault("installer", {})["speed_calibration"] = {"date": time.strftime("%Y-%m-%d %H:%M"),
+                                                                "failed": str(e)[:300]}
+        cfg_path.write_text(json.dumps(N.env_out(cfg), indent=1), encoding="utf-8")
+        return False
+    o, d = res["other"]["tok_s"], res["dflash2"]["tok_s"]
+    tie = abs(d - o) <= HY4_DRAFT_TIE * max(o, d)
+    keep = rule if tie else "dfly2" if d > o else "mtp"
+    out = mtp if keep == "mtp" else dfly
+    out.setdefault("installer", {})["speed_calibration"] = {
+        "date": time.strftime("%Y-%m-%d %H:%M"), "version": maya_version(), "mtp_tok_s": o, "dfly2_tok_s": d,
+        "tokens": [res["other"]["tokens"], res["dflash2"]["tokens"]], "kept": keep}
+    cfg_path.write_text(json.dumps(N.env_out(out), indent=1), encoding="utf-8")
+    say()
+    ok(f"speed calibration: {d:.1f} tokens/s with DFly2 against {o:.1f} with the MTP block - Maya drafts with " +
+       ("DFly2" if keep == "dfly2" else "the MTP block") + (" (a tie: this size's default)" if tie else ""))
+    say(f"       (saved in {cfg_path.name}; {ME} --speed-calibration measures again, --setup --drafting mtp|dfly2 "
+        "picks one by hand)")
     return True
 
 
@@ -5525,7 +5796,7 @@ def drafting_choice(a, drafter: str, minutes: str) -> str:
     measuring - "on" (draft with it) or "off".  --drafting, or --no-speed-calibration (= on), else asked; --yes
     measures."""
     if getattr(a, "drafting", None):
-        return a.drafting
+        return "on" if a.drafting in ("mtp", "dfly2") else a.drafting   # (Hy4-Flash's drafter by name: elsewhere on)
     if getattr(a, "no_speed_calibration", False):
         return "on"
     say()
@@ -5659,7 +5930,8 @@ def server_command(cfg_path: Path, a) -> tuple:
         cfg = read_json(cfg_path)
         args = cfg.get("args") or []
     if not unattended and needs_speed_calibration(cfg):     # a drafter set up without its speed calibration: measured once
-        drafter = {"deepseek": "DeepSeek's DSpark drafter", "minimax": "MiniMax's DSpark drafter"}.get(
+        drafter = {"deepseek": "DeepSeek's DSpark drafter", "minimax": "MiniMax's DSpark drafter",
+                   "hy4": "the MTP block or the DFly2 drafter"}.get(
             config_family(cfg), "DFlash2")
         if speed_calibration(cfg_path, f"once, for a setup that drafts with {drafter}"):
             cfg = read_json(cfg_path)
@@ -5668,6 +5940,10 @@ def server_command(cfg_path: Path, a) -> tuple:
         if link_calibration(cfg_path, "once, for this PC"):
             cfg = read_json(cfg_path)
             args = cfg.get("args") or []
+    # Hy4-Flash's 4-bit expert copies: measured by the engine once its experts are warm, remembered per PC (no start of
+    # its own for it any more); a verdict an earlier start's check wrote into the config is dropped for the engine's
+    cfg = q4x_config_migrate(cfg_path, cfg)
+    args = cfg.get("args") or []
     port = a.port or cfg.get("port") or 8080
     host = a.host or cfg.get("host") or "127.0.0.1"
     key = a.api_key or cfg.get("api_key")
@@ -5863,7 +6139,9 @@ REPORT_LINES = re.compile(r"glm fast:|glm prefill: (?:CUDA|HIP)|glm split|glm st
                           r"^ds4: (?!copying experts |experts \d+ / |loading \d)|^ds4 (?:slots|cache):|^maya-ds4:|"
                           r"^(?:prompt|decode): \d+ tokens in |^decode per token:|^decode (?:reads|left out)|^dspark|"
                           # maya-mm3's: where the model went (its --serve start) and each answer's prompt / decode speed
-                          r"^maya-mm3:|^maya mm3 serve: (?:prompt|DSpark) |^maya-hy4:",
+                          r"^maya-mm3:|^maya mm3 serve: (?:prompt|DSpark) |^maya-hy4:|"
+                          # the Monitor's GPU readings: a reading that failed, a reader that stopped and why
+                          r"^\[maya\] (?:a GPU reading failed|the GPU readings)",
                           re.I)
 STAT_DECODE = re.compile(r"glm stat: decode ([\d.]+) ms/tok")
 
@@ -5880,6 +6158,16 @@ def speed_lines(text) -> list:
             x = "glm stat (prompt only): prompt " + x.split("| prompt ", 1)[1]
         picked.append(x.strip())
     return picked
+
+
+def gpu_readings_report() -> str:
+    """--report: what the dashboard's Monitor reads on each NVIDIA GPU (serve/telemetry.py's NVML reader, a process of
+    its own): each card's readings given or not, any that failed with its error - never an error of the report's own."""
+    try:
+        from serve import telemetry as TM
+        return TM.readings_report()
+    except Exception as e:  # noqa: BLE001 - the report goes on without this part
+        return f"not read ({type(e).__name__}: {e})"
 
 
 def hip_gpu_report(rocm: Path, bindir=None) -> str:
@@ -5980,6 +6268,7 @@ def report(version: str, backend: str | None = None, cfg_path: Path | None = Non
         add("GPUs", S.out(["nvidia-smi", "--query-gpu=index,name,memory.total,memory.used,driver_version,"
                                          "pcie.link.gen.max,pcie.link.width.current,pcie.link.width.max,power.limit,"
                                          "temperature.gpu", "--format=csv"]) or "nvidia-smi did not answer")
+        add("GPU readings (the Monitor's NVML reader, read now)", gpu_readings_report())
     cpu, avx2, avx512 = S.cpu_info()
     total, avail = mem_gb()
     pf = S.page_file_gb()
@@ -6007,6 +6296,12 @@ def report(version: str, backend: str | None = None, cfg_path: Path | None = Non
             images = "off" if "--vision" in args[:-1] and args[args.index("--vision") + 1] == "off" else "on"
         elif config_family(cfg) == "minimax":   # (maya-mm3's too: --vision on when the pack has it, left out without)
             images = "on" if flag_value(args, "--vision") == "on" else "off"
+        elif config_family(cfg) == "hy4":       # (maya-hy4's: on whenever its pack has the tower, unless --vision off -
+            # the tower in RAM, on the GPU a picture at a time: the config has no "vision" entry of its own)
+            images = "off (--vision off)" if flag_value(args, "--vision") == "off" else \
+                "on (read a picture at a time)" if pack is not None and hy4_pack_has_vision(pack) else \
+                "off (no vision tower in the pack)" if pack is not None and (pack / "hy4.txt").exists() else \
+                "? (the pack is not here to look in)"
         else:
             images = "on" if cfg.get("vision") else "off"
         where = ""
@@ -8261,14 +8556,81 @@ def hy4_q4_contexts(gpus: list) -> list:
     return HY4_Q4_CONTEXTS + [c for c in HY4_Q4_LONG if c * per / 2**30 <= HY4_Q4_LONG_SHARE * vram]
 
 
-def hy4_cache_bytes(ctx: int, chunk: int, q8: bool = False) -> int:
+def hy4_cache_bytes(ctx: int, chunk: int, q8: bool = False, resident: int = 0) -> int:
     """The bytes of maya-hy4's caches in VRAM at a context (src/hy4/hy4_model.cu's plan): the window layers' ring of
     latents (the newest 512 + max(16384, chunk) positions), the global layers' latents and pooled keys for every
     position, and the ring's hidden states.  q8: with the latent cache in 8-bit rows (the engine's --kv q8, and its
-    --kv auto where F16 rows do not fit: 672 bytes a row against 1152, the indexer's rows F16 against F32)."""
+    --kv auto where F16 rows do not fit: 672 bytes a row against 1152, the indexer's rows F16 against F32).
+    resident: with KV streaming (the engine's --kv-streaming) - the global layers' latents a ring of that many
+    positions (a chunk's at least) with a tag each, the others in RAM (hy4_stream_ram_gib), and the picked rows'
+    buffer; a context no larger than the ring is not streamed."""
     ring = min(ctx, 512 + max(16384, chunk))
     row, pool = (HY4_KV_Q8_ROW, 2) if q8 else (576 * 2, 4)
-    return 29 * ring * row + 13 * (ctx * row + (ctx // 4 + 1) * 128 * pool + ring * 2 * 128 * pool) + ring * 3072 * 4
+    res = max(int(resident), chunk) if resident else 0
+    if res and ctx > res:
+        rows = res * (row + 4)
+        pick = 64 * (2048 + 4) * (row + 8) + ctx * 4 + 1024
+    else:
+        rows, pick = ctx * row, 0
+    return 29 * ring * row + 13 * (rows + (ctx // 4 + 1) * 128 * pool + ring * 2 * 128 * pool) + ring * 3072 * 4 + pick
+
+
+def hy4_stream_ram_gib(ctx: int, q8: bool = False) -> float:
+    """KV streaming's RAM (GiB, pinned): every position's latent row of the 13 global layers."""
+    return 13 * ctx * (HY4_KV_Q8_ROW if q8 else 576 * 2) / 2**30
+
+
+def hy4_stream_need_gib(plan: dict, ctx: int, q8: bool = False, resident: int | None = None) -> float:
+    """hy4_fit_need_gib with KV streaming: less the global layers' rows that leave the VRAM."""
+    chunk = int(plan.get("chunk") or 1024)
+    res = HY4_KV_RESIDENT if resident is None else resident
+    return hy4_fit_need_gib(plan, ctx, q8) - \
+        (hy4_cache_bytes(ctx, chunk, q8) - hy4_cache_bytes(ctx, chunk, q8, res)) / 2**30
+
+
+def hy4_stream_rows(plan: dict, ctx: int, usable: float, ram_gib: float | None, kv: str | None = None) -> tuple | None:
+    """A context that fits the VRAM only with KV streaming, as the engine's --kv-streaming auto takes it:
+    (rows, ring) - "f16" then "q8", with the ring of HY4_KV_RESIDENT positions and then a prompt chunk's - where the
+    RAM left for the rows (ram_gib) holds them; None: no RAM figure given, or it fits neither way.  kv "f16" / "q8":
+    those rows only (the engine's --kv f16 / q8)."""
+    if ram_gib is None:
+        return None
+    for res in (HY4_KV_RESIDENT, 1):
+        for q8 in ((kv == "q8",) if kv in ("f16", "q8") else (False, True)):
+            if hy4_stream_need_gib(plan, ctx, q8, res) <= usable:
+                # (the engine stops at the first that fits the VRAM: the RAM must hold that one's rows)
+                return ("q8" if q8 else "f16", res) if hy4_stream_ram_gib(ctx, q8) <= ram_gib else None
+    return None
+
+
+def hy4_ram_for_rows(q: dict, usable: float, ram_gb: float | None) -> float | None:
+    """The RAM (GiB) KV streaming's rows may take on this PC: its RAM less the system's headroom (8 GiB or a tenth)
+    and the size's experts outside the VRAM (the CPU lane reads them from the file cache); None: no RAM figure."""
+    if not ram_gb:
+        return None
+    return float(ram_gb) - max(8.0, 0.1 * float(ram_gb)) - max(0.0, float(q.get("memory_gb") or 0) - usable)
+
+
+def hy4_config_stream(quant: str, layout: str, ctx: int, usable: float, ram_gib: float | None,
+                      chunk: int | None = None, reserve_gb: float | None = None, mtp: bool = False,
+                      kv: str | None = None) -> tuple | None:
+    """hy4_stream_rows for a size already set up, counted as hy4_config_need_gib counts it (the Models page's
+    serve/models.py hy4_room): (rows, positions kept in VRAM, VRAM GiB) where the context fits its cards only with KV
+    streaming and the RAM left for the rows (ram_gib: hy4_ram_for_rows) holds them; kv "f16" / "q8": the config's own
+    rows only."""
+    if ram_gib is None:
+        return None
+    plan = (hy4_layouts(hy4_quant_table(quant)).get(layout or HY4_STANDARD) or {}).get("plan") or {}
+    ch = int(chunk or plan.get("chunk") or 1024)
+    for res in (HY4_KV_RESIDENT, 1):
+        for q8 in ((kv == "q8",) if kv in ("f16", "q8") else (False, True)):
+            base = hy4_config_need_gib(quant, layout, ctx, chunk=chunk, reserve_gb=reserve_gb, q8=q8, mtp=mtp)
+            if base is None:
+                return None
+            need = base - (hy4_cache_bytes(ctx, ch, q8) - hy4_cache_bytes(ctx, ch, q8, res)) / 2**30
+            if need <= usable:
+                return ("q8" if q8 else "f16", max(res, ch), need) if hy4_stream_ram_gib(ctx, q8) <= ram_gib else None
+    return None
 
 
 def hy4_need_gib(plan: dict, ctx: int, q8: bool = False) -> float:
@@ -8311,23 +8673,28 @@ def hy4_kv_rows(need_f16: float, need_q8: float, usable: float, kv: str | None =
 
 
 def hy4_config_need_gib(quant: str, layout: str, ctx: int, chunk: int | None = None,
-                        reserve_gb: float | None = None, q8: bool = False, mtp: bool = False) -> float | None:
+                        reserve_gb: float | None = None, q8: bool = False, mtp: bool = False,
+                        dfly2: bool = False, margin: bool = True) -> float | None:
     """The VRAM (GiB) a size already set up needs at a context, as hy4_fit counts it (the dashboard's Models page
     asks before it writes a context into a config - serve/models.py's hy4_room): its layout's plan
     (hy4_fit_need_gib), a prompt chunk above the plan's as hy4_fit doubles it (HY4_CHUNK_UP_GIB), and a --reserve-gb
     other than the plan's by the difference.  q8: with the latent cache in 8-bit rows (what the engine's --kv auto
     takes where F16 rows do not fit).  mtp: a Maya size that drafts (--mtp) - with its draft block's VRAM
-    (hy4_mtp_gib).  None for a size or a layout the manifest has no plan for."""
+    (hy4_mtp_gib); dfly2: one that drafts with its DFly2 drafter (--dfly2: hy4_dfly2_gib).  margin False: a context
+    the plan does not list without HY4_FIT_MARGIN_GIB (the sums themselves - hy4_room_measure's).  None for a size or
+    a layout the manifest has no plan for."""
     plan = (hy4_layouts(hy4_quant_table(quant)).get(layout or HY4_STANDARD) or {}).get("plan") or {}
     if not plan.get("need_gib"):
         return None
-    need = hy4_fit_need_gib(plan, int(ctx), q8)
+    need = hy4_fit_need_gib(plan, int(ctx), q8) if margin else hy4_need_gib(plan, int(ctx), q8)
     if chunk and int(plan.get("chunk") or 0) and int(chunk) > int(plan["chunk"]):
         need += HY4_CHUNK_UP_GIB
     if reserve_gb is not None and "reserve_gb" in plan:
         need += float(reserve_gb) - float(plan["reserve_gb"])
     if mtp and quant != HY4_Q4:
         need += hy4_mtp_gib(int(chunk or plan.get("chunk") or 1024))
+    if dfly2:
+        need += hy4_dfly2_gib(quant)
     return need
 
 
@@ -8356,9 +8723,14 @@ def hy4_apu_gib(gpus: list) -> float:
     """The memory (GiB) a unified-memory APU (hip_unified_memory: Strix Halo / Gorgon Halo) has for the model on its
     GPU: the PC's one memory (apu_memory) less what the engine keeps free for the system and the other programs
     (apu_margin_gb, as src/hy4's own headroom) - and on Linux no more than the driver lets the GPU take
-    (amd_gpu_limit_gib)."""
+    (amd_gpu_limit_gib).  Windows (experimental for Hy4-Flash): the GPU's share Windows gives it (Variable Graphics
+    Memory; HIP's figure), less what the engines leave the desktop there (hip_reserve_mib) - src/hy4 keeps within its
+    dedicated memory as GLM's and DeepSeek's engines do, and the RAM beside it is Windows' and the CPU lane's."""
+    vram = sum(float(g.get("vram_gb") or 0) for g in gpus or [])
+    if WIN:
+        return max(vram - len(gpus or []) * hip_reserve_mib(gpus) / 1024.0, 0.0)
     ram, _ = mem_gb()
-    pool = apu_memory(sum(float(g.get("vram_gb") or 0) for g in gpus or []), ram, not WIN) - apu_margin_gb(ram)
+    pool = apu_memory(vram, ram, not WIN) - apu_margin_gb(ram)
     lim = None if WIN else amd_gpu_limit_gib()
     return max(min(pool, lim) if lim else pool, 0.0)
 
@@ -8377,7 +8749,9 @@ def hy4_apu_note(gpus: list, q: dict, name: str) -> tuple | None:
                       f"{have:.0f} GB of this PC's memory are the model's to take; no expert is computed on the CPU")
     ram, _ = mem_gb()
     lim = None if WIN else amd_gpu_limit_gib()
-    why = (f"Linux lets the GPU take {lim:.0f} GB of this PC's memory (the kernel's limit for it: ttm.pages_limit, "
+    why = (f"Windows gives the GPU {have:.0f} GB of this PC's memory for the model (its share: Variable Graphics "
+           "Memory in AMD Software)" if WIN else
+           f"Linux lets the GPU take {lim:.0f} GB of this PC's memory (the kernel's limit for it: ttm.pages_limit, "
            "see docs/AMD_MAYA.md)" if lim and lim < apu_memory(0.0, ram, not WIN) - apu_margin_gb(ram) - 0.5 else
            f"this PC's memory leaves {have:.0f} GB for the model")
     return False, (f"unified memory: {name} takes about {need:.0f} GB with its caches and {why}: the engine keeps the "
@@ -8389,16 +8763,163 @@ def hy4_usable_gib(gpus: list, used: dict | None = None) -> float:
     """The VRAM (GiB) the chosen cards have for the model: their total less what is in use on each now (nvidia-smi;
     at most HY4_FIT_USED_CAP_GIB a card counts - more is a program that can be closed).  No reading: one card is
     taken to drive a desktop (HY4_FIT_DISPLAY_GIB).  AMD cards (nvidia-smi does not read them): their VRAM less what
-    the engines leave the desktop on each (hip_reserve_mib); a unified-memory APU: hy4_apu_gib."""
+    the engines leave the desktop on each (hip_reserve_mib); a unified-memory APU: hy4_apu_gib.
+    A card with "engine_room_gb" (Windows: hy4_engine_room, measured on this PC): no more than that on it - what
+    the engine's CUDA gets there (Windows keeps part of the VRAM from every program, whatever nvidia-smi says)."""
     total = sum(float(g.get("vram_gb") or 0) for g in gpus or [])
     if hy4_amd(gpus):
         if any(hip_unified_memory(g) for g in gpus):
             return hy4_apu_gib(gpus)
         return max(total - len(gpus) * hip_reserve_mib(gpus) / 1024.0, 0.0)
     used = gpu_used_mib() if used is None else used
+    if any(g.get("engine_room_gb") is not None for g in gpus or []):
+        def card(g: dict) -> float:                    # (a card's own: as below, then no more than its room)
+            mine = float(g.get("vram_gb") or 0) - (
+                min(float(used.get(g.get("index"), 0)) / 1024.0, HY4_FIT_USED_CAP_GIB) if used else
+                HY4_FIT_DISPLAY_GIB if g is gpus[0] else 0.0)
+            room = g.get("engine_room_gb")
+            return mine if room is None else min(mine, float(room))
+        return max(sum(card(g) for g in gpus), 0.0)
     if not used:
         return max(total - (HY4_FIT_DISPLAY_GIB if gpus else 0.0), 0.0)
     return max(total - sum(min(float(used.get(g.get("index"), 0)) / 1024.0, HY4_FIT_USED_CAP_GIB) for g in gpus), 0.0)
+
+
+def hy4_engine_room(pc: dict, probe=None, saved: dict | None = None) -> dict:
+    """Windows: each chosen NVIDIA card's VRAM as the engine's CUDA gets it, measured now, kept on the card as
+    "engine_room_gb" (hy4_usable_gib counts no more than that there); {index: GiB} of what was measured.  Windows
+    keeps part of every card from the programs on it (the display driver's budget), which nvidia-smi does not show:
+    an RTX 3050 8 GB with 0.1 GB in use gave CUDA 7.0 GB free - the engine plans with that figure (cudaMemGetInfo at
+    its start), the setup's own sums with the card's total less what is in use.  So the room is that figure in the
+    setup's terms: CUDA's free VRAM with a context held, plus what CUDA itself takes beside it - a context (the free
+    VRAM with a second one beside it, the difference) and the part of the card the driver keeps from CUDA
+    (nvidia-smi's total less CUDA's) - CUDA's own share as the setup's sums count it.  Windows keeps that share out
+    of sight in its budget, so the engine measures it at its first start on this PC (hy4_room_measure: the engine's
+    --room-report, kept in HY4_ROOM_STORE for this PC, card and driver) and the room counts that figure from then on
+    ("engine_room_how": "measured"); until then the larger of what this PC shows of it and HY4_FIT_CUDA_OWN_GIB, the
+    first guess ("estimated").  "cuda_free_gb": CUDA's own reading (the config keeps it: the Models page counts a
+    figure measured later with it).  On Linux the measured part alone is nvidia-smi's total less its used (nothing
+    else is kept there), so only Windows is measured.  Not measured: another OS, AMD, a unified-memory GPU, a card a
+    Maya engine holds now (its own VRAM would be counted as kept: the reading as before), no answer from the driver.
+    probe: the readings (tests; else cuda_room_bytes); saved: HY4_ROOM_STORE's records (tests; else read)."""
+    gpus = (pc or {}).get("gpus") or []
+    if not WIN or (pc or {}).get("backend", "cuda") != "cuda" or not gpus or hy4_amd(gpus) or \
+            any(g.get("unified_memory") for g in gpus):
+        return {}
+    cards = [g for g in gpus if g.get("pci") and g.get("vram_gb")]   # (CUDA's devices are matched by PCI bus)
+    busy = maya_engine_mib() if cards else {}
+    cards = [g for g in cards if g.get("index") not in busy]
+    got = (cuda_room_bytes() if probe is None else probe) if cards else {}
+    saved = hy4_room_load() if saved is None else saved
+    out = {}
+    for g in cards:
+        r = got.get(S._pci_key(str(g["pci"])))
+        if r:
+            one, two, tot = (float(x) / 2**30 for x in r)
+            rec = saved.get(hy4_room_key(g)) or {}
+            if isinstance(rec.get("own_gib"), (int, float)):
+                own, how = float(rec["own_gib"]), "measured"
+            else:
+                own = max(max(one - two, 0.0) + max(float(g["vram_gb"]) - tot, 0.0), HY4_FIT_CUDA_OWN_GIB)
+                how = "estimated"
+            g["engine_room_gb"] = out[g["index"]] = one + own
+            g["engine_room_how"], g["cuda_free_gb"] = how, one
+    return out
+
+
+def hy4_room_key(g: dict) -> str:
+    """What a card's measured share (HY4_ROOM_STORE) holds for: this PC, the card (its name, PCI place and VRAM) and
+    its driver - a new driver or another card in the slot is measured again."""
+    return "|".join([platform.node() or "?", str(g.get("name") or "?"), S._pci_key(str(g.get("pci") or "?")),
+                     f"{float(g.get('vram_gb') or 0):.2f}", str(g.get("driver") or "?")])
+
+
+def hy4_room_load() -> dict:
+    """HY4_ROOM_STORE's records ({hy4_room_key: {"own_gib": ..., ...}}); {} where there are none."""
+    try:
+        got = json.loads(HY4_ROOM_STORE.read_text(encoding="utf-8"))
+        return got if isinstance(got, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def hy4_room_due(cfg: dict, gpus: list | None = None, saved: dict | None = None, probe=None) -> dict | None:
+    """The server's, just before it starts Hy4-Flash's engine: the card to measure CUDA's own share on at this start
+    (the engine's --room-report, then hy4_room_measure) - Windows, an NVIDIA card, the config on one GPU, no record
+    of it for this PC, card and driver yet - with what the setup's CUDA probe sees of it now, before the engine holds
+    it ("cuda_probe": cuda_room_bytes' reading; Windows' figure for another program drops as the engine fills the
+    card); None otherwise, or where the probe has no reading.  gpus, probe: setup.py's list and the readings (tests;
+    else read)."""
+    if not WIN or (cfg.get("backend") or "cuda") != "cuda" or             Path(str(cfg.get("exe") or "")).stem.lower() != "maya-hy4":
+        return None
+    sel = cfg.get("gpu")                               # (one card, several, or "0,2" - serve's gpu_list)
+    sel = [] if sel is None or sel == "" else list(sel) if isinstance(sel, (list, tuple)) else str(sel).split(",")
+    sel = [int(str(x).strip()) for x in sel if str(x).strip() != ""]
+    if len(sel) != 1:
+        return None
+    found = {g["index"]: g for g in ((S.gpus() if gpus is None else gpus) or [])}
+    g = found.get(sel[0])
+    if not g or not g.get("pci") or not g.get("vram_gb") or g.get("unified_memory"):
+        return None
+    saved = hy4_room_load() if saved is None else saved
+    if hy4_room_key(g) in saved:
+        return None
+    r = (cuda_room_bytes() if probe is None else probe).get(S._pci_key(str(g["pci"])))
+    return dict(g, cuda_probe=[int(x) for x in r]) if r else None
+
+
+def hy4_room_measure(cfg: dict, card: dict, info: dict, probe=None, save: bool = True) -> dict | None:
+    """After the engine started with --room-report on `card` (hy4_room_due): CUDA's own share on it as this PC shows
+    it, kept in HY4_ROOM_STORE.  The engine says how much free VRAM CUDA gave it (free) and how much less of it its
+    start's choices hold with (slack: the cache's rows, the drafter's room, the pictures, that it starts - its own
+    plan, so exactly what decides).  In the setup's terms that start takes the setup's sums for it (need:
+    hy4_config_need_gib with the rows and the drafter the engine took, no margin) and had `slack` more: room = need +
+    slack, against what the setup's CUDA probe saw of the card just before the start (card["cuda_probe"]:
+    hy4_room_due's, else probe's - free with a context held) - the
+    share is room - probe.  Not kept: a start that streams its cache (other sums), a figure out of all reason
+    (beyond -1 / +2 GiB), no reading.  The record, or None."""
+    try:
+        gpus = str(info.get("room_gpus") or "")
+        mine = S._pci_key(str(card.get("pci") or ""))
+        got = next((p.split(",") for p in gpus.split(";")
+                    if len(p.split(",")) == 3 and S._pci_key(p.split(",")[0]) == mine), None)
+        if got is None or int(info.get("room_streamed") or 0):
+            return None
+        free, slack = float(got[1]) / 2**30, float(got[2]) / 2**30
+        args, inst = [str(x) for x in cfg.get("args") or []], cfg.get("installer") or {}
+
+        def arg(k: str):
+            return args[args.index(k) + 1] if k in args[:-1] else None
+        quant, layout = inst.get("hy4_quant") or "", inst.get("layout") or HY4_STANDARD
+        ctx = int(arg("--max-context") or 0)
+        need = hy4_config_need_gib(quant, layout, ctx, chunk=int(arg("--chunk")) if arg("--chunk") else None,
+                                   reserve_gb=float(arg("--reserve-gb")) if arg("--reserve-gb") else None,
+                                   q8=info.get("room_rows") == "q8", mtp="--mtp" in args,
+                                   dfly2=bool(int(info.get("room_drafter") or 0)), margin=False) if ctx else None
+        r = card.get("cuda_probe") or (probe or {}).get(mine)
+        if need is None or not r:
+            return None
+        seen = float(r[0]) / 2**30
+        own = need + slack - seen
+        if not -1.0 <= own <= 2.0:
+            return None
+    except (TypeError, ValueError, IndexError, KeyError, AttributeError):
+        return None
+    rec = {"own_gib": round(own, 3), "probe_free_gib": round(seen, 3), "engine_free_gib": round(free, 3),
+           "slack_gib": round(slack, 3), "need_gib": round(need, 3), "context": ctx, "rows": info.get("room_rows"),
+           "drafter": bool(int(info.get("room_drafter") or 0)), "quant": quant, "layout": layout,
+           "measured": time.strftime("%Y-%m-%d %H:%M:%S")}
+    if save:
+        key = hy4_room_key(card)
+        store = {k: v for k, v in hy4_room_load().items()       # (this card's figure under another driver: gone)
+                 if k.split("|")[:3] != key.split("|")[:3]}
+        store[key] = rec
+        try:
+            HY4_ROOM_STORE.parent.mkdir(parents=True, exist_ok=True)
+            HY4_ROOM_STORE.write_text(json.dumps(store, indent=1) + "\n", encoding="utf-8")
+        except OSError:
+            return None
+    return rec
 
 
 def maya_engine_mib() -> dict:
@@ -8459,44 +8980,70 @@ def hy4_used_mib(before: dict | None = None, used: dict | None = None, own: dict
 
 
 def hy4_fit(q: dict, gpus: list, ctx_wanted: int | None = None, used: dict | None = None,
-            layout: str | None = None, pictures: bool = True) -> dict:
+            layout: str | None = None, pictures: bool = True, name: str | None = None,
+            ram_gb: float | None = None, drafter: float = 0.0, kv: str | None = None) -> dict:
     """How a size of Hy4-Flash (q: its entry in the manifest) runs on these cards, worked out before any download:
     {"layout": "standard" where its plan fits the VRAM (hy4_usable_gib) at the context - else a small-card layout the
     size has; "context": ctx_wanted, else "recommended" - the largest of HY4_CONTEXTS that fits, up to
     HY4_TESTED_CONTEXT; "contexts": all that fit; "kv": the latent cache's rows the engine's --kv auto takes at the
-    context - "f16" or "q8" (8-bit rows; never said on screen: the engine chooses at every start); "vision": a
-    picture's room fits ("vision_small": a smaller picture's only); "chunk" and "args": the layout's own engine flags
+    context - "f16" or "q8" (8-bit rows; never said on screen: the engine chooses at every start); "vision":
+    pictures are read ("vision_small": smaller ones than the tower's largest); "chunk" and "args": the layout's own engine flags
     (none for "standard": the engine's defaults - it fills the VRAM left with the most-routed experts itself, and its
     own plan takes the prompt chunk at every start: the largest of 4096 / 2048 / 1024 tokens that these cards hold
     beside the model, its cache and the pictures' room - pictures first there too, src/hy4/hy4_plan.hpp's chunk_pick -
     so no --chunk is written and none can be one the engine would refuse; never --kv: the engine's auto); "usable",
-    "need" (GiB, with the rows of "kv")}.  Pictures go before the prompts' speed:
-    a small-card layout reads prompts in chunks twice its plan's (HY4_CHUNK_UP_GIB) only where that fits beside the
-    largest picture's room - VRAM that holds one of the two goes to the picture, and where only a smaller picture
-    fits, all the room there is goes to it.  pictures False (--no-vision: no picture is ever read): the chunk is
-    doubled where it fits beside the model's own parts alone.
-    Nothing fits: {"error": why, "hint": what to do, "usable", "need"}.  layout: only this one (the files of a folder
-    are that layout's)."""
+    "need" (GiB, with the rows of "kv")}.  Pictures take no VRAM of their own (the engine lends a picture's room
+    from its prompt buffers), so they are on wherever the model runs, at full size, and cost no context and no
+    row's precision ("vision_small" is always False now, kept for the callers); a small-card layout reads prompts in
+    chunks twice its plan's (HY4_CHUNK_UP_GIB) where that fits beside the model's own parts - with or without
+    pictures.
+    Nothing fits: {"error": why, "hint": what to do, "usable", "need"} ("too_big": not even at the smallest context -
+    the size itself; name: the size's on-screen name for the line, else the model's).  layout: only this one (the
+    files of a folder are that layout's).
+    ram_gb (the PC's RAM; None: as before, VRAM alone): contexts that fit the VRAM only with KV streaming are offered
+    too where the RAM holds their rows beside the system's headroom and the size's experts outside the VRAM -
+    "streamed": those contexts; at one of them "kv_streaming" True, "kv_ram" (GiB of RAM for the rows) and
+    "--kv-streaming auto" in "args" (the engine then streams by itself, only there).
+    drafter (GiB: the DFly2 drafter the setup would load beside the model, hy4_dfly2_gib; 0: none): a small-card
+    layout's chunk is not doubled where that would leave the drafter no room while the plan's own chunk does - its
+    drafts are the larger gain there (an RTX 3050 8 GB at 4K: decoding +12-39%, prompts read 37% slower).
+    kv ("f16" / "q8": the engine's --kv with those rows only - "--kv" in "args"; None: its auto): the faster drafting
+    the setup offers on a small card (hy4_fast_drafting_fit) keeps the cache in 8-bit rows at a context where F16 fit."""
     lays = hy4_layouts(q)
     if layout is not None:
         lays = {k: v for k, v in lays.items() if k == layout}
     usable = hy4_usable_gib(gpus, used)
+    kv_own = kv if kv in ("f16", "q8") else None
+    measured = bool(gpus) and all(g.get("engine_room_how") == "measured" for g in gpus)   # (hy4_engine_room's)
 
     def need(plan: dict, c: int) -> float:             # (the least a context takes: with F16 rows, or with 8-bit rows)
+        if kv_own:
+            return hy4_fit_need_gib(plan, c, kv_own == "q8")
         return min(hy4_fit_need_gib(plan, c), hy4_fit_need_gib(plan, c, True))
 
+    ram_rows = hy4_ram_for_rows(q, usable, ram_gb)     # (the RAM left for streamed rows)
+
+    def stream(plan: dict, c: int) -> tuple | None:
+        return hy4_stream_rows(plan, c, usable, ram_rows, kv_own)
+
+    def need_at(plan: dict, c: int, q8: bool, st: tuple | None) -> float:
+        return hy4_stream_need_gib(plan, c, q8, st[1]) if st else hy4_fit_need_gib(plan, c, q8)
+
+    def in_vram(plan: dict, c: int) -> str | None:     # (the rows a context fits in VRAM with - no streaming)
+        return hy4_kv_rows(hy4_fit_need_gib(plan, c), hy4_fit_need_gib(plan, c, True), usable, kv_own)
+
     def rows(plan: dict, c: int) -> str | None:        # (a context the table does not list: not measured on a card)
-        return hy4_kv_rows(hy4_fit_need_gib(plan, c), hy4_fit_need_gib(plan, c, True), usable)
+        return in_vram(plan, c) or (stream(plan, c) or (None,))[0]
     least = HY4_CONTEXTS[0]
     cards = f"{len(gpus)} cards together have" if len(gpus or []) > 1 else "this card has"
     fits = {k: [c for c in HY4_CONTEXTS if rows(v["plan"], c)] for k, v in lays.items()}
     if not any(fits.values()):
         smallest = min((need(v["plan"], least) for v in lays.values()), default=0.0)
-        return {"error": f"{HY4} needs about {smallest:.1f} GB of free VRAM for the parts of the model that must sit "
-                         f"on the GPU (at its smallest context, {context_label(least)}; the engine has no RAM "
+        return {"error": f"{name or HY4} needs about {smallest:.1f} GB of free VRAM for the parts of the model that "
+                         f"must sit on the GPU (at its smallest context, {context_label(least)}; the engine has no RAM "
                          f"fallback for them), and {cards} {usable:.1f} GB free",
                 "hint": "a card with more VRAM (or more cards: --gpus), or close the programs that use this one",
-                "usable": usable, "need": smallest}
+                "usable": usable, "need": smallest, "too_big": True}
     want = int(ctx_wanted) if ctx_wanted else least
     pick = next((k for k in lays if rows(lays[k]["plan"], want)), None)
     if pick is None:                                   # (the context asked for fits no layout)
@@ -8510,29 +9057,36 @@ def hy4_fit(q: dict, gpus: list, ctx_wanted: int | None = None, used: dict | Non
     rec = max([c for c in fits[pick] if c <= HY4_TESTED_CONTEXT] or [least])
     ctx = int(ctx_wanted) if ctx_wanted else rec
     kv = rows(plan, ctx)
-    takes = hy4_fit_need_gib(plan, ctx, kv == "q8")
+    st = None if in_vram(plan, ctx) else stream(plan, ctx)
+    takes = need_at(plan, ctx, kv == "q8", st)
     chunk, args = int(plan.get("chunk") or 0), []
-    # (pictures: the engine keeps a picture's room free on the main GPU - the context is never made smaller for it.
-    #  Its order, src/hy4/hy4_plan.hpp's kv_pick - pictures before the cache's rows: F16 rows and the largest
-    #  picture's room, 8-bit rows and that room, F16 then 8-bit rows and a smaller picture's room (HY4_VISION_MIN_GIB
-    #  at least: the engine then says the pictures' size and the server resizes to it), and only then text only, with
-    #  the rows worked out above)
-    vision, small = False, False
-    for q8, room in ((False, HY4_VISION_GIB), (True, HY4_VISION_GIB), (False, HY4_VISION_MIN_GIB),
-                     (True, HY4_VISION_MIN_GIB)) if pictures else ():
-        if hy4_fit_need_gib(plan, ctx, q8) + room <= usable:
-            kv, vision, small = "q8" if q8 else "f16", True, room < HY4_VISION_GIB
-            takes = hy4_fit_need_gib(plan, ctx, q8)
-            break
+    # (pictures: their room is lent by the engine's prompt buffers - no VRAM kept, so the rows and the context
+    #  worked out above stand and the largest picture is read on every layout)
+    vision, small = bool(pictures), False
     if pick != HY4_STANDARD:
-        # (the chunk after the pictures: doubled only where that leaves the picture chosen above as it is - beside
-        #  the largest picture's room with the same rows; a smaller picture already takes all the room there is)
-        if chunk and not small and takes + (HY4_VISION_GIB if vision else 0.0) + HY4_CHUNK_UP_GIB <= usable:
+        # (the chunk: doubled where that fits beside the model's own parts with the rows chosen above - the larger
+        #  chunk's buffers hold the largest picture by themselves, so pictures and the chunk no longer compete)
+        def beside(ch: int) -> float:                  # (with the drafter: hy4_drafter_need_gib)
+            return hy4_drafter_need_gib(plan, {"context": ctx, "kv": kv, "need": takes, "chunk": ch,
+                                               "room_measured": measured}, drafter)
+        if chunk and takes + HY4_CHUNK_UP_GIB <= usable and \
+                not (drafter and not st and beside(2 * chunk) > usable >= beside(chunk)):
             chunk *= 2
         args = (["--chunk", str(chunk)] if chunk else []) +             [x for k, flag in (("reserve_gb", "--reserve-gb"), ("vram_experts", "--vram-experts")) if k in plan
              for x in (flag, f"{float(plan[k]):g}")]
-    return {"layout": pick, "context": ctx, "recommended": rec, "contexts": fits[pick], "chunk": chunk, "args": args,
-            "kv": kv, "usable": usable, "need": takes, "vision": vision, "vision_small": small}
+    streamed = [c for c in fits[pick] if not in_vram(plan, c)]
+    if kv_own:                                         # (the rows asked for: the engine's --kv, nothing auto)
+        args = args + ["--kv", kv_own]
+    out = {"layout": pick, "context": ctx, "recommended": rec, "contexts": fits[pick], "chunk": chunk, "args": args,
+           "kv": kv, "usable": usable, "need": takes, "vision": vision, "vision_small": small}
+    if streamed:
+        out["streamed"] = streamed
+    if measured:                                       # (the drafter's sums then without margins: hy4_drafter_need_gib)
+        out["room_measured"] = True
+    if st:
+        out.update(kv_streaming=True, kv_ram=hy4_stream_ram_gib(ctx, kv == "q8"),
+                   args=args + ["--kv-streaming", "auto"])
+    return out
 
 
 def hy4_layout_in(d: Path, quant: str) -> str | None:
@@ -8580,7 +9134,8 @@ def choose_hy4_quant(a, prev: dict) -> str:
               f"Tencent's own Q4_K_M (AngelSlim): {hy4_quant_table(k).get('about', 'GGUF')}; about "
               f"{m[k]['memory_gb']:.0f} GB of VRAM and RAM together; with MTP drafting - run on NVIDIA RTX 30 / A100 "
               "and newer, Linux") for k in others]
-    pick = choose(f"Which files of {HY4}?", ["Maya's GGUF quants of it, on NVIDIA from V100 on or AMD (Linux), and Tencent's own:"],
+    pick = choose(f"Which files of {HY4}?", ["Maya's GGUF quants of it, on NVIDIA from V100 on or AMD (Linux; Windows experimental), and "
+                                           "Tencent's own:"],
                   rows, order.index(default), a.yes or getattr(a, "check", False))
     return order[pick]
 
@@ -8798,20 +9353,147 @@ def hy4_mtp_step(a, d: Path, quant: str, models: Path | None = None) -> Path | N
     return f
 
 
-def hy4_pack_step(a, d: Path, files: list, vis: Path | None = None, mtp: Path | None = None) -> Path:
+def hy4_dfly2_entry(quant: str) -> dict | None:
+    """A Maya size's DFly2 drafter - its size entry's "drafter" in download.json: Tencent's draft layers in a GGUF
+    named .dfly2 on the Hub, kept under that name (the pack finds it in the model's folder) - as a MODELS entry
+    (offer_download's form), from Maya's repo at the table's commit.  None: the size has none (Tencent's own Q4_K_M
+    drafts with its MTP block)."""
+    if quant == HY4_Q4:
+        return None
+    man = read_json(HY4_MANIFEST)
+    src = hy4_quant_table(quant).get("drafter") or {}
+    if not src or not man.get("repo"):
+        return None
+    path, (size, sha) = next(iter(src.items()))
+    name, folder = Path(path).name, Path(path).parent.as_posix()
+    return {"about": f"{HY4}'s DFly2 drafter for {Q.shown('hy4', quant)}; {man.get('license', 'Tencent Hy License')}",
+            "format": "hy4-gguf", "repo": man["repo"], "revision": man.get("revision") or "main",
+            "folder": "" if folder == "." else folder, "files": {name: size}, "sha256": {name: sha},
+            "download_gb": size / 1e9, "name": name, "published": bool(man.get("revision"))}
+
+
+def hy4_dfly2_gib(quant: str) -> float:
+    """The VRAM (GiB) a size's DFly2 drafter takes on the main GPU, as the engine counts it (src/hy4/hy4_plan.hpp's
+    dfly_bytes): its matrices as they are in the file, its small scratch and lists (HY4_DFLY2_EXTRA).  0 where the size
+    has none."""
+    e = hy4_dfly2_entry(quant)
+    return 0.0 if e is None else (e["files"][e["name"]] + HY4_DFLY2_EXTRA) / 2**30
+
+
+def hy4_drafter_need_gib(plan: dict, fit: dict, drafter: float) -> float:
+    """The VRAM (GiB) a start hy4_fit worked out on a layout's plan needs with a drafter of `drafter` GiB beside it (the
+    DFly2 drafter: hy4_dfly2_gib): the fit's own figure ("need", with the cache's rows it chose), a prompt chunk it
+    doubled (HY4_CHUNK_UP_GIB), the drafter's room, and HY4_FIT_MARGIN_GIB where the fit's figure is one measured on a
+    card (a start with the drafter beside it never was; a context the plan does not list carries the margin already).
+    The engine loads the drafter only where its room changes nothing but the experts' places - the cache's rows, the
+    prompt chunk, KV streaming (src/hy4 load()): with this figure free it does, with less it decodes without drafts.
+    "room_measured" (hy4_fit's: every card's room counts CUDA's own share as the engine measured it on this PC -
+    hy4_engine_room): the sums without HY4_FIT_MARGIN_GIB, neither this one nor a context's the plan does not list -
+    the margin stands for sums never set against an engine, and that start set them against this PC's; a claim the
+    engine then finds no room for costs a start without drafts, never a start (the contexts and the rows that fit keep
+    their margins).  Measured on an RTX 3050 8 GB: so the setup claims the drafter at 4K and 5K, not at 6K and 8K,
+    and finds it room at 8K beside 8-bit rows - each as its engine then does."""
+    listed = plan.get("need_gib_q8" if fit.get("kv") == "q8" else "need_gib") or {}
+    up = HY4_CHUNK_UP_GIB if int(fit.get("chunk") or 0) > int(plan.get("chunk") or 0) > 0 else 0.0
+    if fit.get("room_measured") and not fit.get("kv_streaming"):
+        own = 0.0 if str(fit.get("context")) in listed else HY4_FIT_MARGIN_GIB   # (hy4_fit_need_gib's, taken out)
+        return float(fit.get("need") or 0) - own + up + drafter
+    margin = HY4_FIT_MARGIN_GIB if str(fit.get("context")) in listed else 0.0
+    return float(fit.get("need") or 0) + up + drafter + margin
+
+
+def hy4_dfly2_need_gib(quant: str, fit: dict) -> float:
+    """hy4_drafter_need_gib for a size's DFly2 drafter beside the start hy4_fit worked out for it (fit["layout"])."""
+    plan = (hy4_layouts(hy4_quant_table(quant)).get(fit.get("layout") or HY4_STANDARD) or {}).get("plan") or {}
+    return hy4_drafter_need_gib(plan, fit, hy4_dfly2_gib(quant))
+
+
+def hy4_fast_drafting_fit(quant: str, gpus: list, fit: dict, used: dict | None = None,
+                          ram_gb: float | None = None) -> dict | None:
+    """The setup's opt-in faster drafting (--fast-drafting on) for the start hy4_fit worked out (fit): the same
+    context and layout with the latent cache in 8-bit rows (the engine's --kv q8, "--kv q8" in "args";
+    "fast_drafting": True) where those rows are what gives the size's DFly2 drafter its room - on one GPU, where the
+    start as worked out drafts with nothing: its rows F16 in VRAM (no KV streaming), no room for the drafter beside
+    them nor for the MTP block, and with 8-bit rows the drafter's room as the engine counts it
+    (hy4_dfly2_need_gib).  "f16_room": True where these sums find the drafter room beside the F16 rows too (the
+    default then claims it; the engine, which counts its own free VRAM at every start, may still find none there -
+    its start line says so - so the faster start is taken there only when asked by
+    name).  Decided by this PC's own figures (its cards' free VRAM, the size's plan), no card named.  The 8-bit rows
+    round the cache, so the answers are worded slightly differently from the default's (F16) - only when asked;
+    within that start drafting on and off give the same tokens (the drafter's room is counted either way).  None: no
+    such trade here."""
+    if quant == HY4_Q4 or len(gpus or []) != 1 or "error" in fit or fit.get("kv") != "f16" or \
+            fit.get("kv_streaming") or hy4_dfly2_entry(quant) is None:
+        return None
+    usable = float(fit.get("usable") or 0)
+    if fit.get("layout") == HY4_STANDARD and hy4_mtp_entry() is not None and \
+            float(fit.get("need") or 0) + hy4_mtp_gib(int(fit.get("chunk") or 1024)) <= usable:
+        return None                                    # (the MTP block fits: the default drafts with it)
+    f8 = hy4_fit(hy4_quant_table(quant), gpus, fit["context"], used=used, layout=fit.get("layout"),
+                 pictures=bool(fit.get("vision", True)), ram_gb=ram_gb, drafter=hy4_dfly2_gib(quant), kv="q8")
+    if "error" in f8 or f8.get("kv") != "q8" or f8.get("kv_streaming") or hy4_dfly2_need_gib(quant, f8) > f8["usable"]:
+        return None
+    room = hy4_dfly2_need_gib(quant, fit) <= usable
+    if room and fit.get("layout") == HY4_STANDARD:
+        return None                                    # (the standard layout: its room comes from the experts' VRAM)
+    return {**f8, "fast_drafting": True, "f16_room": room}
+
+
+def hy4_pack_dfly2_file(pack: Path) -> str | None:
+    """The name of the DFly2 drafter's file a pack reads (hy4.txt has dfly_layers; tensors.txt's `file` line of the
+    file that is no trunk shard, MTP block or mmproj), or None."""
+    try:
+        if not any(ln.split()[:1] == ["dfly_layers"] for ln in (pack / "hy4.txt").read_text(encoding="utf-8").splitlines()):
+            return None
+        with (pack / "tensors.txt").open(encoding="utf-8") as f:
+            for ln in f:
+                if not ln.startswith("file "):
+                    break
+                n = Path(ln.split(None, 2)[2].strip()).name
+                if n.endswith(".dfly2") or "drafter" in n.lower():
+                    return n
+    except (OSError, IndexError):
+        pass
+    return None
+
+
+def hy4_dfly2_step(a, d: Path, quant: str, models: Path | None = None) -> Path | None:
+    """A Maya size's DFly2 drafter file in d, or None (no drafts: said in step 7).  A file the folder has is taken;
+    else it is hard-linked from another folder of this size here (its other layout's), else downloaded (asked like
+    the model).  Checked against its sha256 (once, then remembered)."""
+    e = hy4_dfly2_entry(quant)
+    if e is None:
+        return None
+    f = d / e["name"]
+    if file_incomplete(e, f) and models is not None:
+        link_published(f, e["files"][f.name], e["sha256"][f.name], hy4_places(models, f.name))
+    if file_incomplete(e, f) and e["published"]:
+        offer_download(a, f"{HY4}'s DFly2 drafter for this size ({e['download_gb']:.1f} GB)", d, [f], e)
+    if file_incomplete(e, f):
+        return None
+    if not sha256_checked(f, e["sha256"][f.name]):
+        fail(f"{f}: the sha256 does not match the published one - the file is damaged (its size is right)",
+             f"delete it and run {ME} --setup again")
+    return f
+
+
+def hy4_pack_step(a, d: Path, files: list, vis: Path | None = None, mtp: Path | None = None,
+                  dfly: Path | None = None) -> Path:
     """tools/hy4/pack_gguf.py's pack in <model>/maya-hy4: the geometry, where every tensor sits in the two GGUF files
-    (read in place) - the vision tower's mmproj file's too (vis), and the draft block's of a Maya size (mtp: Tencent's
-    MTP block in its own file) -, the n-gram table's small parts and the tokenizer with the GGUF's chat template -
-    built again when its tools or the model's files changed, or the vision tower or the draft block came or went."""
+    (read in place) - the vision tower's mmproj file's too (vis), and the drafter's of a Maya size (mtp: Tencent's
+    MTP block in its own file; dfly: the size's DFly2 drafter) -, the n-gram table's small parts and the tokenizer with
+    the GGUF's chat template - built again when its tools or the model's files changed, or the vision tower or a
+    drafter came or went."""
     step(6, "the pack (the engine's index of the model files)")
     pack = d / HY4_PACK
     tools = S.source_hash(HY4_PACK_TOOLS)
     need = ("hy4.txt", "tensors.txt", "engram.bin", "tokenizer/vocab.json", "tokenizer/chat_template.jinja")
-    every = list(files) + ([mtp] if mtp is not None else []) + ([vis] if vis is not None else [])
+    every = list(files) + [f for f in (mtp, dfly, vis) if f is not None]
     if not a.repack and read_json(pack / PACK_SOURCES).get("tools") == tools and \
             all((pack / f).exists() for f in need) and pack_stale(pack, every) is None and \
             hy4_pack_has_vision(pack) == (vis is not None) and \
-            hy4_pack_mtp_file(pack) == (mtp.name if mtp is not None else None):
+            hy4_pack_mtp_file(pack) == (mtp.name if mtp is not None else None) and \
+            hy4_pack_dfly2_file(pack) == (dfly.name if dfly is not None else None):
         ok(f"pack already built: {pack}")
         return pack
     if not os.access(d, os.W_OK):
@@ -8819,7 +9501,7 @@ def hy4_pack_step(a, d: Path, files: list, vis: Path | None = None, mtp: Path | 
     say("  Indexing every tensor of the GGUF files (the weights stay where they are) and the tokenizer ...")
     run([sys.executable, str(ROOT / "tools" / "hy4" / "pack_gguf.py"), "--model", str(d), "--out", str(pack),
          "--mmproj", vis.name if vis is not None else "none", "--mtp", mtp.name if mtp is not None else "none",
-         "--files"] + [f.name for f in files])
+         "--drafter", dfly.name if dfly is not None else "none", "--files"] + [f.name for f in files])
     missing = [f for f in need if not (pack / f).exists()]
     if missing:
         fail(f"the pack builder did not write {pack / missing[0]}", "the reason is in the messages above")
@@ -8832,11 +9514,12 @@ def hy4_pack_step(a, d: Path, files: list, vis: Path | None = None, mtp: Path | 
 
 
 def write_config_hy4(a, pc: dict, meta: dict, pack: Path, ctx: int, models: Path, d: Path, drafting: bool = False,
-                     quant: str = HY4_Q4, fit: dict | None = None, vision: bool = True) -> Path:
+                     quant: str = HY4_Q4, fit: dict | None = None, vision: bool = True, drafter: str = "mtp",
+                     extra: dict | None = None) -> Path:
     """A set's config and its start script: maya-hy4-flash-maya-xs.json for a Maya size (maya_quants.config_stem: one
     config a size, whichever layout), maya-hy4-flash.json for Tencent's own Q4_K_M (--mtp: drafting with its MTP
-    block).  The model's own sampling and thinking level are written at every setup; a setup again keeps what the
-    config before says that this one does not ask - where the server listens, its key, the env, and the engine's
+    block; a Maya size drafts with the block, or with its DFly2 drafter - drafter "dfly2": --dfly2).  The model's own
+    sampling and thinking level are written at every setup; a setup again keeps what the config before says that this one does not ask - where the server listens, its key, the env, and the engine's
     settings set by hand or on the Models page (tensor parallel, the CPU lane's threads, an expert profile, the
     drafts; in the standard layout the prompt chunk and the VRAM kept free too).  A layout's own flags (hy4_fit's
     "args") are worked out again every time.  maya-hy4 stops at a flag it does not know: only its own are written."""
@@ -8848,7 +9531,8 @@ def write_config_hy4(a, pc: dict, meta: dict, pack: Path, ctx: int, models: Path
     # (--tp auto, the engine's default: tensor parallel over the largest group of equal GPUs, the fastest GPU holding
     #  the head and the drafts; the layers split where no group fits.  No --gpus: the server shows the engine only the
     #  config's "gpu" cards, and it takes all it sees)
-    args = ["--pack", str(pack), "--max-context", str(ctx)] + list(fit["args"]) + (["--mtp"] if drafting else [])
+    args = ["--pack", str(pack), "--max-context", str(ctx)] + list(fit["args"]) + \
+        ([("--dfly2" if drafter == "dfly2" else "--mtp")] if drafting else [])
     if quant != HY4_Q4 and HY4_PROFILE.exists():
         args += ["--profile", str(HY4_PROFILE)]
     # pictures: on whenever the pack has the vision tower (the engine's default - no flag; a setup again turns them
@@ -8864,6 +9548,21 @@ def write_config_hy4(a, pc: dict, meta: dict, pack: Path, ctx: int, models: Path
             "drafting": "on" if drafting else "off"}
     if quant != HY4_Q4 and hy4_pack_mtp_file(pack):    # (a Maya size with the draft block: "off" is then a choice)
         inst["draft_block"] = True
+    if quant != HY4_Q4 and hy4_pack_dfly2_file(pack):  # (... with the DFly2 drafter: the same)
+        inst["dfly2"] = True
+    if drafting and quant != HY4_Q4:
+        inst["drafter"] = drafter
+    if fit.get("fast_drafting"):                       # (the opt-in: --kv q8 in its args; a setup again keeps it)
+        inst["fast_drafting"] = True
+    # (Windows: the VRAM the engine's CUDA gets on each card, as measured now - hy4_engine_room - with the card's
+    #  VRAM and CUDA's own reading: the Models page counts it too while the engine holds the card, where it cannot be
+    #  measured - with CUDA's own share as the engine measured it later, where it has since)
+    room = {str(g["index"]): [round(float(g["engine_room_gb"]), 3), float(g["vram_gb"])] +
+            ([round(float(g["cuda_free_gb"]), 3)] if g.get("cuda_free_gb") is not None else [])
+            for g in pc["gpus"] if g.get("engine_room_gb") is not None and g.get("vram_gb")}
+    if room:
+        inst["engine_room_gb"] = room
+    inst.update(extra or {})                         # (draft_choice: auto = both fit, the speed calibration picks)
     sampling, effort = Q.model_defaults({"installer": inst})   # (the model's own, every setup: its card's)
     cfg = {"exe": str(HY4_EXE), "args": args, "cwd": str(ROOT), "tokenizer": str(pack / "tokenizer"),
            "model_name": HY4_MODEL_NAME, "gpu": [g["index"] for g in pc["gpus"]],
@@ -8891,6 +9590,21 @@ def write_config_hy4(a, pc: dict, meta: dict, pack: Path, ctx: int, models: Path
     return cfg_path
 
 
+def hy4_smaller_fit(quant: str, gpus: list, pictures: bool = True) -> tuple[str, str] | None:
+    """Where `quant` does not fit these cards even at its smallest context: the largest smaller Maya size that does
+    (hy4_fit) and that the setup offers - its files published, the layout it takes there too: (key, layout), or None.
+    Another set of files (Tencent's Q4_K_M): any Maya size."""
+    keys = list(HY4_QUANTS)
+    for k in reversed(keys[:keys.index(quant)] if quant in keys else keys):
+        q = hy4_quant_table(k)
+        if not hy4_layouts(q) or not hy4_published(k):
+            continue
+        f = hy4_fit(q, gpus, pictures=pictures)
+        if "error" not in f and hy4_published(k, f["layout"]):
+            return k, f["layout"]
+    return None
+
+
 def hy4_fit_step(a, pc: dict, quant: str, prev_ctx: int | None = None, have=None) -> dict:
     """The layout and the context of a size on the cards chosen (hy4_fit), said; what does not fit stops the setup
     here, before any download.  --model-dir: the layout of the trunk in that folder.  The context: --context, else
@@ -8902,7 +9616,12 @@ def hy4_fit_step(a, pc: dict, quant: str, prev_ctx: int | None = None, have=None
     if not hy4_layouts(q):
         hy4_entry(quant)                               # (a size with no files yet: its own message)
     forced = hy4_layout_in(Path(a.model_dir).expanduser(), quant) if a.model_dir else None
-    fit = hy4_fit(q, pc["gpus"], a.context, layout=forced, pictures=not a.no_vision)
+    ram = mem_gb()[0]
+    # (the DFly2 drafter where the setup would load it - one GPU, drafting not off nor the MTP block's: its room first)
+    de = hy4_dfly2_entry(quant)
+    dg = hy4_dfly2_gib(quant) if de and de["published"] and len(pc["gpus"] or []) == 1 and \
+        getattr(a, "drafting", None) not in ("off", "mtp") else 0.0
+    fit = hy4_fit(q, pc["gpus"], a.context, layout=forced, pictures=not a.no_vision, name=name, ram_gb=ram, drafter=dg)
     if "error" not in fit and hy4_layouts(q)[fit["layout"]].get("published") == "hub" and not forced and \
             read_json(HY4_MANIFEST).get("revision") and \
             not (have and hy4_layout_in(have(fit["layout"]), quant) == fit["layout"]):
@@ -8920,9 +9639,17 @@ def hy4_fit_step(a, pc: dict, quant: str, prev_ctx: int | None = None, have=None
                  "needed); a card with about 10 GB of VRAM or more runs the standard file now")
     if "error" not in fit and not a.context and not getattr(a, "check", False):
         ctx = choose_context(a, prev_ctx, fit["contexts"], fit["recommended"])
-        fit = hy4_fit(q, pc["gpus"], ctx, layout=fit["layout"], pictures=not a.no_vision)
+        fit = hy4_fit(q, pc["gpus"], ctx, layout=fit["layout"], pictures=not a.no_vision, name=name, ram_gb=ram,
+                      drafter=dg)
     if "error" in fit:
-        fail(fit["error"] + (f" (the files in {a.model_dir} are the {forced} layout's)" if forced else ""), fit["hint"])
+        hint = fit["hint"]
+        alt = hy4_smaller_fit(quant, pc["gpus"], not a.no_vision) if fit.get("too_big") and not forced else None
+        if alt:                                        # (a smaller size runs here: said, with its command)
+            k, lay = alt
+            where = "these cards" if len(pc["gpus"] or []) > 1 else "this card"
+            hint = (f"the smaller {Q.shown('hy4', k)} fits {where}" + (" (its 8 GB-card file)" if lay == "8gb" else "")
+                    + f": {ME} --setup --model {Q.setup_id('hy4', k)} - or {hint}")
+        fail(fit["error"] + (f" (the files in {a.model_dir} are the {forced} layout's)" if forced else ""), hint)
     if fit["layout"] == HY4_STANDARD and hy4_amd(pc["gpus"]) and any(hip_unified_memory(g) for g in pc["gpus"]):
         # (a unified-memory APU: the next line - set_up_hy4's hy4_apu_note - says whether the experts all sit there)
         ok(f"{name} fits: about {fit['need']:.1f} GB for what must sit on the GPU, of the {fit['usable']:.1f} GB of "
@@ -8937,6 +9664,9 @@ def hy4_fit_step(a, pc: dict, quant: str, prev_ctx: int | None = None, have=None
            f"{fit['need']:.1f} GB of the {fit['usable']:.1f} GB of VRAM for what must sit there; the routed experts "
            f"are computed on the CPU, prompts are read in chunks of {fit['chunk']} tokens")
     ok(f"context: {fit['context']} tokens" + (" (recommended for this VRAM)" if fit["context"] == fit["recommended"] else ""))
+    if fit.get("kv_streaming"):
+        ok(f"at this context the attention cache's older rows live in RAM: about {fit['kv_ram']:.1f} GB of it, kept "
+           "pinned (the answers are the same; long prompts and answers are somewhat slower)")
     if max(fit["contexts"]) < HY4_CONTEXTS[-1]:        # (the model reaches 1M: what keeps this PC below it, said once)
         ok(f"a context above {context_label(max(fit['contexts']))} needs more VRAM than "
            f"{'these cards have' if len(pc['gpus']) > 1 else 'this card has'} free (the model's own reach: "
@@ -8946,9 +9676,63 @@ def hy4_fit_step(a, pc: dict, quant: str, prev_ctx: int | None = None, have=None
     return fit
 
 
+HY4_FAST_DRAFTING_SAID = "faster drafting, slightly different wording than the default"
+
+
+def hy4_fast_drafting_step(a, pc: dict, quant: str, fit: dict, before: bool = False) -> tuple:
+    """Step 2's faster drafting for a Maya size (hy4_fast_drafting_fit: the cache in 8-bit rows where that gives the
+    DFly2 drafter its room): (the start the setup goes on with, the faster one where it applies here but was not
+    taken - step 5's drafting line names it - else None).  --fast-drafting on: the faster where it applies (else
+    said why not; the default); off: the default; not given: the config before's choice (before) where it still
+    applies, else asked where the setup's sums give the drafter no room beside the F16 rows - the default first
+    (--yes: the default).  Never the default by itself: its answers are not the default's."""
+    want, how = getattr(a, "fast_drafting", None), getattr(a, "drafting", None)
+    if how in ("off", "mtp"):
+        if want == "on":
+            warn(f"faster drafting: not set up with --drafting {how} - it is for the DFly2 drafter; the cache's rows "
+                 "stay the default's")
+        return fit, None
+    fast = hy4_fast_drafting_fit(quant, pc["gpus"], fit, ram_gb=mem_gb()[0])
+    if fast is None:
+        if want == "on" or (want is None and before):
+            usable = float(fit.get("usable") or 0)
+            why = (f"the DFly2 drafter runs on one GPU for now (this PC: {len(pc['gpus'])})" if len(pc["gpus"]) != 1
+                   else "this size has no DFly2 drafter" if hy4_dfly2_entry(quant) is None
+                   else "at this context the cache is in 8-bit rows by default already" if fit.get("kv") == "q8"
+                   else "at this context the cache's older rows live in RAM" if fit.get("kv_streaming")
+                   else "the MTP block drafts here, with the default's answers"
+                   if fit.get("layout") == HY4_STANDARD and hy4_mtp_entry() is not None and
+                   float(fit.get("need") or 0) + hy4_mtp_gib(int(fit.get("chunk") or 1024)) <= usable
+                   else f"even with the cache in 8-bit rows the DFly2 drafter has no room at this context "
+                        f"({usable:.1f} GB free)")
+            (warn if want == "on" else ok)(f"faster drafting: not set up - {why}; the default start")
+        return fit, None
+    if want is None and not before and fast["f16_room"]:
+        return fit, None                               # (the default claims the drafter: nothing asked, nothing said)
+    if want is None and not before:
+        rows = [("Default: the cache in F16 rows, no drafting at this context", "recommended",
+                 "The answers as Maya's default writes them."),
+                ("Faster drafting: the cache in 8-bit rows, so the DFly2 drafter fits", None,
+                 f"Decoding is faster; {HY4_FAST_DRAFTING_SAID}.")]
+        pick = choose("Faster drafting?",
+                      [f"At a context of {context_label(fit['context'])} the DFly2 drafter has no room on this card beside "
+                       "the cache's F16 rows.", "With the cache in 8-bit rows it fits: faster drafting, slightly "
+                       "different wording than the default."], rows, 0, a.yes or getattr(a, "check", False))
+        want = "on" if pick == 1 else "off"
+    if want == "off":                                  # (not asked for by name: step 5 names the faster one)
+        return fit, (fast if getattr(a, "fast_drafting", None) is None else None)
+    ok("faster drafting: on" + (" (as set up before)" if getattr(a, "fast_drafting", None) is None else "") +
+       f" - the cache in 8-bit rows at this context, so the DFly2 drafter fits" +
+       (" also where the engine finds no room for it beside F16 rows (its start line says which)"
+        if fast["f16_room"] else "") +
+       f": {HY4_FAST_DRAFTING_SAID} (F16 rows; {ME} --setup --fast-drafting off sets the default up again)")
+    return fast, None
+
+
 def set_up_hy4(a, prev: dict) -> Path | None:
     """Hy4-Flash's steps 1-8: the files (Maya's sizes, or Tencent's own Q4_K_M), the PC (NVIDIA from V100 on; AMD on
-    Linux: hy4_usable_gib counts a unified-memory APU's one memory, hy4_apu_note says what it holds), the
+    Linux - under Windows experimental: hy4_usable_gib counts a unified-memory APU's memory, hy4_apu_note says what
+    it holds), the
     context - a Maya size: with the layout that fits its VRAM, worked out before any download; the Q4_K_M: recommended
     by the smallest GPU's VRAM, and its drafting - the engine (build/maya-hy4), the files (pinned, sha256-checked), the
     pack, the config.  A Maya size drafts with Tencent's MTP block from its own file (hy4_mtp_step: one for every
@@ -8964,11 +9748,22 @@ def set_up_hy4(a, prev: dict) -> Path | None:
     pc = check_pc(a, "hy4")                            # 1
     total, _ = mem_gb()
     vram = sum(g["vram_gb"] for g in pc["gpus"])
+    room = hy4_engine_room(pc)                         # (Windows: what the engine's CUDA gets on each card, measured)
+    if room and len(room) == len(pc["gpus"]) and \
+            sum(room.values()) < hy4_usable_gib([{k: v for k, v in g.items() if k != "engine_room_gb"}
+                                                 for g in pc["gpus"]]):
+        how = {g.get("engine_room_how") for g in pc["gpus"]}
+        ok(f"VRAM: Windows keeps part of {'these cards' if len(pc['gpus']) > 1 else 'this card'} from the programs "
+           f"on it - the setup counts {sum(room.values()):.1f} of its {vram:.1f} GB, from CUDA's own reading (the "
+           "figure the engine plans with) and CUDA's own share " +
+           ("as the engine measured it at its first start here (measured)" if how == {"measured"} else
+            f"guessed until the engine's first start here measures it (estimated: {HY4_FIT_CUDA_OWN_GIB:g} GB)"
+            if how == {"estimated"} else "measured on some cards, guessed on the others (estimated)"))
     need = float(hy4_quant_table(quant).get("memory_gb") or 0)
     models = (Path(a.models_dir).expanduser().resolve() if a.models_dir else
               Path(inst["models_dir"]) if inst.get("models_dir") else ROOT.parent / "Maya-data" / "models")
     step(2, "your choices")                            # 2
-    drafting = False
+    drafting, plain_fit, fast_alt = False, None, None
     if quant == HY4_Q4:
         m = hy4_entry()
         ok(f"files: {Q.shown('hy4', quant, m['download_gb'])} - Tencent's own Q4_K_M (AngelSlim's GGUF; the repo's "
@@ -8999,6 +9794,8 @@ def set_up_hy4(a, prev: dict) -> Path | None:
     else:
         ok(f"files: {name} (Maya's quant)")
         fit = hy4_fit_step(a, pc, quant, prev_ctx, lambda lay: hy4_dir(a, models, prev, quant, lay))
+        plain_fit = fit
+        fit, fast_alt = hy4_fast_drafting_step(a, pc, quant, fit, same and bool(inst.get("fast_drafting")))
         note = hy4_apu_note(pc["gpus"], hy4_quant_table(quant), name)
         if note:
             (ok if note[0] else warn)(note[1])
@@ -9013,23 +9810,60 @@ def set_up_hy4(a, prev: dict) -> Path | None:
     if files is None:
         return None
     vis = hy4_vision_step(a, d, quant, models)
-    # a Maya size's drafts: the block where it fits on the main GPU beside the model's own parts at this context (and
-    # a picture's room where pictures are on) - a small-card layout has no room for it, and it is not fetched there
-    mtp, mtp_why = None, ""
-    if quant != HY4_Q4 and hy4_mtp_entry() is not None:
-        room = float(fit.get("need") or 0) + hy4_mtp_gib(int(fit.get("chunk") or 1024)) + \
-            (HY4_VISION_GIB if fit.get("vision") and not fit.get("vision_small") and not a.no_vision else
-             HY4_VISION_MIN_GIB if fit.get("vision") and not a.no_vision else 0.0)
-        if fit["layout"] != HY4_STANDARD or room > float(fit.get("usable") or 0):
+    # a Maya size's drafts: the block where it fits on the main GPU beside the model's own parts at this context
+    # (pictures take no VRAM of their own) - a small-card layout has no room for it, and it is not fetched there;
+    # where it does not fit (or --drafting dfly2), the size's DFly2 drafter where that fits - on one GPU (the engine
+    # runs it with the layers it reads and the head on one card)
+    how = getattr(a, "drafting", None) if quant != HY4_Q4 else None
+    mtp, mtp_why, dfly, dfly_why = None, "", None, ""
+    # (the faster drafting's start: the block counted on the default's, where it has no room - hy4_fast_drafting_fit)
+    f0 = plain_fit or fit
+    base = float(f0.get("need") or 0)
+    usable = float(fit.get("usable") or 0)
+    if quant != HY4_Q4 and hy4_mtp_entry() is not None and how != "dfly2":
+        room = base + hy4_mtp_gib(int(f0.get("chunk") or 1024))
+        if f0["layout"] != HY4_STANDARD or room > usable:
             mtp_why = (f"the draft block needs about {hy4_mtp_gib():.1f} GB of VRAM beside the model's own parts "
-                       f"({room:.1f} GB with it at this context, {float(fit.get('usable') or 0):.1f} GB free on "
-                       "this PC's cards)")
+                       f"({room:.1f} GB with it at this context, {usable:.1f} GB free on this PC's cards)")
         else:
             mtp = hy4_mtp_step(a, d, quant, models)
             if mtp is None:
                 mtp_why = ("the draft block's file is not in the model's folder" +
                            ("" if hy4_mtp_entry()["published"] else " (it is not published yet)"))
-    pack = hy4_pack_step(a, d, files, vis, mtp)        # 6
+    # (where the block fits too, the drafter beside it: which of the two drafts is measured on this PC - the speed
+    #  calibration's short A/B at the first start - and until then the faster for this size where it was measured)
+    #  The engine loads the drafter only where its room leaves the start as it is but for the experts' places (the
+    #  cache's rows, the prompt chunk, KV streaming): elsewhere it decodes without drafts, and the setup says so
+    if how != "mtp" and hy4_dfly2_entry(quant) is not None:
+        room = hy4_dfly2_need_gib(quant, fit)
+        if len(pc["gpus"]) > 1:
+            dfly_why = f"the DFly2 drafter runs on one GPU for now (this PC: {len(pc['gpus'])})"
+        elif fit.get("kv_streaming") or room > usable:
+            dfly_why = (f"the DFly2 drafter needs about {hy4_dfly2_gib(quant):.1f} GB beside the model's own parts " +
+                        ("(at this context the cache's older rows live in RAM, and beside it fewer would stay in VRAM)"
+                         if fit.get("kv_streaming") else
+                         f"({room:.1f} GB with it at this context, {usable:.1f} GB free)") +
+                        ": the engine loads it only where it leaves the rest of the start as it is (the cache's rows, "
+                        "the prompt chunk), so the answers with drafts are those without")
+            q, used, ram = hy4_quant_table(quant), gpu_used_mib(), mem_gb()[0]
+            for c in sorted((c for c in fit.get("contexts") or [] if c < fit["context"]), reverse=True):
+                f = hy4_fit(q, pc["gpus"], c, used=used, layout=fit["layout"], pictures=bool(fit.get("vision", True)),
+                            ram_gb=ram, drafter=hy4_dfly2_gib(quant))
+                if "error" not in f and not f.get("kv_streaming") and hy4_dfly2_need_gib(quant, f) <= f["usable"]:
+                    dfly_why += f" (at a context of {context_label(c)} it fits: {ME} --setup --context {c})"
+                    break
+            if fast_alt:                               # (the opt-in: this context, the cache in 8-bit rows)
+                dfly_why += (f"; with the cache in 8-bit rows it fits at {context_label(fit['context'])}: "
+                             f"{HY4_FAST_DRAFTING_SAID} ({ME} --setup --fast-drafting on)")
+        else:
+            dfly = hy4_dfly2_step(a, d, quant, models)
+            if dfly is None:
+                dfly_why = ("the DFly2 drafter's file is not in the model's folder" +
+                            ("" if hy4_dfly2_entry(quant)["published"] else " (it is not published yet)"))
+                if fit.get("fast_drafting"):           # (no drafter: the 8-bit rows would only change the answers)
+                    warn("faster drafting: not set up - " + dfly_why + "; the default start")
+                    fit = plain_fit
+    pack = hy4_pack_step(a, d, files, vis, mtp, dfly)  # 6
     step(7, "images (the vision tower)")               # 7
     pictures = hy4_pack_has_vision(pack) and not a.no_vision and bool(fit.get("vision", True))
     if not hy4_pack_has_vision(pack):
@@ -9039,34 +9873,80 @@ def set_up_hy4(a, prev: dict) -> Path | None:
     elif a.no_vision:
         ok("pictures: off (--no-vision; the pack has the vision tower: Images on the Models page turns them on)")
     elif not pictures:
-        warn(f"pictures: OFF on this PC - at a context of {fit['context']} tokens the model leaves no room in the VRAM "
-             f"for a picture (about {HY4_VISION_MIN_GIB:.1f} GB while a small one is read, {HY4_VISION_GIB:.1f} GB for "
-             f"the largest; {fit.get('usable', 0):.1f} GB free, the model's own parts {fit.get('need', 0):.1f} GB): "
-             "text works as before, a picture sent is refused in plain words; a smaller context or a card with more "
-             "VRAM reads pictures")
+        warn(f"pictures: OFF on this PC - at a context of {fit['context']} tokens the model's own parts fill the VRAM "
+             f"({fit.get('usable', 0):.1f} GB free, the model's own parts {fit.get('need', 0):.1f} GB): text works as "
+             "before, a picture sent is refused in plain words")
     elif fit.get("vision_small"):
         ok("pictures: ON - the model's own vision tower runs in the engine, a picture at a time: its weights stay in "
-           "the file (RAM as the page cache). The VRAM beside the model holds a smaller picture than the tower's "
-           "largest here, so the server makes big pictures smaller before the model reads them (the engine's start "
-           "line says the size; fine print in a big picture may be lost - a card with more VRAM reads it whole)")
+           "the file (RAM as the page cache) and no VRAM is kept for pictures. At this context the card is a little "
+           "short of the tower's largest picture, so the server makes very big pictures slightly smaller before the "
+           "model reads them (the engine's start line says the size)")
     else:
         ok("pictures: ON - the model's own vision tower runs in the engine, a picture at a time: its weights stay in "
-           "the file (RAM as the page cache), a picture's room (under 1 GB) is kept free on the main GPU; the server "
-           "resizes the pictures, the Chat's picture button is shown")
-    if quant != HY4_Q4:
-        how = getattr(a, "drafting", None)
-        if mtp is None:
-            (warn if how in ("on", "measure") else ok)(f"drafting: off - {mtp_why or 'no draft block for these files'}")
+           "the file (RAM as the page cache) and no VRAM is kept for pictures (a picture's room, under 1 GB, is lent "
+           "by the prompt buffers while it is read); the server resizes the pictures, the Chat's picture button is "
+           "shown")
+    drafter = "dfly2" if dfly is not None else "mtp"
+    extra, measure_now = {}, False
+    if quant != HY4_Q4 and mtp is not None and dfly is not None:   # (both fit: the faster on this PC, measured)
+        cal = inst.get("speed_calibration") or {}
+        carried = same and inst.get("layout") == fit["layout"] and inst.get("draft_choice") == "auto" and \
+            cal.get("kept") in ("mtp", "dfly2") and how != "measure"
+        drafter = cal["kept"] if carried else HY4_DRAFT_RULE.get(quant, "mtp")
+        extra["draft_choice"] = "auto"
+        if carried:
+            extra["speed_calibration"] = cal
+        elif getattr(a, "no_speed_calibration", False):
+            extra["speed_calibration"] = {"date": time.strftime("%Y-%m-%d %H:%M"), "version": maya_version(),
+                                          "skipped": "chosen", "kept": drafter}
+        had = inst.get("draft_block") or inst.get("dfly2")
+        drafting = how != "off" if how else not (same and had and inst.get("drafting") == "off")
+        measure_now = drafting and how == "measure"
+        one = {"mtp": "the MTP block", "dfly2": "the DFly2 drafter"}
+        if not drafting:
+            ok("drafting: off (--drafting on, or Drafting on the Models page, drafts with the MTP block or the DFly2 "
+               "drafter: both are in the pack)")
+        elif carried:
+            ok(f"drafting: {one[drafter]} - the faster of the two on this PC (the speed calibration of "
+               f"{cal.get('date', 'before')}; {ME} --speed-calibration measures again)")
         else:
+            ok("drafting: Tencent's MTP block and DFly2 drafter both fit here - each drafts tokens the model checks, "
+               "so only tokens the model itself would pick are written. " +
+               ("Maya measures now which is faster on this PC" if measure_now else
+                f"Until a speed calibration measures which is faster on this PC ({ME} --speed-calibration; "
+                "otherwise once, at the first start that is not unattended)" if "speed_calibration" not in extra else
+                "Not measured (--no-speed-calibration)") +
+               f": {one[drafter]} (the faster for {name} where it was measured)")
+    elif quant != HY4_Q4:
+        if mtp is None and dfly is None:
+            (warn if how in ("on", "measure", "mtp", "dfly2") else ok)(
+                f"drafting: off - {mtp_why or ('no draft block for these files' if how != 'dfly2' else '--drafting dfly2')}"
+                + (f"; {dfly_why}" if dfly_why else ""))
+        else:
+            what = "the MTP block" if dfly is None else "the DFly2 drafter"
+            extra["draft_choice"] = how if how in ("mtp", "dfly2") else "only"
             if how == "measure":
-                warn(f"no speed calibration for {HY4} yet: it drafts with the MTP block (--drafting off: without)")
-            chose_off = same and inst.get("draft_block") and inst.get("drafting") == "off"
+                warn(f"nothing to measure for {HY4} here: only {what} fits on this PC, and it drafts (--drafting off: "
+                     "without)")
+            had = inst.get("draft_block") if dfly is None else inst.get("dfly2")
+            # (the faster drafting drafts: its 8-bit rows are there for the drafter)
+            chose_off = same and had and inst.get("drafting") == "off" and not fit.get("fast_drafting")
             drafting = how != "off" if how else not chose_off
-            ok("drafting: Tencent's MTP block drafts tokens and the model checks every one - only tokens the model "
-               f"itself would pick are written; about {hy4_mtp_gib(int(fit.get('chunk') or 1024)):.1f} GB of the main "
-               "GPU's VRAM" if drafting else
-               "drafting: off (--drafting on, or Drafting on the Models page, drafts with the MTP block)")
-    return write_config_hy4(a, pc, meta, pack, fit["context"], models, d, drafting, quant, fit, pictures)   # 8
+            if dfly is None:
+                ok("drafting: Tencent's MTP block drafts tokens and the model checks every one - only tokens the "
+                   f"model itself would pick are written; about {hy4_mtp_gib(int(fit.get('chunk') or 1024)):.1f} GB "
+                   "of the main GPU's VRAM" if drafting else
+                   "drafting: off (--drafting on, or Drafting on the Models page, drafts with the MTP block)")
+            else:
+                ok("drafting: Tencent's DFly2 drafter drafts tokens and the model checks every one - only tokens the "
+                   f"model itself would pick are written; about {hy4_dfly2_gib(quant):.1f} GB of the GPU's VRAM" +
+                   (f" (the MTP block: {mtp_why})" if mtp_why else "") if drafting else
+                   "drafting: off (--drafting on, or Drafting on the Models page, drafts with the DFly2 drafter)")
+    cfg_path = write_config_hy4(a, pc, meta, pack, fit["context"], models, d, drafting, quant, fit, pictures,
+                                drafter, extra)   # 8
+    if measure_now:
+        speed_calibration(cfg_path, measure_asked(a))
+    return cfg_path
 
 
 # ------------------------------------------------------------------------------------------------ CYBER-FROST-3.8-PS
@@ -9611,8 +10491,8 @@ def main() -> int:
                          "from V100 on and on AMD; with --model-dir: the files you have (the same as --model "
                          "minimax-maya-xs / minimax-maya-s)")
     ap.add_argument("--hy4-quant", choices=list(HY4_QUANTS) + [HY4_Q4],
-                    help=f"{HY4}'s files, Maya's own GGUF quants of it (NVIDIA from V100 on, Linux or Windows; AMD on Linux; text "
-                         "only for now): maya-xs = Hy4-Flash-Maya-XS (routed experts in 2 bits), maya-s / maya-m / "
+                    help=f"{HY4}'s files, Maya's own GGUF quants of it (NVIDIA from V100 on, Linux or Windows; AMD on Linux, "
+                         "and under Windows experimental): maya-xs = Hy4-Flash-Maya-XS (routed experts in 2 bits), maya-s / maya-m / "
                          "maya-l once they are published; q4_k_m = Tencent's own Q4_K_M from AngelSlim, with MTP "
                          "drafting (--drafting off: without; run on RTX 30 / A100 and newer, Linux); with "
                          "--model-dir: the files you have (the same as --model hy4-flash-maya-xs, hy4-flash-q4_k_m ...)")
@@ -9691,10 +10571,18 @@ def main() -> int:
                          "without it (sustained speed, ~5-30 minutes, the model loaded twice) and keep the faster; "
                          "then start the model "
                          "(with --no-start: only measure)")
-    ap.add_argument("--drafting", choices=("measure", "on", "off"),
+    ap.add_argument("--drafting", choices=("measure", "on", "off", "mtp", "dfly2"),
                     help="the drafter (DFlash2 with --draft dflash2, DeepSeek's DSpark): measure = the speed "
                          "calibration keeps it only if it is faster on this PC (the default with --yes; asked "
-                         "otherwise), on = draft with it, off = without it - both skip the measuring")
+                         "otherwise), on = draft with it, off = without it - both skip the measuring.  Hy4-Flash's "
+                         "sizes: on = the MTP block where it fits in the VRAM, else the size's DFly2 drafter; mtp / "
+                         "dfly2 = that one alone (another model: the same as on)")
+    ap.add_argument("--fast-drafting", choices=["on", "off"],
+                    help="Hy4-Flash's sizes on a small card (a setup setting, kept in the config): where the DFly2 "
+                         "drafter has no room beside the cache's F16 rows at the context chosen, on keeps that context "
+                         "with the cache in 8-bit rows so the drafter fits - faster drafting (an 8 GB card at 8K: "
+                         "decoding about +8-27%%), slightly different wording than the default; off = the default "
+                         "(F16 rows, Maya's default answers). Not given: asked where it applies (--yes: the default)")
     ap.add_argument("--no-speed-calibration", action="store_true",
                     help="the same as --drafting on: draft with the drafter without measuring it")
     ap.add_argument("--config", type=Path, help="the installed JSON config to start (its run-maya-<model>.sh does), or "
@@ -9753,6 +10641,9 @@ def main() -> int:
                 say(f"  {i}) {c.name}")
             pick = have[int(ask("Which one?", [str(i) for i in range(1, len(have) + 1)], "1", a.yes)) - 1]
         check_parallel(a, config_family(read_json(pick)))
+        if getattr(a, "fast_drafting", None):   # (a setup setting: the cache's rows are worked out with the context)
+            warn(f"--fast-drafting is a setup setting of Hy4-Flash: {ME} --setup --fast-drafting {a.fast_drafting} "
+                 "sets it up; this start keeps the config as it is")
         if getattr(a, "fast_prefill", None):   # (given on a start too: written into a DeepSeek config, which keeps it)
             cfg = read_json(pick)
             if config_family(cfg) != "deepseek":

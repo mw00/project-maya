@@ -473,9 +473,47 @@ __device__ __forceinline__ float fma_no_contract(float a, float b, float c) {
 #endif
 }
 
+// The K-quants' minimum term (Q4_K, Q5_K, Q2_K, Q3_K): v = d X - (m0 sl + m1 sh).  CUDA's __fmul_rn / __fadd_rn /
+// __fsub_rn round each operation; HIP's are the plain operators, which ROCm's clang contracts into FMAs - and not the
+// same way in every instantiation: on gfx11 the token kernels (NE 1) and the window kernels (NE 4 ..) of one matrix
+// rounded differently, so a verify window's rows were not the rows the tokens get one at a time and an answer with
+// drafts could leave the answer without (seen with Q5_K experts on a Radeon 8065S).  MF names the rounding, the same
+// in every instantiation of a role:
+//   -1  the expression as written (CUDA: each operation rounded; the strict HIP targets: the same behind barriers)
+//    0  each operation rounded            1  W = fma(m0, sl, m1 sh)            2  W = fma(m1, sh, m0 sl)
+//    3  v = fma(d, X, -W), W as 0         4  ... W as 1                         5  ... W as 2
+// kMinG / kMinU / kMinDN / kMinMV: the gate's, the up's, the down's and the GEMV kernels'.  A HIP build outside the
+// strict targets that asks for it (DS4_IQ_MIN_FORMS: maya-hy4's, whose Maya-L has Q5_K experts) takes the forms its
+// token kernels - the answers without drafts - had from ROCm 7's clang on gfx1151 (hy4_experts_test, HY4_EXPERTS_K:
+// the bits before and after), so those keep their bits and the windows now match them.  DS4_IQ_MF_G / _U / _DN / _MV:
+// a build's own choice.  The other builds of this file compile as before.
+#if defined(STRATA_USE_HIP) && !DS4_IQ_STRICT_FP && defined(DS4_IQ_MIN_FORMS)
+#if !defined(DS4_IQ_MF_G)
+#define DS4_IQ_MF_G 4
+#endif
+#if !defined(DS4_IQ_MF_U)
+#define DS4_IQ_MF_U 5
+#endif
+#if !defined(DS4_IQ_MF_DN)
+#define DS4_IQ_MF_DN 5
+#endif
+#if !defined(DS4_IQ_MF_MV)
+#define DS4_IQ_MF_MV 4
+#endif
+constexpr int kMinG = DS4_IQ_MF_G, kMinU = DS4_IQ_MF_U, kMinDN = DS4_IQ_MF_DN, kMinMV = DS4_IQ_MF_MV;
+#else
+constexpr int kMinG = -1, kMinU = -1, kMinDN = -1, kMinMV = -1;
+#endif
+__device__ __forceinline__ float min_bar(float v) {   // (a value the compiler cannot fold a rounding through)
+#if defined(STRATA_USE_HIP) && defined(__clang__)
+    asm volatile("" : "+v"(v));
+#endif
+    return v;
+}
+
 // the sub-block against 32 int8 activations (xa: values 0..15, xb: 16..31), before their scale: an exact integer dot,
 // its scales in F32 (explicit roundings: every instantiation the same bits)
-template <int T>
+template <int T, int MF = -1>
 __device__ __forceinline__ float sub_dot(const Sub& s, const int4& xa, const int4& xb) {
     int lo = __dp4a(s.q[0], xa.x, 0);
     lo = __dp4a(s.q[1], xa.y, lo);
@@ -485,6 +523,24 @@ __device__ __forceinline__ float sub_dot(const Sub& s, const int4& xa, const int
     hi = __dp4a(s.q[5], xb.y, hi);
     hi = __dp4a(s.q[6], xb.z, hi);
     hi = __dp4a(s.q[7], xb.w, hi);
+    if constexpr (Ty<T>::MIN && MF >= 0) {
+        int sl = __dp4a(0x01010101, xa.x, 0);
+        sl = __dp4a(0x01010101, xa.y, sl);
+        sl = __dp4a(0x01010101, xa.z, sl);
+        sl = __dp4a(0x01010101, xa.w, sl);
+        int sh = __dp4a(0x01010101, xb.x, 0);
+        sh = __dp4a(0x01010101, xb.y, sh);
+        sh = __dp4a(0x01010101, xb.z, sh);
+        sh = __dp4a(0x01010101, xb.w, sh);
+        const float d = min_bar(s.d), X = min_bar((float) (s.s0 * lo + s.s1 * hi));
+        const float m0 = min_bar(s.m0), m1 = min_bar(s.m1), fl = min_bar((float) sl), fh = min_bar((float) sh);
+        float W;
+        if constexpr (MF % 3 == 0) W = min_bar(min_bar(m0 * fl) + min_bar(m1 * fh));
+        else if constexpr (MF % 3 == 1) W = min_bar(fmaf(m0, fl, min_bar(m1 * fh)));
+        else W = min_bar(fmaf(m1, fh, min_bar(m0 * fl)));
+        if constexpr (MF < 3) return min_bar(min_bar(d * X) - W);
+        else return min_bar(fmaf(d, X, min_bar(-W)));
+    }
     float v = fmul_no_fma(s.d, (float) (s.s0 * lo + s.s1 * hi));
     if constexpr (Ty<T>::MIN) {
         int sl = __dp4a(0x01010101, xa.x, 0);
@@ -884,8 +940,8 @@ __global__ void __launch_bounds__(kThreads) gate_up_kernel(const Args a, int gro
                             const int4* xp = (const int4*) (a.xq + (size_t) xr[i] * a.n_embd + (size_t) kb * 32);
                             const int4 xa = xp[0], xb = xp[1];
                             const float dx = a.xd[(size_t) xr[i] * nsb + kb];
-                            ag[i] = fma_no_contract(dx, sub_dot<T>(sg, xa, xb), ag[i]);
-                            if constexpr (TWO) au[i] = fma_no_contract(dx, sub_dot<T>(su, xa, xb), au[i]);
+                            ag[i] = fma_no_contract(dx, sub_dot<T, kMinG>(sg, xa, xb), ag[i]);
+                            if constexpr (TWO) au[i] = fma_no_contract(dx, sub_dot<T, kMinU>(su, xa, xb), au[i]);
                         }
                     pg = ng;
                     if constexpr (TWO) pu = nu;
@@ -961,7 +1017,7 @@ __global__ void __launch_bounds__(kThreads) down_kernel(const Args a, int groups
                         if (i < ne) {
                             const int4* hp = (const int4*) (a.hq + (size_t) es[i] * a.n_ff + (size_t) kb * 32);
                             const int4 ha = hp[0], hb = hp[1];
-                            ad[i] = fma_no_contract(a.hd[(size_t) es[i] * nsb + kb], sub_dot<T>(sd, ha, hb), ad[i]);
+                            ad[i] = fma_no_contract(a.hd[(size_t) es[i] * nsb + kb], sub_dot<T, kMinDN>(sd, ha, hb), ad[i]);
                         }
                 }
 #pragma unroll
@@ -1237,7 +1293,48 @@ __global__ void __launch_bounds__(kThreads) mv_kernel(const Jobs J) {
         for (int c = 0; c < NC; ++c)
             if (c < b.ncol) {
                 const int4* xp = (const int4*) (b.xq + (size_t) c * b.k + (size_t) kb * 32);
-                acc[c] = fmaf(b.xd[(size_t) c * nsb + kb], sub_dot<T>(s, xp[0], xp[1]), acc[c]);
+                acc[c] = fmaf(b.xd[(size_t) c * nsb + kb], sub_dot<T, kMinMV>(s, xp[0], xp[1]), acc[c]);
+            }
+    }
+#pragma unroll
+    for (int c = 0; c < NC; ++c)
+        if (c < b.ncol) {
+            const float v = warp_sum(acc[c]);
+            if (lane == 0) b.y[c * b.ycs + row] = b.alpha * v + (b.bias != nullptr ? b.bias[row] : 0.0f);
+        }
+}
+
+// mv_kernel for H jobs alike but for their offsets (a 3D matrix's heads: grid y = the head): head h's job is b0 with w,
+// xq, xd and y moved h strides - one launch for every head where mv's take kMaxJobs a launch.  A row's arithmetic is
+// mv_kernel's, line for line: the same bits.
+template <int T, int NC>
+__global__ void __launch_bounds__(kThreads) mv_heads_kernel(const MvJob b0, size_t w_st, size_t xq_st, size_t xd_st,
+                                                            size_t y_st) {
+    pdl_wait();
+    pdl_trigger();
+    __shared__ uint32_t tab[Ty<T>::TAB > 0 ? Ty<T>::TAB : 1];
+    load_tab<T>(tab);
+    __syncthreads();
+    MvJob b = b0;
+    b.w += (size_t) blockIdx.y * w_st;
+    b.xq += (size_t) blockIdx.y * xq_st;
+    b.xd += (size_t) blockIdx.y * xd_st;
+    b.y += (size_t) blockIdx.y * y_st;
+    const int row = blockIdx.x * kWarps + (threadIdx.x >> 5), lane = threadIdx.x & 31;
+    if (row >= b.n) return;
+    const uint8_t* w = b.w + (size_t) row * b.ld;
+    const int nsb = b.k / 32;
+    float acc[NC];
+#pragma unroll
+    for (int c = 0; c < NC; ++c) acc[c] = 0.0f;
+    for (int kb = lane; kb < nsb; kb += 32) {
+        Sub s;
+        decode<T>(w, kb, tab, s);
+#pragma unroll
+        for (int c = 0; c < NC; ++c)
+            if (c < b.ncol) {
+                const int4* xp = (const int4*) (b.xq + (size_t) c * b.k + (size_t) kb * 32);
+                acc[c] = fmaf(b.xd[(size_t) c * nsb + kb], sub_dot<T, kMinMV>(s, xp[0], xp[1]), acc[c]);
             }
     }
 #pragma unroll
@@ -1755,12 +1852,26 @@ bool light_set(const SetArgs& a, bool gu, cudaStream_t s) {
     return true;
 }
 
+// (5 to 8 columns: their own instance - a window of that many tokens need not pay for sixteen; a column's sums are the
+//  same lanes' in the same order whatever the instance.  MAYA_IQ_MV8=0: as before)
+static bool mv8() {
+    static const bool on = !(std::getenv("MAYA_IQ_MV8") && std::getenv("MAYA_IQ_MV8")[0] == '0');
+    return on;
+}
 template <int T>
 void mv_nc(const Jobs& J, int nj, int max_n, int max_c, cudaStream_t s) {
     const dim3 grid((unsigned) ((max_n + kWarps - 1) / kWarps), (unsigned) nj);
     if (max_c <= 1) pdl_launch(mv_kernel<T, 1>, grid, kThreads, 0, s, J);
     else if (max_c <= 4) pdl_launch(mv_kernel<T, 4>, grid, kThreads, 0, s, J);
+    else if (max_c <= 8 && mv8()) pdl_launch(mv_kernel<T, 8>, grid, kThreads, 0, s, J);
     else pdl_launch(mv_kernel<T, 16>, grid, kThreads, 0, s, J);
+}
+template <int T>
+void mv_heads_nc(const MvJob& b, int H, size_t ws, size_t xs, size_t ds, size_t ys, cudaStream_t s) {
+    const dim3 grid((unsigned) ((b.n + kWarps - 1) / kWarps), (unsigned) H);
+    if (b.ncol <= 1) pdl_launch(mv_heads_kernel<T, 1>, grid, kThreads, 0, s, b, ws, xs, ds, ys);
+    else if (b.ncol <= 4) pdl_launch(mv_heads_kernel<T, 4>, grid, kThreads, 0, s, b, ws, xs, ds, ys);
+    else pdl_launch(mv_heads_kernel<T, 16>, grid, kThreads, 0, s, b, ws, xs, ds, ys);
 }
 
 }  // namespace
@@ -2363,6 +2474,14 @@ bool mv(const MvJob* jobs, int n, cudaStream_t s) {
             DS4_IQ_SWITCH_MV(t, MV_)
 #undef MV_
         }
+    return true;
+}
+bool mv_heads(const MvJob& b, int H, size_t w_stride, size_t xq_stride, size_t xd_stride, size_t y_stride,
+              cudaStream_t s) {
+    if (H <= 0 || b.n <= 0 || b.k % block_values(b.type) != 0 || b.ncol < 1 || b.ncol > 16) return false;
+#define MVH_(T) mv_heads_nc<T>(b, H, w_stride, xq_stride, xd_stride, y_stride, s)
+    DS4_IQ_SWITCH_MV(b.type, MVH_)
+#undef MVH_
     return true;
 }
 

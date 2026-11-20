@@ -18,10 +18,12 @@
 
 namespace hy4 {
 
-/// n threads, each running f(i) when started: start() returns at once, wait() when every one is done.
+/// n threads, each running f(i) when started: start() returns at once, wait() when every one is done.  spin_s: how long
+/// a thread watches for the next start before it sleeps (0: it sleeps at once) - a token window's threads are started
+/// again a few milliseconds after their last (HY4_CREW_SPIN_MS overrides it).
 class Crew {
 public:
-    explicit Crew(int n);
+    explicit Crew(int n, double spin_s = 0.0);
     ~Crew();
     Crew(const Crew&) = delete;
     Crew& operator=(const Crew&) = delete;
@@ -34,9 +36,9 @@ private:
     std::function<void(int)> f_;
     std::mutex mu_;
     std::condition_variable cv_, done_cv_;
-    unsigned gen_ = 0;
-    int left_ = 0;
-    bool quit_ = false;
+    std::atomic<unsigned> gen_{0};
+    std::atomic<int> left_{0};
+    std::atomic<bool> quit_{false};
 };
 
 /// The host's sums: dst[i] = parts[0][i] + parts[1][i] + ... (that order, whatever the threads), on the caller and
