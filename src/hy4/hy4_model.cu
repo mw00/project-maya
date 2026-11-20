@@ -2611,11 +2611,22 @@ struct Model::Impl {
                                      std::max(1, pk.eg.head_dim)));
         CK(cudaMallocHost(&h_valid, sizeof(float) * Tc));
         CK(cudaMallocHost(&h_pos, sizeof(int) * 3 * Tc));
+        // the routed experts in VRAM (INFO vram_slots): the layer split's per layer (n_res); tensor parallel's L holds
+        // none - its members (TL) and helpers hold every expert's slices, so they are counted there
         int n_partial = 0, n_res = 0, n_all = 0;
         for (const Layer& l : L)
             if (!l.dense) {
                 n_partial += l.partial();
-                n_res += l.n_res;
+                if (tp > 1) {
+                    std::vector<const std::vector<int>*> maps;
+                    for (const auto& ml : TL)
+                        if ((size_t) l.il < ml.size()) maps.push_back(&ml[(size_t) l.il].slot_of);
+                    for (const Helper& h : hel)
+                        if (!h.L.empty() && (size_t) l.il < h.L[0].size()) maps.push_back(&h.L[0][(size_t) l.il].slot_of);
+                    n_res += experts_held(g.n_expert, maps);
+                } else {
+                    n_res += l.n_res;
+                }
                 n_all += g.n_expert;
             }
         if (n_partial == 0 && !o.profile_out.empty()) CK(cudaMallocHost(&h_ids, sizeof(int) * Tc * 16));

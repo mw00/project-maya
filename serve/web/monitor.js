@@ -114,7 +114,7 @@ function Throughput({m}) {
     <div class="stats">
       <div class="stat"><span class="stat__label">Time per token</span><${Num} v=${ms == null ? null : fmt(ms, 1)} unit="ms"/></div>
       <div class="stat"><span class="stat__label">VRAM hit</span><${Num} v=${hit == null ? null : fmt(hit, 1)} unit="%"/></div>
-      <div class="stat"><span class="stat__label">Requests served</span><${Num} v=${m.totals && m.totals.requests != null ? fmt(m.totals.requests) : null}/></div>
+      <div class="stat" title="Answers finished since the server started: the one being written counts when it ends"><span class="stat__label">Requests served</span><${Num} v=${m.totals && m.totals.requests != null ? fmt(m.totals.requests) : null}/></div>
       <div class="stat stat--spec" title=${spec.state === "off" ? "No drafter is running for this answer: every token comes from a full model step"
           : "Drafting: a small drafter proposes tokens and the full model checks them. Shown: the drafts the model kept of those offered, live while an answer is written, else the last answer's. A dash: nothing drafted yet."}>
         <span class="stat__label">Speculation</span>
@@ -503,8 +503,10 @@ const METRICS = [
   {key: "temp", label: "GPU temp", unit: "°C", series: "gpu_temp", tone: "warn"},
   {key: "pcie", label: "PCIe", series: "gpu_pcie_rx_mb", tone: "info"},
   {key: "cpu", label: "CPU", unit: "%", series: "cpu", max: 100},
-  {key: "ram", label: "System RAM", series: "ram_used", tone: "info"},
-  {key: "disk", label: "Disk read", series: "disk_read_mb", tone: "info"},
+  {key: "ram", label: "System RAM", series: "ram_used", tone: "info",
+   tip: "The memory programs use. The file cache is not counted: model files the system keeps in RAM after a read (the n-gram table among them) are given back whenever a program needs the memory."},
+  {key: "disk", label: "Disk read", series: "disk_read_mb", tone: "info",
+   tip: "What the drives read this second. A file the system already holds in RAM (its file cache) needs no read, so a model or n-gram table read before shows 0."},
 ];
 function Hardware({m, gpuEach}) {
   const hw = m.hardware || {}, st = m.hardware_static || {}, eng = m.engine || {}, h = m.history || {};
@@ -589,7 +591,8 @@ function Requests({m}) {
           <td>${fmt(r.prompt_tokens)}</td><td>${fmt(r.reused)}</td><td>${fmt(pre)}</td><td>${fmt(r.output_tokens)}</td>
           <td class="strong">${fmt(r.decode_tok_s, 1)}</td><td>${r.hit_rate == null ? "–" : `${(r.hit_rate * 100).toFixed(1)}%`}</td>
           <td>${fmt(r.duration_s, 1)} s</td></tr>`;
-      }) : html`<tr><td colspan="9" class="l muted">No requests yet</td></tr>`}</tbody>
+      }) : html`<tr><td colspan="9" class="l muted">${m.live && (m.live.state === "reading" || m.live.state === "generating")
+        ? "None finished yet: the answer being written is listed when it ends" : "No requests yet"}</td></tr>`}</tbody>
     </table></div>
     ${m.totals && m.totals.requests ? html`<p class="card__note">${totalsLine(m.totals, m.loop_guard || {})}</p>` : null}
   </section>`;

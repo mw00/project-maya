@@ -6,6 +6,7 @@
 
 #include <cstdio>
 #include <string>
+#include <vector>
 
 #define CHECK(expr) do { if (!(expr)) { std::fprintf(stderr, "line %d: %s\n", __LINE__, #expr); return 1; } } while (0)
 
@@ -338,6 +339,31 @@ int main() {
         CHECK(o[0] == 1 && o[1] == 5 && o[2] == 2 && o[3] == 6 && o[6] == 4 && o[7] == 8);
         CHECK(hy4::dfly_bytes(1e9, 2e8, 5, 16, 2112, 3072, 9216) > 1.2e9 &&
               hy4::dfly_bytes(1e9, 2e8, 5, 16, 2112, 3072, 9216) < 1.25e9);
+    }
+    // the experts in VRAM (INFO vram_slots): the layer split's own map; tensor parallel's members' and helpers' maps,
+    // an expert held when any of them holds a slice of it (its blocks round the members: every expert on some member)
+    {
+        const std::vector<int> split = {0, -1, 1, -1, -1, 2, -1, -1};   // (3 of 8 in VRAM, 5 on the CPU lane)
+        CHECK(hy4::experts_held(8, {&split}) == 3);
+        const std::vector<int> all = {0, 1, 2, 3, 4, 5, 6, 7};
+        CHECK(hy4::experts_held(8, {&all}) == 8);
+        // two members, an expert of one block on member 0 or 1 only: each half, together all
+        const std::vector<int> m0 = {0, -1, 1, -1, 2, -1, 3, -1}, m1 = {-1, 0, -1, 1, -1, 2, -1, 3};
+        CHECK(hy4::experts_held(8, {&m0}) == 4);
+        CHECK(hy4::experts_held(8, {&m0, &m1}) == 8);
+        // three members and a helper's units: an expert held twice counts once
+        const std::vector<int> t0 = {0, 1, -1, -1, 2, -1, -1, -1}, t1 = {-1, 0, 1, -1, -1, 2, -1, -1},
+                               t2 = {-1, -1, 0, 1, -1, -1, 2, -1}, hp = {-1, -1, -1, 0, -1, -1, 1, 2};
+        CHECK(hy4::experts_held(8, {&t0, &t1, &t2, &hp}) == 8);
+        CHECK(hy4::experts_held(8, {&t0, &t1, &t2}) == 7);   // (expert 7: the helper's alone)
+        // the old count's case: the head's placeholder layer (no map) holds none - the members hold them all
+        const std::vector<int> none;
+        CHECK(hy4::experts_held(8, {&none}) == 0);
+        CHECK(hy4::experts_held(8, {&none, &m0, &m1}) == 8);
+        CHECK(hy4::experts_held(8, {nullptr, &m0}) == 4);
+        const std::vector<int> short_map = {0, 1};   // (past a map's end: not held there)
+        CHECK(hy4::experts_held(8, {&short_map}) == 2);
+        CHECK(hy4::experts_held(0, {&all}) == 0);
     }
     std::puts("hy4_plan_test: ok");
     return 0;
