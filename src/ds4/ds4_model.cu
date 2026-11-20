@@ -2138,6 +2138,11 @@ struct Model::Impl {
     // CPU lane (helper_dead) and the layer devices go on
     bool broken() {
         if (lend_broken || front_dead) return true;
+#if defined(STRATA_USE_HIP) || defined(DS4_CUDA_PEER_AR)
+        // A timed-out peer collective can leave valid GPU streams but invalid model state.
+        // Its error stays set for this process, so reset cannot make a later request safe.
+        if (peer_ar_failed.load(std::memory_order_relaxed)) return true;
+#endif
         int cur = -1;
         const bool had = cudaGetDevice(&cur) == cudaSuccess;
         bool bad = false;
