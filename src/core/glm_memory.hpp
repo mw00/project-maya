@@ -238,6 +238,33 @@ inline int64_t pin_cap_room(bool discrete_amd_windows, int64_t cap, int64_t room
     return std::max(kRoom, up(std::max<int64_t>(0, cap) / 10));
 }
 
+// Whether the pinning cap is measured before the expert pool (#924, #1035).  On Windows with a discrete Radeon (HIP),
+// pinning host memory up to Windows' refusal while the card's VRAM is nearly full leaves the device unusable for the
+// rest of the process - the next upload fails ("unspecified launch failure") even once everything is freed - while
+// the same search with VRAM to spare is harmless (measured on an RX 7900 XT 20 GB with 64 GB of RAM).  So there the
+// cap is measured before the pool fills the card, the RAM tier is sized under it, and nothing pinned after the pool
+// goes up to a refusal.  Not on an APU (HIP does not refuse there: apu_shared_room sizes its tier), nor in a split
+// (its parts load at once: a later part's search would run with another card's pool in place).  `force`
+// (MAYA_GLM_PIN_MEASURE_FIRST): "0" off, "1" on for every one-GPU host (tests, with MAYA_GLM_PIN_CAP_MB).
+inline bool pin_cap_before_pool(bool windows_hip, bool integrated, int n_parts, const char* force) {
+    if (n_parts != 1) return false;
+    if (force != nullptr && force[0] != '\0') return std::atoi(force) != 0;
+    return windows_hip && !integrated;
+}
+
+// What more pins now under a cap measured earlier: what more pinned then, less what was pinned since (never below 0)
+inline int64_t pin_left_since(int64_t measured_more, int64_t pinned_since) {
+    return std::max<int64_t>(0, measured_more - std::max<int64_t>(0, pinned_since));
+}
+
+// A RAM tier class's slots under a pinning cap: `left` more pins, `keep` stays pinnable above the tier, `planned` the
+// bytes this class and the classes after it planned, `n` this class's planned slots.  Taken class by class (each one's
+// bytes off `left` before the next), the classes together never pass left - keep.
+inline int64_t pin_cap_share(int64_t left, int64_t keep, int64_t planned, int64_t n) {
+    const double f = (double) std::max<int64_t>(0, left - keep) / (double) std::max<int64_t>(1, planned);
+    return (int64_t) (f * (double) n);
+}
+
 // The shared GPU memory a Windows APU's RAM tier leaves free above it and what is pinned after it (glm_fast_path's
 // apu_shared_room): an eighth of Windows' shared GPU memory limit, 1 to 4 GB, in whole 256 MB.  With the prompt
 // path's buffers in place (a GLM-5.3 quant the batched prompt path now covers) a Radeon 8065S (15.84 GB limit) failed

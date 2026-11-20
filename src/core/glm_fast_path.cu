@@ -627,6 +627,14 @@ static int64_t avail_ram_now() {
 #endif
 }
 
+// the RAM the tier leaves free for the OS, the server and the page cache (MAYA_GLM_RAM_HEADROOM_GB): 6 GB, 16 GB
+// where the GPU's memory is the system's
+static int64_t ram_headroom_b(bool unified) {
+    double head_gb = unified ? 16.0 : 6.0;
+    if (const char* h = getenv("MAYA_GLM_RAM_HEADROOM_GB")) head_gb = std::max(0.0, std::atof(h));
+    return (int64_t) (head_gb * 1073741824.0);
+}
+
 static void numa_pinned_free(void* p, size_t bytes) {
 #ifdef __linux__
     cudaHostUnregister(p);
@@ -1337,6 +1345,39 @@ bool Glm5Model::fast_setup(std::string& err) {
         pool_check(floor_b, stride_max, all_b);
         // the batched prompt path: its sizes (it borrows the pool's tail, see below)
         if (!prefill_setup(err)) return false;
+        // #924 / #1035 (Windows, a discrete Radeon, one GPU): the pinning cap measured now, while the card still has
+        // room - searched for once the expert pool fills the card, Windows' refusal left the device unusable (the
+        // warmed tables' upload then failed).  Probed up to what the RAM tier could take (the free RAM less the
+        // headroom, or the size set) with the room kept above it and the small buffers pinned before it; the tier
+        // is sized under it below (glmfast::pin_cap_before_pool)
+        int64_t pre_more = -1, pre_held = 0;
+        const int64_t pre_small = (int64_t) (FastState::kMaxUpd * (sizeof(int) + sizeof(unsigned long long))) +
+                                  (int64_t) g.n_exp_used * (int64_t) sstride;   // (the table updates', the staging)
+        {
+#if defined(STRATA_USE_HIP) && defined(_WIN32)
+            const bool win_hip = true;
+#else
+            const bool win_hip = false;
+#endif
+            int integrated = 0;
+            if (cudaDeviceGetAttribute(&integrated, cudaDevAttrIntegrated, dev_) != cudaSuccess) cudaGetLastError();
+            if (glmfast::pin_cap_before_pool(win_hip, integrated != 0 || F->unified_memory, n_parts_,
+                                             getenv("MAYA_GLM_PIN_MEASURE_FIRST"))) {
+                const char* rg = getenv("MAYA_GLM_RAM_GB");
+                const char* rm = getenv("MAYA_GLM_PIN_ROOM_MB");
+                int64_t want = ram_budget_ >= 0 ? ram_budget_
+                             : rg != nullptr  ? (int64_t) (std::atof(rg) * 1073741824.0)
+                                              : std::max<int64_t>(0, avail_ram_now() - ram_headroom_b(F->unified_memory));
+                want += glmfast::pin_cap_room(true, want, rm != nullptr ? std::atoll(rm) : -1) + pre_small;
+                const auto t0 = std::chrono::steady_clock::now();
+                pre_held = g_pin_held;
+                pre_more = pin_room(want);
+                std::fprintf(stderr, "glm fast: CUDA%d pinning measured before the expert pool: %.2f GB more pin%s (%.1f s)\n",
+                             dev_, (double) pre_more / 1073741824.0,
+                             pre_more + ((int64_t) 256 << 20) <= want ? ", Windows' limit" : ", all the RAM tier can take",
+                             std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+            }
+        }
         size_t free_b = 0, total_b = 0;
         cudaMemGetInfo(&free_b, &total_b);
         {
@@ -1889,9 +1930,7 @@ bool Glm5Model::fast_setup(std::string& err) {
         const int later = n_parts_ - 1 - part_;   // the parts that start after this one
         const int64_t unseen_pf = (int64_t) std::max(0, later - 1) * (int64_t) pinned_pf.staging +
                                   (int64_t) std::max(0, later - 1) * (int64_t) pinned_pf.hop;
-        double head_gb = F->unified_memory ? 16.0 : 6.0;
-        if (const char* h = getenv("MAYA_GLM_RAM_HEADROOM_GB")) head_gb = std::max(0.0, std::atof(h));
-        const int64_t head_b = (int64_t) (head_gb * 1073741824.0);
+        const int64_t head_b = ram_headroom_b(F->unified_memory);
         const bool fixed_ram = getenv("MAYA_GLM_RAM_GB") != nullptr;
         if (budget < 0) {
             if (total < 0) {
@@ -2063,9 +2102,20 @@ bool Glm5Model::fast_setup(std::string& err) {
         const auto share = [&](size_t c) {
             int64_t planned = 0;
             for (size_t k = c; k < cls_n.size(); ++k) planned += cls_n[k] * (int64_t) cls_stride[k];
-            const double f = (double) std::max<int64_t>(0, pin_left - pin_keep()) / (double) std::max<int64_t>(1, planned);
-            return (int64_t) (f * (double) cls_n[c]);
+            return glmfast::pin_cap_share(pin_left, pin_keep(), planned, cls_n[c]);
         };
+        // a cap measured before the expert pool (#924): every class sized under it from the start, less what was pinned
+        // since (the table updates, the staging) - no pin after the pool goes up to a refusal
+        if (pre_more >= 0) {
+            pin_left = glmfast::pin_left_since(pre_more, g_pin_held - pre_held + pre_small);
+            pin_cap = g_pin_held + pin_left;
+            std::fprintf(stderr, "glm fast: CUDA%d a pinning cap: %.2f GB more pin (measured before the expert pool), %s "
+                                 "(%.2f GB kept free above it)\n",
+                         dev_, (double) pin_left / 1073741824.0,
+                         balanced_ram ? "mandatory RAM slots retained" : "the RAM tier sized to it",
+                         (double) pin_keep() / 1073741824.0);
+        }
+        bool pre_refused = false;
         // a class pinned in pieces of at most MAYA_GLM_PIN_PIECE_MB (Windows: 1024 by default; 0: one block, as on
         // Linux): a block of many GB takes far more of Windows' per-process pinning budget than its size - 61 GB pin in
         // 1 GB pieces where the largest single block is ~21 GB - so a 2-GPU split's first part left its second 0 GB and
@@ -2142,6 +2192,9 @@ bool Glm5Model::fast_setup(std::string& err) {
                     break;
                 }
                 if ((p = pin_tier(R, n)) != nullptr) {
+                    // (a cap measured before the pool: the class was sized under it with the room kept - not probed
+                    // here, where a refusal would break a Radeon under Windows, #924)
+                    if (pre_more >= 0 && !balanced_ram) break;
                     // ... and leave room under the cap: a pageable copy needs pinned buffers of the driver's own, and
                     // with two tiers pinned right up to it the warmed tables' upload failed (#105).  512 MB more that
                     // will not pin: a step less.  (A larger room is probed in pieces, pin_room.)
@@ -2157,6 +2210,14 @@ bool Glm5Model::fast_setup(std::string& err) {
                 }
                 cudaGetLastError();
                 p = nullptr;
+                if (pre_more >= 0 && !pre_refused) {
+                    pre_refused = true;
+                    std::fprintf(stderr, "glm fast: WARNING - CUDA%d: Windows refused the RAM tier's %.2f GB under the "
+                                         "pinning cap measured before the expert pool (it moved since); on a Radeon "
+                                         "this can stop the start (\"unspecified launch failure\") - if it does, set "
+                                         "MAYA_GLM_RAM_GB a few GB under that cap\n",
+                                 dev_, (double) n * (double) R.stride / 1073741824.0);
+                }
                 if (pin_left < 0) {
                     int64_t planned = 0;
                     for (size_t k = c; k < cls_n.size(); ++k) planned += cls_n[k] * (int64_t) cls_stride[k];
