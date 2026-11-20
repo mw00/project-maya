@@ -2387,9 +2387,12 @@ Models page's switch, turns drafting off.
 caches and propose up to 5 tokens in one pass, checked by the model like the block's (the same tokens). It takes
 about as much VRAM as its file (no prompt work of its own), so the setup takes it where the block does not fit -
 12 and 16 GB cards, and 8 GB cards where it still fits (a short context) - on one GPU (`--dfly2`; tensor parallel, or a layer split that
-puts its layers away from the head: the model runs without drafts and says why). `--drafting mtp|dfly2` at the setup
-picks one of the two by name, `--drafting on` the block where it fits and else DFly2; Drafting on the Models page
-offers each one the pack has.
+puts its layers away from the head: the model runs without drafts and says why). Where both fit, both go into the pack
+and the faster of the two on this PC drafts: a short speed calibration measures them once (two loads, about 500
+tokens each - at the first start that is not unattended, or `--speed-calibration`, or `--drafting measure` at the
+setup) and keeps the faster; until it runs, the size's default (HY4_DRAFT_RULE in maya.py: the faster one where it was
+measured). `--drafting mtp|dfly2` at the setup picks one by name (nothing measured), `--drafting on` lets Maya pick;
+Drafting on the Models page offers each one the pack has.
 
 **Not available for Hy4-Flash yet** (the dashboard offers no switch for them): `--parallel` (one request at a time
 for now); Mac, and AMD on Windows.

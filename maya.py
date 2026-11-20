@@ -824,6 +824,12 @@ HY4_MTP_VRAM = 0.56
 # (... and where the block does not fit, with the size's DFly2 drafter - its "drafter": its matrices as they are in the
 #  file, beside them its lists and rows, under HY4_DFLY2_EXTRA bytes)
 HY4_DFLY2_EXTRA = 32 << 20
+# (where both fit, which drafts is measured on the PC - speed_calibration_hy4: a short A/B, the faster kept unless
+#  within HY4_DRAFT_TIE, where this rule stays; until it runs, the rule: the faster for the size on the V100s measured,
+#  server answers of code and chat, greedy and sampled)
+HY4_DRAFT_RULE = {"maya-xs": "dfly2", "maya-s": "mtp", "maya-m": "mtp", "maya-l": "mtp"}
+HY4_DRAFT_TIE = 0.02
+HY4_DRAFT_PROBE = {"mixed": True, "tokens": 512, "answer": 128, "warm": 32}
 HY4_VISION_GIB = 0.81                              # (the engine's room for its largest picture, 2048 x 2048: 828 MB of the main GPU)
 # (... and for the smallest picture budget it takes, a sixteenth of the largest: 512 x 512 - src/hy4/hy4_vision.cu's
 #  layout: the weights' two slots, the attention's scores, cuBLAS's workspace and the patches' rows)
@@ -4977,8 +4983,12 @@ def needs_speed_calibration(cfg: dict) -> bool:
     if cfg.get("backend") == "metal":                  # (CUDA's measurement: on a Mac MTP or DFlash2 is the user's choice)
         return False
     # (CYBER-FROST: measured at its setup, or --speed-calibration; Hy4-flash: Tencent's Q4_K_M drafts with its MTP block
-    #  or not, chosen - its drafts doubled code answers on the GPUs it ran on; Maya's sizes have no drafter yet)
-    if config_family(cfg) in ("qwen", "hy4"):
+    #  or not, chosen - its drafts doubled code answers on the GPUs it ran on; a Maya size where the MTP block and the
+    #  DFly2 drafter both fit: which of the two, measured once - hy4_both_drafters)
+    if config_family(cfg) == "hy4":
+        return hy4_both_drafters(cfg) and (cfg.get("installer") or {}).get("drafting") == "on" and \
+            "speed_calibration" not in (cfg.get("installer") or {})
+    if config_family(cfg) == "qwen":
         return False
     if config_family(cfg) in ("deepseek", "minimax"):  # (their DSpark drafter: measured once too)
         return CDS.has_drafter(cfg) and "speed_calibration" not in (cfg.get("installer") or {}) and             not (config_family(cfg) == "minimax" and parallel_of(cfg) > 1)   # (maya-mm3 --parallel: no drafting)
@@ -5002,12 +5012,15 @@ def speed_calibration(cfg_path: Path, why: str = "") -> bool:
     if config_family(cfg) == "qwen":                   # (CYBER-FROST: its MTP drafter or none)
         return bool(qwen_draft_calibration(cfg_path) is not None)
     if config_family(cfg) == "hy4":
+        if hy4_both_drafters(cfg):                     # (a Maya size with both drafters: which is faster here)
+            return speed_calibration_hy4(cfg_path, cfg, why)
         if Q.config_key(cfg) == HY4_Q4:                # (Tencent's own Q4_K_M: the one set with the MTP block)
             warn(f"no speed calibration for {HY4} yet: it drafts with its MTP block unless set up with --drafting off "
                  f"({ME} --setup --model hy4-flash-q4_k_m --drafting on|off)")
         else:
-            ok(f"{HY4}: no speed calibration yet - a Maya size drafts with the MTP block where the setup found room "
-               f"for it ({ME} --setup --drafting on|off)")
+            ok(f"{HY4}: no speed calibration here - a Maya size measures which drafter is faster where the MTP block "
+               f"and the DFly2 drafter both fit; here the setup found room for one of them or none ({ME} --setup "
+               "--drafting on|off|mtp|dfly2)")
         return False
     if config_family(cfg) in ("deepseek", "minimax"):
         return speed_calibration_ds4(cfg_path, cfg, why)
@@ -5075,6 +5088,73 @@ def speed_calibration(cfg_path: Path, why: str = "") -> bool:
            "Maya " + ("decodes without drafting" if one else "drafts with the MTP block"))
         say(f"       (saved in {cfg_path.name}; to draft with DFlash2 anyway: {ME} --setup --draft dflash2 "
             "--no-speed-calibration)")
+    return True
+
+
+def hy4_both_drafters(cfg: dict) -> bool:
+    """A Maya size of Hy4-Flash set up where its MTP block and its DFly2 drafter both fit (installer.draft_choice
+    "auto": both in the pack, one GPU): which of the two drafts is the speed calibration's to measure."""
+    inst = cfg.get("installer") or {}
+    return config_family(cfg) == "hy4" and Q.config_key(cfg) != HY4_Q4 and inst.get("draft_choice") == "auto" and \
+        bool(inst.get("draft_block")) and bool(inst.get("dfly2")) and len(cfg.get("gpu") or [0]) < 2
+
+
+def hy4_with_drafter(cfg: dict, drafter: str) -> dict:
+    """A copy of a Hy4-Flash config that drafts with `drafter` ("mtp": --mtp, "dfly2": --dfly2) - the other's flag
+    out."""
+    out = json.loads(json.dumps(cfg))
+    args = [x for x in (out.get("args") or []) if x not in ("--mtp", "--dfly2")]
+    out["args"] = args + ["--dfly2" if drafter == "dfly2" else "--mtp"]
+    out.setdefault("installer", {})["drafter"] = drafter
+    return out
+
+
+def speed_calibration_hy4(cfg_path: Path, cfg: dict, why: str = "") -> bool:
+    """A Maya size of Hy4-Flash where both drafters fit: its sustained decode speed with the MTP block and with the
+    DFly2 drafter (both write only tokens the model checks: the same answers), a short probe each as
+    tools/calibrate_draft.py measures (HY4_DRAFT_PROBE: code, an explanation, plain text, thinking).  The faster is
+    kept; within HY4_DRAFT_TIE the size's rule (HY4_DRAFT_RULE) stays.  False: not measured (nothing changed)."""
+    if busy_skip(cfg, why == "asked for", "the speed calibration", "the GPU",
+                 f" (a model server still running?) - it runs at the next start, or: {ME} --speed-calibration"):
+        return False
+    quant = Q.config_key(cfg)
+    rule = HY4_DRAFT_RULE.get(quant, "mtp")
+    mtp, dfly = hy4_with_drafter(cfg, "mtp"), hy4_with_drafter(cfg, "dfly2")
+    say()
+    say("  Speed calibration: the MTP block or the DFly2 drafter?" + (f" ({why})" if why else ""))
+    say("  Both fit on this GPU and the model checks every drafted token; which drafts faster depends on how much of")
+    say(f"  the model the GPU holds beside it. Maya loads the model twice (the MTP block, then DFly2); each time it "
+        f"writes about {HY4_DRAFT_PROBE['tokens']} tokens of")
+    say("  short answers (code, an explanation, plain text, thinking) after a warm-up, and the speeds are compared.")
+    say("  The PC is busy meanwhile.")
+    log = cfg.get("log")
+    since = os.path.getsize(log) if log and os.path.isfile(log) else 0
+    now = (cfg.get("installer") or {}).get("drafter") or ("dfly2" if "--dfly2" in (cfg.get("args") or []) else "mtp")
+    try:
+        res = CD.run(mtp, dfly, say=say, other_label="the MTP block", draft_label="DFly2", size=HY4_DRAFT_PROBE)
+    except Exception as e:                             # never stops a setup or a start: the config stays as it was
+        warn(f"the speed calibration did not finish ({e}): nothing changed - Maya keeps "
+             f"{'DFly2' if now == 'dfly2' else 'the MTP block'}; {ME} --speed-calibration tries again")
+        why_not = CAL.engine_error(log, since)
+        if why_not:
+            say(f"       the engine said: {why_not}")
+        cfg.setdefault("installer", {})["speed_calibration"] = {"date": time.strftime("%Y-%m-%d %H:%M"),
+                                                                "failed": str(e)[:300]}
+        cfg_path.write_text(json.dumps(N.env_out(cfg), indent=1), encoding="utf-8")
+        return False
+    o, d = res["other"]["tok_s"], res["dflash2"]["tok_s"]
+    tie = abs(d - o) <= HY4_DRAFT_TIE * max(o, d)
+    keep = rule if tie else "dfly2" if d > o else "mtp"
+    out = mtp if keep == "mtp" else dfly
+    out.setdefault("installer", {})["speed_calibration"] = {
+        "date": time.strftime("%Y-%m-%d %H:%M"), "version": maya_version(), "mtp_tok_s": o, "dfly2_tok_s": d,
+        "tokens": [res["other"]["tokens"], res["dflash2"]["tokens"]], "kept": keep}
+    cfg_path.write_text(json.dumps(N.env_out(out), indent=1), encoding="utf-8")
+    say()
+    ok(f"speed calibration: {d:.1f} tokens/s with DFly2 against {o:.1f} with the MTP block - Maya drafts with " +
+       ("DFly2" if keep == "dfly2" else "the MTP block") + (" (a tie: this size's default)" if tie else ""))
+    say(f"       (saved in {cfg_path.name}; {ME} --speed-calibration measures again, --setup --drafting mtp|dfly2 "
+        "picks one by hand)")
     return True
 
 
@@ -5662,7 +5742,8 @@ def server_command(cfg_path: Path, a) -> tuple:
         cfg = read_json(cfg_path)
         args = cfg.get("args") or []
     if not unattended and needs_speed_calibration(cfg):     # a drafter set up without its speed calibration: measured once
-        drafter = {"deepseek": "DeepSeek's DSpark drafter", "minimax": "MiniMax's DSpark drafter"}.get(
+        drafter = {"deepseek": "DeepSeek's DSpark drafter", "minimax": "MiniMax's DSpark drafter",
+                   "hy4": "the MTP block or the DFly2 drafter"}.get(
             config_family(cfg), "DFlash2")
         if speed_calibration(cfg_path, f"once, for a setup that drafts with {drafter}"):
             cfg = read_json(cfg_path)
@@ -8907,7 +8988,8 @@ def hy4_pack_step(a, d: Path, files: list, vis: Path | None = None, mtp: Path | 
 
 
 def write_config_hy4(a, pc: dict, meta: dict, pack: Path, ctx: int, models: Path, d: Path, drafting: bool = False,
-                     quant: str = HY4_Q4, fit: dict | None = None, vision: bool = True, drafter: str = "mtp") -> Path:
+                     quant: str = HY4_Q4, fit: dict | None = None, vision: bool = True, drafter: str = "mtp",
+                     extra: dict | None = None) -> Path:
     """A set's config and its start script: maya-hy4-flash-maya-xs.json for a Maya size (maya_quants.config_stem: one
     config a size, whichever layout), maya-hy4-flash.json for Tencent's own Q4_K_M (--mtp: drafting with its MTP
     block; a Maya size drafts with the block, or with its DFly2 drafter - drafter "dfly2": --dfly2).  The model's own
@@ -8942,6 +9024,9 @@ def write_config_hy4(a, pc: dict, meta: dict, pack: Path, ctx: int, models: Path
         inst["draft_block"] = True
     if quant != HY4_Q4 and hy4_pack_dfly2_file(pack):  # (... with the DFly2 drafter: the same)
         inst["dfly2"] = True
+    if drafting and quant != HY4_Q4:
+        inst["drafter"] = drafter
+    inst.update(extra or {})                           # (draft_choice: auto = both fit, the speed calibration picks)
     sampling, effort = Q.model_defaults({"installer": inst})   # (the model's own, every setup: its card's)
     cfg = {"exe": str(HY4_EXE), "args": args, "cwd": str(ROOT), "tokenizer": str(pack / "tokenizer"),
            "model_name": HY4_MODEL_NAME, "gpu": [g["index"] for g in pc["gpus"]],
@@ -9111,7 +9196,9 @@ def set_up_hy4(a, prev: dict) -> Path | None:
             if mtp is None:
                 mtp_why = ("the draft block's file is not in the model's folder" +
                            ("" if hy4_mtp_entry()["published"] else " (it is not published yet)"))
-    if mtp is None and how != "mtp" and hy4_dfly2_entry(quant) is not None:
+    # (where the block fits too, the drafter beside it: which of the two drafts is measured on this PC - the speed
+    #  calibration's short A/B at the first start - and until then the faster for this size where it was measured)
+    if how != "mtp" and hy4_dfly2_entry(quant) is not None:
         room = base + hy4_dfly2_gib(quant)
         if len(pc["gpus"]) > 1:
             dfly_why = f"the DFly2 drafter runs on one GPU for now (this PC: {len(pc['gpus'])})"
@@ -9148,15 +9235,47 @@ def set_up_hy4(a, prev: dict) -> Path | None:
            "the file (RAM as the page cache), a picture's room (under 1 GB) is kept free on the main GPU; the server "
            "resizes the pictures, the Chat's picture button is shown")
     drafter = "dfly2" if dfly is not None else "mtp"
-    if quant != HY4_Q4:
+    extra, measure_now = {}, False
+    if quant != HY4_Q4 and mtp is not None and dfly is not None:   # (both fit: the faster on this PC, measured)
+        cal = inst.get("speed_calibration") or {}
+        carried = same and inst.get("layout") == fit["layout"] and inst.get("draft_choice") == "auto" and \
+            cal.get("kept") in ("mtp", "dfly2") and how != "measure"
+        drafter = cal["kept"] if carried else HY4_DRAFT_RULE.get(quant, "mtp")
+        extra["draft_choice"] = "auto"
+        if carried:
+            extra["speed_calibration"] = cal
+        elif getattr(a, "no_speed_calibration", False):
+            extra["speed_calibration"] = {"date": time.strftime("%Y-%m-%d %H:%M"), "version": maya_version(),
+                                          "skipped": "chosen", "kept": drafter}
+        had = inst.get("draft_block") or inst.get("dfly2")
+        drafting = how != "off" if how else not (same and had and inst.get("drafting") == "off")
+        measure_now = drafting and how == "measure"
+        one = {"mtp": "the MTP block", "dfly2": "the DFly2 drafter"}
+        if not drafting:
+            ok("drafting: off (--drafting on, or Drafting on the Models page, drafts with the MTP block or the DFly2 "
+               "drafter: both are in the pack)")
+        elif carried:
+            ok(f"drafting: {one[drafter]} - the faster of the two on this PC (the speed calibration of "
+               f"{cal.get('date', 'before')}; {ME} --speed-calibration measures again)")
+        else:
+            ok("drafting: Tencent's MTP block and DFly2 drafter both fit here - each drafts tokens the model checks, "
+               "so only tokens the model itself would pick are written. " +
+               ("Maya measures now which is faster on this PC" if measure_now else
+                f"Until a speed calibration measures which is faster on this PC ({ME} --speed-calibration; "
+                "otherwise once, at the first start that is not unattended)" if "speed_calibration" not in extra else
+                "Not measured (--no-speed-calibration)") +
+               f": {one[drafter]} (the faster for {name} where it was measured)")
+    elif quant != HY4_Q4:
         if mtp is None and dfly is None:
             (warn if how in ("on", "measure", "mtp", "dfly2") else ok)(
                 f"drafting: off - {mtp_why or ('no draft block for these files' if how != 'dfly2' else '--drafting dfly2')}"
                 + (f"; {dfly_why}" if dfly_why else ""))
         else:
             what = "the MTP block" if dfly is None else "the DFly2 drafter"
+            extra["draft_choice"] = how if how in ("mtp", "dfly2") else "only"
             if how == "measure":
-                warn(f"no speed calibration for {HY4} yet: it drafts with {what} (--drafting off: without)")
+                warn(f"nothing to measure for {HY4} here: only {what} fits on this PC, and it drafts (--drafting off: "
+                     "without)")
             had = inst.get("draft_block") if dfly is None else inst.get("dfly2")
             chose_off = same and had and inst.get("drafting") == "off"
             drafting = how != "off" if how else not chose_off
@@ -9170,8 +9289,11 @@ def set_up_hy4(a, prev: dict) -> Path | None:
                    f"model itself would pick are written; about {hy4_dfly2_gib(quant):.1f} GB of the GPU's VRAM" +
                    (f" (the MTP block: {mtp_why})" if mtp_why else "") if drafting else
                    "drafting: off (--drafting on, or Drafting on the Models page, drafts with the DFly2 drafter)")
-    return write_config_hy4(a, pc, meta, pack, fit["context"], models, d, drafting, quant, fit, pictures,
-                            drafter)   # 8
+    cfg_path = write_config_hy4(a, pc, meta, pack, fit["context"], models, d, drafting, quant, fit, pictures,
+                                drafter, extra)   # 8
+    if measure_now:
+        speed_calibration(cfg_path, measure_asked(a))
+    return cfg_path
 
 
 # ------------------------------------------------------------------------------------------------ CYBER-FROST-3.8-PS

@@ -1498,15 +1498,66 @@ class Drafts(unittest.TestCase):
         self.assertNotIn("--dfly2", c["args"])
         self.assertIn("drafting: off - the draft block needs about", text)
 
-    def test_mtp_first_dfly2_by_name(self):
-        # where the block fits it drafts and the DFly2 drafter is not taken; --drafting dfly2: the drafter instead
-        c, _, cmd = self.set_up(32, dfly=True)
-        self.assertEqual((cmd[cmd.index("--mtp") + 1], cmd[cmd.index("--drafter") + 1]), (MTP_FILE, "none"))
-        self.assertIn("--mtp", c["args"])
+    def test_both_fit(self):
+        # where both fit, both are packed and the size's rule drafts until the speed calibration measures (once, at a
+        # start); a setup again keeps what it measured; --no-speed-calibration: the rule, recorded as chosen
+        c, text, cmd = self.set_up(32, dfly=True)
+        self.assertEqual((cmd[cmd.index("--mtp") + 1], cmd[cmd.index("--drafter") + 1]), (MTP_FILE, DFLY_FILE))
+        rule = maya.HY4_DRAFT_RULE["maya-xs"]
+        self.assertIn("--dfly2" if rule == "dfly2" else "--mtp", c["args"])
+        self.assertNotIn("--mtp" if rule == "dfly2" else "--dfly2", c["args"])
+        self.assertEqual({k: c["installer"].get(k) for k in ("draft_choice", "drafter", "draft_block", "dfly2")},
+                         {"draft_choice": "auto", "drafter": rule, "draft_block": True, "dfly2": True})
+        self.assertIn("both fit here", text)
+        self.assertTrue(maya.hy4_both_drafters(c) and maya.needs_speed_calibration(c))
+        c["installer"]["speed_calibration"] = {"date": "d", "kept": "mtp" if rule == "dfly2" else "dfly2"}
+        self.assertFalse(maya.needs_speed_calibration(c))
+        c2, text, _ = self.set_up(32, dfly=True, prev=c)
+        self.assertEqual(c2["installer"]["drafter"], c["installer"]["speed_calibration"]["kept"])
+        self.assertEqual(c2["installer"]["speed_calibration"], c["installer"]["speed_calibration"])
+        self.assertIn("the faster of the two on this PC", text)
+        c3, _, _ = self.set_up(32, dfly=True, no_speed_calibration=True)
+        self.assertEqual(c3["installer"]["speed_calibration"]["skipped"], "chosen")
+        self.assertFalse(maya.needs_speed_calibration(c3))
+        # two cards: the drafter is not taken, nothing to measure
+        c4, _, cmd = self.set_up(32, dfly=True, gpus=2)
+        self.assertEqual(cmd[cmd.index("--drafter") + 1], "none")
+        self.assertFalse(maya.needs_speed_calibration(c4))
+
+    def test_by_name(self):
+        # --drafting mtp / dfly2: that one alone, packed alone, nothing measured
         c, _, cmd = self.set_up(32, dfly=True, drafting="dfly2")
         self.assertEqual((cmd[cmd.index("--mtp") + 1], cmd[cmd.index("--drafter") + 1]), ("none", DFLY_FILE))
         self.assertIn("--dfly2", c["args"])
         self.assertNotIn("--mtp", c["args"])
+        self.assertFalse(maya.needs_speed_calibration(c))
+        c, _, cmd = self.set_up(32, dfly=True, drafting="mtp")
+        self.assertEqual((cmd[cmd.index("--mtp") + 1], cmd[cmd.index("--drafter") + 1]), (MTP_FILE, "none"))
+        self.assertIn("--mtp", c["args"])
+        self.assertEqual(c["installer"]["draft_choice"], "mtp")
+        self.assertFalse(maya.needs_speed_calibration(c))
+
+    def test_speed_calibration(self):
+        # the A/B: MTP block first, then DFly2; the faster is kept, a tie keeps the size's rule
+        c, _, _ = self.set_up(32, dfly=True)
+        p = Path(self.tmp.name) / "maya-hy4-flash-maya-xs.json"
+        for o, d, want in ((30.0, 36.0, "dfly2"), (36.0, 30.0, "mtp"), (30.0, 30.3, maya.HY4_DRAFT_RULE["maya-xs"])):
+            p.write_text(json.dumps(c))
+            seen = []
+
+            def run(mtp, dfly, **kw):
+                seen.append(("--mtp" in mtp["args"], "--dfly2" in mtp["args"], "--dfly2" in dfly["args"],
+                             "--mtp" in dfly["args"]))
+                return {"other": {"tok_s": o, "tokens": 512}, "dflash2": {"tok_s": d, "tokens": 512}}
+            with patch.object(maya.CD, "run", run), patch.object(maya, "busy_skip", return_value=False), \
+                    patch.object(maya, "say", lambda *a: None), patch.object(maya, "ok", lambda *a: None):
+                self.assertTrue(maya.speed_calibration(p, "asked for"))
+            out = json.loads(p.read_text())
+            self.assertEqual(seen, [(True, False, True, False)])
+            self.assertEqual((out["installer"]["drafter"], out["installer"]["speed_calibration"]["kept"]), (want, want))
+            self.assertIn("--dfly2" if want == "dfly2" else "--mtp", out["args"])
+            self.assertNotIn("--mtp" if want == "dfly2" else "--dfly2", out["args"])
+            self.assertFalse(maya.needs_speed_calibration(out))
 
     def test_dfly2_not_where_it_cannot_run(self):
         # no room for the drafter either, or two cards (the engine runs it with its layers on one GPU): not taken, said
