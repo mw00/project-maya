@@ -1205,12 +1205,12 @@ private:
     std::string pack_content_identity(PackShardDigests& digests) const;
     std::string pack_metadata_bytes_; // exact metadata lines parsed by this part, captured during load
     std::string pack_exl3_metadata_bytes_; // first EXL3 parse, checked against the MTP parse
-    std::string pack_content_digest_;   // frozen while the mapped bytes are still available
+    std::string pack_content_digest_;   // frozen while mapped bytes are available, only when persistent caching needs it
 public:
     static std::string pack_identity_of(const Glm5Model& part);   // the same for this part and every split part
     /// What a retained slot or prompt-cache entry must match to be restored by this load: the state layout's words,
     /// the parts' layer ranges and each part's content digest (the GGUF shards, MAYA_GLM_MTP_GGUF's draft block and an
-    /// EXL3 pack's safetensors).  Empty before a pack load.
+    /// EXL3 pack's safetensors).  The content digest is empty before a pack load or when persistent caching is off.
     std::string pack_identity() const;
 };
 

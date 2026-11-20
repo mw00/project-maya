@@ -4,7 +4,8 @@
 //   MAYA_GLM_MTP_GGUF's draft block, an EXL3 pack's safetensors), read through the mapping itself rather than by
 //   reopening paths - a path re-read could see another file than the load did.  Slots and prompt-cache entries carry
 //   it, so a retained state written over one set of weights is refused by a later load of different bytes under the
-//   same names and sizes.
+//   same names and sizes. The loader calls this only when persistent caching is enabled; default and RAM-only loads
+//   do not read every shard for identity.
 //   Glm5Model::pack_identity() = pack_content_identity() + what the state layout holds (geometry, mode, k_pe and
 //   index-key dtype, rotation, latent row size, the NextN block and its carrier): the same words state_fp() carries,
 //   read from lay_ directly because this file is built without CUDA and so without state_fp's translation unit.

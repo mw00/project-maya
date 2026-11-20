@@ -49,8 +49,11 @@ export MAYA_GLM_COMPLETION_MIN_TOKENS=1024
 
 Persistent slot and prompt-cache keys include SHA-256 digests of the weight
 shards mapped by the loader, together with the parsed expert routing and split
-layout. A weight change between loads gives the pack a different key. Entries
-created before this key format require a fresh prefill.
+layout. These digests are computed only when spill/kept slots, learned prefixes
+or prompt caching require persistent identity. Default and RAM-only loads skip
+the full-weight hash; `MAYA_GLM_NO_REUSE` suppresses it as well. A weight change
+between loads gives the pack a different key. Entries created before this key
+format require a fresh prefill.
 
 Keep model files immutable throughout loading and inference. Install a new
 revision in a separate directory and use a private slot directory. Hashing
