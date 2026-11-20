@@ -2393,6 +2393,14 @@ setup) and keeps the faster; until it runs, the size's default (HY4_DRAFT_RULE i
 measured). `--drafting mtp|dfly2` at the setup picks one by name (nothing measured), `--drafting on` lets Maya pick;
 Drafting on the Models page offers each one the pack has.
 
+**Faster drafting on a small card (opt-in, `--fast-drafting on`):** where the DFly2 drafter has no room beside the
+cache's F16 rows at the context chosen (and the MTP block has none either), the setup can keep that context with the
+latent cache in 8-bit rows (`--kv q8`), which leaves the drafter its room: faster drafting, slightly different
+wording than the default. On an 8 GB card at 8K it decoded about 8-27% faster than the default there. The setup
+works this out from the card's free VRAM and the size's plan, and asks where it applies (`--yes`, and
+`--fast-drafting off`: the default, F16 rows - Maya's default answers). A setup again keeps the choice; KV cache on
+the Models page shows it (Auto or 8-bit). Within that config, drafting on and off give the same tokens.
+
 **Not available for Hy4-Flash yet** (the dashboard offers no switch for them): `--parallel` (one request at a time
 for now); Mac, and AMD on Windows.
 

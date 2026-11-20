@@ -1422,10 +1422,12 @@ class Drafts(unittest.TestCase):
             self.assertEqual(maya.hy4_pack_mtp_file(pack), MTP_FILE)
 
     def set_up(self, gib, block=True, published=False, prev=None, downloads=None, dfly=False, gpus=1, dfly_gib=None,
-               **kw):
+               small=False, used=300, choose=None, revision="", **kw):
         """One setup of Maya-XS from a folder with stand-in files on `gpus` cards of `gib`: (config, what was said,
-        the pack's command).  dfly: the size has a DFly2 drafter in the table, its file in the folder."""
-        man, body = stand_ins()
+        the pack's command).  dfly: the size has a DFly2 drafter in the table, its file in the folder.  small: the
+        folder has the 8 GB-card trunk; used: the MiB nvidia-smi reads in use on each card; choose: the setup's
+        questions answered by it (else none is asked: --yes); revision: the table's (the drafter published)."""
+        man, body = stand_ins(dict(MANIFEST, revision=revision))
         blob = b"m" * 777
         man["mtp"] = {MTP_HUB: [len(blob), hashlib.sha256(blob).hexdigest()]}
         man["mtp_revision"] = "d" * 40 if published else ""
@@ -1434,7 +1436,10 @@ class Drafts(unittest.TestCase):
         root, d = Path(self.tmp.name) / "maya", Path(self.tmp.name) / "mine"
         root.mkdir(exist_ok=True)
         d.mkdir(exist_ok=True)
-        (d / TRUNK).write_bytes(body[list(xs["files"])[0]])
+        if small:
+            (d / SMALL).write_bytes(body[list(xs["layouts"]["8gb"]["files"])[0]])
+        else:
+            (d / TRUNK).write_bytes(body[list(xs["files"])[0]])
         (d / NGRAM).write_bytes(body[list(man["ngram"])[0]])
         if block:
             (d / MTP_FILE).write_bytes(blob)
@@ -1467,14 +1472,16 @@ class Drafts(unittest.TestCase):
                 patch.object(maya, "step", lambda *a: None), patch.object(maya, "say", lambda *a: said.extend(a)), \
                 patch.object(maya, "ok", said.append), patch.object(maya, "warn", said.append), \
                 patch.object(maya, "check_pc", lambda a, fam: pc), \
-                patch.object(maya, "gpu_used_mib", return_value={0: 300}), \
+                patch.object(maya, "gpu_used_mib", return_value={i: used for i in range(gpus)}), \
+                patch.object(maya, "choose", choose or (lambda q, i, o, default, yes, *r: default)), \
                 patch.object(maya, "mem_gb", return_value=(64.0, 60.0)), \
                 patch.object(maya, "tools_step", lambda a: Path("llama")), \
                 patch.object(maya, "build_step", lambda a, pc, llama, target: {"lib_dirs": []}), \
                 patch.object(maya, "rotational", return_value=False), patch.object(maya, "configs", return_value=[]), \
                 patch.object(maya, "run", run), patch.object(maya, "write_run_script", lambda p, port: "run"), \
                 patch.object(maya, "hy4_mtp_gib", lambda chunk=1024: 3.95),                 patch.object(maya, "offer_download", offer):
-            a = args(model="hy4-flash-maya-xs", model_dir=str(d), no_vision=True, **kw)
+            a = args(model="hy4-flash-maya-xs", model_dir=str(d), no_vision=True, **({"yes": False} if choose else {}),
+                     **kw)
             maya.model_option(a)
             c = json.loads(maya.set_up_hy4(a, prev or {}).read_text())
         return c, "\n".join(map(str, said)), ran[-1] if ran else None
@@ -1695,6 +1702,123 @@ class Drafts(unittest.TestCase):
             (d / MTP_FILE).write_bytes(b"x" * 777)                                 # (damaged: the size is right)
             with self.assertRaises(Failed):
                 maya.hy4_mtp_step(args(), d, "maya-l", models)
+
+
+class FastDrafting(unittest.TestCase):
+    """The opt-in faster drafting (--fast-drafting on): where the DFly2 drafter has no room beside the cache's F16
+    rows but has it beside 8-bit rows, the setup offers the same context with --kv q8 - never by itself (the answers
+    are not the default's), worked out from the card's free VRAM."""
+    G = maya.hy4_dfly2_gib("maya-xs")                  # (the committed table's drafter: its real size)
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def set_up(self, used, **kw):                      # (an 8 GB card at 8K, the 8 GB-card trunk and the drafter)
+        return Drafts.set_up(self, 8, block=False, dfly=True, dfly_gib=self.G, small=True, used=used, context=8192,
+                             revision=TABLE["revision"], **kw)
+
+    def test_where_it_applies(self):
+        q, card8 = maya.hy4_quant_table("maya-xs"), [card(8)]
+
+        def fit(used, ctx=8192, cards=card8):
+            f = maya.hy4_fit(q, cards, ctx, used={g["index"]: used for g in cards}, ram_gb=64, drafter=self.G)
+            return f, maya.hy4_fast_drafting_fit("maya-xs", cards, f, used={g["index"]: used for g in cards}, ram_gb=64)
+        # a desktop's ~0.4 GB in use: F16 rows fit, the drafter beside them does not, beside 8-bit rows it does
+        f, fast = fit(400)
+        self.assertEqual((f["kv"], maya.hy4_dfly2_need_gib("maya-xs", f) > f["usable"]), ("f16", True))
+        self.assertEqual((fast["kv"], fast["context"], fast["layout"], fast["fast_drafting"], fast["f16_room"]),
+                         ("q8", 8192, "8gb", True, False))
+        self.assertEqual(fast["args"][-2:], ["--kv", "q8"])
+        self.assertEqual(fast["chunk"], maya.hy4_layouts(q)["8gb"]["plan"]["chunk"])   # (the drafter's room first)
+        self.assertLessEqual(maya.hy4_dfly2_need_gib("maya-xs", fast), fast["usable"])
+        self.assertNotIn("--kv", f["args"])                                            # (the default: the engine's auto)
+        # where these sums find the drafter room beside the F16 rows too (a free card; 4K): marked - the setup asks
+        # nothing there (the default claims the drafter), and takes it only by name
+        self.assertTrue(fit(76)[1]["f16_room"])
+        self.assertTrue(fit(400, 4096)[1]["f16_room"])
+        # not where 8-bit rows do not make the room either (more in use), at a context whose default rows are 8-bit
+        # already, or on two cards
+        self.assertIsNone(fit(552)[1])
+        self.assertEqual(fit(400, 16384)[0]["kv"], "q8")
+        self.assertIsNone(fit(400, 16384)[1])
+        self.assertIsNone(fit(400, cards=[card(8), card(8, 1)])[1])
+        # the standard layout on larger cards: the MTP block or the drafter drafts there with F16 rows
+        for gib in (12, 16, 24):
+            f = maya.hy4_fit(q, [card(gib)], None, used={0: 400}, ram_gb=64, drafter=self.G)
+            self.assertIsNone(maya.hy4_fast_drafting_fit("maya-xs", [card(gib)], f, used={0: 400}, ram_gb=64), gib)
+        self.assertIsNone(maya.hy4_fast_drafting_fit(maya.HY4_Q4, card8, f))            # (Tencent's own set: no drafter)
+        # the rows asked for: only those counted and written (the engine's --kv)
+        f8 = maya.hy4_fit(q, card8, 8192, used={0: 400}, ram_gb=64, kv="q8")
+        self.assertEqual((f8["kv"], f8["args"][-2:]), ("q8", ["--kv", "q8"]))
+        self.assertAlmostEqual(f8["need"], maya.hy4_fit_need_gib(maya.hy4_layouts(q)["8gb"]["plan"], 8192, True))
+
+    def test_the_default_says_it(self):
+        # --yes (and no flag): the default start - F16 rows, no drafter - and the drafting line names the faster one
+        c, text, cmd = self.set_up(400)
+        self.assertEqual(cmd[cmd.index("--drafter") + 1], "none")
+        self.assertNotIn("--kv", c["args"])
+        self.assertNotIn("--dfly2", c["args"])
+        self.assertNotIn("fast_drafting", c["installer"])
+        self.assertIn("with the cache in 8-bit rows it fits at 8K: faster drafting, slightly different wording than "
+                      "the default (./maya.sh --setup --fast-drafting on)".replace("./maya.sh", maya.ME), text)
+        # a free card: the drafter fits beside the F16 rows - the default drafts, nothing offered
+        c, text, _ = self.set_up(76)
+        self.assertEqual(("--dfly2" in c["args"], "--kv" in c["args"]), (True, False))
+        self.assertNotIn("fast-drafting", text)
+
+    def test_on(self):
+        c, text, cmd = self.set_up(400, fast_drafting="on")
+        self.assertEqual(cmd[cmd.index("--drafter") + 1], DFLY_FILE)
+        self.assertEqual((c["args"][c["args"].index("--kv") + 1], "--dfly2" in c["args"]), ("q8", True))
+        self.assertEqual(c["args"][c["args"].index("--chunk") + 1], "256")
+        self.assertEqual((c["installer"]["fast_drafting"], c["installer"]["drafting"], c["installer"]["drafter"]),
+                         (True, "on", "dfly2"))
+        self.assertIn("faster drafting: on - the cache in 8-bit rows at this context, so the DFly2 drafter fits: "
+                      "faster drafting, slightly different wording than the default", text)
+        # a setup again keeps it (with drafting turned off on the Models page too: it is for the drafter); off goes back
+        again, text, _ = self.set_up(400, prev={**c, "installer": {**c["installer"], "drafting": "off"}})
+        self.assertEqual((again["args"][again["args"].index("--kv") + 1], "--dfly2" in again["args"]), ("q8", True))
+        self.assertIn("faster drafting: on (as set up before)", text)
+        off, _, _ = self.set_up(400, prev=c, fast_drafting="off")
+        self.assertEqual(("--kv" in off["args"], "--dfly2" in off["args"], "fast_drafting" in off["installer"]),
+                         (False, False, False))
+
+    def test_asked(self):
+        # asked where it applies, the default first; the answer taken
+        seen = []
+
+        def answer(pick):
+            def choose(q, intro, options, default, yes, *r):
+                seen.append((q, default, [o[0] for o in options], yes))
+                return pick if q == "Faster drafting?" else default
+            return choose
+        c, _, _ = self.set_up(400, choose=answer(1))
+        self.assertEqual(seen[-1][:2], ("Faster drafting?", 0))
+        self.assertEqual(seen[-1][2][0], "Default: the cache in F16 rows, no drafting at this context")
+        self.assertEqual(c["args"][c["args"].index("--kv") + 1], "q8")
+        c, _, _ = self.set_up(400, choose=answer(0))
+        self.assertNotIn("--kv", c["args"])
+        seen.clear()
+        self.set_up(76, choose=answer(1))                                              # (no trade here: not asked)
+        self.assertNotIn("Faster drafting?", [s[0] for s in seen])
+
+    def test_by_name(self):
+        # where the setup's sums give the drafter room beside F16 rows too (a free card), the default claims it and the
+        # engine may still find none (an 8 GB card under Windows at 8K): by name the 8-bit rows are taken, said so
+        c, text, _ = self.set_up(76, fast_drafting="on")
+        self.assertEqual((c["args"][c["args"].index("--kv") + 1], "--dfly2" in c["args"]), ("q8", True))
+        self.assertIn("so the DFly2 drafter fits also where the engine finds no room for it beside F16 rows", text)
+        # where even 8-bit rows leave it no room, or drafting is off: the default, said why
+        c, text, _ = self.set_up(552, fast_drafting="on")
+        self.assertEqual(("--kv" in c["args"], "--dfly2" in c["args"]), (False, False))
+        self.assertIn("faster drafting: not set up - even with the cache in 8-bit rows the DFly2 drafter has no room",
+                      text)
+        c, text, _ = self.set_up(400, fast_drafting="on", drafting="off")
+        self.assertEqual(("--kv" in c["args"], "--dfly2" in c["args"]), (False, False))
+        self.assertIn("faster drafting: not set up with --drafting off", text)
 
 
 def hy4_cfg(d: Path, mtp: bool = True, n_mtp: int = 1, vision: bool = False) -> dict:

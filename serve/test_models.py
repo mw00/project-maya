@@ -324,7 +324,7 @@ class Settings(unittest.TestCase):
         self.assertEqual(M.family({"exe": "C:/b/maya-hy4.exe", "args": ["--pack", "/p"]}), "hy4")   # (no installer)
         self.assertEqual(M.settings_of(cfg), {"context": 32768, "gpus": [0, 1], "env": {}, "ablate": False,
                                               "images": False, "draft": "none", "tp": "auto", "cpu_threads": 12,
-                                              "reserve_gb": 0.5, "prefill_chunk": 256})
+                                              "reserve_gb": 0.5, "prefill_chunk": 256, "kv": "auto"})
         self.assertEqual(M.choices(cfg), {"draft": ["none"], "images": False,
                                           "ablate": {"available": False, "why": "not available for this model"}})
         self.assertEqual(M.quant_label(cfg, Path("maya-hy4-flash-maya-xs.json")), "Maya-XS")
@@ -348,10 +348,22 @@ class Settings(unittest.TestCase):
         self.assertEqual((one["gpu"], "--gpus" in one["args"]), ([1], False))
         three = M.apply(cfg, {"gpus": [0, 2, 3]})
         self.assertEqual((three["gpu"], M.flag(three["args"], "--gpus")), ([0, 2, 3], "0,1,2"))
+        # KV cache: auto (no flag, the default) or 8-bit rows (--kv q8: the setup's opt-in faster drafting) - another
+        # setting left as it is; a config's own --kv f16 stays offered, other formats are refused
+        q8 = M.apply(cfg, {"kv": "q8"})
+        self.assertEqual((M.flag(q8["args"], "--kv"), M.settings_of(q8)["kv"]), ("q8", "q8"))
+        self.assertEqual([x for x in q8["args"] if x not in ("--kv", "q8")], before)
+        self.assertEqual(M.apply(M.apply(q8, {"draft": "none"}), {})["args"], q8["args"])   # (drafting: rows kept)
+        self.assertEqual(M.apply(q8, {"kv": "auto"})["args"], before)
+        f16 = {**cfg, "args": before + ["--kv", "f16"]}
+        self.assertEqual(M.flag(M.apply(f16, M.settings_of(f16))["args"], "--kv"), "f16")
+        for bad in ("f16", "int8"):
+            with self.assertRaisesRegex(ValueError, "KV cache: auto or 8-bit"):
+                M.apply(cfg, {"kv": bad})
         # what the engine does not have yet: a plain no, nothing written
         for key, value, why in (("parallel", 2, "one request at a time"), ("draft", "mtp", "this pack has no MTP block"),
-                                ("images", True, "this pack has no vision tower"), ("kv_cache", "fp8", "one cache format"),
-                                ("kv", "int8", "one cache format"), ("kv_streaming", True, "KV streaming: .* by itself"),
+                                ("images", True, "this pack has no vision tower"), ("kv_cache", "fp8", "auto or 8-bit"),
+                                ("kv_streaming", True, "KV streaming: .* by itself"),
                                 ("kv_resident", 8192, "KV streaming: .* by itself"),
                                 ("ablate", True, "Refusal ablation: not available for this model")):
             with self.assertRaisesRegex(ValueError, why):

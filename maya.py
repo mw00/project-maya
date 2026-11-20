@@ -8494,14 +8494,15 @@ def hy4_stream_need_gib(plan: dict, ctx: int, q8: bool = False, resident: int | 
         (hy4_cache_bytes(ctx, chunk, q8) - hy4_cache_bytes(ctx, chunk, q8, res)) / 2**30
 
 
-def hy4_stream_rows(plan: dict, ctx: int, usable: float, ram_gib: float | None) -> tuple | None:
+def hy4_stream_rows(plan: dict, ctx: int, usable: float, ram_gib: float | None, kv: str | None = None) -> tuple | None:
     """A context that fits the VRAM only with KV streaming, as the engine's --kv-streaming auto takes it:
     (rows, ring) - "f16" then "q8", with the ring of HY4_KV_RESIDENT positions and then a prompt chunk's - where the
-    RAM left for the rows (ram_gib) holds them; None: no RAM figure given, or it fits neither way."""
+    RAM left for the rows (ram_gib) holds them; None: no RAM figure given, or it fits neither way.  kv "f16" / "q8":
+    those rows only (the engine's --kv f16 / q8)."""
     if ram_gib is None:
         return None
     for res in (HY4_KV_RESIDENT, 1):
-        for q8 in (False, True):
+        for q8 in ((kv == "q8",) if kv in ("f16", "q8") else (False, True)):
             if hy4_stream_need_gib(plan, ctx, q8, res) <= usable:
                 # (the engine stops at the first that fits the VRAM: the RAM must hold that one's rows)
                 return ("q8" if q8 else "f16", res) if hy4_stream_ram_gib(ctx, q8) <= ram_gib else None
@@ -8738,7 +8739,7 @@ def hy4_used_mib(before: dict | None = None, used: dict | None = None, own: dict
 
 def hy4_fit(q: dict, gpus: list, ctx_wanted: int | None = None, used: dict | None = None,
             layout: str | None = None, pictures: bool = True, name: str | None = None,
-            ram_gb: float | None = None, drafter: float = 0.0) -> dict:
+            ram_gb: float | None = None, drafter: float = 0.0, kv: str | None = None) -> dict:
     """How a size of Hy4-Flash (q: its entry in the manifest) runs on these cards, worked out before any download:
     {"layout": "standard" where its plan fits the VRAM (hy4_usable_gib) at the context - else a small-card layout the
     size has; "context": ctx_wanted, else "recommended" - the largest of HY4_CONTEXTS that fits, up to
@@ -8763,26 +8764,33 @@ def hy4_fit(q: dict, gpus: list, ctx_wanted: int | None = None, used: dict | Non
     "--kv-streaming auto" in "args" (the engine then streams by itself, only there).
     drafter (GiB: the DFly2 drafter the setup would load beside the model, hy4_dfly2_gib; 0: none): a small-card
     layout's chunk is not doubled where that would leave the drafter no room while the plan's own chunk does - its
-    drafts are the larger gain there (an RTX 3050 8 GB at 4K: decoding +12-39%, prompts read 37% slower)."""
+    drafts are the larger gain there (an RTX 3050 8 GB at 4K: decoding +12-39%, prompts read 37% slower).
+    kv ("f16" / "q8": the engine's --kv with those rows only - "--kv" in "args"; None: its auto): the faster drafting
+    the setup offers on a small card (hy4_fast_drafting_fit) keeps the cache in 8-bit rows at a context where F16 fit."""
     lays = hy4_layouts(q)
     if layout is not None:
         lays = {k: v for k, v in lays.items() if k == layout}
     usable = hy4_usable_gib(gpus, used)
+    kv_own = kv if kv in ("f16", "q8") else None
 
     def need(plan: dict, c: int) -> float:             # (the least a context takes: with F16 rows, or with 8-bit rows)
+        if kv_own:
+            return hy4_fit_need_gib(plan, c, kv_own == "q8")
         return min(hy4_fit_need_gib(plan, c), hy4_fit_need_gib(plan, c, True))
 
     ram_rows = hy4_ram_for_rows(q, usable, ram_gb)     # (the RAM left for streamed rows)
 
     def stream(plan: dict, c: int) -> tuple | None:
-        return hy4_stream_rows(plan, c, usable, ram_rows)
+        return hy4_stream_rows(plan, c, usable, ram_rows, kv_own)
 
     def need_at(plan: dict, c: int, q8: bool, st: tuple | None) -> float:
         return hy4_stream_need_gib(plan, c, q8, st[1]) if st else hy4_fit_need_gib(plan, c, q8)
 
+    def in_vram(plan: dict, c: int) -> str | None:     # (the rows a context fits in VRAM with - no streaming)
+        return hy4_kv_rows(hy4_fit_need_gib(plan, c), hy4_fit_need_gib(plan, c, True), usable, kv_own)
+
     def rows(plan: dict, c: int) -> str | None:        # (a context the table does not list: not measured on a card)
-        kv = hy4_kv_rows(hy4_fit_need_gib(plan, c), hy4_fit_need_gib(plan, c, True), usable)
-        return kv or (stream(plan, c) or (None,))[0]
+        return in_vram(plan, c) or (stream(plan, c) or (None,))[0]
     least = HY4_CONTEXTS[0]
     cards = f"{len(gpus)} cards together have" if len(gpus or []) > 1 else "this card has"
     fits = {k: [c for c in HY4_CONTEXTS if rows(v["plan"], c)] for k, v in lays.items()}
@@ -8806,8 +8814,7 @@ def hy4_fit(q: dict, gpus: list, ctx_wanted: int | None = None, used: dict | Non
     rec = max([c for c in fits[pick] if c <= HY4_TESTED_CONTEXT] or [least])
     ctx = int(ctx_wanted) if ctx_wanted else rec
     kv = rows(plan, ctx)
-    st = None if hy4_kv_rows(hy4_fit_need_gib(plan, ctx), hy4_fit_need_gib(plan, ctx, True), usable) else \
-        stream(plan, ctx)
+    st = None if in_vram(plan, ctx) else stream(plan, ctx)
     takes = need_at(plan, ctx, kv == "q8", st)
     chunk, args = int(plan.get("chunk") or 0), []
     # (pictures: their room is lent by the engine's prompt buffers - no VRAM kept, so the rows and the context
@@ -8823,8 +8830,9 @@ def hy4_fit(q: dict, gpus: list, ctx_wanted: int | None = None, used: dict | Non
             chunk *= 2
         args = (["--chunk", str(chunk)] if chunk else []) +             [x for k, flag in (("reserve_gb", "--reserve-gb"), ("vram_experts", "--vram-experts")) if k in plan
              for x in (flag, f"{float(plan[k]):g}")]
-    streamed = [c for c in fits[pick]
-                if not hy4_kv_rows(hy4_fit_need_gib(plan, c), hy4_fit_need_gib(plan, c, True), usable)]
+    streamed = [c for c in fits[pick] if not in_vram(plan, c)]
+    if kv_own:                                         # (the rows asked for: the engine's --kv, nothing auto)
+        args = args + ["--kv", kv_own]
     out = {"layout": pick, "context": ctx, "recommended": rec, "contexts": fits[pick], "chunk": chunk, "args": args,
            "kv": kv, "usable": usable, "need": takes, "vision": vision, "vision_small": small}
     if streamed:
@@ -9145,6 +9153,37 @@ def hy4_dfly2_need_gib(quant: str, fit: dict) -> float:
     return hy4_drafter_need_gib(plan, fit, hy4_dfly2_gib(quant))
 
 
+def hy4_fast_drafting_fit(quant: str, gpus: list, fit: dict, used: dict | None = None,
+                          ram_gb: float | None = None) -> dict | None:
+    """The setup's opt-in faster drafting (--fast-drafting on) for the start hy4_fit worked out (fit): the same
+    context and layout with the latent cache in 8-bit rows (the engine's --kv q8, "--kv q8" in "args";
+    "fast_drafting": True) where those rows are what gives the size's DFly2 drafter its room - on one GPU, where the
+    start as worked out drafts with nothing: its rows F16 in VRAM (no KV streaming), no room for the drafter beside
+    them nor for the MTP block, and with 8-bit rows the drafter's room as the engine counts it
+    (hy4_dfly2_need_gib).  "f16_room": True where these sums find the drafter room beside the F16 rows too (the
+    default then claims it; the engine, which counts its own free VRAM at every start, may still find none there -
+    an 8 GB card under Windows at 8K: its start line says so - so the faster start is taken there only when asked by
+    name).  Decided by this PC's own figures (its cards' free VRAM, the size's plan), no card named.  The 8-bit rows
+    round the cache, so the answers are worded slightly differently from the default's (F16) - only when asked;
+    within that start drafting on and off give the same tokens (the drafter's room is counted either way).  None: no
+    such trade here."""
+    if quant == HY4_Q4 or len(gpus or []) != 1 or "error" in fit or fit.get("kv") != "f16" or \
+            fit.get("kv_streaming") or hy4_dfly2_entry(quant) is None:
+        return None
+    usable = float(fit.get("usable") or 0)
+    if fit.get("layout") == HY4_STANDARD and hy4_mtp_entry() is not None and \
+            float(fit.get("need") or 0) + hy4_mtp_gib(int(fit.get("chunk") or 1024)) <= usable:
+        return None                                    # (the MTP block fits: the default drafts with it)
+    f8 = hy4_fit(hy4_quant_table(quant), gpus, fit["context"], used=used, layout=fit.get("layout"),
+                 pictures=bool(fit.get("vision", True)), ram_gb=ram_gb, drafter=hy4_dfly2_gib(quant), kv="q8")
+    if "error" in f8 or f8.get("kv") != "q8" or f8.get("kv_streaming") or hy4_dfly2_need_gib(quant, f8) > f8["usable"]:
+        return None
+    room = hy4_dfly2_need_gib(quant, fit) <= usable
+    if room and fit.get("layout") == HY4_STANDARD:
+        return None                                    # (the standard layout: its room comes from the experts' VRAM)
+    return {**f8, "fast_drafting": True, "f16_room": room}
+
+
 def hy4_pack_dfly2_file(pack: Path) -> str | None:
     """The name of the DFly2 drafter's file a pack reads (hy4.txt has dfly_layers; tensors.txt's `file` line of the
     file that is no trunk shard, MTP block or mmproj), or None."""
@@ -9258,7 +9297,9 @@ def write_config_hy4(a, pc: dict, meta: dict, pack: Path, ctx: int, models: Path
         inst["dfly2"] = True
     if drafting and quant != HY4_Q4:
         inst["drafter"] = drafter
-    inst.update(extra or {})                           # (draft_choice: auto = both fit, the speed calibration picks)
+    if fit.get("fast_drafting"):                       # (the opt-in: --kv q8 in its args; a setup again keeps it)
+        inst["fast_drafting"] = True
+    inst.update(extra or {})                         # (draft_choice: auto = both fit, the speed calibration picks)
     sampling, effort = Q.model_defaults({"installer": inst})   # (the model's own, every setup: its card's)
     cfg = {"exe": str(HY4_EXE), "args": args, "cwd": str(ROOT), "tokenizer": str(pack / "tokenizer"),
            "model_name": HY4_MODEL_NAME, "gpu": [g["index"] for g in pc["gpus"]],
@@ -9372,6 +9413,59 @@ def hy4_fit_step(a, pc: dict, quant: str, prev_ctx: int | None = None, have=None
     return fit
 
 
+HY4_FAST_DRAFTING_SAID = "faster drafting, slightly different wording than the default"
+
+
+def hy4_fast_drafting_step(a, pc: dict, quant: str, fit: dict, before: bool = False) -> tuple:
+    """Step 2's faster drafting for a Maya size (hy4_fast_drafting_fit: the cache in 8-bit rows where that gives the
+    DFly2 drafter its room): (the start the setup goes on with, the faster one where it applies here but was not
+    taken - step 5's drafting line names it - else None).  --fast-drafting on: the faster where it applies (else
+    said why not; the default); off: the default; not given: the config before's choice (before) where it still
+    applies, else asked where the setup's sums give the drafter no room beside the F16 rows - the default first
+    (--yes: the default).  Never the default by itself: its answers are not the default's."""
+    want, how = getattr(a, "fast_drafting", None), getattr(a, "drafting", None)
+    if how in ("off", "mtp"):
+        if want == "on":
+            warn(f"faster drafting: not set up with --drafting {how} - it is for the DFly2 drafter; the cache's rows "
+                 "stay the default's")
+        return fit, None
+    fast = hy4_fast_drafting_fit(quant, pc["gpus"], fit, ram_gb=mem_gb()[0])
+    if fast is None:
+        if want == "on" or (want is None and before):
+            usable = float(fit.get("usable") or 0)
+            why = (f"the DFly2 drafter runs on one GPU for now (this PC: {len(pc['gpus'])})" if len(pc["gpus"]) != 1
+                   else "this size has no DFly2 drafter" if hy4_dfly2_entry(quant) is None
+                   else "at this context the cache is in 8-bit rows by default already" if fit.get("kv") == "q8"
+                   else "at this context the cache's older rows live in RAM" if fit.get("kv_streaming")
+                   else "the MTP block drafts here, with the default's answers"
+                   if fit.get("layout") == HY4_STANDARD and hy4_mtp_entry() is not None and
+                   float(fit.get("need") or 0) + hy4_mtp_gib(int(fit.get("chunk") or 1024)) <= usable
+                   else f"even with the cache in 8-bit rows the DFly2 drafter has no room at this context "
+                        f"({usable:.1f} GB free)")
+            (warn if want == "on" else ok)(f"faster drafting: not set up - {why}; the default start")
+        return fit, None
+    if want is None and not before and fast["f16_room"]:
+        return fit, None                               # (the default claims the drafter: nothing asked, nothing said)
+    if want is None and not before:
+        rows = [("Default: the cache in F16 rows, no drafting at this context", "recommended",
+                 "The answers as Maya's default writes them."),
+                ("Faster drafting: the cache in 8-bit rows, so the DFly2 drafter fits", None,
+                 f"Decoding is faster; {HY4_FAST_DRAFTING_SAID}.")]
+        pick = choose("Faster drafting?",
+                      [f"At a context of {context_label(fit['context'])} the DFly2 drafter has no room on this card beside "
+                       "the cache's F16 rows.", "With the cache in 8-bit rows it fits: faster drafting, slightly "
+                       "different wording than the default."], rows, 0, a.yes or getattr(a, "check", False))
+        want = "on" if pick == 1 else "off"
+    if want == "off":                                  # (not asked for by name: step 5 names the faster one)
+        return fit, (fast if getattr(a, "fast_drafting", None) is None else None)
+    ok("faster drafting: on" + (" (as set up before)" if getattr(a, "fast_drafting", None) is None else "") +
+       f" - the cache in 8-bit rows at this context, so the DFly2 drafter fits" +
+       (" also where the engine finds no room for it beside F16 rows (its start line says which)"
+        if fast["f16_room"] else "") +
+       f": {HY4_FAST_DRAFTING_SAID} (F16 rows; {ME} --setup --fast-drafting off sets the default up again)")
+    return fast, None
+
+
 def set_up_hy4(a, prev: dict) -> Path | None:
     """Hy4-Flash's steps 1-8: the files (Maya's sizes, or Tencent's own Q4_K_M), the PC (NVIDIA from V100 on; AMD on
     Linux - under Windows experimental: hy4_usable_gib counts a unified-memory APU's memory, hy4_apu_note says what
@@ -9395,7 +9489,7 @@ def set_up_hy4(a, prev: dict) -> Path | None:
     models = (Path(a.models_dir).expanduser().resolve() if a.models_dir else
               Path(inst["models_dir"]) if inst.get("models_dir") else ROOT.parent / "Maya-data" / "models")
     step(2, "your choices")                            # 2
-    drafting = False
+    drafting, plain_fit, fast_alt = False, None, None
     if quant == HY4_Q4:
         m = hy4_entry()
         ok(f"files: {Q.shown('hy4', quant, m['download_gb'])} - Tencent's own Q4_K_M (AngelSlim's GGUF; the repo's "
@@ -9426,6 +9520,8 @@ def set_up_hy4(a, prev: dict) -> Path | None:
     else:
         ok(f"files: {name} (Maya's quant)")
         fit = hy4_fit_step(a, pc, quant, prev_ctx, lambda lay: hy4_dir(a, models, prev, quant, lay))
+        plain_fit = fit
+        fit, fast_alt = hy4_fast_drafting_step(a, pc, quant, fit, same and bool(inst.get("fast_drafting")))
         note = hy4_apu_note(pc["gpus"], hy4_quant_table(quant), name)
         if note:
             (ok if note[0] else warn)(note[1])
@@ -9446,11 +9542,13 @@ def set_up_hy4(a, prev: dict) -> Path | None:
     # runs it with the layers it reads and the head on one card)
     how = getattr(a, "drafting", None) if quant != HY4_Q4 else None
     mtp, mtp_why, dfly, dfly_why = None, "", None, ""
-    base = float(fit.get("need") or 0)
+    # (the faster drafting's start: the block counted on the default's, where it has no room - hy4_fast_drafting_fit)
+    f0 = plain_fit or fit
+    base = float(f0.get("need") or 0)
     usable = float(fit.get("usable") or 0)
     if quant != HY4_Q4 and hy4_mtp_entry() is not None and how != "dfly2":
-        room = base + hy4_mtp_gib(int(fit.get("chunk") or 1024))
-        if fit["layout"] != HY4_STANDARD or room > usable:
+        room = base + hy4_mtp_gib(int(f0.get("chunk") or 1024))
+        if f0["layout"] != HY4_STANDARD or room > usable:
             mtp_why = (f"the draft block needs about {hy4_mtp_gib():.1f} GB of VRAM beside the model's own parts "
                        f"({room:.1f} GB with it at this context, {usable:.1f} GB free on this PC's cards)")
         else:
@@ -9480,11 +9578,17 @@ def set_up_hy4(a, prev: dict) -> Path | None:
                 if "error" not in f and not f.get("kv_streaming") and hy4_dfly2_need_gib(quant, f) <= f["usable"]:
                     dfly_why += f" (at a context of {context_label(c)} it fits: {ME} --setup --context {c})"
                     break
+            if fast_alt:                               # (the opt-in: this context, the cache in 8-bit rows)
+                dfly_why += (f"; with the cache in 8-bit rows it fits at {context_label(fit['context'])}: "
+                             f"{HY4_FAST_DRAFTING_SAID} ({ME} --setup --fast-drafting on)")
         else:
             dfly = hy4_dfly2_step(a, d, quant, models)
             if dfly is None:
                 dfly_why = ("the DFly2 drafter's file is not in the model's folder" +
                             ("" if hy4_dfly2_entry(quant)["published"] else " (it is not published yet)"))
+                if fit.get("fast_drafting"):           # (no drafter: the 8-bit rows would only change the answers)
+                    warn("faster drafting: not set up - " + dfly_why + "; the default start")
+                    fit = plain_fit
     pack = hy4_pack_step(a, d, files, vis, mtp, dfly)  # 6
     step(7, "images (the vision tower)")               # 7
     pictures = hy4_pack_has_vision(pack) and not a.no_vision and bool(fit.get("vision", True))
@@ -9551,7 +9655,8 @@ def set_up_hy4(a, prev: dict) -> Path | None:
                 warn(f"nothing to measure for {HY4} here: only {what} fits on this PC, and it drafts (--drafting off: "
                      "without)")
             had = inst.get("draft_block") if dfly is None else inst.get("dfly2")
-            chose_off = same and had and inst.get("drafting") == "off"
+            # (the faster drafting drafts: its 8-bit rows are there for the drafter)
+            chose_off = same and had and inst.get("drafting") == "off" and not fit.get("fast_drafting")
             drafting = how != "off" if how else not chose_off
             if dfly is None:
                 ok("drafting: Tencent's MTP block drafts tokens and the model checks every one - only tokens the "
@@ -10198,6 +10303,12 @@ def main() -> int:
                          "otherwise), on = draft with it, off = without it - both skip the measuring.  Hy4-Flash's "
                          "sizes: on = the MTP block where it fits in the VRAM, else the size's DFly2 drafter; mtp / "
                          "dfly2 = that one alone (another model: the same as on)")
+    ap.add_argument("--fast-drafting", choices=["on", "off"],
+                    help="Hy4-Flash's sizes on a small card (a setup setting, kept in the config): where the DFly2 "
+                         "drafter has no room beside the cache's F16 rows at the context chosen, on keeps that context "
+                         "with the cache in 8-bit rows so the drafter fits - faster drafting (an 8 GB card at 8K: "
+                         "decoding about +8-27%%), slightly different wording than the default; off = the default "
+                         "(F16 rows, Maya's default answers). Not given: asked where it applies (--yes: the default)")
     ap.add_argument("--no-speed-calibration", action="store_true",
                     help="the same as --drafting on: draft with the drafter without measuring it")
     ap.add_argument("--config", type=Path, help="the installed JSON config to start (its run-maya-<model>.sh does), or "
@@ -10256,6 +10367,9 @@ def main() -> int:
                 say(f"  {i}) {c.name}")
             pick = have[int(ask("Which one?", [str(i) for i in range(1, len(have) + 1)], "1", a.yes)) - 1]
         check_parallel(a, config_family(read_json(pick)))
+        if getattr(a, "fast_drafting", None):   # (a setup setting: the cache's rows are worked out with the context)
+            warn(f"--fast-drafting is a setup setting of Hy4-Flash: {ME} --setup --fast-drafting {a.fast_drafting} "
+                 "sets it up; this start keeps the config as it is")
         if getattr(a, "fast_prefill", None):   # (given on a start too: written into a DeepSeek config, which keeps it)
             cfg = read_json(pick)
             if config_family(cfg) != "deepseek":

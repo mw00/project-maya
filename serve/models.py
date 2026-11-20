@@ -10,10 +10,11 @@ A config's settings, as the page shows them (None: the engine's own default, or 
   CYBER-FROST (the `maya` engine's Qwen path; its server always loads the MTP drafter - "none" is --mtp-max-t 1):
              draft ("mtp" | "none"), expert_cache, prefill, kv ("fp16" | "int8" |
              "k8v4" | "q4_0"), ram_gb (the experts' RAM tier, MAYA_EXPERT_RAM_GB); no images (text only)
-  Hy4-flash (maya-hy4: it stops at a flag it does not know - only its own are written): draft ("mtp" | "none": a
-             pack with the model's MTP block - AngelSlim's Q4_K_M), tp ("auto" | 0: the layers split | a group's
-             size), reserve_gb, prefill_chunk, cpu_threads; images (the pack's mmproj file: --vision off when off);
-             one answer at a time, one cache format
+  Hy4-flash (maya-hy4: it stops at a flag it does not know - only its own are written): draft ("mtp" | "dfly2" |
+             "none": the drafters the pack names), tp ("auto" | 0: the layers split | a group's size), reserve_gb,
+             prefill_chunk, cpu_threads, kv ("auto" | "q8": the latent cache's rows, --kv - 8-bit rows are the setup's
+             opt-in faster drafting on a small card, "f16" kept where a config has it); images (the pack's mmproj
+             file: --vision off when off); one answer at a time
 apply() writes them back into the config's "args", "env", "gpu" and "vision" - its other keys as they are."""
 from __future__ import annotations
 
@@ -65,7 +66,7 @@ DS4_KEYS = ("context", "images", "gpus", "reserve_mib", "env", "parallel", "draf
 MM3_KEYS = ("context", "images", "gpus", "env", "parallel", "draft", "tp", "kv_cache", "kv_streaming", "kv_resident",
             "cpu_threads", "reserve_gb", "prefill_chunk", "cache_gb", "dspark_conf")
 QWEN_KEYS = ("context", "images", "gpus", "reserve_mib", "env", "draft", "expert_cache", "prefill", "kv", "ram_gb")
-HY4_KEYS = ("context", "images", "gpus", "env", "draft", "tp", "reserve_gb", "prefill_chunk", "cpu_threads")
+HY4_KEYS = ("context", "images", "gpus", "env", "draft", "tp", "reserve_gb", "prefill_chunk", "cpu_threads", "kv")
 HY4_KV_BYTES = 13 * (2 * (512 + 64) + 128 * 4 // 4)   # (maya.py's: its cache a context token, on each GPU of a group)
 HY4_Q4_CONTEXTS = [32768, 65536, 131072, 262144]   # AngelSlim's Q4_K_M: the setup's choices for it (maya.py's HY4_Q4_CONTEXTS)
 # (... and its longer ones, up to the model's 1M, where the cache in the engine's smaller rows is at most this share of
@@ -78,8 +79,7 @@ HY4_STREAM_RAM_BYTES = {"f16": 13 * (512 + 64) * 2, "q8": 13 * (512 + 512 // 32 
 # or nothing - is taken as it is: the page sends back what it was shown)
 HY4_OFF = {"parallel": 1, "kv_streaming": False}
 HY4_NOT_YET = {"parallel": "Answers at once: Hy4-Flash answers one request at a time for now",
-               "kv_cache": "KV cache: Hy4-Flash's engine has one cache format",
-               "kv": "KV cache: Hy4-Flash's engine has one cache format",
+               "kv_cache": "KV cache: Hy4-Flash's cache rows are auto or 8-bit (its setting kv)",
                "kv_streaming": "KV streaming: Hy4-Flash's engine turns it on by itself where the context needs it",
                "kv_resident": "KV streaming: Hy4-Flash's engine turns it on by itself where the context needs it"}
 
@@ -409,7 +409,8 @@ def settings_of(cfg: dict) -> dict:
                    draft="mtp" if "--mtp" in [str(a) for a in args] else
                    "dfly2" if "--dfly2" in [str(a) for a in args] else "none",
                    tp="auto" if tp == "auto" else _int(tp, "auto"), reserve_gb=_float(flag(args, "--reserve-gb")),
-                   prefill_chunk=_int(flag(args, "--chunk")), cpu_threads=_int(flag(args, "--cpu-threads")))
+                   prefill_chunk=_int(flag(args, "--chunk")), cpu_threads=_int(flag(args, "--cpu-threads")),
+                   kv=flag(args, "--kv", "auto"))     # (the latent cache's rows: auto, the engine's default)
         return out
     if family(cfg) == "qwen":
         ec, pf = flag(args, "--expert-cache", "auto"), flag(args, "--prefill", "auto")
@@ -626,6 +627,13 @@ def apply(cfg: dict, settings: dict) -> dict:
         args = set_flag(args, "--chunk", ch) if ch is not None else drop_flag(args, "--chunk")
         ct = _num(s, "cpu_threads", 1, 512, "CPU threads")
         args = set_flag(args, "--cpu-threads", ct) if ct is not None else drop_flag(args, "--cpu-threads")
+        # (the latent cache's rows: auto - the engine's default, F16 where they fit - writes no flag; 8-bit rows (the
+        #  setup's opt-in faster drafting: the DFly2 drafter's room on a small card; slightly different wording than
+        #  the default) --kv q8; a config's own --kv f16 stays offered as it is)
+        kv = str(s.get("kv") or "auto")
+        if kv not in ("auto", "q8") and not (kv == "f16" and flag(cfg.get("args") or [], "--kv") == "f16"):
+            raise ValueError("KV cache: auto or 8-bit")
+        args = drop_flag(args, "--kv") if kv == "auto" else set_flag(args, "--kv", kv)
         # (images: on is the engine's default when the pack has the tower - no flag; off gives its room to the model.
         #  On a card with no room for a picture beside the model the engine itself starts text only and says so)
         if s.get("images"):
@@ -1080,7 +1088,8 @@ def hy4_refit(new: dict) -> dict | None:
                            used=hy4_used(gpus),
                            layout=inst.get("layout") or maya.HY4_STANDARD,
                            pictures=flag(args, "--vision") != "off" and hy4_has_vision(new),
-                           drafter=maya.hy4_dfly2_gib(inst.get("hy4_quant") or "") if dfly else 0.0)
+                           drafter=maya.hy4_dfly2_gib(inst.get("hy4_quant") or "") if dfly else 0.0,
+                           kv=flag(args, "--kv"))      # (the config's own rows: --kv q8, the faster drafting's)
     except Exception:  # noqa: BLE001
         return None
     return None if fit.get("error") else fit
@@ -1093,7 +1102,7 @@ def hy4_chunk_again(cfg: dict, new: dict) -> tuple:
     a config whose context the page changes gets that choice again for the new one: the larger chunk never takes a
     picture's room there.  Left as they are: a chunk set by hand - one this save changes, or hy4_chunk_by_hand -
     the standard layout, a save that keeps the context, and what cannot be worked out.  The larger chunk only with
-    the layout's own VRAM kept free and the engine's own choice of rows (the sums of hy4_fit are for those)."""
+    the layout's own VRAM kept free (the sums of hy4_fit are for that), its rows the config's own (--kv: hy4_refit)."""
     args = list(new.get("args") or [])
     if hy4_plain(cfg):
         return args, False
@@ -1110,7 +1119,7 @@ def hy4_chunk_again(cfg: dict, new: dict) -> tuple:
     fit = hy4_refit(new)
     own = base
     if fit and fit.get("chunk"):
-        plain = flag(args, "--kv") is None and _float(flag(args, "--reserve-gb")) == float(plan.get("reserve_gb", -1))
+        plain = _float(flag(args, "--reserve-gb")) == float(plan.get("reserve_gb", -1))   # (its rows: hy4_refit's kv)
         own = int(fit["chunk"]) if plain else base
     if chunk != was:
         # (changed in this save: its user's from now on - unless it is the very one the setup would write here, or
