@@ -2089,7 +2089,7 @@ void plan_experts(const int* ids, int n_used, const uint8_t* base, size_t stride
 // miss lands in may vary from run to run, where it lies does not change what is computed)
 __global__ void __launch_bounds__(1024) fetch_resolve_kernel(const int* __restrict__ ids, int T, int n_used,
                                                              FetchLayer fl, FetchScratch fs, int k_gpu, int cache,
-                                                             float decay) {
+                                                             float decay, int ahead) {
     __shared__ int ent[kMaxWin * 16];
     __shared__ int cnt[1024], miss_e[kMaxWin * 16], vict_e[kMaxWin * 16];
     __shared__ float sc[1024];
@@ -2110,7 +2110,7 @@ __global__ void __launch_bounds__(1024) fetch_resolve_kernel(const int* __restri
             const bool res = fl.slot[e] >= 0;
             const bool mine = res || k_gpu < 0 || g < k_gpu;
             if (!res && mine) ++g;
-            fs.who[i] = mine ? 0 : 1;
+            if (!ahead) fs.who[i] = mine ? 0 : 1;
             if (mine) gpu_e[e] = 1;
             hit += res;
             lane += !mine;
@@ -2125,7 +2125,7 @@ __global__ void __launch_bounds__(1024) fetch_resolve_kernel(const int* __restri
         float v = 0.0f;
         if (cache) {
             v = fl.score[tid] * powf(decay, (float) T) + (float) cnt[tid];
-            fl.score[tid] = v;
+            if (!ahead) fl.score[tid] = v;   // (a guess weighs as the picks would, and is not counted)
         }
         sc[tid] = v;
         kind[tid] = gpu_e[tid] && s < 0 ? 1 : cache && s >= 0 && cnt[tid] == 0 ? 2 : 0;
@@ -2158,7 +2158,7 @@ __global__ void __launch_bounds__(1024) fetch_resolve_kernel(const int* __restri
             fl.owner[sl] = m;
             dst = (unsigned long long) (fl.vram + (size_t) sl * fl.blob);
             atomicAdd(&n_adm, 1);
-        } else {
+        } else if (!ahead) {   // (a guess the cache does not take: not copied)
             const int k = atomicAdd(&n_stage, 1);
             if (k < fs.n_stage) dst = (unsigned long long) (fs.stage + (size_t) k * fl.blob);
         }
@@ -2166,14 +2166,14 @@ __global__ void __launch_bounds__(1024) fetch_resolve_kernel(const int* __restri
             const int f = atomicAdd(&n_fetch, 1);
             fs.src[f] = fl.hptr[m];
             fs.dst[f] = dst;
-            fs.eptr[m] = dst;
-        } else {
+            if (!ahead) fs.eptr[m] = dst;
+        } else if (!ahead) {
             fs.eptr[m] = fl.hptr[m];   // (no slot left: the kernels read it where it lies)
             atomicAdd(&n_zc, 1);
         }
     }
     __syncthreads();
-    if (tid < n_exp && kind[tid] != 1) {
+    if (!ahead && tid < n_exp && kind[tid] != 1) {
         const int s = fl.slot[tid];
         fs.eptr[tid] = gpu_e[tid] && s >= 0 ? (unsigned long long) (fl.vram + (size_t) s * fl.blob) : 0ull;
     }
@@ -2202,8 +2202,8 @@ __global__ void __launch_bounds__(256) fetch_copy_kernel(const unsigned long lon
     }
 }
 void fetch_resolve(const int* ids, int T, int n_used, const FetchLayer& fl, const FetchScratch& fs, int k_gpu,
-                   bool cache, float decay, cudaStream_t s) {
-    fetch_resolve_kernel<<<1, 1024, 0, s>>>(ids, T, n_used, fl, fs, k_gpu, cache ? 1 : 0, decay);
+                   bool cache, float decay, cudaStream_t s, bool ahead) {
+    fetch_resolve_kernel<<<1, 1024, 0, s>>>(ids, T, n_used, fl, fs, k_gpu, cache ? 1 : 0, decay, ahead ? 1 : 0);
     check("fetch_resolve");
 }
 void fetch_copy(const FetchScratch& fs, size_t blob, int blocks, cudaStream_t s) {

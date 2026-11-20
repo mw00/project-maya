@@ -378,9 +378,13 @@ struct Gpu {
     int* pmap = nullptr;        // (... each expert's slot in them, -1: not this pass's)
     // (the GPU fetch: its scratch and staging slots, the copies' stream and its two events - the resolve done, the
     //  copies done)
-    k::FetchScratch fxs;
+    k::FetchScratch fxs, fxa[2];   // (fxa: the look-ahead's copies - a later layer's guessed misses; a pair by the
+                                   //  layer's parity: one is listed while the other's copies may still run)
+    float* fx_rl = nullptr;      // (... its router's logits on this layer's input, its picks and weights)
+    int* fx_ids = nullptr;
+    float* fx_rw = nullptr;
     cudaStream_t fxst = nullptr;
-    cudaEvent_t fx_ev0 = nullptr, fx_ev1 = nullptr;
+    cudaEvent_t fx_ev0 = nullptr, fx_ev1 = nullptr, fx_ev2 = nullptr;
     // (tensor parallel with the CPU lane: the member's own pinned routing, bounce and map; its thread streams its share)
     int* hs_ids = nullptr;
     uint8_t* hs_stage = nullptr;
@@ -795,6 +799,7 @@ struct Model::Impl {
             cudaSetDevice(gp.dev);
             if (gp.fx_ev0) cudaEventDestroy(gp.fx_ev0);
             if (gp.fx_ev1) cudaEventDestroy(gp.fx_ev1);
+            if (gp.fx_ev2) cudaEventDestroy(gp.fx_ev2);
             if (gp.fxst) cudaStreamDestroy(gp.fxst);
             for (void* p : gp.allocs) cudaFree(p);
             if (gp.blas) cublasDestroy(gp.blas);
@@ -4658,6 +4663,8 @@ struct Model::Impl {
         int mode = 0;            // the one running: 0 the lane (or off), 1 gpu, 2 mix
         int k = 0;               // mix: each token's experts a layer on the GPU beyond the VRAM ones
         bool cache = true;       // gpu: the slots follow the routing (HY4_FETCH_CACHE=0: they stay as loaded)
+        bool ahead = false;      // gpu: the next layer's misses guessed (its router on this layer's FFN input) and
+                                 //  copied into its cache while this one runs (HY4_FETCH_AHEAD=1; being measured)
         float decay = 0.0f;      // the scores' fading a token
         int blocks = 0;          // fetch_copy's blocks
         int n_stage = 0;         // the staging slots a window (the prompt's: gp.stage)
@@ -4741,6 +4748,7 @@ struct Model::Impl {
         };
         fx.k = k;
         fx.cache = num("HY4_FETCH_CACHE", 1.0) != 0.0;
+        fx.ahead = num("HY4_FETCH_AHEAD", 0.0) != 0.0;
         fx.decay = (float) std::exp(-1.0 / std::max(1.0, num("HY4_FETCH_HORIZON", 256.0)));
         std::vector<Layer*> ls;
         size_t blob = 0;
@@ -4875,15 +4883,22 @@ struct Model::Impl {
             CK(cudaSetDevice(gp.dev));
             k::FetchScratch& s = gp.fxs;
             if (!gp.alloc(s.eptr, 1024, err) || !gp.alloc(s.who, (size_t) W * 16, err) || !gp.alloc(s.src, (size_t) W * 16, err) ||
-                !gp.alloc(s.dst, (size_t) W * 16, err) || !gp.alloc(s.nf, 1, err) || !gp.alloc(s.stats, 8, err))
+                !gp.alloc(s.dst, (size_t) W * 16, err) || !gp.alloc(s.nf, 1, err) || !gp.alloc(s.stats, 16, err) ||
+                !gp.alloc(gp.fxa[0].src, (size_t) W * 16, err) || !gp.alloc(gp.fxa[0].dst, (size_t) W * 16, err) ||
+                !gp.alloc(gp.fxa[1].src, (size_t) W * 16, err) || !gp.alloc(gp.fxa[1].dst, (size_t) W * 16, err) ||
+                !gp.alloc(gp.fxa[1].nf, 1, err) ||
+                !gp.alloc(gp.fxa[0].nf, 1, err) || !gp.alloc(gp.fx_rl, (size_t) W * g.n_expert, err) ||
+                !gp.alloc(gp.fx_ids, (size_t) W * 16, err) || !gp.alloc(gp.fx_rw, (size_t) W * 16, err))
                 return false;
             s.stage = gp.stage;
             s.n_stage = std::min(kStage, W * 16);
             fx.n_stage = s.n_stage;
-            CK(cudaMemset(s.stats, 0, sizeof(unsigned long long) * 8));
+            CK(cudaMemset(s.stats, 0, sizeof(unsigned long long) * 16));
+            gp.fxa[0].stats = gp.fxa[1].stats = s.stats + 8;
             CK(cudaStreamCreateWithFlags(&gp.fxst, cudaStreamNonBlocking));
             CK(cudaEventCreateWithFlags(&gp.fx_ev0, cudaEventDisableTiming));
             CK(cudaEventCreateWithFlags(&gp.fx_ev1, cudaEventDisableTiming));
+            CK(cudaEventCreateWithFlags(&gp.fx_ev2, cudaEventDisableTiming));
             int sms = 0;
             cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, gp.dev);
             fx.blocks = std::max(fx.blocks, (int) num("HY4_FETCH_BLOCKS", 2.0 * std::max(1, sms)));
@@ -4931,9 +4946,10 @@ struct Model::Impl {
         cudaEvent_t a, b;
         CK(cudaEventCreate(&a));
         CK(cudaEventCreate(&b));
-        k::fetch_copy(gp.fxs, l.blob, fx.blocks, gp.s);
+        for (int r = 0; r < 2; ++r) k::fetch_copy(gp.fxs, l.blob, fx.blocks, gp.s);   // (the pages mapped first)
+        CK(cudaStreamSynchronize(gp.s));
         CK(cudaEventRecord(a, gp.s));
-        for (int r = 0; r < 3; ++r) k::fetch_copy(gp.fxs, l.blob, fx.blocks, gp.s);
+        for (int r = 0; r < 4; ++r) k::fetch_copy(gp.fxs, l.blob, fx.blocks, gp.s);
         CK(cudaEventRecord(b, gp.s));
         CK(cudaEventSynchronize(b));
         float ms = 0.0f;
@@ -4942,7 +4958,7 @@ struct Model::Impl {
         cudaEventDestroy(b);
         const unsigned zero = 0;
         CK(cudaMemcpy(gp.fxs.nf, &zero, sizeof zero, cudaMemcpyHostToDevice));
-        gbs = ms > 0.0f ? 3.0 * n * (double) l.blob / 1e6 / ms : 0.0;
+        gbs = ms > 0.0f ? 4.0 * n * (double) l.blob / 1e6 / ms : 0.0;
         return true;
     }
     // a token window's picks of layer l resolved and the GPU's misses copied (on the fetch stream, beside the layer's
@@ -4964,6 +4980,32 @@ struct Model::Impl {
         k::fetch_copy(gp.fxs, l.blob, fx.blocks, gp.fxst);
         CK(cudaEventRecord(gp.fx_ev1, gp.fxst));
         if (cache) fx.dirty = true;
+        return true;
+    }
+    // gpu's look-ahead: layer nl's router on this layer's FFN input (gp.xf) - a guess at its picks - and the guessed
+    // misses its cache takes copied on the fetch stream behind this layer's own copies, so they cross the bus while
+    // this layer computes; nl's own resolve then finds them in VRAM (a wrong guess costs the copy and the slot only:
+    // what is computed is the same)
+    bool fetch_ahead(Layer& nl, Gpu& gp, int T, std::string& err) {
+        if (!mm(gp, nl.router, gp.xf, g.n_embd, T, gp.fx_rl, g.n_expert)) {
+            err = "layer " + std::to_string(nl.il) + ": the look-ahead's router did not take its shapes";
+            return false;
+        }
+        k::router(gp.fx_rl, T, g.n_expert, nl.router_b, g.n_used, g.w_norm, g.w_scale, gp.fx_ids, gp.fx_rw, gp.s);
+        k::FetchLayer fl;
+        fl.slot = nl.slot_d;
+        fl.owner = nl.fx_owner;
+        fl.score = nl.fx_score;
+        fl.hptr = nl.fx_hptr;
+        fl.vram = nl.experts;
+        fl.blob = nl.blob;
+        fl.n_res = nl.n_res;
+        fl.n_exp = g.n_expert;
+        k::FetchScratch& fa = gp.fxa[nl.il & 1];
+        k::fetch_resolve(gp.fx_ids, T, g.n_used, fl, fa, -1, true, fx.decay, gp.s, true);
+        CK(cudaEventRecord(gp.fx_ev2, gp.s));
+        CK(cudaStreamWaitEvent(gp.fxst, gp.fx_ev2, 0));
+        k::fetch_copy(fa, nl.blob, fx.blocks, gp.fxst);
         return true;
     }
     // the host's slot tables read back from the devices (gpu's cache moves them): before a prompt chunk
@@ -5005,19 +5047,21 @@ struct Model::Impl {
                          "layers, %.2f ms of the GPU's layers, %.2f ms wall\n", fx.p_tok, fx.p_host * 1e3 / fx.p_tok,
                          fx.p_gpu * 1e3 / fx.p_tok, fx.p_wall * 1e3 / fx.p_tok);
         if (fx.layers == 0) return;
-        unsigned long long t[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+        unsigned long long t[16] = {0};
         for (Gpu& gp : G) {
             if (!gp.fxs.stats) continue;
-            unsigned long long v[8];
+            unsigned long long v[16];
             cudaSetDevice(gp.dev);
             if (cudaMemcpy(v, gp.fxs.stats, sizeof v, cudaMemcpyDeviceToHost) != cudaSuccess) continue;
-            for (int i = 0; i < 8; ++i) t[i] += v[i];
+            for (int i = 0; i < 16; ++i) t[i] += v[i];
         }
         if (t[0] == 0) return;
         const double n = (double) t[0];
         std::fprintf(stderr, "maya-hy4: GPU fetch (%s): %llu routed picks in its layers - %.1f%% in VRAM, %.1f%% on the "
-                     "CPU lane; %llu experts copied over the bus (%llu of them into the cache), %llu read in place\n",
-                     fetch_name(fx.mode), t[0], 100.0 * (double) t[1] / n, 100.0 * (double) t[4] / n, t[2], t[5], t[3]);
+                     "CPU lane; %llu experts copied over the bus (%llu of them into the cache), %llu read in place; the "
+                     "look-ahead: %llu guessed picks, %llu copied ahead\n",
+                     fetch_name(fx.mode), t[0], 100.0 * (double) t[1] / n, 100.0 * (double) t[4] / n, t[2], t[5], t[3],
+                     t[8], t[10]);
     }
     void count_routes(int il, int T) {
         std::lock_guard<std::mutex> lk(cnt_mu);   // (q4x_builder copies the counts)
@@ -5377,6 +5421,10 @@ struct Model::Impl {
             //  below - gpu: no lane, no wait; mix: the lane takes the entries fetch_resolve left it)
             const bool fxl = fx.mode != 0 && l.fx_on && T <= W && l.tpm < 0;
             if (fxl && !fetch_layer(l, gp, T, err)) return false;
+            if (fxl && fx.mode == 1 && fx.cache && fx.ahead && (size_t) l.il + 1 < L.size()) {
+                Layer& nl = L[(size_t) l.il + 1];
+                if (nl.fx_on && nl.gpu == l.gpu && !nl.dense && nl.tpm < 0 && !fetch_ahead(nl, gp, T, err)) return false;
+            }
             const bool lane_on = l.partial() && !(fxl && fx.mode == 1);
             if (!lane_on && lead && !o.profile_out.empty()) {   // (the profile: this layer's routes as well)
                 CK(cudaMemcpyAsync(h_ids, gp.ids, sizeof(int) * T * nu, cudaMemcpyDeviceToHost, s));

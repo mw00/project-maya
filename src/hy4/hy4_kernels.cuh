@@ -150,8 +150,10 @@ struct FetchScratch {
 /// when `cache`, else into a staging slot, else read in place); k_gpu >= 0 - the VRAM experts and each token's first
 /// k_gpu others (in pick order) this GPU's, copied into staging slots, the rest the CPU lane's (who); the slots kept
 /// (no cache).  decay: the scores' fading a token.  One block.
+/// ahead: the picks are a guess at a later layer's (its router on this layer's input) - only the misses the cache
+/// takes are listed (copied ahead of the layer), nothing else is written, the scores are left as they are
 void fetch_resolve(const int* ids, int T, int n_used, const FetchLayer& fl, const FetchScratch& fs, int k_gpu,
-                   bool cache, float decay, cudaStream_t s);
+                   bool cache, float decay, cudaStream_t s, bool ahead = false);
 /// The copies fetch_resolve listed (pinned RAM -> VRAM, blob bytes each) by `blocks` blocks
 void fetch_copy(const FetchScratch& fs, size_t blob, int blocks, cudaStream_t s);
 /// out[t] = sum_j w[t][j] part[t * 16 + j] (part rows of n; the plan form: part[j], T 1) - entries of weight 0 skipped
