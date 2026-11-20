@@ -143,6 +143,66 @@ __global__ void __launch_bounds__(256) gemv_rows_kernel(const W* __restrict__ w,
     acc = block_sum(acc);
     if (threadIdx.x == 0) y[(size_t) c * ldy + row] = alpha * acc;
 }
+// (a row's 4 weights at k index i: W F32 or BF16)
+template <typename W>
+__device__ __forceinline__ float4 gemv4_w(const W* __restrict__ wr, int i) {
+    float4 wv;
+    if constexpr (sizeof(W) == 2) {
+        const uint2 p = *(const uint2*) (wr + i);
+        wv.x = __uint_as_float(p.x << 16);
+        wv.y = __uint_as_float(p.x & 0xffff0000u);
+        wv.z = __uint_as_float(p.y << 16);
+        wv.w = __uint_as_float(p.y & 0xffff0000u);
+    } else {
+        wv = *(const float4*) (wr + i);
+    }
+    return wv;
+}
+// AMD, a window's columns: gemv4_kernel's sums with x's columns staged in shared memory 1024 values at a time - the
+// block's 8 rows read x there, where every row re-read it from the caches (a verify window's 4 columns put the router's
+// F32 rows at a quarter of the memory's speed on a Radeon; one column gains nothing from it).  Each lane's steps, their
+// order and the warp's sum are gemv4_kernel's: the same bits.
+template <typename W, int NC>
+__global__ void __launch_bounds__(256) gemv4s_kernel(const W* __restrict__ w, size_t ld, int k, int n,
+                                                     const float* __restrict__ x, size_t ldx, int ncol,
+                                                     float* __restrict__ y, size_t ldy, float alpha) {
+    constexpr int KC = 1024;
+    __shared__ float4 xs[NC][KC / 4];
+    const int row = blockIdx.x * 8 + (threadIdx.x >> 5), lane = threadIdx.x & 31;
+    const int c0 = blockIdx.y * NC;
+    const bool live = row < n;
+    const W* wr = w + (size_t) (live ? row : 0) * ld;
+    float acc[NC];
+#pragma unroll
+    for (int c = 0; c < NC; ++c) acc[c] = 0.0f;
+    for (int k0 = 0; k0 < k; k0 += KC) {
+        const int kq = min(KC, k - k0) / 4;   // (k a multiple of 128)
+        __syncthreads();
+        for (int idx = (int) threadIdx.x; idx < NC * kq; idx += (int) blockDim.x) {
+            const int c = idx / kq, q = idx - c * kq;
+            xs[c][q] = c0 + c < ncol ? *(const float4*) (x + (size_t) (c0 + c) * ldx + k0 + 4 * q)
+                                     : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        }
+        __syncthreads();
+        if (!live) continue;
+#pragma unroll 4
+        for (int i = lane * 4; i < 4 * kq; i += 128) {
+            const float4 wv = gemv4_w(wr, k0 + i);
+#pragma unroll
+            for (int c = 0; c < NC; ++c)
+                if (c0 + c < ncol) {
+                    const float4 xv = xs[c][i / 4];
+                    acc[c] = fmaf(wv.w, xv.w, fmaf(wv.z, xv.z, fmaf(wv.y, xv.y, fmaf(wv.x, xv.x, acc[c]))));
+                }
+        }
+    }
+    if (!live) return;
+#pragma unroll
+    for (int c = 0; c < NC; ++c) {
+        const float v = warp_sum(acc[c]);
+        if (lane == 0 && c0 + c < ncol) y[(size_t) (c0 + c) * ldy + row] = alpha * v;
+    }
+}
 // ... 16-byte loads (4 values a lane a step, rows and columns 16-byte aligned, k a multiple of 128): a column's sums in
 // the same order whatever NC, so a window's rows are a token's bits
 template <typename W, int NC>
@@ -186,6 +246,17 @@ void gemv(const W* w, size_t ld, int k, int n, const float* x, size_t ldx, int n
     static const bool old = std::getenv("HY4_GEMV_OLD") != nullptr;
     const bool v4 = !old && n >= 128 && k % 128 == 0 && ld % 8 == 0 && ldx % 4 == 0 && ((uintptr_t) w & 15) == 0 &&
                     ((uintptr_t) x & 15) == 0;
+#if defined(STRATA_USE_HIP)
+    if (v4 && ncol > 1) {   // (AMD, a window's columns: x staged in shared memory - the same sums; one column: below)
+        const dim3 b(256), g1((unsigned) ((n + 7) / 8), 1);
+        if (ncol <= 4) gemv4s_kernel<W, 4><<<g1, b, 0, s>>>(w, ld, k, n, x, ldx, ncol, y, ldy, alpha);
+        else
+            gemv4s_kernel<W, 8><<<dim3((unsigned) ((n + 7) / 8), (unsigned) ((ncol + 7) / 8)), b, 0, s>>>(
+                w, ld, k, n, x, ldx, ncol, y, ldy, alpha);
+        check("gemv4s");
+        return;
+    }
+#endif
     if (v4) {
         const dim3 b(256), g1((unsigned) ((n + 7) / 8), 1);
         if (ncol == 1) gemv4_kernel<W, 1><<<g1, b, 0, s>>>(w, ld, k, n, x, ldx, ncol, y, ldy, alpha);
@@ -247,7 +318,8 @@ __device__ __forceinline__ void hc_part_body(int t, int b, const float* __restri
     const int w = threadIdx.x >> 5, l = threadIdx.x & 31;
 #pragma unroll
     for (int j = 0; j <= kMaxM; ++j) {
-        const float v = warp_sum(acc[j]);
+        // (the sums past nm are zeros: written as such without their shuffles - the same bits)
+        const float v = j < nm || j == kMaxM ? warp_sum(acc[j]) : 0.0f;
         if (l == 0) sh[w][j] = v;
     }
     __syncthreads();
@@ -523,15 +595,18 @@ constexpr int kKC = 128, kKCmin = 32, kTile = 32;   // (a chunk's keys: kKC, or 
 constexpr int kRowW = 288;   // words a row (kv_lora 512 + rope 64, F16)
 // (Q8: the cache's Q8_0 rows of rb bytes - the latent's int8 values, its 16 blocks' F16 scales, the rotated part's F16
 // values -, dequantized to F16 as the tile is loaded: the same arithmetic after it)
-template <bool Q8>
-__global__ void __launch_bounds__(256) attn_kernel(const float* __restrict__ q, int H, const void* __restrict__ cache_v,
-                                                   int ring, const int* __restrict__ keys, int ldk,
-                                                   const int* __restrict__ lo, const int* __restrict__ nk, float scale,
-                                                   int nchunk, int kc, float* __restrict__ ws, int rb) {
+// HB: the heads a block (a warp each; grid y ceil(H / HB)) - every head's sums the same whichever HB, only the tiles a
+// key is read into: 8 (NVIDIA), 32 on AMD (a gathered key read once for 32 heads rather than 4 times: the indexed
+// layers' prompt attention past the dense span and the decode steps' attention are bound by those reads on a Radeon)
+template <bool Q8, int HB = 8>
+__global__ void __launch_bounds__(32 * HB) attn_kernel(const float* __restrict__ q, int H, const void* __restrict__ cache_v,
+                                                       int ring, const int* __restrict__ keys, int ldk,
+                                                       const int* __restrict__ lo, const int* __restrict__ nk, float scale,
+                                                       int nchunk, int kc, float* __restrict__ ws, int rb) {
     __shared__ __half2 tile[kTile][kRowW];
     __shared__ int rows[kTile];
     const int c = blockIdx.x, t = blockIdx.z, w = threadIdx.x >> 5, lane = threadIdx.x & 31;
-    const int h = blockIdx.y * 8 + w;
+    const int h = blockIdx.y * HB + w;
     const int n = nk[t], k0 = c * kc, k1 = min(n, k0 + kc);
     float qr[18];
     if (h < H) {
@@ -1074,6 +1149,36 @@ __global__ void to_f16_kernel(const float* __restrict__ src, size_t lds, int n, 
     if (i >= total) return;
     const size_t r = i / n, c = i % n;
     dst[r * ldd + c] = __float2half_rn(src[r * lds + c]);
+}
+// The same conversions a row at a time (grid y: the rows, a stride gridDim.y), 4 values a thread - for AMD, where the
+// one-value kernel's 64-bit division a value made it slower than the memory (the prompt's queries a sub-batch, the
+// GEMMs' inputs).  Rows 16-byte aligned in src, 8 in dst; the same values written.
+__global__ void to_f16_rows_kernel(const float* __restrict__ src, size_t lds, int n, __half* __restrict__ dst, size_t ldd,
+                                   int rows) {
+    const int c = (int) (blockIdx.x * blockDim.x + threadIdx.x) * 4;
+    if (c >= n) return;
+    for (int r = (int) blockIdx.y; r < rows; r += (int) gridDim.y) {
+        const float* sp = src + (size_t) r * lds + c;
+        __half* dp = dst + (size_t) r * ldd + c;
+        if (c + 4 <= n) {
+            const float4 v = *(const float4*) sp;
+            *(__half2*) dp = __floats2half2_rn(v.x, v.y);
+            *(__half2*) (dp + 2) = __floats2half2_rn(v.z, v.w);
+        } else {
+            for (int j = 0; c + j < n; ++j) dp[j] = __float2half_rn(sp[j]);
+        }
+    }
+}
+// (the row kernel's threads a block: a row's 4-value groups rounded up to a warp, 256 at most)
+inline int rows_threads(int n) { return std::min(256, ((n + 3) / 4 + 31) / 32 * 32); }
+// (whether the row kernel takes these operands: AMD only - NVIDIA keeps the one-value kernel)
+inline bool f16_rows_form(const void* src, size_t lds, const void* dst, size_t ldd) {
+#if defined(STRATA_USE_HIP)
+    return ((uintptr_t) src & 15) == 0 && lds % 4 == 0 && ((uintptr_t) dst & 7) == 0 && ldd % 4 == 0;
+#else
+    (void) src, (void) lds, (void) dst, (void) ldd;
+    return false;
+#endif
 }
 // one block: the counts, their scan, the scatter (the order within an expert does not change a row's sums)
 __global__ void __launch_bounds__(1024) moe_sort_kernel(const int* __restrict__ ids, int n_ent, int n_exp,
@@ -1636,6 +1741,21 @@ size_t attn_ws_floats(int T, int H, int kv_lora, int max_keys) {
     return std::max((size_t) T * H * ((max_keys + kKC - 1) / kKC),
                     (size_t) kMaxWin * H * ((max_keys + kKCmin - 1) / kKCmin)) * (kv_lora + 2);
 }
+namespace {
+// attn_kernel's heads a block: 8 on NVIDIA, 32 on AMD (HY4_ATTN_HB=8 / 16 / 32 sets it there - the same sums)
+int attn_heads_a_block() {
+#if defined(STRATA_USE_HIP)
+    static const int hb = [] {
+        const char* e = std::getenv("HY4_ATTN_HB");
+        const int v = e ? std::atoi(e) : 32;
+        return v == 8 || v == 16 ? v : 32;
+    }();
+    return hb;
+#else
+    return 8;
+#endif
+}
+}  // namespace
 void attention(const float* q, int T, int H, int kv_lora, int n_rot, const uint16_t* cache, int ring, const int* keys,
                int ldk, const int* lo, const int* nk, int max_keys, float scale, const float* sinks, float* ws,
                float* out, cudaStream_t s, bool q8) {
@@ -1647,12 +1767,19 @@ void attention(const float* q, int T, int H, int kv_lora, int n_rot, const uint1
     // (every window of the token path - a decode step, a draft's verify window - in chunks of kKCmin: a token's sums are
     // the same whichever window it is in, so drafting does not change a greedy answer)
     const int kc = T <= kMaxWin ? kKCmin : kKC, nchunk = (max_keys + kc - 1) / kc;
-    const dim3 grid((unsigned) nchunk, (unsigned) ((H + 7) / 8), (unsigned) T);
-    if (q8)
-        attn_kernel<true><<<grid, 256, 0, s>>>(q, H, cache, ring, keys, ldk, lo, nk, scale, nchunk, kc, ws,
-                                               (int) kv_q8_row_bytes(kv_lora, n_rot));
-    else
-        attn_kernel<false><<<grid, 256, 0, s>>>(q, H, cache, ring, keys, ldk, lo, nk, scale, nchunk, kc, ws, 0);
+    const int rb = q8 ? (int) kv_q8_row_bytes(kv_lora, n_rot) : 0;
+    const int hb = attn_heads_a_block();
+    const dim3 grid((unsigned) nchunk, (unsigned) ((H + hb - 1) / hb), (unsigned) T);
+    if (hb == 32) {
+        if (q8) attn_kernel<true, 32><<<grid, 1024, 0, s>>>(q, H, cache, ring, keys, ldk, lo, nk, scale, nchunk, kc, ws, rb);
+        else attn_kernel<false, 32><<<grid, 1024, 0, s>>>(q, H, cache, ring, keys, ldk, lo, nk, scale, nchunk, kc, ws, rb);
+    } else if (hb == 16) {
+        if (q8) attn_kernel<true, 16><<<grid, 512, 0, s>>>(q, H, cache, ring, keys, ldk, lo, nk, scale, nchunk, kc, ws, rb);
+        else attn_kernel<false, 16><<<grid, 512, 0, s>>>(q, H, cache, ring, keys, ldk, lo, nk, scale, nchunk, kc, ws, rb);
+    } else {
+        if (q8) attn_kernel<true><<<grid, 256, 0, s>>>(q, H, cache, ring, keys, ldk, lo, nk, scale, nchunk, kc, ws, rb);
+        else attn_kernel<false><<<grid, 256, 0, s>>>(q, H, cache, ring, keys, ldk, lo, nk, scale, nchunk, kc, ws, 0);
+    }
     check("attention");
     attn_combine_kernel<<<dim3((unsigned) H, (unsigned) T), 512, 0, s>>>(H, nchunk, kc, nk, sinks, ws, out);
     check("attn_combine");
@@ -1893,6 +2020,13 @@ void kv_pick(const uint16_t* cache, int ring, size_t row_bytes, const int* keys,
 void to_f16(const float* src, size_t lds, int rows, int n, uint16_t* dst, size_t ldd, cudaStream_t s) {
     const size_t total = (size_t) rows * n;
     if (total == 0) return;
+    if (f16_rows_form(src, lds, dst, ldd)) {
+        const int b = rows_threads(n);
+        const dim3 g((unsigned) (((n + 3) / 4 + b - 1) / b), (unsigned) std::min(rows, 65535));
+        to_f16_rows_kernel<<<g, b, 0, s>>>(src, lds, n, (__half*) dst, ldd, rows);
+        check("to_f16");
+        return;
+    }
     to_f16_kernel<<<(unsigned) ((total + 255) / 256), 256, 0, s>>>(src, lds, n, (__half*) dst, ldd, total);
     check("to_f16");
 }

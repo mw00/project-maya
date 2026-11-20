@@ -20,6 +20,7 @@
 #include "hy4_pack.hpp"
 #include "hy4_plan.hpp"
 #include "../ds4/ds4_iq.cuh"
+#include "../ds4/ds4_lt.hpp"
 
 #include <atomic>
 #include <cublas_v2.h>
@@ -45,6 +46,7 @@
 namespace hy4 {
 
 namespace iq = strata::ds4::gguf::iq;
+namespace lt = strata::ds4::lt;
 
 extern "C" void quantize_row_q4_K_ref(const float* x, void* y, int64_t k);   // (ggml-quants: ggml's own Q4_K rounding)
 // (ggml-quants' row decoders: a token's embedding row in the K types - the host reads one row a token)
@@ -2265,6 +2267,10 @@ struct Model::Impl {
             return false;
         }
         if (!pk.load(o.pack, err)) return false;
+        {   // (AMD: the prompt GEMMs' measured kernels - the pack's lt-picks.txt, or HY4_LT_STORE's file; empty: none kept)
+            const char* ls = std::getenv("HY4_LT_STORE");
+            lt::set_store(ls != nullptr ? ls : (o.pack + "/lt-picks.txt").c_str());
+        }
         g = pk.g;
         if (o.max_ctx <= 0 || o.max_ctx > g.context) o.max_ctx = g.context;
         o.max_ctx = (o.max_ctx + g.ix_kpool - 1) / g.ix_kpool * g.ix_kpool;
@@ -2817,6 +2823,27 @@ struct Model::Impl {
     // (tests: the layers' time by kind, synced at each step; the names with a leading space are parts of "ffn, experts")
     const bool prof = (lane_prof().on = std::getenv("HY4_PROF") != nullptr);
     std::map<std::string, double> prof_acc;
+    // (a step inside a layer's half, synced: the names with a leading space; part0 starts the clock)
+    double prof_mark = 0.0;
+    void part0(Gpu& gp) {
+        if (!prof) return;
+        cudaStreamSynchronize(gp.s);
+        prof_mark = now_s();
+    }
+    void part(Gpu& gp, const char* what, int T) {
+        if (!prof) return;
+        cudaStreamSynchronize(gp.s);
+        const double t = now_s();
+        prof_acc[std::string(" ") + what + (T > W ? " (prompt)" : " (token)")] += t - prof_mark;
+        prof_mark = t;
+    }
+    // AMD: the prompt path's FP16 GEMMs on hipBLASLt, each shape's fastest kernel measured on this GPU (ds4_lt, as
+    // maya-ds4's and maya-mm3's prompt GEMMs) - hipBLAS's FP16 GEMM is several times slower on a Radeon.  HY4_LT=0:
+    // hipBLAS for all of them, as before.  (CUDA: ds4_lt's functions take nothing, cuBLAS as ever.)
+    const bool lt_on = [] {
+        const char* e = std::getenv("HY4_LT");
+        return e == nullptr || std::atoi(e) != 0;
+    }();
     void prof_report() {
         double all = 0;
         for (const auto& [k2, v] : prof_acc)
@@ -2969,6 +2996,7 @@ struct Model::Impl {
         for (int r0 = 0; r0 < M.n; r0 += band) {
             const int nb = std::min(band, M.n - r0);
             if (!iq::f16_rows(M.type, M.w + (size_t) r0 * M.ld, M.k, nb, gp.wband, M.k, gp.s)) return false;
+            if (lt_on && alpha == 1.0f && lt::gemm(gp.s, gp.wband, nb, M.k, gp.xh16, M.k, T, y + r0, (int) ldy)) continue;
             if (cublasGemmEx(gp.blas, CUBLAS_OP_T, CUBLAS_OP_N, nb, T, M.k, &alpha, gp.wband, CUDA_R_16F, M.k, gp.xh16,
                              CUDA_R_16F, M.k, &beta, y + r0, CUDA_R_32F, (int) ldy, CUBLAS_COMPUTE_32F,
                              CUBLAS_GEMM_DEFAULT) != CUBLAS_STATUS_SUCCESS)
@@ -2985,12 +3013,35 @@ struct Model::Impl {
             if (!iq::f16_rows(M.type, M.w, M.k, M.n * H, gp.wband, M.k, gp.s)) return false;
             k::to_f16(x, ldt, T, (int) (ldh * (H - 1) + M.k), gp.xh16, ldt, gp.s);
             const float one = 1.0f, zero = 0.0f;
+            if (lt_on) {   // (AMD: a head a product - false at the first head: the BLAS's batched GEMM for them all)
+                int h = 0;
+                while (h < H && lt::gemm(gp.s, gp.wband + (size_t) h * per, M.n, M.k, gp.xh16 + (size_t) h * ldh, (int) ldt,
+                                         T, y + (size_t) h * ldyh, (int) ldyt))
+                    ++h;
+                if (h == H) return true;
+            }
             return cublasGemmStridedBatchedEx(gp.blas, CUBLAS_OP_T, CUBLAS_OP_N, M.n, T, M.k, &one, gp.wband,
                                               CUDA_R_16F, M.k, (long long) per, gp.xh16, CUDA_R_16F, (int) ldt,
                                               (long long) ldh, &zero, y, CUDA_R_32F, (int) ldyt, (long long) ldyh, H,
                                               CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT) == CUBLAS_STATUS_SUCCESS;
         }
         k::q8_heads(x, ldt, ldh, T, H, M.k, gp.xq, gp.xd, gp.s);
+#if defined(STRATA_USE_HIP)
+        {   // (AMD: every head in one launch - the same rows' sums as the jobs below, 8 heads a launch)
+            iq::MvJob j;
+            j.w = M.w;
+            j.ld = M.ld;
+            j.type = M.type;
+            j.k = M.k;
+            j.n = M.n;
+            j.ncol = T;
+            j.xq = gp.xq;
+            j.xd = gp.xd;
+            j.y = y;
+            j.ycs = ldyt;
+            if (iq::mv_heads(j, H, (size_t) M.n * M.ld, (size_t) T * M.k, (size_t) T * M.k / 32, ldyh, gp.s)) return true;
+        }
+#endif
         std::vector<iq::MvJob> jobs((size_t) H);
         for (int h = 0; h < H; ++h) {
             iq::MvJob& j = jobs[(size_t) h];
@@ -3050,18 +3101,27 @@ struct Model::Impl {
         k::to_f16(gp.qcat + (size_t) t0 * H * KR, KR, ts * H, KR, gp.xh16, KR, gp.s);
         const int ldS = (nkr + 7) / 8 * 8;
         const float one = 1.0f, zero = 0.0f;
-        if (cublasGemmEx(gp.blas, CUBLAS_OP_T, CUBLAS_OP_N, nkr, ts * H, KR, &one, K, CUDA_R_16F, KR, gp.xh16,
+        const int Tp = W + 1;   // (the profile's names: a prompt step)
+        part(gp, "attn: the keys and queries as FP16", Tp);
+        if (!(lt_on && lt::gemm_loose(gp.s, K, nkr, KR, gp.xh16, KR, ts * H, gp.sS, ldS)) &&
+            cublasGemmEx(gp.blas, CUBLAS_OP_T, CUBLAS_OP_N, nkr, ts * H, KR, &one, K, CUDA_R_16F, KR, gp.xh16,
                          CUDA_R_16F, KR, &zero, gp.sS, CUDA_R_32F, ldS, CUBLAS_COMPUTE_32F,
                          CUBLAS_GEMM_DEFAULT) != CUBLAS_STATUS_SUCCESS)
             return false;
+        part(gp, "attn: scores GEMM", Tp);
         if (!l.swa && !all)
             k::dsa_mask(gp.keys + (size_t) t0 * maxk, maxk, gp.knk + t0, ts, (int) k0, nkr, gp.dmask, (size_t) dense_max,
                         gp.s);
         k::attn_softmax(gp.sS, ldS, ts, H, nkr, (int) k0, gp.pos + t0, window, gp.dmask, (size_t) dense_max, scale, l.sinks,
                         gp.sP, ldS, gp.s);
-        return cublasGemmEx(gp.blas, CUBLAS_OP_N, CUBLAS_OP_N, KL, ts * H, nkr, &one, K, CUDA_R_16F, KR, gp.sP,
-                            CUDA_R_16F, ldS, &zero, gp.o + (size_t) t0 * H * KL, CUDA_R_32F, KL, CUBLAS_COMPUTE_32F,
-                            CUBLAS_GEMM_DEFAULT) == CUBLAS_STATUS_SUCCESS;
+        part(gp, "attn: mask and softmax", Tp);
+        const bool ok =
+            (lt_on && lt::gemm_n(gp.s, K, KR, KL, nkr, gp.sP, ldS, ts * H, gp.o + (size_t) t0 * H * KL, KL, true)) ||
+            cublasGemmEx(gp.blas, CUBLAS_OP_N, CUBLAS_OP_N, KL, ts * H, nkr, &one, K, CUDA_R_16F, KR, gp.sP, CUDA_R_16F,
+                         ldS, &zero, gp.o + (size_t) t0 * H * KL, CUDA_R_32F, KL, CUBLAS_COMPUTE_32F,
+                         CUBLAS_GEMM_DEFAULT) == CUBLAS_STATUS_SUCCESS;
+        part(gp, "attn: values GEMM", Tp);
+        return ok;
     }
 
     // A prompt sub-batch's attention over its tokens' picks past the dense span (tokens t0 .. t0 + ts - 1 of an indexed
@@ -3171,6 +3231,7 @@ struct Model::Impl {
     bool attn_core(Layer& l, Gpu& gp, int T, int64_t p0, std::string& err, int tpm = -1, unsigned v = 0) {
         const int E = g.n_embd, H = l.H, KL = g.kv_lora, R = g.rope, KR = g.kv_row(), nope = g.nope();
         cudaStream_t s = gp.s;
+        part0(gp);
         bool ok = l.ix ? mm_multi(gp, {{&l.q_a, gp.qa, (size_t) g.q_lora}, {&l.kv_a, gp.kvr, (size_t) KR},
                                        {&l.gate, gp.g, (size_t) H * g.v_mla}, {&l.ix_k, gp.ik, (size_t) g.ix_dim}},
                                   gp.xa, E, T)
@@ -3180,6 +3241,7 @@ struct Model::Impl {
         dbg("q_resid", l.il, gp, gp.qr, T, g.q_lora);
         if (inject) ref_cmp("q_resid", l.il, gp, gp.qr, (size_t) T * g.q_lora, T);
         ok = ok && mm(gp, l.q_b, gp.qr, g.q_lora, T, gp.q, (size_t) H * g.k_mla);
+        part(gp, "attn: q_a, kv_a, gate, q_b", T);
         k::kv_store(gp.kvr, T, KL, R, l.kv_a_norm, g.eps, gp.pos, l.base, l.kv, l.res > 0 ? l.res : l.ring, s, kv_q8,
                     l.hs());
         if (l.res > 0) l.hi = std::max(l.hi, p0 + T);
@@ -3189,6 +3251,7 @@ struct Model::Impl {
         dbg("q_pe", l.il, gp, gp.q, (size_t) T * H, g.k_mla, R, nope);
         ok = ok && mm_heads(gp, l.k_b, gp.q, (size_t) H * g.k_mla, g.k_mla, T, H, gp.qcat, (size_t) H * KR, KR);
         k::copy_cols(gp.q + nope, g.k_mla, gp.qcat + KL, KR, T * H, R, s);
+        part(gp, "attn: kv store, rope, k_b", T);
         const float scale = 1.0f / std::sqrt((float) g.k_mla);
         if (l.ix) {
             // the indexer: its query, the window's pooling rows, the groups they complete, every token's picks
@@ -3210,6 +3273,7 @@ struct Model::Impl {
             ok = ok && mm(gp, l.ix_proj, gp.xa, E, T, gp.wt, IH, 1.0f / std::sqrt((float) D * IH));
             dbg("indexer_weights", l.il, gp, gp.wt, T, IH);
             if (!kv_q8) dbg("indexer_pool_k", l.il, gp, l.pooled, (size_t) g1, D);
+            part(gp, "attn: the indexer's projections and pools", T);
             const int npool_ld = (int) (o.max_ctx / KP + 1), maxk = g.ix_top_k + KP;
             const int top = g.ix_top_k / KP - 1;
             // the prompt path's scores as GEMMs past ix_gemm_from (ix_score_gemm): the pooled keys in F16 for them -
@@ -3351,7 +3415,9 @@ struct Model::Impl {
                         k::ix_unpack(wire + (size_t) a * ixw_ld, ixw_ld, b - a, gp.pos + a, KP, top,
                                      gp.keys + (size_t) a * maxk, maxk, gp.knk + a, s);
                 }
+                part(gp, "attn: the indexer's scores and picks", T);
                 for (int t0 = 0; t0 < T; t0 += kSub) attend(t0, std::min(kSub, T - t0));
+                part(gp, "attn: gathering kernel", T);
             } else {
                 for (int t0 = 0; t0 < T; t0 += kSub) {   // (the scores of kSub tokens at a time)
                     const int ts = std::min(kSub, T - t0);
@@ -3367,7 +3433,9 @@ struct Model::Impl {
                         continue;
                     }
                     pick(t0, ts);
+                    part(gp, "attn: the indexer's scores and picks", T);
                     attend(t0, ts);
+                    part(gp, "attn: gathering kernel", T);
                 }
             }
             if (sparse_stat && T > W && sparse_attn && p0 + T > dense_max)
@@ -3387,14 +3455,18 @@ struct Model::Impl {
                 if (T > W && attn_prompt(l, gp, t0, ts, p0, false, scale, dq)) continue;
                 k::attention(gp.qcat + (size_t) t0 * H * KR, ts, H, KL, R, l.kv, l.ring, nullptr, 0, gp.lo + t0,
                              gp.nk + t0, g.n_swa, scale, l.sinks, gp.ws, gp.o + (size_t) t0 * H * KL, s, kv_q8);
+                part(gp, "attn: gathering kernel", T);
             }
         }
+        part0(gp);
         ok = ok && mm_heads(gp, l.v_b, gp.o, (size_t) H * KL, KL, T, H, gp.ob, (size_t) H * g.v_mla, g.v_mla);
+        part(gp, "attn: v_b", T);
         dbg("attn_kqv", l.il, gp, gp.ob, T, (size_t) H * g.v_mla);
         if (inject) ref_cmp("attn_kqv", l.il, gp, gp.ob, (size_t) T * H * g.v_mla, T);
         k::sigmoid_mul(gp.ob, gp.g, (size_t) T * H * g.v_mla, s);
         dbg("attn_gated", l.il, gp, gp.ob, T, (size_t) H * g.v_mla);
         ok = ok && mm(gp, l.wo, gp.ob, (size_t) H * g.v_mla, T, gp.y, E);
+        part(gp, "attn: gate and output", T);
         if (!ok) err = "layer " + std::to_string(l.il) + ": a GEMV the kernels do not take";
         return ok;
     }
@@ -3625,6 +3697,7 @@ struct Model::Impl {
                       int n_slots = -1, bool accumulate = false) {
         const int lat = g.n_lat, nu = g.n_used, ne = slot ? (n_slots >= 0 ? n_slots : l.n_res) : g.n_expert;
         cudaStream_t s = gp.s;
+        part0(gp);
         k::moe_sort(gp.ids, T, nu, g.n_expert, gp.bounds, gp.stok, gp.srow, s, slot, nullptr, ne);
         if (ne == 0) {   // (no expert of the set here: the zeros, or nothing to add)
             if (!accumulate) k::moe_combine(gp.sy, gp.srow, gp.rw, T, nu, lat, gp.latout, s);
@@ -3635,6 +3708,7 @@ struct Model::Impl {
         CK(cudaStreamSynchronize(s));
         int max_rows = 0;
         for (int e = 0; e < ne; ++e) max_rows = std::max(max_rows, b[(size_t) e + 1] - b[(size_t) e]);
+        part(gp, "experts: sort", T);
         iq::SetArgs a;
         a.wbase = wbase ? wbase : l.experts;
         a.stride = l.blob;
@@ -3660,6 +3734,7 @@ struct Model::Impl {
             err = "layer " + std::to_string(l.il) + ": the experts' gate / up sets did not run";
             return false;
         }
+        part(gp, "experts: gate / up sets", T);
         iq::SetArgs d = a;
         d.xf = nullptr;
         d.idx = nullptr;
@@ -3672,7 +3747,9 @@ struct Model::Impl {
             err = "layer " + std::to_string(l.il) + ": the experts' down sets did not run";
             return false;
         }
+        part(gp, "experts: down sets", T);
         k::moe_combine(gp.sy, gp.srow, gp.rw, T, nu, lat, gp.latout, s, accumulate);
+        part(gp, "experts: combine", T);
         return true;
     }
 

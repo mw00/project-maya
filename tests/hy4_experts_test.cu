@@ -79,7 +79,8 @@ struct Expert {
 
 float silu(float x) { return x / (1.0f + std::exp(-x)); }
 
-void run_case(int tg, int td, int n_exp, int T, std::mt19937& rng, int F = 1536) {
+// (lane false: the GPU forms alone - the draws added for the forms' bits, the CPU lane's tolerance is not their test)
+void run_case(int tg, int td, int n_exp, int T, std::mt19937& rng, int F = 1536, bool lane = true) {
     const int E = 1536, nu = 4;
     const float limit = 10.0f;
     const size_t gb = iq::row_bytes(tg, E) * F, db = iq::row_bytes(td, F) * E;
@@ -270,40 +271,54 @@ void run_case(int tg, int td, int n_exp, int T, std::mt19937& rng, int F = 1536)
             cudaFree(gs);
             cudaFree(ge);
             cudaFree(ng);
-            // token 0 alone through the token form: the same bits as its row of the window's (drafting relies on it)
+            // every token alone through the token form: the same bits as its row of the window's (drafting relies on
+            // it: a verify window's rows must be the rows the tokens get one at a time)
             {
-                std::vector<float> win((size_t) E), one((size_t) E);
-                CU(cudaMemcpy(win.data(), dout, sizeof(float) * E, cudaMemcpyDeviceToHost));
+                std::vector<float> win((size_t) T * E), one((size_t) E);
+                CU(cudaMemcpy(win.data(), dout, sizeof(float) * T * E, cudaMemcpyDeviceToHost));
                 unsigned long long* plan;
                 float* d1;
                 CU(cudaMalloc(&plan, sizeof(unsigned long long) * 16));
                 CU(cudaMalloc(&d1, sizeof(float) * E));
-                iq::Args b = a;
-                b.grp_ptr = nullptr;
-                b.grp_start = nullptr;
-                b.grp_ent = nullptr;
-                b.n_groups = nullptr;
-                hy4::k::plan_experts(dids, nu, dw, blob, plan, s);
-                b.plan_ptr = plan;
-                b.xq = dq;
-                b.xd = dd;
-                CHECK(iq::gate_up(b, nu, 1, s));
-                hy4::k::q8_rows(dh, F, nu, F, dhq, dhd, s);
-                b.hq = dhq;
-                b.hd = dhd;
-                CHECK(iq::down(b, nu, 1, s));
-                hy4::k::moe_sum(dpart, 1, nu, E, dw_, d1, s);
-                CU(cudaMemcpy(one.data(), d1, sizeof(float) * E, cudaMemcpyDeviceToHost));
                 int diff = 0;
-                for (int i = 0; i < E; ++i) diff += std::memcmp(&win[(size_t) i], &one[(size_t) i], 4) != 0;
-                std::printf("  token form vs window form (%d tokens), token 0: %d of %d values differ\n", T, diff, E);
+                double worst = 0;
+                for (int t = 0; t < T; ++t) {
+                    iq::Args b = a;
+                    b.grp_ptr = nullptr;
+                    b.grp_start = nullptr;
+                    b.grp_ent = nullptr;
+                    b.n_groups = nullptr;
+                    hy4::k::plan_experts(dids + (size_t) t * nu, nu, dw, blob, plan, s);
+                    b.plan_ptr = plan;
+                    b.xq = dq + (size_t) t * E;
+                    b.xd = dd + (size_t) t * E / 32;
+                    CHECK(iq::gate_up(b, nu, 1, s));
+                    hy4::k::q8_rows(dh, F, nu, F, dhq, dhd, s);
+                    b.hq = dhq;
+                    b.hd = dhd;
+                    CHECK(iq::down(b, nu, 1, s));
+                    hy4::k::moe_sum(dpart, 1, nu, E, dw_ + (size_t) t * nu, d1, s);
+                    CU(cudaMemcpy(one.data(), d1, sizeof(float) * E, cudaMemcpyDeviceToHost));
+                    for (int i = 0; i < E; ++i)
+                        if (std::memcmp(&win[(size_t) t * E + i], &one[(size_t) i], 4) != 0) {
+                            ++diff;
+                            worst = std::max(worst, (double) std::fabs(win[(size_t) t * E + i] - one[(size_t) i]) /
+                                                        std::max(1e-30, (double) std::fabs(one[(size_t) i])));
+                        }
+                }
+                std::printf("  token form vs window form, types %s/%s, %d tokens: %d of %d values differ (worst rel %.1e)\n",
+                            iq::name(tg), iq::name(td), T, diff, T * E, worst);
+                CHECK(diff == 0);
                 cudaFree(plan);
                 cudaFree(d1);
             }
         }
         CU(cudaMemcpy(out.data(), dout, sizeof(float) * T * E, cudaMemcpyDeviceToHost));
         const double r = rel(out);
-        std::printf("  token/window form, types %s/%s, %d tokens: rel %.2e\n", iq::name(tg), iq::name(td), T, r);
+        uint32_t hsh = 2166136261u;   // (the bits' FNV-1a: two builds' sums side by side)
+        for (size_t i = 0; i < out.size() * 4; ++i) hsh = (hsh ^ ((const uint8_t*) out.data())[i]) * 16777619u;
+        std::printf("  token/window form, types %s/%s, %d tokens: rel %.2e bits %08x\n", iq::name(tg), iq::name(td), T, r,
+                    hsh);
         CHECK(r < 2e-3);
     }
     // the prompt form: the sets over every expert's sorted rows
@@ -363,7 +378,7 @@ void run_case(int tg, int td, int n_exp, int T, std::mt19937& rng, int F = 1536)
         cudaFree(h16);
     }
     // the CPU lane: the same experts from host memory (each role's rows back to back, as a GGUF stacks them)
-    {
+    if (lane) {
         std::vector<uint8_t> hg((size_t) n_exp * gb), hu((size_t) n_exp * gb), hd((size_t) n_exp * db);
         for (int e = 0; e < n_exp; ++e) {
             const uint8_t* b = host.data() + (size_t) e * blob;
@@ -431,6 +446,13 @@ void mv_columns(int type, std::mt19937& rng) {
             } else if (type == iq::kQ6_K) {
                 p[bb - 2] = 0x00;
                 p[bb - 1] = 0x20;
+            } else if (type == iq::kQ4_K || type == iq::kQ5_K) {
+                // (d and dmin with full mantissas: powers of two would make the minimum term's products exact, and
+                //  every rounding order the same bits)
+                p[0] = 0x55;
+                p[1] = 0x21;
+                p[2] = 0x33;
+                p[3] = 0x11;
             } else {
                 p[0] = 0x00;
                 p[1] = 0x20;
@@ -473,6 +495,9 @@ void mv_columns(int type, std::mt19937& rng) {
         CU(cudaMemcpy(y.data(), dy, y.size() * 4, cudaMemcpyDeviceToHost));
         if (nc == 1) {
             y1 = y;
+            uint32_t hsh = 2166136261u;
+            for (size_t i = 0; i < y.size() * 4; ++i) hsh = (hsh ^ ((const uint8_t*) y.data())[i]) * 16777619u;
+            std::printf("  mv %s: one column, bits %08x\n", iq::name(type), hsh);
             continue;
         }
         int diff = 0;
@@ -480,6 +505,7 @@ void mv_columns(int type, std::mt19937& rng) {
             for (int r = 0; r < n; ++r) diff += std::memcmp(&y[(size_t) c * n + r], &y1[(size_t) r], 4) != 0;
         std::printf("  mv %s: column 0 alone vs in %d columns: %d of %d values differ\n", iq::name(type), nc, diff,
                     n * ((nc + 1) / 2));
+        CHECK(diff == 0);
     }
     cudaFree(dw);
     cudaFree(dx);
@@ -527,6 +553,19 @@ int main() {
         return 0;
     }
     std::mt19937 rng(7);
+    // HY4_EXPERTS_K=N: the K-quants' forms alone, N draws (two builds' bits side by side: the minimum term's rounding)
+    if (const char* e = std::getenv("HY4_EXPERTS_K")) {
+        for (int rep = 0; rep < std::atoi(e); ++rep)
+            for (int ty : {iq::kQ4_K, iq::kQ5_K}) {
+                for (int F : {512, 1536}) run_case(ty, iq::kQ6_K, 24, 1, rng, F, false);
+                run_case(ty, ty, 24, 1, rng, 512, false);
+                run_case(ty, ty, 24, 3, rng, 512, false);
+                std::mt19937 rng2(7 + rep);
+                mv_columns(ty, rng2);
+            }
+        std::printf("hy4_experts_test (K-quants): %s\n", fails ? "FAILED" : "ok");
+        return fails ? 1 : 0;
+    }
     const int types[3][2] = {{iq::kQ4_K, iq::kQ6_K}, {iq::kQ4_K, iq::kQ4_K}, {iq::kQ8_0, iq::kQ8_0}};
     for (const auto& tt : types) {
         CHECK(iq::expert_supported(tt[0]) && iq::expert_supported(tt[1]));
@@ -544,7 +583,18 @@ int main() {
     for (int ty : {iq::kIQ2_XXS, iq::kIQ2_S, iq::kIQ3_XXS, iq::kIQ4_XS, iq::kQ5_K}) {
         CHECK(iq::expert_supported(ty));
         for (int T : {1, 5, 16, 80}) run_case(ty, ty, 24, T, rng);
+        std::mt19937 rng2(7);
+        mv_columns(ty, rng2);
     }
+    // the verify windows' sizes (a token and 1 .. 3 drafts), the types of Maya's sizes
+    for (int ty : {iq::kIQ2_XXS, iq::kIQ3_XXS, iq::kIQ4_XS, iq::kQ4_K, iq::kQ5_K, iq::kQ8_0})
+        for (int T : {2, 3, 4}) run_case(ty, ty, 24, T, rng, 512, false);
+    // (the K-quants' minimum term in the gate / up alone, the down's type without one: a few draws of the token form)
+    for (int rep = 0; rep < 4; ++rep)
+        for (int ty : {iq::kQ4_K, iq::kQ5_K}) {
+            run_case(ty, iq::kQ6_K, 24, 1, rng, 512, false);
+            run_case(ty, iq::kQ6_K, 24, 3, rng, 512, false);
+        }
     std::printf("hy4_experts_test: %s\n", fails ? "FAILED" : "ok");
     return fails ? 1 : 0;
 }
