@@ -113,12 +113,49 @@ void router(const float* logits, int T, int n_exp, const float* bias, int n_used
 /// grp_ptr[g] = base + expert * stride, grp_start[g .. g + 1] its entries in grp_ent, *n_groups
 /// slot (null: none): each expert's slot among the VRAM ones (base + slot stride), -1 for the CPU lane's - those entries
 /// are left out and their weight w[t][j] zeroed (the lane adds their part)
+/// (eptr, the GPU fetch's: each expert's blob wherever it lies - a VRAM slot, a staging slot, pinned RAM - 0 for none
+///  of this GPU's; who [T][n_used], when given: 1 for an entry the CPU lane computes - left out, its weight zeroed -
+///  so one expert may run here for one token and on the lane for another; slot is not read then)
 void group_experts(const int* ids, int T, int n_used, int n_exp, const uint8_t* base, size_t stride,
                    unsigned long long* grp_ptr, int* grp_start, int* grp_ent, int* n_groups, cudaStream_t s,
-                   const int* slot = nullptr, float* w = nullptr);
+                   const int* slot = nullptr, float* w = nullptr, const unsigned long long* eptr = nullptr,
+                   const int* who = nullptr);
 /// ... a token's alone (ds4_iq's plan form): plan[j] = base + ids[j] * stride
 void plan_experts(const int* ids, int n_used, const uint8_t* base, size_t stride, unsigned long long* plan,
-                  cudaStream_t s, const int* slot = nullptr, float* w = nullptr);
+                  cudaStream_t s, const int* slot = nullptr, float* w = nullptr,
+                  const unsigned long long* eptr = nullptr, const int* who = nullptr);
+
+/// The GPU fetch (a token window's routed experts that VRAM does not hold, computed by this GPU from a copy of the
+/// layer's experts in pinned RAM): one layer's device state and a GPU's scratch for it
+struct FetchLayer {
+    int* slot = nullptr;         // [n_exp] each expert's VRAM slot (-1: none) - the layer's slot table, kept current
+    int* owner = nullptr;        // [n_res] each slot's expert
+    float* score = nullptr;      // [n_exp] each expert's decayed picks (the cache's: a miss takes the slot of the
+                                 //  lowest scored expert not picked in the window when it scores higher)
+    const unsigned long long* hptr = nullptr;   // [n_exp] each expert's blob in pinned RAM, as this GPU addresses it
+    uint8_t* vram = nullptr;     // the layer's VRAM slots
+    size_t blob = 0;
+    int n_res = 0, n_exp = 0;
+};
+struct FetchScratch {
+    unsigned long long* eptr = nullptr;   // [n_exp] (out) the window's experts' blobs where this GPU reads them
+    int* who = nullptr;                   // [kMaxWin][16] (out) 1: the entry is the CPU lane's
+    unsigned long long *src = nullptr, *dst = nullptr;   // [kMaxWin x 16] (out) the copies to make, *nf of them
+    unsigned* nf = nullptr;
+    uint8_t* stage = nullptr;             // n_stage staging slots (blob apart) for misses the cache does not take
+    int n_stage = 0;
+    unsigned long long* stats = nullptr;  // [8] (summed) picks, VRAM hits, copied, read in place, the lane's, admitted
+};
+/// The window's picks resolved: k_gpu < 0 - every entry this GPU's (a miss copied into the slot of a colder expert
+/// when `cache`, else into a staging slot, else read in place); k_gpu >= 0 - the VRAM experts and each token's first
+/// k_gpu others (in pick order) this GPU's, copied into staging slots, the rest the CPU lane's (who); the slots kept
+/// (no cache).  decay: the scores' fading a token.  One block.
+/// ahead: the picks are a guess at a later layer's (its router on this layer's input) - only the misses the cache
+/// takes are listed (copied ahead of the layer), nothing else is written, the scores are left as they are
+void fetch_resolve(const int* ids, int T, int n_used, const FetchLayer& fl, const FetchScratch& fs, int k_gpu,
+                   bool cache, float decay, cudaStream_t s, bool ahead = false);
+/// The copies fetch_resolve listed (pinned RAM -> VRAM, blob bytes each) by `blocks` blocks
+void fetch_copy(const FetchScratch& fs, size_t blob, int blocks, cudaStream_t s);
 /// out[t] = sum_j w[t][j] part[t * 16 + j] (part rows of n; the plan form: part[j], T 1) - entries of weight 0 skipped
 void moe_sum(const float* part, int T, int n_used, int n, const float* w, float* out, cudaStream_t s);
 /// Duplicate each row: dst[2 r] = dst[2 r + 1] = src[r] (int8 rows of k with their scales: the grouped form's input

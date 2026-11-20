@@ -76,6 +76,12 @@ struct CpuExperts {
     strata::ds4::gguf::IqCpu f;
     const uint8_t *gate = nullptr, *up = nullptr, *down = nullptr;
     size_t g_stride = 0, d_stride = 0;   // bytes an expert in the gate / up tensors, in the down tensor
+    // (0: g_stride / d_stride) the step from one expert's matrix to the next's - the GPU fetch's RAM store, where an
+    // expert's three matrices lie side by side in one blob (gate, up, down at its offsets): the blob's bytes
+    size_t step = 0;
+    const uint8_t* G(size_t e) const { return gate + e * (step ? step : g_stride); }
+    const uint8_t* U(size_t e) const { return up + e * (step ? step : g_stride); }
+    const uint8_t* D(size_t e) const { return down + e * (step ? step : d_stride); }
     float limit = 0.0f;
     std::shared_ptr<Q4xSet> q4x;         // (null: no copies for this layer)
     size_t q4x_gu = 0, q4x_d = 0;        // the form's bytes of an expert's gate (= up) matrix, its down matrix
@@ -122,6 +128,10 @@ void place_experts(const CpuExperts& ex, const std::vector<int>& experts, int no
 /// a page, or the disk.  ram_available: the RAM the system can still give, file cache included (0: not known).
 void warm_experts(const CpuExperts& ex, const std::vector<int>& experts, const std::atomic<bool>& stop);
 uint64_t ram_available();
+/// The GPU fetch's RAM copy of a layer's experts: `bytes` of zeroed memory of the process's own (Linux: anonymous,
+/// transparent huge pages asked for; Windows: committed pages), null when the system gives none; ram_free gives it back
+void* ram_alloc(size_t bytes);
+void ram_free(void* p, size_t bytes);
 /// the calling thread below the others (a background helper: nice 10 on Linux, below normal on Windows)
 void lower_this_thread();
 /// the calling thread on every CPU the process may run on (Linux: a thread inherits the mask of the thread that
