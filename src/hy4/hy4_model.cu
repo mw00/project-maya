@@ -309,6 +309,7 @@ struct Gpu {
     //  attention's query: evf the two chains' common input ready, evj the picks made; its GEMVs' int8 rows apart)
     cudaStream_t s4 = nullptr;
     cudaEvent_t evf = nullptr, evj = nullptr;
+    bool ixf = false, atf = false;   // (this GPU's forks: the indexer's, the window layers' - fork_wanted)
     int8_t* xq4 = nullptr;
     float* xd4 = nullptr;
     cudaStream_t s2 = nullptr;  // (... a member's side stream: the routing copied out beside its experts)
@@ -2055,7 +2056,9 @@ struct Model::Impl {
             err = "GPU " + std::to_string(gp.dev) + ": cuBLAS did not start";
             return false;
         }
-        if (!gp.s4) {
+        gp.ixf = fork_wanted(gp.dev, ix_fork);
+        gp.atf = fork_wanted(gp.dev, attn_fork);
+        if (!gp.s4 && (gp.ixf || gp.atf)) {
             CK(cudaStreamCreateWithFlags(&gp.s4, cudaStreamNonBlocking));
             CK(cudaEventCreateWithFlags(&gp.evf, cudaEventDisableTiming));
             CK(cudaEventCreateWithFlags(&gp.evj, cudaEventDisableTiming));
@@ -2879,7 +2882,7 @@ struct Model::Impl {
         // (a token window's layer without an indexer: the query's chain - q_a, its norm, q_b, the rotation, k_b - on the
         //  stream, the cache's row and the gate - kv_a and the gate's GEMVs, kv_store - beside it on the side stream,
         //  joined before the attention.  The same GEMVs a job each: the same sums.  HY4_ATTN_FORK=0: one launch, in line)
-        const bool afork = !l.ix && T <= W && attn_fork && gp.s4 != nullptr && !dump && !inject;
+        const bool afork = !l.ix && T <= W && gp.atf && gp.s4 != nullptr && !dump && !inject;
         bool ok = true;
         if (afork) {
             Gpu gi = gp;
@@ -2905,7 +2908,7 @@ struct Model::Impl {
         // (a token window's indexer on its own stream from here - HY4_IX_FORK=0: in line.  Both chains are short kernels,
         //  each waiting for the one before it; side by side the layer waits for the longer one only.  The same kernels
         //  on the same inputs: the same picks)
-        const bool fork = l.ix && T <= W && ix_fork && gp.s4 != nullptr && !dump && !inject;
+        const bool fork = l.ix && T <= W && gp.ixf && gp.s4 != nullptr && !dump && !inject;
         if (fork) {
             CK(cudaEventRecord(gp.evf, s));
             CK(cudaStreamWaitEvent(gp.s4, gp.evf, 0));
@@ -3496,8 +3499,31 @@ struct Model::Impl {
     // state; stops after a draft below `floor`.  The MTP cache's rows at pos .. are rewritten by the next forward.
     // HY4_MTP_EAGER=1: every window's MTP rows at its end, as before (the drafts' first step alone)
     const bool mtp_eager = std::getenv("HY4_MTP_EAGER") != nullptr;
-    const bool ix_fork = !(std::getenv("HY4_IX_FORK") && std::atoi(std::getenv("HY4_IX_FORK")) == 0);
-    const bool attn_fork = !(std::getenv("HY4_ATTN_FORK") && std::atoi(std::getenv("HY4_ATTN_FORK")) == 0);
+    // (the token path's second stream: HY4_IX_FORK / HY4_ATTN_FORK =0 off, =1 on; unset: fork_wanted's pick by the GPU)
+    static int env_tri(const char* n) {
+        const char* e = std::getenv(n);
+        return e == nullptr || *e == 0 ? -1 : std::atoi(e) != 0 ? 1 : 0;
+    }
+    const int ix_fork = env_tri("HY4_IX_FORK");
+    const int attn_fork = env_tri("HY4_ATTN_FORK");
+    // Whether a GPU's token windows take the second stream (set: as set).  Its joins cost a few microseconds each, the
+    // chains it overlaps are short kernels: measured slower on Volta (three V100s, tensor parallel, a token a window:
+    // -17%), so off there; on the newer GPUs it was measured on, on.  The same sums either way.
+    static bool fork_wanted(int dev, int set) {
+        if (set >= 0) return set == 1;
+        cudaDeviceProp p{};
+        if (cudaGetDeviceProperties(&p, dev) != cudaSuccess) {
+            (void) cudaGetLastError();
+            return false;
+        }
+#if defined(STRATA_USE_HIP) && defined(_WIN32)
+        return false;   // (Windows' HIP submits queued work only at a host wait: no second stream there untested)
+#elif defined(STRATA_USE_HIP)
+        return true;
+#else
+        return p.major >= 8;
+#endif
+    }
     const bool mtp_full = std::getenv("HY4_MTP_FULL") != nullptr;
     // the last draft's first step: its token and position - the MTP cache's row there is the model's (the trunk's state
     // before it, that token), so a window that starts with them leaves it
