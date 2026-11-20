@@ -471,6 +471,11 @@ void cpu_experts(Lane& lane, const CpuExperts& ex, const std::vector<CpuEntry>& 
         return lp.on ? std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count() : 0.0;
     };
     const double tp0 = clk();
+    LaneCount& lcm = lane_count();
+    const int qmode = lcm.q4x_mode.load(std::memory_order_relaxed);
+    const bool trial = qmode == 2 && T == 1;
+    const bool use_q4 = qmode == 1 || (trial && (++lcm.trial_tick & 1));
+    const auto tt0 = trial ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     thread_local Scratch tls;
     Scratch& sc = tls;   // (the caller's: the workers use it through this reference, never their own thread_local)
     sc.h.resize((size_t) n * F);
@@ -511,7 +516,7 @@ void cpu_experts(Lane& lane, const CpuExperts& ex, const std::vector<CpuEntry>& 
         const int e = entries[(size_t) sc.order[(size_t) i]].e;
         int j = i;
         while (j < n && entries[(size_t) sc.order[(size_t) j]].e == e) ++j;
-        const uint8_t* q4 = ex.q4x ? ex.q4x->p[(size_t) e].load(std::memory_order_acquire) : nullptr;
+        const uint8_t* q4 = ex.q4x && use_q4 ? ex.q4x->p[(size_t) e].load(std::memory_order_acquire) : nullptr;
         for (int a = i; a < j; a += gn) groups.push_back({e, a, std::min(gn, j - a), q4});
         i = j;
     }
@@ -581,6 +586,12 @@ void cpu_experts(Lane& lane, const CpuExperts& ex, const std::vector<CpuEntry>& 
         LaneCount& lc = lane_count();
         lc.entries.fetch_add(n, std::memory_order_relaxed);
         if (nq) lc.q4x.fetch_add(nq, std::memory_order_relaxed);
+        if (trial) {
+            const int k = use_q4 ? 1 : 0;
+            lc.trial_s[k] += std::chrono::duration<double>(std::chrono::steady_clock::now() - tt0).count();
+            lc.trial_entries[k] += n;
+            ++lc.trial_calls[k];
+        }
     }
     if (lp.on) {
         lp.prep_s += tp1 - tp0;

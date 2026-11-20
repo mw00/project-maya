@@ -105,6 +105,12 @@ LaneProf& lane_prof();
 /// cpu_experts' entries so far, and how many of them ran on 4-bit copies (always counted)
 struct LaneCount {
     std::atomic<long long> entries{0}, q4x{0};
+    // whether calls use the 4-bit copies: 1 yes, 0 no, 2 a trial - one-token calls in turns with and without them,
+    // each side's time and entries summed (the engine's thread alone writes these: trial_*[1] with the copies)
+    std::atomic<int> q4x_mode{1};
+    long long trial_calls[2] = {0, 0}, trial_entries[2] = {0, 0};
+    double trial_s[2] = {0, 0};
+    unsigned long long trial_tick = 0;
 };
 LaneCount& lane_count();
 
