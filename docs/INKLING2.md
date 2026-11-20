@@ -119,8 +119,87 @@ in memory are read from the SSD. A ~150 GB pack in the shape of Maya's DeepSeek 
 dense weights GPTQ'd at 5-6 bits) is the target for a 160 GB pool; unsloth's KLD (0.092 against their BF16 file,
 which keeps the experts' original bits) is the bar.
 
-## 6. Next
+## 6. Phase 2: the engine, `maya-ik2`
 
-1. Kernels for the new ops, each against the reference's seams: the attention (relative bias, sink, window,
-   clips, log scaling), the convs, the attention residual, the expert scale + softcapped SwiGLU.
-2. The engine: weights from the GGUF, the expert tiers, KV, decode and prefill.
+`src/ik2/` runs unsloth's GGUFs in place (UD-Q4_K_XL: NVFP4 experts in layers 0-39; UD-Q3_K_XL: IQ3_XXS / IQ4_XS),
+CUDA on Linux, Ampere on. Built by CMake beside the other engines (`maya-ik2`, and `ik2_kernels_test` with
+`STRATA_BUILD_TESTS`); a 90 in `CMAKE_CUDA_ARCHITECTURES` builds sm_90a for the Hopper attention.
+
+**Where the weights sit.** The dense weights (attention, router, head: ~4.7 B) are decoded once to FP16 in VRAM. The
+routed experts stay as the GGUF holds them, all of them in pinned host memory (the files are read and registered
+in place, a layer at a time: 48 s from NVMe for UD-Q4_K_XL), and the GPU keeps a cache of them in what VRAM is left
+(`--cache-gb`). The host needs the experts' size in RAM: ~323 GiB for UD-Q4_K_XL, ~260 GiB for UD-Q3_K_XL.
+
+**Prompts** go through layer by layer in passes of up to 16,384 tokens, so a pass copies each expert it misses
+once; the next layer's likely experts are copied while this one runs, and a pass evicts its own experts first
+(scan resistance) instead of flushing the cache. `IK2_WARM` fills the cache at load with the experts tokens pick
+most (a profile written with `IK2_POP_OUT`). The attention is one fused kernel (relative bias, sinks, sliding window
+and clips; FP16 MMA, and wgmma on Hopper).
+
+**Decode** is bound by the PCIe link (~47 expert misses a token on the H200). `IK2_CPU=1` computes a missing
+expert on the CPU when that is sooner than its copy (NVFP4 experts, AVX-512).
+
+**Two GPUs** (`--gpus 2`): `IK2_EP=1` deals each layer's experts to both by how often they are picked
+(`IK2_EP_SPLIT`, GPU 1's share), each GPU with its own cache and link; attention and the KV cache stay on GPU 0.
+Without it the layers are split between the GPUs.
+
+**Serving.** `--serve` speaks Maya's engine protocol (`serve/server.py`'s `StrataEngine`: `INFO`, `READY <ctx> stop`,
+`GEN`, `PP`, `T`, `DONE`, `STOP`), keeps the conversation's cache for its next turn, and ends a request at
+`<|content_model_end_sampling|>` and `<|endoftext|>` (`--eos` to change). The server side:
+
+- `tools/ik2/chat_template.jinja` is thinkingmachines' own template (the GGUF carries the conversion's, which
+  differs). `ChatTemplate` recognizes it (`.inkling`): the thinking level by its names (`none` .. `max`; thinking off
+  is `none`, Auto its default 0.9), a past call's arguments given as a JSON string (OpenAI's form; the template
+  refuses one) parsed into an object, `None` content as "".
+- The model writes typed segments rather than tags - `<|content_thinking|>`, `<|content_text|>`, a call as
+  `<|message_model|>NAME<|content_invoke_tool_json|>{"name": .., "args": {..}}<|end_message|>`.
+  `InklingRewriter` turns them, as they stream, into what `OutputParser` reads (DeepSeek's and MiniMax's path).
+- A required tool call (`tool_choice`) opens in its own form; a picture is refused in plain words (no vision
+  tower yet).
+- `tools/strata_tokenizer.py` reads the tokenizer under both names unsloth's files give its pre-tokenizer (`gpt-4o`,
+  `inkling`): 442 strings against the model's own `tokenizer.json`, all equal, with both files.
+
+To run it (no setup in `maya.py` yet):
+
+    python tools/strata_tokenizer.py --gguf Inkling-2-Small-UD-Q4_K_XL-00001-of-00009.gguf --out ik2 \
+        --chat-template tools/ik2/chat_template.jinja --check
+    cat > ik2.json <<EOF
+    {"exe": "build/maya-ik2", "args": ["--model", "Inkling-2-Small-UD-Q4_K_XL-00001-of-00009.gguf",
+     "--max-context", "65536", "--cache-gb", "200"], "tokenizer": "ik2/tokenizer", "model_name": "inkling-2-small"}
+    EOF
+    python serve/server.py --engine maya --config ik2.json
+
+### 6.1 Measured
+
+UD-Q4_K_XL, KV in FP16, the experts in pinned host memory, PCIe 5:
+
+| | H200 (141 GB) | RTX PRO 6000 (96 GB) | 2x RTX PRO 6000, `IK2_EP=1` |
+| --- | --- | --- | --- |
+| Expert cache | ~114 GiB | ~67 GiB | one on each GPU |
+| Decode | 35-36 tok/s (`IK2_CPU=1`: 36.2) | 22 tok/s | 42 tok/s |
+| A 21.8k-token prompt, fresh | 5.9 s | 7.7-8.0 s | 7.25-7.8 s |
+| A 105k-token prompt | 19.3 s | | |
+
+(Two GPUs read a prompt hardly faster: nsys shows each idle over a third of the time, waiting on its copies - the
+link is busy only 61% - with the host's per-layer work between them. Decode nearly doubles.)
+
+UD-Q3_K_XL on the H200: decode 44.6 tok/s (its experts are smaller: fewer misses, more of them cached).
+
+Against `ref/inkling2.py` (float64) over the same GGUF, 48 tokens: layers 0-5 within 3e-4 relative, every top-1
+token the same, KL mean 8.5e-4 (max 7.2e-3). With `IK2_KV=fp8` 5 of the 48 top-1 tokens differ (KL mean 8.3e-3):
+Inkling's router is full of near-ties, and FP8's 1.5% in layer 0's attention output already changes 7 tokens'
+experts there - so FP16 is the default.
+
+`ik2_kernels_test` holds each kernel (attention in its forms, the convs, the attention residual, routing, the
+expert decodes and their softcapped SwiGLU) to a double-precision reference on the CPU; no model needed.
+
+What did not help (kept out): prefetching two or three layers ahead, or before the routing round trip (both crowd
+the cache: a 21.8k prompt on an RTX PRO 6000 went 8.05 -> 9.7 s); predicting the next layer's experts from this
+layer's input (46% precise); tensor parallel experts (`IK2_TP=1`: 42.8 vs EP's 41.3 tok/s but slower prompts; kept
+as an option); the drafter (`--draft`: 2.4-2.7 tokens a step, but verifying 8 costs ~260 ms).
+
+## 7. Next
+
+1. Setup in `maya.py` (download, the RAM / VRAM check, the run config), as Hy4-Flash has.
+2. Several requests at once; the vision tower (unsloth's `mmproj`).
+3. A Maya quant of the experts in the shape of DeepSeek XS (section 5), for 160 GB of host memory.
