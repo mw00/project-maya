@@ -526,10 +526,15 @@ int serve(mm3::Model& m, const std::vector<int>& eos, int chunk, bool spec_on, f
         auto stat_line = [&]() {
             const auto& s = m.stats();
             const double per0 = produced > 0 ? 1.0 / (double) produced : 0.0;
-            char extra[160] = "";
+            char extra[256] = "";
             int ne = 0;
             if (s.staged > s_dec.staged)
                 ne += std::snprintf(extra + ne, sizeof extra - ne, " pcie=%.3f", (double) (s.staged - s_dec.staged) * per0);
+            if (s.helper_held > 0)   // (MAYA_MM3_HELPER: its picks a token, the CPU lane's after a failure, its waits)
+                ne += std::snprintf(extra + ne, sizeof extra - ne, " helper=%.3f helper_fb=%.3f helper_ms=%.3f helper_held=%ld "
+                                    "helper_dead=%d", (double) (s.helper_experts - s_dec.helper_experts) * per0,
+                                    (double) (s.helper_fallback - s_dec.helper_fallback) * per0,
+                                    1e3 * (s.t_helper - s_dec.t_helper) * per0, s.helper_held, s.helper_dead);
             if (d_off > 0) std::snprintf(extra + ne, sizeof extra - ne, " drafts=%.3f draft_acc=%lld draft_off=%lld",
                                                            (double) d_acc / (double) d_off, d_acc, d_off);
             const double ms = now() * 1e3 - t1;
@@ -2171,6 +2176,11 @@ int main(int argc, char** argv) {
                          "%.1f staged)\n", 1e3 * t_verify / rounds, 1e3 * (s1.t_sync - s0.t_sync) / rounds,
                          1e3 * (s1.t_lane - s0.t_lane) / rounds, (double) (s1.cpu_experts - s0.cpu_experts) / rounds,
                          (double) (s1.staged - s0.staged) / rounds);
+            if (s1.helper_held > 0)
+                std::fprintf(stderr, "  a round's helper: %.1f experts, its waits after the CPU lane %.2f ms, %.1f on the "
+                             "CPU lane after a failure\n", (double) (s1.helper_experts - s0.helper_experts) / rounds,
+                             1e3 * (s1.t_helper - s0.t_helper) / rounds,
+                             (double) (s1.helper_fallback - s0.helper_fallback) / rounds);
         }
         gen = 0;
     }
@@ -2205,6 +2215,11 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "  a token: %.1f ms - routing waits %.1f ms, CPU lane %.1f ms, promotions' copies %.1f ms "
                          "(%ld promoted)\n", 1e3 * s2.t_token / done, 1e3 * s2.t_sync / done, 1e3 * s2.t_lane / done,
                          1e3 * s2.t_promo / done, s2.promoted);
+            if (s2.helper_held > 0)
+                std::fprintf(stderr, "  helper (CUDA%d, %ld experts, %.1f GB): %.1f experts a token, its waits after the "
+                             "CPU lane %.2f ms, %ld on the CPU lane after a failure%s\n", s2.helper_id, s2.helper_held,
+                             s2.helper_gb, (double) s2.helper_experts / done, 1e3 * s2.t_helper / done,
+                             s2.helper_fallback, s2.helper_dead ? " (it failed)" : "");
         }
     }
     if (!profile_out.empty()) {
