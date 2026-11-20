@@ -38,6 +38,7 @@ td.log
 /maya-*.json.prev
 /.maya-switch.json
 /token-savings.json*
+/maya-users.db*
 /vision-memory.json
 /answers/
 /run-maya-*.sh

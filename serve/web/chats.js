@@ -1,13 +1,46 @@
-// serve/web/chats.js - the chats (kept in this browser), their folders and pins, and the chat itself: sending, an answer
-// streamed (and taken back up from the server after a reload or a dropped connection), stopping, editing, regenerating,
-// attachments, the context meter and the Markdown export.
-import {SPRITE, api, coarse, ctxfmt, db, download, fmt, headers, store, uid} from "./lib.js";
+// serve/web/chats.js - the chats (kept in this browser; a signed-in user's: in their account on the server, the same
+// on every device), their folders and pins, and the chat itself: sending, an answer streamed (and taken back up from
+// the server after a reload or a dropped connection), stopping, editing, regenerating, attachments, the context meter
+// and the Markdown export.
+import {SPRITE, UID, api, browserDb, coarse, ctxfmt, db, download, fmt, headers, store, uid} from "./lib.js";
 import {P, PENALTIES, S, confirmDialog, defaultSystem, emit, levelFor, modelId, prefsKey, promptDialog, toast} from "./state.js";
 import {mcpOn} from "./server.js";
 
 // ------------------------------------------------------------------ the chats' list
 let dbBroken = false;                 // IndexedDB unavailable (some private windows): localStorage, without pictures
-function saveFolders() { store.set("folders", S.folders); store.set("folders-open", S.folderOpen); }
+export const ACCOUNT = UID != null;   // a signed-in user: the chats and the folders are the account's (lib.js)
+// the folders: in this browser, and an account's on the server too (which ones are open stays this browser's own)
+let foldersSent = JSON.stringify(S.folders), foldersTimer = null;
+async function pushFolders() {
+  const text = JSON.stringify(S.folders);
+  if (text === foldersSent) return;
+  try {
+    await db.setWorkspace({folders: JSON.parse(text)});
+    foldersSent = text;
+  } catch (e) {
+    if (e.status && e.status !== 401 && e.status < 500) { foldersSent = text; toast("error", "The folders were not saved", e.message, 6000); }
+    else { clearTimeout(foldersTimer); foldersTimer = setTimeout(pushFolders, 5000); }     // (not reached: again soon)
+  }
+}
+function saveFolders() {
+  store.set("folders", S.folders);
+  store.set("folders-open", S.folderOpen);
+  if (!ACCOUNT || JSON.stringify(S.folders) === foldersSent) return;
+  clearTimeout(foldersTimer);
+  foldersTimer = setTimeout(pushFolders, 300);
+}
+// the account's folders, as the server has them (none there yet: this browser's become the account's)
+async function loadFolders() {
+  const w = await db.workspace();
+  if (JSON.stringify(S.folders) !== foldersSent) return;         // (changed here meanwhile: on their way there)
+  if (!w || !Array.isArray(w.folders)) { foldersSent = "[]"; if (S.folders.length) pushFolders(); return; }
+  const text = JSON.stringify(w.folders);
+  foldersSent = text;
+  if (text === JSON.stringify(S.folders)) return;
+  S.folders = w.folders;
+  store.set("folders", S.folders);
+  emit();
+}
 export const titleOf = (msgs) => {
   const u = msgs.find((m) => m.role === "user" && (m.text || (m.files || []).length));
   const t = u ? (u.text || (u.files || []).map((f) => f.name).join(", ")) : "";
@@ -90,9 +123,20 @@ export function saveChat(c = S.current) {
 }
 export async function loadChats() {
   let chats;
-  try { chats = await db.all(); }
-  catch (e) { dbBroken = true; chats = store.get("chats-fallback", []); }
-  if (!chats.length) {                            // the single chat of earlier versions becomes the first one
+  if (ACCOUNT) {                                  // the account's: from the server (not reached: again in a moment)
+    try {
+      chats = await db.all();
+      loadFolders().catch(() => {});
+      offerBrowserChats();
+    } catch (e) {
+      chats = [];
+      if (e.status !== 409) setTimeout(() => syncChats(true), 3000);
+    }
+  } else {
+    try { chats = await db.all(); }
+    catch (e) { dbBroken = true; chats = store.get("chats-fallback", []); }
+  }
+  if (!chats.length && !ACCOUNT) {                // the single chat of earlier versions becomes the first one
     const old = store.get("chat", []);
     if (old.length) {
       const c = newChatObj();
@@ -103,7 +147,7 @@ export async function loadChats() {
       await persist(c);
     }
   }
-  try { localStorage.removeItem("maya.chat"); localStorage.removeItem("strata.chat"); } catch (e) { /* ignore */ }
+  if (!ACCOUNT) try { localStorage.removeItem("maya.chat"); localStorage.removeItem("strata.chat"); } catch (e) { /* ignore */ }
   for (const c of chats) for (const m of c.messages) if (!m.id) m.id = uid();
   chats.sort((a, b) => b.updated - a.updated);
   S.chats = chats;
@@ -112,6 +156,117 @@ export async function loadChats() {
   emit();
 }
 export const chatById = (id) => S.chats.find((c) => c.id === id);
+
+// ------------------------------------------------------------------ an account's chats, on every device
+// What another device (or another tab) did since: its newer chats taken, the ones it deleted dropped.  A chat changed
+// here and not yet saved, or being answered or edited here, is left alone - the last save of a chat is the one kept.
+const refused = new Set();            // chats the server would not keep (too large for the account): this page's only
+let syncing = false;
+const inUse = (c) => !!((S.busy && S.busy.chat === c) || (S.current === c && S.editIndex != null));
+// (a save or a delete of it that reached the server after the list was asked for: the list may be from before it)
+const mid = (id, t0) => db.queued(id) || db.sentAt(id) >= t0;
+export async function syncChats(again = false) {
+  if (!ACCOUNT || syncing) return;
+  syncing = true;
+  try {
+    const t0 = Date.now(), theirs = new Map((await db.index()).map((x) => [x.id, x.updated]));
+    let changed = false;
+    for (const [id, updated] of theirs) {
+      const mine = chatById(id);
+      if (mid(id, t0) || (mine && (mine.updated >= updated || inUse(mine)))) continue;
+      let got;
+      try { got = await db.one(id); } catch (e) { if (e.status === 404) continue; throw e; }
+      const now = chatById(id);
+      if (mid(id, t0) || (now && (now.updated >= got.updated || inUse(now)))) continue;      // (changed here meanwhile)
+      for (const m of got.messages) if (!m.id) m.id = uid();
+      if (now) S.chats[S.chats.indexOf(now)] = got; else S.chats.push(got);
+      if (S.current === now && now) {
+        S.current = got;
+        if (!S.busy) setTimeout(() => { updateCtxMeter(); resumePending(true); }, 0);
+      } else if (!now && !S.current.messages.length && store.get("current-chat", null) === id) S.current = got;
+      changed = true;
+    }
+    for (const c of [...S.chats]) {               // deleted elsewhere (not: made here since, or not there yet)
+      if (theirs.has(c.id) || mid(c.id, t0) || refused.has(c.id) || inUse(c) || c.updated >= t0) continue;
+      S.chats = S.chats.filter((x) => x !== c);
+      if (S.current === c) { S.current = S.chats[0] || newChatObj(); cancelEdit(); }
+      changed = true;
+    }
+    if (changed) { S.chats.sort((a, b) => b.updated - a.updated); emit(); }
+    await loadFolders();
+  } catch (e) {
+    if (again && e.status !== 409) setTimeout(() => syncChats(true), 5000);    // (the first load failed: until it works)
+  } finally { syncing = false; }
+}
+if (ACCOUNT) {
+  db.onError = (c, e) => {
+    if (c) refused.add(c.id);
+    toast("error", c ? "This chat was not saved" : "The chat was not deleted", `${e.message || e}`, 8000);
+  };
+  document.addEventListener("visibilitychange", () => { if (!document.hidden) syncChats(); });
+  if (typeof globalThis.addEventListener === "function") {
+    globalThis.addEventListener("online", () => syncChats());
+    globalThis.addEventListener("beforeunload", (e) => {         // a save still on its way to the server
+      if (db.pending()) { e.preventDefault(); e.returnValue = ""; }
+    });
+  }
+  setInterval(() => { if (!document.hidden) syncChats(); }, 60000);
+}
+
+// The chats this browser kept before its users had accounts (IndexedDB: everyone's who used it): a signed-in user can
+// take them into their account, or delete them.
+export async function browserChats() {
+  if (!ACCOUNT) return [];
+  try { return (await browserDb.all()).filter((c) => c && c.id && Array.isArray(c.messages) && c.messages.length); }
+  catch (e) { return []; }
+}
+async function offerBrowserChats() {
+  if (store.get("adopt-asked", false)) return;
+  const n = (await browserChats()).length;
+  if (!n) return;
+  store.set("adopt-asked", true);
+  toast("info", `${fmt(n)} earlier chat${n === 1 ? "" : "s"} in this browser`,
+        "From before you signed in. Settings › Data and privacy moves them into your account.", 12000,
+        {label: "Move them", run: () => adoptBrowserChats()});
+}
+export async function adoptBrowserChats() {
+  const old = await browserChats();
+  if (!old.length) { toast("info", "No earlier chats in this browser"); return 0; }
+  const have = new Set(S.folders.map((f) => f.id));              // their folders come along
+  const more = store.browser("folders", []).filter((f) => f && f.id && f.name && !have.has(f.id) && old.some((c) => c.folder === f.id));
+  if (more.length) { S.folders = [...S.folders, ...more]; saveFolders(); }
+  let moved = 0, failed = "";
+  for (const c of old) {
+    try {
+      if (typeof c.updated !== "number") c.updated = c.created || Date.now();
+      const mine = chatById(c.id);
+      if (!mine || mine.updated < c.updated) {
+        await db.save(c);                          // (in the account first, out of the browser after)
+        for (const m of c.messages) if (!m.id) m.id = uid();
+        if (mine) S.chats[S.chats.indexOf(mine)] = c; else S.chats.push(c);
+        if (S.current === mine && mine) S.current = c;
+      }
+      await browserDb.del(c.id);
+      moved++;
+    } catch (e) { failed = e.message || String(e); if (e.status === 409) break; }
+  }
+  S.chats.sort((a, b) => b.updated - a.updated);
+  if (!S.current.messages.length && S.chats.length) S.current = S.chats[0];
+  emit();
+  if (failed) toast("error", `${fmt(old.length - moved)} chat${old.length - moved === 1 ? " was" : "s were"} not moved`, failed, 8000);
+  if (moved) toast("success", `${fmt(moved)} chat${moved === 1 ? "" : "s"} moved into your account`, "They are yours alone now, on every device you sign in on.", 6000);
+  return moved;
+}
+export async function deleteBrowserChats() {
+  const n = (await browserChats()).length;
+  if (!n) return;
+  const ok = await confirmDialog(`Delete the ${fmt(n)} earlier chat${n === 1 ? "" : "s"} in this browser?`,
+    "<p>The chats this browser kept from before you signed in. The chats in your account are not touched.</p>", "Delete them", true);
+  if (!ok) return;
+  try { await browserDb.clear(); } catch (e) { /* nothing stored there */ }
+  toast("info", "Earlier chats deleted");
+  emit();
+}
 
 // an answer being written goes on in its own chat while another one is open (and shows again when its chat is)
 export function openChat(c) {
@@ -736,6 +891,17 @@ export function exportChat(c = S.current) {
 
 // ------------------------------------------------------------------ clear this browser
 export async function clearBrowser() {
+  if (ACCOUNT) {                                   // a signed-in user: their own chats (the account's) and settings
+    const mine = await confirmDialog("Delete all your chats and settings?",
+      "<p>Every chat and folder in your account is deleted, on every device you use, and your chat settings and " +
+      "instructions in this browser. Your account, your API keys and the other users' chats are not touched.</p>", "Delete everything", true);
+    if (!mine) return;
+    try { await db.clear(); await db.setWorkspace({folders: []}); }
+    catch (e) { toast("error", "Not deleted", e.message, 6000); return; }
+    try { for (const k of Object.keys(localStorage)) if (store.mine(k)) localStorage.removeItem(k); } catch (e) { /* ignore */ }
+    location.reload();
+    return;
+  }
   const ok = await confirmDialog("Clear this browser's chats and settings?",
     "<p>Every chat, its folders, the chat settings, the instructions and the API key kept in this browser are removed. " +
     "The model, its files and the server's own settings are not touched.</p>", "Clear everything", true);
