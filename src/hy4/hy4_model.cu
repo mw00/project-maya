@@ -567,6 +567,66 @@ struct Model::Impl {
     };
     std::vector<Helper> hel;
     int U = 0;
+    // A layer's routed experts unsplit (tp_unsplit[layer]), expert e unit tp_own[layer n_expert + e]'s alone: where the
+    // slices would leave a tenth or more of zero blocks (experts of 6 blocks over 4 units: 2 blocks a slice held for
+    // 1.5 used, a third more VRAM and work; over 5 units: two thirds).  HY4_TP_EXPERTS=slices|unsplit: one way.
+    std::vector<char> tp_unsplit;
+    std::vector<int> tp_own;
+    int tp_own_most() const { return (g.n_expert + U - 1) / U; }   // (the experts a unit holds at most)
+    bool unsplit_experts(int il) const { return (size_t) il < tp_unsplit.size() && tp_unsplit[(size_t) il] != 0; }
+    // the blocks a unit's slice of layer il's experts holds, and the blocks an expert is (0: not a routed layer)
+    int slice_blocks(int il, int& B) const {
+        const Tensor* td = pk.get("blk." + std::to_string(il) + ".ffn_down_exps.weight");
+        const int bv = td ? iq::block_values(type_id(td->type)) : 0;
+        B = bv > 0 ? g.n_ff_exp / bv : 0;
+        return B > 0 && U > 0 ? (U >= B ? 1 : (B + U - 1) / U) : 0;
+    }
+    void pick_unsplit_experts() {
+        const char* e = std::getenv("HY4_TP_EXPERTS");
+        tp_unsplit.assign((size_t) g.n_layer, 0);
+        for (int il = g.n_dense_lead; il < g.n_layer; ++il) {
+            int B = 0;
+            const int c = slice_blocks(il, B);
+            if (c == 0) continue;
+            const bool pad = U < B && c * U * 10 >= B * 11;
+            tp_unsplit[(size_t) il] = e && !std::strcmp(e, "unsplit") ? 1 : e && !std::strcmp(e, "slices") ? 0 : pad;
+        }
+    }
+    // a unit's share of layer il's routed experts' bytes, w units side by side
+    double expert_share(int il, int w) const {
+        if (unsplit_experts(il)) return (double) std::min(g.n_expert, w * tp_own_most()) / g.n_expert;
+        int B = 0;
+        const int c = slice_blocks(il, B);
+        return c == 0 || U >= B ? (double) w / std::max(1, U) : std::min(1.0, (double) w * c / B);
+    }
+    // the unsplit experts' units: each layer's experts dealt round the units from the most routed down (the profile's
+    // counts; none: by index), so every unit holds as many and as much of the routing as the next
+    void deal_unsplit_experts() {
+        tp_own.assign((size_t) g.n_layer * g.n_expert, 0);
+        std::vector<int> order((size_t) g.n_expert);
+        int n = 0, first = -1;
+        for (int il = 0; il < g.n_layer; ++il) {
+            if (!unsplit_experts(il)) continue;
+            for (int e = 0; e < g.n_expert; ++e) order[(size_t) e] = e;
+            if ((size_t) (il + 1) * g.n_expert <= prof_in.size()) {
+                const uint32_t* c = prof_in.data() + (size_t) il * g.n_expert;
+                std::stable_sort(order.begin(), order.end(), [&](int x, int y) { return c[x] > c[y]; });
+            }
+            for (int r = 0; r < g.n_expert; ++r) tp_own[(size_t) il * g.n_expert + (size_t) order[(size_t) r]] = r % U;
+            if (first < 0) first = il;
+            ++n;
+        }
+        if (n == 0) return;
+        int B = 0;
+        const int c = slice_blocks(first, B);
+        char buf[320], why[160] = "";
+        if (U < B && c * U > B)
+            std::snprintf(why, sizeof why, " (slices would hold %d of an expert's %d blocks each: %.0f%% "
+                          "more VRAM and work)", c, B, 100.0 * c * U / B - 100.0);
+        std::snprintf(buf, sizeof buf, "INFO tensor parallel: %d layers' routed experts unsplit, each on one of the %d "
+                      "GPUs%s", n, U, why);
+        info.push_back(buf);
+    }
     float* tp_route = nullptr;
     unsigned* tp_froute = nullptr;
     float* tp_route2 = nullptr;      // (a staggered chunk's second half's routing, and its counter)
@@ -1362,6 +1422,7 @@ struct Model::Impl {
                     head_tp = false;
                     mem.clear();
                     hel.clear();
+                    tp_unsplit.clear();
                     TL.clear();
                     for (Gpu& gp : G) {
                         gp.sH = 64;
@@ -1699,6 +1760,7 @@ struct Model::Impl {
             h.unit0 = u0;
             u0 += h.w;
         }
+        pick_unsplit_experts();
         // a member's bytes of layer il: its share of the split matrices and of the experts, the rest whole
         auto member_bytes = [&](int il) {
             static const char* split[] = {"attn_q_b.weight", "attn_k_b.weight", "attn_v_b.weight",
@@ -1714,8 +1776,8 @@ struct Model::Impl {
                 bool sp = false;
                 for (const char* x : split) sp |= rest == x;
                 const bool half = rest == "ffn_gate_inp.weight" && narrowable(n);   // (kept as BF16: mat_narrow)
-                b += ex ? (double) t.bytes / U * 1.02 + 4096 : sp ? (double) t.bytes / N * 1.02 + 4096
-                        : (double) t.bytes * (half ? 0.5 : 1.0) + 256;
+                b += ex ? (double) t.bytes * expert_share(il, 1) * 1.02 + 4096
+                        : sp ? (double) t.bytes / N * 1.02 + 4096 : (double) t.bytes * (half ? 0.5 : 1.0) + 256;
             }
             if (g.swa[(size_t) il]) b += (double) ring * kv_rb();
             else
@@ -1795,6 +1857,7 @@ struct Model::Impl {
 
     // the members' layers (a thread a member), their scratch, the head GPU's scratch, the pinned buffers and threads
     bool load_tp(std::string& err) {
+        deal_unsplit_experts();
         std::vector<std::string> errs((size_t) tp);
         std::vector<std::thread> th;
         head_m.assign(head_tp ? (size_t) tp : 0, HeadPart());
@@ -2355,6 +2418,7 @@ struct Model::Impl {
     // side by side, zero blocks after them up to ceil(B / N) (a zero row adds nothing), an expert of none of its blocks
     // left out (slot -1).  The SwiGLU is a value's own, so the slices' sums are the expert's.
     // (units [m, m + w): a helper's several units in one slice - its blocks of each expert side by side)
+    // (unsplit experts, unsplit_experts(): every block of expert e is unit tp_own's, the others' slot -1 for it)
     bool expert_slices(Layer& l, Gpu& gp, std::string& err, int m, int N, const uint8_t* sg, const uint8_t* su,
                        const uint8_t* sd, int w = 1) {
         const int lat = g.n_lat, ff = g.n_ff_exp, bv = iq::block_values(l.td), B = ff / bv;
@@ -2362,10 +2426,11 @@ struct Model::Impl {
         const size_t bd = iq::row_bytes(l.td, bv), rd = iq::row_bytes(l.td, ff), db = rd * (size_t) lat;
         auto al = [](size_t b) { return (b + 255) / 256 * 256; };
         std::vector<std::vector<int>> mine((size_t) g.n_expert);
+        const int* own = unsplit_experts(l.il) ? tp_own.data() + (size_t) l.il * g.n_expert : nullptr;
         int cmax = 0;
         for (int e = 0; e < g.n_expert; ++e) {
             for (int j = 0; j < B; ++j) {
-                const int u = (int) (((int64_t) e * B + j) % N);
+                const int u = own ? own[e] : (int) (((int64_t) e * B + j) % N);
                 if (u >= m && u < m + w) mine[(size_t) e].push_back(j);
             }
             cmax = std::max(cmax, (int) mine[(size_t) e].size());
