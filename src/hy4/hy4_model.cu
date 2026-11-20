@@ -1183,10 +1183,11 @@ struct Model::Impl {
         cudaFree(c);
         return best;
     }
-    // the DFly2 drafter's VRAM on the head's GPU (Options::dfly2 and a pack that has it; else 0): hy4_plan.hpp's
-    // dfly_bytes over the pack's tensors
+    // the DFly2 drafter's VRAM on the head's GPU (a pack that has it, while the plan counts it - df_room, load's
+    // choice: with drafting on and off alike; else 0): hy4_plan.hpp's dfly_bytes over the pack's tensors
+    bool df_room = false;
     double dfly_plan_bytes() const {
-        if (!o.dfly2 || pk.num("dfly_layers") < 1) return 0;
+        if (!df_room || pk.num("dfly_layers") < 1) return 0;
         double file = 0;
         const std::string pre = "model.dfly_layers.";
         for (const auto& [n, t] : pk.t)
@@ -2659,55 +2660,117 @@ struct Model::Impl {
                 for (const Layer& l : L) t.res += l.n_res;   // (the layer split's; tensor parallel holds them all)
                 return t;
             };
-            const int c = !chunk_auto ? o.prefill_chunk
-                                      : chunk_pick([&](int ch) { return plan_at(ch, kDenseBase); }, kChunks, kChunkBase);
-            again(c, kDenseBase);
-            if (!plan(err)) return false;   // (the start as it was before the span: its own error)
-            // the spans tried: kDense on GPUs with tensor cores (compute capability 7.0 and later: on the others the
-            // F16 products of a longer span were not measured against the gathering kernel), or HY4_DENSE_MAX's own
-            std::vector<int> spans;
+            int c = 0;
             const char* de = std::getenv("HY4_DENSE_MAX");
-            bool tensor_cores = !G.empty();
-            for (Gpu& gp : G) {
-                cudaDeviceProp pi{};
-                CK(cudaGetDeviceProperties(&pi, gp.dev));
-                tensor_cores = tensor_cores && pi.major >= 7;
-            }
+            // the whole choice - the chunk, then the span - into c and the plan's state (false: its error in e)
+            auto choose = [&](std::string& e) -> bool {
+                c = !chunk_auto ? o.prefill_chunk
+                                : chunk_pick([&](int ch) { return plan_at(ch, kDenseBase); }, kChunks, kChunkBase);
+                again(c, kDenseBase);
+                if (!plan(e)) return false;   // (the start as it was before the span: its own error)
+                // the spans tried: kDense on GPUs with tensor cores (compute capability 7.0 and later: on the others
+                // the F16 products of a longer span were not measured against the gathering kernel), or HY4_DENSE_MAX's
+                std::vector<int> spans;
+                bool tensor_cores = !G.empty();
+                for (Gpu& gp : G) {
+                    cudaDeviceProp pi{};
+                    CK(cudaGetDeviceProperties(&pi, gp.dev));
+                    tensor_cores = tensor_cores && pi.major >= 7;
+                }
 #if defined(STRATA_USE_HIP)
-            tensor_cores = false;   // (AMD: measured slower past kDenseBase on a 16K prompt - the span stays)
+                tensor_cores = false;   // (AMD: measured slower past kDenseBase on a 16K prompt - the span stays)
 #endif
-            ix_gemm = tensor_cores ? 16 : 0;
-            if (const char* ie = std::getenv("HY4_IX_GEMM")) {
-                const int m = std::atoi(ie);
-                ix_gemm = m == 16 || m == 32 ? m : 0;
-            }
-            if (const char* ie = std::getenv("HY4_IX_GEMM_FROM")) ix_gemm_from = std::max(0, std::atoi(ie));
-            sparse_attn = tensor_cores;
-            if (const char* se = std::getenv("HY4_SPARSE")) sparse_attn = std::atoi(se) != 0;
-            if (const char* se = std::getenv("HY4_SPARSE_SUB")) sparse_sub = std::max(8, std::min(kSub, std::atoi(se)));
-            if (const char* se = std::getenv("HY4_SPARSE_FRAC")) sparse_frac = std::max(0, std::min(100, std::atoi(se)));
+                ix_gemm = tensor_cores ? 16 : 0;
+                if (const char* ie = std::getenv("HY4_IX_GEMM")) {
+                    const int m = std::atoi(ie);
+                    ix_gemm = m == 16 || m == 32 ? m : 0;
+                }
+                if (const char* ie = std::getenv("HY4_IX_GEMM_FROM")) ix_gemm_from = std::max(0, std::atoi(ie));
+                sparse_attn = tensor_cores;
+                if (const char* se = std::getenv("HY4_SPARSE")) sparse_attn = std::atoi(se) != 0;
+                if (const char* se = std::getenv("HY4_SPARSE_SUB")) sparse_sub = std::max(8, std::min(kSub, std::atoi(se)));
+                if (const char* se = std::getenv("HY4_SPARSE_FRAC")) sparse_frac = std::max(0, std::min(100, std::atoi(se)));
 #if defined(STRATA_USE_HIP)
-            ix_split = false;   // (AMD: not measured there)
+                ix_split = false;   // (AMD: not measured there)
 #else
-            ix_split = true;
+                ix_split = true;
 #endif
-            if (const char* se = std::getenv("HY4_IX_SPLIT")) ix_split = std::atoi(se) != 0;
-            if (const char* se = std::getenv("HY4_IX_SPLIT_FROM")) ix_split_from = std::max(0, std::atoi(se));
-            if (de) {
-                const int d = std::min(kDenseTop, std::atoi(de)) / 8 * 8;
-                if (d > kDenseBase) spans.push_back(d);
-            } else if (tensor_cores) {
-                spans.assign(std::begin(kDense), std::end(kDense));
+                if (const char* se = std::getenv("HY4_IX_SPLIT")) ix_split = std::atoi(se) != 0;
+                if (const char* se = std::getenv("HY4_IX_SPLIT_FROM")) ix_split_from = std::max(0, std::atoi(se));
+                if (de) {
+                    const int d = std::min(kDenseTop, std::atoi(de)) / 8 * 8;
+                    if (d > kDenseBase) spans.push_back(d);
+                } else if (tensor_cores) {
+                    spans.assign(std::begin(kDense), std::end(kDense));
+                }
+                if (!spans.empty()) {
+                    // (HY4_DENSE_MAX names a span: taken where the plan holds it, at the price of experts too)
+                    const int d = dense_pick([&](int dd) {
+                        ChunkTry t = plan_at(c, dd);
+                        if (de) t.res = 0;
+                        return t;
+                    }, spans, kDenseBase);
+                    again(c, d);
+                    if (!plan(e)) return false;
+                }
+                return true;
+            };
+            // The DFly2 drafter in the pack: its room is counted in the plan with drafting on and off alike, so turning
+            // drafting on or off moves no routed expert between the VRAM and the CPU lane - the answers keep their bits
+            // (the drafts are checked token by token: a verify window's rows are the one-token pass's bits).  Where
+            // counting it changes more than the experts' places - the cache's rows (F16 or 8-bit), the pictures' size,
+            // the prompt chunk or span, KV streaming, the GPUs' layout, or whether the start fits - the plan is the
+            // one without it and the drafter is not loaded: with drafts the answers would differ from without (an
+            // 8 GB card at 8K: the drafter's 0.7 GB put the cache in 8-bit rows).  Counted on one GPU (the drafter's
+            // layout), or where --dfly2 asks on more (as before)
+            struct Sum {
+                bool ok;
+                int tp, chunk, span;
+                bool q8, vision, head, own;
+                long long pixels, kvres;
+                bool operator==(const Sum& b) const {
+                    return ok == b.ok && tp == b.tp && chunk == b.chunk && span == b.span && q8 == b.q8 &&
+                           vision == b.vision && head == b.head && own == b.own && pixels == b.pixels && kvres == b.kvres;
+                }
+            };
+            auto sum = [&](bool ok) {   // (the span as far as the context reaches: beyond it no prompt reads)
+                return Sum{ok, tp, c, (int) std::min<int64_t>(dense_max, (int64_t) o.max_ctx), kv_q8, o.vision, head_tp, mtp_own,
+                           o.vision ? (long long) vgeo.max_pixels : 0, (long long) o.kv_resident};
+            };
+            int n_gpu = 0;
+            CK(cudaGetDeviceCount(&n_gpu));
+            if (!o.gpus.empty()) n_gpu = (int) o.gpus.size();
+            df_room = pk.num("dfly_layers") >= 1 && (o.dfly2 || n_gpu == 1);
+            std::string e1, df_why;
+            bool ok1 = choose(e1);
+            if (df_room) {
+                const Sum s1 = sum(ok1);
+                df_room = false;
+                std::string e0;
+                const bool ok0 = choose(e0);
+                const Sum s0 = sum(ok0);
+                if (s0 == s1) {   // (the plan with its room, chosen again)
+                    df_room = true;
+                    ok1 = choose(e1);
+                } else {
+                    ok1 = ok0;
+                    e1 = e0;
+                    df_why = !s1.ok ? "the start does not fit beside it"
+                             : s1.q8 != s0.q8 ? "beside it the latent cache would be in 8-bit rows (F16 without it)"
+                             : s1.vision != s0.vision || s1.pixels != s0.pixels ? "beside it pictures would be read smaller"
+                             : s1.kvres != s0.kvres ? "beside it the latent cache would stream from the RAM"
+                             : s1.chunk != s0.chunk || s1.span != s0.span ? "beside it prompts would be read in shorter pieces"
+                                                                         : "beside it the GPUs would be shared otherwise";
+                }
             }
-            if (!spans.empty()) {
-                // (HY4_DENSE_MAX names a span: taken where the plan holds it, at the price of experts too)
-                const int d = dense_pick([&](int dd) {
-                    ChunkTry t = plan_at(c, dd);
-                    if (de) t.res = 0;
-                    return t;
-                }, spans, kDenseBase);
-                again(c, d);
-                if (!plan(err)) return false;
+            if (!ok1) {
+                if (!e1.empty()) err = e1;   // (else a CUDA call's, in err already)
+                return false;
+            }
+            if (!df_why.empty() && o.dfly2) {
+                info.push_back("INFO the DFly2 drafter is not loaded: " + df_why + ", and the answers with its drafts "
+                               "would not be the same as without them - decoding without drafts");
+                o.dfly2 = false;
             }
             char cb[320];
             if (chunk_auto) {
