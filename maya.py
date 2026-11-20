@@ -1442,6 +1442,7 @@ def check_hip_pc(a, installed=False, text_only=True) -> dict:
              "(https://github.com/mw00/project-maya/issues)")
     select_build_backend("hip")
     return {"backend": "hip", "gpus": chosen, "archs": sorted({g["arch"] for g in chosen}), "rocm": str(root),
+            "amd_found": usable,                       # (the build's archs: every installed model's GPUs - hip_archs_in_use)
             **({"rocm_bin": str(bindir)} if WIN else {})}
 
 
@@ -2921,11 +2922,23 @@ def copy_hip_dlls(bindir: Path, dest: Path) -> None:
 
 
 def compile_engine_hip(pc: dict, llama: Path, src: str, soft=False, target: str = "maya", also=()) -> dict | None:
-    """The HIP build of `target` - and of the targets in `also` (--rebuild: every engine the PC uses) - in build-hip/."""
+    """The HIP build of `target` - and of the targets in `also` (--rebuild: every engine the PC uses) - in build-hip/,
+    for this setup's AMD GPUs and those every installed model of build-hip/ runs on (hip_archs_in_use: one binary
+    each for all of them, as the CUDA build); where this ROCm cannot compile for one of the others, this model's."""
     cmake = pick_cmake()
     if not cmake:
         fail("CMake 3.24 or newer is needed")
     root, clang, bindir, env = hip_toolchain(pc)
+    own = sorted(str(x) for x in pc["archs"])
+    archs = hip_archs_in_use(own, pc.get("amd_found"))
+    if archs != own and not hip_builds(root, env, clang, archs):
+        warn("another installed model runs on " + ", ".join(x for x in archs if x not in own) + f", which the ROCm in "
+             f"{root} does not compile for: the engine is compiled for this model's GPUs only")
+        archs = own
+    elif archs != own:
+        ok("also compiled for " + ", ".join(x for x in archs if x not in own) + " (the GPUs another installed model "
+           "runs on)")
+    pc = dict(pc, archs=archs)
     conf = [cmake]
     if WIN:
         # as tools\hip\build_maya_windows.bat, which built it on Windows (#54): ROCm's clang for the host code too, in
@@ -3062,6 +3075,44 @@ def archs_in_use(archs) -> list:
     return sorted(want)
 
 
+def config_amd_archs(cfg: dict, found: list) -> set:
+    """The gfx archs of the AMD GPUs a config of the HIP build runs on (its "gpu" numbers, as HIP numbers them -
+    setup.py's amd_gpus list `found`; a GPU that is gone, or one Maya's HIP build does not take, is left out)."""
+    takes = HIP_ARCHS + HIP_ARCHS_UNVALIDATED + HIP_ARCHS_WAVE64
+    cards = {int(g["index"]): str(g["arch"]) for g in found or [] if str(g.get("arch")) in takes and "index" in g}
+    ids = cfg.get("gpu") if isinstance(cfg.get("gpu"), list) else [cfg["gpu"]] if isinstance(cfg.get("gpu"), int) else []
+    return {cards[i] for i in ids if isinstance(i, int) and i in cards}
+
+
+def hip_archs_in_use(archs, found: list | None = None) -> list:
+    """The AMD archs build-hip/ is compiled for: `archs` (the GPUs chosen now) and those of the GPUs every installed
+    config of this build folder runs on - the engines share one CMake cache and one binary each, so a setup (or
+    --rebuild, or a start's update build) for one model on one GPU would otherwise compile the next engine without
+    another model's GPUs (an RX 7900 XTX + RX 9070 XT: GLM on the 7900, Hy4-Flash on both) - as archs_in_use does
+    for CUDA.  found: the PC's AMD GPUs (check_hip_pc's "amd_found"; None: read now)."""
+    want = {str(x) for x in archs}
+    cfgs = [c for c in map(read_json, configs()) if target_of_exe(c.get("exe"))]
+    if cfgs:
+        if found is None:
+            try:
+                found = S.amd_gpus(installed_hip_info()) if WIN else S.amd_gpus()
+            except Exception:  # noqa: BLE001 - no GPU list: this setup's archs
+                found = []
+        for c in cfgs:
+            want |= config_amd_archs(c, found)
+    return sorted(want)
+
+
+def hip_builds(root: Path, env: dict, clang: Path, archs) -> bool:
+    """Whether this ROCm compiles for all of these GPUs: its device libraries hold each one's ISA bitcode
+    (oclc_isa_version_<n>.bc - gfx1151: 1151); where no such folder is found, assumed (as nvcc_builds)."""
+    dirs = [Path(env["HIP_DEVICE_LIB_PATH"])] if env.get("HIP_DEVICE_LIB_PATH") else []
+    dirs += [root / "amdgcn" / "bitcode", *root.glob("lib/llvm/lib/clang/*/lib/amdgcn/bitcode"),
+             *clang.parent.parent.glob("lib/clang/*/amdgcn/bitcode"), *clang.parent.parent.glob("amdgcn/bitcode")]
+    have = next((d for d in dirs if d.is_dir() and any(d.glob("oclc_isa_version_*.bc"))), None)
+    return have is None or all((have / f"oclc_isa_version_{str(x)[3:]}.bc").exists() for x in archs)
+
+
 def nvcc_builds(nvcc, archs) -> bool:
     """Whether this toolkit's release can compile for all of these GPUs (nvcc_range; an unknown release: assumed)."""
     v = S.nvcc_version(nvcc) if nvcc else None
@@ -3086,8 +3137,10 @@ def build_step(a, pc, llama: Path, target: str = "maya") -> dict:
     if len(every) > 1:
         say("  --rebuild: compiling every engine this PC uses (" + ", ".join(every) + "), not only this model's")
     if pc.get("backend") == "hip":
+        # (compiled for this model's GPUs and the other installed models' already: nothing to do - hip_archs_in_use)
         if (exe.exists() and not a.rebuild and meta.get("backend") == "hip" and meta.get("src") == src
-                and meta.get("archs") == pc["archs"] and meta.get("rocm") == pc["rocm"]
+                and set(hip_archs_in_use(pc["archs"], pc.get("amd_found"))) <= set(meta.get("archs") or [])
+                and meta.get("rocm") == pc["rocm"]
                 and target in (meta.get("targets") or ["maya"])):
             ok(f"HIP engine already compiled: {exe}")
             return meta

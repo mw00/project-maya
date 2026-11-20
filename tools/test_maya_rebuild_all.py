@@ -146,6 +146,78 @@ class RebuildAll(unittest.TestCase):
         self.assertEqual(self.built, [["maya-hy4", "maya", "maya-ds4"]])
         self.assertEqual(json.loads(self.stamp.read_text())["targets"], ["maya", "maya-ds4", "maya-hy4"])
 
+    # the HIP build: one binary per engine for every installed model's AMD GPUs, as the CUDA build (an RX 7900 XTX
+    # (HIP GPU 0) + an RX 9070 XT (GPU 1): GLM on the 7900, Hy4-Flash on both)
+    AMD = [{"index": 0, "name": "Radeon RX 7900 XTX", "vram_gb": 24, "arch": "gfx1100"},
+           {"index": 1, "name": "Radeon RX 9070 XT", "vram_gb": 16, "arch": "gfx1201"}]
+
+    def hip(self, bitcode=None):
+        env = {"HIP_DEVICE_LIB_PATH": str(bitcode)} if bitcode else {}
+        return (patch.object(maya, "hip_toolchain", return_value=(self.root / "rocm", self.root / "rocm/llvm/bin/clang++",
+                                                                  self.root / "rocm/bin", env)),
+                patch.object(maya, "WIN", False), patch.object(maya.S, "amd_gpus", return_value=self.AMD))
+
+    def hip_configs(self):
+        self.updated_pc()
+        for p in self.root.glob("maya-*.json"):
+            p.unlink()
+        (self.root / "maya-glm.json").write_text(json.dumps({"exe": str(self.build / "maya"), "gpu": [0]}))
+        (self.root / "maya-hy4-flash-maya-s.json").write_text(json.dumps({"exe": str(self.build / "maya-hy4"),
+                                                                          "gpu": [0, 1]}))
+        return {"backend": "hip", "gpus": self.AMD[:1], "archs": ["gfx1100"], "rocm": str(self.root / "rocm"),
+                "amd_found": self.AMD}
+
+    def test_hip_the_gpus_of_every_installed_model_are_compiled_for(self):
+        pc = self.hip_configs()
+        a, b, c = self.hip()
+        with a, b, c:
+            maya.build_step(self.a(True), pc, self.llama, "maya")
+        self.assertEqual(self.archs, ["gfx1100;gfx1201"])
+        self.assertEqual(json.loads(self.stamp.read_text())["archs"], ["gfx1100", "gfx1201"])
+        self.assertEqual(pc["archs"], ["gfx1100"])                         # (the setup's own choice is kept)
+
+    def test_hip_a_rocm_without_the_other_gpu_keeps_this_models(self):
+        pc = self.hip_configs()
+        bc = self.root / "bitcode"
+        bc.mkdir()
+        (bc / "oclc_isa_version_1100.bc").touch()                          # (no 1201 in this ROCm's device libraries)
+        a, b, c = self.hip(bc)
+        with a, b, c:
+            maya.build_step(self.a(True), pc, self.llama, "maya")
+        self.assertEqual(self.archs, ["gfx1100"])
+        self.assertTrue(any("gfx1201" in w for w in self.warned))
+        (bc / "oclc_isa_version_1201.bc").touch()
+        self.archs.clear()
+        with a, b, c:
+            maya.build_step(self.a(True), pc, self.llama, "maya")
+        self.assertEqual(self.archs, ["gfx1100;gfx1201"])
+
+    def test_hip_a_build_for_both_is_not_narrowed_by_a_setup_on_one(self):
+        pc = self.hip_configs()
+        self.stamp.write_text(json.dumps({"backend": "hip", "src": "new", "archs": ["gfx1100", "gfx1201"],
+                                          "rocm": pc["rocm"], "targets": ["maya", "maya-hy4"]}))
+        a, b, c = self.hip()
+        with a, b, c:
+            maya.build_step(self.a(False), pc, self.llama, "maya")
+        self.assertEqual(self.built, [])
+        self.stamp.write_text(json.dumps({"backend": "hip", "src": "new", "archs": ["gfx1100"],   # (GLM's alone before)
+                                          "rocm": pc["rocm"], "targets": ["maya", "maya-hy4"]}))
+        with a, b, c:
+            maya.build_step(self.a(False), pc, self.llama, "maya")
+        self.assertEqual(self.archs, ["gfx1100;gfx1201"])
+
+    def test_hip_a_start_after_an_update_compiles_for_every_models_gpus(self):
+        self.hip_configs()
+        (self.llama / "ggml").mkdir(parents=True)
+        (self.llama / "ggml" / "CMakeLists.txt").touch()
+        self.stamp.write_text(json.dumps({"backend": "hip", "src": "old", "archs": ["gfx1100"], "rocm": "/opt/rocm",
+                                          "llama": str(self.llama), "targets": ["maya", "maya-hy4"]}))
+        a, b, c = self.hip()
+        with a, b, c, patch.object(maya, "hip_clang", return_value=Path("/opt/rocm/llvm/bin/clang++")):
+            maya.refresh_engine({"exe": str(self.build / "maya-hy4"), "gpu": [0, 1], "backend": "hip"})
+        self.assertEqual(self.built, [["maya-hy4"]])
+        self.assertEqual(self.archs, ["gfx1100;gfx1201"])
+
     def test_windows_build_script_builds_every_target(self):
         # the .bat cmake_steps writes on Windows carries every target of the one build
         seen = {}
