@@ -2665,10 +2665,11 @@ def toolkit_root_defs(nvcc) -> list:
 
 
 def compile_engine(archs, gpu_ids, nvcc, host_compiler, llama: Path, src: str, soft=False,
-                   target: str = "maya") -> dict | None:
-    """cmake configure + build of the `maya` target (DeepSeek: `maya-ds4`) in build/; the exact commands are
-    printed as they run.  soft: an update's rebuild (refresh_engine) - a failure stops with the reason and says that
-    the engine from before is not started (#805)."""
+                   target: str = "maya", also=()) -> dict | None:
+    """cmake configure + build of the `maya` target (DeepSeek: `maya-ds4`) in build/ - and of the targets in `also`
+    (--rebuild: every engine the PC uses) in the same build; the exact commands are printed as they run.  soft: an
+    update's rebuild (refresh_engine) - a failure stops with the reason and says that the engine from before is not
+    started (#805)."""
     def stop(what):
         msg = f"the engine build stopped while {what} (the reason is above)"
         hint = ("common causes: 'unsupported Microsoft Visual Studio version' - CUDA 12.x needs Visual Studio 2019 or "
@@ -2708,9 +2709,10 @@ def compile_engine(archs, gpu_ids, nvcc, host_compiler, llama: Path, src: str, s
     env = dict(os.environ, CUDA_DEVICE_ORDER="PCI_BUS_ID", CUDA_VISIBLE_DEVICES=",".join(str(i) for i in gpu_ids))
     # nvcc takes 2-4 GB per job on the big kernels: half the threads, and no more jobs than RAM / 4 GB
     jobs = max(2, min((os.cpu_count() or 4) // 2, int(mem_gb()[0] // 4) or 2))
-    build = [cmake, "--build", str(BUILD), "--target", target, "-j", str(jobs)]
-    say("  Compiling the engine for " + ", ".join(f"sm_{x}" for x in archs) +
-        " (10-30 minutes the first time, a few minutes after an update) ...")
+    targets = [target] + [t for t in also if t != target]
+    build = [cmake, "--build", str(BUILD), "--target", *targets, "-j", str(jobs)]
+    say("  Compiling the engine" + ("s " + ", ".join(targets) if len(targets) > 1 else "") + " for " +
+        ", ".join(f"sm_{x}" for x in archs) + " (10-30 minutes the first time, a few minutes after an update) ...")
     stopped = cmake_steps(conf, build, env, "build-maya.bat", nvcc=nvcc)
     if stopped:
         return stop(stopped)
@@ -2719,9 +2721,10 @@ def compile_engine(archs, gpu_ids, nvcc, host_compiler, llama: Path, src: str, s
     same = old.get("src") == src and old.get("archs") == archs and old.get("nvcc") == nvcc
     meta = {"src": src, "archs": archs, "gpu_ids": list(gpu_ids), "nvcc": nvcc, "host_compiler": host_compiler,
             "llama": str(llama), "lib_dirs": cuda_lib_dirs(nvcc), "date": time.strftime("%Y-%m-%d %H:%M"),
-            "targets": sorted({target} | (set(old.get("targets") or ["maya"]) if same else set()))}
+            "targets": sorted(set(targets) | (set(old.get("targets") or ["maya"]) if same else set()))}
     STAMP.write_text(json.dumps(meta, indent=1), encoding="utf-8")
-    ok(f"engine compiled: {exe_for_target(target)}")
+    ok(("engines compiled: " if len(targets) > 1 else "engine compiled: ") +
+       ", ".join(str(exe_for_target(t)) for t in targets))
     return meta
 
 
@@ -2884,7 +2887,8 @@ def copy_hip_dlls(bindir: Path, dest: Path) -> None:
                 warn(f"could not copy {dll.name} next to {dest} ({e})")
 
 
-def compile_engine_hip(pc: dict, llama: Path, src: str, soft=False, target: str = "maya") -> dict | None:
+def compile_engine_hip(pc: dict, llama: Path, src: str, soft=False, target: str = "maya", also=()) -> dict | None:
+    """The HIP build of `target` - and of the targets in `also` (--rebuild: every engine the PC uses) - in build-hip/."""
     cmake = pick_cmake()
     if not cmake:
         fail("CMake 3.24 or newer is needed")
@@ -2912,9 +2916,11 @@ def compile_engine_hip(pc: dict, llama: Path, src: str, soft=False, target: str 
     if not WIN and root == Path("/usr"):   # a distribution's ROCm: CMake's HIP check looks for hip-lang under this root
         conf.append(f"-DCMAKE_HIP_COMPILER_ROCM_ROOT={root.as_posix()}")
     jobs = max(1, min(4, (os.cpu_count() or 4) // 2))
-    say("  Compiling Maya for AMD " + ", ".join(pc["archs"]) + " ...")
+    targets = [target] + [t for t in also if t != target]
+    say("  Compiling Maya" + (" (" + ", ".join(targets) + ")" if len(targets) > 1 else "") + " for AMD " +
+        ", ".join(pc["archs"]) + " ...")
     vcvars = S.find_vcvars(cuda=False) if WIN else None
-    if cmake_steps(conf, [cmake, "--build", str(BUILD), "--target", target, "-j", str(jobs)], env,
+    if cmake_steps(conf, [cmake, "--build", str(BUILD), "--target", *targets, "-j", str(jobs)], env,
                    "build-maya-hip.bat", vcvars=vcvars):
         if soft:
             # (not the engine compiled before: it is from the older source, and this version's server and config
@@ -2934,9 +2940,10 @@ def compile_engine_hip(pc: dict, llama: Path, src: str, soft=False, target: str 
     meta = {"backend": "hip", "src": src, "archs": pc["archs"], "rocm": str(root),
             "gpu_ids": [g["index"] for g in pc["gpus"]], "llama": str(llama),
             "lib_dirs": [str(bindir if WIN else root / "lib")], "date": time.strftime("%Y-%m-%d %H:%M"),
-            "targets": sorted({target} | (set(old.get("targets") or ["maya"]) if same else set()))}
+            "targets": sorted(set(targets) | (set(old.get("targets") or ["maya"]) if same else set()))}
     STAMP.write_text(json.dumps(meta, indent=1), encoding="utf-8")
-    ok(f"engine compiled: {exe_for_target(target)}")
+    ok(("engines compiled: " if len(targets) > 1 else "engine compiled: ") +
+       ", ".join(str(exe_for_target(t)) for t in targets))
     return meta
 
 
@@ -2971,6 +2978,66 @@ def compile_engine_metal(llama: Path, src: str, soft=False) -> dict | None:
     return meta
 
 
+ENGINE_TARGETS = ("maya", "maya-ds4", "maya-mm3", "maya-hy4")
+
+
+def target_of_exe(exe) -> str | None:
+    """The build target whose binary in this build folder `exe` is (maya, maya-ds4, maya-mm3, maya-hy4), or None (an
+    engine of another backend's folder, or of none)."""
+    if not exe:
+        return None
+    p = Path(str(exe)).expanduser().resolve()
+    return next((t for t in ENGINE_TARGETS if p == exe_for_target(t).resolve()), None)
+
+
+def engines_in_use(target: str) -> list:
+    """What --rebuild compiles: `target` (the model set up now) first, then every other engine of this build folder
+    the PC uses - an installed config's engine, a target the stamp lists, an engine binary compiled here before (the
+    stamp keeps only the targets compiled from its source, so after an update it may list fewer).  A setup that
+    compiles only its own model's engine left the others as they were (#1066: maya-hy4 and maya-ds4 stayed old)."""
+    found = {t for t in (read_json(STAMP).get("targets") or []) if t in ENGINE_TARGETS + ("maya-glm-helper",)}
+    found |= {t for t in map(lambda p: target_of_exe(read_json(p).get("exe")), configs()) if t}
+    found |= {t for t in ENGINE_TARGETS + ("maya-glm-helper",) if exe_for_target(t).exists()}
+    return [target] + sorted(found - {target})
+
+
+def config_gpu_archs(cfg: dict, found: list | None = None) -> set:
+    """The compute capabilities of the NVIDIA cards a config runs on (its "gpu" numbers, as nvidia-smi numbers them;
+    a card that is gone, or too old for any engine, is left out)."""
+    try:
+        cards = {int(g["index"]): int(g["arch"]) for g in (S.gpus() if found is None else found) or []}
+    except Exception:  # noqa: BLE001 - no nvidia-smi, or it failed: none
+        cards = {}
+    ids = cfg.get("gpu") if isinstance(cfg.get("gpu"), list) else [cfg["gpu"]] if isinstance(cfg.get("gpu"), int) else []
+    return {cards[i] for i in ids if isinstance(i, int) and i in cards and cards[i] >= MIN_CC}
+
+
+def archs_in_use(archs) -> list:
+    """The CUDA archs build/ is compiled for: `archs` (the GPUs chosen now) and those of the cards every installed
+    config of this build folder runs on - the engines share one CMake cache, so a setup (or --rebuild) for one model
+    on one card would otherwise compile the next engine without another model's cards (an RTX 5090 + 4070 SUPER: GLM
+    on the 5090, Hy4-Flash on both)."""
+    want = {int(x) for x in archs}
+    cfgs = [c for c in map(read_json, configs()) if target_of_exe(c.get("exe"))]
+    if cfgs:
+        try:
+            found = S.gpus() or []
+        except Exception:  # noqa: BLE001
+            found = []
+        for c in cfgs:
+            want |= config_gpu_archs(c, found)
+    return sorted(want)
+
+
+def nvcc_builds(nvcc, archs) -> bool:
+    """Whether this toolkit's release can compile for all of these GPUs (nvcc_range; an unknown release: assumed)."""
+    v = S.nvcc_version(nvcc) if nvcc else None
+    if not v:
+        return True
+    lo, hi = nvcc_range(archs)
+    return v >= lo and (hi is None or v < hi)
+
+
 def build_step(a, pc, llama: Path, target: str = "maya") -> dict:
     step(4, "the engine")
     src = S.source_hash(S.ENGINE_SOURCES)              # src/, include/, third_party/ggml, CMakeLists.txt
@@ -2981,22 +3048,38 @@ def build_step(a, pc, llama: Path, target: str = "maya") -> dict:
             ok(f"Metal engine already compiled: {exe}")
             return meta
         return compile_engine_metal(llama, src)
+    # --rebuild: every engine this PC uses, with the same compiler and GPUs (not only this model's - #1066)
+    every = engines_in_use(target) if a.rebuild else [target]
+    if len(every) > 1:
+        say("  --rebuild: compiling every engine this PC uses (" + ", ".join(every) + "), not only this model's")
     if pc.get("backend") == "hip":
         if (exe.exists() and not a.rebuild and meta.get("backend") == "hip" and meta.get("src") == src
                 and meta.get("archs") == pc["archs"] and meta.get("rocm") == pc["rocm"]
                 and target in (meta.get("targets") or ["maya"])):
             ok(f"HIP engine already compiled: {exe}")
             return meta
-        return compile_engine_hip(pc, llama, src, target=target)
-    if (exe.exists() and not a.rebuild and meta.get("src") == src and set(pc["archs"]) <= set(meta.get("archs", []))
+        return compile_engine_hip(pc, llama, src, target=target, also=every[1:])
+    archs = archs_in_use(pc["archs"])                  # (the other installed models' cards too)
+    if (exe.exists() and not a.rebuild and meta.get("src") == src and set(archs) <= set(meta.get("archs", []))
             and target in (meta.get("targets") or ["maya"])
             and (not a.nvcc or a.nvcc == meta.get("nvcc"))
             and (not a.host_compiler or a.host_compiler == meta.get("host_compiler"))):
         ok(f"engine already compiled for " + ", ".join(f"sm_{x}" for x in meta["archs"]) + f": {exe}")
         return meta
-    nvcc, hc = toolchain_for(pc["archs"], a.nvcc, a.host_compiler)
+    nvcc, hc = toolchain_for(archs, a.nvcc, a.host_compiler)
+    if archs != sorted(int(x) for x in pc["archs"]) and not nvcc_builds(nvcc, archs):
+        # (no toolkit here compiles for this model's cards and another model's together: this model's, as before)
+        warn("another installed model runs on " + ", ".join(f"sm_{x}" for x in archs if x not in pc["archs"]) +
+             f", which {nvcc} does not compile for beside " + ", ".join(f"sm_{x}" for x in pc["archs"]) +
+             ": the engine is compiled for this model's GPUs only")
+        archs = sorted(int(x) for x in pc["archs"])
+        nvcc, hc = toolchain_for(archs, a.nvcc, a.host_compiler)
+    elif archs != sorted(int(x) for x in pc["archs"]):
+        ok("also compiled for " + ", ".join(f"sm_{x}" for x in archs if x not in pc["archs"]) +
+           " (the GPUs another installed model runs on)")
     pc["nvcc"] = nvcc or pc["nvcc"]
-    return compile_engine(pc["archs"], [g["index"] for g in pc["gpus"]], pc["nvcc"], hc, llama, src, target=target)
+    return compile_engine(archs, [g["index"] for g in pc["gpus"]], pc["nvcc"], hc, llama, src, target=target,
+                          also=every[1:])
 
 
 def mixed_builds(a, pc, llama: Path, target: str, quiet: bool = False) -> None:
@@ -3119,7 +3202,11 @@ def refresh_engine(cfg: dict) -> None:
              "not started",
              f"{ME} --setup --rebuild finds the compiler and compiles the engine again")
     gpu_ids = meta.get("gpu_ids") or (cfg.get("gpu") if isinstance(cfg.get("gpu"), list) else [0])
-    compile_engine(meta["archs"], gpu_ids, nvcc, meta.get("host_compiler"), llama, src, soft=True, target=target)
+    # (the cards this config runs on too: the last setup may have been another model's, on other GPUs - #1066)
+    archs = sorted(set(meta["archs"]) | config_gpu_archs(cfg))
+    if archs != sorted(meta["archs"]) and not nvcc_builds(nvcc, archs):
+        archs = meta["archs"]
+    compile_engine(archs, gpu_ids, nvcc, meta.get("host_compiler"), llama, src, soft=True, target=target)
 
 
 # ------------------------------------------------------------------------------------------------ 5. the model
