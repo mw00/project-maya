@@ -39,6 +39,7 @@
 #include <map>
 #include <mutex>
 #include <thread>
+#include <type_traits>
 
 namespace hy4 {
 
@@ -272,6 +273,10 @@ struct Gpu {
     cudaEvent_t ev = nullptr;   // (the CPU lane's: its inputs copied)
     std::vector<void*> allocs;
     size_t used = 0;
+    // scratch()'s buffers: one allocation, carved in order (idle between forwards - the vision tower's room for a
+    // picture is lent from its start: vis_encode)
+    uint8_t* arena = nullptr;
+    size_t arena_b = 0;
     // a window's activations
     float *x = nullptr, *cur = nullptr, *post = nullptr, *xa = nullptr, *qa = nullptr, *qr = nullptr, *q = nullptr;
     float *qcat = nullptr, *kvr = nullptr, *o = nullptr, *ob = nullptr, *g = nullptr, *y = nullptr, *xf = nullptr;
@@ -449,7 +454,18 @@ struct Model::Impl {
     std::vector<int> tokens;             // the sequence so far (Engram's n-gram history)
     std::unique_ptr<Vision> vis;         // the vision tower (Options::vision)
     VisionGeo vgeo;
-    double vis_room = 0;                 // its room for the largest picture, kept free on the main GPU
+    double vis_room = 0;                 // its room for the largest picture this start reads
+    // That room is LENT, never resident: a picture is read before its prompt, when the head GPU's scratch (scratch():
+    // one allocation) is idle - the tower works in its start and the bytes it used are zeroed after (vis_encode).  So
+    // nothing is kept free for pictures and the plan places the experts as a start without pictures does.  Only where
+    // a scratch is smaller than a picture's room (a small --chunk) is it made longer by what is missing (vis_keep:
+    // tens of MB on an 8 GB card at its smallest context, not the room).  HY4_VISION_LEND=0: nothing lent - the whole
+    // room kept free between pictures and allocated for each, as before.
+    bool vis_lend_on = true;
+    double vis_lend = 0;                 // (the plan's: the head GPU's scratch at least this large)
+    double vis_keep = 0;                 // (the plan's: bytes of the main GPU a picture's room costs - 0 where lent)
+    bool vis_lent = false;               // (the load's: the head GPU's scratch holds the largest picture's room)
+    long long vis_lent_n = 0, vis_own_n = 0;   // (pictures read in the scratch / in an allocation of their own)
     int vis_tok = -1, vis_tok_map = -1;  // (the image token's n-gram map entry before the tower took it)
     std::vector<Model::Image> imgs;      // the request's pictures (their positions' rows)
     // the embeddings of positions p0 .. p0 + T - 1 that are a picture's image tokens: its rows (dst [T][E])
@@ -922,7 +938,26 @@ struct Model::Impl {
                     (G[i].bw > G[(size_t) main_gi].bw / 1.15 && free_b[i] > free_b[(size_t) main_gi] + 1e9))
                     main_gi = (int) i;
         }
-        free_b[(size_t) main_gi] -= vis_room;   // (the vision tower's room for a picture: free between pictures)
+        // the vision tower's room for a picture: lent by the head GPU's scratch where that holds it (the smallest a
+        // GPU's scratch can be in this start: a tensor-parallel member's share over every GPU given) - nothing is kept
+        // free then; else the scratch is made longer by what it lacks (vis_keep)
+        vis_lend = vis_keep = 0;
+        if (vis_room > 0) {
+            const char* vl = std::getenv("HY4_VISION_LEND");
+            vis_lend_on = !(vl && vl[0] == '0');
+            if (vis_lend_on) {
+                const int N = (int) std::max<size_t>(1, devs.size());
+                int sH = 64, sFF = 0;
+                if (N > 1) {
+                    sH = sFF = 1;
+                    for (int il = 0; il < g.n_layer; ++il) sH = std::max(sH, (g.heads[(size_t) il] + N - 1) / N);
+                    for (int ff : {g.n_ff, g.n_ff_exp * g.n_shared}) sFF = std::max(sFF, ((ff + N - 1) / N + 255) / 256 * 256);
+                }
+                vis_lend = (double) arena_bytes(sH, sFF);
+            }
+            vis_keep = vision_keep(vis_room, vis_lend);
+        }
+        free_b[(size_t) main_gi] -= vis_keep;
         // tensor parallel: --tp N, or auto (-1): over the largest group of GPUs of one kind when it holds everything -
         // the layer split otherwise (an INFO line says why)
         if (o.tp != 0 && o.tp != 1) {
@@ -1037,47 +1072,58 @@ struct Model::Impl {
             double eb = 0;
             for (int il = 0; il < g.n_layer; ++il) eb = std::max(eb, (double) expert_bytes(il));
             for (double& f : free_b) f -= eb * kStage;
+            // (one GPU: its staging slots are its scratch's end - a picture's room is lent from both)
+            if (vis_lend > 0 && devs.size() == 1 && eb > 768) {
+                vis_lend += (eb - 768) * kStage;
+                const double keep = vision_keep(vis_room, vis_lend);
+                free_b[(size_t) main_gi] += vis_keep - keep;
+                vis_keep = keep;
+            }
         }
         // what the model's own parts fit with (hy4_plan.hpp's kv_pick): as asked - else, in turn, with the cache in
         // 8-bit rows (--kv auto) and a picture's room kept, with the room of a smaller picture (F16 rows, then 8-bit:
         // as many patches as this VRAM holds, a sixteenth of the tower's largest picture at least - the server makes
         // the pictures that size), with F16 rows and no picture's room (pictures not asked for by name), with 8-bit
-        // rows and no room.  Pictures go before the rows' precision
-        const double vr = vis_room;
+        // rows and no room.  Pictures go before the rows' precision.  A picture the scratch lends its room keeps
+        // nothing free (keep_bytes 0): every step with one is then the step without, and pictures cost no row's
+        // precision, no context and no expert its place
+        const double vr = vis_room, vk = vis_keep;
         const long long vis_n = vr > 0 ? (long long) vgeo.max_pixels / ((long long) vgeo.patch * vgeo.patch) : 0;
-        auto vis_bytes = [&](long long n) {
-            VisionGeo vg = vgeo;
-            vg.max_pixels = (int) (n * vgeo.patch * vgeo.patch);
-            return (double) Vision::room_for(vg);
+        auto vis_bytes = [&](long long n) { return vis_room_of(n); };
+        auto keep_bytes = [&](long long n) {
+            return vision_keep(vis_bytes(n), vis_lend);
         };
         const KvPick pick = kv_pick([&](bool q8, double room) {
             const bool was = kv_q8;
             kv_q8 = q8;
-            free_b[(size_t) main_gi] += vr - room;
+            free_b[(size_t) main_gi] += vk - room;
             const bool fit = place(rho, false) || place(0.0, false);
-            free_b[(size_t) main_gi] -= vr - room;
+            free_b[(size_t) main_gi] -= vk - room;
             kv_q8 = was;
             return fit;
         }, kv_q8, o.kv < 0 && kv_q8_rows(), vr > 0, o.vision_auto, vis_n,
-           std::max<long long>(vis_n / 16, (long long) vgeo.min_pixels / ((long long) vgeo.patch * vgeo.patch) + 1), vis_bytes);
+           std::max<long long>(vis_n / 16, (long long) vgeo.min_pixels / ((long long) vgeo.patch * vgeo.patch) + 1), keep_bytes);
         if (pick.fits && pick.vision && pick.patches < vis_n) {
             // (a picture's room for fewer patches than the tower's largest: the engine says the size, the server
             //  resizes to it - `INFO vision=hy4 ... vision_max_pixels`)
             vgeo.max_pixels = (int) (pick.patches * vgeo.patch * vgeo.patch);
             vis_room = vis_bytes(pick.patches);
-            free_b[(size_t) main_gi] += vr - vis_room;
-            char sb[320];
+            vis_keep = keep_bytes(pick.patches);
+            free_b[(size_t) main_gi] += vk - vis_keep;
+            char sb[400];
             std::snprintf(sb, sizeof sb, "INFO pictures up to %d pixels on this GPU (the tower's largest: %lld): CUDA%d "
-                          "has %.0f MB for a picture beside the model's dense parts and caches at this context, the "
-                          "largest takes %.0f MB", vgeo.max_pixels, vis_n * vgeo.patch * vgeo.patch,
-                          G[(size_t) main_gi].dev, vis_room / 1048576.0, vr / 1048576.0);
+                          "has %.0f MB for a picture (%s) beside the model's dense parts and caches at this context, "
+                          "the largest takes %.0f MB", vgeo.max_pixels, vis_n * vgeo.patch * vgeo.patch,
+                          G[(size_t) main_gi].dev, vis_room / 1048576.0,
+                          !vis_lend_on ? "kept free" : "lent by the prompt buffers", vr / 1048576.0);
             info.push_back(sb);
         }
         if (pick.q8 && !kv_q8) {
             char qb[360];
             std::snprintf(qb, sizeof qb, "INFO the latent cache in 8-bit rows (--kv auto): with F16 rows a context of %lld "
                           "tokens does not fit in the VRAM beside the model's dense parts%s (the cache: %.2f GB in 8-bit "
-                          "rows, %.2f GB in F16)", (long long) o.max_ctx, pick.vision ? " and a picture's room" : "",
+                          "rows, %.2f GB in F16)", (long long) o.max_ctx,
+                          pick.vision && keep_bytes(pick.patches) > 0 ? " and a picture's room" : "",
                           cache_gb(true), cache_gb(false));
             info.push_back(qb);
             kv_q8 = true;
@@ -1090,7 +1136,8 @@ struct Model::Impl {
                           "smallest it would take) beside the model's dense parts and caches at this context - text only",
                           G[(size_t) main_gi].dev, vis_room / 1048576.0, vis_bytes(std::max(1LL, vis_n / 16)) / 1048576.0);
             info.push_back(vb);
-            free_b[(size_t) main_gi] += vis_room;
+            free_b[(size_t) main_gi] += vis_keep;
+            vis_keep = 0;
             vis_room = 0;
             o.vision = false;
             if (vis_tok >= 0) pk.eg.token_map[(size_t) vis_tok] = vis_tok_map;
@@ -1098,9 +1145,15 @@ struct Model::Impl {
         if (!place(rho, false)) {
             double lo = 0.0, hi = rho;
             if (!place(0.0, false)) {
+                // (what helps: a smaller context only above the smallest one offered - the setup's 4K, maya.py's
+                //  HY4_CONTEXTS - else a smaller size of the model or more VRAM)
+                constexpr long long kLeastCtx = 4096;
                 err = std::string("the model's dense parts and caches do not fit in the GPUs' VRAM even with every routed "
                                   "expert on the CPU") + (o.kv < 0 && kv_q8_rows() ? " and the latent cache in 8-bit rows" : "") +
-                      " (--max-context smaller, or more GPUs)";
+                      ((long long) o.max_ctx > kLeastCtx
+                           ? " (--max-context smaller, a smaller size of the model, or more GPUs)"
+                           : " (at the smallest context, 4096 tokens: a smaller size of the model, a card with more VRAM, "
+                             "or more GPUs)");
                 return false;
             }
             for (int it = 0; it < 30; ++it) {
@@ -1774,8 +1827,10 @@ struct Model::Impl {
         return flush();
     }
 
-    bool scratch(Gpu& gp, std::string& err) {
-        CK(cudaSetDevice(gp.dev));
+    // (only_bytes: nothing allocated - what the buffers come to for this GPU's sH / sFF.  stage_b: the GPU's staging
+    //  slots for a prompt's streamed experts, at the allocation's end - a pass's copy, idle between prompts as the rest)
+    bool scratch(Gpu& gp, std::string& err, size_t* only_bytes = nullptr, size_t stage_b = 0) {
+        if (!only_bytes) CK(cudaSetDevice(gp.dev));
         const size_t E = (size_t) g.n_embd, hc = (size_t) g.hc, H = (size_t) gp.sH, maxk = (size_t) g.ix_top_k + g.ix_kpool;
         const size_t lat = (size_t) g.n_lat, ff = (size_t) (gp.sFF ? gp.sFF : g.n_ff), ffe = (size_t) g.n_ff_exp,
                      T = (size_t) Tc;
@@ -1783,40 +1838,112 @@ struct Model::Impl {
         const size_t qk = std::max({H * (size_t) g.v_mla, ff, H * (size_t) g.kv_lora, (size_t) g.q_lora, egc, E});
         const size_t npool = (size_t) (o.max_ctx / g.ix_kpool + 1);
         const size_t att = dense_att_values(kSub, H, (size_t) g.n_swa, (size_t) dense_max);
-        if (cublasCreate(&gp.blas) != CUBLAS_STATUS_SUCCESS || cublasSetStream(gp.blas, gp.s) != CUBLAS_STATUS_SUCCESS) {
+        if (!only_bytes && (cublasCreate(&gp.blas) != CUBLAS_STATUS_SUCCESS || cublasSetStream(gp.blas, gp.s) != CUBLAS_STATUS_SUCCESS)) {
             err = "GPU " + std::to_string(gp.dev) + ": cuBLAS did not start";
             return false;
         }
         gp.wband_n = kBand;
-        return gp.alloc(gp.x, T * hc * E, err) && gp.alloc(gp.cur, T * E, err) && gp.alloc(gp.post, T * hc, err) &&
-               gp.alloc(gp.xa, T * E, err) && gp.alloc(gp.qa, T * g.q_lora, err) && gp.alloc(gp.qr, T * g.q_lora, err) &&
-               gp.alloc(gp.q, T * H * g.k_mla, err) && gp.alloc(gp.qcat, T * H * g.kv_row(), err) &&
-               gp.alloc(gp.kvr, T * g.kv_row(), err) && gp.alloc(gp.o, T * H * g.kv_lora, err) &&
-               gp.alloc(gp.ob, T * H * g.v_mla, err) && gp.alloc(gp.g, T * H * g.v_mla, err) &&
-               gp.alloc(gp.y, T * E, err) && gp.alloc(gp.xf, T * E, err) && gp.alloc(gp.gu, T * ff * 2, err) &&
-               gp.alloc(gp.hd, T * ff, err) && gp.alloc(gp.rl, T * g.n_expert, err) && gp.alloc(gp.rw, T * 16, err) &&
-               gp.alloc(gp.ids, T * 16, err) && gp.alloc(gp.lat, T * lat, err) && gp.alloc(gp.latout, T * (lat + (gp.sFF ? E : 0)), err) &&
-               gp.alloc(gp.xq, W * qk, err) && gp.alloc(gp.xd, W * qk / 32, err) &&
-               gp.alloc(gp.x2q, 2 * W * lat, err) && gp.alloc(gp.x2d, 2 * W * lat / 32, err) &&
-               gp.alloc(gp.eh, 16 * W * ffe, err) && gp.alloc(gp.ehq, 16 * W * ffe, err) &&
-               gp.alloc(gp.ehd, 16 * W * ffe / 32, err) && gp.alloc(gp.part, 16 * W * lat, err) &&
-               gp.alloc(gp.grp_ptr, 16 * W + 1, err) && gp.alloc(gp.plan, 16, err) &&
-               gp.alloc(gp.grp_start, 16 * W + 2, err) && gp.alloc(gp.grp_ent, 16 * W, err) &&
-               gp.alloc(gp.n_groups, 1, err) &&
-               gp.alloc(gp.ws, k::attn_ws_floats(kSub, (int) H, g.kv_lora, (int) maxk), err) &&
-               gp.alloc(gp.pos, 3 * T, err) && gp.alloc(gp.keys, T * maxk, err) && gp.alloc(gp.knk, T, err) &&
-               gp.alloc(gp.iq, T * g.ix_heads * g.ix_dim, err) && gp.alloc(gp.ik, T * g.ix_dim, err) &&
-               gp.alloc(gp.ivt, T * 2 * g.ix_dim, err) && gp.alloc(gp.wt, T * g.ix_heads, err) &&
-               gp.alloc(gp.score, (size_t) kSub * npool, err) && gp.alloc(gp.eg_rows, T * egc, err) &&
-               gp.alloc(gp.eg_valid, T, err) && gp.alloc(gp.eg_r, T * egc, err) &&
-               (eg_scale == nullptr || gp.alloc(gp.eg_sc, T * (size_t) std::max(1, pk.eg.cols()), err)) &&
-               gp.alloc(gp.eg_kvo, T * (hc + 1) * E, err) && gp.alloc(gp.hcur, T * E, err) &&
-               gp.alloc(gp.xh16, T * qk, err) && gp.alloc(gp.wband, kBand, err) && gp.alloc(gp.sh16, 16 * T * ffe, err) &&
-               gp.alloc(gp.sy, 16 * T * lat, err) && gp.alloc(gp.cpo, T * lat, err) && gp.alloc(gp.bounds, 1025, err) && gp.alloc(gp.stok, 16 * T, err) &&
-               gp.alloc(gp.srow, 16 * T, err) && gp.alloc(gp.sS, att, err) && gp.alloc(gp.sP, att, err) &&
-               gp.alloc(gp.dmask, (size_t) kSub * dense_max, err) &&
-               gp.alloc(gp.kbuf, deq_rows() * g.kv_row(), err) &&
-               (gp.lo = gp.pos + T, gp.nk = gp.pos + 2 * T, true);
+        // every buffer a whole number of 256 bytes, as cudaMalloc gave them one by one: pass 0 sums them, pass 1 carves
+        // the one allocation in the same order
+        size_t at = 0;
+        bool carve = false;
+        auto take = [&](auto*& p, size_t n) {
+            const size_t b = (std::max<size_t>(n * sizeof(*p), 256) + 255) & ~(size_t) 255;
+            if (carve) p = (std::remove_reference_t<decltype(p)>) (void*) (gp.arena + at);
+            at += b;
+            return true;
+        };
+        auto all = [&]() {
+            return take(gp.x, T * hc * E) && take(gp.cur, T * E) && take(gp.post, T * hc) &&
+               take(gp.xa, T * E) && take(gp.qa, T * g.q_lora) && take(gp.qr, T * g.q_lora) &&
+               take(gp.q, T * H * g.k_mla) && take(gp.qcat, T * H * g.kv_row()) &&
+               take(gp.kvr, T * g.kv_row()) && take(gp.o, T * H * g.kv_lora) &&
+               take(gp.ob, T * H * g.v_mla) && take(gp.g, T * H * g.v_mla) &&
+               take(gp.y, T * E) && take(gp.xf, T * E) && take(gp.gu, T * ff * 2) &&
+               take(gp.hd, T * ff) && take(gp.rl, T * g.n_expert) && take(gp.rw, T * 16) &&
+               take(gp.ids, T * 16) && take(gp.lat, T * lat) && take(gp.latout, T * (lat + (gp.sFF ? E : 0))) &&
+               take(gp.xq, W * qk) && take(gp.xd, W * qk / 32) &&
+               take(gp.x2q, 2 * W * lat) && take(gp.x2d, 2 * W * lat / 32) &&
+               take(gp.eh, 16 * W * ffe) && take(gp.ehq, 16 * W * ffe) &&
+               take(gp.ehd, 16 * W * ffe / 32) && take(gp.part, 16 * W * lat) &&
+               take(gp.grp_ptr, 16 * W + 1) && take(gp.plan, 16) &&
+               take(gp.grp_start, 16 * W + 2) && take(gp.grp_ent, 16 * W) &&
+               take(gp.n_groups, 1) &&
+               take(gp.ws, k::attn_ws_floats(kSub, (int) H, g.kv_lora, (int) maxk)) &&
+               take(gp.pos, 3 * T) && take(gp.keys, T * maxk) && take(gp.knk, T) &&
+               take(gp.iq, T * g.ix_heads * g.ix_dim) && take(gp.ik, T * g.ix_dim) &&
+               take(gp.ivt, T * 2 * g.ix_dim) && take(gp.wt, T * g.ix_heads) &&
+               take(gp.score, (size_t) kSub * npool) && take(gp.eg_rows, T * egc) &&
+               take(gp.eg_valid, T) && take(gp.eg_r, T * egc) &&
+               (eg_scale == nullptr || take(gp.eg_sc, T * (size_t) std::max(1, pk.eg.cols()))) &&
+               take(gp.eg_kvo, T * (hc + 1) * E) && take(gp.hcur, T * E) &&
+               take(gp.xh16, T * qk) && take(gp.wband, kBand) && take(gp.sh16, 16 * T * ffe) &&
+               take(gp.sy, 16 * T * lat) && take(gp.cpo, T * lat) && take(gp.bounds, 1025) && take(gp.stok, 16 * T) &&
+               take(gp.srow, 16 * T) && take(gp.sS, att) && take(gp.sP, att) &&
+               take(gp.dmask, (size_t) kSub * dense_max) &&
+               take(gp.kbuf, deq_rows() * g.kv_row()) &&
+               (stage_b == 0 || take(gp.stage, stage_b));
+        };
+        // (the head GPU's: what its buffers lack of the largest picture's room - the plan's vis_keep - at their end)
+        const size_t pad_b = !only_bytes && vis_lend_on && !G.empty() && &gp == &G[(size_t) head_gpu] ? (size_t) vis_keep : 0;
+        all();
+        if (only_bytes) {
+            *only_bytes = at;
+            return true;
+        }
+        if (!gp.alloc(gp.arena, at + pad_b, err)) return false;
+        gp.arena_b = at + pad_b;
+        at = 0;
+        carve = true;
+        all();
+        gp.lo = gp.pos + T;
+        gp.nk = gp.pos + 2 * T;
+        return true;
+    }
+
+    // the room of the largest picture of `n` patches
+    double vis_room_of(long long n) const {
+        VisionGeo vg = vgeo;
+        vg.max_pixels = (int) (n * vgeo.patch * vgeo.patch);
+        return (double) Vision::room_for(vg);
+    }
+
+    // A picture's rows: the tower works in the head GPU's scratch, idle now (a queued MTP pass settled, the GPU's
+    // stream drained) - where the picture's room fits in it; the bytes it used are zeroed after, so the next forward
+    // finds the scratch the same whatever the picture was.  Else (HY4_VISION_LEND=0)
+    // the encode allocates the room from the VRAM the plan kept free and frees it.
+    bool vis_encode(const uint8_t* rgb, int width, int height, std::vector<float>& rows, std::string& err) {
+        Gpu& hg = G[(size_t) head_gpu];
+        uint8_t* room = nullptr;
+        size_t cap = 0;
+        if (vis_lend_on && hg.arena && vis->device() == hg.dev && vis->room_of(width, height) <= hg.arena_b) {
+            mtp_settle();
+            CK(cudaSetDevice(hg.dev));
+            CK(cudaStreamSynchronize(hg.s));
+            room = hg.arena;
+            cap = hg.arena_b;
+        }
+        const bool ok = vis->encode(rgb, width, height, rows, err, room, cap);
+        if (vis->last_lent()) {
+            ++vis_lent_n;
+            CK(cudaSetDevice(hg.dev));
+            CK(cudaMemsetAsync(hg.arena, 0, std::min(vis->last_bytes(), hg.arena_b), hg.s));
+            CK(cudaStreamSynchronize(hg.s));
+        } else if (ok) {
+            ++vis_own_n;
+        }
+        return ok;
+    }
+
+    // scratch()'s bytes for a GPU that takes the most heads `sH` and the widest FFN `sFF` (0: the model's) of a layer
+    size_t arena_bytes(int sH = 64, int sFF = 0) {
+        Gpu t;
+        t.sH = sH;
+        t.sFF = sFF;
+        size_t n = 0;
+        std::string e;
+        scratch(t, e, &n);
+        return n;
     }
 
     bool load(const Options& opt, std::string& err) {
@@ -2044,9 +2171,6 @@ struct Model::Impl {
                 th.emplace_back([&, gi] {
                     for (auto& l : L)
                         if (l.gpu == (int) gi && !load_layer(l, errs[gi])) return;
-                    bool used = (int) gi == head_gpu;
-                    for (auto& l : L) used |= l.gpu == (int) gi;
-                    if (used) scratch(G[gi], errs[gi]);
                 });
             for (auto& t : th) t.join();
             for (auto& e : errs)
@@ -2054,6 +2178,18 @@ struct Model::Impl {
                     err = e;
                     return false;
                 }
+            // each GPU's scratch, after its layers as before - with its staging slots (a GPU with layers whose
+            // experts are not all in VRAM: kStage of the largest blob) at its end, one allocation
+            size_t blob = 0;
+            for (const Layer& l : L) blob = std::max(blob, l.blob);
+            for (size_t gi = 0; gi < G.size(); ++gi) {
+                bool used = (int) gi == head_gpu, part = false;
+                for (auto& l : L) {
+                    used |= l.gpu == (int) gi;
+                    part |= l.gpu == (int) gi && l.partial();
+                }
+                if (used && !scratch(G[gi], err, nullptr, part ? blob * kStage : 0)) return false;
+            }
         }
         // the head
         Gpu& hg = G[(size_t) head_gpu];
@@ -2149,7 +2285,8 @@ struct Model::Impl {
                 for (const Layer& l : L) any |= l.gpu == (int) gi && l.partial();
                 if (!any) continue;
                 CK(cudaSetDevice(G[gi].dev));
-                if (!G[gi].alloc(G[gi].stage, blob * kStage, err) || !G[gi].alloc(G[gi].pmap, (size_t) g.n_expert, err))
+                if ((!G[gi].stage && !G[gi].alloc(G[gi].stage, blob * kStage, err)) ||
+                    !G[gi].alloc(G[gi].pmap, (size_t) g.n_expert, err))
                     return false;
                 // the GPU's PCIe as streaming sees it: the pinned bounce to the staging slots
                 CK(cudaMemcpy(G[gi].stage, h_stage, blob * kStage, cudaMemcpyHostToDevice));
@@ -2232,11 +2369,38 @@ struct Model::Impl {
                 vis.reset();
                 cudaGetLastError();
             } else {
-                char vb[320];
+                // (where the room comes from: the head GPU's scratch as it was allocated, else the room kept free)
+                const Gpu& vg = G[(size_t) head_gpu];
+                vis_lent = vis_lend_on && vg.arena != nullptr && (double) vg.arena_b >= vis_room;
+                if (!vis_lent && vis_lend_on && vg.arena != nullptr) {
+                    // (the plan counted on a larger scratch than this GPU's came to: the pictures it does hold)
+                    long long lo = 1, hi = (long long) vgeo.max_pixels / ((long long) vgeo.patch * vgeo.patch);
+                    while (hi - lo > 64) {
+                        const long long mid = lo + (hi - lo) / 2;
+                        if (vis_room_of(mid) <= (double) vg.arena_b) lo = mid;
+                        else hi = mid;
+                    }
+                    if (vis_room_of(lo) <= (double) vg.arena_b) {
+                        vgeo.max_pixels = (int) (lo * vgeo.patch * vgeo.patch);
+                        vis_room = vis_room_of(lo);
+                        vis_lent = true;
+                    }
+                }
+                char how[200];
+                if (vis_lent && vis_keep > 0)
+                    std::snprintf(how, sizeof how, "lent by the prompt buffers (%zu MB) while a picture is read: %.0f MB "
+                                  "added to them for it, no other VRAM kept for pictures", vg.arena_b >> 20,
+                                  vis_keep / 1048576.0);
+                else if (vis_lent)
+                    std::snprintf(how, sizeof how, "lent by the prompt buffers (%zu MB) while a picture is read: no VRAM "
+                                  "kept for pictures", vg.arena_b >> 20);
+                else
+                    std::snprintf(how, sizeof how, "kept free there between pictures");
+                char vb[560];
                 std::snprintf(vb, sizeof vb, "INFO vision tower: %zu MB in host memory (the pack's mapping), a picture "
-                              "at a time on CUDA%d (up to %.0f MB, kept free there between pictures), up to %d pixels "
+                              "at a time on CUDA%d (up to %.0f MB, %s), up to %d pixels "
                               "a picture (a square one: %d image tokens)", vis->host_bytes() >> 20, vdev,
-                              vis_room / 1048576.0, vgeo.max_pixels,
+                              vis_room / 1048576.0, how, vgeo.max_pixels,
                               vgeo.tokens((int) std::sqrt((double) vgeo.max_pixels) / vgeo.factor() * vgeo.factor(),
                                           (int) std::sqrt((double) vgeo.max_pixels) / vgeo.factor() * vgeo.factor()));
                 info.push_back(vb);
@@ -2910,7 +3074,11 @@ struct Model::Impl {
                     for (char c : used) n_u += c;
                     const double est_cpu = n_ent * cpu_us_et * 1e-3;   // (ms)
                     const double est_stream = (double) n_u * l.blob * (1.0 / (gp.h2d_gbs * 1e6) + 1.0 / (copy_gbs * 1e6));
-                    if (est_stream < est_cpu) {
+                    // (HY4_ROUTE=stream|lane: the choice pinned.  The two routes sum a token's experts in another
+                    //  order, so a start that picks by its timings is not the same from run to run in the last bit;
+                    //  pinned, two runs - and two builds - can be compared token for token)
+                    static const char* const route = std::getenv("HY4_ROUTE");
+                    if (route && (route[0] == 's' || route[0] == 'l') ? route[0] == 's' : est_stream < est_cpu) {
                         const double ts = now_s();
                         const double c0 = st.stream_ms;
                         ok = ok && experts_streamed(l, gp, T, err);
@@ -4038,12 +4206,18 @@ bool Model::save_profile(std::string& err) const {
 }
 int Model::eos() const { return m->g.eos; }
 const VisionGeo* Model::vision() const { return m->vis ? &m->vgeo : nullptr; }
+const char* Model::vision_room() const { return !m->vis ? nullptr : m->vis_lent ? "chunk" : "free"; }
+size_t Model::vision_room_bytes() const { return m->vis ? (size_t) m->vis_room : 0; }
+void Model::vision_reads(long long& lent, long long& own) const {
+    lent = m->vis_lent_n;
+    own = m->vis_own_n;
+}
 bool Model::encode_image(const uint8_t* rgb, int width, int height, std::vector<float>& rows, std::string& err) {
     if (!m->vis) {
         err = "no vision tower loaded (--vision on, and a pack with the mmproj file)";
         return false;
     }
-    if (!m->vis->encode(rgb, width, height, rows, err)) return false;
+    if (!m->vis_encode(rgb, width, height, rows, err)) return false;
     if (rows.size() != (size_t) m->vgeo.tokens(width, height) * (size_t) m->g.n_embd) {
         err = "vision: the tower gave " + std::to_string(rows.size()) + " values for a picture's " +
               std::to_string(m->vgeo.tokens(width, height)) + " rows";

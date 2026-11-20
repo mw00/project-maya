@@ -396,22 +396,24 @@ class Settings(unittest.TestCase):
             return c["installer"].get("chunk_by_hand")
         wide = cfg_with(4096, 512)                     # (the setup's on a card with room for both at 4K)
         self.assertTrue(M.settings_of(wide)["images"])
-        with cards(9.5):                               # 8.5 GB for the model: 6.5 + 0.81 + 0.95 at 4K
+        with cards(9.5):                               # 8.5 GB for the model: 6.5 + 0.95 at 4K (pictures take none)
             self.assertEqual(M.apply(wide, M.settings_of(wide)), wide)      # (a save that changes nothing)
             self.assertEqual(chunk(M.apply(wide, {"cpu_threads": 8})), "512")
-            for ctx in (8192, 16384, 32768):           # (8K: 6.8 + 0.81 + 0.95 is more than there is)
+            # (8K: 6.8 + 0.95 fits; 16K and 32K: 7.6 / 7.9 in F16 rows + 0.95 is more than there is)
+            for ctx, want in ((8192, "512"), (16384, "256"), (32768, "256")):
                 new = M.apply(wide, {**M.settings_of(wide), "context": ctx})   # (the page sends all it shows)
-                self.assertEqual((M.flag(new["args"], "--max-context"), chunk(new), by_hand(new)), (str(ctx), "256", None))
-                fit = M.hy4_refit(new)                 # ... and the largest picture's room is there
-                self.assertEqual((fit["vision"], fit["vision_small"], fit["chunk"]), (True, False, 256), ctx)
+                self.assertEqual((M.flag(new["args"], "--max-context"), chunk(new), by_hand(new)), (str(ctx), want, None))
+                fit = M.hy4_refit(new)                 # ... and the largest picture is read either way
+                self.assertEqual((fit["vision"], fit["vision_small"], fit["chunk"]), (True, False, int(want)), ctx)
                 self.assertNotIn("--kv", new["args"])
             at32 = M.apply(wide, {"context": 32768})
-            self.assertEqual(M.hy4_refit(at32)["kv"], "q8")
+            self.assertEqual(M.hy4_refit(at32)["kv"], "f16")   # (no 8-bit rows for a picture's sake)
             # back at 4K: the larger chunk again, as the setup writes it there
             self.assertEqual(chunk(M.apply(at32, {"context": 4096})), "512")
-            # pictures switched off: the room is the chunk's (the setup's --no-vision)
+            # pictures on or off: the same chunk (they take no VRAM of their own)
             self.assertEqual(chunk(M.apply(at32, {"context": 8192, "images": False})), "512")
-            self.assertEqual(chunk(M.apply(at32, {"context": 8192})), "256")
+            self.assertEqual(chunk(M.apply(at32, {"context": 8192})), "512")
+            self.assertEqual(chunk(M.apply(at32, {"context": 16384, "images": False})), "256")
             # another VRAM kept free than the layout's: the sums are not for it - the layout's own chunk
             self.assertEqual(chunk(M.apply(at32, {"context": 4096, "reserve_gb": 0.25})), "256")
             # a chunk set by hand stays: one that is not the layout's ...
@@ -429,17 +431,17 @@ class Settings(unittest.TestCase):
                 self.assertEqual((chunk(new), by_hand(new)), ("512", True), ctx)
             with self.assertRaisesRegex(ValueError, r"at 65536 tokens; this card has 8\.5 GB for them"):
                 M.apply(mine, {"context": 65536})      # (what fits is counted with the chunk that stays)
-            both = M.apply(at32, {"context": 8192, "prefill_chunk": 512})   # (changed with the context: the user's)
+            both = M.apply(at32, {"context": 16384, "prefill_chunk": 512})  # (changed with the context: the user's)
             self.assertEqual((chunk(both), by_hand(both)), ("512", True))
             # put back to the layout's choice by its user: the layout's again
             back = M.apply(mine, {"prefill_chunk": 256})
             self.assertEqual((chunk(back), by_hand(back)), ("256", None))
             self.assertEqual(chunk(M.apply(back, {"context": 4096})), "512")
         tight = cfg_with(4096, 512)
-        with cards(8.4):                               # 7.4 GB: at 32K the room left is a smaller picture's
+        with cards(8.4):                               # 7.4 GB: 32K in 8-bit rows - the largest picture all the same
             new = M.apply(tight, {"context": 32768})
             fit = M.hy4_refit(new)
-            self.assertEqual((chunk(new), fit["kv"], fit["vision"], fit["vision_small"]), ("256", "q8", True, True))
+            self.assertEqual((chunk(new), fit["kv"], fit["vision"], fit["vision_small"]), ("256", "q8", True, False))
             # the page's Reset (what the setup wrote, its chunk with its context): not a chunk set by hand
             new["installer"]["as_set_up"] = M.settings_of(tight)
             reset = M.apply(new, new["installer"]["as_set_up"])

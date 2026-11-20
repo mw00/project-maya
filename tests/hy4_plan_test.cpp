@@ -124,6 +124,39 @@ int main() {
         CHECK(!p.fits && !p.q8 && !p.vision);
         CHECK(c.tried == "fVqVf-q-");
     }
+    // a picture's room lent by the prompt buffers (vision_keep): nothing kept free, so a card the model's own parts
+    // fill reads the largest picture with the rows a text-only start has - no 8-bit rows, no smaller picture, no
+    // pictures turned off for the room
+    {
+        CHECK(hy4::vision_keep(0.8, 0.9) == 0.0 && hy4::vision_keep(0.8, 0.8) == 0.0);
+        CHECK(hy4::vision_keep(0.75, 0.5) == 0.25 && hy4::vision_keep(0.8, 0.0) == 0.8);
+        auto lent = [](Card& c, double lend, int kv, bool vision_auto) {
+            return hy4::kv_pick(c, kv == 1, kv < 0, true, vision_auto, kMax, 1024,
+                                [&](long long n) { return hy4::vision_keep(c.room(n), lend); });
+        };
+        Card a{7.0, 6.0, 1.0, 0.8, ""};   // (no room for a picture beside F16 rows: before, pictures off - 8-bit rows)
+        const hy4::KvPick p = lent(a, 0.9, -1, true);
+        CHECK(p.fits && !p.q8 && p.vision && p.patches == kMax);
+        CHECK(a.tried == "f-");
+        Card b{7.0, 6.0, 1.5, 0.8, ""};   // (8-bit rows for the context alone, as a text-only start: the picture whole)
+        const hy4::KvPick q = lent(b, 0.9, -1, true);
+        CHECK(q.fits && q.q8 && q.vision && q.patches == kMax);
+        CHECK(b.tried == "f-q-");
+        // buffers smaller than the largest picture's room (a small chunk): only what they lack is counted ...
+        Card c{7.35, 6.0, 1.0, 0.8, ""};   // (0.5 lent: 0.3 more - before, 0.8 did not fit beside F16 rows)
+        const hy4::KvPick r = lent(c, 0.5, -1, true);
+        CHECK(r.fits && !r.q8 && r.vision && r.patches == kMax);
+        CHECK(c.tried == "fv");
+        // ... and where that does not fit with the rows asked for (--kv f16), the largest picture the buffers hold
+        Card d{7.0, 6.0, 1.0, 0.8, ""};
+        const hy4::KvPick s = lent(d, 0.5, 0, true);
+        CHECK(s.fits && !s.q8 && s.vision && s.patches >= 1024 && s.patches < kMax);
+        CHECK(d.room(s.patches) <= 0.5 + 1e-9 && d.room(s.patches + 64) > 0.5);
+        // nothing lent at all (HY4_VISION_LEND=0): the plan as before
+        Card e{7.3, 6.0, 1.0, 0.8, ""}, f{7.3, 6.0, 1.0, 0.8, ""};
+        const hy4::KvPick t = lent(e, 0.0, -1, true), u = pick(f, -1, true, true, 1024);
+        CHECK(t.fits == u.fits && t.q8 == u.q8 && t.vision == u.vision && t.patches == u.patches && e.tried == f.tried);
+    }
     // --chunk auto (chunk_pick): the largest chunk whose plan keeps the layout, the cache's rows and the pictures of
     // the plan at the base chunk.  A rig in GB: every card `vram` free beyond the reserve; a tensor-parallel member
     // needs `member`, the head's GPU the head and the MTP block (`head`), a picture's room and a chunk's scratch

@@ -698,9 +698,9 @@ class Fit(unittest.TestCase):
         self.assertEqual((f["kv"], f["need"], f["chunk"]), ("f16", 6.8, 256))
         self.assertEqual(self.fit(8, ctx_wanted=4096)["kv"], "f16")
         f = self.fit(8, ctx_wanted=16384)
-        self.assertEqual((f["layout"], f["kv"], f["need"], f["vision"], f["vision_small"]), ("8gb", "q8", 7.0, True, True))
+        self.assertEqual((f["layout"], f["kv"], f["need"], f["vision"], f["vision_small"]), ("8gb", "q8", 7.0, True, False))
         f = self.fit(8, 1024)                              # (a desktop with 1 GB in use: 16K, not 32K)
-        self.assertEqual((f["context"], f["contexts"], f["kv"], f["vision"]), (16384, [4096, 8192, 16384], "q8", False))
+        self.assertEqual((f["context"], f["contexts"], f["kv"], f["vision"]), (16384, [4096, 8192, 16384], "q8", True))
         self.assertIn("error", self.fit(8, 1024, ctx_wanted=32768))
         for gib in (12, 16, 24, 32):                       # (cards every context fits with F16 rows: as before)
             f = self.fit(gib)
@@ -718,65 +718,62 @@ class Fit(unittest.TestCase):
                     f16, q8 = maya.hy4_fit_need_gib(plan, c) <= f["usable"], maya.hy4_fit_need_gib(plan, c, True) <= f["usable"]
                     self.assertEqual(c in f["contexts"], f16 or q8, (gib, used, c))
 
-    def test_pictures_only_where_their_room_fits(self):
-        """A picture's room on the main GPU beside the plan at the context chosen, pictures before the cache's rows
-        (the engine's order, src/hy4/hy4_plan.hpp): F16 rows + the largest picture's room (HY4_VISION_GIB), 8-bit
-        rows + that room, F16 then 8-bit rows + a smaller picture's room (HY4_VISION_MIN_GIB), then text only.  The
-        context is never made smaller for it; the prompt chunk is doubled only with what the picture leaves."""
-        f = self.fit(8, 400)                               # (7.6 GB: 7.1 at 32K + a small picture's room)
-        self.assertEqual((f["layout"], f["context"], f["kv"], f["vision"], f["vision_small"]), ("8gb", 32768, "q8", True, True))
-        f = self.fit(8, 400, ctx_wanted=8192)              # (6.8 + 0.81 does not fit: F16 rows and a smaller picture)
-        self.assertEqual((f["kv"], f["vision"], f["vision_small"]), ("f16", True, True))
-        f = self.fit(8, 1024, ctx_wanted=16384)            # (7.0 GB: the model's own parts fill it - text only)
-        self.assertEqual((f["kv"], f["vision"], f["vision_small"]), ("q8", False, False))
-        # (8-bit rows with pictures go before F16 rows without them: 8.1 GB at 32K in F16, 7.1 + 0.81 in 8-bit rows)
+    def test_pictures_cost_no_vram(self):
+        """The engine lends a picture's room from its prompt buffers (idle while a picture is read), so pictures are
+        on wherever the model runs, at the tower's largest size, and take nothing from the plan: the layout, the
+        contexts, the cache's rows, the chunk and the VRAM counted are those of a start without pictures."""
+        f = self.fit(8, 400)                               # (7.6 GB: 7.1 at 32K in 8-bit rows - before, a small picture)
+        self.assertEqual((f["layout"], f["context"], f["kv"], f["vision"], f["vision_small"]), ("8gb", 32768, "q8", True, False))
+        f = self.fit(8, 400, ctx_wanted=8192)              # (6.8: F16 rows, the largest picture)
+        self.assertEqual((f["kv"], f["vision"], f["vision_small"]), ("f16", True, False))
+        f = self.fit(8, 1024, ctx_wanted=16384)            # (7.0 GB: the model's own parts fill it - before, text only)
+        self.assertEqual((f["kv"], f["vision"], f["vision_small"]), ("q8", True, False))
+        # (no 8-bit rows for a picture's sake any more: 7.9 GB at 32K in F16 fits 8.1 GB)
         f = self.fit(8.5, 400, ctx_wanted=32768, layout="8gb")
-        self.assertEqual((f["kv"], f["need"], f["vision"], f["vision_small"]), ("q8", 7.1, True, False))
-        # (a context in 8-bit rows: a picture's room is counted beside the 8-bit plan, as it is beside the F16 one)
-        f = self.fit(12, 500, ctx_wanted=131072)
-        self.assertEqual((f["layout"], f["kv"], f["vision"], f["vision_small"]), ("standard", "q8", True, False))
-        f = self.fit(12, 800, ctx_wanted=131072)
-        self.assertEqual((f["layout"], f["kv"], f["vision"], f["vision_small"]), ("standard", "q8", True, True))
-        # (VRAM for the larger chunk or for the picture, not both: the picture - 6.5 + 0.81 of 7.6 GB, 6.8 + 0.81 of 8.5)
-        f = self.fit(8, 400, ctx_wanted=4096)
-        self.assertEqual((f["chunk"], f["kv"], f["vision"], f["vision_small"]), (256, "f16", True, False))
-        f = self.fit(9, 500, ctx_wanted=8192)
-        self.assertEqual((f["chunk"], f["kv"], f["vision"], f["vision_small"]), (256, "f16", True, False))
-        f = self.fit(11, 300, ctx_wanted=8192, layout="8gb")
         self.assertEqual((f["kv"], f["vision"], f["vision_small"]), ("f16", True, False))
         for gib in (12, 16, 24, 32):                       # (F16 rows and the largest picture: as before)
             f = self.fit(gib, 400)
             self.assertEqual((f["layout"], f["kv"], f["vision"], f["vision_small"]), ("standard", "f16", True, False), gib)
+        seen = 0
+        for gib in (6.5, 7, 8, 8.5, 9, 9.5, 10, 11, 12, 16, 24):
+            for used in (0, 400, 1024):
+                for ctx in (None, 4096, 8192, 32768, 131072):
+                    on, off = self.fit(gib, used, ctx_wanted=ctx), self.fit(gib, used, ctx_wanted=ctx, pictures=False)
+                    self.assertEqual("error" in on, "error" in off, (gib, used, ctx))
+                    if "error" in on:
+                        self.assertEqual(on, off, (gib, used, ctx))
+                        continue
+                    self.assertEqual((on["vision"], on["vision_small"], off["vision"]), (True, False, False), (gib, used, ctx))
+                    self.assertEqual({k: v for k, v in on.items() if k != "vision"},
+                                     {k: v for k, v in off.items() if k != "vision"}, (gib, used, ctx))
+                    seen += 1
+        self.assertGreater(seen, 60)
 
-    def test_chunk_512_only_after_the_pictures(self):
-        """The chunk is doubled only where that fits beside the largest picture's room, with the rows the picture
-        was chosen with; never where only a smaller picture fits (it takes all the room there is)."""
-        small, up, big = XS["layouts"]["8gb"]["plan"], maya.HY4_CHUNK_UP_GIB, maya.HY4_VISION_GIB
+    def test_chunk_512_where_it_fits(self):
+        """A small-card layout's chunk is doubled where that fits beside the model's own parts with the rows the
+        context takes - pictures or not: the larger chunk's buffers lend a picture its room as the smaller one's do."""
+        small, up = XS["layouts"]["8gb"]["plan"], maya.HY4_CHUNK_UP_GIB
         seen = set()
         for gib, used, ctx in ((8, 400, None), (8, 400, 4096), (8.5, 300, None), (9, 500, None), (9, 500, 8192),
                                (8, 0, None), (9.5, 900, 4096), (8, 0, 4096), (9.5, 0, 4096), (10, 0, 8192),
-                               (11, 300, 8192), (11, 300, 32768), (12, 0, 32768)):
+                               (11, 300, 8192), (11, 300, 32768), (12, 0, 32768), (8, 1024, 16384)):
             f = self.fit(gib, used, ctx_wanted=ctx, layout="8gb")
             need = maya.hy4_fit_need_gib(small, f["context"], f["kv"] == "q8")
-            both = f["vision"] and not f["vision_small"] and need + big + up <= f["usable"]
-            self.assertEqual(f["chunk"], 512 if both else 256, (gib, used, ctx))
+            self.assertEqual(f["chunk"], 512 if need + up <= f["usable"] else 256, (gib, used, ctx))
             self.assertEqual(f["args"][:2], ["--chunk", str(f["chunk"])])
-            if f["chunk"] == 512:                          # (the picture is the one the plan's own chunk gets)
-                self.assertEqual((f["kv"], f["vision"], f["vision_small"]), ("f16", True, False), (gib, used, ctx))
-            if need + up <= f["usable"]:                   # (room for the larger chunk: never taken from a picture)
-                self.assertTrue(f["vision"] and not f["vision_small"], (gib, used, ctx))
+            self.assertTrue(f["vision"] and not f["vision_small"], (gib, used, ctx))
             seen.add(f["chunk"])
         self.assertEqual(seen, {256, 512})
-        # (an 8 GB card with nothing on it at 4K: 6.5 + 0.95 fits and 6.5 + 0.81 fits, both do not - the picture)
-        f = self.fit(8, 0, ctx_wanted=4096)
-        self.assertEqual((f["chunk"], f["kv"], f["vision"], f["vision_small"]), (256, "f16", True, False))
-        # (both fit: both - 6.5 + 0.81 + 0.95 of 9.5 GB)
-        f = self.fit(9.5, 0, ctx_wanted=4096, layout="8gb")
+        # (an 8 GB card at 4K with a light desktop: 6.5 + 0.95 of 7.6 GB - before, the picture took that room)
+        f = self.fit(8, 400, ctx_wanted=4096)
         self.assertEqual((f["chunk"], f["kv"], f["vision"], f["vision_small"]), (512, "f16", True, False))
-        # (the larger chunk never moves the rows to 8-bit or the picture to a smaller one: 8.1 + 0.81 of 9.3 GB at 32K)
-        f = self.fit(9.5, 200, ctx_wanted=32768, layout="8gb")
-        self.assertEqual((f["chunk"], f["kv"], f["vision"], f["vision_small"]), (256, "f16", True, False))
-        self.assertEqual(self.fit(8, 400)["chunk"], 256)   # (32K with a smaller picture: all the room is its)
+        f = self.fit(9, 500, ctx_wanted=8192)              # (6.8 + 0.95 of 8.5 GB)
+        self.assertEqual((f["chunk"], f["kv"], f["vision"], f["vision_small"]), (512, "f16", True, False))
+        # (the larger chunk never moves the rows to 8-bit: 7.1 + 0.95 does not fit 7.6 GB at 32K)
+        f = self.fit(8, 400)
+        self.assertEqual((f["chunk"], f["kv"]), (256, "q8"))
+        f = self.fit(8, 400, ctx_wanted=16384)             # (7.0 in 8-bit rows of 7.6 GB: the chunk stays)
+        self.assertEqual((f["chunk"], f["kv"]), (256, "q8"))
 
     def test_chunk_512_with_no_pictures_asked(self):
         """--no-vision: no picture is ever read, so the room goes to the chunk as it did."""
@@ -881,6 +878,31 @@ class Fit(unittest.TestCase):
                 maya.hy4_fit_step(args(context=131072), {"gpus": [card(8)]}, "maya-xs")
             with with_manifest(manifest()), self.assertRaisesRegex(Failed, "not available yet"):
                 maya.hy4_fit_step(args(), {"gpus": [card(24)]}, "maya-s")
+
+    def test_a_size_too_big_names_itself_and_the_smaller_one(self):
+        """A size the card does not hold even at 4K: the line names the size, and the hint the largest smaller size
+        that runs there with its exact command (none where no smaller one fits, or for the smallest)."""
+        with patch.object(maya, "fail", fail), patch.object(maya, "ok", lambda *a: None), \
+                patch.object(maya, "warn", lambda *a: None), patch.object(maya, "say", lambda *a: None), \
+                patch.object(maya, "gpu_used_mib", return_value={0: 400}):
+            with self.assertRaises(Failed) as e:
+                maya.hy4_fit_step(args(), {"gpus": [card(8)]}, "maya-s")
+            said = str(e.exception)
+            self.assertIn("Hy4-Flash · Maya-S needs about", said)
+            self.assertIn("this card has 7.6 GB free", said)
+            self.assertIn("the smaller Hy4-Flash · Maya-XS fits this card (its 8 GB-card file): "
+                          f"{maya.ME} --setup --model hy4-flash-maya-xs - or a card with more VRAM", said)
+            self.assertEqual(maya.hy4_smaller_fit("maya-l", [card(8)]), ("maya-xs", "8gb"))
+            self.assertIsNone(maya.hy4_smaller_fit("maya-xs", [card(8)]))          # (the smallest: none smaller)
+            for quant in ("maya-s", "maya-xs"):                # (a card no size fits: the plain hint alone)
+                with self.assertRaises(Failed) as e:
+                    maya.hy4_fit_step(args(), {"gpus": [card(6)]}, quant)
+                self.assertNotIn("the smaller", str(e.exception))
+                self.assertIn("a card with more VRAM", str(e.exception))
+            with with_manifest(manifest(revision="", only=None, hub=False)), self.assertRaises(Failed) as e:
+                maya.hy4_fit_step(args(), {"gpus": [card(8)]}, "maya-l")      # (nothing uploaded: none offered)
+            self.assertIn("Hy4-Flash · Maya-L needs about", str(e.exception))
+            self.assertNotIn("the smaller", str(e.exception))
 
     def test_the_8gb_file_on_the_hub_or_not(self):
         """Both ways by the Hub's answer alone: there - used (from the commit the Hub named); not there - a plain

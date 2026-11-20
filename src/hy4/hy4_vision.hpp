@@ -44,18 +44,24 @@ public:
     static bool in_pack(const Pack& pk);
     // its geometry from hy4.txt (false: one maya-hy4 does not run)
     static bool geometry(const Pack& pk, VisionGeo& g, std::string& err);
-    // the device memory an encode of the largest picture takes (the engine leaves it free on the tower's GPU)
+    // the device memory an encode of the largest picture takes (nothing is kept free for it: the engine lends it)
     static size_t room_for(const VisionGeo& g);
     // its weights in host memory (the BF16 matrices where `pk` maps them: it must outlive the tower), pictures encoded
     // on device `dev` - nothing of the tower stays in its memory between pictures: an encode takes the room it needs
     // (room_for() at most), copies the weights in a layer at a time and gives the room back
     bool load(const Pack& pk, int dev, std::string& err);
     const VisionGeo& geo() const;
-    // rgb: height x width x 3 bytes -> rows F32 [tokens][out_dim]
-    bool encode(const uint8_t* rgb, int width, int height, std::vector<float>& rows, std::string& err);
+    // the device memory an encode of a picture of these sides takes (0: sides the tower does not read)
+    size_t room_of(int width, int height) const;
+    // rgb: height x width x 3 bytes -> rows F32 [tokens][out_dim].  `room`: `room_bytes` of device `dev`'s memory
+    // lent for the encode (idle memory of the caller's: its contents are lost) - used where the picture's room fits
+    // in it, else (and with none) the encode allocates its own and frees it
+    bool encode(const uint8_t* rgb, int width, int height, std::vector<float>& rows, std::string& err,
+                uint8_t* room = nullptr, size_t room_bytes = 0);
     size_t host_bytes() const;   // its weights in host memory (or the pack's mapping)
     size_t room_bytes() const;   // room_for(geo())
     size_t last_bytes() const;   // the device memory the last encode took
+    bool last_lent() const;      // ... in the room it was lent (false: its own allocation)
     int device() const;
 
 private:

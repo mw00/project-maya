@@ -7487,8 +7487,11 @@ def main() -> int:
             # Hy4-flash: the engine's own vision tower (the mmproj file in its pack); the server resizes the pictures
             vision = hy4_vision.Vision(hy4_vision.Geometry.from_info(engine.info),
                                        Path(tempfile.mkdtemp(prefix="maya-hy4-pictures-")), Vision.load)
+            # (where a picture's room comes from - the engine's `vision_room`: "chunk" = lent by its prompt buffers)
+            where = (f"; no VRAM kept for pictures (~{engine.info.get('vision_room_mib')} MiB while one is read, lent "
+                     "by the prompt buffers)" if engine.info.get("vision_room") == "chunk" else "")
             print(f"[maya] images: the model's vision tower runs in the engine, up to {vision.g.max_pixels} pixels "
-                  f"({vision.g.max_tokens} tokens for a square one) a picture", flush=True)
+                  f"({vision.g.max_tokens} tokens for a square one) a picture{where}", flush=True)
         elif vision is None and not vcfg and engine.info.get("vision") == "mm3":
             # MiniMax-M3.1-Flash: the engine's own vision tower; the server resizes the pictures
             vision = mm3_vision.Vision(mm3_vision.Geometry.from_info(engine.info),
