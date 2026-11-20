@@ -6,8 +6,24 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <vector>
 
 namespace hy4 {
+
+/// A MoE layer's routed experts in VRAM (the INFO line's vram_slots, the Monitor's "Where the experts live"): those a GPU
+/// holds - whole (the layer split: the layer's own slot map) or a slice of (tensor parallel: each member's and each
+/// helper's map; every expert has its blocks on some member, so all of them) - the others the CPU lane's.  `maps`:
+/// each holder's slot map for the layer (an expert's slot, -1 or past the map's end: not held there; null: none).
+inline int experts_held(int n_expert, const std::vector<const std::vector<int>*>& maps) {
+    int n = 0;
+    for (int e = 0; e < n_expert; ++e)
+        for (const std::vector<int>* m : maps)
+            if (m && e < (int) m->size() && (*m)[(size_t) e] >= 0) {
+                ++n;
+                break;
+            }
+    return n;
+}
 
 struct KvPick {
     bool fits = false;       // the model's own parts fit in VRAM this way (false: nothing fits - the plan's error)
