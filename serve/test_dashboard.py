@@ -903,7 +903,7 @@ out.sets = ["ds4", "mm3", "qwen", "glm-fast"].map((k) => m.tierSet({engine_kind:
 // a layer split with all of them in VRAM, one GPU with the CPU lane (Jupiter's V100, Maya-XS)
 const info = (line) => Object.fromEntries(line.split(" ").slice(1).map((kv) => kv.split("=")).map(([k, v]) => [k, /^-?\\d+$/.test(v) ? +v : v]));
 const lay = {tp: "INFO engine=hy4 engine_kind=hy4 model=Hy4-flash ctx=32768 vram_gb=49.40 dspark=0 mtp=1 experts=20992 vram_slots=20992",
-             one: "INFO engine=hy4 engine_kind=hy4 model=Hy4-flash ctx=32768 vram_gb=31.40 dspark=0 mtp=1 experts=20992 vram_slots=10086"};
+             one: "INFO engine=hy4 engine_kind=hy4 model=Hy4-flash ctx=32768 vram_gb=31.40 dspark=0 mtp=1 experts=20992 vram_slots=8118"};
 out.lay = Object.fromEntries(Object.entries(lay).map(([k, l]) => [k, sv.tierShares({vram_hit: 1, cpu: 0}, info(l))]));
 out.layTip = m.tierTip({vram_hit: 1, cpu: 0, engram_ms: 0.07}, info(lay.tp), {disk: 0});
 console.log(JSON.stringify(out));""")
@@ -925,7 +925,7 @@ console.log(JSON.stringify(out));""")
         self.assertEqual(got["calm"], "")
         # (maya-hy4 before the fix said vram_slots=0 in tensor parallel: the bar all RAM beside a 100% VRAM hit)
         self.assertEqual({k: (v["vu"], v["ru"], v["total"], v["disk"]) for k, v in got["lay"].items()},
-                         {"tp": (20992, 0, 20992, 0), "one": (10086, 10906, 20992, 0)})
+                         {"tp": (20992, 0, 20992, 0), "one": (8118, 12874, 20992, 0)})
         self.assertEqual(got["layTip"], "")
         self.assertEqual(got["sets"], ["ram_fetch,disk,promo,engram_ms", "ram_fetch,disk,promo", "ram_fetch,disk",
                                        "ram_fetch,disk,promo"])                   # (the other engines': unchanged)
