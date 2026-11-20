@@ -853,6 +853,7 @@ def _drain_seconds() -> float:
 
 
 DRAIN_S = _drain_seconds()
+CANCEL_POLL_S = 0.2         # --parallel: how often a request waiting for its engine's next line looks at its cancel
 STALL_CPU_SHARE = 0.02      # the engine may use 2% of one core over the window and still count as stuck: its idle
                             # threads' polls (the GLM service threads sleep 2 ms at a time when quiet); work is cores
 STALL_IO_EPS_B = 1 << 20    # bytes it may read or write in that window
@@ -1708,10 +1709,18 @@ class StrataEngine:
             # less when MAYA_REQUEST_QUIET_S is set low (so a test - or a tuned server - sees it in its own time)
             poll_s = 10.0 if REQUEST_QUIET_S <= 0 else min(10.0, max(0.2, REQUEST_QUIET_S / 2))
             want_lp, lp_wait = logprobs_asked(sampling) is not None, None   # (as generate(): a token waits for its LP)
+            # the wait goes in short steps, so a client gone away (cancel) sends this request's STOP at once: a long
+            # one-piece prompt read writes no line of it until it ends, and the STOP then waited for poll_s - while
+            # the next request (often the same conversation sent again) was placed beside the stopped one, in another
+            # conversation, and read its prompt from the shared start (#1057).  The checks below keep poll_s.
+            step, waited_from = min(poll_s, CANCEL_POLL_S), time.monotonic()
             while True:
                 try:
-                    line = q.get(timeout=poll_s)
+                    line = q.get(timeout=step)
                 except queue.Empty:
+                    if time.monotonic() - waited_from < poll_s and not cancel.is_set():
+                        continue
+                    waited_from = time.monotonic()
                     if lp_wait is not None:
                         t, lp_wait = lp_wait, None
                         yield t
@@ -1743,7 +1752,7 @@ class StrataEngine:
                 if line is None:
                     done = True
                     raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})")
-                heard = time.monotonic()
+                heard = waited_from = time.monotonic()
                 stall.clear()
                 f = line.split()
                 if lp_wait is not None and not line.startswith("LP "):
