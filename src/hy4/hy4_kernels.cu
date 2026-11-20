@@ -318,7 +318,8 @@ __device__ __forceinline__ void hc_part_body(int t, int b, const float* __restri
     const int w = threadIdx.x >> 5, l = threadIdx.x & 31;
 #pragma unroll
     for (int j = 0; j <= kMaxM; ++j) {
-        const float v = warp_sum(acc[j]);
+        // (the sums past nm are zeros: written as such without their shuffles - the same bits)
+        const float v = j < nm || j == kMaxM ? warp_sum(acc[j]) : 0.0f;
         if (l == 0) sh[w][j] = v;
     }
     __syncthreads();
@@ -1046,6 +1047,36 @@ __global__ void to_f16_kernel(const float* __restrict__ src, size_t lds, int n, 
     const size_t r = i / n, c = i % n;
     dst[r * ldd + c] = __float2half_rn(src[r * lds + c]);
 }
+// The same conversions a row at a time (grid y: the rows, a stride gridDim.y), 4 values a thread - for AMD, where the
+// one-value kernel's 64-bit division a value made it slower than the memory (the prompt's queries a sub-batch, the
+// GEMMs' inputs).  Rows 16-byte aligned in src, 8 in dst; the same values written.
+__global__ void to_f16_rows_kernel(const float* __restrict__ src, size_t lds, int n, __half* __restrict__ dst, size_t ldd,
+                                   int rows) {
+    const int c = (int) (blockIdx.x * blockDim.x + threadIdx.x) * 4;
+    if (c >= n) return;
+    for (int r = (int) blockIdx.y; r < rows; r += (int) gridDim.y) {
+        const float* sp = src + (size_t) r * lds + c;
+        __half* dp = dst + (size_t) r * ldd + c;
+        if (c + 4 <= n) {
+            const float4 v = *(const float4*) sp;
+            *(__half2*) dp = __floats2half2_rn(v.x, v.y);
+            *(__half2*) (dp + 2) = __floats2half2_rn(v.z, v.w);
+        } else {
+            for (int j = 0; c + j < n; ++j) dp[j] = __float2half_rn(sp[j]);
+        }
+    }
+}
+// (the row kernel's threads a block: a row's 4-value groups rounded up to a warp, 256 at most)
+inline int rows_threads(int n) { return std::min(256, ((n + 3) / 4 + 31) / 32 * 32); }
+// (whether the row kernel takes these operands: AMD only - NVIDIA keeps the one-value kernel)
+inline bool f16_rows_form(const void* src, size_t lds, const void* dst, size_t ldd) {
+#if defined(STRATA_USE_HIP)
+    return ((uintptr_t) src & 15) == 0 && lds % 4 == 0 && ((uintptr_t) dst & 7) == 0 && ldd % 4 == 0;
+#else
+    (void) src, (void) lds, (void) dst, (void) ldd;
+    return false;
+#endif
+}
 // one block: the counts, their scan, the scatter (the order within an expert does not change a row's sums)
 __global__ void __launch_bounds__(1024) moe_sort_kernel(const int* __restrict__ ids, int n_ent, int n_exp,
                                                         int* __restrict__ bounds, int* __restrict__ tok,
@@ -1737,6 +1768,13 @@ void kv_gather(const uint16_t* cache, int ring, int row, int k0, int n, uint16_t
 void to_f16(const float* src, size_t lds, int rows, int n, uint16_t* dst, size_t ldd, cudaStream_t s) {
     const size_t total = (size_t) rows * n;
     if (total == 0) return;
+    if (f16_rows_form(src, lds, dst, ldd)) {
+        const int b = rows_threads(n);
+        const dim3 g((unsigned) (((n + 3) / 4 + b - 1) / b), (unsigned) std::min(rows, 65535));
+        to_f16_rows_kernel<<<g, b, 0, s>>>(src, lds, n, (__half*) dst, ldd, rows);
+        check("to_f16");
+        return;
+    }
     to_f16_kernel<<<(unsigned) ((total + 255) / 256), 256, 0, s>>>(src, lds, n, (__half*) dst, ldd, total);
     check("to_f16");
 }
