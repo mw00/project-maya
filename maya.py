@@ -6064,7 +6064,9 @@ REPORT_LINES = re.compile(r"glm fast:|glm prefill: (?:CUDA|HIP)|glm split|glm st
                           r"^ds4: (?!copying experts |experts \d+ / |loading \d)|^ds4 (?:slots|cache):|^maya-ds4:|"
                           r"^(?:prompt|decode): \d+ tokens in |^decode per token:|^decode (?:reads|left out)|^dspark|"
                           # maya-mm3's: where the model went (its --serve start) and each answer's prompt / decode speed
-                          r"^maya-mm3:|^maya mm3 serve: (?:prompt|DSpark) |^maya-hy4:",
+                          r"^maya-mm3:|^maya mm3 serve: (?:prompt|DSpark) |^maya-hy4:|"
+                          # the Monitor's GPU readings: a reading that failed, a reader that stopped and why
+                          r"^\[maya\] (?:a GPU reading failed|the GPU readings)",
                           re.I)
 STAT_DECODE = re.compile(r"glm stat: decode ([\d.]+) ms/tok")
 
@@ -6081,6 +6083,16 @@ def speed_lines(text) -> list:
             x = "glm stat (prompt only): prompt " + x.split("| prompt ", 1)[1]
         picked.append(x.strip())
     return picked
+
+
+def gpu_readings_report() -> str:
+    """--report: what the dashboard's Monitor reads on each NVIDIA GPU (serve/telemetry.py's NVML reader, a process of
+    its own): each card's readings given or not, any that failed with its error - never an error of the report's own."""
+    try:
+        from serve import telemetry as TM
+        return TM.readings_report()
+    except Exception as e:  # noqa: BLE001 - the report goes on without this part
+        return f"not read ({type(e).__name__}: {e})"
 
 
 def hip_gpu_report(rocm: Path, bindir=None) -> str:
@@ -6181,6 +6193,7 @@ def report(version: str, backend: str | None = None, cfg_path: Path | None = Non
         add("GPUs", S.out(["nvidia-smi", "--query-gpu=index,name,memory.total,memory.used,driver_version,"
                                          "pcie.link.gen.max,pcie.link.width.current,pcie.link.width.max,power.limit,"
                                          "temperature.gpu", "--format=csv"]) or "nvidia-smi did not answer")
+        add("GPU readings (the Monitor's NVML reader, read now)", gpu_readings_report())
     cpu, avx2, avx512 = S.cpu_info()
     total, avail = mem_gb()
     pf = S.page_file_gb()
@@ -6208,6 +6221,12 @@ def report(version: str, backend: str | None = None, cfg_path: Path | None = Non
             images = "off" if "--vision" in args[:-1] and args[args.index("--vision") + 1] == "off" else "on"
         elif config_family(cfg) == "minimax":   # (maya-mm3's too: --vision on when the pack has it, left out without)
             images = "on" if flag_value(args, "--vision") == "on" else "off"
+        elif config_family(cfg) == "hy4":       # (maya-hy4's: on whenever its pack has the tower, unless --vision off -
+            # the tower in RAM, on the GPU a picture at a time: the config has no "vision" entry of its own)
+            images = "off (--vision off)" if flag_value(args, "--vision") == "off" else \
+                "on (read a picture at a time)" if pack is not None and hy4_pack_has_vision(pack) else \
+                "off (no vision tower in the pack)" if pack is not None and (pack / "hy4.txt").exists() else \
+                "? (the pack is not here to look in)"
         else:
             images = "on" if cfg.get("vision") else "off"
         where = ""
