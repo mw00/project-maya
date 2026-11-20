@@ -1160,7 +1160,7 @@ class StrataEngine:
 
     def death_note(self) -> str:
         """Why the engine most likely ended, from the end of its log: its own watchdog (issue #29), a GPU's fault it
-        caught after a request (exit 3), else RAM."""
+        caught after a request (exit 3), a signal from outside, an abort (a failed check, its log line), else RAM."""
         tail = ""
         try:
             with open(self.log_path, "rb") as f:
@@ -1178,9 +1178,17 @@ class StrataEngine:
                         "the like), after which that GPU's state is lost; a fresh engine starts with the next request. "
                         "Its log line: " + line.strip() + " - the lines above it name the GPU and the error; please "
                         "report it at github.com/mw00/project-maya/issues.")
-        if getattr(getattr(self, "proc", None), "returncode", None) in (-2, -15):   # (#539: read as a lack of RAM)
+        rc = getattr(getattr(self, "proc", None), "returncode", None)
+        if rc in (-2, -15):   # (#539: read as a lack of RAM)
             return ("A signal from outside ended it (SIGINT or SIGTERM: Ctrl+C, kill, a service manager), not a lack "
                     "of RAM.")
+        if rc == -6:   # (#1007: SIGABRT is a check that failed - Linux's out-of-memory killer sends SIGKILL, -9)
+            hit = next((ln.strip() for ln in reversed(tail.splitlines())
+                        if any(k in ln for k in ("Assertion", "terminate called", "what():", "GGML_ASSERT"))), "")
+            return ("The engine aborted (SIGABRT): a check inside it or inside a library it calls (the GPU's runtime) "
+                    "failed - not a lack of RAM; a fresh engine starts with the next request. "
+                    + (f"Its log line: {hit[:600]} - please" if hit else "The lines above in its log name it; please")
+                    + " report it at github.com/mw00/project-maya/issues.")
         return ("The usual cause is running out of RAM: Linux then ends the biggest program (check: sudo dmesg | "
                 "grep -i -E 'killed process|out of memory'); Windows slows down instead. Close other programs or use a "
                 "smaller model (Q2_0 / IQ2_XS).")
