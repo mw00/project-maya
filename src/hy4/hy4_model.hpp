@@ -56,6 +56,8 @@ struct Options {
     bool vision = true;           // the vision tower (the pack's mmproj file) on the main GPU: a picture's room is lent by
                                   // the prompt buffers while it is read (made longer by what they lack of it, if anything)
     bool vision_auto = true;      // (not asked for by name: a pack without one runs text only, no error)
+    bool room_report = false;     // --room-report: say how much less free VRAM each GPU could have had with this start's
+                                  // choices unchanged (Model::room_report; the plan only - the start is the same)
     bool verbose = false;
 };
 
@@ -125,6 +127,11 @@ public:
     int eos() const;
     const Stats& stats() const;
     std::vector<std::string> info_lines() const;
+    /// --room-report's measurement, the server's INFO keys (empty: not asked, or the start did not fit):
+    /// "room_rows=f16|q8 room_drafter=0|1 room_streamed=0|1 room_gpus=<PCI bus id>,<free>,<slack>;..." - each GPU's
+    /// free VRAM as the plan read it at the start (bytes) and how much less of it the start's choices hold with: the
+    /// latent cache's rows, KV streaming, the drafter's room, the pictures, the GPUs' layout, that it starts at all
+    std::string room_report() const;
 
     /// Pictures (Options::vision): the tower's geometry (nullptr: none loaded); a picture's rows, F32 [tokens][n_embd]
     /// (VisionGeo::tokens of them); and the request's pictures - each one's image tokens, the positions start ..

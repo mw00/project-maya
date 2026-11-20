@@ -7,6 +7,7 @@ engine, no GPU.
 from __future__ import annotations
 
 import contextlib
+import io
 import json
 import os
 import sys
@@ -652,6 +653,41 @@ class Settings(unittest.TestCase):
         self.assertEqual(M.hy4_cards({"installer": {"engine_room_gb": {"0": "x", "a": [1, 2]}}},
                                      [{"index": 0, "vram_gb": 8.0}]), {0: {"index": 0, "vram_gb": 8.0}})
         self.assertEqual(maya.hy4_usable_gib([{"index": 0, "vram_gb": 8.0}], {0: 1024}), 7.0)
+
+    def test_hy4_page_counts_the_share_the_engine_measured(self):
+        """The setup kept CUDA's reading beside the room (its first guess for CUDA's own share): once the engine has
+        measured the share on that card (maya.py's HY4_ROOM_STORE, this PC, card and driver), the page counts the
+        reading with it, as the next setup does; no record, or a config without the reading: the setup's figure."""
+        import maya
+        cfg = {"installer": {"engine_room_gb": {"0": [7.537, 8.0, 7.037]}}}
+        gl = [{"index": 0, "name": "x", "vram_gb": 8.0}]
+        M._gpu_cache.pop("room_own", None)
+        self.addCleanup(M._gpu_cache.pop, "room_own", None)
+        for own, room in (({0: 0.42}, 7.457), ({}, 7.537)):
+            with mock.patch.object(M, "hy4_room_own", return_value=own):
+                self.assertAlmostEqual(M.hy4_cards(cfg, gl)[0]["engine_room_gb"], room)
+        with mock.patch.object(M, "hy4_room_own", side_effect=AssertionError("not asked")):
+            self.assertAlmostEqual(M.hy4_cards({"installer": {"engine_room_gb": {"0": [7.48, 8.0]}}}, gl)[0]
+                                   ["engine_room_gb"], 7.48)
+        # the record for this PC's card and driver, by the setup's own key (setup.py's list: its PCI id and driver)
+        raw = [{"index": 0, "name": "x", "vram_gb": 8.0, "pci": "00000000:01:00.0", "driver": "610.88"}]
+        with mock.patch.object(maya, "hy4_room_load", return_value={maya.hy4_room_key(raw[0]): {"own_gib": 0.42}}), \
+                mock.patch.object(maya.S, "gpus", return_value=raw):
+            self.assertEqual(M.hy4_room_own(), {0: 0.42})
+            M._gpu_cache.pop("room_own", None)
+            with mock.patch.object(maya.S, "gpus", return_value=[dict(raw[0], driver="615.10")]):
+                self.assertEqual(M.hy4_room_own(), {})
+        # the server's start: the card to measure, and the figure said once kept
+        with mock.patch.object(maya, "hy4_room_due", return_value={"index": 0}):
+            self.assertEqual(M.hy4_room_due({}), {"index": 0})
+        with mock.patch.object(maya, "hy4_room_due", side_effect=OSError("no driver")):
+            self.assertIsNone(M.hy4_room_due({}))
+        with mock.patch.object(maya, "hy4_room_measure", return_value={"own_gib": 0.42}), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(M.hy4_room_measured({}, {"name": "RTX"}, {}), {"own_gib": 0.42})
+        self.assertIn("0.42 GB", out.getvalue())
+        with mock.patch.object(maya, "hy4_room_measure", side_effect=ValueError):
+            self.assertIsNone(M.hy4_room_measured({}, {}, {}))
 
     def test_hy4_contexts_that_fit(self):
         """Hy4-Flash's context on the Models page: only what fits the config's cards by its layout's plan, as the

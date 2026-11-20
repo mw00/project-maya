@@ -2405,8 +2405,13 @@ the Models page shows it (Auto or 8-bit). Within that config, drafting on and of
 not show (an idle RTX 3050 8 GB: CUDA reports 7.0 GB free). So on Windows the setup measures the card the way the
 engine does at its start (CUDA's own free figure, in a short separate process) and counts no more than that - its
 line "VRAM: Windows keeps part of this card ..." says the figure - so it claims the DFly2 drafter, and asks about
-faster drafting, where the engine then really loads it. The figure is kept in the config, and the Models page counts
-it too. Linux and AMD cards are counted as before.
+faster drafting, where the engine then really loads it. CUDA's own share of the card, which Windows keeps out of that
+figure, is a first guess (0.5 GB) until the engine's first start on the PC measures it for that card: how much less
+free VRAM its start's choices hold with, against what the setup's reading saw. The figure is kept in
+`data/vram-room.json` for this PC, the card and its driver (a new driver or card is measured again), and from then on the setup's line says
+"measured" instead of "estimated"; the Models page counts it too. With a measured figure the setup claims the
+drafter by its sums without their safety margin, as the engine then decides (the contexts and the cache's rows keep
+theirs). Linux and AMD cards are counted as before.
 
 **Not available for Hy4-Flash yet** (the dashboard offers no switch for them): `--parallel` (one request at a time
 for now); Mac, and AMD on Windows.

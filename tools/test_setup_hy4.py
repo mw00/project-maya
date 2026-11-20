@@ -1844,11 +1844,120 @@ class WindowsRoom(unittest.TestCase):
     V100 = (33745534976, 33422573568, 34072559616)
 
     def pc(self, gib=8, n=1):
-        return {"backend": "cuda", "gpus": [dict(card(gib, i), pci=f"00000000:0{i + 1}:00.0") for i in range(n)]}
+        return {"backend": "cuda", "gpus": [dict(card(gib, i), pci=f"00000000:0{i + 1}:00.0", driver="610.88")
+                                            for i in range(n)]}
 
-    def room(self, pc, probe, win=True, busy=None):
+    def room(self, pc, probe, win=True, busy=None, saved=None):
         with patch.object(maya, "WIN", win), patch.object(maya, "maya_engine_mib", return_value=busy or {}):
-            return maya.hy4_engine_room(pc, probe=probe)
+            return maya.hy4_engine_room(pc, probe=probe, saved=saved)
+
+    # an 8 GB layout's start at 8K (the setup's config on the RTX 3050) and what its engine said with --room-report
+    CFG = {"exe": "C:/Maya/build/maya-hy4.exe", "gpu": [0], "backend": "cuda",
+           "args": ["--pack", "p", "--max-context", "8192", "--chunk", "256", "--reserve-gb", "0.5",
+                    "--vram-experts", "0"], "installer": {"hy4_quant": "maya-xs", "layout": "8gb"}}
+    INFO = {"room_rows": "f16", "room_drafter": 0, "room_streamed": 0,
+            "room_gpus": "0000:01:00.0,7556038656,805306368"}                     # (0.75 GiB spare)
+
+    def test_first_guess_then_the_engines_figure(self):
+        one = self.URANUS[0] / 2**30
+        pc = self.pc()
+        self.room(pc, {"0000:01:00.0": self.URANUS})
+        g = pc["gpus"][0]
+        self.assertEqual((g["engine_room_how"], round(g["cuda_free_gb"], 4)), ("estimated", round(one, 4)))
+        self.assertAlmostEqual(g["engine_room_gb"], one + maya.HY4_FIT_CUDA_OWN_GIB)
+        # the engine's first start on this card measures it: the setup's sums for that start (the 8 GB layout at 8K,
+        # F16 rows, no drafter: 6.8 GiB) and what it had spare, against what the setup's CUDA probe sees
+        with patch.object(maya, "WIN", True):
+            # (the probe's reading is taken before the engine starts: Windows' figure drops as the engine fills it)
+            card_ = maya.hy4_room_due(self.CFG, gpus=self.pc()["gpus"], probe={"0000:01:00.0": self.URANUS})
+            self.assertEqual((card_["pci"], card_["cuda_probe"]), ("00000000:01:00.0", list(self.URANUS)))
+            rec = maya.hy4_room_measure(self.CFG, card_, self.INFO, probe=AssertionError("not asked"))
+            self.assertIsNone(maya.hy4_room_due(self.CFG, gpus=self.pc()["gpus"], probe=AssertionError("no")))
+        need = maya.hy4_config_need_gib("maya-xs", "8gb", 8192, chunk=256, reserve_gb=0.5)
+        self.assertEqual(need, 6.8)
+        self.assertAlmostEqual(rec["own_gib"], need + 0.75 - one, places=3)
+        self.assertEqual((rec["rows"], rec["drafter"], rec["context"]), ("f16", False, 8192))
+        self.assertEqual(list(maya.hy4_room_load()), [maya.hy4_room_key(card_)])
+        # the next setup counts it ("measured"); on another driver, or another card in the slot: the first guess
+        pc = self.pc()
+        got = self.room(pc, {"0000:01:00.0": self.URANUS})
+        self.assertAlmostEqual(got[0], one + rec["own_gib"])
+        self.assertEqual(pc["gpus"][0]["engine_room_how"], "measured")
+        for other in ({"driver": "615.10"}, {"name": "NVIDIA GeForce RTX 4060"}, {"vram_gb": 12.0}):
+            pc = {"backend": "cuda", "gpus": [dict(self.pc()["gpus"][0], **other)]}
+            self.room(pc, {"0000:01:00.0": self.URANUS})
+            self.assertEqual(pc["gpus"][0]["engine_room_how"], "estimated", other)
+        # measured again under a new driver: the old driver's figure goes
+        with patch.object(maya, "WIN", True):
+            new = dict(card_, driver="615.10")
+            self.assertIsNotNone(maya.hy4_room_measure(self.CFG, new, self.INFO))
+        self.assertEqual(list(maya.hy4_room_load()), [maya.hy4_room_key(new)])
+
+    def test_the_measured_start(self):
+        probe = {"0000:01:00.0": self.URANUS}
+        card_ = self.pc()["gpus"][0]
+
+        def got(info=None, cfg=None, **kw):
+            return maya.hy4_room_measure(cfg or self.CFG, card_, {**self.INFO, **(info or {})}, probe=kw.get("probe", probe),
+                                         save=False)
+        base = got()["own_gib"]
+        # the rows and the drafter the engine took count in the sums (8-bit rows: their own; the drafter's room)
+        self.assertAlmostEqual(got({"room_drafter": 1})["own_gib"], base + maya.hy4_dfly2_gib("maya-xs"), delta=0.002)
+        self.assertLess(got({"room_rows": "q8"})["own_gib"], base)
+        # a context the plan does not list: its sums without the fit's margin
+        c6 = dict(self.CFG, args=[x if x != "8192" else "6144" for x in self.CFG["args"]])
+        self.assertAlmostEqual(got(cfg=c6)["need_gib"], maya.hy4_config_need_gib("maya-xs", "8gb", 6144, chunk=256,
+                                                                                reserve_gb=0.5) - maya.HY4_FIT_MARGIN_GIB,
+                               places=3)
+        # not kept: a start that streams its cache, a card the engine did not report, no probe reading, a figure out
+        # of all reason, no plan for the size, a report the engine did not write
+        for info, kw in (({"room_streamed": 1}, {}), ({"room_gpus": "0000:02:00.0,7556038656,805306368"}, {}),
+                         ({}, {"probe": {}}), ({"room_gpus": "0000:01:00.0,7556038656,8053063680"}, {}),
+                         ({"room_gpus": "0000:01:00.0,x,1"}, {}), ({"room_gpus": None}, {})):
+            self.assertIsNone(got(info, **kw), info)
+        self.assertIsNone(got(cfg=dict(self.CFG, installer={"hy4_quant": "nope"})))
+
+    def test_uranus_measured(self):
+        # the RTX 3050's engine at 8K (F16 rows, no drafter): 7.04 GiB free, its choices held with 0.49 GiB less - CUDA's
+        # own share there 0.26 GiB in the setup's terms; with it the setup claims the drafter where the engine loads
+        # it: at 4K and 5K, not at 6K and 8K (F16), and at 8K beside 8-bit rows (the question asked) - measured
+        info = dict(self.INFO, room_gpus="0000:01:00.0,7556038656,531283968")
+        rec = maya.hy4_room_measure(self.CFG, dict(self.pc()["gpus"][0], cuda_probe=list(self.URANUS)), info)
+        self.assertAlmostEqual(rec["own_gib"], 0.258, delta=0.001)
+        q, pc = maya.hy4_quant_table("maya-xs"), self.pc()
+        self.room(pc, {"0000:01:00.0": self.URANUS})
+        cards = pc["gpus"]
+        self.assertEqual(cards[0]["engine_room_how"], "measured")
+        claims = {}
+        for ctx in (4096, 5120, 6144, 8192):
+            f = maya.hy4_fit(q, cards, ctx, used={0: 76}, ram_gb=64, drafter=self.G)
+            self.assertEqual((f["kv"], f["room_measured"]), ("f16", True))
+            claims[ctx] = maya.hy4_dfly2_need_gib("maya-xs", f) <= f["usable"]
+        self.assertEqual(claims, {4096: True, 5120: True, 6144: False, 8192: False})
+        f8 = maya.hy4_fit(q, cards, 8192, used={0: 76}, ram_gb=64, drafter=self.G)
+        fast = maya.hy4_fast_drafting_fit("maya-xs", cards, f8, used={0: 76}, ram_gb=64)
+        self.assertEqual((fast["kv"], fast["f16_room"]), ("q8", False))
+        # the first guess keeps the margins (the drafter's sums never set against this PC's engine)
+        pc = self.pc()
+        self.room(pc, {"0000:01:00.0": self.URANUS}, saved={})
+        f4 = maya.hy4_fit(q, pc["gpus"], 4096, used={0: 76}, ram_gb=64, drafter=self.G)
+        self.assertNotIn("room_measured", f4)
+        self.assertAlmostEqual(maya.hy4_dfly2_need_gib("maya-xs", f4), 6.5 + self.G + maya.HY4_FIT_MARGIN_GIB)
+
+    def test_due(self):
+        gl, pr = self.pc(n=2)["gpus"], {"0000:01:00.0": self.URANUS, "0000:02:00.0": self.URANUS}
+        with patch.object(maya, "WIN", True):
+            self.assertIsNotNone(maya.hy4_room_due(self.CFG, gpus=gl, saved={}, probe=pr))
+            self.assertEqual(maya.hy4_room_due(dict(self.CFG, gpu="1"), gpus=gl, saved={}, probe=pr)["index"], 1)
+            self.assertIsNone(maya.hy4_room_due(self.CFG, gpus=gl, saved={maya.hy4_room_key(gl[0]): {"own_gib": 0.5}},
+                                                probe=pr))
+            self.assertIsNone(maya.hy4_room_due(self.CFG, gpus=gl, saved={}, probe={}))   # (no reading: no figure)
+            for cfg in (dict(self.CFG, gpu=[0, 1]), dict(self.CFG, gpu=None), dict(self.CFG, gpu=[3]),
+                        dict(self.CFG, exe="C:/Maya/build/maya-ds4.exe"), dict(self.CFG, backend="hip")):
+                self.assertIsNone(maya.hy4_room_due(cfg, gpus=gl, saved={}, probe=pr), cfg)
+            self.assertIsNone(maya.hy4_room_due(self.CFG, gpus=[dict(gl[0], unified_memory=True)], saved={}, probe=pr))
+        with patch.object(maya, "WIN", False):
+            self.assertIsNone(maya.hy4_room_due(self.CFG, gpus=gl, saved={}, probe=pr))
 
     def test_measured_on_windows_only(self):
         one, two, tot = self.URANUS
@@ -1911,6 +2020,10 @@ class WindowsRoom(unittest.TestCase):
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
+        # (the engine's measured figures: a store of the test's own, empty to begin with)
+        store = patch.object(maya, "HY4_ROOM_STORE", Path(self.tmp.name) / "data" / "vram-room.json")
+        store.start()
+        self.addCleanup(store.stop)
 
     def tearDown(self):
         self.tmp.cleanup()

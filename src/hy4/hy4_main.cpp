@@ -3,7 +3,11 @@
 //   maya-hy4 --pack <model>/maya-hy4 --serve [--gpus 0,1,...] [--max-context N] [--chunk N] [--eos id,id,...]
 //            [--mtp | --dfly2 [--draft N] [--draft-floor P]] [--vram-experts F] [--cpu-threads N] [--profile F] [--profile-out F]
 //            [--tp N|auto] [--main-gpu I] [--vision on|off] [--kv auto|f16|q8]
-//            [--kv-streaming on|off|auto] [--kv-resident N]
+//            [--kv-streaming on|off|auto] [--kv-resident N] [--room-report]
+//
+// --room-report (the server's, at a first start on a PC whose cards it has no figure for): an INFO line says, for
+// each GPU, its free VRAM as the plan read it and how much less of it this start's choices would hold with (the
+// cache's rows, KV streaming, the drafter's room, the pictures, the layout) - worked out on the plan alone.
 //
 // --kv: the latent cache's rows - F16, or q8: the latent's 512 values int8 in blocks of 32 with an F16 scale, the
 // rotated part's 64 F16 (672 bytes a row against 1152), the indexer's per-position and pooled rows F16 (the reference's
@@ -636,6 +640,7 @@ int serve(hy4::Model& m, const std::vector<int>& eos, int n_draft, float floor0,
                 (long long) m.max_ctx(), st0.vram_gb, m.has_mtp() && n_draft > 0 ? 1 : 0, st0.experts_all,
                 st0.experts_vram);
     if (m.has_dfly2()) std::printf("INFO dfly2=%d draft=%d\n", n_draft > 0 ? 1 : 0, n_draft);
+    if (!m.room_report().empty()) std::printf("INFO %s\n", m.room_report().c_str());   // (--room-report)
     if (const hy4::VisionGeo* vg = m.vision())   // (serve/hy4_vision.py's Geometry.from_info)
         std::printf("INFO vision=hy4 image_token=%d image_start=%d image_end=%d vision_patch=%d vision_merge=%d "
                     "vision_max_pixels=%d vision_min_pixels=%d vision_room=%s vision_room_mib=%zu\n", vg->image_token,
@@ -1161,6 +1166,7 @@ int main(int argc, char** argv) {
             o.layer_split = v == "auto" ? std::vector<int>{} : parse_list(v);
         }
         else if (a == "--reserve-gb") o.reserve_gb = std::atof(next().c_str());
+        else if (a == "--room-report") o.room_report = true;
         else if (a == "--chunk") {   // (auto, the default: the engine's plan picks it)
             const std::string v = next();
             o.prefill_chunk = v == "auto" ? 0 : std::atoi(v.c_str());

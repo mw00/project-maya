@@ -856,8 +856,12 @@ HY4_FIT_MARGIN_GIB = 0.25
 # driver's share - which nvidia-smi's free figure still holds under Linux, where the sums above were measured (0.57 GiB
 # on a V100 32 GB: a context 308 MiB, the driver 274); under Windows CUDA's own figure has it out already (the display
 # driver keeps it in its budget: a context shows as 68 MiB on an RTX 3050, whose engine draws its DFly2 line 0.48-0.53
-# GiB above CUDA's figure) - hy4_engine_room adds this much back, or what this PC shows of it where that is more
+# GiB above CUDA's figure) - hy4_engine_room adds this much back, or what this PC shows of it where that is more: the
+# first guess only, until the engine's first start on the PC measures the figure for its card (HY4_ROOM_STORE)
 HY4_FIT_CUDA_OWN_GIB = 0.5
+# (Windows: CUDA's own share of each card in the setup's terms, as the engine measured it at its first start on this PC
+#  - hy4_room_measure - by PC, card and driver; the setup and the Models page count it from then on)
+HY4_ROOM_STORE = ROOT / "data" / "vram-room.json"
 HY4_KV_RESIDENT = 32768                            # (KV streaming: the global layers' newest positions kept in VRAM)
 # a small-card layout's prompt chunk doubled where it fits: the prompt scratch grows by about 0.9 GiB from 256 to 512
 # tokens (an 8 GB card at 4K: measured) - counted as 0.95, conservatively
@@ -8628,18 +8632,19 @@ def hy4_kv_rows(need_f16: float, need_q8: float, usable: float, kv: str | None =
 
 def hy4_config_need_gib(quant: str, layout: str, ctx: int, chunk: int | None = None,
                         reserve_gb: float | None = None, q8: bool = False, mtp: bool = False,
-                        dfly2: bool = False) -> float | None:
+                        dfly2: bool = False, margin: bool = True) -> float | None:
     """The VRAM (GiB) a size already set up needs at a context, as hy4_fit counts it (the dashboard's Models page
     asks before it writes a context into a config - serve/models.py's hy4_room): its layout's plan
     (hy4_fit_need_gib), a prompt chunk above the plan's as hy4_fit doubles it (HY4_CHUNK_UP_GIB), and a --reserve-gb
     other than the plan's by the difference.  q8: with the latent cache in 8-bit rows (what the engine's --kv auto
     takes where F16 rows do not fit).  mtp: a Maya size that drafts (--mtp) - with its draft block's VRAM
-    (hy4_mtp_gib); dfly2: one that drafts with its DFly2 drafter (--dfly2: hy4_dfly2_gib).  None for a size or a
-    layout the manifest has no plan for."""
+    (hy4_mtp_gib); dfly2: one that drafts with its DFly2 drafter (--dfly2: hy4_dfly2_gib).  margin False: a context
+    the plan does not list without HY4_FIT_MARGIN_GIB (the sums themselves - hy4_room_measure's).  None for a size or
+    a layout the manifest has no plan for."""
     plan = (hy4_layouts(hy4_quant_table(quant)).get(layout or HY4_STANDARD) or {}).get("plan") or {}
     if not plan.get("need_gib"):
         return None
-    need = hy4_fit_need_gib(plan, int(ctx), q8)
+    need = hy4_fit_need_gib(plan, int(ctx), q8) if margin else hy4_need_gib(plan, int(ctx), q8)
     if chunk and int(plan.get("chunk") or 0) and int(chunk) > int(plan["chunk"]):
         need += HY4_CHUNK_UP_GIB
     if reserve_gb is not None and "reserve_gb" in plan:
@@ -8738,7 +8743,7 @@ def hy4_usable_gib(gpus: list, used: dict | None = None) -> float:
     return max(total - sum(min(float(used.get(g.get("index"), 0)) / 1024.0, HY4_FIT_USED_CAP_GIB) for g in gpus), 0.0)
 
 
-def hy4_engine_room(pc: dict, probe=None) -> dict:
+def hy4_engine_room(pc: dict, probe=None, saved: dict | None = None) -> dict:
     """Windows: each chosen NVIDIA card's VRAM as the engine's CUDA gets it, measured now, kept on the card as
     "engine_room_gb" (hy4_usable_gib counts no more than that there); {index: GiB} of what was measured.  Windows
     keeps part of every card from the programs on it (the display driver's budget), which nvidia-smi does not show:
@@ -8746,11 +8751,15 @@ def hy4_engine_room(pc: dict, probe=None) -> dict:
     its start), the setup's own sums with the card's total less what is in use.  So the room is that figure in the
     setup's terms: CUDA's free VRAM with a context held, plus what CUDA itself takes beside it - a context (the free
     VRAM with a second one beside it, the difference) and the part of the card the driver keeps from CUDA
-    (nvidia-smi's total less CUDA's), at least HY4_FIT_CUDA_OWN_GIB: what the sums count for them, which Windows
-    keeps out of sight in its budget.  On Linux the measured part alone is nvidia-smi's total less its used (nothing
+    (nvidia-smi's total less CUDA's) - CUDA's own share as the setup's sums count it.  Windows keeps that share out
+    of sight in its budget, so the engine measures it at its first start on this PC (hy4_room_measure: the engine's
+    --room-report, kept in HY4_ROOM_STORE for this PC, card and driver) and the room counts that figure from then on
+    ("engine_room_how": "measured"); until then the larger of what this PC shows of it and HY4_FIT_CUDA_OWN_GIB, the
+    first guess ("estimated").  "cuda_free_gb": CUDA's own reading (the config keeps it: the Models page counts a
+    figure measured later with it).  On Linux the measured part alone is nvidia-smi's total less its used (nothing
     else is kept there), so only Windows is measured.  Not measured: another OS, AMD, a unified-memory GPU, a card a
     Maya engine holds now (its own VRAM would be counted as kept: the reading as before), no answer from the driver.
-    probe: the readings (tests; else cuda_room_bytes)."""
+    probe: the readings (tests; else cuda_room_bytes); saved: HY4_ROOM_STORE's records (tests; else read)."""
     gpus = (pc or {}).get("gpus") or []
     if not WIN or (pc or {}).get("backend", "cuda") != "cuda" or not gpus or hy4_amd(gpus) or \
             any(g.get("unified_memory") for g in gpus):
@@ -8759,14 +8768,116 @@ def hy4_engine_room(pc: dict, probe=None) -> dict:
     busy = maya_engine_mib() if cards else {}
     cards = [g for g in cards if g.get("index") not in busy]
     got = (cuda_room_bytes() if probe is None else probe) if cards else {}
+    saved = hy4_room_load() if saved is None else saved
     out = {}
     for g in cards:
         r = got.get(S._pci_key(str(g["pci"])))
         if r:
             one, two, tot = (float(x) / 2**30 for x in r)
-            own = max(one - two, 0.0) + max(float(g["vram_gb"]) - tot, 0.0)
-            g["engine_room_gb"] = out[g["index"]] = one + max(own, HY4_FIT_CUDA_OWN_GIB)
+            rec = saved.get(hy4_room_key(g)) or {}
+            if isinstance(rec.get("own_gib"), (int, float)):
+                own, how = float(rec["own_gib"]), "measured"
+            else:
+                own = max(max(one - two, 0.0) + max(float(g["vram_gb"]) - tot, 0.0), HY4_FIT_CUDA_OWN_GIB)
+                how = "estimated"
+            g["engine_room_gb"] = out[g["index"]] = one + own
+            g["engine_room_how"], g["cuda_free_gb"] = how, one
     return out
+
+
+def hy4_room_key(g: dict) -> str:
+    """What a card's measured share (HY4_ROOM_STORE) holds for: this PC, the card (its name, PCI place and VRAM) and
+    its driver - a new driver or another card in the slot is measured again."""
+    return "|".join([platform.node() or "?", str(g.get("name") or "?"), S._pci_key(str(g.get("pci") or "?")),
+                     f"{float(g.get('vram_gb') or 0):.2f}", str(g.get("driver") or "?")])
+
+
+def hy4_room_load() -> dict:
+    """HY4_ROOM_STORE's records ({hy4_room_key: {"own_gib": ..., ...}}); {} where there are none."""
+    try:
+        got = json.loads(HY4_ROOM_STORE.read_text(encoding="utf-8"))
+        return got if isinstance(got, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def hy4_room_due(cfg: dict, gpus: list | None = None, saved: dict | None = None, probe=None) -> dict | None:
+    """The server's, just before it starts Hy4-Flash's engine: the card to measure CUDA's own share on at this start
+    (the engine's --room-report, then hy4_room_measure) - Windows, an NVIDIA card, the config on one GPU, no record
+    of it for this PC, card and driver yet - with what the setup's CUDA probe sees of it now, before the engine holds
+    it ("cuda_probe": cuda_room_bytes' reading; Windows' figure for another program drops as the engine fills the
+    card); None otherwise, or where the probe has no reading.  gpus, probe: setup.py's list and the readings (tests;
+    else read)."""
+    if not WIN or (cfg.get("backend") or "cuda") != "cuda" or             Path(str(cfg.get("exe") or "")).stem.lower() != "maya-hy4":
+        return None
+    sel = cfg.get("gpu")                               # (one card, several, or "0,2" - serve's gpu_list)
+    sel = [] if sel is None or sel == "" else list(sel) if isinstance(sel, (list, tuple)) else str(sel).split(",")
+    sel = [int(str(x).strip()) for x in sel if str(x).strip() != ""]
+    if len(sel) != 1:
+        return None
+    found = {g["index"]: g for g in ((S.gpus() if gpus is None else gpus) or [])}
+    g = found.get(sel[0])
+    if not g or not g.get("pci") or not g.get("vram_gb") or g.get("unified_memory"):
+        return None
+    saved = hy4_room_load() if saved is None else saved
+    if hy4_room_key(g) in saved:
+        return None
+    r = (cuda_room_bytes() if probe is None else probe).get(S._pci_key(str(g["pci"])))
+    return dict(g, cuda_probe=[int(x) for x in r]) if r else None
+
+
+def hy4_room_measure(cfg: dict, card: dict, info: dict, probe=None, save: bool = True) -> dict | None:
+    """After the engine started with --room-report on `card` (hy4_room_due): CUDA's own share on it as this PC shows
+    it, kept in HY4_ROOM_STORE.  The engine says how much free VRAM CUDA gave it (free) and how much less of it its
+    start's choices hold with (slack: the cache's rows, the drafter's room, the pictures, that it starts - its own
+    plan, so exactly what decides).  In the setup's terms that start takes the setup's sums for it (need:
+    hy4_config_need_gib with the rows and the drafter the engine took, no margin) and had `slack` more: room = need +
+    slack, against what the setup's CUDA probe saw of the card just before the start (card["cuda_probe"]:
+    hy4_room_due's, else probe's - free with a context held) - the
+    share is room - probe.  Not kept: a start that streams its cache (other sums), a figure out of all reason
+    (beyond -1 / +2 GiB), no reading.  The record, or None."""
+    try:
+        gpus = str(info.get("room_gpus") or "")
+        mine = S._pci_key(str(card.get("pci") or ""))
+        got = next((p.split(",") for p in gpus.split(";")
+                    if len(p.split(",")) == 3 and S._pci_key(p.split(",")[0]) == mine), None)
+        if got is None or int(info.get("room_streamed") or 0):
+            return None
+        free, slack = float(got[1]) / 2**30, float(got[2]) / 2**30
+        args, inst = [str(x) for x in cfg.get("args") or []], cfg.get("installer") or {}
+
+        def arg(k: str):
+            return args[args.index(k) + 1] if k in args[:-1] else None
+        quant, layout = inst.get("hy4_quant") or "", inst.get("layout") or HY4_STANDARD
+        ctx = int(arg("--max-context") or 0)
+        need = hy4_config_need_gib(quant, layout, ctx, chunk=int(arg("--chunk")) if arg("--chunk") else None,
+                                   reserve_gb=float(arg("--reserve-gb")) if arg("--reserve-gb") else None,
+                                   q8=info.get("room_rows") == "q8", mtp="--mtp" in args,
+                                   dfly2=bool(int(info.get("room_drafter") or 0)), margin=False) if ctx else None
+        r = card.get("cuda_probe") or (probe or {}).get(mine)
+        if need is None or not r:
+            return None
+        seen = float(r[0]) / 2**30
+        own = need + slack - seen
+        if not -1.0 <= own <= 2.0:
+            return None
+    except (TypeError, ValueError, IndexError, KeyError, AttributeError):
+        return None
+    rec = {"own_gib": round(own, 3), "probe_free_gib": round(seen, 3), "engine_free_gib": round(free, 3),
+           "slack_gib": round(slack, 3), "need_gib": round(need, 3), "context": ctx, "rows": info.get("room_rows"),
+           "drafter": bool(int(info.get("room_drafter") or 0)), "quant": quant, "layout": layout,
+           "measured": time.strftime("%Y-%m-%d %H:%M:%S")}
+    if save:
+        key = hy4_room_key(card)
+        store = {k: v for k, v in hy4_room_load().items()       # (this card's figure under another driver: gone)
+                 if k.split("|")[:3] != key.split("|")[:3]}
+        store[key] = rec
+        try:
+            HY4_ROOM_STORE.parent.mkdir(parents=True, exist_ok=True)
+            HY4_ROOM_STORE.write_text(json.dumps(store, indent=1) + "\n", encoding="utf-8")
+        except OSError:
+            return None
+    return rec
 
 
 def maya_engine_mib() -> dict:
@@ -8861,6 +8972,7 @@ def hy4_fit(q: dict, gpus: list, ctx_wanted: int | None = None, used: dict | Non
         lays = {k: v for k, v in lays.items() if k == layout}
     usable = hy4_usable_gib(gpus, used)
     kv_own = kv if kv in ("f16", "q8") else None
+    measured = bool(gpus) and all(g.get("engine_room_how") == "measured" for g in gpus)   # (hy4_engine_room's)
 
     def need(plan: dict, c: int) -> float:             # (the least a context takes: with F16 rows, or with 8-bit rows)
         if kv_own:
@@ -8913,7 +9025,8 @@ def hy4_fit(q: dict, gpus: list, ctx_wanted: int | None = None, used: dict | Non
         # (the chunk: doubled where that fits beside the model's own parts with the rows chosen above - the larger
         #  chunk's buffers hold the largest picture by themselves, so pictures and the chunk no longer compete)
         def beside(ch: int) -> float:                  # (with the drafter: hy4_drafter_need_gib)
-            return hy4_drafter_need_gib(plan, {"context": ctx, "kv": kv, "need": takes, "chunk": ch}, drafter)
+            return hy4_drafter_need_gib(plan, {"context": ctx, "kv": kv, "need": takes, "chunk": ch,
+                                               "room_measured": measured}, drafter)
         if chunk and takes + HY4_CHUNK_UP_GIB <= usable and \
                 not (drafter and not st and beside(2 * chunk) > usable >= beside(chunk)):
             chunk *= 2
@@ -8926,6 +9039,8 @@ def hy4_fit(q: dict, gpus: list, ctx_wanted: int | None = None, used: dict | Non
            "kv": kv, "usable": usable, "need": takes, "vision": vision, "vision_small": small}
     if streamed:
         out["streamed"] = streamed
+    if measured:                                       # (the drafter's sums then without margins: hy4_drafter_need_gib)
+        out["room_measured"] = True
     if st:
         out.update(kv_streaming=True, kv_ram=hy4_stream_ram_gib(ctx, kv == "q8"),
                    args=args + ["--kv-streaming", "auto"])
@@ -9229,9 +9344,18 @@ def hy4_drafter_need_gib(plan: dict, fit: dict, drafter: float) -> float:
     doubled (HY4_CHUNK_UP_GIB), the drafter's room, and HY4_FIT_MARGIN_GIB where the fit's figure is one measured on a
     card (a start with the drafter beside it never was; a context the plan does not list carries the margin already).
     The engine loads the drafter only where its room changes nothing but the experts' places - the cache's rows, the
-    prompt chunk, KV streaming (src/hy4 load()): with this figure free it does, with less it decodes without drafts."""
+    prompt chunk, KV streaming (src/hy4 load()): with this figure free it does, with less it decodes without drafts.
+    "room_measured" (hy4_fit's: every card's room counts CUDA's own share as the engine measured it on this PC -
+    hy4_engine_room): the sums without HY4_FIT_MARGIN_GIB, neither this one nor a context's the plan does not list -
+    the margin stands for sums never set against an engine, and that start set them against this PC's; a claim the
+    engine then finds no room for costs a start without drafts, never a start (the contexts and the rows that fit keep
+    their margins).  Measured on an RTX 3050 8 GB: so the setup claims the drafter at 4K and 5K, not at 6K and 8K,
+    and finds it room at 8K beside 8-bit rows - each as its engine then does."""
     listed = plan.get("need_gib_q8" if fit.get("kv") == "q8" else "need_gib") or {}
     up = HY4_CHUNK_UP_GIB if int(fit.get("chunk") or 0) > int(plan.get("chunk") or 0) > 0 else 0.0
+    if fit.get("room_measured") and not fit.get("kv_streaming"):
+        own = 0.0 if str(fit.get("context")) in listed else HY4_FIT_MARGIN_GIB   # (hy4_fit_need_gib's, taken out)
+        return float(fit.get("need") or 0) - own + up + drafter
     margin = HY4_FIT_MARGIN_GIB if str(fit.get("context")) in listed else 0.0
     return float(fit.get("need") or 0) + up + drafter + margin
 
@@ -9389,9 +9513,11 @@ def write_config_hy4(a, pc: dict, meta: dict, pack: Path, ctx: int, models: Path
     if fit.get("fast_drafting"):                       # (the opt-in: --kv q8 in its args; a setup again keeps it)
         inst["fast_drafting"] = True
     # (Windows: the VRAM the engine's CUDA gets on each card, as measured now - hy4_engine_room - with the card's
-    #  VRAM: the Models page counts it too while the engine holds the card, where it cannot be measured)
-    room = {str(g["index"]): [round(float(g["engine_room_gb"]), 3), float(g["vram_gb"])] for g in pc["gpus"]
-            if g.get("engine_room_gb") is not None and g.get("vram_gb")}
+    #  VRAM and CUDA's own reading: the Models page counts it too while the engine holds the card, where it cannot be
+    #  measured - with CUDA's own share as the engine measured it later, where it has since)
+    room = {str(g["index"]): [round(float(g["engine_room_gb"]), 3), float(g["vram_gb"])] +
+            ([round(float(g["cuda_free_gb"]), 3)] if g.get("cuda_free_gb") is not None else [])
+            for g in pc["gpus"] if g.get("engine_room_gb") is not None and g.get("vram_gb")}
     if room:
         inst["engine_room_gb"] = room
     inst.update(extra or {})                         # (draft_choice: auto = both fit, the speed calibration picks)
@@ -9584,9 +9710,13 @@ def set_up_hy4(a, prev: dict) -> Path | None:
     if room and len(room) == len(pc["gpus"]) and \
             sum(room.values()) < hy4_usable_gib([{k: v for k, v in g.items() if k != "engine_room_gb"}
                                                  for g in pc["gpus"]]):
+        how = {g.get("engine_room_how") for g in pc["gpus"]}
         ok(f"VRAM: Windows keeps part of {'these cards' if len(pc['gpus']) > 1 else 'this card'} from the programs "
            f"on it - the setup counts {sum(room.values()):.1f} of its {vram:.1f} GB, from CUDA's own reading (the "
-           "figure the engine plans with)")
+           "figure the engine plans with) and CUDA's own share " +
+           ("as the engine measured it at its first start here (measured)" if how == {"measured"} else
+            f"guessed until the engine's first start here measures it (estimated: {HY4_FIT_CUDA_OWN_GIB:g} GB)"
+            if how == {"estimated"} else "measured on some cards, guessed on the others (estimated)"))
     need = float(hy4_quant_table(quant).get("memory_gb") or 0)
     models = (Path(a.models_dir).expanduser().resolve() if a.models_dir else
               Path(inst["models_dir"]) if inst.get("models_dir") else ROOT.parent / "Maya-data" / "models")

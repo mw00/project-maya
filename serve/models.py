@@ -971,16 +971,80 @@ def hy4_cards(cfg: dict, gpus: list) -> dict:
     """{index: card} of machine_gpus' cards, each with the VRAM the engine's CUDA gets on it as the setup measured it
     under Windows (installer.engine_room_gb - maya.py's hy4_engine_room: Windows keeps part of every card, and while
     the engine holds it that cannot be measured again) where the card's VRAM is still the one measured then:
-    hy4_usable_gib counts no more than that there, as the setup did."""
+    hy4_usable_gib counts no more than that there, as the setup did.  Where the engine has since measured CUDA's own
+    share on that card (maya.py's HY4_ROOM_STORE, this PC, card and driver - hy4_room_own): CUDA's reading the setup
+    kept (the entry's third figure) with that share, as the next setup counts it ("engine_room_how": "measured" -
+    the drafter's sums then as the setup's, without margins)."""
     cards = {g["index"]: g for g in gpus}
-    for k, v in ((cfg.get("installer") or {}).get("engine_room_gb") or {}).items():
+    room = (cfg.get("installer") or {}).get("engine_room_gb") or {}
+    own = hy4_room_own() if any(isinstance(v, list) and len(v) >= 3 for v in room.values()) else {}
+    for k, v in room.items():
         try:
             i, gib, vram = int(k), float(v[0]), float(v[1])
+            how = "measured" if len(v) >= 3 and own.get(i) is not None else None
+            if how:
+                gib = float(v[2]) + own[i]
         except (TypeError, ValueError, IndexError):
             continue
         if i in cards and abs(float(cards[i].get("vram_gb") or 0) - vram) < 0.01:
-            cards[i] = {**cards[i], "engine_room_gb": gib}
+            cards[i] = {**cards[i], "engine_room_gb": gib, **({"engine_room_how": how} if how else {})}
     return cards
+
+
+def hy4_room_due(cfg: dict) -> dict | None:
+    """The server's, before it starts an engine: Hy4-Flash's card on which CUDA's own share is to be measured at this
+    start (maya.py's hy4_room_due: Windows, one NVIDIA card, none kept for this PC, card and driver); None else."""
+    try:
+        root = str(Path(__file__).resolve().parents[1])
+        if root not in sys.path:
+            sys.path.insert(0, root)
+        import maya
+        return maya.hy4_room_due(cfg)
+    except Exception:  # noqa: BLE001 - nothing to measure: the start as it was
+        return None
+
+
+def hy4_room_measured(cfg: dict, card: dict, info: dict) -> dict | None:
+    """After that start (the engine's --room-report in its INFO keys): the figure kept (maya.py's hy4_room_measure),
+    said in the server window; None where none was."""
+    try:
+        root = str(Path(__file__).resolve().parents[1])
+        if root not in sys.path:
+            sys.path.insert(0, root)
+        import maya
+        rec = maya.hy4_room_measure(cfg, card, info)
+    except Exception:  # noqa: BLE001 - no figure: the setup keeps its first guess
+        rec = None
+    _gpu_cache.pop("room_own", None)
+    if rec:
+        print(f"[maya] VRAM: CUDA's own share of {card.get('name') or 'the card'} measured at this first start: "
+              f"{rec['own_gib']:.2f} GB (the setup and the Models page count it from now on)", flush=True)
+    return rec
+
+
+def hy4_room_own() -> dict:
+    """{GPU index: GiB} - CUDA's own share of each of this PC's NVIDIA cards as the engine measured it (maya.py's
+    HY4_ROOM_STORE, for this PC, the card and its driver now); {} where none is kept or nothing can be read."""
+    now = time.time()
+    hit = _gpu_cache.get("room_own")
+    if hit and now - hit[0] < 60:
+        return hit[1]
+    out = {}
+    try:
+        root = str(Path(__file__).resolve().parents[1])
+        if root not in sys.path:
+            sys.path.insert(0, root)
+        import maya                                    # (the setup's own records; nothing runs on import)
+        saved = maya.hy4_room_load()
+        if saved:
+            for g in maya.S.gpus() or []:
+                rec = saved.get(maya.hy4_room_key(g)) or {}
+                if isinstance(rec.get("own_gib"), (int, float)):
+                    out[int(g["index"])] = float(rec["own_gib"])
+    except Exception:  # noqa: BLE001 - no record to read: the setup's figure stands
+        out = {}
+    _gpu_cache["room_own"] = (now, out)
+    return out
 
 
 def hy4_room(cfg: dict) -> dict | None:
