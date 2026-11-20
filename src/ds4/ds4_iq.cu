@@ -536,10 +536,10 @@ __device__ __forceinline__ float sub_dot(const Sub& s, const int4& xa, const int
         const float m0 = min_bar(s.m0), m1 = min_bar(s.m1), fl = min_bar((float) sl), fh = min_bar((float) sh);
         float W;
         if constexpr (MF % 3 == 0) W = min_bar(min_bar(m0 * fl) + min_bar(m1 * fh));
-        else if constexpr (MF % 3 == 1) W = min_bar(__builtin_fmaf(m0, fl, min_bar(m1 * fh)));
-        else W = min_bar(__builtin_fmaf(m1, fh, min_bar(m0 * fl)));
+        else if constexpr (MF % 3 == 1) W = min_bar(fmaf(m0, fl, min_bar(m1 * fh)));
+        else W = min_bar(fmaf(m1, fh, min_bar(m0 * fl)));
         if constexpr (MF < 3) return min_bar(min_bar(d * X) - W);
-        else return min_bar(__builtin_fmaf(d, X, min_bar(-W)));
+        else return min_bar(fmaf(d, X, min_bar(-W)));
     }
     float v = fmul_no_fma(s.d, (float) (s.s0 * lo + s.s1 * hi));
     if constexpr (Ty<T>::MIN) {
