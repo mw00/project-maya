@@ -366,15 +366,19 @@ __device__ __forceinline__ void hc_fin_body(int t, const float* __restrict__ x, 
         s_mix[threadIdx.x] = v;
     }
     __syncthreads();
-    if (threadIdx.x == 0) {
+    // (a thread a stream, not thread 0 looping over them: CUDA 13.0's ptxas (V13.0.88) built that loop for sm_120
+    //  with base + hc's address in 32 bits - its upper half dropped, an illegal read at the warm-up; the same products)
+    if ((int) threadIdx.x < hc) {
+        const int j = threadIdx.x;
         const float r = 1.0f / sqrtf(s_mix[kMaxM] / (float) HE + eps);
-        for (int j = 0; j < nm; ++j) s_mix[j] *= r;
-        if (mix_out)
-            for (int j = 0; j < nm; ++j) mix_out[(size_t) t * nm + j] = s_mix[j];
-        for (int j = 0; j < hc; ++j) s_pre[j] = sigmoidf_(s_mix[j] * scale[0] + base[j]) + hc_eps;
-        if (!HEAD)
-            for (int j = 0; j < hc; ++j)
-                post[(size_t) t * hc + j] = sigmoidf_(s_mix[hc + j] * scale[1] + base[hc + j]) * mag + hc_eps;
+        const float m0 = s_mix[j] * r;
+        if (mix_out) mix_out[(size_t) t * nm + j] = m0;
+        s_pre[j] = sigmoidf_(m0 * scale[0] + base[j]) + hc_eps;
+        if (!HEAD) {
+            const float m1 = s_mix[hc + j] * r;
+            if (mix_out) mix_out[(size_t) t * nm + hc + j] = m1;
+            post[(size_t) t * hc + j] = sigmoidf_(m1 * scale[1] + base[hc + j]) * mag + hc_eps;
+        }
     }
     __syncthreads();
     const float* xt = x + (size_t) t * HE;
