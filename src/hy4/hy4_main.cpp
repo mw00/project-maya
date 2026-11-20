@@ -654,7 +654,9 @@ int serve(hy4::Model& m, const std::vector<int>& eos, int n_draft, float floor0,
 #if defined(SIGPIPE)
     std::signal(SIGPIPE, SIG_IGN);
 #endif
-    Lines in;
+    // (never freed: its reader thread is detached and wakes at stdin's end, which can come after QUIT while the model
+    //  is still being torn down - a Lines on this stack would be gone by then and its mutex with it)
+    Lines& in = *new Lines;
     in.start();
     std::vector<int> state;   // the tokens in the caches, positions 0 ..
     struct Held {
