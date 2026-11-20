@@ -324,6 +324,29 @@ class ImageUUIDIsolationHTTP(unittest.TestCase):
         self.assert_miss(self.post(key=b))
         self.assertEqual(self.post(key=a)[0], 200)
 
+    def test_global_eviction_refresh_and_retry_remain_key_isolated(self):
+        from unittest.mock import patch
+        self.service.api_key = ["key-a", "key-b"]
+        a, b = {"x-api-key": "key-a"}, {"Authorization": "Bearer key-b"}
+        # A small bound exercises the same global LRU without generating 65 answers.
+        with patch.object(DV.Vision, "IMAGE_IDS_MAX", 2):
+            self.assertEqual(self.post("red", a)[0], 200)
+            self.assertEqual(self.post("blue", b)[0], 200)
+            self.assertEqual(self.post(key=a)[0], 200)  # refresh A ahead of B
+            other = {"messages": [{"role": "user", "content": [
+                {"type": "image_url", "image_url": {"url": "green"}, "uuid": "other-id"}]}]}
+            self.assertEqual(self.post(key=b, extra=other, path="/api/tokens")[0], 200)
+            self.assertEqual(len(self.service.vision.image_ids), 2)
+            self.assert_miss(self.post(key=b))
+            self.assertEqual(self.post(key=a)[0], 200)
+            # Eviction lets B resend pixels for its UUID, but cannot rebind A's UUID.
+            self.assertEqual(self.post("yellow", b)[0], 200)
+            self.assertEqual(self.post(key=a)[0], 200)
+            self.assertEqual(len(self.service.vision.image_ids), 2)
+            self.assertEqual({p.rgb[0] for p in self.service.vision.image_ids.values()},
+                             {ord("r"), ord("y")})
+            self.assertNotIn("blue", self.loads[self.loads.index("green") + 1:])
+
     def test_context_isolation_on_concurrent_requests(self):
         from concurrent.futures import ThreadPoolExecutor
         self.service.api_key = ["key-a", "key-b"]
