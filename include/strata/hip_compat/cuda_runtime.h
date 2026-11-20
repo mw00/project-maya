@@ -108,6 +108,7 @@ inline hipError_t cudaHostAlloc(T** p, size_t bytes, unsigned int flags) {
 #define cudaMemcpyHostToDevice hipMemcpyHostToDevice
 #define cudaMemset hipMemset
 #define cudaMemsetAsync hipMemsetAsync
+#define cudaMemset2DAsync hipMemset2DAsync
 #define cudaPeekAtLastError hipPeekAtLastError
 #define cudaRuntimeGetVersion hipRuntimeGetVersion
 #define cudaSetDevice hipSetDevice
