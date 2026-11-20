@@ -19,6 +19,7 @@ apply() writes them back into the config's "args", "env", "gpu" and "vision" - i
 from __future__ import annotations
 
 import copy
+import glob
 import json
 import os
 import re
@@ -1779,8 +1780,10 @@ def delete(root: Path, path: Path, files: bool = False) -> dict:
                     pass
         if errors:
             raise OSError("could not delete " + "; ".join(errors) + " - the model stays on the list")
+    # (and the copies a setup run kept of it before it changed it: <config>.json.bak-<date>, maya.py's set_up)
     for p in (path, path.with_name(f"run-{path.stem}.sh"), path.with_name(f"run-{path.stem}.bat"),
-              path.with_name(path.name + ".prev"), path.with_name(path.stem + ".shared-settings.json")):
+              path.with_name(path.name + ".prev"), path.with_name(path.stem + ".shared-settings.json"),
+              *path.parent.glob(glob.escape(path.name) + ".bak-*")):
         try:
             p.unlink()
         except FileNotFoundError:

@@ -1301,7 +1301,8 @@ def vs_2026(vcvars) -> bool:
     return vcvars is not None and any(p.isdigit() and 18 <= int(p) < 1000 for p in PureWindowsPath(str(vcvars)).parts)
 
 
-def check_hip_pc(a, installed=False, text_only=True) -> dict:
+def check_hip_pc(a, installed=False, text_only=True, before=None) -> dict:
+    """`before`: the GPUs this model's config ran on - a setup again without --gpu / --gpus keeps them."""
     if not WIN and (not sys.platform.startswith("linux") or S.is_wsl()):
         fail("Maya's HIP backend runs on native Linux or Windows")
     vcvars = S.find_vcvars(cuda=False) if WIN else None
@@ -1328,7 +1329,11 @@ def check_hip_pc(a, installed=False, text_only=True) -> dict:
              f"check with {hipinfo}")
     elif WIN and len(found) > 1 and any(g.get("source") == "registry" for g in found):
         warn("these GPU numbers are Windows' order (ROCm's hipInfo was not found): HIP's own can differ")
-    if a.gpus:
+    kept = None if (a.gpus or a.gpu is not None) else gpus_before(before, usable)
+    if kept:                                           # (a setup again: the GPUs its config ran on, said)
+        chosen = [next(g for g in usable if g["index"] == i) for i in kept]
+        ok("GPUs: " + ", ".join(str(i) for i in kept) + " - as set up before (--gpu / --gpus picks others)")
+    elif a.gpus:
         # two or more cards split the layers (each caches the experts of its own portion); the larger card goes first, as it
         # takes the bigger first portion - the order measured on an R9700 + RX 7900 XT
         try:
@@ -1355,7 +1360,7 @@ def check_hip_pc(a, installed=False, text_only=True) -> dict:
         missing = sorted({g["arch"] for g in chosen}) if root is None else rocm_devices_missing(g["arch"] for g in chosen)
         if missing and not installed and (root is None or not getattr(a, "check", False)):   # (--check: says so below)
             install_rocm(a, chosen)
-            return check_hip_pc(a, installed=True)
+            return check_hip_pc(a, installed=True, before=before)
         if root is None:
             fail("AMD's ROCm SDK for Windows was not found after its install", f"run {ME} again")
         if missing:
@@ -1548,10 +1553,24 @@ def cuda_lib_dirs(nvcc: str) -> list:
 
 
 # ------------------------------------------------------------------------------------------------ 1. the PC
-def choose_gpus(a, found, min_cc: int = MIN_CC, family: str = "") -> list:
-    """The GPUs the model runs on: --gpu / --gpus, else asked when several can share it (all of them recommended)."""
+def gpus_before(before, usable: list) -> list | None:
+    """The GPU numbers a config of this model ran on (its "gpu"), when every one of them is still here and usable -
+    a setup again offers them first (#1066: it took all the GPUs again, adding one the user had left out)."""
+    ids = before if isinstance(before, list) else [before] if isinstance(before, int) else []
+    ids = [i for i in ids if isinstance(i, int)]
+    byid = {g["index"]: g for g in usable}
+    if not ids or len(set(ids)) != len(ids) or any(i not in byid for i in ids):
+        return None
+    return ids
+
+
+def choose_gpus(a, found, min_cc: int = MIN_CC, family: str = "", before=None) -> list:
+    """The GPUs the model runs on: --gpu / --gpus, else asked when several can share it (all of them recommended).
+    `before`: the GPUs this model's config ran on - a setup again keeps them (the default answer; --gpus picks
+    others)."""
     byid = {g["index"]: g for g in found}
     usable = [g for g in found if int(g["arch"]) >= min_cc]
+    kept = None if (a.gpus or a.gpu is not None) else gpus_before(before, usable)
     if a.gpus or a.gpu is not None:
         try:
             want = [int(x) for x in str(a.gpus).split(",") if x.strip()] if a.gpus else [a.gpu]
@@ -1575,21 +1594,33 @@ def choose_gpus(a, found, min_cc: int = MIN_CC, family: str = "") -> list:
     # layers of the split and runs out of memory at the pack; the automatic pick leaves it out (--gpus still takes it).
     small = [g for g in best[1:] if g["vram_gb"] < SMALL_GPU_SHARE * best[0]["vram_gb"]]
     for g in small:
-        say(f"    {gpu_label(g)} is left out: too little VRAM beside the others for a part of the split "
-            f"(--gpus takes it anyway)")
+        if not kept or g["index"] not in kept:
+            say(f"    {gpu_label(g)} is left out: too little VRAM beside the others for a part of the split "
+                f"(--gpus takes it anyway)")
     best = [g for g in best if g not in small]
+    kept_gs = [byid[i] for i in kept] if kept else None
+
+    def label(gs):
+        if len(gs) > 2:
+            return (f"all {len(gs)}" if gs == best[:MAX_GPUS] else f"{len(gs)}") + " together: GPUs " + \
+                ", ".join(str(g["index"]) for g in gs) + f" ({sum(g['vram_gb'] for g in gs):.0f} GB of VRAM)"
+        if len(gs) == 2:
+            return f"{gpu_label(gs[0])} + {gpu_label(gs[1])} together"
+        return f"{gpu_label(gs[0])} only"
     if len(best) == 1:
+        if kept_gs and kept_gs != best:                # (chosen before with --gpus: still the answer)
+            ok("GPUs: " + label(kept_gs) + " - as set up before (--gpus picks others)")
+            return kept_gs
         return best
     opts = ([best[:MAX_GPUS]] if len(best) > 2 else []) + [best[:2], best[:1]]
-    labels = []
-    for gs in opts:
-        if len(gs) > 2:
-            labels.append(f"all {len(gs)} together: GPUs " + ", ".join(str(g["index"]) for g in gs) +
-                          f" ({sum(g['vram_gb'] for g in gs):.0f} GB of VRAM)")
-        elif len(gs) == 2:
-            labels.append(f"{gpu_label(gs[0])} + {gpu_label(gs[1])} together")
-        else:
-            labels.append(f"{gpu_label(gs[0])} only")
+    rec, default = 0, 0                                # (the recommended answer, and the one Enter / --yes takes)
+    if kept_gs:
+        at = next((i for i, gs in enumerate(opts) if [g["index"] for g in gs] == kept), None)
+        if at is None:                                 # (another set: offered first, the recommended one after it)
+            opts.insert(0, kept_gs)
+            at, rec = 0, 1
+        default = at
+    labels = [label(gs) + (" - as set up before" if kept_gs and i == default else "") for i, gs in enumerate(opts)]
     intro = (["MiniMax-M3.1-Flash runs best on all of them: the GPUs share the layers (or split them in groups where",
               "that measures faster), and the more VRAM, the fewer experts the CPU computes."]
              if family == "minimax" else
@@ -1603,7 +1634,7 @@ def choose_gpus(a, found, min_cc: int = MIN_CC, family: str = "") -> list:
               "of its", "own layers, so together they hold more of them (V100s: ~50 tok/s benchmark on two, ~24 "
               "on one)."])
     pick = choose("Which GPUs?", intro,
-                  [(label, "recommended" if i == 0 else None, None) for i, label in enumerate(labels)], 0,
+                  [(lab, "recommended" if i == rec else None, None) for i, lab in enumerate(labels)], default,
                   a.yes or a.check,
                   ["(--gpus picks any others, e.g. --gpus 0,2,5; a model with a draft block drafts tokens on two GPUs "
                    "or more)"] if len(best) > 2 and S.UI is None else [])   # (the plain setup's; not on the screen)
@@ -1618,7 +1649,8 @@ def oomd_active() -> bool:
     return S.out(["systemctl", "is-active", "systemd-oomd"]).strip() == "active"
 
 
-def check_pc(a, family: str = "glm", gguf: bool = False, ds4_quant: str = "exl3") -> dict:
+def check_pc(a, family: str = "glm", gguf: bool = False, ds4_quant: str = "exl3", before=None) -> dict:
+    """Step 1.  `before`: the GPUs the config of this model's setup before ran on (its answer is the default)."""
     step(1, "checking this PC")
     ds4 = family == "deepseek"
     mm3 = family == "minimax"
@@ -1635,7 +1667,7 @@ def check_pc(a, family: str = "glm", gguf: bool = False, ds4_quant: str = "exl3"
              "Linux) - if it does not start or its answers look wrong, docs/AMD_MAYA.md says how to report it and "
              "what to use instead")
     if a.backend == "hip":
-        return check_hip_pc(a, text_only=not (mm3 or hy4))
+        return check_hip_pc(a, text_only=not (mm3 or hy4), before=before)
     if a.backend == "metal":
         if family != "glm":
             fail(f"Maya's setup runs GLM-5.3-Flash only on a Mac (not {ds4 and DS4 or mm3 and MM3 or hy4 and HY4 or QWEN_SHOWN})",
@@ -1666,7 +1698,7 @@ def check_pc(a, family: str = "glm", gguf: bool = False, ds4_quant: str = "exl3"
         say(f"    {gpu_label(g)} - " + ("can be used" if int(g["arch"]) >= max(min_cc, VALIDATED_CC) else
                                        "can be used (Pascal: experimental)" if int(g["arch"]) >= min_cc else
                                        f"too old (this model needs compute capability {min_cc / 10:.1f} or newer)"))
-    chosen = choose_gpus(a, found, min_cc, family)
+    chosen = choose_gpus(a, found, min_cc, family, before)
     archs = sorted({int(g["arch"]) for g in chosen})
     vram = sum(g["vram_gb"] for g in chosen)
     ok("using " + " + ".join(gpu_label(g) for g in chosen) +
@@ -4189,17 +4221,48 @@ def _fetch_ablate_file(url: str, dst: Path, part: Path, model: str, repo: str, n
     return why
 
 
-def ablate_step(cfg_path: Path, key: str, models: Path) -> None:
+def had_ablation(cfg: dict) -> bool:
+    """Whether a config loads a refusal direction (its "ablate" record, or --ablate in its args)."""
+    return isinstance(cfg.get("ablate"), dict) or "--ablate" in [str(x) for x in cfg.get("args") or []]
+
+
+def ablate_step(cfg_path: Path, key: str, models: Path, a=None) -> None:
     """The config's refusal direction: the downloaded file recorded as cfg["ablate"] (its model and quant, a default
     set on the Models page kept) with --ablate FILE --ablate-default off in the engine's args.  A file named by hand
-    (outside the setup's folder) stays as it is; without a file the three flags go."""
+    (outside the setup's folder) stays as it is; without a file the three flags go.
+    A setup again over a config without a direction leaves it without (#1066: the user's config, not this model's
+    default for a new one) - unless that config's own setup found none to download (installer "ablate": "none": tried
+    again) or --ablation on asks for it; --ablation off takes it out.  The choice is recorded in installer "ablate"."""
     from serve import models as SM
     cfg = read_json(cfg_path)
-    old = cfg.get("ablate") if isinstance(cfg.get("ablate"), dict) else {}
+    before = config_before(cfg_path)                   # (None: a new config)
+    want = getattr(a, "ablation", None)
+    inst = cfg.setdefault("installer", {})
+
+    def without(why: str, mark: str) -> None:
+        cfg.pop("ablate", None)
+        cfg["args"] = SM.ablate_args(cfg, list(cfg.get("args") or []))
+        inst["ablate"] = mark
+        cfg_path.write_text(json.dumps(N.env_out(cfg), indent=1), encoding="utf-8")
+        ok(why)
+    if want == "off":
+        return without("refusal ablation: left out (--ablation off; --ablation on loads it again)", "off")
+    if want is None and before is not None and not had_ablation(before) and \
+            (before.get("installer") or {}).get("ablate") != "none":
+        return without("refusal ablation: the config before had none, so it stays without "
+                       f"({ME} --setup --ablation on loads the direction, off by default)", "off")
+    # (the config before's record: the Models page's default and scale, a file set by hand - the writers start anew)
+    old = cfg.get("ablate") if isinstance(cfg.get("ablate"), dict) else \
+        before.get("ablate") if before is not None and isinstance(before.get("ablate"), dict) else {}
     mine = models / ABLATE_DIR
     hand = old.get("file") and Path(str(old["file"])).expanduser().is_file() and \
         Path(str(old["file"])).expanduser().resolve().parent != mine.resolve()
     if hand:
+        if cfg.get("ablate") != old:                   # (the config before's: written back into the new one)
+            cfg["ablate"] = old
+            cfg["args"] = SM.ablate_args(cfg, list(cfg.get("args") or []))
+            inst["ablate"] = "loaded"
+            cfg_path.write_text(json.dumps(N.env_out(cfg), indent=1), encoding="utf-8")
         ok(f"refusal ablation: the direction file set by hand stays ({old['file']})")
         return
     p = fetch_ablate_direction(key, models)
@@ -4211,6 +4274,7 @@ def ablate_step(cfg_path: Path, key: str, models: Path) -> None:
         md = GR.GGUFFile(p).metadata
         cfg["ablate"] = {**kept, "file": str(p), "model": md.get("maya.ablate.model") or ABLATE_DIRECTIONS[key][0],
                          **({"fitted_on": md["maya.ablate.fitted_on"]} if md.get("maya.ablate.fitted_on") else {})}
+    inst["ablate"] = "none" if p is None else "loaded"   # (none: no direction to download - a setup again tries)
     cfg["args"] = SM.ablate_args(cfg, list(cfg.get("args") or []))
     cfg_path.write_text(json.dumps(N.env_out(cfg), indent=1), encoding="utf-8")
 
@@ -4426,6 +4490,12 @@ def glm_config_path(pc: dict, quant: str) -> Path:
     return ROOT / f"maya-{quant.lower()}{({'hip': '-hip', 'metal': '-metal'}.get(pc.get('backend'), ''))}.json"
 
 
+# the environment settings the GLM setup itself writes (or leaves out) by the PC and GPUs chosen - a setup again works
+# them out anew instead of keeping the config before's
+GLM_SETUP_ENV = ("MAYA_GLM_RESERVE_MB", "MAYA_GLM_RAM_HEADROOM_GB", "MAYA_GLM_SPLIT", "MAYA_GLM_MTP_DECODE",
+                 "MAYA_GLM_PARALLEL_LOAD", "MAYA_GLM_PREFILL_SUB", "MAYA_GLM_PREFILL_MB", "MAYA_HIPBLASLT_TUNING")
+
+
 def write_config(a, pc, meta, pack: Path, quant: str, ctx: int, models: Path, vision: dict | None,
                  choice: tuple | None = None, dflash: Path | None = None, gguf: Path | None = None) -> Path:
     step(8, "the configuration and the start script")
@@ -4507,10 +4577,16 @@ def write_config(a, pc, meta, pack: Path, quant: str, ctx: int, models: Path, vi
             # the OS's path-list separator: a ':' would also split a Windows drive letter (C:\...)
             hip_env["MAYA_HIPBLASLT_TUNING"] = os.pathsep.join(tables)
         env = {**hip_env, **env}
-    if env:
-        cfg["env"] = env
     cfg_path = glm_config_path(pc, quant)
     old_cfg = read_json(cfg_path)
+    # the config before's own variables (set by hand, on the Models page or with --env then) stay, as the DeepSeek,
+    # MiniMax, Hy4-Flash and Qwen setups keep them - a GLM setup again dropped them (#1066); the ones this setup works
+    # out (the AMD settings, written or left out by the GPUs chosen now) and the tuning's are its own, and an --env
+    # given now wins
+    own = set(GLM_SETUP_ENV) | set(CAL.KEYS)
+    forced, env = env, {**{k: v for k, v in (old_cfg.get("env") or {}).items() if N.shown(str(k)) not in own}, **env}
+    if env:
+        cfg["env"] = env
     # the server's own settings from the config before (the address it listens on, its API key, ...): kept, as the
     # DeepSeek, MiniMax and Qwen setups keep them - a GLM setup run again dropped them; --host / --api-key given now win
     for k in ("host", "api_key", "cors_origins", "mcp_servers", "mixed_gpus", "mixed_exe", "mixed_gpu"):
@@ -4570,7 +4646,7 @@ def write_config(a, pc, meta, pack: Path, quant: str, ctx: int, models: Path, vi
     cal = saved_calibration(cfg, any_context=True)     # tuned on this PC for this model (and context) before
     if cal is not None:
         tuned = CAL.apply(cfg.get("env") or {}, cal.get("settings") or {})
-        tuned.update(env)                              # (an --env given now wins)
+        tuned.update(forced)                           # (an --env given now wins)
         if tuned:
             cfg["env"] = tuned
         if cal.get("gpu_env"):                         # (where it was measured: stale_tuning at a start compares)
@@ -6634,7 +6710,108 @@ def setup_screen(a, asks: bool = True) -> bool:
     return True
 
 
+# the installed configs as they were when this setup run began ({resolved path: text}): ablate_step reads the config
+# before from it, and set_up keeps a copy of each config the run changed next to it (keep_config_backups)
+SETUP_BEFORE: dict = {}
+# what a setup run may change in a config's installer record without a copy kept: when it was written
+CONFIG_VOLATILE = ("written",)
+
+
+def args_map(args) -> dict:
+    """An engine argument list as {flag: value, or True for a flag without one} (order and paths left as they are)."""
+    out, args = {}, [str(x) for x in args or []]
+    for i, x in enumerate(args):
+        if x.startswith("--"):
+            out[x] = args[i + 1] if i + 1 < len(args) and not args[i + 1].startswith("--") else True
+    return out
+
+
+def config_changes(old: dict, new: dict) -> list:
+    """What a setup run changed in a config, in words: GPUs, engine arguments, environment, other settings (its
+    installer record's date left out) - [] when nothing that matters changed."""
+    lines = []
+    if old.get("gpu") != new.get("gpu"):
+        lines.append(f"GPUs {old.get('gpu')} -> {new.get('gpu')}")
+    oa, na = args_map(old.get("args")), args_map(new.get("args"))
+    short = lambda v: "" if v is True else f" {v}" if len(str(v)) <= 40 else " ..." + str(v)[-30:]   # noqa: E731
+    lines += [f"{f} added" for f in na if f not in oa]
+    lines += [f"{f} removed" for f in oa if f not in na]
+    lines += [f"{f}{short(oa[f])} ->{short(na[f])}" for f in na if f in oa and na[f] != oa[f]]
+    oe, ne = old.get("env") or {}, new.get("env") or {}
+    lines += [f"env {k} added" for k in ne if k not in oe] + [f"env {k} removed" for k in oe if k not in ne]
+    lines += [f"env {k}={oe[k]} -> {ne[k]}" for k in ne if k in oe and str(ne[k]) != str(oe[k])]
+    for k in sorted(set(old) | set(new)):
+        if k in ("gpu", "args", "env"):
+            continue
+        ov, nv = old.get(k), new.get(k)
+        if k == "installer":
+            ov = {x: y for x, y in (ov or {}).items() if x not in CONFIG_VOLATILE}
+            nv = {x: y for x, y in (nv or {}).items() if x not in CONFIG_VOLATILE}
+        if ov != nv:
+            lines.append(f"{k} " + ("added" if ov is None else "removed" if nv is None else "changed"))
+    return lines
+
+
+def keep_config_backups(before: dict) -> list:
+    """After a setup run: each installed config it changed gets the text it had before kept next to it, as
+    <config>.json.bak-<date> (not a config the start or the Models page lists), and the changes are said.  The
+    backups made."""
+    made = []
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    for p, text in before.items():
+        path = Path(p)
+        try:
+            now = path.read_text(encoding="utf-8-sig")
+        except OSError:
+            continue
+        if now == text:
+            continue
+        try:
+            changes = config_changes(json.loads(text), json.loads(now))
+        except ValueError:
+            changes = ["rewritten"]
+        if not changes:
+            continue
+        bak = path.with_name(f"{path.name}.bak-{stamp}")
+        try:
+            bak.write_text(text, encoding="utf-8")
+        except OSError as e:
+            warn(f"{path.name}: changed by this setup, but the copy of the config before could not be written ({e})")
+            continue
+        made.append(bak)
+        ok(f"{path.name}: changed by this setup (" + "; ".join(changes[:8]) +
+           (f"; {len(changes) - 8} more" if len(changes) > 8 else "") + f") - the config before is kept as {bak.name}")
+    return made
+
+
+def config_before(cfg_path: Path) -> dict | None:
+    """The config at cfg_path as it was when this setup run began, or None (a new one, or not a setup run)."""
+    text = SETUP_BEFORE.get(str(Path(cfg_path).resolve()))
+    try:
+        return json.loads(text) if text is not None else None
+    except ValueError:
+        return None
+
+
 def set_up(a, prev: dict) -> Path | None:
+    """The setup (_set_up): the installed configs read first, and each one the run changed keeps a copy of what it had
+    before next to it, said on the screen (#1066: a setup again rewrote a config - --ablate added, a GPU added)."""
+    global SETUP_BEFORE
+    before = {}
+    for p in configs():
+        try:
+            before[str(p.resolve())] = p.read_text(encoding="utf-8-sig")
+        except OSError:
+            pass
+    SETUP_BEFORE = before
+    try:
+        return _set_up(a, prev)
+    finally:
+        SETUP_BEFORE = {}
+        keep_config_backups(before)
+
+
+def _set_up(a, prev: dict) -> Path | None:
     """Steps 1-8, then the tuning: the config written, or None when the model was not downloaded.  `prev`: the
     config of the setup before (its answers are the defaults).  The model comes first: GLM-5.3-Flash or DeepSeek-V4.1-
     Flash-1017 (set_up_ds4), each then with the answers of its own setup before."""
@@ -6655,7 +6832,7 @@ def set_up(a, prev: dict) -> Path | None:
     inst = prev.get("installer") or {}
     prev_args = prev.get("args") or []
     prev_ctx = int(prev_args[prev_args.index("--max-context") + 1]) if "--max-context" in prev_args[:-1] else None
-    pc = check_pc(a)                                   # 1
+    pc = check_pc(a, before=prev.get("gpu"))           # 1
     metal = pc["backend"] == "metal"
     step(2, "your choices")                            # 2
     # the models folder: --models-dir, else the one set up before (a config from before the option has its data
@@ -6721,7 +6898,7 @@ def set_up(a, prev: dict) -> Path | None:
         vision = vision_step(a, pc, meta, llama, d, quant)  # 7
     cfg_path = write_config(a, pc, meta, pack, quant, ctx, models, vision, choice, dflash, shards[0] if metal else None)   # 8
     if not metal:                                      # (the Mac engine does not project a direction)
-        ablate_step(cfg_path, "glm-dsa" if dsa else "glm", models)
+        ablate_step(cfg_path, "glm-dsa" if dsa else "glm", models, a)
     if dflash is not None and metal:                   # (the speed calibration is CUDA's: on a Mac the choice is yours)
         ok("DFlash2 drafts on this Mac, not measured against the MTP block (the model checks both): "
            f"{ME} --setup --draft mtp goes back")
@@ -7802,7 +7979,7 @@ def set_up_ds4(a, prev: dict) -> Path | None:
     prev_args = prev.get("args") or []
     prev_ctx = int(prev_args[prev_args.index("--max-context") + 1]) if "--max-context" in prev_args[:-1] else None
     gguf = quant not in DS4_EXL3
-    pc = check_pc(a, "deepseek", gguf, quant)          # 1
+    pc = check_pc(a, "deepseek", gguf, quant, before=prev.get("gpu"))   # 1
     step(2, "your choices")                            # 2
     ok(f"files: {Q.shown('deepseek', quant)}" + (" (Maya's quant)" if quant in DS4_MAYA else
                                                  " (a gated repo: your Hugging Face token)" if quant in DS4_ABL else
@@ -7898,7 +8075,7 @@ def set_up_ds4(a, prev: dict) -> Path | None:
     if gguf:                                           # (an earlier layout's copy of the shared tables: one copy, #777)
         ds4_table_dupes(pack, d)
     cfg_path = write_config_ds4(a, pc, meta, pack, ctx, models, d, quant, vision)   # 8
-    ablate_step(cfg_path, "deepseek", models)
+    ablate_step(cfg_path, "deepseek", models, a)
     if (drafter or not gguf) and CDS.has_drafter(read_json(cfg_path)):
         how = drafting_choice(a, "The DSpark drafter", "10-30")
         if how != "measure":
@@ -8421,7 +8598,7 @@ def set_up_mm3(a, prev: dict) -> Path | None:
     gguf = quant != "exl3"
     own = mm3_own_dir(a, quant)                        # --model-dir: an EXL3 folder of your own, not the pinned download
     need = mm3_memory_gb(quant, own)
-    pc = check_pc(a, "minimax", gguf=gguf)             # 1
+    pc = check_pc(a, "minimax", gguf=gguf, before=prev.get("gpu"))   # 1
     total, _ = mem_gb()
     vram = sum(g["vram_gb"] for g in pc["gpus"])
     name = MM3 if not gguf else Q.shown("minimax", quant)
@@ -8465,7 +8642,7 @@ def set_up_mm3(a, prev: dict) -> Path | None:
     else:
         ok("no vision tower in this pack: text only")
     cfg_path = write_config_mm3(a, pc, meta, pack, ctx, models, d, quant, bool(own))   # 8
-    ablate_step(cfg_path, "minimax", models)
+    ablate_step(cfg_path, "minimax", models, a)
     if S.UI is not None:                               # 9: how this PC reads prompts fastest, measured
         S.UI.step(9, "prefill calibration")
     prefill_calibration(cfg_path, "once, for this setup")
@@ -9832,7 +10009,7 @@ def set_up_hy4(a, prev: dict) -> Path | None:
     prev_ctx = int(prev_args[prev_args.index("--max-context") + 1]) \
         if same and "--max-context" in prev_args[:-1] else None
     name = Q.shown("hy4", quant)
-    pc = check_pc(a, "hy4")                            # 1
+    pc = check_pc(a, "hy4", before=prev.get("gpu"))    # 1
     total, _ = mem_gb()
     vram = sum(g["vram_gb"] for g in pc["gpus"])
     room = hy4_engine_room(pc)                         # (Windows: what the engine's CUDA gets on each card, measured)
@@ -10430,7 +10607,7 @@ def set_up_qwen(a, prev: dict) -> Path | None:
     prev_args = prev.get("args") or []
     prev_ctx = int(prev_args[prev_args.index("--max-context") + 1]) if "--max-context" in prev_args[:-1] else None
     m = qwen_entry(quant)
-    pc = check_pc(a, "qwen")                           # 1
+    pc = check_pc(a, "qwen", before=prev.get("gpu"))   # 1
     total, _ = mem_gb()
     vram = sum(g["vram_gb"] for g in pc["gpus"])
     if vram + total < m["memory_gb"]:
@@ -10528,6 +10705,10 @@ def main() -> int:
                     help="GPU backend (HIP: gfx1100/gfx1201/gfx1151 on Linux and Windows; Metal: experimental, "
                          "Apple Silicon Macs, text only; the default on a Mac)")
     ap.add_argument("--setup", action="store_true", help="set up again instead of starting the installed model")
+    ap.add_argument("--ablation", choices=["on", "off"],
+                    help="GLM, DeepSeek and MiniMax: the model's refusal direction loaded (on - each request still "
+                         "asks for it, off by default) or left out (off). Not given: a new config loads it, a setup "
+                         "again keeps what its config had")
     ap.add_argument("--check", action="store_true", help="only check this PC and exit")
     ap.add_argument("--no-start", action="store_true", help="set up, but do not start the dashboard")
     ap.add_argument("--yes", action="store_true",
@@ -10731,6 +10912,9 @@ def main() -> int:
         if getattr(a, "fast_drafting", None):   # (a setup setting: the cache's rows are worked out with the context)
             warn(f"--fast-drafting is a setup setting of Hy4-Flash: {ME} --setup --fast-drafting {a.fast_drafting} "
                  "sets it up; this start keeps the config as it is")
+        if getattr(a, "ablation", None):       # (a setup setting, kept in the config)
+            warn(f"--ablation is a setup setting: {ME} --setup --ablation {a.ablation} sets it up; this start keeps "
+                 "the config as it is")
         if getattr(a, "fast_prefill", None):   # (given on a start too: written into a DeepSeek config, which keeps it)
             cfg = read_json(pick)
             if config_family(cfg) != "deepseek":
