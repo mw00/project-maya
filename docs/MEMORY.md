@@ -49,7 +49,7 @@ adds room for the system and the default context.
 \* Mac (Apple Silicon) support is experimental, GLM-5.3-Flash's GGUF quants only.
 ¹ DeepSeek's download includes its n-gram (Engram) tables, which always stay on the SSD and never count toward memory.
 ² Qwen's n-gram table also stays on the SSD.
-⁴ Hy4-Flash on AMD: Linux only for now - a Strix Halo / Gorgon Halo (below), or Radeon cards; with an AMD GPU on Windows it has not been tested yet and the setup does not offer it.
+⁴ Hy4-Flash on AMD: Linux - a Strix Halo / Gorgon Halo (below), or Radeon cards; with an AMD GPU on Windows it is experimental (the setup offers it, not tested by us: [AMD_MAYA.md](AMD_MAYA.md#hy4-flash-under-windows-experimental)).
 ³ Hy4-Flash's download is the model file (44.8 GB for Maya-XS, 68.4 GB for Maya-M, 89.5 GB for Maya-L) and one n-gram table (63.4 GB) that every size shares; the table
 stays on the SSD, is read page by page and never counts toward memory. About 110 GB of disk in all for Maya-XS. Tencent's own
 Q4_K_M (AngelSlim) is a 105 GB model file with the same table; all of its experts fit in about 108 GB of VRAM.

@@ -72,7 +72,7 @@ It first asks which model to set up:
 - **Hy4-Flash** (`--model hy4-flash-maya-xs`, or `--hy4-quant maya-xs`) - Project Maya's own GGUF quant of Tencent's
   Hy4-flash, [Hy4-Flash · Maya-XS](https://huggingface.co/peasantsmith/Hy4-Flash-Maya-GGUF) (the model file 44.8 GB
   and one n-gram table of 63.4 GB that every size shares: about 110 GB of disk; Maya-M, 68.4 GB, and Maya-L, 89.5 GB, for PCs with more
-  memory - the setup recommends one by the PC's RAM + VRAM), on its own engine (`build/maya-hy4`): NVIDIA GPUs (CUDA) from the V100 on, Linux and Windows, and AMD GPUs (`--backend hip`, `build-hip/maya-hy4`) on Linux - a Strix Halo / Gorgon Halo, whose one memory holds a whole size on the GPU, or Radeon cards; not with an AMD GPU on Windows yet (untested), and not on
+  memory - the setup recommends one by the PC's RAM + VRAM), on its own engine (`build/maya-hy4`): NVIDIA GPUs (CUDA) from the V100 on, Linux and Windows, and AMD GPUs (`--backend hip`, `build-hip/maya-hy4`) on Linux - a Strix Halo / Gorgon Halo, whose one memory holds a whole size on the GPU, or Radeon cards; with an AMD GPU on Windows experimental (offered, not tested by us: [AMD_MAYA.md](AMD_MAYA.md#hy4-flash-under-windows-experimental)), and not on
   Mac yet. The same steps with these differences: the setup picks the layout and the context that fit
   the card (4K, 8K, 16K, 32K, 64K or 128K; for a card under about 10 GB the "8 GB" layout of Maya-XS, a second model
   file of 43.6 GB; a card with less than about 7 GB cannot run it); it downloads the model file and the n-gram table

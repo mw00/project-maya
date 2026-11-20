@@ -13,6 +13,7 @@
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
+#include "hy4_kernels.cuh"   // (k::submit: AMD under Windows)
 #include "hy4_pack.hpp"
 
 namespace hy4 {
@@ -608,6 +609,7 @@ struct Vision::Impl {
             VK(cudaStreamWaitEvent(cs, ev_free[b], 0));
             VK(cudaMemcpyAsync(sl[b], bounce[b], S.bytes, cudaMemcpyHostToDevice, cs));
             VK(cudaEventRecord(ev_up[b], cs));
+            k::submit(cs);   // (AMD under Windows: the compute stream waits for it on the GPU)
             return true;
         };
         auto acquire = [&](int k, uint8_t*& at) -> bool {
@@ -617,6 +619,7 @@ struct Vision::Impl {
         };
         auto done = [&](int k) -> bool {
             VK(cudaEventRecord(ev_free[k & 1], s));
+            k::submit(s);   // (AMD under Windows: the next upload waits for it on the GPU, the host for that)
             return k + 2 < ns ? upload(k + 2) : true;
         };
         if (!upload(0) || (ns > 1 && !upload(1))) return false;

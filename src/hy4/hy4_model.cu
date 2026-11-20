@@ -956,6 +956,47 @@ struct Model::Impl {
                     }
                 }
 #endif
+#if defined(_WIN32) && defined(STRATA_USE_HIP)
+                // AMD under Windows (experimental), an APU's GPU (Strix Halo / Gorgon Halo): HIP counts its carve-out
+                // plus shared system memory, and what fills into the shared part pages under Windows (GLM's #206,
+                // maya-ds4's Maya-S at 2.45 tok/s on a 160 GB Strix Halo) - so the model keeps within the DEDICATED
+                // memory DXGI reports, as GLM's engine and maya-ds4 do; and within Windows' commit (RAM + page file),
+                // which every allocation on the APU's GPU is charged to, less max(8 GiB, a tenth of the RAM) for the
+                // system and the other programs (HY4_RAM_HEADROOM_GB: another one).  HY4_APU_DEDICATED_GB=<n>: n GB
+                // dedicated (a test: a smaller carve-out), =0: HIP's figure
+                {
+                    int integrated = 0;
+                    if (cudaDeviceGetAttribute(&integrated, cudaDevAttrIntegrated, devs[i]) != cudaSuccess) {
+                        cudaGetLastError();
+                        integrated = 0;
+                    }
+                    if (integrated != 0) {
+                        double ded = 0.0;
+                        if (const char* v = std::getenv("HY4_APU_DEDICATED_GB")) {
+                            ded = std::max(0.0, std::atof(v)) * 1073741824.0;
+                        } else {
+                            cudaDeviceProp pr{};
+                            if (cudaGetDeviceProperties(&pr, devs[i]) == cudaSuccess)
+                                ded = (double) gpu_dedicated(pr.luid);
+                            else
+                                cudaGetLastError();
+                        }
+                        double room = (double) fr;
+                        if (ded > 0.0 && ded < (double) tot) room = std::max(0.0, ded - (double) (tot - fr));
+                        const double ram = (double) ram_total(), commit = (double) commit_available();
+                        double head = std::max(8.0 * 1073741824.0, 0.1 * ram);
+                        if (const char* h = std::getenv("HY4_RAM_HEADROOM_GB")) head = std::max(0.0, std::atof(h)) * 1073741824.0;
+                        if (commit > 0.0) room = std::min(room, std::max(0.0, commit - head));
+                        char ub[320];
+                        std::snprintf(ub, sizeof ub, "INFO GPU%zu shares the system's memory (Windows): %.1f GB dedicated to "
+                                      "it (HIP counts %.1f GB with shared memory), %.1f GB more may be committed, %.1f GB "
+                                      "kept free for the system, %.1f GB for the model", i, ded / 1e9, (double) tot / 1e9,
+                                      commit / 1e9, head / 1e9, std::min(room, (double) fr) / 1e9);
+                        info.push_back(ub);
+                        if (room < (double) fr) fr = (size_t) room;
+                    }
+                }
+#endif
                 free0[i] = (double) fr;
                 G[i].bw = measure_bw(err);
                 if (G[i].bw <= 0) return false;
@@ -998,6 +1039,15 @@ struct Model::Impl {
         free_b[(size_t) main_gi] -= vis_keep;
         // tensor parallel: --tp N, or auto (-1): over the largest group of GPUs of one kind when it holds everything -
         // the layer split otherwise (an INFO line says why)
+#if defined(_WIN32) && defined(STRATA_USE_HIP)
+        // (AMD under Windows, experimental: tensor parallel's hand-offs - flags in mapped host memory that the GPUs and
+        //  the host's summing threads spin on - have never run there; auto takes the layer split, --tp N still asks)
+        if (o.tp < 0 && devs.size() > 1) {
+            o.tp = 0;
+            info.push_back("INFO tensor parallel not taken on AMD under Windows (experimental there, not run yet): the "
+                           "layers split over the GPUs - --tp N asks for it");
+        }
+#endif
         if (o.tp != 0 && o.tp != 1) {
             int N = o.tp;
             if (N < 0) {
@@ -2468,6 +2518,16 @@ struct Model::Impl {
                 info.push_back(vb);
             }
         }
+#if defined(_WIN32) && defined(STRATA_USE_HIP)
+        // AMD under Windows: the load's legacy-stream work (the counters' and the indexer pools' cudaMemset) finished
+        // before any of the non-blocking streams' - nothing orders the two, and Windows' HIP submits queued work only
+        // when the host waits (GLM's #133: a legacy-stream memset still pending at the first answer)
+        for (auto& gp : G) {
+            CK(cudaSetDevice(gp.dev));
+            CK(cudaDeviceSynchronize());
+        }
+        CK(cudaSetDevice(G[(size_t) head_gpu].dev));
+#endif
         for (auto& gp : G) st.vram_gb += (double) gp.used / 1e9;
         st.load_s = now_s() - t0;
         char buf[512];
@@ -3274,6 +3334,7 @@ struct Model::Impl {
                 k::pack3(gp.lat, (size_t) T * lat, gp.ids, (size_t) T * 16, gp.rw, (size_t) T * 16, rt, s);
                 if (gp.s2 && !hand_inline) {   // (copied out on the side stream: member 0's own work goes on meanwhile)
                     CK(cudaEventRecord(gp.ev2, s));
+                    k::submit(s);   // (AMD under Windows: the side stream's publish waits for this on the GPU)
                     CK(cudaStreamWaitEvent(gp.s2, gp.ev2, 0));
                     k::publish(rt, trt, (size_t) T * (lat + 32), gp.cnt2, tfr, v, gp.s2);
                 } else {
@@ -3291,6 +3352,7 @@ struct Model::Impl {
                 if (T <= W)
                     ok = ok && mm_multi(gp, {{&l.sh_gate, gp.gu, (size_t) sf}, {&l.sh_up, gp.gu + (size_t) T * sf,
                                                                                 (size_t) sf}}, gp.xf, E, T);
+                k::submit(s);   // (AMD under Windows: the copies and the shared expert started now, not at the wait)
                 const double tw = now_s();
                 // (a token's copies are there within a millisecond or two: polled that long - a thread that sleeps on
                 //  the event comes back late on some hosts, and the lane's threads wait for it - then, a prompt
@@ -3342,6 +3404,7 @@ struct Model::Impl {
                 ok = ok && routed_token(l, gp, T, slot, gp.latout);
             }
             if (lane_on && !streamed) {   // (the GPU's experts run meanwhile)
+                k::submit(s);   // (AMD under Windows: they would sit in the queue until the next wait - after the lane's)
                 count_routes(l.il, T);
                 lane_entries.clear();
                 for (int t = 0; t < T; ++t)
@@ -3773,6 +3836,7 @@ struct Model::Impl {
             if (mtp_async && T > W) {   // (its own scratch and stream, queued by its thread: beside the next chunk)
                 CK(cudaMemcpyAsync(hm.pos, hg.pos, sizeof(int) * 3 * Tc, cudaMemcpyDeviceToDevice, hg.s));
                 CK(cudaEventRecord(ev_hin, hg.s));
+                k::submit(hg.s);   // (AMD under Windows: the MTP pass's stream waits for this on the GPU)
                 mtp_ids.assign(ids, ids + T);
                 mtp_pending = true;
                 mtp_crew->start([this, T, p0](int) {
@@ -3781,6 +3845,7 @@ struct Model::Impl {
                     std::string e2;
                     if (!mtp_forward(mtp_ids.data(), T, p0, 0, e2, nullptr, &hm)) mtp_err = e2;
                     cudaEventRecord(ev_mtp, hm.s);
+                    k::submit(hm.s);   // (AMD under Windows: the head's stream waits for it on the GPU, no host wait)
                 });
                 if (p0 <= mtp_done) mtp_done = std::max(mtp_done, p0 + T);
                 return true;
@@ -3811,6 +3876,7 @@ struct Model::Impl {
                     q.s = gp.s3;
                     pull_blocks(q, buf, (int) (n / E), v);
                     cudaEventRecord(gp.evh, gp.s3);
+                    k::submit(gp.s3);   // (AMD under Windows: waited for on the GPU only)
                 }
                 return;
             }
@@ -3856,6 +3922,7 @@ struct Model::Impl {
         if (f16_sums && gp.h16) {   // (packed to F16 on the main stream, the halves and factors out by blocks)
             k::pack16_rows(buf, T, (int) E, gp.h16, gp.sc16, gp.s);
             cudaEventRecord(gp.ev2, gp.s);
+            k::submit(gp.s);   // (AMD under Windows: the side stream's flags wait for this on the GPU)
             cudaStreamWaitEvent(gp.s2, gp.ev2, 0);
             for (int b = 0; b * R < T; ++b) {
                 const size_t r0 = (size_t) b * R, nr = (size_t) std::min(R, T - b * R);
@@ -3870,6 +3937,7 @@ struct Model::Impl {
             return;
         }
         cudaEventRecord(gp.ev2, gp.s);
+        k::submit(gp.s);
         cudaStreamWaitEvent(gp.s2, gp.ev2, 0);
         for (int b = 0; b * R < T; ++b) {
             const size_t r0 = (size_t) b * R, nr = (size_t) std::min(R, T - b * R);
