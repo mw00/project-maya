@@ -1406,59 +1406,62 @@ __global__ void softcap_kernel(float* x, size_t n, float cap) {
     if (i < n) x[i] = cap * tanhf(x[i] / cap);
 }
 
-// The loop's message gate, two launches a call so that a token's work spreads over the SMs.
-// (1) g [T][R] = D [rms(x); rms(m)]: a block is kLoopRanks ranks of a token, a warp a rank; each block sums the two
-// mean squares itself (9 values a thread).
-constexpr int kLoopRanks = kBlk / 32;
-__global__ void loop_gate_g_kernel(const float* __restrict__ x, const float* __restrict__ m,
-                                   const float* __restrict__ D, int C, int R, float eps, float* __restrict__ g) {
-    __shared__ float sh_red[2 * (kBlk / 32)];
-    const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, n_warp = kBlk / 32;
-    const float* xr = x + (size_t) blockIdx.x * C;
-    const float* mr = m + (size_t) blockIdx.x * C;
-    float sx = 0.0f, sm = 0.0f;
-    for (int c = tid; c < C; c += kBlk) {
-        const float a = xr[c], b = mr[c];
-        sx += a * a, sm += b * b;
+// The loop's message gates, up to three (a layer's q, k and v inputs) in two launches that spread over the SMs.
+// sc [n][T][2 R + 2]: per gate and token, the two halves of each g before the norms (D's x columns . x, its m columns
+// . m), then the two sums of squares.
+struct LoopGateArgs {
+    const float *x[3], *m[3], *D[3], *F[3], *G[3];
+    float* y[3];
+};
+constexpr int kLoopRankMax = 128;
+// (1) a block a rank (128 threads): its two dots; rank 0's block also stores the sums of squares
+__global__ void loop_gate_dots_kernel(LoopGateArgs a, int T, int C, int R, float* sc) {
+    __shared__ float sh[4][4];
+    const int r = blockIdx.x, j = blockIdx.y, t = blockIdx.z, tid = threadIdx.x, warp = tid >> 5;
+    const float* xr = a.x[j] + (size_t) t * C;
+    const float* mr = a.m[j] + (size_t) t * C;
+    const float* dr = a.D[j] + (size_t) r * 2 * C;
+    float ax = 0.0f, am = 0.0f, sx = 0.0f, sm = 0.0f;
+    for (int c = tid; c < C; c += 128) {
+        const float xv = xr[c], mv = mr[c];
+        ax += dr[c] * xv, am += dr[C + c] * mv;
+        sx += xv * xv, sm += mv * mv;
     }
-    for (int o = 16; o > 0; o >>= 1) {
-        sx += __shfl_down_sync(0xffffffffu, sx, o);
-        sm += __shfl_down_sync(0xffffffffu, sm, o);
-    }
-    if (lane == 0) sh_red[warp] = sx, sh_red[n_warp + warp] = sm;
+    ax = wsum(ax), am = wsum(am), sx = wsum(sx), sm = wsum(sm);
+    if ((tid & 31) == 0) sh[warp][0] = ax, sh[warp][1] = am, sh[warp][2] = sx, sh[warp][3] = sm;
     __syncthreads();
-    float tx = 0.0f, tm = 0.0f;
-    for (int w = 0; w < n_warp; ++w) tx += sh_red[w], tm += sh_red[n_warp + w];
-    const float rx = rsqrtf(tx / (float) C + eps), rm = rsqrtf(tm / (float) C + eps);
-    const int r = (int) blockIdx.y * kLoopRanks + warp;
-    if (r >= R) return;
-    const float* dr = D + (size_t) r * 2 * C;
-    float ax = 0.0f, am = 0.0f;
-    for (int c = lane; c < C; c += 32) ax += dr[c] * xr[c], am += dr[C + c] * mr[c];
-    for (int o = 16; o > 0; o >>= 1) {
-        ax += __shfl_down_sync(0xffffffffu, ax, o);
-        am += __shfl_down_sync(0xffffffffu, am, o);
+    if (tid == 0) {
+        float* o = sc + ((size_t) j * T + t) * (2 * R + 2);
+        o[2 * r] = sh[0][0] + sh[1][0] + sh[2][0] + sh[3][0];
+        o[2 * r + 1] = sh[0][1] + sh[1][1] + sh[2][1] + sh[3][1];
+        if (r == 0) {
+            o[2 * R] = sh[0][2] + sh[1][2] + sh[2][2] + sh[3][2];
+            o[2 * R + 1] = sh[0][3] + sh[1][3] + sh[2][3] + sh[3][3];
+        }
     }
-    if (lane == 0) g[(size_t) blockIdx.x * R + r] = rx * ax + rm * am;
 }
 // (2) y = (1 - tanh(F g)) x + tanh(G g) m: a block is kBlk channels of a token, a thread a channel; F and G by rank
-// ([R][C]), so that a warp's threads read side by side.  y may be x.
-constexpr int kLoopRankMax = 128;
-__global__ void loop_gate_apply_kernel(const float* x, const float* __restrict__ m, const float* __restrict__ F,
-                                       const float* __restrict__ G, const float* __restrict__ g, int C, int R,
-                                       float* y) {
+// ([R][C]), so that a warp's threads read side by side.  y may be x (x's sums were taken in (1)).
+__global__ void loop_gate_apply_kernel(LoopGateArgs a, int T, int C, int R, float eps, const float* __restrict__ sc) {
     __shared__ float sh_g[kLoopRankMax];
-    if ((int) threadIdx.x < R) sh_g[threadIdx.x] = g[(size_t) blockIdx.x * R + threadIdx.x];
+    const int j = blockIdx.y, t = blockIdx.z, tid = threadIdx.x;
+    const float* o = sc + ((size_t) j * T + t) * (2 * R + 2);
+    if (tid < R) {
+        const float rx = rsqrtf(o[2 * R] / (float) C + eps), rm = rsqrtf(o[2 * R + 1] / (float) C + eps);
+        sh_g[tid] = rx * o[2 * tid] + rm * o[2 * tid + 1];
+    }
     __syncthreads();
-    const int c = (int) blockIdx.y * kBlk + (int) threadIdx.x;
+    const int c = (int) blockIdx.x * kBlk + tid;
     if (c >= C) return;
+    const float* F = a.F[j];
+    const float* G = a.G[j];
     float f = 0.0f, gn = 0.0f;
     for (int r = 0; r < R; ++r) {
         const float gv = sh_g[r];
         f += F[(size_t) r * C + c] * gv, gn += G[(size_t) r * C + c] * gv;
     }
-    const size_t i = (size_t) blockIdx.x * C + c;
-    y[i] = (1.0f - tanhf(f)) * x[i] + tanhf(gn) * m[i];
+    const size_t i = (size_t) t * C + c;
+    a.y[j][i] = (1.0f - tanhf(f)) * a.x[j][i] + tanhf(gn) * a.m[j][i];
 }
 
 // ---- the decodes: value v of a run of blocks, ggml's dequantize_row_* arithmetic
@@ -2878,14 +2881,11 @@ __global__ void unpack_kv_fp8_to_f16_kernel(const uint8_t* kc, const uint8_t* vc
 template <int WARPS>
 __global__ void mv_f16_kernel(const uint16_t* __restrict__ W, int N, int K, const float* __restrict__ x,
                               float* __restrict__ y) {
-    extern __shared__ float xs[];
-    for (int i = threadIdx.x; i < K; i += blockDim.x) xs[i] = x[i];
-    __syncthreads();
     const int row = blockIdx.x * WARPS + (threadIdx.x >> 5), lane = threadIdx.x & 31;
     if (row >= N) return;
     const uint16_t* w = W + (size_t) row * K;
     float a = 0.0f;
-    for (int i = lane; i < K; i += 32) a += h2f(w[i]) * xs[i];
+    for (int i = lane; i < K; i += 32) a += h2f(w[i]) * x[i];
     a = wsum(a);
     if (lane == 0) y[row] = a;
 }
@@ -3638,19 +3638,25 @@ void softcap(float* x, size_t n, float cap, cudaStream_t s) {
     check("softcap");
 }
 
-void loop_gate(const float* x, const float* m, const float* D, const float* F, const float* G, int T, int C, int R,
-               float eps, float* g, float* y, cudaStream_t s) {
-    if (T <= 0) return;
-    if (R > kLoopRankMax || R > kBlk) {
-        std::fprintf(stderr, "ik2::k::loop_gate: rank %d past %d\n", R, kLoopRankMax);
+void loop_gates(const LoopGate* gt, int n, int T, int C, int R, float eps, float* sc, cudaStream_t s) {
+    if (T <= 0 || n <= 0) return;
+    if (n > 3 || R > kLoopRankMax || T > 65535) {
+        std::fprintf(stderr, "ik2::k::loop_gates: %d gates, rank %d, %d tokens\n", n, R, T);
         std::abort();
     }
-    loop_gate_g_kernel<<<dim3((unsigned) T, (unsigned) ((R + kLoopRanks - 1) / kLoopRanks)), kBlk, 0, s>>>(x, m, D, C, R,
-                                                                                                        eps, g);
-    check("loop_gate (g)");
-    loop_gate_apply_kernel<<<dim3((unsigned) T, (unsigned) ((C + kBlk - 1) / kBlk)), kBlk, 0, s>>>(x, m, F, G, g, C, R,
-                                                                                                y);
-    check("loop_gate (apply)");
+    LoopGateArgs a{};
+    for (int j = 0; j < n; ++j)
+        a.x[j] = gt[j].x, a.m[j] = gt[j].m, a.D[j] = gt[j].D, a.F[j] = gt[j].F, a.G[j] = gt[j].G, a.y[j] = gt[j].y;
+    loop_gate_dots_kernel<<<dim3((unsigned) R, (unsigned) n, (unsigned) T), 128, 0, s>>>(a, T, C, R, sc);
+    check("loop_gates (dots)");
+    loop_gate_apply_kernel<<<dim3((unsigned) ((C + kBlk - 1) / kBlk), (unsigned) n, (unsigned) T), kBlk, 0, s>>>(
+        a, T, C, R, eps, sc);
+    check("loop_gates (apply)");
+}
+void loop_gate(const float* x, const float* m, const float* D, const float* F, const float* G, int T, int C, int R,
+               float eps, float* sc, float* y, cudaStream_t s) {
+    const LoopGate g{x, m, D, F, G, y};
+    loop_gates(&g, 1, T, C, R, eps, sc, s);
 }
 
 void conv_hist_after(const float* old, const float* x, int T, int C, float* hist, cudaStream_t s) {
@@ -3959,7 +3965,7 @@ void attn_decode_fp8(const float* q, const float* r, const float* sink, const ui
 
 void mv_f16(const uint16_t* W, int N, int K, const float* x, float* y, cudaStream_t s) {
     if (N <= 0) return;
-    mv_f16_kernel<4><<<(unsigned) ((N + 3) / 4), 128, (size_t) K * 4, s>>>(W, N, K, x, y);
+    mv_f16_kernel<4><<<(unsigned) ((N + 3) / 4), 128, 0, s>>>(W, N, K, x, y);
     check("mv_f16");
 }
 
