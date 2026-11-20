@@ -1390,19 +1390,34 @@ struct Model::Impl {
                     }
                     return false;
                 };
+                // (--tp auto: where the group of N does not hold the model, one GPU fewer - the one left out holds the
+                //  head, the drafts and a helper's share of the experts - before the layer split.  HY4_TP_DOWN=0: N only)
+                const char* dn = std::getenv("HY4_TP_DOWN");
+                const int n_min = o.tp < 0 && !(dn && std::atoi(dn) == 0) ? 2 : N;
                 std::string terr;
-                if (split(terr)) return true;
-                // (--kv auto: every member holds the whole cache - in 8-bit rows, 58% of its VRAM, when F16 does not fit)
-                if (o.kv < 0 && !kv_q8 && kv_q8_rows()) {
-                    kv_q8 = true;
-                    std::string t8;
-                    if (split(t8)) {
-                        info.push_back("INFO the latent cache in 8-bit rows (--kv auto): with F16 rows tensor parallel "
-                                       "does not hold this context (" + terr + ")");
+                for (int n = N; n >= n_min; --n) {
+                    std::string tn;
+                    N = n;
+                    if (split(tn)) {
+                        if (!terr.empty())
+                            info.push_back("INFO tensor parallel over " + std::to_string(n) + " GPUs (--tp auto): " + terr);
                         return true;
                     }
-                    kv_q8 = false;
-                    terr += "; in 8-bit rows: " + t8;
+                    // (--kv auto: every member holds the whole cache - in 8-bit rows, 58% of its VRAM, when F16 does not fit)
+                    if (o.kv < 0 && !kv_q8 && kv_q8_rows()) {
+                        kv_q8 = true;
+                        std::string t8;
+                        if (split(t8)) {
+                            info.push_back("INFO the latent cache in 8-bit rows (--kv auto): with F16 rows tensor parallel "
+                                           "does not hold this context (" + tn + ")");
+                            if (!terr.empty())
+                                info.push_back("INFO tensor parallel over " + std::to_string(n) + " GPUs (--tp auto): " + terr);
+                            return true;
+                        }
+                        kv_q8 = false;
+                        tn += "; in 8-bit rows: " + t8;
+                    }
+                    terr += (terr.empty() ? "" : "; ") + tn;
                 }
                 if (o.tp > 0) {
                     err = terr;
