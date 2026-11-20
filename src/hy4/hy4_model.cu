@@ -2711,8 +2711,10 @@ struct Model::Impl {
     // HY4_Q4X=2: measured as above; =1: always, untimed; unset: never; HY4_Q4X_GB: the RAM they take at most
     void q4x_start() {
         const char* qv = std::getenv("HY4_Q4X");
-        // (off unless asked: on Uranus' Windows build the greedy ids differed with the copies - Linux builds gave the
-        //  same ids - so the copies are not yet the same answers everywhere)
+        // (off unless asked: no decode gain measured on the V100 hosts.  The copies give the file's bits - the lane's
+        //  output and the greedy ids the same with and without them, Linux and Windows builds; a prompt chunk's route
+        //  - streamed to the GPU or the lane, chosen by measured rates - may still move with the lane's speed, as with
+        //  any other load on the CPU)
         if (!qv || (std::atoi(qv) != 1 && std::atoi(qv) != 2)) return;
         const bool force = std::atoi(qv) == 1;
         double lane_b = 0, per = 0;
