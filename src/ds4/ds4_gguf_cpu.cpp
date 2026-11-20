@@ -31,8 +31,11 @@
 #endif
 #define MX_AVX2 MX_TARGET("avx2,fma")
 // AVX-VNNI's intrinsics: GCC 11, Clang 12, MSVC 2022
-#if defined(MX_X86) && (defined(_MSC_VER) || (defined(__clang__) && __clang_major__ >= 12) || \
-                        (!defined(__clang__) && defined(__GNUC__) && __GNUC__ >= 11))
+// (MAYA_NO_AVXVNNI: the toolchain's assembler has no AVX-VNNI - Rocky / RHEL 9's binutils 2.35 with any GCC, #535's
+//  "unsupported instruction `vpdpbusd'" - so the tier is left out and the AVX2 one runs; CMake checks it)
+#if defined(MX_X86) && !defined(MAYA_NO_AVXVNNI) && \
+    (defined(_MSC_VER) || (defined(__clang__) && __clang_major__ >= 12) || \
+     (!defined(__clang__) && defined(__GNUC__) && __GNUC__ >= 11))
 #define MX_AVXVNNI 1
 #endif
 

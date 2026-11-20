@@ -1476,6 +1476,19 @@ elseif(STRATA_CPU_X86)
   # MAYA_CPU_VNNI_EMULATE=ON chooses that on any toolchain (tests)
   option(MAYA_CPU_VNNI_EMULATE "CPU expert kernel: AVX512-BW in place of VNNI's dot products" OFF)
   include(CheckCXXSourceCompiles)
+  # ... and the GGUF experts' CPU rows (src/ds4/ds4_gguf_cpu.cpp) have an AVX-VNNI tier (VEX-encoded vpdpbusd), which
+  # the same assemblers refuse: without it that tier is left out (MAYA_NO_AVXVNNI) and the AVX2 one runs in its place
+  set(CMAKE_REQUIRED_FLAGS "-mavx2 -mavxvnni")
+  check_cxx_source_compiles([=[
+#include <immintrin.h>
+__m256i f(__m256i a, __m256i b, __m256i c) { return _mm256_dpbusd_avx_epi32(a, b, c); }
+int main() { return 0; }
+]=] MAYA_TOOLCHAIN_AVXVNNI)
+  unset(CMAKE_REQUIRED_FLAGS)
+  if(NOT MAYA_TOOLCHAIN_AVXVNNI)
+    message(STATUS "Maya: the assembler has no AVX-VNNI - the GGUF experts' CPU rows are built without that tier")
+    add_compile_definitions(MAYA_NO_AVXVNNI)
+  endif()
   set(CMAKE_REQUIRED_FLAGS "-mavx512f -mavx512bw -mavx512vl -mavx512dq -mavx512vnni -mavx512vbmi -mf16c -mfma")
   check_cxx_source_compiles([=[
 #include <immintrin.h>
