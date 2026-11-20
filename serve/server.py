@@ -65,6 +65,18 @@ ENGINE_VISION = (ds4_vision.Vision, mm3_vision.Vision)   # the engines that run 
 HY4_TEXT_ONLY = "Hy4-Flash with its pictures off"         # (no vision tower loaded: the errors' name for it)
 HY4_LANE_FILE = ROOT / "data" / "hy4-cpu-lane.txt"        # (maya-hy4's 4-bit copies' verdict on this PC: child_env)
 HY4_ROUTE_FILE = ROOT / "data" / "hy4-prompt-route.txt"   # (... its prompt route's rates measured on this PC: child_env)
+
+
+def hy4_hot_file(cfg: dict) -> Path:
+    """maya-hy4's HY4_HOT scores for this config's model (each layer's experts a start places in VRAM): in the data
+    folder, a file a model - named by its folder (the pack's maya-hy4 folder sits in it)."""
+    args = cfg.get("args") or []
+    pack = Path(args[args.index("--pack") + 1]) if "--pack" in args[:-1] else None
+    name = "" if pack is None else pack.parent.name if pack.name == "maya-hy4" else pack.name
+    name = re.sub(r"[^A-Za-z0-9._-]+", "_", name).strip("._") or "model"
+    return ROOT / "data" / f"hy4-expert-hot-{name}.bin"
+
+
 # (... and what stands for a picture in a tool result then: the agent's turn goes on)
 HY4_PICTURE_NOTE = "[a picture was here; pictures are off on this server, so it was not read]"
 
@@ -2232,7 +2244,10 @@ def child_env(cfg: dict) -> dict:
         # (... and the prompt route's rates - a chunk's experts outside VRAM streamed to the GPU or on the CPU lane -
         #  measured once on this PC, so the same prompt takes the same routes from start to start)
         env.setdefault("HY4_ROUTE_FILE", str(HY4_ROUTE_FILE))
-    dirs = [d for d in cfg.get("lib_dirs") or [] if Path(d).is_dir()]
+        # (... and HY4_HOT's scores - which experts a start places in VRAM - learned by the first start, then kept as
+        #  they are until maya --speed-calibration: a file a model in the data folder, not in its download)
+        env.setdefault("HY4_HOT_FILE", str(hy4_hot_file(cfg)))
+    dirs =[d for d in cfg.get("lib_dirs") or [] if Path(d).is_dir()]
     if dirs:
         var = "PATH" if os.name == "nt" else "LD_LIBRARY_PATH"
         env[var] = os.pathsep.join(dirs + ([env[var]] if env.get(var) else []))

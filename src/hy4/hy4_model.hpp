@@ -102,10 +102,10 @@ public:
     int draft_default() const;
     int draft_max() const;
     /// The routings counted (with the profile read at the load) to Options::profile_out; no file named: nothing.
-    /// HY4_HOT=1: its experts' scores to its file as well
+    /// HY4_HOT, in a start that learns (its file missing, or HY4_HOT_LEARN=1): its experts' scores to its file as well
     bool save_profile(std::string& err) const;
-    /// Between requests: HY4_HOT=1's larger round of swaps (the experts in VRAM following the answers' routing);
-    /// nothing without it
+    /// Between requests: HY4_HOT's larger round of swaps (the experts in VRAM following the answers' routing);
+    /// nothing where it is off
     void idle();
     /// Page-lock a host buffer the logits go to (the copies then run at the link's speed, not through the driver's
     /// staging); unpin it before it is freed.  false: left as it was

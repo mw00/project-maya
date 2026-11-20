@@ -5090,6 +5090,22 @@ def route_forget() -> None:
         warn(f"{path} could not be removed ({e}): delete it by hand to measure the prompt route again")
 
 
+def hot_forget(cfg: dict) -> None:
+    """--speed-calibration: maya-hy4's HY4_HOT scores for this config's model (data/hy4-expert-hot-<model>.bin: which
+    experts a start places in VRAM, kept as they are between calibrations so that every start begins the same) are
+    dropped - the next run learns them again from its answers (the CPU lane check's run below, else the next start)."""
+    sys.path.insert(0, str(ROOT))
+    import serve.server as SV
+    path = ROOT / "data" / SV.hy4_hot_file(cfg).name
+    try:
+        path.unlink()
+        ok("the experts a start places in VRAM (HY4_HOT's scores) are learned again from the next answers")
+    except FileNotFoundError:
+        pass
+    except OSError as e:
+        warn(f"{path} could not be removed ({e}): delete it by hand to learn the experts in VRAM again")
+
+
 def route_prompts(tdir: Path, n: int) -> list[str]:
     """--speed-calibration's prompts for the prompt route's rates: long and each its own (no prefix the engine reuses),
     from this install's docs - a few prompt chunks each."""
@@ -5248,6 +5264,7 @@ def speed_calibration(cfg_path: Path, why: str = "") -> bool:
         return bool(qwen_draft_calibration(cfg_path) is not None)
     if config_family(cfg) == "hy4":
         route_forget()                                 # (the prompt route's rates: measured again too)
+        hot_forget(cfg)                                # (... and the experts a start places in VRAM: learned again)
         if hy4_both_drafters(cfg):                     # (a Maya size with both drafters: which is faster here)
             return speed_calibration_hy4(cfg_path, cfg, why)
         if Q.config_key(cfg) == HY4_Q4:                # (Tencent's own Q4_K_M: the one set with the MTP block)

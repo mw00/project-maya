@@ -25,10 +25,11 @@
 // chunk sends them to the GPU instead where this PC's PCIe is measured faster than its CPU.  --profile: an expert
 // profile (uint32 [layers][experts] routings) - each layer's most routed experts are the ones kept in VRAM;
 // --profile-out: where the routings this run counts (with the profile's) are written, after each request when serving
-// and at the end otherwise.  HY4_HOT=1 (opt-in: the text differs from without it): the experts in VRAM follow the
-// generated tokens' routing - every HY4_HOT_EVERY (8) token steps up to HY4_HOT_SWAPS (64) cold ones trade places with
-// hotter CPU-lane ones, more between requests; the scores are kept over restarts in HY4_HOT_FILE
-// (<pack>/expert-hot.bin), and a start places each layer's highest scored experts in VRAM; HY4_HOT_LOG=1 logs.
+// and at the end otherwise.  HY4_HOT (on; HY4_HOT=0 off - the text differs from without it): where a layer's experts
+// are partly in VRAM, the ones there follow the generated tokens' routing - every HY4_HOT_EVERY (8) token steps up to
+// HY4_HOT_SWAPS (64) cold ones trade places with hotter CPU-lane ones, more between requests; a start places each
+// layer's highest scored experts in VRAM by HY4_HOT_FILE (<pack>/expert-hot.bin; the server's: its data folder),
+// written only by a start that found none (or HY4_HOT_LEARN=1), so every start begins the same; HY4_HOT_LOG=1 logs.
 //
 // --draft-more N (1) / --draft-sure P (0.8) / --draft-streak S (1): up to N drafts more in a step - one for every S
 // steps in a row before it whose drafts were all kept - while every draft of the step so far, and the added one, has a
