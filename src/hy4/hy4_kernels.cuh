@@ -42,6 +42,9 @@ void hc_pre(const float* x, int T, int hc, int E, const float* fn, const float* 
 ///  weights side by side, read in 16-byte loads; the same sums)
 void hc_head(const float* x, int T, int hc, int E, const float* fn, const float* scale, const float* base, float eps,
              float hc_eps, float* cur, cudaStream_t s, bool fn_by_element = false);
+/// hc_pre's and hc_head's buffers for launches of up to T rows, made on the current device (at the load: a buffer grown
+/// inside a forward is freed under a lock every GPU's thread takes)
+void hc_reserve(int T);
 /// x[t][s] += y[t] post[t][s]
 void hc_post(float* x, int T, int hc, int E, const float* y, const float* post, cudaStream_t s);
 /// ... with y's RMS norm (weight w, eps) first: the layer's post norm and the post-mix in one pass (yo: the normed y

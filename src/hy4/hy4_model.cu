@@ -2554,6 +2554,7 @@ struct Model::Impl {
         }
         if (!gp.alloc(gp.arena, at + pad_b, err)) return false;
         gp.arena_b = at + pad_b;
+        k::hc_reserve(Tc);   // (the hyper-connections' buffers for a chunk's rows: never grown inside a forward)
         at = 0;
         carve = true;
         all();
