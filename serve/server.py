@@ -4613,11 +4613,15 @@ class Service:
                             if stops:
                                 sampling["_think_stops"] = stops
                 # MAYA_DS4_RESTORE_POINTS: where the DeepSeek engine keeps restore points for this prompt (never a
-                # client's own `_restore`; not with pictures, whose spans the engine reads whole)
+                # client's own `_restore`).  Pictures too: the engine reads a span whole, so it moves a point inside
+                # one to the span's start, and a prompt with another picture there goes back no further than that
+                # place (the points past it are given up).  Without them a client that sends only its newest picture
+                # - the one before gone from the history, a few hundred tokens from the end - had the whole
+                # conversation read again from token 0 on every picture (#1007)
                 if sampling and "_restore" in sampling:
                     sampling = {k: v for k, v in sampling.items() if k != "_restore"}
                 on, tail = restore_point_settings()
-                if on and not emb and getattr(self.template, "deepseek", False):
+                if on and getattr(self.template, "deepseek", False):
                     pts = (deepseek_restore_points_fast if prompt_memo_on() and isinstance(ids, list)
                            else deepseek_restore_points)(ids, self.ds_user_id, self.ds_system_id, tail)
                     if pts:

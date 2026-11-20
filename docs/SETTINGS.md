@@ -2024,7 +2024,10 @@ keep the state at three more places of each prompt it reads:
 - the end of the system prompt and its tools (the first user turn), given up last: another conversation behind the same
   start reads only its own part.
 
-None under 1,024 tokens, and none for a prompt with pictures. The read keeps the state at each point - the window rings
+None under 1,024 tokens. A prompt with pictures gets them too (without them, a client that sends only its newest
+picture had the whole conversation read again on every picture, #1007): a point inside a picture's span
+moves to the span's start (a span is read whole), and a prompt with another picture at a place goes back no further
+than that place. The read keeps the state at each point - the window rings
 and the compressors' partial groups, a few MB in RAM (V4.1: its 43 layers' 128-row rings; the engine's log gives the
 size at the first one) - and a later prompt that leaves this one past a point reads on from there, from exactly that
 state. Where the points lie near the prompt's end (the tail point, and the last user turn's start when that turn is
