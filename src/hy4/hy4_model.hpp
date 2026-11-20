@@ -38,6 +38,8 @@ struct Options {
     std::string profile;          // an expert profile (uint32 [layers][experts] routings): the most routed in VRAM
     std::string profile_out;      // where save_profile writes it (the read one's counts with this run's)
     bool mtp = false;             // load the MTP block (the GGUF's nextn layer, its BF16 rounded to Q8_0) for drafts
+    bool dfly2 = false;           // load the DFly2 drafter (the pack's model.dfly_layers.* tensors) for drafts: a few
+                                  // dense layers over the trunk's own caches, several tokens a pass (not with mtp)
     std::vector<int> layer_split; // the first layer of each GPU after the first (empty: fill each GPU in turn)
     int kv = -1;                  // the latent cache's rows: 0 F16, 1 8-bit (the latent int8 in blocks of 32 with F16
                                   // scales, the rotated part F16; the indexer's rows F16: about 58% of the VRAM), -1
@@ -87,6 +89,14 @@ public:
     bool draft(int tok, int64_t pos, int n, float floor, std::vector<int>& drafts, std::vector<float>& conf,
                std::string& err);
     bool has_mtp() const;
+    /// The DFly2 drafter is loaded (Options::dfly2): draft() is then its pass - up to n tokens after `tok` from one
+    /// pass over the trunk's caches (nothing to keep in step: a forward leaves it what it needs).  has_draft(): either
+    /// drafter; draft_default(): the drafts a round the loaded one is made for (3: the MTP block; the drafter's own
+    /// count), draft_max() the most a round takes.
+    bool has_dfly2() const;
+    bool has_draft() const { return has_mtp() || has_dfly2(); }
+    int draft_default() const;
+    int draft_max() const;
     /// The routings counted (with the profile read at the load) to Options::profile_out; no file named: nothing
     bool save_profile(std::string& err) const;
     /// Page-lock a host buffer the logits go to (the copies then run at the link's speed, not through the driver's

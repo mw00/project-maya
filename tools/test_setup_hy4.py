@@ -1177,7 +1177,8 @@ class Files(unittest.TestCase):
             self.assertEqual(pack, d / "maya-hy4")
             cmd = ran[0]
             self.assertEqual(cmd[1:], [str(maya.ROOT / "tools" / "hy4" / "pack_gguf.py"), "--model", str(d), "--out",
-                                       str(pack), "--mmproj", "none", "--mtp", "none", "--files", TRUNK, NGRAM])
+                                       str(pack), "--mmproj", "none", "--mtp", "none", "--drafter", "none",
+                                       "--files", TRUNK, NGRAM])
             self.assertNotIn("--engram-eps", cmd)
             self.assertEqual(json.loads((pack / maya.PACK_SOURCES).read_text())["tools"],
                              maya.S.source_hash(maya.HY4_PACK_TOOLS))
@@ -1379,6 +1380,7 @@ MMPROJ = "mmproj-Hy4-flash-bf16.gguf"
 
 MTP_HUB = "mtp/Hy4-Flash-mtp-BF16.gguf_file"
 MTP_FILE = "Hy4-Flash-mtp-BF16.gguf"
+DFLY_FILE = "Hy4-Flash-Maya-XS-drafter.dfly2"
 
 
 class Drafts(unittest.TestCase):
@@ -1419,9 +1421,10 @@ class Drafts(unittest.TestCase):
             (pack / "tensors.txt").write_text("file 0 a.gguf\nfile 1 b.gguf\nfile 2 %s\nt x F32 0 0 4 1\n" % MTP_FILE)
             self.assertEqual(maya.hy4_pack_mtp_file(pack), MTP_FILE)
 
-    def set_up(self, gib, block=True, published=False, prev=None, downloads=None, **kw):
-        """One setup of Maya-XS from a folder with stand-in files on a card of `gib`: (config, what was said, the
-        pack's command)."""
+    def set_up(self, gib, block=True, published=False, prev=None, downloads=None, dfly=False, gpus=1, dfly_gib=None,
+               **kw):
+        """One setup of Maya-XS from a folder with stand-in files on `gpus` cards of `gib`: (config, what was said,
+        the pack's command).  dfly: the size has a DFly2 drafter in the table, its file in the folder."""
         man, body = stand_ins()
         blob = b"m" * 777
         man["mtp"] = {MTP_HUB: [len(blob), hashlib.sha256(blob).hexdigest()]}
@@ -1435,15 +1438,21 @@ class Drafts(unittest.TestCase):
         (d / NGRAM).write_bytes(body[list(man["ngram"])[0]])
         if block:
             (d / MTP_FILE).write_bytes(blob)
+        if dfly:
+            dblob = b"f" * 555
+            xs["drafter"] = {"Maya-XS/" + DFLY_FILE: [len(dblob), hashlib.sha256(dblob).hexdigest()]}
+            (d / DFLY_FILE).write_bytes(dblob)
 
         def run(cmd, *a, **k):
             ran.append(cmd)
             pack = Path(cmd[cmd.index("--out") + 1])
             (pack / "tokenizer").mkdir(parents=True, exist_ok=True)
-            for n in ("hy4.txt", "engram.bin", "tokenizer/vocab.json", "tokenizer/chat_template.jinja"):
+            for n in ("engram.bin", "tokenizer/vocab.json", "tokenizer/chat_template.jinja"):
                 (pack / n).write_text("x")
-            m = cmd[cmd.index("--mtp") + 1]
-            (pack / "tensors.txt").write_text("file 0 a\nfile 1 b\n" + ("" if m == "none" else "file 2 %s\n" % m))
+            m, f = cmd[cmd.index("--mtp") + 1], cmd[cmd.index("--drafter") + 1]
+            (pack / "hy4.txt").write_text("x\n" + ("" if f == "none" else "dfly_layers 5\n"))
+            (pack / "tensors.txt").write_text("file 0 a\nfile 1 b\n" + "".join(
+                "file %d %s\n" % (2 + i, n) for i, n in enumerate(x for x in (m, f) if x != "none")))
 
         def offer(a, what, dd, files, m):
             (downloads if downloads is not None else []).append((what, [f.name for f in files], maya.file_url(m, files[0].name)))
@@ -1451,8 +1460,10 @@ class Drafts(unittest.TestCase):
                 raise AssertionError("no download")
             files[0].write_bytes(blob)
             return True
-        pc = {"backend": "cuda", "gpus": [card(gib)], "archs": [86], "nvcc": "nvcc"}
+        pc = {"backend": "cuda", "gpus": [card(gib, i) for i in range(gpus)], "archs": [86], "nvcc": "nvcc"}
+        gib_f = (lambda q: dfly_gib) if dfly_gib is not None else maya.hy4_dfly2_gib
         with with_manifest(man), patch.object(maya, "ROOT", root), patch.object(maya, "fail", fail), \
+                patch.object(maya, "hy4_dfly2_gib", gib_f), \
                 patch.object(maya, "step", lambda *a: None), patch.object(maya, "say", lambda *a: said.extend(a)), \
                 patch.object(maya, "ok", said.append), patch.object(maya, "warn", said.append), \
                 patch.object(maya, "check_pc", lambda a, fam: pc), \
@@ -1512,6 +1523,119 @@ class Drafts(unittest.TestCase):
         self.assertNotIn("draft_block", c["installer"])
         self.assertIn("drafting: off - the draft block needs about", text)
         self.assertIn("GB free on this PC's cards", text)
+
+    def test_dfly2_table(self):
+        # every Maya size has its own DFly2 drafter in the table (.dfly2 in its folder of the repo, at the table's
+        # commit); its VRAM is the file's bytes and a little scratch
+        for q in ("maya-xs", "maya-s", "maya-m", "maya-l"):
+            e = maya.hy4_dfly2_entry(q)
+            self.assertEqual((e["repo"], e["revision"], e["published"]), (TABLE["repo"], TABLE["revision"], True))
+            self.assertRegex(e["name"], r"^Hy4-Flash-Maya-(XS|S|M|L)-drafter\.dfly2$")
+            self.assertTrue(e["folder"].startswith("Maya-"))
+            self.assertTrue(0.6 < maya.hy4_dfly2_gib(q) < 0.9)
+        self.assertIsNone(maya.hy4_dfly2_entry(maya.HY4_Q4))
+        self.assertEqual(maya.hy4_dfly2_gib(maya.HY4_Q4), 0.0)
+        base = maya.hy4_config_need_gib("maya-xs", "standard", 32768)
+        self.assertAlmostEqual(maya.hy4_config_need_gib("maya-xs", "standard", 32768, dfly2=True),
+                               base + maya.hy4_dfly2_gib("maya-xs"), places=6)
+
+    def test_dfly2_where_only_it_fits(self):
+        # a 12 GB card: no room for the block, room for the DFly2 drafter - packed, --dfly2, drafting on
+        c, text, cmd = self.set_up(12, published=True, dfly=True)
+        self.assertEqual((cmd[cmd.index("--mtp") + 1], cmd[cmd.index("--drafter") + 1]), ("none", DFLY_FILE))
+        self.assertIn("--dfly2", c["args"])
+        self.assertNotIn("--mtp", c["args"])
+        self.assertEqual((c["installer"]["drafting"], c["installer"]["dfly2"]), ("on", True))
+        self.assertNotIn("draft_block", c["installer"])
+        self.assertIn("drafting: Tencent's DFly2 drafter drafts tokens and the model checks every one", text)
+        self.assertIn("(the MTP block: the draft block needs about", text)
+        # --drafting off: the drafter stays in the pack, no --dfly2, a setup again keeps it off; --drafting on again
+        c, text, _ = self.set_up(12, published=True, dfly=True, prev=c, drafting="off")
+        self.assertNotIn("--dfly2", c["args"])
+        self.assertIn("drafting: off (--drafting on, or Drafting on the Models page, drafts with the DFly2 drafter)",
+                      text)
+        c, _, _ = self.set_up(12, published=True, dfly=True, prev=c)
+        self.assertNotIn("--dfly2", c["args"])
+        c, _, _ = self.set_up(12, published=True, dfly=True, prev=c, drafting="on")
+        self.assertIn("--dfly2", c["args"])
+        # --drafting mtp: the block alone - off on this card, said
+        c, text, cmd = self.set_up(12, published=True, dfly=True, drafting="mtp")
+        self.assertEqual(cmd[cmd.index("--drafter") + 1], "none")
+        self.assertNotIn("--dfly2", c["args"])
+        self.assertIn("drafting: off - the draft block needs about", text)
+
+    def test_both_fit(self):
+        # where both fit, both are packed and the size's rule drafts until the speed calibration measures (once, at a
+        # start); a setup again keeps what it measured; --no-speed-calibration: the rule, recorded as chosen
+        c, text, cmd = self.set_up(32, dfly=True)
+        self.assertEqual((cmd[cmd.index("--mtp") + 1], cmd[cmd.index("--drafter") + 1]), (MTP_FILE, DFLY_FILE))
+        rule = maya.HY4_DRAFT_RULE["maya-xs"]
+        self.assertIn("--dfly2" if rule == "dfly2" else "--mtp", c["args"])
+        self.assertNotIn("--mtp" if rule == "dfly2" else "--dfly2", c["args"])
+        self.assertEqual({k: c["installer"].get(k) for k in ("draft_choice", "drafter", "draft_block", "dfly2")},
+                         {"draft_choice": "auto", "drafter": rule, "draft_block": True, "dfly2": True})
+        self.assertIn("both fit here", text)
+        self.assertTrue(maya.hy4_both_drafters(c) and maya.needs_speed_calibration(c))
+        c["installer"]["speed_calibration"] = {"date": "d", "kept": "mtp" if rule == "dfly2" else "dfly2"}
+        self.assertFalse(maya.needs_speed_calibration(c))
+        c2, text, _ = self.set_up(32, dfly=True, prev=c)
+        self.assertEqual(c2["installer"]["drafter"], c["installer"]["speed_calibration"]["kept"])
+        self.assertEqual(c2["installer"]["speed_calibration"], c["installer"]["speed_calibration"])
+        self.assertIn("the faster of the two on this PC", text)
+        c3, _, _ = self.set_up(32, dfly=True, no_speed_calibration=True)
+        self.assertEqual(c3["installer"]["speed_calibration"]["skipped"], "chosen")
+        self.assertFalse(maya.needs_speed_calibration(c3))
+        # two cards: the drafter is not taken, nothing to measure
+        c4, _, cmd = self.set_up(32, dfly=True, gpus=2)
+        self.assertEqual(cmd[cmd.index("--drafter") + 1], "none")
+        self.assertFalse(maya.needs_speed_calibration(c4))
+
+    def test_by_name(self):
+        # --drafting mtp / dfly2: that one alone, packed alone, nothing measured
+        c, _, cmd = self.set_up(32, dfly=True, drafting="dfly2")
+        self.assertEqual((cmd[cmd.index("--mtp") + 1], cmd[cmd.index("--drafter") + 1]), ("none", DFLY_FILE))
+        self.assertIn("--dfly2", c["args"])
+        self.assertNotIn("--mtp", c["args"])
+        self.assertFalse(maya.needs_speed_calibration(c))
+        c, _, cmd = self.set_up(32, dfly=True, drafting="mtp")
+        self.assertEqual((cmd[cmd.index("--mtp") + 1], cmd[cmd.index("--drafter") + 1]), (MTP_FILE, "none"))
+        self.assertIn("--mtp", c["args"])
+        self.assertEqual(c["installer"]["draft_choice"], "mtp")
+        self.assertFalse(maya.needs_speed_calibration(c))
+
+    def test_speed_calibration(self):
+        # the A/B: MTP block first, then DFly2; the faster is kept, a tie keeps the size's rule
+        c, _, _ = self.set_up(32, dfly=True)
+        p = Path(self.tmp.name) / "maya-hy4-flash-maya-xs.json"
+        for o, d, want in ((30.0, 36.0, "dfly2"), (36.0, 30.0, "mtp"), (30.0, 30.3, maya.HY4_DRAFT_RULE["maya-xs"])):
+            p.write_text(json.dumps(c))
+            seen = []
+
+            def run(mtp, dfly, **kw):
+                seen.append(("--mtp" in mtp["args"], "--dfly2" in mtp["args"], "--dfly2" in dfly["args"],
+                             "--mtp" in dfly["args"]))
+                return {"other": {"tok_s": o, "tokens": 512}, "dflash2": {"tok_s": d, "tokens": 512}}
+            with patch.object(maya.CD, "run", run), patch.object(maya, "busy_skip", return_value=False), \
+                    patch.object(maya, "say", lambda *a: None), patch.object(maya, "ok", lambda *a: None):
+                self.assertTrue(maya.speed_calibration(p, "asked for"))
+            out = json.loads(p.read_text())
+            self.assertEqual(seen, [(True, False, True, False)])
+            self.assertEqual((out["installer"]["drafter"], out["installer"]["speed_calibration"]["kept"]), (want, want))
+            self.assertIn("--dfly2" if want == "dfly2" else "--mtp", out["args"])
+            self.assertNotIn("--mtp" if want == "dfly2" else "--dfly2", out["args"])
+            self.assertFalse(maya.needs_speed_calibration(out))
+
+    def test_dfly2_not_where_it_cannot_run(self):
+        # no room for the drafter either, or two cards (the engine runs it with its layers on one GPU): not taken, said
+        c, text, cmd = self.set_up(12, published=True, dfly=True, dfly_gib=5.0)
+        self.assertEqual(cmd[cmd.index("--drafter") + 1], "none")
+        self.assertNotIn("--dfly2", c["args"])
+        self.assertIn("; the DFly2 drafter needs about 5.0 GB", text)
+        c, text, cmd = self.set_up(12, published=True, dfly=True, gpus=2)
+        self.assertEqual(cmd[cmd.index("--drafter") + 1], "none")
+        self.assertNotIn("--dfly2", c["args"])
+        if "--mtp" not in c["args"]:
+            self.assertIn("the DFly2 drafter runs on one GPU for now (this PC: 2)", text)
 
     def test_the_file(self):
         # not uploaded yet and not in the folder: no download, said; uploaded: asked from Maya's repo at its commit,
@@ -1832,6 +1956,24 @@ class Dashboard(unittest.TestCase):
                     M.apply(cfg, bad)
             with self.assertRaises(ValueError):
                 M.apply(hy4_cfg(Path(t) / "b", n_mtp=0), {"draft": "mtp"})
+            with self.assertRaises(ValueError):
+                M.apply(cfg, {"draft": "dfly2"})                 # (no DFly2 drafter in this pack)
+
+    def test_models_page_dfly2(self):
+        """A pack with the DFly2 drafter (hy4.txt: dfly_layers): DFly2 offered beside MTP; one drafter's flag at a time."""
+        from serve import models as M
+        with tempfile.TemporaryDirectory() as t:
+            cfg = hy4_cfg(Path(t), mtp=False)
+            with (M.pack_of(cfg) / "hy4.txt").open("a") as f:
+                f.write("dfly_layers 5\n")
+            self.assertEqual(M.choices(cfg)["draft"], ["mtp", "dfly2", "none"])
+            self.assertEqual(M.settings_of(cfg)["draft"], "none")
+            on = M.apply(cfg, {"draft": "dfly2"})
+            self.assertEqual(on["args"][-1], "--dfly2")
+            self.assertEqual(M.settings_of(on)["draft"], "dfly2")
+            mtp = M.apply(on, {"draft": "mtp"})
+            self.assertEqual((mtp["args"][-1], "--dfly2" in mtp["args"]), ("--mtp", False))
+            self.assertNotIn("--dfly2", M.apply(on, {"draft": "none"})["args"])
 
     def test_models_page_images(self):
         """A pack with the vision tower: Images on by default (no flag), off writes --vision off, on drops it."""

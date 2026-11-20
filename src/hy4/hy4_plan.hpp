@@ -133,4 +133,45 @@ int dense_pick(PlanAt&& plan_at, const Cands& cands, int base) {
     return base;
 }
 
+/// The DFly2 drafter (a block of dense layers that proposes several tokens in one pass over a query block; each of
+/// its layers reads one trunk layer's latent cache and that layer's indexer picks - it keeps no cache of its own).
+/// The keys of the query block's rows (positions pos .. pos + rows - 1): row j sees the trunk layer's picks for the
+/// last accepted position (`picks`, those below pos, in their order) and then the block's own positions pos .. pos + j.
+/// keys [rows][ldk], nk [rows]; returns the widest list (0: ldk is too narrow - nothing written).
+inline int dfly_keys(const int* picks, int n_picks, long long pos, int rows, int* keys, int ldk, int* nk) {
+    int n = 0;
+    for (int i = 0; i < n_picks; ++i) n += picks[i] >= 0 && picks[i] < pos;
+    if (n + rows > ldk) return 0;
+    for (int j = 0; j < rows; ++j) {
+        int* k = keys + (size_t) j * (size_t) ldk;
+        int c = 0;
+        for (int i = 0; i < n_picks; ++i)
+            if (picks[i] >= 0 && picks[i] < pos) k[c++] = picks[i];
+        for (int q = 0; q <= j; ++q) k[c++] = (int) (pos + q);
+        nk[j] = c;
+    }
+    return n + rows;
+}
+/// The drafter's kv_b projection [heads (nope + v)][kv_lora] (a head's key rows, then its value rows) as the engine's
+/// two matrices: the row of head h's value r, and the engine's key matrix of a head - [kv_lora][nope], the head's key
+/// rows transposed (a query's nope part goes through it into the latent space).
+inline size_t dfly_kvb_k_row(int h, int r, int nope, int v) { return (size_t) h * (size_t) (nope + v) + (size_t) r; }
+inline size_t dfly_kvb_v_row(int h, int r, int nope, int v) {
+    return (size_t) h * (size_t) (nope + v) + (size_t) nope + (size_t) r;
+}
+/// k [nope][kv_lora] (a head's key rows) -> out [kv_lora][nope]
+inline void dfly_k_b(const float* k, int nope, int kv_lora, float* out) {
+    for (int c = 0; c < kv_lora; ++c)
+        for (int i = 0; i < nope; ++i) out[(size_t) c * nope + i] = k[(size_t) i * kv_lora + c];
+}
+/// The bytes the drafter takes on the head's GPU beside its matrices (`file`: its tensors' bytes in the pack): the
+/// drafts' copy of the output head (`head`: its bytes, 0 when the model's own head serves), the picks kept from the
+/// trunk's last window and the query block's key lists (`layers` trunk layers, `win` rows, lists of `maxk` + `win`
+/// positions), its rows and its FFN's (`win` rows of `n_embd` and of `ff`).
+inline double dfly_bytes(double file, double head, long long layers, long long win, long long maxk, long long n_embd,
+                         long long ff) {
+    return file + head + (double) layers * (double) win * (double) (2 * maxk + win + 2) * 4 +
+           (double) win * (double) (8 * n_embd + 3 * ff) * 4 + (double) (8u << 20);
+}
+
 }  // namespace hy4

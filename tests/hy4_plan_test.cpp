@@ -318,6 +318,27 @@ int main() {
         Span named_tight{14.2, 14.0, 0.075, true, false, 1 << 30, 1 << 30, ""};
         CHECK(hy4::dense_pick(named_tight, one, 8192) == 8192);
     }
+    {   // the DFly2 drafter's key lists: the picks below pos in their order, then the block's own rows up to each
+        const int picks[6] = {8, 9, 0, 1, 12, -1};
+        int keys[3 * 8], nk[3];
+        CHECK(hy4::dfly_keys(picks, 6, 12, 3, keys, 8, nk) == 7);
+        CHECK(nk[0] == 5 && nk[1] == 6 && nk[2] == 7);
+        const int want2[7] = {8, 9, 0, 1, 12, 13, 14};
+        for (int i = 0; i < 7; ++i) CHECK(keys[2 * 8 + i] == want2[i]);
+        CHECK(keys[0 * 8 + 4] == 12 && keys[1 * 8 + 5] == 13);
+        CHECK(hy4::dfly_keys(picks, 6, 13, 3, keys, 8, nk) == 8 && keys[4] == 12 && keys[5] == 13 && nk[2] == 8);
+        CHECK(hy4::dfly_keys(picks, 6, 13, 4, keys, 8, nk) == 0);   // (too narrow: refused)
+        CHECK(hy4::dfly_keys(picks, 0, 0, 2, keys, 8, nk) == 2 && nk[0] == 1 && keys[8 + 1] == 1);
+        // its kv_b rows: a head's 2 key rows, then its 3 value rows; the key matrix transposed
+        CHECK(hy4::dfly_kvb_k_row(0, 1, 2, 3) == 1 && hy4::dfly_kvb_k_row(2, 0, 2, 3) == 10);
+        CHECK(hy4::dfly_kvb_v_row(0, 0, 2, 3) == 2 && hy4::dfly_kvb_v_row(1, 2, 2, 3) == 9);
+        const float k[2 * 4] = {1, 2, 3, 4, 5, 6, 7, 8};
+        float o[4 * 2];
+        hy4::dfly_k_b(k, 2, 4, o);
+        CHECK(o[0] == 1 && o[1] == 5 && o[2] == 2 && o[3] == 6 && o[6] == 4 && o[7] == 8);
+        CHECK(hy4::dfly_bytes(1e9, 2e8, 5, 16, 2112, 3072, 9216) > 1.2e9 &&
+              hy4::dfly_bytes(1e9, 2e8, 5, 16, 2112, 3072, 9216) < 1.25e9);
+    }
     std::puts("hy4_plan_test: ok");
     return 0;
 }

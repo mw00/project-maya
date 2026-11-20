@@ -2380,6 +2380,18 @@ Models page, changes it. On AMD an answer written with drafting can differ from 
 token on (seen with Maya-L on a Radeon; Maya-XS gave the same tokens with and without). `--drafting off`, or the
 Models page's switch, turns drafting off.
 
+**DFly2, where the block does not fit:** every Maya size also has Tencent's DFly2 drafter in its own file
+(`Hy4-Flash-Maya-<size>-drafter.dfly2`, 0.7-0.9 GB, from Maya's repo): five small layers that read the model's own
+caches and propose up to 5 tokens in one pass, checked by the model like the block's (the same tokens). It takes
+about as much VRAM as its file (no prompt work of its own), so the setup takes it where the block does not fit -
+12 and 16 GB cards, and 8 GB cards where it still fits (a short context) - on one GPU (`--dfly2`; tensor parallel, or a layer split that
+puts its layers away from the head: the model runs without drafts and says why). Where both fit, both go into the pack
+and the faster of the two on this PC drafts: a short speed calibration measures them once (two loads, about 500
+tokens each - at the first start that is not unattended, or `--speed-calibration`, or `--drafting measure` at the
+setup) and keeps the faster; until it runs, the size's default (HY4_DRAFT_RULE in maya.py: the faster one where it was
+measured). `--drafting mtp|dfly2` at the setup picks one by name (nothing measured), `--drafting on` lets Maya pick;
+Drafting on the Models page offers each one the pack has.
+
 **Not available for Hy4-Flash yet** (the dashboard offers no switch for them): `--parallel` (one request at a time
 for now); Mac, and AMD on Windows.
 
@@ -2537,8 +2549,9 @@ Engine options, in the config's `"args"`:
 | `--profile` | - | an expert profile (uint32 routings, [layers][experts]): each layer's most routed experts are the ones in VRAM |
 | `--profile-out` | - | where the routings counted in this run (with `--profile`'s) are written, after each request |
 | `--mtp` | off | the MTP block drafts tokens, the model checks them (the same tokens) |
-| `--draft` | 3 | with `--mtp`: drafts a step at most |
-| `--draft-floor` | 0.55 | with `--mtp`: the drafts end at one the block gives less than this probability |
+| `--dfly2` | off | the pack's DFly2 drafter drafts tokens instead (one pass a round, one GPU), the model checks them (the same tokens) |
+| `--draft` | 3 (`--dfly2`: 5) | drafts a step at most |
+| `--draft-floor` | 0.55 (`--dfly2`: 0.8) | the drafts end at one the drafter gives less than this probability |
 | `--eos` | the GGUF's | the token ids that end an answer |
 | `--kv` | `auto` | the latent cache's rows: `f16`, `q8` (8 bits: 58% of the VRAM a position), or `auto` - F16 where the context fits in VRAM with it, the 8-bit rows where it fits only with them (any layout: one GPU, the layer split, tensor parallel) |
 | `--vision` | on when the pack has the tower | `off`: text only, and no room kept for pictures on the main GPU; `on`: an error when the pack has no tower |

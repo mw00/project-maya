@@ -1,7 +1,7 @@
 // src/hy4/hy4_main.cpp - maya-hy4: Tencent's Hy4-flash (a GGUF set) on NVIDIA GPUs (CUDA) and AMD GPUs (HIP, Linux).
 //
 //   maya-hy4 --pack <model>/maya-hy4 --serve [--gpus 0,1,...] [--max-context N] [--chunk N] [--eos id,id,...]
-//            [--mtp [--draft N] [--draft-floor P]] [--vram-experts F] [--cpu-threads N] [--profile F] [--profile-out F]
+//            [--mtp | --dfly2 [--draft N] [--draft-floor P]] [--vram-experts F] [--cpu-threads N] [--profile F] [--profile-out F]
 //            [--tp N|auto] [--main-gpu I] [--vision on|off] [--kv auto|f16|q8]
 //            [--kv-streaming on|off|auto] [--kv-resident N]
 //
@@ -18,10 +18,13 @@
 // and at the end otherwise.
 //
 // --mtp: the GGUF's MTP block drafts up to --draft tokens (3) a step, each verified by the model in one window with the
-// token before it; a draft below --draft-floor (0.4: the block's probability of its own pick) ends the drafts.  Greedy:
+// token before it; a draft below --draft-floor (0.55: the block's probability of its own pick) ends the drafts.  Greedy:
 // the drafts the model's argmax agrees with are kept; sampling: a draft d is kept with the model's probability of d,
 // else the token is drawn from the model's distribution without d - every token is still the model's own sample.  A
 // request's spec=0|1 turns the drafts off / on for it.
+// --dfly2: the pack's DFly2 drafter instead (a few dense layers over the trunk's own caches: about a quarter of the MTP
+// block's VRAM and nothing added to a prompt's read) - up to --draft tokens (the drafter's own count, 5; its floor 0.8)
+// from one pass, verified and kept by the same rules.  One drafter at a time; one GPU's layout for now.
 //
 // --serve speaks what serve/server.py's StrataEngine expects (maya-mm3's protocol, one conversation): INFO lines, then
 // `READY <context> stop`; per request `GEN <max_new> [key=value ...] <id,id,...>` answered by `PP <read> <total> <ms>
@@ -572,6 +575,7 @@ int serve(hy4::Model& m, const std::vector<int>& eos, int n_draft, float floor0)
                 "vram_slots=%d\n",
                 (long long) m.max_ctx(), st0.vram_gb, m.has_mtp() && n_draft > 0 ? 1 : 0, st0.experts_all,
                 st0.experts_vram);
+    if (m.has_dfly2()) std::printf("INFO dfly2=%d draft=%d\n", n_draft > 0 ? 1 : 0, n_draft);
     if (const hy4::VisionGeo* vg = m.vision())   // (serve/hy4_vision.py's Geometry.from_info)
         std::printf("INFO vision=hy4 image_token=%d image_start=%d image_end=%d vision_patch=%d vision_merge=%d "
                     "vision_max_pixels=%d vision_min_pixels=%d vision_room=%s vision_room_mib=%zu\n", vg->image_token,
@@ -729,7 +733,7 @@ int serve(hy4::Model& m, const std::vector<int>& eos, int n_draft, float floor0)
                                        d_off);
             std::printf(" engram_ms=%.3f\n", produced > 0 ? d_eg / (double) produced : 0.0);
         };
-        const bool spec = m.has_mtp() && n_draft > 0 && (r.spec < 0 || r.spec != 0);
+        const bool spec = m.has_draft() && n_draft > 0 && (r.spec < 0 || r.spec != 0);
         const float floor = r.conf >= 0.0f ? r.conf : floor0;
         std::vector<int> drafts;
         Weights wts;   // (plain sampling's rows)
@@ -854,7 +858,7 @@ int serve(hy4::Model& m, const std::vector<int>& eos, int n_draft, float floor0)
             state.clear();
             held.clear();
         }
-        if (spec && d_off > 0) std::fprintf(stderr, "maya hy4 serve: MTP kept %lld of %lld drafts\n", d_acc, d_off);
+        if (spec && d_off > 0) std::fprintf(stderr, "maya hy4 serve: %s kept %lld of %lld drafts\n", m.has_dfly2() ? "DFly2" : "MTP", d_acc, d_off);
         stat_line();
         const double t2 = now() * 1e3;
         std::printf("DONE %lld %zu %.1f %.1f %s %lld %lld %zu 0 0\n", produced, r.ids.size(), t1 - t0, t2 - t1, finish,
@@ -1040,8 +1044,8 @@ int main(int argc, char** argv) {
     int trace = 0;
     int bench_layer = -1, bench_n = 16, bench_t = 1;
     std::vector<int> eos;
-    int n_draft = 3;
-    float floor = 0.55f;
+    int n_draft = -1;   // (the loaded drafter's own: 3 with the MTP block, the DFly2 drafter's count)
+    float floor = -1.0f;   // (the loaded drafter's own: 0.55 with the MTP block, 0.8 with the DFly2 drafter)
     std::string images, enc_rgb, enc_size, enc_out, kld_save;
     int kv_stream = 0;   // --kv-streaming on: the indexed layers' rows beyond --kv-resident positions in host memory
     long long kv_res_arg = 0;
@@ -1086,6 +1090,7 @@ int main(int argc, char** argv) {
         else if (a == "--bench-experts") bench_n = std::atoi(next().c_str());
         else if (a == "--bench-tokens") bench_t = std::atoi(next().c_str());
         else if (a == "--mtp") o.mtp = true;
+        else if (a == "--dfly2") o.dfly2 = true;
         else if (a == "--draft") n_draft = std::atoi(next().c_str());
         else if (a == "--draft-floor") floor = (float) std::atof(next().c_str());
         else if (a == "--eos") eos = parse_list(next());
@@ -1147,6 +1152,11 @@ int main(int argc, char** argv) {
     }
     for (const auto& l : m.info_lines()) std::fprintf(stderr, "%s\n", l.c_str());
     if (eos.empty()) eos.push_back(m.eos());
+    if (n_draft < 0) n_draft = m.draft_default();
+    if (m.has_dfly2()) n_draft = std::min(n_draft, m.draft_max());
+    // (DFly2: 0.8 - its later drafts are kept less often than the block's and each costs a verified row; measured on a V100
+    //  from 0 to all routed experts in VRAM: as fast as 0.55 with most experts in VRAM, 4-30% faster with few)
+    if (floor < 0) floor = m.has_dfly2() ? 0.8f : 0.55f;
     if (serving) return serve(m, eos, n_draft, floor);
     if (!kld.empty()) return run_kld(m, kld, chunks, kld_save);
     std::vector<int> ids = parse_ids(ids_arg);
@@ -1183,7 +1193,7 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "\n");
     std::vector<int> out;
     int64_t pos = (int64_t) ids.size();
-    if (m.has_mtp() && n_draft > 0 && gen > 0) {   // greedy with the MTP block's drafts
+    if (m.has_draft() && n_draft > 0 && gen > 0) {   // greedy with the drafts (the MTP block's, or the DFly2 drafter's)
         std::vector<float> lw((size_t) (n_draft + 1) * m.vocab());
         std::vector<int> drafts;
         std::vector<float> confs;
@@ -1226,9 +1236,9 @@ int main(int argc, char** argv) {
         const double t2 = now();
         for (size_t i = 0; i < out.size(); ++i) std::printf("%s%d", i ? "," : "", out[i]);
         std::printf("\n");
-        std::fprintf(stderr, "decode: %zu tokens in %.2f s (%.2f tok/s); %lld rounds, MTP kept %lld of %lld drafts "
+        std::fprintf(stderr, "decode: %zu tokens in %.2f s (%.2f tok/s); %lld rounds, %s kept %lld of %lld drafts "
                      "(%.1f tokens a round); a round: drafts %.1f ms, verify %.1f ms\n", out.size(), t2 - t1,
-                     out.size() / (t2 - t1), rounds, acc, off, rounds ? (double) out.size() / rounds : 0.0,
+                     out.size() / (t2 - t1), rounds, m.has_dfly2() ? "DFly2" : "MTP", acc, off, rounds ? (double) out.size() / rounds : 0.0,
                      rounds ? 1e3 * t_draft / rounds : 0.0, rounds ? 1e3 * t_verify / rounds : 0.0);
         return 0;
     }
