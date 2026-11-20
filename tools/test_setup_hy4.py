@@ -1412,6 +1412,24 @@ class Drafts(unittest.TestCase):
                                base + maya.hy4_mtp_gib(), places=6)
         self.assertEqual(maya.hy4_config_need_gib("maya-xs", "standard", 32768, mtp=False), base)
 
+    def test_the_engines_count_of_the_drafters(self):
+        # the engine counts the room of the drafters a pack holds with drafting on and off, and one drafter runs at
+        # a time: with the MTP block and the DFly2 drafter, the larger room once (src/hy4 load())
+        base = maya.hy4_config_need_gib("maya-xs", "standard", 32768)
+        both = maya.hy4_config_need_gib("maya-xs", "standard", 32768, mtp=True, dfly2=True)
+        self.assertAlmostEqual(both, base + max(maya.hy4_mtp_gib(), maya.hy4_dfly2_gib("maya-xs")), places=6)
+        self.assertAlmostEqual(both, maya.hy4_config_need_gib("maya-xs", "standard", 32768, mtp=True), places=6)
+        # the block's claim as the DFly2 drafter's: the fit's figure, the block, the margin where the figure is a
+        # measured one (a start with the block beside it never was) - none on a card whose room the engine measured
+        fit = {"layout": "standard", "context": 32768, "need": 9.83, "kv": "f16"}
+        self.assertAlmostEqual(maya.hy4_mtp_need_gib("maya-xs", fit),
+                               9.83 + maya.hy4_mtp_gib() + maya.HY4_FIT_MARGIN_GIB, places=6)
+        self.assertAlmostEqual(maya.hy4_mtp_need_gib("maya-xs", dict(fit, room_measured=True)),
+                               9.83 + maya.hy4_mtp_gib(), places=6)
+        self.assertAlmostEqual(maya.hy4_mtp_need_gib("maya-xs", dict(fit, chunk=4096)),
+                               9.83 + maya.HY4_CHUNK_UP_GIB + maya.hy4_mtp_gib(4096) + maya.HY4_FIT_MARGIN_GIB,
+                               places=6)                                   # (its rows at the fit's chunk)
+
     def test_the_packs_file(self):
         with tempfile.TemporaryDirectory() as tmp:
             pack = Path(tmp)

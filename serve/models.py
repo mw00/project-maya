@@ -1075,13 +1075,15 @@ def hy4_room(cfg: dict) -> dict | None:
         # (the prompt chunk: the config's own at the context it has; at another one the page writes the layout's
         #  choice again - hy4_chunk_again - so only a chunk set by hand counts there)
         cur, own = _int(flag(args, "--max-context"), 32768), hy4_chunk_by_hand(cfg)
+        # (the drafters' room as the engine counts it: by the pack, with drafting on and off alike - the MTP block it
+        #  holds, the DFly2 drafter on one GPU or with --dfly2; both: the larger once)
+        mtp = hy4_has_mtp(cfg)
+        dfly2 = hy4_has_dfly2(cfg) and (len(set(gpus)) == 1 or "--dfly2" in [str(x) for x in args])
 
         def one(ctx: int, q8: bool):
             return maya.hy4_config_need_gib(inst.get("hy4_quant") or "", inst.get("layout") or maya.HY4_STANDARD, ctx,
                                             chunk=_int(flag(args, "--chunk")) if own or ctx == cur else None,
-                                            reserve_gb=_float(flag(args, "--reserve-gb")), q8=q8,
-                                            mtp="--mtp" in [str(x) for x in args],
-                                            dfly2="--dfly2" in [str(x) for x in args])
+                                            reserve_gb=_float(flag(args, "--reserve-gb")), q8=q8, mtp=mtp, dfly2=dfly2)
 
         def need_vram(ctx: int):
             if kv in ("f16", "q8") or one(ctx, False) is None:
@@ -1102,7 +1104,7 @@ def hy4_room(cfg: dict) -> dict | None:
                 streamed[ctx] = maya.hy4_config_stream(
                     inst.get("hy4_quant") or "", inst.get("layout") or maya.HY4_STANDARD, ctx, usable, ram,
                     chunk=_int(flag(args, "--chunk")) if own or ctx == cur else None,
-                    reserve_gb=_float(flag(args, "--reserve-gb")), mtp="--mtp" in [str(x) for x in args], kv=kv)
+                    reserve_gb=_float(flag(args, "--reserve-gb")), mtp=mtp, kv=kv)
             return streamed[ctx]
 
         def need(ctx: int):
@@ -1163,7 +1165,9 @@ def hy4_refit(new: dict) -> dict | None:
         maya, plan = _hy4_plan(new)
         if not plan.get("need_gib"):
             return None
-        dfly = "--dfly2" in [str(x) for x in args]     # (the DFly2 drafter's room first, as the setup's fit)
+        # (the DFly2 drafter's room first, as the setup's fit - where the engine counts it: the pack holds it, on one
+        #  GPU or with --dfly2, drafting on or off)
+        dfly = hy4_has_dfly2(new) and (len(set(gpus)) == 1 or "--dfly2" in [str(x) for x in args])
         fit = maya.hy4_fit(maya.hy4_quant_table(inst.get("hy4_quant") or ""), [cards[i] for i in gpus],
                            _int(flag(args, "--max-context"), 32768),
                            used=hy4_used(gpus),

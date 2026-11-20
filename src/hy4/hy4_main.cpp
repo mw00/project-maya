@@ -36,6 +36,9 @@
 // --dfly2: the pack's DFly2 drafter instead (a few dense layers over the trunk's own caches: about a quarter of the MTP
 // block's VRAM and nothing added to a prompt's read) - up to --draft tokens (the drafter's own count, 5; its floor 0.8)
 // from one pass, verified and kept by the same rules.  One drafter at a time; one GPU's layout for now.
+// The VRAM plan counts the room of the drafters the pack holds (the larger one's) with drafting on and off alike, so
+// --mtp, --dfly2 and neither keep the same plan and the same answers; a drafter whose room would change more than
+// where experts sit (the cache's rows, the prompt chunk, KV streaming, the GPUs' layout) is not loaded (said).
 //
 // --serve speaks what serve/server.py's StrataEngine expects (maya-mm3's protocol, one conversation): INFO lines, then
 // `READY <context> stop`; per request `GEN <max_new> [key=value ...] <id,id,...>` answered by `PP <read> <total> <ms>

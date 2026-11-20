@@ -1315,6 +1315,18 @@ struct Model::Impl {
         return dfly_bytes(file, head, (long long) pk.num("dfly_layers"), W, g.ix_top_k + g.ix_kpool, g.n_embd,
                           (long long) pk.num("dfly_ff"));
     }
+    // the MTP block's VRAM on the head's GPU (a pack that has the block, while the plan counts it - mtp_room, load's
+    // choice: with drafting on and off alike, as the DFly2 drafter's; else 0): its matrices rounded to Q8_0 and a
+    // prompt chunk of its rows (hy4_plan.hpp's mtp_rows_bytes).  Under tensor parallel its pass's own scratch and the
+    // drafts' head rows are counted with it (mtp_counted)
+    bool mtp_room = false;
+    bool mtp_counted() const { return mtp_room && g.n_mtp > 0; }
+    double mtp_plan_bytes() const {
+        return mtp_counted() ? (double) layer_bytes(g.n_layer) * 0.56 + mtp_rows_bytes(Tc, g.n_embd) : 0;
+    }
+    // the drafters' room on the head's GPU: one drafter at a time (--mtp or --dfly2), so the larger of the two the plan
+    // counts - with either of them on, or none, the plan is the same
+    double draft_plan_bytes() const { return std::max(mtp_plan_bytes(), dfly_plan_bytes()); }
     bool plan(std::string& err) {
         int ndev = 0;
         CK(cudaGetDeviceCount(&ndev));
@@ -1491,7 +1503,7 @@ struct Model::Impl {
                 // the MTP block's pass over a prompt chunk beside the next chunk: on a scratch of its own on the head's
                 // GPU, counted here - where a member's plan does not hold it, the pass runs in line on the head's
                 // scratch (said), and tensor parallel stays
-                const bool want_own = o.mtp && g.n_mtp > 0 && !std::getenv("HY4_MTP_SYNC");
+                const bool want_own = mtp_counted() && !std::getenv("HY4_MTP_SYNC");
                 std::vector<double> fb;
                 auto split = [&](std::string& e) {
                     for (int own = want_own ? 1 : 0; own >= 0; --own) {
@@ -1499,7 +1511,7 @@ struct Model::Impl {
                         fb = free_b;
                         e.clear();
                         if (!tensor_split(ndev, devs, fb, e, N, own == 1)) continue;
-                        if (want_own && !own) {
+                        if (want_own && !own && o.mtp) {   // (its room counted with drafting off too: said when on)
                             char mb[240];
                             std::snprintf(mb, sizeof mb, "INFO the MTP block's pass in line with the prompt's chunks: its "
                                           "own scratch (%.2f GB at a chunk of %d tokens) does not fit beside a member's "
@@ -1594,8 +1606,7 @@ struct Model::Impl {
         const Tensor* ot = pk.get("output.weight");
         double head_b = (ot ? (double) ot->bytes : 0) + (double) g.n_vocab * W * 4 + (64u << 20) +
                         (double) ring * g.n_embd * 4;   // (the states' ring)
-        if (o.mtp && g.n_mtp > 0) head_b += (double) layer_bytes(g.n_layer) * 0.56 + mtp_rows_bytes(Tc, g.n_embd);
-        head_b += dfly_plan_bytes();
+        head_b += draft_plan_bytes();
         L.resize((size_t) g.n_layer);
         free_b[(size_t) main_gi] -= head_b;   // (the head and the MTP block on the main GPU)
         // the layers over the GPUs in order, each with `rho` of its routed experts in VRAM (the others on the CPU
@@ -1843,8 +1854,7 @@ struct Model::Impl {
         const Tensor* ot0 = pk.get("output.weight");
         double head_b0 = (ot0 ? (double) ot0->bytes : 0) + (double) g.n_vocab * W * 4 + (64u << 20) +
                          (double) ring * g.n_embd * 4;
-        if (o.mtp && g.n_mtp > 0) head_b0 += (double) layer_bytes(g.n_layer) * 0.56 + mtp_rows_bytes(Tc, g.n_embd);
-        head_b0 += dfly_plan_bytes();
+        head_b0 += draft_plan_bytes();
         if (own) head_b0 += (double) scratch_bytes();   // (the MTP pass's own scratch: a whole chunk's buffers)
         double exp_all = 0;   // (every routed expert's bytes)
         for (const auto& [n, t] : pk.t)
@@ -1911,8 +1921,7 @@ struct Model::Impl {
         const Tensor* ot = pk.get("output.weight");
         double head_b = (ot ? (double) ot->bytes : 0) + (double) g.n_vocab * W * 4 + (64u << 20) +
                         (double) ring * g.n_embd * 4;
-        if (o.mtp && g.n_mtp > 0) head_b += (double) layer_bytes(g.n_layer) * 0.56 + mtp_rows_bytes(Tc, g.n_embd);
-        head_b += dfly_plan_bytes();
+        head_b += draft_plan_bytes();
         if (own) head_b += (double) scratch_bytes();
         head_tp = false;
         {   // (the head's rows over the members too, where their VRAM holds a share: HY4_TP_HEAD=0: the head's GPU alone)
@@ -1929,7 +1938,7 @@ struct Model::Impl {
                 const int ru = g.n_vocab / (N + hw) / 8 * 8;
                 const double slice = (double) ru * g.n_embd * 2 + (double) W * ru * 4 +
                                      (double) g.hc * g.hc * g.n_embd * 4 + (double) (1u << 20) +
-                                     (o.mtp && g.n_mtp > 0 ? (double) ru * iq::row_bytes(iq::kQ4_K, g.n_embd) : 0.0);
+                                     (mtp_counted() ? (double) ru * iq::row_bytes(iq::kQ4_K, g.n_embd) : 0.0);
                 if (ru >= 128 && need + slice <= have) {
                     head_tp = true;
                     head_rows = ru;
@@ -2973,58 +2982,75 @@ struct Model::Impl {
                 }
                 return true;
             };
-            // The DFly2 drafter in the pack: its room is counted in the plan with drafting on and off alike, so turning
-            // drafting on or off moves no routed expert between the VRAM and the CPU lane - the answers keep their bits
-            // (the drafts are checked token by token: a verify window's rows are the one-token pass's bits).  Where
-            // counting it changes more than the experts' places - the cache's rows (F16 or 8-bit), the pictures' size,
-            // the prompt chunk or span, KV streaming, the GPUs' layout, or whether the start fits - the plan is the
-            // one without it and the drafter is not loaded: with drafts the answers would differ from without (an
-            // 8 GB card at 8K: the drafter's 0.7 GB put the cache in 8-bit rows).  Counted on one GPU (the drafter's
-            // layout), or where --dfly2 asks on more (as before)
+            // The drafters in the pack - the MTP block, the DFly2 drafter: their room (one drafter runs at a time, so the
+            // larger one's: draft_plan_bytes) is counted in the plan with drafting on and off alike, with either of
+            // them on, so turning drafting on or off, or the one for the other, moves no routed expert between the
+            // VRAM and the CPU lane - the answers keep their bits (the drafts are checked token by token: a verify
+            // window's rows are the one-token pass's bits).  Where counting a drafter changes more than the experts'
+            // places - the cache's rows (F16 or 8-bit), the pictures' size, the prompt chunk or span, KV streaming,
+            // the GPUs' layout, or whether the start fits - its room is not counted and it is not loaded: with its
+            // drafts the answers would differ from without (an 8 GB card at 8K: the DFly2 drafter's 0.7 GB put the
+            // cache in 8-bit rows; the MTP block's 3.95 GB did so on larger cards).  Both first, then the DFly2 drafter
+            // alone (the smaller), then none - the same order whichever is asked, so the plan stays the same.  The MTP
+            // block on any layout; the DFly2 drafter on one GPU (its layout), or where --dfly2 asks on more (as before)
             struct Sum {
                 bool ok;
                 int tp, chunk, span;
                 bool q8, vision, head, own;
                 long long pixels, kvres;
-                bool operator==(const Sum& b) const {
+                // (not the MTP pass's own scratch under tensor parallel: a part of the block's room, it moves no
+                //  part of the trunk)
+                bool same(const Sum& b) const {
                     return ok == b.ok && tp == b.tp && chunk == b.chunk && span == b.span && q8 == b.q8 &&
-                           vision == b.vision && head == b.head && own == b.own && pixels == b.pixels && kvres == b.kvres;
+                           vision == b.vision && head == b.head && pixels == b.pixels && kvres == b.kvres;
                 }
             };
             auto sum = [&](bool ok) {   // (the span as far as the context reaches: beyond it no prompt reads)
                 return Sum{ok, tp, c, (int) std::min<int64_t>(dense_max, (int64_t) o.max_ctx), kv_q8, o.vision, head_tp, mtp_own,
                            o.vision ? (long long) vgeo.max_pixels : 0, (long long) o.kv_resident};
             };
+            auto why_not = [](const Sum& s1, const Sum& s0) -> std::string {
+                return !s1.ok ? "the start does not fit beside it"
+                       : s1.q8 != s0.q8 ? "beside it the latent cache would be in 8-bit rows (F16 without it)"
+                       : s1.vision != s0.vision || s1.pixels != s0.pixels ? "beside it pictures would be read smaller"
+                       : s1.kvres != s0.kvres ? "beside it the latent cache would stream from the RAM"
+                       : s1.chunk != s0.chunk || s1.span != s0.span ? "beside it prompts would be read in shorter pieces"
+                                                                   : "beside it the GPUs would be shared otherwise";
+            };
             int n_gpu = 0;
             CK(cudaGetDeviceCount(&n_gpu));
             if (!o.gpus.empty()) n_gpu = (int) o.gpus.size();
-            // (the whole choice, the drafter's room with it: the plan's state is then the start's; false: its error in e1)
-            auto decide = [&](std::string& e1, std::string& df_why) -> bool {
+            // (the whole choice, the drafters' room with it: the plan's state is then the start's; false: its error in
+            //  e1.  df_why / mtp_why: why that drafter is not loaded, where its room would change the start)
+            auto decide = [&](std::string& e1, std::string& df_why, std::string& mtp_why) -> bool {
                 e1.clear();
                 df_why.clear();
-                df_room = pk.num("dfly_layers") >= 1 && (o.dfly2 || n_gpu == 1);
-                bool ok1 = choose(e1);
-                if (df_room) {
-                    const Sum s1 = sum(ok1);
-                    df_room = false;
-                    std::string e0;
-                    const bool ok0 = choose(e0);
-                    const Sum s0 = sum(ok0);
-                    if (s0 == s1) {   // (the plan with its room, chosen again)
-                        df_room = true;
-                        ok1 = choose(e1);
-                    } else {
-                        ok1 = ok0;
-                        e1 = e0;
-                        df_why = !s1.ok ? "the start does not fit beside it"
-                                 : s1.q8 != s0.q8 ? "beside it the latent cache would be in 8-bit rows (F16 without it)"
-                                 : s1.vision != s0.vision || s1.pixels != s0.pixels ? "beside it pictures would be read smaller"
-                                 : s1.kvres != s0.kvres ? "beside it the latent cache would stream from the RAM"
-                                 : s1.chunk != s0.chunk || s1.span != s0.span ? "beside it prompts would be read in shorter pieces"
-                                                                             : "beside it the GPUs would be shared otherwise";
-                    }
+                mtp_why.clear();
+                const bool df_c = pk.num("dfly_layers") >= 1 && (o.dfly2 || n_gpu == 1);
+                const bool mtp_c = g.n_mtp > 0;
+                df_room = mtp_room = false;
+                if (!df_c && !mtp_c) return choose(e1);
+                std::string e0;
+                const bool ok0 = choose(e0);   // (without any drafter's room: what the start comes to)
+                const Sum s0 = sum(ok0);
+                if (mtp_c) {
+                    mtp_room = true;
+                    df_room = df_c;
+                    const bool ok = choose(e1);
+                    const Sum s = sum(ok);
+                    if (s.same(s0)) return ok;
+                    mtp_why = why_not(s, s0);
+                    mtp_room = false;
                 }
-                return ok1;
+                if (df_c) {
+                    df_room = true;
+                    const bool ok = choose(e1);
+                    const Sum s = sum(ok);
+                    if (s.same(s0)) return ok;
+                    df_why = why_not(s, s0);
+                    df_room = false;
+                }
+                return choose(e1);   // (the plan without: chosen again, its state the start's)
             };
             // --room-report (the server asks at a first start on a PC whose cards it has no such figure for): each GPU's
             // free VRAM as read above, and how much less of it this start's choices hold with - the latent cache's
@@ -3036,18 +3062,18 @@ struct Model::Impl {
             std::string room_line;
             if (o.room_report) {
                 struct Pick {
-                    bool ok, q8, vision, head, own, df;
+                    bool ok, q8, vision, head, own, df, mt;
                     int tp;
                     long long pixels, kvres;
                     bool operator==(const Pick& b) const {
                         return ok == b.ok && q8 == b.q8 && vision == b.vision && head == b.head && own == b.own &&
-                               df == b.df && tp == b.tp && pixels == b.pixels && kvres == b.kvres;
+                               df == b.df && mt == b.mt && tp == b.tp && pixels == b.pixels && kvres == b.kvres;
                     }
                 };
                 auto pick = [&]() {
-                    std::string e, w;
-                    const bool ok = decide(e, w);
-                    return Pick{ok, kv_q8, o.vision, head_tp, mtp_own, df_room, tp,
+                    std::string e, w, wm;
+                    const bool ok = decide(e, w, wm);
+                    return Pick{ok, kv_q8, o.vision, head_tp, mtp_own, df_room, mtp_counted(), tp,
                                 o.vision ? (long long) vgeo.max_pixels : 0, (long long) o.kv_resident};
                 };
                 const Pick ref = pick();
@@ -3076,13 +3102,13 @@ struct Model::Impl {
                         say += gb;
                     }
                     room_out = std::string("room_rows=") + (ref.q8 ? "q8" : "f16") + " room_drafter=" + (ref.df ? "1" : "0") +
-                               " room_streamed=" + (streamed ? "1" : "0") + " room_gpus=" + gpus;
+                               " room_mtp=" + (ref.mt ? "1" : "0") + " room_streamed=" + (streamed ? "1" : "0") + " room_gpus=" + gpus;
                     room_line = "INFO VRAM room (--room-report): " + say + " - this start's choices hold with that much "
                                 "less free (" + room_out + ")";
                 }
             }
-            std::string e1, df_why;
-            bool ok1 = decide(e1, df_why);
+            std::string e1, df_why, mtp_why;
+            bool ok1 = decide(e1, df_why, mtp_why);
             if (!room_line.empty()) info.push_back(room_line);
             if (!ok1) {
                 if (!e1.empty()) err = e1;   // (else a CUDA call's, in err already)
@@ -3092,6 +3118,11 @@ struct Model::Impl {
                 info.push_back("INFO the DFly2 drafter is not loaded: " + df_why + ", and the answers with its drafts "
                                "would not be the same as without them - decoding without drafts");
                 o.dfly2 = false;
+            }
+            if (!mtp_why.empty() && o.mtp) {
+                info.push_back("INFO the MTP block is not loaded: " + mtp_why + ", and the answers with its drafts "
+                               "would not be the same as without them - decoding without drafts");
+                o.mtp = false;
             }
             char cb[320];
             if (chunk_auto) {

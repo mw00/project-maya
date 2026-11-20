@@ -8951,7 +8951,8 @@ def hy4_config_need_gib(quant: str, layout: str, ctx: int, chunk: int | None = N
     takes where F16 rows do not fit).  mtp: a Maya size that drafts (--mtp) - with its draft block's VRAM
     (hy4_mtp_gib); dfly2: one that drafts with its DFly2 drafter (--dfly2: hy4_dfly2_gib).  margin False: a context
     the plan does not list without HY4_FIT_MARGIN_GIB (the sums themselves - hy4_room_measure's).  None for a size or
-    a layout the manifest has no plan for."""
+    a layout the manifest has no plan for.  The engine counts a drafter's room by the pack, not by the flag: the MTP
+    block and the DFly2 drafter (one GPU) the pack holds, with drafting on and off - both: the larger room once."""
     plan = (hy4_layouts(hy4_quant_table(quant)).get(layout or HY4_STANDARD) or {}).get("plan") or {}
     if not plan.get("need_gib"):
         return None
@@ -8960,11 +8961,9 @@ def hy4_config_need_gib(quant: str, layout: str, ctx: int, chunk: int | None = N
         need += HY4_CHUNK_UP_GIB
     if reserve_gb is not None and "reserve_gb" in plan:
         need += float(reserve_gb) - float(plan["reserve_gb"])
-    if mtp and quant != HY4_Q4:
-        need += hy4_mtp_gib(int(chunk or plan.get("chunk") or 1024))
-    if dfly2:
-        need += hy4_dfly2_gib(quant)
-    return need
+    # (one drafter at a time: the engine counts the larger room of the two a pack holds, with drafting on and off)
+    return need + max(hy4_mtp_gib(int(chunk or plan.get("chunk") or 1024)) if mtp and quant != HY4_Q4 else 0.0,
+                      hy4_dfly2_gib(quant) if dfly2 else 0.0)
 
 
 def hy4_amd(gpus: list) -> bool:
@@ -9163,7 +9162,8 @@ def hy4_room_measure(cfg: dict, card: dict, info: dict, probe=None, save: bool =
         ctx = int(arg("--max-context") or 0)
         need = hy4_config_need_gib(quant, layout, ctx, chunk=int(arg("--chunk")) if arg("--chunk") else None,
                                    reserve_gb=float(arg("--reserve-gb")) if arg("--reserve-gb") else None,
-                                   q8=info.get("room_rows") == "q8", mtp="--mtp" in args,
+                                   q8=info.get("room_rows") == "q8",
+                                   mtp=bool(int(info.get("room_mtp") or 0)) if "room_mtp" in info else "--mtp" in args,
                                    dfly2=bool(int(info.get("room_drafter") or 0)), margin=False) if ctx else None
         r = card.get("cuda_probe") or (probe or {}).get(mine)
         if need is None or not r:
@@ -9677,6 +9677,15 @@ def hy4_dfly2_need_gib(quant: str, fit: dict) -> float:
     return hy4_drafter_need_gib(plan, fit, hy4_dfly2_gib(quant))
 
 
+def hy4_mtp_need_gib(quant: str, fit: dict) -> float:
+    """hy4_drafter_need_gib for the MTP block (hy4_mtp_gib at the fit's prompt chunk) beside the start hy4_fit worked
+    out for a size - the engine counts the block's room as the DFly2 drafter's (with drafting on and off; where it
+    would change the cache's rows, the prompt chunk or KV streaming, the block is not loaded).  With both drafters in
+    a pack the engine counts the larger room once (one drafter at a time): the block's."""
+    plan = (hy4_layouts(hy4_quant_table(quant)).get(fit.get("layout") or HY4_STANDARD) or {}).get("plan") or {}
+    return hy4_drafter_need_gib(plan, fit, hy4_mtp_gib(int(fit.get("chunk") or plan.get("chunk") or 1024)))
+
+
 def hy4_fast_drafting_fit(quant: str, gpus: list, fit: dict, used: dict | None = None,
                           ram_gb: float | None = None) -> dict | None:
     """The setup's opt-in faster drafting (--fast-drafting on) for the start hy4_fit worked out (fit): the same
@@ -9886,10 +9895,11 @@ def hy4_fit_step(a, pc: dict, quant: str, prev_ctx: int | None = None, have=None
         hy4_entry(quant)                               # (a size with no files yet: its own message)
     forced = hy4_layout_in(Path(a.model_dir).expanduser(), quant) if a.model_dir else None
     ram = mem_gb()[0]
-    # (the DFly2 drafter where the setup would load it - one GPU, drafting not off nor the MTP block's: its room first)
+    # (the DFly2 drafter where the setup would pack it - one GPU, not --drafting mtp: its room first; with drafting off
+    #  too - the engine counts the room of the drafter the pack holds either way, so on and off keep one start)
     de = hy4_dfly2_entry(quant)
     dg = hy4_dfly2_gib(quant) if de and de["published"] and len(pc["gpus"] or []) == 1 and \
-        getattr(a, "drafting", None) not in ("off", "mtp") else 0.0
+        getattr(a, "drafting", None) != "mtp" else 0.0
     fit = hy4_fit(q, pc["gpus"], a.context, layout=forced, pictures=not a.no_vision, name=name, ram_gb=ram, drafter=dg)
     if "error" not in fit and hy4_layouts(q)[fit["layout"]].get("published") == "hub" and not forced and \
             read_json(HY4_MANIFEST).get("revision") and \
@@ -10088,13 +10098,28 @@ def set_up_hy4(a, prev: dict) -> Path | None:
     mtp, mtp_why, dfly, dfly_why = None, "", None, ""
     # (the faster drafting's start: the block counted on the default's, where it has no room - hy4_fast_drafting_fit)
     f0 = plain_fit or fit
-    base = float(f0.get("need") or 0)
     usable = float(fit.get("usable") or 0)
+    # (the engine loads the block only where its room leaves the start as it is but for the experts' places - the
+    #  cache's rows, the prompt chunk, KV streaming - and counts that room with drafting off too: hy4_mtp_need_gib)
     if quant != HY4_Q4 and hy4_mtp_entry() is not None and how != "dfly2":
-        room = base + hy4_mtp_gib(int(f0.get("chunk") or 1024))
-        if f0["layout"] != HY4_STANDARD or room > usable:
-            mtp_why = (f"the draft block needs about {hy4_mtp_gib():.1f} GB of VRAM beside the model's own parts "
-                       f"({room:.1f} GB with it at this context, {usable:.1f} GB free on this PC's cards)")
+        room = hy4_mtp_need_gib(quant, f0)
+        if f0["layout"] != HY4_STANDARD:
+            mtp_why = (f"the draft block needs about {hy4_mtp_gib():.1f} GB of VRAM beside the model's own parts, "
+                       "more than this card's layout leaves")
+        elif f0.get("kv_streaming") or room > usable:
+            mtp_why = (f"the draft block needs about {hy4_mtp_gib():.1f} GB of VRAM beside the model's own parts " +
+                       ("(at this context the cache's older rows live in RAM, and beside it fewer would stay in VRAM)"
+                        if f0.get("kv_streaming") else
+                        f"({room:.1f} GB with it at this context, {usable:.1f} GB free on this PC's cards)") +
+                       ": the engine loads it only where it leaves the rest of the start as it is (the cache's rows, "
+                       "the prompt chunk), so the answers with drafts are those without")
+            q, used, ram = hy4_quant_table(quant), gpu_used_mib(), mem_gb()[0]
+            for c in sorted((c for c in f0.get("contexts") or [] if c < f0["context"]), reverse=True):
+                f = hy4_fit(q, pc["gpus"], c, used=used, layout=f0["layout"], pictures=bool(f0.get("vision", True)),
+                            ram_gb=ram)
+                if "error" not in f and not f.get("kv_streaming") and hy4_mtp_need_gib(quant, f) <= f["usable"]:
+                    mtp_why += f" (at a context of {context_label(c)} it fits: {ME} --setup --context {c})"
+                    break
         else:
             mtp = hy4_mtp_step(a, d, quant, models)
             if mtp is None:
