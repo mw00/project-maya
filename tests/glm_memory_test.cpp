@@ -258,5 +258,41 @@ int main() {
         assert(apu_shared_margin(4 * GB) == GB && apu_shared_margin(0) == GB && apu_shared_margin(-1) == GB);
         assert(apu_shared_margin(25 * GB) == 3 * GB + 256 * M && apu_shared_margin(64 * GB) == 4 * GB);
     }
+    {
+        // #924 / #1035: the cap measured before the expert pool - Windows + a discrete Radeon, one GPU only; never
+        // on NVIDIA, Linux, an APU or a split; the setting wins on one GPU (an empty one counts as unset), never in a
+        // split
+        using strata::core::glmfast::pin_cap_before_pool;
+        assert(pin_cap_before_pool(true, false, 1, nullptr) && pin_cap_before_pool(true, false, 1, ""));
+        assert(!pin_cap_before_pool(false, false, 1, nullptr) && !pin_cap_before_pool(true, true, 1, nullptr));
+        assert(!pin_cap_before_pool(true, false, 2, nullptr) && !pin_cap_before_pool(false, true, 3, nullptr));
+        assert(!pin_cap_before_pool(true, false, 1, "0") && pin_cap_before_pool(false, false, 1, "1"));
+        assert(pin_cap_before_pool(false, true, 1, "1") && !pin_cap_before_pool(false, true, 2, "1"));
+        using strata::core::glmfast::pin_left_since;
+        const int64_t M = int64_t{1} << 20, GB = int64_t{1} << 30;
+        assert(pin_left_since(29 * GB, 300 * M) == 29 * GB - 300 * M && pin_left_since(GB, 2 * GB) == 0);
+        assert(pin_left_since(GB, -5) == GB && pin_left_since(0, 0) == 0);
+        // the classes sized one after another under a measured cap never pass it less the room kept above them,
+        // and with room to spare each keeps its planned slots (the caller's min with the plan)
+        using strata::core::glmfast::pin_cap_share;
+        using strata::core::glmfast::pin_cap_room;
+        const int64_t stride[] = {6 * M + 3 * 4096, 9 * M + 512, 2 * M + 7};
+        const int64_t plan[] = {3000, 1500, 900};   // ~35 GB planned: more than the cap below
+        for (const int64_t left0 : {29 * GB + 768 * M, 12 * GB, 40 * GB, 600 * M}) {
+            const int64_t keep = pin_cap_room(true, left0, -1);
+            int64_t left = left0, pinned = 0;
+            for (int c = 0; c < 3; ++c) {
+                int64_t planned = 0;
+                for (int k = c; k < 3; ++k) planned += plan[k] * stride[k];
+                const int64_t n = std::min(plan[c], pin_cap_share(left, keep, planned, plan[c]));
+                assert(n >= 0);
+                left -= n * stride[c];
+                pinned += n * stride[c];
+            }
+            assert(pinned + keep <= left0 || (left0 <= keep && pinned == 0));
+            if (left0 == 40 * GB) assert(pinned == plan[0] * stride[0] + plan[1] * stride[1] + plan[2] * stride[2]);
+            if (left0 == 29 * GB + 768 * M) assert(pinned > left0 - keep - 3 * 9 * M);   // (no more than a slot a class lost)
+        }
+    }
     std::puts("GLM memory policy checks passed (CPU only)");
 }
