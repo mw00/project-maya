@@ -1126,11 +1126,20 @@ any other I/O. `--ssd-cache` gives that RAM to a store of whole experts instead:
   unbuffered reads fail - some USB bridges refuse them - is read through the page cache from then on, and the log says
   so; on Windows through the files' ordinary handles, so there the page cache still sees the reads - see
   `DS4_STORE_UNBUFFERED`);
+- a slot is its expert's own size: each of its three matrices rounded up to whole 4096-byte pages, with room for the
+  page offset it is read at, so layers of one quantization share a slot size and a GGUF that quantizes its layers
+  differently gets a few (the 2.25 bpw set's experts run from 9.12 to 11.34 MB). The store's size counts those bytes,
+  so the same RAM holds more experts than slots of the largest size would;
 - when it is full, `--ssd-policy` decides which expert gives way: `lru` the least recently asked for, `lfu` the least
-  asked for lately (its count decays); never one a token is computing;
+  asked for lately (its count decays), among the experts of the same slot size; never one a token is computing. Each
+  slot size keeps the share of the store it took (at load: in the order below) until RAM is given back, and while a
+  slot size holds no slots, room for its first ones stays kept for it, in the store and in the RAM the others grow
+  into (those first ones need only 6 GB of RAM free beside them, halfway from `DS4_STORE_FLOOR_GB` to
+  `DS4_STORE_GROW_GB`), so a layer read late, or one whose RAM was given back, still gets some;
 - at load it is filled with the profile's hottest CPU-lane experts, then (`DS4_STORE_SPARE`) with the VRAM experts the
-  profile counts least - the ones the expert cache gives back to the CPU lane first - and an expert that leaves VRAM is
-  copied into it from VRAM (`DS4_STORE_PUT`), so the lane does not read it from the SSD;
+  profile counts least - the ones the expert cache gives back to the CPU lane first - then with the CPU-lane experts
+  the profile has not seen, experts of equal count across the layers in turn; an expert that leaves VRAM is copied into
+  it from VRAM (`DS4_STORE_PUT`), so the lane does not read it from the SSD;
 - a token computes the experts the store holds while it reads the others, each as its read lands (`DS4_STORE_SPLIT`);
 - the PCIe lane, the expert cache's moves into VRAM and the prompt's chunks copy an expert out of the store when it
   holds one, instead of reading it;
@@ -1141,18 +1150,19 @@ It changes no arithmetic: the same bytes are computed the same way (the PCIe lan
 it may stream other experts, as it can from one run to the next). Whether it is faster than the page cache has not been
 measured yet, so it is off by default. It applies to a GGUF's experts read in place; where
 `--mmap-experts auto` copies them all into RAM it does nothing (the copy is the faster way), and it stays off with
-`MAYA_DS4_RAM_TIER=1`. The engine log says what it took (`ds4: RAM store ...`) and, after a decode, how a token's
-experts came (`RAM store: ...`; STAT lines: `store_hit=`, `store_miss=`, `store_wait_ms=`).
+`MAYA_DS4_RAM_TIER=1`. The engine log says what it took (`ds4: RAM store ...`: its GB and slot sizes, then the experts
+read in at load, their GB and how many of each slot size) and, after a decode, how a token's experts came
+(`RAM store: ...`; STAT lines: `store_hit=`, `store_miss=`, `store_wait_ms=`).
 
 The `DS4_STORE_*` settings go in a config's `"env"`, or as `MAYA_DS4_STORE_*` in the settings.
 
 | Setting | Default | |
 | --- | --- | --- |
-| `--ssd-cache GB\|auto\|off` (or `DS4_STORE_GB`) | off | the store's size in GB, at most every expert it could hold; `auto`: the free RAM at load (after VRAM's experts and any RAM copies) less `DS4_STORE_ROOM_GB`, not started under 4 GB |
+| `--ssd-cache GB\|auto\|off` (or `DS4_STORE_GB`) | off | the store's size in GB, each expert counted at its own size, at most every expert it could hold; `auto`: the free RAM at load (after VRAM's experts and any RAM copies) less `DS4_STORE_ROOM_GB`, not started under 4 GB |
 | `--ssd-policy lru\|lfu` (or `DS4_STORE_POLICY`) | `lru` | which expert gives way when it is full |
 | `DS4_STORE_ROOM_GB` | 12 | `auto` leaves this much of the free RAM to the system and the owner's programs |
 | `DS4_STORE_FLOOR_GB` | 4 | below this much free RAM the store gives chunks back |
-| `DS4_STORE_GROW_GB` | 8 | a new chunk only while this much RAM stays free beside it |
+| `DS4_STORE_GROW_GB` | 8 | a new chunk only while this much RAM stays free beside it (a slot size's first: halfway from `DS4_STORE_FLOOR_GB` to this) |
 | `DS4_STORE_THREADS` | 8 | its reading threads |
 | `DS4_STORE_PRELOAD` | 1 | `0`: nothing read at load; the first tokens fill it |
 | `DS4_STORE_SPARE` | 1 | `0`: no VRAM experts in the slots the CPU lane's leave over |

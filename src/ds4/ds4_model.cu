@@ -8435,7 +8435,11 @@ struct Model::Impl {
         if (!pk.gguf) return off("it holds a GGUF's experts only");
         if (ram_tier) return off("the RAM tier (MAYA_DS4_RAM_TIER) is on");
         std::vector<ExpertStore::Geo> geo((size_t) g.nl);   // (the trunk's layers: the drafter's stay in place)
-        size_t lane = 0, all = 0;   // (the in-place CPU-lane experts; every routed expert of the layers)
+        const bool spare = store_env("DS4_STORE_SPARE", 1) != 0;
+        size_t lane = 0, smin = ~(size_t) 0, smax = 0;   // (the in-place CPU-lane experts; the smallest, largest slot)
+        uint64_t cap = 0;   // (every expert it may hold, at its own size: the lane's, and VRAM's with DS4_STORE_SPARE)
+        std::map<size_t, int> none_in;   // (without DS4_STORE_SPARE: a slot size none of whose experts the lane reads
+                                         // at load - its experts, for the first chunk the store keeps for it)
         for (const Layer& l : L) {
             if (l.mtp || l.il < 0 || l.il >= g.nl || l.lay.fmt != gg::kFmtMXFP4 || l.packed_host) continue;
             ExpertStore::Geo& gl = geo[(size_t) l.il];
@@ -8446,13 +8450,21 @@ struct Model::Impl {
                 gl.stride[r] = l.mx_stride[r];
                 gl.bytes[r] = mx_part_bytes(l, r);
             }
-            all += (size_t) l.n_exp;
-            for (int e = 0; e < l.n_exp; ++e) lane += file_read(l, e) ? 1 : 0;
+            int in = 0;
+            for (int e = 0; e < l.n_exp; ++e) in += file_read(l, e) ? 1 : 0;
+            const size_t sb = ExpertStore::slot_layout(gl);
+            smin = std::min(smin, sb);
+            smax = std::max(smax, sb);
+            lane += (size_t) in;
+            cap += (uint64_t) sb * (uint64_t) (spare ? l.n_exp : in);
+            if (!spare) {
+                auto it = none_in.emplace(sb, 0).first;
+                it->second = in > 0 || it->second < 0 ? -1 : it->second + l.n_exp;
+            }
         }
+        for (const auto& x : none_in)   // (the room kept for it comes on top of the lane's experts, not out of them)
+            if (x.second > 0) cap += (uint64_t) x.first * (uint64_t) std::min(ExpertStore::Cfg{}.chunk_slots, (size_t) x.second);
         if (lane == 0) return off(copy_mode ? "every CPU-lane expert is copied into RAM" : "no expert is read in place");
-        const bool spare = store_env("DS4_STORE_SPARE", 1) != 0;
-        const size_t sb = ExpertStore::slot_layout(geo);
-        const uint64_t cap = (uint64_t) sb * (uint64_t) (spare ? all : lane);
         const double req = store_request();
         uint64_t bytes = 0;
         if (req < 0) {
@@ -8494,10 +8506,12 @@ struct Model::Impl {
         store_put = store_env("DS4_STORE_PUT", 1.0) != 0;
         store_ahead = store_env("DS4_STORE_AHEAD", 0.0) != 0;
         store_flow = store_env("DS4_STORE_FLOW", 1.0) != 0;
-        std::fprintf(stderr, "ds4: RAM store (--ssd-cache): up to %zu experts in slots of %.1f MB (%.1f GB; the CPU lane "
-                             "reads %zu in place), %s, %d readers, %s; below %.1f GB of free RAM it gives RAM back\n",
-                     store->slots_max(), sb / 1e6, store->slots_max() * (double) sb / 1e9, lane,
-                     c.policy == ExpertStore::kLfu ? "lfu" : "lru", c.readers,
+        char sizes[64];
+        if (smin == smax) std::snprintf(sizes, sizeof sizes, "slots of %.2f MB", smin / 1e6);
+        else std::snprintf(sizes, sizeof sizes, "slots of %.2f to %.2f MB", smin / 1e6, smax / 1e6);
+        std::fprintf(stderr, "ds4: RAM store (--ssd-cache): %.1f GB, each expert at its own size (%s; the CPU lane reads "
+                             "%zu in place), %s, %d readers, %s; below %.1f GB of free RAM it gives RAM back\n",
+                     bytes / 1e9, sizes, lane, c.policy == ExpertStore::kLfu ? "lfu" : "lru", c.readers,
                      direct ? "reads past the page cache" : "reads through the page cache (no unbuffered handle)",
                      c.floor / 1e9);
         if (store_env("DS4_STORE_PRELOAD", 1.0) != 0) {
@@ -8505,23 +8519,33 @@ struct Model::Impl {
             for (const auto& x : hot)
                 if (store->covers(x.first)) list.push_back(x);
             const size_t n_hot = list.size();
-            if (spare) {   // (the VRAM experts, the profile's least counted first)
-                std::vector<std::pair<uint32_t, std::pair<int, int>>> v;
+            // then the VRAM experts (the profile's least counted first), then the ones it has not seen (by_count:
+            // experts of equal count across the layers in turn)
+            std::vector<std::pair<uint32_t, std::pair<int, int>>> vram, fresh;
+            if (spare)
                 for (const Layer& l : L)
                     if (store->covers(l.il) && !l.mtp)
                         for (int e = 0; e < l.n_exp; ++e)
-                            if (l.slot[(size_t) e] >= 0) v.push_back({prof[(size_t) l.il * g.n_exp + e], {l.il, e}});
-                std::stable_sort(v.begin(), v.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
-                for (const auto& x : v) list.push_back(x.second);
-            }
+                            if (l.slot[(size_t) e] >= 0) vram.push_back({prof[(size_t) l.il * g.n_exp + e], {l.il, e}});
             for (const auto& x : unseen)
-                if (store->covers(x.first)) list.push_back(x);
+                if (store->covers(x.first)) fresh.push_back({0u, x});
+            ExpertStore::by_count(vram, list);
+            ExpertStore::by_count(fresh, list);
             const double t0 = now_ms();
             const size_t n = store->preload(list, 0);
-            std::fprintf(stderr, "ds4: RAM store: %zu experts read in at load (%.1f GB, %.1f s) - the profile's hottest "
-                                 "CPU-lane experts first (%zu)%s\n",
-                         n, n * (double) sb / 1e9, (now_ms() - t0) / 1000.0, std::min(n, n_hot),
+            size_t hot_in = 0;   // (preload passes over an expert whose class is full: a later one may come in)
+            for (size_t i = 0; i < n_hot; ++i) hot_in += store->has(list[i].first, list[i].second) ? 1 : 0;
+            std::fprintf(stderr, "ds4: RAM store: %zu experts read in at load (%.1f GB of its %.1f GB, %.1f s) - the "
+                                 "profile's hottest CPU-lane experts first (%zu)%s\n",
+                         n, store->held_bytes() / 1e9, bytes / 1e9, (now_ms() - t0) / 1000.0, hot_in,
                          spare ? ", then the VRAM ones it counts least (DS4_STORE_SPARE)" : "");
+            std::string by;   // (each slot size's share: a size keeps it until RAM is given back)
+            for (const auto& k : store->classes()) {
+                char b[48];
+                std::snprintf(b, sizeof b, "%s%.2f MB x %zu", by.empty() ? "" : ", ", k.first / 1e6, k.second);
+                by += b;
+            }
+            std::fprintf(stderr, "ds4: RAM store: experts held by slot size: %s\n", by.c_str());
         }
         store->watch_every(1000);
         store_stats();
