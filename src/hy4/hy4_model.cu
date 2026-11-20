@@ -4538,6 +4538,7 @@ struct Model::Impl {
                     ok = ok && mm_multi(gp, {{&l.sh_gate, gp.gu, (size_t) sf}, {&l.sh_up, gp.gu + (size_t) T * sf,
                                                                             (size_t) sf}}, gp.xf, E, T);
             }
+            bool sh_early = false;   // (the shared expert's down already queued - one GPU's token windows, below)
             if (lane_on) {
                 CK(cudaMemcpyAsync(h_ids, gp.ids, sizeof(int) * T * nu, cudaMemcpyDeviceToHost, s));
                 CK(cudaMemcpyAsync(h_w, gp.rw, sizeof(float) * T * nu, cudaMemcpyDeviceToHost, s));
@@ -4546,6 +4547,12 @@ struct Model::Impl {
                 if (T <= W)
                     ok = ok && mm_multi(gp, {{&l.sh_gate, gp.gu, (size_t) sf}, {&l.sh_up, gp.gu + (size_t) T * sf,
                                                                                 (size_t) sf}}, gp.xf, E, T);
+                if (T <= W && l.tpm < 0) {   // (its down as well, beside the lane: off the GPU's path after the lane's
+                    //  sum - the same kernels on the same rows, gp.cur added after the up-projection as before)
+                    k::swiglu(gp.gu, gp.gu + (size_t) T * sf, sf, T, sf, gp.hd, sf, s);
+                    ok = ok && mm(gp, l.sh_down, gp.hd, sf, T, gp.cur, E);
+                    sh_early = true;
+                }
                 k::submit(s);   // (AMD under Windows: the copies and the shared expert started now, not at the wait)
                 const double tw = now_s();
                 // (a token's copies are there within a millisecond or two: polled that long - a thread that sleeps on
@@ -4651,8 +4658,10 @@ struct Model::Impl {
             ok = ok && mm(gp, l.rup, gp.latout, lat, T, gp.y, E);
             dbg("ffn_moe_up", l.il, gp, gp.y, T, E);
             // the shared expert
-            k::swiglu(gp.gu, gp.gu + (size_t) T * sf, sf, T, sf, gp.hd, sf, s);
-            ok = ok && mm(gp, l.sh_down, gp.hd, sf, T, gp.cur, E);
+            if (!sh_early) {
+                k::swiglu(gp.gu, gp.gu + (size_t) T * sf, sf, T, sf, gp.hd, sf, s);
+                ok = ok && mm(gp, l.sh_down, gp.hd, sf, T, gp.cur, E);
+            }
             dbg("ffn_shexp", l.il, gp, gp.cur, T, E);
             if (inject) ref_cmp("ffn_shexp", l.il, gp, gp.cur, (size_t) T * E, T);
             k::add(gp.y, gp.cur, (size_t) T * E, s);
