@@ -44,7 +44,11 @@
 #endif
 #define IQ_AVX2 IQX_TARGET("avx2,fma")
 // AVX-VNNI's intrinsics: GCC 11, Clang 12, MSVC 2022 (as iq2v_rows.cpp)
-#if defined(_MSC_VER) || (defined(__clang__) && __clang_major__ >= 12) ||     (!defined(__clang__) && defined(__GNUC__) && __GNUC__ >= 11)
+// (MAYA_NO_AVXVNNI: the assembler has no AVX-VNNI - Rocky / RHEL 9's binutils 2.35 - so the tier is left out,
+//  vnni_form() says so and the AVX2 form runs in its place; CMake checks it)
+#if !defined(MAYA_NO_AVXVNNI) && \
+    (defined(_MSC_VER) || (defined(__clang__) && __clang_major__ >= 12) || \
+     (!defined(__clang__) && defined(__GNUC__) && __GNUC__ >= 11))
 #define IQ3V_AVXVNNI 1
 #endif
 #if defined(_MSC_VER)

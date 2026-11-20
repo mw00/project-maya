@@ -1477,7 +1477,8 @@ elseif(STRATA_CPU_X86)
   option(MAYA_CPU_VNNI_EMULATE "CPU expert kernel: AVX512-BW in place of VNNI's dot products" OFF)
   include(CheckCXXSourceCompiles)
   # ... and the GGUF experts' CPU rows (src/ds4/ds4_gguf_cpu.cpp) have an AVX-VNNI tier (VEX-encoded vpdpbusd), which
-  # the same assemblers refuse: without it that tier is left out (MAYA_NO_AVXVNNI) and the AVX2 one runs in its place
+  # the same assemblers refuse: without it that tier is left out (MAYA_NO_AVXVNNI) and the AVX2 one runs in its place;
+  # the same for the IQ2 / IQ3 rows' AVX-VNNI form (src/kernels/cpu/iq2v_rows.cpp, iq3v_rows.cpp: VEX vpdpwssd)
   set(CMAKE_REQUIRED_FLAGS "-mavx2 -mavxvnni")
   check_cxx_source_compiles([=[
 #include <immintrin.h>
