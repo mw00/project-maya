@@ -139,20 +139,36 @@ struct Lane::Impl {
     std::mutex mu;
     std::condition_variable cv;
     const std::function<void(int)>* f = nullptr;
+    int direct_n = 0;                    // >0: single-node fast path (indices 0..direct_n-1, no items[] copy)
     std::vector<int> items[kMaxNodes];   // the job's items, by node
-    std::atomic<int> next[kMaxNodes];
-    std::atomic<int> busy{0};
-    std::atomic<uint64_t> gen{0};
-    std::atomic<int> sleepers{0};
+    alignas(64) std::atomic<int> next[kMaxNodes];
+    alignas(64) std::atomic<int> done{0};
+    alignas(64) std::atomic<int> active{0};
+    alignas(64) std::atomic<bool> open{false};
+    alignas(64) std::atomic<uint64_t> gen{0};
+    alignas(64) std::atomic<int> sleepers{0};
     std::atomic<bool> quit{false};
 
     void work(int node) {
-        for (int k = 0; k < n_nodes; ++k) {
-            const int q = (node + k) % n_nodes;
-            const std::vector<int>& v = items[q];
-            const int nn = (int) v.size();
-            for (int i; (i = next[q].fetch_add(1, std::memory_order_relaxed)) < nn;) (*f)(v[(size_t) i]);
+        int local_done = 0;
+        if (direct_n > 0) {
+            const int nn = direct_n;
+            for (int i; (i = next[0].fetch_add(1, std::memory_order_relaxed)) < nn;) {
+                (*f)(i);
+                ++local_done;
+            }
+        } else {
+            for (int k = 0; k < n_nodes; ++k) {
+                const int q = (node + k) % n_nodes;
+                const std::vector<int>& v = items[q];
+                const int nn = (int) v.size();
+                for (int i; (i = next[q].fetch_add(1, std::memory_order_relaxed)) < nn;) {
+                    (*f)(v[(size_t) i]);
+                    ++local_done;
+                }
+            }
         }
+        if (local_done > 0) done.fetch_add(local_done, std::memory_order_release);
     }
     void loop(int core, int node) {
         if (core >= 0) strata::kernels::cpu::pin_current_thread(core);
@@ -181,8 +197,9 @@ struct Lane::Impl {
             }
             if (quit.load()) return;
             seen = g;
-            work(node);
-            busy.fetch_sub(1, std::memory_order_acq_rel);
+            active.fetch_add(1, std::memory_order_seq_cst);
+            if (open.load(std::memory_order_seq_cst)) work(node);
+            active.fetch_sub(1, std::memory_order_release);
         }
     }
 };
@@ -228,7 +245,13 @@ Lane::Lane(int threads) : p(new Impl) {
     for (size_t i = 0; i < most; ++i)
         for (int q = 0; q < p->n_nodes; ++q)
             if (i < nodes[(size_t) q].size() && !(q == 0 && i == 0)) order.push_back({nodes[(size_t) q][i], q});
-    if (threads < 0) threads = (int) order.size();
+    if (threads < 0) {
+        // Leave headroom cores unpinned on high-core-count hosts so OS / CUDA / server threads don't preempt
+        // pinned workers mid-item (explicit --cpu-threads still overrides).
+        const int total = (int) order.size() + 1;
+        const int reserve = total >= 12 ? std::min(4, total / 8) : 0;
+        threads = std::max(0, (int) order.size() - reserve);
+    }
     // the caller's core: node 0's first, the one no worker takes (not pinned: the caller left where the system runs
     // it - beside a worker, on its core's second thread, when it comes back from a wait)
     if (threads > 0 && !nodes[0].empty() && lw.pin_caller) p->caller_core = nodes[0][0];
@@ -285,13 +308,19 @@ void Lane::parallel_for(int n, const std::function<void(int)>& f, const std::vec
         for (int i = 0; i < n; ++i) f(i);
         return;
     }
-    for (int q = 0; q < p->n_nodes; ++q) {
-        p->items[q].clear();
-        p->next[q].store(0, std::memory_order_relaxed);
-    }
-    for (int i = 0; i < n; ++i) {
-        const int q = node_of && (*node_of)[(size_t) i] >= 0 ? (*node_of)[(size_t) i] % p->n_nodes : i % p->n_nodes;
-        p->items[q].push_back(i);
+    if (p->n_nodes == 1 && !node_of) {
+        p->direct_n = n;
+        p->next[0].store(0, std::memory_order_relaxed);
+    } else {
+        p->direct_n = 0;
+        for (int q = 0; q < p->n_nodes; ++q) {
+            p->items[q].clear();
+            p->next[q].store(0, std::memory_order_relaxed);
+        }
+        for (int i = 0; i < n; ++i) {
+            const int q = node_of && (*node_of)[(size_t) i] >= 0 ? (*node_of)[(size_t) i] % p->n_nodes : i % p->n_nodes;
+            p->items[q].push_back(i);
+        }
     }
     if (p->caller_core >= 0) {   // (the thread that brings the jobs: pinned once)
         thread_local const Impl* pinned_for = nullptr;
@@ -310,14 +339,17 @@ void Lane::parallel_for(int n, const std::function<void(int)>& f, const std::vec
         }
     }
     p->f = &f;
-    p->busy.store((int) p->th.size(), std::memory_order_relaxed);
-    {
+    p->done.store(0, std::memory_order_relaxed);
+    p->open.store(true, std::memory_order_release);
+    p->gen.fetch_add(1, std::memory_order_seq_cst);
+    if (p->sleepers.load(std::memory_order_seq_cst) > 0) {
         std::lock_guard<std::mutex> lk(p->mu);   // (a sleeper checks gen under the lock: no lost wake-up)
-        p->gen.fetch_add(1, std::memory_order_release);
+        p->cv.notify_all();
     }
-    if (p->sleepers.load() > 0) p->cv.notify_all();
     p->work(p->caller_node);
-    while (p->busy.load(std::memory_order_acquire) > 0) cpu_relax();
+    while (p->done.load(std::memory_order_acquire) < n) cpu_relax();
+    p->open.store(false, std::memory_order_seq_cst);
+    while (p->active.load(std::memory_order_seq_cst) > 0) cpu_relax();
     p->f = nullptr;
     if (!p->spin_fixed) p->last_end = std::chrono::steady_clock::now();
 }
@@ -525,7 +557,7 @@ void cpu_experts(Lane& lane, const CpuExperts& ex, const std::vector<CpuEntry>& 
         iqc::iq_cpu_quant(f.gu_act, x + (size_t) t * E, E, sc.xq.data() + (size_t) t * f.act_bytes);
     };
     const int nq = (int) sc.toks.size();
-    if (nq <= 2)
+    if ((int64_t) nq * E <= 32768)
         for (int i = 0; i < nq; ++i) qx(i);
     else
         lane.parallel_for(nq, qx);
@@ -577,7 +609,7 @@ void cpu_experts(Lane& lane, const CpuExperts& ex, const std::vector<CpuEntry>& 
     const auto qh = [&](int i) {
         iqc::iq_cpu_quant(f.d_act, sc.h.data() + (size_t) i * F, F, sc.hq.data() + (size_t) i * f.h_bytes);
     };
-    if (n <= 2)
+    if ((int64_t) n * F <= 32768)
         for (int i = 0; i < n; ++i) qh(i);
     else
         lane.parallel_for(n, qh);
