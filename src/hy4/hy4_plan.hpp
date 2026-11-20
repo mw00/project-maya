@@ -86,6 +86,7 @@ struct ChunkTry {
     long long pixels = 0;
     bool own = false;        // tensor parallel: the MTP block's pass on a scratch of its own (dense_pick's alone)
     bool head = false;       // tensor parallel: the output head's rows over the members too (dense_pick's alone)
+    bool lane = false;       // tensor parallel: a part of the routed experts on the CPU lane (the group holds the rest)
     long long res = 0;       // the routed experts the plan keeps in VRAM, over the layers (dense_pick's alone)
 };
 
@@ -101,7 +102,9 @@ int chunk_pick(PlanAt&& plan_at, const Cands& cands, int base) {
     for (int c : cands) {
         if (c <= base) continue;
         const ChunkTry t = plan_at(c);
-        if (t.ok && t.tp == ref.tp && t.q8 == ref.q8 && t.vision == ref.vision && t.pixels >= ref.pixels) return c;
+        if (t.ok && t.tp == ref.tp && t.q8 == ref.q8 && t.vision == ref.vision && t.pixels >= ref.pixels &&
+            (t.lane == ref.lane || ref.lane))
+            return c;
     }
     return base;
 }
