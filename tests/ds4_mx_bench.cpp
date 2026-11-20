@@ -1,7 +1,7 @@
 // tests/ds4_mx_bench.cpp - how fast does this CPU run DeepSeek-V4.1-Flash's MXFP4 experts on the CPU lane?
 //
 //   ds4_mx_bench [--threads 1,6,12] [--T 1,2,4,8,16] [--experts 16] [--per-layer 3] [--secs 0.4] [--pf 0]
-//                [--kernels float,avx2,avxvnni,avx512,avx512vnni,ggml,scalar] [--file PATH] [--make-file PATH]
+//                [--kernels float,ssse3,avx2,avxvnni,avx512,avx512vnni,ggml,scalar] [--file PATH] [--make-file PATH]
 //
 // Experts of the real shape (gate / up 2304 rows x 5120, down 5120 x 2304, MXFP4: 18.8 MB each) with random codes in
 // anonymous memory (huge pages where the OS gives them), or in a file's mapping (--file: 4 KiB page-cache pages, as the
@@ -230,7 +230,7 @@ struct Bench {
 
 int main(int argc, char** argv) {
     std::vector<int> threads = {1}, Ts = {1, 2, 4, 8, 16}, pfs = {0};
-    std::vector<std::string> kerns = {"float", "avx2", "avxvnni", "avx512", "avx512vnni", "ggml"};
+    std::vector<std::string> kerns = {"float", "ssse3", "avx2", "avxvnni", "avx512", "avx512vnni", "ggml"};
     std::string file, make_file;
     Bench B;
     for (int i = 1; i + 1 < argc; i += 2) {

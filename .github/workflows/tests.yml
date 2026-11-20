@@ -1,5 +1,6 @@
-# Every push and pull request: the Python tests (server, installer, tools) and the AMD build's CUDA-name check - no GPU
-# needed. The engine's CUDA build and its GPU tests run on the maintainers' V100s before a merge (CONTRIBUTING.md).
+# Every push and pull request: the Python tests (server, installer, tools), the AMD build's CUDA-name check and the
+# DeepSeek MXFP4 CPU tier tests - no GPU needed. The engine's CUDA build and its GPU tests run on the maintainers'
+# V100s before a merge (CONTRIBUTING.md).
 name: tests
 
 on:
@@ -43,6 +44,21 @@ jobs:
           "$RUNNER_TEMP/ds4_cpu_prepare_rows_test"
           c++ -std=c++20 -O2 -DNDEBUG -Wall -Wextra -Werror -DDS4_CPU_PREPARE_STUB_TEST=1 tests/ds4_cpu_prepare_rows_test.cpp src/ds4/ds4_iq_cpu.cpp -o "$RUNNER_TEMP/ds4_cpu_prepare_stub_test"
           "$RUNNER_TEMP/ds4_cpu_prepare_stub_test"
+      - name: DeepSeek MXFP4 CPU tiers (CPU only)
+        run: |
+          c++ -std=c++20 -O2 -DNDEBUG -Wall -Wextra -Werror -ffp-contract=off -Iinclude -pthread \
+            -ffunction-sections -fdata-sections tests/ds4_mx_fma_test.cpp src/ds4/ds4_gguf_cpu.cpp \
+            -Wl,--gc-sections -o "$RUNNER_TEMP/ds4_mx_fma_test"
+          for s in 0 1; do for f in 0 1; do
+            DS4_MX_SSSE3=$s DS4_MX_FAST_FMA=$f "$RUNNER_TEMP/ds4_mx_fma_test"
+          done; done
+          c++ -std=c++20 -O2 -DNDEBUG -Wall -Wextra -Werror -ffp-contract=off -Iinclude -pthread \
+            -ffunction-sections -fdata-sections tests/ds4_mx_ssse3_test.cpp src/ds4/ds4_gguf_cpu.cpp \
+            -Wl,--gc-sections -o "$RUNNER_TEMP/ds4_mx_ssse3_test"
+          # the runner's CPU has SSSE3: a 77 (no SSSE3) must fail here, not pass for a skipped run
+          grep -q ssse3 /proc/cpuinfo
+          "$RUNNER_TEMP/ds4_mx_ssse3_test"
+          DS4_MX_SSSE3=1 DS4_MX_FAST_FMA=1 "$RUNNER_TEMP/ds4_mx_ssse3_test"
       - name: Server tests
         run: '"$RUNNER_TEMP/venv/bin/python" -m unittest discover -s serve -p "test_*.py" -t .'
       - name: Installer and tools tests
