@@ -5168,9 +5168,9 @@ struct Model::Impl {
     // model is loaded, on a thread of its own (a thread a GPU), while the first person still types: the pass's kinds
     // of product (the mHC mix in F32, the FP16 projections, the indexer's FP16 weights) on zeros in the prompt
     // buffers of a fixed size (never a borrowed tail), on the device's stream - they stay zeros, nothing else is
-    // touched, so the answers are what they were.  A prompt that comes first waits for it (blas_wait: never longer
-    // than its own first products would have taken), and so does a picture (its room may be those buffers); one that
-    // comes before it started stops it
+    // touched, so the answers are what they were.  A request that comes first waits for it (blas_wait, at its
+    // begin_request: never longer than a prompt's own first products would have taken), and so does a picture (its
+    // room may be those buffers); one that comes before it started stops it
     std::thread blas_th;
     std::mutex blas_mu;
     std::atomic<bool> blas_skip{false};
@@ -23603,6 +23603,11 @@ int Model::fed() const { return p_->fed_n; }
 bool Model::cancelled() const { return p_->halted; }
 bool Model::broken() { return p_->broken(); }
 void Model::begin_request() {
+    // (#1006: the prompt path's GEMM warm-up finished first for every request, not only for a chunked read - its first
+    //  cuBLAS products load their kernels into the context, and a request right after the load (--bench, the speed
+    //  calibration) whose window kernels wait for each other across the GPUs hung on that load: one GPU at 100%, the
+    //  other idle, its launches behind the driver's lock the loading thread held)
+    p_->blas_wait();
     p_->begin_request();
     p_->part_pre.have = false;
     if (p_->part_link()) p_->part_mirror(part::kBegin, part::Writer());
