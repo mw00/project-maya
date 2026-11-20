@@ -492,7 +492,7 @@ def find_vcvars(cuda=True, nvcc=None):
     if not cuda or nvcc_takes_vs2026(nvcc):
         ranges.append(["-version", "[18.0,)"])
     for versions in ranges:
-        p = out([str(vswhere), "-latest", "-products", "*", *versions, "-requires",
+        p = out([str(vswhere), "-latest", "-prerelease", "-products", "*", *versions, "-requires",
                  "Microsoft.VisualStudio.Component.VC.Tools.x86.x64", "-property", "installationPath"]).strip()
         v = Path(p) / "VC/Auxiliary/Build/vcvars64.bat" if p else None
         if v and v.exists():
