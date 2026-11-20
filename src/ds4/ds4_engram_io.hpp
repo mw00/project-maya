@@ -13,6 +13,7 @@
 #endif
 
 #include "ds4_os.hpp"
+#include "ds4_engram_numa.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -160,6 +161,13 @@ public:
             err = "Engram RAM: range is too large"; return false;
         }
         const size_t length = (size_t) (off - begin + n);
+        const bool numa_on = engram_numa_on();
+#if defined(__linux__)
+        EngramNuma numa;
+        if (numa_on && !numa.init(err)) return false;
+#else
+        if (numa_on) { err = "Engram RAM NUMA requires Linux"; return false; }
+#endif
         const os::fd_t fd = os::open_ro(path);
         if (fd == os::kBadFd) { err = "Engram RAM: cannot open " + path; return false; }
         const uint64_t bytes = os::file_size(fd);
@@ -172,6 +180,12 @@ public:
         uint8_t* base = (uint8_t*) raw;
         const size_t chunk = 256ull << 20;
         for (size_t pos = 0; pos < length; pos += chunk) {
+#if defined(__linux__)
+            // Existing warm shared-cache pages must be relocated, not merely assigned a new policy.
+            if (numa_on && !numa.balance(base + pos, std::min(chunk, length - pos), begin + pos, err)) {
+                ::munlock(base, length); ::munmap(base, length); return false;
+            }
+#endif
             if (::mlock(base + pos, std::min(chunk, length - pos)) != 0) {
                 // (#836: the distro default of 8 MB fails at the first chunk; say what the limit is and the durable fix)
                 std::string lim = "unknown";
@@ -188,6 +202,12 @@ public:
                 std::fprintf(stderr, "ds4: Engram RAM file %d locked %.2f / %.2f GB\n", file,
                              (double) std::min(pos + chunk, length) / 1e9, (double) length / 1e9);
         }
+#if defined(__linux__)
+        if (numa_on)
+            std::fprintf(stderr, "ds4: Engram RAM NUMA file %d: verified N0=%llu N1=%llu pages, relocated_batches=%llu (2 MiB strict batches/stripes)\n",
+                         file, (unsigned long long) numa.verified[0], (unsigned long long) numa.verified[1],
+                         (unsigned long long) numa.relocated_batches);
+#endif
         ram_.push_back({file, off, n, base, length, (size_t) (off - begin)});
         return true;
 #endif
