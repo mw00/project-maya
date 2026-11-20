@@ -1393,7 +1393,7 @@ struct Model::Impl {
                 // (--tp auto: where the group of N does not hold the model, one GPU fewer - the one left out holds the
                 //  head, the drafts and a helper's share of the experts - before the layer split.  HY4_TP_DOWN=0: N only)
                 const char* dn = std::getenv("HY4_TP_DOWN");
-                const int n_min = o.tp < 0 && !(dn && std::atoi(dn) == 0) ? 2 : N;
+                const int n_min = o.tp < 0 && !(dn && std::atoi(dn) == 0) ? 2 : N, n_all = N;
                 std::string terr;
                 for (int n = N; n >= n_min; --n) {
                     std::string tn;
@@ -1419,6 +1419,7 @@ struct Model::Impl {
                     }
                     terr += (terr.empty() ? "" : "; ") + tn;
                 }
+                N = n_all;   // (none held it: what follows weighs the whole group again)
                 if (o.tp > 0) {
                     err = terr;
                     return false;
