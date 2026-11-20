@@ -126,7 +126,7 @@ export function relTime(t) {
   return d.toLocaleDateString([], {month: "short", day: "numeric"});
 }
 
-// the model family's logo (web/logo-*.svg: lobe-icons' marks, MIT; Hy4's: a mark of Maya's own) and its name as people write it:
+// the model family's logo (web/logo-*.svg: lobe-icons' marks, MIT) and its name as people write it:
 // "glm-5.3-flash" -> "GLM 5.3 Flash", "deepseek-v4.1-flash" -> "DeepSeek V4.1 Flash", "qwen3.8-flash-next" -> "Qwen3.8 Flash Next"
 // (CYBER-FROST-3.8-PS, a Qwen3.8-Flash-Next fine-tune: Qwen's mark, its own name as its card writes it)
 const MODEL_LOGOS = [[/glm/i, "glm", true], [/deepseek/i, "deepseek"], [/minimax/i, "minimax"], [/qwen|cyber-frost/i, "qwen"],
