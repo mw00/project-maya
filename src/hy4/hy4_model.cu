@@ -1346,10 +1346,12 @@ struct Model::Impl {
         left = avail == 0 ? 1e30 : std::max(0.0, (double) avail - head);
         return avail == 0 || left >= host;
     }
-    // (--kv-streaming auto: streaming for more routed experts in VRAM too - HY4_KV_MORE=0: only where nothing fits)
+    // (--kv-streaming auto: streaming for more routed experts in VRAM too - opt-in, HY4_KV_MORE=1: on one V100 with
+    //  Maya-XS at 128K it read a 16K prompt 2% faster but a 48K one 1.1% slower, decode equal; off until it is chosen
+    //  per PC by a measurement)
     static bool kv_more_on() {
         const char* e = std::getenv("HY4_KV_MORE");
-        return !(e && *e && std::atoi(e) == 0);
+        return e && *e && std::atoi(e) != 0;
     }
     // (the indexer's pooled keys and its value | gate ring: F16 with 8-bit rows - the reference's own cache type -,
     //  else F32)
@@ -2132,7 +2134,7 @@ struct Model::Impl {
         // --kv-streaming auto (the default): the cache fits, the routed experts do not all - the indexed layers' rows
         // beyond the ring in host memory too where that gives every layer more experts in VRAM and the RAM holds the
         // rows.  Nothing is read from the host until a conversation passes the ring; the same bits either way
-        // (HY4_KV_MORE=0: only where nothing else fits, as before).  Not where the DFly2 drafter is planned: it reads
+        // (opt-in: HY4_KV_MORE=1 - off, only where nothing else fits, as before).  Not where the DFly2 drafter is planned: it reads
         // the trunk's rows in VRAM only, and streaming would leave it off
         if (o.kv_streaming < 0 && !kv_auto_set && o.kv_resident == 0 && kv_auto_n > 0 && kv_more_on() &&
             dfly_plan_bytes() <= 0) {

@@ -47,9 +47,9 @@ struct Options {
                                   // only with them (any layout: one GPU, the layer split, tensor parallel)
     int kv_streaming = -1;        // KV streaming: 0 off, 1 on, -1 auto (the default) - on where the context does not
                                   // fit in the VRAM without it (after 8-bit rows and no picture's room: a start that
-                                  // failed before), or where it gives every layer more routed experts in VRAM (the
-                                  // cache fits, the experts do not - nothing read from the host until a conversation
-                                  // passes the ring; HY4_KV_MORE=0: not for that), and the RAM holds the rows;
+                                  // failed before), or, with HY4_KV_MORE=1 (opt-in), where it gives every layer more
+                                  // routed experts in VRAM (the cache fits, the experts do not - nothing read from the
+                                  // host until a conversation passes the ring), and the RAM holds the rows;
                                   // kv_resident then the ring tried first
     int64_t kv_resident = 0;      // KV streaming: the indexed layers' cache rows kept in VRAM - a ring of the newest
                                   // positions (a chunk's at least); every position's row in pinned host memory, the
