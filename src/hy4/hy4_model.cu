@@ -5641,6 +5641,28 @@ struct Model::Impl {
         return true;
     }
 
+    // An error after a GPU fault: the fault named first.  A kernel's illegal memory access is sticky - every launch and
+    // cuBLAS call after it fails too, and the error that ends the step ("a GEMV the kernels do not take": cuBLAS
+    // refusing) only follows from it.  Only when a launch failed in this process and a GPU is in that state (else the
+    // error as it was)
+    void name_fault(std::string& err) {
+        static const char* kTag = "the GPU stopped";
+        const std::string f = k::first_fault();
+        if (f.empty() || err.rfind(kTag, 0) == 0) return;
+        int cur = -1;
+        if (cudaGetDevice(&cur) != cudaSuccess) cur = -1;
+        cudaError_t e = cudaSuccess;
+        for (const Gpu& gp : G) {
+            if (cudaSetDevice(gp.dev) != cudaSuccess) continue;
+            const cudaError_t d = cudaDeviceSynchronize();
+            if (e == cudaSuccess) e = d;
+        }
+        if (cur >= 0) (void) cudaSetDevice(cur);
+        if (e == cudaSuccess) return;
+        err = std::string(kTag) + ": " + cudaGetErrorString(e) + " (first reported at the launch of " + f +
+              "; CUDA reports a kernel's fault at a later launch - CUDA_LAUNCH_BLOCKING=1 names the kernel that faulted)"
+              " - then: " + err;
+    }
     bool window(const int* ids, int T, int64_t p0, int want, float* logits_out, std::string& err) {
         const int E = g.n_embd, hc = g.hc;
         win_t0 = now_s();
@@ -6504,6 +6526,7 @@ bool Model::load(const Options& o, std::string& err) {
     m->mtp_done = 0;
     m->st = keep;
     if (!ok) {
+        m->name_fault(err);
         err = "the warm-up: " + err;
         return false;
     }
@@ -6558,7 +6581,10 @@ bool Model::forward(const int* ids, int n, int64_t pos0, int want, float* logits
     int done = 0;
     while (done < n) {
         const int T = done < head ? std::min(Tc, head - done) : last;
-        if (!m->window(ids + done, T, pos0 + done, done + T == n ? want : 0, logits_out, err)) return false;
+        if (!m->window(ids + done, T, pos0 + done, done + T == n ? want : 0, logits_out, err)) {
+            m->name_fault(err);
+            return false;
+        }
         done += T;
         m->end = pos0 + done;
         m->st.tokens += T;

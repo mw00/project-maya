@@ -14,6 +14,7 @@
 #include <mutex>
 #include <cstdio>
 #include <cstdlib>
+#include <string>
 
 namespace hy4::k {
 
@@ -21,11 +22,27 @@ namespace {
 
 std::atomic<int> g_err{0};
 float* g_mix_out = nullptr;   // (tests: hc_pre's mixes, set_mix_out)
+// the first failed launch's kernel and error (first_fault), and how many were printed: a fault in a kernel is sticky -
+// every launch after it fails the same way, so past the first few they are counted, not printed (hundreds of lines
+// hid the first one)
+std::mutex g_fault_mu;
+std::string g_fault;
+int g_printed = 0;
+constexpr int kPrintMax = 8;
 
 void check(const char* what) {
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
-        std::fprintf(stderr, "maya-hy4 kernel %s: %s\n", what, cudaGetErrorString(e));
+        bool print = true;
+        {
+            std::lock_guard<std::mutex> lk(g_fault_mu);
+            if (g_fault.empty()) g_fault = what;
+            print = g_printed < kPrintMax;
+            ++g_printed;
+            if (g_printed == kPrintMax + 1)
+                std::fprintf(stderr, "maya-hy4: more kernels failed the same way - counted, not printed\n");
+        }
+        if (print) std::fprintf(stderr, "maya-hy4 kernel %s: %s\n", what, cudaGetErrorString(e));
         g_err.fetch_add(1, std::memory_order_relaxed);
     }
 }
@@ -367,7 +384,8 @@ __device__ __forceinline__ void hc_fin_body(int t, const float* __restrict__ x, 
     }
     __syncthreads();
     // (a thread a stream, not thread 0 looping over them: CUDA 13.0's ptxas (V13.0.88) built that loop for sm_120
-    //  with base + hc's address in 32 bits - its upper half dropped, an illegal read at the warm-up; the same products)
+    //  with base + hc's address in 32 bits - its upper half dropped, an illegal read at the warm-up; the same products.
+    //  12.9's ptxas builds it the same way, 12.8's and 13.3's do not; hc_pre1 (HY4_HC_ONE=1) shares this body)
     if ((int) threadIdx.x < hc) {
         const int j = threadIdx.x;
         const float r = 1.0f / sqrtf(s_mix[kMaxM] / (float) HE + eps);
@@ -2531,6 +2549,10 @@ void row_top(const float* x, int rows, int n, size_t ld, int i0, float* out, cud
     check("row_top");
 }
 int errors() { return g_err.exchange(0); }
+std::string first_fault() {
+    std::lock_guard<std::mutex> lk(g_fault_mu);
+    return g_fault;
+}
 void set_mix_out(float* p) { g_mix_out = p; }
 
 }  // namespace hy4::k
