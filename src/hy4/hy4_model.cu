@@ -1543,10 +1543,14 @@ struct Model::Impl {
                 // The group does not hold every routed expert: each member takes as many of every layer's as its VRAM
                 // holds (unsplit, the most routed first) and the others are the CPU lane's, as on the layer split: the
                 // cache in 8-bit rows where --kv auto allows (more experts in VRAM), the MTP block's pass in line
-                // (HY4_TP_LANE=0: --tp auto keeps the layer split here, and the INFO line says what the group would hold)
+                // (--tp auto takes it for a group of 3 GPUs or more; a group of 2 keeps the layer split, whose prompts
+                //  read faster there, unless HY4_TP_LANE=1. HY4_TP_LANE=0: the layer split for every group. The INFO
+                //  line says what the group would hold)
                 {
                     const char* le = std::getenv("HY4_TP_LANE");
-                    const bool asked = o.tp > 0 || !(le && *le && std::atoi(le) == 0);
+                    const bool lane_set = le && *le;
+                    const bool lane_on = lane_set ? std::atoi(le) != 0 : N >= 3;
+                    const bool asked = o.tp > 0 || lane_on;
                     const bool was = kv_q8;
                     if (o.kv < 0 && kv_q8_rows()) kv_q8 = true;
                     undo();
@@ -1557,9 +1561,13 @@ struct Model::Impl {
                     for (int c : tp_cap) held += c;
                     const double pct = 100.0 * (double) std::min<long long>(held, g.n_expert) / g.n_expert;
                     if (fit_l && !asked) {
-                        char lb[200];
-                        std::snprintf(lb, sizeof lb, "HY4_TP_LANE=0 - the group would hold %.0f%% of the routed experts "
-                                      "(unset or --tp %d takes it)", pct, N);
+                        char lb[240];
+                        if (lane_set)
+                            std::snprintf(lb, sizeof lb, "HY4_TP_LANE=0 - the group would hold %.0f%% of the routed "
+                                          "experts (HY4_TP_LANE=1 or --tp %d takes it)", pct, N);
+                        else
+                            std::snprintf(lb, sizeof lb, "a group of %d GPUs takes the CPU lane only with HY4_TP_LANE=1 "
+                                          "or --tp %d - the group would hold %.0f%% of the routed experts", N, N, pct);
                         tl = lb;
                         undo();
                     } else if (fit_l) {
