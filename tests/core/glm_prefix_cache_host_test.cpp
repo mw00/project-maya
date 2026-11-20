@@ -27,7 +27,7 @@ namespace pm = strata::core::glm_cache_memory;
 namespace pa = strata::core::glm_prefix;
 static void env_write(const char* name, const char* value) {
 #ifdef _WIN32
-    if (value == nullptr) SetEnvironmentVariableA(name, nullptr);
+    if (value == nullptr) _putenv_s(name, "");
     else if (value[0] == '\0') SetEnvironmentVariableA(name, "");
     else _putenv_s(name, value);
 #else
@@ -354,6 +354,62 @@ struct CgroupFixture {
     }
     std::optional<uint64_t> read() const { return pm::linux_available(dir / "meminfo", dir / "membership", root); }
 };
+using namespace strata::core;
+struct LoaderIdentityGate {
+    strata::core::PackShardDigests* pack_digests_ = nullptr;
+    std::vector<int> pack_shards_{1};
+    mutable int calls = 0;
+    std::string pack_content_digest_, err;
+    std::string pack_content_identity(strata::core::PackShardDigests&) const {
+        ++calls;
+        return std::string(64, 'a');
+    }
+    int run() {
+        // PRODUCTION_LOAD_IDENTITY_GATE
+        return 0;
+    }
+};
+static void loader_gate_checks() {
+    const char* names[] = {"MAYA_GLM_SLOT_SPILL", "MAYA_GLM_SLOT_KEEP", "MAYA_GLM_LEARNED_PREFIX",
+                           "MAYA_GLM_PROMPT_CACHE_DIR", "MAYA_GLM_SLOT_RAM_GB", "MAYA_GLM_NO_REUSE"};
+    std::optional<std::string> saved[6];
+    struct Restore {
+        const char** names;
+        std::optional<std::string>* saved;
+        ~Restore() {
+            for (size_t i = 0; i < 6; ++i) {
+                const std::optional<std::string>& value = saved[i];
+                env_write(names[i], value ? value->c_str() : nullptr);
+            }
+        }
+    } restore{names, saved};
+    for (size_t i = 0; i < 6; ++i) {
+        if (const char* value = std::getenv(names[i])) saved[i] = value;
+        env_write(names[i], nullptr);
+    }
+    const auto run_case = [&](const char* name, const char* value, bool required) {
+        if (name != nullptr) env_write(name, value);
+        LoaderIdentityGate loader;
+        const int rc = loader.run();
+        const std::string& digest = loader.pack_content_digest_;
+        const bool valid = digest.size() == 64 && digest.find_first_not_of("0123456789abcdef") == std::string::npos;
+        const bool passed = rc == 0 && loader.calls == (required ? 1 : 0) && (required ? valid : digest.empty());
+        if (!passed)
+            std::printf("DEBUG load gate rc=%d calls=%d required=%d digest_size=%zu\n",
+                        rc, loader.calls, required ? 1 : 0, digest.size());
+        expect(passed, name == nullptr ? "PACK_LOAD_GATE default does not hash" : name);
+        if (name != nullptr) env_write(name, nullptr);
+    };
+    run_case(nullptr, nullptr, false);
+    run_case("MAYA_GLM_SLOT_RAM_GB", "8", false);
+    run_case("MAYA_GLM_SLOT_SPILL", "1", true);
+    run_case("MAYA_GLM_SLOT_KEEP", "1", true);
+    run_case("MAYA_GLM_LEARNED_PREFIX", "1", true);
+    run_case("MAYA_GLM_PROMPT_CACHE_DIR", "prompt-cache-fixture", true);
+    env_write("MAYA_GLM_SLOT_KEEP", "1");
+    run_case("MAYA_GLM_NO_REUSE", "1", false);
+    env_write("MAYA_GLM_SLOT_KEEP", nullptr);
+}
 static std::string digest_of(const std::string& text) {
     strata::core::Sha256 s;   // the pack identity's own digest, checked against the published FIPS 180-4 vectors
     s.feed(text.data(), text.size());
@@ -506,6 +562,7 @@ int main(int argc, char** argv) {
     const fs::path root(argv[1]);
     scan_checks(root);
     pack_identity_checks(root / "pack-identity");
+    loader_gate_checks();
     regular_stream_checks(root / "regular-streams");
     {
         pa::Admission a;

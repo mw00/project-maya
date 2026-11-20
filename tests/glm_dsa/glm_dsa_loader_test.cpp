@@ -388,20 +388,6 @@ bool parse(const std::string& path, Glm5Geometry& g, std::string& err) {
 
 bool has(const std::string& s, const std::string& sub) { return s.find(sub) != std::string::npos; }
 
-std::string first_content_digest(const std::string& id) {
-    const size_t content = id.find(" content=");
-    if (content == std::string::npos) return "missing-content-field";
-    const size_t colon = id.find(':', content + 9);
-    if (colon == std::string::npos) return "missing-layer-separator";
-    const size_t semicolon = id.find(';', colon + 1);
-    if (semicolon == std::string::npos) return "missing-part-terminator";
-    return id.substr(colon + 1, semicolon - colon - 1);
-}
-
-bool is_sha256_hex(const std::string& digest) {
-    return digest.size() == 64 && digest.find_first_not_of("0123456789abcdef") == std::string::npos;
-}
-
 }  // namespace
 
 int main() {
@@ -661,9 +647,6 @@ int main() {
         check(cost[0] == 6144.0 * 2048 / 256 * 144 && cost[1] == 0 && cost[5] == 0,
               "dense split cost from index.txt + the shards (experts excluded)");
 
-        for (const char* name : {"MAYA_GLM_SLOT_SPILL", "MAYA_GLM_SLOT_KEEP", "MAYA_GLM_LEARNED_PREFIX",
-                                 "MAYA_GLM_PROMPT_CACHE_DIR", "MAYA_GLM_SLOT_RAM_GB", "MAYA_GLM_NO_REUSE"})
-            unsetenv(name);
         strata::core::Glm5Model m;
         err.clear();
         ok = m.load_pack(pack.string(), 4096, err);
@@ -671,27 +654,6 @@ int main() {
               "load_pack: shards open, experts rows verified, shapes pass, refused at the forward gate");
         std::printf("    (%s)\n", err.c_str());
         check(m.geometry().arch == GlmArch::GlmDsa && m.geometry().n_layers == 78, "load_pack read the glm-dsa geometry");
-        check(first_content_digest(m.pack_identity()).empty(),
-              "load_pack default skips persistent weight identity");
-        const auto identity_case = [&](const char* name, const char* value, bool required) {
-            setenv(name, value, 1);
-            strata::core::Glm5Model candidate;
-            std::string candidate_err;
-            const bool loaded = candidate.load_pack(pack.string(), 4096, candidate_err);
-            const std::string digest = first_content_digest(candidate.pack_identity());
-            check(!loaded && has(candidate_err, "check-only load") &&
-                      (required ? is_sha256_hex(digest) : digest.empty()),
-                  std::string("load_pack identity gate: ") + name + "=" + value);
-            unsetenv(name);
-        };
-        identity_case("MAYA_GLM_SLOT_RAM_GB", "8", false);
-        identity_case("MAYA_GLM_SLOT_SPILL", "1", true);
-        identity_case("MAYA_GLM_SLOT_KEEP", "1", true);
-        identity_case("MAYA_GLM_LEARNED_PREFIX", "1", true);
-        identity_case("MAYA_GLM_PROMPT_CACHE_DIR", "prompt-cache-fixture", true);
-        setenv("MAYA_GLM_SLOT_KEEP", "1", 1);
-        identity_case("MAYA_GLM_NO_REUSE", "1", false);
-        unsetenv("MAYA_GLM_SLOT_KEEP");
     }
     const auto pack_err = [&](const LayerOpts& o) {
         const fs::path pack = write_pack(pdir, o);

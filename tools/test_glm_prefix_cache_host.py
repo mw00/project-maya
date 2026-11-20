@@ -27,6 +27,7 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--receipt", type=Path, required=True)
     ap.add_argument("--cxx", default=os.environ.get("CXX", "cl" if os.name == "nt" else "c++"))
+    ap.add_argument("--model-source", type=Path, default=ROOT / "src/core/glm_model.cu")
     args = ap.parse_args()
     args.receipt.parent.mkdir(parents=True, exist_ok=True)
     # Reserve the path before compilation, without destroying previous evidence.
@@ -42,7 +43,22 @@ def main() -> int:
         receipt["compiler"] = cxx
         with tempfile.TemporaryDirectory(prefix="maya-prefix-host-") as temp:
             td = Path(temp).resolve()
-            source = ROOT / "tests/core/glm_prefix_cache_host_test.cpp"
+            model = args.model_source.read_text(encoding="utf-8")
+            start = model.find("    const bool identity_required = pack_identity_required();")
+            if start < 0:
+                start = model.find("    PackShardDigests single_load_digests;")
+            if start < 0:
+                raise RuntimeError("load identity gate extraction changed")
+            end = model.index("    pack_ = true;", start)
+            block = model[start:end]
+            test_source = (ROOT / "tests/core/glm_prefix_cache_host_test.cpp").read_text(encoding="utf-8")
+            if test_source.count("        // PRODUCTION_LOAD_IDENTITY_GATE") != 1:
+                raise RuntimeError("load identity fixture marker changed")
+            test_source = test_source.replace("        // PRODUCTION_LOAD_IDENTITY_GATE", block)
+            source = td / "fixture.cpp"
+            source.write_text(test_source, encoding="utf-8")
+            receipt["model_source"] = {"path": str(args.model_source),
+                                       "sha256": hashlib.sha256(args.model_source.read_bytes()).hexdigest()}
             exe = td / ("fixture.exe" if os.name == "nt" else "fixture")
             if Path(cxx).stem.lower() in ("cl", "clang-cl"):
                 cmd = [cxx, "/nologo", "/std:c++20", "/EHsc", "/W4", "/D_CRT_SECURE_NO_WARNINGS", f"/I{ROOT / 'include'}",
