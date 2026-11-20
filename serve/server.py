@@ -63,6 +63,7 @@ from serve import glm_link  # noqa: E402  GLM on an AMD APU + an NVIDIA card ("m
 ENGINE_VISION = (ds4_vision.Vision, mm3_vision.Vision)   # the engines that run their vision tower themselves
 #                                                          (hy4_vision.Vision is an mm3_vision.Vision)
 HY4_TEXT_ONLY = "Hy4-Flash with its pictures off"         # (no vision tower loaded: the errors' name for it)
+HY4_LANE_FILE = ROOT / "data" / "hy4-cpu-lane.txt"        # (maya-hy4's 4-bit copies' verdict on this PC: child_env)
 # (... and what stands for a picture in a tool result then: the agent's turn goes on)
 HY4_PICTURE_NOTE = "[a picture was here; pictures are off on this server, so it was not read]"
 
@@ -2205,6 +2206,11 @@ def child_env(cfg: dict) -> dict:
     # default (off)
     if isinstance(cfg.get("fast_prefill"), bool):
         env["DS4_YOCO_CONE"] = "1" if cfg["fast_prefill"] else "0"
+    # Hy4-flash's CPU lane: whether its 4-bit expert copies pay is measured once on this PC (the engine's timed turns,
+    # once its experts are warm) and remembered in the data folder beside the expert profiles - per PC, model and
+    # lane kernels (maya --speed-calibration measures again)
+    if models.family(cfg) == "hy4":
+        env.setdefault("HY4_Q4X_FILE", str(HY4_LANE_FILE))
     dirs = [d for d in cfg.get("lib_dirs") or [] if Path(d).is_dir()]
     if dirs:
         var = "PATH" if os.name == "nt" else "LD_LIBRARY_PATH"

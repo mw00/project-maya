@@ -145,6 +145,23 @@ uint64_t commit_available();
 /// the copies are twice the bytes).  False: no 4-bit form here.
 bool q4x_probe(Lane& lane, const CpuExperts& ex, int n_expert, double& ms_file, double& ms_q4x);
 
+/// The 4-bit copies' verdict as this PC measured it once (the engine's timed turns), kept in a small text file - a
+/// line a key: this PC (q4x_memo_key: its CPU, threads and RAM, the lane's threads), the model's lane experts (the
+/// caller's words) and the lane kernels' build (lane_kernels_id: changed kernels are measured again).
+struct Q4xMemo {
+    bool found = false, kept = false;
+    double us_with = 0, us_without = 0;   // an expert run with / without the copies, as measured
+    std::string date;                     // YYYY-MM-DD
+};
+/// this PC's key for the model's lane `model` (no tabs or line ends)
+std::string q4x_memo_key(const std::string& model, int lane_threads);
+/// `key`'s verdict in `path` (found false: none, no file, or a line it cannot read)
+Q4xMemo q4x_memo_get(const std::string& path, const std::string& key);
+/// `key`'s verdict written in `path` (its line replaced, the others kept; date: today's); false: not written
+bool q4x_memo_put(const std::string& path, const std::string& key, Q4xMemo m);
+/// the lane kernels' build - a hash of their sources (CMake's HY4_LANE_KERNELS), or "unknown"
+const char* lane_kernels_id();
+
 /// out [T][n_embd] = each token's weighted sum of its entries' experts (rows with no entry: 0), x [T][n_embd]; the
 /// experts' weights read once for up to 8 of their tokens.  Scratch is the lane's own (grown as needed).
 void cpu_experts(Lane& lane, const CpuExperts& ex, const std::vector<CpuEntry>& entries, const float* x, int T,

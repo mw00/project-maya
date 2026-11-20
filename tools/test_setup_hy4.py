@@ -2037,8 +2037,9 @@ class Dashboard(unittest.TestCase):
 
 
 class Q4xCheck(unittest.TestCase):
-    """The CPU lane's 4-bit expert copies (maya-hy4's HY4_Q4X): measured once per PC at an attended start - the
-    engine's own verdict (HY4_Q4X=2) kept in the config's env as 1 / 0 - unless the env sets it already."""
+    """The CPU lane's 4-bit expert copies (maya-hy4's HY4_Q4X): the engine measures them once its experts are warm and
+    remembers the verdict per PC (the data folder's hy4-cpu-lane.txt) - no start of their own; --speed-calibration
+    measures again (HY4_Q4X_MEASURE=1); a verdict an earlier start's check wrote into the config's env is dropped."""
 
     def cfg(self, root: Path, **kw) -> dict:
         tok = root / "tokenizer"
@@ -2050,17 +2051,34 @@ class Q4xCheck(unittest.TestCase):
         c.update(kw)
         return c
 
-    def test_who_needs_it(self):
+    def test_an_earlier_checks_verdict_is_left_to_the_engine(self):
+        """1.1.69's start-time check wrote HY4_Q4X 1 / 0 into the config (often measured on cold experts): dropped at
+        the start, so the engine measures once warm and remembers it per PC, model and lane kernels.  A value of the
+        user's own stays."""
         with tempfile.TemporaryDirectory() as t:
-            c = self.cfg(Path(t))
-            self.assertTrue(maya.needs_q4x_calibration(c))
-            self.assertFalse(maya.needs_q4x_calibration(dict(c, env={"HY4_Q4X": "0"})))   # (the user's own)
-            self.assertFalse(maya.needs_q4x_calibration(dict(c, installer=dict(c["installer"],
-                                                                               q4x_calibration={"result": "on"}))))
-            self.assertFalse(maya.needs_q4x_calibration(dict(c, installer=dict(c["installer"], hy4_quant=maya.HY4_Q4))))
-            self.assertFalse(maya.needs_q4x_calibration(dict(c, backend="metal")))
-            self.assertFalse(maya.needs_q4x_calibration({"exe": "/b/maya", "args": ["--glm-pack", "/p"],
-                                                         "installer": {"family": "glm"}}))
+            p = Path(t) / "maya-hy4-flash-maya-xs.json"
+            for env, inst, kept in (({"HY4_Q4X": "1"}, {"q4x_calibration": {"result": "on"}}, False),
+                                    ({"HY4_Q4X": "0"}, {"q4x_calibration": {"result": "off"}}, False),
+                                    ({"HY4_Q4X": "0"}, {}, True),                                 # (set by hand)
+                                    ({"HY4_Q4X": "1"}, {"q4x_calibration": {"result": "off"}}, True)):
+                with self.subTest(env=env, inst=inst):
+                    c = self.cfg(Path(t), env=dict(env))
+                    c["installer"].update(inst)
+                    p.write_text(json.dumps(c))
+                    got = maya.q4x_config_migrate(p, maya.read_json(p))
+                    self.assertEqual("HY4_Q4X" in (got.get("env") or {}), kept)
+                    self.assertEqual("HY4_Q4X" in (maya.read_json(p).get("env") or {}), kept)
+            glm = {"exe": "/b/maya", "args": ["--glm-pack", "/p"], "env": {"HY4_Q4X": "1"},
+                   "installer": {"family": "glm", "q4x_calibration": {"result": "on"}}}
+            self.assertEqual(maya.q4x_config_migrate(p, glm), glm)
+        self.assertFalse(hasattr(maya, "needs_q4x_calibration"))          # (no start loads the model for it any more)
+
+    def test_the_server_names_the_verdicts_file(self):
+        import serve.server as SV
+        with tempfile.TemporaryDirectory() as t:
+            env = SV.child_env(self.cfg(Path(t)))
+        self.assertEqual(env["HY4_Q4X_FILE"], str(SV.ROOT / "data" / "hy4-cpu-lane.txt"))
+        self.assertNotIn("HY4_Q4X_FILE", SV.child_env({"exe": "/b/maya", "args": ["--glm-pack", "/p"]}))
 
     def test_the_verdict(self):
         self.assertEqual(maya.q4x_verdict("maya-hy4: CPU lane: the 4-bit copies kept - an expert run 60 us"), "on")
@@ -2100,17 +2118,19 @@ class Q4xCheck(unittest.TestCase):
             got = maya.q4x_calibration(p)
         return got, maya.read_json(p), seen, said
 
-    def test_on_and_off_kept_in_the_config(self):
-        for line, want, env in (("maya-hy4: CPU lane: the 4-bit copies kept - x", True, "1"),
-                                ("maya-hy4: CPU lane: the 4-bit copies dropped - x", False, "0")):
+    def test_measured_again_and_left_to_the_engine(self):
+        for line, want in (("maya-hy4: CPU lane: the 4-bit copies kept - x", True),
+                           ("maya-hy4: CPU lane: the 4-bit copies dropped - x", False)):
             with self.subTest(want=want), tempfile.TemporaryDirectory() as t:
                 got, c, seen, _ = self.run_check(Path(t), line)
                 self.assertIs(got, want)
                 self.assertEqual(seen["env"]["HY4_Q4X"], "2")          # (the engine's own measurement)
+                self.assertEqual(seen["env"]["HY4_Q4X_MEASURE"], "1")  # (again: not the verdict it remembers)
+                self.assertTrue(seen["env"]["HY4_Q4X_FILE"].endswith("hy4-cpu-lane.txt"))
                 self.assertEqual(seen["cmd"][1], "--serve")
-                self.assertEqual(c["env"]["HY4_Q4X"], env)
+                self.assertNotIn("HY4_Q4X", c.get("env") or {})        # (the engine remembers it, not the config)
                 self.assertEqual(c["installer"]["q4x_calibration"]["result"], "on" if want else "off")
-                self.assertFalse(maya.needs_q4x_calibration(c))         # (measured once)
+                self.assertIs(maya.q4x_config_migrate(Path(t) / "maya-hy4-flash-maya-xs.json", c), c)
 
     def test_nothing_to_decide_or_unfinished(self):
         with tempfile.TemporaryDirectory() as t:
