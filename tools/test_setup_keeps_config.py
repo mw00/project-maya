@@ -46,6 +46,11 @@ class GpusKept(unittest.TestCase):
         self.assertEqual(self.ids(maya.choose_gpus(self.a, self.three, before=[0, 1])), [0, 1])
         self.assertEqual(self.ids(maya.choose_gpus(self.a, self.three, before=[2, 0])), [2, 0])   # (any set, its order)
 
+    def test_the_setups_hand_it_over_on_the_answers(self):
+        # (set_up_* set a.gpus_before from the config before; check_pc's question reads it)
+        a = SimpleNamespace(gpus=None, gpu=None, yes=True, check=False, gpus_before=[1])
+        self.assertEqual(self.ids(maya.choose_gpus(a, self.three)), [1])
+
     def test_the_users_two_cards_case(self):
         # #1066: an RTX 5090 (GPU 0) + an RTX 4070 SUPER (GPU 1), the config on the 5090 alone
         pcs = [card(0), card(1, "RTX 4070 SUPER", 12, "89")]

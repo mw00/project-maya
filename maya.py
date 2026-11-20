@@ -1301,8 +1301,8 @@ def vs_2026(vcvars) -> bool:
     return vcvars is not None and any(p.isdigit() and 18 <= int(p) < 1000 for p in PureWindowsPath(str(vcvars)).parts)
 
 
-def check_hip_pc(a, installed=False, text_only=True, before=None) -> dict:
-    """`before`: the GPUs this model's config ran on - a setup again without --gpu / --gpus keeps them."""
+def check_hip_pc(a, installed=False, text_only=True) -> dict:
+    """a.gpus_before: the GPUs this model's config ran on - a setup again without --gpu / --gpus keeps them."""
     if not WIN and (not sys.platform.startswith("linux") or S.is_wsl()):
         fail("Maya's HIP backend runs on native Linux or Windows")
     vcvars = S.find_vcvars(cuda=False) if WIN else None
@@ -1329,7 +1329,7 @@ def check_hip_pc(a, installed=False, text_only=True, before=None) -> dict:
              f"check with {hipinfo}")
     elif WIN and len(found) > 1 and any(g.get("source") == "registry" for g in found):
         warn("these GPU numbers are Windows' order (ROCm's hipInfo was not found): HIP's own can differ")
-    kept = None if (a.gpus or a.gpu is not None) else gpus_before(before, usable)
+    kept = None if (a.gpus or a.gpu is not None) else gpus_before(getattr(a, "gpus_before", None), usable)
     if kept:                                           # (a setup again: the GPUs its config ran on, said)
         chosen = [next(g for g in usable if g["index"] == i) for i in kept]
         ok("GPUs: " + ", ".join(str(i) for i in kept) + " - as set up before (--gpu / --gpus picks others)")
@@ -1360,7 +1360,7 @@ def check_hip_pc(a, installed=False, text_only=True, before=None) -> dict:
         missing = sorted({g["arch"] for g in chosen}) if root is None else rocm_devices_missing(g["arch"] for g in chosen)
         if missing and not installed and (root is None or not getattr(a, "check", False)):   # (--check: says so below)
             install_rocm(a, chosen)
-            return check_hip_pc(a, installed=True, before=before)
+            return check_hip_pc(a, installed=True)
         if root is None:
             fail("AMD's ROCm SDK for Windows was not found after its install", f"run {ME} again")
         if missing:
@@ -1570,7 +1570,8 @@ def choose_gpus(a, found, min_cc: int = MIN_CC, family: str = "", before=None) -
     others)."""
     byid = {g["index"]: g for g in found}
     usable = [g for g in found if int(g["arch"]) >= min_cc]
-    kept = None if (a.gpus or a.gpu is not None) else gpus_before(before, usable)
+    kept = None if (a.gpus or a.gpu is not None) else \
+        gpus_before(getattr(a, "gpus_before", None) if before is None else before, usable)
     if a.gpus or a.gpu is not None:
         try:
             want = [int(x) for x in str(a.gpus).split(",") if x.strip()] if a.gpus else [a.gpu]
@@ -1649,8 +1650,8 @@ def oomd_active() -> bool:
     return S.out(["systemctl", "is-active", "systemd-oomd"]).strip() == "active"
 
 
-def check_pc(a, family: str = "glm", gguf: bool = False, ds4_quant: str = "exl3", before=None) -> dict:
-    """Step 1.  `before`: the GPUs the config of this model's setup before ran on (its answer is the default)."""
+def check_pc(a, family: str = "glm", gguf: bool = False, ds4_quant: str = "exl3") -> dict:
+    """Step 1.  a.gpus_before: the GPUs the config of this model's setup before ran on (the default answer)."""
     step(1, "checking this PC")
     ds4 = family == "deepseek"
     mm3 = family == "minimax"
@@ -1667,7 +1668,7 @@ def check_pc(a, family: str = "glm", gguf: bool = False, ds4_quant: str = "exl3"
              "Linux) - if it does not start or its answers look wrong, docs/AMD_MAYA.md says how to report it and "
              "what to use instead")
     if a.backend == "hip":
-        return check_hip_pc(a, text_only=not (mm3 or hy4), before=before)
+        return check_hip_pc(a, text_only=not (mm3 or hy4))
     if a.backend == "metal":
         if family != "glm":
             fail(f"Maya's setup runs GLM-5.3-Flash only on a Mac (not {ds4 and DS4 or mm3 and MM3 or hy4 and HY4 or QWEN_SHOWN})",
@@ -1698,7 +1699,7 @@ def check_pc(a, family: str = "glm", gguf: bool = False, ds4_quant: str = "exl3"
         say(f"    {gpu_label(g)} - " + ("can be used" if int(g["arch"]) >= max(min_cc, VALIDATED_CC) else
                                        "can be used (Pascal: experimental)" if int(g["arch"]) >= min_cc else
                                        f"too old (this model needs compute capability {min_cc / 10:.1f} or newer)"))
-    chosen = choose_gpus(a, found, min_cc, family, before)
+    chosen = choose_gpus(a, found, min_cc, family)
     archs = sorted({int(g["arch"]) for g in chosen})
     vram = sum(g["vram_gb"] for g in chosen)
     ok("using " + " + ".join(gpu_label(g) for g in chosen) +
@@ -3235,9 +3236,9 @@ def refresh_engine(cfg: dict) -> None:
              f"{ME} --setup --rebuild finds the compiler and compiles the engine again")
     gpu_ids = meta.get("gpu_ids") or (cfg.get("gpu") if isinstance(cfg.get("gpu"), list) else [0])
     # (the cards this config runs on too: the last setup may have been another model's, on other GPUs - #1066)
-    archs = sorted(set(meta["archs"]) | config_gpu_archs(cfg))
-    if archs != sorted(meta["archs"]) and not nvcc_builds(nvcc, archs):
-        archs = meta["archs"]
+    archs, extra = meta["archs"], config_gpu_archs(cfg) - {int(x) for x in meta["archs"]}
+    if extra and nvcc_builds(nvcc, sorted({int(x) for x in meta["archs"]} | extra)):
+        archs = sorted({int(x) for x in meta["archs"]} | extra)
     compile_engine(archs, gpu_ids, nvcc, meta.get("host_compiler"), llama, src, soft=True, target=target)
 
 
@@ -6832,7 +6833,8 @@ def _set_up(a, prev: dict) -> Path | None:
     inst = prev.get("installer") or {}
     prev_args = prev.get("args") or []
     prev_ctx = int(prev_args[prev_args.index("--max-context") + 1]) if "--max-context" in prev_args[:-1] else None
-    pc = check_pc(a, before=prev.get("gpu"))           # 1
+    a.gpus_before = prev.get("gpu")                    # (the GPU question's default: this config's GPUs)
+    pc = check_pc(a)                                   # 1
     metal = pc["backend"] == "metal"
     step(2, "your choices")                            # 2
     # the models folder: --models-dir, else the one set up before (a config from before the option has its data
@@ -7979,7 +7981,8 @@ def set_up_ds4(a, prev: dict) -> Path | None:
     prev_args = prev.get("args") or []
     prev_ctx = int(prev_args[prev_args.index("--max-context") + 1]) if "--max-context" in prev_args[:-1] else None
     gguf = quant not in DS4_EXL3
-    pc = check_pc(a, "deepseek", gguf, quant, before=prev.get("gpu"))   # 1
+    a.gpus_before = prev.get("gpu")                    # (the GPU question's default: this config's GPUs)
+    pc = check_pc(a, "deepseek", gguf, quant)          # 1
     step(2, "your choices")                            # 2
     ok(f"files: {Q.shown('deepseek', quant)}" + (" (Maya's quant)" if quant in DS4_MAYA else
                                                  " (a gated repo: your Hugging Face token)" if quant in DS4_ABL else
@@ -8598,7 +8601,8 @@ def set_up_mm3(a, prev: dict) -> Path | None:
     gguf = quant != "exl3"
     own = mm3_own_dir(a, quant)                        # --model-dir: an EXL3 folder of your own, not the pinned download
     need = mm3_memory_gb(quant, own)
-    pc = check_pc(a, "minimax", gguf=gguf, before=prev.get("gpu"))   # 1
+    a.gpus_before = prev.get("gpu")                    # (the GPU question's default: this config's GPUs)
+    pc = check_pc(a, "minimax", gguf=gguf)             # 1
     total, _ = mem_gb()
     vram = sum(g["vram_gb"] for g in pc["gpus"])
     name = MM3 if not gguf else Q.shown("minimax", quant)
@@ -10009,7 +10013,8 @@ def set_up_hy4(a, prev: dict) -> Path | None:
     prev_ctx = int(prev_args[prev_args.index("--max-context") + 1]) \
         if same and "--max-context" in prev_args[:-1] else None
     name = Q.shown("hy4", quant)
-    pc = check_pc(a, "hy4", before=prev.get("gpu"))    # 1
+    a.gpus_before = prev.get("gpu")                    # (the GPU question's default: this config's GPUs)
+    pc = check_pc(a, "hy4")                            # 1
     total, _ = mem_gb()
     vram = sum(g["vram_gb"] for g in pc["gpus"])
     room = hy4_engine_room(pc)                         # (Windows: what the engine's CUDA gets on each card, measured)
@@ -10607,7 +10612,8 @@ def set_up_qwen(a, prev: dict) -> Path | None:
     prev_args = prev.get("args") or []
     prev_ctx = int(prev_args[prev_args.index("--max-context") + 1]) if "--max-context" in prev_args[:-1] else None
     m = qwen_entry(quant)
-    pc = check_pc(a, "qwen", before=prev.get("gpu"))   # 1
+    a.gpus_before = prev.get("gpu")                    # (the GPU question's default: this config's GPUs)
+    pc = check_pc(a, "qwen")                           # 1
     total, _ = mem_gb()
     vram = sum(g["vram_gb"] for g in pc["gpus"])
     if vram + total < m["memory_gb"]:
