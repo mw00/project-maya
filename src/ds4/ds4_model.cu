@@ -8585,6 +8585,53 @@ struct Model::Impl {
         const char* v = std::getenv("MAYA_DS4_LOAD_DROP_CACHE");
         return v == nullptr || std::atoi(v) != 0;
     }
+    // A NUMA part of the CPU lane's copies is first touched with its node preferred, not required (os::anon_alloc): a
+    // node with too little free memory lends the rest from the other nodes before it reclaims its own file cache.  After
+    // a switch of models the cache still holds the model before - on a 2-socket host one node's part then landed mostly
+    // on the other (its workers read every weight across the sockets) and a fifth of the copies off huge pages: the
+    // load took 804 s in place of 141, decode 55 tok/s in place of 63 (2x Xeon Gold 6152, EXL3 3.5 bpw, 142.6 GB of
+    // copies, 157 GB of another model's files in the cache; with this: 175 s, 60.7).  So each such node releases the
+    // cache its part needs first (os::node_make_room: the kernel's own reclaim, of clean cache only, never more than
+    // the node holds), and the copies' mappings are touched at once (copies_touch) - the load's own reads would fill
+    // the room again before an expert read minutes later reaches its copy (16 GB of a part still crossed over that
+    // way).  The copies then lie where their workers are, on huge pages.  need: a node's bytes (every node the same);
+    // with one part there is no node of its own.  True: some node released cache.  An EXL3 pack's copies
+    // (load_experts); a GGUF's arena is filled as it was (copy_experts, MAYA_DS4_ARENA_THP).  DS4_COPY_ROOM=0
+    // (MAYA_DS4_COPY_ROOM): off - wherever memory is free, as before
+    static bool copy_room_on() {
+        const char* v = ds4_env("DS4_COPY_ROOM");
+        return v == nullptr || std::atoi(v) != 0;
+    }
+    static int copy_room_threads() { return (int) std::max(1u, std::min(16u, std::thread::hardware_concurrency() / 2)); }
+    bool copies_make_room(uint64_t need) {
+        if (NH <= 1 || need == 0 || !copy_room_on()) return false;
+        bool any = false;
+        for (int X = 0; X < NH; ++X) {
+            os::NodeMem m0;
+            if (!os::node_mem(X, m0)) return any;
+            const double tr = now_ms();
+            const uint64_t got = os::node_make_room(X, need, copy_room_threads());
+            if (got > 0)
+                std::fprintf(stderr, "ds4: NUMA node %d had %.1f GB free for its %.1f GB of the CPU lane's copies and %.1f "
+                                     "GB of file cache: %.1f GB of the cache released first, in %.1f s - the copies stay "
+                                     "on their node, on huge pages (DS4_COPY_ROOM=0: wherever memory is free)\n",
+                             X, (double) m0.free / 1e9, (double) need / 1e9, (double) m0.file / 1e9, (double) got / 1e9,
+                             (now_ms() - tr) / 1000.0);
+            any = any || got > 0;
+        }
+        return any;
+    }
+    // (after copies_make_room released cache) the copies' fresh mappings first touched now, while their nodes hold
+    // the room, a few at a time
+    static void copies_touch(const std::vector<std::pair<void*, size_t>>& maps) {
+        std::atomic<size_t> next{0};
+        std::vector<std::thread> th;
+        for (int t = 0; t < copy_room_threads(); ++t)
+            th.emplace_back([&] {
+                for (size_t i; (i = next.fetch_add(1)) < maps.size();) os::populate_fresh(maps[i].first, maps[i].second);
+            });
+        for (auto& t : th) t.join();
+    }
     bool copy_experts(const std::vector<std::pair<int, int>>& hot, std::string& err) {
         const char* require_ram = std::getenv("DS4_REQUIRE_ALL_RAM");
         const bool strict_ram = require_ram && std::atoi(require_ram) != 0;
@@ -9333,6 +9380,11 @@ struct Model::Impl {
         if (store_request() != 0.0)
             std::fprintf(stderr, "ds4: RAM store (--ssd-cache): off - it holds a GGUF's experts only\n");
         const bool drop_cache = load_drop_cache();
+        if (!file_experts && !host_maps.empty()) {   // (the CPU lane's copies: mapped a part a node, not touched yet)
+            uint64_t need = 0;
+            for (const auto& m : host_maps) need += (uint64_t) m.second;
+            if (copies_make_room(need / (uint64_t) std::max(1, NH))) copies_touch(host_maps);
+        }
         // every expert's region, in file order, by a few threads; VRAM ones through a pinned staging blob.  In place
         // (file_experts) the CPU lane's experts are not copied: the most-routed of them (the profile's share of their
         // layer) are read once, up to warm_bytes, so the page cache starts with them, and the VRAM ones' pages are
