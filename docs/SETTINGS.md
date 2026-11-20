@@ -2608,7 +2608,7 @@ A request's `spec` (0 / 1) turns the drafts off or on for it.
 | `HY4_TP_SKIP_SUM`, `HY4_TP_SKIP_COPY` | off | debugging only (the answers are no longer the model's): the host's sums, or the copies, left out - what each costs |
 | `HY4_ENGRAM_EPS` | 1.1920929e-07 | the Engram norms' eps (the graph's norms have none set: FP32's machine epsilon; `0.0078125` is BF16's, what the release takes when it runs in BF16). The pack's `--engram-eps` sets it for a model |
 | `HY4_ENGRAM_SCALES` | on when the set has them | `0`: the Engram table's row scales (`*.engram-scales.bf16` beside a table of per-row scaled codes) are not applied |
-| `HY4_EG_POPULATE` | off | `1`: the Engram table's pages are mapped into the engine in the background after the load (the whole table goes through the page cache); off, the table stays on the disk and each looked-up page is read at its first use |
+| `HY4_EG_POPULATE` | off | `1`: the Engram table's pages are mapped into the engine in the background after the load, on Linux and Windows (the whole table goes through the page cache; the load's `INFO Engram:` line says so); off, the table stays on the disk and each looked-up page is read at its first use |
 | `HY4_DRAFT_HEAD` | `q4k` | `q8`: the drafts' head in Q8_0 |
 | `HY4_GEMV_OLD`, `HY4_GROUP_SERIAL`, `HY4_TOP1_ONE`, `HY4_HC_ONE`, `HY4_ROUTER_WARP`, `HY4_TP_SUM_EACH`, `HY4_TP_HAND0`, `HY4_TP_HAND_INLINE`, `HY4_MTP_EAGER`, `HY4_EG_SERIAL`, `HY4_ATTN_OLD`, `HY4_HC_ROWS` | off | A/B switches: the earlier kernels and paths these replaced (the same results, slower) |
 | `HY4_ROUTER_SORT` | off | the router's earlier block-wide sort instead of the warp's picks (the same picks) |
