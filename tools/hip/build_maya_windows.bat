@@ -19,7 +19,7 @@ set "ROCM_F=%ROCM:\=/%"
 set "BITCODE=%ROCM_F%/lib/llvm/amdgcn/bitcode"
 set "VSWHERE=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe"
 set "VS="
-if exist "%VSWHERE%" for /f "delims=" %%V in ('"%VSWHERE%" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath') do set "VS=%%V"
+if exist "%VSWHERE%" for /f "delims=" %%V in ('"%VSWHERE%" -latest -prerelease -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath') do set "VS=%%V"
 if not defined VS (echo Visual Studio Build Tools not found & exit /b 1)
 call "%VS%\VC\Auxiliary\Build\vcvars64.bat" >nul || exit /b 1
 set "HIP_PLATFORM=amd"

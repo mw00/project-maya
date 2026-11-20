@@ -188,6 +188,24 @@ bool gemm(cublasHandle_t h, const uint16_t* W, int ldw, const uint16_t* x, int l
     return true;
 }
 
+// the tower's cuBLAS handle and its two streams, each one made where it is missing (a start that failed half way is
+// finished by the next call), the handle on the first stream
+bool make_handles(void*& blas, void*& st, void*& cs, std::string& err) {
+    if (blas == nullptr) {
+        cublasHandle_t h = nullptr;
+        VB(cublasCreate(&h));
+        blas = h;
+    }
+    for (void** p : {&st, &cs})
+        if (*p == nullptr) {
+            cudaStream_t s = nullptr;
+            VK(cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking));
+            *p = s;
+        }
+    VB(cublasSetStream((cublasHandle_t) blas, (cudaStream_t) st));   // (the workspace: the room's, set by each encode)
+    return true;
+}
+
 }  // namespace
 
 VisionTower::~VisionTower() { release(); }
@@ -379,15 +397,13 @@ bool VisionTower::load(const VisionGeo& g, int device, const Reader& read, std::
     n2_.assign(g.layers, nullptr);
     bqkv_.assign(g.layers, nullptr);
     bo_.assign(g.layers, nullptr);
-    cublasHandle_t h = nullptr;
-    VB(cublasCreate(&h));
-    blas_ = h;
-    cudaStream_t st = nullptr, cs = nullptr;
-    VK(cudaStreamCreateWithFlags(&st, cudaStreamNonBlocking));
-    VK(cudaStreamCreateWithFlags(&cs, cudaStreamNonBlocking));
-    st_ = st;
-    cs_ = cs;
-    VB(cublasSetStream(h, st));   // (the workspace: the room's, set by each encode)
+    // (the cuBLAS handle and the two streams: on AMD made at the first picture - encode - not here: on ROCm a stream
+    // takes one of the GPU's few hardware queues (GPU_MAX_HW_QUEUES, 4), and two made before the engine's own streams
+    // moved those onto shared queues on this GPU - its prompt chunks ~25% slower with the tower loaded, no picture sent.
+    // NVIDIA's streams take no such queue: made here, as before, so the handle's VRAM is taken before the plan)
+#if !defined(STRATA_USE_HIP)
+    if (!make_handles(blas_, st_, cs_, err)) return false;
+#endif
     for (int i = 0; i < 2; ++i) {
         cudaEvent_t a = nullptr, b = nullptr;
         VK(cudaEventCreateWithFlags(&a, cudaEventDisableTiming));
@@ -410,6 +426,8 @@ bool VisionTower::encode(const uint8_t* rgb, int width, int height, uint8_t* roo
         return false;
     }
     cudaSetDevice(dev_);
+    // (load's note: on AMD made at the first picture, after the engine's streams)
+    if ((blas_ == nullptr || st_ == nullptr || cs_ == nullptr) && !make_handles(blas_, st_, cs_, err)) return false;
     cur_ = room_;
     const bool ok = run(rgb, width, height, room, rows, n_h, n_w, err);
     // every copy and kernel of this encode done before the room goes back to its owner (one that failed half way too)
