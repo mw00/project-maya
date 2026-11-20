@@ -17211,8 +17211,12 @@ struct Model::Impl {
             return part_draft(y, out, conf, err, temperature, top_p, top_k, min_p, seed, counter, max_n, conf_min,
                               cum_min, min_n);
         const double t0 = now_ms();
-        // (with penalties the drafts are the drafter's argmax: its own draws know no history - verify() is as exact)
-        drafts_q = temperature > 0.0f && sample_drafts && pen_n <= 0;
+        // (with penalties the drafts are the drafter's argmax: its own draws know no history - verify() is as exact.
+        //  And in a round its caller weighs against a proposal of its own, min_n > 0 - the prompt lookup's, taken
+        //  where it starts with the drafter's first draft: the argmax there too, so that choice hangs on no draw and
+        //  the lookup works beside DS4_DSPARK_SAMPLE=1 as without it.  Which rounds those are follows from the tokens
+        //  written so far alone, so every token is still the model's own draw)
+        drafts_q = temperature > 0.0f && sample_drafts && pen_n <= 0 && min_n <= 0;
         dq_temp = temperature;
         dq_top_p = top_p;
         dq_top_k = top_k;

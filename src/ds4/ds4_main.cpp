@@ -288,7 +288,8 @@ float dspark_cum_default() {
 // millisecond from them - from this PC's round times by window size and the lookup drafts' acceptance, both measured
 // as it decodes - so a lookup window may run past DSpark's block, up to verify_max().  Only which drafts are verified
 // changes: verify() keeps a draft the drafter did not draw with probability p(d) (q a point at it), so every token is
-// still the model's own draw.  Not beside DS4_DSPARK_SAMPLE=1's drawn drafts (the choice would then hang on a draw).
+// still the model's own draw.  With DS4_DSPARK_SAMPLE=1 (drawn drafts) a round with a lookup proposal takes the
+// drafter's argmax as without it, so the choice hangs on no draw; the rounds without one draw their drafts.
 // A round with no drafter window (--dspark none or off, or DSpark resting after drafts below its confidence) weighs
 // the lookup's drafts against a plain step the same way.  --suffix-draft N: the shortest match it proposes from (3; 0:
 // off).  A proposal the policy trusts (DraftPolicy::trust: a long match whose windows measured hold) is verified alone,
