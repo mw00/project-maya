@@ -143,6 +143,66 @@ __global__ void __launch_bounds__(256) gemv_rows_kernel(const W* __restrict__ w,
     acc = block_sum(acc);
     if (threadIdx.x == 0) y[(size_t) c * ldy + row] = alpha * acc;
 }
+// (a row's 4 weights at k index i: W F32 or BF16)
+template <typename W>
+__device__ __forceinline__ float4 gemv4_w(const W* __restrict__ wr, int i) {
+    float4 wv;
+    if constexpr (sizeof(W) == 2) {
+        const uint2 p = *(const uint2*) (wr + i);
+        wv.x = __uint_as_float(p.x << 16);
+        wv.y = __uint_as_float(p.x & 0xffff0000u);
+        wv.z = __uint_as_float(p.y << 16);
+        wv.w = __uint_as_float(p.y & 0xffff0000u);
+    } else {
+        wv = *(const float4*) (wr + i);
+    }
+    return wv;
+}
+// AMD, a window's columns: gemv4_kernel's sums with x's columns staged in shared memory 1024 values at a time - the
+// block's 8 rows read x there, where every row re-read it from the caches (a verify window's 4 columns put the router's
+// F32 rows at a quarter of the memory's speed on a Radeon; one column gains nothing from it).  Each lane's steps, their
+// order and the warp's sum are gemv4_kernel's: the same bits.
+template <typename W, int NC>
+__global__ void __launch_bounds__(256) gemv4s_kernel(const W* __restrict__ w, size_t ld, int k, int n,
+                                                     const float* __restrict__ x, size_t ldx, int ncol,
+                                                     float* __restrict__ y, size_t ldy, float alpha) {
+    constexpr int KC = 1024;
+    __shared__ float4 xs[NC][KC / 4];
+    const int row = blockIdx.x * 8 + (threadIdx.x >> 5), lane = threadIdx.x & 31;
+    const int c0 = blockIdx.y * NC;
+    const bool live = row < n;
+    const W* wr = w + (size_t) (live ? row : 0) * ld;
+    float acc[NC];
+#pragma unroll
+    for (int c = 0; c < NC; ++c) acc[c] = 0.0f;
+    for (int k0 = 0; k0 < k; k0 += KC) {
+        const int kq = min(KC, k - k0) / 4;   // (k a multiple of 128)
+        __syncthreads();
+        for (int idx = (int) threadIdx.x; idx < NC * kq; idx += (int) blockDim.x) {
+            const int c = idx / kq, q = idx - c * kq;
+            xs[c][q] = c0 + c < ncol ? *(const float4*) (x + (size_t) (c0 + c) * ldx + k0 + 4 * q)
+                                     : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        }
+        __syncthreads();
+        if (!live) continue;
+#pragma unroll 4
+        for (int i = lane * 4; i < 4 * kq; i += 128) {
+            const float4 wv = gemv4_w(wr, k0 + i);
+#pragma unroll
+            for (int c = 0; c < NC; ++c)
+                if (c0 + c < ncol) {
+                    const float4 xv = xs[c][i / 4];
+                    acc[c] = fmaf(wv.w, xv.w, fmaf(wv.z, xv.z, fmaf(wv.y, xv.y, fmaf(wv.x, xv.x, acc[c]))));
+                }
+        }
+    }
+    if (!live) return;
+#pragma unroll
+    for (int c = 0; c < NC; ++c) {
+        const float v = warp_sum(acc[c]);
+        if (lane == 0 && c0 + c < ncol) y[(size_t) (c0 + c) * ldy + row] = alpha * v;
+    }
+}
 // ... 16-byte loads (4 values a lane a step, rows and columns 16-byte aligned, k a multiple of 128): a column's sums in
 // the same order whatever NC, so a window's rows are a token's bits
 template <typename W, int NC>
@@ -186,6 +246,17 @@ void gemv(const W* w, size_t ld, int k, int n, const float* x, size_t ldx, int n
     static const bool old = std::getenv("HY4_GEMV_OLD") != nullptr;
     const bool v4 = !old && n >= 128 && k % 128 == 0 && ld % 8 == 0 && ldx % 4 == 0 && ((uintptr_t) w & 15) == 0 &&
                     ((uintptr_t) x & 15) == 0;
+#if defined(STRATA_USE_HIP)
+    if (v4 && ncol > 1) {   // (AMD, a window's columns: x staged in shared memory - the same sums; one column: below)
+        const dim3 b(256), g1((unsigned) ((n + 7) / 8), 1);
+        if (ncol <= 4) gemv4s_kernel<W, 4><<<g1, b, 0, s>>>(w, ld, k, n, x, ldx, ncol, y, ldy, alpha);
+        else
+            gemv4s_kernel<W, 8><<<dim3((unsigned) ((n + 7) / 8), (unsigned) ((ncol + 7) / 8)), b, 0, s>>>(
+                w, ld, k, n, x, ldx, ncol, y, ldy, alpha);
+        check("gemv4s");
+        return;
+    }
+#endif
     if (v4) {
         const dim3 b(256), g1((unsigned) ((n + 7) / 8), 1);
         if (ncol == 1) gemv4_kernel<W, 1><<<g1, b, 0, s>>>(w, ld, k, n, x, ldx, ncol, y, ldy, alpha);
