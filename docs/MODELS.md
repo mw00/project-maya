@@ -9,6 +9,7 @@ special about it. Back to the [README](../README.md).
 - [DeepSeek-V4.1-Flash-1017](#deepseek-v41-flash-1017)
 - [MiniMax-M3.1-Flash](#minimax-m31-flash)
 - [Hy4-Flash](#hy4-flash)
+- [Inkling-2-Small (by hand, for now)](#inkling-2-small-by-hand-for-now)
 - [Community quants of GLM-5.3-Flash](#community-quants-of-glm-53-flash)
 
 ## How the quants are named
@@ -293,6 +294,19 @@ Other GGUF sets of the model are not offered by the setup; `tools/hy4/pack_gguf.
 ([SETTINGS.md](SETTINGS.md#hy4-flash)).
 
 Its engine settings: [SETTINGS.md](SETTINGS.md#hy4-flash).
+
+## Inkling-2-Small (by hand, for now)
+
+**[Inkling-2-Small](https://huggingface.co/thinkingmachines/Inkling-2-Small)** (thinkingmachines; 594 B, ~17 B active,
+Apache 2.0) runs on its own engine, `maya-ik2` (#974), from unsloth's GGUFs as they are - not from the setup yet: a
+tokenizer folder and a run config by hand, then `serve/server.py` ([INKLING2.md](INKLING2.md) section 6).
+
+| Files | Size | Runs on |
+| --- | --- | --- |
+| [unsloth's UD-Q4_K_XL](https://huggingface.co/unsloth/Inkling-2-Small-GGUF) (NVFP4 experts, layers 0-39) | 330 GiB; the experts ~323 GiB of pinned RAM | NVIDIA, Ampere on (CUDA), Linux; one or two GPUs. Run on H200 (35 tok/s) and RTX PRO 6000 (22; two: 42) |
+| unsloth's UD-Q3_K_XL (IQ3_XXS / IQ4_XS experts) | 266 GiB; ~260 GiB of pinned RAM | the same; H200: 44.6 tok/s |
+
+Text only, one request at a time. Its engine settings: [SETTINGS.md](SETTINGS.md#inkling-2-small).
 
 ## Community quants of GLM-5.3-Flash
 
