@@ -214,6 +214,7 @@ Máquinas reais medidas por nossos usuários, a maioria com `./maya.sh --bench` 
 | Máquina | Modelo | Decodificação (escrevendo a resposta) | Prefill (lendo o seu prompt) | Por |
 | --- | --- | ---: | ---: | --- |
 | **3x Tesla V100 32 GB** (PCIe 3.0 x16 cada), 2x Xeon Gold 6138, 183 GB de RAM | Maya-XS / Maya-S, contexto de 32K, drafting MTP | **88,7 / 84,2 tokens/s** | 1607 / 1566 tokens/s | mantenedor (v1.1.68) |
+| **3x RX 7900 XTX 24 GB** (PCIe 3.0 x8/x16/x8), i9-10980XE, 188 GB de RAM, Linux | Maya-S, contexto de 32K, tensor parallel em 3 GPUs | 43,9-48,2 tokens/s | 1053 tokens/s | @Antero128 (v1.1.68, #1055) |
 
 </details>
 

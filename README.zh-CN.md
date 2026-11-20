@@ -213,6 +213,7 @@ Maya 的量化版本由各模型公开发布的权重制作，并与原版对比
 | 机器 | 模型 | 解码 (写出回答) | 预填充 (读取提示) | 提交者 |
 | --- | --- | ---: | ---: | --- |
 | **3x Tesla V100 32 GB** (各 PCIe 3.0 x16)、2x Xeon Gold 6138、183 GB 内存 | Maya-XS / Maya-S，32K 上下文，MTP 草稿 | **88.7 / 84.2 tokens/s** | 1607 / 1566 tokens/s | 维护者 (v1.1.68) |
+| **3x RX 7900 XTX 24 GB** (PCIe 3.0 x8/x16/x8)、i9-10980XE、188 GB 内存、Linux | Maya-S，32K 上下文，3 卡张量并行 | 43.9-48.2 tokens/s | 1053 tokens/s | @Antero128 (v1.1.68, #1055) |
 
 </details>
 
