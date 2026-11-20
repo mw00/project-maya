@@ -488,6 +488,7 @@ model API: `partial_thinking` - when it was still thinking), less the last few t
 back. The message says how many tokens the answer had and why it stopped: after a GPU's fault on DeepSeek, the call
 that failed and the position in the context (what the engine prints on the console as it ends); otherwise that the
 reason is in the engine's log. After a GPU's fault the engine ends, and the next request starts a fresh one.
+
 ## Server configuration
 
 These settings are top-level fields in the run configuration, not environment variables.
