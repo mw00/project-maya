@@ -2498,6 +2498,22 @@ struct Model::Impl {
                                               CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT) == CUBLAS_STATUS_SUCCESS;
         }
         k::q8_heads(x, ldt, ldh, T, H, M.k, gp.xq, gp.xd, gp.s);
+#if defined(STRATA_USE_HIP)
+        {   // (AMD: every head in one launch - the same rows' sums as the jobs below, 8 heads a launch)
+            iq::MvJob j;
+            j.w = M.w;
+            j.ld = M.ld;
+            j.type = M.type;
+            j.k = M.k;
+            j.n = M.n;
+            j.ncol = T;
+            j.xq = gp.xq;
+            j.xd = gp.xd;
+            j.y = y;
+            j.ycs = ldyt;
+            if (iq::mv_heads(j, H, (size_t) M.n * M.ld, (size_t) T * M.k, (size_t) T * M.k / 32, ldyh, gp.s)) return true;
+        }
+#endif
         std::vector<iq::MvJob> jobs((size_t) H);
         for (int h = 0; h < H; ++h) {
             iq::MvJob& j = jobs[(size_t) h];

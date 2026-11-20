@@ -1304,6 +1304,47 @@ __global__ void __launch_bounds__(kThreads) mv_kernel(const Jobs J) {
         }
 }
 
+// mv_kernel for H jobs alike but for their offsets (a 3D matrix's heads: grid y = the head): head h's job is b0 with w,
+// xq, xd and y moved h strides - one launch for every head where mv's take kMaxJobs a launch.  A row's arithmetic is
+// mv_kernel's, line for line: the same bits.
+template <int T, int NC>
+__global__ void __launch_bounds__(kThreads) mv_heads_kernel(const MvJob b0, size_t w_st, size_t xq_st, size_t xd_st,
+                                                            size_t y_st) {
+    pdl_wait();
+    pdl_trigger();
+    __shared__ uint32_t tab[Ty<T>::TAB > 0 ? Ty<T>::TAB : 1];
+    load_tab<T>(tab);
+    __syncthreads();
+    MvJob b = b0;
+    b.w += (size_t) blockIdx.y * w_st;
+    b.xq += (size_t) blockIdx.y * xq_st;
+    b.xd += (size_t) blockIdx.y * xd_st;
+    b.y += (size_t) blockIdx.y * y_st;
+    const int row = blockIdx.x * kWarps + (threadIdx.x >> 5), lane = threadIdx.x & 31;
+    if (row >= b.n) return;
+    const uint8_t* w = b.w + (size_t) row * b.ld;
+    const int nsb = b.k / 32;
+    float acc[NC];
+#pragma unroll
+    for (int c = 0; c < NC; ++c) acc[c] = 0.0f;
+    for (int kb = lane; kb < nsb; kb += 32) {
+        Sub s;
+        decode<T>(w, kb, tab, s);
+#pragma unroll
+        for (int c = 0; c < NC; ++c)
+            if (c < b.ncol) {
+                const int4* xp = (const int4*) (b.xq + (size_t) c * b.k + (size_t) kb * 32);
+                acc[c] = fmaf(b.xd[(size_t) c * nsb + kb], sub_dot<T, kMinMV>(s, xp[0], xp[1]), acc[c]);
+            }
+    }
+#pragma unroll
+    for (int c = 0; c < NC; ++c)
+        if (c < b.ncol) {
+            const float v = warp_sum(acc[c]);
+            if (lane == 0) b.y[c * b.ycs + row] = b.alpha * v + (b.bias != nullptr ? b.bias[row] : 0.0f);
+        }
+}
+
 // ---------------------------------------------------------------- the prompt sets' light experts
 // A set's experts of a few rows (<= kLightRows: a prompt of a few hundred tokens spreads ~10 over most of 384 experts)
 // in the token kernels' form: each weight sub-block decoded once and dotted with every row's int8 input (rounded per 32
@@ -1817,6 +1858,13 @@ void mv_nc(const Jobs& J, int nj, int max_n, int max_c, cudaStream_t s) {
     if (max_c <= 1) pdl_launch(mv_kernel<T, 1>, grid, kThreads, 0, s, J);
     else if (max_c <= 4) pdl_launch(mv_kernel<T, 4>, grid, kThreads, 0, s, J);
     else pdl_launch(mv_kernel<T, 16>, grid, kThreads, 0, s, J);
+}
+template <int T>
+void mv_heads_nc(const MvJob& b, int H, size_t ws, size_t xs, size_t ds, size_t ys, cudaStream_t s) {
+    const dim3 grid((unsigned) ((b.n + kWarps - 1) / kWarps), (unsigned) H);
+    if (b.ncol <= 1) pdl_launch(mv_heads_kernel<T, 1>, grid, kThreads, 0, s, b, ws, xs, ds, ys);
+    else if (b.ncol <= 4) pdl_launch(mv_heads_kernel<T, 4>, grid, kThreads, 0, s, b, ws, xs, ds, ys);
+    else pdl_launch(mv_heads_kernel<T, 16>, grid, kThreads, 0, s, b, ws, xs, ds, ys);
 }
 
 }  // namespace
@@ -2419,6 +2467,14 @@ bool mv(const MvJob* jobs, int n, cudaStream_t s) {
             DS4_IQ_SWITCH_MV(t, MV_)
 #undef MV_
         }
+    return true;
+}
+bool mv_heads(const MvJob& b, int H, size_t w_stride, size_t xq_stride, size_t xd_stride, size_t y_stride,
+              cudaStream_t s) {
+    if (H <= 0 || b.n <= 0 || b.k % block_values(b.type) != 0 || b.ncol < 1 || b.ncol > 16) return false;
+#define MVH_(T) mv_heads_nc<T>(b, H, w_stride, xq_stride, xd_stride, y_stride, s)
+    DS4_IQ_SWITCH_MV(b.type, MVH_)
+#undef MVH_
     return true;
 }
 

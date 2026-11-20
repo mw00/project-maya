@@ -163,6 +163,10 @@ struct MvJob {
     float alpha = 1.0f;
 };
 bool mv(const MvJob* jobs, int n, cudaStream_t s);
+/// H jobs alike but for their offsets, in one launch (a 3D matrix's heads): job h = b with w + h w_stride (bytes),
+/// xq + h xq_stride, xd + h xd_stride, y + h y_stride; each row's sums as mv's.  false: a type or size mv refuses.
+bool mv_heads(const MvJob& b, int H, size_t w_stride, size_t xq_stride, size_t xd_stride, size_t y_stride,
+              cudaStream_t s);
 
 /// (tests) every value of n rows of k (rows row_bytes(type, k) apart, on the device) as the kernels decode them: sub =
 /// the token / window / light kernels' codes times their scales (d s q - m; IQ1_M through the persistent kernels'
