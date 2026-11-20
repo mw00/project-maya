@@ -1145,7 +1145,8 @@ int main(int argc, char** argv) {
     int n_more = 1, need = 1;   // (--draft-more / --draft-streak: the MTP block's drafts)
     float sure = 0.8f;
     std::string images, enc_rgb, enc_size, enc_out, kld_save;
-    int kv_stream = 0;   // --kv-streaming on: the indexed layers' rows beyond --kv-resident positions in host memory
+    int kv_stream = -1;  // --kv-streaming on: the indexed layers' rows beyond --kv-resident positions in host memory
+                         // (auto, the default: where the context or more experts need it - see Options::kv_streaming)
     long long kv_res_arg = 0;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];

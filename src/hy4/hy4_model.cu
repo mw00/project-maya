@@ -1064,6 +1064,20 @@ struct Model::Impl {
         for (int il = 0; il < g.n_layer; ++il) nix += g.swa[(size_t) il] ? 0 : 1;
         return (double) nix * (double) o.max_ctx * (double) kv_rb();
     }
+    // (--kv-streaming auto) whether the RAM holds `host` bytes of rows beside the system's headroom (the larger of
+    // 8 GB and a tenth of the RAM; HY4_RAM_HEADROOM_GB sets it) - left: what it has for them
+    static bool kv_ram_holds(double host, double& left) {
+        const uint64_t avail = ram_available(), ram = ram_total();
+        double head = std::max(8.0 * 1073741824.0, 0.1 * (double) ram);
+        if (const char* h = std::getenv("HY4_RAM_HEADROOM_GB")) head = std::max(0.0, std::atof(h)) * 1073741824.0;
+        left = avail == 0 ? 1e30 : std::max(0.0, (double) avail - head);
+        return avail == 0 || left >= host;
+    }
+    // (--kv-streaming auto: streaming for more routed experts in VRAM too - HY4_KV_MORE=0: only where nothing fits)
+    static bool kv_more_on() {
+        const char* e = std::getenv("HY4_KV_MORE");
+        return !(e && *e && std::atoi(e) == 0);
+    }
     // (the indexer's pooled keys and its value | gate ring: F16 with 8-bit rows - the reference's own cache type -,
     //  else F32)
     size_t pool_b() const { return kv_q8 ? 2 : 4; }
@@ -1537,6 +1551,41 @@ struct Model::Impl {
                         kv_q8 = false;
                         tn += "; in 8-bit rows: " + t8;
                     }
+                    // (--kv-streaming auto: the indexed layers' rows beyond the ring in RAM - one copy there, shared by
+                    //  the members - before a smaller group or the CPU lane: F16 rows, then 8-bit where --kv auto allows)
+                    if (o.kv_streaming < 0 && !kv_auto_set && o.kv_resident == 0 && kv_auto_n > 0) {
+                        o.kv_resident = kv_auto_n;
+                        double left = 0;
+                        if (kv_res() > 0) {
+                            const double pb = (double) pick_bytes();
+                            for (double& f : free_b) f -= pb;
+                            const bool was8 = kv_q8;
+                            std::string ts;
+                            bool ok_s = false;
+                            for (int q = 0; q < 2 && !ok_s; ++q) {
+                                if (q == 1) {
+                                    if (was8 || o.kv >= 0 || !kv_q8_rows()) break;
+                                    kv_q8 = true;
+                                }
+                                ok_s = kv_ram_holds(kv_host_bytes(), left) && split(ts);
+                            }
+                            if (ok_s) {
+                                kv_auto_set = true;
+                                char sb[360];
+                                std::snprintf(sb, sizeof sb, "INFO KV streaming (auto): tensor parallel over %d GPUs holds "
+                                              "this context with the indexed layers' rows beyond the newest %d positions "
+                                              "in RAM (%.2f GB, one copy for the members)%s", n, kv_res(),
+                                              kv_host_bytes() / 1e9, kv_q8 && !was8 ? ", in 8-bit rows (--kv auto)" : "");
+                                info.push_back(sb);
+                                if (!terr.empty())
+                                    info.push_back("INFO tensor parallel over " + std::to_string(n) + " GPUs (--tp auto): " + terr);
+                                return true;
+                            }
+                            kv_q8 = was8;
+                            for (double& f : free_b) f += pb;
+                        }
+                        o.kv_resident = 0;
+                    }
                     terr += (terr.empty() ? "" : "; ") + tn;
                 }
                 N = n_all;   // (none held it: what follows weighs the whole group again)
@@ -1559,6 +1608,44 @@ struct Model::Impl {
                     const bool fit_l = tensor_split(ndev, devs, fb, tl, N, false, true);
                     long long held = 0;
                     for (int c : tp_cap) held += c;
+                    // (--kv-streaming auto: the indexed layers' rows beyond the ring in RAM too where the members then
+                    //  hold more of every layer's experts)
+                    if (fit_l && asked && held < g.n_expert && o.kv_streaming < 0 && !kv_auto_set && o.kv_resident == 0 &&
+                        kv_auto_n > 0 && kv_more_on()) {
+                        o.kv_resident = kv_auto_n;
+                        double left = 0;
+                        bool took = false;
+                        if (kv_res() > 0 && kv_ram_holds(kv_host_bytes(), left)) {
+                            const double pb = (double) pick_bytes();
+                            undo();
+                            std::vector<double> fs = free_b;
+                            for (double& f : fs) f -= pb;
+                            std::string ts;
+                            const bool fit_s = tensor_split(ndev, devs, fs, ts, N, false, true);
+                            long long held2 = 0;
+                            for (int c : tp_cap) held2 += c;
+                            if (fit_s && held2 > held) {
+                                char sb[360];
+                                std::snprintf(sb, sizeof sb, "INFO KV streaming (auto): the indexed layers' rows beyond "
+                                              "the newest %d positions in RAM (%.2f GB, one copy for the members) give the "
+                                              "group %lld of every layer's routed experts in VRAM instead of %lld", kv_res(),
+                                              kv_host_bytes() / 1e9, held2, held);
+                                info.push_back(sb);
+                                took = kv_auto_set = true;
+                                held = held2;
+                                fb = fs;
+                                tl = ts;
+                                for (double& f : free_b) f -= pb;
+                            }
+                        }
+                        if (!took) {
+                            o.kv_resident = 0;
+                            undo();
+                            fb = free_b;
+                            tl.clear();
+                            tensor_split(ndev, devs, fb, tl, N, false, true);
+                        }
+                    }
                     const double pct = 100.0 * (double) std::min<long long>(held, g.n_expert) / g.n_expert;
                     if (fit_l && !asked) {
                         char lb[240];
@@ -1685,15 +1772,13 @@ struct Model::Impl {
                     kv_q8 = sp.q8;
                     const double host = kv_host_bytes();
                     kv_q8 = was;
-                    const uint64_t avail = ram_available(), ram = ram_total();
-                    double head = std::max(8.0 * 1073741824.0, 0.1 * (double) ram);
-                    if (const char* h = std::getenv("HY4_RAM_HEADROOM_GB")) head = std::max(0.0, std::atof(h)) * 1073741824.0;
-                    ram_ok = avail == 0 || (double) avail - head >= host;
+                    double left = 0;
+                    ram_ok = kv_ram_holds(host, left);
                     if (!ram_ok) {
                         char nb[320];
                         std::snprintf(nb, sizeof nb, "NOTE KV streaming not taken: the rows of a context of %lld tokens "
                                       "need %.1f GB of RAM, %.1f GB are available beside the system's headroom",
-                                      (long long) o.max_ctx, host / 1e9, std::max(0.0, (double) avail - head) / 1e9);
+                                      (long long) o.max_ctx, host / 1e9, left / 1e9);
                         info.push_back(nb);
                     }
                 }
@@ -1745,6 +1830,46 @@ struct Model::Impl {
             vis_room = 0;
             o.vision = false;
             if (vis_tok >= 0) pk.eg.token_map[(size_t) vis_tok] = vis_tok_map;
+        }
+        // the largest share of every layer's routed experts the GPUs hold (at most rho; -1: not even none)
+        auto most = [&](double r) {
+            if (place(r, false)) return r;
+            if (!place(0.0, false)) return -1.0;
+            double lo = 0.0, hi = r;
+            for (int it = 0; it < 30; ++it) {
+                const double mid = 0.5 * (lo + hi);
+                (place(mid, false) ? lo : hi) = mid;
+            }
+            return lo;
+        };
+        // --kv-streaming auto (the default): the cache fits, the routed experts do not all - the indexed layers' rows
+        // beyond the ring in host memory too where that gives every layer more experts in VRAM and the RAM holds the
+        // rows.  Nothing is read from the host until a conversation passes the ring; the same bits either way
+        // (HY4_KV_MORE=0: only where nothing else fits, as before)
+        if (o.kv_streaming < 0 && !kv_auto_set && o.kv_resident == 0 && kv_auto_n > 0 && kv_more_on()) {
+            const double ra = most(rho);
+            const int na = ra < 0 ? -1 : (int) std::floor(ra * g.n_expert);
+            o.kv_resident = kv_auto_n;
+            if (ra >= 0 && ra < cap && kv_res() > 0) {
+                const double pb = (double) pick_bytes(), rows0 = (double) ix_rows_bytes();
+                for (double& f : free_b) f -= pb;
+                const double rs = most(rho);
+                const int ns = rs < 0 ? -1 : (int) std::floor(rs * g.n_expert);
+                double left = 0;
+                const double host = kv_host_bytes();
+                if (ns > na && kv_ram_holds(host, left)) {
+                    kv_auto_set = true;
+                    char sb[400];
+                    std::snprintf(sb, sizeof sb, "INFO KV streaming (auto): the indexed layers' rows beyond the newest %d "
+                                  "positions in RAM (%.2f GB) give every layer %d routed experts in VRAM instead of %d "
+                                  "(%.2f GB of VRAM a layer's rows -> %.2f GB)", kv_res(), host / 1e9, ns, na,
+                                  rows0 / 1e9, (double) ix_rows_bytes() / 1e9);
+                    info.push_back(sb);
+                } else {
+                    for (double& f : free_b) f += pb;
+                }
+            }
+            if (!kv_auto_set) o.kv_resident = 0;
         }
         if (!place(rho, false)) {
             double lo = 0.0, hi = rho;
