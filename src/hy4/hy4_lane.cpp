@@ -236,6 +236,7 @@ Lane::~Lane() {
     for (auto& t : p->th) t.join();
 }
 int Lane::threads() const { return (int) p->th.size(); }
+bool Lane::idle() const { return !p->th.empty() && p->sleepers.load() == (int) p->th.size(); }
 int Lane::nodes() const { return p->n_nodes; }
 
 int Lane::node_of_page(const void* ptr) {
@@ -318,9 +319,29 @@ bool CpuExperts::init(int tg, int td, int n_embd, int n_ff, std::string& err) {
     return true;
 }
 
+bool CpuExperts::q4x_can() {
+    if (!iqc::iq_cpu_q4x_ok(f.tg) || !iqc::iq_cpu_q4x_ok(f.td) || f.n_embd % 256 || f.n_ff % 256) return false;
+    q4x_gu = iqc::iq_cpu_q4x_row_bytes(f.n_embd) * (size_t) f.n_ff;
+    q4x_d = iqc::iq_cpu_q4x_row_bytes(f.n_ff) * (size_t) f.n_embd;
+    return true;
+}
+
+bool CpuExperts::q4x_make(int e) {
+    if (!q4x || q4x_gu == 0 || q4x->p[(size_t) e].load(std::memory_order_acquire) != nullptr) return false;
+    std::unique_ptr<uint8_t[]> m(new (std::nothrow) uint8_t[2 * q4x_gu + q4x_d + 32]);
+    if (!m) return false;
+    uint8_t* b = (uint8_t*) (((uintptr_t) m.get() + 31) & ~(uintptr_t) 31);   // (32-byte rows)
+    iqc::iq_cpu_q4x_convert(gate + (size_t) e * g_stride, f.gu_row, f.n_ff, f.n_embd, b);
+    iqc::iq_cpu_q4x_convert(up + (size_t) e * g_stride, f.gu_row, f.n_ff, f.n_embd, b + q4x_gu);
+    iqc::iq_cpu_q4x_convert(down + (size_t) e * d_stride, f.d_row, f.n_embd, f.n_ff, b + 2 * q4x_gu);
+    q4x->owned.push_back(std::move(m));
+    q4x->p[(size_t) e].store(b, std::memory_order_release);
+    return true;
+}
+
 namespace {
 
-constexpr int kMaxNt = 64;       // tokens one call's rows take at most (a group's: its weights read once for them)
+constexpr int kMaxNt = 64;      // tokens one call's rows take at most (a group's: its weights read once for them)
 int group_nt() {                 // (HY4_LANE_NT: a group's tokens, 1 .. kMaxNt; default 32)
     static const int v = [] {
         const char* e = std::getenv("HY4_LANE_NT");
@@ -329,10 +350,11 @@ int group_nt() {                 // (HY4_LANE_NT: a group's tokens, 1 .. kMaxNt;
     }();
     return v;
 }
-constexpr int kRowChunk = 128;   // rows a work item
+constexpr int kRowChunk = 128;   // rows a work item (64 and 32: slower on Sun's Zen 5)
 
 struct Grp {
-    int e, a, c;   // the expert, its first entry in Scratch::order, how many
+    int e, a, c;                    // the expert, its first entry in Scratch::order, how many
+    const uint8_t* q4 = nullptr;    // (the expert's 4-bit copy when it has one: the same bits, faster)
 };
 struct Scratch {
     std::vector<Grp> groups;          // the entries by expert, a group up to kMaxNt of them
@@ -342,6 +364,11 @@ struct Scratch {
 };
 
 }  // namespace
+
+LaneCount& lane_count() {
+    static LaneCount c;
+    return c;
+}
 
 LaneProf& lane_prof() {
     static LaneProf p;
@@ -387,6 +414,21 @@ uint64_t ram_available() {
     const std::string m = read_file("/proc/meminfo");
     const size_t at = m.find("MemAvailable:");
     return at == std::string::npos ? 0 : (uint64_t) std::strtoull(m.c_str() + at + 13, nullptr, 10) * 1024;
+#endif
+}
+
+void unpin_this_thread() {
+#if defined(__linux__)
+    cpu_set_t all;
+    if (process_mask(all)) pthread_setaffinity_np(pthread_self(), sizeof all, &all);
+#endif
+}
+
+void lower_this_thread() {
+#if defined(_WIN32)
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+#elif defined(__linux__)
+    (void) nice(10);   // (Linux: a thread's own nice value)
 #endif
 }
 
@@ -469,7 +511,8 @@ void cpu_experts(Lane& lane, const CpuExperts& ex, const std::vector<CpuEntry>& 
         const int e = entries[(size_t) sc.order[(size_t) i]].e;
         int j = i;
         while (j < n && entries[(size_t) sc.order[(size_t) j]].e == e) ++j;
-        for (int a = i; a < j; a += gn) groups.push_back({e, a, std::min(gn, j - a)});
+        const uint8_t* q4 = ex.q4x ? ex.q4x->p[(size_t) e].load(std::memory_order_acquire) : nullptr;
+        for (int a = i; a < j; a += gn) groups.push_back({e, a, std::min(gn, j - a), q4});
         i = j;
     }
     const int gu_chunks = (F + kRowChunk - 1) / kRowChunk, dn_chunks = (E + kRowChunk - 1) / kRowChunk;
@@ -492,8 +535,11 @@ void cpu_experts(Lane& lane, const CpuExperts& ex, const std::vector<CpuEntry>& 
             act[k] = sc.xq.data() + (size_t) entries[(size_t) id].t * f.act_bytes;
             ff[k] = sc.h.data() + (size_t) id * F;
         }
-        iqc::iq_cpu_gate_up(f, ex.gate + (size_t) gr.e * ex.g_stride, ex.up + (size_t) gr.e * ex.g_stride, act, gr.c,
-                            ff, r0, r1, ex.limit);
+        if (gr.q4)
+            iqc::iq_cpu_q4x_gate_up(f, gr.q4, gr.q4 + ex.q4x_gu, act, gr.c, ff, r0, r1, ex.limit);
+        else
+            iqc::iq_cpu_gate_up(f, ex.gate + (size_t) gr.e * ex.g_stride, ex.up + (size_t) gr.e * ex.g_stride, act,
+                                gr.c, ff, r0, r1, ex.limit);
     }, gu_node.empty() ? nullptr : &gu_node);
     // each entry's h quantized once (each down item quantized its entries' h before: 12 times over in a decode)
     sc.hq.resize((size_t) n * f.h_bytes);
@@ -515,7 +561,10 @@ void cpu_experts(Lane& lane, const CpuExperts& ex, const std::vector<CpuEntry>& 
             hq[k] = sc.hq.data() + (size_t) id * f.h_bytes;
             y[k] = sc.y.data() + (size_t) id * E;
         }
-        iqc::iq_cpu_down(f, ex.down + (size_t) gr.e * ex.d_stride, hq, gr.c, y, r0, r1);
+        if (gr.q4)
+            iqc::iq_cpu_q4x_down(f, gr.q4 + 2 * ex.q4x_gu, hq, gr.c, y, r0, r1);
+        else
+            iqc::iq_cpu_down(f, ex.down + (size_t) gr.e * ex.d_stride, hq, gr.c, y, r0, r1);
     }, dn_node.empty() ? nullptr : &dn_node);
     const double tp3 = clk();
     // each token's weighted sum, in its entries' order
@@ -525,6 +574,14 @@ void cpu_experts(Lane& lane, const CpuExperts& ex, const std::vector<CpuEntry>& 
         const float* y = sc.y.data() + (size_t) i * E;
         for (int d = 0; d < E; ++d) o[d] += e.w * y[d];
     }
+    {
+        long long nq = 0;
+        for (const Grp& gr : groups)
+            if (gr.q4) nq += gr.c;
+        LaneCount& lc = lane_count();
+        lc.entries.fetch_add(n, std::memory_order_relaxed);
+        if (nq) lc.q4x.fetch_add(nq, std::memory_order_relaxed);
+    }
     if (lp.on) {
         lp.prep_s += tp1 - tp0;
         lp.gate_up_s += tp2 - tp1;
@@ -533,6 +590,53 @@ void cpu_experts(Lane& lane, const CpuExperts& ex, const std::vector<CpuEntry>& 
         ++lp.calls;
         lp.entries += n;
     }
+}
+
+bool q4x_probe(Lane& lane, const CpuExperts& ex0, int n_expert, double& ms_file, double& ms_q4x) {
+    ms_file = ms_q4x = 0.0;
+    CpuExperts ex = ex0;   // (the same file rows; copies of its own)
+    if (!ex.q4x_can() || n_expert < 16) return false;
+    // up to 64 experts spread over the layer (the file's rows read once first: the page cache timed, not the disk)
+    const int n_exp = std::min(64, n_expert);
+    std::vector<int> pick((size_t) n_exp);
+    for (int i = 0; i < n_exp; ++i) pick[(size_t) i] = (int) ((int64_t) i * n_expert / n_exp);
+    ex.q4x = std::make_shared<Q4xSet>(n_expert);
+    volatile uint8_t sink = 0;
+    for (int e : pick) {
+        for (size_t b = 0; b < ex.g_stride; b += 4096) sink = sink ^ ex.gate[(size_t) e * ex.g_stride + b] ^ ex.up[(size_t) e * ex.g_stride + b];
+        for (size_t b = 0; b < ex.d_stride; b += 4096) sink = sink ^ ex.down[(size_t) e * ex.d_stride + b];
+        if (!ex.q4x_make(e)) return false;
+    }
+    const int E = ex.f.n_embd;
+    std::vector<float> x((size_t) E), out((size_t) E);
+    uint32_t s = 2463534242u;
+    auto rnd = [&s] {
+        s ^= s << 13;
+        s ^= s >> 17;
+        s ^= s << 5;
+        return s;
+    };
+    for (float& v : x) v = ((float) (rnd() % 2001) - 1000.0f) * 1e-3f;
+    std::vector<CpuEntry> ent;
+    double best[2] = {1e30, 1e30};
+    const std::shared_ptr<Q4xSet> set = ex.q4x;
+    for (int r = 0; r < 24; ++r) {
+        if (r % 2 == 0) {   // (the same 16 experts for both forms)
+            std::vector<int> p = pick;
+            for (int i = 0; i < 16 && i < n_exp; ++i) std::swap(p[(size_t) i], p[(size_t) (i + rnd() % (uint32_t) (n_exp - i))]);
+            ent.clear();
+            for (int i = 0; i < 16 && i < n_exp; ++i) ent.push_back({0, p[(size_t) i], 0.25f});
+        }
+        const int form = r % 2;
+        ex.q4x = form ? set : nullptr;
+        const auto t0 = std::chrono::steady_clock::now();
+        cpu_experts(lane, ex, ent, x.data(), 1, out.data());
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        if (r >= 4) best[form] = std::min(best[form], ms);
+    }
+    ms_file = best[0];
+    ms_q4x = best[1];
+    return true;
 }
 
 }  // namespace hy4

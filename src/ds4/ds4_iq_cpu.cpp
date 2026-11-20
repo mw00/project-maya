@@ -396,6 +396,129 @@ IQ_AVX2 void iq_rows_avx2(const uint8_t* w, size_t rb, int nb, const block_q8_K*
     }
 }
 
+// ---- IQ2_XXS re-coded at 4 bits a weight (the CPU lane's hottest experts, iq_cpu_q4x_*).  Every IQ2_XXS weight is
+// one of six values (a grid byte 8, 25 or 43 with its sign), so a nibble holds it: codes 0-2 = +8 / +25 / +43, 3-5 =
+// their negatives.  A row of n values: its blocks' codes (128 bytes a block: 32-byte pairs of chunks, the low nibble
+// of byte w weight w of the pair's first chunk, the high nibble of its second), then the chunks' scales 2 s + 1 (8
+// bytes a block), then the blocks' F16 d, padded to 32 bytes.  The rows are a nibble mask and a byte shuffle a 32
+// values where the grid form is ~60 instructions a 64 (index fields, table loads, sign lookups), then the same per-
+// token step as the one-table form ((q8 + 128) x signed value less 128 x the value's pair sums): the same exact int32
+// lanes, the same float steps - ggml-cpu's dot to the bit (q4x_check), at twice the bytes.
+size_t q4x_row_bytes(int n) {
+    const size_t nb = (size_t) n / QK_K;
+    return (nb * (128 + 8 + 2) + 31) & ~(size_t) 31;
+}
+// a grid entry's 8 magnitude codes (0-2, a byte each), a sign index's 8 sign offsets (3 where the weight is negative)
+alignas(64) uint64_t g_q4m[256], g_q4s[128];
+void build_q4x() {
+    for (int g = 0; g < 256; ++g) {
+        uint64_t v = 0;
+        for (int j = 0; j < 8; ++j) {
+            const int gb = (int) ((iq2xxs_grid[g] >> (8 * j)) & 255u);
+            v |= (uint64_t) (gb == 0x08 ? 0 : gb == 0x19 ? 1 : 2) << (8 * j);
+        }
+        g_q4m[g] = v;
+    }
+    for (int i = 0; i < 128; ++i) {
+        uint64_t v = 0;
+        for (int j = 0; j < 8; ++j)
+            if ((ksigns_iq2xs[i] >> j) & 1) v |= (uint64_t) 3 << (8 * j);
+        g_q4s[i] = v;
+    }
+}
+void q4x_convert_row(const uint8_t* src, int n, uint8_t* dst) {
+    static std::once_flag once;
+    std::call_once(once, build_q4x);
+    const int nb = n / QK_K;
+    int8_t* sc = (int8_t*) (dst + (size_t) nb * 128);
+    uint8_t* dd = dst + (size_t) nb * (128 + 8);
+    const size_t end = (size_t) nb * (128 + 8 + 2);
+    std::memset(dst + end, 0, q4x_row_bytes(n) - end);
+    for (int i = 0; i < nb; ++i) {
+        const uint8_t* blk = src + (size_t) i * sizeof(block_iq2_xxs);
+        std::memcpy(dd + 2 * i, blk, 2);
+        for (int ib = 0; ib < QK_K / 32; ib += 2) {   // (a pair of chunks: 32 bytes, the second chunk's codes high)
+            const uint8_t* q = blk + 2 + 8 * ib;
+            const uint32_t a0 = u32(q), a1 = u32(q + 4), b0 = u32(q + 8), b1 = u32(q + 12);
+            sc[i * 8 + ib] = (int8_t) (2 * (a1 >> 28) + 1);
+            sc[i * 8 + ib + 1] = (int8_t) (2 * (b1 >> 28) + 1);
+            for (int k = 0; k < 4; ++k) {   // (8 weights: codes 0-5 a byte, added without carries)
+                const uint64_t lo = g_q4m[(a0 >> (8 * k)) & 255u] + g_q4s[(a1 >> (7 * k)) & 127u];
+                const uint64_t hi = g_q4m[(b0 >> (8 * k)) & 255u] + g_q4s[(b1 >> (7 * k)) & 127u];
+                const uint64_t v = lo | (hi << 4);
+                std::memcpy(dst + (size_t) i * 128 + (size_t) (ib / 2) * 32 + 8 * (size_t) k, &v, 8);
+            }
+        }
+    }
+}
+bool q4x_grid_ok() {   // (every IQ2_XXS grid byte one of 8, 25, 43: the codes' premise)
+    for (int g = 0; g < 256; ++g)
+        for (int j = 0; j < 8; ++j) {
+            const int b = (int) ((iq2xxs_grid[g] >> (8 * j)) & 255u);
+            if (b != 0x08 && b != 0x19 && b != 0x2b) return false;
+        }
+    return true;
+}
+template <int NT>
+IQ_AVX2 void q4x_rows_avx2(const uint8_t* w, size_t rb, int nb, const block_q8_K* const* y, float* const* out, int r0,
+                           int r1) {
+    const __m256i k80 = _mm256_set1_epi8((char) 0x80), k0f = _mm256_set1_epi8(0x0F);
+    const __m256i tbl = _mm256_setr_epi8(8, 25, 43, -8, -25, -43, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,   //
+                                         8, 25, 43, -8, -25, -43, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+    for (int r = r0; r < r1; ++r) {
+        const uint8_t* row = w + (size_t) r * rb;
+        const int8_t* sc = (const int8_t*) (row + (size_t) nb * 128);
+        const uint8_t* dd = row + (size_t) nb * (128 + 8);
+        __m256 accf[NT];
+        for (int t = 0; t < NT; ++t) accf[t] = _mm256_setzero_ps();
+        for (int i = 0; i < nb; ++i) {
+            __m256i sumi[NT];
+            for (int t = 0; t < NT; ++t) sumi[t] = _mm256_setzero_si256();
+            for (int p = 0; p < 4; ++p) {
+                const __m256i x = _mm256_loadu_si256((const __m256i*) (row + (size_t) i * 128 + 32 * p));
+                const __m256i v1 = _mm256_shuffle_epi8(tbl, _mm256_and_si256(x, k0f));
+                const __m256i v2 = _mm256_shuffle_epi8(tbl, _mm256_and_si256(_mm256_srli_epi16(x, 4), k0f));
+                const __m256i s1 = _mm256_maddubs_epi16(k80, v1), s2 = _mm256_maddubs_epi16(k80, v2);
+                const __m256i c1 = _mm256_set1_epi16((short) sc[i * 8 + 2 * p]);
+                const __m256i c2 = _mm256_set1_epi16((short) sc[i * 8 + 2 * p + 1]);
+                for (int t = 0; t < NT; ++t) {
+                    const int8_t* q8 = y[t][i].qs + 64 * p;
+                    const __m256i u1 = _mm256_xor_si256(_mm256_loadu_si256((const __m256i*) q8), k80);   // (q8 + 128)
+                    const __m256i u2 = _mm256_xor_si256(_mm256_loadu_si256((const __m256i*) (q8 + 32)), k80);
+                    const __m256i d1 = _mm256_sub_epi16(_mm256_maddubs_epi16(u1, v1), s1);
+                    const __m256i d2 = _mm256_sub_epi16(_mm256_maddubs_epi16(u2, v2), s2);
+                    sumi[t] = _mm256_add_epi32(sumi[t], _mm256_add_epi32(_mm256_madd_epi16(d1, c1), _mm256_madd_epi16(d2, c2)));
+                }
+            }
+            uint16_t dh;
+            std::memcpy(&dh, dd + 2 * i, 2);
+            const float dx = h2f(dh);
+            for (int t = 0; t < NT; ++t)
+                accf[t] = _mm256_fmadd_ps(_mm256_set1_ps(dx * y[t][i].d), _mm256_cvtepi32_ps(sumi[t]), accf[t]);
+        }
+        for (int t = 0; t < NT; ++t) out[t][r - r0] = 0.125f * hsum_ggml(accf[t]);
+    }
+}
+// out[t][r - r0] for rows [r0, r1) of the form (rb = q4x_row_bytes(n)), 4 tokens a pass
+void q4x_rows_n(const uint8_t* w, size_t rb, int n, const void* const* act, int nt, float* const* out, int r0, int r1) {
+    const int nb = n / QK_K;
+    for (int t0 = 0; t0 < nt; t0 += 4) {
+        const block_q8_K* y[4];
+        float* o[4];
+        const int c = nt - t0 < 4 ? nt - t0 : 4;
+        for (int t = 0; t < c; ++t) {
+            y[t] = (const block_q8_K*) act[t0 + t];
+            o[t] = out[t0 + t];
+        }
+        switch (c) {
+            case 1: q4x_rows_avx2<1>(w, rb, nb, y, o, r0, r1); break;
+            case 2: q4x_rows_avx2<2>(w, rb, nb, y, o, r0, r1); break;
+            case 3: q4x_rows_avx2<3>(w, rb, nb, y, o, r0, r1); break;
+            default: q4x_rows_avx2<4>(w, rb, nb, y, o, r0, r1); break;
+        }
+    }
+}
+
 // IQ1_S's two scalar float steps as the compiler built ggml-cpu's: accum1 += d * sumi1 (bit 0) and hsum_float_8 +
 // IQ1S_DELTA * accum1 (bit 1) each one FMA when set (gcc contracts them, MSVC does not) - own() keeps the form whose
 // rows own_check finds equal to ggml's, bit for bit
@@ -884,6 +1007,46 @@ bool own_check(int type) {
 }
 
 #if defined(IQ_X86)
+// the 4-bit rows against ggml-cpu's IQ2_XXS dot, bit for bit: random blocks (a small normal F16 scale), Q8_K
+// activations from ggml's quantizer, 1, 2, 3, 5 and 9 tokens, 13 rows of 8 blocks - re-coded, then dotted
+bool q4x_check() {
+    ggml_cpu_init();
+    const ggml_type t = GGML_TYPE_IQ2_XXS;
+    const int n = 2048, rows = 13;
+    const size_t rb = ggml_row_size(t, n), bb = ggml_type_size(t), ab = ggml_row_size(GGML_TYPE_Q8_K, n);
+    const size_t qb = q4x_row_bytes(n);
+    uint64_t st = 0x9E3779B97F4A7C15ull;
+    auto next = [&st] {
+        st ^= st << 13;
+        st ^= st >> 7;
+        st ^= st << 17;
+        return st;
+    };
+    std::vector<uint8_t> w(rb * rows), q((size_t) qb * rows);
+    for (auto& b : w) b = (uint8_t) next();
+    for (size_t o = 0; o < w.size(); o += bb) put_scale(t, &w[o], ggml_fp32_to_fp16(0.002f + 0.001f * (float) (next() % 16)));
+    for (int r = 0; r < rows; ++r) q4x_convert_row(w.data() + (size_t) r * rb, n, q.data() + (size_t) r * qb);
+    const auto* q8 = ggml_get_type_traits_cpu(GGML_TYPE_Q8_K);
+    const auto dot = ggml_get_type_traits_cpu(t)->vec_dot;
+    for (int nt : {1, 2, 3, 5, 9}) {
+        std::vector<uint8_t> a(ab * (size_t) nt);
+        std::vector<float> x((size_t) n), got((size_t) nt * rows), ref((size_t) nt * rows);
+        std::vector<const void*> ap((size_t) nt);
+        std::vector<float*> op((size_t) nt);
+        for (int k = 0; k < nt; ++k) {
+            for (auto& v : x) v = ((float) (next() % 2001) - 1000.0f) * 1e-3f;
+            q8->from_float(x.data(), a.data() + ab * (size_t) k, n);
+            ap[(size_t) k] = a.data() + ab * (size_t) k;
+            op[(size_t) k] = got.data() + (size_t) k * rows;
+        }
+        q4x_rows_n(q.data(), qb, n, ap.data(), nt, op.data(), 0, rows);
+        for (int k = 0; k < nt; ++k)
+            for (int r = 0; r < rows; ++r) dot(n, &ref[(size_t) k * rows + r], 0, w.data() + (size_t) r * rb, 0, ap[(size_t) k], 0, 1);
+        if (std::memcmp(got.data(), ref.data(), got.size() * sizeof(float)) != 0) return false;
+    }
+    return true;
+}
+
 // The weights the variants are timed on (own()): rows of the type in a buffer larger than a CPU's
 // caches, walked in turn - in the lane each call's experts come from RAM, and a form with a large table (IQ2_XXS's
 // one-table forms: 256 KB) loses its edge to the weights' traffic there, which rows that stay in the caches (a small
@@ -1197,6 +1360,85 @@ void iq_cpu_row_hint(int n) {
 #endif
 }
 
+bool iq_cpu_q4x_ok(int type) {
+#if defined(IQ_X86)
+    if (type != GGML_TYPE_IQ2_XXS) return false;
+    static const bool ok = [] {
+        const char* v = std::getenv("DS4_IQ_Q4X");   // (=0: never)
+        if ((v != nullptr && std::atoi(v) == 0) || !isa().avx2) return false;
+        const bool good = q4x_grid_ok() && q4x_check();
+        if (!good) std::fprintf(stderr, "ds4: CPU lane: the 4-bit IQ2_XXS rows differ from ggml-cpu's dot in this build - not used\n");
+        return good;
+    }();
+    return ok;
+#else
+    (void) type;
+    return false;
+#endif
+}
+
+size_t iq_cpu_q4x_row_bytes(int n) {
+#if defined(IQ_X86)
+    return q4x_row_bytes(n);
+#else
+    (void) n;
+    return 0;
+#endif
+}
+
+void iq_cpu_q4x_convert(const uint8_t* src, size_t src_row, int rows, int n, uint8_t* dst) {
+#if defined(IQ_X86)
+    const size_t rb = q4x_row_bytes(n);
+    for (int r = 0; r < rows; ++r) q4x_convert_row(src + (size_t) r * src_row, n, dst + (size_t) r * rb);
+#else
+    (void) src, (void) src_row, (void) rows, (void) n, (void) dst;
+#endif
+}
+
+void iq_cpu_q4x_gate_up(const IqCpu& f, const uint8_t* gate, const uint8_t* up, const void* const* act, int nt,
+                        float* const* ff, int r0, int r1, float limit) {
+#if defined(IQ_X86)
+    if (r1 <= r0) return;
+    const int nr = r1 - r0;
+    const size_t rb = q4x_row_bytes(f.n_embd);
+    thread_local std::vector<float> buf;
+    thread_local std::vector<float*> go, uo;
+    buf.resize((size_t) 2 * nt * nr);
+    go.resize((size_t) nt);
+    uo.resize((size_t) nt);
+    for (int t = 0; t < nt; ++t) {
+        go[(size_t) t] = buf.data() + (size_t) t * nr;
+        uo[(size_t) t] = buf.data() + (size_t) (nt + t) * nr;
+    }
+    q4x_rows_n(gate, rb, f.n_embd, act, nt, go.data(), r0, r1);
+    q4x_rows_n(up, rb, f.n_embd, act, nt, uo.data(), r0, r1);
+    for (int t = 0; t < nt; ++t)   // (iq_cpu_gate_up's epilogue, on the same values)
+        for (int r = 0; r < nr; ++r) {
+            float g = go[(size_t) t][r], u = uo[(size_t) t][r];
+            if (limit > 0.0f) {
+                g = std::fmin(g, limit);
+                u = std::fmin(std::fmax(u, -limit), limit);
+            }
+            ff[t][r0 + r] = (g / (1.f + std::exp(-g))) * u;
+        }
+#else
+    (void) f, (void) gate, (void) up, (void) act, (void) nt, (void) ff, (void) r0, (void) r1, (void) limit;
+#endif
+}
+
+void iq_cpu_q4x_down(const IqCpu& f, const uint8_t* down, const void* const* hq, int nt, float* const* out, int r0,
+                     int r1) {
+#if defined(IQ_X86)
+    if (r1 <= r0) return;
+    thread_local std::vector<float*> o;
+    o.resize((size_t) nt);
+    for (int t = 0; t < nt; ++t) o[(size_t) t] = out[t] + r0;
+    q4x_rows_n(down, q4x_row_bytes(f.n_ff), f.n_ff, hq, nt, o.data(), r0, r1);
+#else
+    (void) f, (void) down, (void) hq, (void) nt, (void) out, (void) r0, (void) r1;
+#endif
+}
+
 int iq_cpu_act_type(int type) {
     kc::NativeFmt n;
     std::string err;
@@ -1259,6 +1501,12 @@ void iq_cpu_gate_up(const IqCpu&, const uint8_t*, const uint8_t*, const void* co
 void iq_cpu_down(const IqCpu&, const uint8_t*, const void* const*, int, float* const*, int, int) {}
 int iq_cpu_act_type(int) { return -1; }
 void iq_cpu_row_hint(int) {}
+bool iq_cpu_q4x_ok(int) { return false; }
+size_t iq_cpu_q4x_row_bytes(int) { return 0; }
+void iq_cpu_q4x_convert(const uint8_t*, size_t, int, int, uint8_t*) {}
+void iq_cpu_q4x_gate_up(const IqCpu&, const uint8_t*, const uint8_t*, const void* const*, int, float* const*, int, int,
+                        float) {}
+void iq_cpu_q4x_down(const IqCpu&, const uint8_t*, const void* const*, int, float* const*, int, int) {}
 void iq_cpu_rows(int, const uint8_t*, size_t, int, const void* const*, int, float* const*, int, int) {}
 bool iq_cpu_own_rows(int) { return false; }
 void iq_cpu_iq1s_rows(bool) {}

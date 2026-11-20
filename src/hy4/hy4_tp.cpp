@@ -1,5 +1,6 @@
 // src/hy4/hy4_tp.cpp - maya-hy4's tensor parallel: the host's threads (see hy4_tp.hpp).
 #include "hy4_tp.hpp"
+#include "hy4_lane.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -35,6 +36,7 @@ namespace hy4 {
 Crew::Crew(int n) {
     for (int i = 0; i < n; ++i)
         th_.emplace_back([this, i] {
+            unpin_this_thread();   // (not the lane caller's one core, when it starts the crew)
             unsigned seen = 0;
             for (;;) {
                 std::function<void(int)> f;

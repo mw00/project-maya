@@ -379,6 +379,10 @@ struct Model::Impl {
     std::unique_ptr<Lane> lane;
     std::thread placer;               // (place_experts in the background: the CPU lane's experts over the NUMA nodes)
     std::atomic<bool> placer_stop{false};
+    // (the CPU lane's most routed experts re-coded at 4 bits in spare RAM, by q4x_builder from the routing counts)
+    std::thread q4x_builder;
+    std::mutex cnt_mu;   // (prof_cnt: the engine's thread counts, q4x_builder copies)
+    std::atomic<int64_t> q4x_made{0}, q4x_bytes{0};
     int* h_ids = nullptr;
     float *h_w = nullptr, *h_lat = nullptr, *h_cpu = nullptr;
     uint8_t* h_stage = nullptr;   // (pinned: a pass of streamed experts, kStage blobs)
@@ -496,6 +500,14 @@ struct Model::Impl {
         }
         placer_stop.store(true);
         if (placer.joinable()) placer.join();
+        if (q4x_builder.joinable()) {
+            q4x_builder.join();
+            const LaneCount& lc = lane_count();
+            std::fprintf(stderr, "maya-hy4: CPU lane: %lld experts re-coded at 4 bits (%.1f GB); %lld of %lld expert runs "
+                         "on them (%.1f%%)\n", (long long) q4x_made.load(), (double) q4x_bytes.load() / 1e9,
+                         lc.q4x.load(), lc.entries.load(),
+                         100.0 * (double) lc.q4x.load() / std::max(1.0, (double) lc.entries.load()));
+        }
         if (eg_populator.joinable()) eg_populator.join();
         for (auto& gp : G) {
             cudaSetDevice(gp.dev);
@@ -2206,6 +2218,7 @@ struct Model::Impl {
                 }
             }
         }
+        if (lane) q4x_start();
         st.experts_vram = n_res;
         st.experts_all = n_all;
         // peer access between neighbours (a hop a GPU boundary)
@@ -2686,8 +2699,119 @@ struct Model::Impl {
     // A chunk's routed experts (more than W tokens): the entries sorted by expert, ds4_iq's sets over every expert's
     // rows (gate / up -> F16 h, down -> F32 rows), then each token's weighted sum -> latout
     // (slot: each expert's slot in wbase - null: every expert, wbase the layer's; n_slots of them; accumulate: latout +=)
+    // The CPU lane's most routed experts re-coded at 4 bits a weight in the RAM left over (hy4_lane.hpp's Q4xSet: the
+    // same bits as the file's IQ2_XXS rows; on a lane bound by the CPU's arithmetic about twice as fast an expert,
+    // on one bound by its memory slower - twice the bytes).  Asked for only (HY4_Q4X=2: when a probe of this
+    // host's lane times its calls faster with the copies, by 15 %; =1: without the probe's verdict) and where RAM is
+    // free beyond the lane's experts (counted as if all were in the page cache) and a headroom of max(4 GiB, a tenth
+    // of the RAM); a thread re-codes the most routed experts while the lane is idle (between answers), until that
+    // RAM is used, and the copies stay until the model goes.  The answers are the same either way.  HY4_Q4X_GB: the
+    // RAM it takes at most.  Not on by default: on Jupiter's Xeons the copies' lane calls were 19 % faster, but an
+    // answer after 12 GB of them (16-32 % of its expert runs) was no faster - measure on the PC before turning it on
+    void q4x_start() {
+        const char* qv = std::getenv("HY4_Q4X");
+        if (!qv || (std::atoi(qv) != 1 && std::atoi(qv) != 2)) return;
+        const bool force = std::atoi(qv) == 1;
+        double lane_b = 0, per = 0;
+        int probe_l = -1;
+        for (Layer& l : L) {
+            if (!l.partial()) continue;
+            if (!l.cex.q4x_can()) return;   // (every lane layer of the form, or none)
+            per = std::max(per, (double) (2 * l.cex.q4x_gu + l.cex.q4x_d));
+            lane_b += (double) (g.n_expert - l.n_res) * (double) (2 * l.cex.g_stride + l.cex.d_stride);
+            if (probe_l < 0) probe_l = l.il;
+        }
+        if (probe_l < 0 || per <= 0) return;
+        const double avail = (double) ram_available(), tot = (double) ram_total();
+        const double head = std::max(4.0 * 1073741824.0, 0.1 * tot);
+        double budget = avail - lane_b - head;
+        if (const char* gb = std::getenv("HY4_Q4X_GB")) budget = std::min(budget, std::atof(gb) * 1e9);
+        char buf[320];
+        if (avail <= 0 || budget < 64.0 * per) {
+            std::snprintf(buf, sizeof buf, "INFO CPU lane: no 4-bit copies of its experts (%.1f GB of RAM free, %.1f GB "
+                          "of it for the lane's experts, %.1f GB kept free)", avail / 1e9, lane_b / 1e9, head / 1e9);
+            info.push_back(buf);
+            return;
+        }
+        double ms_f = 0, ms_q = 0;
+        bool probed = false;
+        // (on a thread of its own: the lane pins the thread that brings it jobs, and the engine's own is not to be
+        //  pinned before its first job - a thread it starts would inherit that one core)
+        std::thread([&] { probed = q4x_probe(*lane, L[(size_t) probe_l].cex, g.n_expert, ms_f, ms_q); }).join();
+        if (!probed) return;
+        const bool faster = ms_q < 0.85 * ms_f;
+        std::snprintf(buf, sizeof buf, "INFO CPU lane: a call of 16 experts %.2f ms from the file, %.2f ms as 4-bit "
+                      "copies - ", ms_f, ms_q);
+        std::string line = buf;
+        if (!faster && !force) {
+            info.push_back(line + "the file's rows kept");
+            return;
+        }
+        std::snprintf(buf, sizeof buf, "the most routed experts re-coded as they come, up to %.1f GB of RAM%s",
+                      budget / 1e9, faster ? "" : " (HY4_Q4X=1)");
+        info.push_back(line + buf);
+        for (Layer& l : L)
+            if (l.partial()) l.cex.q4x = std::make_shared<Q4xSet>(g.n_expert);
+        const int nodes = lane->nodes();
+        q4x_builder = std::thread([this, budget, nodes] {
+            lower_this_thread();
+            unpin_this_thread();
+            const int ne = g.n_expert;
+            double used = 0;
+            std::vector<std::pair<uint32_t, int>> cand;
+            auto nap = [&](int ms) {
+                for (int t = 0; t < ms && !placer_stop.load(std::memory_order_relaxed); t += 20)
+                    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            };
+            // (only while the lane is idle - between answers: a thread beside the lane's, which spin on every
+            //  core through a decode, holds one of them for a time slice and the whole lane call waits for it - on
+            //  Jupiter that turned the copies' 20 % into a decode 20 % slower.  An expert at a time, the lane looked at
+            //  between them)
+            bool full = false;
+            std::vector<uint32_t> snap;
+            while (!full && !placer_stop.load()) {
+                if (!lane->idle()) {
+                    nap(20);
+                    continue;
+                }
+                {
+                    std::lock_guard<std::mutex> lk(cnt_mu);
+                    snap = prof_cnt;
+                }
+                cand.clear();
+                for (const Layer& l : L) {
+                    if (!l.partial() || !l.cex.q4x || (size_t) (l.il + 1) * ne > snap.size()) continue;
+                    for (int e = 0; e < ne; ++e) {
+                        const uint32_t c = snap[(size_t) l.il * ne + e];
+                        if (c >= 2 && l.slot_of[(size_t) e] < 0 &&
+                            !l.cex.q4x->p[(size_t) e].load(std::memory_order_relaxed))
+                            cand.push_back({c, l.il * ne + e});
+                    }
+                }
+                std::sort(cand.begin(), cand.end(), [](const auto& x, const auto& y) { return x.first > y.first; });
+                for (const auto& [c, k] : cand) {
+                    if (placer_stop.load() || !lane->idle()) break;
+                    Layer& l = L[(size_t) (k / ne)];
+                    const int e = k % ne;
+                    const double b = (double) (2 * l.cex.q4x_gu + l.cex.q4x_d);
+                    if (used + b > budget) {
+                        full = true;
+                        break;
+                    }
+                    if (!l.cex.q4x_make(e)) continue;
+                    if (nodes > 1)   // (on its work's NUMA node, as place_experts puts the file's rows)
+                        Lane::move_to_node(l.cex.q4x->p[(size_t) e].load(), (size_t) b, e % nodes);
+                    used += b;
+                    q4x_made.fetch_add(1, std::memory_order_relaxed);
+                    q4x_bytes.store((int64_t) used, std::memory_order_relaxed);
+                }
+                nap(200);
+            }
+        });
+    }
     // the routes in h_ids (T tokens of layer il) into the profile's counts
     void count_routes(int il, int T) {
+        std::lock_guard<std::mutex> lk(cnt_mu);   // (q4x_builder copies the counts)
         if (prof_cnt.empty()) prof_cnt.assign((size_t) g.n_layer * g.n_expert, 0);
         if (il >= g.n_layer) return;
         uint32_t* c = prof_cnt.data() + (size_t) il * g.n_expert;
