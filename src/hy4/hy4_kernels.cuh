@@ -70,7 +70,24 @@ size_t kv_q8_row_bytes(int kv_lora, int n_rot);
 struct KvHost {
     int* tag = nullptr;
     uint16_t* rows = nullptr;
+    // KV spill (the rows past what the RAM holds on a drive): hidx [positions] (device) the host slot of each position
+    // (-1: on the drive only, -2: claimed by kv_need), the newest hres positions in slots p % hres (htag [hres],
+    // device: the position each holds), the slots past them the rows a read brought from the drive (kv_need, then the
+    // host, then kv_hidx).  hidx nullptr: position p's row at p, as before
+    int* hidx = nullptr;
+    int* htag = nullptr;
+    int hres = 0;
 };
+/// KV spill: the positions a read takes that are neither in the VRAM ring nor in host memory, each once (hidx -1 ->
+/// -2), into miss [cap] (host memory, mapped) with their count in mcount (device; the caller zeroes it); the slots
+/// past the newest tier the read takes get fgen [slot - hres] = gen (host memory, mapped: kept while the host makes
+/// room).  The positions: keys (T rows of ldk, nk[t] each) when given, else list's pools (n of kpool positions, those
+/// below kend), else the span [k0, k0 + n).
+void kv_need(const int* keys, int ldk, const int* nk, int T, const int* list, int kpool, int kend, int k0, int n,
+             int ring, const KvHost& hs, int* fgen, int gen, int* miss, int* mcount, int cap, cudaStream_t s);
+/// ... then hidx[set[2i]] = set[2i + 1] (n_set rows the host put in slots) and hidx[drop[2i]] = -1 where it still is
+/// drop[2i + 1] (the slots given back); set and drop in host memory (mapped)
+void kv_hidx(const int* set, int n_set, const int* drop, int n_drop, int* hidx, cudaStream_t s);
 void kv_store(const float* kv, int T, int kv_lora, int n_rot, const float* w, float eps, const int* pos, float base,
               uint16_t* cache, int ring, cudaStream_t s, bool q8 = false, const KvHost& hs = KvHost{});
 /// The picked rows of a sub-batch side by side: dst[t * ldk + j] = the cache row (row_bytes bytes, F16 or 8-bit: as

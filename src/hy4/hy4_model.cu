@@ -19,6 +19,7 @@
 #include "hy4_tp.hpp"
 #include "hy4_pack.hpp"
 #include "hy4_plan.hpp"
+#include "hy4_spill.hpp"
 #include "../ds4/ds4_iq.cuh"
 #include "../ds4/ds4_lt.hpp"
 
@@ -291,7 +292,15 @@ struct Layer {
     uint16_t* hrows = nullptr;
     int64_t hi = 0;
     bool wrapped() const { return res > 0 && hi > res; }
-    k::KvHost hs() const { return res > 0 ? k::KvHost{tag, hrows} : k::KvHost{}; }
+    k::KvHost hs() const { return res > 0 ? k::KvHost{tag, hrows, hidx, htag, hidx ? hres : 0} : k::KvHost{}; }
+    // KV spill (Options::kv_spill): hidx / htag on this GPU (k::KvHost's), the newest tier's slots (hres); the slots
+    // this layer's reads fill from the drive [fbase, fbase + fpos.size()), the position each holds (fpos), the next one
+    // round (fcur), the read's stamp (gen); kv_need's lists (host memory, mapped: fgen, miss, hset, hdrop) and count
+    int* hidx = nullptr;
+    int* htag = nullptr;
+    int hres = 0, fbase = 0, fcur = 0, gen = 0, region = -1;
+    std::vector<int> fpos;
+    int *fgen = nullptr, *miss = nullptr, *hset = nullptr, *hdrop = nullptr, *hcount = nullptr, *mcount = nullptr;
     float* pooled = nullptr;     // the indexer's pooled keys [max_ctx / kpool][ix_dim]
     float* ivg = nullptr;        // ... and each position's value | gate [ring][2 ix_dim]
     size_t bytes = 0;            // (the plan: its VRAM)
@@ -795,6 +804,8 @@ struct Model::Impl {
         if (h_pmap) cudaFreeHost(h_pmap);
         for (uint16_t* p : kv_host)
             if (p) cudaFreeHost(p);
+        for (int* p : sp_host)
+            if (p) cudaFreeHost(p);
         for (Gpu& gp : G)
             for (void* p : {(void*) gp.hs_ids, (void*) gp.hs_stage, (void*) gp.hs_pmap})
                 if (p) cudaFreeHost(p);
@@ -1042,7 +1053,8 @@ struct Model::Impl {
     }
     size_t ix_rows_bytes(size_t rb) const {
         const int r = kv_res();
-        return r > 0 ? (size_t) r * (rb + 4) : (size_t) o.max_ctx * rb;
+        return r > 0 ? (size_t) r * (rb + 4) + (sp_res > 0 ? ((size_t) o.max_ctx + (size_t) sp_res) * 4 : 0)
+                     : (size_t) o.max_ctx * rb;
     }
     size_t ix_rows_bytes() const { return ix_rows_bytes(kv_rb()); }
     // ... and the picked rows' buffer of a sub-batch (scratch)
@@ -1051,12 +1063,273 @@ struct Model::Impl {
     }
     std::vector<uint16_t*> kv_host;   // the host's rows, a layer (shared by its tensor-parallel members)
     bool kv_said = false;
+    // KV spill: the file; the newest positions' rows in RAM (sp_res a layer, 0: off), each layer copy's slots for a
+    // read's rows from the drive (sp_f), the copies a layer (sp_m: its tensor-parallel members), the regions (an
+    // indexed layer each: sp_nreg) - a region's first copy (its rows on the file: [0, sp_done)), the copies made so far
+    SpillFile sp_file;
+    int64_t sp_res = 0;
+    int sp_f = 0, sp_m = 1, sp_nreg = 0;
+    std::vector<int64_t> sp_done;
+    std::vector<Layer*> sp_lay;
+    std::vector<int> sp_reg, sp_cnt;
+    std::vector<int*> sp_host;
+    std::mutex sp_mu;
+    std::unique_ptr<Crew> sp_io;
+    std::string sp_err;
+    double sp_mbs = 0, sp_read_s = 0;
+    long long sp_rows = 0, sp_reads = 0;
+    bool spill() const { return sp_res > 0; }
+    // (a region's rows in blocks of 64 positions, the regions' blocks side by side: a pool's rows in one read, the file
+    //  growing from its start)
+    uint64_t sp_off(int region, int64_t p) const {
+        return ((((uint64_t) p / 64) * (uint64_t) sp_nreg + (uint64_t) region) * 64 + (uint64_t) p % 64) * kv_rb();
+    }
+    int sp_nix() const {
+        int nix = 1;
+        for (int il = 0; il < g.n_layer; ++il) nix += g.swa[(size_t) il] ? 0 : 1;
+        return nix;
+    }
+    // the largest read's rows from the drive a layer copy holds at once (HY4_KV_SPILL_SLOTS)
+    int sp_slots() const {
+        int f = std::max<int>(32768, (int) deq_rows() + 1024);
+        if (const char* e = std::getenv("HY4_KV_SPILL_SLOTS")) f = std::max(4096, std::atoi(e));
+        return (int) std::min<int64_t>(f, o.max_ctx);
+    }
+    // KV spill for this plan where `left` bytes of RAM are free for rows: the newest tier as large as they hold beside
+    // every copy's slots (members: the copies), at least 4 chunks and 64K positions, below the context; false: not
+    // possible
+    bool sp_plan(double left, int members) {
+        const int F = sp_slots(), nix = sp_nix();
+        const double rb = (double) kv_rb();
+        int64_t m = (int64_t) ((left - (double) nix * members * F * rb) / ((double) nix * rb));
+        if (const char* e = std::getenv("HY4_KV_SPILL_RES")) m = std::atoll(e);
+        m = m / 64 * 64;
+        if (m < std::max<int64_t>(65536, 4 * (int64_t) Tc) || m >= o.max_ctx) return false;
+        sp_res = m;
+        sp_f = F;
+        sp_m = std::max(1, members);
+        sp_nreg = nix;
+        return true;
+    }
+    // --kv-spill on (asked for by name, with KV streaming): the newest tier as large as the RAM holds - or
+    // HY4_KV_SPILL_RES positions - before the first layer's rows
+    bool sp_tried = false;
+    bool kv_spill_on_plan(std::string& err) {
+        if (sp_tried || o.kv_spill != 1 || spill()) return true;
+        sp_tried = true;
+        double left = 0;
+        kv_ram_holds(0.0, left);
+        if (!sp_plan(std::min(left, 1e15), std::max(1, tp))) {
+            info.push_back("NOTE --kv-spill on: not taken (the RAM holds this context's rows, or too few positions "
+                           "would stay in RAM - HY4_KV_SPILL_RES sets them)");
+        }
+        (void) err;
+        return true;
+    }
+    // the drive the file goes on: --kv-spill-dir, else the pack's directory
+    std::string sp_dir() const {
+        if (!o.kv_spill_dir.empty()) return o.kv_spill_dir;
+        const size_t k = o.pack.find_last_of("/\\");
+        return k == std::string::npos ? std::string(".") : o.pack.substr(0, k);
+    }
+    // a layer copy's spill state (after its host rows): hidx / htag on its GPU, its slots, its lists
+    bool spill_layer(Layer& l, Gpu& gp, int hi, std::string& err) {
+        if (sp_reg.empty()) {
+            sp_reg.assign((size_t) g.n_layer + 2, -1);
+            sp_lay.assign((size_t) sp_nreg, nullptr);
+            sp_cnt.assign((size_t) sp_nreg, 0);
+            sp_done.assign((size_t) sp_nreg, 0);
+        }
+        int& r = sp_reg[(size_t) hi];
+        if (r < 0) {
+            int n = 0;
+            for (int x : sp_reg) n += x >= 0;
+            if (n >= sp_nreg) {
+                err = "KV spill: more indexed layers than planned";
+                return false;
+            }
+            r = n;
+            sp_lay[(size_t) r] = &l;
+        }
+        const int idx = sp_cnt[(size_t) r]++;
+        if (idx >= sp_m) {
+            err = "KV spill: more copies of a layer than planned";
+            return false;
+        }
+        const int F = sp_f;
+        l.region = r;
+        l.hres = (int) sp_res;
+        l.fbase = (int) sp_res + idx * F;
+        l.fcur = 0;
+        l.gen = 0;
+        l.fpos.assign((size_t) F, -1);
+        if (!gp.alloc(l.hidx, (size_t) o.max_ctx, err) || !gp.alloc(l.htag, (size_t) sp_res, err) ||
+            !gp.alloc(l.mcount, 1, err))
+            return false;
+        CK(cudaMemset(l.hidx, 0xff, sizeof(int) * (size_t) o.max_ctx));
+        CK(cudaMemset(l.htag, 0xff, sizeof(int) * (size_t) sp_res));
+        int* hb = nullptr;
+        const size_t nb = sizeof(int) * ((size_t) F * 6 + 64);
+        if (cudaHostAlloc((void**) &hb, nb, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess) {
+            cudaGetLastError();
+            err = "KV spill: no pinned memory for a layer's lists";
+            return false;
+        }
+        std::memset(hb, 0, nb);
+        sp_host.push_back(hb);
+        l.fgen = hb;
+        l.miss = hb + F;
+        l.hset = hb + 2 * (size_t) F;
+        l.hdrop = hb + 4 * (size_t) F;
+        l.hcount = hb + 6 * (size_t) F;
+        if (!sp_file.is_open()) {
+            if (!sp_file.open(sp_dir(), err)) {
+                err += " (--kv-spill-dir: a directory on an SSD with room for the rows)";
+                return false;
+            }
+            sp_io = std::make_unique<Crew>(std::max(4, std::min(16, (int) std::thread::hardware_concurrency() / 2)));
+            sp_mbs = sp_file.measure((size_t) 256 << 20, 4096, 2048);
+            double floor_mbs = 50.0;
+            if (const char* e = std::getenv("HY4_KV_SPILL_MIN_MBS")) floor_mbs = std::max(0.0, std::atof(e));
+            char sb[480];
+            std::snprintf(sb, sizeof sb, "INFO KV spill: the indexed layers' rows of the newest %lld positions in RAM "
+                          "(%.2f GB), the others in %s (up to %.1f GB; the drive reads %.0f MB/s in 4 KB pieces), read "
+                          "for the positions a token picks only", (long long) sp_res,
+                          (double) sp_nreg * ((double) sp_res + (double) sp_m * F) * kv_rb() / 1e9, sp_file.path().c_str(),
+                          (double) sp_nreg * o.max_ctx * kv_rb() / 1e9, sp_mbs);
+            info.push_back(sb);
+            if (o.kv_spill < 0 && sp_mbs > 0 && sp_mbs < floor_mbs) {
+                char eb[400];
+                std::snprintf(eb, sizeof eb, "KV spill: the drive at %s reads %.0f MB/s in 4 KB pieces (below %.0f: a "
+                              "hard disk?) - this context would be very slow; a smaller --max-context, or --kv-spill-dir "
+                              "on an SSD", sp_dir().c_str(), sp_mbs, floor_mbs);
+                err = eb;
+                return false;
+            }
+        }
+        return true;
+    }
+    // KV spill, before a read of layer l's rows: the positions it takes that are on the drive only, read into this
+    // copy's slots (round them, past the ones this read takes), hidx set on the GPU - the read then finds every row in
+    // the VRAM ring or host memory.  Positions as k::kv_need's.  (Nothing while no position has left the RAM.)
+    bool spill_need(Layer& l, Gpu& gp, const int* keys, int ldk, const int* nk, int T, const int* list, int kpool,
+                    int kend, int k0, int n) {
+        if (!l.hidx || l.hi <= l.hres) return true;
+        const auto t0 = std::chrono::steady_clock::now();
+        cudaStream_t s = gp.s;
+        const int F = (int) l.fpos.size();
+        if (++l.gen == 0) ++l.gen;
+        cudaMemsetAsync(l.mcount, 0, sizeof(int), s);
+        k::kv_need(keys, ldk, nk, T, list, kpool, kend, k0, n, l.res, l.hs(), l.fgen, l.gen, l.miss, l.mcount, F, s);
+        cudaMemcpyAsync(l.hcount, l.mcount, sizeof(int), cudaMemcpyDeviceToHost, s);
+        if (cudaStreamSynchronize(s) != cudaSuccess) {
+            if (sp_err.empty()) sp_err = "KV spill: the GPU's list of rows failed";
+            return false;
+        }
+        const int nm = *l.hcount;
+        if (nm <= 0) return true;
+        auto fail = [&](const char* why) {
+            if (sp_err.empty()) {
+                char eb[300];
+                std::snprintf(eb, sizeof eb, "KV spill: %s (layer %d: %d rows from the drive, %d slots - "
+                              "HY4_KV_SPILL_SLOTS more)", why, l.il, nm, F);
+                sp_err = eb;
+            }
+            return false;
+        };
+        if (nm > F) return fail("a read takes more rows from the drive than its slots hold");
+        std::sort(l.miss, l.miss + nm);
+        int nd = 0;
+        for (int i = 0; i < nm; ++i) {
+            int tries = 0;
+            while (l.fgen[l.fcur] == l.gen) {
+                l.fcur = (l.fcur + 1) % F;
+                if (++tries > F) return fail("every slot is taken by this read");
+            }
+            const int sl = l.fcur;
+            l.fcur = (l.fcur + 1) % F;
+            if (l.fpos[(size_t) sl] >= 0) {
+                l.hdrop[2 * nd] = l.fpos[(size_t) sl];
+                l.hdrop[2 * nd + 1] = l.fbase + sl;
+                ++nd;
+            }
+            l.fpos[(size_t) sl] = l.miss[i];
+            l.fgen[sl] = l.gen;
+            l.hset[2 * i] = l.miss[i];
+            l.hset[2 * i + 1] = l.fbase + sl;
+        }
+        // (runs: consecutive positions of one block of 64 in consecutive slots - one read each)
+        std::vector<std::pair<int, int>> runs;
+        for (int i = 0; i < nm;) {
+            int j = i + 1;
+            while (j < nm && l.hset[2 * j] == l.hset[2 * j - 2] + 1 && l.hset[2 * j + 1] == l.hset[2 * j - 1] + 1 &&
+                   l.hset[2 * j] % 64 != 0)
+                ++j;
+            runs.push_back({i, j - i});
+            i = j;
+        }
+        const size_t rb = kv_rb();
+        uint8_t* base = (uint8_t*) l.hrows;
+        std::atomic<bool> bad{false};
+        {
+            std::lock_guard<std::mutex> lk(sp_mu);
+            const int nt = sp_io->size();
+            sp_io->start([&](int t) {
+                for (size_t r = (size_t) t; r < runs.size(); r += (size_t) nt) {
+                    const int i = runs[r].first, k = runs[r].second;
+                    if (!sp_file.read(base + (size_t) l.hset[2 * i + 1] * rb, (size_t) k * rb,
+                                      sp_off(l.region, l.hset[2 * i])))
+                        bad = true;
+                }
+            });
+            sp_io->wait();
+            sp_rows += nm;
+            ++sp_reads;
+            sp_read_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        }
+        if (bad) return fail("a read from the drive failed");
+        k::kv_hidx(l.hset, nm, l.hdrop, nd, l.hidx, s);
+        return true;
+    }
+    // KV spill, before a forward from position p0: every region's rows stored since the last time onto the file (from
+    // the newest tier, which a forward of at most a chunk does not wrap past them); a forward from before them (a
+    // rewind) moves the mark back - its positions are written again
+    bool spill_flush(int64_t p0, int64_t end, std::string& err) {
+        if (!spill() || sp_lay.empty()) return true;
+        mtp_settle();
+        for (Gpu& gp : G) {
+            CK(cudaSetDevice(gp.dev));
+            CK(cudaDeviceSynchronize());
+        }
+        const size_t rb = kv_rb();
+        for (size_t r = 0; r < sp_lay.size(); ++r) {
+            const Layer* l = sp_lay[r];
+            if (!l) continue;
+            const int64_t b = std::min<int64_t>(l->hi, end);
+            int64_t a = std::max<int64_t>(sp_done[r], b - sp_res);
+            const uint8_t* base = (const uint8_t*) l->hrows;
+            while (a < b) {
+                const int64_t slot = a % sp_res;
+                const int64_t k = std::min<int64_t>({b - a, 64 - a % 64, sp_res - slot});
+                if (!sp_file.write(base + (size_t) slot * rb, (size_t) k * rb, sp_off((int) r, a))) {
+                    err = "KV spill: a write to " + sp_file.path() + " failed (the drive full?)";
+                    return false;
+                }
+                a += k;
+            }
+            sp_done[r] = std::max<int64_t>(sp_done[r], b);
+            if (p0 < sp_done[r]) sp_done[r] = p0;
+        }
+        return true;
+    }
     // (--kv-streaming auto: the ring asked for, and whether this plan took streaming - o.kv_resident is then its ring)
     int64_t kv_auto_n = 0;
     bool kv_auto_set = false;
     void kv_auto_reset() {
         if (kv_auto_set) o.kv_resident = 0;
         kv_auto_set = false;
+        sp_res = 0;
+        sp_tried = false;
     }
     // the host's rows of every indexed layer (and the MTP block's) at this context, with the rows' current format
     double kv_host_bytes() const {
@@ -1553,7 +1826,8 @@ struct Model::Impl {
                     }
                     // (--kv-streaming auto: the indexed layers' rows beyond the ring in RAM - one copy there, shared by
                     //  the members - before a smaller group or the CPU lane: F16 rows, then 8-bit where --kv auto allows)
-                    if (o.kv_streaming < 0 && !kv_auto_set && o.kv_resident == 0 && kv_auto_n > 0) {
+                    if (o.kv_streaming < 0 && !kv_auto_set && o.kv_resident == 0 && kv_auto_n > 0 &&
+                        dfly_plan_bytes() <= 0) {
                         o.kv_resident = kv_auto_n;
                         double left = 0;
                         if (kv_res() > 0) {
@@ -1611,7 +1885,7 @@ struct Model::Impl {
                     // (--kv-streaming auto: the indexed layers' rows beyond the ring in RAM too where the members then
                     //  hold more of every layer's experts)
                     if (fit_l && asked && held < g.n_expert && o.kv_streaming < 0 && !kv_auto_set && o.kv_resident == 0 &&
-                        kv_auto_n > 0 && kv_more_on()) {
+                        kv_auto_n > 0 && kv_more_on() && dfly_plan_bytes() <= 0) {
                         o.kv_resident = kv_auto_n;
                         double left = 0;
                         bool took = false;
@@ -1771,9 +2045,22 @@ struct Model::Impl {
                     const bool was = kv_q8;
                     kv_q8 = sp.q8;
                     const double host = kv_host_bytes();
-                    kv_q8 = was;
                     double left = 0;
                     ram_ok = kv_ram_holds(host, left);
+                    // (--kv-spill auto: the RAM short of the rows - the newest positions' in RAM, the others on the
+                    //  drive; VRAM: a position's slot number a layer)
+                    if (!ram_ok && o.kv_spill != 0 && sp_plan(left, 1)) {
+                        const double hb = (double) sp_nreg * ((double) o.max_ctx + (double) sp_res) * 4;
+                        for (double& f : free_b) f -= hb;
+                        if (do_pick().fits) {
+                            ram_ok = true;
+                            sp_tried = true;
+                        } else {
+                            for (double& f : free_b) f += hb;
+                            sp_res = 0;
+                        }
+                    }
+                    kv_q8 = was;
                     if (!ram_ok) {
                         char nb[320];
                         std::snprintf(nb, sizeof nb, "NOTE KV streaming not taken: the rows of a context of %lld tokens "
@@ -1845,13 +2132,16 @@ struct Model::Impl {
         // --kv-streaming auto (the default): the cache fits, the routed experts do not all - the indexed layers' rows
         // beyond the ring in host memory too where that gives every layer more experts in VRAM and the RAM holds the
         // rows.  Nothing is read from the host until a conversation passes the ring; the same bits either way
-        // (HY4_KV_MORE=0: only where nothing else fits, as before)
-        if (o.kv_streaming < 0 && !kv_auto_set && o.kv_resident == 0 && kv_auto_n > 0 && kv_more_on()) {
+        // (HY4_KV_MORE=0: only where nothing else fits, as before).  Not where the DFly2 drafter is planned: it reads
+        // the trunk's rows in VRAM only, and streaming would leave it off
+        if (o.kv_streaming < 0 && !kv_auto_set && o.kv_resident == 0 && kv_auto_n > 0 && kv_more_on() &&
+            dfly_plan_bytes() <= 0) {
             const double ra = most(rho);
             const int na = ra < 0 ? -1 : (int) std::floor(ra * g.n_expert);
+            const double rows0 = (double) ix_rows_bytes();
             o.kv_resident = kv_auto_n;
             if (ra >= 0 && ra < cap && kv_res() > 0) {
-                const double pb = (double) pick_bytes(), rows0 = (double) ix_rows_bytes();
+                const double pb = (double) pick_bytes();
                 for (double& f : free_b) f -= pb;
                 const double rs = most(rho);
                 const int ns = rs < 0 ? -1 : (int) std::floor(rs * g.n_expert);
@@ -2635,7 +2925,7 @@ struct Model::Impl {
     bool kv_host_rows(Layer& l, std::string& err) {
         if (kv_host.empty()) kv_host.assign((size_t) g.n_layer + 2, nullptr);
         uint16_t*& h = kv_host[(size_t) std::min(l.il, g.n_layer + 1)];
-        const size_t b = (size_t) o.max_ctx * kv_rb();
+        const size_t b = (spill() ? (size_t) sp_res + (size_t) sp_m * sp_f : (size_t) o.max_ctx) * kv_rb();
         if (!h && cudaHostAlloc((void**) &h, b, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess) {
             h = nullptr;
             cudaGetLastError();
@@ -2658,7 +2948,8 @@ struct Model::Impl {
             l.hi = 0;
             if (!gp.alloc(l.kv, (size_t) l.res * kv_rb() / 2, err) || !gp.alloc(l.tag, (size_t) l.res, err) ||
                 !gp.alloc(l.pooled, (size_t) (o.max_ctx / g.ix_kpool + 1) * g.ix_dim * pool_b() / 4, err) ||
-                !gp.alloc(l.ivg, (size_t) ring * 2 * g.ix_dim * pool_b() / 4, err) || !kv_host_rows(l, err))
+                !gp.alloc(l.ivg, (size_t) ring * 2 * g.ix_dim * pool_b() / 4, err) || !kv_spill_on_plan(err) ||
+                !kv_host_rows(l, err) || (spill() && !spill_layer(l, gp, std::min(l.il, g.n_layer + 1), err)))
                 return false;
             CK(cudaMemset(l.tag, 0xff, sizeof(int) * (size_t) l.res));
             CK(cudaMemset(l.pooled, 0, (size_t) (o.max_ctx / g.ix_kpool + 1) * g.ix_dim * pool_b()));
@@ -3969,6 +4260,7 @@ struct Model::Impl {
         if (kv_q8 || st) {
             if (dq.base < 0 || k0 < dq.base || k1 - dq.base > (int64_t) deq_rows()) dq.base = dq.hi = k0;
             if (k1 > dq.hi) {
+                if (st) spill_need(l, gp, nullptr, 0, nullptr, 0, nullptr, 1, 0, (int) dq.hi, (int) (k1 - dq.hi));
                 if (kv_q8)
                     k::kv_deq(l.kv, st ? l.res : l.ring, KL, g.rope, (int) dq.hi, (int) (k1 - dq.hi),
                               gp.kbuf + (size_t) (dq.hi - dq.base) * KR, gp.s, nullptr, 1, 0,
@@ -4040,6 +4332,7 @@ struct Model::Impl {
         }
         dq.base = -1;   // (kbuf's dequantized rows are gone)
         // (KV streaming: l.res the ring, a row outside it read from the host's copy - the same bits; else as before)
+        spill_need(l, gp, nullptr, 0, nullptr, 0, list, KP, (int) k1, 0, np);
         if (kv_q8) k::kv_deq(l.kv, l.res, KL, g.rope, 0, rows, gp.kbuf, gp.s, list, KP, (int) k1, l.hs());
         else k::kv_gather(l.kv, l.res, KR, 0, rows, gp.kbuf, gp.s, list, KP, (int) k1, l.hs());
         k::to_f16(gp.qcat + (size_t) t0 * H * KR, KR, ts * H, KR, gp.xh16, KR, gp.s);
@@ -4296,6 +4589,8 @@ struct Model::Impl {
                             continue;
                         }
                         if (l.wrapped()) {   // (KV streaming: the piece's picked rows once each, as below)
+                            spill_need(l, gp, gp.keys + (size_t) pc.first * maxk, maxk, gp.knk + pc.first, pc.second,
+                                       nullptr, 1, 0, 0, 0);
                             k::kv_pick_union(l.kv, l.res, kv_rb(), gp.keys + (size_t) pc.first * maxk, maxk,
                                              gp.knk + pc.first, pc.second, gp.pslot, gp.pcount, gp.plist, gp.pkeys,
                                              gp.kpick, s, l.hs());
@@ -4313,6 +4608,7 @@ struct Model::Impl {
                 if (l.wrapped() && ts > 1) {
                     // (KV streaming, several tokens: each picked position's row fetched once - the ring's or the
                     //  host's -, the same kernel over them through the keys' rows there, in the same order)
+                    spill_need(l, gp, gp.keys + (size_t) t0 * maxk, maxk, gp.knk + t0, ts, nullptr, 1, 0, 0, 0);
                     k::kv_pick_union(l.kv, l.res, kv_rb(), gp.keys + (size_t) t0 * maxk, maxk, gp.knk + t0, ts, gp.pslot,
                                      gp.pcount, gp.plist, gp.pkeys, gp.kpick, s, l.hs());
                     k::attention(gp.qcat + (size_t) t0 * H * KR, ts, H, KL, R, gp.kpick, 0, gp.pkeys, maxk, nullptr,
@@ -4321,6 +4617,7 @@ struct Model::Impl {
                 }
                 if (l.wrapped()) {
                     // (one token: its picked rows side by side)
+                    spill_need(l, gp, gp.keys + (size_t) t0 * maxk, maxk, gp.knk + t0, ts, nullptr, 1, 0, 0, 0);
                     k::kv_pick(l.kv, l.res, kv_rb(), gp.keys + (size_t) t0 * maxk, maxk, gp.knk + t0, ts, gp.kpick, s,
                                l.hs());
                     k::attention(gp.qcat + (size_t) t0 * H * KR, ts, H, KL, R, gp.kpick, 0, nullptr, 0, gp.plo,
@@ -6933,8 +7230,13 @@ bool Model::forward(const int* ids, int n, int64_t pos0, int want, float* logits
     int done = 0;
     while (done < n) {
         const int T = done < head ? std::min(Tc, head - done) : last;
+        if (m->spill() && !m->spill_flush(pos0 + done, pos0 + done, err)) return false;
         if (!m->window(ids + done, T, pos0 + done, done + T == n ? want : 0, logits_out, err)) {
             m->name_fault(err);
+            return false;
+        }
+        if (!m->sp_err.empty()) {
+            err = m->sp_err;
             return false;
         }
         done += T;

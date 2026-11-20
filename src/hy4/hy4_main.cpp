@@ -3,7 +3,8 @@
 //   maya-hy4 --pack <model>/maya-hy4 --serve [--gpus 0,1,...] [--max-context N] [--chunk N] [--eos id,id,...]
 //            [--mtp | --dfly2 [--draft N] [--draft-floor P]] [--vram-experts F] [--cpu-threads N] [--profile F] [--profile-out F]
 //            [--tp N|auto] [--main-gpu I] [--vision on|off] [--kv auto|f16|q8]
-//            [--kv-streaming on|off|auto] [--kv-resident N] [--room-report]
+//            [--kv-streaming on|off|auto] [--kv-resident N] [--kv-spill on|off|auto] [--kv-spill-dir D]
+//            [--room-report]
 //
 // --room-report (the server's, at a first start on a PC whose cards it has no figure for): an INFO line says, for
 // each GPU, its free VRAM as the plan read it and how much less of it this start's choices would hold with (the
@@ -1213,6 +1214,15 @@ int main(int argc, char** argv) {
             kv_stream = v == "on" ? 1 : v == "auto" ? -1 : 0;
         }
         else if (a == "--kv-resident") kv_res_arg = std::atoll(next().c_str());
+        else if (a == "--kv-spill") {
+            const std::string v = next();
+            if (v != "on" && v != "off" && v != "auto") {
+                std::fprintf(stderr, "--kv-spill: on, off or auto\n");
+                return 2;
+            }
+            o.kv_spill = v == "on" ? 1 : v == "auto" ? -1 : 0;
+        }
+        else if (a == "--kv-spill-dir") o.kv_spill_dir = next();
         else if (a == "--kv") {
             const std::string v = next();
             if (v != "auto" && v != "f16" && v != "q8") {

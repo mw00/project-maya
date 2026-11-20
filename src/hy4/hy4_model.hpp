@@ -56,6 +56,13 @@ struct Options {
                                   // picked rows outside the ring read from there (the same bits: the same answers).
                                   // 0: off - every row in VRAM.  Off as well where the context is no larger
                                   // than the ring.
+    int kv_spill = -1;            // KV spill (with KV streaming): 0 off, 1 on, -1 auto (the default) - where the RAM does not
+                                  // hold every position's row beside its headroom: the newest positions' rows in RAM,
+                                  // the others in a file on a drive (kv_spill_dir; the pack's directory by default),
+                                  // read for the positions a token picks only - the same bits, the same answers.  Auto
+                                  // only where nothing else starts this context, and not on a drive that reads slower
+                                  // than HY4_KV_SPILL_MIN_MBS (default 50 MB/s, measured once at the start)
+    std::string kv_spill_dir;
     bool vision = true;           // the vision tower (the pack's mmproj file) on the main GPU: a picture's room is lent by
                                   // the prompt buffers while it is read (made longer by what they lack of it, if anything)
     bool vision_auto = true;      // (not asked for by name: a pack without one runs text only, no error)

@@ -550,21 +550,35 @@ __global__ void rope_kernel(float* __restrict__ x, int nh, size_t ld, size_t ldt
 // ---------------------------------------------------------------- the latent cache
 // KV streaming: the row just written (words 32-bit words) into the host's row of its position as well, and the slot's
 // tag
-__device__ __forceinline__ void kv_mirror(const void* row, uint32_t* host_row, int words, int* tag, int slot, int p) {
+// (KV spill: the newest tier's slot p % hres, its last position's hidx dropped where it still names the slot)
+__device__ __forceinline__ void kv_mirror(const void* row, uint32_t* host, int words, int* tag, int slot, int p,
+                                          int* htag, int* hidx, int hres) {
     __syncthreads();
+    const size_t hs = hidx ? (size_t) (p % hres) : (size_t) p;
+    uint32_t* host_row = host + hs * (size_t) words;
     const uint32_t* src = (const uint32_t*) row;
     for (int i = threadIdx.x; i < words; i += blockDim.x) host_row[i] = src[i];
-    if (threadIdx.x == 0) tag[slot] = p;
+    if (threadIdx.x == 0) {
+        tag[slot] = p;
+        if (hidx) {
+            const int old = htag[hs];
+            if (old >= 0 && old != p && hidx[old] == (int) hs) hidx[old] = -1;
+            htag[hs] = p;
+            hidx[p] = (int) hs;
+        }
+    }
 }
 // a reader's row of position p: the VRAM ring's where its tag is p, else the host's
-__device__ __forceinline__ size_t kv_src(int p, int ring, const int* tag, bool& host) {
+// (KV spill: the host's row of p in slot hidx[p] - kv_need put it there before the read)
+__device__ __forceinline__ size_t kv_src(int p, int ring, const int* tag, const int* hidx, bool& host) {
     const int r = ring > 0 ? p % ring : p;
     host = tag != nullptr && tag[r] != p;
-    return host ? (size_t) p : (size_t) r;
+    return host ? (size_t) (hidx ? max(hidx[p], 0) : p) : (size_t) r;
 }
 __global__ void kv_store_kernel(const float* __restrict__ kv, int kv_lora, int n_rot, const float* __restrict__ w,
                                 float eps, const int* __restrict__ pos, float base, __half* __restrict__ cache,
-                                int ring, int* __restrict__ tag, uint32_t* __restrict__ host) {
+                                int ring, int* __restrict__ tag, uint32_t* __restrict__ host, int* htag, int* hidx,
+                                int hres) {
     const int t = blockIdx.x, row = kv_lora + n_rot;
     const float* x = kv + (size_t) t * row;
     const int p = pos[t];
@@ -581,7 +595,7 @@ __global__ void kv_store_kernel(const float* __restrict__ kv, int kv_lora, int n
         dst[kv_lora + 2 * i] = __float2half_rn(a);
         dst[kv_lora + 2 * i + 1] = __float2half_rn(b);
     }
-    if (tag) kv_mirror(dst, host + (size_t) p * (row / 2), row / 2, tag, slot, p);
+    if (tag) kv_mirror(dst, host, row / 2, tag, slot, p, htag, hidx, hres);
 }
 
 // ... in Q8_0 rows (kv_q8_row_bytes): the row's values staged in shared memory, then each block of 32 of the latent by
@@ -589,7 +603,8 @@ __global__ void kv_store_kernel(const float* __restrict__ kv, int kv_lora, int n
 // values the F16 kernel stores, before their F16 rounding); the rotated part as F16 after the scales
 __global__ void kv_store_q8_kernel(const float* __restrict__ kv, int kv_lora, int n_rot, const float* __restrict__ w,
                                    float eps, const int* __restrict__ pos, float base, uint8_t* __restrict__ cache,
-                                   int ring, int rb, int* __restrict__ tag, uint32_t* __restrict__ host) {
+                                   int ring, int rb, int* __restrict__ tag, uint32_t* __restrict__ host,
+                                   int* htag, int* hidx, int hres) {
     __shared__ float v[1024];
     const int t = blockIdx.x, row = kv_lora + n_rot;
     const float* x = kv + (size_t) t * row;
@@ -623,7 +638,7 @@ __global__ void kv_store_q8_kernel(const float* __restrict__ kv, int kv_lora, in
         if (lane == 0) sc[b] = dh;
     }
     for (int i = kv_lora + kv_lora / 16 + 2 * n_rot + threadIdx.x; i < rb; i += blockDim.x) dst[i] = 0;   // (its pad)
-    if (tag) kv_mirror(dst, host + (size_t) p * (rb / 4), rb / 4, tag, slot, p);
+    if (tag) kv_mirror(dst, host, rb / 4, tag, slot, p, htag, hidx, hres);
 }
 
 // ---------------------------------------------------------------- MLA attention over the latent cache
@@ -1263,7 +1278,8 @@ __global__ void __launch_bounds__(1024) ix_union_kernel(const int* __restrict__ 
 // (list: row j the position list[j / kpool] kpool + j % kpool - a list of pools' rows; zeros from position kend on)
 __global__ void kv_deq_kernel(const uint8_t* __restrict__ cache, int ring, int kv_lora, int n_rot, int rb, int k0, int n,
                               __half2* __restrict__ dst, const int* __restrict__ list, int kpool,
-                              int kend, const int* __restrict__ tag, const uint8_t* __restrict__ host) {
+                              int kend, const int* __restrict__ tag, const uint8_t* __restrict__ host,
+                              const int* __restrict__ hidx) {
     const size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
     const int half_row = (kv_lora + n_rot) / 2;
     if (i >= (size_t) n * half_row) return;
@@ -1274,7 +1290,7 @@ __global__ void kv_deq_kernel(const uint8_t* __restrict__ cache, int ring, int k
         return;
     }
     bool fh = false;
-    const size_t r = kv_src(q, ring, tag, fh);
+    const size_t r = kv_src(q, ring, tag, hidx, fh);
     const uint8_t* rp = (fh ? host : cache) + r * rb;
     if (2 * c < kv_lora) {
         const char2 qv = *(const char2*) (rp + 2 * c);
@@ -1286,7 +1302,8 @@ __global__ void kv_deq_kernel(const uint8_t* __restrict__ cache, int ring, int k
 }
 __global__ void kv_gather_kernel(const uint4* __restrict__ cache, int ring, int row16, int k0, int n,
                                  uint4* __restrict__ dst, const int* __restrict__ list, int kpool,
-                                 int kend, const int* __restrict__ tag, const uint4* __restrict__ host) {
+                                 int kend, const int* __restrict__ tag, const uint4* __restrict__ host,
+                                 const int* __restrict__ hidx) {
     const size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= (size_t) n * row16) return;
     const int j = (int) (i / row16), c = (int) (i % row16);
@@ -1296,19 +1313,20 @@ __global__ void kv_gather_kernel(const uint4* __restrict__ cache, int ring, int 
         return;
     }
     bool fh = false;
-    const size_t r = kv_src(q, ring, tag, fh);
+    const size_t r = kv_src(q, ring, tag, hidx, fh);
     dst[i] = (fh ? host : cache)[r * row16 + c];
 }
 // a block row a token: its picked rows (row16 uint4s each) side by side
 __global__ void kv_pick_kernel(const uint4* __restrict__ cache, int ring, int row16, const int* __restrict__ keys,
                                int ldk, const int* __restrict__ nk, uint4* __restrict__ dst,
-                               const int* __restrict__ tag, const uint4* __restrict__ host) {
+                               const int* __restrict__ tag, const uint4* __restrict__ host,
+                               const int* __restrict__ hidx) {
     const int t = blockIdx.y;
     const size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
     const int j = (int) (i / row16), c = (int) (i % row16);
     if (j >= nk[t]) return;
     bool fh = false;
-    const size_t r = kv_src(keys[(size_t) t * ldk + j], ring, tag, fh);
+    const size_t r = kv_src(keys[(size_t) t * ldk + j], ring, tag, hidx, fh);
     dst[((size_t) t * ldk + j) * row16 + c] = (fh ? host : cache)[r * row16 + c];
 }
 
@@ -1959,10 +1977,11 @@ void kv_store(const float* kv, int T, int kv_lora, int n_rot, const float* w, fl
     }
     if (q8)
         kv_store_q8_kernel<<<T, 256, 0, s>>>(kv, kv_lora, n_rot, w, eps, pos, base, (uint8_t*) cache, ring,
-                                             (int) kv_q8_row_bytes(kv_lora, n_rot), hs.tag, (uint32_t*) hs.rows);
+                                             (int) kv_q8_row_bytes(kv_lora, n_rot), hs.tag, (uint32_t*) hs.rows,
+                                             hs.htag, hs.hidx, hs.hres);
     else
         kv_store_kernel<<<T, 256, 0, s>>>(kv, kv_lora, n_rot, w, eps, pos, base, (__half*) cache, ring, hs.tag,
-                                          (uint32_t*) hs.rows);
+                                          (uint32_t*) hs.rows, hs.htag, hs.hidx, hs.hres);
     check("kv_store");
 }
 size_t attn_ws_floats(int T, int H, int kv_lora, int max_keys) {
@@ -2163,7 +2182,7 @@ void kv_deq(const uint16_t* cache, int ring, int kv_lora, int n_rot, int k0, int
     kv_deq_kernel<<<(unsigned) ((total + 255) / 256), 256, 0, s>>>((const uint8_t*) cache, ring, kv_lora, n_rot,
                                                                  (int) kv_q8_row_bytes(kv_lora, n_rot), k0, n,
                                                                  (__half2*) dst, list, kpool, kend, hs.tag,
-                                                                 (const uint8_t*) hs.rows);
+                                                                 (const uint8_t*) hs.rows, hs.hidx);
     check("kv_deq");
 }
 void kv_gather(const uint16_t* cache, int ring, int row, int k0, int n, uint16_t* dst, cudaStream_t s, const int* list,
@@ -2173,7 +2192,7 @@ void kv_gather(const uint16_t* cache, int ring, int row, int k0, int n, uint16_t
     if (total == 0) return;
     kv_gather_kernel<<<(unsigned) ((total + 255) / 256), 256, 0, s>>>((const uint4*) cache, ring, row16, k0, n,
                                                                     (uint4*) dst, list, kpool, kend, hs.tag,
-                                                                    (const uint4*) hs.rows);
+                                                                    (const uint4*) hs.rows, hs.hidx);
     check("kv_gather");
 }
 void ix_union(const int* keys, int ldk, const int* nk, int T, int kpool, int n_pool, int* col, int* list, int* n,
@@ -2203,12 +2222,13 @@ __global__ void kv_union_claim_kernel(const int* __restrict__ keys, int ldk, con
 }
 __global__ void kv_union_fetch_kernel(const uint4* __restrict__ cache, int ring, int row16, const int* __restrict__ list,
                                       const int* __restrict__ count, uint4* __restrict__ dst,
-                                      const int* __restrict__ tag, const uint4* __restrict__ host) {
+                                      const int* __restrict__ tag, const uint4* __restrict__ host,
+                                      const int* __restrict__ hidx) {
     const size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
     const int idx = (int) (i / row16), c = (int) (i % row16);
     if (idx >= *count) return;
     bool fh = false;
-    const size_t r = kv_src(list[idx], ring, tag, fh);
+    const size_t r = kv_src(list[idx], ring, tag, hidx, fh);
     dst[i] = (fh ? host : cache)[r * row16 + c];
 }
 __global__ void kv_union_remap_kernel(const int* __restrict__ keys, int ldk, const int* __restrict__ nk, int T,
@@ -2238,7 +2258,7 @@ void kv_pick_union(const uint16_t* cache, int ring, size_t row_bytes, const int*
     kv_union_claim_kernel<<<nb, 256, 0, s>>>(keys, ldk, nk, T, slot, count, list);
     kv_union_fetch_kernel<<<(unsigned) ((n * row16 + 255) / 256), 256, 0, s>>>((const uint4*) cache, ring, row16, list,
                                                                               count, (uint4*) dst, hs.tag,
-                                                                              (const uint4*) hs.rows);
+                                                                              (const uint4*) hs.rows, hs.hidx);
     kv_union_remap_kernel<<<nb, 256, 0, s>>>(keys, ldk, nk, T, slot, keys2);
     kv_union_reset_kernel<<<nb, 256, 0, s>>>(list, count, slot);
     check("kv_pick_union");
@@ -2254,8 +2274,61 @@ void kv_pick(const uint16_t* cache, int ring, size_t row_bytes, const int* keys,
     }
     const dim3 grid((unsigned) (((size_t) ldk * row16 + 255) / 256), (unsigned) T);
     kv_pick_kernel<<<grid, 256, 0, s>>>((const uint4*) cache, ring, row16, keys, ldk, nk, (uint4*) dst, hs.tag,
-                                        (const uint4*) hs.rows);
+                                        (const uint4*) hs.rows, hs.hidx);
     check("kv_pick");
+}
+namespace {
+__global__ void kv_need_kernel(const int* __restrict__ keys, int ldk, const int* __restrict__ nk, int T,
+                               const int* __restrict__ list, int kpool, int kend, int k0, int n, int ring,
+                               const int* __restrict__ tag, int* hidx, int hres, int* fgen, int gen, int* miss,
+                               int* mcount, int cap) {
+    const size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
+    int p;
+    if (keys) {
+        if (i >= (size_t) T * ldk || (int) (i % ldk) >= nk[i / ldk]) return;
+        p = keys[i];
+    } else if (list) {
+        if (i >= (size_t) n * kpool) return;
+        p = list[i / kpool] * kpool + (int) (i % kpool);
+        if (p >= kend) return;
+    } else {
+        if (i >= (size_t) n) return;
+        p = k0 + (int) i;
+    }
+    if (p < 0) return;
+    if (tag && tag[ring > 0 ? p % ring : p] == p) return;
+    const int h = hidx[p];
+    if (h >= hres) {
+        fgen[h - hres] = gen;
+        return;
+    }
+    if (h != -1) return;
+    if (atomicCAS(hidx + p, -1, -2) == -1) {
+        const int k = atomicAdd(mcount, 1);
+        if (k < cap) miss[k] = p;
+    }
+}
+__global__ void kv_hidx_kernel(const int* __restrict__ set, int n_set, const int* __restrict__ drop, int n_drop,
+                               int* hidx) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n_drop) atomicCAS(hidx + drop[2 * i], drop[2 * i + 1], -1);
+    if (i < n_set) hidx[set[2 * i]] = set[2 * i + 1];
+}
+}
+void kv_need(const int* keys, int ldk, const int* nk, int T, const int* list, int kpool, int kend, int k0, int n,
+             int ring, const KvHost& hs, int* fgen, int gen, int* miss, int* mcount, int cap, cudaStream_t s) {
+    const size_t total = keys ? (size_t) T * ldk : list ? (size_t) n * kpool : (size_t) n;
+    if (total == 0 || !hs.hidx) return;
+    kv_need_kernel<<<(unsigned) ((total + 255) / 256), 256, 0, s>>>(keys, ldk, nk, T, list, kpool, kend, k0, n, ring,
+                                                                   hs.tag, hs.hidx, hs.hres, fgen, gen, miss, mcount,
+                                                                   cap);
+    check("kv_need");
+}
+void kv_hidx(const int* set, int n_set, const int* drop, int n_drop, int* hidx, cudaStream_t s) {
+    const int n = std::max(n_set, n_drop);
+    if (n <= 0) return;
+    kv_hidx_kernel<<<(unsigned) ((n + 255) / 256), 256, 0, s>>>(set, n_set, drop, n_drop, hidx);
+    check("kv_hidx");
 }
 namespace {
 __global__ void bf16_f32_kernel(const uint16_t* __restrict__ src, float* __restrict__ dst, size_t n) {
