@@ -505,15 +505,18 @@ constexpr int kKC = 128, kKCmin = 32, kTile = 32;   // (a chunk's keys: kKC, or 
 constexpr int kRowW = 288;   // words a row (kv_lora 512 + rope 64, F16)
 // (Q8: the cache's Q8_0 rows of rb bytes - the latent's int8 values, its 16 blocks' F16 scales, the rotated part's F16
 // values -, dequantized to F16 as the tile is loaded: the same arithmetic after it)
-template <bool Q8>
-__global__ void __launch_bounds__(256) attn_kernel(const float* __restrict__ q, int H, const void* __restrict__ cache_v,
-                                                   int ring, const int* __restrict__ keys, int ldk,
-                                                   const int* __restrict__ lo, const int* __restrict__ nk, float scale,
-                                                   int nchunk, int kc, float* __restrict__ ws, int rb) {
+// HB: the heads a block (a warp each; grid y ceil(H / HB)) - every head's sums the same whichever HB, only the tiles a
+// key is read into: 8 (NVIDIA), 32 on AMD (a gathered key read once for 32 heads rather than 4 times: the indexed
+// layers' prompt attention past the dense span and the decode steps' attention are bound by those reads on a Radeon)
+template <bool Q8, int HB = 8>
+__global__ void __launch_bounds__(32 * HB) attn_kernel(const float* __restrict__ q, int H, const void* __restrict__ cache_v,
+                                                       int ring, const int* __restrict__ keys, int ldk,
+                                                       const int* __restrict__ lo, const int* __restrict__ nk, float scale,
+                                                       int nchunk, int kc, float* __restrict__ ws, int rb) {
     __shared__ __half2 tile[kTile][kRowW];
     __shared__ int rows[kTile];
     const int c = blockIdx.x, t = blockIdx.z, w = threadIdx.x >> 5, lane = threadIdx.x & 31;
-    const int h = blockIdx.y * 8 + w;
+    const int h = blockIdx.y * HB + w;
     const int n = nk[t], k0 = c * kc, k1 = min(n, k0 + kc);
     float qr[18];
     if (h < H) {
@@ -1492,6 +1495,21 @@ size_t attn_ws_floats(int T, int H, int kv_lora, int max_keys) {
     return std::max((size_t) T * H * ((max_keys + kKC - 1) / kKC),
                     (size_t) kMaxWin * H * ((max_keys + kKCmin - 1) / kKCmin)) * (kv_lora + 2);
 }
+namespace {
+// attn_kernel's heads a block: 8 on NVIDIA, 32 on AMD (HY4_ATTN_HB=8 / 16 / 32 sets it there - the same sums)
+int attn_heads_a_block() {
+#if defined(STRATA_USE_HIP)
+    static const int hb = [] {
+        const char* e = std::getenv("HY4_ATTN_HB");
+        const int v = e ? std::atoi(e) : 32;
+        return v == 8 || v == 16 ? v : 32;
+    }();
+    return hb;
+#else
+    return 8;
+#endif
+}
+}  // namespace
 void attention(const float* q, int T, int H, int kv_lora, int n_rot, const uint16_t* cache, int ring, const int* keys,
                int ldk, const int* lo, const int* nk, int max_keys, float scale, const float* sinks, float* ws,
                float* out, cudaStream_t s, bool q8) {
@@ -1503,12 +1521,19 @@ void attention(const float* q, int T, int H, int kv_lora, int n_rot, const uint1
     // (every window of the token path - a decode step, a draft's verify window - in chunks of kKCmin: a token's sums are
     // the same whichever window it is in, so drafting does not change a greedy answer)
     const int kc = T <= kMaxWin ? kKCmin : kKC, nchunk = (max_keys + kc - 1) / kc;
-    const dim3 grid((unsigned) nchunk, (unsigned) ((H + 7) / 8), (unsigned) T);
-    if (q8)
-        attn_kernel<true><<<grid, 256, 0, s>>>(q, H, cache, ring, keys, ldk, lo, nk, scale, nchunk, kc, ws,
-                                               (int) kv_q8_row_bytes(kv_lora, n_rot));
-    else
-        attn_kernel<false><<<grid, 256, 0, s>>>(q, H, cache, ring, keys, ldk, lo, nk, scale, nchunk, kc, ws, 0);
+    const int rb = q8 ? (int) kv_q8_row_bytes(kv_lora, n_rot) : 0;
+    const int hb = attn_heads_a_block();
+    const dim3 grid((unsigned) nchunk, (unsigned) ((H + hb - 1) / hb), (unsigned) T);
+    if (hb == 32) {
+        if (q8) attn_kernel<true, 32><<<grid, 1024, 0, s>>>(q, H, cache, ring, keys, ldk, lo, nk, scale, nchunk, kc, ws, rb);
+        else attn_kernel<false, 32><<<grid, 1024, 0, s>>>(q, H, cache, ring, keys, ldk, lo, nk, scale, nchunk, kc, ws, rb);
+    } else if (hb == 16) {
+        if (q8) attn_kernel<true, 16><<<grid, 512, 0, s>>>(q, H, cache, ring, keys, ldk, lo, nk, scale, nchunk, kc, ws, rb);
+        else attn_kernel<false, 16><<<grid, 512, 0, s>>>(q, H, cache, ring, keys, ldk, lo, nk, scale, nchunk, kc, ws, rb);
+    } else {
+        if (q8) attn_kernel<true><<<grid, 256, 0, s>>>(q, H, cache, ring, keys, ldk, lo, nk, scale, nchunk, kc, ws, rb);
+        else attn_kernel<false><<<grid, 256, 0, s>>>(q, H, cache, ring, keys, ldk, lo, nk, scale, nchunk, kc, ws, 0);
+    }
     check("attention");
     attn_combine_kernel<<<dim3((unsigned) H, (unsigned) T), 512, 0, s>>>(H, nchunk, kc, nk, sinks, ws, out);
     check("attn_combine");
