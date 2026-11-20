@@ -15,7 +15,10 @@
 // chunk sends them to the GPU instead where this PC's PCIe is measured faster than its CPU.  --profile: an expert
 // profile (uint32 [layers][experts] routings) - each layer's most routed experts are the ones kept in VRAM;
 // --profile-out: where the routings this run counts (with the profile's) are written, after each request when serving
-// and at the end otherwise.
+// and at the end otherwise.  HY4_HOT=1 (opt-in: the text differs from without it): the experts in VRAM follow the
+// generated tokens' routing - every HY4_HOT_EVERY (8) token steps up to HY4_HOT_SWAPS (64) cold ones trade places with
+// hotter CPU-lane ones, more between requests; the scores are kept over restarts in HY4_HOT_FILE
+// (<pack>/expert-hot.bin), and a start places each layer's highest scored experts in VRAM; HY4_HOT_LOG=1 logs.
 //
 // --mtp: the GGUF's MTP block drafts up to --draft tokens (3) a step, each verified by the model in one window with the
 // token before it; a draft below --draft-floor (0.55: the block's probability of its own pick) ends the drafts.  Greedy:
@@ -867,6 +870,7 @@ int serve(hy4::Model& m, const std::vector<int>& eos, int n_draft, float floor0)
         {
             std::string perr;
             if (!m.save_profile(perr)) std::fprintf(stderr, "hy4: the expert profile: %s\n", perr.c_str());
+            m.idle();   // (HY4_HOT: its larger round of swaps while the answer is read)
         }
         std::fprintf(stderr,
                      "maya hy4 serve: prompt %zu tokens = %zu reused + %zu read in %.0f ms (%.1f tok/s), %lld generated "
