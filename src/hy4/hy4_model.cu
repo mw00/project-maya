@@ -1524,20 +1524,32 @@ struct Model::Impl {
                 // The group does not hold every routed expert: each member takes as many of every layer's as its VRAM
                 // holds (unsplit, the most routed first) and the others are the CPU lane's, as on the layer split: the
                 // cache in 8-bit rows where --kv auto allows (more experts in VRAM), the MTP block's pass in line
+                // (asked for: --tp N, or HY4_TP_LANE=1 for --tp auto.  Unasked, --tp auto keeps the layer split - its
+                //  layout and answers as before - and the INFO line says what the group would hold)
                 {
+                    const char* le = std::getenv("HY4_TP_LANE");
+                    const bool asked = o.tp > 0 || (le && std::atoi(le) != 0);
                     const bool was = kv_q8;
                     if (o.kv < 0 && kv_q8_rows()) kv_q8 = true;
                     undo();
                     fb = free_b;
                     std::string tl;
-                    if (tensor_split(ndev, devs, fb, tl, N, false, true)) {
-                        long long held = 0;
-                        for (int c : tp_cap) held += c;
+                    const bool fit_l = tensor_split(ndev, devs, fb, tl, N, false, true);
+                    long long held = 0;
+                    for (int c : tp_cap) held += c;
+                    const double pct = 100.0 * (double) std::min<long long>(held, g.n_expert) / g.n_expert;
+                    if (fit_l && !asked) {
+                        char lb[200];
+                        std::snprintf(lb, sizeof lb, "the group would hold %.0f%% of the routed experts (HY4_TP_LANE=1 "
+                                      "or --tp %d takes it)", pct, N);
+                        tl = lb;
+                        undo();
+                    } else if (fit_l) {
                         char lb[400];
                         std::snprintf(lb, sizeof lb, "INFO tensor parallel with the CPU lane: the group holds %.0f%% of the "
                                       "routed experts beside its own parts and caches (%s); the others are computed on the "
                                       "CPU for a token and sent to the GPUs for a prompt chunk, a share to each",
-                                      100.0 * (double) std::min<long long>(held, g.n_expert) / g.n_expert, terr.c_str());
+                                      pct, terr.c_str());
                         info.push_back(lb);
                         if (kv_q8 && !was) info.push_back("INFO the latent cache in 8-bit rows (--kv auto)");
                         return true;
@@ -4655,7 +4667,10 @@ struct Model::Impl {
             if (share) {   // (the lane's pool is one caller's: a member's own threads)
                 std::atomic<int> next{0};
                 std::vector<std::thread> th;
-                for (int w = 0; w < std::min(kShareThreads, np * 3); ++w)
+                // (the lane's cores shared out over the members, kShareThreads at least: the copies are bound by the
+                //  RAM's speed, and 8 a member was a sixth of the lane's rate on 2 of 3 Tesla V100s of a 40-core PC)
+                const int nth = std::max(kShareThreads, (lane ? lane->threads() + 1 : 0) / std::max(1, tp));
+                for (int w = 0; w < std::min(nth, np * 3); ++w)
                     th.emplace_back([&] {
                         for (int it; (it = next.fetch_add(1)) < np * 3;) copy(it);
                     });
