@@ -2487,7 +2487,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                            a.r.top_k, a.r.min_p, a.r.seed, a.counter, a.got, off, acc, err, a.r.cum, L, dc)) {
                     std::fprintf(stderr, "ds4: %s\n", err.c_str());
                     fault_why = err;
-                    a.a.finish = err.rfind("grammar:", 0) == 0 ? "grammar" : "cancel";
+                    a.finish = err.rfind("grammar:", 0) == 0 ? "grammar" : "cancel";
                     a.done = true;
                 } else {
                     a.d_off += off;

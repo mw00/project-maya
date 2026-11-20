@@ -268,7 +268,8 @@ for line in sys.stdin:
     if line.split()[1] == "9":
         pending[rid] = path
     else:
-        print(f"DONE {rid} 1 3 1.0 1.0 stop 0 0 0", flush=True)
+        finish = "grammar" if char == "F" else "stop"
+        print(f"DONE {rid} 1 3 1.0 1.0 {finish} 0 0 0", flush=True)
 '''
         with tempfile.TemporaryDirectory() as directory:
             tempdir = Path(directory) / "spaced 目录"
@@ -296,6 +297,9 @@ for line in sys.stdin:
                     self.assertEqual(next(gen), 69)
                     self.assertEqual(len(list(tempdir.glob("*.gbnf"))), 1)
                     gen.close()
+                    with self.assertRaisesRegex(ValueError, "no valid token"):
+                        call("F")
+                    self.assertEqual(call("G"), [71])
                 self.assertEqual(engine._routes, {})
                 self.assertEqual(list(tempdir.glob("*.gbnf")), [])
                 self.assertIsNone(engine.proc.poll())  # the fake native's ownership assertions did not fail
@@ -316,6 +320,24 @@ for line in sys.stdin:
         self.assertEqual(next(gen), 65)
         with self.assertRaisesRegex(ValueError, "no valid token"):
             next(gen)
+
+    def test_recoverable_grammar_failure_keeps_engine_and_next_request_clean(self):
+        import io
+        import queue
+        from types import SimpleNamespace
+        engine = StrataEngine.__new__(StrataEngine)
+        engine.proc = SimpleNamespace(stdin=io.StringIO(), poll=lambda: None)
+        engine.lines = queue.Queue()
+        engine.can_stop = False
+        for line in ("T 65", "DONE 1 3 1.0 1.0 grammar 0 0 0",
+                     "T 66", "DONE 1 3 1.0 1.0 stop 0 0 0"):
+            engine.lines.put(line)
+        with self.assertRaisesRegex(ValueError, "no valid token"):
+            list(engine.generate([1, 2, 3], 8, {}, threading.Event()))
+        self.assertFalse(getattr(engine, "ended", False))
+        self.assertEqual(list(engine.generate([4, 5, 6], 8, {}, threading.Event())), [66])
+        self.assertEqual(engine.last["finish"], "stop")
+        self.assertNotIn("STOP", engine.proc.stdin.getvalue())
 
     def test_http_four_requests_stream_nonstream_and_bad_request(self):
         svc = self.service()
