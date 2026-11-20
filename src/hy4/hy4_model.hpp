@@ -58,6 +58,7 @@ struct Options {
     bool vision_auto = true;      // (not asked for by name: a pack without one runs text only, no error)
     bool room_report = false;     // --room-report: say how much less free VRAM each GPU could have had with this start's
                                   // choices unchanged (Model::room_report; the plan only - the start is the same)
+    std::string gpu_fetch;        // --gpu-fetch off|auto|gpu|lane|K (empty: HY4_FETCH, else off) - see Impl::Fetch
     bool verbose = false;
 };
 

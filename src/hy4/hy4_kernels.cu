@@ -1045,22 +1045,25 @@ __global__ void __launch_bounds__(512) router_bitonic_kernel(const float* __rest
 // one thread (a window has at most 16 x 16 entries): counting sort of the entries by expert
 __global__ void group_kernel(const int* __restrict__ ids, int T, int n_used, int n_exp, const uint8_t* base,
                              size_t stride, unsigned long long* grp_ptr, int* grp_start, int* grp_ent, int* n_groups,
-                             const int* __restrict__ slot, float* __restrict__ w) {
+                             const int* __restrict__ slot, float* __restrict__ w,
+                             const unsigned long long* __restrict__ eptr, const int* __restrict__ who) {
     __shared__ int cnt[1024], at[1024];
+    // (an entry left out: the CPU lane's - who's flag, else no blob in eptr, else no slot)
+    auto out_of = [&](int i, int e) { return who ? who[i] != 0 : eptr ? eptr[e] == 0ull : slot && slot[e] < 0; };
     for (int e = threadIdx.x; e < n_exp; e += blockDim.x) cnt[e] = 0;
     __syncthreads();
     if (threadIdx.x != 0) return;
     for (int t = 0; t < T; ++t)
         for (int j = 0; j < n_used; ++j) {
             const int e = ids[t * n_used + j];
-            if (slot && slot[e] < 0) w[t * n_used + j] = 0.0f;   // (the CPU lane's)
+            if (out_of(t * n_used + j, e)) w[t * n_used + j] = 0.0f;   // (the CPU lane's)
             else ++cnt[e];
         }
     int g = 0, off = 0;
     for (int e = 0; e < n_exp; ++e) {
         at[e] = off;
         if (cnt[e]) {
-            grp_ptr[g] = (unsigned long long) (base + (size_t) (slot ? slot[e] : e) * stride);
+            grp_ptr[g] = eptr ? eptr[e] : (unsigned long long) (base + (size_t) (slot ? slot[e] : e) * stride);
             grp_start[g] = off;
             ++g;
             off += cnt[e];
@@ -1071,7 +1074,7 @@ __global__ void group_kernel(const int* __restrict__ ids, int T, int n_used, int
     for (int t = 0; t < T; ++t)
         for (int j = 0; j < n_used; ++j) {
             const int e = ids[t * n_used + j];
-            if (!slot || slot[e] >= 0) grp_ent[at[e]++] = t * 16 + j;
+            if (!out_of(t * n_used + j, e)) grp_ent[at[e]++] = t * 16 + j;
         }
 }
 // ... the same groups and the same entry order (by expert, then t 16 + j), a thread an expert: the window's entries
@@ -1081,13 +1084,15 @@ __global__ void __launch_bounds__(1024) group_par_kernel(const int* __restrict__
                                                          const uint8_t* base, size_t stride,
                                                          unsigned long long* grp_ptr, int* grp_start, int* grp_ent,
                                                          int* n_groups, const int* __restrict__ slot,
-                                                         float* __restrict__ w) {
+                                                         float* __restrict__ w,
+                                                         const unsigned long long* __restrict__ eptr,
+                                                         const int* __restrict__ who) {
     __shared__ int ent[16 * 16];
     __shared__ int sc[1024], sg[1024];
     const int e = threadIdx.x, n_ent = T * n_used;
     for (int i = threadIdx.x; i < n_ent; i += blockDim.x) {
         const int x = ids[i];
-        const bool out = slot && slot[x] < 0;
+        const bool out = who ? who[i] != 0 : eptr ? eptr[x] == 0ull : slot && slot[x] < 0;
         if (out) w[i] = 0.0f;   // (not this GPU's)
         ent[i] = out ? -1 : x;
     }
@@ -1108,7 +1113,7 @@ __global__ void __launch_bounds__(1024) group_par_kernel(const int* __restrict__
     }
     const int off = sc[e] - c, gi = sg[e] - (c > 0);
     if (e < n_exp && c > 0) {
-        grp_ptr[gi] = (unsigned long long) (base + (size_t) (slot ? slot[e] : e) * stride);
+        grp_ptr[gi] = eptr ? eptr[e] : (unsigned long long) (base + (size_t) (slot ? slot[e] : e) * stride);
         grp_start[gi] = off;
         int k = off;
         for (int i = 0; i < n_ent; ++i)
@@ -1122,9 +1127,16 @@ __global__ void __launch_bounds__(1024) group_par_kernel(const int* __restrict__
     }
 }
 __global__ void plan_kernel(const int* ids, int n_used, const uint8_t* base, size_t stride, unsigned long long* plan,
-                            const int* __restrict__ slot, float* __restrict__ w) {
+                            const int* __restrict__ slot, float* __restrict__ w,
+                            const unsigned long long* __restrict__ eptr, const int* __restrict__ who) {
     const int j = threadIdx.x;
     if (j >= n_used) return;
+    if (eptr) {   // (the GPU fetch: the blob where it lies, or the CPU lane's)
+        const unsigned long long p = who && who[j] != 0 ? 0ull : eptr[ids[j]];
+        plan[j] = p;
+        if (p == 0ull) w[j] = 0.0f;
+        return;
+    }
     const int s = slot ? slot[ids[j]] : ids[j];
     plan[j] = s >= 0 ? (unsigned long long) (base + (size_t) s * stride) : 0ull;   // (0: the CPU lane's)
     if (s < 0) w[j] = 0.0f;
@@ -2057,19 +2069,146 @@ void router(const float* logits, int T, int n_exp, const float* bias, int n_used
 }
 void group_experts(const int* ids, int T, int n_used, int n_exp, const uint8_t* base, size_t stride,
                    unsigned long long* grp_ptr, int* grp_start, int* grp_ent, int* n_groups, cudaStream_t s,
-                   const int* slot, float* w) {
+                   const int* slot, float* w, const unsigned long long* eptr, const int* who) {
     static const bool serial = std::getenv("HY4_GROUP_SERIAL") != nullptr;   // (the earlier one-thread sort)
     if (!serial && n_exp <= 1024)
         group_par_kernel<<<1, 1024, 0, s>>>(ids, T, n_used, n_exp, base, stride, grp_ptr, grp_start, grp_ent, n_groups,
-                                            slot, w);
+                                            slot, w, eptr, who);
     else
-        group_kernel<<<1, 256, 0, s>>>(ids, T, n_used, n_exp, base, stride, grp_ptr, grp_start, grp_ent, n_groups, slot, w);
+        group_kernel<<<1, 256, 0, s>>>(ids, T, n_used, n_exp, base, stride, grp_ptr, grp_start, grp_ent, n_groups, slot, w,
+                                       eptr, who);
     check("group_experts");
 }
 void plan_experts(const int* ids, int n_used, const uint8_t* base, size_t stride, unsigned long long* plan,
-                  cudaStream_t s, const int* slot, float* w) {
-    plan_kernel<<<1, 32, 0, s>>>(ids, n_used, base, stride, plan, slot, w);
+                  cudaStream_t s, const int* slot, float* w, const unsigned long long* eptr, const int* who) {
+    plan_kernel<<<1, 32, 0, s>>>(ids, n_used, base, stride, plan, slot, w, eptr, who);
     check("plan_experts");
+}
+// One block of 1024 threads (n_exp <= 1024, T n_used <= 256): see fetch_resolve.  Every choice is a function of the
+// window's picks and the layer's state alone (ranks by score with the expert's number breaking ties; the staging slot a
+// miss lands in may vary from run to run, where it lies does not change what is computed)
+__global__ void __launch_bounds__(1024) fetch_resolve_kernel(const int* __restrict__ ids, int T, int n_used,
+                                                             FetchLayer fl, FetchScratch fs, int k_gpu, int cache,
+                                                             float decay) {
+    __shared__ int ent[kMaxWin * 16];
+    __shared__ int cnt[1024], miss_e[kMaxWin * 16], vict_e[kMaxWin * 16];
+    __shared__ float sc[1024];
+    __shared__ unsigned char gpu_e[1024], kind[1024];   // kind: 1 a miss, 2 a victim candidate
+    __shared__ int n_miss, n_vict, n_fetch, n_stage, n_hit, n_lane, n_zc, n_adm;
+    const int tid = threadIdx.x, n_ent = T * n_used, n_exp = fl.n_exp;
+    if (tid == 0) n_miss = n_vict = n_fetch = n_stage = n_hit = n_lane = n_zc = n_adm = 0;
+    for (int i = tid; i < n_ent; i += blockDim.x) ent[i] = ids[i];
+    if (tid < n_exp) {
+        cnt[tid] = 0;
+        gpu_e[tid] = 0;
+    }
+    __syncthreads();
+    if (tid < T) {   // (a token's entries in pick order: its VRAM ones, then its first k_gpu others, this GPU's)
+        int g = 0, hit = 0, lane = 0;
+        for (int j = 0; j < n_used; ++j) {
+            const int i = tid * n_used + j, e = ent[i];
+            const bool res = fl.slot[e] >= 0;
+            const bool mine = res || k_gpu < 0 || g < k_gpu;
+            if (!res && mine) ++g;
+            fs.who[i] = mine ? 0 : 1;
+            if (mine) gpu_e[e] = 1;
+            hit += res;
+            lane += !mine;
+            atomicAdd(&cnt[e], 1);
+        }
+        atomicAdd(&n_hit, hit);
+        atomicAdd(&n_lane, lane);
+    }
+    __syncthreads();
+    if (tid < n_exp) {
+        const int s = fl.slot[tid];
+        float v = 0.0f;
+        if (cache) {
+            v = fl.score[tid] * powf(decay, (float) T) + (float) cnt[tid];
+            fl.score[tid] = v;
+        }
+        sc[tid] = v;
+        kind[tid] = gpu_e[tid] && s < 0 ? 1 : cache && s >= 0 && cnt[tid] == 0 ? 2 : 0;
+    }
+    __syncthreads();
+    if (tid < n_exp && kind[tid] != 0) {   // ranks: the misses by score down, the victims by score up
+        const float v = sc[tid];
+        const bool m = kind[tid] == 1;
+        int r = 0;
+        for (int e = 0; e < n_exp; ++e)
+            if (kind[e] == kind[tid] && (m ? (sc[e] > v || (sc[e] == v && e < tid)) : (sc[e] < v || (sc[e] == v && e < tid))))
+                ++r;
+        if (m) {
+            miss_e[r] = tid;   // (r < n_ent: at most a miss an entry)
+            atomicAdd(&n_miss, 1);
+        } else {
+            if (r < kMaxWin * 16) vict_e[r] = tid;
+            atomicAdd(&n_vict, 1);
+        }
+    }
+    __syncthreads();
+    if (tid < n_miss) {   // miss r against victim r: the cache takes it when it scores higher (no admission past one
+                          //  that does not - the misses' scores fall as the victims' rise)
+        const int m = miss_e[tid];
+        unsigned long long dst = 0ull;
+        if (cache && tid < n_vict && tid < kMaxWin * 16 && sc[m] > sc[vict_e[tid]]) {
+            const int v = vict_e[tid], sl = fl.slot[v];
+            fl.slot[v] = -1;
+            fl.slot[m] = sl;
+            fl.owner[sl] = m;
+            dst = (unsigned long long) (fl.vram + (size_t) sl * fl.blob);
+            atomicAdd(&n_adm, 1);
+        } else {
+            const int k = atomicAdd(&n_stage, 1);
+            if (k < fs.n_stage) dst = (unsigned long long) (fs.stage + (size_t) k * fl.blob);
+        }
+        if (dst != 0ull) {
+            const int f = atomicAdd(&n_fetch, 1);
+            fs.src[f] = fl.hptr[m];
+            fs.dst[f] = dst;
+            fs.eptr[m] = dst;
+        } else {
+            fs.eptr[m] = fl.hptr[m];   // (no slot left: the kernels read it where it lies)
+            atomicAdd(&n_zc, 1);
+        }
+    }
+    __syncthreads();
+    if (tid < n_exp && kind[tid] != 1) {
+        const int s = fl.slot[tid];
+        fs.eptr[tid] = gpu_e[tid] && s >= 0 ? (unsigned long long) (fl.vram + (size_t) s * fl.blob) : 0ull;
+    }
+    if (tid == 0) {
+        *fs.nf = (unsigned) n_fetch;
+        if (fs.stats) {
+            atomicAdd(&fs.stats[0], (unsigned long long) n_ent);
+            atomicAdd(&fs.stats[1], (unsigned long long) n_hit);
+            atomicAdd(&fs.stats[2], (unsigned long long) n_fetch);
+            atomicAdd(&fs.stats[3], (unsigned long long) n_zc);
+            atomicAdd(&fs.stats[4], (unsigned long long) n_lane);
+            atomicAdd(&fs.stats[5], (unsigned long long) n_adm);
+        }
+    }
+}
+// the listed copies one after another, each by the whole grid in 16-byte words (pinned RAM read over the bus)
+__global__ void __launch_bounds__(256) fetch_copy_kernel(const unsigned long long* __restrict__ src,
+                                                         const unsigned long long* __restrict__ dst,
+                                                         const unsigned* __restrict__ nf, size_t n16) {
+    const unsigned n = *nf;
+    const size_t step = (size_t) gridDim.x * blockDim.x;
+    for (unsigned f = 0; f < n; ++f) {
+        const uint4* a = (const uint4*) src[f];
+        uint4* b = (uint4*) dst[f];
+        for (size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x; i < n16; i += step) b[i] = a[i];
+    }
+}
+void fetch_resolve(const int* ids, int T, int n_used, const FetchLayer& fl, const FetchScratch& fs, int k_gpu,
+                   bool cache, float decay, cudaStream_t s) {
+    fetch_resolve_kernel<<<1, 1024, 0, s>>>(ids, T, n_used, fl, fs, k_gpu, cache ? 1 : 0, decay);
+    check("fetch_resolve");
+}
+void fetch_copy(const FetchScratch& fs, size_t blob, int blocks, cudaStream_t s) {
+    fetch_copy_kernel<<<(unsigned) std::max(1, blocks), 256, 0, s>>>(fs.src, fs.dst, fs.nf, (blob + 15) / 16);
+    check("fetch_copy");
 }
 void moe_sum(const float* part, int T, int n_used, int n, const float* w, float* out, cudaStream_t s) {
     moe_sum_kernel<<<dim3((unsigned) ((n + 255) / 256), (unsigned) T), 256, 0, s>>>(part, n_used, n, w, out, 16);

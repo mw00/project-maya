@@ -3,8 +3,14 @@
 //   maya-hy4 --pack <model>/maya-hy4 --serve [--gpus 0,1,...] [--max-context N] [--chunk N] [--eos id,id,...]
 //            [--mtp | --dfly2 [--draft N] [--draft-floor P]] [--vram-experts F] [--cpu-threads N] [--profile F] [--profile-out F]
 //            [--tp N|auto] [--main-gpu I] [--vision on|off] [--kv auto|f16|q8]
-//            [--kv-streaming on|off|auto] [--kv-resident N] [--room-report]
+//            [--kv-streaming on|off|auto] [--kv-resident N] [--room-report] [--gpu-fetch off|auto|gpu|lane|K]
 //
+// --gpu-fetch (HY4_FETCH; off by default): the routed experts VRAM does not hold copied into pinned RAM, and the GPU
+// fetching the ones a token routes to it over the bus itself - gpu: all of them on the GPU (the experts in VRAM follow
+// the routing), K: each token's first K of them a layer on the GPU and the rest on the CPU lane beside it, lane: the
+// CPU lane alone (as off), auto: whichever of them a short decode at the first start measures fastest on this PC
+// (remembered; HY4_FETCH_MEASURE=1 or maya --speed-calibration measures again).  gpu / K change the answers in the last
+// bits against the CPU lane's (each choice's own are the same from run to run, drafting or not).
 // --room-report (the server's, at a first start on a PC whose cards it has no figure for): an INFO line says, for
 // each GPU, its free VRAM as the plan read it and how much less of it this start's choices would hold with (the
 // cache's rows, KV streaming, the drafter's room, the pictures, the layout) - worked out on the plan alone.
@@ -1173,6 +1179,7 @@ int main(int argc, char** argv) {
         }
         else if (a == "--vram-experts") o.vram_experts = std::atof(next().c_str());
         else if (a == "--cpu-threads") o.cpu_threads = std::atoi(next().c_str());
+        else if (a == "--gpu-fetch") o.gpu_fetch = next();
         else if (a == "--profile") o.profile = next();
         else if (a == "--tp") {
             const std::string v = next();
