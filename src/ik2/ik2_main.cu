@@ -151,8 +151,11 @@ float bf16_to_f32(uint16_t b) {
 
 struct Config {
     int n_layer, C, H, KV, D, E, K, F, window, d_rel, extent, extent_swa, block, n_vocab, n_rows;
+    // A looped model (Inkling-2-Mini): the layers core0 .. core1 - 1 (whole blocks) run n_pass times a token, so a
+    // token is n_visit layer visits (n_layer without a loop).  rank: the rank of the loop's message gates.
+    int n_visit = 0, n_pass = 1, core0 = 0, core1 = 0, rank = 0;
     float eps, route_scale, qk_clip, rel_clip, alpha, n_floor, gate_cap, up_cap, logit_cap;
-    std::vector<bool> sliding;
+    std::vector<bool> sliding;   // by layer
 };
 
 // a dense matrix as the GGUF holds it, in VRAM: its blocks [N][K]
@@ -185,7 +188,10 @@ struct Layer {
     bool host_contig = false;
     size_t slot_bytes = 0;
     std::vector<float> scale[3];                   // empty: 1
-    // the state
+    // a looped core's layer: its later passes' message gates by module (0 q's, 1 k's, 2 v's, 3 the MoE's) -
+    // down [rank][2 C], forget and gain [rank][C] - and the four messages' queries [4][C] in that order (F32)
+    float *lp_down[4] = {}, *lp_forget[4] = {}, *lp_gain[4] = {}, *lp_query = nullptr;
+    // the state: of the visit being run (bind_visit)
     uint16_t *kc = nullptr, *vc = nullptr;         // FP16 [kv_cap][KV * D] (IK2_KV=f16)
     uint8_t *kc8 = nullptr, *vc8 = nullptr;        // FP8 E4M3 [kv_cap][KV * D] (IK2_KV=fp8)
     int kv_cap = 0;
@@ -193,14 +199,37 @@ struct Layer {
     float *rec_old[4] = {}, *rec_x[4] = {};        // (speculative) the convs' histories and inputs of a verify window
 };
 
+// A layer visit and its own state.  Without a loop a visit is a layer; a looped core's layer is visited once a pass,
+// each time with that visit's K / V cache and conv histories (the weights, and the experts in the cache, are the
+// layer's).  bind_visit() points the layer's state at a visit's before it runs.
+struct Visit {
+    int l = 0;        // the layer
+    int pass = 0;     // the core's pass (0: its first, or a layer outside the core)
+    uint16_t *kc = nullptr, *vc = nullptr;
+    uint8_t *kc8 = nullptr, *vc8 = nullptr;
+    int kv_cap = 0;
+    float *h_k = nullptr, *h_v = nullptr, *h_attn = nullptr, *h_mlp = nullptr;
+    float *rec_old[4] = {}, *rec_x[4] = {};
+};
+
 struct Model {
     Config c;
     std::vector<Layer> L;
+    std::vector<Visit> V;   // the visits of a token, in order
     Mat out_w;            // [n_rows][C]
     float *out_norm, *out_res_score, *embd_norm;
     const uint8_t* embd;  // host Q8_0 [n_rows][C]
     int embd_type;
 };
+
+inline Layer& bind_visit(Model& M, int v) {
+    const Visit& Vi = M.V[v];
+    Layer& Ly = M.L[Vi.l];
+    Ly.kc = Vi.kc, Ly.vc = Vi.vc, Ly.kc8 = Vi.kc8, Ly.vc8 = Vi.vc8, Ly.kv_cap = Vi.kv_cap;
+    Ly.h_k = Vi.h_k, Ly.h_v = Vi.h_v, Ly.h_attn = Vi.h_attn, Ly.h_mlp = Vi.h_mlp;
+    for (int i = 0; i < 4; ++i) Ly.rec_old[i] = Vi.rec_old[i], Ly.rec_x[i] = Vi.rec_x[i];
+    return Ly;
+}
 
 // ---- the device helpers
 
@@ -996,6 +1025,11 @@ struct Work {
     std::vector<int> gi_idx;
     uint32_t stamp = 0;
     float* logits;
+    // A looped core's passes ([Tm][C] each): the stream the core was first given; the bank of the pass before (the
+    // blocks it added after its first, then its final stream); a layer's four messages (q's, k's, v's, the MoE's);
+    // its three attention inputs before the messages.
+    float *lp_pre = nullptr, *lp_bank = nullptr, *lp_msg = nullptr, *lp_in = nullptr;
+    float* lp_g = nullptr;   // a message gate's scratch [Tm][rank]
 };
 
 // --serve: SIGUSR1 asks the request running to stop (its client went away) at its next token or prompt chunk
@@ -1067,10 +1101,21 @@ __global__ void scatter_add_rows_kernel(const float* __restrict__ y, const int* 
     }
 }
 
+// Y [T] rows (ldy) = rows [r0, r0 + n) of a dense matrix over X: a fused projection's part that takes its own input
+void matmul_rows(const Mat& m, int r0, int n, const float* x32, const uint16_t* x16, int T, float* Y, int ldy) {
+    Mat p = m;
+    p.N = n;
+    if (m.f16) p.f16 = m.f16 + (size_t) r0 * m.K;
+    else p.raw = m.raw + (size_t) r0 * (m.K / k::block_values(m.type)) * k::block_bytes(m.type);
+    matmul(p, x32, x16, T, Y, ldy);
+}
+
 // One layer's attention + post-attention conv + residual into r_out ([T][C]).
 // h_in ([T][C]) is unmodified and acts as the residual input; when l % c.block == 0, it is saved to blk(nb).
+// msg: a looped core's later pass - the layer's messages [4][T][C] (q's, k's, v's, the MoE's), which gate its q, k and
+// v inputs before their norms (so a sliding layer too projects each from its own input).
 void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const float* h_in, const int* pos_p, int nb,
-                    size_t blk_off, float* r_out, Work& W) {
+                    size_t blk_off, float* r_out, Work& W, const float* msg = nullptr) {
     const Config& c = M.c;
     const int C = c.C;
     const size_t TC = (size_t) T * C;
@@ -1080,7 +1125,24 @@ void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const flo
     const uint16_t* xk16 = W.x16;
     const uint16_t* xv16 = W.x16;
     const float *in_q = h_in, *in_k = h_in, *in_v = h_in;
-    if (l > 0) {
+    if (msg) {
+        k::ResStates st{};
+        for (int i = 0; i < nb; ++i) st.st[i] = blk(i);
+        st.st[nb] = h_in;
+        k::attn_res(st, nb + 1, Ly.res_score, Ly.n_res_q, T, C, 1e-6f, W.lp_in, g_s);
+        const float* nw[3] = {Ly.sliding ? Ly.attn_norm : Ly.q_in_norm, Ly.sliding ? Ly.attn_norm : Ly.k_in_norm,
+                              Ly.sliding ? Ly.attn_norm : Ly.v_in_norm};
+        uint16_t* y16[3] = {W.x16, W.xk16, W.xv16};
+        float* y32[3] = {W.xq, W.xk, W.xv};
+        for (int j = 0; j < 3; ++j) {
+            const float* in = W.lp_in + (size_t) (Ly.n_res_q == 3 ? j : 0) * TC;
+            k::loop_gate(in, msg + (size_t) j * TC, Ly.lp_down[j], Ly.lp_forget[j], Ly.lp_gain[j], T, C, c.rank, 1e-6f,
+                         W.lp_g, y32[j], g_s);
+            k::rms_f16(y32[j], nw[j], T, C, c.eps, y16[j], need_x32 ? y32[j] : nullptr, g_s);
+        }
+        in_q = W.xq, in_k = W.xk, in_v = W.xv;
+        xk16 = W.xk16, xv16 = W.xv16;
+    } else if (l > 0) {
         k::ResStates st{};
         for (int i = 0; i < nb; ++i) st.st[i] = blk(i);
         st.st[nb] = h_in;
@@ -1114,7 +1176,15 @@ void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const flo
     float *kd_p = W.dyn, *vd_p = W.dyn;
     if (Ly.sliding) {
         if (Ly.wqkvrg.N > 0) {
-            matmul(Ly.wqkvrg, in_q, W.x16, T, W.qkv, Ly.wqkvrg.N);
+            if (msg) {   // the fused rows by the input they take: q | k | v | r, gate (and the sink)
+                const int N = Ly.wqkvrg.N;
+                matmul_rows(Ly.wqkvrg, 0, HD, in_q, W.x16, T, W.qkv, N);
+                matmul_rows(Ly.wqkvrg, HD, KD, in_k, xk16, T, W.qkv + HD, N);
+                matmul_rows(Ly.wqkvrg, HD + KD, KD, in_v, xv16, T, W.qkv + HD + KD, N);
+                matmul_rows(Ly.wqkvrg, HD + 2 * KD, N - HD - 2 * KD, in_q, W.x16, T, W.qkv + HD + 2 * KD, N);
+            } else {
+                matmul(Ly.wqkvrg, in_q, W.x16, T, W.qkv, Ly.wqkvrg.N);
+            }
             const bool has_sink = !g_dense_q8;
             if (T == 1) {
                 q_p = W.qkv;
@@ -1723,8 +1793,10 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
         std::fclose(f);
     };
 
-    for (int l = 0; l < c.n_layer; ++l) {
-        Layer& Ly = M.L[l];
+    int nb_pre = 0, n_bank = 0;   // (a looped core: the blocks before it, the states of the pass before's bank)
+    for (int vis = 0; vis < c.n_visit; ++vis) {
+        const int l = M.V[vis].l;   // (the layer: its weights, its experts in the cache; the state is the visit's)
+        Layer& Ly = bind_visit(M, vis);
         if (Ly.dev != g_cur) {   // the next GPU's layers: the stream and the block states go along
             const int from = g_cur;
             Work& F = dev_work(from);
@@ -1740,21 +1812,55 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
             ECp = &dev_cache(g_cur);
         }
         g_pf.start();
-        if (g_taps && l % 6 == 5 && l < c.n_layer - 1)   // (layers 5, 11, .., 41: the drafter's taps 0 .. 6)
+        // A looped core.  Its first pass: the stream it is given is kept.  A later pass starts again from that stream
+        // and the blocks before the core, and reads the pass before through messages: that pass's bank is the blocks
+        // it added after its first (the first is the kept stream) and its final stream.
+        const float* msg = nullptr;
+        if (c.n_pass > 1 && l == c.core0) {
+            if (M.V[vis].pass == 0) {
+                nb_pre = nb;
+                CU(cudaMemcpyAsync(W.lp_pre, W.h, TC * 4, cudaMemcpyDeviceToDevice, g_s));
+            } else {
+                n_bank = 0;
+                for (int i = nb_pre + 1; i < nb; ++i, ++n_bank)
+                    CU(cudaMemcpyAsync(W.lp_bank + (size_t) n_bank * TC, blk(i), TC * 4, cudaMemcpyDeviceToDevice, g_s));
+                CU(cudaMemcpyAsync(W.lp_bank + (size_t) n_bank * TC, W.h, TC * 4, cudaMemcpyDeviceToDevice, g_s));
+                ++n_bank;
+                CU(cudaMemcpyAsync(W.h, W.lp_pre, TC * 4, cudaMemcpyDeviceToDevice, g_s));
+                nb = nb_pre;
+            }
+        }
+        if (M.V[vis].pass > 0) {   // the layer's messages: q's, k's, v's, the MoE's
+            k::ResStates st{};
+            for (int i = 0; i < n_bank; ++i) st.st[i] = W.lp_bank + (size_t) i * TC;
+            // (two queries a launch: the kernel takes at most three)
+            k::attn_res(st, n_bank, Ly.lp_query, 2, T, C, 1e-6f, W.lp_msg, g_s);
+            k::attn_res(st, n_bank, Ly.lp_query + (size_t) 2 * C, 2, T, C, 1e-6f, W.lp_msg + 2 * TC, g_s);
+            msg = W.lp_msg;
+        }
+        // (the drafter's taps 0 .. 6: the stream at the start of layers 5, 11, .., 41 - without a loop)
+        if (g_taps && c.n_pass == 1 && l % 6 == 5 && l < c.n_layer - 1)
             CU(cudaMemcpyAsync(g_taps + (size_t) (l / 6) * g_taps_ld * C, W.h, TC * 4, cudaMemcpyDeviceToDevice, g_s));
-        run_layer_attn(M, Ly, l, T, pos0, W.h, W.pos, nb, 0, W.r, W);
-        dump_f("blk." + std::to_string(l) + ".attn_out", W.r, TC);
+        run_layer_attn(M, Ly, l, T, pos0, W.h, W.pos, nb, 0, W.r, W, msg);
+        dump_f("blk." + std::to_string(vis) + ".attn_out", W.r, TC);
         if (l % c.block == 0) ++nb;
         // the MoE
         {
             k::ResStates st{};
             for (int i = 0; i < nb; ++i) st.st[i] = blk(i);
             st.st[nb] = W.r;
-            k::RmsOuts outs{};
-            outs.w[0] = Ly.ffn_norm;
-            outs.y16[0] = W.x16;
-            outs.y32[0] = W.xq;
-            k::attn_res_rms_f16(st, nb + 1, Ly.ffn_res_score, 1, T, C, 1e-6f, c.eps, outs, g_s);
+            if (msg) {   // (its message gates the input before the norm)
+                k::attn_res(st, nb + 1, Ly.ffn_res_score, 1, T, C, 1e-6f, W.xq, g_s);
+                k::loop_gate(W.xq, msg + (size_t) 3 * TC, Ly.lp_down[3], Ly.lp_forget[3], Ly.lp_gain[3], T, C, c.rank,
+                             1e-6f, W.lp_g, W.xq, g_s);
+                k::rms_f16(W.xq, Ly.ffn_norm, T, C, c.eps, W.x16, W.xq, g_s);
+            } else {
+                k::RmsOuts outs{};
+                outs.w[0] = Ly.ffn_norm;
+                outs.y16[0] = W.x16;
+                outs.y32[0] = W.xq;
+                k::attn_res_rms_f16(st, nb + 1, Ly.ffn_res_score, 1, T, C, 1e-6f, c.eps, outs, g_s);
+            }
         }
         g_pf.lap(g_pf.attn);
         gemm16(Ly.router16, c.E, C, W.x16, T, W.rlog, c.E);
@@ -1772,7 +1878,7 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
         pop_count(l, top, S);
         g_pf.lap(g_pf.route);
         if (!dump.empty()) {   // the experts picked, [T][K] int32 (compare with the reference's blk.L.picks)
-            FILE* f = std::fopen((dump + "/blk." + std::to_string(l) + ".picks.i32").c_str(), "wb");
+            FILE* f = std::fopen((dump + "/blk." + std::to_string(vis) + ".picks.i32").c_str(), "wb");
             if (f) std::fwrite(top, 4, (size_t) S, f), std::fclose(f);
         }
         if (g_trace) {
@@ -1883,7 +1989,7 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
             t_exp += now() - te0;
             conv_rec(Ly, 3, W.tmp, Ly.h_mlp, T, C);
             k::conv4_res(W.tmp, Ly.h_mlp, Ly.sc_mlp, nullptr, 0, T, C, W.r, W.h, g_s);
-            dump_f("blk." + std::to_string(l) + ".out", W.h, TC);
+            dump_f("blk." + std::to_string(vis) + ".out", W.h, TC);
             continue;
         }
         if (g_ep && T == 1 && g_overlap && !g_prof) {
@@ -1973,7 +2079,7 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
             t_exp += now() - te0;
             conv_rec(Ly, 3, W.tmp, Ly.h_mlp, T, C);
             k::conv4_res(W.tmp, Ly.h_mlp, Ly.sc_mlp, nullptr, 0, T, C, W.r, W.h, g_s);
-            dump_f("blk." + std::to_string(l) + ".out", W.h, TC);
+            dump_f("blk." + std::to_string(vis) + ".out", W.h, TC);
             continue;
         }
         if (g_mv && S <= 64) {
@@ -2170,12 +2276,12 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
             conv_rec(Ly, 3, W.tmp, Ly.h_mlp, T, C);
             k::conv4_res(W.tmp, Ly.h_mlp, Ly.sc_mlp, nullptr, 0, T, C, W.r, W.h, g_s);
             g_pf.lap(g_pf.rest);
-            dump_f("blk." + std::to_string(l) + ".out", W.h, TC);
+            dump_f("blk." + std::to_string(vis) + ".out", W.h, TC);
             continue;
         }
         run_prefill_moe(M, Ly, l, T, W.x16, top, w, W.r, W.h, W, EC, t_exp);
         g_pf.lap(g_pf.rest);
-        dump_f("blk." + std::to_string(l) + ".out", W.h, TC);
+        dump_f("blk." + std::to_string(vis) + ".out", W.h, TC);
     }
     run_head(M, T, all_logits, out_mode, nb, W.h, W, logits_out, argmax_out);
 #undef W
@@ -2358,8 +2464,9 @@ void forward_prefill_sup(Model& M, const int* tok, int T, int pos0, int sub_chun
     if (pf)
         for (int ll = 0; ll < depth; ++ll) prefetch(ll, ll + 1);
     int nb = 0;
-    for (int l = 0; l < c.n_layer; ++l) {
-        Layer& Ly = M.L[l];
+    for (int vis = 0; vis < c.n_visit; ++vis) {   // (no loop here: a looped model's prompts go through forward())
+        const int l = M.V[vis].l;
+        Layer& Ly = bind_visit(M, vis);
         g_pf.start();
         for (int off = 0; off < T; off += sub_chunk) {
             const int ts = std::min(sub_chunk, T - off);
@@ -2434,7 +2541,8 @@ void forward_prefill_sup(Model& M, const int* tok, int T, int pos0, int sub_chun
 // every short conv's history as after the first n of the verify window's tokens
 void rollback(Model& M, int n) {
     const int C = M.c.C, KD = M.c.KV * M.c.D;
-    for (auto& Ly : M.L) {
+    for (int vis = 0; vis < (int) M.V.size(); ++vis) {
+        Layer& Ly = bind_visit(M, vis);
         float* hist[4] = {Ly.h_k, Ly.h_v, Ly.h_attn, Ly.h_mlp};
         const int cc[4] = {KD, KD, C, C};
         for (int i = 0; i < 4; ++i) k::conv_hist_after(Ly.rec_old[i], Ly.rec_x[i], n, cc[i], hist[i], g_s);
@@ -2526,38 +2634,63 @@ int main(int argc, char** argv) {
     Model M;
     Config& c = M.c;
     const std::string a = "inkling2.";
-    c.n_layer = (int) S.num(a + "block_count");
-    c.C = (int) S.num(a + "embedding_length");
-    c.H = (int) S.num(a + "attention.head_count");
-    c.KV = (int) S.num(a + "attention.head_count_kv");
-    c.D = (int) S.num(a + "attention.key_length");
-    c.E = (int) S.num(a + "expert_count");
-    c.K = (int) S.num(a + "expert_used_count");
-    c.F = (int) S.num(a + "expert_feed_forward_length");
-    c.window = (int) S.num(a + "attention.sliding_window");
-    c.d_rel = (int) S.num(a + "d_rel");
-    c.extent = (int) S.num(a + "rel_extent");
-    c.extent_swa = (int) S.num(a + "rel_extent_swa");
-    c.block = (int) S.num(a + "attn_res.block_size");
-    c.n_vocab = (int) S.num(a + "unpadded_vocab_size");
-    c.eps = (float) S.num(a + "attention.layer_norm_rms_epsilon");
-    c.route_scale = (float) S.num(a + "expert_weights_scale");
-    c.qk_clip = (float) S.num(a + "qk_clip_threshold");
-    c.rel_clip = (float) S.num(a + "rel_clip_threshold");
-    c.alpha = (float) S.num(a + "log_scaling_alpha");
-    c.n_floor = (float) S.num(a + "log_scaling_n_floor");
-    c.gate_cap = (float) S.num(a + "mlp_gate_softcap");
-    c.up_cap = (float) S.num(a + "mlp_up_softcap");
-    c.logit_cap = (float) S.num(a + "final_logit_softcapping");
-    {
-        const auto* sp = S.get(a + "attention.sliding_window_pattern");
-        if (!sp || (int) sp->items.size() != c.n_layer) die("sliding_window_pattern");
-        for (const auto& it : sp->items) c.sliding.push_back(it.u != 0);
+    // a key under PR #32187's name, else under llama.cpp master's; a value master writes a visit (an array of equal
+    // values) read as one
+    auto key = [&](const char* k1, const char* k2 = nullptr) -> double {
+        const auto* v = S.get(a + k1);
+        if (!v && k2) v = S.get(a + k2);
+        if (!v) die(std::string("no key ") + a + k1);
+        return v->items.empty() ? v->num() : v->items[0].num();
+    };
+    c.n_visit = (int) key("block_count");
+    c.C = (int) key("embedding_length");
+    c.H = (int) key("attention.head_count");
+    c.KV = (int) key("attention.head_count_kv");
+    c.D = (int) key("attention.key_length");
+    c.E = (int) key("expert_count");
+    c.K = (int) key("expert_used_count");
+    c.F = (int) key("expert_feed_forward_length");
+    c.window = (int) key("attention.sliding_window");
+    c.d_rel = (int) key("d_rel", "attention.relative_length");
+    c.extent = (int) key("rel_extent", "attention.relative_extent");
+    c.extent_swa = S.get(a + "rel_extent_swa") ? (int) key("rel_extent_swa") : c.window;   // (master: the window)
+    c.block = (int) key("attn_res.block_size");
+    c.n_vocab = (int) key("unpadded_vocab_size", "vocab_size_unpadded");
+    c.eps = (float) key("attention.layer_norm_rms_epsilon");
+    c.route_scale = (float) key("expert_weights_scale");
+    c.qk_clip = (float) key("qk_clip_threshold", "attention.qk_clip");
+    c.rel_clip = (float) key("rel_clip_threshold", "attention.relative_clip");
+    c.alpha = (float) key("log_scaling_alpha", "attention.log_scale_alpha");
+    c.n_floor = (float) key("log_scaling_n_floor", "attention.log_scale_floor");
+    c.gate_cap = (float) key("mlp_gate_softcap", "activation.situ_beta");
+    c.up_cap = (float) key("mlp_up_softcap", "activation.situ_linear_beta");
+    c.logit_cap = (float) key("final_logit_softcapping");
+    // the loop (Inkling-2-Mini): block_count counts the layer visits, the core's layers once a pass
+    if (S.get(a + "num_loops")) c.n_pass = (int) key("num_loops");
+    if (c.n_pass > 1) {
+        c.core0 = (int) key("loop.core_start"), c.core1 = (int) key("loop.core_end"), c.rank = (int) key("loop.gate_rank");
+        if (c.core0 <= 0 || c.core1 <= c.core0 || c.core0 % c.block || (c.core1 - c.core0) % c.block || c.rank <= 0)
+            die("the looped core must start after the first block and span whole blocks");
     }
-    if (c.D != 128 || c.H % c.KV || c.C % 256 || c.F % 256) die("unexpected shapes");
+    const int n_core = c.core1 - c.core0;
+    c.n_layer = c.n_visit - (c.n_pass - 1) * n_core;
+    {   // the pattern is a visit's; a layer's is its first visit's (the same in every pass)
+        const auto* sp = S.get(a + "attention.sliding_window_pattern");
+        if (!sp || (int) sp->items.size() != c.n_visit) die("sliding_window_pattern");
+        for (int l = 0; l < c.n_layer; ++l)
+            c.sliding.push_back(sp->items[l < c.core1 ? l : l + (c.n_pass - 1) * n_core].u != 0);
+    }
+    // (a row of an expert is whole blocks of its type: checked per tensor below; 64 covers NVFP4 and Q8_0)
+    if (c.D != 128 || c.H % c.KV || c.C % 64 || c.F % 64) die("unexpected shapes");
     const int n_sliding = (int) std::count(c.sliding.begin(), c.sliding.end(), true);
     std::printf("maya-ik2: %d layers (%d sliding), %d experts (%d a token), width %d, vocab %d; %zu shards\n",
                 c.n_layer, n_sliding, c.E, c.K, c.C, c.n_vocab, S.files.size());
+    if (c.n_pass > 1) {
+        std::printf("looped: layers %d .. %d run %d times - %d layer visits a token; message gates of rank %d\n", c.core0,
+                    c.core1 - 1, c.n_pass, c.n_visit, c.rank);
+        if (n_gpu != 1) die("a looped model: one GPU so far (--gpus 1)");
+        if (!draft_path.empty()) die("--draft: not for a looped model yet");
+    }
     if (getenv("IK2_POP_OUT")) g_pop.assign((size_t) c.n_layer * c.E, 0), g_pop_E = c.E;
     g_tp_F = c.F, g_tp_C = c.C;
     if (n_gpu == 2 && getenv("IK2_EP") && std::atoi(getenv("IK2_EP"))) {
@@ -2693,6 +2826,11 @@ int main(int argc, char** argv) {
     std::vector<ExpJob> exp_jobs;
     size_t host_total = 0;
     M.embd_norm = load_f32(S, "token_embd_norm.weight", C);   // (on GPU 0, where the embedding rows go)
+    std::vector<float> lp_q, lp_kv;   // a looped core's message queries, [2 n_core][C] each
+    if (c.n_pass > 1) {
+        lp_q = host_f32(S, "loop_res_query.weight", (size_t) 2 * n_core * C);
+        lp_kv = host_f32(S, "loop_kv_res_query.weight", (size_t) 2 * n_core * C);
+    }
     for (int l = 0; l < c.n_layer; ++l) {
         Layer& Ly = M.L[l];
         const std::string b = "blk." + std::to_string(l) + ".";
@@ -2797,6 +2935,8 @@ int main(int argc, char** argv) {
             const int nr = (int) pr.second.size();
             if (ti->elements() != (uint64_t) c.E * c.F * C * nr) die(n + ": shape");
             if (!k::block_values((int) ti->type)) die(n + ": type " + ti->type_name() + " not decoded here");
+            if (C % k::block_values((int) ti->type) || c.F % k::block_values((int) ti->type))
+                die(n + ": a row is not whole " + ti->type_name() + " blocks");
             const size_t per = tensor_bytes(*ti) / c.E;
             std::vector<float> sc;
             const std::string sn = b + "ffn_" + pr.first + "_exps.scale";
@@ -2812,19 +2952,50 @@ int main(int argc, char** argv) {
             host_total += tensor_bytes(*ti);
             exp_jobs.push_back({l, n, pr.second});
         }
-        // the state (FP8 E4M3 or FP16 KV; sliding layers ring-buffered in both CLI and --serve)
-        Ly.kv_cap = Ly.sliding ? std::min(ctx, c.window + std::max(chunk, ik2::draft::kBlock)) : ctx;
-        if (g_kv_fp8) {
-            Ly.kc8 = dalloc<uint8_t>((size_t) Ly.kv_cap * KD);
-            Ly.vc8 = dalloc<uint8_t>((size_t) Ly.kv_cap * KD);
-        } else {
-            Ly.kc = dalloc<uint16_t>((size_t) Ly.kv_cap * KD);
-            Ly.vc = dalloc<uint16_t>((size_t) Ly.kv_cap * KD);
+        if (c.n_pass > 1 && l >= c.core0 && l < c.core1) {   // the core: its later passes' message gates and queries
+            static const char* mod[4] = {"attn", "k", "v", "mlp"};
+            for (int m = 0; m < 4; ++m) {
+                const std::string p = b + "loop_" + mod[m] + "_";
+                Ly.lp_down[m] = load_f32(S, p + "down.weight", (size_t) c.rank * 2 * C);
+                for (int fg = 0; fg < 2; ++fg) {   // (the file's [C][rank] by rank, [rank][C]: k::loop_gate's layout)
+                    const auto w = host_f32(S, p + (fg ? "gain.weight" : "forget.weight"), C * c.rank);
+                    std::vector<float> t(w.size());
+                    for (size_t ch = 0; ch < C; ++ch)
+                        for (int r = 0; r < c.rank; ++r) t[(size_t) r * C + ch] = w[ch * c.rank + r];
+                    (fg ? Ly.lp_gain[m] : Ly.lp_forget[m]) = dev_f32(t);
+                }
+            }
+            // loop_res_query: rows 2 i (q's) and 2 i + 1 (the MoE's) of core layer i; loop_kv_res_query: k's and v's
+            const size_t i = (size_t) (l - c.core0);
+            std::vector<float> q(4 * C);
+            std::memcpy(q.data(), lp_q.data() + 2 * i * C, C * 4);
+            std::memcpy(q.data() + C, lp_kv.data() + 2 * i * C, C * 4);
+            std::memcpy(q.data() + 2 * C, lp_kv.data() + (2 * i + 1) * C, C * 4);
+            std::memcpy(q.data() + 3 * C, lp_q.data() + (2 * i + 1) * C, C * 4);
+            Ly.lp_query = dev_f32(q);
         }
-        Ly.h_k = dalloc<float>(3 * KD);
-        Ly.h_v = dalloc<float>(3 * KD);
-        Ly.h_attn = dalloc<float>(3 * C);
-        Ly.h_mlp = dalloc<float>(3 * C);
+    }
+    // the visits of a token and their state (FP8 E4M3 or FP16 KV; sliding layers ring-buffered in both CLI and --serve)
+    M.V.resize(c.n_visit);
+    for (int v = 0; v < c.n_visit; ++v) {
+        Visit& Vi = M.V[v];
+        if (c.n_pass == 1 || v < c.core0) Vi.l = v;
+        else if (v < c.core0 + c.n_pass * n_core) Vi.l = c.core0 + (v - c.core0) % n_core, Vi.pass = (v - c.core0) / n_core;
+        else Vi.l = v - (c.n_pass - 1) * n_core;
+        const Layer& Ly = M.L[Vi.l];
+        use_dev(Ly.dev);
+        Vi.kv_cap = Ly.sliding ? std::min(ctx, c.window + std::max(chunk, ik2::draft::kBlock)) : ctx;
+        if (g_kv_fp8) {
+            Vi.kc8 = dalloc<uint8_t>((size_t) Vi.kv_cap * KD);
+            Vi.vc8 = dalloc<uint8_t>((size_t) Vi.kv_cap * KD);
+        } else {
+            Vi.kc = dalloc<uint16_t>((size_t) Vi.kv_cap * KD);
+            Vi.vc = dalloc<uint16_t>((size_t) Vi.kv_cap * KD);
+        }
+        Vi.h_k = dalloc<float>(3 * KD);
+        Vi.h_v = dalloc<float>(3 * KD);
+        Vi.h_attn = dalloc<float>(3 * C);
+        Vi.h_mlp = dalloc<float>(3 * C);
     }
     c.n_rows = (int) (S.info("output.weight")->elements() / C);
     M.out_w = load_mat(S, "output.weight", c.n_rows, (int) C);
@@ -2838,9 +3009,9 @@ int main(int argc, char** argv) {
     if (g_stage) cudaFree(g_stage), g_stage = nullptr, g_stage_bytes = 0;
     {
         size_t kv_bytes = 0;
-        for (const auto& Ly : M.L) kv_bytes += (size_t) Ly.kv_cap * KD * (g_kv_fp8 ? 1 : 2) * 2;
-        std::printf("kv cache: %s (%.2f GiB across %d layers)\n", g_kv_fp8 ? "FP8 E4M3" : "FP16",
-                    kv_bytes / 1073741824.0, c.n_layer);
+        for (const auto& Vi : M.V) kv_bytes += (size_t) Vi.kv_cap * KD * (g_kv_fp8 ? 1 : 2) * 2;
+        std::printf("kv cache: %s (%.2f GiB across %d layer%s)\n", g_kv_fp8 ? "FP8 E4M3" : "FP16",
+                    kv_bytes / 1073741824.0, c.n_visit, c.n_pass > 1 ? " visits" : "s");
         std::fflush(stdout);
     }
     size_t fr = 0, tot = 0;
@@ -3035,11 +3206,11 @@ int main(int argc, char** argv) {
         }
         g_taps_ld = std::max(chunk, ik2::draft::kBlock);
         g_taps = dalloc<float>((size_t) ik2::draft::kTaps * g_taps_ld * c.C);
-        for (auto& Ly : M.L) {
+        for (auto& Vi : M.V) {
             const size_t cc[4] = {KD, KD, C, C};
             for (int i = 0; i < 4; ++i) {
-                Ly.rec_old[i] = dalloc<float>(3 * cc[i]);
-                Ly.rec_x[i] = dalloc<float>((size_t) ik2::draft::kBlock * cc[i]);
+                Vi.rec_old[i] = dalloc<float>(3 * cc[i]);
+                Vi.rec_x[i] = dalloc<float>((size_t) ik2::draft::kBlock * cc[i]);
             }
         }
         std::printf("drafter: %s, %.2f GiB of VRAM, %.1f s\n", draft_path.c_str(),
@@ -3056,7 +3227,8 @@ int main(int argc, char** argv) {
     W.nk_max = std::min(ctx, ctx);
     // Tokens a layer-major prefill pass (every expert not in VRAM streams in once a pass): 16384 when there is room
     // (a pass's scratch is ~280 KB a token: 4.6 GB, taken from the expert cache), else 4096.
-    W.T_sup = ((n_gpu == 1 || dual()) && draft_path.empty() && fr >= (20ULL << 30)) ? (fr >= (60ULL << 30) ? 16384 : 4096) : 0;
+    // (a looped model's prompts go through forward(): forward_prefill_sup has no loop yet)
+    W.T_sup = ((n_gpu == 1 || dual()) && draft_path.empty() && c.n_pass == 1 && fr >= (20ULL << 30)) ? (fr >= (60ULL << 30) ? 16384 : 4096) : 0;
     // IK2_SUP=N: tokens a layer-major prefill pass (each pass streams every expert not in the cache once)
     if (W.T_sup > 0 && getenv("IK2_SUP")) W.T_sup = std::max(W.Tm, std::atoi(getenv("IK2_SUP")));
     const size_t Tm = W.Tm, S8 = Tm * c.K;
@@ -3138,12 +3310,19 @@ int main(int argc, char** argv) {
     W.seen_late.assign(c.E, 0);
     W.gi_idx.assign(c.E, 0);
     W.logits = dalloc<float>((size_t) 16 * c.n_rows);
-    for (auto& Ly : M.L) {   // the conv histories start at zero
-        if (Ly.dev != d) continue;
-        CU(cudaMemset(Ly.h_k, 0, 3 * KD * 4));
-        CU(cudaMemset(Ly.h_v, 0, 3 * KD * 4));
-        CU(cudaMemset(Ly.h_attn, 0, 3 * C * 4));
-        CU(cudaMemset(Ly.h_mlp, 0, 3 * C * 4));
+    if (c.n_pass > 1) {
+        W.lp_pre = dalloc<float>(Tm * C);
+        W.lp_bank = dalloc<float>((size_t) (n_core / c.block) * Tm * C);   // (the pass's blocks after its first, its final stream)
+        W.lp_msg = dalloc<float>(4 * Tm * C);
+        W.lp_in = dalloc<float>(3 * Tm * C);
+        W.lp_g = dalloc<float>(Tm * c.rank);
+    }
+    for (auto& Vi : M.V) {   // the conv histories start at zero
+        if (M.L[Vi.l].dev != d) continue;
+        CU(cudaMemset(Vi.h_k, 0, 3 * KD * 4));
+        CU(cudaMemset(Vi.h_v, 0, 3 * KD * 4));
+        CU(cudaMemset(Vi.h_attn, 0, 3 * C * 4));
+        CU(cudaMemset(Vi.h_mlp, 0, 3 * C * 4));
     }
     ExpertCache& EC = g_dev[d].EC;
     CU(cudaMemGetInfo(&fr, &tot));
@@ -3234,10 +3413,10 @@ int main(int argc, char** argv) {
         const size_t kv_elem_b = g_kv_fp8 ? 1 : 2;
         std::vector<Snap> snaps(8);
         for (auto& sn : snaps) {
-            sn.kv_k.resize(M.L.size());
-            sn.kv_v.resize(M.L.size());
-            for (size_t l = 0; l < M.L.size(); ++l) {
-                auto& Ly = M.L[l];
+            sn.kv_k.resize(M.V.size());
+            sn.kv_v.resize(M.V.size());
+            for (size_t l = 0; l < M.V.size(); ++l) {   // (l: a visit)
+                auto& Ly = bind_visit(M, (int) l);
                 use_dev(Ly.dev);
                 const size_t cc[4] = {KD, KD, C, C};
                 for (int i = 0; i < 4; ++i) sn.h.push_back(dalloc<float>(3 * cc[i]));
@@ -3253,8 +3432,8 @@ int main(int argc, char** argv) {
             const size_t cc[4] = {KD, KD, C, C};
             const cudaMemcpyKind kv_dir = save ? cudaMemcpyDeviceToHost : cudaMemcpyHostToDevice;
             const size_t row_b = (size_t) KD * kv_elem_b;
-            for (size_t l = 0; l < M.L.size(); ++l) {
-                Layer& Ly = M.L[l];
+            for (size_t l = 0; l < M.V.size(); ++l) {   // (l: a visit)
+                Layer& Ly = bind_visit(M, (int) l);
                 use_dev(Ly.dev);
                 float* hs[4] = {Ly.h_k, Ly.h_v, Ly.h_attn, Ly.h_mlp};
                 for (int i = 0; i < 4; ++i) {
@@ -3287,7 +3466,8 @@ int main(int argc, char** argv) {
         };
         auto reset = [&]() {
             for (auto& sn : snaps) sn.pos = -1;
-            for (auto& Ly : M.L) {
+            for (int vis = 0; vis < (int) M.V.size(); ++vis) {
+                Layer& Ly = bind_visit(M, vis);
                 use_dev(Ly.dev);
                 CU(cudaMemset(Ly.h_k, 0, 3 * KD * 4));
                 CU(cudaMemset(Ly.h_v, 0, 3 * KD * 4));

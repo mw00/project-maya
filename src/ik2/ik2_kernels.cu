@@ -1404,6 +1404,61 @@ __global__ void softcap_kernel(float* x, size_t n, float cap) {
     if (i < n) x[i] = cap * tanhf(x[i] / cap);
 }
 
+// The loop's message gate, two launches a call so that a token's work spreads over the SMs.
+// (1) g [T][R] = D [rms(x); rms(m)]: a block is kLoopRanks ranks of a token, a warp a rank; each block sums the two
+// mean squares itself (9 values a thread).
+constexpr int kLoopRanks = kBlk / 32;
+__global__ void loop_gate_g_kernel(const float* __restrict__ x, const float* __restrict__ m,
+                                   const float* __restrict__ D, int C, int R, float eps, float* __restrict__ g) {
+    __shared__ float sh_red[2 * (kBlk / 32)];
+    const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, n_warp = kBlk / 32;
+    const float* xr = x + (size_t) blockIdx.x * C;
+    const float* mr = m + (size_t) blockIdx.x * C;
+    float sx = 0.0f, sm = 0.0f;
+    for (int c = tid; c < C; c += kBlk) {
+        const float a = xr[c], b = mr[c];
+        sx += a * a, sm += b * b;
+    }
+    for (int o = 16; o > 0; o >>= 1) {
+        sx += __shfl_down_sync(0xffffffffu, sx, o);
+        sm += __shfl_down_sync(0xffffffffu, sm, o);
+    }
+    if (lane == 0) sh_red[warp] = sx, sh_red[n_warp + warp] = sm;
+    __syncthreads();
+    float tx = 0.0f, tm = 0.0f;
+    for (int w = 0; w < n_warp; ++w) tx += sh_red[w], tm += sh_red[n_warp + w];
+    const float rx = rsqrtf(tx / (float) C + eps), rm = rsqrtf(tm / (float) C + eps);
+    const int r = (int) blockIdx.y * kLoopRanks + warp;
+    if (r >= R) return;
+    const float* dr = D + (size_t) r * 2 * C;
+    float ax = 0.0f, am = 0.0f;
+    for (int c = lane; c < C; c += 32) ax += dr[c] * xr[c], am += dr[C + c] * mr[c];
+    for (int o = 16; o > 0; o >>= 1) {
+        ax += __shfl_down_sync(0xffffffffu, ax, o);
+        am += __shfl_down_sync(0xffffffffu, am, o);
+    }
+    if (lane == 0) g[(size_t) blockIdx.x * R + r] = rx * ax + rm * am;
+}
+// (2) y = (1 - tanh(F g)) x + tanh(G g) m: a block is kBlk channels of a token, a thread a channel; F and G by rank
+// ([R][C]), so that a warp's threads read side by side.  y may be x.
+constexpr int kLoopRankMax = 128;
+__global__ void loop_gate_apply_kernel(const float* x, const float* __restrict__ m, const float* __restrict__ F,
+                                       const float* __restrict__ G, const float* __restrict__ g, int C, int R,
+                                       float* y) {
+    __shared__ float sh_g[kLoopRankMax];
+    if ((int) threadIdx.x < R) sh_g[threadIdx.x] = g[(size_t) blockIdx.x * R + threadIdx.x];
+    __syncthreads();
+    const int c = (int) blockIdx.y * kBlk + (int) threadIdx.x;
+    if (c >= C) return;
+    float f = 0.0f, gn = 0.0f;
+    for (int r = 0; r < R; ++r) {
+        const float gv = sh_g[r];
+        f += F[(size_t) r * C + c] * gv, gn += G[(size_t) r * C + c] * gv;
+    }
+    const size_t i = (size_t) blockIdx.x * C + c;
+    y[i] = (1.0f - tanhf(f)) * x[i] + tanhf(gn) * m[i];
+}
+
 // ---- the decodes: value v of a run of blocks, ggml's dequantize_row_* arithmetic
 
 __host__ __device__ __forceinline__ float ue4m3(uint8_t x) {   // ggml_ue4m3_to_fp32 (branchless bit-ops)
@@ -3539,6 +3594,21 @@ void softcap(float* x, size_t n, float cap, cudaStream_t s) {
     if (!n) return;
     softcap_kernel<<<grid(n), kBlk, 0, s>>>(x, n, cap);
     check("softcap");
+}
+
+void loop_gate(const float* x, const float* m, const float* D, const float* F, const float* G, int T, int C, int R,
+               float eps, float* g, float* y, cudaStream_t s) {
+    if (T <= 0) return;
+    if (R > kLoopRankMax || R > kBlk) {
+        std::fprintf(stderr, "ik2::k::loop_gate: rank %d past %d\n", R, kLoopRankMax);
+        std::abort();
+    }
+    loop_gate_g_kernel<<<dim3((unsigned) T, (unsigned) ((R + kLoopRanks - 1) / kLoopRanks)), kBlk, 0, s>>>(x, m, D, C, R,
+                                                                                                        eps, g);
+    check("loop_gate (g)");
+    loop_gate_apply_kernel<<<dim3((unsigned) T, (unsigned) ((C + kBlk - 1) / kBlk)), kBlk, 0, s>>>(x, m, F, G, g, C, R,
+                                                                                                y);
+    check("loop_gate (apply)");
 }
 
 void conv_hist_after(const float* old, const float* x, int T, int C, float* hist, cudaStream_t s) {
