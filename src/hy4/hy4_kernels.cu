@@ -14,6 +14,7 @@
 #include <mutex>
 #include <cstdio>
 #include <cstdlib>
+#include <string>
 
 namespace hy4::k {
 
@@ -21,11 +22,27 @@ namespace {
 
 std::atomic<int> g_err{0};
 float* g_mix_out = nullptr;   // (tests: hc_pre's mixes, set_mix_out)
+// the first failed launch's kernel and error (first_fault), and how many were printed: a fault in a kernel is sticky -
+// every launch after it fails the same way, so past the first few they are counted, not printed (hundreds of lines
+// hid the first one)
+std::mutex g_fault_mu;
+std::string g_fault;
+int g_printed = 0;
+constexpr int kPrintMax = 8;
 
 void check(const char* what) {
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
-        std::fprintf(stderr, "maya-hy4 kernel %s: %s\n", what, cudaGetErrorString(e));
+        bool print = true;
+        {
+            std::lock_guard<std::mutex> lk(g_fault_mu);
+            if (g_fault.empty()) g_fault = what;
+            print = g_printed < kPrintMax;
+            ++g_printed;
+            if (g_printed == kPrintMax + 1)
+                std::fprintf(stderr, "maya-hy4: more kernels failed the same way - counted, not printed\n");
+        }
+        if (print) std::fprintf(stderr, "maya-hy4 kernel %s: %s\n", what, cudaGetErrorString(e));
         g_err.fetch_add(1, std::memory_order_relaxed);
     }
 }
@@ -366,15 +383,17 @@ __device__ __forceinline__ void hc_fin_body(int t, const float* __restrict__ x, 
         s_mix[threadIdx.x] = v;
     }
     __syncthreads();
-    if (threadIdx.x == 0) {
+    // a mix a thread - thread j the j-th: its norm, its pre (j < hc) or post value - the same operations on the same
+    // values as one thread doing the mixes in turn, so the same bits.  (Not one thread in a loop over base[]: CUDA
+    // 12.9's ptxas builds that loop for Blackwell, sm_120, with base + 4 (hc + j) made of the pointer's low 32 bits
+    // only - an illegal address; #1063's CUDA 13.0 build faulted on that very load)
+    if ((int) threadIdx.x < nm) {
+        const int j = (int) threadIdx.x;
         const float r = 1.0f / sqrtf(s_mix[kMaxM] / (float) HE + eps);
-        for (int j = 0; j < nm; ++j) s_mix[j] *= r;
-        if (mix_out)
-            for (int j = 0; j < nm; ++j) mix_out[(size_t) t * nm + j] = s_mix[j];
-        for (int j = 0; j < hc; ++j) s_pre[j] = sigmoidf_(s_mix[j] * scale[0] + base[j]) + hc_eps;
-        if (!HEAD)
-            for (int j = 0; j < hc; ++j)
-                post[(size_t) t * hc + j] = sigmoidf_(s_mix[hc + j] * scale[1] + base[hc + j]) * mag + hc_eps;
+        const float m = s_mix[j] * r;
+        if (mix_out) mix_out[(size_t) t * nm + j] = m;
+        if (j < hc) s_pre[j] = sigmoidf_(m * scale[0] + base[j]) + hc_eps;
+        else if (!HEAD) post[(size_t) t * hc + (j - hc)] = sigmoidf_(m * scale[1] + base[j]) * mag + hc_eps;
     }
     __syncthreads();
     const float* xt = x + (size_t) t * HE;
@@ -2520,6 +2539,10 @@ void row_top(const float* x, int rows, int n, size_t ld, int i0, float* out, cud
     check("row_top");
 }
 int errors() { return g_err.exchange(0); }
+std::string first_fault() {
+    std::lock_guard<std::mutex> lk(g_fault_mu);
+    return g_fault;
+}
 void set_mix_out(float* p) { g_mix_out = p; }
 
 }  // namespace hy4::k

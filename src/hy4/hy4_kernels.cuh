@@ -5,6 +5,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <string>
 #include <cuda_runtime.h>
 
 namespace hy4::k {
@@ -234,5 +235,8 @@ void row_top(const float* x, int rows, int n, size_t ld, int i0, float* out, cud
 void set_mix_out(float* p);
 /// A launch failure since the last call (printed); 0 none
 int errors();
+/// The kernel of the first launch that failed in this process (empty: none).  A kernel's fault (an illegal memory
+/// access) is sticky and reported at a later launch: CUDA_LAUNCH_BLOCKING=1 names the kernel that faulted
+std::string first_fault();
 
 }  // namespace hy4::k
