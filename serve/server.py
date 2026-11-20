@@ -7477,7 +7477,16 @@ def main() -> int:
             engine = mixed_gpus.engine_class(StrataEngine, wait_gpu_release)(
                 cfg["exe"], engine_args(cfg), cwd=cfg.get("cwd"), log=cfg.get("log"), env=engine_env, mixed=mixed)
         else:
-            engine = StrataEngine(cfg["exe"], engine_args(cfg), cwd=cfg.get("cwd"), log=cfg.get("log"), env=engine_env)
+            # (Hy4-Flash under Windows, a card whose CUDA share is not measured yet for this PC and driver: the engine
+            #  says at this start how much less free VRAM its choices hold with - the setup and the Models page count
+            #  the figure from then on; the start itself is the same)
+            room_card = models.hy4_room_due(cfg)
+            eargs = engine_args(cfg) + (["--room-report"] if room_card else [])
+            engine = StrataEngine(cfg["exe"], eargs, cwd=cfg.get("cwd"), log=cfg.get("log"), env=engine_env)
+            if room_card:
+                exe_, args_, *rest = engine.spawn             # (a start again: as without the flag)
+                engine.spawn = (exe_, [x for x in args_ if x != "--room-report"], *rest)
+                models.hy4_room_measured(cfg, room_card, engine.info)
         engine.load_s = round(time.time() - t0, 1)      # (the dashboard's estimate of a reload: this start's time)
         two_gpus = bool(getattr(engine, "mixed_on", False))   # (DeepSeek on both GPUs: serve/mixed_gpus.py)
         warn_tight_ram(engine.info.get("arena_mib"))

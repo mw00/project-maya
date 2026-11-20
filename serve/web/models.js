@@ -562,7 +562,7 @@ function hy4Fields(m, d, s, ch, images, gpus) {
   return [
     {label: "Model", rows: [
       contextRow(m, d, ch, (m.kv_streamed || {})[String(d.context)] ||
-        {vram: m.kv_small_from && Number(d.context) >= m.kv_small_from ? HY4_KV_SMALL_BYTES : HY4_KV_BYTES}, [], null,
+        {vram: d.kv === "q8" || (m.kv_small_from && Number(d.context) >= m.kv_small_from) ? HY4_KV_SMALL_BYTES : HY4_KV_BYTES}, ["kv"], null,
         m.context_more ? "A larger context needs more VRAM than this model's GPUs have." : null),
       html`<${Row} label="Drafting" flag=${d.draft === "dfly2" ? "--dfly2" : "--mtp"} changed=${ch("draft")}
         hint=${mtp || dfly ? (mtp ? "The model's own MTP block drafts a few tokens for the model to check: the same answers, about twice as fast on code. " : "") +
@@ -583,7 +583,10 @@ function hy4Fields(m, d, s, ch, images, gpus) {
         hint="Per GPU, beyond the engine's plan: for the driver, the desktop and other programs. Empty: the engine's own."
         warn=${decimal(d.reserve_gb) ? null : "A number of GB, or empty for the default."}>
         <${Dec} label="VRAM kept free" value=${d.reserve_gb} ph="default" unit="GB / GPU" on=${(v) => setDraft({reserve_gb: v})}/><//>`,
-      html`<${Row} label="KV cache" hint="Hy4-Flash's engine has one cache format: no choice of format and no KV streaming yet."/>`]},
+      html`<${Row} label="KV cache" flag="--kv" changed=${ch("kv")}
+        hint="Auto, the default: F16 rows where the context fits with them, 8-bit rows only where it needs them. 8-bit: the smaller rows at every context - on a small card they leave room for the DFly2 drafter (the setup's --fast-drafting on): faster drafting, slightly different wording than the default.">
+        <${Seg} label="KV cache" value=${d.kv} options=${[{id: "auto", label: "Auto"}, ...(d.kv === "f16" || s.kv === "f16" ? [{id: "f16", label: "F16"}] : []), {id: "q8", label: "8-bit"}]}
+          onChange=${(v) => setDraft({kv: v})}/><//>`]},
     {label: "Speed", rows: [
       html`<${Row} label="Prompt chunk" flag="--chunk" changed=${ch("prefill_chunk")}
         hint="The prompt tokens one pass reads at most: larger reads long prompts faster and takes more VRAM. Empty: the engine picks at every start - 4096, 2048 or 1024, the largest that fits beside the model and the pictures. On a small card, a new context size puts the setup's own chunk back unless you changed it here."

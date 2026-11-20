@@ -2393,6 +2393,26 @@ setup) and keeps the faster; until it runs, the size's default (HY4_DRAFT_RULE i
 measured). `--drafting mtp|dfly2` at the setup picks one by name (nothing measured), `--drafting on` lets Maya pick;
 Drafting on the Models page offers each one the pack has.
 
+**Faster drafting on a small card (opt-in, `--fast-drafting on`):** where the DFly2 drafter has no room beside the
+cache's F16 rows at the context chosen (and the MTP block has none either), the setup can keep that context with the
+latent cache in 8-bit rows (`--kv q8`), which leaves the drafter its room: faster drafting, slightly different
+wording than the default. On an 8 GB card at 8K it decoded about 8-27% faster than the default there. The setup
+works this out from the card's free VRAM and the size's plan, and asks where it applies (`--yes`, and
+`--fast-drafting off`: the default, F16 rows - Maya's default answers). A setup again keeps the choice; KV cache on
+the Models page shows it (Auto or 8-bit). Within that config, drafting on and off give the same tokens.
+
+**Free VRAM under Windows:** Windows keeps part of every NVIDIA card from the programs on it, which nvidia-smi does
+not show (an idle RTX 3050 8 GB: CUDA reports 7.0 GB free). So on Windows the setup measures the card the way the
+engine does at its start (CUDA's own free figure, in a short separate process) and counts no more than that - its
+line "VRAM: Windows keeps part of this card ..." says the figure - so it claims the DFly2 drafter, and asks about
+faster drafting, where the engine then really loads it. CUDA's own share of the card, which Windows keeps out of that
+figure, is a first guess (0.5 GB) until the engine's first start on the PC measures it for that card: how much less
+free VRAM its start's choices hold with, against what the setup's reading saw. The figure is kept in
+`data/vram-room.json` for this PC, the card and its driver (a new driver or card is measured again), and from then on the setup's line says
+"measured" instead of "estimated"; the Models page counts it too. With a measured figure the setup claims the
+drafter by its sums without their safety margin, as the engine then decides (the contexts and the cache's rows keep
+theirs). Linux and AMD cards are counted as before.
+
 **Not available for Hy4-Flash yet** (the dashboard offers no switch for them): `--parallel` (one request at a time
 for now); Mac, and AMD on Windows.
 

@@ -7,6 +7,7 @@ engine, no GPU.
 from __future__ import annotations
 
 import contextlib
+import io
 import json
 import os
 import sys
@@ -324,7 +325,7 @@ class Settings(unittest.TestCase):
         self.assertEqual(M.family({"exe": "C:/b/maya-hy4.exe", "args": ["--pack", "/p"]}), "hy4")   # (no installer)
         self.assertEqual(M.settings_of(cfg), {"context": 32768, "gpus": [0, 1], "env": {}, "ablate": False,
                                               "images": False, "draft": "none", "tp": "auto", "cpu_threads": 12,
-                                              "reserve_gb": 0.5, "prefill_chunk": 256})
+                                              "reserve_gb": 0.5, "prefill_chunk": 256, "kv": "auto"})
         self.assertEqual(M.choices(cfg), {"draft": ["none"], "images": False,
                                           "ablate": {"available": False, "why": "not available for this model"}})
         self.assertEqual(M.quant_label(cfg, Path("maya-hy4-flash-maya-xs.json")), "Maya-XS")
@@ -348,10 +349,22 @@ class Settings(unittest.TestCase):
         self.assertEqual((one["gpu"], "--gpus" in one["args"]), ([1], False))
         three = M.apply(cfg, {"gpus": [0, 2, 3]})
         self.assertEqual((three["gpu"], M.flag(three["args"], "--gpus")), ([0, 2, 3], "0,1,2"))
+        # KV cache: auto (no flag, the default) or 8-bit rows (--kv q8: the setup's opt-in faster drafting) - another
+        # setting left as it is; a config's own --kv f16 stays offered, other formats are refused
+        q8 = M.apply(cfg, {"kv": "q8"})
+        self.assertEqual((M.flag(q8["args"], "--kv"), M.settings_of(q8)["kv"]), ("q8", "q8"))
+        self.assertEqual([x for x in q8["args"] if x not in ("--kv", "q8")], before)
+        self.assertEqual(M.apply(M.apply(q8, {"draft": "none"}), {})["args"], q8["args"])   # (drafting: rows kept)
+        self.assertEqual(M.apply(q8, {"kv": "auto"})["args"], before)
+        f16 = {**cfg, "args": before + ["--kv", "f16"]}
+        self.assertEqual(M.flag(M.apply(f16, M.settings_of(f16))["args"], "--kv"), "f16")
+        for bad in ("f16", "int8"):
+            with self.assertRaisesRegex(ValueError, "KV cache: auto or 8-bit"):
+                M.apply(cfg, {"kv": bad})
         # what the engine does not have yet: a plain no, nothing written
         for key, value, why in (("parallel", 2, "one request at a time"), ("draft", "mtp", "this pack has no MTP block"),
-                                ("images", True, "this pack has no vision tower"), ("kv_cache", "fp8", "one cache format"),
-                                ("kv", "int8", "one cache format"), ("kv_streaming", True, "KV streaming: .* by itself"),
+                                ("images", True, "this pack has no vision tower"), ("kv_cache", "fp8", "auto or 8-bit"),
+                                ("kv_streaming", True, "KV streaming: .* by itself"),
                                 ("kv_resident", 8192, "KV streaming: .* by itself"),
                                 ("ablate", True, "Refusal ablation: not available for this model")):
             with self.assertRaisesRegex(ValueError, why):
@@ -616,6 +629,65 @@ class Settings(unittest.TestCase):
             M._hy4_used_cache.clear()
             M._HY4_BEFORE.clear()
             self.used.start()
+
+    def test_hy4_page_counts_the_vram_windows_gives_the_engine(self):
+        """Windows keeps part of every card from the programs on it: the setup measured what the engine's CUDA gets
+        (maya.py's hy4_engine_room, kept in the config with the card's VRAM) and the page counts no more than that -
+        on the card it was measured on; a config without it, or another card now: as before."""
+        import maya
+        p = hy4_cfg(self.d)
+        c = json.loads(p.read_text())
+        c.update(args=["--pack", M.flag(c["args"], "--pack"), "--max-context", "8192", "--chunk", "256",
+                       "--reserve-gb", "0.5", "--vram-experts", "0", "--dfly2"], gpu=[0])
+        c["installer"].update(layout="8gb", hy4_quant="maya-xs", engine_room_gb={"0": [7.48, 8.0]})
+        p.write_text(json.dumps(c, indent=1))
+        cfg = M.read(p)
+        for vram, usable in ((8.0, 7.48), (12.0, 12.0 - 76 / 1024)):    # (76 MiB in use, nvidia-smi's reading)
+            with mock.patch.object(M, "machine_gpus", return_value=[{"index": 0, "name": "x", "vram_gb": vram}]), \
+                    mock.patch.object(M, "hy4_used", side_effect=lambda gpus: {i: 76 for i in gpus}):
+                self.assertAlmostEqual(M.hy4_room(cfg)["usable"], usable)
+                self.assertEqual(M.hy4_cards(cfg, M.machine_gpus())[0].get("engine_room_gb"),
+                                 7.48 if vram == 8.0 else None)
+                fit = M.hy4_refit(cfg)
+                self.assertAlmostEqual(fit["usable"], usable)
+        self.assertEqual(M.hy4_cards({"installer": {"engine_room_gb": {"0": "x", "a": [1, 2]}}},
+                                     [{"index": 0, "vram_gb": 8.0}]), {0: {"index": 0, "vram_gb": 8.0}})
+        self.assertEqual(maya.hy4_usable_gib([{"index": 0, "vram_gb": 8.0}], {0: 1024}), 7.0)
+
+    def test_hy4_page_counts_the_share_the_engine_measured(self):
+        """The setup kept CUDA's reading beside the room (its first guess for CUDA's own share): once the engine has
+        measured the share on that card (maya.py's HY4_ROOM_STORE, this PC, card and driver), the page counts the
+        reading with it, as the next setup does; no record, or a config without the reading: the setup's figure."""
+        import maya
+        cfg = {"installer": {"engine_room_gb": {"0": [7.537, 8.0, 7.037]}}}
+        gl = [{"index": 0, "name": "x", "vram_gb": 8.0}]
+        M._gpu_cache.pop("room_own", None)
+        self.addCleanup(M._gpu_cache.pop, "room_own", None)
+        for own, room in (({0: 0.42}, 7.457), ({}, 7.537)):
+            with mock.patch.object(M, "hy4_room_own", return_value=own):
+                self.assertAlmostEqual(M.hy4_cards(cfg, gl)[0]["engine_room_gb"], room)
+        with mock.patch.object(M, "hy4_room_own", side_effect=AssertionError("not asked")):
+            self.assertAlmostEqual(M.hy4_cards({"installer": {"engine_room_gb": {"0": [7.48, 8.0]}}}, gl)[0]
+                                   ["engine_room_gb"], 7.48)
+        # the record for this PC's card and driver, by the setup's own key (setup.py's list: its PCI id and driver)
+        raw = [{"index": 0, "name": "x", "vram_gb": 8.0, "pci": "00000000:01:00.0", "driver": "610.88"}]
+        with mock.patch.object(maya, "hy4_room_load", return_value={maya.hy4_room_key(raw[0]): {"own_gib": 0.42}}), \
+                mock.patch.object(maya.S, "gpus", return_value=raw):
+            self.assertEqual(M.hy4_room_own(), {0: 0.42})
+            M._gpu_cache.pop("room_own", None)
+            with mock.patch.object(maya.S, "gpus", return_value=[dict(raw[0], driver="615.10")]):
+                self.assertEqual(M.hy4_room_own(), {})
+        # the server's start: the card to measure, and the figure said once kept
+        with mock.patch.object(maya, "hy4_room_due", return_value={"index": 0}):
+            self.assertEqual(M.hy4_room_due({}), {"index": 0})
+        with mock.patch.object(maya, "hy4_room_due", side_effect=OSError("no driver")):
+            self.assertIsNone(M.hy4_room_due({}))
+        with mock.patch.object(maya, "hy4_room_measure", return_value={"own_gib": 0.42}), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(M.hy4_room_measured({}, {"name": "RTX"}, {}), {"own_gib": 0.42})
+        self.assertIn("0.42 GB", out.getvalue())
+        with mock.patch.object(maya, "hy4_room_measure", side_effect=ValueError):
+            self.assertIsNone(M.hy4_room_measured({}, {}, {}))
 
     def test_hy4_contexts_that_fit(self):
         """Hy4-Flash's context on the Models page: only what fits the config's cards by its layout's plan, as the

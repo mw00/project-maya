@@ -401,6 +401,7 @@ struct Model::Impl {
     bool mtp_async = false;
     bool mtp_own = false;                // (the plan's: that scratch is counted on the head's GPU - tensor_split)
     std::vector<double> free0;           // each GPU's free VRAM as the plan first read it (a plan run again: the same)
+    std::string room_out;                // (--room-report's measurement: Model::room_report)
     std::atomic<bool> emb_pending{false};   // (a queued pass's copy of h_emb maybe still in flight)
     cudaEvent_t ev_hin = nullptr, ev_mtp = nullptr, ev_emb = nullptr;
     std::unique_ptr<Crew> mtp_crew;
@@ -2742,29 +2743,92 @@ struct Model::Impl {
             int n_gpu = 0;
             CK(cudaGetDeviceCount(&n_gpu));
             if (!o.gpus.empty()) n_gpu = (int) o.gpus.size();
-            df_room = pk.num("dfly_layers") >= 1 && (o.dfly2 || n_gpu == 1);
-            std::string e1, df_why;
-            bool ok1 = choose(e1);
-            if (df_room) {
-                const Sum s1 = sum(ok1);
-                df_room = false;
-                std::string e0;
-                const bool ok0 = choose(e0);
-                const Sum s0 = sum(ok0);
-                if (s0 == s1) {   // (the plan with its room, chosen again)
-                    df_room = true;
-                    ok1 = choose(e1);
-                } else {
-                    ok1 = ok0;
-                    e1 = e0;
-                    df_why = !s1.ok ? "the start does not fit beside it"
-                             : s1.q8 != s0.q8 ? "beside it the latent cache would be in 8-bit rows (F16 without it)"
-                             : s1.vision != s0.vision || s1.pixels != s0.pixels ? "beside it pictures would be read smaller"
-                             : s1.kvres != s0.kvres ? "beside it the latent cache would stream from the RAM"
-                             : s1.chunk != s0.chunk || s1.span != s0.span ? "beside it prompts would be read in shorter pieces"
-                                                                         : "beside it the GPUs would be shared otherwise";
+            // (the whole choice, the drafter's room with it: the plan's state is then the start's; false: its error in e1)
+            auto decide = [&](std::string& e1, std::string& df_why) -> bool {
+                e1.clear();
+                df_why.clear();
+                df_room = pk.num("dfly_layers") >= 1 && (o.dfly2 || n_gpu == 1);
+                bool ok1 = choose(e1);
+                if (df_room) {
+                    const Sum s1 = sum(ok1);
+                    df_room = false;
+                    std::string e0;
+                    const bool ok0 = choose(e0);
+                    const Sum s0 = sum(ok0);
+                    if (s0 == s1) {   // (the plan with its room, chosen again)
+                        df_room = true;
+                        ok1 = choose(e1);
+                    } else {
+                        ok1 = ok0;
+                        e1 = e0;
+                        df_why = !s1.ok ? "the start does not fit beside it"
+                                 : s1.q8 != s0.q8 ? "beside it the latent cache would be in 8-bit rows (F16 without it)"
+                                 : s1.vision != s0.vision || s1.pixels != s0.pixels ? "beside it pictures would be read smaller"
+                                 : s1.kvres != s0.kvres ? "beside it the latent cache would stream from the RAM"
+                                 : s1.chunk != s0.chunk || s1.span != s0.span ? "beside it prompts would be read in shorter pieces"
+                                                                             : "beside it the GPUs would be shared otherwise";
+                    }
+                }
+                return ok1;
+            };
+            // --room-report (the server asks at a first start on a PC whose cards it has no such figure for): each GPU's
+            // free VRAM as read above, and how much less of it this start's choices hold with - the latent cache's
+            // rows, KV streaming, the drafter's room, the pictures, the GPUs' layout, that it starts at all (not the
+            // prompt chunk or span an auto start takes, nor how many routed experts sit in VRAM: those follow the room
+            // left).  The same plan against smaller readings, one GPU at a time - nothing allocated, and each try is
+            // undone by the next (again()): the start itself is chosen after it, as without it
+            room_out.clear();
+            std::string room_line;
+            if (o.room_report) {
+                struct Pick {
+                    bool ok, q8, vision, head, own, df;
+                    int tp;
+                    long long pixels, kvres;
+                    bool operator==(const Pick& b) const {
+                        return ok == b.ok && q8 == b.q8 && vision == b.vision && head == b.head && own == b.own &&
+                               df == b.df && tp == b.tp && pixels == b.pixels && kvres == b.kvres;
+                    }
+                };
+                auto pick = [&]() {
+                    std::string e, w;
+                    const bool ok = decide(e, w);
+                    return Pick{ok, kv_q8, o.vision, head_tp, mtp_own, df_room, tp,
+                                o.vision ? (long long) vgeo.max_pixels : 0, (long long) o.kv_resident};
+                };
+                const Pick ref = pick();
+                const bool streamed = kv_res() > 0;   // (the start's own: the tries below change it)
+                if (ref.ok) {
+                    std::string gpus, say;
+                    for (size_t i = 0; i < free0.size(); ++i) {
+                        const double f = free0[i];
+                        double lo = 0, hi = f;   // (lo holds, hi does not: to a MiB)
+                        while (hi - lo > 1048576.0) {
+                            const double mid = 0.5 * (lo + hi);
+                            free0[i] = f - mid;
+                            (pick() == ref ? lo : hi) = mid;
+                        }
+                        free0[i] = f;
+                        char bus[32] = "?";
+                        if (cudaDeviceGetPCIBusId(bus, (int) sizeof bus, G[i].dev) != cudaSuccess) {
+                            cudaGetLastError();
+                            std::snprintf(bus, sizeof bus, "?");
+                        }
+                        char gb[160];
+                        std::snprintf(gb, sizeof gb, "%s%s,%.0f,%.0f", gpus.empty() ? "" : ";", bus, f, lo);
+                        gpus += gb;
+                        std::snprintf(gb, sizeof gb, "%sGPU%zu (%s) %.2f GB free, %.2f GB of it spare", say.empty() ? "" : "; ",
+                                      i, bus, f / 1e9, lo / 1e9);
+                        say += gb;
+                    }
+                    room_out = std::string("room_rows=") + (ref.q8 ? "q8" : "f16") + " room_drafter=" + (ref.df ? "1" : "0") +
+                               " room_streamed=" + (streamed ? "1" : "0") + " room_gpus=" + gpus;
+                    room_line = "INFO VRAM room (--room-report): " + say + " - this start's choices hold with that much "
+                                "less free (" + room_out + ")";
                 }
             }
+            std::string e1, df_why;
+            bool ok1 = decide(e1, df_why);
+            if (!room_line.empty()) info.push_back(room_line);
             if (!ok1) {
                 if (!e1.empty()) err = e1;   // (else a CUDA call's, in err already)
                 return false;
@@ -6508,5 +6572,6 @@ void Model::set_images(std::vector<Image> images) {
 }
 const Stats& Model::stats() const { return m->st; }
 std::vector<std::string> Model::info_lines() const { return m->info; }
+std::string Model::room_report() const { return m->room_out; }
 
 }  // namespace hy4
