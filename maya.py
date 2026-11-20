@@ -6714,8 +6714,9 @@ def setup_screen(a, asks: bool = True) -> bool:
 # the installed configs as they were when this setup run began ({resolved path: text}): ablate_step reads the config
 # before from it, and set_up keeps a copy of each config the run changed next to it (keep_config_backups)
 SETUP_BEFORE: dict = {}
-# what a setup run may change in a config's installer record without a copy kept: when it was written
-CONFIG_VOLATILE = ("written",)
+# what a setup run may change in a config's installer record without a copy kept: when it was written, the record of
+# the refusal-direction choice (the choice itself shows in the args)
+CONFIG_VOLATILE = ("written", "ablate")
 
 
 def args_map(args) -> dict:
