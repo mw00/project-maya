@@ -1148,6 +1148,13 @@ measured yet, so it is off by default. It applies to a GGUF's experts read in pl
 `MAYA_DS4_RAM_TIER=1`. The engine log says what it took (`ds4: RAM store ...`) and, after a decode, how a token's
 experts came (`RAM store: ...`; STAT lines: `store_hit=`, `store_miss=`, `store_wait_ms=`).
 
+With or without the store, the reads that pass the page cache are unbuffered on Linux (`O_DIRECT`); where the system
+refuses one (for example `EFAULT`, a destination in memory that it cannot pin), the log names the file and the errno
+once (`ds4: an unbuffered (O_DIRECT) read of ... was refused`) and that file is read through the page cache from then
+on - the same bytes. On a PC whose RAM does not hold the experts, a larger read-ahead on the SSD's block device
+(`/sys/block/<device>/queue/read_ahead_kb`, a system setting) can speed up the reads through the page cache; measure
+it on your PC.
+
 The `DS4_STORE_*` settings go in a config's `"env"`, or as `MAYA_DS4_STORE_*` in the settings.
 
 | Setting | Default | |

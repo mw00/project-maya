@@ -75,23 +75,73 @@ inline fd_t open_direct(const std::string& path) {
 }
 /// [off, off + n) through an unbuffered descriptor into dst, a kDirectAlign-aligned buffer of at least
 /// direct_span(off, n) bytes: the file read from off rounded down, so the bytes land at dst + (off % kDirectAlign).
-/// False if a read fails (the caller reads buffered instead).
+/// False if a read fails (the caller reads buffered instead, the same bytes). A descriptor whose read the system
+/// refused (#1076: EFAULT where the destination is memory O_DIRECT cannot pin) takes no more unbuffered reads - each
+/// later call returns false at once - and the first refusal is logged with its errno and file.
 constexpr uint64_t kDirectAlign = 4096;
 inline uint64_t direct_span(uint64_t off, uint64_t n) {
     const uint64_t a0 = off & ~(kDirectAlign - 1), a1 = (off + n + kDirectAlign - 1) & ~(kDirectAlign - 1);
     return a1 - a0;
 }
+#if !defined(_WIN32)
+struct DirectRefused {
+    std::mutex mu;
+    std::vector<int> fds;      // (the refused descriptors)
+    std::atomic<int> n{0};     // (their count: 0 - the reads take no lock)
+    bool said = false;
+};
+inline DirectRefused& direct_refused() {
+    static DirectRefused r;
+    return r;
+}
+inline bool direct_is_refused(int fd) {
+    DirectRefused& r = direct_refused();
+    if (r.n.load(std::memory_order_acquire) == 0) return false;
+    std::lock_guard<std::mutex> lk(r.mu);
+    return std::find(r.fds.begin(), r.fds.end(), fd) != r.fds.end();
+}
+inline void direct_refuse(int fd, int err) {
+    DirectRefused& r = direct_refused();
+    {
+        std::lock_guard<std::mutex> lk(r.mu);
+        if (std::find(r.fds.begin(), r.fds.end(), fd) != r.fds.end()) return;
+        r.fds.push_back(fd);
+        r.n.store((int) r.fds.size(), std::memory_order_release);
+        if (r.said) return;
+        r.said = true;
+    }
+    char link[48], path[4096];
+    std::snprintf(link, sizeof link, "/proc/self/fd/%d", fd);
+    const ssize_t k = ::readlink(link, path, sizeof path - 1);
+    path[k > 0 ? (size_t) k : 0] = '\0';
+    std::fprintf(stderr, "ds4: an unbuffered (O_DIRECT) read of %s was refused (errno %d: %s) - a file whose unbuffered "
+                 "read is refused is read through the page cache from then on (the same bytes)\n",
+                 k > 0 ? path : link, err, std::strerror(err));
+}
+inline void direct_forget(int fd) {   // (the descriptor closed: its number may name another file next)
+    DirectRefused& r = direct_refused();
+    if (r.n.load(std::memory_order_acquire) == 0) return;
+    std::lock_guard<std::mutex> lk(r.mu);
+    r.fds.erase(std::remove(r.fds.begin(), r.fds.end(), fd), r.fds.end());
+    r.n.store((int) r.fds.size(), std::memory_order_release);
+}
+#endif
 inline bool pread_direct(fd_t f, void* dst, uint64_t n, uint64_t off) {
 #if defined(_WIN32)
     (void) f, (void) dst, (void) n, (void) off;
     return false;
 #else
+    if (direct_is_refused((int) f)) return false;
     const uint64_t a0 = off & ~(kDirectAlign - 1), need = direct_span(off, n), want = (off - a0) + n;
     uint8_t* p = (uint8_t*) dst;
     uint64_t got = 0;
     while (got < need) {
         const ssize_t r = ::pread((int) f, p + got, (size_t) std::min<uint64_t>(need - got, 1ull << 30), (off_t) (a0 + got));
-        if (r < 0) return false;
+        if (r < 0 && errno == EINTR) continue;
+        if (r < 0) {
+            direct_refuse((int) f, errno);
+            return false;
+        }
         if (r == 0) break;   // (the file's end: the last aligned read is short)
         got += (uint64_t) r;
         if ((uint64_t) r % kDirectAlign != 0) break;
@@ -207,6 +257,7 @@ inline void close_fd(fd_t f) {
 #if defined(_WIN32)
     CloseHandle((HANDLE) f);
 #else
+    direct_forget((int) f);
     ::close((int) f);
 #endif
 }
