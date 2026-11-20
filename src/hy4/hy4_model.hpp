@@ -43,6 +43,14 @@ struct Options {
                                   // scales, the rotated part F16; the indexer's rows F16: about 58% of the VRAM), -1
                                   // auto - F16 where the context fits in VRAM with it, 8-bit rows where it fits
                                   // only with them (any layout: one GPU, the layer split, tensor parallel)
+    int kv_streaming = 0;         // KV streaming: 0 off, 1 on, -1 auto - on only where the context does not fit in the
+                                  // VRAM without it (after 8-bit rows and no picture's room: a start that failed
+                                  // before) and the RAM holds the rows; kv_resident then the ring tried first
+    int64_t kv_resident = 0;      // KV streaming: the indexed layers' cache rows kept in VRAM - a ring of the newest
+                                  // positions (a chunk's at least); every position's row in pinned host memory, the
+                                  // picked rows outside the ring read from there (the same bits: the same answers).
+                                  // 0: off - every row in VRAM.  Off as well where the context is no larger
+                                  // than the ring.
     bool vision = true;           // the vision tower (the pack's mmproj file) on the main GPU: a picture's room is lent by
                                   // the prompt buffers while it is read (made longer by what they lack of it, if anything)
     bool vision_auto = true;      // (not asked for by name: a pack without one runs text only, no error)

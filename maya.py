@@ -842,6 +842,7 @@ HY4_STANDARD = "standard"                          # the layout a size's own "fi
 HY4_FIT_USED_CAP_GIB = 1.0
 HY4_FIT_DISPLAY_GIB = 0.4
 HY4_FIT_MARGIN_GIB = 0.25
+HY4_KV_RESIDENT = 32768                            # (KV streaming: the global layers' newest positions kept in VRAM)
 # a small-card layout's prompt chunk doubled where it fits: the prompt scratch grows by about 0.9 GiB from 256 to 512
 # tokens (an 8 GB card at 4K: measured) - counted as 0.95, conservatively
 HY4_CHUNK_UP_GIB = 0.95
@@ -8261,14 +8262,80 @@ def hy4_q4_contexts(gpus: list) -> list:
     return HY4_Q4_CONTEXTS + [c for c in HY4_Q4_LONG if c * per / 2**30 <= HY4_Q4_LONG_SHARE * vram]
 
 
-def hy4_cache_bytes(ctx: int, chunk: int, q8: bool = False) -> int:
+def hy4_cache_bytes(ctx: int, chunk: int, q8: bool = False, resident: int = 0) -> int:
     """The bytes of maya-hy4's caches in VRAM at a context (src/hy4/hy4_model.cu's plan): the window layers' ring of
     latents (the newest 512 + max(16384, chunk) positions), the global layers' latents and pooled keys for every
     position, and the ring's hidden states.  q8: with the latent cache in 8-bit rows (the engine's --kv q8, and its
-    --kv auto where F16 rows do not fit: 672 bytes a row against 1152, the indexer's rows F16 against F32)."""
+    --kv auto where F16 rows do not fit: 672 bytes a row against 1152, the indexer's rows F16 against F32).
+    resident: with KV streaming (the engine's --kv-streaming) - the global layers' latents a ring of that many
+    positions (a chunk's at least) with a tag each, the others in RAM (hy4_stream_ram_gib), and the picked rows'
+    buffer; a context no larger than the ring is not streamed."""
     ring = min(ctx, 512 + max(16384, chunk))
     row, pool = (HY4_KV_Q8_ROW, 2) if q8 else (576 * 2, 4)
-    return 29 * ring * row + 13 * (ctx * row + (ctx // 4 + 1) * 128 * pool + ring * 2 * 128 * pool) + ring * 3072 * 4
+    res = max(int(resident), chunk) if resident else 0
+    if res and ctx > res:
+        rows = res * (row + 4)
+        pick = 64 * (2048 + 4) * (row + 8) + ctx * 4 + 1024
+    else:
+        rows, pick = ctx * row, 0
+    return 29 * ring * row + 13 * (rows + (ctx // 4 + 1) * 128 * pool + ring * 2 * 128 * pool) + ring * 3072 * 4 + pick
+
+
+def hy4_stream_ram_gib(ctx: int, q8: bool = False) -> float:
+    """KV streaming's RAM (GiB, pinned): every position's latent row of the 13 global layers."""
+    return 13 * ctx * (HY4_KV_Q8_ROW if q8 else 576 * 2) / 2**30
+
+
+def hy4_stream_need_gib(plan: dict, ctx: int, q8: bool = False, resident: int | None = None) -> float:
+    """hy4_fit_need_gib with KV streaming: less the global layers' rows that leave the VRAM."""
+    chunk = int(plan.get("chunk") or 1024)
+    res = HY4_KV_RESIDENT if resident is None else resident
+    return hy4_fit_need_gib(plan, ctx, q8) - \
+        (hy4_cache_bytes(ctx, chunk, q8) - hy4_cache_bytes(ctx, chunk, q8, res)) / 2**30
+
+
+def hy4_stream_rows(plan: dict, ctx: int, usable: float, ram_gib: float | None) -> tuple | None:
+    """A context that fits the VRAM only with KV streaming, as the engine's --kv-streaming auto takes it:
+    (rows, ring) - "f16" then "q8", with the ring of HY4_KV_RESIDENT positions and then a prompt chunk's - where the
+    RAM left for the rows (ram_gib) holds them; None: no RAM figure given, or it fits neither way."""
+    if ram_gib is None:
+        return None
+    for res in (HY4_KV_RESIDENT, 1):
+        for q8 in (False, True):
+            if hy4_stream_need_gib(plan, ctx, q8, res) <= usable:
+                # (the engine stops at the first that fits the VRAM: the RAM must hold that one's rows)
+                return ("q8" if q8 else "f16", res) if hy4_stream_ram_gib(ctx, q8) <= ram_gib else None
+    return None
+
+
+def hy4_ram_for_rows(q: dict, usable: float, ram_gb: float | None) -> float | None:
+    """The RAM (GiB) KV streaming's rows may take on this PC: its RAM less the system's headroom (8 GiB or a tenth)
+    and the size's experts outside the VRAM (the CPU lane reads them from the file cache); None: no RAM figure."""
+    if not ram_gb:
+        return None
+    return float(ram_gb) - max(8.0, 0.1 * float(ram_gb)) - max(0.0, float(q.get("memory_gb") or 0) - usable)
+
+
+def hy4_config_stream(quant: str, layout: str, ctx: int, usable: float, ram_gib: float | None,
+                      chunk: int | None = None, reserve_gb: float | None = None, mtp: bool = False,
+                      kv: str | None = None) -> tuple | None:
+    """hy4_stream_rows for a size already set up, counted as hy4_config_need_gib counts it (the Models page's
+    serve/models.py hy4_room): (rows, positions kept in VRAM, VRAM GiB) where the context fits its cards only with KV
+    streaming and the RAM left for the rows (ram_gib: hy4_ram_for_rows) holds them; kv "f16" / "q8": the config's own
+    rows only."""
+    if ram_gib is None:
+        return None
+    plan = (hy4_layouts(hy4_quant_table(quant)).get(layout or HY4_STANDARD) or {}).get("plan") or {}
+    ch = int(chunk or plan.get("chunk") or 1024)
+    for res in (HY4_KV_RESIDENT, 1):
+        for q8 in ((kv == "q8",) if kv in ("f16", "q8") else (False, True)):
+            base = hy4_config_need_gib(quant, layout, ctx, chunk=chunk, reserve_gb=reserve_gb, q8=q8, mtp=mtp)
+            if base is None:
+                return None
+            need = base - (hy4_cache_bytes(ctx, ch, q8) - hy4_cache_bytes(ctx, ch, q8, res)) / 2**30
+            if need <= usable:
+                return ("q8" if q8 else "f16", max(res, ch), need) if hy4_stream_ram_gib(ctx, q8) <= ram_gib else None
+    return None
 
 
 def hy4_need_gib(plan: dict, ctx: int, q8: bool = False) -> float:
@@ -8466,7 +8533,8 @@ def hy4_used_mib(before: dict | None = None, used: dict | None = None, own: dict
 
 
 def hy4_fit(q: dict, gpus: list, ctx_wanted: int | None = None, used: dict | None = None,
-            layout: str | None = None, pictures: bool = True, name: str | None = None) -> dict:
+            layout: str | None = None, pictures: bool = True, name: str | None = None,
+            ram_gb: float | None = None) -> dict:
     """How a size of Hy4-Flash (q: its entry in the manifest) runs on these cards, worked out before any download:
     {"layout": "standard" where its plan fits the VRAM (hy4_usable_gib) at the context - else a small-card layout the
     size has; "context": ctx_wanted, else "recommended" - the largest of HY4_CONTEXTS that fits, up to
@@ -8484,7 +8552,11 @@ def hy4_fit(q: dict, gpus: list, ctx_wanted: int | None = None, used: dict | Non
     pictures.
     Nothing fits: {"error": why, "hint": what to do, "usable", "need"} ("too_big": not even at the smallest context -
     the size itself; name: the size's on-screen name for the line, else the model's).  layout: only this one (the
-    files of a folder are that layout's)."""
+    files of a folder are that layout's).
+    ram_gb (the PC's RAM; None: as before, VRAM alone): contexts that fit the VRAM only with KV streaming are offered
+    too where the RAM holds their rows beside the system's headroom and the size's experts outside the VRAM -
+    "streamed": those contexts; at one of them "kv_streaming" True, "kv_ram" (GiB of RAM for the rows) and
+    "--kv-streaming auto" in "args" (the engine then streams by itself, only there)."""
     lays = hy4_layouts(q)
     if layout is not None:
         lays = {k: v for k, v in lays.items() if k == layout}
@@ -8493,8 +8565,17 @@ def hy4_fit(q: dict, gpus: list, ctx_wanted: int | None = None, used: dict | Non
     def need(plan: dict, c: int) -> float:             # (the least a context takes: with F16 rows, or with 8-bit rows)
         return min(hy4_fit_need_gib(plan, c), hy4_fit_need_gib(plan, c, True))
 
+    ram_rows = hy4_ram_for_rows(q, usable, ram_gb)     # (the RAM left for streamed rows)
+
+    def stream(plan: dict, c: int) -> tuple | None:
+        return hy4_stream_rows(plan, c, usable, ram_rows)
+
+    def need_at(plan: dict, c: int, q8: bool, st: tuple | None) -> float:
+        return hy4_stream_need_gib(plan, c, q8, st[1]) if st else hy4_fit_need_gib(plan, c, q8)
+
     def rows(plan: dict, c: int) -> str | None:        # (a context the table does not list: not measured on a card)
-        return hy4_kv_rows(hy4_fit_need_gib(plan, c), hy4_fit_need_gib(plan, c, True), usable)
+        kv = hy4_kv_rows(hy4_fit_need_gib(plan, c), hy4_fit_need_gib(plan, c, True), usable)
+        return kv or (stream(plan, c) or (None,))[0]
     least = HY4_CONTEXTS[0]
     cards = f"{len(gpus)} cards together have" if len(gpus or []) > 1 else "this card has"
     fits = {k: [c for c in HY4_CONTEXTS if rows(v["plan"], c)] for k, v in lays.items()}
@@ -8518,7 +8599,9 @@ def hy4_fit(q: dict, gpus: list, ctx_wanted: int | None = None, used: dict | Non
     rec = max([c for c in fits[pick] if c <= HY4_TESTED_CONTEXT] or [least])
     ctx = int(ctx_wanted) if ctx_wanted else rec
     kv = rows(plan, ctx)
-    takes = hy4_fit_need_gib(plan, ctx, kv == "q8")
+    st = None if hy4_kv_rows(hy4_fit_need_gib(plan, ctx), hy4_fit_need_gib(plan, ctx, True), usable) else \
+        stream(plan, ctx)
+    takes = need_at(plan, ctx, kv == "q8", st)
     chunk, args = int(plan.get("chunk") or 0), []
     # (pictures: their room is lent by the engine's prompt buffers - no VRAM kept, so the rows and the context
     #  worked out above stand and the largest picture is read on every layout)
@@ -8530,8 +8613,16 @@ def hy4_fit(q: dict, gpus: list, ctx_wanted: int | None = None, used: dict | Non
             chunk *= 2
         args = (["--chunk", str(chunk)] if chunk else []) +             [x for k, flag in (("reserve_gb", "--reserve-gb"), ("vram_experts", "--vram-experts")) if k in plan
              for x in (flag, f"{float(plan[k]):g}")]
-    return {"layout": pick, "context": ctx, "recommended": rec, "contexts": fits[pick], "chunk": chunk, "args": args,
-            "kv": kv, "usable": usable, "need": takes, "vision": vision, "vision_small": small}
+    streamed = [c for c in fits[pick]
+                if not hy4_kv_rows(hy4_fit_need_gib(plan, c), hy4_fit_need_gib(plan, c, True), usable)]
+    out = {"layout": pick, "context": ctx, "recommended": rec, "contexts": fits[pick], "chunk": chunk, "args": args,
+           "kv": kv, "usable": usable, "need": takes, "vision": vision, "vision_small": small}
+    if streamed:
+        out["streamed"] = streamed
+    if st:
+        out.update(kv_streaming=True, kv_ram=hy4_stream_ram_gib(ctx, kv == "q8"),
+                   args=args + ["--kv-streaming", "auto"])
+    return out
 
 
 def hy4_layout_in(d: Path, quant: str) -> str | None:
@@ -8917,7 +9008,8 @@ def hy4_fit_step(a, pc: dict, quant: str, prev_ctx: int | None = None, have=None
     if not hy4_layouts(q):
         hy4_entry(quant)                               # (a size with no files yet: its own message)
     forced = hy4_layout_in(Path(a.model_dir).expanduser(), quant) if a.model_dir else None
-    fit = hy4_fit(q, pc["gpus"], a.context, layout=forced, pictures=not a.no_vision, name=name)
+    ram = mem_gb()[0]
+    fit = hy4_fit(q, pc["gpus"], a.context, layout=forced, pictures=not a.no_vision, name=name, ram_gb=ram)
     if "error" not in fit and hy4_layouts(q)[fit["layout"]].get("published") == "hub" and not forced and \
             read_json(HY4_MANIFEST).get("revision") and \
             not (have and hy4_layout_in(have(fit["layout"]), quant) == fit["layout"]):
@@ -8935,7 +9027,7 @@ def hy4_fit_step(a, pc: dict, quant: str, prev_ctx: int | None = None, have=None
                  "needed); a card with about 10 GB of VRAM or more runs the standard file now")
     if "error" not in fit and not a.context and not getattr(a, "check", False):
         ctx = choose_context(a, prev_ctx, fit["contexts"], fit["recommended"])
-        fit = hy4_fit(q, pc["gpus"], ctx, layout=fit["layout"], pictures=not a.no_vision)
+        fit = hy4_fit(q, pc["gpus"], ctx, layout=fit["layout"], pictures=not a.no_vision, name=name, ram_gb=ram)
     if "error" in fit:
         hint = fit["hint"]
         alt = hy4_smaller_fit(quant, pc["gpus"], not a.no_vision) if fit.get("too_big") and not forced else None
@@ -8959,6 +9051,9 @@ def hy4_fit_step(a, pc: dict, quant: str, prev_ctx: int | None = None, have=None
            f"{fit['need']:.1f} GB of the {fit['usable']:.1f} GB of VRAM for what must sit there; the routed experts "
            f"are computed on the CPU, prompts are read in chunks of {fit['chunk']} tokens")
     ok(f"context: {fit['context']} tokens" + (" (recommended for this VRAM)" if fit["context"] == fit["recommended"] else ""))
+    if fit.get("kv_streaming"):
+        ok(f"at this context the attention cache's older rows live in RAM: about {fit['kv_ram']:.1f} GB of it, kept "
+           "pinned (the answers are the same; long prompts and answers are somewhat slower)")
     if max(fit["contexts"]) < HY4_CONTEXTS[-1]:        # (the model reaches 1M: what keeps this PC below it, said once)
         ok(f"a context above {context_label(max(fit['contexts']))} needs more VRAM than "
            f"{'these cards have' if len(pc['gpus']) > 1 else 'this card has'} free (the model's own reach: "
