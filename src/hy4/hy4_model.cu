@@ -388,6 +388,27 @@ struct Model::Impl {
     // counted where the routes reach the host (the CPU lane's layers, every layer with Options::profile_out) and
     // written back (with the read ones) by save_profile
     std::vector<uint32_t> prof_in, prof_cnt;
+    // HY4_HOT=1 (opt-in): in a layer whose routed experts a GPU holds only some of, the ones in VRAM follow what the
+    // answers route to.  Each expert's score is its picks by generated tokens (the token path's; a prompt's routing
+    // predicts an answer's poorly), older picks fading over `horizon` tokens.  Every `every` token steps the lowest
+    // scored experts in VRAM give their slots to higher scored CPU-lane ones (by more than ratio x + margin picks: a
+    // copy costs more than a few lane runs), at most `max_swaps` a time, more between requests (idle()).  The scores
+    // are kept over restarts (`file`, written with the profile): a start places each layer's highest scored experts
+    // in VRAM (else Options::profile's most routed, else the first ones).  Deterministic for a start's file and the
+    // same requests; which experts the GPU computes moves the sums' rounding, so the text differs from without it
+    struct Hot {
+        bool on = false, quiet = false, log = false, loaded = false;
+        int every = 8, max_swaps = 64, steps = 0;
+        double horizon = 1024.0, margin = 2.0, ratio = 1.25;
+        std::string file;
+        std::vector<float> score;      // [n_layer][n_expert]
+        std::vector<uint32_t> win;     // [n_layer][n_expert] picks since the last fold
+        int64_t win_tokens = 0, win_picks = 0, win_hits = 0;
+        int64_t swaps = 0, picks = 0, hits = 0, rounds = 0;
+        double swap_s = 0;
+    } hot;
+    std::atomic<bool> placing{false};   // (the placer thread reads the layers' slots meanwhile: no swaps)
+    size_t stage_blob = 0;              // (h_stage's blob size)
     double copy_gbs = 15.0;       // ... the copies into the bounce, GB/s (measured, EMA)
     int* h_pmap = nullptr;
     std::vector<CpuEntry> lane_entries;
@@ -1630,7 +1651,10 @@ struct Model::Impl {
             l.slot_of.assign((size_t) g.n_expert, -1);
             std::vector<int> order((size_t) g.n_expert);
             for (int e = 0; e < g.n_expert; ++e) order[(size_t) e] = e;
-            if (!l.mtp && (size_t) (il + 1) * g.n_expert <= prof_in.size()) {
+            if (!l.mtp && hot.loaded && (size_t) (il + 1) * g.n_expert <= hot.score.size()) {   // (HY4_HOT's file)
+                const float* c = hot.score.data() + (size_t) il * g.n_expert;
+                std::stable_sort(order.begin(), order.end(), [&](int a, int b) { return c[a] > c[b]; });
+            } else if (!l.mtp && (size_t) (il + 1) * g.n_expert <= prof_in.size()) {
                 const uint32_t* c = prof_in.data() + (size_t) il * g.n_expert;
                 std::stable_sort(order.begin(), order.end(), [&](int a, int b) { return c[a] > c[b]; });
             }
@@ -1964,6 +1988,7 @@ struct Model::Impl {
             if (f && f.read((char*) v.data(), (std::streamsize) (v.size() * 4))) prof_in = std::move(v);
             else info.push_back("INFO the expert profile " + o.profile + " was not read (missing, or another model's)");
         }
+        hot_init();
         // the host's parts: the token embeddings and the Engram table, read in place
         const Tensor* te = need("token_embd.weight", err);
         if (!te) return false;
@@ -2143,6 +2168,7 @@ struct Model::Impl {
             size_t blob = 0;
             for (const Layer& l : L) blob = std::max(blob, l.blob);
             CK(cudaMallocHost(&h_stage, blob * kStage));
+            stage_blob = blob;
             CK(cudaMallocHost(&h_pmap, sizeof(int) * g.n_expert));
             for (size_t gi = 0; gi < G.size(); ++gi) {   // (the staging slots where a GPU holds such layers)
                 bool any = false;
@@ -2164,8 +2190,15 @@ struct Model::Impl {
                           lane->threads() + 1, lane->nodes() > 1 ? " (their pages spread over the NUMA nodes in the "
                                                                    "background)" : "");
             info.push_back(buf);
+            if (hot.on) {
+                std::snprintf(buf, sizeof buf, "INFO HY4_HOT: the experts in VRAM follow the answers' routing (placed by "
+                              "%s), every %d token steps up to %d swaps", hot.loaded ? hot.file.c_str() :
+                              !prof_in.empty() ? "the profile" : "their order, no scores yet", hot.every, hot.max_swaps);
+                info.push_back(buf);
+            }
             if (lane->nodes() > 1) {
                 const int nodes = lane->nodes();
+                placing.store(true);
                 placer = std::thread([this, nodes] {
 #if defined(__linux__)
                     (void) nice(10);
@@ -2177,6 +2210,7 @@ struct Model::Impl {
                             if (l.slot_of[(size_t) e] < 0) cpu.push_back(e);
                         place_experts(l.cex, cpu, nodes, placer_stop);
                     }
+                    placing.store(false);
                 });
             } else {
                 // one node: the lane's experts read into this process in the background when the RAM holds them
@@ -2191,6 +2225,7 @@ struct Model::Impl {
                 const uint64_t avail = ram_available();
                 if (we && std::atoi(we) != 0 && avail > 0 && (double) avail > 1.1 * (double) lane_bytes + 2e9) {
                     info.push_back("INFO CPU lane: its experts are read into memory in the background");
+                    placing.store(true);
                     placer = std::thread([this] {
 #if defined(__linux__)
                         (void) nice(10);
@@ -2202,6 +2237,7 @@ struct Model::Impl {
                                 if (l.slot_of[(size_t) e] < 0) cpu.push_back(e);
                             warm_experts(l.cex, cpu, placer_stop);
                         }
+                        placing.store(false);
                     });
                 }
             }
@@ -2693,6 +2729,166 @@ struct Model::Impl {
         uint32_t* c = prof_cnt.data() + (size_t) il * g.n_expert;
         for (int i = 0; i < T * g.n_used; ++i) ++c[h_ids[i]];
     }
+
+    // HY4_HOT (see Hot): its settings and the scores a start begins with - the file's, else the profile's counts
+    // as 256 tokens of history, else none
+    void hot_init() {
+        const char* on = std::getenv("HY4_HOT");
+        hot.on = on && std::atoi(on) != 0;
+        if (!hot.on) return;
+        auto num = [](const char* k, double d) {
+            const char* v = std::getenv(k);
+            return v && *v ? std::atof(v) : d;
+        };
+        hot.every = std::max(1, (int) num("HY4_HOT_EVERY", hot.every));
+        hot.max_swaps = std::max(0, (int) num("HY4_HOT_SWAPS", hot.max_swaps));
+        hot.horizon = std::max(1.0, num("HY4_HOT_HORIZON", hot.horizon));
+        hot.margin = std::max(0.0, num("HY4_HOT_MARGIN", hot.margin));
+        hot.log = std::getenv("HY4_HOT_LOG") != nullptr;
+        const char* f = std::getenv("HY4_HOT_FILE");
+        hot.file = f ? std::string(f) : o.pack + "/expert-hot.bin";
+        const size_t n = (size_t) g.n_layer * g.n_expert;
+        hot.score.assign(n, 0.0f);
+        hot.win.assign(n, 0);
+        if (!hot.file.empty()) {
+            std::ifstream in(hot.file, std::ios::binary);
+            char magic[8];
+            int32_t hd[2] = {0, 0};
+            std::vector<float> v(n);
+            if (in && in.read(magic, 8) && std::memcmp(magic, "HY4HOT1", 8) == 0 && in.read((char*) hd, sizeof hd) &&
+                hd[0] == g.n_layer && hd[1] == g.n_expert && in.read((char*) v.data(), (std::streamsize) (n * 4))) {
+                hot.score = std::move(v);
+                hot.loaded = true;
+            }
+        }
+        if (!hot.loaded && prof_in.size() >= n)
+            for (int il = 0; il < g.n_layer; ++il) {
+                const uint32_t* c = prof_in.data() + (size_t) il * g.n_expert;
+                double sum = 0;
+                for (int e = 0; e < g.n_expert; ++e) sum += c[e];
+                for (int e = 0; sum > 0 && e < g.n_expert; ++e)
+                    hot.score[(size_t) il * g.n_expert + e] = (float) (c[e] / sum * g.n_used * 256.0);
+            }
+    }
+    // a token window's routes of layer l (in h_ids) into the window's picks
+    void hot_count(const Layer& l, int T) {
+        uint32_t* c = hot.win.data() + (size_t) l.il * g.n_expert;
+        const int n = T * g.n_used;
+        for (int i = 0; i < n; ++i) {
+            const int e = h_ids[i];
+            ++c[e];
+            hot.win_hits += l.slot_of[(size_t) e] >= 0;
+        }
+        hot.win_picks += n;
+    }
+    // the window's picks folded into the scores (the old ones fading by the window's tokens), then up to max_swaps
+    // swaps of a layer's lowest scored VRAM experts with its highest scored CPU-lane ones.  Only between forwards:
+    // the copies and the slot tables go on the layer GPU's stream, after what it has queued
+    bool hot_rebalance(int max_swaps, std::string& err) {
+        hot.steps = 0;
+        if (!hot.on || placing.load()) return true;
+        const double t0 = now_s();
+        const float decay = (float) std::exp(-(double) hot.win_tokens / hot.horizon);
+        const int64_t wp = hot.win_picks, wh = hot.win_hits;
+        hot.picks += wp;
+        hot.hits += wh;
+        hot.win_tokens = hot.win_picks = hot.win_hits = 0;
+        struct Sw {
+            float gain;
+            int il, out, in;
+        };
+        std::vector<Sw> plan;
+        size_t wanted = 0;
+        std::vector<int> res, cpu;
+        for (Layer& l : L) {
+            if (!l.partial() || l.il >= g.n_layer) continue;
+            float* sc = hot.score.data() + (size_t) l.il * g.n_expert;
+            uint32_t* w = hot.win.data() + (size_t) l.il * g.n_expert;
+            for (int e = 0; e < g.n_expert; ++e) {
+                sc[e] = sc[e] * decay + (float) w[e];
+                w[e] = 0;
+            }
+            res.clear();
+            cpu.clear();
+            for (int e = 0; e < g.n_expert; ++e) (l.slot_of[(size_t) e] >= 0 ? res : cpu).push_back(e);
+            std::stable_sort(res.begin(), res.end(), [&](int a, int b) { return sc[a] < sc[b]; });
+            std::stable_sort(cpu.begin(), cpu.end(), [&](int a, int b) { return sc[a] > sc[b]; });
+            for (size_t i = 0; i < res.size() && i < cpu.size(); ++i) {
+                if (sc[cpu[i]] <= (float) hot.ratio * sc[res[i]] + (float) hot.margin) break;
+                plan.push_back({sc[cpu[i]] - sc[res[i]], l.il, res[i], cpu[i]});
+            }
+        }
+        wanted = plan.size();
+        std::stable_sort(plan.begin(), plan.end(), [](const Sw& a, const Sw& b) { return a.gain > b.gain; });
+        if ((int) plan.size() > max_swaps) plan.resize((size_t) std::max(0, max_swaps));
+        if (!plan.empty()) {
+            mtp_settle();
+            for (size_t gi = 0; gi < G.size(); ++gi) {
+                Gpu& gp = G[gi];
+                std::vector<const Sw*> mine;
+                for (const Sw& s : plan)
+                    if (L[(size_t) s.il].gpu == (int) gi) mine.push_back(&s);
+                if (mine.empty()) continue;
+                CK(cudaSetDevice(gp.dev));
+                for (size_t b0 = 0; b0 < mine.size(); b0 += kStage) {
+                    const size_t nb = std::min<size_t>(kStage, mine.size() - b0);
+                    std::vector<int> touched;
+                    for (size_t i = 0; i < nb; ++i) {   // (each blob's copy runs while the next one is gathered)
+                        const Sw& s = *mine[b0 + i];
+                        Layer& l = L[(size_t) s.il];
+                        uint8_t* b = h_stage + i * stage_blob;
+                        const size_t e = (size_t) s.in;
+                        std::memcpy(b + l.tr[0], l.cex.gate + e * l.cex.g_stride, l.cex.g_stride);
+                        std::memcpy(b + l.tr[1], l.cex.up + e * l.cex.g_stride, l.cex.g_stride);
+                        std::memcpy(b + l.tr[2], l.cex.down + e * l.cex.d_stride, l.cex.d_stride);
+                        const int slot = l.slot_of[(size_t) s.out];
+                        l.slot_of[(size_t) s.out] = -1;
+                        l.slot_of[e] = slot;
+                        CK(cudaMemcpyAsync(l.experts + (size_t) slot * l.blob, b, l.tr[2] + l.cex.d_stride,
+                                           cudaMemcpyHostToDevice, gp.s));
+                        if (std::find(touched.begin(), touched.end(), s.il) == touched.end()) touched.push_back(s.il);
+                    }
+                    for (int il : touched) {
+                        Layer& l = L[(size_t) il];
+                        CK(cudaMemcpyAsync(l.slot_d, l.slot_of.data(), sizeof(int) * g.n_expert, cudaMemcpyHostToDevice,
+                                           gp.s));
+                    }
+                    CK(cudaStreamSynchronize(gp.s));   // (the staging blobs taken before they are reused)
+                }
+            }
+        }
+        const double dt = now_s() - t0;
+        hot.swaps += (int64_t) plan.size();
+        hot.swap_s += dt;
+        ++hot.rounds;
+        if (hot.log)
+            std::fprintf(stderr, "maya-hy4: HY4_HOT: window picks %lld, %.1f%% in VRAM; %zu swaps of %zu wanted, %.1f ms\n",
+                         (long long) wp, wp ? 100.0 * (double) wh / (double) wp : 0.0, plan.size(), wanted, dt * 1e3);
+        return true;
+    }
+    // the scores (the window's picks folded in, unswapped) to hot.file
+    bool hot_save(std::string& err) const {
+        if (!hot.on || hot.file.empty() || hot.score.empty()) return true;
+        const float decay = (float) std::exp(-(double) hot.win_tokens / hot.horizon);
+        std::vector<float> v(hot.score.size());
+        for (size_t i = 0; i < v.size(); ++i) v[i] = hot.score[i] * decay + (float) hot.win[i];
+        const std::string tmp = hot.file + ".tmp";
+        {
+            std::ofstream f(tmp, std::ios::binary);
+            const int32_t hd[2] = {g.n_layer, g.n_expert};
+            if (!f.write("HY4HOT1", 8) || !f.write((const char*) hd, sizeof hd) ||
+                !f.write((const char*) v.data(), (std::streamsize) (v.size() * 4))) {
+                err = tmp + ": not written";
+                return false;
+            }
+        }
+        std::remove(hot.file.c_str());   // (Windows' rename does not replace)
+        if (std::rename(tmp.c_str(), hot.file.c_str()) != 0) {
+            err = hot.file + ": not replaced";
+            return false;
+        }
+        return true;
+    }
     bool experts_sets(Layer& l, Gpu& gp, int T, std::string& err, const int* slot, const uint8_t* wbase = nullptr,
                       int n_slots = -1, bool accumulate = false) {
         const int lat = g.n_lat, nu = g.n_used, ne = slot ? (n_slots >= 0 ? n_slots : l.n_res) : g.n_expert;
@@ -2925,6 +3121,7 @@ struct Model::Impl {
             }
             if (lane_on && !streamed) {   // (the GPU's experts run meanwhile)
                 count_routes(l.il, T);
+                if (hot.on && T <= W && !hot.quiet) hot_count(l, T);
                 lane_entries.clear();
                 for (int t = 0; t < T; ++t)
                     for (int j = 0; j < nu; ++j) {
@@ -3908,6 +4105,10 @@ struct Model::Impl {
 
 Model::Model() : m(new Impl) {}
 Model::~Model() {
+    if (m && m->hot.on && m->hot.rounds > 0)
+        std::fprintf(stderr, "maya-hy4: HY4_HOT: %lld swaps in %lld rounds, %.2f s; the generated tokens' routes of the "
+                     "CPU-lane layers %.1f%% in VRAM\n", (long long) m->hot.swaps, (long long) m->hot.rounds,
+                     m->hot.swap_s, m->hot.picks ? 100.0 * (double) m->hot.hits / (double) m->hot.picks : 0.0);
     if (m) m->tp_report();
     if (m) m->ev_report();
     if (m && m->prof) m->prof_report();
@@ -3926,7 +4127,9 @@ bool Model::load(const Options& o, std::string& err) {
     if (T < 2) return true;
     std::vector<int> ids((size_t) T, m->g.bos >= 0 && m->g.bos < V ? m->g.bos : 0);
     std::vector<float> lg((size_t) hy4::k::kMaxWin * V);
+    m->hot.quiet = true;   // (HY4_HOT: the warm-up's routes not counted)
     bool ok = forward(ids.data(), T, 0, 1, lg.data(), err) && forward(ids.data(), 4, T, 4, lg.data(), err);
+    m->hot.quiet = false;
     if (ok && has_mtp()) {
         std::vector<int> d;
         std::vector<float> c;
@@ -3979,6 +4182,9 @@ bool Model::forward(const int* ids, int n, int64_t pos0, int want, float* logits
         err = "logits of at most " + std::to_string(W) + " positions a call";
         return false;
     }
+    // (HY4_HOT: a token step's routes count; every hot.every steps the experts in VRAM follow them first)
+    const bool hot_step = m->hot.on && n <= W && !m->hot.quiet;
+    if (hot_step && m->hot.steps >= m->hot.every && !m->hot_rebalance(m->hot.max_swaps, err)) return false;
     m->tokens.resize((size_t) pos0);
     m->mtp_done = std::min(m->mtp_done, pos0);
     m->tokens.insert(m->tokens.end(), ids, ids + n);
@@ -3993,8 +4199,17 @@ bool Model::forward(const int* ids, int n, int64_t pos0, int want, float* logits
         m->end = pos0 + done;
         m->st.tokens += T;
     }
+    if (hot_step) {
+        m->hot.win_tokens += n;
+        ++m->hot.steps;
+    }
     if (m->inject) m->inject_report();
     return true;
+}
+void Model::idle() {
+    std::string err;
+    if (m->hot.on && !m->hot.quiet && !m->hot_rebalance(4 * m->hot.max_swaps, err))
+        std::fprintf(stderr, "maya-hy4: HY4_HOT: %s\n", err.c_str());
 }
 
 int Model::vocab() const { return m->g.n_vocab; }
@@ -4017,6 +4232,7 @@ void Model::unpin(void* p) {
     if (p && cudaHostUnregister(p) != cudaSuccess) (void) cudaGetLastError();
 }
 bool Model::save_profile(std::string& err) const {
+    if (!m->hot_save(err)) return false;   // (HY4_HOT's scores, with the profile)
     const std::string& path = m->o.profile_out;
     if (path.empty()) return true;
     std::vector<uint32_t> v((size_t) m->g.n_layer * m->g.n_expert, 0);
