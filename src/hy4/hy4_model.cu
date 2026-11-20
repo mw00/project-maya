@@ -2701,22 +2701,22 @@ struct Model::Impl {
     // (slot: each expert's slot in wbase - null: every expert, wbase the layer's; n_slots of them; accumulate: latout +=)
     // The CPU lane's most routed experts re-coded at 4 bits a weight in the RAM left over (hy4_lane.hpp's Q4xSet: the
     // same bits as the file's IQ2_XXS rows; on a lane bound by the CPU's arithmetic about twice as fast an expert,
-    // on one bound by its memory slower - twice the bytes).  Asked for only (HY4_Q4X=2: when a probe of this
-    // host's lane times its calls faster with the copies, by 15 %; =1: without the probe's verdict) and where RAM is
-    // free beyond the lane's experts (counted as if all were in the page cache) and a headroom of max(4 GiB, a tenth
-    // of the RAM), a quarter of the RAM at most; a thread re-codes the most routed experts while the lane is idle
-    // (between answers).  Whether they pay is measured on this PC: a probe at the start (a lane call of 16 experts on
-    // each form) must time them 5 % faster, then, once copies exist, the next answers' one-token lane calls run in
-    // turns with and without them (q4x_trial) and the faster side is kept - the copies freed when without wins.  The
-    // HY4_Q4X=2: measured as above; =1: always, untimed; unset: never; HY4_Q4X_GB: the RAM they take at most
+    // on one bound by its memory slower - twice the bytes) - where RAM is free beyond the lane's experts (counted as
+    // if all were in the page cache) and a headroom of max(4 GiB, a tenth of the RAM), a quarter of the RAM at most;
+    // a thread re-codes the most routed experts while the lane is idle (between answers).  Whether they pay is
+    // measured on this PC (the default, HY4_Q4X=2): a probe at the start (a lane call of 16 experts on each form)
+    // must time them 5 % faster, then, once copies exist, the next answers' one-token lane calls run in turns with
+    // and without them (q4x_trial) and the faster side is kept - the copies freed when without wins.  maya.py's
+    // q4x_calibration runs that once per PC and keeps the verdict in the config (HY4_Q4X=1 / 0), so a start of the
+    // config does not measure again.  The copies give the file's bits (the lane's output and the greedy ids the same
+    // with and without them, Linux and Windows builds); a prompt chunk's route - streamed to the GPU or the lane,
+    // chosen by measured rates - may still move with the lane's speed, as with any other load on the CPU.
+    // HY4_Q4X unset or 2: measured as above; 1: always, untimed; 0: never; HY4_Q4X_GB: the RAM they take at most
     void q4x_start() {
         const char* qv = std::getenv("HY4_Q4X");
-        // (off unless asked: no decode gain measured on the V100 hosts.  The copies give the file's bits - the lane's
-        //  output and the greedy ids the same with and without them, Linux and Windows builds; a prompt chunk's route
-        //  - streamed to the GPU or the lane, chosen by measured rates - may still move with the lane's speed, as with
-        //  any other load on the CPU)
-        if (!qv || (std::atoi(qv) != 1 && std::atoi(qv) != 2)) return;
-        const bool force = std::atoi(qv) == 1;
+        const int mode = qv ? std::atoi(qv) : 2;
+        if (mode != 1 && mode != 2) return;
+        const bool force = mode == 1;
         double lane_b = 0, per = 0;
         int probe_l = -1;
         for (Layer& l : L) {
@@ -2799,8 +2799,12 @@ struct Model::Impl {
                     }
                 }
                 std::sort(cand.begin(), cand.end(), [](const auto& x, const auto& y) { return x.first > y.first; });
+                bool cut = false;   // (a pass left for the next idle time: the lane took work, or a stop)
                 for (const auto& [c, k] : cand) {
-                    if (placer_stop.load() || q4x_stop.load() || !lane->idle()) break;
+                    if (placer_stop.load() || q4x_stop.load() || !lane->idle()) {
+                        cut = true;
+                        break;
+                    }
                     Layer& l = L[(size_t) (k / ne)];
                     const int e = k % ne;
                     const double b = (double) (2 * l.cex.q4x_gu + l.cex.q4x_d);
@@ -2815,6 +2819,7 @@ struct Model::Impl {
                     q4x_made.fetch_add(1, std::memory_order_relaxed);
                     q4x_bytes.store((int64_t) used, std::memory_order_relaxed);
                 }
+                if (!cut && q4x_made.load(std::memory_order_relaxed) > 0) q4x_pass.store(true);
                 nap(200);
             }
         });
@@ -2825,12 +2830,15 @@ struct Model::Impl {
     // the builder stopped and the copies freed
     bool q4x_adaptive = false, q4x_decided = false;
     std::atomic<bool> q4x_stop{false};
+    std::atomic<bool> q4x_pass{false};   // (the builder went once through every expert routed twice, or the RAM is full)
     void q4x_trial() {
         if (!q4x_adaptive || q4x_decided) return;
         LaneCount& lc = lane_count();
         const int m = lc.q4x_mode.load(std::memory_order_relaxed);
         if (m == 0) {
-            if (q4x_made.load(std::memory_order_relaxed) >= 64) {
+            // (the turns start once the builder has been through the experts the counts asked for: the side with the
+            //  copies is timed with them in place, not while a few exist)
+            if (q4x_made.load(std::memory_order_relaxed) >= 64 && q4x_pass.load(std::memory_order_relaxed)) {
                 for (int k = 0; k < 2; ++k) lc.trial_calls[k] = lc.trial_entries[k] = 0, lc.trial_s[k] = 0;
                 lc.q4x_mode.store(2, std::memory_order_relaxed);
             }

@@ -1805,5 +1805,95 @@ class Dashboard(unittest.TestCase):
         self.assertEqual(json.loads(out.stdout), ["hy4", ["none", "high"], "high", "high", "high", "Hy4 Flash"])
 
 
+class Q4xCheck(unittest.TestCase):
+    """The CPU lane's 4-bit expert copies (maya-hy4's HY4_Q4X): measured once per PC at an attended start - the
+    engine's own verdict (HY4_Q4X=2) kept in the config's env as 1 / 0 - unless the env sets it already."""
+
+    def cfg(self, root: Path, **kw) -> dict:
+        tok = root / "tokenizer"
+        tok.mkdir(exist_ok=True)
+        (tok / "chat_template.jinja").write_text("{{ messages }}")
+        c = {"exe": str(root / "maya-hy4"), "tokenizer": str(tok), "gpu": [0],
+             "args": ["--pack", str(root / "pack"), "--max-context", "8192"],
+             "installer": {"family": "hy4", "hy4_quant": "maya-xs"}}
+        c.update(kw)
+        return c
+
+    def test_who_needs_it(self):
+        with tempfile.TemporaryDirectory() as t:
+            c = self.cfg(Path(t))
+            self.assertTrue(maya.needs_q4x_calibration(c))
+            self.assertFalse(maya.needs_q4x_calibration(dict(c, env={"HY4_Q4X": "0"})))   # (the user's own)
+            self.assertFalse(maya.needs_q4x_calibration(dict(c, installer=dict(c["installer"],
+                                                                               q4x_calibration={"result": "on"}))))
+            self.assertFalse(maya.needs_q4x_calibration(dict(c, installer=dict(c["installer"], hy4_quant=maya.HY4_Q4))))
+            self.assertFalse(maya.needs_q4x_calibration(dict(c, backend="metal")))
+            self.assertFalse(maya.needs_q4x_calibration({"exe": "/b/maya", "args": ["--glm-pack", "/p"],
+                                                         "installer": {"family": "glm"}}))
+
+    def test_the_verdict(self):
+        self.assertEqual(maya.q4x_verdict("maya-hy4: CPU lane: the 4-bit copies kept - an expert run 60 us"), "on")
+        self.assertEqual(maya.q4x_verdict("maya-hy4: CPU lane: the 4-bit copies dropped - an expert run"), "off")
+        self.assertEqual(maya.q4x_verdict("INFO CPU lane: a call of 16 experts ... - the file's rows kept"), "off")
+        self.assertEqual(maya.q4x_verdict("INFO CPU lane: no 4-bit copies of its experts (2.0 GB of RAM free"), "off")
+        self.assertEqual(maya.q4x_verdict("INFO CPU lane: ... 4-bit copies - the most routed experts re-coded"),
+                         "unmeasured")
+        self.assertIsNone(maya.q4x_verdict("INFO every routed expert in VRAM"))
+
+    def run_check(self, root: Path, verdict_line: str):
+        p = root / "maya-hy4-flash-maya-xs.json"
+        p.write_text(json.dumps(self.cfg(root)))
+        seen = {}
+
+        class Engine:
+            def __init__(self, cmd, stdin=None, stdout=None, stderr=None, env=None, **kw):
+                seen["env"], seen["cmd"] = env, cmd
+                stderr.write(verdict_line + "\n")
+                self.stdin = io.StringIO()
+                self.stdout = iter(["READY\n", "T 5\n", "DONE 64 30 1 1 length\n", "DONE 256 30 1 1 length\n"])
+
+            def wait(self, timeout=None):
+                return 0
+
+        class Tok:
+            @staticmethod
+            def from_dir(d):
+                return SimpleNamespace(encode=lambda s, parse_special=False: [1, 2, 3])
+
+        said = []
+        with patch.object(maya.subprocess, "Popen", Engine), patch.object(maya, "busy_skip", return_value=False), \
+                patch.object(maya.time, "sleep"), patch.object(maya, "ok", said.append), \
+                patch.object(maya, "warn", said.append), patch.object(maya, "say"), \
+                patch.object(maya, "ROOT", root), patch.dict(sys.modules, {"strata_tokenizer": SimpleNamespace(Tokenizer=Tok)}), \
+                patch.object(maya, "bench_chat", return_value=lambda q: q):
+            got = maya.q4x_calibration(p)
+        return got, maya.read_json(p), seen, said
+
+    def test_on_and_off_kept_in_the_config(self):
+        for line, want, env in (("maya-hy4: CPU lane: the 4-bit copies kept - x", True, "1"),
+                                ("maya-hy4: CPU lane: the 4-bit copies dropped - x", False, "0")):
+            with self.subTest(want=want), tempfile.TemporaryDirectory() as t:
+                got, c, seen, _ = self.run_check(Path(t), line)
+                self.assertIs(got, want)
+                self.assertEqual(seen["env"]["HY4_Q4X"], "2")          # (the engine's own measurement)
+                self.assertEqual(seen["cmd"][1], "--serve")
+                self.assertEqual(c["env"]["HY4_Q4X"], env)
+                self.assertEqual(c["installer"]["q4x_calibration"]["result"], "on" if want else "off")
+                self.assertFalse(maya.needs_q4x_calibration(c))         # (measured once)
+
+    def test_nothing_to_decide_or_unfinished(self):
+        with tempfile.TemporaryDirectory() as t:
+            got, c, _, _ = self.run_check(Path(t), "INFO every routed expert in VRAM")
+            self.assertIsNone(got)
+            self.assertNotIn("HY4_Q4X", c.get("env") or {})            # (the engine's default stays)
+            self.assertEqual(c["installer"]["q4x_calibration"]["result"], "n/a")
+        with tempfile.TemporaryDirectory() as t:
+            got, c, _, said = self.run_check(Path(t), "INFO CPU lane: ... 4-bit copies - re-coded")
+            self.assertIsNone(got)
+            self.assertNotIn("HY4_Q4X", c.get("env") or {})
+            self.assertEqual(c["installer"]["q4x_calibration"]["result"], "unmeasured")
+            self.assertTrue(any("did not finish" in s for s in said))
+
+
 if __name__ == "__main__":
     unittest.main()
