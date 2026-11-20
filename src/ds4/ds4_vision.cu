@@ -379,15 +379,9 @@ bool VisionTower::load(const VisionGeo& g, int device, const Reader& read, std::
     n2_.assign(g.layers, nullptr);
     bqkv_.assign(g.layers, nullptr);
     bo_.assign(g.layers, nullptr);
-    cublasHandle_t h = nullptr;
-    VB(cublasCreate(&h));
-    blas_ = h;
-    cudaStream_t st = nullptr, cs = nullptr;
-    VK(cudaStreamCreateWithFlags(&st, cudaStreamNonBlocking));
-    VK(cudaStreamCreateWithFlags(&cs, cudaStreamNonBlocking));
-    st_ = st;
-    cs_ = cs;
-    VB(cublasSetStream(h, st));   // (the workspace: the room's, set by each encode)
+    // (the cuBLAS handle and the two streams: made at the first picture - encode - not here: on ROCm a stream takes
+    // one of the GPU's few hardware queues (GPU_MAX_HW_QUEUES, 4), and two made before the engine's own streams moved
+    // those onto shared queues on this GPU - its prompt chunks ~25% slower with the tower loaded, no picture sent)
     for (int i = 0; i < 2; ++i) {
         cudaEvent_t a = nullptr, b = nullptr;
         VK(cudaEventCreateWithFlags(&a, cudaEventDisableTiming));
@@ -410,6 +404,17 @@ bool VisionTower::encode(const uint8_t* rgb, int width, int height, uint8_t* roo
         return false;
     }
     cudaSetDevice(dev_);
+    if (blas_ == nullptr) {   // (load's note: made at the first picture, after the engine's streams)
+        cublasHandle_t h = nullptr;
+        VB(cublasCreate(&h));
+        blas_ = h;
+        cudaStream_t st = nullptr, cs = nullptr;
+        VK(cudaStreamCreateWithFlags(&st, cudaStreamNonBlocking));
+        VK(cudaStreamCreateWithFlags(&cs, cudaStreamNonBlocking));
+        st_ = st;
+        cs_ = cs;
+        VB(cublasSetStream(h, st));   // (the workspace: the room's, set by each encode)
+    }
     cur_ = room_;
     const bool ok = run(rgb, width, height, room, rows, n_h, n_w, err);
     // every copy and kernel of this encode done before the room goes back to its owner (one that failed half way too)
