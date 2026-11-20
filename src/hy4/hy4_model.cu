@@ -2899,33 +2899,26 @@ struct Model::Impl {
                 CK(cudaMallocHost(&h_egs, sizeof(float) * (size_t) pk.eg.modules * Tc * pk.eg.cols()));
             }
             if (const char* ed = std::getenv("HY4_EG_DUMP")) eg_dump = std::fopen(ed, "wb");
-            {
-                char buf[200];
-                std::snprintf(buf, sizeof buf, "INFO Engram: %d layers, the table read from the disk a row at a time; "
-                              "norm eps %.9g; row scales %s", pk.eg.modules, (double) eg_eps, eg_scale ? "on" : "none");
-                info.push_back(buf);
-            }
-            // its pages mapped into this process in the background (MADV_POPULATE_READ, else a read a page): a
+            // its pages mapped into this process in the background (mm3::os::populate_mapped: Linux
+            // MADV_POPULATE_READ, Windows PrefetchVirtualMemory, else a read a page - on every platform, #1069): a
             // window's lookups land on random pages of tens of GB, and each first touch is a page fault - faults that
             // queue on the process's memory map.  Off unless asked (HY4_EG_POPULATE=1): the table stays on the disk and
             // a looked-up row's page is read at its first use - Maya never pulls an n-gram table into RAM by itself
             const char* ep = std::getenv("HY4_EG_POPULATE");
-            if (ep && std::atoi(ep) != 0) {
+            const bool eg_populate = ep && std::atoi(ep) != 0;
+            {
+                char buf[240];
+                std::snprintf(buf, sizeof buf, "INFO Engram: %d layers, %s; norm eps %.9g; row scales %s",
+                              pk.eg.modules,
+                              eg_populate ? "the table's pages mapped in the background (HY4_EG_POPULATE)"
+                                          : "the table read from the disk a row at a time",
+                              (double) eg_eps, eg_scale ? "on" : "none");
+                info.push_back(buf);
+            }
+            if (eg_populate) {
                 eg_populator = std::thread([this] {
-#if defined(__linux__)
-                    (void) nice(10);
-                    const size_t pg = 4096, chunk = (size_t) 256 << 20;
-                    uint8_t* a = (uint8_t*) ((uintptr_t) eg_table & ~(uintptr_t) (pg - 1));
-                    uint8_t* end = (uint8_t*) eg_table + eg_bytes;
-                    for (uint8_t* c = a; c < end && !placer_stop.load(); c += chunk) {
-                        const size_t n = (size_t) std::min<ptrdiff_t>((ptrdiff_t) chunk, end - c);
-#if defined(MADV_POPULATE_READ)
-                        if (madvise(c, n, MADV_POPULATE_READ) == 0) continue;
-#endif
-                        volatile uint8_t sink = 0;
-                        for (size_t b = 0; b < n; b += pg) sink ^= c[b];
-                    }
-#endif
+                    lower_this_thread();   // (below the engine's own threads: Linux nice 10, Windows below normal)
+                    (void) mm3::os::populate_mapped(eg_table, eg_bytes, placer_stop);
                 });
             }
         }

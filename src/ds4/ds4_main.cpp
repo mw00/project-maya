@@ -2649,11 +2649,18 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                 settle();
             }, kTurn);
         };
-        // after every event: a STOP of a prompt waiting for its turn (ended now, the conversation before it kept), the
-        // requests ended (their conversations to the requests waiting), then the next turn - or, none running, idle
-        settle = [&] {
+        // the requests the server stopped, ended: a prompt waiting for its turn there (the conversation before it kept)
+        // and - `answers` - an answer before its next token (as round_turn ends it); then every ended request's
+        // conversation given back.  True: one was
+        const auto reap = [&](bool answers) -> bool {
             for (auto& ap : acts)
-                if (ap->reading && !ap->done && in.stopped(ap->r.rid)) read_turn(*ap, 0, false);
+                if (!ap->done && in.stopped(ap->r.rid)) {
+                    if (ap->reading) read_turn(*ap, 0, false);
+                    else if (answers) {
+                        ap->finish = "cancel";
+                        ap->done = true;
+                    }
+                }
             bool freed = false;
             for (size_t i = 0; i < acts.size();) {
                 if (!acts[i]->done) {
@@ -2668,7 +2675,12 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                 freed = true;
             }
             if (freed) end_if_broken();   // (the other conversations' state is the same GPUs': lost with it)
-            if (freed) admit_waiting();
+            return freed;
+        };
+        // after every event: the stopped prompts and the ended requests (their conversations to the requests waiting),
+        // then the next turn - or, none running, idle
+        settle = [&] {
+            if (reap(false)) admit_waiting();
             if (!acts.empty()) {
                 queue_turn();
                 return;
@@ -2692,6 +2704,10 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                 quit = true;
                 in.stop_all.store(true);
             } else if (ln.rfind("GEN ", 0) == 0 || ln.rfind("GENI ", 0) == 0) {
+                // the requests whose STOP came before this line end first: a conversation they held is then idle for
+                // it - often the same conversation sent again after the client gave up on the last one.  Placed
+                // before them, it took another conversation and read its prompt from the shared start (#1057)
+                reap(true);
                 waiting.push_back(ln);
                 admit_waiting();
             } else {

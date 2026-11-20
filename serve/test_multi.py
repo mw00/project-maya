@@ -314,6 +314,69 @@ class AWedgedRequest(unittest.TestCase):
         self.assertEqual(self.engine._routes, {})
 
 
+# --parallel, a long prompt read in one piece: no line of the request until the read ends - here never - but its STOP
+# ends it at once (DONE ... cancel), as the DeepSeek engine's read stops at its next chunk (#1057)
+QUIET_READ_ENGINE = '''\
+#!/usr/bin/env python3
+import sys, threading, time
+quit_ = threading.Event()
+
+def out(s):
+    sys.stdout.write(s + "\\n")
+    sys.stdout.flush()
+
+def reader():
+    for line in sys.stdin:
+        f = line.split()
+        if f and f[0] == "QUIT":
+            break
+        if f and f[0] == "GEN":
+            keys = dict(x.split("=", 1) for x in f[2:-1] if "=" in x)
+            out("PP %s 1 100000 1.0 1000.0" % keys.get("rid", "0"))   # the read begun; then quiet until its STOP
+        if f and f[0] == "STOP" and len(f) > 1:
+            out("DONE %s 0 100000 1.0 0.0 cancel 0 0 0" % f[1])
+    quit_.set()
+
+threading.Thread(target=reader, daemon=True).start()
+out("READY 4096 stop multi=2")
+while not quit_.wait(0.05):
+    pass
+'''
+
+
+class ACancelDuringAQuietRead(unittest.TestCase):
+    """#1057: a client gone away during a long one-piece prompt read - no line of its request comes until the read
+    ends - sends its STOP at once, not at the next 10 s wait's end; meanwhile the next request (the same conversation
+    sent again) was placed beside it and read its prompt from the shared start."""
+
+    def setUp(self):
+        import serve.server as srv
+        self.srv = srv
+        self.old = srv.REQUEST_QUIET_S
+        srv.REQUEST_QUIET_S = 0                                    # (the 10 s wait, as a server runs by default)
+        self.path = Path(tempfile.mkdtemp()) / "quiet-read-engine.py"
+        self.path.write_text(QUIET_READ_ENGINE)
+        self.path.chmod(0o755)
+        self.engine = StrataEngine(script_exe(self.path), [])
+
+    def tearDown(self):
+        self.srv.REQUEST_QUIET_S = self.old
+        self.engine.close()
+        shutil.rmtree(self.path.parent, ignore_errors=True)
+
+    def test_the_stop_goes_out_as_the_client_goes_away(self):
+        cancel = threading.Event()
+        gen = self.engine.generate(list(range(10)), 10, {}, cancel)
+        self.assertIsNone(next(gen))                               # its PP line: the read is running
+        threading.Timer(0.2, cancel.set).start()                   # the client goes away during the read
+        started = time.monotonic()
+        rest = list(gen)                                           # (the request's end: STOP, its DONE drained)
+        self.assertLess(time.monotonic() - started, 3.0)           # not the 10 s wait
+        self.assertEqual(rest, [])
+        self.assertEqual(self.engine.last.get("finish"), "cancel")  # the engine got the STOP and ended it
+        self.assertEqual(self.engine._routes, {})
+
+
 # One conversation, and STOP is looked at only after a slow "prompt chunk" (1.5 s): the stopped request's tokens and
 # DONE come long after the drain started.
 SLOW_STOP_ENGINE = r'''#!/usr/bin/env python3

@@ -3,6 +3,9 @@
 // stdin read as it arrives, and thread pinning.
 #pragma once
 
+#include <algorithm>
+#include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -132,5 +135,32 @@ inline void drop_mapped(const void* p, size_t n) {
 
 /// The calling thread on logical CPU `cpu`.
 inline void pin_self(int cpu) { sys::pin_self(cpu); }
+
+/// Every page of [p, p + n) of a read-only file mapping brought into this process, `chunk` bytes at a time, until
+/// `stop` is set (maya-hy4's HY4_EG_POPULATE: the Engram table in the background).  Linux: MADV_POPULATE_READ where
+/// the kernel has it; Windows: PrefetchVirtualMemory reads the chunk in large requests; then (and wherever the first
+/// is missing or fails) one byte a page read, so each page is in the page cache and mapped.  Returns the bytes walked
+/// (n, or less when stopped).
+inline size_t populate_mapped(const void* p, size_t n, const std::atomic<bool>& stop,
+                              size_t chunk = (size_t) 256 << 20) {
+    const size_t pg = 4096;
+    if (p == nullptr || n == 0 || chunk < pg) return 0;
+    const uint8_t* a = (const uint8_t*) ((uintptr_t) p & ~(uintptr_t) (pg - 1));
+    const uint8_t* end = (const uint8_t*) p + n;
+    const uint8_t* c = a;
+    for (; c < end && !stop.load(); c += chunk) {
+        const size_t m = (size_t) std::min<ptrdiff_t>((ptrdiff_t) chunk, end - c);
+#if defined(__linux__) && defined(MADV_POPULATE_READ)
+        if (::madvise((void*) c, m, MADV_POPULATE_READ) == 0) continue;
+#elif defined(_WIN32)
+        sys::prefetch({{(const void*) c, m}});
+#endif
+        volatile uint8_t sink = 0;
+        for (size_t b = 0; b < m; b += pg) sink ^= c[b];
+        (void) sink;
+    }
+    if (c >= end) return n;
+    return c > (const uint8_t*) p ? (size_t) (c - (const uint8_t*) p) : 0;
+}
 
 }  // namespace mm3::os
