@@ -3,6 +3,7 @@
 // (src/models/hy-v4-flash.cpp of their hy4-flash patch).
 #include "hy4_kernels.cuh"
 #include "strata/kernels/fresh_load.hpp"
+#include "strata/kernels/rdna_wmma.hpp"
 
 #include <cuda_fp16.h>
 
@@ -14,6 +15,7 @@
 #include <mutex>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <string>
 
 namespace hy4::k {
@@ -847,6 +849,200 @@ __global__ void __launch_bounds__(256) attn2_kernel(const float* __restrict__ q,
         o[2 + 2 * (lane + 32 * i) + 1] = acc[2 * i + 1];
     }
 }
+// ---------------------------------------------------------------- the same attention on an RDNA GPU's matrix cores
+// A prompt sub-batch's tokens over their picked keys (the indexed layers past the dense span), maya-ds4's WMMA pattern
+// (sparse_attn_wmma_kernel) on this cache's rows: grid (H / (16 G), T), 256 threads (8 warps) a group of 16 heads, G
+// groups a block over one token's keys - each tile of 16 rows staged once into shared memory as F16 for all G (a
+// thread's 16-byte loads of the next tile in flight under this tile's sums; Q8 rows dequantized as they are stored).
+// The dots: A = 16 heads' queries, B = the tile's 16 rows; warp w over the latent's dimensions w * 64 .. + 64 and, for
+// w < 4, the rotated part's 512 + 16 w .. + 16; the warps' parts summed in shared memory in warp order.  The query and
+// the probabilities split into an F16 high and a low part (two products each: ~22 bits of mantissa), the rows exact
+// in F16 - within rounding of attn_kernel's F32 sums, in another order.  Then a thread a (head, row): the online
+// softmax; warp w's output dimensions w * 64 .. + 64; the sink and the division at the end (attn_combine's sums, in
+// one pass: no partial results).  Only past the dense span on the prompt path: every token window - decode, a draft's
+// verify - keeps attn_kernel's own sums.
+constexpr int kWR = 16, kWDS = 576 + 8;   // (the tile's rows; a row's stride in F16 values: 16-byte reads on other banks)
+// (AMD: registers for 8 waves a SIMD - two blocks of 512 threads a WGP rather than one at the 200 the compiler takes
+//  on its own: the kernel waits on its loads and barriers, so the second block hides them)
+#if defined(STRATA_USE_HIP)
+#define HY4_WMMA_OCC __attribute__((amdgpu_waves_per_eu(8)))
+#else
+#define HY4_WMMA_OCC
+#endif
+template <bool Q8, int G>
+__global__ void __launch_bounds__(256 * G) HY4_WMMA_OCC attn_wmma_kernel(const float* __restrict__ q, int H,
+                                                           const void* __restrict__ cache_v, int ring,
+                                                           const int* __restrict__ keys, int ldk,
+                                                           const int* __restrict__ nk, float scale,
+                                                           const float* __restrict__ sinks, float* __restrict__ out,
+                                                           int rb) {
+#if defined(MAYA_RDNA_WMMA)
+    using namespace maya::kernels;
+    constexpr int NT = 256 * G, NQ = (kWR * 72 + NT - 1) / NT;   // (a tile: 16 rows x 72 16-byte words)
+    constexpr int PS = kWR + 4;
+    const int g = G == 1 ? 0 : (int) (threadIdx.x >> 8), lt = (int) (threadIdx.x & 255);
+    const int hb = (blockIdx.x * G + g) * 16, t = blockIdx.y;
+    const int n = nk[t];
+    const int* kt = keys + (size_t) t * ldk;
+    __shared__ __align__(16) _Float16 tile[kWR * kWDS];
+    __shared__ float sp_[G][8][kWR * kWR];
+    __shared__ float pr_[G][16 * PS];
+    __shared__ float m_run_[G][16], den_[G][16], tsc_[G][16];
+    float(*sp)[kWR * kWR] = sp_[g];
+    float* pr = pr_[g];
+    float *m_run = m_run_[g], *den = den_[g], *tsc = tsc_[g];
+    const int lane = lt & 31, wp = lt >> 5, m16 = lane & 15, hi = lane >> 4;
+    const int nkk = wp < 4 ? 5 : 4;   // (k-steps: the latent's 4, the rotated part's 1 for warps 0 .. 3)
+    wmma_h16 qa[5], qb[5];
+    {
+        const float* qh = q + ((size_t) t * H + hb + m16) * 576;
+#pragma unroll
+        for (int kk = 0; kk < 5; ++kk) {
+            const int d0 = kk < 4 ? wp * 64 + kk * 16 : 512 + wp * 16;
+#pragma unroll
+            for (int e = 0; e < 16; ++e) {
+                const float v = kk < nkk ? qh[d0 + e] : 0.0f;
+                const _Float16 h = (_Float16) v;
+                qa[kk][e] = h;
+                qb[kk][e] = (_Float16) (v - (float) h);
+            }
+        }
+    }
+    if (lt < 16) {
+        m_run[lt] = -1e30f;
+        den[lt] = 0.0f;
+    }
+    lds_sync();
+    wmma_f8 acc[4];
+#pragma unroll
+    for (int nt = 0; nt < 4; ++nt) acc[nt] = wmma_f8{};
+    // the staging: word i of the tile (row i / 72, 16-byte word i % 72 of it) - thread x's words x, x + NT, ..
+    uint4 nx[NQ];
+    auto fetch = [&](int f0) {
+#pragma unroll
+        for (int k = 0; k < NQ; ++k) {
+            const int i = (int) threadIdx.x + k * NT, r = i / 72, w = i % 72;
+            if (i >= kWR * 72 || f0 + r >= n) continue;
+            const int p = kt[f0 + r], row = ring > 0 ? p % ring : p;
+            if (!Q8) {
+                nx[k] = ((const uint4*) cache_v)[(size_t) row * 72 + w];
+            } else {
+                const uint8_t* rp = (const uint8_t*) cache_v + (size_t) row * rb;
+                if (w < 64) {   // (8 int8 values and their block's scale)
+                    const uint2 b = *(const uint2*) (rp + 8 * w);
+                    nx[k].x = b.x;
+                    nx[k].y = b.y;
+                    nx[k].z = *(const uint16_t*) (rp + 512 + 2 * (w >> 2));
+                } else {
+                    nx[k] = *(const uint4*) (rp + 544 + 16 * (w - 64));
+                }
+            }
+        }
+    };
+    auto stage = [&](int f0) {
+#pragma unroll
+        for (int k = 0; k < NQ; ++k) {
+            const int i = (int) threadIdx.x + k * NT, r = i / 72, w = i % 72;
+            if (i >= kWR * 72) continue;
+            uint4* dst = (uint4*) (tile + r * kWDS) + w;
+            if (f0 + r >= n) {
+                *dst = make_uint4(0u, 0u, 0u, 0u);
+            } else if (!Q8 || w >= 64) {
+                *dst = nx[k];
+            } else {   // (attn_kernel's dequantization: d * q rounded to F16)
+                const float d = (float) __builtin_bit_cast(_Float16, (unsigned short) nx[k].z);
+                const uint32_t b[2] = {nx[k].x, nx[k].y};
+                _Float16 o[8];
+#pragma unroll
+                for (int j = 0; j < 8; ++j) o[j] = (_Float16) (d * (float) (int8_t) ((b[j >> 2] >> (8 * (j & 3))) & 0xff));
+                *dst = *(const uint4*) o;
+            }
+        }
+    };
+    fetch(0);
+    for (int t0 = 0; t0 < n; t0 += kWR) {
+        const int nr = min(kWR, n - t0);
+        stage(t0);   // (this tile's readers before: done at the loop's last barrier)
+        lds_sync();
+        if (t0 + kWR < n) fetch(t0 + kWR);
+        wmma_f8 s = {};
+#pragma unroll
+        for (int kk = 0; kk < 5; ++kk) {   // B: row m16, the k-step's 16 dimensions
+            if (kk >= nkk) break;
+            const int d0 = kk < 4 ? wp * 64 + kk * 16 : 512 + wp * 16;
+            const uint4* kr = (const uint4*) (tile + m16 * kWDS + d0);
+            const uint4 x0 = kr[0], x1 = kr[1];
+            wmma_h16 kb;
+            const uint32_t w8[8] = {x0.x, x0.y, x0.z, x0.w, x1.x, x1.y, x1.z, x1.w};
+#pragma unroll
+            for (int e = 0; e < 8; ++e) {
+                kb[2 * e] = __builtin_bit_cast(_Float16, (unsigned short) (w8[e] & 0xffffu));
+                kb[2 * e + 1] = __builtin_bit_cast(_Float16, (unsigned short) (w8[e] >> 16));
+            }
+            s = wmma_f16(qa[kk], kb, s);
+            s = wmma_f16(qb[kk], kb, s);
+        }
+#pragma unroll
+        for (int i = 0; i < 8; ++i) sp[wp][wmma_row(i, hi) * kWR + m16] = s[i];
+        lds_sync();
+        {   // thread (head lt / 16, row lt % 16): the tile's score, the head's running max and denominator
+            const int h = lt >> 4, r = lt & 15;
+            float v = 0.0f;
+#pragma unroll
+            for (int w = 0; w < 8; ++w) v += sp[w][lt];
+            v = r < nr ? v * scale : -INFINITY;
+            float mx = v;
+#pragma unroll
+            for (int k = 8; k >= 1; k >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, k));
+            const float m_old = m_run[h], m_new = fmaxf(m_old, mx);
+            const float p = r < nr ? expf(v - m_new) : 0.0f;
+            float sum = p;
+#pragma unroll
+            for (int k = 8; k >= 1; k >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, k);
+            pr[h * PS + r] = p;
+            if (r == 0) {   // (the head's 16 lanes read m_run above, in this same instruction stream)
+                const float ts = expf(m_old - m_new);
+                tsc[h] = ts;
+                den[h] = den[h] * ts + sum;
+                m_run[h] = m_new;
+            }
+        }
+        lds_sync();
+        wmma_h16 pa, pb;   // A of the weighted sums: head m16's probabilities of the tile's rows
+#pragma unroll
+        for (int r = 0; r < kWR; ++r) {
+            const float p = pr[m16 * PS + r];
+            const _Float16 h = (_Float16) p;
+            pa[r] = h;
+            pb[r] = (_Float16) (p - (float) h);
+        }
+#pragma unroll
+        for (int nt = 0; nt < 4; ++nt) {   // B: output dimension wp * 64 + nt * 16 + m16 of the tile's rows
+#pragma unroll
+            for (int i = 0; i < 8; ++i) acc[nt][i] *= tsc[wmma_row(i, hi)];
+            const _Float16* vc = tile + wp * 64 + nt * 16 + m16;
+            wmma_h16 vb;
+#pragma unroll
+            for (int r = 0; r < kWR; ++r) vb[r] = vc[r * kWDS];
+            acc[nt] = wmma_f16(pa, vb, acc[nt]);
+            acc[nt] = wmma_f16(pb, vb, acc[nt]);
+        }
+        lds_sync();
+    }
+#pragma unroll
+    for (int nt = 0; nt < 4; ++nt)
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            const int h = wmma_row(i, hi);   // (attn_combine's: the largest of the sink and the scores the base)
+            const float mr = m_run[h], M = sinks ? fmaxf(mr, sinks[hb + h]) : mr, f = expf(mr - M);
+            const float dn = den[h] * f + (sinks ? expf(sinks[hb + h] - M) : 0.0f);
+            out[((size_t) t * H + hb + h) * 512 + wp * 64 + nt * 16 + m16] = dn > 0.0f ? acc[nt][i] * f / dn : 0.0f;
+        }
+#else
+    (void) q, (void) H, (void) cache_v, (void) ring, (void) keys, (void) ldk, (void) nk, (void) scale, (void) sinks;
+    (void) out, (void) rb;
+#endif
+}
 // a block a (t, head): the chunks merged with the sink, 512 threads (a value dim each)
 __global__ void attn_combine_kernel(int H, int nchunk, int kc, const int* __restrict__ nk,
                                     const float* __restrict__ sinks, const float* __restrict__ ws,
@@ -1678,6 +1874,101 @@ __global__ void __launch_bounds__(256) ix_score_kernel(const float* __restrict__
     }
     score[(size_t) t * ld + g] = out;
 }
+// The same scores on an RDNA GPU's matrix cores (16 heads of 128 dimensions): maya-ds4's WMMA indexer pattern on these
+// pools - a warp a token, its 16 heads' query split into an F16 high and a low part held as A (8 k-steps); the pools
+// in tiles of 64 staged into shared memory as F16 for the block's 8 tokens (the next tile's loads in flight under this
+// one's products), B = 16 of them; a lane's 8 heads' products of its pool, relu, the head weights, the other half of
+// the wave's 8 (lane ^ 16).  Grid (ceil(n_pool / kIxPB), ceil(T / 8)).  The pools rounded to F16 (an 8-bit cache's are
+// F16 already), the sums in another order: past ix_gemm_from on the prompt path alone (as ix_gemm's GEMMs).
+constexpr int kIxTile = 64, kIxPB = 512, kIxLD = 128 + 8;
+template <typename P>
+__global__ void __launch_bounds__(256) ix_score_wmma_kernel(const float* __restrict__ q, const float* __restrict__ wt,
+                                                            int T, const P* __restrict__ pooled,
+                                                            const int* __restrict__ pos, int kpool, int n_pool,
+                                                            float* __restrict__ score, size_t ld) {
+#if defined(MAYA_RDNA_WMMA)
+    using namespace maya::kernels;
+    __shared__ __align__(16) _Float16 ks[kIxTile * kIxLD];
+    const int lane = threadIdx.x & 31, wp = threadIdx.x >> 5, m16 = lane & 15, hi = lane >> 4;
+    const int t = blockIdx.y * 8 + wp, g0 = blockIdx.x * kIxPB, g1 = min(n_pool, g0 + kIxPB);
+    const bool live = t < T;
+    const int nv = live ? pos[t] / kpool : 0;
+    wmma_h16 qa[8], qb[8];
+    float w8[8];
+    if (live) {
+        const float* qh = q + ((size_t) t * 16 + m16) * 128;
+#pragma unroll
+        for (int kk = 0; kk < 8; ++kk)
+#pragma unroll
+            for (int e = 0; e < 16; ++e) {
+                const float v = qh[kk * 16 + e];
+                const _Float16 h = (_Float16) v;
+                qa[kk][e] = h;
+                qb[kk][e] = (_Float16) (v - (float) h);
+            }
+#pragma unroll
+        for (int i = 0; i < 8; ++i) w8[i] = wt[(size_t) t * 16 + wmma_row(i, hi)];
+    }
+    // the staging: a tile's 64 pools x 16 groups of 8 values - thread x's groups x, x + 256, x + 512, x + 768
+    float4 nx[4][2];
+    auto fetch = [&](int f0) {
+#pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            const int i = (int) threadIdx.x + 256 * k, r = i >> 4, c = i & 15;
+            if (f0 + r < g1) pooled8(pooled + (size_t) (f0 + r) * 128, 2 * c, nx[k][0], nx[k][1]);
+            else nx[k][0] = nx[k][1] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        }
+    };
+    auto stage = [&]() {
+#pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            const int i = (int) threadIdx.x + 256 * k, r = i >> 4, c = i & 15;
+            const float v[8] = {nx[k][0].x, nx[k][0].y, nx[k][0].z, nx[k][0].w,
+                                nx[k][1].x, nx[k][1].y, nx[k][1].z, nx[k][1].w};
+            _Float16 o[8];
+#pragma unroll
+            for (int e = 0; e < 8; ++e) o[e] = (_Float16) v[e];
+            *(uint4*) (ks + r * kIxLD + 8 * c) = *(const uint4*) o;
+        }
+    };
+    fetch(g0);
+    for (int f0 = g0; f0 < g1; f0 += kIxTile) {
+        stage();
+        lds_sync();
+        if (f0 + kIxTile < g1) fetch(f0 + kIxTile);
+        if (live) {
+#pragma unroll
+            for (int sub = 0; sub < kIxTile / 16; ++sub) {
+                const int g = f0 + sub * 16 + m16;
+                if (f0 + sub * 16 >= g1) break;
+                wmma_f8 c = {};
+#pragma unroll
+                for (int kk = 0; kk < 8; ++kk) {   // B: pool g's dimensions kk * 16 .. + 15
+                    const uint4* kr = (const uint4*) (ks + (sub * 16 + m16) * kIxLD + kk * 16);
+                    const uint4 x0 = kr[0], x1 = kr[1];
+                    const uint32_t u[8] = {x0.x, x0.y, x0.z, x0.w, x1.x, x1.y, x1.z, x1.w};
+                    wmma_h16 kb;
+#pragma unroll
+                    for (int e = 0; e < 8; ++e) {
+                        kb[2 * e] = __builtin_bit_cast(_Float16, (unsigned short) (u[e] & 0xffffu));
+                        kb[2 * e + 1] = __builtin_bit_cast(_Float16, (unsigned short) (u[e] >> 16));
+                    }
+                    c = wmma_f16(qa[kk], kb, c);
+                    c = wmma_f16(qb[kk], kb, c);
+                }
+                float s = 0.0f;
+#pragma unroll
+                for (int i = 0; i < 8; ++i) s = fmaf(fmaxf(c[i], 0.0f), w8[i], s);
+                s += __shfl_xor_sync(0xffffffffu, s, 16);
+                if (hi == 0 && g < g1) score[(size_t) t * ld + g] = g < nv ? s : -INFINITY;
+            }
+        }
+        lds_sync();
+    }
+#else
+    (void) q, (void) wt, (void) T, (void) pooled, (void) pos, (void) kpool, (void) n_pool, (void) score, (void) ld;
+#endif
+}
 // The scores from the heads' dot products a GEMM left in S (column (t, h), row g - g0; ldS apart): grid
 // (ceil(n / 256), T), a thread a pool - the heads summed in ix_score_kernel's order
 __global__ void ix_reduce_kernel(const float* __restrict__ S, size_t ldS, const float* __restrict__ wt, int heads,
@@ -2019,6 +2310,46 @@ void attention(const float* q, int T, int H, int kv_lora, int n_rot, const uint1
     attn_combine_kernel<<<dim3((unsigned) H, (unsigned) T), 512, 0, s>>>(H, nchunk, kc, nk, sinks, ws, out);
     check("attn_combine");
 }
+bool attn_wmma_on() {
+#if defined(STRATA_USE_HIP)
+    // (the device's arch once a device: gfx11 - RDNA 3 / 3.5 - by default; gfx12 only with HY4_ATTN_WMMA=1, not
+    //  measured there; HY4_ATTN_WMMA=0 off everywhere)
+    static const int env = std::getenv("HY4_ATTN_WMMA") ? std::atoi(std::getenv("HY4_ATTN_WMMA")) : -1;
+    static std::atomic<int> known[64];   // 0: not asked yet, 1: no, 2: yes
+    int dev = 0;
+    if (env == 0 || cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) return false;
+    int v = known[dev].load(std::memory_order_relaxed);
+    if (v == 0) {
+        cudaDeviceProp p{};
+        const bool ok = cudaGetDeviceProperties(&p, dev) == cudaSuccess;
+        v = ok && (std::strncmp(p.gcnArchName, "gfx11", 5) == 0 ||
+                   (env == 1 && std::strncmp(p.gcnArchName, "gfx12", 5) == 0)) ? 2 : 1;
+        known[dev].store(v, std::memory_order_relaxed);
+    }
+    return v == 2;
+#else
+    return false;
+#endif
+}
+bool attention_wmma(const float* q, int T, int H, int kv_lora, int n_rot, const uint16_t* cache, int ring,
+                    const int* keys, int ldk, const int* nk, float scale, const float* sinks, float* out,
+                    cudaStream_t s, bool q8) {
+    if (T <= 0 || kv_lora != 512 || n_rot != 64 || keys == nullptr || H % 16 != 0 || !attn_wmma_on()) return false;
+    // G: the groups of 16 heads a block sharing a staged tile - 2 where the heads come in 32s (HY4_ATTN_WMMA_G=1: one)
+    static const int g1 = std::getenv("HY4_ATTN_WMMA_G") ? std::atoi(std::getenv("HY4_ATTN_WMMA_G")) : 0;
+    const int G = H % 32 == 0 && g1 != 1 ? 2 : 1;
+    const int rb = q8 ? (int) kv_q8_row_bytes(kv_lora, n_rot) : 0;
+    const dim3 grid((unsigned) (H / (16 * G)), (unsigned) T);
+    if (G == 2) {
+        if (q8) attn_wmma_kernel<true, 2><<<grid, 512, 0, s>>>(q, H, cache, ring, keys, ldk, nk, scale, sinks, out, rb);
+        else attn_wmma_kernel<false, 2><<<grid, 512, 0, s>>>(q, H, cache, ring, keys, ldk, nk, scale, sinks, out, rb);
+    } else {
+        if (q8) attn_wmma_kernel<true, 1><<<grid, 256, 0, s>>>(q, H, cache, ring, keys, ldk, nk, scale, sinks, out, rb);
+        else attn_wmma_kernel<false, 1><<<grid, 256, 0, s>>>(q, H, cache, ring, keys, ldk, nk, scale, sinks, out, rb);
+    }
+    check("attention_wmma");
+    return true;
+}
 void sigmoid_mul(float* x, const float* g, size_t n, cudaStream_t s) {
     sigmoid_mul_kernel<<<(unsigned) ((n + 255) / 256), 256, 0, s>>>(x, g, n);
     check("sigmoid_mul");
@@ -2118,6 +2449,20 @@ void ix_score(const float* q, const float* wt, int T, int heads, int dim, const 
     else
         ix_score_kernel<float><<<grid, 256, sh, s>>>(q, wt, heads, dim, pooled, pos, kpool, n_pool, score, ld);
     check("ix_score");
+}
+bool ix_score_wmma(const float* q, const float* wt, int T, int heads, int dim, const float* pooled, const int* pos,
+                   int kpool, int n_pool, float* score, size_t ld, cudaStream_t s, bool f16) {
+    // (HY4_IX_WMMA=0: ix_score's own kernel; the device as attention_wmma's)
+    static const bool off = std::getenv("HY4_IX_WMMA") != nullptr && std::atoi(std::getenv("HY4_IX_WMMA")) == 0;
+    if (off || T <= 0 || heads != 16 || dim != 128 || !attn_wmma_on()) return false;
+    if (n_pool <= 0) return true;
+    const dim3 grid((unsigned) ((n_pool + kIxPB - 1) / kIxPB), (unsigned) ((T + 7) / 8));
+    if (f16)
+        ix_score_wmma_kernel<__half><<<grid, 256, 0, s>>>(q, wt, T, (const __half*) pooled, pos, kpool, n_pool, score, ld);
+    else
+        ix_score_wmma_kernel<float><<<grid, 256, 0, s>>>(q, wt, T, pooled, pos, kpool, n_pool, score, ld);
+    check("ix_score_wmma");
+    return true;
 }
 void ix_reduce(const float* S, size_t ldS, const float* wt, int T, int heads, const int* pos, int kpool, int g0, int n,
                float* score, size_t ld, cudaStream_t s) {
