@@ -209,6 +209,14 @@ Máquinas reais medidas por nossos usuários, a maioria com `./maya.sh --bench` 
 
 </details>
 
+<details><summary><b>Benchmarks de velocidade do Hy4-Flash</b></summary>
+
+| Máquina | Modelo | Decodificação (escrevendo a resposta) | Prefill (lendo o seu prompt) | Por |
+| --- | --- | ---: | ---: | --- |
+| **3x Tesla V100 32 GB** (PCIe 3.0 x16 cada), 2x Xeon Gold 6138, 183 GB de RAM | Maya-XS / Maya-S, contexto de 32K, drafting MTP | **88,7 / 84,2 tokens/s** | 1607 / 1566 tokens/s | mantenedor (v1.1.68) |
+
+</details>
+
 Um token equivale a cerca de ¾ de uma palavra. A velocidade se mantém conforme a conversa cresce, e as primeiras respostas depois de iniciar são as mais lentas, enquanto os caches se enchem com o que você usa.
 
 ## <a name="using-it"></a>Como usar

@@ -234,6 +234,14 @@ an 8K-token prompt unless the row says otherwise). Share yours: `--bench`, then 
 
 </details>
 
+<details><summary><b>Hy4-Flash speed benchmarks</b></summary>
+
+| Machine | Model | Decode (writing the answer) | Prefill (reading your prompt) | By |
+| --- | --- | ---: | ---: | --- |
+| **3x Tesla V100 32 GB** (PCIe 3.0 x16 each), 2x Xeon Gold 6138, 183 GB RAM | Maya-XS / Maya-S, 32K context, MTP drafting | **88.7 / 84.2 tokens/s** | 1607 / 1566 tokens/s | maintainer (v1.1.68) |
+
+</details>
+
 A token is about ¾ of a word. The speed holds as a conversation grows, and the first answers after a start are the
 slowest while the caches fill with what you use.
 
