@@ -504,6 +504,40 @@ void test_indexer() {
         }
     std::printf("  ix_score: max rel diff %.2e\n", emax);
     CHECK(emax < 1e-4);
+    {   // ix_reduce: the heads' products as a GEMM leaves them (column (t, h), row g - g0), in two slabs -> ix_score's
+        // scores, -inf from each token's nv on
+        const int cut = n_pool / 3 / 8 * 8;
+        float* sr;
+        cudaMalloc(&sr, sizeof(float) * T * ld);
+        double er = 0;
+        int bad_inf = 0;
+        for (int part = 0; part < 2; ++part) {
+            const int g0 = part ? cut : 0, n = part ? n_pool - cut : cut, ldS = (n + 7) / 8 * 8;
+            std::vector<float> S((size_t) T * IH * ldS, 0.0f);
+            for (int t = 0; t < T; ++t)
+                for (int h = 0; h < IH; ++h)
+                    for (int j = 0; j < n; ++j) {
+                        double d = 0;
+                        for (int c = 0; c < D; ++c)
+                            d += (double) q[((size_t) t * IH + h) * D + c] * pk[(size_t) (g0 + j) * D + c];
+                        S[(size_t) (t * IH + h) * ldS + j] = (float) d;
+                    }
+            float* dS = dev(S);
+            hy4::k::ix_reduce(dS, (size_t) ldS, dwt, T, IH, dpos, KP, g0, n, sr, ld, 0);
+            cudaDeviceSynchronize();
+            cudaFree(dS);
+        }
+        const std::vector<float> s3 = host(sr, (size_t) T * ld);
+        for (int t = 0; t < T; ++t)
+            for (int gi = 0; gi < n_pool; ++gi) {
+                const float a = s3[(size_t) t * ld + gi], b = sc[(size_t) t * ld + gi];
+                if (gi >= pos[(size_t) t] / KP) bad_inf += !(std::isinf(a) && a < 0 && std::isinf(b) && b < 0);
+                else er = std::max(er, (double) std::fabs(a - b) / std::max(1.0, (double) std::fabs(b)));
+            }
+        std::printf("  ix_reduce: max rel diff to ix_score %.2e, %d beyond a token's pools not -inf\n", er, bad_inf);
+        CHECK(er < 1e-4 && bad_inf == 0);
+        cudaFree(sr);
+    }
     {   // --kv q8's F16 rows (value | gate ring, pooled keys): the pooled values within F16's rounding, the scores
         // within its effect on them
         float *p16, *s16, *iv16;
@@ -585,6 +619,103 @@ void test_indexer() {
     }
     std::printf("  ix_select: %d tokens with other keys\n", bad);
     CHECK(bad == 0);
+    {   // the prompt path past the dense span: the pools the tokens' keys name (ix_union), their columns' mask
+        // (dsa_mask_list), their rows gathered from a cache (kv_gather's list form), the softmax by the mask alone
+        const int npl = n_pos / KP + 1, kend = n_pos - 2, row = 16;
+        int *col, *list, *dn;
+        cudaMalloc(&col, sizeof(int) * npl);
+        cudaMalloc(&list, sizeof(int) * npl);
+        cudaMalloc(&dn, sizeof(int));
+        hy4::k::ix_union(keys, ldk, nk, T, KP, npl, col, list, dn, 0);
+        const std::vector<int> hc = host(col, (size_t) npl), hl = host(list, (size_t) npl), hn1 = host(dn, 1);
+        std::vector<int> want((size_t) npl, 0);
+        for (int t = 0; t < T; ++t)
+            for (int i = 0; i < hn[(size_t) t]; ++i) want[(size_t) (hk[(size_t) t * ldk + i] / KP)] = 1;
+        int ub = 0, r = 0;
+        for (int gi = 0; gi < npl; ++gi) {
+            if (want[(size_t) gi]) {
+                ub += hc[(size_t) gi] != r || hl[(size_t) r] != gi;
+                ++r;
+            } else {
+                ub += hc[(size_t) gi] != -1;
+            }
+        }
+        ub += hn1[0] != r;
+        const int ncol = r * KP;
+        float* mask;
+        cudaMalloc(&mask, sizeof(float) * T * ncol);
+        hy4::k::dsa_mask_list(keys, ldk, nk, T, col, KP, ncol, mask, (size_t) ncol, 0);
+        const std::vector<float> hm = host(mask, (size_t) T * ncol);
+        int mb = 0;
+        for (int t = 0; t < T; ++t) {
+            std::vector<char> in((size_t) ncol, 0);
+            for (int i = 0; i < hn[(size_t) t]; ++i) {
+                const int p = hk[(size_t) t * ldk + i];
+                in[(size_t) (hc[(size_t) (p / KP)] * KP + p % KP)] = 1;
+            }
+            for (int j = 0; j < ncol; ++j) {
+                const float v = hm[(size_t) t * ncol + j];
+                mb += in[(size_t) j] ? v != 0.0f : !(std::isinf(v) && v < 0);
+            }
+        }
+        // a cache whose row q holds q + 1 in every value: the list's rows in order, zeros from kend on
+        std::vector<uint16_t> cache((size_t) (npl * KP) * row);
+        for (size_t i = 0; i < cache.size(); ++i) cache[i] = (uint16_t) (i / row + 1);
+        uint16_t *dc = dev(cache), *gat;
+        cudaMalloc(&gat, sizeof(uint16_t) * ncol * row);
+        hy4::k::kv_gather(dc, 0, row, 0, ncol, gat, 0, list, KP, kend);
+        const std::vector<uint16_t> hg = host((const uint16_t*) gat, (size_t) ncol * row);
+        int gb = 0;
+        for (int j = 0; j < ncol; ++j) {
+            const int q = hl[(size_t) (j / KP)] * KP + j % KP;
+            for (int c = 0; c < row; ++c) gb += hg[(size_t) j * row + c] != (q < kend ? (uint16_t) (q + 1) : 0);
+        }
+        // the softmax by the mask alone = the one over positions when every column is a position the tokens see
+        const int Hh = 2, ldS = (ncol + 7) / 8 * 8;
+        auto S = randn((size_t) T * Hh * ldS, 1.0f);
+        std::vector<int> far((size_t) T, ncol);
+        float* dS = dev(S);
+        int* dfar = dev(far);
+        uint16_t *P1, *P2;
+        cudaMalloc(&P1, sizeof(uint16_t) * T * Hh * ldS);
+        cudaMalloc(&P2, sizeof(uint16_t) * T * Hh * ldS);
+        cudaMemset(P1, 0, sizeof(uint16_t) * T * Hh * ldS);
+        cudaMemset(P2, 0, sizeof(uint16_t) * T * Hh * ldS);
+        hy4::k::attn_softmax(dS, ldS, T, Hh, ncol, 0, dfar, 0, mask, (size_t) ncol, 0.3f, nullptr, P1, ldS, 0);
+        hy4::k::attn_softmax(dS, ldS, T, Hh, ncol, 0, dpos, -1, mask, (size_t) ncol, 0.3f, nullptr, P2, ldS, 0);
+        const bool same_p = host((const uint16_t*) P1, (size_t) T * Hh * ldS) ==
+                            host((const uint16_t*) P2, (size_t) T * Hh * ldS);
+        std::printf("  ix_union: %d pools, %d wrong; dsa_mask_list: %d wrong; kv_gather by the list: %d wrong; the "
+                    "softmax by the mask alone: %s\n", r, ub, mb, gb, same_p ? "the same" : "DIFFERENT");
+        CHECK(ub == 0 && mb == 0 && gb == 0 && same_p);
+        {   // tensor parallel's exchange of the picks: packed into mapped host rows, unpacked over cleared keys
+            const int ldw = (top + 7) / 8 * 8;
+            uint16_t* wire = nullptr;
+            cudaHostAlloc(&wire, sizeof(uint16_t) * T * ldw, cudaHostAllocMapped | cudaHostAllocPortable);
+            int *k2, *n2;
+            cudaMalloc(&k2, sizeof(int) * T * ldk);
+            cudaMalloc(&n2, sizeof(int) * T);
+            cudaMemset(k2, 0xff, sizeof(int) * T * ldk);
+            cudaMemset(n2, 0, sizeof(int) * T);
+            hy4::k::ix_pack(keys, ldk, T, dpos, KP, top, wire, ldw, 0);
+            hy4::k::ix_unpack(wire, ldw, T, dpos, KP, top, k2, ldk, n2, 0);
+            const std::vector<int> hk2 = host(k2, (size_t) T * ldk), hn2 = host(n2, (size_t) T);
+            int xb = 0;
+            for (int t = 0; t < T; ++t) {
+                xb += hn2[(size_t) t] != hn[(size_t) t];
+                for (int i = 0; i < hn[(size_t) t]; ++i) xb += hk2[(size_t) t * ldk + i] != hk[(size_t) t * ldk + i];
+            }
+            std::printf("  ix_pack / ix_unpack: %d keys or counts other than ix_select's\n", xb);
+            CHECK(xb == 0);
+            cudaFree(k2);
+            cudaFree(n2);
+            cudaFreeHost(wire);
+        }
+        for (int* p : {col, list, dn, dfar}) cudaFree(p);
+        for (uint16_t* p : {dc, gat, P1, P2}) cudaFree(p);
+        cudaFree(mask);
+        cudaFree(dS);
+    }
     for (float* p : {divg, dape, dw, pooled, dq, dwt, score}) cudaFree(p);
     for (int* p : {dpos, keys, nk}) cudaFree(p);
 }

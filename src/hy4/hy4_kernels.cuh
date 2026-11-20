@@ -117,24 +117,48 @@ void ix_pool(const float* ivg, int ring, int g0, int n, int kpool, int dim, cons
 /// wt[t][h]; -inf beyond.  q [T][heads][dim], wt [T][heads]; score rows ld apart, n_pool columns
 void ix_score(const float* q, const float* wt, int T, int heads, int dim, const float* pooled, const int* pos, int kpool,
               int n_pool, float* score, size_t ld, cudaStream_t s, bool f16 = false);
+/// ... from the heads' dot products of a GEMM (the prompt path): S[(t heads + h) ldS + j] = q[t][h] . pk[g0 + j],
+/// j < n -> score[t][g0 + j] as ix_score's (the same sum over the heads; -inf from nv[t] on)
+void ix_reduce(const float* S, size_t ldS, const float* wt, int T, int heads, const int* pos, int kpool, int g0, int n,
+               float* score, size_t ld, cudaStream_t s);
 /// The attention keys of each token: the top min(nv, top) of its scores' pools (their kpool positions each), then its
 /// own group's positions up to itself -> keys[t][0 .. nk[t]), ldk apart
 void ix_select(const float* score, size_t ld, int T, const int* pos, int kpool, int top, int* keys, int ldk, int* nk,
+               cudaStream_t s);
+/// Tensor parallel's exchange of those picks: ix_pack writes the min(nv, top) picked pools of T tokens as 16-bit
+/// numbers into wire (mapped host memory, rows ldw apart - a multiple of 8) and fences them for the host; ix_unpack
+/// makes keys[t][0 .. nk[t]) again from such rows (read past every cache) - ix_select's own keys, the tail its own
+void ix_pack(const int* keys, int ldk, int T, const int* pos, int kpool, int top, uint16_t* wire, int ldw,
+             cudaStream_t s);
+void ix_unpack(const uint16_t* wire, int ldw, int T, const int* pos, int kpool, int top, int* keys, int ldk, int* nk,
                cudaStream_t s);
 
 /// The prompt path's attention as two GEMMs (the model's cuBLAS calls) and this between them: S [T H][nkr] (rows ldS
 /// apart) the scores of tokens t (positions pos[t]) and heads h against the keys at positions k0 .. k0 + nkr - 1 ->
 /// P (F16, ldP) = softmax(scale S, the head's sink) over the keys the token sees: window > 0 the last `window`
 /// positions up to its own, else mask[t][j] == 0 (the indexer's picks, dsa_mask); 0 elsewhere
+/// (window < 0: the mask alone - the keys a list, not the positions from k0: dsa_mask_list's)
 void attn_softmax(const float* S, size_t ldS, int T, int H, int nkr, int k0, const int* pos, int window,
                   const float* mask, size_t ldm, float scale, const float* sinks, uint16_t* P, size_t ldP,
                   cudaStream_t s);
 /// mask[t][j] = 0 for every key position k0 + j among keys[t][0 .. nk[t]), -inf for the others
 void dsa_mask(const int* keys, int ldk, const int* nk, int T, int k0, int nkr, float* mask, size_t ldm, cudaStream_t s);
 /// dst[j] = the latent cache row of position k0 + j (row p % ring), j < n: a ring's rows in position order
-void kv_gather(const uint16_t* cache, int ring, int row, int k0, int n, uint16_t* dst, cudaStream_t s);
+/// (list: row j the position list[j / kpool] kpool + j % kpool instead - the rows of a list of pools, zeros for the
+///  positions from kend on; kv_deq's too)
+void kv_gather(const uint16_t* cache, int ring, int row, int k0, int n, uint16_t* dst, cudaStream_t s,
+               const int* list = nullptr, int kpool = 1, int kend = 0);
 /// ... from a q8 cache (kv_store's 8-bit rows): dst[j] the F16 row of position k0 + j
-void kv_deq(const uint16_t* cache, int ring, int kv_lora, int n_rot, int k0, int n, uint16_t* dst, cudaStream_t s);
+void kv_deq(const uint16_t* cache, int ring, int kv_lora, int n_rot, int k0, int n, uint16_t* dst, cudaStream_t s,
+            const int* list = nullptr, int kpool = 1, int kend = 0);
+/// The pools the keys of T tokens name (ix_select's keys: whole pools, kpool positions each, then the token's own
+/// pool up to itself) among [0, n_pool): col[g] = pool g's rank among them in index order (-1: not named),
+/// list[rank] = g, *n = how many
+void ix_union(const int* keys, int ldk, const int* nk, int T, int kpool, int n_pool, int* col, int* list, int* n,
+              cudaStream_t s);
+/// dsa_mask over the columns of such a list (pool g's kpool positions at columns col[g] kpool ..): ncol columns
+void dsa_mask_list(const int* keys, int ldk, const int* nk, int T, const int* col, int kpool, int ncol, float* mask,
+                   size_t ldm, cudaStream_t s);
 /// The prompt path.  dst[r][i] = F16(src[r * lds + i]), i < n
 void to_f16(const float* src, size_t lds, int rows, int n, uint16_t* dst, size_t ldd, cudaStream_t s);
 /// A chunk's expert entries sorted by expert for ds4_iq's sets: entry e = t n_used + j of ids; bounds[x .. x + 1] the
