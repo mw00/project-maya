@@ -119,6 +119,13 @@ void to_f16(const float* x, size_t n, uint16_t* y, cudaStream_t s);
 /// x = cap tanh(x / cap), n values (the head's logits).
 void softcap(float* x, size_t n, float cap, cudaStream_t s);
 
+/// The message gate of a looped model (Inkling-2-Mini: a core layer's input in the core's later passes), a row a
+/// token: g = D [rms(x); rms(m)] (D [R][2 C]: x's columns first; the norms without a weight, eps),
+/// y = (1 - tanh(F g)) x + tanh(G g) m (F, G by rank: [R][C]).  x: the input, m: the message from the pass before, [T][C];
+/// g: scratch [T][R]; R <= 128.  y may be x.
+void loop_gate(const float* x, const float* m, const float* D, const float* F, const float* G, int T, int C, int R,
+               float eps, float* g, float* y, cudaStream_t s);
+
 // ---- the token path: the experts straight from their blocks, the attention of one query
 
 /// The routed experts of a few tokens as matrix-vector products over the blocks as the GGUF holds them (NVFP4, Q8_0,
