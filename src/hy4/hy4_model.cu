@@ -2708,11 +2708,13 @@ struct Model::Impl {
     // (between answers).  Whether they pay is measured on this PC: a probe at the start (a lane call of 16 experts on
     // each form) must time them 5 % faster, then, once copies exist, the next answers' one-token lane calls run in
     // turns with and without them (q4x_trial) and the faster side is kept - the copies freed when without wins.  The
-    // answers are the same either way.  HY4_Q4X=0: never; =1: always, untimed; HY4_Q4X_GB: the RAM they take at most
+    // HY4_Q4X=2: measured as above; =1: always, untimed; unset: never; HY4_Q4X_GB: the RAM they take at most
     void q4x_start() {
         const char* qv = std::getenv("HY4_Q4X");
-        if (qv && std::atoi(qv) == 0) return;
-        const bool force = qv && std::atoi(qv) == 1;
+        // (off unless asked: on Uranus' Windows build the greedy ids differed with the copies - Linux builds gave the
+        //  same ids - so the copies are not yet the same answers everywhere)
+        if (!qv || (std::atoi(qv) != 1 && std::atoi(qv) != 2)) return;
+        const bool force = std::atoi(qv) == 1;
         double lane_b = 0, per = 0;
         int probe_l = -1;
         for (Layer& l : L) {
