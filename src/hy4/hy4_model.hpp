@@ -61,7 +61,7 @@ struct Options {
                                   // the others in a file on a drive (kv_spill_dir; the pack's directory by default),
                                   // read for the positions a token picks only - the same bits, the same answers.  Auto
                                   // only where nothing else starts this context, and not on a drive that reads slower
-                                  // than HY4_KV_SPILL_MIN_MBS (default 50 MB/s, measured once at the start)
+                                  // than HY4_KV_SPILL_MIN_MBS (default 10 MB/s in 4 KB reads one at a time, measured once at the start)
     std::string kv_spill_dir;
     bool vision = true;           // the vision tower (the pack's mmproj file) on the main GPU: a picture's room is lent by
                                   // the prompt buffers while it is read (made longer by what they lack of it, if anything)

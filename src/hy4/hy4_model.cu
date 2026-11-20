@@ -1189,7 +1189,7 @@ struct Model::Impl {
             }
             sp_io = std::make_unique<Crew>(std::max(4, std::min(16, (int) std::thread::hardware_concurrency() / 2)));
             sp_mbs = sp_file.measure((size_t) 256 << 20, 4096, 2048);
-            double floor_mbs = 50.0;
+            double floor_mbs = 10.0;   // (an NVMe reads ~50 MB/s at one 4 KB read at a time, a SATA SSD ~30, a hard disk ~0.5)
             if (const char* e = std::getenv("HY4_KV_SPILL_MIN_MBS")) floor_mbs = std::max(0.0, std::atof(e));
             char sb[480];
             std::snprintf(sb, sizeof sb, "INFO KV spill: the indexed layers' rows of the newest %lld positions in RAM "
