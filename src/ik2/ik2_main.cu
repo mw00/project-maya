@@ -160,6 +160,10 @@ struct Config {
 
 // a dense matrix as the GGUF holds it, in VRAM: its blocks [N][K]
 struct Mat {
+    // (IK2_DENSE=q8 with Q8_0 blocks and K a multiple of 128: the blocks taken apart - the int8 values [N][K] and the
+    //  blocks' FP16 scales [N][K / 32] - which a warp reads 128 values an instruction; raw is then null)
+    int8_t* q8 = nullptr;
+    uint16_t* q8d = nullptr;
     uint8_t* raw = nullptr;     // IK2_DENSE=q8: the blocks, one token's products straight over them
     uint16_t* f16 = nullptr;    // else (the default): an FP16 copy, every product a cuBLAS GEMM - measured faster on an
     int type = 0, N = 0, K = 0; // RTX PRO 6000 (16 against 21 ms a token), for 4 GiB more VRAM
@@ -338,6 +342,29 @@ bool g_dense_q8 = false;
 // top-1 token (KL mean 8.5e-4) and FP8 changed 5 (KL 8.3e-3): Inkling's router is full of near-ties, so FP8's 1.5% in
 // layer 0's attention output already moves 7 of 48 tokens' experts.  The full layers' cache is 32 KB a token in FP16.
 bool g_kv_fp8 = false;
+// Q8_0 blocks (2 bytes of FP16 scale, 32 int8 values) taken apart into m.q8 / m.q8d on the device; false if the
+// matrix cannot be kept so (another type, or K not a multiple of 128)
+bool upload_planar(Mat& m, const std::vector<const uint8_t*>& parts, const std::vector<size_t>& part_values) {
+    if (m.type != k::kQ8_0 || m.K % 128) return false;
+    size_t n = 0;
+    for (size_t v : part_values) n += v;
+    std::vector<int8_t> q(n);
+    std::vector<uint16_t> d(n / 32);
+    size_t b = 0;
+    for (size_t i = 0; i < parts.size(); ++i) {
+        const uint8_t* p = parts[i];
+        for (size_t j = 0; j < part_values[i] / 32; ++j, ++b, p += 34) {
+            std::memcpy(&d[b], p, 2);
+            std::memcpy(&q[b * 32], p + 2, 32);
+        }
+    }
+    m.q8 = dalloc<int8_t>(n);
+    m.q8d = dalloc<uint16_t>(n / 32);
+    CU(cudaMemcpy(m.q8, q.data(), n, cudaMemcpyHostToDevice));
+    CU(cudaMemcpy(m.q8d, d.data(), n / 32 * 2, cudaMemcpyHostToDevice));
+    return true;
+}
+
 Mat load_mat(const Shards& S, const std::string& n, int N, int Kd) {
     const auto* t = S.info(n);
     if (!t) die("no tensor " + n);
@@ -348,6 +375,7 @@ Mat load_mat(const Shards& S, const std::string& n, int N, int Kd) {
     m.type = (int) t->type, m.N = N, m.K = Kd;
     const size_t nb = tensor_bytes(*t);
     if (g_dense_q8) {
+        if (upload_planar(m, {S.data(n)}, {(size_t) N * Kd})) return m;
         m.raw = dalloc<uint8_t>(nb);
         CU(cudaMemcpy(m.raw, S.data(n), nb, cudaMemcpyHostToDevice));
         return m;
@@ -482,6 +510,12 @@ bool try_load_fused_raw(const Shards& S, const std::vector<MatPart>& parts, int 
     out.type = ty;
     out.N = N_tot;
     out.K = Kd;
+    {
+        std::vector<const uint8_t*> ps;
+        std::vector<size_t> vs;
+        for (const auto& pt : parts) ps.push_back(S.data(pt.name)), vs.push_back((size_t) pt.N * Kd);
+        if (upload_planar(out, ps, vs)) return true;
+    }
     out.raw = dalloc<uint8_t>(nb_tot);
     size_t off = 0;
     for (const auto& pt : parts) {
@@ -490,6 +524,12 @@ bool try_load_fused_raw(const Shards& S, const std::vector<MatPart>& parts, int 
         off += nb;
     }
     return true;
+}
+
+// one token's product over a dense matrix kept as the GGUF's blocks, or planar
+void mv1(const Mat& m, const float* x, float* y) {
+    if (m.q8) k::mv_q8p(m.q8, m.q8d, m.N, m.K, x, y, g_s);
+    else k::mv_blocks(m.type, m.raw, m.N, m.K, x, y, g_s);
 }
 
 uint16_t* g_w16 = nullptr;   // a matrix's FP16 decode for the prompt path's GEMMs (the largest of a layer's)
@@ -502,11 +542,11 @@ void matmul(const Mat& m, const float* x32, const uint16_t* x16, int T, float* Y
         return;
     }
     if (m.K <= 8192 && (T == 1 || (size_t) m.N * m.K > g_w16_n)) {
-        for (int t = 0; t < T; ++t)
-            k::mv_blocks(m.type, m.raw, m.N, m.K, x32 + (size_t) t * m.K, Y + (size_t) t * ldy, g_s);
+        for (int t = 0; t < T; ++t) mv1(m, x32 + (size_t) t * m.K, Y + (size_t) t * ldy);
         return;
     }
-    k::decode_f16(m.type, m.raw, (size_t) m.N * m.K, g_w16, g_s);
+    if (m.q8) k::decode_q8p_f16(m.q8, m.q8d, (size_t) m.N * m.K, g_w16, g_s);
+    else k::decode_f16(m.type, m.raw, (size_t) m.N * m.K, g_w16, g_s);
     gemm16(g_w16, m.N, m.K, x16, T, Y, ldy);
 }
 
@@ -1114,6 +1154,7 @@ void matmul_rows(const Mat& m, int r0, int n, const float* x32, const uint16_t* 
     Mat p = m;
     p.N = n;
     if (m.f16) p.f16 = m.f16 + (size_t) r0 * m.K;
+    else if (m.q8) p.q8 = m.q8 + (size_t) r0 * m.K, p.q8d = m.q8d + (size_t) r0 * (m.K >> 5);
     else p.raw = m.raw + (size_t) r0 * (m.K / k::block_values(m.type)) * k::block_bytes(m.type);
     matmul(p, x32, x16, T, Y, ldy);
 }
@@ -1857,7 +1898,7 @@ void fast_token_launches(Model& M, Work& W, OutMode out_mode) {
         if (Ly.sliding) {
             const Mat& m = Ly.wqkvrg;   // q | k | v | r | gate
             if (!sep) {
-                k::mv_blocks(m.type, m.raw, m.N, m.K, W.xq, W.qkv, g_s);
+                mv1(m, W.xq, W.qkv);
             } else {
                 matmul_rows(m, 0, HD, W.xq, nullptr, 1, W.qkv, m.N);
                 matmul_rows(m, HD, KD, W.xk, nullptr, 1, W.qkv + HD, m.N);
@@ -1867,11 +1908,11 @@ void fast_token_launches(Model& M, Work& W, OutMode out_mode) {
             q_p = W.qkv, k_p = q_p + HD, v_p = k_p + KD, r_p = v_p + KD, gate_p = r_p + HR;
         } else {
             const Mat& m = Ly.wqrg;     // q | r | gate
-            k::mv_blocks(m.type, m.raw, m.N, m.K, W.xq, W.qkv, g_s);
+            mv1(m, W.xq, W.qkv);
             q_p = W.qkv, r_p = q_p + HD, gate_p = r_p + HR;
             k_p = W.kk, v_p = W.vv, kd_p = W.dyn, vd_p = W.dyn + (size_t) c.KV * 4;
-            k::mv_blocks(Ly.wk.type, Ly.wk.raw, KD, C, W.xk, k_p, g_s);
-            k::mv_blocks(Ly.wv.type, Ly.wv.raw, KD, C, W.xv, v_p, g_s);
+            mv1(Ly.wk, W.xk, k_p);
+            mv1(Ly.wv, W.xv, v_p);
             k::mv_f16(Ly.sc_k_dyn16, c.KV * 4, C, W.xk, kd_p, g_s);
             k::mv_f16(Ly.sc_v_dyn16, c.KV * 4, C, W.xv, vd_p, g_s);
         }
@@ -1896,7 +1937,7 @@ void fast_token_launches(Model& M, Work& W, OutMode out_mode) {
                                   qk_scale, Ly.rel_proj, c.d_rel, extent, window, W.lg, W.o, g_s);
         }
         k::gate_mul_f16(W.o, gate_p, (size_t) HD, W.x16, true, g_s);
-        k::mv_blocks(Ly.wo.type, Ly.wo.raw, C, HD, W.o, W.tmp, g_s);
+        mv1(Ly.wo, W.o, W.tmp);
         if (l % c.block == 0) {   // a block's first layer: the stream joins the blocks and starts again
             CU(cudaMemcpyAsync(blk(nb), W.h, Cb, cudaMemcpyDeviceToDevice, g_s));
             k::conv4(W.tmp, Ly.h_attn, Ly.sc_attn, nullptr, 0, 1, C, W.r, g_s);
@@ -1940,7 +1981,7 @@ void fast_token_launches(Model& M, Work& W, OutMode out_mode) {
         k::RmsOuts outs{};
         outs.w[0] = M.out_norm, outs.y16[0] = W.x16, outs.y32[0] = W.xq;
         k::attn_res_rms_f16(st, nb + 1, M.out_res_score, 1, 1, C, 1e-6f, c.eps, outs, g_s);
-        k::mv_blocks(M.out_w.type, M.out_w.raw, c.n_rows, C, W.xq, W.logits, g_s);
+        mv1(M.out_w, W.xq, W.logits);
         if (out_mode == OutMode::kArgmax) {
             k::argmax_sum(W.logits, nullptr, nullptr, c.n_vocab, W.argmax_d, g_s);
             CU(cudaMemcpyAsync(W.argmax_h, W.argmax_d, 4, cudaMemcpyDeviceToHost, g_s));
@@ -3281,13 +3322,20 @@ int main(int argc, char** argv) {
     const double t_host = now();
     Pinned pin;
     double t_alloc = 0;
-    const bool host_mmap = getenv("IK2_HOST") && std::string(getenv("IK2_HOST")) == "mmap";
+    // (the resident path keeps every expert in VRAM, so no pinned host copy is needed: the experts go from where the
+    //  files are mapped straight to their slots, and stay in the page cache for the next load - IK2_HOST=pinned: as
+    //  for the other models)
+    const bool host_mmap = getenv("IK2_HOST") ? std::string(getenv("IK2_HOST")) == "mmap" : g_fast_want;
     if (host_mmap) {
         if (g_pool) die("IK2_HOST=mmap with the CPU lane");
         for (const auto& J : exp_jobs) {
             Layer& Ly = M.L[J.l];
             const uint8_t* p = S.data(J.name);
             for (size_t i = 0; i < J.roles.size(); ++i) Ly.host[J.roles[i]] = p + i * Ly.eb[J.roles[i]];
+            {   // (read ahead: a cold file otherwise comes in a page fault at a time)
+                const size_t pg = 4096, a0 = (size_t) p & ~(pg - 1);
+                ::madvise((void*) a0, (size_t) p - a0 + tensor_bytes(*S.info(J.name)), MADV_WILLNEED);
+            }
         }
         std::printf("experts: read where the files are mapped (IK2_HOST=mmap)\n");
         std::fflush(stdout);
@@ -3641,10 +3689,11 @@ int main(int argc, char** argv) {
         }
     }
     if (g_fast_want && d == 0) {   // the resident path: every expert in now, and where each is on the device
-        bool all = !EC.pools.empty(), raw = M.out_w.raw != nullptr;
+        auto blocks = [](const Mat& m) { return m.raw || m.q8; };   // (kept as the GGUF's blocks, whole or planar)
+        bool all = !EC.pools.empty(), raw = blocks(M.out_w);
         for (const auto& P : EC.pools) all = all && P.n_active >= P.n_layers * c.E;
         for (const auto& Ly : M.L)
-            raw = raw && Ly.wo.raw && (Ly.sliding ? Ly.wqkvrg.raw != nullptr : (Ly.wqrg.raw && Ly.wk.raw && Ly.wv.raw));
+            raw = raw && blocks(Ly.wo) && (Ly.sliding ? blocks(Ly.wqkvrg) : (blocks(Ly.wqrg) && blocks(Ly.wk) && blocks(Ly.wv)));
         if (all && raw) {
             const double tw = now();
             const uint64_t m0 = EC.misses, b0 = EC.bytes_up;
