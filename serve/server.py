@@ -4442,12 +4442,7 @@ class Service:
             cur, left = list(ids) + produced, max_new - len(produced)
             smp = self._resumed_sampling(sampling, produced)   # (the thinking budget counts from where it got to)
         if len(segments) > 1:                           # the request's figures, over all its slices
-            first, last = segments[0], segments[-1]
-            merged = dict(last, prompt_tokens=first.get("prompt_tokens"), reused=first.get("reused"))
-            for k in ("generated", "prompt_ms", "decode_ms", "drafts_accepted", "drafts_offered", "hits", "lookups"):
-                if all(k in sg for sg in segments):
-                    merged[k] = sum(sg[k] for sg in segments)
-            self.engine.last = merged
+            self.engine.last = merge_calls(segments)
         lastd = getattr(self.engine, "last", None)
         if isinstance(lastd, dict) and (lastd.get("prompt_tokens") or 0) > len(ids):
             self.engine.last = own_prompt_figures(lastd, len(ids))   # (the first call's DONE was not seen)
@@ -4528,6 +4523,7 @@ class Service:
         # Identity token: only a DONE line replaces engine.last, so a request that died, errored or was
         # disconnected must not have the PREVIOUS request's decode figures recorded as its own.
         engine_last0 = getattr(self.engine, "last", None)
+        calls: list[dict] = []                          # each finished engine call's DONE (segments()), merged at the end
         counted, my_started, my_first, queued = False, time.time(), None, False
         stat = RequestStat()                            # this request's live figures
         stat.spec_off = request_spec_off(sampling)
@@ -4647,7 +4643,11 @@ class Service:
                     engine rejected prompt + max_new + CTX_SLACK > context)."""
                     while True:
                         room = self.engine.max_context - CTX_SLACK - len(seg["prompt"])
+                        l0 = getattr(self.engine, "last", None)
                         yield from attempts(seg["prompt"], max(1, min(max_new - n, room)))
+                        got = getattr(self.engine, "last", None)
+                        if got is not None and got is not l0:   # (its DONE: the request's figures merge every call's)
+                            calls.append(got)
                         if seg["next"] is None or cancel.is_set() or self.stopping:
                             return
                         seg["prompt"], seg["next"], seg["ids"] = seg["next"], None, []
@@ -4895,9 +4895,15 @@ class Service:
             with self.status_lock:
                 self.current_requests.discard(stat)
                 if counted:
-                    # only this request's DONE counts: same object means no DONE arrived (death, error, disconnect)
-                    last = dict(getattr(self.engine, "last", {}) or {}) \
-                        if getattr(self.engine, "last", None) is not engine_last0 else {}
+                    # only this request's DONE counts: same object means no DONE arrived (death, error, disconnect);
+                    # over all its engine calls (#1058: a continuation's DONE alone read the whole answer as cached)
+                    last_obj, last = getattr(self.engine, "last", None), {}
+                    if last_obj is not engine_last0:
+                        if last_obj is not None and (not calls or calls[-1] is not last_obj):
+                            calls.append(last_obj)      # (the last call, closed before segments() saw its end)
+                        last = merge_calls(calls) if calls else dict(last_obj or {})
+                        if (last.get("prompt_tokens") or 0) > len(ids):
+                            last = own_prompt_figures(last, len(ids))
                     started = my_started
                     loaded = str((getattr(self.engine, "info", {}) or {}).get("cvec", 0)) not in ("0", "", "None")
                     hit_rate = round(last["hits"] / last["lookups"], 3) if last.get("lookups") else None
@@ -4960,6 +4966,31 @@ class Service:
         yield "done", {"finish": finish, "completion_tokens": n, "reasoning_tokens": reasoning_tokens,
                        "reused": (timings or {}).get("cache_n", 0),
                        "timings": timings, "stop_sequence": matched if finish == "stop" else None}
+
+
+CALL_SUMS = ("generated", "decode_ms", "drafts_accepted", "drafts_offered", "hits", "lookups")
+
+
+def merge_calls(calls: list[dict]) -> dict:
+    """One request's figures over its engine calls (its DONE lines, in order): fair slices, the loop guard's and the
+    thinking budget's continuations, and the calls after a blocked tool call, a keep or a thinking resume (#1058) - each
+    later call's prompt is the request's prompt plus what was written, all of it in the conversation cache, and its
+    DONE counts only its own tokens.  The prompt's figures are the first call's (prompt_tokens, reused and prompt_ms:
+    the request's own prompt read, so prefill_tok_s and the timings keep one scope); the tokens written, the decode
+    time, the drafts and the expert-cache lookups are summed (a key only when every call reported it)."""
+    if not calls:
+        return {}
+    first, merged = calls[0], dict(calls[-1])
+    for k in ("prompt_tokens", "reused", "prompt_ms"):
+        if k in first:
+            merged[k] = first[k]
+        else:
+            merged.pop(k, None)
+    if len(calls) > 1:
+        for k in CALL_SUMS:
+            if all(k in c for c in calls):
+                merged[k] = sum(c[k] for c in calls)
+    return merged
 
 
 def own_prompt_figures(last: dict, n_prompt: int) -> dict:
