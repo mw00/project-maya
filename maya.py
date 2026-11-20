@@ -825,8 +825,9 @@ HY4_MTP_VRAM = 0.56
 #  file, beside them its lists and rows, under HY4_DFLY2_EXTRA bytes)
 HY4_DFLY2_EXTRA = 32 << 20
 # (where both fit, which drafts is measured on the PC - speed_calibration_hy4: a short A/B, the faster kept unless
-#  within HY4_DRAFT_TIE, where this rule stays; until it runs, the rule: the faster for the size on the V100s measured,
-#  server answers of code and chat, greedy and sampled)
+#  within HY4_DRAFT_TIE, where this rule stays; until it runs, the rule: the faster for the size on the V100 measured
+#  (32 and 16 GB, server answers of code and chat, greedy and sampled): XS DFly2 (+10-20% over the block), S the block
+#  (+5-35% on chat), L a tie (DFly2 ahead on greedy code, the block on sampled chat: the block kept); M not measured)
 HY4_DRAFT_RULE = {"maya-xs": "dfly2", "maya-s": "mtp", "maya-m": "mtp", "maya-l": "mtp"}
 HY4_DRAFT_TIE = 0.02
 HY4_DRAFT_PROBE = {"mixed": True, "tokens": 512, "answer": 128, "warm": 32}
