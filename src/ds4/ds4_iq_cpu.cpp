@@ -884,19 +884,60 @@ bool own_check(int type) {
 }
 
 #if defined(IQ_X86)
+// The weights the variants are timed on (own()): rows of the type in a buffer larger than a CPU's
+// caches, walked in turn - in the lane each call's experts come from RAM, and a form with a large table (IQ2_XXS's
+// one-table forms: 256 KB) loses its edge to the weights' traffic there, which rows that stay in the caches (a small
+// set timed over and over) never show: on Sun's Zen 5 a one-table form timed 39 us there against the blend form's 43
+// ran a lane call in 5.5-6.2 ms against its 5.15; on streamed rows it times 94-121 us against 76-92
+// (the rows' length: the engine's, when it said - iq_cpu_row_hint - else 4096.  A row's own work beside its blocks'
+//  weighs more in short rows: on Sun's Zen 5 the AVX2 blend rows and the AVX-512 rows timed alike on rows of 4096 and
+//  the lane's calls on rows of 1536 ran 6-11 % apart)
+std::atomic<int> g_row_hint{0};
+int tv_n() {
+    const int h = g_row_hint.load(std::memory_order_relaxed);
+    return h > 0 ? h : 4096;
+}
+struct TvBuf {
+    std::vector<uint8_t> w;
+    size_t rb = 0, rows = 0, at = 0;
+    TvBuf(int type, size_t bytes) {
+        const ggml_type t = (ggml_type) type;
+        rb = ggml_row_size(t, tv_n());
+        rows = std::max<size_t>(64, bytes / rb);
+        w.resize(rb * rows);
+        uint64_t st = 0x2545F4914F6CDD1Dull;
+        for (size_t o = 0; o + 8 <= w.size(); o += 8) {
+            st ^= st << 13;
+            st ^= st >> 7;
+            st ^= st << 17;
+            std::memcpy(&w[o], &st, 8);
+        }
+        const size_t bb = ggml_type_size(t);
+        const ggml_fp16_t d = ggml_fp32_to_fp16(0.003f);
+        for (size_t o = 0; o + bb <= w.size(); o += bb) put_scale(t, &w[o], d);
+    }
+    const uint8_t* next(size_t n_rows) {   // the next n_rows, the oldest the caches hold the least
+        if (at + n_rows > rows) at = 0;
+        const uint8_t* p = w.data() + at * rb;
+        at += n_rows;
+        return p;
+    }
+};
 // the time (us, best of 5 rounds) of 32 rows of 16 blocks of the type against nt tokens: ours with the IQ3 grids as
-// broadcasts + blends (variant 1) or by vpgatherdd (2), or the native lane's rows (0: the GLM lane's / ggml-cpu's)
-double time_variant(int type, int variant, int nt = 1) {
+// broadcasts + blends (variant 1) or by vpgatherdd (2) - IQ2_XXS: its one-table form (2) - or the native lane's rows
+// (0: the GLM lane's / ggml-cpu's), on big's rows when given (every call fresh ones), else on one small set
+double time_variant(int type, int variant, int nt = 1, TvBuf* big = nullptr) {
     const ggml_type t = (ggml_type) type;
-    const int n = 4096, rows = 32;
+    const int n = big ? tv_n() : 4096, rows = std::max(8, 32 * 4096 / n);   // (the same work a call whatever n)
     const size_t rb = ggml_row_size(t, n), bb = ggml_type_size(t), ab = ggml_row_size(GGML_TYPE_Q8_K, n);
-    std::vector<uint8_t> w(rb * rows), a(ab * (size_t) nt);
+    std::vector<uint8_t> w(big ? 0 : rb * rows), a(ab * (size_t) nt);
     uint32_t s = 12345u;
     for (auto& b : w) b = (uint8_t) ((s = s * 1664525u + 1013904223u) >> 24);
     for (size_t o = 0; o < w.size(); o += bb) {
         const ggml_fp16_t d = ggml_fp32_to_fp16(0.003f);
         put_scale(t, &w[o], d);
     }
+    auto rows_w = [&]() -> const uint8_t* { return big ? big->next((size_t) rows) : w.data(); };
     std::vector<float> x((size_t) n), y((size_t) rows * nt);
     std::vector<const void*> ap((size_t) nt);
     std::vector<float*> yp((size_t) nt);
@@ -917,12 +958,14 @@ double time_variant(int type, int variant, int nt = 1) {
     for (int round = 0; round < 6; ++round) {
         const auto t0 = std::chrono::steady_clock::now();
         for (int rep = 0; rep < 4; ++rep) {
+            const uint8_t* w1 = rows_w();
+            const uint8_t* w2 = rows_w();
             if (variant == 0) {
-                kc::native_gu_rows_split(nf, w.data(), w.data(), ap.data(), nt, yp.data(), 0, rows,
+                kc::native_gu_rows_split(nf, w1, w2, ap.data(), nt, yp.data(), 0, rows,
                                          std::numeric_limits<float>::infinity());
             } else {
-                own_rows(type, w.data(), rb, n, ap.data(), nt, yp.data(), 0, rows);
-                own_rows(type, w.data(), rb, n, ap.data(), nt, yp.data(), 0, rows);
+                own_rows(type, w1, rb, n, ap.data(), nt, yp.data(), 0, rows);
+                own_rows(type, w2, rb, n, ap.data(), nt, yp.data(), 0, rows);
             }
         }
         const double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
@@ -966,8 +1009,12 @@ bool own(int type) {
         build_ct2x();
         return mode != 0 && isa().avx2;
     }();
-    // (IQ2 on an AVX-512 CPU: the GLM lane's AVX-512 rows serve them, unless DS4_IQ_AVX2; IQ1_S has no such rows)
-    if (!allowed || ((k == 2 || k == 3) && isa().w512 && !force_avx2) || (k == 4 && !isa().f16c) ||
+    // (IQ2 on an AVX-512 CPU: timed against the GLM lane's AVX-512 rows like any native rows - on Sun's Zen 5 the
+    //  blend form ran a lane call of IQ2_XXS 11 % faster at one thread, 6 % at 16; DS4_IQ_AVX2=0: the AVX-512 rows
+    //  without timing, as before.  IQ1_S has no such rows)
+    const char* a2v = std::getenv("DS4_IQ_AVX2");
+    const bool avx2_off = a2v != nullptr && std::atoi(a2v) == 0;
+    if (!allowed || ((k == 2 || k == 3) && isa().w512 && avx2_off && !force_avx2) || (k == 4 && !isa().f16c) ||
         (k >= 5 && x512_from(type) == 0))
         return false;
     static std::once_flag once[7];
@@ -1033,10 +1080,11 @@ bool own(int type) {
         // (IQ1_S timed on 4 tokens, where the two differ most: ours are ~2.3x ggml-cpu's there, ~1.25x on one)
         const int nt = k == 4 ? 4 : 1;
         double tn = 1e30, tb = 1e30, tg = 1e30;
+        TvBuf big(type, (size_t) 64 << 20);   // (the weights streamed from RAM, as the lane's are)
         for (int it = 0; it < 5; ++it) {
-            tn = std::min(tn, time_variant(type, 0, nt));
-            if (good) tb = std::min(tb, time_variant(type, 1, nt));
-            if (good_g) tg = std::min(tg, time_variant(type, 2, nt));
+            tn = std::min(tn, time_variant(type, 0, nt, &big));
+            if (good) tb = std::min(tb, time_variant(type, 1, nt, &big));
+            if (good_g) tg = std::min(tg, time_variant(type, 2, nt, &big));
         }
         if (gflag != nullptr) *gflag = tg < tb;
         ok[k] = std::min(tb, tg) < 0.9 * tn;
@@ -1061,6 +1109,9 @@ bool own_nt(int type, int nt) {
     if (type == GGML_TYPE_IQ1_S && !iq1_no_pdep() && !g_iq1_on.load(std::memory_order_relaxed)) return false;
 #if defined(IQ_X86)
     if (!own(type)) return false;
+    // (IQ2 on an AVX-512 CPU: ours for a decode's one token, where own() timed them; the AVX-512 multi-token rows
+    //  keep the calls of several tokens)
+    if ((type == GGML_TYPE_IQ2_XXS || type == GGML_TYPE_IQ2_S) && isa().w512 && nt > 1) return false;
     return !x512_type(type) || nt >= x512_from(type);   // (IQ1_M on Zen 4: from 2 tokens)
 #else
     return own(type);
@@ -1137,6 +1188,15 @@ void iq_cpu_down(const IqCpu& f, const uint8_t* down, const void* const* hq, int
     kc::native_down_rows_split(native(f), down, hq, nt, out, r0, r1);
 }
 
+void iq_cpu_row_hint(int n) {
+#if defined(IQ_X86)
+    int z = 0;
+    if (n > 0 && n % QK_K == 0) g_row_hint.compare_exchange_strong(z, n);
+#else
+    (void) n;
+#endif
+}
+
 int iq_cpu_act_type(int type) {
     kc::NativeFmt n;
     std::string err;
@@ -1198,6 +1258,7 @@ void iq_cpu_gate_up(const IqCpu&, const uint8_t*, const uint8_t*, const void* co
                     float) {}
 void iq_cpu_down(const IqCpu&, const uint8_t*, const void* const*, int, float* const*, int, int) {}
 int iq_cpu_act_type(int) { return -1; }
+void iq_cpu_row_hint(int) {}
 void iq_cpu_rows(int, const uint8_t*, size_t, int, const void* const*, int, float* const*, int, int) {}
 bool iq_cpu_own_rows(int) { return false; }
 void iq_cpu_iq1s_rows(bool) {}

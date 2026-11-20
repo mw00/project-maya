@@ -312,6 +312,7 @@ void Lane::parallel_for(int n, const std::function<void(int)>& f, const std::vec
 // ---------------------------------------------------------------- the experts
 bool CpuExperts::init(int tg, int td, int n_embd, int n_ff, std::string& err) {
     if (!iqc::iq_cpu_fmt(tg, td, n_embd, n_ff, f, err)) return false;
+    iqc::iq_cpu_row_hint(n_embd);   // (the row forms timed on this length)
     g_stride = f.gu_row * (size_t) n_ff;
     d_stride = f.d_row * (size_t) n_embd;
     return true;
