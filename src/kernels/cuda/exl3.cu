@@ -991,6 +991,7 @@ struct KWin {
     const int* cpu_flag;
     const float* x;
     size_t x_stride;
+    int x_shift;         // an entry's input row: e >> x_shift (3: a window's e = t * 8 + i; 0: rows, WinArgs::rows)
     float* h;            // [T * 8][n_ff]: the gate's values, then the swiglu
     float* u;            // [T * 8][n_ff]: the up's values
     float* part;         // [T * 8][n_embd]
@@ -1026,7 +1027,7 @@ __global__ void EXL3_BOUNDS(kMinBlocksX<K2>) win_gu_kernel(const KWin a) {
     for (int mm = m0; mm < m1; mm += kTok) {
         const int nc = min(kTok, m1 - mm);
         Xin x;
-        if (warp < nc) x.f = a.x + (size_t) (a.grp_ent[mm + warp] >> 3) * a.x_stride;
+        if (warp < nc) x.f = a.x + (size_t) (a.grp_ent[mm + warp] >> a.x_shift) * a.x_stride;
 #if defined(EXL3_SEP_DEV)
         block_gemv<K2, cb>((const uint32_t*) (blob + a.tr[r]), a.n_ff / 16, g * 8, sp * a.gkr,
                           min(a.n_embd, (sp + 1) * a.gkr), x, (const uint16_t*) (blob + a.suh[r]), nc, sm);
@@ -1354,7 +1355,7 @@ __global__ void EXL3_BOUNDS(2) win_gu_mix_kernel(const KWin a, const KMix mx) {
     for (int mm = m0; mm < m1; mm += kTok) {
         const int nc = min(kTok, m1 - mm);
         Xin x;
-        if (warp < nc) x.f = a.x + (size_t) (a.grp_ent[mm + warp] >> 3) * a.x_stride;
+        if (warp < nc) x.f = a.x + (size_t) (a.grp_ent[mm + warp] >> a.x_shift) * a.x_stride;
         mix_gemv<cb>(k2, (const uint32_t*) (blob + mx.tr[c][r]), a.n_ff / 16, g * 8, 0, a.n_embd, x,
                      (const uint16_t*) (blob + mx.suh[c][r]), nc, sm);
         if (warp < nc)
@@ -3122,7 +3123,8 @@ static bool xsplit_set(int rows, int n_embd, int n_ff, float* xp, float*& dst, i
     xsplit(n_embd, gS, gkr);
     xsplit(n_ff, dS, dkr);
     dst = xp;
-    if ((size_t) rows * 2 * gS * n_ff > kXPFloats || (size_t) rows * dS * n_embd > kXPFloats) {
+    // (no split - S 1 both: the partials' scratch is neither used nor allocated, whatever the rows)
+    if ((gS > 1 || dS > 1) && ((size_t) rows * 2 * gS * n_ff > kXPFloats || (size_t) rows * dS * n_embd > kXPFloats)) {
         std::fprintf(stderr, "exl3: the experts' input split takes more than its scratch (%d rows)\n", rows);
         return false;
     }
@@ -3246,21 +3248,39 @@ void moe_down(const MoeArgs& a, const float* h, const float* sh_out, float* out,
     launch_check("moe_down");
 }
 
+bool win_rows_covered(const WinArgs& a) {
+    if (!a.rows || a.mix.n > 0 || a.T < 1 || a.k < 1 || a.k > 8 || a.max_groups < 1 || a.n_embd % kCols != 0 ||
+        a.n_ff % kCols != 0 || a.n_embd > kMaxMoeK || a.n_ff > kMaxMoeK || a.lay.k2[0] != a.lay.k2[1] ||
+        kCntGU + (size_t) a.max_groups * (a.n_ff / kCols) > kCounters)
+        return false;
+#if defined(STRATA_USE_HIP)
+    int gS, gkr, dS, dkr;   // (xsplit_set's check, without its message)
+    xsplit(a.n_embd, gS, gkr);
+    xsplit(a.n_ff, dS, dkr);
+    if ((gS > 1 || dS > 1) && ((size_t) a.T * 2 * gS * a.n_ff > kXPFloats || (size_t) a.T * dS * a.n_embd > kXPFloats))
+        return false;
+#endif
+    return true;
+}
+
 bool win_experts(const WinArgs& a, cudaStream_t s) {
-    if (a.mix.n == 0) EXL3_LEGACY_MOE(a, win_experts(a, s));
+    if (a.mix.n == 0 && !a.rows) EXL3_LEGACY_MOE(a, win_experts(a, s));   // (rows: these kernels only)
     if (a.mix.n > 0 && !mixed_ok(a.mix, "win_experts")) return false;
     if (a.T < 1 || a.k < 1 || a.k > 8 || a.n_embd % kCols != 0 || a.n_ff % kCols != 0 || a.n_embd > kMaxMoeK ||
         a.n_ff > kMaxMoeK || (a.mix.n == 0 && a.lay.k2[0] != a.lay.k2[1]) || a.h == nullptr || a.part == nullptr ||
-        a.out == nullptr) {
-        std::fprintf(stderr, "exl3 win_experts: not covered (T %d k %d n_embd %d n_ff %d, gate K %g up K %g)\n", a.T,
-                     a.k, a.n_embd, a.n_ff, a.lay.k2[0] / 2.0, a.lay.k2[1] / 2.0);
+        (!a.rows && a.out == nullptr) || (a.rows && (a.u == nullptr || a.max_groups < 1 || a.mix.n > 0))) {
+        std::fprintf(stderr, "exl3 win_experts: not covered (T %d k %d n_embd %d n_ff %d, gate K %g up K %g%s)\n", a.T,
+                     a.k, a.n_embd, a.n_ff, a.lay.k2[0] / 2.0, a.lay.k2[1] / 2.0, a.rows ? ", rows" : "");
         return false;
     }
     Scratch* sc = scratch(s);
     if (sc == nullptr) return false;
-    const int groups = a.T * a.k;   // at most (the blocks past the real count return at once)
-    if ((size_t) a.T * 8 * a.n_ff > kUFloats || kCntGU + (size_t) groups * (a.n_ff / kCols) > kCounters) {
-        std::fprintf(stderr, "exl3 win_experts: %d tokens are more than the scratch takes\n", a.T);
+    // (rows: the entries are rows, a.T of them at most, in at most max_groups groups - u the caller's)
+    const int groups = a.rows ? a.max_groups : a.T * a.k;   // at most (the blocks past the real count return at once)
+    const size_t entries = a.rows ? (size_t) a.T : (size_t) a.T * 8;
+    if ((!a.rows && entries * a.n_ff > kUFloats) || kCntGU + (size_t) groups * (a.n_ff / kCols) > kCounters) {
+        std::fprintf(stderr, "exl3 win_experts: %d %s are more than the scratch takes\n", a.rows ? groups : a.T,
+                     a.rows ? "groups" : "tokens");
         return false;
     }
     KWin w{};
@@ -3275,8 +3295,9 @@ bool win_experts(const WinArgs& a, cudaStream_t s) {
     w.cpu_flag = a.cpu_flag;
     w.x = a.x;
     w.x_stride = a.x_stride;
+    w.x_shift = a.rows ? 0 : 3;
     w.h = a.h;
-    w.u = sc->u;
+    w.u = a.rows ? a.u : sc->u;
     w.cnt_gu = sc->cnt + kCntGU;
     w.part = a.part;
     w.sh_out = a.sh_out;
@@ -3292,7 +3313,7 @@ bool win_experts(const WinArgs& a, cudaStream_t s) {
     w.n_ff = a.n_ff;
     w.limit = a.limit;
 #if defined(STRATA_USE_HIP)
-    if (!xsplit_set(a.T * 8, a.n_embd, a.n_ff, sc->xp, w.xp, w.gS, w.gkr, w.dS, w.dkr)) return false;
+    if (!xsplit_set((int) entries, a.n_embd, a.n_ff, sc->xp, w.xp, w.gS, w.gkr, w.dS, w.dkr)) return false;
 #endif
     if (a.mix.n > 0) {
         const KMix k = kmix(a.mix);
@@ -3304,6 +3325,10 @@ bool win_experts(const WinArgs& a, cudaStream_t s) {
     } else if (!dispatch<RunWin>(a.lay.k2[0], a.lay.cb, w, groups, s) ||
                !dispatch<RunWinDown>(a.lay.k2[2], a.lay.cb, w, groups, s)) {
         return false;
+    }
+    if (a.rows) {   // (each entry's output is its part row: no combine)
+        launch_check("win_experts");
+        return true;
     }
     if (a.wait_ptr != nullptr) win_wait_kernel<<<1, 32, 0, s>>>(a.wait_ptr, a.wait_val);
     win_combine_kernel<<<dim3((unsigned) (a.n_embd / kCols), (unsigned) a.T), kCols, 0, s>>>(w);

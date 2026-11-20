@@ -165,8 +165,19 @@ struct WinArgs {
     // part arrives while the device computes the experts); cpu_flag may be null (no CPU part)
     const unsigned* wait_ptr = nullptr;
     unsigned wait_val = 0;
+    // rows: a prompt chunk's experts by rows (ds4 DS4_LIGHT_WIN) - an entry e is a row: its input at x + e x_stride,
+    // its values at h / u + e n_ff, its output at part + e n_embd, the expert's own (no plan, no weights, no combine:
+    // out, plan_ptr, plan_w not read).  T: the entries at most; max_groups: the groups at most; u [T][n_ff] the
+    // caller's (the scratch's takes a window's).  Each group's weights decoded once per kTok of its rows
+    bool rows = false;
+    float* u = nullptr;
+    int max_groups = 0;
 };
 bool win_experts(const WinArgs& a, cudaStream_t s);
+/// (WinArgs::rows) whether win_experts takes such a launch: the shapes, the gate's and the up's K, the counters for
+/// max_groups groups, the input split's scratch for T rows - checked without a launch or a message, so a caller can
+/// route a layer's experts elsewhere up front
+bool win_rows_covered(const WinArgs& a);
 /// Whether the current device runs the several-activation kernels (win_experts; mv's ncol > 1): every device does
 /// (they take ~10 KB of shared memory a block).
 bool several_ok();
