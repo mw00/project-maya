@@ -967,6 +967,22 @@ def hy4_used(gpus: list) -> dict:
     return {i: hit[1][i] for i in gpus if i in hit[1]} if hit[1] else {}
 
 
+def hy4_cards(cfg: dict, gpus: list) -> dict:
+    """{index: card} of machine_gpus' cards, each with the VRAM the engine's CUDA gets on it as the setup measured it
+    under Windows (installer.engine_room_gb - maya.py's hy4_engine_room: Windows keeps part of every card, and while
+    the engine holds it that cannot be measured again) where the card's VRAM is still the one measured then:
+    hy4_usable_gib counts no more than that there, as the setup did."""
+    cards = {g["index"]: g for g in gpus}
+    for k, v in ((cfg.get("installer") or {}).get("engine_room_gb") or {}).items():
+        try:
+            i, gib, vram = int(k), float(v[0]), float(v[1])
+        except (TypeError, ValueError, IndexError):
+            continue
+        if i in cards and abs(float(cards[i].get("vram_gb") or 0) - vram) < 0.01:
+            cards[i] = {**cards[i], "engine_room_gb": gib}
+    return cards
+
+
 def hy4_room(cfg: dict) -> dict | None:
     """What Hy4-Flash's config has in VRAM for a context, worked out as the setup does it (maya.py's
     hy4_config_need_gib and hy4_usable_gib: the plan of its size and layout - installer.hy4_quant / layout - in
@@ -981,7 +997,7 @@ def hy4_room(cfg: dict) -> dict | None:
     VRAM left out), so the page and the setup offer the same contexts.  None where it cannot be worked out: a card of
     the config this PC does not list with its VRAM, a size the table has no plan for."""
     inst, args, gpus = cfg.get("installer") or {}, cfg.get("args") or [], gpus_of(cfg)
-    cards = {g["index"]: g for g in machine_gpus(cfg.get("backend") or "cuda")}
+    cards = hy4_cards(cfg, machine_gpus(cfg.get("backend") or "cuda"))
     if not gpus or any(not (cards.get(i) or {}).get("vram_gb") for i in gpus):
         return None
     try:
@@ -1075,7 +1091,7 @@ def hy4_refit(new: dict) -> dict | None:
     pictures switched off (--vision off, or a pack without the tower) are not counted, as with the setup's
     --no-vision.  None where it cannot be worked out, or where the context does not fit (hy4_context_check says so)."""
     inst, args, gpus = new.get("installer") or {}, new.get("args") or [], gpus_of(new)
-    cards = {g["index"]: g for g in machine_gpus(new.get("backend") or "cuda")}
+    cards = hy4_cards(new, machine_gpus(new.get("backend") or "cuda"))
     if hy4_plain(new) or not gpus or any(not (cards.get(i) or {}).get("vram_gb") for i in gpus):
         return None
     try:

@@ -2401,6 +2401,13 @@ works this out from the card's free VRAM and the size's plan, and asks where it 
 `--fast-drafting off`: the default, F16 rows - Maya's default answers). A setup again keeps the choice; KV cache on
 the Models page shows it (Auto or 8-bit). Within that config, drafting on and off give the same tokens.
 
+**Free VRAM under Windows:** Windows keeps part of every NVIDIA card from the programs on it, which nvidia-smi does
+not show (an idle RTX 3050 8 GB: CUDA reports 7.0 GB free). So on Windows the setup measures the card the way the
+engine does at its start (CUDA's own free figure, in a short separate process) and counts no more than that - its
+line "VRAM: Windows keeps part of this card ..." says the figure - so it claims the DFly2 drafter, and asks about
+faster drafting, where the engine then really loads it. The figure is kept in the config, and the Models page counts
+it too. Linux and AMD cards are counted as before.
+
 **Not available for Hy4-Flash yet** (the dashboard offers no switch for them): `--parallel` (one request at a time
 for now); Mac, and AMD on Windows.
 

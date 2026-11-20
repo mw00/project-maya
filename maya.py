@@ -852,6 +852,12 @@ HY4_STANDARD = "standard"                          # the layout a size's own "fi
 HY4_FIT_USED_CAP_GIB = 1.0
 HY4_FIT_DISPLAY_GIB = 0.4
 HY4_FIT_MARGIN_GIB = 0.25
+# what a CUDA start takes of a card beside the free VRAM the engine plans with (cudaMemGetInfo) - its context and the
+# driver's share - which nvidia-smi's free figure still holds under Linux, where the sums above were measured (0.57 GiB
+# on a V100 32 GB: a context 308 MiB, the driver 274); under Windows CUDA's own figure has it out already (the display
+# driver keeps it in its budget: a context shows as 68 MiB on an RTX 3050, whose engine draws its DFly2 line 0.48-0.53
+# GiB above CUDA's figure) - hy4_engine_room adds this much back, or what this PC shows of it where that is more
+HY4_FIT_CUDA_OWN_GIB = 0.5
 HY4_KV_RESIDENT = 32768                            # (KV streaming: the global layers' newest positions kept in VRAM)
 # a small-card layout's prompt chunk doubled where it fits: the prompt scratch grows by about 0.9 GiB from 256 to 512
 # tokens (an 8 GB card at 4K: measured) - counted as 0.95, conservatively
@@ -2137,6 +2143,48 @@ def gpu_used_mib() -> dict:
         except ValueError:
             pass
     return used
+
+
+# (run by cuda_room_bytes in a process of its own - the setup itself never holds a CUDA context: each NVIDIA device's
+#  free VRAM as CUDA's driver says it with one context held - the engine's own reading at its start, cudaMemGetInfo -
+#  then with a second context beside it, and its total; {PCI bus id: [free, free with two, total]} in bytes)
+CUDA_ROOM_PROBE = r"""
+import ctypes, json, sys
+cu = ctypes.WinDLL("nvcuda.dll") if sys.platform == "win32" else ctypes.CDLL("libcuda.so.1")
+out = {}
+n = ctypes.c_int(0)
+if cu.cuInit(0) == 0 and cu.cuDeviceGetCount(ctypes.byref(n)) == 0:
+    for i in range(n.value):
+        dev, bus, p, c = ctypes.c_int(0), ctypes.create_string_buffer(32), ctypes.c_void_p(), ctypes.c_void_p()
+        if cu.cuDeviceGet(ctypes.byref(dev), i) or cu.cuDeviceGetPCIBusId(bus, 32, dev) or \
+                cu.cuDevicePrimaryCtxRetain(ctypes.byref(p), dev):
+            continue
+        one, two, tot = ctypes.c_size_t(0), ctypes.c_size_t(0), ctypes.c_size_t(0)
+        ok = cu.cuCtxSetCurrent(p) == 0 and cu.cuMemGetInfo_v2(ctypes.byref(one), ctypes.byref(tot)) == 0
+        if ok and cu.cuCtxCreate_v2(ctypes.byref(c), 0, dev) == 0:
+            ok = cu.cuMemGetInfo_v2(ctypes.byref(two), ctypes.byref(tot)) == 0
+            cu.cuCtxDestroy_v2(c)
+        else:
+            ok = False
+        cu.cuCtxSetCurrent(None)
+        cu.cuDevicePrimaryCtxRelease_v2(dev)
+        if ok:
+            out[bus.value.decode("ascii", "replace")] = [one.value, two.value, tot.value]
+print(json.dumps(out))
+"""
+
+
+def cuda_room_bytes() -> dict:
+    """{PCI id (setup.py's _pci_key form): (free, free with a second context, total) in bytes} - what CUDA's driver
+    says of each NVIDIA device's VRAM with a context held (CUDA_ROOM_PROBE, in a process of its own); {} where it
+    cannot be asked (no driver, a failing call, a timeout)."""
+    try:
+        txt = subprocess.run([sys.executable, "-I", "-c", CUDA_ROOM_PROBE], capture_output=True, text=True,
+                             timeout=60).stdout
+        got = json.loads(txt.strip().splitlines()[-1]) if txt.strip() else {}
+        return {S._pci_key(k): tuple(int(x) for x in v) for k, v in got.items() if len(v) == 3}
+    except (OSError, subprocess.SubprocessError, ValueError, TypeError, IndexError):
+        return {}
 
 
 def glm_fit_state_mib(ctx: int, kv: str | None = None) -> float:
@@ -8668,16 +8716,57 @@ def hy4_usable_gib(gpus: list, used: dict | None = None) -> float:
     """The VRAM (GiB) the chosen cards have for the model: their total less what is in use on each now (nvidia-smi;
     at most HY4_FIT_USED_CAP_GIB a card counts - more is a program that can be closed).  No reading: one card is
     taken to drive a desktop (HY4_FIT_DISPLAY_GIB).  AMD cards (nvidia-smi does not read them): their VRAM less what
-    the engines leave the desktop on each (hip_reserve_mib); a unified-memory APU: hy4_apu_gib."""
+    the engines leave the desktop on each (hip_reserve_mib); a unified-memory APU: hy4_apu_gib.
+    A card with "engine_room_gb" (Windows: hy4_engine_room, measured on this PC): no more than that on it - what
+    the engine's CUDA gets there (Windows keeps part of the VRAM from every program, whatever nvidia-smi says)."""
     total = sum(float(g.get("vram_gb") or 0) for g in gpus or [])
     if hy4_amd(gpus):
         if any(hip_unified_memory(g) for g in gpus):
             return hy4_apu_gib(gpus)
         return max(total - len(gpus) * hip_reserve_mib(gpus) / 1024.0, 0.0)
     used = gpu_used_mib() if used is None else used
+    if any(g.get("engine_room_gb") is not None for g in gpus or []):
+        def card(g: dict) -> float:                    # (a card's own: as below, then no more than its room)
+            mine = float(g.get("vram_gb") or 0) - (
+                min(float(used.get(g.get("index"), 0)) / 1024.0, HY4_FIT_USED_CAP_GIB) if used else
+                HY4_FIT_DISPLAY_GIB if g is gpus[0] else 0.0)
+            room = g.get("engine_room_gb")
+            return mine if room is None else min(mine, float(room))
+        return max(sum(card(g) for g in gpus), 0.0)
     if not used:
         return max(total - (HY4_FIT_DISPLAY_GIB if gpus else 0.0), 0.0)
     return max(total - sum(min(float(used.get(g.get("index"), 0)) / 1024.0, HY4_FIT_USED_CAP_GIB) for g in gpus), 0.0)
+
+
+def hy4_engine_room(pc: dict, probe=None) -> dict:
+    """Windows: each chosen NVIDIA card's VRAM as the engine's CUDA gets it, measured now, kept on the card as
+    "engine_room_gb" (hy4_usable_gib counts no more than that there); {index: GiB} of what was measured.  Windows
+    keeps part of every card from the programs on it (the display driver's budget), which nvidia-smi does not show:
+    an RTX 3050 8 GB with 0.1 GB in use gave CUDA 7.0 GB free - the engine plans with that figure (cudaMemGetInfo at
+    its start), the setup's own sums with the card's total less what is in use.  So the room is that figure in the
+    setup's terms: CUDA's free VRAM with a context held, plus what CUDA itself takes beside it - a context (the free
+    VRAM with a second one beside it, the difference) and the part of the card the driver keeps from CUDA
+    (nvidia-smi's total less CUDA's), at least HY4_FIT_CUDA_OWN_GIB: what the sums count for them, which Windows
+    keeps out of sight in its budget.  On Linux the measured part alone is nvidia-smi's total less its used (nothing
+    else is kept there), so only Windows is measured.  Not measured: another OS, AMD, a unified-memory GPU, a card a
+    Maya engine holds now (its own VRAM would be counted as kept: the reading as before), no answer from the driver.
+    probe: the readings (tests; else cuda_room_bytes)."""
+    gpus = (pc or {}).get("gpus") or []
+    if not WIN or (pc or {}).get("backend", "cuda") != "cuda" or not gpus or hy4_amd(gpus) or \
+            any(g.get("unified_memory") for g in gpus):
+        return {}
+    cards = [g for g in gpus if g.get("pci") and g.get("vram_gb")]   # (CUDA's devices are matched by PCI bus)
+    busy = maya_engine_mib() if cards else {}
+    cards = [g for g in cards if g.get("index") not in busy]
+    got = (cuda_room_bytes() if probe is None else probe) if cards else {}
+    out = {}
+    for g in cards:
+        r = got.get(S._pci_key(str(g["pci"])))
+        if r:
+            one, two, tot = (float(x) / 2**30 for x in r)
+            own = max(one - two, 0.0) + max(float(g["vram_gb"]) - tot, 0.0)
+            g["engine_room_gb"] = out[g["index"]] = one + max(own, HY4_FIT_CUDA_OWN_GIB)
+    return out
 
 
 def maya_engine_mib() -> dict:
@@ -9162,7 +9251,7 @@ def hy4_fast_drafting_fit(quant: str, gpus: list, fit: dict, used: dict | None =
     them nor for the MTP block, and with 8-bit rows the drafter's room as the engine counts it
     (hy4_dfly2_need_gib).  "f16_room": True where these sums find the drafter room beside the F16 rows too (the
     default then claims it; the engine, which counts its own free VRAM at every start, may still find none there -
-    an 8 GB card under Windows at 8K: its start line says so - so the faster start is taken there only when asked by
+    its start line says so - so the faster start is taken there only when asked by
     name).  Decided by this PC's own figures (its cards' free VRAM, the size's plan), no card named.  The 8-bit rows
     round the cache, so the answers are worded slightly differently from the default's (F16) - only when asked;
     within that start drafting on and off give the same tokens (the drafter's room is counted either way).  None: no
@@ -9299,6 +9388,12 @@ def write_config_hy4(a, pc: dict, meta: dict, pack: Path, ctx: int, models: Path
         inst["drafter"] = drafter
     if fit.get("fast_drafting"):                       # (the opt-in: --kv q8 in its args; a setup again keeps it)
         inst["fast_drafting"] = True
+    # (Windows: the VRAM the engine's CUDA gets on each card, as measured now - hy4_engine_room - with the card's
+    #  VRAM: the Models page counts it too while the engine holds the card, where it cannot be measured)
+    room = {str(g["index"]): [round(float(g["engine_room_gb"]), 3), float(g["vram_gb"])] for g in pc["gpus"]
+            if g.get("engine_room_gb") is not None and g.get("vram_gb")}
+    if room:
+        inst["engine_room_gb"] = room
     inst.update(extra or {})                         # (draft_choice: auto = both fit, the speed calibration picks)
     sampling, effort = Q.model_defaults({"installer": inst})   # (the model's own, every setup: its card's)
     cfg = {"exe": str(HY4_EXE), "args": args, "cwd": str(ROOT), "tokenizer": str(pack / "tokenizer"),
@@ -9485,6 +9580,13 @@ def set_up_hy4(a, prev: dict) -> Path | None:
     pc = check_pc(a, "hy4")                            # 1
     total, _ = mem_gb()
     vram = sum(g["vram_gb"] for g in pc["gpus"])
+    room = hy4_engine_room(pc)                         # (Windows: what the engine's CUDA gets on each card, measured)
+    if room and len(room) == len(pc["gpus"]) and \
+            sum(room.values()) < hy4_usable_gib([{k: v for k, v in g.items() if k != "engine_room_gb"}
+                                                 for g in pc["gpus"]]):
+        ok(f"VRAM: Windows keeps part of {'these cards' if len(pc['gpus']) > 1 else 'this card'} from the programs "
+           f"on it - the setup counts {sum(room.values()):.1f} of its {vram:.1f} GB, from CUDA's own reading (the "
+           "figure the engine plans with)")
     need = float(hy4_quant_table(quant).get("memory_gb") or 0)
     models = (Path(a.models_dir).expanduser().resolve() if a.models_dir else
               Path(inst["models_dir"]) if inst.get("models_dir") else ROOT.parent / "Maya-data" / "models")

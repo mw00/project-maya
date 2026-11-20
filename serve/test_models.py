@@ -629,6 +629,30 @@ class Settings(unittest.TestCase):
             M._HY4_BEFORE.clear()
             self.used.start()
 
+    def test_hy4_page_counts_the_vram_windows_gives_the_engine(self):
+        """Windows keeps part of every card from the programs on it: the setup measured what the engine's CUDA gets
+        (maya.py's hy4_engine_room, kept in the config with the card's VRAM) and the page counts no more than that -
+        on the card it was measured on; a config without it, or another card now: as before."""
+        import maya
+        p = hy4_cfg(self.d)
+        c = json.loads(p.read_text())
+        c.update(args=["--pack", M.flag(c["args"], "--pack"), "--max-context", "8192", "--chunk", "256",
+                       "--reserve-gb", "0.5", "--vram-experts", "0", "--dfly2"], gpu=[0])
+        c["installer"].update(layout="8gb", hy4_quant="maya-xs", engine_room_gb={"0": [7.48, 8.0]})
+        p.write_text(json.dumps(c, indent=1))
+        cfg = M.read(p)
+        for vram, usable in ((8.0, 7.48), (12.0, 12.0 - 76 / 1024)):    # (76 MiB in use, nvidia-smi's reading)
+            with mock.patch.object(M, "machine_gpus", return_value=[{"index": 0, "name": "x", "vram_gb": vram}]), \
+                    mock.patch.object(M, "hy4_used", side_effect=lambda gpus: {i: 76 for i in gpus}):
+                self.assertAlmostEqual(M.hy4_room(cfg)["usable"], usable)
+                self.assertEqual(M.hy4_cards(cfg, M.machine_gpus())[0].get("engine_room_gb"),
+                                 7.48 if vram == 8.0 else None)
+                fit = M.hy4_refit(cfg)
+                self.assertAlmostEqual(fit["usable"], usable)
+        self.assertEqual(M.hy4_cards({"installer": {"engine_room_gb": {"0": "x", "a": [1, 2]}}},
+                                     [{"index": 0, "vram_gb": 8.0}]), {0: {"index": 0, "vram_gb": 8.0}})
+        self.assertEqual(maya.hy4_usable_gib([{"index": 0, "vram_gb": 8.0}], {0: 1024}), 7.0)
+
     def test_hy4_contexts_that_fit(self):
         """Hy4-Flash's context on the Models page: only what fits the config's cards by its layout's plan, as the
         setup works it out (maya.py's hy4_fit) - the engine has no RAM fallback for these parts and stops at its
