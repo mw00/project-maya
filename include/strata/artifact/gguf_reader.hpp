@@ -345,6 +345,19 @@ public:
     uint32_t version() const { return version_; }
     uint64_t data_start() const { return data_start_; }
     uint64_t file_size() const { return size_; }
+    // Compare the open object used to parse the directory, never a second lookup of path_.
+    bool matches_file_id(const std::string& id) const {
+#ifdef _WIN32
+        BY_HANDLE_FILE_INFORMATION info{};
+        return GetFileInformationByHandle((HANDLE)file_, &info) &&
+               id == std::to_string(info.dwVolumeSerialNumber) + ":" +
+                         std::to_string(info.nFileIndexHigh) + ":" + std::to_string(info.nFileIndexLow);
+#else
+        struct stat st{};
+        return fstat(fd_, &st) == 0 &&
+               id == std::to_string((uint64_t) st.st_dev) + ":" + std::to_string((uint64_t) st.st_ino);
+#endif
+    }
 
     const TensorInfo* find(const std::string& name) const {
         for (const auto& t : tensors_)

@@ -22,6 +22,7 @@
 #include "strata/artifact/gguf_reader.hpp"
 #include "strata/core/glm_arch.hpp"
 #include "strata/core/glm_dflash.hpp"
+#include "strata/core/glm_pack_digest.hpp"
 #include "strata/core/glm_state_layout.hpp"   // glm-dsa B4.1
 #include "strata/kernels/cpu/native_expert.hpp"
 #include "strata/kernels/exl3.hpp"
@@ -238,13 +239,24 @@ public:
     /// Conversation slots: the snapshot (its KDA states) and every DSA cache's rows up to its position, every half,
     /// written to a file; slot_load puts them back as the live state and the snapshot, so a conversation set aside
     /// while others ran continues where it was.  The bytes written, or 0 + err.
-    uint64_t slot_save(const std::string& path, std::string& err);
-    bool slot_load(const std::string& path, int64_t n_pos, std::string& err);
+    uint64_t slot_save(const std::string& path, std::string& err, bool bounded_buffer = false);
+    bool slot_load(const std::string& path, int64_t n_pos, std::string& err, bool bounded_buffer = false);
+    /// Caller-owned seekable binary streams, starting at their current position (no reopen or rewind).
+    /// Output must not be in append mode. Leave stream exceptions disabled for status/error returns;
+    /// exceptions requested by the caller propagate. Save flushes and reports bytes; the owner checks close.
+    uint64_t slot_save(std::ostream& out, std::string& err, bool bounded_buffer = false);
+    bool slot_load(std::istream& in, int64_t n_pos, std::string& err, bool bounded_buffer = false);
     /// The same, in host RAM: the exact bytes the file version writes, in a caller-held buffer whose
     /// lifetime is the conversation's (engine-side: the run's).  Nothing reaches the disk.  The bytes
     /// written, or 0 + err (out of RAM, no snapshot).  slot_load takes the buffer back as the live
     /// state and the snapshot; false + err on a mismatch or a truncated buffer.
     uint64_t slot_save(std::vector<uint8_t>& data, std::string& err);
+    // The Flash v2 wire size and a streaming save of a completed live boundary.
+    // The caller admits the entire state and copy buffer before calling slot_save_live.
+    uint64_t slot_flash_bytes(int64_t n) const;
+    static constexpr size_t slot_live_copy_bytes = 4u << 20;
+    static constexpr size_t slot_file_copy_bytes = 64u << 20;
+    bool slot_save_live(int64_t n, const std::function<bool(const void*, size_t)>& put, std::string& err);
     bool slot_load(const std::vector<uint8_t>& data, int64_t n_pos, std::string& err);
     bool slot_load_prefix(const std::string& path, int64_t n_file, int64_t n_use, std::string& err);   // glm-dsa B14.14
     std::string pcache_identity() const;   // glm-dsa B14.14 (src/core/glm_prompt_cache_model.cu)
@@ -390,6 +402,7 @@ public:
     // (wait_pin / pass_pin); CPU lane setup waits until all have loaded
     struct SplitLoad {
         std::mutex mu;
+        PackShardDigests digests;
         std::condition_variable cv;
         std::vector<bool> passed, pinned;
         int turn = 0, pin_turn = 0;
@@ -437,6 +450,7 @@ public:
         }
     };
     SplitLoad* split_load_ = nullptr;
+    PackShardDigests* pack_digests_ = nullptr;
     bool defer_lane_ = false;
     std::vector<float> hop_;                               // the boundary residual staging buffer
     int* d_tok_ = nullptr;                                 // the sampler's one-int output, on dev_
@@ -458,6 +472,7 @@ public:
     bool pack_ = false;
     struct Shard {
         std::string path;
+        std::string file_id;                         // identity of the descriptor used to create this view
         uint8_t* base = nullptr;
         uint64_t size = 0, data_start = 0;
         int fd = -1;                                   // kept open for posix_fadvise reads (prefetch)
@@ -1188,6 +1203,18 @@ private:
     std::shared_ptr<void> dsa_ref_;
     bool dsa_ref_setup(std::string& err);
     bool step_layers_dsa(int64_t p, std::string& err);
+    // ---- the identity of what this part's pack load mapped (src/core/glm_pack_identity.cu).  The digest covers the
+    // mapped bytes themselves, not a path re-read; slots and prompt-cache entries carry pack_identity().
+    std::string pack_content_identity(PackShardDigests& digests) const;
+    std::string pack_metadata_bytes_; // exact metadata lines parsed by this part, captured during load
+    std::string pack_exl3_metadata_bytes_; // first EXL3 parse, checked against the MTP parse
+    std::string pack_content_digest_;   // frozen while mapped bytes are available, only when persistent caching needs it
+public:
+    static std::string pack_identity_of(const Glm5Model& part);   // the same for this part and every split part
+    /// What a retained slot or prompt-cache entry must match to be restored by this load: the state layout's words,
+    /// the parts' layer ranges and each part's content digest (the GGUF shards, MAYA_GLM_MTP_GGUF's draft block and an
+    /// EXL3 pack's safetensors).  The content digest is empty before a pack load or when persistent caching is off.
+    std::string pack_identity() const;
 };
 
 /// What a part with these layer kinds lends the prompt path for a chunk of T tokens, its prestage buffer aside

@@ -8,7 +8,7 @@ if(TARGET strata_engine)
                                        src/core/glm_prompt_cache_engine.cpp)
   # glm_prompt_cache_engine.cpp (every backend) calls its members; portable runtime calls only (HIP: hip_compat)
   if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
-    target_sources(strata_engine PRIVATE src/core/glm_prompt_cache_model.cu)
+    target_sources(strata_engine PRIVATE src/core/glm_prompt_cache_model.cu src/core/glm_pack_identity.cu)
   endif()
 endif()
 
