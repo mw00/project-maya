@@ -201,6 +201,22 @@ int main() {
         CHECK(hy4::chunk_pick(r, kCands, 1024) == 2048);
         CHECK(r.tried == "1024 4096 2048 ");
     }
+    {   // a group that holds every expert at the base and a part of them (the CPU lane's the others) above it: a chunk
+        //  never costs an expert its place in the group's VRAM; a group that holds a part at the base takes the chunk
+        struct Lane {
+            int all_up_to;
+            hy4::ChunkTry operator()(int chunk) {
+                hy4::ChunkTry t;
+                t.ok = true;
+                t.tp = 4;
+                t.lane = chunk > all_up_to;
+                return t;
+            }
+        };
+        Lane full{2048}, part{0};
+        CHECK(hy4::chunk_pick(full, kCands, 1024) == 2048);
+        CHECK(hy4::chunk_pick(part, kCands, 1024) == 4096);
+    }
     {   // one card: the largest chunk the model's own parts leave room for
         Rig r{9.0, 0, 4.6, 0.83, 1.15, 1, 1 << 30, 1 << 30, ""};
         CHECK(hy4::chunk_pick(r, kCands, 1024) == 2048);

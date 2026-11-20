@@ -2439,9 +2439,15 @@ profile's counts), and an INFO line says so. A layer's two partial sums (its att
 adds them in a fixed order, so every GPU's copy of the model's state stays the same bit for bit. The main GPU - the
 fastest memory, measured at the load (`--main-gpu` names another) - holds the output head and the MTP block; where it
 is not of the group's kind it also computes a share of every layer's routed experts, by its memory's speed against
-the others' and as its VRAM allows, from the routing the first member hands it. Where the group cannot hold the
-model (or the context's caches - every member keeps a copy), the layer split runs instead, and an INFO line says
-why.
+the others' and as its VRAM allows, from the routing the first member hands it. Where the group cannot hold every
+routed expert, each of its GPUs keeps as many of every layer's experts as its VRAM takes (unsplit, the most routed
+first by the profile's counts, so a GPU with less room holds fewer) and the others go the CPU lane's way: for a token
+the first member's thread computes them on the CPU, and for a prompt chunk of 256 rows or more every member sends its
+share of them over PCIe to its own GPU, once for both halves of the chunk. `--tp auto` takes this where the group
+holds half of the experts or more, `--tp N` wherever the members' own parts fit; the cache is then in 8-bit rows
+where `--kv auto` allows and the MTP block's pass runs in line. With `HY4_HOT=1` such a group places its experts at
+the start by the routing its earlier answers left in the file and trades none during answers. Where the group cannot hold the model's own parts
+and the context's caches (every member keeps a copy), the layer split runs instead, and an INFO line says why.
 
 **Where the experts live.** All of them in VRAM where they fit (about 108 GB with Q4_K_M), on tensor parallel or a
 layer split over the GPUs (the head and the MTP block on the main GPU either way). Where they do not, each layer keeps the same share of its experts in VRAM and the others are computed on
