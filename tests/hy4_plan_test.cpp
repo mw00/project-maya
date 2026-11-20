@@ -301,7 +301,7 @@ int main() {
         const std::vector<int> t0 = {0, 1, -1, -1, 2, -1, -1, -1}, t1 = {-1, 0, 1, -1, -1, 2, -1, -1},
                                t2 = {-1, -1, 0, 1, -1, -1, 2, -1}, hp = {-1, -1, -1, 0, -1, -1, 1, 2};
         CHECK(hy4::experts_held(8, {&t0, &t1, &t2, &hp}) == 8);
-        CHECK(hy4::experts_held(8, {&t0, &t1, &t2}) == 6);
+        CHECK(hy4::experts_held(8, {&t0, &t1, &t2}) == 7);   // (expert 7: the helper's alone)
         // the old count's case: the head's placeholder layer (no map) holds none - the members hold them all
         const std::vector<int> none;
         CHECK(hy4::experts_held(8, {&none}) == 0);
