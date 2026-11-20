@@ -5062,6 +5062,46 @@ def q4x_verdict(log_text: str) -> str | None:
 
 Q4X_ANSWERS = 12                                   # (--speed-calibration's CPU lane check: answers at most for a verdict)
 Q4X_BUILD_WAIT_S = 120                             # (... and the wait for the copies, made between answers)
+ROUTE_PROMPTS = 12                                 # (... then long prompts at most for the prompt route's rates)
+
+
+def route_state(log_text: str) -> str | None:
+    """maya-hy4's prompt route in its log: "measuring" (its prompt chunks still take the GPU stream and the CPU lane in
+    turns), "measured", "pinned" / "remembered", or None - every routed expert in VRAM, no route to choose."""
+    if "prompt route: the CPU lane" in log_text:
+        return "measured"
+    if "prompt route: pinned" in log_text:
+        return "pinned"
+    if "prompt route: by the rates measured" in log_text:
+        return "remembered"
+    return "measuring" if "prompt route: measured on this PC" in log_text else None
+
+
+def route_forget() -> None:
+    """--speed-calibration: maya-hy4's prompt route rates measured on this PC are dropped (data/hy4-prompt-route.txt),
+    so the engine measures them again - in the CPU lane check's run below, else while the next start reads prompts."""
+    path = ROOT / "data" / "hy4-prompt-route.txt"
+    try:
+        path.unlink()
+        ok("the prompt route's rates (GPU stream or CPU lane for a prompt's experts outside VRAM) are measured again")
+    except FileNotFoundError:
+        pass
+    except OSError as e:
+        warn(f"{path} could not be removed ({e}): delete it by hand to measure the prompt route again")
+
+
+def route_prompts(tdir: Path, n: int) -> list[str]:
+    """--speed-calibration's prompts for the prompt route's rates: long and each its own (no prefix the engine reuses),
+    from this install's docs - a few prompt chunks each."""
+    text = ""
+    for name in ("docs/SETTINGS.md", "README.md", "CHANGELOG.md"):
+        p = ROOT / name
+        if p.exists():
+            text += p.read_text(encoding="utf-8", errors="replace")
+    chat = bench_chat("hy4", tdir)
+    step = 6000
+    return [chat(f"Summarise this in three sentences:\n\n{text[i * step:(i + 1) * step]}") for i in range(n)
+            if len(text) >= (i + 1) * step]
 
 
 def q4x_calibration(cfg_path: Path, why: str = "") -> bool | None:
@@ -5089,6 +5129,7 @@ def q4x_calibration(cfg_path: Path, why: str = "") -> bool | None:
     env = SV.child_env(cfg)
     env[HY4_Q4X_ENV] = "2"
     env["HY4_Q4X_MEASURE"] = "1"                       # (measured again: the verdict remembered before is not used)
+    env["HY4_ROUTE_MEASURE"] = "1"                     # (the prompt route's rates too, on long prompts after the answers)
     say()
     say(f"  Checking the CPU lane's 4-bit expert copies on this PC{f' ({why})' if why else ''}: a few answers, the model")
     say("  loads once (a few minutes) ...")
@@ -5106,8 +5147,8 @@ def q4x_calibration(cfg_path: Path, why: str = "") -> bool | None:
             warn(f"the CPU lane check could not start the engine ({e}): its copies are measured at each start instead")
             return None
 
-        def gen(n_new: int) -> bool:
-            p.stdin.write(f"GEN {n_new} temperature=0 " + ",".join(map(str, ids)) + "\n")
+        def gen(n_new: int, prompt: list[int] | None = None) -> bool:
+            p.stdin.write(f"GEN {n_new} temperature=0 " + ",".join(map(str, prompt or ids)) + "\n")
             p.stdin.flush()
             for line in p.stdout:
                 if line.startswith(("DONE", "ERR")):
@@ -5130,6 +5171,14 @@ def q4x_calibration(cfg_path: Path, why: str = "") -> bool | None:
                             break
                         done = gen(256)
                         time.sleep(2)                  # (the verdict's line reaches the log)
+                    # (the prompt route's rates: long prompts, each read in chunks whose CPU lane layers take the GPU
+                    #  stream and the lane in turns, until two windows of times agree)
+                    tok = ST.Tokenizer.from_dir(tdir)
+                    for text in route_prompts(tdir, ROUTE_PROMPTS):
+                        if not done or route_state(said()) != "measuring":
+                            break
+                        done = gen(1, tok.encode(text, parse_special=True))
+                        time.sleep(1)
                     break
             p.stdin.write("QUIT\n")
             p.stdin.flush()
@@ -5137,6 +5186,13 @@ def q4x_calibration(cfg_path: Path, why: str = "") -> bool | None:
         except (OSError, ValueError, subprocess.TimeoutExpired):
             p.kill()
     verdict = q4x_verdict(log_path.read_text(encoding="utf-8", errors="replace"))
+    rs = route_state(said())
+    if rs == "measured":
+        ok("the prompt route's rates (GPU stream or CPU lane for a prompt's experts outside VRAM) measured on this PC: "
+           "the same prompt now takes the same route at every start")
+    elif rs == "measuring":
+        warn("the prompt route's rates did not settle in this check: the engine measures them while the next start "
+             "reads prompts, and remembers them")
     if not done or verdict == "unmeasured":
         warn(f"the CPU lane check did not finish ({log_path.name} says why): the engine measures its copies while it "
              f"answers instead, once its experts are warm, and remembers it ({ME} --speed-calibration tries again)")
@@ -5191,6 +5247,7 @@ def speed_calibration(cfg_path: Path, why: str = "") -> bool:
     if config_family(cfg) == "qwen":                   # (CYBER-FROST: its MTP drafter or none)
         return bool(qwen_draft_calibration(cfg_path) is not None)
     if config_family(cfg) == "hy4":
+        route_forget()                                 # (the prompt route's rates: measured again too)
         if hy4_both_drafters(cfg):                     # (a Maya size with both drafters: which is faster here)
             return speed_calibration_hy4(cfg_path, cfg, why)
         if Q.config_key(cfg) == HY4_Q4:                # (Tencent's own Q4_K_M: the one set with the MTP block)

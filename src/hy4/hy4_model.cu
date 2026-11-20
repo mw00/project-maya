@@ -476,7 +476,8 @@ struct Model::Impl {
     float *h_w = nullptr, *h_lat = nullptr, *h_cpu = nullptr;
     uint8_t* h_stage = nullptr;   // (pinned: a pass of streamed experts, kStage blobs)
     const double ev_poll_s = (double) lane_waits().ev_poll_us * 1e-6;   // (0: asleep on the event at once)
-    double cpu_us_et = 15.0;      // the CPU lane's microseconds an expert-token on a prompt chunk (measured, EMA)
+    int route_side = -1;          // (a prompt chunk's layer timed for the route's rates: 0 lane, 1 stream; route_add)
+    double route_amount = 0;      // (... its lane entries / its streamed MB)
     // the expert profile: uint32 [n_layer][n_expert] routings - read (Options::profile: the most routed stay in VRAM),
     // counted where the routes reach the host (the CPU lane's layers, every layer with Options::profile_out) and
     // written back (with the read ones) by save_profile
@@ -3413,6 +3414,7 @@ struct Model::Impl {
             }
         }
         if (lane) q4x_start();
+        if (lane) route_start();
         st.experts_vram = n_res;
         st.experts_all = n_all;
         // peer access between neighbours (a hop a GPU boundary)
@@ -4594,6 +4596,260 @@ struct Model::Impl {
             if (l.cex.q4x) l.cex.q4x.reset();   // (no lane call runs now: this is its thread)
         q4x_bytes.store(0);
     }
+
+    // A prompt chunk's experts outside VRAM (ffn_core) are streamed to the GPU or run on the CPU lane.  The two routes
+    // sum a token's experts in another order, so the choice may not follow the moment's timings: a start would not
+    // give the tokens of the start before.  The rule is a fixed one of two rates this PC measured once - the lane's
+    // microseconds an expert-token, each GPU's streaming microseconds a MB - a layer's chunk streamed where its unique
+    // experts' MB x the stream rate < its lane entries x the lane rate.  The rates are remembered (HY4_ROUTE_FILE - the
+    // server's data folder - else beside --profile; a line a PC, its GPUs and driver, the model, the layout - every
+    // layer's GPU and VRAM experts, the chunk, tensor parallel - the lane kernels' build and whether the lane's 4-bit
+    // copies are in use), so the same prompt takes the same routes start after start.  Not yet measured here (or
+    // HY4_ROUTE_MEASURE=1 - maya --speed-calibration): the chunks' lane layers take the two routes in turns, each side
+    // timed once the lane's experts are warm (the placer done, the 4-bit copies' verdict in), in windows of the lane
+    // layers' count of calls a side, until two windows in a row agree within 8 % on each GPU's break-even (lane
+    // entries an expert at which both take as long) - then the rates hold for the rest of the run and are written.
+    // Not settled after kRouteWindows windows: they hold for this run only, measured again at the next start.
+    // HY4_ROUTE=stream|lane pins the route (HY4_STREAM=1 / 0 the same): two builds compared token for token.
+    static constexpr int kRouteWindows = 8;
+    struct Route {
+        int mode = 0;                    // 0 measuring (turns), 1 the rates fixed, 2 pinned stream, 3 pinned lane
+        bool any = false;                // (a layer whose prompt chunks choose: a CPU lane layer, not shared out)
+        std::string file, key, desc;     // (the memo's file and this PC's line: empty file, not remembered)
+        double lane_us = 15.0;           // the lane's microseconds an expert-token
+        std::vector<double> str_us;      // [GPU] streaming microseconds a MB (0: no such layer on it)
+        std::vector<int> layers;         // [GPU] its choosing layers
+        // the turns: timed calls a side (lane: entries and seconds; stream: MB and seconds a GPU), the window before
+        std::vector<int64_t> turn;       // [layer] its calls so far
+        int64_t c_lane = 0, wait_calls = 0;
+        double s_lane = 0, n_ent = 0;
+        std::vector<int64_t> c_str;
+        std::vector<double> s_str, mb_str, prev_be;
+        double prev_lane = 0;
+        std::vector<double> prev_str;
+        int windows = 0;
+    } route;
+    // the lane's prompt calls run on 4-bit copies (made or being made, in use: kept or forced - not on trial)
+    bool q4x_in_use() const {
+        if (lane_count().q4x_mode.load(std::memory_order_relaxed) != 1) return false;
+        for (const Layer& l : L)
+            if (l.cex.q4x) return true;
+        return false;
+    }
+    // this PC's line for the route: the GPUs (name, VRAM, PCI slot) and driver, the model's shape, the layout
+    std::string route_key(bool q4x_on) {
+        std::string d = "Hy4 prompt route v1|";
+        char buf[256];
+        int drv = 0;
+        (void) cudaDriverGetVersion(&drv);
+        for (const Gpu& gp : G) {
+            cudaDeviceProp pr{};
+            if (cudaGetDeviceProperties(&pr, gp.dev) != cudaSuccess) continue;
+            std::snprintf(buf, sizeof buf, "%s %.0f GB %02x:%02x|", pr.name, (double) pr.totalGlobalMem / 1e9,
+                          (unsigned) pr.pciBusID, (unsigned) pr.pciDeviceID);
+            d += buf;
+        }
+        (void) cudaGetLastError();
+        uint64_t h = 1469598103934665603ull;   // (FNV-1a over every layer's GPU and VRAM experts)
+        auto mix = [&](int64_t v) {
+            for (int b = 0; b < 8; ++b, v >>= 8) h = (h ^ (uint64_t) (v & 255)) * 1099511628211ull;
+        };
+        size_t blob = 0;
+        int n_lane_l = 0;
+        for (const Layer& l : lane_layers()) {
+            mix(l.il), mix(l.gpu), mix(l.n_res), mix(l.tpm);
+            if (l.partial()) ++n_lane_l, blob = std::max(blob, l.blob);
+        }
+        std::snprintf(buf, sizeof buf, "driver %d|%d layers x %d experts, blob %zu|layout %d lane layers, chunk %d, tp %d, "
+                      "%016llx|4-bit copies %s", drv, g.n_layer, g.n_expert, blob, n_lane_l, Tc, std::max(1, tp),
+                      (unsigned long long) h, q4x_on ? "on" : "off");
+        d += buf;
+        return q4x_memo_key(d, lane->threads() + 1);
+    }
+    // the route's line in route.file for `key` (false: none, or one it cannot read)
+    bool route_get(const std::string& key, double& lane_us, std::vector<double>& str_us, std::string& date) {
+        std::ifstream f(route.file);
+        bool found = false;
+        for (std::string line; f && std::getline(f, line);) {
+            if (!line.empty() && line.back() == '\r') line.pop_back();
+            if (line.empty() || line[0] == '#') continue;
+            std::vector<std::string> v;   // key, lane us, GPU stream us a MB (a,b,..), date
+            size_t a = 0;
+            for (size_t t; (t = line.find('\t', a)) != std::string::npos; a = t + 1) v.push_back(line.substr(a, t - a));
+            v.push_back(line.substr(a));
+            if (v.size() < 4 || v[0] != key) continue;
+            std::vector<double> s;
+            for (size_t p = 0; p <= v[2].size();) {
+                const size_t c = std::min(v[2].find(',', p), v[2].size());
+                s.push_back(std::atof(v[2].substr(p, c - p).c_str()));
+                p = c + 1;
+            }
+            const double lu = std::atof(v[1].c_str());
+            if (lu <= 0 || s.size() != G.size()) continue;
+            lane_us = lu, str_us = s, date = v[3], found = true;
+        }
+        return found;
+    }
+    bool route_put() {
+        if (route.file.empty()) return false;
+        std::vector<std::string> keep;
+        {
+            std::ifstream f(route.file);
+            for (std::string line; f && std::getline(f, line);) {
+                if (!line.empty() && line.back() == '\r') line.pop_back();
+                if (line.empty() || line[0] == '#' || line.substr(0, line.find('\t')) == route.key) continue;
+                keep.push_back(line);
+            }
+        }
+        const std::time_t now = std::time(nullptr);
+        char day[16] = "?", num[48];
+        std::tm tmv{};
+#if defined(_WIN32)
+        if (localtime_s(&tmv, &now) == 0) std::strftime(day, sizeof day, "%Y-%m-%d", &tmv);
+#else
+        if (localtime_r(&now, &tmv)) std::strftime(day, sizeof day, "%Y-%m-%d", &tmv);
+#endif
+        std::snprintf(num, sizeof num, "\t%.4f\t", route.lane_us);
+        std::string line = route.key + num;
+        for (size_t gi = 0; gi < route.str_us.size(); ++gi) {
+            std::snprintf(num, sizeof num, "%s%.4f", gi ? "," : "", route.str_us[gi]);
+            line += num;
+        }
+        keep.push_back(line + "\t" + day);
+        const std::string tmp = route.file + ".new";
+        {
+            std::ofstream o(tmp, std::ios::trunc);
+            if (!o) return false;
+            o << "# maya-hy4: the prompt route's rates, measured on this PC - a line a PC, GPUs, model, layout and lane\n"
+                 "# kernels (key, the CPU lane's us an expert-token, each GPU's streaming us a MB, date); delete a line,\n"
+                 "# or run maya --speed-calibration, to measure again\n";
+            for (const std::string& l : keep) o << l << "\n";
+            if (!o.flush()) return false;
+        }
+        std::remove(route.file.c_str());   // (Windows: rename does not replace)
+        return std::rename(tmp.c_str(), route.file.c_str()) == 0;
+    }
+    void route_start() {
+        Route& r = route;
+        r.str_us.assign(G.size(), 0.0);
+        r.layers.assign(G.size(), 0);
+        for (const Layer& l : lane_layers())
+            if (l.partial() && l.gpu >= 0 && (size_t) l.gpu < G.size()) {
+                r.any = true;
+                ++r.layers[(size_t) l.gpu];
+            }
+        if (!r.any) return;
+        r.turn.assign((size_t) g.n_layer + 2, 0);
+        r.c_str.assign(G.size(), 0);
+        r.s_str.assign(G.size(), 0.0);
+        r.mb_str.assign(G.size(), 0.0);
+        r.prev_str.assign(G.size(), 0.0);
+        r.prev_be.assign(G.size(), 0.0);
+        const char* pin = std::getenv("HY4_ROUTE");
+        const char* fs = std::getenv("HY4_STREAM");
+        if ((pin && (pin[0] == 's' || pin[0] == 'l')) || (fs && (fs[0] == '1' || fs[0] == '0'))) {
+            const bool s = pin && (pin[0] == 's' || pin[0] == 'l') ? pin[0] == 's' : fs[0] == '1';
+            r.mode = s ? 2 : 3;
+            info.push_back(std::string("INFO prompt route: pinned - a chunk's experts outside VRAM ") +
+                           (s ? "streamed to the GPU" : "on the CPU lane") + " (" + (pin ? "HY4_ROUTE" : "HY4_STREAM") + ")");
+            return;
+        }
+        // (the file: HY4_ROUTE_FILE, else beside the 4-bit copies' verdict - HY4_Q4X_FILE - else beside --profile)
+        const char* rf = std::getenv("HY4_ROUTE_FILE");
+        const char* qf = std::getenv("HY4_Q4X_FILE");
+        const std::string by = qf && *qf ? std::string(qf) : o.profile;
+        const size_t sl = by.find_last_of("/\\");
+        r.file = rf && *rf ? std::string(rf)
+                 : by.empty() ? std::string()
+                              : (sl == std::string::npos ? std::string(".") : by.substr(0, sl)) + "/hy4-prompt-route.txt";
+        const char* again = std::getenv("HY4_ROUTE_MEASURE");
+        const bool q4x_open = q4x_adaptive && !q4x_decided;   // (its verdict still to come: measured with it in)
+        std::string date;
+        if (!r.file.empty() && !(again && std::atoi(again) != 0) && !q4x_open) {
+            r.key = route_key(q4x_in_use());
+            if (route_get(r.key, r.lane_us, r.str_us, date)) {
+                r.mode = 1;
+                std::string s = "INFO prompt route: by the rates measured on this PC (" + date + ": the CPU lane ";
+                char buf[96];
+                std::snprintf(buf, sizeof buf, "%.2f us an expert-token", r.lane_us);
+                s += buf;
+                for (size_t gi = 0; gi < G.size(); ++gi)
+                    if (r.layers[gi] > 0) {
+                        std::snprintf(buf, sizeof buf, ", GPU %zu streams %.0f us a MB", gi, r.str_us[gi]);
+                        s += buf;
+                    }
+                info.push_back(s + "; " + r.file + ")");
+                return;
+            }
+        }
+        r.mode = 0;
+        info.push_back(std::string("INFO prompt route: measured on this PC while prompts are read (a chunk's experts "
+                                   "outside VRAM streamed to the GPU or on the CPU lane, in turns, until the times "
+                                   "settle), then ") + (r.file.empty() ? "kept for this run (no data folder named)"
+                                                                       : "remembered in " + r.file));
+    }
+    // measuring: this layer's side for this chunk (1 stream, 0 lane) - neighbouring layers and a layer's next chunk
+    // take the other; timed: the lane's experts warm and the 4-bit copies' verdict in (a long wait: timed anyway)
+    int route_turn(const Layer& l, bool& timed) {
+        Route& r = route;
+        const int side = (int) ((r.turn[(size_t) l.il]++ + l.il) & 1);
+        const bool q4x_open = q4x_adaptive && !q4x_decided;
+        timed = !placing.load(std::memory_order_relaxed) && (!q4x_open || r.wait_calls > 64LL * g.n_layer);
+        if (!timed) ++r.wait_calls;
+        return side;
+    }
+    void route_add(const Layer& l, int side, double secs, double amount) {
+        Route& r = route;
+        if (side == 0) {
+            r.s_lane += secs, r.n_ent += amount, ++r.c_lane;
+        } else {
+            r.s_str[(size_t) l.gpu] += secs, r.mb_str[(size_t) l.gpu] += amount, ++r.c_str[(size_t) l.gpu];
+        }
+        int n_l = 0;
+        for (int c : r.layers) n_l += c;
+        if (r.c_lane < std::max(4, n_l / 2) || r.n_ent <= 0) return;
+        for (size_t gi = 0; gi < G.size(); ++gi)
+            if (r.layers[gi] > 0 && (r.c_str[gi] < std::max(2, r.layers[gi] / 2) || r.mb_str[gi] <= 0)) return;
+        const double lu = r.s_lane * 1e6 / r.n_ent;
+        bool steady = r.windows > 0;
+        std::vector<double> su(G.size(), 0.0), be(G.size(), 0.0);
+        for (size_t gi = 0; gi < G.size(); ++gi) {
+            if (r.layers[gi] <= 0) continue;
+            su[gi] = r.s_str[gi] * 1e6 / r.mb_str[gi];
+            be[gi] = su[gi] / lu;   // (lane entries a MB of unique experts at which both routes take as long)
+            steady = steady && std::fabs(be[gi] - r.prev_be[gi]) <= 0.08 * r.prev_be[gi];
+        }
+        ++r.windows;
+        if (!steady && r.windows < kRouteWindows) {   // (the next window: these times stand for the one before)
+            r.prev_lane = lu, r.prev_str = su, r.prev_be = be;
+            r.c_lane = 0, r.s_lane = 0, r.n_ent = 0;
+            for (size_t gi = 0; gi < G.size(); ++gi) r.c_str[gi] = 0, r.s_str[gi] = 0, r.mb_str[gi] = 0;
+            return;
+        }
+        r.lane_us = steady ? 0.5 * (lu + r.prev_lane) : lu;
+        for (size_t gi = 0; gi < G.size(); ++gi) r.str_us[gi] = steady ? 0.5 * (su[gi] + r.prev_str[gi]) : su[gi];
+        r.mode = 1;
+        std::string note;
+        if (!steady) {
+            note = "; the times did not settle: kept for this run, measured again at the next start";
+        } else if (r.file.empty()) {
+            note = "; kept for this run (no data folder named)";
+        } else {
+            r.key = route_key(q4x_in_use());
+            note = route_put() ? "; remembered for this PC in " + r.file
+                               : "; kept for this run (" + r.file + " could not be written)";
+        }
+        std::string s;
+        char buf[128];
+        for (size_t gi = 0; gi < G.size(); ++gi)
+            if (r.layers[gi] > 0) {
+                std::snprintf(buf, sizeof buf, ", GPU %zu streams %.0f us a MB (break-even %.1f entries a MB)", gi,
+                              r.str_us[gi], r.str_us[gi] / r.lane_us);
+                s += buf;
+            }
+        std::fprintf(stderr, "maya-hy4: prompt route: the CPU lane %.2f us an expert-token%s (%d windows, the last %d "
+                     "timed in)%s\n", r.lane_us, s.c_str(), r.windows, steady ? 2 : 1, note.c_str());
+    }
     void count_routes(int il, int T) {
         std::lock_guard<std::mutex> lk(cnt_mu);   // (q4x_builder copies the counts)
         if (prof_cnt.empty()) prof_cnt.assign((size_t) g.n_layer * g.n_expert, 0);
@@ -5014,12 +5270,13 @@ struct Model::Impl {
             const bool share = l.tpm >= 0 && !l.stream_e.empty() && T >= kTpStream;
             if (T > W) {
                 ok = ok && experts_sets(l, gp, T, err, slot);
-                // a prompt chunk's experts not in VRAM: streamed to the GPU, or the CPU lane - whichever the measured
-                // rates say is faster for this many experts and entries (a PC's PCIe against its CPU)
+                // a prompt chunk's experts not in VRAM: streamed to the GPU, or the CPU lane - by the rates this PC
+                // measured once (route_start: remembered, or measured now in turns), so the same prompt takes the
+                // same routes from start to start (the two sum a token's experts in another order)
                 if (share) {   // (tensor parallel with the CPU lane: every member its share, to its own GPU)
                     ok = ok && experts_streamed(l, gp, T, err, true);
                     streamed = true;
-                } else if (lane_on) {
+                } else if (lane_on && route.any) {
                     int n_ent = 0;
                     std::vector<char> used((size_t) g.n_expert, 0);
                     for (int i = 0; i < T * nu; ++i)
@@ -5029,23 +5286,27 @@ struct Model::Impl {
                         }
                     int n_u = 0;
                     for (char c : used) n_u += c;
-                    const double est_cpu = n_ent * cpu_us_et * 1e-3;   // (ms)
-                    const double est_stream = (double) n_u * l.blob * (1.0 / (gp.h2d_gbs * 1e6) + 1.0 / (copy_gbs * 1e6));
-                    // (HY4_ROUTE=stream|lane: the choice pinned.  The two routes sum a token's experts in another
-                    //  order, so a start that picks by its timings is not the same from run to run in the last bit;
-                    //  pinned, two runs - and two builds - can be compared token for token.  HY4_STREAM=1 / 0: the
-                    //  same, always / never streamed)
-                    static const char* const route = std::getenv("HY4_ROUTE");
-                    static const char* const fs = std::getenv("HY4_STREAM");
-                    const bool pinned = route && (route[0] == 's' || route[0] == 'l');
-                    if (pinned ? route[0] == 's' : fs ? fs[0] == '1' : est_stream < est_cpu) {
+                    const double mb = (double) n_u * l.blob * 1e-6;
+                    bool stream = false;
+                    route_side = -1;
+                    if (route.mode == 2 || route.mode == 3) {
+                        stream = route.mode == 2;
+                    } else if (route.mode == 1) {
+                        const size_t gi = l.gpu >= 0 && (size_t) l.gpu < route.str_us.size() ? (size_t) l.gpu : 0;
+                        stream = route.str_us[gi] > 0 && mb * route.str_us[gi] < (double) n_ent * route.lane_us;
+                    } else {
+                        bool timed = false;
+                        const int side = route_turn(l, timed);
+                        stream = side == 1;
+                        if (timed && n_ent > 0) route_side = side, route_amount = side ? mb : (double) n_ent;
+                    }
+                    if (stream) {
+                        if (route_side == 1) CK(cudaStreamSynchronize(s));   // (timed alone: the GPU's queue done)
                         const double ts = now_s();
-                        const double c0 = st.stream_ms;
                         ok = ok && experts_streamed(l, gp, T, err);
                         streamed = true;
-                        const double copy_ms = st.stream_ms - c0;
-                        if (copy_ms > 0.1) copy_gbs = 0.8 * copy_gbs + 0.2 * ((double) n_u * l.blob / 1e6 / copy_ms);
-                        (void) ts;
+                        if (route_side == 1 && ok) route_add(l, 1, now_s() - ts, route_amount);
+                        route_side = -1;
                     }
                 }
             } else {
@@ -5066,8 +5327,8 @@ struct Model::Impl {
                 const double ms = (now_s() - tc) * 1e3;
                 st.cpu_ms += ms;
                 if (prof) prof_acc[T > W ? " lane: the CPU's experts (prompt)" : " lane: the CPU's experts (token)"] += ms * 1e-3;
-                if (T > W && !lane_entries.empty())   // (the prompt chunks' rate: what the route choice weighs)
-                    cpu_us_et = 0.8 * cpu_us_et + 0.2 * (ms * 1e3 / (double) lane_entries.size());
+                if (T > W && route_side == 0) route_add(l, 0, ms * 1e-3, route_amount);   // (the route's turns)
+                route_side = -1;
                 st.cpu_experts += (int64_t) lane_entries.size();
                 q4x_trial();
                 CK(cudaMemcpyAsync(gp.cpo, h_cpu, sizeof(float) * T * lat, cudaMemcpyHostToDevice, s));

@@ -64,6 +64,7 @@ ENGINE_VISION = (ds4_vision.Vision, mm3_vision.Vision)   # the engines that run 
 #                                                          (hy4_vision.Vision is an mm3_vision.Vision)
 HY4_TEXT_ONLY = "Hy4-Flash with its pictures off"         # (no vision tower loaded: the errors' name for it)
 HY4_LANE_FILE = ROOT / "data" / "hy4-cpu-lane.txt"        # (maya-hy4's 4-bit copies' verdict on this PC: child_env)
+HY4_ROUTE_FILE = ROOT / "data" / "hy4-prompt-route.txt"   # (... its prompt route's rates measured on this PC: child_env)
 # (... and what stands for a picture in a tool result then: the agent's turn goes on)
 HY4_PICTURE_NOTE = "[a picture was here; pictures are off on this server, so it was not read]"
 
@@ -2228,6 +2229,9 @@ def child_env(cfg: dict) -> dict:
     # lane kernels (maya --speed-calibration measures again)
     if models.family(cfg) == "hy4":
         env.setdefault("HY4_Q4X_FILE", str(HY4_LANE_FILE))
+        # (... and the prompt route's rates - a chunk's experts outside VRAM streamed to the GPU or on the CPU lane -
+        #  measured once on this PC, so the same prompt takes the same routes from start to start)
+        env.setdefault("HY4_ROUTE_FILE", str(HY4_ROUTE_FILE))
     dirs = [d for d in cfg.get("lib_dirs") or [] if Path(d).is_dir()]
     if dirs:
         var = "PATH" if os.name == "nt" else "LD_LIBRARY_PATH"
