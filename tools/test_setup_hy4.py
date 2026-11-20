@@ -1637,6 +1637,29 @@ class Drafts(unittest.TestCase):
         if "--mtp" not in c["args"]:
             self.assertIn("the DFly2 drafter runs on one GPU for now (this PC: 2)", text)
 
+    def test_dfly2_where_the_engine_loads_it(self):
+        # the engine loads the drafter only where its room changes nothing but the experts' places: the setup counts
+        # it on the fit's figure with a doubled chunk's buffers, and with the margin where that figure is measured -
+        # an 8 GB card driving a desktop at 8K (the engine: 8-bit rows beside it) does not take it
+        g, q, card8 = maya.hy4_dfly2_gib("maya-xs"), maya.hy4_quant_table("maya-xs"), [{"index": 0, "vram_gb": 8.0}]
+        f8 = maya.hy4_fit(q, card8, 8192, used={0: 552}, ram_gb=64)
+        self.assertEqual((f8["layout"], f8["kv"]), ("8gb", "f16"))
+        self.assertAlmostEqual(maya.hy4_dfly2_need_gib("maya-xs", f8), f8["need"] + g + maya.HY4_FIT_MARGIN_GIB)
+        self.assertGreater(maya.hy4_dfly2_need_gib("maya-xs", f8), f8["usable"])
+        f5 = maya.hy4_fit(q, card8, 5120, used={0: 552}, ram_gb=64)   # (a context the plan does not list)
+        up = maya.HY4_CHUNK_UP_GIB if f5["chunk"] > maya.hy4_layouts(q)["8gb"]["plan"]["chunk"] else 0.0
+        self.assertAlmostEqual(maya.hy4_dfly2_need_gib("maya-xs", f5), f5["need"] + up + g)
+        self.assertAlmostEqual(maya.hy4_dfly2_need_gib("maya-xs", dict(f8, chunk=2 * f8["chunk"])),
+                               f8["need"] + maya.HY4_CHUNK_UP_GIB + g + maya.HY4_FIT_MARGIN_GIB)
+        # at 4K the larger chunk fits, the drafter beside it does not, beside the plan's chunk it does: with the
+        # drafter counted the chunk stays the plan's (the drafts are the larger gain), without it it doubles
+        base = maya.hy4_layouts(q)["8gb"]["plan"]["chunk"]
+        self.assertEqual(maya.hy4_fit(q, card8, 4096, used={0: 552}, ram_gb=64)["chunk"], 2 * base)
+        f4 = maya.hy4_fit(q, card8, 4096, used={0: 552}, ram_gb=64, drafter=g)
+        self.assertEqual(f4["chunk"], base)
+        self.assertLessEqual(maya.hy4_dfly2_need_gib("maya-xs", f4), f4["usable"])
+        self.assertEqual(maya.hy4_fit(q, card8, 4096, used={0: 0}, ram_gb=64, drafter=g)["chunk"], base)
+
     def test_the_file(self):
         # not uploaded yet and not in the folder: no download, said; uploaded: asked from Maya's repo at its commit,
         # under its name there, saved under the name the pack reads

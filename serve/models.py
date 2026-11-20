@@ -1074,11 +1074,13 @@ def hy4_refit(new: dict) -> dict | None:
         maya, plan = _hy4_plan(new)
         if not plan.get("need_gib"):
             return None
+        dfly = "--dfly2" in [str(x) for x in args]     # (the DFly2 drafter's room first, as the setup's fit)
         fit = maya.hy4_fit(maya.hy4_quant_table(inst.get("hy4_quant") or ""), [cards[i] for i in gpus],
                            _int(flag(args, "--max-context"), 32768),
                            used=hy4_used(gpus),
                            layout=inst.get("layout") or maya.HY4_STANDARD,
-                           pictures=flag(args, "--vision") != "off" and hy4_has_vision(new))
+                           pictures=flag(args, "--vision") != "off" and hy4_has_vision(new),
+                           drafter=maya.hy4_dfly2_gib(inst.get("hy4_quant") or "") if dfly else 0.0)
     except Exception:  # noqa: BLE001
         return None
     return None if fit.get("error") else fit
