@@ -168,6 +168,73 @@ class CheckpointTests(unittest.TestCase):
                     self.assertEqual(starts[-1][1], ["--max-context", "2048"])
                     self.assertEqual(engine.deep_sleep, mode)
 
+    def test_idle_unload_of_checkpointed_engine_reloads_with_new_slot_capacity(self):
+        svc = self.service()
+        engine = svc.engine
+        engine.deep_sleep = "checkpoint"
+        engine.sleeping, engine.sleep_via = True, "checkpoint"
+        engine.sleep_pids, engine.sleep_launcher = [101, 102], 103
+        engine.proc = unittest.mock.Mock(pid=103)
+        engine.alive = lambda: engine.proc.poll() is None
+        engine.proc.poll.return_value = None
+        engine.proc.wait.side_effect = lambda **kwargs: setattr(engine.proc.poll, "return_value", 0)
+        svc.last_request_at, svc.started_at, svc.unloaded = 0, 0, False
+        def restart():
+            self.assertFalse(engine.sleeping)
+            engine.proc.poll.return_value = None
+            engine.multi = 2
+        engine.restart = unittest.mock.Mock(side_effect=restart)
+        with patch.object(d, "_kill_processes") as kill, \
+                patch("serve.server.wait_gpu_release") as released, patch.object(d, "wake") as wake:
+            self.assertEqual(svc.unload(idle_for=1), "unloaded")
+            self.assertTrue(svc.unloaded)
+            self.assertEqual(kill.call_args_list,
+                             [unittest.mock.call([101, 102]), unittest.mock.call([103])])
+            released.assert_called_once_with(103)
+            engine.proc.stdin.write.assert_not_called()
+            svc.ensure_engine()
+            wake.assert_not_called()
+        engine.restart.assert_called_once()
+        self.assertFalse(svc.unloaded)
+        self.assertEqual(svc.fifo.capacity, 2)
+        self.assertEqual(engine.deep_sleep, "checkpoint")
+
+    def test_restart_keeps_request_routes_and_resets_engine_error_with_sleep_enabled(self):
+        import queue
+        for fail in (False, True):
+            with self.subTest(restart_fails=fail):
+                engine = object.__new__(StrataEngine)
+                engine.proc = unittest.mock.Mock(pid=123)
+                engine.spawn = ("engine", [], None, None, None)
+                engine.deep_sleep = "checkpoint"
+                engine.ended, engine.end_reason = True, "GPU decode failed"
+                engine.info, engine.max_context = {"cache": "enabled"}, 8192
+                old_queue = queue.Queue()
+                routes, rids, lock = {17: old_queue}, iter(range(18, 30)), threading.Lock()
+                engine._routes, engine._rids, engine._routes_lock = routes, rids, lock
+                def initialize(self, *args):
+                    self.deep_sleep = "off"
+                    self.info, self.max_context = {}, 0
+                    self._routes, self._rids, self._routes_lock = {}, iter(range(1, 10)), threading.Lock()
+                    if fail:
+                        raise RuntimeError("start failed")
+                with patch.object(StrataEngine, "__init__", initialize), patch("serve.server.wait_gpu_release"):
+                    if fail:
+                        with self.assertRaisesRegex(RuntimeError, "start failed"):
+                            engine.restart()
+                    else:
+                        engine.restart()
+                self.assertIsNone(old_queue.get_nowait())
+                self.assertIs(engine._routes, routes)
+                self.assertIs(engine._rids, rids)
+                self.assertIs(engine._routes_lock, lock)
+                self.assertEqual(engine.deep_sleep, "checkpoint")
+                self.assertFalse(engine.ended)
+                self.assertEqual(engine.end_reason, "")
+                self.assertEqual(engine.info["cache"], "enabled")
+                if fail:
+                    self.assertEqual(engine.max_context, 8192)
+
     def test_reused_pid_never_touches_driver_or_receives_signal(self):
         drv = Driver()
         with patch.object(d, "_process_start", return_value=42):
