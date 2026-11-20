@@ -2890,6 +2890,33 @@ __global__ void mv_f16_kernel(const uint16_t* __restrict__ W, int N, int K, cons
     if (lane == 0) y[row] = a;
 }
 
+// y [N] = W . x for a Q8_0 matrix kept planar - its values q [N][K] int8 and its blocks' scales d [N][K / 32] FP16 -
+// so that a warp reads 128 values an instruction; x where it is.  A warp a row.
+template <int WARPS>
+__global__ void mv_q8p_kernel(const int8_t* __restrict__ q, const uint16_t* __restrict__ d, int N, int K,
+                              const float* __restrict__ x, float* __restrict__ y) {
+    const int row = blockIdx.x * WARPS + (threadIdx.x >> 5), lane = threadIdx.x & 31;
+    if (row >= N) return;
+    const uint32_t* qr = (const uint32_t*) (q + (size_t) row * K);
+    const uint16_t* dr = d + (size_t) row * (K >> 5);
+    const float4* x4 = (const float4*) x;
+    float acc = 0.0f;
+    for (int it = 0, n_it = K >> 7; it < n_it; ++it) {
+        const uint32_t w = __ldg(qr + it * 32 + lane);
+        const float4 xv = __ldg(x4 + it * 32 + lane);
+        const float dv = h2f(__ldg(dr + it * 4 + (lane >> 3)));
+        acc += dv * ((float) (int8_t) (w & 0xFFu) * xv.x + (float) (int8_t) ((w >> 8) & 0xFFu) * xv.y +
+                     (float) (int8_t) ((w >> 16) & 0xFFu) * xv.z + (float) (int8_t) (w >> 24) * xv.w);
+    }
+    acc = wsum(acc);
+    if (lane == 0) y[row] = acc;
+}
+__global__ void decode_q8p_f16_kernel(const int8_t* __restrict__ q, const uint16_t* __restrict__ d, size_t n,
+                                      uint16_t* __restrict__ out) {
+    const size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) out[i] = f2h(h2f(d[i >> 5]) * (float) q[i]);
+}
+
 // the routed slots' tables from the picks, on the device: slot i's expert e = top[i] - its blocks, its token, its
 // scales; wt = the route weight times down's scale
 __global__ void route_gather_kernel(const int* __restrict__ top, const float* __restrict__ w,
@@ -3961,6 +3988,21 @@ void attn_decode_fp8(const float* q, const float* r, const float* sink, const ui
                      float* out, cudaStream_t s) {
     attn_decode_impl(q, r, sink, kc, vc, kv_cap, H, Hkv, D, k0, nk, qpos, qk_scale, v_inv_scale, proj, d_rel, extent,
                      window, scratch, out, s);
+}
+
+void mv_q8p(const int8_t* q, const uint16_t* d, int N, int K, const float* x, float* y, cudaStream_t s) {
+    if (N <= 0) return;
+    if (K % 128 || ((uintptr_t) q & 3) || ((uintptr_t) x & 15)) {
+        std::fprintf(stderr, "ik2::k::mv_q8p: K %d, or q / x not aligned\n", K);
+        std::abort();
+    }
+    mv_q8p_kernel<4><<<(unsigned) ((N + 3) / 4), 128, 0, s>>>(q, d, N, K, x, y);
+    check("mv_q8p");
+}
+void decode_q8p_f16(const int8_t* q, const uint16_t* d, size_t n, uint16_t* out, cudaStream_t s) {
+    if (!n) return;
+    decode_q8p_f16_kernel<<<grid(n), kBlk, 0, s>>>(q, d, n, out);
+    check("decode_q8p_f16");
 }
 
 void mv_f16(const uint16_t* W, int N, int K, const float* x, float* y, cudaStream_t s) {

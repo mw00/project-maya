@@ -221,6 +221,11 @@ void unpack_kv_fp8_to_f16(const uint8_t* kc, const uint8_t* vc, int kv_cap, int 
 // ---- the resident token path: every expert in VRAM (found on the device), the position read on the device, so a
 // token needs nothing from the host between its embedding and its logits and its launches replay as one CUDA graph
 
+/// y [N] = W [N][K] . x [K] for a Q8_0 matrix kept planar: q [N][K] its int8 values, d [N][K / 32] its blocks' FP16
+/// scales (the GGUF's blocks taken apart, the values unchanged) - a warp reads 128 values an instruction.  K a
+/// multiple of 128; q aligned to 4 bytes, x to 16.  decode_q8p_f16: the same matrix as FP16 (n values).
+void mv_q8p(const int8_t* q, const uint16_t* d, int N, int K, const float* x, float* y, cudaStream_t s);
+void decode_q8p_f16(const int8_t* q, const uint16_t* d, size_t n, uint16_t* out, cudaStream_t s);
 /// y [N] = W [N][K] . x [K] for a small dense matrix kept in FP16 (the sinks, a full layer's dynamic taps, the
 /// router): F32 sums, a warp a row.
 void mv_f16(const uint16_t* W, int N, int K, const float* x, float* y, cudaStream_t s);
