@@ -27,7 +27,9 @@ namespace pm = strata::core::glm_cache_memory;
 namespace pa = strata::core::glm_prefix;
 static void env_write(const char* name, const char* value) {
 #ifdef _WIN32
-    _putenv_s(name, value != nullptr ? value : "");
+    if (value == nullptr) SetEnvironmentVariableA(name, nullptr);
+    else if (value[0] == '\0') SetEnvironmentVariableA(name, "");
+    else _putenv_s(name, value);
 #else
     if (value != nullptr) setenv(name, value, 1);
     else unsetenv(name);
@@ -361,6 +363,16 @@ static void pack_identity_checks(const fs::path& root) {
     const char* names[] = {"MAYA_GLM_SLOT_SPILL", "MAYA_GLM_SLOT_KEEP", "MAYA_GLM_LEARNED_PREFIX",
                            "MAYA_GLM_PROMPT_CACHE_DIR", "MAYA_GLM_SLOT_RAM_GB", "MAYA_GLM_NO_REUSE"};
     std::optional<std::string> saved[6];
+    struct Restore {
+        const char** names;
+        std::optional<std::string>* saved;
+        ~Restore() {
+            for (size_t i = 0; i < 6; ++i) {
+                const std::optional<std::string>& value = saved[i];
+                env_write(names[i], value ? value->c_str() : nullptr);
+            }
+        }
+    } restore{names, saved};
     for (size_t i = 0; i < 6; ++i) {
         if (const char* value = std::getenv(names[i])) saved[i] = value;
         env_write(names[i], nullptr);
@@ -384,10 +396,8 @@ static void pack_identity_checks(const fs::path& root) {
     env_write("MAYA_GLM_SLOT_SPILL", "1");
     env_write("MAYA_GLM_NO_REUSE", "1");
     expect(!strata::core::pack_identity_required(), "PACK_GATE no-reuse suppresses persistent weight identity");
-    for (size_t i = 0; i < 6; ++i) {
-        const std::optional<std::string>& value = saved[i];
-        env_write(names[i], value ? value->c_str() : nullptr);
-    }
+    env_write("MAYA_GLM_NO_REUSE", "");
+    expect(!strata::core::pack_identity_required(), "PACK_GATE present-but-empty no-reuse also suppresses identity");
     expect(digest_of("") == "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
            "PACK_DIGEST empty input matches the published SHA-256 vector");
     expect(digest_of("abc") == "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",

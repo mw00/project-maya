@@ -56,9 +56,9 @@ between loads gives the pack a different key. Entries created before this key
 format require a fresh prefill.
 
 Keep model files immutable throughout loading and inference. Install a new
-revision in a separate directory and use a private slot directory. Hashing
-reads each distinct mapped shard during loading, including when learned-prefix
-caching is disabled.
+revision in a separate directory and use a private slot directory. When identity
+is required, hashing reads each distinct mapped shard during loading, including
+ordinary spill/kept-slot configurations with learned-prefix caching disabled.
 
 Choose RAM and disk budgets for the machine, not by copying the example blindly.
 The learned path checks available memory with a default 32 GiB reserve, bounds
