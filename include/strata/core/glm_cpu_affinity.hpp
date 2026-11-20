@@ -8,6 +8,7 @@
 // count and the per-node CPU lists already came from sched_getaffinity.
 #pragma once
 
+#include <algorithm>
 #include <thread>
 
 #if defined(__linux__)
@@ -34,6 +35,12 @@ inline int mask_cpus() {
     if (m > 0) return m;
     const int h = (int) std::thread::hardware_concurrency();
     return h > 0 ? h : 1;
+}
+
+/// Explicit global shared-pool count only; unknown affinity keeps the old 64-thread limit.
+/// This is a logical-CPU ceiling, not a physical-core count, CPU-time quota or recommendation.
+inline int manual_shared_threads(int requested, int available) {
+    return std::max(0, std::min(requested, available > 0 ? available : 64));
 }
 
 }  // namespace strata::core::glmaff
