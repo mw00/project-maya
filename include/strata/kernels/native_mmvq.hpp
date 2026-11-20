@@ -4,7 +4,7 @@
 
 namespace strata::kernels {
 
-// Native GGUF Q2_0, Q4_0, Q5_0, Q8_0, Q3_K, Q4_K, Q5_K, Q6_K, IQ4_NL
+// Native GGUF Q2_0, Q4_0, Q5_0, Q5_1, Q8_0, Q3_K, Q4_K, Q5_K, Q6_K, IQ4_NL
 // and IQ4_XS / CUDA Q8_1 adapters, pinned to llama.cpp
 // 3cf03257f219afbe7334045ff7c6a06ac68c627d, sm_120 generic MMVQ.
 // All pointers are device pointers, at least 4-byte aligned, with no overlap.
@@ -16,11 +16,11 @@ namespace strata::kernels {
 // (plan v0.3 P3). Columns are contiguous: activation column j is x + j * n_in
 // (its Q8_1 blocks at j * n_in / 32) and output column j is y + j * n_out. See
 // native_mmvq_set_multi_exact for how ncols > 1 relates to ncols == 1.
-// n_in must be a positive multiple of 32 for quantization/Q4_0/Q5_0/Q8_0/IQ4_NL,
+// n_in must be a positive multiple of 32 for quantization/Q4_0/Q5_0/Q5_1/Q8_0/IQ4_NL,
 // 64 for Q2_0, or 256 for the other formats. n_out must be positive. Weights remain
 // unmodified row-major GGUF blocks: Q3_K=110, Q4_K=144, Q5_K=176, Q6_K=210 and
 // IQ4_XS=136 bytes per 256 elements; Q2_0 is 18 bytes per 64 elements.
-// Q4_0/IQ4_NL=18, Q5_0=22, Q8_0=34 bytes per 32 elements.
+// Q4_0/IQ4_NL=18, Q5_0=22, Q5_1=24, Q8_0=34 bytes per 32 elements.
 // Q8_1 scratch has 36 bytes per 32 elements, with no extra row padding here.
 // Input floats must be finite, and their block scales/sums representable in FP16.
 std::size_t native_q8_1_bytes(int n_in, int ncols = 1);
@@ -87,6 +87,12 @@ void native_q5_0_mmvq(const void* weights, const void* x_q8_1, float* y,
 void native_q5_0_f32(const void* weights, const float* x, void* scratch_q8_1,
                       float* y, int n_in, int n_out, int ncols, void* stream);
 
+void native_q5_1_mmvq(const void* weights, const void* x_q8_1, float* y,
+                       int n_in, int n_out, int ncols, void* stream);
+
+void native_q5_1_f32(const void* weights, const float* x, void* scratch_q8_1,
+                      float* y, int n_in, int n_out, int ncols, void* stream);
+
 void native_q8_0_mmvq(const void* weights, const void* x_q8_1, float* y,
                        int n_in, int n_out, int ncols, void* stream);
 
@@ -100,7 +106,7 @@ void native_iq4_nl_f32(const void* weights, const float* x, void* scratch_q8_1,
                       float* y, int n_in, int n_out, int ncols, void* stream);
 
 // Storage/dispatch helpers take stable GGML type IDs, avoiding a ggml runtime
-// dependency in the engine: Q4_0=2, Q5_0=6, Q8_0=8, Q3_K=11, Q4_K=12, Q5_K=13,
+// dependency in the engine: Q4_0=2, Q5_0=6, Q5_1=7, Q8_0=8, Q3_K=11, Q4_K=12, Q5_K=13,
 // Q6_K=14, IQ4_NL=20, IQ4_XS=23, Q2_0=42. Unsupported IDs throw in the byte-count
 // and launch helpers; only the
 // capability query returns false.

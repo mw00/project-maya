@@ -25,6 +25,10 @@ bool cpu_block(int type, const uint8_t* b, float* out) {
     switch (type) {
     case 2: dequantize_q4_0(b, out); return true;
     case 6: dequantize_q5_0(b, out); return true;
+    // Q5_1 is now in dequant_bf16_supported, so this test picks a Q5_1 tensor up. Without its CPU
+    // reference here the comparison would run against a zero-filled row and report a false failure,
+    // so the reference is not optional: it is what makes the GPU window check Q5_1 for real.
+    case 7: dequantize_q5_1(b, out); return true;
     case 8: dequantize_q8_0(b, out); return true;
     case 11: dequantize_q3_K(b, out); return true;
     case 12: dequantize_q4_K(b, out); return true;
