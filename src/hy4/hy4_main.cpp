@@ -935,6 +935,18 @@ int bench_lane(const std::string& pack_dir, int il, int n_exp_call, int n_tok) {
         std::printf("lane nodes %d; experts' gate pages: node0 %d, node1 %d, other %d, unknown %d\n", probe.nodes(),
                     hist[0], hist[1], hist[2], hist[3]);
     }
+    if (const char* q4 = std::getenv("HY4_BENCH_Q4X"); q4 && std::atoi(q4) != 0) {   // (every expert's 4-bit copy)
+        if (!ex.q4x_can()) {
+            std::fprintf(stderr, "HY4_BENCH_Q4X: this layer's experts have no 4-bit form here\n");
+            return 1;
+        }
+        ex.q4x = std::make_shared<hy4::Q4xSet>(NE);
+        const auto t0 = std::chrono::steady_clock::now();
+        for (int e = 0; e < NE; ++e) ex.q4x_make(e);
+        std::printf("4-bit copies of the %d experts: %.2f GB, %.2f s\n", NE,
+                    (double) NE * (2.0 * ex.q4x_gu + ex.q4x_d) / 1e9,
+                    std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+    }
     const double mb = (2.0 * ex.g_stride + ex.d_stride) / 1e6;
     std::printf("layer %d: %s / %s experts, %.2f MB each; %d a token, %d tokens a call\n", il, tg->type.c_str(),
                 td->type.c_str(), mb, n_exp_call, n_tok);
@@ -947,14 +959,20 @@ int bench_lane(const std::string& pack_dir, int il, int n_exp_call, int n_tok) {
     std::vector<int> counts;
     for (int c = 1; c < phys; c *= 2) counts.push_back(c);
     for (int c : {phys - 2, phys, phys + phys / 2, logical}) counts.push_back(c);
+    if (const char* hc = std::getenv("HY4_BENCH_THREADS")) {   // (these thread counts only: "1,6")
+        counts.clear();
+        std::stringstream ss(hc);
+        for (std::string v; std::getline(ss, v, ',');) counts.push_back(std::atoi(v.c_str()));
+    }
     std::sort(counts.begin(), counts.end());
     counts.erase(std::unique(counts.begin(), counts.end()), counts.end());
+    // (the fastest call besides the mean: a busy host's other work only ever adds time, so two builds compare by it)
     for (int c : counts) {
         if (c < 1 || c > logical) continue;
         hy4::Lane lane(c - 1);
         std::vector<hy4::CpuEntry> ent;
         const int reps = n_tok > 1 ? 4 : 60;
-        double ms2[2] = {0, 0};
+        double ms2[2] = {0, 0}, best = 1e30;
         uint64_t bits = 1469598103934665603ull;
         for (int same = 0; same < 2; ++same) {
             std::mt19937 r2(7);
@@ -972,7 +990,10 @@ int bench_lane(const std::string& pack_dir, int il, int n_exp_call, int n_tok) {
                 if (gap_us > 0) std::this_thread::sleep_for(std::chrono::microseconds(gap_us));
                 const double t0 = now();
                 hy4::cpu_experts(lane, ex, ent, x.data(), n_tok, out.data());
-                if (r >= 3) tsum += now() - t0;
+                if (r >= 3) {
+                    tsum += now() - t0;
+                    if (!same) best = std::min(best, now() - t0);
+                }
                 if (r == 0 && !same)
                     for (float v : out) {
                         uint32_t u;
@@ -982,9 +1003,9 @@ int bench_lane(const std::string& pack_dir, int il, int n_exp_call, int n_tok) {
             }
             ms2[same] = 1e3 * tsum / reps;
         }
-        std::printf("  %2d threads: %.3f ms a call, %.3f ms an expert-token, %.1f tokens/s; the same experts every call "
-                    "%.3f ms; sum %016llx\n", c, ms2[0], ms2[0] / ((double) n_exp_call * n_tok), 1000.0 * n_tok / ms2[0],
-                    ms2[1], (unsigned long long) bits);
+        std::printf("  %2d threads: %.3f ms a call (fastest %.3f), %.3f ms an expert-token, %.1f tokens/s; the same experts "
+                    "every call %.3f ms; sum %016llx\n", c, ms2[0], 1e3 * best, ms2[0] / ((double) n_exp_call * n_tok),
+                    1000.0 * n_tok / ms2[0], ms2[1], (unsigned long long) bits);
     }
     return 0;
 }

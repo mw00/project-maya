@@ -4971,10 +4971,112 @@ def skip_start_calibrations(cfg_path: Path, cfg: dict, why: str) -> None:
         todo.append(("speed calibration", "--speed-calibration"))
     elif needs_link_calibration(cfg):
         todo.append(("both-GPU speed check", "--speed-calibration"))
+    if needs_q4x_calibration(cfg) and not any(f == "--speed-calibration" for _, f in todo):
+        todo.append(("CPU lane check", "--speed-calibration"))
     if todo:
         say("  Calibration skipped on this start (" + why + "): the model starts with its default settings. Run it once "
             "when you can wait for it: " + "; ".join(f"{ME} --config {cfg_path} {flag} --no-start ({name})"
                                                       for name, flag in todo))
+
+
+HY4_Q4X_ENV = "HY4_Q4X"                            # maya-hy4's 4-bit expert copies: 2 / unset measured, 1 on, 0 off
+
+
+def needs_q4x_calibration(cfg: dict) -> bool:
+    """A Maya size of Hy4-Flash with no verdict yet on its CPU lane's 4-bit expert copies (maya-hy4's HY4_Q4X): its
+    next attended start measures them once (q4x_calibration).  Not Tencent's Q4_K_M (no IQ2_XXS experts), not on
+    Metal, and not where the config's env sets HY4_Q4X itself."""
+    if config_family(cfg) != "hy4" or Q.config_key(cfg) == HY4_Q4 or cfg.get("backend") == "metal":
+        return False
+    if HY4_Q4X_ENV in (cfg.get("env") or {}):
+        return False
+    return "q4x_calibration" not in (cfg.get("installer") or {})
+
+
+def q4x_verdict(log_text: str) -> str | None:
+    """maya-hy4's own verdict on the 4-bit copies in its log (HY4_Q4X=2): "on", "off", "unmeasured" (copies made, the
+    answers too short for the timed turns), or None - no CPU lane of IQ2_XXS experts, nothing to decide."""
+    if "the 4-bit copies kept" in log_text:
+        return "on"
+    if ("the 4-bit copies dropped" in log_text or "the file's rows kept" in log_text
+            or "no 4-bit copies of its experts" in log_text):
+        return "off"
+    return "unmeasured" if "4-bit copies" in log_text else None
+
+
+def q4x_calibration(cfg_path: Path, why: str = "") -> bool | None:
+    """maya-hy4's 4-bit copies of the CPU lane's most routed experts, measured once on this PC: the engine's own check
+    (HY4_Q4X=2 - a probe at its start, then one answer's lane calls timed in turns with and without the copies; the
+    same tokens either way, the copies giving the file's bits) over a warm-up answer and a longer one.  The verdict
+    goes into the config's env (HY4_Q4X 1 or 0: the next starts do not measure) and installer.q4x_calibration.
+    True / False: on / off; None: nothing to decide here (no CPU lane, no IQ2_XXS experts) or not measured (said)."""
+    cfg = read_json(cfg_path)
+    tdir = Path(cfg.get("tokenizer") or "")
+    if not cfg.get("exe") or not cfg.get("tokenizer") or not (tdir / "chat_template.jinja").exists():
+        warn("the CPU lane check needs the config's engine and tokenizer (with its chat template): its 4-bit expert "
+             f"copies are measured at each start instead ({ME} --setup writes them again)")
+        return None
+    if busy_skip(cfg, why == "asked for", "the CPU lane check", "the GPU(s)",
+                 f" (a model server still running?) - it runs at the next start, or: {ME} --speed-calibration"):
+        return None
+    sys.path.insert(0, str(ROOT))
+    sys.path.insert(0, str(ROOT / "tools"))
+    import serve.server as SV
+    import strata_tokenizer as ST
+    ids = ST.Tokenizer.from_dir(tdir).encode(bench_chat("hy4", tdir)(BENCH_TOPICS[0]), parse_special=True)
+    env = SV.child_env(cfg)
+    env[HY4_Q4X_ENV] = "2"
+    say()
+    say(f"  Checking the CPU lane's 4-bit expert copies on this PC{f' ({why})' if why else ''}: two answers, the model")
+    say("  loads once (a few minutes) ...")
+    log_path = ROOT / "maya-q4x-calibration.log"
+    done = False
+    with open(log_path, "w", encoding="utf-8") as log:
+        try:
+            p = subprocess.Popen([cfg["exe"], "--serve"] + SV.engine_args(cfg), stdin=subprocess.PIPE,
+                                 stdout=subprocess.PIPE, stderr=log, text=True, env=env,
+                                 cwd=cfg.get("cwd") or str(ROOT), bufsize=1)
+        except OSError as e:
+            warn(f"the CPU lane check could not start the engine ({e}): its copies are measured at each start instead")
+            return None
+
+        def gen(n_new: int) -> bool:
+            p.stdin.write(f"GEN {n_new} temperature=0 " + ",".join(map(str, ids)) + "\n")
+            p.stdin.flush()
+            for line in p.stdout:
+                if line.startswith(("DONE", "ERR")):
+                    return line.startswith("DONE")
+            return False
+
+        try:
+            for line in p.stdout:
+                if line.startswith("READY"):
+                    # (the warm-up answer gives the routing counts the copies are made by - between answers - and the
+                    #  second answer's one-token calls are timed in turns with and without them)
+                    done = gen(64) and (time.sleep(15) or True) and gen(256)
+                    break
+            p.stdin.write("QUIT\n")
+            p.stdin.flush()
+            p.wait(timeout=120)
+        except (OSError, ValueError, subprocess.TimeoutExpired):
+            p.kill()
+    verdict = q4x_verdict(log_path.read_text(encoding="utf-8", errors="replace"))
+    if not done or verdict == "unmeasured":
+        warn(f"the CPU lane check did not finish ({log_path.name} says why): its copies are measured at each start "
+             f"instead ({ME} --speed-calibration tries again)")
+        cfg.setdefault("installer", {})["q4x_calibration"] = {"result": "unmeasured", "date": time.strftime("%Y-%m-%d")}
+        cfg_path.write_text(json.dumps(N.env_out(cfg), indent=1), encoding="utf-8")
+        return None
+    cfg.setdefault("installer", {})["q4x_calibration"] = {"result": verdict or "n/a", "date": time.strftime("%Y-%m-%d")}
+    if verdict is not None:
+        cfg.setdefault("env", {})[HY4_Q4X_ENV] = "1" if verdict == "on" else "0"
+    cfg_path.write_text(json.dumps(N.env_out(cfg), indent=1), encoding="utf-8")
+    if verdict is None:
+        ok("CPU lane check: nothing to decide on this PC (no CPU lane of IQ2_XXS experts)")
+        return None
+    ok(f"the CPU lane's 4-bit expert copies: {'ON - faster' if verdict == 'on' else 'off - not faster'} on this PC "
+       "(the same answers either way)")
+    return verdict == "on"
 
 
 def needs_speed_calibration(cfg: dict) -> bool:
@@ -5023,6 +5125,15 @@ def speed_calibration(cfg_path: Path, why: str = "") -> bool:
             ok(f"{HY4}: no speed calibration here - a Maya size measures which drafter is faster where the MTP block "
                f"and the DFly2 drafter both fit; here the setup found room for one of them or none ({ME} --setup "
                "--drafting on|off|mtp|dfly2)")
+            inst, env = cfg.setdefault("installer", {}), cfg.get("env") or {}
+            if HY4_Q4X_ENV in env and "q4x_calibration" not in inst:   # (set by hand: the user's choice stays)
+                ok(f"the CPU lane's 4-bit expert copies: {HY4_Q4X_ENV}={env[HY4_Q4X_ENV]} in the config's env - kept, "
+                   "not measured")
+                return False
+            if inst.pop("q4x_calibration", None) is not None:   # (measured again, as asked)
+                env.pop(HY4_Q4X_ENV, None)
+                cfg_path.write_text(json.dumps(N.env_out(cfg), indent=1), encoding="utf-8")
+            return q4x_calibration(cfg_path, why) is not None
         return False
     if config_family(cfg) in ("deepseek", "minimax"):
         return speed_calibration_ds4(cfg_path, cfg, why)
@@ -5754,6 +5865,10 @@ def server_command(cfg_path: Path, a) -> tuple:
         if link_calibration(cfg_path, "once, for this PC"):
             cfg = read_json(cfg_path)
             args = cfg.get("args") or []
+    if not unattended and needs_q4x_calibration(cfg):       # Hy4-Flash's 4-bit expert copies: on or off, measured once
+        q4x_calibration(cfg_path, "once, for this PC")
+        cfg = read_json(cfg_path)
+        args = cfg.get("args") or []
     port = a.port or cfg.get("port") or 8080
     host = a.host or cfg.get("host") or "127.0.0.1"
     key = a.api_key or cfg.get("api_key")
