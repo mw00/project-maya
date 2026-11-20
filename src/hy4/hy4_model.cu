@@ -349,6 +349,8 @@ struct Gpu {
     float* cpo = nullptr;   // (the CPU lane's sums, [Tc][n_lat])
     uint8_t* stage = nullptr;   // (a prompt's streamed experts: kStage slots of the largest blob)
     double h2d_gbs = 10.0;      // (... the copies to it, GB/s: measured at the load)
+    int heads_one = -1;         // (a token window's head-by-head GEMVs in one launch: 1, 8 heads a launch: 0, -1 not
+                                //  timed yet - mm_heads)
     int* pmap = nullptr;        // (... each expert's slot in them, -1: not this pass's)
     // ... and its attention as GEMMs: the scores, the probabilities (F16), a ring's keys in order, the picks' mask
     float *sS = nullptr, *dmask = nullptr;
@@ -3414,22 +3416,23 @@ struct Model::Impl {
                                               CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT) == CUBLAS_STATUS_SUCCESS;
         }
         k::q8_heads(x, ldt, ldh, T, H, M.k, gp.xq, gp.xd, gp.s);
-#if defined(STRATA_USE_HIP)
-        {   // (AMD: every head in one launch - the same rows' sums as the jobs below, 8 heads a launch)
-            iq::MvJob j;
-            j.w = M.w;
-            j.ld = M.ld;
-            j.type = M.type;
-            j.k = M.k;
-            j.n = M.n;
-            j.ncol = T;
-            j.xq = gp.xq;
-            j.xd = gp.xd;
-            j.y = y;
-            j.ycs = ldyt;
-            if (iq::mv_heads(j, H, (size_t) M.n * M.ld, (size_t) T * M.k, (size_t) T * M.k / 32, ldyh, gp.s)) return true;
-        }
-#endif
+        // every head in one launch (mv_heads) or 8 heads a launch (mv's jobs): a row's sums the same either way, so
+        // the faster of the two on this GPU - AMD: one launch; NVIDIA: both timed on the first one-token call (8 heads
+        // a launch until then), the faster kept for the GPU.  HY4_MV_HEADS=1 / 0: one launch / 8 heads a launch
+        iq::MvJob j1;
+        j1.w = M.w;
+        j1.ld = M.ld;
+        j1.type = M.type;
+        j1.k = M.k;
+        j1.n = M.n;
+        j1.ncol = T;
+        j1.xq = gp.xq;
+        j1.xd = gp.xd;
+        j1.y = y;
+        j1.ycs = ldyt;
+        auto one = [&] {
+            return iq::mv_heads(j1, H, (size_t) M.n * M.ld, (size_t) T * M.k, (size_t) T * M.k / 32, ldyh, gp.s);
+        };
         std::vector<iq::MvJob> jobs((size_t) H);
         for (int h = 0; h < H; ++h) {
             iq::MvJob& j = jobs[(size_t) h];
@@ -3444,9 +3447,51 @@ struct Model::Impl {
             j.y = y + (size_t) h * ldyh;
             j.ycs = ldyt;
         }
-        for (int h0 = 0; h0 < H; h0 += 64)
-            if (!iq::mv(jobs.data() + h0, std::min(64, H - h0), gp.s)) return false;
-        return true;
+        auto eight = [&] {
+            for (int h0 = 0; h0 < H; h0 += 64)
+                if (!iq::mv(jobs.data() + h0, std::min(64, H - h0), gp.s)) return false;
+            return true;
+        };
+#if defined(STRATA_USE_HIP)
+        if (one()) return true;
+        return eight();
+#else
+        static const int forced = [] {
+            const char* e = std::getenv("HY4_MV_HEADS");
+            return e ? (std::atoi(e) != 0 ? 1 : 0) : -1;
+        }();
+        if (gp.heads_one < 0 && forced >= 0) gp.heads_one = forced;
+        if (gp.heads_one < 0 && T == 1) {
+            if (!one()) gp.heads_one = 0;   // (a type mv_heads does not take: the jobs)
+            if (gp.heads_one < 0) {   // (each form 6 times in turns, the first of each not counted; the best kept)
+                cudaEvent_t e0 = nullptr, e1 = nullptr;
+                float best[2] = {1e30f, 1e30f};
+                bool ok = cudaEventCreate(&e0) == cudaSuccess && cudaEventCreate(&e1) == cudaSuccess;
+                for (int r = 0; r < 12 && ok; ++r) {
+                    const int f = r & 1;
+                    float ms = 0.0f;
+                    ok = cudaEventRecord(e0, gp.s) == cudaSuccess && (f ? one() : eight()) &&
+                         cudaEventRecord(e1, gp.s) == cudaSuccess && cudaEventSynchronize(e1) == cudaSuccess &&
+                         cudaEventElapsedTime(&ms, e0, e1) == cudaSuccess;
+                    if (r >= 2) best[f] = std::min(best[f], ms);
+                }
+                if (e0) cudaEventDestroy(e0);
+                if (e1) cudaEventDestroy(e1);
+                if (!ok) {   // (not timed: the jobs, as before)
+                    gp.heads_one = 0;
+                    return eight();
+                }
+                gp.heads_one = best[1] < best[0] ? 1 : 0;
+                // (after the load's INFO lines: the first token's, on stderr)
+                std::fprintf(stderr, "maya-hy4: GPU %d: a token's head-by-head GEMVs %s (%d heads: %.1f us in one "
+                             "launch, %.1f us 8 heads a launch)\n", gp.dev, gp.heads_one ? "in one launch" :
+                             "8 heads a launch", H, best[1] * 1e3, best[0] * 1e3);
+                return true;   // (y as each form writes it: the same values)
+            }
+        }
+        if (gp.heads_one == 1 && one()) return true;
+        return eight();
+#endif
     }
 
     // A prompt sub-batch's attention (tokens t0 .. t0 + ts - 1 of the chunk) on the tensor cores: S = Q K^T over every
@@ -4493,6 +4538,7 @@ struct Model::Impl {
                     ok = ok && mm_multi(gp, {{&l.sh_gate, gp.gu, (size_t) sf}, {&l.sh_up, gp.gu + (size_t) T * sf,
                                                                             (size_t) sf}}, gp.xf, E, T);
             }
+            bool sh_early = false;   // (the shared expert's down already queued - one GPU's token windows, below)
             if (lane_on) {
                 CK(cudaMemcpyAsync(h_ids, gp.ids, sizeof(int) * T * nu, cudaMemcpyDeviceToHost, s));
                 CK(cudaMemcpyAsync(h_w, gp.rw, sizeof(float) * T * nu, cudaMemcpyDeviceToHost, s));
@@ -4501,6 +4547,12 @@ struct Model::Impl {
                 if (T <= W)
                     ok = ok && mm_multi(gp, {{&l.sh_gate, gp.gu, (size_t) sf}, {&l.sh_up, gp.gu + (size_t) T * sf,
                                                                                 (size_t) sf}}, gp.xf, E, T);
+                if (T <= W && l.tpm < 0) {   // (its down as well, beside the lane: off the GPU's path after the lane's
+                    //  sum - the same kernels on the same rows, gp.cur added after the up-projection as before)
+                    k::swiglu(gp.gu, gp.gu + (size_t) T * sf, sf, T, sf, gp.hd, sf, s);
+                    ok = ok && mm(gp, l.sh_down, gp.hd, sf, T, gp.cur, E);
+                    sh_early = true;
+                }
                 k::submit(s);   // (AMD under Windows: the copies and the shared expert started now, not at the wait)
                 const double tw = now_s();
                 // (a token's copies are there within a millisecond or two: polled that long - a thread that sleeps on
@@ -4606,8 +4658,10 @@ struct Model::Impl {
             ok = ok && mm(gp, l.rup, gp.latout, lat, T, gp.y, E);
             dbg("ffn_moe_up", l.il, gp, gp.y, T, E);
             // the shared expert
-            k::swiglu(gp.gu, gp.gu + (size_t) T * sf, sf, T, sf, gp.hd, sf, s);
-            ok = ok && mm(gp, l.sh_down, gp.hd, sf, T, gp.cur, E);
+            if (!sh_early) {
+                k::swiglu(gp.gu, gp.gu + (size_t) T * sf, sf, T, sf, gp.hd, sf, s);
+                ok = ok && mm(gp, l.sh_down, gp.hd, sf, T, gp.cur, E);
+            }
             dbg("ffn_shexp", l.il, gp, gp.cur, T, E);
             if (inject) ref_cmp("ffn_shexp", l.il, gp, gp.cur, (size_t) T * E, T);
             k::add(gp.y, gp.cur, (size_t) T * E, s);

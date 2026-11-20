@@ -910,6 +910,13 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
       # (DS4_IQ_MIN_FORMS: on AMD the K-quants' minimum term rounded one way in the token and the window kernels -
       #  ds4_iq.cu's kMinG ..; a verify window's rows are then the rows the tokens get one at a time)
       target_compile_definitions(maya-hy4 PRIVATE MAYA_DS4_IQ_ONLY DS4_IQ_MIN_FORMS)
+      # maya-hy4's CPU lane alone (no GPU, no model): a call's time / GB/s by expert format and a hash of its
+      # outputs, to compare the lane's row forms bit for bit across runs (built by name)
+      add_executable(hy4_lane_bench EXCLUDE_FROM_ALL tests/hy4_lane_bench.cpp src/hy4/hy4_lane.cpp src/ds4/ds4_iq_cpu.cpp
+                                    src/ds4/ds4_gguf_cpu.cpp)
+      target_include_directories(hy4_lane_bench PRIVATE include src/hy4 third_party/ggml)
+      target_link_libraries(hy4_lane_bench PRIVATE strata_kernels_cpu Threads::Threads)
+      target_compile_definitions(hy4_lane_bench PRIVATE MAYA_DS4_IQ_ONLY DS4_IQ_MIN_FORMS)
       if(STRATA_BUILD_TESTS)
         # maya-hy4's routed experts (no model): the token, window and prompt forms on ds4_iq's kernels against
         # per-matrix GEMVs, in Hy4-flash's types (Q4_K / Q6_K, and the MTP block's Q8_0)
@@ -1533,7 +1540,8 @@ if(STRATA_NATIVE_EXPERTS)
   if(STRATA_CPU_X86)
     target_sources(strata_kernels_cpu PRIVATE src/kernels/cpu/native_expert.cpp src/kernels/cpu/iq_avx512.cpp
                                              src/kernels/cpu/iq_avx2.cpp src/kernels/cpu/kq_avx512.cpp
-                                             src/kernels/cpu/iq_avx512_one.cpp)
+                                             src/kernels/cpu/iq_avx512_one.cpp src/kernels/cpu/iq2v_rows.cpp
+                                             src/kernels/cpu/iq3v_rows.cpp)
   else()
     target_sources(strata_kernels_cpu PRIVATE src/kernels/cpu/native_expert.cpp)
   endif()
@@ -1544,7 +1552,16 @@ if(STRATA_NATIVE_EXPERTS)
     # Match the non-MSVC no-contraction mode: IQ1_M's subnormal-scale parity checks need it too.
     set_source_files_properties(src/kernels/cpu/iq_avx2.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX2;/fp:strict")
     set_source_files_properties(src/kernels/cpu/iq_avx512_one.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX512")
+    # (the second-generation IQ2 rows: VEX encodings throughout - without /arch the compiler's own SSE code beside
+    #  them cost a third of their speed on Golden Cove; their AVX-512 form's intrinsics compile as they are, and the
+    #  caller runs each form only where the CPU takes it)
+    set_source_files_properties(src/kernels/cpu/iq2v_rows.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX2;/fp:strict")
+    # (the second-generation IQ3_XXS / IQ4_XS / 4-bit IQ2_XXS rows: the same, for the same reason)
+    set_source_files_properties(src/kernels/cpu/iq3v_rows.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX2;/fp:strict")
   elseif(STRATA_CPU_X86)
+    # (the second-generation IQ2 rows: each function's instruction set its own, no contraction)
+    set_source_files_properties(src/kernels/cpu/iq2v_rows.cpp PROPERTIES COMPILE_OPTIONS "-ffp-contract=off")
+    set_source_files_properties(src/kernels/cpu/iq3v_rows.cpp PROPERTIES COMPILE_OPTIONS "-ffp-contract=off")
     # (no VNNI / VBMI needed - cpu_avx512bw_ok() is enough to run them; no FP contraction: their sums must take
     # ggml-cpu's float steps exactly, see iq_avx512.cpp)
     set_source_files_properties(src/kernels/cpu/iq_avx512.cpp PROPERTIES COMPILE_OPTIONS
