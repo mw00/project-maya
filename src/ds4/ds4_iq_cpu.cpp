@@ -5,6 +5,7 @@
 #include "ds4_cpu_prepare_rows.hpp"
 
 #if defined(STRATA_NATIVE_EXPERTS)
+#include "strata/kernels/cpu/iq2v_rows.hpp"
 #include "strata/kernels/cpu/native_expert.hpp"
 
 #define GGML_COMMON_DECL_CPP
@@ -70,6 +71,7 @@ kc::NativeFmt native(const IqCpu& f) {   // (the fields the rows read; no lookup
 // x512: AVX-512 F / BW / VL / DQ with BMI2 (no VBMI: Skylake-SP Xeons too), pop512: and VPOPCNTDQ
 struct IqCpuIsa {
     bool avx2 = false, w512 = false, bmi2 = false, f16c = false, x512 = false, pop512 = false;
+    bool vnni256 = false, z512 = false;   // AVX-VNNI; AVX-512 F BW VL DQ VBMI BITALG VNNI (IQ2_XXS's 512-bit form)
 };
 IqCpuIsa iq_isa() {
     IqCpuIsa c;
@@ -106,6 +108,9 @@ IqCpuIsa iq_isa() {
     c.x512 = c.avx2 && (xcr0 & 0xE6) == 0xE6 && ((r[1] >> 16) & 1u) && ((r[1] >> 17) & 1u) && ((r[1] >> 30) & 1u) &&
              ((r[1] >> 31) & 1u) && ((r[1] >> 8) & 1u);   // AVX-512 F, DQ, BW, VL; BMI2
     c.pop512 = c.x512 && ((r[2] >> 14) & 1u);              // AVX-512 VPOPCNTDQ
+    c.z512 = c.x512 && c.w512 && ((r[2] >> 12) & 1u) && ((r[2] >> 11) & 1u);   // and VBMI, BITALG, VNNI
+    cpuid(7, 1);
+    c.vnni256 = c.avx2 && ((r[0] >> 4) & 1u);              // AVX-VNNI
 #endif
     return c;
 }
@@ -817,6 +822,10 @@ bool g_iq1m_fma = true;   // IQ1_M's last step one FMA (gcc's build of ggml-cpu)
 #define IQX_POP 1
 #include "ds4_iq512_kern.inc"
 bool g_x512_18 = false;   // IQ3_XXS on these rows rather than the ones above (own())
+// IQ2_XXS's / IQ2_S's second-generation rows (strata/kernels/cpu/iq2v_rows.hpp): the form own() took (0: the rows
+// above), and whether a call of several tokens takes it on an AVX-512 CPU too (else the native lane's AVX-512 rows)
+int g_iq2v = 0, g_iq2sv = 0;
+bool g_iq2v_multi = false, g_iq2sv_multi = false;
 
 template <int TY, int NT>
 void x512_pass(const uint8_t* w, size_t rb, int nb, const block_q8_K* const* y, float* const* out, int r0, int r1) {
@@ -937,8 +946,14 @@ void iq1s_rows_n(const uint8_t* w, size_t rb, int n, const void* const* act, int
 void own_rows(int type, const uint8_t* w, size_t rb, int n, const void* const* act, int nt, float* const* out, int r0,
               int r1) {
 #if defined(IQ_X86)
-    if (type == GGML_TYPE_IQ2_XXS) return iq_rows_n<16>(w, rb, n, act, nt, out, r0, r1);
-    if (type == GGML_TYPE_IQ2_S) return iq_rows_n<22>(w, rb, n, act, nt, out, r0, r1);
+    if (type == GGML_TYPE_IQ2_XXS) {
+        if (g_iq2v > 0) return kc::iq2v::rows(g_iq2v, w, rb, n, act, nt, out, r0, r1);
+        return iq_rows_n<16>(w, rb, n, act, nt, out, r0, r1);
+    }
+    if (type == GGML_TYPE_IQ2_S) {
+        if (g_iq2sv > 0) return kc::iq2v::rows(10 + g_iq2sv, w, rb, n, act, nt, out, r0, r1);
+        return iq_rows_n<22>(w, rb, n, act, nt, out, r0, r1);
+    }
     if (type == GGML_TYPE_IQ3_XXS) {
         if (g_x512_18) return x512_rows<18>(w, rb, n, act, nt, out, r0, r1);
         return iq_rows_n<18>(w, rb, n, act, nt, out, r0, r1);
@@ -1116,7 +1131,10 @@ double time_variant(int type, int variant, int nt = 1, TvBuf* big = nullptr) {
     bool* gflag = type == GGML_TYPE_IQ3_XXS ? &g_gather18 : type == GGML_TYPE_IQ3_S ? &g_gather21 :
                   type == GGML_TYPE_IQ2_XXS ? &g_ct16 : nullptr;
     const bool keep = gflag != nullptr && *gflag;
-    if (gflag != nullptr) *gflag = variant >= 2;
+    if (gflag != nullptr) *gflag = variant == 2;
+    int* gv = type == GGML_TYPE_IQ2_XXS ? &g_iq2v : type == GGML_TYPE_IQ2_S ? &g_iq2sv : nullptr;
+    const int keep_v = gv != nullptr ? *gv : 0;   // (IQ2_XXS / IQ2_S: variant 2 + v = the second-generation form v)
+    if (gv != nullptr) *gv = variant >= 3 ? variant - 2 : 0;
     double best = 1e30;
     for (int round = 0; round < 6; ++round) {
         const auto t0 = std::chrono::steady_clock::now();
@@ -1135,6 +1153,7 @@ double time_variant(int type, int variant, int nt = 1, TvBuf* big = nullptr) {
         if (round > 0) best = std::min(best, us);
     }
     if (gflag != nullptr) *gflag = keep;
+    if (gv != nullptr) *gv = keep_v;
     return best;
 }
 #endif  // IQ_X86
@@ -1250,11 +1269,54 @@ bool own(int type) {
             if (good_g) tg = std::min(tg, time_variant(type, 2, nt, &big));
         }
         if (gflag != nullptr) *gflag = tg < tb;
-        ok[k] = std::min(tb, tg) < 0.9 * tn;
+        double tv = 1e30;
+        std::string vrep;
+        if (k == 2 || k == 3) {   // (IQ2_XXS / IQ2_S: the second-generation forms this CPU runs, each checked
+                                  //  against ggml-cpu's dot)
+            int& gv = k == 2 ? g_iq2v : g_iq2sv;
+            bool& gmulti = k == 2 ? g_iq2v_multi : g_iq2sv_multi;
+            static const bool v_on = [] {   // (DS4_IQ2V=0: never these forms - the lane's rows as before)
+                const char* e = std::getenv("DS4_IQ2V");
+                return e == nullptr || std::atoi(e) != 0;
+            }();
+            bool vok[4] = {false, v_on && isa().avx2, v_on && isa().avx2 && isa().vnni256 && kc::iq2v::vnni_form(),
+                           v_on && isa().z512};
+            for (int v = 1; v <= 3; ++v)
+                if (vok[v]) {
+                    gv = v;
+                    vok[v] = own_check(type);
+                    gv = 0;
+                }
+            double tvs[4] = {1e30, 1e30, 1e30, 1e30};
+            for (int it = 0; it < 5; ++it)
+                for (int v = 1; v <= 3; ++v)
+                    if (vok[v]) tvs[v] = std::min(tvs[v], time_variant(type, 2 + v, nt, &big));
+            int best = 0;
+            for (int v = 1; v <= 3; ++v) {
+                if (vok[v] && tvs[v] < tv) tv = tvs[v], best = v;
+                vrep += " v" + std::to_string(v) + " " + (vok[v] ? std::to_string((int) tvs[v]) : std::string("-"));
+            }
+            if (best > 0 && tv < std::min(tb, tg)) {
+                gv = best;
+                if (gflag != nullptr) *gflag = false;
+            }
+            // (an AVX-512 CPU's calls of several tokens: the native lane's AVX-512 rows unless the form is faster at 4)
+            if (gv > 0 && isa().w512) {
+                double tn4 = 1e30, tv4 = 1e30;
+                for (int it = 0; it < 3; ++it) {
+                    tn4 = std::min(tn4, time_variant(type, 0, 4, &big));
+                    tv4 = std::min(tv4, time_variant(type, 2 + gv, 4, &big));
+                }
+                gmulti = tv4 < 0.9 * tn4;
+                vrep += " | 4 tokens: native " + std::to_string((int) tn4) + " us, v" + std::to_string(gv) + " " +
+                        std::to_string((int) tv4) + " us";
+            }
+        }
+        ok[k] = std::min(std::min(tb, tg), tv) < 0.9 * tn;
         if (std::getenv("DS4_IQ_VERBOSE") != nullptr)
             std::fprintf(stderr, "ds4: CPU lane %s rows (%d token%s): native %.0f us, ours %.0f us%s -> %s\n",
-                         ggml_type_name((ggml_type) type), nt, nt > 1 ? "s" : "", tn, tb, gflag != nullptr ? (std::string(" (second form: gather / one table ") + std::to_string((int) tg) + " us)").c_str() : "",
-                         ok[k] ? (gflag != nullptr && *gflag ? "ours (second form)" : "ours") : "native");
+                         ggml_type_name((ggml_type) type), nt, nt > 1 ? "s" : "", tn, tb, ((gflag != nullptr ? std::string(" (second form: gather / one table ") + std::to_string((int) tg) + " us)" : std::string()) + vrep).c_str(),
+                         ok[k] ? ((k == 2 || k == 3) && (k == 2 ? g_iq2v : g_iq2sv) > 0 ? (std::string("ours (v") + std::to_string(k == 2 ? g_iq2v : g_iq2sv) + ")").c_str() : gflag != nullptr && *gflag ? "ours (second form)" : "ours") : "native");
     });
     return ok[k];
 #else
@@ -1274,7 +1336,9 @@ bool own_nt(int type, int nt) {
     if (!own(type)) return false;
     // (IQ2 on an AVX-512 CPU: ours for a decode's one token, where own() timed them; the AVX-512 multi-token rows
     //  keep the calls of several tokens)
-    if ((type == GGML_TYPE_IQ2_XXS || type == GGML_TYPE_IQ2_S) && isa().w512 && nt > 1) return false;
+    if ((type == GGML_TYPE_IQ2_XXS || type == GGML_TYPE_IQ2_S) && isa().w512 && nt > 1 &&
+        !(type == GGML_TYPE_IQ2_XXS ? g_iq2v > 0 && g_iq2v_multi : g_iq2sv > 0 && g_iq2sv_multi))
+        return false;
     return !x512_type(type) || nt >= x512_from(type);   // (IQ1_M on Zen 4: from 2 tokens)
 #else
     return own(type);
