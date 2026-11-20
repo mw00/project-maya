@@ -324,7 +324,9 @@ template <class KV>
 __global__ void prep_qkv_r_impl_kernel(float* q, const float* q_clip, const float* k_in, KV* kc, const float* v_in,
                                        KV* vc, float* r, const float* r_clip, int T, int H, int KVh, int D, int d_rel,
                                        float qk_clip, float rel_clip, float eps, const int* pos, float alpha,
-                                       float n_floor, int pos0, int kv_cap, float k_scale, float v_scale) {
+                                       float n_floor, int pos0, int kv_cap, float k_scale, float v_scale,
+                                       const int* pos0_d) {
+    if (pos0_d) pos0 = *pos0_d;   // (a token of a replayed graph: its position read here)
     const int gid = blockIdx.x;
     const int per_tok = 2 * H + 2 * KVh;
     if (gid >= T * per_tok) return;
@@ -2740,7 +2742,12 @@ __device__ __forceinline__ void attn_flash_range(const float* qh, const float* r
 template <class KV>
 __global__ void attn_split_kernel(const float* q, const float* r, const KV* kc, const KV* vc, int kv_cap, int H,
                                   int Hkv, int k0, int nk, int qpos0, float qk_scale, const float* proj, int d_rel,
-                                  int extent, int window, float* part) {
+                                  int extent, int window, float* part, const int* pos_d) {
+    if (pos_d) {   // (tokens of a replayed graph: the first's position read here, the keys they may see from it)
+        qpos0 = *pos_d;
+        k0 = window < (1 << 30) ? max(0, qpos0 - window + 1) : 0;
+        nk = qpos0 + (int) gridDim.z - k0;
+    }
     __shared__ float sm_m[4], sm_s[4];
     __shared__ __align__(16) float sm_o[4][128];
     const int h = blockIdx.x, p = blockIdx.y, P = gridDim.y, qi = blockIdx.z, g = h / (H / Hkv), tid = threadIdx.x;
@@ -2863,6 +2870,41 @@ __global__ void unpack_kv_fp8_to_f16_kernel(const uint8_t* kc, const uint8_t* vc
         if (k_out16) k_out16[idx] = f2h(e4m3fn_to_f32(kc[src]) * k_inv_scale);
         if (v_out16) v_out16[idx] = f2h(e4m3fn_to_f32(vc[src]) * v_inv_scale);
     }
+}
+
+// ---- the resident token path: every expert in VRAM and nothing of a token on the host
+
+// y [N] = W [N][K] FP16 . x [K]: a warp a row (the small dense matrices kept in FP16: sinks, dynamic taps, the router)
+template <int WARPS>
+__global__ void mv_f16_kernel(const uint16_t* __restrict__ W, int N, int K, const float* __restrict__ x,
+                              float* __restrict__ y) {
+    extern __shared__ float xs[];
+    for (int i = threadIdx.x; i < K; i += blockDim.x) xs[i] = x[i];
+    __syncthreads();
+    const int row = blockIdx.x * WARPS + (threadIdx.x >> 5), lane = threadIdx.x & 31;
+    if (row >= N) return;
+    const uint16_t* w = W + (size_t) row * K;
+    float a = 0.0f;
+    for (int i = lane; i < K; i += 32) a += h2f(w[i]) * xs[i];
+    a = wsum(a);
+    if (lane == 0) y[row] = a;
+}
+
+// the routed slots' tables from the picks, on the device: slot i's expert e = top[i] - its blocks, its token, its
+// scales; wt = the route weight times down's scale
+__global__ void route_gather_kernel(const int* __restrict__ top, const float* __restrict__ w,
+                                    const uint8_t* const* __restrict__ tab, const float* __restrict__ sg_t,
+                                    const float* __restrict__ su_t, const float* __restrict__ sd_t, int S, int K,
+                                    const uint8_t** blob, int* tok, int* inv, float* sg, float* su, float* wt) {
+    const int i = threadIdx.x;
+    if (i >= S) return;
+    const int e = top[i];
+    blob[i] = tab[e];
+    tok[i] = i / K;
+    inv[i] = i;
+    sg[i] = sg_t ? sg_t[e] : 1.0f;
+    su[i] = su_t ? su_t[e] : 1.0f;
+    wt[i] = w[i] * (sd_t ? sd_t[e] : 1.0f);
 }
 
 // ---- speculative decoding
@@ -3796,7 +3838,7 @@ void prep_qkv_r_f16(float* q, const float* q_clip, const float* k_in, uint16_t* 
     const int total = T * (2 * H + 2 * KV);
     prep_qkv_r_impl_kernel<uint16_t><<<(unsigned) total, 32, 0, s>>>(
         q, q_clip, k_in, kc, v_in, vc, r, r_clip, T, H, KV, D, d_rel, qk_clip, rel_clip, eps, pos, alpha, n_floor,
-        pos0, kv_cap, 1.0f, 1.0f);
+        pos0, kv_cap, 1.0f, 1.0f, nullptr);
     check("prep_qkv_r_f16");
 }
 
@@ -3808,7 +3850,7 @@ void prep_qkv_r_fp8(float* q, const float* q_clip, const float* k_in, uint8_t* k
     const int total = T * (2 * H + 2 * KV);
     prep_qkv_r_impl_kernel<uint8_t><<<(unsigned) total, 32, 0, s>>>(
         q, q_clip, k_in, kc, v_in, vc, r, r_clip, T, H, KV, D, d_rel, qk_clip, rel_clip, eps, pos, alpha, n_floor,
-        pos0, kv_cap, k_scale, v_scale);
+        pos0, kv_cap, k_scale, v_scale, nullptr);
     check("prep_qkv_r_fp8");
 }
 
@@ -3823,7 +3865,7 @@ void attn_multi_impl(const float* q, const float* r, const float* sink, const KV
     const int P = std::min(128, std::max(1, (nk + 63) / 64));
     float* part = scratch;
     attn_split_kernel<KV><<<dim3(H, P, nq), 128, 0, s>>>(q, r, kc, vc, kv_cap, H, Hkv, k0, nk, qpos0, qk_scale, proj,
-                                                          d_rel, extent, window, part);
+                                                          d_rel, extent, window, part, nullptr);
     check("attn_multi_split");
     attn_combine_kernel<<<dim3(H, nq), 128, 0, s>>>(sink, part, H, P, v_inv_scale, out);
     check("attn_multi_combine");
@@ -3887,7 +3929,7 @@ void attn_decode_impl(const float* q, const float* r, const float* sink, const K
     }
     float* part = scratch;
     attn_split_kernel<KV><<<dim3(H, P), 128, 0, s>>>(q, r, kc, vc, kv_cap, H, Hkv, k0, nk, qpos, qk_scale, proj, d_rel,
-                                                      extent, window, part);
+                                                      extent, window, part, nullptr);
     check("attn_decode_split");
     attn_combine_kernel<<<dim3(H, 1), 128, 0, s>>>(sink, part, H, P, v_inv_scale, out);
     check("attn_decode_combine");
@@ -3913,6 +3955,64 @@ void attn_decode_fp8(const float* q, const float* r, const float* sink, const ui
                      float* out, cudaStream_t s) {
     attn_decode_impl(q, r, sink, kc, vc, kv_cap, H, Hkv, D, k0, nk, qpos, qk_scale, v_inv_scale, proj, d_rel, extent,
                      window, scratch, out, s);
+}
+
+void mv_f16(const uint16_t* W, int N, int K, const float* x, float* y, cudaStream_t s) {
+    if (N <= 0) return;
+    mv_f16_kernel<4><<<(unsigned) ((N + 3) / 4), 128, (size_t) K * 4, s>>>(W, N, K, x, y);
+    check("mv_f16");
+}
+
+void route_gather(const int* top, const float* w, const uint8_t* const* tab, const float* sg_t, const float* su_t,
+                  const float* sd_t, int S, int K, const uint8_t** blob, int* tok, int* inv, float* sg, float* su,
+                  float* wt, cudaStream_t s) {
+    if (S <= 0) return;
+    if (S > 1024) {
+        std::fprintf(stderr, "ik2::k::route_gather: %d slots\n", S);
+        std::abort();
+    }
+    route_gather_kernel<<<1, (unsigned) ((S + 31) / 32 * 32), 0, s>>>(top, w, tab, sg_t, su_t, sd_t, S, K, blob, tok, inv,
+                                                                       sg, su, wt);
+    check("route_gather");
+}
+
+void prep_qkv_r_f16_at(float* q, const float* q_clip, const float* k_in, uint16_t* kc, const float* v_in, uint16_t* vc,
+                       float* r, const float* r_clip, int H, int KV, int D, int d_rel, float qk_clip, float rel_clip,
+                       float eps, const int* pos, bool log_scale, float alpha, float n_floor, int kv_cap,
+                       cudaStream_t s) {
+    prep_qkv_r_impl_kernel<uint16_t><<<(unsigned) (2 * H + 2 * KV), 32, 0, s>>>(
+        q, q_clip, k_in, kc, v_in, vc, r, r_clip, 1, H, KV, D, d_rel, qk_clip, rel_clip, eps, log_scale ? pos : nullptr,
+        alpha, n_floor, 0, kv_cap, 1.0f, 1.0f, pos);
+    check("prep_qkv_r_f16_at");
+}
+void prep_qkv_r_fp8_at(float* q, const float* q_clip, const float* k_in, uint8_t* kc, const float* v_in, uint8_t* vc,
+                       float* r, const float* r_clip, int H, int KV, int D, int d_rel, float qk_clip, float rel_clip,
+                       float eps, const int* pos, bool log_scale, float alpha, float n_floor, int kv_cap,
+                       float k_scale, float v_scale, cudaStream_t s) {
+    prep_qkv_r_impl_kernel<uint8_t><<<(unsigned) (2 * H + 2 * KV), 32, 0, s>>>(
+        q, q_clip, k_in, kc, v_in, vc, r, r_clip, 1, H, KV, D, d_rel, qk_clip, rel_clip, eps, log_scale ? pos : nullptr,
+        alpha, n_floor, 0, kv_cap, k_scale, v_scale, pos);
+    check("prep_qkv_r_fp8_at");
+}
+
+void attn_decode_f16_at(const float* q, const float* r, const float* sink, const uint16_t* kc, const uint16_t* vc,
+                        int kv_cap, int H, int Hkv, const int* pos, int P, float qk_scale, const float* proj,
+                        int d_rel, int extent, int window, float* scratch, float* out, cudaStream_t s) {
+    attn_split_kernel<uint16_t><<<dim3(H, P), 128, 0, s>>>(q, r, kc, vc, kv_cap, H, Hkv, 0, 0, 0, qk_scale, proj,
+                                                            d_rel, extent, window, scratch, pos);
+    check("attn_decode_f16_at (split)");
+    attn_combine_kernel<<<dim3(H, 1), 128, 0, s>>>(sink, scratch, H, P, 1.0f, out);
+    check("attn_decode_f16_at (combine)");
+}
+void attn_decode_fp8_at(const float* q, const float* r, const float* sink, const uint8_t* kc, const uint8_t* vc,
+                        int kv_cap, int H, int Hkv, const int* pos, int P, float qk_scale, float v_inv_scale,
+                        const float* proj, int d_rel, int extent, int window, float* scratch, float* out,
+                        cudaStream_t s) {
+    attn_split_kernel<uint8_t><<<dim3(H, P), 128, 0, s>>>(q, r, kc, vc, kv_cap, H, Hkv, 0, 0, 0, qk_scale, proj, d_rel,
+                                                           extent, window, scratch, pos);
+    check("attn_decode_fp8_at (split)");
+    attn_combine_kernel<<<dim3(H, 1), 128, 0, s>>>(sink, scratch, H, P, v_inv_scale, out);
+    check("attn_decode_fp8_at (combine)");
 }
 
 void unpack_kv_fp8_to_f16(const uint8_t* kc, const uint8_t* vc, int kv_cap, int k0, int nk, int KD,

@@ -212,6 +212,40 @@ void unpack_kv_fp8_to_f16(const uint8_t* kc, const uint8_t* vc, int kv_cap, int 
                           float k_inv_scale, float v_inv_scale, uint16_t* k_out16, uint16_t* v_out16,
                           cudaStream_t s);
 
+// ---- the resident token path: every expert in VRAM (found on the device), the position read on the device, so a
+// token needs nothing from the host between its embedding and its logits and its launches replay as one CUDA graph
+
+/// y [N] = W [N][K] . x [K] for a small dense matrix kept in FP16 (the sinks, a full layer's dynamic taps, the
+/// router): F32 sums, a warp a row.
+void mv_f16(const uint16_t* W, int N, int K, const float* x, float* y, cudaStream_t s);
+/// The routed slots' tables from the router's picks, all on the device.  top, w [S]: route()'s; tab [E]: where each
+/// expert's blocks are (gate | up | down); sg_t, su_t, sd_t [E]: the experts' scales (null: 1).  Slot i (token
+/// i / K): blob[i] = tab[top[i]], tok[i], inv[i] = i, sg[i], su[i], wt[i] = w[i] * down's scale - what
+/// experts_gate_up_swiglu, experts_down and moe_combine_f32 take.
+void route_gather(const int* top, const float* w, const uint8_t* const* tab, const float* sg_t, const float* su_t,
+                  const float* sd_t, int S, int K, const uint8_t** blob, int* tok, int* inv, float* sg, float* su,
+                  float* wt, cudaStream_t s);
+/// prep_qkv_r_f16 / _fp8 of one token whose position is at pos (device): the cache slot from it, and with log_scale
+/// (a full layer) q's and r's tau.
+void prep_qkv_r_f16_at(float* q, const float* q_clip, const float* k_in, uint16_t* kc, const float* v_in, uint16_t* vc,
+                       float* r, const float* r_clip, int H, int KV, int D, int d_rel, float qk_clip, float rel_clip,
+                       float eps, const int* pos, bool log_scale, float alpha, float n_floor, int kv_cap,
+                       cudaStream_t s);
+void prep_qkv_r_fp8_at(float* q, const float* q_clip, const float* k_in, uint8_t* kc, const float* v_in, uint8_t* vc,
+                       float* r, const float* r_clip, int H, int KV, int D, int d_rel, float qk_clip, float rel_clip,
+                       float eps, const int* pos, bool log_scale, float alpha, float n_floor, int kv_cap,
+                       float k_scale, float v_scale, cudaStream_t s);
+/// attn_decode_f16 / _fp8 of the token at position *pos (device): the keys it may see follow from the position and
+/// the window (1 << 30: every one), split P ways whatever their number (P fixed, so the launches do not change from
+/// a token to the next).  scratch: H x P x 130 floats.
+void attn_decode_f16_at(const float* q, const float* r, const float* sink, const uint16_t* kc, const uint16_t* vc,
+                        int kv_cap, int H, int Hkv, const int* pos, int P, float qk_scale, const float* proj,
+                        int d_rel, int extent, int window, float* scratch, float* out, cudaStream_t s);
+void attn_decode_fp8_at(const float* q, const float* r, const float* sink, const uint8_t* kc, const uint8_t* vc,
+                        int kv_cap, int H, int Hkv, const int* pos, int P, float qk_scale, float v_inv_scale,
+                        const float* proj, int d_rel, int extent, int window, float* scratch, float* out,
+                        cudaStream_t s);
+
 // ---- speculative decoding: the draft model's (Inkling 2's DSpark drafter, mtp.safetensors) and the rollback's
 
 /// hist = the last 3 rows of [old (3 rows of C); x (T rows of C)] - a short conv's history after T of the inputs it
