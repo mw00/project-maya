@@ -80,14 +80,14 @@ Layer split 13/11/11/10, 32K context, MTP drafts (82-93% accepted), `--bench`-st
 | prompt, 2K / 8K tokens, `--prefill 512` | 133 / 220 |
 | prompt, 2K / 8K tokens, `--prefill 1024` | 131 / 257 |
 | prompt, 4K tokens: `--prefill 1024` / 1536 / 2048 | 175 / 173 / 160 |
-| prompt, 4K tokens, `--prefill 1024` with `STRATA_GLM_PREFILL_CPU=0` / `STRATA_GLM_PRESTAGE=96` / `STRATA_GLM_PREFILL_SUB=512` | 147 / 169 / 175 |
+| prompt, 4K tokens, `--prefill 1024` with `MAYA_GLM_PREFILL_CPU=0` / `MAYA_GLM_PRESTAGE=96` / `MAYA_GLM_PREFILL_SUB=512` | 147 / 169 / 175 |
 
 Decode is bound by the host: the RAM tier's experts (about a fifth of the routes, 2-3 a layer) go through the CPU lane (0.32 ms an
 expert, the host's 26 GB/s DDR read bandwidth) or over PCIe (1.1 ms), and the GPU waits for them (`moe_cpu_wait` is the largest
 single category after the idle time of the layer split). So GEMV speed buys little: the Q4_K kernel above, 1.5x faster in isolation
 (`kda_proj_mv` -34% in a profiled run), gave 22.31 -> 23.52 tokens/s (+5.4%) over three interleaved A/B rounds (all nine paired
 questions faster; one unpaired A/B pair differed by less than the +-5% run-to-run noise, so compare interleaved runs). CPU-lane
-threads (8 or 11 equal, 14 slower), `STRATA_GLM_PREFETCH_N` and `RAM_RESIDENT` (stops with "454 of 544 slots": the tier is 33 GB of
+threads (8 or 11 equal, 14 slower), `MAYA_GLM_PREFETCH_N` and `RAM_RESIDENT` (stops with "454 of 544 slots": the tier is 33 GB of
 the 37.3 needed) did not help. More free RAM and more memory bandwidth are what would. Prompts are bound the same way: a 1024-token chunk stages or computes about 100 non-resident experts a layer, the CPU
 lane's multi-token dots run at roughly 0.26 TFLOP/s, and the three idle cards wait for the working one.
 
