@@ -2427,7 +2427,10 @@ free VRAM its start's choices hold with, against what the setup's reading saw. T
 `data/vram-room.json` for this PC, the card and its driver (a new driver or card is measured again), and from then on the setup's line says
 "measured" instead of "estimated"; the Models page counts it too. With a measured figure the setup claims the
 drafter by its sums without their safety margin, as the engine then decides (the contexts and the cache's rows keep
-theirs). Linux and AMD cards are counted as before.
+theirs). A config on several cards (a layer split or tensor parallel) is measured at its first start on them
+together: the engine also says how much less free on every card at once its choices hold with, and each card's share
+is kept for that set of cards (a start on one of them alone is measured on its own). Linux and AMD cards are counted
+as before.
 
 **Not available for Hy4-Flash yet** (the dashboard offers no switch for them): `--parallel` (one request at a time
 for now); Mac, and AMD on Windows.

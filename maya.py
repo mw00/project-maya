@@ -9122,6 +9122,8 @@ def hy4_engine_room(pc: dict, probe=None, saved: dict | None = None) -> dict:
     figure measured later with it).  On Linux the measured part alone is nvidia-smi's total less its used (nothing
     else is kept there), so only Windows is measured.  Not measured: another OS, AMD, a unified-memory GPU, a card a
     Maya engine holds now (its own VRAM would be counted as kept: the reading as before), no answer from the driver.
+    Several cards: each one's share from their record together where a start on all of them measured it
+    (hy4_room_set_key - a split's or a tensor-parallel group's plan is not one card's), else each card's own.
     probe: the readings (tests; else cuda_room_bytes); saved: HY4_ROOM_STORE's records (tests; else read)."""
     gpus = (pc or {}).get("gpus") or []
     if not WIN or (pc or {}).get("backend", "cuda") != "cuda" or not gpus or hy4_amd(gpus) or \
@@ -9132,13 +9134,19 @@ def hy4_engine_room(pc: dict, probe=None, saved: dict | None = None) -> dict:
     cards = [g for g in cards if g.get("index") not in busy]
     got = (cuda_room_bytes() if probe is None else probe) if cards else {}
     saved = hy4_room_load() if saved is None else saved
+    # (several cards: their record together where one start on all of them measured it - hy4_room_measure_set)
+    together = ((saved.get(hy4_room_set_key(cards)) or {}).get("cards") or {}) \
+        if len(cards) > 1 and len(cards) == len(gpus) else {}
     out = {}
     for g in cards:
         r = got.get(S._pci_key(str(g["pci"])))
         if r:
             one, two, tot = (float(x) / 2**30 for x in r)
             rec = saved.get(hy4_room_key(g)) or {}
-            if isinstance(rec.get("own_gib"), (int, float)):
+            mine = together.get(S._pci_key(str(g["pci"])))
+            if isinstance(mine, (int, float)):
+                own, how = float(mine), "measured"
+            elif isinstance(rec.get("own_gib"), (int, float)):
                 own, how = float(rec["own_gib"]), "measured"
             else:
                 own = max(max(one - two, 0.0) + max(float(g["vram_gb"]) - tot, 0.0), HY4_FIT_CUDA_OWN_GIB)
@@ -9169,24 +9177,69 @@ def hy4_room_due(cfg: dict, gpus: list | None = None, saved: dict | None = None,
     (the engine's --room-report, then hy4_room_measure) - Windows, an NVIDIA card, the config on one GPU, no record
     of it for this PC, card and driver yet - with what the setup's CUDA probe sees of it now, before the engine holds
     it ("cuda_probe": cuda_room_bytes' reading; Windows' figure for another program drops as the engine fills the
-    card); None otherwise, or where the probe has no reading.  gpus, probe: setup.py's list and the readings (tests;
-    else read)."""
+    card); None otherwise, or where the probe has no reading.  The config on several GPUs (a layer split or tensor
+    parallel): {"name", "cards": each card so} where these cards have no record together yet (hy4_room_set_key;
+    each card is measured in it: hy4_room_measure_set).  gpus, probe: setup.py's list and the readings (tests; else
+    read)."""
     if not WIN or (cfg.get("backend") or "cuda") != "cuda" or             Path(str(cfg.get("exe") or "")).stem.lower() != "maya-hy4":
         return None
     sel = cfg.get("gpu")                               # (one card, several, or "0,2" - serve's gpu_list)
     sel = [] if sel is None or sel == "" else list(sel) if isinstance(sel, (list, tuple)) else str(sel).split(",")
     sel = [int(str(x).strip()) for x in sel if str(x).strip() != ""]
-    if len(sel) != 1:
+    if not sel:
         return None
     found = {g["index"]: g for g in ((S.gpus() if gpus is None else gpus) or [])}
-    g = found.get(sel[0])
-    if not g or not g.get("pci") or not g.get("vram_gb") or g.get("unified_memory"):
+    cards = [found.get(i) for i in sel]
+    if any(not g or not g.get("pci") or not g.get("vram_gb") or g.get("unified_memory") for g in cards):
         return None
     saved = hy4_room_load() if saved is None else saved
-    if hy4_room_key(g) in saved:
+    if (hy4_room_key(cards[0]) if len(cards) == 1 else hy4_room_set_key(cards)) in saved:
         return None
-    r = (cuda_room_bytes() if probe is None else probe).get(S._pci_key(str(g["pci"])))
-    return dict(g, cuda_probe=[int(x) for x in r]) if r else None
+    probe = cuda_room_bytes() if probe is None else probe
+    out = []
+    for g in cards:
+        r = probe.get(S._pci_key(str(g["pci"])))
+        if not r:
+            return None
+        out.append(dict(g, cuda_probe=[int(x) for x in r]))
+    return out[0] if len(out) == 1 else {"name": f"{len(out)} cards", "cards": out}
+
+
+def hy4_room_set_key(cards: list) -> str:
+    """What the measured shares of several cards in one start (HY4_ROOM_STORE) hold for: this PC and the cards (each
+    one's name, PCI place, VRAM and driver, as hy4_room_key) - another card in the set, or a driver, is measured
+    again; a start on one of them alone has its own record (hy4_room_key)."""
+    return "|".join([platform.node() or "?", "set"]) + "|" + "+".join(sorted(hy4_room_key(g).split("|", 1)[1]
+                                                                              for g in cards))
+
+
+def hy4_room_store(key: str, rec: dict, same) -> dict | None:
+    """rec kept in HY4_ROOM_STORE under key - a record same(key) says is the same cards' under another driver gone."""
+    store = {k: v for k, v in hy4_room_load().items() if not same(k)}
+    store[key] = rec
+    try:
+        HY4_ROOM_STORE.parent.mkdir(parents=True, exist_ok=True)
+        HY4_ROOM_STORE.write_text(json.dumps(store, indent=1) + "\n", encoding="utf-8")
+    except OSError:
+        return None
+    return rec
+
+
+def hy4_room_need(cfg: dict, info: dict) -> tuple:
+    """(the setup's sums for the start the engine reported on - hy4_config_need_gib with the cache's rows and the
+    drafters' room the engine took, no margin -, its context, size, layout); need None where there are none."""
+    args, inst = [str(x) for x in cfg.get("args") or []], cfg.get("installer") or {}
+
+    def arg(k: str):
+        return args[args.index(k) + 1] if k in args[:-1] else None
+    quant, layout = inst.get("hy4_quant") or "", inst.get("layout") or HY4_STANDARD
+    ctx = int(arg("--max-context") or 0)
+    need = hy4_config_need_gib(quant, layout, ctx, chunk=int(arg("--chunk")) if arg("--chunk") else None,
+                               reserve_gb=float(arg("--reserve-gb")) if arg("--reserve-gb") else None,
+                               q8=info.get("room_rows") == "q8",
+                               mtp=bool(int(info.get("room_mtp") or 0)) if "room_mtp" in info else "--mtp" in args,
+                               dfly2=bool(int(info.get("room_drafter") or 0)), margin=False) if ctx else None
+    return need, ctx, quant, layout
 
 
 def hy4_room_measure(cfg: dict, card: dict, info: dict, probe=None, save: bool = True) -> dict | None:
@@ -9199,6 +9252,8 @@ def hy4_room_measure(cfg: dict, card: dict, info: dict, probe=None, save: bool =
     hy4_room_due's, else probe's - free with a context held) - the
     share is room - probe.  Not kept: a start that streams its cache (other sums), a figure out of all reason
     (beyond -1 / +2 GiB), no reading.  The record, or None."""
+    if card.get("cards"):
+        return hy4_room_measure_set(cfg, card["cards"], info, probe, save)
     try:
         gpus = str(info.get("room_gpus") or "")
         mine = S._pci_key(str(card.get("pci") or ""))
@@ -9207,17 +9262,7 @@ def hy4_room_measure(cfg: dict, card: dict, info: dict, probe=None, save: bool =
         if got is None or int(info.get("room_streamed") or 0):
             return None
         free, slack = float(got[1]) / 2**30, float(got[2]) / 2**30
-        args, inst = [str(x) for x in cfg.get("args") or []], cfg.get("installer") or {}
-
-        def arg(k: str):
-            return args[args.index(k) + 1] if k in args[:-1] else None
-        quant, layout = inst.get("hy4_quant") or "", inst.get("layout") or HY4_STANDARD
-        ctx = int(arg("--max-context") or 0)
-        need = hy4_config_need_gib(quant, layout, ctx, chunk=int(arg("--chunk")) if arg("--chunk") else None,
-                                   reserve_gb=float(arg("--reserve-gb")) if arg("--reserve-gb") else None,
-                                   q8=info.get("room_rows") == "q8",
-                                   mtp=bool(int(info.get("room_mtp") or 0)) if "room_mtp" in info else "--mtp" in args,
-                                   dfly2=bool(int(info.get("room_drafter") or 0)), margin=False) if ctx else None
+        need, ctx, quant, layout = hy4_room_need(cfg, info)
         r = card.get("cuda_probe") or (probe or {}).get(mine)
         if need is None or not r:
             return None
@@ -9232,15 +9277,50 @@ def hy4_room_measure(cfg: dict, card: dict, info: dict, probe=None, save: bool =
            "drafter": bool(int(info.get("room_drafter") or 0)), "quant": quant, "layout": layout,
            "measured": time.strftime("%Y-%m-%d %H:%M:%S")}
     if save:
-        key = hy4_room_key(card)
-        store = {k: v for k, v in hy4_room_load().items()       # (this card's figure under another driver: gone)
-                 if k.split("|")[:3] != key.split("|")[:3]}
-        store[key] = rec
-        try:
-            HY4_ROOM_STORE.parent.mkdir(parents=True, exist_ok=True)
-            HY4_ROOM_STORE.write_text(json.dumps(store, indent=1) + "\n", encoding="utf-8")
-        except OSError:
+        key = hy4_room_key(card)                       # (this card's figure under another driver: gone)
+        return hy4_room_store(key, rec, lambda k: k.split("|")[:3] == key.split("|")[:3])
+    return rec
+
+
+def hy4_room_measure_set(cfg: dict, cards: list, info: dict, probe=None, save: bool = True) -> dict | None:
+    """hy4_room_measure for a start on several cards (a layer split or tensor parallel): the setup's sums for it are
+    one figure for the cards together (need: hy4_usable_gib adds the cards' rooms), and the engine says how much less
+    free on every card at once its choices hold with (room_joint - each card's own figure counts the others' spare
+    too where a layer split moves layers to a card with room).  So the cards' shares together are need + n * joint
+    less what the probe saw of them, each card's in proportion to what the start takes on it (its probe less joint):
+    a tensor-parallel group's cache on every member, a split's layers by the cards' room.  Kept as one record for
+    these cards (hy4_room_set_key: "cards", each one's share by PCI place) - a start on one of them alone has its own.
+    Not kept: as hy4_room_measure's, or a share beyond -2 / +2 GiB on a card."""
+    try:
+        if int(info.get("room_streamed") or 0) or "room_joint" not in info:
             return None
+        joint = float(info["room_joint"]) / 2**30
+        need, ctx, quant, layout = hy4_room_need(cfg, info)
+        seen = []
+        for g in cards:
+            r = g.get("cuda_probe") or (probe or {}).get(S._pci_key(str(g.get("pci") or "")))
+            if not r:
+                return None
+            seen.append(float(r[0]) / 2**30)
+        takes = [x - joint for x in seen]
+        if need is None or min(takes) <= 0:
+            return None
+        own = [t * (need / sum(takes) - 1.0) for t in takes]
+        if not all(-2.0 <= x <= 2.0 for x in own):
+            return None
+    except (TypeError, ValueError, IndexError, KeyError, AttributeError, ZeroDivisionError):
+        return None
+    rec = {"cards": {S._pci_key(str(g["pci"])): round(x, 3) for g, x in zip(cards, own)},
+           "probe_free_gib": [round(x, 3) for x in seen], "joint_gib": round(joint, 3), "need_gib": round(need, 3),
+           "context": ctx, "rows": info.get("room_rows"), "tp": int(info.get("room_tp") or 0),
+           "drafter": bool(int(info.get("room_drafter") or 0)), "mtp": bool(int(info.get("room_mtp") or 0)),
+           "quant": quant, "layout": layout, "measured": time.strftime("%Y-%m-%d %H:%M:%S")}
+    if save:
+        key = hy4_room_set_key(cards)                  # (these cards' figures under other drivers: gone)
+
+        def bare(k: str) -> list:                      # (a set key's cards without their drivers)
+            return sorted("|".join(c.split("|")[:3]) for c in "|".join(k.split("|")[2:]).split("+"))
+        return hy4_room_store(key, rec, lambda k: k.split("|")[:2] == key.split("|")[:2] and bare(k) == bare(key))
     return rec
 
 

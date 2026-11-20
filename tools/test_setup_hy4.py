@@ -1970,12 +1970,60 @@ class WindowsRoom(unittest.TestCase):
             self.assertIsNone(maya.hy4_room_due(self.CFG, gpus=gl, saved={maya.hy4_room_key(gl[0]): {"own_gib": 0.5}},
                                                 probe=pr))
             self.assertIsNone(maya.hy4_room_due(self.CFG, gpus=gl, saved={}, probe={}))   # (no reading: no figure)
-            for cfg in (dict(self.CFG, gpu=[0, 1]), dict(self.CFG, gpu=None), dict(self.CFG, gpu=[3]),
+            for cfg in (dict(self.CFG, gpu=None), dict(self.CFG, gpu=[3]), dict(self.CFG, gpu=[0, 3]),
                         dict(self.CFG, exe="C:/Maya/build/maya-ds4.exe"), dict(self.CFG, backend="hip")):
                 self.assertIsNone(maya.hy4_room_due(cfg, gpus=gl, saved={}, probe=pr), cfg)
+            # (several cards: each one, measured in one start on all of them - unless they have a record together)
+            both = maya.hy4_room_due(dict(self.CFG, gpu=[0, 1]), gpus=gl, saved={}, probe=pr)
+            self.assertEqual([c["index"] for c in both["cards"]], [0, 1])
+            self.assertIsNotNone(maya.hy4_room_due(dict(self.CFG, gpu=[0, 1]), gpus=gl, probe=pr,
+                                                   saved={maya.hy4_room_key(gl[0]): {"own_gib": 0.5}}))
+            self.assertIsNone(maya.hy4_room_due(dict(self.CFG, gpu=[0, 1]), gpus=gl, probe=pr,
+                                                saved={maya.hy4_room_set_key(gl): {"cards": {}}}))
+            self.assertIsNone(maya.hy4_room_due(dict(self.CFG, gpu=[0, 1]), gpus=gl, saved={},
+                                                probe={"0000:01:00.0": self.URANUS}))   # (one card not read)
             self.assertIsNone(maya.hy4_room_due(self.CFG, gpus=[dict(gl[0], unified_memory=True)], saved={}, probe=pr))
         with patch.object(maya, "WIN", False):
             self.assertIsNone(maya.hy4_room_due(self.CFG, gpus=gl, saved={}, probe=pr))
+
+    def test_several_cards_each_measured_in_one_start(self):
+        # two RTX 3050 8 GB under Windows, the 8 GB layout split over both at 8K: the engine's --room-report says how
+        # much less free on both at once its choices hold with (room_joint); the cards' shares together are the
+        # setup's sums + 2 x that - what the probe saw, each card's by what the start takes on it
+        cfg = dict(self.CFG, gpu=[0, 1])
+        gl = self.pc(n=2)["gpus"]
+        probe = {"0000:01:00.0": self.URANUS, "0000:02:00.0": (7356038656, 7284735488, 8589410304)}
+        info = {"room_rows": "f16", "room_drafter": 0, "room_mtp": 0, "room_streamed": 0, "room_tp": 0,
+                "room_gpus": "0000:01:00.0,7556038656,4294967296;0000:02:00.0,7356038656,4294967296",
+                "room_joint": str(2 * 2**30)}                                  # (each alone 4 GiB, both at once 2)
+        with patch.object(maya, "WIN", True):
+            due = maya.hy4_room_due(cfg, gpus=gl, saved={}, probe=probe)
+            rec = maya.hy4_room_measure(cfg, due, info, probe=AssertionError("not asked"))
+            self.assertIsNone(maya.hy4_room_due(cfg, gpus=gl, probe=AssertionError("not asked")))
+            self.assertIsNotNone(maya.hy4_room_due(self.CFG, gpus=gl, probe=probe))   # (GPU 0 alone: its own)
+        need = maya.hy4_config_need_gib("maya-xs", "8gb", 8192, chunk=256, reserve_gb=0.5, margin=False)
+        seen = [self.URANUS[0] / 2**30, 7356038656 / 2**30]
+        takes = [x - 2.0 for x in seen]
+        own = [t * (need / sum(takes) - 1.0) for t in takes]
+        self.assertEqual(list(rec["cards"]), [maya.S._pci_key("00000000:01:00.0"), maya.S._pci_key("00000000:02:00.0")])
+        for got, want in zip(rec["cards"].values(), own):
+            self.assertAlmostEqual(got, want, places=3)
+        self.assertAlmostEqual(sum(rec["cards"].values()), need + 2 * 2.0 - sum(seen), places=2)
+        self.assertEqual(list(maya.hy4_room_load()), [maya.hy4_room_set_key(gl)])
+        # the setup counts each card's share for these two together; a start on one of them alone is not measured yet
+        pc = self.pc(n=2)
+        got = self.room(pc, probe)
+        self.assertEqual([g["engine_room_how"] for g in pc["gpus"]], ["measured", "measured"])
+        self.assertAlmostEqual(got[0], seen[0] + own[0], places=3)
+        self.assertAlmostEqual(got[1], seen[1] + own[1], places=3)
+        one = self.pc()
+        self.room(one, {"0000:01:00.0": self.URANUS})
+        self.assertEqual(one["gpus"][0]["engine_room_how"], "estimated")
+        # a start that streams its cache, an engine without room_joint, a share out of all reason: not kept
+        for bad in ({"room_streamed": 1}, {"room_joint": None}, {"room_joint": str(int(7.0 * 2**30))}):
+            i2 = {k: v for k, v in dict(info, **bad).items() if v is not None}
+            with patch.object(maya, "WIN", True):
+                self.assertIsNone(maya.hy4_room_measure(cfg, due, i2, save=False), bad)
 
     def test_measured_on_windows_only(self):
         one, two, tot = self.URANUS

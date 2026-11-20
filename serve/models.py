@@ -978,7 +978,7 @@ def hy4_cards(cfg: dict, gpus: list) -> dict:
     the drafter's sums then as the setup's, without margins)."""
     cards = {g["index"]: g for g in gpus}
     room = (cfg.get("installer") or {}).get("engine_room_gb") or {}
-    own = hy4_room_own() if any(isinstance(v, list) and len(v) >= 3 for v in room.values()) else {}
+    own = hy4_room_own(gpus_of(cfg)) if any(isinstance(v, list) and len(v) >= 3 for v in room.values()) else {}
     for k, v in room.items():
         try:
             i, gib, vram = int(k), float(v[0]), float(v[1])
@@ -1017,18 +1017,24 @@ def hy4_room_measured(cfg: dict, card: dict, info: dict) -> dict | None:
     except Exception:  # noqa: BLE001 - no figure: the setup keeps its first guess
         rec = None
     _gpu_cache.pop("room_own", None)
-    if rec:
+    if rec and rec.get("cards"):                       # (several cards: each one's share, from one start on all)
+        print(f"[maya] VRAM: CUDA's own share of each of these {len(rec['cards'])} cards measured at this first start "
+              "on them together: " + ", ".join(f"{v:.2f}" for v in rec["cards"].values()) + " GB (the setup and the "
+              "Models page count them for these cards from now on)", flush=True)
+    elif rec:
         print(f"[maya] VRAM: CUDA's own share of {card.get('name') or 'the card'} measured at this first start: "
               f"{rec['own_gib']:.2f} GB (the setup and the Models page count it from now on)", flush=True)
     return rec
 
 
-def hy4_room_own() -> dict:
+def hy4_room_own(gpus: list | None = None) -> dict:
     """{GPU index: GiB} - CUDA's own share of each of this PC's NVIDIA cards as the engine measured it (maya.py's
-    HY4_ROOM_STORE, for this PC, the card and its driver now); {} where none is kept or nothing can be read."""
+    HY4_ROOM_STORE, for this PC, the card and its driver now); {} where none is kept or nothing can be read.  gpus
+    (a config's cards, several): their shares from the record of a start on all of them where there is one (maya.py's
+    hy4_room_set_key), the others' as before."""
     now = time.time()
     hit = _gpu_cache.get("room_own")
-    if hit and now - hit[0] < 60:
+    if hit and now - hit[0] < 60 and hit[2] == tuple(gpus or ()):
         return hit[1]
     out = {}
     try:
@@ -1038,13 +1044,21 @@ def hy4_room_own() -> dict:
         import maya                                    # (the setup's own records; nothing runs on import)
         saved = maya.hy4_room_load()
         if saved:
-            for g in maya.S.gpus() or []:
+            found = maya.S.gpus() or []
+            for g in found:
                 rec = saved.get(maya.hy4_room_key(g)) or {}
                 if isinstance(rec.get("own_gib"), (int, float)):
                     out[int(g["index"])] = float(rec["own_gib"])
+            mine = [g for g in found if g.get("index") in set(gpus or ())]
+            if len(gpus or ()) > 1 and len(mine) == len(set(gpus)):
+                together = (saved.get(maya.hy4_room_set_key(mine)) or {}).get("cards") or {}
+                for g in mine:
+                    v = together.get(maya.S._pci_key(str(g.get("pci") or "")))
+                    if isinstance(v, (int, float)):
+                        out[int(g["index"])] = float(v)
     except Exception:  # noqa: BLE001 - no record to read: the setup's figure stands
         out = {}
-    _gpu_cache["room_own"] = (now, out)
+    _gpu_cache["room_own"] = (now, out, tuple(gpus or ()))
     return out
 
 

@@ -3104,8 +3104,29 @@ struct Model::Impl {
                                       i, bus, f / 1e9, lo / 1e9);
                         say += gb;
                     }
+                    // (several GPUs: also how much less free on EVERY one at once the choices hold with - a layer split
+                    //  moves layers to a GPU with room, so each one's own figure above counts the others' spare too;
+                    //  the setup sums the cards' room, so the cards together are what it is set against)
+                    double joint = 0;
+                    if (free0.size() > 1) {
+                        double lo = 0, hi = *std::min_element(free0.begin(), free0.end());
+                        const std::vector<double> f = free0;
+                        while (hi - lo > 1048576.0) {
+                            const double mid = 0.5 * (lo + hi);
+                            for (size_t i = 0; i < free0.size(); ++i) free0[i] = f[i] - mid;
+                            (pick() == ref ? lo : hi) = mid;
+                        }
+                        free0 = f;
+                        joint = lo;
+                        char jb[120];
+                        std::snprintf(jb, sizeof jb, "; on all %zu at once %.2f GB of each spare", free0.size(), joint / 1e9);
+                        say += jb;
+                    }
+                    char tb[96];
+                    std::snprintf(tb, sizeof tb, " room_joint=%.0f room_tp=%d", joint, ref.tp);
                     room_out = std::string("room_rows=") + (ref.q8 ? "q8" : "f16") + " room_drafter=" + (ref.df ? "1" : "0") +
-                               " room_mtp=" + (ref.mt ? "1" : "0") + " room_streamed=" + (streamed ? "1" : "0") + " room_gpus=" + gpus;
+                               " room_mtp=" + (ref.mt ? "1" : "0") + " room_streamed=" + (streamed ? "1" : "0") + " room_gpus=" + gpus +
+                               (free0.size() > 1 ? tb : "");
                     room_line = "INFO VRAM room (--room-report): " + say + " - this start's choices hold with that much "
                                 "less free (" + room_out + ")";
                 }
