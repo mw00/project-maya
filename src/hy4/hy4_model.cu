@@ -21,6 +21,7 @@
 #include "hy4_plan.hpp"
 #include "../ds4/ds4_iq.cuh"
 
+#include <atomic>
 #include <cublas_v2.h>
 #if defined(__linux__)
 #include <unistd.h>
@@ -326,6 +327,7 @@ struct Gpu {
     // ... and its attention as GEMMs: the scores, the probabilities (F16), a ring's keys in order, the picks' mask
     float *sS = nullptr, *dmask = nullptr;
     uint16_t *sP = nullptr, *kbuf = nullptr;
+    size_t sS_n = 0;   // (sS's and sP's values)
 
     template <typename T>
     bool alloc(T*& p, size_t n, std::string& err) {
@@ -542,7 +544,8 @@ struct Model::Impl {
         summer.reset();
         for (void* p : {(void*) tp_part, (void*) tp_sum, (void*) tp_xo, (void*) tp_fout, (void*) tp_fin, (void*) tp_fx,
                         (void*) tp_route, (void*) tp_froute, (void*) tp_bout, (void*) tp_bin, (void*) tp_route2,
-                        (void*) tp_froute2, (void*) tp_part16, (void*) tp_sum16, (void*) tp_pscale, (void*) tp_sscale})
+                        (void*) tp_froute2, (void*) tp_part16, (void*) tp_sum16, (void*) tp_pscale, (void*) tp_sscale,
+                        (void*) tp_ixw, (void*) tp_ixf})
             if (p) cudaFreeHost(p);
     }
 
@@ -768,6 +771,41 @@ struct Model::Impl {
     static constexpr int kDense[2] = {24576, 16384};
     static constexpr int kDenseTop = 65536;   // (HY4_DENSE_MAX's most)
     int dense_max = kDenseBase;
+    // The indexer's scores on the prompt path.  A token scores every pooled key before it, so the scoring grows with
+    // the prompt's length without a bound (the picks themselves stay top_k): past ix_gemm_from positions a sub-batch's
+    // heads . keys products are GEMMs over slabs of the pools (ix_gemm 16: F16 on the tensor cores, 32: F32) and a
+    // small kernel sums the heads - the same picks but where two scores at the threshold are a rounding apart.  Up to
+    // ix_gemm_from (kDenseBase: the prompts that read as before) and on the token path, ix_score's own kernel.
+    // No buffer of its own: the queries in xh16, an F32 cache's pooled keys in wband, the products in sS.
+    // HY4_IX_GEMM=0 / 16 / 32: that one (default: 16 where every GPU has tensor cores, not on AMD);
+    // HY4_IX_GEMM_FROM=N: from N positions on.
+    int ix_gemm = 0;
+    int ix_gemm_from = kDenseBase;
+    // The indexed layers' attention past the dense span, on the prompt path: a sub-batch's tokens pick top_k keys
+    // each, and neighbours pick much the same pools - so the pools any of them picks (ix_union) are gathered once and
+    // the dense path's two GEMMs run over those rows alone, each token's own picks kept by the mask (attn_sparse).
+    // Taken where the rows fit the dense path's buffers (dense_max keys: no buffer of its own), else the gathering
+    // kernel as before.  On where the dense span is tried (tensor cores, not AMD); HY4_SPARSE=0 / 1 sets it.
+    bool sparse_attn = false;
+    int sparse_sub = kSub;   // (HY4_SPARSE_SUB: the tokens a gathered piece)
+    // (inside the dense span, past kDenseBase: the gathered rows taken where they are under this share of the span's -
+    //  the GEMMs' time goes with the rows; HY4_SPARSE_FRAC, percent; 0: the span's own dense path there)
+    int sparse_frac = 75;
+    const bool sparse_stat = std::getenv("HY4_SPARSE_STAT") != nullptr;
+    std::atomic<long long> sp_st[4] = {};   // (sub-batches taken, their rows, not taken, the most rows)
+    const bool ix_check = std::getenv("HY4_IX_CHECK") != nullptr;
+    std::atomic<long long> ix_chk[4] = {};   // (tokens, tokens with another pick, picks, other picks)
+    // Tensor parallel, the prompt path: every member scored and picked every token of a chunk for its own heads - the
+    // same work N times.  With ix_split member m scores and picks its share of the chunk's sub-batches alone, the
+    // picks go round as 16-bit pool numbers through the host's memory (tp_ixw [Tc][ixw_ld], member j's flag in
+    // tp_ixf), each member unpacks the others' (ix_unpack: ix_select's own form) - the same picks, the scoring's time
+    // a member's share.  Past ix_split_from positions, where a pool's number fits 16 bits.  On but on AMD;
+    // HY4_IX_SPLIT=0 / 1, HY4_IX_SPLIT_FROM=N.
+    bool ix_split = false;
+    int ix_split_from = kDenseBase;
+    uint16_t* tp_ixw = nullptr;
+    unsigned* tp_ixf = nullptr;
+    int ixw_ld = 0;
     // the prompt path's F16 rows of the cache a layer's dense sub-batches read (kbuf): a window's and a chunk's, or an
     // indexed layer's up to dense_max (an 8-bit cache dequantized there; F16's read in place but where a ring wraps)
     size_t deq_rows() const { return dense_kbuf_rows((size_t) g.n_swa, (size_t) Tc, (size_t) dense_max, kSub); }
@@ -1417,6 +1455,12 @@ struct Model::Impl {
         std::memset(tp_fout, 0, sizeof(unsigned) * (size_t) (tp + H) * kLine);
         std::memset(tp_fin, 0, sizeof(unsigned) * kLine);
         std::memset(tp_fx, 0, sizeof(unsigned) * kLine);
+        if (g.ix_top_k > 0 && g.ix_kpool > 0) {   // (ix_split's picks: a pool's 16-bit number each, rows of 16 bytes)
+            ixw_ld = (g.ix_top_k / g.ix_kpool + 7) / 8 * 8;
+            CK(cudaHostAlloc(&tp_ixw, sizeof(uint16_t) * T * (size_t) ixw_ld, fl));
+            CK(cudaHostAlloc(&tp_ixf, sizeof(unsigned) * (size_t) tp * kLine, fl));
+            std::memset(tp_ixf, 0, sizeof(unsigned) * (size_t) tp * kLine);
+        }
         tp_cnt.assign((size_t) tp, nullptr);
         for (int j = 0; j < tp; ++j) {
             Gpu& gp = G[(size_t) mem[(size_t) j]];
@@ -1896,6 +1940,7 @@ struct Model::Impl {
         at = 0;
         carve = true;
         all();
+        gp.sS_n = att;
         gp.lo = gp.pos + T;
         gp.nk = gp.pos + 2 * T;
         return true;
@@ -2045,20 +2090,37 @@ struct Model::Impl {
             // F16 products of a longer span were not measured against the gathering kernel), or HY4_DENSE_MAX's own
             std::vector<int> spans;
             const char* de = std::getenv("HY4_DENSE_MAX");
+            bool tensor_cores = !G.empty();
+            for (Gpu& gp : G) {
+                cudaDeviceProp pi{};
+                CK(cudaGetDeviceProperties(&pi, gp.dev));
+                tensor_cores = tensor_cores && pi.major >= 7;
+            }
+#if defined(STRATA_USE_HIP)
+            tensor_cores = false;   // (AMD: measured slower past kDenseBase on a 16K prompt - the span stays)
+#endif
+            ix_gemm = tensor_cores ? 16 : 0;
+            if (const char* ie = std::getenv("HY4_IX_GEMM")) {
+                const int m = std::atoi(ie);
+                ix_gemm = m == 16 || m == 32 ? m : 0;
+            }
+            if (const char* ie = std::getenv("HY4_IX_GEMM_FROM")) ix_gemm_from = std::max(0, std::atoi(ie));
+            sparse_attn = tensor_cores;
+            if (const char* se = std::getenv("HY4_SPARSE")) sparse_attn = std::atoi(se) != 0;
+            if (const char* se = std::getenv("HY4_SPARSE_SUB")) sparse_sub = std::max(8, std::min(kSub, std::atoi(se)));
+            if (const char* se = std::getenv("HY4_SPARSE_FRAC")) sparse_frac = std::max(0, std::min(100, std::atoi(se)));
+#if defined(STRATA_USE_HIP)
+            ix_split = false;   // (AMD: not measured there)
+#else
+            ix_split = true;
+#endif
+            if (const char* se = std::getenv("HY4_IX_SPLIT")) ix_split = std::atoi(se) != 0;
+            if (const char* se = std::getenv("HY4_IX_SPLIT_FROM")) ix_split_from = std::max(0, std::atoi(se));
             if (de) {
                 const int d = std::min(kDenseTop, std::atoi(de)) / 8 * 8;
                 if (d > kDenseBase) spans.push_back(d);
-            } else {
-                bool tensor_cores = !G.empty();
-                for (Gpu& gp : G) {
-                    cudaDeviceProp pi{};
-                    CK(cudaGetDeviceProperties(&pi, gp.dev));
-                    tensor_cores = tensor_cores && pi.major >= 7;
-                }
-#if defined(STRATA_USE_HIP)
-                tensor_cores = false;   // (AMD: measured slower past kDenseBase on a 16K prompt - the span stays)
-#endif
-                if (tensor_cores) spans.assign(std::begin(kDense), std::end(kDense));
+            } else if (tensor_cores) {
+                spans.assign(std::begin(kDense), std::end(kDense));
             }
             if (!spans.empty()) {
                 // (HY4_DENSE_MAX names a span: taken where the plan holds it, at the price of experts too)
@@ -2692,6 +2754,79 @@ struct Model::Impl {
                             CUBLAS_GEMM_DEFAULT) == CUBLAS_STATUS_SUCCESS;
     }
 
+    // A prompt sub-batch's attention over its tokens' picks past the dense span (tokens t0 .. t0 + ts - 1 of an indexed
+    // layer, their keys in gp.keys): the pools any of them picks, their cache rows gathered in gp.kbuf, then
+    // attn_prompt's GEMMs over those rows with each token's picks as the mask.  false: more rows than the dense
+    // path's buffers hold (the caller's gathering kernel instead).  (gp.score: the pools' ranks and their list here)
+    bool attn_sparse(Layer& l, Gpu& gp, int t0, int ts, int64_t p0, float scale, Deq& dq, int limit) {
+        const int H = l.H, KR = g.kv_row(), KL = g.kv_lora, KP = g.ix_kpool, maxk = g.ix_top_k + KP;
+        const int64_t k1 = p0 + t0 + ts;
+        const int n_pool = (int) ((k1 - 1) / KP + 1);
+        int *col = (int*) gp.score, *list = col + n_pool, *dn = list + n_pool;
+        if ((size_t) 2 * n_pool + 1 > (size_t) kSub * (size_t) (o.max_ctx / KP + 1)) return false;
+        k::ix_union(gp.keys + (size_t) t0 * maxk, maxk, gp.knk + t0, ts, KP, n_pool, col, list, dn, gp.s);
+        int np = 0;
+        if (cudaMemcpyAsync(&np, dn, sizeof(int), cudaMemcpyDeviceToHost, gp.s) != cudaSuccess ||
+            cudaStreamSynchronize(gp.s) != cudaSuccess)
+            return false;
+        const int rows = np * KP, ldS = (rows + 7) / 8 * 8;
+        if (sparse_stat) {
+            long long m = sp_st[3].load();
+            while (rows > m && !sp_st[3].compare_exchange_weak(m, rows)) {}
+        }
+        if (rows <= 0 || rows > limit || rows > dense_max || (size_t) rows > deq_rows() ||
+            (size_t) ts * H * ldS > gp.sS_n) {
+            if (sparse_stat) sp_st[2] += 1;
+            return false;
+        }
+        if (sparse_stat) {
+            sp_st[0] += 1;
+            sp_st[1] += rows;
+        }
+        dq.base = -1;   // (kbuf's dequantized rows are gone)
+        if (kv_q8) k::kv_deq(l.kv, 0, KL, g.rope, 0, rows, gp.kbuf, gp.s, list, KP, (int) k1);
+        else k::kv_gather(l.kv, 0, KR, 0, rows, gp.kbuf, gp.s, list, KP, (int) k1);
+        k::to_f16(gp.qcat + (size_t) t0 * H * KR, KR, ts * H, KR, gp.xh16, KR, gp.s);
+        const float one = 1.0f, zero = 0.0f;
+        if (cublasGemmEx(gp.blas, CUBLAS_OP_T, CUBLAS_OP_N, rows, ts * H, KR, &one, gp.kbuf, CUDA_R_16F, KR, gp.xh16,
+                         CUDA_R_16F, KR, &zero, gp.sS, CUDA_R_32F, ldS, CUBLAS_COMPUTE_32F,
+                         CUBLAS_GEMM_DEFAULT) != CUBLAS_STATUS_SUCCESS)
+            return false;
+        k::dsa_mask_list(gp.keys + (size_t) t0 * maxk, maxk, gp.knk + t0, ts, col, KP, rows, gp.dmask, (size_t) dense_max,
+                         gp.s);
+        k::attn_softmax(gp.sS, ldS, ts, H, rows, 0, gp.pos + t0, -1, gp.dmask, (size_t) dense_max, scale, l.sinks, gp.sP,
+                        ldS, gp.s);
+        return cublasGemmEx(gp.blas, CUBLAS_OP_N, CUBLAS_OP_N, KL, ts * H, rows, &one, gp.kbuf, CUDA_R_16F, KR, gp.sP,
+                            CUDA_R_16F, ldS, &zero, gp.o + (size_t) t0 * H * KL, CUDA_R_32F, KL, CUBLAS_COMPUTE_32F,
+                            CUBLAS_GEMM_DEFAULT) == CUBLAS_STATUS_SUCCESS;
+    }
+
+    // A prompt sub-batch's indexer scores (tokens t0 .. t0 + ts - 1 against the pools [0, n_pool)) as GEMMs over slabs
+    // of the pools, the heads summed by ix_reduce -> gp.score as ix_score's.  pk16: the pooled keys in F16 (ix_gemm 16).
+    // false: not taken here (the caller's ix_score instead)
+    bool ix_score_gemm(Layer& l, Gpu& gp, int t0, int ts, int n_pool, int npool_ld, const uint16_t* pk16) {
+        const int D = g.ix_dim, IH = g.ix_heads, rows = ts * IH;
+        const int cap = (int) std::min<size_t>(gp.sS_n / (size_t) rows, (size_t) 1 << 30) / 8 * 8;
+        if (cap < 8) return false;
+        const float one = 1.0f, zero = 0.0f;
+        const float* q = gp.iq + (size_t) t0 * IH * D;
+        if (ix_gemm == 16) k::to_f16(q, D, rows, D, gp.xh16, D, gp.s);
+        for (int g0 = 0; g0 < n_pool; g0 += cap) {
+            const int n = std::min(cap, n_pool - g0), ld = (n + 7) / 8 * 8;
+            const bool ok =
+                ix_gemm == 16
+                    ? cublasGemmEx(gp.blas, CUBLAS_OP_T, CUBLAS_OP_N, n, rows, D, &one, pk16 + (size_t) g0 * D,
+                                   CUDA_R_16F, D, gp.xh16, CUDA_R_16F, D, &zero, gp.sS, CUDA_R_32F, ld,
+                                   CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT) == CUBLAS_STATUS_SUCCESS
+                    : cublasSgemm(gp.blas, CUBLAS_OP_T, CUBLAS_OP_N, n, rows, D, &one, l.pooled + (size_t) g0 * D, D, q,
+                                  D, &zero, gp.sS, ld) == CUBLAS_STATUS_SUCCESS;
+            if (!ok) return false;
+            k::ix_reduce(gp.sS, (size_t) ld, gp.wt + (size_t) t0 * IH, ts, IH, gp.pos + t0, g.ix_kpool, g0, n, gp.score,
+                         (size_t) npool_ld, gp.s);
+        }
+        return true;
+    }
+
     // A trunk layer's attention half: the hyper-connections' pre-mix, the norm, attn_core, the post-mix
     // (tensor parallel: member tpm's partial output summed over the members - sync v - before the post-mix)
     bool attention(Layer& l, Gpu& gp, int T, int64_t p0, std::string& err, int tpm = -1, unsigned v = 0) {
@@ -2706,7 +2841,7 @@ struct Model::Impl {
         }
         dbg("attn_norm", l.il, gp, gp.xa, T, E);
         if (inject) ref_cmp("attn_norm", l.il, gp, gp.xa, (size_t) T * E, T);
-        if (!attn_core(l, gp, T, p0, err)) return false;
+        if (!attn_core(l, gp, T, p0, err, tpm, v)) return false;
         if (tpm >= 0) {
             mark(tpm, gp, l.il, 1);
             all_reduce(tpm, gp, T, v);
@@ -2721,7 +2856,8 @@ struct Model::Impl {
         return true;
     }
     // The attention itself (the trunk's layers and the MTP block's): xa [T][E] -> y [T][E] (before its post norm)
-    bool attn_core(Layer& l, Gpu& gp, int T, int64_t p0, std::string& err) {
+    // (tensor parallel: member tpm's, v its attention's sync - ix_split's exchange goes by it)
+    bool attn_core(Layer& l, Gpu& gp, int T, int64_t p0, std::string& err, int tpm = -1, unsigned v = 0) {
         const int E = g.n_embd, H = l.H, KL = g.kv_lora, R = g.rope, KR = g.kv_row(), nope = g.nope();
         cudaStream_t s = gp.s;
         bool ok = l.ix ? mm_multi(gp, {{&l.q_a, gp.qa, (size_t) g.q_lora}, {&l.kv_a, gp.kvr, (size_t) KR},
@@ -2763,20 +2899,134 @@ struct Model::Impl {
             if (!kv_q8) dbg("indexer_pool_k", l.il, gp, l.pooled, (size_t) g1, D);
             const int npool_ld = (int) (o.max_ctx / KP + 1), maxk = g.ix_top_k + KP;
             const int top = g.ix_top_k / KP - 1;
-            for (int t0 = 0; t0 < T; t0 += kSub) {   // (the scores of kSub tokens at a time)
-                const int ts = std::min(kSub, T - t0);
+            // the prompt path's scores as GEMMs past ix_gemm_from (ix_score_gemm): the pooled keys in F16 for them -
+            // an 8-bit cache's are, an F32 cache's rounded into wband once a call (the pools the chunk sees)
+            const bool gemm = ix_gemm != 0 && T > W && p0 + T > (int64_t) ix_gemm_from && (ix_gemm == 16 || !kv_q8) &&
+                              (kv_q8 || ix_gemm == 32 || (size_t) (last / KP + 1) * D <= gp.wband_n);
+            const uint16_t* pk16 = (const uint16_t*) l.pooled;
+            if (gemm && ix_gemm == 16 && !kv_q8) {
+                k::to_f16(l.pooled, D, (int) (last / KP), D, gp.wband, D, s);
+                pk16 = gp.wband;
+            }
+            // a sub-batch's picks (tokens t0 .. t0 + ts - 1, each seeing more than `top` pools): scores, then the top
+            auto pick = [&](int t0, int ts) {
                 const int n_pool = (int) ((p0 + t0 + ts - 1) / KP);
-                // the picks are every pool the tokens see until a token sees more than `top` of them
-                const bool all = n_pool <= top;
-                if (T > W && all && attn_prompt(l, gp, t0, ts, p0, true, scale, dq)) continue;
-                k::ix_score(gp.iq + (size_t) t0 * IH * D, gp.wt + (size_t) t0 * IH, ts, IH, D, l.pooled, gp.pos + t0,
-                            KP, n_pool, gp.score, npool_ld, s, kv_q8);
+                const bool by_gemm = gemm && p0 + t0 >= (int64_t) ix_gemm_from &&
+                                     ix_score_gemm(l, gp, t0, ts, n_pool, npool_ld, pk16);
+                if (by_gemm && ix_check) {   // (HY4_IX_CHECK: the GEMMs' picks against ix_score's own, counted)
+                    std::vector<int> a((size_t) ts * maxk), b((size_t) ts * maxk), na((size_t) ts), nb((size_t) ts);
+                    auto picks = [&](std::vector<int>& kk, std::vector<int>& nn) {
+                        k::ix_select(gp.score, npool_ld, ts, gp.pos + t0, KP, top, gp.keys + (size_t) t0 * maxk, maxk,
+                                     gp.knk + t0, s);
+                        cudaMemcpyAsync(kk.data(), gp.keys + (size_t) t0 * maxk, sizeof(int) * kk.size(),
+                                        cudaMemcpyDeviceToHost, s);
+                        cudaMemcpyAsync(nn.data(), gp.knk + t0, sizeof(int) * nn.size(), cudaMemcpyDeviceToHost, s);
+                        cudaStreamSynchronize(s);
+                    };
+                    k::ix_score(gp.iq + (size_t) t0 * IH * D, gp.wt + (size_t) t0 * IH, ts, IH, D, l.pooled,
+                                gp.pos + t0, KP, n_pool, gp.score, npool_ld, s, kv_q8);
+                    picks(b, nb);
+                    ix_score_gemm(l, gp, t0, ts, n_pool, npool_ld, pk16);
+                    picks(a, na);
+                    for (int t = 0; t < ts; ++t) {
+                        const int* x = a.data() + (size_t) t * maxk;
+                        const int* y = b.data() + (size_t) t * maxk;
+                        int i = 0, j = 0, same = 0;   // (both in position order)
+                        while (i < na[(size_t) t] && j < nb[(size_t) t])
+                            if (x[i] == y[j]) ++same, ++i, ++j;
+                            else if (x[i] < y[j]) ++i;
+                            else ++j;
+                        ix_chk[0] += 1;
+                        ix_chk[1] += same != nb[(size_t) t];
+                        ix_chk[2] += nb[(size_t) t];
+                        ix_chk[3] += nb[(size_t) t] - same;
+                    }
+                }
+                if (!by_gemm)
+                    k::ix_score(gp.iq + (size_t) t0 * IH * D, gp.wt + (size_t) t0 * IH, ts, IH, D, l.pooled,
+                                gp.pos + t0, KP, n_pool, gp.score, npool_ld, s, kv_q8);
                 k::ix_select(gp.score, npool_ld, ts, gp.pos + t0, KP, top, gp.keys + (size_t) t0 * maxk, maxk,
                              gp.knk + t0, s);
-                if (T > W && attn_prompt(l, gp, t0, ts, p0, false, scale, dq)) continue;
+            };
+            // ... its attention over them
+            auto attend = [&](int t0, int ts) {
+                const int64_t span = p0 + t0 + ts;
+                if (T > W && sparse_attn && sparse_frac > 0 && span > kDenseBase && span <= dense_max &&
+                    attn_sparse(l, gp, t0, ts, p0, scale, dq, (int) (span * sparse_frac / 100)))
+                    return;
+                if (T > W && attn_prompt(l, gp, t0, ts, p0, false, scale, dq)) return;
+                if (T > W && sparse_attn) {
+                    // (pieces of the sub-batch: fewer tokens pick fewer pools between them; a piece whose rows do
+                    //  not fit is halved, the last resort the gathering kernel)
+                    std::vector<std::pair<int, int>> todo;
+                    for (int a = ts - (ts - 1) % sparse_sub - 1; a >= 0; a -= sparse_sub)
+                        todo.push_back({t0 + a, std::min(sparse_sub, ts - a)});
+                    while (!todo.empty()) {
+                        const std::pair<int, int> pc = todo.back();
+                        todo.pop_back();
+                        if (attn_sparse(l, gp, pc.first, pc.second, p0, scale, dq, dense_max)) continue;
+                        if (pc.second >= 16) {
+                            const int h1 = pc.second / 2;
+                            todo.push_back({pc.first + h1, pc.second - h1});
+                            todo.push_back({pc.first, h1});
+                            continue;
+                        }
+                        k::attention(gp.qcat + (size_t) pc.first * H * KR, pc.second, H, KL, R, l.kv, 0,
+                                     gp.keys + (size_t) pc.first * maxk, maxk, nullptr, gp.knk + pc.first, maxk, scale,
+                                     l.sinks, gp.ws, gp.o + (size_t) pc.first * H * KL, s, kv_q8);
+                    }
+                    return;
+                }
                 k::attention(gp.qcat + (size_t) t0 * H * KR, ts, H, KL, R, l.kv, 0, gp.keys + (size_t) t0 * maxk, maxk,
                              nullptr, gp.knk + t0, maxk, scale, l.sinks, gp.ws, gp.o + (size_t) t0 * H * KL, s, kv_q8);
+            };
+            // (ix_split: every sub-batch past `top` pools from the first token on, and a pool's number in 16 bits)
+            const bool split = tpm >= 0 && tp > 1 && ix_split && !ix_check && tp_ixw && tp_ixf && T > W &&
+                               p0 >= (int64_t) (top + 1) * KP && p0 + T > (int64_t) ix_split_from &&
+                               (int64_t) o.max_ctx / KP < 65536 && gp.row0 + T <= Tc && top <= ixw_ld;
+            if (split) {
+                // member j's sub-batches: [j nsb / tp, (j + 1) nsb / tp) - its rows' picks made here, packed into the
+                // host's rows (gp.row0 on), its flag v; then every other member's unpacked once its flag says v
+                const int nsb = (T + kSub - 1) / kSub;
+                auto rows = [&](int j, int& a, int& b) {
+                    a = std::min(T, (int) ((int64_t) j * nsb / tp) * kSub);
+                    b = std::min(T, (int) ((int64_t) (j + 1) * nsb / tp) * kSub);
+                };
+                uint16_t* wire = tp_ixw + (size_t) gp.row0 * ixw_ld;
+                int a = 0, b = 0;
+                rows(tpm, a, b);
+                for (int t0 = a; t0 < b; t0 += kSub) pick(t0, std::min(kSub, b - t0));
+                if (b > a)
+                    k::ix_pack(gp.keys + (size_t) a * maxk, maxk, b - a, gp.pos + a, KP, top, wire + (size_t) a * ixw_ld,
+                               ixw_ld, s);
+                k::set_flag(tp_ixf + (size_t) tpm * kLine, v, s);
+                for (int j = 0; j < tp; ++j) {
+                    if (j == tpm) continue;
+                    rows(j, a, b);
+                    k::wait_flag(tp_ixf + (size_t) j * kLine, v, s);
+                    if (b > a)
+                        k::ix_unpack(wire + (size_t) a * ixw_ld, ixw_ld, b - a, gp.pos + a, KP, top,
+                                     gp.keys + (size_t) a * maxk, maxk, gp.knk + a, s);
+                }
+                for (int t0 = 0; t0 < T; t0 += kSub) attend(t0, std::min(kSub, T - t0));
+            } else {
+                for (int t0 = 0; t0 < T; t0 += kSub) {   // (the scores of kSub tokens at a time)
+                    const int ts = std::min(kSub, T - t0);
+                    // the picks are every pool the tokens see until a token sees more than `top` of them
+                    const bool all = (p0 + t0 + ts - 1) / KP <= top;
+                    if (T > W && all && attn_prompt(l, gp, t0, ts, p0, true, scale, dq)) continue;
+                    pick(t0, ts);
+                    attend(t0, ts);
+                }
             }
+            if (sparse_stat && T > W && sparse_attn && p0 + T > dense_max)
+                std::fprintf(stderr, "SPARSE layer %d to %lld: %lld sub-batches over %lld rows, %lld not taken, most %lld\n",
+                             l.il, (long long) (p0 + T), sp_st[0].load(), sp_st[1].load(), sp_st[2].load(),
+                             sp_st[3].load());
+            if (gemm && ix_check)
+                std::fprintf(stderr, "IXCHK layer %d to %lld: %lld tokens, %lld with another pick; %lld picks, %lld other\n",
+                             l.il, (long long) (p0 + T), ix_chk[0].load(), ix_chk[1].load(), ix_chk[2].load(),
+                             ix_chk[3].load());
         } else {
             for (int t0 = 0; t0 < T; t0 += kSub) {
                 const int ts = std::min(kSub, T - t0);
@@ -3715,7 +3965,7 @@ struct Model::Impl {
         if (l.eg >= 0 && !engram(l, gv, T, err, r0)) return false;
         k::hc_pre(gv.x, T, g.hc, g.n_embd, l.hca_fn, l.hca_scale, l.hca_base, g.eps, g.hc_eps, g.hc_mag, gv.xa, gv.post,
                   gv.s, l.attn_norm, g.eps);
-        if (!attn_core(l, gv, T, p0, err)) return false;
+        if (!attn_core(l, gv, T, p0, err, m, v)) return false;
         all_reduce(m, gv, gv.y, (size_t) T * g.n_embd, v);   // (published only: gv.defer)
         return true;
     }

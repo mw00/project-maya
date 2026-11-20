@@ -901,6 +901,7 @@ __global__ void __launch_bounds__(256) attn_softmax_kernel(const float* __restri
     __half* pr = P + (size_t) r * ldP;
     const int lo = window > 0 ? max(0, p - window + 1) : 0;
     auto seen = [&](int j) {
+        if (window < 0) return mask[(size_t) t * ldm + j] == 0.0f;   // (the columns a list of keys: the mask alone)
         const int q = k0 + j;
         if (q > p || q < lo) return false;
         return window > 0 || mask[(size_t) t * ldm + j] == 0.0f;
@@ -938,14 +939,73 @@ __global__ void dsa_mask_kernel(const int* __restrict__ keys, int ldk, const int
         if (j >= 0 && j < nkr) mr[j] = 0.0f;
     }
 }
+// ... over the columns of a list of pools (col[g]: pool g's rank in it; a pool kpool columns): ncol columns
+__global__ void dsa_mask_list_kernel(const int* __restrict__ keys, int ldk, const int* __restrict__ nk,
+                                     const int* __restrict__ col, int kpool, int ncol, float* __restrict__ mask,
+                                     size_t ldm) {
+    const int t = blockIdx.x;
+    float* mr = mask + (size_t) t * ldm;
+    for (int j = threadIdx.x; j < ncol; j += blockDim.x) mr[j] = -INFINITY;
+    __syncthreads();
+    for (int i = threadIdx.x; i < nk[t]; i += blockDim.x) {
+        const int p = keys[(size_t) t * ldk + i];
+        mr[col[p / kpool] * kpool + p % kpool] = 0.0f;
+    }
+}
+// one block (1024 threads): the pools the keys of T tokens name (a token's keys whole pools, then its own pool's first
+// positions: every kpool-th key names one) -> col[g] = pool g's rank among them (-1: not named), list[rank] = g, *n
+__global__ void __launch_bounds__(1024) ix_union_kernel(const int* __restrict__ keys, int ldk,
+                                                        const int* __restrict__ nk, int T, int kpool, int n_pool,
+                                                        int* __restrict__ col, int* __restrict__ list, int* n) {
+    __shared__ int cnt[1024];
+    const int nth = blockDim.x, tid = threadIdx.x;
+    for (int g = tid; g < n_pool; g += nth) col[g] = 0;
+    __syncthreads();
+    const int per_t = (ldk + kpool - 1) / kpool;
+    for (int e = tid; e < T * per_t; e += nth) {
+        const int t = e / per_t, i = (e % per_t) * kpool;
+        if (i < nk[t]) col[keys[(size_t) t * ldk + i] / kpool] = 1;
+    }
+    __syncthreads();
+    const int per = (n_pool + nth - 1) / nth, b0 = min(n_pool, tid * per), b1 = min(n_pool, b0 + per);
+    int c = 0;
+    for (int g = b0; g < b1; ++g) c += col[g];
+    cnt[tid] = c;
+    __syncthreads();
+    if (tid == 0) {
+        int a = 0;
+        for (int i = 0; i < nth; ++i) {
+            const int x = cnt[i];
+            cnt[i] = a;
+            a += x;
+        }
+        *n = a;
+    }
+    __syncthreads();
+    int r = cnt[tid];
+    for (int g = b0; g < b1; ++g) {
+        if (col[g]) {
+            col[g] = r;
+            list[r++] = g;
+        } else {
+            col[g] = -1;
+        }
+    }
+}
 // Q8_0 rows (rb bytes) -> F16 rows of kv_lora + n_rot values, a thread a value pair
+// (list: row j the position list[j / kpool] kpool + j % kpool - a list of pools' rows; zeros from position kend on)
 __global__ void kv_deq_kernel(const uint8_t* __restrict__ cache, int ring, int kv_lora, int n_rot, int rb, int k0, int n,
-                              __half2* __restrict__ dst) {
+                              __half2* __restrict__ dst, const int* __restrict__ list, int kpool,
+                              int kend) {
     const size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
     const int half_row = (kv_lora + n_rot) / 2;
     if (i >= (size_t) n * half_row) return;
     const int j = (int) (i / half_row), c = (int) (i % half_row);
-    const int q = k0 + j;
+    const int q = list ? list[j / kpool] * kpool + j % kpool : k0 + j;
+    if (list && q >= kend) {
+        dst[i] = __floats2half2_rn(0.0f, 0.0f);
+        return;
+    }
     const uint8_t* rp = cache + (size_t) (ring > 0 ? q % ring : q) * rb;
     if (2 * c < kv_lora) {
         const char2 qv = *(const char2*) (rp + 2 * c);
@@ -956,11 +1016,16 @@ __global__ void kv_deq_kernel(const uint8_t* __restrict__ cache, int ring, int k
     }
 }
 __global__ void kv_gather_kernel(const uint4* __restrict__ cache, int ring, int row16, int k0, int n,
-                                 uint4* __restrict__ dst) {
+                                 uint4* __restrict__ dst, const int* __restrict__ list, int kpool,
+                                 int kend) {
     const size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= (size_t) n * row16) return;
     const int j = (int) (i / row16), c = (int) (i % row16);
-    const int q = k0 + j;
+    const int q = list ? list[j / kpool] * kpool + j % kpool : k0 + j;
+    if (list && q >= kend) {
+        dst[i] = make_uint4(0, 0, 0, 0);
+        return;
+    }
     dst[i] = cache[(size_t) (ring > 0 ? q % ring : q) * row16 + c];
 }
 
@@ -1272,6 +1337,22 @@ __global__ void __launch_bounds__(256) ix_score_kernel(const float* __restrict__
     }
     score[(size_t) t * ld + g] = out;
 }
+// The scores from the heads' dot products a GEMM left in S (column (t, h), row g - g0; ldS apart): grid
+// (ceil(n / 256), T), a thread a pool - the heads summed in ix_score_kernel's order
+__global__ void ix_reduce_kernel(const float* __restrict__ S, size_t ldS, const float* __restrict__ wt, int heads,
+                                 const int* __restrict__ pos, int kpool, int g0, int n, float* __restrict__ score,
+                                 size_t ld) {
+    const int t = blockIdx.y, j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (j >= n) return;
+    const int g = g0 + j, nv = pos[t] / kpool;
+    float out = -INFINITY;
+    if (g < nv) {
+        out = 0.0f;
+        for (int h = 0; h < heads; ++h)
+            out = fmaf(fmaxf(S[(size_t) (t * heads + h) * ldS + j], 0.0f), wt[(size_t) t * heads + h], out);
+    }
+    score[(size_t) t * ld + g] = out;
+}
 __device__ __forceinline__ uint32_t ord_key(float f) {
     const uint32_t u = __float_as_uint(f);
     return (u & 0x80000000u) ? ~u : (u | 0x80000000u);
@@ -1371,6 +1452,30 @@ __global__ void __launch_bounds__(1024) ix_select_kernel(const float* __restrict
     const int ntail = p % kpool + 1;
     for (int k = tid; k < ntail; k += nth) kt[nsel * kpool + k] = nv * kpool + k;
     if (tid == 0) nk[t] = nsel * kpool + ntail;
+}
+// a block a token: its picked pools (ix_select's keys, kpool positions a pool) as 16-bit numbers into the host's row
+__global__ void ix_pack_kernel(const int* __restrict__ keys, int ldk, const int* __restrict__ pos, int kpool, int top,
+                               uint16_t* wire, int ldw) {
+    const int t = blockIdx.x, nsel = min(pos[t] / kpool, top);
+    const int* kt = keys + (size_t) t * ldk;
+    uint16_t* w = wire + (size_t) t * ldw;
+    for (int j = threadIdx.x; j < nsel; j += blockDim.x) w[j] = (uint16_t) (kt[(size_t) j * kpool] / kpool);
+    __threadfence_system();
+}
+// ... and back: the row's numbers in shared memory (16 bytes a load, past every cache), then ix_select's keys
+__global__ void ix_unpack_kernel(const uint16_t* wire, int ldw, const int* __restrict__ pos, int kpool, int top,
+                                 int* __restrict__ keys, int ldk, int* __restrict__ nk) {
+    extern __shared__ float4 ix_row[];
+    const int t = blockIdx.x, p = pos[t], nv = p / kpool, nsel = min(nv, top);
+    const float4* src = (const float4*) (wire + (size_t) t * ldw);
+    for (int i = threadIdx.x; i < (nsel + 7) / 8; i += blockDim.x) ix_row[i] = strata::kernels::ld_fresh_v(src + i);
+    __syncthreads();
+    const uint16_t* sp = (const uint16_t*) ix_row;
+    int* kt = keys + (size_t) t * ldk;
+    for (int i = threadIdx.x; i < nsel * kpool; i += blockDim.x) kt[i] = (int) sp[i / kpool] * kpool + i % kpool;
+    const int ntail = p % kpool + 1;
+    for (int k = threadIdx.x; k < ntail; k += blockDim.x) kt[nsel * kpool + k] = nv * kpool + k;
+    if (threadIdx.x == 0) nk[t] = nsel * kpool + ntail;
 }
 
 }  // namespace
@@ -1604,10 +1709,29 @@ void ix_score(const float* q, const float* wt, int T, int heads, int dim, const 
         ix_score_kernel<float><<<grid, 256, sh, s>>>(q, wt, heads, dim, pooled, pos, kpool, n_pool, score, ld);
     check("ix_score");
 }
+void ix_reduce(const float* S, size_t ldS, const float* wt, int T, int heads, const int* pos, int kpool, int g0, int n,
+               float* score, size_t ld, cudaStream_t s) {
+    if (n <= 0 || T <= 0) return;
+    ix_reduce_kernel<<<dim3((unsigned) ((n + 255) / 256), (unsigned) T), 256, 0, s>>>(S, ldS, wt, heads, pos, kpool, g0,
+                                                                                    n, score, ld);
+    check("ix_reduce");
+}
 void ix_select(const float* score, size_t ld, int T, const int* pos, int kpool, int top, int* keys, int ldk, int* nk,
                cudaStream_t s) {
     ix_select_kernel<<<T, 1024, 0, s>>>(score, ld, pos, kpool, top, keys, ldk, nk);
     check("ix_select");
+}
+void ix_pack(const int* keys, int ldk, int T, const int* pos, int kpool, int top, uint16_t* wire, int ldw,
+             cudaStream_t s) {
+    if (T <= 0) return;
+    ix_pack_kernel<<<T, 256, 0, s>>>(keys, ldk, pos, kpool, top, wire, ldw);
+    check("ix_pack");
+}
+void ix_unpack(const uint16_t* wire, int ldw, int T, const int* pos, int kpool, int top, int* keys, int ldk, int* nk,
+               cudaStream_t s) {
+    if (T <= 0) return;
+    ix_unpack_kernel<<<T, 256, (size_t) (top + 7) / 8 * 16, s>>>(wire, ldw, pos, kpool, top, keys, ldk, nk);
+    check("ix_unpack");
 }
 void attn_softmax(const float* S, size_t ldS, int T, int H, int nkr, int k0, const int* pos, int window,
                   const float* mask, size_t ldm, float scale, const float* sinks, uint16_t* P, size_t ldP,
@@ -1622,21 +1746,34 @@ void dsa_mask(const int* keys, int ldk, const int* nk, int T, int k0, int nkr, f
     dsa_mask_kernel<<<T, 256, 0, s>>>(keys, ldk, nk, k0, nkr, mask, ldm);
     check("dsa_mask");
 }
-void kv_deq(const uint16_t* cache, int ring, int kv_lora, int n_rot, int k0, int n, uint16_t* dst, cudaStream_t s) {
+void kv_deq(const uint16_t* cache, int ring, int kv_lora, int n_rot, int k0, int n, uint16_t* dst, cudaStream_t s,
+            const int* list, int kpool, int kend) {
     const size_t total = (size_t) n * ((kv_lora + n_rot) / 2);
     if (total == 0) return;
     kv_deq_kernel<<<(unsigned) ((total + 255) / 256), 256, 0, s>>>((const uint8_t*) cache, ring, kv_lora, n_rot,
                                                                  (int) kv_q8_row_bytes(kv_lora, n_rot), k0, n,
-                                                                 (__half2*) dst);
+                                                                 (__half2*) dst, list, kpool, kend);
     check("kv_deq");
 }
-void kv_gather(const uint16_t* cache, int ring, int row, int k0, int n, uint16_t* dst, cudaStream_t s) {
+void kv_gather(const uint16_t* cache, int ring, int row, int k0, int n, uint16_t* dst, cudaStream_t s, const int* list,
+               int kpool, int kend) {
     const int row16 = row * 2 / 16;   // (uint4s a row: 576 F16 = 72)
     const size_t total = (size_t) n * row16;
     if (total == 0) return;
     kv_gather_kernel<<<(unsigned) ((total + 255) / 256), 256, 0, s>>>((const uint4*) cache, ring, row16, k0, n,
-                                                                    (uint4*) dst);
+                                                                    (uint4*) dst, list, kpool, kend);
     check("kv_gather");
+}
+void ix_union(const int* keys, int ldk, const int* nk, int T, int kpool, int n_pool, int* col, int* list, int* n,
+              cudaStream_t s) {
+    ix_union_kernel<<<1, 1024, 0, s>>>(keys, ldk, nk, T, kpool, n_pool, col, list, n);
+    check("ix_union");
+}
+void dsa_mask_list(const int* keys, int ldk, const int* nk, int T, const int* col, int kpool, int ncol, float* mask,
+                   size_t ldm, cudaStream_t s) {
+    if (T <= 0) return;
+    dsa_mask_list_kernel<<<T, 256, 0, s>>>(keys, ldk, nk, col, kpool, ncol, mask, ldm);
+    check("dsa_mask_list");
 }
 void to_f16(const float* src, size_t lds, int rows, int n, uint16_t* dst, size_t ldd, cudaStream_t s) {
     const size_t total = (size_t) rows * n;
