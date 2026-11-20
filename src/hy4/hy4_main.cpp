@@ -1180,6 +1180,8 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "usage: maya-hy4 --pack <model>/maya-hy4 (--ids @file [--gen N] | --kld ref.kld)\n");
         return 2;
     }
+    // (a step's window - the token and its drafts - is kMaxWin positions at most: the added drafts within it)
+    n_more = std::min(n_more, std::max(0, hy4::k::kMaxWin - 1 - n_draft));
     if (bench_layer >= 0) return bench_lane(o.pack, bench_layer, bench_n, bench_t);
     if (!enc_rgb.empty()) return encode_alone(o, enc_rgb, enc_size, enc_out);
     if (!images.empty()) {
