@@ -4030,13 +4030,18 @@ struct Model::Impl {
     // if all were in the page cache) and a headroom of max(4 GiB, a tenth of the RAM), a quarter of the RAM at most;
     // a thread re-codes the most routed experts while the lane is idle (between answers).  Whether they pay is
     // measured on this PC (the default, HY4_Q4X=2): a probe at the start (a lane call of 16 experts on each form)
-    // must time them 5 % faster, then, once copies exist, the next answers' one-token lane calls run in turns with
-    // and without them (q4x_trial) and the faster side is kept - the copies freed when without wins.  maya.py's
-    // q4x_calibration runs that once per PC and keeps the verdict in the config (HY4_Q4X=1 / 0), so a start of the
-    // config does not measure again.  The copies give the file's bits (the lane's output and the greedy ids the same
-    // with and without them, Linux and Windows builds); a prompt chunk's route - streamed to the GPU or the lane,
-    // chosen by measured rates - may still move with the lane's speed, as with any other load on the CPU.
-    // HY4_Q4X unset or 2: measured as above; 1: always, untimed; 0: never; HY4_Q4X_GB: the RAM they take at most
+    // must time them 5 % faster, then, once copies exist and the lane's experts are warm, the next answers' one-token
+    // lane calls run in turns with and without them (q4x_trial) and the faster side is kept - the copies freed when
+    // without wins.  The verdict is remembered on this PC (HY4_Q4X_FILE - the server's data folder - else beside
+    // --profile; a line a PC, model and lane-kernel build, hy4_lane's q4x_memo_*): a start that finds it builds the
+    // copies untimed (kept) or none at all (dropped: no RAM, no re-coding thread, no probe), and changed lane kernels
+    // are measured again (HY4_Q4X_MEASURE=1 - maya --speed-calibration - measures again too).  The copies give the
+    // file's bits (the lane's output and the greedy ids the same with and without them, Linux and Windows builds); a
+    // prompt chunk's route - streamed to the GPU or the lane, chosen by measured rates - may still move with the
+    // lane's speed, as with any other load on the CPU.
+    // HY4_Q4X unset or 2: measured as above (or remembered); 1: always, untimed; 0: never; HY4_Q4X_GB: the RAM they
+    // take at most; HY4_Q4X_PROBE=0: the timed turns run even where the start's probe found them not faster
+    std::string q4x_file, q4x_key;   // (the verdict's file and this PC's line in it: empty, not remembered)
     void q4x_start() {
         const char* qv = std::getenv("HY4_Q4X");
         const int mode = qv ? std::atoi(qv) : 2;
@@ -4066,25 +4071,61 @@ struct Model::Impl {
             info.push_back(buf);
             return;
         }
-        double ms_f = 0, ms_q = 0;
-        bool probed = false;
-        // (on a thread of its own: the lane pins the thread that brings it jobs, and the engine's own is not to be
-        //  pinned before its first job - a thread it starts would inherit that one core)
-        std::thread([&] { probed = q4x_probe(*lane, L[(size_t) probe_l].cex, g.n_expert, ms_f, ms_q); }).join();
-        if (!probed) return;
-        const bool faster = ms_q < 0.95 * ms_f;
-        std::snprintf(buf, sizeof buf, "INFO CPU lane: a call of 16 experts %.2f ms from the file, %.2f ms as 4-bit "
-                      "copies - ", ms_f, ms_q);
-        std::string line = buf;
-        if (!faster && !force) {
-            info.push_back(line + "the file's rows kept");
+        // the verdict this PC measured before (not with HY4_Q4X=1, nor HY4_Q4X_MEASURE=1)
+        Q4xMemo memo;
+        if (!force) {
+            const char* mf = std::getenv("HY4_Q4X_FILE");
+            const size_t sl = o.profile.find_last_of("/\\");
+            q4x_file = mf && *mf ? std::string(mf)
+                       : o.profile.empty() ? std::string()
+                                           : (sl == std::string::npos ? std::string(".") : o.profile.substr(0, sl)) +
+                                                 "/hy4-cpu-lane.txt";
+            const CpuExperts& pe = L[(size_t) probe_l].cex;
+            std::snprintf(buf, sizeof buf, "Hy4 %d layers x %d experts of %zu + %zu bytes", g.n_layer, g.n_expert,
+                          2 * pe.g_stride, pe.d_stride);
+            q4x_key = q4x_memo_key(buf, lane->threads() + 1);
+            const char* again = std::getenv("HY4_Q4X_MEASURE");
+            if (!q4x_file.empty() && !(again && std::atoi(again) != 0)) memo = q4x_memo_get(q4x_file, q4x_key);
+        }
+        if (memo.found && !memo.kept) {
+            std::snprintf(buf, sizeof buf, "INFO CPU lane: no 4-bit copies of its experts - not faster on this PC "
+                          "(measured %s: an expert run %.1f us with them, %.1f us without; ", memo.date.c_str(),
+                          memo.us_with, memo.us_without);
+            info.push_back(buf + q4x_file + ")");
             return;
         }
+        std::string line;
+        if (memo.found) {
+            std::snprintf(buf, sizeof buf, "INFO CPU lane: the 4-bit copies kept, as measured on this PC (%s: an expert "
+                          "run %.1f us with them, %.1f us without) - ", memo.date.c_str(), memo.us_with,
+                          memo.us_without);
+            line = buf;
+        } else {
+            double ms_f = 0, ms_q = 0;
+            bool probed = false;
+            // (on a thread of its own: the lane pins the thread that brings it jobs, and the engine's own is not to
+            //  be pinned before its first job - a thread it starts would inherit that one core)
+            std::thread([&] { probed = q4x_probe(*lane, L[(size_t) probe_l].cex, g.n_expert, ms_f, ms_q); }).join();
+            if (!probed) return;
+            const bool faster = ms_q < 0.95 * ms_f;
+            std::snprintf(buf, sizeof buf, "INFO CPU lane: a call of 16 experts %.2f ms from the file, %.2f ms as 4-bit "
+                          "copies - ", ms_f, ms_q);
+            line = buf;
+            const char* pv = std::getenv("HY4_Q4X_PROBE");   // (0: the timed turns decide, whatever the probe says)
+            if (!faster && !force) {
+                if (!(pv && std::atoi(pv) == 0)) {
+                    info.push_back(line + "the file's rows kept");
+                    return;
+                }
+                line += "not faster, tried anyway (HY4_Q4X_PROBE=0): ";
+            }
+        }
         std::snprintf(buf, sizeof buf, "the most routed experts re-coded between answers, up to %.1f GB of RAM%s",
-                      budget / 1e9, force ? " (HY4_Q4X=1)" : ", kept if answers run faster with them");
+                      budget / 1e9, force ? " (HY4_Q4X=1)" : memo.found ? "" : ", kept if answers run faster with "
+                                                                              "them (measured once on this PC)");
         info.push_back(line + buf);
-        q4x_adaptive = !force;
-        lane_count().q4x_mode.store(force ? 1 : 0, std::memory_order_relaxed);
+        q4x_adaptive = !force && !memo.found;
+        lane_count().q4x_mode.store(force || memo.found ? 1 : 0, std::memory_order_relaxed);
         for (Layer& l : L)
             if (l.partial()) l.cex.q4x = std::make_shared<Q4xSet>(g.n_expert);
         const int nodes = lane->nodes();
@@ -4150,34 +4191,71 @@ struct Model::Impl {
         });
     }
     // the routes in h_ids (T tokens of layer il) into the profile's counts
-    // (the engine's thread, after a lane call) the 4-bit copies' trial: started once copies exist, decided after 40
-    // tokens' one-token calls a side (over answers if need be) - kept when an expert run is 3 % faster with them, else
-    // the builder stopped and the copies freed
+    // (the engine's thread, after a lane call) the 4-bit copies' trial: started once copies exist and the lane's
+    // background placement / warm pass is done, timed in windows of 40 tokens' one-token calls a side (over answers if
+    // need be) and decided once two windows in a row agree - the same side faster, each side's expert run within 8 %
+    // of the window before: the lane's experts warm.  (A report's first start timed its file rows cold - still read
+    // from the disk, 4x its next start's time - and kept the copies; the next start, warm, dropped them.)  Kept when
+    // an expert run is 3 % faster with them, else the builder stopped and the copies freed; the verdict remembered
+    // for this PC (q4x_file).  Not settled after kQ4xWindows windows: decided for this run only, not remembered.
+    static constexpr int kQ4xWindows = 8;
     bool q4x_adaptive = false, q4x_decided = false;
     std::atomic<bool> q4x_stop{false};
     std::atomic<bool> q4x_pass{false};   // (the builder went once through every expert routed twice, or the RAM is full)
+    int q4x_windows = 0;
+    double q4x_prev[2] = {0, 0};          // (the window before: an expert run without / with the copies, s)
     void q4x_trial() {
         if (!q4x_adaptive || q4x_decided) return;
         LaneCount& lc = lane_count();
         const int m = lc.q4x_mode.load(std::memory_order_relaxed);
         if (m == 0) {
-            // (the turns start once the builder has been through the experts the counts asked for: the side with the
-            //  copies is timed with them in place, not while a few exist)
-            if (q4x_made.load(std::memory_order_relaxed) >= 64 && q4x_pass.load(std::memory_order_relaxed)) {
+            // (the turns start once the builder has been through the experts the counts asked for - the side with
+            //  the copies timed with them in place, not while a few exist - and no placement pass moves pages)
+            if (q4x_made.load(std::memory_order_relaxed) >= 64 && q4x_pass.load(std::memory_order_relaxed) &&
+                !placing.load(std::memory_order_relaxed)) {
                 for (int k = 0; k < 2; ++k) lc.trial_calls[k] = lc.trial_entries[k] = 0, lc.trial_s[k] = 0;
                 lc.q4x_mode.store(2, std::memory_order_relaxed);
+                std::fprintf(stderr, "maya-hy4: CPU lane: %lld experts re-coded at 4 bits (%.1f GB): timing the answers' "
+                             "one-token lane calls with and without them (windows of %lld calls a side, until two "
+                             "agree)\n", (long long) q4x_made.load(), (double) q4x_bytes.load() / 1e9,
+                             40LL * g.n_layer);
             }
             return;
         }
         const long long K = 40LL * g.n_layer;
         if (m != 2 || lc.trial_calls[0] < K || lc.trial_calls[1] < K) return;
-        q4x_decided = true;
         const double r0 = lc.trial_s[0] / (double) std::max(1LL, lc.trial_entries[0]);
         const double r1 = lc.trial_s[1] / (double) std::max(1LL, lc.trial_entries[1]);
-        const bool keep = r1 < 0.97 * r0;
+        const bool steady = q4x_windows > 0 && (r1 < 0.97 * r0) == (q4x_prev[1] < 0.97 * q4x_prev[0]) &&
+                            std::fabs(r0 - q4x_prev[0]) <= 0.08 * q4x_prev[0] &&
+                            std::fabs(r1 - q4x_prev[1]) <= 0.08 * q4x_prev[1];
+        ++q4x_windows;
+        if (!steady && q4x_windows < kQ4xWindows) {   // (the next window: these times stand for the one before)
+            q4x_prev[0] = r0;
+            q4x_prev[1] = r1;
+            for (int k = 0; k < 2; ++k) lc.trial_calls[k] = lc.trial_entries[k] = 0, lc.trial_s[k] = 0;
+            return;
+        }
+        q4x_decided = true;
+        const double w0 = steady ? 0.5 * (r0 + q4x_prev[0]) : r0, w1 = steady ? 0.5 * (r1 + q4x_prev[1]) : r1;
+        const bool keep = w1 < 0.97 * w0;
+        std::string note;
+        if (!steady) {
+            note = "; the times did not settle: not remembered, measured again at the next start";
+        } else if (q4x_file.empty()) {
+            note = "; not remembered (no data folder named)";
+        } else {
+            Q4xMemo mm;
+            mm.kept = keep;
+            mm.us_with = w1 * 1e6;
+            mm.us_without = w0 * 1e6;
+            note = q4x_memo_put(q4x_file, q4x_key, mm) ? "; remembered for this PC in " + q4x_file
+                                                       : "; not remembered (" + q4x_file + " could not be written)";
+        }
         std::fprintf(stderr, "maya-hy4: CPU lane: the 4-bit copies %s - an expert run %.1f us with them, %.1f us without "
-                     "(%lld / %lld one-token calls, %lld experts re-coded)\n", keep ? "kept" : "dropped", r1 * 1e6,
-                     r0 * 1e6, lc.trial_calls[1], lc.trial_calls[0], (long long) q4x_made.load());
+                     "(%d windows of %lld one-token calls a side, the last %d timed in; %lld experts re-coded)%s\n",
+                     keep ? "kept" : "dropped", w1 * 1e6, w0 * 1e6, q4x_windows, K, steady ? 2 : 1,
+                     (long long) q4x_made.load(), note.c_str());
         if (keep) {
             lc.q4x_mode.store(1, std::memory_order_relaxed);
             return;

@@ -59,3 +59,5 @@ build-vision.bat
 /third_party/*.zip
 
 /data/glm-link-cpu-cal.txt
+/data/hy4-cpu-lane.txt
+/data/hy4-cpu-lane.txt.new

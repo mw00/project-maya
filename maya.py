@@ -4971,8 +4971,6 @@ def skip_start_calibrations(cfg_path: Path, cfg: dict, why: str) -> None:
         todo.append(("speed calibration", "--speed-calibration"))
     elif needs_link_calibration(cfg):
         todo.append(("both-GPU speed check", "--speed-calibration"))
-    if needs_q4x_calibration(cfg) and not any(f == "--speed-calibration" for _, f in todo):
-        todo.append(("CPU lane check", "--speed-calibration"))
     if todo:
         say("  Calibration skipped on this start (" + why + "): the model starts with its default settings. Run it once "
             "when you can wait for it: " + "; ".join(f"{ME} --config {cfg_path} {flag} --no-start ({name})"
@@ -4982,15 +4980,21 @@ def skip_start_calibrations(cfg_path: Path, cfg: dict, why: str) -> None:
 HY4_Q4X_ENV = "HY4_Q4X"                            # maya-hy4's 4-bit expert copies: 2 / unset measured, 1 on, 0 off
 
 
-def needs_q4x_calibration(cfg: dict) -> bool:
-    """A Maya size of Hy4-Flash with no verdict yet on its CPU lane's 4-bit expert copies (maya-hy4's HY4_Q4X): its
-    next attended start measures them once (q4x_calibration).  Not Tencent's Q4_K_M (no IQ2_XXS experts), not on
-    Metal, and not where the config's env sets HY4_Q4X itself."""
-    if config_family(cfg) != "hy4" or Q.config_key(cfg) == HY4_Q4 or cfg.get("backend") == "metal":
-        return False
-    if HY4_Q4X_ENV in (cfg.get("env") or {}):
-        return False
-    return "q4x_calibration" not in (cfg.get("installer") or {})
+def q4x_config_migrate(cfg_path: Path, cfg: dict) -> dict:
+    """A Hy4-Flash config whose env still carries the HY4_Q4X an earlier start's CPU lane check wrote (1.1.69 and
+    before, installer.q4x_calibration "on" / "off" - often measured on cold experts, so starts flipped): that value
+    dropped.  maya-hy4 now measures its 4-bit copies once its lane's experts are warm and remembers the verdict itself
+    (the data folder's hy4-cpu-lane.txt: a line a PC, model and lane-kernel build), so a start never loads the model
+    an extra time for it.  A value set by hand (no installer.q4x_calibration, or another value) stays."""
+    inst, env = cfg.get("installer") or {}, cfg.get("env") or {}
+    res = (inst.get("q4x_calibration") or {}).get("result")
+    if config_family(cfg) != "hy4" or res not in ("on", "off") or \
+            str(env.get(HY4_Q4X_ENV)) != ("1" if res == "on" else "0"):
+        return cfg
+    env.pop(HY4_Q4X_ENV, None)
+    inst.pop("q4x_calibration", None)
+    cfg_path.write_text(json.dumps(N.env_out(cfg), indent=1), encoding="utf-8")
+    return read_json(cfg_path)
 
 
 def q4x_verdict(log_text: str) -> str | None:
@@ -5004,11 +5008,17 @@ def q4x_verdict(log_text: str) -> str | None:
     return "unmeasured" if "4-bit copies" in log_text else None
 
 
+Q4X_ANSWERS = 12                                   # (--speed-calibration's CPU lane check: answers at most for a verdict)
+Q4X_BUILD_WAIT_S = 120                             # (... and the wait for the copies, made between answers)
+
+
 def q4x_calibration(cfg_path: Path, why: str = "") -> bool | None:
-    """maya-hy4's 4-bit copies of the CPU lane's most routed experts, measured once on this PC: the engine's own check
-    (HY4_Q4X=2 - a probe at its start, then one answer's lane calls timed in turns with and without the copies; the
-    same tokens either way, the copies giving the file's bits) over a warm-up answer and a longer one.  The verdict
-    goes into the config's env (HY4_Q4X 1 or 0: the next starts do not measure) and installer.q4x_calibration.
+    """maya-hy4's 4-bit copies of the CPU lane's most routed experts, measured again on this PC (--speed-calibration):
+    the engine's own check (HY4_Q4X=2 with HY4_Q4X_MEASURE=1 - a probe at its start, then, once the copies are made and
+    the lane's experts warm, the answers' lane calls timed in turns with and without them until two windows agree; the
+    same tokens either way, the copies giving the file's bits) over a warm-up answer and as many more as it takes (up
+    to Q4X_ANSWERS).  The engine remembers the verdict itself (the data folder's hy4-cpu-lane.txt), so the next starts
+    do not measure; installer.q4x_calibration keeps the result for the record (the config's env is left as it is).
     True / False: on / off; None: nothing to decide here (no CPU lane, no IQ2_XXS experts) or not measured (said)."""
     cfg = read_json(cfg_path)
     tdir = Path(cfg.get("tokenizer") or "")
@@ -5026,11 +5036,15 @@ def q4x_calibration(cfg_path: Path, why: str = "") -> bool | None:
     ids = ST.Tokenizer.from_dir(tdir).encode(bench_chat("hy4", tdir)(BENCH_TOPICS[0]), parse_special=True)
     env = SV.child_env(cfg)
     env[HY4_Q4X_ENV] = "2"
+    env["HY4_Q4X_MEASURE"] = "1"                       # (measured again: the verdict remembered before is not used)
     say()
-    say(f"  Checking the CPU lane's 4-bit expert copies on this PC{f' ({why})' if why else ''}: two answers, the model")
+    say(f"  Checking the CPU lane's 4-bit expert copies on this PC{f' ({why})' if why else ''}: a few answers, the model")
     say("  loads once (a few minutes) ...")
     log_path = ROOT / "maya-q4x-calibration.log"
     done = False
+
+    def said() -> str:
+        return log_path.read_text(encoding="utf-8", errors="replace") if log_path.exists() else ""
     with open(log_path, "w", encoding="utf-8") as log:
         try:
             p = subprocess.Popen([cfg["exe"], "--serve"] + SV.engine_args(cfg), stdin=subprocess.PIPE,
@@ -5051,9 +5065,19 @@ def q4x_calibration(cfg_path: Path, why: str = "") -> bool | None:
         try:
             for line in p.stdout:
                 if line.startswith("READY"):
-                    # (the warm-up answer gives the routing counts the copies are made by - between answers - and the
-                    #  second answer's one-token calls are timed in turns with and without them)
-                    done = gen(64) and (time.sleep(15) or True) and gen(256)
+                    # (the warm-up answer gives the routing counts the copies are made by - between answers, so the
+                    #  engine is left idle until it times them - then answers until its verdict: the one-token calls
+                    #  timed in turns with and without them, window by window, until two agree)
+                    done = gen(64)
+                    for _ in range(Q4X_BUILD_WAIT_S // 5):
+                        if not done or q4x_verdict(said()) != "unmeasured" or "timing the answers" in said():
+                            break
+                        time.sleep(5)
+                    for _ in range(Q4X_ANSWERS):
+                        if not done or q4x_verdict(said()) != "unmeasured":
+                            break
+                        done = gen(256)
+                        time.sleep(2)                  # (the verdict's line reaches the log)
                     break
             p.stdin.write("QUIT\n")
             p.stdin.flush()
@@ -5062,14 +5086,13 @@ def q4x_calibration(cfg_path: Path, why: str = "") -> bool | None:
             p.kill()
     verdict = q4x_verdict(log_path.read_text(encoding="utf-8", errors="replace"))
     if not done or verdict == "unmeasured":
-        warn(f"the CPU lane check did not finish ({log_path.name} says why): its copies are measured at each start "
-             f"instead ({ME} --speed-calibration tries again)")
+        warn(f"the CPU lane check did not finish ({log_path.name} says why): the engine measures its copies while it "
+             f"answers instead, once its experts are warm, and remembers it ({ME} --speed-calibration tries again)")
         cfg.setdefault("installer", {})["q4x_calibration"] = {"result": "unmeasured", "date": time.strftime("%Y-%m-%d")}
         cfg_path.write_text(json.dumps(N.env_out(cfg), indent=1), encoding="utf-8")
         return None
+    # (the verdict is the engine's to remember - per PC, model and lane kernels; the config only records it)
     cfg.setdefault("installer", {})["q4x_calibration"] = {"result": verdict or "n/a", "date": time.strftime("%Y-%m-%d")}
-    if verdict is not None:
-        cfg.setdefault("env", {})[HY4_Q4X_ENV] = "1" if verdict == "on" else "0"
     cfg_path.write_text(json.dumps(N.env_out(cfg), indent=1), encoding="utf-8")
     if verdict is None:
         ok("CPU lane check: nothing to decide on this PC (no CPU lane of IQ2_XXS experts)")
@@ -5865,10 +5888,10 @@ def server_command(cfg_path: Path, a) -> tuple:
         if link_calibration(cfg_path, "once, for this PC"):
             cfg = read_json(cfg_path)
             args = cfg.get("args") or []
-    if not unattended and needs_q4x_calibration(cfg):       # Hy4-Flash's 4-bit expert copies: on or off, measured once
-        q4x_calibration(cfg_path, "once, for this PC")
-        cfg = read_json(cfg_path)
-        args = cfg.get("args") or []
+    # Hy4-Flash's 4-bit expert copies: measured by the engine once its experts are warm, remembered per PC (no start of
+    # its own for it any more); a verdict an earlier start's check wrote into the config is dropped for the engine's
+    cfg = q4x_config_migrate(cfg_path, cfg)
+    args = cfg.get("args") or []
     port = a.port or cfg.get("port") or 8080
     host = a.host or cfg.get("host") or "127.0.0.1"
     key = a.api_key or cfg.get("api_key")
@@ -6064,7 +6087,9 @@ REPORT_LINES = re.compile(r"glm fast:|glm prefill: (?:CUDA|HIP)|glm split|glm st
                           r"^ds4: (?!copying experts |experts \d+ / |loading \d)|^ds4 (?:slots|cache):|^maya-ds4:|"
                           r"^(?:prompt|decode): \d+ tokens in |^decode per token:|^decode (?:reads|left out)|^dspark|"
                           # maya-mm3's: where the model went (its --serve start) and each answer's prompt / decode speed
-                          r"^maya-mm3:|^maya mm3 serve: (?:prompt|DSpark) |^maya-hy4:",
+                          r"^maya-mm3:|^maya mm3 serve: (?:prompt|DSpark) |^maya-hy4:|"
+                          # the Monitor's GPU readings: a reading that failed, a reader that stopped and why
+                          r"^\[maya\] (?:a GPU reading failed|the GPU readings)",
                           re.I)
 STAT_DECODE = re.compile(r"glm stat: decode ([\d.]+) ms/tok")
 
@@ -6081,6 +6106,16 @@ def speed_lines(text) -> list:
             x = "glm stat (prompt only): prompt " + x.split("| prompt ", 1)[1]
         picked.append(x.strip())
     return picked
+
+
+def gpu_readings_report() -> str:
+    """--report: what the dashboard's Monitor reads on each NVIDIA GPU (serve/telemetry.py's NVML reader, a process of
+    its own): each card's readings given or not, any that failed with its error - never an error of the report's own."""
+    try:
+        from serve import telemetry as TM
+        return TM.readings_report()
+    except Exception as e:  # noqa: BLE001 - the report goes on without this part
+        return f"not read ({type(e).__name__}: {e})"
 
 
 def hip_gpu_report(rocm: Path, bindir=None) -> str:
@@ -6181,6 +6216,7 @@ def report(version: str, backend: str | None = None, cfg_path: Path | None = Non
         add("GPUs", S.out(["nvidia-smi", "--query-gpu=index,name,memory.total,memory.used,driver_version,"
                                          "pcie.link.gen.max,pcie.link.width.current,pcie.link.width.max,power.limit,"
                                          "temperature.gpu", "--format=csv"]) or "nvidia-smi did not answer")
+        add("GPU readings (the Monitor's NVML reader, read now)", gpu_readings_report())
     cpu, avx2, avx512 = S.cpu_info()
     total, avail = mem_gb()
     pf = S.page_file_gb()
@@ -6208,6 +6244,12 @@ def report(version: str, backend: str | None = None, cfg_path: Path | None = Non
             images = "off" if "--vision" in args[:-1] and args[args.index("--vision") + 1] == "off" else "on"
         elif config_family(cfg) == "minimax":   # (maya-mm3's too: --vision on when the pack has it, left out without)
             images = "on" if flag_value(args, "--vision") == "on" else "off"
+        elif config_family(cfg) == "hy4":       # (maya-hy4's: on whenever its pack has the tower, unless --vision off -
+            # the tower in RAM, on the GPU a picture at a time: the config has no "vision" entry of its own)
+            images = "off (--vision off)" if flag_value(args, "--vision") == "off" else \
+                "on (read a picture at a time)" if pack is not None and hy4_pack_has_vision(pack) else \
+                "off (no vision tower in the pack)" if pack is not None and (pack / "hy4.txt").exists() else \
+                "? (the pack is not here to look in)"
         else:
             images = "on" if cfg.get("vision") else "off"
         where = ""

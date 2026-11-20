@@ -910,6 +910,20 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
       # (DS4_IQ_MIN_FORMS: on AMD the K-quants' minimum term rounded one way in the token and the window kernels -
       #  ds4_iq.cu's kMinG ..; a verify window's rows are then the rows the tokens get one at a time)
       target_compile_definitions(maya-hy4 PRIVATE MAYA_DS4_IQ_ONLY DS4_IQ_MIN_FORMS)
+      # the CPU lane kernels' build: a hash of their sources (maya-hy4 remembers per PC whether its 4-bit expert
+      # copies pay, by this too - changed kernels are measured again); a change to one of them configures again
+      file(GLOB _hy4_lane_src src/hy4/hy4_lane.cpp src/hy4/hy4_lane.hpp src/ds4/ds4_iq_cpu.* src/ds4/ds4_iq512_kern.inc
+           src/kernels/cpu/iq*.cpp src/kernels/cpu/iq*.inc include/strata/kernels/cpu/iq*.hpp)
+      list(SORT _hy4_lane_src)
+      set(_hy4_lane_sum "")
+      foreach(_f IN LISTS _hy4_lane_src)
+        file(MD5 "${_f}" _h)
+        string(APPEND _hy4_lane_sum "${_h}")
+      endforeach()
+      string(MD5 _hy4_lane_sum "${_hy4_lane_sum}")
+      string(SUBSTRING "${_hy4_lane_sum}" 0 12 _hy4_lane_sum)
+      set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${_hy4_lane_src})
+      set_property(SOURCE src/hy4/hy4_lane.cpp APPEND PROPERTY COMPILE_DEFINITIONS HY4_LANE_KERNELS=k${_hy4_lane_sum})
       # maya-hy4's CPU lane alone (no GPU, no model): a call's time / GB/s by expert format and a hash of its
       # outputs, to compare the lane's row forms bit for bit across runs (built by name)
       add_executable(hy4_lane_bench EXCLUDE_FROM_ALL tests/hy4_lane_bench.cpp src/hy4/hy4_lane.cpp src/ds4/ds4_iq_cpu.cpp

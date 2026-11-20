@@ -23,10 +23,17 @@
 #endif
 #include <chrono>
 #include <condition_variable>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <mutex>
 #include <thread>
+#if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
+#include <intrin.h>   // (__cpuid: the CPU's name in the 4-bit copies' verdict key)
+#elif (defined(__x86_64__) || defined(__i386__)) && (defined(__GNUC__) || defined(__clang__))
+#include <cpuid.h>
+#endif
 
 #include "strata/platform/commit.hpp"
 #include "strata/platform/dedicated.hpp"
@@ -667,6 +674,128 @@ bool q4x_probe(Lane& lane, const CpuExperts& ex0, int n_expert, double& ms_file,
     ms_file = best[0];
     ms_q4x = best[1];
     return true;
+}
+
+// ------------------------------------------------------------------------------------- the 4-bit copies' verdict
+#ifndef HY4_LANE_KERNELS
+#define HY4_LANE_KERNELS unknown
+#endif
+#define HY4_STR2(x) #x
+#define HY4_STR(x) HY4_STR2(x)
+const char* lane_kernels_id() { return HY4_STR(HY4_LANE_KERNELS); }
+
+namespace {
+
+// the CPU's own name (x86: its brand string; else Linux's cpuinfo), tabs and line ends out
+std::string cpu_brand() {
+    std::string s;
+#if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
+    int r[4] = {0, 0, 0, 0};
+    __cpuid(r, (int) 0x80000000);
+    if ((unsigned) r[0] >= 0x80000004u)
+        for (int leaf = 0; leaf < 3; ++leaf) {
+            __cpuid(r, (int) (0x80000002u + leaf));
+            s.append((const char*) r, 16);
+        }
+#elif (defined(__x86_64__) || defined(__i386__)) && (defined(__GNUC__) || defined(__clang__))
+    unsigned w[4] = {0, 0, 0, 0};
+    if (__get_cpuid(0x80000000u, &w[0], &w[1], &w[2], &w[3]) && w[0] >= 0x80000004u)
+        for (unsigned leaf = 0x80000002u; leaf <= 0x80000004u; ++leaf)
+            if (__get_cpuid(leaf, &w[0], &w[1], &w[2], &w[3])) s.append((const char*) w, 16);
+#endif
+#if defined(__linux__)
+    if (s.find_first_not_of(std::string(" \0", 2)) == std::string::npos) {
+        const std::string info = read_file("/proc/cpuinfo");
+        for (const char* k : {"model name", "Hardware", "CPU part"}) {
+            const size_t at = info.find(k);
+            if (at == std::string::npos) continue;
+            const size_t colon = info.find(':', at), end = info.find('\n', at);
+            if (colon != std::string::npos && colon < end) s = info.substr(colon + 1, end - colon - 1);
+            break;
+        }
+    }
+#endif
+    std::string out;
+    for (char ch : s) {
+        if (ch == '\0') break;
+        out += (ch == '\t' || ch == '\n' || ch == '\r') ? ' ' : ch;
+    }
+    const size_t b0 = out.find_first_not_of(' '), b1 = out.find_last_not_of(' ');
+    return b0 == std::string::npos ? std::string("cpu") : out.substr(b0, b1 - b0 + 1);
+}
+
+std::vector<std::string> split_tabs(const std::string& line) {
+    std::vector<std::string> f;
+    size_t a = 0;
+    for (size_t t; (t = line.find('\t', a)) != std::string::npos; a = t + 1) f.push_back(line.substr(a, t - a));
+    f.push_back(line.substr(a));
+    return f;
+}
+
+}  // namespace
+
+std::string q4x_memo_key(const std::string& model, int lane_threads) {
+    char buf[160];
+    std::snprintf(buf, sizeof buf, "|threads %u|RAM %.0f GB|lane %d threads|", std::thread::hardware_concurrency(),
+                  (double) ram_total() / 1e9, lane_threads);
+    std::string k = cpu_brand() + buf + model + "|lane kernels " + lane_kernels_id();
+    for (char& ch : k)
+        if (ch == '\t' || ch == '\n' || ch == '\r') ch = ' ';
+    return k;
+}
+
+Q4xMemo q4x_memo_get(const std::string& path, const std::string& key) {
+    Q4xMemo m;
+    std::ifstream f(path);
+    for (std::string line; f && std::getline(f, line);) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (line.empty() || line[0] == '#') continue;
+        const std::vector<std::string> v = split_tabs(line);   // key, kept|dropped, us with, us without, date
+        if (v.size() < 5 || v[0] != key || (v[1] != "kept" && v[1] != "dropped")) continue;
+        m.found = true;
+        m.kept = v[1] == "kept";
+        m.us_with = std::atof(v[2].c_str());
+        m.us_without = std::atof(v[3].c_str());
+        m.date = v[4];
+    }
+    return m;
+}
+
+bool q4x_memo_put(const std::string& path, const std::string& key, Q4xMemo m) {
+    if (path.empty()) return false;
+    std::vector<std::string> keep;
+    {
+        std::ifstream f(path);
+        for (std::string line; f && std::getline(f, line);) {
+            if (!line.empty() && line.back() == '\r') line.pop_back();
+            if (line.empty() || line[0] == '#' || split_tabs(line)[0] == key) continue;
+            keep.push_back(line);
+        }
+    }
+    const std::time_t now = std::time(nullptr);
+    char day[16] = "?";
+    std::tm tmv{};
+#if defined(_WIN32)
+    if (localtime_s(&tmv, &now) == 0) std::strftime(day, sizeof day, "%Y-%m-%d", &tmv);
+#else
+    if (localtime_r(&now, &tmv)) std::strftime(day, sizeof day, "%Y-%m-%d", &tmv);
+#endif
+    m.date = day;
+    char nums[64];
+    std::snprintf(nums, sizeof nums, "%.1f\t%.1f\t", m.us_with, m.us_without);
+    keep.push_back(key + "\t" + (m.kept ? "kept" : "dropped") + "\t" + nums + m.date);
+    const std::string tmp = path + ".new";
+    {
+        std::ofstream o(tmp, std::ios::trunc);
+        if (!o) return false;
+        o << "# maya-hy4: the CPU lane's 4-bit expert copies, measured on this PC - a line a PC, model and lane kernels\n"
+             "# (key, kept / dropped, an expert run's us with them and without, date); delete a line, or run\n"
+             "# maya --speed-calibration, to measure again\n";
+        for (const std::string& l : keep) o << l << "\n";
+        if (!o.flush()) return false;
+    }
+    std::remove(path.c_str());   // (Windows: rename does not replace)
+    return std::rename(tmp.c_str(), path.c_str()) == 0;
 }
 
 }  // namespace hy4
