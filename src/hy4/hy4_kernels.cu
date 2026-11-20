@@ -1863,6 +1863,13 @@ void rmsnorm(const float* x, size_t ldx, int rows, int n, const float* w, float 
     rms_kernel<<<rows, 256, 0, s>>>(x, ldx, n, w, eps, y, ldy);
     check("rmsnorm");
 }
+// hc_pre's and hc_head's buffers for launches of up to T rows on the current device, made now.  Grown inside a forward,
+// the old buffer is freed under the buffers' lock, and the free waits for the GPU's queued work: in tensor parallel that
+// work can wait for another member's sum, and that member for the lock.
+void hc_reserve(int T) {
+    (void) hc_part_buf(T);
+    (void) hc_cnt_buf(T);
+}
 void hc_pre(const float* x, int T, int hc, int E, const float* fn, const float* scale, const float* base, float eps,
             float hc_eps, float mag, float* cur, float* post, cudaStream_t s, const float* norm_w, float norm_eps,
             bool fn_by_element) {
