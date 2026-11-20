@@ -5,7 +5,8 @@
 // the caches hold, a call's 16 experts a token drawn at random, the activations random.
 //
 //   hy4_lane_bench [--format iq2_xxs|iq2_s|iq3_xxs|iq4_xs|q4_k] [--tokens 1] [--calls 400] [--experts 96]
-//                  [--threads -1] [--dump FILE] (one hash a call)
+//                  [--threads -1] [--dump FILE] (one hash a call) [--q4x 1] (iq2_xxs: every expert's 4-bit copy, the
+//                  rows the lane then takes)
 #include "../src/hy4/hy4_lane.hpp"
 
 #include "ggml.h"
@@ -15,6 +16,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <random>
 #include <string>
 #include <vector>
@@ -55,7 +57,7 @@ void fill(std::vector<uint8_t>& w, int type, std::mt19937_64& rng) {
 
 int main(int argc, char** argv) {
     std::string fmt = "iq2_xxs", dump;
-    int tokens = 1, calls = 400, n_exp = 96, threads = -1;
+    int tokens = 1, calls = 400, n_exp = 96, threads = -1, q4x = 0;
     for (int i = 1; i + 1 < argc; i += 2) {
         const std::string a = argv[i];
         if (a == "--format") fmt = argv[i + 1];
@@ -64,6 +66,7 @@ int main(int argc, char** argv) {
         else if (a == "--experts") n_exp = std::atoi(argv[i + 1]);
         else if (a == "--threads") threads = std::atoi(argv[i + 1]);
         else if (a == "--dump") dump = argv[i + 1];
+        else if (a == "--q4x") q4x = std::atoi(argv[i + 1]);
     }
     const int type = type_of(fmt);
     if (type < 0) {
@@ -86,6 +89,14 @@ int main(int argc, char** argv) {
     ex.up = up.data();
     ex.down = down.data();
     ex.limit = 7.0f;
+    if (q4x) {
+        if (!ex.q4x_can()) {
+            std::fprintf(stderr, "format %s: no 4-bit copies here\n", fmt.c_str());
+            return 2;
+        }
+        ex.q4x = std::make_shared<hy4::Q4xSet>(n_exp);
+        for (int e = 0; e < n_exp; ++e) ex.q4x_make(e);
+    }
     hy4::Lane lane(threads);
     // the calls' entries and activations, fixed by the seed (the same in every run)
     std::vector<std::vector<hy4::CpuEntry>> ent((size_t) calls);
@@ -125,10 +136,12 @@ int main(int argc, char** argv) {
         std::vector<int> d;
         for (const auto& e : ent[0]) d.push_back(e.e);
         std::sort(d.begin(), d.end());
-        bytes = (double) (std::unique(d.begin(), d.end()) - d.begin()) * (double) (2 * ex.g_stride + ex.d_stride);
+        bytes = (double) (std::unique(d.begin(), d.end()) - d.begin()) *
+                (double) (q4x ? 2 * ex.q4x_gu + ex.q4x_d : 2 * ex.g_stride + ex.d_stride);
     }
     const double mean = sum / calls;
-    std::printf("%s tokens %d threads %d: mean %.3f ms (best %.3f), %.1f GB/s mean, hash %016llx\n", fmt.c_str(), tokens,
+    std::printf("%s%s tokens %d threads %d: mean %.3f ms (best %.3f), %.1f GB/s mean, hash %016llx\n", fmt.c_str(),
+                q4x ? " q4x" : "", tokens,
                 lane.threads() + 1, 1e3 * mean, 1e3 * best, bytes / mean / 1e9, (unsigned long long) h);
     return 0;
 }
