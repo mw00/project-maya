@@ -1036,7 +1036,7 @@ struct Work {
     // blocks it added after its first, then its final stream); a layer's four messages (q's, k's, v's, the MoE's);
     // its three attention inputs before the messages.
     float *lp_pre = nullptr, *lp_bank = nullptr, *lp_msg = nullptr, *lp_in = nullptr;
-    float* lp_g = nullptr;   // a message gate's scratch [Tm][rank]
+    float* lp_g = nullptr;   // the message gates' scratch [3][Tm][2 rank + 2]
     float* logits_h = nullptr;   // the resident token path's logits, pinned [n_vocab]
 };
 
@@ -1142,12 +1142,13 @@ void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const flo
                               Ly.sliding ? Ly.attn_norm : Ly.v_in_norm};
         uint16_t* y16[3] = {W.x16, W.xk16, W.xv16};
         float* y32[3] = {W.xq, W.xk, W.xv};
-        for (int j = 0; j < 3; ++j) {
-            const float* in = W.lp_in + (size_t) (Ly.n_res_q == 3 ? j : 0) * TC;
-            k::loop_gate(in, msg + (size_t) j * TC, Ly.lp_down[j], Ly.lp_forget[j], Ly.lp_gain[j], T, C, c.rank, 1e-6f,
-                         W.lp_g, y32[j], g_s);
+        k::LoopGate gt[3];
+        for (int j = 0; j < 3; ++j)
+            gt[j] = {W.lp_in + (size_t) (Ly.n_res_q == 3 ? j : 0) * TC, msg + (size_t) j * TC, Ly.lp_down[j],
+                     Ly.lp_forget[j], Ly.lp_gain[j], y32[j]};
+        k::loop_gates(gt, 3, T, C, c.rank, 1e-6f, W.lp_g, g_s);
+        for (int j = 0; j < 3; ++j)
             k::rms_f16(y32[j], nw[j], T, C, c.eps, y16[j], need_x32 ? y32[j] : nullptr, g_s);
-        }
         in_q = W.xq, in_k = W.xk, in_v = W.xv;
         xk16 = W.xk16, xv16 = W.xv16;
     } else if (l > 0) {
@@ -1835,11 +1836,12 @@ void fast_token_launches(Model& M, Work& W, OutMode out_mode) {
             st.st[nb] = W.h;
             if (msg) {
                 k::attn_res(st, nb + 1, Ly.res_score, Ly.n_res_q, 1, C, 1e-6f, W.lp_in, g_s);
-                for (int j = 0; j < 3; ++j) {
-                    k::loop_gate(W.lp_in + (size_t) (Ly.n_res_q == 3 ? j : 0) * C, msg + (size_t) j * C, Ly.lp_down[j],
-                                 Ly.lp_forget[j], Ly.lp_gain[j], 1, C, c.rank, 1e-6f, W.lp_g, x3[j], g_s);
-                    k::rms(x3[j], nw[j], 1, C, c.eps, x3[j], g_s);
-                }
+                k::LoopGate gt[3];
+                for (int j = 0; j < 3; ++j)
+                    gt[j] = {W.lp_in + (size_t) (Ly.n_res_q == 3 ? j : 0) * C, msg + (size_t) j * C, Ly.lp_down[j],
+                             Ly.lp_forget[j], Ly.lp_gain[j], x3[j]};
+                k::loop_gates(gt, 3, 1, C, c.rank, 1e-6f, W.lp_g, g_s);
+                for (int j = 0; j < 3; ++j) k::rms(x3[j], nw[j], 1, C, c.eps, x3[j], g_s);
                 sep = true;
             } else if (l > 0) {
                 k::RmsOuts outs{};
@@ -3568,7 +3570,7 @@ int main(int argc, char** argv) {
         W.lp_bank = dalloc<float>((size_t) (n_core / c.block) * Tm * C);   // (the pass's blocks after its first, its final stream)
         W.lp_msg = dalloc<float>(4 * Tm * C);
         W.lp_in = dalloc<float>(3 * Tm * C);
-        W.lp_g = dalloc<float>(Tm * c.rank);
+        W.lp_g = dalloc<float>(3 * Tm * (2 * (size_t) c.rank + 2));
     }
     for (auto& Vi : M.V) {   // the conv histories start at zero
         if (M.L[Vi.l].dev != d) continue;
