@@ -211,6 +211,10 @@ public:
     bool ablate_loaded() const;
     void set_ablate(bool on);
     bool ablating() const;
+    /// The projection a loaded direction applies, as the key of the states read with it: a hash of the direction's
+    /// values and its scale ("" without a direction).  The serve loop keeps it with a conversation it sets aside and
+    /// with a shared start, and takes one back only for a request that projects the same direction out.
+    std::string ablate_identity() const;
     /// The request's log-probabilities (GEN logprobs=<k>, ds4_logprobs.hpp) for every pick after this - sample(),
     /// sample_multi(), verify() and verify_multi() alike: logprobs() then holds a row for each token the pick returned
     /// (verify: the accepted drafts, then the token after them), each its token's logprob and its row's top k, from the
