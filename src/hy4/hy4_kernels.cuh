@@ -37,9 +37,11 @@ void rmsnorm(const float* x, size_t ldx, int rows, int n, const float* w, float 
 ///   head: the same with fn [hc][hc E], scale[0], base[hc] and no post
 void hc_pre(const float* x, int T, int hc, int E, const float* fn, const float* scale, const float* base, float eps,
             float hc_eps, float mag, float* cur, float* post, cudaStream_t s, const float* norm_w = nullptr,
-            float norm_eps = 0.0f);
+            float norm_eps = 0.0f, bool fn_by_element = false);
+/// (fn_by_element, both: fn laid out by element - [hc E][its rows], the rows a multiple of 4 - not by row: an element's
+///  weights side by side, read in 16-byte loads; the same sums)
 void hc_head(const float* x, int T, int hc, int E, const float* fn, const float* scale, const float* base, float eps,
-             float hc_eps, float* cur, cudaStream_t s);
+             float hc_eps, float* cur, cudaStream_t s, bool fn_by_element = false);
 /// x[t][s] += y[t] post[t][s]
 void hc_post(float* x, int T, int hc, int E, const float* y, const float* post, cudaStream_t s);
 /// ... with y's RMS norm (weight w, eps) first: the layer's post norm and the post-mix in one pass (yo: the normed y
@@ -183,6 +185,8 @@ void dsa_mask_list(const int* keys, int ldk, const int* nk, int T, const int* co
                    size_t ldm, cudaStream_t s);
 /// The prompt path.  dst[r][i] = F16(src[r * lds + i]), i < n
 void to_f16(const float* src, size_t lds, int rows, int n, uint16_t* dst, size_t ldd, cudaStream_t s);
+/// dst[i] = the F32 of BF16 src[i] (exact), n values
+void bf16_to_f32(const uint16_t* src, float* dst, size_t n, cudaStream_t s);
 /// A chunk's expert entries sorted by expert for ds4_iq's sets: entry e = t n_used + j of ids; bounds[x .. x + 1] the
 /// sorted rows of expert x (n_exp + 1 values), tok[r] the token of sorted row r, row_of[e] the sorted row of entry e
 /// (slot non-null: the bounds over the n_slots slots, an entry without one left out - row_of -1, its weight zeroed when
@@ -220,6 +224,12 @@ unsigned wait_timeouts();
 /// A row's top token and its probability: out[0] = the argmax (ties: the lower id, as an int's bits), out[1] =
 /// softmax(row)[argmax]
 void top1(const float* row, int n, float* out, cudaStream_t s);
+/// ... of a part of a row (n values): out[0] its top value, out[1] that one's index (as bits), out[2] the sum of
+/// exp(v - top) over the part, out[3] 0 - the row's top token and its probability are made of its parts' on the host
+void top1_part(const float* row, int n, float* out, cudaStream_t s);
+/// rows of n values, ld apart: each row's largest value's index (of equals the lowest, as a walk from the first) plus
+/// i0 at out[2 r] (as bits) and the value at out[2 r + 1] - the index -1 where the row has a NaN or nothing above -inf
+void row_top(const float* x, int rows, int n, size_t ld, int i0, float* out, cudaStream_t s);
 /// (tests) hc_pre writes its mixes [T][2 hc] here too (null: not)
 void set_mix_out(float* p);
 /// A launch failure since the last call (printed); 0 none

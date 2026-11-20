@@ -1,7 +1,7 @@
 // tests/hy4_kernels_test.cu - maya-hy4's own kernels (src/hy4/hy4_kernels.cu) against double-precision references on the
 // host (no model): the hyper-connections' pre-mix (with its norm folded in), post-mix and head; RoPE and the latent
 // cache rows; the MLA attention with sinks over a window ring and over a key list; the router; the indexer's pooled
-// keys, scores and picks (ties included); Engram's rows and mix.
+// keys, scores and picks (ties included); Engram's rows and mix; a row's top token (row_top).
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -813,6 +813,49 @@ void test_engram() {
     for (float* p : {dvalid, dln, r, dx, dkv, dkvb, deg, dgam, dhcs}) cudaFree(p);
 }
 
+// row_top: each row's largest value's first index (the host's walk), the value beside it; -1 for a row with a NaN or
+// nothing above -inf - over a row's part (an offset i0, rows ld apart)
+void test_row_top() {
+    const int rows = 6, n = 13424, ld = 13440, i0 = 26848;
+    std::vector<float> x = randn((size_t) rows * ld);
+    // row 1: its largest value twice (the lower index wins), at a block-stride apart; row 2: equal values everywhere;
+    // row 3: a NaN; row 4: all -inf; row 5: the largest in the last column
+    x[(size_t) 1 * ld + 700] = 9.0f;
+    x[(size_t) 1 * ld + 700 + 256] = 9.0f;
+    x[(size_t) 1 * ld + 5000] = 9.0f;
+    for (int i = 0; i < n; ++i) x[(size_t) 2 * ld + i] = 0.5f;
+    x[(size_t) 3 * ld + 4321] = std::nanf("");
+    for (int i = 0; i < n; ++i) x[(size_t) 4 * ld + i] = -INFINITY;
+    x[(size_t) 5 * ld + n - 1] = 99.0f;
+    float* dx = dev(x);
+    float* dout = nullptr;
+    cudaMalloc(&dout, sizeof(float) * 2 * rows);
+    hy4::k::row_top(dx, rows, n, (size_t) ld, i0, dout, 0);
+    const std::vector<float> out = host(dout, (size_t) 2 * rows);
+    int bad = 0;
+    for (int r = 0; r < rows; ++r) {
+        const float* row = x.data() + (size_t) r * ld;
+        int b = 0;
+        bool nan = false;
+        for (int i = 0; i < n; ++i) {
+            nan |= std::isnan(row[i]);
+            if (row[i] > row[b]) b = i;
+        }
+        const bool none = nan || !(row[b] > -INFINITY);
+        int id;
+        std::memcpy(&id, &out[(size_t) 2 * r], 4);
+        const int want = none ? -1 : i0 + b;
+        if (id != want || (!none && out[(size_t) 2 * r + 1] != row[b])) {
+            std::fprintf(stderr, "  row_top row %d: %d, the walk %d\n", r, id, want);
+            ++bad;
+        }
+    }
+    std::printf("  row_top: %d of %d rows as the walk (ties, a NaN, -inf)\n", rows - bad, rows);
+    CHECK(bad == 0);
+    cudaFree(dx);
+    cudaFree(dout);
+}
+
 }  // namespace
 
 // KV streaming: a VRAM ring with tags and every row in (mapped) host memory read as the cache with every row in VRAM -
@@ -931,6 +974,7 @@ int main() {
     test_router();
     test_indexer();
     test_engram();
+    test_row_top();
     CHECK(hy4::k::errors() == 0);
     std::printf("hy4_kernels_test: %s\n", fails ? "FAILED" : "ok");
     return fails ? 1 : 0;

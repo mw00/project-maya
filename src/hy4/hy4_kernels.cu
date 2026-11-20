@@ -300,6 +300,9 @@ __global__ void rms_kernel(const float* __restrict__ x, size_t ldx, int n, const
 // sum of squares and its 2 hc (head: hc) partial dots with fn's rows; hc_fin (a block a token) - the sums, the mixes,
 // pre / post, cur
 constexpr int kHcBlocks = 24, kMaxM = 16;
+// (BYEL: fn by element - [HE][nm], nm a multiple of 4 - so an element's nm weights come in nm / 4 loads of 16 bytes,
+//  not nm loads a memory trip each: the same products summed in the same order)
+template <bool BYEL>
 __device__ __forceinline__ void hc_part_body(int t, int b, const float* __restrict__ x, int HE, int nm,
                                              const float* __restrict__ fn, float* __restrict__ part) {
     __shared__ float sh[8][kMaxM + 1];
@@ -311,9 +314,22 @@ __device__ __forceinline__ void hc_part_body(int t, int b, const float* __restri
     for (int i = i0 + (int) threadIdx.x; i < i1; i += blockDim.x) {
         const float v = xt[i];
         acc[kMaxM] = fmaf(v, v, acc[kMaxM]);
+        if constexpr (BYEL) {
+            const float4* f4 = (const float4*) (fn + (size_t) i * nm);
 #pragma unroll
-        for (int j = 0; j < kMaxM; ++j)
-            if (j < nm) acc[j] = fmaf(fn[(size_t) j * HE + i], v, acc[j]);
+            for (int j = 0; j < kMaxM; j += 4)
+                if (j < nm) {
+                    const float4 wv = f4[j / 4];
+                    acc[j] = fmaf(wv.x, v, acc[j]);
+                    acc[j + 1] = fmaf(wv.y, v, acc[j + 1]);
+                    acc[j + 2] = fmaf(wv.z, v, acc[j + 2]);
+                    acc[j + 3] = fmaf(wv.w, v, acc[j + 3]);
+                }
+        } else {
+#pragma unroll
+            for (int j = 0; j < kMaxM; ++j)
+                if (j < nm) acc[j] = fmaf(fn[(size_t) j * HE + i], v, acc[j]);
+        }
     }
     const int w = threadIdx.x >> 5, l = threadIdx.x & 31;
 #pragma unroll
@@ -329,9 +345,10 @@ __device__ __forceinline__ void hc_part_body(int t, int b, const float* __restri
         part[((size_t) t * kHcBlocks + b) * (kMaxM + 1) + threadIdx.x] = v;
     }
 }
+template <bool BYEL>
 __global__ void __launch_bounds__(256) hc_part_kernel(const float* __restrict__ x, int HE, int nm,
                                                       const float* __restrict__ fn, float* __restrict__ part) {
-    hc_part_body(blockIdx.y, blockIdx.x, x, HE, nm, fn, part);
+    hc_part_body<BYEL>(blockIdx.y, blockIdx.x, x, HE, nm, fn, part);
 }
 // hc_fin's work for token t, KPER values a thread (E <= blockDim KPER); part read past L1 (another block's writes)
 template <bool HEAD, int KPER>
@@ -404,7 +421,7 @@ __global__ void __launch_bounds__(256) hc_pre1_kernel(const float* __restrict__ 
                                                       float* __restrict__ mix_out, const float* __restrict__ nw,
                                                       float neps) {
     const int t = blockIdx.y;
-    hc_part_body(t, blockIdx.x, x, hc * E, 2 * hc, fn, part);
+    hc_part_body<false>(t, blockIdx.x, x, hc * E, 2 * hc, fn, part);
     __shared__ bool last;
     __threadfence();
     __syncthreads();
@@ -661,6 +678,137 @@ __global__ void __launch_bounds__(32 * HB) attn_kernel(const float* __restrict__
                 const float2 v = __half22float2(tile[j][lane + 32 * i]);
                 acc[2 * i] = fmaf(pj, v.x, acc[2 * i] * corr);
                 acc[2 * i + 1] = fmaf(pj, v.y, acc[2 * i + 1] * corr);
+            }
+            m = mn;
+        }
+    }
+    if (h >= H) return;
+    float* o = ws + (((size_t) t * H + h) * nchunk + c) * (512 + 2);
+    if (lane == 0) {
+        o[0] = m;
+        o[1] = l;
+    }
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        o[2 + 2 * (lane + 32 * i)] = acc[2 * i];
+        o[2 + 2 * (lane + 32 * i) + 1] = acc[2 * i + 1];
+    }
+}
+// ... the same sums, sooner.  A thread's loads from the cache come back one after another, each a trip to memory - so
+// the tile is read 16 bytes a load (a row's 42 such words spread over the block's threads: two or three loads a thread
+// where attn_kernel made dozens), its scales first.  The tile holds F32 - the F16 values, widened as they are loaded -
+// in half the rows; a key that is not a new maximum (most) leaves the sums unscaled (their factor is expf(0) = 1:
+// x * 1 = x).  Every product, sum and rounding as attn_kernel's: the same bits.
+constexpr int kTile2 = 16;
+template <bool Q8>
+__global__ void __launch_bounds__(256) attn2_kernel(const float* __restrict__ q, int H, const void* __restrict__ cache_v,
+                                                    int ring, const int* __restrict__ keys, int ldk,
+                                                    const int* __restrict__ lo, const int* __restrict__ nk, float scale,
+                                                    int nchunk, int kc, float* __restrict__ ws, int rb) {
+    __shared__ float2 tile[kTile2][kRowW];
+    __shared__ int rows[kTile2];
+    __shared__ float sc[kTile2][16];   // (Q8: a row's 16 scales)
+    const int c = blockIdx.x, t = blockIdx.z, w = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int h = blockIdx.y * 8 + w;
+    const int n = nk[t], k0 = c * kc, k1 = min(n, k0 + kc);
+    float qr[18];
+    if (h < H) {   // (the head's query: this lane's 18 of its 576 values, in 16-byte loads where they are aligned)
+        const float* qh = q + ((size_t) t * H + h) * (2 * kRowW);
+#pragma unroll
+        for (int i = 0; i < 9; ++i) {
+            const float2 v = *(const float2*) (qh + 2 * (lane + 32 * i));
+            qr[2 * i] = v.x;
+            qr[2 * i + 1] = v.y;
+        }
+    }
+    float m = -INFINITY, l = 0.0f, acc[16];
+#pragma unroll
+    for (int i = 0; i < 16; ++i) acc[i] = 0.0f;
+    for (int kt = k0; kt < k1; kt += kTile2) {
+        const int nt = min(kTile2, k1 - kt);
+        __syncthreads();
+        if ((int) threadIdx.x < nt) {
+            const int p = keys ? keys[(size_t) t * ldk + kt + threadIdx.x] : lo[t] + kt + (int) threadIdx.x;
+            rows[threadIdx.x] = ring > 0 ? p % ring : p;
+        }
+        __syncthreads();
+        if (Q8) {
+            // a row: 512 int8 (32 words of 16 bytes), its 16 F16 scales (2 words), 64 F16 rotated values (8 words)
+            if ((int) threadIdx.x < 2 * nt) {
+                const int r = threadIdx.x >> 1, hf = threadIdx.x & 1;
+                const uint4 u = *(const uint4*) ((const uint8_t*) cache_v + (size_t) rows[r] * rb + 512 + 16 * hf);
+                const unsigned wd[4] = {u.x, u.y, u.z, u.w};
+#pragma unroll
+                for (int qd = 0; qd < 4; ++qd) {
+                    sc[r][hf * 8 + 2 * qd] = __half2float(__ushort_as_half((unsigned short) (wd[qd] & 0xffffu)));
+                    sc[r][hf * 8 + 2 * qd + 1] = __half2float(__ushort_as_half((unsigned short) (wd[qd] >> 16)));
+                }
+            }
+            __syncthreads();
+            for (int it = threadIdx.x; it < nt * 40; it += blockDim.x) {
+                const int r = it / 40, ci = it % 40;
+                const uint8_t* rp = (const uint8_t*) cache_v + (size_t) rows[r] * rb;
+                if (ci < 32) {   // (16 int8: 8 pairs, one scale - the block of 32 values they are in)
+                    const uint4 u = *(const uint4*) (rp + 16 * ci);
+                    const unsigned wd[4] = {u.x, u.y, u.z, u.w};
+                    const float d = sc[r][ci >> 1];
+#pragma unroll
+                    for (int qd = 0; qd < 4; ++qd) {
+                        const float a0 = (float) (signed char) (wd[qd] & 0xffu), a1 = (float) (signed char) ((wd[qd] >> 8) & 0xffu);
+                        const float a2 = (float) (signed char) ((wd[qd] >> 16) & 0xffu), a3 = (float) (signed char) (wd[qd] >> 24);
+                        tile[r][8 * ci + 2 * qd] = __half22float2(__floats2half2_rn(d * a0, d * a1));
+                        tile[r][8 * ci + 2 * qd + 1] = __half22float2(__floats2half2_rn(d * a2, d * a3));
+                    }
+                } else {         // (the rotated part: 4 pairs of F16)
+                    const uint4 u = *(const uint4*) (rp + 544 + 16 * (ci - 32));
+                    const unsigned wd[4] = {u.x, u.y, u.z, u.w};
+#pragma unroll
+                    for (int qd = 0; qd < 4; ++qd)
+                        tile[r][256 + 4 * (ci - 32) + qd] =
+                            make_float2(__half2float(__ushort_as_half((unsigned short) (wd[qd] & 0xffffu))),
+                                        __half2float(__ushort_as_half((unsigned short) (wd[qd] >> 16))));
+                }
+            }
+        } else {   // (F16 rows: 72 words of 4 pairs)
+            for (int it = threadIdx.x; it < nt * 72; it += blockDim.x) {
+                const int r = it / 72, ci = it % 72;
+                const uint4 u = *(const uint4*) ((const uint8_t*) cache_v + ((size_t) rows[r] * kRowW + 4 * ci) * 4);
+                const unsigned wd[4] = {u.x, u.y, u.z, u.w};
+#pragma unroll
+                for (int qd = 0; qd < 4; ++qd)
+                    tile[r][4 * ci + qd] = make_float2(__half2float(__ushort_as_half((unsigned short) (wd[qd] & 0xffffu))),
+                                                       __half2float(__ushort_as_half((unsigned short) (wd[qd] >> 16))));
+            }
+        }
+        __syncthreads();
+        if (h >= H) continue;
+        for (int j = 0; j < nt; ++j) {
+            float s = 0.0f;
+#pragma unroll
+            for (int i = 0; i < 9; ++i) {
+                const float2 kv = tile[j][lane + 32 * i];
+                s = fmaf(qr[2 * i], kv.x, fmaf(qr[2 * i + 1], kv.y, s));
+            }
+            s = warp_sum(s) * scale;
+            const float mn = fmaxf(m, s);
+            if (mn == m) {   // (not a new maximum: corr = expf(m - m) = 1)
+                const float pj = expf(s - mn);
+                l = l * 1.0f + pj;
+#pragma unroll
+                for (int i = 0; i < 8; ++i) {
+                    const float2 v = tile[j][lane + 32 * i];
+                    acc[2 * i] = fmaf(pj, v.x, acc[2 * i]);
+                    acc[2 * i + 1] = fmaf(pj, v.y, acc[2 * i + 1]);
+                }
+            } else {         // (a new maximum, s: pj = expf(s - s) = 1 - or a NaN, as attn_kernel takes it)
+                const float corr = expf(m - mn), pj = expf(s - mn);
+                l = l * corr + pj;
+#pragma unroll
+                for (int i = 0; i < 8; ++i) {
+                    const float2 v = tile[j][lane + 32 * i];
+                    acc[2 * i] = fmaf(pj, v.x, acc[2 * i] * corr);
+                    acc[2 * i + 1] = fmaf(pj, v.y, acc[2 * i + 1] * corr);
+                }
             }
             m = mn;
         }
@@ -1290,6 +1438,9 @@ __global__ void __launch_bounds__(1024) top1_kernel(const float* __restrict__ ro
 constexpr int kTop1Blocks = 64;
 __device__ unsigned g_top1_done = 0;
 __device__ float g_top1_part[kTop1Blocks * 3];
+// (PART: a part of a row - its top value, that one's index and its sum of exp(v - top), for the whole row's to be made
+//  of its parts': out[0..2])
+template <bool PART>
 __global__ void __launch_bounds__(256) top1_multi_kernel(const float* __restrict__ row, int n, float* __restrict__ out) {
     __shared__ float sv[8];
     __shared__ int si[8];
@@ -1339,8 +1490,15 @@ __global__ void __launch_bounds__(256) top1_multi_kernel(const float* __restrict
         const float v = ((volatile float*) g_top1_part)[b * 3];
         if (v > -INFINITY) S += ((volatile float*) g_top1_part)[b * 3 + 2] * expf(v - M);
     }
-    out[0] = __int_as_float(I);
-    out[1] = 1.0f / S;
+    if constexpr (PART) {
+        out[0] = M;
+        out[1] = __int_as_float(I);
+        out[2] = S;
+        out[3] = 0.0f;
+    } else {
+        out[0] = __int_as_float(I);
+        out[1] = 1.0f / S;
+    }
     g_top1_done = 0;
 }
 
@@ -1446,6 +1604,18 @@ __device__ __forceinline__ float4 pooled4(const __half* p, int i) {
     const float2 a = __half22float2(*(const __half2*) &u.x), b = __half22float2(*(const __half2*) &u.y);
     return make_float4(a.x, a.y, b.x, b.y);
 }
+// (groups i and i + 1 - 8 values - at once)
+__device__ __forceinline__ void pooled8(const float* p, int i, float4& a, float4& b) {
+    a = ((const float4*) p)[i];
+    b = ((const float4*) p)[i + 1];
+}
+__device__ __forceinline__ void pooled8(const __half* p, int i, float4& a, float4& b) {
+    const uint4 u = ((const uint4*) p)[i / 2];
+    const float2 a0 = __half22float2(*(const __half2*) &u.x), a1 = __half22float2(*(const __half2*) &u.y);
+    const float2 b0 = __half22float2(*(const __half2*) &u.z), b1 = __half22float2(*(const __half2*) &u.w);
+    a = make_float4(a0.x, a0.y, a1.x, a1.y);
+    b = make_float4(b0.x, b0.y, b1.x, b1.y);
+}
 template <typename P>
 __global__ void __launch_bounds__(256) ix_score_kernel(const float* __restrict__ q, const float* __restrict__ wt,
                                                        int heads, int dim, const P* __restrict__ pooled,
@@ -1464,14 +1634,20 @@ __global__ void __launch_bounds__(256) ix_score_kernel(const float* __restrict__
 #pragma unroll
         for (int h = 0; h < 16; ++h) acc[h] = 0.0f;
         const P* pk = pooled + (size_t) g * dim;
-        for (int i = 0; i < dim / 4; ++i) {
-            const float4 kk = pooled4(pk, i);
+        for (int i2 = 0; i2 < dim / 4; i2 += 2) {   // (two groups of 4 values a pass: F16 keys in one 16-byte load)
+            float4 k2[2];
+            pooled8(pk, i2, k2[0], k2[1]);
 #pragma unroll
-            for (int h = 0; h < 16; ++h)
-                if (h < heads) {
-                    const float* qh = sq + h * dim + 4 * i;
-                    acc[h] = fmaf(qh[0], kk.x, fmaf(qh[1], kk.y, fmaf(qh[2], kk.z, fmaf(qh[3], kk.w, acc[h]))));
-                }
+            for (int u = 0; u < 2; ++u) {
+                const float4 kk = k2[u];
+                const int i = i2 + u;
+#pragma unroll
+                for (int h = 0; h < 16; ++h)
+                    if (h < heads) {
+                        const float* qh = sq + h * dim + 4 * i;
+                        acc[h] = fmaf(qh[0], kk.x, fmaf(qh[1], kk.y, fmaf(qh[2], kk.z, fmaf(qh[3], kk.w, acc[h]))));
+                    }
+            }
         }
         out = 0.0f;
 #pragma unroll
@@ -1508,7 +1684,7 @@ __global__ void __launch_bounds__(1024) ix_select_kernel(const float* __restrict
     __shared__ int hist[256];
     __shared__ uint32_t s_prefix, s_mask;
     __shared__ int s_need;
-    __shared__ int s_gt[1024], s_eq[1024];
+    __shared__ int s_gt[32], s_eq[32];   // (the warps' totals, then their offsets)
     const int t = blockIdx.x, nth = blockDim.x, tid = threadIdx.x;
     const int p = pos[t], nv = p / kpool;
     const float* sc = score + (size_t) t * ld;
@@ -1557,23 +1733,44 @@ __global__ void __launch_bounds__(1024) ix_select_kernel(const float* __restrict
         }
     else
         cg = b1 - b0;
-    s_gt[tid] = cg;
-    s_eq[tid] = ce;
+    // the counts' exclusive scans (integers: the same numbers however they are added): each warp its own, the warps'
+    // totals by the first warp - one thread walking 1024 entries was most of this kernel's time
+    const int lane = tid & 31, wp = tid >> 5;
+    int ia = cg, ie = ce;
+#pragma unroll
+    for (int o = 1; o < 32; o <<= 1) {
+        const int pa = __shfl_up_sync(0xffffffffu, ia, o), pe = __shfl_up_sync(0xffffffffu, ie, o);
+        if (lane >= o) {
+            ia += pa;
+            ie += pe;
+        }
+    }
+    if (lane == 31) {
+        s_gt[wp] = ia;
+        s_eq[wp] = ie;
+    }
     __syncthreads();
-    if (tid == 0) {   // (exclusive scans; 1024 entries)
-        int a = 0, e = 0;
-        for (int i = 0; i < nth; ++i) {
-            const int x = s_gt[i], y = s_eq[i];
-            s_gt[i] = a;
-            s_eq[i] = e;
-            a += x;
-            e += y;
+    if (tid < 32) {
+        const bool in = tid < (nth >> 5);
+        const int ta = in ? s_gt[tid] : 0, te = in ? s_eq[tid] : 0;
+        int wa = ta, we = te;
+#pragma unroll
+        for (int o = 1; o < 32; o <<= 1) {
+            const int pa = __shfl_up_sync(0xffffffffu, wa, o), pe = __shfl_up_sync(0xffffffffu, we, o);
+            if (lane >= o) {
+                wa += pa;
+                we += pe;
+            }
+        }
+        if (in) {
+            s_gt[tid] = wa - ta;
+            s_eq[tid] = we - te;
         }
     }
     __syncthreads();
     // a pick's slot: the picks before it in index order = the greater keys before it + the ties taken before it (the
     // first take_eq ties in index order)
-    int ng = s_gt[tid], ne = s_eq[tid];
+    int ng = s_gt[wp] + ia - cg, ne = s_eq[wp] + ie - ce;
     for (int g = b0; g < b1; ++g) {
         int slot = -1;
         if (nv <= top) {
@@ -1663,7 +1860,8 @@ void rmsnorm(const float* x, size_t ldx, int rows, int n, const float* w, float 
     check("rmsnorm");
 }
 void hc_pre(const float* x, int T, int hc, int E, const float* fn, const float* scale, const float* base, float eps,
-            float hc_eps, float mag, float* cur, float* post, cudaStream_t s, const float* norm_w, float norm_eps) {
+            float hc_eps, float mag, float* cur, float* post, cudaStream_t s, const float* norm_w, float norm_eps,
+            bool fn_by_element) {
     float* part = hc_part_buf(T);
     if (part == nullptr || 2 * hc > kMaxM || hc > 8 || E > 512 * 8) {
         std::fprintf(stderr, "maya-hy4 hc_pre: no room for its sums (%d streams)\n", hc);
@@ -1672,26 +1870,28 @@ void hc_pre(const float* x, int T, int hc, int E, const float* fn, const float* 
     }
     // (HY4_HC_ONE=1: one launch, the last block of a token finishing it - measured no faster: the launches queue ahead)
     static const bool two = std::getenv("HY4_HC_ONE") == nullptr;
-    unsigned* cnt = two || E > 256 * 12 ? nullptr : hc_cnt_buf(T);
+    unsigned* cnt = two || fn_by_element || E > 256 * 12 ? nullptr : hc_cnt_buf(T);
     if (cnt) {
         hc_pre1_kernel<<<dim3(kHcBlocks, (unsigned) T), 256, 0, s>>>(x, hc, E, fn, part, cnt, scale, base, eps, hc_eps,
                                                                      mag, cur, post, g_mix_out, norm_w, norm_eps);
     } else {
-        hc_part_kernel<<<dim3(kHcBlocks, (unsigned) T), 256, 0, s>>>(x, hc * E, 2 * hc, fn, part);
+        if (fn_by_element) hc_part_kernel<true><<<dim3(kHcBlocks, (unsigned) T), 256, 0, s>>>(x, hc * E, 2 * hc, fn, part);
+        else hc_part_kernel<false><<<dim3(kHcBlocks, (unsigned) T), 256, 0, s>>>(x, hc * E, 2 * hc, fn, part);
         hc_fin_kernel<false><<<T, 512, 0, s>>>(x, hc, E, part, scale, base, eps, hc_eps, mag, cur, post, g_mix_out,
                                                norm_w, norm_eps);
     }
     check("hc_pre");
 }
 void hc_head(const float* x, int T, int hc, int E, const float* fn, const float* scale, const float* base, float eps,
-             float hc_eps, float* cur, cudaStream_t s) {
+             float hc_eps, float* cur, cudaStream_t s, bool fn_by_element) {
     float* part = hc_part_buf(T);
     if (part == nullptr || hc > kMaxM) {
         std::fprintf(stderr, "maya-hy4 hc_head: no room for its sums\n");
         g_err.fetch_add(1);
         return;
     }
-    hc_part_kernel<<<dim3(kHcBlocks, (unsigned) T), 256, 0, s>>>(x, hc * E, hc, fn, part);
+    if (fn_by_element) hc_part_kernel<true><<<dim3(kHcBlocks, (unsigned) T), 256, 0, s>>>(x, hc * E, hc, fn, part);
+    else hc_part_kernel<false><<<dim3(kHcBlocks, (unsigned) T), 256, 0, s>>>(x, hc * E, hc, fn, part);
     hc_fin_kernel<true><<<T, 512, 0, s>>>(x, hc, E, part, scale, base, eps, hc_eps, 1.0f, cur, nullptr, nullptr, nullptr,
                                           0.0f);
     check("hc_head");
@@ -1769,6 +1969,9 @@ void attention(const float* q, int T, int H, int kv_lora, int n_rot, const uint1
     const int kc = T <= kMaxWin ? kKCmin : kKC, nchunk = (max_keys + kc - 1) / kc;
     const int rb = q8 ? (int) kv_q8_row_bytes(kv_lora, n_rot) : 0;
     const int hb = attn_heads_a_block();
+    // (8 heads a block - NVIDIA, or HY4_ATTN_HB=8 on AMD: attn2_kernel, attn_kernel's sums in fewer loads; HY4_ATTN_OLD:
+    //  attn_kernel, as before.  16 / 32 - AMD: attn_kernel over that many heads.  The same bits every way)
+    static const bool old = std::getenv("HY4_ATTN_OLD") != nullptr;
     const dim3 grid((unsigned) nchunk, (unsigned) ((H + hb - 1) / hb), (unsigned) T);
     if (hb == 32) {
         if (q8) attn_kernel<true, 32><<<grid, 1024, 0, s>>>(q, H, cache, ring, keys, ldk, lo, nk, scale, nchunk, kc, ws, rb);
@@ -1776,9 +1979,12 @@ void attention(const float* q, int T, int H, int kv_lora, int n_rot, const uint1
     } else if (hb == 16) {
         if (q8) attn_kernel<true, 16><<<grid, 512, 0, s>>>(q, H, cache, ring, keys, ldk, lo, nk, scale, nchunk, kc, ws, rb);
         else attn_kernel<false, 16><<<grid, 512, 0, s>>>(q, H, cache, ring, keys, ldk, lo, nk, scale, nchunk, kc, ws, rb);
-    } else {
+    } else if (old) {
         if (q8) attn_kernel<true><<<grid, 256, 0, s>>>(q, H, cache, ring, keys, ldk, lo, nk, scale, nchunk, kc, ws, rb);
         else attn_kernel<false><<<grid, 256, 0, s>>>(q, H, cache, ring, keys, ldk, lo, nk, scale, nchunk, kc, ws, 0);
+    } else {
+        if (q8) attn2_kernel<true><<<grid, 256, 0, s>>>(q, H, cache, ring, keys, ldk, lo, nk, scale, nchunk, kc, ws, rb);
+        else attn2_kernel<false><<<grid, 256, 0, s>>>(q, H, cache, ring, keys, ldk, lo, nk, scale, nchunk, kc, ws, 0);
     }
     check("attention");
     attn_combine_kernel<<<dim3((unsigned) H, (unsigned) T), 512, 0, s>>>(H, nchunk, kc, nk, sinks, ws, out);
@@ -1870,6 +2076,11 @@ void ix_pool(const float* ivg, int ring, int g0, int n, int kpool, int dim, cons
 void ix_score(const float* q, const float* wt, int T, int heads, int dim, const float* pooled, const int* pos, int kpool,
               int n_pool, float* score, size_t ld, cudaStream_t s, bool f16) {
     if (n_pool <= 0) return;
+    if (dim % 8 || heads > 16) {
+        std::fprintf(stderr, "maya-hy4 ix_score: %d heads of %d (16 at most, a multiple of 8)\n", heads, dim);
+        g_err.fetch_add(1);
+        return;
+    }
     const size_t sh = (size_t) (heads * dim + heads) * sizeof(float);
     const dim3 grid((unsigned) ((n_pool + 255) / 256), (unsigned) T);
     if (f16)
@@ -2016,6 +2227,17 @@ void kv_pick(const uint16_t* cache, int ring, size_t row_bytes, const int* keys,
     kv_pick_kernel<<<grid, 256, 0, s>>>((const uint4*) cache, ring, row16, keys, ldk, nk, (uint4*) dst, hs.tag,
                                         (const uint4*) hs.rows);
     check("kv_pick");
+}
+namespace {
+__global__ void bf16_f32_kernel(const uint16_t* __restrict__ src, float* __restrict__ dst, size_t n) {
+    const size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) dst[i] = bf16f(src[i]);
+}
+}  // namespace
+void bf16_to_f32(const uint16_t* src, float* dst, size_t n, cudaStream_t s) {
+    if (n == 0) return;
+    bf16_f32_kernel<<<(unsigned) ((n + 255) / 256), 256, 0, s>>>(src, dst, n);
+    check("bf16_to_f32");
 }
 void to_f16(const float* src, size_t lds, int rows, int n, uint16_t* dst, size_t ldd, cudaStream_t s) {
     const size_t total = (size_t) rows * n;
@@ -2250,9 +2472,52 @@ void top1(const float* row, int n, float* out, cudaStream_t s) {
         top1_kernel<<<1, 1024, 0, s>>>(row, n, out);
     } else {
         const int blocks = std::max(1, std::min(kTop1Blocks, (n + 4095) / 4096));
-        top1_multi_kernel<<<blocks, 256, 0, s>>>(row, n, out);
+        top1_multi_kernel<false><<<blocks, 256, 0, s>>>(row, n, out);
     }
     check("top1");
+}
+void top1_part(const float* row, int n, float* out, cudaStream_t s) {
+    const int blocks = std::max(1, std::min(kTop1Blocks, (n + 4095) / 4096));
+    top1_multi_kernel<true><<<blocks, 256, 0, s>>>(row, n, out);
+    check("top1_part");
+}
+// a block a row (256 threads): each thread's first largest of its stride, then the warps' and the block's - of equal
+// values the lower index
+__global__ void __launch_bounds__(256) row_top_kernel(const float* __restrict__ x, int n, size_t ld, int i0,
+                                                      float* __restrict__ out) {
+    __shared__ float sv[8];
+    __shared__ int si[8];
+    const float* row = x + (size_t) blockIdx.x * ld;
+    float best = -INFINITY;
+    int bi = 0x7fffffff;
+    int nan = 0;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        const float v = row[i];
+        nan |= v != v;
+        if (v > best) best = v, bi = i;
+    }
+    nan = __syncthreads_or(nan);
+    const int w = threadIdx.x >> 5, l = threadIdx.x & 31;
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) {
+        const float ob = __shfl_xor_sync(0xffffffffu, best, o);
+        const int oi = __shfl_xor_sync(0xffffffffu, bi, o);
+        if (ob > best || (ob == best && oi < bi)) best = ob, bi = oi;
+    }
+    if (l == 0) sv[w] = best, si[w] = bi;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        for (int k = 1; k < (int) (blockDim.x >> 5); ++k)
+            if (sv[k] > sv[0] || (sv[k] == sv[0] && si[k] < si[0])) sv[0] = sv[k], si[0] = si[k];
+        const bool none = nan || si[0] == 0x7fffffff;
+        out[2 * blockIdx.x] = __int_as_float(none ? -1 : i0 + si[0]);
+        out[2 * blockIdx.x + 1] = sv[0];
+    }
+}
+void row_top(const float* x, int rows, int n, size_t ld, int i0, float* out, cudaStream_t s) {
+    if (rows <= 0) return;
+    row_top_kernel<<<rows, 256, 0, s>>>(x, n, ld, i0, out);
+    check("row_top");
 }
 int errors() { return g_err.exchange(0); }
 void set_mix_out(float* p) { g_mix_out = p; }

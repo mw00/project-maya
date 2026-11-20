@@ -20,6 +20,10 @@
 // hotter CPU-lane ones, more between requests; the scores are kept over restarts in HY4_HOT_FILE
 // (<pack>/expert-hot.bin), and a start places each layer's highest scored experts in VRAM; HY4_HOT_LOG=1 logs.
 //
+// --draft-more N (1) / --draft-sure P (0.8) / --draft-streak S (1): up to N drafts more in a step - one for every S
+// steps in a row before it whose drafts were all kept - while every draft of the step so far, and the added one, has a
+// probability of at least P.  A longer window pays where the drafts hold (code), and costs where they do not: what
+// was just kept says which it is.
 // --mtp: the GGUF's MTP block drafts up to --draft tokens (3) a step, each verified by the model in one window with the
 // token before it; a draft below --draft-floor (0.55: the block's probability of its own pick) ends the drafts.  Greedy:
 // the drafts the model's argmax agrees with are kept; sampling: a draft d is kept with the model's probability of d,
@@ -111,9 +115,29 @@ std::vector<int> parse_list(const std::string& a) {
 double now() {
     return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
 }
+// The largest value's index (of equals the lowest): the maximum first, in 16 lanes - a loop the compiler vectorizes,
+// where one that carries the index goes a value at a time (a row of logits is 120 thousand, a decode round reads a few)
+// - then the first index that holds it
 int argmax(const float* r, int n) {
-    int b = 0;
-    for (int i = 1; i < n; ++i)
+    int i = 0;
+    float mx = r[0];
+    if (n >= 32) {
+        float m[16];
+        for (int j = 0; j < 16; ++j) m[j] = r[j];
+        for (i = 16; i + 16 <= n; i += 16)
+            for (int j = 0; j < 16; ++j) m[j] = r[i + j] > m[j] ? r[i + j] : m[j];
+        for (int j = 0; j < 16; ++j) mx = m[j] > mx ? m[j] : mx;
+    }
+    for (; i < n; ++i) mx = r[i] > mx ? r[i] : mx;
+    for (i = 0; i + 16 <= n; i += 16) {
+        int any = 0;
+        for (int j = 0; j < 16; ++j) any |= r[i + j] == mx;
+        if (any) break;
+    }
+    for (; i < n; ++i)
+        if (r[i] == mx) return i;
+    int b = 0;   // (a NaN among them: the plain walk)
+    for (i = 1; i < n; ++i)
         if (r[i] > r[b]) b = i;
     return b;
 }
@@ -459,12 +483,16 @@ bool picture_rows(hy4::Model& m, const std::vector<Pic>& pics, const std::vector
 // needed: greedy without penalties is the row's argmax (ties: the lower id); sampling without penalties takes the
 // tokens within 40 nats of the top (temperature-scaled) - the rest hold under 1e-12 of the mass - to mm3's candidate
 // form.  Penalties: the whole row, as before.
+// (top: the row's largest value's index when the engine has it - Model::row_top - else -1, the walk)
 std::vector<std::pair<int, double>> row_dist(const float* row, int V, const mm3::sample::Req& r,
-                                             const std::vector<int>& hist) {
+                                             const std::vector<int>& hist, int top = -1) {
     if (mm3::sample::penalised(r)) return mm3::sample::dist(row, V, r, hist);
-    int b = 0;
-    for (int i = 1; i < V; ++i)
-        if (row[i] > row[b]) b = i;
+    int b = top;
+    if (b < 0) {
+        b = 0;
+        for (int i = 1; i < V; ++i)
+            if (row[i] > row[b]) b = i;
+    }
     if (!(r.temperature > 0.0f)) return {{b, 1.0}};
     if (r.top_k > 0 && r.top_k < V) {
         // top_k: the k largest (ties: the lower id, as dist_c's sort) without sorting the row - every block of 1024's
@@ -533,10 +561,8 @@ struct Weights {
     int top = 0;
     double z = 0;
     std::vector<float> e;
-    void of(const float* row, int V, float temperature) {
-        top = 0;
-        for (int i = 1; i < V; ++i)
-            if (row[i] > row[top]) top = i;
+    void of(const float* row, int V, float temperature, int top_known = -1) {
+        top = top_known >= 0 ? top_known : argmax(row, V);
         e.resize((size_t) V);
         const float m = row[top], it = 1.0f / temperature;
         float* w = e.data();
@@ -571,7 +597,38 @@ inline bool plain_sampling(const mm3::sample::Req& r) {
            !(r.min_p > 0.0f);
 }
 
-int serve(hy4::Model& m, const std::vector<int>& eos, int n_draft, float floor0) {
+// The drafts a step may add to its usual ones: one more for every `need` steps in a row whose drafts were all kept, up
+// to n_more (need 0: n_more always) - and none for a while once the added drafts are not being kept: an added draft
+// costs a draft step and a token more in the window, about half of what a kept token is worth, so while fewer than
+// half of the recent ones held (the first one counts: nothing is assumed of a text) they are left out for a number of
+// steps that doubles each time, until one is kept again.
+struct Extra {
+    int n_more = 0, need = 1;
+    int streak = 0, pause = 0, wait = 16;
+    double rate = 0.55;   // (the added drafts kept, lately)
+    int now() {
+        if (pause > 0) {
+            --pause;
+            return 0;
+        }
+        return need > 0 ? std::min(n_more, streak / need) : n_more;
+    }
+    // a step's k drafts in the window, `kept` of them kept; base: its usual drafts
+    void seen(int k, int kept, int base) {
+        streak = k > 0 && kept == k ? streak + 1 : 0;
+        if (k <= base) return;
+        const bool held = kept > base;
+        rate = 0.875 * rate + (held ? 0.125 : 0.0);
+        if (held) wait = 16;
+        if (rate < 0.5) {
+            pause = wait;
+            wait = std::min(wait * 2, 512);
+            rate = 0.55;
+        }
+    }
+};
+
+int serve(hy4::Model& m, const std::vector<int>& eos, int n_draft, float floor0, int n_more, float sure, int need) {
     for (const auto& l : m.info_lines()) std::printf("NOTE %s\n", l.c_str());
     const auto& st0 = m.stats();
     std::printf("INFO engine=hy4 engine_kind=hy4 model=Hy4-flash ctx=%lld vram_gb=%.2f dspark=0 mtp=%d experts=%d "
@@ -717,12 +774,15 @@ int serve(hy4::Model& m, const std::vector<int>& eos, int n_draft, float floor0)
         long long produced = 0;
         const char* finish = "length";
         bool in_think = r.think_budget > 0 && r.think_end >= 0;
-        int tok = mm3::sample::draw(row_dist(lg.data(), m.vocab(), r, state), rng);
+        int tok = mm3::sample::draw(row_dist(lg.data(), m.vocab(), r, state, m.row_top(0)), rng);
         long long d_off = 0, d_acc = 0;
         // the decode's own counts (the model's totals less what they were once the prompt was read): the routed
         // experts run, those of them on the CPU lane, the host's n-gram gathers
         const long long ex0 = (long long) m.stats().experts, cpu0 = (long long) m.stats().cpu_experts;
         const double eg0 = m.stats().engram_ms;
+        Extra extra;      // (when a step tries a draft more than the usual ones)
+        extra.n_more = n_more;
+        extra.need = need;
         auto stat_line = [&]() {
             const double ms = now() * 1e3 - t1;
             const long long d_ex = (long long) m.stats().experts - ex0;
@@ -741,7 +801,7 @@ int serve(hy4::Model& m, const std::vector<int>& eos, int n_draft, float floor0)
         std::vector<int> drafts;
         Weights wts;   // (plain sampling's rows)
         std::vector<float> confs;
-        std::vector<float> lgw(spec ? (size_t) (n_draft + 1) * m.vocab() : 0);
+        std::vector<float> lgw(spec ? (size_t) (n_draft + n_more + 1) * m.vocab() : 0);
         Unpin lgw_unpin{lgw.data(), hy4::Model::pin(lgw.data(), lgw.size() * sizeof(float))};
         std::string fail;
         // one token out: false when the answer ends with it (an end token, max_new, the context)
@@ -771,23 +831,25 @@ int serve(hy4::Model& m, const std::vector<int>& eos, int n_draft, float floor0)
             if (in_think && in.wrap.load()) room = 0;
             int k = 0;
             if (spec && room > 0) {
-                if (!m.draft(tok, pos, (int) std::min<long long>(room, n_draft), floor, drafts, confs, err)) {
+                if (!m.draft(tok, pos, (int) std::min<long long>(room, n_draft + extra.now()), floor,
+                             drafts, confs, err, n_draft, sure)) {
                     fail = err;
                     break;
                 }
                 while (k < (int) drafts.size() && confs[(size_t) k] >= floor) ++k;
             }
             if (k == 0) {
+                extra.seen(0, 0, n_draft);
                 if (!m.forward(&tok, 1, pos, 1, lg.data(), err)) {
                     fail = err;
                     break;
                 }
                 state.push_back(tok);
                 if (plain_sampling(r)) {
-                    wts.of(lg.data(), m.vocab(), r.temperature);
+                    wts.of(lg.data(), m.vocab(), r.temperature, m.row_top(0));
                     tok = wts.draw(std::uniform_real_distribution<double>(0.0, 1.0)(rng));
                 } else {
-                    tok = mm3::sample::draw(row_dist(lg.data(), m.vocab(), r, state), rng);
+                    tok = mm3::sample::draw(row_dist(lg.data(), m.vocab(), r, state, m.row_top(0)), rng);
                 }
                 continue;
             }
@@ -799,11 +861,12 @@ int serve(hy4::Model& m, const std::vector<int>& eos, int n_draft, float floor0)
             }
             state.push_back(tok);
             d_off += k;
+            const long long acc0 = d_acc;
             bool more = true;
             int next = -1;
             const bool plain = plain_sampling(r);
             for (int i = 0; i <= k && more && plain; ++i) {   // (plain sampling: the rows' weights, no copies)
-                wts.of(lgw.data() + (size_t) i * m.vocab(), m.vocab(), r.temperature);
+                wts.of(lgw.data() + (size_t) i * m.vocab(), m.vocab(), r.temperature, m.row_top(i));
                 std::uniform_real_distribution<double> u01(0.0, 1.0);
                 if (i == k) {
                     next = wts.draw(u01(rng));
@@ -825,7 +888,7 @@ int serve(hy4::Model& m, const std::vector<int>& eos, int n_draft, float floor0)
                 state.push_back(x);
             }
             for (int i = 0; i <= k && more && !plain; ++i) {
-                const auto d = row_dist(lgw.data() + (size_t) i * m.vocab(), m.vocab(), r, state);
+                const auto d = row_dist(lgw.data() + (size_t) i * m.vocab(), m.vocab(), r, state, m.row_top(i));
                 if (i == k) {   // every draft kept: the model's token after them
                     next = mm3::sample::draw(d, rng);
                     break;
@@ -850,6 +913,7 @@ int serve(hy4::Model& m, const std::vector<int>& eos, int n_draft, float floor0)
                 more = emit(x);
                 state.push_back(x);
             }
+            extra.seen(k, (int) (d_acc - acc0), n_draft);
             if (!more) break;
             tok = next;
         }
@@ -1071,6 +1135,8 @@ int main(int argc, char** argv) {
     std::vector<int> eos;
     int n_draft = -1;   // (the loaded drafter's own: 3 with the MTP block, the DFly2 drafter's count)
     float floor = -1.0f;   // (the loaded drafter's own: 0.55 with the MTP block, 0.8 with the DFly2 drafter)
+    int n_more = 1, need = 1;   // (--draft-more / --draft-streak: the MTP block's drafts)
+    float sure = 0.8f;
     std::string images, enc_rgb, enc_size, enc_out, kld_save;
     int kv_stream = 0;   // --kv-streaming on: the indexed layers' rows beyond --kv-resident positions in host memory
     long long kv_res_arg = 0;
@@ -1118,6 +1184,9 @@ int main(int argc, char** argv) {
         else if (a == "--dfly2") o.dfly2 = true;
         else if (a == "--draft") n_draft = std::atoi(next().c_str());
         else if (a == "--draft-floor") floor = (float) std::atof(next().c_str());
+        else if (a == "--draft-more") n_more = std::max(0, std::atoi(next().c_str()));
+        else if (a == "--draft-sure") sure = (float) std::atof(next().c_str());
+        else if (a == "--draft-streak") need = std::max(0, std::atoi(next().c_str()));
         else if (a == "--eos") eos = parse_list(next());
         else if (a == "--vision") {   // (on by default when the pack has the tower; --vision on: it must)
             const std::string v = next();
@@ -1182,7 +1251,10 @@ int main(int argc, char** argv) {
     // (DFly2: 0.8 - its later drafts are kept less often than the block's and each costs a verified row; measured on a V100
     //  from 0 to all routed experts in VRAM: as fast as 0.55 with most experts in VRAM, 4-30% faster with few)
     if (floor < 0) floor = m.has_dfly2() ? 0.8f : 0.55f;
-    if (serving) return serve(m, eos, n_draft, floor);
+    // (--draft-more: the MTP block's drafts - the DFly2 drafter's round is one pass of its own count; a step's window,
+    //  the token and its drafts, is kMaxWin positions at most: the added drafts within it)
+    n_more = m.has_dfly2() ? 0 : std::min(n_more, std::max(0, hy4::k::kMaxWin - 1 - n_draft));
+    if (serving) return serve(m, eos, n_draft, floor, n_more, sure, need);
     if (!kld.empty()) return run_kld(m, kld, chunks, kld_save);
     std::vector<int> ids = parse_ids(ids_arg);
     if (ids.empty()) {
@@ -1205,6 +1277,9 @@ int main(int argc, char** argv) {
     }
     if (trace > 0) return run_trace(m, ids, trace);
     std::vector<float> logits((size_t) m.vocab());
+    // (page-locked: with the output head over several GPUs each one copies its rows' logits straight into it)
+    const bool lg_pinned = hy4::Model::pin(logits.data(), logits.size() * sizeof(float));
+    (void) lg_pinned;
     const double t0 = now();
     if (!m.forward(ids.data(), (int) ids.size(), 0, 1, logits.data(), err)) {
         std::fprintf(stderr, "maya-hy4: %s\n", err.c_str());
@@ -1219,17 +1294,28 @@ int main(int argc, char** argv) {
     std::vector<int> out;
     int64_t pos = (int64_t) ids.size();
     if (m.has_draft() && n_draft > 0 && gen > 0) {   // greedy with the drafts (the MTP block's, or the DFly2 drafter's)
-        std::vector<float> lw((size_t) (n_draft + 1) * m.vocab());
+        std::vector<float> lw((size_t) (n_draft + n_more + 1) * m.vocab());
+        const bool lw_pinned = hy4::Model::pin(lw.data(), lw.size() * sizeof(float));
+        (void) lw_pinned;
         std::vector<int> drafts;
         std::vector<float> confs;
         long long off = 0, acc = 0, rounds = 0;
+        Extra extra;
+        extra.n_more = n_more;
+        extra.need = need;
         double t_draft = 0, t_verify = 0;
-        int tok = argmax(logits.data(), m.vocab());
+        // (a row's top: the GPUs' where they found it - Model::row_top - else the walk over its logits)
+        auto top_of = [&](const float* row, int r) {
+            const int t = m.row_top(r);
+            return t >= 0 ? t : argmax(row, m.vocab());
+        };
+        int tok = top_of(logits.data(), 0);
         while ((int) out.size() < gen) {
             out.push_back(tok);
             if (tok == m.eos() || (int) out.size() >= gen) break;
             const double ta = now();
-            if (!m.draft(tok, pos, std::min(n_draft, gen - (int) out.size()), floor, drafts, confs, err)) {
+            if (!m.draft(tok, pos, std::min(n_draft + extra.now(), gen - (int) out.size()), floor,
+                         drafts, confs, err, n_draft, sure)) {
                 std::fprintf(stderr, "maya-hy4: %s\n", err.c_str());
                 return 1;
             }
@@ -1249,14 +1335,15 @@ int main(int argc, char** argv) {
             pos += 1;
             int i = 0;
             for (; i < k; ++i) {
-                if (argmax(lw.data() + (size_t) i * m.vocab(), m.vocab()) != drafts[(size_t) i]) break;
+                if (top_of(lw.data() + (size_t) i * m.vocab(), i) != drafts[(size_t) i]) break;
                 out.push_back(drafts[(size_t) i]);
                 ++acc;
                 ++pos;
                 if (drafts[(size_t) i] == m.eos() || (int) out.size() >= gen) break;
             }
+            extra.seen(k, i, n_draft);
             if (out.back() == m.eos() || (int) out.size() >= gen) break;
-            tok = argmax(lw.data() + (size_t) i * m.vocab(), m.vocab());
+            tok = top_of(lw.data() + (size_t) i * m.vocab(), i);
         }
         const double t2 = now();
         for (size_t i = 0; i < out.size(); ++i) std::printf("%s%d", i ? "," : "", out[i]);
