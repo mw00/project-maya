@@ -252,6 +252,10 @@ float* up32(Drafter* d, const std::vector<uint16_t>& v) {
 
 // Y [T][N] (ldy) = X [T][K] BF16 . W [N][K]^T BF16, F32 sums
 void gemm_bf(Drafter* d, const uint16_t* W, int N, int K, const uint16_t* X, int T, float* Y, int ldy) {
+#ifdef STRATA_USE_HIP   // (AMD: the BLAS's kernels for 8 rows read the weights at a fifth of the bus - the drafter's
+                        //  block on a kernel of ours, the weights read once; the drafts only, never an answer)
+    if (k::gemm_bf16_cols(W, N, K, X, T, Y, ldy, d->s)) return;
+#endif
     const float one = 1.0f, zero = 0.0f;
     cb(cublasGemmEx(d->blas, CUBLAS_OP_T, CUBLAS_OP_N, N, T, K, &one, W, CUDA_R_16BF, K, X, CUDA_R_16BF, K, &zero, Y,
                     CUDA_R_32F, ldy, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT),
@@ -541,7 +545,11 @@ void set_head_q8(Drafter* d, const int8_t* q8, const uint16_t* q8d) {
     int dev = 0, major = 0;
     cu(cudaGetDevice(&dev), "cudaGetDevice");
     cu(cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev), "cudaDeviceGetAttribute");
+#ifdef STRATA_USE_HIP
+    d->head_tiles = false;        // (AMD: mma.sync is emulated on the shuffles - the row sums read the head once)
+#else
     d->head_tiles = major >= 8;   // (no mma.sync m16n8k16 before Ampere)
+#endif
 }
 
 }  // namespace ik2::draft

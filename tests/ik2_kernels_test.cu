@@ -2669,6 +2669,9 @@ void test_experts_mma() {
 // path's to the bit - mv_q8p_cols vs mv_q8p, experts_*_mem vs experts_gate_up_swiglu / experts_down (NVFP4, Q8_0),
 // experts_block_gu / _down vs experts_gate_up_swiglu_mma / experts_down_mma (sm_80 on) - Inkling-2-Mini's sizes.
 void test_window_exact(bool mma) {
+#ifdef STRATA_USE_HIP
+    mma = false;   // (AMD: the token path's experts are the row dots - IK2_EXPERT_MMA's default 0 there)
+#endif
     constexpr int C = 2304, F = 1152, K = 8, E = 24;   // (E 24: a window of 5 picks about 2.6x one token's experts)
     {   // the dense products: rows of a planar Q8_0 matrix (N not a multiple of the rows a block)
         const int N = 1029;

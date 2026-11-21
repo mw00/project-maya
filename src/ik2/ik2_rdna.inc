@@ -366,7 +366,65 @@ void attn_flash_rdna(const uint16_t* q16, int q_ld, const KVT* kc, const KVT* vc
                                                             bias, extent, window, n_split, o_part, ml_part);
     check("attn_flash_rdna");
 }
+
+// y [T][ldy] = x [T][K] . W [N][K]^T in BF16 for a few tokens (TT >= T): a warp R rows, a lane 8 values a step (16
+// bytes of each row and of each token's x), every token's sum in its own register, then the warp's sum.
+template <int WARPS, int R, int TT>
+__global__ void __launch_bounds__(WARPS * 32)
+gemm_bf16_cols_kernel(const uint16_t* __restrict__ W, int N, int K, const uint16_t* __restrict__ x, int T,
+                      float* __restrict__ y, int ldy) {
+    const int row0 = (blockIdx.x * WARPS + (threadIdx.x >> 5)) * R, lane = threadIdx.x & 31;
+    if (row0 >= N) return;
+    const uint4* wr[R];
+#pragma unroll
+    for (int i = 0; i < R; ++i) wr[i] = (const uint4*) (W + (size_t) min(row0 + i, N - 1) * K);
+    float acc[R][TT];
+#pragma unroll
+    for (int i = 0; i < R; ++i)
+#pragma unroll
+        for (int t = 0; t < TT; ++t) acc[i][t] = 0.0f;
+    auto lo = [](uint32_t v) { return __uint_as_float(v << 16); };
+    auto hi = [](uint32_t v) { return __uint_as_float(v & 0xFFFF0000u); };
+    for (int c = lane; c < (K >> 3); c += 32) {
+        float wf[R][8];
+#pragma unroll
+        for (int i = 0; i < R; ++i) {
+            const uint4 w = __ldg(wr[i] + c);
+            wf[i][0] = lo(w.x), wf[i][1] = hi(w.x), wf[i][2] = lo(w.y), wf[i][3] = hi(w.y);
+            wf[i][4] = lo(w.z), wf[i][5] = hi(w.z), wf[i][6] = lo(w.w), wf[i][7] = hi(w.w);
+        }
+#pragma unroll
+        for (int t = 0; t < TT; ++t) {
+            if (t >= T) break;
+            const uint4 v = __ldg((const uint4*) (x + (size_t) t * K) + c);
+            const float xf[8] = {lo(v.x), hi(v.x), lo(v.y), hi(v.y), lo(v.z), hi(v.z), lo(v.w), hi(v.w)};
+#pragma unroll
+            for (int i = 0; i < R; ++i)
+#pragma unroll
+                for (int j = 0; j < 8; ++j) acc[i][t] = fmaf(wf[i][j], xf[j], acc[i][t]);
+        }
+    }
+#pragma unroll
+    for (int i = 0; i < R; ++i)
+#pragma unroll
+        for (int t = 0; t < TT; ++t) {
+            if (t >= T) break;
+            const float a = wsum(acc[i][t]);
+            if (lane == 0 && row0 + i < N) y[(size_t) t * ldy + row0 + i] = a;
+        }
+}
 }  // namespace
+
+bool gemm_bf16_cols(const uint16_t* W, int N, int K, const uint16_t* x, int T, float* y, int ldy, cudaStream_t s) {
+    if (N <= 0 || T <= 0 || T > 8 || K % 8 || ((uintptr_t) W & 15) || ((uintptr_t) x & 15)) return false;
+    constexpr int WARPS = 4, R = 4;
+    const unsigned g = (unsigned) ((N + WARPS * R - 1) / (WARPS * R));
+    if (T <= 4) gemm_bf16_cols_kernel<WARPS, R, 4><<<g, WARPS * 32, 0, s>>>(W, N, K, x, T, y, ldy);
+    else gemm_bf16_cols_kernel<WARPS, R, 8><<<g, WARPS * 32, 0, s>>>(W, N, K, x, T, y, ldy);
+    check("gemm_bf16_cols");
+    return true;
+}
+
 
 bool experts_rdna_available(int ty_gate, int ty_up, int ty_down, int C, int F) {
     static const int on = [] {   // (the current GPU: an RDNA 3 / 3.5 / 4 one of this build; IK2_RDNA_MOE=0: off)

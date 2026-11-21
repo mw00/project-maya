@@ -4813,6 +4813,33 @@ mv_q8p_cols_kernel(const int8_t* __restrict__ q, const uint16_t* __restrict__ d,
     for (int i = 0; i < R; ++i)
 #pragma unroll
         for (int t = 0; t < TT; ++t) acc[i][t] = 0.0f;
+#ifdef STRATA_USE_HIP
+    if ((K & 255) == 0) {   // (AMD: mv_q8p_kernel's 8 values a lane a step, the same expression a token)
+        for (int it = 0, n_it = K >> 8; it < n_it; ++it) {
+            uint2 w[R];
+            float dv[R];
+#pragma unroll
+            for (int i = 0; i < R; ++i)
+                w[i] = __ldg((const uint2*) qr[i] + it * 32 + lane), dv[i] = h2f(__ldg(dr[i] + it * 8 + (lane >> 2)));
+#pragma unroll
+            for (int t = 0; t < TT; ++t) {
+                if (t >= T) break;
+                const float4* x4 = (const float4*) (x + (size_t) t * x_ld);
+                const float4 xa = __ldg(x4 + (it * 32 + lane) * 2), xb = __ldg(x4 + (it * 32 + lane) * 2 + 1);
+#pragma unroll
+                for (int i = 0; i < R; ++i)
+                    acc[i][t] += dv[i] * ((float) (int8_t) (w[i].x & 0xFFu) * xa.x +
+                                          (float) (int8_t) ((w[i].x >> 8) & 0xFFu) * xa.y +
+                                          (float) (int8_t) ((w[i].x >> 16) & 0xFFu) * xa.z +
+                                          (float) (int8_t) (w[i].x >> 24) * xa.w +
+                                          (float) (int8_t) (w[i].y & 0xFFu) * xb.x +
+                                          (float) (int8_t) ((w[i].y >> 8) & 0xFFu) * xb.y +
+                                          (float) (int8_t) ((w[i].y >> 16) & 0xFFu) * xb.z +
+                                          (float) (int8_t) (w[i].y >> 24) * xb.w);
+            }
+        }
+    } else
+#endif
     for (int it = 0, n_it = K >> 7; it < n_it; ++it) {
         uint32_t w[R];
         float dv[R];

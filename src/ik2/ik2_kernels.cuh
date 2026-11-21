@@ -115,6 +115,9 @@ void experts_rdna_down(const uint8_t* const* eptr, const int* tiles, int n_tiles
 /// out [T][C] = sum over token t's K picks (inv [T * K]: their rows) of wtr[row] y32[row], in row order
 void moe_rows_combine(const float* y32, const int* inv, const float* wtr, int T, int K, int C, float* out,
                       cudaStream_t s);
+/// AMD: y [T][ldy] = x [T][K] . W [N][K]^T, BF16 in, F32 sums, T <= 8 (the drafter's block): the weights read once,
+/// a warp's rows sharing each x load.  False (nothing launched): not this shape (K % 8, alignment, T) - the BLAS then.
+bool gemm_bf16_cols(const uint16_t* W, int N, int K, const uint16_t* x, int T, float* y, int ldy, cudaStream_t s);
 #endif
 
 /// o *= sigmoid(g), n values.
