@@ -991,7 +991,7 @@ def deepseek_restore_points(ids, user_id, system_id=None, tail=512, least=RESTOR
 HY4_MEASURE_LEFT = re.compile(r"measuring this PC: (\d+) of (\d+) choices done in \d+ s - about (\d+) s more")
 # (roughly how long maya-hy4's first-start measurements take - measured on a GPU holding the whole model and on GPUs
 #  with the CPU lane; tools/setup_bridge.py's HY4_TRIAL_TIME / HY4_LANE_TIME are the same)
-HY4_TRIAL_TIME = {2: "half a minute to a minute", 3: "one to two minutes"}
+HY4_TRIAL_TIME = {2: "about a minute", 3: "one to two minutes"}
 HY4_LANE_TIME = "one minute"
 
 

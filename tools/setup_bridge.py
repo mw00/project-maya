@@ -38,7 +38,7 @@ def measure_said(line: str) -> str:
 
 # (roughly how long maya-hy4's first-start measurements take - measured on a GPU holding the whole model and on GPUs
 #  with the CPU lane; serve/server.py's HY4_TRIAL_TIME / HY4_LANE_TIME are the same)
-HY4_TRIAL_TIME = {2: "half a minute to a minute", 3: "one to two minutes"}
+HY4_TRIAL_TIME = {2: "about a minute", 3: "one to two minutes"}
 HY4_LANE_TIME = "one minute"
 
 
