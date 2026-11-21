@@ -8966,6 +8966,7 @@ struct Model::Impl {
     // short says so, with what the next start keeps free.  MAYA_DS4_LATE_MB=<n>: n MiB a GPU instead of the
     // measured figure (0: the reserve alone, v1.1.72's plan).
     size_t keep_b(const Dev& d) const { return ((size_t) std::max<int64_t>(0, o.reserve_mib) << 20) + d.late; }
+    int reserve_short_mib = 0;   // (> 0: this start came out short of the reserve; the next keeps this many MiB beside it)
     std::string late_file() const {
         const char* f = std::getenv("MAYA_DS4_LATE_FILE");
         return f == nullptr ? o.pack + "/vram-late.txt" : std::string(f) == "none" ? "" : f;
@@ -9030,6 +9031,9 @@ struct Model::Impl {
                                      "the experts' plan%s\n", d.id, fr >> 20, (long long) (res >> 20),
                              (long long) (want >> 20), f.empty() ? " (MAYA_DS4_LATE_FILE=none: not kept)" : "");
             d.late_kept = (size_t) want;
+            // (a start found short, the figure kept for the next one: the server starts the engine once more - #1026)
+            if (loaded && !f.empty() && (int64_t) fr + 2 * step < res && (o.reserve_given || want + 4 * step > res))
+                reserve_short_mib = std::max(reserve_short_mib, (int) (want >> 20));
             if (!f.empty())
                 pcie::cal_put(f, late_key(di), std::to_string(want >> 20),
                               [](const std::string& a, const std::string& b) { return os::replace_file(a, b); });
@@ -23873,6 +23877,7 @@ bool Model::feed_part_(const FeedPlan& plan, const int* tokens, int k0, int k1, 
 }
 int Model::prompt_chunk() const { return p_->chunk; }
 int Model::pipeline_stages() const { return std::max(1, (int) p_->groups.size()); }
+int Model::reserve_short_mib() const { return p_->reserve_short_mib; }
 void Model::set_progress(std::function<void(int64_t)> f) { p_->progress = std::move(f); }
 void Model::set_cancel(std::function<bool()> f) { p_->cancel = std::move(f); }
 void Model::set_yield(std::function<bool()> f) { p_->yield_to = std::move(f); }

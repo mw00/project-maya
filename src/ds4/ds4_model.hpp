@@ -290,6 +290,8 @@ public:
     int fed() const;   // the tokens the last feed() / feed_mark() took (all of them unless a yield)
     /// A request starts (before its prompt): DISK_SKIP_AUTO may switch back on here, never mid-answer.
     void begin_request();
+    /// (#1026) > 0: this start came out short of --reserve-mib; the next keeps this many MiB beside it (its file)
+    int reserve_short_mib() const;
     int64_t pos() const;
     int64_t max_context() const;
     int vocab() const;
