@@ -40,7 +40,7 @@ struct OffFetch {
 struct OffCount {
     uint32_t seq;
     uint32_t pad;
-    unsigned long long picks, tier, stage, fetched;
+    unsigned long long picks, tier, stage, fetched, bytes;
 };
 
 /// The misses of one visit (blob[i] null: not in the tier) into staging: a slot holding the expert already (tag) is

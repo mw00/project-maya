@@ -5446,6 +5446,15 @@ int main(int argc, char** argv) {
     if (g_prof)
         std::printf("profile (all calls): attention %.2f s, router %.2f s, uploads %.2f s, experts %.2f s, rest %.2f s\n",
                     g_pf.attn, g_pf.route, g_pf.upload, g_pf.experts, g_pf.rest);
+    if (g_off) {   // (the offload path's counters since load: decoded tokens only)
+        k::OffCount oc{};
+        CU(cudaMemcpyAsync(&oc, g_offs.cnt, sizeof oc, cudaMemcpyDeviceToHost, g_s));
+        CU(cudaStreamSynchronize(g_s));
+        const double p = oc.picks ? 100.0 / (double) oc.picks : 0.0;
+        std::printf("offload: %llu picks, %.1f%% in the VRAM tier, %.1f%% in staging, %.1f%% fetched (%.2f GiB, %.1f MiB "
+                    "a token)\n", oc.picks, oc.tier * p, oc.stage * p, oc.fetched * p, oc.bytes / 1073741824.0,
+                    oc.picks ? oc.bytes / 1048576.0 / ((double) oc.picks / (M.c.n_visit * M.c.K)) : 0.0);
+    }
     if (out.size() > 1)
         std::printf("generation: %d tokens in %.2f s (%.2f tok/s); cache %llu hits, %llu misses in it\n",
                     (int) out.size() - 1, gen_s, (out.size() - 1) / gen_s, (unsigned long long) (ec_sum([](ExpertCache& e) { return e.hits; }) - h0),

@@ -58,6 +58,7 @@ __global__ void off_fetch_plan_kernel(const uint8_t** blob, const int* __restric
         cnt->tier += (unsigned long long) n_tier;
         cnt->stage += (unsigned long long) n_stage;
         cnt->fetched += (unsigned long long) n_fetch;
+        cnt->bytes += (unsigned long long) n_fetch * hstride;
     }
 }
 
