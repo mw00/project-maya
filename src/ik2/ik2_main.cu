@@ -703,6 +703,9 @@ struct ExpertCache {
     std::vector<uint64_t> ghost_at;    // l * E + e -> ghost_seq when evicted in decode (0: none)
     int last_handle = -1;
     bool scan = false;   // a long prefill's pass (evict_scan; IK2_SCAN=0: off)
+    // the offload path's tier (set before init): the pools are only what the profile is worth a byte - no minimum
+    // of a layer's experts (prompts take their misses through the staging ring, run_prefill_moe), none merged
+    bool tier_only = false;
     int tp = -1;         // IK2_TP: this GPU's half of every expert (its index), not whole experts
     uint64_t tick = 0, hits = 0, misses = 0, bytes_up = 0;
     double t_up = 0;
@@ -863,7 +866,7 @@ struct ExpertCache {
             for (const auto& g : grps) s += (size_t) std::min(E, (int) g.layers.size() * E) * g.sb;
             return s;
         };
-        while (grps.size() > 1 && (min_req_bytes() > budget || grps.size() > 4)) {
+        while (grps.size() > 1 && ((!tier_only && min_req_bytes() > budget) || grps.size() > 4)) {
             size_t best_waste = SIZE_MAX;
             size_t best_i = 0;
             for (size_t i = 0; i + 1 < grps.size(); ++i) {
@@ -874,12 +877,12 @@ struct ExpertCache {
                                            grps[best_i].layers.end());
             grps.erase(grps.begin() + (ptrdiff_t) best_i);
         }
-        const size_t hard_min = min_req_bytes();
+        const size_t hard_min = tier_only ? 0 : min_req_bytes();
         if (hard_min > budget)
             die("--cache-gb too small: need at least " + std::to_string((hard_min + (1 << 20) - 1) >> 20) + " MiB");
         size_t soft_min = 0;
         for (const auto& g : grps) soft_min += (size_t) std::min(E + 16, (int) g.layers.size() * E) * g.sb;
-        const int min_base = soft_min <= budget ? E + 16 : E;
+        const int min_base = tier_only ? 0 : soft_min <= budget ? E + 16 : E;
 
         pools.resize(grps.size());
         std::vector<int> pmin(grps.size()), pmax(grps.size());
@@ -1667,7 +1670,7 @@ void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const flo
 void prefetch_layer(Model& M, int l, Work& W, ExpertCache& EC, int T, const Work* Wpop = nullptr, int own = -1, int ahead = 1) {
     const int pr = ((l % Work::kPfRing) + Work::kPfRing) % Work::kPfRing;
     W.pf_layers[pr] = -1;
-    if (getenv("IK2_PREFETCH") && !std::atoi(getenv("IK2_PREFETCH"))) return;
+    if (g_off || (getenv("IK2_PREFETCH") && !std::atoi(getenv("IK2_PREFETCH")))) return;   // (offload: the ring)
     if (!g_overlap || g_prof || l >= M.c.n_layer || (!dual() && M.L[l].dev != g_cur)) return;
     const Work& U = Wpop ? *Wpop : W;   // (whose picks so far: under EP, GPU 0's)
     const int E = M.c.E, pi = EC.layer_pool[l];
@@ -1744,28 +1747,40 @@ void run_prefill_moe(const Model& M, Layer& Ly, int l, int T, const uint16_t* xq
 
     // the experts on a GPU: d -1 all of them (one GPU), else the ones it owns (IK2_EP), into X.tmp
     auto exec = [&](int d, Work& X, ExpertCache& XC, const uint16_t* xin) {
-        const uint64_t tick = ++XC.tick;
+        const uint64_t tick = g_off ? XC.tick : ++XC.tick;   // (the offload path: the tier is not touched)
         const cudaStream_t cst = g_overlap && !g_prof ? g_cs : g_s;
         X.hit_exps.clear();
         X.miss_exps.clear();
         const double tu = now();
-        for (int e = 0; e < c.E; ++e) {
-            if (!W.cnt[e] || (d >= 0 && ep_owner(l, e) != d)) {
+        if (g_off) {   // (the offload path: a hit read in place in the tier, the misses through the staging ring below)
+            const auto& P = XC.pools[XC.layer_pool[l]];
+            for (int e = 0; e < c.E; ++e) {
                 X.slot_ptrs[e] = nullptr;
-                continue;
+                if (!W.cnt[e]) continue;
+                const int s = XC.loc[(size_t) l * c.E + e];
+                if (s >= 0) X.slot_ptrs[e] = P.data + (size_t) s * P.slot_bytes, X.hit_exps.push_back(e);
+                else X.miss_exps.push_back(e);
             }
-            if (XC.has(l, e)) {
-                X.slot_ptrs[e] = XC.get(Ly, l, e, tick, cst, nullptr, false, true);
-                X.hit_exps.push_back(e);
-            } else {
-                X.slot_ptrs[e] = nullptr;
-                X.miss_exps.push_back(e);
+            XC.hits += X.hit_exps.size(), XC.misses += X.miss_exps.size();
+        } else {
+            for (int e = 0; e < c.E; ++e) {
+                if (!W.cnt[e] || (d >= 0 && ep_owner(l, e) != d)) {
+                    X.slot_ptrs[e] = nullptr;
+                    continue;
+                }
+                if (XC.has(l, e)) {
+                    X.slot_ptrs[e] = XC.get(Ly, l, e, tick, cst, nullptr, false, true);
+                    X.hit_exps.push_back(e);
+                } else {
+                    X.slot_ptrs[e] = nullptr;
+                    X.miss_exps.push_back(e);
+                }
             }
+            for (int e : X.miss_exps) X.slot_ptrs[e] = XC.get(Ly, l, e, tick, cst, nullptr, false, true);
         }
-        for (int e : X.miss_exps) X.slot_ptrs[e] = XC.get(Ly, l, e, tick, cst, nullptr, false, true);
 
         const int n_miss = (int) X.miss_exps.size();
-        const int n_batches = (n_miss + Work::kMissBatch - 1) / Work::kMissBatch;
+        const int n_batches = g_off ? 0 : (n_miss + Work::kMissBatch - 1) / Work::kMissBatch;
         for (int b = 0; b < n_batches; ++b) {
             const int b0 = b * Work::kMissBatch, b1 = std::min(n_miss, b0 + Work::kMissBatch);
             for (int m = b0; m < b1; ++m) {
@@ -1803,6 +1818,42 @@ void run_prefill_moe(const Model& M, Layer& Ly, int l, int T, const uint16_t* xq
             gemm16(X.w16, C, F, X.h16, cnt_e, X.y32, C);
             scatter_add_rows_kernel<<<cnt_e, 256, 0, g_s>>>(X.y32, X.gidx + st_e, X.wtr + st_e, C, X.tmp, C);
         };
+        if (g_off) {
+            // The offload path: the misses copied into the staging ring of their slot size (the decode's staging
+            // slots), up to a ring ahead of the experts that read them - a slot copied again only once the expert
+            // before it there has run (its event); index order kept, so the sums do not depend on the tier.
+            const int pi = g_offs.pool[l];
+            const auto& st = g_offs.stage[pi];
+            auto& rf = g_offs.ring_free[pi];
+            auto& rc = g_offs.ring_full[pi];
+            int issued = 0;
+            X.miss_pos.assign(c.E, -1);
+            auto issue = [&]() {
+                const int e = X.miss_exps[issued++];
+                const int r = g_offs.ring_hand[pi];
+                g_offs.ring_hand[pi] = (r + 1) % st.n;
+                uint8_t* dst = st.data + (size_t) r * st.sb;
+                if (cst != g_s) CU(cudaStreamWaitEvent(cst, rf[r], 0));
+                XC.copy_in(Ly, e, dst, cst);
+                if (cst != g_s) CU(cudaEventRecord(rc[r], cst));
+                X.slot_ptrs[e] = dst;
+                X.miss_pos[e] = r;
+            };
+            while (issued < std::min(n_miss, st.n)) issue();
+            XC.t_up += now() - tu;
+            for (int e = 0; e < c.E; ++e) {
+                if (!W.cnt[e]) continue;
+                const int r = X.miss_pos[e];
+                if (r >= 0 && cst != g_s) CU(cudaStreamWaitEvent(g_s, rc[r], 0));
+                run_exp(e);
+                if (r >= 0) {
+                    if (cst != g_s) CU(cudaEventRecord(rf[r], g_s));
+                    if (issued < n_miss) issue();
+                }
+            }
+            if (n_miss) CU(cudaMemsetAsync(st.tag, 0xff, (size_t) st.n * 4, g_s));   // (no decode copy left there)
+            return;
+        }
         const bool pf = X.pf_layers[l % Work::kPfRing] == l;
         X.miss_pos.assign(c.E, -1);
         for (int m = 0; m < n_miss; ++m) X.miss_pos[X.miss_exps[m]] = m;
@@ -2010,6 +2061,9 @@ struct OffState {
     std::vector<const uint8_t*> host;   // [n_layer] the layer's pinned experts as the device sees them
     std::vector<int> pool;              // [n_layer] its staging pool (the cache's pool of its slot size)
     std::vector<k::OffStage> stage;     // a pool a slot size
+    // (prompts: the staging slots as a ring - an event a slot for its copy, one for the expert that read it)
+    std::vector<std::vector<cudaEvent_t>> ring_free, ring_full;
+    std::vector<int> ring_hand;
     k::OffFetch* fl = nullptr;
     k::OffCount* cnt = nullptr;         // (device)
     uint32_t* heat = nullptr;           // [n_layer * E] (device): picks since load
@@ -3587,7 +3641,9 @@ size_t big_carve(const Config& c, int T, size_t gu32_have, size_t lg_want, size_
 // Tokens a pass for a prompt of n new tokens: W.T_sup, or more with a lent scratch (then big_end gives it back).
 int big_begin(const Model& M, Work& W, ExpertCache& EC, int n, int ctx_end, BigScratch& bs) {
     bs.pool = -1;
-    if (W.T_sup <= 0 || dual() || (getenv("IK2_BORROW") && !std::atoi(getenv("IK2_BORROW")))) return W.T_sup;
+    // (the offload path lends none of the tier: what a prompt took would be gone from it for the decode)
+    if (W.T_sup <= 0 || dual() || (g_off && EC.tier_only) || (getenv("IK2_BORROW") && !std::atoi(getenv("IK2_BORROW"))))
+        return W.T_sup;
     const Config& c = M.c;
     // the attention's scratch for 256 queries against the whole context: few, large GEMMs (the default ~400 MB left
     // room for only ~20 queries a step at 100k tokens) - also lent for a short prompt at the end of a long context
@@ -4741,6 +4797,11 @@ int main(int argc, char** argv) {
             CU(cudaMemsetAsync(st.used, 0, (size_t) n_st * 4, g_s));
             CU(cudaMemsetAsync(st.hand, 0, 4, g_s));
             g_offs.stage.push_back(st);
+            std::vector<cudaEvent_t> a(n_st), b(n_st);
+            for (int i = 0; i < n_st; ++i)
+                CU(cudaEventCreateWithFlags(&a[i], cudaEventDisableTiming)),
+                    CU(cudaEventCreateWithFlags(&b[i], cudaEventDisableTiming));
+            g_offs.ring_free.push_back(a), g_offs.ring_full.push_back(b), g_offs.ring_hand.push_back(0);
         }
         g_offs.fl = dalloc<k::OffFetch>(1);
         g_offs.cnt = dalloc<k::OffCount>(1);
@@ -4768,6 +4829,7 @@ int main(int argc, char** argv) {
                                    : (size_t) 2 << 30;
     const size_t budget = std::min((size_t) (cache_gb * 1073741824.0), fr > room ? fr - room : (size_t) 0);
     EC.tp = g_tp ? d : -1;
+    EC.tier_only = g_off_want && d == 0 && !(getenv("IK2_TIER_MIN") && std::atoi(getenv("IK2_TIER_MIN")));
     std::vector<double> off_value;   // (the offload path: the profile's picks an expert, the tier's pools sized by them)
     if (g_off_want && d == 0)
         if (const char* wf = getenv("IK2_WARM"); wf && *wf)
