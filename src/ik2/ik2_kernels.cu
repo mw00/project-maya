@@ -523,6 +523,7 @@ __device__ __forceinline__ void attn_res_warp0_softmax(float sh_red[][kResMax * 
     }
 }
 
+constexpr int kResGroup = 4;
 template <bool FUSED_RMS, int BLOCK_THREADS>
 __global__ void attn_res_vec4_kernel(ResStates st, int n, const float* q, int nq, int T, int C, float res_eps,
                                      float rms_eps, float* out, RmsOuts outs, size_t job_step) {
@@ -544,32 +545,47 @@ __global__ void attn_res_vec4_kernel(ResStates st, int n, const float* q, int nq
         if (nq > 1) q1[1] = __ldg((const float4*) (q + C) + d4_1);
         if (nq > 2) q1[2] = __ldg((const float4*) (q + 2 * C) + d4_1);
     }
-    for (int i = 0; i < n; ++i) {
-        const float4* x4 = (const float4*) (st.st[i] + (size_t) t * C);
-        float sum_sq = 0.0f, qd0 = 0.0f, qd1 = 0.0f, qd2 = 0.0f;
-        if (d4_0 < c4) {
-            const float4 xv0 = __ldg(x4 + d4_0);
-            sum_sq += xv0.x * xv0.x + xv0.y * xv0.y + xv0.z * xv0.z + xv0.w * xv0.w;
-            qd0 += xv0.x * q0[0].x + xv0.y * q0[0].y + xv0.z * q0[0].z + xv0.w * q0[0].w;
-            if (nq > 1) qd1 += xv0.x * q0[1].x + xv0.y * q0[1].y + xv0.z * q0[1].z + xv0.w * q0[1].w;
-            if (nq > 2) qd2 += xv0.x * q0[2].x + xv0.y * q0[2].y + xv0.z * q0[2].z + xv0.w * q0[2].w;
+    // (kResGroup states' values asked for at once, then used in the states' order: a thread waits for a load before
+    //  it issues the next one's, and a token's launch is those waits - the sums are the one-by-one loop's, bit for bit)
+    const bool in0 = d4_0 < c4, in1 = d4_1 < c4;
+    const float4 zero4 = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    for (int i0 = 0; i0 < n; i0 += kResGroup) {
+        float4 xa[kResGroup], xb[kResGroup];
+#pragma unroll
+        for (int j = 0; j < kResGroup; ++j) {
+            const float4* x4 = (const float4*) (st.st[min(i0 + j, n - 1)] + (size_t) t * C);
+            xa[j] = in0 ? __ldg(x4 + d4_0) : zero4;
+            xb[j] = in1 ? __ldg(x4 + d4_1) : zero4;
         }
-        if (d4_1 < c4) {
-            const float4 xv1 = __ldg(x4 + d4_1);
-            sum_sq += xv1.x * xv1.x + xv1.y * xv1.y + xv1.z * xv1.z + xv1.w * xv1.w;
-            qd0 += xv1.x * q1[0].x + xv1.y * q1[0].y + xv1.z * q1[0].z + xv1.w * q1[0].w;
-            if (nq > 1) qd1 += xv1.x * q1[1].x + xv1.y * q1[1].y + xv1.z * q1[1].z + xv1.w * q1[1].w;
-            if (nq > 2) qd2 += xv1.x * q1[2].x + xv1.y * q1[2].y + xv1.z * q1[2].z + xv1.w * q1[2].w;
-        }
-        sum_sq = wsum(sum_sq);
-        qd0 = wsum(qd0);
-        if (nq > 1) qd1 = wsum(qd1);
-        if (nq > 2) qd2 = wsum(qd2);
-        if (lane == 0) {
-            sh_red[warp][i * 4 + 0] = sum_sq;
-            sh_red[warp][i * 4 + 1] = qd0;
-            sh_red[warp][i * 4 + 2] = qd1;
-            sh_red[warp][i * 4 + 3] = qd2;
+#pragma unroll
+        for (int j = 0; j < kResGroup; ++j) {
+            const int i = i0 + j;
+            if (i >= n) break;
+            float sum_sq = 0.0f, qd0 = 0.0f, qd1 = 0.0f, qd2 = 0.0f;
+            if (in0) {
+                const float4 xv0 = xa[j];
+                sum_sq += xv0.x * xv0.x + xv0.y * xv0.y + xv0.z * xv0.z + xv0.w * xv0.w;
+                qd0 += xv0.x * q0[0].x + xv0.y * q0[0].y + xv0.z * q0[0].z + xv0.w * q0[0].w;
+                if (nq > 1) qd1 += xv0.x * q0[1].x + xv0.y * q0[1].y + xv0.z * q0[1].z + xv0.w * q0[1].w;
+                if (nq > 2) qd2 += xv0.x * q0[2].x + xv0.y * q0[2].y + xv0.z * q0[2].z + xv0.w * q0[2].w;
+            }
+            if (in1) {
+                const float4 xv1 = xb[j];
+                sum_sq += xv1.x * xv1.x + xv1.y * xv1.y + xv1.z * xv1.z + xv1.w * xv1.w;
+                qd0 += xv1.x * q1[0].x + xv1.y * q1[0].y + xv1.z * q1[0].z + xv1.w * q1[0].w;
+                if (nq > 1) qd1 += xv1.x * q1[1].x + xv1.y * q1[1].y + xv1.z * q1[1].z + xv1.w * q1[1].w;
+                if (nq > 2) qd2 += xv1.x * q1[2].x + xv1.y * q1[2].y + xv1.z * q1[2].z + xv1.w * q1[2].w;
+            }
+            sum_sq = wsum(sum_sq);
+            qd0 = wsum(qd0);
+            if (nq > 1) qd1 = wsum(qd1);
+            if (nq > 2) qd2 = wsum(qd2);
+            if (lane == 0) {
+                sh_red[warp][i * 4 + 0] = sum_sq;
+                sh_red[warp][i * 4 + 1] = qd0;
+                sh_red[warp][i * 4 + 2] = qd1;
+                sh_red[warp][i * 4 + 3] = qd2;
+            }
         }
     }
     __syncthreads();
@@ -577,30 +593,34 @@ __global__ void attn_res_vec4_kernel(ResStates st, int n, const float* q, int nq
     __syncthreads();
 
     float4 o0[3] = {}, o1[3] = {};
-    for (int i = 0; i < n; ++i) {
-        const float4* x4 = (const float4*) (st.st[i] + (size_t) t * C);
-        if (d4_0 < c4) {
-            const float4 xv0 = __ldg(x4 + d4_0);
+    for (int i0 = 0; i0 < n; i0 += kResGroup) {
+        float4 xa[kResGroup], xb[kResGroup];
 #pragma unroll
-            for (int qi = 0; qi < 3; ++qi) {
-                if (qi >= nq) break;
-                const float w_qi = sc[qi][i];
-                o0[qi].x += w_qi * xv0.x;
-                o0[qi].y += w_qi * xv0.y;
-                o0[qi].z += w_qi * xv0.z;
-                o0[qi].w += w_qi * xv0.w;
-            }
+        for (int j = 0; j < kResGroup; ++j) {
+            const float4* x4 = (const float4*) (st.st[min(i0 + j, n - 1)] + (size_t) t * C);
+            xa[j] = in0 ? __ldg(x4 + d4_0) : zero4;
+            xb[j] = in1 ? __ldg(x4 + d4_1) : zero4;
         }
-        if (d4_1 < c4) {
-            const float4 xv1 = __ldg(x4 + d4_1);
+#pragma unroll
+        for (int j = 0; j < kResGroup; ++j) {
+            const int i = i0 + j;
+            if (i >= n) break;
 #pragma unroll
             for (int qi = 0; qi < 3; ++qi) {
                 if (qi >= nq) break;
                 const float w_qi = sc[qi][i];
-                o1[qi].x += w_qi * xv1.x;
-                o1[qi].y += w_qi * xv1.y;
-                o1[qi].z += w_qi * xv1.z;
-                o1[qi].w += w_qi * xv1.w;
+                if (in0) {
+                    o0[qi].x += w_qi * xa[j].x;
+                    o0[qi].y += w_qi * xa[j].y;
+                    o0[qi].z += w_qi * xa[j].z;
+                    o0[qi].w += w_qi * xa[j].w;
+                }
+                if (in1) {
+                    o1[qi].x += w_qi * xb[j].x;
+                    o1[qi].y += w_qi * xb[j].y;
+                    o1[qi].z += w_qi * xb[j].z;
+                    o1[qi].w += w_qi * xb[j].w;
+                }
             }
         }
     }
