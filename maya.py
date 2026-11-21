@@ -9285,8 +9285,10 @@ def hy4_room_measure(cfg: dict, card: dict, info: dict, probe=None, save: bool =
 def hy4_room_measure_set(cfg: dict, cards: list, info: dict, probe=None, save: bool = True) -> dict | None:
     """hy4_room_measure for a start on several cards (a layer split or tensor parallel): the setup's sums for it are
     one figure for the cards together (need: hy4_usable_gib adds the cards' rooms), and the engine says how much less
-    free on every card at once its choices hold with (room_joint - each card's own figure counts the others' spare
-    too where a layer split moves layers to a card with room).  So the cards' shares together are need + n * joint
+    free on every card at once what the setup claims of the start holds with (room_joint: that it fits, the cache's
+    rows, the drafters, the pictures, KV streaming - not tensor parallel against a layer split, which the sums do
+    not count; each card's own figure counts the others' spare too where a layer split moves layers to a card with
+    room).  So the cards' shares together are need + n * joint
     less what the probe saw of them, each card's in proportion to what the start takes on it (its probe less joint):
     a tensor-parallel group's cache on every member, a split's layers by the cards' room.  Kept as one record for
     these cards (hy4_room_set_key: "cards", each one's share by PCI place) - a start on one of them alone has its own.

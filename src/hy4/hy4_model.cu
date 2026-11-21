@@ -3072,6 +3072,12 @@ struct Model::Impl {
                         return ok == b.ok && q8 == b.q8 && vision == b.vision && head == b.head && own == b.own &&
                                df == b.df && mt == b.mt && tp == b.tp && pixels == b.pixels && kvres == b.kvres;
                     }
+                    // (what the setup claims of a start: that it fits, the cache's rows, the drafters, the pictures, KV
+                    //  streaming - not the GPUs' layout, which its sums do not count)
+                    bool claims(const Pick& b) const {
+                        return ok == b.ok && q8 == b.q8 && vision == b.vision && df == b.df && mt == b.mt &&
+                               pixels == b.pixels && kvres == b.kvres;
+                    }
                 };
                 auto pick = [&]() {
                     std::string e, w, wm;
@@ -3104,9 +3110,11 @@ struct Model::Impl {
                                       i, bus, f / 1e9, lo / 1e9);
                         say += gb;
                     }
-                    // (several GPUs: also how much less free on EVERY one at once the choices hold with - a layer split
-                    //  moves layers to a GPU with room, so each one's own figure above counts the others' spare too;
-                    //  the setup sums the cards' room, so the cards together are what it is set against)
+                    // (several GPUs: also how much less free on EVERY one at once what the setup claims of the start
+                    //  holds with - a layer split moves layers to a GPU with room, so each one's own figure above counts
+                    //  the others' spare too; the setup sums the cards' room, so the cards together are what it is set
+                    //  against, and its sums count no layout: where less room would only change tensor parallel to a
+                    //  layer split, its claims still hold)
                     double joint = 0;
                     if (free0.size() > 1) {
                         double lo = 0, hi = *std::min_element(free0.begin(), free0.end());
@@ -3114,7 +3122,7 @@ struct Model::Impl {
                         while (hi - lo > 1048576.0) {
                             const double mid = 0.5 * (lo + hi);
                             for (size_t i = 0; i < free0.size(); ++i) free0[i] = f[i] - mid;
-                            (pick() == ref ? lo : hi) = mid;
+                            (pick().claims(ref) ? lo : hi) = mid;
                         }
                         free0 = f;
                         joint = lo;
