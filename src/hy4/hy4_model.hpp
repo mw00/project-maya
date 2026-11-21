@@ -69,8 +69,21 @@ struct Options {
     bool room_report = false;     // --room-report: say how much less free VRAM each GPU could have had with this start's
                                   // choices unchanged (Model::room_report; the plan only - the start is the same)
     std::string gpu_fetch;        // --gpu-fetch off|auto|gpu|lane|K (empty: HY4_FETCH, else off) - see Impl::Fetch
+    bool trial = false;           // a drafting trial's load (--drafting auto / on, hy4_main.cpp): the plan, the weights
+                                  // and the caches as a start with this drafter has them - no warm-up, no measuring,
+                                  // no 4-bit copies, no GPU fetch, nothing written (memory files, profile, room report)
     bool verbose = false;
 };
+
+/// --drafting auto / on: the drafting a PC measured once is remembered by draft_file() in the line draft_key() names -
+/// this PC (CPU, RAM, the lane's threads and kernels), its GPUs and driver, the model's pack and the start's options
+/// that shape the plan (context, chunk, experts, VRAM kept free, layout, cache, pictures, HY4_HOT).  The file:
+/// HY4_DRAFT_FILE, else beside HY4_Q4X_FILE (the server's data folder), else beside --profile; empty: none (then not
+/// measured: the pack's drafter is taken, the MTP block first)
+std::string draft_key(const Options& o);
+std::string draft_file(const Options& o);
+/// the GPUs a start with these options runs on (--gpus, else every visible one)
+int gpus_of(const Options& o);
 
 struct Stats {
     double load_s = 0;
@@ -109,6 +122,10 @@ public:
     /// count), draft_max() the most a round takes.
     bool has_dfly2() const;
     bool has_draft() const { return has_mtp() || has_dfly2(); }
+    /// The drafters the pack holds, loaded or not: 1 the MTP block, 2 the DFly2 drafter (bits); gpu_count(): the GPUs
+    /// this start runs on
+    int pack_drafters() const;
+    int gpu_count() const;
     int draft_default() const;
     int draft_max() const;
     /// The routings counted (with the profile read at the load) to Options::profile_out; no file named: nothing.

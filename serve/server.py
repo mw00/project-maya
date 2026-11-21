@@ -65,6 +65,7 @@ ENGINE_VISION = (ds4_vision.Vision, mm3_vision.Vision)   # the engines that run 
 HY4_TEXT_ONLY = "Hy4-Flash with its pictures off"         # (no vision tower loaded: the errors' name for it)
 HY4_LANE_FILE = ROOT / "data" / "hy4-cpu-lane.txt"        # (maya-hy4's 4-bit copies' verdict on this PC: child_env)
 HY4_ROUTE_FILE = ROOT / "data" / "hy4-prompt-route.txt"   # (... its prompt route's rates measured on this PC: child_env)
+HY4_DRAFT_FILE = ROOT / "data" / "hy4-drafting.txt"       # (... and its drafting, --drafting auto: child_env)
 HY4_MEASURE_DOCS = ("docs/SETTINGS.md", "README.md")      # (... the text its first start measures them on: hy4_measure_ids)
 HY4_MEASURE_CHARS = 200_000                               # (... about 55K tokens of it: up to 12 prompt chunks of 4096)
 
@@ -2301,6 +2302,9 @@ def child_env(cfg: dict) -> dict:
         # (... and the prompt route's rates - a chunk's experts outside VRAM streamed to the GPU or on the CPU lane -
         #  measured once on this PC, so the same prompt takes the same routes from start to start)
         env.setdefault("HY4_ROUTE_FILE", str(HY4_ROUTE_FILE))
+        # (... and, with --drafting auto, which of no drafting, the MTP block and the DFly2 drafter decodes fastest -
+        #  each loaded once with its own VRAM plan at the first start, before READY)
+        env.setdefault("HY4_DRAFT_FILE", str(HY4_DRAFT_FILE))
         # (... and HY4_HOT's scores - which experts a start places in VRAM - learned by the first start, then kept as
         #  they are until maya --speed-calibration: a file a model in the data folder, not in its download)
         env.setdefault("HY4_HOT_FILE", str(hy4_hot_file(cfg)))

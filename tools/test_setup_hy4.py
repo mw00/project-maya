@@ -1399,6 +1399,15 @@ MTP_FILE = "Hy4-Flash-mtp-BF16.gguf"
 DFLY_FILE = "Hy4-Flash-Maya-XS-drafter.dfly2"
 
 
+def draft_flag(c: dict) -> str:
+    """A config's drafting as its args give it the engine: auto / on (--drafting: measured by the engine), mtp, dfly2
+    (by name) or none."""
+    args = c["args"]
+    if "--drafting" in args:
+        return args[args.index("--drafting") + 1]
+    return "mtp" if "--mtp" in args else "dfly2" if "--dfly2" in args else "none"
+
+
 class Drafts(unittest.TestCase):
     """A Maya size drafts with Tencent's MTP block from its own file: the table's entry, its VRAM, the setup's choice
     (on where the block fits beside the model's own parts and a picture's room; --drafting off, and a setup again
@@ -1538,12 +1547,16 @@ class Drafts(unittest.TestCase):
     def test_on_where_the_block_fits(self):
         c, text, cmd = self.set_up(32)
         self.assertEqual(cmd[cmd.index("--mtp") + 1], MTP_FILE)
-        self.assertIn("--mtp", c["args"])
+        # (the block or no drafting: the engine measures which decodes faster at its first start on the PC)
+        self.assertEqual(draft_flag(c), "auto")
+        self.assertNotIn("--mtp", c["args"])
         self.assertEqual((c["installer"]["drafting"], c["installer"]["draft_block"], c["installer"]["layout"]),
                          ("on", True, "standard"))
-        self.assertIn("drafting: Tencent's MTP block drafts tokens and the model checks every one", text)
-        self.assertNotIn("the same answers", text)
-        self.assertNotIn("--draft", [x for x in c["args"] if x != "--mtp"])   # (the engine's own draft length)
+        self.assertIn("drafting: auto - the MTP block fits here", text)
+        self.assertIn("whether the MTP block or no drafting decodes faster", text)
+        self.assertTrue(maya.hy4_engine_drafting(c))
+        self.assertFalse(maya.needs_speed_calibration(c))
+        self.assertNotIn("--draft", c["args"])   # (the engine's own draft length)
         # --drafting off: the block stays in the pack (the Models page's switch), no --mtp; a setup again keeps the
         # choice; --drafting on drafts again
         c, text, cmd = self.set_up(32, prev=c, drafting="off")
@@ -1553,15 +1566,22 @@ class Drafts(unittest.TestCase):
         self.assertIn("drafting: off (--drafting on", text)
         c, text, _ = self.set_up(32, prev=c)
         self.assertNotIn("--mtp", c["args"])
+        self.assertEqual(draft_flag(c), "none")
+        # (--drafting on by hand: drafting, the faster drafter the engine finds - here the block, the only one)
         c, text, _ = self.set_up(32, prev=c, drafting="on")
-        self.assertIn("--mtp", c["args"])
+        self.assertEqual(draft_flag(c), "on")
+        self.assertIn("drafting: Tencent's MTP block drafts tokens and the model checks every one", text)
+        # by name: that one, nothing measured
+        c, text, _ = self.set_up(32, prev=c, drafting="mtp")
+        self.assertEqual(draft_flag(c), "mtp")
+        self.assertFalse(maya.hy4_engine_drafting(c))
 
     def test_a_config_from_before_the_block(self):
         # (a config written when these files had no drafting: its "off" was no choice)
         prev = {"args": ["--pack", "/p", "--max-context", "32768"],
                 "installer": {"family": "hy4", "hy4_quant": "maya-xs", "layout": "standard", "drafting": "off"}}
         c, _, _ = self.set_up(32, prev=prev)
-        self.assertIn("--mtp", c["args"])
+        self.assertEqual(draft_flag(c), "auto")
 
     def test_off_where_it_does_not_fit(self):
         # a 12 GB card: the model's own parts at 32K and the block together are more than the card has - the block is
@@ -1593,11 +1613,11 @@ class Drafts(unittest.TestCase):
         # a 12 GB card: no room for the block, room for the DFly2 drafter - packed, --dfly2, drafting on
         c, text, cmd = self.set_up(12, published=True, dfly=True)
         self.assertEqual((cmd[cmd.index("--mtp") + 1], cmd[cmd.index("--drafter") + 1]), ("none", DFLY_FILE))
-        self.assertIn("--dfly2", c["args"])
+        self.assertEqual(draft_flag(c), "auto")   # (it or no drafting: measured by the engine)
         self.assertNotIn("--mtp", c["args"])
         self.assertEqual((c["installer"]["drafting"], c["installer"]["dfly2"]), ("on", True))
         self.assertNotIn("draft_block", c["installer"])
-        self.assertIn("drafting: Tencent's DFly2 drafter drafts tokens and the model checks every one", text)
+        self.assertIn("drafting: auto - the DFly2 drafter fits here", text)
         self.assertIn("(the MTP block: the draft block needs about", text)
         # --drafting off: the drafter stays in the pack, no --dfly2, a setup again keeps it off; --drafting on again
         c, text, _ = self.set_up(12, published=True, dfly=True, prev=c, drafting="off")
@@ -1607,7 +1627,7 @@ class Drafts(unittest.TestCase):
         c, _, _ = self.set_up(12, published=True, dfly=True, prev=c)
         self.assertNotIn("--dfly2", c["args"])
         c, _, _ = self.set_up(12, published=True, dfly=True, prev=c, drafting="on")
-        self.assertIn("--dfly2", c["args"])
+        self.assertEqual(draft_flag(c), "on")
         # --drafting mtp: the block alone - off on this card, said
         c, text, cmd = self.set_up(12, published=True, dfly=True, drafting="mtp")
         self.assertEqual(cmd[cmd.index("--drafter") + 1], "none")
@@ -1615,23 +1635,28 @@ class Drafts(unittest.TestCase):
         self.assertIn("drafting: off - the draft block needs about", text)
 
     def test_both_fit(self):
-        # where both fit, both are packed and the size's rule drafts until the speed calibration measures (once, at a
-        # start); a setup again keeps what it measured; --no-speed-calibration: the rule, recorded as chosen
+        # where both fit, both are packed and --drafting auto: the engine measures no drafting, the block and DFly2
+        # once at its first start on the PC (each with its own plan) - nothing for the setup's speed calibration; a
+        # config from before (--mtp / --dfly2 by the size's rule) keeps the old A/B; --no-speed-calibration: recorded
         c, text, cmd = self.set_up(32, dfly=True)
         self.assertEqual((cmd[cmd.index("--mtp") + 1], cmd[cmd.index("--drafter") + 1]), (MTP_FILE, DFLY_FILE))
         rule = maya.HY4_DRAFT_RULE["maya-xs"]
-        self.assertIn("--dfly2" if rule == "dfly2" else "--mtp", c["args"])
-        self.assertNotIn("--mtp" if rule == "dfly2" else "--dfly2", c["args"])
+        self.assertEqual(draft_flag(c), "auto")
+        self.assertNotIn("--mtp", c["args"])
+        self.assertNotIn("--dfly2", c["args"])
         self.assertEqual({k: c["installer"].get(k) for k in ("draft_choice", "drafter", "draft_block", "dfly2")},
                          {"draft_choice": "auto", "drafter": rule, "draft_block": True, "dfly2": True})
         self.assertIn("both fit here", text)
-        self.assertTrue(maya.hy4_both_drafters(c) and maya.needs_speed_calibration(c))
-        c["installer"]["speed_calibration"] = {"date": "d", "kept": "mtp" if rule == "dfly2" else "dfly2"}
+        self.assertIn("whether no drafting, the MTP block or the DFly2 drafter decodes fastest", text)
+        self.assertTrue(maya.hy4_both_drafters(c) and maya.hy4_engine_drafting(c))
         self.assertFalse(maya.needs_speed_calibration(c))
-        c2, text, _ = self.set_up(32, dfly=True, prev=c)
-        self.assertEqual(c2["installer"]["drafter"], c["installer"]["speed_calibration"]["kept"])
-        self.assertEqual(c2["installer"]["speed_calibration"], c["installer"]["speed_calibration"])
-        self.assertIn("the faster of the two on this PC", text)
+        old = dict(c, args=[x for x in c["args"] if x not in ("--drafting", "auto")] + ["--" + rule])
+        self.assertTrue(maya.needs_speed_calibration(old))
+        old["installer"] = dict(old["installer"], speed_calibration={"date": "d", "kept": "mtp" if rule == "dfly2" else "dfly2"})
+        self.assertFalse(maya.needs_speed_calibration(old))
+        c2, text, _ = self.set_up(32, dfly=True, prev=old)
+        self.assertEqual(draft_flag(c2), "auto")
+        self.assertIn("drafting: auto", text)
         c3, _, _ = self.set_up(32, dfly=True, no_speed_calibration=True)
         self.assertEqual(c3["installer"]["speed_calibration"]["skipped"], "chosen")
         self.assertFalse(maya.needs_speed_calibration(c3))
@@ -1653,9 +1678,25 @@ class Drafts(unittest.TestCase):
         self.assertEqual(c["installer"]["draft_choice"], "mtp")
         self.assertFalse(maya.needs_speed_calibration(c))
 
-    def test_speed_calibration(self):
-        # the A/B: MTP block first, then DFly2; the faster is kept, a tie keeps the size's rule
+    def test_speed_calibration_by_the_engine(self):
+        # --drafting auto: the measured drafting forgotten, one engine start (the CPU lane check's) measures it again
         c, _, _ = self.set_up(32, dfly=True)
+        p = Path(self.tmp.name) / "maya-hy4-flash-maya-xs.json"
+        p.write_text(json.dumps(c))
+        ran = []
+        with patch.object(maya, "draft_forget", lambda: ran.append("forget")), \
+                patch.object(maya, "route_forget", lambda: None), patch.object(maya, "hot_forget", lambda cfg: None), \
+                patch.object(maya, "q4x_calibration", lambda path, why="": ran.append("start") or True), \
+                patch.object(maya.CD, "run", lambda *a, **k: self.fail("the setup's A/B ran")):
+            self.assertTrue(maya.speed_calibration(p, "asked for"))
+        self.assertEqual(ran, ["forget", "start"])
+        self.assertEqual(draft_flag(json.loads(p.read_text())), "auto")
+
+    def test_speed_calibration(self):
+        # a config from before v1.1.71 (--mtp / --dfly2 by the size's rule): the A/B - MTP block first, then DFly2;
+        # the faster is kept, a tie keeps the size's rule
+        c, _, _ = self.set_up(32, dfly=True)
+        c["args"] = [x for x in c["args"] if x not in ("--drafting", "auto")] + ["--" + maya.HY4_DRAFT_RULE["maya-xs"]]
         p = Path(self.tmp.name) / "maya-hy4-flash-maya-xs.json"
         for o, d, want in ((30.0, 36.0, "dfly2"), (36.0, 30.0, "mtp"), (30.0, 30.3, maya.HY4_DRAFT_RULE["maya-xs"])):
             p.write_text(json.dumps(c))
@@ -1684,8 +1725,7 @@ class Drafts(unittest.TestCase):
         c, text, cmd = self.set_up(12, published=True, dfly=True, gpus=2)
         self.assertEqual(cmd[cmd.index("--drafter") + 1], "none")
         self.assertNotIn("--dfly2", c["args"])
-        if "--mtp" not in c["args"]:
-            self.assertIn("the DFly2 drafter runs on one GPU for now (this PC: 2)", text)
+        self.assertIn("the DFly2 drafter runs on one GPU for now (this PC: 2)", text)
 
     def test_dfly2_where_the_engine_loads_it(self):
         # the engine loads the drafter only where its room changes nothing but the experts' places: the setup counts
@@ -1724,7 +1764,7 @@ class Drafts(unittest.TestCase):
         self.assertEqual(got[0][2], f"https://huggingface.co/{TABLE['repo']}/resolve/{'d' * 40}/{MTP_HUB}")
         self.assertIn("one file for every size", got[0][0])
         self.assertEqual(cmd[cmd.index("--mtp") + 1], MTP_FILE)
-        self.assertIn("--mtp", c["args"])
+        self.assertEqual(draft_flag(c), "auto")
 
     def test_linked_from_another_size(self):
         man, _ = stand_ins()
@@ -1809,7 +1849,7 @@ class FastDrafting(unittest.TestCase):
                       "the default (./maya.sh --setup --fast-drafting on)".replace("./maya.sh", maya.ME), text)
         # a free card: the drafter fits beside the F16 rows - the default drafts, nothing offered
         c, text, _ = self.set_up(76)
-        self.assertEqual(("--dfly2" in c["args"], "--kv" in c["args"]), (True, False))
+        self.assertEqual((draft_flag(c), "--kv" in c["args"]), ("auto", False))
         self.assertNotIn("fast-drafting", text)
 
     def test_on(self):
@@ -2130,8 +2170,8 @@ class WindowsRoom(unittest.TestCase):
         # at 4K: claimed and written
         c, text, _ = Drafts.set_up(self, 8, block=False, dfly=True, dfly_gib=self.G, small=True, used=76, context=4096,
                                    revision=TABLE["revision"], room=self.URANUS)
-        self.assertIn("--dfly2", c["args"])
-        self.assertIn("drafting: Tencent's DFly2 drafter drafts tokens", text)
+        self.assertEqual(draft_flag(c), "auto")
+        self.assertIn("drafting: auto - the DFly2 drafter fits here", text)
 
 
 def hy4_cfg(d: Path, mtp: bool = True, n_mtp: int = 1, vision: bool = False) -> dict:
@@ -2397,7 +2437,7 @@ class Dashboard(unittest.TestCase):
         from serve import models as M
         with tempfile.TemporaryDirectory() as t:
             cfg = hy4_cfg(Path(t))
-            self.assertEqual(M.choices(cfg), {"draft": ["mtp", "none"], "images": False,
+            self.assertEqual(M.choices(cfg), {"draft": ["auto", "mtp", "none"], "images": False,
                                               "ablate": {"available": False, "why": "not available for this model"}})
             s = M.settings_of(cfg)
             self.assertEqual((s["draft"], s["tp"], s["reserve_gb"], s["prefill_chunk"], s["images"]),
@@ -2426,7 +2466,7 @@ class Dashboard(unittest.TestCase):
             cfg = hy4_cfg(Path(t), mtp=False)
             with (M.pack_of(cfg) / "hy4.txt").open("a") as f:
                 f.write("dfly_layers 5\n")
-            self.assertEqual(M.choices(cfg)["draft"], ["mtp", "dfly2", "none"])
+            self.assertEqual(M.choices(cfg)["draft"], ["auto", "mtp", "dfly2", "none"])
             self.assertEqual(M.settings_of(cfg)["draft"], "none")
             on = M.apply(cfg, {"draft": "dfly2"})
             self.assertEqual(on["args"][-1], "--dfly2")
@@ -2434,6 +2474,12 @@ class Dashboard(unittest.TestCase):
             mtp = M.apply(on, {"draft": "mtp"})
             self.assertEqual((mtp["args"][-1], "--dfly2" in mtp["args"]), ("--mtp", False))
             self.assertNotIn("--dfly2", M.apply(on, {"draft": "none"})["args"])
+            # auto: --drafting auto (the engine measures none / MTP / DFly2 once on this PC) in place of either flag
+            auto = M.apply(on, {"draft": "auto"})
+            self.assertEqual((auto["args"][-2:], "--dfly2" in auto["args"], M.settings_of(auto)["draft"]),
+                             (["--drafting", "auto"], False, "auto"))
+            back = M.apply(auto, {"draft": "mtp"})
+            self.assertEqual(("--drafting" in back["args"], "--mtp" in back["args"]), (False, True))
 
     def test_models_page_images(self):
         """A pack with the vision tower: Images on by default (no flag), off writes --vision off, on drops it."""

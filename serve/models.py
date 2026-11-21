@@ -280,6 +280,18 @@ def hy4_has_dfly2(cfg: dict) -> bool:
         return False
 
 
+def hy4_draft_of(args: list) -> str:
+    """A Hy4-flash config's drafting as the Models page shows it: auto (--drafting auto / on: the engine measures once
+    on this PC which decodes fastest), mtp, dfly2 or none."""
+    args = [str(a) for a in args]
+    how = flag(args, "--drafting")
+    if how in ("auto", "on"):
+        return "auto"
+    if "--mtp" in args or how == "mtp":
+        return "mtp"
+    return "dfly2" if "--dfly2" in args or how == "dfly2" else "none"
+
+
 def hy4_has_vision(cfg: dict) -> bool:
     """Hy4-flash's pack has the vision tower (hy4.txt's vision.* keys: tools/hy4/pack_gguf.py with the mmproj file)."""
     pack = pack_of(cfg)
@@ -371,8 +383,9 @@ def _choices(cfg: dict) -> dict:
         return {"draft": ["dspark", "none"] if ds4_has_drafter(cfg) else ["none"],
                 "images": ds4_has_vision(cfg) or "--vision" not in (cfg.get("args") or [])}
     if family(cfg) == "hy4":                           # (images: the pack's mmproj file)
-        return {"draft": (["mtp"] if hy4_has_mtp(cfg) else []) + (["dfly2"] if hy4_has_dfly2(cfg) else []) + ["none"],
-                "images": hy4_has_vision(cfg)}
+        # (auto: the engine measures once on this PC which decodes fastest - no drafting or a drafter the pack holds)
+        drafters = (["mtp"] if hy4_has_mtp(cfg) else []) + (["dfly2"] if hy4_has_dfly2(cfg) else [])
+        return {"draft": (["auto"] if drafters else []) + drafters + ["none"], "images": hy4_has_vision(cfg)}
     if family(cfg) == "qwen":                          # (images: the setup's maya-vision entry, on or kept off)
         return {"draft": ["mtp", "none"] if qwen_mtp(cfg) is not None else ["none"],
                 "images": bool(cfg.get("vision") or cfg.get("vision_off"))}
@@ -407,8 +420,7 @@ def settings_of(cfg: dict) -> dict:
     if family(cfg) == "hy4":                           # (maya-hy4's own defaults where the config names none)
         tp = flag(args, "--tp", "auto")
         out.update(images=flag(args, "--vision") != "off" and hy4_has_vision(cfg),
-                   draft="mtp" if "--mtp" in [str(a) for a in args] else
-                   "dfly2" if "--dfly2" in [str(a) for a in args] else "none",
+                   draft=hy4_draft_of(args),
                    tp="auto" if tp == "auto" else _int(tp, "auto"), reserve_gb=_float(flag(args, "--reserve-gb")),
                    prefill_chunk=_int(flag(args, "--chunk")), cpu_threads=_int(flag(args, "--cpu-threads")),
                    kv=flag(args, "--kv", "auto"))     # (the latent cache's rows: auto, the engine's default)
@@ -613,9 +625,10 @@ def apply(cfg: dict, settings: dict) -> dict:
         if s.get("draft") not in can["draft"]:
             raise ValueError("Drafting: this pack has no MTP block" if s.get("draft") == "mtp" else
                              "Drafting: this pack has no DFly2 drafter" if s.get("draft") == "dfly2" else
-                             "Drafting: MTP, DFly2 or none")
-        args = [x for x in args if x not in ("--mtp", "--dfly2")] + \
-            (["--mtp"] if s["draft"] == "mtp" else ["--dfly2"] if s["draft"] == "dfly2" else [])
+                             "Drafting: auto, MTP, DFly2 or none")
+        args = [x for x in drop_flag(args, "--drafting") if x not in ("--mtp", "--dfly2")] + \
+            (["--drafting", "auto"] if s["draft"] == "auto" else ["--mtp"] if s["draft"] == "mtp" else
+             ["--dfly2"] if s["draft"] == "dfly2" else [])
         # (auto, the engine's default: tensor parallel over the largest group of equal GPUs; 0 splits the layers)
         tp = s.get("tp")
         if tp in (None, "", "auto"):

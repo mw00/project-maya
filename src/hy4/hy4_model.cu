@@ -3285,6 +3285,10 @@ struct Model::Impl {
     bool load(const Options& opt, std::string& err) {
         const double t0 = now_s();
         o = opt;
+        if (o.trial) {   // (a drafting trial's load: nothing written)
+            o.room_report = false;
+            o.profile_out.clear();
+        }
         if (o.mtp && o.dfly2) {
             err = "--mtp and --dfly2: one drafter at a time (the MTP block, or the DFly2 drafter)";
             return false;
@@ -3456,20 +3460,21 @@ struct Model::Impl {
                 }
                 return true;
             };
-            // The drafters in the pack - the MTP block, the DFly2 drafter: their room (one drafter runs at a time, so the
-            // larger one's: draft_plan_bytes) is counted in the plan with drafting on and off alike, with either of
-            // them on, so turning drafting on or off, or the one for the other, moves no routed expert between the
-            // VRAM and the CPU lane - the answers keep their bits (the drafts are checked token by token: a verify
-            // window's rows are the one-token pass's bits).  The prompt chunk an auto start takes is the one beside the
-            // drafters' room, with drafting on and off alike (the block's 3.95 GB is more than a step of the chunk's
-            // buffers: leaving it out for a chunk would take drafting from every card that holds it only beside a
-            // smaller chunk).  Where counting a drafter changes more than that and the experts' places - the cache's
-            // rows (F16 or 8-bit), the pictures' size, the dense prompt span, KV streaming, the GPUs' layout, or
-            // whether the start fits - its room is not counted and it is not loaded: with its
-            // drafts the answers would differ from without (an 8 GB card at 8K: the DFly2 drafter's 0.7 GB put the
-            // cache in 8-bit rows; the MTP block's 3.95 GB did so on larger cards).  Both first, then the DFly2 drafter
-            // alone (the smaller), then none - the same order whichever is asked, so the plan stays the same.  The MTP
-            // block on any layout; the DFly2 drafter on one GPU (its layout), or where --dfly2 asks on more (as before)
+            // The drafter this start loads - the MTP block (--mtp) or the DFly2 drafter (--dfly2): its room alone is
+            // counted in the plan, and none without a drafter - so a start without drafting gives every byte to the
+            // routed experts, and a pack with both drafters keeps room for the one it runs (--drafting auto / on: the
+            // one this PC measured fastest, or none - hy4_main.cpp).  Within a start the plan holds with the drafts on
+            // and off (a request's spec=0|1), so the two give the same answers (the drafts are checked token by token:
+            // a verify window's rows are the one-token pass's bits); a start with another drafter, or none, plans
+            // otherwise and may word an answer differently.  The prompt chunk an auto start takes is the one beside the
+            // drafter's room (the block's 3.95 GB is more than a step of the chunk's buffers: leaving it out for a
+            // chunk would take drafting from every card that holds it only beside a smaller chunk).  Where counting
+            // the drafter changes more than that and the experts' places - the cache's rows (F16 or 8-bit), the
+            // pictures' size, the dense prompt span, KV streaming, the GPUs' layout, or whether the start fits - its
+            // room is not counted and it is not loaded: with its drafts the answers would differ from without (an 8 GB
+            // card at 8K: the DFly2 drafter's 0.7 GB put the cache in 8-bit rows; the MTP block's 3.95 GB did so on
+            // larger cards).  The MTP block on any layout; the DFly2 drafter on one GPU (its layout), or where --dfly2
+            // asks on more (as before)
             struct Sum {
                 bool ok;
                 int tp, chunk, span;
@@ -3503,8 +3508,9 @@ struct Model::Impl {
                 e1.clear();
                 df_why.clear();
                 mtp_why.clear();
-                const bool df_c = pk.num("dfly_layers") >= 1 && (o.dfly2 || n_gpu == 1);
-                const bool mtp_c = g.n_mtp > 0;
+                (void) n_gpu;
+                const bool df_c = pk.num("dfly_layers") >= 1 && o.dfly2;
+                const bool mtp_c = g.n_mtp > 0 && o.mtp;
                 df_room = mtp_room = false;
                 if (!df_c && !mtp_c) return choose(e1);
                 std::string e0;
@@ -3968,8 +3974,9 @@ struct Model::Impl {
         // the GPU fetch (its copies in RAM first: the 4-bit copies take what RAM is left), then the 4-bit copies -
         // not where every expert runs on the GPU - and the prompt route; neither before auto has measured
         // (Model::load starts them then)
-        if (lane && !fetch_setup(err)) return false;
-        if (lane && fx.mode != 1 && !fetch_pending()) q4x_start();
+        //  (a drafting trial: the lane as a start finds it before its copies are made - neither, and no files)
+        if (lane && !o.trial && !fetch_setup(err)) return false;
+        if (lane && !o.trial && fx.mode != 1 && !fetch_pending()) q4x_start();
         if (lane && !fetch_pending()) route_start();
         st.experts_vram = n_res;
         st.experts_all = n_all;
@@ -5382,6 +5389,7 @@ struct Model::Impl {
         r.file = rf && *rf ? std::string(rf)
                  : by.empty() ? std::string()
                               : (sl == std::string::npos ? std::string(".") : by.substr(0, sl)) + "/hy4-prompt-route.txt";
+        if (o.trial) r.file.clear();   // (a drafting trial: the moment's timings, nothing remembered)
         const char* again = std::getenv("HY4_ROUTE_MEASURE");
         const bool q4x_open = q4x_adaptive && !q4x_decided;   // (its verdict still to come: measured with it in)
         std::string date;
@@ -5998,7 +6006,7 @@ struct Model::Impl {
             }
         }
         const char* learn = std::getenv("HY4_HOT_LEARN");
-        hot.learn = !hot.file.empty() && (!hot.loaded || (learn && std::atoi(learn) != 0));
+        hot.learn = !o.trial && !hot.file.empty() && (!hot.loaded || (learn && std::atoi(learn) != 0));
         if (!hot.loaded && prof_in.size() >= n)
             for (int il = 0; il < g.n_layer; ++il) {
                 const uint32_t* c = prof_in.data() + (size_t) il * g.n_expert;
@@ -8174,6 +8182,7 @@ Model::~Model() {
 // the MTP cache empty, the counts as they were
 bool Model::load(const Options& o, std::string& err) {
     if (!m->load(o, err)) return false;
+    if (o.trial) return true;   // (a drafting trial: its own short warm-up, hy4_main.cpp)
     // the GPU fetch's auto (Impl::Fetch): the lane, gpu and mix timed on the same short decode, the fastest kept (the
     // lane unless another is 3% faster) and remembered; then the state as loaded.  First the decode's tokens: a greedy
     // one from the BOS on the lane, untimed - it pays what only a PC's first decode of them pays (the Engram rows they
@@ -8672,6 +8681,66 @@ bool Model::draft(int tok, int64_t pos, int n, float floor, std::vector<int>& d,
 }
 bool Model::has_mtp() const { return m->M.mtp; }
 bool Model::has_dfly2() const { return m->df.on; }
+int Model::pack_drafters() const {
+    return (m->g.n_mtp > 0 ? 1 : 0) | (m->pk.num("dfly_layers") >= 1 ? 2 : 0);
+}
+int Model::gpu_count() const { return (int) m->G.size(); }
+
+std::string draft_file(const Options& o) {
+    if (const char* f = std::getenv("HY4_DRAFT_FILE")) return f;
+    auto dir_of = [](const std::string& p) {
+        const size_t sl = p.find_last_of("/\\");
+        return sl == std::string::npos ? std::string(".") : p.substr(0, sl);
+    };
+    if (const char* q = std::getenv("HY4_Q4X_FILE"))
+        if (*q) return dir_of(q) + "/hy4-drafting.txt";
+    if (!o.profile.empty()) return dir_of(o.profile) + "/hy4-drafting.txt";
+    return std::string();
+}
+
+int gpus_of(const Options& o) {
+    if (!o.gpus.empty()) return (int) o.gpus.size();
+    int n = 0;
+    if (cudaGetDeviceCount(&n) != cudaSuccess) {
+        (void) cudaGetLastError();
+        n = 0;
+    }
+    return n;
+}
+
+std::string draft_key(const Options& o) {
+    std::string d = "Hy4 drafting v1|";
+    char buf[512];
+    int drv = 0, n = 0;
+    (void) cudaDriverGetVersion(&drv);
+    if (cudaGetDeviceCount(&n) != cudaSuccess) n = 0;
+    std::vector<int> devs = o.gpus;
+    if (devs.empty())
+        for (int i = 0; i < n; ++i) devs.push_back(i);
+    for (int dv : devs) {
+        cudaDeviceProp pr{};
+        if (dv < 0 || dv >= n || cudaGetDeviceProperties(&pr, dv) != cudaSuccess) continue;
+        std::snprintf(buf, sizeof buf, "%s %.0f GB %02x:%02x|", pr.name, (double) pr.totalGlobalMem / 1e9,
+                      (unsigned) pr.pciBusID, (unsigned) pr.pciDeviceID);
+        d += buf;
+    }
+    (void) cudaGetLastError();
+    long long tsz = -1;   // (the pack: its folder and its tensor list's size)
+    if (FILE* f = std::fopen((o.pack + "/tensors.txt").c_str(), "rb")) {
+        if (std::fseek(f, 0, SEEK_END) == 0) tsz = (long long) std::ftell(f);
+        std::fclose(f);
+    }
+    std::string split;
+    for (int v : o.layer_split) split += std::to_string(v) + ",";
+    const char* hot = std::getenv("HY4_HOT");
+    std::snprintf(buf, sizeof buf, "driver %d|pack %s %lld|ctx %lld chunk %d experts %.3f reserve %.2f tp %d main %d "
+                  "kv %d streaming %d resident %lld vision %d split %s fetch %s|HY4_HOT %s", drv, o.pack.c_str(), tsz,
+                  (long long) o.max_ctx, o.prefill_chunk, o.vram_experts, o.reserve_gb, o.tp, o.main_gpu, o.kv,
+                  o.kv_streaming, (long long) o.kv_resident, o.vision ? 1 : 0, split.c_str(), o.gpu_fetch.c_str(),
+                  hot ? hot : "");
+    d += buf;
+    return q4x_memo_key(d, o.cpu_threads);
+}
 int Model::draft_default() const { return m->df.on ? m->df.n_def : 3; }
 int Model::draft_max() const { return W - 1; }
 bool Model::pin(void* p, size_t bytes) {

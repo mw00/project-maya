@@ -2579,13 +2579,23 @@ beside them). `--mtp` loads the GGUF's MTP block (its BF16 weights rounded to Q8
 head for the drafts' top token in Q4_K - only how often a draft holds depends on it) and drafts up to
 `--draft` tokens a step; the model checks them in one window, so the tokens are the model's own: greedy answers are
 the same with and without it, and with sampling a draft is kept with the model's probability of it. The VRAM plan
-counts the room of the drafters the pack holds (the MTP block, the DFly2 drafter: the larger one's, as one runs at a
-time) with drafting on and off alike, so turning drafting on or off, or one drafter for the other, moves no expert
-and keeps the answers (a start's own prompt chunk is then the one beside that room). Where a drafter's room would
-change more than that - the cache's rows, the dense prompt span, KV streaming, the GPUs' layout - the start leaves it
-out and says so ("INFO the MTP block is not loaded: ..."), and
-decodes without drafts; `--kv q8` (the 8-bit rows by hand) gives it room on a card where F16 rows and the block do
-not fit together.
+counts the room of the drafter the start runs only - none without one, so the routed experts get all of the VRAM -
+and a pack with the MTP block and the DFly2 drafter keeps room for the one it runs; an automatic prompt chunk is the
+one beside that room (it may be smaller than without the drafter). Within a start, drafts on and off (a request's
+own) give the same answers. Where a drafter's room would change more than that - the cache's rows, the dense prompt
+span, KV streaming, the GPUs' layout - the start leaves it out and says so ("INFO the MTP block is not loaded: ..."),
+and decodes without drafts; `--kv q8` (the 8-bit rows by hand) gives it room on a card where F16 rows and the block
+do not fit together.
+
+**`--drafting auto`** (what the setup writes for a Maya size whose pack holds a drafter): the first start on a PC
+loads each choice once with its own VRAM plan - no drafting, the MTP block, the DFly2 drafter (one GPU) - and times a
+short greedy decode of each on this install's docs (three prompts, 192 tokens; before the engine is ready, a load and
+some seconds a choice); the fastest is kept (within 2%, the one with less VRAM of its own: no drafting, then DFly2,
+then the MTP block) and remembered in `data/hy4-drafting.txt`, per PC, GPUs, model and start options - the starts
+after read it and skip the measuring, so they give the same answers. `maya --speed-calibration` measures again.
+`--drafting on`: the faster of the drafters (never none); `--drafting off`, `mtp`, `dfly2` (the setup's `--drafting`,
+or Drafting on the Models page): that choice by hand, nothing measured - its VRAM plan can differ from the measured
+one's, so an answer may be worded slightly differently than with the measured choice.
 
 Measured by the engine's contributor (@needmorevram) on his own PC, with AngelSlim's Q4_K_M set, not with Maya's
 files - a 9-GPU NVIDIA PC (an RTX 3090 and eight RTX 5060 Ti on PCIe 3, two Xeon sockets):
@@ -2710,7 +2720,8 @@ A request's `spec` (0 / 1) turns the drafts off or on for it.
 | `HY4_KV_SPILL_RES`, `HY4_KV_SPILL_SLOTS`, `HY4_KV_SPILL_MIN_MBS` | by the RAM; 32768; 10 | KV spill: the newest positions whose rows stay in RAM; the rows a layer's read may bring from the drive at once; the slowest drive (MB/s in 4 KB reads) auto takes |
 | `HY4_ROUTE` | by the rates measured once on this PC | a PC whose routed experts are not all in VRAM: where a prompt chunk's other experts are computed - streamed to the GPU or on the CPU lane. The two routes sum a token's experts in another order, so the engine does not pick by the moment's timings: it picks per layer and chunk by two rates this PC measured once (the lane's time an expert-token, each GPU's streaming time a MB) - the same prompt takes the same routes and gives the same tokens from start to start. Not yet measured: the first start's prompt chunks take the two routes in turns, timed once the lane's experts are warm, until two windows agree (its log says `prompt route: ...`); the rates are remembered per PC, GPUs and driver, model, layout (each layer's VRAM experts, the chunk) and lane kernels in `data/hy4-prompt-route.txt` (`HY4_ROUTE_FILE` names another file; without one: beside `HY4_Q4X_FILE`, else beside `--profile`); a new layout or new lane kernels are measured again, and `--speed-calibration` measures again (`HY4_ROUTE_MEASURE=1`). `stream` or `lane` pins the route (runs and builds compare token for token) |
 | `HY4_MEASURE`, `HY4_MEASURE_IDS`, `HY4_MEASURE_S` | on, with the server's text, 300 | the first start on a PC: what `HY4_Q4X` and `HY4_ROUTE` would measure while the first answers read their prompts (2.5-3x slower then) is measured before the engine says READY - on `HY4_MEASURE_IDS`, a file of token ids (the server writes this install's `docs/SETTINGS.md` and `README.md` in the model's tokens into `data/hy4-measure-ids-<tokenizer>.txt` once), with the same timing code: a prompt chunk and 64 tokens give the routing counts the 4-bit copies are made by, then the text goes on a token at a time until the copies' turns decide, then it is read in chunks of the prompt's size until the route's windows agree. The log says `measuring this PC once ...` and `measured this PC once in N s ...`; both results are remembered as before, so the starts after skip it, and the first answer then reads its prompt by the rates the later starts use (the same tokens as theirs). Only where the results are remembered (a data folder named); `HY4_MEASURE=0`, no file, or not decided within `HY4_MEASURE_S` seconds: the answers measure the rest, as before |
-| `HY4_LAST_ALONE` | on with tensor parallel | `--serve`: a prompt's last token is read alone on the token path after the rest, as a repeat of the request (its prompt in the caches) reads it - the first answer and every repeat begin from the same row (one extra step a new prompt). `1`: on every layout; `0`: on none |
+| `HY4_LAST_ALONE` | on | `--serve`: a prompt's last token is read alone on the token path after the rest, as a repeat of the request (its prompt in the caches) reads it - the first answer and every repeat begin from the same row (one extra step a new prompt), on every layout. `0`: off |
+| `HY4_DRAFT_FILE`, `HY4_DRAFT_MEASURE` | the data folder's `hy4-drafting.txt`; off | `--drafting auto` / `on`: where the drafting measured once on this PC is remembered (the server's data folder; the engine alone: beside `HY4_Q4X_FILE` or `--profile`, else not measured - the MTP block drafts); `HY4_DRAFT_MEASURE=1` measures again (`maya --speed-calibration` drops the file). `HY4_DRAFT_TOKENS` (192), `HY4_DRAFT_ROUNDS` (3), `HY4_DRAFT_PROMPT` (512), `HY4_DRAFT_TIE` (0.02): the timed decode, its prompts, their length, the tie |
 | `HY4_FETCH` (`--gpu-fetch`) | off | decode: the routed experts VRAM does not hold copied into pinned RAM, and the GPU fetches the ones a token routes to it itself. `gpu`: all of them on the GPU; `mix:K`: each token's first K others a layer on the GPU, the rest on the CPU lane; `lane`: the CPU lane alone (no copy); `auto`: the three timed once at the first start on the same tokens and the fastest kept (the lane unless another is 3% faster), remembered per PC (`HY4_FETCH_FILE`; `HY4_FETCH_MEASURE=1` or `--speed-calibration` measures again); a lane verdict gives the copies back at once. `HY4_FETCH_GB`: the most RAM the copies take |
 | `HY4_LANE_RESERVE`, `HY4_LANE_RESERVE_CORES` | auto | the CPU lane of the size the engine picks (12 cores or more): a few cores (min(4, cores / 8)) left out of its threads only while other programs keep the PC busy (measured, with hysteresis), so a busy PC's lane does not wait for a core it shares; `1`: always left out; `0`: never; `_CORES`: how many |
 | `HY4_ATTN_WMMA`, `HY4_IX_WMMA` | on for RDNA 3 / 3.5 (gfx11) | AMD, prompts past 8,192 positions: the indexed layers' attention over the picked keys (`ATTN`) and the indexer's scores (`IX`) on the matrix cores (WMMA). `0`: the earlier kernels; `HY4_ATTN_WMMA=1`: RDNA 4 (gfx12) too |

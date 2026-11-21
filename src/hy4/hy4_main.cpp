@@ -1,7 +1,8 @@
 // src/hy4/hy4_main.cpp - maya-hy4: Tencent's Hy4-flash (a GGUF set) on NVIDIA GPUs (CUDA) and AMD GPUs (HIP, Linux).
 //
 //   maya-hy4 --pack <model>/maya-hy4 --serve [--gpus 0,1,...] [--max-context N] [--chunk N] [--eos id,id,...]
-//            [--mtp | --dfly2 [--draft N] [--draft-floor P]] [--vram-experts F] [--cpu-threads N] [--profile F] [--profile-out F]
+//            [--drafting auto|on|off|mtp|dfly2 | --mtp | --dfly2 [--draft N] [--draft-floor P]] [--vram-experts F]
+//            [--cpu-threads N] [--profile F] [--profile-out F]
 //            [--tp N|auto] [--main-gpu I] [--vision on|off] [--kv auto|f16|q8]
 //            [--kv-streaming on|off|auto] [--kv-resident N] [--kv-spill on|off|auto] [--kv-spill-dir D]
 //            [--room-report] [--gpu-fetch off|auto|gpu|lane|K]
@@ -45,10 +46,14 @@
 // --dfly2: the pack's DFly2 drafter instead (a few dense layers over the trunk's own caches: about a quarter of the MTP
 // block's VRAM and nothing added to a prompt's read) - up to --draft tokens (the drafter's own count, 5; its floor 0.8)
 // from one pass, verified and kept by the same rules.  One drafter at a time; one GPU's layout for now.
-// The VRAM plan counts the room of the drafters the pack holds (the larger one's) with drafting on and off alike, so
-// --mtp, --dfly2 and neither keep the same plan and the same answers; a drafter whose room would change more than
-// where experts sit (the cache's rows, the dense prompt span, KV streaming, the GPUs' layout) is not loaded (said);
-// an auto prompt chunk is the one beside that room.
+// The VRAM plan counts the room of the drafter the start loads, none without one (every byte to the routed experts):
+// within a start the drafts on and off (a request's spec) give the same answers; a start with another drafter, or
+// none, plans otherwise and may word an answer differently.  A drafter whose room would change more than where
+// experts sit (the cache's rows, the dense prompt span, KV streaming, the GPUs' layout) is not loaded (said); an auto
+// prompt chunk is the one beside its room.  --drafting auto (the server's): no drafting, the MTP block or the DFly2
+// drafter - whichever this PC decodes fastest, each loaded once with its own plan and timed at the first start (before
+// READY), remembered per PC, GPUs, model and options (HY4_DRAFT_FILE; pick_drafting); on: the faster drafter of the
+// two; off / mtp / dfly2 (--mtp, --dfly2): by hand, not measured.
 //
 // --serve speaks what serve/server.py's StrataEngine expects (maya-mm3's protocol, one conversation): INFO lines, then
 // `READY <context> stop`; per request `GEN <max_new> [key=value ...] <id,id,...>` answered by `PP <read> <total> <ms>
@@ -83,6 +88,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <fstream>
 #include <sstream>
 #include <string>
@@ -841,12 +847,12 @@ int serve(hy4::Model& m, const std::vector<int>& eos, int n_draft, float floor0,
         //  token before it in the caches and reads that one alone too - the same row, the same first logits, so the
         //  same answer as the first time.  A chunk's last row is the prompt path's - other kernels and, with tensor
         //  parallel, other sums than a token's - so the two differ in the last bits and a greedy answer can part.
-        //  Default: tensor parallel; HY4_LAST_ALONE=1 on every layout, 0 on none)
-        static const int last_alone = [] {
+        //  Every layout - one GPU, the layer split, tensor parallel; HY4_LAST_ALONE=0: none)
+        static const bool last_alone = [] {
             const char* e = std::getenv("HY4_LAST_ALONE");
-            return e && *e ? (std::atoi(e) != 0 ? 1 : 0) : -1;
+            return !(e && *e && std::atoi(e) == 0);
         }();
-        const bool alone = r.ids.size() - from > 1 && (last_alone < 0 ? m.tensor_parallel() > 1 : last_alone == 1);
+        const bool alone = r.ids.size() - from > 1 && last_alone;
         const size_t body = alone ? r.ids.size() - 1 : r.ids.size();
         for (size_t a = from; a < r.ids.size();) {
             const int T = (int) std::min<size_t>((size_t) C, (a < body ? body : r.ids.size()) - a);
@@ -1240,6 +1246,370 @@ int encode_alone(const hy4::Options& o, const std::string& rgb_path, const std::
     return 0;
 }
 
+// ---- --drafting auto / on: the drafting this PC runs fastest, measured once and remembered -------------------------
+// Each choice - no drafting (auto only), the MTP block, the DFly2 drafter (one GPU; on more only by hand, --dfly2) -
+// is loaded on its own with its own plan (only the drafter it runs has room: without one the routed experts get all
+// of it) and times a greedy decode: HY4_DRAFT_ROUNDS (3) prompts of HY4_DRAFT_PROMPT (512) tokens from the measured
+// text (HY4_MEASURE_IDS - the server's: this install's docs in the model's tokens), each answered for HY4_DRAFT_TOKENS
+// (192) / rounds tokens as a request is answered (its drafts as served).  The first load reads the text untimed once
+// before (the Engram rows it looks up come from the disk the first time - a cost no later load pays); the others warm
+// up on a short answer.  Each choice in a process of its own (this program again, --draft-trial): a load leaves
+// per-stream scratch behind in the kernels' caches, so loads in one process would plan on VRAM the next one does not
+// have - the start's own load is then the one a later start makes from the remembered choice.  The fastest is kept -
+// within HY4_DRAFT_TIE (2%) of it the one with the least VRAM of its own (none, the DFly2 drafter, the MTP block).
+// Remembered per PC, GPUs, model and start options (hy4::draft_key) in hy4::draft_file (the server's data folder);
+// HY4_DRAFT_MEASURE=1 (maya --speed-calibration) measures again.  No text or no file: not measured - the pack's
+// drafter, the MTP block first.  --drafting on: the faster drafter of the same measurement (none only where neither
+// loads); --mtp / --dfly2 / --drafting off by hand: that one, nothing measured.
+struct DraftArgs {
+    int n_draft;
+    float floor;
+    int n_more;
+    float sure;
+    int need;
+};
+
+void draft_params(const hy4::Model& m, const DraftArgs& a, int& n_draft, float& floor, int& n_more) {
+    n_draft = a.n_draft < 0 ? m.draft_default() : a.n_draft;
+    if (m.has_dfly2()) n_draft = std::min(n_draft, m.draft_max());
+    floor = a.floor < 0 ? (m.has_dfly2() ? 0.8f : 0.55f) : a.floor;
+    n_more = m.has_dfly2() ? 0 : std::min(a.n_more, std::max(0, hy4::k::kMaxWin - 1 - n_draft));
+}
+
+// one answer: the prompt read from position 0, then `gen` greedy tokens - drafted as a request is where a drafter is
+// loaded; the decode's tokens and seconds
+bool trial_answer(hy4::Model& m, const std::vector<int>& p, int gen, const DraftArgs& a, std::vector<float>& lg,
+                  int& made, double& secs, std::string& err) {
+    if (!m.forward(p.data(), (int) p.size(), 0, 1, lg.data(), err)) return false;
+    int n_draft = 0, n_more = 0;
+    float floor = 0.0f;
+    draft_params(m, a, n_draft, floor, n_more);
+    auto top_of = [&](const float* row, int r) {
+        const int t = m.row_top(r);
+        return t >= 0 ? t : argmax(row, m.vocab());
+    };
+    const double t0 = now();
+    int64_t pos = (int64_t) p.size();
+    std::vector<int> out;
+    if (m.has_draft() && n_draft > 0) {
+        std::vector<int> drafts;
+        std::vector<float> confs;
+        Extra extra;
+        extra.n_more = n_more;
+        extra.need = a.need;
+        int tok = top_of(lg.data(), 0);
+        while ((int) out.size() < gen) {
+            out.push_back(tok);
+            if (tok == m.eos() || (int) out.size() >= gen) break;
+            if (!m.draft(tok, pos, std::min(n_draft + extra.now(), gen - (int) out.size()), floor, drafts, confs, err,
+                         n_draft, a.sure))
+                return false;
+            int k = 0;
+            while (k < (int) drafts.size() && confs[(size_t) k] >= floor) ++k;
+            std::vector<int> win(1, tok);
+            win.insert(win.end(), drafts.begin(), drafts.begin() + k);
+            if (!m.forward(win.data(), k + 1, pos, k + 1, lg.data(), err)) return false;
+            pos += 1;
+            int i = 0;
+            for (; i < k; ++i) {
+                if (top_of(lg.data() + (size_t) i * m.vocab(), i) != drafts[(size_t) i]) break;
+                out.push_back(drafts[(size_t) i]);
+                ++pos;
+                if (drafts[(size_t) i] == m.eos() || (int) out.size() >= gen) break;
+            }
+            extra.seen(k, i, n_draft);
+            if (out.back() == m.eos() || (int) out.size() >= gen) break;
+            tok = top_of(lg.data() + (size_t) i * m.vocab(), i);
+        }
+    } else {
+        for (int i = 0; i < gen; ++i) {
+            const int next = top_of(lg.data(), 0);
+            out.push_back(next);
+            if (next == m.eos() || i + 1 >= gen) break;
+            if (!m.forward(&next, 1, pos, 1, lg.data(), err)) return false;
+            ++pos;
+        }
+    }
+    secs = now() - t0;
+    made = (int) out.size();
+    return true;
+}
+
+std::string line_get(const std::string& file, const std::string& key) {
+    std::ifstream f(file);
+    std::string out;
+    for (std::string line; f && std::getline(f, line);) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        const size_t tab = line.rfind('\t');
+        if (tab != std::string::npos && line.compare(0, tab, key) == 0 && tab == key.size()) out = line.substr(tab + 1);
+    }
+    return out;
+}
+
+bool line_put(const std::string& file, const std::string& key, const std::string& vals) {
+    std::string keep;
+    {
+        std::ifstream f(file);
+        for (std::string line; f && std::getline(f, line);) {
+            if (!line.empty() && line.back() == '\r') line.pop_back();
+            const size_t tab = line.rfind('\t');
+            if (line.empty() || (tab == key.size() && line.compare(0, tab, key) == 0)) continue;
+            keep += line + "\n";
+        }
+    }
+    keep += key + "\t" + vals + "\n";
+    const std::string tmp = file + ".new";
+    {
+        std::ofstream f(tmp, std::ios::binary);
+        if (!(f << keep)) return false;
+    }
+    std::remove(file.c_str());   // (Windows: rename does not replace)
+    return std::rename(tmp.c_str(), file.c_str()) == 0;
+}
+
+// the drafters a pack names in its hy4.txt (1 the MTP block, 2 the DFly2 drafter) - before any load
+int pack_has_drafters(const std::string& pack) {
+    std::ifstream f(pack + "/hy4.txt");
+    int bits = 0;
+    for (std::string line; f && std::getline(f, line);) {
+        if (line.rfind("n_mtp ", 0) == 0 && std::atoi(line.c_str() + 6) > 0) bits |= 1;
+        if (line.rfind("dfly_layers ", 0) == 0 && std::atoi(line.c_str() + 12) > 0) bits |= 2;
+    }
+    return bits;
+}
+
+// the measuring text's prompts: HY4_DRAFT_ROUNDS (3) of HY4_DRAFT_PROMPT (512) tokens from its thirds' middles, each
+// answered for HY4_DRAFT_TOKENS (192) / rounds tokens.  false: no text (HY4_MEASURE_IDS) or the context is too short
+struct TrialText {
+    std::vector<std::vector<int>> prompts;
+    int gen = 0;
+    size_t n = 0;
+};
+bool trial_text(const hy4::Options& o, TrialText& tx) {
+    auto envi = [](const char* k, int d) {
+        const char* v = std::getenv(k);
+        return v && *v ? std::max(1, std::atoi(v)) : d;
+    };
+    std::vector<int> text;
+    if (const char* path = std::getenv("HY4_MEASURE_IDS")) {   // (its '#' lines: a comment)
+        std::ifstream f(path);
+        for (std::string line; f && std::getline(f, line);)
+            if (!line.empty() && line[0] != '#')
+                for (int v : parse_ids(line))
+                    if (v >= 0) text.push_back(v);
+    }
+    const int rounds = envi("HY4_DRAFT_ROUNDS", 3), P = envi("HY4_DRAFT_PROMPT", 512);
+    tx.gen = std::max(8, envi("HY4_DRAFT_TOKENS", 192) / rounds);
+    tx.n = text.size();
+    if ((int64_t) text.size() < 4LL * P || o.max_ctx < P + tx.gen + 64) return false;
+    for (int r = 0; r < rounds; ++r) {
+        const size_t at = (size_t) ((double) text.size() * (2 * r + 1) / (2.0 * rounds)) - (size_t) P / 2;
+        tx.prompts.emplace_back(text.begin() + (long) at, text.begin() + (long) at + P);
+    }
+    return true;
+}
+
+// --draft-trial none|mtp|dfly2[:full|:short] (pick_drafting's child): that choice loaded as a start with it plans,
+// the text answered (full: read once untimed first - the first child; short: a 16-token warm-up), and one line
+// "TRIAL <tok/s> <tokens> <experts in VRAM> <experts> <chunk> <load s>" on stdout - 0 tok/s: it does not load beside
+// this start (its room would change it)
+int run_draft_trial(hy4::Options o, const std::string& spec, const DraftArgs& a) {
+    static const char* said[3] = {"no drafting", "the MTP block", "the DFly2 drafter"};
+    const std::string what = spec.substr(0, spec.find(':'));
+    const int c = what == "mtp" ? 1 : what == "dfly2" ? 2 : 0;
+    const bool full = spec.find(":full") != std::string::npos;
+    o.mtp = c == 1;
+    o.dfly2 = c == 2;
+    o.trial = true;
+    TrialText tx;
+    if (!trial_text(o, tx)) {
+        std::printf("TRIAL 0\n");
+        return 0;
+    }
+    const double tl = now();
+    std::string err;
+    hy4::Model t;
+    if (!t.load(o, err)) {
+        std::fprintf(stderr, "maya-hy4: drafting trial: %s does not load beside this start (%s)\n", said[c], err.c_str());
+        std::printf("TRIAL 0\n");
+        return 0;
+    }
+    if (c > 0 && !t.has_draft()) {   // (its room would change the start: the plan leaves it out, said)
+        for (const auto& l : t.info_lines())
+            if (l.find("is not loaded") != std::string::npos)
+                std::fprintf(stderr, "maya-hy4: drafting trial: %s\n", l.c_str() + 5);
+        std::printf("TRIAL 0\n");
+        return 0;
+    }
+    const double ls = now() - tl;
+    std::vector<float> lg((size_t) hy4::k::kMaxWin * t.vocab());
+    const bool pinned = hy4::Model::pin(lg.data(), lg.size() * sizeof(float));
+    int made = 0, n = 0;
+    double secs = 0.0, s = 0.0;
+    bool ok = true;
+    if (full)   // (the text's Engram rows read once, untimed: the disk's first reads are no choice's cost)
+        for (size_t r = 0; ok && r < tx.prompts.size(); ++r) ok = trial_answer(t, tx.prompts[r], tx.gen, a, lg, made, s, err);
+    else
+        ok = trial_answer(t, tx.prompts[0], 16, a, lg, made, s, err);
+    for (size_t r = 0; ok && r < tx.prompts.size(); ++r) {
+        ok = trial_answer(t, tx.prompts[r], tx.gen, a, lg, made, s, err);
+        n += made;
+        secs += s;
+    }
+    if (pinned) hy4::Model::unpin(lg.data());
+    if (!ok) {
+        std::fprintf(stderr, "maya-hy4: drafting trial: %s - %s\n", said[c], err.c_str());
+        std::printf("TRIAL 0\n");
+        return 0;
+    }
+    const double tps = secs > 0 ? n / secs : 0.0;
+    const auto& st = t.stats();
+    std::fprintf(stderr, "maya-hy4: drafting trial: %s %.2f tokens/s (%d tokens; load %.0f s; %d of %d routed experts in "
+                 "VRAM, prompt chunk %d)\n", said[c], tps, n, ls, st.experts_vram, st.experts_all, t.chunk());
+    std::printf("TRIAL %.3f %d %d %d %d %.1f\n", tps, n, st.experts_vram, st.experts_all, t.chunk(), ls);
+    std::fflush(stdout);
+    return 0;
+}
+
+// this program's own path (its trials run it again)
+std::string self_exe(const std::string& argv0) {
+#if defined(_WIN32)
+    char* p = nullptr;
+    if (_get_pgmptr(&p) == 0 && p && *p) return p;
+#else
+    char buf[4096];
+    const ssize_t n = readlink("/proc/self/exe", buf, sizeof buf - 1);
+    if (n > 0) return std::string(buf, (size_t) n);
+#endif
+    return argv0;
+}
+std::string quote(const std::string& s) {
+    std::string q = "\"";
+    for (char ch : s) {
+        if (ch == '"') q += '\\';
+        q += ch;
+    }
+    return q + "\"";
+}
+FILE* open_pipe(const std::string& cmd) {
+#if defined(_WIN32)
+    return _popen(("\"" + cmd + "\"").c_str(), "r");   // (cmd /c drops the outer quotes)
+#else
+    return popen(cmd.c_str(), "r");
+#endif
+}
+void close_pipe(FILE* p) {
+#if defined(_WIN32)
+    _pclose(p);
+#else
+    pclose(p);
+#endif
+}
+
+// how: "auto" or "on".  o.mtp / o.dfly2 set to the choice; child_args: this start's arguments without its drafting
+// and its mode (a trial's)
+bool pick_drafting(hy4::Options& o, const std::string& how, const std::string& argv0,
+                   const std::vector<std::string>& child_args, std::string& err) {
+    (void) err;
+    static const char* id[3] = {"none", "mtp", "dfly2"};
+    static const char* said[3] = {"no drafting", "the MTP block", "the DFly2 drafter"};
+    const double tie = [] {
+        const char* v = std::getenv("HY4_DRAFT_TIE");
+        return v && *v ? std::max(0.0, std::atof(v)) : 0.02;
+    }();
+    const bool on = how == "on";
+    auto choose = [&](const double* tps) {   // (the order of the least VRAM of its own: none, DFly2, the block)
+        static const int order[3] = {0, 2, 1};
+        double best = 0.0;
+        for (int c = on ? 1 : 0; c < 3; ++c) best = std::max(best, tps[c]);
+        if (best <= 0.0) return 0;
+        for (int c : order)
+            if (!(on && c == 0) && tps[c] > 0.0 && tps[c] >= best * (1.0 - tie)) return c;
+        return 0;
+    };
+    auto apply = [&](int c) {
+        o.mtp = c == 1;
+        o.dfly2 = c == 2;
+    };
+    // (the choices: no drafting - not with --drafting on -, the MTP block, the DFly2 drafter on one GPU)
+    const int bits0 = pack_has_drafters(o.pack), ngpu0 = hy4::gpus_of(o);
+    bool cand[3] = {!on, (bits0 & 1) != 0, (bits0 & 2) != 0 && ngpu0 <= 1};
+    const int n_cand = (int) cand[0] + (int) cand[1] + (int) cand[2];
+    if (n_cand <= 1) {   // (nothing to choose between: the one there is)
+        const int c = cand[1] ? 1 : cand[2] ? 2 : 0;
+        apply(c);
+        std::fprintf(stderr, "INFO drafting: %s - the only choice here (--drafting %s)\n", said[c], how.c_str());
+        return true;
+    }
+    const std::string file = hy4::draft_file(o), key = hy4::draft_key(o);
+    const char* again = std::getenv("HY4_DRAFT_MEASURE");
+    if (!file.empty() && !(again && std::atoi(again) != 0)) {
+        const std::string v = line_get(file, key);   // "<none> <mtp> <dfly2> tok/s <date>" (0: not loadable, -1: not
+        double tps[3] = {0, 0, 0};                   //  measured)
+        char date[64] = "";
+        if (!v.empty() && std::sscanf(v.c_str(), "%lf %lf %lf %63s", &tps[0], &tps[1], &tps[2], date) == 4 &&
+            !(cand[0] && tps[0] < 0) && !(cand[1] && tps[1] < 0) && !(cand[2] && tps[2] < 0)) {
+            const int c = choose(tps);
+            apply(c);
+            std::fprintf(stderr, "INFO drafting: %s - the fastest on this PC (measured %s: no drafting %.2f, the MTP "
+                         "block %.2f, the DFly2 drafter %.2f tokens/s - 0: not loadable here; %s)\n", said[c], date,
+                         tps[0], tps[1], tps[2], file.c_str());
+            return true;
+        }
+    }
+    // the text (the server's measuring text): none, or no file to remember the choice in - the pack's drafter
+    TrialText tx;
+    if (file.empty() || !trial_text(o, tx)) {
+        const int c = cand[1] ? 1 : cand[2] ? 2 : 0;
+        apply(c);
+        std::fprintf(stderr, "INFO drafting: %s - not measured (%s); --drafting off|mtp|dfly2 picks by hand\n", said[c],
+                     file.empty() ? "no file to remember it in: HY4_DRAFT_FILE" : "no text to measure it on: HY4_MEASURE_IDS");
+        return true;
+    }
+    const double t0 = now();
+    std::string which;
+    for (int c = 0; c < 3; ++c)
+        if (cand[c]) which += std::string(which.empty() ? "" : ", ") + said[c];
+    std::fprintf(stderr, "maya-hy4: measuring this PC once, before the first answer: drafting (%s: a load and %zu short "
+                 "answers each) - on %zu tokens of text; remembered, the next starts skip it\n", which.c_str(),
+                 tx.prompts.size(), tx.n);
+    std::fflush(stderr);
+    const std::string self = self_exe(argv0);
+    double tps[3] = {-1, -1, -1};
+    bool first = true;
+    for (int c = 0; c < 3; ++c) {
+        if (!cand[c]) continue;
+        std::string cmd = quote(self);
+        for (const std::string& x : child_args) cmd += " " + quote(x);
+        cmd += std::string(" --draft-trial ") + id[c] + (first ? ":full" : ":short");
+        first = false;
+        tps[c] = 0.0;
+        if (FILE* p = open_pipe(cmd)) {   // (its stderr is this one's: its lines in the start's log)
+            char line[512];
+            while (std::fgets(line, sizeof line, p))
+                if (std::strncmp(line, "TRIAL ", 6) == 0) tps[c] = std::max(0.0, std::atof(line + 6));
+            close_pipe(p);
+        } else {
+            std::fprintf(stderr, "maya-hy4: drafting trial: %s - this program could not be started again (%s)\n",
+                         said[c], self.c_str());
+        }
+    }
+    const int c = choose(tps);
+    apply(c);
+    char day[32];
+    const std::time_t tt = std::time(nullptr);
+    std::strftime(day, sizeof day, "%Y-%m-%d", std::localtime(&tt));
+    char vals[160];
+    std::snprintf(vals, sizeof vals, "%.3f %.3f %.3f %s", tps[0], tps[1], tps[2], day);
+    const bool kept = line_put(file, key, vals);
+    std::fprintf(stderr, "maya-hy4: measured this PC once in %.0f s, before the first answer: drafting - %s (no "
+                 "drafting %.2f, the MTP block %.2f, the DFly2 drafter %.2f tokens/s)%s\n", now() - t0, said[c], tps[0],
+                 tps[1], tps[2], kept ? "" : " - not remembered (the file does not open for writing)");
+    std::fprintf(stderr, "INFO drafting: %s - the fastest on this PC (measured now; %s)\n", said[c], file.c_str());
+    (void) id;
+    return true;
+}
+
 int main(int argc, char** argv) {
     hy4::Options o;
     std::string ids_arg, kld;
@@ -1248,6 +1618,7 @@ int main(int argc, char** argv) {
     int trace = 0;
     int bench_layer = -1, bench_n = 16, bench_t = 1;
     std::vector<int> eos;
+    std::string drafting, draft_trial;   // (--drafting; --mtp / --dfly2 by name; --draft-trial: a trial's child)
     int n_draft = -1;   // (the loaded drafter's own: 3 with the MTP block, the DFly2 drafter's count)
     float floor = -1.0f;   // (the loaded drafter's own: 0.55 with the MTP block, 0.8 with the DFly2 drafter)
     int n_more = 1, need = 1;   // (--draft-more / --draft-streak: the MTP block's drafts)
@@ -1299,8 +1670,18 @@ int main(int argc, char** argv) {
         else if (a == "--bench-lane") bench_layer = std::atoi(next().c_str());
         else if (a == "--bench-experts") bench_n = std::atoi(next().c_str());
         else if (a == "--bench-tokens") bench_t = std::atoi(next().c_str());
-        else if (a == "--mtp") o.mtp = true;
-        else if (a == "--dfly2") o.dfly2 = true;
+        else if (a == "--mtp") o.mtp = true, drafting = "mtp";
+        else if (a == "--dfly2") o.dfly2 = true, drafting = "dfly2";
+        else if (a == "--draft-trial") draft_trial = next();   // (pick_drafting's child: run_draft_trial)
+        else if (a == "--drafting") {   // (auto / on: measured once on this PC - pick_drafting; the rest by hand)
+            drafting = next();
+            if (drafting != "auto" && drafting != "on" && drafting != "off" && drafting != "mtp" && drafting != "dfly2") {
+                std::fprintf(stderr, "--drafting: auto, on, off, mtp or dfly2\n");
+                return 2;
+            }
+            o.mtp = drafting == "mtp";
+            o.dfly2 = drafting == "dfly2";
+        }
         else if (a == "--draft") n_draft = std::atoi(next().c_str());
         else if (a == "--draft-floor") floor = (float) std::atof(next().c_str());
         else if (a == "--draft-more") n_more = std::max(0, std::atoi(next().c_str()));
@@ -1368,6 +1749,26 @@ int main(int argc, char** argv) {
     std::string err;
     o.kv_streaming = kv_stream;
     o.kv_resident = kv_stream != 0 ? (kv_res_arg > 0 ? kv_res_arg : 32768) : 0;
+    if (!draft_trial.empty()) return run_draft_trial(o, draft_trial, DraftArgs{n_draft, floor, n_more, sure, need});
+    std::vector<std::string> child_args;   // (a drafting trial's: this start's arguments but its drafting and its mode)
+    {
+        static const char* drop1[] = {"--mtp", "--dfly2", "--serve", "--room-report", "--top", "-v", "--verbose"};
+        static const char* drop2[] = {"--drafting", "--draft-trial", "--ids", "--gen", "--kld", "--kld-topk", "--chunks",
+                                      "--trace", "--images", "--kld-save", "--profile-out"};
+        for (int i = 1; i < argc; ++i) {
+            const std::string x = argv[i];
+            if (std::find(std::begin(drop2), std::end(drop2), x) != std::end(drop2)) {
+                ++i;
+                continue;
+            }
+            if (std::find(std::begin(drop1), std::end(drop1), x) == std::end(drop1)) child_args.push_back(x);
+        }
+    }
+    if ((drafting == "auto" || drafting == "on") && kld.empty() &&
+        !pick_drafting(o, drafting, argv[0], child_args, err)) {
+        std::fprintf(stderr, "maya-hy4: %s\n", err.c_str());
+        return 1;
+    }
     if (!m.load(o, err)) {
         std::fprintf(stderr, "maya-hy4: %s\n", err.c_str());
         return 1;

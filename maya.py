@@ -5313,6 +5313,28 @@ def route_state(log_text: str) -> str | None:
     return "measuring" if "prompt route: measured on this PC" in log_text else None
 
 
+def hy4_engine_drafting(cfg: dict) -> bool:
+    """A Hy4-Flash config whose engine picks its drafting itself (--drafting auto / on): no drafting, the MTP block or
+    the DFly2 drafter, whichever decodes fastest here - each loaded once with its own VRAM plan at the first start on
+    this PC, before it is ready, and remembered in the data folder (hy4-drafting.txt)."""
+    args = [str(x) for x in cfg.get("args") or []]
+    return config_family(cfg) == "hy4" and "--drafting" in args[:-1] and \
+        args[args.index("--drafting") + 1] in ("auto", "on")
+
+
+def draft_forget() -> None:
+    """--speed-calibration: maya-hy4's drafting measured on this PC (data/hy4-drafting.txt) is dropped, so the engine
+    measures it again - in the CPU lane check's run below, else at the next start (before it is ready)."""
+    path = ROOT / "data" / "hy4-drafting.txt"
+    try:
+        path.unlink()
+        ok("drafting (none, the MTP block or the DFly2 drafter, whichever decodes fastest here) is measured again")
+    except FileNotFoundError:
+        pass
+    except OSError as e:
+        warn(f"{path} could not be removed ({e}): delete it by hand to measure the drafting again")
+
+
 def route_forget() -> None:
     """--speed-calibration: maya-hy4's prompt route rates measured on this PC are dropped (data/hy4-prompt-route.txt),
     so the engine measures them again - in the CPU lane check's run below, else at the next start (before it is
@@ -5439,6 +5461,9 @@ def q4x_calibration(cfg_path: Path, why: str = "") -> bool | None:
         except (OSError, ValueError, subprocess.TimeoutExpired):
             p.kill()
     verdict = q4x_verdict(log_path.read_text(encoding="utf-8", errors="replace"))
+    if m := re.search(r"INFO drafting: (.+?) - the fastest on this PC \(measured (now|[0-9-]+)", said()):
+        ok(f"drafting: {m.group(1)} - whichever of no drafting, the MTP block and the DFly2 drafter decodes fastest on "
+           "this PC, each with its own VRAM plan (measured once, remembered: the next starts use it)")
     rs = route_state(said())
     if rs == "measured":
         ok("the prompt route's rates (GPU stream or CPU lane for a prompt's experts outside VRAM) measured on this PC: "
@@ -5473,8 +5498,9 @@ def needs_speed_calibration(cfg: dict) -> bool:
     # (CYBER-FROST: measured at its setup, or --speed-calibration; Hy4-flash: Tencent's Q4_K_M drafts with its MTP block
     #  or not, chosen - its drafts doubled code answers on the GPUs it ran on; a Maya size where the MTP block and the
     #  DFly2 drafter both fit: which of the two, measured once - hy4_both_drafters)
-    if config_family(cfg) == "hy4":
-        return hy4_both_drafters(cfg) and (cfg.get("installer") or {}).get("drafting") == "on" and \
+    if config_family(cfg) == "hy4":                    # (--drafting auto / on: the engine measures at its first start)
+        return hy4_both_drafters(cfg) and not hy4_engine_drafting(cfg) and \
+            (cfg.get("installer") or {}).get("drafting") == "on" and \
             "speed_calibration" not in (cfg.get("installer") or {})
     if config_family(cfg) == "qwen":
         return False
@@ -5502,6 +5528,13 @@ def speed_calibration(cfg_path: Path, why: str = "") -> bool:
     if config_family(cfg) == "hy4":
         route_forget()                                 # (the prompt route's rates: measured again too)
         hot_forget(cfg)                                # (... and the experts a start places in VRAM: learned again)
+        if hy4_engine_drafting(cfg):                   # (--drafting auto / on: the engine's start measures it)
+            draft_forget()
+            inst, env = cfg.setdefault("installer", {}), cfg.get("env") or {}
+            if inst.pop("q4x_calibration", None) is not None and HY4_Q4X_ENV in env:
+                env.pop(HY4_Q4X_ENV, None)
+                cfg_path.write_text(json.dumps(N.env_out(cfg), indent=1), encoding="utf-8")
+            return q4x_calibration(cfg_path, why) is not None
         if hy4_both_drafters(cfg):                     # (a Maya size with both drafters: which is faster here)
             return speed_calibration_hy4(cfg_path, cfg, why)
         if Q.config_key(cfg) == HY4_Q4:                # (Tencent's own Q4_K_M: the one set with the MTP block)
@@ -10035,8 +10068,15 @@ def write_config_hy4(a, pc: dict, meta: dict, pack: Path, ctx: int, models: Path
     # (--tp auto, the engine's default: tensor parallel over the largest group of equal GPUs, the fastest GPU holding
     #  the head and the drafts; the layers split where no group fits.  No --gpus: the server shows the engine only the
     #  config's "gpu" cards, and it takes all it sees)
-    args = ["--pack", str(pack), "--max-context", str(ctx)] + list(fit["args"]) + \
-        ([("--dfly2" if drafter == "dfly2" else "--mtp")] if drafting else [])
+    # (drafting on a Maya size, not by hand: --drafting auto - the engine measures once on this PC whether no drafting,
+    #  the MTP block or the DFly2 drafter decodes fastest, each with its own VRAM plan, and keeps it; --drafting on:
+    #  the faster drafter; mtp / dfly2 by hand, or the opt-in faster drafting's DFly2: that one)
+    how = getattr(a, "drafting", None)
+    if drafting and quant != HY4_Q4 and how not in ("mtp", "dfly2") and not fit.get("fast_drafting"):
+        draft_args = ["--drafting", "on" if how == "on" else "auto"]
+    else:
+        draft_args = [("--dfly2" if drafter == "dfly2" else "--mtp")] if drafting else []
+    args = ["--pack", str(pack), "--max-context", str(ctx)] + list(fit["args"]) + draft_args
     if quant != HY4_Q4 and HY4_PROFILE.exists():
         args += ["--profile", str(HY4_PROFILE)]
     # pictures: on whenever the pack has the vision tower (the engine's default - no flag; a setup again turns them
@@ -10424,6 +10464,13 @@ def set_up_hy4(a, prev: dict) -> Path | None:
         if not drafting:
             ok("drafting: off (--drafting on, or Drafting on the Models page, drafts with the MTP block or the DFly2 "
                "drafter: both are in the pack)")
+        elif how not in ("mtp", "dfly2", "on"):         # (--drafting auto: the engine's own measurement)
+            ok("drafting: auto - Tencent's MTP block and DFly2 drafter both fit here; each drafts tokens the model "
+               "checks, so only tokens the model itself would pick are written. The engine measures once on this PC, "
+               "at its first start (before it is ready), whether no drafting, the MTP block or the DFly2 drafter "
+               "decodes fastest - each with its own VRAM plan, all of it for the experts without drafting - and keeps "
+               f"that one ({ME} --speed-calibration measures again; --setup --drafting off|mtp|dfly2 picks one by "
+               "hand: another plan, so an answer may be worded differently)")
         elif carried:
             ok(f"drafting: {one[drafter]} - the faster of the two on this PC (the speed calibration of "
                f"{cal.get('date', 'before')}; {ME} --speed-calibration measures again)")
@@ -10443,14 +10490,20 @@ def set_up_hy4(a, prev: dict) -> Path | None:
         else:
             what = "the MTP block" if dfly is None else "the DFly2 drafter"
             extra["draft_choice"] = how if how in ("mtp", "dfly2") else "only"
-            if how == "measure":
-                warn(f"nothing to measure for {HY4} here: only {what} fits on this PC, and it drafts (--drafting off: "
-                     "without)")
+            measure_now = how == "measure"                 # (it against no drafting: the engine's start measures it)
             had = inst.get("draft_block") if dfly is None else inst.get("dfly2")
             # (the faster drafting drafts: its 8-bit rows are there for the drafter)
             chose_off = same and had and inst.get("drafting") == "off" and not fit.get("fast_drafting")
             drafting = how != "off" if how else not chose_off
-            if dfly is None:
+            if drafting and how not in ("mtp", "dfly2", "on"):   # (--drafting auto: the engine's own measurement)
+                ok(f"drafting: auto - {what} fits here (it drafts tokens the model checks, so only tokens the model "
+                   "itself would pick are written). The engine measures once on this PC, at its first start (before "
+                   f"it is ready), whether {what} or no drafting decodes faster - each with its own VRAM plan, all of "
+                   f"it for the experts without drafting - and keeps that one ({ME} --speed-calibration measures "
+                   "again; --setup --drafting off|on picks by hand: another plan, so an answer may be worded "
+                   "differently)" + (f" (the MTP block: {mtp_why})" if mtp_why and dfly is not None else
+                                     f" ({dfly_why})" if dfly_why and dfly is None else ""))
+            elif dfly is None:
                 ok("drafting: Tencent's MTP block drafts tokens and the model checks every one - only tokens the "
                    f"model itself would pick are written; about {hy4_mtp_gib(int(fit.get('chunk') or 1024)):.1f} GB "
                    "of the main GPU's VRAM" if drafting else
