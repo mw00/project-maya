@@ -239,8 +239,10 @@ class LoopGuard:
 # hand the client broken JSON.  So a loop whose repeated tokens touch a tool call is never cut and never closes the
 # thinking; a loop inside one call's own text (a line written again and again) only gets the short repetition
 # penalty, once a call.  Outside tool calls nothing changes.
-_TOOL_OPEN = re.compile(r"<tool_call>|<｜DSML｜\s*(?:tool_)?calls[^>]*>")
-_TOOL_CLOSE = re.compile(r"</tool_call>|</｜DSML｜\s*(?:tool_)?calls\s*>")
+# (Inkling 2: a call is its block, <|content_invoke_tool_json|> / _text|> up to the block's <|end_message|> - the tokens'
+#  text as the server reads them, before frontend.InklingRewriter)
+_TOOL_OPEN = re.compile(r"<tool_call>|<｜DSML｜\s*(?:tool_)?calls[^>]*>|<\|content_invoke_tool_(?:json|text)\|>")
+_TOOL_CLOSE = re.compile(r"</tool_call>|</｜DSML｜\s*(?:tool_)?calls\s*>|<\|end_message\|>")
 _TAIL = 48              # the text kept to find a marker split across tokens
 
 

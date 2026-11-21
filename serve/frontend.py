@@ -1328,10 +1328,23 @@ INKLING_EFFORT = ("none", "minimal", "low", "medium", "high", "xhigh", "max")   
 
 def inkling_messages(messages: list[dict]) -> list[dict]:
     """The messages as Inkling 2's template takes them: a tool call's arguments an object (it refuses a JSON string),
-    no None content, a developer message a system one, reasoning as reasoning_content."""
-    out = []
+    no None content, a developer message a system one, reasoning as reasoning_content.  A tool result is headed by its
+    tool's name (<|message_tool|>NAME: the template takes message.name, or the call its tool_call_id answers); the
+    server's messages carry neither, so a result without them is named by its place - the k-th result after an
+    assistant turn answers its k-th call (OpenAI's and Anthropic's order)."""
+    out, calls, k = [], [], 0
     for m in messages:
         m = dict(m)
+        if m.get("role") == "assistant":
+            calls, k = [c for c in m.get("tool_calls") or [] if isinstance(c, dict)], 0
+        elif m.get("role") == "tool":
+            if not m.get("name") and not m.get("tool_call_id") and k < len(calls):
+                fn = calls[k].get("function") if isinstance(calls[k].get("function"), dict) else {}
+                if isinstance(fn.get("name"), str) and fn["name"]:
+                    m["name"] = fn["name"]
+            k += 1
+        else:
+            calls, k = [], 0
         if m.get("content") is None:
             m["content"] = ""
         if m.get("role") == "developer":

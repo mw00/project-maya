@@ -63,6 +63,14 @@ from serve import glm_link  # noqa: E402  GLM on an AMD APU + an NVIDIA card ("m
 ENGINE_VISION = (ds4_vision.Vision, mm3_vision.Vision)   # the engines that run their vision tower themselves
 #                                                          (hy4_vision.Vision is an mm3_vision.Vision)
 HY4_TEXT_ONLY = "Hy4-Flash with its pictures off"         # (no vision tower loaded: the errors' name for it)
+INKLING_TEXT_ONLY = "Inkling-2-Small"                     # (text only: neither of its engines has a vision tower yet)
+
+
+def inkling_text_only(engine) -> str:
+    """Inkling 2's name in the errors about pictures, with the engine that runs it (its INFO engine=: maya-ik2 on
+    NVIDIA, maya-inkling2 on AMD)."""
+    kind = str((getattr(engine, "info", None) or {}).get("engine") or "")
+    return f"{INKLING_TEXT_ONLY} on maya-{kind}" if kind in ("ik2", "inkling2") else INKLING_TEXT_ONLY
 HY4_LANE_FILE = ROOT / "data" / "hy4-cpu-lane.txt"        # (maya-hy4's 4-bit copies' verdict on this PC: child_env)
 # (... and what stands for a picture in a tool result then: the agent's turn goes on)
 HY4_PICTURE_NOTE = "[a picture was here; pictures are off on this server, so it was not read]"
@@ -2183,7 +2191,10 @@ def engine_args(cfg: dict) -> list[str]:
     """The engine's arguments: the config's, and with several GPUs the layer split across them ("layer_split" in the
     config: "auto" by default, or the first layer of each later GPU's share, e.g. "18" or "16,32")."""
     args = list(cfg["args"])
-    if len(gpu_list(cfg)) > 1 and "--layer-split" not in args:
+    # (maya-ik2 - Inkling 2 on CUDA - has no --layer-split and stops at a flag it does not know: its two GPUs are its
+    #  own --gpus 2 with IK2_EP / IK2_TP, as the config has them.  Inkling 2's AMD engine, maya-inkling2, takes it)
+    own_split = Path(str(cfg.get("exe", ""))).name.startswith("maya-ik2")
+    if len(gpu_list(cfg)) > 1 and "--layer-split" not in args and not own_split:
         args += ["--layer-split", str(cfg.get("layer_split") or "auto")]
     # --parallel N: each extra conversation's rings and KV come out of the experts' room, and the prompt path
     # needs its own room there.  On a card the model already fills (Maya-XS leaves ~130 MB) the third
@@ -2631,6 +2642,11 @@ class Service:
                             _special_ids("[e~[") + _special_ids("]~b]") +
                             # Inkling 2 with <|content_model_end_sampling|>
                             _special_ids("<|content_model_end_sampling|>") +
+                            # (... with <|endoftext|> above, llama.cpp's end of generation; and another role's message
+                            #  would start the next turn: the model's own turn is over)
+                            (_special_ids("<|message_user|>") +
+                             _special_ids("<|message_system|>") + _special_ids("<|message_tool|>")
+                             if getattr(template, "inkling", False) else []) +
                             # Hy4-flash with <｜hy_end:..｜> (and would start the next turn with <｜hy_start:..｜>)
                             (_special_ids("<｜hy_end%s｜>" % template.hy4_tag) +
                              _special_ids("<｜hy_start%s｜>" % template.hy4_tag)
@@ -3016,6 +3032,8 @@ class Service:
         tpl = getattr(self, "template", None)
         if getattr(self, "vision", None) is None and getattr(tpl, "hy4", False):
             return HY4_TEXT_ONLY
+        if getattr(self, "vision", None) is None and getattr(tpl, "inkling", False):
+            return inkling_text_only(getattr(self, "engine", None))   # (no vision tower in either engine yet)
         if getattr(self, "vision", None) is None and getattr(tpl, "glm_dsa", False) and not reads_images(tpl.source):
             return glm_dsa_product.LABEL
         return None
@@ -3770,7 +3788,8 @@ class Service:
             keep = self._keep_suffix(tools, kwargs)
             if keep is not None:                     # (+ what the model said before: stops_short's `seen`)
                 given["_blocked"] = {**(given["_blocked"] or {}), "_keep": keep + (loop_guard.said_before(asked),)}
-        if getattr(self.template, "hy4", False) and getattr(self, "vision", None) is None:
+        if (getattr(self.template, "hy4", False) or getattr(self.template, "inkling", False)) and \
+                getattr(self, "vision", None) is None:
             messages = hy4_tool_pictures_noted(messages)   # (a tool result's picture: a text note, not a 400)
         ids = self._as_written(self.render_ids(messages, tools, kwargs, prefill))   # (Qwen3.x: the model's own ids)
         self.embeddings.path = None
@@ -3814,8 +3833,9 @@ class Service:
                                  "the card has room for a picture beside the model), so it cannot read images or "
                                  "videos: send the request without them (describe the picture in text instead)")
             if self.vision is None and getattr(self.template, "inkling", False):
-                # Inkling 2: maya-ik2 has no vision tower yet (the GGUF leaves it out; unsloth's mmproj is not read)
-                raise ValueError("Inkling-2-Small on maya-ik2 reads text only for now, so it cannot read images or "
+                # Inkling 2: its engines (maya-ik2, maya-inkling2) have no vision tower yet (the GGUF leaves it out;
+                # unsloth's mmproj is not read)
+                raise ValueError(f"{inkling_text_only(self.engine)} reads text only for now, so it cannot read images or "
                                  "videos: send the request without them (describe the picture in text instead)")
             if self.vision is None:
                 raise ValueError("this server was started without the vision encoder (run setup again and choose "
@@ -4213,6 +4233,8 @@ class Service:
             call_end = f"</{dsml_token}{tool_calls_block_name}>"
         elif getattr(self.template, "hy4", False):   # (Hy4-flash: the end of its wrapper, after the last call's own)
             call_end = "</tool_calls%s>" % self.template.hy4_tag
+        elif getattr(self.template, "inkling", False):   # (Inkling 2: the end of the call's block - the turn's last)
+            call_end = "<|end_message|>"
         out = {}
         for key, rep in blocked.items():
             call = {"id": "call_loop_guard", "type": "function",
@@ -4255,6 +4277,10 @@ class Service:
         # before a user message - DeepSeek with no tools opens the current thinking with <think> and the earlier one
         # without, so p is not a prefix of f there; f's own copy of the words is the same position in both.)
         tail = f[f.rindex(mark) + len(mark):]
+        if getattr(self.template, "inkling", False) and tail.startswith("<|end_message|>"):
+            # (Inkling 2: the model closes its own block before its turn's end - the token it stops at - so what
+            # follows its words starts after that <|end_message|>)
+            tail = tail[len("<|end_message|>"):]
         if not tail:
             return None
         return (self.tok.encode(tail, parse_special=True), self._opens_thinking(f))
@@ -7151,7 +7177,10 @@ def chat_template_path(tpath) -> Path:
     """The template a model renders with (main): its tokenizer's chat_template.jinja (the pack's copy: MiniMax's and
     DeepSeek's are tools/mm3's and tools/ds4's - DeepSeek's rendered by its pinned encoder, serve/ds41_encoding.py -
     CYBER-FROST's its own, verbatim), a GLM-5 pack's swapped for serve/glm5_chat_template.jinja (MAYA_PACK_TEMPLATE=1
-    keeps the pack's), and serve/chat_template.jinja when the tokenizer has none."""
+    keeps the pack's), and serve/chat_template.jinja when the tokenizer has none.  An Inkling 2 tokenizer that holds
+    the GGUF's template (the llama.cpp conversion's, which differs - a maya-inkling2 pack made before its tool wrote
+    the official one, or a strata_tokenizer.py run without --chat-template): thinkingmachines' own,
+    tools/ik2/chat_template.jinja, the one ChatTemplate.inkling reads (MAYA_PACK_TEMPLATE=1 keeps the pack's)."""
     tpl = Path(tpath) / "chat_template.jinja"
     tpl = tpl if tpl.exists() else ROOT / "serve/chat_template.jinja"
     glm5 = ROOT / "serve/glm5_chat_template.jinja"
@@ -7161,6 +7190,13 @@ def chat_template_path(tpath) -> Path:
         head = tpl.read_text(encoding="utf-8", errors="replace")
         if head.startswith("[gMASK]<sop>") and "reasoning_effort in ['low', 'high']" in head:
             tpl = glm5
+    ik2 = ROOT / "tools/ik2/chat_template.jinja"
+    if ik2.exists() and os.environ.get("MAYA_PACK_TEMPLATE") != "1" and tpl != ik2:
+        head = tpl.read_text(encoding="utf-8", errors="replace")
+        if "<|content_invoke_tool_json|>" in head and "<|message_model|>" in head and "effort_map" not in head:
+            print(f"[maya] Inkling 2: {tpl} is the GGUF's chat template (the llama.cpp conversion's); using "
+                  f"thinkingmachines' own, {ik2}", flush=True)
+            tpl = ik2
     return tpl
 
 

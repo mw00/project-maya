@@ -196,7 +196,7 @@ function closeEditor() {
 
 // the draft as the server takes it: "" -> the default (null), a number typed -> a number
 const NUMS = ["context", "parallel", "reserve_mib", "expert_cache", "prefill", "kv_resident", "tp", "prefill_chunk", "cpu_threads"];
-const DECS = ["reserve_gb", "cache_gb", "dspark_conf"];   // (a decimal: 0.7, 1.5)
+const DECS = ["reserve_gb", "cache_gb", "dspark_conf", "dspark_cum"];   // (a decimal: 0.7, 1.5)
 function toSend(d) {
   const out = {...d};
   for (const k of [...NUMS, ...DECS]) {
@@ -288,11 +288,12 @@ const Num = ({label, value, ph, unit, on}) => html`<span class="mdl-num">
 const Dec = ({label, value, ph, unit, on}) => html`<span class="mdl-num">
   <input class=${`input input--num${decimal(value) ? "" : " is-bad"}`} inputmode="decimal" aria-label=${label} value=${value ?? ""}
     placeholder=${ph} onInput=${(e) => on(e.target.value.replace(",", "."))}/>${unit ? html`<span>${unit}</span>` : null}</span>`;
-// a drafter's confidence floor (DeepSeek's and MiniMax's --dspark-conf), shown while it drafts
-const draftConf = (d, ch, dflt) => (d.draft === "dspark" ? html`<${Row} label="Draft confidence" flag="--dspark-conf" changed=${ch("dspark_conf")}
-  hint=${`A draft is checked only while the drafter's confidence in it is at least this, from 0 to 1. Lower checks more drafts. Empty: the engine's ${dflt}.`}
-  warn=${decimal(d.dspark_conf) && !(+d.dspark_conf > 1) ? null : "A number from 0 to 1, or empty."}>
-  <${Dec} label="Draft confidence" value=${d.dspark_conf} ph=${String(dflt)} on=${(v) => setDraft({dspark_conf: v})}/><//>` : null);
+// a drafter's confidence floor (DeepSeek's and MiniMax's --dspark-conf; Inkling 2's --dspark-cum, the floor on the running
+// product of its drafts' probabilities: key, flag and what), shown while it drafts
+const draftConf = (d, ch, dflt, key = "dspark_conf", flag = "--dspark-conf", what = "the drafter's confidence in it") => (d.draft === "dspark" ? html`<${Row} label="Draft confidence" flag=${flag} changed=${ch(key)}
+  hint=${`A draft is checked only while ${what} is at least this, from 0 to 1. Lower checks more drafts. Empty: the engine's ${dflt}.`}
+  warn=${decimal(d[key]) && !(+d[key] > 1) ? null : "A number from 0 to 1, or empty."}>
+  <${Dec} label="Draft confidence" value=${d[key]} ph=${String(dflt)} on=${(v) => setDraft({[key]: v})}/><//>` : null);
 function Stepper({label, value, min, max, on}) {
   const v = Number(value) || min;
   return html`<span class="mdl-step" role="group" aria-label=${label}>
@@ -367,6 +368,7 @@ function fieldsOf(m, d) {
   if (m.family === "minimax") return mm3Fields(m, d, s, ch, images, gpus);
   if (m.family === "qwen") return qwenFields(m, d, s, ch, gpus);
   if (m.family === "hy4") return hy4Fields(m, d, s, ch, images, gpus);
+  if (m.family === "ik2") return ik2Fields(m, d, ch, gpus, reserve);
   if (glm) {
     const ec = AutoOr({label: "Expert cache", k: "expert_cache", d, dflt: 1200, unit: "experts", subLabel: "Experts in the first GPU's pool"});
     const pf = AutoOr({label: "Prompt chunk", k: "prefill", d, dflt: 8192, unit: "tokens", subLabel: "Tokens a prompt is read in at a time"});
@@ -595,6 +597,39 @@ function hy4Fields(m, d, s, ch, images, gpus) {
       html`<${Row} label="CPU threads" flag="--cpu-threads" changed=${ch("cpu_threads")} hint="The CPU lane's threads, which compute the experts VRAM does not hold. Empty: the engine picks."
         warn=${whole(d.cpu_threads) ? null : "A whole number, or empty."}>
         <${Num} label="CPU threads" value=${d.cpu_threads} ph="auto" unit="threads" on=${(v) => setDraft({cpu_threads: v})}/><//>`]},
+  ];
+}
+
+// Inkling 2 Small's (family "ik2": maya-ik2 on NVIDIA, maya-inkling2 on AMD - text only, one answer at a time; either
+// engine's other flags stay as the config has them).  Its VRAM a context position: maya-inkling2's figures from the
+// server (serve/models.py, the setup's too: m.kv_bytes for all the GPUs' caches, m.kv_gpu_bytes on each GPU, the
+// drafter's m.dspark_kv_bytes while it drafts); maya-ik2's the 8 global layers' K and V rows alone (8 heads x 128 in
+// F16 - the sliding-window layers' rings do not grow with the context).  Drafting: maya-inkling2's DSpark drafter
+// (choices.drafting: the engine has the switch; maya-ik2 has no drafter), m.dspark_gb of the last GPU's VRAM
+const IK2_KV_BYTES = 32768;
+function ik2Fields(m, d, ch, gpus, reserve) {
+  const dspark = m.choices.draft.includes("dspark"), amd = m.choices.drafting;
+  const kvb = (m.kv_bytes || IK2_KV_BYTES) + (m.kv_gpu_bytes || 0) * Math.max(1, d.gpus.length) +
+    (d.draft === "dspark" ? m.dspark_kv_bytes || 0 : 0);
+  return [
+    {label: "Model", rows: [contextRow(m, d, ch, {vram: kvb}, ["gpus", "draft"]),
+      m.choices.drafting ? html`<${Row} label="Drafting" flag="--dspark" changed=${ch("draft")}
+        hint=${dspark ? `DSpark, the model's own drafter, drafts a few tokens at a time for the model to check: the same answers, faster on prose and code.${m.dspark_gb ? ` About ${m.dspark_gb} GB of the last GPU's VRAM.` : ""}`
+          : "No DSpark drafter for this model on this PC: the setup downloads Thinking Machines' drafter and converts it."}>
+        <${Seg} label="Drafting" value=${d.draft} options=${[...(dspark ? [{id: "dspark", label: "DSpark"}] : []), {id: "none", label: "Off"}]}
+          onChange=${(v) => setDraft({draft: v})}/><//>` : null,
+      html`<${Row} label="Images" hint="Inkling 2 Small's engines read text only for now."/>`,
+      html`<${Row} label="Answers at once" hint="Inkling 2 Small answers one request at a time for now."/>`].filter(Boolean)},
+    // (maya-inkling2: DeepSeek's rows for the settings it shares with maya-ds4; maya-ik2 has none of them)
+    {label: "GPUs and memory", rows: amd ? [gpus, reserve] : [gpus]},
+    ...(amd ? [{label: "Speed", rows: [
+      html`<${Row} label="Prompt chunk" flag="--prefill-chunk" changed=${ch("prefill_chunk")} hint="Empty: the engine picks."
+        warn=${whole(d.prefill_chunk) ? null : "A whole number, or empty."}>
+        <${Num} label="Prompt chunk" value=${d.prefill_chunk} ph="auto" unit="tokens" on=${(v) => setDraft({prefill_chunk: v})}/><//>`,
+      html`<${Row} label="CPU threads" flag="--cpu-threads" changed=${ch("cpu_threads")} hint="The CPU lane's threads, which compute the experts VRAM does not hold. Empty: the engine picks."
+        warn=${whole(d.cpu_threads) ? null : "A whole number, or empty."}>
+        <${Num} label="CPU threads" value=${d.cpu_threads} ph="auto" unit="threads" on=${(v) => setDraft({cpu_threads: v})}/><//>`,
+      draftConf(d, ch, 0.5, "dspark_cum", "--dspark-cum", "the running product of the drafter's probabilities")].filter(Boolean)}] : []),
   ];
 }
 

@@ -147,13 +147,16 @@ export const PENALTIES = ["repetition_penalty", "frequency_penalty", "presence_p
 // Hy4-flash (Tencent's template): High, or Off (its no_think) - the only two it is made for
 const THINK_LEVELS = {glm: ["none", "low", "high", "max"], deepseek: ["none", "low", "high", "max"],
                       minimax: ["none", "auto", "low", "medium", "high", "xhigh", "max"], qwen: ["none", "low", "medium", "xhigh"],
-                      hy4: ["none", "high"]};
-const THINK_DEFAULT = {glm: "max", deepseek: "high", minimax: "auto", qwen: "xhigh", hy4: "high"};   // (the run config's level wins: loadHealth)
+                      hy4: ["none", "high"], ik2: ["none", "auto", "low", "medium", "high", "xhigh", "max"]};
+// Inkling 2 Small (Thinking Machines' template, family "ik2"): its effort levels by name - none 0, low 0.2, medium 0.7,
+// high 0.9, xhigh / max 0.99; auto: none named, the template's own default (0.9)
+const THINK_DEFAULT = {glm: "max", deepseek: "high", minimax: "auto", qwen: "xhigh", hy4: "high", ik2: "auto"};   // (the run config's level wins: loadHealth)
 const LEVEL = {none: ["Off", "Answers right away"], auto: ["Auto", "It decides whether to think"], low: ["Low", "A short think"],
                medium: ["Medium", "A moderate think"], high: ["High", "Thinks it through"], xhigh: ["XHigh", "Thinks hard"],
                max: ["Max", "The most thorough, and the longest"]};
 const LEVEL_MINIMAX = {low: "Effort low", medium: "Effort medium", high: "Effort high", xhigh: "Effort extra-high",
                        max: "Effort max, the most thorough"};   // (each: it decides whether to think, at that effort)
+const LEVEL_IK2 = {auto: "The model's own default effort"};   // (Inkling 2: no level named - its template's 0.9)
 export const THINK_TITLES = {
   glm: {none: "No thinking: it answers right away", low: "GLM's Low: a short think", high: "GLM's High: thinks it through",
         max: "GLM's Max: the most thorough, and the longest"},
@@ -165,19 +168,24 @@ export const THINK_TITLES = {
             xhigh: "Effort extra-high: it decides whether to think, and thinks hard",
             max: "Effort max: it decides whether to think - the most thorough, and the longest"},
   hy4: {none: "No thinking: it answers right away (Hy4's no_think)", high: "Hy4's High: thinks it through (its default)"},
+  ik2: {none: "Thinking effort 0: it answers right away", auto: "Inkling's default: thinking effort 0.9",
+        low: "Thinking effort 0.2: a short think", medium: "Thinking effort 0.7",
+        high: "Thinking effort 0.9: thinks it through", xhigh: "Thinking effort 0.99: the most thorough",
+        max: "Thinking effort 0.99: the most thorough"},
   qwen: {none: "No thinking: it answers right away", low: "Reasoning effort low: a short think", medium: "Reasoning effort medium: thinks it through",
          xhigh: "Reasoning effort xhigh (its default): checks its assumptions and alternatives - the most thorough"},
 };
 // the running model's family, its thinking levels (THINKING, LEVELS: live bindings) and their titles
 export const familyOf = (model = S.health.model) =>
   (/deepseek/i.test(model || "") ? "deepseek" : /minimax/i.test(model || "") ? "minimax"
-    : /cyber-frost|qwen/i.test(model || "") ? "qwen" : /hy4/i.test(model || "") ? "hy4" : "glm");
+    : /cyber-frost|qwen/i.test(model || "") ? "qwen" : /hy4/i.test(model || "") ? "hy4"
+    : /inkling/i.test(model || "") ? "ik2" : "glm");
 export let THINKING = THINK_LEVELS.glm;
 export let LEVELS = [];
 export function setFamily(model) {
   const f = familyOf(model);
   THINKING = THINK_LEVELS[f];
-  LEVELS = THINKING.map((id) => ({id, name: LEVEL[id][0], desc: (f === "minimax" && LEVEL_MINIMAX[id]) || LEVEL[id][1]}));
+  LEVELS = THINKING.map((id) => ({id, name: LEVEL[id][0], desc: (f === "minimax" && LEVEL_MINIMAX[id]) || (f === "ik2" && LEVEL_IK2[id]) || LEVEL[id][1]}));
   DEFAULTS.thinking = THINK_DEFAULT[f];
   return f;
 }
@@ -222,7 +230,8 @@ function ownKeyOnce(key) {
   return key;
 }
 export const prefsKey = () => ownKeyOnce(isGlm53() ? GLM53_KEY
-  : {deepseek: "sampling_deepseek", minimax: "sampling_minimax", qwen: "sampling_qwen", hy4: "sampling_hy4"}[familyOf()] || "sampling");
+  : {deepseek: "sampling_deepseek", minimax: "sampling_minimax", qwen: "sampling_qwen", hy4: "sampling_hy4",
+     ik2: "sampling_ik2"}[familyOf()] || "sampling");
 export let P = null;                     // the running model's chat settings: its defaults, then its user's own choices
 // stored: only what the user chose (a preset, a slider, a level) - the model's own defaults fill the rest, so they apply
 // until its user picks something.  Before (prefs_v 3) a change saved every value as it was then, the defaults too:
