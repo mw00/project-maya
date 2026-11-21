@@ -1,14 +1,29 @@
-# Experimental opt-in KDA layer graphs
+# KDA layer graphs (GLM-5.3-Flash decode)
 
-`MAYA_GLM_KDA_GRAPH=1` captures the recurrent layers of GLM decode. Default is
-the ordinary direct path. The DSA layers' attention stays direct, and their
-FFN side is captured too when `MAYA_GLM_DSA_FFN_GRAPH` is on (the default
-since v1.1.52 - see `MAYA_GLM_DSA_FFN_GRAPH` in SETTINGS.md). Speculative
-passes (the spec gate), profiling, dumps, prefetch and lookahead bypass
-capture. Expert selection, weights, quantization and kernel arithmetic are
-unchanged; graph replay explicitly accounts for MoE requests and
-residual-buffer swaps. CPU-plan/buffer-key changes invalidate the
-corresponding captured graph. Graphs are destroyed before their buffers.
+`MAYA_GLM_KDA_GRAPH` captures the recurrent layers of GLM-5.3-Flash's decode as
+CUDA graphs and replays them token after token. Since v1.1.72 it is on by
+default in NVIDIA builds (`0` turns it off; AMD builds keep direct launches
+unless it is `1`; `MAYA_GLM_DEFER_CPU` keeps direct launches). The DSA layers'
+attention stays direct, and their FFN side is captured too when
+`MAYA_GLM_DSA_FFN_GRAPH` is on (its default). Speculative passes (the spec
+gate), profiling, dumps, prefetch, lookahead, the DFlash2 drafter and a
+request's `graphs=0` bypass capture. Expert selection, weights, quantization
+and kernel arithmetic are unchanged; graph replay explicitly accounts for MoE
+requests and residual-buffer swaps. CPU-plan/buffer-key changes (and a
+request's `promote_min` / `miss_skip_*`) select their own captured graph. A
+capture that fails falls back to direct launches for the engine's life.
+Graphs are destroyed before their buffers.
+
+## Checks for the default (v1.1.72)
+
+- `tests/glm_pack_graph_test` on GLM-5.3-Flash Maya-S v2, one Tesla V100: PASS, 192
+  full-vocabulary logit rows identical bit for bit with and without graphs (snapshots, reset), and 48
+  steps across CPU-plan changes finite.
+- Greedy answers (three prompts, `MAYA_GLM_REPEATABLE=1 MAYA_GLM_PREFILL_STABLE=1`, CPU lane off on the
+  V100): the same tokens with graphs on and off, on the V100 (CUDA) and on a Radeon 8065S (HIP, `1`).
+- Decode, default settings: +1% on one V100 that computes most of its RAM-tier experts on the CPU; no
+  change on the Radeon 8065S, whose one-GPU MTP decode runs its verify windows without the graphs - AMD
+  builds keep direct launches by default. #795 measured +8-9% on 3x V100 + RTX 3060.
 
 ## Measured thinking-Max screens (v1.0.21)
 
