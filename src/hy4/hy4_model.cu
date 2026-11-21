@@ -8379,7 +8379,8 @@ bool Model::load(const Options& o, std::string& err) {
     // docs in the model's tokens).  First the copies: a prompt chunk and 64 tokens one at a time give the routing
     // counts they are made by, the lane is left idle until the builder has been through them (and the placer is done),
     // then the text goes on a token at a time until the timed turns decide.  Then the route, looked up again by the
-    // key it has now: not in the file, the text read on in chunks of the prompt's size until its windows agree.  Then
+    // key it has now: not in the file, the text read on in chunks of the prompt's size (tensor parallel with the lane: of the
+    // size the chunks that choose have - shorter than kTpStream) until its windows agree.  Then
     // the state as loaded (no tokens, the counts and the stats as they were, HY4_HOT's scores untouched - its routes
     // not counted, kept copies given back and made again from the answers) and both remembered as before, so the starts after find them and skip this; a first answer then
     // reads its prompt by the rates later starts use, the same tokens as theirs.  Only where the result is remembered
@@ -8436,12 +8437,18 @@ bool Model::load(const Options& o, std::string& err) {
         const long long K = 40LL * x.g.n_layer;   // (q4x_trial's window: calls a side)
         const int q_tokens =
             (int) std::min<long long>(4096, (long long) Impl::kQ4xWindows * (2 * K / std::max(1, n_pl) + 2) + 64);
-        const int r_chunks = Impl::kRouteWindows + 2;
+        // (the route's chunks: the prompt's size - under tensor parallel with the lane, a chunk of kTpStream rows or
+        //  more has every member stream its share and takes no route, so the chunks that choose are shorter: the
+        //  longest of them, more of them - a window is a chunk or two)
+        bool tp_share = false;
+        for (const Layer& l : x.lane_layers()) tp_share |= l.partial() && l.tpm >= 0 && !l.stream_e.empty();
+        const int Rc = tp_share ? std::min(Tc, Impl::kTpStream - 1) : Tc;
+        const int r_chunks = (Rc < Tc ? 4 : 1) * (Impl::kRouteWindows + 2);
         std::string plan;
         if (want_q) plan = " the CPU lane's 4-bit expert copies (a decode of up to " + std::to_string(q_tokens) + " tokens)";
         if (want_r)
             plan += std::string(want_q ? ", then" : "") + " the prompt route (up to " + std::to_string(r_chunks) +
-                    " chunks of " + std::to_string(Tc) + " tokens)";
+                    " chunks of " + std::to_string(Rc) + " tokens)";
         std::fprintf(stderr, "maya-hy4: measuring this PC once, before the first answer:%s - on %zu tokens of text, %.0f s "
                      "at most; remembered, the next starts skip it\n", plan.c_str(), text.size(), cap_s);
         const Stats keep = x.st;
@@ -8525,7 +8532,7 @@ bool Model::load(const Options& o, std::string& err) {
             if (x.placing.load()) wait_s += nap(cap_s, [&] { return !x.placing.load(); });
             restart();
             pos = 0;
-            for (int c = 0; ok && x.route.mode == 0 && c < r_chunks && clk() - t0 < cap_s; ++c) ok = feed(Tc);
+            for (int c = 0; ok && x.route.mode == 0 && c < r_chunks && clk() - t0 < cap_s; ++c) ok = feed(Rc);
             r_s = clk() - tr;
             if (x.route.mode == 1) {
                 const Impl::Route measured = x.route;
