@@ -137,6 +137,13 @@ struct LoopGate {
 void loop_gates(const LoopGate* gates, int n, int T, int C, int R, float eps, float* sc, cudaStream_t s);
 void loop_gate(const float* x, const float* m, const float* D, const float* F, const float* G, int T, int C, int R,
                float eps, float* sc, float* y, cudaStream_t s);
+/// The same gate over a chunk of tokens with its products taken as matrix products by the caller (loop_gates'
+/// kernels are a token's): loop_gate_mix gives g [T][R] = a1 / rms(x) + a2 / rms(m) of a1 = x D_x^T, a2 = m D_m^T
+/// ([T][R]); loop_gate_blend y = (1 - tanh f) x + tanh(gn) m of f = g F, gn = g G ([T][C]; n = T C; y may be x).
+void loop_gate_mix(const float* x, const float* m, const float* a1, const float* a2, int T, int C, int R, float eps,
+                   float* g, cudaStream_t s);
+void loop_gate_blend(const float* x, const float* m, const float* f, const float* gn, size_t n, float* y,
+                     cudaStream_t s);
 
 // ---- the token path: the experts straight from their blocks, the attention of one query
 

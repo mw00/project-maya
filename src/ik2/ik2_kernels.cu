@@ -1784,6 +1784,33 @@ __global__ void loop_gate_apply_kernel(LoopGateArgs a, int T, int C, int R, floa
     const size_t i = (size_t) t * C + c;
     a.y[j][i] = (1.0f - tanhf(f)) * a.x[j][i] + tanhf(gn) * a.m[j][i];
 }
+// The gates of a chunk of tokens: their two products (g = D [rms(x); rms(m)], then F g and G g) are matrix products
+// taken outside, and these are what is left.  (1) g [T][R] = a1 / rms(x) + a2 / rms(m), a1 = x D_x^T and
+// a2 = m D_m^T; a block a token.
+__global__ void loop_gate_mix_kernel(const float* __restrict__ x, const float* __restrict__ m,
+                                     const float* __restrict__ a1, const float* __restrict__ a2, int C, int R, float eps,
+                                     float* __restrict__ g) {
+    __shared__ float sh[kBlk];
+    const int t = blockIdx.x, tid = threadIdx.x;
+    const float* xr = x + (size_t) t * C;
+    const float* mr = m + (size_t) t * C;
+    float sx = 0.0f, sm = 0.0f;
+    for (int c = tid; c < C; c += kBlk) {
+        const float xv = xr[c], mv = mr[c];
+        sx += xv * xv, sm += mv * mv;
+    }
+    sx = bsum(sx, sh), sm = bsum(sm, sh);
+    if (tid < R) {
+        const float rx = rsqrtf(sx / (float) C + eps), rm = rsqrtf(sm / (float) C + eps);
+        g[(size_t) t * R + tid] = rx * a1[(size_t) t * R + tid] + rm * a2[(size_t) t * R + tid];
+    }
+}
+// (2) y = (1 - tanh f) x + tanh(gn) m, f = g F and gn = g G; y may be x
+__global__ void loop_gate_blend_kernel(const float* x, const float* m, const float* __restrict__ f,
+                                       const float* __restrict__ gn, size_t n, float* y) {
+    const size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) y[i] = (1.0f - tanhf(f[i])) * x[i] + tanhf(gn[i]) * m[i];
+}
 
 // ---- the decodes: value v of a run of blocks, ggml's dequantize_row_* arithmetic
 
@@ -4025,6 +4052,22 @@ void loop_gate(const float* x, const float* m, const float* D, const float* F, c
                float eps, float* sc, float* y, cudaStream_t s) {
     const LoopGate g{x, m, D, F, G, y};
     loop_gates(&g, 1, T, C, R, eps, sc, s);
+}
+void loop_gate_mix(const float* x, const float* m, const float* a1, const float* a2, int T, int C, int R, float eps,
+                   float* g, cudaStream_t s) {
+    if (T <= 0) return;
+    if (R > kBlk) {
+        std::fprintf(stderr, "ik2::k::loop_gate_mix: rank %d\n", R);
+        std::abort();
+    }
+    loop_gate_mix_kernel<<<(unsigned) T, kBlk, 0, s>>>(x, m, a1, a2, C, R, eps, g);
+    check("loop_gate_mix");
+}
+void loop_gate_blend(const float* x, const float* m, const float* f, const float* gn, size_t n, float* y,
+                     cudaStream_t s) {
+    if (!n) return;
+    loop_gate_blend_kernel<<<grid(n), kBlk, 0, s>>>(x, m, f, gn, n, y);
+    check("loop_gate_blend");
 }
 
 void conv_hist_after(const float* old, const float* x, int T, int C, float* hist, cudaStream_t s) {
