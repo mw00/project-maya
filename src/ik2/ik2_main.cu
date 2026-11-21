@@ -3558,6 +3558,51 @@ void embed_row(Model& M, int t, float* raw, float* out) {
 
 }  // namespace
 
+// The Inkling 2 preview: Linux, one NVIDIA GPU of 24 GB, Ampere (sm_80) or newer.  Outside it the engine stops with one
+// line saying why; IK2_UNSUPPORTED=1 runs it anyway where it can run at all (two GPUs, smaller cards with the experts
+// streamed from RAM, Windows: untested).
+void check_preview(int n_gpu, bool serve) {
+    auto refuse = [&](const std::string& m) {   // (--serve: the server prints a NOTE line)
+        if (serve) std::printf("NOTE maya-ik2: %s\n", m.c_str()), std::fflush(stdout);
+        die(m);
+    };
+    const bool force = getenv("IK2_UNSUPPORTED") && std::atoi(getenv("IK2_UNSUPPORTED"));
+    const std::string run_anyway = " (IK2_UNSUPPORTED=1 runs it anyway, untested)";
+#ifdef _WIN32
+    if (!force) refuse("the Inkling 2 preview runs on Linux, Windows is outside it" + run_anyway);
+#endif
+    int nd = 0;
+    const cudaError_t e = cudaGetDeviceCount(&nd);
+    if (e != cudaSuccess || nd < 1)
+        refuse(std::string("no NVIDIA GPU visible (") + (e != cudaSuccess ? cudaGetErrorString(e) : "0 devices") +
+            "): the Inkling 2 preview runs on one NVIDIA GPU");
+    if (n_gpu < 1 || n_gpu > 2) refuse("--gpus " + std::to_string(n_gpu) + ": the Inkling 2 preview runs on one GPU");
+    if (n_gpu == 2 && !force)
+        refuse("--gpus 2: the Inkling 2 preview runs on one GPU, two (IK2_EP=1 or IK2_TP=1) are outside it" + run_anyway);
+    for (int d = 0; d < std::min(n_gpu, nd); ++d) {
+        cudaDeviceProp p{};
+        CU(cudaGetDeviceProperties(&p, d));
+        const std::string gpu = "GPU " + std::to_string(d) + " (" + p.name + ", sm_" + std::to_string(p.major) +
+                                std::to_string(p.minor) + ")";
+        if (p.major < 8) refuse(gpu + " is too old: maya-ik2 needs an NVIDIA GPU of sm_80 (Ampere) or newer");
+        CU(cudaSetDevice(d));
+#ifndef STRATA_USE_HIP   // (a kernel of this build for the GPU: none when its arch is not in the list)
+        cudaFuncAttributes fa{};
+        if (cudaFuncGetAttributes(&fa, unpack_segments_kernel) != cudaSuccess) {
+            (void) cudaGetLastError();
+            refuse("this build has no kernels for " + gpu + ": add " + std::to_string(p.major) + std::to_string(p.minor) +
+                " to CMAKE_CUDA_ARCHITECTURES and rebuild");
+        }
+#endif
+        if (p.totalGlobalMem < (22ull << 30) && !force) {
+            char m[64];
+            std::snprintf(m, sizeof m, "%.1f GB", (double) p.totalGlobalMem / 1e9);
+            refuse(gpu + " has " + m + ", the Inkling 2 preview needs a 24 GB card" + run_anyway);
+        }
+    }
+    CU(cudaSetDevice(0));
+}
+
 int main(int argc, char** argv) {
     std::string model, toks, dump, draft_path;
     int gen = 16, chunk = 2048, ctx = 262144, threads = 8, n_gpu = 1;
@@ -3628,6 +3673,7 @@ int main(int argc, char** argv) {
         while (*p && *p != ',') ++p;
         if (*p == ',') ++p;
     }
+    check_preview(n_gpu, serve);
     const double t_start = now();
     Shards S(model);
     Model M;
