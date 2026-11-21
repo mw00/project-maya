@@ -554,11 +554,10 @@ function qwenFields(m, d, s, ch, gpus) {
 
 // Inkling-2-Mini's (maya-ik2, an experimental preview: it stops at a flag it does not know, so only its own are offered).
 // Its cache's VRAM a context token: the 8 visits of the layers without a window, by its format (m.ik2_kv_bytes, the
-// setup's figures); m.ik2_fit: whether each context keeps every expert in VRAM on its card, and the drafter beside them
+// setup's figures); m.ik2_fit: whether each context keeps every expert in VRAM on its card (no drafting in the preview)
 function ik2Fields(m, d, ch) {
   const kvb = (m.ik2_kv_bytes || {})[d.kv] || 16384;
   const fit = ((m.ik2_fit || {})[d.kv] || {})[String(d.context)];
-  const drafter = m.choices.draft.includes("dspark");
   const gpu = html`<${Row} label="GPU" flag="gpu" changed=${ch("gpus")} hint="Inkling 2 Mini runs on one GPU for now: the whole model sits on it (24 GB or more)."
     below=${html`<div class="mdl-gpus" role="radiogroup" aria-label="GPU">${(MS.data.gpus || []).map((g) => {
       const on = d.gpus.length === 1 && d.gpus[0] === g.index;
@@ -568,14 +567,9 @@ function ik2Fields(m, d, ch) {
     })}</div>`}/>`;
   return [
     {label: "Model", rows: [
-      contextRow(m, d, ch, {vram: kvb}, ["kv", "draft"],
+      contextRow(m, d, ch, {vram: kvb}, ["kv"],
         fit && !fit.resident ? "At this size the model and its cache do not all fit on the card: the engine runs its slower path." : null),
-      html`<${Row} label="Drafting" flag="--draft" changed=${ch("draft")}
-        warn=${fit && fit.resident && d.draft === "dspark" && !fit.drafting ? "No room for the drafter beside the model at this context size: a smaller context leaves room." : null}
-        hint=${drafter ? "The model's own drafter (under 1 GB of VRAM) proposes a few tokens for the model to check in one pass: the same answers, faster on code and edits - the engine drafts only where it pays. Off decodes token by token."
-          : "This model's folder has no drafter (the setup downloads it)."}>
-        <${Seg} label="Drafting" value=${d.draft} options=${[...(drafter ? [{id: "dspark", label: "On"}] : []), {id: "none", label: "Off"}]}
-          onChange=${(v) => setDraft({draft: v})}/><//>`,
+      html`<${Row} label="Drafting" hint="Not offered in this preview: Inkling 2 Mini decodes without drafting for now."/>`,
       html`<${Row} label="Images" hint="Coming soon: Inkling 2 Mini reads text only for now."/>`,
       html`<${Row} label="Answers at once" hint="Coming soon: Inkling 2 Mini answers one request at a time for now."/>`]},
     {label: "GPU and memory", rows: [gpu,

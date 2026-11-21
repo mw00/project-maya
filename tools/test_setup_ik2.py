@@ -95,19 +95,18 @@ class Manifest(unittest.TestCase):
         for name, (size, sha) in man["files"].items():
             self.assertGreater(size, 100 << 20, name)
             self.assertRegex(sha, r"^[0-9a-f]{64}$", name)
-        src = man["sources"][man["draft"]]
-        self.assertEqual(src["repo"], "thinkingmachines/Inkling-2-Mini")
-        self.assertRegex(src["revision"], r"^[0-9a-f]{40}$")
+        self.assertEqual(list(man["files"]), [man["gguf"]])                  # (no drafter in the preview)
+        self.assertEqual(man["files"][man["gguf"]][1],
+                         "e62d463c135ffe283df8d94b279a96ca145ac128b52ce854478613045bf4de15")   # (the author's)
+        self.assertNotIn("draft", man)
 
     def test_entry_and_urls(self):
         m = maya.ik2_entry()
-        self.assertAlmostEqual(m["download_gb"], 18.27, places=1)
-        gguf, draft = maya.file_url(m, m["gguf"]), maya.file_url(m, m["draft"])
+        self.assertAlmostEqual(m["download_gb"], 17.63, places=1)
+        gguf = maya.file_url(m, m["gguf"])
         self.assertTrue(gguf.startswith("https://huggingface.co/unsloth/Inkling-2-Mini-GGUF/resolve/"), gguf)
         self.assertTrue(gguf.endswith("/Inkling-2-Mini-UD-Q4_K_XL.gguf"), gguf)
         self.assertNotIn("Mainline_Support", gguf)
-        self.assertTrue(draft.startswith("https://huggingface.co/thinkingmachines/Inkling-2-Mini/resolve/"), draft)
-        self.assertTrue(draft.endswith("/mtp.safetensors"), draft)
 
 
 class Refusals(unittest.TestCase):
@@ -167,20 +166,19 @@ class Refusals(unittest.TestCase):
 
 class Fit(unittest.TestCase):
     def test_a_24_gb_card(self):
-        """The contributor's figures on an RTX 3090: 262,144 with an FP8 cache and every expert in VRAM; the drafter
-        beside them sees the last 65,536 tokens (IK2_DRAFT_CTX), as docs/INKLING2.md says it fits."""
+        """The contributor's figures on an RTX 3090: 262,144 with an FP8 cache and every expert in VRAM, as
+        docs/INKLING2.md says it fits."""
         self.assertEqual(F.recommended_context(24.0), 262144)
         p = F.plan(24.0, 262144)
-        self.assertEqual((p["resident"], p["drafting"], p["draft_ctx"]), (True, True, 65536))
+        self.assertTrue(p["resident"])
         self.assertLessEqual(p["need_gib"], 24.0 - F.MARGIN_GIB)
-        self.assertEqual(F.plan(24.0, 131072)["draft_ctx"], None)    # (its whole context at 128K)
         self.assertFalse(F.plan(24.0, 262144, "f16")["resident"])   # (F16: twice the cache - the slower path)
         self.assertEqual(F.recommended_context(24.0, "f16"), 131072)
 
     def test_scales_with_the_card(self):
-        self.assertEqual(F.plan(32.0, 262144)["draft_ctx"], None)    # (an RTX 5090: the drafter's whole context)
+        self.assertTrue(F.plan(32.0, 262144, "f16")["resident"])     # (an RTX 5090: F16 at 256K too)
         self.assertEqual(F.plan(0, 262144)["resident"], True)          # (VRAM not read: the engine measures)
-        self.assertFalse(F.plan(24.0, 262144, drafting=False)["drafting"])
+        self.assertEqual(F.recommended_context(8.0), F.CONTEXTS[0])    # (nothing resident: the smallest)
 
 
 class Picker(unittest.TestCase):
@@ -212,13 +210,12 @@ class Steps(unittest.TestCase):
     def files(self):
         d = self.root / "models" / maya.IK2
         d.mkdir(parents=True)
-        gguf, draft = d / "Inkling-2-Mini-UD-Q4_K_XL.gguf", d / "mtp.safetensors"
+        gguf = d / "Inkling-2-Mini-UD-Q4_K_XL.gguf"
         gguf.write_bytes(b"GGUF" + b"\0" * 60)
-        draft.write_bytes(b"\0" * 32)
-        return d, gguf, draft
+        return d, gguf
 
     def test_tokenizer_with_its_own_template(self):
-        d, gguf, draft = self.files()
+        d, gguf = self.files()
         seen = []
 
         def run(cmd, check=True, **kw):
@@ -235,43 +232,41 @@ class Steps(unittest.TestCase):
             self.assertEqual(cmd[cmd.index("--chat-template") + 1], str(maya.IK2_TEMPLATE))
             self.assertIn("--check", cmd)
             rec = json.loads((d / "maya-ik2" / "sources.json").read_text(encoding="utf-8"))
-            self.assertEqual([f["name"] for f in rec["files"]], [gguf.name, draft.name])
+            self.assertEqual([f["name"] for f in rec["files"]], [gguf.name])
             maya.ik2_tokenizer_step(args(), d, gguf)              # (the same tools and GGUF: not exported again)
             self.assertEqual(len(seen), 1)
 
     def test_the_config(self):
-        d, gguf, draft = self.files()
+        d, gguf = self.files()
         tok = d / "maya-ik2" / "tokenizer"
         tok.mkdir(parents=True)
         (tok / "vocab.json").write_text("{}", encoding="utf-8")
         pc = {"gpus": [card(24, 1)], "backend": "cuda"}
-        fit = F.plan(24.0, 262144)
         with patch.object(maya, "ROOT", self.root), \
                 patch.object(maya, "write_run_script", lambda p, port: p.with_name("run-" + p.stem + ".sh")):
-            path = maya.write_config_ik2(args(), pc, {}, gguf, draft, tok, 262144, fit, self.root / "models", d)
+            path = maya.write_config_ik2(args(), pc, {}, gguf, tok, 262144, self.root / "models", d)
         cfg = json.loads(path.read_text(encoding="utf-8"))
         self.assertEqual(path.name, "maya-inkling-2-mini.json")
         self.assertEqual(cfg["exe"], str(maya.IK2_EXE))
-        self.assertEqual(cfg["args"], ["--model", str(gguf), "--max-context", "262144", "--draft", str(draft)])
-        self.assertEqual(cfg["env"], {"IK2_KV": "fp8", "IK2_DRAFT_CTX": "65536"})
+        self.assertEqual(cfg["args"], ["--model", str(gguf), "--max-context", "262144"])   # (no drafter)
+        self.assertEqual(cfg["env"], {"IK2_KV": "fp8"})
         self.assertEqual((cfg["sampling"], cfg["reasoning_effort"]), ({"temperature": 1.0, "top_p": 1.0}, "high"))
         self.assertEqual((cfg["model_name"], cfg["gpu"], cfg["tokenizer"]), ("inkling-2-mini", [1], str(tok)))
         inst = cfg["installer"]
         self.assertEqual((inst["family"], inst["ik2_quant"], inst["experimental"]), ("ik2", Q.IK2_QUANT, True))
         self.assertEqual((Q.family_of(cfg), Q.model_key(cfg)), ("ik2", "ik2-mini"))
-        # (drafting off, a smaller context: no --draft, no drafter cap; the user's own variable kept)
+        # (a smaller context; the user's own variable kept)
         cfg["env"]["MY_VAR"] = "1"
         path.write_text(json.dumps(cfg), encoding="utf-8")
         with patch.object(maya, "ROOT", self.root), \
                 patch.object(maya, "write_run_script", lambda p, port: p.with_name("run-" + p.stem + ".sh")):
-            maya.write_config_ik2(args(), pc, {}, gguf, None, tok, 65536, F.plan(24.0, 65536, drafting=False),
-                                  self.root / "models", d)
+            maya.write_config_ik2(args(), pc, {}, gguf, tok, 65536, self.root / "models", d)
         cfg = json.loads(path.read_text(encoding="utf-8"))
         self.assertEqual(cfg["args"], ["--model", str(gguf), "--max-context", "65536"])
         self.assertEqual(cfg["env"], {"IK2_KV": "fp8", "MY_VAR": "1"})
 
     def test_a_start_of_it(self):
-        d, gguf, draft = self.files()
+        d, gguf = self.files()
         exe = self.root / "maya-ik2"
         exe.touch()
         tok = d / "maya-ik2" / "tokenizer"
@@ -279,7 +274,7 @@ class Steps(unittest.TestCase):
         (tok / "vocab.json").write_text("{}", encoding="utf-8")
         cfg = {"exe": str(exe), "tokenizer": str(tok), "gpu": [0], "model_name": "inkling-2-mini",
                "installer": {"family": "ik2", "ik2_quant": Q.IK2_QUANT},
-               "args": ["--model", str(gguf), "--max-context", "65536", "--draft", str(draft)]}
+               "args": ["--model", str(gguf), "--max-context", "65536"]}
         path = self.root / "maya-inkling-2-mini.json"
         path.write_text(json.dumps(cfg), encoding="utf-8")
         a = SimpleNamespace(parallel=None, port=None, host=None, api_key=None, gpus=None, gpu=None, yes=True)
@@ -307,7 +302,7 @@ class Steps(unittest.TestCase):
                                    "<|message_model|><|content_text|>"), p[-120:])
 
     def test_nothing_to_tune_and_no_calibration(self):
-        cfg = {"exe": "/b/maya-ik2", "args": ["--model", "/m/x.gguf", "--draft", "/m/mtp.safetensors"],
+        cfg = {"exe": "/b/maya-ik2", "args": ["--model", "/m/x.gguf"],
                "installer": {"family": "ik2"}}
         self.assertFalse(maya.needs_speed_calibration(cfg))
         path = self.root / "maya-inkling-2-mini.json"

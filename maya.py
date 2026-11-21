@@ -869,11 +869,11 @@ HY4_CHUNK_UP_GIB = 0.95
 # Inkling-2-Mini (an EXPERIMENTAL PREVIEW, PR #1095): thinkingmachines' looped 26B on its own engine maya-ik2 (src/ik2,
 # docs/INKLING2.md section 8) - NVIDIA only, Linux only, one GPU of 24 GB or more, RTX 30 / A100 and newer (the
 # engine's kernels: mma.sync m16n8k16, cp.async); every expert in VRAM (the resident token path), text only for now.
-# Its files: unsloth's UD-Q4_K_XL (Unsloth's looped layout, which the engine reads) and thinkingmachines' own drafter
-# (mtp.safetensors: the engine drafts only where it pays) - tools/ik2/download.json, pinned by size and sha256.  What
-# fits on the card (the context, the drafter's room): tools/ik2_fit.py, shared with the Models page.  Its defaults:
-# maya_quants.MODEL_DEFAULTS["ik2-mini"] (its author's values); thinkingmachines' chat template
-# (tools/ik2/chat_template.jinja) in the tokenizer folder.  One request at a time.
+# Its file: unsloth's UD-Q4_K_XL (Unsloth's looped layout, which the engine reads) - tools/ik2/download.json, pinned
+# by size and sha256; the setup offers no drafter (the engine's --draft is by hand, docs/INKLING2.md).  What fits on
+# the card (the context): tools/ik2_fit.py, shared with the Models page.  Its defaults: maya_quants.MODEL_DEFAULTS
+# ["ik2-mini"] (its author's); thinkingmachines' chat template (tools/ik2/chat_template.jinja) in the tokenizer
+# folder.  One request at a time.
 import ik2_fit as IK2F  # noqa: E402  (tools/) what fits on the card
 IK2 = Q.MODEL["ik2"]                               # "Inkling-2-Mini" (its id: the installer record, --model)
 IK2_SHOWN = Q.SHOWN["ik2"]
@@ -5164,8 +5164,8 @@ def calibrate_config(cfg_path: Path) -> bool:
     if config_family(cfg) == "hy4":       # (maya-hy4 sizes its CPU lane and its expert pool by this PC at every start)
         ok(f"{HY4}: nothing to tune - its engine sizes its CPU lane and its expert pool by this PC at every start")
         return True
-    if config_family(cfg) == "ik2":       # (maya-ik2: every expert in VRAM; its drafter decides at every step)
-        ok(f"{IK2_SHOWN}: nothing to tune - every expert sits in VRAM, and its drafter drafts only where it pays")
+    if config_family(cfg) == "ik2":       # (maya-ik2: every expert in VRAM)
+        ok(f"{IK2_SHOWN}: nothing to tune - every expert sits in VRAM")
         return True
     if cfg.get("backend") == "hip":
         warn("the tuning measures the CUDA engine's CPU lane (NVIDIA GPUs): the HIP port keeps its own settings")
@@ -5568,7 +5568,7 @@ def needs_speed_calibration(cfg: dict) -> bool:
         return hy4_both_drafters(cfg) and not hy4_engine_drafting(cfg) and \
             (cfg.get("installer") or {}).get("drafting") == "on" and \
             "speed_calibration" not in (cfg.get("installer") or {})
-    if config_family(cfg) in ("qwen", "ik2"):         # (Inkling 2: its engine measures whether a draft pays)
+    if config_family(cfg) in ("qwen", "ik2"):         # (Inkling 2: the setup offers no drafter)
         return False
     if config_family(cfg) in ("deepseek", "minimax"):  # (their DSpark drafter: measured once too)
         return CDS.has_drafter(cfg) and "speed_calibration" not in (cfg.get("installer") or {}) and             not (config_family(cfg) == "minimax" and parallel_of(cfg) > 1)   # (maya-mm3 --parallel: no drafting)
@@ -6294,8 +6294,6 @@ def server_command(cfg_path: Path, a) -> tuple:
     ik2 = config_family(cfg) == "ik2"                  # (maya-ik2 reads its GGUF itself: --model, no pack)
     flag = ("--gguf" if metal else "--glm-pack") if config_family(cfg) == "glm" else "--model" if ik2 else "--pack"   # (maya-ds4 and maya-mm3: --pack)
     pack = Path(args[args.index(flag) + 1]) if flag in args[:-1] else None       # (Metal: the first GGUF file)
-    if ik2 and "--draft" in args[:-1] and not Path(args[args.index("--draft") + 1]).exists():
-        fail(f"{cfg_path.name}: the drafter is missing ({args[args.index('--draft') + 1]})", f"run {ME} --setup to repair it")
     for p, what in ((Path(cfg.get("exe", "")), "the engine"),
                     (pack, "the model's GGUF file" if metal or ik2 else "the pack"),
                     (Path(cfg.get("tokenizer", "")) / "vocab.json", "the tokenizer")):
@@ -11039,19 +11037,19 @@ def set_up_qwen(a, prev: dict) -> Path | None:
 
 # ------------------------------------------------------------------------------------------------ Inkling-2-Mini
 def ik2_entry() -> dict:
-    """Inkling-2-Mini's download (tools/ik2/download.json: unsloth's UD-Q4_K_XL, thinkingmachines' drafter from the
-    model's own repo - "sources") as a MODELS entry (offer_download's form)."""
+    """Inkling-2-Mini's download (tools/ik2/download.json: unsloth's UD-Q4_K_XL) as a MODELS entry (offer_download's
+    form)."""
     man = read_json(IK2_MANIFEST)
     if not man.get("files") or not man.get("revision") or man.get("gguf") not in (man.get("files") or {}):
         fail(f"{IK2_MANIFEST} is missing or damaged", "restore it (git checkout tools/ik2/download.json)")
     src = man.get("sources") or {}
-    return {"about": f"{IK2_SHOWN} in unsloth's GGUF ({man.get('about', 'UD-Q4_K_XL')}) and thinkingmachines' own "
-                     f"drafter; {man.get('license', 'Apache 2.0')}",
+    return {"about": f"{IK2_SHOWN} in unsloth's GGUF ({man.get('about', 'UD-Q4_K_XL')}); "
+                     f"{man.get('license', 'Apache 2.0')}",
             "format": "ik2-gguf", "repo": man["repo"], "revision": man["revision"], "folder": man.get("folder", ""),
             "files": {k: v[0] for k, v in man["files"].items()}, "sha256": {k: v[1] for k, v in man["files"].items()},
             "sources": {k: (v["repo"], v["revision"]) for k, v in src.items()},
             "source_folders": {k: v.get("folder", "") for k, v in src.items()},
-            "gguf": man["gguf"], "draft": man.get("draft"),
+            "gguf": man["gguf"],
             "download_gb": sum(v[0] for v in man["files"].values()) / 1e9}
 
 
@@ -11060,7 +11058,7 @@ def ik2_about() -> str:
     files = read_json(IK2_MANIFEST).get("files") or {}   # (damaged: the setup says so when it is picked)
     gb = f"{sum(v[0] for v in files.values()) / 1e9:.0f} GB" if files else "about 18 GB"
     return ("An EXPERIMENTAL PREVIEW: thinkingmachines' Inkling-2-Mini (26B, a looped model: 8 of 128 experts a token) "
-            f"on its own engine, in unsloth's UD-Q4_K_XL GGUF with the model's own drafter ({gb}); NVIDIA RTX 30 / "
+            f"on its own engine, in unsloth's UD-Q4_K_XL GGUF ({gb}); NVIDIA RTX 30 / "
             "A100 and newer, Linux, one GPU with 24 GB of VRAM or more - the whole model sits on the card; tool calls, "
             "its thinking levels, up to a 256K context; text only, one answer at a time.")
 
@@ -11075,16 +11073,12 @@ def ik2_dir(a, models: Path, prev: dict) -> Path:
     return models / IK2
 
 
-def ik2_model_step(a, d: Path, models: Path, drafting: bool) -> list | None:
-    """The model's files in d - the GGUF, and the drafter when it drafts - downloaded when they are not there, then
-    checked against their published sha256: [gguf, drafter or None], or None when nothing was downloaded."""
+def ik2_model_step(a, d: Path, models: Path) -> Path | None:
+    """The model's GGUF in d, downloaded when it is not there, then checked against its published sha256; None when
+    it was not downloaded."""
     step(5, f"the model ({Q.shown('ik2', Q.IK2_QUANT)})")
     m = ik2_entry()
-    names = [m["gguf"]] + ([m["draft"]] if drafting and m.get("draft") else [])
-    if not drafting:                                   # (the drafter left out: the download is the GGUF alone)
-        m = {**m, "files": {n: m["files"][n] for n in names}, "sha256": {n: m["sha256"][n] for n in names},
-             "download_gb": sum(m["files"][n] for n in names) / 1e9}
-    files = [d / n for n in names]
+    files = [d / m["gguf"]]
     missing = [f for f in files if file_incomplete(m, f)]
     if missing and not offer_download(a, Q.shown("ik2", Q.IK2_QUANT, m["download_gb"]), d, files, m):
         return None
@@ -11096,7 +11090,7 @@ def ik2_model_step(a, d: Path, models: Path, drafting: bool) -> list | None:
     if rotational(d):
         warn(f"{d} is on a spinning hard disk: every start copies the whole model from it into VRAM - an NVMe SSD "
              "starts it in seconds (--models-dir)")
-    return [files[0], files[1] if len(files) > 1 else None]
+    return files[0]
 
 
 def ik2_tokenizer_step(a, d: Path, gguf: Path) -> Path:
@@ -11121,17 +11115,13 @@ def ik2_tokenizer_step(a, d: Path, gguf: Path) -> Path:
     out.mkdir(parents=True, exist_ok=True)
     # (the files the config runs from, for the Models page's size and its delete: serve/models.py's pack_shards)
     files = [{"name": gguf.name, "size": gguf.stat().st_size}]
-    draft = d / (ik2_entry().get("draft") or "")
-    if draft.is_file():
-        files.append({"name": draft.name, "size": draft.stat().st_size})
     (out / PACK_SOURCES).write_text(json.dumps({"tools": tools, "gguf": files[0], "files": files}, indent=1),
                                     encoding="utf-8")
     ok(f"tokenizer: {vocab.parent} (thinkingmachines' chat template)")
     return out / "tokenizer"
 
 
-def write_config_ik2(a, pc: dict, meta: dict, gguf: Path, draft: Path | None, tok: Path, ctx: int, fit: dict,
-                     models: Path, d: Path) -> Path:
+def write_config_ik2(a, pc: dict, meta: dict, gguf: Path, tok: Path, ctx: int, models: Path, d: Path) -> Path:
     """maya-inkling-2-mini.json and its start script.  A setup again keeps what the config before says that this one
     does not ask (its engine flags it names, where the server listens and its key); the model's own sampling and
     thinking level every setup."""
@@ -11140,8 +11130,6 @@ def write_config_ik2(a, pc: dict, meta: dict, gguf: Path, draft: Path | None, to
     cfg_path = ROOT / f"{Q.config_stem('ik2', Q.IK2_QUANT)}.json"
     old = read_json(cfg_path)
     args = ["--model", str(gguf), "--max-context", str(ctx)]
-    if draft is not None and fit.get("drafting"):      # (the engine drafts only where a window pays: SpecCtl)
-        args += ["--draft", str(draft)]
     kept = keep_args(old.get("args") or [], args, ("--threads", "--eos", "--cache-gb"))
     inst = {"family": "ik2", "quant": Q.OTHERS[("ik2", Q.IK2_QUANT)], "ik2_quant": Q.IK2_QUANT}
     sampling, effort = Q.model_defaults({"installer": inst})   # (the model's own, every setup)
@@ -11149,12 +11137,9 @@ def write_config_ik2(a, pc: dict, meta: dict, gguf: Path, draft: Path | None, to
            "gpu": [g["index"] for g in pc["gpus"]], "sampling": sampling, "reasoning_effort": effort,
            "lib_dirs": meta.get("lib_dirs") or old.get("lib_dirs") or [], "port": port}
     kept += keep_server_settings(cfg, old, a)
-    # (its cache in FP8 - half the bytes, the faster one deep in a context; the drafter's positions where the card
-    #  holds fewer than the context - tools/ik2_fit.py; the user's own variables kept)
-    env = {k: v for k, v in (old.get("env") or {}).items() if k != "IK2_DRAFT_CTX"}
+    # (its cache in FP8 - half the bytes, the faster one deep in a context; the user's own variables kept)
+    env = dict(old.get("env") or {})
     env.setdefault("IK2_KV", IK2F.DEFAULT_KV)
-    if fit.get("draft_ctx") and "--draft" in args:
-        env["IK2_DRAFT_CTX"] = str(fit["draft_ctx"])
     env.update(parse_env(a.env))
     cfg["env"] = env
     if a.host:
@@ -11189,26 +11174,15 @@ def set_up_ik2(a, prev: dict) -> Path | None:
     m = ik2_entry()
     ok(f"model: {Q.shown('ik2', Q.IK2_QUANT, m['download_gb'])} - thinkingmachines' Inkling-2-Mini in unsloth's GGUF "
        "(Apache 2.0)")
-    how = getattr(a, "drafting", None)
-    # (the drafter: on unless --drafting off, or the setup before had it off)
-    drafting = how == "on" if how in ("on", "off") else (not prev_args or "--draft" in prev_args[:-1])
     kv = str((prev.get("env") or {}).get("IK2_KV") or IK2F.DEFAULT_KV)
-    rec = IK2F.recommended_context(vram, kv, drafting)
+    rec = IK2F.recommended_context(vram, kv)
     ctx = choose_context(a, prev_ctx, IK2F.CONTEXTS, rec)
-    fit = IK2F.plan(vram, ctx, kv, drafting)
+    fit = IK2F.plan(vram, ctx, kv)
     ok(f"context: {ctx} tokens" + (" (recommended for this card's VRAM)" if ctx == rec else "") +
        f"; its cache: {ctx * IK2F.KV_BYTES.get(kv, IK2F.KV_BYTES['f16']) / 2**30:.1f} GB of VRAM ({kv.upper()})")
     if not fit["resident"]:
         warn(f"at {context_label(ctx)} the model and its cache do not all fit in this card's {vram:.0f} GB: the "
              f"engine then runs its slower path (a context of {context_label(rec)} keeps everything in VRAM)")
-    if drafting and not fit["drafting"]:
-        warn("drafting: off - no room on the card beside the model at this context (a smaller context leaves room)")
-    elif drafting:
-        ok("drafting: the model's own drafter proposes tokens for the model to check - the same answers; the engine "
-           "drafts only where it pays" + (f" (it sees the last {context_label(fit['draft_ctx'])} tokens: the card's "
-                                          "room)" if fit.get("draft_ctx") else ""))
-    else:
-        ok("drafting: off (--drafting on drafts with the model's own drafter)")
     models = (Path(a.models_dir).expanduser().resolve() if a.models_dir else
               Path(inst["models_dir"]) if inst.get("models_dir") else ROOT.parent / "Maya-data" / "models")
     d = ik2_dir(a, models, prev)
@@ -11218,12 +11192,11 @@ def set_up_ik2(a, prev: dict) -> Path | None:
     if not IK2_EXE.exists():
         fail(f"the engine was not built ({IK2_EXE})", "the reason is in the build's messages above (maya-ik2 needs "
              "an RTX 30 / A100 or newer card in the build's GPU list)")
-    got = ik2_model_step(a, d, models, drafting and fit["drafting"])   # 5
-    if got is None:
+    gguf = ik2_model_step(a, d, models)               # 5
+    if gguf is None:
         return None
-    gguf, draft = got
     tok = ik2_tokenizer_step(a, d, gguf)              # 6
-    return write_config_ik2(a, pc, meta, gguf, draft, tok, ctx, fit, models, d)   # 7
+    return write_config_ik2(a, pc, meta, gguf, tok, ctx, models, d)   # 7
 
 
 def set_up_and_serve(a, prev: dict) -> tuple | None:
