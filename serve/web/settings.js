@@ -46,7 +46,7 @@ const Row = ({label, sub, children, htmlFor, cls = ""}) => html`<div class=${`se
 
 // the engines by their INFO engine_kind
 const ENGINES = {"glm-fast": "GLM fast path", ds4: "DeepSeek-V4.1 (maya-ds4)", mm3: "MiniMax-M3.1 (maya-mm3)",
-                 hy4: "Hy4-Flash (maya-hy4)"};
+                 hy4: "Hy4-Flash (maya-hy4)", ik2: "Inkling 2 (maya-ik2, an experimental preview)"};
 
 // ------------------------------------------------------------------ General
 function General() {
@@ -438,6 +438,8 @@ function facts() {
     kv = eng.kv_resident   // KV streaming (--kv-resident): the cache's VRAM is its window, not a cost per token
       ? `${k} attention cache, streamed: ${fmt(eng.kv_resident)} positions per layer in VRAM, the rest in RAM`
       : `${k} attention cache, in VRAM${kvPerTok ? ` (about ${fmt(kvPerTok / 1024)} KB a token, ${fmt(eng.kv_gb, 1)} GB at this size)` : ""}`;
+  } else if (eng.engine_kind === "ik2") {   // (maya-ik2's INFO: kv=fp8|f16 - the full layers' cache, all in VRAM)
+    kv = `${eng.kv === "fp8" ? "8-bit (FP8)" : "16-bit"}, all in VRAM (the layers without a window; the others keep 1,024 positions)`;
   } else {
     const k = (eng.engine_kind === "mm3"   // (MiniMax's: maya-mm3's KV formats)
       ? {bf16: "16-bit (BF16)", int8: "8-bit (INT8)", fp8: "8-bit (FP8)", fp4: "4-bit (FP4)", nvfp4: "4-bit (NVFP4)",

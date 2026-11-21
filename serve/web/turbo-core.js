@@ -2,7 +2,7 @@
 // under node): what a chat's stored settings become when Turbo goes on, and what comes back when it goes off.  The engine's
 // half (the context, the expert skipping, the drafting) is the server's: serve/models.py turbo_enable / turbo_disable.
 
-// the fastest thinking level a model has: none where it offers it (GLM, DeepSeek, MiniMax, Hy4), else its lowest (Qwen's low)
+// the fastest thinking level a model has: none where it offers it (GLM, DeepSeek, MiniMax, Hy4, Inkling 2), else its lowest (Qwen's low)
 export const fastestThinking = (levels) => (levels.includes("none") ? "none" : levels[0]);
 
 // Turbo on: `stored` is what the browser holds for this model's chat settings (only what its user chose; null for nothing).

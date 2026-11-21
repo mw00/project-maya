@@ -89,6 +89,11 @@ class Boxes(unittest.TestCase):
         calm = {**m, "tiers": {**m["tiers"], "now": {**now, "vram_hit": 0.9}}}
         self.assertNotIn(D.TIPS["ds4_cpu"][0], text(D.tiers(calm, 120), 122))
 
+    def test_ik2_says_it_reports_no_tiers(self):   # (maya-ik2 writes no STAT lines: no "while it writes" promise)
+        out = text(D.tiers({"engine": {"engine_kind": "ik2", "model": "Inkling-2", "kv": "fp8"}}, 120), 122)
+        self.assertIn("reports no tiers", out)
+        self.assertNotIn("while it writes", out)
+
     def test_the_tiers_bar_fits_when_the_tiers_overlap(self):   # (Maya-L on 9 GPUs: 10,813 + 1,571 of 12,096)
         now = {**METRICS["tiers"]["now"], "vram_used": 10813, "ram_used": 1571}
         m = {**METRICS, "engine": {**METRICS["engine"], "experts": 12096}, "tiers": {**METRICS["tiers"], "now": now}}

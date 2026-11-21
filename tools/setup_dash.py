@@ -197,6 +197,9 @@ def tiers(m: dict, width: int):
     t, eng = m.get("tiers") or {}, m.get("engine") or {}
     n, h = t.get("now"), t.get("history") or {}
     if not n:
+        if eng.get("engine_kind") == "ik2":            # (maya-ik2 writes no STAT lines: nothing comes later)
+            return Text("Inkling 2 Mini's engine keeps its experts in VRAM where the card holds them; it reports no "
+                        "tiers.", f"italic {MUTED}")
         return Text("The engine tells where its experts live while it writes an answer.", f"italic {MUTED}")
     ds4 = eng.get("engine_kind") == "ds4"
     hy4 = eng.get("engine_kind") == "hy4"

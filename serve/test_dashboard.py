@@ -932,6 +932,39 @@ console.log(JSON.stringify(out));""")
         self.assertEqual(got["sets"], ["ram_fetch,disk,promo,engram_ms", "ram_fetch,disk,promo", "ram_fetch,disk",
                                        "ram_fetch,disk,promo"])                   # (the other engines': unchanged)
 
+    def test_ik2_its_levels_its_own_settings_its_name_and_its_monitor(self):
+        # Inkling 2 Mini ("inkling-2-mini", maya-ik2, an experimental preview): its template's effort levels by name -
+        # Off, Low, Medium, High (its default: 0.9), Max - chat settings of its own; a level of another model's goes to
+        # the nearest it has; its name from its id; no maker's mark in lobe-icons (the page's chip); the Monitor: no
+        # tiers card (maya-ik2 writes no STAT lines) and the other engines' sets as they were
+        got = self.node("""
+const m = await import(web + "/monitor.js"), lib = await import(web + "/lib.js"), tc = await import(web + "/turbo-core.js");
+const out = {family: st.familyOf("inkling-2-mini"), small: st.familyOf("inkling-2-small"),
+  others: ["glm-5.3-flash", "deepseek-v4.1-flash", "minimax-m3.1-flash", "cyber-frost-3.8-ps", "hy4-flash", ""].map((x) => st.familyOf(x))};
+st.setFamily("inkling-2-mini");
+st.S.health = {model: "inkling-2-mini"};
+out.levels = st.LEVELS.map((l) => [l.id, l.name]); out.dflt = st.DEFAULTS.thinking; out.titles = st.thinkTitles(); out.key = st.prefsKey();
+out.nearest = ["none", "auto", "low", "medium", "high", "xhigh", "max"].map((l) => st.levelFor(l));
+out.fastest = tc.fastestThinking(st.THINKING);
+out.name = lib.modelName("inkling-2-mini"); out.short = lib.modelName("inkling-2-mini", true);
+out.logo = lib.modelLogo("inkling-2-mini");
+const eng = {engine_kind: "ik2", model: "Inkling-2", kv: "fp8", ctx: 262144, gpus: 1};
+out.set = m.tierSet(eng).map((x) => x.key).join(); out.tip = m.tierTip({}, eng, {disk: 0});
+out.sets = ["ds4", "mm3", "qwen", "hy4", "glm-fast"].map((k) => m.tierSet({engine_kind: k}).map((x) => x.key).join());
+console.log(JSON.stringify(out));""")
+        self.assertEqual((got["family"], got["small"]), ("ik2", "ik2"))
+        self.assertEqual(got["others"], ["glm", "deepseek", "minimax", "qwen", "hy4", "glm"])   # (as before)
+        self.assertEqual(got["levels"], [["none", "Off"], ["low", "Low"], ["medium", "Medium"], ["high", "High"],
+                                         ["max", "Max"]])
+        self.assertEqual((got["dflt"], got["key"], got["fastest"]), ("high", "sampling_ik2", "none"))
+        self.assertEqual(sorted(got["titles"]), ["high", "low", "max", "medium", "none"])
+        self.assertIn("its default", got["titles"]["high"])
+        self.assertEqual(got["nearest"], ["none", None, "low", "medium", "high", "max", "max"])   # (None: its default)
+        self.assertEqual((got["name"], got["short"], got["logo"]), ("Inkling 2 Mini", "Inkling 2 Mini", None))
+        self.assertEqual(got["tip"], "")
+        self.assertEqual(got["sets"], ["ram_fetch,disk,promo,engram_ms", "ram_fetch,disk,promo", "ram_fetch,disk",
+                                       "cpu,engram_ms", "ram_fetch,disk,promo"])
+
     def test_about_has_the_support_line_always_and_the_update_card_none(self):
         # owner 2026-11-05: one line on About (always, also while an update shows), its link on "supporting me" in bold
         # violet; no row under an update's button; the sidebar's heart stays

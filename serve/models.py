@@ -15,6 +15,10 @@ A config's settings, as the page shows them (None: the engine's own default, or 
              prefill_chunk, cpu_threads, kv ("auto" | "q8": the latent cache's rows, --kv - 8-bit rows are the setup's
              opt-in faster drafting on a small card, "f16" kept where a config has it); images (the pack's mmproj
              file: --vision off when off); one answer at a time
+  Inkling-2-Mini (maya-ik2, an experimental preview - it stops at a flag it does not know, only its own are written):
+             draft ("dspark" | "none": thinkingmachines' drafter, --draft), kv ("fp8" | "f16": IK2_KV); one GPU, one
+             answer at a time, text only for now; the drafter's positions (IK2_DRAFT_CTX) worked out again when the
+             context, the cache or the GPU changes (tools/ik2_fit.py, the setup's)
 apply() writes them back into the config's "args", "env", "gpu" and "vision" - its other keys as they are."""
 from __future__ import annotations
 
@@ -48,7 +52,8 @@ CONTEXT_FALLBACK_MAX = 262144   # ... and the largest when the model file does n
 # GLM engine's 256K, and maya-mm3's 256K (MiniMax-M3.1 is offered up to its 1M; past 256K it has not been run end to
 # end yet)
 # (maya-hy4: Tencent's own Q4_K_M run end to end up to 256K; Maya's sizes up to 32K so far - the model is trained for 1M)
-CONTEXT_TESTED = {"ds4": 1048576, "mm3": 262144, "hy4": 32768, "hy4-q4": 262144}
+# (maya-ik2: Inkling-2-Mini run to 262,144 by its contributor - every expert in VRAM with an FP8 cache)
+CONTEXT_TESTED = {"ds4": 1048576, "mm3": 262144, "hy4": 32768, "hy4-q4": 262144, "ik2": 262144}
 CONTEXT_TESTED_DEFAULT = 262144
 QWEN_KV =("fp16", "int8", "k8v4", "q4_0")                        # the Qwen path's --kv
 MM3_KV = ("bf16", "int8", "fp8", "fp4")                           # maya-mm3 --kv-cache (one format for K and V)
@@ -83,6 +88,13 @@ HY4_NOT_YET = {"parallel": "Answers at once: Hy4-Flash answers one request at a 
                "kv_cache": "KV cache: Hy4-Flash's cache rows are auto or 8-bit (its setting kv)",
                "kv_streaming": "KV streaming: Hy4-Flash's engine turns it on by itself where the context needs it",
                "kv_resident": "KV streaming: Hy4-Flash's engine turns it on by itself where the context needs it"}
+# Inkling-2-Mini (maya-ik2, an experimental preview): its settings, and what its engine does not have yet - said in
+# plain words when a client asks for it (each one's "off": IK2_OFF)
+import ik2_fit as IK2F  # noqa: E402  (tools/) what fits on its card: the setup's own figures
+IK2_KEYS = ("context", "images", "gpus", "env", "draft", "kv")
+IK2_OFF = {"parallel": 1}
+IK2_NOT_YET = {"parallel": "Answers at once: Inkling 2 Mini answers one request at a time for now"}
+IK2_DRAFTER = "mtp.safetensors"                     # (tools/ik2/download.json's "draft", in the model's folder)
 
 
 # ------------------------------------------------------------------ the engine's arguments
@@ -147,7 +159,29 @@ def gpus_of(cfg: dict) -> list:
 def pack_of(cfg: dict) -> Path | None:
     args = cfg.get("args") or []
     p = flag(args, "--glm-pack") or flag(args, "--pack")
+    if not p and family(cfg) == "ik2" and flag(args, "--model") and cfg.get("tokenizer"):
+        # (maya-ik2 reads its GGUF in place: the setup's folder beside it - the tokenizer and its sources.json - stands
+        #  for the pack, in the model's folder)
+        return Path(str(cfg["tokenizer"])).parent
     return Path(p) if p else None
+
+
+def ik2_drafter(cfg: dict) -> Path | None:
+    """Inkling-2-Mini's drafter: the one the config drafts with (--draft), else the one its setup downloaded beside the
+    model (switched off: kept, so Drafting can be switched on again)."""
+    p = flag(cfg.get("args") or [], "--draft")
+    if p:
+        return Path(p)
+    d = (cfg.get("installer") or {}).get("model_dir")
+    f = Path(d) / IK2_DRAFTER if d else None
+    return f if f is not None and f.is_file() else None
+
+
+def ik2_vram_gb(cfg: dict) -> float:
+    """The VRAM of the card an Inkling 2 config runs on (its first "gpu"), as the setup reads it; 0 when not known."""
+    ids = gpus_of(cfg) or [0]
+    card = next((g for g in machine_gpus("cuda") if g.get("index") == ids[0]), None)
+    return float((card or {}).get("vram_gb") or 0)
 
 
 # ------------------------------------------------------------------ the context a model was trained for
@@ -386,6 +420,9 @@ def _choices(cfg: dict) -> dict:
         # (auto: the engine measures once on this PC which decodes fastest - no drafting or a drafter the pack holds)
         drafters = (["mtp"] if hy4_has_mtp(cfg) else []) + (["dfly2"] if hy4_has_dfly2(cfg) else [])
         return {"draft": (["auto"] if drafters else []) + drafters + ["none"], "images": hy4_has_vision(cfg)}
+    if family(cfg) == "ik2":                           # (pictures: not set up for the preview - text only)
+        return {"draft": ["dspark", "none"] if ik2_drafter(cfg) is not None else ["none"],
+                "images": bool(cfg.get("vision") or cfg.get("vision_off")), "kv": list(IK2F.KV_BYTES)}
     if family(cfg) == "qwen":                          # (images: the setup's maya-vision entry, on or kept off)
         return {"draft": ["mtp", "none"] if qwen_mtp(cfg) is not None else ["none"],
                 "images": bool(cfg.get("vision") or cfg.get("vision_off"))}
@@ -424,6 +461,11 @@ def settings_of(cfg: dict) -> dict:
                    tp="auto" if tp == "auto" else _int(tp, "auto"), reserve_gb=_float(flag(args, "--reserve-gb")),
                    prefill_chunk=_int(flag(args, "--chunk")), cpu_threads=_int(flag(args, "--cpu-threads")),
                    kv=flag(args, "--kv", "auto"))     # (the latent cache's rows: auto, the engine's default)
+        return out
+    if family(cfg) == "ik2":                           # (maya-ik2's own defaults where the config names none)
+        kv = str(env.pop("IK2_KV", "f16")).lower()     # (its cache: Settings' KV cache, not a variable of the page's)
+        out.update(images=bool(cfg.get("vision")), draft="dspark" if flag(args, "--draft") else "none",
+                   kv="f16" if kv in ("f16", "fp16") else "fp8" if kv in ("fp8", "e4m3") else kv)
         return out
     if family(cfg) == "qwen":
         ec, pf = flag(args, "--expert-cache", "auto"), flag(args, "--prefill", "auto")
@@ -517,7 +559,7 @@ def apply(cfg: dict, settings: dict) -> dict:
         raise ValueError("the settings must be a JSON object")
     fam = family(cfg)
     ds4 = fam == "deepseek"
-    known = {"minimax": MM3_KEYS, "deepseek": DS4_KEYS, "qwen": QWEN_KEYS, "hy4": HY4_KEYS}.get(fam, GLM_KEYS)
+    known = {"minimax": MM3_KEYS, "deepseek": DS4_KEYS, "qwen": QWEN_KEYS, "hy4": HY4_KEYS, "ik2": IK2_KEYS}.get(fam, GLM_KEYS)
     known += ("ablate",)
     if fam == "hy4":
         not_yet = sorted(k for k in set(settings) & set(HY4_NOT_YET)
@@ -525,6 +567,12 @@ def apply(cfg: dict, settings: dict) -> dict:
         if not_yet:
             raise ValueError(HY4_NOT_YET[not_yet[0]])
         known += tuple(HY4_NOT_YET)
+    if fam == "ik2":                                   # (Inkling-2-Mini's preview: what it does not have yet, said)
+        not_yet = sorted(k for k in set(settings) & set(IK2_NOT_YET)
+                         if settings[k] not in (None, "") and settings[k] != IK2_OFF.get(k))
+        if not_yet:
+            raise ValueError(IK2_NOT_YET[not_yet[0]])
+        known += tuple(IK2_NOT_YET)
     unknown = sorted(set(settings) - set(known))
     if unknown:
         raise ValueError(f"not a setting of this model: {', '.join(unknown)}")
@@ -575,7 +623,7 @@ def apply(cfg: dict, settings: dict) -> dict:
     else:
         out.pop("env", None)
 
-    reserve = _num(s, "reserve_mib", 0, 65536, "VRAM kept free") if fam not in ("minimax", "hy4") else None
+    reserve = _num(s, "reserve_mib", 0, 65536, "VRAM kept free") if fam not in ("minimax", "hy4", "ik2") else None
     if fam == "qwen":
         if s.get("draft") not in can["draft"]:
             raise ValueError("Drafting: this pack has no MTP drafter (the setup builds it)" if s.get("draft") == "mtp"
@@ -664,6 +712,39 @@ def apply(cfg: dict, settings: dict) -> dict:
                 out["installer"][HY4_CHUNK_BY_HAND] = True
         if hy4_context_check(cfg, {**out, "args": args}) and flag(args, "--kv-streaming") is None:
             args = set_flag(args, "--kv-streaming", "auto")   # (streams only where nothing else fits, as the setup's)
+    elif fam == "ik2":
+        # (maya-ik2: --max-context above; one GPU; the drafter - --draft, its file kept in the model's folder while it is
+        #  off; the cache's format, IK2_KV; and the drafter's positions, IK2_DRAFT_CTX, worked out again for the card
+        #  whenever the context, the cache, the drafting or the GPU changes - the setup's figures, tools/ik2_fit.py)
+        if len(set(gpus)) != 1:
+            raise ValueError("GPUs: Inkling 2 Mini runs on one GPU for now - pick one")
+        if s.get("draft") not in can["draft"]:
+            raise ValueError("Drafting: this model's folder has no drafter (the setup downloads it)"
+                             if s.get("draft") == "dspark" else "Drafting: DSpark or none")
+        args = drop_flag(args, "--draft")
+        if s["draft"] == "dspark":
+            args = set_flag(args, "--draft", ik2_drafter(cfg))
+        # (the KV cache setting; IK2_KV typed into the variables by hand where the setting itself was not sent)
+        kv = str(settings.get("kv") or clean.get("IK2_KV") or s.get("kv") or IK2F.DEFAULT_KV).lower()
+        kv = {"fp16": "f16", "e4m3": "fp8"}.get(kv, kv)
+        if kv not in IK2F.KV_BYTES:
+            raise ValueError("KV cache: FP8 or F16")
+        if s.get("images") and not out.get("vision"):
+            if not out.get("vision_off"):
+                raise ValueError("Images: Inkling 2 Mini reads text only for now (its image encoder is not set up yet)")
+            out["vision"] = out.pop("vision_off")
+        elif not s.get("images") and out.get("vision"):
+            out["vision_off"] = out.pop("vision")       # (kept, so Images can be switched on again)
+        env2 = dict(out.get("env") or {})
+        env2["IK2_KV"] = kv
+        cur = settings_of(cfg)
+        if any(str(s.get(k)) != str(cur.get(k)) for k in ("context", "kv", "draft", "gpus")):
+            env2.pop("IK2_DRAFT_CTX", None)
+            fit = IK2F.plan(ik2_vram_gb({**out, "gpu": gpus}), int(flag(args, "--max-context")), kv,
+                            s["draft"] == "dspark")
+            if s["draft"] == "dspark" and fit.get("draft_ctx"):
+                env2["IK2_DRAFT_CTX"] = str(fit["draft_ctx"])
+        out["env"] = env2
     elif fam == "minimax":
         # (maya-mm3 --parallel: n conversations at once - each its own KV cache in VRAM, so no KV streaming and no DSpark
         #  while it is above 1; those two settings stay as chosen for the day it is 1 again; written where it changes)
@@ -802,7 +883,10 @@ def shown_env(env: dict | None) -> dict:
 
 
 def shown_settings(cfg: dict) -> dict:
-    return {**settings_of(cfg), "env": shown_env(cfg.get("env"))}
+    env = shown_env(cfg.get("env"))
+    if family(cfg) == "ik2":                           # (Inkling 2's cache format: its KV cache setting, not a variable)
+        env.pop("IK2_KV", None)
+    return {**settings_of(cfg), "env": env}
 
 
 def command(cfg: dict) -> dict:
@@ -887,9 +971,10 @@ def describe(path: Path, running: str | None) -> dict:
         used = None
     cur = shown_settings(cfg)
     rng = context_range(trained_context_of(cfg), cur.get("context"),
-                        {"deepseek": "ds4", "minimax": "mm3",
+                        {"deepseek": "ds4", "minimax": "mm3", "ik2": "ik2",
                          "hy4": "hy4-q4" if hy4_plain(cfg) else "hy4"}.get(family(cfg), ""))
     hy4_fits = hy4_contexts(cfg) if family(cfg) == "hy4" else []
+    ik2 = family(cfg) == "ik2"
     if family(cfg) == "hy4" and not hy4_plain(cfg):
         rng["max"] = min(rng["max"], max(hy4_fits + [CONTEXT_MIN, int(cur.get("context") or 0)]))
     setup = dict(inst.get("as_set_up") or cur)
@@ -909,6 +994,14 @@ def describe(path: Path, running: str | None) -> dict:
                                 for c, v in st.items() if v} or None)
         own.update(kv_small_from=min(small) if small else None,
                    context_more=bool(hy4_fits) and max(hy4_fits) < (HY4_Q4_LONG if hy4_plain(cfg) else HY4_CONTEXTS)[-1])
+    if ik2:
+        # (Inkling-2-Mini: whether each context keeps every expert in VRAM on its card, and the drafter beside them -
+        #  by the cache's format; the page says where the engine would run its slower path, or drafting has no room)
+        vram = ik2_vram_gb(cfg)
+        ctxs = sorted({*IK2F.CONTEXTS, int(cur.get("context") or 0)} - {0})
+        own.update(ik2_fit={kv: {str(c): {k: v for k, v in IK2F.plan(vram, c, kv).items() if k != "need_gib"}
+                                 for c in ctxs} for kv in IK2F.KV_BYTES} if vram else None,
+                   ik2_kv_bytes=IK2F.KV_BYTES)
     return {**own, "file": path.name, "path": str(path), "model": cfg.get("model_name") or "", "family": family(cfg),
             "quant": quant_label(cfg, path), "backend": cfg.get("backend") or "cuda", "written": inst.get("written"),
             "used": used, "running": running is not None and str(path.resolve()) == str(Path(running).resolve()),
@@ -917,7 +1010,7 @@ def describe(path: Path, running: str | None) -> dict:
             "settings": cur, "setup": setup, "choices": choices(cfg), "command": command(cfg),
             # (Hy4-Flash: only the contexts that fit this config's cards - hy4_contexts; the slider ends at the largest)
             "contexts": {"deepseek": DS4_CONTEXTS, "minimax": MM3_CONTEXTS, "qwen": QWEN_CONTEXTS,
-                         "hy4": hy4_fits}.get(family(cfg), CONTEXTS),
+                         "hy4": hy4_fits, "ik2": IK2F.CONTEXTS}.get(family(cfg), CONTEXTS),
             # (the Engine settings' Context size slider: the same range as Settings > Model's for this model)
             "context_range": rng}
 
