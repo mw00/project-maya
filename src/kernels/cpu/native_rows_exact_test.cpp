@@ -262,6 +262,41 @@ void check_split(int type, std::mt19937& rng) {
     if (!gu_same || !dn_same) ++failures;
 }
 
+// The opt-in prefill path groups five through eight Q8_K activations per IQ3_S/IQ2_S gate/up decode.  Its exact
+// result must remain the ordinary split path's result, including a tail group and clipped SwiGLU inputs.
+void check_split_prefill_iq_avx512(int type, std::mt19937& rng) {
+    cpu::NativeFmt f;
+    std::string err;
+    if (!cpu::native_fmt(type, type, 4096, 2048, f, err)) {
+        std::printf("  prefill %-8s: %s\n", ggml_type_name((ggml_type) type), err.c_str());
+        ++failures;
+        return;
+    }
+    const auto gate = rand_rows(type, 4096, 2048, rng), up = rand_rows(type, 4096, 2048, rng);
+    constexpr float guard = -12345.25f;
+    for (int nt : {5, 8, 9, 11}) {
+        const auto a = rand_acts(4096, nt, rng);
+        std::vector<const void*> ap(nt);
+        std::vector<float> ordinary((size_t) nt * 2048, guard), candidate(ordinary);
+        std::vector<float*> oo(nt), co(nt);
+        for (int k = 0; k < nt; ++k) {
+            ap[k] = a.data() + (size_t) k * f.act_bytes;
+            oo[k] = ordinary.data() + (size_t) k * 2048;
+            co[k] = candidate.data() + (size_t) k * 2048;
+        }
+        for (int r0 = 0; r0 < 2048; r0 += 683)
+            cpu::native_gu_rows_split(f, gate.data(), up.data(), ap.data(), nt, oo.data(), r0, std::min(2048, r0 + 683),
+                                      10.0f);
+        const bool used = cpu::native_gu_rows_split_prefill_iq_avx512(f, gate.data(), up.data(), ap.data(), nt,
+                                                                        co.data(), 0, 2048, 10.0f);
+        const bool same = std::memcmp(ordinary.data(), candidate.data(), ordinary.size() * sizeof(float)) == 0;
+        const bool untouched = std::all_of(candidate.begin(), candidate.end(), [](float v) { return v == guard; });
+        std::printf("  prefill %-8s %2d tokens: %s\n", ggml_type_name((ggml_type) type), nt,
+                    used ? (same ? "identical" : "DIFFER") : (untouched ? "unavailable (untouched)" : "FAILED (wrote)"));
+        if ((used && !same) || (!used && !untouched)) ++failures;
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -283,6 +318,7 @@ int main() {
         check_iq1m_row_bounds(rng);
     }
     for (int t : types) check_split(t, rng);
+    for (int t : {GGML_TYPE_IQ3_S, GGML_TYPE_IQ2_S}) check_split_prefill_iq_avx512(t, rng);
     if (failures != 0) {
         std::printf("native_rows_exact_test: %d FAILED\n", failures);
         return 1;

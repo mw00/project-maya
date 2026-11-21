@@ -396,6 +396,50 @@ void iq512_gu_rows(int type, const uint8_t* blob, size_t gu_row, size_t up_off, 
     }
 }
 
+template <int TY, int NT>
+void gu_rows_split_prefill_iq_avx512(const uint8_t* gate_base, const uint8_t* up_base, size_t row_bytes, int n,
+                                      const void* const* act, float* const* ff, int r0, int r1, float limit) {
+    const block_q8_K* y[NT];
+    for (int t = 0; t < NT; ++t) y[t] = (const block_q8_K*) act[t];
+    const bool clamp = limit != std::numeric_limits<float>::infinity();
+    float g[NT], u[NT];
+    for (int r = r0; r < r1; ++r) {
+        row_dot<TY, NT>(gate_base + (size_t) r * row_bytes, n / QK_K, y, g);
+        row_dot<TY, NT>(up_base + (size_t) r * row_bytes, n / QK_K, y, u);
+        for (int t = 0; t < NT; ++t) {
+            float gt = g[t], ut = u[t];
+            if (clamp) { gt = std::fmin(gt, limit); ut = std::fmin(std::fmax(ut, -limit), limit); }
+            ff[t][r] = (gt / (1.f + std::exp(-gt))) * ut;
+        }
+    }
+}
+
+template <int TY>
+void gu_rows_split_prefill_iq_avx512_nt(const uint8_t* gate_base, const uint8_t* up_base, size_t row_bytes, int n,
+                                         const void* const* act, int nt, float* const* ff, int r0, int r1, float limit) {
+    switch (nt) {
+        case 1: gu_rows_split_prefill_iq_avx512<TY, 1>(gate_base, up_base, row_bytes, n, act, ff, r0, r1, limit); break;
+        case 2: gu_rows_split_prefill_iq_avx512<TY, 2>(gate_base, up_base, row_bytes, n, act, ff, r0, r1, limit); break;
+        case 3: gu_rows_split_prefill_iq_avx512<TY, 3>(gate_base, up_base, row_bytes, n, act, ff, r0, r1, limit); break;
+        case 4: gu_rows_split_prefill_iq_avx512<TY, 4>(gate_base, up_base, row_bytes, n, act, ff, r0, r1, limit); break;
+        case 5: gu_rows_split_prefill_iq_avx512<TY, 5>(gate_base, up_base, row_bytes, n, act, ff, r0, r1, limit); break;
+        case 6: gu_rows_split_prefill_iq_avx512<TY, 6>(gate_base, up_base, row_bytes, n, act, ff, r0, r1, limit); break;
+        case 7: gu_rows_split_prefill_iq_avx512<TY, 7>(gate_base, up_base, row_bytes, n, act, ff, r0, r1, limit); break;
+        case 8: gu_rows_split_prefill_iq_avx512<TY, 8>(gate_base, up_base, row_bytes, n, act, ff, r0, r1, limit); break;
+        default: break;
+    }
+}
+
+void iq512_gu_rows_split_prefill_iq_avx512(int type, const uint8_t* gate_base, const uint8_t* up_base,
+                                            size_t row_bytes, int n, const void* const* act, int nt,
+                                            float* const* ff, int r0, int r1, float limit) {
+    switch (type) {
+        case 21: gu_rows_split_prefill_iq_avx512_nt<21>(gate_base, up_base, row_bytes, n, act, nt, ff, r0, r1, limit); break;
+        case 22: gu_rows_split_prefill_iq_avx512_nt<22>(gate_base, up_base, row_bytes, n, act, nt, ff, r0, r1, limit); break;
+        default: break;
+    }
+}
+
 void iq512_rows(int type, const uint8_t* w, size_t row_bytes, int n, const void* const* act, int nt, float* const* out,
                 int r0, int r1) {
     switch (type) {

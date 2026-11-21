@@ -66,6 +66,11 @@ void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* 
 void native_gu_rows_split(const NativeFmt& f, const uint8_t* gate_base, const uint8_t* up_base,
                           const void* const* act, int nt, float* const* ff, int r0, int r1,
                           float swiglu_limit = std::numeric_limits<float>::infinity());
+// Prefill-only exact AVX-512 try wrapper for non-mixed IQ3_S/IQ2_S gate/up.
+// False means no writes; true means all groups used the split-base backend.
+bool native_gu_rows_split_prefill_iq_avx512(const NativeFmt& f, const uint8_t* gate_base, const uint8_t* up_base,
+                                             const void* const* act, int nt, float* const* ff, int r0, int r1,
+                                             float swiglu_limit = std::numeric_limits<float>::infinity());
 void native_down_rows_split(const NativeFmt& f, const uint8_t* down_base, const void* const* hq,
                             int nt, float* const* out, int r0, int r1);
 /// Whether the split variants take the multi-token kernels for this weight type here (the CPU has
