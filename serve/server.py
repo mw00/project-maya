@@ -2365,6 +2365,51 @@ def hy4_draft_ids(cfg: dict) -> Path | None:
         return None
 
 
+IK2_DRAFT_FILE = ROOT / "data" / "ik2-drafting.txt"   # (maya-ik2's --drafting auto: this PC's choice, child_env)
+IK2_DRAFT_TOOL = {"type": "function", "function": {
+    "name": "get_weather", "description": "The current weather in a city.",
+    "parameters": {"type": "object", "properties": {"city": {"type": "string", "description": "The city's name."}},
+                   "required": ["city"]}}}
+IK2_DRAFT_QS = HY4_DRAFT_QS[:2] + (   # (chat, code - and a tool call: Inkling's drafting timed on all three)
+    "What is the weather in Paris and in Rome right now? Use the tool for each city.",)
+
+
+def ik2_draft_ids(cfg: dict) -> Path | None:
+    """The requests maya-ik2 times its --drafting auto on (IK2_DRAFT_IDS): IK2_DRAFT_QS in the
+    model's own chat template with thinking off (the last with IK2_DRAFT_TOOL offered) - a line of token ids each,
+    written once into the data folder (a file a tokenizer and template).  None: not written - the engine then says it
+    did not measure and drafts."""
+    tdir = Path(cfg.get("tokenizer") or "")
+    vocab, tpl = tdir / "vocab.json", tdir / "chat_template.jinja"
+    if not cfg.get("tokenizer") or not vocab.is_file() or not tpl.is_file():
+        return None
+    try:
+        tag = hashlib.md5(vocab.read_bytes() + tpl.read_bytes() + repr(IK2_DRAFT_QS).encode()).hexdigest()[:10]
+    except OSError:
+        return None
+    path = ROOT / "data" / f"ik2-draft-ids-{tag}.txt"
+    if path.is_file():
+        return path
+    try:
+        import strata_tokenizer as ST
+        from serve.frontend import ChatTemplate
+        tok, chat = ST.Tokenizer.from_dir(tdir), ChatTemplate(tpl)
+        lines = []
+        for i, q in enumerate(IK2_DRAFT_QS):
+            tools = [IK2_DRAFT_TOOL] if i == len(IK2_DRAFT_QS) - 1 else None
+            text = chat.render([{"role": "user", "content": q}], tools=tools, enable_thinking=False,
+                               reasoning_effort="none")
+            lines.append(",".join(map(str, tok.encode(text, parse_special=True))))
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text("# maya: requests in the model's chat template, a line each - the answers maya-ik2's "
+                       "--drafting auto times at its first start on a PC\n" + "\n".join(lines) + "\n", encoding="utf-8")
+        os.replace(tmp, path)
+        return path
+    except Exception:  # noqa: BLE001 - none: the engine drafts without measuring
+        return None
+
+
 def child_env(cfg: dict) -> dict:
     """The engine's environment: the CUDA libraries setup installed (pip's nvidia packages, or the toolkit that
     compiled it) first on the library search path."""
@@ -2407,6 +2452,15 @@ def child_env(cfg: dict) -> dict:
             ids = hy4_measure_ids(cfg)
             if ids is not None:
                 env["HY4_MEASURE_IDS"] = str(ids)
+    # Inkling 2 (maya-ik2 --drafting auto): which of no drafting, the prompt lookup and the drafter decodes fastest -
+    # measured once on this PC at the first start (before READY) on a chat, a code and a tool-call request in the
+    # model's template, remembered in the data folder (maya --speed-calibration measures again: IK2_DRAFT_MEASURE)
+    if models.family(cfg) == "ik2" and "--drafting" in (cfg.get("args") or []):
+        env.setdefault("IK2_DRAFT_FILE", str(IK2_DRAFT_FILE))
+        if "IK2_DRAFT_IDS" not in env:
+            ids = ik2_draft_ids(cfg)
+            if ids is not None:
+                env["IK2_DRAFT_IDS"] = str(ids)
     dirs =[d for d in cfg.get("lib_dirs") or [] if Path(d).is_dir()]
     if dirs:
         var = "PATH" if os.name == "nt" else "LD_LIBRARY_PATH"
@@ -7732,6 +7786,8 @@ def main() -> int:
                 vcfg = dict(vcfg, max_tokens=fp[0])
                 if models.family(cfg) != "ik2":   # (maya-ik2 lends no memory: the encoder takes what is free)
                     engine_env = dict(env, MAYA_GLM_VISION_LEND_MB=str((fp[1] >> 20) + 1))
+                else:   # (... and its drafting leaves the room the encoder would have had on the GPU: IK2_VISION_GIB)
+                    engine_env = dict(env, IK2_VISION_GIB=f"{fp[1] / 2**30:.3f}")
                 print(f"[maya] images: the vision encoder needs {fp[1] / 2**30:.2f} GB on this GPU at up to {fp[0]} "
                       "image tokens", flush=True)
         if vcfg and not on_demand:

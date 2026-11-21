@@ -5405,6 +5405,18 @@ def draft_forget() -> None:
         warn(f"{path} could not be removed ({e}): delete it by hand to measure the drafting again")
 
 
+def ik2_draft_forget() -> None:
+    """--speed-calibration: maya-ik2's drafting measured on this PC (data/ik2-drafting.txt, --drafting auto) is
+    dropped, so its next start measures it again before it is ready."""
+    path = ROOT / "data" / "ik2-drafting.txt"
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass
+    except OSError as e:
+        warn(f"{path} could not be removed ({e}): delete it by hand to measure the drafting again")
+
+
 def route_forget() -> None:
     """--speed-calibration: maya-hy4's prompt route rates measured on this PC are dropped (data/hy4-prompt-route.txt),
     so the engine measures them again - in the CPU lane check's run below, else at the next start (before it is
@@ -5572,7 +5584,7 @@ def needs_speed_calibration(cfg: dict) -> bool:
         return hy4_both_drafters(cfg) and not hy4_engine_drafting(cfg) and \
             (cfg.get("installer") or {}).get("drafting") == "on" and \
             "speed_calibration" not in (cfg.get("installer") or {})
-    if config_family(cfg) in ("qwen", "ik2"):         # (Inkling 2: the setup offers no drafter)
+    if config_family(cfg) in ("qwen", "ik2"):         # (Inkling 2: --drafting auto, measured by its engine)
         return False
     if config_family(cfg) in ("deepseek", "minimax"):  # (their DSpark drafter: measured once too)
         return CDS.has_drafter(cfg) and "speed_calibration" not in (cfg.get("installer") or {}) and             not (config_family(cfg) == "minimax" and parallel_of(cfg) > 1)   # (maya-mm3 --parallel: no drafting)
@@ -5595,6 +5607,16 @@ def speed_calibration(cfg_path: Path, why: str = "") -> bool:
         return False
     if config_family(cfg) == "qwen":                   # (CYBER-FROST: its MTP drafter or none)
         return bool(qwen_draft_calibration(cfg_path) is not None)
+    if config_family(cfg) == "ik2":                    # (Inkling 2: --drafting auto measures at the engine's start)
+        args = cfg.get("args") or []
+        if "--drafting" in args[:-1] and args[args.index("--drafting") + 1] == "auto":
+            ik2_draft_forget()
+            ok(f"{IK2_SHOWN}: its drafting is measured again at the next start (the engine times no drafting, the "
+               "prompt lookup and the drafter once, before its first answer)")
+            return True
+        ok(f"{IK2_SHOWN}: no speed calibration - drafting is set by hand (--drafting on|off); {ME} --setup "
+           "--drafting measure lets the engine measure it")
+        return False
     if config_family(cfg) == "hy4":
         route_forget()                                 # (the prompt route's rates: measured again too)
         hot_forget(cfg)                                # (... and the experts a start places in VRAM: learned again)
@@ -11066,7 +11088,8 @@ def ik2_about() -> str:
     return ("An EXPERIMENTAL PREVIEW: thinkingmachines' Inkling-2-Mini (26B, a looped model: 8 of 128 experts a token) "
             f"on its own engine, in unsloth's UD-Q4_K_XL GGUF ({gb}); NVIDIA RTX 30 / "
             "A100 and newer, Linux, one GPU with 24 GB of VRAM or more - the whole model sits on the card; tool calls, "
-            "its thinking levels, up to a 256K context, pictures (its vision tower, 0.6 GB); one answer at a time.")
+            "its thinking levels, up to a 256K context, pictures (its vision tower, 0.6 GB), drafting (its own "
+            "drafter, 0.6 GB, and the prompt lookup: measured once on this PC, the same answers); one answer at a time.")
 
 
 def ik2_dir(a, models: Path, prev: dict) -> Path:
@@ -11140,6 +11163,58 @@ def ik2_vision_model() -> dict | None:
             "download_gb": sum(v[0] for v in man["files"].values()) / 1e9}
 
 
+def ik2_drafter_model() -> dict | None:
+    """The model's drafter as offer_download's form (tools/ik2/download.json's "drafter": thinkingmachines' own
+    mtp.safetensors at a pinned revision), or None when the manifest names none."""
+    man = read_json(IK2_MANIFEST).get("drafter") or {}
+    if not man.get("files") or not man.get("repo") or not man.get("revision"):
+        return None
+    return {"about": f"{IK2_SHOWN}'s drafter (it drafts tokens the model checks: faster answers, the same ones): "
+                     f"thinkingmachines' own ({man.get('license', 'Apache 2.0')})", "format": "safetensors",
+            "repo": man["repo"], "revision": man["revision"], "folder": man.get("folder", ""),
+            "files": {k: v[0] for k, v in man["files"].items()}, "sha256": {k: v[1] for k, v in man["files"].items()},
+            "download_gb": sum(v[0] for v in man["files"].values()) / 1e9}
+
+
+def ik2_drafting(a) -> str:
+    """The engine's --drafting from the setup's: off by hand; on by hand (the drafter and the prompt lookup, not
+    measured); else auto - measured once on the PC at the engine's first start (measure, --yes, another model's
+    mtp / dfly2: the same as auto)."""
+    how = getattr(a, "drafting", None)
+    return how if how in ("on", "off") else "auto"
+
+
+def ik2_drafter_step(a, d: Path, vram: float, ctx: int, kv: str) -> Path | None:
+    """The drafter beside the GGUF (in d), downloaded when it is not there and checked against its published sha256,
+    or None: drafting off (--drafting off), or not downloaded - the engine then drafts with the prompt lookup alone.
+    Truthful about this card: where the drafter's room does not fit beside the model at this context, the engine
+    leaves it out at its start (the plan as without it)."""
+    how = ik2_drafting(a)
+    if how == "off":
+        ok("drafting: off (--drafting off) - every token from a full model step")
+        return None
+    m = ik2_drafter_model()
+    if m is None:
+        warn(f"{IK2_MANIFEST} names no drafter: drafting with the prompt lookup alone")
+        return None
+    files = [d / n for n in m["files"]]
+    if any(file_incomplete(m, f) for f in files) and not offer_download(a, "the drafter", d, files, m):
+        warn(f"the drafter was not downloaded: drafting with the prompt lookup alone ({ME} --setup asks again)")
+        return None
+    for f in files:
+        if not sha256_checked(f, m["sha256"][f.name]):
+            f.unlink(missing_ok=True)                  # else the next run finds it complete and fails here again
+            fail(f"{f}: the sha256 does not match the published one (the file was removed)", "run the setup again")
+    fits = IK2F.draft_fits(vram, ctx, kv)
+    ok(f"drafting: {how} - {files[0].name} ({m['download_gb']:.1f} GB) and the prompt lookup; "
+       + ("measured once at the engine's first start on this PC (a minute), the faster kept - the answers are the "
+          "same with drafting or without" if how == "auto" else "on (--drafting on), not measured"))
+    if not fits:
+        warn(f"at {context_label(ctx)} the drafter's {IK2F.draft_gib(ctx):.1f} GB does not fit beside the model on this "
+             f"card: the engine leaves it out (the prompt lookup still drafts) - a smaller context leaves it room")
+    return files[0]
+
+
 def ik2_vision_step(a, pc: dict, meta: dict, llama: Path, d: Path) -> dict | None:
     """Step 7: the config's "vision" entry - maya-vision with the model's mmproj (beside the GGUF, in d) - or None
     (text only, said why).  No text model in it: the pinned llama.cpp does not open Inkling's GGUF, and maya-vision
@@ -11170,17 +11245,20 @@ def ik2_vision_step(a, pc: dict, meta: dict, llama: Path, d: Path) -> dict | Non
 
 
 def write_config_ik2(a, pc: dict, meta: dict, gguf: Path, tok: Path, ctx: int, models: Path, d: Path,
-                     vision: dict | None = None) -> Path:
+                     vision: dict | None = None, drafter: Path | None = None) -> Path:
     """maya-inkling-2-mini.json and its start script.  A setup again keeps what the config before says that this one
     does not ask (its engine flags it names, where the server listens and its key); the model's own sampling and
-    thinking level every setup; pictures (`vision`, step 7) when they were set up."""
+    thinking level every setup; pictures (`vision`, step 7) when they were set up; drafting (--drafting auto by
+    default: the drafter where it was downloaded, and the prompt lookup)."""
     step(8, "the configuration and the start script")
     port = a.port or 8080
     cfg_path = ROOT / f"{Q.config_stem('ik2', Q.IK2_QUANT)}.json"
     old = read_json(cfg_path)
     args = ["--model", str(gguf), "--max-context", str(ctx)]
+    how = ik2_drafting(a)
+    args += (["--draft", str(drafter)] if drafter and how != "off" else []) + ["--drafting", how]
     kept = keep_args(old.get("args") or [], args, ("--threads", "--eos", "--cache-gb"))
-    inst = {"family": "ik2", "quant": Q.OTHERS[("ik2", Q.IK2_QUANT)], "ik2_quant": Q.IK2_QUANT}
+    inst = {"family": "ik2", "quant": Q.OTHERS[("ik2", Q.IK2_QUANT)], "ik2_quant": Q.IK2_QUANT, "drafting": how}
     sampling, effort = Q.model_defaults({"installer": inst})   # (the model's own, every setup)
     cfg = {"exe": str(IK2_EXE), "args": args, "cwd": str(ROOT), "tokenizer": str(tok), "model_name": IK2_MODEL_NAME,
            "gpu": [g["index"] for g in pc["gpus"]], "sampling": sampling, "reasoning_effort": effort,
@@ -11246,9 +11324,10 @@ def set_up_ik2(a, prev: dict) -> Path | None:
     gguf = ik2_model_step(a, d, models)               # 5
     if gguf is None:
         return None
+    drafter = ik2_drafter_step(a, d, vram, ctx, kv)   # (5: its drafter)
     tok = ik2_tokenizer_step(a, d, gguf)              # 6
     vision = ik2_vision_step(a, pc, meta, llama, d)   # 7
-    return write_config_ik2(a, pc, meta, gguf, tok, ctx, models, d, vision)   # 8
+    return write_config_ik2(a, pc, meta, gguf, tok, ctx, models, d, vision, drafter)   # 8
 
 
 def set_up_and_serve(a, prev: dict) -> tuple | None:
