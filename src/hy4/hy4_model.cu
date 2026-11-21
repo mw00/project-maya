@@ -34,6 +34,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -110,6 +111,31 @@ float half_to_float(uint16_t h) {
 }
 // A token's embedding row (k values) from the file's bytes: Q8_0 as it always was read (d * q, block by block), the K
 // types by ggml's own decoders, F32 / BF16 / F16 as they are.  false: a type the host does not decode
+// Whether the IOMMU translates a GPU's DMA (Linux: its PCI device's IOMMU group of type DMA / DMA-FQ - not identity, the
+// passthrough, and no group at all with the IOMMU off).  NVIDIA does not support peer copies on bare metal there: #1100's
+// peer writes faulted (DMAR "PTE Write access is not set").  A group whose type cannot be read counts as translated.
+bool iommu_translates(int dev) {
+#if defined(__linux__)
+    char bus[64] = {0};
+    if (cudaDeviceGetPCIBusId(bus, (int) sizeof bus, dev) != cudaSuccess) {
+        (void) cudaGetLastError();
+        return false;
+    }
+    std::string b(bus);
+    for (char& c : b) c = (char) std::tolower((unsigned char) c);
+    const size_t c1 = b.find(':');   // (sysfs: a 4-digit domain - "0000:02:00.0"; the driver may give 8)
+    if (c1 != std::string::npos && c1 > 4) b = b.substr(c1 - 4);
+    const std::string d = "/sys/bus/pci/devices/" + b;
+    if (access((d + "/iommu_group").c_str(), F_OK) != 0) return false;
+    std::ifstream f(d + "/iommu_group/type");
+    std::string t;
+    if (!(f >> t)) return true;
+    return t == "DMA" || t == "DMA-FQ";
+#else
+    (void) dev;
+    return false;
+#endif
+}
 bool tok_type_ok(int type) { return type == 8 || type == 12 || type == 13 || type == 14 || type == 0 || type == 30 || type == 1; }
 void tok_row(int type, const uint8_t* row, int k, float* dst) {
     if (type == 8) {
@@ -327,6 +353,12 @@ struct Gpu {
     double bw = 0;              // its memory's measured GB/s (a copy within it)
     cudaStream_t s = nullptr;
     cudaEvent_t ev = nullptr;   // (the CPU lane's: its inputs copied)
+    // (the layer split's hand-offs through host memory - where a peer copy is not safe, hand_off: the two pinned halves
+    //  this GPU's incoming pieces pass through, each half's event of its last copy in on this GPU, and as a source the
+    //  event of its last piece out)
+    float* ho_buf[2] = {nullptr, nullptr};
+    size_t ho_b = 0;
+    cudaEvent_t ho_in[2] = {nullptr, nullptr}, ho_out = nullptr;
     std::vector<void*> allocs;
     size_t used = 0;
     // scratch()'s buffers: one allocation, carved in order (idle between forwards - the vision tower's room for a
@@ -434,6 +466,12 @@ struct Model::Impl {
     std::vector<Layer> L;
     std::vector<Gpu> G;
     int head_gpu = 0;
+    // the layer split's hand-offs from G[a] to G[b]: xfer[a * G.size() + b] (peer_setup) - kXPeer a peer copy (peer
+    // access on, a test copy arrived right), kXDriver the same call without peer access (the driver's own route, its
+    // test copy right), kXHost through pinned host memory (hand_off)
+    static constexpr uint8_t kXPeer = 0, kXDriver = 1, kXHost = 2;
+    std::vector<uint8_t> xfer;
+    int n_bad_drafts = 0;   // (drafts stopped at a step with no top token: its logits not finite - #1084)
     Mat out;
     float *out_norm = nullptr, *hh_fn = nullptr, *hh_base = nullptr, *hh_scale = nullptr;
     // the trunk's final state of each position (ring rows of E: the MTP block's input a position later), and the MTP
@@ -844,6 +882,11 @@ struct Model::Impl {
             if (gp.evh0) cudaEventDestroy(gp.evh0);
             if (gp.evh1) cudaEventDestroy(gp.evh1);
             if (gp.s3) cudaStreamDestroy(gp.s3);
+            for (int h = 0; h < 2; ++h) {
+                if (gp.ho_in[h]) cudaEventDestroy(gp.ho_in[h]);
+                if (gp.ho_buf[h]) cudaFreeHost(gp.ho_buf[h]);
+            }
+            if (gp.ho_out) cudaEventDestroy(gp.ho_out);
             if (gp.s) cudaStreamDestroy(gp.s);
         }
         if (h_x) cudaFreeHost(h_x);
@@ -3988,16 +4031,9 @@ struct Model::Impl {
         if (lane && !fetch_pending()) route_start();
         st.experts_vram = n_res;
         st.experts_all = n_all;
-        // peer access between neighbours (a hop a GPU boundary)
-        for (size_t i = 0; i + 1 < G.size(); ++i) {
-            int can = 0;
-            cudaDeviceCanAccessPeer(&can, G[i + 1].dev, G[i].dev);
-            if (can) {
-                cudaSetDevice(G[i + 1].dev);
-                (void) cudaDeviceEnablePeerAccess(G[i].dev, 0);
-                (void) cudaGetLastError();
-            }
-        }
+        // the layer split's hand-offs between GPUs: peer copies where they are safe and arrive right, else through host
+        // memory
+        if (!peer_setup(err)) return false;
         if (o.vision) {   // the vision tower: host memory (the pack's mapping), a picture's room on the main GPU
             vis = std::make_unique<Vision>();
             std::string verr;
@@ -6665,6 +6701,10 @@ struct Model::Impl {
             emb_pending = false;
         }
         for (int t = 0; t < T; ++t) {   // (the embeddings, host-dequantised as the trunk's)
+            if (ids[t] < 0 || ids[t] >= g.n_vocab) {
+                err = "the MTP block: token id " + std::to_string(ids[t]) + " outside the vocabulary";
+                return false;
+            }
             const uint8_t* row = tok_embd + (size_t) ids[t] * tok_ld;
             tok_row(tok_type, row, E, h_emb + (size_t) t * E);
         }
@@ -6864,6 +6904,16 @@ struct Model::Impl {
     }
     // (base >= 0: the drafts after the first `base` are made only while every draft so far has at least `sure` - a
     //  longer window pays when the drafts in it are nearly certain, and costs when they are not)
+    // A draft step's top token: none when every logit is NaN - top1's sentinel 0x7fffffff (#1084: the next step read
+    // that token's embedding row far outside the table and the engine died in the warm-up).  The draft stops there;
+    // said once, the rest counted.
+    bool draft_id_ok(int id) {
+        if (id >= 0 && id < g.n_vocab) return true;
+        if (n_bad_drafts++ == 0)
+            std::fprintf(stderr, "maya-hy4: WARN a draft step's logits were not finite (no top token): the draft stopped "
+                                 "there (the next ones counted, not shown)\n");
+        return false;
+    }
     bool draft(int tok, int64_t pos, int n, float floor, std::vector<int>& d, std::vector<float>& conf,
                std::string& err, int base = -1, float sure = 0.0f) {
         d.clear();
@@ -6941,6 +6991,7 @@ struct Model::Impl {
             }
             int id;
             std::memcpy(&id, &r[0], 4);
+            if (!draft_id_ok(id)) break;
             if (base >= 0 && i >= base && r[1] < sure) break;   // (a draft beyond `base`: taken only when it is sure too)
             d.push_back(id);
             conf.push_back(r[1]);
@@ -7290,6 +7341,7 @@ struct Model::Impl {
             if (dmp) dfly_file("hc_" + std::to_string(i) + ".f32", df.t, rb, true, s);
             int id;
             std::memcpy(&id, &r[0], 4);
+            if (!draft_id_ok(id)) break;
             d.push_back(id);
             conf.push_back(r[1]);
             if (r[1] < floor) break;
@@ -7332,6 +7384,181 @@ struct Model::Impl {
               "; CUDA reports a kernel's fault at a later launch - CUDA_LAUNCH_BLOCKING=1 names the kernel that faulted)"
               " - then: " + err;
     }
+    // The layer split's hand-offs between GPUs (a layer's GPU to the next layer's, the last to the head's): a peer copy
+    // only where the driver offers peer access, the IOMMU translates neither GPU's DMA (iommu_translates - #1100) and a
+    // test copy over the very call arrives right (a PHB pair took peer copies and delivered 99.6% of the bytes wrong);
+    // else through pinned host memory (hand_off), the same bytes.  HY4_HOST_STAGE=1: host memory for every hand-off;
+    // HY4_PEER=1: peer copies tried (and tested) where the IOMMU translates too.  Tensor parallel hands nothing over
+    // between GPUs (the host sums): no peer access there.
+    bool peer_setup(std::string& err) {
+        const size_t n = G.size();
+        xfer.assign(n * n, kXDriver);
+        if (n < 2 || tp > 1) return true;
+        std::vector<char> used(n * n, 0), peer(n * n, 0);
+        int cur = -1;
+        for (const Layer& l : L) {
+            if (l.gpu < 0) continue;
+            if (cur >= 0 && l.gpu != cur) used[(size_t) cur * n + (size_t) l.gpu] = 1;
+            cur = l.gpu;
+        }
+        if (cur >= 0 && cur != head_gpu) used[(size_t) cur * n + (size_t) head_gpu] = 1;
+        const char* hs = std::getenv("HY4_HOST_STAGE");
+        const char* hp = std::getenv("HY4_PEER");
+        const bool force_host = hs && std::atoi(hs) != 0, force_peer = hp && std::atoi(hp) != 0;
+        std::vector<char> smmu(n, 0);
+        for (size_t i = 0; i < n; ++i) smmu[i] = !force_host && !force_peer && iommu_translates(G[i].dev);
+        std::vector<std::string> why(n * n);   // (a hand-off through host memory: why)
+        for (size_t a = 0; a < n; ++a)
+            for (size_t b = 0; b < n; ++b) {
+                if (!used[a * n + b]) continue;
+                if (force_host) why[a * n + b] = "HY4_HOST_STAGE=1";
+                else if (smmu[a] || smmu[b]) why[a * n + b] = "the IOMMU translates the GPUs' DMA";
+            }
+        // peer access as it always was (each GPU onto the one before it), between neighbours with a hand-off that may
+        // be a peer copy
+        for (size_t i = 0; i + 1 < n; ++i) {
+            const size_t f = i * n + i + 1, r = (i + 1) * n + i;
+            if (!(used[f] && why[f].empty()) && !(used[r] && why[r].empty())) continue;
+            int can = 0;
+            if (cudaDeviceCanAccessPeer(&can, G[i + 1].dev, G[i].dev) != cudaSuccess) can = 0;
+            (void) cudaGetLastError();
+            if (!can) continue;
+            CK(cudaSetDevice(G[i + 1].dev));
+            const cudaError_t pe = cudaDeviceEnablePeerAccess(G[i].dev, 0);
+            (void) cudaGetLastError();
+            if (pe == cudaSuccess || pe == cudaErrorPeerAccessAlreadyEnabled) peer[f] = peer[r] = 1;
+        }
+        // a test copy over each remaining hand-off's own call, between its own buffers (idle until the first forward)
+        const size_t full = sizeof(float) * (size_t) Tc * (size_t) g.hc * (size_t) g.n_embd;
+        const size_t nb = std::min<size_t>((size_t) 4 << 20, full) & ~(size_t) 3;
+        std::vector<uint32_t> pat(nb / 4), back(nb / 4);
+        for (size_t a = 0; a < n; ++a)
+            for (size_t b = 0; b < n; ++b) {
+                if (!used[a * n + b] || !why[a * n + b].empty()) continue;
+                Gpu& pa = G[a];
+                Gpu& pb = G[b];
+                if (!pa.x || !pb.x) {
+                    why[a * n + b] = "no buffers to test a copy";
+                    continue;
+                }
+                for (size_t i = 0; i < pat.size(); ++i) pat[i] = (uint32_t) (i * 2654435761u) ^ (0x9e3779b9u + (uint32_t) (a * 64 + b));
+                CK(cudaSetDevice(pa.dev));
+                CK(cudaMemcpy(pa.x, pat.data(), nb, cudaMemcpyHostToDevice));
+                CK(cudaSetDevice(pb.dev));
+                CK(cudaMemsetAsync(pb.x, 0, nb, pb.s));
+                CK(cudaStreamSynchronize(pb.s));
+                const cudaError_t ce = cudaMemcpyPeerAsync(pb.x, pb.dev, pa.x, pa.dev, nb, pb.s);
+                cudaError_t se = cudaSuccess;
+                if (ce == cudaSuccess) {
+                    const double t0 = now_s();
+                    while ((se = cudaStreamQuery(pb.s)) == cudaErrorNotReady && now_s() - t0 < 20.0) std::this_thread::yield();
+                    if (se == cudaErrorNotReady) {
+                        err = "a test copy from GPU " + std::to_string(pa.dev) + " to GPU " + std::to_string(pb.dev) +
+                              " did not finish in 20 s (peer copies hang on this PC: HY4_HOST_STAGE=1 hands over "
+                              "through host memory)";
+                        return false;
+                    }
+                }
+                (void) cudaGetLastError();
+                size_t wrong = pat.size();
+                if (ce == cudaSuccess && se == cudaSuccess &&
+                    cudaMemcpy(back.data(), pb.x, nb, cudaMemcpyDeviceToHost) == cudaSuccess) {
+                    wrong = 0;
+                    for (size_t i = 0; i < pat.size(); ++i) wrong += back[i] != pat[i];
+                }
+                (void) cudaGetLastError();
+                if (wrong == 0) continue;
+                char m[160];
+                if (ce != cudaSuccess || se != cudaSuccess)
+                    std::snprintf(m, sizeof m, "a test copy failed: %s", cudaGetErrorString(ce != cudaSuccess ? ce : se));
+                else
+                    std::snprintf(m, sizeof m, "a test copy arrived wrong: %zu of %zu words", wrong, pat.size());
+                why[a * n + b] = m;
+                if (peer[a * n + b]) {   // (peer access off between the two: neither way peer copies then)
+                    const size_t lo = std::min(a, b), hi = std::max(a, b);
+                    CK(cudaSetDevice(G[hi].dev));
+                    (void) cudaDeviceDisablePeerAccess(G[lo].dev);
+                    (void) cudaGetLastError();
+                    peer[a * n + b] = peer[b * n + a] = 0;
+                    if (used[b * n + a] && why[b * n + a].empty()) why[b * n + a] = "peer access dropped (the other way's test copy)";
+                }
+            }
+        // the GPUs still sound after the tests (a fault there is sticky: say where it came from)
+        for (size_t i = 0; i < n; ++i) {
+            CK(cudaSetDevice(G[i].dev));
+            const cudaError_t e = cudaDeviceSynchronize();
+            if (e != cudaSuccess) {
+                err = "GPU " + std::to_string(G[i].dev) + " after the test copies between GPUs: " + cudaGetErrorString(e) +
+                      " (HY4_HOST_STAGE=1 hands over through host memory)";
+                return false;
+            }
+        }
+        const char* sm = std::getenv("HY4_STAGE_MB");
+        const size_t piece = std::min(full, (size_t) std::max(1, sm ? std::atoi(sm) : 8) << 20);
+        std::string say;
+        for (size_t a = 0; a < n; ++a)
+            for (size_t b = 0; b < n; ++b) {
+                if (!used[a * n + b]) continue;
+                const bool host = !why[a * n + b].empty();
+                xfer[a * n + b] = host ? kXHost : peer[a * n + b] ? kXPeer : kXDriver;
+                say += (say.empty() ? "" : ", ") + std::string("CUDA") + std::to_string(G[a].dev) + " -> CUDA" +
+                       std::to_string(G[b].dev) + (host ? " through host memory (" + why[a * n + b] + ")" :
+                                                   peer[a * n + b] ? " peer copy (tested)" : " driver copy (tested)");
+                if (!host) continue;
+                Gpu& pa = G[a];
+                Gpu& pb = G[b];
+                if (!pa.ho_out) {
+                    CK(cudaSetDevice(pa.dev));
+                    CK(cudaEventCreateWithFlags(&pa.ho_out, cudaEventDisableTiming));
+                }
+                if (!pb.ho_buf[0]) {
+                    CK(cudaSetDevice(pb.dev));
+                    for (int h = 0; h < 2; ++h) {
+                        if (cudaHostAlloc((void**) &pb.ho_buf[h], piece, cudaHostAllocPortable) != cudaSuccess) {
+                            (void) cudaGetLastError();
+                            err = "the hand-offs through host memory: " + std::to_string(piece >> 20) + " MiB pinned did not come";
+                            return false;
+                        }
+                        CK(cudaEventCreateWithFlags(&pb.ho_in[h], cudaEventDisableTiming));
+                    }
+                    pb.ho_b = piece;
+                }
+            }
+        if (!say.empty()) info.push_back("INFO hand-offs between GPUs: " + say);
+        return true;
+    }
+    // One of the layer split's hand-offs, G[a]'s rows to G[b] (b's device current after it): a's queued work waited for
+    // on the host, as it always was, then a peer copy on b's stream - or through host memory (xfer kXHost) in pieces of
+    // a pinned half each, a's stream copying a piece out once that half's last piece is in, b's copying it in once it is
+    // out (a's next piece out beside b's copy in)
+    bool hand_off(int a, int b, float* dst, const float* src, size_t bytes, std::string& err) {
+        Gpu& pa = G[(size_t) a];
+        Gpu& pb = G[(size_t) b];
+        CK(cudaStreamSynchronize(pa.s));
+        if (xfer.empty() || xfer[(size_t) a * G.size() + (size_t) b] != kXHost) {
+            CK(cudaMemcpyPeerAsync(dst, pb.dev, src, pa.dev, bytes, pb.s));
+            return true;
+        }
+        const char* s8 = (const char*) src;
+        char* d8 = (char*) dst;
+        size_t piece = 0;
+        for (size_t off = 0; off < bytes; off += pb.ho_b, ++piece) {
+            const size_t nb = std::min(pb.ho_b, bytes - off);
+            const int h = (int) (piece & 1);
+            CK(cudaSetDevice(pa.dev));
+            CK(cudaStreamWaitEvent(pa.s, pb.ho_in[h], 0));
+            CK(cudaMemcpyAsync(pb.ho_buf[h], s8 + off, nb, cudaMemcpyDeviceToHost, pa.s));
+            CK(cudaEventRecord(pa.ho_out, pa.s));
+            k::submit(pa.s);
+            CK(cudaSetDevice(pb.dev));
+            CK(cudaStreamWaitEvent(pb.s, pa.ho_out, 0));
+            CK(cudaMemcpyAsync(d8 + off, pb.ho_buf[h], nb, cudaMemcpyHostToDevice, pb.s));
+            CK(cudaEventRecord(pb.ho_in[h], pb.s));
+        }
+        CK(cudaSetDevice(pb.dev));
+        return true;
+    }
+
     bool window(const int* ids, int T, int64_t p0, int want, float* logits_out, std::string& err) {
         const int E = g.n_embd, hc = g.hc;
         win_t0 = now_s();
@@ -7395,10 +7622,8 @@ struct Model::Impl {
                 if (cur < 0) {
                     CK(cudaMemcpyAsync(gp.cur, h_x, sizeof(float) * T * E, cudaMemcpyHostToDevice, gp.s));
                     k::expand_streams(gp.cur, T, hc, E, gp.x, gp.s);
-                } else {
-                    Gpu& pg = G[(size_t) cur];
-                    CK(cudaStreamSynchronize(pg.s));
-                    CK(cudaMemcpyPeerAsync(gp.x, gp.dev, pg.x, pg.dev, sizeof(float) * T * hc * E, gp.s));
+                } else if (!hand_off(cur, l.gpu, gp.x, G[(size_t) cur].x, sizeof(float) * T * hc * E, err)) {
+                    return false;
                 }
                 cur = l.gpu;
             }
@@ -7446,10 +7671,8 @@ struct Model::Impl {
             fx.p_host += now_s() - wh0;
         }
         if (cur != head_gpu) {   // (the final state and the positions: the head's GPU may hold no layer)
-            Gpu& pg = G[(size_t) cur];
-            CK(cudaStreamSynchronize(pg.s));
             CK(cudaMemcpyAsync(hg.pos, h_pos, sizeof(int) * 3 * Tc, cudaMemcpyHostToDevice, hg.s));
-            CK(cudaMemcpyPeerAsync(hg.x, hg.dev, pg.x, pg.dev, sizeof(float) * T * hc * E, hg.s));
+            if (!hand_off(cur, head_gpu, hg.x, G[(size_t) cur].x, sizeof(float) * T * hc * E, err)) return false;
         }
         if (!head_tail(ids, T, p0, want, logits_out, err)) return false;
         CK(cudaStreamSynchronize(hg.s));
@@ -8582,10 +8805,23 @@ bool Model::load(const Options& o, std::string& err) {
     m->hot.quiet = true;   // (HY4_HOT: the warm-up's routes not counted)
     bool ok = forward(ids.data(), T, 0, 1, lg.data(), err) && forward(ids.data(), 4, T, 4, lg.data(), err);
     m->hot.quiet = false;
+    if (ok) {   // (NaN logits: every answer wrong and a draft without a top token - #1084 - said at the start instead)
+        size_t nan = 0;
+        for (size_t i = 0; i < (size_t) 4 * V; ++i) nan += std::isnan(lg[i]) ? 1 : 0;
+        if (nan > 0) {
+            err = "the logits came out NaN (" + std::to_string(nan) + " of " + std::to_string((size_t) 4 * V) +
+                  " values): wrong numbers on this PC (with several GPUs: HY4_HOST_STAGE=1 hands their activations over "
+                  "through host memory)";
+            ok = false;
+        }
+    }
     if (ok && has_mtp()) {
         std::vector<int> d;
         std::vector<float> c;
+        const int bad0 = m->n_bad_drafts;
         ok = draft(ids[0], T + 4, 3, 0.0f, d, c, err);
+        if (ok && m->n_bad_drafts > bad0)
+            m->info.push_back("NOTE the warm-up's draft had no top token (its logits not finite): drafts stop at such a step");
     }
     if (ok && m->vis) {   // (the tower's kernels and cuBLAS's start, and its weights read once: a small grey picture)
         const int f = m->vgeo.factor() * 2;
