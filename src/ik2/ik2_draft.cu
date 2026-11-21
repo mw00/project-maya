@@ -535,4 +535,47 @@ void propose(Drafter* d, int anchor, const float* anchor_h, int P, const uint16_
 size_t bytes(const Drafter* d) { return d->vram; }
 void set_head_q8(Drafter* d, const int8_t* q8, const uint16_t* q8d) { d->head_q8 = q8, d->head_q8d = q8d; }
 
+namespace {
+// save_context / load_context: each layer's K then V rows of positions pos - w .. pos - 1 (w = min(pos, cap)), in
+// ring order from the oldest - the two pieces either side of the ring's end
+template <class F>
+void ctx_rows(const Drafter* d, int pos, F&& copy) {
+    const size_t KD = (size_t) d->KV * 128;
+    for (const auto& l : d->L) {
+        const int w = std::min(pos, l.cap);
+        if (w <= 0) continue;
+        const int s0 = (pos - w) % l.cap, n1 = std::min(w, l.cap - s0), n2 = w - n1;
+        const size_t row = KD * (l.kc16 ? 2 : 4);
+        uint8_t* kc = l.kc16 ? (uint8_t*) l.kc16 : (uint8_t*) l.kc;
+        uint8_t* vc = l.kc16 ? (uint8_t*) l.vc16 : (uint8_t*) l.vc;
+        for (uint8_t* c : {kc, vc}) {
+            copy(c + (size_t) s0 * row, (size_t) n1 * row);
+            if (n2 > 0) copy(c, (size_t) n2 * row);
+        }
+    }
+}
+}  // namespace
+
+void save_context(const Drafter* d, int pos, std::vector<uint8_t>& out) {
+    size_t n = 0;
+    ctx_rows(d, pos, [&](uint8_t*, size_t b) { n += b; });
+    out.resize(n);
+    size_t at = 0;
+    ctx_rows(d, pos, [&](uint8_t* dev, size_t b) {
+        cu(cudaMemcpyAsync(out.data() + at, dev, b, cudaMemcpyDeviceToHost, d->s), "save_context");
+        at += b;
+    });
+    cu(cudaStreamSynchronize(d->s), "save_context");
+}
+
+void load_context(Drafter* d, int pos, const std::vector<uint8_t>& in) {
+    size_t at = 0;
+    ctx_rows(d, pos, [&](uint8_t* dev, size_t b) {
+        if (at + b > in.size()) return;   // (not this drafter's rows: what is there stays, the drafts only worse)
+        cu(cudaMemcpyAsync(dev, in.data() + at, b, cudaMemcpyHostToDevice, d->s), "load_context");
+        at += b;
+    });
+    cu(cudaStreamSynchronize(d->s), "load_context");
+}
+
 }  // namespace ik2::draft

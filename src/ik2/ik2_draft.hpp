@@ -47,5 +47,10 @@ void propose(Drafter* d, int anchor, const float* anchor_h, int P, const uint16_
 void set_head_q8(Drafter* d, const int8_t* q8, const uint16_t* q8d);
 /// VRAM it holds, bytes.
 size_t bytes(const Drafter* d);
+/// The context caches' rows of the positions before `pos` that their rings hold (each layer's last min(pos, cap)),
+/// copied to the host (out, resized) / back from it - a session put aside and taken up again (--serve's session
+/// cache).  Synchronous.
+void save_context(const Drafter* d, int pos, std::vector<uint8_t>& out);
+void load_context(Drafter* d, int pos, const std::vector<uint8_t>& in);
 
 }  // namespace ik2::draft
