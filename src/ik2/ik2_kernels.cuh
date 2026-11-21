@@ -249,6 +249,11 @@ void mv_f16(const uint16_t* W, int N, int K, const float* x, float* y, cudaStrea
 void route_gather(const int* top, const float* w, const uint8_t* const* tab, const float* sg_t, const float* su_t,
                   const float* sd_t, int S, int K, const uint8_t** blob, int* tok, int* inv, float* sg, float* su,
                   float* wt, cudaStream_t s);
+/// One token's route() and route_gather() in one launch (the same values to the bit): top, w [K] and the K slots'
+/// tables.
+void route_token(const float* logits, const float* bias, int E, int K, float scale, const uint8_t* const* tab,
+                 const float* sg_t, const float* su_t, const float* sd_t, int* top, float* w, const uint8_t** blob,
+                 int* tok, int* inv, float* sg, float* su, float* wt, cudaStream_t s);
 /// prep_qkv_r_f16 / _fp8 of one token whose position is at pos (device): the cache slot from it, and with log_scale
 /// (a full layer) q's and r's tau.  q16 (given): an FP16 copy of the clipped q, [H][D] (attn_decode_mma's).
 void prep_qkv_r_f16_at(float* q, const float* q_clip, const float* k_in, uint16_t* kc, const float* v_in, uint16_t* vc,

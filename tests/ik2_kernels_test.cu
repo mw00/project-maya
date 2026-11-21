@@ -403,6 +403,44 @@ void test_route() {
     }
     expect_true("route: the picks", picks_ok);
     if (picks_ok) expect("route: the weights", w, want_w, 2e-5);
+    // route_token: a token's route and route_gather in one launch, the same values to the bit (ties among them:
+    // the logits of the first rows repeated)
+    {
+        std::vector<const uint8_t*> tab(E);
+        for (int e = 0; e < E; ++e) tab[e] = (const uint8_t*) (uintptr_t) (0x1000 + 64 * e);
+        auto sgt = fvec(E, 2.0f), sut = fvec(E, 2.0f), sdt = fvec(E, 2.0f);
+        const uint8_t** dtab = dev(tab);
+        float *dsg = dev(sgt), *dsu = dev(sut), *dsd = dev(sdt);
+        bool same = true;
+        for (int t = 0; t < 40; ++t) {
+            std::vector<float> row(lg.begin() + (size_t) t * E, lg.begin() + (size_t) (t + 1) * E);
+            if (t >= 30)   // ties: a handful of equal logits and biases among the largest
+                for (int e = 0; e < E; e += 7) row[e] = 5.5f;
+            std::vector<float> b2 = bias;
+            if (t >= 30)
+                for (int e = 0; e < E; e += 7) b2[e] = 0.1f;
+            float *dr = dev(row), *db2 = dev(b2);
+            int *t1 = dev_n<int>(K), *t2 = dev_n<int>(K), *k1 = dev_n<int>(K), *k2 = dev_n<int>(K), *i1 = dev_n<int>(K),
+                *i2 = dev_n<int>(K);
+            float *w1 = dev_n<float>(K), *w2 = dev_n<float>(K), *g1 = dev_n<float>(K), *g2 = dev_n<float>(K),
+                  *u1 = dev_n<float>(K), *u2 = dev_n<float>(K), *x1 = dev_n<float>(K), *x2 = dev_n<float>(K);
+            const uint8_t **b1 = dev_n<const uint8_t*>(K), **bb2 = dev_n<const uint8_t*>(K);
+            k::route(dr, db2, 1, E, K, 8.0f, t1, w1, 0);
+            k::route_gather(t1, w1, dtab, dsg, dsu, dsd, K, K, b1, k1, i1, g1, u1, x1, 0);
+            k::route_token(dr, db2, E, K, 8.0f, dtab, dsg, dsu, dsd, t2, w2, bb2, k2, i2, g2, u2, x2, 0);
+            same &= host(t1, K) == host(t2, K) && host(k1, K) == host(k2, K) && host(i1, K) == host(i2, K);
+            same &= host(b1, K) == host(bb2, K);
+            const auto a1 = host(w1, K), a2 = host(w2, K), c1 = host(g1, K), c2 = host(g2, K), d1 = host(u1, K),
+                       d2 = host(u2, K), e1 = host(x1, K), e2 = host(x2, K);
+            same &= !std::memcmp(a1.data(), a2.data(), K * 4) && !std::memcmp(c1.data(), c2.data(), K * 4) &&
+                    !std::memcmp(d1.data(), d2.data(), K * 4) && !std::memcmp(e1.data(), e2.data(), K * 4);
+            for (int* q : {t1, t2, k1, k2, i1, i2}) cudaFree(q);
+            for (float* q : {w1, w2, g1, g2, u1, u2, x1, x2, dr, db2}) cudaFree(q);
+            cudaFree(b1), cudaFree(bb2);
+        }
+        expect_true("route_token: route and route_gather's values to the bit (40 tokens, ties among them)", same);
+        cudaFree(dtab), cudaFree(dsg), cudaFree(dsu), cudaFree(dsd);
+    }
     cudaFree(dl), cudaFree(db), cudaFree(dw), cudaFree(dt);
 }
 
