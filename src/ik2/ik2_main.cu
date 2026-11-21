@@ -24,6 +24,7 @@
 #include "ik2_cpu.hpp"
 #include "ik2_draft.hpp"
 #include "ik2_kernels.cuh"
+#include "ik2_lane.hpp"
 #include "ik2_off.cuh"
 #include "strata/artifact/gguf_reader.hpp"
 
@@ -2013,8 +2014,20 @@ struct OffState {
     uint32_t* heat = nullptr;           // [n_layer * E] (device): picks since load
     int blocks = 0;                     // off_fetch_copy's grid
     uint64_t tick = ~0ull;              // the cache's tick the tables were made at (a prompt moves experts)
+    // the lane-parity mode (IK2_LANE): the CPU lane's mailboxes (mapped host memory) and the split's figures
+    std::vector<int> fmt;               // [n_layer] 0 NVFP4, 1 Q8_0
+    k::LaneCost* cost = nullptr;        // (device)
+    k::LaneCost cost_h{};               // (pinned host: what was last sent)
+    k::LaneState* ls = nullptr;         // (device)
+    int* cls = nullptr;                 // (device) [K]
+    float* hx = nullptr;                // (device) [K][F] the exact lane's h
+    k::LaneJob* job_d = nullptr;        // (the GPU's view of the mailboxes)
+    k::LaneDone* done_d = nullptr;
+    void *job_h = nullptr, *done_h = nullptr;
+    std::unique_ptr<ik2::lane::Server> lane;
 };
 OffState g_offs;
+bool g_lane = false;   // IK2_LANE: the offload path's lane-parity mode (set at load)
 bool g_graph = true;        // IK2_GRAPH=0: the resident path's launches one by one
 bool g_block = true;        // IK2_BLOCK=0: a verify window through forward() instead of the block path
 int g_attn_mma = 1;         // a token's attention on the tensor cores (IK2_ATTN_MMA=0: the scalar kernels; 2: the
@@ -2190,12 +2203,24 @@ void fast_token_launches(Model& M, Work& W, OutMode out_mode) {
         float* rw = (float*) (W.route_d + c.K);
         // (NVFP4 experts go through the tensor cores, their input as two FP16 limbs the router's launch writes)
         static const int exp_mma = getenv("IK2_EXPERT_MMA") ? atoi(getenv("IK2_EXPERT_MMA")) : 1;
-        const bool exp_tc = exp_mma && k::experts_mma_fits(Ly.ty[0], Ly.ty[1], Ly.ty[2], C, c.F);
+        const bool exp_tc = exp_mma && !g_lane && k::experts_mma_fits(Ly.ty[0], Ly.ty[1], Ly.ty[2], C, c.F);
         k::route_token(W.rlog, Ly.probs_b, c.E, c.K, c.route_scale, Ly.tab_blob, Ly.tab_sc[0], Ly.tab_sc[1],
                        Ly.tab_sc[2], rtop, rw, W.blob, W.tok, W.inv, W.sg, W.su, W.wt, g_s, W.xq, C,
                        exp_tc ? (uint16_t*) W.gu32 : nullptr);
         if (g_off) {   // (the offload path: the picks the tier does not hold copied into staging, their slots filled)
             const auto& st = g_offs.stage[g_offs.pool[l]];
+            if (g_lane) {   // (lane parity: every expert in ik2_exact.h's sums, the CPU lane beside the fetch)
+                k::off_lane_plan(W.blob, rtop, c.K, l * c.E, g_offs.host[l], Ly.slot_bytes, st, g_offs.fl, g_offs.cnt,
+                                 g_offs.heat, g_offs.cost, g_offs.fmt[l], W.xq, C, W.sg, W.su, l, g_offs.job_d,
+                                 g_offs.ls, g_offs.cls, g_s);
+                k::off_fetch_copy(g_offs.fl, Ly.slot_bytes, g_offs.blocks, g_s);
+                k::off_gate_up_x(W.blob, g_offs.cls, c.K, Ly.ty[0], Ly.eb[0], W.xq, C, c.F, W.sg, W.su, c.gate_cap,
+                                 c.up_cap, g_offs.hx, g_s);
+                k::off_down_x(W.blob, g_offs.cls, c.K, Ly.ty[2], Ly.eb[0] + Ly.eb[1], g_offs.hx, C, c.F, W.y32, g_s);
+                k::off_lane_wait(g_offs.ls, g_offs.done_d, C, W.y32, g_s);
+                k::moe_combine_conv(W.y32, W.inv, W.wt, c.K, C, Ly.h_mlp, Ly.sc_mlp, W.r, W.h, g_s);
+                continue;
+            }
             k::off_fetch_plan(W.blob, rtop, c.K, l * c.E, g_offs.host[l], Ly.slot_bytes, st, g_offs.fl, g_offs.cnt,
                               g_offs.heat, g_s);
             k::off_fetch_copy(g_offs.fl, Ly.slot_bytes, g_offs.blocks, g_s);
@@ -2258,12 +2283,128 @@ void off_tables(Model& M) {
     g_offs.tick = EC.tick;
 }
 
+// The lane-parity mode (IK2_LANE=1, =fetch / =cpu: every miss to one side - tests): the CPU lane started and the
+// split's figures measured here (an expert on the lane, over the bus, on the GPU).  False: the layers' experts are
+// not in formats the exact lane has (NVFP4 / Q8_0, gate and up of one type) - the offload path goes on without it.
+bool lane_init(Model& M, const std::string& want, int threads) {
+    const Config& c = M.c;
+    const int C = c.C, F = c.F, K = c.K;
+    auto fmt_ok = [](int t) { return t == k::kNVFP4 || t == k::kQ8_0; };
+    if (F % 32 || C % 64 || K > k::kOffMaxK) return false;
+    g_offs.fmt.assign(c.n_layer, 0);
+    std::vector<ik2::lane::LayerW> lw(c.n_layer);
+    for (int l = 0; l < c.n_layer; ++l) {
+        const Layer& Ly = M.L[l];
+        if (!fmt_ok(Ly.ty[0]) || Ly.ty[1] != Ly.ty[0] || !fmt_ok(Ly.ty[2])) return false;
+        g_offs.fmt[l] = Ly.ty[0] == k::kNVFP4 ? 0 : 1;
+        lw[l] = {Ly.host[0], Ly.slot_bytes, Ly.eb[0], Ly.eb[0] + Ly.eb[1], Ly.ty[0], Ly.ty[2]};
+    }
+    g_offs.cost = dalloc<k::LaneCost>(1);
+    g_offs.ls = dalloc<k::LaneState>(1);
+    g_offs.cls = dalloc<int>(k::kOffMaxK);
+    g_offs.hx = dalloc<float>((size_t) k::kOffMaxK * F);
+    CU(cudaMemsetAsync(g_offs.ls, 0, sizeof(k::LaneState), g_s));
+    const size_t jb = k::kLaneJobX + (size_t) C * 4, db = k::kLaneDoneY + (size_t) k::kOffMaxK * C * 4;
+    CU(cudaHostAlloc(&g_offs.job_h, jb, cudaHostAllocMapped | cudaHostAllocPortable));
+    CU(cudaHostAlloc(&g_offs.done_h, db, cudaHostAllocMapped | cudaHostAllocPortable));
+    std::memset(g_offs.job_h, 0, jb);
+    std::memset(g_offs.done_h, 0, db);
+    CU(cudaHostGetDevicePointer((void**) &g_offs.job_d, g_offs.job_h, 0));
+    CU(cudaHostGetDevicePointer((void**) &g_offs.done_d, g_offs.done_h, 0));
+    g_offs.lane = std::make_unique<ik2::lane::Server>(threads, C, F, c.gate_cap, c.up_cap, lw, g_offs.job_h, g_offs.done_h);
+    // the split's figures: the fastest of a few runs each (an idle start: the decode re-times the lane as it goes)
+    std::vector<float> xr(C);
+    for (int i = 0; i < C; ++i) xr[i] = std::sin(0.37f * i) * 0.8f;
+    k::LaneCost cs{};
+    cs.lat = 30.0f;
+    int lay[2] = {-1, -1};
+    for (int l = 0; l < c.n_layer; ++l)
+        if (lay[g_offs.fmt[l]] < 0) lay[g_offs.fmt[l]] = l;
+    cudaEvent_t e0, e1;
+    CU(cudaEventCreate(&e0));
+    CU(cudaEventCreate(&e1));
+    const uint8_t** tb = dalloc<const uint8_t*>(k::kOffMaxK);
+    float* sgd = dalloc<float>(k::kOffMaxK);
+    float* xd = dalloc<float>(C);
+    float* yd = dalloc<float>((size_t) k::kOffMaxK * C);
+    {
+        std::vector<float> ones(k::kOffMaxK, 1.0f);
+        CU(cudaMemcpyAsync(sgd, ones.data(), ones.size() * 4, cudaMemcpyHostToDevice, g_s));
+        CU(cudaMemcpyAsync(xd, xr.data(), (size_t) C * 4, cudaMemcpyHostToDevice, g_s));
+        CU(cudaMemsetAsync(g_offs.cls, 0, k::kOffMaxK * 4, g_s));
+        CU(cudaStreamSynchronize(g_s));
+    }
+    for (int f = 0; f < 2; ++f) {
+        const int l = lay[f];
+        if (l < 0) continue;
+        const Layer& Ly = M.L[l];
+        int ex[8];
+        for (int i = 0; i < 8; ++i) ex[i] = (i * 37 + 5) % c.E;
+        cs.cpu[f] = (float) g_offs.lane->time_experts(l, ex, 4, xr.data(), 3);
+        // the bus: 8 experts into staging, the copy kernel the decode uses
+        const auto& st = g_offs.stage[g_offs.pool[l]];
+        k::OffFetch fh{};
+        fh.n = std::min(8, st.n);
+        std::vector<const uint8_t*> slots(fh.n);
+        for (int i = 0; i < fh.n; ++i) {
+            fh.src[i] = g_offs.host[l] + (size_t) ex[i] * Ly.slot_bytes;
+            fh.dst[i] = st.data + (size_t) i * st.sb;
+            slots[i] = fh.dst[i];
+        }
+        CU(cudaMemcpyAsync(g_offs.fl, &fh, sizeof fh, cudaMemcpyHostToDevice, g_s));
+        CU(cudaMemcpyAsync(tb, slots.data(), slots.size() * sizeof(void*), cudaMemcpyHostToDevice, g_s));
+        float best_f = 1e30f, best_g = 1e30f;
+        for (int r = 0; r < 3; ++r) {
+            float ms = 0;
+            CU(cudaEventRecord(e0, g_s));
+            k::off_fetch_copy(g_offs.fl, Ly.slot_bytes, g_offs.blocks, g_s);
+            CU(cudaEventRecord(e1, g_s));
+            CU(cudaEventSynchronize(e1));
+            CU(cudaEventElapsedTime(&ms, e0, e1));
+            best_f = std::min(best_f, ms * 1e3f / fh.n);
+            CU(cudaEventRecord(e0, g_s));
+            k::off_gate_up_x(tb, g_offs.cls, fh.n, Ly.ty[0], Ly.eb[0], xd, C, F, sgd, sgd, c.gate_cap, c.up_cap,
+                             g_offs.hx, g_s);
+            k::off_down_x(tb, g_offs.cls, fh.n, Ly.ty[2], Ly.eb[0] + Ly.eb[1], g_offs.hx, C, F, yd, g_s);
+            CU(cudaEventRecord(e1, g_s));
+            CU(cudaEventSynchronize(e1));
+            CU(cudaEventElapsedTime(&ms, e0, e1));
+            best_g = std::min(best_g, ms * 1e3f / fh.n);
+        }
+        cs.fetch[f] = best_f, cs.gpu[f] = best_g;
+        CU(cudaMemsetAsync(st.tag, 0xff, (size_t) st.n * 4, g_s));   // (the slots used: free again)
+    }
+    for (int f = 0; f < 2; ++f)   // (a format with no layer: the other's figures)
+        if (lay[f] < 0) cs.cpu[f] = cs.cpu[1 - f], cs.fetch[f] = cs.fetch[1 - f], cs.gpu[f] = cs.gpu[1 - f];
+    cs.force = want == "fetch" ? 1 : want == "cpu" ? 2 : 0;
+    g_offs.cost_h = cs;
+    CU(cudaMemcpyAsync(g_offs.cost, &g_offs.cost_h, sizeof cs, cudaMemcpyHostToDevice, g_s));
+    CU(cudaStreamSynchronize(g_s));
+    cudaFree(tb), cudaFree(sgd), cudaFree(xd), cudaFree(yd);
+    cudaEventDestroy(e0), cudaEventDestroy(e1);
+    std::printf("lane parity: the CPU lane on %d threads (%s rows); an expert %.0f / %.0f us on the CPU, %.0f / %.0f us "
+                "over the bus, %.0f / %.0f us on the GPU (NVFP4 / Q8_0)%s\n",
+                g_offs.lane->threads(), ik2::lane::rows_form(), cs.cpu[0], cs.cpu[1], cs.fetch[0], cs.fetch[1],
+                cs.gpu[0], cs.gpu[1], cs.force == 1 ? "; every miss fetched (IK2_LANE=fetch)"
+                                      : cs.force == 2 ? "; every miss on the CPU (IK2_LANE=cpu)" : "");
+    return true;
+}
+
 // one token through the resident path: its logits appended to logits_out (kLogits) or its argmax (kArgmax)
 void fast_token(Model& M, int tok, int pos, OutMode out_mode, std::vector<float>& logits_out,
                 std::vector<int>* argmax_out) {
     const Config& c = M.c;
     Work& W = dev_work(0);
     if (g_off) off_tables(M);
+    if (g_lane) {   // (the lane re-timed as it runs: its figure sent when it moved by more than a tenth - a busy PC)
+        bool moved = false;
+        for (int f = 0; f < 2; ++f) {
+            const double us = g_offs.lane->us_expert(f);
+            if (us > 0 && std::fabs(us - g_offs.cost_h.cpu[f]) > 0.1 * g_offs.cost_h.cpu[f])
+                g_offs.cost_h.cpu[f] = (float) us, moved = true;
+        }
+        if (moved) CU(cudaMemcpyAsync(g_offs.cost, &g_offs.cost_h, sizeof(k::LaneCost), cudaMemcpyHostToDevice, g_s));
+    }
     const size_t rb = (size_t) c.C / k::block_values(M.embd_type) * k::block_bytes(M.embd_type);
     k::decode_host(M.embd_type, M.embd + (size_t) tok * rb, c.C, W.emb_h);
     W.pos_h[0] = pos;
@@ -4685,6 +4826,10 @@ int main(int argc, char** argv) {
         }
         g_off = true;
         off_tables(M);
+        if (const char* le = getenv("IK2_LANE"); le && *le && std::string(le) != "0") {
+            g_lane = lane_init(M, le, getenv("IK2_LANE_THREADS") ? std::atoi(getenv("IK2_LANE_THREADS")) : -1);
+            if (!g_lane) std::printf("lane parity: off - an expert format the exact lane does not have\n");
+        }
         int n_tier = 0;
         for (int i = 0; i < c.n_layer * c.E; ++i) n_tier += EC.loc[i] >= 0;
         size_t st_b = 0;
@@ -5189,6 +5334,7 @@ int main(int argc, char** argv) {
             std::fflush(stdout);
             busy = false;
         }
+        g_offs.lane.reset();   // (the CPU lane's thread polls mapped memory: stopped before the driver goes)
         return 0;
     }
     if ((int) prompt.size() + gen > ctx) die("prompt + gen past --ctx");
@@ -5490,8 +5636,12 @@ int main(int argc, char** argv) {
         CU(cudaStreamSynchronize(g_s));
         const double p = oc.picks ? 100.0 / (double) oc.picks : 0.0;
         std::printf("offload: %llu picks, %.1f%% in the VRAM tier, %.1f%% in staging, %.1f%% fetched (%.2f GiB, %.1f MiB "
-                    "a token)\n", oc.picks, oc.tier * p, oc.stage * p, oc.fetched * p, oc.bytes / 1073741824.0,
-                    oc.picks ? oc.bytes / 1048576.0 / ((double) oc.picks / (M.c.n_visit * M.c.K)) : 0.0);
+                    "a token), %.1f%% on the CPU lane\n", oc.picks, oc.tier * p, oc.stage * p, oc.fetched * p,
+                    oc.bytes / 1073741824.0,
+                    oc.picks ? oc.bytes / 1048576.0 / ((double) oc.picks / (M.c.n_visit * M.c.K)) : 0.0, oc.cpu * p);
+        if (g_lane)
+            std::printf("lane: %.0f / %.0f us an expert as measured (NVFP4 / Q8_0)\n", g_offs.lane->us_expert(0),
+                        g_offs.lane->us_expert(1));
     }
     if (out.size() > 1)
         std::printf("generation: %d tokens in %.2f s (%.2f tok/s); cache %llu hits, %llu misses in it\n",
@@ -5503,5 +5653,6 @@ int main(int argc, char** argv) {
     std::fflush(stdout);
     if (g_trace) std::fclose(g_trace);
     pop_dump();
+    g_offs.lane.reset();
     return 0;
 }
