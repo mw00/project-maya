@@ -280,6 +280,25 @@ void publish(const float* src, float* dst, size_t n, unsigned* counter, unsigned
 void submit(cudaStream_t s);
 void wait_pull(const unsigned* flag, unsigned v, float* dst, const float* src, size_t n, cudaStream_t s);
 void wait_flag(const unsigned* flag, unsigned v, cudaStream_t s);
+// A prefetch: the ranges' bytes read once (a word a 32-byte line, the ranges in their order) and nothing made of them -
+// the GPU's cache then holds the last of them that fit it, for the kernels that read them next (a tensor-parallel
+// member's GEMVs of a layer's dense weights, read here while its partial sum goes through the host)
+struct Prefetch {
+    static constexpr int kMax = 12;
+    const uint8_t* p[kMax];
+    uint32_t pre[kMax + 1];   // (lines before range i; pre[n]: all of them)
+    int n = 0;
+    void add(const uint8_t* w, size_t bytes) {   // (the whole 4-byte words inside [w, w + bytes))
+        const uint8_t* a = (const uint8_t*) (((uintptr_t) w + 3) & ~(uintptr_t) 3);
+        const uint8_t* e = w + bytes;
+        if (w == nullptr || n >= kMax || e < a + 64) return;
+        if (n == 0) pre[0] = 0;
+        p[n] = a;
+        pre[n + 1] = pre[n] + (uint32_t) ((size_t) (e - a - 4) / 32 + 1);
+        ++n;
+    }
+};
+void prefetch(const Prefetch& j, unsigned* sink, cudaStream_t s, int max_blocks = 0);
 void set_flag(unsigned* flag, unsigned v, cudaStream_t s);
 /// dst = a (na words) | b (nb) | c (nc), 4-byte words; split3 the other way
 void pack3(const void* a, size_t na, const void* b, size_t nb, const void* c, size_t nc, void* dst, cudaStream_t s);

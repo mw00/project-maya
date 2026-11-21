@@ -1646,6 +1646,13 @@ unsigned persist_blocks(long long items) {
 }
 #endif
 
+// (the down's rows of at most 8 sub-blocks - a member's block of the width: 4 rows a warp, each on 8 lanes, where 2
+//  rows a warp left half the lanes idle and twice the blocks.  A row's lanes and their sum's order are the same - the
+//  idle lanes added +0.0 - so the bits are.  MAYA_IQ_DN_RW4=0: 2 rows a warp, as before)
+static bool dn_rw4() {
+    static const bool on = !(std::getenv("MAYA_IQ_DN_RW4") && std::getenv("MAYA_IQ_DN_RW4")[0] == '0');
+    return on;
+}
 // grid.x: the blocks of one pass (n / (kWarps RW))
 template <int T, int NE, int EPI = 0>
 void launch_gu(const Args& a, dim3 grid, cudaStream_t s) {
@@ -1670,6 +1677,15 @@ void launch_gu(const Args& a, dim3 grid, cudaStream_t s) {
 }
 template <int T, int NE>
 void launch_dn(const Args& a, dim3 grid, cudaStream_t s) {
+    if constexpr (T != kIQ1_S && T != kIQ1_M) {
+        const bool rw4 = dn_rw4() && a.n_ff / 32 <= 32 / 4 && a.n_embd % (kWarps * 4) == 0 && kDnRW == 2;
+        const dim3 g4((unsigned) (a.n_embd / (kWarps * 4)), grid.y);
+        if constexpr (!kPersist<T, 0>)
+            if (rw4) {
+                pdl_launch(down_kernel<T, NE, 1, false, 4>, g4, kThreads, 0, s, a, (int) grid.y);
+                return;
+            }
+    }
 #if DS4_IQ_PERSIST_BUILD
     if constexpr (kPersist<T, 0>)
         if (persist_plain<T>()) {

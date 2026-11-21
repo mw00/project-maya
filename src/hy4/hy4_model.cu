@@ -401,6 +401,12 @@ struct Gpu {
     //  attention's query: evf the two chains' common input ready, evj the picks made; its GEMVs' int8 rows apart)
     cudaStream_t s4 = nullptr;
     cudaEvent_t evf = nullptr, evj = nullptr;
+    // (a tensor-parallel member's prefetches - Impl::pf_queue: their stream, the event each waits for, their sink)
+    cudaStream_t s5 = nullptr;
+    cudaEvent_t evp = nullptr;
+    unsigned* pf_sink = nullptr;
+    size_t pf_cap = 0;   // (the bytes its cache was measured to hold - pf_probe; 0: no prefetch on this GPU)
+    int pf_blocks = 0;   // (the prefetch kernel's blocks: one a multiprocessor)
     bool ixf = false, atf = false;   // (this GPU's forks: the indexer's, the window layers' - fork_wanted)
     int8_t* xq4 = nullptr;
     float* xd4 = nullptr;
@@ -877,6 +883,8 @@ struct Model::Impl {
             if (gp.evf) cudaEventDestroy(gp.evf);
             if (gp.evj) cudaEventDestroy(gp.evj);
             if (gp.s4) cudaStreamDestroy(gp.s4);
+            if (gp.evp) cudaEventDestroy(gp.evp);
+            if (gp.s5) cudaStreamDestroy(gp.s5);
             if (gp.ev2) cudaEventDestroy(gp.ev2);
             if (gp.s2) cudaStreamDestroy(gp.s2);
             if (gp.evh0) cudaEventDestroy(gp.evh0);
@@ -2807,6 +2815,155 @@ struct Model::Impl {
     }
     // HY4_TP_PROF: the token windows' host time - waiting for the members' attention / FFN partials, the sums, the
     // whole forwards (printed at the end)
+    // The prefetch.  A tensor-parallel member's token windows read a layer's dense weights into the GPU's cache while
+    // its partial sum goes through the host - behind the attention's partial: the layer's router, routed down and
+    // shared gate / up (and the routed up and shared down: behind the experts' gate / up in a window of 3 tokens and
+    // more, whose experts would push them out of the cache again); behind the FFN's: the next layer's attention
+    // matrices, in the order its kernels read them.  Those GEMVs then read the cache, where the memory was idle for the
+    // sum's round trip.  Reads alone: no output moves.  Each member's cache is measured at the start (pf_probe: a
+    // range read twice - the second pass faster where the cache held it), a call's matrices are cut to what it holds,
+    // and a GPU whose cache holds less than 8 MB reads nothing ahead (an RTX 5060 Ti: about 24 MB of the 14 to 23 MB a
+    // layer's attention matrices are a member, and the 15 of its FFN's dense ones; an RTX 3090: 6 MB).  The prefetch
+    // kernel is a block a multiprocessor: its threads wait on the memory, and more of them took the room of the main
+    // stream's kernels (128 blocks on 36 multiprocessors: a 4-token window a sixth slower).
+    // HY4_PREFETCH unset: measured, on NVIDIA; 0: off; N: bits, unmeasured (1 the FFN's router, routed down, shared
+    // gate / up; 2 its routed up and shared down; 4 the next layer's q_a, kv_a, gate; 8 its other attention matrices).
+    // HY4_PF_BLOCKS: the kernel's blocks
+#if defined(STRATA_USE_HIP)
+    const int pf_mode = std::getenv("HY4_PREFETCH") ? std::atoi(std::getenv("HY4_PREFETCH")) : 0;   // (AMD: not run)
+#else
+    const int pf_mode = std::getenv("HY4_PREFETCH") ? std::atoi(std::getenv("HY4_PREFETCH")) : -1;
+#endif
+    const int pf_bits = pf_mode > 0 ? pf_mode : 15;
+    const int pf_blocks_env = std::getenv("HY4_PF_BLOCKS") ? std::atoi(std::getenv("HY4_PF_BLOCKS")) : 0;
+    static size_t mat_bytes(const Mat& m) { return m.w ? m.ld * (size_t) m.n * (size_t) std::max(1, m.batch) : 0; }
+    // (queued on the member's prefetch stream, started when what its main stream holds so far is done; the matrices in
+    //  their order as far as the cache holds them)
+    void pf_queue(Gpu& gp, std::initializer_list<const Mat*> ms) {
+        if (gp.s5 == nullptr || gp.pf_cap == 0) return;
+        k::Prefetch j;
+        size_t sum = 0;
+        for (const Mat* m : ms) {
+            if (m == nullptr || m->w == nullptr) continue;
+            const size_t b = mat_bytes(*m);
+            if (sum + b > gp.pf_cap) break;
+            sum += b;
+            j.add(m->w, b);
+        }
+        if (j.n == 0) return;
+        if (cudaEventRecord(gp.evp, gp.s) != cudaSuccess || cudaStreamWaitEvent(gp.s5, gp.evp, 0) != cudaSuccess) {
+            (void) cudaGetLastError();
+            return;
+        }
+        k::prefetch(j, gp.pf_sink, gp.s5, gp.pf_blocks);
+    }
+    void pf_ffn(const Layer& l, Gpu& gp, int T) {   // (behind member l.tpm's attention partial)
+        if (gp.s5 == nullptr || gp.pf_cap == 0 || T > W || l.tpm < 0) return;
+        const bool a = (pf_bits & 1) != 0, b = (pf_bits & 2) != 0 && T <= 2;
+        if (l.dense) {
+            if (a) pf_queue(gp, {&l.ffn_gate, &l.ffn_up, &l.ffn_down});
+        } else if (a || b) {
+            pf_queue(gp, {a ? &l.router : nullptr, a ? &l.rdown : nullptr, a ? &l.sh_gate : nullptr, a ? &l.sh_up : nullptr,
+                          b ? &l.rup : nullptr, b ? &l.sh_down : nullptr});
+        }
+    }
+    void pf_attn(const Layer& l, Gpu& gp, int T) {   // (behind its FFN partial: the next layer's)
+        if (gp.s5 == nullptr || gp.pf_cap == 0 || T > W || l.tpm < 0 || (pf_bits & 12) == 0) return;
+        const std::vector<Layer>& ls = TL[(size_t) l.tpm];
+        if ((size_t) l.il + 1 >= ls.size()) return;
+        const Layer& n = ls[(size_t) l.il + 1];
+        if (n.il != l.il + 1 || n.il >= g.n_layer) return;
+        const bool a = (pf_bits & 4) != 0, b = (pf_bits & 8) != 0;
+        pf_queue(gp, {a ? &n.q_a : nullptr, a ? &n.kv_a : nullptr, a ? &n.gate : nullptr, a && n.ix ? &n.ix_k : nullptr,
+                      b ? &n.q_b : nullptr, b && n.ix ? &n.ix_q_b : nullptr, b ? &n.k_b : nullptr, b ? &n.v_b : nullptr,
+                      b ? &n.wo : nullptr});
+    }
+    // Each member's cache, measured once at the start: ranges of a layer's routed experts (weights no window has read
+    // yet) read by the prefetch kernel twice in a row - where the second pass takes under 0.6 of the first, the cache
+    // held the range.  8, 16 and 24 MB, three ranges each: the largest held is the GPU's pf_cap.
+    void pf_probe() {
+        if (tp <= 1 || pf_mode == 0) return;
+        size_t least = SIZE_MAX, most = 0;
+        int on = 0;
+        for (int m = 0; m < tp; ++m) {
+            Gpu& gp = G[(size_t) mem[(size_t) m]];
+            if (gp.s5 == nullptr) continue;
+            if (cudaSetDevice(gp.dev) != cudaSuccess) {
+                (void) cudaGetLastError();
+                continue;
+            }
+            cudaDeviceProp pi{};
+            if (cudaGetDeviceProperties(&pi, gp.dev) != cudaSuccess) {
+                (void) cudaGetLastError();
+                continue;
+            }
+            gp.pf_blocks = pf_blocks_env > 0 ? pf_blocks_env : std::max(8, std::min(64, pi.multiProcessorCount));
+            if (pf_mode > 0) {   // (asked for by hand: not measured)
+                gp.pf_cap = (size_t) 1 << 40;
+                ++on;
+                continue;
+            }
+            const Layer* src = nullptr;
+            size_t have = 0;
+            for (const Layer& l : TL[(size_t) m]) {
+                size_t held = 0;
+                for (int sl : l.slot_of) held += sl >= 0;
+                if (l.slot_of.empty() && l.experts != nullptr) held = (size_t) g.n_expert;
+                if (l.experts != nullptr && held * l.blob > have) src = &l, have = held * l.blob;
+            }
+            const size_t sizes[3] = {(size_t) 8 << 20, (size_t) 16 << 20, (size_t) 24 << 20};
+            cudaEvent_t e0 = nullptr, e1 = nullptr, e2 = nullptr;
+            if (src == nullptr || have < 3 * sizes[2] + ((size_t) 2 << 20) || cudaEventCreate(&e0) != cudaSuccess ||
+                cudaEventCreate(&e1) != cudaSuccess || cudaEventCreate(&e2) != cudaSuccess) {
+                (void) cudaGetLastError();
+                continue;
+            }
+            {   // (the kernel's first launch, untimed: a megabyte past the timed ranges)
+                k::Prefetch j;
+                j.add(src->experts + 3 * sizes[2], (size_t) 1 << 20);
+                k::prefetch(j, gp.pf_sink, gp.s5, gp.pf_blocks);
+                cudaStreamSynchronize(gp.s5);
+            }
+            size_t cap = 0;
+            for (size_t S : sizes) {
+                int held = 0;
+                for (int r = 0; r < 3; ++r) {
+                    k::Prefetch j;
+                    j.add(src->experts + (size_t) r * sizes[2], S);
+                    cudaEventRecord(e0, gp.s5);
+                    k::prefetch(j, gp.pf_sink, gp.s5, gp.pf_blocks);
+                    cudaEventRecord(e1, gp.s5);
+                    k::prefetch(j, gp.pf_sink, gp.s5, gp.pf_blocks);
+                    cudaEventRecord(e2, gp.s5);
+                    float cold = 0.0f, hot = 0.0f;
+                    if (cudaEventSynchronize(e2) != cudaSuccess || cudaEventElapsedTime(&cold, e0, e1) != cudaSuccess ||
+                        cudaEventElapsedTime(&hot, e1, e2) != cudaSuccess) {
+                        (void) cudaGetLastError();
+                        continue;
+                    }
+                    held += cold > 0.0f && hot < 0.6f * cold;
+                }
+                if (held >= 2) cap = S;
+            }
+            cudaEventDestroy(e0);
+            cudaEventDestroy(e1);
+            cudaEventDestroy(e2);
+            gp.pf_cap = cap >= sizes[0] ? cap : 0;
+            if (gp.pf_cap > 0) ++on, least = std::min(least, gp.pf_cap), most = std::max(most, gp.pf_cap);
+        }
+        char buf[240];
+        if (pf_mode > 0)
+            std::snprintf(buf, sizeof buf, "INFO tensor parallel: a token window's dense weights read ahead, behind the "
+                          "members' sums (HY4_PREFETCH=%d)", pf_mode);
+        else if (on > 0)
+            std::snprintf(buf, sizeof buf, "INFO tensor parallel: a token window's dense weights read ahead, behind the "
+                          "members' sums, on %d of the %d GPUs (their caches hold %zu%s MB of a range read twice)", on, tp,
+                          least >> 20, most > least ? " and more" : "");
+        else
+            std::snprintf(buf, sizeof buf, "INFO tensor parallel: no weights read ahead (the GPUs' caches held under 8 MB "
+                          "of a range read twice)");
+        info.push_back(buf);
+    }
     const bool tp_prof = std::getenv("HY4_TP_PROF") != nullptr;
     // ([0]: token windows, [1]: prompt chunks - those also by token)
     double tp_wait[2][2] = {{0, 0}, {0, 0}}, tp_sum_s[2] = {0, 0}, tp_fwd_s[2] = {0, 0}, tp_prep_s[2] = {0, 0},
@@ -3214,6 +3371,14 @@ struct Model::Impl {
             CK(cudaStreamCreateWithFlags(&gp.s4, cudaStreamNonBlocking));
             CK(cudaEventCreateWithFlags(&gp.evf, cudaEventDisableTiming));
             CK(cudaEventCreateWithFlags(&gp.evj, cudaEventDisableTiming));
+        }
+        if (!only_bytes && !gp.s5 && pf_mode != 0) {
+            CK(cudaStreamCreateWithFlags(&gp.s5, cudaStreamNonBlocking));
+            CK(cudaEventCreateWithFlags(&gp.evp, cudaEventDisableTiming));
+            void* sink = nullptr;
+            CK(cudaMalloc(&sink, 256));
+            gp.allocs.push_back(sink);
+            gp.pf_sink = (unsigned*) sink;
         }
         gp.wband_n = kBand;
         // every buffer a whole number of 256 bytes, as cudaMalloc gave them one by one: pass 0 sums them, pass 1 carves
@@ -4586,7 +4751,7 @@ struct Model::Impl {
         if (!attn_core(l, gp, T, p0, err, tpm, v)) return false;
         if (tpm >= 0) {
             mark(tpm, gp, l.il, 1);
-            all_reduce(tpm, gp, T, v);
+            all_reduce(tpm, gp, T, v, &l, 1);
             mark(tpm, gp, l.il, 2);
         }
         k::hc_post_norm(gp.x, T, g.hc, E, gp.y, gp.post, l.post_attn, g.eps, s, dump || inject ? gp.cur : nullptr);
@@ -4985,6 +5150,7 @@ struct Model::Impl {
             ne_max = T;
         }
         ok = ok && iq::gate_up(a, groups, ne_max, s);
+        if (gp.s5 != nullptr && l.tpm >= 0 && T > 2 && (pf_bits & 2) != 0) pf_queue(gp, {&l.rup, &l.sh_down});
         // h's rows: every entry's (the plan form: nu of them; the grouped form: t 16 + j)
         const int rows = T == 1 ? nu : 16 * T;
         k::q8_rows(gp.eh, ffe, rows, ffe, gp.ehq, gp.ehd, s);
@@ -6382,7 +6548,7 @@ struct Model::Impl {
             ok = ok && mm(gp, l.ffn_down, gp.hd, ff, T, gp.y, E);
             if (ok && l.tpm >= 0) {
                 mark(l.tpm, gp, l.il, 4);
-                all_reduce(l.tpm, gp, gp.y, (size_t) T * E, v);
+                all_reduce(l.tpm, gp, gp.y, (size_t) T * E, v, true, &l, 2, T);
                 mark(l.tpm, gp, l.il, 5);
             }
         } else {
@@ -6554,7 +6720,7 @@ struct Model::Impl {
                 ok = ok && mm(gp, l.sh_down, gp.hd, sf, T, gp.cur, E);
                 k::add(gp.y, gp.cur, (size_t) T * E, s);
                 mark(l.tpm, gp, l.il, 4);
-                if (ok) all_reduce(l.tpm, gp, gp.y, (size_t) T * E, v);
+                if (ok) all_reduce(l.tpm, gp, gp.y, (size_t) T * E, v, true, &l, 2, T);
                 mark(l.tpm, gp, l.il, 5);
                 if (!ok) err = "layer " + std::to_string(l.il) + ": an FFN kernel did not take its shapes";
                 return ok;
@@ -7764,10 +7930,14 @@ struct Model::Impl {
 
     // ------------------------------------------------------------ tensor parallel's forward
     // member m's partial gp.y [T][E] to the host (sync v), then the members' sum back into gp.y
-    void all_reduce(int m, Gpu& gp, int T, unsigned v) { all_reduce(m, gp, gp.y, (size_t) T * g.n_embd, v); }
+    void all_reduce(int m, Gpu& gp, int T, unsigned v, const Layer* pf = nullptr, int pf_kind = 0) {
+        all_reduce(m, gp, gp.y, (size_t) T * g.n_embd, v, true, pf, pf_kind, T);
+    }
     // ... of n floats at buf (in place)
-    // (rows: n is rows of E - a prompt chunk's sum then goes by blocks of rows)
-    void all_reduce(int m, Gpu& gp, float* buf, size_t n, unsigned v, bool rows = true) {
+    // (rows: n is rows of E - a prompt chunk's sum then goes by blocks of rows; pf: the layer whose sum this is, for
+    //  the prefetch queued behind the partial - pf_kind 1: its FFN's matrices, 2: the next layer's attention's)
+    void all_reduce(int m, Gpu& gp, float* buf, size_t n, unsigned v, bool rows = true, const Layer* pf = nullptr,
+                    int pf_kind = 0, int pf_T = 0) {
         const size_t E = (size_t) g.n_embd;
         if (rows && blocked && gp.s2 && n > (size_t) W * E && n % E == 0) {
             publish_blocks(m, gp, buf, (int) (n / E), v);
@@ -7787,6 +7957,8 @@ struct Model::Impl {
         }
         k::publish(buf, tp_part + (size_t) m * tp_stride(), n, tp_cnt[(size_t) m], tp_fout + (size_t) m * kLine, v,
                    gp.s);
+        if (pf != nullptr && pf_kind == 1) pf_ffn(*pf, gp, pf_T);
+        else if (pf != nullptr && pf_kind == 2) pf_attn(*pf, gp, pf_T);
         k::wait_pull(tp_fin, v, buf, tp_sum, n, gp.s);
     }
     // a prompt chunk's sum read back into buf block by block, each once the host has summed it
@@ -8803,6 +8975,7 @@ bool Model::load(const Options& o, std::string& err) {
     std::vector<int> ids((size_t) T, m->g.bos >= 0 && m->g.bos < V ? m->g.bos : 0);
     std::vector<float> lg((size_t) hy4::k::kMaxWin * V);
     m->hot.quiet = true;   // (HY4_HOT: the warm-up's routes not counted)
+    m->pf_probe();         // (the members' caches, before a window reads the experts the probe times)
     bool ok = forward(ids.data(), T, 0, 1, lg.data(), err) && forward(ids.data(), 4, T, 4, lg.data(), err);
     m->hot.quiet = false;
     if (ok) {   // (NaN logits: every answer wrong and a draft without a top token - #1084 - said at the start instead)

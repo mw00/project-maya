@@ -2902,6 +2902,17 @@ __global__ void wait_pull_kernel(const unsigned* flag, unsigned v, float4* __res
         dst[i] = strata::kernels::ld_fresh_v(src + i);
 }
 __global__ void wait_flag_kernel(const unsigned* flag, unsigned v) { wait_for(flag, v); }
+// (the ranges' lines in turn, every thread a line a step: the first ranges' come first)
+__global__ void __launch_bounds__(256) prefetch_kernel(const Prefetch j, unsigned* sink) {
+    const uint32_t nt = gridDim.x * blockDim.x, total = j.pre[j.n];
+    uint32_t acc = 0;
+    int r = 0;
+    for (uint32_t l = blockIdx.x * blockDim.x + threadIdx.x; l < total; l += nt) {
+        while (l >= j.pre[r + 1]) ++r;
+        acc ^= *(const uint32_t*) (j.p[r] + (size_t) (l - j.pre[r]) * 32);
+    }
+    if (acc == 0x9e3779b9u) *sink = acc;   // (the loads kept: a value no data is expected to make)
+}
 __global__ void set_flag_kernel(unsigned* flag, unsigned v) {
     __threadfence_system();
     *(volatile unsigned*) flag = v;
@@ -2947,6 +2958,14 @@ void publish(const float* src, float* dst, size_t n, unsigned* counter, unsigned
     publish_kernel<<<blocks, 256, 0, s>>>((const float4*) src, (float4*) dst, n4, counter, flag, v);
     check("publish");
     submit(s);
+}
+void prefetch(const Prefetch& j, unsigned* sink, cudaStream_t s, int max_blocks) {
+    if (j.n <= 0 || j.pre[j.n] == 0) return;
+    // (a thread a few lines: 16 thousand threads and more read 5 MB at the memory's speed, 4 thousand at half of it)
+    const unsigned blocks = (unsigned) std::max<uint32_t>(
+        8, std::min<uint32_t>(max_blocks > 0 ? (uint32_t) max_blocks : 128u, j.pre[j.n] / (256 * 8)));
+    prefetch_kernel<<<blocks, 256, 0, s>>>(j, sink);
+    check("prefetch");
 }
 void wait_pull(const unsigned* flag, unsigned v, float* dst, const float* src, size_t n, cudaStream_t s) {
     if (n % 4) {
