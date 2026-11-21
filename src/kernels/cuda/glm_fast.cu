@@ -4774,6 +4774,102 @@ __global__ void __launch_bounds__(256) moe_wait_fetch_kernel(MoeDev d, int n_emb
     }
 }
 
+// MAYA_GLM_FETCH_EARLY: moe_wait_fetch_kernel with the RAM tier's entries pulled BEFORE the wait for the host's
+// disk reads (the token path waits first and then pulls everything: the pull of the RAM tier's experts waited on
+// the SSD for nothing).  The same entries and bytes end up in the same slots.
+__global__ void __launch_bounds__(256) moe_early_wait_fetch_kernel(MoeDev d, int n_embd, int k, size_t n16) {
+    __shared__ unsigned int s_need;
+    __shared__ unsigned long long s_src[8];
+    const int tid = threadIdx.x;
+    // the entries that have a source already (the RAM tier's: the route set them) are pulled first, while the host
+    // still reads this route's disk misses; the copy after the wait then takes only the host's sources
+    __shared__ unsigned long long s_early[8];
+    __shared__ unsigned int s_route, s_pm0;
+    if (tid < 8) s_early[tid] = tid < k ? ((volatile const unsigned long long*) d.fetch_src)[tid] : 0ull;
+    __syncthreads();
+    if (tid == 0) {   // (read AFTER the sources: an answer applied before they were read is seen here)
+        s_route = d.seq != nullptr ? *(volatile const unsigned int*) d.seq : 0u;
+        const volatile MoeResponse* r0 = (const volatile MoeResponse*) d.resp;
+        s_pm0 = r0 != nullptr && s_route != 0u && r0->seq == s_route ? r0->ptr_mask : 0u;
+    }
+    __syncthreads();
+    if (tid < 8 && ((s_pm0 >> tid) & 1u)) s_early[tid] = 0ull;   // the answer's entries are not RAM-tier sources
+    __syncthreads();
+    for (int i = 0; i < k; ++i) {
+        const unsigned long long esrc = s_early[i];
+        if (esrc == 0ull) continue;
+        const uint4* es = (const uint4*) esrc;
+        uint4* et = (uint4*) d.plan_ptr[i];
+        for (size_t j = blockIdx.x * (size_t) blockDim.x + threadIdx.x; j < n16; j += (size_t) gridDim.x * blockDim.x)
+            et[j] = es[j];
+    }
+    __syncthreads();
+    if (tid == 0) {
+        s_need = *(volatile unsigned int*) d.wait_seq;
+        __threadfence();   // (0 read after block 0's reset: its fetch_src writes are seen below)
+    }
+    __syncthreads();
+    if (s_need != 0u) {
+        if (blockIdx.x == 0) {
+            const MoeResponse* r = (const MoeResponse*) d.resp;
+            if (tid == 0) {
+                const long long t0 = clock64();   // bounded like moe_wait (~60 s)
+                while (((volatile const MoeResponse*) r)->seq != s_need) {
+                    if (clock64() - t0 > (1ll << 36)) {
+                        wait_gave_up(d.wait_diag, 5u, s_need, ((volatile const MoeResponse*) r)->seq);
+                        break;
+                    }
+                }
+                __threadfence_system();
+            }
+            __syncthreads();
+            const unsigned int pm = ((volatile const MoeResponse*) r)->ptr_mask;
+            if (tid < 8 && (pm >> tid) & 1u) d.fetch_src[tid] = ((volatile const MoeResponse*) r)->ptr[tid];
+            const int nu = ((volatile const MoeResponse*) r)->n_upd;
+            for (int u = tid; u < nu && u < 64; u += blockDim.x)
+                d.tab[((volatile const MoeResponse*) r)->upd_key[u]] = ((volatile const MoeResponse*) r)->upd_val[u];
+            if (((volatile const MoeResponse*) r)->cpu) {
+                for (int e = tid; e < n_embd; e += blockDim.x)
+                    d.cpu_part[e] = ((volatile const MoeResponse*) r)->cpu_part[e];
+                if (tid == 0) *d.cpu_flag = 1;
+            }
+            __threadfence();
+            __syncthreads();
+            if (tid == 0) *(volatile unsigned int*) d.wait_seq = 0u;   // (the next route sets it again)
+        } else if (tid == 0) {
+            // the grid is one block an SM, all resident at once: block 0 runs while the others spin
+            const long long t0 = clock64();
+            while (*(volatile unsigned int*) d.wait_seq == s_need) {
+                if (clock64() - t0 > (1ll << 36)) { wait_gave_up(d.wait_diag, 5u, s_need, 0u); break; }
+            }
+            __threadfence();
+        }
+        __syncthreads();
+    }
+    if (tid < 8) s_src[tid] = tid < k ? ((volatile const unsigned long long*) d.fetch_src)[tid] : 0ull;
+    __shared__ unsigned int s_sm;   // MAYA_GLM_STREAM_FETCH's streamed entries (block 0 reset wait_seq: s_need)
+    if (tid == 0) {
+        // a block that started after block 0 applied the answer read wait_seq as 0: the route's own seq says which
+        // answer is this route's, and its streamed entries are still copied piece by piece
+        const unsigned int rs = s_need != 0u ? s_need : s_route;
+        s_sm = rs != 0u && d.resp != nullptr && ((volatile const MoeResponse*) d.resp)->seq == rs
+                   ? ((volatile const MoeResponse*) d.resp)->stream_mask : 0u;
+    }
+    __syncthreads();
+    for (int i = 0; i < k; ++i) {
+        const unsigned long long src = s_src[i];
+        if (src == 0ull || src == s_early[i]) continue;   // (pulled before the wait)
+        if ((s_sm >> i) & 1u) {
+            moe_stream_copy(d, i, (const uint8_t*) src, (uint8_t*) d.plan_ptr[i]);
+            continue;
+        }
+        const uint4* s = (const uint4*) src;
+        uint4* t = (uint4*) d.plan_ptr[i];
+        for (size_t j = blockIdx.x * (size_t) blockDim.x + threadIdx.x; j < n16; j += (size_t) gridDim.x * blockDim.x)
+            t[j] = s[j];
+    }
+}
+
 // a batched step's CPU-lane answers, one block a row (moe_cpu_wait_kernel's, n launches in one)
 __global__ void moe_cpu_wait_rows_kernel(CpuWaitRows w, int n_embd) {
     __shared__ unsigned int s_need;
@@ -7169,6 +7265,18 @@ void moe_wait_fetch(const MoeDev& d, int n_embd, int k, size_t blob_bytes, cudaS
     }
     moe_wait_fetch_kernel<<<sms, 256, 0, s>>>(d, n_embd, k, (blob_bytes + 15) / 16);
     launch_check("moe_wait_fetch");
+}
+
+void moe_early_wait_fetch(const MoeDev& d, int n_embd, int k, size_t blob_bytes, cudaStream_t s) {
+    static int sms = 0;
+    if (sms == 0) {
+        int dev = 0;
+        cudaGetDevice(&dev);
+        cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
+        if (sms <= 0) sms = 80;
+    }
+    moe_early_wait_fetch_kernel<<<sms, 256, 0, s>>>(d, n_embd, k, (blob_bytes + 15) / 16);
+    launch_check("moe_early_wait_fetch");
 }
 
 void moe_cpu_wait_rows(const CpuWaitRows& w, int n, int n_embd, cudaStream_t s) {
