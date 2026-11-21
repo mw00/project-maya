@@ -85,6 +85,37 @@ __global__ void q8_kernel(const float* __restrict__ x, size_t ldx, int k, int8_t
     if (lane == 0) d[(size_t) r * (k / 32) + b] = sc;
 }
 
+// A kernel's own values as the next GEMV's int8 rows too (Q8Out): a warp's 32 lanes hold 32 consecutive values of a row
+// - block at / 32 of q8_kernel's layout - and make its code and scale, q8_kernel's arithmetic on the values written.
+// Every lane of the warp calls it (the row a multiple of 32 values).
+__device__ __forceinline__ void q8_put(float v, size_t at, const Q8Out& o) {
+    const float am = warp_max(fabsf(v));
+    const float sc = am / 127.0f;
+    const int8_t c = (int8_t) (am > 0.0f ? __float2int_rn(v / sc) : 0);
+    o.q[at] = c;
+    if (o.q2 != nullptr) o.q2[at] = c;
+    if ((threadIdx.x & 31) == 0) {
+        o.d[at / 32] = sc;
+        if (o.d2 != nullptr) o.d2[at / 32] = sc;
+    }
+}
+// q8_kernel's rows, each written twice - rows 2 r and 2 r + 1 of q2 / d2 (q8_rows then dup_rows_q8, in one launch)
+__global__ void q8_dup_kernel(const float* __restrict__ x, size_t ldx, int k, int8_t* __restrict__ q2,
+                              float* __restrict__ d2) {
+    const int r = blockIdx.y, b = blockIdx.x * 8 + (threadIdx.x >> 5), lane = threadIdx.x & 31;
+    if (b * 32 >= k) return;
+    const float v = x[(size_t) r * ldx + (size_t) b * 32 + lane];
+    const float am = warp_max(fabsf(v));
+    const float sc = am / 127.0f;
+    const int8_t c = (int8_t) (am > 0.0f ? __float2int_rn(v / sc) : 0);
+    q2[(size_t) (2 * r) * k + (size_t) b * 32 + lane] = c;
+    q2[(size_t) (2 * r + 1) * k + (size_t) b * 32 + lane] = c;
+    if (lane == 0) {
+        d2[(size_t) (2 * r) * (k / 32) + b] = sc;
+        d2[(size_t) (2 * r + 1) * (k / 32) + b] = sc;
+    }
+}
+
 __global__ void q8_heads_kernel(const float* __restrict__ x, size_t ldt, size_t ldh, int T, int k,
                                 int8_t* __restrict__ q, float* __restrict__ d) {
     const int r = blockIdx.y, h = r / T, t = r % T, b = blockIdx.x * 8 + (threadIdx.x >> 5), lane = threadIdx.x & 31;
@@ -308,14 +339,18 @@ void gemv(const W* w, size_t ld, int k, int n, const float* x, size_t ldx, int n
 
 // ---------------------------------------------------------------- norms
 __global__ void rms_kernel(const float* __restrict__ x, size_t ldx, int n, const float* __restrict__ w, float eps,
-                           float* __restrict__ y, size_t ldy) {
+                           float* __restrict__ y, size_t ldy, const Q8Out q8) {
     const float* xr = x + (size_t) blockIdx.x * ldx;
     float ss = 0.0f;
     for (int i = threadIdx.x; i < n; i += blockDim.x) ss += xr[i] * xr[i];
     ss = block_sum(ss);
     const float r = 1.0f / sqrtf(ss / (float) n + eps);
     float* yr = y + (size_t) blockIdx.x * ldy;
-    for (int i = threadIdx.x; i < n; i += blockDim.x) yr[i] = xr[i] * r * (w ? w[i] : 1.0f);
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {   // (n a multiple of 32 with q8: a warp's lanes together)
+        const float o = xr[i] * r * (w ? w[i] : 1.0f);
+        yr[i] = o;
+        if (q8.q != nullptr) q8_put(o, (size_t) blockIdx.x * n + i, q8);
+    }
 }
 
 // ---------------------------------------------------------------- hyper-connections
@@ -380,7 +415,8 @@ __device__ __forceinline__ void hc_fin_body(int t, const float* __restrict__ x, 
                                             const float* __restrict__ part, const float* __restrict__ scale,
                                             const float* __restrict__ base, float eps, float hc_eps, float mag,
                                             float* __restrict__ cur, float* __restrict__ post,
-                                            float* __restrict__ mix_out, const float* __restrict__ nw, float neps) {
+                                            float* __restrict__ mix_out, const float* __restrict__ nw, float neps,
+                                            const Q8Out& q8) {
     __shared__ float s_mix[kMaxM + 1], s_pre[8];
     const int nm = HEAD ? hc : 2 * hc, HE = hc * E;
     if ((int) threadIdx.x <= kMaxM) {
@@ -429,7 +465,11 @@ __device__ __forceinline__ void hc_fin_body(int t, const float* __restrict__ x, 
 #pragma unroll
     for (int q = 0; q < kPer; ++q) {
         const int d = threadIdx.x + q * blockDim.x;
-        if (d < E) cur[(size_t) t * E + d] = nw ? vals[q] * r * nw[d] : vals[q];
+        if (d < E) {   // (E a multiple of 32 with q8: a warp's lanes together, 32 values in a row)
+            const float o = nw ? vals[q] * r * nw[d] : vals[q];
+            cur[(size_t) t * E + d] = o;
+            if (q8.q != nullptr) q8_put(o, (size_t) t * E + d, q8);
+        }
     }
 }
 template <bool HEAD>
@@ -438,8 +478,8 @@ __global__ void __launch_bounds__(512) hc_fin_kernel(const float* __restrict__ x
                                                      const float* __restrict__ base, float eps, float hc_eps, float mag,
                                                      float* __restrict__ cur, float* __restrict__ post,
                                                      float* __restrict__ mix_out, const float* __restrict__ nw,
-                                                     float neps) {
-    hc_fin_body<HEAD, 8>(blockIdx.x, x, hc, E, part, scale, base, eps, hc_eps, mag, cur, post, mix_out, nw, neps);
+                                                     float neps, const Q8Out q8) {
+    hc_fin_body<HEAD, 8>(blockIdx.x, x, hc, E, part, scale, base, eps, hc_eps, mag, cur, post, mix_out, nw, neps, q8);
 }
 // ... in one launch: the slices' blocks as hc_part, the last of a token's to finish its hc_fin (a counter a token)
 __global__ void __launch_bounds__(256) hc_pre1_kernel(const float* __restrict__ x, int hc, int E,
@@ -458,7 +498,7 @@ __global__ void __launch_bounds__(256) hc_pre1_kernel(const float* __restrict__ 
     __syncthreads();
     if (!last) return;
     __threadfence();
-    hc_fin_body<false, 12>(t, x, hc, E, part, scale, base, eps, hc_eps, mag, cur, post, mix_out, nw, neps);
+    hc_fin_body<false, 12>(t, x, hc, E, part, scale, base, eps, hc_eps, mag, cur, post, mix_out, nw, neps, Q8Out{});
     if (threadIdx.x == 0) cnt[t] = 0u;
 }
 // hc_pre1's counters (a token's, back to 0 after each launch), a zeroed buffer a device, grown as needed
@@ -552,6 +592,25 @@ __global__ void rope_kernel(float* __restrict__ x, int nh, size_t ld, size_t ldt
     const int h = i / half, p = i % half;
     float* v = x + (size_t) t * ldt + (size_t) h * ld + off + 2 * p;
     rope_pair(v[0], v[1], (float) pos[t], p, n_rot, base);
+}
+
+// A window's queries in one launch (a block a (head, token), a thread a value of the head's k = nope + n_rot): the
+// rotated part rotated in place as rope_kernel does and copied to qcat's rotated columns (copy_cols), the first nope
+// values' int8 rows for k_b (q8_heads' layout: row h T + t) - three launches' work, each value's arithmetic the same
+__global__ void __launch_bounds__(256) rope_q8_copy_kernel(float* __restrict__ q, int k, int nope, int n_rot,
+                                                           const int* __restrict__ pos, float base,
+                                                           float* __restrict__ qcat, size_t ldq, int kl, const Q8Out q8) {
+    const int h = blockIdx.x, t = blockIdx.y, c = threadIdx.x;
+    const size_t r = (size_t) t * gridDim.x + h;
+    float* v = q + r * k;
+    if (c < nope) {   // (nope a multiple of 32: a warp's lanes together)
+        q8_put(v[c], ((size_t) h * gridDim.y + t) * nope + c, q8);
+    } else if (c < nope + n_rot && ((c - nope) & 1) == 0) {
+        rope_pair(v[c], v[c + 1], (float) pos[t], (c - nope) >> 1, n_rot, base);
+        float* d = qcat + r * ldq + kl + (c - nope);
+        d[0] = v[c];
+        d[1] = v[c + 1];
+    }
 }
 
 // ---------------------------------------------------------------- the latent cache
@@ -1066,7 +1125,7 @@ __global__ void __launch_bounds__(256 * G) HY4_WMMA_OCC attn_wmma_kernel(const f
 // a block a (t, head): the chunks merged with the sink, 512 threads (a value dim each)
 __global__ void attn_combine_kernel(int H, int nchunk, int kc, const int* __restrict__ nk,
                                     const float* __restrict__ sinks, const float* __restrict__ ws,
-                                    float* __restrict__ out) {
+                                    float* __restrict__ out, const Q8Out q8) {
     const int t = blockIdx.y, h = blockIdx.x, d = threadIdx.x;
     const int used = (nk[t] + kc - 1) / kc;
     const float* base = ws + ((size_t) t * H + h) * nchunk * (512 + 2);
@@ -1080,20 +1139,30 @@ __global__ void attn_combine_kernel(int H, int nchunk, int kc, const int* __rest
         den += o[1] * f;
         num += o[2 + d] * f;
     }
-    out[((size_t) t * H + h) * 512 + d] = den > 0.0f ? num / den : 0.0f;
+    const float o = den > 0.0f ? num / den : 0.0f;
+    out[((size_t) t * H + h) * 512 + d] = o;
+    // (q8_heads' rows for the 512 values a head: row h T + t)
+    if (q8.q != nullptr) q8_put(o, ((size_t) h * gridDim.y + t) * 512 + d, q8);
 }
 
 // ---------------------------------------------------------------- elementwise
-__global__ void sigmoid_mul_kernel(float* x, const float* g, size_t n) {
+__global__ void sigmoid_mul_kernel(float* x, const float* g, size_t n, const Q8Out q8) {
     const size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) x[i] *= sigmoidf_(g[i]);
+    if (i < n) {   // (n a multiple of 32 with q8: a warp's lanes together)
+        const float o = x[i] * sigmoidf_(g[i]);
+        x[i] = o;
+        if (q8.q != nullptr) q8_put(o, i, q8);
+    }
 }
-__global__ void swiglu_kernel(const float* g, const float* u, size_t ldg, int n, float* h, size_t ldh, size_t total) {
+__global__ void swiglu_kernel(const float* g, const float* u, size_t ldg, int n, float* h, size_t ldh, size_t total,
+                              const Q8Out q8) {
     const size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= total) return;
     const size_t r = i / n, c = i % n;
     const float gv = g[r * ldg + c];
-    h[r * ldh + c] = gv / (1.0f + expf(-gv)) * u[r * ldg + c];
+    const float o = gv / (1.0f + expf(-gv)) * u[r * ldg + c];
+    h[r * ldh + c] = o;
+    if (q8.q != nullptr) q8_put(o, i, q8);   // (n a multiple of 32: row r's block c / 32)
 }
 __global__ void add_kernel(float* y, const float* x, size_t n) {
     const size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
@@ -1358,7 +1427,7 @@ __global__ void plan_kernel(const int* ids, int n_used, const uint8_t* base, siz
     if (s < 0) w[j] = 0.0f;
 }
 __global__ void moe_sum_kernel(const float* __restrict__ part, int n_used, int n, const float* __restrict__ w,
-                               float* __restrict__ out, int stride16) {
+                               float* __restrict__ out, int stride16, const Q8Out q8) {
     const int t = blockIdx.y, i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
     float v = 0.0f;
@@ -1367,6 +1436,7 @@ __global__ void moe_sum_kernel(const float* __restrict__ part, int n_used, int n
         if (wj != 0.0f) v = fmaf(wj, part[((size_t) t * stride16 + j) * n + i], v);   // (0: the CPU lane's entry)
     }
     out[(size_t) t * n + i] = v;
+    if (q8.q != nullptr) q8_put(v, (size_t) t * n + i, q8);   // (n a multiple of 32: a warp's lanes together)
 }
 __global__ void dup_q8_kernel(const int8_t* q, const float* d, int k, int8_t* q2, float* d2) {
     const int r = blockIdx.y;
@@ -2202,10 +2272,13 @@ void gemv_bf16w(const uint16_t* W, size_t ld, int k, int n, const float* x, size
                 float alpha, cudaStream_t s) {
     gemv<uint16_t>(W, ld, k, n, x, ldx, ncol, y, ldy, alpha, s);
 }
-void rmsnorm(const float* x, size_t ldx, int rows, int n, const float* w, float eps, float* y, size_t ldy, cudaStream_t s) {
-    if (rows <= 0) return;
-    rms_kernel<<<rows, 256, 0, s>>>(x, ldx, n, w, eps, y, ldy);
+bool rmsnorm(const float* x, size_t ldx, int rows, int n, const float* w, float eps, float* y, size_t ldy, cudaStream_t s,
+             Q8Out q8) {
+    if (rows <= 0) return false;
+    if (n % 32 != 0) q8 = Q8Out{};
+    rms_kernel<<<rows, 256, 0, s>>>(x, ldx, n, w, eps, y, ldy, q8);
     check("rmsnorm");
+    return q8.q != nullptr;
 }
 // hc_pre's and hc_head's buffers for launches of up to T rows on the current device, made now.  Grown inside a forward,
 // the old buffer is freed under the buffers' lock, and the free waits for the GPU's queued work: in tensor parallel that
@@ -2214,15 +2287,16 @@ void hc_reserve(int T) {
     (void) hc_part_buf(T);
     (void) hc_cnt_buf(T);
 }
-void hc_pre(const float* x, int T, int hc, int E, const float* fn, const float* scale, const float* base, float eps,
+bool hc_pre(const float* x, int T, int hc, int E, const float* fn, const float* scale, const float* base, float eps,
             float hc_eps, float mag, float* cur, float* post, cudaStream_t s, const float* norm_w, float norm_eps,
-            bool fn_by_element) {
+            bool fn_by_element, Q8Out q8) {
     float* part = hc_part_buf(T);
     if (part == nullptr || 2 * hc > kMaxM || hc > 8 || E > 512 * 8) {
         std::fprintf(stderr, "maya-hy4 hc_pre: no room for its sums (%d streams)\n", hc);
         g_err.fetch_add(1);
-        return;
+        return false;
     }
+    if (E % 32 != 0) q8 = Q8Out{};
     // (HY4_HC_ONE=1: one launch, the last block of a token finishing it - measured no faster: the launches queue ahead)
     static const bool two = std::getenv("HY4_HC_ONE") == nullptr;
     unsigned* cnt = two || fn_by_element || E > 256 * 12 ? nullptr : hc_cnt_buf(T);
@@ -2233,9 +2307,12 @@ void hc_pre(const float* x, int T, int hc, int E, const float* fn, const float* 
         if (fn_by_element) hc_part_kernel<true><<<dim3(kHcBlocks, (unsigned) T), 256, 0, s>>>(x, hc * E, 2 * hc, fn, part);
         else hc_part_kernel<false><<<dim3(kHcBlocks, (unsigned) T), 256, 0, s>>>(x, hc * E, 2 * hc, fn, part);
         hc_fin_kernel<false><<<T, 512, 0, s>>>(x, hc, E, part, scale, base, eps, hc_eps, mag, cur, post, g_mix_out,
-                                               norm_w, norm_eps);
+                                               norm_w, norm_eps, q8);
+        check("hc_pre");
+        return q8.q != nullptr;
     }
     check("hc_pre");
+    return false;   // (the one-launch form: no int8 rows)
 }
 void hc_head(const float* x, int T, int hc, int E, const float* fn, const float* scale, const float* base, float eps,
              float hc_eps, float* cur, cudaStream_t s, bool fn_by_element) {
@@ -2248,7 +2325,7 @@ void hc_head(const float* x, int T, int hc, int E, const float* fn, const float*
     if (fn_by_element) hc_part_kernel<true><<<dim3(kHcBlocks, (unsigned) T), 256, 0, s>>>(x, hc * E, hc, fn, part);
     else hc_part_kernel<false><<<dim3(kHcBlocks, (unsigned) T), 256, 0, s>>>(x, hc * E, hc, fn, part);
     hc_fin_kernel<true><<<T, 512, 0, s>>>(x, hc, E, part, scale, base, eps, hc_eps, 1.0f, cur, nullptr, nullptr, nullptr,
-                                          0.0f);
+                                          0.0f, Q8Out{});
     check("hc_head");
 }
 void hc_post(float* x, int T, int hc, int E, const float* y, const float* post, cudaStream_t s) {
@@ -2265,6 +2342,14 @@ void hc_post_norm(float* x, int T, int hc, int E, const float* y, const float* p
     }
     hc_post_norm_kernel<<<dim3(kPostBlocks, (unsigned) T), 256, 0, s>>>(x, hc, E, y, post, w, eps, yo);
     check("hc_post_norm");
+}
+bool rope_q8_copy(float* q, int T, int H, int k, int nope, int n_rot, const int* pos, float base, float* qcat, size_t ldq,
+                  int kl, Q8Out q8, cudaStream_t s) {
+    if (T <= 0 || H <= 0 || q8.q == nullptr || k != 256 || nope + n_rot != k || nope % 32 != 0 || n_rot % 2 != 0)
+        return false;   // (the caller's three launches instead)
+    rope_q8_copy_kernel<<<dim3((unsigned) H, (unsigned) T), 256, 0, s>>>(q, k, nope, n_rot, pos, base, qcat, ldq, kl, q8);
+    check("rope_q8_copy");
+    return true;
 }
 void rope(float* x, int T, int nh, size_t ld, size_t ldt, int off, int n_rot, const int* pos, float base, cudaStream_t s) {
     const int n = nh * n_rot / 2;
@@ -2314,7 +2399,7 @@ int attn_heads_a_block() {
 }  // namespace
 void attention(const float* q, int T, int H, int kv_lora, int n_rot, const uint16_t* cache, int ring, const int* keys,
                int ldk, const int* lo, const int* nk, int max_keys, float scale, const float* sinks, float* ws,
-               float* out, cudaStream_t s, bool q8) {
+               float* out, cudaStream_t s, bool q8, Q8Out q8o) {
     if (kv_lora != 512 || n_rot != 64) {
         std::fprintf(stderr, "maya-hy4 attention: kv_lora %d + rope %d (512 + 64 only)\n", kv_lora, n_rot);
         g_err.fetch_add(1);
@@ -2343,7 +2428,7 @@ void attention(const float* q, int T, int H, int kv_lora, int n_rot, const uint1
         else attn2_kernel<false><<<grid, 256, 0, s>>>(q, H, cache, ring, keys, ldk, lo, nk, scale, nchunk, kc, ws, 0);
     }
     check("attention");
-    attn_combine_kernel<<<dim3((unsigned) H, (unsigned) T), 512, 0, s>>>(H, nchunk, kc, nk, sinks, ws, out);
+    attn_combine_kernel<<<dim3((unsigned) H, (unsigned) T), 512, 0, s>>>(H, nchunk, kc, nk, sinks, ws, out, q8o);
     check("attn_combine");
 }
 bool attn_wmma_on() {
@@ -2386,14 +2471,18 @@ bool attention_wmma(const float* q, int T, int H, int kv_lora, int n_rot, const 
     check("attention_wmma");
     return true;
 }
-void sigmoid_mul(float* x, const float* g, size_t n, cudaStream_t s) {
-    sigmoid_mul_kernel<<<(unsigned) ((n + 255) / 256), 256, 0, s>>>(x, g, n);
+bool sigmoid_mul(float* x, const float* g, size_t n, cudaStream_t s, Q8Out q8) {
+    if (n % 32 != 0) q8 = Q8Out{};
+    sigmoid_mul_kernel<<<(unsigned) ((n + 255) / 256), 256, 0, s>>>(x, g, n, q8);
     check("sigmoid_mul");
+    return q8.q != nullptr;
 }
-void swiglu(const float* g, const float* u, size_t ldg, int rows, int n, float* h, size_t ldh, cudaStream_t s) {
+bool swiglu(const float* g, const float* u, size_t ldg, int rows, int n, float* h, size_t ldh, cudaStream_t s, Q8Out q8) {
     const size_t total = (size_t) rows * n;
-    swiglu_kernel<<<(unsigned) ((total + 255) / 256), 256, 0, s>>>(g, u, ldg, n, h, ldh, total);
+    if (n % 32 != 0) q8 = Q8Out{};
+    swiglu_kernel<<<(unsigned) ((total + 255) / 256), 256, 0, s>>>(g, u, ldg, n, h, ldh, total, q8);
     check("swiglu");
+    return q8.q != nullptr;
 }
 void add(float* y, const float* x, size_t n, cudaStream_t s) {
     add_kernel<<<(unsigned) ((n + 255) / 256), 256, 0, s>>>(y, x, n);
@@ -2565,9 +2654,16 @@ void fetch_copy(const FetchScratch& fs, size_t blob, int blocks, cudaStream_t s)
     fetch_copy_kernel<<<(unsigned) std::max(1, blocks), 256, 0, s>>>(fs.src, fs.dst, fs.nf, (blob + 15) / 16);
     check("fetch_copy");
 }
-void moe_sum(const float* part, int T, int n_used, int n, const float* w, float* out, cudaStream_t s) {
-    moe_sum_kernel<<<dim3((unsigned) ((n + 255) / 256), (unsigned) T), 256, 0, s>>>(part, n_used, n, w, out, 16);
+bool moe_sum(const float* part, int T, int n_used, int n, const float* w, float* out, cudaStream_t s, Q8Out q8) {
+    if (n % 32 != 0) q8 = Q8Out{};
+    moe_sum_kernel<<<dim3((unsigned) ((n + 255) / 256), (unsigned) T), 256, 0, s>>>(part, n_used, n, w, out, 16, q8);
     check("moe_sum");
+    return q8.q != nullptr;
+}
+void q8_rows_dup(const float* x, size_t ldx, int rows, int k, int8_t* q2, float* d2, cudaStream_t s) {
+    if (rows <= 0) return;
+    q8_dup_kernel<<<dim3((unsigned) ((k / 32 + 7) / 8), (unsigned) rows), 256, 0, s>>>(x, ldx, k, q2, d2);
+    check("q8_rows_dup");
 }
 void dup_rows_q8(const int8_t* q, const float* d, int rows, int k, int8_t* q2, float* d2, cudaStream_t s) {
     if (rows <= 0) return;
@@ -2880,9 +2976,19 @@ __device__ __forceinline__ void wait_for(const unsigned* flag, unsigned v) {
 }
 }  // namespace
 __global__ void publish_kernel(const float4* __restrict__ src, float4* dst, size_t n4, unsigned* counter, unsigned* flag,
-                               unsigned v) {
-    for (size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x; i < n4; i += (size_t) gridDim.x * blockDim.x)
-        dst[i] = src[i];
+                               unsigned v, const float4* __restrict__ plus) {
+    // (plus: src + plus goes out - add_kernel's sums, value by value, without their launch)
+    for (size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x; i < n4; i += (size_t) gridDim.x * blockDim.x) {
+        float4 a = src[i];
+        if (plus != nullptr) {
+            const float4 b = plus[i];
+            a.x += b.x;
+            a.y += b.y;
+            a.z += b.z;
+            a.w += b.w;
+        }
+        dst[i] = a;
+    }
     __threadfence_system();
     __syncthreads();
     __shared__ bool last;
@@ -2936,13 +3042,19 @@ void submit(cudaStream_t s) {
 //  end with submit: the host's summing threads and the other GPUs spin on the flag - #303's hang on maya-ds4 was a
 //  flag whose writer had never been submitted)
 constexpr size_t kViaKernel = 64 * 1024;
-void publish(const float* src, float* dst, size_t n, unsigned* counter, unsigned* flag, unsigned v, cudaStream_t s) {
+void publish(const float* src, float* dst, size_t n, unsigned* counter, unsigned* flag, unsigned v, cudaStream_t s,
+             const float* plus) {
     if (n % 4) {
         std::fprintf(stderr, "maya-hy4 publish: %zu values (a multiple of 4 expected)\n", n);
         g_err.fetch_add(1);
         return;
     }
     if (n > kViaKernel) {
+        if (plus != nullptr) {
+            std::fprintf(stderr, "maya-hy4 publish: an addend with %zu values (a kernel's copy only)\n", n);
+            g_err.fetch_add(1);
+            return;
+        }
         if (cudaMemcpyAsync(dst, src, n * sizeof(float), cudaMemcpyDeviceToHost, s) != cudaSuccess) {
             std::fprintf(stderr, "maya-hy4 publish: the copy failed\n");
             g_err.fetch_add(1);
@@ -2955,7 +3067,7 @@ void publish(const float* src, float* dst, size_t n, unsigned* counter, unsigned
     }
     const size_t n4 = n / 4;
     const int blocks = (int) std::max<size_t>(1, std::min<size_t>(16, (n4 + 255) / 256));
-    publish_kernel<<<blocks, 256, 0, s>>>((const float4*) src, (float4*) dst, n4, counter, flag, v);
+    publish_kernel<<<blocks, 256, 0, s>>>((const float4*) src, (float4*) dst, n4, counter, flag, v, (const float4*) plus);
     check("publish");
     submit(s);
 }

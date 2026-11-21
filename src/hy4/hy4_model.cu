@@ -2964,6 +2964,22 @@ struct Model::Impl {
                           "of a range read twice)");
         info.push_back(buf);
     }
+    // A token window's kernels write the next GEMV's int8 rows themselves (k::Q8Out: the hyper-connections' mix, the
+    // norms, the attention's combine, the gate's product, the SwiGLU, the experts' sum - q8_rows' arithmetic on the
+    // values they store), the query's rotation, its int8 rows and its copy are one launch, and the FFN's last add goes
+    // out with the partial: a layer is 11 or 12 launches fewer of about 46 - the member's host thread, which queues a
+    // window's launches, and the GPU's small kernels both.  The same values, the same order: the same bits
+    // (HY4_LOGIT_HASH=1 prints a hash of every window's logits to compare).  HY4_Q8_FUSE=0: the launches apart, as before.
+    const bool q8_fuse_on = !(std::getenv("HY4_Q8_FUSE") && std::getenv("HY4_Q8_FUSE")[0] == '0');
+    bool q8f(int T) const { return q8_fuse_on && T <= W && !dump && !inject; }
+    static k::Q8Out q8o(bool on, int8_t* q, float* d, int8_t* q2 = nullptr, float* d2 = nullptr) {
+        k::Q8Out o;
+        if (on) o.q = q, o.d = d, o.q2 = q2, o.d2 = d2;
+        return o;
+    }
+    const bool logit_hash = std::getenv("HY4_LOGIT_HASH") != nullptr;
+    uint64_t lh_sum = 1469598103934665603ull;
+    long lh_rows = 0;
     const bool tp_prof = std::getenv("HY4_TP_PROF") != nullptr;
     // ([0]: token windows, [1]: prompt chunks - those also by token)
     double tp_wait[2][2] = {{0, 0}, {0, 0}}, tp_sum_s[2] = {0, 0}, tp_fwd_s[2] = {0, 0}, tp_prep_s[2] = {0, 0},
@@ -4405,7 +4421,9 @@ struct Model::Impl {
     }
     // y = M x for T columns (x rows ldx apart, y rows ldy apart): GEMVs over int8 inputs up to W columns (ds4_iq's), else
     // the prompt path's GEMMs - the weights decoded to F16 a band at a time, cuBLAS with F32 sums (F32 weights: SGEMM)
-    bool mm(Gpu& gp, const Mat& M, const float* x, size_t ldx, int T, float* y, size_t ldy, float alpha = 1.0f) {
+    // (pre: gp.xq / gp.xd hold x's int8 rows already - the kernel that made x wrote them, k::Q8Out)
+    bool mm(Gpu& gp, const Mat& M, const float* x, size_t ldx, int T, float* y, size_t ldy, float alpha = 1.0f,
+            bool pre = false) {
         if (T > W) return gemm(gp, M, x, ldx, T, y, ldy, alpha);
         if (M.type == kF32) {
             k::gemv_f32w((const float*) M.w, M.ld / 4, M.k, M.n, x, ldx, T, y, ldy, alpha, gp.s);
@@ -4415,7 +4433,7 @@ struct Model::Impl {
             k::gemv_bf16w((const uint16_t*) M.w, M.ld / 2, M.k, M.n, x, ldx, T, y, ldy, alpha, gp.s);
             return true;
         }
-        k::q8_rows(x, ldx, T, M.k, gp.xq, gp.xd, gp.s);
+        if (!pre) k::q8_rows(x, ldx, T, M.k, gp.xq, gp.xd, gp.s);
         iq::MvJob j;
         j.w = M.w;
         j.ld = M.ld;
@@ -4437,7 +4455,7 @@ struct Model::Impl {
         float* y;
         size_t ldy;
     };
-    bool mm_multi(Gpu& gp, std::initializer_list<Out> outs, const float* x, size_t ldx, int T) {
+    bool mm_multi(Gpu& gp, std::initializer_list<Out> outs, const float* x, size_t ldx, int T, bool pre = false) {
         bool quant = T <= W;
         int k = -1;
         for (const Out& o : outs) {
@@ -4446,11 +4464,11 @@ struct Model::Impl {
             quant = quant && o.m->k == k;
         }
         if (!quant || outs.size() > 64) {
-            for (const Out& o : outs)
-                if (!mm(gp, *o.m, x, ldx, T, o.y, o.ldy)) return false;
+            for (const Out& o : outs)   // (pre: the int8 rows are the first matrix's width of x)
+                if (!mm(gp, *o.m, x, ldx, T, o.y, o.ldy, 1.0f, pre && o.m->k == k)) return false;
             return true;
         }
-        k::q8_rows(x, ldx, T, k, gp.xq, gp.xd, gp.s);
+        if (!pre) k::q8_rows(x, ldx, T, k, gp.xq, gp.xd, gp.s);
         std::vector<iq::MvJob> jobs;
         for (const Out& o : outs) {
             iq::MvJob j;
@@ -4497,7 +4515,7 @@ struct Model::Impl {
     }
     // a 3D matrix head by head: y head h = M[h] x head h; x [T][H][..] (ldt, ldh), y + h ldyh, columns ldyt apart
     bool mm_heads(Gpu& gp, const Mat& M, const float* x, size_t ldt, size_t ldh, int T, int H, float* y, size_t ldyt,
-                  size_t ldyh) {
+                  size_t ldyh, bool pre = false) {
         if (T > W) {   // (one strided batched GEMM over the heads: every head's matrix decoded to F16 at once)
             const size_t per = (size_t) M.n * M.k;
             if (per * H > gp.wband_n) return false;
@@ -4516,7 +4534,7 @@ struct Model::Impl {
                                               (long long) ldh, &zero, y, CUDA_R_32F, (int) ldyt, (long long) ldyh, H,
                                               CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT) == CUBLAS_STATUS_SUCCESS;
         }
-        k::q8_heads(x, ldt, ldh, T, H, M.k, gp.xq, gp.xd, gp.s);
+        if (!pre) k::q8_heads(x, ldt, ldh, T, H, M.k, gp.xq, gp.xd, gp.s);
         // every head in one launch (mv_heads) or 8 heads a launch (mv's jobs): a row's sums the same either way, so
         // the faster of the two on this GPU - AMD: one launch; NVIDIA: both timed on the first one-token call (8 heads
         // a launch until then), the faster kept for the GPU.  HY4_MV_HEADS=1 / 0: one launch / 8 heads a launch
@@ -4740,15 +4758,18 @@ struct Model::Impl {
         const int E = g.n_embd;
         cudaStream_t s = gp.s;
         if (inject) k::set_mix_out(gp.rl);
-        k::hc_pre(gp.x, T, g.hc, E, l.hca_fn, l.hca_scale, l.hca_base, g.eps, g.hc_eps, g.hc_mag, gp.xa, gp.post, s,
-                  l.attn_norm, g.eps, hc_el());
+        // (xa's int8 rows from the mix's own launch: the stream's GEMVs', and the side stream's where the layer forks)
+        const bool f8 = q8f(T), af8 = !l.ix && T <= W && gp.atf && gp.s4 != nullptr && !dump && !inject;
+        const bool xa_pre = k::hc_pre(gp.x, T, g.hc, E, l.hca_fn, l.hca_scale, l.hca_base, g.eps, g.hc_eps, g.hc_mag, gp.xa,
+                                      gp.post, s, l.attn_norm, g.eps, hc_el(),
+                                      q8o(f8, gp.xq, gp.xd, af8 ? gp.xq4 : nullptr, af8 ? gp.xd4 : nullptr));
         if (inject) {
             k::set_mix_out(nullptr);
             ref_cmp("hc_mixes", l.il, gp, gp.rl, (size_t) T * 2 * g.hc, T);
         }
         dbg("attn_norm", l.il, gp, gp.xa, T, E);
         if (inject) ref_cmp("attn_norm", l.il, gp, gp.xa, (size_t) T * E, T);
-        if (!attn_core(l, gp, T, p0, err, tpm, v)) return false;
+        if (!attn_core(l, gp, T, p0, err, tpm, v, false, xa_pre)) return false;
         if (tpm >= 0) {
             mark(tpm, gp, l.il, 1);
             all_reduce(tpm, gp, T, v, &l, 1);
@@ -4765,8 +4786,9 @@ struct Model::Impl {
     // The attention itself (the trunk's layers and the MTP block's): xa [T][E] -> y [T][E] (before its post norm)
     // (tensor parallel: member tpm's, v its attention's sync - ix_split's exchange goes by it; cache_only: the rows its
     //  caches keep of these positions - the latent rows, the indexer's - and no more)
+    // (xa_pre: gp.xq / gp.xd - and a forked layer's gp.xq4 / gp.xd4 - hold xa's int8 rows already)
     bool attn_core(Layer& l, Gpu& gp, int T, int64_t p0, std::string& err, int tpm = -1, unsigned v = 0,
-                   bool cache_only = false) {
+                   bool cache_only = false, bool xa_pre = false) {
         const int E = g.n_embd, H = l.H, KL = g.kv_lora, R = g.rope, KR = g.kv_row(), nope = g.nope();
         cudaStream_t s = gp.s;
         part0(gp);
@@ -4802,19 +4824,24 @@ struct Model::Impl {
             gi.xd = gp.xd4;
             CK(cudaEventRecord(gp.evf, s));
             CK(cudaStreamWaitEvent(gp.s4, gp.evf, 0));
-            ok = mm_multi(gi, {{&l.kv_a, gp.kvr, (size_t) KR}, {&l.gate, gp.g, (size_t) H * g.v_mla}}, gp.xa, E, T);
+            ok = mm_multi(gi, {{&l.kv_a, gp.kvr, (size_t) KR}, {&l.gate, gp.g, (size_t) H * g.v_mla}}, gp.xa, E, T,
+                          xa_pre);
             k::kv_store(gp.kvr, T, KL, R, l.kv_a_norm, g.eps, gp.pos, l.base, l.kv, l.res > 0 ? l.res : l.ring, gp.s4,
                         kv_q8, l.hs());
             CK(cudaEventRecord(gp.evj, gp.s4));
-            ok = ok && mm(gp, l.q_a, gp.xa, E, T, gp.qa, (size_t) g.q_lora);
+            ok = ok && mm(gp, l.q_a, gp.xa, E, T, gp.qa, (size_t) g.q_lora, 1.0f, xa_pre);
         } else {
             ok = l.ix ? mm_multi(gp, {{&l.q_a, gp.qa, (size_t) g.q_lora}, {&l.kv_a, gp.kvr, (size_t) KR},
                                       {&l.gate, gp.g, (size_t) H * g.v_mla}, {&l.ix_k, gp.ik, (size_t) g.ix_dim}},
-                                 gp.xa, E, T)
+                                 gp.xa, E, T, xa_pre)
                       : mm_multi(gp, {{&l.q_a, gp.qa, (size_t) g.q_lora}, {&l.kv_a, gp.kvr, (size_t) KR},
-                                      {&l.gate, gp.g, (size_t) H * g.v_mla}}, gp.xa, E, T);
+                                      {&l.gate, gp.g, (size_t) H * g.v_mla}}, gp.xa, E, T, xa_pre);
         }
-        k::rmsnorm(gp.qa, g.q_lora, T, g.q_lora, l.q_a_norm, g.eps, gp.qr, g.q_lora, s);
+        // (the token path, q8f: the norm writes qr's int8 rows for q_b - and for the forked indexer's ix_q_b beside it)
+        const bool f8 = q8f(T);
+        const bool fork8 = l.ix && T <= W && gp.ixf && gp.s4 != nullptr && !dump && !inject;
+        const bool qr_pre = k::rmsnorm(gp.qa, g.q_lora, T, g.q_lora, l.q_a_norm, g.eps, gp.qr, g.q_lora, s,
+                                       q8o(f8, gp.xq, gp.xd, fork8 ? gp.xq4 : nullptr, fork8 ? gp.xd4 : nullptr));
         dbg("q_resid", l.il, gp, gp.qr, T, g.q_lora);
         if (inject) ref_cmp("q_resid", l.il, gp, gp.qr, (size_t) T * g.q_lora, T);
         // (a token window's indexer on its own stream from here - HY4_IX_FORK=0: in line.  Both chains are short kernels,
@@ -4825,7 +4852,7 @@ struct Model::Impl {
             CK(cudaEventRecord(gp.evf, s));
             CK(cudaStreamWaitEvent(gp.s4, gp.evf, 0));
         }
-        ok = ok && mm(gp, l.q_b, gp.qr, g.q_lora, T, gp.q, (size_t) H * g.k_mla);
+        ok = ok && mm(gp, l.q_b, gp.qr, g.q_lora, T, gp.q, (size_t) H * g.k_mla, 1.0f, qr_pre);
         part(gp, "attn: q_a, kv_a, gate, q_b", T);
         if (!afork)
             k::kv_store(gp.kvr, T, KL, R, l.kv_a_norm, g.eps, gp.pos, l.base, l.kv, l.res > 0 ? l.res : l.ring, s, kv_q8,
@@ -4833,12 +4860,21 @@ struct Model::Impl {
         if (l.res > 0) l.hi = std::max(l.hi, p0 + T);
         Deq dq;
         // q: q_pe rotated in place, q_nope into the latent space through k_b, both side by side in qcat
-        k::rope(gp.q, T, H, g.k_mla, (size_t) H * g.k_mla, nope, R, gp.pos, l.base, s);
+        // (the token path, q8f: the rotation, the nope part's int8 rows for k_b and the rotated columns' copy in one
+        //  launch - else the three)
+        const bool kb_pre = f8 && l.k_b.k == nope && l.k_b.type != kF32 && l.k_b.type != kBF16 &&
+                            k::rope_q8_copy(gp.q, T, H, g.k_mla, nope, R, gp.pos, l.base, gp.qcat, (size_t) KR, KL,
+                                            q8o(true, gp.xq, gp.xd), s);
+        if (!kb_pre) k::rope(gp.q, T, H, g.k_mla, (size_t) H * g.k_mla, nope, R, gp.pos, l.base, s);
         dbg("q_pe", l.il, gp, gp.q, (size_t) T * H, g.k_mla, R, nope);
-        ok = ok && mm_heads(gp, l.k_b, gp.q, (size_t) H * g.k_mla, g.k_mla, T, H, gp.qcat, (size_t) H * KR, KR);
-        k::copy_cols(gp.q + nope, g.k_mla, gp.qcat + KL, KR, T * H, R, s);
+        ok = ok && mm_heads(gp, l.k_b, gp.q, (size_t) H * g.k_mla, g.k_mla, T, H, gp.qcat, (size_t) H * KR, KR, kb_pre);
+        if (!kb_pre) k::copy_cols(gp.q + nope, g.k_mla, gp.qcat + KL, KR, T * H, R, s);
         part(gp, "attn: kv store, rope, k_b", T);
         const float scale = 1.0f / std::sqrt((float) g.k_mla);
+        // (the token path, q8f: the attention's combine writes its output's int8 rows for v_b - where one call makes
+        //  the window's rows and v_b reads KL = 512 quantized values a head)
+        const bool vb8 = f8 && KL == 512 && l.v_b.k == KL && l.v_b.type != kF32 && l.v_b.type != kBF16;
+        bool vb_pre = false;
         if (l.ix) {
             // the indexer: its query, the window's pooling rows, the groups they complete, every token's picks
             const int D = g.ix_dim, IH = g.ix_heads, KP = g.ix_kpool;
@@ -4850,12 +4886,13 @@ struct Model::Impl {
             }
             const cudaStream_t si = gi.s;
             bool joined = !fork;
-            ok = ok && mm(gi, l.ix_q_b, gp.qr, g.q_lora, T, gp.iq, (size_t) IH * D);
+            // (forked: qr's int8 rows are the norm's second copy; ik's are its norm's own, forked or not)
+            ok = ok && mm(gi, l.ix_q_b, gp.qr, g.q_lora, T, gp.iq, (size_t) IH * D, 1.0f, fork && fork8 && qr_pre);
             k::rope(gp.iq, T, IH, D, (size_t) IH * D, D - R, R, gp.pos, l.base, si);
-            k::rmsnorm(gp.ik, D, T, D, l.ix_k_norm, g.eps, gp.ik, D, si);
+            const bool ik_pre = k::rmsnorm(gp.ik, D, T, D, l.ix_k_norm, g.eps, gp.ik, D, si, q8o(f8, gi.xq, gi.xd));
             dbg("indexer_k", l.il, gp, gp.ik, T, D);
             ok = ok && mm_multi(gi, {{&l.ix_val, gp.ivt, (size_t) 2 * D}, {&l.ix_gate, gp.ivt + D, (size_t) 2 * D}}, gp.ik,
-                                D, T);
+                                D, T, ik_pre);
             dbg("indexer_gate", l.il, gp, gp.ivt, T, 2 * D, D, D);
             dbg("indexer_q", l.il, gp, gp.iq, T, (size_t) IH * D);
             k::store_rows(gp.ivt, T, 2 * D, l.ivg, ring, gp.pos, si, kv_q8);
@@ -4997,8 +5034,13 @@ struct Model::Impl {
                     spill_need(l, gp, gp.keys + (size_t) t0 * maxk, maxk, gp.knk + t0, ts, nullptr, 1, 0, 0, 0);
                     k::kv_pick_union(l.kv, l.res, kv_rb(), gp.keys + (size_t) t0 * maxk, maxk, gp.knk + t0, ts, gp.pslot,
                                      gp.pcount, gp.plist, gp.pkeys, gp.kpick, s, l.hs());
-                    k::attention(gp.qcat + (size_t) t0 * H * KR, ts, H, KL, R, gp.kpick, 0, gp.pkeys, maxk, nullptr,
-                                 gp.knk + t0, maxk, scale, l.sinks, gp.ws, gp.o + (size_t) t0 * H * KL, s, kv_q8);
+                    {
+                        const bool vo = vb8 && t0 == 0 && ts == T;
+                        k::attention(gp.qcat + (size_t) t0 * H * KR, ts, H, KL, R, gp.kpick, 0, gp.pkeys, maxk, nullptr,
+                                     gp.knk + t0, maxk, scale, l.sinks, gp.ws, gp.o + (size_t) t0 * H * KL, s, kv_q8,
+                                     q8o(vo, gp.xq, gp.xd));
+                        vb_pre = vb_pre || vo;
+                    }
                     return;
                 }
                 if (l.wrapped()) {
@@ -5006,12 +5048,22 @@ struct Model::Impl {
                     spill_need(l, gp, gp.keys + (size_t) t0 * maxk, maxk, gp.knk + t0, ts, nullptr, 1, 0, 0, 0);
                     k::kv_pick(l.kv, l.res, kv_rb(), gp.keys + (size_t) t0 * maxk, maxk, gp.knk + t0, ts, gp.kpick, s,
                                l.hs());
-                    k::attention(gp.qcat + (size_t) t0 * H * KR, ts, H, KL, R, gp.kpick, 0, nullptr, 0, gp.plo,
-                                 gp.knk + t0, maxk, scale, l.sinks, gp.ws, gp.o + (size_t) t0 * H * KL, s, kv_q8);
+                    {
+                        const bool vo = vb8 && t0 == 0 && ts == T;
+                        k::attention(gp.qcat + (size_t) t0 * H * KR, ts, H, KL, R, gp.kpick, 0, nullptr, 0, gp.plo,
+                                     gp.knk + t0, maxk, scale, l.sinks, gp.ws, gp.o + (size_t) t0 * H * KL, s, kv_q8,
+                                     q8o(vo, gp.xq, gp.xd));
+                        vb_pre = vb_pre || vo;
+                    }
                     return;
                 }
-                k::attention(gp.qcat + (size_t) t0 * H * KR, ts, H, KL, R, l.kv, 0, gp.keys + (size_t) t0 * maxk, maxk,
-                             nullptr, gp.knk + t0, maxk, scale, l.sinks, gp.ws, gp.o + (size_t) t0 * H * KL, s, kv_q8);
+                {
+                    const bool vo = vb8 && t0 == 0 && ts == T;
+                    k::attention(gp.qcat + (size_t) t0 * H * KR, ts, H, KL, R, l.kv, 0, gp.keys + (size_t) t0 * maxk, maxk,
+                                 nullptr, gp.knk + t0, maxk, scale, l.sinks, gp.ws, gp.o + (size_t) t0 * H * KL, s, kv_q8,
+                                 q8o(vo, gp.xq, gp.xd));
+                    vb_pre = vb_pre || vo;
+                }
             };
             // (ix_split: every sub-batch past `top` pools from the first token on, and a pool's number in 16 bits)
             const bool split = tpm >= 0 && tp > 1 && ix_split && !ix_check && tp_ixw && tp_ixf && T > W &&
@@ -5089,19 +5141,23 @@ struct Model::Impl {
             for (int t0 = 0; t0 < T; t0 += kSub) {
                 const int ts = std::min(kSub, T - t0);
                 if (T > W && attn_prompt(l, gp, t0, ts, p0, false, scale, dq)) continue;
+                const bool vo = vb8 && t0 == 0 && ts == T;
                 k::attention(gp.qcat + (size_t) t0 * H * KR, ts, H, KL, R, l.kv, l.ring, nullptr, 0, gp.lo + t0,
-                             gp.nk + t0, g.n_swa, scale, l.sinks, gp.ws, gp.o + (size_t) t0 * H * KL, s, kv_q8);
+                             gp.nk + t0, g.n_swa, scale, l.sinks, gp.ws, gp.o + (size_t) t0 * H * KL, s, kv_q8,
+                             q8o(vo, gp.xq, gp.xd));
+                vb_pre = vb_pre || vo;
                 part(gp, "attn: gathering kernel", T);
             }
         }
         part0(gp);
-        ok = ok && mm_heads(gp, l.v_b, gp.o, (size_t) H * KL, KL, T, H, gp.ob, (size_t) H * g.v_mla, g.v_mla);
+        ok = ok && mm_heads(gp, l.v_b, gp.o, (size_t) H * KL, KL, T, H, gp.ob, (size_t) H * g.v_mla, g.v_mla, vb_pre);
         part(gp, "attn: v_b", T);
         dbg("attn_kqv", l.il, gp, gp.ob, T, (size_t) H * g.v_mla);
         if (inject) ref_cmp("attn_kqv", l.il, gp, gp.ob, (size_t) T * H * g.v_mla, T);
-        k::sigmoid_mul(gp.ob, gp.g, (size_t) T * H * g.v_mla, s);
+        const bool wo_pre = k::sigmoid_mul(gp.ob, gp.g, (size_t) T * H * g.v_mla, s,
+                                           q8o(f8 && (H * g.v_mla) % 32 == 0 && l.wo.k == H * g.v_mla, gp.xq, gp.xd));
         dbg("attn_gated", l.il, gp, gp.ob, T, (size_t) H * g.v_mla);
-        ok = ok && mm(gp, l.wo, gp.ob, (size_t) H * g.v_mla, T, gp.y, E);
+        ok = ok && mm(gp, l.wo, gp.ob, (size_t) H * g.v_mla, T, gp.y, E, 1.0f, wo_pre);
         part(gp, "attn: gate and output", T);
         if (!ok) err = "layer " + std::to_string(l.il) + ": a GEMV the kernels do not take";
         return ok;
@@ -5110,12 +5166,15 @@ struct Model::Impl {
     // A window's routed experts on the token path (T <= W): gp.lat's int8 rows through ds4_iq's plan (one token) or
     // grouped (a few) form, each token's weighted sum -> out [T][n_lat]; slot: the GPU's expert set (its weights in
     // gp.rw zeroed for the others)
+    // (out_pre: where given and the token path fuses - q8f - the sum writes out's int8 rows into gp.xq / gp.xd for the
+    //  up-projection that follows, and says so)
     bool routed_token(Layer& l, Gpu& gp, int T, const int* slot, float* out, const unsigned long long* eptr = nullptr,
-                      const int* who = nullptr) {
+                      const int* who = nullptr, bool* out_pre = nullptr) {
         const int lat = g.n_lat, ffe = l.ffe, nu = g.n_used;
         cudaStream_t s = gp.s;
         bool ok = true;
-        k::q8_rows(gp.lat, lat, T, lat, gp.xq, gp.xd, s);
+        const bool f8 = q8f(T);
+        if (T == 1 || !f8) k::q8_rows(gp.lat, lat, T, lat, gp.xq, gp.xd, s);
         iq::Args a;
         a.tr[0] = l.tr[0];
         a.tr[1] = l.tr[1];
@@ -5137,7 +5196,8 @@ struct Model::Impl {
             groups = nu;
             ne_max = 1;
         } else {
-            k::dup_rows_q8(gp.xq, gp.xd, T, lat, gp.x2q, gp.x2d, s);
+            if (f8) k::q8_rows_dup(gp.lat, lat, T, lat, gp.x2q, gp.x2d, s);   // (q8_rows and the copy: one launch)
+            else k::dup_rows_q8(gp.xq, gp.xd, T, lat, gp.x2q, gp.x2d, s);
             k::group_experts(gp.ids, T, nu, g.n_expert, l.experts, l.blob, gp.grp_ptr, gp.grp_start, gp.grp_ent,
                              gp.n_groups, s, slot, gp.rw, eptr, who);
             a.grp_ptr = gp.grp_ptr;
@@ -5157,7 +5217,8 @@ struct Model::Impl {
         a.hq = gp.ehq;
         a.hd = gp.ehd;
         ok = ok && iq::down(a, groups, ne_max, s);
-        k::moe_sum(gp.part, T, nu, lat, gp.rw, out, s);
+        const bool pre = k::moe_sum(gp.part, T, nu, lat, gp.rw, out, s, q8o(f8 && out_pre != nullptr, gp.xq, gp.xd));
+        if (out_pre != nullptr) *out_pre = pre;
         return ok;
     }
 
@@ -6518,11 +6579,11 @@ struct Model::Impl {
     bool ffn(Layer& l, Gpu& gp, int T, std::string& err, int tpm = -1, unsigned v = 0) {
         const int E = g.n_embd;
         cudaStream_t s = gp.s;
-        k::hc_pre(gp.x, T, g.hc, E, l.hcf_fn, l.hcf_scale, l.hcf_base, g.eps, g.hc_eps, g.hc_mag, gp.xf, gp.post, s,
-                  l.ffn_norm, g.eps, hc_el());
+        const bool xf_pre = k::hc_pre(gp.x, T, g.hc, E, l.hcf_fn, l.hcf_scale, l.hcf_base, g.eps, g.hc_eps, g.hc_mag, gp.xf,
+                                      gp.post, s, l.ffn_norm, g.eps, hc_el(), q8o(q8f(T), gp.xq, gp.xd));
         dbg("ffn_norm", l.il, gp, gp.xf, T, E);
         if (inject) ref_cmp("ffn_norm", l.il, gp, gp.xf, (size_t) T * E, T);
-        if (!ffn_core(l, gp, T, err, v)) return false;   // (tensor parallel: its sum is ffn_core's)
+        if (!ffn_core(l, gp, T, err, v, xf_pre)) return false;   // (tensor parallel: its sum is ffn_core's)
         (void) tpm;
         k::hc_post_norm(gp.x, T, g.hc, E, gp.y, gp.post, l.post_ffn, g.eps, s, dump || inject ? gp.cur : nullptr);
         if (dump || inject) {
@@ -6536,16 +6597,19 @@ struct Model::Impl {
     // post norm)
     // (tensor parallel, l a member's slice: its partial summed over the members - sync v - inside: the routed experts'
     //  sum in the latent space beside the shared expert's, so ffn_routed_up projects the whole sum)
-    bool ffn_core(Layer& l, Gpu& gp, int T, std::string& err, unsigned v = 0) {
+    // (xf_pre: gp.xq / gp.xd hold xf's int8 rows already)
+    bool ffn_core(Layer& l, Gpu& gp, int T, std::string& err, unsigned v = 0, bool xf_pre = false) {
         const int E = g.n_embd;
         cudaStream_t s = gp.s;
         bool ok = true;
+        const bool f8 = q8f(T);
         if (l.dense) {
             const int ff = l.ffn_gate.n;   // (a member's slice: its share)
             ok = mm_multi(gp, {{&l.ffn_gate, gp.gu, (size_t) ff}, {&l.ffn_up, gp.gu + (size_t) T * ff, (size_t) ff}}, gp.xf, E,
-                          T);
-            k::swiglu(gp.gu, gp.gu + (size_t) T * ff, ff, T, ff, gp.hd, ff, s);
-            ok = ok && mm(gp, l.ffn_down, gp.hd, ff, T, gp.y, E);
+                          T, xf_pre);
+            const bool hd_pre = k::swiglu(gp.gu, gp.gu + (size_t) T * ff, ff, T, ff, gp.hd, ff, s,
+                                          q8o(f8 && l.ffn_down.k == ff, gp.xq, gp.xd));
+            ok = ok && mm(gp, l.ffn_down, gp.hd, ff, T, gp.y, E, 1.0f, hd_pre);
             if (ok && l.tpm >= 0) {
                 mark(l.tpm, gp, l.il, 4);
                 all_reduce(l.tpm, gp, gp.y, (size_t) T * E, v, true, &l, 2, T);
@@ -6554,7 +6618,7 @@ struct Model::Impl {
         } else {
             const int lat = g.n_lat, ffe = l.ffe, nu = g.n_used;
             const bool lead = l.tpm <= 0;   // (the stats and the profile: one member's count)
-            ok = mm(gp, l.router, gp.xf, E, T, gp.rl, g.n_expert);
+            ok = mm(gp, l.router, gp.xf, E, T, gp.rl, g.n_expert, 1.0f, xf_pre);
             dbg("ffn_moe_logits", l.il, gp, gp.rl, T, g.n_expert);
             k::router(gp.rl, T, g.n_expert, l.router_b, nu, g.w_norm, g.w_scale, gp.ids, gp.rw, s);
             if (dump) {
@@ -6586,10 +6650,12 @@ struct Model::Impl {
             }
             // (tensor parallel: a member hands the helpers the routing - member il % N, so the copy goes round them)
             const bool hand = l.tpm >= 0 && !hel.empty() && l.tpm == (hand_rot ? l.il % tp : 0);
-            if ((lane_on || hand) && T <= W) ok = ok && mm(gp, l.rdown, gp.xf, E, T, gp.lat, lat);
+            // (xf's int8 rows stay in gp.xq / gp.xd until the experts: the router's, the down's and the shared gate /
+            //  up's GEMVs all read them - nothing between them writes those buffers)
+            if ((lane_on || hand) && T <= W) ok = ok && mm(gp, l.rdown, gp.xf, E, T, gp.lat, lat, 1.0f, xf_pre);
             else
                 ok = ok && mm_multi(gp, {{&l.rdown, gp.lat, (size_t) lat}, {&l.sh_gate, gp.gu, (size_t) sf},
-                                         {&l.sh_up, gp.gu + (size_t) T * sf, (size_t) sf}}, gp.xf, E, T);
+                                         {&l.sh_up, gp.gu + (size_t) T * sf, (size_t) sf}}, gp.xf, E, T, xf_pre);
             if (hand) {   // (the helpers' input - the routing, the latent rows - then the shared expert's gate / up)
                 float* rt = gp.half ? gp.route2 : gp.route;   // (a staggered chunk's halves: a buffer each)
                 float* trt = gp.half ? tp_route2 : tp_route;
@@ -6605,7 +6671,7 @@ struct Model::Impl {
                 }
                 if (T <= W)
                     ok = ok && mm_multi(gp, {{&l.sh_gate, gp.gu, (size_t) sf}, {&l.sh_up, gp.gu + (size_t) T * sf,
-                                                                            (size_t) sf}}, gp.xf, E, T);
+                                                                            (size_t) sf}}, gp.xf, E, T, xf_pre);
             }
             bool sh_early = false;   // (the shared expert's down already queued - one GPU's token windows, below)
             if (lane_on) {
@@ -6640,7 +6706,7 @@ struct Model::Impl {
                 if (prof) prof_acc[T > W ? " lane: wait for the routes (prompt)" : " lane: wait for the routes (token)"] += now_s() - tw;
             }
             const int* slot = lane_on || l.tpm >= 0 ? l.slot_d : nullptr;
-            bool streamed = false;
+            bool streamed = false, lat_pre = false;   // (lat_pre: the experts' sum wrote latout's int8 rows)
             const bool share = l.tpm >= 0 && !l.stream_e.empty() && T >= kTpStream;
             if (T > W) {
                 ok = ok && experts_sets(l, gp, T, err, slot);
@@ -6687,7 +6753,8 @@ struct Model::Impl {
                 CK(cudaStreamWaitEvent(s, gp.fx_ev1, 0));
                 ok = ok && routed_token(l, gp, T, nullptr, gp.latout, gp.fxs.eptr, fx.mode == 2 ? gp.fxs.who : nullptr);
             } else {
-                ok = ok && routed_token(l, gp, T, slot, gp.latout);
+                ok = ok && routed_token(l, gp, T, slot, gp.latout, nullptr, nullptr,
+                                        l.tpm >= 0 && model_sum && !lane_on ? &lat_pre : nullptr);
             }
             if (lane_on && !streamed) {   // (the GPU's experts run meanwhile)
                 k::submit(s);   // (AMD under Windows: they would sit in the queue until the next wait - after the lane's)
@@ -6715,12 +6782,16 @@ struct Model::Impl {
             dbg("ffn_moe_out", l.il, gp, gp.latout, T, lat);
             if (inject) ref_cmp("ffn_moe_out", l.il, gp, gp.latout, (size_t) T * lat, T);
             if (l.tpm >= 0 && model_sum) {   // (HY4_TP_MODEL_SUM=1: each member's own up-projection, summed after)
-                ok = ok && mm(gp, l.rup, gp.latout, lat, T, gp.y, E);
-                k::swiglu(gp.gu, gp.gu + (size_t) T * sf, sf, T, sf, gp.hd, sf, s);
-                ok = ok && mm(gp, l.sh_down, gp.hd, sf, T, gp.cur, E);
-                k::add(gp.y, gp.cur, (size_t) T * E, s);
+                ok = ok && mm(gp, l.rup, gp.latout, lat, T, gp.y, E, 1.0f, lat_pre && T <= W);
+                const bool hd_pre = k::swiglu(gp.gu, gp.gu + (size_t) T * sf, sf, T, sf, gp.hd, sf, s,
+                                              q8o(f8 && l.sh_down.k == sf, gp.xq, gp.xd));
+                ok = ok && mm(gp, l.sh_down, gp.hd, sf, T, gp.cur, E, 1.0f, hd_pre);
+                // (the token path, q8f: the shared expert's part goes out added to the routed one's - the sum that
+                //  comes back replaces gp.y, so the add needs no launch of its own)
+                const bool plus = f8 && !check_tp;
+                if (!plus) k::add(gp.y, gp.cur, (size_t) T * E, s);
                 mark(l.tpm, gp, l.il, 4);
-                if (ok) all_reduce(l.tpm, gp, gp.y, (size_t) T * E, v, true, &l, 2, T);
+                if (ok) all_reduce(l.tpm, gp, gp.y, (size_t) T * E, v, true, &l, 2, T, plus ? gp.cur : nullptr);
                 mark(l.tpm, gp, l.il, 5);
                 if (!ok) err = "layer " + std::to_string(l.il) + ": an FFN kernel did not take its shapes";
                 return ok;
@@ -7725,7 +7796,26 @@ struct Model::Impl {
         return true;
     }
 
+    // (HY4_LOGIT_HASH: every window's logits rows hashed, bit by bit, as they come - printed with the reports at the
+    //  end; two builds or settings that print the same hash made the same logits for every row)
     bool window(const int* ids, int T, int64_t p0, int want, float* logits_out, std::string& err) {
+        if (!window_run(ids, T, p0, want, logits_out, err)) return false;
+        if (logit_hash && want > 0 && logits_out != nullptr) {
+            const size_t n = (size_t) want * g.n_vocab;
+            for (size_t i = 0; i < n; ++i) {
+                uint32_t b;
+                std::memcpy(&b, logits_out + i, 4);
+                lh_sum = (lh_sum ^ b) * 1099511628211ull;
+            }
+            lh_rows += want;
+        }
+        return true;
+    }
+    void lh_report() const {
+        if (logit_hash)
+            std::fprintf(stderr, "HY4_LOGIT_HASH %016llx over %ld rows of logits\n", (unsigned long long) lh_sum, lh_rows);
+    }
+    bool window_run(const int* ids, int T, int64_t p0, int want, float* logits_out, std::string& err) {
         const int E = g.n_embd, hc = g.hc;
         win_t0 = now_s();
         cur_p0 = p0;
@@ -7936,9 +8026,14 @@ struct Model::Impl {
     // ... of n floats at buf (in place)
     // (rows: n is rows of E - a prompt chunk's sum then goes by blocks of rows; pf: the layer whose sum this is, for
     //  the prefetch queued behind the partial - pf_kind 1: its FFN's matrices, 2: the next layer's attention's)
+    //  plus: buf + plus is what goes out - the token path's; a chunk's blocks add it first)
     void all_reduce(int m, Gpu& gp, float* buf, size_t n, unsigned v, bool rows = true, const Layer* pf = nullptr,
-                    int pf_kind = 0, int pf_T = 0) {
+                    int pf_kind = 0, int pf_T = 0, const float* plus = nullptr) {
         const size_t E = (size_t) g.n_embd;
+        if (plus != nullptr && n > (size_t) W * E) {
+            k::add(buf, plus, n, gp.s);
+            plus = nullptr;
+        }
         if (rows && blocked && gp.s2 && n > (size_t) W * E && n % E == 0) {
             publish_blocks(m, gp, buf, (int) (n / E), v);
             if (gp.defer) {   // (a staggered half: its read-back queued now on s3, waited for by its own later step)
@@ -7956,7 +8051,7 @@ struct Model::Impl {
             return;
         }
         k::publish(buf, tp_part + (size_t) m * tp_stride(), n, tp_cnt[(size_t) m], tp_fout + (size_t) m * kLine, v,
-                   gp.s);
+                   gp.s, plus);
         if (pf != nullptr && pf_kind == 1) pf_ffn(*pf, gp, pf_T);
         else if (pf != nullptr && pf_kind == 2) pf_attn(*pf, gp, pf_T);
         k::wait_pull(tp_fin, v, buf, tp_sum, n, gp.s);
@@ -8289,14 +8384,15 @@ struct Model::Impl {
             k::wait_pull(tp_froute, v, gp.route, tp_route, (size_t) T * (lat + 32), gp.s);
             k::split3(gp.route, gp.lat, (size_t) T * lat, gp.ids, nr, gp.rw, nr, gp.s);
             Layer& l = hp.L[0][(size_t) il];
+            bool lat_pre = false;
             if (T > W) {
                 if (!experts_sets(l, gp, T, err, l.slot_d)) return false;
-            } else if (!routed_token(l, gp, T, l.slot_d, gp.latout)) {
+            } else if (!routed_token(l, gp, T, l.slot_d, gp.latout, nullptr, nullptr, model_sum ? &lat_pre : nullptr)) {
                 err = "the helper's experts did not take their shapes";
                 return false;
             }
             if (model_sum) {
-                if (!mm(gp, l.rup, gp.latout, lat, T, gp.y, g.n_embd)) {
+                if (!mm(gp, l.rup, gp.latout, lat, T, gp.y, g.n_embd, 1.0f, lat_pre && T <= W)) {
                     err = "the helper's ffn_routed_up did not take its shapes";
                     return false;
                 }
@@ -8576,6 +8672,7 @@ Model::~Model() {
                      "CPU-lane layers %.1f%% in VRAM\n", (long long) m->hot.swaps, (long long) m->hot.rounds,
                      m->hot.swap_s, m->hot.picks ? 100.0 * (double) m->hot.hits / (double) m->hot.picks : 0.0);
     if (m) m->tp_report();
+    if (m) m->lh_report();
     if (m) m->ev_report();
     if (m) m->draft_report();
     if (m && m->prof) m->prof_report();
