@@ -1,0 +1,232 @@
+{
+  "schema": 1,
+  "date": "2026-11-15",
+  "result": "PASS",
+  "source_commit": "082464a8b295304d56c796f0b5984057be3eb0b8",
+  "source_generate_sha256": "d202e1b28b116b2b7c4da0830edf48fb4a74c9542859d7bc95b551fa7362c903",
+  "cuda_binary_sha256": "e63d91fad9be0c091944657feac38018b343e5a93c40459d4fc8385756f18633",
+  "cuda_binary_bytes": 92320792,
+  "driver_file": "tools/check_glm_slot_spill_model.py",
+  "executed_and_published_driver_sha256": "a8dde901dcad380fd15f2e7d055a6a2283f29635fcfd5bc13df47f124ef75ff3",
+  "input_fixture": "docs/testing/glm-slot-spill-model-inputs.json",
+  "input_fixture_sha256": "58b2f98de601c5bdc2519f751f5d2deb9f723bbb750735cdb0509f063aa21b1e",
+  "tokenizer_json_sha256": "60458021da45393b01761d2c49144a02759a52927239bd665136dcf870e64bb5",
+  "chat_template_sha256": "a4fddbbf0b432101a296c17094f8bc5a2b0d30713b5b5cd92f86be78511aa724",
+  "configuration": {
+    "model": "GLM-5.3-Flash Maya-L IQ3_S",
+    "gpus": "4 x RTX 4090",
+    "host_ram_gib": 251.30196380615234,
+    "context": 4096,
+    "parallel": 1,
+    "prefill_chunk": 1024,
+    "layer_split": [
+      12,
+      24,
+      35
+    ],
+    "cpu_threads_observed": 76,
+    "cpu_pool": "upstream shared pool; no local 144-thread overlay",
+    "mtp": false,
+    "dflash": false,
+    "thinking": false,
+    "greedy": true,
+    "seed": 1729,
+    "max_new_tokens": 16,
+    "slot_ram_gib": 0.001,
+    "slot_disk_gib": 2,
+    "environment": {
+      "CUDA_DEVICE_ORDER": "PCI_BUS_ID",
+      "CUDA_VISIBLE_DEVICES": "0,1,2,3",
+      "MAYA_GLM_CKPTS": "0",
+      "MAYA_GLM_CKPT_EVERY": "0",
+      "MAYA_GLM_MULTI_CKPTS": "0",
+      "MAYA_GLM_NO_MTP": "1",
+      "MAYA_GLM_PREFIX_CUT": "0",
+      "MAYA_GLM_RAM_GB": "160",
+      "MAYA_GLM_RAM_HEADROOM_GB": "32",
+      "MAYA_GLM_SLOTS": "1",
+      "MAYA_GLM_SLOT_DIR": "<fresh-output>/private-slots",
+      "MAYA_GLM_SLOT_GB": "2",
+      "MAYA_GLM_SLOT_KEEP": "1",
+      "MAYA_GLM_SLOT_MIN": "1024",
+      "MAYA_GLM_SLOT_RAM_GB": "0.001",
+      "MAYA_GLM_SLOT_SPILL": "1"
+    },
+    "engine_arguments": [
+      "--glm-pack",
+      "<pack>",
+      "--max-context",
+      "4096",
+      "--parallel",
+      "1",
+      "--prefill",
+      "1024",
+      "--layer-split",
+      "12,24,35",
+      "--glm-ram-resident",
+      "--seed",
+      "1729",
+      "--greedy",
+      "--temperature",
+      "0",
+      "--serve"
+    ]
+  },
+  "execution": {
+    "model_loads": 2,
+    "generated_requests": 4,
+    "explicit_warmup_requests": 0,
+    "order": [
+      "process1:A",
+      "process1:B",
+      "process1:A",
+      "QUIT",
+      "process2:A",
+      "QUIT"
+    ],
+    "preliminary_loader_failure": {
+      "error": "libcudart.so.13 was not on the test process library search path",
+      "model_loads": 0,
+      "generated_requests": 0,
+      "correction": "Reuse the existing runtime library directory; exact native command plus --help then returned 0 before the one corrected attempt."
+    }
+  },
+  "spill_evidence": {
+    "after_B_before_restore_bin_count": 1,
+    "A_bin_bytes": 161738820,
+    "A_tokens_in_meta": 1227,
+    "ram_cap_bytes": 1073741,
+    "files_after_first_normal_exit": 2,
+    "total_state_bytes_after_first_exit": 323477640,
+    "disk_cap_bytes": 2147483648
+  },
+  "requests": [
+    {
+      "case": "A_cold",
+      "prompt": 1228,
+      "reused": 0,
+      "generated": 10,
+      "finish": "stop",
+      "tokens": [
+        32,
+        96698,
+        1930,
+        9002,
+        12,
+        969,
+        28125,
+        12,
+        3925,
+        154827
+      ],
+      "tokens_sha256": "a74c111b571bac5749c085badc7bcef748a04c0f45da51c056b9823182da72d7",
+      "text": "A-ISOLATED-ALPHA-OK<|user|>"
+    },
+    {
+      "case": "B_evict",
+      "prompt": 1228,
+      "reused": 0,
+      "generated": 10,
+      "finish": "stop",
+      "tokens": [
+        33,
+        96698,
+        1930,
+        9002,
+        7671,
+        5609,
+        11164,
+        12,
+        3925,
+        154827
+      ],
+      "tokens_sha256": "e198de0c3a32824d7e5f48b8038e77f1a729ac130e0d6da705b199c22bb7985d",
+      "text": "B-ISOLATED-BRAVO-OK<|user|>"
+    },
+    {
+      "case": "A_fromdisk",
+      "prompt": 1228,
+      "reused": 1227,
+      "generated": 10,
+      "finish": "stop",
+      "tokens": [
+        32,
+        96698,
+        1930,
+        9002,
+        12,
+        969,
+        28125,
+        12,
+        3925,
+        154827
+      ],
+      "tokens_sha256": "a74c111b571bac5749c085badc7bcef748a04c0f45da51c056b9823182da72d7",
+      "text": "A-ISOLATED-ALPHA-OK<|user|>"
+    },
+    {
+      "case": "A_afterrestart",
+      "prompt": 1228,
+      "reused": 1227,
+      "generated": 10,
+      "finish": "stop",
+      "tokens": [
+        32,
+        96698,
+        1930,
+        9002,
+        12,
+        969,
+        28125,
+        12,
+        3925,
+        154827
+      ],
+      "tokens_sha256": "a74c111b571bac5749c085badc7bcef748a04c0f45da51c056b9823182da72d7",
+      "text": "A-ISOLATED-ALPHA-OK<|user|>"
+    }
+  ],
+  "native_phases": {
+    "phase1": {
+      "slot_notes": [
+        "NOTE sessions: folder <private-slots>: 0 conversation(s) kept from earlier runs (0.00 GB)",
+        "NOTE sessions: two-tier slots: RAM 0.00 GB max, disk 2.15 GB in <private-slots>; kept across runs",
+        "NOTE sessions: miss: no candidate",
+        "NOTE sessions: saved a 1227-token conversation (0.16 GB in RAM in 0.1 s); 0 in RAM, 1 on disk",
+        "NOTE sessions: miss: diverged at token 10",
+        "NOTE sessions: saved a 1227-token conversation (0.16 GB in RAM in 0.1 s); 0 in RAM, 2 on disk",
+        "NOTE sessions: took back a 1227-token conversation from disk (0.1 s); 1 new tokens to read",
+        "NOTE sessions: saved a 1227-token conversation on shutdown (0.16 GB in RAM in 0.1 s); 0 in RAM, 2 on disk"
+      ],
+      "done_lines": [
+        "DONE 10 1228 1968.2 280.1 stop 0 0 0 2027 3024",
+        "DONE 10 1228 1871.9 252.4 stop 0 0 0 2222 3024",
+        "DONE 10 1228 26.0 229.6 stop 0 0 1227 2381 3024"
+      ],
+      "normal_exit_zero_checked_by_driver": true,
+      "raw_stdout_sha256": "2cd85b57669daea021ca783f134a9cb069591a2aca9cc83017858c66158b1dd6",
+      "raw_stderr_sha256": "1d6498a36d444229c9a23c673193e5fd5912cc3e4b98edd56974e3fee56b2361"
+    },
+    "phase2": {
+      "slot_notes": [
+        "NOTE sessions: folder <private-slots>: 2 conversation(s) kept from earlier runs (0.32 GB)",
+        "NOTE sessions: two-tier slots: RAM 0.00 GB max, disk 2.15 GB in <private-slots>; kept across runs",
+        "NOTE sessions: took back a 1227-token conversation from disk (0.0 s); 1 new tokens to read",
+        "NOTE sessions: saved a 1227-token conversation on shutdown (0.16 GB in RAM in 0.1 s); 0 in RAM, 2 on disk"
+      ],
+      "done_lines": [
+        "DONE 10 1228 41.1 289.9 stop 0 0 1227 2020 3024"
+      ],
+      "normal_exit_zero_checked_by_driver": true,
+      "raw_stdout_sha256": "f807dd4cd08f227c36413dcc880d070294b2b9ba7652400cd84e246cd36fd86f",
+      "raw_stderr_sha256": "cb25bc872af3b49ce2127da9737f1be42f363cd6e2ae299c5e60ffa91e10d4bd"
+    }
+  },
+  "limits": [
+    "One short synthetic A/B pair and one restart, not a full quality suite or multi-agent throughput test.",
+    "Single active sequence, 4096 context, no MTP/DFlash/vision; no claim for other execution modes.",
+    "File-backed state across processes; OS page cache was not dropped and no power-loss durability or cold-SSD timing claim is made.",
+    "Tiny forced-spill budget; production-sized budget saturation and crash recovery were not tested.",
+    "Native DONE timing fields are raw protocol evidence, not a performance comparison."
+  ]
+}
