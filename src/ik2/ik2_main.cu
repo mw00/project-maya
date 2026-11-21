@@ -1101,6 +1101,71 @@ void conv_rec(Layer& Ly, int which, const float* x, const float* hist, int T, in
     CU(cudaMemcpyAsync(Ly.rec_x[which], x, (size_t) T * Cc * 4, cudaMemcpyDeviceToDevice, g_s));
 }
 
+// The pictures of the request running (GENI): the image encoder's rows (maya-vision's SVE1 records, [n][C] F32), each
+// in place of one image token of the prompt - the model reads them as they are, without the embedding's norm.
+struct Pictures {
+    std::vector<float> rows;
+    std::vector<int> row_at;   // a prompt position's row (-1: a token)
+    int n = 0;
+    void clear() { rows.clear(), row_at.clear(), n = 0; }
+    int at(int pos) const { return n && pos < (int) row_at.size() ? row_at[pos] : -1; }
+};
+Pictures g_img;
+// the rows of `path` for the image tokens of ids in order; sig[i]: a hash of position i's row (0: a token), the
+// kept state's key beside the ids.  -> an error's text, or empty
+std::string load_pictures(const std::string& path, const std::vector<int>& ids, int image_token, int C, Pictures& P,
+                          std::vector<uint64_t>& sig) {
+    FILE* f = std::fopen(path.c_str(), "rb");
+    if (!f) return "cannot read the pictures' file";
+    for (;;) {
+        int32_t h[5];
+        if (std::fread(h, 4, 5, f) != 5) break;
+        if (h[0] != 0x31455653 || h[1] <= 0 || h[4] != C) {
+            std::fclose(f);
+            return "the pictures' file is not the image encoder's for this model";
+        }
+        const size_t at = P.rows.size(), n = (size_t) h[1] * C;
+        P.rows.resize(at + n);
+        if (std::fread(P.rows.data() + at, 4, n, f) != n) {
+            std::fclose(f);
+            return "the pictures' file is cut short";
+        }
+    }
+    std::fclose(f);
+    const int n_rows = (int) (P.rows.size() / C);
+    P.row_at.assign(ids.size(), -1);
+    int k = 0;
+    for (size_t i = 0; i < ids.size(); ++i) {
+        if (ids[i] != image_token) continue;
+        if (k >= n_rows) return "the prompt has more image tokens than its pictures have rows";
+        P.row_at[i] = k;
+        uint64_t hsh = 1469598103934665603ull;   // FNV-1a over the row's bytes
+        const uint8_t* b = (const uint8_t*) (P.rows.data() + (size_t) k * C);
+        for (size_t j = 0; j < (size_t) C * 4; ++j) hsh = (hsh ^ b[j]) * 1099511628211ull;
+        sig[i] = hsh | 1;
+        ++k;
+    }
+    if (k != n_rows) return "the prompt's image tokens and its pictures' rows do not match";
+    P.n = n_rows;
+    return "";
+}
+// the pictures' rows of positions pos0 .. pos0 + T - 1 over their tokens' embeddings in h [T][C]
+void place_pictures(float* h, int T, int pos0, int C, cudaStream_t s) {
+    if (!g_img.n) return;
+    for (int t = 0; t < T;) {
+        const int r = g_img.at(pos0 + t);
+        if (r < 0) {
+            ++t;
+            continue;
+        }
+        int n = 1;
+        while (t + n < T && g_img.at(pos0 + t + n) == r + n) ++n;
+        CU(cudaMemcpyAsync(h + (size_t) t * C, g_img.rows.data() + (size_t) r * C, (size_t) n * C * 4,
+                           cudaMemcpyHostToDevice, s));
+        t += n;
+    }
+}
+
 // a GPU's own: its streams and cuBLAS handle, work buffers and expert cache; use_dev() makes it the current one (the
 // globals g_s, g_cs, g_ev, g_blas the kernels and copies go to)
 struct DevCtx {
@@ -2024,7 +2089,8 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
              std::vector<float>& logits_out, std::vector<int>* argmax_out, double& t_exp) {
     const Config& c = M.c;
     const int C = c.C;
-    if (g_fast && T == 1 && dump.empty() && !g_prof && !g_rec && !g_taps && !g_trace && g_pop.empty()) {
+    if (g_fast && T == 1 && dump.empty() && !g_prof && !g_rec && !g_taps && !g_trace && g_pop.empty() &&
+        g_img.at(pos0) < 0) {
         fast_token(M, tok[0], pos0, out_mode, logits_out, argmax_out);
         return;
     }
@@ -2040,6 +2106,7 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
             k::decode_host(M.embd_type, M.embd + (size_t) tok[t] * rb, C, W.emb_h + (size_t) t * C);
         CU(cudaMemcpyAsync(W.tmp, W.emb_h, (size_t) T * C * 4, cudaMemcpyHostToDevice, g_s));
         k::rms(W.tmp, M.embd_norm, T, C, c.eps, W.h, g_s);
+        place_pictures(W.h, T, pos0, C, g_s);
         for (int t = 0; t < T; ++t) W.pos_h[t] = pos0 + t;
         CU(cudaMemcpyAsync(W.pos, W.pos_h, (size_t) T * 4, cudaMemcpyHostToDevice, g_s));
     }
@@ -2698,6 +2765,7 @@ void forward_prefill_sup(Model& M, const int* tok, int T, int pos0, int sub_chun
                 k::decode_host(M.embd_type, M.embd + (size_t) tok[off + t] * rb, C, W.emb_h + (size_t) t * C);
             CU(cudaMemcpyAsync(W.tmp, W.emb_h, (size_t) ts * C * 4, cudaMemcpyHostToDevice, g_s));
             k::rms(W.tmp, M.embd_norm, ts, C, c.eps, W.h + (size_t) off * C, g_s);
+            place_pictures(W.h + (size_t) off * C, ts, pos0 + off, C, g_s);
             if (off + ts < T) CU(cudaStreamSynchronize(g_s));   // (W.emb_h reused on next iteration)
         }
         for (int t = 0; t < T; ++t) W.pos_h[t] = pos0 + t;
@@ -2830,6 +2898,7 @@ int main(int argc, char** argv) {
     bool serve = false, serve_maya = true;   // (--serve: Maya's engine protocol; --serve-ik2: the @-line one)
     std::vector<int> eos_ids;                 // --eos a,b: the tokens a request ends at (Maya's protocol)
     double cache_gb = 60;
+    int image_token = 200054;   // --image-token: Inkling 2's <|unused_200054|>, the template's placeholder of a picture
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         auto next = [&]() -> std::string {
@@ -2862,6 +2931,7 @@ int main(int argc, char** argv) {
                 if (*p == ',') ++p;
             }
         }
+        else if (a == "--image-token") image_token = std::atoi(next().c_str());
         else if (a == "--dump") dump = next();
         else die("unknown argument " + a);
     }
@@ -3735,6 +3805,7 @@ int main(int argc, char** argv) {
         // the answer on stdout as "@TOK id" lines then "@END reason prompt_tokens cached_tokens prompt_s gen_s".  The
         // tokens whose state the model holds are kept: a request that starts with them runs only what follows.
         std::vector<int> hist;
+        std::vector<uint64_t> hist_sig;   // a picture row's hash at its position (shorter than hist: the rest are tokens)
         std::vector<float> last;
         double t_exp = 0;
         // Snapshots of every short conv's history (plus sliding-layer KV windows in host RAM) at the end of a
@@ -3811,6 +3882,7 @@ int main(int argc, char** argv) {
                 CU(cudaMemset(Ly.h_mlp, 0, 3 * C * 4));
             }
             hist.clear();
+            hist_sig.clear();
             last.clear();
         };
         auto parse_ints = [](const std::string& t) {
@@ -3873,7 +3945,7 @@ int main(int argc, char** argv) {
         std::mt19937_64 rng(1234);
         while (next_line(line)) {
             std::istringstream in(line);
-            std::string cmd, stops_s, ids_s;
+            std::string cmd, stops_s, ids_s, emb_path;
             int max_new = 0, top_k = 0;
             double temp = 0, top_p = 1;
             long long seed = -1;
@@ -3882,7 +3954,10 @@ int main(int argc, char** argv) {
                 pop_dump();
                 break;
             }
-            if (cmd != "GEN") {   // (Maya's PAUSE / WRAP and the like: not offered in READY, so not sent)
+            // GENI: GEN with the request's pictures - "GENI <max_new> [key=value ...] <pictures file> <ids>", the file
+            // the image encoder's rows (SVE1 records back to back), one row an image token of the ids in order
+            const bool geni = cmd == "GENI";
+            if (cmd != "GEN" && !geni) {   // (Maya's PAUSE / WRAP and the like: not offered in READY, so not sent)
                 if (!serve_maya) {
                     std::printf("@END error unknown_command 0 0 0 0\n");
                     std::fflush(stdout);
@@ -3896,7 +3971,10 @@ int main(int argc, char** argv) {
                 while (in >> w) {
                     const size_t eq = w.find('=');
                     if (eq == std::string::npos) {
-                        ids_s = w;
+                        if (geni && emb_path.empty() && ids_s.empty() && w.find_first_not_of("0123456789,-") != std::string::npos)
+                            emb_path = w;   // (the pictures' file comes before the ids)
+                        else
+                            ids_s = w;
                         continue;
                     }
                     const std::string k = w.substr(0, eq), v = w.substr(eq + 1);
@@ -3922,11 +4000,23 @@ int main(int argc, char** argv) {
                 std::fflush(stdout);
                 continue;
             }
+            g_img.clear();
+            std::vector<uint64_t> sig(ids.size(), 0);
+            if (!emb_path.empty()) {
+                const std::string err = load_pictures(emb_path, ids, image_token, c.C, g_img, sig);
+                if (!err.empty()) {
+                    g_img.clear();
+                    std::printf("ERR %s\nDONE 0 %zu 0 0 cancel 0 0 0\n", err.c_str(), ids.size());
+                    std::fflush(stdout);
+                    continue;
+                }
+            }
             busy = true;
             if (seed >= 0) rng.seed((uint64_t) seed);
             g_cancel = 0;
-            size_t L = 0;
-            while (L < hist.size() && L < ids.size() && hist[L] == ids[L]) ++L;
+            size_t L = 0;   // (a picture's position is the same only with the same rows: its hash beside its token)
+            auto hsig = [&](size_t i) { return i < hist_sig.size() ? hist_sig[i] : (uint64_t) 0; };
+            while (L < hist.size() && L < ids.size() && hist[L] == ids[L] && hsig(L) == sig[L]) ++L;
             if (L < hist.size() || L == ids.size()) {
                 // back to the latest snapshot at or before L that leaves a token to run (one past it is dropped:
                 // its position's state follows from a prefix the request does not share)
@@ -3943,6 +4033,7 @@ int main(int argc, char** argv) {
                     for (auto& sn : snaps)
                         if (sn.pos > sp) sn.pos = -1;
                     hist.resize(sp);
+                    if (hist_sig.size() > (size_t) sp) hist_sig.resize(sp);
                     last.clear();
                     L = sp;
                 } else {
@@ -4005,6 +4096,7 @@ int main(int argc, char** argv) {
             }
             if (L < ids.size()) {
                 hist = ids;
+                hist_sig = sig;
                 Snap& sn = snaps[snap_next];
                 snap_next = (snap_next + 1) % (int) snaps.size();
                 sn.pos = (int) hist.size();
