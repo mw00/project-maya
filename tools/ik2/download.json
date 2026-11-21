@@ -10,5 +10,14 @@
  "files": {
   "Inkling-2-Mini-UD-Q4_K_XL.gguf": [17629759456, "e62d463c135ffe283df8d94b279a96ca145ac128b52ce854478613045bf4de15"]
  },
- "gguf": "Inkling-2-Mini-UD-Q4_K_XL.gguf"
+ "gguf": "Inkling-2-Mini-UD-Q4_K_XL.gguf",
+ "vision": {
+  "_": "The pictures: unsloth's mmproj of the model's vision tower (llama.cpp's inkling2v projector, BF16), from the same repo and revision, read by maya-vision (tools/vision/inkling2v_patch.py) when a picture arrives; not with --no-vision.",
+  "repo": "unsloth/Inkling-2-Mini-GGUF",
+  "revision": "ae9327c5fbc7333116ba32eee78bb5d2bbefae4f",
+  "folder": "",
+  "files": {
+   "mmproj-BF16.gguf": [641805760, "2c165c78790e78a3f45a2d1e9e931083e52ee69d45ff2a0dc9c281fdf1a666e7"]
+  }
+ }
 }

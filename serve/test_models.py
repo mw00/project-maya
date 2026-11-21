@@ -335,7 +335,8 @@ class Settings(unittest.TestCase):
 
     def test_ik2_read_and_written_with_its_own_flags(self):
         """Inkling-2-Mini's preview on the Models page: its context, cache format and one GPU - maya-ik2's own flags
-        only; what it does not have yet (drafting, answers at once, pictures) said in plain words."""
+        only; what it does not have yet (drafting, answers at once) said in plain words, and pictures where the setup
+        left out the image encoder."""
         cards = mock.patch.object(M, "machine_gpus", return_value=[{"index": 0, "name": "RTX 3090", "vram_gb": 24.0},
                                                                    {"index": 1, "name": "RTX 5090", "vram_gb": 31.5}])
         cards.start()
@@ -361,11 +362,30 @@ class Settings(unittest.TestCase):
                          {"--model", "--max-context"})
         for bad, why in (({"gpus": [0, 1]}, "one GPU"), ({"parallel": 2}, "one request at a time"),
                          ({"draft": "dspark"}, "not offered in the Inkling 2 Mini preview"),
-                         ({"kv": "int8"}, "FP8 or F16"), ({"images": True}, "text only"),
+                         ({"kv": "int8"}, "FP8 or F16"), ({"images": True}, "set up without its image encoder"),
                          ({"reserve_mib": 512}, "not a setting")):
             with self.assertRaises(ValueError, msg=str(bad)) as e:
                 M.apply(cfg, bad)
             self.assertIn(why, str(e.exception))
+
+    def test_ik2_images_on_and_off(self):
+        """The setup's "vision" entry (maya-vision and the mmproj, no text model): Images off keeps it as "vision_off",
+        on puts it back; the engine's arguments are the same either way (the plan holds no room for pictures)."""
+        cards = mock.patch.object(M, "machine_gpus", return_value=[{"index": 0, "name": "RTX 3090", "vram_gb": 24.0}])
+        cards.start()
+        self.addCleanup(cards.stop)
+        path = self.ik2_cfg()
+        cfg = M.read(path)
+        v = {"exe": "/b/maya-vision", "mmproj": "/m/mmproj-BF16.gguf", "gpu": True}
+        cfg["vision"] = v
+        self.assertTrue(M.settings_of(cfg)["images"])
+        self.assertTrue(M.choices(cfg)["images"])
+        off = M.apply(cfg, {"images": False})
+        self.assertEqual((off.get("vision"), off["vision_off"], off["args"]), (None, v, cfg["args"]))
+        self.assertTrue(M.choices(off)["images"])                       # (it can be switched on again)
+        on = M.apply(off, {"images": True})
+        self.assertEqual((on["vision"], on.get("vision_off"), on["args"]), (v, None, cfg["args"]))
+        self.assertIn(Path(v["mmproj"]), M.vision_files(cfg))
 
     def test_ik2_described_for_the_page(self):
         cards = mock.patch.object(M, "machine_gpus", return_value=[{"index": 0, "name": "RTX 3090", "vram_gb": 24.0}])

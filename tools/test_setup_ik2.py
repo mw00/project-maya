@@ -2,7 +2,7 @@
 its own defaults (its author's), the pinned manifest, the one-line refusals on the hosts the preview
 does not run on (AMD, a Mac, Windows, two GPUs or more asked for, a card older than RTX 30 / A100 or under 24 GB), the
 one GPU it picks, what fits on the card (the context, the drafter's room), the picker's row, the tokenizer step, the
-config it writes and a start of it.  No GPU, no network.
+config it writes (its pictures too) and a start of it.  No GPU, no network.
 
     python -m unittest tools.test_setup_ik2 -v
 """
@@ -100,6 +100,17 @@ class Manifest(unittest.TestCase):
                          "e62d463c135ffe283df8d94b279a96ca145ac128b52ce854478613045bf4de15")   # (the author's)
         self.assertNotIn("draft", man)
 
+    def test_vision_pinned(self):
+        """The pictures: unsloth's mmproj-BF16.gguf from the GGUF's own repo and revision, by size and sha256."""
+        man = json.loads(maya.IK2_MANIFEST.read_text(encoding="utf-8"))
+        m = maya.ik2_vision_model()
+        self.assertEqual((m["repo"], m["revision"], m["folder"]), (man["repo"], man["revision"], ""))
+        self.assertEqual(m["files"], {"mmproj-BF16.gguf": 641805760})
+        self.assertEqual(m["sha256"]["mmproj-BF16.gguf"],
+                         "2c165c78790e78a3f45a2d1e9e931083e52ee69d45ff2a0dc9c281fdf1a666e7")
+        self.assertEqual(maya.file_url(m, "mmproj-BF16.gguf"), "https://huggingface.co/unsloth/Inkling-2-Mini-GGUF/"
+                         f"resolve/{man['revision']}/mmproj-BF16.gguf")
+
     def test_entry_and_urls(self):
         m = maya.ik2_entry()
         self.assertAlmostEqual(m["download_gb"], 17.63, places=1)
@@ -193,7 +204,7 @@ class Picker(unittest.TestCase):
         self.assertEqual((got["rows"][-1], fam), ("Inkling 2 Mini (experimental)", "ik2"))
         about = got["about"]["Inkling 2 Mini (experimental)"]
         for part in ("EXPERIMENTAL PREVIEW", "thinkingmachines' Inkling-2-Mini", "UD-Q4_K_XL", "18 GB",
-                     "RTX 30 / A100", "Linux", "one GPU with 24 GB", "text only"):
+                     "RTX 30 / A100", "Linux", "one GPU with 24 GB", "pictures"):
             self.assertIn(part, about)
 
 
@@ -264,6 +275,42 @@ class Steps(unittest.TestCase):
         cfg = json.loads(path.read_text(encoding="utf-8"))
         self.assertEqual(cfg["args"], ["--model", str(gguf), "--max-context", "65536"])
         self.assertEqual(cfg["env"], {"IK2_KV": "fp8", "MY_VAR": "1"})
+
+    def va(self, **kw):
+        return args(**dict(dict(rebuild=False, download_model=False, yes=False), **kw))
+
+    def test_vision_step(self):
+        """Step 7: on by default - the mmproj beside the GGUF and maya-vision, no text model in the entry (the pinned
+        llama.cpp does not open Inkling's GGUF; the encoder needs none); none with --no-vision, a declined download
+        or an encoder that did not compile."""
+        d, gguf = self.files()
+        self.assertIsNone(maya.ik2_vision_step(self.va(no_vision=True), {}, {}, d, d))
+        with patch.object(maya, "offer_download", lambda *a, **k: False):
+            self.assertIsNone(maya.ik2_vision_step(self.va(), {}, {}, d, d))
+        sure = [patch.object(maya, "file_incomplete", lambda *a: None), patch.object(maya, "sha256_checked", lambda *a: True)]
+        for p in sure:
+            p.start()
+            self.addCleanup(p.stop)
+        with patch.object(maya, "vision_encoder_ready", lambda *a: True):
+            v = maya.ik2_vision_step(self.va(), {}, {}, d, d)
+        self.assertEqual(v, {"exe": str(maya.VEXE), "mmproj": str(d / "mmproj-BF16.gguf"), "gpu": True})
+        with patch.object(maya, "vision_encoder_ready", lambda *a: False):
+            self.assertIsNone(maya.ik2_vision_step(self.va(), {}, {}, d, d))
+
+    def test_the_config_with_pictures(self):
+        d, gguf = self.files()
+        tok = d / "maya-ik2" / "tokenizer"
+        tok.mkdir(parents=True)
+        v = {"exe": "/b/maya-vision", "mmproj": str(d / "mmproj-BF16.gguf"), "gpu": True}
+        pc = {"gpus": [card(24, 0)], "backend": "cuda"}
+        with patch.object(maya, "ROOT", self.root), \
+                patch.object(maya, "write_run_script", lambda p, port: p.with_name("run-" + p.stem + ".sh")):
+            path = maya.write_config_ik2(args(), pc, {}, gguf, tok, 262144, self.root / "models", d, v)
+            cfg = json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual(cfg["vision"], v)
+            self.assertEqual(cfg["args"], ["--model", str(gguf), "--max-context", "262144"])   # (the same plan)
+            maya.write_config_ik2(args(), pc, {}, gguf, tok, 262144, self.root / "models", d)   # (--no-vision)
+            self.assertNotIn("vision", json.loads(path.read_text(encoding="utf-8")))
 
     def test_a_start_of_it(self):
         d, gguf = self.files()

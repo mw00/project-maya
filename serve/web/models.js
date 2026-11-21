@@ -570,7 +570,10 @@ function ik2Fields(m, d, ch) {
       contextRow(m, d, ch, {vram: kvb}, ["kv"],
         fit && !fit.resident ? "At this size the model and its cache do not all fit on the card: the engine runs its slower path." : null),
       html`<${Row} label="Drafting" hint="Not offered in this preview: Inkling 2 Mini decodes without drafting for now."/>`,
-      html`<${Row} label="Images" hint="Coming soon: Inkling 2 Mini reads text only for now."/>`,
+      html`<${Row} label="Images" flag="vision" changed=${ch("images")}
+        hint=${m.choices.images ? "Reads pictures in chats: the image encoder starts when a picture arrives, no VRAM kept for it (on the GPU where its free VRAM holds it, else on the CPU). Off reads text only."
+          : "This model was set up without its image encoder: the setup adds it."}>
+        <${Switch} label="Images" on=${d.images} disabled=${!m.choices.images && !d.images} onChange=${(v) => setDraft({images: v})}/><//>`,
       html`<${Row} label="Answers at once" hint="Coming soon: Inkling 2 Mini answers one request at a time for now."/>`]},
     {label: "GPU and memory", rows: [gpu,
       html`<${Row} label="KV cache" flag="IK2_KV" changed=${ch("kv")}

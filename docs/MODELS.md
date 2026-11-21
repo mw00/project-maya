@@ -314,7 +314,11 @@ GGUF as it is. An **experimental preview**: `maya.py --setup --model inkling-2-m
   by hand: docs/INKLING2.md).
 - **Thinking and tools:** thinkingmachines' own template; its effort levels Off, Low, Medium, High (its default) and
   Max. Tool calls through Maya's OpenAI-compatible server.
-- Text only and one request at a time for now.
+- **Pictures:** on by default - the setup fetches the model's vision tower (unsloth's `mmproj-BF16.gguf`, 0.6 GB, from the
+  same repo; `--no-vision` skips it) and builds Maya's image encoder; the encoder starts only when a picture arrives
+  (on the GPU where its free VRAM holds it, else on the CPU), so the context's fit is the same. Images on the Models
+  page turns them off and on.
+- One request at a time for now.
 
 ## Inkling-2-Small (by hand, for now)
 

@@ -868,9 +868,12 @@ HY4_KV_RESIDENT = 32768                            # (KV streaming: the global l
 HY4_CHUNK_UP_GIB = 0.95
 # Inkling-2-Mini (an EXPERIMENTAL PREVIEW, PR #1095): thinkingmachines' looped 26B on its own engine maya-ik2 (src/ik2,
 # docs/INKLING2.md section 8) - NVIDIA only, Linux only, one GPU of 24 GB or more, RTX 30 / A100 and newer (the
-# engine's kernels: mma.sync m16n8k16, cp.async); every expert in VRAM (the resident token path), text only for now.
+# engine's kernels: mma.sync m16n8k16, cp.async); every expert in VRAM (the resident token path).
 # Its file: unsloth's UD-Q4_K_XL (Unsloth's looped layout, which the engine reads) - tools/ik2/download.json, pinned
-# by size and sha256; the setup offers no drafter (the engine's --draft is by hand, docs/INKLING2.md).  What fits on
+# by size and sha256; the setup offers no drafter (the engine's --draft is by hand, docs/INKLING2.md).  Pictures: the
+# model's vision tower as unsloth's mmproj-BF16.gguf (download.json's "vision", beside the GGUF; not with --no-vision),
+# read by maya-vision (tools/vision/inkling2v_patch.py) only while a request's pictures are encoded - on the GPU where
+# its free VRAM holds the encoder, else on the CPU; never kept in VRAM, and the context's fit is the same.  What fits on
 # the card (the context): tools/ik2_fit.py, shared with the Models page.  Its defaults: maya_quants.MODEL_DEFAULTS
 # ["ik2-mini"] (its author's); thinkingmachines' chat template (tools/ik2/chat_template.jinja) in the tokenizer
 # folder.  One request at a time.
@@ -6407,7 +6410,8 @@ def server_command(cfg_path: Path, a) -> tuple:
             say("  " + line)
     elif config_family(cfg) == "ik2":
         say(f"  {IK2_SHOWN} is an experimental preview: loading takes a few seconds to a minute (every expert is")
-        say("  copied into VRAM); one answer at a time, text only for now.")
+        say("  copied into VRAM); one answer at a time" + (", pictures read by the image encoder when one arrives."
+                                                          if cfg.get("vision") else ", text only."))
     elif config_family(cfg) == "qwen":
         say("  Loading takes a few minutes: the engine places the most-used experts in VRAM, the next ones in RAM as far")
         say("  as the free RAM goes (MAYA_EXPERT_RAM_GB caps it) and reads the rest from the SSD when they are routed.")
@@ -6722,9 +6726,10 @@ def report(version: str, backend: str | None = None, cfg_path: Path | None = Non
                 "on (read a picture at a time)" if pack is not None and hy4_pack_has_vision(pack) else \
                 "off (no vision tower in the pack)" if pack is not None and (pack / "hy4.txt").exists() else \
                 "? (the pack is not here to look in)"
-        elif config_family(cfg) == "ik2":       # (maya-ik2: pictures through maya-vision's Inkling 2 tower - not
-            #  set up yet: the preview reads text)
-            images = "on" if cfg.get("vision") else "off (text only for now)"
+        elif config_family(cfg) == "ik2":       # (maya-ik2: pictures through maya-vision's Inkling 2 tower, read a
+            #  request's pictures at a time - on the GPU where its free VRAM holds the encoder, else on the CPU)
+            images = "on (read a request's pictures at a time)" if cfg.get("vision") else \
+                "off (Images on the Models page)" if cfg.get("vision_off") else "off (set up without the image encoder)"
         else:
             images = "on" if cfg.get("vision") else "off"
         where = ""
@@ -11061,7 +11066,7 @@ def ik2_about() -> str:
     return ("An EXPERIMENTAL PREVIEW: thinkingmachines' Inkling-2-Mini (26B, a looped model: 8 of 128 experts a token) "
             f"on its own engine, in unsloth's UD-Q4_K_XL GGUF ({gb}); NVIDIA RTX 30 / "
             "A100 and newer, Linux, one GPU with 24 GB of VRAM or more - the whole model sits on the card; tool calls, "
-            "its thinking levels, up to a 256K context; text only, one answer at a time.")
+            "its thinking levels, up to a 256K context, pictures (its vision tower, 0.6 GB); one answer at a time.")
 
 
 def ik2_dir(a, models: Path, prev: dict) -> Path:
@@ -11122,11 +11127,54 @@ def ik2_tokenizer_step(a, d: Path, gguf: Path) -> Path:
     return out / "tokenizer"
 
 
-def write_config_ik2(a, pc: dict, meta: dict, gguf: Path, tok: Path, ctx: int, models: Path, d: Path) -> Path:
+def ik2_vision_model() -> dict | None:
+    """The model's vision tower as offer_download's form (tools/ik2/download.json's "vision": unsloth's mmproj of
+    Inkling-2-Mini's tower, from the GGUF's repo and revision), or None when the manifest names none."""
+    man = read_json(IK2_MANIFEST).get("vision") or {}
+    if not man.get("files") or not man.get("repo") or not man.get("revision"):
+        return None
+    return {"about": f"{IK2_SHOWN}'s vision tower (it lets the model read pictures): unsloth's mmproj of the model's "
+                     "own tower (BF16)", "format": "mmproj",
+            "repo": man["repo"], "revision": man["revision"], "folder": man.get("folder", ""),
+            "files": {k: v[0] for k, v in man["files"].items()}, "sha256": {k: v[1] for k, v in man["files"].items()},
+            "download_gb": sum(v[0] for v in man["files"].values()) / 1e9}
+
+
+def ik2_vision_step(a, pc: dict, meta: dict, llama: Path, d: Path) -> dict | None:
+    """Step 7: the config's "vision" entry - maya-vision with the model's mmproj (beside the GGUF, in d) - or None
+    (text only, said why).  No text model in it: the pinned llama.cpp does not open Inkling's GGUF, and maya-vision
+    needs none for its pictures (the server writes the template's markers).  The server starts the encoder only while
+    a request's pictures are encoded, on the GPU where its free VRAM holds it, else on the CPU; the engine puts the
+    rows in place of the image tokens (GENI requests)."""
+    step(7, "images (the vision encoder)")
+    if a.no_vision:
+        ok("skipped (--no-vision): the model reads text only")
+        return None
+    m = ik2_vision_model()
+    if m is None:
+        warn(f"{IK2_MANIFEST} names no vision tower: the model reads text only")
+        return None
+    files = [d / n for n in m["files"]]
+    if any(file_incomplete(m, f) for f in files) and not offer_download(a, "the vision tower", d, files, m):
+        warn(f"the vision tower was not downloaded: the model reads text only ({ME} --setup asks again)")
+        return None
+    for f in files:                                    # (offer_download checked the ones it fetched; these too)
+        if not sha256_checked(f, m["sha256"][f.name]):
+            f.unlink(missing_ok=True)                  # else the next run finds it complete and fails here again
+            fail(f"{f}: the sha256 does not match the published one (the file was removed)", "run the setup again")
+    if not vision_encoder_ready(a, pc, meta, llama):
+        return None
+    ok(f"pictures: ON - the vision encoder {VEXE} with {files[0].name} ({m['download_gb']:.1f} GB on the SSD); it "
+       "starts only when a picture arrives, no VRAM kept for it")
+    return {"exe": str(VEXE), "mmproj": str(files[0]), "gpu": True}
+
+
+def write_config_ik2(a, pc: dict, meta: dict, gguf: Path, tok: Path, ctx: int, models: Path, d: Path,
+                     vision: dict | None = None) -> Path:
     """maya-inkling-2-mini.json and its start script.  A setup again keeps what the config before says that this one
     does not ask (its engine flags it names, where the server listens and its key); the model's own sampling and
-    thinking level every setup."""
-    step(7, "the configuration and the start script")
+    thinking level every setup; pictures (`vision`, step 7) when they were set up."""
+    step(8, "the configuration and the start script")
     port = a.port or 8080
     cfg_path = ROOT / f"{Q.config_stem('ik2', Q.IK2_QUANT)}.json"
     old = read_json(cfg_path)
@@ -11136,7 +11184,8 @@ def write_config_ik2(a, pc: dict, meta: dict, gguf: Path, tok: Path, ctx: int, m
     sampling, effort = Q.model_defaults({"installer": inst})   # (the model's own, every setup)
     cfg = {"exe": str(IK2_EXE), "args": args, "cwd": str(ROOT), "tokenizer": str(tok), "model_name": IK2_MODEL_NAME,
            "gpu": [g["index"] for g in pc["gpus"]], "sampling": sampling, "reasoning_effort": effort,
-           "lib_dirs": meta.get("lib_dirs") or old.get("lib_dirs") or [], "port": port}
+           "lib_dirs": meta.get("lib_dirs") or old.get("lib_dirs") or [], "port": port,
+           **({"vision": vision} if vision else {})}
     kept += keep_server_settings(cfg, old, a)
     # (its cache in FP8 - half the bytes, the faster one deep in a context; the user's own variables kept)
     env = dict(old.get("env") or {})
@@ -11159,10 +11208,11 @@ def write_config_ik2(a, pc: dict, meta: dict, gguf: Path, tok: Path, ctx: int, m
 
 
 def set_up_ik2(a, prev: dict) -> Path | None:
-    """Inkling-2-Mini's steps 1-7 (an experimental preview): the PC (refused in one line where the preview does not
+    """Inkling-2-Mini's steps 1-8 (an experimental preview): the PC (refused in one line where the preview does not
     run: AMD, a Mac, Windows, two GPUs or more asked for, a card older than RTX 30 / A100 or under 24 GB), the context
     (the largest that keeps every expert in VRAM on this card), the engine (build/maya-ik2), the files (pinned,
-    sha256-checked), the tokenizer with the model's own template, the config."""
+    sha256-checked), the tokenizer with the model's own template, the pictures (its mmproj and maya-vision), the
+    config."""
     inst = prev.get("installer") or {}
     prev_args = prev.get("args") or []
     prev_ctx = int(prev_args[prev_args.index("--max-context") + 1]) if "--max-context" in prev_args[:-1] else None
@@ -11197,7 +11247,8 @@ def set_up_ik2(a, prev: dict) -> Path | None:
     if gguf is None:
         return None
     tok = ik2_tokenizer_step(a, d, gguf)              # 6
-    return write_config_ik2(a, pc, meta, gguf, tok, ctx, models, d)   # 7
+    vision = ik2_vision_step(a, pc, meta, llama, d)   # 7
+    return write_config_ik2(a, pc, meta, gguf, tok, ctx, models, d, vision)   # 8
 
 
 def set_up_and_serve(a, prev: dict) -> tuple | None:

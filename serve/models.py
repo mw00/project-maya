@@ -408,7 +408,7 @@ def _choices(cfg: dict) -> dict:
         # (auto: the engine measures once on this PC which decodes fastest - no drafting or a drafter the pack holds)
         drafters = (["mtp"] if hy4_has_mtp(cfg) else []) + (["dfly2"] if hy4_has_dfly2(cfg) else [])
         return {"draft": (["auto"] if drafters else []) + drafters + ["none"], "images": hy4_has_vision(cfg)}
-    if family(cfg) == "ik2":                           # (pictures: not set up for the preview - text only; no drafting)
+    if family(cfg) == "ik2":                           # (images: the setup's maya-vision entry, on or kept off; no drafting)
         return {"draft": ["none"], "images": bool(cfg.get("vision") or cfg.get("vision_off")),
                 "kv": list(IK2F.KV_BYTES)}
     if family(cfg) == "qwen":                          # (images: the setup's maya-vision entry, on or kept off)
@@ -711,7 +711,7 @@ def apply(cfg: dict, settings: dict) -> dict:
             raise ValueError("KV cache: FP8 or F16")
         if s.get("images") and not out.get("vision"):
             if not out.get("vision_off"):
-                raise ValueError("Images: Inkling 2 Mini reads text only for now (its image encoder is not set up yet)")
+                raise ValueError("Images: this model was set up without its image encoder (the setup adds it)")
             out["vision"] = out.pop("vision_off")
         elif not s.get("images") and out.get("vision"):
             out["vision_off"] = out.pop("vision")       # (kept, so Images can be switched on again)
