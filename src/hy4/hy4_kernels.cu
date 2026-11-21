@@ -3048,6 +3048,13 @@ void submit(cudaStream_t s) {
 //  end with submit: the host's summing threads and the other GPUs spin on the flag - #303's hang on maya-ds4 was a
 //  flag whose writer had never been submitted)
 constexpr size_t kViaKernel = 64 * 1024;
+// (the read-back kernel's blocks at most: 3 - 768 threads, a token's 768 loads of 16 bytes one each, a window of four's
+//  four each.  More blocks read a window's sum more slowly: 8 blocks about 1% slower over four prompts on eight RTX
+//  5060 Ti; fewer than a token's 3 read one token's sum 5% slower.  HY4_PULL_BLOCKS: another count)
+static size_t pull_blocks() {
+    static const size_t v = std::getenv("HY4_PULL_BLOCKS") ? (size_t) std::atoll(std::getenv("HY4_PULL_BLOCKS")) : 3;
+    return std::max<size_t>(1, v);
+}
 void publish(const float* src, float* dst, size_t n, unsigned* counter, unsigned* flag, unsigned v, cudaStream_t s,
              const float* plus) {
     if (n % 4) {
@@ -3056,11 +3063,8 @@ void publish(const float* src, float* dst, size_t n, unsigned* counter, unsigned
         return;
     }
     if (n > kViaKernel) {
-        if (plus != nullptr) {
-            std::fprintf(stderr, "maya-hy4 publish: an addend with %zu values (a kernel's copy only)\n", n);
-            g_err.fetch_add(1);
-            return;
-        }
+        if (plus != nullptr)   // (the copy engine takes the buffer as it is: the addend added first)
+            add_kernel<<<(unsigned) ((n + 255) / 256), 256, 0, s>>>(const_cast<float*>(src), plus, n);
         if (cudaMemcpyAsync(dst, src, n * sizeof(float), cudaMemcpyDeviceToHost, s) != cudaSuccess) {
             std::fprintf(stderr, "maya-hy4 publish: the copy failed\n");
             g_err.fetch_add(1);
@@ -3101,7 +3105,7 @@ void wait_pull(const unsigned* flag, unsigned v, float* dst, const float* src, s
         return;
     }
     const size_t n4 = n / 4;
-    const int blocks = (int) std::max<size_t>(1, std::min<size_t>(8, (n4 + 255) / 256));
+    const int blocks = (int) std::max<size_t>(1, std::min<size_t>(pull_blocks(), (n4 + 255) / 256));
     wait_pull_kernel<<<blocks, 256, 0, s>>>(flag, v, (float4*) dst, (const float4*) src, n4);
     check("wait_pull");
 }
