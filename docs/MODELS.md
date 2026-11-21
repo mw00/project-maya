@@ -304,10 +304,10 @@ GGUF as it is. An **experimental preview**: `maya.py --setup --model inkling-2-m
 
 | Files | Size | Runs on |
 | --- | ---: | --- |
-| [unsloth's UD-Q4_K_XL](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF) (NVFP4 experts in layers 0-19, Q8_0 elsewhere) | 17.6 GB | NVIDIA RTX 30 / A100 and newer, or AMD RDNA 3 / 3.5 / 4 (Radeon RX 7000 / 9000, Ryzen AI Max); Linux, one GPU with 24 GB of VRAM or more (an AMD APU: that much of its memory) |
+| [unsloth's UD-Q4_K_XL](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF) (NVFP4 experts in layers 0-19, Q8_0 elsewhere) | 17.6 GB | NVIDIA V100 / RTX 20 and newer, or AMD RDNA 3 / 3.5 / 4 (Radeon RX 7000 / 9000, Ryzen AI Max); Linux, one GPU with 24 GB of VRAM or more (an AMD APU: that much of its memory) |
 
 - **Where it runs:** the whole model sits on one GPU. The setup says so in one line and stops on a Mac, Windows, two
-  GPUs or more, NVIDIA cards older than RTX 30 / A100, AMD GPUs older than RDNA 3 and GPUs under 24 GB.
+  GPUs or more, NVIDIA cards older than V100 / RTX 20, AMD GPUs older than RDNA 3 and GPUs under 24 GB.
 - **AMD (`--backend hip`):** run by Maya's team on a Radeon 8065S (Gorgon Halo, Linux); Radeon RX 7000 / 9000 cards
   build the same engine but have not been run here yet - tell us how it goes.
 - **Context:** up to 256K (the setup offers 32K to 256K and recommends the largest that keeps every expert in VRAM on

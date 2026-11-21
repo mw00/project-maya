@@ -4030,7 +4030,7 @@ void check_preview(int n_gpu, bool serve) {
 #else
         const std::string gpu = "GPU " + std::to_string(d) + " (" + p.name + ", sm_" + std::to_string(p.major) +
                                 std::to_string(p.minor) + ")";
-        if (p.major < 8) refuse(gpu + " is too old: maya-ik2 needs an NVIDIA GPU of sm_80 (Ampere) or newer");
+        if (p.major < 7) refuse(gpu + " is too old: maya-ik2 needs an NVIDIA GPU of sm_70 (Volta) or newer");
 #endif
         CU(cudaSetDevice(d));
 #ifndef STRATA_USE_HIP   // (a kernel of this build for the GPU: none when its arch is not in the list)
@@ -4323,6 +4323,24 @@ int main(int argc, char** argv) {
     }
     g_attn_mma = c.D == 128 && c.H / c.KV <= 8 ? (getenv("IK2_ATTN_MMA") ? std::atoi(getenv("IK2_ATTN_MMA")) : 1) : 0;
     g_mma_split = k::attn_decode_mma_blocks(c.KV);
+    // Older NVIDIA (docs/INKLING2.md 8): Volta (sm_70) and Turing (sm_75) take their own attention and expert kernels
+    // (k::arch_class); a prompt's attention goes through cuBLAS there (the fused kernel is Ampere's: cp.async, and more
+    // shared memory than a Turing SM has), and Volta has no verify window (the block path's kernels are mma.sync's).
+    // Drafting needs a verify window with the token path's own arithmetic: proven on Ampere on and AMD only, so on
+    // Volta and Turing (their own token kernels, no window twins yet) it stays off - the answers stay plain decoding's.
+    {
+        int cls = 80;
+        for (int d = 0; d < n_gpu; ++d) use_dev(d), cls = std::min(cls, k::arch_class());
+        use_dev(0);
+        if (cls < 80) g_flash = false;
+        if (cls < 75) g_block = false;
+        if (cls < 80 && (!draft_path.empty() || g_lookup)) {
+            std::printf("NOTE maya-ik2: drafting off - on this GPU (sm_%d class) the verify window does not have the "
+                        "one-token path's kernels yet, so it would change the answers; plain decoding\n", cls);
+            std::fflush(stdout);
+            draft_path.clear(), g_lookup = false;
+        }
+    }
     if (n_gpu == 1 && !g_pool) {
         size_t exp_b = 0, dense_b = 0, kv_b = 0;
         for (const auto& kv : S.by_name) {

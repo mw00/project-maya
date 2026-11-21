@@ -18,7 +18,7 @@ CONTEXTS = [32768, 65536, 131072, 262144]           # the setup's choices (the e
                                                     # to 352,256 with an FP8 cache on a 24 GB card: text only)
 DEFAULT_KV = "fp8"
 MIN_VRAM_GB = 22.0                                  # the engine's own floor (check_preview: 22 GiB - a "24 GB" card)
-MIN_CC = 80                                         # the engine's kernels: mma.sync m16n8k16, cp.async (Ampere on)
+MIN_CC = 70                                         # the engine's kernels: Volta on (V100: mma.m8n8k4; RTX 20, Ampere on)
 AMD_ARCHS = ("gfx11", "gfx12")                      # AMD: RDNA 3 / 3.5 / 4 - the matrix-core prompt kernels (HIP)
 
 
@@ -101,7 +101,7 @@ def unsupported(backend: str, windows: bool, gpus_asked: int, cards: list) -> st
     if cards:
         new = [g for g in cards if int(g.get("arch") or 0) >= MIN_CC]
         if not new:
-            return ("Inkling 2 Mini needs an NVIDIA RTX 30 / A100 or newer GPU (compute capability 8.0 or newer) - "
+            return ("Inkling 2 Mini needs an NVIDIA V100 / RTX 20 or newer GPU (compute capability 7.0 or newer) - "
                     "older cards are not supported by its engine")
         if max(float(g.get("vram_gb") or 0) for g in new) < MIN_VRAM_GB:
             return "Inkling 2 Mini needs one NVIDIA GPU with 24 GB of VRAM or more (its whole model sits on the card)"

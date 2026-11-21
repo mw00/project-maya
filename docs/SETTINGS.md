@@ -2770,7 +2770,7 @@ A request's `spec` (0 / 1) turns the drafts off or on for it.
 ## Inkling-2-Small
 
 thinkingmachines' [Inkling-2-Small](https://huggingface.co/thinkingmachines/Inkling-2-Small) (594B, ~17B active) on
-its own engine, `maya-ik2` (`src/ik2`; CUDA on Linux, Ampere on), from unsloth's GGUFs
+its own engine, `maya-ik2` (`src/ik2`; CUDA on Linux, Volta on), from unsloth's GGUFs
 ([unsloth/Inkling-2-Small-GGUF](https://huggingface.co/unsloth/Inkling-2-Small-GGUF): UD-Q4_K_XL, UD-Q3_K_XL) read in
 place. The routed experts sit in pinned host memory (~323 GiB for UD-Q4_K_XL, ~260 GiB for UD-Q3_K_XL) with a cache of
 them in VRAM; one request at a time, text only. `maya.py` does not set it up yet: docs/INKLING2.md section 6 has the
@@ -2799,8 +2799,9 @@ Engine flags: `--max-context N` (262144), `--cache-gb N` (60: the expert cache's
 | `IK2_HOST` | pinned; `mmap` when every expert stays in VRAM | `mmap`: the experts read through the page cache instead of pinned (for a host without the RAM: unusably slow from network storage, 0.34 tok/s). With every expert in VRAM they are copied there straight from the mapped files and no pinned copy is kept (Inkling-2-Mini loads in 3 s from the page cache) |
 | `IK2_FAST` | on when every expert fits in VRAM | the resident token path (docs/INKLING2.md 8): every expert in VRAM, a token's launches with nothing from the host between its embedding and its logits. `0`: tokens take the cache path |
 | `IK2_GRAPH` | on | `0`: the resident path's launches one by one instead of a CUDA graph a token (for profiling: nsys does not see inside a graph) |
-| `IK2_ATTN_MMA` | `1` | a token's attention on the tensor cores, a warp straight from the KV cache (65,536 tokens deep on an RTX 3090: 63 -> 77 tok/s with an FP16 cache, 53 -> 84 with FP8). `0`: the scalar kernels; `2`: the layers without a window only |
-| `IK2_EXPERT_MMA`, `IK2_EXPERT_MMA_SPLIT`, `IK2_EXPERT_MMA_SPLIT_DOWN` | `1`, `8`, `4` | a token's NVFP4 experts on the tensor cores straight from their blocks (resident path): the gate / up input as two FP16 limbs in two columns, a code times its scale exact in FP16, FP32 sums. A group of 16 rows is a block of `SPLIT` warps, each a stride of the 64-value blocks (the weights in flight). One RTX 3090, Inkling-2-Mini: 121 -> 127 tok/s. `0`: the scalar kernels (also what Q8_0 experts take) |
+| `IK2_ATTN_MMA` | `1` | a token's attention on the tensor cores, a warp straight from the KV cache (65,536 tokens deep on an RTX 3090: 63 -> 77 tok/s with an FP16 cache, 53 -> 84 with FP8). `0`: the scalar kernels; `2`: the layers without a window only. A V100 (sm_70) takes its own kernel (`mma.m8n8k4`, 32 keys a warp step) |
+| `IK2_EXPERT_MMA`, `IK2_EXPERT_MMA_SPLIT`, `IK2_EXPERT_MMA_SPLIT_DOWN` | `1`, `8`, `4` | a token's NVFP4 experts on the tensor cores straight from their blocks (resident path): the gate / up input as two FP16 limbs in two columns, a code times its scale exact in FP16, FP32 sums. A group of 16 rows is a block of `SPLIT` warps, each a stride of the 64-value blocks (the weights in flight). One RTX 3090, Inkling-2-Mini: 121 -> 127 tok/s. `0`: the scalar kernels (also what Q8_0 experts take). A V100 (sm_70) takes its own kernel (`mma.m8n8k4`; the same rows and splits) |
+| `IK2_ARCH` | - | tests only: `70` or `75` runs an older GPU class's kernels on a newer GPU (Volta's everywhere; Turing's where the build has them, a `75-virtual` build) - docs/INKLING2.md section 6 |
 | `IK2_DRAFT_WIDTH` | `5` | `--draft` on Inkling-2-Mini's resident path: the widest window a step verifies (the anchor and its drafts, 2 .. 8) |
 | `IK2_DRAFT_ADAPT`, `IK2_DRAFT_PROBE`, `IK2_DRAFT_DECAY` | `1`, `8`, `0.85` | the controller: a window only when its expected tokens over its measured time beat a plain token's; after `PROBE` plain tokens one window to look at the acceptance again; `DECAY` how fast the acceptance is forgotten. `IK2_DRAFT_ADAPT=0`: always `IK2_DRAFT_WIDTH` wide |
 | `IK2_DRAFT_CTX` | the context | the positions the drafter's layer without a window sees (the last ones; its cache FP16, 4 KB a position): `65536` keeps 262144 resident on a 24 GB card |

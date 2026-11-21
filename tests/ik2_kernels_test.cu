@@ -2879,8 +2879,9 @@ int main() {
     test_round2_fused();
     test_fp8_kv();
     test_round6();
-    if (k::attn_flash_available()) test_attn_flash();   // (last: its random data leaves the others' as they were)
-    else std::printf("skip attn_flash: not built for this GPU\n");
+    if (!k::attn_flash_available()) std::printf("skip attn_flash: not built for this GPU\n");
+    else if (k::arch_class() >= 80) test_attn_flash();   // (last: its random data leaves the others' as they were)
+    else std::printf("--   attn_flash: Ampere's kernel (sm_%d class here)\n", k::arch_class());
     test_attn_decode_mma();
     test_cand_topk();
     test_token_path();
