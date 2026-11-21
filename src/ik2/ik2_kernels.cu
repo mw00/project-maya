@@ -3590,6 +3590,21 @@ __global__ void mv_q8p_kernel(const int8_t* __restrict__ q, const uint16_t* __re
                                         : (unsigned) (row - a1.r0) < (unsigned) a1.n ? a1.x
                                                                                      : x);
     float acc = 0.0f;
+#ifdef STRATA_USE_HIP
+    if ((K & 255) == 0) {   // (AMD: 8 values a lane a step - a wave reads 256 bytes an instruction, three steps ahead)
+        const uint2* q2 = (const uint2*) qr;
+#pragma unroll 3
+        for (int it = 0, n_it = K >> 8; it < n_it; ++it) {
+            const uint2 w = __ldg(q2 + it * 32 + lane);
+            const float4 xa = __ldg(x4 + (it * 32 + lane) * 2), xb = __ldg(x4 + (it * 32 + lane) * 2 + 1);
+            const float dv = h2f(__ldg(dr + it * 8 + (lane >> 2)));
+            acc += dv * ((float) (int8_t) (w.x & 0xFFu) * xa.x + (float) (int8_t) ((w.x >> 8) & 0xFFu) * xa.y +
+                         (float) (int8_t) ((w.x >> 16) & 0xFFu) * xa.z + (float) (int8_t) (w.x >> 24) * xa.w +
+                         (float) (int8_t) (w.y & 0xFFu) * xb.x + (float) (int8_t) ((w.y >> 8) & 0xFFu) * xb.y +
+                         (float) (int8_t) ((w.y >> 16) & 0xFFu) * xb.z + (float) (int8_t) (w.y >> 24) * xb.w);
+        }
+    } else
+#endif
     for (int it = 0, n_it = K >> 7; it < n_it; ++it) {
         const uint32_t w = __ldg(qr + it * 32 + lane);
         const float4 xv = __ldg(x4 + it * 32 + lane);
