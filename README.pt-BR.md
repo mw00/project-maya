@@ -64,7 +64,7 @@ Toda quantização do Maya tem o nome do modelo seguido do nível - XS, S, M ou 
 
 **Qual modelo cabe no seu PC?** Veja em [docs/MEMORY.md](docs/MEMORY.md) a memória recomendada de cada modelo (VRAM + RAM somadas).
 
-Todos rodam em NVIDIA a partir da V100 / RTX 20, e em AMD e Windows (veja [O que você precisa](#what-you-need)); o Hy4-Flash roda em NVIDIA (Linux e Windows) e em AMD no Linux (Strix Halo / Gorgon Halo, placas Radeon) e lê imagens (em placas de 8 GB, imagens grandes são reduzidas antes). Os tamanhos do DeepSeek incluem as tabelas Engram. A instalação também oferece os GGUFs da unsloth e as quantizações EXL3 da turboderp e da LibertAIDAI do DeepSeek, o DeepSeek abliterated da orcarouter, a quantização EXL3 do MiniMax da Mia-AiLab, as quantizações EXL3 do GLM da turboderp o Qwen-3.8-Flash-Next (CYBER-FROST) como GGUF Q5_K_M e o próprio Qwen-3.8-Flash-Next como GGUF UD-IQ2_XS da unsloth, ambos com imagens ([suas configurações](docs/SETTINGS.md#qwen-38-flash-next-cyber-frost)). **Arquivos, drafters, imagens e opções de cada modelo: [docs/MODELS.md](docs/MODELS.md).**
+Todos rodam em NVIDIA a partir da V100 / RTX 20, e em AMD e Windows (veja [O que você precisa](#what-you-need)); o Hy4-Flash roda em NVIDIA (Linux e Windows) e em AMD no Linux (Strix Halo / Gorgon Halo, placas Radeon) e lê imagens em toda placa que o roda (placas de 8 GB incluídas). Os tamanhos do DeepSeek incluem as tabelas Engram. A instalação também oferece os GGUFs da unsloth e as quantizações EXL3 da turboderp e da LibertAIDAI do DeepSeek, o DeepSeek abliterated da orcarouter, a quantização EXL3 do MiniMax da Mia-AiLab, as quantizações EXL3 do GLM da turboderp o Qwen-3.8-Flash-Next (CYBER-FROST) como GGUF Q5_K_M e o próprio Qwen-3.8-Flash-Next como GGUF UD-IQ2_XS da unsloth, ambos com imagens ([suas configurações](docs/SETTINGS.md#qwen-38-flash-next-cyber-frost)). **Arquivos, drafters, imagens e opções de cada modelo: [docs/MODELS.md](docs/MODELS.md).**
 
 ## <a name="quality"></a>Qualidade
 
@@ -214,6 +214,7 @@ Máquinas reais medidas por nossos usuários, a maioria com `./maya.sh --bench` 
 | Máquina | Modelo | Decodificação (escrevendo a resposta) | Prefill (lendo o seu prompt) | Por |
 | --- | --- | ---: | ---: | --- |
 | **3x Tesla V100 32 GB** (PCIe 3.0 x16 cada), 2x Xeon Gold 6138, 183 GB de RAM | Maya-XS / Maya-S, contexto de 32K, drafting MTP | **88,7 / 84,2 tokens/s** | 1607 / 1566 tokens/s | mantenedor (v1.1.68) |
+| **3x RX 7900 XTX 24 GB** (PCIe 3.0 x8/x16/x8), i9-10980XE, 188 GB de RAM, Linux | Maya-S, contexto de 32K, tensor parallel em 3 GPUs | 43,9-48,2 tokens/s | 1053 tokens/s | @Antero128 (v1.1.68, #1055) |
 
 </details>
 

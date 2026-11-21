@@ -1,7 +1,7 @@
-# Maya on RX 7900 XT / XTX, R9700 / RX 9070 and Strix Halo / Gorgon Halo
+# Maya on RX 7900 XT / XTX, 7600 XT, 9060 XT, R9700 / RX 9070 and Strix Halo / Gorgon Halo
 
 This branch adds a Linux HIP build and installer path for Maya's GLM-5.3-Flash
-engine on `gfx1100`, `gfx1201` and `gfx1151` (Strix Halo, Gorgon Halo). It uses one GPU, or two supported GPUs that split the
+engine on `gfx1100`, `gfx1102` (RX 7600 / 7600 XT), `gfx1200` (RX 9050 / 9060 XT), `gfx1201` and `gfx1151` (Strix Halo, Gorgon Halo). It uses one GPU, or two supported GPUs that split the
 layers (see [Two GPUs](#two-gpus)), and reads pictures too: setup builds the image encoder for the GPU
 (ggml's HIP backend), started only while a picture is encoded, as on NVIDIA; `--no-vision` leaves it out. The
 [CPU image encoder](#cpu-image-encoder-on-linux) stays an option on Linux.
@@ -41,7 +41,7 @@ The first setup downloads about 96.5 GB of weights and verifies the SHA-256
 hash of each shard. `--gguf-dir DIR` uses existing files instead. GPU numbers
 are the kernel KFD topology order shown by `--check`; on the test machine the
 7900 XT is GPU 0, an R9700 is GPU 1, and the integrated GPU is GPU 2. This
-installer accepts `gfx1100`, `gfx1201` and `gfx1151` and compiles the binary for the
+installer accepts `gfx1100`, `gfx1102`, `gfx1200`, `gfx1201` and `gfx1151` and compiles the binary for the
 architectures of the chosen cards only (`gfx1100;gfx1201` for that 7900 XT + R9700).
 
 RDNA 2 (`gfx1030`: RX 6800 / 6800 XT / 6900 XT / 6950 XT, Radeon PRO V620 / W6800) is accepted too, as experimental:
@@ -222,7 +222,13 @@ text (`MAYA_GLM_MTP_DECODE`, on by default on `gfx115x` only). On the Gorgon Hal
 
 `./maya.sh --setup --backend hip --model hy4-flash-maya-xs` (Linux). Hy4-Flash's engine (`maya-hy4`) keeps a whole size in the GPU's memory where the PC's memory holds it - a 64 GB Halo Maya-XS, a 96 GB one Maya-M, a 128 GB one Maya-L ([MEMORY.md](MEMORY.md)) - and then computes no expert on the CPU. It takes what the RAM has available less 8 GB (or a tenth of the RAM, if more) for the system; the model file is not held twice, and the n-gram table is read from the SSD.
 
-Linux limits how much of the RAM a GPU may take (by default about half). The setup reads the limit and says so when a size does not fit under it; the engine then keeps the most-routed experts on the GPU and computes the rest on the CPU, slower. To let the GPU take more, set the kernel parameter `ttm.pages_limit` (in 4 KiB pages: GiB x 262144) and restart - for example `ttm.pages_limit=14680064` (56 GiB) on a 64 GB PC. Older kernels take `amdgpu.gttsize` (in MiB). Run on a 192 GB Gorgon Halo (Radeon 8065S, Ubuntu 26.04, kernel 7.0, ROCm 7.14) with `ttm.pages_limit=46137344`; the kernel's default limit has not been run. Windows on a Halo: not tested for Hy4-Flash yet.
+Linux limits how much of the RAM a GPU may take (by default about half). The setup reads the limit and says so when a size does not fit under it; the engine then keeps the most-routed experts on the GPU and computes the rest on the CPU, slower. To let the GPU take more, set the kernel parameter `ttm.pages_limit` (in 4 KiB pages: GiB x 262144) and restart - for example `ttm.pages_limit=14680064` (56 GiB) on a 64 GB PC. Older kernels take `amdgpu.gttsize` (in MiB). Run on a 192 GB Gorgon Halo (Radeon 8065S, Ubuntu 26.04, kernel 7.0, ROCm 7.14) with `ttm.pages_limit=46137344`; the kernel's default limit has not been run. Windows: [experimental](#hy4-flash-under-windows-experimental).
+
+### Hy4-Flash under Windows (experimental)
+
+Hy4-Flash also sets up on an AMD GPU under Windows - a Strix Halo / Gorgon Halo, or a Radeon card - with the same command as the other models (`START-MAYA.bat --backend hip --setup --model hy4-flash-maya-xs`). It is **experimental: we have not run it on Windows ourselves** (no Windows PC with an AMD GPU here). It is the same engine that runs on Linux, built with AMD's SDK for Windows the way GLM's and DeepSeek's engines are, with the same Windows rules they follow: on a Halo the model stays within the memory Windows gives the GPU (Variable Graphics Memory, set in AMD Software) and within what Windows can still commit (the RAM and the page file), and the setup says once that the platform is experimental. With several AMD GPUs, tensor parallel is not taken by default on Windows (the layers split over the GPUs; `--tp N` in the config's `"args"` asks for it).
+
+**If it does not work.** A start that stops, an answer that never comes (the engine waiting with the GPU idle) or answers that look wrong: please open an issue with your GPU, Windows version, the setup's output and the engine's log from the start (its first line says the platform is experimental), and, if it stops or hangs, whether it runs with `"GPU_FLUSH_ON_EXECUTION": "1"` in the config's `"env"` (AMD's runtime then sends the GPU its work at once - slower, but it tells us where to look). Meanwhile: turn drafting off (`--drafting off` at the setup), or run Hy4-Flash on Linux on the same PC (see above), or pick another model - GLM-5.3-Flash and DeepSeek-V4.1-Flash have been run on AMD under Windows.
 
 ## Instinct MI300X / MI325X
 

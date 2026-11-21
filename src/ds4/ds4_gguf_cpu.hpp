@@ -75,6 +75,21 @@ const char* mx_tier_name(int t);
 /// without VBMI - ds4_iq512_kern.inc, DS4_IQ512: ggml-cpu's numbers bit for bit, checked against its dot on first use;
 /// DS4_IQ_OWN=0 turns them off) rather than ggml's / the GLM lane's.
 bool iq_cpu_own_rows(int type);
+/// IQ2_XXS experts re-coded at 4 bits a weight (maya-hy4's CPU lane keeps its hottest experts so in spare RAM): the
+/// same integer sums and float steps as ggml-cpu's dot, bit for bit, from a nibble mask and a byte shuffle instead of
+/// the grid's index and table work.  q4x_ok: this CPU runs them and they give ggml's bits (checked once; DS4_IQ_Q4X=0
+/// never); q4x_row_bytes: a row of n values; q4x_convert: rows of IQ2_XXS (src_row bytes apart) into the form;
+/// q4x_gate_up / q4x_down: iq_cpu_gate_up / iq_cpu_down on rows of the form (the same epilogue).
+bool iq_cpu_q4x_ok(int type);
+size_t iq_cpu_q4x_row_bytes(int n);
+void iq_cpu_q4x_convert(const uint8_t* src, size_t src_row, int rows, int n, uint8_t* dst);
+void iq_cpu_q4x_gate_up(const IqCpu& f, const uint8_t* gate, const uint8_t* up, const void* const* act, int nt,
+                        float* const* ff, int r0, int r1, float limit);
+void iq_cpu_q4x_down(const IqCpu& f, const uint8_t* down, const void* const* hq, int nt, float* const* out, int r0,
+                     int r1);
+/// The length of the rows the lane will run (its experts' inputs), before its first call: the choice between this
+/// CPU's row forms (own()) is timed on rows of it - the first one said is kept
+void iq_cpu_row_hint(int n);
 /// Load-time preparation of the same guarded one/multi CPU row selection/parity checks.
 void iq_cpu_prepare_rows(int type);
 /// IQ1_S's own multi-token rows (the same bits as ggml-cpu's dot): allowed by default; the engine turns them off where

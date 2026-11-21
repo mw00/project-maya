@@ -15,6 +15,7 @@ emoji (4-byte), combining marks, whitespace runs, and C0 control bytes.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import pathlib
 import sys
@@ -42,6 +43,17 @@ def bytes_to_unicode() -> dict[int, str]:
 
 BYTE_TO_UNICODE = bytes_to_unicode()
 UNICODE_TO_BYTE = {v: k for k, v in BYTE_TO_UNICODE.items()}
+
+
+def _vocab_fingerprint(tokens, ids) -> str:
+    """A digest of the token table and its reverse map as they stand: the same on every call while they are
+    untouched, something else once memory corruption has scribbled either (see Tokenizer.corruption_note)."""
+    h = hashlib.sha1()
+    for t in tokens:
+        h.update(t.encode("utf-8", "surrogatepass"))
+        h.update(b"\0")
+    h.update(str(len(ids)).encode())
+    return h.hexdigest()[:16]
 
 # The `qwen35` pre-tokenizer, transcribed from the ORACLE rather than from the family resemblance:
 # `.ref/llama.cpp/src/llama-vocab.cpp` L396, `case LLAMA_VOCAB_PRE_TYPE_QWEN35`.  The commented-out line
@@ -155,6 +167,7 @@ class Tokenizer:
         if len(self.ids) != len(tokens):
             raise ValueError("vocabulary has duplicate tokens: %d entries, %d unique"
                              % (len(tokens), len(self.ids)))
+        self._loaded_fingerprint = _vocab_fingerprint(self.tokens, self.ids)
         # Merge rules as (left, right) -> rank.  A merge list that is not a total order over its pairs, or one
         # naming a token that is not in the vocabulary, would make BPE silently produce different ids than the
         # model was trained with, so both are checked here rather than discovered as a bad answer later.
@@ -199,6 +212,17 @@ class Tokenizer:
         if not literals:
             return None
         return regex.compile("|".join(regex.escape(s) for s in sorted(literals, key=len, reverse=True)))
+
+    def corruption_note(self) -> str:
+        """An empty string when the token tables still match what __init__ loaded, else the words an error should carry.  The
+        tables are never written after load, so a difference is memory corruption in this process, not a bad file -
+        2026-11-16: a server's in-memory table grew NUL bytes and lost entries after days of uptime (the same files
+        encode fine in a fresh process), and the bare KeyErrors it raised read like a broken vocabulary.  The fix is
+        a restart, so say that rather than leave callers to suspect the model files."""
+        if _vocab_fingerprint(self.tokens, self.ids) == self._loaded_fingerprint:
+            return ""
+        return ("; the token table changed in memory after load (heap corruption in this process) - "
+                "restart the process")
 
     # -------------------------------------------------------------- constructors
     @classmethod
@@ -286,7 +310,8 @@ class Tokenizer:
                 for tok in self._bpe(mapped):
                     i = self.ids.get(tok)
                     if i is None:
-                        raise KeyError("BPE produced a token outside the vocabulary: %r" % tok)
+                        raise KeyError("BPE produced a token outside the vocabulary: %r%s"
+                                       % (tok, self.corruption_note()))
                     got.append(i)
                 ids = tuple(got)
             memo[piece] = ids
@@ -372,7 +397,8 @@ class Tokenizer:
         b = cache.get(i)
         if b is None:
             if i < 0 or i >= len(self.tokens):
-                raise IndexError("token id %d is outside the vocabulary (%d)" % (i, len(self.tokens)))
+                raise IndexError("token id %d is outside the vocabulary (%d)%s"
+                                 % (i, len(self.tokens), self.corruption_note()))
             alias = self.__dict__.get("aliases", {}).get(i)
             if alias is not None:
                 b = cache[i] = alias.encode("utf-8")
@@ -386,7 +412,8 @@ class Tokenizer:
             for ch in self.tokens[i]:
                 v = UNICODE_TO_BYTE.get(ch)
                 if v is None:
-                    raise KeyError("token %d contains a character outside the byte alphabet: %r" % (i, ch))
+                    raise KeyError("token %d contains a character outside the byte alphabet: %r%s"
+                                   % (i, ch, self.corruption_note()))
                 raw.append(v)
             b = cache[i] = bytes(raw)
         return b

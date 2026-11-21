@@ -49,7 +49,7 @@ adds room for the system and the default context.
 \* Mac (Apple Silicon) support is experimental, GLM-5.3-Flash's GGUF quants only.
 ¹ DeepSeek's download includes its n-gram (Engram) tables, which always stay on the SSD and never count toward memory.
 ² Qwen's n-gram table also stays on the SSD.
-⁴ Hy4-Flash on AMD: Linux only for now - a Strix Halo / Gorgon Halo (below), or Radeon cards; with an AMD GPU on Windows it has not been tested yet and the setup does not offer it.
+⁴ Hy4-Flash on AMD: Linux - a Strix Halo / Gorgon Halo (below), or Radeon cards; with an AMD GPU on Windows it is experimental (the setup offers it, not tested by us: [AMD_MAYA.md](AMD_MAYA.md#hy4-flash-under-windows-experimental)).
 ³ Hy4-Flash's download is the model file (44.8 GB for Maya-XS, 68.4 GB for Maya-M, 89.5 GB for Maya-L) and one n-gram table (63.4 GB) that every size shares; the table
 stays on the SSD, is read page by page and never counts toward memory. About 110 GB of disk in all for Maya-XS. Tencent's own
 Q4_K_M (AngelSlim) is a 105 GB model file with the same table; all of its experts fit in about 108 GB of VRAM.
@@ -67,11 +67,11 @@ Q4_K_M (AngelSlim) is a 105 GB model file with the same table; all of its expert
   about 7 GB cannot run it.
 - **The n-gram table:** on an SSD / NVMe, never a hard disk. It does not need to fit in memory.
 - **Pictures:** the vision tower's file (0.8 GB) stays on the SSD (RAM as the page cache); a picture takes up to
-  0.8 GB of VRAM while it is read, which the engine keeps free on the main GPU. Where the card has less room beside
-  the model (8 GB cards), big pictures are made smaller first, to what fits.
+  0.8 GB of VRAM while it is read, lent by the engine's prompt buffers (idle then): no VRAM is kept for pictures, so
+  they are on, at full size, on every card that runs the model - 8 GB cards included.
 - **Drafting:** the draft block's file (7.5 GB on the SSD, one for every size) takes about 4 GB of VRAM on the main
   GPU, rounded to 8 bits when the engine starts. The setup turns drafting on where that fits beside the parts above
-  and a picture's room (Maya-XS at a 32K context: about 14.6 GB in all), and leaves it off on smaller cards.
+  (Maya-XS at a 32K context: about 13.8 GB in all), and leaves it off on smaller cards.
 
 ## Examples
 

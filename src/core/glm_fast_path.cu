@@ -627,6 +627,14 @@ static int64_t avail_ram_now() {
 #endif
 }
 
+// the RAM the tier leaves free for the OS, the server and the page cache (MAYA_GLM_RAM_HEADROOM_GB): 6 GB, 16 GB
+// where the GPU's memory is the system's
+static int64_t ram_headroom_b(bool unified) {
+    double head_gb = unified ? 16.0 : 6.0;
+    if (const char* h = getenv("MAYA_GLM_RAM_HEADROOM_GB")) head_gb = std::max(0.0, std::atof(h));
+    return (int64_t) (head_gb * 1073741824.0);
+}
+
 static void numa_pinned_free(void* p, size_t bytes) {
 #ifdef __linux__
     cudaHostUnregister(p);
@@ -1337,6 +1345,39 @@ bool Glm5Model::fast_setup(std::string& err) {
         pool_check(floor_b, stride_max, all_b);
         // the batched prompt path: its sizes (it borrows the pool's tail, see below)
         if (!prefill_setup(err)) return false;
+        // #924 / #1035 (Windows, a discrete Radeon, one GPU): the pinning cap measured now, while the card still has
+        // room - searched for once the expert pool fills the card, Windows' refusal left the device unusable (the
+        // warmed tables' upload then failed).  Probed up to what the RAM tier could take (the free RAM less the
+        // headroom, or the size set) with the room kept above it and the small buffers pinned before it; the tier
+        // is sized under it below (glmfast::pin_cap_before_pool)
+        int64_t pre_more = -1, pre_held = 0;
+        const int64_t pre_small = (int64_t) (FastState::kMaxUpd * (sizeof(int) + sizeof(unsigned long long))) +
+                                  (int64_t) g.n_exp_used * (int64_t) sstride;   // (the table updates', the staging)
+        {
+#if defined(STRATA_USE_HIP) && defined(_WIN32)
+            const bool win_hip = true;
+#else
+            const bool win_hip = false;
+#endif
+            int integrated = 0;
+            if (cudaDeviceGetAttribute(&integrated, cudaDevAttrIntegrated, dev_) != cudaSuccess) cudaGetLastError();
+            if (glmfast::pin_cap_before_pool(win_hip, integrated != 0 || F->unified_memory, n_parts_,
+                                             getenv("MAYA_GLM_PIN_MEASURE_FIRST"))) {
+                const char* rg = getenv("MAYA_GLM_RAM_GB");
+                const char* rm = getenv("MAYA_GLM_PIN_ROOM_MB");
+                int64_t want = ram_budget_ >= 0 ? ram_budget_
+                             : rg != nullptr  ? (int64_t) (std::atof(rg) * 1073741824.0)
+                                              : std::max<int64_t>(0, avail_ram_now() - ram_headroom_b(F->unified_memory));
+                want += glmfast::pin_cap_room(true, want, rm != nullptr ? std::atoll(rm) : -1) + pre_small;
+                const auto t0 = std::chrono::steady_clock::now();
+                pre_held = g_pin_held;
+                pre_more = pin_room(want);
+                std::fprintf(stderr, "glm fast: CUDA%d pinning measured before the expert pool: %.2f GB more pin%s (%.1f s)\n",
+                             dev_, (double) pre_more / 1073741824.0,
+                             pre_more + ((int64_t) 256 << 20) <= want ? ", Windows' limit" : ", all the RAM tier can take",
+                             std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+            }
+        }
         size_t free_b = 0, total_b = 0;
         cudaMemGetInfo(&free_b, &total_b);
         {
@@ -1889,9 +1930,7 @@ bool Glm5Model::fast_setup(std::string& err) {
         const int later = n_parts_ - 1 - part_;   // the parts that start after this one
         const int64_t unseen_pf = (int64_t) std::max(0, later - 1) * (int64_t) pinned_pf.staging +
                                   (int64_t) std::max(0, later - 1) * (int64_t) pinned_pf.hop;
-        double head_gb = F->unified_memory ? 16.0 : 6.0;
-        if (const char* h = getenv("MAYA_GLM_RAM_HEADROOM_GB")) head_gb = std::max(0.0, std::atof(h));
-        const int64_t head_b = (int64_t) (head_gb * 1073741824.0);
+        const int64_t head_b = ram_headroom_b(F->unified_memory);
         const bool fixed_ram = getenv("MAYA_GLM_RAM_GB") != nullptr;
         if (budget < 0) {
             if (total < 0) {
@@ -2063,9 +2102,20 @@ bool Glm5Model::fast_setup(std::string& err) {
         const auto share = [&](size_t c) {
             int64_t planned = 0;
             for (size_t k = c; k < cls_n.size(); ++k) planned += cls_n[k] * (int64_t) cls_stride[k];
-            const double f = (double) std::max<int64_t>(0, pin_left - pin_keep()) / (double) std::max<int64_t>(1, planned);
-            return (int64_t) (f * (double) cls_n[c]);
+            return glmfast::pin_cap_share(pin_left, pin_keep(), planned, cls_n[c]);
         };
+        // a cap measured before the expert pool (#924): every class sized under it from the start, less what was pinned
+        // since (the table updates, the staging) - no pin after the pool goes up to a refusal
+        if (pre_more >= 0) {
+            pin_left = glmfast::pin_left_since(pre_more, g_pin_held - pre_held + pre_small);
+            pin_cap = g_pin_held + pin_left;
+            std::fprintf(stderr, "glm fast: CUDA%d a pinning cap: %.2f GB more pin (measured before the expert pool), %s "
+                                 "(%.2f GB kept free above it)\n",
+                         dev_, (double) pin_left / 1073741824.0,
+                         balanced_ram ? "mandatory RAM slots retained" : "the RAM tier sized to it",
+                         (double) pin_keep() / 1073741824.0);
+        }
+        bool pre_refused = false;
         // a class pinned in pieces of at most MAYA_GLM_PIN_PIECE_MB (Windows: 1024 by default; 0: one block, as on
         // Linux): a block of many GB takes far more of Windows' per-process pinning budget than its size - 61 GB pin in
         // 1 GB pieces where the largest single block is ~21 GB - so a 2-GPU split's first part left its second 0 GB and
@@ -2142,6 +2192,9 @@ bool Glm5Model::fast_setup(std::string& err) {
                     break;
                 }
                 if ((p = pin_tier(R, n)) != nullptr) {
+                    // (a cap measured before the pool: the class was sized under it with the room kept - not probed
+                    // here, where a refusal would break a Radeon under Windows, #924)
+                    if (pre_more >= 0 && !balanced_ram) break;
                     // ... and leave room under the cap: a pageable copy needs pinned buffers of the driver's own, and
                     // with two tiers pinned right up to it the warmed tables' upload failed (#105).  512 MB more that
                     // will not pin: a step less.  (A larger room is probed in pieces, pin_room.)
@@ -2157,6 +2210,14 @@ bool Glm5Model::fast_setup(std::string& err) {
                 }
                 cudaGetLastError();
                 p = nullptr;
+                if (pre_more >= 0 && !pre_refused) {
+                    pre_refused = true;
+                    std::fprintf(stderr, "glm fast: WARNING - CUDA%d: Windows refused the RAM tier's %.2f GB under the "
+                                         "pinning cap measured before the expert pool (it moved since); on a Radeon "
+                                         "this can stop the start (\"unspecified launch failure\") - if it does, set "
+                                         "MAYA_GLM_RAM_GB a few GB under that cap\n",
+                                 dev_, (double) n * (double) R.stride / 1073741824.0);
+                }
                 if (pin_left < 0) {
                     int64_t planned = 0;
                     for (size_t k = c; k < cls_n.size(); ++k) planned += cls_n[k] * (int64_t) cls_stride[k];
@@ -2366,6 +2427,7 @@ bool Glm5Model::fast_setup_finish(std::string& err) {
     F->lane_pending = false;
     cudaSetDevice(dev_);
     if (!fast_cpu_lane_setup(err)) return false;   // keep the existing CPU pool/calibration for batched prefill
+    if (n_parts_ == 1 && split_next_ == nullptr) (void) slot_bounce();   // AMD: at start-up (a split's: at its first switch)
     if (const char* h = getenv("MAYA_GLM_EXPERT_HELPER"); h != nullptr && h[0] != '\0')
         if (!fast_helper_setup(err)) return false;
     F->svc = std::thread([this] { fast_service(); });
@@ -5340,6 +5402,13 @@ void Glm5Model::fast_service() {
             unsigned int* sv = F->pfce_seq_h + (sq % gf::kRingSize);
             *sv = sq;
             cudaMemcpyAsync(F->pf_flag_d, sv, sizeof(unsigned int), cudaMemcpyHostToDevice, F->pfce_stream);
+            // Windows' HIP runtime holds queued work until the host waits on or queries its stream (docs/AMD_MAYA.md,
+            // "Kernel submission"), and nothing else touches this one: without the query the flag never lands and the
+            // next layer's moe_pf_wait spins on it ("token N waiting > 10 s" on an RX 7900 XT).  It returns at once;
+            // "not ready" is not an error and is not left behind for the next check.
+#if defined(STRATA_USE_HIP)
+            if (cudaStreamQuery(F->pfce_stream) == cudaErrorNotReady) cudaGetLastError();
+#endif
         }
         // (the lanes are made at the CPU lane's setup, after this thread started; an EXL3 pack's merged rows with them)
         // A batched rows step's group (MAYA_GLM_GROUP_EXPERTS, win_rows) is held the same way and merged on this part's
@@ -5555,7 +5624,9 @@ void Glm5Model::fast_service() {
                         bool draining = false;
                         for (const auto& d : F->draining)
                             if (d.rclass == cls && d.rslot == rs) {
+                                F->svc_phase.store(4, std::memory_order_relaxed);   // (#860: the stall line's phase)
                                 cudaEventSynchronize(d.ev);
+                                F->svc_phase.store(1, std::memory_order_relaxed);
                                 draining = true;
                                 break;
                             }
@@ -5592,9 +5663,11 @@ void Glm5Model::fast_service() {
                 const int rch = F->read_chunks > 0 ? F->read_chunks : rch_env;
                 const auto wait_ahead = [&] {   // the lookahead's reads in flight for this route land outside its jobs
                     const auto tw = std::chrono::steady_clock::now();
+                    F->svc_phase.store(3, std::memory_order_relaxed);   // (#860: the stall line's phase)
                     for (int i = 0; i < nw; ++i)
                         while ((F->rload[(size_t) cls][(size_t) wt[i]].load(std::memory_order_acquire) & 3u) != 2u)
                             cpu_relax();
+                    F->svc_phase.store(1, std::memory_order_relaxed);
                     F->ah_waited += (uint64_t) nw;
                     F->ah_wait_us.fetch_add((uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(
                                                 std::chrono::steady_clock::now() - tw).count(),
@@ -8309,7 +8382,11 @@ bool Glm5Model::decode_spec(strata::kernels::SamplerParams& sp, int64_t max_new,
     // is - the device's given-up waits for the host, the service thread's routes and what it does.  Two atomic stores a
     // phase and a watcher thread that wakes once a second; nothing the decode computes changes
     strata::platform::StallWatch stall(strata::platform::stall_limit_s(), [this](const char* phase, double sec) {
-        static const char* const svc[3] = {"waiting for a route", "on a route", "in its CPU lane"};
+        // (3, 4: the two places a route's service waits on something else - a look-ahead read another thread has in
+        //  hand, the copy of an expert demoted at the last boundary)
+        static const char* const svc[5] = {"waiting for a route", "on a route", "in its CPU lane",
+                                           "on a route, waiting for a look-ahead read to land",
+                                           "on a route, waiting for a demoted expert's copy"};
         static const char* const kinds[6] = {"-", "a route's answer", "the CPU lane's answer", "a deferred CPU answer",
                                              "a rows step's CPU answer", "a route's answer (wait+fetch)"};
         std::string line = "glm stall: a drafting step has run " + std::to_string((int) sec) + " s (" + phase + ")";
@@ -8317,7 +8394,7 @@ bool Glm5Model::decode_spec(strata::kernels::SamplerParams& sp, int64_t max_new,
             FastState* Fm = m->fast_;
             if (Fm == nullptr) continue;
             const unsigned int done = Fm->svc_next.load(std::memory_order_relaxed);
-            const int ph = std::min(2, std::max(0, Fm->svc_phase.load(std::memory_order_relaxed)));
+            const int ph = std::min(4, std::max(0, Fm->svc_phase.load(std::memory_order_relaxed)));
             unsigned int posted = 0u;
             if (Fm->ring_h != nullptr)
                 posted = ((volatile const gf::MoeRequest*) gf::ring_entry(Fm->ring_h, done + 1u, Fm->md.ring_n,
@@ -8985,6 +9062,7 @@ bool Glm5Model::ckpt_restore(int slot, std::string& err) {
 // per half the KDA snapshot and the DSA runs in that order.
 namespace {
 constexpr uint64_t kSlotMagic = 0x3254534C4159414Dull;   // "MAYALST2" (v2: the ik / ig ring's open pool only)
+constexpr int64_t kSlotChunk = (int64_t) 16 << 20;   // floats: slot_save / slot_load copy a run this much at a time
 
 // (start, floats) of each DSA cache run a slot of n positions holds on one half, in file order: in the state arena, or a
 // KV-streamed layer's latents in its host copy (kv_host[il])
@@ -9018,6 +9096,33 @@ std::vector<std::pair<float*, int64_t>> slot_dsa_runs(const GlmStateLayout& lay,
 }
 }  // namespace
 
+// AMD: slot_save's and slot_load's bounce (kSlotChunk floats), pinned once and kept.  They copied through a 64 MiB
+// vector made for each call instead; on ROCm (7.2.3, gfx1201) the copy leaves part of that pageable memory registered
+// with the driver (an SVM range), so freeing the vector unmaps a range amdgpu still tracks and it stops every GPU queue
+// of the process (kgd2kfd_quiesce_mm) - at every conversation switch, whatever the THP settings.  On gfx1201 such a
+// stop sometimes hangs the MES and the host (ROCm/TheRock #9299, #9861).  nullptr (CUDA builds, or the allocation
+// failed): the vector, as before.
+float* Glm5Model::slot_bounce() {
+#if defined(STRATA_USE_HIP)
+    if (slot_bounce_ == nullptr && !slot_bounce_tried_) {
+        slot_bounce_tried_ = true;
+        if (cudaHostAlloc((void**) &slot_bounce_, (size_t) kSlotChunk * sizeof(float), cudaHostAllocPortable) !=
+            cudaSuccess) {
+            (void) cudaGetLastError();
+            slot_bounce_ = nullptr;
+            std::fprintf(stderr, "glm slots: the pinned bounce (%lld MB) did not allocate - slots copy through pageable "
+                                 "memory, as before\n", (long long) (kSlotChunk * (int64_t) sizeof(float) >> 20));
+        } else {
+            std::fprintf(stderr, "glm slots: pinned bounce %lld MB (AMD: conversation switches free no registered "
+                                 "memory)\n", (long long) (kSlotChunk * (int64_t) sizeof(float) >> 20));
+        }
+    }
+    return slot_bounce_;
+#else
+    return nullptr;
+#endif
+}
+
 uint64_t Glm5Model::slot_save(const std::string& path, std::string& err) {
     std::vector<Glm5Model*> halves;
     for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
@@ -9044,6 +9149,7 @@ uint64_t Glm5Model::slot_save(const std::string& path, std::string& err) {
     put(&nh, 4);
     put(&n, 8);
     std::vector<float> buf;
+    float* const bounce = slot_bounce();   // AMD: pinned once (nullptr: buf, as before)
     double t_sync = 0, t_copy = 0, t_write = 0;
     for (Glm5Model* m : halves) {
         const Glm5Geometry& g = m->g_;
@@ -9067,13 +9173,14 @@ uint64_t Glm5Model::slot_save(const std::string& path, std::string& err) {
         if (pool_rows > 0) src.push_back({m->snap_pool_, pool_rows});
         for (const auto& r : runs) src.push_back({r.first, r.second});
         for (const auto& s : src) {
-            constexpr int64_t kChunk = (int64_t) 16 << 20;   // floats
+            constexpr int64_t kChunk = kSlotChunk;   // floats
             for (int64_t at = 0; at < s.second; at += kChunk) {
                 const int64_t c = std::min(kChunk, s.second - at);
-                buf.resize((size_t) c);
+                if (bounce == nullptr) buf.resize((size_t) c);
+                float* const bp = bounce != nullptr ? bounce : buf.data();
                 tq = std::chrono::steady_clock::now();
                 // (Default: a streamed layer's latents are pinned host memory)
-                if (cudaMemcpy(buf.data(), s.first + at, (size_t) c * sizeof(float), cudaMemcpyDefault) !=
+                if (cudaMemcpy(bp, s.first + at, (size_t) c * sizeof(float), cudaMemcpyDefault) !=
                     cudaSuccess) {
                     cudaGetLastError();
                     cudaSetDevice(dev_);
@@ -9082,7 +9189,7 @@ uint64_t Glm5Model::slot_save(const std::string& path, std::string& err) {
                 }
                 const auto tw = std::chrono::steady_clock::now();
                 t_copy += std::chrono::duration<double, std::milli>(tw - tq).count();
-                put(buf.data(), (size_t) c * sizeof(float));
+                put(bp, (size_t) c * sizeof(float));
                 t_write += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tw).count();
             }
         }
@@ -9123,6 +9230,7 @@ bool Glm5Model::slot_load(const std::string& path, int64_t n_pos, std::string& e
         return false;
     }
     std::vector<float> buf;
+    float* const bounce = slot_bounce();   // AMD: pinned once (nullptr: buf, as before)
     for (Glm5Model* m : halves) {
         if (m->fast_ == nullptr) {
             err = "no fast path";
@@ -9174,12 +9282,13 @@ bool Glm5Model::slot_load(const std::string& path, int64_t n_pos, std::string& e
         }
         for (const auto& r : runs) dst.push_back({r.first, r.second});
         for (const auto& d : dst) {
-            constexpr int64_t kChunk = (int64_t) 16 << 20;
+            constexpr int64_t kChunk = kSlotChunk;
             for (int64_t at = 0; at < d.second; at += kChunk) {
                 const int64_t c = std::min(kChunk, d.second - at);
-                buf.resize((size_t) c);
-                if (!get(buf.data(), (size_t) c * sizeof(float)) ||
-                    cudaMemcpy(d.first + at, buf.data(), (size_t) c * sizeof(float), cudaMemcpyDefault) !=
+                if (bounce == nullptr) buf.resize((size_t) c);
+                float* const bp = bounce != nullptr ? bounce : buf.data();
+                if (!get(bp, (size_t) c * sizeof(float)) ||
+                    cudaMemcpy(d.first + at, bp, (size_t) c * sizeof(float), cudaMemcpyDefault) !=
                         cudaSuccess) {
                     cudaGetLastError();
                     cudaSetDevice(dev_);

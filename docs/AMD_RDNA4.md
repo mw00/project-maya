@@ -1,6 +1,8 @@
 # R9700 / RX 9070: Maya HIP
 
-The Linux HIP installer accepts RX 7900 XT/XTX (`gfx1100`) and RX 9070 /
+The Linux HIP installer accepts RX 7900 XT/XTX (`gfx1100`), RX 9050 / 9060 XT
+(`gfx1200`, the same RDNA4 wave32 family as gfx1201; no hipBLASLt tuning table yet,
+so its prompt projections run plain hipBLAS) and RX 9070 /
 Radeon AI PRO R9700 (`gfx1201`). It uses one GPU, text input, and system ROCm 7.
 The shared backend changes come from the upstream engine
 [`d5ea713`](https://github.com/Niko1221/Strata/tree/d5ea7133741e67743c0e886bb426c0ce8d69cf6c).

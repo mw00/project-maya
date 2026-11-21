@@ -13,6 +13,16 @@ namespace strata::ds4::lt {
 /// caller's cuBLAS / hipBLAS then.
 bool gemm(void* stream, const uint16_t* W, int n, int k, const uint16_t* x, int ldx, int t, float* y, int ldy);
 
+/// The same product for a family of shapes (an attention's scores: a count of keys that changes from one product to
+/// the next): the kernel measured once for the bucket of n and k (powers of two), then taken by every shape of the
+/// bucket that it runs.
+bool gemm_loose(void* stream, const uint16_t* W, int n, int k, const uint16_t* x, int ldx, int t, float* y, int ldy);
+
+/// y[r][c] = sum over j < k of x[r][j] A[j][c], for r < t, c < n: A FP16 [k][la] row-major (its first n columns), x
+/// FP16 rows of ldx, y FP32 rows of ldy.  loose: as gemm_loose.
+bool gemm_n(void* stream, const uint16_t* A, int la, int n, int k, const uint16_t* x, int ldx, int t, float* y, int ldy,
+            bool loose = false);
+
 constexpr int kMinRows = 64;   // (fewer: the BLAS's own GEMV-like kernels)
 
 /// The file the picks are kept in (the pack's lt-picks.txt, or MAYA_DS4_LT_STORE's): each line a GPU kind and hipBLASLt

@@ -64,7 +64,7 @@ git clone https://github.com/mw00/project-maya.git && cd project-maya
 
 **哪个模型适合你的电脑？** 请看 [docs/MEMORY.md](docs/MEMORY.md)，里面有每个模型的推荐内存（VRAM 与 RAM 合计）。
 
-它们都能在 V100 / RTX 20 及更新的 NVIDIA 显卡上运行，也支持 AMD 和 Windows (见[你需要什么](#what-you-need))；Hy4-Flash 支持 NVIDIA (Linux 和 Windows) 以及 Linux 上的 AMD (Strix Halo / Gorgon Halo、Radeon 显卡)，也能读取图片 (8 GB 显卡上会先把大图缩小)。DeepSeek 的大小包含其 Engram 表。安装程序还提供 unsloth 的 GGUF、turboderp 和 LibertAIDAI 的 DeepSeek EXL3 量化、orcarouter 的 abliterated DeepSeek、Mia-AiLab 的 MiniMax EXL3 量化、turboderp 的 GLM EXL3 量化，以 Q5_K_M GGUF 提供的 Qwen-3.8-Flash-Next (CYBER-FROST)，以及以 unsloth 的 UD-IQ2_XS GGUF 提供的 Qwen-3.8-Flash-Next 本身 (两者都支持图片) ([其设置](docs/SETTINGS.md#qwen-38-flash-next-cyber-frost))。**每个模型的文件、草稿模型、图片和选项：[docs/MODELS.md](docs/MODELS.md)。**
+它们都能在 V100 / RTX 20 及更新的 NVIDIA 显卡上运行，也支持 AMD 和 Windows (见[你需要什么](#what-you-need))；Hy4-Flash 支持 NVIDIA (Linux 和 Windows) 以及 Linux 上的 AMD (Strix Halo / Gorgon Halo、Radeon 显卡)，在能运行它的每块显卡上都能读取图片 (包括 8 GB 显卡)。DeepSeek 的大小包含其 Engram 表。安装程序还提供 unsloth 的 GGUF、turboderp 和 LibertAIDAI 的 DeepSeek EXL3 量化、orcarouter 的 abliterated DeepSeek、Mia-AiLab 的 MiniMax EXL3 量化、turboderp 的 GLM EXL3 量化，以 Q5_K_M GGUF 提供的 Qwen-3.8-Flash-Next (CYBER-FROST)，以及以 unsloth 的 UD-IQ2_XS GGUF 提供的 Qwen-3.8-Flash-Next 本身 (两者都支持图片) ([其设置](docs/SETTINGS.md#qwen-38-flash-next-cyber-frost))。**每个模型的文件、草稿模型、图片和选项：[docs/MODELS.md](docs/MODELS.md)。**
 
 ## <a name="quality"></a>质量
 
@@ -213,6 +213,7 @@ Maya 的量化版本由各模型公开发布的权重制作，并与原版对比
 | 机器 | 模型 | 解码 (写出回答) | 预填充 (读取提示) | 提交者 |
 | --- | --- | ---: | ---: | --- |
 | **3x Tesla V100 32 GB** (各 PCIe 3.0 x16)、2x Xeon Gold 6138、183 GB 内存 | Maya-XS / Maya-S，32K 上下文，MTP 草稿 | **88.7 / 84.2 tokens/s** | 1607 / 1566 tokens/s | 维护者 (v1.1.68) |
+| **3x RX 7900 XTX 24 GB** (PCIe 3.0 x8/x16/x8)、i9-10980XE、188 GB 内存、Linux | Maya-S，32K 上下文，3 卡张量并行 | 43.9-48.2 tokens/s | 1053 tokens/s | @Antero128 (v1.1.68, #1055) |
 
 </details>
 

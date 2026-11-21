@@ -13,6 +13,7 @@
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
+#include "hy4_kernels.cuh"   // (k::submit: AMD under Windows)
 #include "hy4_pack.hpp"
 
 namespace hy4 {
@@ -262,6 +263,7 @@ struct Vision::Impl {
     std::vector<uint8_t> bounce_v[2];          // (pageable, when no pinned memory was had)
     bool pinned = false;
     size_t host_b = 0, last_b = 0;
+    bool last_lent = false;
     bool tf32 = std::getenv("HY4_VISION_F32") == nullptr;   // (attention's products in TF32; =1: plain F32)
 
     ~Impl() {
@@ -503,7 +505,9 @@ struct Vision::Impl {
         return al((D * P + 2 * D + M4 + 2 * (size_t) g.out_dim) * 4 + 6 * 256);
     }
 
-    bool encode(const uint8_t* rgb, int w, int hgt, std::vector<float>& rows, std::string& err) {
+    bool encode(const uint8_t* rgb, int w, int hgt, std::vector<float>& rows, std::string& err, uint8_t* room,
+                size_t room_b) {
+        last_lent = false;
         const int n_tok = g.tokens(w, hgt);
         if (n_tok == 0) {
             err = "vision: a picture of " + std::to_string(w) + " x " + std::to_string(hgt) +
@@ -555,7 +559,10 @@ struct Vision::Impl {
         }
         const Lay y = layout(g, (size_t) N, (size_t) (gh / g.merge), slot, pre_h.size());
         uint8_t* base = nullptr;
-        if (cudaMalloc((void**) &base, y.total) != cudaSuccess) {
+        last_lent = room != nullptr && y.total <= room_b;
+        if (last_lent) {
+            base = room;
+        } else if (cudaMalloc((void**) &base, y.total) != cudaSuccess) {
             cudaGetLastError();
             size_t fr = 0, tot = 0;
             cudaMemGetInfo(&fr, &tot);
@@ -567,7 +574,7 @@ struct Vision::Impl {
         const bool ok = run(base, y, hp, hpos, gh, gw, rows, err);
         cudaStreamSynchronize(s);
         cudaStreamSynchronize(cs);
-        cudaFree(base);
+        if (!last_lent) cudaFree(base);
         if (!ok) cudaGetLastError();
         return ok;
     }
@@ -602,6 +609,7 @@ struct Vision::Impl {
             VK(cudaStreamWaitEvent(cs, ev_free[b], 0));
             VK(cudaMemcpyAsync(sl[b], bounce[b], S.bytes, cudaMemcpyHostToDevice, cs));
             VK(cudaEventRecord(ev_up[b], cs));
+            k::submit(cs);   // (AMD under Windows: the compute stream waits for it on the GPU)
             return true;
         };
         auto acquire = [&](int k, uint8_t*& at) -> bool {
@@ -611,6 +619,7 @@ struct Vision::Impl {
         };
         auto done = [&](int k) -> bool {
             VK(cudaEventRecord(ev_free[k & 1], s));
+            k::submit(s);   // (AMD under Windows: the next upload waits for it on the GPU, the host for that)
             return k + 2 < ns ? upload(k + 2) : true;
         };
         if (!upload(0) || (ns > 1 && !upload(1))) return false;
@@ -744,8 +753,15 @@ bool Vision::load(const Pack& pk, int dev, std::string& err) {
     return true;
 }
 const VisionGeo& Vision::geo() const { return p->g; }
-bool Vision::encode(const uint8_t* rgb, int w, int h, std::vector<float>& rows, std::string& err) {
-    return p->encode(rgb, w, h, rows, err);
+size_t Vision::room_of(int w, int h) const {
+    if (p->g.tokens(w, h) <= 0) return 0;
+    const size_t gh = (size_t) (h / p->g.patch), gw = (size_t) (w / p->g.patch);
+    return Impl::layout(p->g, gh * gw, gh / (size_t) p->g.merge, p->slot, p->pre_h.size()).total;
+}
+bool Vision::last_lent() const { return p->last_lent; }
+bool Vision::encode(const uint8_t* rgb, int w, int h, std::vector<float>& rows, std::string& err, uint8_t* room,
+                    size_t room_b) {
+    return p->encode(rgb, w, h, rows, err, room, room_b);
 }
 size_t Vision::host_bytes() const { return p->host_b; }
 size_t Vision::room_bytes() const { return room_for(p->g); }

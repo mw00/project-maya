@@ -1,11 +1,14 @@
 # Experimental opt-in KDA layer graphs
 
-`MAYA_GLM_KDA_GRAPH=1` captures recurrent layers of single-device GLM decode.
-Default is the ordinary direct path. DSA layers remain direct. Split/MTP,
-profiling, dumps, prefetch and lookahead bypass capture. Expert selection, weights,
-quantization and kernel arithmetic are unchanged; graph replay explicitly accounts
-for MoE requests and residual-buffer swaps. CPU-plan/buffer-key changes invalidate
-the corresponding captured graph. Graphs are destroyed before their buffers.
+`MAYA_GLM_KDA_GRAPH=1` captures the recurrent layers of GLM decode. Default is
+the ordinary direct path. The DSA layers' attention stays direct, and their
+FFN side is captured too when `MAYA_GLM_DSA_FFN_GRAPH` is on (the default
+since v1.1.52 - see `MAYA_GLM_DSA_FFN_GRAPH` in SETTINGS.md). Speculative
+passes (the spec gate), profiling, dumps, prefetch and lookahead bypass
+capture. Expert selection, weights, quantization and kernel arithmetic are
+unchanged; graph replay explicitly accounts for MoE requests and
+residual-buffer swaps. CPU-plan/buffer-key changes invalidate the
+corresponding captured graph. Graphs are destroyed before their buffers.
 
 ## Measured thinking-Max screens (v1.0.21)
 

@@ -528,5 +528,174 @@ class MtpFileTest(unittest.TestCase):
         self.assertIn("MTP block's file", r.stderr)
 
 
+DFLY = "hy_v4_flash_dfly"
+DH, DFF = 4, 512   # (the drafter's heads and FFN width)
+MASK = 260
+
+
+def indexed(root: pathlib.Path) -> pathlib.Path:
+    """model() with two indexed layers (0 and 2 dense and indexed, 1 sliding-window): a 2-layer drafter's targets."""
+    a = lambda k: ARCH + "." + k  # noqa: E731
+    return model(root, **{a("attention.sliding_window_pattern"): (9, (7, [False, True, False, False])),
+                          a("attention.indexer.types"): (9, (7, [True, False, True, True]))})
+
+
+def drafter(path: pathlib.Path, targets=(0, 2), kv_over: dict | None = None, t_over: dict | None = None) -> pathlib.Path:
+    """A drafter's file for model()'s shapes (q_lora 128, kv_lora 64, keys of 96 = 64 + 32 rope, values of 64): a draft
+    layer a target.  kv_over: keys replaced (None: left out); t_over: a tensor's dims replaced (None: left out)."""
+    a = lambda k: DFLY + "." + k  # noqa: E731
+    n = len(targets)
+    kv = {"general.architecture": (8, DFLY), "general.type": (8, "drafter"),
+          a("block_count"): (4, n), a("embedding_length"): (4, D), a("mask_token_id"): (4, MASK),
+          a("num_speculative_tokens"): (4, 5), a("mtp_fusion"): (8, "slot0"), a("hidden_correction"): (7, True),
+          a("target_index_layers"): (9, (5, list(targets))), a("target_kv_layers"): (9, (5, list(targets))),
+          a("attention.head_count"): (4, DH), a("attention.kv_lora_rank"): (4, 64),
+          a("attention.q_lora_rank"): (4, 128)}
+    for k, v in (kv_over or {}).items():
+        if v is None:
+            kv.pop(a(k), None)
+        else:
+            kv[a(k)] = v
+    p = "model.dfly_layers."
+    t = []
+    for i in range(n):
+        q = "%s%d.self_attn." % (p, i)
+        t += [(q + "q_a_proj.weight", 30, [D, 128]), (q + "q_b_proj.weight", 30, [128, DH * 96]),
+              (q + "kv_a_proj_with_mqa.weight", 8, [D, 64 + 32]), (q + "kv_b_proj.weight", 30, [64, DH * (64 + 64)]),
+              (q + "linear_gate.weight", 30, [D, DH * 64]), (q + "o_proj.weight", 12, [DH * 64, D]),
+              (q + "learnable_sink_param", 0, [DH]), ("%s%d.mlp.up_proj.weight" % (p, i), 12, [D, DFF])]
+    t += [(p + "mtp_fusion.eh_proj.weight", 30, [2 * D, D]), (p + "mtp_fusion.gate", 0, [D]),
+          (p + "final_norm.weight", 0, [D]), (p + "hidden_correction.gate_proj.weight", 30, [2 * D, D]),
+          (p + "hidden_correction.down_proj.weight", 30, [D, D])]
+    for name, dims in (t_over or {}).items():
+        t = [x for x in t if x[0] != p + name]
+        if dims is not None:
+            t.append((p + name, 30, dims))
+    gguf(path, kv, t)
+    return path
+
+
+class DrafterFileTest(unittest.TestCase):
+    NAME = "Hy4-Flash-drafter.gguf"
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = indexed(pathlib.Path(self.tmp.name) / "m")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def read(self) -> tuple:
+        out = self.root / "maya-hy4"
+        geo = dict(line.split(" ", 1) for line in (out / "hy4.txt").read_text().splitlines())
+        lines = (out / "tensors.txt").read_text().splitlines()
+        files = [ln.split()[2] for ln in lines if ln.startswith("file ")]
+        return geo, files, {ln.split()[1]: ln.split()[2:] for ln in lines if ln.startswith("t ")}
+
+    def refused(self, words: str, *more: str):
+        r = pack(self.root, *more)
+        self.assertNotEqual(r.returncode, 0, r.stdout)
+        self.assertIn(words, r.stderr)
+        self.assertNotIn("Traceback", r.stderr)
+
+    def test_found_beside_the_set(self):
+        """The folder's drafter file: not a third shard; its tensors one more file at their bytes, the geometry the
+        dfly_* lines."""
+        drafter(self.root / self.NAME)
+        r = pack(self.root)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("the DFly2 drafter: " + self.NAME, r.stdout)
+        self.assertNotIn("left out", r.stdout)
+        geo, files, t = self.read()
+        self.assertEqual(files[2:], [self.NAME])
+        self.assertEqual((geo["dfly_layers"], geo["dfly_heads"], geo["dfly_ff"], geo["dfly_targets"], geo["dfly_mask"],
+                          geo["dfly_tokens"]), ("2", str(DH), str(DFF), "0,2", str(MASK), "5"))
+        self.assertEqual((geo["n_layer"], geo["n_mtp"]), ("3", "1"))   # (the trunk's: as they were)
+        mine = [n for n in t if n.startswith("model.dfly_layers.")]
+        self.assertEqual(len(mine), 2 * 8 + 5)
+        self.assertEqual(len(t), 8 + len(mine))
+        self.assertTrue(all(t[n][1] == "2" for n in mine))
+        typ, fi, off, nb, *dims = t["model.dfly_layers.1.self_attn.kv_a_proj_with_mqa.weight"]
+        self.assertEqual((typ, int(nb), dims), ("Q8_0", 96 * D // 32 * 34, [str(D), "96"]))
+        with (self.root / files[2]).open("rb") as f:   # (the writer's pattern: the tensor's index in its file)
+            f.seek(int(off))
+            self.assertEqual(f.read(int(nb)), bytes([10]) * int(nb))
+        self.assertEqual(t["model.dfly_layers.0.self_attn.learnable_sink_param"][0::4], ["F32", str(DH)])
+        self.assertEqual(t["model.dfly_layers.0.mlp.up_proj.weight"][0], "Q4_K")
+        self.assertEqual(t["blk.2.attn_q_a.weight"][1], "1")   # (the trunk's own)
+        # --files naming the set's shards (the setup's way) with the drafter named: the same pack
+        r = pack(self.root, "--files", "Hy4-flash-Q4_K_M-00001-of-00002.gguf", "Hy4-flash-Q4_K_M-00002-of-00002.gguf",
+                 "--drafter", self.NAME)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.read()[0]["dfly_targets"], "0,2")
+
+    def test_left_out(self):
+        """A set without a drafter's file, and --drafter none beside one: the same pack, no dfly_ line."""
+        r = pack(self.root)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        out = self.root / "maya-hy4"
+        before = (out / "hy4.txt").read_text(), (out / "tensors.txt").read_text()
+        self.assertNotIn("dfly_", before[0])
+        self.assertNotIn("dfly_layers", before[1])
+        self.assertNotIn("DFly2", r.stdout)
+        drafter(self.root / self.NAME)
+        r = pack(self.root, "--drafter", "none")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertNotIn("left out", r.stdout)
+        self.assertEqual(((out / "hy4.txt").read_text(), (out / "tensors.txt").read_text()), before)
+
+    def test_not_a_drafter_named(self):
+        self.refused("drafter's file", "--drafter", "Hy4-flash-Q4_K_M-00002-of-00002.gguf")
+        drafter(self.root / self.NAME)
+        drafter(self.root / "another-drafter.gguf")
+        self.refused("2 drafter files")
+        self.assertEqual(pack(self.root, "--drafter", self.NAME).returncode, 0)
+
+    def test_target_layers(self):
+        for targets, words in (((0, 1), "target layer 1 is no indexed layer"),     # (a sliding-window layer)
+                               ((0, 7), "target layer 7 is no indexed layer"),     # (out of range)
+                               ((0, 3), "target layer 3 is no indexed layer"),     # (the MTP block: no trunk layer)
+                               ((0, 0), "each read one trunk layer")):
+            drafter(self.root / self.NAME, targets=targets)
+            self.refused(words)
+        drafter(self.root / self.NAME, kv_over={"target_index_layers": (9, (5, [2, 0]))})
+        self.refused("each read one trunk layer")
+        drafter(self.root / self.NAME, kv_over={"block_count": (4, 3)})
+        self.refused("each read one trunk layer")
+
+    def test_another_models_drafter(self):
+        for over, words in (({"embedding_length": (4, 2 * D)}, "not this model's drafter"),
+                            ({"attention.kv_lora_rank": (4, 32)}, "not this model's drafter"),
+                            ({"mask_token_id": (4, 100000)}, "mask token 100000"),
+                            ({"mtp_fusion": (8, "all")}, "slot0 fusion"),
+                            ({"hidden_correction": (7, False)}, "slot0 fusion")):
+            drafter(self.root / self.NAME, kv_over=over)
+            self.refused(words)
+
+    def test_tensor_shapes(self):
+        for over, words in (({"1.self_attn.q_b_proj.weight": [128, DH * 96 + 32]}, "expected"),
+                            ({"0.self_attn.kv_b_proj.weight": [64, DH * 64]}, "expected"),
+                            ({"0.self_attn.o_proj.weight": None}, "missing"),
+                            ({"1.mlp.up_proj.weight": [D, 2 * DFF]}, "mlp.up_proj.weight is"),
+                            ({"1.mlp.up_proj.weight": None}, "mlp.up_proj.weight is missing"),
+                            ({"0.mlp.up_proj.weight": [D, 384], "1.mlp.up_proj.weight": [D, 384]}, "an FFN of 384"),
+                            ({"final_norm.weight": None}, "lacks model.dfly_layers.final_norm.weight")):
+            drafter(self.root / self.NAME, t_over=over)
+            self.refused(words)
+        gguf(self.root / self.NAME, {"general.architecture": (8, DFLY), "general.type": (8, "drafter")},
+             [("blk.0.attn_q_a.weight", 30, [D, 128])])
+        self.refused("is no drafter tensor")
+
+    def test_the_vision_tower_stays_last(self):
+        drafter(self.root / self.NAME)
+        mmproj(self.root / "mmproj-Hy4-flash-bf16.gguf")
+        r = pack(self.root)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        geo, files, t = self.read()
+        self.assertEqual(files[2:], [self.NAME, "mmproj-Hy4-flash-bf16.gguf"])
+        self.assertEqual((t["model.dfly_layers.final_norm.weight"][1], t["mm.0.weight"][1]), ("2", "3"))
+        self.assertEqual((geo["dfly_layers"], geo["vision.dim"]), ("2", str(DV)))
+
+
 if __name__ == "__main__":
     unittest.main()

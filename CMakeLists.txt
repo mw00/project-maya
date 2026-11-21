@@ -212,6 +212,7 @@ target_compile_options(strata_warnings INTERFACE
   $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<NOT:$<CXX_COMPILER_ID:MSVC>>>:-Wall>
   $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<NOT:$<CXX_COMPILER_ID:MSVC>>>:-Wextra>
   $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CXX_COMPILER_ID:MSVC>>:-Xcompiler=/W4>
+  $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CXX_COMPILER_ID:MSVC>>:-Xcompiler=/utf-8>
   $<$<COMPILE_LANGUAGE:HIP>:-Wall>
   $<$<COMPILE_LANGUAGE:HIP>:-Wextra>)
 if(STRATA_WERROR)
@@ -248,6 +249,10 @@ if(STRATA_BUILD_TESTS)
   # maya-hy4's --kv auto and its pictures' room: what is tried, in which order (src/hy4/hy4_plan.hpp; no GPU)
   add_executable(hy4_plan_test tests/hy4_plan_test.cpp)
   add_test(NAME hy4_plan_test COMMAND hy4_plan_test)
+  # maya-hy4's HY4_EG_POPULATE: a mapping's pages walked on every platform (src/mm3/mm3_os.hpp; no GPU, #1069)
+  add_executable(hy4_populate_test tests/hy4_populate_test.cpp)
+  target_include_directories(hy4_populate_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  add_test(NAME hy4_populate_test COMMAND hy4_populate_test)
   add_executable(ds4_pcie_test tests/ds4_pcie_test.cpp)
   add_test(NAME ds4_pcie_test COMMAND ds4_pcie_test)
   add_executable(ds4_ram_slice_test tests/ds4_ram_slice_test.cpp)
@@ -897,12 +902,39 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     # kernels (src/ds4/ds4_iq) and maya-mm3's OS helpers; NVIDIA, and AMD on Linux
     if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
       add_executable(maya-hy4 src/hy4/hy4_main.cpp src/hy4/hy4_model.cu src/hy4/hy4_vision.cu src/hy4/hy4_kernels.cu src/hy4/hy4_lane.cpp src/hy4/hy4_tp.cpp
-                              src/ds4/ds4_iq.cu src/ds4/ds4_iq_cpu.cpp src/ds4/ds4_gguf_cpu.cpp)
+                              src/ds4/ds4_iq.cu src/ds4/ds4_iq_cpu.cpp src/ds4/ds4_gguf_cpu.cpp src/ds4/ds4_lt.cu)
+      if(STRATA_ENABLE_HIP AND STRATA_HIPBLASLT_AVAILABLE)   # (the prompt path's FP16 GEMMs on AMD: ds4_lt.cu, measured)
+        set_source_files_properties(src/ds4/ds4_lt.cu PROPERTIES COMPILE_DEFINITIONS STRATA_HIPBLASLT_AVAILABLE=1)
+        target_link_libraries(maya-hy4 PRIVATE roc::hipblaslt)
+      endif()
       target_include_directories(maya-hy4 PRIVATE ${_strata_gpu_include_directories} include src/hy4 src/mm3
                                                   third_party/ggml)
       target_link_libraries(maya-hy4 PRIVATE strata_kernels_cpu ${_strata_gpu_runtime_target} ${_strata_gpu_blas_target}
                                              Threads::Threads)
-      target_compile_definitions(maya-hy4 PRIVATE MAYA_DS4_IQ_ONLY)
+      # (DS4_IQ_MIN_FORMS: on AMD the K-quants' minimum term rounded one way in the token and the window kernels -
+      #  ds4_iq.cu's kMinG ..; a verify window's rows are then the rows the tokens get one at a time)
+      target_compile_definitions(maya-hy4 PRIVATE MAYA_DS4_IQ_ONLY DS4_IQ_MIN_FORMS)
+      # the CPU lane kernels' build: a hash of their sources (maya-hy4 remembers per PC whether its 4-bit expert
+      # copies pay, by this too - changed kernels are measured again); a change to one of them configures again
+      file(GLOB _hy4_lane_src src/hy4/hy4_lane.cpp src/hy4/hy4_lane.hpp src/ds4/ds4_iq_cpu.* src/ds4/ds4_iq512_kern.inc
+           src/kernels/cpu/iq*.cpp src/kernels/cpu/iq*.inc include/strata/kernels/cpu/iq*.hpp)
+      list(SORT _hy4_lane_src)
+      set(_hy4_lane_sum "")
+      foreach(_f IN LISTS _hy4_lane_src)
+        file(MD5 "${_f}" _h)
+        string(APPEND _hy4_lane_sum "${_h}")
+      endforeach()
+      string(MD5 _hy4_lane_sum "${_hy4_lane_sum}")
+      string(SUBSTRING "${_hy4_lane_sum}" 0 12 _hy4_lane_sum)
+      set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${_hy4_lane_src})
+      set_property(SOURCE src/hy4/hy4_lane.cpp APPEND PROPERTY COMPILE_DEFINITIONS HY4_LANE_KERNELS=k${_hy4_lane_sum})
+      # maya-hy4's CPU lane alone (no GPU, no model): a call's time / GB/s by expert format and a hash of its
+      # outputs, to compare the lane's row forms bit for bit across runs (built by name)
+      add_executable(hy4_lane_bench EXCLUDE_FROM_ALL tests/hy4_lane_bench.cpp src/hy4/hy4_lane.cpp src/ds4/ds4_iq_cpu.cpp
+                                    src/ds4/ds4_gguf_cpu.cpp)
+      target_include_directories(hy4_lane_bench PRIVATE include src/hy4 third_party/ggml)
+      target_link_libraries(hy4_lane_bench PRIVATE strata_kernels_cpu Threads::Threads)
+      target_compile_definitions(hy4_lane_bench PRIVATE MAYA_DS4_IQ_ONLY DS4_IQ_MIN_FORMS)
       if(STRATA_BUILD_TESTS)
         # maya-hy4's routed experts (no model): the token, window and prompt forms on ds4_iq's kernels against
         # per-matrix GEMVs, in Hy4-flash's types (Q4_K / Q6_K, and the MTP block's Q8_0)
@@ -911,7 +943,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
         target_include_directories(hy4_experts_test PRIVATE ${_strata_gpu_include_directories} include src/hy4
                                                            third_party/ggml)
         target_link_libraries(hy4_experts_test PRIVATE strata_kernels_cpu ${_strata_gpu_runtime_target})
-        target_compile_definitions(hy4_experts_test PRIVATE MAYA_DS4_IQ_ONLY)
+        target_compile_definitions(hy4_experts_test PRIVATE MAYA_DS4_IQ_ONLY DS4_IQ_MIN_FORMS)
         add_test(NAME hy4_experts_test COMMAND hy4_experts_test)
         # maya-hy4's own kernels (no model): hyper-connections, the latent cache and MLA attention with sinks, the
         # router, the indexer's pools / scores / picks, Engram - against double-precision host references
@@ -1444,6 +1476,20 @@ elseif(STRATA_CPU_X86)
   # MAYA_CPU_VNNI_EMULATE=ON chooses that on any toolchain (tests)
   option(MAYA_CPU_VNNI_EMULATE "CPU expert kernel: AVX512-BW in place of VNNI's dot products" OFF)
   include(CheckCXXSourceCompiles)
+  # ... and the GGUF experts' CPU rows (src/ds4/ds4_gguf_cpu.cpp) have an AVX-VNNI tier (VEX-encoded vpdpbusd), which
+  # the same assemblers refuse: without it that tier is left out (MAYA_NO_AVXVNNI) and the AVX2 one runs in its place;
+  # the same for the IQ2 / IQ3 rows' AVX-VNNI form (src/kernels/cpu/iq2v_rows.cpp, iq3v_rows.cpp: VEX vpdpwssd)
+  set(CMAKE_REQUIRED_FLAGS "-mavx2 -mavxvnni")
+  check_cxx_source_compiles([=[
+#include <immintrin.h>
+__m256i f(__m256i a, __m256i b, __m256i c) { return _mm256_dpbusd_avx_epi32(a, b, c); }
+int main() { return 0; }
+]=] MAYA_TOOLCHAIN_AVXVNNI)
+  unset(CMAKE_REQUIRED_FLAGS)
+  if(NOT MAYA_TOOLCHAIN_AVXVNNI)
+    message(STATUS "Maya: the assembler has no AVX-VNNI - the GGUF experts' CPU rows are built without that tier")
+    add_compile_definitions(MAYA_NO_AVXVNNI)
+  endif()
   set(CMAKE_REQUIRED_FLAGS "-mavx512f -mavx512bw -mavx512vl -mavx512dq -mavx512vnni -mavx512vbmi -mf16c -mfma")
   check_cxx_source_compiles([=[
 #include <immintrin.h>
@@ -1526,7 +1572,8 @@ if(STRATA_NATIVE_EXPERTS)
   if(STRATA_CPU_X86)
     target_sources(strata_kernels_cpu PRIVATE src/kernels/cpu/native_expert.cpp src/kernels/cpu/iq_avx512.cpp
                                              src/kernels/cpu/iq_avx2.cpp src/kernels/cpu/kq_avx512.cpp
-                                             src/kernels/cpu/iq_avx512_one.cpp)
+                                             src/kernels/cpu/iq_avx512_one.cpp src/kernels/cpu/iq2v_rows.cpp
+                                             src/kernels/cpu/iq3v_rows.cpp)
   else()
     target_sources(strata_kernels_cpu PRIVATE src/kernels/cpu/native_expert.cpp)
   endif()
@@ -1537,7 +1584,16 @@ if(STRATA_NATIVE_EXPERTS)
     # Match the non-MSVC no-contraction mode: IQ1_M's subnormal-scale parity checks need it too.
     set_source_files_properties(src/kernels/cpu/iq_avx2.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX2;/fp:strict")
     set_source_files_properties(src/kernels/cpu/iq_avx512_one.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX512")
+    # (the second-generation IQ2 rows: VEX encodings throughout - without /arch the compiler's own SSE code beside
+    #  them cost a third of their speed on Golden Cove; their AVX-512 form's intrinsics compile as they are, and the
+    #  caller runs each form only where the CPU takes it)
+    set_source_files_properties(src/kernels/cpu/iq2v_rows.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX2;/fp:strict")
+    # (the second-generation IQ3_XXS / IQ4_XS / 4-bit IQ2_XXS rows: the same, for the same reason)
+    set_source_files_properties(src/kernels/cpu/iq3v_rows.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX2;/fp:strict")
   elseif(STRATA_CPU_X86)
+    # (the second-generation IQ2 rows: each function's instruction set its own, no contraction)
+    set_source_files_properties(src/kernels/cpu/iq2v_rows.cpp PROPERTIES COMPILE_OPTIONS "-ffp-contract=off")
+    set_source_files_properties(src/kernels/cpu/iq3v_rows.cpp PROPERTIES COMPILE_OPTIONS "-ffp-contract=off")
     # (no VNNI / VBMI needed - cpu_avx512bw_ok() is enough to run them; no FP contraction: their sums must take
     # ggml-cpu's float steps exactly, see iq_avx512.cpp)
     set_source_files_properties(src/kernels/cpu/iq_avx512.cpp PROPERTIES COMPILE_OPTIONS
@@ -1671,6 +1727,7 @@ if(STRATA_NATIVE_EXPERTS)
     target_compile_options(strata_mmq PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--extended-lambda -use_fast_math>)
     if(MSVC)
       target_compile_options(strata_mmq PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/bigobj>)
+      target_compile_options(strata_mmq PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/utf-8>)
     endif()
     target_link_libraries(strata_mmq PUBLIC ggml-base ${_strata_gpu_runtime_target})
     target_link_libraries(strata_prefill PUBLIC strata_mmq)
@@ -1825,6 +1882,11 @@ if(STRATA_BUILD_TESTS)
     target_link_libraries(direct_file_async_test PRIVATE Threads::Threads)
     add_test(NAME direct_file_async_test COMMAND direct_file_async_test)
   endif()
+  # Failed expert-cache reads or member transfers must not publish a partially filled spare (host-only injection).
+  add_executable(ds4_cache_swap_test tests/ds4_cache_swap_test.cpp)
+  target_include_directories(ds4_cache_swap_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/ds4)
+  target_link_libraries(ds4_cache_swap_test PRIVATE strata_warnings)
+  add_test(NAME ds4_cache_swap_test COMMAND ds4_cache_swap_test)
   # maya-ds4's RAM expert store (--ssd-cache, src/ds4/ds4_store.hpp) over files of fake experts written in the build
   # directory (~1 MB, removed): reads, where they land, eviction, the read queue, giving RAM back, preload, the miss
   # split's order, put - host code only, no GPU

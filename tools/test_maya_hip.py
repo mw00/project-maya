@@ -57,6 +57,16 @@ class HipSetupTests(unittest.TestCase):
         self.assertEqual(pc["gpus"], [self.gpus[1]])
         self.assertEqual(maya.EXE, self.root / "build-hip/maya")
 
+    def test_rx_9060_xt_is_a_supported_discrete_card(self):
+        """gfx1200 (RX 9050 / 9060 XT): RDNA4 like the gfx1201 R9700, no hipBLASLt table yet (plain hipBLAS)."""
+        card = {"index": 0, "arch": "gfx1200", "vendor": "amd", "name": "AMD Radeon RX 9060 XT", "vram_gb": 16}
+        with patch.object(maya.S, "amd_gpus", return_value=[card]):
+            self.a.gpu = None
+            pc = maya.check_pc(self.a)
+        self.assertEqual(pc["gpus"], [card])
+        self.assertEqual(pc["backend"], "hip")
+        self.assertFalse(maya.hip_unified_memory(card))
+
     def test_versioned_llvm_slot_is_found(self) -> None:
         """Gentoo's versioned LLVM slots count as ROCm's compiler."""
         # Gentoo keeps each LLVM version in its own slot: <root>/lib/llvm/22/bin/clang++
@@ -194,6 +204,16 @@ class HipSetupTests(unittest.TestCase):
         p = maya.write_config(self.a, pc, {"lib_dirs": [str(self.rocm / "lib")]},
                               self.root / "pack", "test", 8192, self.root / "data", None)
         self.assertEqual(maya.read_json(p)["env"]["MAYA_HIPBLASLT_TUNING"], "/selected/table.txt")
+
+    def test_shipped_glm_tuning_tables_name_their_architecture(self):
+        """The tables shipped in tools/hip (gfx1200's tuned on a RX 9060 XT): the engine accepts a table only for
+        its own arch and hipBLASLt version, so a header that does not match the file name's arch would silently
+        leave that card's prompts on plain hipBLAS."""
+        for table in sorted((Path(__file__).resolve().parents[1] / "tools" / "hip").glob("*-glm-hipblaslt-*.txt")):
+            magic = next((l for l in table.read_text(errors="replace").splitlines()
+                          if l.startswith("MAYA_HIPBLASLT_TUNING_V1")), None)
+            self.assertIsNotNone(magic, table.name)
+            self.assertEqual(magic.split()[1], table.name.split("-")[0], table.name)
 
     def test_glm53_tuning_table_only_on_a_glm_dsa_pack(self):
         # GLM-5.3 (glm-dsa) prompt shapes have their own rows (<arch>-glm53-hipblaslt-<version>.txt), after the GLM
@@ -674,6 +694,7 @@ class HipSetupTests(unittest.TestCase):
         (self.root / "build/MAYA-BUILD.json").write_text(json.dumps(stamp))
         with patch.object(maya.S, "out", return_value="NVIDIA V100") as query, \
                 patch.object(maya.S, "page_file_gb", return_value=None), \
+                patch.object(maya, "gpu_readings_report", return_value="GPU 0 Tesla P4: 11 of 11 readings given"), \
                 patch.object(maya.S, "amd_gpus", side_effect=AssertionError("CUDA must not query AMD")):
             self.assertEqual(maya.report("test"), 0)
         query.assert_any_call(["nvidia-smi", "--query-gpu=index,name,memory.total,memory.used,driver_version,"
@@ -682,6 +703,36 @@ class HipSetupTests(unittest.TestCase):
         text = (self.root / "maya-report.txt").read_text()
         self.assertIn(json.dumps(stamp), text)
         self.assertNotIn("## ROCm", text)
+        self.assertIn("## GPU readings (the Monitor's NVML reader, read now)\nGPU 0 Tesla P4: 11 of 11 readings given",
+                      text)
+
+    def test_report_hy4_pictures_and_the_readers_lines(self):
+        """A user's report said "images off" for Hy4-Flash while its engine read pictures: maya-hy4's tower is the
+        pack's (on unless --vision off), not a "vision" entry in the config.  And the GPU readings' lines are picked."""
+        pack = self.root / "Hy4-Flash-Maya-XS" / "pack"
+        pack.mkdir(parents=True)
+        (pack / "hy4.txt").write_text("n_layer 42\nvision.dim 1152\n")
+        for args, want in ((["--pack", str(pack), "--max-context", "262144"], "images on (read a picture at a time)"),
+                           (["--pack", str(pack), "--vision", "off"], "images off (--vision off)")):
+            with self.subTest(args=args):
+                path = self.root / "maya-hy4-flash-maya-xs.json"
+                path.write_text(json.dumps({"exe": str(self.root / "build/maya-hy4"), "args": args, "gpu": [1],
+                                            "installer": {"family": "hy4", "hy4_quant": "maya-xs"}}))
+                path.with_suffix(".log").write_text(
+                    "[maya] the GPU readings' NVML reader stopped (it ended, exit code 1; its last words: x); starting\n"
+                    "[maya] a GPU reading failed on GPU 0 (Tesla P4): power - TypeError: x - left out\n")
+                with patch.object(maya.S, "out", return_value=""), patch.object(maya.S, "page_file_gb", return_value=None), \
+                        patch.object(maya, "gpu_readings_report", return_value="-"):
+                    self.assertEqual(maya.report("test", "cuda", path), 0)
+                text = (self.root / "maya-report.txt").read_text()
+                self.assertIn(want, text)
+                self.assertIn("lines (last 80 of 2)", text)
+        (pack / "hy4.txt").write_text("n_layer 42\n")
+        path.write_text(json.dumps({"exe": "maya-hy4", "args": ["--pack", str(pack)], "installer": {"family": "hy4"}}))
+        with patch.object(maya.S, "out", return_value=""), patch.object(maya.S, "page_file_gb", return_value=None), \
+                patch.object(maya, "gpu_readings_report", return_value="-"):
+            maya.report("test", "cuda", path)
+        self.assertIn("images off (no vision tower in the pack)", (self.root / "maya-report.txt").read_text())
 
     def test_cli_backend_selects_hip_config_for_bench(self):
         hip = self.installed_config()
@@ -799,8 +850,10 @@ class WindowsDetectionTests(unittest.TestCase):
         self.assertAlmostEqual(g["vram_gb"], 96.0)
         rows = json.dumps([{"DriverDesc": "AMD Radeon(TM) 8065S Graphics", "MatchingDeviceId": "pci\\ven_1002&dev_9999"},
                            {"DriverDesc": "AMD Radeon RX 9070 XT", "MatchingDeviceId": "pci\\ven_1002&dev_7550"},
+                           {"DriverDesc": "AMD Radeon RX 9060 XT", "MatchingDeviceId": "pci\\ven_1002&dev_7590"},
                            {"DriverDesc": "AMD Radeon(TM) Graphics", "MatchingDeviceId": "pci\\ven_1002&dev_164e"}])
-        self.assertEqual([g["arch"] for g in maya.S.parse_display_adapters(rows)], ["gfx1151", "gfx1201", "unknown"])
+        self.assertEqual([g["arch"] for g in maya.S.parse_display_adapters(rows)],
+                         ["gfx1151", "gfx1201", "gfx1200", "unknown"])
         self.assertEqual(maya.S.parse_display_adapters(""), [])
         self.assertEqual(maya.S.parse_display_adapters("not json"), [])
 

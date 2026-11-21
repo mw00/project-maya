@@ -204,7 +204,7 @@ the [model card](https://huggingface.co/peasantsmith/Hy4-Flash-Maya-GGUF).
 - **One n-gram table for every size:** Tencent's FP8 table, value for value (63.4 GB). It is downloaded once, stays
   on the SSD and is read page by page while the model answers: it does not need to fit in memory and is never loaded
   into RAM whole. Keep it on an SSD / NVMe, never a hard disk.
-- **AMD (Linux):** `./maya.sh --setup --backend hip --model hy4-flash-maya-xs`. Run by us on a Gorgon Halo (Radeon 8065S, `gfx1151`, ROCm 7.14) with the Radeon alone: Maya-XS and Maya-L with every expert in the GPU's memory, pictures, tool calls and both thinking levels. On a Strix Halo / Gorgon Halo the setup says whether the size sits in the GPU's memory whole ([MEMORY.md](MEMORY.md): 64 GB - Maya-XS, 96 GB - Maya-M, 128 GB - Maya-L). Radeon cards (`gfx1100`): the engine's AMD build was contributed by [@Cass67](https://github.com/Cass67), who ran Tencent's own Q4_K_M on four RX 7900 XT; we have not run such cards ourselves. With an AMD GPU on Windows it has not been tested yet: the setup does not offer it there.
+- **AMD (Linux):** `./maya.sh --setup --backend hip --model hy4-flash-maya-xs`. Run by us on a Gorgon Halo (Radeon 8065S, `gfx1151`, ROCm 7.14) with the Radeon alone: Maya-XS and Maya-L with every expert in the GPU's memory, pictures, tool calls and both thinking levels. On a Strix Halo / Gorgon Halo the setup says whether the size sits in the GPU's memory whole ([MEMORY.md](MEMORY.md): 64 GB - Maya-XS, 96 GB - Maya-M, 128 GB - Maya-L). Radeon cards (`gfx1100`): the engine's AMD build was contributed by [@Cass67](https://github.com/Cass67), who ran Tencent's own Q4_K_M on four RX 7900 XT; we have not run such cards ourselves. With an AMD GPU on Windows it is experimental - the setup offers it and says so; we have not run it there ([AMD_MAYA.md](AMD_MAYA.md#hy4-flash-under-windows-experimental)).
 - **Memory:** RAM + VRAM of about 56-64 GB for Maya-XS (a rule of thumb: the model file plus 4-8 GB for the context).
   With less it still runs, slower ([MEMORY.md](MEMORY.md)).
 - **VRAM:** everything but the routed experts has to fit in VRAM; the experts that do not fit are computed on the CPU
@@ -229,9 +229,9 @@ the [model card](https://huggingface.co/peasantsmith/Hy4-Flash-Maya-GGUF).
 - **Pictures:** the model's own vision tower runs in the engine (contributed by
   [@needmorevram](https://github.com/needmorevram), #1051). The setup downloads Maya's vision file with the model
   (0.8 GB, one for every size; `--no-vision` skips it). Its weights stay in the file; a picture takes up to 0.8 GB of
-  VRAM while it is read, which the engine keeps free on the main GPU. A card with less room beside the model (8 GB
-  cards) reads smaller pictures: the engine keeps what room there is and big pictures are scaled down to it (about
-  1.8 million pixels at an 8K context on an 8 GB card, 512 x 512 at 32K). Only where not even that fits are pictures
+  VRAM while it is read, lent by the engine's prompt buffers (idle while a picture is read): no VRAM is kept for
+  pictures, so every card that runs the model reads them at full size, 8 GB cards included, and the VRAM goes to the
+  model. Only where the tower does not load are pictures
   off: the setup says so, text works as before, a picture sent is refused in plain words and a picture in a tool
   result becomes a short note. Pictures up to 2048 x 2048 pixels (larger ones are scaled down), a square one 4,160 tokens of the context. Pictures only, no videos. Images on the Models page
   turns them on or off.
@@ -283,7 +283,7 @@ without pictures.
   are the two levels offered - a request for another level runs at High. Chat, thinking and tool calls through Maya's
   OpenAI-compatible server.
 - **Pictures:** the model's own vision tower runs in the engine on the main GPU (its weights stay in RAM; a picture
-  takes up to 0.8 GB there while it is read, kept free for it). Pictures up to 2048 x 2048 pixels (larger ones are
+  takes up to 0.8 GB there while it is read, lent by the prompt buffers - none kept for pictures). Pictures up to 2048 x 2048 pixels (larger ones are
   scaled down), a square one 4,160 tokens of the context; 1024 x 768 is read in about 0.25 s, the largest in about
   5 s on an RTX 3090. Pictures only, no videos. Images on the Models page turns them off.
 - **The pack:** `python tools/hy4/pack_gguf.py --model <folder>` indexes the GGUF set and the vision tower's file

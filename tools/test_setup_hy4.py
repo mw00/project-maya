@@ -404,10 +404,10 @@ class Picker(unittest.TestCase):
         self.assertNotIn("Maya-S", about)                             # (only the sizes that are uploaded)
         self.assertIn("or AMD on Linux (Strix Halo / Gorgon Halo, Radeon cards)", about)
         self.assertNotIn("Mac", about)
-        with patch.object(maya, "WIN", False):                        # (AMD: Linux only so far)
-            self.assertIn("Hy4-Flash", self.rows(args(model=None, backend="hip"), man=manifest())["rows"])
-        with patch.object(maya, "WIN", True):
-            self.assertNotIn("Hy4-Flash", self.rows(args(model=None, backend="hip"), man=manifest())["rows"])
+        self.assertIn("under Windows experimental", about)
+        for win in (False, True):                                     # (AMD: Linux, and Windows - experimental)
+            with patch.object(maya, "WIN", win):
+                self.assertIn("Hy4-Flash", self.rows(args(model=None, backend="hip"), man=manifest())["rows"])
 
     def test_the_setup_before(self):
         prev = {"exe": "/b/maya-hy4", "args": ["--pack", "/p"], "installer": {"family": "hy4"}}
@@ -475,12 +475,15 @@ class Gate(unittest.TestCase):
         self.assertEqual(why, "")
         self.assertEqual(said, [("hip", {"text_only": False})])       # (pictures: the tower runs on HIP too)
 
-    def test_amd_on_windows_not_yet(self):
+    def test_amd_on_windows_experimental(self):
+        """Windows + AMD: said once to be experimental, then the AMD check as on Linux (no stop, no extra question)."""
         why, said = self.check("hip", win=True)
-        self.assertIn("runs on AMD GPUs on Linux only for now: with an AMD GPU on Windows it has not been tested yet",
-                      why)
-        self.assertIn("set it up on Linux on this PC, or on a PC with an NVIDIA GPU (V100 or newer", why)
-        self.assertEqual(said, [])
+        self.assertEqual(why, "")
+        self.assertEqual(len(said), 2)
+        self.assertIn("Hy4-Flash on an AMD GPU under Windows is experimental: Maya's team has not tested it there",
+                      said[0])
+        self.assertIn("docs/AMD_MAYA.md", said[0])
+        self.assertEqual(said[1], ("hip", {"text_only": False}))
 
     def test_mac(self):
         why, _ = self.check("metal")
@@ -575,6 +578,21 @@ class Amd(unittest.TestCase):
         self.assertEqual((fit["layout"], fit["vision"]), ("standard", True))
         self.assertAlmostEqual(fit["usable"], 17.0)
 
+    def test_windows_apu_is_its_share(self):
+        """Windows: the GPU's share (HIP's figure) less the desktop's 3 GB - not the share and the RAM together: the
+        engine keeps within the dedicated memory there."""
+        win_halo = dict(halo(), vram_gb=96.0)
+        with contextlib.ExitStack() as stack:
+            for p in self.pc(31, win=True):
+                stack.enter_context(p)
+            self.assertAlmostEqual(maya.hy4_usable_gib([win_halo]), 93.0)
+            fits, line = maya.hy4_apu_note([win_halo], TABLE["quants"]["Hy4-Flash-Maya-M"], "Hy4-Flash-Maya-M")
+            self.assertTrue(fits, line)
+            fits, line = maya.hy4_apu_note([dict(win_halo, vram_gb=64.0)], TABLE["quants"]["Hy4-Flash-Maya-L"],
+                                           "Hy4-Flash-Maya-L")
+        self.assertFalse(fits)
+        self.assertIn("Windows gives the GPU 61 GB of this PC's memory", line)
+
     def test_limit_read_from_sysfs(self):
         with patch.object(maya.sys, "platform", "win32"):
             self.assertIsNone(maya.amd_gpu_limit_gib())
@@ -659,6 +677,32 @@ class Fit(unittest.TestCase):
         gpus = gib if isinstance(gib, list) else [card(gib)]
         return maya.hy4_fit(XS, gpus, used={g["index"]: used for g in gpus}, **kw)
 
+    def test_kv_streaming_offers_longer_contexts_where_the_ram_holds_the_rows(self):
+        for gib in (8, 12, 16, 24, 32):                    # (no RAM figure: the VRAM alone, as before)
+            f = self.fit(gib, 0)
+            self.assertNotIn("streamed", f)
+            self.assertNotIn("--kv-streaming", f["args"])
+            # ... and what fitted without streaming is never streamed, whatever the RAM
+            r = self.fit(gib, 0, ram_gb=128)
+            self.assertEqual([c for c in r["contexts"] if c not in r.get("streamed", [])], f["contexts"], gib)
+            self.assertEqual(self.fit(gib, 0, ram_gb=32).get("streamed"), None, gib)   # (a small RAM: no rows there)
+        f = self.fit(8, ram_gb=64)                         # (an 8 GB card: 32K before; 1M's pooled keys do not fit)
+        self.assertEqual((f["layout"], f["streamed"], f["context"]), ("8gb", [65536, 131072, 262144, 524288], 32768))
+        self.assertIn("error", self.fit(8, ram_gb=64, ctx_wanted=1048576))
+        f = self.fit(8, ram_gb=64, ctx_wanted=262144)
+        self.assertEqual((f["kv_streaming"], f["kv"], f["args"][-2:]), (True, "q8", ["--kv-streaming", "auto"]))
+        self.assertAlmostEqual(f["kv_ram"], 13 * 262144 * 672 / 2**30, places=3)
+        self.assertLessEqual(f["need"], f["usable"])
+        f = self.fit(16, 0, ram_gb=64, ctx_wanted=1048576)  # (a 16 GB card: the model's whole reach, F16 rows in RAM)
+        self.assertEqual((f["layout"], f["kv_streaming"], f["kv"], f["args"]), ("standard", True, "f16", ["--kv-streaming", "auto"]))
+        self.assertAlmostEqual(f["kv_ram"], 13 * 1048576 * 1152 / 2**30, places=3)
+        f = self.fit(32, 0, ram_gb=64, ctx_wanted=1048576)  # (a card that holds it all: not streamed)
+        self.assertNotIn("kv_streaming", f)
+        # the streamed cache: a ring of the global layers' rows instead of every position's
+        full, st = maya.hy4_cache_bytes(1048576, 1024), maya.hy4_cache_bytes(1048576, 1024, resident=32768)
+        self.assertEqual(full - st, 13 * ((1048576 - 32768) * 1152 - 32768 * 4) - (64 * 2052 * 1160 + 1048576 * 4 + 1024))
+        self.assertEqual(maya.hy4_cache_bytes(32768, 1024, resident=32768), maya.hy4_cache_bytes(32768, 1024))
+
     def test_8gb_card(self):
         f = self.fit(8)                                               # (a card that also drives the desktop)
         # (16K and 32K fit with the cache in 8-bit rows - the engine's --kv auto takes them by itself: no --kv)
@@ -698,9 +742,9 @@ class Fit(unittest.TestCase):
         self.assertEqual((f["kv"], f["need"], f["chunk"]), ("f16", 6.8, 256))
         self.assertEqual(self.fit(8, ctx_wanted=4096)["kv"], "f16")
         f = self.fit(8, ctx_wanted=16384)
-        self.assertEqual((f["layout"], f["kv"], f["need"], f["vision"], f["vision_small"]), ("8gb", "q8", 7.0, True, True))
+        self.assertEqual((f["layout"], f["kv"], f["need"], f["vision"], f["vision_small"]), ("8gb", "q8", 7.0, True, False))
         f = self.fit(8, 1024)                              # (a desktop with 1 GB in use: 16K, not 32K)
-        self.assertEqual((f["context"], f["contexts"], f["kv"], f["vision"]), (16384, [4096, 8192, 16384], "q8", False))
+        self.assertEqual((f["context"], f["contexts"], f["kv"], f["vision"]), (16384, [4096, 8192, 16384], "q8", True))
         self.assertIn("error", self.fit(8, 1024, ctx_wanted=32768))
         for gib in (12, 16, 24, 32):                       # (cards every context fits with F16 rows: as before)
             f = self.fit(gib)
@@ -718,65 +762,62 @@ class Fit(unittest.TestCase):
                     f16, q8 = maya.hy4_fit_need_gib(plan, c) <= f["usable"], maya.hy4_fit_need_gib(plan, c, True) <= f["usable"]
                     self.assertEqual(c in f["contexts"], f16 or q8, (gib, used, c))
 
-    def test_pictures_only_where_their_room_fits(self):
-        """A picture's room on the main GPU beside the plan at the context chosen, pictures before the cache's rows
-        (the engine's order, src/hy4/hy4_plan.hpp): F16 rows + the largest picture's room (HY4_VISION_GIB), 8-bit
-        rows + that room, F16 then 8-bit rows + a smaller picture's room (HY4_VISION_MIN_GIB), then text only.  The
-        context is never made smaller for it; the prompt chunk is doubled only with what the picture leaves."""
-        f = self.fit(8, 400)                               # (7.6 GB: 7.1 at 32K + a small picture's room)
-        self.assertEqual((f["layout"], f["context"], f["kv"], f["vision"], f["vision_small"]), ("8gb", 32768, "q8", True, True))
-        f = self.fit(8, 400, ctx_wanted=8192)              # (6.8 + 0.81 does not fit: F16 rows and a smaller picture)
-        self.assertEqual((f["kv"], f["vision"], f["vision_small"]), ("f16", True, True))
-        f = self.fit(8, 1024, ctx_wanted=16384)            # (7.0 GB: the model's own parts fill it - text only)
-        self.assertEqual((f["kv"], f["vision"], f["vision_small"]), ("q8", False, False))
-        # (8-bit rows with pictures go before F16 rows without them: 8.1 GB at 32K in F16, 7.1 + 0.81 in 8-bit rows)
+    def test_pictures_cost_no_vram(self):
+        """The engine lends a picture's room from its prompt buffers (idle while a picture is read), so pictures are
+        on wherever the model runs, at the tower's largest size, and take nothing from the plan: the layout, the
+        contexts, the cache's rows, the chunk and the VRAM counted are those of a start without pictures."""
+        f = self.fit(8, 400)                               # (7.6 GB: 7.1 at 32K in 8-bit rows - before, a small picture)
+        self.assertEqual((f["layout"], f["context"], f["kv"], f["vision"], f["vision_small"]), ("8gb", 32768, "q8", True, False))
+        f = self.fit(8, 400, ctx_wanted=8192)              # (6.8: F16 rows, the largest picture)
+        self.assertEqual((f["kv"], f["vision"], f["vision_small"]), ("f16", True, False))
+        f = self.fit(8, 1024, ctx_wanted=16384)            # (7.0 GB: the model's own parts fill it - before, text only)
+        self.assertEqual((f["kv"], f["vision"], f["vision_small"]), ("q8", True, False))
+        # (no 8-bit rows for a picture's sake any more: 7.9 GB at 32K in F16 fits 8.1 GB)
         f = self.fit(8.5, 400, ctx_wanted=32768, layout="8gb")
-        self.assertEqual((f["kv"], f["need"], f["vision"], f["vision_small"]), ("q8", 7.1, True, False))
-        # (a context in 8-bit rows: a picture's room is counted beside the 8-bit plan, as it is beside the F16 one)
-        f = self.fit(12, 500, ctx_wanted=131072)
-        self.assertEqual((f["layout"], f["kv"], f["vision"], f["vision_small"]), ("standard", "q8", True, False))
-        f = self.fit(12, 800, ctx_wanted=131072)
-        self.assertEqual((f["layout"], f["kv"], f["vision"], f["vision_small"]), ("standard", "q8", True, True))
-        # (VRAM for the larger chunk or for the picture, not both: the picture - 6.5 + 0.81 of 7.6 GB, 6.8 + 0.81 of 8.5)
-        f = self.fit(8, 400, ctx_wanted=4096)
-        self.assertEqual((f["chunk"], f["kv"], f["vision"], f["vision_small"]), (256, "f16", True, False))
-        f = self.fit(9, 500, ctx_wanted=8192)
-        self.assertEqual((f["chunk"], f["kv"], f["vision"], f["vision_small"]), (256, "f16", True, False))
-        f = self.fit(11, 300, ctx_wanted=8192, layout="8gb")
         self.assertEqual((f["kv"], f["vision"], f["vision_small"]), ("f16", True, False))
         for gib in (12, 16, 24, 32):                       # (F16 rows and the largest picture: as before)
             f = self.fit(gib, 400)
             self.assertEqual((f["layout"], f["kv"], f["vision"], f["vision_small"]), ("standard", "f16", True, False), gib)
+        seen = 0
+        for gib in (6.5, 7, 8, 8.5, 9, 9.5, 10, 11, 12, 16, 24):
+            for used in (0, 400, 1024):
+                for ctx in (None, 4096, 8192, 32768, 131072):
+                    on, off = self.fit(gib, used, ctx_wanted=ctx), self.fit(gib, used, ctx_wanted=ctx, pictures=False)
+                    self.assertEqual("error" in on, "error" in off, (gib, used, ctx))
+                    if "error" in on:
+                        self.assertEqual(on, off, (gib, used, ctx))
+                        continue
+                    self.assertEqual((on["vision"], on["vision_small"], off["vision"]), (True, False, False), (gib, used, ctx))
+                    self.assertEqual({k: v for k, v in on.items() if k != "vision"},
+                                     {k: v for k, v in off.items() if k != "vision"}, (gib, used, ctx))
+                    seen += 1
+        self.assertGreater(seen, 60)
 
-    def test_chunk_512_only_after_the_pictures(self):
-        """The chunk is doubled only where that fits beside the largest picture's room, with the rows the picture
-        was chosen with; never where only a smaller picture fits (it takes all the room there is)."""
-        small, up, big = XS["layouts"]["8gb"]["plan"], maya.HY4_CHUNK_UP_GIB, maya.HY4_VISION_GIB
+    def test_chunk_512_where_it_fits(self):
+        """A small-card layout's chunk is doubled where that fits beside the model's own parts with the rows the
+        context takes - pictures or not: the larger chunk's buffers lend a picture its room as the smaller one's do."""
+        small, up = XS["layouts"]["8gb"]["plan"], maya.HY4_CHUNK_UP_GIB
         seen = set()
         for gib, used, ctx in ((8, 400, None), (8, 400, 4096), (8.5, 300, None), (9, 500, None), (9, 500, 8192),
                                (8, 0, None), (9.5, 900, 4096), (8, 0, 4096), (9.5, 0, 4096), (10, 0, 8192),
-                               (11, 300, 8192), (11, 300, 32768), (12, 0, 32768)):
+                               (11, 300, 8192), (11, 300, 32768), (12, 0, 32768), (8, 1024, 16384)):
             f = self.fit(gib, used, ctx_wanted=ctx, layout="8gb")
             need = maya.hy4_fit_need_gib(small, f["context"], f["kv"] == "q8")
-            both = f["vision"] and not f["vision_small"] and need + big + up <= f["usable"]
-            self.assertEqual(f["chunk"], 512 if both else 256, (gib, used, ctx))
+            self.assertEqual(f["chunk"], 512 if need + up <= f["usable"] else 256, (gib, used, ctx))
             self.assertEqual(f["args"][:2], ["--chunk", str(f["chunk"])])
-            if f["chunk"] == 512:                          # (the picture is the one the plan's own chunk gets)
-                self.assertEqual((f["kv"], f["vision"], f["vision_small"]), ("f16", True, False), (gib, used, ctx))
-            if need + up <= f["usable"]:                   # (room for the larger chunk: never taken from a picture)
-                self.assertTrue(f["vision"] and not f["vision_small"], (gib, used, ctx))
+            self.assertTrue(f["vision"] and not f["vision_small"], (gib, used, ctx))
             seen.add(f["chunk"])
         self.assertEqual(seen, {256, 512})
-        # (an 8 GB card with nothing on it at 4K: 6.5 + 0.95 fits and 6.5 + 0.81 fits, both do not - the picture)
-        f = self.fit(8, 0, ctx_wanted=4096)
-        self.assertEqual((f["chunk"], f["kv"], f["vision"], f["vision_small"]), (256, "f16", True, False))
-        # (both fit: both - 6.5 + 0.81 + 0.95 of 9.5 GB)
-        f = self.fit(9.5, 0, ctx_wanted=4096, layout="8gb")
+        # (an 8 GB card at 4K with a light desktop: 6.5 + 0.95 of 7.6 GB - before, the picture took that room)
+        f = self.fit(8, 400, ctx_wanted=4096)
         self.assertEqual((f["chunk"], f["kv"], f["vision"], f["vision_small"]), (512, "f16", True, False))
-        # (the larger chunk never moves the rows to 8-bit or the picture to a smaller one: 8.1 + 0.81 of 9.3 GB at 32K)
-        f = self.fit(9.5, 200, ctx_wanted=32768, layout="8gb")
-        self.assertEqual((f["chunk"], f["kv"], f["vision"], f["vision_small"]), (256, "f16", True, False))
-        self.assertEqual(self.fit(8, 400)["chunk"], 256)   # (32K with a smaller picture: all the room is its)
+        f = self.fit(9, 500, ctx_wanted=8192)              # (6.8 + 0.95 of 8.5 GB)
+        self.assertEqual((f["chunk"], f["kv"], f["vision"], f["vision_small"]), (512, "f16", True, False))
+        # (the larger chunk never moves the rows to 8-bit: 7.1 + 0.95 does not fit 7.6 GB at 32K)
+        f = self.fit(8, 400)
+        self.assertEqual((f["chunk"], f["kv"]), (256, "q8"))
+        f = self.fit(8, 400, ctx_wanted=16384)             # (7.0 in 8-bit rows of 7.6 GB: the chunk stays)
+        self.assertEqual((f["chunk"], f["kv"]), (256, "q8"))
 
     def test_chunk_512_with_no_pictures_asked(self):
         """--no-vision: no picture is ever read, so the room goes to the chunk as it did."""
@@ -881,6 +922,31 @@ class Fit(unittest.TestCase):
                 maya.hy4_fit_step(args(context=131072), {"gpus": [card(8)]}, "maya-xs")
             with with_manifest(manifest()), self.assertRaisesRegex(Failed, "not available yet"):
                 maya.hy4_fit_step(args(), {"gpus": [card(24)]}, "maya-s")
+
+    def test_a_size_too_big_names_itself_and_the_smaller_one(self):
+        """A size the card does not hold even at 4K: the line names the size, and the hint the largest smaller size
+        that runs there with its exact command (none where no smaller one fits, or for the smallest)."""
+        with patch.object(maya, "fail", fail), patch.object(maya, "ok", lambda *a: None), \
+                patch.object(maya, "warn", lambda *a: None), patch.object(maya, "say", lambda *a: None), \
+                patch.object(maya, "gpu_used_mib", return_value={0: 400}):
+            with self.assertRaises(Failed) as e:
+                maya.hy4_fit_step(args(), {"gpus": [card(8)]}, "maya-s")
+            said = str(e.exception)
+            self.assertIn("Hy4-Flash · Maya-S needs about", said)
+            self.assertIn("this card has 7.6 GB free", said)
+            self.assertIn("the smaller Hy4-Flash · Maya-XS fits this card (its 8 GB-card file): "
+                          f"{maya.ME} --setup --model hy4-flash-maya-xs - or a card with more VRAM", said)
+            self.assertEqual(maya.hy4_smaller_fit("maya-l", [card(8)]), ("maya-xs", "8gb"))
+            self.assertIsNone(maya.hy4_smaller_fit("maya-xs", [card(8)]))          # (the smallest: none smaller)
+            for quant in ("maya-s", "maya-xs"):                # (a card no size fits: the plain hint alone)
+                with self.assertRaises(Failed) as e:
+                    maya.hy4_fit_step(args(), {"gpus": [card(6)]}, quant)
+                self.assertNotIn("the smaller", str(e.exception))
+                self.assertIn("a card with more VRAM", str(e.exception))
+            with with_manifest(manifest(revision="", only=None, hub=False)), self.assertRaises(Failed) as e:
+                maya.hy4_fit_step(args(), {"gpus": [card(8)]}, "maya-l")      # (nothing uploaded: none offered)
+            self.assertIn("Hy4-Flash · Maya-L needs about", str(e.exception))
+            self.assertNotIn("the smaller", str(e.exception))
 
     def test_the_8gb_file_on_the_hub_or_not(self):
         """Both ways by the Hub's answer alone: there - used (from the commit the Hub named); not there - a plain
@@ -1111,7 +1177,8 @@ class Files(unittest.TestCase):
             self.assertEqual(pack, d / "maya-hy4")
             cmd = ran[0]
             self.assertEqual(cmd[1:], [str(maya.ROOT / "tools" / "hy4" / "pack_gguf.py"), "--model", str(d), "--out",
-                                       str(pack), "--mmproj", "none", "--mtp", "none", "--files", TRUNK, NGRAM])
+                                       str(pack), "--mmproj", "none", "--mtp", "none", "--drafter", "none",
+                                       "--files", TRUNK, NGRAM])
             self.assertNotIn("--engram-eps", cmd)
             self.assertEqual(json.loads((pack / maya.PACK_SOURCES).read_text())["tools"],
                              maya.S.source_hash(maya.HY4_PACK_TOOLS))
@@ -1313,6 +1380,7 @@ MMPROJ = "mmproj-Hy4-flash-bf16.gguf"
 
 MTP_HUB = "mtp/Hy4-Flash-mtp-BF16.gguf_file"
 MTP_FILE = "Hy4-Flash-mtp-BF16.gguf"
+DFLY_FILE = "Hy4-Flash-Maya-XS-drafter.dfly2"
 
 
 class Drafts(unittest.TestCase):
@@ -1353,10 +1421,14 @@ class Drafts(unittest.TestCase):
             (pack / "tensors.txt").write_text("file 0 a.gguf\nfile 1 b.gguf\nfile 2 %s\nt x F32 0 0 4 1\n" % MTP_FILE)
             self.assertEqual(maya.hy4_pack_mtp_file(pack), MTP_FILE)
 
-    def set_up(self, gib, block=True, published=False, prev=None, downloads=None, **kw):
-        """One setup of Maya-XS from a folder with stand-in files on a card of `gib`: (config, what was said, the
-        pack's command)."""
-        man, body = stand_ins()
+    def set_up(self, gib, block=True, published=False, prev=None, downloads=None, dfly=False, gpus=1, dfly_gib=None,
+               small=False, used=300, choose=None, revision="", room=None, **kw):
+        """One setup of Maya-XS from a folder with stand-in files on `gpus` cards of `gib`: (config, what was said,
+        the pack's command).  dfly: the size has a DFly2 drafter in the table, its file in the folder.  small: the
+        folder has the 8 GB-card trunk; used: the MiB nvidia-smi reads in use on each card; choose: the setup's
+        questions answered by it (else none is asked: --yes); revision: the table's (the drafter published); room:
+        Windows, with CUDA's readings of each card (cuda_room_bytes' free, free with two contexts, total)."""
+        man, body = stand_ins(dict(MANIFEST, revision=revision))
         blob = b"m" * 777
         man["mtp"] = {MTP_HUB: [len(blob), hashlib.sha256(blob).hexdigest()]}
         man["mtp_revision"] = "d" * 40 if published else ""
@@ -1365,19 +1437,28 @@ class Drafts(unittest.TestCase):
         root, d = Path(self.tmp.name) / "maya", Path(self.tmp.name) / "mine"
         root.mkdir(exist_ok=True)
         d.mkdir(exist_ok=True)
-        (d / TRUNK).write_bytes(body[list(xs["files"])[0]])
+        if small:
+            (d / SMALL).write_bytes(body[list(xs["layouts"]["8gb"]["files"])[0]])
+        else:
+            (d / TRUNK).write_bytes(body[list(xs["files"])[0]])
         (d / NGRAM).write_bytes(body[list(man["ngram"])[0]])
         if block:
             (d / MTP_FILE).write_bytes(blob)
+        if dfly:
+            dblob = b"f" * 555
+            xs["drafter"] = {"Maya-XS/" + DFLY_FILE: [len(dblob), hashlib.sha256(dblob).hexdigest()]}
+            (d / DFLY_FILE).write_bytes(dblob)
 
         def run(cmd, *a, **k):
             ran.append(cmd)
             pack = Path(cmd[cmd.index("--out") + 1])
             (pack / "tokenizer").mkdir(parents=True, exist_ok=True)
-            for n in ("hy4.txt", "engram.bin", "tokenizer/vocab.json", "tokenizer/chat_template.jinja"):
+            for n in ("engram.bin", "tokenizer/vocab.json", "tokenizer/chat_template.jinja"):
                 (pack / n).write_text("x")
-            m = cmd[cmd.index("--mtp") + 1]
-            (pack / "tensors.txt").write_text("file 0 a\nfile 1 b\n" + ("" if m == "none" else "file 2 %s\n" % m))
+            m, f = cmd[cmd.index("--mtp") + 1], cmd[cmd.index("--drafter") + 1]
+            (pack / "hy4.txt").write_text("x\n" + ("" if f == "none" else "dfly_layers 5\n"))
+            (pack / "tensors.txt").write_text("file 0 a\nfile 1 b\n" + "".join(
+                "file %d %s\n" % (2 + i, n) for i, n in enumerate(x for x in (m, f) if x != "none")))
 
         def offer(a, what, dd, files, m):
             (downloads if downloads is not None else []).append((what, [f.name for f in files], maya.file_url(m, files[0].name)))
@@ -1385,19 +1466,31 @@ class Drafts(unittest.TestCase):
                 raise AssertionError("no download")
             files[0].write_bytes(blob)
             return True
-        pc = {"backend": "cuda", "gpus": [card(gib)], "archs": [86], "nvcc": "nvcc"}
-        with with_manifest(man), patch.object(maya, "ROOT", root), patch.object(maya, "fail", fail), \
+        pc = {"backend": "cuda", "gpus": [card(gib, i) for i in range(gpus)], "archs": [86], "nvcc": "nvcc"}
+        gib_f = (lambda q: dfly_gib) if dfly_gib is not None else maya.hy4_dfly2_gib
+        st = contextlib.ExitStack()
+        if room is not None:                           # (Windows, CUDA's readings of the cards: WindowsRoom)
+            for i, g in enumerate(pc["gpus"]):
+                g["pci"] = f"00000000:0{i + 1}:00.0"
+            for p in (patch.object(maya, "WIN", True), patch.object(maya, "maya_engine_mib", return_value={}),
+                      patch.object(maya, "cuda_room_bytes",
+                                   return_value={f"0000:0{i + 1}:00.0": room for i in range(gpus)})):
+                st.enter_context(p)
+        with st, with_manifest(man), patch.object(maya, "ROOT", root), patch.object(maya, "fail", fail), \
+                patch.object(maya, "hy4_dfly2_gib", gib_f), \
                 patch.object(maya, "step", lambda *a: None), patch.object(maya, "say", lambda *a: said.extend(a)), \
                 patch.object(maya, "ok", said.append), patch.object(maya, "warn", said.append), \
                 patch.object(maya, "check_pc", lambda a, fam: pc), \
-                patch.object(maya, "gpu_used_mib", return_value={0: 300}), \
+                patch.object(maya, "gpu_used_mib", return_value={i: used for i in range(gpus)}), \
+                patch.object(maya, "choose", choose or (lambda q, i, o, default, yes, *r: default)), \
                 patch.object(maya, "mem_gb", return_value=(64.0, 60.0)), \
                 patch.object(maya, "tools_step", lambda a: Path("llama")), \
                 patch.object(maya, "build_step", lambda a, pc, llama, target: {"lib_dirs": []}), \
                 patch.object(maya, "rotational", return_value=False), patch.object(maya, "configs", return_value=[]), \
                 patch.object(maya, "run", run), patch.object(maya, "write_run_script", lambda p, port: "run"), \
                 patch.object(maya, "hy4_mtp_gib", lambda chunk=1024: 3.95),                 patch.object(maya, "offer_download", offer):
-            a = args(model="hy4-flash-maya-xs", model_dir=str(d), no_vision=True, **kw)
+            a = args(model="hy4-flash-maya-xs", model_dir=str(d), no_vision=True, **({"yes": False} if choose else {}),
+                     **kw)
             maya.model_option(a)
             c = json.loads(maya.set_up_hy4(a, prev or {}).read_text())
         return c, "\n".join(map(str, said)), ran[-1] if ran else None
@@ -1447,6 +1540,142 @@ class Drafts(unittest.TestCase):
         self.assertIn("drafting: off - the draft block needs about", text)
         self.assertIn("GB free on this PC's cards", text)
 
+    def test_dfly2_table(self):
+        # every Maya size has its own DFly2 drafter in the table (.dfly2 in its folder of the repo, at the table's
+        # commit); its VRAM is the file's bytes and a little scratch
+        for q in ("maya-xs", "maya-s", "maya-m", "maya-l"):
+            e = maya.hy4_dfly2_entry(q)
+            self.assertEqual((e["repo"], e["revision"], e["published"]), (TABLE["repo"], TABLE["revision"], True))
+            self.assertRegex(e["name"], r"^Hy4-Flash-Maya-(XS|S|M|L)-drafter\.dfly2$")
+            self.assertTrue(e["folder"].startswith("Maya-"))
+            self.assertTrue(0.6 < maya.hy4_dfly2_gib(q) < 0.9)
+        self.assertIsNone(maya.hy4_dfly2_entry(maya.HY4_Q4))
+        self.assertEqual(maya.hy4_dfly2_gib(maya.HY4_Q4), 0.0)
+        base = maya.hy4_config_need_gib("maya-xs", "standard", 32768)
+        self.assertAlmostEqual(maya.hy4_config_need_gib("maya-xs", "standard", 32768, dfly2=True),
+                               base + maya.hy4_dfly2_gib("maya-xs"), places=6)
+
+    def test_dfly2_where_only_it_fits(self):
+        # a 12 GB card: no room for the block, room for the DFly2 drafter - packed, --dfly2, drafting on
+        c, text, cmd = self.set_up(12, published=True, dfly=True)
+        self.assertEqual((cmd[cmd.index("--mtp") + 1], cmd[cmd.index("--drafter") + 1]), ("none", DFLY_FILE))
+        self.assertIn("--dfly2", c["args"])
+        self.assertNotIn("--mtp", c["args"])
+        self.assertEqual((c["installer"]["drafting"], c["installer"]["dfly2"]), ("on", True))
+        self.assertNotIn("draft_block", c["installer"])
+        self.assertIn("drafting: Tencent's DFly2 drafter drafts tokens and the model checks every one", text)
+        self.assertIn("(the MTP block: the draft block needs about", text)
+        # --drafting off: the drafter stays in the pack, no --dfly2, a setup again keeps it off; --drafting on again
+        c, text, _ = self.set_up(12, published=True, dfly=True, prev=c, drafting="off")
+        self.assertNotIn("--dfly2", c["args"])
+        self.assertIn("drafting: off (--drafting on, or Drafting on the Models page, drafts with the DFly2 drafter)",
+                      text)
+        c, _, _ = self.set_up(12, published=True, dfly=True, prev=c)
+        self.assertNotIn("--dfly2", c["args"])
+        c, _, _ = self.set_up(12, published=True, dfly=True, prev=c, drafting="on")
+        self.assertIn("--dfly2", c["args"])
+        # --drafting mtp: the block alone - off on this card, said
+        c, text, cmd = self.set_up(12, published=True, dfly=True, drafting="mtp")
+        self.assertEqual(cmd[cmd.index("--drafter") + 1], "none")
+        self.assertNotIn("--dfly2", c["args"])
+        self.assertIn("drafting: off - the draft block needs about", text)
+
+    def test_both_fit(self):
+        # where both fit, both are packed and the size's rule drafts until the speed calibration measures (once, at a
+        # start); a setup again keeps what it measured; --no-speed-calibration: the rule, recorded as chosen
+        c, text, cmd = self.set_up(32, dfly=True)
+        self.assertEqual((cmd[cmd.index("--mtp") + 1], cmd[cmd.index("--drafter") + 1]), (MTP_FILE, DFLY_FILE))
+        rule = maya.HY4_DRAFT_RULE["maya-xs"]
+        self.assertIn("--dfly2" if rule == "dfly2" else "--mtp", c["args"])
+        self.assertNotIn("--mtp" if rule == "dfly2" else "--dfly2", c["args"])
+        self.assertEqual({k: c["installer"].get(k) for k in ("draft_choice", "drafter", "draft_block", "dfly2")},
+                         {"draft_choice": "auto", "drafter": rule, "draft_block": True, "dfly2": True})
+        self.assertIn("both fit here", text)
+        self.assertTrue(maya.hy4_both_drafters(c) and maya.needs_speed_calibration(c))
+        c["installer"]["speed_calibration"] = {"date": "d", "kept": "mtp" if rule == "dfly2" else "dfly2"}
+        self.assertFalse(maya.needs_speed_calibration(c))
+        c2, text, _ = self.set_up(32, dfly=True, prev=c)
+        self.assertEqual(c2["installer"]["drafter"], c["installer"]["speed_calibration"]["kept"])
+        self.assertEqual(c2["installer"]["speed_calibration"], c["installer"]["speed_calibration"])
+        self.assertIn("the faster of the two on this PC", text)
+        c3, _, _ = self.set_up(32, dfly=True, no_speed_calibration=True)
+        self.assertEqual(c3["installer"]["speed_calibration"]["skipped"], "chosen")
+        self.assertFalse(maya.needs_speed_calibration(c3))
+        # two cards: the drafter is not taken, nothing to measure
+        c4, _, cmd = self.set_up(32, dfly=True, gpus=2)
+        self.assertEqual(cmd[cmd.index("--drafter") + 1], "none")
+        self.assertFalse(maya.needs_speed_calibration(c4))
+
+    def test_by_name(self):
+        # --drafting mtp / dfly2: that one alone, packed alone, nothing measured
+        c, _, cmd = self.set_up(32, dfly=True, drafting="dfly2")
+        self.assertEqual((cmd[cmd.index("--mtp") + 1], cmd[cmd.index("--drafter") + 1]), ("none", DFLY_FILE))
+        self.assertIn("--dfly2", c["args"])
+        self.assertNotIn("--mtp", c["args"])
+        self.assertFalse(maya.needs_speed_calibration(c))
+        c, _, cmd = self.set_up(32, dfly=True, drafting="mtp")
+        self.assertEqual((cmd[cmd.index("--mtp") + 1], cmd[cmd.index("--drafter") + 1]), (MTP_FILE, "none"))
+        self.assertIn("--mtp", c["args"])
+        self.assertEqual(c["installer"]["draft_choice"], "mtp")
+        self.assertFalse(maya.needs_speed_calibration(c))
+
+    def test_speed_calibration(self):
+        # the A/B: MTP block first, then DFly2; the faster is kept, a tie keeps the size's rule
+        c, _, _ = self.set_up(32, dfly=True)
+        p = Path(self.tmp.name) / "maya-hy4-flash-maya-xs.json"
+        for o, d, want in ((30.0, 36.0, "dfly2"), (36.0, 30.0, "mtp"), (30.0, 30.3, maya.HY4_DRAFT_RULE["maya-xs"])):
+            p.write_text(json.dumps(c))
+            seen = []
+
+            def run(mtp, dfly, **kw):
+                seen.append(("--mtp" in mtp["args"], "--dfly2" in mtp["args"], "--dfly2" in dfly["args"],
+                             "--mtp" in dfly["args"]))
+                return {"other": {"tok_s": o, "tokens": 512}, "dflash2": {"tok_s": d, "tokens": 512}}
+            with patch.object(maya.CD, "run", run), patch.object(maya, "busy_skip", return_value=False), \
+                    patch.object(maya, "say", lambda *a: None), patch.object(maya, "ok", lambda *a: None):
+                self.assertTrue(maya.speed_calibration(p, "asked for"))
+            out = json.loads(p.read_text())
+            self.assertEqual(seen, [(True, False, True, False)])
+            self.assertEqual((out["installer"]["drafter"], out["installer"]["speed_calibration"]["kept"]), (want, want))
+            self.assertIn("--dfly2" if want == "dfly2" else "--mtp", out["args"])
+            self.assertNotIn("--mtp" if want == "dfly2" else "--dfly2", out["args"])
+            self.assertFalse(maya.needs_speed_calibration(out))
+
+    def test_dfly2_not_where_it_cannot_run(self):
+        # no room for the drafter either, or two cards (the engine runs it with its layers on one GPU): not taken, said
+        c, text, cmd = self.set_up(12, published=True, dfly=True, dfly_gib=5.0)
+        self.assertEqual(cmd[cmd.index("--drafter") + 1], "none")
+        self.assertNotIn("--dfly2", c["args"])
+        self.assertIn("; the DFly2 drafter needs about 5.0 GB", text)
+        c, text, cmd = self.set_up(12, published=True, dfly=True, gpus=2)
+        self.assertEqual(cmd[cmd.index("--drafter") + 1], "none")
+        self.assertNotIn("--dfly2", c["args"])
+        if "--mtp" not in c["args"]:
+            self.assertIn("the DFly2 drafter runs on one GPU for now (this PC: 2)", text)
+
+    def test_dfly2_where_the_engine_loads_it(self):
+        # the engine loads the drafter only where its room changes nothing but the experts' places: the setup counts
+        # it on the fit's figure with a doubled chunk's buffers, and with the margin where that figure is measured -
+        # an 8 GB card driving a desktop at 8K (the engine: 8-bit rows beside it) does not take it
+        g, q, card8 = maya.hy4_dfly2_gib("maya-xs"), maya.hy4_quant_table("maya-xs"), [{"index": 0, "vram_gb": 8.0}]
+        f8 = maya.hy4_fit(q, card8, 8192, used={0: 552}, ram_gb=64)
+        self.assertEqual((f8["layout"], f8["kv"]), ("8gb", "f16"))
+        self.assertAlmostEqual(maya.hy4_dfly2_need_gib("maya-xs", f8), f8["need"] + g + maya.HY4_FIT_MARGIN_GIB)
+        self.assertGreater(maya.hy4_dfly2_need_gib("maya-xs", f8), f8["usable"])
+        f5 = maya.hy4_fit(q, card8, 5120, used={0: 552}, ram_gb=64)   # (a context the plan does not list)
+        up = maya.HY4_CHUNK_UP_GIB if f5["chunk"] > maya.hy4_layouts(q)["8gb"]["plan"]["chunk"] else 0.0
+        self.assertAlmostEqual(maya.hy4_dfly2_need_gib("maya-xs", f5), f5["need"] + up + g)
+        self.assertAlmostEqual(maya.hy4_dfly2_need_gib("maya-xs", dict(f8, chunk=2 * f8["chunk"])),
+                               f8["need"] + maya.HY4_CHUNK_UP_GIB + g + maya.HY4_FIT_MARGIN_GIB)
+        # at 4K the larger chunk fits, the drafter beside it does not, beside the plan's chunk it does: with the
+        # drafter counted the chunk stays the plan's (the drafts are the larger gain), without it it doubles
+        base = maya.hy4_layouts(q)["8gb"]["plan"]["chunk"]
+        self.assertEqual(maya.hy4_fit(q, card8, 4096, used={0: 552}, ram_gb=64)["chunk"], 2 * base)
+        f4 = maya.hy4_fit(q, card8, 4096, used={0: 552}, ram_gb=64, drafter=g)
+        self.assertEqual(f4["chunk"], base)
+        self.assertLessEqual(maya.hy4_dfly2_need_gib("maya-xs", f4), f4["usable"])
+        self.assertEqual(maya.hy4_fit(q, card8, 4096, used={0: 0}, ram_gb=64, drafter=g)["chunk"], base)
+
     def test_the_file(self):
         # not uploaded yet and not in the folder: no download, said; uploaded: asked from Maya's repo at its commit,
         # under its name there, saved under the name the pack reads
@@ -1482,6 +1711,345 @@ class Drafts(unittest.TestCase):
             (d / MTP_FILE).write_bytes(b"x" * 777)                                 # (damaged: the size is right)
             with self.assertRaises(Failed):
                 maya.hy4_mtp_step(args(), d, "maya-l", models)
+
+
+class FastDrafting(unittest.TestCase):
+    """The opt-in faster drafting (--fast-drafting on): where the DFly2 drafter has no room beside the cache's F16
+    rows but has it beside 8-bit rows, the setup offers the same context with --kv q8 - never by itself (the answers
+    are not the default's), worked out from the card's free VRAM."""
+    G = maya.hy4_dfly2_gib("maya-xs")                  # (the committed table's drafter: its real size)
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def set_up(self, used, **kw):                      # (an 8 GB card at 8K, the 8 GB-card trunk and the drafter)
+        return Drafts.set_up(self, 8, block=False, dfly=True, dfly_gib=self.G, small=True, used=used, context=8192,
+                             revision=TABLE["revision"], **kw)
+
+    def test_where_it_applies(self):
+        q, card8 = maya.hy4_quant_table("maya-xs"), [card(8)]
+
+        def fit(used, ctx=8192, cards=card8):
+            f = maya.hy4_fit(q, cards, ctx, used={g["index"]: used for g in cards}, ram_gb=64, drafter=self.G)
+            return f, maya.hy4_fast_drafting_fit("maya-xs", cards, f, used={g["index"]: used for g in cards}, ram_gb=64)
+        # a desktop's ~0.4 GB in use: F16 rows fit, the drafter beside them does not, beside 8-bit rows it does
+        f, fast = fit(400)
+        self.assertEqual((f["kv"], maya.hy4_dfly2_need_gib("maya-xs", f) > f["usable"]), ("f16", True))
+        self.assertEqual((fast["kv"], fast["context"], fast["layout"], fast["fast_drafting"], fast["f16_room"]),
+                         ("q8", 8192, "8gb", True, False))
+        self.assertEqual(fast["args"][-2:], ["--kv", "q8"])
+        self.assertEqual(fast["chunk"], maya.hy4_layouts(q)["8gb"]["plan"]["chunk"])   # (the drafter's room first)
+        self.assertLessEqual(maya.hy4_dfly2_need_gib("maya-xs", fast), fast["usable"])
+        self.assertNotIn("--kv", f["args"])                                            # (the default: the engine's auto)
+        # where these sums find the drafter room beside the F16 rows too (a free card; 4K): marked - the setup asks
+        # nothing there (the default claims the drafter), and takes it only by name
+        self.assertTrue(fit(76)[1]["f16_room"])
+        self.assertTrue(fit(400, 4096)[1]["f16_room"])
+        # not where 8-bit rows do not make the room either (more in use), at a context whose default rows are 8-bit
+        # already, or on two cards
+        self.assertIsNone(fit(552)[1])
+        self.assertEqual(fit(400, 16384)[0]["kv"], "q8")
+        self.assertIsNone(fit(400, 16384)[1])
+        self.assertIsNone(fit(400, cards=[card(8), card(8, 1)])[1])
+        # the standard layout on larger cards: the MTP block or the drafter drafts there with F16 rows
+        for gib in (12, 16, 24):
+            f = maya.hy4_fit(q, [card(gib)], None, used={0: 400}, ram_gb=64, drafter=self.G)
+            self.assertIsNone(maya.hy4_fast_drafting_fit("maya-xs", [card(gib)], f, used={0: 400}, ram_gb=64), gib)
+        self.assertIsNone(maya.hy4_fast_drafting_fit(maya.HY4_Q4, card8, f))            # (Tencent's own set: no drafter)
+        # the rows asked for: only those counted and written (the engine's --kv)
+        f8 = maya.hy4_fit(q, card8, 8192, used={0: 400}, ram_gb=64, kv="q8")
+        self.assertEqual((f8["kv"], f8["args"][-2:]), ("q8", ["--kv", "q8"]))
+        self.assertAlmostEqual(f8["need"], maya.hy4_fit_need_gib(maya.hy4_layouts(q)["8gb"]["plan"], 8192, True))
+
+    def test_the_default_says_it(self):
+        # --yes (and no flag): the default start - F16 rows, no drafter - and the drafting line names the faster one
+        c, text, cmd = self.set_up(400)
+        self.assertEqual(cmd[cmd.index("--drafter") + 1], "none")
+        self.assertNotIn("--kv", c["args"])
+        self.assertNotIn("--dfly2", c["args"])
+        self.assertNotIn("fast_drafting", c["installer"])
+        self.assertIn("with the cache in 8-bit rows it fits at 8K: faster drafting, slightly different wording than "
+                      "the default (./maya.sh --setup --fast-drafting on)".replace("./maya.sh", maya.ME), text)
+        # a free card: the drafter fits beside the F16 rows - the default drafts, nothing offered
+        c, text, _ = self.set_up(76)
+        self.assertEqual(("--dfly2" in c["args"], "--kv" in c["args"]), (True, False))
+        self.assertNotIn("fast-drafting", text)
+
+    def test_on(self):
+        c, text, cmd = self.set_up(400, fast_drafting="on")
+        self.assertEqual(cmd[cmd.index("--drafter") + 1], DFLY_FILE)
+        self.assertEqual((c["args"][c["args"].index("--kv") + 1], "--dfly2" in c["args"]), ("q8", True))
+        self.assertEqual(c["args"][c["args"].index("--chunk") + 1], "256")
+        self.assertEqual((c["installer"]["fast_drafting"], c["installer"]["drafting"], c["installer"]["drafter"]),
+                         (True, "on", "dfly2"))
+        self.assertIn("faster drafting: on - the cache in 8-bit rows at this context, so the DFly2 drafter fits: "
+                      "faster drafting, slightly different wording than the default", text)
+        # a setup again keeps it (with drafting turned off on the Models page too: it is for the drafter); off goes back
+        again, text, _ = self.set_up(400, prev={**c, "installer": {**c["installer"], "drafting": "off"}})
+        self.assertEqual((again["args"][again["args"].index("--kv") + 1], "--dfly2" in again["args"]), ("q8", True))
+        self.assertIn("faster drafting: on (as set up before)", text)
+        off, _, _ = self.set_up(400, prev=c, fast_drafting="off")
+        self.assertEqual(("--kv" in off["args"], "--dfly2" in off["args"], "fast_drafting" in off["installer"]),
+                         (False, False, False))
+
+    def test_asked(self):
+        # asked where it applies, the default first; the answer taken
+        seen = []
+
+        def answer(pick):
+            def choose(q, intro, options, default, yes, *r):
+                seen.append((q, default, [o[0] for o in options], yes))
+                return pick if q == "Faster drafting?" else default
+            return choose
+        c, _, _ = self.set_up(400, choose=answer(1))
+        self.assertEqual(seen[-1][:2], ("Faster drafting?", 0))
+        self.assertEqual(seen[-1][2][0], "Default: the cache in F16 rows, no drafting at this context")
+        self.assertEqual(c["args"][c["args"].index("--kv") + 1], "q8")
+        c, _, _ = self.set_up(400, choose=answer(0))
+        self.assertNotIn("--kv", c["args"])
+        seen.clear()
+        self.set_up(76, choose=answer(1))                                              # (no trade here: not asked)
+        self.assertNotIn("Faster drafting?", [s[0] for s in seen])
+
+    def test_by_name(self):
+        # where the setup's sums give the drafter room beside F16 rows too (a free card), the default claims it and the
+        # engine may still find none (its start line says so): by name the 8-bit rows are taken, said so
+        c, text, _ = self.set_up(76, fast_drafting="on")
+        self.assertEqual((c["args"][c["args"].index("--kv") + 1], "--dfly2" in c["args"]), ("q8", True))
+        self.assertIn("so the DFly2 drafter fits also where the engine finds no room for it beside F16 rows", text)
+        # where even 8-bit rows leave it no room, or drafting is off: the default, said why
+        c, text, _ = self.set_up(552, fast_drafting="on")
+        self.assertEqual(("--kv" in c["args"], "--dfly2" in c["args"]), (False, False))
+        self.assertIn("faster drafting: not set up - even with the cache in 8-bit rows the DFly2 drafter has no room",
+                      text)
+        c, text, _ = self.set_up(400, fast_drafting="on", drafting="off")
+        self.assertEqual(("--kv" in c["args"], "--dfly2" in c["args"]), (False, False))
+        self.assertIn("faster drafting: not set up with --drafting off", text)
+
+
+MIB = 2**20
+
+
+class WindowsRoom(unittest.TestCase):
+    """Windows keeps part of every card from the programs on it, which nvidia-smi does not show: the setup counts the
+    VRAM the engine's CUDA gets there (hy4_engine_room, measured on the PC: CUDA's free VRAM with a context held - the
+    engine's own reading - plus what a context takes and what the driver keeps from CUDA), and only there."""
+    G = maya.hy4_dfly2_gib("maya-xs")
+    # CUDA's readings (free with one context, free with two, total), bytes: an RTX 3050 8 GB under Windows with 0.1 GB
+    # in use (Uranus), a V100 32 GB under Linux (Sun's eGPU)
+    URANUS = (7556038656, 7484735488, 8589410304)
+    V100 = (33745534976, 33422573568, 34072559616)
+
+    def pc(self, gib=8, n=1):
+        return {"backend": "cuda", "gpus": [dict(card(gib, i), pci=f"00000000:0{i + 1}:00.0", driver="610.88")
+                                            for i in range(n)]}
+
+    def room(self, pc, probe, win=True, busy=None, saved=None):
+        with patch.object(maya, "WIN", win), patch.object(maya, "maya_engine_mib", return_value=busy or {}):
+            return maya.hy4_engine_room(pc, probe=probe, saved=saved)
+
+    # an 8 GB layout's start at 8K (the setup's config on the RTX 3050) and what its engine said with --room-report
+    CFG = {"exe": "C:/Maya/build/maya-hy4.exe", "gpu": [0], "backend": "cuda",
+           "args": ["--pack", "p", "--max-context", "8192", "--chunk", "256", "--reserve-gb", "0.5",
+                    "--vram-experts", "0"], "installer": {"hy4_quant": "maya-xs", "layout": "8gb"}}
+    INFO = {"room_rows": "f16", "room_drafter": 0, "room_streamed": 0,
+            "room_gpus": "0000:01:00.0,7556038656,805306368"}                     # (0.75 GiB spare)
+
+    def test_first_guess_then_the_engines_figure(self):
+        one = self.URANUS[0] / 2**30
+        pc = self.pc()
+        self.room(pc, {"0000:01:00.0": self.URANUS})
+        g = pc["gpus"][0]
+        self.assertEqual((g["engine_room_how"], round(g["cuda_free_gb"], 4)), ("estimated", round(one, 4)))
+        self.assertAlmostEqual(g["engine_room_gb"], one + maya.HY4_FIT_CUDA_OWN_GIB)
+        # the engine's first start on this card measures it: the setup's sums for that start (the 8 GB layout at 8K,
+        # F16 rows, no drafter: 6.8 GiB) and what it had spare, against what the setup's CUDA probe sees
+        with patch.object(maya, "WIN", True):
+            # (the probe's reading is taken before the engine starts: Windows' figure drops as the engine fills it)
+            card_ = maya.hy4_room_due(self.CFG, gpus=self.pc()["gpus"], probe={"0000:01:00.0": self.URANUS})
+            self.assertEqual((card_["pci"], card_["cuda_probe"]), ("00000000:01:00.0", list(self.URANUS)))
+            rec = maya.hy4_room_measure(self.CFG, card_, self.INFO, probe=AssertionError("not asked"))
+            self.assertIsNone(maya.hy4_room_due(self.CFG, gpus=self.pc()["gpus"], probe=AssertionError("no")))
+        need = maya.hy4_config_need_gib("maya-xs", "8gb", 8192, chunk=256, reserve_gb=0.5)
+        self.assertEqual(need, 6.8)
+        self.assertAlmostEqual(rec["own_gib"], need + 0.75 - one, places=3)
+        self.assertEqual((rec["rows"], rec["drafter"], rec["context"]), ("f16", False, 8192))
+        self.assertEqual(list(maya.hy4_room_load()), [maya.hy4_room_key(card_)])
+        # the next setup counts it ("measured"); on another driver, or another card in the slot: the first guess
+        pc = self.pc()
+        got = self.room(pc, {"0000:01:00.0": self.URANUS})
+        self.assertAlmostEqual(got[0], one + rec["own_gib"])
+        self.assertEqual(pc["gpus"][0]["engine_room_how"], "measured")
+        for other in ({"driver": "615.10"}, {"name": "NVIDIA GeForce RTX 4060"}, {"vram_gb": 12.0}):
+            pc = {"backend": "cuda", "gpus": [dict(self.pc()["gpus"][0], **other)]}
+            self.room(pc, {"0000:01:00.0": self.URANUS})
+            self.assertEqual(pc["gpus"][0]["engine_room_how"], "estimated", other)
+        # measured again under a new driver: the old driver's figure goes
+        with patch.object(maya, "WIN", True):
+            new = dict(card_, driver="615.10")
+            self.assertIsNotNone(maya.hy4_room_measure(self.CFG, new, self.INFO))
+        self.assertEqual(list(maya.hy4_room_load()), [maya.hy4_room_key(new)])
+
+    def test_the_measured_start(self):
+        probe = {"0000:01:00.0": self.URANUS}
+        card_ = self.pc()["gpus"][0]
+
+        def got(info=None, cfg=None, **kw):
+            return maya.hy4_room_measure(cfg or self.CFG, card_, {**self.INFO, **(info or {})}, probe=kw.get("probe", probe),
+                                         save=False)
+        base = got()["own_gib"]
+        # the rows and the drafter the engine took count in the sums (8-bit rows: their own; the drafter's room)
+        self.assertAlmostEqual(got({"room_drafter": 1})["own_gib"], base + maya.hy4_dfly2_gib("maya-xs"), delta=0.002)
+        self.assertLess(got({"room_rows": "q8"})["own_gib"], base)
+        # a context the plan does not list: its sums without the fit's margin
+        c6 = dict(self.CFG, args=[x if x != "8192" else "6144" for x in self.CFG["args"]])
+        self.assertAlmostEqual(got(cfg=c6)["need_gib"], maya.hy4_config_need_gib("maya-xs", "8gb", 6144, chunk=256,
+                                                                                reserve_gb=0.5) - maya.HY4_FIT_MARGIN_GIB,
+                               places=3)
+        # not kept: a start that streams its cache, a card the engine did not report, no probe reading, a figure out
+        # of all reason, no plan for the size, a report the engine did not write
+        for info, kw in (({"room_streamed": 1}, {}), ({"room_gpus": "0000:02:00.0,7556038656,805306368"}, {}),
+                         ({}, {"probe": {}}), ({"room_gpus": "0000:01:00.0,7556038656,8053063680"}, {}),
+                         ({"room_gpus": "0000:01:00.0,x,1"}, {}), ({"room_gpus": None}, {})):
+            self.assertIsNone(got(info, **kw), info)
+        self.assertIsNone(got(cfg=dict(self.CFG, installer={"hy4_quant": "nope"})))
+
+    def test_uranus_measured(self):
+        # the RTX 3050's engine at 8K (F16 rows, no drafter): 7.04 GiB free, its choices held with 0.49 GiB less - CUDA's
+        # own share there 0.26 GiB in the setup's terms; with it the setup claims the drafter where the engine loads
+        # it: at 4K and 5K, not at 6K and 8K (F16), and at 8K beside 8-bit rows (the question asked) - measured
+        info = dict(self.INFO, room_gpus="0000:01:00.0,7556038656,531283968")
+        rec = maya.hy4_room_measure(self.CFG, dict(self.pc()["gpus"][0], cuda_probe=list(self.URANUS)), info)
+        self.assertAlmostEqual(rec["own_gib"], 0.258, delta=0.001)
+        q, pc = maya.hy4_quant_table("maya-xs"), self.pc()
+        self.room(pc, {"0000:01:00.0": self.URANUS})
+        cards = pc["gpus"]
+        self.assertEqual(cards[0]["engine_room_how"], "measured")
+        claims = {}
+        for ctx in (4096, 5120, 6144, 8192):
+            f = maya.hy4_fit(q, cards, ctx, used={0: 76}, ram_gb=64, drafter=self.G)
+            self.assertEqual((f["kv"], f["room_measured"]), ("f16", True))
+            claims[ctx] = maya.hy4_dfly2_need_gib("maya-xs", f) <= f["usable"]
+        self.assertEqual(claims, {4096: True, 5120: True, 6144: False, 8192: False})
+        f8 = maya.hy4_fit(q, cards, 8192, used={0: 76}, ram_gb=64, drafter=self.G)
+        fast = maya.hy4_fast_drafting_fit("maya-xs", cards, f8, used={0: 76}, ram_gb=64)
+        self.assertEqual((fast["kv"], fast["f16_room"]), ("q8", False))
+        # the first guess keeps the margins (the drafter's sums never set against this PC's engine)
+        pc = self.pc()
+        self.room(pc, {"0000:01:00.0": self.URANUS}, saved={})
+        f4 = maya.hy4_fit(q, pc["gpus"], 4096, used={0: 76}, ram_gb=64, drafter=self.G)
+        self.assertNotIn("room_measured", f4)
+        self.assertAlmostEqual(maya.hy4_dfly2_need_gib("maya-xs", f4), 6.5 + self.G + maya.HY4_FIT_MARGIN_GIB)
+
+    def test_due(self):
+        gl, pr = self.pc(n=2)["gpus"], {"0000:01:00.0": self.URANUS, "0000:02:00.0": self.URANUS}
+        with patch.object(maya, "WIN", True):
+            self.assertIsNotNone(maya.hy4_room_due(self.CFG, gpus=gl, saved={}, probe=pr))
+            self.assertEqual(maya.hy4_room_due(dict(self.CFG, gpu="1"), gpus=gl, saved={}, probe=pr)["index"], 1)
+            self.assertIsNone(maya.hy4_room_due(self.CFG, gpus=gl, saved={maya.hy4_room_key(gl[0]): {"own_gib": 0.5}},
+                                                probe=pr))
+            self.assertIsNone(maya.hy4_room_due(self.CFG, gpus=gl, saved={}, probe={}))   # (no reading: no figure)
+            for cfg in (dict(self.CFG, gpu=[0, 1]), dict(self.CFG, gpu=None), dict(self.CFG, gpu=[3]),
+                        dict(self.CFG, exe="C:/Maya/build/maya-ds4.exe"), dict(self.CFG, backend="hip")):
+                self.assertIsNone(maya.hy4_room_due(cfg, gpus=gl, saved={}, probe=pr), cfg)
+            self.assertIsNone(maya.hy4_room_due(self.CFG, gpus=[dict(gl[0], unified_memory=True)], saved={}, probe=pr))
+        with patch.object(maya, "WIN", False):
+            self.assertIsNone(maya.hy4_room_due(self.CFG, gpus=gl, saved={}, probe=pr))
+
+    def test_measured_on_windows_only(self):
+        one, two, tot = self.URANUS
+        pc = self.pc()
+        got = self.room(pc, {"0000:01:00.0": self.URANUS})
+        # (CUDA's 7.04 GiB free; a context 68 MiB and the driver's 0.5 MiB there, less than the sums count for them)
+        self.assertLess((one - two) / 2**30 + 8.0 - tot / 2**30, maya.HY4_FIT_CUDA_OWN_GIB)
+        self.assertAlmostEqual(got[0], one / 2**30 + maya.HY4_FIT_CUDA_OWN_GIB)
+        self.assertEqual(pc["gpus"][0]["engine_room_gb"], got[0])
+        # not measured: another OS, a card a Maya engine holds now, AMD, a unified-memory GPU, a card with no PCI id,
+        # a device CUDA did not read
+        for case in ({"win": False}, {"busy": {0: None}}):
+            pc = self.pc()
+            self.assertEqual(self.room(pc, {"0000:01:00.0": self.URANUS}, **case), {}, case)
+            self.assertNotIn("engine_room_gb", pc["gpus"][0])
+        for pc in ({"backend": "hip", "gpus": [dict(radeon(), pci="00000000:01:00.0")]},
+                   {"backend": "cuda", "gpus": [dict(card(8), pci="00000000:01:00.0", unified_memory=True)]},
+                   {"backend": "cuda", "gpus": [card(8)]}):
+            self.assertEqual(self.room(pc, AssertionError("not asked")), {})
+        self.assertEqual(self.room(self.pc(), {"0000:02:00.0": self.URANUS}), {})
+        with patch.object(maya, "WIN", True), patch.object(maya, "maya_engine_mib", return_value={}), \
+                patch.object(maya, "cuda_room_bytes", return_value={}):
+            self.assertEqual(maya.hy4_engine_room(self.pc()), {})           # (no driver to ask: as before)
+
+    def test_the_same_as_linux_counts(self):
+        # the same sums on Linux (nothing kept there) give nvidia-smi's total less what is in use: CUDA's free VRAM
+        # and a context's 308 MiB and the driver's 274 MiB (32768 MiB less CUDA's total), 0 MiB in use - more than
+        # HY4_FIT_CUDA_OWN_GIB, so the measured part
+        got = self.room(self.pc(32), {"0000:01:00.0": self.V100})
+        self.assertAlmostEqual(got[0], 32.0, delta=0.01)
+
+    def test_usable(self):
+        room = dict(card(8), engine_room_gb=7.5)
+        self.assertAlmostEqual(maya.hy4_usable_gib([room], {0: 76}), 7.5)                # (no more than its room)
+        self.assertAlmostEqual(maya.hy4_usable_gib([room], {0: 900}), 8.0 - 900 / 1024)   # (less in VRAM in use)
+        self.assertAlmostEqual(maya.hy4_usable_gib([room], {0: 4000}), 7.0)               # (in use: at most 1 GiB)
+        self.assertAlmostEqual(maya.hy4_usable_gib([room], {}), 7.5)                      # (no reading)
+        self.assertAlmostEqual(maya.hy4_usable_gib([dict(card(8), engine_room_gb=7.7)], {}), 7.6)
+        self.assertAlmostEqual(maya.hy4_usable_gib([room, card(8, 1)], {0: 76, 1: 76}), 7.5 + 8.0 - 76 / 1024)
+        # no room on the cards: the figures as before
+        self.assertAlmostEqual(maya.hy4_usable_gib([card(8)], {0: 76}), 8.0 - 76 / 1024)
+        self.assertAlmostEqual(maya.hy4_usable_gib([card(8), card(8, 1)], {}), 16.0 - maya.HY4_FIT_DISPLAY_GIB)
+
+    def test_uranus(self):
+        # an idle 8 GB card under Windows: at 8K the setup no longer claims the drafter beside the F16 rows (the
+        # engine does not load it there) and offers the faster drafting; at 4K it claims it (the engine loads it)
+        q, pc = maya.hy4_quant_table("maya-xs"), self.pc()
+        self.room(pc, {"0000:01:00.0": self.URANUS})
+        cards = pc["gpus"]
+        f8 = maya.hy4_fit(q, cards, 8192, used={0: 76}, ram_gb=64, drafter=self.G)
+        self.assertEqual((f8["kv"], f8["chunk"]), ("f16", 256))
+        self.assertGreater(maya.hy4_dfly2_need_gib("maya-xs", f8), f8["usable"])
+        fast = maya.hy4_fast_drafting_fit("maya-xs", cards, f8, used={0: 76}, ram_gb=64)
+        self.assertEqual((fast["kv"], fast["f16_room"]), ("q8", False))
+        f4 = maya.hy4_fit(q, cards, 4096, used={0: 76}, ram_gb=64, drafter=self.G)
+        self.assertLessEqual(maya.hy4_dfly2_need_gib("maya-xs", f4), f4["usable"])
+        # without the room (before; or Linux with the same card): the drafter claimed at 8K
+        f8 = maya.hy4_fit(q, [card(8)], 8192, used={0: 76}, ram_gb=64, drafter=self.G)
+        self.assertLessEqual(maya.hy4_dfly2_need_gib("maya-xs", f8), f8["usable"])
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        # (the engine's measured figures: a store of the test's own, empty to begin with)
+        store = patch.object(maya, "HY4_ROOM_STORE", Path(self.tmp.name) / "data" / "vram-room.json")
+        store.start()
+        self.addCleanup(store.stop)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_setup(self):
+        # the setup on that card: at 8K no --dfly2, the drafting line says why and the faster drafting is asked
+        seen = []
+
+        def choose(q, intro, options, default, yes, *r):
+            seen.append(q)
+            return default
+        c, text, _ = Drafts.set_up(self, 8, block=False, dfly=True, dfly_gib=self.G, small=True, used=76, context=8192,
+                                   revision=TABLE["revision"], room=self.URANUS, choose=choose)
+        self.assertNotIn("--dfly2", c["args"])
+        self.assertIn("Faster drafting?", seen)
+        self.assertIn("VRAM: Windows keeps part of this card from the programs on it - the setup counts 7.5 of its "
+                      "8.0 GB, from CUDA's own reading", text)
+        self.assertIn("the DFly2 drafter needs about 0.7 GB beside the model's own parts (7.7 GB with it at this "
+                      "context, 7.5 GB free)", text)
+        self.assertIn("(at a context of 4K it fits: ", text)
+        self.assertEqual(c["installer"]["engine_room_gb"]["0"][1], 8.0)
+        # at 4K: claimed and written
+        c, text, _ = Drafts.set_up(self, 8, block=False, dfly=True, dfly_gib=self.G, small=True, used=76, context=4096,
+                                   revision=TABLE["revision"], room=self.URANUS)
+        self.assertIn("--dfly2", c["args"])
+        self.assertIn("drafting: Tencent's DFly2 drafter drafts tokens", text)
 
 
 def hy4_cfg(d: Path, mtp: bool = True, n_mtp: int = 1, vision: bool = False) -> dict:
@@ -1766,6 +2334,24 @@ class Dashboard(unittest.TestCase):
                     M.apply(cfg, bad)
             with self.assertRaises(ValueError):
                 M.apply(hy4_cfg(Path(t) / "b", n_mtp=0), {"draft": "mtp"})
+            with self.assertRaises(ValueError):
+                M.apply(cfg, {"draft": "dfly2"})                 # (no DFly2 drafter in this pack)
+
+    def test_models_page_dfly2(self):
+        """A pack with the DFly2 drafter (hy4.txt: dfly_layers): DFly2 offered beside MTP; one drafter's flag at a time."""
+        from serve import models as M
+        with tempfile.TemporaryDirectory() as t:
+            cfg = hy4_cfg(Path(t), mtp=False)
+            with (M.pack_of(cfg) / "hy4.txt").open("a") as f:
+                f.write("dfly_layers 5\n")
+            self.assertEqual(M.choices(cfg)["draft"], ["mtp", "dfly2", "none"])
+            self.assertEqual(M.settings_of(cfg)["draft"], "none")
+            on = M.apply(cfg, {"draft": "dfly2"})
+            self.assertEqual(on["args"][-1], "--dfly2")
+            self.assertEqual(M.settings_of(on)["draft"], "dfly2")
+            mtp = M.apply(on, {"draft": "mtp"})
+            self.assertEqual((mtp["args"][-1], "--dfly2" in mtp["args"]), ("--mtp", False))
+            self.assertNotIn("--dfly2", M.apply(on, {"draft": "none"})["args"])
 
     def test_models_page_images(self):
         """A pack with the vision tower: Images on by default (no flag), off writes --vision off, on drops it."""
@@ -1803,6 +2389,116 @@ class Dashboard(unittest.TestCase):
                              timeout=60)
         self.assertEqual(out.returncode, 0, out.stderr)
         self.assertEqual(json.loads(out.stdout), ["hy4", ["none", "high"], "high", "high", "high", "Hy4 Flash"])
+
+
+class Q4xCheck(unittest.TestCase):
+    """The CPU lane's 4-bit expert copies (maya-hy4's HY4_Q4X): the engine measures them once its experts are warm and
+    remembers the verdict per PC (the data folder's hy4-cpu-lane.txt) - no start of their own; --speed-calibration
+    measures again (HY4_Q4X_MEASURE=1); a verdict an earlier start's check wrote into the config's env is dropped."""
+
+    def cfg(self, root: Path, **kw) -> dict:
+        tok = root / "tokenizer"
+        tok.mkdir(exist_ok=True)
+        (tok / "chat_template.jinja").write_text("{{ messages }}")
+        c = {"exe": str(root / "maya-hy4"), "tokenizer": str(tok), "gpu": [0],
+             "args": ["--pack", str(root / "pack"), "--max-context", "8192"],
+             "installer": {"family": "hy4", "hy4_quant": "maya-xs"}}
+        c.update(kw)
+        return c
+
+    def test_an_earlier_checks_verdict_is_left_to_the_engine(self):
+        """1.1.69's start-time check wrote HY4_Q4X 1 / 0 into the config (often measured on cold experts): dropped at
+        the start, so the engine measures once warm and remembers it per PC, model and lane kernels.  A value of the
+        user's own stays."""
+        with tempfile.TemporaryDirectory() as t:
+            p = Path(t) / "maya-hy4-flash-maya-xs.json"
+            for env, inst, kept in (({"HY4_Q4X": "1"}, {"q4x_calibration": {"result": "on"}}, False),
+                                    ({"HY4_Q4X": "0"}, {"q4x_calibration": {"result": "off"}}, False),
+                                    ({"HY4_Q4X": "0"}, {}, True),                                 # (set by hand)
+                                    ({"HY4_Q4X": "1"}, {"q4x_calibration": {"result": "off"}}, True)):
+                with self.subTest(env=env, inst=inst):
+                    c = self.cfg(Path(t), env=dict(env))
+                    c["installer"].update(inst)
+                    p.write_text(json.dumps(c))
+                    got = maya.q4x_config_migrate(p, maya.read_json(p))
+                    self.assertEqual("HY4_Q4X" in (got.get("env") or {}), kept)
+                    self.assertEqual("HY4_Q4X" in (maya.read_json(p).get("env") or {}), kept)
+            glm = {"exe": "/b/maya", "args": ["--glm-pack", "/p"], "env": {"HY4_Q4X": "1"},
+                   "installer": {"family": "glm", "q4x_calibration": {"result": "on"}}}
+            self.assertEqual(maya.q4x_config_migrate(p, glm), glm)
+        self.assertFalse(hasattr(maya, "needs_q4x_calibration"))          # (no start loads the model for it any more)
+
+    def test_the_server_names_the_verdicts_file(self):
+        import serve.server as SV
+        with tempfile.TemporaryDirectory() as t:
+            env = SV.child_env(self.cfg(Path(t)))
+        self.assertEqual(env["HY4_Q4X_FILE"], str(SV.ROOT / "data" / "hy4-cpu-lane.txt"))
+        self.assertNotIn("HY4_Q4X_FILE", SV.child_env({"exe": "/b/maya", "args": ["--glm-pack", "/p"]}))
+
+    def test_the_verdict(self):
+        self.assertEqual(maya.q4x_verdict("maya-hy4: CPU lane: the 4-bit copies kept - an expert run 60 us"), "on")
+        self.assertEqual(maya.q4x_verdict("maya-hy4: CPU lane: the 4-bit copies dropped - an expert run"), "off")
+        self.assertEqual(maya.q4x_verdict("INFO CPU lane: a call of 16 experts ... - the file's rows kept"), "off")
+        self.assertEqual(maya.q4x_verdict("INFO CPU lane: no 4-bit copies of its experts (2.0 GB of RAM free"), "off")
+        self.assertEqual(maya.q4x_verdict("INFO CPU lane: ... 4-bit copies - the most routed experts re-coded"),
+                         "unmeasured")
+        self.assertIsNone(maya.q4x_verdict("INFO every routed expert in VRAM"))
+
+    def run_check(self, root: Path, verdict_line: str):
+        p = root / "maya-hy4-flash-maya-xs.json"
+        p.write_text(json.dumps(self.cfg(root)))
+        seen = {}
+
+        class Engine:
+            def __init__(self, cmd, stdin=None, stdout=None, stderr=None, env=None, **kw):
+                seen["env"], seen["cmd"] = env, cmd
+                stderr.write(verdict_line + "\n")
+                self.stdin = io.StringIO()
+                self.stdout = iter(["READY\n", "T 5\n", "DONE 64 30 1 1 length\n", "DONE 256 30 1 1 length\n"])
+
+            def wait(self, timeout=None):
+                return 0
+
+        class Tok:
+            @staticmethod
+            def from_dir(d):
+                return SimpleNamespace(encode=lambda s, parse_special=False: [1, 2, 3])
+
+        said = []
+        with patch.object(maya.subprocess, "Popen", Engine), patch.object(maya, "busy_skip", return_value=False), \
+                patch.object(maya.time, "sleep"), patch.object(maya, "ok", said.append), \
+                patch.object(maya, "warn", said.append), patch.object(maya, "say"), \
+                patch.object(maya, "ROOT", root), patch.dict(sys.modules, {"strata_tokenizer": SimpleNamespace(Tokenizer=Tok)}), \
+                patch.object(maya, "bench_chat", return_value=lambda q: q):
+            got = maya.q4x_calibration(p)
+        return got, maya.read_json(p), seen, said
+
+    def test_measured_again_and_left_to_the_engine(self):
+        for line, want in (("maya-hy4: CPU lane: the 4-bit copies kept - x", True),
+                           ("maya-hy4: CPU lane: the 4-bit copies dropped - x", False)):
+            with self.subTest(want=want), tempfile.TemporaryDirectory() as t:
+                got, c, seen, _ = self.run_check(Path(t), line)
+                self.assertIs(got, want)
+                self.assertEqual(seen["env"]["HY4_Q4X"], "2")          # (the engine's own measurement)
+                self.assertEqual(seen["env"]["HY4_Q4X_MEASURE"], "1")  # (again: not the verdict it remembers)
+                self.assertTrue(seen["env"]["HY4_Q4X_FILE"].endswith("hy4-cpu-lane.txt"))
+                self.assertEqual(seen["cmd"][1], "--serve")
+                self.assertNotIn("HY4_Q4X", c.get("env") or {})        # (the engine remembers it, not the config)
+                self.assertEqual(c["installer"]["q4x_calibration"]["result"], "on" if want else "off")
+                self.assertIs(maya.q4x_config_migrate(Path(t) / "maya-hy4-flash-maya-xs.json", c), c)
+
+    def test_nothing_to_decide_or_unfinished(self):
+        with tempfile.TemporaryDirectory() as t:
+            got, c, _, _ = self.run_check(Path(t), "INFO every routed expert in VRAM")
+            self.assertIsNone(got)
+            self.assertNotIn("HY4_Q4X", c.get("env") or {})            # (the engine's default stays)
+            self.assertEqual(c["installer"]["q4x_calibration"]["result"], "n/a")
+        with tempfile.TemporaryDirectory() as t:
+            got, c, _, said = self.run_check(Path(t), "INFO CPU lane: ... 4-bit copies - re-coded")
+            self.assertIsNone(got)
+            self.assertNotIn("HY4_Q4X", c.get("env") or {})
+            self.assertEqual(c["installer"]["q4x_calibration"]["result"], "unmeasured")
+            self.assertTrue(any("did not finish" in s for s in said))
 
 
 if __name__ == "__main__":

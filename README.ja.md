@@ -66,7 +66,7 @@ Maya の量子化はすべて、モデル名のあとに階層 (XS、S、M、L�
 
 **どのモデルがあなたの PC に合う?** 各モデルの推奨メモリ (VRAM と RAM の合計) は [docs/MEMORY.md](docs/MEMORY.md) を見てください。
 
-いずれも NVIDIA の V100 / RTX 20 以降、および AMD と Windows ([必要なもの](#what-you-need)を参照) で動きます。Hy4-Flash は NVIDIA (Linux と Windows) と Linux 上の AMD (Strix Halo / Gorgon Halo、Radeon カード) で動き、画像も読めます (8 GB のカードでは大きな画像を先に縮小します)。DeepSeek のサイズには Engram テーブルが含まれます。セットアップでは、unsloth の GGUF と turboderp および LibertAIDAI の DeepSeek 用 EXL3 量子化、orcarouter の abliterated 版 DeepSeek、Mia-AiLab の MiniMax 用 EXL3 量子化、turboderp の GLM 用 EXL3 量子化、画像対応の Q5_K_M GGUF としての Qwen-3.8-Flash-Next (CYBER-FROST)、そして同じく画像対応の unsloth の UD-IQ2_XS GGUF としての Qwen-3.8-Flash-Next 本体 ([その設定](docs/SETTINGS.md#qwen-38-flash-next-cyber-frost)) も選べます。**各モデルのファイル、ドラフター、画像、オプション: [docs/MODELS.md](docs/MODELS.md)。**
+いずれも NVIDIA の V100 / RTX 20 以降、および AMD と Windows ([必要なもの](#what-you-need)を参照) で動きます。Hy4-Flash は NVIDIA (Linux と Windows) と Linux 上の AMD (Strix Halo / Gorgon Halo、Radeon カード) で動き、動くすべてのカードで画像も読めます (8 GB のカードを含む)。DeepSeek のサイズには Engram テーブルが含まれます。セットアップでは、unsloth の GGUF と turboderp および LibertAIDAI の DeepSeek 用 EXL3 量子化、orcarouter の abliterated 版 DeepSeek、Mia-AiLab の MiniMax 用 EXL3 量子化、turboderp の GLM 用 EXL3 量子化、画像対応の Q5_K_M GGUF としての Qwen-3.8-Flash-Next (CYBER-FROST)、そして同じく画像対応の unsloth の UD-IQ2_XS GGUF としての Qwen-3.8-Flash-Next 本体 ([その設定](docs/SETTINGS.md#qwen-38-flash-next-cyber-frost)) も選べます。**各モデルのファイル、ドラフター、画像、オプション: [docs/MODELS.md](docs/MODELS.md)。**
 
 ## <a name="quality"></a>品質
 
@@ -215,6 +215,7 @@ Maya の量子化は、各モデルの公開された重みから作られ、元
 | マシン | モデル | デコード (回答の書き出し) | プリフィル (プロンプトの読み込み) | 報告者 |
 | --- | --- | ---: | ---: | --- |
 | **3x Tesla V100 32 GB** (各 PCIe 3.0 x16)、2x Xeon Gold 6138、RAM 183 GB | Maya-XS / Maya-S、32K コンテキスト、MTP ドラフト | **88.7 / 84.2 トークン/秒** | 1607 / 1566 トークン/秒 | メンテナー (v1.1.68) |
+| **3x RX 7900 XTX 24 GB** (PCIe 3.0 x8/x16/x8)、i9-10980XE、RAM 188 GB、Linux | Maya-S、32K コンテキスト、3 GPU テンソル並列 | 43.9-48.2 トークン/秒 | 1053 トークン/秒 | @Antero128 (v1.1.68, #1055) |
 
 </details>
 

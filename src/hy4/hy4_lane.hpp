@@ -29,6 +29,8 @@ public:
     void parallel_for(int n, const std::function<void(int)>& f, const std::vector<int>* node_of = nullptr);
     int threads() const;
     int nodes() const;
+    /// every worker asleep - no job for longer than the spin (between answers); false for a lane of no workers
+    bool idle() const;
     /// The NUMA node of the page at p (-1: not known - not resident, or not Linux)
     static int node_of_page(const void* p);
     /// Move the pages of [p, p + bytes) to NUMA node `node` (their page cache's pages too, when only this process maps
@@ -59,11 +61,28 @@ LaneWaits lane_waits();
 
 /// A layer's routed experts in host memory: each role's tensor (the GGUF's stacked [n_exp][rows][row bytes]) and the
 /// layer's format (ds4's IqCpu: the types, the row bytes, the activations' types).
+/// The experts of a layer kept re-coded at 4 bits a weight in RAM (ds4's iq_cpu_q4x_*: the same bits as the file's
+/// IQ2_XXS rows, about twice as fast on the lane): an expert's slot is null until its copy is complete, then points
+/// at its gate | up | down rows of the form - set by one thread, read by cpu_experts at each call.
+struct Q4xSet {
+    explicit Q4xSet(int n_exp) : p(new std::atomic<const uint8_t*>[(size_t) n_exp]) {
+        for (int e = 0; e < n_exp; ++e) p[(size_t) e].store(nullptr, std::memory_order_relaxed);
+    }
+    std::unique_ptr<std::atomic<const uint8_t*>[]> p;
+    std::vector<std::unique_ptr<uint8_t[]>> owned;   // (the copies' memory: kept until the model goes)
+};
+
 struct CpuExperts {
     strata::ds4::gguf::IqCpu f;
     const uint8_t *gate = nullptr, *up = nullptr, *down = nullptr;
     size_t g_stride = 0, d_stride = 0;   // bytes an expert in the gate / up tensors, in the down tensor
     float limit = 0.0f;
+    std::shared_ptr<Q4xSet> q4x;         // (null: no copies for this layer)
+    size_t q4x_gu = 0, q4x_d = 0;        // the form's bytes of an expert's gate (= up) matrix, its down matrix
+    /// whether this layer's experts can be re-coded (both types IQ2_XXS, this CPU running the rows); sets q4x_gu / q4x_d
+    bool q4x_can();
+    /// expert e re-coded into new memory and published (false: q4x_can is not, or no memory)
+    bool q4x_make(int e);
     // (on a host of several NUMA nodes expert e's work goes to node e % nodes' threads, where place_experts moves its
     //  pages: a token's experts read by every socket, each from its own memory)
     bool init(int tg, int td, int n_embd, int n_ff, std::string& err);
@@ -83,6 +102,17 @@ struct LaneProf {
     long long calls = 0, entries = 0;
 };
 LaneProf& lane_prof();
+/// cpu_experts' entries so far, and how many of them ran on 4-bit copies (always counted)
+struct LaneCount {
+    std::atomic<long long> entries{0}, q4x{0};
+    // whether calls use the 4-bit copies: 1 yes, 0 no, 2 a trial - one-token calls in turns with and without them,
+    // each side's time and entries summed (the engine's thread alone writes these: trial_*[1] with the copies)
+    std::atomic<int> q4x_mode{1};
+    long long trial_calls[2] = {0, 0}, trial_entries[2] = {0, 0};
+    double trial_s[2] = {0, 0};
+    unsigned long long trial_tick = 0;
+};
+LaneCount& lane_count();
 
 /// The pages of these experts moved to node e % nodes (their work's node in cpu_experts), the ones there already passed
 /// over; returns early when stop is set.  For a background thread: the model's CPU-lane experts after the load.
@@ -92,11 +122,45 @@ void place_experts(const CpuExperts& ex, const std::vector<int>& experts, int no
 /// a page, or the disk.  ram_available: the RAM the system can still give, file cache included (0: not known).
 void warm_experts(const CpuExperts& ex, const std::vector<int>& experts, const std::atomic<bool>& stop);
 uint64_t ram_available();
+/// the calling thread below the others (a background helper: nice 10 on Linux, below normal on Windows)
+void lower_this_thread();
+/// the calling thread on every CPU the process may run on (Linux: a thread inherits the mask of the thread that
+/// starts it, and the lane's caller is pinned to one core after its first job; elsewhere nothing to do)
+void unpin_this_thread();
 /// the system's RAM (0: not known)
 uint64_t ram_total();
 /// Linux, an AMD GPU at this PCI address: the free bytes of the memory that is the GPU's own (on an APU the BIOS's
 /// share, which the system does not count as RAM) - 0 where the driver does not say
 uint64_t gpu_own_free(int domain, int bus, int dev);
+/// Windows: the dedicated memory DXGI reports for the adapter with this LUID (a device property's luid: an APU's
+/// carve-out; strata/platform/dedicated.hpp) - 0 where unknown, and off Windows
+uint64_t gpu_dedicated(const void* luid);
+/// Windows: what this process can still commit (RAM + page file, with what a page file Windows manages may still
+/// grow by; strata/platform/commit.hpp) - every allocation on an APU's GPU is charged to it; 0 off Windows
+uint64_t commit_available();
+
+/// Whether 4-bit copies make this host's lane faster: up to 64 of ex's experts re-coded (freed after), then lane calls
+/// of 16 of them for one token on each form in turns, the lane's own threads - ms_file / ms_q4x: the fastest call of
+/// each (both forms give the same bits; a lane bound by the CPU's arithmetic gains, one bound by its memory loses -
+/// the copies are twice the bytes).  False: no 4-bit form here.
+bool q4x_probe(Lane& lane, const CpuExperts& ex, int n_expert, double& ms_file, double& ms_q4x);
+
+/// The 4-bit copies' verdict as this PC measured it once (the engine's timed turns), kept in a small text file - a
+/// line a key: this PC (q4x_memo_key: its CPU, threads and RAM, the lane's threads), the model's lane experts (the
+/// caller's words) and the lane kernels' build (lane_kernels_id: changed kernels are measured again).
+struct Q4xMemo {
+    bool found = false, kept = false;
+    double us_with = 0, us_without = 0;   // an expert run with / without the copies, as measured
+    std::string date;                     // YYYY-MM-DD
+};
+/// this PC's key for the model's lane `model` (no tabs or line ends)
+std::string q4x_memo_key(const std::string& model, int lane_threads);
+/// `key`'s verdict in `path` (found false: none, no file, or a line it cannot read)
+Q4xMemo q4x_memo_get(const std::string& path, const std::string& key);
+/// `key`'s verdict written in `path` (its line replaced, the others kept; date: today's); false: not written
+bool q4x_memo_put(const std::string& path, const std::string& key, Q4xMemo m);
+/// the lane kernels' build - a hash of their sources (CMake's HY4_LANE_KERNELS), or "unknown"
+const char* lane_kernels_id();
 
 /// out [T][n_embd] = each token's weighted sum of its entries' experts (rows with no entry: 0), x [T][n_embd]; the
 /// experts' weights read once for up to 8 of their tokens.  Scratch is the lane's own (grown as needed).
