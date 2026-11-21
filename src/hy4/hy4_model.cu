@@ -268,6 +268,8 @@ struct Layer {
     bool fx_on = false;
     unsigned long long* fx_hptr = nullptr;
     uint8_t* fx_mem = nullptr;   // (its RAM copy: n_expert blobs)
+    const uint8_t* fx_file[3] = {nullptr, nullptr, nullptr};   // (the lane's view of the file before it read the copy)
+    size_t fx_step0 = 0;
     int* fx_owner = nullptr;
     float* fx_score = nullptr;
     std::vector<int> fx_slot0;
@@ -4934,10 +4936,11 @@ struct Model::Impl {
     // median turn (Model::load) - and the fastest kept, the lane unless another is 3% faster; the verdict remembered
     // for this PC, its GPUs, the model and its VRAM experts (HY4_FETCH_FILE, else beside the 4-bit copies' verdict:
     // the server's data folder's hy4-gpu-fetch.txt; else beside --profile, else the pack); HY4_FETCH_MEASURE=1
-    // (HY4_Q4X_MEASURE=1 too: maya --speed-calibration) measures again.
-    // The copies take RAM beyond a headroom of max(4 GiB, a tenth of the RAM) (HY4_FETCH_GB: at most), a layer at a
-    // time; a layer whose copy the system does not pin (Windows locks about half the RAM) keeps the CPU lane.  On one
-    // NUMA node the CPU lane reads the copies too (the same bytes), so the file's pages are not needed beside them.
+    // (HY4_Q4X_MEASURE=1 too: maya --speed-calibration) measures again.  A lane verdict gives the copies back at once
+    // (fetch_release): that start goes on as the ones after it.  The copies take RAM beyond a headroom of max(4 GiB,
+    // a tenth of the RAM) (HY4_FETCH_GB: at most), a layer at a time; a layer whose copy the system does not pin
+    // (Windows locks about half the RAM) keeps the CPU lane.  On one NUMA node the CPU lane reads the copies too (the
+    // same bytes), so the file's pages are not needed beside them.
     // gpu and mix compute experts on the GPU that the lane computed: their answers differ from the lane's in the last
     // bits (each one's own are the same from run to run, and with drafts or without).  Not with tensor parallel.
     struct Fetch {
@@ -5114,6 +5117,10 @@ struct Model::Impl {
             ++n_copied;
             l.fx_mem = mem;
             if (fx.lane_store) {   // (the same bytes: the lane's answers unchanged)
+                l.fx_file[0] = l.cex.gate;
+                l.fx_file[1] = l.cex.up;
+                l.fx_file[2] = l.cex.down;
+                l.fx_step0 = l.cex.step;
                 l.cex.gate = mem + l.tr[0];
                 l.cex.up = mem + l.tr[1];
                 l.cex.down = mem + l.tr[2];
@@ -5324,6 +5331,46 @@ struct Model::Impl {
             if (!fetch_put_slots(l, err)) return false;
         }
         fx.dirty = false;
+        return true;
+    }
+    // a first start's lane verdict: the copies given back and the lane on the file's tensors again, as in every start
+    // after it (the verdict found, no copies made) - the RAM theirs (the 4-bit copies, the file's cache), so the
+    // same prompt route and the same tokens.  Not while a placer thread reads the lane's view (HY4_LANE_WARM)
+    bool fetch_release(std::string& err) {
+        if (fx.lane_store && placing.load()) return true;
+        for (Gpu& gp : G) {
+            CK(cudaSetDevice(gp.dev));
+            if (gp.s) CK(cudaStreamSynchronize(gp.s));
+            if (gp.fxst) CK(cudaStreamSynchronize(gp.fxst));
+        }
+        for (Layer& l : L) {
+            if (!l.fx_mem) continue;
+            if (fx.lane_store) {
+                l.cex.gate = l.fx_file[0];
+                l.cex.up = l.fx_file[1];
+                l.cex.down = l.fx_file[2];
+                l.cex.step = l.fx_step0;
+            }
+            l.fx_mem = nullptr;
+            l.fx_on = false;
+        }
+        const double gb = fx.gb;
+        for (size_t i = 0; i < fx.mem.size(); ++i) {
+            if (fx.pinned[i]) cudaHostUnregister(fx.mem[i]);
+            ram_free(fx.mem[i], fx.bytes[i]);
+        }
+        fx.mem.clear();
+        fx.bytes.clear();
+        fx.pinned.clear();
+        fx.gb = 0;
+        fx.layers = 0;
+        fx.want = 0;
+        fx.mode = 0;
+        fx.dirty = false;
+        char buf[160];
+        std::snprintf(buf, sizeof buf, "INFO GPU fetch: its copies (%.1f GB) given back - the CPU lane reads the "
+                      "model's file, as the starts after this one", gb);
+        info.push_back(buf);
         return true;
     }
     void fetch_report() {
@@ -7748,6 +7795,11 @@ bool Model::load(const Options& o, std::string& err) {
             x.hot.quiet = false;
             if (best != 0)
                 x.info.push_back("INFO HY4_HOT: off with the GPU fetch (the fetch's own cache follows the routing)");
+        }
+        if (best == 0 && !x.fetch_release(err)) {   // (the lane: as the starts after - no copies)
+            x.name_fault(err);
+            err = "the GPU fetch's copies: " + err;
+            return false;
         }
         if (best != 1 && x.lane) x.q4x_start();   // (the 4-bit copies, as without the fetch)
         if (x.lane) x.route_start();             // (the prompt route: by the fetch's mode)
