@@ -743,8 +743,19 @@ int serve(hy4::Model& m, const std::vector<int>& eos, int n_draft, float floor0,
         }
         bool ok = true, cancel = false;
         const int C = std::max(1, m.chunk());
+        // (the prompt's last token read alone, on the token path, after the rest: a repeat of this request finds every
+        //  token before it in the caches and reads that one alone too - the same row, the same first logits, so the
+        //  same answer as the first time.  A chunk's last row is the prompt path's - other kernels and, with tensor
+        //  parallel, other sums than a token's - so the two differ in the last bits and a greedy answer can part.
+        //  Default: tensor parallel; HY4_LAST_ALONE=1 on every layout, 0 on none)
+        static const int last_alone = [] {
+            const char* e = std::getenv("HY4_LAST_ALONE");
+            return e && *e ? (std::atoi(e) != 0 ? 1 : 0) : -1;
+        }();
+        const bool alone = r.ids.size() - from > 1 && (last_alone < 0 ? m.tensor_parallel() > 1 : last_alone == 1);
+        const size_t body = alone ? r.ids.size() - 1 : r.ids.size();
         for (size_t a = from; a < r.ids.size();) {
-            const int T = (int) std::min<size_t>((size_t) C, r.ids.size() - a);
+            const int T = (int) std::min<size_t>((size_t) C, (a < body ? body : r.ids.size()) - a);
             const bool last = a + (size_t) T == r.ids.size();
             if (!m.forward(r.ids.data() + a, T, (int64_t) a, last ? 1 : 0, last ? lg.data() : nullptr, err)) {
                 ok = false;

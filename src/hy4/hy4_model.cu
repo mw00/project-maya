@@ -5038,7 +5038,11 @@ struct Model::Impl {
                     static const char* const route = std::getenv("HY4_ROUTE");
                     static const char* const fs = std::getenv("HY4_STREAM");
                     const bool pinned = route && (route[0] == 's' || route[0] == 'l');
-                    if (pinned ? route[0] == 's' : fs ? fs[0] == '1' : est_stream < est_cpu) {
+                    // (tensor parallel - member 0's lane, a chunk shorter than kTpStream: the lane, not the rates -
+                    //  their running averages move with the load, so two runs of one prompt took two routes; the
+                    //  lane is the one they pick for so few rows - a GPU's copy of every expert they use costs more)
+                    const bool by_rates = l.tpm < 0;
+                    if (pinned ? route[0] == 's' : fs ? fs[0] == '1' : by_rates && est_stream < est_cpu) {
                         const double ts = now_s();
                         const double c0 = st.stream_ms;
                         ok = ok && experts_streamed(l, gp, T, err);
@@ -5372,8 +5376,12 @@ struct Model::Impl {
                        gp.s);
         });
         const int r0 = N * head_rows, nr = g.n_vocab - r0;
-        bool ok = mm(hg, out_draft_own, hrow, E, 1, hg.logits, (size_t) nr);
-        k::top1_part(hg.logits, nr, mtp_top, hg.s);
+        // (the head on member 0's GPU: that member's rows are in the same logits buffer, queued on the same stream from
+        //  its own thread in any order with these - the head's own rows go past them, at r0, so neither reads the
+        //  other's: the same draft every run)
+        float* own_lg = hg.logits + (head_member() ? (size_t) r0 : 0);
+        bool ok = mm(hg, out_draft_own, hrow, E, 1, own_lg, (size_t) nr);
+        k::top1_part(own_lg, nr, mtp_top, hg.s);
         float own[4] = {0, 0, 0, 0};
         CK(cudaMemcpyAsync(own, mtp_top, sizeof own, cudaMemcpyDeviceToHost, hg.s));
         CK(cudaStreamSynchronize(hg.s));
@@ -6833,6 +6841,7 @@ int Model::vocab() const { return m->g.n_vocab; }
 int Model::row_top(int r) const { return m->row_top(r); }
 int64_t Model::max_ctx() const { return m->o.max_ctx; }
 int Model::chunk() const { return m->Tc; }
+int Model::tensor_parallel() const { return std::max(1, m->tp); }
 bool Model::draft(int tok, int64_t pos, int n, float floor, std::vector<int>& d, std::vector<float>& c,
                   std::string& err, int base, float sure) {
     return m->df.on ? m->dfly_draft(tok, pos, n, floor, d, c, err) : m->draft(tok, pos, n, floor, d, c, err, base, sure);

@@ -124,6 +124,8 @@ public:
     /// the most tokens a forward reads at once (the prompt path's chunk): a prompt in calls of this many reports its
     /// progress between them
     int chunk() const;
+    /// the GPUs a layer is split over (tensor parallel: 2 or more; 1: the layer split or one GPU)
+    int tensor_parallel() const;
     int eos() const;
     const Stats& stats() const;
     std::vector<std::string> info_lines() const;
