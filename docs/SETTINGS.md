@@ -2812,6 +2812,36 @@ Engine flags: `--max-context N` (262144), `--cache-gb N` (60: the expert cache's
 | `IK2_PROF`, `IK2_STATS` | off | each request's time by phase; where its experts came from (cached, prefetched, copied on a miss, the CPU) |
 | `IK2_TRACE`, `IK2_POP_OUT`, `IK2_FORCE`, `IK2_LOGITS_OUT`, `IK2_MARGIN`, `IK2_VERIFY_CHECK`, `IK2_UP_MS`, `IK2_ALLOC_THREADS` | off | measurement: every layer's picks to a file; the pick counts (for `IK2_WARM`); fixed tokens fed (`--tokens` runs: two builds compared on the same text, and how often each one's pick agrees); every generated token's logits to a file (with `IK2_FORCE`: two builds' logits over the same tokens); the drafter's checks (`--draft`); the CPU lane's estimate of an expert's copy time; threads allocating host memory |
 
+
+### Inkling-2-Small on AMD
+
+`maya-ik2`'s AMD build (`src/ik2/hip`, docs/INKLING2_AMD.md) reads a pack of unsloth's UD-Q2_K_XL on maya-ds4's
+ggml block-type kernels, the layers split over the cards (`--layer-split`, which the server adds), the routed experts
+placed last in VRAM by the expert profile, the rest computed on the CPU lane from RAM or read in place from the SSD,
+with the model's DSpark drafter. `./maya.sh --setup --backend hip --model inkling-2-small` sets it up. Its flags are
+maya-ds4's where the setting is the same, and the CUDA build's `--model`, `--gpus N` and `--chunk` are taken too:
+
+| Flag | Default | What it does |
+| --- | --- | --- |
+| `--pack DIR` / `--model F` | - | the pack (`tools/ik2/pack_gguf.py`), or the set's first shard (its folder's `maya-ik2` pack) |
+| `--max-context N` | 32768 | positions the 8 global layers' caches hold (the setup writes DeepSeek's recommendation, 64K - 256K) |
+| `--reserve-mib N` | 600 | VRAM each GPU keeps free after the load (the setup writes DeepSeek's AMD figure: 3072 on a discrete card) |
+| `--mmap-experts on\|off\|auto` | auto | the experts RAM does not hold read in place from the model's files (maya-ds4's flag) |
+| `--cpu-threads N` | 0 | the CPU lane's threads (0: one a physical core) |
+| `--prefill-chunk N` | 512 | a prompt's tokens a chunk (measured: docs/INKLING2_AMD.md, "The measured values") |
+| `--expert-profile F` / `--profile-readonly` / `--profile-out F` | the pack's `expert-profile.bin` | the most routed experts in VRAM at the load, and this PC's routing written back |
+| `--no-expert-cache` | off | the experts stay where the load put them |
+| `--dspark on\|off\|none`, `--dspark-index DIR`, `--dspark-cum F` | on (the setup writes none until the speed calibration); 0.5 | the DSpark drafter (maya-ds4's values), its Q8_0 index, the floor on the drafts' running probability |
+| `--rewind N` | 4096 | positions a rewind goes back without reading the prompt again |
+| `--parallel N` | 1 | conversations at once, 1 - 8 (maya-ds4's flag and protocol): each its own caches in VRAM, their tokens decoded together; a request alone still drafts (docs/INKLING2_AMD.md, "Several conversations at once") |
+
+Environment (`IK2_HIP_*`, measurement and A/B only - every default is measured or maya-ds4's:
+docs/INKLING2_AMD.md, "Values and their sources"): `IK2_HIP_VRAM_LOG` (free VRAM a GPU at each stage of the load
+and after each request), `IK2_HIP_PHASES` / `_TIMELINE` / `_PROF` / `_ROUND_LOG` (where a step's time goes, a line a
+drafting round), `IK2_HIP_RAM_MARGIN_GB` (8: the RAM left to the rest, maya-ds4's), `IK2_HIP_CACHE_DECAY` /
+`_MARGIN` / `_BONUS` (the expert cache's rule, maya-ds4's), and the swept values' overrides (`IK2_HIP_STAGE`,
+`_TS_MAX`, `_S_FLOOR_MI`, `_WARM_TOKENS`, `_SWAP_*`, `_BURST_*`, `_DRAFT_*`, `_LANE_SPIN_US`).
+
 ## GLM-5.3 (744B)
 
 GLM-5.3 ([the model's page](GLM53.md)) runs on the same engine as GLM-5.3-Flash, so the GLM settings above apply to it
