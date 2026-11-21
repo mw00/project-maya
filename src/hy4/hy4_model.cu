@@ -4929,11 +4929,12 @@ struct Model::Impl {
     //  - mix K: the VRAM experts (as loaded) and each token's first K others a layer on the GPU, the rest on the CPU
     //    lane beside them, as before
     //  - lane: the CPU lane alone, as without the fetch (no copy in RAM)
-    // auto: the three measured at the first start - a short greedy decode from the BOS each (lane, gpu, then mix at
-    // the K the measured rates of the lane and the copies suggest) - and the fastest kept, the lane unless another is
-    // 3% faster; the verdict remembered for this PC, its GPUs, the model and its VRAM experts (HY4_FETCH_FILE, else
-    // beside the 4-bit copies' verdict: the server's data folder's hy4-gpu-fetch.txt; else beside --profile, else
-    // the pack); HY4_FETCH_MEASURE=1 (HY4_Q4X_MEASURE=1 too: maya --speed-calibration) measures again.
+    // auto: the three measured at the first start - the same short decode (a greedy one from the BOS, made and warmed
+    // first) in rounds of a turn each, mix at the K the measured rates of the lane and the copies suggest, each one's
+    // median turn (Model::load) - and the fastest kept, the lane unless another is 3% faster; the verdict remembered
+    // for this PC, its GPUs, the model and its VRAM experts (HY4_FETCH_FILE, else beside the 4-bit copies' verdict:
+    // the server's data folder's hy4-gpu-fetch.txt; else beside --profile, else the pack); HY4_FETCH_MEASURE=1
+    // (HY4_Q4X_MEASURE=1 too: maya --speed-calibration) measures again.
     // The copies take RAM beyond a headroom of max(4 GiB, a tenth of the RAM) (HY4_FETCH_GB: at most), a layer at a
     // time; a layer whose copy the system does not pin (Windows locks about half the RAM) keeps the CPU lane.  On one
     // NUMA node the CPU lane reads the copies too (the same bytes), so the file's pages are not needed beside them.
@@ -7565,10 +7566,17 @@ Model::~Model() {
 // the MTP cache empty, the counts as they were
 bool Model::load(const Options& o, std::string& err) {
     if (!m->load(o, err)) return false;
-    // the GPU fetch's auto (Impl::Fetch): the lane, gpu and mix each timed over a short greedy decode from the BOS,
-    // the fastest kept (the lane unless another is 3% faster) and remembered; then the state as loaded.  The lane as
-    // it runs: with HY4_HOT where it is on (its swaps every few tokens, and the round a request ends with - idle() -
-    // after the warm tokens), its slots and scores put back after
+    // the GPU fetch's auto (Impl::Fetch): the lane, gpu and mix timed on the same short decode, the fastest kept (the
+    // lane unless another is 3% faster) and remembered; then the state as loaded.  First the decode's tokens: a greedy
+    // one from the BOS on the lane, untimed - it pays what only a PC's first decode of them pays (the Engram rows they
+    // look up read from the disk, ~10 ms a token from an NVMe; the lane's first touches) - paid before by each
+    // mode's own first decode, the lane's the most (an 8 GB card: the lane 31% slower than warm, mix 17%, so mix won
+    // the trial by 5% and lost the real decode by as much).  Then rounds (HY4_FETCH_ROUNDS, 3) of a turn a mode - the
+    // same tokens fed from the start at the placement as loaded, HY4_FETCH_WARM (4) untimed, then its share of
+    // HY4_FETCH_TOKENS (32) timed - their order turned each round (no mode always first, nor always after the same
+    // one), each mode's median of its rounds kept.  The lane as it runs: with HY4_HOT where it is on (its swaps every
+    // few tokens, and the round a request ends with - idle() - after the warm tokens), its slots and scores put back
+    // after each turn, as the GPU fetch's after each of gpu's
     auto measure = [&]() -> bool {
         Impl& x = *m;
         if (!x.fetch_pending()) return true;
@@ -7577,62 +7585,121 @@ bool Model::load(const Options& o, std::string& err) {
         };
         const double t0 = clk();
         const Stats keep = x.st;
+        std::vector<uint32_t> keep_cnt;   // (the trial's routes not counted: the profile and the 4-bit copies' order)
+        {
+            std::lock_guard<std::mutex> lk(x.cnt_mu);
+            keep_cnt = x.prof_cnt;
+        }
         const int V = x.g.n_vocab, bos = x.g.bos >= 0 && x.g.bos < V ? x.g.bos : 0;
         auto envi = [](const char* k, int d) {
             const char* v = std::getenv(k);
             return v && *v ? std::max(1, std::atoi(v)) : d;
         };
-        const int n_warm = envi("HY4_FETCH_WARM", 8), n_time = envi("HY4_FETCH_TOKENS", 32);
+        const int n_warm = envi("HY4_FETCH_WARM", 4), n_time = envi("HY4_FETCH_TOKENS", 32);
+        const int rounds = envi("HY4_FETCH_ROUNDS", 3), n_round = (n_time + rounds - 1) / rounds;
+        const int n_seq = n_warm + n_round;
         std::vector<float> lg((size_t) V);
-        x.hot.quiet = true;
-        auto decode = [&](int mode, int k, double& ms) -> bool {
-            x.fx.mode = mode;
-            x.fx.k = k;
+        std::vector<int> seq((size_t) n_seq, bos);
+        auto restart = [&] {
             x.tokens.clear();
             x.end = 0;
             x.mtp_done = 0;
-            int id = bos;
+        };
+        x.hot.on = false;
+        x.hot.quiet = true;
+        x.fx.mode = 0;
+        x.fx.k = 0;
+        restart();
+        bool ok = true;
+        for (int i = 0; ok && i < n_seq; ++i) {   // (the tokens: on the lane, the placement as loaded)
+            ok = forward(&seq[(size_t) i], 1, i, 1, lg.data(), err);
+            if (ok && i + 1 < n_seq) seq[(size_t) i + 1] = (int) (std::max_element(lg.begin(), lg.end()) - lg.begin());
+        }
+        auto turn = [&](int mode, int k, double& ms) -> bool {
+            x.fx.mode = mode;
+            x.fx.k = k;
+            restart();
             double ts = 0.0;
-            for (int i = 0; i < n_warm + n_time; ++i) {
+            for (int i = 0; i < n_seq; ++i) {
                 if (i == n_warm) {
                     if (x.hot.on && !x.hot_rebalance(4 * x.hot.max_swaps, err)) return false;
                     ts = clk();
                 }
-                if (!forward(&id, 1, i, 1, lg.data(), err)) return false;
-                id = (int) (std::max_element(lg.begin(), lg.end()) - lg.begin());
+                if (!forward(&seq[(size_t) i], 1, i, 1, lg.data(), err)) return false;
             }
-            ms = (clk() - ts) * 1e3 / n_time;
+            ms = (clk() - ts) * 1e3 / n_round;
             return true;
         };
-        const double cms0 = x.st.cpu_ms;
-        const int64_t ce0 = x.st.cpu_experts;
         const bool hot = x.hot.want;
         const Impl::HotMark hk = hot ? x.hot_mark() : Impl::HotMark{};
-        x.hot.on = hot;
-        x.hot.quiet = !hot;
-        bool ok = decode(0, 0, x.fx.ms[0]);
-        const int64_t hot_swaps = x.hot.swaps;
-        x.hot.on = false;
-        x.hot.quiet = true;
-        if (ok && hot) ok = x.hot_back(hk, err);
-        const double c_ms = (x.st.cpu_experts > ce0) ? (x.st.cpu_ms - cms0) / (double) (x.st.cpu_experts - ce0) : 0.0;
-        const double miss = (double) (x.st.cpu_experts - ce0) / ((double) (n_warm + n_time) * std::max(1, x.fx.layers));
-        ok = ok && decode(1, 0, x.fx.ms[1]);
-        ok = ok && x.fetch_restore(err);
+        double c_ms = 0.0, miss = 0.0;
+        int64_t hot_swaps = 0;
+        int kmix = 0;
+        auto lane_turn = [&](double& ms) -> bool {
+            const double cms0 = x.st.cpu_ms;
+            const int64_t ce0 = x.st.cpu_experts;
+            x.hot.on = hot;
+            x.hot.quiet = !hot;
+            bool okl = turn(0, 0, ms);
+            hot_swaps += x.hot.swaps;
+            x.hot.on = false;
+            x.hot.quiet = true;
+            if (okl && hot) okl = x.hot_back(hk, err);
+            if (c_ms == 0.0 && x.st.cpu_experts > ce0) {   // (the first turn's: mix's K)
+                c_ms = (x.st.cpu_ms - cms0) / (double) (x.st.cpu_experts - ce0);
+                miss = (double) (x.st.cpu_experts - ce0) / ((double) n_seq * std::max(1, x.fx.layers));
+            }
+            return okl;
+        };
         // mix: each token's first K misses a layer on the GPU, K where the two lanes finish together by the rates
         size_t blob = 0;
         for (const Layer& l : x.L)
             if (l.fx_on) blob = std::max(blob, l.blob);
         const double p_ms = x.fx.gbs > 0 ? (double) blob / 1e6 / x.fx.gbs : 0.0;
-        int kmix = c_ms > 0 && p_ms > 0 ? (int) std::lround(miss * c_ms / (c_ms + p_ms)) : 0;
-        if (kmix >= (int) std::ceil(miss)) kmix = (int) std::ceil(miss) - 1;
-        x.fx.ms[2] = 0.0;
-        if (ok && kmix >= 1) ok = decode(2, kmix, x.fx.ms[2]);
+        std::vector<double> tm[3];
+        static const int order[3][3] = {{0, 1, 2}, {1, 2, 0}, {2, 0, 1}};   // (the lane first once: K from its turn)
+        for (int r = 0; ok && r < rounds; ++r)
+            for (int j = 0; ok && j < 3; ++j) {
+                const int mode = order[r % 3][j];
+                double ms = 0.0;
+                if (mode == 0) {
+                    ok = lane_turn(ms);
+                    if (ok && r == 0) {
+                        kmix = c_ms > 0 && p_ms > 0 ? (int) std::lround(miss * c_ms / (c_ms + p_ms)) : 0;
+                        if (kmix >= (int) std::ceil(miss)) kmix = (int) std::ceil(miss) - 1;
+                    }
+                } else if (mode == 1) {
+                    ok = turn(1, 0, ms) && x.fetch_restore(err);
+                } else {
+                    if (kmix < 1) continue;
+                    ok = turn(2, kmix, ms);
+                }
+                if (ok) tm[mode].push_back(ms);
+            }
+        std::string per[3];
+        for (int c = 0; c < 3; ++c) {
+            std::vector<double> v = tm[c];
+            std::sort(v.begin(), v.end());
+            const size_t n = v.size();
+            x.fx.ms[c] = n == 0 ? 0.0 : n % 2 ? v[n / 2] : 0.5 * (v[n / 2 - 1] + v[n / 2]);
+            for (size_t i = 0; i < tm[c].size(); ++i) {
+                char b[16];
+                std::snprintf(b, sizeof b, "%s%.1f", i ? " " : "", tm[c][i]);
+                per[c] += b;
+            }
+        }
         x.hot.quiet = false;
-        x.tokens.clear();
-        x.end = 0;
-        x.mtp_done = 0;
+        restart();
         x.st = keep;
+        {
+            std::lock_guard<std::mutex> lk(x.cnt_mu);
+            x.prof_cnt = keep_cnt;
+        }
+        for (Gpu& gp : x.G)   // (the fetch's counts: the run's own, as in a start that found the verdict)
+            if (ok && gp.fxs.stats) {
+                CK(cudaSetDevice(gp.dev));
+                CK(cudaMemset(gp.fxs.stats, 0, sizeof(unsigned long long) * 16));
+            }
         if (!ok) {
             x.name_fault(err);
             err = "the GPU fetch's measurement: " + err;
@@ -7664,13 +7731,16 @@ bool Model::load(const Options& o, std::string& err) {
                 kept = std::rename(tmp.c_str(), f.c_str()) == 0;
                 return kept;
             });
-        char buf[480];
-        std::snprintf(buf, sizeof buf, "INFO GPU fetch: %s%s - measured on this PC in %.1f s (a token: %.1f ms on the CPU "
-                      "lane%s, %.1f with every expert on the GPU, %.1f with %d a layer on it; the lane's %.0f us an expert, "
-                      "%.1f a token a layer); %s %s", Impl::fetch_name(best),
-                      best == 2 ? (" " + std::to_string(kmix)).c_str() : "", clk() - t0, x.fx.ms[0],
-                      hot ? (" with HY4_HOT, " + std::to_string(hot_swaps) + " swaps").c_str() : "", x.fx.ms[1],
-                      x.fx.ms[2], kmix, c_ms * 1e3, miss, kept ? "remembered in" : "not remembered:", x.fx.file.c_str());
+        const int n_lane = std::max(1, (int) tm[0].size());
+        char buf[640];
+        std::snprintf(buf, sizeof buf, "INFO GPU fetch: %s%s - measured on this PC in %.1f s (a token, the median of "
+                      "%d rounds of %d: %.1f ms on the CPU lane%s [%s], %.1f with every expert on the GPU [%s], %.1f "
+                      "with %d a layer on it [%s]; the lane's %.0f us an expert, %.1f a token a layer); %s %s",
+                      Impl::fetch_name(best), best == 2 ? (" " + std::to_string(kmix)).c_str() : "", clk() - t0, rounds,
+                      n_round, x.fx.ms[0],
+                      hot ? (" with HY4_HOT, " + std::to_string(hot_swaps / n_lane) + " swaps a turn").c_str() : "",
+                      per[0].c_str(), x.fx.ms[1], per[1].c_str(), x.fx.ms[2], kmix, per[2].c_str(), c_ms * 1e3, miss,
+                      kept ? "remembered in" : "not remembered:", x.fx.file.c_str());
         x.info.push_back(buf);
         if (hot) {   // (as the starts after: on with the lane, off with the fetch)
             x.hot.want = false;
