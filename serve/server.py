@@ -2239,6 +2239,36 @@ def gpu_free_bytes(gpu: int) -> int | None:
         return None
 
 
+def amd_gpu_free_bytes(gpu: int, sysfs: str | None = None, meminfo: str = "/proc/meminfo") -> int | None:
+    """The free memory of AMD GPU `gpu` (HIP's numbering, Linux) now: its VRAM's, as the amdgpu driver says
+    (mem_info_vram_total / _used); on an APU whose memory is the RAM (a carve-out under 8 GiB beside a GTT larger than
+    it: Strix / Gorgon Halo) what MemAvailable leaves beyond the max(8 GiB, 10% of the RAM) the engines keep free.
+    None when it does not read."""
+    from serve import telemetry   # (its KFD -> render node numbering, as the Monitor reads the cards)
+
+    def num(path):
+        try:
+            with open(path, encoding="utf-8") as f:
+                return int(f.read().strip())
+        except (OSError, ValueError):
+            return None
+    dev = telemetry.amd_device_dir(gpu, sysfs)
+    if not dev:
+        return None
+    total, used = num(os.path.join(dev, "mem_info_vram_total")), num(os.path.join(dev, "mem_info_vram_used"))
+    gtt = num(os.path.join(dev, "mem_info_gtt_total"))
+    if total is not None and total < (8 << 30) and gtt is not None and gtt > total:
+        try:
+            with open(meminfo, encoding="utf-8") as f:
+                kb = {k: int(v.split()[0]) for k, v in (line.split(":", 1) for line in f if ":" in line)
+                      if k in ("MemTotal", "MemAvailable")}
+            margin = max(8 << 30, kb["MemTotal"] * 1024 // 10)
+            return max(0, kb["MemAvailable"] * 1024 - margin)
+        except (OSError, ValueError, KeyError):
+            return None
+    return total - used if total is not None and used is not None else None
+
+
 def vision_footprint(vcfg: dict, env: dict, cache_file: Path, gpu: int) -> tuple[int, int] | None:
     """(image token cap, bytes) for the on-demand vision encoder on THIS machine's first GPU: measured once by
     `maya-vision --measure` (before the model loads, so the GPU is otherwise idle) and cached per encoder file, cap
@@ -7801,10 +7831,11 @@ def main() -> int:
                 # a picture arrives - on the GPU when its free memory then holds what the encoder measured, else on
                 # the CPU - and ends once the request's pictures are read
                 need, gi = fp[1], (gpu_list(cfg) or [0])[0]
+                free_of = amd_gpu_free_bytes if cfg.get("backend") == "hip" else gpu_free_bytes   # (AMD: sysfs)
                 vision = Vision(vcfg, log=vlog, env=venv, start=False)
-                vision.room = lambda: (gpu_free_bytes(gi) or 0) >= need
+                vision.room = lambda: (free_of(gi) or 0) >= need
                 vision.cpu_threads = max(1, (os.cpu_count() or 2) // 2)
-                free = gpu_free_bytes(gi)
+                free = free_of(gi)
                 print(f"[maya] images: the vision encoder starts when a picture arrives - on GPU {gi} while "
                       f"{need / 2**30:.2f} GB of it is free ({(free or 0) / 2**30:.2f} GB now), else on the CPU; "
                       "no VRAM kept for it", flush=True)

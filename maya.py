@@ -11183,6 +11183,7 @@ def write_config_ik2(a, pc: dict, meta: dict, gguf: Path, tok: Path, ctx: int, m
     inst = {"family": "ik2", "quant": Q.OTHERS[("ik2", Q.IK2_QUANT)], "ik2_quant": Q.IK2_QUANT}
     sampling, effort = Q.model_defaults({"installer": inst})   # (the model's own, every setup)
     cfg = {"exe": str(IK2_EXE), "args": args, "cwd": str(ROOT), "tokenizer": str(tok), "model_name": IK2_MODEL_NAME,
+           **({"backend": "hip"} if pc.get("backend") == "hip" else {}),
            "gpu": [g["index"] for g in pc["gpus"]], "sampling": sampling, "reasoning_effort": effort,
            "lib_dirs": meta.get("lib_dirs") or old.get("lib_dirs") or [], "port": port,
            **({"vision": vision} if vision else {})}
@@ -11209,7 +11210,8 @@ def write_config_ik2(a, pc: dict, meta: dict, gguf: Path, tok: Path, ctx: int, m
 
 def set_up_ik2(a, prev: dict) -> Path | None:
     """Inkling-2-Mini's steps 1-8 (an experimental preview): the PC (refused in one line where the preview does not
-    run: AMD, a Mac, Windows, two GPUs or more asked for, a card older than RTX 30 / A100 or under 24 GB), the context
+    run: a Mac, Windows, two GPUs or more asked for, a card older than RTX 30 / A100 or under 24 GB, an AMD GPU older
+    than RDNA 3 or with less memory - an APU counts the RAM it shares, less what is kept free), the context
     (the largest that keeps every expert in VRAM on this card), the engine (build/maya-ik2), the files (pinned,
     sha256-checked), the tokenizer with the model's own template, the pictures (its mmproj and maya-vision), the
     config."""
@@ -11219,9 +11221,21 @@ def set_up_ik2(a, prev: dict) -> Path | None:
     a.gpus_before = prev.get("gpu")                    # (the GPU question's default: this config's GPU)
     pc = check_pc(a, "ik2")                            # 1
     vram = float(pc["gpus"][0].get("vram_gb") or 0)
+    amd = pc.get("backend") == "hip"
+    if amd:   # (AMD, Linux: RDNA 3 / 3.5 / 4 with every expert in memory; an APU's is the RAM, less what is kept free)
+        g = dict(pc["gpus"][0])
+        if hip_unified_memory(g):
+            ram = mem_gb()[0]
+            g.update(unified_memory=True, memory_gb=apu_memory(vram, ram, not WIN) - apu_margin_gb(ram))
+            vram = g["memory_gb"]
+        why = IK2F.unsupported("hip", WIN, len(pc["gpus"]), [g])
+        if why:
+            fail(why)
     step(2, "your choices")                            # 2
     warn(f"{IK2_SHOWN} is an experimental preview: run by its contributor on RTX 3090 cards (Linux), not yet by "
-         "Maya's team on every card - tell us how it goes in an issue")
+         "Maya's team on every card - tell us how it goes in an issue" if not amd else
+         f"{IK2_SHOWN} on AMD is an experimental preview: run by Maya's team on a Radeon 8065S (Gorgon Halo, "
+         "Linux), not yet on Radeon RX 7000 / 9000 cards - tell us how it goes in an issue")
     m = ik2_entry()
     ok(f"model: {Q.shown('ik2', Q.IK2_QUANT, m['download_gb'])} - thinkingmachines' Inkling-2-Mini in unsloth's GGUF "
        "(Apache 2.0)")
@@ -11242,7 +11256,8 @@ def set_up_ik2(a, prev: dict) -> Path | None:
     meta = build_step(a, pc, llama, "maya-ik2")        # 4
     if not IK2_EXE.exists():
         fail(f"the engine was not built ({IK2_EXE})", "the reason is in the build's messages above (maya-ik2 needs "
-             "an RTX 30 / A100 or newer card in the build's GPU list)")
+             + ("an RDNA 3 / 3.5 / 4 GPU in the build's list, on Linux)" if amd else
+                "an RTX 30 / A100 or newer card in the build's GPU list)"))
     gguf = ik2_model_step(a, d, models)               # 5
     if gguf is None:
         return None

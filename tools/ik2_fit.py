@@ -19,6 +19,7 @@ CONTEXTS = [32768, 65536, 131072, 262144]           # the setup's choices (the e
 DEFAULT_KV = "fp8"
 MIN_VRAM_GB = 22.0                                  # the engine's own floor (check_preview: 22 GiB - a "24 GB" card)
 MIN_CC = 80                                         # the engine's kernels: mma.sync m16n8k16, cp.async (Ampere on)
+AMD_ARCHS = ("gfx11", "gfx12")                      # AMD: RDNA 3 / 3.5 / 4 - the matrix-core prompt kernels (HIP)
 
 
 def need_gib(ctx: int, kv: str = DEFAULT_KV) -> float:
@@ -41,14 +42,39 @@ def recommended_context(vram_gb: float, kv: str = DEFAULT_KV) -> int:
     return max(fits) if fits else CONTEXTS[0]
 
 
+def amd_unsupported(cards: list) -> str | None:
+    """The AMD half of unsupported(): maya-ik2's HIP build (Linux) runs on RDNA 3 / 3.5 / 4 (gfx11 / gfx12: its prompt
+    kernels are the matrix cores') with every expert in memory - 24 GB of VRAM, or an APU whose memory is the RAM
+    ("unified_memory": its "memory_gb", what the engine may take of it).  cards: {"arch": "gfx1151", "vram_gb", ...}."""
+    if not cards:
+        return None
+    rdna = [g for g in cards if str(g.get("arch") or "").startswith(AMD_ARCHS)]
+    if not rdna:
+        return ("Inkling 2 Mini on AMD needs a Radeon RX 7000 / 9000, a Radeon PRO W7000 / AI PRO R9700 or a Ryzen AI "
+                "Max (Strix / Gorgon Halo) GPU - RDNA 3, 3.5 or 4 (gfx11 / gfx12); older AMD GPUs are not supported "
+                "by its engine")
+    room = max(float(g.get("memory_gb") if g.get("unified_memory") else g.get("vram_gb") or 0) for g in rdna)
+    if room < MIN_VRAM_GB:
+        return ("Inkling 2 Mini needs one AMD GPU with 24 GB of VRAM or more, or a Ryzen AI Max APU with that much "
+                "memory free for it (its whole model sits in the GPU's memory)")
+    return None
+
+
 def unsupported(backend: str, windows: bool, gpus_asked: int, cards: list) -> str | None:
     """Why this PC cannot run the preview, in one plain line, or None (said before anything is built or downloaded;
     the engine's own check_preview says the same at its start).  backend: cuda / hip / metal; gpus_asked: how many GPUs
-    --gpu / --gpus named (0: none named); cards: the NVIDIA GPUs the model would pick from ({"arch", "vram_gb"},
-    nvidia-smi's) - empty when they are not read yet."""
-    if backend in ("hip", "metal"):
-        return ("Inkling 2 Mini is an experimental preview that runs on NVIDIA GPUs only for now (no AMD or Mac "
+    --gpu / --gpus named (0: none named); cards: the GPUs the model would pick from (NVIDIA: {"arch", "vram_gb"},
+    nvidia-smi's; AMD: amd_unsupported's) - empty when they are not read yet."""
+    if backend == "metal":
+        return ("Inkling 2 Mini is an experimental preview that runs on NVIDIA and AMD GPUs only for now (no Mac "
                 "engine yet)")
+    if backend == "hip":
+        if windows:
+            return ("Inkling 2 Mini on AMD runs on Linux only for now (its engine is not built for AMD on Windows "
+                    "yet)")
+        if gpus_asked > 1:
+            return "Inkling 2 Mini is an experimental preview that runs on one GPU only for now: pick one (--gpu N)"
+        return amd_unsupported(cards)
     if windows:
         return "Inkling 2 Mini is an experimental preview that runs on Linux only for now (not on Windows yet)"
     if gpus_asked > 1:

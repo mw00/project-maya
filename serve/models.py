@@ -166,10 +166,20 @@ def pack_of(cfg: dict) -> Path | None:
 
 
 def ik2_vram_gb(cfg: dict) -> float:
-    """The VRAM of the card an Inkling 2 config runs on (its first "gpu"), as the setup reads it; 0 when not known."""
+    """The VRAM of the card an Inkling 2 config runs on (its first "gpu"), as the setup reads it; 0 when not known.
+    (AMD: a Ryzen AI Max APU's memory is the RAM - the larger figure, less the max(8 GB, 10%) kept free, as the
+    setup counts it.)"""
     ids = gpus_of(cfg) or [0]
-    card = next((g for g in machine_gpus("cuda") if g.get("index") == ids[0]), None)
-    return float((card or {}).get("vram_gb") or 0)
+    hip = cfg.get("backend") == "hip"
+    card = next((g for g in machine_gpus("hip" if hip else "cuda") if g.get("index") == ids[0]), None)
+    vram = float((card or {}).get("vram_gb") or 0)
+    if hip and card and card.get("arch") == "gfx1151" and hasattr(os, "sysconf"):
+        try:
+            ram = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") / 1e9
+        except (ValueError, OSError):
+            return vram
+        vram = max(vram, ram) - max(8.0, 0.1 * ram)
+    return vram
 
 
 # ------------------------------------------------------------------ the context a model was trained for

@@ -37,6 +37,10 @@ def card(gib, index=0, arch="86", name="NVIDIA GeForce RTX 3090"):
     return {"index": index, "name": name, "arch": arch, "vram_gb": float(gib), "driver": "580.0"}
 
 
+def amd(arch, gib, index=0, **kw):
+    return {"index": index, "name": "AMD Radeon", "arch": arch, "vram_gb": float(gib), **kw}
+
+
 def refusal(fn):
     """The line a fail() printed, and that it stopped (SystemExit)."""
     out = io.StringIO()
@@ -126,8 +130,12 @@ class Refusals(unittest.TestCase):
     def test_the_lines(self):
         ok = [card(24)]
         cases = [
-            ("hip", False, 0, ok, "NVIDIA GPUs only"),
-            ("metal", False, 0, [], "NVIDIA GPUs only"),
+            ("metal", False, 0, [], "NVIDIA and AMD GPUs only"),
+            ("hip", True, 0, [], "Linux only"),
+            ("hip", False, 2, [], "one GPU only"),
+            ("hip", False, 0, [amd("gfx1030", 16)], "RDNA 3, 3.5 or 4"),
+            ("hip", False, 0, [amd("gfx1201", 16)], "24 GB of VRAM or more"),
+            ("hip", False, 0, [amd("gfx1151", 0.5, unified_memory=True, memory_gb=20)], "24 GB of VRAM or more"),
             ("cuda", True, 0, ok, "Linux only"),
             ("cuda", False, 2, ok, "one GPU only"),
             ("cuda", False, 0, [card(32, arch="70", name="Tesla V100")], "RTX 30 / A100 or newer"),
@@ -140,9 +148,13 @@ class Refusals(unittest.TestCase):
             self.assertNotIn("\n", why)
         for cards in (ok, [card(23.99, arch="89")], [card(80, arch="90")], [card(12, arch="86"), card(24, 1)], []):
             self.assertIsNone(F.unsupported("cuda", False, 1, cards))
+        # (AMD on Linux: RDNA 3 / 3.5 / 4 with 24 GB, or an APU whose shared memory leaves that much)
+        for cards in ([amd("gfx1100", 24)], [amd("gfx1201", 32)], [amd("gfx1030", 16), amd("gfx1100", 24, 1)],
+                      [amd("gfx1151", 0.5, unified_memory=True, memory_gb=168)], []):
+            self.assertIsNone(F.unsupported("hip", False, 1, cards))
 
     def test_check_pc_refuses_first(self):
-        for a, part in ((args(backend="hip"), "NVIDIA GPUs only"), (args(gpus="0,1"), "one GPU only")):
+        for a, part in ((args(gpus="0,1"), "one GPU only"),):
             with patch.object(maya.S, "gpus", side_effect=AssertionError("no GPU read before the refusal")), \
                     patch.object(maya, "WIN", False):
                 out = refusal(lambda: maya.check_pc(a, "ik2"))

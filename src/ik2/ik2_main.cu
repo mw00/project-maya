@@ -2230,7 +2230,11 @@ void fast_token_launches(Model& M, Work& W, OutMode out_mode) {
         int* rtop = W.route_d;
         float* rw = (float*) (W.route_d + c.K);
         // (NVFP4 experts go through the tensor cores, their input as two FP16 limbs the router's launch writes)
+#ifdef STRATA_USE_HIP   // (AMD: the scalar kernels read the blocks faster than the mma's layouts on the shuffles)
+        static const int exp_mma = getenv("IK2_EXPERT_MMA") ? atoi(getenv("IK2_EXPERT_MMA")) : 0;
+#else
         static const int exp_mma = getenv("IK2_EXPERT_MMA") ? atoi(getenv("IK2_EXPERT_MMA")) : 1;
+#endif
         const bool exp_tc = exp_mma && k::experts_mma_fits(Ly.ty[0], Ly.ty[1], Ly.ty[2], C, c.F);
         k::route_token(W.rlog, Ly.probs_b, c.E, c.K, c.route_scale, Ly.tab_blob, Ly.tab_sc[0], Ly.tab_sc[1],
                        Ly.tab_sc[2], rtop, rw, W.blob, W.tok, W.inv, W.sg, W.su, W.wt, g_s, W.xq, C,
@@ -3954,6 +3958,26 @@ int main(int argc, char** argv) {
         }
         size_t fr0 = 0, tot0 = 0;
         CU(cudaMemGetInfo(&fr0, &tot0));
+#ifdef STRATA_USE_HIP
+        {   // (an AMD APU whose memory is the RAM - Strix / Gorgon Halo on Linux: HIP's free figure is the GTT's, which
+            //  can exceed what the RAM has left; the engines keep max(8 GiB, 10% of the RAM) free for the system)
+            cudaDeviceProp p{};
+            CU(cudaGetDeviceProperties(&p, 0));
+            FILE* mi = p.integrated ? std::fopen("/proc/meminfo", "r") : nullptr;
+            if (mi) {
+                char line[256];
+                unsigned long long tot_kb = 0, av_kb = 0;
+                while (std::fgets(line, sizeof line, mi)) {
+                    std::sscanf(line, "MemTotal: %llu kB", &tot_kb);
+                    std::sscanf(line, "MemAvailable: %llu kB", &av_kb);
+                }
+                std::fclose(mi);
+                const size_t margin = std::max<size_t>((size_t) 8 << 30, (size_t) (tot_kb * 1024 / 10));
+                const size_t room = av_kb * 1024 > margin ? (size_t) (av_kb * 1024 - margin) : 0;
+                if (av_kb && room < fr0) fr0 = room;
+            }
+        }
+#endif
         const size_t reserve = (size_t) 3 << 29;   // (the work buffers and a quarter of a GiB of room: 1.5 GiB)
         const bool fits = exp_b + dense_b + kv_b + reserve <= fr0 && exp_b <= (size_t) (cache_gb * 1073741824.0);
         if (fits && !getenv("IK2_DENSE")) g_dense_q8 = true;
