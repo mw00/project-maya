@@ -1133,6 +1133,185 @@ void test_attn_f16() {
     for (float* p : {dq, dr, ds, dp, scratch, out, one}) cudaFree(p);
 }
 
+// The resident token path's kernels: the planar Q8 product (with a short conv on some rows, with rows that take
+// another input) and the FP16 one against a double reference; the launches that stand for several - rms_multi,
+// attn_res_jobs, moe_combine_conv, the sinks in the clips' launch - against the ones they replace, to the bit; a
+// looped layer's message gate, a token's kernels and a chunk's, against a double reference.
+void test_token_path() {
+    const int C = 2304;
+    {   // mv_q8p and mv_q8p_conv
+        const int N = 300, K = C, nb = K / 32;
+        std::vector<int8_t> q((size_t) N * K);
+        for (auto& v : q) v = (int8_t) ((int) (rng() % 255) - 127);
+        std::vector<uint16_t> d((size_t) N * nb);
+        for (auto& v : d) v = f2h_host(0.001f + 0.01f * std::fabs(frand()));
+        auto x = fvec(K, 2.0f), xa = fvec(K, 2.0f), xb = fvec(K, 2.0f);
+        int8_t* dq = dev(q);
+        uint16_t* dd = dev(d);
+        float *dx = dev(x), *dxa = dev(xa), *dxb = dev(xb), *dy = dev_n<float>(N);
+        auto dot = [&](int row, const std::vector<float>& in) {
+            double a = 0;
+            for (int b = 0; b < nb; ++b) {
+                double sb = 0;
+                for (int j = 0; j < 32; ++j) sb += (double) q[(size_t) row * K + b * 32 + j] * in[b * 32 + j];
+                a += (double) h2f_host(d[(size_t) row * nb + b]) * sb;
+            }
+            return a;
+        };
+        k::mv_q8p(dq, dd, N, K, dx, dy, 0);
+        std::vector<double> want(N);
+        for (int r = 0; r < N; ++r) want[r] = dot(r, x);
+        expect("mv_q8p", host(dy, N), want, 2e-4, 1e-3);
+        // rows 40..99 through a conv with dynamic taps and a residual, rows 200..259 through a plain one; rows
+        // 100..149 take xa, 150..199 xb
+        const int n0 = 60, n1 = 60, heads = 4;
+        auto h0 = fvec(3 * n0), w0 = fvec(4 * n0), dyn = fvec(heads * 4), res = fvec(n0), h1 = fvec(3 * n1), w1 = fvec(4 * n1);
+        float *dh0 = dev(h0), *dw0 = dev(w0), *ddyn = dev(dyn), *dres = dev(res), *dh1 = dev(h1), *dw1 = dev(w1);
+        float *dy0 = dev_n<float>(n0), *dy1 = dev_n<float>(n1);
+        CU(cudaMemset(dy, 0, N * sizeof(float)));
+        k::mv_q8p_conv(dq, dd, N, K, dx, dy, k::MvConv{40, n0, dh0, dw0, ddyn, heads, dres, dy0},
+                       k::MvConv{200, n1, dh1, dw1, nullptr, 0, nullptr, dy1}, 0, k::MvAlt{dxa, 100, 50},
+                       k::MvAlt{dxb, 150, 50});
+        const auto gy = host(dy, N), gy0 = host(dy0, n0), gy1 = host(dy1, n1), gh0 = host(dh0, 3 * n0);
+        std::vector<float> got;
+        std::vector<double> ref;
+        for (int r = 0; r < N; ++r) {
+            const double v = dot(r, r >= 100 && r < 150 ? xa : r >= 150 && r < 200 ? xb : x);
+            if (r >= 40 && r < 40 + n0) {
+                const int c = r - 40;
+                const float* dc = dyn.data() + (size_t) (c / (n0 / heads)) * 4;
+                double a = (double) w0[c * 4] * h0[c] + (double) w0[c * 4 + 1] * h0[n0 + c] +
+                           (double) w0[c * 4 + 2] * h0[2 * n0 + c] + (double) w0[c * 4 + 3] * v;
+                a += dc[0] * v + (double) dc[1] * h0[2 * n0 + c] + (double) dc[2] * h0[n0 + c] + (double) dc[3] * h0[c];
+                got.push_back(gy0[c]), ref.push_back(a + res[c]);
+                got.push_back(gh0[2 * n0 + c]), ref.push_back(v);         // (the history takes the row)
+                got.push_back(gh0[c]), ref.push_back(h0[n0 + c]);
+            } else if (r >= 200 && r < 200 + n1) {
+                const int c = r - 200;
+                got.push_back(gy1[c]);
+                ref.push_back((double) w1[c * 4] * h1[c] + (double) w1[c * 4 + 1] * h1[n1 + c] +
+                              (double) w1[c * 4 + 2] * h1[2 * n1 + c] + (double) w1[c * 4 + 3] * v);
+            } else {
+                got.push_back(gy[r]), ref.push_back(v);
+            }
+        }
+        expect("mv_q8p_conv: convs and other inputs", got, ref, 2e-4, 2e-3);
+        // mv_f16
+        const int Nf = 40;
+        std::vector<uint16_t> wf((size_t) Nf * K);
+        for (auto& v : wf) v = f2h_host(frand());
+        uint16_t* dwf = dev(wf);
+        float* dyf = dev_n<float>(Nf);
+        k::mv_f16(dwf, Nf, K, dx, dyf, 0);
+        std::vector<double> wantf(Nf);
+        for (int r = 0; r < Nf; ++r)
+            for (int i = 0; i < K; ++i) wantf[r] += (double) h2f_host(wf[(size_t) r * K + i]) * x[i];
+        expect("mv_f16", host(dyf, Nf), wantf, 2e-4, 1e-3);
+        // the sinks in the clips' launch: mv_f16's values to the bit
+        {
+            const int H = 24, KV = 8, D = 128, d_rel = 16;
+            auto qv = fvec((size_t) H * D), kv = fvec((size_t) KV * D), vv = fvec((size_t) KV * D), rv = fvec((size_t) H * d_rel);
+            float *dqv = dev(qv), *dkv = dev(kv), *dvv = dev(vv), *drv = dev(rv), *dsk = dev_n<float>(H);
+            uint16_t *dkc = dev_n<uint16_t>((size_t) 4 * KV * D), *dvc = dev_n<uint16_t>((size_t) 4 * KV * D);
+            std::vector<int> pos = {2};
+            int* dpos = dev(pos);
+            k::prep_qkv_r_f16_at(dqv, nullptr, dkv, dkc, dvv, dvc, drv, nullptr, H, KV, D, d_rel, 22.6f, 8.0f, 1e-6f, dpos,
+                                 false, 0.1f, 128000.0f, 0, nullptr, 0, dwf, dx, K, dsk);
+            const auto a = host(dsk, H), b = host(dyf, H);
+            expect_true("prep_qkv_r_f16_at: the sinks are mv_f16's to the bit", !std::memcmp(a.data(), b.data(), H * 4));
+            for (float* p : {dqv, dkv, dvv, drv, dsk}) cudaFree(p);
+            cudaFree(dkc), cudaFree(dvc), cudaFree(dpos);
+        }
+        cudaFree(dq), cudaFree(dd), cudaFree(dwf);
+        for (float* p : {dx, dxa, dxb, dy, dh0, dw0, ddyn, dres, dh1, dw1, dy0, dy1, dyf}) cudaFree(p);
+    }
+    {   // rms_multi against rms; moe_combine_conv against moe_combine_f32 + conv4_res; attn_res_jobs against attn_res
+        auto x3 = fvec((size_t) 3 * C, 3.0f), w3 = fvec((size_t) 3 * C);
+        float *dx3 = dev(x3), *dw3 = dev(w3), *ya = dev_n<float>((size_t) 3 * C), *yb = dev_n<float>((size_t) 3 * C);
+        for (int j = 0; j < 3; ++j) k::rms(dx3 + (size_t) j * C, dw3 + (size_t) j * C, 1, C, 1e-6f, ya + (size_t) j * C, 0);
+        k::rms_multi(k::RmsJobs{{dx3, dx3 + C, dx3 + 2 * C}, {dw3, dw3 + C, dw3 + 2 * C}, {yb, yb + C, yb + 2 * C}}, 3, C,
+                     1e-6f, 0);
+        const auto ra = host(ya, (size_t) 3 * C), rb = host(yb, (size_t) 3 * C);
+        expect_true("rms_multi: rms's values to the bit", !std::memcmp(ra.data(), rb.data(), ra.size() * 4));
+
+        const int K = 8;
+        auto y = fvec((size_t) K * C), wt = fvec(K), hist = fvec((size_t) 3 * C), tw = fvec((size_t) 4 * C), res = fvec(C);
+        std::vector<int> inv = {3, 1, 0, 2, 7, 5, 6, 4};
+        float *dyk = dev(y), *dwt = dev(wt), *dha = dev(hist), *dhb = dev(hist), *dtw = dev(tw), *dres = dev(res);
+        float *tmp = dev_n<float>(C), *oa = dev_n<float>(C), *ob = dev_n<float>(C);
+        int* dinv = dev(inv);
+        k::moe_combine_f32(dyk, dinv, dwt, 1, K, C, tmp, false, 0);
+        k::conv4_res(tmp, dha, dtw, nullptr, 0, 1, C, dres, oa, 0);
+        k::moe_combine_conv(dyk, dinv, dwt, K, C, dhb, dtw, dres, ob, 0);
+        const auto a1 = host(oa, C), b1 = host(ob, C), a2 = host(dha, (size_t) 3 * C), b2 = host(dhb, (size_t) 3 * C);
+        expect_true("moe_combine_conv: moe_combine_f32 and conv4_res's values to the bit",
+                    !std::memcmp(a1.data(), b1.data(), C * 4) && !std::memcmp(a2.data(), b2.data(), a2.size() * 4));
+
+        const int n = 5;
+        auto st = fvec((size_t) n * C, 2.0f), qq = fvec((size_t) 4 * C);
+        float *dst = dev(st), *dqq = dev(qq), *ra4 = dev_n<float>((size_t) 4 * C), *rb4 = dev_n<float>((size_t) 4 * C);
+        k::ResStates states{};
+        for (int i = 0; i < n; ++i) states.st[i] = dst + (size_t) i * C;
+        k::attn_res(states, n, dqq, 2, 1, C, 1e-6f, ra4, 0);
+        k::attn_res(states, n, dqq + (size_t) 2 * C, 2, 1, C, 1e-6f, ra4 + (size_t) 2 * C, 0);
+        k::attn_res_jobs(states, n, dqq, 2, 2, C, 1e-6f, rb4, 0);
+        const auto a4 = host(ra4, (size_t) 4 * C), b4 = host(rb4, (size_t) 4 * C);
+        expect_true("attn_res_jobs: two attn_res's values to the bit", !std::memcmp(a4.data(), b4.data(), a4.size() * 4));
+        for (float* p : {dx3, dw3, ya, yb, dyk, dwt, dha, dhb, dtw, dres, tmp, oa, ob, dst, dqq, ra4, rb4}) cudaFree(p);
+        cudaFree(dinv);
+    }
+    {   // a looped layer's gate: y = (1 - tanh(F g)) x + tanh(G g) m, g = D [rms(x); rms(m)]
+        const int T = 3, R = 64;
+        const float eps = 1e-6f;
+        auto x = fvec((size_t) T * C, 2.0f), m = fvec((size_t) T * C, 2.0f), D = fvec((size_t) R * 2 * C, 0.05f),
+             F = fvec((size_t) R * C, 0.3f), G = fvec((size_t) R * C, 0.3f);
+        std::vector<double> want((size_t) T * C), a1((size_t) T * R), a2((size_t) T * R), fw((size_t) T * C), gw((size_t) T * C);
+        for (int t = 0; t < T; ++t) {
+            double sx = 0, sm = 0;
+            for (int c = 0; c < C; ++c) sx += (double) x[(size_t) t * C + c] * x[(size_t) t * C + c], sm += (double) m[(size_t) t * C + c] * m[(size_t) t * C + c];
+            const double rx = 1.0 / std::sqrt(sx / C + eps), rm = 1.0 / std::sqrt(sm / C + eps);
+            std::vector<double> g(R);
+            for (int r = 0; r < R; ++r) {
+                double p1 = 0, p2 = 0;
+                for (int c = 0; c < C; ++c) {
+                    p1 += (double) D[(size_t) r * 2 * C + c] * x[(size_t) t * C + c];
+                    p2 += (double) D[(size_t) r * 2 * C + C + c] * m[(size_t) t * C + c];
+                }
+                a1[(size_t) t * R + r] = p1, a2[(size_t) t * R + r] = p2;
+                g[r] = rx * p1 + rm * p2;
+            }
+            for (int c = 0; c < C; ++c) {
+                double f = 0, gn = 0;
+                for (int r = 0; r < R; ++r) f += (double) F[(size_t) r * C + c] * g[r], gn += (double) G[(size_t) r * C + c] * g[r];
+                fw[(size_t) t * C + c] = f, gw[(size_t) t * C + c] = gn;
+                want[(size_t) t * C + c] = (1.0 - std::tanh(f)) * x[(size_t) t * C + c] + std::tanh(gn) * m[(size_t) t * C + c];
+            }
+        }
+        float *dx = dev(x), *dm = dev(m), *dD = dev(D), *dF = dev(F), *dG = dev(G), *dy = dev_n<float>((size_t) T * C);
+        float* dsc = dev_n<float>((size_t) 3 * T * (2 * R + 2));
+        const k::LoopGate gt{dx, dm, dD, dF, dG, dy};
+        k::loop_gates(&gt, 1, T, C, R, eps, dsc, 0);
+        expect("loop_gates (a token's kernels)", host(dy, want.size()), want, 2e-4, 2e-4);
+        // a chunk's: the products given (here the reference's), the two kernels around them
+        std::vector<float> a1f(a1.begin(), a1.end()), a2f(a2.begin(), a2.end());
+        float *da1 = dev(a1f), *da2 = dev(a2f), *dg = dev_n<float>((size_t) T * R);
+        k::loop_gate_mix(dx, dm, da1, da2, T, C, R, eps, dg, 0);
+        const auto gg = host(dg, (size_t) T * R);
+        std::vector<float> ff((size_t) T * C), gf((size_t) T * C);   // f = g F, gn = g G from the kernel's g
+        for (int t = 0; t < T; ++t)
+            for (int c = 0; c < C; ++c) {
+                double f = 0, gn = 0;
+                for (int r = 0; r < R; ++r) f += (double) F[(size_t) r * C + c] * gg[(size_t) t * R + r], gn += (double) G[(size_t) r * C + c] * gg[(size_t) t * R + r];
+                ff[(size_t) t * C + c] = (float) f, gf[(size_t) t * C + c] = (float) gn;
+            }
+        float *df = dev(ff), *dgn = dev(gf);
+        CU(cudaMemset(dy, 0, (size_t) T * C * sizeof(float)));
+        k::loop_gate_blend(dx, dm, df, dgn, (size_t) T * C, dy, 0);
+        expect("loop_gate_mix, loop_gate_blend (a chunk's)", host(dy, want.size()), want, 2e-4, 2e-4);
+        for (float* p : {dx, dm, dD, dF, dG, dy, dsc, da1, da2, dg, df, dgn}) cudaFree(p);
+    }
+}
+
 // cand_topk: every one of the K largest values is among the gathered, each gathered value is its token's, and the
 // count says when the buffer was too small (a flat row)
 void test_cand_topk() {
@@ -2356,6 +2535,7 @@ int main() {
     test_attn_flash();   // (last: its random data leaves the others' as they were)
     test_attn_decode_mma();
     test_cand_topk();
+    test_token_path();
     std::printf(g_fail ? "FAILED: %d check(s)\n" : "all passed\n", g_fail);
     return g_fail ? 1 : 0;
 }
