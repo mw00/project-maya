@@ -1271,7 +1271,29 @@ constexpr int kMaxJobs = 8;
 struct Jobs {
     MvJob j[kMaxJobs];
 };
-template <int T, int NC>
+// A Q8_0 block (2-byte aligned: its scale, then 32 codes) in 9 aligned 4-byte loads where decode<kQ8_0> takes 17 of 2
+// bytes - the same codes and scale.  The 36 bytes read are the block's and, a block that starts 2 bytes past a 4-byte
+// boundary, the 2 before it; a block on a boundary, the 2 after it: inside the row where the matrix starts on a 4-byte
+// boundary and a row is an even number of blocks (mv / mv_heads check).  A GEMV whose weights are in the GPU's cache
+// is bound by its loads, not by the memory: there the kernel is a tenth to a third faster (hy4's dense matrices,
+// prefetched behind its sums).  MAYA_IQ_Q8_WIDE=0: decode<kQ8_0>, as before.
+__device__ __forceinline__ void decode_q8_wide(const uint8_t* __restrict__ row, int kb, Sub& s) {
+    const uint8_t* b = row + (size_t) kb * 34;
+    const uint32_t odd = (uint32_t) ((uintptr_t) b & 2u);
+    const uint32_t* m = (const uint32_t*) (b - odd);
+    uint32_t w[9];
+#pragma unroll
+    for (int t = 0; t < 9; ++t) w[t] = m[t];
+#pragma unroll
+    for (int t = 0; t < 8; ++t) s.q[t] = (int) (odd ? w[t + 1] : (w[t] >> 16) | (w[t + 1] << 16));
+    s.s0 = s.s1 = 1;
+    s.d = __half2float(__ushort_as_half((uint16_t) (odd ? w[0] >> 16 : w[0] & 0xffffu)));
+}
+static bool q8_wide() {
+    static const bool on = !(std::getenv("MAYA_IQ_Q8_WIDE") && std::getenv("MAYA_IQ_Q8_WIDE")[0] == '0');
+    return on;
+}
+template <int T, int NC, bool WIDE = false>
 __global__ void __launch_bounds__(kThreads) mv_kernel(const Jobs J) {
     pdl_wait();
     pdl_trigger();
@@ -1288,7 +1310,8 @@ __global__ void __launch_bounds__(kThreads) mv_kernel(const Jobs J) {
     for (int c = 0; c < NC; ++c) acc[c] = 0.0f;
     for (int kb = lane; kb < nsb; kb += 32) {
         Sub s;
-        decode<T>(w, kb, tab, s);
+        if constexpr (WIDE) decode_q8_wide(w, kb, s);
+        else decode<T>(w, kb, tab, s);
 #pragma unroll
         for (int c = 0; c < NC; ++c)
             if (c < b.ncol) {
@@ -1307,7 +1330,7 @@ __global__ void __launch_bounds__(kThreads) mv_kernel(const Jobs J) {
 // mv_kernel for H jobs alike but for their offsets (a 3D matrix's heads: grid y = the head): head h's job is b0 with w,
 // xq, xd and y moved h strides - one launch for every head where mv's take kMaxJobs a launch.  A row's arithmetic is
 // mv_kernel's, line for line: the same bits.
-template <int T, int NC>
+template <int T, int NC, bool WIDE = false>
 __global__ void __launch_bounds__(kThreads) mv_heads_kernel(const MvJob b0, size_t w_st, size_t xq_st, size_t xd_st,
                                                             size_t y_st) {
     pdl_wait();
@@ -1329,7 +1352,8 @@ __global__ void __launch_bounds__(kThreads) mv_heads_kernel(const MvJob b0, size
     for (int c = 0; c < NC; ++c) acc[c] = 0.0f;
     for (int kb = lane; kb < nsb; kb += 32) {
         Sub s;
-        decode<T>(w, kb, tab, s);
+        if constexpr (WIDE) decode_q8_wide(w, kb, s);
+        else decode<T>(w, kb, tab, s);
 #pragma unroll
         for (int c = 0; c < NC; ++c)
             if (c < b.ncol) {
@@ -1892,8 +1916,18 @@ static bool mv56() {
     return on;
 }
 template <int T>
-void mv_nc(const Jobs& J, int nj, int max_n, int max_c, cudaStream_t s) {
+void mv_nc(const Jobs& J, int nj, int max_n, int max_c, cudaStream_t s, bool wide = false) {
     const dim3 grid((unsigned) ((max_n + kWarps - 1) / kWarps), (unsigned) nj);
+    if constexpr (T == kQ8_0)
+        if (wide && mv56() && mv8()) {   // (every job's blocks readable in aligned words: mv's check)
+            if (max_c <= 1) pdl_launch(mv_kernel<T, 1, true>, grid, kThreads, 0, s, J);
+            else if (max_c <= 4) pdl_launch(mv_kernel<T, 4, true>, grid, kThreads, 0, s, J);
+            else if (max_c <= 5) pdl_launch(mv_kernel<T, 5, true>, grid, kThreads, 0, s, J);
+            else if (max_c <= 6) pdl_launch(mv_kernel<T, 6, true>, grid, kThreads, 0, s, J);
+            else if (max_c <= 8) pdl_launch(mv_kernel<T, 8, true>, grid, kThreads, 0, s, J);
+            else pdl_launch(mv_kernel<T, 16, true>, grid, kThreads, 0, s, J);
+            return;
+        }
     if (max_c <= 1) pdl_launch(mv_kernel<T, 1>, grid, kThreads, 0, s, J);
     else if (max_c <= 4) pdl_launch(mv_kernel<T, 4>, grid, kThreads, 0, s, J);
     else if (max_c <= 5 && mv56()) pdl_launch(mv_kernel<T, 5>, grid, kThreads, 0, s, J);
@@ -1902,8 +1936,18 @@ void mv_nc(const Jobs& J, int nj, int max_n, int max_c, cudaStream_t s) {
     else pdl_launch(mv_kernel<T, 16>, grid, kThreads, 0, s, J);
 }
 template <int T>
-void mv_heads_nc(const MvJob& b, int H, size_t ws, size_t xs, size_t ds, size_t ys, cudaStream_t s) {
+void mv_heads_nc(const MvJob& b, int H, size_t ws, size_t xs, size_t ds, size_t ys, cudaStream_t s, bool wide = false) {
     const dim3 grid((unsigned) ((b.n + kWarps - 1) / kWarps), (unsigned) H);
+    if constexpr (T == kQ8_0)
+        if (wide && mv56()) {
+            if (b.ncol <= 1) pdl_launch(mv_heads_kernel<T, 1, true>, grid, kThreads, 0, s, b, ws, xs, ds, ys);
+            else if (b.ncol <= 4) pdl_launch(mv_heads_kernel<T, 4, true>, grid, kThreads, 0, s, b, ws, xs, ds, ys);
+            else if (b.ncol <= 5) pdl_launch(mv_heads_kernel<T, 5, true>, grid, kThreads, 0, s, b, ws, xs, ds, ys);
+            else if (b.ncol <= 6) pdl_launch(mv_heads_kernel<T, 6, true>, grid, kThreads, 0, s, b, ws, xs, ds, ys);
+            else if (b.ncol <= 8) pdl_launch(mv_heads_kernel<T, 8, true>, grid, kThreads, 0, s, b, ws, xs, ds, ys);
+            else pdl_launch(mv_heads_kernel<T, 16, true>, grid, kThreads, 0, s, b, ws, xs, ds, ys);
+            return;
+        }
     if (b.ncol <= 1) pdl_launch(mv_heads_kernel<T, 1>, grid, kThreads, 0, s, b, ws, xs, ds, ys);
     else if (b.ncol <= 4) pdl_launch(mv_heads_kernel<T, 4>, grid, kThreads, 0, s, b, ws, xs, ds, ys);
     else if (b.ncol <= 5 && mv56()) pdl_launch(mv_heads_kernel<T, 5>, grid, kThreads, 0, s, b, ws, xs, ds, ys);
@@ -2500,15 +2544,18 @@ bool mv(const MvJob* jobs, int n, cudaStream_t s) {
             const int t = jobs[i].type;
             Jobs J{};
             int nj = 0, max_n = 0, max_c = 1;
-            for (int k = i; k < n && nj < kMaxJobs; ++k) {
+            bool wide = t == kQ8_0 && q8_wide();   // (decode_q8_wide: every job on a 4-byte boundary, rows of an even
+            for (int k = i; k < n && nj < kMaxJobs; ++k) {   //  number of blocks)
                 if (done[k] || jobs[k].type != t) continue;
                 if (jobs[k].k % block_values(t) != 0 || jobs[k].ncol < 1 || jobs[k].ncol > 16) return false;
+                wide = wide && ((uintptr_t) jobs[k].w & 3u) == 0 && jobs[k].k % 64 == 0 &&
+                       jobs[k].ld == (size_t) jobs[k].k / 32 * 34;
                 J.j[nj++] = jobs[k];
                 max_n = std::max(max_n, jobs[k].n);
                 max_c = std::max(max_c, jobs[k].ncol);
                 done[k] = true;
             }
-#define MV_(T) mv_nc<T>(J, nj, max_n, max_c, s)
+#define MV_(T) mv_nc<T>(J, nj, max_n, max_c, s, wide)
             DS4_IQ_SWITCH_MV(t, MV_)
 #undef MV_
         }
@@ -2517,7 +2564,9 @@ bool mv(const MvJob* jobs, int n, cudaStream_t s) {
 bool mv_heads(const MvJob& b, int H, size_t w_stride, size_t xq_stride, size_t xd_stride, size_t y_stride,
               cudaStream_t s) {
     if (H <= 0 || b.n <= 0 || b.k % block_values(b.type) != 0 || b.ncol < 1 || b.ncol > 16) return false;
-#define MVH_(T) mv_heads_nc<T>(b, H, w_stride, xq_stride, xd_stride, y_stride, s)
+    const bool wide = b.type == kQ8_0 && q8_wide() && ((uintptr_t) b.w & 3u) == 0 && w_stride % 4 == 0 && b.k % 64 == 0 &&
+                      b.ld == (size_t) b.k / 32 * 34;
+#define MVH_(T) mv_heads_nc<T>(b, H, w_stride, xq_stride, xd_stride, y_stride, s, wide)
     DS4_IQ_SWITCH_MV(b.type, MVH_)
 #undef MVH_
     return true;
