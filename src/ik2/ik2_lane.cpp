@@ -79,24 +79,49 @@ IK2L_T512 float tree512(__m512 l) {
     return _mm_cvtss_f32(_mm_add_ss(t2, _mm_shuffle_ps(t2, t2, 1)));
 }
 
+// an NVFP4 scale byte's value, ik2_exact.h's ue4m3 (exact), read from a table
+struct ScaleLut {
+    float v[256];
+    ScaleLut() {
+        for (int i = 0; i < 256; ++i) v[i] = x::ue4m3((uint8_t) i);
+    }
+};
+const ScaleLut g_sl;
+
 // ---- AVX-512: a sub-block = one register of 16 lanes
+// the 16 exact weights of sub-block c of the 36-byte block at b
+IK2L_T512 inline __m512 nvfp4_w512(const uint8_t* b, int c, __m128i tab, __m128i m4) {
+    const __m128i raw = _mm_loadl_epi64((const __m128i*) (b + 4 + 8 * c));
+    const __m128i idx = _mm_unpacklo_epi64(_mm_and_si128(raw, m4), _mm_and_si128(_mm_srli_epi16(raw, 4), m4));
+    return _mm512_mul_ps(_mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(_mm_shuffle_epi8(tab, idx))), _mm512_set1_ps(g_sl.v[b[c]]));
+}
 IK2L_T512 void nvfp4_512(const uint8_t* W, int K, int r0, int r1, const float* x, float* out) {
     const __m128i tab = _mm_setr_epi8(0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12);
     const __m128i m4 = _mm_set1_epi8(0x0F);
     const int nb = K / 64;
     const size_t rb = (size_t) nb * 36;
-    for (int r = r0; r < r1; ++r) {
+    int r = r0;
+    for (; r + 1 < r1; r += 2) {   // (two rows a pass: x read once, eight chains in flight)
+        const uint8_t *b = W + (size_t) r * rb, *b2 = b + rb;
+        __m512 a[4], c2[4];
+        for (int c = 0; c < 4; ++c) a[c] = _mm512_setzero_ps(), c2[c] = _mm512_setzero_ps();
+        for (int i = 0; i < nb; ++i, b += 36, b2 += 36) {
+            const float* xp = x + 64 * i;
+            for (int c = 0; c < 4; ++c) {
+                const __m512 xv = _mm512_loadu_ps(xp + 16 * c);
+                a[c] = _mm512_fmadd_ps(xv, nvfp4_w512(b, c, tab, m4), a[c]);
+                c2[c] = _mm512_fmadd_ps(xv, nvfp4_w512(b2, c, tab, m4), c2[c]);
+            }
+        }
+        out[r - r0] = tree512(_mm512_add_ps(_mm512_add_ps(a[0], a[1]), _mm512_add_ps(a[2], a[3])));
+        out[r + 1 - r0] = tree512(_mm512_add_ps(_mm512_add_ps(c2[0], c2[1]), _mm512_add_ps(c2[2], c2[3])));
+    }
+    for (; r < r1; ++r) {
         const uint8_t* b = W + (size_t) r * rb;
         __m512 a[4] = {_mm512_setzero_ps(), _mm512_setzero_ps(), _mm512_setzero_ps(), _mm512_setzero_ps()};
         for (int i = 0; i < nb; ++i, b += 36) {
             const float* xp = x + 64 * i;
-            for (int c = 0; c < 4; ++c) {
-                const __m128i raw = _mm_loadl_epi64((const __m128i*) (b + 4 + 8 * c));
-                const __m128i idx = _mm_unpacklo_epi64(_mm_and_si128(raw, m4), _mm_and_si128(_mm_srli_epi16(raw, 4), m4));
-                const __m512 w = _mm512_mul_ps(_mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(_mm_shuffle_epi8(tab, idx))),
-                                               _mm512_set1_ps(x::ue4m3(b[c])));
-                a[c] = _mm512_fmadd_ps(_mm512_loadu_ps(xp + 16 * c), w, a[c]);
-            }
+            for (int c = 0; c < 4; ++c) a[c] = _mm512_fmadd_ps(_mm512_loadu_ps(xp + 16 * c), nvfp4_w512(b, c, tab, m4), a[c]);
         }
         out[r - r0] = tree512(_mm512_add_ps(_mm512_add_ps(a[0], a[1]), _mm512_add_ps(a[2], a[3])));
     }
@@ -136,7 +161,7 @@ IK2L_T256 void nvfp4_256(const uint8_t* W, int K, int r0, int r1, const float* x
                 const __m128i raw = _mm_loadl_epi64((const __m128i*) (b + 4 + 8 * c));
                 const __m128i ql = _mm_shuffle_epi8(tab, _mm_and_si128(raw, m4));
                 const __m128i qh = _mm_shuffle_epi8(tab, _mm_and_si128(_mm_srli_epi16(raw, 4), m4));
-                const __m256 d = _mm256_set1_ps(x::ue4m3(b[c]));
+                const __m256 d = _mm256_set1_ps(g_sl.v[b[c]]);
                 const __m256 wl = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(ql)), d);
                 const __m256 wh = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(qh)), d);
                 lo[c] = _mm256_fmadd_ps(_mm256_loadu_ps(xp + 16 * c), wl, lo[c]);
@@ -204,14 +229,15 @@ constexpr int kGuRows = 64, kDownRows = 96;   // (a piece's rows: ~48 pieces a v
 
 Server::Server(int threads, int C, int F, float gcap, float ucap, std::vector<LayerW> layers, void* job, void* done)
     : C_(C), F_(F), gcap_(gcap), ucap_(ucap), L_(std::move(layers)), job_((uint8_t*) job), done_((uint8_t*) done) {
-    if (threads < 0) {
-        const int phys = (int) strata::kernels::cpu::physical_cores(false).size();
-        threads = std::max(0, phys - 3);   // (one a physical core: two left to the system, one the polling thread's)
-    }
+    (void) rows_form();   // (the CPU's form decided before the workers use it)
     lane_ = std::make_unique<hy4::Lane>(threads);
     h_.assign((size_t) k::kOffMaxK * F_, 0.0f);
     us_[0].store(0.0), us_[1].store(0.0);
     th_ = std::thread([this] { loop(); });
+}
+void Server::set_threads(int n) {
+    lane_.reset();
+    lane_ = std::make_unique<hy4::Lane>(n);
 }
 Server::~Server() {
     quit_.store(true);

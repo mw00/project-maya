@@ -27,6 +27,7 @@
 #include "ik2_lane.hpp"
 #include "ik2_off.cuh"
 #include "strata/artifact/gguf_reader.hpp"
+#include "strata/kernels/cpu/pool.hpp"
 
 #include <cublas_v2.h>
 #include <cuda_fp16.h>
@@ -2312,9 +2313,34 @@ bool lane_init(Model& M, const std::string& want, int threads) {
     CU(cudaHostGetDevicePointer((void**) &g_offs.job_d, g_offs.job_h, 0));
     CU(cudaHostGetDevicePointer((void**) &g_offs.done_d, g_offs.done_h, 0));
     g_offs.lane = std::make_unique<ik2::lane::Server>(threads, C, F, c.gate_cap, c.up_cap, lw, g_offs.job_h, g_offs.done_h);
-    // the split's figures: the fastest of a few runs each (an idle start: the decode re-times the lane as it goes)
     std::vector<float> xr(C);
     for (int i = 0; i < C; ++i) xr[i] = std::sin(0.37f * i) * 0.8f;
+    if (threads < 0) {   // the lane's size: counts below the CPU's cores timed on experts read from memory, the
+                         // fastest kept (a smaller one within 5%) - a lane as wide as the CPU loses on a busy PC
+        const int phys = (int) strata::kernels::cpu::physical_cores(false).size();
+        std::vector<int> cand;
+        for (int n : {phys / 4, phys / 2, (3 * phys) / 4, phys - 2})
+            if (n >= 1 && (cand.empty() || n > cand.back())) cand.push_back(n);
+        std::vector<int> l4;   // (the timing's layers: one format - the most common one, NVFP4 in Mini's file)
+        for (int l = 0; l < c.n_layer; ++l)
+            if (g_offs.fmt[l] == g_offs.fmt[c.n_layer / 2]) l4.push_back(l);
+        int best_n = -1, call = 0;
+        double best_us = 1e30;
+        for (int n : cand) {
+            g_offs.lane->set_threads(n - 1);
+            std::vector<double> t;
+            for (int r = 0; r < 3; ++r, ++call) {   // (8 experts a call, none of them read before: cold, as in decode)
+                int ex[8];
+                const int l = l4[(size_t) (call * 5) % l4.size()];
+                for (int i = 0; i < 8; ++i) ex[i] = (call * 8 + i) % c.E;
+                t.push_back(g_offs.lane->time_experts(l, ex, 8, xr.data(), 1));
+            }
+            std::sort(t.begin(), t.end());
+            if (t[1] < best_us * 0.95) best_us = t[1], best_n = n;
+        }
+        g_offs.lane->set_threads(best_n - 1);
+    }
+    // the split's figures: the fastest of a few runs each (an idle start: the decode re-times the lane as it goes)
     k::LaneCost cs{};
     cs.lat = 30.0f;
     int lay[2] = {-1, -1};

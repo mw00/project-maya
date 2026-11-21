@@ -43,6 +43,9 @@ public:
     Server(const Server&) = delete;
     Server& operator=(const Server&) = delete;
     int threads() const;
+    /// the lane's workers made again (n besides the polling thread; < 0: Hy4's default size, a physical core each
+    /// but one, with its measured reserve on a busy PC) - at the start only, before any job
+    void set_threads(int n);
     /// microseconds an expert as measured while it runs (fmt 0 NVFP4, 1 Q8_0; 0: none yet), and the experts done
     double us_expert(int fmt) const;
     unsigned long long experts() const { return n_done_.load(); }
