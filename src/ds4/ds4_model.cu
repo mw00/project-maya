@@ -771,6 +771,8 @@ struct Chunk {
     // (a group's Engram rows read once, Impl::eg_src_dev: the seq of the chunk last read into each slot - the reader's
     //  - and of the chunk whose copies out of the slot this device last issued)
     std::atomic<unsigned> eg_read_seq[2] = {}, eg_copied_seq[2] = {};
+    // (DS4_EG_LATE) the seq of the chunk whose rows of Engram table i the reader last put in each slot
+    std::atomic<unsigned> eg_layer_seq[2][8] = {};
     // where this device's thread is in a run of chunks (Model::where: the serve watchdog's report of a run that stopped
     // moving, #539 / #494 - which device waits for what)
     std::atomic<int> at_k{-1}, at_il{-1};
@@ -1088,6 +1090,7 @@ struct WinPlan {
     int snap_n = 0;
     int snap_t[kSnapN] = {}, snap_ix[kSnapN] = {};
     int eg_slot = -1;       // (a run of chunks, layer-major) the Engram rows' slot (-1: k % 2)
+    bool eg_late = false;   // (DS4_EG_LATE) an Engram layer waits for its own table's rows (eg_layer_seq), not the chunk
     unsigned vl = 0;        // (a window) bit t: token t is inside a picture's span (routed with the image bias)
     // (--parallel, Impl::step_multi) rows of nrow conversations instead of a window of one: row t is conversation
     // rseq[t]'s token at position rpos[t] (0: a window of the bound conversation from p0)
@@ -10899,6 +10902,17 @@ struct Model::Impl {
         return any;
     }
 
+    // DS4_EG_LATE=1 (opt-in): a run of one chunk does not wait for all its Engram rows before its first layer - each
+    // Engram layer waits for its own table's rows (the reader puts them out table by table, the first layer's first),
+    // so the layers before it run while the rest are read (a small read's start: ~35 rows a token, from the SSD when
+    // the page cache does not hold them).  The same rows in: the same bits
+    static bool eg_late_on() {
+        static const bool on = [] {
+            const char* v = ds4_env("DS4_EG_LATE");
+            return v != nullptr && std::atoi(v) != 0;
+        }();
+        return on;
+    }
     // ---- Engram: a window's rows of one table (Engram layer li), tokens p0 .. p0 + T - 1 into dst ([token] of [cols]
     // [hd] codes then the scales; nullptr: h_eg).  eg_issue serves the rows already fetched from the row cache (and a
     // row the window needs twice from one read) and hands the rest to the reader's threads; eg_finish waits for them,
@@ -18418,7 +18432,19 @@ struct Model::Impl {
             const int cols = (pk.eg_ngram - 1) * pk.eg_heads, ehd = pk.eg_hd;
             const size_t per = (size_t) cols * (ehd + ehd / 32);
             const int slot = wp.eg_slot >= 0 ? wp.eg_slot : wp.k % 2;   // (read ahead by the run: two in flight)
-            uint8_t* host = chunks[(size_t) eg_src_dev(l.dev)]->eg_host[slot] + (size_t) l.eg * c.C * per;
+            Chunk& src = *chunks[(size_t) eg_src_dev(l.dev)];
+            if (wp.eg_late) {   // (DS4_EG_LATE) this table's rows of the chunk: the reader puts them out table by table
+                const double te = now_ms();
+                while ((int) (src.eg_layer_seq[slot][l.eg].load(std::memory_order_acquire) - wp.win) < 0) {
+                    if (eg_abort.load(std::memory_order_acquire) || halt.load(std::memory_order_acquire)) {
+                        err = "the Engram rows' reader stopped";
+                        return false;
+                    }
+                    std::this_thread::sleep_for(std::chrono::microseconds(20));
+                }
+                if (mi == 0) st.engram_ms += now_ms() - te;
+            }
+            uint8_t* host = src.eg_host[slot] + (size_t) l.eg * c.C * per;
             CK(cudaMemcpyAsync(c.eg_rows, host, (size_t) T * per, cudaMemcpyHostToDevice, s));
             CK(cudaEventRecord(c.eg_ev[slot], s));
             for (int s0 = 0; s0 < T; s0 += 256) {
@@ -19389,6 +19415,7 @@ struct Model::Impl {
                 if (eg_pf != nullptr) eg_pf->wait_unit(li, k);
                 engram_rows(run.p0[(size_t) k], run.T[(size_t) k], li, c.eg_host[sl] + (size_t) li * c.C * eg_per);
                 if (eg_pf != nullptr) eg_pf->finish_unit(li, k);
+                if (li < 8) c.eg_layer_seq[sl][li].store(run.seq[(size_t) k], std::memory_order_release);   // (DS4_EG_LATE)
             }
             if (eg_pf != nullptr) eg_pf->finish_chunk(k);
             c.eg_read_seq[sl].store(run.seq[(size_t) k], std::memory_order_release);
@@ -19452,7 +19479,9 @@ struct Model::Impl {
             const int64_t p0 = run.p0[(size_t) k];
             const int T = run.T[(size_t) k], slot = k % 2;
             const bool last_k = k + 1 == nk;
-            if (!egs.empty()) {   // chunk k's rows ready, chunk k + 1's on their way
+            // (DS4_EG_LATE: a run of one chunk - its Engram layers wait for their own tables' rows instead)
+            const bool eg_late = !egs.empty() && eg_late_on() && nk == 1 && eg_pf == nullptr && pk.eg_layers <= 8;
+            if (!egs.empty() && !eg_late) {   // chunk k's rows ready, chunk k + 1's on their way
                 const double te = now_ms();
                 if (eg_src == di) {
                     c.at.store("reading the Engram rows", std::memory_order_relaxed);
@@ -19477,6 +19506,7 @@ struct Model::Impl {
             wp.async = true;
             wp.win = run.seq[(size_t) k];
             wp.k = k;
+            wp.eg_late = eg_late;
             run.snaps(p0, T, wp);
             bool started = false, in_back = false;
             std::vector<char> got(srcs.size(), 0);
@@ -19568,6 +19598,7 @@ struct Model::Impl {
             if (part_link() && L[(size_t) part_hi - 1].dev == di && !part_chunk_out(d, di, c, run, k, s, err))
                 return false;
             if (trace && !c.flow && tr_ev.size() == 3 + 2 * (size_t) k) tr_rec(s);   // (DS4_RUN_TRACE: chunk k's end)
+            if (eg_late && eg_src == di) eg_next.get();   // (DS4_EG_LATE: the reader done - every table was waited for)
             // (chunk k's copies out of its Engram slot issued, their event recorded: the reader may refill it)
             if (!egs.empty()) c.eg_copied_seq[slot].store(wp.win, std::memory_order_release);
             if (di == head_dev && (size_t) k < chunk_done.size() && !(late_k == k && !late.empty())) {   // (or take_late)
