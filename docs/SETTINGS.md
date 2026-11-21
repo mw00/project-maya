@@ -1,5 +1,13 @@
 # Tuning and settings
 
+## Qwen context extension
+
+Qwen supports optional `--rope-scaling none|linear|yarn` and `--rope-scale F`.
+The Models page exposes these under Engine → Model; numerical overrides are under
+RoPE advanced. Model default preserves GGUF metadata. Changing scaling restarts
+the engine and requires fresh context computation. See [Qwen YaRN](QWEN-YARN.md)
+for precedence, examples, attribution and measured limits.
+
 Everything on this page is optional: the engine sizes itself for the PC it runs on. Back to the
 [README](../README.md).
 

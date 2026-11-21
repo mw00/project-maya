@@ -6,6 +6,7 @@
 #pragma once
 
 #include "strata/kernels/kv_stream.hpp"
+#include "strata/kernels/rope_scaling.hpp"
 
 #include <cstdint>
 
@@ -67,8 +68,10 @@ void moe_combine(const float* D, const int32_t* slot, const float* w, const floa
 // ---- QSA helpers
 /// In place: x[r, :] = x[r, :] * rsqrt(mean x^2 + eps) * w  over rows of `cols` (row stride `ld`).
 void rms_rows(float* x, const float* w, int64_t rows, int64_t cols, int64_t ld, float eps, void* stream);
-/// NEOX rotary on the first 64 dims of each head: x [T, heads, dim] at positions pos0 + t.
-void rope(float* x, int64_t T, int64_t heads, int64_t dim, int64_t ld, int64_t pos0, float freq_base, void* stream);
+/// NEOX rotary on the first 64 dims of each head: x [T, heads, dim] at positions pos0 + t.  The rope
+/// scaling (rope_scaling.hpp) rides in as the process config - none is today's arithmetic exactly.
+void rope(float* x, int64_t T, int64_t heads, int64_t dim, int64_t ld, int64_t pos0,
+          const strata::kernels::RopeScaling& scaling, void* stream);
 /// q_full [T, 24, 512] (q | gate per head) -> q [T, 24, 256]
 void split_q(const float* q_full, float* q, int64_t T, void* stream);
 /// attn[t, h, d] *= sigmoid(q_full[t, h, 256 + d]) -> out16 (fp16 bits: the o-projection is quantized)

@@ -156,6 +156,20 @@ struct Options {
     bool native_flash_attn_short = false; // diagnostic pinned attention, context <=256
     bool native_qsa_indexer = false;  // pinned F16 key cache and F32 pooling
     bool native_qsa = false;          // pinned F32 QSA norms and gate
+    /// THE CONTEXT EXTENSION (rope scaling, rope_scaling.hpp).  These knobs resolve to ONE process config,
+    /// set once before `session_init` builds the rope table and the graphs capture the kernels.  There is
+    /// deliberately no per-request form: K sits in the cache POST-RoPE, so one cache must never mix two
+    /// scalings.  Precedence: an EXPLICIT flag over the model file's rope keys over the struct defaults -
+    /// `none` and `1` are explicit values (the opt-outs), the absent flag is not.
+    std::string rope_scaling;           ///< --rope-scaling none|linear|yarn (llama.cpp's names); empty = the flag is absent
+    double rope_scale = 0;              ///< --rope-scale F: the extension factor; 0 = the flag is absent (the model file's, else 1 = off)
+    double rope_freq_base = 0;          ///< --rope-freq-base N: 0 = the model's (1e7)
+    double rope_freq_scale = 0;         ///< --rope-freq-scale F: the raw ggml knob; 0 = 1/--rope-scale
+    double yarn_orig_ctx = 0;           ///< --yarn-orig-ctx N: 0 = the model's, else 262144
+    double yarn_ext_factor = -1.0;      ///< --yarn-ext-factor F: <0 = auto (1 for yarn, 0 otherwise)
+    double yarn_attn_factor = 1.0;      ///< --yarn-attn-factor F
+    double yarn_beta_fast = 32.0;       ///< --yarn-beta-fast F
+    double yarn_beta_slow = 1.0;        ///< --yarn-beta-slow F
     bool native_rope = false;         // pinned text-only CUDA rotary arithmetic
     bool native_ple_postops = false;  // pinned PLE postprojection arithmetic
     bool native_router = false;       // pinned fused 512-expert top-10 router
@@ -458,6 +472,10 @@ void usage() {
                  "  --expert-cache-cpu-order  experimental GPU expert reduction matching CPU order\n"
                  "  --max-new N          tokens to generate (default 16)\n"
                  "  --max-context N      KV/state capacity (default 4096)\n"
+                 "  --rope-scaling T     Qwen context scaling: none, linear, yarn (metadata default)\n"
+                 "  --rope-scale F       Extension factor (e.g. 2); resolved once at startup\n"
+                 "  --rope-freq-base N --rope-freq-scale F --yarn-orig-ctx N\n"
+                 "  --yarn-ext-factor F --yarn-attn-factor F --yarn-beta-fast F --yarn-beta-slow F\n"
                  "  --greedy             argmax (the default)\n"
                  "  --seed S             enable sampling with this Philox seed\n"
                  "  --top-k N --top-p F --temperature F\n"
@@ -4797,6 +4815,15 @@ int main(int argc, char** argv) {
         }
         else if (a == "--max-new") o.max_new = std::atoll(next("--max-new"));
         else if (a == "--max-context") o.max_context = std::atoll(next("--max-context"));
+        else if (a == "--rope-scaling") o.rope_scaling = next("--rope-scaling");
+        else if (a == "--rope-scale") o.rope_scale = std::atof(next("--rope-scale"));
+        else if (a == "--rope-freq-base") o.rope_freq_base = std::atof(next("--rope-freq-base"));
+        else if (a == "--rope-freq-scale") o.rope_freq_scale = std::atof(next("--rope-freq-scale"));
+        else if (a == "--yarn-orig-ctx") o.yarn_orig_ctx = std::atof(next("--yarn-orig-ctx"));
+        else if (a == "--yarn-ext-factor") o.yarn_ext_factor = std::atof(next("--yarn-ext-factor"));
+        else if (a == "--yarn-attn-factor") o.yarn_attn_factor = std::atof(next("--yarn-attn-factor"));
+        else if (a == "--yarn-beta-fast") o.yarn_beta_fast = std::atof(next("--yarn-beta-fast"));
+        else if (a == "--yarn-beta-slow") o.yarn_beta_slow = std::atof(next("--yarn-beta-slow"));
         else if (a == "--greedy") o.greedy = true;
         else if (a == "--seed") { o.seed = (uint64_t) std::atoll(next("--seed")); o.greedy = false; }
         else if (a == "--top-k") o.top_k = std::atoi(next("--top-k"));
@@ -5230,6 +5257,46 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "maya generate: positive --max-new and --max-context must fit the prompt and generation\n");
         return 2;
     }
+    // THE ROPE KNOBS (rope_scaling.hpp).  Anything invalid dies here, at second zero, rather than becoming a
+    // NaN angle inside one of the twelve QSA layers.  Only the RANGES are checked - the config itself is
+    // resolved after the model file has had its say, right before session_init.
+    strata::kernels::RopeScaling rope_cfg;   // type filled here; the rest at the resolution below
+    {
+        using RST = strata::kernels::RopeScalingType;
+        // an absent --rope-scaling (the empty default) leaves the type to the model file's rope keys,
+        // resolved below; anything present must be one of the three names
+        if (o.rope_scaling == "none") rope_cfg.type = RST::None;
+        else if (o.rope_scaling == "linear") rope_cfg.type = RST::Linear;
+        else if (o.rope_scaling == "yarn") rope_cfg.type = RST::YaRN;
+        else if (!o.rope_scaling.empty()) {
+            std::fprintf(stderr, "maya generate: --rope-scaling must be none, linear or yarn (got '%s')\n",
+                         o.rope_scaling.c_str());
+            return 2;
+        }
+        // every knob FINITE first: `atof("nan")` is NaN, and a NaN passes every range comparison below
+        for (const double v : {o.rope_scale, o.rope_freq_base, o.rope_freq_scale, o.yarn_orig_ctx, o.yarn_ext_factor,
+                               o.yarn_attn_factor, o.yarn_beta_fast, o.yarn_beta_slow})
+            if (!std::isfinite(v)) {
+                std::fprintf(stderr, "maya generate: a rope scaling knob is not a finite number (%g)\n", v);
+                return 2;
+            }
+        // 0 is the absent default; an explicit factor must extend, not shrink
+        if (o.rope_scale != 0 && o.rope_scale < 1.0) {
+            std::fprintf(stderr, "maya generate: --rope-scale %g must be >= 1 (it extends the context, not shrinks it)\n",
+                         o.rope_scale);
+            return 2;
+        }
+        if (o.rope_freq_base != 0 && o.rope_freq_base <= 1.0) {
+            std::fprintf(stderr, "maya generate: --rope-freq-base must be a base above 1 (0 = the model's)\n");
+            return 2;
+        }
+        if (o.rope_freq_scale < 0 || o.yarn_orig_ctx < 0 || o.yarn_ext_factor < -1.0 || o.yarn_attn_factor <= 0 ||
+            o.yarn_beta_fast <= 0 || o.yarn_beta_slow <= 0) {
+            std::fprintf(stderr, "maya generate: invalid rope scaling knob (see usage: --yarn-ext-factor <0 = auto, "
+                                 "--yarn-orig-ctx 0 = default, the rest positive)\n");
+            return 2;
+        }
+    }
     if (!std::isfinite(o.temperature) || o.temperature < 0 || !std::isfinite(o.top_p) ||
         o.top_p <= 0 || o.top_p > 1 || o.top_k < 0 || o.expert_cache < -1 ||
         o.pool_workers < 0 || std::any_of(o.expert_cache_remote.begin(), o.expert_cache_remote.end(),
@@ -5423,6 +5490,8 @@ int main(int argc, char** argv) {
     strata::kernels::ple_set_native_postops(o.native_ple_postops);
     strata::core::ModelGeometry g;   // canonical defaults; the model file overrides the MoE shape below
     int64_t K = 10;
+    std::string gguf_rope_type;
+    double gguf_rope_base=0, gguf_rope_factor=0, gguf_rope_orig_ctx=0;
     if (!o.native_preset.empty()) {
         // a pruned variant (the Qwen Coder) ships fewer experts than the canonical 512x10; the model file
         // is the authority on its own MoE shape - everything else in the geometry is unchanged
@@ -5445,10 +5514,88 @@ int main(int argc, char** argv) {
             }
             if (const strata::MetaValue* v = model_gguf.get("qwen4exp.expert_count")) g.n_expert = (int64_t) v->u;
             if (const strata::MetaValue* v = model_gguf.get("qwen4exp.expert_used_count")) K = (int64_t) v->u;
+            if (const auto* v=model_gguf.get("qwen4exp.rope.freq_base")) gguf_rope_base=v->num();
+            if (const auto* v=model_gguf.get("qwen4exp.rope.scaling.type")) gguf_rope_type=v->s;
+            if (const auto* v=model_gguf.get("qwen4exp.rope.scaling.factor")) gguf_rope_factor=v->num();
+            if (const auto* v=model_gguf.get("qwen4exp.rope.scaling.original_context_length")) gguf_rope_orig_ctx=v->num();
+
         } catch (const std::exception& e) {
             std::fprintf(stderr, "maya generate: reading the model's expert shape from %s: %s\n",
                          o.native_preset.c_str(), e.what());
             return 1;
+        }
+    }
+    {
+        using RST = strata::kernels::RopeScalingType;
+        if (!o.rope_scaling.empty()) {
+            // the early validation pinned the spelling; `none` here is the CLI opting OUT of the model file's keys
+            if (o.rope_scaling == "linear") rope_cfg.type = RST::Linear;
+            else if (o.rope_scaling == "yarn") rope_cfg.type = RST::YaRN;
+            else rope_cfg.type = RST::None;
+        } else if (!gguf_rope_type.empty()) {
+            if (gguf_rope_type == "linear") rope_cfg.type = RST::Linear;
+            else if (gguf_rope_type == "yarn") rope_cfg.type = RST::YaRN;
+            else if (gguf_rope_type != "none") {
+                std::fprintf(stderr, "maya generate: %s carries rope.scaling.type '%s' - none, linear or yarn only\n",
+                             o.native_preset.c_str(), gguf_rope_type.c_str());
+                return 2;
+            }
+        }
+        if (o.rope_scale > 0) rope_cfg.factor = o.rope_scale;            // an explicit factor, 1 included
+        else if (gguf_rope_factor > 1.0) rope_cfg.factor = gguf_rope_factor;
+        if (o.rope_freq_base > 0) rope_cfg.freq_base = o.rope_freq_base;
+        else if (gguf_rope_base > 1.0) rope_cfg.freq_base = gguf_rope_base;
+        if (o.yarn_orig_ctx > 0) rope_cfg.orig_ctx = o.yarn_orig_ctx;
+        else if (gguf_rope_orig_ctx >= 1) rope_cfg.orig_ctx = gguf_rope_orig_ctx;
+        rope_cfg.freq_scale_in = o.rope_freq_scale;
+        rope_cfg.ext_factor = o.yarn_ext_factor >= 0 ? o.yarn_ext_factor
+                                                     : (rope_cfg.type == RST::YaRN ? 1.0 : 0.0);
+        rope_cfg.attn_factor = o.yarn_attn_factor;
+        rope_cfg.beta_fast = o.yarn_beta_fast;
+        rope_cfg.beta_slow = o.yarn_beta_slow;
+        if (rope_cfg.type == RST::None) {
+            // none is the trained rotation, exactly: the scaling knobs are inert (the table builder and
+            // `kernel_args` ignore them), and resetting them keeps the logged/queried config honest.  Only the
+            // frequency base survives - it is the rotation itself, not a scaling knob.
+            const bool knobs = o.rope_scale > 1.0 || o.rope_freq_scale > 0 || o.yarn_ext_factor > 0 ||
+                               o.yarn_attn_factor != 1.0;
+            const double base = rope_cfg.freq_base;
+            rope_cfg = strata::kernels::RopeScaling{};
+            rope_cfg.freq_base = base;
+            if (knobs)
+                std::fprintf(stderr, "maya generate: note: no rope scaling is active (none), so --rope-scale, "
+                                     "--rope-freq-scale and the --yarn-* knobs have no effect\n");
+        }
+        // THE RESOLVED CONFIG IS VALIDATED AS A WHOLE, with the one rule every rotation site also applies
+        // (rope_scaling.hpp): the CLI ranges above cannot see a model-file value, nor a combination such as a
+        // --rope-freq-scale that turns the resolved factor non-finite.
+        if (const char* why = strata::kernels::rope_scaling_invalid(rope_cfg)) {
+            std::fprintf(stderr, "maya generate: invalid rope scaling configuration: %s (type %s, factor %g, "
+                                 "freq_scale %g, base %g, original context %g)\n",
+                         why, rope_cfg.type == RST::YaRN ? "yarn" : rope_cfg.type == RST::Linear ? "linear" : "none",
+                         rope_cfg.factor, rope_cfg.freq_scale(), rope_cfg.freq_base, rope_cfg.orig_ctx);
+            return 2;
+        }
+        strata::kernels::rope_scaling_set(rope_cfg);
+        if (rope_cfg.type != RST::None) {
+            const char* tn = rope_cfg.type == RST::YaRN ? "yarn" : "linear";
+            std::fprintf(stderr,
+                         "maya generate: rope scaling %s, factor %.6g (freq_scale %.6g, base %.6g, mscale %.6f), "
+                         "--max-context %lld against a trained context of %.0f\n",
+                         tn, rope_cfg.factor, rope_cfg.freq_scale(), rope_cfg.freq_base, rope_cfg.mscale(),
+                         (long long) o.max_context, rope_cfg.orig_ctx);
+            if ((double) o.max_context <= rope_cfg.orig_ctx)
+                std::fprintf(stderr,
+                             "maya generate: note: the context is within the trained %.0f - no position needs the "
+                             "extension, and the resolved scaling still applies to every angle\n",
+                             rope_cfg.orig_ctx);
+            // only when there IS a magnitude correction: YaRN's log term (ext_factor != 0) or an explicit
+            // --yarn-attn-factor; plain linear (mscale 1) has none, and saying otherwise was TODO 22
+            if (rope_cfg.mscale() != 1.0)
+                std::fprintf(stderr,
+                             "maya generate: note: the %s magnitude correction scales cos and sin by %.6f "
+                             "at every position\n",
+                             rope_cfg.type == RST::YaRN ? "YaRN" : "--yarn-attn-factor", rope_cfg.mscale());
         }
     }
     // before session_init: every graph captured from here on has the vector's kernels where it applies

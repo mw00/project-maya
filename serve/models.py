@@ -66,7 +66,12 @@ DS4_KEYS = ("context", "images", "gpus", "reserve_mib", "env", "parallel", "draf
             "cpu_threads", "prompt_lookup", "dspark_conf", "fast_prefill")
 MM3_KEYS = ("context", "images", "gpus", "env", "parallel", "draft", "tp", "kv_cache", "kv_streaming", "kv_resident",
             "cpu_threads", "reserve_gb", "prefill_chunk", "cache_gb", "dspark_conf")
-QWEN_KEYS = ("context", "images", "gpus", "reserve_mib", "env", "draft", "expert_cache", "prefill", "kv", "ram_gb")
+QWEN_ROPE_FLAGS = {"rope_scale": "--rope-scale", "rope_freq_base": "--rope-freq-base",
+                   "rope_freq_scale": "--rope-freq-scale", "yarn_orig_ctx": "--yarn-orig-ctx",
+                   "yarn_ext_factor": "--yarn-ext-factor", "yarn_attn_factor": "--yarn-attn-factor",
+                   "yarn_beta_fast": "--yarn-beta-fast", "yarn_beta_slow": "--yarn-beta-slow"}
+QWEN_KEYS = ("context", "images", "gpus", "reserve_mib", "env", "draft", "expert_cache", "prefill", "kv", "ram_gb",
+             "rope_scaling", *QWEN_ROPE_FLAGS)
 HY4_KEYS = ("context", "images", "gpus", "env", "draft", "tp", "reserve_gb", "prefill_chunk", "cpu_threads", "kv")
 HY4_KV_BYTES = 13 * (2 * (512 + 64) + 128 * 4 // 4)   # (maya.py's: its cache a context token, on each GPU of a group)
 HY4_Q4_CONTEXTS = [32768, 65536, 131072, 262144]   # AngelSlim's Q4_K_M: the setup's choices for it (maya.py's HY4_Q4_CONTEXTS)
@@ -431,7 +436,9 @@ def settings_of(cfg: dict) -> dict:
         out.update(images=bool(cfg.get("vision")), reserve_mib=_int(flag(args, "--vram-reserve-mib")),
                    draft="mtp" if flag(args, "--mtp") and flag(args, "--mtp-max-t") != "1" else "none",
                    expert_cache=None if ec == "auto" else _int(ec), prefill=None if pf == "auto" else _int(pf),
-                   kv=flag(args, "--kv", "fp16"), ram_gb=_int(ram))
+                   kv=flag(args, "--kv", "fp16"), ram_gb=_int(ram),
+                   rope_scaling=flag(args, "--rope-scaling", "auto"))
+        out.update({key: _float(flag(args, arg)) for key, arg in QWEN_ROPE_FLAGS.items()})
         return out
     if family(cfg) == "deepseek":
         dspark = flag(args, "--dspark")
@@ -577,6 +584,28 @@ def apply(cfg: dict, settings: dict) -> dict:
 
     reserve = _num(s, "reserve_mib", 0, 65536, "VRAM kept free") if fam not in ("minimax", "hy4") else None
     if fam == "qwen":
+        scaling = s.get("rope_scaling") or "auto"
+        if scaling not in ("auto", "none", "linear", "yarn"):
+            raise ValueError("RoPE scaling: model default, none, linear or yarn")
+        args = drop_flag(args, "--rope-scaling") if scaling == "auto" else set_flag(args, "--rope-scaling", scaling)
+        for key, arg in QWEN_ROPE_FLAGS.items():
+            value = s.get(key)
+            if value in (None, ""):
+                args = drop_flag(args, arg)
+                continue
+            try:
+                value = float(value) if not isinstance(value, bool) else float("nan")
+            except (TypeError, ValueError):
+                raise ValueError(f"{arg}: a finite number")
+            import math
+            valid = math.isfinite(value)
+            if key == "rope_scale": valid = valid and value >= 1
+            elif key == "rope_freq_base": valid = valid and (value == 0 or value > 1)
+            elif key in ("rope_freq_scale", "yarn_orig_ctx"): valid = valid and value >= 0
+            elif key == "yarn_ext_factor": valid = valid and value >= -1
+            else: valid = valid and value > 0
+            if not valid: raise ValueError(f"{arg}: outside the engine's numerical range")
+            args = set_flag(args, arg, f"{value:g}")
         if s.get("draft") not in can["draft"]:
             raise ValueError("Drafting: this pack has no MTP drafter (the setup builds it)" if s.get("draft") == "mtp"
                              else "Drafting: MTP or none")
