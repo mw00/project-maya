@@ -110,10 +110,13 @@ def chat_parts(cfg: dict):
     rendered as the server renders them."""
     import strata_tokenizer as ST
     from serve.frontend import ChatTemplate, effort_kwargs
+    from serve.server import chat_template_path
     tpath = Path(cfg["tokenizer"])
     tok = ST.Tokenizer.from_dir(tpath)
-    tpl_path = tpath / "chat_template.jinja"
-    tpl = ChatTemplate(tpl_path if tpl_path.exists() else ROOT / "serve" / "chat_template.jinja")
+    # (the server's own choice: an Inkling 2 pack's GGUF template is swapped for thinkingmachines' own, a GLM-5 pack's
+    #  for serve/glm5_chat_template.jinja - the pack's file read as it is rendered other prompts than the server's, and
+    #  the GGUF's Inkling template refused the tool calls' requests: "Tool declarations require a function object")
+    tpl = ChatTemplate(chat_template_path(tpath))
     try:
         kw = effort_kwargs(cfg.get("reasoning_effort"))
     except ValueError:                                 # (a level the template does not know: its own default)

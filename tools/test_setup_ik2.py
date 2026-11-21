@@ -54,7 +54,7 @@ class Names(unittest.TestCase):
         self.assertEqual(Q.config_stem("ik2", Q.IK2_QUANT), "maya-inkling-2-mini")
         for name in ("inkling-2-mini", "Inkling-2-Mini", "inkling-2-mini-ud-q4_k_xl", "ik2-mini", "INKLING2-MINI"):
             self.assertEqual(Q.resolve(name), ("ik2", Q.IK2_QUANT), name)
-        self.assertIsNone(Q.resolve("inkling-2-small"))   # (Inkling-2-Small: by hand, no setup)
+        self.assertEqual(Q.resolve("inkling-2-small"), ("ik2", Q.IK2_SMALL_QUANT))   # (Inkling-2-Small: AMD's setup)
         self.assertEqual((maya.IK2, maya.IK2_SHOWN, maya.IK2_MODEL_NAME),
                          ("Inkling-2-Mini", "Inkling 2 Mini", "inkling-2-mini"))
         self.assertIn("ik2", maya.FAMILIES)
