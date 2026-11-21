@@ -887,7 +887,8 @@ IK2_TOKENIZER_TOOLS = ("tools/strata_tokenizer.py", "tools/ik2/chat_template.jin
 IK2_DIR = "maya-ik2"                               # (in the model's folder: tokenizer/, sources.json)
 IK2_MODEL_NAME = "inkling-2-mini"
 IK2_MIN_CC = IK2F.MIN_CC
-FAMILIES = ("glm", "deepseek", "minimax", "qwen", "hy4", "ik2")
+IK2_PROFILE = ROOT / "data" / "expert-profile-ik2mini.bin"   # (the offload path's starting VRAM tier: maya-ik2's IK2_WARM)
+FAMILIES =("glm", "deepseek", "minimax", "qwen", "hy4", "ik2")
 SHARD_RE = re.compile(r"-(\d{5})-of-(\d{5})\.gguf$")
 
 
@@ -1736,7 +1737,7 @@ def check_pc(a, family: str = "glm", gguf: bool = False, ds4_quant: str = "exl3"
              ("install the NVIDIA driver (https://www.nvidia.com/drivers)" if WIN else
               "install the NVIDIA driver (Ubuntu: sudo ubuntu-drivers install)") + f", restart, and run {ME} again")
     if ik2:                                            # (no card new or large enough: the one line, before the list)
-        why = IK2F.unsupported("cuda", False, 0, found)
+        why = IK2F.unsupported("cuda", False, 0, found, mem_gb()[0])
         if why:
             fail(why)
     say("  NVIDIA GPUs:")
@@ -1746,7 +1747,7 @@ def check_pc(a, family: str = "glm", gguf: bool = False, ds4_quant: str = "exl3"
                                        f"too old (this model needs compute capability {min_cc / 10:.1f} or newer)"))
     chosen = choose_gpus(a, found, min_cc, family)
     if ik2:                                            # (the card picked: 24 GB or more)
-        why = IK2F.unsupported("cuda", False, len(chosen), chosen)
+        why = IK2F.unsupported("cuda", False, len(chosen), chosen, mem_gb()[0])
         if why:
             fail(why)
     archs = sorted({int(g["arch"]) for g in chosen})
@@ -11190,6 +11191,14 @@ def write_config_ik2(a, pc: dict, meta: dict, gguf: Path, tok: Path, ctx: int, m
     # (its cache in FP8 - half the bytes, the faster one deep in a context; the user's own variables kept)
     env = dict(old.get("env") or {})
     env.setdefault("IK2_KV", IK2F.DEFAULT_KV)
+    # (a card that does not hold every expert: the offload path's VRAM tier starts from Maya's profile of the
+    #  experts Inkling-2-Mini picks most - data/expert-profile-ik2mini.bin; where every expert fits, none)
+    vram = float(pc["gpus"][0].get("vram_gb") or 0) if pc.get("gpus") else 0.0
+    seed = str(IK2_PROFILE)
+    if IK2F.plan(vram, ctx, env["IK2_KV"])["layout"] == "offload" and IK2_PROFILE.is_file():
+        env.setdefault("IK2_WARM", seed)
+    elif env.get("IK2_WARM") == seed:
+        env.pop("IK2_WARM")
     env.update(parse_env(a.env))
     cfg["env"] = env
     if a.host:
@@ -11232,8 +11241,11 @@ def set_up_ik2(a, prev: dict) -> Path | None:
     ok(f"context: {ctx} tokens" + (" (recommended for this card's VRAM)" if ctx == rec else "") +
        f"; its cache: {ctx * IK2F.KV_BYTES.get(kv, IK2F.KV_BYTES['f16']) / 2**30:.1f} GB of VRAM ({kv.upper()})")
     if not fit["resident"]:
-        warn(f"at {context_label(ctx)} the model and its cache do not all fit in this card's {vram:.0f} GB: the "
-             f"engine then runs its slower path (a context of {context_label(rec)} keeps everything in VRAM)")
+        word, line = IK2F.verdict(vram, mem_gb()[0], ctx, kv)
+        keep = (f" (a context of {context_label(rec)} keeps everything in VRAM)"
+                if IK2F.plan(vram, rec, kv)["resident"] else "")
+        warn(f"at {context_label(ctx)} the model and its cache do not all fit in this card's {vram:.0f} GB: "
+             f"{line}{keep}" + (" - it may not start" if word == "tight" else ""))
     models = (Path(a.models_dir).expanduser().resolve() if a.models_dir else
               Path(inst["models_dir"]) if inst.get("models_dir") else ROOT.parent / "Maya-data" / "models")
     d = ik2_dir(a, models, prev)

@@ -400,8 +400,9 @@ class Settings(unittest.TestCase):
         self.assertEqual(m["contexts"], [32768, 65536, 131072, 262144])
         self.assertEqual(m["context_range"]["tested"], 262144)
         self.assertEqual(m["ik2_kv_bytes"], {"fp8": 16384, "f16": 32768})
-        self.assertEqual(m["ik2_fit"]["fp8"]["262144"], {"resident": True})
-        self.assertFalse(m["ik2_fit"]["f16"]["262144"]["resident"])
+        self.assertEqual({k: v for k, v in m["ik2_fit"]["fp8"]["262144"].items() if k in ("resident", "layout")},
+                         {"resident": True, "layout": "resident"})
+        self.assertEqual(m["ik2_fit"]["f16"]["262144"]["layout"], "offload")   # (the offload path: a tier on the card)
         self.assertGreaterEqual(m["size"], 1000)                               # (the GGUF)
         plan = M.delete_plan(self.d, self.d / "maya-inkling-2-mini.json")
         self.assertTrue(plan["ok"], plan.get("why"))
