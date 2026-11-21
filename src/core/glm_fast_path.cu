@@ -934,6 +934,14 @@ bool Glm5Model::fast_setup(std::string& err) {
         Ly.recr = is_mtp ? false : g.is_recr(il);
         Ly.moe = il >= g.dense_lead;
         Ly.mtp = is_mtp;
+        // the FFN width: the model's, or this tensor-parallel member's slice of the layer (glm_tp.cu)
+        Ly.ff = g.n_ff_exp;
+        Ly.ffd = g.n_ff_dense;
+        Ly.f0 = 0;
+        if (tp_on() && il < (int) tp_.f0.size()) {
+            Ly.f0 = tp_.f0[(size_t) il];
+            (Ly.moe ? Ly.ff : Ly.ffd) = tp_.f1[(size_t) il] - tp_.f0[(size_t) il];
+        }
         if (is_mtp) {
             // no hyper-connections: eh_proj in, plain residuals, the shared head's norm out
             Ly.eh = q("nextn.eh_proj.weight");
@@ -1015,10 +1023,14 @@ bool Glm5Model::fast_setup(std::string& err) {
             } else {
                 Ly.gu_type = nl.fmt.gu_type;
                 Ly.d_type = nl.fmt.d_type;
-                Ly.gu_bytes = (size_t) nl.fmt.gu_row * (size_t) g.n_ff_exp;
-                Ly.dn_bytes = (size_t) nl.fmt.d_row * (size_t) g.n_embd;
+                Ly.gu_bytes = (size_t) nl.fmt.gu_row * (size_t) Ly.ff;
+                Ly.d_row = Ly.ff == g.n_ff_exp ? nl.fmt.d_row : gf::row_bytes(Ly.d_type, Ly.ff);
+                Ly.dn_bytes = Ly.d_row * (size_t) g.n_embd;
                 Ly.down_off = 2 * Ly.gu_bytes;
                 Ly.blob = 2 * Ly.gu_bytes + Ly.dn_bytes;
+                Ly.src_gu = (size_t) nl.fmt.gu_row * (size_t) g.n_ff_exp;
+                Ly.src_d_row = nl.fmt.d_row;
+                Ly.src_dn = (size_t) nl.fmt.d_row * (size_t) g.n_embd;
                 if (!gf::moe_supported(Ly.gu_type) || !gf::moe_supported(Ly.d_type) ||
                     gf::row_bytes(Ly.gu_type, g.n_embd) != nl.fmt.gu_row ||
                     gf::row_bytes(Ly.d_type, g.n_ff_exp) != nl.fmt.d_row)
@@ -1260,7 +1272,9 @@ bool Glm5Model::fast_setup(std::string& err) {
     int n_moe = 0;
     for (int il = l0_; il < lt_; ++il)
         if (F->L[(size_t) il].moe) {
-            blob_max = std::max(blob_max, F->L[(size_t) il].blob);
+            // (a tensor-parallel member stages the whole expert and keeps its slice: glm_tp.cu tp_compact)
+            const auto& Lb = F->L[(size_t) il];
+            blob_max = std::max(blob_max, tp_on() ? std::max(Lb.blob, 2 * Lb.src_gu + Lb.src_dn) : Lb.blob);
             ++n_moe;
         }
     F->lp.assign((size_t) NL, FastState::LayerPool{});
@@ -3845,6 +3859,10 @@ static unsigned long long lane_plan(double c_ms, double p_ms, std::string* tab =
 bool Glm5Model::fast_cpu_lane_setup(std::string& err) {
     FastState* F = fast_;
     const Glm5Geometry& g = g_;
+    if (tp_on()) {   // tensor parallel (this version): every expert slice in VRAM, no CPU lane
+        F->cpu_fmt.assign(F->L.size(), strata::kernels::cpu::NativeFmt{});
+        return true;
+    }
     const char* lv = getenv(("MAYA_GLM_CPU_LANE" + std::to_string(dev_)).c_str());
     const bool own_count = lv != nullptr;   // this card's own count: a pool of its own
     if (lv == nullptr) lv = getenv("MAYA_GLM_CPU_LANE");
@@ -4653,6 +4671,14 @@ bool Glm5Model::fast_warm(std::string& err) {
             jobs.push_back(Job{il, e, P.slot_ptr(j), true});
         }
         next[(size_t) il] = nv;
+        // tensor parallel (this version): every member holds all its slices in VRAM - no RAM tier, no disk reads
+        if (tp_on() && nv < g.n_expert) {
+            err = "glm tp: CUDA" + std::to_string(dev_) + " holds " + std::to_string(nv) + " of layer " +
+                  std::to_string(il) + "'s " + std::to_string(g.n_expert) +
+                  " expert slices in VRAM - tensor parallel needs every one there for now (a shorter --max-context, "
+                  "more GPUs, or the layer split)";
+            return false;
+        }
     }
     // the RAM tier, round-robin over the layers so every layer gets its share of a class that cannot hold all
     std::vector<int> rfree(F->rc.size(), 0), rcur(F->rc.size(), 0);
@@ -4712,6 +4738,14 @@ bool Glm5Model::fast_warm(std::string& err) {
                 return;
             }
             const Shard& sh = pack_shards_[(size_t) (role == 0 ? nl.gate_shard : role == 1 ? nl.up_shard : nl.down_shard)];
+            if (tp_on()) {   // tensor parallel: the whole expert into the staging, its slice kept below (tp_compact)
+                const uint64_t so = role == 0   ? nl.gate_off + (uint64_t) J.e * Ly.src_gu
+                                    : role == 1 ? nl.up_off + (uint64_t) J.e * Ly.src_gu
+                                                : nl.down_off + (uint64_t) J.e * Ly.src_dn;
+                read_slice(sh, so, role == 2 ? Ly.src_dn : Ly.src_gu,
+                           F->stage[(size_t) (job / 3)] + (role == 0 ? 0 : role == 1 ? Ly.src_gu : 2 * Ly.src_gu));
+                return;
+            }
             const uint64_t off = role == 0   ? nl.gate_off + (uint64_t) J.e * Ly.gu_bytes
                                  : role == 1 ? nl.up_off + (uint64_t) J.e * Ly.gu_bytes
                                              : nl.down_off + (uint64_t) J.e * Ly.dn_bytes;
@@ -4746,6 +4780,7 @@ bool Glm5Model::fast_warm(std::string& err) {
         }
         for (int k = 0; k < nb; ++k) {
             const Job& J = jobs[b + (size_t) k];
+            if (tp_on()) glmfast::tp_compact(F->stage[(size_t) k], F->L[(size_t) J.il], g.n_embd);
             if (J.vram)
                 cudaMemcpyAsync(J.dst, F->stage[(size_t) k], F->L[(size_t) J.il].blob, cudaMemcpyHostToDevice, F->copy);
             done_bytes += F->L[(size_t) J.il].blob;
@@ -6921,7 +6956,7 @@ bool Glm5Model::fast_moe(int il, bool& pf_pending, std::string& err, bool cpu_wa
     const Glm5Geometry& g = g_;
     cudaStream_t s = F->cs;
     const auto& Ly = F->L[(size_t) il];
-    const int FFs = g.n_ff_exp * g.n_shared;
+    const int FFs = Ly.ff * g.n_shared;
     gf::MvJob j[gf::kMaxMvJobs];
     int nj = 3;
     j[0] = {Ly.router_w, nullptr, F->x, F->rlog, nullptr, 1.0f, Ly.router_type, g.n_embd, g.n_expert};
@@ -6958,7 +6993,7 @@ void Glm5Model::fast_moe_route(int il, const MoeIo& io, const gf::MoeDev& md, vo
     FastState* F = fast_;
     const Glm5Geometry& g = g_;
     const auto& Ly = F->L[(size_t) il];
-    const int FFs = g.n_ff_exp * g.n_shared;
+    const int FFs = Ly.ff * g.n_shared;
     // MAYA_GLM_PROMOTE_MIN=<n>: a fetched expert is kept in VRAM only when its aged route count clears n.
     // Unset or <= 1: the old rule (keep it whenever a spare is free).
     static const int promote_min_start = [] {   // glm-dsa request knobs: the start value
@@ -6995,7 +7030,7 @@ bool Glm5Model::fast_moe_experts(int il, const MoeIo& io, bool pred, int n_ah, c
     const Glm5Geometry& g = g_;
     cudaStream_t s = F->cs;
     const auto& Ly = F->L[(size_t) il];
-    const int FFs = g.n_ff_exp * g.n_shared;
+    const int FFs = Ly.ff * g.n_shared;
     // the prefetch list of THIS route lives in the buffer of this layer's parity (the side stream may still
     // read the previous layer's list while this route writes)
     gf::MoeDev md = F->md;
@@ -7084,10 +7119,10 @@ bool Glm5Model::fast_moe_experts(int il, const MoeIo& io, bool pred, int n_ah, c
         err = "glm fast: shared expert down";
         return false;
     }
-    gf::moe_gate_up(Ly.gu_type, md, g.n_exp_used, g.n_embd, g.n_ff_exp, g.swiglu_exp, io.xq, F->hq,
+    gf::moe_gate_up(Ly.gu_type, md, g.n_exp_used, g.n_embd, Ly.ff, g.swiglu_exp, io.xq, F->hq,
                     sh_apart ? nullptr : Ly.sh_down.q, Ly.sh_down.type, F->sh_hq, FFs, F->sh_out, s);
     if (F->prof_on) F->mark("moe_gate_up");
-    gf::moe_down(Ly.d_type, md, g.n_exp_used, g.n_embd, g.n_ff_exp, Ly.down_off, F->hq,
+    gf::moe_down(Ly.d_type, md, g.n_exp_used, g.n_embd, Ly.ff, Ly.down_off, F->hq,
                  Ly.sh_down.q != nullptr ? F->sh_out : nullptr, io.ffn, s);
     if (F->prof_on) F->mark("moe_down");
     }
@@ -7135,7 +7170,7 @@ bool Glm5Model::fast_layers(int64_t p, bool hop_in, std::string& err) {
     float* Ro = state_ + (int64_t) g.hc * g.n_embd;
     // the decode layers as CUDA graphs (kda_graph_wanted): a graphs=0 request, the spec gate, profiling, dumps,
     // prefetch, lookahead and the DFlash capture launch directly; so does an engine whose capture once failed
-    bool graphs = kda_graph_wanted() && !F->kda_graph_broken && (F->win.pipe_t < 8) && !F->spec_gate &&
+    bool graphs = kda_graph_wanted() && !tp_on() && !F->kda_graph_broken && (F->win.pipe_t < 8) && !F->spec_gate &&
                   !F->prof_on && !dumps && F->max_pf == 0 && F->n_ahead == 0 &&
                   getenv("GLM_DUMP_H") == nullptr && cap_d_ == nullptr && glmknob::get(glmknob::GraphsOff, 0) == 0;
     // the route kernel's per-request arguments, in the graphs' key (fast_moe_route reads the same values)
@@ -7262,6 +7297,7 @@ bool Glm5Model::fast_layers(int64_t p, bool hop_in, std::string& err) {
         } else {
             if (!fast_dsa(il, p, err)) return false;
         }
+        if (tp_on()) tp_all_reduce(F->mixer, s);   // tensor parallel: the members' mixer parts, summed (glm_tp.cu)
 
         if (deferred) {   // the previous layer's CPU experts, into the streams before they are read again
             gf::moe_cpu_wait_streams(F->md, g.n_embd, F->defer_post, Rc, g.hc, s);
@@ -7291,13 +7327,13 @@ bool Glm5Model::fast_layers(int64_t p, bool hop_in, std::string& err) {
 
             if (!Ly.moe) {
                 gf::MvJob j[2];
-                j[0] = {Ly.ffn_gate.q, F->xq, F->x, F->dg, nullptr, 1.0f, Ly.ffn_gate.type, g.n_embd, g.n_ff_dense};
-                j[1] = {Ly.ffn_up.q, F->xq, F->x, F->du, nullptr, 1.0f, Ly.ffn_up.type, g.n_embd, g.n_ff_dense};
+                j[0] = {Ly.ffn_gate.q, F->xq, F->x, F->dg, nullptr, 1.0f, Ly.ffn_gate.type, g.n_embd, Ly.ffd};
+                j[1] = {Ly.ffn_up.q, F->xq, F->x, F->du, nullptr, 1.0f, Ly.ffn_up.type, g.n_embd, Ly.ffd};
                 if (!gf::mv(j, 2, s)) { err = "glm fast: dense ffn"; return false; }
                 if (F->prof_on) F->mark("dense_gu_mv");
-                gf::swiglu_q8(F->dg, F->du, g.swiglu_shexp, g.n_ff_dense, F->dhq, s);
+                gf::swiglu_q8(F->dg, F->du, g.swiglu_shexp, Ly.ffd, F->dhq, s);
                 if (F->prof_on) F->mark("dense_swiglu");
-                gf::MvJob dn = {Ly.ffn_down.q, F->dhq, nullptr, F->ffn, nullptr, 1.0f, Ly.ffn_down.type, g.n_ff_dense,
+                gf::MvJob dn = {Ly.ffn_down.q, F->dhq, nullptr, F->ffn, nullptr, 1.0f, Ly.ffn_down.type, Ly.ffd,
                                 g.n_embd};
                 if (!gf::mv(&dn, 1, s)) { err = "glm fast: dense ffn down"; return false; }
                 if (F->prof_on) F->mark("dense_down_mv");
@@ -7309,6 +7345,7 @@ bool Glm5Model::fast_layers(int64_t p, bool hop_in, std::string& err) {
                     deferred = true;
                 }
             }
+            if (tp_on()) tp_all_reduce(F->ffn, s);   // tensor parallel: the members' FFN parts, summed (glm_tp.cu)
             if (dumps) fast_dump(s, "ffn_out-" + std::to_string(il), F->ffn, g.n_embd);
             return true;
         };
@@ -7364,6 +7401,7 @@ bool Glm5Model::fast_layers(int64_t p, bool hop_in, std::string& err) {
 }
 
 bool Glm5Model::fast_token(int32_t token, std::string& err) {
+    if (tp_on()) return fast_token_tp(token, err);   // tensor parallel: the whole group (glm_tp.cu)
     FastState* F = fast_;
     const Glm5Geometry& g = g_;
     const int64_t p = pos_++;

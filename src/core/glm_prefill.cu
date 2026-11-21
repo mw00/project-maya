@@ -4910,6 +4910,7 @@ int64_t Glm5Model::prefill_floor(int64_t nn, int call_min) const {
 
 bool Glm5Model::prefill(const std::vector<int32_t>& tokens, std::string& err, int32_t next_token) {
     err.clear();
+    if (tp_on()) return false;   // tensor parallel (this version): no prompt path - the token path reads the prompt
     if (prefill_tokens_dsa(tokens, next_token, err) || !err.empty()) return err.empty();   // glm-dsa B11.1: glm-dsa + NextN off the batched path (glm_dsa_mixer.cu)
     prefill_next_ = next_token;
     if (fast_ == nullptr || tokens.empty()) return false;

@@ -636,6 +636,7 @@ bool Glm5Geometry::from_gguf(const maya::GgufFile& g, Glm5Geometry& out, std::st
 
 Glm5Model::~Glm5Model() {
     ckpt_join();
+    tp_destroy();   // tensor parallel: the other members and the host side first (glm_tp.cu)
     if (split_next_) split_next_.reset();   // the tail half first (its service thread, its device)
     cudaSetDevice(dev_);   // every free below belongs to this half's device
     if (abl_r_ != nullptr) cudaFree(abl_r_);   // (--ablate: this part's copy of the direction)
@@ -849,6 +850,7 @@ void Glm5Model::reset() {
     mtp_hx_pos_ = -1;   // (head_x holds no position of the new sequence)
     mtp_carry_reset();   // glm-dsa: a sequence starting at pos 0 drafts from a zero carrier
     dflash_reset();   // a new sequence: the drafter's cached positions belong to the old one
+    for (auto& m : tp_peers_) m->reset();   // tensor parallel: every member's share of the state (glm_tp.cu)
     if (split_next_) {
         split_next_->reset();
         cudaSetDevice(dev_);
@@ -2073,6 +2075,19 @@ bool Glm5Model::load_pack_place(const std::string& pack_dir, int64_t max_ctx, st
     // device; =<layer>[,<layer>..] pins the boundaries; MAYA_GLM_DEV1 picks the second device of a
     // two-part split (default 1), MAYA_GLM_DEVS the devices of any split.
     if (!glm_pack_geometry(pack_dir, g_, err)) return false;   // glm-dsa B1.5: bounds checked against this pack
+    // MAYA_GLM_TP=N (opt-in): tensor parallel over the first N GPUs of MAYA_GLM_DEVS (else 0..N-1) - glm_tp.cu
+    if (const char* tp = getenv("MAYA_GLM_TP"); tp != nullptr && std::atoi(tp) >= 2) {
+        std::vector<int> devs;
+        if (const char* dv = getenv("MAYA_GLM_DEVS"); dv != nullptr && dv[0] != '\0') {
+            std::stringstream ss(dv);
+            std::string t;
+            while (std::getline(ss, t, ',')) devs.push_back(std::atoi(t.c_str()));
+        }
+        for (int d = 0; (int) devs.size() < std::atoi(tp); ++d)
+            if (std::find(devs.begin(), devs.end(), d) == devs.end()) devs.push_back(d);
+        devs.resize((size_t) std::atoi(tp));
+        return load_pack_tp(pack_dir, max_ctx, devs, err);
+    }
     const bool kv_auto = glm_dsa_kv_auto(g_, max_ctx);       // decision 36 (glm-dsa only; Flash: false)
     const char* sp = getenv("MAYA_GLM_SPLIT");
     const std::string spec = sp != nullptr ? std::string(sp) : layer_split;
@@ -3005,7 +3020,7 @@ bool maya::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max_c
             return il >= l0_ && il < l1_;
         }
         if (n == "token_embd.weight") return l0_ == 0;
-        if (n == "output.weight" || n == "output_norm.weight") return l1_ == g_.n_layers;
+        if (n == "output.weight" || n == "output_norm.weight") return l1_ == g_.n_layers && tp_cut(n).mode != 3;
         return true;
     };
 
@@ -3202,6 +3217,30 @@ bool maya::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max_c
         return (fast_mode_ || g_.arch == GlmArch::GlmDsa) && r.kind == "4" && t->elements() >= 65536;   // glm-dsa B3.5
     };
     const auto skip_upload = [&](const Row& r) { return fast_mode_ && r.name == "token_embd.weight"; };
+    // tensor parallel (glm_tp.cu): a tensor's shape on this member - its rows are its last dimension (a 1-D tensor is
+    // one row), and the cut keeps rows [a0, a1) or columns [a0, a1) of every row
+    const auto tp_shape = [&](const std::string& name, const strata::TensorInfo* t, strata::TensorInfo& out) -> TpCut {
+        const TpCut c = tp_cut(name);
+        out = *t;
+        if (c.mode == 1 || c.mode == 2) {
+            const uint64_t rows = t->shape.size() >= 2 ? t->shape.back() : 1, ne0 = t->elements() / rows;
+            out.shape = {c.mode == 2 ? (uint64_t) (c.a1 - c.a0) : ne0, c.mode == 1 ? (uint64_t) (c.a1 - c.a0) : rows};
+        }
+        return c;
+    };
+    // ... and the copy of that share: src holds the whole tensor (rows of ne0 elements in blocks of bw elements of bb
+    // bytes), dst gets the member's rows, or every row's columns, back to back
+    const auto tp_copy = [](const TpCut& c, const uint8_t* src, const strata::TensorInfo* t, int64_t bw, size_t bb,
+                            uint8_t* dst) {
+        const uint64_t rows = t->shape.size() >= 2 ? t->shape.back() : 1, ne0 = t->elements() / rows;
+        const size_t row_b = (size_t) (ne0 / (uint64_t) bw) * bb;
+        if (c.mode == 1) {
+            std::memcpy(dst, src + (size_t) c.a0 * row_b, (size_t) (c.a1 - c.a0) * row_b);
+            return;
+        }
+        const size_t o = (size_t) (c.a0 / bw) * bb, n = (size_t) ((c.a1 - c.a0) / bw) * bb;
+        for (uint64_t r = 0; r < rows; ++r) std::memcpy(dst + r * n, src + r * row_b + o, n);
+    };
     uint64_t bytes = 0;
     std::map<std::string, uint64_t> by_kind;   // MAYA_GLM_TIMING: the dense weights' VRAM by kind and storage
     const auto kind_of = [](const std::string& n) -> std::string {
@@ -3240,7 +3279,9 @@ bool maya::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max_c
         }
         if (skip_upload(r)) continue;
         std::string how;
-        const uint64_t b = pack_row_vram(r.name, r.kind, t, fast_mode_, &how, g_.arch == GlmArch::GlmDsa);
+        strata::TensorInfo tcut;   // tensor parallel: this member's share of it (the whole tensor otherwise)
+        (void) tp_shape(r.name, t, tcut);
+        const uint64_t b = pack_row_vram(r.name, r.kind, &tcut, fast_mode_, &how, g_.arch == GlmArch::GlmDsa);
         bytes += b;
         by_kind[kind_of(r.name.substr(r.name.find('.', 4) + 1)) + how] += b;
     }
@@ -3344,9 +3385,15 @@ bool maya::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max_c
                 err = "pack: short read on dense.bin for " + r.name;
                 return false;
             }
-            { cudaError_t e_ = cudaMemcpy((uint8_t*) w_arena_ + at, raw.data(), (size_t) r.bytes, cudaMemcpyHostToDevice); if (e_ != cudaSuccess) { err = std::string("pack: ") + cudaGetErrorString(e_); return false; } }
+            strata::TensorInfo tc;
+            if (const TpCut c = tp_shape(r.name, t, tc); c.mode == 1 || c.mode == 2) {   // tensor parallel: the share
+                std::vector<uint8_t> cut((size_t) tc.elements() * 2);
+                tp_copy(c, raw.data(), t, 1, 2, cut.data());
+                raw.swap(cut);
+            }
+            { cudaError_t e_ = cudaMemcpy((uint8_t*) w_arena_ + at, raw.data(), raw.size(), cudaMemcpyHostToDevice); if (e_ != cudaSuccess) { err = std::string("pack: ") + cudaGetErrorString(e_); return false; } }
             w16_[r.name] = (const uint16_t*) ((uint8_t*) w_arena_ + at);
-            at += (r.bytes + 255u) & ~(uint64_t) 255u;
+            at += ((uint64_t) raw.size() + 255u) & ~(uint64_t) 255u;
             continue;
         }
         if (!dequant_at_load(r.name)) {
@@ -3356,15 +3403,26 @@ bool maya::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max_c
                 err = "pack: native tensor " + r.name + " not found in any shard";
                 return false;
             }
-            const maya::TensorInfo* ti = gfs[(size_t) si]->find(r.name);
+            const maya::TensorInfo* ti0 = gfs[(size_t) si]->find(r.name);
+            maya::TensorInfo tcq;   // tensor parallel: this member's share (the whole tensor otherwise)
+            const TpCut cq = tp_shape(r.name, ti0, tcq);
+            const maya::TensorInfo* ti = &tcq;
             const size_t nbytes = maya::kernels::native_mmvq_weight_bytes(ti->type, (int) ti->shape[0],
                                                                             (int) (ti->elements() / ti->shape[0]));   // glm-dsa B10.7: 3-D native rows
             const uint8_t* src = pack_shards_[(size_t) si].base + gfs[(size_t) si]->data_start() + ti->offset;
+            const uint8_t* const whole = src;   // (token_embd's rows: the shard mapping, never a share)
+            std::vector<uint8_t> share;
+            if (cq.mode == 1 || cq.mode == 2) {
+                const ggml_type qt = (ggml_type) ti->type;
+                share.assign(nbytes, 0);
+                tp_copy(cq, src, ti0, ggml_blck_size(qt), ggml_type_size(qt), share.data());
+                src = share.data();
+            }
             { cudaError_t e_ = cudaMemcpy((uint8_t*) w_arena_ + at, src, nbytes, cudaMemcpyHostToDevice); if (e_ != cudaSuccess) { err = std::string("pack: ") + cudaGetErrorString(e_); return false; } }
             ws_map_[r.name] = maya::core::WSlot{nullptr, (int) ti->type, (const void*) ((uint8_t*) w_arena_ + at),
                                     (int64_t) ti->shape[0], (int64_t) ti->shape[1]};
             if (r.name == "token_embd.weight") {
-                pack_emb_src_ = src;
+                pack_emb_src_ = whole;
                 pack_emb_type_ = (int) ti->type;
             }
             at += (nbytes + 255u) & ~(uint64_t) 255u;
@@ -3417,11 +3475,21 @@ bool maya::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max_c
             err = "pack: unsupported dense kind '" + r.kind + "' for " + r.name;
             return false;
         }
-        { cudaError_t e_ = cudaMemcpy((uint8_t*) w_arena_ + at, host.data(), (size_t) n_f32 * 4,
+        uint64_t n_up = n_f32;   // tensor parallel: this member's share of the floats
+        {
+            strata::TensorInfo tc;
+            if (const TpCut c = tp_shape(r.name, t, tc); c.mode == 1 || c.mode == 2) {
+                std::vector<float> cut((size_t) tc.elements());
+                tp_copy(c, (const uint8_t*) host.data(), t, 1, 4, (uint8_t*) cut.data());
+                host.swap(cut);
+                n_up = (uint64_t) host.size();
+            }
+        }
+        { cudaError_t e_ = cudaMemcpy((uint8_t*) w_arena_ + at, host.data(), (size_t) n_up * 4,
                             cudaMemcpyHostToDevice); if (e_ != cudaSuccess) { err = std::string("pack: ") + cudaGetErrorString(e_); return false; } }
         w_[r.name] = (const float*) ((uint8_t*) w_arena_ + at);
         ws_map_[r.name] = maya::core::WSlot{(const float*) ((uint8_t*) w_arena_ + at), 0, nullptr, 0, 0};
-        at += (n_f32 * 4 + 255u) & ~(uint64_t) 255u;
+        at += (n_up * 4 + 255u) & ~(uint64_t) 255u;
     }
     if (head_half_) {
         // the helper's half of the head: per 16-row slice the tiles of columns [c0, n) (a 2-D copy out of the
@@ -3487,6 +3555,9 @@ bool maya::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max_c
 
     // 4b. the NextN (MTP) block on the LAST half of the fast path: its own weights from the shards (the pack never
     //     carried blk.<n_layers>.*), its experts through the tiers like any MoE layer
+    // (tensor parallel: from here on this member's geometry has its own heads - the KDA and MLA mixers' state,
+    // buffers and kernels; the FFN widths are per layer, FastState::Layer::ff / ffd - and no draft block yet)
+    if (tp_on()) g_.n_head = tp_.h1 - tp_.h0;
     lt_ = l1_;
     // (only the tail of a split uses it - the pipelined speculative decode; one device would carry its weights and
     // expert slots for nothing until a batched verify exists; MAYA_GLM_MTP=1 loads it anyway)
@@ -3516,7 +3587,7 @@ bool maya::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max_c
     // for the one-GPU MTP decode - glm_mtp.cu: by default on the Strix / Gorgon Halo APUs)
     // (glm-dsa too since L1-4: its NextN cache rows and the verify window run glm-dsa's own caches)
     const bool mtp_one = l0_ == 0 && mtp_decode_wanted(dev_, n_parts_, g_.arch == GlmArch::GlmDsa);
-    if (fast_mode_ && l1_ == g_.n_layers && (g_.nextn > 0 || mtp_extra) &&
+    if (fast_mode_ && l1_ == g_.n_layers && (g_.nextn > 0 || mtp_extra) && !tp_on() &&
         !maya::platform::env_switch("MAYA_GLM_NO_MTP") &&
         (l0_ > 0 || getenv("MAYA_GLM_MTP") != nullptr || mtp_one)) {   // any split: the speculative decode, 2+ parts
         if (!load_mtp(gfs, err)) return false;

@@ -593,6 +593,11 @@ struct Glm5Model::FastState {
         WSlot ffn_gate, ffn_up, ffn_down;
         int gu_type = 0, d_type = 0;
         size_t blob = 0, down_off = 0, gu_bytes = 0, dn_bytes = 0;
+        // the FFN width this instance computes (the routed experts', the shared expert's per expert, the dense FFN's):
+        // the model's own, or a tensor-parallel member's slice [f0, f0 + ff) - then the blob above is the slice's and
+        // src_gu / src_dn / src_d_row are the whole expert's in the shards (the reads take those, glm_tp.cu compacts)
+        int ff = 0, ffd = 0, f0 = 0;
+        size_t src_gu = 0, src_dn = 0, src_d_row = 0, d_row = 0;
         // EXL3 (an exl3.txt pack): the routed experts' blob layout, and the indexer's q_b when it is an EXL3 matrix
         bool exl3 = false;
         maya::kernels::exl3::ExpertLayout xl;
@@ -1060,6 +1065,12 @@ struct Glm5Model::FastState {
         return false;
     }
 };
+namespace glmfast {
+/// Tensor parallel (glm_tp.cu): a whole expert staged at the shards' layout ([gate | up | down] of Ly.src_*) becomes
+/// this member's slice in place - gate and up rows [f0, f0 + ff), every down row's columns [f0, f0 + ff) - at the
+/// layout of Ly.gu_bytes / Ly.d_row (Ly.blob bytes).
+void tp_compact(uint8_t* blob, const Glm5Model::FastState::Layer& Ly, int n_embd);
+}  // namespace glmfast
 
 // KV streaming (Glm5Model::kv_stream_setup): per DSA layer of this part (the NextN block's too), its latent cache in
 // pinned host memory - the authoritative copy, position order - and the residency map of its VRAM slots, which are
