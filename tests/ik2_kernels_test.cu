@@ -1095,6 +1095,124 @@ void test_attn_f16() {
     for (float* p : {dq, dr, ds, dp, scratch, out, one}) cudaFree(p);
 }
 
+float e4m3fn_to_f32_host(uint8_t q);
+// attn_decode_mma_{f16,fp8} (one token's attention, a warp straight from the cache) against a double reference:
+// 1 to 8 heads a K / V head, linear and ring caches, a window, the bias within and past its extent, the sink, a
+// first token, a context shorter than a step, splits with and without keys; the FP8 cache with every finite byte
+// (the subnormals among them).
+void test_attn_decode_mma() {
+    const int D = 128, d_rel = 16;
+    struct Case {
+        int H, KV, qpos, window, extent, kv_cap, n_split;
+        const char* name;
+    };
+    const Case cases[] = {
+        {12, 4, 0, 1 << 30, 64, 0, 1, "first token"},
+        {12, 4, 9, 1 << 30, 64, 0, 3, "10 keys, 3 blocks"},
+        {24, 8, 2499, 1 << 30, 1024, 0, 5, "2500 keys, 3 heads a K/V head"},
+        {8, 1, 1000, 1 << 30, 200, 0, 2, "1001 keys, 8 heads a K/V head"},
+        {4, 4, 333, 1 << 30, 64, 0, 7, "334 keys, 1 head a K/V head"},
+        {12, 2, 2000, 256, 256, 400, 2, "ring 400, window 256, 6 heads"},
+        {10, 2, 5000, 1024, 1024, 1056, 4, "ring 1056, window 1024, 5 heads"},
+    };
+    for (int fp8 = 0; fp8 < 2; ++fp8)
+        for (const Case& c : cases) {
+            const int H = c.H, KV = c.KV, n_pos = c.qpos + 1, rows = c.kv_cap > 0 ? c.kv_cap : n_pos;
+            const float k_inv = fp8 ? 1.0f / 16.0f : 1.0f, v_inv = fp8 ? 1.0f / 32.0f : 1.0f;
+            // the cache's values as the kernel reads them: kf, vf [n_pos][KV * D] (before the scales)
+            std::vector<float> kf((size_t) n_pos * KV * D), vf((size_t) n_pos * KV * D);
+            std::vector<uint16_t> k16, v16;
+            std::vector<uint8_t> k8, v8;
+            if (fp8) k8.assign((size_t) rows * KV * D, 0x7e), v8.assign((size_t) rows * KV * D, 0x7e);
+            else k16.assign((size_t) rows * KV * D, 0x7e00), v16.assign((size_t) rows * KV * D, 0x7e00);   // (NaN: unused)
+            for (int pos = 0; pos < n_pos; ++pos) {
+                const size_t pr = (size_t) (c.kv_cap > 0 ? pos % c.kv_cap : pos) * KV * D;
+                for (int x = 0; x < KV * D; ++x) {
+                    const size_t i = (size_t) pos * KV * D + x;
+                    if (fp8) {
+                        uint8_t bk = (uint8_t) (rng() & 0xFFu), bv = (uint8_t) (rng() & 0xFFu);
+                        if ((bk & 0x7F) >= 0x60) bk &= 0xDFu;   // (magnitudes under 32, as a clipped K times 16)
+                        if ((bv & 0x7F) >= 0x60) bv &= 0xDFu;
+                        k8[pr + x] = bk, v8[pr + x] = bv;
+                        kf[i] = e4m3fn_to_f32_host(bk), vf[i] = e4m3fn_to_f32_host(bv);
+                    } else {
+                        k16[pr + x] = f2h_host(frand(1.0f)), v16[pr + x] = f2h_host(frand(1.0f));
+                        kf[i] = h2f_host(k16[pr + x]), vf[i] = h2f_host(v16[pr + x]);
+                    }
+                }
+            }
+            auto qf = fvec((size_t) H * D, fp8 ? 2.0f : 4.0f);
+            std::vector<uint16_t> q16(qf.size());
+            for (size_t i = 0; i < qf.size(); ++i) q16[i] = f2h_host(qf[i]);
+            auto r = fvec((size_t) H * d_rel, 2.0f), proj = fvec((size_t) c.extent * d_rel), sink = fvec((size_t) H, 3.0f);
+            auto gate = fvec((size_t) H * D, 3.0f);   // (the FP8 runs go through the gate and take the FP16 copy)
+            const float scale = 1.0f / std::sqrt((float) D);
+            uint16_t* dq = dev(q16);
+            float *dr = dev(r), *dp = dev(proj), *ds = dev(sink), *dout = dev_n<float>((size_t) H * D), *dg = dev(gate);
+            uint16_t* dout16 = dev_n<uint16_t>((size_t) H * D);
+            float* dscr = dev_n<float>(k::attn_decode_mma_scratch(H, c.n_split));
+            std::vector<int> pos_h = {c.qpos};
+            int* dpos = dev(pos_h);
+            if (fp8) {
+                uint8_t *dk = dev(k8), *dv = dev(v8);
+                k::attn_decode_mma_fp8(dq, dr, ds, dk, dv, c.kv_cap, H, KV, dpos, -1, c.n_split, scale * k_inv, v_inv, dp,
+                                       d_rel, c.extent, c.window, dscr, dout, dg, dout16, 0);
+                CU(cudaDeviceSynchronize());
+                cudaFree(dk), cudaFree(dv);
+            } else {
+                uint16_t *dk = dev(k16), *dv = dev(v16);
+                k::attn_decode_mma_f16(dq, dr, ds, dk, dv, c.kv_cap, H, KV, nullptr, c.qpos, c.n_split, scale, dp, d_rel,
+                                       c.extent, c.window, dscr, dout, nullptr, nullptr, 0);
+                CU(cudaDeviceSynchronize());
+                cudaFree(dk), cudaFree(dv);
+            }
+            const int lo = std::max(0, c.qpos - (c.window < (1 << 30) ? c.window : c.qpos + 1) + 1);
+            std::vector<double> want((size_t) H * D);
+            double mag = 0;   // the largest sum of |terms| of an output (the tolerance below)
+            for (int h = 0; h < H; ++h) {
+                const int g = h / (H / KV);
+                std::vector<double> l(c.qpos + 1 - lo);
+                double m = sink[h];
+                for (int kp = lo; kp <= c.qpos; ++kp) {
+                    double a = 0;
+                    for (int d = 0; d < D; ++d)
+                        a += (double) h2f_host(q16[(size_t) h * D + d]) * kf[((size_t) kp * KV + g) * D + d];
+                    a *= (double) (scale * k_inv);
+                    if (c.qpos - kp < c.extent)
+                        for (int e = 0; e < d_rel; ++e)
+                            a += (double) r[h * d_rel + e] * proj[(size_t) (c.qpos - kp) * d_rel + e];
+                    l[kp - lo] = a;
+                    m = std::max(m, a);
+                }
+                double sum = std::exp(sink[h] - m);
+                for (double a : l) sum += std::exp(a - m);
+                for (int d = 0; d < D; ++d) {
+                    double o = 0, oa = 0;
+                    for (int kp = lo; kp <= c.qpos; ++kp) {
+                        const double t = std::exp(l[kp - lo] - m) / sum * vf[((size_t) kp * KV + g) * D + d];
+                        o += t, oa += std::fabs(t);
+                    }
+                    const double gs = fp8 ? 1.0 / (1.0 + std::exp(-(double) gate[(size_t) h * D + d])) : 1.0;
+                    want[(size_t) h * D + d] = o * (double) v_inv * gs;
+                    mag = std::max(mag, oa * (double) v_inv);
+                }
+            }
+            char label[96];
+            std::snprintf(label, sizeof label, "mma %s %s", fp8 ? "fp8" : "f16", c.name);
+            // (P is FP16 in the P V product: 2^-11 of a term)
+            const auto got = host(dout, want.size());
+            expect(label, got, want, 1e-2, std::max(1e-6, 1e-3 * mag));
+            if (fp8) {   // the FP16 copy: the output's rounding
+                const auto h16 = host(dout16, want.size());
+                bool same = true;
+                for (size_t i = 0; i < got.size(); ++i) same &= h16[i] == f2h_host(got[i]);
+                if (!same) expect_true("mma fp8: the FP16 copy is the output rounded", false);
+            }
+            cudaFree(dq), cudaFree(dpos), cudaFree(dout16);
+            for (float* p : {dr, dp, ds, dout, dscr, dg}) cudaFree(p);
+        }
+}
+
 // attn_flash_f16 (the fused prefill attention) against a double reference: linear and ring caches, a window, the
 // relative bias table, the sink, a chunk from 0 and one at an offset, 1 to 7 key splits (some of them empty).
 void test_attn_flash() {
@@ -2153,6 +2271,7 @@ int main() {
     test_fp8_kv();
     test_round6();
     test_attn_flash();   // (last: its random data leaves the others' as they were)
+    test_attn_decode_mma();
     std::printf(g_fail ? "FAILED: %d check(s)\n" : "all passed\n", g_fail);
     return g_fail ? 1 : 0;
 }

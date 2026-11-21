@@ -1890,8 +1890,9 @@ void run_head(const Model& M, int T, bool all_logits, OutMode out_mode, int nb, 
 bool g_fast = false;        // set at load: every expert resident, one GPU, the dense weights as blocks (IK2_FAST=0: no)
 bool g_fast_want = false;
 bool g_graph = true;        // IK2_GRAPH=0: the resident path's launches one by one
-bool g_attn_mma = true;     // IK2_ATTN_MMA=0: a full layer's token attention through the scalar kernel
-constexpr int kMmaSplits = 32;   // the splits of a full layer's keys (a block a K / V head and split)
+int g_attn_mma = 1;         // a token's attention on the tensor cores (IK2_ATTN_MMA=0: the scalar kernels; 2: the
+                            // layers without a window only)
+int g_mma_split = 1;        // its blocks a K / V head (k::attn_decode_mma_blocks: the device filled once)
 struct FastGraph {
     cudaGraph_t graph = nullptr;
     cudaGraphExec_t exec = nullptr;
@@ -1995,18 +1996,20 @@ void fast_token_launches(Model& M, Work& W, OutMode out_mode) {
         const int extent = Ly.sliding ? c.extent_swa : c.extent;
         const int window = Ly.sliding ? c.window : (1 << 30);
         const int P = Ly.sliding ? P_sl : P_full;
-        // a full layer's keys are the whole context: its attention on the tensor cores (IK2_ATTN_MMA=0: as a sliding
-        // layer's), from an FP16 copy of q
-        const bool mma = g_attn_mma && !Ly.sliding;
+        // the attention on the tensor cores, from an FP16 copy of q (IK2_ATTN_MMA=0: the scalar kernels - a layer
+        // without a window, its keys the whole context, is bound by their arithmetic)
+        const bool mma = g_attn_mma == 1 || (g_attn_mma == 2 && !Ly.sliding);
+        const int ring = Ly.sliding ? Ly.kv_cap : 0;
+        const int ns = Ly.sliding ? std::min(g_mma_split, std::max(1, (c.window + 63) / 64)) : g_mma_split;
         uint16_t* q16 = mma ? W.x16 : nullptr;
         if (g_kv_fp8) {
             k::prep_qkv_r_fp8_at(q_p, Ly.q_clip, W.kconv, Ly.kc8, W.vconv, Ly.vc8, r_p, Ly.r_clip, c.H, c.KV, c.D, c.d_rel,
                                  c.qk_clip, c.rel_clip, c.eps, W.pos, !Ly.sliding, c.alpha, c.n_floor, Ly.kv_cap,
                                  k_scale, v_scale, q16, g_s);
             if (mma)
-                k::attn_decode_mma_fp8(q16, r_p, W.sink, Ly.kc8, Ly.vc8, 0, c.H, c.KV, W.pos, 0, kMmaSplits,
+                k::attn_decode_mma_fp8(q16, r_p, W.sink, Ly.kc8, Ly.vc8, ring, c.H, c.KV, W.pos, 0, ns,
                                        qk_scale / k_scale, 1.0f / v_scale, Ly.rel_proj, c.d_rel, extent, window, W.lg,
-                                       W.o, g_s);
+                                       W.o, gate_p, W.x16, g_s);
             else
                 k::attn_decode_fp8_at(q_p, r_p, W.sink, Ly.kc8, Ly.vc8, Ly.sliding ? Ly.kv_cap : 0, c.H, c.KV, W.pos, P,
                                       qk_scale / k_scale, 1.0f / v_scale, Ly.rel_proj, c.d_rel, extent, window, W.lg,
@@ -2016,13 +2019,13 @@ void fast_token_launches(Model& M, Work& W, OutMode out_mode) {
                                  c.qk_clip, c.rel_clip, c.eps, W.pos, !Ly.sliding, c.alpha, c.n_floor, Ly.kv_cap, q16,
                                  g_s);
             if (mma)
-                k::attn_decode_mma_f16(q16, r_p, W.sink, Ly.kc, Ly.vc, 0, c.H, c.KV, W.pos, 0, kMmaSplits, qk_scale,
-                                       Ly.rel_proj, c.d_rel, extent, window, W.lg, W.o, g_s);
+                k::attn_decode_mma_f16(q16, r_p, W.sink, Ly.kc, Ly.vc, ring, c.H, c.KV, W.pos, 0, ns, qk_scale,
+                                       Ly.rel_proj, c.d_rel, extent, window, W.lg, W.o, gate_p, W.x16, g_s);
             else
                 k::attn_decode_f16_at(q_p, r_p, W.sink, Ly.kc, Ly.vc, Ly.sliding ? Ly.kv_cap : 0, c.H, c.KV, W.pos, P,
                                       qk_scale, Ly.rel_proj, c.d_rel, extent, window, W.lg, W.o, g_s);
         }
-        k::gate_mul_f16(W.o, gate_p, (size_t) HD, W.x16, true, g_s);
+        if (!mma) k::gate_mul_f16(W.o, gate_p, (size_t) HD, W.x16, true, g_s);   // (the tensor cores' merge has it)
         mv1(Ly.wo, W.o, W.tmp);
         if (l % c.block == 0) {   // a block's first layer: the stream joins the blocks and starts again
             CU(cudaMemcpyAsync(blk(nb), W.h, Cb, cudaMemcpyDeviceToDevice, g_s));
@@ -3137,8 +3140,8 @@ int main(int argc, char** argv) {
     // (half an FP16 copy's bytes, a token's products straight over them) and tokens take the resident path
     // (IK2_FAST=0: off; IK2_GRAPH=0: its launches one by one instead of a CUDA graph a token).
     g_graph = !(getenv("IK2_GRAPH") && !std::atoi(getenv("IK2_GRAPH")));
-    g_attn_mma = !(getenv("IK2_ATTN_MMA") && !std::atoi(getenv("IK2_ATTN_MMA"))) && c.D == 128 && c.H / c.KV <= 16;
-    k::attn_decode_mma_prepare();
+    g_attn_mma = c.D == 128 && c.H / c.KV <= 8 ? (getenv("IK2_ATTN_MMA") ? std::atoi(getenv("IK2_ATTN_MMA")) : 1) : 0;
+    g_mma_split = k::attn_decode_mma_blocks(c.KV);
     if (n_gpu == 1 && !g_pool) {
         size_t exp_b = 0, dense_b = 0, kv_b = 0;
         for (const auto& kv : S.by_name) {
@@ -4296,6 +4299,9 @@ int main(int argc, char** argv) {
         while (std::fscanf(ff, "%d,", &v) == 1) force.push_back(v);
         std::fclose(ff);
     }
+    // IK2_LOGITS_OUT=FILE: every generated token's logits [n_vocab] F32 appended there (with IK2_FORCE: two builds'
+    // logits over the same tokens, to compare)
+    FILE* lo = getenv("IK2_LOGITS_OUT") ? std::fopen(getenv("IK2_LOGITS_OUT"), "wb") : nullptr;
     for (int i = 0, best = first_best; i < gen && !drafter; ++i) {
         const int tok = i < (int) force.size() ? force[i] : best;
         if (i < (int) force.size()) agree += best == force[i];
@@ -4304,9 +4310,17 @@ int main(int argc, char** argv) {
         std::fflush(stdout);
         if (i + 1 == gen) break;
         std::vector<int> ag;
-        forward(M, &tok, 1, (int) prompt.size() + i, false, OutMode::kArgmax, std::string(), logits, &ag, t_exp);
-        best = ag[0];
+        if (lo) logits.clear();
+        forward(M, &tok, 1, (int) prompt.size() + i, false, lo ? OutMode::kLogits : OutMode::kArgmax, std::string(),
+                logits, &ag, t_exp);
+        if (lo) {
+            std::fwrite(logits.data(), sizeof(float), (size_t) c.n_vocab, lo);
+            best = (int) (std::max_element(logits.begin(), logits.begin() + c.n_vocab) - logits.begin());
+        } else {
+            best = ag[0];
+        }
     }
+    if (lo) std::fclose(lo);
     if (!force.empty())
         std::printf("forced: %d tokens fed, the model's pick agreed with the next one %d times (%.2f%%)\n",
                     (int) std::min<size_t>(force.size(), out.size()), agree,
