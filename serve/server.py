@@ -3813,10 +3813,16 @@ class Service:
                 raise ValueError(f"{HY4_TEXT_ONLY} reads text only (Images on the Models page turns them on where "
                                  "the card has room for a picture beside the model), so it cannot read images or "
                                  "videos: send the request without them (describe the picture in text instead)")
-            if self.vision is None and getattr(self.template, "inkling", False):
-                # Inkling 2: maya-ik2 has no vision tower yet (the GGUF leaves it out; unsloth's mmproj is not read)
-                raise ValueError("Inkling-2-Small on maya-ik2 reads text only for now, so it cannot read images or "
-                                 "videos: send the request without them (describe the picture in text instead)")
+            inkling = getattr(self.template, "inkling", False)
+            if self.vision is None and inkling:
+                # Inkling 2: maya-ik2 has no vision tower of its own (the GGUF leaves it out); with a "vision" entry in
+                # the config the image encoder (maya-vision and unsloth's mmproj) reads the pictures
+                raise ValueError(f"{self.model} on maya-ik2 reads text only without the image encoder (a \"vision\" "
+                                 "entry in its config: maya-vision and the model's mmproj file), so it cannot read "
+                                 "images or videos: send the request without them (describe the picture in text "
+                                 "instead)")
+            if inkling and any(kind == "video" for kind, _ in media):
+                raise ValueError(f"{self.model} reads pictures, not videos")
             if self.vision is None:
                 raise ValueError("this server was started without the vision encoder (run setup again and choose "
                                  "'vision'), so it cannot read images or videos")
@@ -3826,12 +3832,18 @@ class Service:
             glm = "<|begin_of_image|>" in self.template.source
             image_pad, image_start = ("<|image|>", "<|begin_of_image|>") if glm else (IMAGE_PAD, VISION_START)
             video_pad, video_start = ("<|video|>", "<|begin_of_video|>") if glm else ("<|video_pad|>", VISION_START)
+            if inkling:
+                # Inkling 2 writes <|content_image|><|unused_200054|><|end_message|>: the one placeholder becomes the
+                # picture's image tokens (each takes one of the encoder's rows); pictures only
+                image_pad, image_start = "<|unused_200054|>", "<|content_image|>"
             pad = self.tok.encode(image_pad, parse_special=True)[0]
             start = self.tok.encode(image_start, parse_special=True)[0]
-            vp = self.tok.encode(video_pad, parse_special=True)[0]
-            vstart = self.tok.encode(video_start, parse_special=True)[0]
-            # every frame is an independent image: the image's own begin / end markers around its pads
-            iend = self.tok.encode("<|end_of_image|>" if glm else "<|vision_end|>", parse_special=True)[0]
+            vp = vstart = iend = None
+            if not inkling:
+                vp = self.tok.encode(video_pad, parse_special=True)[0]
+                vstart = self.tok.encode(video_start, parse_special=True)[0]
+                # every frame is an independent image: the image's own begin / end markers around its pads
+                iend = self.tok.encode("<|end_of_image|>" if glm else "<|vision_end|>", parse_special=True)[0]
             frame = (start, pad, iend)
             # Encode only while the engine is idle: the engine and the image encoder (a separate process) must not
             # run on the GPU at the same time - an encode during a running request left that request stuck at
