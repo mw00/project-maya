@@ -2014,6 +2014,11 @@ void fast_token_launches(Model& M, Work& W, OutMode out_mode) {
             if (!sep) {
                 mv1c(m, W.xq, W.qkv, k::MvConv{HD, KD, Ly.h_k, Ly.sc_k, nullptr, 0, nullptr, W.kconv},
                      k::MvConv{HD + KD, KD, Ly.h_v, Ly.sc_v, nullptr, 0, nullptr, W.vconv});
+            } else if (m.q8) {   // (q, k and v each with its input: k's and v's rows take theirs, one launch)
+                k::mv_q8p_conv(m.q8, m.q8d, m.N, m.K, W.xq, W.qkv,
+                               k::MvConv{HD, KD, Ly.h_k, Ly.sc_k, nullptr, 0, nullptr, W.kconv},
+                               k::MvConv{HD + KD, KD, Ly.h_v, Ly.sc_v, nullptr, 0, nullptr, W.vconv}, g_s,
+                               k::MvAlt{W.xk, HD, KD}, k::MvAlt{W.xv, HD + KD, KD});
             } else {
                 mv1(mat_rows(m, 0, HD), W.xq, W.qkv);
                 mv1c(mat_rows(m, HD, KD), W.xk, k_p, k::MvConv{0, KD, Ly.h_k, Ly.sc_k, nullptr, 0, nullptr, W.kconv});
