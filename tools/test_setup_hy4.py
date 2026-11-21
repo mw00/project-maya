@@ -2719,6 +2719,46 @@ class Q4xCheck(unittest.TestCase):
                 Tok.from_dir = staticmethod(lambda d: SimpleNamespace(encode=lambda s: [1, 2, 3]))
                 self.assertNotIn("HY4_MEASURE_IDS", SV.child_env(c))          # (too little text: none)
 
+    def test_the_drafting_trial_answers_chat_requests(self):
+        """--drafting auto: the server names the drafting file (HY4_DRAFT_FILE) and gives the trial requests in the
+        model's chat template (HY4_DRAFT_IDS: a line of ids each, written once); no --drafting: no requests."""
+        import serve.server as SV
+        seen = []
+
+        class Tok:
+            @staticmethod
+            def from_dir(d):
+                return SimpleNamespace(encode=lambda s, parse_special=False: seen.append((s, parse_special)) or [7, 8, 9])
+
+        class Chat:
+            def __init__(self, path):
+                pass
+
+            def render(self, msgs, enable_thinking=True):
+                return f"<u>{msgs[0]['content']}<a>{enable_thinking}"
+        with tempfile.TemporaryDirectory() as t:
+            root = Path(t)
+            c = self.cfg(root)
+            c["args"] = c["args"] + ["--drafting", "auto"]
+            (Path(c["tokenizer"]) / "vocab.json").write_text('{"a": 0}')
+            with patch.object(SV, "ROOT", root), \
+                    patch.dict(sys.modules, {"strata_tokenizer": SimpleNamespace(Tokenizer=Tok)}), \
+                    patch("serve.frontend.ChatTemplate", Chat):
+                (Path(c["tokenizer"]) / "chat_template.jinja").write_text("{{ x }}")
+                env = SV.child_env(c)
+                self.assertEqual(env["HY4_DRAFT_FILE"], str(SV.HY4_DRAFT_FILE))
+                ids = Path(SV.child_env(c)["HY4_DRAFT_IDS"])
+                self.assertTrue(ids.name.startswith("hy4-draft-ids-") and ids.parent == root / "data")
+                body = ids.read_text(encoding="utf-8").splitlines()
+                self.assertEqual((body[0][:7], body[1:]), ("# maya:", ["7,8,9"] * len(SV.HY4_DRAFT_QS)))
+                chats = [s for s, p in seen if p]                              # (the template's tokens; the
+                self.assertEqual(len(chats), len(SV.HY4_DRAFT_QS))             #  others: the docs text's)
+                self.assertTrue(all(s.endswith("<a>False") for s in chats))    # (thinking off)
+                self.assertEqual(SV.child_env(c)["HY4_DRAFT_IDS"], str(ids))   # (written once)
+                self.assertEqual(len([p for _, p in seen if p]), len(SV.HY4_DRAFT_QS))
+                c["args"] = [x for x in c["args"] if x not in ("--drafting", "auto")]
+                self.assertNotIn("HY4_DRAFT_IDS", SV.child_env(c))
+
     def test_the_hot_experts_file_is_kept_until_a_calibration(self):
         """maya-hy4's HY4_HOT (on by default) places a start's experts in VRAM by scores the first start learns and
         the starts after only read: a file a model in the data folder (not in the model's download), named by the

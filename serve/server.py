@@ -2276,6 +2276,46 @@ def engine_args(cfg: dict) -> list[str]:
     return args
 
 
+HY4_DRAFT_QS = (   # (--drafting auto's trial: requests as in real use - code, an explanation, plain text)
+    "Write a Python script that reads a CSV file of sales (date, region, amount) and prints the total for each region "
+    "and month as a table, with comments.",
+    "Explain how a hash table works, then show a short Python class that implements one.",
+    "Write a friendly email to my team: the release is on track for Friday, two bugs are left, and every test passes. "
+    "Ask who can review the last changes.")
+
+
+def hy4_draft_ids(cfg: dict) -> Path | None:
+    """The requests maya-hy4's --drafting auto times at its first start here (HY4_DRAFT_IDS): HY4_DRAFT_QS in the
+    model's own chat template, thinking off - a line of token ids each, written once into the data folder (a file a
+    tokenizer and template).  None: no tokenizer or template, or not written - the engine then answers slices of the
+    measuring text."""
+    tdir = Path(cfg.get("tokenizer") or "")
+    vocab, tpl = tdir / "vocab.json", tdir / "chat_template.jinja"
+    if not cfg.get("tokenizer") or not vocab.is_file() or not tpl.is_file():
+        return None
+    try:
+        tag = hashlib.md5(vocab.read_bytes() + tpl.read_bytes()).hexdigest()[:10]
+    except OSError:
+        return None
+    path = ROOT / "data" / f"hy4-draft-ids-{tag}.txt"
+    if path.is_file():
+        return path
+    try:
+        import strata_tokenizer as ST
+        from serve.frontend import ChatTemplate
+        tok, chat = ST.Tokenizer.from_dir(tdir), ChatTemplate(tpl)
+        lines = [",".join(map(str, tok.encode(chat.render([{"role": "user", "content": q}], enable_thinking=False),
+                                              parse_special=True))) for q in HY4_DRAFT_QS]
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text("# maya: requests in the model's chat template, a line each - the answers maya-hy4's "
+                       "--drafting auto times at its first start on a PC\n" + "\n".join(lines) + "\n", encoding="utf-8")
+        os.replace(tmp, path)
+        return path
+    except Exception:  # noqa: BLE001 - none: the engine times slices of the measuring text
+        return None
+
+
 def child_env(cfg: dict) -> dict:
     """The engine's environment: the CUDA libraries setup installed (pip's nvidia packages, or the toolkit that
     compiled it) first on the library search path."""
@@ -2305,6 +2345,10 @@ def child_env(cfg: dict) -> dict:
         # (... and, with --drafting auto, which of no drafting, the MTP block and the DFly2 drafter decodes fastest -
         #  each loaded once with its own VRAM plan at the first start, before READY)
         env.setdefault("HY4_DRAFT_FILE", str(HY4_DRAFT_FILE))
+        if "HY4_DRAFT_IDS" not in env and "--drafting" in (cfg.get("args") or []):
+            ids = hy4_draft_ids(cfg)
+            if ids is not None:
+                env["HY4_DRAFT_IDS"] = str(ids)
         # (... and HY4_HOT's scores - which experts a start places in VRAM - learned by the first start, then kept as
         #  they are until maya --speed-calibration: a file a model in the data folder, not in its download)
         env.setdefault("HY4_HOT_FILE", str(hy4_hot_file(cfg)))

@@ -3636,6 +3636,7 @@ struct Model::Impl {
                                "would not be the same as without them - decoding without drafts");
                 o.mtp = false;
             }
+            if (o.trial && (opt.mtp || opt.dfly2) && !o.mtp && !o.dfly2) return true;   // (a drafting trial: nothing to time)
             char cb[320];
             if (chunk_auto) {
                 std::snprintf(cb, sizeof cb, "INFO prompt chunk: %d tokens (auto: the largest of %d / %d / %d this VRAM "

@@ -1398,9 +1398,25 @@ bool trial_text(const hy4::Options& o, TrialText& tx) {
                 for (int v : parse_ids(line))
                     if (v >= 0) text.push_back(v);
     }
+    tx.n = text.size();
+    // (HY4_DRAFT_IDS - the server's: requests in the model's chat template, a line each - answered in place of the
+    //  text's slices: the drafts hold as in real use, not as in a document's continuation)
+    if (const char* dp = std::getenv("HY4_DRAFT_IDS")) {
+        std::ifstream f(dp);
+        for (std::string line; f && std::getline(f, line);)
+            if (!line.empty() && line[0] != '#') {
+                std::vector<int> p = parse_ids(line);
+                if (p.size() >= 8) tx.prompts.push_back(std::move(p));
+            }
+        if (!tx.prompts.empty()) {
+            tx.gen = std::max(8, envi("HY4_DRAFT_TOKENS", 384) / (int) tx.prompts.size());
+            for (const auto& p : tx.prompts)
+                if (o.max_ctx < (int64_t) p.size() + tx.gen + 64) tx.prompts.clear();
+            if (!tx.prompts.empty()) return true;
+        }
+    }
     const int rounds = envi("HY4_DRAFT_ROUNDS", 3), P = envi("HY4_DRAFT_PROMPT", 512);
     tx.gen = std::max(8, envi("HY4_DRAFT_TOKENS", 192) / rounds);
-    tx.n = text.size();
     if ((int64_t) text.size() < 4LL * P || o.max_ctx < P + tx.gen + 64) return false;
     for (int r = 0; r < rounds; ++r) {
         const size_t at = (size_t) ((double) text.size() * (2 * r + 1) / (2.0 * rounds)) - (size_t) P / 2;
@@ -1577,18 +1593,19 @@ bool pick_drafting(hy4::Options& o, const std::string& how, const std::string& a
     const std::string self = self_exe(argv0);
     double tps[3] = {-1, -1, -1};
     bool first = true;
-    for (int c = 0; c < 3; ++c) {
+    for (int c : {1, 2, 0}) {   // (the drafters first: one its room leaves out stops after the plan)
         if (!cand[c]) continue;
+        tps[c] = 0.0;
+        if (c == 0 && tps[1] <= 0.0 && tps[2] <= 0.0) break;   // (no drafter loads here: nothing to time it against)
         std::string cmd = quote(self);
         for (const std::string& x : child_args) cmd += " " + quote(x);
         cmd += std::string(" --draft-trial ") + id[c] + (first ? ":full" : ":short");
-        first = false;
-        tps[c] = 0.0;
         if (FILE* p = open_pipe(cmd)) {   // (its stderr is this one's: its lines in the start's log)
             char line[512];
             while (std::fgets(line, sizeof line, p))
                 if (std::strncmp(line, "TRIAL ", 6) == 0) tps[c] = std::max(0.0, std::atof(line + 6));
             close_pipe(p);
+            if (tps[c] > 0.0) first = false;   // (the text read once: by the first trial that timed)
         } else {
             std::fprintf(stderr, "maya-hy4: drafting trial: %s - this program could not be started again (%s)\n",
                          said[c], self.c_str());
