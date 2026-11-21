@@ -418,11 +418,17 @@ __device__ __forceinline__ void hc_fin_body(int t, const float* __restrict__ x, 
                                             float* __restrict__ mix_out, const float* __restrict__ nw, float neps,
                                             const Q8Out& q8) {
     __shared__ float s_mix[kMaxM + 1], s_pre[8];
+    __shared__ float s_part[kHcBlocks * (kMaxM + 1)];
     const int nm = HEAD ? hc : 2 * hc, HE = hc * E;
+    // (the slices' partial sums: a thread a value into shared memory - 17 threads read their 24 one after another,
+    //  each a trip past L1 - then summed in the slices' order as before: the same bits)
+    constexpr int kNp = kHcBlocks * (kMaxM + 1);
+    for (int i = threadIdx.x; i < kNp; i += blockDim.x)
+        s_part[i] = strata::kernels::ld_l2(part + (size_t) t * kNp + i);
+    __syncthreads();
     if ((int) threadIdx.x <= kMaxM) {
         float v = 0.0f;
-        for (int b = 0; b < kHcBlocks; ++b)
-            v += strata::kernels::ld_l2(part + ((size_t) t * kHcBlocks + b) * (kMaxM + 1) + threadIdx.x);
+        for (int b = 0; b < kHcBlocks; ++b) v += s_part[b * (kMaxM + 1) + threadIdx.x];
         s_mix[threadIdx.x] = v;
     }
     __syncthreads();
