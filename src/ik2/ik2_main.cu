@@ -24,6 +24,7 @@
 #include "ik2_cpu.hpp"
 #include "ik2_draft.hpp"
 #include "ik2_kernels.cuh"
+#include "ik2_off.cuh"
 #include "strata/artifact/gguf_reader.hpp"
 
 #include <cublas_v2.h>
@@ -1974,6 +1975,22 @@ void run_head(const Model& M, int T, bool all_logits, OutMode out_mode, int nb, 
 // dense weights are the GGUF's blocks (IK2_DENSE=q8, the default when the experts fit), one product a launch.
 bool g_fast = false;        // set at load: every expert resident, one GPU, the dense weights as blocks (IK2_FAST=0: no)
 bool g_fast_want = false;
+// ---- the offload token path (ik2_off.cuh): the resident path's launches where the experts do not all fit - a tier
+// of them in VRAM (the expert cache's slots: Ly.tab_blob, null where an expert is not there) and the rest copied by
+// the GPU from pinned host memory into staging slots after the router, the same expert kernels on the same bytes
+bool g_off = false;        // set at load
+bool g_off_want = false;   // the layout chosen (the fit, IK2_OFF)
+struct OffState {
+    std::vector<const uint8_t*> host;   // [n_layer] the layer's pinned experts as the device sees them
+    std::vector<int> pool;              // [n_layer] its staging pool (the cache's pool of its slot size)
+    std::vector<k::OffStage> stage;     // a pool a slot size
+    k::OffFetch* fl = nullptr;
+    k::OffCount* cnt = nullptr;         // (device)
+    uint32_t* heat = nullptr;           // [n_layer * E] (device): picks since load
+    int blocks = 0;                     // off_fetch_copy's grid
+    uint64_t tick = ~0ull;              // the cache's tick the tables were made at (a prompt moves experts)
+};
+OffState g_offs;
 bool g_graph = true;        // IK2_GRAPH=0: the resident path's launches one by one
 bool g_block = true;        // IK2_BLOCK=0: a verify window through forward() instead of the block path
 int g_attn_mma = 1;         // a token's attention on the tensor cores (IK2_ATTN_MMA=0: the scalar kernels; 2: the
@@ -2153,6 +2170,12 @@ void fast_token_launches(Model& M, Work& W, OutMode out_mode) {
         k::route_token(W.rlog, Ly.probs_b, c.E, c.K, c.route_scale, Ly.tab_blob, Ly.tab_sc[0], Ly.tab_sc[1],
                        Ly.tab_sc[2], rtop, rw, W.blob, W.tok, W.inv, W.sg, W.su, W.wt, g_s, W.xq, C,
                        exp_tc ? (uint16_t*) W.gu32 : nullptr);
+        if (g_off) {   // (the offload path: the picks the tier does not hold copied into staging, their slots filled)
+            const auto& st = g_offs.stage[g_offs.pool[l]];
+            k::off_fetch_plan(W.blob, rtop, c.K, l * c.E, g_offs.host[l], Ly.slot_bytes, st, g_offs.fl, g_offs.cnt,
+                              g_offs.heat, g_s);
+            k::off_fetch_copy(g_offs.fl, Ly.slot_bytes, g_offs.blocks, g_s);
+        }
         if (exp_tc) {
             k::experts_gate_up_swiglu_mma(W.blob, c.K, Ly.eb[0], (const uint16_t*) W.gu32, C, c.F, W.sg, W.su,
                                           c.gate_cap, c.up_cap, W.h16, g_s);
@@ -2189,11 +2212,34 @@ void fast_token_launches(Model& M, Work& W, OutMode out_mode) {
     }
 }
 
+// The offload path's tier tables (Ly.tab_blob) from the cache as it is: an expert's slot, or null where it is not in
+// VRAM.  Made again whenever the cache path ran since (a prompt moves experts in and out of the cache's slots).
+void off_tables(Model& M) {
+    ExpertCache& EC = g_dev[0].EC;
+    if (g_offs.tick == EC.tick) return;
+    const Config& c = M.c;
+    static std::vector<const uint8_t*> tab;
+    tab.resize((size_t) c.n_layer * c.E);
+    for (int l = 0; l < c.n_layer; ++l) {
+        const auto& P = EC.pools[EC.layer_pool[l]];
+        for (int e = 0; e < c.E; ++e) {
+            const int s = EC.loc[(size_t) l * c.E + e];
+            tab[(size_t) l * c.E + e] = s >= 0 && s < P.n_active ? P.data + (size_t) s * P.slot_bytes : nullptr;
+        }
+    }
+    for (int l = 0; l < c.n_layer; ++l)   // (on the compute stream: after whatever still reads them)
+        CU(cudaMemcpyAsync(M.L[l].tab_blob, tab.data() + (size_t) l * c.E, (size_t) c.E * sizeof(void*),
+                           cudaMemcpyHostToDevice, g_s));
+    CU(cudaStreamSynchronize(g_s));   // (tab is the source until then)
+    g_offs.tick = EC.tick;
+}
+
 // one token through the resident path: its logits appended to logits_out (kLogits) or its argmax (kArgmax)
 void fast_token(Model& M, int tok, int pos, OutMode out_mode, std::vector<float>& logits_out,
                 std::vector<int>* argmax_out) {
     const Config& c = M.c;
     Work& W = dev_work(0);
+    if (g_off) off_tables(M);
     const size_t rb = (size_t) c.C / k::block_values(M.embd_type) * k::block_bytes(M.embd_type);
     k::decode_host(M.embd_type, M.embd + (size_t) tok * rb, c.C, W.emb_h);
     W.pos_h[0] = pos;
@@ -2697,7 +2743,8 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
              std::vector<float>& logits_out, std::vector<int>* argmax_out, double& t_exp) {
     const Config& c = M.c;
     const int C = c.C;
-    if (g_fast && T == 1 && dump.empty() && !g_prof && !g_rec && !g_trace && g_pop.empty() && g_img.at(pos0) < 0) {
+    if ((g_fast || g_off) && T == 1 && dump.empty() && !g_prof && !g_rec && !g_trace && g_pop.empty() &&
+        g_img.at(pos0) < 0) {
         fast_token(M, tok[0], pos0, out_mode, logits_out, argmax_out);
         return;
     }
@@ -3594,10 +3641,12 @@ void check_preview(int n_gpu, bool serve) {
                 " to CMAKE_CUDA_ARCHITECTURES and rebuild");
         }
 #endif
-        if (p.totalGlobalMem < (22ull << 30) && !force) {
+        // (a card that does not hold every expert takes the offload path: a tier of them in VRAM, the rest in RAM;
+        //  under 7 GiB - an 8 GB card's - the dense weights, the caches and the smallest tier do not fit beside)
+        if (p.totalGlobalMem < (7ull << 30) && !force) {
             char m[64];
             std::snprintf(m, sizeof m, "%.1f GB", (double) p.totalGlobalMem / 1e9);
-            refuse(gpu + " has " + m + ", the Inkling 2 preview needs a 24 GB card" + run_anyway);
+            refuse(gpu + " has " + m + ", the Inkling 2 preview needs a card of 8 GB or more" + run_anyway);
         }
     }
     CU(cudaSetDevice(0));
@@ -3674,6 +3723,19 @@ int main(int argc, char** argv) {
         if (*p == ',') ++p;
     }
     check_preview(n_gpu, serve);
+    // IK2_VRAM_GB=N (tests): the first GPU as a card of N GiB - the rest of its memory taken now and kept, so every
+    // figure the engine reads (cudaMemGetInfo) is a smaller card's
+    if (const char* vg = getenv("IK2_VRAM_GB"); vg && *vg) {
+        size_t fr = 0, tot = 0;
+        CU(cudaMemGetInfo(&fr, &tot));
+        const size_t want = (size_t) (std::atof(vg) * 1073741824.0);
+        if (want < tot) {
+            void* ballast = nullptr;
+            CU(cudaMalloc(&ballast, tot - want));
+            std::printf("IK2_VRAM_GB=%s: GPU 0 as a card of %.1f GiB (%.1f GiB held back)\n", vg, want / 1073741824.0,
+                        (tot - want) / 1073741824.0);
+        }
+    }
     const double t_start = now();
     Shards S(model);
     Model M;
@@ -3847,11 +3909,22 @@ int main(int argc, char** argv) {
         CU(cudaMemGetInfo(&fr0, &tot0));
         const size_t reserve = (size_t) 3 << 29;   // (the work buffers and a quarter of a GiB of room: 1.5 GiB)
         const bool fits = exp_b + dense_b + kv_b + reserve <= fr0 && exp_b <= (size_t) (cache_gb * 1073741824.0);
+        // Where they do not all fit (a card under 24 GB, or a context past what one holds), the offload token path:
+        // the resident path's launches with a tier of the experts in VRAM and the others fetched by the GPU from
+        // host memory (ik2_off.cuh).  IK2_OFF=0: the cache path instead (forward() a visit at a time); IK2_OFF=1:
+        // the offload path even where every expert fits (tests).  Not with two GPUs or the CPU lane (n_gpu == 1,
+        // !g_pool here).
+        const char* off_env = getenv("IK2_OFF");
+        const int off_set = off_env && *off_env ? std::atoi(off_env) : -1;
         if (fits && !getenv("IK2_DENSE")) g_dense_q8 = true;
-        g_fast_want = fits && g_dense_q8 && !(getenv("IK2_FAST") && !std::atoi(getenv("IK2_FAST")));
+        g_fast_want = fits && off_set != 1 && g_dense_q8 && !(getenv("IK2_FAST") && !std::atoi(getenv("IK2_FAST")));
+        g_off_want = (off_set == 1 || (off_set != 0 && !fits)) && !getenv("IK2_DENSE");
+        if (g_off_want) g_dense_q8 = true;
         std::printf("experts %.1f GiB, dense weights %.1f GiB as blocks, K / V cache %.1f GiB, %.1f GiB free: %s\n",
                     exp_b / 1073741824.0, dense_b / 1073741824.0, kv_b / 1073741824.0, fr0 / 1073741824.0,
-                    fits ? "every expert stays in VRAM" : "the experts in host memory, a cache of them in VRAM");
+                    fits && !g_off_want ? "every expert stays in VRAM"
+                    : g_off_want ? "the experts in host memory, a tier of them in VRAM, the rest fetched by the GPU"
+                                 : "the experts in host memory, a cache of them in VRAM");
     }
 
     // the dense weights
@@ -4116,6 +4189,7 @@ int main(int argc, char** argv) {
     const bool host_mmap = getenv("IK2_HOST") ? std::string(getenv("IK2_HOST")) == "mmap" : g_fast_want;
     if (host_mmap) {
         if (g_pool) die("IK2_HOST=mmap with the CPU lane");
+        if (g_off_want) die("IK2_HOST=mmap with the offload path (it reads pinned host memory: IK2_OFF=0)");
         for (const auto& J : exp_jobs) {
             Layer& Ly = M.L[J.l];
             const uint8_t* p = S.data(J.name);
@@ -4193,7 +4267,8 @@ int main(int argc, char** argv) {
                         if (l >= c.n_layer) return;
                         const size_t layer_bytes = (size_t) c.E * M.L[l].slot_bytes;
                         void* p = nullptr;
-                        CU(cudaHostAlloc(&p, layer_bytes, cudaHostAllocPortable));
+                        // (the offload path: mapped too - the GPU reads its misses from here itself)
+                        CU(cudaHostAlloc(&p, layer_bytes, cudaHostAllocPortable | (g_off_want ? cudaHostAllocMapped : 0)));
                         pin.blocks[l] = {p, layer_bytes, false, false};
                         ready[l].store(1, std::memory_order_release);
                         if (--alloc_left == 0) t_alloc_end = now();
@@ -4226,7 +4301,8 @@ int main(int argc, char** argv) {
                         l = reg_q.front();
                         reg_q.pop_front();
                     }
-                    if (cudaHostRegister(pin.blocks[l].ptr, pin.blocks[l].bytes, cudaHostRegisterPortable) == cudaSuccess)
+                    const unsigned fl = cudaHostRegisterPortable | (g_off_want ? cudaHostRegisterMapped : 0);
+                    if (cudaHostRegister(pin.blocks[l].ptr, pin.blocks[l].bytes, fl) == cudaSuccess)
                         pin.blocks[l].registered = true;
                     else
                         cudaGetLastError(), ++reg_fail;
@@ -4449,10 +4525,53 @@ int main(int argc, char** argv) {
         CU(cudaMemset(Vi.h_mlp, 0, 3 * C * 4));
     }
     ExpertCache& EC = g_dev[d].EC;
+    if (g_off_want && d == 0) {   // the offload path's staging: 2 K slots a slot size (an expert's bytes)
+        g_offs.pool.assign(c.n_layer, -1);
+        std::vector<size_t> sizes;
+        for (int l = 0; l < c.n_layer; ++l) {
+            const size_t sb = M.L[l].slot_bytes;
+            if (sb % 16 || !M.L[l].host_contig) die("the offload path: an expert's blocks not as it needs them");
+            auto it = std::find(sizes.begin(), sizes.end(), sb);
+            g_offs.pool[l] = (int) (it - sizes.begin());
+            if (it == sizes.end()) sizes.push_back(sb);
+        }
+        const int n_st = std::max(c.K, getenv("IK2_STAGE") ? std::atoi(getenv("IK2_STAGE")) : 2 * c.K);
+        for (size_t sb : sizes) {
+            k::OffStage st;
+            st.sb = sb, st.n = n_st;
+            st.data = dalloc<uint8_t>((size_t) n_st * sb);
+            st.tag = dalloc<int>(n_st);
+            st.used = dalloc<uint32_t>(n_st);
+            st.hand = dalloc<int>(1);
+            CU(cudaMemsetAsync(st.tag, 0xff, (size_t) n_st * 4, g_s));
+            CU(cudaMemsetAsync(st.used, 0, (size_t) n_st * 4, g_s));
+            CU(cudaMemsetAsync(st.hand, 0, 4, g_s));
+            g_offs.stage.push_back(st);
+        }
+        g_offs.fl = dalloc<k::OffFetch>(1);
+        g_offs.cnt = dalloc<k::OffCount>(1);
+        g_offs.heat = dalloc<uint32_t>((size_t) c.n_layer * c.E);
+        CU(cudaMemsetAsync(g_offs.cnt, 0, sizeof(k::OffCount), g_s));
+        CU(cudaMemsetAsync(g_offs.heat, 0, (size_t) c.n_layer * c.E * 4, g_s));
+        CU(cudaStreamSynchronize(g_s));
+        g_offs.host.assign(c.n_layer, nullptr);
+        for (int l = 0; l < c.n_layer; ++l) {
+            void* dp = nullptr;
+            if (cudaHostGetDevicePointer(&dp, (void*) M.L[l].host[0], 0) != cudaSuccess || !dp)
+                die("the offload path: layer " + std::to_string(l) + "'s experts are not mapped for the GPU (pinning "
+                    "failed - IK2_OFF=0 runs the cache path)");
+            g_offs.host[l] = (const uint8_t*) dp;
+        }
+        int sms = 0;
+        CU(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, 0));
+        g_offs.blocks = std::max(8, 2 * sms);
+    }
     CU(cudaMemGetInfo(&fr, &tot));
     // (what is left free: 2 GiB beside a cache that streams experts in and out; a quarter of one when every expert
-    //  stays in VRAM - nothing more is allocated but a token's graph)
-    const size_t room = g_fast_want ? (size_t) 256 << 20 : (size_t) 2 << 30;
+    //  stays in VRAM - nothing more is allocated but a token's graph; the offload path: IK2_ROOM_MB, 1 GiB)
+    const size_t room = g_fast_want ? (size_t) 256 << 20
+                      : g_off_want ? (size_t) (getenv("IK2_ROOM_MB") ? std::atof(getenv("IK2_ROOM_MB")) : 1024.0) << 20
+                                   : (size_t) 2 << 30;
     const size_t budget = std::min((size_t) (cache_gb * 1073741824.0), fr > room ? fr - room : (size_t) 0);
     EC.tp = g_tp ? d : -1;
     EC.init(M.L, dual() ? -1 : d, c.n_layer, c.E, budget);
@@ -4513,6 +4632,29 @@ int main(int argc, char** argv) {
                         now() - tw);
             EC.misses = m0, EC.bytes_up = b0;
         }
+    }
+    if (g_off_want && d == 0) {   // the offload path: the tier is what the cache holds (warmed above), tables a layer
+        auto blocks = [](const Mat& m) { return m.raw || m.q8; };
+        bool raw = blocks(M.out_w);
+        for (const auto& Ly : M.L)
+            raw = raw && blocks(Ly.wo) && (Ly.sliding ? blocks(Ly.wqkvrg) : (blocks(Ly.wqrg) && blocks(Ly.wk) && blocks(Ly.wv)));
+        if (!raw) die("the offload path: a dense matrix is not kept as blocks");
+        for (int l = 0; l < c.n_layer; ++l) {
+            Layer& Ly = M.L[l];
+            Ly.tab_blob = dalloc<const uint8_t*>(c.E);
+            for (int r = 0; r < 3; ++r)
+                if (!Ly.scale[r].empty()) Ly.tab_sc[r] = dev_f32(Ly.scale[r]);
+        }
+        g_off = true;
+        off_tables(M);
+        int n_tier = 0;
+        for (int i = 0; i < c.n_layer * c.E; ++i) n_tier += EC.loc[i] >= 0;
+        size_t st_b = 0;
+        for (const auto& st : g_offs.stage) st_b += (size_t) st.n * st.sb;
+        std::printf("offload: %d of %d experts in VRAM (%.1f GiB), the rest fetched by the GPU from pinned host "
+                    "memory through %zu staging pools (%.2f GiB); tokens take the resident path's launches%s\n",
+                    n_tier, c.n_layer * c.E, EC.total_bytes() / 1073741824.0, g_offs.stage.size(), st_b / 1073741824.0,
+                    g_graph ? ", a CUDA graph each" : "");
     }
     if (g_fast_want && d == 0) {   // the resident path: every expert in now, and where each is on the device
         auto blocks = [](const Mat& m) { return m.raw || m.q8; };   // (kept as the GGUF's blocks, whole or planar)
