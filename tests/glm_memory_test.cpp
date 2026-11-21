@@ -78,8 +78,32 @@ static void check_ram_plan() {
     assert(balanced_resident_ram(true, true, false));
 }
 
+// #860: a route's miss on an expert demoted at the last boundary finds its demotion by RAM slot and key, and reads the
+// bytes from the VRAM slot the copy reads while that slot is still draining - never by waiting for the copy
+static void check_drain_source() {
+    using namespace strata::core::glmfast;
+    struct Drain {   // (glm_fast_state.hpp's FastState::Drain fields the lookup reads)
+        int il, vslot, key, rclass, rslot;
+    };
+    const char kResident = 1, kSpare = 2, kDraining = 3, kLent = 4;   // (FastState's VRAM slot states)
+    const int NE = 256;
+    const std::vector<Drain> drains{{12, 40, 12 * NE + 7, 0, 5}, {13, 41, 13 * NE + 7, 0, 6}, {20, 3, 20 * NE + 9, 1, 5}};
+    assert(drain_of(drains, 0, 5, 12 * NE + 7) == 0);
+    assert(drain_of(drains, 0, 6, 13 * NE + 7) == 1);
+    assert(drain_of(drains, 1, 5, 20 * NE + 9) == 2);   // (the same RAM slot index in another class)
+    assert(drain_of(drains, 0, 5, 20 * NE + 9) == -1);  // another expert's key in that slot: not this drain
+    assert(drain_of(drains, 1, 6, 13 * NE + 7) == -1);  // the right key in another class's slot
+    assert(drain_of(std::vector<Drain>{}, 0, 5, 12 * NE + 7) == -1);
+    // the draining VRAM slot of the route's own layer holds the bytes; any other state of it, or another layer's
+    // slot, does not (the old wait for the copy, then the RAM slot)
+    assert(drain_reads_vram(12, 12, kDraining, kDraining));
+    assert(!drain_reads_vram(12, 13, kDraining, kDraining));
+    for (const char st : {kResident, kSpare, kLent, (char) 0}) assert(!drain_reads_vram(12, 12, st, kDraining));
+}
+
 int main() {
     check_ram_plan();
+    check_drain_source();
     using strata::core::glmfast::expert_pool_budget;
     using strata::core::glmfast::minimal_ram_tier;
     using strata::core::glmfast::full_unified_pool;

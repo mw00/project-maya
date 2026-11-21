@@ -564,6 +564,9 @@ struct Glm5Model::FastState {
     unsigned int* wait_diag_h = nullptr;
     std::atomic<unsigned int> svc_next{1};
     std::atomic<int> svc_phase{0};
+    // the routes' experts demoted at the last boundary that the fetch took from their draining VRAM slot (#860: no
+    // wait for the demotion's copy; the service thread's own count, read by the stall report)
+    std::atomic<uint64_t> drain_vram{0};
     float* emb_h = nullptr;     // pinned
     float* hop_h = nullptr;     // pinned, hc * n_embd
     int* tok_h = nullptr;       // pinned

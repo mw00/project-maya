@@ -5616,22 +5616,28 @@ void Glm5Model::fast_service() {
                         continue;
                     }
                     // Demoted at the last boundary: its RAM copy is still landing (kRDemote until the next boundary makes
-                    // it live), so the table has no entry for it - but its bytes are one PCIe copy away, not a disk read
-                    // away.  Wait for that drain's event and serve it from the slot.  (The boundary runs only once this
-                    // thread has caught up, so F->draining is not being edited here.)  A route that promotes it leaves
-                    // a duplicate that the tier clean-up frees.
+                    // it live), so the table has no entry for it - but its bytes are still in the VRAM slot the copy
+                    // reads (kDraining until that boundary: nothing writes it), not a disk read away.  The fetch takes
+                    // them from there (glmfast::drain_reads_vram): the same bytes, and no wait on the copy stream - on
+                    // Windows that copy did not run while the device spun on this route's answer (#860).  Otherwise,
+                    // or MAYA_GLM_DRAIN_WAIT=1 (A/B): wait for that drain's event and serve it from the RAM slot.  (The
+                    // boundary runs only once this thread has caught up, so F->draining is not being edited here.)  A
+                    // route that promotes it leaves a duplicate that the tier clean-up frees.
                     if (rs >= 0 && R.st[(size_t) rs] == FastState::kRDemote && R.key[(size_t) rs] == key) {
-                        bool draining = false;
-                        for (const auto& d : F->draining)
-                            if (d.rclass == cls && d.rslot == rs) {
+                        const int di = glmfast::drain_of(F->draining, cls, rs, key);
+                        if (di >= 0) {
+                            static const bool drain_wait = strata::platform::env_switch("MAYA_GLM_DRAIN_WAIT");
+                            const auto& d = F->draining[(size_t) di];
+                            if (!drain_wait && d.vslot >= 0 && d.vslot < P.n &&
+                                glmfast::drain_reads_vram(d.il, il, P.st[(size_t) d.vslot], FastState::kDraining)) {
+                                dst[m] = P.slot_ptr(d.vslot);
+                                F->drain_vram.fetch_add(1, std::memory_order_relaxed);
+                            } else {
                                 F->svc_phase.store(4, std::memory_order_relaxed);   // (#860: the stall line's phase)
                                 cudaEventSynchronize(d.ev);
                                 F->svc_phase.store(1, std::memory_order_relaxed);
-                                draining = true;
-                                break;
+                                dst[m] = R.slot((size_t) rs);
                             }
-                        if (draining) {
-                            dst[m] = R.slot((size_t) rs);
                             continue;
                         }
                     }
@@ -6593,6 +6599,18 @@ bool Glm5Model::fast_boundary(std::string& err) {
             glmheat::flush_ups(heat, [&](int il, uint8_t* d, const uint8_t* h, size_t b) { glmtier::h2d(F->tier.get(), il, d, h, b, F->copy); }, [&](void* ev) { cudaEventRecord((cudaEvent_t) ev, F->copy); }, [&](int il, const void* h) { return glmtier::h2d_plain(F->tier.get(), il, h); });   // glm-dsa B15.8
         }
     }
+#if defined(_WIN32)
+    // Windows (WDDM: CUDA's driver and HIP's runtime alike) submits queued work only when the host waits on or queries
+    // its stream (maya-ds4's win_submit, #303): the moves just queued on the copy stream go out now, not at the next
+    // boundary's query of their events.  It returns at once; "not ready" is not an error and is not left behind.
+    // MAYA_GLM_WIN_SUBMIT=0: off (A/B).  (#860)
+    static const bool win_submit = [] {
+        const char* v = getenv("MAYA_GLM_WIN_SUBMIT");
+        return v == nullptr || std::atoi(v) != 0;
+    }();
+    if (win_submit && (!F->draining.empty() || !F->bg.empty()) && cudaStreamQuery(F->copy) == cudaErrorNotReady)
+        cudaGetLastError();
+#endif
     flush();
     if (ok && !fast_helper_adapt(err)) return false;
     if (glmfast::dt_on()) {
@@ -8413,6 +8431,9 @@ bool Glm5Model::decode_spec(strata::kernels::SamplerParams& sp, int64_t max_new,
                 std::snprintf(b, sizeof(b), " (the last: %s, wanted seq %u, saw %u)", kinds[kind], wd[2], wd[3]);
                 line += b;
             }
+            std::snprintf(b, sizeof(b), "; %llu demoted expert(s) read from VRAM",
+                          (unsigned long long) Fm->drain_vram.load(std::memory_order_relaxed));
+            line += b;
         }
         std::fprintf(stderr, "%s - MAYA_GLM_STALL_S=0 turns this line off\n", line.c_str());
     });
