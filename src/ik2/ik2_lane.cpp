@@ -299,7 +299,9 @@ void Server::run(uint32_t seq) {
         Hist& hh = hist_[(size_t) n - 1];
         ++hh.n, hh.sum += us, hh.max = std::max(hh.max, us);
     }
-    const double old = us_[fmt].load(), per = us / std::max(1, n);
+    // (an expert's share: past the round trip the split already counts once a job - 30 us, LaneCost::lat - so small
+    //  jobs do not make the lane look slower an expert than it is and push its share onto the bus)
+    const double old = us_[fmt].load(), per = std::max(0.25 * us, us - 30.0) / std::max(1, n);
     us_[fmt].store(old > 0 ? 0.9 * old + 0.1 * per : per);
     n_done_.fetch_add((unsigned long long) n);
     std::atomic_thread_fence(std::memory_order_release);
