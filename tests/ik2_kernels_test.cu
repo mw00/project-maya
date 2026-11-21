@@ -2518,6 +2518,120 @@ void test_round6() {
 
 // One token's NVFP4 experts through the tensor cores against the scalar kernels over the same blocks (every scale
 // byte, the subnormal ones and 0x7F with them): gate | up with the input as two FP16 limbs, down over the FP16 h.
+#ifdef STRATA_USE_HIP
+// AMD: the grouped prompt experts on the matrix cores (ik2_rdna.inc) against double references - rows grouped by
+// expert (37 = a tile of 32 and one of 5, 1, 6), gate / up + SwiGLU (FP16 out), down, each token's picks summed
+void test_experts_rdna() {
+    const int C = 256, F = 128, E = 3, cnt[E] = {37, 1, 6};
+    const float gcap = 4.0f, ucap = 25.0f;
+    for (int ty : {k::kNVFP4, k::kQ8_0}) {
+        if (!k::experts_rdna_available(ty, ty, ty, C, F)) {
+            std::printf("skip experts_rdna: not this GPU\n");
+            return;
+        }
+        auto g = rand_blocks(ty, (size_t) E * F * C), u = rand_blocks(ty, (size_t) E * F * C),
+             d = rand_blocks(ty, (size_t) E * C * F);
+        const size_t eb0 = g.size() / E, eb1 = u.size() / E, eb2 = d.size() / E;
+        const size_t slot = (eb0 + eb1 + eb2 + 255) / 256 * 256;
+        std::vector<uint8_t> pool(slot * E);
+        for (int e = 0; e < E; ++e) {
+            std::memcpy(pool.data() + e * slot, g.data() + e * eb0, eb0);
+            std::memcpy(pool.data() + e * slot + eb0, u.data() + e * eb1, eb1);
+            std::memcpy(pool.data() + e * slot + eb0 + eb1, d.data() + e * eb2, eb2);
+        }
+        uint8_t* dpool = dev(pool);
+        std::vector<const uint8_t*> eptr(E);
+        std::vector<int> tiles, row_e;
+        int rows = 0;
+        for (int e = 0; e < E; ++e) {
+            eptr[e] = dpool + e * slot;
+            for (int m0 = 0; m0 < cnt[e]; m0 += 32) tiles.insert(tiles.end(), {e, rows + m0, std::min(32, cnt[e] - m0), 0});
+            for (int i = 0; i < cnt[e]; ++i) row_e.push_back(e);
+            rows += cnt[e];
+        }
+        const uint8_t** deptr = nullptr;
+        CU(cudaMalloc(&deptr, E * sizeof(void*)));
+        CU(cudaMemcpy(deptr, eptr.data(), E * sizeof(void*), cudaMemcpyHostToDevice));
+        int* dtiles = dev(tiles);
+        std::vector<uint16_t> x16((size_t) rows * C);
+        std::vector<float> xf(x16.size());
+        for (size_t i = 0; i < x16.size(); ++i) x16[i] = f2h_host(frand(2.0f)), xf[i] = h2f_host(x16[i]);
+        auto sg = fvec(rows, 1.5f), su = fvec(rows, 1.5f);
+        uint16_t *dx = dev(x16), *dh = dev_n<uint16_t>((size_t) rows * F);
+        float *dsg = dev(sg), *dsu = dev(su), *dy = dev_n<float>((size_t) rows * C);
+        const int nt = (int) tiles.size() / 4;
+        k::experts_rdna_gu(deptr, dtiles, nt, ty, eb0, dx, C, F, dsg, dsu, gcap, ucap, dh, 0);
+        k::experts_rdna_down(deptr, dtiles, nt, ty, eb0 + eb1, dh, C, F, dy, 0);
+        const auto h16 = host(dh, (size_t) rows * F);
+        std::vector<float> hgot(h16.size()), row(C);
+        for (size_t i = 0; i < h16.size(); ++i) hgot[i] = h2f_host(h16[i]);
+        std::vector<double> want_h((size_t) rows * F), want_y((size_t) rows * C);
+        // (the weights as the kernel holds them: FP16 - NVFP4's exact, Q8_0's d q rounded, as decode_f16's are)
+        auto dec = [&](const uint8_t* w, int n) {
+            k::decode_host(ty, w, n, row.data());
+            for (int i = 0; i < n; ++i) row[i] = h2f_host(f2h_host(row[i]));
+        };
+        double worst_mag = 0;   // (down's largest sum of |products|: the F32 sums' error bound scales with it)
+        auto act = [&](double gg, double uu) {
+            return gcap * std::tanh(gg / gcap) / (1.0 + std::exp(-gg)) * ucap * std::tanh(uu / ucap);
+        };
+        int gu_bad = 0, gu_at = -1;   // (h within the activation's range over gate / up +- their F32 sums' bound)
+        for (int r = 0; r < rows; ++r) {
+            const int e = row_e[r];
+            for (int j = 0; j < F; ++j) {
+                double gg = 0, uu = 0, mg = 0, mu = 0;
+                dec(g.data() + e * eb0 + (size_t) j * (eb0 / F), C);
+                for (int c = 0; c < C; ++c) gg += (double) row[c] * xf[(size_t) r * C + c];
+                for (int c = 0; c < C; ++c) mg += std::fabs((double) row[c] * xf[(size_t) r * C + c]);
+                dec(u.data() + e * eb1 + (size_t) j * (eb1 / F), C);
+                for (int c = 0; c < C; ++c) uu += (double) row[c] * xf[(size_t) r * C + c];
+                for (int c = 0; c < C; ++c) mu += std::fabs((double) row[c] * xf[(size_t) r * C + c]);
+                gg *= sg[r], uu *= su[r], mg *= std::fabs(sg[r]) * 1e-6, mu *= std::fabs(su[r]) * 1e-6;
+                const double w = act(gg, uu), got = hgot[(size_t) r * F + j];
+                double lo = w, hi = w;
+                for (double a : {gg - mg, gg + mg})
+                    for (double b : {uu - mu, uu + mu}) lo = std::min(lo, act(a, b)), hi = std::max(hi, act(a, b));
+                const double slack = 2e-3 + 2e-3 * std::fabs(w);   // (the FP16 output)
+                if (!(got >= lo - slack && got <= hi + slack) && !gu_bad++) gu_at = r * F + j;
+                want_h[(size_t) r * F + j] = w;
+            }
+            for (int c = 0; c < C; ++c) {   // (down over the hidden the kernel wrote: its FP16 rounding not counted)
+                dec(d.data() + e * eb2 + (size_t) c * (eb2 / C), F);
+                double a = 0, mag = 0;
+                for (int j = 0; j < F; ++j) a += (double) row[j] * hgot[(size_t) r * F + j];
+                for (int j = 0; j < F; ++j) mag += std::fabs((double) row[j] * hgot[(size_t) r * F + j]);
+                want_y[(size_t) r * C + c] = a;
+                worst_mag = std::max(worst_mag, mag);
+            }
+        }
+        const char* nm = ty == k::kNVFP4 ? "NVFP4" : "Q8_0";
+        char name[64];
+        std::snprintf(name, sizeof name, "experts_rdna_gu %s: %d of %zu off%s", nm, gu_bad, want_h.size(),
+                      gu_bad ? " (first below)" : "");
+        expect_true(name, gu_bad == 0);
+        if (gu_bad) std::printf("     at %d: got %g want %g\n", gu_at, (double) hgot[gu_at], want_h[gu_at]);
+        std::snprintf(name, sizeof name, "experts_rdna_down %s", nm);
+        expect(name, host(dy, want_y.size()), want_y, 2e-4, 1e-6 * worst_mag);
+        // each token's picks (K = 3, their rows in any order) summed with their weights
+        const int T = 4, K = 3, inv[T * K] = {5, 0, 40, 37, 2, 43, 38, 39, 1, 10, 41, 42};
+        auto wtr = fvec(rows, 1.0f);
+        int* dinv = dev(std::vector<int>(inv, inv + T * K));
+        float *dw = dev(wtr), *dout = dev_n<float>((size_t) T * C);
+        k::moe_rows_combine(dy, dinv, dw, T, K, C, dout, 0);
+        const auto yv = host(dy, (size_t) rows * C);
+        std::vector<double> want_o((size_t) T * C, 0.0);
+        for (int t = 0; t < T; ++t)
+            for (int kk = 0; kk < K; ++kk)
+                for (int c = 0; c < C; ++c) want_o[(size_t) t * C + c] += (double) wtr[inv[t * K + kk]] * yv[(size_t) inv[t * K + kk] * C + c];
+        std::snprintf(name, sizeof name, "moe_rows_combine %s", nm);
+        expect(name, host(dout, want_o.size()), want_o, 1e-5, 1e-5);
+        for (void* p : {(void*) dpool, (void*) deptr, (void*) dtiles, (void*) dx, (void*) dh, (void*) dsg, (void*) dsu,
+                        (void*) dy, (void*) dinv, (void*) dw, (void*) dout})
+            cudaFree(p);
+    }
+}
+#endif
+
 void test_experts_mma() {
     constexpr int C = 256, F = 128, S = 5;
     const int ty = k::kNVFP4;
@@ -2582,6 +2696,9 @@ int main() {
     test_cand_topk();
     test_token_path();
     test_experts_mma();
+#ifdef STRATA_USE_HIP
+    test_experts_rdna();
+#endif
     std::printf(g_fail ? "FAILED: %d check(s)\n" : "all passed\n", g_fail);
     return g_fail ? 1 : 0;
 }
