@@ -308,6 +308,18 @@ class Loading(unittest.TestCase):
         self.assertIsNone(blind.fraction())
         self.assertIn("so far", text(D.loading(blind, 60)))
 
+    def test_a_first_start_measuring_this_pc(self):   # (maya-hy4: its choices measured once, before it is ready)
+        w = self.watch(["maya-hy4: measuring this PC once, before the first answer: the prompt route (up to 10 chunks "
+                        "of 4096 tokens) - on 56132 tokens of text, 300 s at most; remembered, the next starts skip it"],
+                       gpus=(0,))
+        self.assertTrue(w.measuring)
+        self.assertIn("Measuring this PC once", text(D.loading(w, 60)))
+        w = self.watch(["maya-hy4: measuring this PC once, before the first answer: the prompt route",
+                        "maya-hy4: measured this PC once in 23 s, before the first answer (...): the prompt route's "
+                        "rates remembered"], gpus=(0,))
+        self.assertFalse(w.measuring)
+        self.assertIn("Reading the model's weights", text(D.loading(w, 60)))
+
 
 @unittest.skipIf(T is None, "Textual is not installed (./maya.sh --setup installs it)")
 class Start(unittest.IsolatedAsyncioTestCase):

@@ -5041,6 +5041,13 @@ struct Model::Impl {
         info.push_back(line + buf);
         q4x_adaptive = !force && !memo.found;
         lane_count().q4x_mode.store(force || memo.found ? 1 : 0, std::memory_order_relaxed);
+        q4x_budget = budget;
+        q4x_spawn();
+    }
+    // the copies' sets (empty) and their builder (q4x_start; q4x_fresh)
+    double q4x_budget = 0;
+    void q4x_spawn() {
+        const double budget = q4x_budget;
         for (Layer& l : L)
             if (l.partial()) l.cex.q4x = std::make_shared<Q4xSet>(g.n_expert);
         const int nodes = lane->nodes();
@@ -5101,9 +5108,25 @@ struct Model::Impl {
                     q4x_bytes.store((int64_t) used, std::memory_order_relaxed);
                 }
                 if (!cut && q4x_made.load(std::memory_order_relaxed) > 0) q4x_pass.store(true);
+                if (!cut) q4x_passes.fetch_add(1);
                 nap(200);
             }
+            q4x_over.store(true);
         });
+    }
+    // (Model::load's measuring: the copies kept) the copies its text was made into given back and the builder started
+    // again from none - by the answers' counts between them, as at the starts after (a first start on an 8 GB card
+    // with 61 GB of RAM held 10.8 GB of the text's copies, its page cache that much smaller: decode 17% slower)
+    void q4x_fresh() {
+        q4x_stop.store(true);
+        if (q4x_builder.joinable()) q4x_builder.join();
+        q4x_stop.store(false);
+        q4x_over.store(false);
+        q4x_pass.store(false);
+        q4x_passes.store(0);
+        q4x_made.store(0);
+        q4x_bytes.store(0);
+        q4x_spawn();   // (new sets: the old ones and their copies freed - no lane call runs now)
     }
     // the routes in h_ids (T tokens of layer il) into the profile's counts
     // (the engine's thread, after a lane call) the 4-bit copies' trial: started once copies exist and the lane's
@@ -5117,6 +5140,9 @@ struct Model::Impl {
     bool q4x_adaptive = false, q4x_decided = false;
     std::atomic<bool> q4x_stop{false};
     std::atomic<bool> q4x_pass{false};   // (the builder went once through every expert routed twice, or the RAM is full)
+    std::atomic<int> q4x_passes{0};      // (... its passes through them, each to its end)
+    std::atomic<bool> q4x_over{false};   // (... it has stopped: the RAM full, or a stop)
+    std::atomic<bool> q4x_hold{false};   // (Model::load's measuring: the turns wait while its counts are made into copies)
     int q4x_windows = 0;
     double q4x_prev[2] = {0, 0};          // (the window before: an expert run without / with the copies, s)
     void q4x_trial() {
@@ -5127,7 +5153,7 @@ struct Model::Impl {
             // (the turns start once the builder has been through the experts the counts asked for - the side with
             //  the copies timed with them in place, not while a few exist - and no placement pass moves pages)
             if (q4x_made.load(std::memory_order_relaxed) >= 64 && q4x_pass.load(std::memory_order_relaxed) &&
-                !placing.load(std::memory_order_relaxed)) {
+                !placing.load(std::memory_order_relaxed) && !q4x_hold.load(std::memory_order_relaxed)) {
                 for (int k = 0; k < 2; ++k) lc.trial_calls[k] = lc.trial_entries[k] = 0, lc.trial_s[k] = 0;
                 lc.q4x_mode.store(2, std::memory_order_relaxed);
                 std::fprintf(stderr, "maya-hy4: CPU lane: %lld experts re-coded at 4 bits (%.1f GB): timing the answers' "
@@ -5373,6 +5399,14 @@ struct Model::Impl {
                                    "outside VRAM streamed to the GPU or on the CPU lane, in turns, until the times "
                                    "settle), then ") + (r.file.empty() ? "kept for this run (no data folder named)"
                                                                        : "remembered in " + r.file));
+    }
+    // (Model::load's measuring at a first start: the 4-bit copies' verdict in, the route looked up again by the key it
+    //  has now - a line in the file for it: nothing to measure, as at the starts after)
+    void route_again() {
+        for (auto it = info.begin(); it != info.end();)
+            it = it->rfind("INFO prompt route:", 0) == 0 ? info.erase(it) : std::next(it);
+        route = Route{};
+        route_start();
     }
     // measuring: this layer's side for this chunk (1 stream, 0 lane) - neighbouring layers and a layer's next chunk
     // take the other; timed: the lane's experts warm and the 4-bit copies' verdict in (a long wait: timed anyway)
@@ -8337,6 +8371,197 @@ bool Model::load(const Options& o, std::string& err) {
         if (x.lane) x.route_start();             // (the prompt route: by the fetch's mode)
         return true;
     };
+    // The choices a first start on a PC would otherwise measure while it answers - whether the CPU lane's 4-bit copies
+    // pay (q4x_trial) and the prompt route's rates (route_add) - measured here instead, before the engine says READY,
+    // with their own timing code, on real text: HY4_MEASURE_IDS, a file of token ids (the server writes this install's
+    // docs in the model's tokens).  First the copies: a prompt chunk and 64 tokens one at a time give the routing
+    // counts they are made by, the lane is left idle until the builder has been through them (and the placer is done),
+    // then the text goes on a token at a time until the timed turns decide.  Then the route, looked up again by the
+    // key it has now: not in the file, the text read on in chunks of the prompt's size until its windows agree.  Then
+    // the state as loaded (no tokens, the counts and the stats as they were, HY4_HOT's scores untouched - its routes
+    // not counted, kept copies given back and made again from the answers) and both remembered as before, so the starts after find them and skip this; a first answer then
+    // reads its prompt by the rates later starts use, the same tokens as theirs.  Only where the result is remembered
+    // (a data folder named) and only once (no file, HY4_MEASURE=0, or not decided within HY4_MEASURE_S seconds - 300:
+    // the answers measure the rest, as before)
+    auto measure_pc = [&]() -> bool {
+        Impl& x = *m;
+        const char* on = std::getenv("HY4_MEASURE");
+        const char* path = std::getenv("HY4_MEASURE_IDS");
+        if (!x.lane || (on && std::atoi(on) == 0) || !path || !*path) return true;
+        // (the copies' verdict to come, remembered; the route measured once it is in - or now, nothing before it)
+        const bool want_q = x.q4x_adaptive && !x.q4x_decided && !x.q4x_file.empty();
+        const bool q_open = x.q4x_adaptive && !x.q4x_decided;
+        const bool want_r = x.route.any && x.route.mode == 0 && !x.route.file.empty() && (want_q || !q_open);
+        if (!want_q && !want_r) return true;
+        const int V = x.g.n_vocab;
+        std::vector<int> text;
+        {
+            std::ifstream f(path);
+            for (std::string line; f && std::getline(f, line);) {
+                if (line.empty() || line[0] == '#') continue;
+                const char* s = line.c_str();
+                while (*s) {
+                    char* e = nullptr;
+                    const long v = std::strtol(s, &e, 10);
+                    if (e == s) {
+                        ++s;
+                        continue;
+                    }
+                    if (v >= 0 && v < V) text.push_back((int) v);
+                    s = e;
+                }
+            }
+        }
+        const int Tc = x.Tc, P = std::min(Tc, 256);
+        const int64_t ctx = x.o.max_ctx - 8;
+        if ((int64_t) text.size() < 2LL * std::max(Tc, 1024) || P <= hy4::k::kMaxWin || ctx < Tc + 64) {
+            x.info.push_back("INFO measuring this PC: not before the first answer (" + std::string(path) + ": " +
+                             std::to_string(text.size()) + " tokens, the context " + std::to_string(x.o.max_ctx) +
+                             ") - the answers measure it, as before");
+            return true;
+        }
+        auto clk = [] {
+            return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+        };
+        const double t0 = clk();
+        const double cap_s = [] {
+            const char* v = std::getenv("HY4_MEASURE_S");
+            return v && *v ? std::max(10.0, std::atof(v)) : 300.0;
+        }();
+        int n_pl = 0;   // (the lane layers: a token's one-token lane calls)
+        for (const Layer& l : x.L)
+            if (l.partial()) ++n_pl;
+        const long long K = 40LL * x.g.n_layer;   // (q4x_trial's window: calls a side)
+        const int q_tokens =
+            (int) std::min<long long>(4096, (long long) Impl::kQ4xWindows * (2 * K / std::max(1, n_pl) + 2) + 64);
+        const int r_chunks = Impl::kRouteWindows + 2;
+        std::string plan;
+        if (want_q) plan = " the CPU lane's 4-bit expert copies (a decode of up to " + std::to_string(q_tokens) + " tokens)";
+        if (want_r)
+            plan += std::string(want_q ? ", then" : "") + " the prompt route (up to " + std::to_string(r_chunks) +
+                    " chunks of " + std::to_string(Tc) + " tokens)";
+        std::fprintf(stderr, "maya-hy4: measuring this PC once, before the first answer:%s - on %zu tokens of text, %.0f s "
+                     "at most; remembered, the next starts skip it\n", plan.c_str(), text.size(), cap_s);
+        const Stats keep = x.st;
+        std::vector<uint32_t> keep_cnt;   // (the text's routes not counted: the profile as the starts after see it)
+        {
+            std::lock_guard<std::mutex> lk(x.cnt_mu);
+            keep_cnt = x.prof_cnt;
+        }
+        LaneCount& lc = lane_count();
+        const long long keep_ent = lc.entries.load(), keep_q4 = lc.q4x.load();
+        const bool quiet = x.hot.quiet;
+        x.hot.quiet = true;   // (HY4_HOT: its routes neither counted nor swapped - its scores as loaded)
+        auto restart = [&] {
+            x.tokens.clear();
+            x.end = 0;
+            x.mtp_done = 0;
+        };
+        restart();
+        std::vector<float> lg((size_t) V);
+        size_t at = 0;   // (the text's next token)
+        int64_t pos = 0;
+        std::vector<int> ids;
+        auto feed = [&](int n) -> bool {   // (the text's next n tokens after the last ones; from position 0 when full)
+            if (pos + n > ctx) {
+                restart();
+                pos = 0;
+            }
+            ids.resize((size_t) n);
+            for (int i = 0; i < n; ++i, at = (at + 1) % text.size()) ids[(size_t) i] = text[at];
+            if (!forward(ids.data(), n, pos, 1, lg.data(), err)) return false;
+            pos += n;
+            return true;
+        };
+        auto nap = [&](double secs, auto&& done) {   // (the lane idle: its builder and placer at work), the seconds
+            const double ts = clk(), until = std::min(t0 + cap_s, ts + secs);
+            while (!done() && clk() < until) std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            return clk() - ts;
+        };
+        bool ok = true;
+        std::string how;
+        double q_s = 0, r_s = 0, wait_s = 0;
+        if (want_q) {
+            const double tq = clk();
+            // the routing counts: a prompt chunk and 64 tokens one at a time; the copies made from them while the lane
+            // is idle - 64 more tokens a round while the builder finds fewer than its trial needs.  The turns wait
+            // meanwhile (q4x_hold); turns the warm-up's counts started - copies of the few experts its one repeated
+            // token routes to - start again from these
+            x.q4x_hold.store(true);
+            if (lc.q4x_mode.load() == 2) {
+                lc.q4x_mode.store(0);
+                for (int k = 0; k < 2; ++k) lc.trial_calls[k] = lc.trial_entries[k] = 0, lc.trial_s[k] = 0;
+                x.q4x_windows = 0;
+            }
+            ok = feed(P);
+            for (int i = 0; ok && i < 64; ++i) ok = feed(1);
+            auto built = [&](int p0) {   // (a whole pass of the builder after the counts: two from p0 on; or it ended)
+                return x.q4x_over.load() || x.q4x_passes.load() >= p0 + 2;
+            };
+            bool primed = false;
+            for (int round = 0; ok && !primed && round < 4 && clk() - t0 < cap_s; ++round) {
+                if (round > 0)
+                    for (int i = 0; ok && i < 64; ++i) ok = feed(1);
+                const int p0 = x.q4x_passes.load();
+                wait_s += nap(120.0, [&] { return built(p0) && !x.placing.load(); });
+                primed = built(p0) && !x.placing.load() && x.q4x_made.load() >= 64 && x.q4x_pass.load();
+                if (x.q4x_over.load()) break;
+            }
+            x.q4x_hold.store(false);
+            if (ok && primed)   // (the timed turns: the text on, a token at a time, until two windows agree)
+                for (int i = 0; ok && !x.q4x_decided && i < q_tokens && clk() - t0 < cap_s; ++i) ok = feed(1);
+            q_s = clk() - tq;
+            how = !x.q4x_decided ? " the 4-bit copies not decided (the answers go on timing them)"
+                  : lc.q4x_mode.load() == 1 ? " the 4-bit copies kept (made again from the answers)"
+                                            : " the 4-bit copies dropped";
+            // (the route, as a start after this one finds it: by the key it has now)
+            if (ok && x.q4x_decided) x.route_again();
+        }
+        if (ok && x.route.any && x.route.mode == 0 && !x.route.file.empty() && !(x.q4x_adaptive && !x.q4x_decided)) {
+            const double tr = clk();
+            if (x.placing.load()) wait_s += nap(cap_s, [&] { return !x.placing.load(); });
+            restart();
+            pos = 0;
+            for (int c = 0; ok && x.route.mode == 0 && c < r_chunks && clk() - t0 < cap_s; ++c) ok = feed(Tc);
+            r_s = clk() - tr;
+            if (x.route.mode == 1) {
+                const Impl::Route measured = x.route;
+                x.route_again();   // (the rates as written: the starts after read the same digits)
+                const bool kept = x.route.mode == 1;
+                if (!kept) x.route = measured;   // (not written: this run keeps its own)
+                how += std::string(how.empty() ? "" : ";") + " the prompt route's rates " +
+                       (kept ? "remembered" : "kept for this run");
+            } else {
+                how += std::string(how.empty() ? "" : ";") + " the prompt route not settled (the prompts go on timing it)";
+            }
+        } else if (ok && want_r && x.route.mode == 1) {
+            how += std::string(how.empty() ? "" : ";") + " the prompt route's rates were in the file already";
+        }
+        restart();
+        x.st = keep;
+        {
+            std::lock_guard<std::mutex> lk(x.cnt_mu);
+            x.prof_cnt = keep_cnt;
+        }
+        lc.entries.store(keep_ent);
+        lc.q4x.store(keep_q4);
+        x.hot.quiet = quiet;
+        // (the copies kept: the text's given back, made again from the answers' counts as at the starts after)
+        if (want_q && x.q4x_decided && lc.q4x_mode.load() == 1 && x.q4x_builder.joinable()) x.q4x_fresh();
+        if (ok && x.fx.layers > 0 && x.fx.mode == 1) ok = x.fetch_restore(err);   // (the slots as loaded again)
+        if (!ok) {
+            x.name_fault(err);
+            err = "measuring this PC: " + err;
+            return false;
+        }
+        char buf[240];
+        std::snprintf(buf, sizeof buf, "INFO measured this PC once in %.0f s, before the first answer (the copies %.0f s, "
+                      "the route %.0f s; %.0f s of it waiting for the lane's builder / placer):", clk() - t0, q_s, r_s,
+                      wait_s);
+        x.info.push_back(buf + how);
+        std::fprintf(stderr, "maya-hy4: %s%s\n", buf + 5, how.c_str());
+        return true;
+    };
     if (std::getenv("HY4_NO_WARMUP")) return measure();
     const double t0 = std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
     const Stats keep = m->st;
@@ -8373,7 +8598,7 @@ bool Model::load(const Options& o, std::string& err) {
     std::snprintf(buf, sizeof buf, "INFO warmed up in %.1f s (a prompt chunk, a token window, a draft%s)", t1 - t0,
                   m->vis ? ", a picture" : "");
     m->info.push_back(buf);
-    return measure();
+    return measure() && measure_pc();
 }
 
 bool Model::resumable(int64_t pos) const {

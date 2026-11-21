@@ -5296,7 +5296,8 @@ def route_state(log_text: str) -> str | None:
 
 def route_forget() -> None:
     """--speed-calibration: maya-hy4's prompt route rates measured on this PC are dropped (data/hy4-prompt-route.txt),
-    so the engine measures them again - in the CPU lane check's run below, else while the next start reads prompts."""
+    so the engine measures them again - in the CPU lane check's run below, else at the next start (before it is
+    ready, on this install's docs: serve/server.py's hy4_measure_ids)."""
     path = ROOT / "data" / "hy4-prompt-route.txt"
     try:
         path.unlink()
@@ -5424,11 +5425,11 @@ def q4x_calibration(cfg_path: Path, why: str = "") -> bool | None:
         ok("the prompt route's rates (GPU stream or CPU lane for a prompt's experts outside VRAM) measured on this PC: "
            "the same prompt now takes the same route at every start")
     elif rs == "measuring":
-        warn("the prompt route's rates did not settle in this check: the engine measures them while the next start "
-             "reads prompts, and remembers them")
+        warn("the prompt route's rates did not settle in this check: the engine measures them at the next start, "
+             "before it is ready, and remembers them")
     if not done or verdict == "unmeasured":
-        warn(f"the CPU lane check did not finish ({log_path.name} says why): the engine measures its copies while it "
-             f"answers instead, once its experts are warm, and remembers it ({ME} --speed-calibration tries again)")
+        warn(f"the CPU lane check did not finish ({log_path.name} says why): the engine measures its copies at the "
+             f"next start instead, once its experts are warm, and remembers it ({ME} --speed-calibration tries again)")
         cfg.setdefault("installer", {})["q4x_calibration"] = {"result": "unmeasured", "date": time.strftime("%Y-%m-%d")}
         cfg_path.write_text(json.dumps(N.env_out(cfg), indent=1), encoding="utf-8")
         return None
@@ -6278,7 +6279,9 @@ def server_command(cfg_path: Path, a) -> tuple:
     elif config_family(cfg) == "hy4":
         say("  Loading takes a minute or a few: the engine places what must sit in VRAM and as many of the most-routed")
         say("  experts as fit beside it; the others are computed on the CPU from the model file (RAM as the page cache),")
-        say("  the n-gram table is read from the SSD - the first answers are the slowest.")
+        say("  the n-gram table is read from the SSD - the first answers are the slowest.  The first start on a PC also")
+        say("  measures it once before it is ready (its CPU lane and prompt route: one to two minutes more); later")
+        say("  starts skip that.")
     elif config_family(cfg) == "qwen":
         say("  Loading takes a few minutes: the engine places the most-used experts in VRAM, the next ones in RAM as far")
         say("  as the free RAM goes (MAYA_EXPERT_RAM_GB caps it) and reads the rest from the SSD when they are routed.")

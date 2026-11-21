@@ -70,6 +70,7 @@ class LoadWatch:
     def reset(self) -> None:
         """A start (or a reload) begins: nothing warm yet."""
         self.parts, self.t0 = {}, time.monotonic()      # the part's number -> [GB warm, GB in all]
+        self.measuring = False                          # (maya-hy4's first start on a PC: its choices measured once)
 
     def read(self) -> None:
         """The log's new lines (on the screen's thread, once a second: a few KB)."""
@@ -86,6 +87,10 @@ class LoadWatch:
                 self.parts[int(m.group(2))] = [float(m.group(3)), float(m.group(4))]
             elif m := WARMED.search(line):
                 self.parts[int(m.group(2))] = [float(m.group(3))] * 2
+            elif "measuring this PC once, before the first answer" in line:
+                self.measuring = True
+            elif "measured this PC once in" in line:
+                self.measuring = False
 
     def total(self) -> tuple:
         """(the GB the start warms in all, whether it is known): each part's as the engine said; one not started yet

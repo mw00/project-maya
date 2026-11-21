@@ -65,6 +65,8 @@ ENGINE_VISION = (ds4_vision.Vision, mm3_vision.Vision)   # the engines that run 
 HY4_TEXT_ONLY = "Hy4-Flash with its pictures off"         # (no vision tower loaded: the errors' name for it)
 HY4_LANE_FILE = ROOT / "data" / "hy4-cpu-lane.txt"        # (maya-hy4's 4-bit copies' verdict on this PC: child_env)
 HY4_ROUTE_FILE = ROOT / "data" / "hy4-prompt-route.txt"   # (... its prompt route's rates measured on this PC: child_env)
+HY4_MEASURE_DOCS = ("docs/SETTINGS.md", "README.md")      # (... the text its first start measures them on: hy4_measure_ids)
+HY4_MEASURE_CHARS = 200_000                               # (... about 55K tokens of it: up to 12 prompt chunks of 4096)
 
 
 def hy4_hot_file(cfg: dict) -> Path:
@@ -75,6 +77,44 @@ def hy4_hot_file(cfg: dict) -> Path:
     name = "" if pack is None else pack.parent.name if pack.name == "maya-hy4" else pack.name
     name = re.sub(r"[^A-Za-z0-9._-]+", "_", name).strip("._") or "model"
     return ROOT / "data" / f"hy4-expert-hot-{name}.bin"
+
+
+def hy4_measure_ids(cfg: dict) -> Path | None:
+    """The text maya-hy4 measures this PC's choices on at its first start here (HY4_MEASURE_IDS): whether the CPU
+    lane's 4-bit expert copies pay and the prompt route's rates, before it says READY - so the first answers read
+    their prompts as fast as at the starts after.  This install's docs in the model's tokens, written once into the
+    data folder (a file a tokenizer).  None: no tokenizer, or the file cannot be written - the engine then measures
+    while it answers, as before."""
+    tdir = Path(cfg.get("tokenizer") or "")
+    vocab = tdir / "vocab.json"
+    if not cfg.get("tokenizer") or not vocab.is_file():
+        return None
+    try:
+        tag = hashlib.md5(vocab.read_bytes()).hexdigest()[:10]
+    except OSError:
+        return None
+    path = ROOT / "data" / f"hy4-measure-ids-{tag}.txt"
+    if path.is_file():
+        return path
+    try:
+        import strata_tokenizer as ST
+        text = ""
+        for name in HY4_MEASURE_DOCS:
+            p = ROOT / name
+            if p.is_file() and len(text) < HY4_MEASURE_CHARS:
+                text += p.read_text(encoding="utf-8", errors="replace")[:HY4_MEASURE_CHARS - len(text)] + "\n\n"
+        ids = ST.Tokenizer.from_dir(tdir).encode(text)
+        if len(ids) < 8192:
+            return None
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(f"# maya: {', '.join(HY4_MEASURE_DOCS)} in the model's tokens ({len(ids)}) - the text maya-hy4 "
+                       "measures a PC's 4-bit copies and prompt route on at its first start there\n" +
+                       ",".join(map(str, ids)) + "\n", encoding="utf-8")
+        os.replace(tmp, path)
+        return path
+    except Exception:  # noqa: BLE001 - no text: the engine measures while it answers, as before
+        return None
 
 
 # (... and what stands for a picture in a tool result then: the agent's turn goes on)
@@ -980,6 +1020,10 @@ def narrate_start(log_path: str, offset: int, args: list, done: threading.Event,
                     say("cache", f"[maya] filling the GPU's expert cache ({n}) ...")
                 elif "session is up" in line:
                     say("up", "[maya] almost ready ...")
+                elif "measuring this PC once, before the first answer:" in line:   # (maya-hy4's first start here)
+                    what = re.sub(r" \([^()]*\)", "", line.split("first answer:", 1)[1].split(" - on ", 1)[0]).strip()
+                    say("measure", f"[maya] measuring this PC once ({what}) - one to two minutes, then ready; the "
+                                   "next starts skip this")
                 elif "WARNING - " in line:   # the engine's own (e.g. Windows' commit limit capping the RAM tier)
                     print("[maya] WARNING: " + line.split("WARNING - ", 1)[1].strip(), flush=True)
         if time.time() - last > heartbeat:
@@ -2247,6 +2291,12 @@ def child_env(cfg: dict) -> dict:
         # (... and HY4_HOT's scores - which experts a start places in VRAM - learned by the first start, then kept as
         #  they are until maya --speed-calibration: a file a model in the data folder, not in its download)
         env.setdefault("HY4_HOT_FILE", str(hy4_hot_file(cfg)))
+        # (... and both measured at the first start on this PC before the engine says READY, on this install's docs
+        #  in the model's tokens - not while the first answers read their prompts, 2.5-3x slower then)
+        if "HY4_MEASURE_IDS" not in env:
+            ids = hy4_measure_ids(cfg)
+            if ids is not None:
+                env["HY4_MEASURE_IDS"] = str(ids)
     dirs =[d for d in cfg.get("lib_dirs") or [] if Path(d).is_dir()]
     if dirs:
         var = "PATH" if os.name == "nt" else "LD_LIBRARY_PATH"
