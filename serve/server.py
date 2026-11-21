@@ -1137,6 +1137,17 @@ class StrataEngine:
             # only after the process is reaped (a busy CI runner saw it alive right after a failed restart)
             self.ended = True
             raise RuntimeError("the engine exited before it was ready" + (f" (see {log})" if log else ""))
+        # (#1026) a start that came out short of its VRAM reserve (maya-ds4: INFO reserve_short=<MiB>) - the engine
+        # measured what it allocates after its experts' plan and keeps that free from its next start on: started
+        # once more now, so the first start after an update or a new setting never serves with the reserve used up
+        if self.info.get("reserve_short") and not (env or os.environ).get("MAYA_RESERVE_RESTARTED"):
+            print(f"[maya] this start came out short of the VRAM reserve: the engine starts once more and keeps "
+                  f"{self.info['reserve_short']} MiB more free beside it (measured on this PC)", flush=True)
+            self.close()
+            if self.log is not subprocess.DEVNULL:
+                self.log.close()
+            self.__init__(exe, args, cwd, log, dict(env if env is not None else os.environ, MAYA_RESERVE_RESTARTED="1"))
+            return
         # (from PR #41, midhatn) a locally built engine can sit next to another release's BUILD.json: engines that
         # report their own version (INFO engine=, 0.1.8+) win, the manifest stays the fallback for older ones
         if self.info.get("engine"):

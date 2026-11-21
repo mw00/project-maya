@@ -45,6 +45,19 @@ class Contexts(unittest.TestCase):
 
 
 class Family(unittest.TestCase):
+    def test_vram_reserve_flag_per_engine(self):   # (#1026: --vram-reserve-mib as each engine takes it)
+        cases = (("glm", None, "--vram-reserve-mib", "4096"), ("qwen", None, "--vram-reserve-mib", "4096"),
+                 ("deepseek", None, "--reserve-mib", "4096"), ("minimax", None, "--reserve-gb", "4"),
+                 ("hy4", None, "--reserve-gb", "4.295"))
+        for fam, backend, flag, value in cases:
+            a = ["--x", "1", flag, "7"]
+            self.assertEqual(maya.set_vram_reserve(a, fam, 4096, backend), f"{flag} {value}")
+            self.assertEqual(a, ["--x", "1", flag, value])
+        for fam, backend in (("glm", "metal"), ("ik2", None)):
+            a = ["--x", "1"]
+            self.assertIsNone(maya.set_vram_reserve(a, fam, 4096, backend))
+            self.assertEqual(a, ["--x", "1"])
+
     def test_options_pick_the_model(self):
         self.assertEqual(maya.choose_family(args(model=maya.DS4), {}), "deepseek")
         self.assertEqual(maya.choose_family(args(model="Maya-L"), {}), "glm")
