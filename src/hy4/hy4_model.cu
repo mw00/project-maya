@@ -3475,22 +3475,26 @@ struct Model::Impl {
             // a verify window's rows are the one-token pass's bits); a start with another drafter, or none, plans
             // otherwise and may word an answer differently.  The prompt chunk an auto start takes is the one beside the
             // drafter's room (the block's 3.95 GB is more than a step of the chunk's buffers: leaving it out for a
-            // chunk would take drafting from every card that holds it only beside a smaller chunk).  Where counting
-            // the drafter changes more than that and the experts' places - the cache's rows (F16 or 8-bit), the
-            // pictures' size, the dense prompt span, KV streaming, the GPUs' layout, or whether the start fits - its
-            // room is not counted and it is not loaded: with its drafts the answers would differ from without (an 8 GB
-            // card at 8K: the DFly2 drafter's 0.7 GB put the cache in 8-bit rows; the MTP block's 3.95 GB did so on
-            // larger cards).  The MTP block on any layout; the DFly2 drafter on one GPU (its layout), or where --dfly2
-            // asks on more (as before)
+            // chunk would take drafting from every card that holds it only beside a smaller chunk), and so is the dense
+            // prompt span (dense_max): like the chunk it moves no pick, only the order of a long prompt's attention
+            // sums, and leaving the drafter out for it took drafting from tensor parallel on 16 GB members at 256K
+            // (24576 positions without the MTP block's room, 16384 with it: decode 92 -> 200 tok/s on short code) -
+            // the start says the span it would take without.  Where counting the drafter changes more than that and
+            // the experts' places - the cache's rows (F16 or 8-bit), the pictures' size, KV streaming, the GPUs'
+            // layout, or whether the start fits - its room is not counted and it is not loaded: with its drafts the
+            // answers would differ from without (an 8 GB card at 8K: the DFly2 drafter's 0.7 GB put the cache in 8-bit
+            // rows; the MTP block's 3.95 GB did so on larger cards).  The MTP block on any layout; the DFly2 drafter on
+            // one GPU (its layout), or where --dfly2 asks on more (as before)
             struct Sum {
                 bool ok;
                 int tp, chunk, span;
                 bool q8, vision, head, own;
                 long long pixels, kvres;
                 // (not the MTP pass's own scratch under tensor parallel: a part of the block's room, it moves no
-                //  part of the trunk; not the auto chunk: the one beside the drafters' room, on and off)
+                //  part of the trunk; not the auto chunk nor the dense span: the ones beside the drafter's room - the
+                //  span is said, span_free below)
                 bool same(const Sum& b) const {
-                    return ok == b.ok && tp == b.tp && span == b.span && q8 == b.q8 &&
+                    return ok == b.ok && tp == b.tp && q8 == b.q8 &&
                            vision == b.vision && head == b.head && pixels == b.pixels && kvres == b.kvres;
                 }
             };
@@ -3503,18 +3507,22 @@ struct Model::Impl {
                        : s1.q8 != s0.q8 ? "beside it the latent cache would be in 8-bit rows (F16 without it)"
                        : s1.vision != s0.vision || s1.pixels != s0.pixels ? "beside it pictures would be read smaller"
                        : s1.kvres != s0.kvres ? "beside it the latent cache would stream from the RAM"
-                       : s1.span != s0.span ? "beside it long prompts would be read on a shorter dense span"
                                                                    : "beside it the GPUs would be shared otherwise";
             };
             int n_gpu = 0;
             CK(cudaGetDeviceCount(&n_gpu));
             if (!o.gpus.empty()) n_gpu = (int) o.gpus.size();
+            // (decide's: the dense span the start would take without the drafter it loads, where that drafter's room
+            //  shortens it within the context - said at the start; 0: the same either way)
+            int span_free = 0;
+            const char* span_who = "";
             // (the whole choice, the drafters' room with it: the plan's state is then the start's; false: its error in
             //  e1.  df_why / mtp_why: why that drafter is not loaded, where its room would change the start)
             auto decide = [&](std::string& e1, std::string& df_why, std::string& mtp_why) -> bool {
                 e1.clear();
                 df_why.clear();
                 mtp_why.clear();
+                span_free = 0;
                 (void) n_gpu;
                 const bool df_c = pk.num("dfly_layers") >= 1 && o.dfly2;
                 const bool mtp_c = g.n_mtp > 0 && o.mtp;
@@ -3523,12 +3531,22 @@ struct Model::Impl {
                 std::string e0;
                 const bool ok0 = choose(e0);   // (without any drafter's room: what the start comes to)
                 const Sum s0 = sum(ok0);
+                const int d0 = dense_max;
+                auto kept = [&](const Sum& s, const char* who) {
+                    if (s.span < s0.span) {
+                        span_free = d0;
+                        span_who = who;
+                    }
+                };
                 if (mtp_c) {
                     mtp_room = true;
                     df_room = df_c;
                     const bool ok = choose(e1);
                     const Sum s = sum(ok);
-                    if (s.same(s0)) return ok;
+                    if (s.same(s0)) {
+                        kept(s, "the MTP block's");
+                        return ok;
+                    }
                     mtp_why = why_not(s, s0);
                     mtp_room = false;
                 }
@@ -3536,7 +3554,10 @@ struct Model::Impl {
                     df_room = true;
                     const bool ok = choose(e1);
                     const Sum s = sum(ok);
-                    if (s.same(s0)) return ok;
+                    if (s.same(s0)) {
+                        kept(s, "the DFly2 drafter's");
+                        return ok;
+                    }
                     df_why = why_not(s, s0);
                     df_room = false;
                 }
@@ -3651,10 +3672,14 @@ struct Model::Impl {
                               kChunks[1], kChunkBase);
                 info.push_back(cb);
             }
-            if (dense_max != kDenseBase || de) {
+            if (dense_max != kDenseBase || de || span_free > dense_max) {
+                char why[128] = "";
+                if (span_free > dense_max)
+                    std::snprintf(why, sizeof why, " (beside %s room: %d without it)", span_who, span_free);
+                else if (dense_max == kDenseBase)
+                    std::snprintf(why, sizeof why, " (a longer span does not fit beside this start's plan)");
                 std::snprintf(cb, sizeof cb, "INFO prompts: the indexed layers' attention on the tensor cores up to %d "
-                              "positions%s", dense_max,
-                              dense_max != kDenseBase ? "" : " (a longer span does not fit beside this start's plan)");
+                              "positions%s", dense_max, why);
                 info.push_back(cb);
             }
         }
