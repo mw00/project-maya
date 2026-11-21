@@ -323,11 +323,22 @@ To run it (one GPU):
 Thinking off (`reasoning_effort` `none`, `enable_thinking` false) has the prompt open the answer's text segment:
 the model has no switch for its thinking, only the effort level, and at the lowest it still thinks a little.
 
-**The preview.** Inkling-2-Mini comes in as an experimental preview: Linux, one NVIDIA GPU of 24 GB, sm_80
+**Smaller cards: the offload path.** Where the experts do not all fit (an 8, 12 or 16 GB card, or a 24 GB one past
+its context), tokens still take the resident path's launches, one CUDA graph a token, with a tier of the experts in
+VRAM - the ones Maya's profile (`data/expert-profile-ik2mini.bin`, prompts and answers over code, docs and a tool
+chat) says are picked most a byte, the looped core's counted three times - and every other expert pinned in RAM: a
+pick the tier does not hold is copied by the GPU itself into a staging slot (a small cache of its own) right after the
+router, with no host step, and the same expert kernels read the same bytes, so the answers are the ones every expert
+in VRAM gives. With `IK2_LANE=1` (lane parity) the CPU lane takes a share of the misses beside the copies, split by
+measured costs; every expert then runs one exact arithmetic on either side (`src/ik2/ik2_exact.h`, held bit for bit
+by `tests/ik2_off_test.cu`), so an answer does not depend on where an expert ran. The PC needs the model in RAM and
+VRAM together (about 24 GB; no SSD tier): the setup refuses less in one line.
+
+**The preview.** Inkling-2-Mini comes in as an experimental preview: Linux, one NVIDIA GPU of 8 GB or more, sm_80
 (Ampere) or newer; tested on RTX 3090s (sm_86). Elsewhere `maya-ik2` stops at the start with one line saying why
 (under `--serve` also as a `NOTE` the server prints): no NVIDIA GPU, a GPU older than sm_80 (a V100 cannot run it:
 the kernels use Ampere's `mma.sync` m16n8k16 and `cp.async`), a build with no kernels for the GPU's arch, less than
-22 GiB of VRAM, `--gpus 2` or more, Windows. `IK2_UNSUPPORTED=1` runs it anyway where it can run at all: two GPUs
+7 GiB of VRAM, `--gpus 2` or more, Windows. `IK2_UNSUPPORTED=1` runs it anyway where it can run at all: two GPUs
 (`IK2_EP=1` or `IK2_TP=1`, section 6), smaller cards with the experts streamed from RAM, @cobra91's Windows / CUDA 13
 port - untested here. CMake skips `maya-ik2` without a CUDA arch of 80 or more in the list, in a HIP build, and on
 Windows unless `-DSTRATA_IK2_WINDOWS=ON`.
