@@ -57,34 +57,6 @@ static inline int munmap(void*, size_t) { return 0; }
 #include <unistd.h>
 #endif
 
-#if defined(CUDART_VERSION) && CUDART_VERSION >= 13000
-static inline cudaError_t cudaMemPrefetchAsync_compat(const void* devPtr, size_t count, int dstDevice, cudaStream_t stream = 0) {
-    cudaMemLocation loc{};
-    if (dstDevice < 0) {
-        loc.type = cudaMemLocationTypeHost;
-        loc.id = 0;
-    } else {
-        loc.type = cudaMemLocationTypeDevice;
-        loc.id = dstDevice;
-    }
-    return cudaMemPrefetchAsync(devPtr, count, loc, 0, stream);
-}
-#define cudaMemPrefetchAsync cudaMemPrefetchAsync_compat
-
-static inline cudaError_t cudaMemAdvise_compat(const void* devPtr, size_t count, cudaMemoryAdvise advice, int device) {
-    cudaMemLocation loc{};
-    if (device < 0) {
-        loc.type = cudaMemLocationTypeHost;
-        loc.id = 0;
-    } else {
-        loc.type = cudaMemLocationTypeDevice;
-        loc.id = device;
-    }
-    return cudaMemAdvise(devPtr, count, advice, loc);
-}
-#define cudaMemAdvise cudaMemAdvise_compat
-#endif
-
 #include <algorithm>
 #include <atomic>
 #include <cctype>
@@ -2230,7 +2202,7 @@ void fast_token(Model& M, int tok, int pos, OutMode out_mode, std::vector<float>
     } else {
         FastGraph& G = g_fgraph[(int) out_mode];
         if (!G.exec) {   // the first token of this kind: its launches recorded
-            CU(cudaStreamBeginCapture(g_s, cudaStreamCaptureModeGlobal));
+            CU(cudaStreamBeginCapture(g_s, cudaStreamCaptureModeThreadLocal));
             fast_token_launches(M, W, out_mode);
             CU(cudaStreamEndCapture(g_s, &G.graph));
             CU(cudaGraphInstantiate(&G.exec, G.graph, 0));
@@ -2532,7 +2504,7 @@ void fast_block(Model& M, const int* tok, int T, int pos0, OutMode out_mode, std
     } else {
         FastGraph& G = g_bgraph[T][(int) out_mode];
         if (!G.exec) {
-            CU(cudaStreamBeginCapture(g_s, cudaStreamCaptureModeGlobal));
+            CU(cudaStreamBeginCapture(g_s, cudaStreamCaptureModeThreadLocal));
             fast_block_launches(M, W, T, out_mode);
             CU(cudaStreamEndCapture(g_s, &G.graph));
             CU(cudaGraphInstantiate(&G.exec, G.graph, 0));
