@@ -91,6 +91,10 @@ bool iq512_supported(int) noexcept { return false; }
 void iq512_gu_rows(int, const uint8_t*, size_t, size_t, int, const void* const*, int, float* const*, int, int) {
     unsupported("the AVX-512 i-quant kernel");
 }
+void iq512_gu_rows_split_prefill_iq_avx512(int, const uint8_t*, const uint8_t*, size_t, int, const void* const*, int,
+                                            float* const*, int, int, float) {
+    unsupported("the AVX-512 split-base i-quant prefill kernel");
+}
 void iq512_rows(int, const uint8_t*, size_t, int, const void* const*, int, float* const*, int, int) {
     unsupported("the AVX-512 i-quant kernel");
 }

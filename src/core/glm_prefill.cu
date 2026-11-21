@@ -72,6 +72,11 @@ namespace strata::core {
 namespace gb = strata::kernels::glmb;
 namespace mmq = strata::prefill::mmq;
 
+static const bool iq_prefill_gu_enabled = [] {
+    const char* v = std::getenv("MAYA_GLM_PREFILL_IQ_GU");
+    return v != nullptr && std::atoi(v) != 0;
+}();
+
 // The floats a prompt token's residual rows hold that the next part reads: Flash's four mHC streams (4 x n_embd),
 // GLM-5.3's one (n_embd - glm-dsa writes and reads T x n_embd of R, glm_prefill_dsa.cu).  The split's hand-over copies
 // this many a token; the buffers keep Flash's 4 x n_embd carve (their sizes set the chunk length, so they stay).
@@ -4425,8 +4430,13 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                         a[(size_t) t] = S->c_act.data() + (size_t) (b + t) * kA;
                         o[(size_t) t] = S->c_ff.data() + (size_t) (b + t) * nff;
                     }
-                    kc::native_gu_rows_split(nf, blob, blob + Ly.gu_bytes, a.data(), cnt, o.data(), r0, r0 + kGu,
-                                             g.swiglu_exp);
+                    const bool iq_prefill_gu = iq_prefill_gu_enabled &&
+                                               kc::native_gu_rows_split_prefill_iq_avx512(
+                                                   nf, blob, blob + Ly.gu_bytes, a.data(), cnt, o.data(), r0, r0 + kGu,
+                                                   g.swiglu_exp);
+                    if (!iq_prefill_gu)
+                        kc::native_gu_rows_split(nf, blob, blob + Ly.gu_bytes, a.data(), cnt, o.data(), r0, r0 + kGu,
+                                                 g.swiglu_exp);
                 });
                 F->cpu_pool->run(cpu_nrows, [&](int r) {
                     kc::native_quant_h(nf, S->c_ff.data() + (size_t) r * nff, S->c_hq.data() + (size_t) r * kH);

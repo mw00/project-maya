@@ -392,6 +392,21 @@ void native_gu_rows_split(const NativeFmt& f, const uint8_t* gate_base, const ui
     }
 }
 
+bool native_gu_rows_split_prefill_iq_avx512(const NativeFmt& f, const uint8_t* gate_base, const uint8_t* up_base,
+                                             const void* const* act, int nt, float* const* ff, int r0, int r1,
+                                             float swiglu_limit) {
+    if ((f.gu_type != 21 && f.gu_type != 22) || f.mixed() || nt < 5 || r1 <= r0 ||
+        exact_rows(f.gu_type) != iq512_rows) return false;
+    int t = 0;
+    for (; t + 8 <= nt; t += 8)
+        iq512_gu_rows_split_prefill_iq_avx512(f.gu_type, gate_base, up_base, f.gu_row, (int) f.n_embd, act + t, 8,
+                                               ff + t, r0, r1, swiglu_limit);
+    const int tail = nt - t;
+    if (tail) iq512_gu_rows_split_prefill_iq_avx512(f.gu_type, gate_base, up_base, f.gu_row, (int) f.n_embd, act + t,
+                                                     tail, ff + t, r0, r1, swiglu_limit);
+    return true;
+}
+
 void native_down_rows_split(const NativeFmt& f, const uint8_t* down_base, const void* const* hq,
                             int nt, float* const* out, int r0, int r1) {
     if (r1 > r0) {
