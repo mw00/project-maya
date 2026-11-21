@@ -320,7 +320,11 @@ def _extract_image(block: Dict[str, Any]) -> Dict[str, Any]:
         for key in ("source", "url", "data"):
             if key in block:
                 record[key] = block[key]
-    if not any(record.get(key) for key in ("source", "url", "data")):
+    if block.get("uuid"):
+        if not isinstance(block["uuid"], str):
+            raise ValueError("Image uuid must be a string")
+        record["uuid"] = block["uuid"]
+    if not record.get("uuid") and not any(record.get(key) for key in ("source", "url", "data")):
         raise ValueError("Image block does not contain a valid source")
     return record
 
