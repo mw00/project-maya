@@ -2239,6 +2239,36 @@ def gpu_free_bytes(gpu: int) -> int | None:
         return None
 
 
+def amd_gpu_free_bytes(gpu: int, sysfs: str | None = None, meminfo: str = "/proc/meminfo") -> int | None:
+    """The free memory of AMD GPU `gpu` (HIP's numbering, Linux) now: its VRAM's, as the amdgpu driver says
+    (mem_info_vram_total / _used); on an APU whose memory is the RAM (a carve-out under 8 GiB beside a GTT larger than
+    it: Strix / Gorgon Halo) what MemAvailable leaves beyond the max(8 GiB, 10% of the RAM) the engines keep free.
+    None when it does not read."""
+    from serve import telemetry   # (its KFD -> render node numbering, as the Monitor reads the cards)
+
+    def num(path):
+        try:
+            with open(path, encoding="utf-8") as f:
+                return int(f.read().strip())
+        except (OSError, ValueError):
+            return None
+    dev = telemetry.amd_device_dir(gpu, sysfs)
+    if not dev:
+        return None
+    total, used = num(os.path.join(dev, "mem_info_vram_total")), num(os.path.join(dev, "mem_info_vram_used"))
+    gtt = num(os.path.join(dev, "mem_info_gtt_total"))
+    if total is not None and total < (8 << 30) and gtt is not None and gtt > total:
+        try:
+            with open(meminfo, encoding="utf-8") as f:
+                kb = {k: int(v.split()[0]) for k, v in (line.split(":", 1) for line in f if ":" in line)
+                      if k in ("MemTotal", "MemAvailable")}
+            margin = max(8 << 30, kb["MemTotal"] * 1024 // 10)
+            return max(0, kb["MemAvailable"] * 1024 - margin)
+        except (OSError, ValueError, KeyError):
+            return None
+    return total - used if total is not None and used is not None else None
+
+
 def vision_footprint(vcfg: dict, env: dict, cache_file: Path, gpu: int) -> tuple[int, int] | None:
     """(image token cap, bytes) for the on-demand vision encoder on THIS machine's first GPU: measured once by
     `maya-vision --measure` (before the model loads, so the GPU is otherwise idle) and cached per encoder file, cap
@@ -2365,6 +2395,51 @@ def hy4_draft_ids(cfg: dict) -> Path | None:
         return None
 
 
+IK2_DRAFT_FILE = ROOT / "data" / "ik2-drafting.txt"   # (maya-ik2's --drafting auto: this PC's choice, child_env)
+IK2_DRAFT_TOOL = {"type": "function", "function": {
+    "name": "get_weather", "description": "The current weather in a city.",
+    "parameters": {"type": "object", "properties": {"city": {"type": "string", "description": "The city's name."}},
+                   "required": ["city"]}}}
+IK2_DRAFT_QS = HY4_DRAFT_QS[:2] + (   # (chat, code - and a tool call: Inkling's drafting timed on all three)
+    "What is the weather in Paris and in Rome right now? Use the tool for each city.",)
+
+
+def ik2_draft_ids(cfg: dict) -> Path | None:
+    """The requests maya-ik2 times its --drafting auto on (IK2_DRAFT_IDS): IK2_DRAFT_QS in the
+    model's own chat template with thinking off (the last with IK2_DRAFT_TOOL offered) - a line of token ids each,
+    written once into the data folder (a file a tokenizer and template).  None: not written - the engine then says it
+    did not measure and drafts."""
+    tdir = Path(cfg.get("tokenizer") or "")
+    vocab, tpl = tdir / "vocab.json", tdir / "chat_template.jinja"
+    if not cfg.get("tokenizer") or not vocab.is_file() or not tpl.is_file():
+        return None
+    try:
+        tag = hashlib.md5(vocab.read_bytes() + tpl.read_bytes() + repr(IK2_DRAFT_QS).encode()).hexdigest()[:10]
+    except OSError:
+        return None
+    path = ROOT / "data" / f"ik2-draft-ids-{tag}.txt"
+    if path.is_file():
+        return path
+    try:
+        import strata_tokenizer as ST
+        from serve.frontend import ChatTemplate
+        tok, chat = ST.Tokenizer.from_dir(tdir), ChatTemplate(tpl)
+        lines = []
+        for i, q in enumerate(IK2_DRAFT_QS):
+            tools = [IK2_DRAFT_TOOL] if i == len(IK2_DRAFT_QS) - 1 else None
+            text = chat.render([{"role": "user", "content": q}], tools=tools, enable_thinking=False,
+                               reasoning_effort="none")
+            lines.append(",".join(map(str, tok.encode(text, parse_special=True))))
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text("# maya: requests in the model's chat template, a line each - the answers maya-ik2's "
+                       "--drafting auto times at its first start on a PC\n" + "\n".join(lines) + "\n", encoding="utf-8")
+        os.replace(tmp, path)
+        return path
+    except Exception:  # noqa: BLE001 - none: the engine drafts without measuring
+        return None
+
+
 def child_env(cfg: dict) -> dict:
     """The engine's environment: the CUDA libraries setup installed (pip's nvidia packages, or the toolkit that
     compiled it) first on the library search path."""
@@ -2407,6 +2482,15 @@ def child_env(cfg: dict) -> dict:
             ids = hy4_measure_ids(cfg)
             if ids is not None:
                 env["HY4_MEASURE_IDS"] = str(ids)
+    # Inkling 2 (maya-ik2 --drafting auto): which of no drafting, the prompt lookup and the drafter decodes fastest -
+    # measured once on this PC at the first start (before READY) on a chat, a code and a tool-call request in the
+    # model's template, remembered in the data folder (maya --speed-calibration measures again: IK2_DRAFT_MEASURE)
+    if models.family(cfg) == "ik2" and "--drafting" in (cfg.get("args") or []):
+        env.setdefault("IK2_DRAFT_FILE", str(IK2_DRAFT_FILE))
+        if "IK2_DRAFT_IDS" not in env:
+            ids = ik2_draft_ids(cfg)
+            if ids is not None:
+                env["IK2_DRAFT_IDS"] = str(ids)
     dirs =[d for d in cfg.get("lib_dirs") or [] if Path(d).is_dir()]
     if dirs:
         var = "PATH" if os.name == "nt" else "LD_LIBRARY_PATH"
@@ -7732,6 +7816,8 @@ def main() -> int:
                 vcfg = dict(vcfg, max_tokens=fp[0])
                 if models.family(cfg) != "ik2":   # (maya-ik2 lends no memory: the encoder takes what is free)
                     engine_env = dict(env, MAYA_GLM_VISION_LEND_MB=str((fp[1] >> 20) + 1))
+                else:   # (... and its drafting leaves the room the encoder would have had on the GPU: IK2_VISION_GIB)
+                    engine_env = dict(env, IK2_VISION_GIB=f"{fp[1] / 2**30:.3f}")
                 print(f"[maya] images: the vision encoder needs {fp[1] / 2**30:.2f} GB on this GPU at up to {fp[0]} "
                       "image tokens", flush=True)
         if vcfg and not on_demand:
@@ -7801,10 +7887,11 @@ def main() -> int:
                 # a picture arrives - on the GPU when its free memory then holds what the encoder measured, else on
                 # the CPU - and ends once the request's pictures are read
                 need, gi = fp[1], (gpu_list(cfg) or [0])[0]
+                free_of = amd_gpu_free_bytes if cfg.get("backend") == "hip" else gpu_free_bytes   # (AMD: sysfs)
                 vision = Vision(vcfg, log=vlog, env=venv, start=False)
-                vision.room = lambda: (gpu_free_bytes(gi) or 0) >= need
+                vision.room = lambda: (free_of(gi) or 0) >= need
                 vision.cpu_threads = max(1, (os.cpu_count() or 2) // 2)
-                free = gpu_free_bytes(gi)
+                free = free_of(gi)
                 print(f"[maya] images: the vision encoder starts when a picture arrives - on GPU {gi} while "
                       f"{need / 2**30:.2f} GB of it is free ({(free or 0) / 2**30:.2f} GB now), else on the CPU; "
                       "no VRAM kept for it", flush=True)

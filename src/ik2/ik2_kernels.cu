@@ -3,7 +3,14 @@
 #include "ik2_iq_tables.h"
 
 #include <cuda_fp16.h>
-#include <cuda_fp8.h>
+#ifndef STRATA_USE_HIP
+#include <cuda_fp8.h>   // (AMD: the FP8 conversions are the portable ones below)
+#else
+#include "strata/kernels/rdna_wmma.hpp"   // (AMD: the matrix cores - ik2_rdna.inc)
+
+#include <string>
+#include <type_traits>
+#endif
 
 #include <algorithm>
 #include <cmath>
@@ -164,6 +171,27 @@ __device__ float bmax(float v, float* sh) {
 
 constexpr int kBlk = 256;
 
+// two FP16 a register: a * b / a - b, each half rounded to nearest (as PTX's mul.rn / sub.rn.f16x2)
+#ifdef STRATA_USE_HIP
+typedef _Float16 ik2_h2v __attribute__((ext_vector_type(2)));
+__device__ __forceinline__ uint32_t h2_mul(uint32_t a, uint32_t b) {
+    return __builtin_bit_cast(uint32_t, __builtin_bit_cast(ik2_h2v, a) * __builtin_bit_cast(ik2_h2v, b));
+}
+__device__ __forceinline__ uint32_t h2_sub(uint32_t a, uint32_t b) {
+    return __builtin_bit_cast(uint32_t, __builtin_bit_cast(ik2_h2v, a) - __builtin_bit_cast(ik2_h2v, b));
+}
+#else
+__device__ __forceinline__ uint32_t h2_mul(uint32_t a, uint32_t b) {
+    uint32_t r;
+    asm("mul.rn.f16x2 %0, %1, %2;" : "=r"(r) : "r"(a), "r"(b));
+    return r;
+}
+__device__ __forceinline__ uint32_t h2_sub(uint32_t a, uint32_t b) {
+    uint32_t r;
+    asm("sub.rn.f16x2 %0, %1, %2;" : "=r"(r) : "r"(a), "r"(b));
+    return r;
+}
+#endif
 __device__ __forceinline__ uint32_t f2_to_u32(float a, float b) {
     const __half2 h2 = __float22half2_rn(make_float2(a, b));
     return (uint32_t) __half_as_ushort(__low2half(h2)) | ((uint32_t) __half_as_ushort(__high2half(h2)) << 16);
@@ -893,6 +921,65 @@ __global__ void attn_probs_bias_f16_kernel(const float* lg, uint16_t* out16, int
 constexpr int kFaBN = 64, kFaD = 128, kFaLd = kFaD + 8;   // (row pad: conflict-free fragments/ldmatrix)
 constexpr float kLog2e = 1.4426950408889634f;
 
+#ifdef STRATA_USE_HIP
+// AMD: no mma.sync / ldmatrix / cp.async.  These keep their CUDA fragment layouts exactly (a lane's registers hold the
+// same elements), so every kernel written for them runs as it is: the m16n8k16 product from the A rows and B columns
+// gathered by shuffles (each product of two FP16 is exact in FP32; the sums in a fixed order, the same every run), an
+// ldmatrix from the row addresses of the lanes that give them, a cp.async as a plain copy (the kernels wait for a
+// copy before they read its buffer and never write one that is still read).  The hot paths have RDNA kernels of
+// their own (ik2_rdna.inc); these are what every other path takes.
+__device__ __forceinline__ void mma16816(float* c, const uint32_t* a, uint32_t b0, uint32_t b1) {
+    const int lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {   // (lane 4 g + j holds row g's / g + 8's k 2 j, 2 j + 1 and 2 j + 8, 2 j + 9)
+        const float2 ra0 = u32_to_f2(__shfl_sync(0xffffffffu, a[0], 4 * g + j));
+        const float2 ra1 = u32_to_f2(__shfl_sync(0xffffffffu, a[1], 4 * g + j));
+        const float2 ra2 = u32_to_f2(__shfl_sync(0xffffffffu, a[2], 4 * g + j));
+        const float2 ra3 = u32_to_f2(__shfl_sync(0xffffffffu, a[3], 4 * g + j));
+#pragma unroll
+        for (int cc = 0; cc < 2; ++cc) {   // (column 2 t + cc: lane 4 (2 t + cc) + j's b0 / b1)
+            const int sb = 4 * (2 * t + cc) + j;
+            const float2 rb0 = u32_to_f2(__shfl_sync(0xffffffffu, b0, sb));
+            const float2 rb1 = u32_to_f2(__shfl_sync(0xffffffffu, b1, sb));
+            c[cc] = fmaf(ra2.y, rb1.y, fmaf(ra2.x, rb1.x, fmaf(ra0.y, rb0.y, fmaf(ra0.x, rb0.x, c[cc]))));
+            c[2 + cc] = fmaf(ra3.y, rb1.y, fmaf(ra3.x, rb1.x, fmaf(ra1.y, rb0.y, fmaf(ra1.x, rb0.x, c[2 + cc]))));
+        }
+    }
+}
+// (an LDS pointer's generic address: the aperture's high half, the same for every lane of a block, + the offset)
+__device__ __forceinline__ const uint8_t* ldsm_row(const void* p, int src) {
+    const uintptr_t u = (uintptr_t) p;
+    const uint32_t lo = __shfl_sync(0xffffffffu, (uint32_t) u, src);
+    return (const uint8_t*) ((u & ~(uintptr_t) 0xFFFFFFFFu) | lo);
+}
+__device__ __forceinline__ void ldsm_x4_t(uint32_t& r0, uint32_t& r1, uint32_t& r2, uint32_t& r3, const void* p) {
+    const int lane = threadIdx.x & 31, rr = 2 * (lane & 3), cb = 2 * (lane >> 2);
+    uint32_t r[4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const uint16_t lo = *(const uint16_t*) (ldsm_row(p, 8 * i + rr) + cb);
+        const uint16_t hi = *(const uint16_t*) (ldsm_row(p, 8 * i + rr + 1) + cb);
+        r[i] = (uint32_t) lo | ((uint32_t) hi << 16);
+    }
+    r0 = r[0], r1 = r[1], r2 = r[2], r3 = r[3];
+}
+__device__ __forceinline__ void ldsm_x4(uint32_t& r0, uint32_t& r1, uint32_t& r2, uint32_t& r3, const void* p) {
+    const int lane = threadIdx.x & 31;
+    uint32_t r[4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) r[i] = *(const uint32_t*) (ldsm_row(p, 8 * i + (lane >> 2)) + 4 * (lane & 3));
+    r0 = r[0], r1 = r[1], r2 = r[2], r3 = r[3];
+}
+__device__ __forceinline__ void cp_async16(void* dst, const void* src, bool valid) {
+    *(uint4*) dst = valid ? *(const uint4*) src : make_uint4(0u, 0u, 0u, 0u);
+}
+__device__ __forceinline__ void cp_async4(void* dst, const void* src, bool valid) {
+    *(uint32_t*) dst = valid ? *(const uint32_t*) src : 0u;
+}
+__device__ __forceinline__ void cp_async_commit() {}
+template <int N>
+__device__ __forceinline__ void cp_async_wait() {}
+#else
 __device__ __forceinline__ void mma16816(float* c, const uint32_t* a, uint32_t b0, uint32_t b1) {
     asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, "
                  "{%0,%1,%2,%3};\n"
@@ -926,6 +1013,7 @@ template <int N>
 __device__ __forceinline__ void cp_async_wait() {
     asm volatile("cp.async.wait_group %0;\n" ::"n"(N));
 }
+#endif   // STRATA_USE_HIP
 
 // one 64-key tile of K and V (rows kt .. kt+63; rows at or past k_end zero-filled) into smem, NT threads
 template <int NT>
@@ -1058,7 +1146,11 @@ __device__ __forceinline__ void wg_wait0() {
 #endif
 }
 // (keeps the compiler from moving an accumulator's use across the asynchronous MMA's issue or wait)
+#ifdef STRATA_USE_HIP
+__device__ __forceinline__ void wg_fence_operand(float&) {}   // (AMD: the warpgroup kernel is never built)
+#else
 __device__ __forceinline__ void wg_fence_operand(float& r) { asm volatile("" : "+f"(r)::"memory"); }
+#endif
 __device__ __forceinline__ void fence_proxy_async() {
 #if defined(__CUDA_ARCH_FEAT_SM90_ALL)
     asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
@@ -1066,7 +1158,11 @@ __device__ __forceinline__ void fence_proxy_async() {
 }
 // shared-memory matrix descriptor with the 128-byte swizzle: start, leading / stride byte offsets
 __device__ __forceinline__ uint64_t wg_desc(const void* p, uint32_t lbo, uint32_t sbo) {
+#ifdef STRATA_USE_HIP
+    const uint32_t a = (uint32_t) (uintptr_t) p;   // (AMD: never used - the warpgroup kernel is Hopper's)
+#else
     const uint32_t a = (uint32_t) __cvta_generic_to_shared(p);
+#endif
     return (uint64_t) ((a & 0x3FFFF) >> 4) | ((uint64_t) ((lbo & 0x3FFFF) >> 4) << 16) |
            ((uint64_t) ((sbo & 0x3FFFF) >> 4) << 32) | ((uint64_t) 1 << 62);
 }
@@ -2537,9 +2633,7 @@ __device__ __forceinline__ uint32_t ue4m3_h2(uint32_t x) {   // FP16 bits of ue4
 __device__ __forceinline__ uint32_t nv_pair_h2(uint32_t s, uint32_t scale) {   // bytes 0 and 1's low nibbles
     const uint32_t mag = __byte_perm(0x42403c00u, 0x4a484644u, (s & 0x0707u) << 4);
     const uint32_t sign = ((s & 0x0808u) * 0x101000u) & 0x80008000u;
-    uint32_t r;
-    asm("mul.rn.f16x2 %0, %1, %2;" : "=r"(r) : "r"(mag | sign), "r"(scale));
-    return r;
+    return h2_mul(mag | sign, scale);
 }
 struct NvStep {   // a lane's part of a 64-value block of its two rows: the sub-block's scales and codes
     uint32_t sa, sb, wa0, wa1, wb0, wb1;
@@ -3496,6 +3590,21 @@ __global__ void mv_q8p_kernel(const int8_t* __restrict__ q, const uint16_t* __re
                                         : (unsigned) (row - a1.r0) < (unsigned) a1.n ? a1.x
                                                                                      : x);
     float acc = 0.0f;
+#ifdef STRATA_USE_HIP
+    if ((K & 255) == 0) {   // (AMD: 8 values a lane a step - a wave reads 256 bytes an instruction, three steps ahead)
+        const uint2* q2 = (const uint2*) qr;
+#pragma unroll 3
+        for (int it = 0, n_it = K >> 8; it < n_it; ++it) {
+            const uint2 w = __ldg(q2 + it * 32 + lane);
+            const float4 xa = __ldg(x4 + (it * 32 + lane) * 2), xb = __ldg(x4 + (it * 32 + lane) * 2 + 1);
+            const float dv = h2f(__ldg(dr + it * 8 + (lane >> 2)));
+            acc += dv * ((float) (int8_t) (w.x & 0xFFu) * xa.x + (float) (int8_t) ((w.x >> 8) & 0xFFu) * xa.y +
+                         (float) (int8_t) ((w.x >> 16) & 0xFFu) * xa.z + (float) (int8_t) (w.x >> 24) * xa.w +
+                         (float) (int8_t) (w.y & 0xFFu) * xb.x + (float) (int8_t) ((w.y >> 8) & 0xFFu) * xb.y +
+                         (float) (int8_t) ((w.y >> 16) & 0xFFu) * xb.z + (float) (int8_t) (w.y >> 24) * xb.w);
+        }
+    } else
+#endif
     for (int it = 0, n_it = K >> 7; it < n_it; ++it) {
         const uint32_t w = __ldg(qr + it * 32 + lane);
         const float4 xv = __ldg(x4 + it * 32 + lane);
@@ -4123,15 +4232,9 @@ unsigned grid(size_t n, int b = kBlk) { return (unsigned) ((n + b - 1) / b); }
 // the int8 pairs of Q8_0 blocks as FP16 (exact), and those times a block scale
 __device__ __forceinline__ uint32_t q8_pair(uint32_t w) {
     const uint32_t u = __byte_perm(w ^ 0x80808080u, 0x64646464u, 0x4140);
-    uint32_t f;
-    asm("sub.rn.f16x2 %0, %1, %2;" : "=r"(f) : "r"(u), "r"(0x64806480u));
-    return f;
+    return h2_sub(u, 0x64806480u);
 }
-__device__ __forceinline__ uint32_t q8_h2(uint32_t w, uint32_t scale) {
-    uint32_t f = q8_pair(w);
-    asm("mul.rn.f16x2 %0, %1, %2;" : "=r"(f) : "r"(f), "r"(scale));
-    return f;
-}
+__device__ __forceinline__ uint32_t q8_h2(uint32_t w, uint32_t scale) { return h2_mul(q8_pair(w), scale); }
 
 // Quantized planar Q8 GEMM for the small verify/prefill tiles. One scale covers
 // both 16-wide MMA instructions. Packing the signed bytes via 1024+u is exact
@@ -4566,7 +4669,9 @@ __global__ void __launch_bounds__(SPLIT * 32)
 experts_block_gu_kernel(const uint8_t* const* __restrict__ blob, const int* __restrict__ n_g, const int* __restrict__ tok_g,
                         const int* __restrict__ row_g, size_t off_up, int C, int F, const uint16_t* __restrict__ limbs,
                         const float* __restrict__ sg, const float* __restrict__ su, float gcap, float ucap, uint16_t* h) {
-    __shared__ float4 part[SPLIT][NT][32];
+    // (a warp's sums as experts_mma_kernel's: hi + lo of the gate and of the up row first, then the warps' sums in
+    //  order - so that a member's h is the one-token kernel's to the bit with the same SPLIT)
+    __shared__ float2 part[SPLIT][NT][32];
     const int grp = blockIdx.y, n = n_g[grp];
     if (n <= 0) return;
     const int lane = threadIdx.x & 31, split = threadIdx.x >> 5, gr = lane >> 2, t = lane & 3;
@@ -4611,21 +4716,18 @@ experts_block_gu_kernel(const uint8_t* const* __restrict__ blob, const int* __re
         cur = nxt;
     }
 #pragma unroll
-    for (int j = 0; j < NT; ++j) part[split][j][lane] = make_float4(v[j][0], v[j][1], v[j][2], v[j][3]);
+    for (int j = 0; j < NT; ++j) part[split][j][lane] = make_float2(v[j][0] + v[j][1], v[j][2] + v[j][3]);
     __syncthreads();
     if (split) return;
 #pragma unroll
     for (int j = 0; j < NT; ++j) {
-        float4 tot = part[0][j][lane];
+        float2 tot = part[0][j][lane];
 #pragma unroll
-        for (int s = 1; s < SPLIT; ++s) {
-            const float4 z = part[s][j][lane];
-            tot.x += z.x, tot.y += z.y, tot.z += z.z, tot.w += z.w;
-        }
+        for (int s = 1; s < SPLIT; ++s) tot.x += part[s][j][lane].x, tot.y += part[s][j][lane].y;
         const int mem = j * 4 + t;   // (the lane's columns 2 t, 2 t + 1 of tile j: member 4 j + t's two limbs)
         if (mem < n) {
             const int slot = row_g[grp * kGroupMax + mem];
-            const float gg = (tot.x + tot.y) * (sg ? sg[slot] : 1.0f), u = (tot.z + tot.w) * (su ? su[slot] : 1.0f);
+            const float gg = tot.x * (sg ? sg[slot] : 1.0f), u = tot.y * (su ? su[slot] : 1.0f);
             h[(size_t) slot * F + r] = f2h(gcap * tanhf(gg / gcap) * (1.0f / (1.0f + expf(-gg))) * ucap * tanhf(u / ucap));
         }
     }
@@ -4686,6 +4788,153 @@ experts_block_down_kernel(const uint8_t* const* __restrict__ blob, const int* __
     }
 }
 
+
+// ---- the exact window: a verify window's products with the one-token path's arithmetic for every token (drafting
+// on = drafting off, to the bit), the weights read once for the window
+
+// y [T][N] = W . x [T][K] for a planar Q8_0 matrix: mv_q8p_kernel's sums for each token - a lane the same 4 values of
+// each 128 (the same FMA order), the same warp sum - its R rows a warp sharing each x load, every token's sum in its
+// own register.  TT: the most tokens (T <= TT).
+template <int WARPS, int R, int TT>
+__global__ void __launch_bounds__(WARPS * 32)
+mv_q8p_cols_kernel(const int8_t* __restrict__ q, const uint16_t* __restrict__ d, int N, int K,
+                   const float* __restrict__ x, int x_ld, int T, float* __restrict__ y, int y_ld) {
+    const int row0 = (blockIdx.x * WARPS + (threadIdx.x >> 5)) * R, lane = threadIdx.x & 31;
+    if (row0 >= N) return;
+    const uint32_t* qr[R];
+    const uint16_t* dr[R];
+#pragma unroll
+    for (int i = 0; i < R; ++i) {
+        const int row = min(row0 + i, N - 1);   // (past the last row: the last again, not written)
+        qr[i] = (const uint32_t*) (q + (size_t) row * K), dr[i] = d + (size_t) row * (K >> 5);
+    }
+    float acc[R][TT];
+#pragma unroll
+    for (int i = 0; i < R; ++i)
+#pragma unroll
+        for (int t = 0; t < TT; ++t) acc[i][t] = 0.0f;
+#ifdef STRATA_USE_HIP
+    if ((K & 255) == 0) {   // (AMD: mv_q8p_kernel's 8 values a lane a step, the same expression a token)
+        for (int it = 0, n_it = K >> 8; it < n_it; ++it) {
+            uint2 w[R];
+            float dv[R];
+#pragma unroll
+            for (int i = 0; i < R; ++i)
+                w[i] = __ldg((const uint2*) qr[i] + it * 32 + lane), dv[i] = h2f(__ldg(dr[i] + it * 8 + (lane >> 2)));
+#pragma unroll
+            for (int t = 0; t < TT; ++t) {
+                if (t >= T) break;
+                const float4* x4 = (const float4*) (x + (size_t) t * x_ld);
+                const float4 xa = __ldg(x4 + (it * 32 + lane) * 2), xb = __ldg(x4 + (it * 32 + lane) * 2 + 1);
+#pragma unroll
+                for (int i = 0; i < R; ++i)
+                    acc[i][t] += dv[i] * ((float) (int8_t) (w[i].x & 0xFFu) * xa.x +
+                                          (float) (int8_t) ((w[i].x >> 8) & 0xFFu) * xa.y +
+                                          (float) (int8_t) ((w[i].x >> 16) & 0xFFu) * xa.z +
+                                          (float) (int8_t) (w[i].x >> 24) * xa.w +
+                                          (float) (int8_t) (w[i].y & 0xFFu) * xb.x +
+                                          (float) (int8_t) ((w[i].y >> 8) & 0xFFu) * xb.y +
+                                          (float) (int8_t) ((w[i].y >> 16) & 0xFFu) * xb.z +
+                                          (float) (int8_t) (w[i].y >> 24) * xb.w);
+            }
+        }
+    } else
+#endif
+    for (int it = 0, n_it = K >> 7; it < n_it; ++it) {
+        uint32_t w[R];
+        float dv[R];
+#pragma unroll
+        for (int i = 0; i < R; ++i)
+            w[i] = __ldg(qr[i] + it * 32 + lane), dv[i] = h2f(__ldg(dr[i] + it * 4 + (lane >> 3)));
+#pragma unroll
+        for (int t = 0; t < TT; ++t) {
+            if (t >= T) break;
+            const float4 xv = __ldg((const float4*) (x + (size_t) t * x_ld) + it * 32 + lane);
+#pragma unroll
+            for (int i = 0; i < R; ++i)
+                acc[i][t] += dv[i] * ((float) (int8_t) (w[i] & 0xFFu) * xv.x + (float) (int8_t) ((w[i] >> 8) & 0xFFu) * xv.y +
+                                      (float) (int8_t) ((w[i] >> 16) & 0xFFu) * xv.z + (float) (int8_t) (w[i] >> 24) * xv.w);
+        }
+    }
+#pragma unroll
+    for (int i = 0; i < R; ++i)
+#pragma unroll
+        for (int t = 0; t < TT; ++t) {
+            if (t >= T) break;
+            const float a = wsum(acc[i][t]);
+            if (lane == 0 && row0 + i < N) y[(size_t) t * y_ld + row0 + i] = a;
+        }
+}
+
+// experts_gate_up_swiglu_kernel for group_route's groups: a block's rows for each member in turn (its x in shared
+// memory, the rows' weights read again from the cache), with the one-token kernel's row dots - the same h to the bit
+template <int WARPS, int ROWS>
+__global__ void experts_gate_up_swiglu_mem_kernel(const uint8_t* const* blob, const int* n_g, const int* tok_g,
+                                                  const int* row_g, int ty_gate, int ty_up, size_t eb0, const float* x,
+                                                  int C, int F, size_t rb_gate, size_t rb_up, const float* sg,
+                                                  const float* su, float gcap, float ucap, uint16_t* h) {
+    extern __shared__ float xs[];
+    const int grp = blockIdx.y, n = n_g[grp];
+    if (n <= 0) return;
+    const int warp = threadIdx.x >> 5;
+    const uint8_t* bl = blob[grp];
+    for (int m = 0; m < n; ++m) {
+        const int slot = row_g[grp * kGroupMax + m];
+        if (m) __syncthreads();
+        load_xs_f32(x + (size_t) tok_g[grp * kGroupMax + m] * C, C, xs);
+        __syncthreads();
+        const float sgs = sg ? sg[slot] : 1.0f;
+        const float sus = su ? su[slot] : 1.0f;
+        for (int j = 0; j < ROWS; ++j) {
+            const int r = (blockIdx.x * WARPS + warp) * ROWS + j;
+            if (r >= F) break;
+            float vg, vu;
+            if (ty_gate == ty_up) {
+                row_dot_pair(ty_gate, bl + (size_t) r * rb_gate, bl + eb0 + (size_t) r * rb_up, xs, C, vg, vu);
+            } else {
+                vg = row_dot(ty_gate, bl + (size_t) r * rb_gate, xs, C);
+                vu = row_dot(ty_up, bl + eb0 + (size_t) r * rb_up, xs, C);
+            }
+            if ((threadIdx.x & 31) == 0) {
+                const float g = vg * sgs, u = vu * sus;
+                h[(size_t) slot * F + r] = f2h(gcap * tanhf(g / gcap) * (1.0f / (1.0f + expf(-g))) * ucap * tanhf(u / ucap));
+            }
+        }
+    }
+}
+// ... experts_down_kernel's (its rows in pairs through row_dot_2: ROWS even)
+template <int WARPS, int ROWS>
+__global__ void experts_down_mem_kernel(const uint8_t* const* blob, const int* n_g, const int* row_g, int ty_down,
+                                        size_t off_down, const uint16_t* h, int C, int F, size_t rb_down, float* y) {
+    extern __shared__ float xs[];
+    const int grp = blockIdx.y, n = n_g[grp];
+    if (n <= 0) return;
+    const int warp = threadIdx.x >> 5;
+    const uint8_t* w = blob[grp] + off_down;
+    for (int m = 0; m < n; ++m) {
+        const int slot = row_g[grp * kGroupMax + m];
+        if (m) __syncthreads();
+        load_xs_f16(h + (size_t) slot * F, F, xs);
+        __syncthreads();
+        for (int j = 0; j < ROWS;) {
+            const int row = (blockIdx.x * WARPS + warp) * ROWS + j;
+            if (row >= C) break;
+            if (j + 1 < ROWS && row + 1 < C) {
+                float v0, v1;
+                row_dot_2(ty_down, w + (size_t) row * rb_down, w + (size_t) (row + 1) * rb_down, xs, F, v0, v1);
+                if ((threadIdx.x & 31) == 0) {
+                    y[(size_t) slot * C + row] = v0;
+                    y[(size_t) slot * C + row + 1] = v1;
+                }
+                j += 2;
+            } else {
+                const float v = row_dot(ty_down, w + (size_t) row * rb_down, xs, F);
+                if ((threadIdx.x & 31) == 0) y[(size_t) slot * C + row] = v;
+                j += 1;
+            }
+        }
+    }
+}
 
 // route() for a window, a block of E threads a token (route_token_kernel's picks: the same weights to the bit)
 __global__ void route_rows_kernel(const float* __restrict__ logits, const float* __restrict__ bias, int E, int K,
@@ -4858,6 +5107,10 @@ experts_block_down_q8_kernel(const uint8_t* const* __restrict__ blob, const int*
 
 }  // namespace
 
+#ifdef STRATA_USE_HIP
+#include "ik2_rdna.inc"   // (AMD: the matrix-core kernels)
+#endif
+
 void rms(const float* x, const float* w, int rows, int D, float eps, float* y, cudaStream_t s) {
     if (rows <= 0) return;
     rms_impl_kernel<false, true><<<rows, kBlk, 0, s>>>(x, w, D, eps, nullptr, y);
@@ -4980,10 +5233,25 @@ bool fa_wgmma() {
     }();
     return on != 0;
 }
+#ifdef STRATA_USE_HIP
+// (AMD: the matrix-core kernel of ik2_rdna.inc on RDNA 3 / 3.5 / 4 - the CUDA kernel's 86 KB of shared memory is past
+//  RDNA's 64 KB; IK2_RDNA_FLASH=0: off)
+bool attn_flash_available() {
+    static const bool on = !(std::getenv("IK2_RDNA_FLASH") && !std::atoi(std::getenv("IK2_RDNA_FLASH"))) && rdna_wmma_gpu();
+    return on;
+}
+#else
+bool attn_flash_available() { return true; }
+#endif
 template <int NW, bool WG, class KVT>
 void attn_flash_launch(const uint16_t* q16, int q_ld, const KVT* kc, const KVT* vc, int kv_cap, int H, int KV,
                        int Tq, int qpos0, float qk_scale, const float* bias, int extent, int window, int n_split,
                        float* o_part, float2* ml_part, cudaStream_t s) {
+#ifdef STRATA_USE_HIP
+    attn_flash_rdna<KVT>(q16, q_ld, kc, vc, kv_cap, H, KV, Tq, qpos0, qk_scale, bias, extent, window, n_split, o_part,
+                         ml_part, s);
+    return;
+#endif
     static bool attr[16] = {};   // (per device: the attribute is a device's, and the layer split runs on several)
     int dev = 0;
     cudaGetDevice(&dev);
@@ -5928,5 +6196,52 @@ void experts_block_down_q8(const uint8_t* const* blob, const int* n, const int* 
                                                                                             F, h, y);
     check("experts_block_down_q8");
 }
+
+void mv_q8p_cols(const int8_t* q, const uint16_t* d, int N, int K, const float* x, int x_ld, int T, float* y, int y_ld,
+                 cudaStream_t s) {
+    if (N <= 0 || T <= 0) return;
+    if (K % 128 || ((uintptr_t) q & 3) || ((uintptr_t) x & 15) || (x_ld & 3) || T > 8) {
+        std::fprintf(stderr, "ik2::k::mv_q8p_cols: K %d, x_ld %d, %d tokens, or q / x not aligned\n", K, x_ld, T);
+        std::abort();
+    }
+    // (a warp's rows: more share each x load - the window's x is read once per R rows - fewer warps in flight)
+    static const int rr = getenv("IK2_COLS_R") ? atoi(getenv("IK2_COLS_R")) : 0;
+    const int R = rr == 2 || rr == 4 || rr == 8 ? rr : (T <= 2 ? 2 : 4);
+    constexpr int WARPS = 4;
+    const unsigned g = (unsigned) ((N + WARPS * R - 1) / (WARPS * R));
+#define IK2_COLS(RR, TT) mv_q8p_cols_kernel<WARPS, RR, TT><<<g, WARPS * 32, 0, s>>>(q, d, N, K, x, x_ld, T, y, y_ld)
+#define IK2_COLS_T(RR) \
+    if (T <= 2) IK2_COLS(RR, 2); \
+    else if (T <= 4) IK2_COLS(RR, 4); \
+    else if (T <= 6) IK2_COLS(RR, 6); \
+    else IK2_COLS(RR, 8)
+    if (R == 2) { IK2_COLS_T(2); }
+    else if (R == 4) { IK2_COLS_T(4); }
+    else { IK2_COLS_T(8); }
+#undef IK2_COLS_T
+#undef IK2_COLS
+    check("mv_q8p_cols");
+}
+void experts_gate_up_swiglu_mem(const uint8_t* const* blob, const int* n, const int* tok, const int* row, int G,
+                                int ty_gate, int ty_up, size_t eb0, const float* x, int C, int F, const float* sg,
+                                const float* su, float gcap, float ucap, uint16_t* h, cudaStream_t s) {
+    if (G <= 0) return;
+    constexpr int WARPS = 4, ROWS = 2;
+    const dim3 g((unsigned) ((F + WARPS * ROWS - 1) / (WARPS * ROWS)), (unsigned) G);
+    experts_gate_up_swiglu_mem_kernel<WARPS, ROWS><<<g, WARPS * 32, xp_floats(C) * 4, s>>>(
+        blob, n, tok, row, ty_gate, ty_up, eb0, x, C, F, mv_row_bytes(ty_gate, C), mv_row_bytes(ty_up, C), sg, su,
+        gcap, ucap, h);
+    check("experts_gate_up_swiglu_mem");
+}
+void experts_down_mem(const uint8_t* const* blob, const int* n, const int* row, int G, int ty_down, size_t off_down,
+                      const uint16_t* h, int C, int F, float* y, cudaStream_t s) {
+    if (G <= 0) return;
+    constexpr int WARPS = 4, ROWS = 2;
+    const dim3 g((unsigned) ((C + WARPS * ROWS - 1) / (WARPS * ROWS)), (unsigned) G);
+    experts_down_mem_kernel<WARPS, ROWS><<<g, WARPS * 32, xp_floats(F) * 4, s>>>(blob, n, row, ty_down, off_down, h, C,
+                                                                                F, mv_row_bytes(ty_down, F), y);
+    check("experts_down_mem");
+}
+bool experts_block_exact() { return experts_mma_split(true) == 8 && experts_mma_split(false) == 4; }
 
 }  // namespace ik2::k
