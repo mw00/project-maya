@@ -95,6 +95,14 @@ size_t attn_ws_floats(int T, int H, int kv_lora, int max_keys);
 void attention(const float* q, int T, int H, int kv_lora, int n_rot, const uint16_t* cache, int ring, const int* keys,
                int ldk, const int* lo, const int* nk, int max_keys, float scale, const float* sinks, float* ws,
                float* out, cudaStream_t s, bool q8 = false);
+/// The same over keys[t][0 .. nk[t]) on an RDNA GPU's matrix cores (gfx11; HY4_ATTN_WMMA=0 off, =1 also gfx12): a
+/// prompt's tokens past the dense span - within rounding of attention's sums (F16 products of a split query and
+/// split probabilities, in another order), so never a token window's.  false: not taken (another GPU, H not a
+/// multiple of 16, no keys) - attention then.  attn_wmma_on: whether this device takes it.
+bool attn_wmma_on();
+bool attention_wmma(const float* q, int T, int H, int kv_lora, int n_rot, const uint16_t* cache, int ring,
+                    const int* keys, int ldk, const int* nk, float scale, const float* sinks, float* out,
+                    cudaStream_t s, bool q8 = false);
 
 /// x *= sigmoid(g), n values
 void sigmoid_mul(float* x, const float* g, size_t n, cudaStream_t s);
@@ -182,6 +190,11 @@ void ix_pool(const float* ivg, int ring, int g0, int n, int kpool, int dim, cons
 /// wt[t][h]; -inf beyond.  q [T][heads][dim], wt [T][heads]; score rows ld apart, n_pool columns
 void ix_score(const float* q, const float* wt, int T, int heads, int dim, const float* pooled, const int* pos, int kpool,
               int n_pool, float* score, size_t ld, cudaStream_t s, bool f16 = false);
+/// ... on an RDNA GPU's matrix cores (attn_wmma_on's devices; 16 heads of 128; HY4_IX_WMMA=0 off): the pools rounded
+/// to F16, the products of a split query, in another order - the prompt path past the exact span alone.  false: not
+/// taken (ix_score then)
+bool ix_score_wmma(const float* q, const float* wt, int T, int heads, int dim, const float* pooled, const int* pos,
+                   int kpool, int n_pool, float* score, size_t ld, cudaStream_t s, bool f16 = false);
 /// ... from the heads' dot products of a GEMM (the prompt path): S[(t heads + h) ldS + j] = q[t][h] . pk[g0 + j],
 /// j < n -> score[t][g0 + j] as ix_score's (the same sum over the heads; -inf from nv[t] on)
 void ix_reduce(const float* S, size_t ldS, const float* wt, int T, int heads, const int* pos, int kpool, int g0, int n,

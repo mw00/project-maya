@@ -258,6 +258,15 @@ void test_attention() {
         const double e = rel(host(out, (size_t) T * H * KL), ref(keys));
         std::printf("  attention, key list: rel %.2e\n", e);
         CHECK(e < 1e-5);
+        // the matrix cores' form (AMD gfx11): within the split products' rounding of the reference
+        cudaMemset(out, 0, sizeof(float) * (size_t) T * H * KL);
+        if (hy4::k::attention_wmma(dq, T, H, KL, R, full, 0, dk, ldk, dnk, scale, dsink, out, 0)) {
+            const double ew = rel(host(out, (size_t) T * H * KL), ref(keys));
+            std::printf("  attention on the matrix cores, key list: rel %.2e\n", ew);
+            CHECK(ew < 1e-4);
+        } else {
+            std::printf("  attention on the matrix cores: not on this GPU\n");
+        }
         cudaFree(full);
         cudaFree(dk);
         cudaFree(dnk);
@@ -355,6 +364,12 @@ void test_attention() {
         const double ek = rel(host(out, (size_t) T * H * KL), ref8(keys2));
         std::printf("  attention q8, key list: rel %.2e\n", ek);
         CHECK(ek < 1e-5);
+        cudaMemset(out, 0, sizeof(float) * (size_t) T * H * KL);
+        if (hy4::k::attention_wmma(dq, T, H, KL, R, q8f, 0, dk, ldk, dnk2, scale, dsink, out, 0, true)) {
+            const double ew = rel(host(out, (size_t) T * H * KL), ref8(keys2));
+            std::printf("  attention q8 on the matrix cores, key list: rel %.2e\n", ew);
+            CHECK(ew < 1e-4);
+        }
         cudaFree(ws2);
         cudaFree(dk);
         cudaFree(dnk2);
@@ -504,6 +519,24 @@ void test_indexer() {
         }
     std::printf("  ix_score: max rel diff %.2e\n", emax);
     CHECK(emax < 1e-4);
+    {   // the matrix cores' form (AMD gfx11): the pools rounded to F16 - within that rounding of ix_score's, -inf alike
+        float* sw;
+        cudaMalloc(&sw, sizeof(float) * T * ld);
+        if (hy4::k::ix_score_wmma(dq, dwt, T, IH, D, pooled, dpos, KP, n_pool, sw, ld, 0)) {
+            const std::vector<float> s4 = host(sw, (size_t) T * ld);
+            double ew = 0;
+            int bad = 0;
+            for (int t = 0; t < T; ++t)
+                for (int gi = 0; gi < n_pool; ++gi) {
+                    const float a = s4[(size_t) t * ld + gi], b = sc[(size_t) t * ld + gi];
+                    if (gi >= pos[(size_t) t] / KP) bad += !(std::isinf(a) && a < 0);
+                    else ew = std::max(ew, (double) std::fabs(a - b) / std::max(1.0, (double) std::fabs(b)));
+                }
+            std::printf("  ix_score on the matrix cores: max rel diff %.2e, %d beyond a token's pools not -inf\n", ew, bad);
+            CHECK(ew < 5e-3 && bad == 0);
+        }
+        cudaFree(sw);
+    }
     {   // ix_reduce: the heads' products as a GEMM leaves them (column (t, h), row g - g0), in two slabs -> ix_score's
         // scores, -inf from each token's nv on
         const int cut = n_pool / 3 / 8 * 8;

@@ -4269,11 +4269,29 @@ struct Model::Impl {
                         ix_chk[3] += nb[(size_t) t] - same;
                     }
                 }
-                if (!by_gemm)
+                // (AMD RDNA 3 / 4, the prompt path past ix_gemm_from: the scores on the matrix cores - HY4_IX_WMMA=0 off)
+                const bool by_wmma = !by_gemm && T > W && p0 + t0 >= (int64_t) ix_gemm_from &&
+                                     k::ix_score_wmma(gp.iq + (size_t) t0 * IH * D, gp.wt + (size_t) t0 * IH, ts, IH, D,
+                                                      l.pooled, gp.pos + t0, KP, n_pool, gp.score, npool_ld, si, kv_q8);
+                if (!by_gemm && !by_wmma)
                     k::ix_score(gp.iq + (size_t) t0 * IH * D, gp.wt + (size_t) t0 * IH, ts, IH, D, l.pooled,
                                 gp.pos + t0, KP, n_pool, gp.score, npool_ld, si, kv_q8);
                 k::ix_select(gp.score, npool_ld, ts, gp.pos + t0, KP, top, gp.keys + (size_t) t0 * maxk, maxk,
                              gp.knk + t0, si);
+            };
+            // (the matrix cores' attention, AMD: the sub-batches [wm_a, wm_b) waiting for one launch - attend)
+            const bool wm_on = T > W && k::attn_wmma_on();
+            int wm_a = 0, wm_b = 0;
+            auto flush_wmma = [&] {
+                if (wm_b > wm_a &&
+                    !k::attention_wmma(gp.qcat + (size_t) wm_a * H * KR, wm_b - wm_a, H, KL, R, l.kv, 0,
+                                       gp.keys + (size_t) wm_a * maxk, maxk, gp.knk + wm_a, scale, l.sinks,
+                                       gp.o + (size_t) wm_a * H * KL, s, kv_q8))
+                    for (int a = wm_a; a < wm_b; a += kSub)   // (not taken: the gathering kernel, a sub-batch's ws each)
+                        k::attention(gp.qcat + (size_t) a * H * KR, std::min(kSub, wm_b - a), H, KL, R, l.kv, 0,
+                                     gp.keys + (size_t) a * maxk, maxk, nullptr, gp.knk + a, maxk, scale, l.sinks,
+                                     gp.ws, gp.o + (size_t) a * H * KL, s, kv_q8);
+                wm_a = wm_b = 0;
             };
             // ... its attention over them
             auto attend = [&](int t0, int ts) {
@@ -4286,6 +4304,16 @@ struct Model::Impl {
                     attn_sparse(l, gp, t0, ts, p0, scale, dq, (int) (span * sparse_frac / 100)))
                     return;
                 if (T > W && attn_prompt(l, gp, t0, ts, p0, false, scale, dq)) return;
+                // (AMD RDNA 3 / 4: the picks' attention on the matrix cores - past the dense span alone, within
+                //  rounding of the gathering kernel's sums; HY4_ATTN_WMMA=0: that kernel.  Consecutive sub-batches
+                //  wait to go in one launch - a block a token, a sub-batch's 64 left most of the GPU idle; the
+                //  picks of each stay in its own rows of gp.keys, nothing reads gp.o before flush_wmma)
+                if (T > W && !sparse_attn && !l.wrapped() && wm_on) {
+                    if (wm_b != t0) flush_wmma();
+                    if (wm_b == wm_a) wm_a = t0;
+                    wm_b = t0 + ts;
+                    return;
+                }
                 if (T > W && sparse_attn) {
                     // (pieces of the sub-batch: fewer tokens pick fewer pools between them; a piece whose rows do
                     //  not fit is halved, the last resort the gathering kernel)
@@ -4367,6 +4395,7 @@ struct Model::Impl {
                 }
                 part(gp, "attn: the indexer's scores and picks", T);
                 for (int t0 = 0; t0 < T; t0 += kSub) attend(t0, std::min(kSub, T - t0));
+                flush_wmma();
                 part(gp, "attn: gathering kernel", T);
             } else {
                 for (int t0 = 0; t0 < T; t0 += kSub) {   // (the scores of kSub tokens at a time)
@@ -4392,6 +4421,8 @@ struct Model::Impl {
                     attend(t0, ts);
                     part(gp, "attn: gathering kernel", T);
                 }
+                flush_wmma();
+                part(gp, "attn: gathering kernel", T);
             }
             if (sparse_stat && T > W && sparse_attn && p0 + T > dense_max)
                 std::fprintf(stderr, "SPARSE layer %d to %lld: %lld sub-batches over %lld rows, %lld not taken, most %lld\n",
