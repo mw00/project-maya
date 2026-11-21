@@ -446,6 +446,21 @@ Thinking budget: the config's `"thinking_budget"` (none by default: Inkling thin
 Thinking off (`reasoning_effort` `none`, `enable_thinking` false) has the prompt open the answer's text segment:
 the model has no switch for its thinking, only the effort level, and at the lowest it still thinks a little.
 
+**Several conversations: the session cache.** One conversation stays on the GPU. Without the session cache, a request
+that does not continue it (and shares none of its snapshots) drops it and reads its own prompt from the start, so two
+conversations taking turns each read their whole prompt every turn. With `IK2_SESSION_CACHE_GB=N`, the conversation
+being dropped is first put aside in up to N GiB of host RAM: its latest snapshot's short-convolution states and
+sliding windows, the full layers' K / V rows before its position, and the drafter's context. A later request whose
+tokens start with an entry's tokens (and the same picture signatures) is taken up from there and reads only what is
+new. Entries are evicted least recently used first; conversations shorter than `IK2_SESSION_CACHE_MIN` tokens (1024)
+are not kept. The cache is off with `--parallel`, where each conversation keeps its own slot, and where the K / V
+cache is streamed from RAM. Measured on an RTX 3090 under Windows (FP8 K / V, the drafter): three conversations of
+30K, 12K and 20K tokens taking turns read 12.5, 5.2 and 8.1 s on their first turn and 0.4-0.8 s on each turn after it.
+Putting a conversation aside or taking it up takes 0.03-0.5 s, and a 20K-token conversation holds 0.4-0.5 GiB of RAM.
+A conversation taken up gives the same tokens as one that never left: 200 greedy tokens compared with the drafter on
+the 24 GB card, and without it on `IK2_VRAM_GB=8`'s offload path, where the K / V rows lent to experts are given back
+first.
+
 **Smaller cards: the offload path.** Where the experts do not all fit (an 8, 12 or 16 GB card, or a 24 GB one past
 its context), tokens still take the resident path's launches, one CUDA graph a token, with a tier of the experts in
 VRAM - the ones Maya's profile (`data/expert-profile-ik2mini.bin`, prompts and answers over code, docs and a tool
