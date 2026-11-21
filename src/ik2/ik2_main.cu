@@ -531,6 +531,17 @@ void mv1(const Mat& m, const float* x, float* y) {
     if (m.q8) k::mv_q8p(m.q8, m.q8d, m.N, m.K, x, y, g_s);
     else k::mv_blocks(m.type, m.raw, m.N, m.K, x, y, g_s);
 }
+// ... with up to two short convs on its rows: the planar Q8 product has them as its epilogue (a launch less each;
+// those rows of y are then not written), any other matrix gets the product and then the convs
+void mv1c(const Mat& m, const float* x, float* y, const k::MvConv& c0, const k::MvConv& c1 = k::MvConv{}) {
+    if (m.q8) {
+        k::mv_q8p_conv(m.q8, m.q8d, m.N, m.K, x, y, c0, c1, g_s);
+        return;
+    }
+    k::mv_blocks(m.type, m.raw, m.N, m.K, x, y, g_s);
+    for (const k::MvConv* cv : {&c0, &c1})
+        if (cv->n) k::conv4_res(y + cv->r0, cv->hist, cv->w, cv->dyn, cv->heads, 1, cv->n, cv->res, cv->y, g_s);
+}
 
 uint16_t* g_w16 = nullptr;   // a matrix's FP16 decode for the prompt path's GEMMs (the largest of a layer's)
 size_t g_w16_n = 0;          // values it holds
@@ -1216,13 +1227,16 @@ __global__ void scatter_add_rows_kernel(const float* __restrict__ y, const int* 
 }
 
 // Y [T] rows (ldy) = rows [r0, r0 + n) of a dense matrix over X: a fused projection's part that takes its own input
-void matmul_rows(const Mat& m, int r0, int n, const float* x32, const uint16_t* x16, int T, float* Y, int ldy) {
+Mat mat_rows(const Mat& m, int r0, int n) {   // the rows [r0, r0 + n) of a matrix
     Mat p = m;
     p.N = n;
     if (m.f16) p.f16 = m.f16 + (size_t) r0 * m.K;
     else if (m.q8) p.q8 = m.q8 + (size_t) r0 * m.K, p.q8d = m.q8d + (size_t) r0 * (m.K >> 5);
     else p.raw = m.raw + (size_t) r0 * (m.K / k::block_values(m.type)) * k::block_bytes(m.type);
-    matmul(p, x32, x16, T, Y, ldy);
+    return p;
+}
+void matmul_rows(const Mat& m, int r0, int n, const float* x32, const uint16_t* x16, int T, float* Y, int ldy) {
+    matmul(mat_rows(m, r0, n), x32, x16, T, Y, ldy);
 }
 
 // A looped layer's message gates over a chunk of tokens.  A gate is two matrix products - g = D [rms(x); rms(m)],
@@ -1993,30 +2007,30 @@ void fast_token_launches(Model& M, Work& W, OutMode out_mode) {
         }
         // the projections, straight over the blocks
         float *q_p, *k_p, *v_p, *r_p, *gate_p, *kd_p = nullptr, *vd_p = nullptr;
+        // (k's and v's short convs ride their products' launches - mv1c - and the sinks the clips' launch below)
         if (Ly.sliding) {
             const Mat& m = Ly.wqkvrg;   // q | k | v | r | gate
-            if (!sep) {
-                mv1(m, W.xq, W.qkv);
-            } else {
-                matmul_rows(m, 0, HD, W.xq, nullptr, 1, W.qkv, m.N);
-                matmul_rows(m, HD, KD, W.xk, nullptr, 1, W.qkv + HD, m.N);
-                matmul_rows(m, HD + KD, KD, W.xv, nullptr, 1, W.qkv + HD + KD, m.N);
-                matmul_rows(m, HD + 2 * KD, m.N - HD - 2 * KD, W.xq, nullptr, 1, W.qkv + HD + 2 * KD, m.N);
-            }
             q_p = W.qkv, k_p = q_p + HD, v_p = k_p + KD, r_p = v_p + KD, gate_p = r_p + HR;
+            if (!sep) {
+                mv1c(m, W.xq, W.qkv, k::MvConv{HD, KD, Ly.h_k, Ly.sc_k, nullptr, 0, nullptr, W.kconv},
+                     k::MvConv{HD + KD, KD, Ly.h_v, Ly.sc_v, nullptr, 0, nullptr, W.vconv});
+            } else {
+                mv1(mat_rows(m, 0, HD), W.xq, W.qkv);
+                mv1c(mat_rows(m, HD, KD), W.xk, k_p, k::MvConv{0, KD, Ly.h_k, Ly.sc_k, nullptr, 0, nullptr, W.kconv});
+                mv1c(mat_rows(m, HD + KD, KD), W.xv, v_p,
+                     k::MvConv{0, KD, Ly.h_v, Ly.sc_v, nullptr, 0, nullptr, W.vconv});
+                mv1(mat_rows(m, HD + 2 * KD, m.N - HD - 2 * KD), W.xq, W.qkv + HD + 2 * KD);
+            }
         } else {
             const Mat& m = Ly.wqrg;     // q | r | gate
             mv1(m, W.xq, W.qkv);
             q_p = W.qkv, r_p = q_p + HD, gate_p = r_p + HR;
             k_p = W.kk, v_p = W.vv, kd_p = W.dyn, vd_p = W.dyn + (size_t) c.KV * 4;
-            mv1(Ly.wk, W.xk, k_p);
-            mv1(Ly.wv, W.xv, v_p);
             k::mv_f16(Ly.sc_k_dyn16, c.KV * 4, C, W.xk, kd_p, g_s);
             k::mv_f16(Ly.sc_v_dyn16, c.KV * 4, C, W.xv, vd_p, g_s);
+            mv1c(Ly.wk, W.xk, k_p, k::MvConv{0, KD, Ly.h_k, Ly.sc_k, kd_p, c.KV, nullptr, W.kconv});
+            mv1c(Ly.wv, W.xv, v_p, k::MvConv{0, KD, Ly.h_v, Ly.sc_v, vd_p, c.KV, nullptr, W.vconv});
         }
-        k::mv_f16(Ly.sink16, c.H, C, W.xq, W.sink, g_s);
-        k::conv4(k_p, Ly.h_k, Ly.sc_k, kd_p, kd_p ? c.KV : 0, 1, KD, W.kconv, g_s);
-        k::conv4(v_p, Ly.h_v, Ly.sc_v, vd_p, vd_p ? c.KV : 0, 1, KD, W.vconv, g_s);
         // the clips, the token's K and V into the cache at its position, the attention
         const int extent = Ly.sliding ? c.extent_swa : c.extent;
         const int window = Ly.sliding ? c.window : (1 << 30);
@@ -2030,7 +2044,7 @@ void fast_token_launches(Model& M, Work& W, OutMode out_mode) {
         if (g_kv_fp8) {
             k::prep_qkv_r_fp8_at(q_p, Ly.q_clip, W.kconv, Ly.kc8, W.vconv, Ly.vc8, r_p, Ly.r_clip, c.H, c.KV, c.D, c.d_rel,
                                  c.qk_clip, c.rel_clip, c.eps, W.pos, !Ly.sliding, c.alpha, c.n_floor, Ly.kv_cap,
-                                 k_scale, v_scale, q16, g_s);
+                                 k_scale, v_scale, q16, g_s, Ly.sink16, W.xq, C, W.sink);
             if (mma)
                 k::attn_decode_mma_fp8(q16, r_p, W.sink, Ly.kc8, Ly.vc8, ring, c.H, c.KV, W.pos, 0, ns,
                                        qk_scale / k_scale, 1.0f / v_scale, Ly.rel_proj, c.d_rel, extent, window, W.lg,
@@ -2042,7 +2056,7 @@ void fast_token_launches(Model& M, Work& W, OutMode out_mode) {
         } else {
             k::prep_qkv_r_f16_at(q_p, Ly.q_clip, W.kconv, Ly.kc, W.vconv, Ly.vc, r_p, Ly.r_clip, c.H, c.KV, c.D, c.d_rel,
                                  c.qk_clip, c.rel_clip, c.eps, W.pos, !Ly.sliding, c.alpha, c.n_floor, Ly.kv_cap, q16,
-                                 g_s);
+                                 g_s, Ly.sink16, W.xq, C, W.sink);
             if (mma)
                 k::attn_decode_mma_f16(q16, r_p, W.sink, Ly.kc, Ly.vc, ring, c.H, c.KV, W.pos, 0, ns, qk_scale,
                                        Ly.rel_proj, c.d_rel, extent, window, W.lg, W.o, gate_p, W.x16, g_s);
@@ -2051,14 +2065,12 @@ void fast_token_launches(Model& M, Work& W, OutMode out_mode) {
                                       qk_scale, Ly.rel_proj, c.d_rel, extent, window, W.lg, W.o, g_s);
         }
         if (!mma) k::gate_mul_f16(W.o, gate_p, (size_t) HD, W.x16, true, g_s);   // (the tensor cores' merge has it)
-        mv1(Ly.wo, W.o, W.tmp);
-        if (l % c.block == 0) {   // a block's first layer: the stream joins the blocks and starts again
-            CU(cudaMemcpyAsync(blk(nb), W.h, Cb, cudaMemcpyDeviceToDevice, g_s));
-            k::conv4(W.tmp, Ly.h_attn, Ly.sc_attn, nullptr, 0, 1, C, W.r, g_s);
-            ++nb;
-        } else {
-            k::conv4_res(W.tmp, Ly.h_attn, Ly.sc_attn, nullptr, 0, 1, C, W.h, W.r, g_s);
-        }
+        // the output projection with its short conv (and the stream added, but where a block starts: there the
+        // stream joins the blocks and starts again)
+        const bool first = l % c.block == 0;
+        if (first) CU(cudaMemcpyAsync(blk(nb), W.h, Cb, cudaMemcpyDeviceToDevice, g_s));
+        mv1c(Ly.wo, W.o, W.tmp, k::MvConv{0, C, Ly.h_attn, Ly.sc_attn, nullptr, 0, first ? nullptr : W.h, W.r});
+        if (first) ++nb;
         // the MoE: its input, the router and the picks' tables on the device, the experts
         {
             k::ResStates st{};
@@ -2083,8 +2095,7 @@ void fast_token_launches(Model& M, Work& W, OutMode out_mode) {
         k::experts_gate_up_swiglu(W.blob, W.tok, c.K, Ly.ty[0], Ly.ty[1], Ly.eb[0], W.xq, C, c.F, W.sg, W.su,
                                   c.gate_cap, c.up_cap, W.h16, g_s);
         k::experts_down(W.blob, c.K, Ly.ty[2], Ly.eb[0] + Ly.eb[1], W.h16, C, c.F, W.y32, g_s);
-        k::moe_combine_f32(W.y32, W.inv, W.wt, 1, c.K, C, W.tmp, false, g_s);
-        k::conv4_res(W.tmp, Ly.h_mlp, Ly.sc_mlp, nullptr, 0, 1, C, W.r, W.h, g_s);
+        k::moe_combine_conv(W.y32, W.inv, W.wt, c.K, C, Ly.h_mlp, Ly.sc_mlp, W.r, W.h, g_s);
     }
     if (out_mode == OutMode::kNone) return;
     {   // the head
