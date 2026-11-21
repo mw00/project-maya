@@ -1166,8 +1166,13 @@ extern "C" void on_usr1(int) { g_cancel = 1; }
 // stream at the start of layers 5, 11, .., 41, the final normed hidden); with g_rec each short conv's history and
 // inputs are kept, so that a verify window's rejected part can be taken back (rollback()).
 float* g_taps = nullptr;
-int g_taps_ld = 0;
+int g_taps_ld = 0, g_final_tap = 7;   // (the final normed hidden: tap 7, a looped model's 3)
 bool g_rec = false;
+// the drafter's tap a visit's stream (at its start) is, or -1
+inline int draft_tap(const Config& c, int l, int vis) {
+    if (c.n_pass == 1) return (l % 6 == 5 && l < c.n_layer - 1) ? l / 6 : -1;
+    return vis == 5 ? 0 : vis == 23 ? 1 : vis == 41 ? 2 : -1;
+}
 void conv_rec(Layer& Ly, int which, const float* x, const float* hist, int T, int Cc) {
     if (!g_rec) return;
     CU(cudaMemcpyAsync(Ly.rec_old[which], hist, (size_t) 3 * Cc * 4, cudaMemcpyDeviceToDevice, g_s));
@@ -1950,12 +1955,12 @@ void run_head(const Model& M, int T, bool all_logits, OutMode out_mode, int nb, 
             outs.y32[0] = (g_taps || g_dense_q8) ? W.xq : nullptr;
             k::attn_res_rms_f16(st, nb + 1, M.out_res_score, 1, T, C, 1e-6f, c.eps, outs, g_s);
             if (g_taps)
-                CU(cudaMemcpyAsync(g_taps + (size_t) 7 * g_taps_ld * C, W.xq, TC * 4, cudaMemcpyDeviceToDevice, g_s));
+                CU(cudaMemcpyAsync(g_taps + (size_t) g_final_tap * g_taps_ld * C, W.xq, TC * 4, cudaMemcpyDeviceToDevice, g_s));
         } else {
             k::attn_res(st, nb + 1, M.out_res_score, 1, T, C, 1e-6f, W.tmp, g_s);
             k::rms(W.tmp, M.out_norm, T, C, c.eps, W.xq, g_s);
             if (g_taps)
-                CU(cudaMemcpyAsync(g_taps + (size_t) 7 * g_taps_ld * C, W.xq, TC * 4, cudaMemcpyDeviceToDevice, g_s));
+                CU(cudaMemcpyAsync(g_taps + (size_t) g_final_tap * g_taps_ld * C, W.xq, TC * 4, cudaMemcpyDeviceToDevice, g_s));
             if (out_mode != OutMode::kNone) k::to_f16(W.xq + (size_t) (T - 1) * C, (size_t) C, W.x16, g_s);
         }
         if (out_mode != OutMode::kNone) {
@@ -1998,6 +2003,7 @@ void run_head(const Model& M, int T, bool all_logits, OutMode out_mode, int nb, 
 bool g_fast = false;        // set at load: every expert resident, one GPU, the dense weights as blocks (IK2_FAST=0: no)
 bool g_fast_want = false;
 bool g_graph = true;        // IK2_GRAPH=0: the resident path's launches one by one
+bool g_block = true;        // IK2_BLOCK=0: a verify window through forward() instead of the block path
 int g_attn_mma = 1;         // a token's attention on the tensor cores (IK2_ATTN_MMA=0: the scalar kernels; 2: the
                             // layers without a window only)
 int g_mma_split = 1;        // its blocks a K / V head (k::attn_decode_mma_blocks: the device filled once)
@@ -2240,6 +2246,295 @@ void fast_token(Model& M, int tok, int pos, OutMode out_mode, std::vector<float>
     }
 }
 
+
+// ---- the block path: the T tokens (2 .. 8) of a speculative step's verify window through the resident path in one
+// go - fast_token_launches for several tokens: every position read from the device, the experts grouped on the
+// device (an expert's blocks read once for the tokens that picked it), the attention a key's rows read once for the
+// window's queries, the convs' histories and inputs kept for a rollback - and its launches replayed as one CUDA graph
+// a window size.  The dense products are the tensor cores' (q8_tile, the prompt path's arithmetic).
+constexpr int kBlockMax = 8;
+struct BlockBufs {
+    bool ready = false;
+    float* emb_h = nullptr;      // pinned [kBlockMax][C]: the window's embedding rows
+    int* pos_h = nullptr;        // pinned [kBlockMax]: its positions
+    float* logits_h = nullptr;   // pinned [kBlockMax][n_vocab] (kLogits)
+    const uint8_t** blob = nullptr;   // group_route's arrays, device
+    int *n = nullptr, *tok = nullptr, *row = nullptr, *inv = nullptr;
+    float *sg = nullptr, *su = nullptr, *wt = nullptr;
+    float* lp_msg = nullptr;     // a pass's messages, [n_core][4][kBlockMax][C]
+    k::ConvRec* recs = nullptr;  // every visit's four convs (rollback_block)
+    int n_recs = 0;
+};
+BlockBufs g_blk;
+FastGraph g_bgraph[kBlockMax + 1][4];   // by window size and OutMode
+
+void block_init(Model& M) {
+    if (g_blk.ready) return;
+    const Config& c = M.c;
+    const int C = c.C, KD = c.KV * c.D, S = kBlockMax * c.K;
+    CU(cudaHostAlloc(&g_blk.emb_h, (size_t) kBlockMax * C * 4, cudaHostAllocPortable));
+    CU(cudaHostAlloc(&g_blk.pos_h, (size_t) kBlockMax * 4, cudaHostAllocPortable));
+    CU(cudaHostAlloc(&g_blk.logits_h, (size_t) kBlockMax * c.n_vocab * 4, cudaHostAllocPortable));
+    g_blk.blob = dalloc<const uint8_t*>(S);
+    g_blk.n = dalloc<int>(S), g_blk.inv = dalloc<int>(S);
+    g_blk.tok = dalloc<int>((size_t) S * k::kGroupMax), g_blk.row = dalloc<int>((size_t) S * k::kGroupMax);
+    g_blk.sg = dalloc<float>(S), g_blk.su = dalloc<float>(S), g_blk.wt = dalloc<float>(S);
+    if (c.n_pass > 1) g_blk.lp_msg = dalloc<float>((size_t) (c.core1 - c.core0) * 4 * kBlockMax * C);
+    std::vector<k::ConvRec> recs;
+    for (auto& Vi : M.V) {
+        float* hist[4] = {Vi.h_k, Vi.h_v, Vi.h_attn, Vi.h_mlp};
+        const int cc[4] = {KD, KD, C, C};
+        for (int i = 0; i < 4; ++i) {
+            if (!Vi.rec_old[i] || !Vi.rec_x[i]) die("the block path: the convs' records are not allocated");
+            recs.push_back({Vi.rec_old[i], Vi.rec_x[i], hist[i], cc[i]});
+        }
+    }
+    g_blk.n_recs = (int) recs.size();
+    g_blk.recs = dalloc<k::ConvRec>(recs.size());
+    CU(cudaMemcpy(g_blk.recs, recs.data(), recs.size() * sizeof(k::ConvRec), cudaMemcpyHostToDevice));
+    g_blk.ready = true;
+}
+
+// rows [r0, r0 + n) of a planar Q8_0 matrix times x16 [T][K] (FP16): y [T][ldy] (the tensor cores, q8_tile)
+void tile_rows(const Mat& m, int r0, int n, const uint16_t* x16, int T, float* y, int ldy) {
+    if (!m.q8) die("the block path: a dense matrix that is not planar Q8_0");
+    k::q8_tile(m.q8 + (size_t) r0 * m.K, m.q8d + (size_t) r0 * (m.K >> 5), n, m.K, x16, T, y, ldy, g_s);
+}
+
+void fast_block_launches(Model& M, Work& W, int T, OutMode out_mode) {
+    const Config& c = M.c;
+    const int C = c.C, HD = c.H * c.D, KD = c.KV * c.D, HR = c.H * c.d_rel, S = T * c.K;
+    const size_t TC = (size_t) T * C, TCb = TC * 4;
+    const float qk_scale = 1.0f / std::sqrt((float) c.D);
+    const float k_scale = c.qk_clip <= 28.0f ? 16.0f : 1.0f, v_scale = 32.0f;
+    CU(cudaMemcpyAsync(W.tmp, g_blk.emb_h, TCb, cudaMemcpyHostToDevice, g_s));
+    k::rms(W.tmp, M.embd_norm, T, C, c.eps, W.h, g_s);
+    CU(cudaMemcpyAsync(W.pos, g_blk.pos_h, (size_t) T * 4, cudaMemcpyHostToDevice, g_s));
+    auto blk = [&](int i) { return W.blocks + (size_t) i * W.blk_ld * C; };
+    int nb = 0, nb_pre = 0, n_bank = 0;
+    for (int vis = 0; vis < c.n_visit; ++vis) {
+        const int l = M.V[vis].l;
+        Layer& Ly = bind_visit(M, vis);
+        const float* msg = nullptr;
+        if (c.n_pass > 1 && l == c.core0) {
+            if (M.V[vis].pass == 0) {
+                nb_pre = nb;
+                CU(cudaMemcpyAsync(W.lp_pre, W.h, TCb, cudaMemcpyDeviceToDevice, g_s));
+            } else {
+                n_bank = 0;
+                for (int i = nb_pre + 1; i < nb; ++i, ++n_bank)
+                    CU(cudaMemcpyAsync(W.lp_bank + (size_t) n_bank * TC, blk(i), TCb, cudaMemcpyDeviceToDevice, g_s));
+                CU(cudaMemcpyAsync(W.lp_bank + (size_t) n_bank * TC, W.h, TCb, cudaMemcpyDeviceToDevice, g_s));
+                ++n_bank;
+                CU(cudaMemcpyAsync(W.h, W.lp_pre, TCb, cudaMemcpyDeviceToDevice, g_s));
+                nb = nb_pre;
+                k::ResStates st{};
+                for (int i = 0; i < n_bank; ++i) st.st[i] = W.lp_bank + (size_t) i * TC;
+                k::attn_res_jobs_block(st, n_bank, M.lp_query_all, 2, 2 * (c.core1 - c.core0), T, C, 1e-6f,
+                                       g_blk.lp_msg, g_s);
+            }
+        }
+        if (M.V[vis].pass > 0) msg = g_blk.lp_msg + (size_t) (l - c.core0) * 4 * TC;   // [4][T][C]: q, k, v, MoE
+        if (g_taps) {
+            const int tap = draft_tap(c, l, vis);
+            if (tap >= 0)
+                CU(cudaMemcpyAsync(g_taps + (size_t) tap * g_taps_ld * C, W.h, TCb, cudaMemcpyDeviceToDevice, g_s));
+        }
+        float* x3[3] = {W.xq, W.xk, W.xv};
+        uint16_t* y16[3] = {W.x16, W.xk16, W.xv16};
+        const float* nw[3] = {Ly.sliding ? Ly.attn_norm : Ly.q_in_norm, Ly.sliding ? Ly.attn_norm : Ly.k_in_norm,
+                              Ly.sliding ? Ly.attn_norm : Ly.v_in_norm};
+        bool sep = !Ly.sliding;
+        {
+            k::ResStates st{};
+            for (int i = 0; i < nb; ++i) st.st[i] = blk(i);
+            st.st[nb] = W.h;
+            if (msg) {
+                k::attn_res(st, nb + 1, Ly.res_score, Ly.n_res_q, T, C, 1e-6f, W.lp_in, g_s);
+                k::LoopGate gt[3];
+                for (int j = 0; j < 3; ++j)
+                    gt[j] = {W.lp_in + (size_t) (Ly.n_res_q == 3 ? j : 0) * TC, msg + (size_t) j * TC, Ly.lp_down[j],
+                             Ly.lp_forget[j], Ly.lp_gain[j], x3[j]};
+                k::loop_gates(gt, 3, T, C, c.rank, 1e-6f, W.lp_g, g_s);
+                for (int j = 0; j < 3; ++j) k::rms_f16(x3[j], nw[j], T, C, c.eps, y16[j], x3[j], g_s);
+                sep = true;
+            } else if (l > 0) {
+                k::RmsOuts outs{};
+                for (int j = 0; j < Ly.n_res_q; ++j) outs.w[j] = nw[j], outs.y16[j] = y16[j], outs.y32[j] = x3[j];
+                k::attn_res_rms_f16(st, nb + 1, Ly.res_score, Ly.n_res_q, T, C, 1e-6f, c.eps, outs, g_s);
+            } else {
+                for (int j = 0; j < (sep ? 3 : 1); ++j) k::rms_f16(W.h, nw[j], T, C, c.eps, y16[j], x3[j], g_s);
+            }
+        }
+        // the projections (the tensor cores), the k and v short convs (their histories and inputs recorded)
+        float *q_p, *r_p, *gate_p;
+        int q_ld, r_ld, gate_ld;
+        if (Ly.sliding) {
+            const Mat& m = Ly.wqkvrg;   // q | k | v | r | gate
+            const int N = m.N;
+            if (!sep) {
+                tile_rows(m, 0, N, W.x16, T, W.qkv, N);
+            } else {
+                tile_rows(m, 0, HD, W.x16, T, W.qkv, N);
+                tile_rows(m, HD, KD, W.xk16, T, W.qkv + HD, N);
+                tile_rows(m, HD + KD, KD, W.xv16, T, W.qkv + HD + KD, N);
+                tile_rows(m, HD + 2 * KD, N - HD - 2 * KD, W.x16, T, W.qkv + HD + 2 * KD, N);
+            }
+            q_p = W.qkv, r_p = W.qkv + HD + 2 * KD, gate_p = r_p + HR;
+            q_ld = r_ld = gate_ld = N;
+            k::conv_block(W.qkv + HD, N, Ly.h_k, Ly.sc_k, nullptr, 0, 0, T, KD, nullptr, 0, W.kconv, KD, Ly.rec_old[0],
+                          Ly.rec_x[0], g_s);
+            k::conv_block(W.qkv + HD + KD, N, Ly.h_v, Ly.sc_v, nullptr, 0, 0, T, KD, nullptr, 0, W.vconv, KD,
+                          Ly.rec_old[1], Ly.rec_x[1], g_s);
+        } else {
+            const Mat& m = Ly.wqrg;     // q | r | gate
+            const int N = m.N;
+            tile_rows(m, 0, N, W.x16, T, W.qkv, N);
+            q_p = W.qkv, r_p = W.qkv + HD, gate_p = r_p + HR;
+            q_ld = r_ld = gate_ld = N;
+            const int DL = c.KV * 4;
+            float *kd = W.dyn, *vd = W.dyn + (size_t) T * DL;
+            k::mv_f16_rows(Ly.sc_k_dyn16, DL, C, W.xk, C, T, kd, DL, g_s);
+            k::mv_f16_rows(Ly.sc_v_dyn16, DL, C, W.xv, C, T, vd, DL, g_s);
+            tile_rows(Ly.wk, 0, KD, W.xk16, T, W.kk, KD);
+            tile_rows(Ly.wv, 0, KD, W.xv16, T, W.vv, KD);
+            k::conv_block(W.kk, KD, Ly.h_k, Ly.sc_k, kd, DL, c.KV, T, KD, nullptr, 0, W.kconv, KD, Ly.rec_old[0],
+                          Ly.rec_x[0], g_s);
+            k::conv_block(W.vv, KD, Ly.h_v, Ly.sc_v, vd, DL, c.KV, T, KD, nullptr, 0, W.vconv, KD, Ly.rec_old[1],
+                          Ly.rec_x[1], g_s);
+        }
+        // the clips, the window's K and V into the cache at its positions, the attention of its queries
+        const int extent = Ly.sliding ? c.extent_swa : c.extent;
+        const int window = Ly.sliding ? c.window : (1 << 30);
+        const int ring = Ly.sliding ? Ly.kv_cap : 0;
+        const int ns = Ly.sliding ? std::min(g_mma_split, std::max(1, (c.window + 63) / 64)) : g_mma_split;
+        uint16_t* q16 = W.x16;
+        if (g_kv_fp8) {
+            k::prep_qkv_r_fp8_block(q_p, q_ld, Ly.q_clip, W.kconv, Ly.kc8, W.vconv, Ly.vc8, r_p, r_ld, Ly.r_clip, T, c.H,
+                                    c.KV, c.D, c.d_rel, c.qk_clip, c.rel_clip, c.eps, W.pos, !Ly.sliding, c.alpha,
+                                    c.n_floor, Ly.kv_cap, k_scale, v_scale, q16, g_s, Ly.sink16, W.xq, C, W.sink);
+            k::attn_block_fp8(q16, r_p, r_ld, W.sink, Ly.kc8, Ly.vc8, ring, c.H, c.KV, W.pos, T, ns, qk_scale / k_scale,
+                              1.0f / v_scale, Ly.rel_proj, c.d_rel, extent, window, W.lg, W.o, gate_p, gate_ld, W.x16,
+                              g_s);
+        } else {
+            k::prep_qkv_r_f16_block(q_p, q_ld, Ly.q_clip, W.kconv, Ly.kc, W.vconv, Ly.vc, r_p, r_ld, Ly.r_clip, T, c.H,
+                                    c.KV, c.D, c.d_rel, c.qk_clip, c.rel_clip, c.eps, W.pos, !Ly.sliding, c.alpha,
+                                    c.n_floor, Ly.kv_cap, q16, g_s, Ly.sink16, W.xq, C, W.sink);
+            k::attn_block_f16(q16, r_p, r_ld, W.sink, Ly.kc, Ly.vc, ring, c.H, c.KV, W.pos, T, ns, qk_scale,
+                              Ly.rel_proj, c.d_rel, extent, window, W.lg, W.o, gate_p, gate_ld, W.x16, g_s);
+        }
+        // the output projection and its short conv (the stream added, but where a block starts)
+        const bool first = l % c.block == 0;
+        if (first) CU(cudaMemcpyAsync(blk(nb), W.h, TCb, cudaMemcpyDeviceToDevice, g_s));
+        tile_rows(Ly.wo, 0, C, W.x16, T, W.tmp, C);
+        k::conv_block(W.tmp, C, Ly.h_attn, Ly.sc_attn, nullptr, 0, 0, T, C, first ? nullptr : W.h, C, W.r, C,
+                      Ly.rec_old[2], Ly.rec_x[2], g_s);
+        if (first) ++nb;
+        // the MoE: its input, the router, the picks grouped by expert on the device, the experts
+        {
+            k::ResStates st{};
+            for (int i = 0; i < nb; ++i) st.st[i] = blk(i);
+            st.st[nb] = W.r;
+            if (msg) {
+                k::attn_res(st, nb + 1, Ly.ffn_res_score, 1, T, C, 1e-6f, W.xq, g_s);
+                const k::LoopGate gt{W.xq, msg + (size_t) 3 * TC, Ly.lp_down[3], Ly.lp_forget[3], Ly.lp_gain[3], W.xq};
+                k::loop_gates(&gt, 1, T, C, c.rank, 1e-6f, W.lp_g, g_s);
+                k::rms(W.xq, Ly.ffn_norm, T, C, c.eps, W.xq, g_s);
+            } else {
+                k::RmsOuts outs{};
+                outs.w[0] = Ly.ffn_norm, outs.y16[0] = W.x16, outs.y32[0] = W.xq;
+                k::attn_res_rms_f16(st, nb + 1, Ly.ffn_res_score, 1, T, C, 1e-6f, c.eps, outs, g_s);
+            }
+        }
+        k::mv_f16_rows(Ly.router16, c.E, C, W.xq, C, T, W.rlog, c.E, g_s);
+        int* rtop = W.route_d;
+        float* rw = (float*) (W.route_d + S);
+        k::route_rows(W.rlog, Ly.probs_b, T, c.E, c.K, c.route_scale, rtop, rw, g_s);
+        k::group_route(rtop, rw, S, c.K, Ly.tab_blob, Ly.tab_sc[0], Ly.tab_sc[1], Ly.tab_sc[2], g_blk.blob, g_blk.n,
+                       g_blk.tok, g_blk.row, g_blk.sg, g_blk.su, g_blk.wt, g_blk.inv, g_s);
+        if (k::experts_mma_fits(Ly.ty[0], Ly.ty[1], Ly.ty[2], C, c.F)) {
+            uint16_t* limbs = (uint16_t*) W.gu32;
+            k::f16_limbs_rows(W.xq, T, C, limbs, g_s);
+            k::experts_block_gu(g_blk.blob, g_blk.n, g_blk.tok, g_blk.row, S, T, Ly.eb[0], C, c.F, limbs, g_blk.sg,
+                                g_blk.su, c.gate_cap, c.up_cap, W.h16, g_s);
+            k::experts_block_down(g_blk.blob, g_blk.n, g_blk.row, S, Ly.eb[0] + Ly.eb[1], C, c.F, W.h16, W.y32, g_s);
+        } else if (Ly.ty[0] == k::kQ8_0 && Ly.ty[1] == k::kQ8_0 && Ly.ty[2] == k::kQ8_0 && C % 32 == 0 && c.F % 32 == 0) {
+            uint16_t* limbs = (uint16_t*) W.gu32;
+            k::f16_limbs_rows(W.xq, T, C, limbs, g_s);
+            k::experts_block_gu_q8(g_blk.blob, g_blk.n, g_blk.tok, g_blk.row, S, T, Ly.eb[0], C, c.F, limbs, g_blk.sg,
+                                   g_blk.su, c.gate_cap, c.up_cap, W.h16, g_s);
+            k::experts_block_down_q8(g_blk.blob, g_blk.n, g_blk.row, S, Ly.eb[0] + Ly.eb[1], C, c.F, W.h16, W.y32, g_s);
+        } else {
+            k::experts_gate_up_swiglu_g(g_blk.blob, g_blk.n, g_blk.tok, g_blk.row, S, Ly.ty[0], Ly.ty[1], Ly.eb[0], W.xq,
+                                        C, c.F, g_blk.sg, g_blk.su, c.gate_cap, c.up_cap, W.h16, g_s);
+            k::experts_down_g(g_blk.blob, g_blk.n, g_blk.row, S, Ly.ty[2], Ly.eb[0] + Ly.eb[1], W.h16, C, c.F, W.y32,
+                              g_s);
+        }
+        k::moe_combine_f32(W.y32, g_blk.inv, g_blk.wt, T, c.K, C, W.tmp, false, g_s);
+        k::conv_block(W.tmp, C, Ly.h_mlp, Ly.sc_mlp, nullptr, 0, 0, T, C, W.r, C, W.h, C, Ly.rec_old[3], Ly.rec_x[3],
+                      g_s);
+    }
+    if (out_mode == OutMode::kNone) return;
+    {   // the head: every token's logits
+        k::ResStates st{};
+        for (int i = 0; i < nb; ++i) st.st[i] = blk(i);
+        st.st[nb] = W.h;
+        k::RmsOuts outs{};
+        outs.w[0] = M.out_norm, outs.y16[0] = W.x16, outs.y32[0] = W.xq;
+        k::attn_res_rms_f16(st, nb + 1, M.out_res_score, 1, T, C, 1e-6f, c.eps, outs, g_s);
+        if (g_taps)
+            CU(cudaMemcpyAsync(g_taps + (size_t) g_final_tap * g_taps_ld * C, W.xq, TCb, cudaMemcpyDeviceToDevice, g_s));
+        tile_rows(M.out_w, 0, c.n_rows, W.x16, T, W.logits, c.n_rows);
+        if (out_mode == OutMode::kArgmax) {
+            k::argmax_rows(W.logits, c.n_rows, T, c.n_vocab, W.argmax_d, g_s);
+            CU(cudaMemcpyAsync(W.argmax_h, W.argmax_d, (size_t) T * 4, cudaMemcpyDeviceToHost, g_s));
+        } else {
+            k::softcap(W.logits, (size_t) T * c.n_rows, c.logit_cap, g_s);
+            for (int t = 0; t < T; ++t)
+                CU(cudaMemcpyAsync(g_blk.logits_h + (size_t) t * c.n_vocab, W.logits + (size_t) t * c.n_rows,
+                                   (size_t) c.n_vocab * 4, cudaMemcpyDeviceToHost, g_s));
+        }
+    }
+}
+
+// The window tok [T] at positions pos0 .. pos0 + T - 1 through the block path: argmax_out [T] (kArgmax) or logits_out
+// [T][n_vocab] appended (kLogits).  The convs' records then hold the window (block_rollback takes it back).
+void fast_block(Model& M, const int* tok, int T, int pos0, OutMode out_mode, std::vector<float>& logits_out,
+                std::vector<int>* argmax_out) {
+    const Config& c = M.c;
+    if (T < 1 || T > kBlockMax) die("fast_block: a window of 1 .. 8 tokens");
+    if (!g_blk.ready) block_init(M);
+    if (out_mode == OutMode::kCand) out_mode = OutMode::kLogits;
+    Work& W = dev_work(0);
+    const size_t rb = (size_t) c.C / k::block_values(M.embd_type) * k::block_bytes(M.embd_type);
+    for (int t = 0; t < T; ++t) {
+        k::decode_host(M.embd_type, M.embd + (size_t) tok[t] * rb, c.C, g_blk.emb_h + (size_t) t * c.C);
+        g_blk.pos_h[t] = pos0 + t;
+    }
+    if (!g_graph) {
+        fast_block_launches(M, W, T, out_mode);
+    } else {
+        FastGraph& G = g_bgraph[T][(int) out_mode];
+        if (!G.exec) {
+            CU(cudaStreamBeginCapture(g_s, cudaStreamCaptureModeGlobal));
+            fast_block_launches(M, W, T, out_mode);
+            CU(cudaStreamEndCapture(g_s, &G.graph));
+            CU(cudaGraphInstantiate(&G.exec, G.graph, 0));
+        }
+        CU(cudaGraphLaunch(G.exec, g_s));
+    }
+    CU(cudaStreamSynchronize(g_s));
+    if (out_mode == OutMode::kArgmax) {
+        argmax_out->assign(W.argmax_h, W.argmax_h + T);
+    } else if (out_mode == OutMode::kLogits) {
+        logits_out.insert(logits_out.end(), g_blk.logits_h, g_blk.logits_h + (size_t) T * c.n_vocab);
+    }
+}
+// every conv's history as after the first n tokens of the last window (fast_block's records)
+void block_rollback(int n) {
+    k::rollback_block(g_blk.recs, g_blk.n_recs, n, g_s);
+}
+
 void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode out_mode, const std::string& dump,
              std::vector<float>& logits_out, std::vector<int>* argmax_out, double& t_exp) {
     const Config& c = M.c;
@@ -2324,9 +2619,13 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
             k::attn_res(st, n_bank, Ly.lp_query + (size_t) 2 * C, 2, T, C, 1e-6f, W.lp_msg + 2 * TC, g_s);
             msg = W.lp_msg;
         }
-        // (the drafter's taps 0 .. 6: the stream at the start of layers 5, 11, .., 41 - without a loop)
-        if (g_taps && c.n_pass == 1 && l % 6 == 5 && l < c.n_layer - 1)
-            CU(cudaMemcpyAsync(g_taps + (size_t) (l / 6) * g_taps_ld * C, W.h, TC * 4, cudaMemcpyDeviceToDevice, g_s));
+        // (the drafter's taps: the stream at the start of layers 5, 11, .., 41 - and of a looped model's visits 5, 23
+        // and 41, its mtp_config's target_layer_ids)
+        if (g_taps) {
+            const int tap = draft_tap(c, l, vis);
+            if (tap >= 0)
+                CU(cudaMemcpyAsync(g_taps + (size_t) tap * g_taps_ld * C, W.h, TC * 4, cudaMemcpyDeviceToDevice, g_s));
+        }
         run_layer_attn(M, Ly, l, T, pos0, W.h, W.pos, nb, 0, W.r, W, msg);
         dump_f("blk." + std::to_string(vis) + ".attn_out", W.r, TC);
         if (l % c.block == 0) ++nb;
@@ -3232,7 +3531,7 @@ int main(int argc, char** argv) {
         std::printf("looped: layers %d .. %d run %d times - %d layer visits a token; message gates of rank %d\n", c.core0,
                     c.core1 - 1, c.n_pass, c.n_visit, c.rank);
         // if (n_gpu != 1) die("a looped model: one GPU so far (--gpus 1)");
-        if (!draft_path.empty()) die("--draft: not for a looped model yet");
+        if (!draft_path.empty() && (c.C != 2304 || c.n_visit != 48)) die("--draft: a looped model other than Inkling-2-Mini");
     }
     if (getenv("IK2_POP_OUT")) g_pop.assign((size_t) c.n_layer * c.E, 0), g_pop_E = c.E;
     g_tp_F = c.F, g_tp_C = c.C;
@@ -3326,6 +3625,7 @@ int main(int argc, char** argv) {
     // (half an FP16 copy's bytes, a token's products straight over them) and tokens take the resident path
     // (IK2_FAST=0: off; IK2_GRAPH=0: its launches one by one instead of a CUDA graph a token).
     g_graph = !(getenv("IK2_GRAPH") && !std::atoi(getenv("IK2_GRAPH")));
+    g_block = !(getenv("IK2_BLOCK") && !std::atoi(getenv("IK2_BLOCK")));
     g_attn_mma = c.D == 128 && c.H / c.KV <= 8 ? (getenv("IK2_ATTN_MMA") ? std::atoi(getenv("IK2_ATTN_MMA")) : 1) : 0;
     g_mma_split = k::attn_decode_mma_blocks(c.KV);
     if (n_gpu == 1 && !g_pool) {
@@ -3784,18 +4084,31 @@ int main(int argc, char** argv) {
 
     // the drafter (before the expert cache takes what VRAM is left)
     ik2::draft::Drafter* drafter = nullptr;
+    uint16_t* draft_head = M.out_w.f16;
     if (!draft_path.empty()) {
         if (n_gpu != 1) die("--draft: one GPU only so far");
-        if (!M.out_w.f16) die("--draft needs the output head in FP16 (not IK2_DENSE=q8)");
+        if (!draft_head && M.out_w.q8) {   // (a Q8_0 head: an FP16 copy for the drafter's base logits and its fold)
+            const size_t n = (size_t) c.n_rows * c.C;
+            draft_head = dalloc<uint16_t>(n);
+            k::decode_q8p_f16(M.out_w.q8, M.out_w.q8d, n, draft_head, g_s);
+        }
+        if (!draft_head) die("--draft: the output head is neither FP16 nor planar Q8_0");
+        g_final_tap = c.n_pass == 1 ? 7 : 3;
         const double t0 = now();
         try {
             drafter = ik2::draft::load(draft_path, c.C, ctx, g_blas, g_s);
-            ik2::draft::fold(drafter, M.out_w.f16, c.n_rows);
+            ik2::draft::fold(drafter, draft_head, c.n_rows);
         } catch (const std::exception& e) {
             die(e.what());
         }
+        if (M.out_w.q8 && draft_head != M.out_w.f16) {   // (the FP16 copy was the fold's: the base logits from the blocks)
+            ik2::draft::set_head_q8(drafter, M.out_w.q8, M.out_w.q8d);
+            CU(cudaStreamSynchronize(g_s));
+            CU(cudaFree(draft_head));
+            draft_head = nullptr;
+        }
         g_taps_ld = std::max(chunk, ik2::draft::kBlock);
-        g_taps = dalloc<float>((size_t) ik2::draft::kTaps * g_taps_ld * c.C);
+        g_taps = dalloc<float>((size_t) (g_final_tap + 1) * g_taps_ld * c.C);
         for (auto& Vi : M.V) {
             const size_t cc[4] = {KD, KD, C, C};
             for (int i = 0; i < 4; ++i) {
@@ -4515,6 +4828,7 @@ int main(int argc, char** argv) {
                    m0 = (uint64_t) ec_sum([](ExpertCache& e) { return e.misses; });
     int n_steps = 0;
     const int verify_check = getenv("IK2_VERIFY_CHECK") ? std::atoi(getenv("IK2_VERIFY_CHECK")) : 0;
+    const int block_check = getenv("IK2_BLOCK_CHECK") ? std::atoi(getenv("IK2_BLOCK_CHECK")) : 0;
     double t_draft = 0, t_verify = 0;
     std::vector<int> acc_hist(ik2::draft::kBlock, 0);
     // IK2_FORCE=FILE (comma-separated ids): the tokens fed are these instead of the model's own picks, and how often
@@ -4562,13 +4876,16 @@ int main(int argc, char** argv) {
         auto argmax_row = [&](const float* r) { return (int) (std::max_element(r, r + c.n_vocab) - r); };
         int anchor = first_best, P = (int) prompt.size();
         out.push_back(anchor);
-        const int B = ik2::draft::kBlock;
+        // IK2_DRAFT_WIDTH: the tokens a step verifies, the anchor and width - 1 drafts (2 .. 8)
+        const int width = getenv("IK2_DRAFT_WIDTH") ? std::clamp(atoi(getenv("IK2_DRAFT_WIDTH")), 2, ik2::draft::kBlock)
+                                                    : ik2::draft::kBlock;
         const bool margin_check = getenv("IK2_MARGIN") != nullptr;
-        while ((int) out.size() < gen && P + B <= ctx) {
+        while ((int) out.size() < gen && P < ctx) {
+            const int B = std::min(width, ctx - P);
             const double t0 = now();
             embed_row(M, anchor, raw, anchor_h);
             int dr[ik2::draft::kBlock - 1];
-            ik2::draft::propose(drafter, anchor, anchor_h, P, M.out_w.f16, c.n_rows, c.n_vocab, dr);
+            if (B > 1) ik2::draft::propose(drafter, anchor, anchor_h, P, draft_head, c.n_rows, c.n_vocab, dr, B - 1);
             const double t1 = now();
             int tk[ik2::draft::kBlock];
             tk[0] = anchor;
@@ -4577,8 +4894,38 @@ int main(int argc, char** argv) {
             logits.clear();
             std::vector<int> ag;
             const bool need_logits = n_steps < verify_check || margin_check;
-            forward(M, tk, B, P, true, need_logits ? OutMode::kLogits : OutMode::kArgmax, std::string(), logits, &ag,
-                    t_exp);
+            const bool use_block = g_fast && g_block && !need_logits;
+            if (use_block && n_steps < block_check) {
+                // (IK2_BLOCK_CHECK=n: the first n windows through both paths, their logits compared; forward()'s
+                //  then taken)
+                std::vector<float> lb;
+                fast_block(M, tk, B, P, OutMode::kLogits, lb, nullptr);
+                block_rollback(0);
+                forward(M, tk, B, P, true, OutMode::kLogits, std::string(), logits, nullptr, t_exp);
+                double mx = 0, kl = 0;
+                int dis = 0;
+                for (int j = 0; j < B; ++j) {
+                    const float* a = logits.data() + (size_t) j * c.n_vocab;
+                    const float* b = lb.data() + (size_t) j * c.n_vocab;
+                    double ma = -1e30, mb = -1e30, sa = 0, sb = 0;
+                    for (int v = 0; v < c.n_vocab; ++v) ma = std::max(ma, (double) a[v]), mb = std::max(mb, (double) b[v]);
+                    for (int v = 0; v < c.n_vocab; ++v) sa += std::exp(a[v] - ma), sb += std::exp(b[v] - mb);
+                    for (int v = 0; v < c.n_vocab; ++v) {
+                        mx = std::max(mx, (double) std::fabs(a[v] - b[v]));
+                        const double pa = std::exp(a[v] - ma) / sa;
+                        if (pa > 0) kl += pa * ((a[v] - ma - std::log(sa)) - (b[v] - mb - std::log(sb)));
+                    }
+                    dis += argmax_row(a) != argmax_row(b);
+                }
+                std::printf("block check, step %d (%d tokens at %d): max |dlogit| %.4f, KL %.2e a row, argmax differs in %d\n",
+                            n_steps, B, P, mx, kl / B, dis);
+                ag.clear();
+                for (int j = 0; j < B; ++j) ag.push_back(argmax_row(logits.data() + (size_t) j * c.n_vocab));
+            } else if (use_block)
+                fast_block(M, tk, B, P, OutMode::kArgmax, logits, &ag);
+            else
+                forward(M, tk, B, P, true, need_logits ? OutMode::kLogits : OutMode::kArgmax, std::string(), logits,
+                        &ag, t_exp);
             if (n_steps < verify_check) {
                 // the same window again through each other path (the convs' history taken back first): the
                 // logits' largest difference and the argmax disagreements against the grouped run
@@ -4628,7 +4975,10 @@ int main(int argc, char** argv) {
             }
             int n = 0;
             while (n < B - 1 && dr[n] == g[n]) ++n;
-            if (n + 1 < B) rollback(M, n + 1);
+            if (n + 1 < B) {
+                if (use_block && n_steps >= block_check) block_rollback(n + 1);
+                else rollback(M, n + 1);
+            }
             ik2::draft::write_context(drafter, g_taps, g_taps_ld, 0, n + 1, P);
             ik2::draft::set_f_rnn(drafter, g_taps, g_taps_ld, n);
             for (int j = 0; j < n && (int) out.size() < gen; ++j) out.push_back(dr[j]);

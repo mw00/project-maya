@@ -136,11 +136,15 @@ struct DLayer {
     bool local = false;
     float *in_norm, *post_norm, *dflare, *q_norm, *k_norm, *k_norm_ctx;
     uint16_t *wq, *wk, *wv, *wo, *wkc, *wvc, *wgu, *wd;   // BF16 [out][in]
-    float *kc, *vc;                                        // the context caches [ctx][KV * 128]
+    float *kc = nullptr, *vc = nullptr;                    // the context caches, F32 [cap][KV * 128] (a window's
+    uint16_t *kc16 = nullptr, *vc16 = nullptr;             //  layer) or FP16 (the layer that sees the whole context)
+    int cap = 0;                                           // their rows: a ring of the last cap positions
 };
 
 struct Drafter {
-    int C = 4608, H = 48, KV = 8, F = 18432, R = 256, V = 0, ctx = 0;
+    int taps = 8, C = 4608, H = 48, KV = 8, F = 18432, R = 256, V = 0, ctx = 0;
+    int cap = 0;   // the rows of the layer without a window's context cache (IK2_DRAFT_CTX, default the context)
+    float* ctx_tmp = nullptr;   // write_context's K and V rows before an FP16 cache, [2][kMixRows][KV * 128]
     float eps = 1e-6f, theta = 1e6f;
     std::vector<DLayer> L;
     float *alpha, *norm, *mask, *mk_dflare, *rnn_b;
@@ -148,6 +152,10 @@ struct Drafter {
     std::vector<uint16_t> hout_w, hout_b;   // host BF16, for the fold
     uint16_t *fold_w = nullptr, *fold_b = nullptr;   // FP16 [R][n_rows], [n_rows]
     int n_rows = 0;
+    const int8_t* head_q8 = nullptr;      // the target's head as planar Q8_0 (set_head_q8): the base logits through it
+    const uint16_t* head_q8d = nullptr;
+    int* shortlist = nullptr;
+    float* shortlist_scores = nullptr;
     cublasHandle_t blas;
     cudaStream_t s;
     size_t vram = 0;
@@ -191,6 +199,41 @@ __global__ void pack_f16_strided_kernel(const float* src, int m, int n_rows, int
     if (i < m) dst[(size_t) r * n_rows + r0 + i] = __half_as_ushort(__float2half_rn(src[(size_t) r * m + i]));
 }
 
+// Each warp keeps the strongest base candidate among 32 vocabulary entries.
+// Only the drafter uses this shortlist; the target still verifies the full vocabulary.
+__global__ void draft_shortlist(const float* base, int ld, int vocab, int stride, int* picks) {
+    const int token = blockIdx.x * blockDim.x + threadIdx.x;
+    const int row = blockIdx.y;
+    float val = token < vocab ? base[(size_t)row * ld + token] : -INFINITY;
+    int idx = token;
+    for (int step = 16; step; step >>= 1) {
+        float v = __shfl_down_sync(0xffffffff, val, step);
+        int j = __shfl_down_sync(0xffffffff, idx, step);
+        if (v > val || (v == val && j < idx)) val = v, idx = j;
+    }
+    if (!(threadIdx.x & 31) && token < vocab) picks[row * stride + token / 32] = idx;
+}
+__global__ void fold_vocab_rows(const float* src, int m, int r0, int R, uint16_t* dst) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < m * R) {
+        const int i = idx / R, r = idx % R;
+        dst[(size_t)(r0 + i) * R + r] = __half_as_ushort(__float2half_rn(src[(size_t)r * m + i]));
+    }
+}
+__global__ void shortlist_gemv(const int* ids, int n, const uint16_t* W, const float* x, const float* base,
+                               const uint16_t* bias, int R, float* scores) {
+    const int lane = threadIdx.x & 31;
+    const int i = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
+    if (i >= n) return;
+    const int token = ids[i];
+    float dot = 0.0f;
+    for (int r = lane; r < R; r += 32)
+        dot = fmaf(__half2float(__ushort_as_half(W[(size_t)token * R + r])), x[r], dot);
+    for (int step = 16; step; step >>= 1) dot += __shfl_down_sync(0xffffffff, dot, step);
+    if (lane == 0) scores[i] = dot + base[token] + __half2float(__ushort_as_half(bias[token]));
+}
+__global__ void shortlist_pick(int* out, const int* ids) { *out = ids[*out]; }
+
 uint16_t* up16(Drafter* d, const std::vector<uint16_t>& v) {
     uint16_t* p = dalloc<uint16_t>(v.size());
     cu(cudaMemcpy(p, v.data(), v.size() * 2, cudaMemcpyHostToDevice), "upload");
@@ -232,9 +275,13 @@ void layer_attn(Drafter* d, DLayer& l, int P, float* out) {
     k::rope_neox(d->kk, T, d->KV, d->pos, d->theta, d->s);
     // Local layers (0, 1, 3, 4) match SGLang inkling2_mtp.py's window_anchor_at_start=True with window=1024:
     // every query in the block [P .. P+7] sees context [max(0, P - 1023) .. P-1] plus all 8 block tokens.
-    const int k_lo = l.local ? std::max(0, P - 1023) : 0;
-    k::draft_attn(d->q, l.kc, l.vc, k_lo, P, d->kk, d->vv, T, d->H, d->KV, 1.0f / std::sqrt(128.0f), d->scratch, d->o,
-                  d->s);
+    const int k_lo = l.local ? std::max(0, P - 1023) : std::max(0, P - l.cap);
+    if (l.kc16)
+        k::draft_attn_f16(d->q, l.kc16, l.vc16, k_lo, P, d->kk, d->vv, T, d->H, d->KV, 1.0f / std::sqrt(128.0f),
+                          d->scratch, d->o, d->s, l.cap);
+    else
+        k::draft_attn(d->q, l.kc, l.vc, k_lo, P, d->kk, d->vv, T, d->H, d->KV, 1.0f / std::sqrt(128.0f), d->scratch,
+                      d->o, d->s, l.cap);
     k::to_bf16(d->o, (size_t) T * HD, d->hb, d->s);
     gemm_bf(d, l.wo, d->C, HD, d->hb, T, out, d->C);
 }
@@ -258,6 +305,20 @@ Drafter* load(const std::string& path, int C, int ctx, cublasHandle_t blas, cuda
     const StFile f = st_open(path);
     auto* d = new Drafter;
     d->C = C, d->ctx = ctx, d->blas = blas, d->s = s;
+    {
+        // (IK2_DRAFT_CTX: the positions the layer without a window sees, the last ones; default the whole context)
+        const int want = getenv("IK2_DRAFT_CTX") ? std::atoi(getenv("IK2_DRAFT_CTX")) : ctx;
+        d->cap = std::min(ctx, std::max(want, 2048));
+    }
+    const bool mini = C == 2304;
+    if (mini) {
+        d->H = 24;
+        d->F = 9216;
+        d->taps = 4;
+    } else if (C != 4608) {
+        throw std::runtime_error("drafter: unsupported target width");
+    }
+    const int layers = mini ? 3 : 5;
     const int64_t H = d->H, KV = d->KV, F = d->F, R = d->R;
     {
         auto it = f.t.find("markov_head.markov_w1.weight");
@@ -266,23 +327,23 @@ Drafter* load(const std::string& path, int C, int ctx, cublasHandle_t blas, cuda
     }
     // fuse_weight [6][8] -> softmax over each row
     {
-        const auto fw = st_bf16(f, "fuse_weight", {6, kTaps});
+        const auto fw = st_bf16(f, "fuse_weight", {layers + 1, d->taps});
         std::vector<float> a(fw.size());
-        for (int r = 0; r < 6; ++r) {
+        for (int r = 0; r <= layers; ++r) {
             float m = -1e30f, sum = 0;
-            for (int t = 0; t < kTaps; ++t) m = std::max(m, bf(fw[r * kTaps + t]));
-            for (int t = 0; t < kTaps; ++t) sum += (a[r * kTaps + t] = std::exp(bf(fw[r * kTaps + t]) - m));
-            for (int t = 0; t < kTaps; ++t) a[r * kTaps + t] /= sum;
+            for (int t = 0; t < d->taps; ++t) m = std::max(m, bf(fw[r * d->taps + t]));
+            for (int t = 0; t < d->taps; ++t) sum += (a[r * d->taps + t] = std::exp(bf(fw[r * d->taps + t]) - m));
+            for (int t = 0; t < d->taps; ++t) a[r * d->taps + t] /= sum;
         }
         d->alpha = dalloc<float>(a.size());
         cu(cudaMemcpy(d->alpha, a.data(), a.size() * 4, cudaMemcpyHostToDevice), "alpha");
     }
     const int local_ids[] = {0, 1, 3, 4};
-    d->L.resize(5);
-    for (int i = 0; i < 5; ++i) {
+    d->L.resize(layers);
+    for (int i = 0; i < layers; ++i) {
         DLayer& l = d->L[i];
         const std::string b = "layers." + std::to_string(i) + ".";
-        l.local = std::find(std::begin(local_ids), std::end(local_ids), i) != std::end(local_ids);
+        l.local = mini ? i != 1 : std::find(std::begin(local_ids), std::end(local_ids), i) != std::end(local_ids);
         l.in_norm = up32(d, st_bf16(f, b + "input_layernorm.weight", {C}));
         l.post_norm = up32(d, st_bf16(f, b + "post_attention_layernorm.weight", {C}));
         l.dflare = up32(d, st_bf16(f, b + "dflare_norm.weight", {C}));
@@ -302,9 +363,17 @@ Drafter* load(const std::string& path, int C, int ctx, cublasHandle_t blas, cuda
             l.wgu = up16(d, g);
         }
         l.wd = up16(d, st_bf16(f, b + "mlp.down_proj.weight", {C, F}));
-        l.kc = dalloc<float>((size_t) ctx * KV * 128);
-        l.vc = dalloc<float>((size_t) ctx * KV * 128);
-        d->vram += (size_t) ctx * KV * 128 * 8;
+        if (l.local) {   // (a window of 1024: a ring of 2048 rows, F32)
+            l.cap = std::min(ctx, 2048);
+            l.kc = dalloc<float>((size_t) l.cap * KV * 128);
+            l.vc = dalloc<float>((size_t) l.cap * KV * 128);
+            d->vram += (size_t) l.cap * KV * 128 * 8;
+        } else {         // (the whole context, or IK2_DRAFT_CTX's last positions: FP16)
+            l.cap = d->cap;
+            l.kc16 = dalloc<uint16_t>((size_t) l.cap * KV * 128);
+            l.vc16 = dalloc<uint16_t>((size_t) l.cap * KV * 128);
+            d->vram += (size_t) l.cap * KV * 128 * 4;
+        }
     }
     d->norm = up32(d, st_bf16(f, "norm.weight", {C}));
     d->mask = up32(d, st_bf16(f, "mask_embed", {C}));
@@ -322,7 +391,9 @@ Drafter* load(const std::string& path, int C, int ctx, cublasHandle_t blas, cuda
     d->gu = dalloc<float>(T * 2 * F);
     d->hb = dalloc<uint16_t>(std::max<size_t>(T * std::max<int64_t>(C, H * 128), (size_t) kMixRows * C));
     d->hb2 = dalloc<uint16_t>(T * F);
-    d->scratch = dalloc<float>((size_t) H * T * (ctx + T));
+    // (draft_attn's: the logits [H][8][<= cap + T + chunk padding], the chunks' outputs [64][H][8][128], (max, sum))
+    d->ctx_tmp = dalloc<float>((size_t) 2 * kMixRows * KV * 128);
+    d->scratch = dalloc<float>((size_t) H * 8 * (d->cap + T + 512) + (size_t) 64 * H * 8 * 130);
     d->mix = dalloc<float>((size_t) kMixRows * C);
     d->f_rnn = dalloc<float>(C);
     d->state = dalloc<float>(R), d->latent = dalloc<float>(R), d->proj = dalloc<float>(3 * R);
@@ -336,6 +407,11 @@ Drafter* load(const std::string& path, int C, int ctx, cublasHandle_t blas, cuda
 void fold(Drafter* d, const uint16_t* lm_f16, int n_rows) {
     const int C = d->C, R = d->R;
     d->n_rows = n_rows;
+    if (getenv("IK2_DRAFT_SHORTLIST") && atoi(getenv("IK2_DRAFT_SHORTLIST"))) {
+        const int stride = (n_rows + 31) / 32;
+        d->shortlist = dalloc<int>((kBlock - 1) * stride);
+        d->shortlist_scores = dalloc<float>(stride);
+    }
     // fold_w [R][n_rows] = (lm . hidden_out)^T, fold_b [n_rows] = lm . b (stored as FP16 to halve Markov traffic).
     // Compute chunked in F32 (like inkling2_mtp.py's 4096-row double() fold) so BF16 hout_w/b never underflow FP16
     // before the C=4608 inner product, then round once to FP16.
@@ -360,7 +436,10 @@ void fold(Drafter* d, const uint16_t* lm_f16, int n_rows) {
         f16_to_f32_kernel<<<(unsigned) ((elems + 255) / 256), 256, 0, d->s>>>(lm_f16 + (size_t) r0 * C, elems, dlm);
         cb(cublasSgemm(d->blas, CUBLAS_OP_T, CUBLAS_OP_N, m, R, C, &one, dlm, C, dht, C, &zero, dfw, m), "fold w");
         cb(cublasSgemv(d->blas, CUBLAS_OP_T, C, m, &one, dlm, C, dhb, 1, &zero, dfb, 1), "fold b");
-        pack_f16_strided_kernel<<<dim3((unsigned) ((m + 255) / 256), (unsigned) R), 256, 0, d->s>>>(
+        if (d->shortlist)
+            fold_vocab_rows<<<(m * R + 255) / 256, 256, 0, d->s>>>(dfw, m, r0, R, d->fold_w);
+        else
+            pack_f16_strided_kernel<<<dim3((unsigned) ((m + 255) / 256), (unsigned) R), 256, 0, d->s>>>(
             dfw, m, n_rows, r0, d->fold_w);
         k::to_f16(dfb, (size_t) m, d->fold_b + r0, d->s);
     }
@@ -371,30 +450,37 @@ void fold(Drafter* d, const uint16_t* lm_f16, int n_rows) {
 
 void write_context(Drafter* d, const float* taps, int ld, int r0, int m, int pos0) {
     const int C = d->C, KD = d->KV * 128;
-    for (int a = 0; a < m; a += kMixRows) {
-        const int n = std::min(kMixRows, m - a);
-        iota_kernel<<<(unsigned) ((n + 255) / 256), 256, 0, d->s>>>(d->ctx_pos, pos0 + a, n);
-        for (auto& l : d->L) {
-            const int li = (int) (&l - d->L.data());
-            k::mix_rms(taps + (size_t) (r0 + a) * C, kTaps, (size_t) ld * C, n, C, d->alpha + li * kTaps, l.dflare,
+    for (auto& l : d->L) {
+        const int li = (int) (&l - d->L.data());
+        for (int a = 0; a < m;) {
+            const int at = (pos0 + a) % l.cap;
+            const int n = std::min({kMixRows, m - a, l.cap - at});   // (a ring: a chunk ends where it wraps)
+            iota_kernel<<<(unsigned) ((n + 255) / 256), 256, 0, d->s>>>(d->ctx_pos, pos0 + a, n);
+            k::mix_rms(taps + (size_t) (r0 + a) * C, d->taps, (size_t) ld * C, n, C, d->alpha + li * d->taps, l.dflare,
                        d->eps, d->mix, d->s);
             k::to_bf16(d->mix, (size_t) n * C, d->hb, d->s);
-            float* kd = l.kc + (size_t) (pos0 + a) * KD;
+            float* kd = l.kc16 ? d->ctx_tmp : l.kc + (size_t) at * KD;
+            float* vd = l.kc16 ? d->ctx_tmp + (size_t) kMixRows * KD : l.vc + (size_t) at * KD;
             gemm_bf(d, l.wkc, KD, C, d->hb, n, kd, KD);
-            gemm_bf(d, l.wvc, KD, C, d->hb, n, l.vc + (size_t) (pos0 + a) * KD, KD);
+            gemm_bf(d, l.wvc, KD, C, d->hb, n, vd, KD);
             k::rms(kd, l.k_norm_ctx, n * d->KV, 128, d->eps, kd, d->s);
             k::rope_neox(kd, n, d->KV, d->ctx_pos, d->theta, d->s);
+            if (l.kc16) {
+                k::to_f16(kd, (size_t) n * KD, l.kc16 + (size_t) at * KD, d->s);
+                k::to_f16(vd, (size_t) n * KD, l.vc16 + (size_t) at * KD, d->s);
+            }
+            a += n;
         }
     }
 }
 
 void set_f_rnn(Drafter* d, const float* taps, int ld, int row) {
-    k::mix_rms(taps + (size_t) row * d->C, kTaps, (size_t) ld * d->C, 1, d->C, d->alpha + 5 * kTaps, d->mk_dflare,
+    k::mix_rms(taps + (size_t) row * d->C, d->taps, (size_t) ld * d->C, 1, d->C, d->alpha + d->L.size() * d->taps, d->mk_dflare,
                d->eps, d->f_rnn, d->s);
 }
 
 void propose(Drafter* d, int anchor, const float* anchor_h, int P, const uint16_t* lm_f16, int n_rows, int n_vocab,
-             int* out) {
+             int* out, int proposals) {
     const int C = d->C, T = kBlock;
     // Initialize the residual stream [anchor_h; mask x 7], block positions, and anchor token in one kernel.
     // Layer 0 reads d->res and overwrites d->x, so d->x does not need pre-filling.
@@ -414,23 +500,39 @@ void propose(Drafter* d, int anchor, const float* anchor_h, int P, const uint16_
     k::add(d->x, d->res, TC, d->res, d->s);
     k::rms(d->res, d->norm, T, C, d->eps, d->h, d->s);   // the draft hidden, rows 1 .. 7 used
     // base logits of rows 1 .. 7 through the target's head
-    k::to_f16(d->h + C, (size_t) (T - 1) * C, (uint16_t*) d->x16, d->s);
-    gemm_h(d, lm_f16, n_rows, C, d->x16, T - 1, d->base, n_rows);
+    k::to_f16(d->h + C, (size_t) proposals * C, (uint16_t*) d->x16, d->s);
+    if (d->head_q8)
+        k::q8_tile(d->head_q8, d->head_q8d, n_rows, C, (const uint16_t*) d->x16, proposals, d->base, n_rows, d->s);
+    else
+        gemm_h(d, lm_f16, n_rows, C, d->x16, proposals, d->base, n_rows);
+    const int shortlist_n = (n_vocab + 31) / 32;
+    if (d->shortlist)
+        draft_shortlist<<<dim3((n_vocab + 127) / 128, proposals), 128, 0, d->s>>>(
+            d->base, n_rows, n_vocab, shortlist_n, d->shortlist);
     // the Markov head, a token at a time (note: k::rnn_gates keeps state/latent in F32 whereas SGLang mtp.py
     // rounds intermediate gate/tanh ops to BF16; fused argmax_gemv_f16 reads FP16 fold_w/fold_b + F32 base/latent)
     cu(cudaMemsetAsync(d->state, 0, d->R * 4, d->s), "state");
-    for (int t = 0; t < T - 1; ++t) {
+    for (int t = 0; t < proposals; ++t) {
         k::rnn_inputs(d->state, d->w1, d->toks + t, d->h + (size_t) (t + 1) * C, d->f_rnn, d->R, C, d->rnn_in, d->s);
         gemm_bf(d, d->rnn_w, 3 * d->R, 2 * d->R + 2 * C, d->rnn_in, 1, d->proj, 3 * d->R);
         k::rnn_gates(d->proj, d->rnn_b, d->R, d->state, d->latent, d->s);
-        k::argmax_gemv_f16(d->fold_w, n_rows, d->latent, d->base + (size_t) t * n_rows, d->fold_b, d->R, n_vocab,
+        if (d->shortlist) {
+            const int* ids = d->shortlist + t * shortlist_n;
+            shortlist_gemv<<<(shortlist_n + 3) / 4, 128, 0, d->s>>>(ids, shortlist_n, d->fold_w, d->latent,
+                d->base + (size_t)t * n_rows, d->fold_b, d->R, d->shortlist_scores);
+            k::argmax_sum(d->shortlist_scores, nullptr, nullptr, shortlist_n, d->toks + t + 1, d->s);
+            shortlist_pick<<<1, 1, 0, d->s>>>(d->toks + t + 1, ids);
+        } else {
+            k::argmax_gemv_f16(d->fold_w, n_rows, d->latent, d->base + (size_t) t * n_rows, d->fold_b, d->R, n_vocab,
                            d->toks + t + 1, d->s);
+        }
     }
-    cu(cudaMemcpyAsync(d->h_out, d->toks + 1, (T - 1) * 4, cudaMemcpyDeviceToHost, d->s), "tokens");
+    cu(cudaMemcpyAsync(d->h_out, d->toks + 1, proposals * 4, cudaMemcpyDeviceToHost, d->s), "tokens");
     cu(cudaStreamSynchronize(d->s), "propose");
-    std::memcpy(out, d->h_out, (T - 1) * sizeof(int));
+    std::memcpy(out, d->h_out, proposals * sizeof(int));
 }
 
 size_t bytes(const Drafter* d) { return d->vram; }
+void set_head_q8(Drafter* d, const int8_t* q8, const uint16_t* q8d) { d->head_q8 = q8, d->head_q8d = q8d; }
 
 }  // namespace ik2::draft

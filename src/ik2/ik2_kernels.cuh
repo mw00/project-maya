@@ -287,6 +287,10 @@ struct MvAlt {
     const float* x = nullptr;
     int r0 = 0, n = 0;
 };
+/// y [T][ldy] = W . x for a planar Q8_0 matrix (q8, d as mv_q8p's) and T <= a few tokens x [T][K] FP16, on the
+/// tensor cores (a value times its block scale rounded to FP16, as the prompt path's decode_q8p_f16).
+void q8_tile(const int8_t* q, const uint16_t* d, int N, int K, const uint16_t* x, int T, float* y, int ldy,
+             cudaStream_t s);
 void mv_q8p_conv(const int8_t* q, const uint16_t* d, int N, int K, const float* x, float* y, const MvConv& c0,
                  const MvConv& c1, cudaStream_t s, const MvAlt& a0 = MvAlt{}, const MvAlt& a1 = MvAlt{});
 void decode_q8p_f16(const int8_t* q, const uint16_t* d, size_t n, uint16_t* out, cudaStream_t s);
@@ -367,7 +371,11 @@ void rope_neox(float* x, int rows, int heads, const int* pos, float theta, cudaS
 /// ([ctx][Hkv][128]) and the block's own nq keys kb / vb ([nq][Hkv][128], all visible to every query); softmax(q . k *
 /// scale) . v -> out [nq][H][128].  scratch: H x nq x (k_hi - k_lo + nq) floats.
 void draft_attn(const float* q, const float* kc, const float* vc, int k_lo, int k_hi, const float* kb, const float* vb,
-                int nq, int H, int Hkv, float scale, float* scratch, float* out, cudaStream_t s);
+                int nq, int H, int Hkv, float scale, float* scratch, float* out, cudaStream_t s, int cap = 0);
+/// ... over a context of FP16 rows.
+void draft_attn_f16(const float* q, const uint16_t* kc, const uint16_t* vc, int k_lo, int k_hi, const float* kb,
+                    const float* vb, int nq, int H, int Hkv, float scale, float* scratch, float* out, cudaStream_t s,
+                    int cap);
 /// out [T][F] BF16 = silu(gu[t][f]) * gu[t][F + f] (gu [T][2 F] F32: gate's then up's).
 void silu_mul_bf16(const float* gu, int T, int F, uint16_t* out, cudaStream_t s);
 /// The Markov head's input [state (R); emb[prev] (R, BF16 table); hidden (C); f (C)] as BF16 into out [2 R + 2 C].
@@ -397,5 +405,77 @@ void decode_f16(int type, const uint8_t* blocks, size_t n, uint16_t* out, cudaSt
 void decode_f32(int type, const uint8_t* blocks, size_t n, float* out, cudaStream_t s);
 /// ... on the host (the reference of the tests, and the embedding's rows).
 void decode_host(int type, const uint8_t* blocks, size_t n, float* out);
+
+// ---- the block path: a few tokens at once (2 .. 8, a speculative step's verify window) on the resident path, every
+// position read from the device (pos [T]: the tokens' positions, consecutive) so that a step's launches replay
+
+/// attn_decode_mma for the T tokens of a window (T * H / Hkv <= 24): q16 [T][H][D]; r: a token's [H][d_rel] r_ld
+/// floats apart; sink [T][H]; a token's keys its own (causal, its window); gate rows gate_ld apart; out, out16
+/// [T][H][D].  scratch: attn_block_scratch floats.
+void attn_block_f16(const uint16_t* q16, const float* r, int r_ld, const float* sink, const uint16_t* kc,
+                    const uint16_t* vc, int kv_cap, int H, int Hkv, const int* pos, int T, int n_split, float qk_scale,
+                    const float* proj, int d_rel, int extent, int window, float* scratch, float* out,
+                    const float* gate, int gate_ld, uint16_t* out16, cudaStream_t s);
+void attn_block_fp8(const uint16_t* q16, const float* r, int r_ld, const float* sink, const uint8_t* kc,
+                    const uint8_t* vc, int kv_cap, int H, int Hkv, const int* pos, int T, int n_split, float qk_scale,
+                    float v_inv_scale, const float* proj, int d_rel, int extent, int window, float* scratch,
+                    float* out, const float* gate, int gate_ld, uint16_t* out16, cudaStream_t s);
+size_t attn_block_scratch(int H, int T, int n_split);
+/// conv4_res for T tokens with row strides (x, res, y); with rec_old [3][C] and rec_x [T][C] given, the history
+/// before and the inputs kept for rollback_block.
+void conv_block(const float* x, int x_ld, float* hist, const float* w, const float* dyn, int d_ld, int heads, int T,
+                int C, const float* res, int res_ld, float* y, int y_ld, float* rec_old, float* rec_x,
+                cudaStream_t s);
+/// A conv's record of a window (conv_block's rec_old, rec_x) and its history.
+struct ConvRec {
+    const float* old;
+    const float* x;
+    float* hist;
+    int C;
+};
+/// Every recorded conv's history as after the first n of the window's tokens (recs: device [n_recs]).
+void rollback_block(const ConvRec* recs, int n_recs, int n, cudaStream_t s);
+/// y [T][N] (rows y_ld apart) = W [N][K] (FP16) . x [T][K] (rows x_ld apart).
+void mv_f16_rows(const uint16_t* W, int N, int K, const float* x, int x_ld, int T, float* y, int y_ld,
+                 cudaStream_t s);
+/// x [T][C] as two FP16 limbs a token: out [T][2][C] (hi, lo).
+void f16_limbs_rows(const float* x, int T, int C, uint16_t* out, cudaStream_t s);
+/// route()'s picks of a window (S = T K <= 64 slots) grouped by expert on the device: blob [S], n [S] (0 past the
+/// last group), tok / row [S][kGroupMax], and a slot's sg, su, wt (down's scale folded) and inv (the slot).
+void group_route(const int* top, const float* w, int S, int K, const uint8_t* const* tab, const float* sg_t,
+                 const float* su_t, const float* sd_t, const uint8_t** blob, int* n, int* tok, int* row, float* sg,
+                 float* su, float* wt, int* inv, cudaStream_t s);
+/// group_route's groups of NVFP4 experts on the tensor cores: gate | up (the input as f16_limbs_rows' limbs) to
+/// h [slot][F] through the capped SwiGLU; down from h to y [slot][C].  G: the launch's groups (those past the last
+/// return at once); T: the window's tokens (a group's members).
+void experts_block_gu(const uint8_t* const* blob, const int* n, const int* tok, const int* row, int G, int T,
+                      size_t off_up, int C, int F, const uint16_t* limbs, const float* sg, const float* su, float gcap,
+                      float ucap, uint16_t* h, cudaStream_t s);
+void experts_block_down(const uint8_t* const* blob, const int* n, const int* row, int G, size_t off_down, int C,
+                        int F, const uint16_t* h, float* y, cudaStream_t s);
+/// prep_qkv_r_*_at for the T tokens of a window: q and r rows q_ld and r_ld floats apart (q16 [T][H][D]), the
+/// positions pos [T] on the device; sinks for each token (sink_x [T][sink_k], sink_y [T][H]).
+void prep_qkv_r_fp8_block(float* q, int q_ld, const float* q_clip, const float* k_in, uint8_t* kc, const float* v_in,
+                          uint8_t* vc, float* r, int r_ld, const float* r_clip, int T, int H, int KV, int D, int d_rel,
+                          float qk_clip, float rel_clip, float eps, const int* pos, bool log_scale, float alpha,
+                          float n_floor, int kv_cap, float k_scale, float v_scale, uint16_t* q16, cudaStream_t s,
+                          const uint16_t* sink_w, const float* sink_x, int sink_k, float* sink_y);
+void prep_qkv_r_f16_block(float* q, int q_ld, const float* q_clip, const float* k_in, uint16_t* kc, const float* v_in,
+                          uint16_t* vc, float* r, int r_ld, const float* r_clip, int T, int H, int KV, int D, int d_rel,
+                          float qk_clip, float rel_clip, float eps, const int* pos, bool log_scale, float alpha,
+                          float n_floor, int kv_cap, uint16_t* q16, cudaStream_t s, const uint16_t* sink_w,
+                          const float* sink_x, int sink_k, float* sink_y);
+/// route() for a window, a block a token (the same picks and weights to the bit).
+void route_rows(const float* logits, const float* bias, int T, int E, int K, float scale, int* top, float* w,
+                cudaStream_t s);
+/// experts_block_gu / _down over Q8_0 experts (a block's sum scaled in FP32: the int8 values exact).
+void experts_block_gu_q8(const uint8_t* const* blob, const int* n, const int* tok, const int* row, int G, int T,
+                         size_t off_up, int C, int F, const uint16_t* limbs, const float* sg, const float* su,
+                         float gcap, float ucap, uint16_t* h, cudaStream_t s);
+void experts_block_down_q8(const uint8_t* const* blob, const int* n, const int* row, int G, size_t off_down, int C,
+                           int F, const uint16_t* h, float* y, cudaStream_t s);
+/// attn_res_jobs for T tokens: job j's queries q + j nq C, its output out + j nq T C ([nq][T][C]).
+void attn_res_jobs_block(const ResStates& states, int n, const float* q, int nq, int jobs, int T, int C, float eps,
+                         float* out, cudaStream_t s);
 
 }  // namespace ik2::k
