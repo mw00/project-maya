@@ -14,8 +14,10 @@
 #include <hipblaslt/hipblaslt.h>
 #include <hipblaslt/hipblaslt-ext.hpp>
 
+#include <cerrno>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <map>
 #include <mutex>
@@ -60,6 +62,8 @@ struct Dev {
 std::mutex g_mu;                   // store path and file appends only; never held while waiting on a GPU
 Dev g_dev[64];
 std::string g_store;                 // set_store's file ("": the picks this process makes only)
+std::string g_store_setting;         // the setting that names another file (the warning below names it)
+bool g_store_warned = false;         // a store that does not open for writing: said once
 
 // y (n x t, FP32, ldy) = W^T (W: k x n column-major = [n][k] row-major) . x (k x t, ldx)
 // as_lies: y = A . x, A n x k column-major with stride la (= [k][la] row-major, its first n columns)
@@ -117,9 +121,10 @@ void load_saved(Dev& d, const std::string& store) {
 
 }  // namespace
 
-void set_store(const char* path) {
+void set_store(const char* path, const char* setting) {
     std::lock_guard<std::mutex> lk(g_mu);
     g_store = path != nullptr ? path : "";
+    g_store_setting = setting != nullptr ? setting : "";
 }
 bool available() { return !off(); }
 
@@ -248,6 +253,16 @@ bool run(void* stream, bool as_lies, bool loose, const uint16_t* W, int la, int 
             if (pick.ok && !store.empty() && !d.tag.empty()) {   // (kept for the next start on this GPU kind)
                 std::lock_guard<std::mutex> store_lk(g_mu);
                 std::ofstream f(store, std::ios::app);
+                if (!f && !g_store_warned) {   // (a read-only pack: each start measured the shapes again, silently)
+                    const int err = errno;
+                    g_store_warned = true;
+                    const std::string hint =
+                        g_store_setting.empty() ? "" : "; " + g_store_setting + "=<a writable file> keeps them elsewhere";
+                    std::fprintf(stderr,
+                                 "ds4 gemm: the measured hipBLASLt picks are not kept - %s does not open for writing "
+                                 "(errno %d: %s), so each start measures the prompt's shapes again%s\n",
+                                 store.c_str(), err, std::strerror(err), hint.c_str());
+                }
                 f << d.arch << kKindTag[kind] << ' ' << d.ver << ' ' << key.n << ' ' << key.k << ' ' << key.ldx << ' '
                   << key.ldy << ' ' << key.tb << ' ' << hipblaslt_ext::getIndexFromAlgo(pick.algo);
                 if (kind == 1) f << ' ' << key.la;
@@ -293,7 +308,7 @@ bool gemm_n(void* stream, const uint16_t* A, int la, int n, int k, const uint16_
     return run(stream, true, loose, A, la, n, k, x, ldx, t, y, ldy);
 }
 #else
-void set_store(const char*) {}
+void set_store(const char*, const char*) {}
 bool available() { return false; }
 bool gemm(void*, const uint16_t*, int, int, const uint16_t*, int, int, float*, int) { return false; }
 bool gemm_loose(void*, const uint16_t*, int, int, const uint16_t*, int, int, float*, int) { return false; }

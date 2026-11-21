@@ -332,7 +332,7 @@ bool gemm_lt_available() {
     return false;
 #endif
 }
-void set_lt_store(const char* path) { strata::ds4::lt::set_store(path); }
+void set_lt_store(const char* path) { strata::ds4::lt::set_store(path, "MAYA_MM3_LT_STORE"); }
 size_t scratch_bytes() {
     // (+ cuBLAS' workspace, and ds4_iq's light sets' int8 rows - 512 experts x 16 rows of up to 8192 values - which it
     //  takes on a stream's first prompt)

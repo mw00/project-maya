@@ -1789,7 +1789,10 @@ model's files (each read again, so those prompts are not timed); a difference fa
 
 On AMD the engine measures hipBLASLt's kernels for each prompt GEMM shape at its first use on a GPU and keeps the
 picks in `<pack>/lt-picks.txt`, so later starts reuse them. A pack whose files must not change (one shared between
-installs, or checked by hash before each start) can keep them elsewhere.
+installs, or checked by hash before each start) can keep them elsewhere. Where the file does not open for writing (a
+pack mounted read-only), the log says so once, with the file, the errno and the setting that moves it (`ds4 gemm: the
+measured hipBLASLt picks are not kept - ...`); the picks then last until the engine stops. Hy4-Flash keeps its picks
+the same way (`HY4_LT_STORE`), and maya-mm3 too (`MAYA_MM3_LT_STORE`).
 
 | Setting | Default | |
 | --- | --- | --- |
@@ -2714,6 +2717,7 @@ A request's `spec` (0 / 1) turns the drafts off or on for it.
 | `HY4_IX_SPLIT`, `HY4_IX_SPLIT_FROM` | on with tensor parallel on NVIDIA; from 8,192 positions | tensor parallel, prompts: each GPU scores and picks its share of a chunk's sub-batches and the cards swap the picks (16-bit pool numbers through the host's memory) instead of every GPU doing all of it; `0`: as before |
 | `HY4_HOT`, `HY4_HOT_EVERY`, `HY4_HOT_SWAPS`, `HY4_HOT_FILE`, `HY4_HOT_LEARN` | on (tensor parallel: off) | on a PC whose GPU holds only some of a layer's experts, the experts in VRAM follow the ones the answers use - every `_EVERY` (8) token steps up to `_SWAPS` (64) cold ones trade places with hotter CPU-lane ones, more between requests - and a start places each layer's most-used first (faster decoding where it acts; the wording can differ from `HY4_HOT=0`, measured no further from the full model). The start's scores are kept in `_FILE` (the server: `data/hy4-expert-hot-<model>.bin`; the engine alone: `<pack>/expert-hot.bin`): the first start learns them from its answers and writes them, the starts after read them as they are - so every start begins the same and the same requests give the same tokens; `--speed-calibration` (or `_LEARN=1`) learns them again. Where no layer has experts both in VRAM and on the CPU lane it does nothing. `HY4_HOT=0` turns it off, `HY4_HOT=1` asks for it with tensor parallel (its start placement only); `HY4_HOT_LOG=1` logs the swaps |
 | `HY4_LT` | on (AMD) | AMD: the prompt path's FP16 matrix products run through hipBLASLt with the fastest kernel measured for each shape on the PC; `0`: hipBLAS as before (the sums are in another order, so wording can differ slightly) |
+| `HY4_LT_STORE` | `<pack>/lt-picks.txt` | AMD, with `HY4_LT`: the measured kernels kept in this file instead (a pack mounted read-only, or one whose files must not change); empty: none kept, each start measures its own |
 | `HY4_TP_CHECK` | off | debugging: after each forward, every member's copy of the state compared |
 | `HY4_TP_HEAD` | on | tensor parallel with a BF16 output head: each member computes its share of the head's rows (the main GPU one share) from its own copy of the final state and copies its logits straight to the host; `0`: the main GPU alone |
 | `HY4_TP_HEAD_UNITS` | 1 | with `HY4_TP_HEAD`: the main GPU's share of the head's rows, in members' shares |
