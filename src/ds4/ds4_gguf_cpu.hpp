@@ -16,6 +16,11 @@ constexpr int kMxCpuMaxN = 8;   // activations a call
 /// (k % 32 == 0) as MXFP4 blocks, rb bytes apart.  (F32 activations: the tests' and the benchmark's old path.)
 void mx_cpu_rows(const uint8_t* w, size_t rb, int k, int r0, int r1, const float* const* x, int n, float* const* y);
 
+/// The gate / up epilogue of iq_cpu_gate_up (IqCpu::act; the ids of ds4_iq.cuh's Args::act, kActSwiglu / kActSitu):
+///   kIqActSwiglu  the clamped SwiGLU (its limit argument)
+///   kIqActSitu    Inkling 2's SITU (llama.cpp's LLM_FFN_SITU): beta tanh(g / beta) sigmoid(g) * (lb > 0 ? lb tanh(u / lb)
+///                 : u), beta = IqCpu::situ_beta, lb = IqCpu::situ_lb - the limit argument unused
+constexpr int kIqActSwiglu = 0, kIqActSitu = 2;
 /// A GGUF's low-bit experts (ds4_iq.cuh's types) on the CPU lane - ggml-cpu's arithmetic through the GLM CPU lane's
 /// native experts (strata::kernels::cpu::native_*: its AVX-512 / AVX2 multi-token rows where they are ggml's bit for bit,
 /// ggml's dots otherwise; ds4_iq_cpu.cpp): an activation quantized once to the weight type's vec_dot_type (Q8_K: an F32
@@ -25,12 +30,15 @@ struct IqCpu {
     int gu_act = 0, d_act = 0;                 // the activations' ggml types
     size_t gu_row = 0, d_row = 0;              // bytes a weight row
     size_t act_bytes = 0, h_bytes = 0;         // bytes of x (n_embd) and of h (n_ff) as those
+    int act = kIqActSwiglu;                    // iq_cpu_gate_up's activation (iq_cpu_fmt leaves it as it is)
+    float situ_beta = 4.0f, situ_lb = 25.0f;   // (kIqActSitu) Inkling 2's
 };
 /// The layer's geometry; false (err) when this build or ggml-cpu cannot take it.
 bool iq_cpu_fmt(int tg, int td, int n_embd, int n_ff, IqCpu& f, std::string& err);
 /// x (k values) as the activation type `act` (f.gu_act / f.d_act) into dst.
 void iq_cpu_quant(int act, const float* x, int k, void* dst);
-/// ff[t][r] = clamped swiglu(gate_r . a[t], up_r . a[t]) for rows [r0, r1) (limit 0: no clamp), nt tokens.
+/// ff[t][r] = clamped swiglu(gate_r . a[t], up_r . a[t]) for rows [r0, r1) (limit 0: no clamp), nt tokens; f.act
+/// kIqActSitu: the SITU of the same sums (each the dot the SwiGLU's rows take) in place of the SwiGLU.
 void iq_cpu_gate_up(const IqCpu& f, const uint8_t* gate, const uint8_t* up, const void* const* act, int nt,
                     float* const* ff, int r0, int r1, float limit);
 /// out[t][r] = down_r . hq[t] for rows [r0, r1).
