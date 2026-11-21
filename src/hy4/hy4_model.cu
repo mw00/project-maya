@@ -19,6 +19,7 @@
 #include "hy4_tp.hpp"
 #include "hy4_pack.hpp"
 #include "hy4_plan.hpp"
+#include "hy4_ring.hpp"
 #include "hy4_spill.hpp"
 #include "../ds4/ds4_iq.cuh"
 #include "../ds4/ds4_lt.hpp"
@@ -744,6 +745,9 @@ struct Model::Impl {
     // the next draft's first step, which makes them together with its own: one MTP forward a round, not two)
     int64_t mtp_done = 0;
     std::vector<int> tokens;             // the sequence so far (Engram's n-gram history)
+    // the lowest position the sliding-window rings (and hring) may still hold: a rewind moves `end` back, but the
+    // slots of the positions below the old end - ring were overwritten when the sequence was read (#1091)
+    int64_t ring_lo = 0;
     std::unique_ptr<Vision> vis;         // the vision tower (Options::vision)
     VisionGeo vgeo;
     double vis_room = 0;                 // its room for the largest picture this start reads
@@ -3309,6 +3313,9 @@ struct Model::Impl {
         } else if (o.kv_resident <= 0) {
             o.kv_resident = 32768;
         }
+        // (HY4_RING_SLACK=N: a ring's positions beyond its window - tests: a small ring, rewinds past it at small sizes)
+        if (const char* e = std::getenv("HY4_RING_SLACK"))
+            if (*e) o.ring_slack = std::max(0, std::atoi(e));
         auto set_chunk = [&](int c) {
             kv_auto_reset();
             Tc = std::max(W, c);
@@ -6748,6 +6755,7 @@ struct Model::Impl {
         mtp_settle();
         int64_t c0 = mtp_done;
         if (c0 < upto - (int64_t) ring + 1) c0 = std::max<int64_t>(0, upto - (int64_t) ring + 1);
+        c0 = std::max<int64_t>(c0, std::min<int64_t>(upto, ring_lo + 1));   // (... or written over before a rewind)
         const size_t rb = sizeof(float) * g.n_embd;
         std::vector<int> pos_save(h_pos, h_pos + 3 * Tc);
         for (int64_t a = c0; a < upto; a += Tc) {
@@ -6875,6 +6883,7 @@ struct Model::Impl {
         // still in the ring) and the new token's, one MTP forward (chunks of Tc), the last row's logits the draft's
         int64_t c0 = std::min(mtp_done, pos);
         if (c0 < pos - (int64_t) ring + 1) c0 = std::max<int64_t>(0, pos - (int64_t) ring + 1);   // (older: gone)
+        c0 = std::max<int64_t>(c0, std::min<int64_t>(pos, ring_lo + 1));   // (... or written over before a rewind)
         std::vector<int> rows;
         for (int64_t q = c0; q < pos; ++q) rows.push_back(tokens[(size_t) q]);
         rows.push_back(tok);
@@ -8220,6 +8229,7 @@ bool Model::load(const Options& o, std::string& err) {
         auto restart = [&] {
             x.tokens.clear();
             x.end = 0;
+            x.ring_lo = 0;
             x.mtp_done = 0;
         };
         x.hot.on = false;
@@ -8447,6 +8457,7 @@ bool Model::load(const Options& o, std::string& err) {
         auto restart = [&] {
             x.tokens.clear();
             x.end = 0;
+            x.ring_lo = 0;
             x.mtp_done = 0;
         };
         restart();
@@ -8578,6 +8589,7 @@ bool Model::load(const Options& o, std::string& err) {
     m->tokens.clear();
     m->end = 0;
     m->mtp_done = 0;
+    m->ring_lo = 0;
     m->st = keep;
     if (ok && m->fx.layers > 0 && m->fx.mode == 1) ok = m->fetch_restore(err);   // (the slots as loaded again)
     if (!ok) {
@@ -8594,9 +8606,8 @@ bool Model::load(const Options& o, std::string& err) {
 }
 
 bool Model::resumable(int64_t pos) const {
-    if (pos == 0) return true;
-    if (pos > m->end) return false;
-    return pos - m->g.n_swa + 1 >= m->end - m->ring;
+    // (the rows a forward from pos reads before it: its window's, and its indexer pool's first rows - hy4_ring.hpp)
+    return ring_holds(pos, m->end, m->ring_lo, m->ring, (int64_t) std::max(m->g.n_swa, m->g.ix_kpool) - 1);
 }
 int64_t Model::end() const { return m->end; }
 
@@ -8631,6 +8642,7 @@ bool Model::forward(const int* ids, int n, int64_t pos0, int want, float* logits
             m->hot.pend_T = n;
         }
     }
+    m->ring_lo = ring_lo_at(pos0, m->ring_lo, m->end, m->ring);   // (#1091)
     m->tokens.resize((size_t) pos0);
     // (the MTP cache's rows from pos0 on are the drafts' own - but the row at pos0 when this is the token the last
     //  drafts started from, there: that one is the model's)
