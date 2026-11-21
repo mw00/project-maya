@@ -12321,8 +12321,8 @@ struct Model::Impl {
             if (n > 0) {
                 // tab_set reads its host-mapped input only when it eventually executes. The head GPU's: before every
                 // overwrite, all earlier work on its stream finished (in particular back-to-back cache_drain /
-                // rc_drain flushes) - after a window's end, which waited for that stream, a no-op; kept as it was
-                // (a one-GPU answer repeats from start to start with it, Sun's Radeon, EXL3 2.25).
+                // rc_drain flushes) - after a window's end, which waited for that stream, a no-op; kept as it was, so
+                // one GPU runs exactly the code it ran before.
                 if ((int) di == head_dev) {
                     const cudaError_t update_sync = cudaStreamSynchronize(devs[di].st);
                     if (update_sync != cudaSuccess) {
