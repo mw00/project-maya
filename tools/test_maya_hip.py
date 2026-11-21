@@ -157,7 +157,9 @@ class HipSetupTests(unittest.TestCase):
         # and Qwen setups keep them): a PC set up for its network was back on 127.0.0.1 without a key
         pc = {"backend": "hip", "gpus": [self.gpus[0]]}   # (what check_pc gives; the config's own settings are the point)
         first = maya.write_config(self.a, pc, {}, self.root / "pack", "test", 8192, self.root / "data", None)
-        own = {"host": "0.0.0.0", "api_key": "k", "cors_origins": ["http://x"], "mcp_servers": {"m": {"url": "u"}}}
+        own = {"host": "0.0.0.0", "api_key": "k", "cors_origins": ["http://x"], "mcp_servers": {"m": {"url": "u"}},
+               "model_management": False, "idle_unload_s": 900, "loop_guard": False,
+               "fit_max_tokens": True}   # (#1089: the model management, the idle unload, ... too; --port: given here)
         first.write_text(json.dumps({**maya.read_json(first), **own}))
         again = maya.read_json(maya.write_config(self.a, pc, {}, self.root / "pack", "test", 8192, self.root / "data",
                                                  None))

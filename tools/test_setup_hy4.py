@@ -1286,6 +1286,22 @@ class Config(unittest.TestCase):
         c = self.write(args(host="0.0.0.0", api_key="s3", port=9001))
         self.assertEqual((c["host"], c["api_key"], c["port"]), ("0.0.0.0", "s3", 9001))
 
+    def test_again_keeps_the_servers_own_settings(self):
+        # #1089: a setup again (an update's) turned "model_management": false back on and the port back to 8080 - every
+        # server setting set by hand stays; a --port / --host / --api-key given now wins
+        own = {"host": "0.0.0.0", "port": 9001, "api_key": "k", "cors_origins": ["*"], "mcp_servers": {"a": 1},
+               "model_management": False, "idle_unload_s": 900, "loop_guard": False,
+               "fit_max_tokens": True}
+        self.assertEqual(set(own), set(maya.SERVER_KEYS))
+        ports = []
+        with patch.object(maya, "write_run_script", lambda p, port: ports.append(port) or self.root / "run.sh"):
+            c = self.write(old={"args": ["--pack", "/old"], **own})
+            self.assertEqual({k: c.get(k) for k in own}, own)
+            c = self.write(args(port=9002, api_key="k2"), old={"args": ["--pack", "/old"], **own})
+        self.assertEqual((c["port"], c["api_key"], c["host"], c["model_management"]), (9002, "k2", "0.0.0.0", False))
+        self.assertEqual(ports, [9001, 9002])                         # (the start script: the config's port)
+        self.assertEqual(self.write(old={"args": ["--pack", "/old"]})["port"], 8080)
+
 
 class Steps(unittest.TestCase):
     def test_from_a_folder_with_the_files(self):
