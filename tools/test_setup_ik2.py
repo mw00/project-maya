@@ -152,20 +152,32 @@ class Refusals(unittest.TestCase):
             ("cuda", True, 0, ok, "Linux only"),
             ("cuda", False, 2, ok, "one GPU only"),
             ("cuda", False, 0, [card(24, arch="61", name="Tesla P40")], "V100 / RTX 20 or newer"),
-            ("cuda", False, 0, [card(12, arch="86")], "24 GB of VRAM or more"),
-            ("cuda", False, 0, [card(16, arch="70"), card(12, 1, arch="89")], "24 GB of VRAM or more"),
+            ("cuda", False, 0, [card(6, arch="86")], "8 GB of VRAM or more"),
+            ("cuda", False, 0, [card(6, arch="70"), card(4, 1, arch="89")], "8 GB of VRAM or more"),
         ]
         for backend, win, asked, cards, part in cases:
             why = F.unsupported(backend, win, asked, cards)
             self.assertIn(part, why or "", (backend, win, asked))
             self.assertNotIn("\n", why)
         for cards in (ok, [card(23.99, arch="89")], [card(80, arch="90")], [card(12, arch="86"), card(24, 1)], [],
-                      [card(32, arch="70", name="Tesla V100-PCIE-32GB")], [card(24, arch="75", name="NVIDIA TITAN RTX")]):
+                      [card(32, arch="70", name="Tesla V100-PCIE-32GB")], [card(24, arch="75", name="NVIDIA TITAN RTX")],
+                      [card(8, arch="86")], [card(16, arch="70"), card(12, 1, arch="89")]):
             self.assertIsNone(F.unsupported("cuda", False, 1, cards))
         # (AMD on Linux: RDNA 3 / 3.5 / 4 with 24 GB, or an APU whose shared memory leaves that much)
         for cards in ([amd("gfx1100", 24)], [amd("gfx1201", 32)], [amd("gfx1030", 16), amd("gfx1100", 24, 1)],
                       [amd("gfx1151", 0.5, unified_memory=True, memory_gb=168)], []):
             self.assertIsNone(F.unsupported("hip", False, 1, cards))
+
+    def test_ram_and_vram_together(self):
+        """No SSD tier (the owner's call): RAM + VRAM under the model is refused in one line naming the amount."""
+        why = F.unsupported("cuda", False, 1, [card(8, arch="86")], ram_gb=12.0)
+        self.assertIn("24 GB of RAM and VRAM together", why or "")
+        self.assertNotIn("\n", why)
+        self.assertIsNone(F.unsupported("cuda", False, 1, [card(8, arch="86")], ram_gb=32.0))
+        self.assertIsNone(F.unsupported("cuda", False, 1, [card(24, arch="86")], ram_gb=8.0))   # (all on the card)
+        # (only the experts the card does not keep are pinned: a 16 GB PC, ~15.4 GiB as Linux reports it, with an
+        #  8 GB card)
+        self.assertIsNone(F.unsupported("cuda", False, 1, [card(8, arch="86")], ram_gb=15.4))
 
     def test_check_pc_refuses_first(self):
         for a, part in ((args(gpus="0,1"), "one GPU only"),):
@@ -179,15 +191,20 @@ class Refusals(unittest.TestCase):
 
     def test_check_pc_refuses_an_old_or_small_card(self):
         for found, part in (([card(24, arch="61", name="Tesla P40")], "V100 / RTX 20 or newer"),
-                            ([card(12, arch="86", name="NVIDIA GeForce RTX 3060")], "24 GB of VRAM or more")):
+                            ([card(6, arch="86", name="NVIDIA GeForce RTX 3050 6GB")], "8 GB of VRAM or more")):
             with patch.object(maya, "WIN", False), patch.object(maya.sys, "platform", "linux"), \
                     patch.object(maya.S, "is_wsl", return_value=False), patch.object(maya.S, "gpus", return_value=found):
                 self.assertIn(part, refusal(lambda: maya.check_pc(args(), "ik2")))
         with patch.object(maya, "WIN", False), patch.object(maya.sys, "platform", "linux"), \
                 patch.object(maya.S, "is_wsl", return_value=False), \
-                patch.object(maya.S, "gpus", return_value=[card(12, 0), card(24, 1, arch="86")]):
-            # (--gpu 0 names the 12 GB card: refused; the 24 GB one would do)
-            self.assertIn("24 GB of VRAM or more", refusal(lambda: maya.check_pc(args(gpu=0), "ik2")))
+                patch.object(maya.S, "gpus", return_value=[card(6, 0), card(24, 1, arch="86")]):
+            # (--gpu 0 names the 6 GB card: refused; the 24 GB one would do)
+            self.assertIn("8 GB of VRAM or more", refusal(lambda: maya.check_pc(args(gpu=0), "ik2")))
+        with patch.object(maya, "WIN", False), patch.object(maya.sys, "platform", "linux"), \
+                patch.object(maya.S, "is_wsl", return_value=False), patch.object(maya, "mem_gb", return_value=(12.0, 10.0)), \
+                patch.object(maya.S, "gpus", return_value=[card(8, arch="86", name="NVIDIA GeForce RTX 3050")]):
+            # (no SSD tier: 12 GB of RAM beside an 8 GB card cannot hold the model)
+            self.assertIn("24 GB of RAM and VRAM together", refusal(lambda: maya.check_pc(args(), "ik2")))
 
     def test_one_gpu_picked(self):
         found = [card(12, 0, arch="86"), card(24, 1, arch="86"), card(24, 2, arch="89"), card(32, 3, arch="61")]
@@ -219,6 +236,23 @@ class Fit(unittest.TestCase):
         self.assertTrue(F.plan(32.0, 262144, "f16")["resident"])     # (an RTX 5090: F16 at 256K too)
         self.assertEqual(F.plan(0, 262144)["resident"], True)          # (VRAM not read: the engine measures)
         self.assertEqual(F.recommended_context(8.0), F.CONTEXTS[0])    # (nothing resident: the smallest)
+
+    def test_smaller_cards_offload(self):
+        """8 / 12 / 16 GB cards: the offload path, a share of the experts on the card growing with it; the verdict
+        says so, and "tight" where the RAM is under what the path pins."""
+        tiers = [F.plan(v, 32768) for v in (8.0, 12.0, 16.0)]
+        self.assertTrue(all(p["layout"] == "offload" and not p["resident"] for p in tiers))
+        self.assertTrue(0 < tiers[0]["tier_gib"] < tiers[1]["tier_gib"] < tiers[2]["tier_gib"] < F.EXPERTS_GIB)
+        self.assertEqual(F.plan(24.0, 262144)["layout"], "resident")
+        self.assertEqual(F.verdict(24.0, 64.0, 262144)[0], "fast")
+        self.assertEqual(F.verdict(8.0, 64.0, 32768)[0], "runs")
+        # (the RAM: the experts the card does not keep, pinned, and the engine's own beside them)
+        for p in tiers:
+            self.assertAlmostEqual(p["ram_gib"], F.EXPERTS_GIB - p["tier_gib"] + F.OFF_HOST_GIB, places=1)
+        self.assertTrue(tiers[0]["ram_gib"] > tiers[1]["ram_gib"] > tiers[2]["ram_gib"])
+        self.assertEqual(F.verdict(8.0, 15.4, 32768)[0], "runs")       # (16 GB of RAM)
+        self.assertEqual(F.verdict(8.0, tiers[0]["ram_gib"] + 0.5, 32768)[0], "tight")
+        self.assertEqual(F.verdict(8.0, 12.0, 32768)[0], "does not fit")
 
 
 class Picker(unittest.TestCase):
