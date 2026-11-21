@@ -9,6 +9,7 @@
 #include "strata/kernels/rdna_wmma.hpp"   // (AMD: the matrix cores - ik2_rdna.inc)
 
 #include <string>
+#include <type_traits>
 #endif
 
 #include <algorithm>
