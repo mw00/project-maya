@@ -325,11 +325,22 @@ __global__ void prep_qkv_r_impl_kernel(float* q, const float* q_clip, const floa
                                        KV* vc, float* r, const float* r_clip, int T, int H, int KVh, int D, int d_rel,
                                        float qk_clip, float rel_clip, float eps, const int* pos, float alpha,
                                        float n_floor, int pos0, int kv_cap, float k_scale, float v_scale,
-                                       const int* pos0_d, uint16_t* q16) {
+                                       const int* pos0_d, uint16_t* q16, const uint16_t* sink_w, const float* sink_x,
+                                       int sink_k, float* sink_y) {
     if (pos0_d) pos0 = *pos0_d;   // (a token of a replayed graph: its position read here)
     const int gid = blockIdx.x;
     const int per_tok = 2 * H + 2 * KVh;
-    if (gid >= T * per_tok) return;
+    if (gid >= T * per_tok) {
+        // (one token's sinks, sink_y [H] = sink_w [H][sink_k] . sink_x - mv_f16_kernel's sums, a launch less)
+        const int h = gid - T * per_tok, lane = threadIdx.x;
+        if (!sink_w || h >= H) return;
+        const uint16_t* w = sink_w + (size_t) h * sink_k;
+        float a = 0.0f;
+        for (int i = lane; i < sink_k; i += 32) a += h2f(w[i]) * sink_x[i];
+        a = wsum(a);
+        if (lane == 0) sink_y[h] = a;
+        return;
+    }
     const int t = gid / per_tok, rem = gid % per_tok;
     const float tau = pos ? (1.0f + alpha * logf(fmaxf(1.0f, ((float) pos[t] + 1.0f) / n_floor))) : 1.0f;
     if (rem < H) {
@@ -1703,6 +1714,24 @@ __global__ void swiglu_cap_f32_kernel(const float* gu, int n, int F, const float
     h[i] = f2h(gcap * tanhf(g / gcap) * (1.0f / (1.0f + expf(-g))) * ucap * tanhf(u / ucap));
 }
 
+// one token's moe_combine_f32 and the conv4_res after it in one launch: out = conv(sum_k wt[k] y[inv[k]]) + res
+__global__ void moe_combine_conv_kernel(const float* __restrict__ y, const int* __restrict__ inv,
+                                        const float* __restrict__ wt, int K, int C, float* hist,
+                                        const float* __restrict__ w, const float* res, float* out) {
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= C) return;
+    float a = 0.0f;
+    for (int k = 0; k < K; ++k) a += wt[k] * y[(size_t) inv[k] * C + c];
+    const float h0 = hist[c], h1 = hist[(size_t) C + c], h2 = hist[(size_t) 2 * C + c];
+    const float* wc = w + (size_t) c * 4;
+    const float w0 = wc[0], w1 = wc[1], w2 = wc[2], w3 = wc[3];
+    float b = w0 * h0 + w1 * h1 + w2 * h2 + w3 * a;
+    if (res) b += res[c];
+    out[c] = b;
+    hist[c] = h1;
+    hist[(size_t) C + c] = h2;
+    hist[(size_t) 2 * C + c] = a;
+}
 __global__ void moe_combine_f32_kernel(const float* y, const int* inv, const float* wt, int T, int K, int C, float* out,
                                        bool add) {
     const size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
@@ -3238,11 +3267,32 @@ __global__ void mv_f16_kernel(const uint16_t* __restrict__ W, int N, int K, cons
     if (lane == 0) y[row] = a;
 }
 
+// a product's row through its short conv (conv4_fused_kernel's arithmetic for one token): false if the row has none
+__device__ __forceinline__ bool mv_conv_row(const MvConv& cv, int row, float x_new) {
+    const int c = row - cv.r0;
+    if (c < 0 || c >= cv.n) return false;
+    const float h0 = cv.hist[c], h1 = cv.hist[(size_t) cv.n + c], h2 = cv.hist[(size_t) 2 * cv.n + c];
+    const float* wc = cv.w + (size_t) c * 4;
+    const float w0 = wc[0], w1 = wc[1], w2 = wc[2], w3 = wc[3];
+    float a = w0 * h0 + w1 * h1 + w2 * h2 + w3 * x_new;
+    if (cv.dyn) {
+        const float* dc = cv.dyn + (size_t) (c / (cv.n / cv.heads)) * 4;
+        a += dc[0] * x_new + dc[1] * h2 + dc[2] * h1 + dc[3] * h0;
+    }
+    if (cv.res) a += cv.res[c];
+    cv.y[c] = a;
+    cv.hist[c] = h1;
+    cv.hist[(size_t) cv.n + c] = h2;
+    cv.hist[(size_t) 2 * cv.n + c] = x_new;
+    return true;
+}
+
 // y [N] = W . x for a Q8_0 matrix kept planar - its values q [N][K] int8 and its blocks' scales d [N][K / 32] FP16 -
-// so that a warp reads 128 values an instruction; x where it is.  A warp a row.
+// so that a warp reads 128 values an instruction; x where it is.  A warp a row; a row of c0's or c1's goes through
+// its short conv instead of to y (a launch less a conv: a token's launches each cost 2 us and more).
 template <int WARPS>
 __global__ void mv_q8p_kernel(const int8_t* __restrict__ q, const uint16_t* __restrict__ d, int N, int K,
-                              const float* __restrict__ x, float* __restrict__ y) {
+                              const float* __restrict__ x, float* y, MvConv c0, MvConv c1) {
     const int row = blockIdx.x * WARPS + (threadIdx.x >> 5), lane = threadIdx.x & 31;
     if (row >= N) return;
     const uint32_t* qr = (const uint32_t*) (q + (size_t) row * K);
@@ -3257,7 +3307,7 @@ __global__ void mv_q8p_kernel(const int8_t* __restrict__ q, const uint16_t* __re
                      (float) (int8_t) ((w >> 16) & 0xFFu) * xv.z + (float) (int8_t) (w >> 24) * xv.w);
     }
     acc = wsum(acc);
-    if (lane == 0) y[row] = acc;
+    if (lane == 0 && !mv_conv_row(c0, row, acc) && !mv_conv_row(c1, row, acc)) y[row] = acc;
 }
 __global__ void decode_q8p_f16_kernel(const int8_t* __restrict__ q, const uint16_t* __restrict__ d, size_t n,
                                       uint16_t* __restrict__ out) {
@@ -4064,6 +4114,11 @@ void moe_combine_f32(const float* y, const int* inv, const float* wt, int T, int
     moe_combine_f32_kernel<<<grid((size_t) T * C), kBlk, 0, s>>>(y, inv, wt, T, K, C, out, add);
     check("moe_combine_f32");
 }
+void moe_combine_conv(const float* y, const int* inv, const float* wt, int K, int C, float* hist, const float* w,
+                      const float* res, float* out, cudaStream_t s) {
+    moe_combine_conv_kernel<<<(unsigned) ((C + 127) / 128), 128, 0, s>>>(y, inv, wt, K, C, hist, w, res, out);
+    check("moe_combine_conv");
+}
 void add(const float* a, const float* b, size_t n, float* y, cudaStream_t s) {
     if (!n) return;
     add_kernel<<<grid(n), kBlk, 0, s>>>(a, b, n, y);
@@ -4303,7 +4358,7 @@ void prep_qkv_r_f16(float* q, const float* q_clip, const float* k_in, uint16_t* 
     const int total = T * (2 * H + 2 * KV);
     prep_qkv_r_impl_kernel<uint16_t><<<(unsigned) total, 32, 0, s>>>(
         q, q_clip, k_in, kc, v_in, vc, r, r_clip, T, H, KV, D, d_rel, qk_clip, rel_clip, eps, pos, alpha, n_floor,
-        pos0, kv_cap, 1.0f, 1.0f, nullptr, nullptr);
+        pos0, kv_cap, 1.0f, 1.0f, nullptr, nullptr, nullptr, nullptr, 0, nullptr);
     check("prep_qkv_r_f16");
 }
 
@@ -4315,7 +4370,7 @@ void prep_qkv_r_fp8(float* q, const float* q_clip, const float* k_in, uint8_t* k
     const int total = T * (2 * H + 2 * KV);
     prep_qkv_r_impl_kernel<uint8_t><<<(unsigned) total, 32, 0, s>>>(
         q, q_clip, k_in, kc, v_in, vc, r, r_clip, T, H, KV, D, d_rel, qk_clip, rel_clip, eps, pos, alpha, n_floor,
-        pos0, kv_cap, k_scale, v_scale, nullptr, nullptr);
+        pos0, kv_cap, k_scale, v_scale, nullptr, nullptr, nullptr, nullptr, 0, nullptr);
     check("prep_qkv_r_fp8");
 }
 
@@ -4422,14 +4477,18 @@ void attn_decode_fp8(const float* q, const float* r, const float* sink, const ui
                      window, scratch, out, s);
 }
 
-void mv_q8p(const int8_t* q, const uint16_t* d, int N, int K, const float* x, float* y, cudaStream_t s) {
+void mv_q8p_conv(const int8_t* q, const uint16_t* d, int N, int K, const float* x, float* y, const MvConv& c0,
+                 const MvConv& c1, cudaStream_t s) {
     if (N <= 0) return;
     if (K % 128 || ((uintptr_t) q & 3) || ((uintptr_t) x & 15)) {
         std::fprintf(stderr, "ik2::k::mv_q8p: K %d, or q / x not aligned\n", K);
         std::abort();
     }
-    mv_q8p_kernel<4><<<(unsigned) ((N + 3) / 4), 128, 0, s>>>(q, d, N, K, x, y);
+    mv_q8p_kernel<4><<<(unsigned) ((N + 3) / 4), 128, 0, s>>>(q, d, N, K, x, y, c0, c1);
     check("mv_q8p");
+}
+void mv_q8p(const int8_t* q, const uint16_t* d, int N, int K, const float* x, float* y, cudaStream_t s) {
+    mv_q8p_conv(q, d, N, K, x, y, MvConv{}, MvConv{}, s);
 }
 void decode_q8p_f16(const int8_t* q, const uint16_t* d, size_t n, uint16_t* out, cudaStream_t s) {
     if (!n) return;
@@ -4472,19 +4531,21 @@ void route_token(const float* logits, const float* bias, int E, int K, float sca
 void prep_qkv_r_f16_at(float* q, const float* q_clip, const float* k_in, uint16_t* kc, const float* v_in, uint16_t* vc,
                        float* r, const float* r_clip, int H, int KV, int D, int d_rel, float qk_clip, float rel_clip,
                        float eps, const int* pos, bool log_scale, float alpha, float n_floor, int kv_cap,
-                       uint16_t* q16, cudaStream_t s) {
-    prep_qkv_r_impl_kernel<uint16_t><<<(unsigned) (2 * H + 2 * KV), 32, 0, s>>>(
+                       uint16_t* q16, cudaStream_t s, const uint16_t* sink_w, const float* sink_x, int sink_k,
+                       float* sink_y) {
+    prep_qkv_r_impl_kernel<uint16_t><<<(unsigned) (2 * H + 2 * KV + (sink_w ? H : 0)), 32, 0, s>>>(
         q, q_clip, k_in, kc, v_in, vc, r, r_clip, 1, H, KV, D, d_rel, qk_clip, rel_clip, eps, log_scale ? pos : nullptr,
-        alpha, n_floor, 0, kv_cap, 1.0f, 1.0f, pos, q16);
+        alpha, n_floor, 0, kv_cap, 1.0f, 1.0f, pos, q16, sink_w, sink_x, sink_k, sink_y);
     check("prep_qkv_r_f16_at");
 }
 void prep_qkv_r_fp8_at(float* q, const float* q_clip, const float* k_in, uint8_t* kc, const float* v_in, uint8_t* vc,
                        float* r, const float* r_clip, int H, int KV, int D, int d_rel, float qk_clip, float rel_clip,
                        float eps, const int* pos, bool log_scale, float alpha, float n_floor, int kv_cap,
-                       float k_scale, float v_scale, uint16_t* q16, cudaStream_t s) {
-    prep_qkv_r_impl_kernel<uint8_t><<<(unsigned) (2 * H + 2 * KV), 32, 0, s>>>(
+                       float k_scale, float v_scale, uint16_t* q16, cudaStream_t s, const uint16_t* sink_w,
+                       const float* sink_x, int sink_k, float* sink_y) {
+    prep_qkv_r_impl_kernel<uint8_t><<<(unsigned) (2 * H + 2 * KV + (sink_w ? H : 0)), 32, 0, s>>>(
         q, q_clip, k_in, kc, v_in, vc, r, r_clip, 1, H, KV, D, d_rel, qk_clip, rel_clip, eps, log_scale ? pos : nullptr,
-        alpha, n_floor, 0, kv_cap, k_scale, v_scale, pos, q16);
+        alpha, n_floor, 0, kv_cap, k_scale, v_scale, pos, q16, sink_w, sink_x, sink_k, sink_y);
     check("prep_qkv_r_fp8_at");
 }
 

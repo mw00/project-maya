@@ -116,6 +116,10 @@ void swiglu_cap_f32(const float* gu, int n, int F, const float* sg, const float*
                     uint16_t* h, cudaStream_t s);
 void moe_combine_f32(const float* y, const int* inv, const float* wt, int T, int K, int C, float* out, bool add,
                      cudaStream_t s);
+/// One token's moe_combine_f32 and the conv4_res after it in one launch: out [C] = conv4(sum_k wt[k] y[inv[k]])
+/// + res (hist [3][C], w [C][4]; res null: nothing added).
+void moe_combine_conv(const float* y, const int* inv, const float* wt, int K, int C, float* hist, const float* w,
+                      const float* res, float* out, cudaStream_t s);
 
 /// y = a + b, n values (y may alias either).
 void add(const float* a, const float* b, size_t n, float* y, cudaStream_t s);
@@ -238,6 +242,20 @@ void unpack_kv_fp8_to_f16(const uint8_t* kc, const uint8_t* vc, int kv_cap, int 
 /// scales (the GGUF's blocks taken apart, the values unchanged) - a warp reads 128 values an instruction.  K a
 /// multiple of 128; q aligned to 4 bytes, x to 16.  decode_q8p_f16: the same matrix as FP16 (n values).
 void mv_q8p(const int8_t* q, const uint16_t* d, int N, int K, const float* x, float* y, cudaStream_t s);
+/// ... with a short conv (conv4's, one token) as the product's epilogue: the rows [r0, r0 + n) go through it - hist
+/// [3][n], w [n][4], dyn [heads * 4] or null, res [n] added or null - to y [n] instead of to the product's y, and
+/// hist takes the row.  A launch less a conv: every launch of a token costs 2 us and more, whatever it does.
+struct MvConv {
+    int r0 = 0, n = 0;
+    float* hist = nullptr;
+    const float* w = nullptr;
+    const float* dyn = nullptr;
+    int heads = 0;
+    const float* res = nullptr;
+    float* y = nullptr;
+};
+void mv_q8p_conv(const int8_t* q, const uint16_t* d, int N, int K, const float* x, float* y, const MvConv& c0,
+                 const MvConv& c1, cudaStream_t s);
 void decode_q8p_f16(const int8_t* q, const uint16_t* d, size_t n, uint16_t* out, cudaStream_t s);
 /// y [N] = W [N][K] . x [K] for a small dense matrix kept in FP16 (the sinks, a full layer's dynamic taps, the
 /// router): F32 sums, a warp a row.
@@ -256,14 +274,18 @@ void route_token(const float* logits, const float* bias, int E, int K, float sca
                  int* tok, int* inv, float* sg, float* su, float* wt, cudaStream_t s);
 /// prep_qkv_r_f16 / _fp8 of one token whose position is at pos (device): the cache slot from it, and with log_scale
 /// (a full layer) q's and r's tau.  q16 (given): an FP16 copy of the clipped q, [H][D] (attn_decode_mma's).
+/// sink_w (given): the token's sinks in the same launch, sink_y [H] = sink_w [H][sink_k] (FP16) . sink_x (mv_f16's).
 void prep_qkv_r_f16_at(float* q, const float* q_clip, const float* k_in, uint16_t* kc, const float* v_in, uint16_t* vc,
                        float* r, const float* r_clip, int H, int KV, int D, int d_rel, float qk_clip, float rel_clip,
                        float eps, const int* pos, bool log_scale, float alpha, float n_floor, int kv_cap,
-                       uint16_t* q16, cudaStream_t s);
+                       uint16_t* q16, cudaStream_t s, const uint16_t* sink_w = nullptr, const float* sink_x = nullptr,
+                       int sink_k = 0, float* sink_y = nullptr);
 void prep_qkv_r_fp8_at(float* q, const float* q_clip, const float* k_in, uint8_t* kc, const float* v_in, uint8_t* vc,
                        float* r, const float* r_clip, int H, int KV, int D, int d_rel, float qk_clip, float rel_clip,
                        float eps, const int* pos, bool log_scale, float alpha, float n_floor, int kv_cap,
-                       float k_scale, float v_scale, uint16_t* q16, cudaStream_t s);
+                       float k_scale, float v_scale, uint16_t* q16, cudaStream_t s,
+                       const uint16_t* sink_w = nullptr, const float* sink_x = nullptr, int sink_k = 0,
+                       float* sink_y = nullptr);
 /// attn_decode_f16 / _fp8 of the token at position *pos (device): the keys it may see follow from the position and
 /// the window (1 << 30: every one), split P ways whatever their number (P fixed, so the launches do not change from
 /// a token to the next).  scratch: H x P x 130 floats.
