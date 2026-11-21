@@ -64,6 +64,9 @@ ENGINE_VISION = (ds4_vision.Vision, mm3_vision.Vision)   # the engines that run 
 #                                                          (hy4_vision.Vision is an mm3_vision.Vision)
 HY4_TEXT_ONLY = "Hy4-Flash with its pictures off"         # (no vision tower loaded: the errors' name for it)
 INKLING_TEXT_ONLY = "Inkling-2-Small"                     # (text only: neither of its engines has a vision tower yet)
+HY4_LANE_FILE = ROOT / "data" / "hy4-cpu-lane.txt"        # (maya-hy4's 4-bit copies' verdict on this PC: child_env)
+# (... and what stands for a picture in a tool result then: the agent's turn goes on)
+HY4_PICTURE_NOTE = "[a picture was here; pictures are off on this server, so it was not read]"
 
 
 def inkling_text_only(engine) -> str:
@@ -71,9 +74,6 @@ def inkling_text_only(engine) -> str:
     NVIDIA, maya-inkling2 on AMD)."""
     kind = str((getattr(engine, "info", None) or {}).get("engine") or "")
     return f"{INKLING_TEXT_ONLY} on maya-{kind}" if kind in ("ik2", "inkling2") else INKLING_TEXT_ONLY
-HY4_LANE_FILE = ROOT / "data" / "hy4-cpu-lane.txt"        # (maya-hy4's 4-bit copies' verdict on this PC: child_env)
-# (... and what stands for a picture in a tool result then: the agent's turn goes on)
-HY4_PICTURE_NOTE = "[a picture was here; pictures are off on this server, so it was not read]"
 
 
 def hy4_tool_pictures_noted(messages: list) -> list:

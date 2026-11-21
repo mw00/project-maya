@@ -306,7 +306,7 @@ def family_of(cfg: dict) -> str:
     exe = Path(str(cfg.get("exe", ""))).name
     if inst.get("family") == "hy4" or exe.startswith("maya-hy4"):
         return "hy4"
-    # (Inkling-2-Small: run by hand so far, no setup.  Both its engines - maya-ik2 on CUDA, maya-inkling2 on AMD, whose
+    # (Inkling-2-Small: both its engines - maya-ik2 on CUDA (a config by hand), maya-inkling2 on AMD (set_up_ik2), whose
     #  --pack would otherwise read as DeepSeek's below; "inkling2" is that engine's family name in configs written
     #  before the two were one family)
     if inst.get("family") in IK2_FAMILY_NAMES or exe.startswith(IK2_EXES):

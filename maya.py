@@ -896,7 +896,7 @@ IK2_RECOMMENDED_CONTEXT = 262144                    # (DS4_RECOMMENDED_CONTEXT)
 # drafter's (the last GPU, while it drafts); the experts give it up to RAM
 IK2_KV_BYTES, IK2_ATTN_BYTES, IK2_DSPARK_KV_BYTES = SM.IK2_KV_BYTES, SM.IK2_ATTN_BYTES, SM.IK2_DSPARK_KV_BYTES
 # VRAM + RAM that hold the whole model, the context aside (as DS4_MEMORY_GB: GiB, the unit of mem_gb and the GPUs'
-# vram_gb), tools/inkling2/download.json's "memory_gb": ceil(files + margin + drafter) = ceil(190.9 + 8 + 2.9) = 202 -
+# vram_gb), tools/inkling2/download.json's "memory_gb": ceil(files + margin + drafter) = ceil(190.9 + 8 + 3.2) = 203 -
 #   files    204,969,055,296 bytes = 190.9 GiB, the six shards' sizes in download.json: every tensor, each once (in VRAM,
 #            or the experts VRAM does not hold copied into RAM - the engine never reads them from the SSD);
 #   margin   8 GiB, IK2_RAM_MARGIN_GIB: the RAM the engine leaves the rest beyond its RAM experts (it stops at its
@@ -6412,7 +6412,7 @@ BENCH_TOPICS = [
 def bench_exe(cfg: dict) -> Path:
     """Which engine binary a HIP config's --bench should relaunch - config_family(cfg)'s target, through the same
     exe_for_target every build step uses, so this can't drift out of sync with either."""
-    if config_family(cfg) == "ik2":                    # (Inkling 2: the engine its config names - built by hand, no setup)
+    if config_family(cfg) == "ik2":                    # (Inkling 2: the engine its config names - maya-inkling2 on AMD)
         return Path(cfg["exe"])
     return exe_for_target({"deepseek": "maya-ds4", "minimax": "maya-mm3", "hy4": "maya-hy4"}.get(config_family(cfg), "maya"))
 
@@ -10947,8 +10947,7 @@ def main() -> int:
     ap.add_argument("--force-fit", action="store_true",
                     help="GLM-5.3-Flash: set up a quant even where the setup works out that it cannot start on this "
                          "PC's one NVIDIA card, not even with its experts on the CPU (it then warns instead of "
-                         "stopping before the download); Inkling 2 Small: even where this PC's VRAM and RAM together "
-                         "are below what holds the model")
+                         "stopping before the download)")
     ap.add_argument("--vram-reserve-mib", type=int, metavar="N",
                     help="VRAM in MiB the expert pool leaves free on each GPU for the driver, the desktop and other "
                          "programs (default 700), kept in the config")
