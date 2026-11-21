@@ -4,7 +4,21 @@
 
 #include <cuda_fp16.h>
 #include <fcntl.h>
+
+#ifdef _WIN32
+#include <io.h>
+#include <BaseTsd.h>
+typedef SSIZE_T ssize_t;
+#define O_RDONLY (_O_RDONLY | _O_BINARY)
+#define open _open
+#define close _close
+static inline ssize_t pread(int fd, void* buf, size_t count, int64_t offset) {
+    if (_lseeki64(fd, offset, SEEK_SET) == -1) return -1;
+    return _read(fd, buf, (unsigned int)count);
+}
+#else
 #include <unistd.h>
+#endif
 
 #include <algorithm>
 #include <cmath>
