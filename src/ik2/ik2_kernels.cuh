@@ -1,0 +1,256 @@
+// src/ik2/ik2_kernels.cuh - maya-ik2's kernels: the ops of Inkling 2 (thinkingmachines/Inkling-2-Small) that Maya's
+// other engines do not have - the short convolutions, the attention residuals, the attention's clips, relative bias and
+// sink, the softcapped SwiGLU with the experts' scales - and the decodes of the weights an `inkling2` GGUF holds
+// (NVFP4, Q5_K, Q6_K, Q8_0).  The arithmetic follows ref/inkling2.py (transformers' modeling_inkling2.py), in F32; the
+// experts' GEMMs of the prompt path take FP16 rows (an NVFP4 weight is exact in FP16).  docs/INKLING2.md has the model.
+//
+// Layouts: rows of tokens; a token's heads back to back ([T][H][D]); the K / V caches by position, [ctx][Hkv][D] F32.
+// CUDA only for now (no HIP mapping yet).
+#pragma once
+
+#include <cstddef>
+#include <cstdint>
+#include <cuda_runtime.h>
+
+namespace ik2::k {
+
+/// y = x * rsqrt(mean(x^2) + eps) * w per row of D (w null: no weight).  x and y may alias.
+void rms(const float* x, const float* w, int rows, int D, float eps, float* y, cudaStream_t s);
+/// Fused RMSNorm + FP16 output (and optional F32 output y32 if non-null; y32 may alias x).
+void rms_f16(const float* x, const float* w, int rows, int D, float eps, uint16_t* y16, float* y32, cudaStream_t s);
+
+/// The scaled L2 clip, a group at a time: x [rows][G][D]; v = x * scale[g] (scale [G][D], null: 1);
+/// y = v * min(1, th / (|v| + 1e-6)) * tau, tau = 1 + alpha ln max(1, (pos[row] + 1) / n_floor) with pos given (a full
+/// layer's log scaling of q and r), else 1.  x and y may alias.
+void l2clip(const float* x, const float* scale, int rows, int G, int D, float th, const int* pos, float alpha,
+            float n_floor, float* y, cudaStream_t s);
+
+/// The folded short conv (docs/INKLING2.md): y[t][c] = sum_j w[c][j] xp[t + j][c], xp = hist's 3 rows then x's T
+/// (hist: the conv's last 3 inputs, oldest first; zeros at a sequence's start), taps = 4; with dyn [T][heads * 4]
+/// (a full layer's k / v) + sum_lag dyn[t][h(c) * 4 + lag] xp[t + 3 - lag][c], h(c) = c / (C / heads).
+/// Then hist = the last 3 rows of xp.  y must not alias x.
+void conv4(const float* x, float* hist, const float* w, const float* dyn, int heads, int T, int C, float* y,
+           cudaStream_t s);
+/// Residual-fused short conv: same as conv4, plus residual[t][c] added to y[t][c] when residual != nullptr.
+void conv4_res(const float* x, float* hist, const float* w, const float* dyn, int heads, int T, int C,
+               const float* residual, float* y, cudaStream_t s);
+
+/// The attention residual: the n states st[i] ([T][C] each, n <= kResMax; the block states then the stream) each
+/// RMS-normed without a weight (eps), p = softmax_i(q . s_i / sqrt(C)) for each of the nq queries (q [nq][C]),
+/// out [nq][T][C] = sum_i p_i s_i.
+constexpr int kResMax = 12;
+struct ResStates {
+    const float* st[kResMax];
+};
+void attn_res(const ResStates& states, int n, const float* q, int nq, int T, int C, float eps, float* out,
+              cudaStream_t s);
+struct RmsOuts {
+    const float* w[3] = {};
+    uint16_t* y16[3] = {};
+    float* y32[3] = {};
+};
+/// Fused attn_res + per-query RMSNorm (res_eps for attn_res, rms_eps for output RMSNorm); writes FP16 outs.y16[qi]
+/// and optional F32 outs.y32[qi] (outs.w[qi] may be null).  nq <= 3.
+void attn_res_rms_f16(const ResStates& states, int n, const float* q, int nq, int T, int C, float res_eps,
+                      float rms_eps, const RmsOuts& outs, cudaStream_t s);
+
+/// One head's attention weights in place over lg [Tq][nk] = q . k (raw dots): query i at position qpos0 + i, key j at
+/// kpos0 + j, dist = their difference;  logit = lg * qk_scale + (0 <= dist < extent ? r[i] . proj[dist] : 0), masked
+/// unless 0 <= dist < window;  p = softmax over the keys and a sink logit sink[i] (whose value is zero: the weights sum
+/// to less than 1).  r: this head's relative states, row i at r + i * r_ld (d_rel values); proj [extent][d_rel];
+/// sink: row i at sink + i * sink_ld.
+void attn_probs(float* lg, int Tq, int nk, int qpos0, int kpos0, float qk_scale, const float* r, int r_ld, int d_rel,
+                const float* proj, int extent, int window, const float* sink, int sink_ld, cudaStream_t s);
+/// Batched FP16-output variant across all H heads: lg [H][Tq][nk] F32 (read-only), r [Tq][H][d_rel], sink [Tq][H],
+/// out16 [H][Tq][nk] FP16 in one launch.
+/// attn_probs_f16 with the relative bias precomputed: bias [Tq * H][extent], row i * H + h, column the distance.
+void attn_probs_bias_f16(const float* lg, uint16_t* out16, int H, int Tq, int nk, int qpos0, int kpos0,
+                         float qk_scale, const float* bias, int extent, int window, const float* sink, cudaStream_t s);
+void attn_probs_f16(const float* lg, uint16_t* out16, int H, int Tq, int nk, int qpos0, int kpos0, float qk_scale,
+                    const float* r, int d_rel, const float* proj, int extent, int window, const float* sink,
+                    cudaStream_t s);
+/// Prefill attention fused (FP16 KV, D = 128): q16 [Tq] rows of q_ld (head h at h * D) at positions qpos0 ..;
+/// kc / vc the cache [pos or pos % kv_cap][KV * D]; keys [max(0, qp - window + 1), qp] of each query; the relative
+/// bias from the table bias [Tq * H][extent] (as attn_probs_bias_f16), sink [Tq][H] -> out [Tq] rows of o_ld (F32).
+/// The keys split n_split ways (scratch: n_split * Tq * H * (D + 2) floats; fewer splits if it holds fewer).
+void attn_flash_f16(const uint16_t* q16, int q_ld, const uint16_t* kc, const uint16_t* vc, int kv_cap, int H, int KV,
+                    int D, int Tq, int qpos0, float qk_scale, const float* bias, int extent, int window,
+                    const float* sink, float* out, int o_ld, float* scratch, size_t scratch_floats, int n_split,
+                    cudaStream_t s);
+/// a split count for attn_flash_f16: Tq queries x H heads against up to nk keys on n_sm SMs
+int attn_flash_splits(int Tq, int H, int nk, int n_sm);
+
+/// o *= sigmoid(g), n values.
+void gate_mul(float* o, const float* g, size_t n, cudaStream_t s);
+/// o16[i] = f2h(o[i] * sigmoid(g[i])), and writes o[i] when write_f32 is true.
+void gate_mul_f16(float* o, const float* g, size_t n, uint16_t* o16, bool write_f32, cudaStream_t s);
+
+/// The router over logits [T][E]: sc = sigmoid; the K largest of sc + bias (ties: the lower expert) -> top [T][K] in
+/// ascending expert order, w [T][K] = sc / (sum of the chosen + 1e-20) * scale.
+void route(const float* logits, const float* bias, int T, int E, int K, float scale, int* top, float* w,
+           cudaStream_t s);
+
+/// FP16 rows gathered from F32 rows: y [n][C] = x[idx[i]][C].
+void gather_f16(const float* x, const int* idx, int n, int C, uint16_t* y, cudaStream_t s);
+
+/// The experts' activation over gate | up rows: gu [n][2 F] FP16 (gate first), row i's scales sg[i], su[i] (the
+/// expert's NVFP4 scales; 1 without) -> h [n][F] FP16 = gcap tanh(g / gcap) sigmoid(g) ucap tanh(u / ucap),
+/// g = gate * sg, u = up * su.
+void swiglu_cap(const uint16_t* gu, int n, int F, const float* sg, const float* su, float gcap, float ucap,
+                uint16_t* h, cudaStream_t s);
+
+/// out [T][C] (+)= sum over the K slots i of wt[t * K + i] * y[t * K + i ... the row inv[t * K + i]] (y [rows][C] FP16;
+/// wt already holds the route weight times the expert's down scale).  add: onto out, else out is overwritten.
+void moe_combine(const uint16_t* y, const int* inv, const float* wt, int T, int K, int C, float* out, bool add,
+                 cudaStream_t s);
+
+/// The same two with F32 inputs: gu [n][2 F] F32 (the experts' raw dot products can pass FP16's range: an NVFP4
+/// expert's values are its true ones over its scale) -> h FP16; y [rows][C] F32.
+void swiglu_cap_f32(const float* gu, int n, int F, const float* sg, const float* su, float gcap, float ucap,
+                    uint16_t* h, cudaStream_t s);
+void moe_combine_f32(const float* y, const int* inv, const float* wt, int T, int K, int C, float* out, bool add,
+                     cudaStream_t s);
+
+/// y = a + b, n values (y may alias either).
+void add(const float* a, const float* b, size_t n, float* y, cudaStream_t s);
+/// FP16 copies of n values.
+void to_f16(const float* x, size_t n, uint16_t* y, cudaStream_t s);
+
+/// x = cap tanh(x / cap), n values (the head's logits).
+void softcap(float* x, size_t n, float cap, cudaStream_t s);
+
+// ---- the token path: the experts straight from their blocks, the attention of one query
+
+/// The routed experts of a few tokens as matrix-vector products over the blocks as the GGUF holds them (NVFP4, Q8_0,
+/// Q5_K, Q6_K), one launch a phase.  Slot s (S of them): its expert's blob at blob[s] (gate | up | down: eb0, eb1 bytes
+/// in), its token's row tok[s] of x.
+///   gate_up: gu [S][2 F] = (gate, up) . x[tok[s]] (x [*][C] F32), raw sums (the scales applied by swiglu_cap_f32)
+///   down:    y [S][C] = down . h[s] (h [S][F] FP16), raw sums
+void experts_gate_up(const uint8_t* const* blob, const int* tok, int S, int ty_gate, int ty_up, size_t eb0,
+                     const float* x, int C, int F, float* gu, cudaStream_t s);
+void experts_down(const uint8_t* const* blob, int S, int ty_down, size_t off_down, const uint16_t* h, int C, int F,
+                  float* y, cudaStream_t s);
+
+/// y [N] = W [N][K] . x [K] for a dense matrix as the GGUF holds it (rows of `type` blocks: Q8_0, NVFP4, Q5_K, Q6_K),
+/// a warp a row in a fixed order - one token's products, half the bytes of an FP16 copy for Q8_0.  K <= 8192.
+void mv_blocks(int type, const uint8_t* W, int N, int K, const float* x, float* y, cudaStream_t s);
+
+/// The same grouped: group g's expert at blob[g], picked by n[g] <= 8 tokens - x rows tok[g * 8 + j], output (and, for
+/// down, input h) rows row[g * 8 + j] - its blocks read once for all of them.
+constexpr int kGroupMax = 8;
+void experts_gate_up_g(const uint8_t* const* blob, const int* n, const int* tok, const int* row, int G, int ty_gate,
+                       int ty_up, size_t eb0, const float* x, int C, int F, float* gu, cudaStream_t s);
+void experts_down_g(const uint8_t* const* blob, const int* n, const int* row, int G, int ty_down, size_t off_down,
+                    const uint16_t* h, int C, int F, float* y, cudaStream_t s);
+/// Fused gate+up+softcapped-SwiGLU straight to h [S][F] FP16 (or h[row[g*8+t]][F] in _g, where sg/su are also
+/// indexed by row[g*8+t]).  sg, su may be null (scale 1).
+void experts_gate_up_swiglu(const uint8_t* const* blob, const int* tok, int S, int ty_gate, int ty_up, size_t eb0,
+                            const float* x, int C, int F, const float* sg, const float* su, float gcap, float ucap,
+                            uint16_t* h, cudaStream_t s);
+/// experts_gate_up_swiglu with slot s's F outputs written at h + orow[s] * h_ld (orow null: s; h_ld 0: F) - a tensor-
+/// parallel GPU's half of every row of a wider h
+void experts_gate_up_swiglu_rows(const uint8_t* const* blob, const int* tok, int S, int ty_gate, int ty_up,
+                                 size_t eb0, const float* x, int C, int F, const float* sg, const float* su, float gcap,
+                                 float ucap, uint16_t* h, const int* orow, int h_ld, cudaStream_t s);
+void experts_gate_up_swiglu_g(const uint8_t* const* blob, const int* n, const int* tok, const int* row, int G,
+                              int ty_gate, int ty_up, size_t eb0, const float* x, int C, int F, const float* sg,
+                              const float* su, float gcap, float ucap, uint16_t* h, cudaStream_t s);
+
+/// Fused attention-input prep: l2clip(q) in place, l2clip(k_in) -> FP16 kc[slot], rms(v_in) -> FP16 vc[slot],
+/// l2clip(r) in place, where slot = kv_cap > 0 ? (pos0 + t) % kv_cap : (pos0 + t).  pos may be null (sliding layers).
+void prep_qkv_r_f16(float* q, const float* q_clip, const float* k_in, uint16_t* kc, const float* v_in, uint16_t* vc,
+                    float* r, const float* r_clip, int T, int H, int KV, int D, int d_rel, float qk_clip,
+                    float rel_clip, float eps, const int* pos, float alpha, float n_floor, int pos0, int kv_cap,
+                    cudaStream_t s);
+/// attn_decode for nq queries at positions qpos0 .. qpos0 + nq - 1 (q [nq][H][128], r [nq][H][d_rel], sink [nq][H],
+/// out [nq][H][128]), each over the keys k0 .. k0 + nk - 1 it may see.  scratch: nq x H x (nk + 128 x 130) floats.
+void attn_multi(const float* q, const float* r, const float* sink, const float* kc, const float* vc, int nq, int H,
+                int Hkv, int k0, int nk, int qpos0, float qk_scale, const float* proj, int d_rel, int extent, int window,
+                float* scratch, float* out, cudaStream_t s);
+
+/// One query's attention (a token being generated), every head in one launch: q [H][D] and r [H][d_rel] as the
+/// clips left them, sink [H]; the keys at positions k0 .. k0 + nk - 1 of the caches kc / vc ([ctx][Hkv][D] F32), the
+/// query at qpos; logits q . k * qk_scale + the relative bias (0 <= dist < extent), masked past the window, softmax
+/// with the sink; out [H][D].  scratch: H x nk + H x 128 x 130 floats (nk >= 256: the keys in runs a block each,
+/// combined after).  D = 128.
+void attn_decode(const float* q, const float* r, const float* sink, const float* kc, const float* vc, int H, int Hkv,
+                 int D, int k0, int nk, int qpos, float qk_scale, const float* proj, int d_rel, int extent, int window,
+                 float* scratch, float* out, cudaStream_t s);
+
+/// FP16 K / V cache variants of attn_multi / attn_decode with optional ring-buffer wraparound (when kv_cap > 0, key
+/// k0 + j sits at slot (k0 + j) % kv_cap; when kv_cap <= 0, linear slot k0 + j).  D = 128.
+void attn_multi_f16(const float* q, const float* r, const float* sink, const uint16_t* kc, const uint16_t* vc,
+                    int kv_cap, int nq, int H, int Hkv, int k0, int nk, int qpos0, float qk_scale, const float* proj,
+                    int d_rel, int extent, int window, float* scratch, float* out, cudaStream_t s);
+void attn_decode_f16(const float* q, const float* r, const float* sink, const uint16_t* kc, const uint16_t* vc,
+                     int kv_cap, int H, int Hkv, int D, int k0, int nk, int qpos, float qk_scale, const float* proj,
+                     int d_rel, int extent, int window, float* scratch, float* out, cudaStream_t s);
+
+/// FP8 (E4M3FN) K / V cache variants: scale K by k_scale and V by v_scale on write; fold 1/k_scale into qk_scale
+/// and pass v_inv_scale = 1/v_scale on read.  slot = kv_cap > 0 ? (pos0 + t) % kv_cap : (pos0 + t).  D = 128.
+void prep_qkv_r_fp8(float* q, const float* q_clip, const float* k_in, uint8_t* kc, const float* v_in, uint8_t* vc,
+                    float* r, const float* r_clip, int T, int H, int KV, int D, int d_rel, float qk_clip,
+                    float rel_clip, float eps, const int* pos, float alpha, float n_floor, int pos0, int kv_cap,
+                    float k_scale, float v_scale, cudaStream_t s);
+void attn_multi_fp8(const float* q, const float* r, const float* sink, const uint8_t* kc, const uint8_t* vc,
+                    int kv_cap, int nq, int H, int Hkv, int k0, int nk, int qpos0, float qk_scale,
+                    float v_inv_scale, const float* proj, int d_rel, int extent, int window, float* scratch,
+                    float* out, cudaStream_t s);
+void attn_decode_fp8(const float* q, const float* r, const float* sink, const uint8_t* kc, const uint8_t* vc,
+                     int kv_cap, int H, int Hkv, int D, int k0, int nk, int qpos, float qk_scale,
+                     float v_inv_scale, const float* proj, int d_rel, int extent, int window, float* scratch,
+                     float* out, cudaStream_t s);
+/// Unwrap nk KV rows starting at k0 from FP8 ring buffer into contiguous FP16 [nk, KD] scaled by k_inv_scale / v_inv_scale.
+void unpack_kv_fp8_to_f16(const uint8_t* kc, const uint8_t* vc, int kv_cap, int k0, int nk, int KD,
+                          float k_inv_scale, float v_inv_scale, uint16_t* k_out16, uint16_t* v_out16,
+                          cudaStream_t s);
+
+// ---- speculative decoding: the draft model's (Inkling 2's DSpark drafter, mtp.safetensors) and the rollback's
+
+/// hist = the last 3 rows of [old (3 rows of C); x (T rows of C)] - a short conv's history after T of the inputs it
+/// was given (the accepted part of a verify window).  hist may alias old.
+void conv_hist_after(const float* old, const float* x, int T, int C, float* hist, cudaStream_t s);
+/// BF16 copies of n values (nearest even).
+void to_bf16(const float* x, size_t n, uint16_t* y, cudaStream_t s);
+/// out [rows][C] = rms(sum_k alpha[k] x[k][row]) * w: x's taps n_tap apart (tap_stride floats), alpha (device) [n_tap].
+void mix_rms(const float* x, int n_tap, size_t tap_stride, int rows, int C, const float* alpha, const float* w,
+             float eps, float* out, cudaStream_t s);
+/// NeoX rotary in place on x [rows][heads][128] at positions pos[row] (device), base theta (inverse frequencies in F32
+/// as torch computes them).
+void rope_neox(float* x, int rows, int heads, const int* pos, float theta, cudaStream_t s);
+/// The drafter's attention: nq queries q [nq][H][128] over the context keys at positions k_lo .. k_hi - 1 of kc / vc
+/// ([ctx][Hkv][128]) and the block's own nq keys kb / vb ([nq][Hkv][128], all visible to every query); softmax(q . k *
+/// scale) . v -> out [nq][H][128].  scratch: H x nq x (k_hi - k_lo + nq) floats.
+void draft_attn(const float* q, const float* kc, const float* vc, int k_lo, int k_hi, const float* kb, const float* vb,
+                int nq, int H, int Hkv, float scale, float* scratch, float* out, cudaStream_t s);
+/// out [T][F] BF16 = silu(gu[t][f]) * gu[t][F + f] (gu [T][2 F] F32: gate's then up's).
+void silu_mul_bf16(const float* gu, int T, int F, uint16_t* out, cudaStream_t s);
+/// The Markov head's input [state (R); emb[prev] (R, BF16 table); hidden (C); f (C)] as BF16 into out [2 R + 2 C].
+void rnn_inputs(const float* state, const uint16_t* emb, const int* prev, const float* hidden, const float* f, int R,
+                int C, uint16_t* out, cudaStream_t s);
+/// The GRU-like step over proj [3 R] (+ bias [3 R]): gate = sigmoid, cand = tanh, out = tanh; state = gate state +
+/// (1 - gate) cand (in place), latent = out.
+void rnn_gates(const float* proj, const float* bias, int R, float* state, float* latent, cudaStream_t s);
+/// *out = argmax over v < n of a[v] + b[v] + c[v] (b, c may be null; ties: the lower index), *out written on the device.
+void argmax_sum(const float* a, const float* b, const float* c, int n, int* out, cudaStream_t s);
+/// out[r] = argmax over c < n_cols of x[r * ld + c] for 0 <= r < n_rows (ties: the lower index), written on the device.
+void argmax_rows(const float* x, int ld, int n_rows, int n_cols, int* out, cudaStream_t s);
+/// *out = argmax over v < n of (base[v] + bias_f16[v] + sum_{r<R} W[r * ld + v] * x[r]), where W is [R][ld] FP16,
+/// x is [R] F32, base (optional) is [n] F32, bias_f16 (optional) is [n] FP16.  Ties: the lower index.
+void argmax_gemv_f16(const uint16_t* W, int ld, const float* x, const float* base, const uint16_t* bias_f16,
+                     int R, int n, int* out, cudaStream_t s);
+
+// ---- the weights' decodes (ggml's block types; values exactly ggml's dequantize_row_*, then rounded to the output)
+
+/// ggml type ids of the blocks these decode.
+constexpr int kQ8_0 = 8, kQ5_K = 13, kQ6_K = 14, kIQ3_XXS = 18, kIQ4_XS = 23, kNVFP4 = 40;
+/// values a block / bytes a block (0: not one of the above).
+int block_values(int type);
+size_t block_bytes(int type);
+/// n values (a multiple of the block's) of `type` blocks -> FP16 (nearest; NVFP4: exact) or F32.
+void decode_f16(int type, const uint8_t* blocks, size_t n, uint16_t* out, cudaStream_t s);
+void decode_f32(int type, const uint8_t* blocks, size_t n, float* out, cudaStream_t s);
+/// ... on the host (the reference of the tests, and the embedding's rows).
+void decode_host(int type, const uint8_t* blocks, size_t n, float* out);
+
+}  // namespace ik2::k
