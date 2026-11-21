@@ -1,6 +1,6 @@
 """tools/test_setup_ik2.py - Inkling-2-Mini (maya-ik2, an experimental preview) in the setup: its names and setup ids,
 its own defaults (its author's), the pinned manifest, the one-line refusals on the hosts the preview
-does not run on (AMD, a Mac, Windows, two GPUs or more asked for, a card older than RTX 30 / A100 or under 24 GB), the
+does not run on (AMD, a Mac, Windows, two GPUs or more asked for, a card older than V100 / RTX 20 or under 24 GB), the
 one GPU it picks, what fits on the card (the context, the drafter's room), the picker's row, the tokenizer step, the
 config it writes (its pictures too) and a start of it.  No GPU, no network.
 
@@ -130,7 +130,7 @@ class Refusals(unittest.TestCase):
             ("metal", False, 0, [], "NVIDIA GPUs only"),
             ("cuda", True, 0, ok, "Linux only"),
             ("cuda", False, 2, ok, "one GPU only"),
-            ("cuda", False, 0, [card(32, arch="70", name="Tesla V100")], "RTX 30 / A100 or newer"),
+            ("cuda", False, 0, [card(24, arch="61", name="Tesla P40")], "V100 / RTX 20 or newer"),
             ("cuda", False, 0, [card(12, arch="86")], "24 GB of VRAM or more"),
             ("cuda", False, 0, [card(16, arch="70"), card(12, 1, arch="89")], "24 GB of VRAM or more"),
         ]
@@ -138,7 +138,8 @@ class Refusals(unittest.TestCase):
             why = F.unsupported(backend, win, asked, cards)
             self.assertIn(part, why or "", (backend, win, asked))
             self.assertNotIn("\n", why)
-        for cards in (ok, [card(23.99, arch="89")], [card(80, arch="90")], [card(12, arch="86"), card(24, 1)], []):
+        for cards in (ok, [card(23.99, arch="89")], [card(80, arch="90")], [card(12, arch="86"), card(24, 1)], [],
+                      [card(32, arch="70", name="Tesla V100-PCIE-32GB")], [card(24, arch="75", name="NVIDIA TITAN RTX")]):
             self.assertIsNone(F.unsupported("cuda", False, 1, cards))
 
     def test_check_pc_refuses_first(self):
@@ -152,7 +153,7 @@ class Refusals(unittest.TestCase):
             self.assertIn("Linux only", refusal(lambda: maya.check_pc(args(), "ik2")))
 
     def test_check_pc_refuses_an_old_or_small_card(self):
-        for found, part in (([card(32, arch="70", name="Tesla V100-SXM2-32GB")], "RTX 30 / A100 or newer"),
+        for found, part in (([card(24, arch="61", name="Tesla P40")], "V100 / RTX 20 or newer"),
                             ([card(12, arch="86", name="NVIDIA GeForce RTX 3060")], "24 GB of VRAM or more")):
             with patch.object(maya, "WIN", False), patch.object(maya.sys, "platform", "linux"), \
                     patch.object(maya.S, "is_wsl", return_value=False), patch.object(maya.S, "gpus", return_value=found):
@@ -164,12 +165,15 @@ class Refusals(unittest.TestCase):
             self.assertIn("24 GB of VRAM or more", refusal(lambda: maya.check_pc(args(gpu=0), "ik2")))
 
     def test_one_gpu_picked(self):
-        found = [card(12, 0, arch="86"), card(24, 1, arch="86"), card(24, 2, arch="89"), card(32, 3, arch="70")]
+        found = [card(12, 0, arch="86"), card(24, 1, arch="86"), card(24, 2, arch="89"), card(32, 3, arch="61")]
         with patch.object(maya, "ok"):
             got = maya.choose_gpus(args(), found, maya.IK2_MIN_CC, "ik2")
-            self.assertEqual([g["index"] for g in got], [1])          # (the largest new enough; the V100 is too old)
+            self.assertEqual([g["index"] for g in got], [1])          # (the largest new enough; the Pascal is too old)
             got = maya.choose_gpus(args(), found, maya.IK2_MIN_CC, "ik2", before=[2])
             self.assertEqual([g["index"] for g in got], [2])          # (the one its config ran on)
+            got = maya.choose_gpus(args(), [card(12, 0, arch="86"), card(32, 1, arch="70", name="Tesla V100")],
+                                   maya.IK2_MIN_CC, "ik2")
+            self.assertEqual([g["index"] for g in got], [1])          # (a V100: Volta on)
         self.assertEqual(maya.ik2_gpus_asked(args(gpus="0, 1")), 2)
         self.assertEqual(maya.ik2_gpus_asked(args(gpu=3)), 1)
         self.assertEqual(maya.ik2_gpus_asked(args()), 0)
@@ -204,7 +208,7 @@ class Picker(unittest.TestCase):
         self.assertEqual((got["rows"][-1], fam), ("Inkling 2 Mini (experimental)", "ik2"))
         about = got["about"]["Inkling 2 Mini (experimental)"]
         for part in ("EXPERIMENTAL PREVIEW", "thinkingmachines' Inkling-2-Mini", "UD-Q4_K_XL", "18 GB",
-                     "RTX 30 / A100", "Linux", "one GPU with 24 GB", "pictures"):
+                     "V100 / RTX 20", "Linux", "one GPU with 24 GB", "pictures"):
             self.assertIn(part, about)
 
 

@@ -304,10 +304,10 @@ GGUF as it is. An **experimental preview**: `maya.py --setup --model inkling-2-m
 
 | Files | Size | Runs on |
 | --- | ---: | --- |
-| [unsloth's UD-Q4_K_XL](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF) (NVFP4 experts in layers 0-19, Q8_0 elsewhere) | 17.6 GB | NVIDIA RTX 30 / A100 and newer, Linux, one GPU with 24 GB of VRAM or more |
+| [unsloth's UD-Q4_K_XL](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF) (NVFP4 experts in layers 0-19, Q8_0 elsewhere) | 17.6 GB | NVIDIA V100 / RTX 20 and newer, Linux, one GPU with 24 GB of VRAM or more |
 
 - **Where it runs:** the whole model sits on one card. The setup says so in one line and stops on AMD GPUs, a Mac,
-  Windows, two GPUs or more, cards older than RTX 30 / A100 and cards under 24 GB.
+  Windows, two GPUs or more, cards older than V100 / RTX 20 and cards under 24 GB.
 - **Context:** up to 256K (the setup offers 32K to 256K and recommends the largest that keeps every expert in VRAM on
   the card); the cache in FP8 by default (F16 on the Models page).
 - **Drafting:** not offered by the setup in this preview (the engine's `--draft` with the model's drafter is

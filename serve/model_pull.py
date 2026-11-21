@@ -43,7 +43,7 @@ OTHER = tuple([(f"deepseek-{k}", "deepseek", k, by) for k, by in DS4_OTHER] + [(
 GATED = ("abliterated-128g", "abliterated-256g")     # (orcarouter's repo is gated: the setup sends the user's HF token)
 EXL3_MIN_CC = 70                                     # (maya.DS4_MIN_CC / mm3_min_cc: the EXL3 quants from V100 on)
 QWEN_MIN_CC = 70                                     # (maya.QWEN_MIN_CC: the Qwen path from V100 on)
-IK2_MIN_CC = 80                                      # (maya.IK2_MIN_CC: maya-ik2's kernels, RTX 30 / A100 on)
+IK2_MIN_CC = 70                                      # (maya.IK2_MIN_CC: maya-ik2's kernels, V100 / RTX 20 on)
 
 
 def _offered(fam: str, key: str, backend: str, ccs: list) -> bool:

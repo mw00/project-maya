@@ -867,8 +867,9 @@ HY4_KV_RESIDENT = 32768                            # (KV streaming: the global l
 # tokens (an 8 GB card at 4K: measured) - counted as 0.95, conservatively
 HY4_CHUNK_UP_GIB = 0.95
 # Inkling-2-Mini (an EXPERIMENTAL PREVIEW, PR #1095): thinkingmachines' looped 26B on its own engine maya-ik2 (src/ik2,
-# docs/INKLING2.md section 8) - NVIDIA only, Linux only, one GPU of 24 GB or more, RTX 30 / A100 and newer (the
-# engine's kernels: mma.sync m16n8k16, cp.async); every expert in VRAM (the resident token path).
+# docs/INKLING2.md section 8) - NVIDIA only, Linux only, one GPU of 24 GB or more, V100 / RTX 20 and newer (the
+# engine's kernels per architecture: Volta's mma.m8n8k4, Turing's and Ampere's mma.sync); every expert in VRAM (the
+# resident token path).
 # Its file: unsloth's UD-Q4_K_XL (Unsloth's looped layout, which the engine reads) - tools/ik2/download.json, pinned
 # by size and sha256; the setup offers no drafter (the engine's --draft is by hand, docs/INKLING2.md).  Pictures: the
 # model's vision tower as unsloth's mmproj-BF16.gguf (download.json's "vision", beside the GGUF; not with --no-vision),
@@ -11064,8 +11065,8 @@ def ik2_about() -> str:
     files = read_json(IK2_MANIFEST).get("files") or {}   # (damaged: the setup says so when it is picked)
     gb = f"{sum(v[0] for v in files.values()) / 1e9:.0f} GB" if files else "about 18 GB"
     return ("An EXPERIMENTAL PREVIEW: thinkingmachines' Inkling-2-Mini (26B, a looped model: 8 of 128 experts a token) "
-            f"on its own engine, in unsloth's UD-Q4_K_XL GGUF ({gb}); NVIDIA RTX 30 / "
-            "A100 and newer, Linux, one GPU with 24 GB of VRAM or more - the whole model sits on the card; tool calls, "
+            f"on its own engine, in unsloth's UD-Q4_K_XL GGUF ({gb}); NVIDIA V100 / "
+            "RTX 20 and newer, Linux, one GPU with 24 GB of VRAM or more - the whole model sits on the card; tool calls, "
             "its thinking levels, up to a 256K context, pictures (its vision tower, 0.6 GB); one answer at a time.")
 
 
@@ -11242,7 +11243,7 @@ def set_up_ik2(a, prev: dict) -> Path | None:
     meta = build_step(a, pc, llama, "maya-ik2")        # 4
     if not IK2_EXE.exists():
         fail(f"the engine was not built ({IK2_EXE})", "the reason is in the build's messages above (maya-ik2 needs "
-             "an RTX 30 / A100 or newer card in the build's GPU list)")
+             "a V100 / RTX 20 or newer card in the build's GPU list)")
     gguf = ik2_model_step(a, d, models)               # 5
     if gguf is None:
         return None

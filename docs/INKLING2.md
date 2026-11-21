@@ -122,8 +122,21 @@ which keeps the experts' original bits) is the bar.
 ## 6. Phase 2: the engine, `maya-ik2`
 
 `src/ik2/` runs unsloth's GGUFs in place (UD-Q4_K_XL: NVFP4 experts in layers 0-39; UD-Q3_K_XL: IQ3_XXS / IQ4_XS),
-CUDA on Linux, Ampere on. Built by CMake beside the other engines (`maya-ik2`, and `ik2_kernels_test` with
-`STRATA_BUILD_TESTS`); a 90 in `CMAKE_CUDA_ARCHITECTURES` builds sm_90a for the Hopper attention.
+CUDA on Linux, Volta (sm_70) on. Built by CMake beside the other engines (`maya-ik2`, and `ik2_kernels_test` with
+`STRATA_BUILD_TESTS`); a 90 in `CMAKE_CUDA_ARCHITECTURES` builds sm_90a for the Hopper attention; `all` / `all-major`
+take the compiler's list from sm_70 on. CUDA 12.x for a V100 (CUDA 13 has no sm_70).
+
+**Kernels per architecture** (`k::arch_class()`; a fix for one class leaves the others' code as it is):
+
+| GPU class | One token's attention | NVFP4 experts (one token) | Prompt attention | Verify window (drafting) |
+| --- | --- | --- | --- | --- |
+| Ampere and newer (sm_80+) | `mma.sync` m16n8k16 | `mma.sync` m16n8k16 | fused (`mma.sync`, `cp.async`; sm_90a: wgmma) | block path |
+| Turing (sm_75) | Ampere's, m16n8k16 as two m16n8k8 | Ampere's, the same | cuBLAS (the fused kernel needs `cp.async` and more shared memory) | block path |
+| Volta (sm_70) | its own: `mma.m8n8k4`, 32 keys a warp step | its own: `mma.m8n8k4` | cuBLAS | none: no drafting (`--draft` prints a NOTE) |
+
+Each class is exact within itself (the same greedy answers start after start); the classes differ from each other in
+their sums' order, as different kernels do. `IK2_ARCH=70` / `75` takes an older class's kernels on a newer GPU (tests;
+Turing's code only where the build has it - a `75-virtual` build).
 
 **Where the weights sit.** The dense weights (attention, router, head: ~4.7 B) are decoded once to FP16 in VRAM. The
 routed experts stay as the GGUF holds them, all of them in pinned host memory (the files are read and registered
@@ -323,14 +336,15 @@ To run it (one GPU):
 Thinking off (`reasoning_effort` `none`, `enable_thinking` false) has the prompt open the answer's text segment:
 the model has no switch for its thinking, only the effort level, and at the lowest it still thinks a little.
 
-**The preview.** Inkling-2-Mini comes in as an experimental preview: Linux, one NVIDIA GPU of 24 GB, sm_80
-(Ampere) or newer; tested on RTX 3090s (sm_86). Elsewhere `maya-ik2` stops at the start with one line saying why
-(under `--serve` also as a `NOTE` the server prints): no NVIDIA GPU, a GPU older than sm_80 (a V100 cannot run it:
-the kernels use Ampere's `mma.sync` m16n8k16 and `cp.async`), a build with no kernels for the GPU's arch, less than
-22 GiB of VRAM, `--gpus 2` or more, Windows. `IK2_UNSUPPORTED=1` runs it anyway where it can run at all: two GPUs
-(`IK2_EP=1` or `IK2_TP=1`, section 6), smaller cards with the experts streamed from RAM, @cobra91's Windows / CUDA 13
-port - untested here. CMake skips `maya-ik2` without a CUDA arch of 80 or more in the list, in a HIP build, and on
-Windows unless `-DSTRATA_IK2_WINDOWS=ON`.
+**The preview.** Inkling-2-Mini comes in as an experimental preview: Linux, one NVIDIA GPU of 24 GB, sm_70
+(Volta: V100) or newer; tested on RTX 3090s (sm_86) and V100s (sm_70); Turing (sm_75) kernel-tested only, Blackwell
+(sm_100 / sm_120) compile-checked only. Elsewhere `maya-ik2` stops at the start with one line saying why (under
+`--serve` also as a `NOTE` the server prints): no NVIDIA GPU, a GPU older than sm_70 (Pascal and before: none of the
+tensor-core instructions its kernels use), a build with no kernels for the GPU's arch, less than 22 GiB of VRAM,
+`--gpus 2` or more, Windows. `IK2_UNSUPPORTED=1` runs it anyway where it can run at all: two GPUs (`IK2_EP=1` or
+`IK2_TP=1`, section 6), smaller cards with the experts streamed from RAM, @cobra91's Windows / CUDA 13 port -
+untested here. CMake skips `maya-ik2` without a CUDA arch of 70 or more in the list, in a HIP build, and on Windows
+unless `-DSTRATA_IK2_WINDOWS=ON`.
 
 **Defaults.** Thinking Machines' `generation_config.json`: temperature 1.0 (no top_p, no top_k: 1.0 and off).
 Thinking is the template's `reasoning_effort`, a name or a number in [0.0, 0.99]: `none` 0.0, `minimal` 0.1, `low`
