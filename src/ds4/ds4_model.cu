@@ -4512,28 +4512,36 @@ struct Model::Impl {
                 if (!gmap(G, G.arb.pflags, (size_t) G.arb.nm * G.arb.slots * kAr2Blocks * 16, err)) return false;
                 G.arb.ar2 = ar2();
             }
-            // DS4_AR2_DECODE=1 (unset: as before): the decode windows' all-reduces of a group of two (G.ar: the
-            // attention output's and the MoE's, a window's rows) in ar2_kernel too - its exact mode only (1: member 0's
-            // partial plus member 1's, ar_sum_kernel's bits), one launch where xfer_put and ar_sum_kernel were two, the
-            // other's rows read 16 bytes a lane.  Its own progress words: G.arb was copied from G.ar before, so it
-            // shares none of them
-            if (G.ar.nm == 2 && ar2_decode()) {
+            // DS4_AR2_DECODE=1 / 2 (unset: as before): the decode windows' all-reduces of a group of two (G.ar: the
+            // attention output's and the MoE's, a window's rows) in ar2_kernel too, one launch where xfer_put and
+            // ar_sum_kernel were two, the other's rows read 16 bytes a lane.  1: exact (member 0's partial plus member
+            // 1's, ar_sum_kernel's bits); 2: FP16 on the wire, as DS4_AR2=2 (both partials rounded alike, summed in F32
+            // in member order, so the members' copies stay equal; half the bytes over host-mapped rows).  Its own
+            // progress words: G.arb was copied from G.ar before, so it shares none of them
+            if (G.ar.nm == 2 && ar2_decode() > 0) {
                 if (!gmap(G, G.ar.pflags, (size_t) G.ar.nm * G.ar.slots * kAr2Blocks * 16, err)) return false;
-                G.ar.ar2 = 1;
+                G.ar.ar2 = ar2_decode();
             }
         }
         if (ar2() < 0) {
             err = "DS4_AR2 takes 0, 1 or 2";
             return false;
         }
-        if (ar2_decode()) {
+        if (ar2_decode() < 0) {
+            err = "DS4_AR2_DECODE takes 0, 1 or 2";
+            return false;
+        }
+        if (ar2_decode() > 0) {
             std::string on;
             for (const Group& G : groups)
                 if (G.ar.ar2 > 0)
                     for (int m : G.mem) on += (on.empty() ? "CUDA" : ", CUDA") + std::to_string(devs[(size_t) m].id);
             std::fprintf(stderr, "%s%s%s\n", on.empty() ? "ds4: DS4_AR2_DECODE: no group of two - not used" :
                                                        "ds4: DS4_AR2_DECODE: the decode windows' all-reduces on ",
-                         on.c_str(), on.empty() ? "" : " in one launch, the other member's rows read 16 bytes a lane; "
+                         on.c_str(), on.empty() ? "" : ar2_decode() == 2 ?
+                                                       " in one launch, the other member's rows read 16 bytes a lane; "
+                                                       "FP16 on the wire (both partials rounded, summed in F32 in member order)" :
+                                                       " in one launch, the other member's rows read 16 bytes a lane; "
                                                        "the sums bit for bit");
         }
         if (ar2() > 0) {
@@ -18004,7 +18012,7 @@ struct Model::Impl {
     // DS4_AR2=1 / 2 (0 / unset: off): a group of two's chunk all-reduces - the attention output's and the MoE's - in
     // ar2_kernel: the put and the sums pipelined in pieces, the other member's rows read 16 bytes a lane.  1:
     // ar_sum_kernel's sums bit for bit; 2: FP16 on the wire (both partials rounded, summed in F32 in member order).
-    // Decode's all-reduces (G.ar) never take it.  Another value: the load refuses (-1).  Unset: 1 on NVIDIA (the same
+    // Decode's all-reduces (G.ar) take DS4_AR2_DECODE's instead.  Another value: the load refuses (-1).  Unset: 1 on NVIDIA (the same
     // sums, prompt +1.5% at 8K and +3% at 32K on 3x V100 --tp 2, v1.1.55), 0 on AMD (its peer path's calibration
     // decides there, below)
     static int ar2() {
@@ -18020,12 +18028,14 @@ struct Model::Impl {
         }();
         return v;
     }
-    static bool ar2_decode() {   // (DS4_AR2_DECODE: see the groups' setup)
-        static const bool on = [] {
+    static int ar2_decode() {   // (DS4_AR2_DECODE 0 / 1 / 2: see the groups' setup; another value -1, the load refuses)
+        static const int v = [] {
             const char* e = ds4_env("DS4_AR2_DECODE");
-            return e != nullptr && std::atoi(e) != 0;
+            if (e == nullptr || *e == 0) return 0;
+            const int x = std::atoi(e);
+            return (x >= 0 && x <= 2 && std::strspn(e, "0123456789") == std::strlen(e)) ? x : -1;
         }();
-        return on;
+        return v;
     }
 #if defined(STRATA_USE_HIP) || defined(DS4_CUDA_PEER_AR)
     // Optional transport scratch is allocated only after expert placement. Failure leaves the
