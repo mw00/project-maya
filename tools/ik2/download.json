@@ -1,5 +1,5 @@
 {
- "_": "Inkling-2-Mini (thinkingmachines/Inkling-2-Mini, 26B: 24 layers, layers 6..17 run three times) on maya-ik2 (src/ik2, docs/INKLING2.md section 8), an experimental preview: unsloth's UD-Q4_K_XL GGUF at the repo's top - Unsloth's looped layout (general.architecture inkling2: inkling2.num_loops, inkling2.loop.core_start), which maya-ik2 reads; the files in Mainline_Support/ (inkling2_loop, llama.cpp master's) are not offered. Experts of layers 0-19 NVFP4 (their original bits), layers 20-23 and the dense weights Q8_0. The setup offers no drafter (the engine's --draft is by hand: docs/INKLING2.md). The file pinned by revision, size and sha256: the setup checks them.",
+ "_": "Inkling-2-Mini (thinkingmachines/Inkling-2-Mini, 26B: 24 layers, layers 6..17 run three times) on maya-ik2 (src/ik2, docs/INKLING2.md section 8), an experimental preview: unsloth's UD-Q4_K_XL GGUF at the repo's top - Unsloth's looped layout (general.architecture inkling2: inkling2.num_loops, inkling2.loop.core_start), which maya-ik2 reads; the files in Mainline_Support/ (inkling2_loop, llama.cpp master's) are not offered. Experts of layers 0-19 NVFP4 (their original bits), layers 20-23 and the dense weights Q8_0. The drafter: \"drafter\" below (thinkingmachines' own, drafting auto by default). The file pinned by revision, size and sha256: the setup checks them.",
  "name": "Inkling-2-Mini-UD-Q4_K_XL",
  "repo": "unsloth/Inkling-2-Mini-GGUF",
  "revision": "ae9327c5fbc7333116ba32eee78bb5d2bbefae4f",
@@ -18,6 +18,16 @@
   "folder": "",
   "files": {
    "mmproj-BF16.gguf": [641805760, "2c165c78790e78a3f45a2d1e9e931083e52ee69d45ff2a0dc9c281fdf1a666e7"]
+  }
+ },
+ "drafter": {
+  "_": "Drafting: thinkingmachines' own drafter of Inkling-2-Mini (mtp.safetensors, a DSpark-style draft model, BF16; Apache 2.0) from the model's repo at a pinned revision, read by maya-ik2 --draft; not with --drafting off. With --drafting auto the engine measures once on the PC whether it (or the prompt lookup) makes answers faster, and drafting never changes the answers.",
+  "repo": "thinkingmachines/Inkling-2-Mini",
+  "revision": "ed40e7da625f594fc9c4990f5f66be24873c22d7",
+  "folder": "",
+  "license": "Apache 2.0",
+  "files": {
+   "mtp.safetensors": [635801416, "7c3b651317f01f73bcf4e1dceba66ef8b7e1a1eac6bc171e882e690a4b10a1d2"]
   }
  }
 }

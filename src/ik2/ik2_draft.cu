@@ -154,6 +154,7 @@ struct Drafter {
     int n_rows = 0;
     const int8_t* head_q8 = nullptr;      // the target's head as planar Q8_0 (set_head_q8): the base logits through it
     const uint16_t* head_q8d = nullptr;
+    bool head_tiles = true;               // its product on the tensor cores (q8_tile: sm_80 on), else mv_q8p_cols
     int* shortlist = nullptr;
     float* shortlist_scores = nullptr;
     cublasHandle_t blas;
@@ -273,7 +274,7 @@ void layer_attn(Drafter* d, DLayer& l, int P, float* out) {
     k::rms(d->kk, l.k_norm, T * d->KV, 128, d->eps, d->kk, d->s);
     k::rope_neox(d->q, T, d->H, d->pos, d->theta, d->s);
     k::rope_neox(d->kk, T, d->KV, d->pos, d->theta, d->s);
-    // Local layers (0, 1, 3, 4) match SGLang inkling2_mtp.py's window_anchor_at_start=True with window=1024:
+    // Local layers (0, 1, 3, 4): a window of 1024 positions anchored at the block's start -
     // every query in the block [P .. P+7] sees context [max(0, P - 1023) .. P-1] plus all 8 block tokens.
     const int k_lo = l.local ? std::max(0, P - 1023) : std::max(0, P - l.cap);
     if (l.kc16)
@@ -501,7 +502,9 @@ void propose(Drafter* d, int anchor, const float* anchor_h, int P, const uint16_
     k::rms(d->res, d->norm, T, C, d->eps, d->h, d->s);   // the draft hidden, rows 1 .. 7 used
     // base logits of rows 1 .. 7 through the target's head
     k::to_f16(d->h + C, (size_t) proposals * C, (uint16_t*) d->x16, d->s);
-    if (d->head_q8)
+    if (d->head_q8 && !d->head_tiles)
+        k::mv_q8p_cols(d->head_q8, d->head_q8d, n_rows, C, d->h + C, C, proposals, d->base, n_rows, d->s);
+    else if (d->head_q8)
         k::q8_tile(d->head_q8, d->head_q8d, n_rows, C, (const uint16_t*) d->x16, proposals, d->base, n_rows, d->s);
     else
         gemm_h(d, lm_f16, n_rows, C, d->x16, proposals, d->base, n_rows);
@@ -509,8 +512,8 @@ void propose(Drafter* d, int anchor, const float* anchor_h, int P, const uint16_
     if (d->shortlist)
         draft_shortlist<<<dim3((n_vocab + 127) / 128, proposals), 128, 0, d->s>>>(
             d->base, n_rows, n_vocab, shortlist_n, d->shortlist);
-    // the Markov head, a token at a time (note: k::rnn_gates keeps state/latent in F32 whereas SGLang mtp.py
-    // rounds intermediate gate/tanh ops to BF16; fused argmax_gemv_f16 reads FP16 fold_w/fold_b + F32 base/latent)
+    // the Markov head, a token at a time (note: k::rnn_gates keeps state/latent in F32, its gate/tanh steps not
+    // rounded to BF16 between them; fused argmax_gemv_f16 reads FP16 fold_w/fold_b + F32 base/latent)
     cu(cudaMemsetAsync(d->state, 0, d->R * 4, d->s), "state");
     for (int t = 0; t < proposals; ++t) {
         k::rnn_inputs(d->state, d->w1, d->toks + t, d->h + (size_t) (t + 1) * C, d->f_rnn, d->R, C, d->rnn_in, d->s);
@@ -533,6 +536,12 @@ void propose(Drafter* d, int anchor, const float* anchor_h, int P, const uint16_
 }
 
 size_t bytes(const Drafter* d) { return d->vram; }
-void set_head_q8(Drafter* d, const int8_t* q8, const uint16_t* q8d) { d->head_q8 = q8, d->head_q8d = q8d; }
+void set_head_q8(Drafter* d, const int8_t* q8, const uint16_t* q8d) {
+    d->head_q8 = q8, d->head_q8d = q8d;
+    int dev = 0, major = 0;
+    cu(cudaGetDevice(&dev), "cudaGetDevice");
+    cu(cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev), "cudaDeviceGetAttribute");
+    d->head_tiles = major >= 8;   // (no mma.sync m16n8k16 before Ampere)
+}
 
 }  // namespace ik2::draft

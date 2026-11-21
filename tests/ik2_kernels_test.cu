@@ -2665,12 +2665,198 @@ void test_experts_mma() {
     expect_true("experts_mma_fits", k::experts_mma_fits(ty, ty, ty, 2304, 1152) && !k::experts_mma_fits(ty, k::kQ8_0, ty, 2304, 1152));
 }
 
+// The exact verify window (drafting on = off): each of T tokens' values from the window's kernels the one-token
+// path's to the bit - mv_q8p_cols vs mv_q8p, experts_*_mem vs experts_gate_up_swiglu / experts_down (NVFP4, Q8_0),
+// experts_block_gu / _down vs experts_gate_up_swiglu_mma / experts_down_mma (sm_80 on) - Inkling-2-Mini's sizes.
+void test_window_exact(bool mma) {
+    constexpr int C = 2304, F = 1152, K = 8, E = 24;   // (E 24: a window of 5 picks about 2.6x one token's experts)
+    {   // the dense products: rows of a planar Q8_0 matrix (N not a multiple of the rows a block)
+        const int N = 1029;
+        std::vector<int8_t> q((size_t) N * C);
+        for (auto& v : q) v = (int8_t) (rng() & 0xFF);
+        std::vector<uint16_t> d((size_t) N * (C / 32));
+        for (auto& v : d) v = f2h_host(std::uniform_real_distribution<float>(0.001f, 0.02f)(rng));
+        int8_t* dq = dev(q);
+        float* dx = dev(fvec((size_t) 8 * C, 2.0f));
+        uint16_t* dd = dev(d);
+        auto *y1 = dev_n<float>((size_t) N), *yT = dev_n<float>((size_t) 8 * N);
+        bool same = true;
+        for (int T = 1; T <= 8; ++T) {
+            k::mv_q8p_cols(dq, dd, N, C, dx, C, T, yT, N, 0);
+            const auto got = host(yT, (size_t) T * N);
+            for (int t = 0; t < T; ++t) {
+                k::mv_q8p(dq, dd, N, C, dx + (size_t) t * C, y1, 0);
+                same &= !std::memcmp(host(y1, N).data(), got.data() + (size_t) t * N, (size_t) N * 4);
+            }
+        }
+        expect_true("mv_q8p_cols = mv_q8p for each token, to the bit (T 1 .. 8)", same);
+        if (getenv("IK2_TEST_WINDOW_TIME")) {   // (the window's dense product against T one-token ones: a 2304 x 2304 matrix)
+            const int NB = 2304 * 4;   // (4 such matrices' rows: about a visit's dense bytes)
+            std::vector<int8_t> qb((size_t) NB * C, 3);
+            std::vector<uint16_t> db((size_t) NB * (C / 32), f2h_host(0.01f));
+            int8_t* dqb = dev(qb);
+            uint16_t* ddb = dev(db);
+            float* yb = dev_n<float>((size_t) 8 * NB);
+            cudaEvent_t e0, e1;
+            CU(cudaEventCreate(&e0));
+            CU(cudaEventCreate(&e1));
+            auto timed = [&](auto&& f) {
+                CU(cudaEventRecord(e0));
+                for (int i = 0; i < 20; ++i) f();
+                CU(cudaEventRecord(e1));
+                CU(cudaEventSynchronize(e1));
+                float ms = 0;
+                CU(cudaEventElapsedTime(&ms, e0, e1));
+                return ms;
+            };
+            for (int T : {1, 2, 3, 4, 5, 6, 8}) {
+                float ms_tok = 0, ms_win = 0;
+                for (int rep = 0; rep < 2; ++rep) {
+                    ms_tok = timed([&] {
+                        for (int t = 0; t < T; ++t) k::mv_q8p(dqb, ddb, NB, C, dx + (size_t) t * C, yb + (size_t) t * NB, 0);
+                    });
+                    ms_win = timed([&] { k::mv_q8p_cols(dqb, ddb, NB, C, dx, C, T, yb, NB, 0); });
+                }
+                std::printf("  time: dense %d x %d, %d tokens: one-token %.3f ms, window %.3f ms (%.2fx one token's)\n",
+                            NB, C, T, ms_tok / 20, ms_win / 20, ms_win / (ms_tok / T));
+            }
+            for (void* p : {(void*) dqb, (void*) ddb, (void*) yb}) CU(cudaFree(p));
+        }
+    }
+    for (const int ty : {k::kNVFP4, k::kQ8_0}) {   // the experts: a window of T tokens' picks grouped by expert
+        const size_t mb = (size_t) C * F / k::block_values(ty) * k::block_bytes(ty);
+        auto pool = rand_blocks(ty, (size_t) E * 3 * C * F);
+        auto* dpool = dev(pool);
+        std::vector<const uint8_t*> tab;
+        for (int e = 0; e < E; ++e) tab.push_back(dpool + 3 * e * mb);
+        auto** dtab = dev(tab);
+        auto sgt = fvec(E), sut = fvec(E);
+        for (auto& v : sgt) v = 0.5f + std::fabs(v);
+        for (auto& v : sut) v = 0.5f + std::fabs(v);
+        auto *dsg_t = dev(sgt), *dsu_t = dev(sut);
+        for (int T : {2, 5, 8}) {
+            const int S = T * K;
+            std::vector<int> top(S);
+            std::vector<float> w(S, 0.125f);
+            for (int t = 0; t < T; ++t) {   // (K distinct experts a token, out of E: groups of 1 .. T members)
+                std::vector<int> e(E);
+                for (int i = 0; i < E; ++i) e[i] = i;
+                std::shuffle(e.begin(), e.end(), rng);
+                std::sort(e.begin(), e.begin() + K);
+                for (int j = 0; j < K; ++j) top[t * K + j] = e[j];
+            }
+            const auto xv = fvec((size_t) T * C, 2.0f);
+            int* dtop = dev(top);
+            float* dx = dev(xv);
+            float* dw = dev(w);
+            const uint8_t** gblob = dev_n<const uint8_t*>(S);
+            int *gn = dev_n<int>(S), *gtok = dev_n<int>((size_t) S * k::kGroupMax), *grow = dev_n<int>((size_t) S * k::kGroupMax);
+            int* ginv = dev_n<int>(S);
+            float *gsg = dev_n<float>(S), *gsu = dev_n<float>(S), *gwt = dev_n<float>(S);
+            k::group_route(dtop, dw, S, K, dtab, dsg_t, dsu_t, nullptr, gblob, gn, gtok, grow, gsg, gsu, gwt, ginv, 0);
+            auto* h_win = dev_n<uint16_t>((size_t) S * F);
+            auto* y_win = dev_n<float>((size_t) S * C);
+            auto* limbs = dev_n<uint16_t>((size_t) T * 2 * C);
+            const bool tc = mma && ty == k::kNVFP4;
+            if (tc) {
+                k::f16_limbs_rows(dx, T, C, limbs, 0);
+                k::experts_block_gu(gblob, gn, gtok, grow, S, T, mb, C, F, limbs, gsg, gsu, 20, 20, h_win, 0);
+                k::experts_block_down(gblob, gn, grow, S, 2 * mb, C, F, h_win, y_win, 0);
+            } else {
+                k::experts_gate_up_swiglu_mem(gblob, gn, gtok, grow, S, ty, ty, mb, dx, C, F, gsg, gsu, 20, 20, h_win, 0);
+                k::experts_down_mem(gblob, gn, grow, S, ty, 2 * mb, h_win, C, F, y_win, 0);
+            }
+            const auto hw = host(h_win, (size_t) S * F);
+            const auto yw = host(y_win, (size_t) S * C);
+            bool h_same = true, y_same = true;
+            auto* h1 = dev_n<uint16_t>((size_t) K * F);
+            auto* y1 = dev_n<float>((size_t) K * C);
+            auto* tok0 = dev(std::vector<int>(K, 0));
+            std::vector<const uint8_t**> dbls(T);
+            std::vector<float*> dsgs(T), dsus(T);
+            for (int t = 0; t < T; ++t) {   // (each token as the one-token path runs it: its K slots in pick order)
+                std::vector<const uint8_t*> bl(K);
+                std::vector<float> sg(K), su(K);
+                for (int j = 0; j < K; ++j) bl[j] = tab[top[t * K + j]], sg[j] = sgt[top[t * K + j]], su[j] = sut[top[t * K + j]];
+                dbls[t] = dev(bl), dsgs[t] = dev(sg), dsus[t] = dev(su);
+            }
+            auto one_token = [&](int t) {
+                if (tc) {
+                    k::to_f16_limbs(dx + (size_t) t * C, C, limbs, 0);
+                    k::experts_gate_up_swiglu_mma(dbls[t], K, mb, limbs, C, F, dsgs[t], dsus[t], 20, 20, h1, 0);
+                    k::experts_down_mma(dbls[t], K, 2 * mb, h1, C, F, y1, 0);
+                } else {
+                    k::experts_gate_up_swiglu(dbls[t], tok0, K, ty, ty, mb, dx + (size_t) t * C, C, F, dsgs[t], dsus[t],
+                                              20, 20, h1, 0);
+                    k::experts_down(dbls[t], K, ty, 2 * mb, h1, C, F, y1, 0);
+                }
+            };
+            for (int t = 0; t < T; ++t) {
+                one_token(t);
+                h_same &= !std::memcmp(host(h1, (size_t) K * F).data(), hw.data() + (size_t) t * K * F, (size_t) K * F * 2);
+                y_same &= !std::memcmp(host(y1, (size_t) K * C).data(), yw.data() + (size_t) t * K * C, (size_t) K * C * 4);
+            }
+            if (getenv("IK2_TEST_WINDOW_TIME")) {   // (T tokens' experts one token at a time against the window's)
+                cudaEvent_t e0, e1;
+                CU(cudaEventCreate(&e0));
+                CU(cudaEventCreate(&e1));
+                float ms[2] = {0, 0};
+                for (int rep = 0; rep < 2; ++rep)
+                    for (int way = 0; way < 2; ++way) {
+                        CU(cudaEventRecord(e0));
+                        for (int i = 0; i < 10; ++i) {
+                            if (way == 0) {
+                                for (int t = 0; t < T; ++t) one_token(t);
+                            } else if (tc) {
+                                k::f16_limbs_rows(dx, T, C, limbs, 0);
+                                k::experts_block_gu(gblob, gn, gtok, grow, S, T, mb, C, F, limbs, gsg, gsu, 20, 20, h_win, 0);
+                                k::experts_block_down(gblob, gn, grow, S, 2 * mb, C, F, h_win, y_win, 0);
+                            } else {
+                                k::experts_gate_up_swiglu_mem(gblob, gn, gtok, grow, S, ty, ty, mb, dx, C, F, gsg, gsu, 20,
+                                                              20, h_win, 0);
+                                k::experts_down_mem(gblob, gn, grow, S, ty, 2 * mb, h_win, C, F, y_win, 0);
+                            }
+                        }
+                        CU(cudaEventRecord(e1));
+                        CU(cudaEventSynchronize(e1));
+                        CU(cudaEventElapsedTime(&ms[way], e0, e1));
+                    }
+                int groups = 0;
+                {
+                    std::vector<int> u(top);
+                    std::sort(u.begin(), u.end());
+                    groups = (int) (std::unique(u.begin(), u.end()) - u.begin());
+                }
+                std::printf("  time: experts %s %s, %d tokens (%d experts of %d picks): one-token %.3f ms, window %.3f ms "
+                            "(%.2fx one token's)\n", ty == k::kNVFP4 ? "NVFP4" : "Q8_0", tc ? "tensor cores" : "row dots", T,
+                            groups, S, ms[0] / 10, ms[1] / 10, ms[1] / (ms[0] / T));
+            }
+            for (int t = 0; t < T; ++t)
+                for (void* p : {(void*) dbls[t], (void*) dsgs[t], (void*) dsus[t]}) CU(cudaFree(p));
+            char name[160];
+            std::snprintf(name, sizeof name, "window experts %s (%s), %d tokens: h and y the one-token path's to the bit",
+                          ty == k::kNVFP4 ? "NVFP4" : "Q8_0", tc ? "tensor cores" : "row dots", T);
+            expect_true(name, h_same && y_same);
+            for (void* p : {(void*) dtop, (void*) dx, (void*) dw, (void*) gblob, (void*) gn, (void*) gtok, (void*) grow,
+                            (void*) ginv, (void*) gsg, (void*) gsu, (void*) gwt, (void*) h_win, (void*) y_win,
+                            (void*) limbs, (void*) h1, (void*) y1, (void*) tok0})
+                CU(cudaFree(p));
+        }
+        for (void* p : {(void*) dpool, (void*) dtab, (void*) dsg_t, (void*) dsu_t}) CU(cudaFree(p));
+    }
+}
+
 int main() {
     int dev_count = 0;
     CU(cudaGetDeviceCount(&dev_count));
     cudaDeviceProp p{};
     CU(cudaGetDeviceProperties(&p, 0));
     std::printf("ik2_kernels_test on %s (sm_%d%d)\n", p.name, p.major, p.minor);
+    if (getenv("IK2_TEST_WINDOW_ONLY")) {   // (the exact window's checks alone: a GPU without the tensor-core kernels)
+        test_window_exact(p.major >= 8);
+        std::printf(g_fail ? "FAILED: %d check(s)\n" : "all passed\n", g_fail);
+        return g_fail ? 1 : 0;
+    }
     test_rms();
     test_l2clip();
     test_conv();
@@ -2699,6 +2885,7 @@ int main() {
 #ifdef STRATA_USE_HIP
     test_experts_rdna();
 #endif
+    test_window_exact(p.major >= 8);
     std::printf(g_fail ? "FAILED: %d check(s)\n" : "all passed\n", g_fail);
     return g_fail ? 1 : 0;
 }

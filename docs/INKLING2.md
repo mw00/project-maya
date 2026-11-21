@@ -20,7 +20,7 @@ yet):
 | MoE | 384 experts, 8 a token, no shared expert, width 2,304; sigmoid router with a selection bias, the weights normalized x 8; SwiGLU with softcaps (gate 4, up 25) |
 | Head | logits softcapped at 30, the first 200,058 of 201,024 rows real |
 | Weights shipped | experts NVFP4 (layers 0-39: e2m1 x e4m3 per 16 x amax / 2688 per expert) and MXFP8 (40-47); the rest BF16 |
-| Extras | a DSpark-style drafter (`mtp.safetensors`, 5 layers); a vision tower |
+| Extras | a DSpark-style drafter (`mtp.safetensors`, 5 layers: drafting, set up by default); a vision tower |
 
 ## 2. The file: llama.cpp's `inkling2` GGUF
 
@@ -290,16 +290,37 @@ CPU) and ends after the request's pictures, so it keeps no VRAM. The server send
 (`GENI`), the engine puts them in place of the image tokens (`--image-token`, 200054) without the embedding's norm.
 640 x 448 is 192 tokens and 22 ms.
 
-**The drafter** (`--draft mtp.safetensors`, the official DSpark checkpoint: 3 layers; its taps the stream at
+**The drafter** (`--draft mtp.safetensors`, the official DSpark checkpoint: 5 layers; its taps the stream at
 visits 5, 23 and 41 and the final hidden, `mtp_config.target_layer_ids`) drafts after the last chosen token, and the
 model checks the window - the anchor and the drafts - in one go on the **block path** (`fast_block`): the resident
 token path for 2 .. 8 tokens, every position read from the device, the picks grouped by expert on the device (an
 expert's blocks read once for the tokens that picked it: 5 tokens need 2.7 times one token's experts, not 5), the
-attention a key's rows read once for the window's queries, the convs' histories and inputs recorded and taken back
-in one launch for the rejected tokens - one CUDA graph a window size. A window of 5 costs 15.6 ms against a token's
-7.8. Greedy keeps the agreeing drafts and the model's next token; sampling accepts a draft with the model's
+convs' histories and inputs recorded and taken back in one launch for the rejected tokens - one CUDA graph a window
+size. Greedy keeps the agreeing drafts and the model's next token; sampling accepts a draft with the model's
 probability of it and otherwise samples the model's distribution without it, which is the model's distribution
 exactly.
+
+**Drafting on = drafting off.** The window gives every token the one-token path's values to the bit (the **exact
+window**, the default): its dense products are `mv_q8p`'s sums for each token with the weights read once
+(`k::mv_q8p_cols`), its attention the token's own kernels a token at a time, its experts the token kernels' sums (the
+tensor cores' NVFP4 blocks with the same warp split and order; the row dots - the Q8_0 layers, and every layer
+where the tensor-core kernels are off - a member at a time, an expert read once for its tokens). So greedy answers
+are the same with drafting and without it, and sampled ones follow the same distribution. `IK2_WINDOW_CHECK=n`
+compares the first n windows with the one-token path row for row. `IK2_BLOCK_EXACT=0` takes the tensor cores' FP16
+tiles and the window's own attention instead (a few 1e-5 off: greedy answers then differ with drafting on; the
+contributor's figures below were measured that way).
+
+**The prompt lookup** (`src/spec/suffix_drafter`) drafts the tokens that followed the latest earlier copy of the
+text's end - edits, quoted code, repeated lines - with no weights; the same window checks them. `--drafting`: **auto**
+(the setup's default) measures once on the PC, before the first answer, which of no drafting, the prompt lookup, the
+drafter and both answers fastest (a chat, a code and a tool-call request, `IK2_DRAFT_IDS`), and keeps it in
+`data/ik2-drafting.txt` (per GPU, driver, model files, context and cache; `maya --speed-calibration` measures again);
+**on** drafts with the drafter and the prompt lookup, the controller choosing each step; **off** loads neither. A
+request's `spec=1` asks for no drafting. The drafter takes room only where the start plan stays as it is without it
+(every expert in VRAM, the same context and cache, and not the free VRAM the pictures' encoder would start in on the
+GPU - `IK2_VISION_GIB`, the server's), else it is left out with a NOTE: on a 24 GB card that is above about 200K tokens of
+context with the FP8 cache (`tools/ik2_fit.py` `draft_gib`: 0.88 GiB + 4.75 KiB a token). The Monitor's Speculation
+shows the drafts kept (STAT `draft_acc` / `draft_off`, `draft_ms`, `verify_ms`).
 
 Whether a window pays depends on the text: the drafts are taken 1.8 tokens a step in prose, 3 in new code, 4.3 in a
 document's edit. A controller decides each step (`SpecCtl`): a window of B's expected tokens, (1 - a^B) / (1 - a)
@@ -352,7 +373,7 @@ Thinking is the template's `reasoning_effort`, a name or a number in [0.0, 0.99]
 |---|---|---|
 | `Inkling-2-Mini-UD-Q4_K_XL.gguf` (17.6 GB) | [unsloth/Inkling-2-Mini-GGUF](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF) | `e62d463c135ffe283df8d94b279a96ca145ac128b52ce854478613045bf4de15` |
 | `mmproj-BF16.gguf` (0.6 GB, pictures) | same | `2c165c78790e78a3f45a2d1e9e931083e52ee69d45ff2a0dc9c281fdf1a666e7` |
-| `mtp.safetensors` (0.6 GB, the drafter: optional) | [thinkingmachines/Inkling-2-Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini) | `7c3b651317f01f73bcf4e1dceba66ef8b7e1a1eac6bc171e882e690a4b10a1d2` |
+| `mtp.safetensors` (0.6 GB, the drafter: the setup fetches it, not with `--drafting off`) | [thinkingmachines/Inkling-2-Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini) | `7c3b651317f01f73bcf4e1dceba66ef8b7e1a1eac6bc171e882e690a4b10a1d2` |
 
 Outside the preview, two GPUs with a loop run as expert parallel (`IK2_EP=1`, its caches filled at the start:
 checked on Windows, an RTX 5080 with an RTX 4060 Ti); the drafter is one GPU's.  Not done: the loop in the layer-major prompt passes (`IK2_SUP`: off

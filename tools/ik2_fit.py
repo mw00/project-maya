@@ -6,8 +6,8 @@ falls back to its cache path - every answer slower - where they do not; it measu
 is worked out here is only which context to write into the config so that the resident path is the one taken: the
 engine's own figures (docs/INKLING2.md 8, an RTX 3090 measured) - 22.3 GiB at a 262,144 context with an FP8 cache, of
 which the cache is 16 KiB a token (the 8 visits of the layers without a window), so 18.3 GiB beside the cache.  Every
-figure scales with the card's own VRAM: nothing here is one PC's constant but the model's sizes.  (The setup offers no
-drafter: the engine's --draft is by hand, docs/INKLING2.md.)"""
+figure scales with the card's own VRAM: nothing here is one PC's constant but the model's sizes.  The drafter
+(draft_gib) takes room only where the plan stays as it is without it: the engine checks at its start."""
 from __future__ import annotations
 
 GIB = 1 << 30
@@ -34,6 +34,25 @@ def plan(vram_gb: float, ctx: int, kv: str = DEFAULT_KV) -> dict:
         return {"resident": True, "need_gib": None}
     need = need_gib(ctx, kv)
     return {"resident": float(vram_gb) - MARGIN_GIB >= need, "need_gib": need}
+
+
+DRAFT_BASE_GIB = 0.88                               # the drafter (mtp.safetensors 0.59 GiB, its fold through the head,
+DRAFT_TOKEN_BYTES = 4864                            # its rings, the taps): maya-ik2's draft_room; its layer without a
+                                                    # window's context 4 KiB a token + its scratch's 768 B
+
+
+def draft_gib(ctx: int) -> float:
+    """GiB the drafter takes beside the model at `ctx` (maya-ik2's draft_room: it sees the whole context)."""
+    return DRAFT_BASE_GIB + ctx * DRAFT_TOKEN_BYTES / GIB
+
+
+def draft_fits(vram_gb: float, ctx: int, kv: str = DEFAULT_KV) -> bool:
+    """Whether the drafter's room fits beside the model at `ctx` on this card with every expert in VRAM - where it
+    does not, the engine leaves it out at its start (the plan stays as without it; the prompt lookup still drafts).
+    A card whose VRAM is not known: True (the engine measures)."""
+    if not vram_gb:
+        return True
+    return plan(vram_gb, ctx, kv)["resident"] and float(vram_gb) - MARGIN_GIB >= need_gib(ctx, kv) + draft_gib(ctx)
 
 
 def recommended_context(vram_gb: float, kv: str = DEFAULT_KV) -> int:

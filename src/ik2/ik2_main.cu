@@ -25,6 +25,7 @@
 #include "ik2_draft.hpp"
 #include "ik2_kernels.cuh"
 #include "strata/artifact/gguf_reader.hpp"
+#include "strata/spec/suffix_drafter.hpp"
 #ifdef STRATA_USE_HIP
 #include "ds4_lt.hpp"   // (AMD: the prompt's FP16 GEMMs on hipBLASLt, the kernel a shape measured and kept)
 #endif
@@ -72,6 +73,7 @@ static inline int munmap(void*, size_t) { return 0; }
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <map>
 #include <memory>
 #include <string>
@@ -2368,6 +2370,20 @@ void tile_rows(const Mat& m, int r0, int n, const uint16_t* x16, int T, float* y
     if (!m.q8) die("the block path: a dense matrix that is not planar Q8_0");
     k::q8_tile(m.q8 + (size_t) r0 * m.K, m.q8d + (size_t) r0 * (m.K >> 5), n, m.K, x16, T, y, ldy, g_s);
 }
+// The exact window (g_block_exact, the default; IK2_BLOCK_EXACT=0: the tensor cores' tiles and the window's own
+// attention - a few 1e-5 off the one-token path, so that drafting changes greedy answers): every token's values the
+// one-token path's to the bit - its products with mv1's sums (the weights read once), its attention through the
+// token's own kernels, its experts' rows with the token kernels' sums (an expert read once for its tokens).
+bool g_block_exact = true;
+// rows [r0, r0 + n) of a dense matrix times x [T][K] (F32, rows x_ld apart): y [T][ldy], each token's mv1's
+void exact_rows(const Mat& m, int r0, int n, const float* x, int x_ld, int T, float* y, int ldy) {
+    if (m.q8) {
+        k::mv_q8p_cols(m.q8 + (size_t) r0 * m.K, m.q8d + (size_t) r0 * (m.K >> 5), n, m.K, x, x_ld, T, y, ldy, g_s);
+        return;
+    }
+    const Mat part = mat_rows(m, r0, n);   // (not planar Q8_0: mv1 a token at a time)
+    for (int t = 0; t < T; ++t) mv1(part, x + (size_t) t * x_ld, y + (size_t) t * ldy);
+}
 
 void fast_block_launches(Model& M, Work& W, int T, OutMode out_mode) {
     const Config& c = M.c;
@@ -2437,10 +2453,18 @@ void fast_block_launches(Model& M, Work& W, int T, OutMode out_mode) {
         // the projections (the tensor cores), the k and v short convs (their histories and inputs recorded)
         float *q_p, *r_p, *gate_p;
         int q_ld, r_ld, gate_ld;
+        const bool ex = g_block_exact;
         if (Ly.sliding) {
             const Mat& m = Ly.wqkvrg;   // q | k | v | r | gate
             const int N = m.N;
-            if (!sep) {
+            if (ex && !sep) {
+                exact_rows(m, 0, N, W.xq, C, T, W.qkv, N);
+            } else if (ex) {   // (q, k and v each with its input, as mv_q8p_conv's alternative inputs)
+                exact_rows(m, 0, HD, W.xq, C, T, W.qkv, N);
+                exact_rows(m, HD, KD, W.xk, C, T, W.qkv + HD, N);
+                exact_rows(m, HD + KD, KD, W.xv, C, T, W.qkv + HD + KD, N);
+                exact_rows(m, HD + 2 * KD, N - HD - 2 * KD, W.xq, C, T, W.qkv + HD + 2 * KD, N);
+            } else if (!sep) {
                 tile_rows(m, 0, N, W.x16, T, W.qkv, N);
             } else {
                 tile_rows(m, 0, HD, W.x16, T, W.qkv, N);
@@ -2457,15 +2481,21 @@ void fast_block_launches(Model& M, Work& W, int T, OutMode out_mode) {
         } else {
             const Mat& m = Ly.wqrg;     // q | r | gate
             const int N = m.N;
-            tile_rows(m, 0, N, W.x16, T, W.qkv, N);
+            if (ex) exact_rows(m, 0, N, W.xq, C, T, W.qkv, N);
+            else tile_rows(m, 0, N, W.x16, T, W.qkv, N);
             q_p = W.qkv, r_p = W.qkv + HD, gate_p = r_p + HR;
             q_ld = r_ld = gate_ld = N;
             const int DL = c.KV * 4;
             float *kd = W.dyn, *vd = W.dyn + (size_t) T * DL;
             k::mv_f16_rows(Ly.sc_k_dyn16, DL, C, W.xk, C, T, kd, DL, g_s);
             k::mv_f16_rows(Ly.sc_v_dyn16, DL, C, W.xv, C, T, vd, DL, g_s);
-            tile_rows(Ly.wk, 0, KD, W.xk16, T, W.kk, KD);
-            tile_rows(Ly.wv, 0, KD, W.xv16, T, W.vv, KD);
+            if (ex) {
+                exact_rows(Ly.wk, 0, KD, W.xk, C, T, W.kk, KD);
+                exact_rows(Ly.wv, 0, KD, W.xv, C, T, W.vv, KD);
+            } else {
+                tile_rows(Ly.wk, 0, KD, W.xk16, T, W.kk, KD);
+                tile_rows(Ly.wv, 0, KD, W.xv16, T, W.vv, KD);
+            }
             k::conv_block(W.kk, KD, Ly.h_k, Ly.sc_k, kd, DL, c.KV, T, KD, nullptr, 0, W.kconv, KD, Ly.rec_old[0],
                           Ly.rec_x[0], g_s);
             k::conv_block(W.vv, KD, Ly.h_v, Ly.sc_v, vd, DL, c.KV, T, KD, nullptr, 0, W.vconv, KD, Ly.rec_old[1],
@@ -2477,7 +2507,44 @@ void fast_block_launches(Model& M, Work& W, int T, OutMode out_mode) {
         const int ring = Ly.sliding ? Ly.kv_cap : 0;
         const int ns = Ly.sliding ? std::min(g_mma_split, std::max(1, (c.window + 63) / 64)) : g_mma_split;
         uint16_t* q16 = W.x16;
-        if (g_kv_fp8) {
+        if (ex) {   // (each token through fast_token_launches' own clips and attention, its position from W.pos + t)
+            const bool mma = g_attn_mma == 1 || (g_attn_mma == 2 && !Ly.sliding);
+            const int P = Ly.sliding ? std::min(128, std::max(1, (c.window + 63) / 64)) : 128;
+            for (int t = 0; t < T; ++t) {
+                float *qt = q_p + (size_t) t * q_ld, *rt = r_p + (size_t) t * r_ld, *ot = W.o + (size_t) t * HD;
+                const float* gt = gate_p + (size_t) t * gate_ld;
+                const int* pt = W.pos + t;
+                uint16_t* q16t = mma ? W.x16 + (size_t) t * HD : nullptr;
+                float* sk = W.sink + (size_t) t * c.H;
+                if (g_kv_fp8) {
+                    k::prep_qkv_r_fp8_at(qt, Ly.q_clip, W.kconv + (size_t) t * KD, Ly.kc8, W.vconv + (size_t) t * KD,
+                                         Ly.vc8, rt, Ly.r_clip, c.H, c.KV, c.D, c.d_rel, c.qk_clip, c.rel_clip, c.eps,
+                                         pt, !Ly.sliding, c.alpha, c.n_floor, Ly.kv_cap, k_scale, v_scale, q16t, g_s,
+                                         Ly.sink16, W.xq + (size_t) t * C, C, sk);
+                    if (mma)
+                        k::attn_decode_mma_fp8(q16t, rt, sk, Ly.kc8, Ly.vc8, ring, c.H, c.KV, pt, 0, ns,
+                                               qk_scale / k_scale, 1.0f / v_scale, Ly.rel_proj, c.d_rel, extent, window,
+                                               W.lg, ot, gt, W.x16 + (size_t) t * HD, g_s);
+                    else
+                        k::attn_decode_fp8_at(qt, rt, sk, Ly.kc8, Ly.vc8, Ly.sliding ? Ly.kv_cap : 0, c.H, c.KV, pt, P,
+                                              qk_scale / k_scale, 1.0f / v_scale, Ly.rel_proj, c.d_rel, extent, window,
+                                              W.lg, ot, g_s);
+                } else {
+                    k::prep_qkv_r_f16_at(qt, Ly.q_clip, W.kconv + (size_t) t * KD, Ly.kc, W.vconv + (size_t) t * KD,
+                                         Ly.vc, rt, Ly.r_clip, c.H, c.KV, c.D, c.d_rel, c.qk_clip, c.rel_clip, c.eps, pt,
+                                         !Ly.sliding, c.alpha, c.n_floor, Ly.kv_cap, q16t, g_s, Ly.sink16,
+                                         W.xq + (size_t) t * C, C, sk);
+                    if (mma)
+                        k::attn_decode_mma_f16(q16t, rt, sk, Ly.kc, Ly.vc, ring, c.H, c.KV, pt, 0, ns, qk_scale,
+                                               Ly.rel_proj, c.d_rel, extent, window, W.lg, ot, gt,
+                                               W.x16 + (size_t) t * HD, g_s);
+                    else
+                        k::attn_decode_f16_at(qt, rt, sk, Ly.kc, Ly.vc, Ly.sliding ? Ly.kv_cap : 0, c.H, c.KV, pt, P,
+                                              qk_scale, Ly.rel_proj, c.d_rel, extent, window, W.lg, ot, g_s);
+                }
+                if (!mma) k::gate_mul_f16(ot, gt, (size_t) HD, W.x16 + (size_t) t * HD, true, g_s);
+            }
+        } else if (g_kv_fp8) {
             k::prep_qkv_r_fp8_block(q_p, q_ld, Ly.q_clip, W.kconv, Ly.kc8, W.vconv, Ly.vc8, r_p, r_ld, Ly.r_clip, T, c.H,
                                     c.KV, c.D, c.d_rel, c.qk_clip, c.rel_clip, c.eps, W.pos, !Ly.sliding, c.alpha,
                                     c.n_floor, Ly.kv_cap, k_scale, v_scale, q16, g_s, Ly.sink16, W.xq, C, W.sink);
@@ -2494,7 +2561,8 @@ void fast_block_launches(Model& M, Work& W, int T, OutMode out_mode) {
         // the output projection and its short conv (the stream added, but where a block starts)
         const bool first = l % c.block == 0;
         if (first) CU(cudaMemcpyAsync(blk(nb), W.h, TCb, cudaMemcpyDeviceToDevice, g_s));
-        tile_rows(Ly.wo, 0, C, W.x16, T, W.tmp, C);
+        if (ex) exact_rows(Ly.wo, 0, C, W.o, HD, T, W.tmp, C);
+        else tile_rows(Ly.wo, 0, C, W.x16, T, W.tmp, C);
         k::conv_block(W.tmp, C, Ly.h_attn, Ly.sc_attn, nullptr, 0, 0, T, C, first ? nullptr : W.h, C, W.r, C,
                       Ly.rec_old[2], Ly.rec_x[2], g_s);
         if (first) ++nb;
@@ -2520,7 +2588,14 @@ void fast_block_launches(Model& M, Work& W, int T, OutMode out_mode) {
         k::route_rows(W.rlog, Ly.probs_b, T, c.E, c.K, c.route_scale, rtop, rw, g_s);
         k::group_route(rtop, rw, S, c.K, Ly.tab_blob, Ly.tab_sc[0], Ly.tab_sc[1], Ly.tab_sc[2], g_blk.blob, g_blk.n,
                        g_blk.tok, g_blk.row, g_blk.sg, g_blk.su, g_blk.wt, g_blk.inv, g_s);
-        if (k::experts_mma_fits(Ly.ty[0], Ly.ty[1], Ly.ty[2], C, c.F)) {
+        // (exact: the token path's choice - NVFP4 on the tensor cores unless IK2_EXPERT_MMA=0, else the row dots)
+        static const int exp_mma = getenv("IK2_EXPERT_MMA") ? atoi(getenv("IK2_EXPERT_MMA")) : 1;
+        if (ex && !(exp_mma && k::experts_mma_fits(Ly.ty[0], Ly.ty[1], Ly.ty[2], C, c.F))) {
+            k::experts_gate_up_swiglu_mem(g_blk.blob, g_blk.n, g_blk.tok, g_blk.row, S, Ly.ty[0], Ly.ty[1], Ly.eb[0],
+                                          W.xq, C, c.F, g_blk.sg, g_blk.su, c.gate_cap, c.up_cap, W.h16, g_s);
+            k::experts_down_mem(g_blk.blob, g_blk.n, g_blk.row, S, Ly.ty[2], Ly.eb[0] + Ly.eb[1], W.h16, C, c.F, W.y32,
+                                g_s);
+        } else if (k::experts_mma_fits(Ly.ty[0], Ly.ty[1], Ly.ty[2], C, c.F)) {
             uint16_t* limbs = (uint16_t*) W.gu32;
             k::f16_limbs_rows(W.xq, T, C, limbs, g_s);
             k::experts_block_gu(g_blk.blob, g_blk.n, g_blk.tok, g_blk.row, S, T, Ly.eb[0], C, c.F, limbs, g_blk.sg,
@@ -2552,7 +2627,8 @@ void fast_block_launches(Model& M, Work& W, int T, OutMode out_mode) {
         k::attn_res_rms_f16(st, nb + 1, M.out_res_score, 1, T, C, 1e-6f, c.eps, outs, g_s);
         if (g_taps)
             CU(cudaMemcpyAsync(g_taps + (size_t) g_final_tap * g_taps_ld * C, W.xq, TCb, cudaMemcpyDeviceToDevice, g_s));
-        tile_rows(M.out_w, 0, c.n_rows, W.x16, T, W.logits, c.n_rows);
+        if (g_block_exact) exact_rows(M.out_w, 0, c.n_rows, W.xq, C, T, W.logits, c.n_rows);
+        else tile_rows(M.out_w, 0, c.n_rows, W.x16, T, W.logits, c.n_rows);
         if (out_mode == OutMode::kArgmax) {
             k::argmax_rows(W.logits, c.n_rows, T, c.n_vocab, W.argmax_d, g_s);
             CU(cudaMemcpyAsync(W.argmax_h, W.argmax_d, (size_t) T * 4, cudaMemcpyDeviceToHost, g_s));
@@ -2713,25 +2789,122 @@ struct SpecCtl {
         ++steps, drafted += B - 1, accepted += acc, ++hist[acc];
         plain_run = 0;
     }
+    // The prompt lookup's drafts (the tokens after the latest earlier copy of the text's end, k of them): their own
+    // acceptance (copied text is kept long or not at all), the same window costs.  pick: a step's source and width
+    // - 0 a plain token, 1 the drafter's B - 1 drafts, 2 the lookup's - the most tokens a second expected.
+    double SL = 2, FL = 1;
+    uint64_t l_steps = 0, l_drafted = 0, l_accepted = 0;
+    bool use_model = true, use_lookup = true;   // (the sources this start runs: --drafting's choice)
+    int pick(int room, int k, int& B) {
+        const int bmax = std::min(wmax, room);
+        B = 1;
+        if (bmax < 2) return 0;
+        int src = 0;
+        double vb = 1.0 / c_plain;
+        if (use_lookup && k > 0) {
+            const double a = std::min(0.98, (SL + 0.5) / (SL + FL + 1.0));
+            for (int b = 2; b <= std::min(bmax, k + 1); ++b) {
+                const double e = (1.0 - std::pow(a, b)) / (1.0 - a), v = e / c[b];
+                if (v > vb) vb = v, B = b, src = 2;
+            }
+        }
+        if (use_model) {
+            const int bm = choose(room);
+            if (bm >= 2) {
+                const double a = std::min(0.98, (S + 0.5) / (S + F + 1.0));
+                const double v = (1.0 - std::pow(a, bm)) / (1.0 - a) / c[bm];
+                if (src == 0 || v > vb || plain_run >= probe) vb = v, B = bm, src = 1;
+            }
+        }
+        return src;
+    }
+    void took_lookup(int B, int acc, double t) {
+        c[B] = 0.8 * c[B] + 0.2 * t;
+        SL = decay * SL + acc, FL = decay * FL + (acc < B - 1 ? 1 : 0);
+        ++l_steps, l_drafted += B - 1, l_accepted += acc;
+        plain_run = 0;
+    }
+    uint64_t offered() const { return drafted + l_drafted; }
+    uint64_t kept() const { return accepted + l_accepted; }
 };
+
+bool g_lookup = false;   // the prompt lookup (src/spec/suffix_drafter): drafts copied from the text so far
+
+// VRAM drafting takes beside the model (the plan's check that it changes nothing): the window's records (every
+// visit's four convs, for rollback_block) and buffers, whichever drafts; with the drafter (path) its weights (the
+// file's BF16), its fold through the head (FP16 [256][n_rows] and a bias), its layer without a window's context
+// (FP16 K and V, 8 heads of 128: 4 KiB a position) and its attention's scratch (24 heads: 768 B a position), the 4
+// windowed layers' rings (F32, 2048 positions) and the target's taps (4 rows of a chunk, F32).  (The head's FP16 copy
+// its fold is made from is gone again before the work buffers take the plan's reserve.)  tools/ik2_fit.py's
+// draft_gib has the same figures.
+size_t draft_room(const std::string& path, int ctx, int chunk, const Config& c, int n_rows) {
+    const size_t C = c.C, KD = (size_t) c.KV * c.D;
+    size_t b = (size_t) c.n_visit * (2 * KD + 2 * C) * (3 + 8) * 4 + ((size_t) 16 << 20);
+    if (path.empty()) return b;
+    std::ifstream f(path, std::ios::binary | std::ios::ate);
+    const size_t file = f ? (size_t) f.tellg() : ((size_t) 640 << 20);
+    b += file + (size_t) n_rows * 258 * 2 + (size_t) ctx * (4096 + 768) + (size_t) 4 * 2048 * 8 * 128 * 8 +
+         (size_t) 4 * std::max(chunk, 8) * C * 4 + ((size_t) 32 << 20);
+    return b;
+}
+
+// a sampled step's pick at a drafted position: the draft with the target's probability of it, else the target's
+// distribution without it - the target's own distribution, whatever drafted (speculative sampling with a point-mass
+// draft).  accepted: the draft was kept.
+int spec_pick(const std::vector<std::pair<int, double>>& dist, int draft, std::mt19937_64& rng, bool& accepted) {
+    double pd = 0;
+    for (const auto& e : dist)
+        if (e.first == draft) pd = e.second;
+    accepted = std::uniform_real_distribution<double>(0, 1)(rng) < pd;
+    return accepted ? draft : sample_from(dist, rng, draft);
+}
+
+int g_window_check = 0;                       // IK2_WINDOW_CHECK: windows still to check against fast_token
+uint64_t g_window_rows = 0, g_window_same = 0;   // (rows checked, rows the same to the bit)
 
 // One speculative step: the anchor (the last chosen token, not run yet) at position P, B - 1 drafts after it, the B
 // verified as one window.  next: the tokens chosen after the anchor - the accepted drafts and the target's own next
 // token (the last: not run yet, the next step's anchor), cut after a stop token.  The anchor and next but its last
 // are then in the cache, the convs' histories taken back to them and the drafter's context written for them.
+// given: the B - 1 drafts from elsewhere (the prompt lookup's), else the drafter's.  t_draft: the drafter's seconds.
 void spec_step(Model& M, ik2::draft::Drafter* drafter, int anchor, int P, int B, const SampleCfg& sc,
-               const std::vector<int>& stops, std::vector<int>& next) {
+               const std::vector<int>& stops, std::vector<int>& next, const int* given = nullptr,
+               double* t_draft = nullptr) {
     const Config& c = M.c;
-    static float *raw = nullptr, *anchor_h = nullptr;
-    if (!raw) raw = dalloc<float>(c.C), anchor_h = dalloc<float>(c.C);
-    embed_row(M, anchor, raw, anchor_h);
     int dr[kBlockMax];
-    ik2::draft::propose(drafter, anchor, anchor_h, P, nullptr, c.n_rows, c.n_vocab, dr, B - 1);
+    if (given) {
+        for (int j = 0; j + 1 < B; ++j) dr[j] = given[j];
+    } else {
+        const double t0 = now();
+        static float *raw = nullptr, *anchor_h = nullptr;
+        if (!raw) raw = dalloc<float>(c.C), anchor_h = dalloc<float>(c.C);
+        embed_row(M, anchor, raw, anchor_h);
+        ik2::draft::propose(drafter, anchor, anchor_h, P, nullptr, c.n_rows, c.n_vocab, dr, B - 1);
+        if (t_draft) *t_draft += now() - t0;
+    }
     int tk[kBlockMax];
     tk[0] = anchor;
     for (int j = 1; j < B; ++j) tk[j] = dr[j - 1];
     next.clear();
     std::vector<float> lo;
+    if (g_window_check > 0) {   // (IK2_WINDOW_CHECK=n: the first n windows against the one-token path, logit for logit)
+        --g_window_check;
+        std::vector<float> lb, lt;
+        fast_block(M, tk, B, P, OutMode::kLogits, lb, nullptr);
+        block_rollback(0);
+        for (int j = 0; j < B; ++j) fast_token(M, tk[j], P + j, OutMode::kLogits, lt, nullptr);
+        int same = 0;
+        double mx = 0;
+        for (int j = 0; j < B; ++j) {
+            const float *a = lb.data() + (size_t) j * c.n_vocab, *b = lt.data() + (size_t) j * c.n_vocab;
+            same += !std::memcmp(a, b, (size_t) c.n_vocab * 4);
+            for (int v = 0; v < c.n_vocab; ++v) mx = std::max(mx, (double) std::fabs(a[v] - b[v]));
+        }
+        g_window_rows += B, g_window_same += same;
+        std::fprintf(stderr, "window check: %d tokens at %d, %d of %d rows the one-token path's to the bit "
+                     "(max |dlogit| %.3g)\n", B, P, same, B, mx);
+        block_rollback(0);   // (and the window again: its records and the drafter's taps)
+    }
     if (sc.temp <= 0) {
         std::vector<int> g;
         fast_block(M, tk, B, P, OutMode::kArgmax, lo, &g);
@@ -2757,15 +2930,9 @@ void spec_step(Model& M, ik2::draft::Drafter* drafter, int anchor, int P, int B,
                 next.push_back(sample_from(dist, *sc.rng));
                 break;
             }
-            double pd = 0;
-            for (const auto& e : dist)
-                if (e.first == dr[j]) pd = e.second;
-            if (std::uniform_real_distribution<double>(0, 1)(*sc.rng) < pd) {
-                next.push_back(dr[j]);
-            } else {
-                next.push_back(sample_from(dist, *sc.rng, dr[j]));
-                break;
-            }
+            bool kept = false;
+            next.push_back(spec_pick(dist, dr[j], *sc.rng, kept));
+            if (!kept) break;
         }
     }
     for (size_t j = 0; j + 1 < next.size(); ++j)   // (a stop among the accepted: it is the last)
@@ -2775,8 +2942,10 @@ void spec_step(Model& M, ik2::draft::Drafter* drafter, int anchor, int P, int B,
         }
     const int m = (int) next.size();   // (the anchor and next[0 .. m - 2] are kept: m positions)
     if (m < B) block_rollback(m);
-    ik2::draft::write_context(drafter, g_taps, g_taps_ld, 0, m, P);
-    ik2::draft::set_f_rnn(drafter, g_taps, g_taps_ld, m - 1);
+    if (drafter) {   // (its context for the kept positions, whichever drafted)
+        ik2::draft::write_context(drafter, g_taps, g_taps_ld, 0, m, P);
+        ik2::draft::set_f_rnn(drafter, g_taps, g_taps_ld, m - 1);
+    }
 }
 
 void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode out_mode, const std::string& dump,
@@ -3647,6 +3816,176 @@ void embed_row(Model& M, int t, float* raw, float* out) {
 // The Inkling 2 preview: Linux, one NVIDIA GPU of 24 GB, Ampere (sm_80) or newer.  Outside it the engine stops with one
 // line saying why; IK2_UNSUPPORTED=1 runs it anyway where it can run at all (two GPUs, smaller cards with the experts
 // streamed from RAM, Windows: untested).
+// Greedy decode on the resident path from `anchor` (chosen, not run yet) at position P until out holds gen tokens
+// (the anchor first): each step a plain token or a window of the drafter's or the prompt lookup's drafts (ctl.pick);
+// lk holds the text before the anchor.  The CLI's generation and --drafting auto's trials.
+void decode_greedy(Model& M, ik2::draft::Drafter* drafter, int anchor, int P, int gen, int ctx, SpecCtl& ctl,
+                   strata::spec::SuffixDrafter& lk, std::vector<int>& out, double* t_draft) {
+    double t_exp = 0;
+    const SampleCfg sc;
+    std::vector<int> next;
+    out.push_back(anchor);
+    while ((int) out.size() < gen && P < ctx) {
+        lk.append(anchor);
+        const int room = std::min(gen - (int) out.size(), ctx - P);
+        int32_t ld[kBlockMax];
+        const int k = g_lookup && ctl.use_lookup && room >= 2 ? lk.propose(std::min(room, kBlockMax) - 1, ld) : 0;
+        int B = 1;
+        int src = ctl.pick(room, k, B);
+        if (src == 1 && !drafter) src = 0, B = 1;
+        const double ts = now();
+        if (B < 2) {
+            std::vector<float> lo;
+            std::vector<int> ag;
+            forward(M, &anchor, 1, P, false, OutMode::kArgmax, std::string(), lo, &ag, t_exp);
+            if (drafter) {
+                ik2::draft::write_context(drafter, g_taps, g_taps_ld, 0, 1, P);
+                ik2::draft::set_f_rnn(drafter, g_taps, g_taps_ld, 0);
+            }
+            CU(cudaStreamSynchronize(g_s));
+            ctl.took_plain(now() - ts);
+            anchor = ag[0], P += 1;
+            out.push_back(anchor);
+            continue;
+        }
+        int given[kBlockMax];
+        for (int j = 0; j + 1 < B; ++j) given[j] = ld[j];
+        spec_step(M, drafter, anchor, P, B, sc, std::vector<int>{}, next, src == 2 ? given : nullptr, t_draft);
+        CU(cudaStreamSynchronize(g_s));
+        if (src == 2) ctl.took_lookup(B, (int) next.size() - 1, now() - ts);
+        else ctl.took_spec(B, (int) next.size() - 1, now() - ts);
+        for (int j = 0; j + 1 < (int) next.size(); ++j) lk.append(next[j]);
+        for (int j = 0; j < (int) next.size() && (int) out.size() < gen; ++j) out.push_back(next[j]);
+        P += (int) next.size();
+        anchor = next.back();
+    }
+}
+
+// --drafting auto: which of no drafting, the prompt lookup, the drafter, and both decodes fastest on this PC -
+// measured once at the first start (before READY, on IK2_DRAFT_IDS's requests: the server's chat, code and tool call
+// in the model's own template) and remembered in IK2_DRAFT_FILE (the server's data folder) a line a key: the GPU, its
+// driver, the model and the drafter files, the context and the cache; IK2_DRAFT_MEASURE=1 measures again.  A line:
+// "<key>\t<none> <lookup> <drafter> <both> tok/s <date>" (-1: not measured here).
+const char* kDraftNames[4] = {"no drafting", "the prompt lookup", "the drafter", "the drafter and the prompt lookup"};
+std::string draft_key(const std::string& model, const std::string& draft_path, int ctx) {
+    cudaDeviceProp p{};
+    int dev = 0, drv = 0;
+    CU(cudaGetDevice(&dev));
+    CU(cudaGetDeviceProperties(&p, dev));
+    (void) cudaDriverGetVersion(&drv);
+    auto fsize = [](const std::string& f) -> long long {
+        std::ifstream in(f, std::ios::binary | std::ios::ate);
+        return in ? (long long) in.tellg() : -1;
+    };
+    const std::string base = model.substr(model.find_last_of("/\\") + 1);
+    char buf[640];
+    std::snprintf(buf, sizeof buf, "ik2 drafting v1|%s %.0f GB sm_%d%d|driver %d|%s %lld|drafter %lld|ctx %d %s",
+                  p.name, p.totalGlobalMem / 1e9, p.major, p.minor, drv, base.c_str(), fsize(model),
+                  draft_path.empty() ? -1LL : fsize(draft_path), ctx, g_kv_fp8 ? "fp8" : "f16");
+    return buf;
+}
+// the remembered choice (0 .. 3, kDraftNames), or -1; tps: its four figures
+int draft_remembered(const std::string& key, double* tps, std::string& date) {
+    const char* f = getenv("IK2_DRAFT_FILE");
+    const char* again = getenv("IK2_DRAFT_MEASURE");
+    if (!f || !*f || (again && std::atoi(again))) return -1;
+    std::ifstream in(f);
+    std::string line;
+    int c = -1;
+    while (std::getline(in, line)) {
+        const size_t tab = line.find('\t');
+        if (tab == std::string::npos || line.compare(0, tab, key) != 0) continue;
+        char d[64] = "";
+        int ch = -1;
+        if (std::sscanf(line.c_str() + tab + 1, "%lf %lf %lf %lf %d %63s", &tps[0], &tps[1], &tps[2], &tps[3], &ch,
+                        d) == 6 && ch >= 0 && ch < 4)
+            c = ch, date = d;   // (the last line of the key wins)
+    }
+    return c;
+}
+void draft_remember(const std::string& key, const double* tps, int c) {
+    const char* f = getenv("IK2_DRAFT_FILE");
+    if (!f || !*f) return;
+    std::vector<std::string> keep;
+    {
+        std::ifstream in(f);
+        std::string line;
+        while (std::getline(in, line))
+            if (line.compare(0, key.size() + 1, key + "\t") != 0) keep.push_back(line);
+    }
+    char day[32];
+    const std::time_t tt = std::time(nullptr);
+    std::strftime(day, sizeof day, "%Y-%m-%d", std::localtime(&tt));
+    char vals[200];
+    std::snprintf(vals, sizeof vals, "%.3f %.3f %.3f %.3f %d %s", tps[0], tps[1], tps[2], tps[3], c, day);
+    keep.push_back(key + "\t" + vals);
+    const std::string tmp = std::string(f) + ".tmp";
+    {
+        std::ofstream out(tmp);
+        for (const auto& l : keep) out << l << "\n";
+        if (!out) return;
+    }
+    std::remove(f);
+    std::rename(tmp.c_str(), f);
+}
+
+// --check-sampling (no GPU, no model): sampled drafting keeps the distribution - a drafted position's pick (spec_pick:
+// the draft with the model's probability of it, else the distribution without it) against the plain pick
+// (sample_from) of the same distribution, a chi-square of each against the probabilities themselves, on candidate
+// lists like the engine's (random logits, temperatures, top_p / top_k) and drafts likely, unlikely and impossible.
+// Exit 0: every p-value above 1e-4.
+int check_sampling() {
+    std::mt19937_64 rng(20261121);
+    int fails = 0;
+    auto chi_p = [](double chi, int df) {   // (upper tail, Wilson-Hilferty)
+        if (df <= 0) return 1.0;
+        const double z = (std::cbrt(chi / df) - (1.0 - 2.0 / (9.0 * df))) / std::sqrt(2.0 / (9.0 * df));
+        return 0.5 * std::erfc(z / std::sqrt(2.0));
+    };
+    const double temps[3] = {0.7, 1.0, 1.3}, tops[3] = {1.0, 0.9, 0.95};
+    const int topks[3] = {0, 20, 0};
+    for (int cs = 0; cs < 3; ++cs) {
+        std::vector<std::pair<float, int>> cd(64);
+        for (int i = 0; i < 64; ++i) cd[i] = {(float) std::normal_distribution<double>(0, 2.0)(rng), 1000 + i};
+        SampleCfg sc;
+        sc.temp = temps[cs], sc.top_p = tops[cs], sc.top_k = topks[cs];
+        const auto dist = sample_dist(cd, sc);
+        const int drafts[3] = {dist[0].first, dist[std::min<size_t>(3, dist.size() - 1)].first, 99999};
+        for (int dk = 0; dk < 4; ++dk) {   // (dk 3: the plain pick)
+            std::map<int, int> n;
+            const int N = 400000;
+            int kept = 0;
+            for (int i = 0; i < N; ++i) {
+                bool acc = false;
+                const int t = dk == 3 ? sample_from(dist, rng) : spec_pick(dist, drafts[dk], rng, acc);
+                ++n[t], kept += acc;
+            }
+            double chi = 0;
+            int df = -1, outside = 0;
+            for (const auto& e : dist) {
+                const double want = e.second * N, got = n.count(e.first) ? n[e.first] : 0;
+                if (want >= 5) chi += (got - want) * (got - want) / want, ++df;
+            }
+            for (const auto& kv : n) {
+                bool in = false;
+                for (const auto& e : dist) in |= e.first == kv.first;
+                if (!in) outside += kv.second;
+            }
+            const double p = chi_p(chi, df);
+            const bool ok = p > 1e-4 && outside == 0;
+            fails += !ok;
+            std::printf("check sampling: temperature %.1f top_p %.2f top_k %d, %s: chi-square %.1f (%d df), p %.3g, "
+                        "drafts kept %.1f%%%s - %s\n", sc.temp, sc.top_p, sc.top_k,
+                        dk == 3 ? "plain pick" : dk == 0 ? "the likeliest draft" : dk == 1 ? "a less likely draft"
+                                                                                    : "an impossible draft",
+                        chi, df, p, 100.0 * kept / N, outside ? " (tokens outside the distribution)" : "",
+                        ok ? "ok" : "FAIL");
+        }
+    }
+    std::printf(fails ? "check sampling: FAILED (%d)\n" : "check sampling: the distribution is kept\n", fails);
+    return fails ? 1 : 0;
+}
+
 void check_preview(int n_gpu, bool serve) {
     auto refuse = [&](const std::string& m) {   // (--serve: the server prints a NOTE line)
         if (serve) std::printf("NOTE maya-ik2: %s\n", m.c_str()), std::fflush(stdout);
@@ -3708,7 +4047,7 @@ void check_preview(int n_gpu, bool serve) {
 }
 
 int main(int argc, char** argv) {
-    std::string model, toks, dump, draft_path;
+    std::string model, toks, dump, draft_path, drafting;
     int gen = 16, chunk = 2048, ctx = 262144, threads = 8, n_gpu = 1;
     bool serve = false, serve_maya = true;   // (--serve: Maya's engine protocol; --serve-ik2: the @-line one)
     std::vector<int> eos_ids;                 // --eos a,b: the tokens a request ends at (Maya's protocol)
@@ -3720,6 +4059,7 @@ int main(int argc, char** argv) {
             if (i + 1 >= argc) die("missing value of " + a);
             return argv[++i];
         };
+        if (a == "--check-sampling") return check_sampling();   // (no GPU, no model)
         if (a == "--model") model = next();
         else if (a == "--tokens") {   // (--tokens @FILE: the ids from a file - a long prompt passes a shell's limit)
             toks = next();
@@ -3748,8 +4088,15 @@ int main(int argc, char** argv) {
         }
         else if (a == "--image-token") image_token = std::atoi(next().c_str());
         else if (a == "--dump") dump = next();
+        else if (a == "--drafting") {   // (auto: measured once on this PC; on: the drafter and the prompt lookup; off)
+            drafting = next();
+            if (drafting != "auto" && drafting != "on" && drafting != "off") die("--drafting: auto, on or off");
+        }
         else die("unknown argument " + a);
     }
+    if (drafting.empty()) drafting = draft_path.empty() ? "off" : "on";   // (--draft alone: as before, drafting on)
+    if (drafting == "off") draft_path.clear();
+    g_lookup = drafting != "off" && !(getenv("IK2_LOOKUP") && !std::atoi(getenv("IK2_LOOKUP")));
     g_prof = getenv("IK2_PROF") && std::atoi(getenv("IK2_PROF"));
     g_flash = !(getenv("IK2_FLASH") && !std::atoi(getenv("IK2_FLASH")));
 #ifdef STRATA_USE_HIP
@@ -3938,12 +4285,38 @@ int main(int argc, char** argv) {
     g_cpu_lazy = !getenv("IK2_CPU_LAZY") || std::atoi(getenv("IK2_CPU_LAZY"));
     if (n_gpu > 1 && getenv("IK2_DENSE")) die("IK2_DENSE with --gpus > 1");
 
+    // --drafting auto: this PC's choice when it was measured before (then only that drafter takes room), else every
+    // source that fits, measured before READY (serve)
+    std::string draft_key_s;
+    int draft_choice = -1;
+    if (drafting == "auto" && (!draft_path.empty() || g_lookup)) {
+        draft_key_s = draft_key(model, draft_path, ctx);
+        double tps[4] = {-1, -1, -1, -1};
+        std::string date;
+        draft_choice = draft_remembered(draft_key_s, tps, date);
+        if (draft_choice >= 0) {
+            if (draft_choice < 2) draft_path.clear();
+            g_lookup = g_lookup && (draft_choice == 1 || draft_choice == 3);
+            std::printf("drafting: %s - the fastest on this PC (measured %s: no drafting %.1f, the prompt lookup %.1f, "
+                        "the drafter %.1f, both %.1f tokens/s)\n", kDraftNames[draft_choice], date.c_str(), tps[0],
+                        tps[1], tps[2], tps[3]);
+        }
+    }
+
     // Do the experts all fit in VRAM beside the dense weights and the K / V cache (Inkling-2-Mini's 14.7 GiB on a 24 GB
     // card)?  Then they all stay there: the dense weights are kept as the GGUF's blocks unless IK2_DENSE says otherwise
     // (half an FP16 copy's bytes, a token's products straight over them) and tokens take the resident path
     // (IK2_FAST=0: off; IK2_GRAPH=0: its launches one by one instead of a CUDA graph a token).
     g_graph = !(getenv("IK2_GRAPH") && !std::atoi(getenv("IK2_GRAPH")));
     g_block = !(getenv("IK2_BLOCK") && !std::atoi(getenv("IK2_BLOCK")));
+    g_block_exact = !(getenv("IK2_BLOCK_EXACT") && !std::atoi(getenv("IK2_BLOCK_EXACT")));
+    g_window_check = getenv("IK2_WINDOW_CHECK") ? std::atoi(getenv("IK2_WINDOW_CHECK")) : 0;
+    if (g_block_exact && !k::experts_block_exact()) {   // (IK2_EXPERT_MMA_SPLIT* not the defaults: no exact window)
+        if (!draft_path.empty())
+            std::printf("INFO maya-ik2: drafting off - IK2_EXPERT_MMA_SPLIT / _DOWN are not 8 / 4, and the verify "
+                        "window would then change the answers\n");
+        g_block = false;
+    }
     g_attn_mma = c.D == 128 && c.H / c.KV <= 8 ? (getenv("IK2_ATTN_MMA") ? std::atoi(getenv("IK2_ATTN_MMA")) : 1) : 0;
     g_mma_split = k::attn_decode_mma_blocks(c.KV);
     if (n_gpu == 1 && !g_pool) {
@@ -3987,6 +4360,42 @@ int main(int argc, char** argv) {
         std::printf("experts %.1f GiB, dense weights %.1f GiB as blocks, K / V cache %.1f GiB, %.1f GiB free: %s\n",
                     exp_b / 1073741824.0, dense_b / 1073741824.0, kv_b / 1073741824.0, fr0 / 1073741824.0,
                     fits ? "every expert stays in VRAM" : "the experts in host memory, a cache of them in VRAM");
+        // Drafting never changes this plan (a loaded drafter takes room only where everything above stays as it is):
+        // it runs on the resident path, its room - the drafter's, or the prompt lookup's window records alone - beside
+        // the model at this context, and not the room the pictures' encoder would have had on the GPU (IK2_VISION_GIB,
+        // the server's: the encoder starts on the GPU when the free VRAM holds it).  Else it is left out, said why.
+        const size_t used = exp_b + dense_b + kv_b + reserve;
+        const double vis = getenv("IK2_VISION_GIB") ? std::atof(getenv("IK2_VISION_GIB")) * 1073741824.0 : 0.0;
+        const double left = fr0 > used ? (double) (fr0 - used) : 0.0;
+        auto room_ok = [&](size_t need, std::string& why) {
+            if (!g_fast_want) why = "it runs where every expert stays in VRAM (the resident path), not here";
+            else if (used + need > fr0) why = "its room does not fit beside the model at this context";
+            else if (vis > 0 && left >= vis && left - (double) need < vis)
+                why = "its room would move the pictures' encoder from the GPU to the CPU";
+            return why.empty();
+        };
+        for (int pass = 0; pass < 2; ++pass) {   // (the drafter, else the prompt lookup alone)
+            const bool model_drafter = pass == 0;
+            if (model_drafter ? draft_path.empty() : !g_lookup) continue;
+            const auto* head = S.info("output.weight");
+            const int head_rows = head ? (int) (head->elements() / c.C) : 201024;
+            const size_t need = draft_room(model_drafter ? draft_path : std::string(), ctx, chunk, c, head_rows);
+            std::string why;
+            if (room_ok(need, why)) {
+                std::printf("drafting: %s, %.2f GiB of VRAM beside the model (the plan as without it)\n",
+                            model_drafter ? (g_lookup ? "the drafter and the prompt lookup" : "the drafter")
+                                          : "the prompt lookup", need / 1073741824.0);
+                break;
+            }
+            std::printf("NOTE maya-ik2: %s left out (%.2f GiB): %s\n", model_drafter ? "the drafter" : "the prompt lookup",
+                        need / 1073741824.0, why.c_str());
+            if (model_drafter) draft_path.clear();
+            else g_lookup = false;
+        }
+        std::fflush(stdout);
+    } else if (!draft_path.empty() || g_lookup) {
+        std::printf("NOTE maya-ik2: drafting off - it runs on one GPU with every expert in VRAM, not here\n");
+        draft_path.clear(), g_lookup = false;
     }
 
     // the dense weights
@@ -4447,6 +4856,10 @@ int main(int argc, char** argv) {
         }
         g_taps_ld = std::max(chunk, ik2::draft::kBlock);
         g_taps = dalloc<float>((size_t) (g_final_tap + 1) * g_taps_ld * c.C);
+        std::printf("drafter: %s, %.2f GiB of VRAM, %.1f s\n", draft_path.c_str(),
+                    ik2::draft::bytes(drafter) / 1073741824.0, now() - t0);
+    }
+    if (drafter || g_lookup) {   // (the verify window's records of every conv: rollback_block)
         for (auto& Vi : M.V) {
             const size_t cc[4] = {KD, KD, C, C};
             for (int i = 0; i < 4; ++i) {
@@ -4454,8 +4867,6 @@ int main(int argc, char** argv) {
                 Vi.rec_x[i] = dalloc<float>((size_t) ik2::draft::kBlock * cc[i]);
             }
         }
-        std::printf("drafter: %s, %.2f GiB of VRAM, %.1f s\n", draft_path.c_str(),
-                    ik2::draft::bytes(drafter) / 1073741824.0, now() - t0);
     }
 
     // the work buffers and the expert cache, a set a GPU
@@ -4803,8 +5214,92 @@ int main(int argc, char** argv) {
             if (const auto* e = S.get("tokenizer.ggml.eos_token_id")) eos_ids.push_back((int) e->u);
             eos_ids.push_back(199999);   // (Inkling 2's <|endoftext|>)
         }
+        // --drafting auto, not measured on this PC yet: each source that loaded - none, the prompt lookup, the
+        // drafter, both - times greedy answers to IK2_DRAFT_IDS's requests (IK2_DRAFT_TOKENS each, 128), the
+        // fastest kept (within IK2_DRAFT_TIE, 3%, of none: none) and remembered; the answers are the same whichever
+        // (drafting on = off), so one load measures them all
+        if (drafting == "auto" && draft_choice < 0 && (drafter || g_lookup) && g_fast && g_block) {
+            std::vector<std::vector<int>> reqs;
+            if (const char* f = getenv("IK2_DRAFT_IDS")) {
+                std::ifstream in(f);
+                std::string l;
+                while (std::getline(in, l))
+                    if (!l.empty() && l[0] != '#') {
+                        auto v = parse_ints(l);
+                        if (!v.empty() && (int) v.size() + 256 < ctx) reqs.push_back(std::move(v));
+                    }
+            }
+            if (reqs.empty()) {
+                std::printf("NOTE maya-ik2: drafting on, not measured (no requests to time it on: IK2_DRAFT_IDS)\n");
+            } else {
+                const int gen_n = getenv("IK2_DRAFT_TOKENS") ? std::max(16, std::atoi(getenv("IK2_DRAFT_TOKENS"))) : 128;
+                const double tie = getenv("IK2_DRAFT_TIE") ? std::atof(getenv("IK2_DRAFT_TIE")) : 0.03;
+                const bool have[4] = {true, g_lookup, drafter != nullptr, drafter && g_lookup};
+                std::printf("NOTE maya-ik2: measuring this PC once, before the first answer: drafting (%zu requests, %d "
+                            "tokens each, a source at a time); remembered, the next starts skip it\n", reqs.size(), gen_n);
+                std::fflush(stdout);
+                const double tm0 = now();
+                auto trial = [&](int mode, int gen_t, double& secs) {
+                    int made = 0;
+                    secs = 0;
+                    for (const auto& ids : reqs) {
+                        reset();
+                        int first = 0;
+                        for (size_t p0 = 0; p0 < ids.size(); p0 += chunk) {
+                            const int n = (int) std::min<size_t>(chunk, ids.size() - p0);
+                            const bool last_c = p0 + n == ids.size();
+                            std::vector<float> lo;
+                            std::vector<int> ag;
+                            forward(M, ids.data() + p0, n, (int) p0, false, last_c ? OutMode::kArgmax : OutMode::kNone,
+                                    std::string(), lo, &ag, t_exp);
+                            if (drafter) {
+                                ik2::draft::write_context(drafter, g_taps, g_taps_ld, 0, n, (int) p0);
+                                if (last_c) ik2::draft::set_f_rnn(drafter, g_taps, g_taps_ld, n - 1);
+                            }
+                            if (last_c) first = ag[0];
+                        }
+                        CU(cudaStreamSynchronize(g_s));
+                        SpecCtl ctl;
+                        ctl.wmax = getenv("IK2_DRAFT_WIDTH") ? std::clamp(atoi(getenv("IK2_DRAFT_WIDTH")), 2, kBlockMax) : 5;
+                        ctl.use_lookup = mode == 1 || mode == 3, ctl.use_model = mode >= 2;
+                        if (mode == 0) ctl.wmax = 1;   // (plain tokens only)
+                        strata::spec::SuffixDrafter lk1;
+                        lk1.append(ids.data(), ids.size());
+                        std::vector<int> out;
+                        const double t0 = now();
+                        decode_greedy(M, mode >= 2 ? drafter : nullptr, first, (int) ids.size(), gen_t, ctx, ctl, lk1, out,
+                                      nullptr);
+                        secs += now() - t0;
+                        made += (int) out.size() - 1;
+                    }
+                    return made / std::max(1e-9, secs);
+                };
+                double warm = 0, tps[4] = {-1, -1, -1, -1};
+                trial(have[3] ? 3 : have[2] ? 2 : 1, 24, warm);   // (the windows' graphs made once, untimed)
+                for (int m = 0; m < 4; ++m)
+                    if (have[m]) tps[m] = trial(m, gen_n, warm);
+                int best = 0;
+                for (int m = 1; m < 4; ++m)
+                    if (tps[m] > tps[best]) best = m;
+                if (best && tps[best] < tps[0] * (1.0 + tie)) best = 0;   // (no clear gain: no drafting)
+                draft_choice = best;
+                draft_remember(draft_key_s, tps, best);
+                reset();
+                std::printf("NOTE maya-ik2: measured this PC once in %.0f s: drafting - %s (no drafting %.1f, the prompt "
+                            "lookup %.1f, the drafter %.1f, both %.1f tokens/s)\n", now() - tm0, kDraftNames[best],
+                            tps[0], tps[1], tps[2], tps[3]);
+            }
+            if (draft_choice >= 0) {   // (the sources not chosen: off - the drafter's room stays as it was planned)
+                if (draft_choice < 2) drafter = nullptr;
+                if (draft_choice != 1 && draft_choice != 3) g_lookup = false;
+            }
+        }
         if (serve_maya) {
-            std::printf("INFO engine=ik2 engine_kind=ik2 model=Inkling-2 kv=%s ctx=%d gpus=%d\n", g_kv_fp8 ? "fp8" : "f16", ctx, n_gpu);
+            // (dspark= / lookup=: the drafters this start runs - the Monitor's Speculation; drafting= the choice)
+            const bool sp = (drafter || g_lookup) && g_fast && g_block;
+            std::printf("INFO engine=ik2 engine_kind=ik2 model=Inkling-2 kv=%s ctx=%d gpus=%d dspark=%d lookup=%d "
+                        "drafting=%s\n", g_kv_fp8 ? "fp8" : "f16", ctx, n_gpu, sp && drafter ? 1 : 0, sp && g_lookup ? 1 : 0,
+                        drafting.c_str());
             std::printf("READY %d stop\n", ctx);
         } else {
             std::printf("@READY ctx %d\n", ctx);
@@ -4845,13 +5340,15 @@ int main(int argc, char** argv) {
         // speculative decoding (--draft, the resident path): the controller decides each step; IK2_DRAFT_WIDTH the
         // widest window, IK2_DRAFT_ADAPT=0 always that wide
         SpecCtl sctl;
-        const bool spec_on = drafter && g_fast && g_block;
+        const bool spec_on = (drafter || g_lookup) && g_fast && g_block;
         sctl.wmax = getenv("IK2_DRAFT_WIDTH") ? std::clamp(atoi(getenv("IK2_DRAFT_WIDTH")), 2, kBlockMax) : 5;
         sctl.adapt = !(getenv("IK2_DRAFT_ADAPT") && !atoi(getenv("IK2_DRAFT_ADAPT")));
+        sctl.use_model = drafter != nullptr, sctl.use_lookup = g_lookup;
+        static strata::spec::SuffixDrafter lk;   // (the prompt lookup: a request's tokens so far)
         while (next_line(line)) {
             std::istringstream in(line);
             std::string cmd, stops_s, ids_s, emb_path;
-            int max_new = 0, top_k = 0;
+            int max_new = 0, top_k = 0, spec_key = 0;
             double temp = 0, top_p = 1;
             long long seed = -1;
             in >> cmd;
@@ -4887,6 +5384,7 @@ int main(int argc, char** argv) {
                     else if (k == "top_p") top_p = std::atof(v.c_str());
                     else if (k == "top_k") top_k = std::atoi(v.c_str());
                     else if (k == "seed") seed = std::atoll(v.c_str());
+                    else if (k == "spec") spec_key = std::atoi(v.c_str());   // (1: no drafting; 2 .. 8: the widest window)
                 }
                 stops = eos_ids;
             } else {
@@ -4919,6 +5417,22 @@ int main(int argc, char** argv) {
             busy = true;
             if (seed >= 0) rng.seed((uint64_t) seed);
             g_cancel = 0;
+            // (drafting for this request: spec=1 asks for none; the prompt lookup's history its tokens; the Monitor's
+            //  figures - STAT draft_acc / draft_off, DONE's kept and offered - this request's drafts)
+            const bool req_spec = spec_on && spec_key != 1;
+            const int req_wmax = spec_key >= 2 ? std::min(spec_key, kBlockMax) : kBlockMax;
+            const uint64_t kept0 = sctl.kept(), offered0 = sctl.offered();
+            uint64_t req_rounds = 0;
+            double req_draft_s = 0, req_verify_s = 0;
+            if (req_spec) {
+                lk.reset();
+                lk.append(ids.data(), ids.size());
+            }
+            auto stat_line = [&]() {
+                std::printf("STAT draft_acc=%llu draft_off=%llu draft_rounds=%llu draft_ms=%.1f verify_ms=%.1f\n",
+                            (unsigned long long) (sctl.kept() - kept0), (unsigned long long) (sctl.offered() - offered0),
+                            (unsigned long long) req_rounds, req_draft_s * 1e3, req_verify_s * 1e3);
+            };
             size_t L = 0;   // (a picture's position is the same only with the same rows: its hash beside its token)
             auto hsig = [&](size_t i) { return i < hist_sig.size() ? hist_sig[i] : (uint64_t) 0; };
             while (L < hist.size() && L < ids.size() && hist[L] == ids[L] && hsig(L) == sig[L]) ++L;
@@ -5090,20 +5604,37 @@ int main(int argc, char** argv) {
                     break;
                 }
                 if (i + 1 == max_new) break;
-                const int B = spec_on ? sctl.choose(std::min(max_new - i - 1, ctx - (int) hist.size())) : 1;
+                if (req_spec) lk.append(tok);
+                // (the step: a plain token, or a window of the drafter's or the prompt lookup's drafts)
+                int B = 1, src = 0;
+                int32_t ld[kBlockMax];
+                if (req_spec) {
+                    const int room = std::min({max_new - i - 1, ctx - (int) hist.size(), req_wmax});
+                    const int k = g_lookup && room >= 2 ? lk.propose(std::min(room, kBlockMax) - 1, ld) : 0;
+                    src = sctl.pick(room, k, B);
+                    if (src == 1 && !drafter) src = 0, B = 1;
+                }
                 if (B >= 2) {
                     SampleCfg sc;
                     sc.temp = temp, sc.top_p = top_p, sc.top_k = top_k, sc.rng = &rng;
                     std::vector<int> next;
                     const double ts = now();
-                    spec_step(M, drafter, tok, (int) hist.size(), B, sc, stops, next);
+                    int given[kBlockMax];
+                    for (int j = 0; j + 1 < B; ++j) given[j] = ld[j];
+                    spec_step(M, drafter, tok, (int) hist.size(), B, sc, stops, next, src == 2 ? given : nullptr,
+                              &req_draft_s);
                     CU(cudaStreamSynchronize(g_s));
-                    sctl.took_spec(B, (int) next.size() - 1, now() - ts);
+                    const double tw = now() - ts;
+                    req_verify_s += tw, ++req_rounds;
+                    if (src == 2) sctl.took_lookup(B, (int) next.size() - 1, tw);
+                    else sctl.took_spec(B, (int) next.size() - 1, tw);
                     hist.push_back(tok);
                     for (size_t j = 0; j + 1 < next.size(); ++j) {
                         std::printf(serve_maya ? "T %d\n" : "@TOK %d\n", next[j]);
                         hist.push_back(next[j]);
+                        lk.append(next[j]);
                     }
+                    if (serve_maya && req_rounds % 8 == 0) stat_line();
                     std::fflush(stdout);
                     n_out += (int) next.size() - 1;
                     i += (int) next.size() - 1;
@@ -5131,21 +5662,28 @@ int main(int argc, char** argv) {
                     cand = use_cand && g_cand.n >= 0;
                     last = std::move(lo);
                 }
-                if (spec_on) {   // (the drafter's context for the token: its taps, row 0)
+                if (drafter && spec_on) {   // (the drafter's context for the token: its taps, row 0)
                     ik2::draft::write_context(drafter, g_taps, g_taps_ld, 0, 1, (int) hist.size());
                     ik2::draft::set_f_rnn(drafter, g_taps, g_taps_ld, 0);
+                }
+                if (req_spec) {
                     CU(cudaStreamSynchronize(g_s));
                     sctl.took_plain(now() - tp0);
                 }
                 hist.push_back(tok);
             }
             if (spec_on && getenv("IK2_STATS"))
-                std::fprintf(stderr, "speculative: %llu windows, %llu of %llu drafts accepted, %llu plain tokens\n",
-                             (unsigned long long) sctl.steps, (unsigned long long) sctl.accepted,
-                             (unsigned long long) sctl.drafted, (unsigned long long) sctl.plain);
-            if (serve_maya)
-                std::printf("DONE %d %zu %.1f %.1f %s 0 0 %d\n", n_out, ids.size(), (t1 - t0) * 1e3, (now() - t1) * 1e3,
-                            std::strcmp(reason, "cancelled") == 0 ? "cancel" : reason, cached);
+                std::fprintf(stderr, "speculative: %llu windows, %llu of %llu drafts accepted (the lookup's %llu of "
+                             "%llu), %llu plain tokens\n", (unsigned long long) (sctl.steps + sctl.l_steps),
+                             (unsigned long long) sctl.kept(), (unsigned long long) sctl.offered(),
+                             (unsigned long long) sctl.l_accepted, (unsigned long long) sctl.l_drafted,
+                             (unsigned long long) sctl.plain);
+            if (serve_maya && req_rounds) stat_line();
+            if (serve_maya)   // (DONE's 6th and 7th fields: this answer's drafts kept and offered)
+                std::printf("DONE %d %zu %.1f %.1f %s %llu %llu %d\n", n_out, ids.size(), (t1 - t0) * 1e3,
+                            (now() - t1) * 1e3, std::strcmp(reason, "cancelled") == 0 ? "cancel" : reason,
+                            (unsigned long long) (sctl.kept() - kept0), (unsigned long long) (sctl.offered() - offered0),
+                            cached);
             else
                 std::printf("@END %s %zu %d %.3f %.3f\n", reason, ids.size(), cached, t1 - t0, now() - t1);
             std::fflush(stdout);
@@ -5244,7 +5782,8 @@ int main(int argc, char** argv) {
     // IK2_LOGITS_OUT=FILE: every generated token's logits [n_vocab] F32 appended there (with IK2_FORCE: two builds'
     // logits over the same tokens, to compare)
     FILE* lo = getenv("IK2_LOGITS_OUT") ? std::fopen(getenv("IK2_LOGITS_OUT"), "wb") : nullptr;
-    for (int i = 0, best = first_best; i < gen && !drafter; ++i) {
+    const bool lookup_only = !drafter && g_lookup && g_fast && g_block;   // (then the drafting loop below)
+    for (int i = 0, best = first_best; i < gen && !drafter && !lookup_only; ++i) {
         const int tok = i < (int) force.size() ? force[i] : best;
         if (i < (int) force.size()) agree += best == force[i];
         out.push_back(tok);
@@ -5269,33 +5808,48 @@ int main(int argc, char** argv) {
                     100.0 * agree / std::max<size_t>(1, std::min<size_t>(force.size(), out.size())));
 
     SpecCtl ctl;
-    if (drafter && g_fast && g_block) {
-        // (the resident path: the controller picks plain tokens or a window; greedy, as the CLI's generation is)
+    if ((drafter || g_lookup) && g_fast && g_block) {
+        // (the resident path: the controller picks plain tokens or a window of the drafter's or the prompt lookup's
+        //  drafts; greedy, as the CLI's generation is)
         ctl.wmax = getenv("IK2_DRAFT_WIDTH") ? std::clamp(atoi(getenv("IK2_DRAFT_WIDTH")), 2, kBlockMax) : 5;
         ctl.adapt = !(getenv("IK2_DRAFT_ADAPT") && !atoi(getenv("IK2_DRAFT_ADAPT")));
+        ctl.use_model = drafter != nullptr, ctl.use_lookup = g_lookup;
+        strata::spec::SuffixDrafter lk;
+        lk.append(prompt.data(), prompt.size());
         int anchor = first_best, P = (int) prompt.size();
         out.push_back(anchor);
         const SampleCfg sc;
         std::vector<int> next;
         while ((int) out.size() < gen && P < ctx) {
+            lk.append(anchor);
             const int room = std::min(gen - (int) out.size(), ctx - P);
-            const int B = ctl.choose(room);
+            int32_t ld[kBlockMax];
+            const int k = g_lookup && room >= 2 ? lk.propose(std::min(room, kBlockMax) - 1, ld) : 0;
+            int B = 1;
+            int src = ctl.pick(room, k, B);
+            if (src == 1 && !drafter) src = 0, B = 1;
             const double ts = now();
             if (B < 2) {
                 std::vector<float> lo;
                 std::vector<int> ag;
                 forward(M, &anchor, 1, P, false, OutMode::kArgmax, std::string(), lo, &ag, t_exp);
-                ik2::draft::write_context(drafter, g_taps, g_taps_ld, 0, 1, P);
-                ik2::draft::set_f_rnn(drafter, g_taps, g_taps_ld, 0);
+                if (drafter) {
+                    ik2::draft::write_context(drafter, g_taps, g_taps_ld, 0, 1, P);
+                    ik2::draft::set_f_rnn(drafter, g_taps, g_taps_ld, 0);
+                }
                 CU(cudaStreamSynchronize(g_s));
                 ctl.took_plain(now() - ts);
                 anchor = ag[0], P += 1;
                 out.push_back(anchor);
                 continue;
             }
-            spec_step(M, drafter, anchor, P, B, sc, std::vector<int>{}, next);
+            int given[kBlockMax];
+            for (int j = 0; j + 1 < B; ++j) given[j] = ld[j];
+            spec_step(M, drafter, anchor, P, B, sc, std::vector<int>{}, next, src == 2 ? given : nullptr, &t_draft);
             CU(cudaStreamSynchronize(g_s));
-            ctl.took_spec(B, (int) next.size() - 1, now() - ts);
+            if (src == 2) ctl.took_lookup(B, (int) next.size() - 1, now() - ts);
+            else ctl.took_spec(B, (int) next.size() - 1, now() - ts);
+            for (int j = 0; j + 1 < (int) next.size(); ++j) lk.append(next[j]);
             for (int j = 0; j < (int) next.size() && (int) out.size() < gen; ++j) out.push_back(next[j]);
             P += (int) next.size();
             anchor = next.back();
@@ -5424,7 +5978,11 @@ int main(int argc, char** argv) {
         for (size_t j = 0; j < out.size(); ++j) std::printf("%d%s", out[j], j + 1 < out.size() ? "," : "\n");
     }
     const double gen_s = now() - tg;
-    if (drafter && (ctl.steps || ctl.plain)) {
+    if ((drafter || g_lookup) && (ctl.steps || ctl.plain || ctl.l_steps)) {
+        if (ctl.l_steps)
+            std::printf("speculative: the prompt lookup %llu windows (%llu drafts, %llu accepted: %.2f tokens a window)\n",
+                        (unsigned long long) ctl.l_steps, (unsigned long long) ctl.l_drafted,
+                        (unsigned long long) ctl.l_accepted, 1.0 + (double) ctl.l_accepted / ctl.l_steps);
         std::printf("speculative: %llu windows (%llu drafts, %llu accepted: %.2f tokens a window; accepted drafts:",
                     (unsigned long long) ctl.steps, (unsigned long long) ctl.drafted, (unsigned long long) ctl.accepted,
                     ctl.steps ? 1.0 + (double) ctl.accepted / ctl.steps : 0.0);
@@ -5434,6 +5992,9 @@ int main(int argc, char** argv) {
         for (int b = 2; b <= 6; ++b) std::printf(" %.1f", ctl.c[b] * 1e3);
         std::printf("), a plain token %.1f ms\n", ctl.c_plain * 1e3);
     }
+    if (g_window_rows)
+        std::printf("window check: %llu of %llu rows the one-token path's to the bit\n",
+                    (unsigned long long) g_window_same, (unsigned long long) g_window_rows);
     if (drafter && n_steps) {
         std::printf("speculative: %d steps, %.2f tokens a step (accepted drafts: ", n_steps,
                     (double) (out.size() - 1) / n_steps);

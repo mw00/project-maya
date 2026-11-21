@@ -99,10 +99,23 @@ class Manifest(unittest.TestCase):
         for name, (size, sha) in man["files"].items():
             self.assertGreater(size, 100 << 20, name)
             self.assertRegex(sha, r"^[0-9a-f]{64}$", name)
-        self.assertEqual(list(man["files"]), [man["gguf"]])                  # (no drafter in the preview)
+        self.assertEqual(list(man["files"]), [man["gguf"]])                  # (the drafter: its own entry)
         self.assertEqual(man["files"][man["gguf"]][1],
                          "e62d463c135ffe283df8d94b279a96ca145ac128b52ce854478613045bf4de15")   # (the author's)
-        self.assertNotIn("draft", man)
+
+    def test_drafter_pinned(self):
+        """Drafting: thinkingmachines' own mtp.safetensors from the model's repo at a pinned revision, by size and
+        sha256 (the ones docs/INKLING2.md lists)."""
+        m = maya.ik2_drafter_model()
+        self.assertEqual((m["repo"], m["revision"], m["folder"]),
+                         ("thinkingmachines/Inkling-2-Mini", "ed40e7da625f594fc9c4990f5f66be24873c22d7", ""))
+        self.assertEqual(m["files"], {"mtp.safetensors": 635801416})
+        self.assertEqual(m["sha256"]["mtp.safetensors"],
+                         "7c3b651317f01f73bcf4e1dceba66ef8b7e1a1eac6bc171e882e690a4b10a1d2")
+        self.assertIn("7c3b651317f01f73bcf4e1dceba66ef8b7e1a1eac6bc171e882e690a4b10a1d2",
+                      (maya.ROOT / "docs" / "INKLING2.md").read_text(encoding="utf-8"))
+        self.assertEqual(maya.file_url(m, "mtp.safetensors"), "https://huggingface.co/thinkingmachines/Inkling-2-Mini/"
+                         "resolve/ed40e7da625f594fc9c4990f5f66be24873c22d7/mtp.safetensors")
 
     def test_vision_pinned(self):
         """The pictures: unsloth's mmproj-BF16.gguf from the GGUF's own repo and revision, by size and sha256."""
@@ -271,7 +284,7 @@ class Steps(unittest.TestCase):
         cfg = json.loads(path.read_text(encoding="utf-8"))
         self.assertEqual(path.name, "maya-inkling-2-mini.json")
         self.assertEqual(cfg["exe"], str(maya.IK2_EXE))
-        self.assertEqual(cfg["args"], ["--model", str(gguf), "--max-context", "262144"])   # (no drafter)
+        self.assertEqual(cfg["args"], ["--model", str(gguf), "--max-context", "262144", "--drafting", "auto"])
         self.assertEqual(cfg["env"], {"IK2_KV": "fp8"})
         self.assertEqual((cfg["sampling"], cfg["reasoning_effort"]), ({"temperature": 1.0, "top_p": 1.0}, "high"))
         self.assertEqual((cfg["model_name"], cfg["gpu"], cfg["tokenizer"]), ("inkling-2-mini", [1], str(tok)))
@@ -285,8 +298,45 @@ class Steps(unittest.TestCase):
                 patch.object(maya, "write_run_script", lambda p, port: p.with_name("run-" + p.stem + ".sh")):
             maya.write_config_ik2(args(), pc, {}, gguf, tok, 65536, self.root / "models", d)
         cfg = json.loads(path.read_text(encoding="utf-8"))
-        self.assertEqual(cfg["args"], ["--model", str(gguf), "--max-context", "65536"])
+        self.assertEqual(cfg["args"], ["--model", str(gguf), "--max-context", "65536", "--drafting", "auto"])
         self.assertEqual(cfg["env"], {"IK2_KV": "fp8", "MY_VAR": "1"})
+        # (the drafter: --draft beside --drafting auto, the default; on / off by hand; off names no drafter)
+        mtp = d / "mtp.safetensors"
+        for how, want in ((None, ["--draft", str(mtp), "--drafting", "auto"]),
+                          ("measure", ["--draft", str(mtp), "--drafting", "auto"]),
+                          ("on", ["--draft", str(mtp), "--drafting", "on"]), ("off", ["--drafting", "off"])):
+            with patch.object(maya, "ROOT", self.root), \
+                    patch.object(maya, "write_run_script", lambda p, port: p.with_name("run-" + p.stem + ".sh")):
+                maya.write_config_ik2(args(drafting=how), pc, {}, gguf, tok, 65536, self.root / "models", d,
+                                      None, mtp)
+            cfg = json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual(cfg["args"][4:], want, how)
+            self.assertEqual(cfg["installer"]["drafting"], {"measure": "auto", None: "auto"}.get(how, how))
+
+    def test_drafter_step(self):
+        """Drafting on by default: the drafter beside the GGUF, sha256-checked; none with --drafting off or a declined
+        download (the prompt lookup then drafts alone); truthful where its room does not fit at the context."""
+        d, gguf = self.files()
+        va = lambda **kw: args(**dict(dict(rebuild=False, download_model=False, yes=False), **kw))   # noqa: E731
+        self.assertIsNone(maya.ik2_drafter_step(va(drafting="off"), d, 24, 65536, "fp8"))
+        with patch.object(maya, "offer_download", lambda *a, **k: False):
+            self.assertIsNone(maya.ik2_drafter_step(va(), d, 24, 65536, "fp8"))
+        with patch.object(maya, "file_incomplete", lambda *a: None), \
+                patch.object(maya, "sha256_checked", lambda *a: True):
+            self.assertEqual(maya.ik2_drafter_step(va(), d, 24, 65536, "fp8"), d / "mtp.safetensors")
+            said = []
+            with patch.object(maya, "warn", said.append):
+                self.assertEqual(maya.ik2_drafter_step(va(), d, 24, 262144, "fp8"), d / "mtp.safetensors")
+            self.assertIn("does not fit beside the model", " ".join(said))
+
+    def test_drafter_room(self):
+        """tools/ik2_fit.py's drafter room (maya-ik2's draft_room): 24 GB cards hold it up to about 200K tokens with the
+        FP8 cache, 32 GB at 262K; it grows 4.75 KiB a token."""
+        self.assertTrue(F.draft_fits(24, 131072, "fp8"))
+        self.assertFalse(F.draft_fits(24, 262144, "fp8"))
+        self.assertTrue(F.draft_fits(32, 262144, "fp8"))
+        self.assertTrue(F.draft_fits(0, 262144, "fp8"))          # (not known: the engine measures)
+        self.assertAlmostEqual(F.draft_gib(262144) - F.draft_gib(0), 262144 * 4864 / 2**30, places=6)
 
     def va(self, **kw):
         return args(**dict(dict(rebuild=False, download_model=False, yes=False), **kw))
@@ -320,7 +370,7 @@ class Steps(unittest.TestCase):
             path = maya.write_config_ik2(args(), pc, {}, gguf, tok, 262144, self.root / "models", d, v)
             cfg = json.loads(path.read_text(encoding="utf-8"))
             self.assertEqual(cfg["vision"], v)
-            self.assertEqual(cfg["args"], ["--model", str(gguf), "--max-context", "262144"])   # (the same plan)
+            self.assertEqual(cfg["args"], ["--model", str(gguf), "--max-context", "262144", "--drafting", "auto"])
             maya.write_config_ik2(args(), pc, {}, gguf, tok, 262144, self.root / "models", d)   # (--no-vision)
             self.assertNotIn("vision", json.loads(path.read_text(encoding="utf-8")))
 
