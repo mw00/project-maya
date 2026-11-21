@@ -33,6 +33,7 @@
 #include "ds4_markov_q8.hpp"
 #include "ds4_multi_attn.hpp"
 #include "ds4_os.hpp"
+#include "ds4_recent_stage.hpp"
 #include "ds4_part_net.hpp"
 #include "ds4_pcie.cuh"
 #include "ds4_pcie.hpp"
@@ -2060,6 +2061,14 @@ struct Model::Impl {
     // protocol at 3.5 bits, 8 / 16 / 24 / 32 of them: 59.0 / 61.5 / 62.2 / 62.9 tok/s, a routing trace's VRAM-neutral
     // optimum ~32), at most DS4_RECENT_FILLS (2) new ones a layer a tick
     int recent_n = 0;
+    const bool rc_store_stage = [] {
+#if defined(_WIN32) && !defined(STRATA_USE_HIP)
+        const char* v = std::getenv("MAYA_DS4_RECENT_STORE");
+        return v != nullptr && std::atoi(v) != 0;
+#else
+        return false;
+#endif
+    }();
     // DS4_RECENT_FIT (MAYA_DS4_RECENT_FIT, ds4_place.hpp; unset or 0: off, the split below as before): 1 - a layer whose
     // slots cannot hold the whole recent set beside a static and the spare keeps as many recent slots as leave one,
     // not none; 2 - also the queue: each layer its recent set, a static and the spare first, the slots past them priced
@@ -2079,6 +2088,7 @@ struct Model::Impl {
     struct RcJob {
         int layer = 0, slot = 0, expert = 0;
         unsigned gen = 0, win = 0;
+        int stage = -1;   // owned host copy source until this fill completes
     };
     // the expert cache's copies on a device (the swaps', the fills') off its group's turn in the windows: over the
     // GPU's PCIe link beside a window's all-reduces they slowed each ~6x (a decode capture's 1405 all-reduces: ~190 us
@@ -12068,22 +12078,69 @@ struct Model::Impl {
         std::vector<RcJob> fly;     // issued, not yet done
         std::deque<RcJob> held;     // waiting for their group's turn to end (copy_open)
         std::string err;
+        RecentStage stage;
+        if (rc_store_stage && store && file_experts && devs.size() == 1 && helper_id < 0) {
+            size_t bytes = 0;
+            for (const Layer& l : L)
+                if (l.rc_n > 0 && l.nm == 1 && l.lay.fmt == gg::kFmtMXFP4) bytes = std::max(bytes, l.blob);
+            if (RecentStage::fits(bytes) && cudaSetDevice(devs[0].id) == cudaSuccess)
+                stage.init(bytes,
+                    [](size_t n) -> uint8_t* {
+                        uint8_t* p = nullptr;
+                        if (cudaHostAlloc((void**) &p, n, cudaHostAllocPortable) == cudaSuccess) return p;
+                        cudaGetLastError();
+                        return nullptr;
+                    },
+                    [](uint8_t* p) { cudaFreeHost(p); },
+                    [] {
+                        size_t free = 0, total = 0;
+                        if (mem_info(&free, &total) == cudaSuccess && free >= (size_t{1536} << 20)) return true;
+                        cudaGetLastError();
+                        return false;
+                    });
+            else cudaGetLastError();
+            std::fprintf(stderr, "ds4: recent store staging: %s (two host buffers, at most 64 MiB)\n",
+                         stage.enabled() ? "on" : "unavailable, original source path");
+        }
+        const auto drain_stage = [&] {
+            if (cudaSetDevice(devs[0].id) == cudaSuccess && cudaStreamSynchronize(rc_cs[0]) == cudaSuccess)
+                return true;
+            cudaGetLastError();
+            return false;
+        };
+        const auto free_stage = [&] {
+            if (!stage.close(drain_stage, [](uint8_t* p) { cudaFreeHost(p); }))
+                std::fprintf(stderr, "ds4: recent staging: copy stream did not drain; sources kept until exit\n");
+        };
         for (;;) {
             {
                 std::unique_lock<std::mutex> lk(rc_mu);
                 if (fly.empty() && held.empty()) rc_cv.wait(lk, [&] { return quit.load() || !rc_q.empty(); });
-                if (quit.load()) return;
+                if (quit.load()) { lk.unlock(); free_stage(); return; }
                 for (const RcJob& j : rc_q) held.push_back(j);
                 rc_q.clear();
             }
             for (size_t i = 0; i < held.size();) {
-                const RcJob j = held[i];
+                RcJob j = held[i];
                 Layer& l = L[(size_t) j.layer];
                 bool open = true;   // (a layer's members are one group's)
                 for (int m = 0; m < l.nm && open; ++m) open = copy_open(member(l, m).dev, j.win);
                 if (!open) {
                     ++i;
                     continue;
+                }
+                if (stage.enabled() && l.nm == 1 && l.lay.fmt == gg::kFmtMXFP4 && store_reads(l, j.expert)) {
+                    const auto prepared = stage.prepare(l.blob, j.stage,
+                        [&](uint8_t* p) { return store_blob(l, j.expert, p); },
+                        [&](uint8_t* p) { return read_mx_file(l, j.expert, p); });
+                    if (prepared == RecentStage::Prepare::Waiting) { ++i; continue; }
+                    if (prepared == RecentStage::Prepare::ReadFailed) {
+                        std::fprintf(stderr, "ds4: recent staged read failed, slot left unmapped: layer %d expert %d\n",
+                                     l.il, j.expert);
+                        rc_pending.fetch_sub(1);
+                        held.erase(held.begin() + (std::ptrdiff_t) i);
+                        continue;
+                    }
                 }
                 // (a failed fill: the event still records - a member's copy may be partly under way - but the job never
                 // reaches fly, so nothing stores rc_done and the tick's rc_done != rc_gen check never publishes the
@@ -12106,13 +12163,20 @@ struct Model::Impl {
                     if (injected) {
                         err = "DS4_FAULT_RC_FILL: injected recent-slot fill failure (nothing was copied)";
                         ok = false;
-                    } else if (!stream_expert(l, m, j.expert, sat(l, x, l.rc_base + j.slot, unit(x)), rc_cs[(size_t) di], err))
+                    } else if (!stream_expert(l, m, j.expert, sat(l, x, l.rc_base + j.slot, unit(x)), rc_cs[(size_t) di], err,
+                                             j.stage >= 0 ? stage.data(j.stage) : nullptr))
                         ok = false;
-                    cudaEventRecord(l.rc_ev[(size_t) j.slot * l.nm + m], rc_cs[(size_t) di]);
+                    const cudaError_t recorded = cudaEventRecord(l.rc_ev[(size_t) j.slot * l.nm + m], rc_cs[(size_t) di]);
+                    if (j.stage >= 0 && recorded != cudaSuccess) {
+                        err = std::string("recent fill event: ") + cudaGetErrorString(recorded);
+                        cudaGetLastError();
+                        ok = false;
+                    }
                 }
                 if (ok)
                     fly.push_back(j);
                 else {
+                    if (j.stage >= 0) stage.failed(j.stage, drain_stage);
                     if (injected)
                         std::fprintf(stderr, "ds4: FAULT recent-slot fill: layer %d expert %d slot %d fails at issue\n",
                                      l.il, j.expert, l.rc_base + j.slot);
@@ -12125,10 +12189,29 @@ struct Model::Impl {
             for (size_t i = 0; i < fly.size();) {   // the ones whose copies are all done: marked
                 const RcJob& j = fly[i];
                 Layer& l = L[(size_t) j.layer];
-                bool done = true;
+                bool done = true, failed = false;
                 for (int m = 0; m < l.nm && done; ++m) {
                     cudaSetDevice(devs[(size_t) member(l, m).dev].id);
-                    done = cudaEventQuery(l.rc_ev[(size_t) j.slot * l.nm + m]) == cudaSuccess;
+                    const cudaError_t queried = cudaEventQuery(l.rc_ev[(size_t) j.slot * l.nm + m]);
+                    done = queried == cudaSuccess;
+                    if (j.stage >= 0 && !done && queried != cudaErrorNotReady) {
+                        err = std::string("recent fill completion: ") + cudaGetErrorString(queried);
+                        cudaGetLastError();
+                        failed = true;
+                    }
+                }
+                if (j.stage >= 0) {
+                    stage.poll(j.stage, failed ? RecentStage::Completion::Failed
+                                              : done ? RecentStage::Completion::Complete : RecentStage::Completion::Pending,
+                               drain_stage);
+                    if (failed) {
+                        std::fprintf(stderr, "ds4: recent-slot fill failed, slot left unmapped: layer %d expert %d: %s\n",
+                                     l.il, j.expert, err.c_str());
+                        rc_pending.fetch_sub(1);
+                        fly[i] = fly.back();
+                        fly.pop_back();
+                        continue;
+                    }
                 }
                 if (done) {
                     rc_done[(size_t) (l.rc_off + j.slot)].store(j.gen, std::memory_order_release);

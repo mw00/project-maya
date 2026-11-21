@@ -865,6 +865,20 @@ to enable size-local feedback, and it is not a universal tuning recommendation.
 
 ## DeepSeek: the PCIe lane
 
+`MAYA_DS4_RECENT_STORE=1` (default off) lets recent-cache fills reuse ready
+RAM-store experts on Windows/NVIDIA with one GPU, file-backed GGUF experts, and
+no helper GPU. A store miss reads the expert into the same pinned source buffer
+from its file, without dereferencing the expert mapping. There are two reusable
+host buffers, at most 32 MiB each; if the pair cannot be allocated or less than
+1536 MiB of free VRAM remains, fills use their original source path. The store
+lease ends after the CPU copy; the owned source remains held until the GPU copy
+completes. Cache selection and compute kernels are unchanged, but completion
+timing can change CPU/GPU placement and generated tokens. This is not a general
+speed recommendation: measure it against both the original streaming path and
+`DS4_STREAM=0`. For a separate correctness run, `DS4_CHECK_SWAPS=1` compares
+completed recent-cache payloads with the model files (its extra I/O and readbacks
+should not be included in timing runs).
+
 While answering, a token's routed experts that VRAM does not hold were all computed on the CPU (the CPU lane). Now,
 as for GLM, some of them can go to the GPU instead: read into pinned memory, copied into a few staging slots on the
 GPU and computed there, while the CPU computes the rest - so both finish together. How many is decided for every token
