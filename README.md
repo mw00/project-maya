@@ -82,7 +82,9 @@ turboderp's EXL3 quants of GLM, Qwen-3.8-Flash-Next (CYBER-FROST) as its Q5_K_M 
 itself as unsloth's UD-IQ2_XS GGUF, both with pictures
 ([its settings](docs/SETTINGS.md#qwen-38-flash-next-cyber-frost)), and Tencent's own Q4_K_M of Hy4-flash (AngelSlim's GGUF)
 with MTP drafting (run on NVIDIA RTX 30 / A100 and newer, Linux; with pictures: `./maya.sh --setup --model hy4-flash-q4_k_m`;
-[its settings](docs/SETTINGS.md#hy4-flash)). **Each model's files, drafters, pictures and options:
+[its settings](docs/SETTINGS.md#hy4-flash)), and Inkling 2 Mini (26 B) as an experimental preview on its own engine:
+unsloth's UD-Q4_K_XL GGUF, the whole model in one 24 GB NVIDIA card (RTX 30 / A100 and newer, Linux), with pictures
+(`./maya.sh --setup --model inkling-2-mini`; [docs/INKLING2.md](docs/INKLING2.md)). **Each model's files, drafters, pictures and options:
 [docs/MODELS.md](docs/MODELS.md).**
 
 ## Quality

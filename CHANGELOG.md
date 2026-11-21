@@ -4,6 +4,17 @@ Every release is on GitHub (Releases) with these notes; every published change m
 page's Settings › About and updates (About > Update before the redesign; from v1.0.18), or `git pull`, then `./setup.sh` (Windows: `START-MAYA.bat`) - it recompiles
 only what changed and starts; the model is not downloaded again.
 
+## v1.1.72 - 2026-11-21
+
+Inkling 2 Mini arrives as an experimental preview on its own engine, `maya-ik2`: the whole model in the VRAM of one
+24 GB NVIDIA card on Linux, with thinking levels, tool calls and pictures.
+
+- **Inkling 2 Mini, an experimental preview (#1095):** a new engine, `maya-ik2`, for Inkling 2 Mini (26 B; its middle layers run three times, as a loop). Every expert stays in the VRAM of one 24 GB NVIDIA card (RTX 30 / A100 and newer, Linux) with an FP8 cache, up to a 262,144-token context. `./maya.sh --setup --model inkling-2-mini` (or the Models page, where it is marked experimental) downloads unsloth's `Inkling-2-Mini-UD-Q4_K_XL` (17.6 GB) and its vision tower (`mmproj-BF16`, 0.64 GB; Apache 2.0) and checks both. It answers through the OpenAI and Anthropic APIs and Maya's model API, with streaming, tool calls, stop and the loop guard, and greedy answers repeat across requests and starts. Its own defaults: temperature 1.0, top_p 1.0, thinking from Off to Max (High by default). On one RTX 3090 (the author's `./maya.sh --bench`): decode 124.6 tok/s and prompt reading 2,542 tok/s, against 57 and 1,052 tok/s in llama.cpp b12590 on the same card. See [docs/INKLING2.md](docs/INKLING2.md).
+- **Inkling 2 Mini reads pictures (on by default):** Maya's image encoder (`maya-vision`) now reads Inkling 2's pictures. It starts when a picture arrives - on the GPU where the card has room beside the model, otherwise on the CPU - and ends after that request, so the model's VRAM plan does not change. Images on the Models page turns it off.
+- **Where the preview does not run:** on AMD, on Windows, on cards with less than 24 GB, on GPUs older than the RTX 30 / A100 and with more than one GPU named, the setup and the engine stop with a one-line reason. The other engines build and run as before; Windows and older-GPU builds skip `maya-ik2` and say so.
+- **GLM-5.3-Flash and Qwen-3.8-Flash-Next pictures:** `maya-vision` is compiled once more at the next setup (about 10-20 minutes, once), because its source changed for Inkling 2; their pictures are read the same as before.
+- **Credits:** Inkling 2 Mini on `maya-ik2` (#1095) was contributed by @alesha-pro, built on @mrsirg97-rgb's file format and reference forward pass (#981) and @OscarSheng's engine and server wiring (#1079), with @cobra91's Windows, CUDA 13 and two-GPU work in the branch; the setup, the Models page and the pictures by @mw00 (peasantsmith).
+
 ## v1.1.71 - 2026-11-21
 
 Hy4-Flash decodes faster where the CPU computes experts (the experts in VRAM follow the ones the answers use, and the
