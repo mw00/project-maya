@@ -13,8 +13,9 @@ writes <model>/maya-ds4/ in pack.py's format, so the engine reads both:
   engram.bin    the Engram hash tables, from the GGUF's metadata (pack.py's layout; no tokenizers package needed)
   tokenizer/    the server's tokenizer from the GGUF's vocabulary and merges (pre "deepseek3"), and its chat template
 
-A GGUF has no DSpark drafter: drafter_pack.py makes it from DeepSeek's checkpoint into ../dspark/, and the pack takes it
-from there when it is present.  Nor a vision tower: vision_pack.py makes it from DeepSeek's checkpoint into ../vision/
+A model GGUF has no DSpark drafter: drafter_pack.py makes it from DeepSeek's checkpoint into ../dspark/, or
+drafter_from_gguf.py references an existing separate DSpark GGUF there without copying its weight file. The pack takes
+either when it is present. Nor a vision tower: vision_pack.py makes it from DeepSeek's checkpoint into ../vision/
 (--vision: another folder), and the pack takes it and its geometry (vision.<key>, image_token_id) from there when it is
 present; without it the engine reads text only.
 
@@ -426,7 +427,8 @@ def main() -> int:
     ap.add_argument("--model", required=True, help="the directory of the GGUF's shards")
     ap.add_argument("--out", help="default: <model>/maya-ds4")
     ap.add_argument("--vision", help="vision_pack.py's folder (default: <model>/../vision; taken when it is there)")
-    ap.add_argument("--drafter", help="the DSpark drafter's .json (drafter_pack.py's; default <model>/../dspark/dspark.json)")
+    ap.add_argument("--drafter", help="the DSpark drafter's .json (from drafter_pack.py or drafter_from_gguf.py; "
+                                  "default <model>/../dspark/dspark.json)")
     ap.add_argument("--engram", help="the folder of the Engram tables' GGUF set, for a quant that leaves them out "
                                      "(default: <model>/../Engram, when it is whole)")
     ap.add_argument("--shards", nargs="+", help="the GGUF's files in --model (default: every .gguf there - one "
@@ -584,7 +586,13 @@ def main() -> int:
             print("DSpark geometry not in the GGUF, taken from %s: %s" %
                   (src, ", ".join("%s %s" % (k, fill[k]) for k in DSPARK_KEYS if k in fill)))
     if drafter_in:
-        files.append(rel(drafter.with_suffix(".bin")))
+        try:
+            drafter_file = rel(drafter.with_suffix(".bin"))
+        except ValueError as exc:  # Windows: another drive
+            raise SystemExit(f"{drafter}: the drafter must be on the model's drive") from exc
+        if any(char.isspace() for char in drafter_file):
+            raise SystemExit(f"{drafter}: the drafter path relative to the model cannot contain whitespace")
+        files.append(drafter_file)
         groups = int(kv["%s.attention.output_group_count" % kv["general.architecture"]])
         for name, dt, off, nb, shape in dinfo["tensors"]:
             if name.endswith(".attn.wo_a.weight"):   # (one entry a group, as the trunk's)
