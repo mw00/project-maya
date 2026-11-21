@@ -2052,6 +2052,11 @@ void fast_token_launches(Model& M, Work& W, OutMode out_mode) {
             }
         }
         if (M.V[vis].pass > 0) msg = W.lp_msg_all + (size_t) (l - c.core0) * 4 * C;   // (q, k | v, MoE)
+        if (g_taps) {   // (the drafter's taps of the token: row 0)
+            const int tap = draft_tap(c, l, vis);
+            if (tap >= 0)
+                CU(cudaMemcpyAsync(g_taps + (size_t) tap * g_taps_ld * C, W.h, Cb, cudaMemcpyDeviceToDevice, g_s));
+        }
         // the attention's inputs, normed, in F32: W.xq, W.xk, W.xv (sep: q, k and v each have their own)
         float* x3[3] = {W.xq, W.xk, W.xv};
         const float* nw[3] = {Ly.sliding ? Ly.attn_norm : Ly.q_in_norm, Ly.sliding ? Ly.attn_norm : Ly.k_in_norm,
@@ -2195,6 +2200,8 @@ void fast_token_launches(Model& M, Work& W, OutMode out_mode) {
         k::RmsOuts outs{};
         outs.w[0] = M.out_norm, outs.y16[0] = W.x16, outs.y32[0] = W.xq;
         k::attn_res_rms_f16(st, nb + 1, M.out_res_score, 1, 1, C, 1e-6f, c.eps, outs, g_s);
+        if (g_taps)
+            CU(cudaMemcpyAsync(g_taps + (size_t) g_final_tap * g_taps_ld * C, W.xq, Cb, cudaMemcpyDeviceToDevice, g_s));
         mv1(M.out_w, W.xq, W.logits);
         if (out_mode == OutMode::kArgmax) {
             k::argmax_sum(W.logits, nullptr, nullptr, c.n_vocab, W.argmax_d, g_s);
@@ -2264,6 +2271,7 @@ struct BlockBufs {
     float* lp_msg = nullptr;     // a pass's messages, [n_core][4][kBlockMax][C]
     k::ConvRec* recs = nullptr;  // every visit's four convs (rollback_block)
     int n_recs = 0;
+    int *cand_d = nullptr, *cand_h = nullptr;   // kCand: each row's k::cand_topk out, [kBlockMax][2 + 2 kCandCap]
 };
 BlockBufs g_blk;
 FastGraph g_bgraph[kBlockMax + 1][4];   // by window size and OutMode
@@ -2275,6 +2283,8 @@ void block_init(Model& M) {
     CU(cudaHostAlloc(&g_blk.emb_h, (size_t) kBlockMax * C * 4, cudaHostAllocPortable));
     CU(cudaHostAlloc(&g_blk.pos_h, (size_t) kBlockMax * 4, cudaHostAllocPortable));
     CU(cudaHostAlloc(&g_blk.logits_h, (size_t) kBlockMax * c.n_vocab * 4, cudaHostAllocPortable));
+    CU(cudaHostAlloc(&g_blk.cand_h, (size_t) kBlockMax * (2 + 2 * kCandCap) * 4, cudaHostAllocPortable));
+    g_blk.cand_d = dalloc<int>((size_t) kBlockMax * (2 + 2 * kCandCap));
     g_blk.blob = dalloc<const uint8_t*>(S);
     g_blk.n = dalloc<int>(S), g_blk.inv = dalloc<int>(S);
     g_blk.tok = dalloc<int>((size_t) S * k::kGroupMax), g_blk.row = dalloc<int>((size_t) S * k::kGroupMax);
@@ -2488,6 +2498,13 @@ void fast_block_launches(Model& M, Work& W, int T, OutMode out_mode) {
         if (out_mode == OutMode::kArgmax) {
             k::argmax_rows(W.logits, c.n_rows, T, c.n_vocab, W.argmax_d, g_s);
             CU(cudaMemcpyAsync(W.argmax_h, W.argmax_d, (size_t) T * 4, cudaMemcpyDeviceToHost, g_s));
+        } else if (out_mode == OutMode::kCand) {   // (each row's candidates, as the token path's)
+            const size_t cs = 2 + 2 * (size_t) kCandCap;
+            k::softcap(W.logits, (size_t) T * c.n_rows, c.logit_cap, g_s);
+            for (int t = 0; t < T; ++t)
+                k::cand_topk(W.logits + (size_t) t * c.n_rows, c.n_vocab, -c.logit_cap, c.logit_cap, kCandK, kCandCap,
+                             W.cand_part, g_blk.cand_d + t * cs, g_s);
+            CU(cudaMemcpyAsync(g_blk.cand_h, g_blk.cand_d, (size_t) T * cs * 4, cudaMemcpyDeviceToHost, g_s));
         } else {
             k::softcap(W.logits, (size_t) T * c.n_rows, c.logit_cap, g_s);
             for (int t = 0; t < T; ++t)
@@ -2504,7 +2521,6 @@ void fast_block(Model& M, const int* tok, int T, int pos0, OutMode out_mode, std
     const Config& c = M.c;
     if (T < 1 || T > kBlockMax) die("fast_block: a window of 1 .. 8 tokens");
     if (!g_blk.ready) block_init(M);
-    if (out_mode == OutMode::kCand) out_mode = OutMode::kLogits;
     Work& W = dev_work(0);
     const size_t rb = (size_t) c.C / k::block_values(M.embd_type) * k::block_bytes(M.embd_type);
     for (int t = 0; t < T; ++t) {
@@ -2530,17 +2546,186 @@ void fast_block(Model& M, const int* tok, int T, int pos0, OutMode out_mode, std
         logits_out.insert(logits_out.end(), g_blk.logits_h, g_blk.logits_h + (size_t) T * c.n_vocab);
     }
 }
+// row t's candidates of the last kCand window (logit, token); false: more than kept (the row's logits then)
+bool block_cands(const Model& M, int t, std::vector<std::pair<float, int>>& cd) {
+    const int* r = g_blk.cand_h + (size_t) t * (2 + 2 * kCandCap);
+    if (r[0] > kCandCap) return false;
+    const int* idx = r + 2;
+    const float* val = (const float*) (r + 2 + kCandCap);
+    cd.resize(r[0]);
+    for (int i = 0; i < r[0]; ++i) cd[i] = {val[i], idx[i]};
+    return true;
+}
 // every conv's history as after the first n tokens of the last window (fast_block's records)
 void block_rollback(int n) {
     k::rollback_block(g_blk.recs, g_blk.n_recs, n, g_s);
+}
+
+
+// ---- speculative decoding on the resident path: the drafter's tokens verified as one window (fast_block)
+
+void embed_row(Model& M, int t, float* raw, float* out);
+
+struct SampleCfg {   // temp <= 0: greedy
+    double temp = 0, top_p = 1;
+    int top_k = 0;
+    std::mt19937_64* rng = nullptr;
+};
+// the serve loop's sampling distribution over candidates cd (logit, token): softmax(logit / temp) over the top_p
+// mass of the min(top_k, kCandK) largest (ties: the lower token first) - pick_top's - as (token, probability)
+std::vector<std::pair<int, double>> sample_dist(std::vector<std::pair<float, int>>& cd, const SampleCfg& sc) {
+    const int kk = std::min((int) cd.size(), sc.top_k > 0 ? std::min(sc.top_k, kCandK) : kCandK);
+    std::partial_sort(cd.begin(), cd.begin() + kk, cd.end(),
+                      [](const std::pair<float, int>& a, const std::pair<float, int>& b) {
+                          return a.first > b.first || (a.first == b.first && a.second < b.second);
+                      });
+    std::vector<double> pr(kk);
+    double z = 0;
+    for (int j = 0; j < kk; ++j) z += (pr[j] = std::exp((cd[j].first - cd[0].first) / sc.temp));
+    double acc = 0;
+    int keep = kk;
+    for (int j = 0; j < kk; ++j) {
+        acc += pr[j] / z;
+        if (acc >= sc.top_p) {
+            keep = j + 1;
+            break;
+        }
+    }
+    double zk = 0;
+    for (int j = 0; j < keep; ++j) zk += pr[j];
+    std::vector<std::pair<int, double>> out(keep);
+    for (int j = 0; j < keep; ++j) out[j] = {cd[j].second, pr[j] / zk};
+    return out;
+}
+int sample_from(const std::vector<std::pair<int, double>>& d, std::mt19937_64& rng, int skip = -1) {
+    double z = 0;
+    for (const auto& e : d)
+        if (e.first != skip) z += e.second;
+    if (z <= 0) return d[0].first;
+    double u = std::uniform_real_distribution<double>(0, z)(rng);
+    for (const auto& e : d) {
+        if (e.first == skip) continue;
+        u -= e.second;
+        if (u <= 0) return e.first;
+    }
+    for (auto it = d.rbegin(); it != d.rend(); ++it)
+        if (it->first != skip) return it->first;
+    return d[0].first;
+}
+
+// When to draft and how wide (IK2_DRAFT_WIDTH the widest; IK2_DRAFT_ADAPT=0: always that wide): a step's expected
+// tokens (1 - a^B) / (1 - a) - a the drafts' acceptance, each accepted given the one before it, from the recent
+// steps - over its measured time, against a plain token's; a plain run drafts once in a while to look again.
+struct SpecCtl {
+    int wmax = 5;
+    bool adapt = true;
+    double c_plain = 7.8e-3, c[kBlockMax + 1] = {};
+    double S = 1, F = 1;   // (the drafts accepted, the ones rejected: decayed counts)
+    int plain_run = 0;
+    int probe = getenv("IK2_DRAFT_PROBE") ? atoi(getenv("IK2_DRAFT_PROBE")) : 8;   // plain tokens before a look
+    int probe_w = 4;
+    double decay = getenv("IK2_DRAFT_DECAY") ? atof(getenv("IK2_DRAFT_DECAY")) : 0.85;
+    uint64_t steps = 0, plain = 0, drafted = 0, accepted = 0;
+    uint64_t hist[kBlockMax] = {};
+    SpecCtl() {
+        const double prior[kBlockMax + 1] = {0, 7.8e-3, 13.3e-3, 15.1e-3, 16.7e-3, 18.2e-3, 19.8e-3, 21.3e-3, 22.8e-3};
+        for (int b = 0; b <= kBlockMax; ++b) c[b] = prior[b];
+    }
+    int choose(int room) {   // room: the widest a step may be (1: plain)
+        const int bmax = std::min(wmax, room);
+        if (bmax < 2) return 1;
+        if (!adapt) return bmax;
+        const double a = std::min(0.98, (S + 0.5) / (S + F + 1.0));
+        int best = 1;
+        double vb = 1.0 / c_plain;
+        for (int b = 2; b <= bmax; ++b) {
+            const double e = (1.0 - std::pow(a, b)) / (1.0 - a), v = e / c[b];
+            if (v > vb) vb = v, best = b;
+        }
+        if (best == 1 && plain_run >= probe) best = std::min(probe_w, bmax);   // (a look at the acceptance again)
+        return best;
+    }
+    void took_plain(double t) {
+        c_plain = 0.9 * c_plain + 0.1 * t;
+        ++plain, ++plain_run;
+    }
+    void took_spec(int B, int acc, double t) {
+        c[B] = 0.8 * c[B] + 0.2 * t;
+        S = decay * S + acc, F = decay * F + (acc < B - 1 ? 1 : 0);
+        ++steps, drafted += B - 1, accepted += acc, ++hist[acc];
+        plain_run = 0;
+    }
+};
+
+// One speculative step: the anchor (the last chosen token, not run yet) at position P, B - 1 drafts after it, the B
+// verified as one window.  next: the tokens chosen after the anchor - the accepted drafts and the target's own next
+// token (the last: not run yet, the next step's anchor), cut after a stop token.  The anchor and next but its last
+// are then in the cache, the convs' histories taken back to them and the drafter's context written for them.
+void spec_step(Model& M, ik2::draft::Drafter* drafter, int anchor, int P, int B, const SampleCfg& sc,
+               const std::vector<int>& stops, std::vector<int>& next) {
+    const Config& c = M.c;
+    static float *raw = nullptr, *anchor_h = nullptr;
+    if (!raw) raw = dalloc<float>(c.C), anchor_h = dalloc<float>(c.C);
+    embed_row(M, anchor, raw, anchor_h);
+    int dr[kBlockMax];
+    ik2::draft::propose(drafter, anchor, anchor_h, P, nullptr, c.n_rows, c.n_vocab, dr, B - 1);
+    int tk[kBlockMax];
+    tk[0] = anchor;
+    for (int j = 1; j < B; ++j) tk[j] = dr[j - 1];
+    next.clear();
+    std::vector<float> lo;
+    if (sc.temp <= 0) {
+        std::vector<int> g;
+        fast_block(M, tk, B, P, OutMode::kArgmax, lo, &g);
+        int n = 0;
+        while (n < B - 1 && dr[n] == g[n]) ++n;
+        for (int j = 0; j < n; ++j) next.push_back(dr[j]);
+        next.push_back(g[n]);
+    } else {
+        // the drafts are the drafter's argmax (a point mass): accept draft d with the target's probability of it,
+        // else sample the target's distribution without d - the target's distribution exactly
+        fast_block(M, tk, B, P, OutMode::kCand, lo, nullptr);
+        for (int j = 0; j < B; ++j) {
+            std::vector<std::pair<float, int>> cd;
+            if (!block_cands(M, j, cd)) {   // (more candidates than kept: the row's logits)
+                std::vector<float> row((size_t) c.n_vocab);
+                CU(cudaMemcpy(row.data(), dev_work(0).logits + (size_t) j * c.n_rows, (size_t) c.n_vocab * 4,
+                              cudaMemcpyDeviceToHost));
+                cd.resize(c.n_vocab);
+                for (int v = 0; v < c.n_vocab; ++v) cd[v] = {row[v], v};
+            }
+            const auto dist = sample_dist(cd, sc);
+            if (j == B - 1) {
+                next.push_back(sample_from(dist, *sc.rng));
+                break;
+            }
+            double pd = 0;
+            for (const auto& e : dist)
+                if (e.first == dr[j]) pd = e.second;
+            if (std::uniform_real_distribution<double>(0, 1)(*sc.rng) < pd) {
+                next.push_back(dr[j]);
+            } else {
+                next.push_back(sample_from(dist, *sc.rng, dr[j]));
+                break;
+            }
+        }
+    }
+    for (size_t j = 0; j + 1 < next.size(); ++j)   // (a stop among the accepted: it is the last)
+        if (std::find(stops.begin(), stops.end(), next[j]) != stops.end()) {
+            next.resize(j + 1);
+            break;
+        }
+    const int m = (int) next.size();   // (the anchor and next[0 .. m - 2] are kept: m positions)
+    if (m < B) block_rollback(m);
+    ik2::draft::write_context(drafter, g_taps, g_taps_ld, 0, m, P);
+    ik2::draft::set_f_rnn(drafter, g_taps, g_taps_ld, m - 1);
 }
 
 void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode out_mode, const std::string& dump,
              std::vector<float>& logits_out, std::vector<int>* argmax_out, double& t_exp) {
     const Config& c = M.c;
     const int C = c.C;
-    if (g_fast && T == 1 && dump.empty() && !g_prof && !g_rec && !g_taps && !g_trace && g_pop.empty() &&
-        g_img.at(pos0) < 0) {
+    if (g_fast && T == 1 && dump.empty() && !g_prof && !g_rec && !g_trace && g_pop.empty() && g_img.at(pos0) < 0) {
         fast_token(M, tok[0], pos0, out_mode, logits_out, argmax_out);
         return;
     }
@@ -4497,6 +4682,12 @@ int main(int argc, char** argv) {
         };
         std::string line;
         std::mt19937_64 rng(1234);
+        // speculative decoding (--draft, the resident path): the controller decides each step; IK2_DRAFT_WIDTH the
+        // widest window, IK2_DRAFT_ADAPT=0 always that wide
+        SpecCtl sctl;
+        const bool spec_on = drafter && g_fast && g_block;
+        sctl.wmax = getenv("IK2_DRAFT_WIDTH") ? std::clamp(atoi(getenv("IK2_DRAFT_WIDTH")), 2, kBlockMax) : 5;
+        sctl.adapt = !(getenv("IK2_DRAFT_ADAPT") && !atoi(getenv("IK2_DRAFT_ADAPT")));
         while (next_line(line)) {
             std::istringstream in(line);
             std::string cmd, stops_s, ids_s, emb_path;
@@ -4637,6 +4828,10 @@ int main(int argc, char** argv) {
                         forward(M, ids.data() + p0, n, (int) p0, false, last_c ? OutMode::kLogits : OutMode::kNone,
                                 std::string(), lo, nullptr, t_exp);
                         if (last_c) last = std::move(lo);
+                        if (drafter) {   // (the drafter's context for these positions, from their taps)
+                            ik2::draft::write_context(drafter, g_taps, g_taps_ld, 0, n, (int) p0);
+                            if (last_c) ik2::draft::set_f_rnn(drafter, g_taps, g_taps_ld, n - 1);
+                        }
                     }
                 }
             }
@@ -4713,6 +4908,7 @@ int main(int argc, char** argv) {
             // IK2_CAND=0: sampling takes the whole vocabulary's logits from the device every token
             const bool use_cand = !(getenv("IK2_CAND") && !std::atoi(getenv("IK2_CAND")));
             bool cand = false;   // the last token's logits came as candidates (g_cand), not in `last`
+            int pending_sample = -1;   // (a speculative window's last token, sampled already)
             const char* reason = "length";
             int n_out = 0;
             int greedy_tok = temp <= 0 && !last.empty() ? pick(last.data()) : -1;
@@ -4721,7 +4917,11 @@ int main(int argc, char** argv) {
                     reason = "cancelled";
                     break;
                 }
-                const int tok = temp <= 0 ? greedy_tok : cand ? pick_cand() : pick(last.data());
+                const int tok = temp <= 0             ? greedy_tok
+                                : pending_sample >= 0 ? pending_sample
+                                : cand                ? pick_cand()
+                                                      : pick(last.data());
+                pending_sample = -1;
                 ++n_out;
                 std::printf(serve_maya ? "T %d\n" : "@TOK %d\n", tok);
                 std::fflush(stdout);
@@ -4730,6 +4930,34 @@ int main(int argc, char** argv) {
                     break;
                 }
                 if (i + 1 == max_new) break;
+                const int B = spec_on ? sctl.choose(std::min(max_new - i - 1, ctx - (int) hist.size())) : 1;
+                if (B >= 2) {
+                    SampleCfg sc;
+                    sc.temp = temp, sc.top_p = top_p, sc.top_k = top_k, sc.rng = &rng;
+                    std::vector<int> next;
+                    const double ts = now();
+                    spec_step(M, drafter, tok, (int) hist.size(), B, sc, stops, next);
+                    CU(cudaStreamSynchronize(g_s));
+                    sctl.took_spec(B, (int) next.size() - 1, now() - ts);
+                    hist.push_back(tok);
+                    for (size_t j = 0; j + 1 < next.size(); ++j) {
+                        std::printf(serve_maya ? "T %d\n" : "@TOK %d\n", next[j]);
+                        hist.push_back(next[j]);
+                    }
+                    std::fflush(stdout);
+                    n_out += (int) next.size() - 1;
+                    i += (int) next.size() - 1;
+                    if (temp <= 0) greedy_tok = next.back();
+                    else pending_sample = next.back();
+                    last.clear();
+                    cand = false;
+                    if (g_cancel) {
+                        reason = "cancelled";
+                        break;
+                    }
+                    continue;
+                }
+                const double tp0 = now();
                 if (temp <= 0) {
                     std::vector<float> lo;
                     std::vector<int> ag;
@@ -4743,8 +4971,18 @@ int main(int argc, char** argv) {
                     cand = use_cand && g_cand.n >= 0;
                     last = std::move(lo);
                 }
+                if (spec_on) {   // (the drafter's context for the token: its taps, row 0)
+                    ik2::draft::write_context(drafter, g_taps, g_taps_ld, 0, 1, (int) hist.size());
+                    ik2::draft::set_f_rnn(drafter, g_taps, g_taps_ld, 0);
+                    CU(cudaStreamSynchronize(g_s));
+                    sctl.took_plain(now() - tp0);
+                }
                 hist.push_back(tok);
             }
+            if (spec_on && getenv("IK2_STATS"))
+                std::fprintf(stderr, "speculative: %llu windows, %llu of %llu drafts accepted, %llu plain tokens\n",
+                             (unsigned long long) sctl.steps, (unsigned long long) sctl.accepted,
+                             (unsigned long long) sctl.drafted, (unsigned long long) sctl.plain);
             if (serve_maya)
                 std::printf("DONE %d %zu %.1f %.1f %s 0 0 %d\n", n_out, ids.size(), (t1 - t0) * 1e3, (now() - t1) * 1e3,
                             std::strcmp(reason, "cancelled") == 0 ? "cancel" : reason, cached);
@@ -4870,7 +5108,40 @@ int main(int argc, char** argv) {
                     (int) std::min<size_t>(force.size(), out.size()), agree,
                     100.0 * agree / std::max<size_t>(1, std::min<size_t>(force.size(), out.size())));
 
-    if (drafter) {
+    SpecCtl ctl;
+    if (drafter && g_fast && g_block) {
+        // (the resident path: the controller picks plain tokens or a window; greedy, as the CLI's generation is)
+        ctl.wmax = getenv("IK2_DRAFT_WIDTH") ? std::clamp(atoi(getenv("IK2_DRAFT_WIDTH")), 2, kBlockMax) : 5;
+        ctl.adapt = !(getenv("IK2_DRAFT_ADAPT") && !atoi(getenv("IK2_DRAFT_ADAPT")));
+        int anchor = first_best, P = (int) prompt.size();
+        out.push_back(anchor);
+        const SampleCfg sc;
+        std::vector<int> next;
+        while ((int) out.size() < gen && P < ctx) {
+            const int room = std::min(gen - (int) out.size(), ctx - P);
+            const int B = ctl.choose(room);
+            const double ts = now();
+            if (B < 2) {
+                std::vector<float> lo;
+                std::vector<int> ag;
+                forward(M, &anchor, 1, P, false, OutMode::kArgmax, std::string(), lo, &ag, t_exp);
+                ik2::draft::write_context(drafter, g_taps, g_taps_ld, 0, 1, P);
+                ik2::draft::set_f_rnn(drafter, g_taps, g_taps_ld, 0);
+                CU(cudaStreamSynchronize(g_s));
+                ctl.took_plain(now() - ts);
+                anchor = ag[0], P += 1;
+                out.push_back(anchor);
+                continue;
+            }
+            spec_step(M, drafter, anchor, P, B, sc, std::vector<int>{}, next);
+            CU(cudaStreamSynchronize(g_s));
+            ctl.took_spec(B, (int) next.size() - 1, now() - ts);
+            for (int j = 0; j < (int) next.size() && (int) out.size() < gen; ++j) out.push_back(next[j]);
+            P += (int) next.size();
+            anchor = next.back();
+        }
+        for (size_t j = 0; j < out.size(); ++j) std::printf("%d%s", out[j], j + 1 < out.size() ? "," : "\n");
+    } else if (drafter) {
         // draft 7 after the anchor, verify the 8 in one call, keep the agreeing prefix and the target's next token
         float *raw = dalloc<float>(c.C), *anchor_h = dalloc<float>(c.C);
         auto argmax_row = [&](const float* r) { return (int) (std::max_element(r, r + c.n_vocab) - r); };
@@ -4993,6 +5264,16 @@ int main(int argc, char** argv) {
         for (size_t j = 0; j < out.size(); ++j) std::printf("%d%s", out[j], j + 1 < out.size() ? "," : "\n");
     }
     const double gen_s = now() - tg;
+    if (drafter && (ctl.steps || ctl.plain)) {
+        std::printf("speculative: %llu windows (%llu drafts, %llu accepted: %.2f tokens a window; accepted drafts:",
+                    (unsigned long long) ctl.steps, (unsigned long long) ctl.drafted, (unsigned long long) ctl.accepted,
+                    ctl.steps ? 1.0 + (double) ctl.accepted / ctl.steps : 0.0);
+        for (int j = 0; j < kBlockMax; ++j) std::printf(" %llu", (unsigned long long) ctl.hist[j]);
+        std::printf("), %llu plain tokens; a window %.1f ms (widths 2 .. 6:", (unsigned long long) ctl.plain,
+                    ctl.c[std::min(ctl.wmax, kBlockMax)] * 1e3);
+        for (int b = 2; b <= 6; ++b) std::printf(" %.1f", ctl.c[b] * 1e3);
+        std::printf("), a plain token %.1f ms\n", ctl.c_plain * 1e3);
+    }
     if (drafter && n_steps) {
         std::printf("speculative: %d steps, %.2f tokens a step (accepted drafts: ", n_steps,
                     (double) (out.size() - 1) / n_steps);
