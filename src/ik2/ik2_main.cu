@@ -58,6 +58,25 @@ static inline int munmap(void*, size_t) { return 0; }
 #include <unistd.h>
 #endif
 
+// CUDA 13 takes a cudaMemLocation where 12 took a device number (cudaCpuDeviceId, -1: the host): the managed KV
+// pool and the expert tiers (IK2_TIER) call the 12 form
+#if !defined(STRATA_USE_HIP) && defined(CUDART_VERSION) && CUDART_VERSION >= 13000
+static inline cudaMemLocation mem_location(int device) {
+    cudaMemLocation loc{};
+    loc.type = device < 0 ? cudaMemLocationTypeHost : cudaMemLocationTypeDevice;
+    loc.id = device < 0 ? 0 : device;
+    return loc;
+}
+static inline cudaError_t cudaMemPrefetchAsync_compat(const void* p, size_t n, int device, cudaStream_t s = 0) {
+    return cudaMemPrefetchAsync(p, n, mem_location(device), 0, s);
+}
+static inline cudaError_t cudaMemAdvise_compat(const void* p, size_t n, cudaMemoryAdvise advice, int device) {
+    return cudaMemAdvise(p, n, advice, mem_location(device));
+}
+#define cudaMemPrefetchAsync cudaMemPrefetchAsync_compat
+#define cudaMemAdvise cudaMemAdvise_compat
+#endif
+
 #include <algorithm>
 #include <atomic>
 #include <cctype>
