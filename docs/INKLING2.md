@@ -246,7 +246,9 @@ half the experts', half the dense) and its launches - each 2 us and more whateve
 
 A prompt goes the cache path's way with every expert a hit; the attention's flash kernel reads an FP8 cache too
 (the tile's bytes by `cp.async`, FP16 of them in shared memory), and a looped layer's gates are cuBLAS products
-over a chunk.
+over a chunk. A short prompt - a chat turn, up to 96 tokens (`IK2_RG_SLOTS`) - has its experts read by groups, an
+expert's blocks once for up to 8 of its tokens, instead of decoded to FP16 for a GEMM: 12 new tokens take 56 ms
+(were 118).
 
 **Measured**, one RTX 3090 (24 GB, 300 W), UD-Q4_K_XL, tok/s:
 
