@@ -16,6 +16,13 @@ namespace ik2::k {
 
 /// y = x * rsqrt(mean(x^2) + eps) * w per row of D (w null: no weight).  x and y may alias.
 void rms(const float* x, const float* w, int rows, int D, float eps, float* y, cudaStream_t s);
+/// rms of n <= 3 vectors [D] in one launch, each with its own weights: y[i] = rms(x[i]) * w[i] (y may be x).
+struct RmsJobs {
+    const float* x[3];
+    const float* w[3];
+    float* y[3];
+};
+void rms_multi(const RmsJobs& jobs, int n, int D, float eps, cudaStream_t s);
 /// Fused RMSNorm + FP16 output (and optional F32 output y32 if non-null; y32 may alias x).
 void rms_f16(const float* x, const float* w, int rows, int D, float eps, uint16_t* y16, float* y32, cudaStream_t s);
 
@@ -44,6 +51,10 @@ struct ResStates {
 };
 void attn_res(const ResStates& states, int n, const float* q, int nq, int T, int C, float eps, float* out,
               cudaStream_t s);
+/// One token's attn_res for jobs x nq queries in one launch (a block a job): job j's queries are q + j nq C, its
+/// output out + j nq C.
+void attn_res_jobs(const ResStates& states, int n, const float* q, int nq, int jobs, int C, float eps, float* out,
+                   cudaStream_t s);
 struct RmsOuts {
     const float* w[3] = {};
     uint16_t* y16[3] = {};
