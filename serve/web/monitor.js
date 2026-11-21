@@ -237,6 +237,7 @@ const TIER_SETS = {
   // RAM or read from the model file - its "disk" counts every expert read from the file, through the page cache or from
   // the SSD (the engine cannot tell which); the drafts' windows count too
   qwen: [
+    {key: "promo", label: "Promoted", unit: "/tok", digits: 2, sub: "completed expert moves into VRAM per generated token"},
     {key: "ram_fetch", label: "From RAM", unit: "/tok", digits: 1, tone: "info", sub: "experts the CPU computed from RAM"},
     {key: "disk", label: "From the model file", unit: "/tok", digits: 2, tone: "warn",
      sub: "experts read from the model file (page cache or SSD)"},
