@@ -12319,11 +12319,26 @@ struct Model::Impl {
             cudaSetDevice(devs[di].id);
             const int n = (int) std::min<size_t>(u.size() / 2, (size_t) kRcUpd);
             if (n > 0) {
-                // tab_set reads its host-mapped input only when it eventually executes: an input is overwritten only
-                // once the tab_set that last read it is done (its own event - back-to-back cache_drain / rc_drain
-                // flushes wait there; a tick after a window finds it done).  Not a wait for the whole stream: on a
-                // layer split the window's end waits only for the head GPU's, and on two AMD GPUs the other GPU's
-                // stream sync here hung with nothing left to run (#1086, #1027 - --no-expert-cache never got here)
+                // tab_set reads its host-mapped input only when it eventually executes. The head GPU's: before every
+                // overwrite, all earlier work on its stream finished (in particular back-to-back cache_drain /
+                // rc_drain flushes) - after a window's end, which waited for that stream, a no-op; kept as it was
+                // (a one-GPU answer repeats from start to start with it, Sun's Radeon, EXL3 2.25).
+                if ((int) di == head_dev) {
+                    const cudaError_t update_sync = cudaStreamSynchronize(devs[di].st);
+                    if (update_sync != cudaSuccess) {
+                        std::fprintf(stderr, "ds4: table-input predecessor sync: %s - the expert tables are unknown\n",
+                                     cudaGetErrorString(update_sync));
+                        std::abort();
+                    }
+                    std::memcpy(rc_upd[di], u.data(), (size_t) n * 16);
+                    tab_set(rc_upd[di], n, devs[di].st);
+                    cudaEventRecord(rc_go[di], devs[di].st);
+                    continue;
+                }
+                // another GPU of a layer split, whose stream the window's end never waits for: no wait for the whole
+                // stream - on two AMD GPUs that sync hung with nothing left to run (#1086, #1027; --no-expert-cache
+                // never got here). An input is overwritten only once the tab_set that last read it is done (its own
+                // event: a tick after a window finds it done; back-to-back drains wait for that one tab_set)
                 cudaError_t te = cudaSuccess;
                 cudaEvent_t* ev = &tab_ev[di * kTabIn];
                 const int k = take_table_input(tab_next[di], kTabIn, [&](int i) {
