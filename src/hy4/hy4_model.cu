@@ -2977,6 +2977,15 @@ struct Model::Impl {
         if (on) o.q = q, o.d = d, o.q2 = q2, o.d2 = d2;
         return o;
     }
+    // A tensor-parallel member's token window, the FFN in two chains side by side: the routed down's and the shared
+    // expert's GEMVs, lat's int8 rows and the shared expert to its end on the side stream, the router, its picks and
+    // the experts' groups on the main one - joined before the experts.  The same kernels on the same inputs: the same
+    // bits.  (With q8f: the side chain reads xf's rows from the mix's second copy.)  HY4_FFN_FORK=0: one chain, as before
+    const bool ffn_fork_on = !(std::getenv("HY4_FFN_FORK") && std::getenv("HY4_FFN_FORK")[0] == '0');
+    bool ffn_forks(const Layer& l, const Gpu& gp, int T) const {
+        return ffn_fork_on && q8f(T) && l.tpm >= 0 && !l.dense && model_sum && gp.s4 != nullptr && gp.evf != nullptr &&
+               !l.partial() && fx.mode == 0 && o.profile_out.empty() && !check_tp;
+    }
     const bool logit_hash = std::getenv("HY4_LOGIT_HASH") != nullptr;
     uint64_t lh_sum = 1469598103934665603ull;
     long lh_rows = 0;
@@ -5168,13 +5177,14 @@ struct Model::Impl {
     // gp.rw zeroed for the others)
     // (out_pre: where given and the token path fuses - q8f - the sum writes out's int8 rows into gp.xq / gp.xd for the
     //  up-projection that follows, and says so)
+    //  lat_made: gp.x2q / gp.x2d hold gp.lat's int8 rows already - one token's row, a window's each twice)
     bool routed_token(Layer& l, Gpu& gp, int T, const int* slot, float* out, const unsigned long long* eptr = nullptr,
-                      const int* who = nullptr, bool* out_pre = nullptr) {
+                      const int* who = nullptr, bool* out_pre = nullptr, bool lat_made = false) {
         const int lat = g.n_lat, ffe = l.ffe, nu = g.n_used;
         cudaStream_t s = gp.s;
         bool ok = true;
         const bool f8 = q8f(T);
-        if (T == 1 || !f8) k::q8_rows(gp.lat, lat, T, lat, gp.xq, gp.xd, s);
+        if (!lat_made && (T == 1 || !f8)) k::q8_rows(gp.lat, lat, T, lat, gp.xq, gp.xd, s);
         iq::Args a;
         a.tr[0] = l.tr[0];
         a.tr[1] = l.tr[1];
@@ -5191,12 +5201,13 @@ struct Model::Impl {
         if (T == 1) {
             k::plan_experts(gp.ids, nu, l.experts, l.blob, gp.plan, s, slot, gp.rw, eptr, who);
             a.plan_ptr = gp.plan;
-            a.xq = gp.xq;
-            a.xd = gp.xd;
+            a.xq = lat_made ? gp.x2q : gp.xq;
+            a.xd = lat_made ? gp.x2d : gp.xd;
             groups = nu;
             ne_max = 1;
         } else {
-            if (f8) k::q8_rows_dup(gp.lat, lat, T, lat, gp.x2q, gp.x2d, s);   // (q8_rows and the copy: one launch)
+            if (lat_made) {
+            } else if (f8) k::q8_rows_dup(gp.lat, lat, T, lat, gp.x2q, gp.x2d, s);   // (q8_rows and the copy: one launch)
             else k::dup_rows_q8(gp.xq, gp.xd, T, lat, gp.x2q, gp.x2d, s);
             k::group_experts(gp.ids, T, nu, g.n_expert, l.experts, l.blob, gp.grp_ptr, gp.grp_start, gp.grp_ent,
                              gp.n_groups, s, slot, gp.rw, eptr, who);
@@ -6579,8 +6590,10 @@ struct Model::Impl {
     bool ffn(Layer& l, Gpu& gp, int T, std::string& err, int tpm = -1, unsigned v = 0) {
         const int E = g.n_embd;
         cudaStream_t s = gp.s;
+        const bool ff8 = ffn_forks(l, gp, T);
         const bool xf_pre = k::hc_pre(gp.x, T, g.hc, E, l.hcf_fn, l.hcf_scale, l.hcf_base, g.eps, g.hc_eps, g.hc_mag, gp.xf,
-                                      gp.post, s, l.ffn_norm, g.eps, hc_el(), q8o(q8f(T), gp.xq, gp.xd));
+                                      gp.post, s, l.ffn_norm, g.eps, hc_el(),
+                                      q8o(q8f(T), gp.xq, gp.xd, ff8 ? gp.xq4 : nullptr, ff8 ? gp.xd4 : nullptr));
         dbg("ffn_norm", l.il, gp, gp.xf, T, E);
         if (inject) ref_cmp("ffn_norm", l.il, gp, gp.xf, (size_t) T * E, T);
         if (!ffn_core(l, gp, T, err, v, xf_pre)) return false;   // (tensor parallel: its sum is ffn_core's)
@@ -6618,7 +6631,26 @@ struct Model::Impl {
         } else {
             const int lat = g.n_lat, ffe = l.ffe, nu = g.n_used;
             const bool lead = l.tpm <= 0;   // (the stats and the profile: one member's count)
-            ok = mm(gp, l.router, gp.xf, E, T, gp.rl, g.n_expert, 1.0f, xf_pre);
+            const int sf0 = l.sh_gate.n;
+            const bool forked = xf_pre && ffn_forks(l, gp, T);
+            if (forked) {   // (the side chain, queued first: it starts when the mix is done)
+                Gpu gi = gp;
+                gi.s = gp.s4;
+                gi.xq = gp.xq4;
+                gi.xd = gp.xd4;
+                CK(cudaEventRecord(gp.evf, s));
+                CK(cudaStreamWaitEvent(gp.s4, gp.evf, 0));
+                ok = mm_multi(gi, {{&l.rdown, gp.lat, (size_t) lat}, {&l.sh_gate, gp.gu, (size_t) sf0},
+                                   {&l.sh_up, gp.gu + (size_t) T * sf0, (size_t) sf0}}, gp.xf, E, T, true);
+                // (lat's int8 rows where the experts read them in this form: gp.x2q / gp.x2d - a window's twice)
+                if (T == 1) k::q8_rows(gp.lat, lat, 1, lat, gp.x2q, gp.x2d, gp.s4);
+                else k::q8_rows_dup(gp.lat, lat, T, lat, gp.x2q, gp.x2d, gp.s4);
+                const bool hd_pre = k::swiglu(gp.gu, gp.gu + (size_t) T * sf0, sf0, T, sf0, gp.hd, sf0, gp.s4,
+                                              q8o(l.sh_down.k == sf0, gp.xq4, gp.xd4));
+                ok = ok && mm(gi, l.sh_down, gp.hd, sf0, T, gp.cur, E, 1.0f, hd_pre);
+                CK(cudaEventRecord(gp.evj, gp.s4));
+            }
+            ok = ok && mm(gp, l.router, gp.xf, E, T, gp.rl, g.n_expert, 1.0f, xf_pre);
             dbg("ffn_moe_logits", l.il, gp, gp.rl, T, g.n_expert);
             k::router(gp.rl, T, g.n_expert, l.router_b, nu, g.w_norm, g.w_scale, gp.ids, gp.rw, s);
             if (dump) {
@@ -6652,7 +6684,8 @@ struct Model::Impl {
             const bool hand = l.tpm >= 0 && !hel.empty() && l.tpm == (hand_rot ? l.il % tp : 0);
             // (xf's int8 rows stay in gp.xq / gp.xd until the experts: the router's, the down's and the shared gate /
             //  up's GEMVs all read them - nothing between them writes those buffers)
-            if ((lane_on || hand) && T <= W) ok = ok && mm(gp, l.rdown, gp.xf, E, T, gp.lat, lat, 1.0f, xf_pre);
+            if (forked) CK(cudaStreamWaitEvent(s, gp.evj, 0));   // (the side chain's rows: before the routing goes out)
+            else if ((lane_on || hand) && T <= W) ok = ok && mm(gp, l.rdown, gp.xf, E, T, gp.lat, lat, 1.0f, xf_pre);
             else
                 ok = ok && mm_multi(gp, {{&l.rdown, gp.lat, (size_t) lat}, {&l.sh_gate, gp.gu, (size_t) sf},
                                          {&l.sh_up, gp.gu + (size_t) T * sf, (size_t) sf}}, gp.xf, E, T, xf_pre);
@@ -6669,7 +6702,7 @@ struct Model::Impl {
                 } else {
                     k::publish(rt, trt, (size_t) T * (lat + 32), gp.cnt2, tfr, v, s);
                 }
-                if (T <= W)
+                if (T <= W && !forked)
                     ok = ok && mm_multi(gp, {{&l.sh_gate, gp.gu, (size_t) sf}, {&l.sh_up, gp.gu + (size_t) T * sf,
                                                                             (size_t) sf}}, gp.xf, E, T, xf_pre);
             }
@@ -6754,7 +6787,7 @@ struct Model::Impl {
                 ok = ok && routed_token(l, gp, T, nullptr, gp.latout, gp.fxs.eptr, fx.mode == 2 ? gp.fxs.who : nullptr);
             } else {
                 ok = ok && routed_token(l, gp, T, slot, gp.latout, nullptr, nullptr,
-                                        l.tpm >= 0 && model_sum && !lane_on ? &lat_pre : nullptr);
+                                        l.tpm >= 0 && model_sum && !lane_on ? &lat_pre : nullptr, forked);
             }
             if (lane_on && !streamed) {   // (the GPU's experts run meanwhile)
                 k::submit(s);   // (AMD under Windows: they would sit in the queue until the next wait - after the lane's)
@@ -6783,9 +6816,11 @@ struct Model::Impl {
             if (inject) ref_cmp("ffn_moe_out", l.il, gp, gp.latout, (size_t) T * lat, T);
             if (l.tpm >= 0 && model_sum) {   // (HY4_TP_MODEL_SUM=1: each member's own up-projection, summed after)
                 ok = ok && mm(gp, l.rup, gp.latout, lat, T, gp.y, E, 1.0f, lat_pre && T <= W);
-                const bool hd_pre = k::swiglu(gp.gu, gp.gu + (size_t) T * sf, sf, T, sf, gp.hd, sf, s,
-                                              q8o(f8 && l.sh_down.k == sf, gp.xq, gp.xd));
-                ok = ok && mm(gp, l.sh_down, gp.hd, sf, T, gp.cur, E, 1.0f, hd_pre);
+                if (!forked) {   // (forked: the shared expert is the side chain's, done before the experts)
+                    const bool hd_pre = k::swiglu(gp.gu, gp.gu + (size_t) T * sf, sf, T, sf, gp.hd, sf, s,
+                                                  q8o(f8 && l.sh_down.k == sf, gp.xq, gp.xd));
+                    ok = ok && mm(gp, l.sh_down, gp.hd, sf, T, gp.cur, E, 1.0f, hd_pre);
+                }
                 // (the token path, q8f: the shared expert's part goes out added to the routed one's - the sum that
                 //  comes back replaces gp.y, so the add needs no launch of its own)
                 const bool plus = f8 && !check_tp;
