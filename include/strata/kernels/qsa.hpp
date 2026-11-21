@@ -118,7 +118,10 @@ inline QsaShapes qsa_real_shapes() {
 
 /// The one legal RMSNorm epsilon for this artifact (`attention.layer_norm_rms_epsilon`).
 inline float qsa_rms_eps() { return 1e-6f; }
-/// `rope.freq_base`, no rope.scaling keys, so freq_scale = 1 and no YaRN.
+/// `rope.freq_base`, the DEFAULT frequency base.  The artifact ships no `rope.scaling` keys, so the
+/// process's rope scaling starts at none - the runtime configuration lives in `rope_scaling.hpp`
+/// (`rope_scaling_set`, once at startup, before the table is built and any graph captured), and this
+/// constant is what that config's `freq_base` defaults to and what CLI `--rope-freq-base` overrides.
 inline double qsa_freq_base() { return 1e7; }
 
 /// The selection width: `min(n_kv, idx_top_k + idx_block - 1)`.

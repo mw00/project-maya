@@ -196,7 +196,7 @@ function closeEditor() {
 
 // the draft as the server takes it: "" -> the default (null), a number typed -> a number
 const NUMS = ["context", "parallel", "reserve_mib", "expert_cache", "prefill", "kv_resident", "tp", "prefill_chunk", "cpu_threads"];
-const DECS = ["reserve_gb", "cache_gb", "dspark_conf"];   // (a decimal: 0.7, 1.5)
+const DECS = ["reserve_gb", "cache_gb", "dspark_conf", "rope_scale", "rope_freq_base", "rope_freq_scale", "yarn_orig_ctx", "yarn_ext_factor", "yarn_attn_factor", "yarn_beta_fast", "yarn_beta_slow"];   // (a decimal: 0.7, 1.5)
 function toSend(d) {
   const out = {...d};
   for (const k of [...NUMS, ...DECS]) {
@@ -518,7 +518,20 @@ function qwenFields(m, d, s, ch, gpus) {
   const pf = AutoOr({label: "Prompt chunk", k: "prefill", d, dflt: 4096, unit: "tokens", subLabel: "Tokens a prompt is read in at a time"});
   return [
     {label: "Model", rows: [
-      contextRow(m, d, ch, {vram: kv.bytes}, ["kv"]),
+      html`<${Row} label="RoPE scaling" flag="--rope-scaling" changed=${ch("rope_scaling")}
+        hint="Model default keeps the GGUF settings. YaRN and linear extend positions; changing scaling restarts the engine and requires fresh context computation.">
+        <${Seg} label="RoPE scaling" value=${d.rope_scaling || "auto"}
+          options=${[{id:"auto",label:"Model default"},{id:"none",label:"None"},{id:"linear",label:"Linear"},{id:"yarn",label:"YaRN"}]}
+          onChange=${(v) => setDraft({rope_scaling:v})}/><//>`,
+      html`<${Row} label="Extension factor" flag="--rope-scale" changed=${ch("rope_scale")}
+        hint="For example, 2 extends the positional range by two. Set Context size separately; allocating a larger cache alone does not enable scaling.">
+        <${Dec} label="Extension factor" value=${d.rope_scale} ph="model default" on=${(v) => setDraft({rope_scale:v})}/><//>`,
+      contextRow({...m, context_range: {...m.context_range,
+        max: Math.max(m.context_range?.max || 262144, Number(d.context) || 0,
+          ["linear","yarn"].includes(d.rope_scaling) ?
+            (m.context_range?.trained || 262144) * Math.max(1, Number(d.rope_scale) || 1) : 0)}},
+        d, ch, {vram: kv.bytes}, ["kv","rope_scaling","rope_scale"],
+        `Native context: ${ctxfmt(m.context_range?.trained || 262144)}. Extended-context quality depends on the model and workload.`),
       html`<${Row} label="Images" flag="vision" changed=${ch("images")}
         hint=${m.choices.images ? "Reads images in chats: the image encoder starts when a picture arrives, no VRAM kept for it. Off reads text only."
           : "This model was set up without its image encoder: the setup adds it."}>
@@ -548,6 +561,17 @@ function qwenFields(m, d, s, ch, gpus) {
         hint="The attention cache's format: INT8 the setup's (the model card's own), FP16 exact, K8 V4 and Q4_0 smaller - more VRAM for experts at long contexts.">
         <${Seg} label="KV cache" value=${kv.id} options=${QWEN_KV.map((f) => ({id: f.id, label: f.label}))}
           onChange=${(v) => setDraft({kv: v})}/><//>`]},
+    {label: "RoPE advanced", rows: [
+      ["rope_freq_base","Frequency base","--rope-freq-base"],
+      ["rope_freq_scale","Frequency scale","--rope-freq-scale"],
+      ["yarn_orig_ctx","Original context","--yarn-orig-ctx"],
+      ["yarn_ext_factor","Extrapolation blend","--yarn-ext-factor"],
+      ["yarn_attn_factor","Attention factor","--yarn-attn-factor"],
+      ["yarn_beta_fast","Fast correction beta","--yarn-beta-fast"],
+      ["yarn_beta_slow","Slow correction beta","--yarn-beta-slow"],
+    ].map(([key,label,flag]) => html`<${Row} label=${label} flag=${flag} changed=${ch(key)}
+        hint="Optional numerical override; empty retains the engine/model default. These are startup settings, not per-request controls.">
+        <${Dec} label=${label} value=${d[key]} ph="default" on=${(v) => setDraft({[key]:v})}/><//>`)},
   ];
 }
 

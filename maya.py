@@ -10723,7 +10723,9 @@ def write_config_qwen(a, pc: dict, meta: dict, pack: Path, gguf: Path, ctx: int,
     if vision:                                         # (pictures: GENI requests, each image's rows at its pad tokens)
         args.append("--vision")
     kept = keep_args(old.get("args") or [], args, ("--mtp-max-t", "--kv", "--vram-reserve-mib", "--pool-workers",
-                                                   "--experts-from-gguf", "--ple-io"))
+                                                   "--experts-from-gguf", "--ple-io", "--rope-scaling", "--rope-scale",
+                                                   "--rope-freq-base", "--rope-freq-scale", "--yarn-orig-ctx",
+                                                   "--yarn-ext-factor", "--yarn-attn-factor", "--yarn-beta-fast", "--yarn-beta-slow"))
     inst = {"family": "qwen", "quant": QWEN_UD_DIR if quant == QWEN_UD else QWEN, "qwen_quant": quant}
     sampling, effort = Q.model_defaults({"installer": inst})   # (the model's own, every setup: its card's)
     cfg = {"exe": str(EXE), "args": args, "cwd": str(ROOT), "tokenizer": str(pack / "tokenizer"),
