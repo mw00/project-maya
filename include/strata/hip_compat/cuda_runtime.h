@@ -104,6 +104,7 @@ inline hipError_t cudaHostAlloc(T** p, size_t bytes, unsigned int flags) {
 #define cudaMemcpy2DAsync hipMemcpy2DAsync
 #define cudaMemcpyAsync hipMemcpyAsync
 #define cudaMemcpyDefault hipMemcpyDefault
+#define cudaMemcpyKind hipMemcpyKind
 #define cudaMemcpyDeviceToDevice hipMemcpyDeviceToDevice
 #define cudaMemcpyDeviceToHost hipMemcpyDeviceToHost
 #define cudaMemcpyHostToDevice hipMemcpyHostToDevice

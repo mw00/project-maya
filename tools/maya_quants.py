@@ -44,6 +44,9 @@ MODEL_DEFAULTS = {
     # Hy4-flash: tencent/Hy4-flash generation_config.json and card ("Recommended sampling parameters") - temperature
     # 0.9, top_p 1.0, no top-k (its -1); reasoning_effort high its template's default (no_think: direct answers)
     "hy4": ({"temperature": 0.9, "top_p": 1.0}, "high"),
+    # Inkling-2-Small (maya-ik2, docs/INKLING2.md): thinkingmachines' card and files name no sampling (no
+    # generation_config.json), so plain sampling - temperature 1.0, top_p 1.0; "auto" its template's own effort (0.9)
+    "ik2": ({"temperature": 1.0, "top_p": 1.0}, "auto"),
     # GLM-5.3 (744B, glm-dsa: model_key "glm53", serve/glm_dsa_product.py): zai-org/GLM-5.3's
     # generation_config.json and card - temperature 1.0, top_p 0.95 (no top-k, min-p or penalties); reasoning_effort
     # low / high / max, max its default.  Its own entry, so that no quant of it takes GLM-5.3-Flash's tuned values
@@ -278,13 +281,16 @@ def resolve(name: str, glm_downloads=()) -> tuple | None:
 
 def family_of(cfg: dict) -> str:
     """"minimax" for a MiniMax-M3.1-Flash config (maya-mm3), "qwen" for CYBER-FROST-3.8-PS (the `maya` engine with its
-    n-gram table, --ple-gguf), "hy4" for Hy4-flash (maya-hy4, whose --pack is its own), "deepseek" for a
+    n-gram table, --ple-gguf), "hy4" for Hy4-flash (maya-hy4, whose --pack is its own), "ik2" for Inkling-2-Small
+    (maya-ik2), "deepseek" for a
     DeepSeek-V4.1-Flash config (maya-ds4's --pack: also the configs from before the programs' names of v1.1.16), else
     "glm"."""
     inst = cfg.get("installer") or {}
     exe = Path(str(cfg.get("exe", ""))).name
     if inst.get("family") == "hy4" or exe.startswith("maya-hy4"):
         return "hy4"
+    if inst.get("family") == "ik2" or exe.startswith("maya-ik2"):   # (Inkling-2-Small: run by hand so far, no setup)
+        return "ik2"
     if inst.get("family") == "minimax" or exe.startswith("maya-mm3"):
         return "minimax"
     args = cfg.get("args") or []
