@@ -866,7 +866,25 @@ HY4_KV_RESIDENT = 32768                            # (KV streaming: the global l
 # a small-card layout's prompt chunk doubled where it fits: the prompt scratch grows by about 0.9 GiB from 256 to 512
 # tokens (an 8 GB card at 4K: measured) - counted as 0.95, conservatively
 HY4_CHUNK_UP_GIB = 0.95
-FAMILIES = ("glm", "deepseek", "minimax", "qwen", "hy4")
+# Inkling-2-Mini (an EXPERIMENTAL PREVIEW, PR #1095): thinkingmachines' looped 26B on its own engine maya-ik2 (src/ik2,
+# docs/INKLING2.md section 8) - NVIDIA only, Linux only, one GPU of 24 GB or more, RTX 30 / A100 and newer (the
+# engine's kernels: mma.sync m16n8k16, cp.async); every expert in VRAM (the resident token path), text only for now.
+# Its files: unsloth's UD-Q4_K_XL (Unsloth's looped layout, which the engine reads) and thinkingmachines' own drafter
+# (mtp.safetensors: the engine drafts only where it pays) - tools/ik2/download.json, pinned by size and sha256.  What
+# fits on the card (the context, the drafter's room): tools/ik2_fit.py, shared with the Models page.  Its defaults:
+# maya_quants.MODEL_DEFAULTS["ik2-mini"] (placeholders until its author sends his); thinkingmachines' chat template
+# (tools/ik2/chat_template.jinja) in the tokenizer folder.  One request at a time.
+import ik2_fit as IK2F  # noqa: E402  (tools/) what fits on the card
+IK2 = Q.MODEL["ik2"]                               # "Inkling-2-Mini" (its id: the installer record, --model)
+IK2_SHOWN = Q.SHOWN["ik2"]
+IK2_EXE = BUILD / ("maya-ik2.exe" if WIN else "maya-ik2")
+IK2_MANIFEST = ROOT / "tools" / "ik2" / "download.json"
+IK2_TEMPLATE = ROOT / "tools" / "ik2" / "chat_template.jinja"
+IK2_TOKENIZER_TOOLS = ("tools/strata_tokenizer.py", "tools/ik2/chat_template.jinja")
+IK2_DIR = "maya-ik2"                               # (in the model's folder: tokenizer/, sources.json)
+IK2_MODEL_NAME = "inkling-2-mini"
+IK2_MIN_CC = IK2F.MIN_CC
+FAMILIES = ("glm", "deepseek", "minimax", "qwen", "hy4", "ik2")
 SHARD_RE = re.compile(r"-(\d{5})-of-(\d{5})\.gguf$")
 
 
@@ -875,7 +893,7 @@ def exe_for_target(target: str) -> Path:
     fresh on every call since select_build_backend() reassigns EXE/DS4_EXE once the backend (cuda/hip) is known."""
     if target == "maya-glm-helper":                    # (GLM's AMD helper program for the two-GPU mode: mixed_builds)
         return BUILD / ("maya-glm-helper.exe" if WIN else "maya-glm-helper")
-    return {"maya": EXE, "maya-ds4": DS4_EXE, "maya-mm3": MM3_EXE, "maya-hy4": HY4_EXE}[target]
+    return {"maya": EXE, "maya-ds4": DS4_EXE, "maya-mm3": MM3_EXE, "maya-hy4": HY4_EXE, "maya-ik2": IK2_EXE}[target]
 GLM_ARCHS = ("glm5-next", "glm5next")             # llama.cpp's spelling and unsloth's
 
 
@@ -1078,12 +1096,13 @@ def fix_config_names(cfg: dict) -> bool:
 
 def select_build_backend(backend: str) -> None:
     """Separate build folders and stamps prevent reusing a binary from the other backend."""
-    global BUILD, EXE, STAMP, DS4_EXE, MM3_EXE, HY4_EXE
+    global BUILD, EXE, STAMP, DS4_EXE, MM3_EXE, HY4_EXE, IK2_EXE
     BUILD = ROOT / {"hip": "build-hip", "metal": "build-metal"}.get(backend, "build")
     EXE = BUILD / ("maya-metal" if backend == "metal" else "maya.exe" if WIN else "maya")
     DS4_EXE = BUILD / ("maya-ds4.exe" if WIN else "maya-ds4")
     MM3_EXE = BUILD / ("maya-mm3.exe" if WIN else "maya-mm3")
     HY4_EXE = BUILD / ("maya-hy4.exe" if WIN else "maya-hy4")
+    IK2_EXE = BUILD / ("maya-ik2.exe" if WIN else "maya-ik2")
     STAMP = BUILD / "MAYA-BUILD.json"
 
 
@@ -1565,6 +1584,13 @@ def gpus_before(before, usable: list) -> list | None:
     return ids
 
 
+def ik2_gpus_asked(a) -> int:
+    """How many GPUs --gpu / --gpus name (0: none named) - Inkling-2-Mini's preview refuses more than one."""
+    if getattr(a, "gpus", None):
+        return len({x.strip() for x in str(a.gpus).split(",") if x.strip()})
+    return 1 if getattr(a, "gpu", None) is not None else 0
+
+
 def choose_gpus(a, found, min_cc: int = MIN_CC, family: str = "", before=None) -> list:
     """The GPUs the model runs on: --gpu / --gpus, else asked when several can share it (all of them recommended).
     `before`: the GPUs this model's config ran on - a setup again keeps them (the default answer; --gpus picks
@@ -1591,6 +1617,12 @@ def choose_gpus(a, found, min_cc: int = MIN_CC, family: str = "", before=None) -
              f"it needs an NVIDIA GPU of compute capability {min_cc / 10:.1f} or newer (" +
              ("V100 and newer; Pascal - Tesla P40 / P100, GTX 10 - is experimental)" if min_cc < 80 else
               "RTX 30 / A100 and newer)"))
+    if family == "ik2":   # (Inkling-2-Mini, a preview: one GPU - the one its config ran on, else the largest)
+        pick = [byid[kept[0]]] if kept and len(kept) == 1 else \
+            [max(usable, key=lambda g: (round(g["vram_gb"]), -g["index"]))]
+        if len(usable) > 1:
+            ok(f"GPU: {gpu_label(pick[0])} - {IK2_SHOWN} runs on one GPU for now (--gpu N picks another)")
+        return pick
     best = sorted(usable, key=lambda g: (-round(g["vram_gb"]), g["index"]))
     # A card with under a quarter of the biggest one's VRAM (a 2 GB display card beside 32 GB ones) still gets whole
     # layers of the split and runs out of memory at the pack; the automatic pick leaves it out (--gpus still takes it).
@@ -1660,6 +1692,11 @@ def check_pc(a, family: str = "glm", gguf: bool = False, ds4_quant: str = "exl3"
     if mm3 and WIN and not MM3_ALL_PLATFORMS:
         fail(f"{MM3}'s engine (maya-mm3) runs on Linux only for now (its Windows build is on the way)",
              f"set it up on a Linux PC with an NVIDIA GPU ({mm3_gpus()})")
+    ik2 = family == "ik2"
+    if ik2:   # (Inkling-2-Mini, an experimental preview: NVIDIA, Linux, one GPU - refused in one line before anything)
+        why = IK2F.unsupported(a.backend, WIN, ik2_gpus_asked(a), [])
+        if why:
+            fail(why)
     hy4 = family == "hy4"
     if hy4 and a.backend == "hip" and WIN:
         # (maya-hy4's AMD build: built and run on Linux - a Gorgon Halo's Radeon 8065S, and RX 7900 XT cards by its
@@ -1686,7 +1723,7 @@ def check_pc(a, family: str = "glm", gguf: bool = False, ds4_quant: str = "exl3"
         fail("Project Maya runs on Linux and Windows (and on Apple Silicon: --backend metal)",
              "the engine needs an NVIDIA GPU and CUDA")
     min_cc = ((DS4_GGUF_MIN_CC if gguf else DS4_MIN_CC) if ds4 else (MM3_GGUF_MIN_CC if gguf else mm3_min_cc()) if mm3
-              else QWEN_MIN_CC if family == "qwen" else HY4_MIN_CC if hy4 else MIN_CC)
+              else QWEN_MIN_CC if family == "qwen" else HY4_MIN_CC if hy4 else IK2_MIN_CC if ik2 else MIN_CC)
     if S.is_wsl():
         warn("this is WSL2, which Maya does not support: WSL2's driver pins only about 1 GB of "
              "RAM for the GPU, and Maya's RAM tier pins tens of GB. Use a native Linux install.")
@@ -1695,22 +1732,32 @@ def check_pc(a, family: str = "glm", gguf: bool = False, ds4_quant: str = "exl3"
         fail("no NVIDIA GPU found (nvidia-smi did not answer)",
              ("install the NVIDIA driver (https://www.nvidia.com/drivers)" if WIN else
               "install the NVIDIA driver (Ubuntu: sudo ubuntu-drivers install)") + f", restart, and run {ME} again")
+    if ik2:                                            # (no card new or large enough: the one line, before the list)
+        why = IK2F.unsupported("cuda", False, 0, found)
+        if why:
+            fail(why)
     say("  NVIDIA GPUs:")
     for g in found:
         say(f"    {gpu_label(g)} - " + ("can be used" if int(g["arch"]) >= max(min_cc, VALIDATED_CC) else
                                        "can be used (Pascal: experimental)" if int(g["arch"]) >= min_cc else
                                        f"too old (this model needs compute capability {min_cc / 10:.1f} or newer)"))
     chosen = choose_gpus(a, found, min_cc, family)
+    if ik2:                                            # (the card picked: 24 GB or more)
+        why = IK2F.unsupported("cuda", False, len(chosen), chosen)
+        if why:
+            fail(why)
     archs = sorted({int(g["arch"]) for g in chosen})
     vram = sum(g["vram_gb"] for g in chosen)
     ok("using " + " + ".join(gpu_label(g) for g in chosen) +
        ("" if len(chosen) < 2 else
         ": the equal GPUs among them share every layer (tensor parallel), else the layers are split across them"
         if family == "hy4" else f": the model's layers are split across the {len(chosen)}"))
-    if any(g.get("unified_memory") for g in chosen):
+    if ik2 and any(g.get("unified_memory") for g in chosen):
+        warn(f"{IK2_SHOWN} has not been run yet on a GPU whose memory is the system's RAM: untested here")
+    elif any(g.get("unified_memory") for g in chosen):
         say("  the GPU's memory is the system's RAM: the engine fills it with the most-used experts and leaves the "
             "rest to the RAM tier and the SSD, so the free RAM at the start is what the pool can take")
-    if vram < 23 and not ds4 and not mm3 and family not in ("qwen", "hy4"):
+    if vram < 23 and not ds4 and not mm3 and family not in ("qwen", "hy4", "ik2"):
         # one small card: can any GLM-5.3-Flash quant start on it at all (glm_fit_verdict)?  Where none can, say so
         # here - the model's choice (step 2) then stops before any download
         try:
@@ -1808,7 +1855,7 @@ def check_pc(a, family: str = "glm", gguf: bool = False, ds4_quant: str = "exl3"
             ok(msg + f"; with {vram:.0f} GB of VRAM that holds {DS4} at {DS4_EXL3.get(ds4_quant, DS4_EXL3['exl3'])['bits']} bits")
         if len(chosen) % 2 or len({round(g["vram_gb"]) for g in chosen}) > 1:
             ok("tensor parallel pairs equal GPUs: a GPU without an equal neighbour runs its layers alone")
-    elif hy4:   # (its routed experts that are not in VRAM: read in place - RAM as the page cache)
+    elif hy4 or ik2:   # (Hy4: its routed experts that are not in VRAM read in place; Inkling 2: all in VRAM)
         ok(msg)
     else:
         ok(msg + ("" if total >= 60 else " - it runs with 32 GB; more RAM keeps more experts close and is faster"))
@@ -1985,7 +2032,8 @@ PARALLEL_FAMILIES = ("glm", "deepseek", "minimax")
 
 def check_parallel(a, family: str) -> None:
     if getattr(a, "parallel", None) is not None and family not in PARALLEL_FAMILIES:
-        model = DS4 if family == "deepseek" else MM3 if family == "minimax" else HY4 if family == "hy4" else QWEN_SHOWN
+        model = DS4 if family == "deepseek" else MM3 if family == "minimax" else HY4 if family == "hy4" else \
+            IK2_SHOWN if family == "ik2" else QWEN_SHOWN
         fail(f"--parallel is supported by GLM-5.3-Flash, DeepSeek-V4.1-Flash and MiniMax-M3.1-Flash; {model} serves "
              "one request at a time",
              "remove --parallel; saved conversations do not enable simultaneous decoding")
@@ -2001,7 +2049,7 @@ def choose_family(a, prev: dict) -> str:
     is the default."""
     if a.model:
         return "deepseek" if a.model == DS4 else "minimax" if a.model == MM3 else "qwen" if a.model == QWEN else \
-            "hy4" if a.model == HY4 else "glm"
+            "hy4" if a.model == HY4 else "ik2" if a.model == IK2 else "glm"
     if getattr(a, "qwen_quant", None):                 # (--qwen-quant alone: Qwen's files named)
         return "qwen"
     if getattr(a, "hy4_quant", None):                  # (--hy4-quant alone: Hy4-Flash's)
@@ -2070,6 +2118,8 @@ def choose_family(a, prev: dict) -> str:
                       "and newer, Linux." if q4 else "")))
     else:
         keys = tuple(k for k in keys if k != "hy4")
+    # Inkling-2-Mini, after it: an experimental preview (PR #1095) - NVIDIA, Linux, one GPU of 24 GB or more
+    rows.append((f"{IK2_SHOWN} (experimental)", None, ik2_about()))
     was53 = default == "glm" and bool(prev) and G53.config_is_glm_dsa(prev)
     pick = keys[choose("Model?", ["Which model to set up:"], rows, keys.index("glm53" if was53 else default), a.yes)]
     if pick in ("glm", "glm53"):
@@ -3024,7 +3074,7 @@ def compile_engine_metal(llama: Path, src: str, soft=False) -> dict | None:
     return meta
 
 
-ENGINE_TARGETS = ("maya", "maya-ds4", "maya-mm3", "maya-hy4")
+ENGINE_TARGETS = ("maya", "maya-ds4", "maya-mm3", "maya-hy4", "maya-ik2")
 
 
 def target_of_exe(exe) -> str | None:
@@ -3249,8 +3299,8 @@ def refresh_engine(cfg: dict) -> None:
     meta = read_json(STAMP)
     exe = Path(cfg["exe"]).resolve()
     target = "maya-ds4" if exe == DS4_EXE.resolve() else "maya-mm3" if exe == MM3_EXE.resolve() else \
-        "maya-hy4" if exe == HY4_EXE.resolve() else "maya"
-    if not meta or exe not in (EXE.resolve(), DS4_EXE.resolve(), MM3_EXE.resolve(), HY4_EXE.resolve()):
+        "maya-hy4" if exe == HY4_EXE.resolve() else "maya-ik2" if exe == IK2_EXE.resolve() else "maya"
+    if not meta or exe not in (EXE.resolve(), DS4_EXE.resolve(), MM3_EXE.resolve(), HY4_EXE.resolve(), IK2_EXE.resolve()):
         return
     src = S.source_hash(S.ENGINE_SOURCES)
     if meta.get("src") == src and target in (meta.get("targets") or ["maya"]):
@@ -5042,7 +5092,7 @@ def busy_gpus(cfg: dict) -> list:
 DISPLAY_MIB = 1536
 
 # Maya's engines as the GPU's process list names them (and the names they had before the rename)
-ENGINE_PROCESSES = ("maya", "maya-ds4", "maya-mm3", "maya-hy4", "maya-glm-helper", "strata", "strata-ds4")
+ENGINE_PROCESSES = ("maya", "maya-ds4", "maya-mm3", "maya-hy4", "maya-ik2", "maya-glm-helper", "strata", "strata-ds4")
 
 
 def maya_engines_on(cfg: dict) -> list:
@@ -5113,6 +5163,9 @@ def calibrate_config(cfg_path: Path) -> bool:
         return bool(qwen_draft_calibration(cfg_path) is not None)
     if config_family(cfg) == "hy4":       # (maya-hy4 sizes its CPU lane and its expert pool by this PC at every start)
         ok(f"{HY4}: nothing to tune - its engine sizes its CPU lane and its expert pool by this PC at every start")
+        return True
+    if config_family(cfg) == "ik2":       # (maya-ik2: every expert in VRAM; its drafter decides at every step)
+        ok(f"{IK2_SHOWN}: nothing to tune - every expert sits in VRAM, and its drafter drafts only where it pays")
         return True
     if cfg.get("backend") == "hip":
         warn("the tuning measures the CUDA engine's CPU lane (NVIDIA GPUs): the HIP port keeps its own settings")
@@ -5515,7 +5568,7 @@ def needs_speed_calibration(cfg: dict) -> bool:
         return hy4_both_drafters(cfg) and not hy4_engine_drafting(cfg) and \
             (cfg.get("installer") or {}).get("drafting") == "on" and \
             "speed_calibration" not in (cfg.get("installer") or {})
-    if config_family(cfg) == "qwen":
+    if config_family(cfg) in ("qwen", "ik2"):         # (Inkling 2: its engine measures whether a draft pays)
         return False
     if config_family(cfg) in ("deepseek", "minimax"):  # (their DSpark drafter: measured once too)
         return CDS.has_drafter(cfg) and "speed_calibration" not in (cfg.get("installer") or {}) and             not (config_family(cfg) == "minimax" and parallel_of(cfg) > 1)   # (maya-mm3 --parallel: no drafting)
@@ -6238,9 +6291,13 @@ def server_command(cfg_path: Path, a) -> tuple:
     args = cfg.get("args") or []
     ds4 = config_family(cfg) == "deepseek"
     metal = cfg.get("backend") == "metal"
-    flag = ("--gguf" if metal else "--glm-pack") if config_family(cfg) == "glm" else "--pack"   # (maya-ds4 and maya-mm3: --pack)
+    ik2 = config_family(cfg) == "ik2"                  # (maya-ik2 reads its GGUF itself: --model, no pack)
+    flag = ("--gguf" if metal else "--glm-pack") if config_family(cfg) == "glm" else "--model" if ik2 else "--pack"   # (maya-ds4 and maya-mm3: --pack)
     pack = Path(args[args.index(flag) + 1]) if flag in args[:-1] else None       # (Metal: the first GGUF file)
-    for p, what in ((Path(cfg.get("exe", "")), "the engine"), (pack, "the model's GGUF file" if metal else "the pack"),
+    if ik2 and "--draft" in args[:-1] and not Path(args[args.index("--draft") + 1]).exists():
+        fail(f"{cfg_path.name}: the drafter is missing ({args[args.index('--draft') + 1]})", f"run {ME} --setup to repair it")
+    for p, what in ((Path(cfg.get("exe", "")), "the engine"),
+                    (pack, "the model's GGUF file" if metal or ik2 else "the pack"),
                     (Path(cfg.get("tokenizer", "")) / "vocab.json", "the tokenizer")):
         if p is None or not p.exists():
             fail(f"{cfg_path.name}: {what} is missing ({p})", f"run {ME} --setup to repair it")
@@ -6258,7 +6315,7 @@ def server_command(cfg_path: Path, a) -> tuple:
         for s in shard_set(pack):
             if not s.exists():
                 fail(f"{cfg_path.name}: the model's file {s.name} is missing ({s.parent})", f"run {ME} --setup to repair it")
-    src = None if metal else pack_source(pack)
+    src = None if metal or ik2 else pack_source(pack)
     if src is not None and src != EXL3_GGUF and all(s.exists() for s in shard_set(pack.parent / src)):
         why = pack_stale(pack, shard_set(pack.parent / src))
         if why is not None:
@@ -6349,6 +6406,9 @@ def server_command(cfg_path: Path, a) -> tuple:
         say("  the n-gram table is read from the SSD - the first answers are the slowest.")
         for line in hy4_first_start_said(cfg):
             say("  " + line)
+    elif config_family(cfg) == "ik2":
+        say(f"  {IK2_SHOWN} is an experimental preview: loading takes a few seconds to a minute (every expert is")
+        say("  copied into VRAM); one answer at a time, text only for now.")
     elif config_family(cfg) == "qwen":
         say("  Loading takes a few minutes: the engine places the most-used experts in VRAM, the next ones in RAM as far")
         say("  as the free RAM goes (MAYA_EXPERT_RAM_GB caps it) and reads the rest from the SSD when they are routed.")
@@ -6663,6 +6723,9 @@ def report(version: str, backend: str | None = None, cfg_path: Path | None = Non
                 "on (read a picture at a time)" if pack is not None and hy4_pack_has_vision(pack) else \
                 "off (no vision tower in the pack)" if pack is not None and (pack / "hy4.txt").exists() else \
                 "? (the pack is not here to look in)"
+        elif config_family(cfg) == "ik2":       # (maya-ik2: pictures through maya-vision's Inkling 2 tower - not
+            #  set up yet: the preview reads text)
+            images = "on" if cfg.get("vision") else "off (text only for now)"
         else:
             images = "on" if cfg.get("vision") else "off"
         where = ""
@@ -6706,7 +6769,8 @@ BENCH_TOPICS = [
 def bench_exe(cfg: dict) -> Path:
     """Which engine binary a HIP config's --bench should relaunch - config_family(cfg)'s target, through the same
     exe_for_target every build step uses, so this can't drift out of sync with either."""
-    return exe_for_target({"deepseek": "maya-ds4", "minimax": "maya-mm3", "hy4": "maya-hy4"}.get(config_family(cfg), "maya"))
+    return exe_for_target({"deepseek": "maya-ds4", "minimax": "maya-mm3", "hy4": "maya-hy4",
+                           "ik2": "maya-ik2"}.get(config_family(cfg), "maya"))
 
 
 BENCH_MIN_ANSWER = 64   # an answer shorter than this (the model stopped early) is listed, not in the decode mean (#549)
@@ -6738,6 +6802,13 @@ def bench_chat(family: str, tokenizer_dir: Path):
                                     enable_thinking=False) + "<|message_model|><|content_text|>"
     if family == "qwen":       # (Qwen's turns, the think block closed: the answer itself)
         return "<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n".format
+    if family == "ik2":        # (thinkingmachines' template at effort none, the answer's text segment opened - as the
+        #  server does for thinking off: Inkling 2 has no switch, only the effort)
+        from serve.frontend import ChatTemplate
+        path = Path(tokenizer_dir) / "chat_template.jinja"
+        tpl = ChatTemplate(path if path.exists() else IK2_TEMPLATE)
+        return lambda q: tpl.render([{"role": "user", "content": q}], enable_thinking=False) + \
+            "<|message_model|><|content_text|>"
     return "[gMASK]<sop><|user|>\n{}<|assistant|>\n</think>".format
 
 
@@ -7035,6 +7106,8 @@ def _set_up(a, prev: dict) -> Path | None:
         return set_up_qwen(a, prev)
     if family == "hy4":
         return set_up_hy4(a, prev)
+    if family == "ik2":
+        return set_up_ik2(a, prev)
     inst = prev.get("installer") or {}
     prev_args = prev.get("args") or []
     prev_ctx = int(prev_args[prev_args.index("--max-context") + 1]) if "--max-context" in prev_args[:-1] else None
@@ -10971,6 +11044,195 @@ def set_up_qwen(a, prev: dict) -> Path | None:
     return cfg_path
 
 
+# ------------------------------------------------------------------------------------------------ Inkling-2-Mini
+def ik2_entry() -> dict:
+    """Inkling-2-Mini's download (tools/ik2/download.json: unsloth's UD-Q4_K_XL, thinkingmachines' drafter from the
+    model's own repo - "sources") as a MODELS entry (offer_download's form)."""
+    man = read_json(IK2_MANIFEST)
+    if not man.get("files") or not man.get("revision") or man.get("gguf") not in (man.get("files") or {}):
+        fail(f"{IK2_MANIFEST} is missing or damaged", "restore it (git checkout tools/ik2/download.json)")
+    src = man.get("sources") or {}
+    return {"about": f"{IK2_SHOWN} in unsloth's GGUF ({man.get('about', 'UD-Q4_K_XL')}) and thinkingmachines' own "
+                     f"drafter; {man.get('license', 'Apache 2.0')}",
+            "format": "ik2-gguf", "repo": man["repo"], "revision": man["revision"], "folder": man.get("folder", ""),
+            "files": {k: v[0] for k, v in man["files"].items()}, "sha256": {k: v[1] for k, v in man["files"].items()},
+            "sources": {k: (v["repo"], v["revision"]) for k, v in src.items()},
+            "source_folders": {k: v.get("folder", "") for k, v in src.items()},
+            "gguf": man["gguf"], "draft": man.get("draft"),
+            "download_gb": sum(v[0] for v in man["files"].values()) / 1e9}
+
+
+def ik2_about() -> str:
+    """The setup's model row for Inkling-2-Mini."""
+    files = read_json(IK2_MANIFEST).get("files") or {}   # (damaged: the setup says so when it is picked)
+    gb = f"{sum(v[0] for v in files.values()) / 1e9:.0f} GB" if files else "about 18 GB"
+    return ("An EXPERIMENTAL PREVIEW: thinkingmachines' Inkling-2-Mini (26B, a looped model: 8 of 128 experts a token) "
+            f"on its own engine, in unsloth's UD-Q4_K_XL GGUF with the model's own drafter ({gb}); NVIDIA RTX 30 / "
+            "A100 and newer, Linux, one GPU with 24 GB of VRAM or more - the whole model sits on the card; tool calls, "
+            "its thinking levels, up to a 256K context; text only, one answer at a time.")
+
+
+def ik2_dir(a, models: Path, prev: dict) -> Path:
+    """The model's folder: --model-dir, else the folder of the setup before, else <models folder>/Inkling-2-Mini."""
+    if a.model_dir:
+        return Path(a.model_dir).expanduser().resolve()
+    d = (prev.get("installer") or {}).get("model_dir")
+    if d and Path(d).is_dir() and config_family(prev) == "ik2":
+        return Path(d)
+    return models / IK2
+
+
+def ik2_model_step(a, d: Path, models: Path, drafting: bool) -> list | None:
+    """The model's files in d - the GGUF, and the drafter when it drafts - downloaded when they are not there, then
+    checked against their published sha256: [gguf, drafter or None], or None when nothing was downloaded."""
+    step(5, f"the model ({Q.shown('ik2', Q.IK2_QUANT)})")
+    m = ik2_entry()
+    names = [m["gguf"]] + ([m["draft"]] if drafting and m.get("draft") else [])
+    if not drafting:                                   # (the drafter left out: the download is the GGUF alone)
+        m = {**m, "files": {n: m["files"][n] for n in names}, "sha256": {n: m["sha256"][n] for n in names},
+             "download_gb": sum(m["files"][n] for n in names) / 1e9}
+    files = [d / n for n in names]
+    missing = [f for f in files if file_incomplete(m, f)]
+    if missing and not offer_download(a, Q.shown("ik2", Q.IK2_QUANT, m["download_gb"]), d, files, m):
+        return None
+    for f in files:                                    # (a file that was already there: checked once, then remembered)
+        if not sha256_checked(f, m["sha256"][f.name]):
+            fail(f"{f.name}: the sha256 does not match the published one - still being downloaded, or damaged",
+                 f"let the download finish, or delete the file and run {ME} --download-model")
+    ok(f"{Q.shown('ik2', Q.IK2_QUANT)}: {sum(f.stat().st_size for f in files) / 1e9:.1f} GB in {d}")
+    if rotational(d):
+        warn(f"{d} is on a spinning hard disk: every start copies the whole model from it into VRAM - an NVMe SSD "
+             "starts it in seconds (--models-dir)")
+    return [files[0], files[1] if len(files) > 1 else None]
+
+
+def ik2_tokenizer_step(a, d: Path, gguf: Path) -> Path:
+    """The tokenizer from the GGUF with thinkingmachines' own chat template (the GGUF carries the conversion's, which
+    differs) in <model folder>/maya-ik2/tokenizer, round-trip checked (tools/strata_tokenizer.py --check); built again
+    when its tools or the GGUF changed."""
+    step(6, "the tokenizer and the chat template")
+    out = d / IK2_DIR
+    tools = S.source_hash(IK2_TOKENIZER_TOOLS)
+    rec = read_json(out / PACK_SOURCES)
+    vocab = out / "tokenizer" / "vocab.json"
+    same = rec.get("tools") == tools and rec.get("gguf") == {"name": gguf.name, "size": gguf.stat().st_size}
+    if not a.repack and same and vocab.exists() and (out / "tokenizer" / "chat_template.jinja").exists():
+        ok(f"tokenizer already exported: {vocab.parent}")
+        return out / "tokenizer"
+    if not os.access(d, os.W_OK):
+        fail(f"{d} is not writable: the tokenizer is written next to the GGUF file", "pass --model-dir with a writable folder")
+    r = run([sys.executable, str(ROOT / "tools" / "strata_tokenizer.py"), "--gguf", str(gguf), "--out", str(out),
+             "--chat-template", str(IK2_TEMPLATE), "--check"], check=False)
+    if r.returncode != 0 or not vocab.exists():
+        fail(f"the tokenizer could not be exported from {gguf.name}", "the reason is in the messages above")
+    out.mkdir(parents=True, exist_ok=True)
+    # (the files the config runs from, for the Models page's size and its delete: serve/models.py's pack_shards)
+    files = [{"name": gguf.name, "size": gguf.stat().st_size}]
+    draft = d / (ik2_entry().get("draft") or "")
+    if draft.is_file():
+        files.append({"name": draft.name, "size": draft.stat().st_size})
+    (out / PACK_SOURCES).write_text(json.dumps({"tools": tools, "gguf": files[0], "files": files}, indent=1),
+                                    encoding="utf-8")
+    ok(f"tokenizer: {vocab.parent} (thinkingmachines' chat template)")
+    return out / "tokenizer"
+
+
+def write_config_ik2(a, pc: dict, meta: dict, gguf: Path, draft: Path | None, tok: Path, ctx: int, fit: dict,
+                     models: Path, d: Path) -> Path:
+    """maya-inkling-2-mini.json and its start script.  A setup again keeps what the config before says that this one
+    does not ask (its engine flags it names, where the server listens and its key); the model's own sampling and
+    thinking level every setup."""
+    step(7, "the configuration and the start script")
+    port = a.port or 8080
+    cfg_path = ROOT / f"{Q.config_stem('ik2', Q.IK2_QUANT)}.json"
+    old = read_json(cfg_path)
+    args = ["--model", str(gguf), "--max-context", str(ctx)]
+    if draft is not None and fit.get("drafting"):      # (the engine drafts only where a window pays: SpecCtl)
+        args += ["--draft", str(draft)]
+    kept = keep_args(old.get("args") or [], args, ("--threads", "--eos", "--cache-gb"))
+    inst = {"family": "ik2", "quant": Q.OTHERS[("ik2", Q.IK2_QUANT)], "ik2_quant": Q.IK2_QUANT}
+    sampling, effort = Q.model_defaults({"installer": inst})   # (the model's own, every setup)
+    cfg = {"exe": str(IK2_EXE), "args": args, "cwd": str(ROOT), "tokenizer": str(tok), "model_name": IK2_MODEL_NAME,
+           "gpu": [g["index"] for g in pc["gpus"]], "sampling": sampling, "reasoning_effort": effort,
+           "lib_dirs": meta.get("lib_dirs") or old.get("lib_dirs") or [], "port": port}
+    kept += keep_server_settings(cfg, old, a)
+    # (its cache in FP8 - half the bytes, the faster one deep in a context; the drafter's positions where the card
+    #  holds fewer than the context - tools/ik2_fit.py; the user's own variables kept)
+    env = {k: v for k, v in (old.get("env") or {}).items() if k != "IK2_DRAFT_CTX"}
+    env.setdefault("IK2_KV", IK2F.DEFAULT_KV)
+    if fit.get("draft_ctx") and "--draft" in args:
+        env["IK2_DRAFT_CTX"] = str(fit["draft_ctx"])
+    env.update(parse_env(a.env))
+    cfg["env"] = env
+    if a.host:
+        cfg["host"] = a.host
+    if a.api_key:
+        cfg["api_key"] = a.api_key
+    if kept:
+        ok("kept from the config before: " + ", ".join(kept))
+    cfg["log"] = str(cfg_path.with_suffix(".log"))
+    cfg["installer"] = {**inst, "models_dir": str(models), "model_dir": str(d), "experimental": True,
+                        "written": time.strftime("%Y-%m-%d %H:%M")}
+    cfg_path.write_text(json.dumps(N.env_out(cfg), indent=1), encoding="utf-8")
+    ok(f"config: {cfg_path}")
+    ok(f"start script: {write_run_script(cfg_path, cfg['port'])}")
+    return cfg_path
+
+
+def set_up_ik2(a, prev: dict) -> Path | None:
+    """Inkling-2-Mini's steps 1-7 (an experimental preview): the PC (refused in one line where the preview does not
+    run: AMD, a Mac, Windows, two GPUs or more asked for, a card older than RTX 30 / A100 or under 24 GB), the context
+    (the largest that keeps every expert in VRAM on this card), the engine (build/maya-ik2), the files (pinned,
+    sha256-checked), the tokenizer with the model's own template, the config."""
+    inst = prev.get("installer") or {}
+    prev_args = prev.get("args") or []
+    prev_ctx = int(prev_args[prev_args.index("--max-context") + 1]) if "--max-context" in prev_args[:-1] else None
+    a.gpus_before = prev.get("gpu")                    # (the GPU question's default: this config's GPU)
+    pc = check_pc(a, "ik2")                            # 1
+    vram = float(pc["gpus"][0].get("vram_gb") or 0)
+    step(2, "your choices")                            # 2
+    warn(f"{IK2_SHOWN} is an experimental preview: run by its contributor on RTX 3090 cards (Linux), not yet by "
+         "Maya's team on every card - tell us how it goes in an issue")
+    m = ik2_entry()
+    ok(f"model: {Q.shown('ik2', Q.IK2_QUANT, m['download_gb'])} - thinkingmachines' Inkling-2-Mini in unsloth's GGUF "
+       "(Apache 2.0)")
+    how = getattr(a, "drafting", None)
+    # (the drafter: on unless --drafting off, or the setup before had it off)
+    drafting = how == "on" if how in ("on", "off") else (not prev_args or "--draft" in prev_args[:-1])
+    kv = str((prev.get("env") or {}).get("IK2_KV") or IK2F.DEFAULT_KV)
+    rec = IK2F.recommended_context(vram, kv, drafting)
+    ctx = choose_context(a, prev_ctx, IK2F.CONTEXTS, rec)
+    fit = IK2F.plan(vram, ctx, kv, drafting)
+    ok(f"context: {ctx} tokens" + (" (recommended for this card's VRAM)" if ctx == rec else "") +
+       f"; its cache: {ctx * IK2F.KV_BYTES.get(kv, IK2F.KV_BYTES['f16']) / 2**30:.1f} GB of VRAM ({kv.upper()})")
+    if not fit["resident"]:
+        warn(f"at {context_label(ctx)} the model and its cache do not all fit in this card's {vram:.0f} GB: the "
+             f"engine then runs its slower path (a context of {context_label(rec)} keeps everything in VRAM)")
+    if drafting and not fit["drafting"]:
+        warn("drafting: off - no room on the card beside the model at this context (a smaller context leaves room)")
+    elif drafting:
+        ok("drafting: the model's own drafter proposes tokens for the model to check - the same answers; the engine "
+           "drafts only where it pays" + (f" (it sees the last {context_label(fit['draft_ctx'])} tokens: the card's "
+                                          "room)" if fit.get("draft_ctx") else ""))
+    else:
+        ok("drafting: off (--drafting on drafts with the model's own drafter)")
+    models = (Path(a.models_dir).expanduser().resolve() if a.models_dir else
+              Path(inst["models_dir"]) if inst.get("models_dir") else ROOT.parent / "Maya-data" / "models")
+    d = ik2_dir(a, models, prev)
+    ok(f"model folder: {d}")
+    llama = tools_step(a)                              # 3
+    meta = build_step(a, pc, llama, "maya-ik2")        # 4
+    if not IK2_EXE.exists():
+        fail(f"the engine was not built ({IK2_EXE})", "the reason is in the build's messages above (maya-ik2 needs "
+             "an RTX 30 / A100 or newer card in the build's GPU list)")
+    got = ik2_model_step(a, d, models, drafting and fit["drafting"])   # 5
+    if got is None:
+        return None
+    gguf, draft = got
+    tok = ik2_tokenizer_step(a, d, gguf)              # 6
+    return write_config_ik2(a, pc, meta, gguf, draft, tok, ctx, fit, models, d)   # 7
+
+
 def set_up_and_serve(a, prev: dict) -> tuple | None:
     """On the setup's screen: the setup, then Maya running on the same screen - its server's output there, Ctrl+C
     stops it.  (The config, the server's exit code or None when it was not started), or None when the model was not
@@ -10999,7 +11261,7 @@ def model_option(a) -> str | None:
     hit = Q.resolve(a.model, list(glm_downloads()))   # (GLM-5.3's downloads included)
     if hit is None:
         return (f"--model {a.model}: not a model Maya knows - one of " + ", ".join(i for _, _, _, i in Q.QUANTS) +
-                f", {DS4}, {MM3}, {HY4}, cyber-frost = {QWEN_SHOWN}, or a GLM-5.3-Flash download: " + ", ".join(MODELS))
+                f", {DS4}, {MM3}, {HY4}, cyber-frost = {QWEN_SHOWN}, {Q.IK2_IDS[0]} = {IK2_SHOWN} (experimental), or a GLM-5.3-Flash download: " + ", ".join(MODELS))
     family, key = hit
     if family == "glm":
         a.model = key
@@ -11011,6 +11273,9 @@ def model_option(a) -> str | None:
         a.model = QWEN
         if key is not None:
             a.qwen_quant = key
+        return None
+    if family == "ik2":                                  # (Inkling-2-Mini: its one file set, unsloth's UD-Q4_K_XL)
+        a.model = IK2
         return None
     a.model, flag = {"deepseek": (DS4, "ds4_quant"), "hy4": (HY4, "hy4_quant")}.get(family, (MM3, "mm3_quant"))
     if key is not None:
@@ -11053,7 +11318,7 @@ def main() -> int:
                     help="which model and files (default: asked): a Maya quant - "
                          + ", ".join(i for _, _, _, i in Q.QUANTS) +
                          f" - or {DS4} / {MM3} / {HY4} (their files asked, or --ds4-quant / --mm3-quant / --hy4-quant), "
-                         f"cyber-frost = {QWEN_SHOWN},"
+                         f"cyber-frost = {QWEN_SHOWN}, {Q.IK2_IDS[0]} = {IK2_SHOWN} (an experimental preview),"
                          " or a GLM-5.3-Flash "
                          "download by its name (" + ", ".join(MODELS) + "; every name used before still works)")
     ap.add_argument("--model-dir", help=f"use the files you already have of {DS4}, MiniMax, {HY4} or {QWEN_SHOWN}: their "
@@ -11292,9 +11557,11 @@ def main() -> int:
     prev = read_json(have[0]) if have else {}
     if a.check:
         hy4 = a.model == HY4 or bool(getattr(a, "hy4_quant", None))
-        ds4 = not hy4 and (a.model == DS4 or bool(a.model_dir) and exl3_folder_family(a.model_dir) is None)
+        ik2 = a.model == IK2                           # (Inkling-2-Mini's preview: its refusals, or this PC's card)
+        ds4 = not hy4 and not ik2 and (a.model == DS4 or bool(a.model_dir) and exl3_folder_family(a.model_dir) is None)
         quant = choose_ds4_quant(a, prev) if ds4 else None
-        pc = check_pc(a, "hy4" if hy4 else "deepseek" if ds4 else "glm", gguf=ds4 and quant != "exl3")
+        pc = check_pc(a, "hy4" if hy4 else "ik2" if ik2 else "deepseek" if ds4 else "glm",
+                      gguf=ds4 and quant != "exl3")
         if hy4:                                        # (the layout and the context that fit this VRAM, or why none does)
             quant = choose_hy4_quant(a, prev if config_family(prev) == "hy4" else {})
             if quant != HY4_Q4:                        # (Tencent's own Q4_K_M: the table has no VRAM plan for it)
