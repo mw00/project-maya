@@ -25,6 +25,9 @@
 #include "ik2_draft.hpp"
 #include "ik2_kernels.cuh"
 #include "strata/artifact/gguf_reader.hpp"
+#ifdef STRATA_USE_HIP
+#include "ds4_lt.hpp"   // (AMD: the prompt's FP16 GEMMs on hipBLASLt, the kernel a shape measured and kept)
+#endif
 
 #include <cublas_v2.h>
 #include <cuda_fp16.h>
@@ -355,6 +358,11 @@ T* dalloc(size_t n) {
 
 // Y [T][N] (ldy) = X [T][K] FP16 . W [N][K]^T FP16, F32 sums
 void gemm16(const uint16_t* W, int N, int Kd, const uint16_t* X, int T, float* Y, int ldy, float beta = 0.0f) {
+#ifdef STRATA_USE_HIP
+    // (AMD: hipBLASLt's kernel for the shape measured once on this GPU and kept in the store - hipBLAS's own pick for
+    //  these FP16 shapes on gfx11 is its generic kernel, ~5x slower; fewer than kMinRows rows: hipBLAS)
+    if (beta == 0.0f && strata::ds4::lt::gemm(g_s, W, N, Kd, X, Kd, T, Y, ldy)) return;
+#endif
     const float one = 1.0f;
     CB(cublasGemmEx(g_blas, CUBLAS_OP_T, CUBLAS_OP_N, N, T, Kd, &one, W, CUDA_R_16F, Kd, X, CUDA_R_16F, Kd, &beta, Y,
                     CUDA_R_32F, ldy, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
@@ -1671,6 +1679,49 @@ void prefetch_layer(Model& M, int l, Work& W, ExpertCache& EC, int T, const Work
     W.pf_layers[pr] = l;
 }
 
+#ifdef STRATA_USE_HIP
+// AMD, one GPU: the grouped prompt experts' buffers (k::experts_rdna_*) - the rows' inputs, hidden and outputs, the
+// tiles and the experts' pointers (their host copies by layer parity, as Work's gidx_h); grown to the largest chunk
+struct RdnaMoe {
+    size_t rows = 0;
+    int E = 0;
+    uint16_t* x16 = nullptr;
+    uint16_t* h16 = nullptr;
+    float* y32 = nullptr;
+    int* tiles = nullptr;
+    const uint8_t** eptr = nullptr;
+    int* tiles_h[2] = {};
+    const uint8_t** eptr_h[2] = {};
+};
+RdnaMoe& rdna_moe(int S, int E, int C, int F) {
+    static RdnaMoe R;
+    if ((size_t) S > R.rows || E > R.E) {
+        CU(cudaDeviceSynchronize());   // (only when a larger chunk comes: the old buffers may still be read)
+        if (R.rows) {
+            CU(cudaFree(R.x16));
+            CU(cudaFree(R.h16));
+            CU(cudaFree(R.y32));
+            CU(cudaFree(R.tiles));
+            CU(cudaFree((void*) R.eptr));
+            for (int i = 0; i < 2; ++i) {
+                CU(cudaFreeHost(R.tiles_h[i]));
+                CU(cudaFreeHost((void*) R.eptr_h[i]));
+            }
+        }
+        R.rows = std::max<size_t>(R.rows, (size_t) S), R.E = std::max(R.E, E);
+        const size_t nt = R.rows / 32 + (size_t) R.E + 1;   // (tiles: up to 32 rows of one expert each)
+        R.x16 = dalloc<uint16_t>(R.rows * C), R.h16 = dalloc<uint16_t>(R.rows * F), R.y32 = dalloc<float>(R.rows * C);
+        R.tiles = dalloc<int>(nt * 4);
+        CU(cudaMalloc((void**) &R.eptr, (size_t) R.E * sizeof(void*)));
+        for (int i = 0; i < 2; ++i) {
+            CU(cudaHostAlloc((void**) &R.tiles_h[i], nt * 16, cudaHostAllocDefault));
+            CU(cudaHostAlloc((void**) &R.eptr_h[i], (size_t) R.E * sizeof(void*), cudaHostAllocDefault));
+        }
+    }
+    return R;
+}
+#endif
+
 void run_prefill_moe(const Model& M, Layer& Ly, int l, int T, const uint16_t* xq16, const int* top, const float* w,
                      const float* r_in, float* h_out, Work& W, ExpertCache& EC, double& t_exp) {
     const Config& c = M.c;
@@ -1777,6 +1828,37 @@ void run_prefill_moe(const Model& M, Layer& Ly, int l, int T, const uint16_t* xq
             scatter_add_rows_kernel<<<cnt_e, 256, 0, g_s>>>(X.y32, X.gidx + st_e, X.wtr + st_e, C, X.tmp, C);
         };
         const bool pf = X.pf_layers[l % Work::kPfRing] == l;
+#ifdef STRATA_USE_HIP
+        if (d < 0 && k::experts_rdna_available(Ly.ty[0], Ly.ty[1], Ly.ty[2], C, F)) {
+            // (AMD matrix cores: all the layer's experts in one launch each for gate / up and down, then each token's
+            //  picks summed in expert order - so every copy and prefetch they read is waited for first)
+            if (pf) {
+                int b = -1;
+                for (int e = 0; e < c.E; ++e)
+                    if (W.cnt[e]) b = std::max(b, X.pf_bs[l % Work::kPfRing][e]);
+                if (b >= 0) CU(cudaStreamWaitEvent(g_s, X.pf_evs[l % Work::kPfRing][b], 0));
+            }
+            if (n_miss > 0 && cst != g_s) CU(cudaStreamWaitEvent(g_s, X.miss_ev[n_batches - 1], 0));
+            RdnaMoe& R = rdna_moe(S, c.E, C, F);
+            int* th = R.tiles_h[ps];
+            int nt = 0;
+            for (int e = 0; e < c.E; ++e) {
+                R.eptr_h[ps][e] = W.cnt[e] ? X.slot_ptrs[e] : nullptr;
+                for (int m0 = 0; m0 < W.cnt[e]; m0 += 32, ++nt)
+                    th[4 * nt] = e, th[4 * nt + 1] = W.start[e] + m0, th[4 * nt + 2] = std::min(32, W.cnt[e] - m0),
+                    th[4 * nt + 3] = 0;
+            }
+            CU(cudaMemcpyAsync(R.tiles, th, (size_t) nt * 16, cudaMemcpyHostToDevice, g_s));
+            CU(cudaMemcpyAsync(R.eptr, R.eptr_h[ps], (size_t) c.E * sizeof(void*), cudaMemcpyHostToDevice, g_s));
+            gather_f16_16_kernel<<<S, 256, 0, g_s>>>(xin, X.gidx, S, C, R.x16);
+            k::experts_rdna_gu(R.eptr, R.tiles, nt, Ly.ty[0], Ly.eb[0], R.x16, C, F, X.sg, X.su, c.gate_cap,
+                               c.up_cap, R.h16, g_s);
+            k::experts_rdna_down(R.eptr, R.tiles, nt, Ly.ty[2], Ly.eb[0] + Ly.eb[1], R.h16, C, F, R.y32, g_s);
+            k::moe_rows_combine(R.y32, X.inv, X.wtr, T, c.K, C, X.tmp, g_s);
+            X.pf_layers[l % Work::kPfRing] = -1;
+            return;
+        }
+#endif
         X.miss_pos.assign(c.E, -1);
         for (int m = 0; m < n_miss; ++m) X.miss_pos[X.miss_exps[m]] = m;
         int pf_waited = -1, miss_waited = -1;
@@ -3573,18 +3655,34 @@ void check_preview(int n_gpu, bool serve) {
 #endif
     int nd = 0;
     const cudaError_t e = cudaGetDeviceCount(&nd);
+#ifdef STRATA_USE_HIP
+    const char* vendor = "AMD";
+#else
+    const char* vendor = "NVIDIA";
+#endif
     if (e != cudaSuccess || nd < 1)
-        refuse(std::string("no NVIDIA GPU visible (") + (e != cudaSuccess ? cudaGetErrorString(e) : "0 devices") +
-            "): the Inkling 2 preview runs on one NVIDIA GPU");
+        refuse(std::string("no ") + vendor + " GPU visible (" + (e != cudaSuccess ? cudaGetErrorString(e) : "0 devices") +
+            "): the Inkling 2 preview runs on one " + vendor + " GPU");
     if (n_gpu < 1 || n_gpu > 2) refuse("--gpus " + std::to_string(n_gpu) + ": the Inkling 2 preview runs on one GPU");
     if (n_gpu == 2 && !force)
         refuse("--gpus 2: the Inkling 2 preview runs on one GPU, two (IK2_EP=1 or IK2_TP=1) are outside it" + run_anyway);
     for (int d = 0; d < std::min(n_gpu, nd); ++d) {
         cudaDeviceProp p{};
         CU(cudaGetDeviceProperties(&p, d));
+#ifdef STRATA_USE_HIP
+        // (AMD, Linux: every arch of this build - include/strata/hip_compat; the device check of the build's arch
+        //  list stops a card it has no code for with a clear line, as the other engines)
+        std::string arch = p.gcnArchName;
+        arch = arch.substr(0, arch.find(':'));
+        const std::string gpu = "GPU " + std::to_string(d) + " (" + p.name + ", " + arch + ")";
+        if ((std::string(",") + STRATA_HIP_ARCHS + ",").find("," + arch + ",") == std::string::npos)
+            refuse("this build has no kernels for " + gpu + ": it is built for " + STRATA_HIP_ARCHS +
+                   " (add " + arch + " to CMAKE_HIP_ARCHITECTURES and rebuild)");
+#else
         const std::string gpu = "GPU " + std::to_string(d) + " (" + p.name + ", sm_" + std::to_string(p.major) +
                                 std::to_string(p.minor) + ")";
         if (p.major < 8) refuse(gpu + " is too old: maya-ik2 needs an NVIDIA GPU of sm_80 (Ampere) or newer");
+#endif
         CU(cudaSetDevice(d));
 #ifndef STRATA_USE_HIP   // (a kernel of this build for the GPU: none when its arch is not in the list)
         cudaFuncAttributes fa{};
@@ -3648,6 +3746,9 @@ int main(int argc, char** argv) {
     }
     g_prof = getenv("IK2_PROF") && std::atoi(getenv("IK2_PROF"));
     g_flash = !(getenv("IK2_FLASH") && !std::atoi(getenv("IK2_FLASH")));
+#ifdef STRATA_USE_HIP
+    if (!k::attn_flash_available()) g_flash = false;   // (AMD: the fused prompt attention where its kernel is built)
+#endif
     g_mv = !getenv("IK2_MV") || std::atoi(getenv("IK2_MV"));
     g_group = !getenv("IK2_GROUP") || std::atoi(getenv("IK2_GROUP"));
     if (getenv("IK2_GROUP")) {
@@ -3674,6 +3775,14 @@ int main(int argc, char** argv) {
         if (*p == ',') ++p;
     }
     check_preview(n_gpu, serve);
+#ifdef STRATA_USE_HIP
+    {   // (AMD: the GEMMs' measured kernels - lt-picks.txt beside the GGUF, or IK2_LT_STORE's file; empty: none kept)
+        const char* ls = std::getenv("IK2_LT_STORE");
+        const size_t sl = model.find_last_of('/');
+        const std::string dir = sl == std::string::npos ? std::string(".") : model.substr(0, sl);
+        strata::ds4::lt::set_store(ls != nullptr ? ls : (dir + "/lt-picks.txt").c_str(), "IK2_LT_STORE");
+    }
+#endif
     const double t_start = now();
     Shards S(model);
     Model M;
@@ -4633,10 +4742,17 @@ int main(int argc, char** argv) {
             for (int vis = 0; vis < (int) M.V.size(); ++vis) {
                 Layer& Ly = bind_visit(M, vis);
                 use_dev(Ly.dev);
+#ifdef STRATA_USE_HIP   // (AMD: on the engine's stream - a plain memset is a device-wide wait there, 192 a request)
+                CU(cudaMemsetAsync(Ly.h_k, 0, 3 * KD * 4, g_s));
+                CU(cudaMemsetAsync(Ly.h_v, 0, 3 * KD * 4, g_s));
+                CU(cudaMemsetAsync(Ly.h_attn, 0, 3 * C * 4, g_s));
+                CU(cudaMemsetAsync(Ly.h_mlp, 0, 3 * C * 4, g_s));
+#else
                 CU(cudaMemset(Ly.h_k, 0, 3 * KD * 4));
                 CU(cudaMemset(Ly.h_v, 0, 3 * KD * 4));
                 CU(cudaMemset(Ly.h_attn, 0, 3 * C * 4));
                 CU(cudaMemset(Ly.h_mlp, 0, 3 * C * 4));
+#endif
             }
             hist.clear();
             hist_sig.clear();

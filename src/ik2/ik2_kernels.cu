@@ -3,7 +3,13 @@
 #include "ik2_iq_tables.h"
 
 #include <cuda_fp16.h>
-#include <cuda_fp8.h>
+#ifndef STRATA_USE_HIP
+#include <cuda_fp8.h>   // (AMD: the FP8 conversions are the portable ones below)
+#else
+#include "strata/kernels/rdna_wmma.hpp"   // (AMD: the matrix cores - ik2_rdna.inc)
+
+#include <string>
+#endif
 
 #include <algorithm>
 #include <cmath>
@@ -164,6 +170,27 @@ __device__ float bmax(float v, float* sh) {
 
 constexpr int kBlk = 256;
 
+// two FP16 a register: a * b / a - b, each half rounded to nearest (as PTX's mul.rn / sub.rn.f16x2)
+#ifdef STRATA_USE_HIP
+typedef _Float16 ik2_h2v __attribute__((ext_vector_type(2)));
+__device__ __forceinline__ uint32_t h2_mul(uint32_t a, uint32_t b) {
+    return __builtin_bit_cast(uint32_t, __builtin_bit_cast(ik2_h2v, a) * __builtin_bit_cast(ik2_h2v, b));
+}
+__device__ __forceinline__ uint32_t h2_sub(uint32_t a, uint32_t b) {
+    return __builtin_bit_cast(uint32_t, __builtin_bit_cast(ik2_h2v, a) - __builtin_bit_cast(ik2_h2v, b));
+}
+#else
+__device__ __forceinline__ uint32_t h2_mul(uint32_t a, uint32_t b) {
+    uint32_t r;
+    asm("mul.rn.f16x2 %0, %1, %2;" : "=r"(r) : "r"(a), "r"(b));
+    return r;
+}
+__device__ __forceinline__ uint32_t h2_sub(uint32_t a, uint32_t b) {
+    uint32_t r;
+    asm("sub.rn.f16x2 %0, %1, %2;" : "=r"(r) : "r"(a), "r"(b));
+    return r;
+}
+#endif
 __device__ __forceinline__ uint32_t f2_to_u32(float a, float b) {
     const __half2 h2 = __float22half2_rn(make_float2(a, b));
     return (uint32_t) __half_as_ushort(__low2half(h2)) | ((uint32_t) __half_as_ushort(__high2half(h2)) << 16);
@@ -893,6 +920,65 @@ __global__ void attn_probs_bias_f16_kernel(const float* lg, uint16_t* out16, int
 constexpr int kFaBN = 64, kFaD = 128, kFaLd = kFaD + 8;   // (row pad: conflict-free fragments/ldmatrix)
 constexpr float kLog2e = 1.4426950408889634f;
 
+#ifdef STRATA_USE_HIP
+// AMD: no mma.sync / ldmatrix / cp.async.  These keep their CUDA fragment layouts exactly (a lane's registers hold the
+// same elements), so every kernel written for them runs as it is: the m16n8k16 product from the A rows and B columns
+// gathered by shuffles (each product of two FP16 is exact in FP32; the sums in a fixed order, the same every run), an
+// ldmatrix from the row addresses of the lanes that give them, a cp.async as a plain copy (the kernels wait for a
+// copy before they read its buffer and never write one that is still read).  The hot paths have RDNA kernels of
+// their own (ik2_rdna.inc); these are what every other path takes.
+__device__ __forceinline__ void mma16816(float* c, const uint32_t* a, uint32_t b0, uint32_t b1) {
+    const int lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {   // (lane 4 g + j holds row g's / g + 8's k 2 j, 2 j + 1 and 2 j + 8, 2 j + 9)
+        const float2 ra0 = u32_to_f2(__shfl_sync(0xffffffffu, a[0], 4 * g + j));
+        const float2 ra1 = u32_to_f2(__shfl_sync(0xffffffffu, a[1], 4 * g + j));
+        const float2 ra2 = u32_to_f2(__shfl_sync(0xffffffffu, a[2], 4 * g + j));
+        const float2 ra3 = u32_to_f2(__shfl_sync(0xffffffffu, a[3], 4 * g + j));
+#pragma unroll
+        for (int cc = 0; cc < 2; ++cc) {   // (column 2 t + cc: lane 4 (2 t + cc) + j's b0 / b1)
+            const int sb = 4 * (2 * t + cc) + j;
+            const float2 rb0 = u32_to_f2(__shfl_sync(0xffffffffu, b0, sb));
+            const float2 rb1 = u32_to_f2(__shfl_sync(0xffffffffu, b1, sb));
+            c[cc] = fmaf(ra2.y, rb1.y, fmaf(ra2.x, rb1.x, fmaf(ra0.y, rb0.y, fmaf(ra0.x, rb0.x, c[cc]))));
+            c[2 + cc] = fmaf(ra3.y, rb1.y, fmaf(ra3.x, rb1.x, fmaf(ra1.y, rb0.y, fmaf(ra1.x, rb0.x, c[2 + cc]))));
+        }
+    }
+}
+// (an LDS pointer's generic address: the aperture's high half, the same for every lane of a block, + the offset)
+__device__ __forceinline__ const uint8_t* ldsm_row(const void* p, int src) {
+    const uintptr_t u = (uintptr_t) p;
+    const uint32_t lo = __shfl_sync(0xffffffffu, (uint32_t) u, src);
+    return (const uint8_t*) ((u & ~(uintptr_t) 0xFFFFFFFFu) | lo);
+}
+__device__ __forceinline__ void ldsm_x4_t(uint32_t& r0, uint32_t& r1, uint32_t& r2, uint32_t& r3, const void* p) {
+    const int lane = threadIdx.x & 31, rr = 2 * (lane & 3), cb = 2 * (lane >> 2);
+    uint32_t r[4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const uint16_t lo = *(const uint16_t*) (ldsm_row(p, 8 * i + rr) + cb);
+        const uint16_t hi = *(const uint16_t*) (ldsm_row(p, 8 * i + rr + 1) + cb);
+        r[i] = (uint32_t) lo | ((uint32_t) hi << 16);
+    }
+    r0 = r[0], r1 = r[1], r2 = r[2], r3 = r[3];
+}
+__device__ __forceinline__ void ldsm_x4(uint32_t& r0, uint32_t& r1, uint32_t& r2, uint32_t& r3, const void* p) {
+    const int lane = threadIdx.x & 31;
+    uint32_t r[4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) r[i] = *(const uint32_t*) (ldsm_row(p, 8 * i + (lane >> 2)) + 4 * (lane & 3));
+    r0 = r[0], r1 = r[1], r2 = r[2], r3 = r[3];
+}
+__device__ __forceinline__ void cp_async16(void* dst, const void* src, bool valid) {
+    *(uint4*) dst = valid ? *(const uint4*) src : make_uint4(0u, 0u, 0u, 0u);
+}
+__device__ __forceinline__ void cp_async4(void* dst, const void* src, bool valid) {
+    *(uint32_t*) dst = valid ? *(const uint32_t*) src : 0u;
+}
+__device__ __forceinline__ void cp_async_commit() {}
+template <int N>
+__device__ __forceinline__ void cp_async_wait() {}
+#else
 __device__ __forceinline__ void mma16816(float* c, const uint32_t* a, uint32_t b0, uint32_t b1) {
     asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, "
                  "{%0,%1,%2,%3};\n"
@@ -926,6 +1012,7 @@ template <int N>
 __device__ __forceinline__ void cp_async_wait() {
     asm volatile("cp.async.wait_group %0;\n" ::"n"(N));
 }
+#endif   // STRATA_USE_HIP
 
 // one 64-key tile of K and V (rows kt .. kt+63; rows at or past k_end zero-filled) into smem, NT threads
 template <int NT>
@@ -1058,7 +1145,11 @@ __device__ __forceinline__ void wg_wait0() {
 #endif
 }
 // (keeps the compiler from moving an accumulator's use across the asynchronous MMA's issue or wait)
+#ifdef STRATA_USE_HIP
+__device__ __forceinline__ void wg_fence_operand(float&) {}   // (AMD: the warpgroup kernel is never built)
+#else
 __device__ __forceinline__ void wg_fence_operand(float& r) { asm volatile("" : "+f"(r)::"memory"); }
+#endif
 __device__ __forceinline__ void fence_proxy_async() {
 #if defined(__CUDA_ARCH_FEAT_SM90_ALL)
     asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
@@ -1066,7 +1157,11 @@ __device__ __forceinline__ void fence_proxy_async() {
 }
 // shared-memory matrix descriptor with the 128-byte swizzle: start, leading / stride byte offsets
 __device__ __forceinline__ uint64_t wg_desc(const void* p, uint32_t lbo, uint32_t sbo) {
+#ifdef STRATA_USE_HIP
+    const uint32_t a = (uint32_t) (uintptr_t) p;   // (AMD: never used - the warpgroup kernel is Hopper's)
+#else
     const uint32_t a = (uint32_t) __cvta_generic_to_shared(p);
+#endif
     return (uint64_t) ((a & 0x3FFFF) >> 4) | ((uint64_t) ((lbo & 0x3FFFF) >> 4) << 16) |
            ((uint64_t) ((sbo & 0x3FFFF) >> 4) << 32) | ((uint64_t) 1 << 62);
 }
@@ -2537,9 +2632,7 @@ __device__ __forceinline__ uint32_t ue4m3_h2(uint32_t x) {   // FP16 bits of ue4
 __device__ __forceinline__ uint32_t nv_pair_h2(uint32_t s, uint32_t scale) {   // bytes 0 and 1's low nibbles
     const uint32_t mag = __byte_perm(0x42403c00u, 0x4a484644u, (s & 0x0707u) << 4);
     const uint32_t sign = ((s & 0x0808u) * 0x101000u) & 0x80008000u;
-    uint32_t r;
-    asm("mul.rn.f16x2 %0, %1, %2;" : "=r"(r) : "r"(mag | sign), "r"(scale));
-    return r;
+    return h2_mul(mag | sign, scale);
 }
 struct NvStep {   // a lane's part of a 64-value block of its two rows: the sub-block's scales and codes
     uint32_t sa, sb, wa0, wa1, wb0, wb1;
@@ -4123,15 +4216,9 @@ unsigned grid(size_t n, int b = kBlk) { return (unsigned) ((n + b - 1) / b); }
 // the int8 pairs of Q8_0 blocks as FP16 (exact), and those times a block scale
 __device__ __forceinline__ uint32_t q8_pair(uint32_t w) {
     const uint32_t u = __byte_perm(w ^ 0x80808080u, 0x64646464u, 0x4140);
-    uint32_t f;
-    asm("sub.rn.f16x2 %0, %1, %2;" : "=r"(f) : "r"(u), "r"(0x64806480u));
-    return f;
+    return h2_sub(u, 0x64806480u);
 }
-__device__ __forceinline__ uint32_t q8_h2(uint32_t w, uint32_t scale) {
-    uint32_t f = q8_pair(w);
-    asm("mul.rn.f16x2 %0, %1, %2;" : "=r"(f) : "r"(f), "r"(scale));
-    return f;
-}
+__device__ __forceinline__ uint32_t q8_h2(uint32_t w, uint32_t scale) { return h2_mul(q8_pair(w), scale); }
 
 // Quantized planar Q8 GEMM for the small verify/prefill tiles. One scale covers
 // both 16-wide MMA instructions. Packing the signed bytes via 1024+u is exact
@@ -4858,6 +4945,10 @@ experts_block_down_q8_kernel(const uint8_t* const* __restrict__ blob, const int*
 
 }  // namespace
 
+#ifdef STRATA_USE_HIP
+#include "ik2_rdna.inc"   // (AMD: the matrix-core kernels)
+#endif
+
 void rms(const float* x, const float* w, int rows, int D, float eps, float* y, cudaStream_t s) {
     if (rows <= 0) return;
     rms_impl_kernel<false, true><<<rows, kBlk, 0, s>>>(x, w, D, eps, nullptr, y);
@@ -4980,6 +5071,11 @@ bool fa_wgmma() {
     }();
     return on != 0;
 }
+#ifdef STRATA_USE_HIP
+bool attn_flash_available() { return false; }   // (AMD: the kernel's 86 KB of shared memory is past RDNA's 64 KB)
+#else
+bool attn_flash_available() { return true; }
+#endif
 template <int NW, bool WG, class KVT>
 void attn_flash_launch(const uint16_t* q16, int q_ld, const KVT* kc, const KVT* vc, int kv_cap, int H, int KV,
                        int Tq, int qpos0, float qk_scale, const float* bias, int extent, int window, int n_split,
