@@ -1090,6 +1090,7 @@ struct Work {
     float* lp_g = nullptr;   // the message gates' scratch [3][Tm][2 rank + 2]
     float *lp_a = nullptr, *lp_f = nullptr;   // ... of a chunk's: [3][Tm][rank] and [2][Tm][C]
     float* logits_h = nullptr;   // the resident token path's logits, pinned [n_vocab]
+    int *cand_d = nullptr, *cand_h = nullptr, *cand_part = nullptr;   // ... its candidates (k::cand_topk's out), scratch
 };
 
 // --serve: SIGUSR1 asks the request running to stop (its client went away) at its next token or prompt chunk
@@ -1199,7 +1200,15 @@ void use_dev(int d) {
     g_s = g_dev[d].s, g_cs = g_dev[d].cs, g_ev = g_dev[d].ev, g_blas = g_dev[d].blas;
 }
 
-enum class OutMode { kNone, kArgmax, kLogits };
+// (kCand: sampling's candidates - the resident token path finds the largest logits on the device, g_cand; any other
+// path gives the logits as kLogits does and leaves g_cand.n at -1)
+enum class OutMode { kNone, kArgmax, kLogits, kCand };
+constexpr int kCandK = 1000, kCandCap = 4096;   // the largest logits sampling looks at; the candidates a token keeps
+struct Cand {
+    int n = -1;                    // candidates of the last kCand token (-1: its logits were given instead)
+    const int* idx = nullptr;      // [n] token ids, in no order
+    const float* val = nullptr;    // [n] their logits
+} g_cand;
 
 __global__ void gather_f16_16_kernel(const uint16_t* __restrict__ x16, const int* __restrict__ idx, int n, int C,
                                      uint16_t* __restrict__ y16) {
@@ -1936,7 +1945,7 @@ struct FastGraph {
     cudaGraph_t graph = nullptr;
     cudaGraphExec_t exec = nullptr;
 };
-FastGraph g_fgraph[3];      // by OutMode
+FastGraph g_fgraph[4];      // by OutMode
 
 // one token's launches: its embedding row in W.emb_h and its position in W.pos_h[0] (pinned host; copied first)
 void fast_token_launches(Model& M, Work& W, OutMode out_mode) {
@@ -2114,6 +2123,10 @@ void fast_token_launches(Model& M, Work& W, OutMode out_mode) {
         if (out_mode == OutMode::kArgmax) {
             k::argmax_sum(W.logits, nullptr, nullptr, c.n_vocab, W.argmax_d, g_s);
             CU(cudaMemcpyAsync(W.argmax_h, W.argmax_d, 4, cudaMemcpyDeviceToHost, g_s));
+        } else if (out_mode == OutMode::kCand) {   // (the softcap keeps the logits within +- logit_cap)
+            k::softcap(W.logits, (size_t) c.n_rows, c.logit_cap, g_s);
+            k::cand_topk(W.logits, c.n_vocab, -c.logit_cap, c.logit_cap, kCandK, kCandCap, W.cand_part, W.cand_d, g_s);
+            CU(cudaMemcpyAsync(W.cand_h, W.cand_d, (size_t) (2 + 2 * kCandCap) * 4, cudaMemcpyDeviceToHost, g_s));
         } else {
             k::softcap(W.logits, (size_t) c.n_rows, c.logit_cap, g_s);
             CU(cudaMemcpyAsync(W.logits_h, W.logits, (size_t) c.n_vocab * 4, cudaMemcpyDeviceToHost, g_s));
@@ -2146,6 +2159,14 @@ void fast_token(Model& M, int tok, int pos, OutMode out_mode, std::vector<float>
         argmax_out->assign(1, W.argmax_h[0]);
     } else if (out_mode == OutMode::kLogits) {
         logits_out.insert(logits_out.end(), W.logits_h, W.logits_h + c.n_vocab);
+    } else if (out_mode == OutMode::kCand) {
+        if (W.cand_h[0] <= kCandCap) {
+            g_cand.n = W.cand_h[0], g_cand.idx = W.cand_h + 2, g_cand.val = (const float*) (W.cand_h + 2 + kCandCap);
+        } else {   // (more than the buffer holds - logits flat past belief: the logits themselves, this once)
+            CU(cudaMemcpy(W.logits_h, W.logits, (size_t) c.n_vocab * 4, cudaMemcpyDeviceToHost));
+            logits_out.insert(logits_out.end(), W.logits_h, W.logits_h + c.n_vocab);
+            g_cand.n = -1;
+        }
     }
 }
 
@@ -2158,6 +2179,7 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
         fast_token(M, tok[0], pos0, out_mode, logits_out, argmax_out);
         return;
     }
+    if (out_mode == OutMode::kCand) out_mode = OutMode::kLogits, g_cand.n = -1;   // (this path: the logits)
     use_dev(M.L[0].dev);
     Work* Wp = &dev_work(g_cur);
     ExpertCache* ECp = &dev_cache(g_cur);
@@ -3731,6 +3753,9 @@ int main(int argc, char** argv) {
     W.argmax_d = dalloc<int>(Tm);
     CU(cudaHostAlloc(&W.argmax_h, Tm * 4, cudaHostAllocPortable));
     CU(cudaHostAlloc(&W.logits_h, (size_t) c.n_rows * 4, cudaHostAllocPortable));
+    CU(cudaHostAlloc(&W.cand_h, (size_t) (2 + 2 * kCandCap) * 4, cudaHostAllocPortable));
+    W.cand_d = dalloc<int>(2 + 2 * kCandCap);
+    W.cand_part = dalloc<int>(k::cand_scratch(c.n_vocab));
     const int n_ev = (c.E + Work::kMissBatch - 1) / Work::kMissBatch;
     W.miss_ev.resize(n_ev);
     for (int i = 0; i < n_ev; ++i) CU(cudaEventCreateWithFlags(&W.miss_ev[i], cudaEventDisableTiming));
@@ -4186,16 +4211,18 @@ int main(int argc, char** argv) {
                             "routing %llu, prefetched and unused %llu\n",
                             (unsigned long long) g_src_hist[0], (unsigned long long) g_src_hist[1],
                             (unsigned long long) g_src_hist[2], (unsigned long long) g_src_hist[3]);
-            auto pick = [&](const float* r) -> int {
-                if (temp <= 0) return (int) (std::max_element(r, r + c.n_vocab) - r);
-                // softmax(logits / T) over the top_p mass of the 1000 largest
-                std::vector<int> ix(c.n_vocab);
-                for (int v = 0; v < c.n_vocab; ++v) ix[v] = v;
-                const int kk = std::min(top_k > 0 ? std::min(top_k, 1000) : 1000, c.n_vocab);
-                std::partial_sort(ix.begin(), ix.begin() + kk, ix.end(), [&](int a2, int b2) { return r[a2] > r[b2]; });
+            // softmax(logits / T) over the top_p mass of the 1000 largest of the (logit, token) pairs given (the
+            // whole vocabulary, or the candidates the resident token path found on the device: every logit of the
+            // highest bins that hold 1000 - the same 1000 either way; ties: the lower token first)
+            auto pick_top = [&](std::vector<std::pair<float, int>>& cd) -> int {
+                const int kk = std::min((int) cd.size(), top_k > 0 ? std::min(top_k, kCandK) : kCandK);
+                std::partial_sort(cd.begin(), cd.begin() + kk, cd.end(),
+                                  [](const std::pair<float, int>& a2, const std::pair<float, int>& b2) {
+                                      return a2.first > b2.first || (a2.first == b2.first && a2.second < b2.second);
+                                  });
                 std::vector<double> pr(kk);
                 double z = 0;
-                for (int j = 0; j < kk; ++j) z += (pr[j] = std::exp((r[ix[j]] - r[ix[0]]) / temp));
+                for (int j = 0; j < kk; ++j) z += (pr[j] = std::exp((cd[j].first - cd[0].first) / temp));
                 double acc = 0;
                 int keep = kk;
                 for (int j = 0; j < kk; ++j) {
@@ -4210,10 +4237,24 @@ int main(int argc, char** argv) {
                 double u = std::uniform_real_distribution<double>(0, zk)(rng);
                 for (int j = 0; j < keep; ++j) {
                     u -= pr[j];
-                    if (u <= 0) return ix[j];
+                    if (u <= 0) return cd[j].second;
                 }
-                return ix[keep - 1];
+                return cd[keep - 1].second;
             };
+            auto pick = [&](const float* r) -> int {
+                if (temp <= 0) return (int) (std::max_element(r, r + c.n_vocab) - r);
+                std::vector<std::pair<float, int>> cd(c.n_vocab);
+                for (int v = 0; v < c.n_vocab; ++v) cd[v] = {r[v], v};
+                return pick_top(cd);
+            };
+            auto pick_cand = [&]() -> int {
+                std::vector<std::pair<float, int>> cd(g_cand.n);
+                for (int i = 0; i < g_cand.n; ++i) cd[i] = {g_cand.val[i], g_cand.idx[i]};
+                return pick_top(cd);
+            };
+            // IK2_CAND=0: sampling takes the whole vocabulary's logits from the device every token
+            const bool use_cand = !(getenv("IK2_CAND") && !std::atoi(getenv("IK2_CAND")));
+            bool cand = false;   // the last token's logits came as candidates (g_cand), not in `last`
             const char* reason = "length";
             int n_out = 0;
             int greedy_tok = temp <= 0 && !last.empty() ? pick(last.data()) : -1;
@@ -4222,7 +4263,7 @@ int main(int argc, char** argv) {
                     reason = "cancelled";
                     break;
                 }
-                const int tok = temp <= 0 ? greedy_tok : pick(last.data());
+                const int tok = temp <= 0 ? greedy_tok : cand ? pick_cand() : pick(last.data());
                 ++n_out;
                 std::printf(serve_maya ? "T %d\n" : "@TOK %d\n", tok);
                 std::fflush(stdout);
@@ -4239,7 +4280,9 @@ int main(int argc, char** argv) {
                     last.clear();
                 } else {
                     std::vector<float> lo;
-                    forward(M, &tok, 1, (int) hist.size(), false, OutMode::kLogits, std::string(), lo, nullptr, t_exp);
+                    forward(M, &tok, 1, (int) hist.size(), false, use_cand ? OutMode::kCand : OutMode::kLogits,
+                            std::string(), lo, nullptr, t_exp);
+                    cand = use_cand && g_cand.n >= 0;
                     last = std::move(lo);
                 }
                 hist.push_back(tok);
