@@ -19,10 +19,15 @@
 #include <cmath>
 #endif
 
-#if defined(__CUDACC__)
+#if defined(__CUDACC__) || defined(__HIPCC__)
 #define IK2X_HD __host__ __device__ __forceinline__
 #else
 #define IK2X_HD inline
+#endif
+#if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)   // (the device's round-to-nearest intrinsics)
+#define IK2X_DEVICE 1
+#else
+#define IK2X_DEVICE 0
 #endif
 
 namespace ik2::x {
@@ -30,49 +35,49 @@ namespace ik2::x {
 constexpr int kNVFP4 = 40, kQ8_0 = 8;   // (ik2_kernels.cuh's type ids)
 
 IK2X_HD float add(float a, float b) {
-#ifdef __CUDA_ARCH__
+#if IK2X_DEVICE
     return __fadd_rn(a, b);
 #else
     return a + b;
 #endif
 }
 IK2X_HD float sub(float a, float b) {
-#ifdef __CUDA_ARCH__
+#if IK2X_DEVICE
     return __fsub_rn(a, b);
 #else
     return a - b;
 #endif
 }
 IK2X_HD float mul(float a, float b) {
-#ifdef __CUDA_ARCH__
+#if IK2X_DEVICE
     return __fmul_rn(a, b);
 #else
     return a * b;
 #endif
 }
 IK2X_HD float div(float a, float b) {
-#ifdef __CUDA_ARCH__
+#if IK2X_DEVICE
     return __fdiv_rn(a, b);
 #else
     return a / b;
 #endif
 }
 IK2X_HD float fma(float a, float b, float c) {
-#ifdef __CUDA_ARCH__
+#if IK2X_DEVICE
     return __fmaf_rn(a, b, c);
 #else
     return std::fma(a, b, c);
 #endif
 }
 IK2X_HD float rint(float a) {   // (to nearest, ties to even: the default rounding mode on the host)
-#ifdef __CUDA_ARCH__
+#if IK2X_DEVICE
     return rintf(a);
 #else
     return std::nearbyint(a);
 #endif
 }
 IK2X_HD uint32_t f2u(float f) {
-#ifdef __CUDA_ARCH__
+#if IK2X_DEVICE
     return __float_as_uint(f);
 #else
     uint32_t u;
@@ -81,7 +86,7 @@ IK2X_HD uint32_t f2u(float f) {
 #endif
 }
 IK2X_HD float u2f(uint32_t u) {
-#ifdef __CUDA_ARCH__
+#if IK2X_DEVICE
     return __uint_as_float(u);
 #else
     float f;

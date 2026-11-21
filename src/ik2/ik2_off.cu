@@ -278,9 +278,13 @@ __global__ void __launch_bounds__(256) off_down_x_kernel(const uint8_t* const* b
 }
 
 __device__ __forceinline__ unsigned long long globaltimer() {
+#ifdef STRATA_USE_HIP   // (AMD builds the offload path but never takes it: no PTX timer there, the wall clock instead)
+    return (unsigned long long) wall_clock64();
+#else
     unsigned long long t;
     asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
     return t;
+#endif
 }
 __global__ void off_lane_wait_kernel(LaneState* ls, const LaneDone* done, int C, float* __restrict__ y) {
     __shared__ int n;
@@ -304,7 +308,12 @@ __global__ void off_lane_wait_kernel(LaneState* ls, const LaneDone* done, int C,
     const float* yd = (const float*) ((const uint8_t*) done + kLaneDoneY);
     for (int k = 0; k < n; ++k) {
         const int slot = ls->slot[k];
+#ifdef STRATA_USE_HIP   // (AMD: no __ldcv - a volatile read of the host's rows; the path is never taken there)
+        for (int r = threadIdx.x; r < C; r += blockDim.x)
+            y[(size_t) slot * C + r] = *(const volatile float*) (yd + (size_t) k * C + r);
+#else
         for (int r = threadIdx.x; r < C; r += blockDim.x) y[(size_t) slot * C + r] = __ldcv(yd + (size_t) k * C + r);
+#endif
     }
 }
 
