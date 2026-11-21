@@ -3281,6 +3281,54 @@ __global__ void route_gather_kernel(const int* __restrict__ top, const float* __
     su[i] = su_t ? su_t[e] : 1.0f;
     wt[i] = w[i] * (sd_t ? sd_t[e] : 1.0f);
 }
+// One token's routing in one launch: route's picks and weights and route_gather's tables, the same values.  A
+// thread an expert: its rank is the count of the experts ahead of it (larger sigmoid + bias; a tie: the lower
+// expert), the K of rank under K are the picks, and a pick's place among them - ascending experts - is the count of
+// picks under it.  (route_warp_kernel finds them by K rounds of one warp's argmax: 10 us of a lone warp's latency.)
+__global__ void route_token_kernel(const float* __restrict__ logits, const float* __restrict__ bias, int E, int K,
+                                   float scale, const uint8_t* const* __restrict__ tab, const float* __restrict__ sg_t,
+                                   const float* __restrict__ su_t, const float* __restrict__ sd_t, int* top, float* w,
+                                   const uint8_t** blob, int* tok, int* inv, float* sg, float* su, float* wt) {
+    extern __shared__ float rt_sm[];
+    float* val = rt_sm;                                       // [E] sigmoid + bias
+    uint32_t* picked = (uint32_t*) (rt_sm + E);               // [warps] a warp's picks, a bit a lane
+    float* sig = (float*) (picked + (blockDim.x >> 5));       // [K] the picks' sigmoids in order, [K]: their sum
+    const int e = threadIdx.x, lane = e & 31, warp = e >> 5;
+    const float sl = e < E ? 1.0f / (1.0f + expf(-__ldg(logits + e))) : 0.0f;
+    const float v = e < E ? sl + __ldg(bias + e) : -INFINITY;
+    if (e < E) val[e] = v;
+    __syncthreads();
+    int rank = 0;
+    for (int j = 0; j < E; ++j) {
+        const float o = val[j];
+        rank += (o > v || (o == v && j < e)) ? 1 : 0;
+    }
+    const bool pick = e < E && rank < K;
+    const uint32_t mine = __ballot_sync(0xffffffffu, pick);
+    if (lane == 0) picked[warp] = mine;
+    __syncthreads();
+    int pos = __popc(mine & ((1u << lane) - 1u));
+    for (int ww = 0; ww < warp; ++ww) pos += __popc(picked[ww]);
+    if (pick) sig[pos] = sl;
+    __syncthreads();
+    if (e == 0) {   // (the sum in route's order: the same weights to the bit)
+        float sum = 0.0f;
+        for (int k = 0; k < K; ++k) sum += sig[k];
+        sig[K] = sum;
+    }
+    __syncthreads();
+    if (pick) {
+        const float wk = sl / (sig[K] + 1e-20f) * scale;
+        top[pos] = e;
+        w[pos] = wk;
+        blob[pos] = tab[e];
+        tok[pos] = 0;
+        inv[pos] = pos;
+        sg[pos] = sg_t ? sg_t[e] : 1.0f;
+        su[pos] = su_t ? su_t[e] : 1.0f;
+        wt[pos] = wk * (sd_t ? sd_t[e] : 1.0f);
+    }
+}
 
 // ---- speculative decoding
 
@@ -4406,6 +4454,19 @@ void route_gather(const int* top, const float* w, const uint8_t* const* tab, con
     route_gather_kernel<<<1, (unsigned) ((S + 31) / 32 * 32), 0, s>>>(top, w, tab, sg_t, su_t, sd_t, S, K, blob, tok, inv,
                                                                        sg, su, wt);
     check("route_gather");
+}
+void route_token(const float* logits, const float* bias, int E, int K, float scale, const uint8_t* const* tab,
+                 const float* sg_t, const float* su_t, const float* sd_t, int* top, float* w, const uint8_t** blob,
+                 int* tok, int* inv, float* sg, float* su, float* wt, cudaStream_t s) {
+    if (E > 1024 || K > E) {   // (more experts than a block's threads: the two kernels)
+        route(logits, bias, 1, E, K, scale, top, w, s);
+        route_gather(top, w, tab, sg_t, su_t, sd_t, K, K, blob, tok, inv, sg, su, wt, s);
+        return;
+    }
+    const unsigned nt = (unsigned) ((E + 31) / 32 * 32);
+    route_token_kernel<<<1, nt, (size_t) (E + nt / 32 + K + 1) * sizeof(float), s>>>(
+        logits, bias, E, K, scale, tab, sg_t, su_t, sd_t, top, w, blob, tok, inv, sg, su, wt);
+    check("route_token");
 }
 
 void prep_qkv_r_f16_at(float* q, const float* q_clip, const float* k_in, uint16_t* kc, const float* v_in, uint16_t* vc,

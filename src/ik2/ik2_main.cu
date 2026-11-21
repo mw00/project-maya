@@ -2078,9 +2078,8 @@ void fast_token_launches(Model& M, Work& W, OutMode out_mode) {
         k::mv_f16(Ly.router16, c.E, C, W.xq, W.rlog, g_s);
         int* rtop = W.route_d;
         float* rw = (float*) (W.route_d + c.K);
-        k::route(W.rlog, Ly.probs_b, 1, c.E, c.K, c.route_scale, rtop, rw, g_s);
-        k::route_gather(rtop, rw, Ly.tab_blob, Ly.tab_sc[0], Ly.tab_sc[1], Ly.tab_sc[2], c.K, c.K, W.blob, W.tok, W.inv,
-                        W.sg, W.su, W.wt, g_s);
+        k::route_token(W.rlog, Ly.probs_b, c.E, c.K, c.route_scale, Ly.tab_blob, Ly.tab_sc[0], Ly.tab_sc[1],
+                       Ly.tab_sc[2], rtop, rw, W.blob, W.tok, W.inv, W.sg, W.su, W.wt, g_s);
         k::experts_gate_up_swiglu(W.blob, W.tok, c.K, Ly.ty[0], Ly.ty[1], Ly.eb[0], W.xq, C, c.F, W.sg, W.su,
                                   c.gate_cap, c.up_cap, W.h16, g_s);
         k::experts_down(W.blob, c.K, Ly.ty[2], Ly.eb[0] + Ly.eb[1], W.h16, C, c.F, W.y32, g_s);
