@@ -744,6 +744,9 @@ struct Model::Impl {
     // the next draft's first step, which makes them together with its own: one MTP forward a round, not two)
     int64_t mtp_done = 0;
     std::vector<int> tokens;             // the sequence so far (Engram's n-gram history)
+    // the lowest position the sliding-window rings (and hring) may still hold: a rewind moves `end` back, but the
+    // slots of the positions below the old end - ring were overwritten when the sequence was read (#1091)
+    int64_t ring_lo = 0;
     std::unique_ptr<Vision> vis;         // the vision tower (Options::vision)
     VisionGeo vgeo;
     double vis_room = 0;                 // its room for the largest picture this start reads
@@ -8577,6 +8580,7 @@ bool Model::load(const Options& o, std::string& err) {
     m->tokens.clear();
     m->end = 0;
     m->mtp_done = 0;
+    m->ring_lo = 0;
     m->st = keep;
     if (ok && m->fx.layers > 0 && m->fx.mode == 1) ok = m->fetch_restore(err);   // (the slots as loaded again)
     if (!ok) {
@@ -8595,7 +8599,7 @@ bool Model::load(const Options& o, std::string& err) {
 bool Model::resumable(int64_t pos) const {
     if (pos == 0) return true;
     if (pos > m->end) return false;
-    return pos - m->g.n_swa + 1 >= m->end - m->ring;
+    return std::max<int64_t>(0, pos - m->g.n_swa + 1) >= std::max<int64_t>(m->ring_lo, m->end - m->ring);
 }
 int64_t Model::end() const { return m->end; }
 
@@ -8630,6 +8634,7 @@ bool Model::forward(const int* ids, int n, int64_t pos0, int want, float* logits
             m->hot.pend_T = n;
         }
     }
+    m->ring_lo = pos0 == 0 ? 0 : std::max<int64_t>(m->ring_lo, m->end - m->ring);   // (#1091)
     m->tokens.resize((size_t) pos0);
     // (the MTP cache's rows from pos0 on are the drafts' own - but the row at pos0 when this is the token the last
     //  drafts started from, there: that one is the model's)
