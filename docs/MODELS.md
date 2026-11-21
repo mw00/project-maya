@@ -305,6 +305,7 @@ tokenizer folder and a run config by hand, then `serve/server.py` ([INKLING2.md]
 | --- | --- | --- |
 | [unsloth's UD-Q4_K_XL](https://huggingface.co/unsloth/Inkling-2-Small-GGUF) (NVFP4 experts, layers 0-39) | 330 GiB; the experts ~323 GiB of pinned RAM | NVIDIA, Ampere on (CUDA), Linux; one or two GPUs. Run on H200 (35 tok/s) and RTX PRO 6000 (22; two: 42) |
 | unsloth's UD-Q3_K_XL (IQ3_XXS / IQ4_XS experts) | 266 GiB; ~260 GiB of pinned RAM | the same; H200: 44.6 tok/s |
+| unsloth's UD-Q2_K_XL, through a pack (`tools/inkling2/pack_gguf.py`) | 191 GiB; the experts VRAM does not hold in RAM | AMD (HIP), Linux, on `maya-inkling2` ([INKLING2_AMD.md](INKLING2_AMD.md)), set up by `./maya.sh --setup --backend hip --model inkling-2-small` with the model's DSpark drafter. Run on 4x Radeon AI PRO R9700: 37 tok/s, 58 with the DSpark drafter |
 
 Text only, one request at a time. Its engine settings: [SETTINGS.md](SETTINGS.md#inkling-2-small).
 
