@@ -1438,7 +1438,7 @@ void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const flo
                                   c.d_rel, Ly.rel_proj, extent, window, sink_p + (size_t) ts * c.H, g_s);
             }
         };
-        if (!g_kv_fp8 && g_flash && c.D == 128 && W.relb && extent <= W.relb_ext) {
+        if (g_flash && c.D == 128 && W.relb && extent <= W.relb_ext) {
             if (!g_n_sm) CU(cudaDeviceGetAttribute(&g_n_sm, cudaDevAttrMultiProcessorCount, Ly.dev));
             for (int ts = 0; ts < T; ts += Work::kRelbRows) {
                 const int Tq = std::min(Work::kRelbRows, T - ts);
@@ -1448,9 +1448,14 @@ void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const flo
                                 CUDA_R_32F, extent, CUBLAS_COMPUTE_32F_PEDANTIC, CUBLAS_GEMM_DEFAULT));
                 const int k_lo = Ly.sliding ? std::max(0, pos0 + ts - c.window + 1) : 0;
                 const int ns = k::attn_flash_splits(Tq, c.H, pos0 + ts + Tq - k_lo, g_n_sm);
-                k::attn_flash_f16(W.x16 + (size_t) ts * HD, HD, Ly.kc, Ly.vc, attn_kv_cap, c.H, c.KV, c.D, Tq,
-                                  pos0 + ts, qk_scale, W.relb, extent, window, sink_p + (size_t) ts * c.H,
-                                  W.o + (size_t) ts * HD, HD, W.lg, W.lg_cap, ns, g_s);
+                if (g_kv_fp8)
+                    k::attn_flash_fp8(W.x16 + (size_t) ts * HD, HD, Ly.kc8, Ly.vc8, attn_kv_cap, c.H, c.KV, c.D, Tq,
+                                      pos0 + ts, qk_scale * k_inv, v_inv, W.relb, extent, window,
+                                      sink_p + (size_t) ts * c.H, W.o + (size_t) ts * HD, HD, W.lg, W.lg_cap, ns, g_s);
+                else
+                    k::attn_flash_f16(W.x16 + (size_t) ts * HD, HD, Ly.kc, Ly.vc, attn_kv_cap, c.H, c.KV, c.D, Tq,
+                                      pos0 + ts, qk_scale, W.relb, extent, window, sink_p + (size_t) ts * c.H,
+                                      W.o + (size_t) ts * HD, HD, W.lg, W.lg_cap, ns, g_s);
             }
         } else
         for (int ts = 0; ts < T;) {
@@ -1885,6 +1890,8 @@ void run_head(const Model& M, int T, bool all_logits, OutMode out_mode, int nb, 
 bool g_fast = false;        // set at load: every expert resident, one GPU, the dense weights as blocks (IK2_FAST=0: no)
 bool g_fast_want = false;
 bool g_graph = true;        // IK2_GRAPH=0: the resident path's launches one by one
+bool g_attn_mma = true;     // IK2_ATTN_MMA=0: a full layer's token attention through the scalar kernel
+constexpr int kMmaSplits = 32;   // the splits of a full layer's keys (a block a K / V head and split)
 struct FastGraph {
     cudaGraph_t graph = nullptr;
     cudaGraphExec_t exec = nullptr;
@@ -1988,18 +1995,32 @@ void fast_token_launches(Model& M, Work& W, OutMode out_mode) {
         const int extent = Ly.sliding ? c.extent_swa : c.extent;
         const int window = Ly.sliding ? c.window : (1 << 30);
         const int P = Ly.sliding ? P_sl : P_full;
+        // a full layer's keys are the whole context: its attention on the tensor cores (IK2_ATTN_MMA=0: as a sliding
+        // layer's), from an FP16 copy of q
+        const bool mma = g_attn_mma && !Ly.sliding;
+        uint16_t* q16 = mma ? W.x16 : nullptr;
         if (g_kv_fp8) {
             k::prep_qkv_r_fp8_at(q_p, Ly.q_clip, W.kconv, Ly.kc8, W.vconv, Ly.vc8, r_p, Ly.r_clip, c.H, c.KV, c.D, c.d_rel,
                                  c.qk_clip, c.rel_clip, c.eps, W.pos, !Ly.sliding, c.alpha, c.n_floor, Ly.kv_cap,
-                                 k_scale, v_scale, g_s);
-            k::attn_decode_fp8_at(q_p, r_p, W.sink, Ly.kc8, Ly.vc8, Ly.sliding ? Ly.kv_cap : 0, c.H, c.KV, W.pos, P,
-                                  qk_scale / k_scale, 1.0f / v_scale, Ly.rel_proj, c.d_rel, extent, window, W.lg, W.o,
-                                  g_s);
+                                 k_scale, v_scale, q16, g_s);
+            if (mma)
+                k::attn_decode_mma_fp8(q16, r_p, W.sink, Ly.kc8, Ly.vc8, 0, c.H, c.KV, W.pos, 0, kMmaSplits,
+                                       qk_scale / k_scale, 1.0f / v_scale, Ly.rel_proj, c.d_rel, extent, window, W.lg,
+                                       W.o, g_s);
+            else
+                k::attn_decode_fp8_at(q_p, r_p, W.sink, Ly.kc8, Ly.vc8, Ly.sliding ? Ly.kv_cap : 0, c.H, c.KV, W.pos, P,
+                                      qk_scale / k_scale, 1.0f / v_scale, Ly.rel_proj, c.d_rel, extent, window, W.lg,
+                                      W.o, g_s);
         } else {
             k::prep_qkv_r_f16_at(q_p, Ly.q_clip, W.kconv, Ly.kc, W.vconv, Ly.vc, r_p, Ly.r_clip, c.H, c.KV, c.D, c.d_rel,
-                                 c.qk_clip, c.rel_clip, c.eps, W.pos, !Ly.sliding, c.alpha, c.n_floor, Ly.kv_cap, g_s);
-            k::attn_decode_f16_at(q_p, r_p, W.sink, Ly.kc, Ly.vc, Ly.sliding ? Ly.kv_cap : 0, c.H, c.KV, W.pos, P,
-                                  qk_scale, Ly.rel_proj, c.d_rel, extent, window, W.lg, W.o, g_s);
+                                 c.qk_clip, c.rel_clip, c.eps, W.pos, !Ly.sliding, c.alpha, c.n_floor, Ly.kv_cap, q16,
+                                 g_s);
+            if (mma)
+                k::attn_decode_mma_f16(q16, r_p, W.sink, Ly.kc, Ly.vc, 0, c.H, c.KV, W.pos, 0, kMmaSplits, qk_scale,
+                                       Ly.rel_proj, c.d_rel, extent, window, W.lg, W.o, g_s);
+            else
+                k::attn_decode_f16_at(q_p, r_p, W.sink, Ly.kc, Ly.vc, Ly.sliding ? Ly.kv_cap : 0, c.H, c.KV, W.pos, P,
+                                      qk_scale, Ly.rel_proj, c.d_rel, extent, window, W.lg, W.o, g_s);
         }
         k::gate_mul_f16(W.o, gate_p, (size_t) HD, W.x16, true, g_s);
         mv1(Ly.wo, W.o, W.tmp);
@@ -3116,6 +3137,8 @@ int main(int argc, char** argv) {
     // (half an FP16 copy's bytes, a token's products straight over them) and tokens take the resident path
     // (IK2_FAST=0: off; IK2_GRAPH=0: its launches one by one instead of a CUDA graph a token).
     g_graph = !(getenv("IK2_GRAPH") && !std::atoi(getenv("IK2_GRAPH")));
+    g_attn_mma = !(getenv("IK2_ATTN_MMA") && !std::atoi(getenv("IK2_ATTN_MMA"))) && c.D == 128 && c.H / c.KV <= 16;
+    k::attn_decode_mma_prepare();
     if (n_gpu == 1 && !g_pool) {
         size_t exp_b = 0, dense_b = 0, kv_b = 0;
         for (const auto& kv : S.by_name) {
