@@ -3130,7 +3130,7 @@ int main(int argc, char** argv) {
         }
         size_t fr0 = 0, tot0 = 0;
         CU(cudaMemGetInfo(&fr0, &tot0));
-        const size_t reserve = (size_t) 3 << 30;   // (the work buffers and the cache's own 2 GiB of room)
+        const size_t reserve = (size_t) 3 << 29;   // (the work buffers and a quarter of a GiB of room: 1.5 GiB)
         const bool fits = exp_b + dense_b + kv_b + reserve <= fr0 && exp_b <= (size_t) (cache_gb * 1073741824.0);
         if (fits && !getenv("IK2_DENSE")) g_dense_q8 = true;
         g_fast_want = fits && g_dense_q8 && !(getenv("IK2_FAST") && !std::atoi(getenv("IK2_FAST")));
@@ -3699,7 +3699,10 @@ int main(int argc, char** argv) {
     }
     ExpertCache& EC = g_dev[d].EC;
     CU(cudaMemGetInfo(&fr, &tot));
-    const size_t budget = std::min((size_t) (cache_gb * 1073741824.0), fr > ((size_t) 2 << 30) ? fr - ((size_t) 2 << 30) : (size_t) 0);
+    // (what is left free: 2 GiB beside a cache that streams experts in and out; a quarter of one when every expert
+    //  stays in VRAM - nothing more is allocated but a token's graph)
+    const size_t room = g_fast_want ? (size_t) 256 << 20 : (size_t) 2 << 30;
+    const size_t budget = std::min((size_t) (cache_gb * 1073741824.0), fr > room ? fr - room : (size_t) 0);
     EC.tp = g_tp ? d : -1;
     EC.init(M.L, dual() ? -1 : d, c.n_layer, c.E, budget);
     std::printf("expert cache, GPU %d: %d slots across %zu pools (%.1f GiB); load %.1f s in all\n", d, EC.total_slots(),
