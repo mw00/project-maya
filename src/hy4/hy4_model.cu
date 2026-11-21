@@ -59,6 +59,28 @@ namespace {
 constexpr int kF32 = 0, kF16 = 1, kBF16 = 30, kF8 = 43;
 constexpr int W = k::kMaxWin;
 
+// Runtime projection adapted from alesha-pro/project-maya (hy4-flash, MIT).
+__global__ void project_refusal_directions(float* x, const float* directions, int width, int streams,
+                                           int rank, float scale) {
+    constexpr int threads = 256;
+    __shared__ float partial[threads];
+    x += (size_t(blockIdx.x) * streams + blockIdx.y) * width;
+    directions += size_t(blockIdx.y) * rank * width;
+    for (int row = 0; row < rank; ++row, directions += width) {
+        float dot = 0.0f;
+        for (int i = threadIdx.x; i < width; i += threads) dot += x[i] * directions[i];
+        partial[threadIdx.x] = dot;
+        __syncthreads();
+        for (int step = threads / 2; step; step /= 2) {
+            if (threadIdx.x < step) partial[threadIdx.x] += partial[threadIdx.x + step];
+            __syncthreads();
+        }
+        const float adjustment = scale * partial[0];
+        for (int i = threadIdx.x; i < width; i += threads) x[i] -= adjustment * directions[i];
+        __syncthreads();
+    }
+}
+
 int type_id(const std::string& s) {
     static const std::pair<const char*, int> names[] = {
         {"F32", 0},      {"F16", 1},     {"Q8_0", 8},     {"Q2_K", 10},  {"Q3_K", 11},    {"Q4_K", 12},
@@ -2799,6 +2821,59 @@ struct Model::Impl {
         return n;
     }
 
+    float* refusal_directions = nullptr;
+    int refusal_rank = 0;
+    float refusal_scale = 1.0f;
+
+    bool load_refusal_directions(std::string& err) {
+        const char* path = std::getenv("HY4F_ABLATE");
+        if (!path || !*path) return true;
+        if (G.size() != 1 || tp > 1) {
+            err = "HY4F_ABLATE currently requires a single GPU";
+            return false;
+        }
+        if (const char* scale = std::getenv("HY4F_ABLATE_SCALE")) {
+            char* end = nullptr;
+            refusal_scale = std::strtof(scale, &end);
+            if (end == scale || *end || !std::isfinite(refusal_scale)) {
+                err = "HY4F_ABLATE_SCALE must be a finite number";
+                return false;
+            }
+        }
+        std::ifstream file(path, std::ios::binary);
+        std::array<int32_t, 4> header{};
+        if (!file.read(reinterpret_cast<char*>(header.data()), sizeof(header)) ||
+            header[0] != g.n_layer + 1 || header[1] != g.hc || header[2] < 1 || header[2] > 64 ||
+            header[3] != g.n_embd) {
+            err = std::string("HY4F_ABLATE: cannot read a compatible direction file: ") + path;
+            return false;
+        }
+        std::vector<float> rows(size_t(header[0]) * header[1] * header[2] * header[3]);
+        const size_t bytes = rows.size() * sizeof(float);
+        if (!file.read(reinterpret_cast<char*>(rows.data()), bytes) || file.peek() != std::char_traits<char>::eof() ||
+            !std::all_of(rows.begin(), rows.end(), [](float v) { return std::isfinite(v); })) {
+            err = "HY4F_ABLATE: invalid direction data or length";
+            return false;
+        }
+        Gpu& gpu = G.front();
+        CK(cudaSetDevice(gpu.dev));
+        if (!gpu.alloc(refusal_directions, rows.size(), err)) return false;
+        CK(cudaMemcpy(refusal_directions, rows.data(), bytes, cudaMemcpyHostToDevice));
+        refusal_rank = header[2];
+        info.push_back("INFO Hy4 refusal projection enabled: " + std::to_string(refusal_rank) +
+                       " directions per stream at " + std::to_string(header[0]) + " points");
+        return true;
+    }
+
+    bool project_refusal(Gpu& gpu, int tokens, int point, std::string& err) {
+        if (!refusal_directions || !tokens || refusal_scale == 0.0f) return true;
+        const float* directions = refusal_directions + size_t(point) * g.hc * refusal_rank * g.n_embd;
+        project_refusal_directions<<<dim3(tokens, g.hc), 256, 0, gpu.s>>>(
+            gpu.x, directions, g.n_embd, g.hc, refusal_rank, refusal_scale);
+        CK(cudaGetLastError());
+        return true;
+    }
+
     bool load(const Options& opt, std::string& err) {
         const double t0 = now_s();
         o = opt;
@@ -3115,6 +3190,7 @@ struct Model::Impl {
             else info.push_back("INFO the expert profile " + o.profile + " was not read (missing, or another model's)");
         }
         hot_init();
+        if (!load_refusal_directions(err)) return false;
         // the host's parts: the token embeddings and the Engram table, read in place
         const Tensor* te = need("token_embd.weight", err);
         if (!te) return false;
@@ -5967,6 +6043,7 @@ struct Model::Impl {
             if (l.eg >= 0 && !engram(l, gp, T, err)) return false;
             if (l.eg >= 0) lap("engram");
             if (inject && l.eg >= 0) ref_cmp("engram_out", l.il, gp, gp.x, nx, T);
+            if (!project_refusal(gp, T, l.il, err)) return false;
             if (!attention(l, gp, T, p0, err)) return false;
             lap(l.swa ? "attention, window" : "attention, indexed");
             if (inject) {
@@ -6008,6 +6085,7 @@ struct Model::Impl {
     bool head_tail(const int* ids, int T, int64_t p0, int want, float* logits_out, std::string& err) {
         const int E = g.n_embd, hc = g.hc;
         Gpu& hg = G[(size_t) head_gpu];
+        if (!project_refusal(hg, T, g.n_layer, err)) return false;
         k::hc_head(hg.x, T, hc, E, hh_fn, hh_scale, hh_base, g.eps, g.hc_eps, hg.hcur, hg.s, hc_el());
         dbg("hc_head", -1, hg, hg.hcur + (size_t) (T - 1) * E, 1, E);
         k::rmsnorm(hg.hcur, E, T, E, out_norm, g.eps, hg.hcur, E, hg.s);
