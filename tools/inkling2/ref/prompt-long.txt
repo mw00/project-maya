@@ -1,0 +1,91 @@
+# Which model fits your PC?
+
+Add up your **GPU memory (VRAM) and system RAM**. That total is what counts: Maya keeps the most-used parts of the
+model on the GPU, the rest in RAM, and reads anything that doesn't fit from your NVMe SSD while it answers.
+
+- **Recommended** = the whole model stays in memory with room to spare: the speeds people report in the README.
+- **Below that it still runs**, just slower, because part of the model is read from the SSD (see [the floor](#the-floor)).
+- More of the total on the GPU is faster than the same total in RAM.
+- On a **Strix Halo, Gorgon Halo or a Mac**, the memory is shared: count it once, and keep about 16 GB for the system.
+
+## The table
+
+Sizes in GB. "Whole model" is the memory the setup counts to keep every part of the model in VRAM + RAM; "Recommended"
+adds room for the system and the default context.
+
+| Model | Quant | Download | Whole model | **Recommended (VRAM + RAM)** | Runs on |
+|---|---|---|---|---|---|
+| **GLM-5.3-Flash** | Maya-XS | 73 | ~80 | **88** (a 24 GB GPU + 64 GB RAM, at 128K context) | NVIDIA, AMD, Mac* |
+| | Maya-S24 (for GPUs of 24 GB or less) | 95 | ~102 | **128** | NVIDIA, AMD, Mac* |
+| | Maya-S (default) | 97 | ~104 | **128** | NVIDIA, AMD, Mac* |
+| | Maya-M | 116 | ~124 | **160** | NVIDIA, AMD, Mac* |
+| | Maya-M-Derisked (experimental) | 116 | ~124 | **160** | NVIDIA, AMD, Mac* |
+| | Maya-L | 156 | ~164 | **192** | NVIDIA, AMD, Mac* |
+| | EXL3 3.05 bpw (turboderp) | 125 | ~133 | **160** | NVIDIA, AMD |
+| | EXL3 4.05 bpw (turboderp) | 165 | ~173 | **192** | NVIDIA, AMD |
+| **GLM-5.3 (744B)**, text only | Maya-XS | 170 | ~176 | **192** | NVIDIA (V100 and newer), AMD |
+| | UD-IQ2_M (unsloth) | 239 | ~245 | **256** | NVIDIA (V100 and newer), AMD |
+| **DeepSeek-V4.1-Flash** | Maya-XS | 277 ¹ | 121 | **128** | NVIDIA, AMD |
+| | Maya-S (default) | 340 ¹ | 186 | **224** | NVIDIA, AMD |
+| | UD-IQ1_M (unsloth) | 301 ¹ | 140 | **160** | NVIDIA, AMD |
+| | UD-IQ3_S (unsloth) | 424 ¹ | 263 | **288** | NVIDIA, AMD |
+| | UD-Q8_K_XL (unsloth) | ~470 ¹ | ~306 | **384** | NVIDIA, AMD |
+| | EXL3 2.25 bpw (turboderp) | 362 ¹ | 160 | **192** | NVIDIA, AMD (x86-64) |
+| | EXL3 2.9 bpw (LibertAIDAI) | 414 ¹ | 230 | **256** | NVIDIA, AMD (x86-64) |
+| | EXL3 3.5 bpw (LibertAIDAI) | 461 ¹ | 280 | **320** | NVIDIA, AMD (x86-64) |
+| | Abliterated Mix-128G (orcarouter) | 275 ¹ | 114 | **128** | NVIDIA, AMD |
+| | Abliterated Mix-256G (orcarouter) | 397 ¹ | 236 | **256** | NVIDIA, AMD |
+| **MiniMax-M3.1-Flash** | Maya-XS | 93 | 100 | **128** | NVIDIA, AMD |
+| | Maya-S | 122 | 130 | **160** | NVIDIA, AMD |
+| | EXL3 3.5 bpw (Mia-AiLab) | 197 | 250 | **256** | NVIDIA, AMD |
+| **Hy4-Flash** | Maya-XS | 108 ³ | 45, plus 4-8 for the context | **56-64** | NVIDIA (V100 and newer), AMD on Linux ⁴ |
+| | Maya-S | 116 ³ | 53, plus 4-8 for the context | **68-80** | NVIDIA (V100 and newer; cards from 12 GB), AMD on Linux ⁴ |
+| | Maya-M | 132 ³ | 68, plus 4-8 for the context | **80-96** | NVIDIA (V100 and newer; cards from 12 GB), AMD on Linux ⁴ |
+| | Maya-L | 153 ³ | 90, plus 4-8 for the context | **104-128** | NVIDIA (V100 and newer; cards from 12 GB), AMD on Linux ⁴ |
+| **Qwen-3.8-Flash-Next** | UD-IQ2_XS (unsloth) | 80 ² | 47 | **64** | NVIDIA, AMD |
+| | CYBER-FROST Q5_K_M | 113 ² | 84 | **96** | NVIDIA, AMD |
+| | Q4_K_M (Tencent's own, AngelSlim) | 168 ³ | ~108 | **192** | NVIDIA; run on RTX 30 / A100 and newer, Linux |
+
+\* Mac (Apple Silicon) support is experimental, GLM-5.3-Flash's GGUF quants only.
+¹ DeepSeek's download includes its n-gram (Engram) tables, which always stay on the SSD and never count toward memory.
+² Qwen's n-gram table also stays on the SSD.
+⁴ Hy4-Flash on AMD: Linux only for now - a Strix Halo / Gorgon Halo (below), or Radeon cards; with an AMD GPU on Windows it has not been tested yet and the setup does not offer it.
+³ Hy4-Flash's download is the model file (44.8 GB for Maya-XS, 68.4 GB for Maya-M, 89.5 GB for Maya-L) and one n-gram table (63.4 GB) that every size shares; the table
+stays on the SSD, is read page by page and never counts toward memory. About 110 GB of disk in all for Maya-XS. Tencent's own
+Q4_K_M (AngelSlim) is a 105 GB model file with the same table; all of its experts fit in about 108 GB of VRAM.
+
+### Hy4-Flash · Maya-XS
+
+- **RAM + VRAM:** about 56-64 GB (a rule of thumb: the model file plus 4-8 GB for the context). With less it still
+  runs, slower.
+- **VRAM:** everything but the routed experts has to fit on the card; the experts that do not fit are computed on the
+  CPU from RAM. About 8.7 / 9.0 / 9.8 GiB of free VRAM at 4K / 8K / 32K context. More VRAM puts more experts on the
+  GPU, which is faster.
+- **Cards under about 10 GB:** the setup picks the "8 GB" layout by itself (a second model file with smaller
+  attention weights, 43.6 GB; slightly lower quality): about 6.5 / 6.8 GiB of free VRAM at 4K / 8K context, and about
+  7.0 / 7.1 GiB at 16K / 32K, where the engine keeps the context's cache in 8 bits by itself. A card with less than
+  about 7 GB cannot run it.
+- **The n-gram table:** on an SSD / NVMe, never a hard disk. It does not need to fit in memory.
+- **Pictures:** the vision tower's file (0.8 GB) stays on the SSD (RAM as the page cache); a picture takes up to
+  0.8 GB of VRAM while it is read, which the engine keeps free on the main GPU. Pictures are on where the card has
+  that room beside the model; on 8 GB cards the model fills the card, so they are off there (text only).
+- **Drafting:** the draft block's file (7.5 GB on the SSD, one for every size) takes about 4 GB of VRAM on the main
+  GPU, rounded to 8 bits when the engine starts. The setup turns drafting on where that fits beside the parts above
+  and a picture's room (Maya-XS at a 32K context: about 14.6 GB in all), and leaves it off on smaller cards.
+
+## Examples
+
+| Your PC | Total | Fits fully | Also runs (slower) |
+|---|---|---|---|
+| 16 GB GPU + 48 GB RAM | 64 | Qwen UD-IQ2_XS, Hy4-Flash Maya-XS | GLM Maya-XS / Maya-S24 |
+| 24 GB GPU + 64 GB RAM | 88 | GLM Maya-XS, Qwen UD-IQ2_XS | GLM Maya-S24 / Maya-S, Qwen CYBER-FROST |
+| 32 GB GPU + 96 GB RAM, or a 128 GB Strix/Gorgon Halo | 128 | GLM Maya-S / S24, DeepSeek Maya-XS, MiniMax Maya-XS, DeepSeek Mix-128G, Qwen CYBER-FROST | GLM Maya-M |
+| 48 GB of GPUs + 128 GB RAM | 176 | the above + GLM Maya-M and EXL3 3.05, MiniMax Maya-S, DeepSeek UD-IQ1_M | GLM Maya-L, DeepSeek Maya-S |
+| 64 GB of GPUs + 128 GB RAM, or a 192 GB Gorgon Halo | 192 | the above + GLM Maya-L and EXL3 4.05, GLM-5.3 (744B) Maya-XS, DeepSeek EXL3 2.25 | DeepSeek Maya-S |
+| 64+ GB of GPUs + 192 GB RAM | 256+ | the above + DeepSeek Maya-S, EXL3 2.9, Mix-256G, MiniMax EXL3, GLM-5.3 (744B) UD-IQ2_M | DeepSeek UD-IQ3_S, EXL3 3.5 |
+| a large-RAM server (384 GB or more) | 384+ | every model, DeepSeek UD-Q8_K_XL included | - |
+
+## Context length
+
+- **GLM-5.3-Flash** keeps its context in RAM and it is small (about 0.2 GB at the default 32K): longer contexts barely
+  change the numbers above
