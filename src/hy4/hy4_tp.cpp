@@ -55,7 +55,10 @@ Crew::Crew(int n, double spin_s) {
                             break;
                         }
                         if (std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() >= spin_s) break;
-                        for (int k = 0; k < 16; ++k) HY4_PAUSE();
+                        for (int k = 0; k < 16; ++k) {   // (a start seen within a pause, as the sums' helpers)
+                            HY4_PAUSE();
+                            if (gen_.load(std::memory_order_acquire) != seen) break;
+                        }
                     }
                 }
                 if (!got) {
@@ -120,7 +123,12 @@ Summer::Summer(int helpers, const std::vector<int>& cpus) {
                 if (quit_.load(std::memory_order_relaxed)) return;
                 if (gg == seen) {
                     if (std::chrono::duration<double>(std::chrono::steady_clock::now() - last).count() < kSpinS) {
-                        for (int i = 0; i < 64; ++i) HY4_PAUSE();
+                        // (the next sum seen within a pause: 64 pauses between looks are 4 us on a Skylake Xeon, whose
+                        //  PAUSE is ~140 cycles - longer than a token window's whole sum, which waits for the last helper)
+                        for (int i = 0; i < 64; ++i) {
+                            HY4_PAUSE();
+                            if (gen_.load(std::memory_order_acquire) != seen) break;
+                        }
                         continue;
                     }
                     std::unique_lock<std::mutex> lk(mu_);
