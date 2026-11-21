@@ -393,6 +393,18 @@ class Config(unittest.TestCase):
                          (maya.DS4_EFFORT, maya.DS4_SAMPLING, "0.0.0.0", "k"))
         self.assertEqual(c["env"], {"DS4_RING_MB": "800", "DS4_CHUNK_MIN": "256"})
 
+    def test_again_keeps_the_servers_own_settings(self):
+        # #1089: "model_management": false (and the port, the idle unload, ...) came back as the defaults after a setup
+        own = {"host": "0.0.0.0", "port": 9001, "api_key": "k", "cors_origins": ["*"], "mcp_servers": {"a": 1},
+               "model_management": False, "web_ui": False, "idle_unload_s": 900, "loop_guard": False,
+               "fit_max_tokens": True}
+        ports = []
+        with patch.object(maya, "write_run_script", lambda p, port: ports.append(port) or self.root / "run.sh"):
+            _, c = self.write(args(), {"args": ["--pack", "/old/maya-ds4"], **own})
+            self.assertEqual({k: c.get(k) for k in own}, own)
+            _, c = self.write(args(port=9002), {"args": ["--pack", "/old/maya-ds4"], **own})
+        self.assertEqual((c["port"], c["model_management"], ports), (9002, False, [9001, 9002]))
+
     def tuned(self, tp=8, threads=33):
         key = maya.hardware_key({"gpu": [0, 1, 2], "args": ["--max-context", "131072"], "installer": {"quant": maya.DS4, "ds4_quant": "exl3"}})
         maya.CAL_STORE.write_text(json.dumps({key: {"args": {"--tp": tp, "--cpu-threads": threads},
@@ -1835,7 +1847,8 @@ class FastPrefill(unittest.TestCase):
     def test_the_flag_and_the_setup_keep_it(self):
         src = Path(maya.__file__).read_text(encoding="utf-8")
         self.assertIn('ap.add_argument("--fast-prefill", choices=["on", "off"]', src)
-        self.assertEqual(src.count('"mcp_servers", "fast_prefill"'), 1)   # (DeepSeek's setup keeps it; no other)
+        self.assertEqual(src.count('keep_server_settings(cfg, old, a, ("fast_prefill"'), 1)   # (DeepSeek's keeps it; no other)
+        self.assertNotIn("fast_prefill", maya.SERVER_KEYS)
 
 
 class TwoSizes(unittest.TestCase):

@@ -294,6 +294,18 @@ class Config(unittest.TestCase):
         self.assertEqual((c["reasoning_effort"], c["sampling"], c["host"]), ("auto", {"temperature": 1.0, "top_p": 0.95},
                                                                               "0.0.0.0"))
 
+    def test_again_keeps_the_servers_own_settings(self):
+        # #1089: "model_management": false (and the port, the idle unload, ...) came back as the defaults after a setup
+        own = {"host": "0.0.0.0", "port": 9001, "api_key": "k", "cors_origins": ["*"], "mcp_servers": {"a": 1},
+               "model_management": False, "web_ui": False, "idle_unload_s": 900, "loop_guard": False,
+               "fit_max_tokens": True}
+        ports = []
+        with patch.object(maya, "write_run_script", lambda p, port: ports.append(port) or self.root / "run.sh"):
+            c = self.write(args(), {"args": ["--pack", "/old"], **own})
+            self.assertEqual({k: c.get(k) for k in own}, own)
+            c = self.write(args(port=9002, host="127.0.0.1"), {"args": ["--pack", "/old"], **own})
+        self.assertEqual((c["port"], c["host"], c["model_management"], ports), (9002, "127.0.0.1", False, [9001, 9002]))
+
     def test_tp_follows_the_gpus_chosen_now(self):
         """#436 (DeepSeek's, the same rule here): the config before's --tp only for the same GPUs"""
         nine = {"args": ["--pack", "/old", "--max-context", "65536", "--tp", "4"], "gpu": list(range(9))}

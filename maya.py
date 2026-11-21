@@ -4549,6 +4549,27 @@ def glm_config_path(pc: dict, quant: str) -> Path:
 GLM_SETUP_ENV = ("MAYA_GLM_RESERVE_MB", "MAYA_GLM_RAM_HEADROOM_GB", "MAYA_GLM_SPLIT", "MAYA_GLM_MTP_DECODE",
                  "MAYA_GLM_PARALLEL_LOAD", "MAYA_GLM_PREFILL_SUB", "MAYA_GLM_PREFILL_MB", "MAYA_HIPBLASLT_TUNING")
 
+# the server's own settings, set in a config by hand (or with --port / --host / --api-key at a setup): every model's
+# setup again keeps them from the config before (#1089: an update's setup turned "model_management": false back on)
+# - where it listens, its API key, the pages it lets in, the MCP servers, the model management, the web page (an
+# API-only server), the idle unload, the loop guard, the output limit fitted to the context
+SERVER_KEYS = ("host", "port", "api_key", "cors_origins", "mcp_servers", "model_management", "web_ui",
+               "idle_unload_s", "loop_guard", "fit_max_tokens")
+
+
+def keep_server_settings(cfg: dict, old: dict, a, extra: tuple = ()) -> list:
+    """The config before's SERVER_KEYS (and a family's own `extra` keys) into the new config `cfg`, except a --port /
+    --host / --api-key given now (it wins): the keys that differ from what this setup wrote."""
+    given = {"port": getattr(a, "port", None), "host": getattr(a, "host", None), "api_key": getattr(a, "api_key", None)}
+    kept = []
+    for k in SERVER_KEYS + tuple(extra):
+        if (old or {}).get(k) is None or given.get(k):
+            continue
+        if cfg.get(k) != old[k]:
+            kept.append(k)
+        cfg[k] = old[k]
+    return kept
+
 
 def write_config(a, pc, meta, pack: Path, quant: str, ctx: int, models: Path, vision: dict | None,
                  choice: tuple | None = None, dflash: Path | None = None, gguf: Path | None = None) -> Path:
@@ -4643,9 +4664,7 @@ def write_config(a, pc, meta, pack: Path, quant: str, ctx: int, models: Path, vi
         cfg["env"] = env
     # the server's own settings from the config before (the address it listens on, its API key, ...): kept, as the
     # DeepSeek, MiniMax and Qwen setups keep them - a GLM setup run again dropped them; --host / --api-key given now win
-    for k in ("host", "api_key", "cors_origins", "mcp_servers", "mixed_gpus", "mixed_exe", "mixed_gpu"):
-        if old_cfg.get(k) is not None:
-            cfg[k] = old_cfg[k]
+    keep_server_settings(cfg, old_cfg, a, ("mixed_gpus", "mixed_exe", "mixed_gpu"))
     if getattr(a, "mixed_gpus", None):
         set_mixed_gpus(cfg, a.mixed_gpus)
     if a.host:
@@ -4711,7 +4730,7 @@ def write_config(a, pc, meta, pack: Path, quant: str, ctx: int, models: Path, vi
             ok(f"(tuned at context {cal['context']}: {ME} --calibrate tunes this context too)")
     cfg_path.write_text(json.dumps(N.env_out(cfg), indent=1), encoding="utf-8")
     ok(f"config: {cfg_path}")
-    ok(f"start script: {write_run_script(cfg_path, port)}")
+    ok(f"start script: {write_run_script(cfg_path, cfg['port'])}")
     return cfg_path
 
 
@@ -6247,7 +6266,9 @@ def server_command(cfg_path: Path, a) -> tuple:
         cmd += ["--api-key", a.api_key]
     if a.gpus or a.gpu is not None:                    # this start only, on these cards
         cmd += ["--gpu", str(a.gpus or a.gpu)]
-    if WIN or sys.platform == "darwin" or os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"):
+    from serve.server import web_ui_setting            # ("web_ui": false: an API-only server, no page to open - #1089)
+    web = web_ui_setting(cfg)
+    if web and (WIN or sys.platform == "darwin" or os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
         cmd.append("--open")                           # a desktop: the browser opens when the model is ready
     here = "127.0.0.1" if host in ("0.0.0.0", "::", "") else host
     ctx = args[args.index("--max-context") + 1] if "--max-context" in args[:-1] else None
@@ -6266,7 +6287,7 @@ def server_command(cfg_path: Path, a) -> tuple:
     say()
     say("  " + "-" * 100)
     say(f"  Starting {info['label'] or cfg.get('model_name', MODEL_NAME)} ({cfg_path.name}).")
-    say(f"  Dashboard:        http://{here}:{port}/")
+    say(f"  Dashboard:        http://{here}:{port}/" if web else "  Dashboard:        off (\"web_ui\": false: the API only)")
     say(f"  API (OpenAI):     http://{here}:{port}/v1        (any model name; the API key: "
         + ("the one you set)" if key else "any)"))
     say(f"  API (Anthropic):  http://{here}:{port}/v1/messages")
@@ -8049,11 +8070,7 @@ def write_config_ds4(a, pc: dict, meta: dict, pack: Path, ctx: int, models: Path
            "gpu": [g["index"] for g in pc["gpus"]],
            "sampling": dict(DS4_SAMPLING), "reasoning_effort": DS4_EFFORT,   # (the model's own, every setup)
            "lib_dirs": meta.get("lib_dirs") or old.get("lib_dirs") or [], "port": port}
-    for k in ("host", "api_key", "cors_origins", "mcp_servers", "fast_prefill", "mixed_gpus", "mixed_exe", "mixed_gpu",
-              "mixed_mode"):
-        if old.get(k) is not None:
-            cfg[k] = old[k]
-            kept.append(k)
+    kept += keep_server_settings(cfg, old, a, ("fast_prefill", "mixed_gpus", "mixed_exe", "mixed_gpu", "mixed_mode"))
     set_fast_prefill(cfg, getattr(a, "fast_prefill", None))
     set_mixed_gpus(cfg, getattr(a, "mixed_gpus", None))
     if hip and os.name != "nt" and "mixed_gpus" not in cfg and getattr(a, "mixed_gpus", None) is None and nvidia_beside():
@@ -8094,7 +8111,7 @@ def write_config_ds4(a, pc: dict, meta: dict, pack: Path, ctx: int, models: Path
                 ok(f"(tuned at context {cal['context']}: {ME} --calibrate tunes this context too)")
     cfg_path.write_text(json.dumps(N.env_out(cfg), indent=1), encoding="utf-8")
     ok(f"config: {cfg_path}")
-    ok(f"start script: {write_run_script(cfg_path, port)}")
+    ok(f"start script: {write_run_script(cfg_path, cfg['port'])}")
     if ds4_seed_profile(cfg):
         ok("expert profile: the pack starts from DeepSeek's shipped one (the most-routed experts placed in VRAM and "
            "read ahead first); the engine adds what this PC routes to it")
@@ -8680,10 +8697,7 @@ def write_config_mm3(a, pc: dict, meta: dict, pack: Path, ctx: int, models: Path
            "sampling": folder_sampling(d, MM3_SAMPLING) if own else dict(MM3_SAMPLING),
            "reasoning_effort": MM3_EFFORT,
            "lib_dirs": meta.get("lib_dirs") or old.get("lib_dirs") or [], "port": port}
-    for k in ("host", "api_key", "cors_origins", "mcp_servers"):
-        if old.get(k) is not None:
-            cfg[k] = old[k]
-            kept.append(k)
+    kept += keep_server_settings(cfg, old, a)
     env = {**(old.get("env") or {}), **parse_env(a.env)}
     if env:
         cfg["env"] = env
@@ -8700,7 +8714,7 @@ def write_config_mm3(a, pc: dict, meta: dict, pack: Path, ctx: int, models: Path
                         "written": time.strftime("%Y-%m-%d %H:%M")}
     cfg_path.write_text(json.dumps(N.env_out(cfg), indent=1), encoding="utf-8")
     ok(f"config: {cfg_path}")
-    ok(f"start script: {write_run_script(cfg_path, port)}")
+    ok(f"start script: {write_run_script(cfg_path, cfg['port'])}")
     if moved:   # (this quant's config under the name before: its dashboard settings come along, the old files go)
         shared = legacy.with_suffix(".shared-settings.json")
         if shared.exists() and not cfg_path.with_suffix(".shared-settings.json").exists():
@@ -10059,10 +10073,7 @@ def write_config_hy4(a, pc: dict, meta: dict, pack: Path, ctx: int, models: Path
            "sampling": sampling, "reasoning_effort": effort,
            "lib_dirs": meta.get("lib_dirs") or old.get("lib_dirs") or [], "port": port,
            **({"backend": "hip"} if pc.get("backend") == "hip" else {})}
-    for k in ("host", "api_key", "cors_origins", "mcp_servers"):
-        if old.get(k) is not None:
-            cfg[k] = old[k]
-            kept.append(k)
+    kept += keep_server_settings(cfg, old, a)
     env = {**(old.get("env") or {}), **parse_env(a.env)}
     if env:
         cfg["env"] = env
@@ -10076,7 +10087,7 @@ def write_config_hy4(a, pc: dict, meta: dict, pack: Path, ctx: int, models: Path
     cfg["installer"] = {**inst, "models_dir": str(models), "model_dir": str(d), "written": time.strftime("%Y-%m-%d %H:%M")}
     cfg_path.write_text(json.dumps(N.env_out(cfg), indent=1), encoding="utf-8")
     ok(f"config: {cfg_path}")
-    ok(f"start script: {write_run_script(cfg_path, port)}")
+    ok(f"start script: {write_run_script(cfg_path, cfg['port'])}")
     return cfg_path
 
 
@@ -10656,10 +10667,7 @@ def write_config_qwen(a, pc: dict, meta: dict, pack: Path, gguf: Path, ctx: int,
            "sampling": sampling, "reasoning_effort": effort,
            "lib_dirs": meta.get("lib_dirs") or old.get("lib_dirs") or [], "port": port,
            **({"vision": vision} if vision else {})}
-    for k in ("host", "api_key", "cors_origins", "mcp_servers", "layer_split"):
-        if old.get(k) is not None:
-            cfg[k] = old[k]
-            kept.append(k)
+    kept += keep_server_settings(cfg, old, a, ("layer_split",))
     env = {**(old.get("env") or {}), **parse_env(a.env)}
     if env:
         cfg["env"] = env
@@ -10673,7 +10681,7 @@ def write_config_qwen(a, pc: dict, meta: dict, pack: Path, gguf: Path, ctx: int,
     cfg["installer"] = {**inst, "models_dir": str(models), "model_dir": str(d), "written": time.strftime("%Y-%m-%d %H:%M")}
     cfg_path.write_text(json.dumps(N.env_out(cfg), indent=1), encoding="utf-8")
     ok(f"config: {cfg_path}")
-    ok(f"start script: {write_run_script(cfg_path, port)}")
+    ok(f"start script: {write_run_script(cfg_path, cfg['port'])}")
     return cfg_path
 
 

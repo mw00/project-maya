@@ -757,6 +757,19 @@ def model_management_setting(cfg: dict | None, env=None) -> bool:
     return bool(v) if v is not None else True
 
 
+def web_ui_setting(cfg: dict | None, env=None) -> bool:
+    """Maya's web page (/, /web/*, /fonts/*): on unless the run config has "web_ui": false or MAYA_WEB_UI says 0 / off /
+    false / no - an API-only server (#1089: a backend behind a proxy and another chat front end); the environment, when
+    set, wins over the config."""
+    on = ("1", "on", "true", "yes")
+    env = os.environ if env is None else env
+    v = maya_names.lookup(env, "MAYA_WEB_UI")
+    if v is not None and str(v).strip():
+        return str(v).strip().lower() in on
+    v = (cfg or {}).get("web_ui")
+    return bool(v) if v is not None else True
+
+
 def loop_guard_setting(cfg: dict | None, env=None) -> bool:
     """The loop guard (serve/loop_guard.py), on unless MAYA_LOOP_GUARD (MAYA_LOOP_GUARD) says 0 / off / false / no
     or the run config has "loop_guard": false; the environment, when set, wins over the config."""
@@ -6267,6 +6280,11 @@ def make_handler(svc: Service):
 
         def do_GET(self):
             path = self.path.split("?")[0].rstrip("/")
+            if not getattr(svc, "web_ui", True) and (path in ("", "/web") or path.startswith(("/web/", "/fonts/"))):
+                # "web_ui": false (an API-only server, #1089): no page and none of its files, as any unknown path; the
+                # API, /health and the page's data routes (each behind the API key when one is set) as before
+                self._json(404, {"error": {"message": "not found"}})
+                return
             if path == "/models/sse":
                 self._models_sse()
                 return
@@ -7691,6 +7709,9 @@ def main() -> int:
     svc.model_management = model_management_setting(cfg)   # ("model_management": true: llama.cpp's load/unload/sse)
     if svc.model_management:
         print("[maya] model management: on (/models/load, /models/unload, /models/sse)", flush=True)
+    svc.web_ui = web_ui_setting(cfg)                    # ("web_ui": false or MAYA_WEB_UI=0: the API only, #1089)
+    if not svc.web_ui:
+        print("[maya] web page: off (\"web_ui\": false - /, /web/ and /fonts/ answer 404; the API as before)", flush=True)
     svc.loop_guard = loop_guard_setting(cfg)            # (MAYA_LOOP_GUARD=0 or "loop_guard": false: off)
     if not svc.loop_guard:
         print("[maya] loop guard: off (a request's \"loop_guard\": true turns it on for that request)", flush=True)
@@ -7757,14 +7778,17 @@ def main() -> int:
     print(f"ready: http://{here}:{a.port}/v1  (OpenAI: /v1/chat/completions, /v1/responses, Anthropic: /v1/messages, "
           f"context {engine.max_context} tokens{', images on' if vision else ''}"
           f"{', API key required' if svc.api_key else ''})", flush=True)
-    print(f"       open http://{here}:{a.port}/ in a browser to chat; close this window to stop the model", flush=True)
+    if svc.web_ui:
+        print(f"       open http://{here}:{a.port}/ in a browser to chat; close this window to stop the model", flush=True)
     if a.host not in ("127.0.0.1", "localhost", "::1"):
         # issue #26: reachable from other devices - say at which address, and what can still block it
         ips = lan_addresses()
         for ip in ips:
-            print(f"       from other devices: http://{ip}:{a.port}/   (API: http://{ip}:{a.port}/v1)", flush=True)
+            print(f"       from other devices: http://{ip}:{a.port}/   (API: http://{ip}:{a.port}/v1)" if svc.web_ui else
+                  f"       from other devices: http://{ip}:{a.port}/v1", flush=True)
         if not ips:
-            print("       from other devices: http://<this PC's IP address>:" + str(a.port) + "/", flush=True)
+            print("       from other devices: http://<this PC's IP address>:" + str(a.port) + ("/" if svc.web_ui else
+                                                                                               "/v1"), flush=True)
         if not svc.api_key:
             print("       WARNING: no API key - anyone on your network can use this model. Add \"api_key\": \"...\" "
                   "to the config (clients send it as their API key; the web page asks for it)", flush=True)
@@ -7773,7 +7797,7 @@ def main() -> int:
                   "in an admin PowerShell:\n         New-NetFirewallRule -DisplayName \"Maya " + str(a.port) + "\" "
                   "-Direction Inbound -Protocol TCP -LocalPort " + str(a.port) + " -Action Allow -Profile Private\n"
                   "       (and set this network to Private in Windows' network settings)", flush=True)
-    if a.open:
+    if a.open and svc.web_ui:
         import webbrowser
         webbrowser.open(f"http://{'127.0.0.1' if a.host in ('0.0.0.0', '') else a.host}:{a.port}/")
     # SIGTERM (llama-swap's cmdStop, systemd), SIGHUP (the terminal closed), Ctrl+C, Windows' Ctrl+Break and - with
