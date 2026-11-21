@@ -154,8 +154,8 @@ Without it the layers are split between the GPUs.
 - The model writes typed segments rather than tags - `<|content_thinking|>`, `<|content_text|>`, a call as
   `<|message_model|>NAME<|content_invoke_tool_json|>{"name": .., "args": {..}}<|end_message|>`.
   `InklingRewriter` turns them, as they stream, into what `OutputParser` reads (DeepSeek's and MiniMax's path).
-- A required tool call (`tool_choice`) opens in its own form; a picture is refused in plain words (no vision
-  tower yet).
+- A required tool call (`tool_choice`) opens in its own form; a picture is refused in plain words when the config
+  has no image encoder (section 8: pictures).
 - `tools/strata_tokenizer.py` reads the tokenizer under both names unsloth's files give its pre-tokenizer (`gpt-4o`,
   `inkling`): 442 strings against the model's own `tokenizer.json`, all equal, with both files.
 
@@ -283,7 +283,10 @@ tokens; FP16 on the tensor cores 2.2e-5) - but any two FP8 runs part within a fe
 flips codes of a 3-bit mantissa.
 
 **Pictures** go through `tools/vision`'s `maya-vision` built against a llama.cpp that has the Inkling 2 tower
-(`PROJECTOR_TYPE_INKLING2V`) and unsloth's `mmproj-BF16.gguf`: the server sends the encoder's rows with the request
+(`PROJECTOR_TYPE_INKLING2V`; Maya's own build adds it to the pinned llama.cpp: `tools/vision/inkling2v_patch.py`,
+and needs no text model for it - the config's "vision" entry names none) and unsloth's `mmproj-BF16.gguf`. The
+setup sets them up; the encoder starts when a picture arrives (on the GPU while its free VRAM holds it, else on the
+CPU) and ends after the request's pictures, so it keeps no VRAM. The server sends the encoder's rows with the request
 (`GENI`), the engine puts them in place of the image tokens (`--image-token`, 200054) without the embedding's norm.
 640 x 448 is 192 tokens and 22 ms.
 
@@ -313,8 +316,7 @@ To run it (one GPU):
     cat > ik2-mini.json <<EOF
     {"exe": "build/maya-ik2", "args": ["--model", "Inkling-2-Mini-UD-Q4_K_XL.gguf", "--max-context", "262144"],
      "env": {"IK2_KV": "fp8"}, "tokenizer": "ik2/tokenizer", "model_name": "inkling-2-mini",
-     "vision": {"exe": "build-vision/bin/maya-vision", "mmproj": "mmproj-BF16.gguf",
-                "model": "Inkling-2-Mini-UD-Q4_K_XL.gguf", "gpu": true, "resident": true}}
+     "vision": {"exe": "build-vision/bin/maya-vision", "mmproj": "mmproj-BF16.gguf", "gpu": true}}
     EOF
     python serve/server.py --engine maya --config ik2-mini.json
 
