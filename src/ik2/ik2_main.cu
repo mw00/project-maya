@@ -2154,7 +2154,7 @@ struct HostExpertPlan {
 HostExpertPlan host_plan;
 
 void prepare_host_experts(Model& model, size_t bytes_needed, int depth) {
-#ifdef IK2_HOST_AVX2
+#if defined(IK2_HOST_AVX2) && defined(__GNUC__)   // (CMake defines it for GCC / Clang only)
     static int threads = getenv("IK2_DEEP_CPU_THREADS") ? std::max(0, atoi(getenv("IK2_DEEP_CPU_THREADS"))) : 0;
     if (!threads || !__builtin_cpu_supports("avx2") || !__builtin_cpu_supports("fma") ||
         !__builtin_cpu_supports("f16c"))
