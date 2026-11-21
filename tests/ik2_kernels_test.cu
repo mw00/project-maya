@@ -2507,6 +2507,41 @@ void test_round6() {
 
 }  // namespace
 
+// One token's NVFP4 experts through the tensor cores against the scalar kernels over the same blocks (every scale
+// byte, the subnormal ones and 0x7F with them): gate | up with the input as two FP16 limbs, down over the FP16 h.
+void test_experts_mma() {
+    constexpr int C = 256, F = 128, S = 5;
+    const int ty = k::kNVFP4;
+    const size_t matrix_bytes = (size_t) C * F / k::block_values(ty) * k::block_bytes(ty);
+    auto pool = rand_blocks(ty, (size_t) S * 3 * C * F);
+    for (size_t off = 0, i = 0; off < pool.size(); off += 36, ++i)   // a scale of each kind somewhere
+        if (i % 7 == 0) pool[off + i % 4] = (uint8_t) (i % 13 == 0 ? 0x7F : i % 8);
+    auto* device_pool = dev(pool);
+    std::vector<const uint8_t*> ptrs;
+    for (int j = 0; j < S; ++j) ptrs.push_back(device_pool + 3 * j * matrix_bytes);
+    auto** blobs = dev(ptrs);
+    auto* input = dev(fvec(C, 3.0f));
+    auto* tokens = dev(std::vector<int>(S, 0));
+    auto sgv = fvec(S), suv = fvec(S);
+    auto *sg = dev(sgv), *su = dev(suv);
+    auto* limbs = dev_n<uint16_t>(2 * C);
+    auto *ref = dev_n<uint16_t>(S * F), *got = dev_n<uint16_t>(S * F);
+    auto *y_ref = dev_n<float>(S * C), *y_got = dev_n<float>(S * C);
+    k::experts_gate_up_swiglu(blobs, tokens, S, ty, ty, matrix_bytes, input, C, F, sg, su, 20, 20, ref, 0);
+    k::to_f16_limbs(input, C, limbs, 0);
+    k::experts_gate_up_swiglu_mma(blobs, S, matrix_bytes, limbs, C, F, sg, su, 20, 20, got, 0);
+    const auto h_ref = host(ref, S * F), h_got = host(got, S * F);
+    std::vector<double> expected(h_ref.size());
+    std::vector<float> actual(h_ref.size());
+    for (size_t i = 0; i < expected.size(); ++i) expected[i] = h2f_host(h_ref[i]), actual[i] = h2f_host(h_got[i]);
+    expect("experts_gate_up_swiglu_mma", actual, expected, 1e-3, 1e-3);
+    k::experts_down(blobs, S, ty, 2 * matrix_bytes, ref, C, F, y_ref, 0);
+    k::experts_down_mma(blobs, S, 2 * matrix_bytes, ref, C, F, y_got, 0);
+    const auto want = host(y_ref, S * C);
+    expect("experts_down_mma", host(y_got, S * C), std::vector<double>(want.begin(), want.end()), 2e-5, 0.25);   // (random scales reach 240: sums of terms of 1e4 and more that cancel)
+    expect_true("experts_mma_fits", k::experts_mma_fits(ty, ty, ty, 2304, 1152) && !k::experts_mma_fits(ty, k::kQ8_0, ty, 2304, 1152));
+}
+
 int main() {
     int dev_count = 0;
     CU(cudaGetDeviceCount(&dev_count));
@@ -2536,6 +2571,7 @@ int main() {
     test_attn_decode_mma();
     test_cand_topk();
     test_token_path();
+    test_experts_mma();
     std::printf(g_fail ? "FAILED: %d check(s)\n" : "all passed\n", g_fail);
     return g_fail ? 1 : 0;
 }

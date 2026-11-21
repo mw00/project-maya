@@ -176,6 +176,15 @@ void loop_gate_blend(const float* x, const float* m, const float* f, const float
 ///   down:    y [S][C] = down . h[s] (h [S][F] FP16), raw sums
 void experts_gate_up(const uint8_t* const* blob, const int* tok, int S, int ty_gate, int ty_up, size_t eb0,
                      const float* x, int C, int F, float* gu, cudaStream_t s);
+/// One token's NVFP4 experts through the tensor cores (slot s: blob[s]; gate | up | down as above): the input in
+/// FP16 (gate / up: x as two limbs, x16 [2][C] = hi, lo with x = hi + lo - to_f16_limbs, or route_token's x_limbs;
+/// down: h [S][F]), a code times its scale exact in FP16, the sum FP32.  C and F multiples of 64.
+void to_f16_limbs(const float* x, size_t n, uint16_t* y, cudaStream_t s);
+bool experts_mma_fits(int ty_gate, int ty_up, int ty_down, int C, int F);
+void experts_gate_up_swiglu_mma(const uint8_t* const* blob, int S, size_t eb0, const uint16_t* x16, int C, int F,
+                                const float* sg, const float* su, float gcap, float ucap, uint16_t* h, cudaStream_t s);
+void experts_down_mma(const uint8_t* const* blob, int S, size_t off_down, const uint16_t* h, int C, int F, float* y,
+                      cudaStream_t s);
 void experts_down(const uint8_t* const* blob, int S, int ty_down, size_t off_down, const uint16_t* h, int C, int F,
                   float* y, cudaStream_t s);
 
@@ -295,7 +304,8 @@ void route_gather(const int* top, const float* w, const uint8_t* const* tab, con
 /// tables.
 void route_token(const float* logits, const float* bias, int E, int K, float scale, const uint8_t* const* tab,
                  const float* sg_t, const float* su_t, const float* sd_t, int* top, float* w, const uint8_t** blob,
-                 int* tok, int* inv, float* sg, float* su, float* wt, cudaStream_t s);
+                 int* tok, int* inv, float* sg, float* su, float* wt, cudaStream_t s, const float* x = nullptr,
+                 int width = 0, uint16_t* x_limbs = nullptr);
 /// prep_qkv_r_f16 / _fp8 of one token whose position is at pos (device): the cache slot from it, and with log_scale
 /// (a full layer) q's and r's tau.  q16 (given): an FP16 copy of the clipped q, [H][D] (attn_decode_mma's).
 /// sink_w (given): the token's sinks in the same launch, sink_y [H] = sink_w [H][sink_k] (FP16) . sink_x (mv_f16's).

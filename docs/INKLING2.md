@@ -243,6 +243,19 @@ half the experts', half the dense) and its launches - each 2 us and more whateve
   the faster one deep in a context. Its bytes are made FP16 in the registers without a branch (`e4m3x4_h4`);
 - sampling takes its candidates from the device (`cand_topk`): a thousand logits and a few more instead of the
   vocabulary's 200,058 every token.
+- the NVFP4 experts of a token run on the tensor cores straight from their blocks (`experts_gate_up_swiglu_mma`,
+  `experts_down_mma`, `IK2_EXPERT_MMA`): a code times its sub-block's scale is exact in FP16, the sums are FP32, and
+  the gate / up input goes in as two FP16 limbs in two of the eight columns, which is the FP32 input's product. A
+  warp alone on 16 rows was slower than the scalar kernel (100 against 118 tok/s): it waits for a block's bytes
+  before it asks for the next ones. Eight warps on the same 16 rows, each a stride of the row, read 745 GB/s;
+- the attention residuals ask for four states at once, and a pass's messages for all twelve core layers are one
+  launch (the bank does not change within a pass): 781 -> 757 launches a token, the same sums bit for bit.
+
+With these three, same card and file, FP8 cache: 124.8 tok/s 47 tokens deep (was 111.9), 120.7 at 4,096 (108.6),
+103.2 after a 63,981-token document (94.1), 89.1 after 127,910 (81.4). The scalar expert path
+(`IK2_EXPERT_MMA=0`) gives the logits of before bit for bit; over 399 forced tokens the tensor-core experts are a
+median KL of 5.7e-5 from it with 394 of the top tokens the same (the tensor-core attention against its scalar
+kernel on that text: 1.7e-4 and 393), and on 96 GSM8K questions they solve 74 where the scalar ones solve 73.
 
 A prompt goes the cache path's way with every expert a hit; the attention's flash kernel reads an FP8 cache too
 (the tile's bytes by `cp.async`, FP16 of them in shared memory), and a looped layer's gates are cuBLAS products

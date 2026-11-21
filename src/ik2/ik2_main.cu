@@ -2112,11 +2112,21 @@ void fast_token_launches(Model& M, Work& W, OutMode out_mode) {
         k::mv_f16(Ly.router16, c.E, C, W.xq, W.rlog, g_s);
         int* rtop = W.route_d;
         float* rw = (float*) (W.route_d + c.K);
+        // (NVFP4 experts go through the tensor cores, their input as two FP16 limbs the router's launch writes)
+        static const int exp_mma = getenv("IK2_EXPERT_MMA") ? atoi(getenv("IK2_EXPERT_MMA")) : 1;
+        const bool exp_tc = exp_mma && k::experts_mma_fits(Ly.ty[0], Ly.ty[1], Ly.ty[2], C, c.F);
         k::route_token(W.rlog, Ly.probs_b, c.E, c.K, c.route_scale, Ly.tab_blob, Ly.tab_sc[0], Ly.tab_sc[1],
-                       Ly.tab_sc[2], rtop, rw, W.blob, W.tok, W.inv, W.sg, W.su, W.wt, g_s);
-        k::experts_gate_up_swiglu(W.blob, W.tok, c.K, Ly.ty[0], Ly.ty[1], Ly.eb[0], W.xq, C, c.F, W.sg, W.su,
-                                  c.gate_cap, c.up_cap, W.h16, g_s);
-        k::experts_down(W.blob, c.K, Ly.ty[2], Ly.eb[0] + Ly.eb[1], W.h16, C, c.F, W.y32, g_s);
+                       Ly.tab_sc[2], rtop, rw, W.blob, W.tok, W.inv, W.sg, W.su, W.wt, g_s, W.xq, C,
+                       exp_tc ? (uint16_t*) W.gu32 : nullptr);
+        if (exp_tc) {
+            k::experts_gate_up_swiglu_mma(W.blob, c.K, Ly.eb[0], (const uint16_t*) W.gu32, C, c.F, W.sg, W.su,
+                                          c.gate_cap, c.up_cap, W.h16, g_s);
+            k::experts_down_mma(W.blob, c.K, Ly.eb[0] + Ly.eb[1], W.h16, C, c.F, W.y32, g_s);
+        } else {
+            k::experts_gate_up_swiglu(W.blob, W.tok, c.K, Ly.ty[0], Ly.ty[1], Ly.eb[0], W.xq, C, c.F, W.sg, W.su,
+                                      c.gate_cap, c.up_cap, W.h16, g_s);
+            k::experts_down(W.blob, c.K, Ly.ty[2], Ly.eb[0] + Ly.eb[1], W.h16, C, c.F, W.y32, g_s);
+        }
         k::moe_combine_conv(W.y32, W.inv, W.wt, c.K, C, Ly.h_mlp, Ly.sc_mlp, W.r, W.h, g_s);
     }
     if (out_mode == OutMode::kNone) return;
