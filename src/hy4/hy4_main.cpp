@@ -27,8 +27,9 @@
 // profile (uint32 [layers][experts] routings) - each layer's most routed experts are the ones kept in VRAM;
 // --profile-out: where the routings this run counts (with the profile's) are written, after each request when serving
 // and at the end otherwise.  HY4_HOT (on; HY4_HOT=0 off - the text differs from without it): where a layer's experts
-// are partly in VRAM, the ones there follow the generated tokens' routing - every HY4_HOT_EVERY (8) token steps up to
-// HY4_HOT_SWAPS (64) cold ones trade places with hotter CPU-lane ones, more between requests; a start places each
+// are partly in VRAM, the ones there follow the answers' kept tokens' routing - between requests only (an answer runs
+// on one placement, so drafting on or off gives the same answers) cold ones trade places with hotter CPU-lane ones
+// (HY4_HOT_SWAPS: at most that many a time; all by default); a start places each
 // layer's highest scored experts in VRAM by HY4_HOT_FILE (<pack>/expert-hot.bin; the server's: its data folder),
 // written only by a start that found none (or HY4_HOT_LEARN=1), so every start begins the same; HY4_HOT_LOG=1 logs.
 //
@@ -1043,9 +1044,12 @@ int serve(hy4::Model& m, const std::vector<int>& eos, int n_draft, float floor0,
                     d_acc, d_off, from);
         std::fflush(stdout);
         {
+            // (HY4_HOT: the routes of the rows a plain decode reads - the prompt's and the answer's tokens but its
+            //  last - drafting on or off the same; then the experts it moves, while the answer is read)
+            m.answered(std::max<int64_t>(0, (int64_t) r.ids.size() + produced - 1));
             std::string perr;
             if (!m.save_profile(perr)) std::fprintf(stderr, "hy4: the expert profile: %s\n", perr.c_str());
-            m.idle();   // (HY4_HOT: its larger round of swaps while the answer is read)
+            m.idle();
         }
         std::fprintf(stderr,
                      "maya hy4 serve: prompt %zu tokens = %zu reused + %zu read in %.0f ms (%.1f tok/s), %lld generated "
@@ -1473,6 +1477,11 @@ int main(int argc, char** argv) {
         const double t2 = now();
         for (size_t i = 0; i < out.size(); ++i) std::printf("%s%d", i ? "," : "", out[i]);
         std::printf("\n");
+        {   // (HY4_HOT: the rows a plain decode reads counted, as there - its learning start's file the same)
+            m.answered((int64_t) (ids.size() + out.size()) - 1);
+            std::string perr;
+            if (!m.save_profile(perr)) std::fprintf(stderr, "maya-hy4: the expert profile: %s\n", perr.c_str());
+        }
         std::fprintf(stderr, "decode: %zu tokens in %.2f s (%.2f tok/s); %lld rounds, %s kept %lld of %lld drafts "
                      "(%.1f tokens a round); a round: drafts %.1f ms, verify %.1f ms\n", out.size(), t2 - t1,
                      out.size() / (t2 - t1), rounds, m.has_dfly2() ? "DFly2" : "MTP", acc, off, rounds ? (double) out.size() / rounds : 0.0,
@@ -1502,6 +1511,7 @@ int main(int argc, char** argv) {
     for (size_t i = 0; i < out.size(); ++i) std::printf("%s%d", i ? "," : "", out[i]);
     std::printf("\n");
     {
+        m.answered((int64_t) (ids.size() + out.size()) - 1);   // (HY4_HOT: the last token's row, if read, not counted)
         std::string perr;
         if (!m.save_profile(perr)) std::fprintf(stderr, "maya-hy4: the expert profile: %s\n", perr.c_str());
     }

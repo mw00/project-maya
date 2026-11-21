@@ -515,28 +515,36 @@ struct Model::Impl {
     // written back (with the read ones) by save_profile
     std::vector<uint32_t> prof_in, prof_cnt;
     // HY4_HOT (on by default; HY4_HOT=0 off): in a layer whose routed experts a GPU holds only some of, the ones in
-    // VRAM follow what the answers route to.  Each expert's score is its picks by generated tokens (the token path's;
-    // a prompt's routing predicts an answer's poorly), older picks fading over `horizon` tokens.  Every `every` token
-    // steps the lowest scored experts in VRAM give their slots to higher scored CPU-lane ones (by more than ratio x +
-    // margin picks: a copy costs more than a few lane runs), at most `max_swaps` a time, more between requests
-    // (idle()).  A start places each layer's highest scored experts in VRAM by the scores of `file` (else
-    // Options::profile's most routed, else the first ones).  The file is frozen: written only by a start that found
-    // none (it learns from its answers, written with the profile after each) or that is asked to learn
-    // (HY4_HOT_LEARN=1; maya --speed-calibration removes the file) - so every start of a PC begins as the one before
-    // and the same requests give the same tokens.  Which experts the GPU computes moves the sums' rounding, so the
-    // text differs from without it (measured: no further from the full model).  Off where it has nothing to move (no
-    // layer with experts both in VRAM and on the CPU lane); tensor parallel: asked for only (HY4_HOT=1: its start
+    // VRAM follow what the answers route to.  Each expert's score is its picks by the answers' kept tokens (the token
+    // path's; a prompt's routing predicts an answer's poorly), older picks fading over `horizon` tokens.  The experts
+    // move only between requests (idle()): an answer - its prompt and its decode - runs on one placement, and the
+    // lowest scored experts in VRAM then give their slots to higher scored CPU-lane ones (by more than ratio x +
+    // margin picks: a copy costs more than a few lane runs; at most `max_swaps`, by default all such).  A drafted
+    // token's routes count once it is kept (a token window's rows wait in `pend` until the next forward's start or
+    // the answer's end - Model::answered - says which were kept), so the placement does not depend on the drafts:
+    // drafting on or off, the same answers.  A start places each layer's highest scored experts in VRAM by the scores
+    // of `file` (else Options::profile's most routed, else the first ones).  The file is frozen: written only by a
+    // start that found none (it learns from its answers, written with the profile after each) or that is asked to
+    // learn (HY4_HOT_LEARN=1; maya --speed-calibration removes the file) - so every start of a PC begins as the one
+    // before and the same requests give the same tokens.  Which experts the GPU computes moves the sums' rounding, so
+    // the text differs from without it (measured: no further from the full model).  Off where it has nothing to move
+    // (no layer with experts both in VRAM and on the CPU lane); tensor parallel: asked for only (HY4_HOT=1: its start
     // placement)
     struct Hot {
         bool on = false, quiet = false, log = false, loaded = false;
         bool asked = false;            // (HY4_HOT=1 set)
         bool learn = false;            // the file written (none was read, or HY4_HOT_LEARN=1)
         bool want = false;             // (on, but held off for the GPU fetch's trial: Model::load's lane turn has it)
-        int every = 8, max_swaps = 64, steps = 0;
+        bool rec = false;              // (this forward is a token window: its rows' routes go to pend)
+        int max_swaps = 1 << 30;
         double horizon = 1024.0, margin = 2.0, ratio = 1.25;
         std::string file;
         std::vector<float> score;      // [n_layer][n_expert]
-        std::vector<uint32_t> win;     // [n_layer][n_expert] picks since the last fold
+        std::vector<uint32_t> win;     // [n_layer][n_expert] kept tokens' picks since the last fold
+        std::vector<int> pend;         // [n_layer][W][n_used] the last token window's routes, counted once kept
+        std::vector<char> pend_on;     // [n_layer] (the window's rows of that layer are in pend)
+        int64_t pend_pos = 0;          // (the window's first position)
+        int pend_T = 0;                // (... and its rows)
         int64_t win_tokens = 0, win_picks = 0, win_hits = 0;
         int64_t swaps = 0, picks = 0, hits = 0, rounds = 0;
         double swap_s = 0;
@@ -3909,8 +3917,8 @@ struct Model::Impl {
                 info.push_back(buf + kept);
             } else if (hot.on) {
                 std::snprintf(buf, sizeof buf, "INFO HY4_HOT: the experts in VRAM follow the answers' routing (placed by "
-                              "%s), every %d token steps up to %d swaps", hot.loaded ? hot.file.c_str() :
-                              !prof_in.empty() ? "the profile" : "their order, no scores yet", hot.every, hot.max_swaps);
+                              "%s), moved between requests only - an answer runs on one placement", hot.loaded ?
+                              hot.file.c_str() : !prof_in.empty() ? "the profile" : "their order, no scores yet");
                 info.push_back(buf + kept);
             }
             // (the placer's lists of each layer's CPU-lane experts taken here, as loaded: HY4_HOT's swaps do not wait
@@ -5523,7 +5531,7 @@ struct Model::Impl {
         }
         char b[200];
         std::snprintf(b, sizeof b, "Hy4 %d layers x %d experts of %zu bytes, %lld in VRAM%s", g.n_layer, g.n_expert, blob,
-                      n_vram, hot.on ? ", HY4_HOT" : "");   // (the lane timed with the swaps it runs with)
+                      n_vram, hot.on ? ", HY4_HOT" : "");   // (the lane timed on the placement it runs with)
         std::string k = gpus + "|" + q4x_memo_key(b, lane ? lane->threads() + 1 : 0);
         for (char& ch : k)
             if (ch == '\t' || ch == '\n' || ch == '\r') ch = ' ';
@@ -5933,8 +5941,7 @@ struct Model::Impl {
             const char* v = std::getenv(k);
             return v && *v ? std::atof(v) : d;
         };
-        hot.every = std::max(1, (int) num("HY4_HOT_EVERY", hot.every));
-        hot.max_swaps = std::max(0, (int) num("HY4_HOT_SWAPS", hot.max_swaps));
+        hot.max_swaps = (int) std::min<double>(hot.max_swaps, std::max(0.0, num("HY4_HOT_SWAPS", hot.max_swaps)));
         hot.horizon = std::max(1.0, num("HY4_HOT_HORIZON", hot.horizon));
         hot.margin = std::max(0.0, num("HY4_HOT_MARGIN", hot.margin));
         hot.log = std::getenv("HY4_HOT_LOG") != nullptr;
@@ -5943,6 +5950,8 @@ struct Model::Impl {
         const size_t n = (size_t) g.n_layer * g.n_expert;
         hot.score.assign(n, 0.0f);
         hot.win.assign(n, 0);
+        hot.pend.assign((size_t) g.n_layer * W * g.n_used, 0);
+        hot.pend_on.assign((size_t) g.n_layer, 0);
         if (!hot.file.empty()) {
             std::ifstream in(hot.file, std::ios::binary);
             char magic[8];
@@ -5965,26 +5974,42 @@ struct Model::Impl {
                     hot.score[(size_t) il * g.n_expert + e] = (float) (c[e] / sum * g.n_used * 256.0);
             }
     }
-    // a token window's routes of layer l (in h_ids) into the window's picks
+    // a token window's routes of layer l (in h_ids) kept aside until its kept rows are known (hot_settle)
     void hot_count(const Layer& l, int T) {
-        uint32_t* c = hot.win.data() + (size_t) l.il * g.n_expert;
-        const int n = T * g.n_used;
-        for (int i = 0; i < n; ++i) {
-            const int e = h_ids[i];
-            ++c[e];
-            hot.win_hits += !l.on_lane(e);
-        }
-        hot.win_picks += n;
+        if (!hot.rec || l.mtp || l.il < 0 || l.il >= g.n_layer || T > W || T != hot.pend_T) return;
+        std::copy(h_ids, h_ids + (size_t) T * g.n_used, hot.pend.begin() + (size_t) l.il * W * g.n_used);
+        hot.pend_on[(size_t) l.il] = 1;
     }
-    // the window's picks folded into the scores (the old ones fading by the window's tokens), then up to max_swaps
-    // swaps of a layer's lowest scored VRAM experts with its highest scored CPU-lane ones.  Only between forwards:
+    // the last token window's rows before position `end` kept - their routes into the window's picks - the others
+    // dropped (a forward from an earlier position reads them again: drafts not kept)
+    void hot_settle(int64_t end) {
+        if (hot.pend_T <= 0) return;
+        const int keep = (int) std::max<int64_t>(0, std::min<int64_t>(hot.pend_T, end - hot.pend_pos));
+        const int nu = g.n_used;
+        const std::vector<Layer>& LL = lane_layers();
+        for (int il = 0; keep > 0 && il < g.n_layer; ++il) {
+            if (!hot.pend_on[(size_t) il]) continue;
+            uint32_t* c = hot.win.data() + (size_t) il * g.n_expert;
+            const int* r = hot.pend.data() + (size_t) il * W * nu;
+            const Layer* l = (size_t) il < LL.size() && LL[(size_t) il].il == il ? &LL[(size_t) il] : nullptr;
+            for (int i = 0; i < keep * nu; ++i) {
+                ++c[r[i]];
+                hot.win_hits += l && !l->on_lane(r[i]);
+            }
+            hot.win_picks += keep * nu;
+        }
+        hot.win_tokens += keep;
+        std::fill(hot.pend_on.begin(), hot.pend_on.end(), 0);
+        hot.pend_T = 0;
+    }
+    // the kept picks folded into the scores (the old ones fading by the kept tokens), then up to max_swaps swaps of
+    // a layer's lowest scored VRAM experts with its highest scored CPU-lane ones.  Between requests only (idle()):
     // the copies and the slot tables go on the layer GPU's stream, after what it has queued
     bool hot_rebalance(int max_swaps, std::string& err) {
-        hot.steps = 0;
         if (!hot.on) return true;
         const double t0 = now_s();
         const float decay = (float) std::exp(-(double) hot.win_tokens / hot.horizon);
-        const int64_t wp = hot.win_picks, wh = hot.win_hits;
+        const int64_t wp = hot.win_picks, wh = hot.win_hits, kt = hot.win_tokens;
         hot.picks += wp;
         hot.hits += wh;
         hot.win_tokens = hot.win_picks = hot.win_hits = 0;
@@ -6067,53 +6092,23 @@ struct Model::Impl {
         hot.swaps += (int64_t) plan.size();
         hot.swap_s += dt;
         ++hot.rounds;
-        if (hot.log)
-            std::fprintf(stderr, "maya-hy4: HY4_HOT: window picks %lld, %.1f%% in VRAM; %zu swaps of %zu wanted, %.1f ms\n",
-                         (long long) wp, wp ? 100.0 * (double) wh / (double) wp : 0.0, plan.size(), wanted, dt * 1e3);
-        return true;
-    }
-    // the GPU fetch's trial (Model::load): HY4_HOT's state as loaded - each layer's slots and the scores - marked before
-    // its CPU lane turn and put back after it (the experts it moved out copied back from the lane's view of the file:
-    // the same bytes), so the start goes on as one that finds the verdict remembered
-    struct HotMark {
-        std::vector<std::vector<int>> slots;
-        std::vector<float> score;
-    };
-    HotMark hot_mark() const {
-        HotMark k;
-        for (const Layer& l : L) k.slots.push_back(l.slot_of);
-        k.score = hot.score;
-        return k;
-    }
-    bool hot_back(const HotMark& k, std::string& err) {
-        mtp_settle();
-        for (size_t il = 0; il < L.size() && il < k.slots.size(); ++il) {
-            Layer& l = L[il];
-            if (l.slot_of == k.slots[il]) continue;
-            Gpu& gp = G[(size_t) l.gpu];
-            CK(cudaSetDevice(gp.dev));
-            CK(cudaStreamSynchronize(gp.s));
-            for (int e = 0; e < g.n_expert; ++e) {
-                const int s0 = k.slots[il][(size_t) e];
-                if (s0 < 0 || l.slot_of[(size_t) e] == s0) continue;
-                uint8_t* b = h_stage;
-                std::memcpy(b + l.tr[0], l.cex.G((size_t) e), l.cex.g_stride);
-                std::memcpy(b + l.tr[1], l.cex.U((size_t) e), l.cex.g_stride);
-                std::memcpy(b + l.tr[2], l.cex.D((size_t) e), l.cex.d_stride);
-                CK(cudaMemcpy(l.experts + (size_t) s0 * l.blob, b, l.tr[2] + l.cex.d_stride, cudaMemcpyHostToDevice));
+        if (hot.log) {   // (and the placement's and the scores' hashes: what the next answer runs on)
+            uint64_t hp = 1469598103934665603ull, hs = hp;
+            for (const Layer& l : lane_layers())
+                for (int v : l.slot_of) hp = (hp ^ (uint32_t) v) * 1099511628211ull;
+            for (float f : hot.score) {
+                uint32_t u;
+                std::memcpy(&u, &f, 4);
+                hs = (hs ^ u) * 1099511628211ull;
             }
-            l.slot_of = k.slots[il];
-            CK(cudaMemcpy(l.slot_d, l.slot_of.data(), sizeof(int) * g.n_expert, cudaMemcpyHostToDevice));
+            std::fprintf(stderr, "maya-hy4: HY4_HOT: kept tokens %lld, picks %lld, %.1f%% in VRAM; %zu swaps of %zu "
+                         "wanted, %.1f ms; placement %016llx scores %016llx\n", (long long) kt, (long long) wp,
+                         wp ? 100.0 * (double) wh / (double) wp : 0.0, plan.size(), wanted, dt * 1e3,
+                         (unsigned long long) hp, (unsigned long long) hs);
         }
-        hot.score = k.score;
-        std::fill(hot.win.begin(), hot.win.end(), 0u);
-        hot.win_tokens = hot.win_picks = hot.win_hits = 0;
-        hot.swaps = hot.picks = hot.hits = hot.rounds = 0;
-        hot.swap_s = 0;
-        hot.steps = 0;
         return true;
     }
-    // the scores (the window's picks folded in, unswapped) to hot.file - by a start that learns only (the file frozen
+    // the scores (the kept picks folded in, unswapped) to hot.file - by a start that learns only (the file frozen
     // otherwise: the next start places as this one did)
     bool hot_save(std::string& err) const {
         if (!hot.on || !hot.learn || hot.file.empty() || hot.score.empty()) return true;
@@ -6445,7 +6440,7 @@ struct Model::Impl {
             if (lane_on && !streamed) {   // (the GPU's experts run meanwhile)
                 k::submit(s);   // (AMD under Windows: they would sit in the queue until the next wait - after the lane's)
                 count_routes(l.il, T);
-                if (hot.on && T <= W && !hot.quiet) hot_count(l, T);
+                if (hot.rec) hot_count(l, T);   // (HY4_HOT: a token window of a forward)
                 lane_entries.clear();
                 for (int t = 0; t < T; ++t)
                     for (int j = 0; j < nu; ++j) {
@@ -8153,9 +8148,8 @@ bool Model::load(const Options& o, std::string& err) {
     // the trial by 5% and lost the real decode by as much).  Then rounds (HY4_FETCH_ROUNDS, 3) of a turn a mode - the
     // same tokens fed from the start at the placement as loaded, HY4_FETCH_WARM (4) untimed, then its share of
     // HY4_FETCH_TOKENS (32) timed - their order turned each round (no mode always first, nor always after the same
-    // one), each mode's median of its rounds kept.  The lane as it runs: with HY4_HOT where it is on (its swaps every
-    // few tokens, and the round a request ends with - idle() - after the warm tokens), its slots and scores put back
-    // after each turn, as the GPU fetch's after each of gpu's
+    // one), each mode's median of its rounds kept.  The lane as it runs: where HY4_HOT is on, on its placement as
+    // loaded (an answer's: HY4_HOT moves experts between requests only), its routes not counted
     auto measure = [&]() -> bool {
         Impl& x = *m;
         if (!x.fetch_pending()) return true;
@@ -8200,30 +8194,19 @@ bool Model::load(const Options& o, std::string& err) {
             restart();
             double ts = 0.0;
             for (int i = 0; i < n_seq; ++i) {
-                if (i == n_warm) {
-                    if (x.hot.on && !x.hot_rebalance(4 * x.hot.max_swaps, err)) return false;
-                    ts = clk();
-                }
+                if (i == n_warm) ts = clk();
                 if (!forward(&seq[(size_t) i], 1, i, 1, lg.data(), err)) return false;
             }
             ms = (clk() - ts) * 1e3 / n_round;
             return true;
         };
         const bool hot = x.hot.want;
-        const Impl::HotMark hk = hot ? x.hot_mark() : Impl::HotMark{};
         double c_ms = 0.0, miss = 0.0;
-        int64_t hot_swaps = 0;
         int kmix = 0;
         auto lane_turn = [&](double& ms) -> bool {
             const double cms0 = x.st.cpu_ms;
             const int64_t ce0 = x.st.cpu_experts;
-            x.hot.on = hot;
-            x.hot.quiet = !hot;
-            bool okl = turn(0, 0, ms);
-            hot_swaps += x.hot.swaps;
-            x.hot.on = false;
-            x.hot.quiet = true;
-            if (okl && hot) okl = x.hot_back(hk, err);
+            const bool okl = turn(0, 0, ms);
             if (c_ms == 0.0 && x.st.cpu_experts > ce0) {   // (the first turn's: mix's K)
                 c_ms = (x.st.cpu_ms - cms0) / (double) (x.st.cpu_experts - ce0);
                 miss = (double) (x.st.cpu_experts - ce0) / ((double) n_seq * std::max(1, x.fx.layers));
@@ -8310,14 +8293,13 @@ bool Model::load(const Options& o, std::string& err) {
                 kept = std::rename(tmp.c_str(), f.c_str()) == 0;
                 return kept;
             });
-        const int n_lane = std::max(1, (int) tm[0].size());
         char buf[640];
         std::snprintf(buf, sizeof buf, "INFO GPU fetch: %s%s - measured on this PC in %.1f s (a token, the median of "
                       "%d rounds of %d: %.1f ms on the CPU lane%s [%s], %.1f with every expert on the GPU [%s], %.1f "
                       "with %d a layer on it [%s]; the lane's %.0f us an expert, %.1f a token a layer); %s %s",
                       Impl::fetch_name(best), best == 2 ? (" " + std::to_string(kmix)).c_str() : "", clk() - t0, rounds,
                       n_round, x.fx.ms[0],
-                      hot ? (" with HY4_HOT, " + std::to_string(hot_swaps / n_lane) + " swaps a turn").c_str() : "",
+                      hot ? " with HY4_HOT's placement" : "",
                       per[0].c_str(), x.fx.ms[1], per[1].c_str(), x.fx.ms[2], kmix, per[2].c_str(), c_ms * 1e3, miss,
                       kept ? "remembered in" : "not remembered:", x.fx.file.c_str());
         x.info.push_back(buf);
@@ -8402,9 +8384,18 @@ bool Model::forward(const int* ids, int n, int64_t pos0, int want, float* logits
         return false;
     }
     m->tops_n = 0;
-    // (HY4_HOT: a token step's routes count; every hot.every steps the experts in VRAM follow them first)
-    const bool hot_step = m->hot.on && n <= W && !m->hot.quiet;
-    if (hot_step && m->hot.steps >= m->hot.every && !m->hot_rebalance(m->hot.max_swaps, err)) return false;
+    // (HY4_HOT: the last token window's rows before pos0 were kept - their routes count - the others are read again
+    //  or were drafts not kept; this one's rows wait until the next forward or Model::answered says which are kept.
+    //  No experts move here: an answer runs on one placement)
+    m->hot.rec = false;
+    if (m->hot.on && !m->hot.quiet) {
+        m->hot_settle(pos0);
+        if (n <= W) {
+            m->hot.rec = true;
+            m->hot.pend_pos = pos0;
+            m->hot.pend_T = n;
+        }
+    }
     m->tokens.resize((size_t) pos0);
     // (the MTP cache's rows from pos0 on are the drafts' own - but the row at pos0 when this is the token the last
     //  drafts started from, there: that one is the model's)
@@ -8432,16 +8423,16 @@ bool Model::forward(const int* ids, int n, int64_t pos0, int want, float* logits
         m->end = pos0 + done;
         m->st.tokens += T;
     }
-    if (hot_step) {
-        m->hot.win_tokens += n;
-        ++m->hot.steps;
-    }
+    m->hot.rec = false;
     if (m->inject) m->inject_report();
     return true;
 }
+void Model::answered(int64_t end) {
+    if (m->hot.on && !m->hot.quiet) m->hot_settle(end < 0 ? m->o.max_ctx : end);
+}
 void Model::idle() {
     std::string err;
-    if (m->hot.on && !m->hot.quiet && !m->hot_rebalance(4 * m->hot.max_swaps, err))
+    if (m->hot.on && !m->hot.quiet && !m->hot_rebalance(m->hot.max_swaps, err))
         std::fprintf(stderr, "maya-hy4: HY4_HOT: %s\n", err.c_str());
 }
 
