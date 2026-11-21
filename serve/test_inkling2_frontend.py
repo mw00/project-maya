@@ -231,7 +231,7 @@ class Serving(unittest.TestCase):
         msgs, tools, kw = openai_to_messages({"messages": [PICTURE]})
         with self.assertRaises(ValueError) as e:
             svc.prepare(msgs, tools, kw, 100)
-        self.assertIn("Inkling-2-Small on maya-ik2 reads text only", str(e.exception))
+        self.assertIn("on maya-ik2 reads text only without the image encoder", str(e.exception))
         self.assertEqual(eng.prompts, [])
 
     def test_logprobs_and_bias_are_refused(self):   # (an engine whose INFO names neither)
