@@ -10,9 +10,14 @@
 
 #include <cuda_runtime.h>
 
+#include <atomic>
+#include <chrono>
+#include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <random>
+#include <thread>
 #include <vector>
 
 namespace k = ik2::k;
@@ -261,7 +266,112 @@ static void test_fetch() {
     cudaFree(cnt), cudaFree(blob), cudaFree(top), cudaFree(tier);
 }
 
-int main() {
+// `ik2_off_test bench [threads ...]`: the figures the offload path's ceiling rests on (no checks) - the CPU lane's rows
+// per thread on rows in cache (compute) and streamed from memory (a 2 GiB buffer, every thread on its own experts),
+// NVFP4 and Q8_0; the bus: cudaMemcpy from pinned memory and off_fetch_copy from mapped memory at a few grid sizes.
+static double bench_rows(int ty, int K, const uint8_t* buf, size_t n_rows, int threads, bool hot, double secs) {
+    const size_t rb = x::row_bytes(ty, K);
+    const int chunk = 256;   // (rows a piece: hot - the same 256 rows again and again, ~330 KiB at 2304 NVFP4)
+    std::vector<float> xv((size_t) K);
+    for (int i = 0; i < K; ++i) xv[(size_t) i] = std::sin(0.37f * (float) i);
+    std::atomic<bool> go{false}, stop{false};
+    std::atomic<unsigned long long> rows_done{0};
+    std::vector<std::thread> th;
+    for (int t = 0; t < threads; ++t)
+        th.emplace_back([&, t] {
+            std::vector<float> out(chunk);
+            unsigned long long n = 0;
+            size_t r = hot ? (size_t) t * chunk % (n_rows - chunk) : (size_t) t * (n_rows / threads);
+            while (!go.load()) {}
+            while (!stop.load(std::memory_order_relaxed)) {
+                if (!hot && r + chunk > n_rows) r = 0;
+                ik2::lane::rows(ty, buf + r * rb, K, 0, chunk, xv.data(), out.data());
+                n += chunk;
+                if (!hot) r += chunk;
+            }
+            rows_done.fetch_add(n);
+        });
+    const auto t0 = std::chrono::steady_clock::now();
+    go.store(true);
+    std::this_thread::sleep_for(std::chrono::duration<double>(secs));
+    stop.store(true);
+    for (auto& t : th) t.join();
+    const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    return (double) rows_done.load() * rb / s / 1e9;
+}
+
+static int bench(int argc, char** argv) {
+    std::vector<int> tc;
+    for (int i = 2; i < argc; ++i) tc.push_back(std::atoi(argv[i]));
+    if (tc.empty()) tc = {1, (int) std::thread::hardware_concurrency() / 2};
+    const size_t bytes = (size_t) 2 << 30;
+    std::vector<uint8_t> buf(bytes);
+    for (size_t i = 0; i < bytes; i += 4096) buf[i] = (uint8_t) i;   // (touched: on this process's node)
+    {   // (scales and bytes: plausible values, 64 MiB of random bytes repeated)
+        std::mt19937 g(7);
+        auto blk = random_rows(x::kNVFP4, 64 * 1024 * 1024 / 1296, 2304, g);
+        for (size_t o = 0; o < bytes; o += blk.size()) std::memcpy(buf.data() + o, blk.data(), std::min(blk.size(), bytes - o));
+    }
+    std::printf("bench: rows form %s\n", ik2::lane::rows_form());
+    for (int ty : {x::kNVFP4, x::kQ8_0}) {
+        const size_t rb = x::row_bytes(ty, 2304), n_rows = bytes / rb;
+        for (int t : tc) {
+            const double hot = bench_rows(ty, 2304, buf.data(), n_rows, t, true, 1.0);
+            const double cold = bench_rows(ty, 2304, buf.data(), n_rows, t, false, 1.5);
+            std::printf("bench: %s rows K 2304, %2d threads: in cache %6.1f GB/s (%.2f a thread), from memory %6.1f GB/s "
+                        "(%.2f a thread)\n", ty == x::kNVFP4 ? "NVFP4" : "Q8_0", t, hot, hot / t, cold, cold / t);
+        }
+    }
+    // the bus
+    const size_t eb = 4478976, nb = 64;   // (an NVFP4 expert of Mini's: 4.48 MB; 64 of them)
+    uint8_t* hp = nullptr;
+    CK(cudaHostAlloc(&hp, eb * nb, cudaHostAllocMapped));
+    std::memset(hp, 1, eb * nb);
+    uint8_t *hd = nullptr, *dd = nullptr;
+    CK(cudaHostGetDevicePointer((void**) &hd, hp, 0));
+    CK(cudaMalloc(&dd, eb * 8));
+    cudaEvent_t e0, e1;
+    CK(cudaEventCreate(&e0));
+    CK(cudaEventCreate(&e1));
+    float ms = 0;
+    for (int r = 0; r < 2; ++r) {
+        CK(cudaEventRecord(e0));
+        for (size_t j = 0; j < nb; ++j) CK(cudaMemcpyAsync(dd + (j % 8) * eb, hp + j * eb, eb, cudaMemcpyHostToDevice));
+        CK(cudaEventRecord(e1));
+        CK(cudaEventSynchronize(e1));
+        CK(cudaEventElapsedTime(&ms, e0, e1));
+    }
+    std::printf("bench: cudaMemcpy pinned -> VRAM, 4.48 MB copies: %.1f GB/s\n", eb * nb / (ms * 1e-3) / 1e9);
+    k::OffFetch fh{};
+    k::OffFetch* fl = nullptr;
+    CK(cudaMalloc(&fl, sizeof fh));
+    int sms = 0;
+    CK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, 0));
+    for (int n : {1, 2, 8}) {
+        for (int mul : {1, 2, 4, 8}) {
+            const int blocks = std::max(8, mul * sms);
+            double best = 0;
+            for (int r = 0; r < 4; ++r) {
+                fh.n = n;
+                for (int i = 0; i < n; ++i) fh.src[i] = hd + (size_t) ((r * 8 + i) % nb) * eb, fh.dst[i] = dd + (size_t) i * eb;
+                CK(cudaMemcpy(fl, &fh, sizeof fh, cudaMemcpyHostToDevice));
+                CK(cudaEventRecord(e0));
+                k::off_fetch_copy(fl, eb, blocks, nullptr);
+                CK(cudaEventRecord(e1));
+                CK(cudaEventSynchronize(e1));
+                CK(cudaEventElapsedTime(&ms, e0, e1));
+                best = std::max(best, n * eb / (ms * 1e-3) / 1e9);
+            }
+            std::printf("bench: off_fetch_copy, %d experts a launch, %4d blocks: %.1f GB/s (%.0f us an expert)\n", n,
+                        blocks, best, eb / best / 1e3);
+        }
+    }
+    cudaFreeHost(hp), cudaFree(dd), cudaFree(fl);
+    return 0;
+}
+
+int main(int argc, char** argv) {
+    if (argc > 1 && !std::strcmp(argv[1], "bench")) return bench(argc, argv);
     std::printf("ik2_off_test: the CPU's rows here: %s\n", ik2::lane::rows_form());
     test_math();
     test_experts(x::kNVFP4, 2304, 1152, 8, 1);
