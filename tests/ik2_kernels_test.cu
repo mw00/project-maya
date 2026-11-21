@@ -2568,7 +2568,8 @@ int main() {
     test_round2_fused();
     test_fp8_kv();
     test_round6();
-    test_attn_flash();   // (last: its random data leaves the others' as they were)
+    if (k::arch_class() >= 80) test_attn_flash();   // (last: its random data leaves the others' as they were)
+    else std::printf("--   attn_flash: Ampere's kernel (sm_%d class here)\n", k::arch_class());
     test_attn_decode_mma();
     test_cand_topk();
     test_token_path();

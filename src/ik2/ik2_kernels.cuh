@@ -14,6 +14,11 @@
 
 namespace ik2::k {
 
+/// The current GPU's class for the kernels that differ by architecture: 70 (Volta: its own attention and NVFP4
+/// expert kernels on mma.m8n8k4), 75 (Turing: Ampere's kernels with mma.sync m16n8k8 and no cp.async - not the
+/// prompt's fused attention), 80 (Ampere and newer).  IK2_ARCH=70 / 75 takes a lower class on a newer GPU (tests).
+int arch_class();
+
 /// y = x * rsqrt(mean(x^2) + eps) * w per row of D (w null: no weight).  x and y may alias.
 void rms(const float* x, const float* w, int rows, int D, float eps, float* y, cudaStream_t s);
 /// rms of n <= 3 vectors [D] in one launch, each with its own weights: y[i] = rms(x[i]) * w[i] (y may be x).
