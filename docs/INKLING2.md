@@ -328,8 +328,14 @@ the model has no switch for its thinking, only the effort level, and at the lowe
 (under `--serve` also as a `NOTE` the server prints): no NVIDIA GPU, a GPU older than sm_80 (a V100 cannot run it:
 the kernels use Ampere's `mma.sync` m16n8k16 and `cp.async`), a build with no kernels for the GPU's arch, less than
 22 GiB of VRAM, `--gpus 2` or more. `IK2_UNSUPPORTED=1` runs it anyway where it can run at all: two GPUs
-(`IK2_EP=1` or `IK2_TP=1`, section 6), smaller cards with the experts streamed from RAM - untested
-here. Windows runs @cobra91's MSVC / CUDA 13 port (run on an RTX 3090 with CUDA 12.9). CMake skips `maya-ik2` without a CUDA arch of 80 or more in the list, and in a HIP build
+(`IK2_EP=1` or `IK2_TP=1`, section 6; untested here) and smaller cards, with the experts that do not fit streamed
+from RAM. The streaming path keeps 2 GiB of VRAM free beside the expert cache, which on an 8 GB card leaves about
+2 GB of cache; `IK2_ROOM_MIB=256` lets it grow to about 3.8 GB. An 8 GB card, simulated on an RTX 3090 under Windows
+(`IK2_ROOM_MIB` raised by the 16 GiB the 3090 has beyond 8 GB, `--max-context 16384`, `IK2_DENSE=q8`): with the 2 GiB
+reserve (5.1 GB of VRAM in all) a 12.6K-token prompt read at 730 tok/s, decode at 22 tok/s on prose and 21 on code;
+with `IK2_ROOM_MIB=256` (6.9 GB in all) 1,079 tok/s, 36 and 31 tok/s. A real 8 GB card has less memory bandwidth
+than an RTX 3090, so expect lower numbers. Windows runs @cobra91's MSVC / CUDA 13 port (run on an RTX 3090 with CUDA 12.9).
+CMake skips `maya-ik2` without a CUDA arch of 80 or more in the list, and in a HIP build
 (`-DSTRATA_IK2_WINDOWS=OFF` leaves it out on Windows).
 
 **Defaults.** Thinking Machines' `generation_config.json`: temperature 1.0 (no top_p, no top_k: 1.0 and off).
