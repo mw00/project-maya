@@ -207,6 +207,37 @@ __global__ void rms_impl_kernel(const float* x, const float* w, int D, float eps
         }
     }
 }
+// rms of up to three vectors, each with its own weights, in one launch (a block a vector; rms_impl_kernel's sums)
+__global__ void rms_multi_kernel(RmsJobs jobs, int D, float eps) {
+    __shared__ float sh[kBlk];
+    const float* xr = jobs.x[blockIdx.x];
+    const float* w = jobs.w[blockIdx.x];
+    float* y32r = jobs.y[blockIdx.x];
+    const bool vec4 = (((uintptr_t) xr & 15) == 0) && (!w || ((uintptr_t) w & 15) == 0) &&
+                      (((uintptr_t) y32r & 15) == 0) && ((D & 3) == 0);
+    float a = 0.0f;
+    if (vec4) {
+        const int n4 = D >> 2;
+        const float4* x4 = (const float4*) xr;
+        for (int d4 = threadIdx.x; d4 < n4; d4 += kBlk) {
+            const float4 v = __ldg(x4 + d4);
+            a += v.x * v.x + v.y * v.y + v.z * v.z + v.w * v.w;
+        }
+        const float rs = rsqrtf(bsum(a, sh) / (float) D + eps);
+        const float4* w4 = (const float4*) w;
+        float4* y32_4 = (float4*) y32r;
+        for (int d4 = threadIdx.x; d4 < n4; d4 += kBlk) {
+            const float4 v = __ldg(x4 + d4);
+            const float4 ww = w4 ? __ldg(w4 + d4) : make_float4(1.0f, 1.0f, 1.0f, 1.0f);
+            const float r0 = v.x * rs * ww.x, r1 = v.y * rs * ww.y, r2 = v.z * rs * ww.z, r3 = v.w * rs * ww.w;
+            y32_4[d4] = make_float4(r0, r1, r2, r3);
+        }
+    } else {
+        for (int d = threadIdx.x; d < D; d += kBlk) a += xr[d] * xr[d];
+        const float rs = rsqrtf(bsum(a, sh) / (float) D + eps);
+        for (int d = threadIdx.x; d < D; d += kBlk) y32r[d] = xr[d] * rs * (w ? w[d] : 1.0f);
+    }
+}
 
 __device__ __forceinline__ float wsum(float v) {
 #pragma unroll
@@ -494,7 +525,8 @@ __device__ __forceinline__ void attn_res_warp0_softmax(float sh_red[][kResMax * 
 
 template <bool FUSED_RMS, int BLOCK_THREADS>
 __global__ void attn_res_vec4_kernel(ResStates st, int n, const float* q, int nq, int T, int C, float res_eps,
-                                     float rms_eps, float* out, RmsOuts outs) {
+                                     float rms_eps, float* out, RmsOuts outs, size_t job_step) {
+    q += blockIdx.y * job_step, out += blockIdx.y * job_step;   // (attn_res_jobs: a job a block of the launch)
     constexpr int NUM_WARPS = BLOCK_THREADS / 32;
     __shared__ float sh_red[NUM_WARPS][kResMax * 4];
     __shared__ float sc[3][kResMax];
@@ -628,7 +660,8 @@ __global__ void attn_res_vec4_kernel(ResStates st, int n, const float* q, int nq
 
 template <bool FUSED_RMS>
 __global__ void attn_res_scalar_kernel(ResStates st, int n, const float* q, int nq, int T, int C, float res_eps,
-                                       float rms_eps, float* out, RmsOuts outs) {
+                                       float rms_eps, float* out, RmsOuts outs, size_t job_step) {
+    q += blockIdx.y * job_step, out += blockIdx.y * job_step;
     constexpr int NUM_WARPS = kBlk / 32;
     __shared__ float sh_red[NUM_WARPS][kResMax * 4];
     __shared__ float sc[3][kResMax];
@@ -3874,6 +3907,15 @@ void rms(const float* x, const float* w, int rows, int D, float eps, float* y, c
     rms_impl_kernel<false, true><<<rows, kBlk, 0, s>>>(x, w, D, eps, nullptr, y);
     check("rms");
 }
+void rms_multi(const RmsJobs& jobs, int n, int D, float eps, cudaStream_t s) {
+    if (n <= 0) return;
+    if (n > 3) {
+        std::fprintf(stderr, "ik2::k::rms_multi: %d vectors\n", n);
+        std::abort();
+    }
+    rms_multi_kernel<<<(unsigned) n, kBlk, 0, s>>>(jobs, D, eps);
+    check("rms_multi");
+}
 void rms_f16(const float* x, const float* w, int rows, int D, float eps, uint16_t* y16, float* y32, cudaStream_t s) {
     if (rows <= 0) return;
     if (y16 && y32) rms_impl_kernel<true, true><<<rows, kBlk, 0, s>>>(x, w, D, eps, y16, y32);
@@ -3911,8 +3953,10 @@ void conv4(const float* x, float* hist, const float* w, const float* dyn, int he
 
 template <bool FUSED_RMS>
 void launch_attn_res(const ResStates& states, int n, const float* q, int nq, int T, int C, float res_eps, float rms_eps,
-                     float* out, const RmsOuts& outs, cudaStream_t s) {
+                     float* out, const RmsOuts& outs, cudaStream_t s, int jobs = 1) {
     if (T <= 0) return;
+    const size_t job_step = (size_t) nq * T * C;
+    const dim3 g((unsigned) T, (unsigned) jobs);
     if (n < 1 || n > kResMax || nq < 1 || nq > 3) {
         std::fprintf(stderr, "ik2::k::attn_res: n %d, nq %d\n", n, nq);
         std::abort();
@@ -3929,11 +3973,14 @@ void launch_attn_res(const ResStates& states, int n, const float* q, int nq, int
         }
     }
     if (vec4 && C == 4608) {
-        attn_res_vec4_kernel<FUSED_RMS, 576><<<T, 576, 0, s>>>(states, n, q, nq, T, C, res_eps, rms_eps, out, outs);
+        attn_res_vec4_kernel<FUSED_RMS, 576><<<g, 576, 0, s>>>(states, n, q, nq, T, C, res_eps, rms_eps, out, outs,
+                                                               job_step);
     } else if (vec4 && C <= 4096) {
-        attn_res_vec4_kernel<FUSED_RMS, 512><<<T, 512, 0, s>>>(states, n, q, nq, T, C, res_eps, rms_eps, out, outs);
+        attn_res_vec4_kernel<FUSED_RMS, 512><<<g, 512, 0, s>>>(states, n, q, nq, T, C, res_eps, rms_eps, out, outs,
+                                                               job_step);
     } else {
-        attn_res_scalar_kernel<FUSED_RMS><<<T, kBlk, 0, s>>>(states, n, q, nq, T, C, res_eps, rms_eps, out, outs);
+        attn_res_scalar_kernel<FUSED_RMS><<<g, kBlk, 0, s>>>(states, n, q, nq, T, C, res_eps, rms_eps, out, outs,
+                                                             job_step);
     }
     check(FUSED_RMS ? "attn_res_rms_f16" : "attn_res");
 }
@@ -3941,6 +3988,10 @@ void launch_attn_res(const ResStates& states, int n, const float* q, int nq, int
 void attn_res(const ResStates& states, int n, const float* q, int nq, int T, int C, float eps, float* out,
               cudaStream_t s) {
     launch_attn_res<false>(states, n, q, nq, T, C, eps, 0.0f, out, RmsOuts{}, s);
+}
+void attn_res_jobs(const ResStates& states, int n, const float* q, int nq, int jobs, int C, float eps, float* out,
+                   cudaStream_t s) {
+    launch_attn_res<false>(states, n, q, nq, 1, C, eps, 0.0f, out, RmsOuts{}, s, jobs);
 }
 
 void attn_res_rms_f16(const ResStates& states, int n, const float* q, int nq, int T, int C, float res_eps,

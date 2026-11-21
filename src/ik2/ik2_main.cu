@@ -1974,8 +1974,7 @@ void fast_token_launches(Model& M, Work& W, OutMode out_mode) {
         if (M.V[vis].pass > 0) {
             k::ResStates st{};
             for (int i = 0; i < n_bank; ++i) st.st[i] = W.lp_bank + (size_t) i * C;
-            k::attn_res(st, n_bank, Ly.lp_query, 2, 1, C, 1e-6f, W.lp_msg, g_s);
-            k::attn_res(st, n_bank, Ly.lp_query + (size_t) 2 * C, 2, 1, C, 1e-6f, W.lp_msg + 2 * C, g_s);
+            k::attn_res_jobs(st, n_bank, Ly.lp_query, 2, 2, C, 1e-6f, W.lp_msg, g_s);   // (q, k | v, MoE)
             msg = W.lp_msg;
         }
         // the attention's inputs, normed, in F32: W.xq, W.xk, W.xv (sep: q, k and v each have their own)
@@ -1994,7 +1993,8 @@ void fast_token_launches(Model& M, Work& W, OutMode out_mode) {
                     gt[j] = {W.lp_in + (size_t) (Ly.n_res_q == 3 ? j : 0) * C, msg + (size_t) j * C, Ly.lp_down[j],
                              Ly.lp_forget[j], Ly.lp_gain[j], x3[j]};
                 k::loop_gates(gt, 3, 1, C, c.rank, 1e-6f, W.lp_g, g_s);
-                for (int j = 0; j < 3; ++j) k::rms(x3[j], nw[j], 1, C, c.eps, x3[j], g_s);
+                k::rms_multi(k::RmsJobs{{x3[0], x3[1], x3[2]}, {nw[0], nw[1], nw[2]}, {x3[0], x3[1], x3[2]}}, 3, C, c.eps,
+                             g_s);
                 sep = true;
             } else if (l > 0) {
                 k::RmsOuts outs{};
