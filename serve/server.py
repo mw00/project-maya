@@ -2782,6 +2782,8 @@ class Service:
                             _special_ids("<｜end▁of▁sentence｜>") + _special_ids("<｜User｜>") +
                             # MiniMax-M3.1 with [e~[ (and would start the next turn with ]~b])
                             _special_ids("[e~[") + _special_ids("]~b]") +
+                            # Inkling 2 with <|content_model_end_sampling|>
+                            _special_ids("<|content_model_end_sampling|>") +
                             # Hy4-flash with <｜hy_end:..｜> (and would start the next turn with <｜hy_start:..｜>)
                             (_special_ids("<｜hy_end%s｜>" % template.hy4_tag) +
                              _special_ids("<｜hy_start%s｜>" % template.hy4_tag)
@@ -3905,8 +3907,20 @@ class Service:
                 prefill = "\n\n<｜DSML｜ calls>\n" + (f'<｜DSML｜ invoke name="{force}">\n' if force else "")
             elif getattr(self.template, "minimax", False):
                 prefill = MINIMAX_NS + "<tool_call>\n" + (MINIMAX_NS + f'<invoke name="{force}">' if force else "")
+            elif getattr(self.template, "inkling", False):
+                # Inkling 2: a call is a model message of its own, <|message_model|>NAME<|content_invoke_tool_json|>
+                # {"name": .., "args": ..}: the prompt opens it; the parser reads it through InklingRewriter
+                prefill = "<|message_model|>" + (force + "<|content_invoke_tool_json|>" if force else "")
             else:
                 prefill = CALL_START + (force if glm_calls else "\n" + (f"<function={force}>\n" if force else ""))
+        if not prefill and not tools and getattr(self.template, "inkling", False) and \
+                (kwargs.get("enable_thinking") is False or kwargs.get("reasoning_effort") == "none"):
+            # Inkling 2 has no switch for its thinking, only its effort level - and at the lowest ("none": 0.0) it
+            # still thinks a little.  With thinking off the prompt opens the answer's text segment itself, as the
+            # template writes an earlier turn that had no reasoning.  (With tools the turn is left to the model: its
+            # first segment may be a call.)
+            kwargs = {**kwargs, "enable_thinking": False}
+            prefill = "<|message_model|><|content_text|>"
         given["_prefill"] = prefill
         if prefill and getattr(self.template, "hy4", False):
             # Hy4-flash: GLM's form under its own suffixed tags, inside its <tool_calls:..> wrapper.  The prompt gets
@@ -3960,6 +3974,16 @@ class Service:
                 raise ValueError(f"{HY4_TEXT_ONLY} reads text only (Images on the Models page turns them on where "
                                  "the card has room for a picture beside the model), so it cannot read images or "
                                  "videos: send the request without them (describe the picture in text instead)")
+            inkling = getattr(self.template, "inkling", False)
+            if self.vision is None and inkling:
+                # Inkling 2: maya-ik2 has no vision tower of its own (the GGUF leaves it out); with a "vision" entry in
+                # the config the image encoder (maya-vision and unsloth's mmproj) reads the pictures
+                raise ValueError(f"{self.model} on maya-ik2 reads text only without the image encoder (a \"vision\" "
+                                 "entry in its config: maya-vision and the model's mmproj file), so it cannot read "
+                                 "images or videos: send the request without them (describe the picture in text "
+                                 "instead)")
+            if inkling and any(kind == "video" for kind, _ in media):
+                raise ValueError(f"{self.model} reads pictures, not videos")
             if self.vision is None:
                 raise ValueError("this server was started without the vision encoder (run setup again and choose "
                                  "'vision'), so it cannot read images or videos")
@@ -3969,12 +3993,18 @@ class Service:
             glm = "<|begin_of_image|>" in self.template.source
             image_pad, image_start = ("<|image|>", "<|begin_of_image|>") if glm else (IMAGE_PAD, VISION_START)
             video_pad, video_start = ("<|video|>", "<|begin_of_video|>") if glm else ("<|video_pad|>", VISION_START)
+            if inkling:
+                # Inkling 2 writes <|content_image|><|unused_200054|><|end_message|>: the one placeholder becomes the
+                # picture's image tokens (each takes one of the encoder's rows); pictures only
+                image_pad, image_start = "<|unused_200054|>", "<|content_image|>"
             pad = self.tok.encode(image_pad, parse_special=True)[0]
             start = self.tok.encode(image_start, parse_special=True)[0]
-            vp = self.tok.encode(video_pad, parse_special=True)[0]
-            vstart = self.tok.encode(video_start, parse_special=True)[0]
-            # every frame is an independent image: the image's own begin / end markers around its pads
-            iend = self.tok.encode("<|end_of_image|>" if glm else "<|vision_end|>", parse_special=True)[0]
+            vp = vstart = iend = None
+            if not inkling:
+                vp = self.tok.encode(video_pad, parse_special=True)[0]
+                vstart = self.tok.encode(video_start, parse_special=True)[0]
+                # every frame is an independent image: the image's own begin / end markers around its pads
+                iend = self.tok.encode("<|end_of_image|>" if glm else "<|vision_end|>", parse_special=True)[0]
             frame = (start, pad, iend)
             # Encode only while the engine is idle: the engine and the image encoder (a separate process) must not
             # run on the GPU at the same time - an encode during a running request left that request stuck at
@@ -4644,6 +4674,7 @@ class Service:
                                 stream_tools=True, dsml=getattr(self.template, "deepseek", False),
                                 token_only_end=getattr(self.template, "deepseek", False) and self.think_end_id is not None,
                                 minimax=getattr(self.template, "minimax", False),
+                                inkling=getattr(self.template, "inkling", False),
                                 strict_tools=responses, single_tool=single_tool,
                                 unions=getattr(self.template, "glm_dsa", False))
         parser = new_parser()
@@ -6442,8 +6473,9 @@ def make_handler(svc: Service):
             elif path == "/health":
                 # the run config's recommended settings: the web app's Chat defaults until its user picks their own
                 rec = {k: v for k, v in svc.sampling_defaults.items() if k in ("temperature", "top_p", "top_k", "min_p")}
-                if svc.default_effort:   # (MiniMax's by its own five names, CYBER-FROST's by Qwen's three)
-                    rec["reasoning_effort"] = (effort_name if getattr(svc.template, "minimax", False) else effort_level)(
+                if svc.default_effort:   # (MiniMax's and Inkling's by their own names, CYBER-FROST's by Qwen's three)
+                    named = getattr(svc.template, "minimax", False) or getattr(svc.template, "inkling", False)
+                    rec["reasoning_effort"] = (effort_name if named else effort_level)(
                         svc.default_effort) or svc.default_effort
                     if getattr(svc.template, "forced_thinking", False):
                         rec["reasoning_effort"] = QWEN_EFFORT.get(rec["reasoning_effort"], rec["reasoning_effort"])
@@ -7757,7 +7789,8 @@ def main() -> int:
     if cfg.get("reasoning_effort") or (svc.template.deepseek and cfg.get("reasoning_effort") is not None):
         svc.default_effort = cfg["reasoning_effort"]    # (checked before the load: checked_config_effort)
         # (#363: DeepSeek's 1..100 budget is a level of its own - it was shown as "none")
-        level = (effort_name if svc.template.minimax else effort_level)(svc.default_effort) or \
+        level = (effort_name if svc.template.minimax or getattr(svc.template, "inkling", False) else effort_level)(
+            svc.default_effort) or \
             (f"{svc.default_effort} of 100" if type(svc.default_effort) is int
                                                      else "none")
         if getattr(svc.template, "forced_thinking", False):   # (CYBER-FROST: Qwen's words, low / medium / xhigh)

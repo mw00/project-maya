@@ -149,6 +149,12 @@ class _IsolatedSplits:
         return pieces
 
 
+# Inkling 2's pre-tokenizer under the names its GGUFs carry: "gpt-4o" (the conversion as unsloth's UD-Q4_K_XL was
+# made), "inkling" (as their UD-Q3_K_XL was, later) and "inkling2" (llama.cpp master's: Inkling-2-Mini's files) - the
+# same split, the same vocabulary and merges
+O200K = ("gpt-4o", "inkling", "inkling2")
+
+
 class Tokenizer:
     def __init__(self, tokens: list[str], merges: list[str], token_types: list[int] | None = None,
                  pre: str = "qwen35", special_ids: dict[str, int] | None = None):
@@ -156,11 +162,13 @@ class Tokenizer:
         self.pre = pre
         # Each supported scheme names a transcription of the vendored llama.cpp reference; an
         # unknown scheme is REFUSED rather than silently tokenized with the wrong splits.
-        if pre not in ("qwen35", "glm4", "glm5", "deepseek3", "minimax", "hy_v4"):
+        if pre not in ("qwen35", "glm4", "glm5", "deepseek3", "minimax", "hy_v4") + O200K:
             raise ValueError("the %r pre-tokenizer is not transcribed; known: qwen35, glm4, glm5, deepseek3, minimax, "
-                             "hy_v4" % pre)
-        # glm4/glm5 set ignore_merges: an exact vocab hit emits the whole pre-token piece
-        self.ignore_merges = pre in ("glm4", "glm5")
+                             "hy_v4, gpt-4o, inkling, inkling2" % pre)
+        # glm4/glm5 set ignore_merges: an exact vocab hit emits the whole pre-token piece.  `gpt-4o` (Inkling 2's: its
+        # tokenizer.json's one Split with GPT-4o's o200k regex - MINIMAX_PATTERN - and no normalizer, its BPE with
+        # ignore_merges; also named "inkling": O200K) the same
+        self.ignore_merges = pre in ("glm4", "glm5") + O200K
         self.token_types = token_types
         self.special_ids = special_ids or {}
         self.ids = {t: i for i, t in enumerate(tokens)}
@@ -180,7 +188,7 @@ class Tokenizer:
                 raise ValueError("merge %d names a token outside the vocabulary: %r" % (i, m))
             self.ranks[(parts[0], parts[1])] = i
         self._re = (_IsolatedSplits(PRE_ISOLATED[pre]) if pre in PRE_ISOLATED else
-                    regex.compile(MINIMAX_PATTERN) if pre == "minimax" else
+                    regex.compile(MINIMAX_PATTERN) if pre in ("minimax",) + O200K else
                     regex.compile(GLM_PATTERN if self.ignore_merges else QWEN35_PATTERN))
         self._nfc = pre == "minimax"
 
@@ -423,8 +431,10 @@ class Tokenizer:
 
 
 # ------------------------------------------------------------------ the pack's tokenizer/ directory
-def extract(gguf_path, out_dir) -> dict:
-    """Write the tokenizer into `<out_dir>/tokenizer/` so the engine never opens the weight shards for it."""
+def extract(gguf_path, out_dir, chat_template=None) -> dict:
+    """Write the tokenizer into `<out_dir>/tokenizer/` so the engine never opens the weight shards for it.
+    `chat_template`: a template file to write in place of the GGUF's (Inkling 2: thinkingmachines' own,
+    tools/ik2/chat_template.jinja - the conversion's differs)."""
     out = pathlib.Path(out_dir) / "tokenizer"
     out.mkdir(parents=True, exist_ok=True)
     tk = Tokenizer.from_gguf(gguf_path)
@@ -438,8 +448,10 @@ def extract(gguf_path, out_dir) -> dict:
         # The pattern is SHIPPED, not recomputed by the reader: it is transcribed from llama.cpp for the
         # declared `pre` type, and a C++ port that re-derived it would be free to get `\p{M}` wrong again.
         "ignore_merges": tk.ignore_merges,
-        "pre_pattern": GLM_PATTERN if tk.ignore_merges else QWEN35_PATTERN,
-        "pre_pattern_source": (".ref/llama.cpp src/llama-vocab.cpp L406 (LLAMA_VOCAB_PRE_TYPE_CHATGLM4; "
+        "pre_pattern": MINIMAX_PATTERN if tk.pre in ("minimax",) + O200K else
+                       GLM_PATTERN if tk.ignore_merges else QWEN35_PATTERN,
+        "pre_pattern_source": ("GPT-4o's o200k Split, as the model's tokenizer.json gives it" if tk.pre in O200K else
+                               ".ref/llama.cpp src/llama-vocab.cpp L406 (LLAMA_VOCAB_PRE_TYPE_CHATGLM4; "
                                "glm4/glm5 set ignore_merges)" if tk.ignore_merges else
                                ".ref/llama.cpp src/llama-vocab.cpp L396 (LLAMA_VOCAB_PRE_TYPE_QWEN35)"),
     }
@@ -451,7 +463,8 @@ def extract(gguf_path, out_dir) -> dict:
     # the model's own chat template: fine-tunes change it (Swift 1.5 differs from Qwen3.8-Flash-Next's)
     sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
     from gguf_reader import GGUFFile
-    tpl = GGUFFile(pathlib.Path(gguf_path)).metadata.get("tokenizer.chat_template")
+    tpl = pathlib.Path(chat_template).read_text(encoding="utf-8") if chat_template else \
+        GGUFFile(pathlib.Path(gguf_path)).metadata.get("tokenizer.chat_template")
     if tpl:
         (out / "chat_template.jinja").write_text(tpl, encoding="utf-8", newline="\n")
     return cfg
@@ -463,8 +476,9 @@ def main() -> int:
     ap.add_argument("--gguf", required=True)
     ap.add_argument("--out", required=True)
     ap.add_argument("--check", action="store_true", help="round-trip a corpus and report")
+    ap.add_argument("--chat-template", help="a chat template file to write in place of the GGUF's")
     args = ap.parse_args()
-    cfg = extract(args.gguf, args.out)
+    cfg = extract(args.gguf, args.out, args.chat_template)
     print("tokenizer/: vocab %d, merges %d, pre %s, specials %s"
           % (cfg["vocab_size"], cfg["n_merges"], cfg["pre"], cfg["special_ids"]))
     if args.check:

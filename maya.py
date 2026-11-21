@@ -6714,7 +6714,8 @@ BENCH_MIN_ANSWER = 64   # an answer shorter than this (the model stopped early) 
 
 def bench_chat(family: str, tokenizer_dir: Path):
     """--bench's prompt for a question, in the model family's own chat format, thinking off: GLM's markers, DeepSeek's
-    (#416), MiniMax's through its chat template as the server renders it (#549: it got GLM's markers)."""
+    (#416), MiniMax's, Hy4's and Inkling 2's through their chat templates as the server renders them (#549: MiniMax
+    got GLM's markers)."""
     if family == "deepseek":
         return "<｜begin▁of▁sentence｜><｜User｜>{}<｜Assistant｜></think>".format
     if family == "minimax":
@@ -6729,6 +6730,12 @@ def bench_chat(family: str, tokenizer_dir: Path):
             fail(f"the model's chat template is missing ({path})", f"run {ME} --setup --repack to build the pack again")
         tpl = ChatTemplate(path)
         return lambda q: tpl.render([{"role": "user", "content": q}], enable_thinking=False)
+    if family == "ik2":        # (Inkling 2: its template at the lowest effort, the answer's text segment opened -
+        from serve.frontend import ChatTemplate   #  the server's thinking off)
+        path = Path(tokenizer_dir) / "chat_template.jinja"
+        tpl = ChatTemplate(path if path.exists() else ROOT / "tools" / "ik2" / "chat_template.jinja")
+        return lambda q: tpl.render([{"role": "user", "content": q}], reasoning_effort="none",
+                                    enable_thinking=False) + "<|message_model|><|content_text|>"
     if family == "qwen":       # (Qwen's turns, the think block closed: the answer itself)
         return "<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n".format
     return "[gMASK]<sop><|user|>\n{}<|assistant|>\n</think>".format
