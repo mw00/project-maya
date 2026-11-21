@@ -359,8 +359,8 @@ int pack_info(const std::string& dir, const std::string& profile_path, const Ker
         if (name == "embed.weight") {   // the token embedding: pinned RAM, decoded to BF16 rows at the load
             b_embed += (double) x.bytes;
             embed_ram = (uint64_t) std::max(0LL, vocab) * (uint64_t) std::max(0LL, dim) * 2;
-            if (x.dtype != "BF16" && x.dtype != "Q8_0" && x.dtype != "Q4_K" && x.dtype != "Q5_K" && x.dtype != "Q6_K")
-                bad("the token embedding in " + x.dtype + " (BF16, Q8_0, Q4_K, Q5_K or Q6_K)");
+            if (x.dtype != "BF16" && x.dtype != "F16" && x.dtype != "Q8_0" && x.dtype != "Q4_K" && x.dtype != "Q5_K" && x.dtype != "Q6_K")
+                bad("the token embedding in " + x.dtype + " (BF16, exact F16, Q8_0, Q4_K, Q5_K or Q6_K)");
             if (x.shape.size() == 2 && (x.shape[0] != vocab || x.shape[1] != dim))
                 cannot.push_back("embed.weight is [" + std::to_string(x.shape[0]) + "][" + std::to_string(x.shape[1]) +
                                  "], ds4.txt says [" + std::to_string(vocab) + "][" + std::to_string(dim) + "]");
