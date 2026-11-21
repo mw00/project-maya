@@ -63,6 +63,7 @@ static inline int munmap(void*, size_t) { return 0; }
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <filesystem>
 #include <fstream>
 #include <condition_variable>
 #include <deque>
@@ -1663,6 +1664,38 @@ void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const flo
     }
 }
 
+// ---- the offload token path (ik2_off.cuh): the resident path's launches where the experts do not all fit - a tier
+// of them in VRAM (the expert cache's slots: Ly.tab_blob, null where an expert is not there) and the rest copied by
+// the GPU from pinned host memory into staging slots after the router, the same expert kernels on the same bytes
+bool g_off = false;        // set at load
+bool g_off_want = false;   // the layout chosen (the fit, IK2_OFF)
+struct OffState {
+    std::vector<const uint8_t*> host;   // [n_layer] the layer's pinned experts as the device sees them
+    std::vector<int> pool;              // [n_layer] its staging pool (the cache's pool of its slot size)
+    std::vector<k::OffStage> stage;     // a pool a slot size
+    // (prompts: the staging slots as a ring - an event a slot for its copy, one for the expert that read it)
+    std::vector<std::vector<cudaEvent_t>> ring_free, ring_full;
+    std::vector<int> ring_hand;
+    k::OffFetch* fl = nullptr;
+    k::OffCount* cnt = nullptr;         // (device)
+    uint32_t* heat = nullptr;           // [n_layer * E] (device): picks since load
+    int blocks = 0;                     // off_fetch_copy's grid
+    uint64_t tick = ~0ull;              // the cache's tick the tables were made at (a prompt moves experts)
+    // the lane-parity mode (IK2_LANE): the CPU lane's mailboxes (mapped host memory) and the split's figures
+    std::vector<int> fmt;               // [n_layer] 0 NVFP4, 1 Q8_0
+    k::LaneCost* cost = nullptr;        // (device)
+    k::LaneCost cost_h{};               // (pinned host: what was last sent)
+    k::LaneState* ls = nullptr;         // (device)
+    int* cls = nullptr;                 // (device) [K]
+    float* hx = nullptr;                // (device) [K][F] the exact lane's h
+    k::LaneJob* job_d = nullptr;        // (the GPU's view of the mailboxes)
+    k::LaneDone* done_d = nullptr;
+    void *job_h = nullptr, *done_h = nullptr;
+    std::unique_ptr<ik2::lane::Server> lane;
+};
+OffState g_offs;
+bool g_lane = false;   // IK2_LANE: the offload path's lane-parity mode (set at load)
+
 // A layer-major prefill pass of many tokens uses nearly every expert of a layer, so the ones not in VRAM can be
 // copied in before the layer's routing is known: while the previous layer's experts and this layer's attention run.
 // The copy stream then has no idle gap between layers. Slots are taken at the current tick, which keeps the previous
@@ -2052,37 +2085,6 @@ void run_head(const Model& M, int T, bool all_logits, OutMode out_mode, int nb, 
 // dense weights are the GGUF's blocks (IK2_DENSE=q8, the default when the experts fit), one product a launch.
 bool g_fast = false;        // set at load: every expert resident, one GPU, the dense weights as blocks (IK2_FAST=0: no)
 bool g_fast_want = false;
-// ---- the offload token path (ik2_off.cuh): the resident path's launches where the experts do not all fit - a tier
-// of them in VRAM (the expert cache's slots: Ly.tab_blob, null where an expert is not there) and the rest copied by
-// the GPU from pinned host memory into staging slots after the router, the same expert kernels on the same bytes
-bool g_off = false;        // set at load
-bool g_off_want = false;   // the layout chosen (the fit, IK2_OFF)
-struct OffState {
-    std::vector<const uint8_t*> host;   // [n_layer] the layer's pinned experts as the device sees them
-    std::vector<int> pool;              // [n_layer] its staging pool (the cache's pool of its slot size)
-    std::vector<k::OffStage> stage;     // a pool a slot size
-    // (prompts: the staging slots as a ring - an event a slot for its copy, one for the expert that read it)
-    std::vector<std::vector<cudaEvent_t>> ring_free, ring_full;
-    std::vector<int> ring_hand;
-    k::OffFetch* fl = nullptr;
-    k::OffCount* cnt = nullptr;         // (device)
-    uint32_t* heat = nullptr;           // [n_layer * E] (device): picks since load
-    int blocks = 0;                     // off_fetch_copy's grid
-    uint64_t tick = ~0ull;              // the cache's tick the tables were made at (a prompt moves experts)
-    // the lane-parity mode (IK2_LANE): the CPU lane's mailboxes (mapped host memory) and the split's figures
-    std::vector<int> fmt;               // [n_layer] 0 NVFP4, 1 Q8_0
-    k::LaneCost* cost = nullptr;        // (device)
-    k::LaneCost cost_h{};               // (pinned host: what was last sent)
-    k::LaneState* ls = nullptr;         // (device)
-    int* cls = nullptr;                 // (device) [K]
-    float* hx = nullptr;                // (device) [K][F] the exact lane's h
-    k::LaneJob* job_d = nullptr;        // (the GPU's view of the mailboxes)
-    k::LaneDone* done_d = nullptr;
-    void *job_h = nullptr, *done_h = nullptr;
-    std::unique_ptr<ik2::lane::Server> lane;
-};
-OffState g_offs;
-bool g_lane = false;   // IK2_LANE: the offload path's lane-parity mode (set at load)
 bool g_graph = true;        // IK2_GRAPH=0: the resident path's launches one by one
 bool g_block = true;        // IK2_BLOCK=0: a verify window through forward() instead of the block path
 int g_attn_mma = 1;         // a token's attention on the tensor cores (IK2_ATTN_MMA=0: the scalar kernels; 2: the
@@ -2369,7 +2371,44 @@ bool lane_init(Model& M, const std::string& want, int threads) {
     g_offs.lane = std::make_unique<ik2::lane::Server>(threads, C, F, c.gate_cap, c.up_cap, lw, g_offs.job_h, g_offs.done_h);
     std::vector<float> xr(C);
     for (int i = 0; i < C; ++i) xr[i] = std::sin(0.37f * i) * 0.8f;
-    if (threads < 0) {   // the lane's size: counts below the CPU's cores timed on experts read from memory, the
+    // The per-PC calibration (IK2_CALIB: its file, default ~/.maya/ik2-offload-calib.txt; 0: measured every start,
+    // not kept): the lane's size and the split's figures measured once for this GPU, CPU and layer formats, kept
+    // under that key and read back on the next start (the decode re-times the lane as it goes either way).
+    const char* ce = getenv("IK2_CALIB");
+    std::string cal_path = ce && *ce ? ce : "";
+    if (cal_path.empty()) {
+        const char* home = getenv("HOME") ? getenv("HOME") : getenv("USERPROFILE");
+        if (home) cal_path = std::string(home) + "/.maya/ik2-offload-calib.txt";
+    }
+    std::string key;
+    {
+        cudaDeviceProp p{};
+        CU(cudaGetDeviceProperties(&p, 0));
+        size_t fr = 0, tot = 0;
+        CU(cudaMemGetInfo(&fr, &tot));
+        char kb[256];
+        std::snprintf(kb, sizeof kb, "%s|%zu MiB|%u logical|%zu physical|%s|lane %d|C %d F %d", p.name, tot >> 20,
+                      std::thread::hardware_concurrency(), strata::kernels::cpu::physical_cores(false).size(),
+                      ik2::lane::rows_form(), threads, C, F);
+        key = kb;
+        for (char& ch : key) ch = ch == ' ' ? '_' : ch;
+    }
+    k::LaneCost cal{};
+    int cal_thr = 0;
+    bool have = false;
+    if (!cal_path.empty() && cal_path != "0")
+        if (std::ifstream in(cal_path); in)
+            for (std::string ln; std::getline(in, ln);) {
+                std::istringstream is(ln);
+                std::string kk;
+                k::LaneCost t{};
+                int th = 0;
+                if ((is >> kk >> th >> t.cpu[0] >> t.cpu[1] >> t.fetch[0] >> t.fetch[1] >> t.gpu[0] >> t.gpu[1] >> t.lat) &&
+                    kk == key && th > 0)
+                    cal = t, cal_thr = th, have = true;   // (the last line of the key wins)
+            }
+    if (have) g_offs.lane->set_threads(cal_thr - 1);
+    if (threads < 0 && !have) {   // the lane's size: counts below the CPU's cores timed on experts read from memory, the
                          // fastest kept (a smaller one within 5%) - a lane as wide as the CPU loses on a busy PC
         const int phys = (int) strata::kernels::cpu::physical_cores(false).size();
         std::vector<int> cand;
@@ -2395,8 +2434,8 @@ bool lane_init(Model& M, const std::string& want, int threads) {
         g_offs.lane->set_threads(best_n - 1);
     }
     // the split's figures: the fastest of a few runs each (an idle start: the decode re-times the lane as it goes)
-    k::LaneCost cs{};
-    cs.lat = 30.0f;
+    k::LaneCost cs = have ? cal : k::LaneCost{};
+    if (!have) cs.lat = 30.0f;
     int lay[2] = {-1, -1};
     for (int l = 0; l < c.n_layer; ++l)
         if (lay[g_offs.fmt[l]] < 0) lay[g_offs.fmt[l]] = l;
@@ -2414,7 +2453,7 @@ bool lane_init(Model& M, const std::string& want, int threads) {
         CU(cudaMemsetAsync(g_offs.cls, 0, k::kOffMaxK * 4, g_s));
         CU(cudaStreamSynchronize(g_s));
     }
-    for (int f = 0; f < 2; ++f) {
+    for (int f = 0; f < 2 && !have; ++f) {
         const int l = lay[f];
         if (l < 0) continue;
         const Layer& Ly = M.L[l];
@@ -2456,6 +2495,13 @@ bool lane_init(Model& M, const std::string& want, int threads) {
     }
     for (int f = 0; f < 2; ++f)   // (a format with no layer: the other's figures)
         if (lay[f] < 0) cs.cpu[f] = cs.cpu[1 - f], cs.fetch[f] = cs.fetch[1 - f], cs.gpu[f] = cs.gpu[1 - f];
+    if (!have && !cal_path.empty() && cal_path != "0") {   // (kept for the next start)
+        std::error_code ec;
+        std::filesystem::create_directories(std::filesystem::path(cal_path).parent_path(), ec);
+        if (std::ofstream out(cal_path, std::ios::app); out)
+            out << key << ' ' << g_offs.lane->threads() << ' ' << cs.cpu[0] << ' ' << cs.cpu[1] << ' ' << cs.fetch[0]
+                << ' ' << cs.fetch[1] << ' ' << cs.gpu[0] << ' ' << cs.gpu[1] << ' ' << cs.lat << '\n';
+    }
     cs.force = want == "fetch" ? 1 : want == "cpu" ? 2 : 0;
     g_offs.cost_h = cs;
     CU(cudaMemcpyAsync(g_offs.cost, &g_offs.cost_h, sizeof cs, cudaMemcpyHostToDevice, g_s));
@@ -4798,9 +4844,10 @@ int main(int argc, char** argv) {
             CU(cudaMemsetAsync(st.hand, 0, 4, g_s));
             g_offs.stage.push_back(st);
             std::vector<cudaEvent_t> a(n_st), b(n_st);
-            for (int i = 0; i < n_st; ++i)
-                CU(cudaEventCreateWithFlags(&a[i], cudaEventDisableTiming)),
-                    CU(cudaEventCreateWithFlags(&b[i], cudaEventDisableTiming));
+            for (int i = 0; i < n_st; ++i) {
+                CU(cudaEventCreateWithFlags(&a[i], cudaEventDisableTiming));
+                CU(cudaEventCreateWithFlags(&b[i], cudaEventDisableTiming));
+            }
             g_offs.ring_free.push_back(a), g_offs.ring_full.push_back(b), g_offs.ring_hand.push_back(0);
         }
         g_offs.fl = dalloc<k::OffFetch>(1);
@@ -4914,9 +4961,38 @@ int main(int argc, char** argv) {
         }
         g_off = true;
         off_tables(M);
-        if (const char* le = getenv("IK2_LANE"); le && *le && std::string(le) != "0") {
-            g_lane = lane_init(M, le, getenv("IK2_LANE_THREADS") ? std::atoi(getenv("IK2_LANE_THREADS")) : -1);
+        // The decode mode (owner, v1.1.73): lane parity wherever it is the faster one on this PC (IK2_LANE unset or
+        // auto: decided from the calibration's figures), else mode A (the resident kernels, the bus only);
+        // IK2_LANE=0: mode A, =1 / fetch / cpu: lane parity (tests).
+        const char* le = getenv("IK2_LANE");
+        const std::string lw = le && *le ? le : "auto";
+        if (lw != "0") {
+            g_lane = lane_init(M, lw, getenv("IK2_LANE_THREADS") ? std::atoi(getenv("IK2_LANE_THREADS")) : -1);
             if (!g_lane) std::printf("lane parity: off - an expert format the exact lane does not have\n");
+        }
+        if (g_lane && lw == "auto") {
+            // a visit's expected misses from the tier's share of the profile's picks (all picks' share of the bytes
+            // when there is no profile), then mode A's time (copies, then the experts; the resident kernels taken
+            // as twice as fast as the exact ones) against lane parity's best split of them
+            double hit = 0, all = 0;
+            for (int i = 0; i < c.n_layer * c.E; ++i) {
+                const double v = off_value.empty() ? 1.0 : off_value[(size_t) i];
+                all += v, hit += EC.loc[(size_t) i] >= 0 ? v : 0.0;
+            }
+            const double h = all > 0 ? hit / all : 0.0, nm = c.K * (1.0 - h);
+            const k::LaneCost& cs = g_offs.cost_h;
+            const double t_a = nm * cs.fetch[0] + 0.5 * c.K * cs.gpu[0];
+            double t_b = 1e30;
+            for (int n = 0; n <= (int) std::ceil(nm); ++n) {
+                const double nn = std::min<double>(n, nm);
+                t_b = std::min(t_b, std::max(nn > 0 ? cs.lat + nn * cs.cpu[0] : 0.0,
+                                             (nm - nn) * cs.fetch[0] + c.K * cs.gpu[0]));
+            }
+            const bool faster = t_b < 0.95 * t_a;
+            std::printf("decode mode: %s (a visit ~%.0f us with the lane, ~%.0f us without; tier %.0f%% of the "
+                        "profile's picks)\n", faster ? "lane parity" : "A (the lane is not faster here)", t_b, t_a,
+                        100.0 * h);
+            if (!faster) g_lane = false, g_offs.lane.reset();
         }
         int n_tier = 0;
         for (int i = 0; i < c.n_layer * c.E; ++i) n_tier += EC.loc[i] >= 0;
