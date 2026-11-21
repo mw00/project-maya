@@ -3,7 +3,8 @@
 //   maya-hy4 --pack <model>/maya-hy4 --serve [--gpus 0,1,...] [--max-context N] [--chunk N] [--eos id,id,...]
 //            [--mtp | --dfly2 [--draft N] [--draft-floor P]] [--vram-experts F] [--cpu-threads N] [--profile F] [--profile-out F]
 //            [--tp N|auto] [--main-gpu I] [--vision on|off] [--kv auto|f16|q8]
-//            [--kv-streaming on|off|auto] [--kv-resident N] [--room-report] [--gpu-fetch off|auto|gpu|lane|K]
+//            [--kv-streaming on|off|auto] [--kv-resident N] [--kv-spill on|off|auto] [--kv-spill-dir D]
+//            [--room-report] [--gpu-fetch off|auto|gpu|lane|K]
 //
 // --gpu-fetch (HY4_FETCH; off by default): the routed experts VRAM does not hold copied into pinned RAM, and the GPU
 // fetching the ones a token routes to it over the bus itself - gpu: all of them on the GPU (the experts in VRAM follow
@@ -1237,7 +1238,8 @@ int main(int argc, char** argv) {
     int n_more = 1, need = 1;   // (--draft-more / --draft-streak: the MTP block's drafts)
     float sure = 0.8f;
     std::string images, enc_rgb, enc_size, enc_out, kld_save;
-    int kv_stream = 0;   // --kv-streaming on: the indexed layers' rows beyond --kv-resident positions in host memory
+    int kv_stream = -1;  // --kv-streaming on: the indexed layers' rows beyond --kv-resident positions in host memory
+                         // (auto, the default: where the context or more experts need it - see Options::kv_streaming)
     long long kv_res_arg = 0;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -1306,6 +1308,15 @@ int main(int argc, char** argv) {
             kv_stream = v == "on" ? 1 : v == "auto" ? -1 : 0;
         }
         else if (a == "--kv-resident") kv_res_arg = std::atoll(next().c_str());
+        else if (a == "--kv-spill") {
+            const std::string v = next();
+            if (v != "on" && v != "off" && v != "auto") {
+                std::fprintf(stderr, "--kv-spill: on, off or auto\n");
+                return 2;
+            }
+            o.kv_spill = v == "on" ? 1 : v == "auto" ? -1 : 0;
+        }
+        else if (a == "--kv-spill-dir") o.kv_spill_dir = next();
         else if (a == "--kv") {
             const std::string v = next();
             if (v != "auto" && v != "f16" && v != "q8") {

@@ -45,14 +45,24 @@ struct Options {
                                   // scales, the rotated part F16; the indexer's rows F16: about 58% of the VRAM), -1
                                   // auto - F16 where the context fits in VRAM with it, 8-bit rows where it fits
                                   // only with them (any layout: one GPU, the layer split, tensor parallel)
-    int kv_streaming = 0;         // KV streaming: 0 off, 1 on, -1 auto - on only where the context does not fit in the
-                                  // VRAM without it (after 8-bit rows and no picture's room: a start that failed
-                                  // before) and the RAM holds the rows; kv_resident then the ring tried first
+    int kv_streaming = -1;        // KV streaming: 0 off, 1 on, -1 auto (the default) - on where the context does not
+                                  // fit in the VRAM without it (after 8-bit rows and no picture's room: a start that
+                                  // failed before), or, with HY4_KV_MORE=1 (opt-in), where it gives every layer more
+                                  // routed experts in VRAM (the cache fits, the experts do not - nothing read from the
+                                  // host until a conversation passes the ring), and the RAM holds the rows;
+                                  // kv_resident then the ring tried first
     int64_t kv_resident = 0;      // KV streaming: the indexed layers' cache rows kept in VRAM - a ring of the newest
                                   // positions (a chunk's at least); every position's row in pinned host memory, the
                                   // picked rows outside the ring read from there (the same bits: the same answers).
                                   // 0: off - every row in VRAM.  Off as well where the context is no larger
                                   // than the ring.
+    int kv_spill = -1;            // KV spill (with KV streaming): 0 off, 1 on, -1 auto (the default) - where the RAM does not
+                                  // hold every position's row beside its headroom: the newest positions' rows in RAM,
+                                  // the others in a file on a drive (kv_spill_dir; the pack's directory by default),
+                                  // read for the positions a token picks only - the same bits, the same answers.  Auto
+                                  // only where nothing else starts this context, and not on a drive that reads slower
+                                  // than HY4_KV_SPILL_MIN_MBS (default 10 MB/s in 4 KB reads one at a time, measured once at the start)
+    std::string kv_spill_dir;
     bool vision = true;           // the vision tower (the pack's mmproj file) on the main GPU: a picture's room is lent by
                                   // the prompt buffers while it is read (made longer by what they lack of it, if anything)
     bool vision_auto = true;      // (not asked for by name: a pack without one runs text only, no error)
