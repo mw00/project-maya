@@ -15,7 +15,10 @@
 //   4. the lane hooks: native_gu_rows_split (plain and with GLM's swiglu clamp, limits inf / 10 / 0.05) and
 //      native_down_rows_split at nt = 1 with the switch off (Maya's ggml loop) vs on (row4), bit for bit, for each
 //      type as gate/up and as down, plus the served pair (IQ1_S gate/up, IQ4_XS down) at GLM-5.3's 6144 x 2048;
-//   5. lane_row4_set, the per-request switch: mode, type mask (a masked-out type declines), back to the env default.
+//   5. lane_row4_set, the per-request switch: mode, type mask (a masked-out type declines), back to the env default;
+//   6. the switch's auto mode: a type's hooks take its kernel exactly where row4_faster() says the kernel is the
+//      faster one on this CPU, a forced-on switch takes every supported type, off none, the switch unset is the
+//      CPU's default (auto on AMD Zen / Zen+, on elsewhere) - and the hooks' rows are ggml's bits in the auto mode.
 //
 // `glm_lane_row4_test --bench [seconds]` adds a single-thread microbenchmark: GB/s of weight rows streamed by ggml's
 // vec_dot loop vs row4_rows, for an L2-resident (~1 MB) and a DRAM-sized (~192 MB) matrix: 6144-wide rows (GLM-5.3's
@@ -368,6 +371,53 @@ void test_setter(std::mt19937& rng, bool env_on) {
     std::printf("  done\n");
 }
 
+// ---- 6: the auto mode - what the hooks take follows row4_faster(), and the rows are ggml's bits whichever way it went
+void test_auto(std::mt19937& rng) {
+    std::printf("the switch's auto mode: each type as row4_faster() has it on this CPU (unset, the switch is %s here):\n",
+                kc::lane_row4_auto_default() ? "auto" : "on");
+    const float inf = std::numeric_limits<float>::infinity();
+    for (const Ty& ty : kTypes) {
+        const int n_embd = 1024, n_ff = 768;
+        kc::NativeFmt f;
+        std::string err;
+        if (!kc::native_fmt(ty.t, ty.t, n_embd, n_ff, f, err)) {
+            check(false, std::string("native_fmt ") + ty.name + ": " + err);
+            continue;
+        }
+        const bool sup = kc::row4_supported(ty.t), fast = kc::row4_faster(ty.t);
+        check(!fast || sup, std::string(ty.name) + ": row4_faster only where row4_supported");
+        check(kc::row4_faster(ty.t) == fast, std::string(ty.name) + ": row4_faster answers the same again");
+        kc::lane_row4_override(1);
+        check(kc::lane_row4_takes(ty.t) == sup, std::string(ty.name) + ": forced on, taken iff supported");
+        kc::lane_row4_override(0);
+        check(!kc::lane_row4_takes(ty.t), std::string(ty.name) + ": off, not taken");
+        kc::lane_row4_override(2);
+        check(kc::lane_row4_takes(ty.t) == fast, std::string(ty.name) + ": auto, taken iff faster here");
+        kc::lane_row4_override(-1);
+        const char* env = std::getenv("MAYA_GLM_LANE_ROW4");
+        if (env == nullptr || env[0] == '\0')   // (unset: on, or auto on AMD Zen / Zen+)
+            check(kc::lane_row4_takes(ty.t) == (kc::lane_row4_auto_default() ? fast : sup),
+                  std::string(ty.name) + ": unset, this CPU's default");
+        // the rows through the hooks' callers in the auto mode, against the switch off
+        std::vector<uint8_t> blob(f.bytes);
+        fill_rows(ty.t, blob.data(), f.bytes, rng, kRandom);
+        std::vector<uint8_t> act(f.act_bytes);
+        kc::native_quant_act(f, rand_act(n_embd, rng, 0).data(), act.data());
+        const void* a[1] = {act.data()};
+        std::vector<float> off((size_t) n_ff, 7.f), now((size_t) n_ff, 7.f);
+        float* o0[1] = {off.data()};
+        float* o1[1] = {now.data()};
+        kc::lane_row4_override(0);
+        kc::native_gu_rows_split(f, blob.data(), blob.data() + f.up_off, a, 1, o0, 0, n_ff, inf);
+        kc::lane_row4_override(2);
+        kc::native_gu_rows_split(f, blob.data(), blob.data() + f.up_off, a, 1, o1, 0, n_ff, inf);
+        check(same_bits(off.data(), now.data(), n_ff), std::string(ty.name) + ": the auto mode gives the switch-off bits");
+        std::printf("  %-8s kernel %s -> auto takes %s\n", ty.name, sup ? "yes" : "no ",
+                    fast ? "the kernel" : "ggml-cpu's dot");
+    }
+    kc::lane_row4_override(-1);
+}
+
 // ---- --bench: single-thread GB/s, ggml vec_dot loop vs row4_rows
 double now_s() {
     return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
@@ -386,7 +436,10 @@ void bench(double secs) {
     std::mt19937 rng(7);
     std::printf("\nmicrobenchmark: one thread, GB/s of weight rows (best of runs); n = 6144 gate/up rows, n = 2048 down\n");
     std::printf("  NOTE: indicative only unless run on the test PC's Xeon Gold 6138 (numactl -N <node> -m <node>).\n");
-    std::printf("  %-8s %6s %-10s %10s %10s %10s %8s\n", "type", "n", "matrix", "rows", "ggml GB/s", "row4 GB/s", "ratio");
+    std::printf("  (auto: what MAYA_GLM_LANE_ROW4=auto takes for the type here - row4_faster(); unset, the switch is %s here)\n",
+                kc::lane_row4_auto_default() ? "auto" : "on");
+    std::printf("  %-8s %6s %-10s %10s %10s %10s %8s  %s\n", "type", "n", "matrix", "rows", "ggml GB/s", "row4 GB/s",
+                "ratio", "auto");
     for (const BenchCase& bc : kBench) {
         if (!kc::row4_supported(bc.t)) {
             std::printf("  %-8s skipped\n", bc.name);
@@ -419,8 +472,9 @@ void bench(double secs) {
             } while (now_s() < t_end || reps < 3);
             const double gb = (double) rb * rows / 1e9;
             check(same_bits(o1.data(), o2.data(), rows), std::string("bench output identical ") + bc.name);
-            std::printf("  %-8s %6d %-10s %10d %10.2f %10.2f %7.2fx\n", bc.name, n,
-                        target < ((size_t) 8 << 20) ? "~1 MB" : "~192 MB", rows, gb / best1, gb / best2, best1 / best2);
+            std::printf("  %-8s %6d %-10s %10d %10.2f %10.2f %7.2fx  %s\n", bc.name, n,
+                        target < ((size_t) 8 << 20) ? "~1 MB" : "~192 MB", rows, gb / best1, gb / best2, best1 / best2,
+                        kc::row4_faster(bc.t) ? "row4" : "ggml");
         }
     }
 }
@@ -445,6 +499,7 @@ int main(int argc, char** argv) {
     test_iq1s_form();
     test_hooks(rng);
     test_setter(rng, env_on);
+    test_auto(rng);
     if (do_bench) bench(secs);
     std::printf("%d checks ok, %d failed, %d types skipped\n", g_ok, g_fail, g_skip);
     return g_fail ? 1 : 0;
