@@ -1,0 +1,51 @@
+{
+ "_": "Inkling 2 Small's files for maya-ik2's AMD build (docs/INKLING2_AMD.md): unsloth's UD-Q2_K_XL GGUF set (tools/ik2/pack_gguf.py packs it in place), and the model's DSpark drafter - Thinking Machines' own mtp.safetensors with the config.json that describes it (tools/ik2/convert_dspark.py makes the engine's Q8_0 copy and its index, docs/INKLING2_DSPARK.md). Each file: [bytes, sha256], at the pinned revision. \"memory_gb\": the VRAM + RAM (GiB) that hold the whole model, the context aside - ceil(these files' 190.9 GiB + the engine's 8 GiB RAM margin + the drafter's 3.2 GiB): its experts outside VRAM are copied into RAM, never read from the SSD (maya.py's IK2_MEMORY_GB says where each part comes from).",
+ "repo": "unsloth/Inkling-2-Small-GGUF",
+ "revision": "3428220b50899e44a7f484c0d8a997e7ac2e9515",
+ "quants": {
+  "ud-q2_k_xl": {
+   "folder": "UD-Q2_K_XL",
+   "files": {
+    "Inkling-2-Small-UD-Q2_K_XL-00001-of-00006.gguf": [
+     11953184,
+     "f2f08c4d808919b38e05a47edacadc6ceaccd24af829b09ec3d6a2a0a471e608"
+    ],
+    "Inkling-2-Small-UD-Q2_K_XL-00002-of-00006.gguf": [
+     49631731392,
+     "0aecc400e1f5184373fb8c7cebea48684c3fd3a976c75b399b701881a03b082e"
+    ],
+    "Inkling-2-Small-UD-Q2_K_XL-00003-of-00006.gguf": [
+     49711619296,
+     "817455bc1290fa0f34bd23a6af4261418d41ea20e7e6949f17d3f482cce49c38"
+    ],
+    "Inkling-2-Small-UD-Q2_K_XL-00004-of-00006.gguf": [
+     48150944928,
+     "1fb9b06595905a28d5407ed9bfe37092dfc4762fe43aa83329d14d65f8e65933"
+    ],
+    "Inkling-2-Small-UD-Q2_K_XL-00005-of-00006.gguf": [
+     48933825696,
+     "8df67d73180f99cc0d8cc82bca0cb50c1d259c4ae76fdb192d5ee42e952e749f"
+    ],
+    "Inkling-2-Small-UD-Q2_K_XL-00006-of-00006.gguf": [
+     8528980800,
+     "df70ea85f7308b2ab555b17d4876e7c0cbc963c4365df17f46d14c7a82927b66"
+    ]
+   },
+   "memory_gb": 203
+  }
+ },
+ "drafter": {
+  "repo": "thinkingmachines/Inkling-2-Small",
+  "revision": "4d564489295e30e9341a9822a8046f0c9ded1a7b",
+  "files": {
+   "mtp.safetensors": [
+    3423429800,
+    "3b265640ec84ba66e928a2844c4c022c94be731336b0f63755a20a247bfd2a36"
+   ],
+   "config.json": [
+    2767,
+    "58211cb34baf5e71ef4cc12c2f17466775a0bfb2c23d5abae9ecc3bd44f770fb"
+   ]
+  }
+ }
+}

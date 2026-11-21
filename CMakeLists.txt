@@ -1013,6 +1013,16 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
         set_tests_properties(hy4_experts_test PROPERTIES TIMEOUT 300)
       endif()
     endif()
+    # maya-ik2 on AMD (HIP): the engine's AMD build, src/ik2/hip - the CUDA build's kernels above are NVIDIA's own
+    # (inline PTX, NVFP4), so on AMD it runs on maya-ds4's ggml block-type kernels (built like maya-hy4) from a pack of
+    # unsloth's GGUF set (tools/ik2/pack_gguf.py), with the model's DSpark drafter (docs/INKLING2_AMD.md,
+    # docs/INKLING2_DSPARK.md).  The target, the expert-activation tests and the drafter's test each live in their own
+    # file.  The CUDA build above is unchanged.
+    if(STRATA_ENABLE_HIP)
+      include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/ik2_hip_engine.cmake)
+      include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/ik2_hip_kernels.cmake)
+      include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/ik2_hip_dspark.cmake)
+    endif()
     if(STRATA_BUILD_TESTS)
       # maya-mm3's EXL3 kernels against the scalar CPU reference (random matrices, no model): exl3_test's cases with
       # swigluoai, the Volta / Turing tensor-core tiles and the FP16 GEMM path before sm_80
