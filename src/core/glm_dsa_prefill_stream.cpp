@@ -9,6 +9,7 @@
 #include "glm_fast_state.hpp"
 #include "glm_tier_numa.hpp"
 #include "strata/core/glm_model.hpp"
+#include "strata/core/pinned_host.hpp"
 
 #include <cuda_runtime.h>
 
@@ -77,12 +78,33 @@ int n_nodes() {
 
 std::mutex g_mu;
 std::map<void*, size_t> g_bound;   // landing rings this file mapped: base -> length
+std::map<int, bool> g_huge_warned;   // one huge-page fallback notice per device
 
 }  // namespace
 
 int host_alloc_node(void** p, size_t bytes, int dev, bool dsa) {
     *p = nullptr;
-    const auto plain = [&]() { return (int) cudaHostAlloc(p, bytes, cudaHostAllocDefault); };
+    const auto plain = [&]() {
+        const bool huge = pinned_huge_wanted(pinned_huge_env(getenv("MAYA_GLM_PIN_HUGETLB")), bytes);
+        PinnedBacking backing = PinnedBacking::None;
+        const cudaError_t e = pinned_host_alloc(p, bytes, cudaHostAllocDefault, huge,
+                                                PinnedHostAccess::NoHostDereference, &backing);
+        if (e == cudaSuccess && backing == PinnedBacking::HugeTlb)
+            std::fprintf(stderr, "glm prefill: CUDA%d disk landing ring %.0f MB pinned on 2 MB huge pages\n",
+                         dev, (double) bytes / 1048576.0);
+        else if (e == cudaSuccess && huge) {
+            std::lock_guard<std::mutex> lk(g_mu);
+            if (!g_huge_warned[dev]) {
+                std::fprintf(stderr, "glm prefill: CUDA%d disk landing ring asked for 2 MB huge pages (%.0f MB), but the "
+                                     "pool could not hold it or registration was refused: ordinary pinned memory; "
+                                     "enlarge the pool with sysctl vm.nr_hugepages=N (reserved) or "
+                                     "sysctl vm.nr_overcommit_hugepages=N (on demand)\n",
+                             dev, (double) bytes / 1048576.0);
+                g_huge_warned[dev] = true;
+            }
+        }
+        return (int) e;
+    };
     if (!dsa || bytes == 0) return plain();
     const int node = staging_node(gpu_node(dev), n_nodes(), getenv("MAYA_GLM_STAGE_NUMA"));
     if (node < 0 || node >= 64) return plain();
@@ -132,7 +154,7 @@ void host_free_node(void* p) {
         }
     }
     if (len == 0) {
-        cudaFreeHost(p);
+        pinned_host_free(p);
         return;
     }
 #ifdef __linux__

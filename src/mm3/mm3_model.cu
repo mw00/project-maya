@@ -13,6 +13,8 @@
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
 
+#include "strata/core/pinned_host.hpp"
+
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -543,8 +545,8 @@ struct Model::Impl {
             cudaSetDevice(owned_dev[i]);
             cudaFree(owned[i]);
         }
-        if (pool) cudaFreeHost(pool);
-        if (kv_host) cudaFreeHost(kv_host);
+        if (pool) strata::core::pinned_host_free(pool);
+        if (kv_host) strata::core::pinned_host_free(kv_host);
         for (auto& d : D) {
             cudaSetDevice(d.id);
             if (d.cs) cudaStreamSynchronize(d.cs);
@@ -1428,17 +1430,35 @@ struct Model::Impl {
             size_t total = 0;
             for (const Layer& l : L) total += l.kvh.ring > 0 ? nb : 0;
             CK(cudaSetDevice(D[0].id));
-            if (cudaHostAlloc((void**) &kv_host, total, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess) {
+            const int hv = strata::core::pinned_huge_env(::mm3::env("MM3_PIN_HUGETLB"));
+            const bool huge = strata::core::pinned_huge_wanted(hv, total);
+            strata::core::PinnedBacking backing = strata::core::PinnedBacking::None;
+            if (strata::core::pinned_host_alloc((void**) &kv_host, total, cudaHostAllocMapped | cudaHostAllocPortable,
+                                                huge, strata::core::PinnedHostAccess::NoHostDereference,
+                                                &backing) != cudaSuccess) {
                 kv_host = nullptr;
                 err = "KV streaming: " + std::to_string(total >> 20) + " MB of pinned host memory not allocated";
                 return false;
             }
+            if (huge && backing != strata::core::PinnedBacking::HugeTlb)
+                info.push_back("KV streaming: ordinary pinned memory - 2 MB huge pages not available; "
+                               "sysctl vm.nr_hugepages=N reserves pages, sysctl vm.nr_overcommit_hugepages=N "
+                               "allows pages on demand");
             size_t off = 0;
-            for (Layer& l : L) {
-                if (l.kvh.ring <= 0) continue;
-                k::kv_carve(kv_host + off, rows, o.kv_k, o.kv_v, o.kv_rot ? 3 : 0, l.kvh.kc, l.kvh.vc, l.kvh.q);
-                off += nb;
-                acct_kvh[D[(size_t) l.dev].id] += nb;
+            // Registered host memory can have a different device address on each GPU (notably on HIP).
+            for (const Dev& d : D) {
+                uint8_t* base = nullptr;
+                for (int li : d.layers) {
+                    Layer& l = L[(size_t) li];
+                    if (l.kvh.ring <= 0) continue;
+                    if (base == nullptr) {
+                        CK(cudaSetDevice(d.id));
+                        CK(cudaHostGetDevicePointer((void**) &base, kv_host, 0));
+                    }
+                    k::kv_carve(base + off, rows, o.kv_k, o.kv_v, o.kv_rot ? 3 : 0, l.kvh.kc, l.kvh.vc, l.kvh.q);
+                    off += nb;
+                    acct_kvh[d.id] += nb;
+                }
             }
             st.kv_ring = kv_ring;
             st.kv_host_gb = (double) total / (1u << 30);
@@ -1719,7 +1739,12 @@ struct Model::Impl {
                 want += b;
             }
             CK(cudaSetDevice(D[0].id));
-            while (want > 0 && cudaHostAlloc((void**) &pool, want, cudaHostAllocPortable) != cudaSuccess) {
+            const int hv = strata::core::pinned_huge_env(::mm3::env("MM3_PIN_HUGETLB"));
+            const bool huge = strata::core::pinned_huge_wanted(hv, want);
+            strata::core::PinnedBacking backing = strata::core::PinnedBacking::None;
+            while (want > 0 && strata::core::pinned_host_alloc((void**) &pool, want, cudaHostAllocPortable, huge,
+                                                               strata::core::PinnedHostAccess::NoHostDereference,
+                                                               &backing) != cudaSuccess) {
                 pool = nullptr;
                 cudaGetLastError();
                 const size_t next = want / 4 * 3;
@@ -1763,7 +1788,15 @@ struct Model::Impl {
                 if (nw < cand.size())
                     info.push_back("pinned pool: " + std::to_string(nw) + " of the " + std::to_string(cand.size()) +
                                    " experts outside VRAM (" + std::to_string(want >> 30) + " GB: the RAM to spare), the "
-                                   "most routed; the rest from the model's files");
+                                   "most routed; the rest from the model's files" +
+                                   (backing == strata::core::PinnedBacking::HugeTlb ? " (2 MB huge pages)" : ""));
+                else if (backing == strata::core::PinnedBacking::HugeTlb)
+                    info.push_back("pinned pool: all " + std::to_string(nw) + " experts outside VRAM (" +
+                                   std::to_string(want >> 30) + " GB), 2 MB huge pages");
+                if (huge && backing != strata::core::PinnedBacking::HugeTlb)
+                    info.push_back("pinned pool: ordinary pinned memory - 2 MB huge pages not available; "
+                                   "sysctl vm.nr_hugepages=N reserves pages, sysctl vm.nr_overcommit_hugepages=N "
+                                   "allows pages on demand");
             }
         }
         // host-free layers: a MoE layer with every routed expert in VRAM makes its decode plan on the device (the routing
@@ -1852,7 +1885,9 @@ struct Model::Impl {
             if (st.kv_ring > 0)
                 kv += ", streamed: " + std::to_string(st.kv_ring) + " positions a layer in VRAM, all " +
                       std::to_string(o.max_ctx) + " in host memory (" + std::to_string((int) (st.kv_host_gb + 0.5)) +
-                      " GB pinned)";
+                      (strata::core::pinned_host_backing(kv_host) == strata::core::PinnedBacking::HugeTlb
+                           ? " GB pinned, 2 MB huge pages)"
+                           : " GB pinned)");
             info.push_back(kv);
         }
         // the Monitor's map of each GPU: the dense weights, the KV caches, the scratch, the DSpark draft, the routed

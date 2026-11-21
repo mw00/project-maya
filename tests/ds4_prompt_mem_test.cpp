@@ -85,15 +85,33 @@ int main() {
         CHECK(!d::copy_all_auto(100 * GB, 200 * GB, spare, false, 0));
         CHECK(!d::copy_all_auto(100 * GB, 200 * GB, spare, true, 0));
     }
-    {   // the huge-page arena: unset -> only when the reserved pool holds every copy; 0 / 1 force it
+    {   // the huge-page arena: unset -> only when reserved-free + on-demand holds every copy; 0 / 1 force it
         const uint64_t GiB = 1ull << 30, page = 2ull << 20, need = 150 * GiB;
-        CHECK(!d::copy_hugetlb_on(-1, 0, need));             // (no pool: the ordinary arena, as before)
+        struct Pool {   // (the two kinds of pool, as strata::platform::HugePool counts them)
+            uint64_t reserved_free = 0, on_demand = 0;
+            uint64_t total() const { return reserved_free + on_demand; }
+        };
+        const Pool none{}, reserved{160 * GiB, 0}, demand{0, 160 * GiB}, mixed{60 * GiB, 100 * GiB};
+        CHECK(!d::copy_hugetlb_on(-1, none.total(), need));   // (no pool: the ordinary arena, as before)
         CHECK(!d::copy_hugetlb_on(-1, need - page, need));   // (one page short)
         CHECK(d::copy_hugetlb_on(-1, need, need));
-        CHECK(d::copy_hugetlb_on(-1, 160 * GiB, need));
-        CHECK(!d::copy_hugetlb_on(-1, 160 * GiB, 0));        // (no copies)
-        CHECK(!d::copy_hugetlb_on(0, 160 * GiB, need));
-        CHECK(d::copy_hugetlb_on(1, 0, need));
+        CHECK(d::copy_hugetlb_on(-1, reserved.total(), need));
+        CHECK(d::copy_hugetlb_on(-1, demand.total(), need));
+        CHECK(d::copy_hugetlb_on(-1, mixed.total(), need));
+        CHECK(!d::copy_hugetlb_on(-1, demand.total(), 0));   // (no copies)
+        CHECK(!d::copy_hugetlb_on(0, reserved.total(), need));
+        CHECK(!d::copy_hugetlb_on(0, demand.total(), need));
+        CHECK(!d::copy_hugetlb_on(0, mixed.total(), need));
+        CHECK(d::copy_hugetlb_on(1, none.total(), need));
+        CHECK(d::copy_hugetlb_on(1, need - page, need));
+        const uint64_t room = 200 * GiB;
+        CHECK(room + d::copy_room_extra(d::copy_hugetlb_on(-1, none.total(), need), none.reserved_free) == room);
+        CHECK(room + d::copy_room_extra(d::copy_hugetlb_on(-1, demand.total(), need), demand.reserved_free) == room);
+        CHECK(room + d::copy_room_extra(d::copy_hugetlb_on(-1, reserved.total(), need), reserved.reserved_free) ==
+              room + reserved.reserved_free);
+        CHECK(room + d::copy_room_extra(d::copy_hugetlb_on(-1, mixed.total(), need), mixed.reserved_free) ==
+              room + mixed.reserved_free);
+        CHECK(d::copy_room_extra(false, reserved.reserved_free) == 0);
         CHECK(d::round_up(1, page) == page && d::round_up(page, page) == page);
         CHECK(d::round_up(page + 1, page) == 2 * page && d::round_up(0, page) == 0);
     }
