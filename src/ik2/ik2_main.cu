@@ -199,6 +199,7 @@ struct Layer {
     // device ([E] each; a scale's null: 1)
     const uint8_t** tab_blob = nullptr;
     float* tab_sc[3] = {};
+    std::vector<const uint8_t*> tab_h;             // (tab_blob on the host: a short prompt's groups)
     // the state: of the visit being run (bind_visit)
     uint16_t *kc = nullptr, *vc = nullptr;         // FP16 [kv_cap][KV * D] (IK2_KV=f16)
     uint8_t *kc8 = nullptr, *vc8 = nullptr;        // FP8 E4M3 [kv_cap][KV * D] (IK2_KV=fp8)
@@ -1091,6 +1092,11 @@ struct Work {
     float *lp_a = nullptr, *lp_f = nullptr;   // ... of a chunk's: [3][Tm][rank] and [2][Tm][C]
     float* logits_h = nullptr;   // the resident token path's logits, pinned [n_vocab]
     int *cand_d = nullptr, *cand_h = nullptr, *cand_part = nullptr;   // ... its candidates (k::cand_topk's out), scratch
+    // a short prompt's experts by groups, every expert in VRAM (forward): the tables, pinned and on the device -
+    // [rg_groups] pointers | n [rg_groups] | tok, row [rg_groups][kGroupMax] | sg, su, wt, id [rg_slots]
+    uint8_t *rg_h = nullptr, *rg_d = nullptr;
+    int rg_slots = 0, rg_groups = 0;
+    size_t rg_bytes = 0;
 };
 
 // --serve: SIGUSR1 asks the request running to stop (its client went away) at its next token or prompt chunk
@@ -2498,6 +2504,60 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
             dump_f("blk." + std::to_string(vis) + ".out", W.h, TC);
             continue;
         }
+        if (g_fast && T > 1 && S <= W.rg_slots && !Ly.tab_h.empty()) {
+            // Every expert in VRAM and a prompt of a few tokens (a chat turn): the experts straight over their
+            // blocks, an expert's blocks read once for up to kGroupMax of the tokens that picked it.  (The GEMM path
+            // below decodes a whole expert to FP16 for the two or three tokens it has: a 47-token prompt took 0.34 s.)
+            const double te0 = now();
+            const int GM = W.rg_groups;
+            const size_t o_n = (size_t) GM * 8, o_tok = o_n + (size_t) GM * 4, o_row = o_tok + (size_t) GM * k::kGroupMax * 4,
+                         o_sg = o_row + (size_t) GM * k::kGroupMax * 4, o_su = o_sg + (size_t) W.rg_slots * 4,
+                         o_wt = o_su + (size_t) W.rg_slots * 4, o_id = o_wt + (size_t) W.rg_slots * 4;
+            auto** gb = (const uint8_t**) W.rg_h;
+            int *gn = (int*) (W.rg_h + o_n), *gtok = (int*) (W.rg_h + o_tok), *grow = (int*) (W.rg_h + o_row);
+            float *sg = (float*) (W.rg_h + o_sg), *su = (float*) (W.rg_h + o_su), *wt = (float*) (W.rg_h + o_wt);
+            int* id = (int*) (W.rg_h + o_id);
+            if (++W.stamp == 0) {
+                std::fill(W.seen_stamp.begin(), W.seen_stamp.end(), 0);
+                std::fill(W.gi_stamp.begin(), W.gi_stamp.end(), 0);
+                W.stamp = 1;
+            }
+            const uint32_t stp = W.stamp;
+            int G = 0;
+            for (int i = 0; i < S; ++i) {   // slot i (token i / K, one of its picks): row i of h16 and y32
+                const int e = top[i];
+                int g = W.gi_stamp[e] == stp ? W.gi_idx[e] : -1;
+                if (g < 0 || gn[g] == k::kGroupMax) {   // the expert's first group, or its next
+                    g = G++;
+                    W.gi_stamp[e] = stp, W.gi_idx[e] = g;
+                    gb[g] = Ly.tab_h[e], gn[g] = 0;
+                }
+                gtok[(size_t) g * k::kGroupMax + gn[g]] = i / c.K;
+                grow[(size_t) g * k::kGroupMax + gn[g]] = i;
+                ++gn[g];
+                sg[i] = Ly.scale[0].empty() ? 1.0f : Ly.scale[0][e];
+                su[i] = Ly.scale[1].empty() ? 1.0f : Ly.scale[1][e];
+                wt[i] = w[i] * (Ly.scale[2].empty() ? 1.0f : Ly.scale[2][e]);
+                id[i] = i;
+            }
+            // (the stream was synchronised after the routing: the copy of the last layer's tables is done)
+            CU(cudaMemcpyAsync(W.rg_d, W.rg_h, W.rg_bytes, cudaMemcpyHostToDevice, g_s));
+            k::experts_gate_up_swiglu_g((const uint8_t* const*) W.rg_d, (const int*) (W.rg_d + o_n),
+                                        (const int*) (W.rg_d + o_tok), (const int*) (W.rg_d + o_row), G, Ly.ty[0],
+                                        Ly.ty[1], Ly.eb[0], W.xq, C, c.F, (const float*) (W.rg_d + o_sg),
+                                        (const float*) (W.rg_d + o_su), c.gate_cap, c.up_cap, W.h16, g_s);
+            k::experts_down_g((const uint8_t* const*) W.rg_d, (const int*) (W.rg_d + o_n), (const int*) (W.rg_d + o_row),
+                              G, Ly.ty[2], Ly.eb[0] + Ly.eb[1], W.h16, C, c.F, W.y32, g_s);
+            k::moe_combine_f32(W.y32, (const int*) (W.rg_d + o_id), (const float*) (W.rg_d + o_wt), T, c.K, C, W.tmp,
+                               false, g_s);
+            g_pf.lap(g_pf.experts);
+            t_exp += now() - te0;
+            conv_rec(Ly, 3, W.tmp, Ly.h_mlp, T, C);
+            k::conv4_res(W.tmp, Ly.h_mlp, Ly.sc_mlp, nullptr, 0, T, C, W.r, W.h, g_s);
+            g_pf.lap(g_pf.rest);
+            dump_f("blk." + std::to_string(vis) + ".out", W.h, TC);
+            continue;
+        }
         if (g_mv && S <= 64) {
             const double te0 = now();
             // the token path: each slot (token t's pick i) its expert's blob straight from the cache
@@ -3754,6 +3814,15 @@ int main(int argc, char** argv) {
     CU(cudaHostAlloc(&W.argmax_h, Tm * 4, cudaHostAllocPortable));
     CU(cudaHostAlloc(&W.logits_h, (size_t) c.n_rows * 4, cudaHostAllocPortable));
     CU(cudaHostAlloc(&W.cand_h, (size_t) (2 + 2 * kCandCap) * 4, cudaHostAllocPortable));
+    {   // (IK2_RG_SLOTS: the slots - tokens x picks - up to which a prompt's experts go by groups; 0: never)
+        // (96 tokens by default: past ~128 the FP16 GEMMs are the faster way)
+        const int want = getenv("IK2_RG_SLOTS") ? std::atoi(getenv("IK2_RG_SLOTS")) : 96 * c.K;
+        W.rg_slots = std::max(0, std::min(want, (int) std::max<size_t>(64, T_buf)));
+        W.rg_groups = c.E + W.rg_slots / k::kGroupMax;
+        W.rg_bytes = (size_t) W.rg_groups * (8 + 4 + 8 * k::kGroupMax) + (size_t) W.rg_slots * 16;
+        CU(cudaHostAlloc(&W.rg_h, W.rg_bytes, cudaHostAllocPortable));
+        W.rg_d = dalloc<uint8_t>(W.rg_bytes);
+    }
     W.cand_d = dalloc<int>(2 + 2 * kCandCap);
     W.cand_part = dalloc<int>(k::cand_scratch(c.n_vocab));
     const int n_ev = (c.E + Work::kMissBatch - 1) / Work::kMissBatch;
@@ -3876,6 +3945,7 @@ int main(int argc, char** argv) {
                 for (int e = 0; e < c.E; ++e) tab[e] = P.data + (size_t) EC.loc[(size_t) l * c.E + e] * P.slot_bytes;
                 Ly.tab_blob = dalloc<const uint8_t*>(c.E);
                 CU(cudaMemcpy(Ly.tab_blob, tab.data(), (size_t) c.E * sizeof(void*), cudaMemcpyHostToDevice));
+                Ly.tab_h = tab;
                 for (int r = 0; r < 3; ++r)
                     if (!Ly.scale[r].empty()) Ly.tab_sc[r] = dev_f32(Ly.scale[r]);
             }
