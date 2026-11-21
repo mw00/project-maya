@@ -18,6 +18,7 @@
 #include "../core/ablate_capture.hpp"   // (MAYA_ABLATE_CAPTURE: the direction fitting's read-out)
 #include "ds4_engram_io.hpp"
 #include "ds4_draft_placement.hpp"
+#include "ds4_helper_prefill.hpp"
 
 #include "ds4_gguf.cuh"
 #if defined(STRATA_USE_HIP)
@@ -866,6 +867,7 @@ struct Layer {
     int* vs_pin = nullptr;
     int* vs_dev = nullptr;
     std::vector<int> host_list;
+    std::vector<int> prefill_helper;  // static helper experts, in virtual-slot order after the streamed experts
     std::string name;         // "layers.N." or, for the DSpark drafter's blocks, "mtp.N."
     int n_exp = 0, k_exp = 0; // routed experts, and how many a token takes (the drafter's: 128, 3)
     bool mtp = false;         // a DSpark block (index stage = il - n_layers)
@@ -1615,6 +1617,7 @@ struct Model::Impl {
     // on (helper_dead; st.helper_fallback)
     int helper_id = -1;
     bool helper_shared = false;   // opt-in: helper GPU also owns DSpark blocks, never target layers
+    std::unique_ptr<helper_prefill::Workspace> helper_pf;
     size_t helper_cap = 0, helper_used = 0;
     size_t helper_prof = 0;                       // (of helper_used: profiled experts; the rest recent slots or reserved slack)
     int helper_n = 0;                             // experts it holds
@@ -2424,6 +2427,7 @@ struct Model::Impl {
         hr_cv.notify_all();
         if (hr_th.joinable()) hr_th.join();
         if (hr_busy.load()) helper_keep = true;   // (a copy that did not finish: its stage and the pool stay)
+        helper_pf.reset();   // (both streams must finish before the pool or trunk buffers are freed)
         helper_close();   // (before any memory its stream reads or writes goes: the requests, its flags and answers)
         if (hr_st != nullptr && !helper_keep) {   // (after the helper's stream: its last 'tables' job's hr_tab_ev)
             int cur = 0;
@@ -5028,6 +5032,7 @@ struct Model::Impl {
                 !tp_check(err))
                 return false;   // (MAYA_DS4_TP_CHECK=1: at load, no request yet)
             if (helper_n > 0 && !rh_lead && ds4_env("DS4_HELPER_CHECK") != nullptr) helper_check();   // (before the lane runs)
+            if (!helper_prefill_open(err)) return false;
             if (helper_n > 0 && !rh_lead) helper_th = std::thread([this] { helper_loop(); });
             if (helper_n > 0 && hr_want > 0 && !hr_open(err)) return false;
             const int core = !cores.empty() && !cores[0].empty() ? cores[0][0] : -1;
@@ -14662,6 +14667,56 @@ struct Model::Impl {
         return true;
     }
 
+    bool helper_prefill_open(std::string& err) {
+        const char* flag = ds4_env("DS4_HELPER_PREFILL");
+        if (flag == nullptr || std::strcmp(flag, "0") == 0) return true;
+        if (std::strcmp(flag, "1") != 0) {
+            err = "DS4_HELPER_PREFILL expects 0 or 1";
+            return false;
+        }
+        if (helper_n <= 0 || pk.gguf || rh_lead || rh_only() || chunk <= 0 || hr_want > 0) {
+            err = "DS4_HELPER_PREFILL requires a static integrated EXL3 helper and chunked prefill";
+            return false;
+        }
+
+        const int group = L[0].grp, lead_di = member(L[0], 0).dev;
+        int picks = 0;
+        std::vector<helper_prefill::Layer> config((size_t) g.nl);
+        for (int il = 0; il < g.nl; ++il) {
+            Layer& l = L[(size_t) il];
+            if (l.grp != group || member(l, 0).dev != lead_di || l.n_cls != 1) {
+                err = "DS4_HELPER_PREFILL requires one trunk group and uniform EXL3 layers";
+                return false;
+            }
+            for (int m = 0; m < l.nm; ++m) {
+                const int di = member(l, m).dev;
+                if (devs[(size_t) di].id == helper_id || !chunks[(size_t) di] || chunks[(size_t) di]->flow) {
+                    err = "DS4_HELPER_PREFILL requires batched prefill and no trunk layers on the helper";
+                    return false;
+                }
+            }
+            auto& cfg = config[(size_t) il];
+            cfg.layout = l.lay;
+            for (int e = 0; e < l.n_exp; ++e) {
+                if (!helper_owned(l, e)) continue;
+                l.prefill_helper.push_back(e);
+                cfg.pointers.push_back(l.helper[(size_t) e]);
+            }
+            picks = std::max(picks, l.k_exp);
+        }
+        if (picks < 1 || picks > kPicks) {
+            err = "DS4_HELPER_PREFILL: unsupported routing width";
+            return false;
+        }
+        auto workspace = std::make_unique<helper_prefill::Workspace>();
+        const Dev& lead = devs[(size_t) lead_di];
+        if (!workspace->open(helper_id, lead.id, lead.st, chunk, g.dim, g.ff, picks, helper_pool, helper_used,
+                             config, err))
+            return false;
+        helper_pf = std::move(workspace);
+        return true;
+    }
+
     // its stream (the expert kernels' scratch for it) and buffers, the pool's size checked and (an integrated GPU's)
     // reserved - first, before the experts' VRAM and the RAM budgets (the read-ahead's, the RAM tier's, the hand-offs')
     bool helper_open(std::string& err) {
@@ -18403,6 +18458,7 @@ struct Model::Impl {
     // after it read of these rows - its compressed KV and index keys - and nothing of its own attention or experts
     bool layer_chunk(Layer& L0, int mi, int64_t p0, int T, const WinPlan& wp, Streamer& S, std::string& err,
                      bool kv_only = false) {
+        helper_prefill::Drain helper_drain{mi == 0 ? helper_pf.get() : nullptr};
         Layer& l = member(L0, mi);
         Dev& d = devs[(size_t) l.dev];
         Chunk& c = *chunks[(size_t) l.dev];
@@ -18700,7 +18756,8 @@ struct Model::Impl {
             route(c.glog + (size_t) r0 * 1024, l.gate_bias, l.n_exp, l.k_exp, nr, g.route_scale,
                   c.ridx + (size_t) r0 * kPicks, c.rw + (size_t) r0 * kPicks, s, l.gate_bias_vl, vl ? &vb : nullptr);
         }
-        const int n_vs = L0.pv_n + (int) L0.host_list.size();
+        const int primary_vs = L0.pv_n + (int) L0.host_list.size();
+        const int n_vs = primary_vs + (int) L0.prefill_helper.size();
         CK(cudaMemcpyAsync(l.vs_dev, l.vs_pin, (size_t) l.n_exp * 4, cudaMemcpyHostToDevice, s));   // (this member's)
         moe_sort(c.ridx, T, l.k_exp, l.vs_dev, n_vs, c.bounds, c.row_tok, c.pos, s);
         CK(cudaMemcpyAsync(c.bounds_pin, c.bounds, (size_t) (n_vs + 1) * 4, cudaMemcpyDeviceToHost, s));
@@ -18731,10 +18788,12 @@ struct Model::Impl {
         CK(cudaStreamSynchronize(s));
         std::vector<int> b(c.bounds_pin, c.bounds_pin + n_vs + 1);
         // pv_n is this run's resident prefix: slots lent to buffers are streamed, not hits.
-        if (S.collect_prefill && !S.prefill.add_bounds(b.data(), (size_t) n_vs, (size_t) L0.pv_n)) {
+        if (S.collect_prefill && !S.prefill.add_bounds(b.data(), (size_t) primary_vs, (size_t) L0.pv_n)) {
             err = "invalid prefill routing bounds for statistics";
             return false;
         }
+        const bool helper_pending = helper_drain.p && helper_drain.p->submit(
+            L0.il, T, l.k_exp, primary_vs, n_vs, b.data(), c.x, c.bounds, c.row_tok, c.pos, c.rw, g.lim);
         if (dump_r != nullptr && mi == 0) {
             const size_t nk = (size_t) T * l.k_exp, np = (size_t) T * kPicks;
             std::vector<int> ri(np), rt(nk);
@@ -18825,6 +18884,8 @@ struct Model::Impl {
             v_done = v_to;
         }
         if (!run_vram(d, c, L0, l, l, b.data(), v_done, L0.pv_n, T, err)) return false;
+        // The helper computed full experts. Add their share on the lead only, before the TP reduction.
+        if (helper_pending) helper_drain.p->finish(c.acc, T);
         if (xsum) moe_x_finish(c.acc, c.acc64, (size_t) T * D, s);
         if (nm > 1) chunk_allreduce(d, c, ab, mi, T * D, s);
         ablate(d, c.acc, T, wp, s);
@@ -18850,14 +18911,18 @@ struct Model::Impl {
         for (Layer& l : L) {
             if (l.mtp || l.vs_pin == nullptr) continue;
             l.host_list.clear();
-            for (int e = 0; e < l.n_exp; ++e)
-                if (l.slot[(size_t) e] < 0 || l.slot[(size_t) e] >= l.pv_n) l.host_list.push_back(e);
-            for (int m = 0; m < l.nm; ++m) {   // (a group's members: each its own copy)
-                Layer& x = member(l, m);
-                int j = 0;
-                for (int e = 0; e < l.n_exp; ++e)
-                    x.vs_pin[e] = l.slot[(size_t) e] >= 0 && l.slot[(size_t) e] < l.pv_n ? l.slot[(size_t) e] : l.pv_n + j++;
+            for (int e = 0; e < l.n_exp; ++e) {
+                const int slot = l.slot[(size_t) e];
+                if (slot >= 0 && slot < l.pv_n) l.vs_pin[e] = slot;
+                else if (l.prefill_helper.empty() || !helper_owned(l, e)) {
+                    l.vs_pin[e] = l.pv_n + (int) l.host_list.size();
+                    l.host_list.push_back(e);
+                }
             }
+            int next = l.pv_n + (int) l.host_list.size();
+            for (int e : l.prefill_helper) l.vs_pin[e] = next++;
+            for (int m = 1; m < l.nm; ++m)
+                std::copy_n(l.vs_pin, l.n_exp, member(l, m).vs_pin);
         }
     }
 
@@ -19205,7 +19270,8 @@ struct Model::Impl {
             }
             lm_layers.store((int) li + 1, std::memory_order_release);
         }
-        S.report_prefill(d.id, std::accumulate(run.T.begin(), run.T.end(), 0), chunk, c.stream_bytes - stream_start);
+        if (!helper_pf || d.id != helper_id)
+            S.report_prefill(d.id, std::accumulate(run.T.begin(), run.T.end(), 0), chunk, c.stream_bytes - stream_start);
         return true;
     }
     bool run_dev_chunks(int di, const Run& run, std::string& err) {
@@ -19614,7 +19680,8 @@ struct Model::Impl {
             for (cudaEvent_t e : tr_ev)
                 if (e) cudaEventDestroy(e);
         }
-        S.report_prefill(d.id, std::accumulate(run.T.begin(), run.T.end(), 0), chunk, c.stream_bytes - stream_start);
+        if (!helper_pf || d.id != helper_id)
+            S.report_prefill(d.id, std::accumulate(run.T.begin(), run.T.end(), 0), chunk, c.stream_bytes - stream_start);
         if (!c.flow && S.copied + S.skipped + S.pooled > 0 && std::getenv("DS4_FLOW_STATS") != nullptr)
             std::fprintf(stderr, "ds4 prompt batches, CUDA%d: %zu experts copied, %zu unpicked experts skipped, %zu out "
                                  "of the helper's pool%s\n",
@@ -21118,6 +21185,7 @@ struct Model::Impl {
         } else if (!borrow_begin(per, err))
             return false;
         const double trc_lent = now_ms();
+        if (helper_pf) helper_pf->counts = {};
         plan_streams();
         // the states the layers keep on the way: feed_marks' restore points inside the run, then feed_mark's state
         // before the run's last row - a set of buffers each
@@ -21399,6 +21467,14 @@ struct Model::Impl {
                               : "DS4_CHECK_LEND: an expert part handed back to VRAM differs from the model file - the "
                                 "prompt is not answered (those experts went to the CPU lane)";
             return false;
+        }
+        if (helper_pf && std::getenv("DS4_PREFILL_STATS") != nullptr &&
+            std::atoi(std::getenv("DS4_PREFILL_STATS")) != 0) {
+            const auto& c = helper_pf->counts;
+            std::fprintf(stderr, "DS4_PREFILL gpu=%d tokens=%d chunk=%d expert_row_picks=%llu vram_row_picks=%llu "
+                                 "unique_expert_uses=%llu vram_unique_expert_uses=%llu streamed_weight_bytes=0\n",
+                         helper_id, n, chunk, (unsigned long long) c.rows, (unsigned long long) c.rows,
+                         (unsigned long long) c.uses, (unsigned long long) c.uses);
         }
         const double trc_back = now_ms();
         st.layer_ms += now_ms() - tl;
