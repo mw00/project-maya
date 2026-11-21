@@ -1823,21 +1823,29 @@ __global__ void softcap_kernel(float* x, size_t n, float cap) {
 // sc [n][T][2 R + 2]: per gate and token, the two halves of each g before the norms (D's x columns . x, its m columns
 // . m), then the two sums of squares.
 struct LoopGateArgs {
-    const float *x[3], *m[3], *D[3], *F[3], *G[3];
+    const float *x[3], *m[3];
+    const void *D[3], *F[3], *G[3];
     float* y[3];
 };
 constexpr int kLoopRankMax = 128;
+template <bool Compact> __device__ __forceinline__ float gate_weight(const void* p, size_t i) {
+    if constexpr (Compact)
+        return __uint_as_float((uint32_t)((const uint16_t*)p)[i] << 16);
+    else
+        return ((const float*)p)[i];
+}
+
 // (1) a block a rank (128 threads): its two dots; rank 0's block also stores the sums of squares
-__global__ void loop_gate_dots_kernel(LoopGateArgs a, int T, int C, int R, float* sc) {
+template <bool Compact> __global__ void loop_gate_dots_kernel(LoopGateArgs a, int T, int C, int R, float* sc) {
     __shared__ float sh[4][4];
     const int r = blockIdx.x, j = blockIdx.y, t = blockIdx.z, tid = threadIdx.x, warp = tid >> 5;
     const float* xr = a.x[j] + (size_t) t * C;
     const float* mr = a.m[j] + (size_t) t * C;
-    const float* dr = a.D[j] + (size_t) r * 2 * C;
+    const size_t row = (size_t)r * 2 * C;
     float ax = 0.0f, am = 0.0f, sx = 0.0f, sm = 0.0f;
     for (int c = tid; c < C; c += 128) {
         const float xv = xr[c], mv = mr[c];
-        ax += dr[c] * xv, am += dr[C + c] * mv;
+        ax += gate_weight<Compact>(a.D[j], row + c) * xv, am += gate_weight<Compact>(a.D[j], row + C + c) * mv;
         sx += xv * xv, sm += mv * mv;
     }
     ax = wsum(ax), am = wsum(am), sx = wsum(sx), sm = wsum(sm);
@@ -1855,23 +1863,24 @@ __global__ void loop_gate_dots_kernel(LoopGateArgs a, int T, int C, int R, float
 }
 // (2) y = (1 - tanh(F g)) x + tanh(G g) m: a block is kBlk channels of a token, a thread a channel; F and G by rank
 // ([R][C]), so that a warp's threads read side by side.  y may be x (x's sums were taken in (1)).
+template <int Rank, bool Compact>
 __global__ void loop_gate_apply_kernel(LoopGateArgs a, int T, int C, int R, float eps, const float* __restrict__ sc) {
     __shared__ float sh_g[kLoopRankMax];
     const int j = blockIdx.y, t = blockIdx.z, tid = threadIdx.x;
     const float* o = sc + ((size_t) j * T + t) * (2 * R + 2);
-    if (tid < R) {
+    for (int i = tid; i < R; i += blockDim.x) {
         const float rx = rsqrtf(o[2 * R] / (float) C + eps), rm = rsqrtf(o[2 * R + 1] / (float) C + eps);
-        sh_g[tid] = rx * o[2 * tid] + rm * o[2 * tid + 1];
+        sh_g[i] = rx * o[2 * i] + rm * o[2 * i + 1];
     }
     __syncthreads();
-    const int c = (int) blockIdx.x * kBlk + tid;
+    const int c = (int)blockIdx.x * blockDim.x + tid;
     if (c >= C) return;
-    const float* F = a.F[j];
-    const float* G = a.G[j];
+
     float f = 0.0f, gn = 0.0f;
-    for (int r = 0; r < R; ++r) {
+    for (int r = 0; r < (Rank ? Rank : R); ++r) {
         const float gv = sh_g[r];
-        f += F[(size_t) r * C + c] * gv, gn += G[(size_t) r * C + c] * gv;
+        f += gate_weight<Compact>(a.F[j], (size_t)r * C + c) * gv,
+            gn += gate_weight<Compact>(a.G[j], (size_t)r * C + c) * gv;
     }
     const size_t i = (size_t) t * C + c;
     a.y[j][i] = (1.0f - tanhf(f)) * a.x[j][i] + tanhf(gn) * a.m[j][i];
@@ -2078,6 +2087,27 @@ __device__ __forceinline__ float2 e2m1_pair_hi(uint32_t s) {
     return u32_to_f2(__byte_perm(0x42403c00u, 0x4a484644u, sel) | sgn);
 }
 
+// Four signed FP16 high bytes in the order of the serialized E2M1 nibbles.
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 860
+__device__ __forceinline__ uint32_t decode_signed_nibbles(uint32_t nib) {
+    const uint32_t p = __byte_perm(0x42403c00u, 0x4a484644u, nib);
+    const uint32_t n = __byte_perm(0xc2c0bc80u, 0xcac8c6c4u, nib);
+    return __byte_perm(p, n, 0x3210u | ((nib & 0x8888u) >> 1));
+}
+__device__ __forceinline__ float nvfp4_sub_dot(uint32_t q0, uint32_t q1, float4 x0, float4 x1, float4 x2, float4 x3) {
+    const uint32_t a = decode_signed_nibbles(q0), b = decode_signed_nibbles(q0 >> 16);
+    const uint32_t c = decode_signed_nibbles(q1), d = decode_signed_nibbles(q1 >> 16);
+
+    const auto v01 = u32_to_f2(__byte_perm(0, a, 0x6040)), v23 = u32_to_f2(__byte_perm(0, b, 0x6040));
+    const auto v45 = u32_to_f2(__byte_perm(0, c, 0x6040)), v67 = u32_to_f2(__byte_perm(0, d, 0x6040));
+    const auto v89 = u32_to_f2(__byte_perm(0, a, 0x7050)), vAB = u32_to_f2(__byte_perm(0, b, 0x7050));
+    const auto vCD = u32_to_f2(__byte_perm(0, c, 0x7050)), vEF = u32_to_f2(__byte_perm(0, d, 0x7050));
+    return (v01.x * x0.x + v01.y * x0.y + v23.x * x0.z + v23.y * x0.w) +
+           (v45.x * x1.x + v45.y * x1.y + v67.x * x1.z + v67.y * x1.w) +
+           (v89.x * x2.x + v89.y * x2.y + vAB.x * x2.z + vAB.y * x2.w) +
+           (vCD.x * x3.x + vCD.y * x3.y + vEF.x * x3.z + vEF.y * x3.w);
+}
+#else
 __device__ __forceinline__ float nvfp4_sub_dot(uint32_t q0, uint32_t q1, float4 x0, float4 x1, float4 x2, float4 x3) {
     const float2 w01 = e2m1_pair_lo(q0), w23 = e2m1_pair_lo(q0 >> 16);
     const float2 w45 = e2m1_pair_lo(q1), w67 = e2m1_pair_lo(q1 >> 16);
@@ -2088,6 +2118,7 @@ __device__ __forceinline__ float nvfp4_sub_dot(uint32_t q0, uint32_t q1, float4 
            (w89.x * x2.x + w89.y * x2.y + wAB.x * x2.z + wAB.y * x2.w) +
            (wCD.x * x3.x + wCD.y * x3.y + wEF.x * x3.z + wEF.y * x3.w);
 }
+#endif
 
 __device__ __forceinline__ float dot_u32_f4(uint32_t q4, float4 f) {
     return (float) (int8_t) (q4 & 0xFFu) * f.x +
@@ -2518,6 +2549,223 @@ __device__ __forceinline__ void load_xs_f16(const uint16_t* h, int K, float* xs)
 
 size_t mv_row_bytes(int type, int K) {
     return (size_t) (K / block_values(type)) * block_bytes(type);
+}
+
+// Two signed-byte limbs per activation, one FP32 scale per sixteen values.
+// The byte order follows the GGUF nibbles, so each four-weight lookup feeds
+// two dp4a accumulators without reshuffling either set of bytes.
+struct NvInput {
+    int high[4], low[4];
+    float scale;
+};
+template <bool Gate>
+__device__ __forceinline__ void pack_limbs(const float* x, const uint16_t* h, int K, NvInput* packed, int i, int slot,
+                                           bool q8) {
+    if (i >= K / 16) return;
+    const int base = slot * K + 16 * i;
+    float vals[16], mx = 0;
+#pragma unroll
+    for (int j = 0; j < 16; ++j) {
+        vals[j] = Gate ? x[base + j] : h2f(h[base + j]);
+        mx = fmaxf(mx, fabsf(vals[j]));
+    }
+    const float inv = mx > 0 ? 16256.f / mx : 0;
+    NvInput dst;
+    dst.scale = mx / 16256.f;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        unsigned hi = 0, lo = 0;
+#pragma unroll
+        for (int t = 0; t < 4; ++t) {
+            const int ix = q8 ? 4 * j + t : 2 * j + (t >> 1) + 8 * (t & 1);
+            const int q = __float2int_rn(vals[ix] * inv);
+            const int qh = (q + 64) >> 7;
+            hi |= (unsigned)(uint8_t)qh << (8 * t);
+            lo |= (unsigned)(uint8_t)(q - 128 * qh) << (8 * t);
+        }
+        dst.high[j] = hi;
+        dst.low[j] = lo;
+    }
+    packed[base / 16] = dst;
+}
+
+template <bool Gate> __global__ void nv_input(const float* x, const uint16_t* h, int K, NvInput* packed, bool q8) {
+    pack_limbs<Gate>(x, h, K, packed, blockIdx.x * blockDim.x + threadIdx.x, blockIdx.y, q8);
+}
+
+__device__ __forceinline__ float nv_limb_dot(const uint8_t* row, int sub, const NvInput& x) {
+    const uint8_t* b = row + 36 * (sub / 4);
+    const uint32_t* words = (const uint32_t*)(b + 4 + 8 * (sub % 4));
+    int hi = 0, lo = 0;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        const uint32_t nib = words[j / 2] >> (16 * (j % 2));
+        const uint32_t pos = __byte_perm(0x03020100, 0x0c080604, nib);
+        const uint32_t neg = __byte_perm(0xfdfeff00, 0xf4f8fafc, nib);
+        const int val = __byte_perm(pos, neg, 0x3210 | ((nib & 0x8888) >> 1));
+        hi = __dp4a(val, x.high[j], hi);
+        lo = __dp4a(val, x.low[j], lo);
+    }
+    return float(128 * hi + lo) * x.scale * ue4m3(b[sub % 4]);
+}
+__device__ __forceinline__ float q8_limb_dot(const uint8_t* row, int sub, const NvInput& x) {
+    const uint8_t* block = row + (sub / 2) * 34;
+    const uint16_t* q = (const uint16_t*)(block + 2 + (sub % 2) * 16);
+    int hi = 0, lo = 0;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        const int four = (uint32_t)q[2 * j] | ((uint32_t)q[2 * j + 1] << 16);
+        hi = __dp4a(four, x.high[j], hi);
+        lo = __dp4a(four, x.low[j], lo);
+    }
+    return float(128 * hi + lo) * x.scale * h2f(*(const uint16_t*)block);
+}
+
+template <bool Gate, bool Q8>
+__global__ void nv_limb_mv(const uint8_t* const* blobs, const NvInput* packed, size_t offset, int C, int F,
+                           const float* sg, const float* su, float gcap, float ucap, uint16_t* hidden, float* y) {
+    const int lane = threadIdx.x % 32, warp = threadIdx.x / 32, slot = blockIdx.y;
+    const int K = Gate ? C : F, N = Gate ? F : C;
+    const int r = (blockIdx.x * (blockDim.x / 32) + warp) * (Gate ? 1 : 2);
+    if (r >= N) return;
+    const int stride = Q8 ? K / 32 * 34 : K / 64 * 36;
+    const uint8_t* row = blobs[slot] + (Gate ? 0 : offset) + (size_t)r * stride;
+    const uint8_t* second = row + (Gate ? offset : stride);
+    const NvInput* xp = packed + (Gate ? 0 : slot * K / 16);
+    float a = 0, b = 0;
+    for (int s = lane; s < K / 16; s += 32) {
+        const NvInput z = xp[s];
+        a += Q8 ? q8_limb_dot(row, s, z) : nv_limb_dot(row, s, z);
+        b += Q8 ? q8_limb_dot(second, s, z) : nv_limb_dot(second, s, z);
+    }
+    a = wsum(a);
+    b = wsum(b);
+    if (lane) return;
+    if (Gate) {
+        const float g = a * (sg ? sg[slot] : 1.f), u = b * (su ? su[slot] : 1.f);
+        hidden[(size_t)slot * F + r] = f2h(gcap * tanhf(g / gcap) * (1.f / (1.f + expf(-g))) * ucap * tanhf(u / ucap));
+    } else {
+        y[(size_t)slot * C + r] = a;
+        y[(size_t)slot * C + r + 1] = b;
+    }
+}
+
+// Each warp multiplies 16 expert rows by the distinct token inputs in its group.
+__device__ __forceinline__ uint32_t ik2_fp4pair(uint32_t v, uint32_t scale) {
+    const uint32_t mag = __byte_perm(0x42403c00u, 0x4a484644u, (v & 0x0707u) << 4);
+    const uint32_t sign = ((v & 8u) << 12) | ((v & 0x800u) << 20);
+    uint32_t ret;
+    asm("mul.rn.f16x2 %0, %1, %2;" : "=r"(ret) : "r"(mag | sign), "r"(scale));
+    return ret;
+}
+__device__ __forceinline__ uint32_t q8_pair(uint32_t w) {
+    const uint32_t u = __byte_perm(w ^ 0x80808080u, 0x64646464u, 0x4140);
+    uint32_t f;
+    asm("sub.rn.f16x2 %0, %1, %2;" : "=r"(f) : "r"(u), "r"(0x64806480u));
+    return f;
+}
+__device__ __forceinline__ uint32_t q8_h2(uint32_t w, uint32_t scale) {
+    uint32_t f = q8_pair(w);
+    asm("mul.rn.f16x2 %0, %1, %2;" : "=r"(f) : "r"(f), "r"(scale));
+    return f;
+}
+
+template <bool Gate, int Splits, bool Q8 = false>
+__global__ void grouped_expert_mma(const uint8_t* const* blobs, const int* tok, size_t offset, int C, int F,
+                                   const uint16_t* h, uint16_t* hidden, float* out, const float* sg, const float* su,
+                                   float gcap, float ucap, const int* counts, const int* rows_out,
+                                   const uint16_t* input16 = nullptr) {
+    static constexpr int rows = Gate ? 8 : 16;
+    const int lane = threadIdx.x & 31, split = threadIdx.x / 32, grp = lane / 4, sub = lane % 4;
+    const int s = blockIdx.y, r = blockIdx.x * rows + grp, K = Gate ? C : F;
+    const int count = counts[s];
+    if (count <= 0) return;
+    const int gi = s * kGroupMax + (grp < count ? grp : 0);
+    const int input_row = Gate ? tok[gi] : rows_out[gi];
+    const int stride = Q8 ? K / 32 * 34 : K / 64 * 36;
+    const uint8_t* a = blobs[s] + (Gate ? 0 : offset) + (size_t)r * stride;
+    const uint8_t* b = a + (Gate ? offset : 8 * stride);
+    float v[4] = {};
+    if constexpr (Q8) {
+        for (int k = split; k < K / 32; k += Splits) {
+            const uint16_t* ap = (const uint16_t*)(a + k * 34);
+            const uint16_t* bp = (const uint16_t*)(b + k * 34);
+            const float sa = h2f(ap[0]), sb = h2f(bp[0]);
+            const int off = k * 32 + sub * 8;
+            uint32_t xx[4];
+                const uint32_t* xp = (const uint32_t*)((Gate ? input16 : h) + (size_t)input_row * K + off);
+#pragma unroll
+                for (int j = 0; j < 4; ++j)
+                    xx[j] = xp[j];
+            ap += 1 + 4 * sub;
+            bp += 1 + 4 * sub;
+            // Q8's signed integers are exactly representable in FP16. Apply its original
+            // per-row block scale after the FP32 dot, avoiding FP16 weight rounding.
+            float block_sum[4]{};
+#pragma unroll
+            for (int j = 0; j < 2; ++j) {
+                uint32_t af[4] = {q8_pair(ap[j]), q8_pair(bp[j]), q8_pair(ap[j + 2]), q8_pair(bp[j + 2])};
+                mma16816(block_sum, af, xx[j], xx[j + 2]);
+            }
+            v[0] += sa * block_sum[0];
+            v[1] += sa * block_sum[1];
+            v[2] += sb * block_sum[2];
+            v[3] += sb * block_sum[3];
+        }
+    } else
+        for (int k = split; k < K / 64; k += Splits) {
+            const uint8_t* ap = a + k * 36;
+            const uint8_t* bp = b + k * 36;
+            uint32_t sa = f2h(ue4m3(ap[sub])), sb = f2h(ue4m3(bp[sub]));
+            sa |= sa << 16;
+            sb |= sb << 16;
+            uint32_t xx[8];
+            const int off = k * 64 + sub * 16;
+                const uint32_t* xp = (const uint32_t*)((Gate ? input16 : h) + (size_t)input_row * K + off);
+#pragma unroll
+                for (int i = 0; i < 8; ++i)
+                    xx[i] = xp[i];
+#pragma unroll
+            for (int j = 0; j < 2; ++j) {
+                const uint32_t wa = ((const uint32_t*)(ap + 4))[sub * 2 + j];
+                const uint32_t wb = ((const uint32_t*)(bp + 4))[sub * 2 + j];
+#pragma unroll
+                for (int m = 0; m < 2; ++m) {
+                    const uint32_t ra = wa >> (16 * m), rb = wb >> (16 * m);
+                    const uint32_t af[4] = {ik2_fp4pair(ra, sa), ik2_fp4pair(rb, sb), ik2_fp4pair(ra >> 4, sa),
+                                            ik2_fp4pair(rb >> 4, sb)};
+                    mma16816(v, af, xx[2 * j + m], xx[4 + 2 * j + m]);
+                }
+            }
+        }
+    __shared__ float4 partial[Splits][32];
+    partial[split][lane] = make_float4(v[0], v[1], v[2], v[3]);
+    __syncthreads();
+    if (split) return;
+    float4 total = partial[0][lane];
+#pragma unroll
+    for (int i = 1; i < Splits; ++i) {
+        const float4 z = partial[i][lane];
+        total.x += z.x;
+        total.y += z.y;
+        total.z += z.z;
+        total.w += z.w;
+    }
+#pragma unroll
+    for (int j = 0; j < 2; ++j) {
+        const int token = sub * 2 + j;
+        if (token >= count) continue;
+        const int dst = rows_out[s * kGroupMax + token];
+        const float a0 = j ? total.y : total.x, a1 = j ? total.w : total.z;
+        if (Gate) {
+            const float g = a0 * (sg ? sg[dst] : 1.f), u = a1 * (su ? su[dst] : 1.f);
+            hidden[(size_t)dst * F + r] =
+                f2h(gcap * tanhf(g / gcap) * (1.f / (1.f + expf(-g))) * ucap * tanhf(u / ucap));
+        } else {
+            out[(size_t)dst * C + r] = a0;
+            out[(size_t)dst * C + r + 8] = a1;
+        }
+    }
 }
 
 // ---- one token's NVFP4 experts through the tensor cores, straight from their blocks into the registers.
@@ -3484,9 +3732,61 @@ __device__ __forceinline__ bool mv_conv_row(const MvConv& cv, int row, float x_n
 // y [N] = W . x for a Q8_0 matrix kept planar - its values q [N][K] int8 and its blocks' scales d [N][K / 32] FP16 -
 // so that a warp reads 128 values an instruction; x where it is.  A warp a row; a row of c0's or c1's goes through
 // its short conv instead of to y (a launch less a conv: a token's launches each cost 2 us and more).
-template <int WARPS>
-__global__ void mv_q8p_kernel(const int8_t* __restrict__ q, const uint16_t* __restrict__ d, int N, int K,
+// Quantized planar Q8 GEMM for the small verify/prefill tiles. One scale covers
+// both 16-wide MMA instructions. Packing the signed bytes via 1024+u is exact
+// for all 256 inputs; the product rounds to half as in decode_q8p_f16_kernel.
+template <int Splits>
+__global__ void q8_mma_tile(const int8_t* q, const uint16_t* scales, int N, int K, const uint16_t* x, int T, float* out,
+                            int ldy) {
+    const int lane = threadIdx.x % 32, split = threadIdx.x / 32, g = lane / 4, t = lane % 4;
+    const int row = 16 * blockIdx.x + g, token = 8 * blockIdx.y + g;
+    const int row0 = min(row, N - 1), row1 = min(row + 8, N - 1);
+    const int blocks = K / 32;
+    float acc[4] = {};
+    for (int i = split; i < blocks; i += Splits) {
+        const int col = i * 32 + t * 8;
+        const uint2 a0 = *(const uint2*)(q + (size_t)row0 * K + col);
+        const uint2 a1 = *(const uint2*)(q + (size_t)row1 * K + col);
+        uint32_t s0 = scales[(size_t)row0 * blocks + i], s1 = scales[(size_t)row1 * blocks + i];
+        s0 |= s0 << 16;
+        s1 |= s1 << 16;
+        const uint4 v = *(const uint4*)(x + (size_t)min(token, T - 1) * K + col);
+        uint32_t a[4] = {q8_h2(a0.x, s0), q8_h2(a1.x, s1), q8_h2(a0.y, s0), q8_h2(a1.y, s1)};
+        mma16816(acc, a, v.x, v.z);
+        a[0] = q8_h2(a0.x >> 16, s0);
+        a[1] = q8_h2(a1.x >> 16, s1);
+        a[2] = q8_h2(a0.y >> 16, s0);
+        a[3] = q8_h2(a1.y >> 16, s1);
+        mma16816(acc, a, v.y, v.w);
+    }
+    __shared__ float4 part[Splits][32];
+    part[split][lane] = make_float4(acc[0], acc[1], acc[2], acc[3]);
+    __syncthreads();
+    if (split) return;
+    float4 v = part[0][lane];
+#pragma unroll
+    for (int i = 1; i < Splits; ++i) {
+        const float4 z = part[i][lane];
+        v.x += z.x;
+        v.y += z.y;
+        v.z += z.z;
+        v.w += z.w;
+    }
+    const int token0 = blockIdx.y * 8 + 2 * t;
+    if (token0 < T) {
+        if (row < N) out[(size_t)token0 * ldy + row] = v.x;
+        if (row + 8 < N) out[(size_t)token0 * ldy + row + 8] = v.z;
+    }
+    if (token0 + 1 < T) {
+        if (row < N) out[(size_t)(token0 + 1) * ldy + row] = v.y;
+        if (row + 8 < N) out[(size_t)(token0 + 1) * ldy + row + 8] = v.w;
+    }
+}
+
+template <int WARPS, int StaticK = 0>
+__global__ void mv_q8p_kernel(const int8_t* __restrict__ q, const uint16_t* __restrict__ d, int N, int runtime_k,
                               const float* __restrict__ x, float* y, MvConv c0, MvConv c1, MvAlt a0, MvAlt a1) {
+    const int K = StaticK ? StaticK : runtime_k;
     const int row = blockIdx.x * WARPS + (threadIdx.x >> 5), lane = threadIdx.x & 31;
     if (row >= N) return;
     const uint32_t* qr = (const uint32_t*) (q + (size_t) row * K);
@@ -3496,6 +3796,7 @@ __global__ void mv_q8p_kernel(const int8_t* __restrict__ q, const uint16_t* __re
                                         : (unsigned) (row - a1.r0) < (unsigned) a1.n ? a1.x
                                                                                      : x);
     float acc = 0.0f;
+#pragma unroll 4
     for (int it = 0, n_it = K >> 7; it < n_it; ++it) {
         const uint32_t w = __ldg(qr + it * 32 + lane);
         const float4 xv = __ldg(x4 + it * 32 + lane);
@@ -3536,13 +3837,16 @@ __global__ void route_token_kernel(const float* __restrict__ logits, const float
                                    float scale, const uint8_t* const* __restrict__ tab, const float* __restrict__ sg_t,
                                    const float* __restrict__ su_t, const float* __restrict__ sd_t, int* top, float* w,
                                    const uint8_t** blob, int* tok, int* inv, float* sg, float* su, float* wt,
-                                   const float* x, int width, uint16_t* x_limbs) {
-    if (blockIdx.x) {   // (the blocks after the first: x = hi + lo in FP16, [2][width] - experts_gate_up_swiglu_mma's input)
+                                   const float* x, int width, NvInput* packed, bool q8, uint16_t* x_limbs) {
+    if (blockIdx.x) {
         const int i = (blockIdx.x - 1) * blockDim.x + threadIdx.x;
-        if (i < width) {
-            const uint16_t hi = f2h(x[i]);
-            x_limbs[i] = hi, x_limbs[width + i] = f2h(x[i] - h2f(hi));
-        }
+        if (x_limbs) {   // x = hi + lo in FP16, [2][width] (experts_gate_up_swiglu_mma's input)
+            if (i < width) {
+                const uint16_t hi = f2h(x[i]);
+                x_limbs[i] = hi, x_limbs[width + i] = f2h(x[i] - h2f(hi));
+            }
+        } else
+            pack_limbs<true>(x, nullptr, width, packed, i, 0, q8);
         return;
     }
     extern __shared__ float rt_sm[];
@@ -4118,71 +4422,6 @@ __global__ void decode_f32_kernel(int type, const uint8_t* blocks, size_t n, flo
 }
 
 unsigned grid(size_t n, int b = kBlk) { return (unsigned) ((n + b - 1) / b); }
-
-
-// the int8 pairs of Q8_0 blocks as FP16 (exact), and those times a block scale
-__device__ __forceinline__ uint32_t q8_pair(uint32_t w) {
-    const uint32_t u = __byte_perm(w ^ 0x80808080u, 0x64646464u, 0x4140);
-    uint32_t f;
-    asm("sub.rn.f16x2 %0, %1, %2;" : "=r"(f) : "r"(u), "r"(0x64806480u));
-    return f;
-}
-__device__ __forceinline__ uint32_t q8_h2(uint32_t w, uint32_t scale) {
-    uint32_t f = q8_pair(w);
-    asm("mul.rn.f16x2 %0, %1, %2;" : "=r"(f) : "r"(f), "r"(scale));
-    return f;
-}
-
-// Quantized planar Q8 GEMM for the small verify/prefill tiles. One scale covers
-// both 16-wide MMA instructions. Packing the signed bytes via 1024+u is exact
-// for all 256 inputs; the product rounds to half as in decode_q8p_f16_kernel.
-template <int Splits>
-__global__ void q8_mma_tile(const int8_t* q, const uint16_t* scales, int N, int K, const uint16_t* x, int T, float* out,
-                            int ldy) {
-    const int lane = threadIdx.x % 32, split = threadIdx.x / 32, g = lane / 4, t = lane % 4;
-    const int row = 16 * blockIdx.x + g, token = 8 * blockIdx.y + g;
-    const int row0 = min(row, N - 1), row1 = min(row + 8, N - 1);
-    const int blocks = K / 32;
-    float acc[4] = {};
-    for (int i = split; i < blocks; i += Splits) {
-        const int col = i * 32 + t * 8;
-        const uint2 a0 = *(const uint2*)(q + (size_t)row0 * K + col);
-        const uint2 a1 = *(const uint2*)(q + (size_t)row1 * K + col);
-        uint32_t s0 = scales[(size_t)row0 * blocks + i], s1 = scales[(size_t)row1 * blocks + i];
-        s0 |= s0 << 16;
-        s1 |= s1 << 16;
-        const uint4 v = *(const uint4*)(x + (size_t)min(token, T - 1) * K + col);
-        uint32_t a[4] = {q8_h2(a0.x, s0), q8_h2(a1.x, s1), q8_h2(a0.y, s0), q8_h2(a1.y, s1)};
-        mma16816(acc, a, v.x, v.z);
-        a[0] = q8_h2(a0.x >> 16, s0);
-        a[1] = q8_h2(a1.x >> 16, s1);
-        a[2] = q8_h2(a0.y >> 16, s0);
-        a[3] = q8_h2(a1.y >> 16, s1);
-        mma16816(acc, a, v.y, v.w);
-    }
-    __shared__ float4 part[Splits][32];
-    part[split][lane] = make_float4(acc[0], acc[1], acc[2], acc[3]);
-    __syncthreads();
-    if (split) return;
-    float4 v = part[0][lane];
-#pragma unroll
-    for (int i = 1; i < Splits; ++i) {
-        const float4 z = part[i][lane];
-        v.x += z.x;
-        v.y += z.y;
-        v.z += z.z;
-        v.w += z.w;
-    }
-    const int token0 = blockIdx.y * 8 + 2 * t;
-    if (token0 < T) {
-        if (row < N) out[(size_t)token0 * ldy + row] = v.x;
-        if (row + 8 < N) out[(size_t)token0 * ldy + row + 8] = v.z;
-    }
-    if (token0 + 1 < T) {
-        if (row < N) out[(size_t)(token0 + 1) * ldy + row] = v.y;
-        if (row + 8 < N) out[(size_t)(token0 + 1) * ldy + row + 8] = v.w;
-    }
-}
 
 
 // ---- the block path: a few tokens at once (2 .. 8, a speculative step's verify window) on the resident path
@@ -5154,13 +5393,36 @@ void loop_gates(const LoopGate* gt, int n, int T, int C, int R, float eps, float
         std::fprintf(stderr, "ik2::k::loop_gates: %d gates, rank %d, %d tokens\n", n, R, T);
         std::abort();
     }
-    LoopGateArgs a{};
+    bool compact = true;
     for (int j = 0; j < n; ++j)
-        a.x[j] = gt[j].x, a.m[j] = gt[j].m, a.D[j] = gt[j].D, a.F[j] = gt[j].F, a.G[j] = gt[j].G, a.y[j] = gt[j].y;
-    loop_gate_dots_kernel<<<dim3((unsigned) R, (unsigned) n, (unsigned) T), 128, 0, s>>>(a, T, C, R, sc);
+        compact = compact && gt[j].compact[0] && gt[j].compact[1] && gt[j].compact[2];
+    LoopGateArgs a{};
+    for (int j = 0; j < n; ++j) {
+        a.x[j] = gt[j].x;
+        a.m[j] = gt[j].m;
+        a.y[j] = gt[j].y;
+        a.D[j] = compact ? (const void*)gt[j].compact[0] : gt[j].D;
+        a.F[j] = compact ? (const void*)gt[j].compact[1] : gt[j].F;
+        a.G[j] = compact ? (const void*)gt[j].compact[2] : gt[j].G;
+    }
+    const dim3 dots(R, n, T);
+    if (compact)
+        loop_gate_dots_kernel<true><<<dots, 128, 0, s>>>(a, T, C, R, sc);
+    else
+        loop_gate_dots_kernel<false><<<dots, 128, 0, s>>>(a, T, C, R, sc);
     check("loop_gates (dots)");
-    loop_gate_apply_kernel<<<dim3((unsigned) ((C + kBlk - 1) / kBlk), (unsigned) n, (unsigned) T), kBlk, 0, s>>>(
-        a, T, C, R, eps, sc);
+    static const int tile = getenv("IK2_GATE_TILE") ? atoi(getenv("IK2_GATE_TILE")) : 0;
+    const bool fixed = T == 1 && R == 64 && (tile == 32 || tile == 64 || tile == 128);
+    const int threads = fixed ? tile : kBlk;
+    const dim3 apply((C + threads - 1) / threads, n, T);
+    if (fixed && compact)
+        loop_gate_apply_kernel<64, true><<<apply, threads, 0, s>>>(a, T, C, R, eps, sc);
+    else if (fixed)
+        loop_gate_apply_kernel<64, false><<<apply, threads, 0, s>>>(a, T, C, R, eps, sc);
+    else if (compact)
+        loop_gate_apply_kernel<0, true><<<apply, threads, 0, s>>>(a, T, C, R, eps, sc);
+    else
+        loop_gate_apply_kernel<0, false><<<apply, threads, 0, s>>>(a, T, C, R, eps, sc);
     check("loop_gates (apply)");
 }
 void loop_gate(const float* x, const float* m, const float* D, const float* F, const float* G, int T, int C, int R,
@@ -5329,6 +5591,29 @@ void launch_experts_down(const uint8_t* const* blob, int S, int ty_down, size_t 
         blob, ty_down, off_down, h, C, F, mv_row_bytes(ty_down, F), y);
 }
 
+void expert_limb_mv(bool gate, const uint8_t* const* blob, size_t offset, int C, int F, int S, const float* x,
+                    uint16_t* h, float* y, const float* sg, const float* su, float gcap, float ucap, void* scratch,
+                    cudaStream_t stream, bool q8, bool packed) {
+    auto* p = (NvInput*)scratch;
+    if (gate) {
+        if (!packed) nv_input<true><<<(C / 16 + 31) / 32, 32, 0, stream>>>(x, nullptr, C, p, q8);
+        if (q8)
+            nv_limb_mv<true, true>
+                <<<dim3((F + 3) / 4, S), 128, 0, stream>>>(blob, p, offset, C, F, sg, su, gcap, ucap, h, nullptr);
+        else
+            nv_limb_mv<true, false>
+                <<<dim3((F + 3) / 4, S), 128, 0, stream>>>(blob, p, offset, C, F, sg, su, gcap, ucap, h, nullptr);
+    } else {
+        nv_input<false><<<dim3((F / 16 + 31) / 32, S), 32, 0, stream>>>(nullptr, h, F, p, q8);
+        if (q8)
+            nv_limb_mv<false, true>
+                <<<dim3((C + 7) / 8, S), 128, 0, stream>>>(blob, p, offset, C, F, nullptr, nullptr, 0, 0, nullptr, y);
+        else
+            nv_limb_mv<false, false>
+                <<<dim3((C + 7) / 8, S), 128, 0, stream>>>(blob, p, offset, C, F, nullptr, nullptr, 0, 0, nullptr, y);
+    }
+    check("nv_expert_limb");
+}
 bool experts_mma_fits(int ty_gate, int ty_up, int ty_down, int C, int F) {
     return ty_gate == kNVFP4 && ty_up == kNVFP4 && ty_down == kNVFP4 && C % 64 == 0 && F % 64 == 0;
 }
@@ -5374,6 +5659,7 @@ void experts_gate_up(const uint8_t* const* blob, const int* tok, int S, int ty_g
 }
 void experts_down(const uint8_t* const* blob, int S, int ty_down, size_t off_down, const uint16_t* h, int C, int F,
                   float* y, cudaStream_t s) {
+
     if (S <= 0) return;
     if (S <= 4) launch_experts_down<4, 2>(blob, S, ty_down, off_down, h, C, F, y, s);
     else launch_experts_down<4, 4>(blob, S, ty_down, off_down, h, C, F, y, s);
@@ -5387,9 +5673,27 @@ void experts_gate_up_g(const uint8_t* const* blob, const int* n, const int* tok,
                                                             mv_row_bytes(ty_gate, C), mv_row_bytes(ty_up, C), gu);
     check("experts_gate_up_g");
 }
+// The serving engine can retain the original short-prompt arithmetic and enable
+// the grouped tensor-core path only in a window whose tokens are being verified.
+thread_local bool grouped_tensor_products = true;
+void enable_grouped_tensor_products(bool enabled) { grouped_tensor_products = enabled; }
 void experts_down_g(const uint8_t* const* blob, const int* n, const int* row, int G, int ty_down, size_t off_down,
                     const uint16_t* h, int C, int F, float* y, cudaStream_t s) {
     if (G <= 0) return;
+    static const bool use_group_mma = getenv("IK2_GROUP_MMA") && (atoi(getenv("IK2_GROUP_MMA")) & 2);
+    if (grouped_tensor_products && use_group_mma && ty_down == kNVFP4 && C % 16 == 0 && F % 64 == 0) {
+        grouped_expert_mma<false, 4><<<dim3(C / 16, G), 128, 0, s>>>(blob, nullptr, off_down, C, F, h, nullptr, y,
+                                                                     nullptr, nullptr, 0, 0, n, row);
+        check("grouped_expert_mma (grouped)");
+        return;
+    }
+
+    if (grouped_tensor_products && use_group_mma && ty_down == kQ8_0 && C % 16 == 0 && F % 32 == 0) {
+        grouped_expert_mma<false, 4, true><<<dim3(C / 16, G), 128, 0, s>>>(blob, nullptr, off_down, C, F, h, nullptr, y,
+                                                                           nullptr, nullptr, 0, 0, n, row);
+        check("q8 grouped MMA");
+        return;
+    }
     const dim3 g((unsigned) ((C + kGroupWarps * kGroupRows - 1) / (kGroupWarps * kGroupRows)), (unsigned) G);
     experts_down_g_kernel<<<g, kGroupWarps * 32, 0, s>>>(blob, n, row, ty_down, off_down, h, C, F,
                                                          mv_row_bytes(ty_down, F), y);
@@ -5418,6 +5722,7 @@ void experts_gate_up_swiglu_rows(const uint8_t* const* blob, const int* tok, int
 void experts_gate_up_swiglu(const uint8_t* const* blob, const int* tok, int S, int ty_gate, int ty_up, size_t eb0,
                             const float* x, int C, int F, const float* sg, const float* su, float gcap, float ucap,
                             uint16_t* h, cudaStream_t s) {
+
     if (S <= 0) return;
     if (S <= 8) launch_experts_gate_up_swiglu<4, 2>(blob, tok, S, ty_gate, ty_up, eb0, x, C, F, sg, su, gcap, ucap, h, s);
     else launch_experts_gate_up_swiglu<4, 4>(blob, tok, S, ty_gate, ty_up, eb0, x, C, F, sg, su, gcap, ucap, h, s);
@@ -5426,8 +5731,23 @@ void experts_gate_up_swiglu(const uint8_t* const* blob, const int* tok, int S, i
 
 void experts_gate_up_swiglu_g(const uint8_t* const* blob, const int* n, const int* tok, const int* row, int G,
                               int ty_gate, int ty_up, size_t eb0, const float* x, int C, int F, const float* sg,
-                              const float* su, float gcap, float ucap, uint16_t* h, cudaStream_t s) {
+                              const float* su, float gcap, float ucap, uint16_t* h, cudaStream_t s,
+                              const uint16_t* input16) {
     if (G <= 0) return;
+    static const bool use_group_mma = getenv("IK2_GROUP_MMA") && (atoi(getenv("IK2_GROUP_MMA")) & 1);
+    if (grouped_tensor_products && use_group_mma && input16 && ty_gate == kNVFP4 && ty_up == kNVFP4 && F % 8 == 0 && C % 64 == 0) {
+        grouped_expert_mma<true, 4><<<dim3(F / 8, G), 128, 0, s>>>(blob, tok, eb0, C, F, nullptr, h, nullptr, sg, su,
+                                                                   gcap, ucap, n, row, input16);
+        check("grouped_expert_mma (grouped)");
+        return;
+    }
+
+    if (grouped_tensor_products && use_group_mma && input16 && ty_gate == kQ8_0 && ty_up == kQ8_0 && F % 8 == 0 && C % 32 == 0) {
+        grouped_expert_mma<true, 4, true><<<dim3(F / 8, G), 128, 0, s>>>(blob, tok, eb0, C, F, nullptr, h, nullptr, sg,
+                                                                         su, gcap, ucap, n, row, input16);
+        check("q8 grouped MMA");
+        return;
+    }
     const dim3 g((unsigned) ((F + kGroupWarps * kGroupSwigluRows - 1) / (kGroupWarps * kGroupSwigluRows)), (unsigned) G);
     experts_gate_up_swiglu_g_kernel<<<g, kGroupWarps * 32, 0, s>>>(blob, n, tok, row, ty_gate, ty_up, eb0, x, C, F,
                                                                    mv_row_bytes(ty_gate, C), mv_row_bytes(ty_up, C),
@@ -5562,6 +5882,12 @@ void attn_decode_fp8(const float* q, const float* r, const float* sink, const ui
                      window, scratch, out, s);
 }
 
+void q8_tile(const int8_t* q, const uint16_t* d, int N, int K, const uint16_t* x, int T, float* y, int ldy,
+             cudaStream_t s) {
+    q8_mma_tile<4><<<dim3((N + 15) / 16, (T + 7) / 8), 128, 0, s>>>(q, d, N, K, x, T, y, ldy);
+    check("q8_mma_tile");
+}
+
 void mv_q8p_conv(const int8_t* q, const uint16_t* d, int N, int K, const float* x, float* y, const MvConv& c0,
                  const MvConv& c1, cudaStream_t s, const MvAlt& a0, const MvAlt& a1) {
     if (N <= 0) return;
@@ -5569,7 +5895,13 @@ void mv_q8p_conv(const int8_t* q, const uint16_t* d, int N, int K, const float* 
         std::fprintf(stderr, "ik2::k::mv_q8p: K %d, or q / x not aligned\n", K);
         std::abort();
     }
-    mv_q8p_kernel<4><<<(unsigned) ((N + 3) / 4), 128, 0, s>>>(q, d, N, K, x, y, c0, c1, a0, a1);
+    static const bool specialize = getenv("IK2_Q8_UNROLL") && atoi(getenv("IK2_Q8_UNROLL"));
+    if (specialize && K == 2304)
+        mv_q8p_kernel<4, 2304><<<(unsigned)((N + 3) / 4), 128, 0, s>>>(q, d, N, K, x, y, c0, c1, a0, a1);
+    else if (specialize && K == 3072)
+        mv_q8p_kernel<4, 3072><<<(unsigned)((N + 3) / 4), 128, 0, s>>>(q, d, N, K, x, y, c0, c1, a0, a1);
+    else
+        mv_q8p_kernel<4><<<(unsigned)((N + 3) / 4), 128, 0, s>>>(q, d, N, K, x, y, c0, c1, a0, a1);
     check("mv_q8p");
 }
 void mv_q8p(const int8_t* q, const uint16_t* d, int N, int K, const float* x, float* y, cudaStream_t s) {
@@ -5602,17 +5934,19 @@ void route_gather(const int* top, const float* w, const uint8_t* const* tab, con
 void route_token(const float* logits, const float* bias, int E, int K, float scale, const uint8_t* const* tab,
                  const float* sg_t, const float* su_t, const float* sd_t, int* top, float* w, const uint8_t** blob,
                  int* tok, int* inv, float* sg, float* su, float* wt, cudaStream_t s, const float* x, int width,
-                 uint16_t* x_limbs) {
+                 void* packed, bool q8, uint16_t* x_limbs) {
     if (E > 1024 || K > E) {   // (more experts than a block's threads: the two kernels)
+        if (packed) nv_input<true><<<(width / 16 + 31) / 32, 32, 0, s>>>(x, nullptr, width, (NvInput*)packed, q8);
         if (x_limbs) to_f16_limbs(x, (size_t) width, x_limbs, s);
         route(logits, bias, 1, E, K, scale, top, w, s);
         route_gather(top, w, tab, sg_t, su_t, sd_t, K, K, blob, tok, inv, sg, su, wt, s);
         return;
     }
     const unsigned nt = (unsigned) ((E + 31) / 32 * 32);
-    const unsigned blocks = 1 + (x_limbs ? (width + nt - 1) / nt : 0);
-    route_token_kernel<<<blocks, nt, (size_t) (E + nt / 32 + K + 1) * sizeof(float), s>>>(
-        logits, bias, E, K, scale, tab, sg_t, su_t, sd_t, top, w, blob, tok, inv, sg, su, wt, x, width, x_limbs);
+    const unsigned blocks = 1 + (x_limbs ? (width + nt - 1) / nt : packed ? (width / 16 + nt - 1) / nt : 0);
+    route_token_kernel<<<blocks, nt, (size_t)(E + nt / 32 + K + 1) * sizeof(float), s>>>(
+        logits, bias, E, K, scale, tab, sg_t, su_t, sd_t, top, w, blob, tok, inv, sg, su, wt, x, width,
+        (NvInput*)packed, q8, x_limbs);
     check("route_token");
 }
 
@@ -5757,13 +6091,6 @@ void decode_f32(int type, const uint8_t* blocks, size_t n, float* out, cudaStrea
 }
 void decode_host(int type, const uint8_t* blocks, size_t n, float* out) {
     for (size_t i = 0; i < n; ++i) out[i] = decode_value(type, blocks, i);
-}
-
-
-void q8_tile(const int8_t* q, const uint16_t* d, int N, int K, const uint16_t* x, int T, float* y, int ldy,
-             cudaStream_t s) {
-    q8_mma_tile<4><<<dim3((N + 15) / 16, (T + 7) / 8), 128, 0, s>>>(q, d, N, K, x, T, y, ldy);
-    check("q8_mma_tile");
 }
 
 

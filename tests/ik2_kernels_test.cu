@@ -2508,6 +2508,105 @@ void test_round6() {
 
 }  // namespace
 
+// One decode token has one input shared by its selected experts. Include zero
+// groups and signed activations whose low limb changes the dot product.
+void test_expert_limbs() {
+    constexpr int C = 256, F = 128, S = 3;
+    for (bool q8 : {false, true}) {
+        const int ty = q8 ? k::kQ8_0 : k::kNVFP4;
+        const int block = k::block_values(ty), bytes = k::block_bytes(ty);
+        const size_t matrix_bytes = (size_t)C * F / block * bytes;
+        auto pool = rand_blocks(ty, (size_t)S * 3 * C * F);
+        for (size_t off = 0; off < pool.size(); off += bytes) {
+            if (q8) {
+                const uint16_t scale = f2h_host(1.0f / 256);
+                std::memcpy(pool.data() + off, &scale, sizeof(scale));
+            } else {
+                std::fill_n(pool.data() + off, 4, uint8_t(0x20));
+            }
+        }
+        auto* device_pool = dev(pool);
+        std::vector<const uint8_t*> ptrs;
+        for (int j = 0; j < S; ++j)
+            ptrs.push_back(device_pool + 3 * j * matrix_bytes);
+        auto** blobs = dev(ptrs);
+        auto x = fvec(C);
+        std::fill_n(x.begin(), 16, 0.0f);
+        auto* input = dev(x);
+        auto* tokens = dev(std::vector<int>(S, 0));
+        auto* output = dev_n<float>(S * C);
+        auto* ref = dev_n<uint16_t>(S * F);
+        auto* got = dev_n<uint16_t>(S * F);
+        // Each group of sixteen activations has two signed-byte limbs and one FP32 scale.
+        auto* scratch = dev_n<float>(9 * std::max(C, S * F) / 16);
+        k::experts_gate_up_swiglu(blobs, tokens, S, ty, ty, matrix_bytes, input, C, F, nullptr, nullptr, 20, 20, ref,
+                                  0);
+        k::expert_limb_mv(true, blobs, matrix_bytes, C, F, S, input, got, output, nullptr, nullptr, 20, 20, scratch, 0,
+                          q8);
+        const auto h_ref = host(ref, S * F), h_got = host(got, S * F);
+        std::vector<double> expected(h_ref.size());
+        std::vector<float> actual(h_ref.size());
+        for (size_t i = 0; i < expected.size(); ++i) {
+            expected[i] = h2f_host(h_ref[i]);
+            actual[i] = h2f_host(h_got[i]);
+        }
+        expect(q8 ? "Q8 limb SwiGLU" : "NVFP4 limb SwiGLU", actual, expected, 2e-3, 5e-3);
+        k::experts_down(blobs, S, ty, 2 * matrix_bytes, ref, C, F, output, 0);
+        const auto reference_down = host(output, S * C);
+        k::expert_limb_mv(false, blobs, 2 * matrix_bytes, C, F, S, input, ref, output, nullptr, nullptr, 20, 20,
+                          scratch, 0, q8);
+        expect(q8 ? "Q8 limb down" : "NVFP4 limb down", host(output, S * C),
+               std::vector<double>(reference_down.begin(), reference_down.end()), 1e-3, 1e-2);
+        // Resident short-prefill callers have an FP16 mirror of each normalized input.
+        // Give the reference the very same rounded activations and test indirect output rows.
+        std::vector<uint16_t> half_inputs(S * C);
+        std::vector<float> rounded(S * C);
+        for (size_t j = 0; j < rounded.size(); ++j) {
+            half_inputs[j] = f2h_host(frand());
+            rounded[j] = h2f_host(half_inputs[j]);
+        }
+        auto* x16 = dev(half_inputs);
+        auto* x32 = dev(rounded);
+        auto* counts = dev(std::vector<int>{2, 1});
+        std::vector<int> grouped_tokens(2 * k::kGroupMax), grouped_rows(2 * k::kGroupMax);
+        grouped_tokens[0] = 0;
+        grouped_tokens[1] = 2;
+        grouped_tokens[k::kGroupMax] = 1;
+        grouped_rows[0] = 2;
+        grouped_rows[1] = 0;
+        grouped_rows[k::kGroupMax] = 1;
+        auto* gt = dev(grouped_tokens);
+        auto* gr = dev(grouped_rows);
+        auto* per_token = dev(std::vector<int>{2, 1, 0});
+        auto** per_blob = dev(std::vector<const uint8_t*>{ptrs[0], ptrs[1], ptrs[0]});
+        k::experts_gate_up_swiglu(per_blob, per_token, S, ty, ty, matrix_bytes, x32, C, F, nullptr, nullptr, 20, 20,
+                                  ref, 0);
+        k::experts_gate_up_swiglu_g(blobs, counts, gt, gr, 2, ty, ty, matrix_bytes, x32, C, F, nullptr, nullptr, 20, 20,
+                                    got, 0, x16);
+        const auto gh = host(got, S * F), rh = host(ref, S * F);
+        for (size_t j = 0; j < gh.size(); ++j) {
+            actual[j] = h2f_host(gh[j]);
+            expected[j] = h2f_host(rh[j]);
+        }
+        expect(q8 ? "Q8 grouped FP16 input" : "NVFP4 grouped FP16 input", actual, expected, 2e-3, 5e-3);
+        cudaFree(x16);
+        cudaFree(x32);
+        cudaFree(counts);
+        cudaFree(gt);
+        cudaFree(gr);
+        cudaFree(per_token);
+        cudaFree(per_blob);
+        cudaFree(scratch);
+        cudaFree(got);
+        cudaFree(ref);
+        cudaFree(output);
+        cudaFree(tokens);
+        cudaFree(input);
+        cudaFree(blobs);
+        cudaFree(device_pool);
+    }
+}
+
 // One token's NVFP4 experts through the tensor cores against the scalar kernels over the same blocks (every scale
 // byte, the subnormal ones and 0x7F with them): gate | up with the input as two FP16 limbs, down over the FP16 h.
 void test_experts_mma() {
@@ -2543,6 +2642,38 @@ void test_experts_mma() {
     expect_true("experts_mma_fits", k::experts_mma_fits(ty, ty, ty, 2304, 1152) && !k::experts_mma_fits(ty, k::kQ8_0, ty, 2304, 1152));
 }
 
+void test_q8_verify_tile() {
+    constexpr int N = 35, K = 256, ld = 39;
+    std::vector<int8_t> weights(N * K);
+    for (auto& q : weights)
+        q = (int8_t)(rng() & 255);
+    std::vector<uint16_t> scales(N * K / 32);
+    for (auto& d : scales)
+        d = f2h_host(0.015625f * std::fabs(frand()));
+    auto* dw = dev(weights);
+    auto* ds = dev(scales);
+    for (int T : {2, 8, 13}) {
+        std::vector<uint16_t> x(T * K);
+        for (auto& v : x)
+            v = f2h_host(frand());
+        auto* dx = dev(x);
+        auto* dy = dev_n<float>(T * ld);
+        k::q8_tile(dw, ds, N, K, dx, T, dy, ld, 0);
+        std::vector<double> wanted(T * ld);
+        for (int t = 0; t < T; ++t)
+            for (int r = 0; r < N; ++r)
+                for (int k = 0; k < K; ++k) {
+                    float w = h2f_host(f2h_host(weights[r * K + k] * h2f_host(scales[(r * K + k) / 32])));
+                    wanted[t * ld + r] += (double)w * h2f_host(x[t * K + k]);
+                }
+        expect("short Q8 tensor-core tile", host(dy, T * ld), wanted, 6e-4, 5e-4);
+        cudaFree(dx);
+        cudaFree(dy);
+    }
+    cudaFree(dw);
+    cudaFree(ds);
+}
+
 int main() {
     int dev_count = 0;
     CU(cudaGetDeviceCount(&dev_count));
@@ -2572,7 +2703,9 @@ int main() {
     test_attn_decode_mma();
     test_cand_topk();
     test_token_path();
+    test_expert_limbs();
     test_experts_mma();
+    test_q8_verify_tile();
     std::printf(g_fail ? "FAILED: %d check(s)\n" : "all passed\n", g_fail);
     return g_fail ? 1 : 0;
 }

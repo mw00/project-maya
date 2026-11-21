@@ -148,6 +148,7 @@ void softcap(float* x, size_t n, float cap, cudaStream_t s);
 struct LoopGate {
     const float *x, *m, *D, *F, *G;
     float* y;
+    const uint16_t* compact[3] = {}; // D, F, G if each F32 is exactly its upper 16 bits
 };
 void loop_gates(const LoopGate* gates, int n, int T, int C, int R, float eps, float* sc, cudaStream_t s);
 void loop_gate(const float* x, const float* m, const float* D, const float* F, const float* G, int T, int C, int R,
@@ -168,6 +169,13 @@ void loop_gate_blend(const float* x, const float* m, const float* f, const float
                      cudaStream_t s);
 
 // ---- the token path: the experts straight from their blocks, the attention of one query
+
+/// Two signed INT8 limbs approximate each activation for DP4A with the serialized NVFP4 or Q8 weights.
+/// Scratch uses nine float-sized words per 16 inputs, one row for gate/up or S rows for down.
+/// A fused router can provide the gate input already packed.
+void expert_limb_mv(bool gate, const uint8_t* const* blob, size_t offset, int C, int F, int S, const float* x,
+                    uint16_t* h, float* y, const float* sg, const float* su, float gcap, float ucap, void* scratch,
+                    cudaStream_t stream, bool q8 = false, bool packed = false);
 
 /// The routed experts of a few tokens as matrix-vector products over the blocks as the GGUF holds them (NVFP4, Q8_0,
 /// Q5_K, Q6_K), one launch a phase.  Slot s (S of them): its expert's blob at blob[s] (gate | up | down: eb0, eb1 bytes
@@ -197,6 +205,7 @@ void mv_blocks(int type, const uint8_t* W, int N, int K, const float* x, float* 
 constexpr int kGroupMax = 8;
 void experts_gate_up_g(const uint8_t* const* blob, const int* n, const int* tok, const int* row, int G, int ty_gate,
                        int ty_up, size_t eb0, const float* x, int C, int F, float* gu, cudaStream_t s);
+void enable_grouped_tensor_products(bool enabled);
 void experts_down_g(const uint8_t* const* blob, const int* n, const int* row, int G, int ty_down, size_t off_down,
                     const uint16_t* h, int C, int F, float* y, cudaStream_t s);
 /// Fused gate+up+softcapped-SwiGLU straight to h [S][F] FP16 (or h[row[g*8+t]][F] in _g, where sg/su are also
@@ -211,7 +220,8 @@ void experts_gate_up_swiglu_rows(const uint8_t* const* blob, const int* tok, int
                                  float ucap, uint16_t* h, const int* orow, int h_ld, cudaStream_t s);
 void experts_gate_up_swiglu_g(const uint8_t* const* blob, const int* n, const int* tok, const int* row, int G,
                               int ty_gate, int ty_up, size_t eb0, const float* x, int C, int F, const float* sg,
-                              const float* su, float gcap, float ucap, uint16_t* h, cudaStream_t s);
+                              const float* su, float gcap, float ucap, uint16_t* h, cudaStream_t s,
+                              const uint16_t* input16 = nullptr);
 
 /// Fused attention-input prep: l2clip(q) in place, l2clip(k_in) -> FP16 kc[slot], rms(v_in) -> FP16 vc[slot],
 /// l2clip(r) in place, where slot = kv_cap > 0 ? (pos0 + t) % kv_cap : (pos0 + t).  pos may be null (sliding layers).
@@ -287,8 +297,6 @@ struct MvAlt {
     const float* x = nullptr;
     int r0 = 0, n = 0;
 };
-/// y [T][ldy] = W . x for a planar Q8_0 matrix (q8, d as mv_q8p's) and T <= a few tokens x [T][K] FP16, on the
-/// tensor cores (a value times its block scale rounded to FP16, as the prompt path's decode_q8p_f16).
 void q8_tile(const int8_t* q, const uint16_t* d, int N, int K, const uint16_t* x, int T, float* y, int ldy,
              cudaStream_t s);
 void mv_q8p_conv(const int8_t* q, const uint16_t* d, int N, int K, const float* x, float* y, const MvConv& c0,
@@ -309,7 +317,7 @@ void route_gather(const int* top, const float* w, const uint8_t* const* tab, con
 void route_token(const float* logits, const float* bias, int E, int K, float scale, const uint8_t* const* tab,
                  const float* sg_t, const float* su_t, const float* sd_t, int* top, float* w, const uint8_t** blob,
                  int* tok, int* inv, float* sg, float* su, float* wt, cudaStream_t s, const float* x = nullptr,
-                 int width = 0, uint16_t* x_limbs = nullptr);
+                 int width = 0, void* packed = nullptr, bool q8 = false, uint16_t* x_limbs = nullptr);
 /// prep_qkv_r_f16 / _fp8 of one token whose position is at pos (device): the cache slot from it, and with log_scale
 /// (a full layer) q's and r's tau.  q16 (given): an FP16 copy of the clipped q, [H][D] (attn_decode_mma's).
 /// sink_w (given): the token's sinks in the same launch, sink_y [H] = sink_w [H][sink_k] (FP16) . sink_x (mv_f16's).
