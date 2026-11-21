@@ -615,6 +615,10 @@ struct Dev {
     cudaEvent_t hc_go = nullptr, hc_done = nullptr;
     unsigned* hc_cnt = nullptr;   // (DS4_HC_MIX_SPLIT) hc_mix_split's counters: kWin for st, then kWin for st2
     size_t free0 = 0, total = 0, weights = 0, experts = 0, caches = 0, scratch = 0;
+    // (#1026) the VRAM this PC's start and requests allocate after the experts' plan (measured, kept in
+    // <pack>/vram-late.txt): kept free beside the reserve, so the reserve is what stays free; late_kept: the file's
+    // figure, fr_min: the least free VRAM this run has seen
+    size_t late = 0, late_kept = 0, fr_min = ~(size_t) 0;
     // (the Monitor's map: the prompt chunks' buffers, out of scratch; of the weights, the copies a group's members
     // each hold of the tensors they do not split - what tensor parallel costs beyond one copy, its members' share)
     size_t prompt = 0, tp_w = 0;
@@ -1944,6 +1948,7 @@ struct Model::Impl {
     // between requests (the serve loop, the CLI's prompt): the switch back on, when the page cache lost most of what
     // the last answer left in it
     void begin_request() {
+        late_check(false);   // (#1026: what the requests before allocated after the plan - their restore points ...)
         if (!disk_skip_auto) return;
         SkipAuto& a = sk_auto;
         ++a.requests;
@@ -3694,6 +3699,7 @@ struct Model::Impl {
             }
             CK(mem_info(&d.free0, &d.total));
         }
+        late_read();   // (#1026: what this PC's start and requests took after the plan before - kept free beside it)
         // abliteration: the direction read once, a copy on every device (projected out at each hc_post: ablate())
         if (!o.ablate.empty() && !o.vision_only) {
             abl_scale = o.ablate_scale;
@@ -3945,7 +3951,7 @@ struct Model::Impl {
                 (n.find(".ffn.experts.") != std::string::npos ? exp_b : other_b) += (double) kt.second.bytes;
             }
             for (const Dev& d : devs)
-                room += std::max(0.0, (double) d.free0 - (double) ((size_t) o.reserve_mib << 20) -
+                room += std::max(0.0, (double) d.free0 - (double) keep_b(d) -
                                           (prompt_par ? 1.5 : 0.4) * (1 << 30)) *
                         o.vram_experts;
             file_experts = exp_b - std::max(0.0, room - other_b) + (double) ram_margin() > (double) ram_avail();
@@ -3976,7 +3982,7 @@ struct Model::Impl {
                 (n.find(".ffn.experts.") != std::string::npos ? exp_b : other_b) += (double) kt.second.bytes;
             }
             for (const Dev& d : devs)
-                room += std::max(0.0, (double) d.free0 - (double) ((size_t) o.reserve_mib << 20) - 1.5 * (1 << 30)) *
+                room += std::max(0.0, (double) d.free0 - (double) keep_b(d) - 1.5 * (1 << 30)) *
                         o.vram_experts;
             const double cpu_share = exp_b > 0 ? 1.0 - std::min(1.0, std::max(0.0, room - other_b) / exp_b) : 0.0;
             chunk = cpu_share >= 0.4 ? 8192 : 4096;
@@ -4088,14 +4094,14 @@ struct Model::Impl {
             l.dense_bytes = b;
         }
         const size_t head_b = mat_bytes("head") + (size_t) g.vocab * 4 + (16u << 20);
-        const size_t per_dev_fixed = (size_t) o.reserve_mib << 20;
+        // (each device's reserve: keep_b - the asked one plus what this PC's start measured it takes after the plan)
         const size_t kv_per_src_dev = 0;   // counted after the split
         (void) kv_per_src_dev;
         std::vector<double> avail(groups.size(), 0.0);
         double avail_sum = 0;
         for (size_t gi = 0; gi < groups.size(); ++gi) {
             for (int m : groups[gi].mem)
-                avail[gi] += std::max(0.0, (double) devs[(size_t) m].free0 - (double) per_dev_fixed - 400.0 * (1 << 20));
+                avail[gi] += std::max(0.0, (double) devs[(size_t) m].free0 - (double) keep_b(devs[(size_t) m]) - 400.0 * (1 << 20));
             avail_sum += avail[gi];
         }
         double need_sum = (double) head_b;
@@ -4129,7 +4135,7 @@ struct Model::Impl {
                     const int nm = (int) groups[(size_t) gi].mem.size();
                     double mn = 1e300;
                     for (int m : groups[(size_t) gi].mem)
-                        mn = std::min(mn, std::max(0.0, (double) devs[(size_t) m].free0 - (double) per_dev_fixed -
+                        mn = std::min(mn, std::max(0.0, (double) devs[(size_t) m].free0 - (double) keep_b(devs[(size_t) m]) -
                                                             400.0 * (1 << 20) - 1.1 * (1 << 30)));   // (the chunk's buffers)
                     cap[(size_t) gi] = mn * nm;
                 }
@@ -4242,7 +4248,7 @@ struct Model::Impl {
                 }
             }
             const Dev& d = devs[di];
-            const double room = (double) d.free0 - (double) ((size_t) o.reserve_mib << 20);
+            const double room = (double) d.free0 - (double) keep_b(d);
             if (!whole || need <= 0 || need <= room) continue;
             char msg[1024];
             std::snprintf(msg, sizeof msg,
@@ -4765,7 +4771,7 @@ struct Model::Impl {
                 cudaSetDevice(d.id);
                 size_t fr = 0, tot = 0;
                 CK(mem_info(&fr, &tot));
-                room += std::max(0.0, (double) fr - (double) ((size_t) o.reserve_mib << 20)) * o.vram_experts;
+                room += std::max(0.0, (double) fr - (double) keep_b(d)) * o.vram_experts;
             }
             for (const Layer& l : L) all += (double) l.blob * l.n_exp;
             const double need = std::max(0.0, all - room - (double) helper_cap);   // (DS4_HELPER: its pool's)
@@ -5157,6 +5163,7 @@ struct Model::Impl {
                 std::fprintf(stderr, "ds4 pool: %s - every layer runs here\n", e.c_str());
             }
         }
+        late_check(true);   // (#1026: what the start took after the experts' plan, against the reserve)
         return true;
     }
 
@@ -5325,7 +5332,7 @@ struct Model::Impl {
             const double rows = (double) lay_chunk(tc, C, nullptr, 2);
             bool ok = true;
             for (const Dev& d : devs) {
-                const double room = std::max(0.0, (double) d.free0 - (double) ((size_t) o.reserve_mib << 20)) * o.vram_experts -
+                const double room = std::max(0.0, (double) d.free0 - (double) keep_b(d)) * o.vram_experts -
                                     other_b / (double) devs.size() - 0.6e9;
                 ok = ok && rows <= room / 2.0;
             }
@@ -5587,7 +5594,7 @@ struct Model::Impl {
                 size_t fr = 0, tot = 0;
                 CK(mem_info(&fr, &tot));
                 const double room =
-                    std::max(0.0, (double) fr - (double) ((size_t) o.reserve_mib << 20)) * o.vram_experts;
+                    std::max(0.0, (double) fr - (double) keep_b(d)) * o.vram_experts;
                 c.ring_stride = stride;
                 if (rm == nullptr || rm[0] == '\0') {
                     const double link = link_h2d(d);
@@ -7270,7 +7277,7 @@ struct Model::Impl {
             if (n.find(".ffn.experts.") != std::string::npos) exp_b += (double) kt.second.bytes;
         }
         for (const Dev& d : devs)
-            room += std::max(0.0, (double) d.free0 - (double) ((size_t) o.reserve_mib << 20)) * o.vram_experts;
+            room += std::max(0.0, (double) d.free0 - (double) keep_b(d)) * o.vram_experts;
         if (exp_b <= 0 || all_b <= room) return true;   // (every expert fits: the lead keeps them, no hand-offs)
         const int n = g.n_mtp, base = n / nm, extra = n % nm;
         for (int m = 0; m < nm; ++m)
@@ -7519,7 +7526,7 @@ struct Model::Impl {
             cudaSetDevice(d.id);
             size_t fr = 0, tot = 0;
             CK(mem_info(&fr, &tot));
-            const double room_e = std::max(0.0, (double) fr - (double) ((size_t) o.reserve_mib << 20)) * o.vram_experts;
+            const double room_e = std::max(0.0, (double) fr - (double) keep_b(d)) * o.vram_experts;
             const size_t need = lay_chunk(c, chunk, nullptr, 2);
             if (!mixed && room_e >= 2.0 * (double) need) continue;   // (the chunk default's bound: at most half the room)
             c.borrow = false;
@@ -7545,7 +7552,7 @@ struct Model::Impl {
                 size_t fr = 0, tot = 0;
                 CK(mem_info(&fr, &tot));
                 const double room_e =
-                    std::max(0.0, (double) fr - (double) ((size_t) o.reserve_mib << 20)) * o.vram_experts;
+                    std::max(0.0, (double) fr - (double) keep_b(d)) * o.vram_experts;
                 lend = lend && room_e >= 2.0 * (double) lay_chunk(*chunks[(size_t) m], chunk, nullptr, 2);
             }
             if (!any || lend) continue;
@@ -7627,7 +7634,7 @@ struct Model::Impl {
                 if (gone > (double) (1 << 30))
                     std::fprintf(stderr, "ds4: WARNING - CUDA%d: %.1f GB went to other programs while the engine loaded "
                                          "(nvidia-smi lists them) - the experts' plan works around it\n", dm.id, gone / 1e9);
-                mroom.push_back(std::max(0.0, ((double) fr - (double) ((size_t) o.reserve_mib << 20))) * o.vram_experts);
+                mroom.push_back(std::max(0.0, ((double) fr - (double) keep_b(dm))) * o.vram_experts);
                 own.push_back(mroom.back());
                 charged = charged || commit_charged(devs[(size_t) m]);
             }
@@ -8949,6 +8956,86 @@ struct Model::Impl {
     // 0 of every pick count streamed) decoded 17-19% slower with it.  At the start it is off when the pack's times file
     // says this GPU's PCIe lane streamed nothing at an earlier start (its "lane off") or the lane is off (DS4_STREAM=0);
     // else on until the load's plan (one_gpu_plan, after the lane's timing) finds that nothing streams
+    // (#1026) --reserve-mib held for the whole run.  The experts' plan (place_experts, and every room estimate before
+    // it) takes the free VRAM less the reserve - but the start allocates more after the plan (the prompt path's
+    // GEMM workspaces, the CPU lane's and the light sets' scratch, graphs, a request's restore points ...), and that
+    // came out of the reserve: on an 8 GB card the reserve was gone by the first request, whatever its size, and a
+    // request's small allocations failed.  So what this PC's start and requests take after the plan is measured
+    // (late_check: the least free VRAM once loaded and between requests, against the reserve), kept per GPU, pack, build and settings in <pack>/vram-late.txt (MAYA_DS4_LATE_FILE=<file>, =none:
+    // not kept), and kept free beside the reserve from the next start on (keep_b); a start that finds the reserve
+    // short says so, with what the next start keeps free.  MAYA_DS4_LATE_MB=<n>: n MiB a GPU instead of the
+    // measured figure (0: the reserve alone, v1.1.72's plan).
+    size_t keep_b(const Dev& d) const { return ((size_t) std::max<int64_t>(0, o.reserve_mib) << 20) + d.late; }
+    std::string late_file() const {
+        const char* f = std::getenv("MAYA_DS4_LATE_FILE");
+        return f == nullptr ? o.pack + "/vram-late.txt" : std::string(f) == "none" ? "" : f;
+    }
+    std::string late_key(size_t di) const {
+        return lane_dev_key((int) di) + " | late ctx " + std::to_string(o.max_context) + " seqs " +
+               std::to_string(o.seqs) + " tp " + std::to_string(o.tp) + " chunk " + std::to_string(o.prefill_chunk) +
+               " dspark " + std::to_string((int) o.dspark) + " vision " + std::to_string((int) o.vision) + " share " +
+               std::to_string((int) (o.vram_experts * 1000));
+    }
+    void late_read() {
+        const char* fixed = ds4_env("DS4_LATE_MB");
+        const std::string f = late_file();
+        for (size_t di = 0; di < devs.size(); ++di) {
+            Dev& d = devs[di];
+            if (fixed != nullptr) {
+                d.late = (size_t) std::max(0LL, std::atoll(fixed)) << 20;
+            } else if (!f.empty()) {
+                const std::string v = pcie::cal_get(f, late_key(di));
+                d.late = d.late_kept = v.empty() ? 0 : (size_t) std::max(0LL, std::atoll(v.c_str())) << 20;
+                // (the default reserve, not asked for: v1.1.72's plan wherever it holds what the run takes after the
+                //  plan with 128 MiB to spare - only a PC whose default reserve it uses up keeps more free)
+                const size_t res = (size_t) std::max<int64_t>(0, o.reserve_mib) << 20;
+                if (!o.reserve_given && d.late + (128u << 20) <= res) d.late = 0;
+            }
+            if (d.late > 0)
+                std::fprintf(stderr, "ds4: CUDA%d keeps %zu MiB free beside the %lld MiB reserve: what this PC's start "
+                                     "and requests allocate after the experts' plan%s\n", d.id, d.late >> 20,
+                             (long long) o.reserve_mib, fixed != nullptr ? " (MAYA_DS4_LATE_MB)" : " (measured before)");
+        }
+    }
+    // once loaded (`loaded`) and between requests: the least free VRAM this run has seen against the reserve - the
+    // figure the next start keeps beside it is this start's plus what is short (less what is over), at most a quarter
+    // of the card (not another program's), in steps of 32 MiB; written when it moves by 32 MiB or more, and a reserve
+    // found short is said (once a step)
+    void late_check(bool loaded) {
+        if (ds4_env("DS4_LATE_MB") != nullptr) return;
+        int cur = 0;
+        if (cudaGetDevice(&cur) != cudaSuccess) (void) cudaGetLastError();
+        const std::string f = late_file();
+        const int64_t res = (int64_t) std::max<int64_t>(0, o.reserve_mib) << 20, step = 32ll << 20;
+        for (size_t di = 0; di < devs.size(); ++di) {
+            Dev& d = devs[di];
+            size_t fr = 0, tot = 0;
+            if (cudaSetDevice(d.id) != cudaSuccess || mem_info(&fr, &tot) != cudaSuccess) {
+                (void) cudaGetLastError();
+                continue;
+            }
+            if (loaded)
+                std::fprintf(stderr, "ds4: CUDA%d: %zu MiB of VRAM free with everything loaded (the reserve %lld MiB%s)\n",
+                             d.id, fr >> 20, (long long) (res >> 20),
+                             d.late > 0 ? (", " + std::to_string(d.late >> 20) + " MiB more kept beside it").c_str() : "");
+            if (fr >= d.fr_min) continue;
+            d.fr_min = fr;
+            int64_t want = (int64_t) d.late + res - (int64_t) fr;
+            want = std::min<int64_t>(std::max<int64_t>(0, want), (int64_t) tot / 4);
+            want = (want + step - 1) / step * step;
+            if (std::llabs(want - (int64_t) d.late_kept) < step) continue;
+            if ((int64_t) fr + 2 * step < res && (o.reserve_given || want + 4 * step > res))   // (late_read keeps it)
+                std::fprintf(stderr, "ds4: WARNING - CUDA%d: %zu MiB free, short of the %lld MiB reserve - the next start "
+                                     "keeps %lld MiB free beside it for what the start and the requests allocate after "
+                                     "the experts' plan%s\n", d.id, fr >> 20, (long long) (res >> 20),
+                             (long long) (want >> 20), f.empty() ? " (MAYA_DS4_LATE_FILE=none: not kept)" : "");
+            d.late_kept = (size_t) want;
+            if (!f.empty())
+                pcie::cal_put(f, late_key(di), std::to_string(want >> 20),
+                              [](const std::string& a, const std::string& b) { return os::replace_file(a, b); });
+        }
+        cudaSetDevice(cur);
+    }
     std::string lane_file() const {   // the PCIe lane's times file ("": none)
         const char* cf = std::getenv("DS4_LANE_CAL");
         return cf == nullptr ? o.pack + "/lane-times.txt" : std::string(cf) == "none" ? "" : cf;
@@ -16145,7 +16232,7 @@ struct Model::Impl {
             CK(cudaSetDevice(d.id));
             size_t fr = 0, tot = 0;
             CK(mem_info(&fr, &tot));
-            const double room = std::max(0.0, (double) fr - (double) ((size_t) o.reserve_mib << 20)) * o.vram_experts;
+            const double room = std::max(0.0, (double) fr - (double) keep_b(d)) * o.vram_experts;
             if (exp_b <= room) continue;   // (every expert of its layers fits)
             if (ln_force.empty() &&
                 pcie::baseline_lane_off(ln_force, pcie::cal_get(ln_file, lane_dev_key((int) di) + " | lane"))) continue;
