@@ -30,7 +30,14 @@ constexpr int kQ8_0 = 8, kQ6_K = 14;
 ///   kActSwiglu  DeepSeek's clamped SwiGLU: g = min(g, limit), u = clamp(u, -limit, limit), silu(g) u (limit 0: none)
 ///   kActOai     MiniMax's swigluoai (gpt-oss's, llama.cpp's LLM_FFN_SWIGLU_OAI_MOE): the same clamps, then
 ///               g sigmoid(kOaiAlpha g) (u + 1)
-constexpr int kActSwiglu = 0, kActOai = 1;
+///   kActSitu    Inkling 2's SITU (llama.cpp's LLM_FFN_SITU, its operations in ggml's order): with beta = situ_beta
+///               and lb = situ_lb, beta tanh(g / beta) sigmoid(g) * (lb > 0 ? lb tanh(u / lb) : u) - no limit.  Gate
+///               and up of one type (tu 0 or tg; else false), situ_beta > 0 (else false).  Every form takes it: the
+///               token and window kernels (gate_up), the sets (set_gate_up: light experts and the tiles - F32, or the
+///               tensor cores'), light_gate_up and situ_f16; not MXFP4's light form, nor maya-ds4's AMD prompt paths
+///               (the MMQ experts and the fused RDNA int8 experts: DeepSeek's shapes and SwiGLU only - a SITU set
+///               takes the tiles there).  The down's SetArgs may keep act (set_down ignores it).
+constexpr int kActSwiglu = 0, kActOai = 1, kActSitu = 2;
 constexpr float kOaiAlpha = 1.702f;
 
 /// Whether the routed experts' kernels take this ggml type.
@@ -68,11 +75,13 @@ struct Args {
     float* h = nullptr;      // [entries][n_ff]: the activation (act's)
     float* part = nullptr;   // [entries][n_embd]: each entry's down output
     int tg = 0, td = 0;      // gate / up's type, down's
-    int act = kActSwiglu;    // the activation (kActOai: MiniMax's)
+    int act = kActSwiglu;    // the activation (kActOai: MiniMax's, kActSitu: Inkling 2's)
     int tu = 0;              // (kActOai) the up's type when it is not the gate's (0: tg): gate and up then in two passes,
                              // the gate's sums in h first - each value the same as one pass gives
     int pexp = 0;            // 1: the token kernels' SwiGLU takes exp_portable (ds4_par_exp.h, DS4_LANE_PARITY), the
                              // CPU lane's exp bit for bit, in place of CUDA's expf (its ex2.approx)
+    float situ_beta = 4.0f;  // (kActSitu) the gate's softcap beta and the up's lb (lb <= 0: the up as it is) - Inkling 2's
+    float situ_lb = 25.0f;   // (GGUF inkling2.activation.situ_beta / situ_linear_beta)
 };
 /// grid (n_ff / 8, groups): h of every entry (ne_max: a group's most entries).  false: a type not covered.
 bool gate_up(const Args& a, int groups, int ne_max, cudaStream_t s);
@@ -106,6 +115,8 @@ struct SetArgs {
     int act = kActSwiglu;      // the activation (Args::act)
     int tu = 0;                // (kActOai) the up's type when it is not the gate's (0: tg) - two passes, as Args::tu
     float* graw = nullptr;     // ... the gate's F32 sums between them: [local rows][n_ff] (the caller's scratch)
+    float situ_beta = 4.0f;    // (kActSitu) as Args::situ_beta / situ_lb
+    float situ_lb = 25.0f;
 };
 #if defined(STRATA_USE_HIP)
 // Host metadata for a prompt set, valid only within this scope; nested calls restore their caller's metadata.
@@ -143,6 +154,8 @@ bool f16_rows(int type, const uint8_t* w, int k, int n, uint16_t* dst, int ldd, 
 void gather_f16(const uint16_t* x, int ldx, const int* idx, int n, int k, uint16_t* dst, cudaStream_t s);
 /// h[r][c] = FP16 of the tiles' clamped SwiGLU of gu[r][c] (gate) and gu[r][ff + c] (up), F32 rows ld apart
 void swiglu_f16(const float* gu, int ld, int n, int ff, float limit, uint16_t* h, int ldh, cudaStream_t s);
+/// The same with the tiles' SITU (kActSitu: beta, lb as Args::situ_beta / situ_lb)
+void situ_f16(const float* gu, int ld, int n, int ff, float beta, float lb, uint16_t* h, int ldh, cudaStream_t s);
 /// The light form alone (the set's experts of at most 16 rows; the others untouched), for any of these types and MXFP4
 /// (tg / td 39: ds4_gguf.cu's experts): false (nothing launched) when it is switched off - the caller's tiles take every
 /// expert then; true: they take those of more rows (skip_le 16).

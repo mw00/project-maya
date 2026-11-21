@@ -1571,8 +1571,42 @@ void iq_cpu_quant(int act, const float* x, int k, void* dst) {
     kc::native_quant_act(n, x, dst);
 }
 
+namespace {
+// Inkling 2's SITU (ds4_iq.cu's situ: llama.cpp's LLM_FFN_SITU, ggml's operations in its order; no multiply-add in it)
+float situ(float g, float u, float beta, float lb) {
+    const float a = std::tanh(g * (1.0f / beta)) * beta * (1.0f / (1.0f + std::exp(-g)));
+    const float v = lb > 0.0f ? std::tanh(u * (1.0f / lb)) * lb : u;
+    return a * v;
+}
+// IqCpu::act kIqActSitu: the gate's and the up's rows [r0, r1) for the nt tokens - each the dot iq_cpu_rows takes for
+// its type (ds4's own rows where they are ggml's bits, the GLM lane's exact rows, ggml-cpu's dot: the same numbers as
+// the SwiGLU's gate / up below) - then the SITU of them
+void situ_gate_up(const IqCpu& f, const uint8_t* gate, const uint8_t* up, const void* const* act, int nt,
+                  float* const* ff, int r0, int r1) {
+    if (r1 <= r0 || nt <= 0) return;
+    const int nr = r1 - r0;
+    thread_local std::vector<float> buf;
+    thread_local std::vector<float*> go, uo;
+    buf.resize((size_t) 2 * nt * nr);
+    go.resize((size_t) nt);
+    uo.resize((size_t) nt);
+    for (int t = 0; t < nt; ++t) {
+        go[(size_t) t] = buf.data() + (size_t) t * nr;
+        uo[(size_t) t] = buf.data() + (size_t) (nt + t) * nr;
+    }
+    iq_cpu_rows(f.tg, gate + (size_t) r0 * f.gu_row, f.gu_row, f.n_embd, act, nt, go.data(), 0, nr);
+    iq_cpu_rows(f.tg, up + (size_t) r0 * f.gu_row, f.gu_row, f.n_embd, act, nt, uo.data(), 0, nr);
+    for (int t = 0; t < nt; ++t)
+        for (int r = 0; r < nr; ++r) ff[t][r0 + r] = situ(go[(size_t) t][r], uo[(size_t) t][r], f.situ_beta, f.situ_lb);
+}
+}  // namespace
+
 void iq_cpu_gate_up(const IqCpu& f, const uint8_t* gate, const uint8_t* up, const void* const* act, int nt,
                     float* const* ff, int r0, int r1, float limit) {
+    if (f.act == kIqActSitu) {
+        situ_gate_up(f, gate, up, act, nt, ff, r0, r1);
+        return;
+    }
     if (r1 > r0 && own_nt(f.tg, nt)) {   // (native_gu_rows_split's epilogue, on the same values)
         const int nr = r1 - r0;
         thread_local std::vector<float> buf;
