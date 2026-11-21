@@ -1964,23 +1964,19 @@ __host__ __device__ __forceinline__ float ue4m3(uint8_t x) {   // ggml_ue4m3_to_
     const float v = (e == 0u) ? sub_f : norm_f;
     return (x == 0x7Fu) ? 0.0f : v;
 }
-// IQ3_XXS / IQ4_XS tables: a device copy (read with __ldg: lanes index them divergently) and a host copy.
-__device__ const uint32_t d_iq3xxs_grid[256] = {IK2_IQ3XXS_GRID};
-static const uint32_t h_iq3xxs_grid[256] = {IK2_IQ3XXS_GRID};
-__device__ const int8_t d_iq4nl[16] = {IK2_IQ4NL_VALUES};
-static const int8_t h_iq4nl[16] = {IK2_IQ4NL_VALUES};
+// IQ3_XXS / IQ4_XS tables: ggml's (ik2_iq_tables.h), the device copy read with __ldg, the host copy on the host.
 __host__ __device__ __forceinline__ uint32_t iq3xxs_grid_at(int i) {
 #ifdef __CUDA_ARCH__
-    return __ldg(d_iq3xxs_grid + i);
+    return __ldg(ik2_iq::dev::iq3xxs_grid + i);
 #else
-    return h_iq3xxs_grid[i];
+    return ik2_iq::host::iq3xxs_grid[i];
 #endif
 }
 __host__ __device__ __forceinline__ int iq4nl_at(int i) {
 #ifdef __CUDA_ARCH__
-    return d_iq4nl[i];
+    return ik2_iq::dev::kvalues_iq4nl[i];
 #else
-    return h_iq4nl[i];
+    return ik2_iq::host::kvalues_iq4nl[i];
 #endif
 }
 // ggml's ksigns_iq2xs[s]: the 7 sign bits plus an 8th that makes the count of set bits even
@@ -2144,7 +2140,8 @@ __device__ __forceinline__ float iq3xxs_sub_dot(const uint8_t* b, int ib32, cons
 #pragma unroll
     for (int l = 0; l < 4; ++l) {
         const uint32_t qq = __ldg(qs + l);
-        const uint32_t g1 = __ldg(d_iq3xxs_grid + (qq & 0xFFu)), g2 = __ldg(d_iq3xxs_grid + (qq >> 8));
+        const uint32_t g1 = __ldg(ik2_iq::dev::iq3xxs_grid + (qq & 0xFFu));
+        const uint32_t g2 = __ldg(ik2_iq::dev::iq3xxs_grid + (qq >> 8));
         const uint32_t sg = iq_signs8((aux >> (7 * l)) & 127u);
         a += sdot4_u8(g1, sg, xv[2 * l]) + sdot4_u8(g2, sg >> 4, xv[2 * l + 1]);
     }
@@ -4008,7 +4005,8 @@ __global__ void decode_f16_iq_kernel(int type, const uint8_t* blocks, size_t nsu
 #pragma unroll
         for (int l = 0; l < 4; ++l) {
             const uint32_t qq = __ldg(qs + l);
-            const uint32_t g1 = __ldg(d_iq3xxs_grid + (qq & 0xFFu)), g2 = __ldg(d_iq3xxs_grid + (qq >> 8));
+            const uint32_t g1 = __ldg(ik2_iq::dev::iq3xxs_grid + (qq & 0xFFu));
+            const uint32_t g2 = __ldg(ik2_iq::dev::iq3xxs_grid + (qq >> 8));
             const uint32_t sg = iq_signs8((aux >> (7 * l)) & 127u);
 #pragma unroll
             for (int j = 0; j < 4; ++j) {
@@ -4026,8 +4024,8 @@ __global__ void decode_f16_iq_kernel(int type, const uint8_t* blocks, size_t nsu
 #pragma unroll
         for (int j = 0; j < 16; ++j) {
             const uint8_t v = __ldg(q + j);
-            y[j] = dl * (float) d_iq4nl[v & 0xF];
-            y[16 + j] = dl * (float) d_iq4nl[v >> 4];
+            y[j] = dl * (float) ik2_iq::dev::kvalues_iq4nl[v & 0xF];
+            y[16 + j] = dl * (float) ik2_iq::dev::kvalues_iq4nl[v >> 4];
         }
     }
     uint32_t* o = (uint32_t*) (out + sb * 32);

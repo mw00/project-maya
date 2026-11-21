@@ -615,8 +615,9 @@ std::vector<uint8_t> rand_blocks(int type, size_t n_values) {
 }
 
 // ggml's dequantize_row_iq3_xxs / dequantize_row_iq4_xs, transcribed (ksigns_iq2xs[i] = i | parity(i) << 7)
-static const uint32_t g_iq3xxs_grid[256] = {IK2_IQ3XXS_GRID};
-static const int8_t g_iq4nl[16] = {IK2_IQ4NL_VALUES};
+// (ggml's tables themselves: ik2_iq_tables.h reads them from third_party/ggml/ggml-common.h)
+static const uint32_t* const g_iq3xxs_grid = ik2_iq::host::iq3xxs_grid;
+static const int8_t* const g_iq4nl = ik2_iq::host::kvalues_iq4nl;
 void ggml_iq3_xxs(const uint8_t* x, float* y, size_t k) {
     for (size_t i = 0; i < k / 256; ++i) {
         const uint8_t* blk = x + i * 98;
