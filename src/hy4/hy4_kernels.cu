@@ -3076,7 +3076,10 @@ void publish(const float* src, float* dst, size_t n, unsigned* counter, unsigned
         return;
     }
     const size_t n4 = n / 4;
-    const int blocks = (int) std::max<size_t>(1, std::min<size_t>(16, (n4 + 255) / 256));
+    // (3 blocks at most, as the read-back's: a window's partial went out on up to 16 - measured equal or about 1%
+    //  slower on eight RTX 5060 Ti.  HY4_PUB_BLOCKS: another count)
+    static const size_t pub_blocks = std::getenv("HY4_PUB_BLOCKS") ? (size_t) std::atoll(std::getenv("HY4_PUB_BLOCKS")) : 3;
+    const int blocks = (int) std::max<size_t>(1, std::min<size_t>(std::max<size_t>(1, pub_blocks), (n4 + 255) / 256));
     publish_kernel<<<blocks, 256, 0, s>>>((const float4*) src, (float4*) dst, n4, counter, flag, v, (const float4*) plus);
     check("publish");
     submit(s);
