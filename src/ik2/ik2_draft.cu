@@ -154,6 +154,7 @@ struct Drafter {
     int n_rows = 0;
     const int8_t* head_q8 = nullptr;      // the target's head as planar Q8_0 (set_head_q8): the base logits through it
     const uint16_t* head_q8d = nullptr;
+    bool head_tiles = true;               // its product on the tensor cores (q8_tile: sm_80 on), else mv_q8p_cols
     int* shortlist = nullptr;
     float* shortlist_scores = nullptr;
     cublasHandle_t blas;
@@ -501,7 +502,9 @@ void propose(Drafter* d, int anchor, const float* anchor_h, int P, const uint16_
     k::rms(d->res, d->norm, T, C, d->eps, d->h, d->s);   // the draft hidden, rows 1 .. 7 used
     // base logits of rows 1 .. 7 through the target's head
     k::to_f16(d->h + C, (size_t) proposals * C, (uint16_t*) d->x16, d->s);
-    if (d->head_q8)
+    if (d->head_q8 && !d->head_tiles)
+        k::mv_q8p_cols(d->head_q8, d->head_q8d, n_rows, C, d->h + C, C, proposals, d->base, n_rows, d->s);
+    else if (d->head_q8)
         k::q8_tile(d->head_q8, d->head_q8d, n_rows, C, (const uint16_t*) d->x16, proposals, d->base, n_rows, d->s);
     else
         gemm_h(d, lm_f16, n_rows, C, d->x16, proposals, d->base, n_rows);
@@ -533,6 +536,12 @@ void propose(Drafter* d, int anchor, const float* anchor_h, int P, const uint16_
 }
 
 size_t bytes(const Drafter* d) { return d->vram; }
-void set_head_q8(Drafter* d, const int8_t* q8, const uint16_t* q8d) { d->head_q8 = q8, d->head_q8d = q8d; }
+void set_head_q8(Drafter* d, const int8_t* q8, const uint16_t* q8d) {
+    d->head_q8 = q8, d->head_q8d = q8d;
+    int dev = 0, major = 0;
+    cu(cudaGetDevice(&dev), "cudaGetDevice");
+    cu(cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev), "cudaDeviceGetAttribute");
+    d->head_tiles = major >= 8;   // (no mma.sync m16n8k16 before Ampere)
+}
 
 }  // namespace ik2::draft

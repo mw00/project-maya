@@ -478,4 +478,20 @@ void experts_block_down_q8(const uint8_t* const* blob, const int* n, const int* 
 void attn_res_jobs_block(const ResStates& states, int n, const float* q, int nq, int jobs, int T, int C, float eps,
                          float* out, cudaStream_t s);
 
+// ---- the exact window: the one-token path's arithmetic for each of a window's tokens (drafting on = off)
+/// y [T][N] (rows y_ld apart) = W . x [T][K] (rows x_ld apart, F32) for a planar Q8_0 matrix: each token's row sums
+/// mv_q8p's to the bit (T <= 8), the matrix read once.
+void mv_q8p_cols(const int8_t* q, const uint16_t* d, int N, int K, const float* x, int x_ld, int T, float* y, int y_ld,
+                 cudaStream_t s);
+/// experts_gate_up_swiglu / experts_down for group_route's groups: each member's h / y the one-token kernels' to the
+/// bit (x [T][C] F32; h [slot][F]; y [slot][C]), an expert's rows read once from memory for its members.
+void experts_gate_up_swiglu_mem(const uint8_t* const* blob, const int* n, const int* tok, const int* row, int G,
+                                int ty_gate, int ty_up, size_t eb0, const float* x, int C, int F, const float* sg,
+                                const float* su, float gcap, float ucap, uint16_t* h, cudaStream_t s);
+void experts_down_mem(const uint8_t* const* blob, const int* n, const int* row, int G, int ty_down, size_t off_down,
+                      const uint16_t* h, int C, int F, float* y, cudaStream_t s);
+/// experts_block_gu / _down give experts_gate_up_swiglu_mma / experts_down_mma's values to the bit (their warp
+/// splits the same: IK2_EXPERT_MMA_SPLIT 8, _DOWN 4, the defaults).
+bool experts_block_exact();
+
 }  // namespace ik2::k
