@@ -2,7 +2,7 @@
 // tensor-core GEMMs of batched prompt processing.
 //
 // One thread per 32-element group, transcribed from the reference `dequantize_row_*` functions of the pinned
-// llama.cpp (`ggml/src/ggml-quants.c`, MIT): Q4_0 (2), Q5_0 (6), Q8_0 (8), Q3_K (11), Q4_K (12), Q5_K (13), Q6_K (14),
+// llama.cpp (`ggml/src/ggml-quants.c`, MIT): Q4_0 (2), Q5_0 (6), Q5_1 (7), Q8_0 (8), Q3_K (11), Q4_K (12), Q5_K (13), Q6_K (14),
 // IQ4_NL (20), IQ4_XS (23) and Q2_0 (42).  A row-major (n_rows, n_cols) tensor of blocks becomes a row-major BF16
 // matrix; `n_cols` must be a multiple of the type's block size.
 #pragma once

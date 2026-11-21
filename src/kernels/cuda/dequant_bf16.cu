@@ -1,7 +1,7 @@
 // src/kernels/cuda/dequant_bf16.cu - see include/strata/kernels/dequant_bf16.hpp.
 //
 // Arithmetic transcribed from ggml/src/ggml-quants.c at the pinned llama.cpp (MIT License, Copyright (c) 2023-2026
-// The ggml authors): dequantize_row_q2_0/q4_0/q5_0/q8_0/q3_K/q4_K/q5_K/q6_K/iq4_nl/iq4_xs.
+// The ggml authors): dequantize_row_q2_0/q4_0/q5_0/q5_1/q8_0/q3_K/q4_K/q5_K/q6_K/iq4_nl/iq4_xs.
 #include "strata/kernels/dequant_bf16.hpp"
 #include "strata/kernels/iq_kernels.hpp"
 
@@ -63,6 +63,20 @@ __device__ __forceinline__ void group32(const uint8_t* row_blocks, int gi_in_row
             const int xh1 = (qh >> (j + 12)) & 0x10;
             put(out, j, (float) (((b[6 + j] & 0x0F) | xh0) - 16) * d);
             put(out, j + 16, (float) (((b[6 + j] >> 4) | xh1) - 16) * d);
+        }
+    } else if constexpr (TYPE == 7) {                              // Q5_1: d m qh[4] qs[16]
+        // Same 32-element block and the same 5th-bit-in-qh layout as Q5_0 above, but the codes are
+        // unsigned in [0,31] and the block carries its own min, which is ADDED after the scale
+        // (x = q*d + m) instead of Q5_0's fixed -16 offset.  This is ggml's dequantize_row_q5_1
+        // and matches the q51 reader PATCH 3 proved bit-identical against the real shard bytes.
+        const uint8_t* b = row_blocks + (size_t) gi_in_row * 24;
+        const float d = h2f(b), m = h2f(b + 2);
+        const uint32_t qh = (uint32_t) b[4] | ((uint32_t) b[5] << 8) | ((uint32_t) b[6] << 16) | ((uint32_t) b[7] << 24);
+        for (int j = 0; j < 16; ++j) {
+            const int xh0 = ((qh >> j) << 4) & 0x10;
+            const int xh1 = (qh >> (j + 12)) & 0x10;
+            put(out, j, (float) ((b[8 + j] & 0x0F) | xh0) * d + m);
+            put(out, j + 16, (float) ((b[8 + j] >> 4) | xh1) * d + m);
         }
     } else if constexpr (TYPE == 8) {                              // Q8_0
         const uint8_t* b = row_blocks + (size_t) gi_in_row * 34;
@@ -252,6 +266,7 @@ bool geometry(int type, int& block_elems, int& block_bytes) {
     switch (type) {
     case 2: block_elems = 32; block_bytes = 18; return true;
     case 6: block_elems = 32; block_bytes = 22; return true;
+    case 7: block_elems = 32; block_bytes = 24; return true;
     case 8: block_elems = 32; block_bytes = 34; return true;
     case 20: block_elems = 32; block_bytes = 18; return true;
     case 11: block_elems = 256; block_bytes = 110; return true;
@@ -280,6 +295,7 @@ void launch(int type, const void* blocks, int64_t row0, int64_t rows, int64_t co
     switch (type) {
     case 2: STRATA_DQ(2);
     case 6: STRATA_DQ(6);
+    case 7: STRATA_DQ(7);
     case 8: STRATA_DQ(8);
     case 11: STRATA_DQ(11);
     case 12: STRATA_DQ(12);

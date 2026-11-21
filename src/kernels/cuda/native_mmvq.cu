@@ -92,6 +92,14 @@ struct Q50Block {
     uint8_t qh[4];
     uint8_t qs[16];
 };
+// Q5_1 is Q5_0's affine twin: same 32-element block and the same 5th-bit-in-qh layout, plus a
+// stored per-block min that is ADDED after the scale (x = q*d + m) instead of the fixed -16.
+struct Q51Block {
+    half d;
+    half m;
+    uint8_t qh[4];
+    uint8_t qs[16];
+};
 struct Q80Block {
     half d;
     int8_t qs[32];
@@ -118,6 +126,8 @@ static_assert(sizeof(Q6KBlock) == 210 && alignof(Q6KBlock) == 2 &&
 static_assert(sizeof(Q40Block) == 18 && alignof(Q40Block) == 2 && offsetof(Q40Block, qs) == 2);
 static_assert(sizeof(Q50Block) == 22 && alignof(Q50Block) == 2 &&
               offsetof(Q50Block, qh) == 2 && offsetof(Q50Block, qs) == 6);
+static_assert(sizeof(Q51Block) == 24 && alignof(Q51Block) == 2 && offsetof(Q51Block, m) == 2 &&
+              offsetof(Q51Block, qh) == 4 && offsetof(Q51Block, qs) == 8);
 static_assert(sizeof(Q80Block) == 34 && alignof(Q80Block) == 2 && offsetof(Q80Block, qs) == 2);
 static_assert(sizeof(IQ4NLBlock) == 18 && alignof(IQ4NLBlock) == 2 && offsetof(IQ4NLBlock, qs) == 2);
 
@@ -661,9 +671,9 @@ __global__ void native_q6_k_mmvq_kernel(const Q6KBlock* __restrict__ w,
     }
 }
 
-// The four 32-element formats use native two-byte loads and VDR=2. The affine
-// Q4_0/Q5_0 correction consumes the original-input sum stored in Q8_1, exactly
-// as the pinned CUDA dot does; a signed-integer code substitution would differ.
+// The five 32-element formats (Q4_0, Q5_0, Q5_1, Q8_0, IQ4_NL) use native two-byte loads and
+// VDR=2. The affine Q4_0/Q5_0/Q5_1 correction consumes the original-input sum stored in Q8_1,
+// exactly as the pinned CUDA dot does; a signed-integer code substitution would differ.
 __device__ __forceinline__ float small_q8_dot(const Q40Block* __restrict__ w,
                                              const Q81Block* __restrict__ x, int iqs) {
     int sumi = 0;
@@ -705,6 +715,44 @@ __device__ __forceinline__ float small_q8_dot(const Q50Block* __restrict__ w,
     return d * (sumi * ds.x - 8 * ds.y);
 }
 
+// Q5_1: the codes are unsigned in [0,31] and the block carries its own min, so the affine term is
+// +m per element rather than Q5_0's fixed -16.  Against a Q8_1 activation that means
+//   sum(q*d + m) * x  =  d * d8 * sum(q*q8)  +  m * sum(x_original),
+// and sum(x_original) is exactly the warp sum Q8_1 keeps in ds.y.  Two threads share one 32-element
+// block (iqs = 0 and iqs = 2 at Qi = 4), so each takes half of the min term and the pair adds to
+// m * sum(x) over the whole block - the same split Q5_0 uses for its -16.
+//
+// Precision vs the pinned oracle: llama.cpp forms d*d8 and m*s8 with __hmul2 on the packed pair
+// under FAST_FP16_AVAILABLE (vecdotq.cuh:228-240), which rounds both products to half before
+// use.  This form keeps them in fp32, so it is NUMERICALLY EQUIVALENT to 3cf03257, not
+// bit-identical - the two differ in the last bits of every product.  Do not chase a 1-ulp parity
+// diff against the oracle; the contract is C1's 1e-5 relative tolerance, not bit equality.
+__device__ __forceinline__ float small_q8_dot(const Q51Block* __restrict__ w,
+                                             const Q81Block* __restrict__ x, int iqs) {
+    int sumi = 0;
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+        const int vl = load_int_b2(w->qs, iqs + i);
+        const int vh = load_int_b2(w->qh, 0) >> (4 * (iqs + i));
+        int vi0 = (vl >> 0) & 0x0f0f0f0f;
+        vi0 |= (vh << 4) & 0x00000010;
+        vi0 |= (vh << 11) & 0x00001000;
+        vi0 |= (vh << 18) & 0x00100000;
+        vi0 |= (vh << 25) & 0x10000000;
+        sumi = __dp4a(vi0, reinterpret_cast<const int*>(x->qs)[iqs + i], sumi);
+        int vi1 = (vl >> 4) & 0x0f0f0f0f;
+        vi1 |= (vh >> 12) & 0x00000010;
+        vi1 |= (vh >> 5) & 0x00001000;
+        vi1 |= (vh << 2) & 0x00100000;
+        vi1 |= (vh << 9) & 0x10000000;
+        sumi = __dp4a(vi1, reinterpret_cast<const int*>(x->qs)[iqs + i + 4], sumi);
+    }
+    const float2 ds = __half22float2(x->ds);
+    const float d = w->d;
+    const float m = w->m;
+    return d * sumi * ds.x + 0.5f * m * ds.y;
+}
+
 __device__ __forceinline__ float small_q8_dot(const Q80Block* __restrict__ w,
                                              const Q81Block* __restrict__ x, int iqs) {
     int sumi = 0;
@@ -733,7 +781,7 @@ __device__ __forceinline__ float small_q8_dot(const IQ4NLBlock* __restrict__ w,
     return d * sumi;
 }
 
-// QI=4 for Q4_0/Q5_0/IQ4_NL and QI=8 for Q8_0. With VDR=2 this preserves
+// QI=4 for Q4_0/Q5_0/Q5_1/IQ4_NL and QI=8 for Q8_0. With VDR=2 this preserves
 // the pinned 64/32-block iteration and 2048/1024-element small-K thresholds.
 template<typename Weight, int Qi, bool SmallK>
 __launch_bounds__(WARPS * WARP, 1)
@@ -978,7 +1026,9 @@ struct IQ4XSTraits {
         return d * sumi;
     }
 };
-// The four 32-element formats: `load` keeps the block pointer (their decode is a few integer ops) and `apply` is
+// The five 32-element formats (Q4_0, Q5_0, Q5_1, Q8_0, IQ4_NL): `load` keeps the block pointer (their decode is a
+// few integer ops) and `apply` is the unchanged small_q8_dot. Their per-column cost is small; the win above is for
+// the K and IQ formats.
 // the unchanged small_q8_dot. Their per-column cost is small; the win above is for the K and IQ formats.
 template<typename Weight, int Qi>
 struct SmallTraits {
@@ -1418,6 +1468,16 @@ void native_q5_0_f32(const void* weights, const float* x, void* scratch_q8_1,
     small_f32<Q50Block, 4>(weights, x, scratch_q8_1, y, n_in, n_out, ncols, stream);
 }
 
+void native_q5_1_mmvq(const void* weights, const void* x_q8_1, float* y,
+                       int n_in, int n_out, int ncols, void* stream) {
+    small_mmvq<Q51Block, 4>(weights, x_q8_1, y, n_in, n_out, ncols, stream);
+}
+
+void native_q5_1_f32(const void* weights, const float* x, void* scratch_q8_1,
+                      float* y, int n_in, int n_out, int ncols, void* stream) {
+    small_f32<Q51Block, 4>(weights, x, scratch_q8_1, y, n_in, n_out, ncols, stream);
+}
+
 void native_q8_0_mmvq(const void* weights, const void* x_q8_1, float* y,
                        int n_in, int n_out, int ncols, void* stream) {
     small_mmvq<Q80Block, 8>(weights, x_q8_1, y, n_in, n_out, ncols, stream);
@@ -1439,7 +1499,7 @@ void native_iq4_nl_f32(const void* weights, const float* x, void* scratch_q8_1,
 }
 
 bool native_mmvq_supported(int ggml_type) noexcept {
-    return ggml_type == 2 || ggml_type == 6 || ggml_type == 8 || ggml_type == 11 ||
+    return ggml_type == 2 || ggml_type == 6 || ggml_type == 7 || ggml_type == 8 || ggml_type == 11 ||
            ggml_type == 12 || ggml_type == 13 || ggml_type == 14 || ggml_type == 20 ||
            ggml_type == 23 || ggml_type == 42 || ggml_type == 16 || ggml_type == 17 || ggml_type == 18 ||
            ggml_type == 21 || ggml_type == 22 || ggml_type == 29;
@@ -1450,6 +1510,7 @@ std::size_t native_mmvq_weight_bytes(int ggml_type, int n_in, int n_out) {
     switch (ggml_type) {
     case 2: block_elems = 32; block_bytes = 18; break;
     case 6: block_elems = 32; block_bytes = 22; break;
+    case 7: block_elems = 32; block_bytes = 24; break;
     case 8: block_elems = 32; block_bytes = 34; break;
     case 20: block_elems = 32; block_bytes = 18; break;
     case 11: block_elems = 256; block_bytes = 110; break;
@@ -1476,6 +1537,7 @@ void native_mmvq(int ggml_type, const void* weights, const void* x_q8_1, float* 
     switch (ggml_type) {
     case 2: native_q4_0_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, stream); break;
     case 6: native_q5_0_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, stream); break;
+    case 7: native_q5_1_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, stream); break;
     case 8: native_q8_0_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, stream); break;
     case 20: native_iq4_nl_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, stream); break;
     case 11: native_q3_k_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, stream); break;
