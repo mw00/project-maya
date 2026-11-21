@@ -47,6 +47,7 @@ SRC_EXT = {".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".hxx", ".cu", ".cu
 MSVC_SKIP_DIRS = ("include/strata/hip_compat/", "tests/hip/")   # the AMD build's only (ROCm clang compiles them)
 MSVC_SKIP_FILES = {
     "tests/mm3_lane_test.cpp": "CMakeLists.txt builds it only if(NOT WIN32)",
+    "src/inkling2/inkling2_model.cu": "CMakeLists.txt builds maya-inkling2 only if(STRATA_ENABLE_HIP): ROCm's clang",
 }
 # taken by nvcc 12.8 (host and device code) and cl.exe 19.44 alike
 ALLOWED_BUILTINS = {"__builtin_bit_cast", "__builtin_addressof", "__builtin_offsetof", "__builtin_huge_val",
