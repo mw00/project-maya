@@ -264,20 +264,23 @@ void attn_decode_fp8_at(const float* q, const float* r, const float* sink, const
                         cudaStream_t s);
 
 /// One token's attention on the tensor cores - for long contexts, where the scalar attn_decode is bound by its
-/// arithmetic.  q16 [H][128]: the clipped q in FP16; r [H][d_rel], sink [H] as attn_decode's.  The keys the token may
-/// see follow from its position (*pos on the device if given, else qpos) and the window (1 << 30: every one), split
-/// n_split ways (fixed, so the launches do not change with the position).  A key's K and V rows are read once for the
-/// H / Hkv heads that share them.  scratch: H x extent + n_split x H x 130 floats.  attn_decode_mma_prepare(): once
-/// a device before the first call (the kernel's shared memory).
-void attn_decode_mma_prepare();
+/// arithmetic; this one reads at the memory's speed, an FP8 cache too.  q16 [H][128]: the clipped q in FP16;
+/// r [H][d_rel], sink [H] as attn_decode's.  The keys the token may see follow from its position (*pos on the device
+/// if given, else qpos) and the window (1 << 30: every one); kv_cap > 0: the cache a ring of that many rows (>= 16).
+/// A key's K and V rows are read once for the H / Hkv <= 8 heads that share them.  n_split: blocks a K / V head
+/// (fixed, so the launches do not change with the position) - attn_decode_mma_blocks(Hkv) of them fill the device
+/// once, a window of w keys needs no more than w / 64.  scratch: attn_decode_mma_scratch(H, n_split) floats.
+/// gate [H][128] (or null): the output times its sigmoid (gate_mul's); out16 (or null): an FP16 copy of the output.
+int attn_decode_mma_blocks(int Hkv);
+size_t attn_decode_mma_scratch(int H, int n_split);
 void attn_decode_mma_f16(const uint16_t* q16, const float* r, const float* sink, const uint16_t* kc, const uint16_t* vc,
                          int kv_cap, int H, int Hkv, const int* pos, int qpos, int n_split, float qk_scale,
                          const float* proj, int d_rel, int extent, int window, float* scratch, float* out,
-                         cudaStream_t s);
+                         const float* gate, uint16_t* out16, cudaStream_t s);
 void attn_decode_mma_fp8(const uint16_t* q16, const float* r, const float* sink, const uint8_t* kc, const uint8_t* vc,
                          int kv_cap, int H, int Hkv, const int* pos, int qpos, int n_split, float qk_scale,
                          float v_inv_scale, const float* proj, int d_rel, int extent, int window, float* scratch,
-                         float* out, cudaStream_t s);
+                         float* out, const float* gate, uint16_t* out16, cudaStream_t s);
 
 // ---- speculative decoding: the draft model's (Inkling 2's DSpark drafter, mtp.safetensors) and the rollback's
 
