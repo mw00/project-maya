@@ -2620,6 +2620,43 @@ class Q4xCheck(unittest.TestCase):
             self.assertNotIn("1", seen["gens"][3:4])                   # (none after the rates settled)
             self.assertTrue(any("prompt route's rates" in s and "measured on this PC" in s for s in said))
 
+    def test_the_first_start_measures_on_the_docs_text(self):
+        """maya-hy4 measures a PC's 4-bit copies and prompt route at its first start there before it says READY, on
+        real text: the server gives it this install's docs in the model's tokens (HY4_MEASURE_IDS), a file a tokenizer
+        in the data folder, written once.  No tokenizer, or too little text: no file - the answers measure, as before."""
+        import serve.server as SV
+        calls = []
+
+        class Tok:
+            @staticmethod
+            def from_dir(d):
+                return SimpleNamespace(encode=lambda s: calls.append(len(s)) or list(range(9000)))
+        with tempfile.TemporaryDirectory() as t:
+            root = Path(t)
+            (root / "docs").mkdir()
+            (root / "docs" / "SETTINGS.md").write_text("word " * 60000)
+            (root / "README.md").write_text("readme " * 10)
+            c = self.cfg(root)
+            with patch.object(SV, "ROOT", root), \
+                    patch.dict(sys.modules, {"strata_tokenizer": SimpleNamespace(Tokenizer=Tok)}):
+                self.assertNotIn("HY4_MEASURE_IDS", SV.child_env(c))          # (no vocab.json: no tokenizer)
+                (Path(c["tokenizer"]) / "vocab.json").write_text('{"a": 0}')
+                ids = Path(SV.child_env(c)["HY4_MEASURE_IDS"])
+                self.assertEqual(ids.parent, root / "data")
+                self.assertTrue(ids.name.startswith("hy4-measure-ids-"))
+                body = ids.read_text(encoding="utf-8").splitlines()
+                self.assertTrue(body[0].startswith("# maya:"))
+                self.assertEqual(body[1].split(",")[:3], ["0", "1", "2"])
+                self.assertEqual(len(body[1].split(",")), 9000)
+                self.assertEqual(len(calls), 1)                                # (the docs, cut to their share)
+                self.assertTrue(SV.HY4_MEASURE_CHARS <= calls[0] < SV.HY4_MEASURE_CHARS + 8)
+                self.assertEqual(SV.child_env(c)["HY4_MEASURE_IDS"], str(ids))  # (written once: not tokenized again)
+                self.assertEqual(len(calls), 1)
+                self.assertNotIn("HY4_MEASURE_IDS", SV.child_env({"exe": "/b/maya", "args": ["--glm-pack", "/p"]}))
+                ids.unlink()
+                Tok.from_dir = staticmethod(lambda d: SimpleNamespace(encode=lambda s: [1, 2, 3]))
+                self.assertNotIn("HY4_MEASURE_IDS", SV.child_env(c))          # (too little text: none)
+
     def test_the_hot_experts_file_is_kept_until_a_calibration(self):
         """maya-hy4's HY4_HOT (on by default) places a start's experts in VRAM by scores the first start learns and
         the starts after only read: a file a model in the data folder (not in the model's download), named by the

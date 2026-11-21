@@ -380,7 +380,9 @@ def loading(w: LoadWatch, width: int):
     def gpu(k):
         return f"GPU {w.gpus[k]}" if k < n else f"part {k + 1}"
     now = [k for k in sorted(parts) if parts[k][0] < parts[k][1]]   # (the GPU warming now; before it starts: the next)
-    if not parts:
+    if getattr(w, "measuring", False):                  # (Hy4-Flash's first start on this PC, before it is ready)
+        what = "measuring this PC once (the CPU lane's 4-bit copies, the prompt route) - the next starts skip this"
+    elif not parts:
         what = "reading the model's weights"
     elif len(parts) >= n and not now:
         what = "the engine's last checks - almost ready"
