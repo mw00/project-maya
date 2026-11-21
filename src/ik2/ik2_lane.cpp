@@ -224,7 +224,9 @@ bool rows_force(const char* name) {
 
 // ---- the server
 namespace {
-constexpr int kGuRows = 64, kDownRows = 96;   // (a piece's rows: ~48 pieces a visit's expert, gate / up then down)
+// (a piece's rows: ~84 pieces a visit's expert, gate / up then down - small enough that a visit's 2-6 experts
+//  spread evenly over a 38-thread lane)
+constexpr int kGuRows = 32, kDownRows = 48;
 }
 
 Server::Server(int threads, int C, int F, float gcap, float ucap, std::vector<LayerW> layers, void* job, void* done)

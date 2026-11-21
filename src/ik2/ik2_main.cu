@@ -58,6 +58,9 @@ static inline int munmap(void*, size_t) { return 0; }
 #else
 #include <sys/mman.h>
 #include <unistd.h>
+#if defined(__linux__)
+#include <sys/syscall.h>
+#endif
 #endif
 
 #include <algorithm>
@@ -2412,7 +2415,10 @@ bool lane_init(Model& M, const std::string& want, int threads) {
                          // fastest kept (a smaller one within 5%) - a lane as wide as the CPU loses on a busy PC
         const int phys = (int) strata::kernels::cpu::physical_cores(false).size();
         std::vector<int> cand;
-        for (int n : {phys / 4, phys / 2, (3 * phys) / 4, phys - 2})
+        // (and the logical CPUs but two where there are more: on a small desktop CPU the second thread a core still
+        //  adds - Uranus' 6 cores: 29 GB/s on 6 threads, 44 on 12)
+        const int logi = (int) std::thread::hardware_concurrency();
+        for (int n : {phys / 4, phys / 2, (3 * phys) / 4, phys - 2, logi > phys + 2 ? logi - 2 : 0})
             if (n >= 1 && (cand.empty() || n > cand.back())) cand.push_back(n);
         std::vector<int> l4;   // (the timing's layers: one format - the most common one, NVFP4 in Mini's file)
         for (int l = 0; l < c.n_layer; ++l)
@@ -4558,6 +4564,20 @@ int main(int argc, char** argv) {
             const int na = std::max(1, getenv("IK2_ALLOC_THREADS") ? std::atoi(getenv("IK2_ALLOC_THREADS")) : 1);
             for (int t = 0; t < na; ++t)
                 alloc_th.emplace_back([&]() {
+#if defined(__linux__)
+                    // (the offload path on a PC of several NUMA nodes: the pinned experts spread over all of them,
+                    //  page by page, so the CPU lane's threads on every node stream them at the sum of the nodes'
+                    //  bandwidth - Jupiter's two Xeons: 85 GB/s against 50 from one node; IK2_NUMA=0: where the
+                    //  allocation lands)
+                    if (g_off_want && !(getenv("IK2_NUMA") && !std::atoi(getenv("IK2_NUMA")))) {
+                        int nn = 0;
+                        while (nn < 64 && std::filesystem::exists("/sys/devices/system/node/node" + std::to_string(nn))) ++nn;
+                        if (nn > 1) {
+                            const unsigned long mask = nn >= 64 ? ~0ul : (1ul << nn) - 1;
+                            syscall(SYS_set_mempolicy, 3 /* MPOL_INTERLEAVE */, &mask, (unsigned long) nn + 1);
+                        }
+                    }
+#endif
                     for (;;) {
                         const int l = next_alloc++;
                         if (l >= c.n_layer) return;
