@@ -2427,7 +2427,10 @@ free VRAM its start's choices hold with, against what the setup's reading saw. T
 `data/vram-room.json` for this PC, the card and its driver (a new driver or card is measured again), and from then on the setup's line says
 "measured" instead of "estimated"; the Models page counts it too. With a measured figure the setup claims the
 drafter by its sums without their safety margin, as the engine then decides (the contexts and the cache's rows keep
-theirs). Linux and AMD cards are counted as before.
+theirs). A config on several cards (a layer split or tensor parallel) is measured at its first start on them
+together: the engine also says how much less free on every card at once its choices hold with, and each card's share
+is kept for that set of cards (a start on one of them alone is measured on its own). Linux and AMD cards are counted
+as before.
 
 **Not available for Hy4-Flash yet** (the dashboard offers no switch for them): `--parallel` (one request at a time
 for now); Mac, and AMD on Windows.
@@ -2520,9 +2523,14 @@ prompt speed are the same either way.
 beside them). `--mtp` loads the GGUF's MTP block (its BF16 weights rounded to Q8_0 at load; its copy of the output
 head for the drafts' top token in Q4_K - only how often a draft holds depends on it) and drafts up to
 `--draft` tokens a step; the model checks them in one window, so the tokens are the model's own: greedy answers are
-the same with and without it on the same placement, and with sampling a draft is kept with the model's probability of
-it. (The MTP block's VRAM can move a layer, or a share of the experts, to another GPU, which rounds a little
-differently: a near-tie can then go the other way.)
+the same with and without it, and with sampling a draft is kept with the model's probability of it. The VRAM plan
+counts the room of the drafters the pack holds (the MTP block, the DFly2 drafter: the larger one's, as one runs at a
+time) with drafting on and off alike, so turning drafting on or off, or one drafter for the other, moves no expert
+and keeps the answers (a start's own prompt chunk is then the one beside that room). Where a drafter's room would
+change more than that - the cache's rows, the dense prompt span, KV streaming, the GPUs' layout - the start leaves it
+out and says so ("INFO the MTP block is not loaded: ..."), and
+decodes without drafts; `--kv q8` (the 8-bit rows by hand) gives it room on a card where F16 rows and the block do
+not fit together.
 
 Measured by the engine's contributor (@needmorevram) on his own PC, with AngelSlim's Q4_K_M set, not with Maya's
 files - a 9-GPU NVIDIA PC (an RTX 3090 and eight RTX 5060 Ti on PCIe 3, two Xeon sockets):
