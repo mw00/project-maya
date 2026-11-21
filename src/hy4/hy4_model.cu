@@ -401,6 +401,10 @@ struct Gpu {
     //  attention's query: evf the two chains' common input ready, evj the picks made; its GEMVs' int8 rows apart)
     cudaStream_t s4 = nullptr;
     cudaEvent_t evf = nullptr, evj = nullptr;
+    // (an Engram layer's lookup rows and their GEMV on the side stream, behind the layer before's FFN partial -
+    //  Impl::eg_early: evg that partial out, eve the GEMV done, eg_armed the layer evg was recorded for)
+    cudaEvent_t evg = nullptr, eve = nullptr;
+    int eg_armed = -1;
     // (a tensor-parallel member's prefetches - Impl::pf_queue: their stream, the event each waits for, their sink)
     cudaStream_t s5 = nullptr;
     cudaEvent_t evp = nullptr;
@@ -882,6 +886,8 @@ struct Model::Impl {
             if (gp.ev) cudaEventDestroy(gp.ev);
             if (gp.evf) cudaEventDestroy(gp.evf);
             if (gp.evj) cudaEventDestroy(gp.evj);
+            if (gp.evg) cudaEventDestroy(gp.evg);
+            if (gp.eve) cudaEventDestroy(gp.eve);
             if (gp.s4) cudaStreamDestroy(gp.s4);
             if (gp.evp) cudaEventDestroy(gp.evp);
             if (gp.s5) cudaStreamDestroy(gp.s5);
@@ -2839,7 +2845,8 @@ struct Model::Impl {
     static size_t mat_bytes(const Mat& m) { return m.w ? m.ld * (size_t) m.n * (size_t) std::max(1, m.batch) : 0; }
     // (queued on the member's prefetch stream, started when what its main stream holds so far is done; the matrices in
     //  their order as far as the cache holds them)
-    void pf_queue(Gpu& gp, std::initializer_list<const Mat*> ms) {
+    //  (after: started when that event is done instead)
+    void pf_queue(Gpu& gp, std::initializer_list<const Mat*> ms, cudaEvent_t after = nullptr) {
         if (gp.s5 == nullptr || gp.pf_cap == 0) return;
         k::Prefetch j;
         size_t sum = 0;
@@ -2851,7 +2858,8 @@ struct Model::Impl {
             j.add(m->w, b);
         }
         if (j.n == 0) return;
-        if (cudaEventRecord(gp.evp, gp.s) != cudaSuccess || cudaStreamWaitEvent(gp.s5, gp.evp, 0) != cudaSuccess) {
+        if ((after == nullptr && cudaEventRecord(gp.evp, gp.s) != cudaSuccess) ||
+            cudaStreamWaitEvent(gp.s5, after != nullptr ? after : gp.evp, 0) != cudaSuccess) {
             (void) cudaGetLastError();
             return;
         }
@@ -2867,16 +2875,34 @@ struct Model::Impl {
                           b ? &l.rup : nullptr, b ? &l.sh_down : nullptr});
         }
     }
-    void pf_attn(const Layer& l, Gpu& gp, int T) {   // (behind its FFN partial: the next layer's)
-        if (gp.s5 == nullptr || gp.pf_cap == 0 || T > W || l.tpm < 0 || (pf_bits & 12) == 0) return;
+    const Layer* next_layer(const Layer& l) const {   // (member l.tpm's layer after l; null: none)
+        if (l.tpm < 0) return nullptr;
         const std::vector<Layer>& ls = TL[(size_t) l.tpm];
-        if ((size_t) l.il + 1 >= ls.size()) return;
+        if ((size_t) l.il + 1 >= ls.size()) return nullptr;
         const Layer& n = ls[(size_t) l.il + 1];
-        if (n.il != l.il + 1 || n.il >= g.n_layer) return;
+        return n.il == l.il + 1 && n.il < g.n_layer ? &n : nullptr;
+    }
+    void pf_attn(const Layer& l, Gpu& gp, int T) {   // (behind its FFN partial: the next layer's)
+        const Layer* n = next_layer(l);
+        if (n != nullptr) pf_attn_of(*n, gp, T, nullptr);
+    }
+    // (layer n's attention matrices: behind the main stream's state now, or behind `after`)
+    void pf_attn_of(const Layer& n, Gpu& gp, int T, cudaEvent_t after) {
+        if (gp.s5 == nullptr || gp.pf_cap == 0 || T > W || n.tpm < 0 || (pf_bits & 12) == 0) return;
         const bool a = (pf_bits & 4) != 0, b = (pf_bits & 8) != 0;
         pf_queue(gp, {a ? &n.q_a : nullptr, a ? &n.kv_a : nullptr, a ? &n.gate : nullptr, a && n.ix ? &n.ix_k : nullptr,
                       b ? &n.q_b : nullptr, b && n.ix ? &n.ix_q_b : nullptr, b ? &n.k_b : nullptr, b ? &n.v_b : nullptr,
-                      b ? &n.wo : nullptr});
+                      b ? &n.wo : nullptr}, after);
+    }
+    // An Engram layer of a tensor-parallel member's token window: its lookup rows, their norm and their GEMV (25 MB of
+    // weights every member reads, and nothing of the layer's state) go on the side stream behind the layer before's FFN
+    // partial - beside that sum's round trip, where they were the layer's first 60 us and more; the mix waits for them.
+    // The layer's attention matrices are then read ahead behind that GEMV (its weights fill the cache until then).  The
+    // same kernels on the same rows: the same bits.  HY4_EG_EARLY=0: in line, as before
+    const bool eg_early_on = !(std::getenv("HY4_EG_EARLY") && std::getenv("HY4_EG_EARLY")[0] == '0');
+    bool eg_early(const Layer& n, const Gpu& gp, int T) const {
+        return eg_early_on && eg_wait && n.eg >= 0 && n.tpm >= 0 && n.il > 0 && T <= W && gp.s4 != nullptr &&
+               gp.evg != nullptr && gp.xq4 != nullptr && n.eg_kv.k <= g.n_embd && !dump && !inject && !check_tp;
     }
     // Each member's cache, measured once at the start: ranges of a layer's routed experts (weights no window has read
     // yet) read by the prefetch kernel twice in a row - where the second pass takes under 0.6 of the first, the cache
@@ -3396,6 +3422,8 @@ struct Model::Impl {
             CK(cudaStreamCreateWithFlags(&gp.s4, cudaStreamNonBlocking));
             CK(cudaEventCreateWithFlags(&gp.evf, cudaEventDisableTiming));
             CK(cudaEventCreateWithFlags(&gp.evj, cudaEventDisableTiming));
+            CK(cudaEventCreateWithFlags(&gp.evg, cudaEventDisableTiming));
+            CK(cudaEventCreateWithFlags(&gp.eve, cudaEventDisableTiming));
         }
         if (!only_bytes && !gp.s5 && pf_mode != 0) {
             CK(cudaStreamCreateWithFlags(&gp.s5, cudaStreamNonBlocking));
@@ -6940,18 +6968,34 @@ struct Model::Impl {
                 }
             }
         }
+        // (early: on the side stream, behind the layer before's FFN partial - eg_early; se: the rows' stream)
+        const bool early = gp.eg_armed == l.il && r0 == 0 && eg_early(l, gp, T);
+        gp.eg_armed = -1;
+        Gpu ge = gp;
+        if (early) {
+            ge.s = gp.s4;
+            ge.xq = gp.xq4;
+            ge.xd = gp.xd4;
+            CK(cudaStreamWaitEvent(gp.s4, gp.evg, 0));
+        }
+        const cudaStream_t se = ge.s;
         CK(cudaMemcpyAsync(gp.eg_rows, h_eg + ((size_t) l.eg * Tc + (size_t) r0) * cols * hd, (size_t) T * cols * hd,
-                           cudaMemcpyHostToDevice, s));
-        CK(cudaMemcpyAsync(gp.eg_valid, h_valid + r0, sizeof(float) * T, cudaMemcpyHostToDevice, s));
+                           cudaMemcpyHostToDevice, se));
+        CK(cudaMemcpyAsync(gp.eg_valid, h_valid + r0, sizeof(float) * T, cudaMemcpyHostToDevice, se));
         const float eps = eg_eps;
         if (eg_scale != nullptr)
             CK(cudaMemcpyAsync(gp.eg_sc, h_egs + ((size_t) l.eg * Tc + (size_t) r0) * cols, sizeof(float) * T * cols,
-                               cudaMemcpyHostToDevice, s));
-        k::engram_rows(gp.eg_rows, gp.eg_valid, T, cols, hd, l.eg_lookup, eps, gp.eg_r, s, eg_scale ? gp.eg_sc : nullptr);
+                               cudaMemcpyHostToDevice, se));
+        k::engram_rows(gp.eg_rows, gp.eg_valid, T, cols, hd, l.eg_lookup, eps, gp.eg_r, se, eg_scale ? gp.eg_sc : nullptr);
         dbg("engram_rows_normed", l.il, gp, gp.eg_r, T, (size_t) cols * hd);
-        if (!mm(gp, l.eg_kv, gp.eg_r, (size_t) cols * hd, T, gp.eg_kvo, (size_t) (g.hc + 1) * E)) {
+        if (!mm(ge, l.eg_kv, gp.eg_r, (size_t) cols * hd, T, gp.eg_kvo, (size_t) (g.hc + 1) * E)) {
             err = "engram_kv: a GEMV the kernels do not take";
             return false;
+        }
+        if (early) {
+            CK(cudaEventRecord(gp.eve, gp.s4));
+            pf_attn_of(l, gp, T, gp.eve);          // (the layer's attention matrices: read ahead behind the GEMV)
+            CK(cudaStreamWaitEvent(s, gp.eve, 0));   // (the mix: after it)
         }
         dbg("engram_kv(no bias)", l.il, gp, gp.eg_kvo, T, (size_t) (g.hc + 1) * E);
         k::engram_mix(gp.x, gp.eg_kvo, l.eg_kv_b, T, g.hc, E, l.eg_gate, l.eg_gamma, l.eg_hcs, gp.eg_valid, eps, s);
@@ -8087,8 +8131,13 @@ struct Model::Impl {
         }
         k::publish(buf, tp_part + (size_t) m * tp_stride(), n, tp_cnt[(size_t) m], tp_fout + (size_t) m * kLine, v,
                    gp.s, plus);
-        if (pf != nullptr && pf_kind == 1) pf_ffn(*pf, gp, pf_T);
-        else if (pf != nullptr && pf_kind == 2) pf_attn(*pf, gp, pf_T);
+        if (pf != nullptr && pf_kind == 1) {
+            pf_ffn(*pf, gp, pf_T);
+        } else if (pf != nullptr && pf_kind == 2) {
+            const Layer* n = next_layer(*pf);
+            if (n != nullptr && eg_early(*n, gp, pf_T) && cudaEventRecord(gp.evg, gp.s) == cudaSuccess) gp.eg_armed = n->il;
+            else pf_attn(*pf, gp, pf_T);   // (an armed Engram layer's: engram() queues it behind its GEMV)
+        }
         k::wait_pull(tp_fin, v, buf, tp_sum, n, gp.s);
     }
     // a prompt chunk's sum read back into buf block by block, each once the host has summed it
