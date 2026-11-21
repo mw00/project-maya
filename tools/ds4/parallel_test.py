@@ -19,6 +19,10 @@ Checks (greedy, spec=0 so a conversation's state ends exactly at its last printe
             the one it got alone, token for token (the check the GLM engine's docs give for --parallel)
   slots     `--parallel 2` with MAYA_DS4_SLOT_KEEP=1: A and B at once, then A's next turn - it reuses A's whole
             prefix from the lane (DONE's `reused`), so a conversation that stays in its lane is not read again
+  copy      `--parallel 2`: a prompt that continues a conversation that is busy answering (a background compaction
+            behind the chat whose answer is still writing) has the busy lane's state copied into the idle lane it
+            takes and reads on from it (MAYA_DS4_SLOT_COPY): its DONE reuses at least the busy prompt's whole
+            length, where the empty idle lane would reuse 0
   stop      two requests at once: STOP <rid> one of them; its DONE says `cancel` with fewer tokens, the other's
             answer is whole (a STOP is a request's own)
   reading   `--parallel 2`: a ~100K-token prompt and, a moment later, a small one: the small one's answer must make
@@ -332,6 +336,30 @@ def main() -> int:
         eng.quit()
     except Exception as e:  # noqa: BLE001
         print(f"the slots run failed: {e}", flush=True)
+        ok = False
+
+    # ---- copy: a prompt that continues a conversation that is busy answering - a background compaction behind the
+    # chat whose answer is still writing - has the busy lane's state copied into the idle lane it takes and reads on
+    # from it, instead of the empty lane reading the whole session again (MAYA_DS4_SLOT_COPY)
+    try:
+        eng = one_run(a, settings, min(2, lanes), a.ctx, os.path.join(tmp, "copy"), keep=True)
+        rid_a = eng.send(probes[2], 300, a.spec)          # A: a long answer, so its lane stays busy
+        time.sleep(0.5)
+        with eng.cond:
+            wrote = [int(l.split()[2]) for k, l, _ in eng.got.get(rid_a, []) if k == "T"]
+        if len(wrote) < 4:
+            raise RuntimeError(f"A wrote only {len(wrote)} tokens in half a second")
+        comp = probes[2] + wrote + text_tokens(tok, "Summarise the above.", 8)   # (the compaction prompt)
+        r = eng.stream(eng.send(comp, 8, a.spec))         # (A's lane is busy: an idle one takes this)
+        check(f"copy: the prompt behind the busy conversation reused {r['reused']} of its {len(comp)} tokens "
+              f"(the busy state was copied; an empty lane would reuse 0)",
+              r["error"] is None and r["reused"] >= len(probes[2]))
+        check("copy: and answered whole from the copy", r["error"] is None and r["generated"] == 8)
+        eng.stop_request(rid_a)
+        eng.stream(rid_a)
+        eng.quit()
+    except Exception as e:  # noqa: BLE001
+        print(f"the copy run failed: {e}", flush=True)
         ok = False
 
     # ---- reading: a long prompt and a small one after it; the small one's answer must not wait for the whole read

@@ -656,6 +656,14 @@ context shares the memory beside the model among the N conversations.
   least recently used, which first goes to a [kept conversation](#deepseek-conversations-kept-an-agents-parent-and-workers-on-one-model)
   with `MAYA_DS4_SLOT_KEEP=1`. Its pictures are read by the engine between two of the others' tokens: the vision tower
   borrows its room and gives it back before the prompt.
+- **A prompt that continues a busy conversation** - an agent's background compaction or title behind the chat whose
+  answer is still writing, the next turn of a conversation whose side request runs - does not wait for it and does not
+  read the session again: the busy conversation's state is copied into the idle conversation the request takes
+  (through RAM, as a kept conversation is) and the prompt reads on from the copy - whole, or from the latest
+  checkpoint the prompt agrees with. The copy goes when it covers at least twice what the idle conversations cover on
+  their own: it costs the state's bytes twice over and saves the tokens between the two (against ~73 s of reading a
+  190K-token conversation again). Text prompts only, and not from a conversation that holds pictures. `MAYA_DS4_SLOT_COPY=0` turns it off; `MAYA_DS4_SLOT_COPY_MIN` (1024) is the
+  shortest state copied. The engine's log says `ds4 slots: copied conversation <n>'s state ...`.
 - **Prompts are read a piece at a time.** The prompts being read take turns, a piece each - a chunk per pipeline stage,
   so a split's GPUs all stay busy - and every running request writes a token between two pieces. A long prompt no
   longer stops the others' answers for its whole read, and a prompt that fits in one piece goes ahead of the longer
@@ -2062,6 +2070,8 @@ engine is unchanged unless asked.
 | `MAYA_DS4_SLOT_DIR` | `<pack>/slots` | the folder: a conversation is a `.bin` (its state) and a `.meta` (this model's identity, its tokens and its size), both written under a temporary name first |
 | `MAYA_DS4_SLOT_MIN` | 1024 | the shortest conversation set aside (tokens): a shorter one is read again in about the time its slot would take |
 | `MAYA_DS4_SLOT_DAYS` | 7 | a slot not used for this many days is removed at start; so is any file not this model's, another engine's, or incomplete. The engine's end (QUIT or the end of its input) writes the conversations in RAM to the folder, so a restart reads on from them (the server gives it `MAYA_ENGINE_QUIT_S`, 50 s, to do so) |
+| `MAYA_DS4_SLOT_COPY` | 1 | with `--parallel`: a prompt that continues a conversation that is busy answering (an agent's background compaction behind the chat whose answer is still writing) has that conversation's state copied into the idle conversation it takes, through RAM as a slot is, and reads on from the copy instead of reading the session again; `0`: a busy conversation's state is not reused - the prompt reads again from its own best match among the idle conversations |
+| `MAYA_DS4_SLOT_COPY_MIN` | 1024 | the shortest state copied (tokens); a copy goes only when it covers at least twice what the idle conversations cover on their own - its cost is the state's bytes through RAM and back, its saving the tokens between the two |
 
 The client sends each assistant turn's `reasoning_content` back with the turn, as it got it: from `content` alone the
 prompt differs from the state and nothing is reused - no error and no log line.
