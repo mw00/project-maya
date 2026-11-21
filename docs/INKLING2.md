@@ -348,3 +348,51 @@ Outside the preview, two GPUs with a loop run as expert parallel (`IK2_EP=1`, it
 checked on Windows, an RTX 5080 with an RTX 4060 Ti); the drafter is one GPU's.  Not done: the loop in the layer-major prompt passes (`IK2_SUP`: off
 for a looped model), a second card for the KV cache (a million tokens is 16 GiB of it), the drafter's own launches
 as a graph (2-3 ms a step now).
+
+### 8.1 Native context, batched prefill, suffix decode
+
+Each of these settings is off unless it is set (docs/SETTINGS.md).
+
+- `IK2_KV_MANAGED=1` reserves the global K and V in unified memory, so physical memory follows the live prefix and
+  a 24 GiB card can reserve 1,048,576 positions. It needs concurrent managed access, which Linux has and Windows
+  does not. Large prefill chunks prefetch each global visit before its attention. `IK2_TIER=1` gives deep decode
+  more VRAM by backing the least-used expert groups with host memory; large fresh prefills restore ordinary GPU
+  expert storage. With `IK2_STAGE_COLD=1` the routed host weights enter the attention scratch in coalesced reads
+  before the expert products. `IK2_HEADROOM_MIB` reserves room beyond the allocations present at the start
+  (default 1536).
+- `IK2_EXPERT_LIMB=0` keeps the reference scalar expert math. The experimental `IK2_EXPERT_LIMB=15` uses two
+  signed-byte activation limbs and DP4A for NVFP4 and Q8_0 gate/up and down in single-token decode. The GGUF
+  weights are unchanged; activation rounding and reduction order can change the logits.
+- `IK2_GATE_BF16=1` checks the F32 loop-gate weights for exact BF16 representation before making the compact copy
+  single-token decode uses. `IK2_GATE_TILE=64` and `IK2_Q8_UNROLL=1` select tuned launch and reduction shapes.
+- `IK2_Q8_TILE=1` uses a tensor-core product for short dense projections. `IK2_GROUP_MMA=3` groups up to eight
+  token inputs per expert for gate/up and down. With `IK2_VERIFY_ONLY=1` those run only on verify batches.
+- With `IK2_BATCH_PREFILL=1`, a cold prefill gathers all routed token rows once, batches the SwiGLU and sums the
+  down projections in the same expert order, in the attention scratch. On an RTX 3090 under Windows (229,376
+  context, the drafter, FP8 KV), it and the three settings above read prompts at 2,609 tok/s at 12K tokens and
+  2,532 at 50K, against 2,318 and 2,375 without them; decode is unchanged.
+- `IK2_SUFFIX=96` proposes copies from the preceding 65,536 tokens of the request (one GPU, no drafter). Every
+  emitted token is the target's, at any temperature; a mismatch rolls the short convolutions back to the committed
+  prefix. Code edits with a long exact substring decode considerably faster than fresh prose.
+- On an AVX2 host, `IK2_DEEP_CPU_THREADS=24` (with `IK2_TIER`) runs whole layers' expert products on the CPU from
+  `IK2_DEEP_CPU_MIN=524288` live tokens when the populated global KV needs the room, in ascending order of visits
+  per byte of expert weights. Expert selection, SwiGLU, FP16 hidden rounding, attention and the output head stay on
+  the GPU; AVX2 keeps the sm_86 sub-block and warp reduction order. The build needs OpenMP, AVX2, F16C and FMA.
+  With `IK2_PARK_WORK=1` the engine moves large unused tails of the prefill work buffers to RAM before deep
+  decode and restores them before a large fresh prefill.
+
+### 8.2 Several conversations: the session cache
+
+`--serve` keeps one history. Without the session cache, a request that shares no snapshot with it drops it and
+reads its own prompt from the start, so two conversations taking turns each read their whole prompt every turn.
+With `IK2_SESSION_CACHE_GB=24`, the history being dropped is put aside in host RAM first: its latest snapshot's short
+convolution states and sliding windows, the full layers' KV rows before its position, and the drafter's context
+rings. A later request whose tokens start with an entry's tokens (and the same image signature) is taken up from
+there and reads only what is new. Entries are evicted least recently used first; conversations shorter than
+`IK2_SESSION_CACHE_MIN` tokens (1024) are not kept.
+
+Measured on an RTX 3090 under Windows (FP8 KV, the drafter at `IK2_DRAFT_CTX=65536`): three conversations of 30K,
+12K and 20K tokens taking turns read 11.3 s, 4.5 s and 7.5 s on their first turn and 0.5-0.9 s on every turn after
+it, each one reusing its whole previous prompt. Putting one aside takes 0.14-0.5 s, taking it up 0.08-0.36 s;
+a 54K-token conversation holds 1.2 GiB of RAM. Driven through the engine directly, a conversation taken up
+produces the same tokens as one that never left, with and without the drafter.
