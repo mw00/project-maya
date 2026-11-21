@@ -872,7 +872,7 @@ HY4_CHUNK_UP_GIB = 0.95
 # Its files: unsloth's UD-Q4_K_XL (Unsloth's looped layout, which the engine reads) and thinkingmachines' own drafter
 # (mtp.safetensors: the engine drafts only where it pays) - tools/ik2/download.json, pinned by size and sha256.  What
 # fits on the card (the context, the drafter's room): tools/ik2_fit.py, shared with the Models page.  Its defaults:
-# maya_quants.MODEL_DEFAULTS["ik2-mini"] (placeholders until its author sends his); thinkingmachines' chat template
+# maya_quants.MODEL_DEFAULTS["ik2-mini"] (its author's values); thinkingmachines' chat template
 # (tools/ik2/chat_template.jinja) in the tokenizer folder.  One request at a time.
 import ik2_fit as IK2F  # noqa: E402  (tools/) what fits on the card
 IK2 = Q.MODEL["ik2"]                               # "Inkling-2-Mini" (its id: the installer record, --model)
@@ -6802,13 +6802,6 @@ def bench_chat(family: str, tokenizer_dir: Path):
                                     enable_thinking=False) + "<|message_model|><|content_text|>"
     if family == "qwen":       # (Qwen's turns, the think block closed: the answer itself)
         return "<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n".format
-    if family == "ik2":        # (thinkingmachines' template at effort none, the answer's text segment opened - as the
-        #  server does for thinking off: Inkling 2 has no switch, only the effort)
-        from serve.frontend import ChatTemplate
-        path = Path(tokenizer_dir) / "chat_template.jinja"
-        tpl = ChatTemplate(path if path.exists() else IK2_TEMPLATE)
-        return lambda q: tpl.render([{"role": "user", "content": q}], enable_thinking=False) + \
-            "<|message_model|><|content_text|>"
     return "[gMASK]<sop><|user|>\n{}<|assistant|>\n</think>".format
 
 

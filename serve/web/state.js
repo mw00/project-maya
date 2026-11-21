@@ -145,9 +145,9 @@ export const PENALTIES = ["repetition_penalty", "frequency_penalty", "presence_p
 // CYBER-FROST-3.8-PS (Qwen3.8's template, thinking always on): Off (the think block closed the way its Qwen base writes
 // thinking off - frontend.ChatTemplate) and its three reasoning efforts, low / medium / xhigh
 // Hy4-flash (Tencent's template): High, or Off (its no_think) - the only two it is made for
-// Inkling 2 (thinkingmachines' template: an effort level 0 .. 0.99 by name): Off (effort 0, the answer's text opened at
-// once - the server's), Low 0.2, Medium 0.7, High 0.9 (its template's default) and Max 0.99 (its xhigh is the same 0.99).
-// PLACEHOLDER until its author (PR #1095) sends the modes he validated
+// Inkling 2 (thinkingmachines' template: an effort level 0 .. 0.99 by name, its author's levels): Off (effort 0, the
+// answer's text opened at once - the server's), Low 0.2, Medium 0.7, High 0.9 (its template's default, "auto") and Max
+// 0.99 (its xhigh is the same 0.99; its minimal, 0.1, the server reads as off - as a client's "minimal" for every model)
 const THINK_LEVELS = {glm: ["none", "low", "high", "max"], deepseek: ["none", "low", "high", "max"],
                       minimax: ["none", "auto", "low", "medium", "high", "xhigh", "max"], qwen: ["none", "low", "medium", "xhigh"],
                       hy4: ["none", "high"], ik2: ["none", "low", "medium", "high", "max"]};

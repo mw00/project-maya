@@ -21,7 +21,7 @@ MARGIN_GIB = 0.5                                    # the driver's and the deskt
 CONTEXTS = [32768, 65536, 131072, 262144]           # the setup's choices (the engine keeps every expert in VRAM up
                                                     # to 352,256 with an FP8 cache on a 24 GB card: text only)
 DEFAULT_KV = "fp8"
-MIN_VRAM_GB = 23.0                                  # a "24 GB" card as nvidia-smi reports it (an RTX 4090: 23.99 GiB)
+MIN_VRAM_GB = 22.0                                  # the engine's own floor (check_preview: 22 GiB - a "24 GB" card)
 MIN_CC = 80                                         # the engine's kernels: mma.sync m16n8k16, cp.async (Ampere on)
 
 

@@ -1,5 +1,5 @@
 """tools/test_setup_ik2.py - Inkling-2-Mini (maya-ik2, an experimental preview) in the setup: its names and setup ids,
-its own defaults (placeholders until its author's), the pinned manifest, the one-line refusals on the hosts the preview
+its own defaults (its author's), the pinned manifest, the one-line refusals on the hosts the preview
 does not run on (AMD, a Mac, Windows, two GPUs or more asked for, a card older than RTX 30 / A100 or under 24 GB), the
 one GPU it picks, what fits on the card (the context, the drafter's room), the picker's row, the tokenizer step, the
 config it writes and a start of it.  No GPU, no network.
@@ -66,9 +66,9 @@ class Names(unittest.TestCase):
         self.assertEqual(a.model, maya.IK2)
         self.assertEqual(maya.choose_family(a, {}), "ik2")
 
-    def test_its_own_defaults_placeholders_for_now(self):
-        """Inkling-2-Mini has its own entry (the author's values go there, not into Inkling-2-Small's): the card's
-        temperature 1.0, top-p 1.0, its template's own level by name (high: 0.9); a config written by hand for
+    def test_its_own_defaults(self):
+        """Inkling-2-Mini has its own entry, its author's values (not Inkling-2-Small's): temperature 1.0, top-p 1.0,
+        no top-k, no penalties, its template's own level by name (high: 0.9); a config written by hand for
         Inkling-2-Small keeps the PR's."""
         mini = {"exe": "/b/maya-ik2", "installer": {"family": "ik2", "ik2_quant": Q.IK2_QUANT}}
         self.assertEqual(Q.model_key(mini), "ik2-mini")
@@ -79,8 +79,6 @@ class Names(unittest.TestCase):
         small = {"exe": "build/maya-ik2", "model_name": "inkling-2-small",
                  "args": ["--model", "Inkling-2-Small-UD-Q4_K_XL-00001-of-00009.gguf"]}
         self.assertEqual((Q.model_key(small), Q.model_defaults(small)[1]), ("ik2", "auto"))
-        src = (ROOT / "tools" / "maya_quants.py").read_text(encoding="utf-8")
-        self.assertIn("PLACEHOLDER until its", src)          # (marked for the author's values)
 
     def test_label(self):
         cfg = {"exe": "/b/maya-ik2", "installer": {"family": "ik2", "ik2_quant": Q.IK2_QUANT}}
