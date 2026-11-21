@@ -2074,7 +2074,7 @@ struct Model::Impl {
     std::vector<cudaEvent_t> rc_go;             // (the fills after the main stream's work so far)
     // the fills off the windows' way: a thread of their own issues each fill's copies (on rc_cs, after rc_go) and
     // marks it done (rc_done[layer's rc_off + slot] = the fill's gen) once its copies are; a tick's table entries go
-    // in one launch a device (tab_set, from rc_upd: pinned, [2 x kRcUpd])
+    // in one launch a device (tab_set, from rc_upd: pinned, kTabIn inputs of [2 x kRcUpd], each freed by its tab_ev)
     struct RcJob {
         int layer = 0, slot = 0, expert = 0;
         unsigned gen = 0, win = 0;
@@ -2107,6 +2107,9 @@ struct Model::Impl {
     std::thread rc_th;
     std::unique_ptr<std::atomic<unsigned>[]> rc_done;
     std::vector<unsigned long long*> rc_upd;
+    static constexpr int kTabIn = 4;   // (a device's table inputs, taken in turn: take_table_input)
+    std::vector<cudaEvent_t> tab_ev;   // [device * kTabIn + input]: after the tab_set that read the input
+    std::vector<int> tab_next;         // [device]: the input taken next
     std::atomic<unsigned> rc_clock{1};
     int64_t rc_fills_done = 0, rc_fills_started = 0, rc_ticks = 0, rc_lands = 0;
     std::atomic<int> rc_pending{0};   // the fills queued and not yet done (rc_drain waits for none)
@@ -12286,11 +12289,19 @@ struct Model::Impl {
         if (!rc_upd.empty()) return true;
         std::string e0;
         rc_go.assign(devs.size(), nullptr);
+        tab_ev.assign(devs.size() * kTabIn, nullptr);
+        tab_next.assign(devs.size(), 0);
         rc_upd.assign(devs.size(), nullptr);
         for (size_t di = 0; di < devs.size(); ++di) {
             cudaSetDevice(devs[di].id);
             cudaEventCreateWithFlags(&rc_go[di], cudaEventDisableTiming);
-            if (!hmap(rc_upd[di], (size_t) 2 * kRcUpd, e0)) {
+            for (int k = 0; k < kTabIn; ++k)
+                if (cudaEventCreateWithFlags(&tab_ev[di * kTabIn + (size_t) k], cudaEventDisableTiming) != cudaSuccess) {
+                    (void) cudaGetLastError();
+                    rc_upd.clear();
+                    return false;
+                }
+            if (!hmap(rc_upd[di], (size_t) kTabIn * 2 * kRcUpd, e0)) {
                 rc_upd.clear();
                 return false;
             }
@@ -12308,17 +12319,34 @@ struct Model::Impl {
             cudaSetDevice(devs[di].id);
             const int n = (int) std::min<size_t>(u.size() / 2, (size_t) kRcUpd);
             if (n > 0) {
-                // tab_set reads this host-mapped input only when it eventually executes. Before every overwrite,
-                // finish all earlier work on this stream (in particular back-to-back cache_drain / rc_drain flushes).
-                // Ordinary forward ticks already synchronized this stream, so their added wait is normally a no-op.
-                const cudaError_t update_sync = cudaStreamSynchronize(devs[di].st);
-                if (update_sync != cudaSuccess) {
-                    std::fprintf(stderr, "ds4: table-input predecessor sync: %s - the expert tables are unknown\n",
-                                 cudaGetErrorString(update_sync));
+                // tab_set reads its host-mapped input only when it eventually executes: an input is overwritten only
+                // once the tab_set that last read it is done (its own event - back-to-back cache_drain / rc_drain
+                // flushes wait there; a tick after a window finds it done).  Not a wait for the whole stream: on a
+                // layer split the window's end waits only for the head GPU's, and on two AMD GPUs the other GPU's
+                // stream sync here hung with nothing left to run (#1086, #1027 - --no-expert-cache never got here)
+                cudaError_t te = cudaSuccess;
+                cudaEvent_t* ev = &tab_ev[di * kTabIn];
+                const int k = take_table_input(tab_next[di], kTabIn, [&](int i) {
+                    te = cudaEventQuery(ev[i]);
+                    return te == cudaSuccess ? 0 : te == cudaErrorNotReady ? 1 : -1;
+                }, [&](int i) {
+                    te = cudaEventSynchronize(ev[i]);
+                    return te == cudaSuccess;
+                });
+                if (k < 0) {
+                    std::fprintf(stderr, "ds4: table-input predecessor wait: %s - the expert tables are unknown\n",
+                                 cudaGetErrorString(te));
                     std::abort();
                 }
-                std::memcpy(rc_upd[di], u.data(), (size_t) n * 16);
-                tab_set(rc_upd[di], n, devs[di].st);
+                unsigned long long* in = rc_upd[di] + (size_t) k * 2 * kRcUpd;
+                std::memcpy(in, u.data(), (size_t) n * 16);
+                tab_set(in, n, devs[di].st);
+                te = cudaEventRecord(ev[k], devs[di].st);
+                if (te != cudaSuccess) {
+                    std::fprintf(stderr, "ds4: table-input event: %s - the expert tables are unknown\n",
+                                 cudaGetErrorString(te));
+                    std::abort();
+                }
             }
             cudaEventRecord(rc_go[di], devs[di].st);
         }

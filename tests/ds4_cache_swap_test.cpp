@@ -38,5 +38,39 @@ int main() {
         assert(retry && !strata::ds4::discard_failed_cache_swap(retry, pending, incoming, inflight));
         assert(pending && incoming == 10 && inflight == 1);
     }
+    // The table inputs (tick_flush): in turn; an input whose reader is done is taken without a wait; one whose reader
+    // still runs is waited for, its own event only; an error at either step gives -1 (the caller aborts).
+    {
+        constexpr int kSlots = 4;
+        std::array<int, kSlots> state{0, 0, 0, 0};   // the event's query: 0 done, 1 not yet, -1 an error
+        int next = 0, waits = 0, last_wait = -1;
+        bool wait_ok = true;
+        auto take = [&] {
+            return strata::ds4::take_table_input(next, kSlots, [&](int k) { return state[(size_t) k]; },
+                                                 [&](int k) {
+                                                     ++waits;
+                                                     last_wait = k;
+                                                     if (wait_ok) state[(size_t) k] = 0;
+                                                     return wait_ok;
+                                                 });
+        };
+        for (int t = 0; t < 2 * kSlots; ++t) {   // ordinary ticks: every reader done before its input comes round
+            assert(take() == t % kSlots);
+            state[(size_t) (t % kSlots)] = 0;
+        }
+        assert(waits == 0);
+        for (int t = 0; t < kSlots; ++t) {   // back-to-back flushes: each input's reader still queued
+            assert(take() == t);
+            state[(size_t) t] = 1;
+        }
+        assert(waits == 0);
+        assert(take() == 0 && waits == 1 && last_wait == 0);   // (the oldest input: its own reader waited for)
+        assert(take() == 1 && waits == 2 && last_wait == 1);
+        state[2] = -1;
+        assert(take() == -1 && waits == 2);   // (a query error: no wait, an error)
+        wait_ok = false;
+        assert(take() == -1 && waits == 3 && last_wait == 3);   // (a wait error)
+        assert(next == 0);
+    }
     std::puts("ds4_cache_swap_test: ok");
 }
