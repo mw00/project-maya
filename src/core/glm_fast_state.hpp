@@ -417,8 +417,11 @@ void read_slice(const Glm5Model::Shard& sh, uint64_t off, size_t len, uint8_t* d
 inline size_t expert_stride(size_t blob, int gu_type, int d_type) {
     // an EXL3 blob: every piece is a multiple of 256 bytes, no ggml blocks to keep whole (the prompt path does not
     // multiply these with MMQ)
-    if (gu_type == strata::kernels::exl3::kTypeEXL3 || d_type == strata::kernels::exl3::kTypeEXL3)
-        return (blob + 255) / 256 * 256;
+    if (gu_type == strata::kernels::exl3::kTypeEXL3 || d_type == strata::kernels::exl3::kTypeEXL3) {
+        // MAYA_GLM_EXPERTS_BIN: slots at 4096-byte boundaries, so an expert is read straight into its slot
+        static const size_t a = std::getenv("MAYA_GLM_EXPERTS_BIN") != nullptr ? 4096 : 256;
+        return (blob + a - 1) / a * a;
+    }
     size_t a = 16;
     const size_t b1 = ggml_type_size((ggml_type) gu_type), b2 = ggml_type_size((ggml_type) d_type);
     if (b1 > 0) a = std::lcm(a, b1);
