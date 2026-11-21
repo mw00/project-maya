@@ -427,7 +427,7 @@ class OtherQuantsTest(unittest.TestCase):
         self.assertEqual(model_pull.IK2_MIN_CC, maya.IK2_MIN_CC)
         model_pull._other_gb.clear()
         try:
-            self.assertAlmostEqual(model_pull._other_sizes()["inkling-2-mini"], 17.6, places=1)   # (the GGUF alone)
+            self.assertAlmostEqual(model_pull._other_sizes()["inkling-2-mini"], 18.3, places=1)   # (the GGUF + mmproj)
         finally:
             model_pull._other_gb.clear()
 

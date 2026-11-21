@@ -202,8 +202,9 @@ def _other_sizes() -> dict:
             elif fam == "qwen":                        # (its files and the vision tower the setup fetches with them)
                 vision = maya.qwen_vision_model()
                 gb = maya.qwen_entry(key)["download_gb"] + (vision["download_gb"] if vision else 0)
-            elif fam == "ik2":                         # (the GGUF)
-                gb = maya.ik2_entry()["download_gb"]
+            elif fam == "ik2":                         # (the GGUF and the vision tower the setup fetches with it)
+                vision = maya.ik2_vision_model()
+                gb = maya.ik2_entry()["download_gb"] + (vision["download_gb"] if vision else 0)
             else:
                 continue                               # (GLM's: the MODELS table, as Maya's own)
             _other_gb[ident] = round(float(gb), 1)
