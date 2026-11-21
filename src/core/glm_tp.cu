@@ -33,9 +33,6 @@
 #include <sstream>
 #include <thread>
 #include <vector>
-#if defined(__x86_64__) || defined(_M_X64)
-#include <immintrin.h>
-#endif
 
 namespace maya::core {
 
@@ -45,8 +42,8 @@ inline double now_s() {
     return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 inline void cpu_relax() {
-#if defined(__x86_64__) || defined(_M_X64)
-    _mm_pause();
+#if defined(__x86_64__)
+    __builtin_ia32_pause();
 #endif
 }
 
