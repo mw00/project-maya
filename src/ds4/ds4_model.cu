@@ -5803,9 +5803,19 @@ struct Model::Impl {
         }
         return true;
     }
-    // hc_mix over a chunk: the dots by an F32 GEMM, then the rms scale
+    // hc_mix over a chunk: the dots by an F32 GEMM, then the rms scale.  DS4_HC_MIX_ROWS=1 (opt-in): one launch
+    // instead, a block of 1-4 tokens reading their rows once for all their mixes - the decode path's hc_mix bits (the GEMM's
+    // M = 24 by K = 16,384 leaves a few workgroups busy: ~0.7-0.9 ms a call at 129-513 rows, twice a layer)
+    static bool hc_mix_rows_on() {
+        static const bool on = [] {
+            const char* v = ds4_env("DS4_HC_MIX_ROWS");
+            return v != nullptr && std::atoi(v) != 0;
+        }();
+        return on;
+    }
     bool hc_mix_chunk(Dev& d, Chunk& c, const float* h, const float* fn, int T, float* mixes, std::string& err) {
         const int hcd = g.hc * g.dim, n_mix = (2 + g.hc) * g.hc;
+        if (hc_mix_rows_on() && hc_mix_rows(h, fn, hcd, n_mix, T, g.eps, mixes, d.st)) return true;
         const float one = 1.0f, zero = 0.0f;
         if (cublasSgemm(c.blas, CUBLAS_OP_T, CUBLAS_OP_N, n_mix, T, hcd, &one, fn, hcd, h, hcd, &zero, mixes, 32) !=
             CUBLAS_STATUS_SUCCESS) {
