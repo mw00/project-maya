@@ -5072,7 +5072,12 @@ bool fa_wgmma() {
     return on != 0;
 }
 #ifdef STRATA_USE_HIP
-bool attn_flash_available() { return false; }   // (AMD: the kernel's 86 KB of shared memory is past RDNA's 64 KB)
+// (AMD: the matrix-core kernel of ik2_rdna.inc on RDNA 3 / 3.5 / 4 - the CUDA kernel's 86 KB of shared memory is past
+//  RDNA's 64 KB; IK2_RDNA_FLASH=0: off)
+bool attn_flash_available() {
+    static const bool on = !(std::getenv("IK2_RDNA_FLASH") && !std::atoi(std::getenv("IK2_RDNA_FLASH"))) && rdna_wmma_gpu();
+    return on;
+}
 #else
 bool attn_flash_available() { return true; }
 #endif
@@ -5080,6 +5085,11 @@ template <int NW, bool WG, class KVT>
 void attn_flash_launch(const uint16_t* q16, int q_ld, const KVT* kc, const KVT* vc, int kv_cap, int H, int KV,
                        int Tq, int qpos0, float qk_scale, const float* bias, int extent, int window, int n_split,
                        float* o_part, float2* ml_part, cudaStream_t s) {
+#ifdef STRATA_USE_HIP
+    attn_flash_rdna<KVT>(q16, q_ld, kc, vc, kv_cap, H, KV, Tq, qpos0, qk_scale, bias, extent, window, n_split, o_part,
+                         ml_part, s);
+    return;
+#endif
     static bool attr[16] = {};   // (per device: the attribute is a device's, and the layer split runs on several)
     int dev = 0;
     cudaGetDevice(&dev);

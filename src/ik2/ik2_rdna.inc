@@ -183,16 +183,188 @@ __global__ void moe_rows_combine_kernel(const float* __restrict__ y, const int* 
         ((float4*) (out + (size_t) t * C))[c4] = a;
     }
 }
+
+// The prompt's fused attention (attn_flash_f16_kernel's job and outputs: a split's unnormalised rows and (max, sum),
+// merged with the sink by attn_flash_combine_kernel) on the matrix cores.  A block: 64 queries (4 warps x 16) of one
+// head against a split of its keys in tiles of 64; S = Q K^T (Q in the registers, K as it lies), the online softmax
+// in the log2 domain on S's layout (a lane: 8 query rows x one key a 16-key column), P through the warp's part of
+// shared memory into the A layout, O += P V from V stored transposed.  54 KB of shared memory (RDNA's 64 KB).
+constexpr int kRfNW = 4, kRfBN = 64, kRfLd = kFaD + 8, kRfVld = kRfBN + 8, kRfBld = 72;
+template <class KVT>
+__global__ void __launch_bounds__(kRfNW * 32)
+attn_flash_rdna_kernel(const uint16_t* __restrict__ q16, int q_ld, const KVT* __restrict__ kc,
+                       const KVT* __restrict__ vc, int kv_cap, int H, int KV, int Tq, int qpos0, float qk_scale,
+                       const float* __restrict__ bias, int extent, int window, int n_split, float* __restrict__ o_part,
+                       float2* __restrict__ ml_part) {
+#if defined(MAYA_RDNA_WMMA)
+    using namespace maya::kernels;
+    __shared__ __align__(16) uint16_t Ks[kRfBN * kRfLd];   // [key][dim]
+    __shared__ __align__(16) uint16_t Vt[kFaD * kRfVld];   // [dim][key]
+    __shared__ __align__(16) float Bws[kRfNW * 16 * kRfBld];
+    constexpr bool F8 = sizeof(KVT) == 1;
+    const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, hi = lane >> 4, ln = lane & 15;
+    float* Bw = Bws + warp * 16 * kRfBld;   // this warp's bias rows [16][kRfBld], then its P [16][kRfVld] (FP16)
+    uint16_t* Ps = (uint16_t*) Bw;
+    const int h = blockIdx.y, split = blockIdx.z, g = h / (H / KV), KD = KV * kFaD;
+    constexpr int BM = 16 * kRfNW;
+    const int i0 = blockIdx.x * BM, i_last = min(Tq, i0 + BM) - 1;
+    const int k_hi = qpos0 + i_last + 1, k_lo = max(0, qpos0 + i0 - window + 1);
+    const int n_tiles = (k_hi - k_lo + kRfBN - 1) / kRfBN;
+    const int per = (n_tiles + n_split - 1) / n_split;
+    const int t0 = min(n_tiles, split * per), t1 = min(n_tiles, t0 + per);
+    const int wi = i0 + warp * 16;
+    wmma_h16 qf[kFaD / 16];   // (the lane's query row wi + ln, its 128 dims)
+    {
+        const int iq = wi + ln;
+        const uint16_t* qr = q16 + (size_t) (iq < Tq ? iq : 0) * q_ld + (size_t) h * kFaD;
+#pragma unroll
+        for (int kk = 0; kk < kFaD / 16; ++kk) qf[kk] = iq < Tq ? rm_frag(qr + kk * 16) : wmma_h16{};
+    }
+    wmma_f8 o[kFaD / 16];
+#pragma unroll
+    for (int j = 0; j < kFaD / 16; ++j) o[j] = wmma_f8{};
+    float mx[8], ls[8];
+#pragma unroll
+    for (int i = 0; i < 8; ++i) mx[i] = -INFINITY, ls[i] = 0.0f;
+    const float sc = qk_scale * kLog2e;
+    for (int t = t0; t < t1; ++t) {
+        const int kt = k_lo + t * kRfBN;
+        __syncthreads();   // (the previous tile's reads done)
+#pragma unroll
+        for (int it = 0; it < (kRfBN * kFaD / 8) / (kRfNW * 32); ++it) {
+            const int c = it * kRfNW * 32 + tid, row = c >> 4, col = (c & 15) * 8;
+            const int kp = kt + row;
+            const bool ok = kp < k_hi;
+            const int pr = ok ? (kv_cap > 0 ? kp % kv_cap : kp) : 0;
+            const size_t off = (size_t) pr * KD + (size_t) g * kFaD + col;
+            uint4 kv, vv;
+            if constexpr (F8) {
+                kv = ok ? e4m3x8_h8(*(const uint2*) (kc + off)) : make_uint4(0u, 0u, 0u, 0u);
+                vv = ok ? e4m3x8_h8(*(const uint2*) (vc + off)) : make_uint4(0u, 0u, 0u, 0u);
+            } else {
+                kv = ok ? *(const uint4*) (kc + off) : make_uint4(0u, 0u, 0u, 0u);
+                vv = ok ? *(const uint4*) (vc + off) : make_uint4(0u, 0u, 0u, 0u);
+            }
+            *(uint4*) (Ks + row * kRfLd + col) = kv;
+            const uint32_t vw[4] = {vv.x, vv.y, vv.z, vv.w};
+#pragma unroll
+            for (int e = 0; e < 4; ++e) {
+                Vt[(col + 2 * e) * kRfVld + row] = (uint16_t) (vw[e] & 0xFFFFu);
+                Vt[(col + 2 * e + 1) * kRfVld + row] = (uint16_t) (vw[e] >> 16);
+            }
+        }
+        // does this warp's rows see any key of the tile, and is any distance within the bias's extent?
+        const bool any = !(kt > qpos0 + wi + 15 || kt + kRfBN - 1 < qpos0 + wi - window + 1) && wi < Tq;
+        const bool near = qpos0 + wi - (kt + kRfBN - 1) < extent;
+        if (any && near) {
+            for (int rr = 0; rr < 16; ++rr) {
+                const int i = wi + rr, qp = qpos0 + i;
+                const float* brow = bias + ((size_t) i * H + h) * extent;
+#pragma unroll
+                for (int hf = 0; hf < 2; ++hf) {
+                    const int c = hf * 32 + lane, dist = qp - kt - c;
+                    const bool ok = i < Tq && dist >= 0 && dist < extent;
+                    Bw[rr * kRfBld + c] = ok ? brow[dist] : 0.0f;
+                }
+            }
+        }
+        __syncthreads();
+        if (!any) continue;
+        wmma_f8 s[kRfBN / 16];
+#pragma unroll
+        for (int j = 0; j < kRfBN / 16; ++j) s[j] = wmma_f8{};
+#pragma unroll
+        for (int kk = 0; kk < kFaD / 16; ++kk)
+#pragma unroll
+            for (int j = 0; j < kRfBN / 16; ++j)
+                s[j] = wmma_f16(qf[kk], rm_frag(Ks + (16 * j + ln) * kRfLd + kk * 16), s[j]);
+        // logits (log2 units): scale, bias, mask; the rows' new maxima
+        float cf[8], u[8];
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            const int m = wmma_row(i, hi), ia = wi + m, qa = qpos0 + ia;
+            float mxi = -INFINITY;
+#pragma unroll
+            for (int j = 0; j < kRfBN / 16; ++j) {
+                const int c = 16 * j + ln, kp = kt + c;
+                float v = s[j][i] * sc;
+                if (near) v += Bw[m * kRfBld + c] * kLog2e;
+                v = (qa - kp < 0 || kp < qa - window + 1 || ia >= Tq) ? -INFINITY : v;
+                s[j][i] = v;
+                mxi = fmaxf(mxi, v);
+            }
+#pragma unroll
+            for (int sh = 1; sh < 16; sh <<= 1) mxi = fmaxf(mxi, __shfl_xor_sync(0xffffffffu, mxi, sh));
+            const float mn = fmaxf(mx[i], mxi);
+            cf[i] = mn == -INFINITY ? 1.0f : exp2f(mx[i] - mn);
+            u[i] = mn == -INFINITY ? 0.0f : mn;
+            mx[i] = mn;
+            ls[i] *= cf[i];
+        }
+#pragma unroll
+        for (int j = 0; j < kFaD / 16; ++j)
+#pragma unroll
+            for (int i = 0; i < 8; ++i) o[j][i] *= cf[i];
+        __syncwarp();   // (every lane's bias reads done: P is written over them)
+#pragma unroll
+        for (int j = 0; j < kRfBN / 16; ++j)
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                const float p = exp2f(s[j][i] - u[i]);
+                ls[i] += p;
+                Ps[wmma_row(i, hi) * kRfVld + 16 * j + ln] = f2h(p);
+            }
+        __syncwarp();
+#pragma unroll
+        for (int kk = 0; kk < kRfBN / 16; ++kk) {
+            const wmma_h16 a = rm_frag(Ps + ln * kRfVld + kk * 16);
+#pragma unroll
+            for (int j = 0; j < kFaD / 16; ++j) o[j] = wmma_f16(a, rm_frag(Vt + (16 * j + ln) * kRfVld + kk * 16), o[j]);
+        }
+    }
+#pragma unroll
+    for (int i = 0; i < 8; ++i)
+#pragma unroll
+        for (int sh = 1; sh < 16; sh <<= 1) ls[i] += __shfl_xor_sync(0xffffffffu, ls[i], sh);
+    // the split's partials: o_part [split][Tq][H][D], ml_part [split][Tq][H] = (max in log2 units, sum)
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        const int ia = wi + wmma_row(i, hi);
+        if (ia >= Tq) continue;
+        float* op = o_part + (((size_t) split * Tq + ia) * H + h) * kFaD + ln;
+#pragma unroll
+        for (int j = 0; j < kFaD / 16; ++j) op[16 * j] = o[j][i];
+        if (ln == 0) ml_part[((size_t) split * Tq + ia) * H + h] = make_float2(mx[i], ls[i]);
+    }
+#else
+    __trap();   // (never launched: attn_flash_available() is false without the matrix cores)
+#endif
+}
+
+// an RDNA 3 / 3.5 / 4 GPU (the current one), whose matrix-core kernels this build has
+bool rdna_wmma_gpu() {
+    int dev = 0;
+    cudaDeviceProp p{};
+    if (cudaGetDevice(&dev) != cudaSuccess || cudaGetDeviceProperties(&p, dev) != cudaSuccess) return false;
+    const std::string a = p.gcnArchName;
+    return a.rfind("gfx11", 0) == 0 || a.rfind("gfx12", 0) == 0;
+}
+
+template <class KVT>
+void attn_flash_rdna(const uint16_t* q16, int q_ld, const KVT* kc, const KVT* vc, int kv_cap, int H, int KV, int Tq,
+                     int qpos0, float qk_scale, const float* bias, int extent, int window, int n_split, float* o_part,
+                     float2* ml_part, cudaStream_t s) {
+    const dim3 grid((unsigned) ((Tq + 16 * kRfNW - 1) / (16 * kRfNW)), (unsigned) H, (unsigned) n_split);
+    attn_flash_rdna_kernel<KVT><<<grid, kRfNW * 32, 0, s>>>(q16, q_ld, kc, vc, kv_cap, H, KV, Tq, qpos0, qk_scale,
+                                                            bias, extent, window, n_split, o_part, ml_part);
+    check("attn_flash_rdna");
+}
 }  // namespace
 
 bool experts_rdna_available(int ty_gate, int ty_up, int ty_down, int C, int F) {
     static const int on = [] {   // (the current GPU: an RDNA 3 / 3.5 / 4 one of this build; IK2_RDNA_MOE=0: off)
         if (std::getenv("IK2_RDNA_MOE") && !std::atoi(std::getenv("IK2_RDNA_MOE"))) return 0;
-        int dev = 0;
-        cudaDeviceProp p{};
-        if (cudaGetDevice(&dev) != cudaSuccess || cudaGetDeviceProperties(&p, dev) != cudaSuccess) return 0;
-        const std::string a = p.gcnArchName;
-        return (a.rfind("gfx11", 0) == 0 || a.rfind("gfx12", 0) == 0) ? 1 : 0;
+        return rdna_wmma_gpu() ? 1 : 0;
     }();
     const bool fmt = (ty_gate == kNVFP4 || ty_gate == kQ8_0) && ty_up == ty_gate && ty_down == ty_gate;
     return on && fmt && C % kRmBN == 0 && F % kRmBN == 0 && C % kRmBK == 0 && F % kRmBK == 0;
