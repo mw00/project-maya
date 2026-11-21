@@ -34,6 +34,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -3686,6 +3687,20 @@ struct Model::Impl {
             }
             eg_table = pk.data(*tt);
             eg_bytes = tt->bytes;
+            const char* ram = std::getenv("HY4_ENGRAM_RAM");
+            const bool lock_engram = ram && std::atoi(ram) != 0;
+            if (lock_engram) {
+#if defined(__linux__)
+                if (mlock(eg_table, eg_bytes) != 0) {
+                    err = std::string("Hy4 Engram RAM lock failed: ") + std::strerror(errno);
+                    return false;
+                }
+                info.push_back("INFO Hy4 Engram RAM locked: " + std::to_string(eg_bytes) + " bytes");
+#else
+                err = "HY4_ENGRAM_RAM requires Linux";
+                return false;
+#endif
+            }
             if (pk.has("engram_eps")) eg_eps = (float) pk.num("engram_eps");
             if (const char* ee = std::getenv("HY4_ENGRAM_EPS")) eg_eps = (float) std::atof(ee);
             if (!(eg_eps > 0.0f) || eg_eps > 1.0f) {
@@ -3711,12 +3726,13 @@ struct Model::Impl {
             // queue on the process's memory map.  Off unless asked (HY4_EG_POPULATE=1): the table stays on the disk and
             // a looked-up row's page is read at its first use - Maya never pulls an n-gram table into RAM by itself
             const char* ep = std::getenv("HY4_EG_POPULATE");
-            const bool eg_populate = ep && std::atoi(ep) != 0;
+            const bool eg_populate = !lock_engram && ep && std::atoi(ep) != 0;
             {
                 char buf[240];
                 std::snprintf(buf, sizeof buf, "INFO Engram: %d layers, %s; norm eps %.9g; row scales %s",
                               pk.eg.modules,
-                              eg_populate ? "the table's pages mapped in the background (HY4_EG_POPULATE)"
+                              lock_engram ? "the table locked in RAM"
+                              : eg_populate ? "the table's pages mapped in the background (HY4_EG_POPULATE)"
                                           : "the table read from the disk a row at a time",
                               (double) eg_eps, eg_scale ? "on" : "none");
                 info.push_back(buf);
