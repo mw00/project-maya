@@ -8248,6 +8248,153 @@ int main(int argc, char** argv) {
             hist_sig.clear();
             last.clear();
         };
+        // The session cache (IK2_SESSION_CACHE_GB, 0 / unset: off): the state at the latest snapshot of a session
+        // that is about to be replaced - another session's request, or one that shares too little to continue it -
+        // put aside in host RAM (the full layers' KV rows before it, the snapshot itself, the drafter's context
+        // rows), and taken up again by a request that starts with that session's tokens.  Agents that take turns on
+        // one engine (a coding agent and its subagents, two chats) then each read only their new tokens.  Least
+        // recently used goes first past the budget; a session shorter than IK2_SESSION_CACHE_MIN (1024) is not kept.
+        struct Stash {
+            std::vector<int> tok;                           // the session's tokens up to its snapshot (pos)
+            std::vector<uint64_t> sig;
+            int pos = 0;
+            std::vector<std::vector<float>> h;              // [visit * 4 + conv]
+            std::vector<std::vector<uint8_t>> kv_k, kv_v;   // [visit]: a full layer's rows 0 .. pos - 1, a window's Snap copy
+            std::vector<uint8_t> draft;
+            size_t bytes = 0;
+            uint64_t used = 0;
+        };
+        std::list<Stash> stash;
+        size_t sc_budget = getenv("IK2_SESSION_CACHE_GB")
+                               ? (size_t) (std::max(0.0, std::atof(getenv("IK2_SESSION_CACHE_GB"))) * 1073741824.0)
+                               : 0;
+        const int sc_min = getenv("IK2_SESSION_CACHE_MIN") ? std::max(1, std::atoi(getenv("IK2_SESSION_CACHE_MIN"))) : 1024;
+        size_t sc_bytes = 0;
+        uint64_t sc_clock = 0;
+        // (off with --parallel: its own loop keeps each conversation in a slot; off with KV streaming: a full visit's
+        //  K / V in host RAM or swinging between the two, where the copies below expect them in VRAM)
+        if (sc_budget && (g_par > 1 || g_kv_streaming || g_kv_swing >= 0)) {
+            std::fprintf(stderr, "session cache: off (%s)\n",
+                         g_par > 1 ? "--parallel" : "the K / V cache streamed from RAM");
+            sc_budget = 0;
+        }
+        if (sc_budget)
+            std::fprintf(stderr, "session cache: up to %.1f GiB of host RAM, sessions of %d tokens or more\n",
+                         sc_budget / 1073741824.0, sc_min);
+        auto full_kv = [&](const Layer& Ly) { return !(Ly.sliding && Ly.kv_cap < ctx); };
+        // the session on the GPU (its latest snapshot) into the cache; `keep`: an entry not to evict or replace
+        auto stash_put = [&](std::list<Stash>::iterator keep) {
+            if (!sc_budget) return;
+            int b = -1;
+            for (int i = 0; i < (int) snaps.size(); ++i)
+                if (snaps[i].pos >= 0 && (b < 0 || snaps[i].pos > snaps[b].pos)) b = i;
+            if (b < 0 || snaps[b].pos < sc_min || snaps[b].pos > (int) hist.size()) return;
+            const Snap& sn = snaps[b];
+            const int pos = sn.pos;
+            auto sig_at = [&](const std::vector<uint64_t>& s, int i) { return i < (int) s.size() ? s[i] : (uint64_t) 0; };
+            // (an entry of this session at an earlier turn: a prefix of it, superseded)
+            for (auto it = stash.begin(); it != stash.end();) {
+                bool prefix = it != keep && it->pos <= pos;
+                for (int i = 0; prefix && i < it->pos; ++i)
+                    prefix = it->tok[i] == hist[i] && sig_at(it->sig, i) == sig_at(hist_sig, i);
+                if (prefix) sc_bytes -= it->bytes, it = stash.erase(it);
+                else ++it;
+            }
+            const double ts = now();
+            Stash s;
+            s.pos = pos;
+            s.tok.assign(hist.begin(), hist.begin() + pos);
+            s.sig.assign(hist_sig.begin(), hist_sig.begin() + std::min((size_t) pos, hist_sig.size()));
+            const size_t cc[4] = {KD, KD, C, C};
+            const size_t row_b = (size_t) KD * kv_elem_b;
+            s.h.resize(M.V.size() * 4), s.kv_k.resize(M.V.size()), s.kv_v.resize(M.V.size());
+            for (size_t l = 0; l < M.V.size(); ++l) {   // (l: a visit)
+                Layer& Ly = bind_visit(M, (int) l);
+                use_dev(Ly.dev);
+                for (int i = 0; i < 4; ++i) {
+                    s.h[l * 4 + i].resize(3 * cc[i]);
+                    CU(cudaMemcpyAsync(s.h[l * 4 + i].data(), sn.h[l * 4 + i], 3 * cc[i] * 4, cudaMemcpyDeviceToHost, g_s));
+                }
+                if (!full_kv(Ly)) {
+                    s.kv_k[l] = sn.kv_k[l], s.kv_v[l] = sn.kv_v[l];
+                } else {
+                    s.kv_k[l].resize((size_t) pos * row_b), s.kv_v[l].resize((size_t) pos * row_b);
+                    CU(cudaMemcpyAsync(s.kv_k[l].data(), g_kv_fp8 ? Ly.kc8 : (uint8_t*) Ly.kc, (size_t) pos * row_b,
+                                       cudaMemcpyDeviceToHost, g_s));
+                    CU(cudaMemcpyAsync(s.kv_v[l].data(), g_kv_fp8 ? Ly.vc8 : (uint8_t*) Ly.vc, (size_t) pos * row_b,
+                                       cudaMemcpyDeviceToHost, g_s));
+                }
+            }
+            for (auto& D : g_dev) CU(cudaStreamSynchronize(D.s));
+            if (drafter) ik2::draft::save_context(drafter, pos, s.draft);
+            s.bytes = s.tok.size() * 4 + s.sig.size() * 8 + s.draft.size();
+            for (auto& v : s.h) s.bytes += v.size() * 4;
+            for (size_t l = 0; l < s.kv_k.size(); ++l) s.bytes += s.kv_k[l].size() + s.kv_v[l].size();
+            if (s.bytes > sc_budget) return;
+            while (sc_bytes + s.bytes > sc_budget) {   // (the least recently used first)
+                auto lru = stash.end();
+                for (auto it = stash.begin(); it != stash.end(); ++it)
+                    if (it != keep && (lru == stash.end() || it->used < lru->used)) lru = it;
+                if (lru == stash.end()) return;
+                sc_bytes -= lru->bytes;
+                stash.erase(lru);
+            }
+            s.used = ++sc_clock;
+            sc_bytes += s.bytes;
+            std::fprintf(stderr, "session cache: put aside %d tokens (%.0f MiB) in %.0f ms; %zu sessions, %.1f GiB\n", pos,
+                         s.bytes / 1048576.0, (now() - ts) * 1e3, stash.size() + 1, sc_bytes / 1073741824.0);
+            stash.push_back(std::move(s));
+        };
+        // the cached session a request starts with (its tokens, then at least one more): the longest
+        auto stash_find = [&](const std::vector<int>& ids, const std::vector<uint64_t>& sig) {
+            auto best = stash.end();
+            for (auto it = stash.begin(); it != stash.end(); ++it) {
+                if (it->pos >= (int) ids.size() || (best != stash.end() && it->pos <= best->pos)) continue;
+                bool match = true;
+                for (int i = 0; match && i < it->pos; ++i)
+                    match = it->tok[i] == ids[i] && (i < (int) it->sig.size() ? it->sig[i] : (uint64_t) 0) == sig[i];
+                if (match) best = it;
+            }
+            return best;
+        };
+        // a cached session back on the GPU, as the session there (it leaves the cache)
+        auto stash_take = [&](std::list<Stash>::iterator it) {
+            const double ts = now();
+            Stash& s = *it;
+            lend_check(M, s.pos);   // (experts lent the K / V rows it writes given back first)
+            Snap& sn = snaps[snap_next];
+            snap_next = (snap_next + 1) % (int) snaps.size();
+            const size_t cc[4] = {KD, KD, C, C};
+            const size_t row_b = (size_t) KD * kv_elem_b;
+            for (size_t l = 0; l < M.V.size(); ++l) {   // (l: a visit)
+                Layer& Ly = bind_visit(M, (int) l);
+                use_dev(Ly.dev);
+                for (int i = 0; i < 4; ++i)
+                    CU(cudaMemcpyAsync(sn.h[l * 4 + i], s.h[l * 4 + i].data(), 3 * cc[i] * 4, cudaMemcpyHostToDevice, g_s));
+                if (!full_kv(Ly)) {
+                    sn.kv_k[l] = std::move(s.kv_k[l]), sn.kv_v[l] = std::move(s.kv_v[l]);
+                } else {
+                    CU(cudaMemcpyAsync(g_kv_fp8 ? Ly.kc8 : (uint8_t*) Ly.kc, s.kv_k[l].data(), (size_t) s.pos * row_b,
+                                       cudaMemcpyHostToDevice, g_s));
+                    CU(cudaMemcpyAsync(g_kv_fp8 ? Ly.vc8 : (uint8_t*) Ly.vc, s.kv_v[l].data(), (size_t) s.pos * row_b,
+                                       cudaMemcpyHostToDevice, g_s));
+                }
+            }
+            for (auto& D : g_dev) CU(cudaStreamSynchronize(D.s));
+            for (auto& o : snaps) o.pos = -1;
+            sn.pos = s.pos;
+            snap_copy(sn, false);   // (the convs' histories and the windows, as a snapshot of this session's)
+            if (drafter) ik2::draft::load_context(drafter, s.pos, s.draft);
+            hist = std::move(s.tok);
+            hist_sig = std::move(s.sig);
+            last.clear();
+            const int pos = sn.pos;
+            sc_bytes -= s.bytes;
+            stash.erase(it);
+            std::fprintf(stderr, "session cache: took up %d tokens in %.0f ms; %zu sessions, %.1f GiB left\n", pos,
+                         (now() - ts) * 1e3, stash.size(), sc_bytes / 1073741824.0);
+            return pos;
+        };
         auto parse_ints = [](const std::string& t) {
             std::vector<int> v;
             for (const char* p = t.c_str(); *p;) {
@@ -9001,6 +9148,23 @@ int main(int argc, char** argv) {
             }
             auto hsig = [&](size_t i) { return i < hist_sig.size() ? hist_sig[i] : (uint64_t) 0; };
             while (L < hist.size() && L < ids.size() && hist[L] == ids[L] && hsig(L) == sig[L]) ++L;
+            if (sc_budget && !stash.empty()) {
+                // what the session on the GPU gives this request (a continuation, or a snapshot to go back to)
+                // against the cached session it starts with: the longer one goes on
+                size_t here = 0;
+                if (L == hist.size()) {
+                    here = L;
+                } else {
+                    for (const auto& sn : snaps)
+                        if (sn.pos >= 0 && sn.pos <= (int) L && sn.pos < (int) ids.size()) here = std::max(here, (size_t) sn.pos);
+                }
+                auto it = stash_find(ids, sig);
+                if (it != stash.end() && (size_t) it->pos > here) {
+                    it->used = ++sc_clock;
+                    stash_put(it);   // (the session on the GPU first: this request replaces it)
+                    L = (size_t) stash_take(it);
+                }
+            }
             if (L < hist.size() || L == ids.size()) {
                 // back to the latest snapshot at or before L that leaves a token to run (one past it is dropped:
                 // its position's state follows from a prefix the request does not share)
@@ -9021,6 +9185,7 @@ int main(int argc, char** argv) {
                     last.clear();
                     L = sp;
                 } else {
+                    stash_put(stash.end());   // (another session, or too little shared: the one there is kept aside)
                     reset(), L = 0;
                 }
             }
@@ -9085,6 +9250,7 @@ int main(int argc, char** argv) {
                 }
             }
             if (cancelled) {
+                stash_put(stash.end());   // (its snapshots are still good: the prompt ran only past them)
                 reset();
                 if (serve_maya) std::printf("DONE 0 %zu %.1f 0 cancel 0 0 %d 0 0\n", ids.size(), (now() - t0) * 1e3, cached);
                 else std::printf("@END cancelled %zu %d %.3f %.3f\n", ids.size(), cached, now() - t0, 0.0);
