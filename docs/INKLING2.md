@@ -286,8 +286,24 @@ flips codes of a 3-bit mantissa.
 (`GENI`), the engine puts them in place of the image tokens (`--image-token`, 200054) without the embedding's norm.
 640 x 448 is 192 tokens and 22 ms.
 
-**The drafter** is left out: DSpark for Mini accepts 2.0-4.2 tokens a step (llama.cpp's implementation: prose 2.0,
-code 3.1, sums 4.2), and a window of eight - eight tokens' experts - pays for itself from about 3.3.
+**The drafter** (`--draft mtp.safetensors`, the official DSpark checkpoint: 3 layers; its taps the stream at
+visits 5, 23 and 41 and the final hidden, `mtp_config.target_layer_ids`) drafts after the last chosen token, and the
+model checks the window - the anchor and the drafts - in one go on the **block path** (`fast_block`): the resident
+token path for 2 .. 8 tokens, every position read from the device, the picks grouped by expert on the device (an
+expert's blocks read once for the tokens that picked it: 5 tokens need 2.7 times one token's experts, not 5), the
+attention a key's rows read once for the window's queries, the convs' histories and inputs recorded and taken back
+in one launch for the rejected tokens - one CUDA graph a window size. A window of 5 costs 15.6 ms against a token's
+7.8. Greedy keeps the agreeing drafts and the model's next token; sampling accepts a draft with the model's
+probability of it and otherwise samples the model's distribution without it, which is the model's distribution
+exactly.
+
+Whether a window pays depends on the text: the drafts are taken 1.8 tokens a step in prose, 3 in new code, 4.3 in a
+document's edit. A controller decides each step (`SpecCtl`): a window of B's expected tokens, (1 - a^B) / (1 - a)
+with a the recent acceptance, over its measured time, against a plain token's; after 8 plain tokens it drafts once
+to look again. One RTX 3090, greedy, against plain decode: prose 131 / 127 tok/s, new code 162 / 126, an edit 213 /
+124; through the server new code 207 tok/s, at temperature 0.7 209. The drafter's context: its windowed layers a
+ring of 2048 rows, the layer without a window the whole context in FP16 (`IK2_DRAFT_CTX` caps it: a 64K document
+continues at 3.07 tokens a step with the whole context, 2.24 with the last 16K).
 
 To run it (one GPU):
 
@@ -304,5 +320,7 @@ To run it (one GPU):
 Thinking off (`reasoning_effort` `none`, `enable_thinking` false) has the prompt open the answer's text segment:
 the model has no switch for its thinking, only the effort level, and at the lowest it still thinks a little.
 
-Not done: two GPUs and the drafter with a loop (the engine refuses them), the loop in the layer-major prompt
-passes (`IK2_SUP`: off for a looped model), a second card for the KV cache (a million tokens is 16 GiB of it).
+Two GPUs with a loop run as expert parallel (`IK2_EP=1`, its caches filled at the start: checked on Windows, an
+RTX 5080 with an RTX 4060 Ti); the drafter is one GPU's.  Not done: the loop in the layer-major prompt passes (`IK2_SUP`: off
+for a looped model), a second card for the KV cache (a million tokens is 16 GiB of it), the drafter's own launches
+as a graph (2-3 ms a step now).
