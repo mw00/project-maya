@@ -6,16 +6,26 @@ path that shares none of its code.
 
 The token ids come from the server's tokenizer (maya-ds4 --serve, or the engine's own --ids runs); --dump writes
 what tools/ds4/compare.py reads.
+
+--workers N runs the routed low-bit experts (the ones gguf-py dequantises) in N spawned CPU worker processes, each
+re-opening the pack: for speed when screening (finding real bugs or large gaps).  Per layer the workers match serial
+to float tolerance; end to end the logits are close, not identical, about as close as two serial runs with different
+thread counts (on real text mean KL around 2e-3), so differences that small between engines are within the oracle's
+own noise either way.  Default 1 is the serial path; 0 means one worker per CPU (affinity mask), up to 8.
 """
 from __future__ import annotations
 
 import argparse
 import math
+import multiprocessing
 import os
 import pathlib
 import struct
 import sys
+import threading
 import time
+from collections import deque
+from concurrent.futures import ProcessPoolExecutor
 from types import SimpleNamespace
 
 import numpy as np
@@ -108,6 +118,83 @@ def gq_values(raw: np.ndarray, dt: str, name: str) -> np.ndarray:
     return np.ascontiguousarray(gq_dequant(raw, qt), dtype=np.float32).reshape(-1)
 
 
+TORCH_DTS = ("F32", "F16", "BF16", "Q8_0", "MXFP4", "MXFP8")   # the types dequant() decodes in torch
+
+_PAR_ST = None
+_PAR_TPC = None   # keeps a threadpool_limits context alive for a worker's whole life
+
+
+def _par_init(pack_dir):
+    """Worker initializer (spawn: a fresh interpreter): reopen the pack here and cap this worker at one thread."""
+    global _PAR_ST, _PAR_TPC
+    try:
+        torch.set_num_threads(1)
+    except Exception:
+        pass
+    try:
+        import threadpoolctl
+        _PAR_TPC = threadpoolctl.threadpool_limits(1)
+        _PAR_TPC.__enter__()
+    except Exception:
+        pass
+    _PAR_ST = Pack(pathlib.Path(pack_dir))
+
+
+_CAPS = ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS")
+# the caps are process-wide, so they are shared by every live pool (two RefGguf objects with workers > 1, say):
+# the first pool's creation saves the old values and sets the caps, the last pool's close() restores them
+_CAPS_LOCK = threading.Lock()
+_CAPS_LIVE = 0        # pools that currently hold the caps
+_CAPS_SAVED = None    # the values saved when the first of them was created
+
+
+def _caps_acquire():
+    """A new pool needs the caps: the first live one saves the old values and sets them to 1."""
+    global _CAPS_LIVE, _CAPS_SAVED
+    with _CAPS_LOCK:
+        if _CAPS_LIVE == 0:
+            _CAPS_SAVED = {v: os.environ.get(v) for v in _CAPS}
+            for v in _CAPS:
+                os.environ[v] = "1"
+        _CAPS_LIVE += 1
+
+
+def _caps_release():
+    """A pool is gone: when it was the last live one, put OMP/OPENBLAS/MKL_NUM_THREADS back as they were."""
+    global _CAPS_LIVE, _CAPS_SAVED
+    with _CAPS_LOCK:
+        if _CAPS_LIVE <= 0:
+            return
+        _CAPS_LIVE -= 1
+        if _CAPS_LIVE == 0:
+            saved, _CAPS_SAVED = _CAPS_SAVED, None
+            for v, old in (saved or {}).items():
+                if old is None:
+                    os.environ.pop(v, None)
+                else:
+                    os.environ[v] = old
+
+
+def _par_expert(job):
+    """One routed expert in a worker: (li, e, xs, wrow, lim) -> the expert's float32 output rows.
+
+    Every failure - gguf-py's SystemExit over a dtype it can't dequantise included - becomes a RuntimeError
+    naming the expert, so it pickles back and raises in moe() instead of looking like a hang.  A worker's own
+    KeyboardInterrupt is re-raised as it is, not wrapped into a task failure."""
+    li, e, xs, wrow, lim = job
+    P = "layers.%d.ffn.experts.%d." % (li, e)
+    try:
+        w1 = dequant(_PAR_ST, P + "w1.weight", "cpu").numpy()
+        w3 = dequant(_PAR_ST, P + "w3.weight", "cpu").numpy()
+        w2 = dequant(_PAR_ST, P + "w2.weight", "cpu").numpy()
+        with np.errstate(over="ignore"):   # silu's exp overflows to inf for large negative a; a / inf is the right -0
+            a = np.clip(xs @ w1.T, None, lim)
+            h = (a / (1.0 + np.exp(-a))) * np.clip(xs @ w3.T, -lim, lim)
+        return (h * wrow[:, None]) @ w2.T
+    except (Exception, SystemExit) as ex:   # SystemExit included: a worker must report, not exit quietly
+        raise RuntimeError("%s: %s" % (P.rstrip("."), ex)) from ex
+
+
 class Hasher:
     """engram_hash.Hasher from the pack's engram.bin (the token map, multipliers, primes and offsets)."""
 
@@ -149,7 +236,7 @@ def q6k_rows(rows: np.ndarray, name: str) -> np.ndarray:
 
 
 class RefGguf(R.Ref):
-    def __init__(self, pack: pathlib.Path, dev: str = "cuda:0", max_seq: int = 8192):
+    def __init__(self, pack: pathlib.Path, dev: str = "cuda:0", max_seq: int = 8192, workers: int = 1):
         self.dir = pack
         self.st = p = Pack(pack)
         g = p.num
@@ -183,12 +270,64 @@ class RefGguf(R.Ref):
         self.lay = SimpleNamespace(layer_ids=tuple(p.ints("engram_layer_ids")), head_dim=self.hasher.hd)
         self.timing = {}
         self._embed = None
+        self._workers = workers
+        self._pool = None
+        self._caps_held = False   # this object's pool holds a share of the process-wide thread caps
 
     def W(self, prefix: str) -> torch.Tensor:
         return dequant(self.st, prefix + ".weight", self.dev)
 
     def V(self, name: str) -> torch.Tensor:
         return dequant(self.st, name, self.dev).float()
+
+    def close(self):
+        """Shut down the expert worker pool, if one was started, cancelling the work that has not started yet,
+        and release its share of the thread-cap env vars: the last live pool in the process puts them back (no-op
+        when no pool was ever started).  The caps are released in a finally: a failing shutdown must not leave
+        them set.  A RefGguf is also a context manager, so `with RefGguf(pack) as r:` calls this on any exit,
+        including an exception; there a failing close() is reported on stderr and the block's own exception is
+        the one that propagates."""
+        pool, self._pool = self._pool, None
+        held, self._caps_held = self._caps_held, False
+        try:
+            if pool is not None:
+                pool.shutdown(wait=True, cancel_futures=True)
+        finally:
+            if held:
+                _caps_release()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if exc_type is None:
+            self.close()      # nothing in flight: a failing close() is the error to report
+            return False
+        try:
+            self.close()
+        except BaseException as cex:   # don't mask the block's exception with the shutdown's
+            print("ref_gguf: closing the expert pool failed too (%s: %s); raising the original error"
+                  % (type(cex).__name__, cex), file=sys.stderr, flush=True)
+        return False
+
+    def _pool_new(self):
+        """The expert pool, started at the first expert that needs one: spawn (Windows-safe, safe after CUDA
+        init), each worker re-opening the pack in its initializer.  The OMP/OPENBLAS/MKL_NUM_THREADS caps are
+        set in this process's env and stay set for the pool's whole life - a ProcessPoolExecutor spawns its
+        workers lazily, on any submit, and a child reads these vars only as it starts (this process, whose
+        numpy and torch loaded long ago, is unaffected).  They are shared by every live pool in the process:
+        the first one saves the old values, and the last one's close() restores them.  While any pool is live they
+        are set for the whole process, so any other subprocess the caller starts inherits them too: end that with
+        `with RefGguf(...)` or close()."""
+        _caps_acquire()
+        try:
+            pool = ProcessPoolExecutor(max_workers=self._workers, mp_context=multiprocessing.get_context("spawn"),
+                                       initializer=_par_init, initargs=(str(self.dir),))
+            self._caps_held = True   # the caps stay set while the pool lives; close() releases them
+            return pool
+        except BaseException:        # no pool is running: nothing else will ever release this share
+            _caps_release()
+            raise
 
     def engram(self, li, x, hash_ids):
         P = "layers.%d.engram." % li
@@ -229,16 +368,44 @@ class RefGguf(R.Ref):
         wts = wts / (wts.sum(-1, keepdim=True) + 1e-20) * t["routed_scaling_factor"]
         lim = t["swiglu_limit"]
         y = torch.zeros(T, self.dim, device=self.dev)
-        for e in torch.unique(idx).tolist():
-            P = M + "experts.%d." % e
-            rows, slot = torch.where(idx == e)
-            xs = x[rows]
-            h = F.silu((xs @ self.W(P + "w1").T).clamp(max=lim)) * (xs @ self.W(P + "w3").T).clamp(-lim, lim)
-            y.index_add_(0, rows, (h * wts[rows, slot, None]) @ self.W(P + "w2").T)
+        t0 = time.time()
+        experts = torch.unique(idx).tolist()
+        par, pend = {}, deque()   # par: submitted, not yet applied (expert id -> (rows, future)); pend: to submit
+        if self._workers > 1:   # the low-bit experts go to the worker pool; the pool starts at the first one that needs it
+            for e in experts:
+                P = M + "experts.%d." % e
+                if any(self.st.t[P + w + ".weight"][0] not in TORCH_DTS for w in ("w1", "w3", "w2")):
+                    pend.append(e)
+            if pend and self._pool is None:
+                self._pool = self._pool_new()
+        used = bool(pend)
+        try:
+            for e in experts:   # applied in expert id order, whatever order the workers finish in
+                while pend and len(par) < 2 * self._workers:   # sliding window: at most 2 * workers in flight
+                    e2 = pend.popleft()
+                    rows, slot = torch.where(idx == e2)
+                    par[e2] = (rows, self._pool.submit(_par_expert, (li, e2, x[rows].float().cpu().numpy(),
+                                                                     wts[rows, slot].float().cpu().numpy(), lim)))
+                if e in par:    # a dead or failed worker raises here (BrokenProcessPool / RuntimeError), not hangs
+                    rows, fut = par.pop(e)
+                    y.index_add_(0, rows, torch.from_numpy(fut.result()).to(self.dev))
+                else:
+                    P = M + "experts.%d." % e
+                    rows, slot = torch.where(idx == e)
+                    xs = x[rows]
+                    h = F.silu((xs @ self.W(P + "w1").T).clamp(max=lim)) * (xs @ self.W(P + "w3").T).clamp(-lim, lim)
+                    y.index_add_(0, rows, (h * wts[rows, slot, None]) @ self.W(P + "w2").T)
+        except BaseException:   # an error or Ctrl-C must not wait for the rest of this layer: drop its queued work
+            for _, fut in par.values():
+                fut.cancel()
+            raise
         S = M + "shared_experts."
         h = F.silu((x @ self.W(S + "w1").T).clamp(max=lim)) * (x @ self.W(S + "w3").T).clamp(-lim, lim)
         y += h @ self.W(S + "w2").T
         self.last_route = (idx, wts)
+        if used:   # only a layer that sent experts to the pool has a parallel time worth reporting
+            print("layer %d/%d: %d experts, %.1f s" % (li, self.nl, len(experts), time.time() - t0),
+                  file=sys.stderr, flush=True)
         return y
 
     @torch.inference_mode()
@@ -261,7 +428,27 @@ class RefGguf(R.Ref):
         return super().forward(ids, dump)
 
 
-def main() -> int:
+WORKERS_CAP = 8   # --workers 0 means one per CPU, up to this
+
+
+def cpus() -> int:
+    """CPUs this process may use: its affinity mask where the OS has one, else os.cpu_count()."""
+    try:
+        return len(os.sched_getaffinity(0))
+    except (AttributeError, OSError):   # Windows has no sched_getaffinity
+        return os.cpu_count() or 1
+
+
+def workers_of(v: str) -> int:
+    """--workers: 0 means one worker per CPU this process may use (up to WORKERS_CAP); a negative count is
+    argparse's error."""
+    n = int(v)
+    if n < 0:
+        raise argparse.ArgumentTypeError("must be >= 0 (0: one worker per CPU, up to %d)" % WORKERS_CAP)
+    return min(cpus(), WORKERS_CAP) if n == 0 else n
+
+
+def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser()
     ap.add_argument("--pack", required=True, help="pack_gguf.py's pack (<model>/maya-ds4)")
     ap.add_argument("--ids", required=True, help="comma-separated token ids")
@@ -269,32 +456,45 @@ def main() -> int:
     ap.add_argument("--dump", help="write the per-layer residual streams, the logits and the ids (.npz)")
     ap.add_argument("--no-hs", action="store_true", help="--dump without the per-layer residual streams")
     ap.add_argument("--dev", default="cuda:0")
-    a = ap.parse_args()
+    ap.add_argument("--workers", type=workers_of, default=1,
+                    help="dequant and matmul the routed low-bit experts in N CPU worker processes: for speed when "
+                         "screening (finding real bugs or large gaps).  Per layer the workers match serial to float "
+                         "tolerance; end to end the logits are close, not identical, about as close as two serial "
+                         "runs with different thread counts (on real text mean KL around 2e-3), so differences that "
+                         "small between engines are within the oracle's own noise either way.  1 (default): today's "
+                         "serial path. 0: one worker per CPU this process may use, up to %d" % WORKERS_CAP)
+    return ap
+
+
+def main() -> int:
+    a = build_parser().parse_args()
     ids = [int(x) for x in a.ids.split(",")]
-    r = RefGguf(pathlib.Path(a.pack).expanduser(), a.dev)
-    print("tokens:", len(ids), ids[:32], flush=True)
-    dump = [] if a.dump and not a.no_hs else None
-    t0 = time.time()
-    logits = r.forward(ids, dump)
-    print("forward %.1fs" % (time.time() - t0), flush=True)
-    lp = torch.log_softmax(logits.float(), -1)
-    if len(ids) > 1:
-        tgt = torch.tensor(ids[1:], device=lp.device)
-        nll = -lp[:-1].gather(1, tgt[:, None]).squeeze(1)
-        print("ppl over %d tokens: %.4f" % (len(ids) - 1, math.exp(nll.mean().item())))
-    top = lp[-1].topk(8)
-    print("next:", list(zip(top.indices.tolist(), [round(v, 3) for v in top.values.tolist()])))
-    if a.dump:
-        np.savez(a.dump, ids=np.array(ids), logits=logits.cpu().numpy(), hs=np.stack(dump) if dump else np.zeros(0))
-    out = list(ids)
-    for _ in range(a.gen):
-        nxt = int(lp[-1].argmax())
-        out.append(nxt)
-        print("gen ids:", out[len(ids):], flush=True)
-        if nxt == 1:
-            break
-        lp = torch.log_softmax(r.forward(out).float(), -1)
-    return 0
+    # `with`, not try/finally: if forward() raises and closing the pool fails too, __exit__ reports the close
+    # failure on stderr and the original error is the one that propagates
+    with RefGguf(pathlib.Path(a.pack).expanduser(), a.dev, workers=a.workers) as r:
+        print("tokens:", len(ids), ids[:32], flush=True)
+        dump = [] if a.dump and not a.no_hs else None
+        t0 = time.time()
+        logits = r.forward(ids, dump)
+        print("forward %.1fs" % (time.time() - t0), flush=True)
+        lp = torch.log_softmax(logits.float(), -1)
+        if len(ids) > 1:
+            tgt = torch.tensor(ids[1:], device=lp.device)
+            nll = -lp[:-1].gather(1, tgt[:, None]).squeeze(1)
+            print("ppl over %d tokens: %.4f" % (len(ids) - 1, math.exp(nll.mean().item())))
+        top = lp[-1].topk(8)
+        print("next:", list(zip(top.indices.tolist(), [round(v, 3) for v in top.values.tolist()])))
+        if a.dump:
+            np.savez(a.dump, ids=np.array(ids), logits=logits.cpu().numpy(), hs=np.stack(dump) if dump else np.zeros(0))
+        out = list(ids)
+        for _ in range(a.gen):
+            nxt = int(lp[-1].argmax())
+            out.append(nxt)
+            print("gen ids:", out[len(ids):], flush=True)
+            if nxt == 1:
+                break
+            lp = torch.log_softmax(r.forward(out).float(), -1)
+        return 0
 
 
 if __name__ == "__main__":
