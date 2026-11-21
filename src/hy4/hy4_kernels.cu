@@ -278,8 +278,13 @@ void gemv(const W* w, size_t ld, int k, int n, const float* x, size_t ldx, int n
 #endif
     if (v4) {
         const dim3 b(256), g1((unsigned) ((n + 7) / 8), 1);
+        // (5 and 6 columns: their own instances - a window of 5 tokens paid for the 8-column one's code; a column's
+        //  sums are the same lanes' in the same order whatever the instance.  HY4_GEMV56=0: as before)
+        static const bool nc56 = !(std::getenv("HY4_GEMV56") && std::getenv("HY4_GEMV56")[0] == '0');
         if (ncol == 1) gemv4_kernel<W, 1><<<g1, b, 0, s>>>(w, ld, k, n, x, ldx, ncol, y, ldy, alpha);
         else if (ncol <= 4) gemv4_kernel<W, 4><<<g1, b, 0, s>>>(w, ld, k, n, x, ldx, ncol, y, ldy, alpha);
+        else if (ncol == 5 && nc56) gemv4_kernel<W, 5><<<g1, b, 0, s>>>(w, ld, k, n, x, ldx, ncol, y, ldy, alpha);
+        else if (ncol == 6 && nc56) gemv4_kernel<W, 6><<<g1, b, 0, s>>>(w, ld, k, n, x, ldx, ncol, y, ldy, alpha);
         else
             gemv4_kernel<W, 8><<<dim3((unsigned) ((n + 7) / 8), (unsigned) ((ncol + 7) / 8)), b, 0, s>>>(
                 w, ld, k, n, x, ldx, ncol, y, ldy, alpha);

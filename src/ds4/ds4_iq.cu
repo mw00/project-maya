@@ -1689,10 +1689,19 @@ void launch_dn(const Args& a, dim3 grid, cudaStream_t s) {
     }
     pdl_launch(down_kernel<T, NE>, grid, kThreads, 0, s, a, (int) grid.y);
 }
+// (a window of 5 or 6 tokens: the token kernels' own instances for up to 5 / 6 entries an expert, where it took the
+//  8-entry one's code - an entry's sums are the same lanes' in the same order whatever the instance.  MAYA_IQ_NE56=0:
+//  as before)
+static bool ne56() {
+    static const bool on = !(std::getenv("MAYA_IQ_NE56") && std::getenv("MAYA_IQ_NE56")[0] == '0');
+    return on;
+}
 template <int T, int EPI = 0>
 void gu_ne(const Args& a, dim3 grid, int ne, cudaStream_t s) {
     if (ne <= 1) launch_gu<T, 1, EPI>(a, grid, s);
     else if (ne <= 4) launch_gu<T, 4, EPI>(a, grid, s);
+    else if (ne <= 5 && ne56()) launch_gu<T, 5, EPI>(a, grid, s);
+    else if (ne <= 6 && ne56()) launch_gu<T, 6, EPI>(a, grid, s);
     else if (ne <= 8) launch_gu<T, 8, EPI>(a, grid, s);
     else launch_gu<T, 16, EPI>(a, grid, s);
 }
@@ -1700,6 +1709,8 @@ template <int T>
 void dn_ne(const Args& a, dim3 grid, int ne, cudaStream_t s) {
     if (ne <= 1) launch_dn<T, 1>(a, grid, s);
     else if (ne <= 4) launch_dn<T, 4>(a, grid, s);
+    else if (ne <= 5 && ne56()) launch_dn<T, 5>(a, grid, s);
+    else if (ne <= 6 && ne56()) launch_dn<T, 6>(a, grid, s);
     else if (ne <= 8) launch_dn<T, 8>(a, grid, s);
     else launch_dn<T, 16>(a, grid, s);
 }
@@ -1858,11 +1869,19 @@ static bool mv8() {
     static const bool on = !(std::getenv("MAYA_IQ_MV8") && std::getenv("MAYA_IQ_MV8")[0] == '0');
     return on;
 }
+// (5 and 6 columns their own instances too, and the heads' GEMVs' 5, 6 and 8: a window of 5 tokens paid for 8 - or, the
+//  heads', for 16 - columns' code.  The same lanes in the same order: the same bits.  MAYA_IQ_MV56=0: as before)
+static bool mv56() {
+    static const bool on = !(std::getenv("MAYA_IQ_MV56") && std::getenv("MAYA_IQ_MV56")[0] == '0');
+    return on;
+}
 template <int T>
 void mv_nc(const Jobs& J, int nj, int max_n, int max_c, cudaStream_t s) {
     const dim3 grid((unsigned) ((max_n + kWarps - 1) / kWarps), (unsigned) nj);
     if (max_c <= 1) pdl_launch(mv_kernel<T, 1>, grid, kThreads, 0, s, J);
     else if (max_c <= 4) pdl_launch(mv_kernel<T, 4>, grid, kThreads, 0, s, J);
+    else if (max_c <= 5 && mv56()) pdl_launch(mv_kernel<T, 5>, grid, kThreads, 0, s, J);
+    else if (max_c <= 6 && mv56()) pdl_launch(mv_kernel<T, 6>, grid, kThreads, 0, s, J);
     else if (max_c <= 8 && mv8()) pdl_launch(mv_kernel<T, 8>, grid, kThreads, 0, s, J);
     else pdl_launch(mv_kernel<T, 16>, grid, kThreads, 0, s, J);
 }
@@ -1871,6 +1890,9 @@ void mv_heads_nc(const MvJob& b, int H, size_t ws, size_t xs, size_t ds, size_t 
     const dim3 grid((unsigned) ((b.n + kWarps - 1) / kWarps), (unsigned) H);
     if (b.ncol <= 1) pdl_launch(mv_heads_kernel<T, 1>, grid, kThreads, 0, s, b, ws, xs, ds, ys);
     else if (b.ncol <= 4) pdl_launch(mv_heads_kernel<T, 4>, grid, kThreads, 0, s, b, ws, xs, ds, ys);
+    else if (b.ncol <= 5 && mv56()) pdl_launch(mv_heads_kernel<T, 5>, grid, kThreads, 0, s, b, ws, xs, ds, ys);
+    else if (b.ncol <= 6 && mv56()) pdl_launch(mv_heads_kernel<T, 6>, grid, kThreads, 0, s, b, ws, xs, ds, ys);
+    else if (b.ncol <= 8 && mv56()) pdl_launch(mv_heads_kernel<T, 8>, grid, kThreads, 0, s, b, ws, xs, ds, ys);
     else pdl_launch(mv_heads_kernel<T, 16>, grid, kThreads, 0, s, b, ws, xs, ds, ys);
 }
 
