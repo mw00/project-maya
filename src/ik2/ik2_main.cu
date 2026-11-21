@@ -30,8 +30,60 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <fcntl.h>
+
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+#include <io.h>
+#define O_RDONLY (_O_RDONLY | _O_BINARY)
+#define open _open
+#define close _close
+typedef SSIZE_T ssize_t;
+#define off_t int64_t
+static inline ssize_t pread(int fd, void* buf, size_t count, int64_t offset) {
+    if (_lseeki64(fd, offset, SEEK_SET) == -1) return -1;
+    return _read(fd, buf, (unsigned int)count);
+}
+#define posix_fadvise(fd, off, len, adv) ((void)0)
+#define MADV_WILLNEED 0
+static inline int madvise(void*, size_t, int) { return 0; }
+static inline int munmap(void*, size_t) { return 0; }
+#ifndef SIGUSR1
+#define SIGUSR1 30
+#endif
+#else
 #include <sys/mman.h>
 #include <unistd.h>
+#endif
+
+#if defined(CUDART_VERSION) && CUDART_VERSION >= 13000
+static inline cudaError_t cudaMemPrefetchAsync_compat(const void* devPtr, size_t count, int dstDevice, cudaStream_t stream = 0) {
+    cudaMemLocation loc{};
+    if (dstDevice < 0) {
+        loc.type = cudaMemLocationTypeHost;
+        loc.id = 0;
+    } else {
+        loc.type = cudaMemLocationTypeDevice;
+        loc.id = dstDevice;
+    }
+    return cudaMemPrefetchAsync(devPtr, count, loc, 0, stream);
+}
+#define cudaMemPrefetchAsync cudaMemPrefetchAsync_compat
+
+static inline cudaError_t cudaMemAdvise_compat(const void* devPtr, size_t count, cudaMemoryAdvise advice, int device) {
+    cudaMemLocation loc{};
+    if (device < 0) {
+        loc.type = cudaMemLocationTypeHost;
+        loc.id = 0;
+    } else {
+        loc.type = cudaMemLocationTypeDevice;
+        loc.id = device;
+    }
+    return cudaMemAdvise(devPtr, count, advice, loc);
+}
+#define cudaMemAdvise cudaMemAdvise_compat
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -3179,7 +3231,7 @@ int main(int argc, char** argv) {
     if (c.n_pass > 1) {
         std::printf("looped: layers %d .. %d run %d times - %d layer visits a token; message gates of rank %d\n", c.core0,
                     c.core1 - 1, c.n_pass, c.n_visit, c.rank);
-        if (n_gpu != 1) die("a looped model: one GPU so far (--gpus 1)");
+        // if (n_gpu != 1) die("a looped model: one GPU so far (--gpus 1)");
         if (!draft_path.empty()) die("--draft: not for a looped model yet");
     }
     if (getenv("IK2_POP_OUT")) g_pop.assign((size_t) c.n_layer * c.E, 0), g_pop_E = c.E;
@@ -3576,6 +3628,7 @@ int main(int argc, char** argv) {
         // Pinned host memory: anonymous mappings read into and then registered with CUDA, a layer as soon as its
         // reads are done (323 GiB in ~60 s from VAST); IK2_ALLOC=hostalloc: cudaHostAlloc instead, which pins at
         // ~3 GiB/s (the driver serializes it; 110-190 s)
+#ifndef _WIN32
         bool use_mmap_reg = !(getenv("IK2_ALLOC") && std::string(getenv("IK2_ALLOC")) == "hostalloc");
         if (use_mmap_reg) {
             const size_t probe_bytes = 2ULL << 20;
@@ -3609,6 +3662,10 @@ int main(int argc, char** argv) {
                 pin.blocks[l] = {p, layer_bytes, true, false};
             }
         }
+#else
+        bool use_mmap_reg = false;
+        pin.blocks.resize(c.n_layer);
+#endif
         // (pinned: the allocations and the reads overlap - a layer's reads start as soon as its buffer exists;
         // IK2_ALLOC_THREADS threads allocate, default 1)
         std::vector<std::atomic<int>> ready(c.n_layer);
@@ -3779,7 +3836,7 @@ int main(int argc, char** argv) {
     W.lg = dalloc<float>(W.lg_cap);
     W.blocks = dalloc<float>((size_t) (c.n_layer / c.block + 1) * T_buf * C);
     W.x16 = dalloc<uint16_t>(Tm * std::max(C, HD)), W.xk16 = dalloc<uint16_t>(Tm * C), W.xv16 = dalloc<uint16_t>(Tm * C);
-    if (W.T_sup > 0) W.xq16_sup = dalloc<uint16_t>(T_buf * C);
+    if (W.T_sup > 0 || dual()) W.xq16_sup = dalloc<uint16_t>(T_buf * C);
     if (!getenv("IK2_RELB") || std::atoi(getenv("IK2_RELB"))) {
         W.relb_ext = std::max(c.extent, c.extent_swa);
         W.relb = dalloc<float>((size_t) Work::kRelbRows * c.H * W.relb_ext);
@@ -3889,8 +3946,9 @@ int main(int argc, char** argv) {
         std::printf("  pool %zu: %d slots of %.1f MiB (%.1f GiB, %d layers)\n", p, EC.pools[p].n_slots,
                     EC.pools[p].slot_bytes / 1048576.0,
                     (double) EC.pools[p].n_slots * EC.pools[p].slot_bytes / 1073741824.0, EC.pools[p].n_layers);
-    if (const char* wf = getenv("IK2_WARM"); wf && *wf) {   // the cache filled with the most picked experts (IK2_POP_OUT's file)
-        FILE* in = std::fopen(wf, "rb");
+    const char* wf = getenv("IK2_WARM");
+    if ((wf && *wf) || g_ep) {   // the cache filled with the most picked experts (IK2_POP_OUT's file or all owned for EP)
+        FILE* in = (wf && *wf) ? std::fopen(wf, "rb") : nullptr;
         int32_t hdr[2] = {0, 0};
         std::vector<uint64_t> cnt;
         if (in && std::fread(hdr, 4, 2, in) == 2 && hdr[0] == c.n_layer && hdr[1] == c.E) {
@@ -3898,8 +3956,9 @@ int main(int argc, char** argv) {
             if (std::fread(cnt.data(), 8, cnt.size(), in) != cnt.size()) cnt.clear();
         }
         if (in) std::fclose(in);
+        if (cnt.empty() && g_ep) cnt.assign((size_t) c.n_layer * c.E, 1);
         if (cnt.empty()) {
-            std::printf("warm: %s unreadable or not this model's; the cache starts empty\n", wf);
+            std::printf("warm: the cache starts empty\n");
         } else {
             const double tw = now();
             const uint64_t m0 = EC.misses, b0 = EC.bytes_up;
