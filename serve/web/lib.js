@@ -135,7 +135,7 @@ export function modelLogo(name) {
   const m = MODEL_LOGOS.find(([re]) => re.test(name || ""));
   return m ? {src: `web/logo-${m[1]}.svg`, mono: !!m[2]} : null;
 }
-const NAME_WORDS = {glm: "GLM", deepseek: "DeepSeek", minimax: "MiniMax", qwen: "Qwen", hy4: "Hy4"};
+const NAME_WORDS = {glm: "GLM", deepseek: "DeepSeek", minimax: "MiniMax", qwen: "Qwen", hy4: "Hy4", inkling: "Inkling"};
 // short: the form for a tight place (the chat header's button) - "Qwen-3.8-Flash-Next" for the CYBER-FROST fine-tune, whose full
 // name is "Qwen-3.8-Flash-Next (CYBER-FROST)" (its id, "cyber-frost-3.8-ps", is what the API reports and stays)
 export function modelName(id, short) {

@@ -19,7 +19,8 @@ from pathlib import Path
 FAMILIES = ("glm", "deepseek", "minimax", "qwen", "hy4", "ik2")
 # ("qwen": CYBER-FROST-3.8-PS, the Qwen3.8-Flash-Next fine-tune - qwen4exp, on the `maya` engine's own Qwen path)
 # ("ik2": thinkingmachines' Inkling 2 on maya-ik2 - the setup's is Inkling-2-Mini, an experimental preview; the 594B
-#  Inkling-2-Small runs by hand, docs/INKLING2.md)
+#  Inkling-2-Small runs by hand on NVIDIA, docs/INKLING2.md, and its setup's on AMD is maya-ik2's HIP build on a pack
+#  of unsloth's UD-Q2_K_XL, docs/INKLING2_AMD.md)
 MODEL = {"glm": "GLM-5.3-Flash", "deepseek": "DeepSeek-V4.1-Flash-1017", "minimax": "MiniMax-M3.1-Flash",
          "qwen": "CYBER-FROST-3.8-PS", "hy4": "Hy4-Flash", "ik2": "Inkling-2-Mini"}   # ("hy4": Tencent's Hy4-flash, on maya-hy4)
 SHOWN = {"glm": "GLM-5.3-Flash", "deepseek": "DeepSeek V4.1", "minimax": "MiniMax M3.1",
@@ -119,10 +120,10 @@ IK2_MINI = "ik2-mini"
 
 def is_ik2_mini(cfg: dict) -> bool:
     """An Inkling 2 config that runs Inkling-2-Mini (the setup's: its installer record; one written by hand: its
-    model_name or its GGUF's name) rather than Inkling-2-Small."""
+    model_name or its GGUF's name) rather than Inkling-2-Small (the AMD setup's record names its set, UD-Q2_K_XL)."""
     inst = cfg.get("installer") or {}
     if inst.get("ik2_quant"):
-        return True
+        return str(inst["ik2_quant"]).lower() != IK2_SMALL_QUANT
     args = [str(a) for a in cfg.get("args") or []]
     gguf = args[args.index("--model") + 1] if "--model" in args[:-1] else ""
     return "mini" in str(cfg.get("model_name") or "").lower() or "mini" in Path(gguf).name.lower()
@@ -228,9 +229,11 @@ OTHERS = {("deepseek", "gguf-q8"): "UD-Q8_K_XL", ("deepseek", "gguf-q4"): "UD-Q4
           ("minimax", "exl3"): "EXL3 3.5 bpw", ("qwen", "q5_k_m"): "Q5_K_M",
           ("qwen", "ud-iq2_xs"): "unsloth UD-IQ2_XS",   # (the base model in unsloth's GGUF: maya.QWEN_UD)
           ("hy4", "q4_k_m"): "Q4_K_M",                  # (AngelSlim's Q4_K_M of Hy4-flash: maya.HY4)
-          ("ik2", "ud-q4_k_xl"): "unsloth UD-Q4_K_XL"}  # (unsloth's GGUF of Inkling-2-Mini: maya.IK2)
+          ("ik2", "ud-q4_k_xl"): "unsloth UD-Q4_K_XL",  # (unsloth's GGUF of Inkling-2-Mini: maya.IK2)
+          ("ik2", "ud-q2_k_xl"): "unsloth UD-Q2_K_XL"}  # (unsloth's GGUF set of Inkling-2-Small on AMD: maya.IK2_SMALL)
 # files of the base model rather than CYBER-FROST: the model's name on screen without "(CYBER-FROST)"
-SHOWN_KEY = {("qwen", "ud-iq2_xs"): "Qwen-3.8-Flash-Next"}
+SHOWN_KEY = {("qwen", "ud-iq2_xs"): "Qwen-3.8-Flash-Next",
+             ("ik2", "ud-q2_k_xl"): "Inkling 2 Small"}   # (Inkling-2-Small's set on AMD, beside Inkling-2-Mini's)
 # CYBER-FROST-3.8-PS: its one GGUF (peasantsmith/CYBER-FROST-3.8-PS-GUFF) - the setup ids it is asked for by
 QWEN_IDS = ("cyber-frost", "cyber-frost-3.8", "cyber-frost-3.8-ps", "cyber-frost-3.8-ps-q5_k_m", "cyber-frost-q5_k_m")
 # unsloth's UD-IQ2_XS of Qwen3.8-Flash-Next: the setup ids it is asked for by (the first: the Models page's)
@@ -242,6 +245,10 @@ HY4_IDS = ("hy4-flash-q4_k_m", "hy4-q4_k_m")
 # for by (the first: the Models page's)
 IK2_IDS = ("inkling-2-mini", "inkling-2-mini-ud-q4_k_xl", "inkling2-mini", "ik2-mini")
 IK2_QUANT = "ud-q4_k_xl"
+# Inkling-2-Small on AMD (maya-ik2's HIP build, src/ik2/hip): unsloth's UD-Q2_K_XL, its one file set there - the setup
+# ids it is asked for by (the first: the Models page's)
+IK2_SMALL_IDS = ("inkling-2-small", "inkling-2-small-ud-q2_k_xl", "inkling2-small", "ik2-small")
+IK2_SMALL_QUANT = "ud-q2_k_xl"
 # --mm3-quant also takes the tier as DeepSeek's --ds4-quant does (maya-xs), beside its first names (gguf-xs)
 MM3_QUANT_ALIASES = {"maya-xs": "gguf-xs", "maya-s": "gguf-s"}
 
@@ -278,8 +285,8 @@ def config_stem(family: str, key: str | None) -> str | None:
         return "maya-qwen-ud-iq2_xs" if key == "ud-iq2_xs" else "maya-cyber-frost"
     if family == "hy4" and key == "q4_k_m":            # (AngelSlim's Q4_K_M: the config's name since its first setup)
         return "maya-hy4-flash"
-    if family == "ik2":                                # (Inkling-2-Mini: its one file set)
-        return "maya-inkling-2-mini"
+    if family == "ik2":                                # (Inkling-2-Mini: its one file set; Inkling-2-Small's on AMD)
+        return "maya-inkling-2-small" if key == IK2_SMALL_QUANT else "maya-inkling-2-mini"
     return f"maya-{setup_id(family, key)}" if family in ("minimax", "hy4") and setup_id(family, key) else None
 
 
@@ -306,6 +313,8 @@ def resolve(name: str, glm_downloads=()) -> tuple | None:
         return "hy4", None
     if low in IK2_IDS:                                 # (Inkling-2-Mini: one file set, unsloth's UD-Q4_K_XL)
         return "ik2", IK2_QUANT
+    if low in IK2_SMALL_IDS:                           # (Inkling-2-Small on AMD: one file set, unsloth's UD-Q2_K_XL)
+        return "ik2", IK2_SMALL_QUANT
     for f in ("deepseek", "minimax", "qwen", "hy4"):
         if low == MODEL[f].lower():
             return f, None

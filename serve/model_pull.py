@@ -36,8 +36,9 @@ GLM_EXL3 = ("EXL3-3.05bpw", "EXL3-4.05bpw")
 # (Qwen3.8-Flash-Next itself: unsloth's UD-IQ2_XS only - its other UD quants run on the same code but are not listed;
 #  the setup id: maya_quants.QWEN_UD_IDS[0])
 QWEN_OTHER = (("qwen-ud-iq2_xs", "qwen", "ud-iq2_xs", "unsloth"),)
-# (Inkling-2-Mini on maya-ik2, an experimental preview: unsloth's UD-Q4_K_XL - the setup id: maya_quants.IK2_IDS[0])
-IK2_OTHER = ((Q.IK2_IDS[0], "ik2", Q.IK2_QUANT, "unsloth"),)
+# (Inkling-2-Mini on maya-ik2, an experimental preview: unsloth's UD-Q4_K_XL - the setup id: maya_quants.IK2_IDS[0];
+#  Inkling-2-Small on AMD: unsloth's UD-Q2_K_XL, the files maya-ik2's AMD build runs - maya_quants.IK2_SMALL_IDS[0])
+IK2_OTHER = ((Q.IK2_IDS[0], "ik2", Q.IK2_QUANT, "unsloth"), (Q.IK2_SMALL_IDS[0], "ik2", Q.IK2_SMALL_QUANT, "unsloth"))
 OTHER = tuple([(f"deepseek-{k}", "deepseek", k, by) for k, by in DS4_OTHER] + [("minimax-exl3", "minimax", "exl3", "Mia-AiLab")] +
               [(f"glm-{k.lower()}", "glm", k, "turboderp") for k in GLM_EXL3] + list(QWEN_OTHER) + list(IK2_OTHER))
 GATED = ("abliterated-128g", "abliterated-256g")     # (orcarouter's repo is gated: the setup sends the user's HF token)
@@ -52,6 +53,8 @@ def _offered(fam: str, key: str, backend: str, ccs: list) -> bool:
     AMD; GLM's EXL3 quants anywhere but Metal."""
     if backend == "metal":
         return False
+    if fam == "ik2" and key == Q.IK2_SMALL_QUANT:      # (Inkling-2-Small: maya-ik2's AMD build - the setup's check_pc)
+        return backend == "hip"
     if fam in ("deepseek", "minimax") and backend != "hip" and ccs:   # (their EXL3 quants and DeepSeek's GGUFs:
         return max(ccs) >= EXL3_MIN_CC                                  # maya-ds4's / maya-mm3's kernels, V100 on)
     if fam == "qwen" and backend != "hip" and ccs:                     # (unsloth's Qwen GGUF: the setup's check_pc)
@@ -66,7 +69,8 @@ def _note(fam: str, key: str, backend: str) -> str:
     if key in GATED:
         out.append("gated repo: needs your Hugging Face token (HF_TOKEN or `hf auth login`)")
     if fam == "ik2":
-        out.append("experimental preview: one NVIDIA GPU with 24 GB or more, Linux; text only")
+        out.append("text only; with the model's DSpark drafter" if key == Q.IK2_SMALL_QUANT else
+                   "experimental preview: one NVIDIA GPU with 24 GB or more, Linux; text only")
     return "; ".join(out)
 
 
@@ -199,6 +203,8 @@ def _other_sizes() -> dict:
                 gb = mk["download_gb"] - mk["files"].get(t, 0) / 1e9 + maya.ds4_abl_engram_gb() if t else mk["download_gb"]
             elif fam == "minimax":
                 gb = maya.mm3_models()[0]["download_gb"]
+            elif fam == "ik2" and key == Q.IK2_SMALL_QUANT:   # (Inkling-2-Small: its files and the drafter with them)
+                gb = maya.ik2_small_entry()["download_gb"] + maya.ik2_small_drafter_entry()["download_gb"]
             elif fam == "qwen":                        # (its files and the vision tower the setup fetches with them)
                 vision = maya.qwen_vision_model()
                 gb = maya.qwen_entry(key)["download_gb"] + (vision["download_gb"] if vision else 0)
