@@ -323,14 +323,14 @@ To run it (one GPU):
 Thinking off (`reasoning_effort` `none`, `enable_thinking` false) has the prompt open the answer's text segment:
 the model has no switch for its thinking, only the effort level, and at the lowest it still thinks a little.
 
-**The preview.** Inkling-2-Mini comes in as an experimental preview: Linux, one NVIDIA GPU of 24 GB, sm_80
+**The preview.** Inkling-2-Mini comes in as an experimental preview: Linux or Windows, one NVIDIA GPU of 24 GB, sm_80
 (Ampere) or newer; tested on RTX 3090s (sm_86). Elsewhere `maya-ik2` stops at the start with one line saying why
 (under `--serve` also as a `NOTE` the server prints): no NVIDIA GPU, a GPU older than sm_80 (a V100 cannot run it:
 the kernels use Ampere's `mma.sync` m16n8k16 and `cp.async`), a build with no kernels for the GPU's arch, less than
-22 GiB of VRAM, `--gpus 2` or more, Windows. `IK2_UNSUPPORTED=1` runs it anyway where it can run at all: two GPUs
-(`IK2_EP=1` or `IK2_TP=1`, section 6), smaller cards with the experts streamed from RAM, @cobra91's Windows / CUDA 13
-port - untested here. CMake skips `maya-ik2` without a CUDA arch of 80 or more in the list, in a HIP build, and on
-Windows unless `-DSTRATA_IK2_WINDOWS=ON`.
+22 GiB of VRAM, `--gpus 2` or more. `IK2_UNSUPPORTED=1` runs it anyway where it can run at all: two GPUs
+(`IK2_EP=1` or `IK2_TP=1`, section 6), smaller cards with the experts streamed from RAM - untested
+here. Windows runs @cobra91's MSVC / CUDA 13 port (run on an RTX 3090 with CUDA 12.9). CMake skips `maya-ik2` without a CUDA arch of 80 or more in the list, and in a HIP build
+(`-DSTRATA_IK2_WINDOWS=OFF` leaves it out on Windows).
 
 **Defaults.** Thinking Machines' `generation_config.json`: temperature 1.0 (no top_p, no top_k: 1.0 and off).
 Thinking is the template's `reasoning_effort`, a name or a number in [0.0, 0.99]: `none` 0.0, `minimal` 0.1, `low`

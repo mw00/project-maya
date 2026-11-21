@@ -3559,9 +3559,9 @@ void embed_row(Model& M, int t, float* raw, float* out) {
 
 }  // namespace
 
-// The Inkling 2 preview: Linux, one NVIDIA GPU of 24 GB, Ampere (sm_80) or newer.  Outside it the engine stops with one
+// The Inkling 2 preview: Linux or Windows, one NVIDIA GPU of 24 GB, Ampere (sm_80) or newer.  Outside it the engine stops with one
 // line saying why; IK2_UNSUPPORTED=1 runs it anyway where it can run at all (two GPUs, smaller cards with the experts
-// streamed from RAM, Windows: untested).
+// streamed from RAM: untested).
 void check_preview(int n_gpu, bool serve) {
     auto refuse = [&](const std::string& m) {   // (--serve: the server prints a NOTE line)
         if (serve) std::printf("NOTE maya-ik2: %s\n", m.c_str()), std::fflush(stdout);
@@ -3569,9 +3569,6 @@ void check_preview(int n_gpu, bool serve) {
     };
     const bool force = getenv("IK2_UNSUPPORTED") && std::atoi(getenv("IK2_UNSUPPORTED"));
     const std::string run_anyway = " (IK2_UNSUPPORTED=1 runs it anyway, untested)";
-#ifdef _WIN32
-    if (!force) refuse("the Inkling 2 preview runs on Linux, Windows is outside it" + run_anyway);
-#endif
     int nd = 0;
     const cudaError_t e = cudaGetDeviceCount(&nd);
     if (e != cudaSuccess || nd < 1)
