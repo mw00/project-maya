@@ -109,6 +109,9 @@ bool Glm5Model::fast_layers_plain(int64_t p, bool hop_in, std::string& err) {
                                    seq_count()))
             return false;
         pg.key.abl = ablating();   // (--ablate: a projecting conversation's part is another graph)
+        // KV streaming: inside the identity window the attentions read their cells as they are; past it every indexer
+        // group resolves its selection first - other launches, another graph (kv_window_hit also ends the window)
+        pg.key.kv = kv_ != nullptr && !kv_window_hit(kv_, p);
     }
     if (F->prof_on) F->mark("start");
     const auto body = [&]() -> bool {

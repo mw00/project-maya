@@ -468,12 +468,15 @@ bool route(const Io& io, const void* router_w, int router_type, const float* bia
 }
 
 // L1-6 KV streaming: layer il's caches on the stage - the prefix [0, p0) from the host copies (with_prefix), the
-// stage as lat / k_pe (identity rows); kv_stage_out: rows [p0, p0 + n) back to the host copies, the map reset
+// stage as lat / k_pe (identity rows); kv_stage_out: rows [p0, p0 + n) back to the host copies, the map reset.
+// Inside the identity window (KvIo::window) lat / k_pe stay the arena's slots - block b is in slot b and the prefix is
+// there already - and kv_stage_out copies the chunk's rows from them to the host copies, the map untouched.
 bool kv_stage_in(const Io& io, int il, bool with_prefix, void*& lat, uint16_t*& k_pe, std::string& err) {
     const KvIo& k = *io.kv;
-    if (io.p0 + io.T > k.stage_rows) {
-        err = "glm-dsa prefill: the KV stage holds " + std::to_string(k.stage_rows) + " positions, the chunk ends at " +
-              std::to_string(io.p0 + io.T);
+    if (k.window) return true;
+    if (k.stage == nullptr || io.p0 + io.T > k.stage_rows) {
+        err = "glm-dsa prefill: the KV stage holds " + std::to_string(k.stage == nullptr ? 0 : k.stage_rows) +
+              " positions, the chunk ends at " + std::to_string(io.p0 + io.T);
         return false;
     }
     uint8_t* sl = k.stage;
@@ -486,21 +489,22 @@ bool kv_stage_in(const Io& io, int il, bool with_prefix, void*& lat, uint16_t*& 
     if (k.kpe_host != nullptr && k_pe != nullptr) k_pe = (uint16_t*) sk;
     return true;
 }
-bool kv_stage_out(const Io& io, int il, int64_t n, bool with_kpe, std::string& err) {
+// lat / k_pe: what the layer ran on (kv_stage_in's)
+bool kv_stage_out(const Io& io, int il, int64_t n, const void* lat, const uint16_t* k_pe, std::string& err) {
     const KvIo& k = *io.kv;
-    const uint8_t* sl = k.stage;
-    const uint8_t* sk = k.stage + (size_t) k.stage_rows * k.lat_row;
+    const uint8_t* sl = (const uint8_t*) lat;
+    const uint8_t* sk = (const uint8_t*) k_pe;
     if (n > 0 &&
         (cudaMemcpyAsync(k.lat_host[il] + (size_t) io.p0 * k.lat_row, sl + (size_t) io.p0 * k.lat_row,
                          (size_t) n * k.lat_row, cudaMemcpyDefault, io.s) != cudaSuccess ||
-         (with_kpe && k.kpe_host != nullptr &&
+         (sk != nullptr && k.kpe_host != nullptr &&
           cudaMemcpyAsync(k.kpe_host[il] + (size_t) io.p0 * k.kpe_row, sk + (size_t) io.p0 * k.kpe_row,
                           (size_t) n * k.kpe_row, cudaMemcpyDefault, io.s) != cudaSuccess))) {
         cudaGetLastError();
         err = "glm-dsa prefill: the KV write-back";
         return false;
     }
-    strata::kernels::kv_stream_reset(k.map[il], (void*) io.s);
+    if (!k.window) strata::kernels::kv_stream_reset(k.map[il], (void*) io.s);
     return true;
 }
 
@@ -801,7 +805,7 @@ bool dsa_layer(const Io& io, int il, std::string& err) {
         err = std::string("glm-dsa prefill: ") + cudaGetErrorString(e);
         return false;
     }
-    if (kv_on && !kv_stage_out(io, il, io.T, k_pe != nullptr, err)) return false;   // L1-6
+    if (kv_on && !kv_stage_out(io, il, io.T, lat, k_pe, err)) return false;   // L1-6
     return true;
 }
 
@@ -892,7 +896,7 @@ bool mtp_fill(const Io& io, const MtpIo& m, std::string& err) {
         err = "glm-dsa prefill: the NextN cache fill failed";
         return false;
     }
-    if (ok && kv_on && !kv_stage_out(io, m.il, m.Tv, k_pe != nullptr, err)) return false;   // L1-6
+    if (ok && kv_on && !kv_stage_out(io, m.il, m.Tv, lat, k_pe, err)) return false;   // L1-6
     return true;
 }
 

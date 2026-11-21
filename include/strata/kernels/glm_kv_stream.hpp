@@ -51,6 +51,32 @@ void glm_kv_pull(uint8_t* dst, const uint8_t* src_mapped, size_t bytes, cudaStre
 void glm_kv_copy_misses(const KvStreamMap& m, const uint8_t* host, uint8_t* slots, int row_bytes, int page,
                         cudaStream_t s);
 
+/// glm-dsa indexer groups: a full-indexer layer and the shared layers after it read the SAME selection, token after
+/// token, so their residency never differs - they share one map.  A resolve of that map then copies each missed block
+/// for every cache of the group (each layer's latent and its k_pe) in one launch: `n` caches, cache j's block of
+/// len[j] bytes (a multiple of 16) from host[j] into slots[j].
+inline constexpr int kKvCopySetMax = 16;
+struct KvCopySet {
+    const uint8_t* host[kKvCopySetMax];
+    uint8_t* slots[kKvCopySetMax];
+    int len[kKvCopySetMax];
+    int n = 0;
+};
+/// The blocks the last resolve of map m missed, for every cache of the set.
+void glm_kv_copy_set(const KvStreamMap& m, const KvCopySet& set, cudaStream_t s);
+/// glm_kv_resolve (n_sel_dev null) or glm_kv_resolve_dev of a group's map, then glm_kv_copy_set: two launches for the
+/// whole group, whatever its size.
+void glm_kv_resolve_set(const KvStreamMap& m, const KvCopySet& set, int page, const int* cells, int n_sel,
+                        const int* n_sel_dev, int* slot_cells, cudaStream_t s);
+
+/// Debug (MAYA_GLM_KV_DEBUG): what an attention is about to read against the host copy.  For each live cell c of the
+/// selection (n_sel of them, or *n_sel_dev when given; -1 = padding) the `row_bytes` at slot row slot_cells[i] (null:
+/// the identity window, row c itself) of `slots` are compared with row c of `host`.  dbg (4 ints, device): [0] rows
+/// compared, [1] rows that differ or have no slot, [2] the first such cell + 1, [3] its tag + 1 (the caller's: a layer).
+/// Counts saturate at INT_MAX.
+void glm_kv_check(const uint8_t* host, const uint8_t* slots, int row_bytes, const int* cells, const int* slot_cells,
+                  int n_sel, const int* n_sel_dev, int tag, int* dbg, cudaStream_t s);
+
 /// glm_kv_resolve of several rows in one launch (MAYA_GLM_ROWS_SMALL), each row its own sequence's map, host copy,
 /// slots, selection and slot cells - no two rows may share a map; a row of n_sel <= 0 does nothing.  Each row's map,
 /// slots and slot cells come out as its own glm_kv_resolve leaves them

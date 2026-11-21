@@ -74,6 +74,11 @@ struct GlmDsaFast::Mixer {
     float* idx_inv_freq = nullptr;
     int* cells_dense = nullptr;
     int* slot_cells = nullptr;     // L1-6 KV streaming: a selection in slot rows (top_k)
+    // ... and what slot_cells holds: the selection of position kv_sel_pos resolved on the map of layer kv_sel_lead of
+    // the stream kv_sel_k (a sequence's) - the shared layers of that indexer group reuse it for the same token
+    const void* kv_sel_k = nullptr;
+    int kv_sel_lead = -1;
+    int64_t kv_sel_pos = -1;
     void* work = nullptr;
     size_t work_bytes = 0;
     void* topk_work = nullptr;     // glmd::topk_mb's (zeroed once; the kernel leaves it zeroed)
@@ -129,6 +134,15 @@ struct GpuOps {
     glmd::DecodePolicy pol;
     int64_t p = 0;                 // the token's position (the policy's n = p + 1)
     void* topk_work = nullptr;
+    // MAYA_GLM_PROF_DSA=1 (with MAYA_GLM_PROF): a profile mark after each step of the mixer, so the part's table splits
+    // "dsa_glm" into the projections, the prep, the rope, the indexer's score and top-k, KV streaming's resolve and
+    // the attention (null: one "dsa_glm" mark a layer, as before)
+    void (*mark)(void* ctx, const char* name) = nullptr;
+    void* mark_ctx = nullptr;
+    bool done(bool ok, const char* name) const {
+        if (mark != nullptr) mark(mark_ctx, name);
+        return ok;
+    }
     const WSlot* slot(int il, Proj w) const {
         const GlmDsaLayerW& W = X->L[(size_t) il];
         switch (w) {
@@ -158,15 +172,15 @@ struct GpuOps {
             m[i].xf_cstride = j[i].xf_cs;
             m[i].y_cstride = j[i].y_cs;
         }
-        return mv(X, m, n, s);
+        return done(mv(X, m, n, s), "dsa_proj");
     }
-    bool prep(const glmd::DsaPrep& a) { return glmd::dsa_prep(a, s); }
-    bool rope_q(const glmd::DsaRopeQ& a) { return glmd::dsa_rope_q(a, s); }
-    bool score(const glmd::IdxScore& a) { return glmd::decode_score(pol, a, p, s); }
+    bool prep(const glmd::DsaPrep& a) { return done(glmd::dsa_prep(a, s), "dsa_prep"); }
+    bool rope_q(const glmd::DsaRopeQ& a) { return done(glmd::dsa_rope_q(a, s), "dsa_rope"); }
+    bool score(const glmd::IdxScore& a) { return done(glmd::decode_score(pol, a, p, s), "dsa_score"); }
     bool topk(const float* score, int ld, int n_kv, const int* pos, int top_k, int* sel) {
-        return glmd::decode_topk(pol, score, ld, n_kv, pos, p, top_k, sel, topk_work, s);
+        return done(glmd::decode_topk(pol, score, ld, n_kv, pos, p, top_k, sel, topk_work, s), "dsa_topk");
     }
-    bool mla2(const glmd::Mla2& a) { return glmd::decode_mla(pol, a, s); }
+    bool mla2(const glmd::Mla2& a) { return done(glmd::decode_mla(pol, a, s), "dsa_mla"); }
     void set_pos(int64_t q) { p = q; }   // (L1-4 mixer_rows: each row's own position)
 };
 
@@ -390,54 +404,128 @@ static void mixer_dump(cudaStream_t s, const std::string& name, const void* dev,
     glmcb::write(name, buf.data(), buf.size(), elem == 4 ? ".f32" : ".bin", (size_t) std::max<int64_t>(pad_n, 0) * elem);
 }
 
-// L1-6 KV streaming: MixerCache::kv_resolve for one streamed layer - the latent's map resolves the selection (and copies
-// the missed latent rows), the same misses are copied from the k_pe host copy into the k_pe slots
+// L1-6 KV streaming: MixerCache::kv_resolve for one streamed layer.  The layers of an indexer group share one
+// residency map (KvStream::lead), so a resolve copies each missed block for every cache of the group (set: each
+// layer's latent and k_pe) and the group's shared layers reuse the full layer's slot rows for the same token.
 namespace {
 struct DsaKvCtx {
+    enum Mode { kResolve = 0, kReuse, kIdentity };
+    int mode = kResolve;
     const strata::kernels::KvStreamMap* map = nullptr;
-    const uint8_t* lat_host = nullptr;
-    uint8_t* lat_slots = nullptr;
-    const uint8_t* kpe_host = nullptr;
-    uint8_t* kpe_slots = nullptr;
-    int lat_row = 0, kpe_row = 0, page = 1;
+    gf::KvCopySet set;             // the group's caches (kResolve)
+    int page = 1;
     int* slot_cells = nullptr;
     cudaStream_t s = nullptr;
+    // what the resolve leaves in slot_cells (Mixer::kv_sel_*; null: a window's rows, nothing is reused)
+    const void** sel_k = nullptr;
+    int* sel_lead = nullptr;
+    int64_t* sel_pos = nullptr;
+    const void* k = nullptr;
+    int lead = -1;
+    int64_t p = -1;
+    // MAYA_GLM_KV_DEBUG: this layer's rows as the attention is about to read them, against the host copies
+    int32_t* dbg = nullptr;
+    int il = -1;
+    const uint8_t* lat_host = nullptr;
+    const uint8_t* lat_slots = nullptr;
+    const uint8_t* kpe_host = nullptr;
+    const uint8_t* kpe_slots = nullptr;
+    int lat_row = 0, kpe_row = 0;
+    void (*mark)(void* ctx, const char* name) = nullptr;   // MAYA_GLM_PROF_DSA: "dsa_kv" after the resolve's launches
+    void* mark_ctx = nullptr;
 };
 const int* dsa_kv_resolve(void* ctx, const int* cells, int n_cap, const int* n_sel_dev) {
     const DsaKvCtx& k = *(const DsaKvCtx*) ctx;
-    if (k.slot_cells == nullptr || cells == nullptr) return nullptr;
-    if (n_sel_dev != nullptr)
-        gf::glm_kv_resolve_dev(*k.map, k.lat_host, k.lat_slots, k.lat_row, k.page, cells, n_cap, n_sel_dev,
-                               k.slot_cells, k.s);
-    else
-        gf::glm_kv_resolve(*k.map, k.lat_host, k.lat_slots, k.lat_row, k.page, cells, n_cap, k.slot_cells, k.s);
-    if (k.kpe_host != nullptr) gf::glm_kv_copy_misses(*k.map, k.kpe_host, k.kpe_slots, k.kpe_row, k.page, k.s);
-    return k.slot_cells;
+    if (cells == nullptr) return nullptr;
+    const int* rows = cells;       // kIdentity: block b is in slot b
+    if (k.mode != DsaKvCtx::kIdentity) {
+        if (k.slot_cells == nullptr) return nullptr;
+        if (k.mode == DsaKvCtx::kResolve) {
+            gf::glm_kv_resolve_set(*k.map, k.set, k.page, cells, n_cap, n_sel_dev, k.slot_cells, k.s);
+            if (k.sel_k != nullptr) {
+                *k.sel_k = k.k;
+                *k.sel_lead = k.lead;
+                *k.sel_pos = k.p;
+            }
+        }
+        rows = k.slot_cells;
+        if (k.mark != nullptr) k.mark(k.mark_ctx, "dsa_kv");
+    }
+    if (k.dbg != nullptr) {
+        const int* sc = k.mode == DsaKvCtx::kIdentity ? nullptr : k.slot_cells;
+        gf::glm_kv_check(k.lat_host, k.lat_slots, k.lat_row, cells, sc, n_cap, n_sel_dev, k.il, k.dbg, k.s);
+        if (k.kpe_host != nullptr)
+            gf::glm_kv_check(k.kpe_host, k.kpe_slots, k.kpe_row, cells, sc, n_cap, n_sel_dev, k.il, k.dbg, k.s);
+    }
+    return rows;
 }
 }  // namespace
 
 // the cache of layer il, streamed or not (k: the resolve context it points at, alive for the layer's call)
-void Glm5Model::dsa_mixer_cache(int il, void* cache, void* kctx, int* slot_cells, void* stream) const {
+void Glm5Model::dsa_mixer_cache(int il, void* cache, void* kctx, int* slot_cells, void* stream, int64_t p_hi,
+                                bool group) const {
     glmdsa::MixerCache& c = *(glmdsa::MixerCache*) cache;
     c.lat = state_ + lay_.dsa_lat[(size_t) il];
     c.lat_q8 = lat_q8_ ? 1 : 0;
     c.k_pe = g_.qk_rope > 0 ? (uint16_t*) (state_ + lay_.dsa_kpe[(size_t) il]) : nullptr;
     if (!kv_streamed(kv_, il)) return;
+    KvStream& K = *kv_;
     DsaKvCtx& k = *(DsaKvCtx*) kctx;
-    k.map = &kv_->map[(size_t) il];
-    k.lat_host = kv_->host[(size_t) il];
-    k.lat_slots = (uint8_t*) c.lat;
-    k.kpe_host = kv_->kpe_host.empty() ? nullptr : kv_->kpe_host[(size_t) il];
-    k.kpe_slots = (uint8_t*) c.k_pe;
-    k.lat_row = kv_->row_bytes;
-    k.kpe_row = kv_->kpe_row_bytes;
-    k.page = kv_->page;
+    // where the prep writes: the host copies always, the slot rows of a resident block (the group's map)
+    c.lat_host = K.host[(size_t) il];
+    c.kpe_host = K.kpe_host.empty() ? nullptr : (uint16_t*) K.kpe_host[(size_t) il];
+    c.kv_table = K.map[(size_t) il].page_table;
+    c.kv_page = K.page;
+    // what the attention reads: the identity window's rows as they are, or the selection resolved into slot rows
+    const bool ident = kv_window_hit(&K, p_hi);
+    if (ident && K.dbg == nullptr) return;   // (kv_resolve stays null: lat / k_pe row c is position c)
+    glmdsa::GlmDsaFast::Mixer& M = *fast_->dsa->mix;
+    const int lead = K.lead.empty() ? il : K.lead[(size_t) il];
+    k.map = &K.map[(size_t) il];
+    k.page = K.page;
     k.slot_cells = slot_cells;
     k.s = (cudaStream_t) stream;
-    c.lat_host = kv_->host[(size_t) il];
-    c.kpe_host = (uint16_t*) k.kpe_host;
-    c.kv_table = kv_->map[(size_t) il].page_table;
-    c.kv_page = kv_->page;
+    k.k = &K;
+    k.lead = lead;
+    k.p = p_hi;
+    if (ident) {
+        k.mode = DsaKvCtx::kIdentity;
+    } else if (group && lead != il && M.kv_sel_k == &K && M.kv_sel_lead == lead && M.kv_sel_pos == p_hi) {
+        k.mode = DsaKvCtx::kReuse;   // the group's full layer resolved this token's selection: the same slot rows
+    } else {
+        k.mode = DsaKvCtx::kResolve;
+        k.set.n = 0;
+        for (size_t m = 0; m < K.host.size(); ++m) {   // every cache on this map (a layer without a group: its own)
+            if (K.host[m] == nullptr || (K.lead.empty() ? (int) m != il : K.lead[m] != lead)) continue;
+            k.set.host[k.set.n] = K.host[m];
+            k.set.slots[k.set.n] = (uint8_t*) (state_ + lay_.dsa_lat[m]);
+            k.set.len[k.set.n++] = K.page * K.row_bytes;
+            if (!K.kpe_host.empty() && K.kpe_host[m] != nullptr && lay_.has_kpe((int) m)) {
+                k.set.host[k.set.n] = K.kpe_host[m];
+                k.set.slots[k.set.n] = (uint8_t*) (state_ + lay_.dsa_kpe[m]);
+                k.set.len[k.set.n++] = K.page * K.kpe_row_bytes;
+            }
+        }
+        if (group) {
+            k.sel_k = &M.kv_sel_k;
+            k.sel_lead = &M.kv_sel_lead;
+            k.sel_pos = &M.kv_sel_pos;
+        } else {
+            M.kv_sel_lead = -1;   // (a window's rows overwrite slot_cells row by row: nothing to reuse after them)
+        }
+    }
+    if (K.dbg != nullptr) {
+        k.dbg = K.dbg;
+        k.il = il;
+        k.lat_host = K.host[(size_t) il];
+        k.lat_slots = (const uint8_t*) c.lat;
+        k.lat_row = K.row_bytes;
+        if (!K.kpe_host.empty() && c.k_pe != nullptr) {
+            k.kpe_host = K.kpe_host[(size_t) il];
+            k.kpe_slots = (const uint8_t*) c.k_pe;
+            k.kpe_row = K.kpe_row_bytes;
+        }
+    }
     c.kv_resolve = dsa_kv_resolve;
     c.kv_ctx = kctx;
 }
@@ -501,7 +589,7 @@ bool Glm5Model::fast_dsa_glm(int il, int64_t p, std::string& err) {
     b.n_grid = M.graph_live ? (int) M.graph_n_cap : 0;
     glmdsa::MixerCache c;
     DsaKvCtx kctx;   // L1-6 KV streaming (unused when the layer is not streamed)
-    dsa_mixer_cache(il, &c, &kctx, M.slot_cells, F->cs);
+    dsa_mixer_cache(il, &c, &kctx, M.slot_cells, F->cs, p, true);
     c.ik = lay_.has_index_cache(il) ? state_ + lay_.dsa_ik[(size_t) il] : nullptr;
     c.ik_f16 = d.pol.idx_fp16 ? 1 : 0;
     c.ik_had = lay_.ik_had;   // B14.11: the BOUND layout's rotation (keys and queries)
@@ -525,6 +613,13 @@ bool Glm5Model::fast_dsa_glm(int il, int64_t p, std::string& err) {
     ops.pol = d.pol;
     ops.p = p;
     ops.topk_work = M.topk_work;
+    static const bool prof_steps = strata::glmenv::env_flag("MAYA_GLM_PROF_DSA", false);
+    if (prof_steps && F->prof_on) {
+        ops.mark = [](void* f, const char* name) { ((FastState*) f)->mark(name); };
+        ops.mark_ctx = F;
+        kctx.mark = ops.mark;
+        kctx.mark_ctx = F;
+    }
     if (!glmdsa::mixer_layer(ops, d, b, c, w, il, p, M.dense, M.st, err)) return false;
     X.n_sel_last = M.st.n_sel_last;
     X.sel_layer = M.st.layer;
@@ -671,7 +766,8 @@ bool Glm5Model::fast_dsa_glm_window(int il, int64_t p0, int t0, int n, const flo
     // the caches and the layer's small weights, as fast_dsa_glm passes them
     glmdsa::MixerCache c;
     DsaKvCtx kctx;   // L1-6 KV streaming (unused when the layer is not streamed)
-    dsa_mixer_cache(il, &c, &kctx, M.slot_cells, F->cs);
+    // (the rows resolve one by one into the one slot_cells: each row's own resolve, on its layer's - its group's - map)
+    dsa_mixer_cache(il, &c, &kctx, M.slot_cells, F->cs, p0 + t0 + n - 1, false);
     c.ik = lay_.has_index_cache(il) ? state_ + lay_.dsa_ik[(size_t) il] : nullptr;
     c.ik_f16 = d.pol.idx_fp16 ? 1 : 0;
     c.ik_had = lay_.ik_had;
@@ -770,6 +866,7 @@ bool graph_run(GlmDsaFast& X, PartGraph& pg, int64_t p, cudaStream_t s, uint64_t
     }
     M.p_cur = M.pos_graph;   // the next token outside a graph takes a ring slot
     M.p_last = p;
+    M.kv_sel_lead = -1;      // (KV streaming: slot_cells holds the part's last group's rows - no layer reuses them)
     return true;
 }
 

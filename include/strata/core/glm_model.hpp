@@ -628,7 +628,9 @@ public:
     bool fast_layers_plain(int64_t p, bool hop_in, std::string& err);
     bool fast_dsa_glm(int il, int64_t p, std::string& err);   // the glm-dsa mixer (glm_dsa_mixer.cu)
     // L1-6: layer il's glmdsa::MixerCache (cache), KV-streamed or not (kctx: the resolve context it points at)
-    void dsa_mixer_cache(int il, void* cache, void* kctx, int* slot_cells, void* stream) const;
+    // p_hi: the last position the call's attentions read from (a window's rows: its last row's); group: the call may
+    // reuse the selection its indexer group's full layer resolved for this token (the token path; never a window's rows)
+    void dsa_mixer_cache(int il, void* cache, void* kctx, int* slot_cells, void* stream, int64_t p_hi, bool group) const;
     bool prefill_tokens_dsa(const std::vector<int32_t>& tokens, int32_t next_token, std::string& err);
     // ... its route (moe_route with the token path's settings) into md's plan, the shared expert's h to sh_hq; win /
     // win_n / win_rows: a grouped batched step's row and rows (glm_rows.cu)
@@ -666,7 +668,10 @@ public:
     KvStream* kv_stream_make(int64_t cells, int64_t ctx, std::string& err);
     void kv_stream_free(KvStream* K);
     uint64_t kv_stage_bytes_ = 0;                            // the prompt path's staging copy (the first sequence's)
-    void kv_stream_reset_maps();                             // nothing resident (reset, slot_load)
+    // the residency maps start over: the identity window where it is on (glm-dsa; identity = false: nothing resident)
+    void kv_stream_reset_maps(bool identity = true);
+    // ... after a conversation of n positions was loaded into the host copies (slot_load, the prompt cache)
+    bool kv_stream_prime(int64_t n, std::string& err);
     float* snap_pool_ = nullptr;
     std::vector<int> dsa_layers() const;                   // this half's DSA layers (NextN block first), slot order
     void snap_pool_copy(bool restore);
@@ -738,6 +743,11 @@ public:
         bool overflow = false;   // a resolve could not place every block (never, with a legal slot count)
         double host_gb = 0;      // the pinned host copies
         int block_bytes = 0;     // one page of latent rows: what a miss reads
+        // MAYA_GLM_KV_DEBUG (glm-dsa): the rows the attentions read, compared with the host copy before each read
+        bool dbg_on = false;
+        uint64_t dbg_rows = 0, dbg_bad = 0;
+        int64_t dbg_cell = -1;   // the first differing row's position, and its layer
+        int dbg_layer = -1;
     };
     KvStreamStats kv_stream_stats() const;
     const GlmStateLayout& state_layout() const { return lay_; }   // glm-dsa B4.1: this part's state arena layout

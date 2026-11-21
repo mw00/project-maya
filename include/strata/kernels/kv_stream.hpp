@@ -64,6 +64,10 @@ inline uint64_t kv_stream_map_bytes(int64_t n_slots) { return (uint64_t) n_slots
 
 /// Every block evicted: page table all -1, slots free, counters zero.
 void kv_stream_reset(const KvStreamMap& m, void* stream);
+/// The identity window: block b < n_slots sits in slot b (the rest evicted), reference bits and counters zero.  A valid
+/// residency map whose slots the caller keeps equal to the host copy's first n_slots blocks - while every position a
+/// reader names lies below n_slots * page, its cells ARE its slot rows and no resolve is needed.
+void kv_stream_reset_ident(const KvStreamMap& m, void* stream);
 
 /// Make every block named by the selections of `n_q` queries resident (ids [n_q][cap], width from
 /// steps[q * kStepCount + kStepWidth]). Capturable. `n_slots` must hold the distinct blocks of one call

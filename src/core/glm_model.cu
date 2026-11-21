@@ -21,6 +21,8 @@
 #include "strata/core/glm_dsa_spec.hpp"   // glm-dsa B11.2
 #include "strata/core/glm_pool_classes.hpp"   // glm-dsa B3.7
 #include "strata/core/glm_cpu_affinity.hpp"   // glm-dsa B15.5
+#include "strata/core/glm_env.hpp"
+#include "strata/core/glm_kv_groups.hpp"
 
 #include "strata/kernels/glm_dsa.hpp"
 #include "strata/kernels/glm_fast.hpp"
@@ -921,21 +923,40 @@ Glm5Model::KvStream* Glm5Model::kv_stream_make(int64_t cells, int64_t ctx, std::
                       "all)", (double) K->host_bytes / 1e9);
         return fail(b);
     }
+    // glm-dsa: which map each layer uses (KvStream::lead) - the layers of an indexer group share their full layer's
+    // (MAYA_GLM_KV_GROUP=0: a map a layer, as Flash); a group larger than one copy launch carries starts another map
+    const bool dsa = g_.arch == GlmArch::GlmDsa;
+    const bool grouped = dsa && strata::glmenv::env_flag("MAYA_GLM_KV_GROUP", true);
+    K->window = dsa && strata::glmenv::env_flag("MAYA_GLM_KV_WINDOW", true);
+    const bool debug = dsa && strata::glmenv::env_flag("MAYA_GLM_KV_DEBUG", false);
+    size_t n_maps = ls.size();
+    if (dsa)
+        K->lead = glm_kv_leads(ls, g_.n_layers, [&](int il) { return g_.idx_full(il); }, grouped,
+                               k::glmf::kKvCopySetMax / (K->kpe_row_bytes > 0 ? 2 : 1), n_maps);
     const auto a16 = [](uint64_t n) { return (n + 15) & ~(uint64_t) 15; };
     const uint64_t per = a16((uint64_t) K->n_blocks * 4) + 5 * a16((uint64_t) K->slots * 4) + a16(k::kKvCtlInts * 4);
-    if (cudaMalloc(&K->map_arena, per * ls.size()) != cudaSuccess) {
+    if (cudaMalloc(&K->map_arena, per * n_maps + 64) != cudaSuccess) {
         cudaGetLastError();
         K->map_arena = nullptr;
         return fail("KV streaming: the residency maps did not allocate");
     }
+    if (debug) {
+        K->dbg = (int32_t*) ((uint8_t*) K->map_arena + per * n_maps);
+        cudaMemset(K->dbg, 0, 4 * sizeof(int32_t));
+    }
     K->host.assign((size_t) g_.n_layers + 1, nullptr);
     if (K->kpe_row_bytes > 0) K->kpe_host.assign((size_t) g_.n_layers + 1, nullptr);
     K->map.assign((size_t) g_.n_layers + 1, k::KvStreamMap{});
+    size_t i_map = 0;
     for (size_t i = 0; i < ls.size(); ++i) {
         const size_t il = (size_t) ls[i];
         K->host[il] = d + i * layer_bytes;
         if (K->kpe_row_bytes > 0) K->kpe_host[il] = d + i * layer_bytes + lat_bytes;
-        uint8_t* at = (uint8_t*) K->map_arena + i * per;
+        if (dsa && K->lead[il] != (int) il) {   // its group's map (the lead comes first in ls)
+            K->map[il] = K->map[(size_t) K->lead[il]];
+            continue;
+        }
+        uint8_t* at = (uint8_t*) K->map_arena + i_map++ * per;
         const auto take = [&](uint64_t n) {
             int32_t* r = (int32_t*) at;
             at += a16(n * 4);
@@ -951,13 +972,21 @@ Glm5Model::KvStream* Glm5Model::kv_stream_make(int64_t cells, int64_t ctx, std::
         m.ctl = take(k::kKvCtlInts);
         m.n_blocks = K->n_blocks;
         m.n_slots = K->slots;
-        k::kv_stream_reset(m, nullptr);
+        if (K->window) k::kv_stream_reset_ident(m, nullptr);
+        else k::kv_stream_reset(m, nullptr);
     }
+    K->ident = K->window;   // (the arena starts zeroed and no position is written: the window holds what the host copy does)
     if (cudaDeviceSynchronize() != cudaSuccess) return fail("KV streaming: the residency maps did not reset");
     std::fprintf(stderr, "glm pack: CUDA%d KV streaming: %lld of %lld positions of each of %zu DSA layers in VRAM (%.2f "
                          "GB), the latent cache in %.2f GB of pinned RAM\n", dev_, (long long) cells, (long long) ctx,
                  ls.size(), (double) cells * (K->row_bytes + K->kpe_row_bytes) * ls.size() / 1e9,
                  (double) K->host_bytes / 1e9);
+    if (dsa)
+        std::fprintf(stderr, "glm pack: CUDA%d KV streaming: %zu residency maps for the %zu layers (%s), the identity "
+                             "window %s%s\n", dev_, n_maps, ls.size(),
+                     grouped ? "one an indexer group" : "one a layer, MAYA_GLM_KV_GROUP=0",
+                     K->window ? "on (no resolve while a conversation fits the VRAM positions)" : "off (MAYA_GLM_KV_WINDOW=0)",
+                     debug ? ", every read checked against the host copy (MAYA_GLM_KV_DEBUG: slow)" : "");
     return K;
 }
 
@@ -978,11 +1007,49 @@ bool Glm5Model::kv_stream_setup(int64_t cells, std::string& err) {
 
 // Every block evicted (the slots' contents are stale or zeroed); the host copies are not cleared - no reader names a
 // position before this sequence has written it.  On the compute stream, after anything still queued there.
-void Glm5Model::kv_stream_reset_maps() {
+// glm-dsa with the identity window: the maps go back to the window instead (block b in slot b) - right for a sequence
+// that starts over (reset: nothing is written yet, and every later write goes to the host copy and the slot);
+// identity = false evicts everything, as on Flash (a prompt chunk that ran on the stage: kv_stage_out resets the maps
+// itself; a conversation longer than the window loaded from a slot)
+void Glm5Model::kv_stream_reset_maps(bool identity) {
     if (kv_ == nullptr) return;
     cudaSetDevice(dev_);
-    for (const auto& m : kv_->map)
-        if (m.page_table != nullptr) strata::kernels::kv_stream_reset(m, fast_ != nullptr ? (void*) fast_->cs : nullptr);
+    void* s = fast_ != nullptr ? (void*) fast_->cs : nullptr;
+    const bool ident = identity && kv_->window;
+    for (size_t il = 0; il < kv_->map.size(); ++il) {
+        const auto& m = kv_->map[il];
+        if (m.page_table == nullptr || (!kv_->lead.empty() && kv_->lead[il] != (int) il)) continue;   // (a group's map: once)
+        if (ident) strata::kernels::kv_stream_reset_ident(m, s);
+        else strata::kernels::kv_stream_reset(m, s);
+    }
+    kv_->ident = ident;
+}
+
+// A conversation of n positions was just written into the host copies (a slot, a prompt-cache entry): with the identity
+// window and n inside it, its rows go into the slots as well - block b in slot b - so the decode that follows reads
+// them with no resolve; a longer one starts with every block evicted and resolves from its first token.  On the
+// compute stream (the copies are queued, not waited for: whatever reads the slots next is queued behind them).
+bool Glm5Model::kv_stream_prime(int64_t n, std::string& err) {
+    if (kv_ == nullptr) return true;
+    const bool ident = glm_kv_window_load(kv_->window, n, kv_->window_cells()) && fast_ != nullptr;
+    kv_stream_reset_maps(ident);
+    if (!ident || n <= 0) return true;
+    cudaSetDevice(dev_);
+    for (size_t il = 0; il < kv_->host.size(); ++il) {
+        if (kv_->host[il] == nullptr) continue;
+        bool ok = cudaMemcpyAsync(state_ + lay_.dsa_lat[il], kv_->host[il], (size_t) n * kv_->row_bytes,
+                                  cudaMemcpyDefault, fast_->cs) == cudaSuccess;
+        if (ok && kv_->kpe_row_bytes > 0 && lay_.has_kpe((int) il))
+            ok = cudaMemcpyAsync(state_ + lay_.dsa_kpe[il], kv_->kpe_host[il], (size_t) n * kv_->kpe_row_bytes,
+                                 cudaMemcpyDefault, fast_->cs) == cudaSuccess;
+        if (!ok) {
+            cudaGetLastError();
+            kv_stream_reset_maps(false);   // (what was queued stays harmless: every block reads as evicted)
+            err = "KV streaming: the loaded conversation's rows did not copy into the VRAM positions";
+            return false;
+        }
+    }
+    return true;
 }
 
 Glm5Model::KvStreamStats Glm5Model::kv_stream_stats() const {
@@ -996,12 +1063,26 @@ Glm5Model::KvStreamStats Glm5Model::kv_stream_stats() const {
         if (m->fast_ != nullptr) cudaStreamSynchronize(m->fast_->cs);
         for (const KvStream* K : ks) {
             if (K == nullptr) continue;
-            for (const auto& mp : K->map) {
+            for (size_t il = 0; il < K->map.size(); ++il) {
+                const auto& mp = K->map[il];
                 if (mp.page_table == nullptr) continue;
+                // (a group's map counts once - and a miss of it reads the block of every layer of the group)
+                if (!K->lead.empty() && K->lead[il] != (int) il) continue;
+                uint64_t members = 1;
+                if (!K->lead.empty()) members = (uint64_t) std::count(K->lead.begin(), K->lead.end(), (int) il);
                 const strata::kernels::KvStreamCounters c = strata::kernels::kv_stream_counters(mp);
-                r.lookups += c.lookups;
-                r.misses += c.misses;
+                r.lookups += c.lookups * members;
+                r.misses += c.misses * members;
                 r.overflow = r.overflow || c.overflow;
+            }
+            if (K->dbg != nullptr) {
+                int32_t d[4] = {};
+                if (cudaMemcpy(d, K->dbg, sizeof(d), cudaMemcpyDeviceToHost) == cudaSuccess) {
+                    r.dbg_rows += (uint64_t) d[0];
+                    r.dbg_bad += (uint64_t) d[1];
+                    if (d[1] != 0 && r.dbg_cell < 0) r.dbg_cell = d[2] - 1, r.dbg_layer = d[3] - 1;
+                }
+                r.dbg_on = true;
             }
             r.host_gb += (double) K->host_bytes / 1e9;
             r.block_bytes = K->page * (K->row_bytes + K->kpe_row_bytes);   // (L1-6: + k_pe on glm-dsa)
