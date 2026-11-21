@@ -174,7 +174,9 @@ class ChatTemplate:
             level = kwargs.pop("reasoning_effort", None)
             level = name or level
             kwargs.pop("thinking_mode", None)
-            if off:
+            if level == "minimal":   # (its template's own 0.1, not off: effort_kwargs reads it off for the others)
+                kwargs["reasoning_effort"] = level
+            elif off:
                 kwargs["reasoning_effort"] = "none"
             elif level in INKLING_EFFORT:
                 kwargs["reasoning_effort"] = level
@@ -294,7 +296,8 @@ def effort_kwargs(value) -> dict:
         raise ValueError(f"unknown reasoning effort {value!r}: use {EFFORT_WORDS}")
     level = EFFORT[key]
     if level is None:
-        return {"enable_thinking": False}
+        # (Inkling 2's template has a "minimal" of its own, 0.1: the name rides along for it, the rest read off)
+        return {"enable_thinking": False, "effort_name": "minimal"} if key == "minimal" else {"enable_thinking": False}
     name = effort_name(value)
     return {"reasoning_effort": level} if name == level else {"reasoning_effort": level, "effort_name": name}
 
