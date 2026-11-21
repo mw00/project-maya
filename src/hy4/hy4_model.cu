@@ -2809,7 +2809,7 @@ struct Model::Impl {
         if (!pk.load(o.pack, err)) return false;
         {   // (AMD: the prompt GEMMs' measured kernels - the pack's lt-picks.txt, or HY4_LT_STORE's file; empty: none kept)
             const char* ls = std::getenv("HY4_LT_STORE");
-            lt::set_store(ls != nullptr ? ls : (o.pack + "/lt-picks.txt").c_str());
+            lt::set_store(ls != nullptr ? ls : (o.pack + "/lt-picks.txt").c_str(), "HY4_LT_STORE");
         }
         g = pk.g;
         if (o.max_ctx <= 0 || o.max_ctx > g.context) o.max_ctx = g.context;
