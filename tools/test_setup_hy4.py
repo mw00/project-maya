@@ -2553,6 +2553,99 @@ class Q4xCheck(unittest.TestCase):
                 self.assertEqual(c["installer"]["q4x_calibration"]["result"], "on" if want else "off")
                 self.assertIs(maya.q4x_config_migrate(Path(t) / "maya-hy4-flash-maya-xs.json", c), c)
 
+    def test_the_prompt_route_measured_once_per_pc(self):
+        """maya-hy4's prompt route (a chunk's experts outside VRAM streamed to the GPU or on the CPU lane) goes by two
+        rates measured once per PC and remembered in the data folder (the server names the file); --speed-calibration
+        drops them and its engine run measures them again on long prompts, each its own."""
+        import serve.server as SV
+        with tempfile.TemporaryDirectory() as t:
+            self.assertEqual(SV.child_env(self.cfg(Path(t)))["HY4_ROUTE_FILE"],
+                             str(SV.ROOT / "data" / "hy4-prompt-route.txt"))
+        self.assertNotIn("HY4_ROUTE_FILE", SV.child_env({"exe": "/b/maya", "args": ["--glm-pack", "/p"]}))
+        self.assertEqual(maya.route_state("maya-hy4: prompt route: the CPU lane 9.10 us an expert-token"), "measured")
+        self.assertEqual(maya.route_state("INFO prompt route: measured on this PC while prompts are read"), "measuring")
+        self.assertEqual(maya.route_state("INFO prompt route: by the rates measured on this PC (2026-11-20"),
+                         "remembered")
+        self.assertEqual(maya.route_state("INFO prompt route: pinned - ..."), "pinned")
+        self.assertIsNone(maya.route_state("INFO every routed expert in VRAM"))
+        with tempfile.TemporaryDirectory() as t:
+            root = Path(t)
+            (root / "docs").mkdir()
+            (root / "docs" / "SETTINGS.md").write_text("word " * 6000)
+            (root / "data").mkdir()
+            (root / "data" / "hy4-prompt-route.txt").write_text("old\n")
+            with patch.object(maya, "ROOT", root), patch.object(maya, "ok"):
+                maya.route_forget()
+            self.assertFalse((root / "data" / "hy4-prompt-route.txt").exists())
+            p = root / "maya-hy4-flash-maya-xs.json"
+            p.write_text(json.dumps(self.cfg(root)))
+            seen = {"gens": []}
+
+            class Engine:
+                def __init__(self, cmd, stdin=None, stdout=None, stderr=None, env=None, **kw):
+                    seen["env"] = env
+                    stderr.write("INFO every routed expert of IQ2_XS\nINFO prompt route: measured on this PC while "
+                                 "prompts are read\n")
+                    stderr.flush()
+                    self.err = stderr
+                    eng = self
+
+                    class In(io.StringIO):
+                        def write(self, s):
+                            seen["gens"].append(s.split(" ")[1] if s.startswith("GEN") else s)
+                            if len(seen["gens"]) == 3:   # (the second long prompt: the rates settle)
+                                eng.err.write("maya-hy4: prompt route: the CPU lane 9.10 us an expert-token\n")
+                                eng.err.flush()
+                            return len(s)
+                    self.stdin = In()
+                    self.stdout = iter(["READY\n"] + ["DONE 1 30 1 1 length\n"] * 8)
+
+                def wait(self, timeout=None):
+                    return 0
+
+            class Tok:
+                @staticmethod
+                def from_dir(d):
+                    return SimpleNamespace(encode=lambda s, parse_special=False: [1, 2, 3])
+            said = []
+            with patch.object(maya.subprocess, "Popen", Engine), patch.object(maya, "busy_skip", return_value=False), \
+                    patch.object(maya.time, "sleep"), patch.object(maya, "ok", said.append), \
+                    patch.object(maya, "warn", said.append), patch.object(maya, "say"), \
+                    patch.object(maya, "ROOT", root), \
+                    patch.dict(sys.modules, {"strata_tokenizer": SimpleNamespace(Tokenizer=Tok)}), \
+                    patch.object(maya, "bench_chat", return_value=lambda q: q):
+                maya.q4x_calibration(p)
+            self.assertEqual(seen["env"]["HY4_ROUTE_MEASURE"], "1")
+            self.assertEqual(seen["gens"][:3], ["64", "1", "1"])        # (the warm-up answer, then long prompts)
+            self.assertNotIn("1", seen["gens"][3:4])                   # (none after the rates settled)
+            self.assertTrue(any("prompt route's rates" in s and "measured on this PC" in s for s in said))
+
+    def test_the_hot_experts_file_is_kept_until_a_calibration(self):
+        """maya-hy4's HY4_HOT (on by default) places a start's experts in VRAM by scores the first start learns and
+        the starts after only read: a file a model in the data folder (not in the model's download), named by the
+        model's folder; --speed-calibration drops this model's file alone, so its run learns it again."""
+        import serve.server as SV
+        with tempfile.TemporaryDirectory() as t:
+            root = Path(t)
+            c = self.cfg(root, args=["--pack", str(root / "Hy4-Flash-Maya-XS" / "maya-hy4"), "--max-context", "8192"])
+            self.assertEqual(SV.child_env(c)["HY4_HOT_FILE"],
+                             str(SV.ROOT / "data" / "hy4-expert-hot-Hy4-Flash-Maya-XS.bin"))
+            self.assertEqual(SV.hy4_hot_file({"args": ["--pack", "/m/My Pack!"]}).name, "hy4-expert-hot-My_Pack.bin")
+            self.assertEqual(SV.hy4_hot_file({"args": []}).name, "hy4-expert-hot-model.bin")
+            self.assertNotIn("HY4_HOT_FILE", SV.child_env({"exe": "/b/maya", "args": ["--glm-pack", "/p"]}))
+            (root / "data").mkdir()
+            mine = root / "data" / "hy4-expert-hot-Hy4-Flash-Maya-XS.bin"
+            other = root / "data" / "hy4-expert-hot-Hy4-Flash-Maya-S.bin"
+            mine.write_bytes(b"HY4HOT1\0")
+            other.write_bytes(b"HY4HOT1\0")
+            said = []
+            with patch.object(maya, "ROOT", root), patch.object(maya, "ok", said.append):
+                maya.hot_forget(c)
+                maya.hot_forget(c)                             # (none left: nothing said)
+            self.assertFalse(mine.exists())
+            self.assertTrue(other.exists())
+            self.assertEqual(len(said), 1)
+
     def test_nothing_to_decide_or_unfinished(self):
         with tempfile.TemporaryDirectory() as t:
             got, c, _, _ = self.run_check(Path(t), "INFO every routed expert in VRAM")

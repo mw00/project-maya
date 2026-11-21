@@ -3,8 +3,14 @@
 //   maya-hy4 --pack <model>/maya-hy4 --serve [--gpus 0,1,...] [--max-context N] [--chunk N] [--eos id,id,...]
 //            [--mtp | --dfly2 [--draft N] [--draft-floor P]] [--vram-experts F] [--cpu-threads N] [--profile F] [--profile-out F]
 //            [--tp N|auto] [--main-gpu I] [--vision on|off] [--kv auto|f16|q8]
-//            [--kv-streaming on|off|auto] [--kv-resident N] [--room-report]
+//            [--kv-streaming on|off|auto] [--kv-resident N] [--room-report] [--gpu-fetch off|auto|gpu|lane|K]
 //
+// --gpu-fetch (HY4_FETCH; off by default): the routed experts VRAM does not hold copied into pinned RAM, and the GPU
+// fetching the ones a token routes to it over the bus itself - gpu: all of them on the GPU (the experts in VRAM follow
+// the routing), K: each token's first K of them a layer on the GPU and the rest on the CPU lane beside it, lane: the
+// CPU lane alone (as off), auto: whichever of them a short decode at the first start measures fastest on this PC
+// (remembered; HY4_FETCH_MEASURE=1 or maya --speed-calibration measures again).  gpu / K change the answers in the last
+// bits against the CPU lane's (each choice's own are the same from run to run, drafting or not).
 // --room-report (the server's, at a first start on a PC whose cards it has no figure for): an INFO line says, for
 // each GPU, its free VRAM as the plan read it and how much less of it this start's choices would hold with (the
 // cache's rows, KV streaming, the drafter's room, the pictures, the layout) - worked out on the plan alone.
@@ -19,10 +25,11 @@
 // chunk sends them to the GPU instead where this PC's PCIe is measured faster than its CPU.  --profile: an expert
 // profile (uint32 [layers][experts] routings) - each layer's most routed experts are the ones kept in VRAM;
 // --profile-out: where the routings this run counts (with the profile's) are written, after each request when serving
-// and at the end otherwise.  HY4_HOT=1 (opt-in: the text differs from without it): the experts in VRAM follow the
-// generated tokens' routing - every HY4_HOT_EVERY (8) token steps up to HY4_HOT_SWAPS (64) cold ones trade places with
-// hotter CPU-lane ones, more between requests; the scores are kept over restarts in HY4_HOT_FILE
-// (<pack>/expert-hot.bin), and a start places each layer's highest scored experts in VRAM; HY4_HOT_LOG=1 logs.
+// and at the end otherwise.  HY4_HOT (on; HY4_HOT=0 off - the text differs from without it): where a layer's experts
+// are partly in VRAM, the ones there follow the generated tokens' routing - every HY4_HOT_EVERY (8) token steps up to
+// HY4_HOT_SWAPS (64) cold ones trade places with hotter CPU-lane ones, more between requests; a start places each
+// layer's highest scored experts in VRAM by HY4_HOT_FILE (<pack>/expert-hot.bin; the server's: its data folder),
+// written only by a start that found none (or HY4_HOT_LEARN=1), so every start begins the same; HY4_HOT_LOG=1 logs.
 //
 // --draft-more N (1) / --draft-sure P (0.8) / --draft-streak S (1): up to N drafts more in a step - one for every S
 // steps in a row before it whose drafts were all kept - while every draft of the step so far, and the added one, has a
@@ -308,6 +315,87 @@ int run_kld(hy4::Model& m, const std::string& path, int chunks, const std::strin
                 kls[(size_t) (kls.size() * 0.99)], kls.back());
     std::printf("top-1 same: %.3f%%;  PPL this %.4f, reference %.4f\n", 100.0 * same / n, std::exp(nll_me / n),
                 std::exp(nll_ref / n));
+    return 0;
+}
+
+// --kld-topk FILE (tests): the model against the quants' own oracle - a top-k reference ("_hy4top_": n_ctx, k, rows;
+// tokens [rows][n_ctx] int32, mask [rows][n_ctx-1] u8, logp [rows][n_ctx][k] f32, idx [rows][n_ctx][k] int32), scored
+// as the quantizer scores (top-k KL with the tails lumped, the same top token), the masked positions of each row's
+// second half: the first half in one call (the prompt path), then windows of kMaxWin (the token path).  save: a line
+// a scored position "row pos kl same" (paired comparisons)
+int run_kld_topk(hy4::Model& m, const std::string& path, int chunks, const std::string& save) {
+    std::ifstream f(path, std::ios::binary);
+    char magic[8];
+    int32_t hd[3] = {0, 0, 0};
+    if (!f.read(magic, 8) || std::memcmp(magic, "_hy4top_", 8) != 0 || !f.read((char*) hd, sizeof hd)) {
+        std::fprintf(stderr, "%s: not a top-k reference\n", path.c_str());
+        return 1;
+    }
+    const int n_ctx = hd[0], K = hd[1], rows = hd[2], nv = m.vocab();
+    std::vector<int32_t> tok((size_t) rows * n_ctx);
+    std::vector<uint8_t> mask((size_t) rows * (n_ctx - 1));
+    std::vector<float> rlp((size_t) rows * n_ctx * K);
+    std::vector<int32_t> rix((size_t) rows * n_ctx * K);
+    f.read((char*) tok.data(), (std::streamsize) (tok.size() * 4));
+    f.read((char*) mask.data(), (std::streamsize) mask.size());
+    f.read((char*) rlp.data(), (std::streamsize) (rlp.size() * 4));
+    if (!f.read((char*) rix.data(), (std::streamsize) (rix.size() * 4))) {
+        std::fprintf(stderr, "%s: cut short\n", path.c_str());
+        return 1;
+    }
+    std::FILE* out = save.empty() ? nullptr : std::fopen(save.c_str(), "w");
+    const int use = chunks > 0 ? std::min(chunks, rows) : rows, first = n_ctx / 2;
+    std::vector<float> logits((size_t) hy4::k::kMaxWin * nv);
+    std::vector<double> lp, kls;
+    double kl = 0;
+    long n = 0, same = 0;
+    for (int r = 0; r < use; ++r) {
+        const int* ids = tok.data() + (size_t) r * n_ctx;
+        std::string err;
+        const double t0 = now();
+        if (!m.forward(ids, first, 0, 0, nullptr, err)) {
+            std::fprintf(stderr, "forward: %s\n", err.c_str());
+            return 1;
+        }
+        for (int p = first; p < n_ctx - 1; p += hy4::k::kMaxWin) {
+            const int T = std::min(hy4::k::kMaxWin, n_ctx - 1 - p);
+            if (!m.forward(ids + p, T, p, T, logits.data(), err)) {
+                std::fprintf(stderr, "forward at %d: %s\n", p, err.c_str());
+                return 1;
+            }
+            for (int t = 0; t < T; ++t) {
+                const int pos = p + t;
+                if (!mask[(size_t) r * (n_ctx - 1) + pos]) continue;
+                const float* me = logits.data() + (size_t) t * nv;
+                log_softmax(me, nv, lp);
+                const float* rl = rlp.data() + ((size_t) r * n_ctx + pos) * K;
+                const int32_t* ri = rix.data() + ((size_t) r * n_ctx + pos) * K;
+                double k = 0, pr_s = 0, q_s = 0;
+                for (int j = 0; j < K; ++j) {
+                    const double pr = std::exp((double) rl[j]), q = lp[(size_t) ri[j]];
+                    k += pr * ((double) rl[j] - q);
+                    pr_s += pr;
+                    q_s += std::exp(q);
+                }
+                const double pt = std::max(1e-9, 1.0 - pr_s), qt = std::max(1e-9, 1.0 - q_s);
+                k += pt * (std::log(pt) - std::log(qt));
+                const int s = argmax(me, nv) == ri[0];
+                kl += k;
+                same += s;
+                ++n;
+                kls.push_back(k);
+                if (out) std::fprintf(out, "%d %d %.6g %d\n", r, pos, k, s);
+            }
+        }
+        std::printf("row %d: %.1f s; running KL %.5f, top-1 same %.2f%% (%ld positions)\n", r, now() - t0,
+                    n ? kl / n : 0.0, n ? 100.0 * same / n : 0.0, n);
+        std::fflush(stdout);
+    }
+    if (out) std::fclose(out);
+    if (kls.empty()) return 1;
+    std::sort(kls.begin(), kls.end());
+    std::printf("KLD-topk over %ld positions: mean %.6f, median %.6f, p99 %.6f; top-1 same %.3f%%\n", n, kl / n,
+                kls[kls.size() / 2], kls[(size_t) (kls.size() * 0.99)], 100.0 * same / n);
     return 0;
 }
 
@@ -1177,6 +1265,7 @@ int main(int argc, char** argv) {
         }
         else if (a == "--vram-experts") o.vram_experts = std::atof(next().c_str());
         else if (a == "--cpu-threads") o.cpu_threads = std::atoi(next().c_str());
+        else if (a == "--gpu-fetch") o.gpu_fetch = next();
         else if (a == "--profile") o.profile = next();
         else if (a == "--tp") {
             const std::string v = next();
@@ -1185,6 +1274,7 @@ int main(int argc, char** argv) {
         else if (a == "--main-gpu") o.main_gpu = std::atoi(next().c_str());
         else if (a == "--profile-out") o.profile_out = next();
         else if (a == "--kld") kld = next();
+        else if (a == "--kld-topk") kld = "topk:" + next();
         else if (a == "--chunks") chunks = std::atoi(next().c_str());
         else if (a == "--top") top = true;
         else if (a == "--trace") trace = std::atoi(next().c_str());
@@ -1267,6 +1357,7 @@ int main(int argc, char** argv) {
     //  the token and its drafts, is kMaxWin positions at most: the added drafts within it)
     n_more = m.has_dfly2() ? 0 : std::min(n_more, std::max(0, hy4::k::kMaxWin - 1 - n_draft));
     if (serving) return serve(m, eos, n_draft, floor, n_more, sure, need);
+    if (kld.rfind("topk:", 0) == 0) return run_kld_topk(m, kld.substr(5), chunks, kld_save);
     if (!kld.empty()) return run_kld(m, kld, chunks, kld_save);
     std::vector<int> ids = parse_ids(ids_arg);
     if (ids.empty()) {
