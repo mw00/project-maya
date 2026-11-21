@@ -32,6 +32,7 @@
 #define cudaDeviceGetStreamPriorityRange hipDeviceGetStreamPriorityRange
 #define cudaDeviceCanAccessPeer hipDeviceCanAccessPeer
 #define cudaDeviceEnablePeerAccess hipDeviceEnablePeerAccess
+#define cudaDeviceDisablePeerAccess hipDeviceDisablePeerAccess
 #define cudaErrorPeerAccessAlreadyEnabled hipErrorPeerAccessAlreadyEnabled
 #define cudaMemcpyPeerAsync hipMemcpyPeerAsync
 #define cudaMemcpyPeer hipMemcpyPeer
