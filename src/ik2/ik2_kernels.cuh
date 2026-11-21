@@ -265,8 +265,14 @@ struct MvConv {
     const float* res = nullptr;
     float* y = nullptr;
 };
+/// ... and with rows that take another input: the rows [r0, r0 + n) of a0 and of a1 are products with a0.x and
+/// a1.x (a layer's fused q | k | v | r | gate matrix whose q, k and v each have an input of their own: one launch).
+struct MvAlt {
+    const float* x = nullptr;
+    int r0 = 0, n = 0;
+};
 void mv_q8p_conv(const int8_t* q, const uint16_t* d, int N, int K, const float* x, float* y, const MvConv& c0,
-                 const MvConv& c1, cudaStream_t s);
+                 const MvConv& c1, cudaStream_t s, const MvAlt& a0 = MvAlt{}, const MvAlt& a1 = MvAlt{});
 void decode_q8p_f16(const int8_t* q, const uint16_t* d, size_t n, uint16_t* out, cudaStream_t s);
 /// y [N] = W [N][K] . x [K] for a small dense matrix kept in FP16 (the sinks, a full layer's dynamic taps, the
 /// router): F32 sums, a warp a row.

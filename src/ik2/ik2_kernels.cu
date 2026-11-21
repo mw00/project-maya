@@ -3325,12 +3325,15 @@ __device__ __forceinline__ bool mv_conv_row(const MvConv& cv, int row, float x_n
 // its short conv instead of to y (a launch less a conv: a token's launches each cost 2 us and more).
 template <int WARPS>
 __global__ void mv_q8p_kernel(const int8_t* __restrict__ q, const uint16_t* __restrict__ d, int N, int K,
-                              const float* __restrict__ x, float* y, MvConv c0, MvConv c1) {
+                              const float* __restrict__ x, float* y, MvConv c0, MvConv c1, MvAlt a0, MvAlt a1) {
     const int row = blockIdx.x * WARPS + (threadIdx.x >> 5), lane = threadIdx.x & 31;
     if (row >= N) return;
     const uint32_t* qr = (const uint32_t*) (q + (size_t) row * K);
     const uint16_t* dr = d + (size_t) row * (K >> 5);
-    const float4* x4 = (const float4*) x;
+    // (a0's and a1's rows have an input of their own: several products of a layer's fused matrix in one launch)
+    const float4* x4 = (const float4*) ((unsigned) (row - a0.r0) < (unsigned) a0.n   ? a0.x
+                                        : (unsigned) (row - a1.r0) < (unsigned) a1.n ? a1.x
+                                                                                     : x);
     float acc = 0.0f;
     for (int it = 0, n_it = K >> 7; it < n_it; ++it) {
         const uint32_t w = __ldg(qr + it * 32 + lane);
@@ -4529,13 +4532,13 @@ void attn_decode_fp8(const float* q, const float* r, const float* sink, const ui
 }
 
 void mv_q8p_conv(const int8_t* q, const uint16_t* d, int N, int K, const float* x, float* y, const MvConv& c0,
-                 const MvConv& c1, cudaStream_t s) {
+                 const MvConv& c1, cudaStream_t s, const MvAlt& a0, const MvAlt& a1) {
     if (N <= 0) return;
-    if (K % 128 || ((uintptr_t) q & 3) || ((uintptr_t) x & 15)) {
+    if (K % 128 || ((uintptr_t) q & 3) || (((uintptr_t) x | (uintptr_t) a0.x | (uintptr_t) a1.x) & 15)) {
         std::fprintf(stderr, "ik2::k::mv_q8p: K %d, or q / x not aligned\n", K);
         std::abort();
     }
-    mv_q8p_kernel<4><<<(unsigned) ((N + 3) / 4), 128, 0, s>>>(q, d, N, K, x, y, c0, c1);
+    mv_q8p_kernel<4><<<(unsigned) ((N + 3) / 4), 128, 0, s>>>(q, d, N, K, x, y, c0, c1, a0, a1);
     check("mv_q8p");
 }
 void mv_q8p(const int8_t* q, const uint16_t* d, int N, int K, const float* x, float* y, cudaStream_t s) {
