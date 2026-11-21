@@ -76,8 +76,9 @@ inline fd_t open_direct(const std::string& path) {
 /// [off, off + n) through an unbuffered descriptor into dst, a kDirectAlign-aligned buffer of at least
 /// direct_span(off, n) bytes: the file read from off rounded down, so the bytes land at dst + (off % kDirectAlign).
 /// False if a read fails (the caller reads buffered instead, the same bytes). A descriptor whose read the system
-/// refused (#1076: EFAULT where the destination is memory O_DIRECT cannot pin) takes no more unbuffered reads - each
-/// later call returns false at once - and the first refusal is logged with its errno and file.
+/// refused (any errno but EFAULT) takes no more unbuffered reads - each later call returns false at once - and the first
+/// refusal is logged with its errno and file. EFAULT (#1076) is the destination's doing, memory O_DIRECT cannot pin:
+/// that call alone returns false (logged once) and the descriptor keeps its unbuffered reads.
 constexpr uint64_t kDirectAlign = 4096;
 inline uint64_t direct_span(uint64_t off, uint64_t n) {
     const uint64_t a0 = off & ~(kDirectAlign - 1), a1 = (off + n + kDirectAlign - 1) & ~(kDirectAlign - 1);
@@ -89,6 +90,7 @@ struct DirectRefused {
     std::vector<int> fds;      // (the refused descriptors)
     std::atomic<int> n{0};     // (their count: 0 - the reads take no lock)
     bool said = false;
+    std::atomic<bool> said_dst{false};   // (the EFAULT line: once)
 };
 inline DirectRefused& direct_refused() {
     static DirectRefused r;
@@ -139,6 +141,13 @@ inline bool pread_direct(fd_t f, void* dst, uint64_t n, uint64_t off) {
         const ssize_t r = ::pread((int) f, p + got, (size_t) std::min<uint64_t>(need - got, 1ull << 30), (off_t) (a0 + got));
         if (r < 0 && errno == EINTR) continue;
         if (r < 0) {
+            if (errno == EFAULT) {   // the destination's doing (memory O_DIRECT cannot pin), not the file's: this call only, the descriptor keeps its unbuffered reads
+                if (!direct_refused().said_dst.exchange(true))
+                    std::fprintf(stderr, "ds4: an unbuffered (O_DIRECT) read was refused with EFAULT: the destination memory cannot be pinned "
+                                 "by O_DIRECT (a hipHostMalloc staging buffer, say) - that read goes through the page cache (the same bytes), "
+                                 "the file's other unbuffered reads go on\n");
+                return false;
+            }
             direct_refuse((int) f, errno);
             return false;
         }
