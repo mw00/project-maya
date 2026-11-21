@@ -6209,8 +6209,8 @@ int attn_decode_mma_blocks(int Hkv) {
     int dev = 0, n_sm = 0, occ16 = 0, occ8 = 0;
     cudaGetDevice(&dev);
     cudaDeviceGetAttribute(&n_sm, cudaDevAttrMultiProcessorCount, dev);
-    if (arch_class() == 70)   // (Volta's kernel: four blocks an SM's worth of splits - its warps mostly wait)
-        return std::max(1, n_sm * 4 / std::max(1, Hkv));
+    if (arch_class() == 70)   // (Volta's kernel: two blocks an SM's worth of splits - fewer partials; 8K deep 63 -> 54 us)
+        return std::max(1, n_sm * 2 / std::max(1, Hkv));
     cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ16, attn_decode_mma_kernel<uint16_t>, kWaNW * 32, 0);
     cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ8, attn_decode_mma_kernel<uint8_t>, kWaNW * 32, 0);
     check("attn_decode_mma (occupancy)");
