@@ -114,6 +114,7 @@ struct HcArgs {
     unsigned int* counter = nullptr;  // zero-initialised once: the single-tail kernel leaves it zero; the grid-
                                       // barrier kernels (hc2 / hc3) only count it up - each barrier waits for the
                                       // next multiple of the block count, so it needs no reset
+    const int* skip = nullptr;        // optional set_skip flag (MAYA_GLM_SKIP_ALL=1)
 };
 void hc(const HcArgs& a, cudaStream_t s);
 /// n rows' hc (each its own args, partials and counter) in one launch where the grid-barrier kernel can hold them all
@@ -145,6 +146,7 @@ struct KdaPrepArgs {
     float* g1 = nullptr;                                    // d_inner
     float* g2 = nullptr;                                    // d_inner
     int n_head = 64, head_dim = 128, d_conv = 4;
+    const int* skip = nullptr;        // optional set_skip flag (MAYA_GLM_SKIP_ALL=1)
 };
 void kda_prep(const KdaPrepArgs& a, cudaStream_t s);
 /// The gated delta recurrence (one token) + the output gate (rms over head_dim * norm_w *

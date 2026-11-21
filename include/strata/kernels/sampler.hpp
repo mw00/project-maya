@@ -64,8 +64,9 @@ struct SpecList {
 
 // draft rows: logits (n_tokens, n_vocab) -> out[t] drawn through this chain, q[t] its kept list.  DEVICE pointers,
 // like sample_tokens; a sampled request without penalties only (greedy keeps the argmax draft).
+// Optional pruned draft vocab mapping (dx_ids, dv): raw indices >= dv map to dx_ids[idx - dv] in q[t].ids and out[t].
 void sample_draft(const float* logits, int n_tokens, int n_vocab, const SamplerParams& p, SpecList* q, int* out,
-                  void* stream);
+                  void* stream, const int* dx_ids = nullptr, int dv = 0);
 // verify rows: the model's logits (n_tokens, n_vocab), the draft draft[t] drawn from q[t] (same p.seed / p.counter as
 // its sample_draft) -> out[t], distributed as sample_tokens' draw.  A draft q[t] does not hold gets the plain draw.
 // With penalties (p.penalty_last_n > 0) `history` holds each row's tokens as in sample_tokens: p is then the

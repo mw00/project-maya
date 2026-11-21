@@ -1517,6 +1517,15 @@ bool Glm5Model::win_pipe_part(int k, int t, std::string& err) {
         return p2p_slot_buf[src_dev];
     };
     cudaSetDevice(m->dev_);
+    static const bool host_cancel_skip = [] {
+        const char* v = getenv("MAYA_GLM_HOST_CANCEL_SKIP");
+        return v != nullptr && std::atoi(v) != 0;
+    }();
+    if (host_cancel_skip && W.from != nullptr && *W.from <= t) {
+        if (m->split_next_) cudaEventRecord(W.ev_tok[sl], F->cs);
+        else cudaEventRecord(W.ev_pick[sl], F->cs);
+        return true;
+    }
     if (prev == nullptr) {
         cudaMemcpyAsync(W.emb + (size_t) sl * E, W.emb_h + (size_t) sl * E, (size_t) E * sizeof(float),
                         cudaMemcpyHostToDevice, F->cs);
