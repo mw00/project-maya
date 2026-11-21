@@ -836,7 +836,8 @@ struct ExpertCache {
         die("expert cache: no slot free");
     }
 
-    void init(const std::vector<Layer>& L, int dev, int n_layers_in, int E_in, size_t budget) {
+    void init(const std::vector<Layer>& L, int dev, int n_layers_in, int E_in, size_t budget,
+              const std::vector<double>* value = nullptr) {
         n_layers = n_layers_in;
         E = E_in;
         layer_pool.assign(n_layers, -1);
@@ -905,6 +906,29 @@ struct ExpertCache {
         for (size_t p = 0; p < pools.size(); ++p) {
             pools[p].n_slots = std::clamp((int) std::floor(pools[p].n_layers * lo), pmin[p], pmax[p]);
             used += (size_t) pools[p].n_slots * pools[p].slot_bytes;
+        }
+        if (value && value->size() == (size_t) n_layers * E) {
+            // (the offload path's tier: the pools sized by what their experts are worth a byte - a profile's picks
+            //  over the slot's bytes, the most first - each pool at least its minimum, the prompt path's)
+            std::vector<std::pair<double, int>> ord;   // (picks a byte, pool)
+            std::vector<std::vector<double>> by_pool(pools.size());
+            for (int l = 0; l < n_layers; ++l)
+                if (layer_pool[l] >= 0)
+                    for (int e = 0; e < E; ++e) by_pool[layer_pool[l]].push_back((*value)[(size_t) l * E + e]);
+            size_t left = budget;
+            for (size_t p = 0; p < pools.size(); ++p) {
+                std::sort(by_pool[p].begin(), by_pool[p].end(), std::greater<double>());
+                pools[p].n_slots = pmin[p];
+                left -= std::min(left, (size_t) pmin[p] * pools[p].slot_bytes);
+                for (size_t i = (size_t) pmin[p]; i < by_pool[p].size(); ++i)
+                    ord.push_back({by_pool[p][i] / (double) pools[p].slot_bytes, (int) p});
+            }
+            std::stable_sort(ord.begin(), ord.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+            for (const auto& o : ord) {
+                Pool& P = pools[(size_t) o.second];
+                if (P.n_slots < pmax[(size_t) o.second] && P.slot_bytes <= left) ++P.n_slots, left -= P.slot_bytes;
+            }
+            used = budget - left;
         }
         size_t rem = budget - used;
         bool grew = true;
@@ -2754,6 +2778,9 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
     ExpertCache* ECp = &dev_cache(g_cur);
 #define W (*Wp)
 #define EC (*ECp)
+    // (the offload path: a prompt streams its experts through the cache without pushing the tier out - the slot
+    //  it takes is the one it took last, evict_scan; IK2_SCAN=0: the usual order)
+    if (g_off) EC.scan = T > 1 && !(getenv("IK2_SCAN") && !std::atoi(getenv("IK2_SCAN")));
     // the embedding rows, normed (pinned host staging, no stream sync needed)
     {
         const size_t rb = (size_t) C / k::block_values(M.embd_type) * k::block_bytes(M.embd_type);
@@ -4574,7 +4601,18 @@ int main(int argc, char** argv) {
                                    : (size_t) 2 << 30;
     const size_t budget = std::min((size_t) (cache_gb * 1073741824.0), fr > room ? fr - room : (size_t) 0);
     EC.tp = g_tp ? d : -1;
-    EC.init(M.L, dual() ? -1 : d, c.n_layer, c.E, budget);
+    std::vector<double> off_value;   // (the offload path: the profile's picks an expert, the tier's pools sized by them)
+    if (g_off_want && d == 0)
+        if (const char* wf = getenv("IK2_WARM"); wf && *wf)
+            if (FILE* in = std::fopen(wf, "rb")) {
+                int32_t hdr[2] = {0, 0};
+                std::vector<uint64_t> cnt((size_t) c.n_layer * c.E);
+                if (std::fread(hdr, 4, 2, in) == 2 && hdr[0] == c.n_layer && hdr[1] == c.E &&
+                    std::fread(cnt.data(), 8, cnt.size(), in) == cnt.size())
+                    off_value.assign(cnt.begin(), cnt.end());
+                std::fclose(in);
+            }
+    EC.init(M.L, dual() ? -1 : d, c.n_layer, c.E, budget, off_value.empty() ? nullptr : &off_value);
     std::printf("expert cache, GPU %d: %d slots across %zu pools (%.1f GiB); load %.1f s in all\n", d, EC.total_slots(),
                 EC.pools.size(), EC.total_bytes() / 1073741824.0, now() - t_start);
     for (size_t p = 0; p < EC.pools.size(); ++p)
