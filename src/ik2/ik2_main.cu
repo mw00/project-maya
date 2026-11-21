@@ -227,6 +227,7 @@ struct Model {
     std::vector<Visit> V;   // the visits of a token, in order
     Mat out_w;            // [n_rows][C]
     float *out_norm, *out_res_score, *embd_norm;
+    float* lp_query_all = nullptr;   // a looped core's message queries, layer by layer ([n_core][4][C]: Layer::lp_query's)
     const uint8_t* embd;  // host Q8_0 [n_rows][C]
     int embd_type;
 };
@@ -1088,6 +1089,7 @@ struct Work {
     // blocks it added after its first, then its final stream); a layer's four messages (q's, k's, v's, the MoE's);
     // its three attention inputs before the messages.
     float *lp_pre = nullptr, *lp_bank = nullptr, *lp_msg = nullptr, *lp_in = nullptr;
+    float* lp_msg_all = nullptr;   // a token's messages of a pass, every core layer's ([n_core][4][C]): one launch a pass
     float* lp_g = nullptr;   // the message gates' scratch [3][Tm][2 rank + 2]
     float *lp_a = nullptr, *lp_f = nullptr;   // ... of a chunk's: [3][Tm][rank] and [2][Tm][C]
     float* logits_h = nullptr;   // the resident token path's logits, pinned [n_vocab]
@@ -1984,14 +1986,14 @@ void fast_token_launches(Model& M, Work& W, OutMode out_mode) {
                 ++n_bank;
                 CU(cudaMemcpyAsync(W.h, W.lp_pre, Cb, cudaMemcpyDeviceToDevice, g_s));
                 nb = nb_pre;
+                // the pass's messages, every core layer's at once: the bank stays as it is until the pass ends, and a
+                // layer's launch of its own was 7 us on one SM (a job a block: the same sums, 24 launches less a token)
+                k::ResStates st{};
+                for (int i = 0; i < n_bank; ++i) st.st[i] = W.lp_bank + (size_t) i * C;
+                k::attn_res_jobs(st, n_bank, M.lp_query_all, 2, 2 * (c.core1 - c.core0), C, 1e-6f, W.lp_msg_all, g_s);
             }
         }
-        if (M.V[vis].pass > 0) {
-            k::ResStates st{};
-            for (int i = 0; i < n_bank; ++i) st.st[i] = W.lp_bank + (size_t) i * C;
-            k::attn_res_jobs(st, n_bank, Ly.lp_query, 2, 2, C, 1e-6f, W.lp_msg, g_s);   // (q, k | v, MoE)
-            msg = W.lp_msg;
-        }
+        if (M.V[vis].pass > 0) msg = W.lp_msg_all + (size_t) (l - c.core0) * 4 * C;   // (q, k | v, MoE)
         // the attention's inputs, normed, in F32: W.xq, W.xk, W.xv (sep: q, k and v each have their own)
         float* x3[3] = {W.xq, W.xk, W.xv};
         const float* nw[3] = {Ly.sliding ? Ly.attn_norm : Ly.q_in_norm, Ly.sliding ? Ly.attn_norm : Ly.k_in_norm,
@@ -3336,6 +3338,7 @@ int main(int argc, char** argv) {
     size_t host_total = 0;
     M.embd_norm = load_f32(S, "token_embd_norm.weight", C);   // (on GPU 0, where the embedding rows go)
     std::vector<float> lp_q, lp_kv;   // a looped core's message queries, [2 n_core][C] each
+    std::vector<float> lp_all;
     if (c.n_pass > 1) {
         lp_q = host_f32(S, "loop_res_query.weight", (size_t) 2 * n_core * C);
         lp_kv = host_f32(S, "loop_kv_res_query.weight", (size_t) 2 * n_core * C);
@@ -3482,6 +3485,8 @@ int main(int argc, char** argv) {
             std::memcpy(q.data() + 2 * C, lp_kv.data() + (2 * i + 1) * C, C * 4);
             std::memcpy(q.data() + 3 * C, lp_q.data() + (2 * i + 1) * C, C * 4);
             Ly.lp_query = dev_f32(q);
+            lp_all.insert(lp_all.end(), q.begin(), q.end());
+            if (l == c.core1 - 1) M.lp_query_all = dev_f32(lp_all);
         }
     }
     // the visits of a token and their state (FP8 E4M3 or FP16 KV; sliding layers ring-buffered in both CLI and --serve)
@@ -3847,6 +3852,7 @@ int main(int argc, char** argv) {
         W.lp_pre = dalloc<float>(Tm * C);
         W.lp_bank = dalloc<float>((size_t) (n_core / c.block) * Tm * C);   // (the pass's blocks after its first, its final stream)
         W.lp_msg = dalloc<float>(4 * Tm * C);
+        W.lp_msg_all = dalloc<float>((size_t) (c.core1 - c.core0) * 4 * C);
         W.lp_in = dalloc<float>(3 * Tm * C);
         W.lp_g = dalloc<float>(3 * Tm * (2 * (size_t) c.rank + 2));
         W.lp_a = dalloc<float>(3 * Tm * (size_t) c.rank);
