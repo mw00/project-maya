@@ -271,7 +271,7 @@ class Vision(unittest.TestCase):
         pack = self.d / "pack"
         (pack / "tokenizer").mkdir(parents=True)
         own = {"host": "0.0.0.0", "port": 9001, "api_key": "k", "cors_origins": ["*"], "mcp_servers": {"a": 1},
-               "model_management": False, "idle_unload_s": 900, "loop_guard": False,
+               "model_management": False, "web_ui": False, "idle_unload_s": 900, "loop_guard": False,
                "fit_max_tokens": True}
         a = type("A", (), dict(port=None, env=[], host=None, api_key=None))()
         ports = []

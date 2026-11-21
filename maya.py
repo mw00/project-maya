@@ -4551,10 +4551,10 @@ GLM_SETUP_ENV = ("MAYA_GLM_RESERVE_MB", "MAYA_GLM_RAM_HEADROOM_GB", "MAYA_GLM_SP
 
 # the server's own settings, set in a config by hand (or with --port / --host / --api-key at a setup): every model's
 # setup again keeps them from the config before (#1089: an update's setup turned "model_management": false back on)
-# - where it listens, its API key, the pages it lets in, the MCP servers, the model management, the idle unload, the
-# loop guard, the output limit fitted to the context
-SERVER_KEYS = ("host", "port", "api_key", "cors_origins", "mcp_servers", "model_management", "idle_unload_s",
-               "loop_guard", "fit_max_tokens")
+# - where it listens, its API key, the pages it lets in, the MCP servers, the model management, the web page (an
+# API-only server), the idle unload, the loop guard, the output limit fitted to the context
+SERVER_KEYS = ("host", "port", "api_key", "cors_origins", "mcp_servers", "model_management", "web_ui",
+               "idle_unload_s", "loop_guard", "fit_max_tokens")
 
 
 def keep_server_settings(cfg: dict, old: dict, a, extra: tuple = ()) -> list:
@@ -6265,7 +6265,9 @@ def server_command(cfg_path: Path, a) -> tuple:
         cmd += ["--api-key", a.api_key]
     if a.gpus or a.gpu is not None:                    # this start only, on these cards
         cmd += ["--gpu", str(a.gpus or a.gpu)]
-    if WIN or sys.platform == "darwin" or os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"):
+    from serve.server import web_ui_setting            # ("web_ui": false: an API-only server, no page to open - #1089)
+    web = web_ui_setting(cfg)
+    if web and (WIN or sys.platform == "darwin" or os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
         cmd.append("--open")                           # a desktop: the browser opens when the model is ready
     here = "127.0.0.1" if host in ("0.0.0.0", "::", "") else host
     ctx = args[args.index("--max-context") + 1] if "--max-context" in args[:-1] else None
@@ -6284,7 +6286,7 @@ def server_command(cfg_path: Path, a) -> tuple:
     say()
     say("  " + "-" * 100)
     say(f"  Starting {info['label'] or cfg.get('model_name', MODEL_NAME)} ({cfg_path.name}).")
-    say(f"  Dashboard:        http://{here}:{port}/")
+    say(f"  Dashboard:        http://{here}:{port}/" if web else "  Dashboard:        off (\"web_ui\": false: the API only)")
     say(f"  API (OpenAI):     http://{here}:{port}/v1        (any model name; the API key: "
         + ("the one you set)" if key else "any)"))
     say(f"  API (Anthropic):  http://{here}:{port}/v1/messages")

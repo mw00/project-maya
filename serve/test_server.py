@@ -2579,6 +2579,60 @@ class ModelManagement(unittest.TestCase):
         self.assertEqual(self.call("POST", "/v1/chat/completions", body)[0], 200)
 
 
+class WebUiOff(unittest.TestCase):
+    """#1089: "web_ui": false (or MAYA_WEB_UI=0) - an API-only server: no page and none of its files, while the API and
+    /health answer as before and the page's data routes stay behind the API key."""
+
+    def setUp(self):
+        self.tok = ByteTokenizer()
+        self.svc = Service(MockEngine(self.tok, "</think>\n\nok", max_context=CTX), self.tok,
+                           ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        self.httpd = serve(self.svc, port=0)
+        self.port = self.httpd.server_address[1]
+
+    def tearDown(self):
+        self.httpd.shutdown()
+        self.httpd.server_close()
+
+    def status(self, method, path, key=None):
+        req = urllib.request.Request(f"http://127.0.0.1:{self.port}{path}", b"{}" if method == "POST" else None,
+                                     {"Content-Type": "application/json", **({"Authorization": "Bearer " + key} if key else {})},
+                                     method=method)
+        try:
+            with urllib.request.urlopen(req, timeout=10) as r:
+                r.read()
+                return r.status
+        except urllib.error.HTTPError as e:
+            e.read()
+            return e.code
+
+    PAGE = ("/", "/web/", "/web/app.js", "/web/manifest.webmanifest", "/fonts/outfit-latin-wght.woff2")
+
+    def test_on_by_default(self):
+        self.assertEqual([self.status("GET", p) for p in self.PAGE], [200] * len(self.PAGE))   # (/web/: its redirect)
+
+    def test_off_serves_only_the_api(self):
+        self.svc.web_ui, self.svc.api_key = False, "k"
+        self.assertEqual([self.status("GET", p) for p in self.PAGE], [404] * len(self.PAGE))
+        self.assertEqual([self.status("GET", p, "k") for p in self.PAGE], [404] * len(self.PAGE))
+        self.assertEqual(self.status("GET", "/health"), 200)                    # (health checks, as before)
+        self.assertEqual((self.status("GET", "/v1/models"), self.status("GET", "/v1/models", "k")), (401, 200))
+        # the page's own data routes: behind the API key, as with the page on
+        for method, path in (("GET", "/settings"), ("GET", "/metrics"), ("GET", "/mcp"), ("GET", "/status"),
+                             ("GET", "/api/context"), ("GET", "/api/models"), ("GET", "/api/savings"),
+                             ("GET", "/api/port"), ("GET", "/api/report"), ("GET", "/v1/strata/stream"),
+                             ("POST", "/settings"), ("POST", "/api/models/switch"), ("POST", "/api/update"),
+                             ("POST", "/attach")):
+            self.assertEqual(self.status(method, path), 401, path)
+
+    def test_the_setting(self):
+        from serve.server import web_ui_setting
+        self.assertTrue(web_ui_setting({}, env={}))
+        self.assertFalse(web_ui_setting({"web_ui": False}, env={}))
+        self.assertTrue(web_ui_setting({"web_ui": False}, env={"MAYA_WEB_UI": "1"}))   # (the environment wins)
+        self.assertFalse(web_ui_setting({}, env={"MAYA_WEB_UI": "off"}))
+
+
 class HeldEngine(MockEngine):
     """The first request holds the engine until `release` is set (heartbeats meanwhile); the others answer at once."""
     def __init__(self, *a, **k):

@@ -1290,7 +1290,7 @@ class Config(unittest.TestCase):
         # #1089: a setup again (an update's) turned "model_management": false back on and the port back to 8080 - every
         # server setting set by hand stays; a --port / --host / --api-key given now wins
         own = {"host": "0.0.0.0", "port": 9001, "api_key": "k", "cors_origins": ["*"], "mcp_servers": {"a": 1},
-               "model_management": False, "idle_unload_s": 900, "loop_guard": False,
+               "model_management": False, "web_ui": False, "idle_unload_s": 900, "loop_guard": False,
                "fit_max_tokens": True}
         self.assertEqual(set(own), set(maya.SERVER_KEYS))
         ports = []

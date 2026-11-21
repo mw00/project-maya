@@ -228,8 +228,21 @@ calling Maya's API unless Maya allows that page. List the pages in the config, `
 Exact addresses (scheme, host and port, no path); `["*"]` lets every page in - set an `api_key` with it, or any page
 you open could use your model. It opens `/v1/*` and nothing else: the settings and the tools stay for Maya's own page.
 Without it nothing changes. A new `--setup` keeps it, as it keeps the server's other settings in the config (`host`,
-`port`, `api_key`, `mcp_servers`, `model_management`, `idle_unload_s`, `loop_guard`, `fit_max_tokens`); a `--port`,
-`--host` or `--api-key` given to that setup wins.
+`port`, `api_key`, `mcp_servers`, `model_management`, `web_ui`, `idle_unload_s`, `loop_guard`, `fit_max_tokens`); a
+`--port`, `--host` or `--api-key` given to that setup wins.
+
+## The API only (no web page)
+
+Maya as a backend behind a proxy or another chat front end: in the config, `maya-<model>.json`,
+
+```json
+"web_ui": false,
+"api_key": "..."
+```
+
+(`MAYA_WEB_UI=0` in the environment does the same.) The page and its files (`/`, `/web/*`, `/fonts/*`) then answer
+404; `/v1/*`, `/v1/messages`, Maya's model API and `/health` answer as before, and no browser opens at the start. With an
+`api_key` every other route needs it too (the settings, the Monitor's `/metrics`, the Models page's `/api/*`).
 
 ## Giving the GPU back when idle
 

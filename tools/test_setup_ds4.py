@@ -396,7 +396,7 @@ class Config(unittest.TestCase):
     def test_again_keeps_the_servers_own_settings(self):
         # #1089: "model_management": false (and the port, the idle unload, ...) came back as the defaults after a setup
         own = {"host": "0.0.0.0", "port": 9001, "api_key": "k", "cors_origins": ["*"], "mcp_servers": {"a": 1},
-               "model_management": False, "idle_unload_s": 900, "loop_guard": False,
+               "model_management": False, "web_ui": False, "idle_unload_s": 900, "loop_guard": False,
                "fit_max_tokens": True}
         ports = []
         with patch.object(maya, "write_run_script", lambda p, port: ports.append(port) or self.root / "run.sh"):
