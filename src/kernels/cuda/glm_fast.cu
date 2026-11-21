@@ -3987,6 +3987,7 @@ struct RouteArgs {
                                 // (0: all); the top-1 always runs, the kept weights are renormalised when the model's are
     int norm_mode;              // glm-dsa B5.1: kRouteNormClamp (Maya, llama.cpp) or kRouteNormHf (glm-dsa, + 1e-20)
     unsigned long long rand_seed = 0;   // glm-dsa B15.7: MAYA_GLM_RANDOM_ROUTING's seed (0: the router's own ids)
+    float ahead_min_w = 0.0f;           // MAYA_GLM_AHEAD_MIN_W: a predicted expert below this share is not named
 };
 
 // kExt: the glm-dsa additions to the route - the HF weight normalisation (norm_mode, B5.1) and the bench mode's random
@@ -4084,6 +4085,7 @@ __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const STRATA_G
         const float* lg = a.ahead_logits + (size_t) w * E;
         const float* bs = a.ahead_bias[w];
         float v[16];
+        float ahp[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};   // the picks' own probabilities (lane 0)
 #pragma unroll
         for (int j = 0; j < 16; ++j) {
             const int e = lane + 32 * j;
@@ -4120,7 +4122,16 @@ __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const STRATA_G
                 const bool valid = bi >= 0 && bi < E && isfinite(bv);
                 s_ah[w][r] = (short) (valid ? bi : -1);
                 if (!valid) atomicMax(&bad, 3);
+                if (valid && r < 8) ahp[r] = 1.0f / (1.0f + expf(-lg[bi]));
             }
+        }
+        // MAYA_GLM_AHEAD_MIN_W, with the disk skip by weight: a pick whose predicted share is below the bar would be left
+        // out by its own route when it is not held, so it is not named for a read ahead (rank 0 always is)
+        if (lane == 0 && a.ahead_min_w > 0.0f) {
+            float sum = 0.0f;
+            for (int r = 0; r < a.k && r < 8; ++r) sum += ahp[r];
+            for (int r = 1; r < a.k && r < 8; ++r)
+                if (ahp[r] < a.ahead_min_w * sum) s_ah[w][r] = (short) -1;
         }
     }
     // the routed experts' VRAM and RAM-tier table entries, loaded at once (thread 0's plan below read them one after
@@ -4643,7 +4654,8 @@ __device__ unsigned int moe_stream_mask(const MoeDev& d) {
 // block's path is the same for all its threads: the __syncthreads below are reached by all or none.)
 __device__ void moe_stream_copy(const MoeDev& d, int i, const uint8_t* s, uint8_t* t) {
     const volatile MoeResponse* r = (const volatile MoeResponse*) d.resp;
-    const int rch = r->s_chunks;
+    const bool xl = r->s_chunks < 0;   // MAYA_GLM_XSTREAM: the experts file - 3 x chunks equal pieces of s_gu bytes
+    const int rch = xl ? -r->s_chunks : r->s_chunks;
     const unsigned long long gu = r->s_gu, dn = r->s_dn;
     const int nb = 3 * rch, G = (int) gridDim.x, b = (int) blockIdx.x;
     const bool split = G >= nb;
@@ -4651,9 +4663,10 @@ __device__ void moe_stream_copy(const MoeDev& d, int i, const uint8_t* s, uint8_
     if (nb <= 0 || sub >= nsub) return;
     for (int bit = split ? b % nb : b; bit < nb; bit += split ? nb : G) {
         const int part = bit / rch, c = bit % rch;
-        const unsigned long long len = part == 2 ? dn : gu;
-        const unsigned long long piece = ((len + (unsigned long long) rch - 1) / rch + 4095ull) & ~4095ull;
-        const unsigned long long c0 = min(len, (unsigned long long) c * piece), c1 = min(len, c0 + piece);
+        const unsigned long long len = xl ? gu : part == 2 ? dn : gu;
+        const unsigned long long piece = xl ? ((len + (unsigned long long) nb - 1) / nb + 4095ull) & ~4095ull
+                                            : ((len + (unsigned long long) rch - 1) / rch + 4095ull) & ~4095ull;
+        const unsigned long long c0 = min(len, (unsigned long long) (xl ? bit : c) * piece), c1 = min(len, c0 + piece);
         if (c1 <= c0) continue;
         const unsigned long long n = c1 - c0, per = ((n + nsub - 1) / nsub + 15ull) & ~15ull;
         const unsigned long long a0 = min(n, (unsigned long long) sub * per), a1 = min(n, a0 + per);
@@ -4669,7 +4682,7 @@ __device__ void moe_stream_copy(const MoeDev& d, int i, const uint8_t* s, uint8_
             __threadfence_system();
         }
         __syncthreads();
-        const unsigned long long off = (part == 0 ? 0ull : part == 1 ? gu : 2ull * gu) + c0 + a0;
+        const unsigned long long off = (xl || part == 0 ? 0ull : part == 1 ? gu : 2ull * gu) + c0 + a0;
         const uint8_t* sp = s + off;
         uint8_t* tp = t + off;
         const size_t nbytes = (size_t) (a1 - a0);
@@ -7026,6 +7039,11 @@ void moe_route(const float* logits, const float* bias, int n_expert, int k, floa
     }();
     a.res_w = resident_ok ? res_w : 0.0f;
     a.res_k = resident_ok ? res_k : 0;
+    static const float ahead_min_w = [] {   // MAYA_GLM_AHEAD_MIN_W (default 0: every pick, as before)
+        const char* v = getenv("MAYA_GLM_AHEAD_MIN_W");
+        return v ? std::max(0.0f, (float) std::atof(v)) : 0.0f;
+    }();
+    a.ahead_min_w = ahead_min_w;
     // MAYA_GLM_ROUTE_RANK=0: the selections by topk_warp's serial rounds again (A/B); topk_rank needs whole warps of
     // experts that one block's threads cover and at most 8 picks
     static const bool rank_on = [] {
