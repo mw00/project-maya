@@ -6753,8 +6753,12 @@ struct Model::Impl {
                        gp.s);
         });
         const int r0 = N * head_rows, nr = g.n_vocab - r0;
-        bool ok = mm(hg, out_draft_own, hrow, E, 1, hg.logits, (size_t) nr);
-        k::top1_part(hg.logits, nr, mtp_top, hg.s);
+        // (the head on member 0's GPU: that member's rows are in the same logits buffer, queued on the same stream from
+        //  its own thread in any order with these - the head's own rows go past them, at r0, so neither reads the
+        //  other's: the same draft every run)
+        float* own_lg = hg.logits + (head_member() ? (size_t) r0 : 0);
+        bool ok = mm(hg, out_draft_own, hrow, E, 1, own_lg, (size_t) nr);
+        k::top1_part(own_lg, nr, mtp_top, hg.s);
         float own[4] = {0, 0, 0, 0};
         CK(cudaMemcpyAsync(own, mtp_top, sizeof own, cudaMemcpyDeviceToHost, hg.s));
         CK(cudaStreamSynchronize(hg.s));
@@ -8435,6 +8439,7 @@ int Model::vocab() const { return m->g.n_vocab; }
 int Model::row_top(int r) const { return m->row_top(r); }
 int64_t Model::max_ctx() const { return m->o.max_ctx; }
 int Model::chunk() const { return m->Tc; }
+int Model::tensor_parallel() const { return std::max(1, m->tp); }
 bool Model::draft(int tok, int64_t pos, int n, float floor, std::vector<int>& d, std::vector<float>& c,
                   std::string& err, int base, float sure) {
     return m->df.on ? m->dfly_draft(tok, pos, n, floor, d, c, err) : m->draft(tok, pos, n, floor, d, c, err, base, sure);
