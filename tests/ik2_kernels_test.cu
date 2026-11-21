@@ -1133,6 +1133,51 @@ void test_attn_f16() {
     for (float* p : {dq, dr, ds, dp, scratch, out, one}) cudaFree(p);
 }
 
+// cand_topk: every one of the K largest values is among the gathered, each gathered value is its token's, and the
+// count says when the buffer was too small (a flat row)
+void test_cand_topk() {
+    const int n = 200058, K = 1000, cap = 4096;
+    int* dscr = dev_n<int>(k::cand_scratch(n));
+    int* dout = dev_n<int>(2 + 2 * cap);
+    for (int kind = 0; kind < 3; ++kind) {
+        std::vector<float> x(n);
+        std::normal_distribution<float> nd(0.0f, kind == 0 ? 3.0f : 0.5f);
+        for (auto& v : x) v = kind == 2 ? 1.25f : std::max(-29.9f, std::min(29.9f, nd(rng)));
+        if (kind == 1)   // (ties at the cut and above it)
+            for (int i = 0; i < n; i += 97) x[i] = 1.5f;
+        float* dx = dev(x);
+        k::cand_topk(dx, n, -30.0f, 30.0f, K, cap, dscr, dout, 0);
+        const auto out = host(dout, 2 + 2 * cap);
+        const int cnt = out[0];
+        if (kind == 2) {
+            expect_true("cand_topk: a flat row reports more values than the buffer holds", cnt == n);
+            cudaFree(dx);
+            continue;
+        }
+        bool ok = cnt >= K && cnt <= cap;
+        std::vector<char> got(n, 0);
+        for (int i = 0; i < std::min(cnt, cap) && ok; ++i) {
+            const int id = out[2 + i];
+            float v;
+            std::memcpy(&v, &out[2 + cap + i], 4);
+            ok = id >= 0 && id < n && !got[id] && v == x[id];
+            if (ok) got[id] = 1;
+        }
+        if (ok) {   // nothing left out is larger than the K-th largest value
+            std::vector<float> sorted = x;
+            std::nth_element(sorted.begin(), sorted.begin() + (K - 1), sorted.end(), std::greater<float>());
+            const float kth = sorted[K - 1];
+            for (int i = 0; i < n && ok; ++i) ok = got[i] || x[i] < kth;
+        }
+        char label[96];
+        std::snprintf(label, sizeof label, "cand_topk: the %d largest of %d are among its %d (%s)", K, n, cnt,
+                      kind ? "ties" : "spread");
+        expect_true(label, ok);
+        cudaFree(dx);
+    }
+    cudaFree(dscr), cudaFree(dout);
+}
+
 float e4m3fn_to_f32_host(uint8_t q);
 // attn_decode_mma_{f16,fp8} (one token's attention, a warp straight from the cache) against a double reference:
 // 1 to 8 heads a K / V head, linear and ring caches, a window, the bias within and past its extent, the sink, a
@@ -2310,6 +2355,7 @@ int main() {
     test_round6();
     test_attn_flash();   // (last: its random data leaves the others' as they were)
     test_attn_decode_mma();
+    test_cand_topk();
     std::printf(g_fail ? "FAILED: %d check(s)\n" : "all passed\n", g_fail);
     return g_fail ? 1 : 0;
 }

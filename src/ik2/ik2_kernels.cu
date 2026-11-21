@@ -1846,6 +1846,56 @@ __global__ void loop_gate_apply_kernel(LoopGateArgs a, int T, int C, int R, floa
     const size_t i = (size_t) t * C + c;
     a.y[j][i] = (1.0f - tanhf(f)) * a.x[j][i] + tanhf(gn) * a.m[j][i];
 }
+// ---- sampling: the largest logits found on the device - the host gets a thousand or two candidates and not the
+// vocabulary (copying 200,000 logits out and sorting them was 0.8 ms a token).  A histogram of the values a block,
+// the bin from which the bins hold K values at least, the values of those bins gathered.
+constexpr int kCandBins = 1024;
+__device__ __forceinline__ int cand_bin(float x, float lo, float inv_w) {
+    return min(kCandBins - 1, max(0, (int) ((x - lo) * inv_w)));
+}
+__global__ void cand_hist_kernel(const float* __restrict__ x, int n, float lo, float inv_w, int per,
+                                 int* __restrict__ part) {
+    __shared__ int h[kCandBins];
+    for (int j = threadIdx.x; j < kCandBins; j += blockDim.x) h[j] = 0;
+    __syncthreads();
+    const int i0 = blockIdx.x * per, i1 = min(n, i0 + per);
+    for (int i = i0 + threadIdx.x; i < i1; i += blockDim.x) atomicAdd(&h[cand_bin(x[i], lo, inv_w)], 1);
+    __syncthreads();
+    for (int j = threadIdx.x; j < kCandBins; j += blockDim.x) part[(size_t) blockIdx.x * kCandBins + j] = h[j];
+}
+// a thread a bin (kCandBins threads): head[1] = the bin from which the bins hold K values (0 if they all hold
+// fewer), head[0] = 0 (the gathered count starts there)
+__global__ void cand_threshold_kernel(const int* __restrict__ part, int n_part, int K, int* head) {
+    __shared__ int cnt[kCandBins];
+    __shared__ int wcnt[kCandBins / 32];
+    const int j = threadIdx.x, lane = j & 31, warp = j >> 5;
+    int c = 0;
+    for (int b = 0; b < n_part; ++b) c += part[(size_t) b * kCandBins + j];
+    cnt[j] = c;
+    int ws = c;
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) ws += __shfl_xor_sync(0xffffffffu, ws, o);
+    if (lane == 0) wcnt[warp] = ws;
+    __syncthreads();
+    int above = 0;   // the values of the bins over this one
+    for (int w = warp + 1; w < kCandBins / 32; ++w) above += wcnt[w];
+    for (int i = j + 1; i < (warp + 1) * 32; ++i) above += cnt[i];
+    if (above < K && above + c >= K) head[1] = j;
+    if (j == 0) {
+        head[0] = 0;
+        if (above + c < K) head[1] = 0;
+    }
+}
+__global__ void cand_gather_kernel(const float* __restrict__ x, int n, float lo, float inv_w, int cap, int* head,
+                                   int* idx, float* val) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const float v = x[i];
+    if (cand_bin(v, lo, inv_w) < head[1]) return;
+    const int at = atomicAdd(head, 1);
+    if (at < cap) idx[at] = i, val[at] = v;
+}
+
 // The gates of a chunk of tokens: their two products (g = D [rms(x); rms(m)], then F g and G g) are matrix products
 // taken outside, and these are what is left.  (1) g [T][R] = a1 / rms(x) + a2 / rms(m), a1 = x D_x^T and
 // a2 = m D_m^T; a block a token.
@@ -4209,6 +4259,19 @@ void loop_gate(const float* x, const float* m, const float* D, const float* F, c
                float eps, float* sc, float* y, cudaStream_t s) {
     const LoopGate g{x, m, D, F, G, y};
     loop_gates(&g, 1, T, C, R, eps, sc, s);
+}
+constexpr int kCandPer = 8192;   // values a block of the histogram
+size_t cand_scratch(int n) { return (size_t) ((n + kCandPer - 1) / kCandPer) * kCandBins; }
+void cand_topk(const float* x, int n, float lo, float hi, int K, int cap, int* scratch, int* out, cudaStream_t s) {
+    if (n <= 0) return;
+    const float inv_w = (float) kCandBins / (hi - lo);
+    const int n_part = (n + kCandPer - 1) / kCandPer;
+    cand_hist_kernel<<<(unsigned) n_part, kBlk, 0, s>>>(x, n, lo, inv_w, kCandPer, scratch);
+    check("cand_topk (histogram)");
+    cand_threshold_kernel<<<1, kCandBins, 0, s>>>(scratch, n_part, K, out);
+    check("cand_topk (threshold)");
+    cand_gather_kernel<<<grid((size_t) n), kBlk, 0, s>>>(x, n, lo, inv_w, cap, out, out + 2, (float*) (out + 2 + cap));
+    check("cand_topk (gather)");
 }
 void loop_gate_mix(const float* x, const float* m, const float* a1, const float* a2, int T, int C, int R, float eps,
                    float* g, cudaStream_t s) {

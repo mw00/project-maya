@@ -152,6 +152,13 @@ struct LoopGate {
 void loop_gates(const LoopGate* gates, int n, int T, int C, int R, float eps, float* sc, cudaStream_t s);
 void loop_gate(const float* x, const float* m, const float* D, const float* F, const float* G, int T, int C, int R,
                float eps, float* sc, float* y, cudaStream_t s);
+/// Sampling's candidates found on the device: of x [n] (its values within [lo, hi]: softcapped logits) every value
+/// of the highest bins that together hold K values at least (1024 bins over [lo, hi]) - K and a few more - gathered
+/// in no order, so that the host sorts a thousand or two values and not the vocabulary.  out [2 + 2 cap] ints:
+/// [0] their count (past cap: only cap of them are there), [1] the first bin taken, then idx [cap] and val [cap]
+/// (F32).  scratch: cand_scratch(n) ints.
+size_t cand_scratch(int n);
+void cand_topk(const float* x, int n, float lo, float hi, int K, int cap, int* scratch, int* out, cudaStream_t s);
 /// The same gate over a chunk of tokens with its products taken as matrix products by the caller (loop_gates'
 /// kernels are a token's): loop_gate_mix gives g [T][R] = a1 / rms(x) + a2 / rms(m) of a1 = x D_x^T, a2 = m D_m^T
 /// ([T][R]); loop_gate_blend y = (1 - tanh f) x + tanh(gn) m of f = g F, gn = g G ([T][C]; n = T C; y may be x).
