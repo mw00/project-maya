@@ -4816,6 +4816,25 @@ def set_arg(args: list, flag: str, value) -> None:
         args += [flag, str(value)]
 
 
+def set_vram_reserve(args: list, family: str, mib: int, backend: str | None = None) -> str | None:
+    """--vram-reserve-mib N (#1026) as the family's engine takes it, written into its arguments (`args` changed in
+    place): GLM-5.3-Flash's and Qwen's `maya` --vram-reserve-mib N (MiB), DeepSeek's maya-ds4 --reserve-mib N (MiB),
+    MiniMax's maya-mm3 --reserve-gb (GiB) and Hy4-Flash's maya-hy4 --reserve-gb (GB of 10^9 bytes).  The flag and
+    value written, for the setup's line; None where the engine has no such setting (Inkling, the Metal engine)."""
+    if family in ("glm", "qwen") and backend != "metal":
+        flag, value = "--vram-reserve-mib", str(mib)
+    elif family == "deepseek":
+        flag, value = "--reserve-mib", str(mib)
+    elif family == "minimax":
+        flag, value = "--reserve-gb", f"{mib / 1024:.3f}".rstrip("0").rstrip(".")
+    elif family == "hy4":
+        flag, value = "--reserve-gb", f"{mib * 1048576 / 1e9:.3f}".rstrip("0").rstrip(".")
+    else:
+        return None
+    set_arg(args, flag, value)
+    return f"{flag} {value}"
+
+
 def keep_args(old: list, new: list, flags: tuple) -> list:
     """The engine arguments `flags` as the old config had them (edited by hand, or written by an earlier setup):
     their values replace the new ones, or are added.  `new` is changed in place; what was kept is returned."""
@@ -8808,7 +8827,10 @@ def write_config_mm3(a, pc: dict, meta: dict, pack: Path, ctx: int, models: Path
         set_arg(args, "--vision", "off")
     elif mm3_pack_has_vision(pack):
         set_arg(args, "--vision", "on")
-    if hip and "--reserve-gb" not in args[:-1]:   # (as DeepSeek's on AMD: the desktop's allocations beside the engine)
+    if getattr(a, "vram_reserve_mib", None) is not None:   # (#1026) given now: written, and a later setup keeps it
+        put = set_vram_reserve(args, "minimax", a.vram_reserve_mib)
+        ok(f"VRAM kept free on each GPU: {a.vram_reserve_mib} MiB (--vram-reserve-mib: {put})")
+    elif hip and "--reserve-gb" not in args[:-1]:   # (as DeepSeek's on AMD: the desktop's allocations beside the engine)
         mib = hip_reserve_mib(pc["gpus"])
         set_arg(args, "--reserve-gb", f"{mib / 1024:.1f}")
         ok(f"VRAM kept free on each GPU: {mib / 1024:.1f} GB (the desktop and other programs on an AMD GPU allocate "
@@ -10178,6 +10200,9 @@ def write_config_hy4(a, pc: dict, meta: dict, pack: Path, ctx: int, models: Path
     kept = keep_args(old.get("args") or [], args, ("--tp", "--main-gpu", "--cpu-threads", "--profile", "--draft",
                                                    "--draft-floor") +
                      (("--chunk", "--reserve-gb", "--vram-experts") if standard else ()))
+    if getattr(a, "vram_reserve_mib", None) is not None:   # (#1026) given now: written, and a later setup keeps it
+        put = set_vram_reserve(args, "hy4", a.vram_reserve_mib)
+        ok(f"VRAM kept free on each GPU: {a.vram_reserve_mib} MiB (--vram-reserve-mib: {put})")
     inst = {"family": "hy4", "hy4_quant": quant, "quant": HY4_QUANTS.get(quant, HY4), "layout": fit["layout"],
             "drafting": "on" if drafting else "off"}
     if quant != HY4_Q4 and hy4_pack_mtp_file(pack):    # (a Maya size with the draft block: "off" is then a choice)
@@ -10801,6 +10826,9 @@ def write_config_qwen(a, pc: dict, meta: dict, pack: Path, gguf: Path, ctx: int,
         args.append("--vision")
     kept = keep_args(old.get("args") or [], args, ("--mtp-max-t", "--kv", "--vram-reserve-mib", "--pool-workers",
                                                    "--experts-from-gguf", "--ple-io"))
+    if getattr(a, "vram_reserve_mib", None) is not None:   # (#1026) given now: written, and a later setup keeps it
+        put = set_vram_reserve(args, "qwen", a.vram_reserve_mib)
+        ok(f"VRAM kept free beside the expert cache: {a.vram_reserve_mib} MiB ({put})")
     inst = {"family": "qwen", "quant": QWEN_UD_DIR if quant == QWEN_UD else QWEN, "qwen_quant": quant}
     sampling, effort = Q.model_defaults({"installer": inst})   # (the model's own, every setup: its card's)
     cfg = {"exe": str(EXE), "args": args, "cwd": str(ROOT), "tokenizer": str(pack / "tokenizer"),
@@ -11406,7 +11434,8 @@ def main() -> int:
                          "stopping before the download)")
     ap.add_argument("--vram-reserve-mib", type=int, metavar="N",
                     help="VRAM in MiB the expert pool leaves free on each GPU for the driver, the desktop and other "
-                         "programs (default 700), kept in the config")
+                         "programs (default 700; DeepSeek 600, MiniMax 1024, Hy4-Flash 715), kept in the config - given on a start "
+                         "too, it is written into the config that starts")
     ap.add_argument("--mmap-experts", choices=["auto", "on", "off"],
                     help="DeepSeek: the experts VRAM does not hold - read in place from the files (auto, the default), "
                          "or off: copied into RAM (with DS4_REQUIRE_ALL_RAM=1 all of them); kept in the config")
@@ -11545,6 +11574,16 @@ def main() -> int:
                 set_arg(cfg.setdefault("args", []), "--mmap-experts", a.mmap_experts)
                 pick.write_text(json.dumps(cfg, indent=1), encoding="utf-8")
                 ok(f"{pick.name}: --mmap-experts {a.mmap_experts}")
+        if a.vram_reserve_mib is not None:   # (#1026: given on a start too - written into the config, which keeps it)
+            cfg = read_json(pick)
+            put = set_vram_reserve(cfg.setdefault("args", []), config_family(cfg), a.vram_reserve_mib,
+                                   cfg.get("backend"))
+            if put is None:
+                warn("--vram-reserve-mib: this model's engine has no VRAM reserve setting - the start keeps the config "
+                     "as it is")
+            else:
+                pick.write_text(json.dumps(cfg, indent=1), encoding="utf-8")
+                ok(f"{pick.name}: VRAM kept free on each GPU {a.vram_reserve_mib} MiB ({put})")
         if (a.calibrate or a.speed_calibration) and read_json(pick).get("backend") == "metal":
             ok("the Metal engine has no CPU lane to tune and no drafter to measure: nothing to tune")
             a.calibrate = a.speed_calibration = False
