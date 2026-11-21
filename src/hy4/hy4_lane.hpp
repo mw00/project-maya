@@ -59,6 +59,35 @@ LaneWaits lane_waits(bool windows, const std::function<const char*(const char*)>
 /// This system, the process's environment
 LaneWaits lane_waits();
 
+/// The lane's core reserve: a few workers sit the jobs out (asleep, their cores left free) while other programs keep
+/// the PC busy - a worker the system takes off its core mid-item holds up the whole job - and every worker works on
+/// an idle PC.  The other programs' CPU use is measured when the lane's jobs start again after a pause and every
+/// quarter second while they run (the PC's busy time less this process's own), with a gap between the levels that
+/// switch it on and off.  The work's items are the same either way: the answers do not change.
+/// A lane of the default size on 12 cores or more: min(4, cores / 8) cores, measured.  HY4_LANE_RESERVE=0: never
+/// (every worker always), =1: always; HY4_LANE_RESERVE_CORES=N: the reserve's size (any lane);
+/// HY4_LANE_RESERVE_LOG=1: each switch printed with the load measured (=2: every sample).
+struct LaneReserve {
+    enum Mode { kNever = 0, kAlways = 1, kMeasured = 2 };
+    int mode = kNever;
+    int cores = 0;   // workers parked while it is on
+    int log = 0;     // 1: each switch printed (stderr), 2: each sample
+};
+/// lane_cores: the lane's workers and its caller; auto_size: the lane of the default size; env: getenv (the tests)
+LaneReserve lane_reserve(int lane_cores, bool auto_size, const std::function<const char*(const char*)>& env);
+/// The switch: on after half a second in a row of other programs on a CPU or more (a desktop's short bursts - a
+/// fan service, a browser tab - leave it off), off after a second in a row below half a CPU
+struct LoadWatch {
+    static constexpr double kOn = 1.0, kOff = 0.5, kBusyUs = 5e5, kQuietUs = 1e6;
+    bool on = false;
+    double busy_us = 0.0, quiet_us = 0.0;
+    /// others: the other programs' CPUs (busy time / wall time) over a window of window_us
+    bool update(double others, double window_us);
+};
+/// The CPU time all programs and this process have used so far (microseconds, summed over the CPUs); false: not
+/// known on this system
+bool cpu_times(double& all_us, double& self_us);
+
 /// A layer's routed experts in host memory: each role's tensor (the GGUF's stacked [n_exp][rows][row bytes]) and the
 /// layer's format (ds4's IqCpu: the types, the row bytes, the activations' types).
 /// The experts of a layer kept re-coded at 4 bits a weight in RAM (ds4's iq_cpu_q4x_*: the same bits as the file's

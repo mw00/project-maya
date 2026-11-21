@@ -16,10 +16,12 @@
 #include <windows.h>
 #endif
 #if defined(__linux__)
+#include <fcntl.h>
 #include <pthread.h>
 #include <sched.h>
 #include <sys/mman.h>
 #include <sys/syscall.h>
+#include <time.h>
 #include <unistd.h>
 #endif
 #include <chrono>
@@ -140,22 +142,75 @@ struct Lane::Impl {
     std::mutex mu;
     std::condition_variable cv;
     const std::function<void(int)>* f = nullptr;
+    int direct_n = 0;                    // >0: single-node fast path (indices 0..direct_n-1, no items[] copy)
     std::vector<int> items[kMaxNodes];   // the job's items, by node
-    std::atomic<int> next[kMaxNodes];
-    std::atomic<int> busy{0};
-    std::atomic<uint64_t> gen{0};
-    std::atomic<int> sleepers{0};
+    alignas(64) std::atomic<int> next[kMaxNodes];
+    alignas(64) std::atomic<int> done{0};
+    alignas(64) std::atomic<int> active{0};
+    alignas(64) std::atomic<bool> open{false};
+    alignas(64) std::atomic<uint64_t> gen{0};
+    alignas(64) std::atomic<int> sleepers{0};
     std::atomic<bool> quit{false};
+    // the core reserve (hy4_lane.hpp LaneReserve): the workers from `limit` on are parked - asleep on park_cv, out of
+    // the jobs - while other programs run.  Which workers take part never changes an item's work, only who does it
+    alignas(64) std::atomic<int> limit{0};
+    std::condition_variable park_cv;
+    std::atomic<int> parked{0};
+    int reserve = 0, reserve_mode = LaneReserve::kNever;
+    int reserve_log = 0;   // (1: each switch printed, 2: each sample)
+    LoadWatch watch;   // (the caller's, like the samples)
+    double s_all = 0.0, s_self = 0.0;
+    std::chrono::steady_clock::time_point s_at{};
+    static constexpr int64_t kSampleUs = 250000;   // the samples' least spacing
+
+    void set_limit(int v) {
+        std::lock_guard<std::mutex> lk(mu);   // (a parked worker checks it under the lock: no lost wake-up)
+        limit.store(v);
+        park_cv.notify_all();
+    }
+    // at a job's start (the caller): a sample once kSampleUs have passed since the last one - at the first job after
+    // a pause, and every kSampleUs while the jobs come (the system's counters move in 10 ms steps: no shorter
+    // window); the reserve switched by what the other programs used in the window
+    void watch_load(std::chrono::steady_clock::time_point t) {
+        const double w = std::chrono::duration<double, std::micro>(t - s_at).count();
+        if (w < (double) kSampleUs) return;
+        double a = 0.0, s = 0.0;
+        if (!cpu_times(a, s)) return;
+        const double others = std::max(0.0, (a - s_all) - (s - s_self)) / w;
+        const bool was = watch.on;
+        const bool flip = watch.update(others, w) != was;
+        if (flip) set_limit((int) th.size() - (watch.on ? reserve : 0));
+        if (reserve_log >= 2 || (flip && reserve_log))
+            std::fprintf(stderr, "hy4 lane: other programs %.2f CPUs over %.0f ms - %d of %d workers, %s\n", others,
+                         w / 1e3, (int) th.size() - (watch.on ? reserve : 0), (int) th.size(),
+                         watch.on ? "busy" : "idle");
+        s_all = a;
+        s_self = s;
+        s_at = t;
+    }
 
     void work(int node) {
-        for (int k = 0; k < n_nodes; ++k) {
-            const int q = (node + k) % n_nodes;
-            const std::vector<int>& v = items[q];
-            const int nn = (int) v.size();
-            for (int i; (i = next[q].fetch_add(1, std::memory_order_relaxed)) < nn;) (*f)(v[(size_t) i]);
+        int local_done = 0;
+        if (direct_n > 0) {
+            const int nn = direct_n;
+            for (int i; (i = next[0].fetch_add(1, std::memory_order_relaxed)) < nn;) {
+                (*f)(i);
+                ++local_done;
+            }
+        } else {
+            for (int k = 0; k < n_nodes; ++k) {
+                const int q = (node + k) % n_nodes;
+                const std::vector<int>& v = items[q];
+                const int nn = (int) v.size();
+                for (int i; (i = next[q].fetch_add(1, std::memory_order_relaxed)) < nn;) {
+                    (*f)(v[(size_t) i]);
+                    ++local_done;
+                }
+            }
         }
+        if (local_done > 0) done.fetch_add(local_done, std::memory_order_release);
     }
-    void loop(int core, int node) {
+    void loop(int idx, int core, int node) {
         if (core >= 0) strata::kernels::cpu::pin_current_thread(core);
 #if defined(__linux__)
         else {   // (a worker beyond the cores: the process's CPUs, not the mask of the thread that started it)
@@ -165,11 +220,19 @@ struct Lane::Impl {
 #endif
         uint64_t seen = 0;
         for (;;) {
+            if (idx >= limit.load(std::memory_order_relaxed)) {   // (in the reserve: parked until it is off)
+                std::unique_lock<std::mutex> lk(mu);
+                parked.fetch_add(1);
+                park_cv.wait(lk, [&] { return idx < limit.load() || quit.load(); });
+                parked.fetch_sub(1);
+                if (quit.load()) return;
+            }
             auto t0 = std::chrono::steady_clock::now();
             uint64_t g;
             for (int k = 0;; ++k) {   // (spin, then sleep)
                 g = gen.load(std::memory_order_acquire);
                 if (g != seen || quit.load(std::memory_order_relaxed)) break;
+                if (idx >= limit.load(std::memory_order_relaxed)) break;
                 cpu_relax();
                 if ((k & 1023) == 1023 && std::chrono::steady_clock::now() - t0 >
                                               std::chrono::microseconds(spin_us.load(std::memory_order_relaxed))) {
@@ -181,9 +244,11 @@ struct Lane::Impl {
                 }
             }
             if (quit.load()) return;
+            if (idx >= limit.load(std::memory_order_relaxed)) continue;   // (the job, if one came, is the others')
             seen = g;
-            work(node);
-            busy.fetch_sub(1, std::memory_order_acq_rel);
+            active.fetch_add(1, std::memory_order_seq_cst);
+            if (open.load(std::memory_order_seq_cst)) work(node);
+            active.fetch_sub(1, std::memory_order_release);
         }
     }
 };
@@ -214,6 +279,70 @@ LaneWaits lane_waits() {
     return lane_waits(windows, [](const char* k) -> const char* { return std::getenv(k); });
 }
 
+LaneReserve lane_reserve(int lane_cores, bool auto_size, const std::function<const char*(const char*)>& env) {
+    LaneReserve r;
+    r.cores = lane_cores >= 12 ? std::min(4, lane_cores / 8) : 0;
+    r.mode = auto_size ? LaneReserve::kMeasured : LaneReserve::kNever;   // (a lane of a size asked for: that size)
+    if (const char* e = env("HY4_LANE_RESERVE"); e && *e) {
+        if (!std::strcmp(e, "0")) r.mode = LaneReserve::kNever;
+        else if (!std::strcmp(e, "1")) r.mode = LaneReserve::kAlways;
+        else if (!std::strcmp(e, "auto")) r.mode = LaneReserve::kMeasured;
+    }
+    if (const char* e = env("HY4_LANE_RESERVE_CORES"); e && *e) r.cores = std::max(0, std::atoi(e));
+    if (const char* e = env("HY4_LANE_RESERVE_LOG")) r.log = std::max(0, std::atoi(e));
+    return r;
+}
+
+bool LoadWatch::update(double others, double window_us) {
+    if (others >= kOn) {
+        busy_us += window_us;
+        quiet_us = 0.0;
+        if (busy_us >= kBusyUs) on = true;
+    } else if (others < kOff) {
+        quiet_us += window_us;
+        busy_us = 0.0;
+        if (quiet_us >= kQuietUs) on = false;
+    } else {
+        busy_us = quiet_us = 0.0;   // (between the levels: as it is)
+    }
+    return on;
+}
+
+bool cpu_times(double& all_us, double& self_us) {
+#if defined(__linux__)
+    // /proc/stat's first line: every CPU's user, nice and system time (interrupts left out: a device's - this
+    // process's GPU and disk's - are no other program's work)
+    static const double tick_us = 1e6 / (double) std::max(1L, sysconf(_SC_CLK_TCK));
+    char b[256];
+    const int fd = ::open("/proc/stat", O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return false;
+    const ssize_t r = ::read(fd, b, sizeof b - 1);
+    ::close(fd);
+    if (r <= 0) return false;
+    b[r] = 0;
+    unsigned long long u = 0, ni = 0, sy = 0;
+    if (std::sscanf(b, "cpu %llu %llu %llu", &u, &ni, &sy) != 3) return false;
+    timespec ts{};
+    if (clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &ts) != 0) return false;
+    all_us = (double) (u + ni + sy) * tick_us;
+    self_us = (double) ts.tv_sec * 1e6 + (double) ts.tv_nsec / 1e3;
+    return true;
+#elif defined(_WIN32)
+    FILETIME idle, kern, user, c0, c1, pk, pu;
+    if (!GetSystemTimes(&idle, &kern, &user) || !GetProcessTimes(GetCurrentProcess(), &c0, &c1, &pk, &pu)) return false;
+    const auto us = [](const FILETIME& f) {   // (100 ns units)
+        return (double) (((uint64_t) f.dwHighDateTime << 32) | f.dwLowDateTime) / 10.0;
+    };
+    all_us = us(kern) - us(idle) + us(user);   // (the system's kernel time holds its idle time)
+    self_us = us(pk) + us(pu);
+    return true;
+#else
+    (void) all_us;
+    (void) self_us;
+    return false;
+#endif
+}
+
 Lane::Lane(int threads) : p(new Impl) {
     const std::vector<std::vector<int>> nodes = node_cores();
     p->n_nodes = std::max(1, std::min((int) nodes.size(), Impl::kMaxNodes));
@@ -229,7 +358,19 @@ Lane::Lane(int threads) : p(new Impl) {
     for (size_t i = 0; i < most; ++i)
         for (int q = 0; q < p->n_nodes; ++q)
             if (i < nodes[(size_t) q].size() && !(q == 0 && i == 0)) order.push_back({nodes[(size_t) q][i], q});
+    const bool auto_size = threads < 0;
     if (threads < 0) threads = (int) order.size();
+    // the core reserve: the last workers (the nodes' last cores) parked while other programs run - always, never or
+    // by the load measured from here on (the first sample now)
+    const LaneReserve lr = lane_reserve(threads + 1, auto_size, [](const char* k) -> const char* { return std::getenv(k); });
+    p->reserve = std::min(std::max(0, lr.cores), threads);
+    p->reserve_mode = p->reserve > 0 ? lr.mode : (int) LaneReserve::kNever;
+    p->reserve_log = lr.log;
+    if (p->reserve_mode == LaneReserve::kMeasured) {
+        p->s_at = std::chrono::steady_clock::now();
+        if (!cpu_times(p->s_all, p->s_self)) p->reserve_mode = LaneReserve::kNever;   // (not known here: idle)
+    }
+    p->limit.store(threads - (p->reserve_mode == LaneReserve::kAlways ? p->reserve : 0));
     // the caller's core: node 0's first, the one no worker takes (not pinned: the caller left where the system runs
     // it - beside a worker, on its core's second thread, when it comes back from a wait)
     if (threads > 0 && !nodes[0].empty() && lw.pin_caller) p->caller_core = nodes[0][0];
@@ -237,7 +378,7 @@ Lane::Lane(int threads) : p(new Impl) {
         const int core = i < (int) order.size() ? order[(size_t) i].first : -1;
         const int node = i < (int) order.size() ? order[(size_t) i].second : 0;
         p->wnode.push_back(node);
-        p->th.emplace_back([this, core, node] { p->loop(core, node); });
+        p->th.emplace_back([this, i, core, node] { p->loop(i, core, node); });
     }
 }
 Lane::~Lane() {
@@ -246,10 +387,13 @@ Lane::~Lane() {
         p->quit.store(true);
     }
     p->cv.notify_all();
+    p->park_cv.notify_all();
     for (auto& t : p->th) t.join();
 }
 int Lane::threads() const { return (int) p->th.size(); }
-bool Lane::idle() const { return !p->th.empty() && p->sleepers.load() == (int) p->th.size(); }
+bool Lane::idle() const {
+    return !p->th.empty() && p->sleepers.load() + p->parked.load() == (int) p->th.size();
+}
 int Lane::nodes() const { return p->n_nodes; }
 
 int Lane::node_of_page(const void* ptr) {
@@ -286,13 +430,20 @@ void Lane::parallel_for(int n, const std::function<void(int)>& f, const std::vec
         for (int i = 0; i < n; ++i) f(i);
         return;
     }
-    for (int q = 0; q < p->n_nodes; ++q) {
-        p->items[q].clear();
-        p->next[q].store(0, std::memory_order_relaxed);
-    }
-    for (int i = 0; i < n; ++i) {
-        const int q = node_of && (*node_of)[(size_t) i] >= 0 ? (*node_of)[(size_t) i] % p->n_nodes : i % p->n_nodes;
-        p->items[q].push_back(i);
+    if (p->reserve_mode == LaneReserve::kMeasured) p->watch_load(std::chrono::steady_clock::now());
+    if (p->n_nodes == 1 && !node_of) {
+        p->direct_n = n;
+        p->next[0].store(0, std::memory_order_relaxed);
+    } else {
+        p->direct_n = 0;
+        for (int q = 0; q < p->n_nodes; ++q) {
+            p->items[q].clear();
+            p->next[q].store(0, std::memory_order_relaxed);
+        }
+        for (int i = 0; i < n; ++i) {
+            const int q = node_of && (*node_of)[(size_t) i] >= 0 ? (*node_of)[(size_t) i] % p->n_nodes : i % p->n_nodes;
+            p->items[q].push_back(i);
+        }
     }
     if (p->caller_core >= 0) {   // (the thread that brings the jobs: pinned once)
         thread_local const Impl* pinned_for = nullptr;
@@ -311,14 +462,17 @@ void Lane::parallel_for(int n, const std::function<void(int)>& f, const std::vec
         }
     }
     p->f = &f;
-    p->busy.store((int) p->th.size(), std::memory_order_relaxed);
-    {
+    p->done.store(0, std::memory_order_relaxed);
+    p->open.store(true, std::memory_order_release);
+    p->gen.fetch_add(1, std::memory_order_seq_cst);
+    if (p->sleepers.load(std::memory_order_seq_cst) > 0) {
         std::lock_guard<std::mutex> lk(p->mu);   // (a sleeper checks gen under the lock: no lost wake-up)
-        p->gen.fetch_add(1, std::memory_order_release);
+        p->cv.notify_all();
     }
-    if (p->sleepers.load() > 0) p->cv.notify_all();
     p->work(p->caller_node);
-    while (p->busy.load(std::memory_order_acquire) > 0) cpu_relax();
+    while (p->done.load(std::memory_order_acquire) < n) cpu_relax();
+    p->open.store(false, std::memory_order_seq_cst);
+    while (p->active.load(std::memory_order_seq_cst) > 0) cpu_relax();
     p->f = nullptr;
     if (!p->spin_fixed) p->last_end = std::chrono::steady_clock::now();
 }

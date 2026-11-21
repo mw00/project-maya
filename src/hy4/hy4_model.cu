@@ -6028,15 +6028,25 @@ struct Model::Impl {
                 CK(cudaSetDevice(gp.dev));
                 for (size_t b0 = 0; b0 < mine.size(); b0 += kStage) {
                     const size_t nb = std::min<size_t>(kStage, mine.size() - b0);
+                    auto gather = [&](int it) {
+                        const size_t i = (size_t) (it / 3);
+                        const int role = it % 3;
+                        const Sw& s = *mine[b0 + i];
+                        const Layer& l = L[(size_t) s.il];
+                        uint8_t* dst = h_stage + i * stage_blob + l.tr[role];
+                        const size_t e = (size_t) s.in;
+                        const uint8_t* src = role == 0 ? l.cex.G(e) : role == 1 ? l.cex.U(e) : l.cex.D(e);
+                        std::memcpy(dst, src, role == 2 ? l.cex.d_stride : l.cex.g_stride);
+                    };
+                    if (lane && nb >= 2) lane->parallel_for((int) (nb * 3), gather);
+                    else
+                        for (int it = 0; it < (int) (nb * 3); ++it) gather(it);
                     std::vector<int> touched;
-                    for (size_t i = 0; i < nb; ++i) {   // (each blob's copy runs while the next one is gathered)
+                    for (size_t i = 0; i < nb; ++i) {
                         const Sw& s = *mine[b0 + i];
                         Layer& l = L[(size_t) s.il];
                         uint8_t* b = h_stage + i * stage_blob;
                         const size_t e = (size_t) s.in;
-                        std::memcpy(b + l.tr[0], l.cex.G(e), l.cex.g_stride);
-                        std::memcpy(b + l.tr[1], l.cex.U(e), l.cex.g_stride);
-                        std::memcpy(b + l.tr[2], l.cex.D(e), l.cex.d_stride);
                         const int slot = l.slot_of[(size_t) s.out];
                         l.slot_of[(size_t) s.out] = -1;
                         l.slot_of[e] = slot;
