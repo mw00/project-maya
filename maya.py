@@ -5313,6 +5313,19 @@ def route_state(log_text: str) -> str | None:
     return "measuring" if "prompt route: measured on this PC" in log_text else None
 
 
+def hy4_first_start_said(cfg: dict) -> list:
+    """The start's lines on what Hy4-Flash's first start on a PC measures once before it is ready, and roughly how
+    long it takes (times as the engine's first starts took them: a GPU holding the whole model, GPUs with the CPU
+    lane; the server then says the time left at this PC's own pace)."""
+    if hy4_engine_drafting(cfg):
+        return ["The first start on this PC measures it once before it is ready: which drafting answers fastest here",
+                "(each choice loaded and timed on a few short answers - roughly one to two minutes), and where part of",
+                "the model runs on the CPU, its CPU lane and prompt route (about one minute more).  Later starts skip",
+                "that and are ready in well under a minute."]
+    return ["The first start on this PC measures it once before it is ready (where part of the model runs on the CPU:",
+            "its CPU lane and prompt route - about one minute more); later starts skip that."]
+
+
 def hy4_engine_drafting(cfg: dict) -> bool:
     """A Hy4-Flash config whose engine picks its drafting itself (--drafting auto / on): no drafting, the MTP block or
     the DFly2 drafter, whichever decodes fastest here - each loaded once with its own VRAM plan at the first start on
@@ -6333,9 +6346,9 @@ def server_command(cfg_path: Path, a) -> tuple:
     elif config_family(cfg) == "hy4":
         say("  Loading takes a minute or a few: the engine places what must sit in VRAM and as many of the most-routed")
         say("  experts as fit beside it; the others are computed on the CPU from the model file (RAM as the page cache),")
-        say("  the n-gram table is read from the SSD - the first answers are the slowest.  The first start on a PC also")
-        say("  measures it once before it is ready (its CPU lane and prompt route: one to two minutes more); later")
-        say("  starts skip that.")
+        say("  the n-gram table is read from the SSD - the first answers are the slowest.")
+        for line in hy4_first_start_said(cfg):
+            say("  " + line)
     elif config_family(cfg) == "qwen":
         say("  Loading takes a few minutes: the engine places the most-used experts in VRAM, the next ones in RAM as far")
         say("  as the free RAM goes (MAYA_EXPERT_RAM_GB caps it) and reads the rest from the SSD when they are routed.")

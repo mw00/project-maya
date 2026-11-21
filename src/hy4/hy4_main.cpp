@@ -1408,8 +1408,8 @@ bool trial_text(const hy4::Options& o, TrialText& tx) {
                 std::vector<int> p = parse_ids(line);
                 if (p.size() >= 8) tx.prompts.push_back(std::move(p));
             }
-        if (!tx.prompts.empty()) {
-            tx.gen = std::max(8, envi("HY4_DRAFT_TOKENS", 384) / (int) tx.prompts.size());
+        if (!tx.prompts.empty()) {   // (192 tokens in all, as the text's: the same choice as 384 on every PC tried)
+            tx.gen = std::max(8, envi("HY4_DRAFT_TOKENS", 192) / (int) tx.prompts.size());
             for (const auto& p : tx.prompts)
                 if (o.max_ctx < (int64_t) p.size() + tx.gen + 64) tx.prompts.clear();
             if (!tx.prompts.empty()) return true;
@@ -1428,7 +1428,13 @@ bool trial_text(const hy4::Options& o, TrialText& tx) {
 // --draft-trial none|mtp|dfly2[:full|:short] (pick_drafting's child): that choice loaded as a start with it plans,
 // the text answered (full: read once untimed first - the first child; short: a 16-token warm-up), and one line
 // "TRIAL <tok/s> <tokens> <experts in VRAM> <experts> <chunk> <load s>" on stdout - 0 tok/s: it does not load beside
-// this start (its room would change it)
+// this start (its room would change it).  A loaded child ends at once once it has said it (trial_exit): the system
+// frees its memory as with any process; nothing of it is written anywhere
+[[noreturn]] void trial_exit() {
+    std::fflush(stdout);
+    std::fflush(stderr);
+    std::_Exit(0);
+}
 int run_draft_trial(hy4::Options o, const std::string& spec, const DraftArgs& a) {
     static const char* said[3] = {"no drafting", "the MTP block", "the DFly2 drafter"};
     const std::string what = spec.substr(0, spec.find(':'));
@@ -1455,7 +1461,7 @@ int run_draft_trial(hy4::Options o, const std::string& spec, const DraftArgs& a)
             if (l.find("is not loaded") != std::string::npos)
                 std::fprintf(stderr, "maya-hy4: drafting trial: %s\n", l.c_str() + 5);
         std::printf("TRIAL 0\n");
-        return 0;
+        trial_exit();
     }
     const double ls = now() - tl;
     std::vector<float> lg((size_t) hy4::k::kMaxWin * t.vocab());
@@ -1476,15 +1482,14 @@ int run_draft_trial(hy4::Options o, const std::string& spec, const DraftArgs& a)
     if (!ok) {
         std::fprintf(stderr, "maya-hy4: drafting trial: %s - %s\n", said[c], err.c_str());
         std::printf("TRIAL 0\n");
-        return 0;
+        trial_exit();
     }
     const double tps = secs > 0 ? n / secs : 0.0;
     const auto& st = t.stats();
     std::fprintf(stderr, "maya-hy4: drafting trial: %s %.2f tokens/s (%d tokens; load %.0f s; %d of %d routed experts in "
                  "VRAM, prompt chunk %d)\n", said[c], tps, n, ls, st.experts_vram, st.experts_all, t.chunk());
     std::printf("TRIAL %.3f %d %d %d %d %.1f\n", tps, n, st.experts_vram, st.experts_all, t.chunk(), ls);
-    std::fflush(stdout);
-    return 0;
+    trial_exit();
 }
 
 // this program's own path (its trials run it again)
@@ -1593,19 +1598,39 @@ bool pick_drafting(hy4::Options& o, const std::string& how, const std::string& a
     const std::string self = self_exe(argv0);
     double tps[3] = {-1, -1, -1};
     bool first = true;
+    int done = 0, timed = 0;
+    double timed_s = 0.0;   // (the timed choices' seconds: this PC's own pace for the "about ... more" line)
     for (int c : {1, 2, 0}) {   // (the drafters first: one its room leaves out stops after the plan)
         if (!cand[c]) continue;
         tps[c] = 0.0;
         if (c == 0 && tps[1] <= 0.0 && tps[2] <= 0.0) break;   // (no drafter loads here: nothing to time it against)
+        if (done > 0 && timed > 0) {   // (what is left, at the pace of the choices timed so far here)
+            std::fprintf(stderr, "maya-hy4: measuring this PC: %d of %d choices done in %.0f s - about %.0f s more\n",
+                         done, n_cand, now() - t0, timed_s / timed * (n_cand - done));
+            std::fflush(stderr);
+        }
+        const double tc = now();
+        const bool full = first;
         std::string cmd = quote(self);
         for (const std::string& x : child_args) cmd += " " + quote(x);
-        cmd += std::string(" --draft-trial ") + id[c] + (first ? ":full" : ":short");
+        cmd += std::string(" --draft-trial ") + id[c] + (full ? ":full" : ":short");
         if (FILE* p = open_pipe(cmd)) {   // (its stderr is this one's: its lines in the start's log)
             char line[512];
+            int toks = 0;
             while (std::fgets(line, sizeof line, p))
-                if (std::strncmp(line, "TRIAL ", 6) == 0) tps[c] = std::max(0.0, std::atof(line + 6));
+                if (std::strncmp(line, "TRIAL ", 6) == 0) {
+                    double v = 0.0;
+                    if (std::sscanf(line + 6, "%lf %d", &v, &toks) < 1) v = 0.0;
+                    tps[c] = std::max(0.0, v);
+                }
             close_pipe(p);
-            if (tps[c] > 0.0) first = false;   // (the text read once: by the first trial that timed)
+            if (tps[c] > 0.0) {   // (the text read once: by the first trial that timed)
+                first = false;
+                ++timed;
+                // (the first one read the text once more, untimed: a later one is about that much shorter)
+                timed_s += std::max(1.0, now() - tc - (full && toks > 0 ? toks / tps[c] : 0.0));
+            }
+            ++done;
         } else {
             std::fprintf(stderr, "maya-hy4: drafting trial: %s - this program could not be started again (%s)\n",
                          said[c], self.c_str());

@@ -2759,6 +2759,29 @@ class Q4xCheck(unittest.TestCase):
                 c["args"] = [x for x in c["args"] if x not in ("--drafting", "auto")]
                 self.assertNotIn("HY4_DRAFT_IDS", SV.child_env(c))
 
+    def test_the_first_start_says_it_measures_this_pc_once_and_roughly_how_long(self):
+        import serve.server as SV
+        trial = ("maya-hy4: measuring this PC once, before the first answer: drafting (no drafting, the MTP block, the "
+                 "DFly2 drafter: a load and 3 short answers each) - on 56132 tokens of text; remembered, the next "
+                 "starts skip it")
+        self.assertIn("which drafting answers fastest - 3 choices", SV.hy4_measure_said(trial))
+        self.assertIn(SV.HY4_TRIAL_TIME[3], SV.hy4_measure_said(trial))
+        two = trial.replace("no drafting, the MTP block, the DFly2 drafter", "no drafting, the MTP block")
+        self.assertIn(SV.HY4_TRIAL_TIME[2], SV.hy4_measure_said(two))
+        lane = ("maya-hy4: measuring this PC once, before the first answer: the CPU lane's 4-bit expert copies (a "
+                "decode of up to 728 tokens), then the prompt route (up to 10 chunks of 4096 tokens) - on 56132 tokens")
+        self.assertIn("4-bit copies and the prompt route, roughly " + SV.HY4_LANE_TIME, SV.hy4_measure_said(lane))
+        m = SV.HY4_MEASURE_LEFT.search("maya-hy4: measuring this PC: 2 of 3 choices done in 74 s - about 37 s more")
+        self.assertEqual(m.groups(), ("2", "3", "37"))
+        import setup_bridge as SB                      # (the setup's screen says the same)
+        self.assertEqual((SB.HY4_TRIAL_TIME, SB.HY4_LANE_TIME), (SV.HY4_TRIAL_TIME, SV.HY4_LANE_TIME))
+        cfg = {"family": "hy4", "args": ["--pack", "p", "--drafting", "auto"]}
+        with patch.object(maya, "config_family", return_value="hy4"):
+            said = " ".join(maya.hy4_first_start_said(cfg))
+            self.assertIn("measures it once before it is ready: which drafting answers fastest", said)
+            self.assertIn("roughly one to two minutes", said)
+            self.assertNotIn("drafting", " ".join(maya.hy4_first_start_said(dict(cfg, args=["--mtp"]))))
+
     def test_the_hot_experts_file_is_kept_until_a_calibration(self):
         """maya-hy4's HY4_HOT (on by default) places a start's experts in VRAM by scores the first start learns and
         the starts after only read: a file a model in the data folder (not in the model's download), named by the

@@ -988,6 +988,25 @@ def deepseek_restore_points(ids, user_id, system_id=None, tail=512, least=RESTOR
     return out
 
 
+HY4_MEASURE_LEFT = re.compile(r"measuring this PC: (\d+) of (\d+) choices done in \d+ s - about (\d+) s more")
+# (roughly how long maya-hy4's first-start measurements take - measured on a GPU holding the whole model and on GPUs
+#  with the CPU lane; tools/setup_bridge.py's HY4_TRIAL_TIME / HY4_LANE_TIME are the same)
+HY4_TRIAL_TIME = {2: "half a minute to a minute", 3: "one to two minutes"}
+HY4_LANE_TIME = "one minute"
+
+
+def hy4_measure_said(line: str) -> str:
+    """maya-hy4's "measuring this PC once" line in plain words, with roughly how long it takes on this kind of PC
+    (tools/setup_bridge.py's measure_said says the same): the drafting trial - each choice loaded and timed on a few
+    short answers - or the CPU lane's 4-bit copies and the prompt route."""
+    if "before the first answer: drafting" in line:
+        m = re.search(r"drafting \(([^:()]*):", line)
+        n = len(m.group(1).split(", ")) if m else 3
+        return (f"which drafting answers fastest - {n} choices, each loaded and timed on a few short answers, roughly "
+                f"{HY4_TRIAL_TIME.get(n, HY4_TRIAL_TIME[3])}")
+    return "the CPU lane's 4-bit copies and the prompt route, roughly " + HY4_LANE_TIME
+
+
 def narrate_start(log_path: str, offset: int, args: list, done: threading.Event, heartbeat=20.0) -> None:
     """While the engine starts, say in the server window what it is doing, from its log: the start reads tens of GB
     into RAM and locks part of it for the GPU, and on many PCs everything is slow or frozen for a minute or more -
@@ -1035,9 +1054,13 @@ def narrate_start(log_path: str, offset: int, args: list, done: threading.Event,
                 elif "session is up" in line:
                     say("up", "[maya] almost ready ...")
                 elif "measuring this PC once, before the first answer:" in line:   # (maya-hy4's first start here)
-                    what = re.sub(r" \([^()]*\)", "", line.split("first answer:", 1)[1].split(" - on ", 1)[0]).strip()
-                    say("measure", f"[maya] measuring this PC once ({what}) - one to two minutes, then ready; the "
-                                   "next starts skip this")
+                    drafting = "before the first answer: drafting" in line
+                    say("measure-" + ("draft" if drafting else "lane"),
+                        f"[maya] the first start on this PC measures it once before it is ready: {hy4_measure_said(line)};"
+                        " the next starts skip this")
+                elif m := HY4_MEASURE_LEFT.search(line):   # (... at this PC's own pace, after each drafting choice)
+                    say("measure-left" + m.group(1), f"[maya] measuring this PC: {m.group(1)} of {m.group(2)} choices "
+                                                     f"done - about {m.group(3)} s more")
                 elif "WARNING - " in line:   # the engine's own (e.g. Windows' commit limit capping the RAM tier)
                     print("[maya] WARNING: " + line.split("WARNING - ", 1)[1].strip(), flush=True)
         if time.time() - last > heartbeat:

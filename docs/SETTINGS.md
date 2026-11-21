@@ -2591,8 +2591,11 @@ do not fit together.
 
 **`--drafting auto`** (what the setup writes for a Maya size whose pack holds a drafter): the first start on a PC
 loads each choice once with its own VRAM plan - no drafting, the MTP block, the DFly2 drafter (one GPU) - and times a
-short greedy decode of each on this install's docs (three prompts, 192 tokens; before the engine is ready, a load and
-some seconds a choice); the fastest is kept (within 2%, the one with less VRAM of its own: no drafting, then DFly2,
+short greedy decode of each on three chat requests in the model's template (192 tokens in all; the first choice reads
+them once more untimed before, so no choice pays the disk's first reads of the n-gram table) - before the engine is
+ready: a load and a few short answers a choice, roughly one to two minutes in all on one GPU, where part of the model
+runs on the CPU then about one minute more for its CPU lane and prompt route (the server says the time left at this
+PC's pace after each choice); the fastest is kept (within 2%, the one with less VRAM of its own: no drafting, then DFly2,
 then the MTP block) and remembered in `data/hy4-drafting.txt`, per PC, GPUs, model and start options - the starts
 after read it and skip the measuring, so they give the same answers. `maya --speed-calibration` measures again.
 `--drafting on`: the faster of the drafters (never none); `--drafting off`, `mtp`, `dfly2` (the setup's `--drafting`,
