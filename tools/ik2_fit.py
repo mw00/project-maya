@@ -17,13 +17,17 @@ BASE_GIB = 18.3                                     # the model's weights, the w
 EXPERTS_GIB = 14.7                                  # the routed experts (UD-Q4_K_XL) - of BASE_GIB
 OFF_ROOM_GIB = 1.2                                  # the offload path's room for prompts and its staging slots
 HOST_GIB = 1.5                                      # the engine's RAM beside the experts (embedding rows, buffers)
+OFF_HOST_GIB = 0.5                                  # the offload path's RAM beside the experts it pins (Jupiter, an 8
+                                                    # GB card: 12.3 GiB anonymous with 12.1 of experts pinned)
+OS_GIB = 1.5                                       # the system's and the server's RAM beside the engine ("tight" under)
 KV_BYTES = {"fp8": 16384, "f16": 32768}             # the cache of a context token (IK2_KV)
 MARGIN_GIB = 0.5                                    # the driver's and the desktop's share of the card
 CONTEXTS = [32768, 65536, 131072, 262144]           # the setup's choices (the engine keeps every expert in VRAM up
                                                     # to 352,256 with an FP8 cache on a 24 GB card: text only)
 DEFAULT_KV = "fp8"
 MIN_VRAM_GB = 7.0                                   # the engine's own floor (check_preview: 7 GiB - an "8 GB" card)
-MIN_TOTAL_GB = 24.0                                 # RAM + VRAM that hold the model (no SSD tier: refused below)
+MIN_TOTAL_GB = 24.0                                 # RAM + VRAM that hold the model, as the refusal says it (no SSD
+                                                    # tier): the floor itself is the RAM a card leaves (ram_gib)
 MIN_CC = 80                                         # the engine's kernels: mma.sync m16n8k16, cp.async (Ampere on)
 
 
@@ -34,16 +38,16 @@ def need_gib(ctx: int, kv: str = DEFAULT_KV) -> float:
 
 def plan(vram_gb: float, ctx: int, kv: str = DEFAULT_KV) -> dict:
     """What this card holds at `ctx`: {"resident": every expert in VRAM, "need_gib", "layout": "resident" or
-    "offload", "tier_gib": the experts' GiB the card keeps, "ram_gib": the engine's RAM (the offload path pins every
-    expert in RAM)}.  A card whose VRAM is not known (0): resident - the engine measures at its start."""
+    "offload", "tier_gib": the experts' GiB the card keeps, "ram_gib": the engine's RAM (the offload path pins the
+    experts the card does not keep)}.  A card whose VRAM is not known (0): resident - the engine measures at its start."""
     if not vram_gb:
         return {"resident": True, "need_gib": None, "layout": "resident", "tier_gib": EXPERTS_GIB, "ram_gib": HOST_GIB}
     need = need_gib(ctx, kv)
     if float(vram_gb) - MARGIN_GIB >= need:
         return {"resident": True, "need_gib": need, "layout": "resident", "tier_gib": EXPERTS_GIB, "ram_gib": HOST_GIB}
-    tier = float(vram_gb) - MARGIN_GIB - (need - EXPERTS_GIB) - OFF_ROOM_GIB
-    return {"resident": False, "need_gib": need, "layout": "offload",
-            "tier_gib": round(max(0.0, min(EXPERTS_GIB, tier)), 1), "ram_gib": EXPERTS_GIB + HOST_GIB}
+    tier = round(max(0.0, min(EXPERTS_GIB, float(vram_gb) - MARGIN_GIB - (need - EXPERTS_GIB) - OFF_ROOM_GIB)), 1)
+    return {"resident": False, "need_gib": need, "layout": "offload", "tier_gib": tier,
+            "ram_gib": round(EXPERTS_GIB - tier + OFF_HOST_GIB, 1)}
 
 
 def recommended_context(vram_gb: float, kv: str = DEFAULT_KV) -> int:
@@ -55,24 +59,25 @@ def recommended_context(vram_gb: float, kv: str = DEFAULT_KV) -> int:
 
 def verdict(vram_gb: float, ram_gb: float, ctx: int, kv: str = DEFAULT_KV) -> tuple:
     """(word, line) for the setup and the Models page: "fast" (every expert in VRAM), "runs" (the offload path),
-    "tight" (the offload path, with less RAM free than it pins - it may not start), "does not fit" (RAM + VRAM under
-    the model).  ram_gb 0: not known."""
+    "tight" (the offload path, with less RAM beside what it takes than the system needs - it may not start),
+    "does not fit" (RAM under what the offload path takes with this card: RAM + VRAM under the model).  ram_gb 0: not known."""
     p = plan(vram_gb, ctx, kv)
     if p["resident"]:
         return "fast", "every expert in VRAM"
-    if ram_gb and ram_gb + vram_gb < MIN_TOTAL_GB:
-        return "does not fit", too_small_line(ram_gb, vram_gb)
+    if ram_gb and ram_gb < p["ram_gib"]:
+        return "does not fit", too_small_line(ram_gb, vram_gb, p["ram_gib"])
     share = 100.0 * p["tier_gib"] / EXPERTS_GIB
-    line = (f"about {p['tier_gib']:.1f} of the experts' {EXPERTS_GIB:.1f} GB on the card ({share:.0f}%), the rest in "
-            f"RAM - slower than with every expert in VRAM")
-    if ram_gb and ram_gb < p["ram_gib"] + 2.0:
-        return "tight", line + f"; it pins {p['ram_gib']:.0f} GB of RAM, this PC has {ram_gb:.0f} GB"
+    line = (f"about {p['tier_gib']:.1f} of the experts' {EXPERTS_GIB:.1f} GB on the card ({share:.0f}%), the other "
+            f"{EXPERTS_GIB - p['tier_gib']:.1f} GB pinned in RAM - slower than with every expert in VRAM")
+    if ram_gb and ram_gb < p["ram_gib"] + OS_GIB:
+        return "tight", line + f"; it takes about {p['ram_gib']:.0f} GB of RAM, this PC has {ram_gb:.0f} GB"
     return "runs", line
 
 
-def too_small_line(ram_gb: float, vram_gb: float) -> str:
-    return (f"Inkling 2 Mini needs about {MIN_TOTAL_GB:.0f} GB of RAM and VRAM together to hold the model (this PC "
-            f"has {ram_gb:.0f} GB of RAM and {vram_gb:.0f} GB of VRAM)")
+def too_small_line(ram_gb: float, vram_gb: float, need: float | None = None) -> str:
+    need = plan(vram_gb, CONTEXTS[0])["ram_gib"] if need is None else need
+    return (f"Inkling 2 Mini needs about {MIN_TOTAL_GB:.0f} GB of RAM and VRAM together to hold the model: about "
+            f"{need:.0f} GB of RAM with this {vram_gb:.0f} GB card (this PC has {ram_gb:.0f} GB of RAM)")
 
 
 def unsupported(backend: str, windows: bool, gpus_asked: int, cards: list, ram_gb: float = 0.0) -> str | None:
@@ -95,6 +100,6 @@ def unsupported(backend: str, windows: bool, gpus_asked: int, cards: list, ram_g
         vram = max(float(g.get("vram_gb") or 0) for g in new)
         if vram < MIN_VRAM_GB:
             return "Inkling 2 Mini needs one NVIDIA GPU with 8 GB of VRAM or more"
-        if ram_gb and vram - MARGIN_GIB < need_gib(CONTEXTS[0]) and ram_gb + vram < MIN_TOTAL_GB:
+        if ram_gb and vram - MARGIN_GIB < need_gib(CONTEXTS[0]) and ram_gb < plan(vram, CONTEXTS[0])["ram_gib"]:
             return too_small_line(ram_gb, vram)
     return None

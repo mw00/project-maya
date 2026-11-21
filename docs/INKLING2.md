@@ -331,8 +331,11 @@ pick the tier does not hold is copied by the GPU itself into a staging slot (a s
 router, with no host step, and the same expert kernels read the same bytes, so the answers are the ones every expert
 in VRAM gives. With `IK2_LANE=1` (lane parity) the CPU lane takes a share of the misses beside the copies, split by
 measured costs; every expert then runs one exact arithmetic on either side (`src/ik2/ik2_exact.h`, held bit for bit
-by `tests/ik2_off_test.cu`), so an answer does not depend on where an expert ran. The PC needs the model in RAM and
-VRAM together (about 24 GB; no SSD tier): the setup refuses less in one line.
+by `tests/ik2_off_test.cu`), so an answer does not depend on where an expert ran. Only the experts the tier does not
+hold are pinned (on Linux): the tier is planned on the card's free VRAM first, copied in from the mapped files, then
+the rest read and pinned - an 8 GB card's tier is 2.6 GiB of RAM the PC does not need (12.1 GiB pinned; 12 GB card
+~8 GiB, 16 GB ~4 GiB). `IK2_PIN_ALL=1` pins every expert. The PC needs the model in RAM and VRAM together (about
+24 GB, e.g. 16 GB of RAM with an 8 GB card; no SSD tier): the setup refuses less in one line.
 
 **The preview.** Inkling-2-Mini comes in as an experimental preview: Linux, one NVIDIA GPU of 8 GB or more, sm_80
 (Ampere) or newer; tested on RTX 3090s (sm_86). Elsewhere `maya-ik2` stops at the start with one line saying why

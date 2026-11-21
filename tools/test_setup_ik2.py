@@ -149,6 +149,9 @@ class Refusals(unittest.TestCase):
         self.assertNotIn("\n", why)
         self.assertIsNone(F.unsupported("cuda", False, 1, [card(8, arch="86")], ram_gb=32.0))
         self.assertIsNone(F.unsupported("cuda", False, 1, [card(24, arch="86")], ram_gb=8.0))   # (all on the card)
+        # (only the experts the card does not keep are pinned: a 16 GB PC, ~15.4 GiB as Linux reports it, with an
+        #  8 GB card)
+        self.assertIsNone(F.unsupported("cuda", False, 1, [card(8, arch="86")], ram_gb=15.4))
 
     def test_check_pc_refuses_first(self):
         for a, part in ((args(backend="hip"), "NVIDIA GPUs only"), (args(gpus="0,1"), "one GPU only")):
@@ -214,7 +217,12 @@ class Fit(unittest.TestCase):
         self.assertEqual(F.plan(24.0, 262144)["layout"], "resident")
         self.assertEqual(F.verdict(24.0, 64.0, 262144)[0], "fast")
         self.assertEqual(F.verdict(8.0, 64.0, 32768)[0], "runs")
-        self.assertEqual(F.verdict(8.0, 17.0, 32768)[0], "tight")
+        # (the RAM: the experts the card does not keep, pinned, and the engine's own beside them)
+        for p in tiers:
+            self.assertAlmostEqual(p["ram_gib"], F.EXPERTS_GIB - p["tier_gib"] + F.OFF_HOST_GIB, places=1)
+        self.assertTrue(tiers[0]["ram_gib"] > tiers[1]["ram_gib"] > tiers[2]["ram_gib"])
+        self.assertEqual(F.verdict(8.0, 15.4, 32768)[0], "runs")       # (16 GB of RAM)
+        self.assertEqual(F.verdict(8.0, tiers[0]["ram_gib"] + 0.5, 32768)[0], "tight")
         self.assertEqual(F.verdict(8.0, 12.0, 32768)[0], "does not fit")
 
 
