@@ -2396,6 +2396,67 @@ class VisionFootprint(unittest.TestCase):
         self.assertEqual(self.measure(0, "MEM 1000 2000 100000\n"), ((1024, 3000 + (256 << 20)), 1))
         self.assertEqual(self.measure(0, ""), ((1024, 3000 + (256 << 20)), 0))   # now from the cache
 
+    def test_no_text_model_no_model_flag(self):
+        """(Inkling 2's entry names no text model: maya-vision is started without --model)"""
+        from unittest import mock
+        from serve.server import vision_footprint
+        self.vcfg.pop("model")
+        done = mock.Mock(returncode=0, stdout="MEM 1000 2000 100000\n")
+        with mock.patch("serve.server.subprocess.run", return_value=done) as run:
+            vision_footprint(self.vcfg, {}, self.cache, 0)
+        self.assertNotIn("--model", run.call_args[0][0])
+        self.assertIn("--measure", run.call_args[0][0])
+
+
+class VisionRoomOnDemand(unittest.TestCase):
+    """Inkling 2's encoder (maya-ik2 lends no memory): started when a picture arrives - on the GPU while its free
+    memory holds the encoder, else on the CPU with no GPU visible - and ended once the request's pictures are read."""
+
+    def start(self, room: bool):
+        from unittest import mock
+        from serve.server import Vision
+        v = Vision({"exe": "maya-vision", "mmproj": "mmproj-BF16.gguf", "gpu": True, "max_tokens": 1024},
+                   env={"CUDA_VISIBLE_DEVICES": "2"}, start=False)
+        self.assertEqual(v.args, ["maya-vision", "--mmproj", "mmproj-BF16.gguf", "--gpu", "--max-tokens", "1024"])
+        v.room, v.cpu_threads = (lambda: room), 8
+        proc = mock.Mock()
+        proc.stdout.readline.return_value = "READY 2304\n"
+        with mock.patch("serve.server.subprocess.Popen", return_value=proc) as popen:
+            v._start()
+        return v, proc, popen.call_args
+
+    def test_on_the_gpu_when_it_has_room(self):
+        v, proc, call = self.start(True)
+        self.assertEqual(call[0][0], ["maya-vision", "--mmproj", "mmproj-BF16.gguf", "--gpu", "--max-tokens", "1024",
+                                      "--no-warmup"])
+        self.assertEqual(call[1]["env"], {"CUDA_VISIBLE_DEVICES": "2"})
+        self.assertIs(v.on_gpu, True)
+        with v.active():
+            pass
+        self.assertIsNone(v.proc)                       # (ended: no VRAM kept between requests)
+        proc.stdin.write.assert_called_with("QUIT\n")
+
+    def test_on_the_cpu_otherwise(self):
+        v, proc, call = self.start(False)
+        self.assertEqual(call[0][0], ["maya-vision", "--mmproj", "mmproj-BF16.gguf", "--max-tokens", "1024",
+                                      "--threads", "8", "--no-warmup"])
+        self.assertEqual(call[1]["env"]["CUDA_VISIBLE_DEVICES"], "")   # (no GPU visible: no context on it either)
+        self.assertIs(v.on_gpu, False)
+        with v.active():
+            pass
+        self.assertIsNone(v.proc)
+
+    def test_free_memory(self):
+        from unittest import mock
+        from serve.server import gpu_free_bytes
+        with mock.patch("serve.server.subprocess.run", return_value=mock.Mock(returncode=0, stdout="9216\n")) as run:
+            self.assertEqual(gpu_free_bytes(2), 9216 << 20)
+        self.assertEqual(run.call_args[0][0][-2:], ["-i", "2"])
+        with mock.patch("serve.server.subprocess.run", side_effect=OSError("no nvidia-smi")):
+            self.assertIsNone(gpu_free_bytes(0))
+        with mock.patch("serve.server.subprocess.run", return_value=mock.Mock(returncode=9, stdout="")):
+            self.assertIsNone(gpu_free_bytes(0))
+
 
 class LifecycleEngine(MockEngine):
     """The mock engine with StrataEngine's lifecycle: alive / close (QUIT) / restart, counted."""

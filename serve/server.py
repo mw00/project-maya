@@ -1990,7 +1990,8 @@ class Vision:
     resident), for a second or two of start-up per request with new pictures."""
 
     def __init__(self, cfg: dict, log=None, env: dict | None = None, start: bool = True):
-        args = [cfg["exe"], "--mmproj", cfg["mmproj"], "--model", cfg["model"]]
+        # (no "model": no text model - Inkling 2's encoder reads its pictures from the mmproj alone)
+        args = [cfg["exe"], "--mmproj", cfg["mmproj"]] + (["--model", cfg["model"]] if cfg.get("model") else [])
         if cfg.get("gpu"):
             args.append("--gpu")
         if cfg.get("threads"):
@@ -2003,6 +2004,11 @@ class Vision:
         self.dir = Path(tempfile.mkdtemp(prefix="maya-vision-"))
         self.proc = None
         self.lend = self.reclaim = None   # on demand: callables (the engine's VLEND / VRECLAIM), wired by main()
+        # on demand without lending (Inkling 2: maya-ik2 lends no memory): a callable, True when the GPU's free memory
+        # holds the encoder now - it then starts there, else on the CPU (no GPU visible, `cpu_threads`); ends after
+        self.room = None
+        self.cpu_threads = 0
+        self.on_gpu = None                # (where the last on-demand start ran: True GPU, False CPU)
         self.owed = False                 # the engine's memory is not back yet (a reclaim that kept failing)
         self.lock = threading.RLock()
         self.cache: dict[str, tuple[Path, int]] = {}
@@ -2013,11 +2019,20 @@ class Vision:
         if self.lend is not None:
             self.settle()
             self.lend()
+        args, env = self.args, self.env
+        if self.room is not None:
+            self.on_gpu = bool(self.room())
+            print(f"[maya] images: reading the pictures on the {'GPU' if self.on_gpu else 'CPU'}", flush=True)
+            if not self.on_gpu:
+                args = [x for x in args if x != "--gpu"] + \
+                    (["--threads", str(self.cpu_threads)] if self.cpu_threads and "--threads" not in args else [])
+                env = dict(env if env is not None else os.environ, CUDA_VISIBLE_DEVICES="")
         try:
-            self.proc = subprocess.Popen(self.args + (["--no-warmup"] if self.lend is not None else []),
+            self.proc = subprocess.Popen(args + (["--no-warmup"] if self.lend is not None or self.room is not None
+                                                 else []),
                                          stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                          stderr=self.log or subprocess.DEVNULL, text=True, encoding="utf-8",
-                                         bufsize=1, env=self.env)
+                                         bufsize=1, env=env)
             line = self.proc.stdout.readline()
             if not line.startswith("READY"):
                 raise RuntimeError("the vision encoder did not start: " + line.strip())
@@ -2063,7 +2078,7 @@ class Vision:
             try:
                 yield self
             finally:
-                if self.lend is not None and self.proc is not None:
+                if (self.lend is not None or self.room is not None) and self.proc is not None:
                     self._stop()
 
     @staticmethod
@@ -2214,6 +2229,16 @@ class Vision:
             self.proc.kill()
 
 
+def gpu_free_bytes(gpu: int) -> int | None:
+    """The free memory of NVIDIA GPU `gpu` (nvidia-smi's numbering) now, or None when nvidia-smi cannot say."""
+    try:
+        r = subprocess.run(["nvidia-smi", "--query-gpu=memory.free", "--format=csv,noheader,nounits", "-i", str(gpu)],
+                           capture_output=True, text=True, timeout=20)
+        return int(r.stdout.strip().splitlines()[0]) << 20 if r.returncode == 0 else None
+    except (OSError, subprocess.TimeoutExpired, ValueError, IndexError):
+        return None
+
+
 def vision_footprint(vcfg: dict, env: dict, cache_file: Path, gpu: int) -> tuple[int, int] | None:
     """(image token cap, bytes) for the on-demand vision encoder on THIS machine's first GPU: measured once by
     `maya-vision --measure` (before the model loads, so the GPU is otherwise idle) and cached per encoder file, cap
@@ -2235,8 +2260,9 @@ def vision_footprint(vcfg: dict, env: dict, cache_file: Path, gpu: int) -> tuple
         if not isinstance(m, dict) or not all(isinstance(m.get(k), int) and m[k] > 0 for k in ("bytes", "total")):
             m = None
         if m is None:
-            args = [vcfg["exe"], "--mmproj", vcfg["mmproj"], "--model", vcfg["model"], "--gpu", "--max-tokens", str(cap),
-                    "--measure"] + (["--no-flash-attn"] if vcfg.get("no_flash_attn") else [])
+            args = [vcfg["exe"], "--mmproj", vcfg["mmproj"]] + \
+                (["--model", vcfg["model"]] if vcfg.get("model") else []) + \
+                ["--gpu", "--max-tokens", str(cap), "--measure"] + (["--no-flash-attn"] if vcfg.get("no_flash_attn") else [])
             print(f"[maya] images: measuring the vision encoder on this GPU ({cap} image tokens) ...", flush=True)
             try:
                 r = subprocess.run(args, capture_output=True, text=True, timeout=600, env=env)
@@ -7704,7 +7730,8 @@ def main() -> int:
                 vcfg, on_demand = dict(vcfg, gpu=False), False
             else:
                 vcfg = dict(vcfg, max_tokens=fp[0])
-                engine_env = dict(env, MAYA_GLM_VISION_LEND_MB=str((fp[1] >> 20) + 1))
+                if models.family(cfg) != "ik2":   # (maya-ik2 lends no memory: the encoder takes what is free)
+                    engine_env = dict(env, MAYA_GLM_VISION_LEND_MB=str((fp[1] >> 20) + 1))
                 print(f"[maya] images: the vision encoder needs {fp[1] / 2**30:.2f} GB on this GPU at up to {fp[0]} "
                       "image tokens", flush=True)
         if vcfg and not on_demand:
@@ -7769,6 +7796,18 @@ def main() -> int:
                 vision.reclaim = lambda: engine.command("VRECLAIM", "VRECLAIMED")
                 print(f"[maya] images: the vision encoder starts when a picture arrives, in {lent / 2**30:.2f} GB "
                       "the model lends it", flush=True)
+            elif models.family(cfg) == "ik2":
+                # Inkling 2 (maya-ik2 lends no memory, and its plan keeps none for pictures): the encoder starts when
+                # a picture arrives - on the GPU when its free memory then holds what the encoder measured, else on
+                # the CPU - and ends once the request's pictures are read
+                need, gi = fp[1], (gpu_list(cfg) or [0])[0]
+                vision = Vision(vcfg, log=vlog, env=venv, start=False)
+                vision.room = lambda: (gpu_free_bytes(gi) or 0) >= need
+                vision.cpu_threads = max(1, (os.cpu_count() or 2) // 2)
+                free = gpu_free_bytes(gi)
+                print(f"[maya] images: the vision encoder starts when a picture arrives - on GPU {gi} while "
+                      f"{need / 2**30:.2f} GB of it is free ({(free or 0) / 2**30:.2f} GB now), else on the CPU; "
+                      "no VRAM kept for it", flush=True)
             else:   # the model's GPU memory is too small to lend that much (or an engine without lending)
                 print("[maya] images: the model cannot lend the vision encoder its GPU memory here - the encoder "
                       "runs on the CPU", flush=True)
