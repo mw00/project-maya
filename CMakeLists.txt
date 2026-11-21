@@ -290,6 +290,13 @@ if(STRATA_BUILD_TESTS)
   add_executable(ds4_place_test tests/ds4_place_test.cpp)
   target_link_libraries(ds4_place_test PRIVATE strata_warnings)
   add_test(NAME ds4_place_test COMMAND ds4_place_test ${CMAKE_CURRENT_SOURCE_DIR}/data/expert-profile-ds4.bin)
+  # maya-ds4's room for the CPU lane's copies on their NUMA node (src/ds4/ds4_os.hpp): what a node short of free
+  # memory releases of its file cache first, the node's meminfo read, the no-ops (host code only, no model, no GPU)
+  find_package(Threads REQUIRED)
+  add_executable(ds4_node_room_test tests/ds4_node_room_test.cpp)
+  target_include_directories(ds4_node_room_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  target_link_libraries(ds4_node_room_test PRIVATE strata_warnings Threads::Threads)
+  add_test(NAME ds4_node_room_test COMMAND ds4_node_room_test)
 endif()
 # maya-ds4's Engram reader: a batch read ahead (a prompt's next part's rows) waits behind the others, every read the
 # file's bytes (src/ds4/ds4_engram_io.hpp; a file in the temp folder, host code only)

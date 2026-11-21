@@ -1077,6 +1077,55 @@ decode at 118K context the same (33.0 against 31.9 tok/s, 32 greedy tokens); per
 short prompts with DSpark (temperature 1) 63.7 against 69.8 tok/s - the first group's 10 layers keep ~89% of their
 experts in VRAM, the second's 27 only ~23%, and each token waits on the second's CPU lane.
 
+The split trades the two. The same PC and quant at v1.1.69 (`--tp 4`, `--parallel 2`, 512K context, DSpark; five short
+prompts of 384 tokens each, greedy / temperature 1; a fresh 32,380-token prompt read in chunks of 6400), by where the
+two groups' layers are cut - more layers on the first group even out the experts the two keep in VRAM, and leave it
+more of the layers a prompt runs in full:
+
+| `DS4_SPLIT` | experts in VRAM, first / second group | routed picks in VRAM | decode, tok/s | 32K prompt, tok/s |
+| --- | --- | --- | --- | --- |
+| `3,10,27` | 80% / 23% | 90.5% | 62.8 / 60.6 | 1,799 |
+| `3,12,25` | 66% / 27% | 92.2% | 67.6 / 63.9 | 1,702 |
+| `3,14,23` | 56% / 30% | 93.0% | 70.5 / 67.5 | 1,515 |
+| `3,16,21` | 49% / 33% | 93.5% | 71.1 / 69.6 | 1,363 |
+| `3,18,19` | 41% / 38% | 93.8% | 71.0 / 68.0 | 1,281 |
+
+A point more of the picks in VRAM is worth about 5% of the decode there. `MAYA_DS4_DSPARK_CUM=0.35` adds 3-5% to
+the greedy decode at any of these splits (more drafts verified a round); at temperature 1 it gains only together with
+`DS4_DSPARK_SAMPLE=1` (the drafts drawn from the drafter's distribution: 72% -> 82% of them kept; a round with a
+prompt-lookup proposal keeps the drafter's argmax, so the lookup works beside it as without), about 2%, and
+`--dspark-conf 0.35` then adds 2.5% more (68.3 -> 70.1 at `3,16,21`; 0.65: 67.5). `DS4_DRAFT_COST=1` measured 3%
+below the fixed 0.35 cut there, `DS4_DSPARK_QTEMP` 0.7 / 1.3 and `DS4_AR_P2P=1` within the runs' noise (about 2%).
+
+`n@g` in `DS4_SPLIT` keeps both: the next `n` layers go to group `g` whichever its turn, so the trunk's last layers
+can go back to a group that ran earlier ones. A long prompt's pace is set by the layers before its skip (0-19), and
+those stay where the prompt wants them; the layers past it run only a prompt's last rows, so they can sit where the
+decode wants them. With `3,9,22,6@1` the first group runs layers 3-11 and then 34-39 with the head, the second 12-33
+between the two. Same PC, quant and runs as the table above:
+
+| `DS4_SPLIT` | experts in VRAM, first / second group | routed picks in VRAM | decode, tok/s | 32K prompt, tok/s |
+| --- | --- | --- | --- | --- |
+| `3,10,27` | 80% / 23% | 90.5% | 62.8 / 60.6 | 1,799 |
+| `3,10,23,4@1` | 50% / 32% | 93.0% | 68.9 / 66.8 | 1,790 |
+| `3,10,22,5@1` | 45% / 34% | 93.4% | 69.6 / 67.7 | 1,766 |
+| `3,10,21,6@1` | 42% / 37% | 93.5% | 70.4 / 66.7 | 1,740 |
+| `3,9,23,5@1` | 48% / 32% | 92.9% | 70.0 / 67.1 | 1,832 |
+| `3,9,22,6@1` | 44% / 35% | 93.5% | 71.3 / 67.7 | 1,818 |
+
+The first group has the time for it: in a long prompt at `3,10,27` the RTX 3090 sets the pace (1.9 s a chunk of 6400
+tokens, three layers and 9 GB of experts streamed), and each group of four is busy ~1.5 s of it (`DS4_RUN_TRACE=1`).
+With layers back on it the first group streams more of its early layers' experts a chunk (19 -> 42 GB a member over
+the 32K prompt at `3,10,23,4@1`), the second fewer, and the prompt's last chunk - the only one that runs the layers
+past the skip - takes 4.3 s, not 5.1. The groups lend chunks of 7168 tokens there (not 6400). A fresh 129K-token
+prompt: `3,10,27` 51.1 s (2,521 tok/s), `3,9,22,6@1` 52.4 s (2,460), `3,10,22,5@1` 55.6 s (2,319) - the first
+group's nine early layers leave it the room its last ones take, ten do not quite.
+
+One group can take layers twice, and the second time they are the trunk's last ones: each device's thread still puts
+its layers on its stream in order and hands a window on once. Not the Engram layers, and not on a pool of PCs. In a
+prompt, a chunk those last layers leave out still brings them its rows of the other group's source (the skip's first
+layer); a device takes them a chunk later, after its first layers of the next chunk, so the two groups keep running
+two chunks at once. While answering, the group's expert-cache copies go in the gap between its two runs of layers.
+
 ## DeepSeek: skipping light experts the SSD would read (experimental)
 
 When DeepSeek-V4.1-Flash's experts do not fit in VRAM and RAM, a token waits for the SSD to read the experts it was
@@ -1247,6 +1296,7 @@ on are used (`taskset`, a container's cpuset).
 | `--cpu-threads N` (the config's engine `args`) | a thread per core | at most N threads, a thread per core; nothing is measured |
 | `MAYA_DS4_CPU_LANE` | measured | `cores`, `pcores`, `node` or `smt` (a thread per logical CPU): that way, nothing is measured |
 | `DS4_COPY_NUMA` (the config's `"env"`) | 2 parts at most | the CPU lane's RAM copies of its experts in this many NUMA parts, `1`-`4`, each on its own node with a worker pool there - so a host of three or four sockets uses them all (the default takes two). 4x Xeon E7-8880 v4 (88 cores), Maya-S + DSpark, `--mmap-experts off`: two RTX 3090s (a pair on sockets 0-1, and one on 2-3, two runs each on the first) 37-39 -> 49 tok/s decode, after a 68K prompt 24-26 -> 32-33 tok/s, the prompt read 644-655 -> 805 tok/s on the first pair (802 both ways on the second); four RTX 3090s (less on the CPU lane) unchanged |
+| `MAYA_DS4_COPY_ROOM` | on (Linux, two NUMA parts or more) | an EXL3 pack: each NUMA node makes room for its part of the CPU lane's RAM copies before they are filled: a node whose free memory is short but which holds file cache (another model's files, read before this start - the usual state after a switch of models) releases that much of the cache first, through the kernel's own reclaim, never more than the node holds. Without it the kernel lends the part's memory from the other node before it reclaims (the copies prefer their node, they do not require it), so one node's workers read their weights across the sockets and part of the copies lose their huge pages. The copies' memory is then touched at once, before the load's own reads fill the room again. 2x Xeon Gold 6152, RTX 3090 + eight RTX 5060 Ti, EXL3 3.5 bpw (142.6 GB of copies), 157 GB of another model's files in the cache at the start: the copies 115 / 35 GB on the two nodes (109 GB of them on huge pages) -> 82 / 68 GB (all on huge pages, as a start with the memory free), the load 804 -> 175 s, decode 55.4 -> 60.7 tok/s greedy and 54.4 -> 60.5 at temperature 1 (five prompts, 384 tokens each, DSpark; a start with the memory free: 63.2 / 60.1 before, 62.6 / 61.2 with it). The log says what each node released (`ds4: NUMA node 1 had ... GB free ...`). `0`: the copies wherever memory is free, as before |
 | `MAYA_DS4_LANE_SPIN_US` | 20000 | the lane's workers spin this many us idle before they sleep (0 .. 1000000): a decode hands the lane work on few layers, and on an APU a shorter spin leaves the integrated GPU more of the shared power (the answers are the same) |
 | `MAYA_DS4_CPU_SPLIT_COLS` | off | `1`: a call of few EXL3 experts on the lane (a decoded token's one or two a layer) has its gate / up and down pieces cut by columns too, so more of the lane's threads share it. A step is cut only where its pieces would leave threads idle for a whole piece (fewer than 8 jobs a thread), into the equal runs that take the fewest rounds; a call of more experts runs as before. Each output is the same sum in the same order, so the answers are the same bit for bit (`ds4_cpu_split_test` checks it; with the engine's own `DS4_CPU_FLOW_CHECK=1` - that bare name, in the config's `"env"`, as the engine reads no `MAYA_` or `STRATA_` name of it - each call is checked against the uncut steps). Off until measured: it may help where the lane has many threads for the few experts a layer leaves it |
 | `MAYA_DS4_CPU_W16` | off | `1`: on a CPU whose lane runs the AVX2 tier (no AVX-512), the EXL3 experts' codebook products and byte sums are computed in 16-bit lanes, a tile row's two halves at once (an expert's call of 1-3 tokens; 4 or more keep the 32-bit path) - fewer of the uops that Haswell and Broadwell run on one port only. The same byte sums and the same float steps, so the answers are the same bit for bit (`exl3_cpu_w16_test` checks it; `DS4_CPU_W16_CHECK=1`, the engine's bare name, checks each lane call against the 32-bit path). The log says whether it took (`ds4: CPU lane: EXL3 codebook products in 16-bit lanes on`); other tiers ignore it. Off until measured: CPUs with more integer-multiply ports (AMD Zen) may not gain |
