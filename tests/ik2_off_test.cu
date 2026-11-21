@@ -237,7 +237,7 @@ static void test_fetch() {
     for (int v = 0; v < 6; ++v) {   // visits: picks overlapping the visit before
         int t[K];
         std::vector<const uint8_t*> b(K, nullptr);
-        for (int i = 0; i < K; ++i) t[i] = (v * 5 + i * 3) % E;
+        for (int i = 0; i < K; ++i) t[i] = (v * 2 + i) % E;
         b[0] = tier;   // (slot 0: "in the tier")
         CK(cudaMemcpy(top, t, K * 4, cudaMemcpyHostToDevice));
         CK(cudaMemcpy(blob, b.data(), K * sizeof(void*), cudaMemcpyHostToDevice));

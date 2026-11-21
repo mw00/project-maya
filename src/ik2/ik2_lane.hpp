@@ -62,6 +62,11 @@ private:
     std::atomic<bool> quit_{false};
     std::atomic<unsigned long long> n_done_{0};
     std::atomic<double> us_[2];
+    struct Hist {
+        unsigned long long n = 0;
+        double sum = 0, max = 0;
+    };
+    std::vector<Hist> hist_ = std::vector<Hist>(16);
     std::thread th_;
 };
 

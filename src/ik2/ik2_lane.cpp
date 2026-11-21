@@ -11,6 +11,8 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 #if defined(_MSC_VER)
@@ -214,6 +216,11 @@ Server::Server(int threads, int C, int F, float gcap, float ucap, std::vector<La
 Server::~Server() {
     quit_.store(true);
     if (th_.joinable()) th_.join();
+    if (std::getenv("IK2_LANE_LOG"))
+        for (size_t i = 0; i < hist_.size(); ++i)
+            if (hist_[i].n)
+                std::printf("lane jobs of %zu experts: %llu, %.0f us on average, %.0f at most\n", i + 1, hist_[i].n,
+                            hist_[i].sum / (double) hist_[i].n, hist_[i].max);
 }
 int Server::threads() const { return lane_->threads() + 1; }
 double Server::us_expert(int fmt) const { return us_[fmt & 1].load(); }
@@ -260,6 +267,10 @@ void Server::run(uint32_t seq) {
     compute(layer, e, sg, su, n, (const float*) (job_ + k::kLaneJobX), (float*) (done_ + k::kLaneDoneY));
     const double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
     const int fmt = L_[(size_t) layer].ty_gu == x::kNVFP4 ? 0 : 1;
+    if (n > 0 && n <= k::kOffMaxK) {   // (IK2_LANE_LOG: a job's time by its size)
+        Hist& hh = hist_[(size_t) n - 1];
+        ++hh.n, hh.sum += us, hh.max = std::max(hh.max, us);
+    }
     const double old = us_[fmt].load(), per = us / std::max(1, n);
     us_[fmt].store(old > 0 ? 0.9 * old + 0.1 * per : per);
     n_done_.fetch_add((unsigned long long) n);
