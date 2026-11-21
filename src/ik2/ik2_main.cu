@@ -3836,7 +3836,7 @@ int main(int argc, char** argv) {
     W.lg = dalloc<float>(W.lg_cap);
     W.blocks = dalloc<float>((size_t) (c.n_layer / c.block + 1) * T_buf * C);
     W.x16 = dalloc<uint16_t>(Tm * std::max(C, HD)), W.xk16 = dalloc<uint16_t>(Tm * C), W.xv16 = dalloc<uint16_t>(Tm * C);
-    if (W.T_sup > 0) W.xq16_sup = dalloc<uint16_t>(T_buf * C);
+    if (W.T_sup > 0 || dual()) W.xq16_sup = dalloc<uint16_t>(T_buf * C);
     if (!getenv("IK2_RELB") || std::atoi(getenv("IK2_RELB"))) {
         W.relb_ext = std::max(c.extent, c.extent_swa);
         W.relb = dalloc<float>((size_t) Work::kRelbRows * c.H * W.relb_ext);
