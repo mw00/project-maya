@@ -1077,6 +1077,7 @@ struct Work {
     // its three attention inputs before the messages.
     float *lp_pre = nullptr, *lp_bank = nullptr, *lp_msg = nullptr, *lp_in = nullptr;
     float* lp_g = nullptr;   // the message gates' scratch [3][Tm][2 rank + 2]
+    float *lp_a = nullptr, *lp_f = nullptr;   // ... of a chunk's: [3][Tm][rank] and [2][Tm][C]
     float* logits_h = nullptr;   // the resident token path's logits, pinned [n_vocab]
 };
 
@@ -1224,6 +1225,30 @@ void matmul_rows(const Mat& m, int r0, int n, const float* x32, const uint16_t* 
     matmul(p, x32, x16, T, Y, ldy);
 }
 
+// A looped layer's message gates over a chunk of tokens.  A gate is two matrix products - g = D [rms(x); rms(m)],
+// then F g and G g - and k::loop_gates' kernels take them a token at a time: over a prefill chunk that was a quarter
+// of the prefill.  Here the products go through cuBLAS and the kernels are what is left around them.
+constexpr int kLoopGemmMin = 32;   // tokens from which the products are cuBLAS's
+void loop_gates_chunk(Work& W, const k::LoopGate* gt, int n, int T, int C, int R, float eps) {
+    if (T < kLoopGemmMin) {
+        k::loop_gates(gt, n, T, C, R, eps, W.lp_g, g_s);
+        return;
+    }
+    const float one = 1.0f, zero = 0.0f;
+    float *a1 = W.lp_a, *a2 = a1 + (size_t) T * R, *g = a2 + (size_t) T * R;
+    float *f = W.lp_f, *gn = f + (size_t) T * C;
+    for (int j = 0; j < n; ++j) {
+        // a1 [T][R] = x D_x^T, a2 = m D_m^T (D [R][2 C]: its rows' halves)
+        CB(cublasSgemm(g_blas, CUBLAS_OP_T, CUBLAS_OP_N, R, T, C, &one, gt[j].D, 2 * C, gt[j].x, C, &zero, a1, R));
+        CB(cublasSgemm(g_blas, CUBLAS_OP_T, CUBLAS_OP_N, R, T, C, &one, gt[j].D + C, 2 * C, gt[j].m, C, &zero, a2, R));
+        k::loop_gate_mix(gt[j].x, gt[j].m, a1, a2, T, C, R, eps, g, g_s);
+        // f [T][C] = g F, gn = g G (F, G [R][C])
+        CB(cublasSgemm(g_blas, CUBLAS_OP_N, CUBLAS_OP_N, C, T, R, &one, gt[j].F, C, g, R, &zero, f, C));
+        CB(cublasSgemm(g_blas, CUBLAS_OP_N, CUBLAS_OP_N, C, T, R, &one, gt[j].G, C, g, R, &zero, gn, C));
+        k::loop_gate_blend(gt[j].x, gt[j].m, f, gn, (size_t) T * C, gt[j].y, g_s);
+    }
+}
+
 // One layer's attention + post-attention conv + residual into r_out ([T][C]).
 // h_in ([T][C]) is unmodified and acts as the residual input; when l % c.block == 0, it is saved to blk(nb).
 // msg: a looped core's later pass - the layer's messages [4][T][C] (q's, k's, v's, the MoE's), which gate its q, k and
@@ -1252,7 +1277,7 @@ void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const flo
         for (int j = 0; j < 3; ++j)
             gt[j] = {W.lp_in + (size_t) (Ly.n_res_q == 3 ? j : 0) * TC, msg + (size_t) j * TC, Ly.lp_down[j],
                      Ly.lp_forget[j], Ly.lp_gain[j], y32[j]};
-        k::loop_gates(gt, 3, T, C, c.rank, 1e-6f, W.lp_g, g_s);
+        loop_gates_chunk(W, gt, 3, T, C, c.rank, 1e-6f);
         for (int j = 0; j < 3; ++j)
             k::rms_f16(y32[j], nw[j], T, C, c.eps, y16[j], need_x32 ? y32[j] : nullptr, g_s);
         in_q = W.xq, in_k = W.xk, in_v = W.xv;
@@ -2205,8 +2230,8 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
             st.st[nb] = W.r;
             if (msg) {   // (its message gates the input before the norm)
                 k::attn_res(st, nb + 1, Ly.ffn_res_score, 1, T, C, 1e-6f, W.xq, g_s);
-                k::loop_gate(W.xq, msg + (size_t) 3 * TC, Ly.lp_down[3], Ly.lp_forget[3], Ly.lp_gain[3], T, C, c.rank,
-                             1e-6f, W.lp_g, W.xq, g_s);
+                const k::LoopGate gt{W.xq, msg + (size_t) 3 * TC, Ly.lp_down[3], Ly.lp_forget[3], Ly.lp_gain[3], W.xq};
+                loop_gates_chunk(W, &gt, 1, T, C, c.rank, 1e-6f);
                 k::rms_f16(W.xq, Ly.ffn_norm, T, C, c.eps, W.x16, W.xq, g_s);
             } else {
                 k::RmsOuts outs{};
@@ -3715,6 +3740,8 @@ int main(int argc, char** argv) {
         W.lp_msg = dalloc<float>(4 * Tm * C);
         W.lp_in = dalloc<float>(3 * Tm * C);
         W.lp_g = dalloc<float>(3 * Tm * (2 * (size_t) c.rank + 2));
+        W.lp_a = dalloc<float>(3 * Tm * (size_t) c.rank);
+        W.lp_f = dalloc<float>(2 * Tm * C);
     }
     for (auto& Vi : M.V) {   // the conv histories start at zero
         if (M.L[Vi.l].dev != d) continue;
