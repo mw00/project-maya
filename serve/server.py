@@ -3760,6 +3760,14 @@ class Service:
                 prefill = "<|message_model|>" + (force + "<|content_invoke_tool_json|>" if force else "")
             else:
                 prefill = CALL_START + (force if glm_calls else "\n" + (f"<function={force}>\n" if force else ""))
+        if not prefill and not tools and getattr(self.template, "inkling", False) and \
+                (kwargs.get("enable_thinking") is False or kwargs.get("reasoning_effort") == "none"):
+            # Inkling 2 has no switch for its thinking, only its effort level - and at the lowest ("none": 0.0) it
+            # still thinks a little.  With thinking off the prompt opens the answer's text segment itself, as the
+            # template writes an earlier turn that had no reasoning.  (With tools the turn is left to the model: its
+            # first segment may be a call.)
+            kwargs = {**kwargs, "enable_thinking": False}
+            prefill = "<|message_model|><|content_text|>"
         given["_prefill"] = prefill
         if prefill and getattr(self.template, "hy4", False):
             # Hy4-flash: GLM's form under its own suffixed tags, inside its <tool_calls:..> wrapper.  The prompt gets
