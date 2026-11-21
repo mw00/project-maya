@@ -2245,27 +2245,53 @@ __global__ void loop_gate_dots_kernel(LoopGateArgs a, int T, int C, int R, float
         }
     }
 }
-// (2) y = (1 - tanh(F g)) x + tanh(G g) m: a block is kBlk channels of a token, a thread a channel; F and G by rank
-// ([R][C]), so that a warp's threads read side by side.  y may be x (x's sums were taken in (1)).
-__global__ void loop_gate_apply_kernel(LoopGateArgs a, int T, int C, int R, float eps, const float* __restrict__ sc) {
-    __shared__ float sh_g[kLoopRankMax];
-    const int j = blockIdx.y, t = blockIdx.z, tid = threadIdx.x;
-    const float* o = sc + ((size_t) j * T + t) * (2 * R + 2);
-    if (tid < R) {
+// (2) y = (1 - tanh(F g)) x + tanh(G g) m, F and G by rank ([R][C]).  A block is 32 channels of up to 8 tokens: its
+// 8 warps copy the channels' R rows of F and G into shared memory (the rows spread over the warps, a warp's loads all
+// issued at once - one thread a channel walking the rows itself left the loads in a chain on 27 blocks: 35 us a visit
+// on a V100), then warp w takes token w, a thread a channel and its two sums over r in order: the same per-element
+// math as before, so the same bits.  y may be x (x's sums were taken in (1)); a thread reads its own element first.
+constexpr int kGateCh = 32, kGateWarps = 8, kGateRows = kLoopRankMax / kGateWarps;
+__global__ void __launch_bounds__(kGateWarps * 32) loop_gate_apply_kernel(LoopGateArgs a, int T, int C, int R,
+                                                                          float eps, const float* __restrict__ sc) {
+    extern __shared__ float sh_lg[];
+    float* sF = sh_lg;                          // [R][kGateCh]
+    float* sG = sF + (size_t) R * kGateCh;      // [R][kGateCh]
+    float* sg = sG + (size_t) R * kGateCh;      // [kGateWarps][R]: the tokens' g
+    const int j = blockIdx.y, tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    const int c = (int) blockIdx.x * kGateCh + lane, t0 = (int) blockIdx.z * kGateWarps;
+    const int nt = min(kGateWarps, T - t0);
+    {
+        const float* F = a.F[j];
+        const float* G = a.G[j];
+        float vf[kGateRows], vg[kGateRows];
+#pragma unroll
+        for (int q = 0; q < kGateRows; ++q) {
+            const int r = warp + q * kGateWarps;
+            const bool in = r < R && c < C;
+            vf[q] = in ? __ldg(F + (size_t) r * C + c) : 0.0f;
+            vg[q] = in ? __ldg(G + (size_t) r * C + c) : 0.0f;
+        }
+#pragma unroll
+        for (int q = 0; q < kGateRows; ++q) {
+            const int r = warp + q * kGateWarps;
+            if (r < R) sF[r * kGateCh + lane] = vf[q], sG[r * kGateCh + lane] = vg[q];
+        }
+    }
+    for (int i = tid; i < nt * R; i += kGateWarps * 32) {
+        const int tt = i / R, r = i - tt * R;
+        const float* o = sc + ((size_t) j * T + t0 + tt) * (2 * R + 2);
         const float rx = rsqrtf(o[2 * R] / (float) C + eps), rm = rsqrtf(o[2 * R + 1] / (float) C + eps);
-        sh_g[tid] = rx * o[2 * tid] + rm * o[2 * tid + 1];
+        sg[tt * R + r] = rx * o[2 * r] + rm * o[2 * r + 1];
     }
     __syncthreads();
-    const int c = (int) blockIdx.x * kBlk + tid;
-    if (c >= C) return;
-    const float* F = a.F[j];
-    const float* G = a.G[j];
+    if (warp >= nt || c >= C) return;
+    const float* g = sg + warp * R;
     float f = 0.0f, gn = 0.0f;
     for (int r = 0; r < R; ++r) {
-        const float gv = sh_g[r];
-        f += F[(size_t) r * C + c] * gv, gn += G[(size_t) r * C + c] * gv;
+        const float gv = g[r];
+        f += sF[r * kGateCh + lane] * gv, gn += sG[r * kGateCh + lane] * gv;
     }
-    const size_t i = (size_t) t * C + c;
+    const size_t i = (size_t) (t0 + warp) * C + c;
     a.y[j][i] = (1.0f - tanhf(f)) * a.x[j][i] + tanhf(gn) * a.m[j][i];
 }
 // ---- sampling: the largest logits found on the device - the host gets a thousand or two candidates and not the
@@ -5696,7 +5722,9 @@ void loop_gates(const LoopGate* gt, int n, int T, int C, int R, float eps, float
         a.x[j] = gt[j].x, a.m[j] = gt[j].m, a.D[j] = gt[j].D, a.F[j] = gt[j].F, a.G[j] = gt[j].G, a.y[j] = gt[j].y;
     loop_gate_dots_kernel<<<dim3((unsigned) R, (unsigned) n, (unsigned) T), 128, 0, s>>>(a, T, C, R, sc);
     check("loop_gates (dots)");
-    loop_gate_apply_kernel<<<dim3((unsigned) ((C + kBlk - 1) / kBlk), (unsigned) n, (unsigned) T), kBlk, 0, s>>>(
+    loop_gate_apply_kernel<<<dim3((unsigned) ((C + kGateCh - 1) / kGateCh), (unsigned) n,
+                                  (unsigned) ((T + kGateWarps - 1) / kGateWarps)),
+                             kGateWarps * 32, (size_t) R * (2 * kGateCh + kGateWarps) * sizeof(float), s>>>(
         a, T, C, R, eps, sc);
     check("loop_gates (apply)");
 }
