@@ -4066,6 +4066,7 @@ class Service:
             else:
                 prefill = CALL_START + (force if glm_calls else "\n" + (f"<function={force}>\n" if force else ""))
         if not prefill and not tools and getattr(self.template, "inkling", False) and \
+                kwargs.get("effort_name") != "minimal" and \
                 (kwargs.get("enable_thinking") is False or kwargs.get("reasoning_effort") == "none"):
             # Inkling 2 has no switch for its thinking, only its effort level - and at the lowest ("none": 0.0) it
             # still thinks a little.  With thinking off the prompt opens the answer's text segment itself, as the

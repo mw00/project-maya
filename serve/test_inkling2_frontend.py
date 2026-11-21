@@ -112,7 +112,7 @@ class Template(unittest.TestCase):
     def test_levels(self):
         # its own names reach it as they are; thinking off is its "none" (0); none named: its default, 0.9
         t = public()
-        for word, num in (("none", "0"), (False, "0"), ("off", "0"), ("minimal", "0"), ("low", "0.2"),
+        for word, num in (("none", "0"), (False, "0"), ("off", "0"), ("minimal", "0.1"), ("low", "0.2"),
                           ("medium", "0.7"), ("high", "0.9"), ("xhigh", "0.99"), ("max", "0.99"), ("auto", "0.9"),
                           (None, "0.9")):
             with self.subTest(word=word):

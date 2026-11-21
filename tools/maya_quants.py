@@ -53,7 +53,8 @@ MODEL_DEFAULTS = {
     # Inkling-2-Mini (the setup's Inkling 2, an experimental preview; model_key "ik2-mini"), its author's values (PR
     # #1095): thinkingmachines/Inkling-2-Mini's generation_config.json - temperature 1.0, top_p 1.0, no top-k, no
     # penalties; the level its template's own default, 0.9 - "high" by name (the page offers none / low / medium /
-    # high / max: its xhigh is max's 0.99, and the server reads a client's "minimal" as off, as for every model)
+    # high / max: its xhigh is max's 0.99; a client's "minimal" reaches its template as its own 0.1, where the server
+    # reads it as off for the other models)
     "ik2-mini": ({"temperature": 1.0, "top_p": 1.0}, "high"),
     # GLM-5.3 (744B, glm-dsa: model_key "glm53", serve/glm_dsa_product.py): zai-org/GLM-5.3's
     # generation_config.json and card - temperature 1.0, top_p 0.95 (no top-k, min-p or penalties); reasoning_effort
