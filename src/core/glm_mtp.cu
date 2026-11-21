@@ -838,10 +838,7 @@ bool Glm5Model::decode_mtp(maya::kernels::SamplerParams& sp, int64_t max_new, co
 bool Glm5Model::decode_spec_pipe(maya::kernels::SamplerParams& sp, int64_t max_new, const std::function<bool(int)>& emit,
                                  int64_t& produced, std::string& err) {
     produced = 0;
-    const bool on = [] {
-        const char* e = getenv("MAYA_GLM_SPEC_WIN");
-        return e != nullptr && std::atoi(e) != 0;
-    }();
+    const bool on = spec_win_mode() != 0;
     if (!on || split_next_ == nullptr || spec_tail_last()->mtp_il_ < 0) {
         err = "glm spec pipe: needs MAYA_GLM_SPEC_WIN and a split with the NextN block";
         return false;

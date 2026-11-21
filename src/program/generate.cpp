@@ -2473,9 +2473,8 @@ static int glm_pack_generate(const Options& o) {
             // no-drafting turn (spec_plain_turn, GLM-5.3 on 3+ GPUs)
             // MAYA_GLM_SPEC_WIN=1: the MTP drafts + the pipelined verify window through a split (decode_spec_pipe)
             int64_t n_spec = 0;
-            int spec_win = 0;
-            if (const char* e = getenv("MAYA_GLM_SPEC_WIN")) spec_win = std::atoi(e) != 0;
-            const bool piped = spec_win != 0;
+            // (unset: on for a split of three or more Volta GPUs - Glm5Model::spec_win_mode)
+            const bool piped = model.spec_win_mode() != 0;
             maya::core::glmng::set_history(&model, prompt);   // glm-dsa B14.13 (no-op unless MAYA_GLM_NGRAM_DRAFT)
             const bool done_ok = piped ? model.decode_spec_pipe(sp, max_new, on_token, n_spec, err)
                                        : model.decode_spec(sp, max_new, on_token, n_spec, err);
@@ -3339,10 +3338,7 @@ static int glm_pack_generate(const Options& o) {
             std::none_of(gens.begin(), gens.end(), [](const std::unique_ptr<Gen>& p) { return p->ready && !p->done; }))
             flush_pauses();
         Gen* only = gens.size() == 1 ? gens[0].get() : nullptr;
-        static const bool spec_win_env = [] {
-            const char* e = getenv("MAYA_GLM_SPEC_WIN");
-            return e != nullptr && std::atoi(e) != 0;
-        }();
+        static const bool spec_win_env = model.spec_win_mode() != 0;
         if (only != nullptr && !only->inflight && multi_spec && !step_no_spec && model.spec_ready() && spec_win_env) {
             Gen& g = *only;
             bind_ctx(g.ctx);

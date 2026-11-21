@@ -1204,8 +1204,7 @@ bool Glm5Model::fast_setup(std::string& err) {
     // the verify window's buffers and its own recurrent-state backup (the window commits restore/replay per part),
     // and the NextN block's part also the cache rows' buffers and the draft head; all before the pool takes the card
     if (!dflash_on_ && g_.nextn > 0) {
-        const char* swe = getenv("MAYA_GLM_SPEC_WIN");
-        if (swe != nullptr && std::atoi(swe) != 0) {
+        if (spec_win_mode() != 0) {
             if (!win_reserve(err) || !spec_kda_reserve(err)) return false;
             if (mtp_il_ >= 0 && l1_ == g_.n_layers) {
                 if (!mtp_cache_setup(err)) return false;
@@ -8060,6 +8059,26 @@ bool Glm5Model::spec_ready() const {
         last = m;
     }
     return last->mtp_il_ >= 0;
+}
+
+int Glm5Model::spec_win_mode() const {
+    const char* e = getenv("MAYA_GLM_SPEC_WIN");
+    if (e != nullptr && e[0] != '\0') return std::atoi(e) != 0 ? 1 : 0;
+#if defined(STRATA_USE_HIP)
+    return 0;
+#else
+    // (#235) a split of three or more parts decodes as two groups that take turns; the pipelined window keeps every
+    // part busy.  Volta only: every other GPU keeps the two-group decode and its tokens
+    if (g_.arch == GlmArch::GlmDsa || !g_.mhc() || n_parts_ < 3 || (int) split_devs_.size() != n_parts_) return 0;
+    for (const int d : split_devs_) {
+        int major = 0, minor = 0;
+        if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, d) != cudaSuccess ||
+            cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, d) != cudaSuccess || major != 7 ||
+            minor != 0)
+            return 0;
+    }
+    return 1;
+#endif
 }
 
 bool Glm5Model::spec_plain_turn() {
