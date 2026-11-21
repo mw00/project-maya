@@ -201,5 +201,93 @@ as an option); the drafter (`--draft`: 2.4-2.7 tokens a step, but verifying 8 co
 ## 7. Next
 
 1. Setup in `maya.py` (download, the RAM / VRAM check, the run config), as Hy4-Flash has.
-2. Several requests at once; the vision tower (unsloth's `mmproj`).
+2. Several requests at once; the vision tower inside the engine (pictures work through `maya-vision`: section 8).
 3. A Maya quant of the experts in the shape of DeepSeek XS (section 5), for 160 GB of host memory.
+
+## 8. Inkling-2-Mini: the looped model, whole on one 24 GB card
+
+[Inkling-2-Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini) (26 B, Apache 2.0) is the family's small
+model with a loop in it: 24 layers of weights, of which layers 6..17 run three times - 48 layer visits a token.
+Width 2304, 24 heads on 8 K / V heads (D 128), 128 experts a layer (8 a token, F 1152), a window of 1024 keys in all
+layers but 5, 11, 17 and 23, the same relative bias, sinks, clips, short convs and attention residuals (block 6).
+
+**The loop** (transformers PR #51050, llama.cpp PR #32695). Each pass of the core starts again from the stream and
+the block states the core was first given. A pass after the first reads the pass before it through four messages a
+layer - for q, k, v and the MoE - each an attention residual over the earlier pass's block states and its final
+stream (`loop_res_query`, `loop_kv_res_query`), let into the layer's input by a gate of rank 64:
+`(1 - tanh(F g)) x + tanh(G g) m`, `g = D [rms(x); rms(m)]`. The weights are a layer's; the KV cache and the conv
+histories are a visit's. `ref/inkling2.py` and `maya-ik2` keep a list of visits; with `num_loops` 1 it is the layers.
+
+**The file.** unsloth's Mini GGUFs are in the layout llama.cpp master reads (other tensor and key names, the convs
+not folded, gate and up merged into `ffn_gate_up_exps`); the reference and the engine read both layouts.
+UD-Q4_K_XL (17.6 GB) holds the experts of layers 0-19 in NVFP4 - their original bits - and those of layers 20-23
+and the dense weights in Q8_0. (UD-Q8_K_XL keeps layers 20-23's experts in BF16: not read here.)
+Against llama.cpp (b12590 with the Inkling 2 PRs) the reference agrees on 47 of 47 top-1 tokens, KL 2.5e-3; the
+engine against the reference on 45-46 of 47, KL 6e-3..7e-3 - near ties of the router, as section 6.1 found; with
+the messages left out the KL is 0.56.
+
+**Everything in VRAM: the resident token path.** The experts are 14.7 GiB, the dense weights 1.1 GiB as the GGUF's
+Q8_0 blocks (taken apart: the values and the scales each on their own, `mv_q8p`), so on a 24 GB card every expert
+stays in VRAM and a token needs nothing from the host between its embedding and its logits: an expert's blocks are
+found on the device (a table of pointers, `route_token`), the position is read on the device, no cuBLAS, no
+synchronisation - and a token's launches replay as one CUDA graph (`IK2_FAST`, `IK2_GRAPH`). The experts are copied
+to VRAM straight from the mapped files (a reload takes 3 s). What a token costs then is its weights' bytes (3.7 GB:
+half the experts', half the dense) and its launches - each 2 us and more whatever it does - so:
+
+- the short convs ride the products before them (`mv_q8p_conv`), the MoE's conv the experts' combine, the sinks
+  the clips' launch; a looped layer's q, k and v products are one launch (`MvAlt`), its three norms one, its four
+  messages one; the router's picks and their tables one (`route_token`): 1404 -> 781 launches a token;
+- the attention of a token runs on the tensor cores, a warp at a time straight from the cache into the registers
+  (`attn_decode_mma`: no shared memory, so sixteen and more warps an SM hide the memory's latency). It reads the
+  cache at the memory's speed - 846 GB/s FP16, 776 GB/s FP8 on an RTX 3090 - and an FP8 cache, half the bytes, is
+  the faster one deep in a context. Its bytes are made FP16 in the registers without a branch (`e4m3x4_h4`);
+- sampling takes its candidates from the device (`cand_topk`): a thousand logits and a few more instead of the
+  vocabulary's 200,058 every token.
+
+A prompt goes the cache path's way with every expert a hit; the attention's flash kernel reads an FP8 cache too
+(the tile's bytes by `cp.async`, FP16 of them in shared memory), and a looped layer's gates are cuBLAS products
+over a chunk.
+
+**Measured**, one RTX 3090 (24 GB, 300 W), UD-Q4_K_XL, tok/s:
+
+| | llama.cpp b12590 | `maya-ik2`, FP16 cache | FP8 cache |
+| --- | --- | --- | --- |
+| A token, 47 tokens deep | 57 | 112 | 110 |
+| 4,096 deep | | 106 | 107 |
+| 65,536 deep | | 84 | 91 |
+| 131,072 deep (context 262,144) | | | 81 |
+| A prompt of 4,096 / 65,536 tokens | 1052 / - | 2526 / 2499 | 2504 / 2387 |
+| Sampling at temperature 1 | | 110 | |
+
+**Context.** The eight visits of the layers without a window keep 32 KB a token in FP16, 16 KB in FP8. With an FP8
+cache every expert stays in VRAM up to `--max-context 352256` (text only; 22.3 GiB at 262,144), and 262,144 fits
+beside the image encoder. Past that the engine falls back to the cache path (64 tok/s). An FP8 cache is as far
+from the FP16 logits whichever kernels read it (KL 1.9e-3 on the tensor cores, 2.0e-3 scalar, over 199 forced
+tokens; FP16 on the tensor cores 2.2e-5) - but any two FP8 runs part within a few tokens: a difference of 1e-5
+flips codes of a 3-bit mantissa.
+
+**Pictures** go through `tools/vision`'s `maya-vision` built against a llama.cpp that has the Inkling 2 tower
+(`PROJECTOR_TYPE_INKLING2V`) and unsloth's `mmproj-BF16.gguf`: the server sends the encoder's rows with the request
+(`GENI`), the engine puts them in place of the image tokens (`--image-token`, 200054) without the embedding's norm.
+640 x 448 is 192 tokens and 22 ms.
+
+**The drafter** is left out: DSpark for Mini accepts 2.0-4.2 tokens a step (llama.cpp's implementation: prose 2.0,
+code 3.1, sums 4.2), and a window of eight - eight tokens' experts - pays for itself from about 3.3.
+
+To run it (one GPU):
+
+    python tools/strata_tokenizer.py --gguf Inkling-2-Mini-UD-Q4_K_XL.gguf --out ik2 \
+        --chat-template tools/ik2/chat_template.jinja --check
+    cat > ik2-mini.json <<EOF
+    {"exe": "build/maya-ik2", "args": ["--model", "Inkling-2-Mini-UD-Q4_K_XL.gguf", "--max-context", "262144"],
+     "env": {"IK2_KV": "fp8"}, "tokenizer": "ik2/tokenizer", "model_name": "inkling-2-mini",
+     "vision": {"exe": "build-vision/bin/maya-vision", "mmproj": "mmproj-BF16.gguf",
+                "model": "Inkling-2-Mini-UD-Q4_K_XL.gguf", "gpu": true, "resident": true}}
+    EOF
+    python serve/server.py --engine maya --config ik2-mini.json
+
+Thinking off (`reasoning_effort` `none`, `enable_thinking` false) has the prompt open the answer's text segment:
+the model has no switch for its thinking, only the effort level, and at the lowest it still thinks a little.
+
+Not done: two GPUs and the drafter with a loop (the engine refuses them), the loop in the layer-major prompt
+passes (`IK2_SUP`: off for a looped model), a second card for the KV cache (a million tokens is 16 GiB of it).
