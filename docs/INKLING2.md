@@ -141,7 +141,9 @@ expert on the CPU when that is sooner than its copy (NVFP4 experts, AVX-512).
 
 **Two GPUs** (`--gpus 2`, outside the preview of section 8: with `IK2_UNSUPPORTED=1`): `IK2_EP=1` deals each layer's experts to both by how often they are picked
 (`IK2_EP_SPLIT`, GPU 1's share), each GPU with its own cache and link; attention and the KV cache stay on GPU 0.
-Without it the layers are split between the GPUs.
+Without it the layers are split between the GPUs (`IK2_SPLIT`: where; half each by default), a chunk or a token
+through one GPU's layers and then the other's. Where each GPU holds its own layers' experts whole - Inkling-2-Mini
+on two 16 GB cards - they stay in VRAM and tokens take the resident path a GPU at a time (section 8, "Two GPUs").
 
 **Serving.** `--serve` speaks Maya's engine protocol (`serve/server.py`'s `StrataEngine`: `INFO`, `READY <ctx> stop`,
 `GEN`, `PP`, `T`, `DONE`, `STOP`), keeps the conversation's cache for its next turn, and ends a request at
@@ -328,7 +330,8 @@ the model has no switch for its thinking, only the effort level, and at the lowe
 (under `--serve` also as a `NOTE` the server prints): no NVIDIA GPU, a GPU older than sm_80 (a V100 cannot run it:
 the kernels use Ampere's `mma.sync` m16n8k16 and `cp.async`), a build with no kernels for the GPU's arch, less than
 22 GiB of VRAM, `--gpus 2` or more, Windows. `IK2_UNSUPPORTED=1` runs it anyway where it can run at all: two GPUs
-(`IK2_EP=1` or `IK2_TP=1`, section 6), smaller cards with the experts streamed from RAM, @cobra91's Windows / CUDA 13
+(the layers split between them - "Two GPUs" below - or `IK2_EP=1` / `IK2_TP=1`, section 6), smaller cards with the
+experts streamed from RAM, @cobra91's Windows / CUDA 13
 port - untested here. CMake skips `maya-ik2` without a CUDA arch of 80 or more in the list, in a HIP build, and on
 Windows unless `-DSTRATA_IK2_WINDOWS=ON`.
 
@@ -344,7 +347,32 @@ Thinking is the template's `reasoning_effort`, a name or a number in [0.0, 0.99]
 | `mmproj-BF16.gguf` (0.6 GB, pictures) | same | `2c165c78790e78a3f45a2d1e9e931083e52ee69d45ff2a0dc9c281fdf1a666e7` |
 | `mtp.safetensors` (0.6 GB, the drafter: optional) | [thinkingmachines/Inkling-2-Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini) | `7c3b651317f01f73bcf4e1dceba66ef8b7e1a1eac6bc171e882e690a4b10a1d2` |
 
-Outside the preview, two GPUs with a loop run as expert parallel (`IK2_EP=1`, its caches filled at the start:
-checked on Windows, an RTX 5080 with an RTX 4060 Ti); the drafter is one GPU's.  Not done: the loop in the layer-major prompt passes (`IK2_SUP`: off
+**Two GPUs** (outside the preview: `--gpus 2` with `IK2_UNSUPPORTED=1`). The layers are split between the cards
+(`IK2_SPLIT=b`: layers 0 .. b - 1 on GPU 0; half each by default). Where each card holds its own layers' experts
+beside their dense weights and KV caches - the engine prints the count for each GPU at the start - they all stay in
+VRAM and tokens take the resident path a GPU at a time (`IK2_FAST=0`: the cache path on both cards, as before). A
+token's 48 visits fall into runs, a run the consecutive visits one GPU holds: six when the split is inside the
+looped core (every pass crosses once and comes back for the next), two when it is not. Each run is a CUDA graph of
+its own on its GPU's stream. Between two runs the token's state crosses through pinned host memory, tens of KB: the
+stream and the block states, or, where the next run starts a later pass, the bank of the pass that ends (the GPU
+that ends a pass makes the bank and its own layers' messages from it; the GPU that starts the next kept the core's
+first stream and makes its layers' messages from the bank it is sent). The runs are chained with events, so the
+host waits once a token (`IK2_HOP=0`: after each run). `--draft` runs there too: the drafter, its taps and the head
+are the last layer's GPU's, a tap taken on the other card goes along with the hand-over, a verify window crosses as
+its rows (the block path, in the same runs), and the fit check counts the drafter and moves the split a layer or
+two to make room for it. Prompts go through `forward()`, a chunk through one GPU's layers and then the other's; a
+hop inside a later pass of the core carries the pass before's bank (without it the next GPU's core layers read a
+bank that was never filled, and the answers were wrong: #1107).
+
+Measured on Windows 11, two RTX 5070 Ti (16 GB each), CUDA 12.8, UD-Q4_K_XL, 262,144 tokens with an FP8 cache
+(10.4 + 12.8 GiB of VRAM in use; 11.7 + 13.7 with the drafter), through the server, greedy, new code: the cache
+path 54 tok/s, the resident split 136, with the drafter 147-259 by the text; at 218K tokens deep 33 and 84. The
+hand-over is exact - splits at layers 6, 9, 12, 14, 17, 18 and 20 write the same tokens, with graphs or without,
+with events or host waits - but the resident kernels round differently from the cache path's, as on one GPU:
+against it, greedy, code and lists came out the same and prose took other words at near-ties. `IK2_EP=1` is expert
+parallel instead (its caches filled at the start: checked on Windows, an RTX 5080 with an RTX 4060 Ti; 42 tok/s on
+the 5070 Tis).
+
+Not done: the loop in the layer-major prompt passes (`IK2_SUP`: off
 for a looped model), a second card for the KV cache (a million tokens is 16 GiB of it), the drafter's own launches
 as a graph (2-3 ms a step now).

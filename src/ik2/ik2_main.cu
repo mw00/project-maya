@@ -12,7 +12,8 @@
 //     experts tokens pick most (a profile written with IK2_POP_OUT).
 //   * Decode a token at a time; with IK2_CPU=1 a missing expert is computed on the CPU (AVX-512) when that is sooner
 //     than its copy.  Two GPUs (--gpus 2): IK2_EP=1 deals each layer's experts to both (expert parallel - each with its
-//     own cache and PCIe link), else the layers are split between them.
+//     own cache and PCIe link), else the layers are split between them (IK2_SPLIT) - and where each GPU holds its
+//     layers' experts, tokens take the resident path a GPU at a time (fast_split_init).
 //
 //   maya-ik2 --model FIRST-SHARD.gguf --serve [--max-context 262144] [--cache-gb 60] [--gpus 1] [--threads 8]
 //            [--eos a,b]
@@ -321,6 +322,10 @@ bool g_tp = false;
 cudaEvent_t g_tp_h[2];
 int g_tp_F = 0, g_tp_C = 0;
 inline bool dual() { return g_ep || g_tp; }
+// --gpus 2 without IK2_EP / IK2_TP: the layers split, 0 .. g_split_at - 1 on GPU 0 and the rest on GPU 1 (IK2_SPLIT).
+// g_split_fast: each GPU holds its own layers' experts, and tokens take the resident path a GPU at a time (fast_token).
+int g_split_at = -1;
+bool g_split_fast = false;
 // which GPU an expert belongs to, [n_layer * E]: IK2_EP_SPLIT = GPU 1's share of the picks (0.5; GPU 0 also holds the
 // attention, the dense weights and the KV cache). With IK2_WARM's profile each layer's experts are dealt by how often
 // they are picked, so the two GPUs' shares come out as asked; without it by a hash of the expert.
@@ -1114,6 +1119,7 @@ struct Work {
     // its three attention inputs before the messages.
     float *lp_pre = nullptr, *lp_bank = nullptr, *lp_msg = nullptr, *lp_in = nullptr;
     float* lp_msg_all = nullptr;   // a token's messages of a pass, every core layer's ([n_core][4][C]): one launch a pass
+    float* lp_query_all = nullptr; // (the layers split over GPUs: this GPU's copy of Model::lp_query_all)
     float* lp_g = nullptr;   // the message gates' scratch [3][Tm][2 rank + 2]
     float *lp_a = nullptr, *lp_f = nullptr;   // ... of a chunk's: [3][Tm][rank] and [2][Tm][C]
     float* logits_h = nullptr;   // the resident token path's logits, pinned [n_vocab]
@@ -1140,6 +1146,11 @@ extern "C" void on_usr1(int) { g_cancel = 1; }
 float* g_taps = nullptr;
 int g_taps_ld = 0, g_final_tap = 7;   // (the final normed hidden: tap 7, a looped model's 3)
 bool g_rec = false;
+// (the layers split over two GPUs: the drafter, g_taps and the head are the last layer's GPU's - g_draft_dev; a tap
+//  taken on the other GPU goes there through pinned memory, g_tap_h [taps][8][C], or by a peer copy in forward())
+int g_draft_dev = -1;
+float* g_tap_h = nullptr;
+float* g_embd_norm_d = nullptr;       // the embedding's norm on the drafter's GPU (embed_row)
 // the drafter's tap a visit's stream (at its start) is, or -1
 inline int draft_tap(const Config& c, int l, int vis) {
     if (c.n_pass == 1) return (l % 6 == 5 && l < c.n_layer - 1) ? l / 6 : -1;
@@ -1222,6 +1233,7 @@ struct DevCtx {
     cudaStream_t s = nullptr, cs = nullptr;
     cudaEvent_t ev = nullptr;
     cublasHandle_t blas = nullptr;
+    uint16_t* w16 = nullptr;   // (the dense weights as blocks over several GPUs: this GPU's g_w16)
     Work W{};
     ExpertCache EC;
 };
@@ -1235,6 +1247,7 @@ void use_dev(int d) {
     CU(cudaSetDevice(d));
     g_cur = d;
     g_s = g_dev[d].s, g_cs = g_dev[d].cs, g_ev = g_dev[d].ev, g_blas = g_dev[d].blas;
+    if (g_dev[d].w16) g_w16 = g_dev[d].w16;
 }
 
 // (kCand: sampling's candidates - the resident token path finds the largest logits on the device, g_cand; any other
@@ -1972,7 +1985,8 @@ void run_head(const Model& M, int T, bool all_logits, OutMode out_mode, int nb, 
 // embedding and its logits: no routing round trip a layer, no table upload.  The position is read on the device too
 // (W.pos), so a token's launches do not change from one token to the next and are replayed as one CUDA graph.  The
 // dense weights are the GGUF's blocks (IK2_DENSE=q8, the default when the experts fit), one product a launch.
-bool g_fast = false;        // set at load: every expert resident, one GPU, the dense weights as blocks (IK2_FAST=0: no)
+bool g_fast = false;        // set at load: every expert resident - one GPU, or two with the layers split, each holding
+                            // its layers' experts (g_split_fast) - and the dense weights as blocks (IK2_FAST=0: no)
 bool g_fast_want = false;
 bool g_graph = true;        // IK2_GRAPH=0: the resident path's launches one by one
 bool g_block = true;        // IK2_BLOCK=0: a verify window through forward() instead of the block path
@@ -1985,8 +1999,71 @@ struct FastGraph {
 };
 FastGraph g_fgraph[4];      // by OutMode
 
+// The layers split over two GPUs (g_split_fast): a token's visits in runs, a run the consecutive visits whose layers
+// one GPU holds.  A run's launches are fast_token_launches' for its visits; between two runs the token's state goes
+// through pinned host memory (g_hop_h: tens of KB) - the stream and the blocks so far, or, where the next run starts
+// a later pass of the looped core, the bank of the pass that ends (the GPU that ends a pass makes the bank and its own
+// layers' messages; the GPU that starts the next one has kept the core's first stream and the blocks before it, and
+// makes its layers' messages from the bank it is sent).
+struct FastSeg {
+    int v0 = 0, v1 = 0, dev = 0;          // visits [v0, v1) on GPU dev
+    int nb = 0, nb_pre = 0, n_bank = 0;   // the token's block count (and the core's bookkeeping) where the run starts
+    bool pos_up = false;                  // the GPU's first run of a token: the position goes up
+    unsigned taps_up = 0;                 // the drafter's taps (bits) the other GPU took since this one's last run
+};
+std::vector<FastSeg> g_segs;
+float* g_hop_h = nullptr;                 // pinned [1 + blocks][C]
+FastGraph g_sgraph[16][4];                // by run and OutMode (the last run's; the others' at [.][0])
+int g_hop_wait = 1;                       // IK2_HOP: 0 the host waits for a run before it starts the next,
+                                          // 1 (default) the runs chained with events: the host waits once a token
+cudaEvent_t g_hop_ev[16];
+// a run's launches handed to its GPU now: under Windows' WDDM the driver keeps a stream's commands in a batch until the
+// host asks about the stream, and the next run - the other GPU's - waits on this one's event (elsewhere a cheap query)
+inline void hop_flush(cudaStream_t s) {
+    const cudaError_t e = cudaStreamQuery(s);
+    if (e != cudaSuccess && e != cudaErrorNotReady) CU(e);
+}
+
+void fast_split_init(Model& M) {
+    const Config& c = M.c;
+    g_segs.clear();
+    int nb = 0, nb_pre = 0, n_bank = 0;
+    unsigned taps_wait = 0;
+    std::vector<char> seen(g_dev.size(), 0);
+    for (int vis = 0; vis < c.n_visit; ++vis) {
+        const int l = M.V[vis].l, d = M.L[l].dev;
+        if (g_segs.empty() || g_segs.back().dev != d) {
+            if (!g_segs.empty()) g_segs.back().v1 = vis;
+            FastSeg sg;
+            sg.v0 = vis, sg.dev = d, sg.nb = nb, sg.nb_pre = nb_pre, sg.n_bank = n_bank, sg.pos_up = !seen[d];
+            if (d == g_draft_dev) sg.taps_up = taps_wait, taps_wait = 0;
+            seen[d] = 1;
+            g_segs.push_back(sg);
+        }
+        if (g_taps && d != g_draft_dev && draft_tap(c, l, vis) >= 0) taps_wait |= 1u << draft_tap(c, l, vis);
+        if (c.n_pass > 1 && l == c.core0) {
+            if (M.V[vis].pass == 0) nb_pre = nb;
+            else n_bank = nb - nb_pre, nb = nb_pre;
+        }
+        if (l % c.block == 0) ++nb;
+    }
+    g_segs.back().v1 = c.n_visit;
+    if (g_segs.size() > 16) die("the resident path over GPUs: more than 16 runs a token");
+    if (taps_wait) die("the resident path over GPUs: the drafter is not on the last run's GPU");
+    // (a verify window's rows too: up to 8 tokens a hand-over)
+    CU(cudaHostAlloc(&g_hop_h, (size_t) (c.n_layer / c.block + 2) * ik2::draft::kBlock * c.C * 4,
+                     cudaHostAllocPortable));
+    g_hop_wait = getenv("IK2_HOP") ? std::atoi(getenv("IK2_HOP")) : 1;
+    for (size_t i = 0; i < g_segs.size(); ++i) {
+        CU(cudaSetDevice(g_segs[i].dev));
+        CU(cudaEventCreateWithFlags(&g_hop_ev[i], cudaEventDisableTiming));
+    }
+    CU(cudaSetDevice(g_cur));
+}
+
 // one token's launches: its embedding row in W.emb_h and its position in W.pos_h[0] (pinned host; copied first)
-void fast_token_launches(Model& M, Work& W, OutMode out_mode) {
+// (sg: one run of the split layers' token - null: every visit, one GPU)
+void fast_token_launches(Model& M, Work& W, OutMode out_mode, const FastSeg* sg = nullptr) {
     const Config& c = M.c;
     const int C = c.C, HD = c.H * c.D, KD = c.KV * c.D, HR = c.H * c.d_rel;
     const size_t Cb = (size_t) C * 4;
@@ -1994,12 +2071,29 @@ void fast_token_launches(Model& M, Work& W, OutMode out_mode) {
     const float k_scale = c.qk_clip <= 28.0f ? 16.0f : 1.0f, v_scale = 32.0f;
     // the attention's key splits: fixed, so that the launches are the same at every position
     const int P_sl = std::min(128, std::max(1, (c.window + 63) / 64)), P_full = 128;
-    CU(cudaMemcpyAsync(W.tmp, W.emb_h, Cb, cudaMemcpyHostToDevice, g_s));
-    k::rms(W.tmp, M.embd_norm, 1, C, c.eps, W.h, g_s);
-    CU(cudaMemcpyAsync(W.pos, W.pos_h, 4, cudaMemcpyHostToDevice, g_s));
+    const int v0 = sg ? sg->v0 : 0, v1 = sg ? sg->v1 : c.n_visit;
+    const float* lp_query_all = W.lp_query_all ? W.lp_query_all : M.lp_query_all;
     auto blk = [&](int i) { return W.blocks + (size_t) i * W.blk_ld * C; };
-    int nb = 0, nb_pre = 0, n_bank = 0;
-    for (int vis = 0; vis < c.n_visit; ++vis) {
+    int nb = sg ? sg->nb : 0, nb_pre = sg ? sg->nb_pre : 0, n_bank = sg ? sg->n_bank : 0;
+    // (a run that starts a later pass of the core: the bank arrives instead of the stream)
+    const bool bank_in = v0 > 0 && c.n_pass > 1 && M.V[v0].l == c.core0 && M.V[v0].pass > 0;
+    if (v0 == 0) {
+        CU(cudaMemcpyAsync(W.tmp, W.emb_h, Cb, cudaMemcpyHostToDevice, g_s));
+        k::rms(W.tmp, M.embd_norm, 1, C, c.eps, W.h, g_s);
+    } else if (bank_in) {
+        CU(cudaMemcpyAsync(W.lp_bank, g_hop_h, (size_t) (nb - nb_pre) * Cb, cudaMemcpyHostToDevice, g_s));
+    } else {   // the stream and the blocks so far, from the GPU before
+        CU(cudaMemcpyAsync(W.h, g_hop_h, Cb, cudaMemcpyHostToDevice, g_s));
+        for (int i = 0; i < nb; ++i)
+            CU(cudaMemcpyAsync(blk(i), g_hop_h + (size_t) (1 + i) * C, Cb, cudaMemcpyHostToDevice, g_s));
+    }
+    if (!sg || sg->pos_up) CU(cudaMemcpyAsync(W.pos, W.pos_h, 4, cudaMemcpyHostToDevice, g_s));
+    if (sg && g_taps)   // (the drafter's taps the other GPU took)
+        for (int t = 0; t <= g_final_tap; ++t)
+            if (sg->taps_up >> t & 1)
+                CU(cudaMemcpyAsync(g_taps + (size_t) t * g_taps_ld * C, g_tap_h + (size_t) t * ik2::draft::kBlock * C,
+                                   Cb, cudaMemcpyHostToDevice, g_s));
+    for (int vis = v0; vis < v1; ++vis) {
         const int l = M.V[vis].l;
         Layer& Ly = bind_visit(M, vis);
         // a looped core's passes (as forward()'s)
@@ -2009,24 +2103,31 @@ void fast_token_launches(Model& M, Work& W, OutMode out_mode) {
                 nb_pre = nb;
                 CU(cudaMemcpyAsync(W.lp_pre, W.h, Cb, cudaMemcpyDeviceToDevice, g_s));
             } else {
-                n_bank = 0;
-                for (int i = nb_pre + 1; i < nb; ++i, ++n_bank)
-                    CU(cudaMemcpyAsync(W.lp_bank + (size_t) n_bank * C, blk(i), Cb, cudaMemcpyDeviceToDevice, g_s));
-                CU(cudaMemcpyAsync(W.lp_bank + (size_t) n_bank * C, W.h, Cb, cudaMemcpyDeviceToDevice, g_s));
-                ++n_bank;
+                if (bank_in && vis == v0) {   // (the bank came from the GPU that ended the pass)
+                    n_bank = nb - nb_pre;
+                } else {
+                    n_bank = 0;
+                    for (int i = nb_pre + 1; i < nb; ++i, ++n_bank)
+                        CU(cudaMemcpyAsync(W.lp_bank + (size_t) n_bank * C, blk(i), Cb, cudaMemcpyDeviceToDevice, g_s));
+                    CU(cudaMemcpyAsync(W.lp_bank + (size_t) n_bank * C, W.h, Cb, cudaMemcpyDeviceToDevice, g_s));
+                    ++n_bank;
+                }
                 CU(cudaMemcpyAsync(W.h, W.lp_pre, Cb, cudaMemcpyDeviceToDevice, g_s));
                 nb = nb_pre;
                 // the pass's messages, every core layer's at once: the bank stays as it is until the pass ends, and a
                 // layer's launch of its own was 7 us on one SM (a job a block: the same sums, 24 launches less a token)
                 k::ResStates st{};
                 for (int i = 0; i < n_bank; ++i) st.st[i] = W.lp_bank + (size_t) i * C;
-                k::attn_res_jobs(st, n_bank, M.lp_query_all, 2, 2 * (c.core1 - c.core0), C, 1e-6f, W.lp_msg_all, g_s);
+                k::attn_res_jobs(st, n_bank, lp_query_all, 2, 2 * (c.core1 - c.core0), C, 1e-6f, W.lp_msg_all, g_s);
             }
         }
         if (M.V[vis].pass > 0) msg = W.lp_msg_all + (size_t) (l - c.core0) * 4 * C;   // (q, k | v, MoE)
         if (g_taps) {   // (the drafter's taps of the token: row 0)
             const int tap = draft_tap(c, l, vis);
-            if (tap >= 0)
+            if (tap >= 0 && sg && sg->dev != g_draft_dev)
+                CU(cudaMemcpyAsync(g_tap_h + (size_t) tap * ik2::draft::kBlock * C, W.h, Cb, cudaMemcpyDeviceToHost,
+                                   g_s));
+            else if (tap >= 0)
                 CU(cudaMemcpyAsync(g_taps + (size_t) tap * g_taps_ld * C, W.h, Cb, cudaMemcpyDeviceToDevice, g_s));
         }
         // the attention's inputs, normed, in F32: W.xq, W.xk, W.xv (sep: q, k and v each have their own)
@@ -2164,6 +2265,25 @@ void fast_token_launches(Model& M, Work& W, OutMode out_mode) {
         }
         k::moe_combine_conv(W.y32, W.inv, W.wt, c.K, C, Ly.h_mlp, Ly.sc_mlp, W.r, W.h, g_s);
     }
+    if (v1 < c.n_visit) {   // the run ends on this GPU: what the next one needs, to pinned host memory
+        if (c.n_pass > 1 && M.V[v1].l == c.core0 && M.V[v1].pass > 0) {
+            // (the next run starts a pass: this pass's bank, and this GPU's layers' messages of the next pass)
+            n_bank = 0;
+            for (int i = nb_pre + 1; i < nb; ++i, ++n_bank)
+                CU(cudaMemcpyAsync(W.lp_bank + (size_t) n_bank * C, blk(i), Cb, cudaMemcpyDeviceToDevice, g_s));
+            CU(cudaMemcpyAsync(W.lp_bank + (size_t) n_bank * C, W.h, Cb, cudaMemcpyDeviceToDevice, g_s));
+            ++n_bank;
+            k::ResStates st{};
+            for (int i = 0; i < n_bank; ++i) st.st[i] = W.lp_bank + (size_t) i * C;
+            k::attn_res_jobs(st, n_bank, lp_query_all, 2, 2 * (c.core1 - c.core0), C, 1e-6f, W.lp_msg_all, g_s);
+            CU(cudaMemcpyAsync(g_hop_h, W.lp_bank, (size_t) n_bank * Cb, cudaMemcpyDeviceToHost, g_s));
+        } else {
+            CU(cudaMemcpyAsync(g_hop_h, W.h, Cb, cudaMemcpyDeviceToHost, g_s));
+            for (int i = 0; i < nb; ++i)
+                CU(cudaMemcpyAsync(g_hop_h + (size_t) (1 + i) * C, blk(i), Cb, cudaMemcpyDeviceToHost, g_s));
+        }
+        return;
+    }
     if (out_mode == OutMode::kNone) return;
     {   // the head
         k::ResStates st{};
@@ -2189,15 +2309,22 @@ void fast_token_launches(Model& M, Work& W, OutMode out_mode) {
     }
 }
 
+void fast_split_runs(Model& M, int T, OutMode out_mode);   // (after the block path's launches, below)
+
 // one token through the resident path: its logits appended to logits_out (kLogits) or its argmax (kArgmax)
 void fast_token(Model& M, int tok, int pos, OutMode out_mode, std::vector<float>& logits_out,
                 std::vector<int>* argmax_out) {
     const Config& c = M.c;
-    Work& W = dev_work(0);
+    // (the layers split over the GPUs: the embedding goes to the first run's GPU, the head is the last run's)
+    const bool split = !g_segs.empty();
+    Work& W = dev_work(split ? g_segs.back().dev : 0);
     const size_t rb = (size_t) c.C / k::block_values(M.embd_type) * k::block_bytes(M.embd_type);
-    k::decode_host(M.embd_type, M.embd + (size_t) tok * rb, c.C, W.emb_h);
+    k::decode_host(M.embd_type, M.embd + (size_t) tok * rb, c.C, (split ? dev_work(g_segs[0].dev) : W).emb_h);
     W.pos_h[0] = pos;
-    if (!g_graph) {
+    if (split) {   // (each GPU reads the position at its first run of the token)
+        for (const FastSeg& sg : g_segs) dev_work(sg.dev).pos_h[0] = pos;
+        fast_split_runs(M, 0, out_mode);
+    } else if (!g_graph) {
         fast_token_launches(M, W, out_mode);
     } else {
         FastGraph& G = g_fgraph[(int) out_mode];
@@ -2246,24 +2373,23 @@ struct BlockBufs {
     int *cand_d = nullptr, *cand_h = nullptr;   // kCand: each row's k::cand_topk out, [kBlockMax][2 + 2 kCandCap]
 };
 BlockBufs g_blk;
+std::vector<BlockBufs> g_blk_dev;       // (the layers split over GPUs: a GPU's own device buffers; the pinned: g_blk's)
 FastGraph g_bgraph[kBlockMax + 1][4];   // by window size and OutMode
+FastGraph g_sbgraph[kBlockMax + 1][16][4];   // ... and run (the layers split over GPUs: the last run's by OutMode)
 
-void block_init(Model& M) {
-    if (g_blk.ready) return;
+// the block path's device buffers on the current GPU (dev >= 0: the records of that GPU's visits only)
+void block_dev_bufs(Model& M, BlockBufs& B, int dev) {
     const Config& c = M.c;
     const int C = c.C, KD = c.KV * c.D, S = kBlockMax * c.K;
-    CU(cudaHostAlloc(&g_blk.emb_h, (size_t) kBlockMax * C * 4, cudaHostAllocPortable));
-    CU(cudaHostAlloc(&g_blk.pos_h, (size_t) kBlockMax * 4, cudaHostAllocPortable));
-    CU(cudaHostAlloc(&g_blk.logits_h, (size_t) kBlockMax * c.n_vocab * 4, cudaHostAllocPortable));
-    CU(cudaHostAlloc(&g_blk.cand_h, (size_t) kBlockMax * (2 + 2 * kCandCap) * 4, cudaHostAllocPortable));
-    g_blk.cand_d = dalloc<int>((size_t) kBlockMax * (2 + 2 * kCandCap));
-    g_blk.blob = dalloc<const uint8_t*>(S);
-    g_blk.n = dalloc<int>(S), g_blk.inv = dalloc<int>(S);
-    g_blk.tok = dalloc<int>((size_t) S * k::kGroupMax), g_blk.row = dalloc<int>((size_t) S * k::kGroupMax);
-    g_blk.sg = dalloc<float>(S), g_blk.su = dalloc<float>(S), g_blk.wt = dalloc<float>(S);
-    if (c.n_pass > 1) g_blk.lp_msg = dalloc<float>((size_t) (c.core1 - c.core0) * 4 * kBlockMax * C);
+    B.cand_d = dalloc<int>((size_t) kBlockMax * (2 + 2 * kCandCap));
+    B.blob = dalloc<const uint8_t*>(S);
+    B.n = dalloc<int>(S), B.inv = dalloc<int>(S);
+    B.tok = dalloc<int>((size_t) S * k::kGroupMax), B.row = dalloc<int>((size_t) S * k::kGroupMax);
+    B.sg = dalloc<float>(S), B.su = dalloc<float>(S), B.wt = dalloc<float>(S);
+    if (c.n_pass > 1) B.lp_msg = dalloc<float>((size_t) (c.core1 - c.core0) * 4 * kBlockMax * C);
     std::vector<k::ConvRec> recs;
     for (auto& Vi : M.V) {
+        if (dev >= 0 && M.L[Vi.l].dev != dev) continue;
         float* hist[4] = {Vi.h_k, Vi.h_v, Vi.h_attn, Vi.h_mlp};
         const int cc[4] = {KD, KD, C, C};
         for (int i = 0; i < 4; ++i) {
@@ -2271,9 +2397,30 @@ void block_init(Model& M) {
             recs.push_back({Vi.rec_old[i], Vi.rec_x[i], hist[i], cc[i]});
         }
     }
-    g_blk.n_recs = (int) recs.size();
-    g_blk.recs = dalloc<k::ConvRec>(recs.size());
-    CU(cudaMemcpy(g_blk.recs, recs.data(), recs.size() * sizeof(k::ConvRec), cudaMemcpyHostToDevice));
+    B.n_recs = (int) recs.size();
+    B.recs = dalloc<k::ConvRec>(recs.size());
+    CU(cudaMemcpy(B.recs, recs.data(), recs.size() * sizeof(k::ConvRec), cudaMemcpyHostToDevice));
+}
+
+void block_init(Model& M) {
+    if (g_blk.ready) return;
+    const Config& c = M.c;
+    const int C = c.C;
+    CU(cudaHostAlloc(&g_blk.emb_h, (size_t) kBlockMax * C * 4, cudaHostAllocPortable));
+    CU(cudaHostAlloc(&g_blk.pos_h, (size_t) kBlockMax * 4, cudaHostAllocPortable));
+    CU(cudaHostAlloc(&g_blk.logits_h, (size_t) kBlockMax * c.n_vocab * 4, cudaHostAllocPortable));
+    CU(cudaHostAlloc(&g_blk.cand_h, (size_t) kBlockMax * (2 + 2 * kCandCap) * 4, cudaHostAllocPortable));
+    if (g_segs.empty()) {
+        block_dev_bufs(M, g_blk, -1);
+    } else {   // (the layers split over GPUs: a set a GPU)
+        const int back = g_cur;
+        g_blk_dev.resize(g_dev.size());
+        for (int d = 0; d < (int) g_dev.size(); ++d) {
+            use_dev(d);
+            block_dev_bufs(M, g_blk_dev[d], d);
+        }
+        use_dev(back);
+    }
     g_blk.ready = true;
 }
 
@@ -2283,18 +2430,37 @@ void tile_rows(const Mat& m, int r0, int n, const uint16_t* x16, int T, float* y
     k::q8_tile(m.q8 + (size_t) r0 * m.K, m.q8d + (size_t) r0 * (m.K >> 5), n, m.K, x16, T, y, ldy, g_s);
 }
 
-void fast_block_launches(Model& M, Work& W, int T, OutMode out_mode) {
+// (sg: one run of the split layers' window, as fast_token_launches' - null: every visit, one GPU)
+void fast_block_launches(Model& M, Work& W, int T, OutMode out_mode, const FastSeg* sg = nullptr) {
     const Config& c = M.c;
+    BlockBufs& B = sg ? g_blk_dev[sg->dev] : g_blk;   // (the device buffers; the pinned ones are g_blk's)
     const int C = c.C, HD = c.H * c.D, KD = c.KV * c.D, HR = c.H * c.d_rel, S = T * c.K;
     const size_t TC = (size_t) T * C, TCb = TC * 4;
     const float qk_scale = 1.0f / std::sqrt((float) c.D);
     const float k_scale = c.qk_clip <= 28.0f ? 16.0f : 1.0f, v_scale = 32.0f;
-    CU(cudaMemcpyAsync(W.tmp, g_blk.emb_h, TCb, cudaMemcpyHostToDevice, g_s));
-    k::rms(W.tmp, M.embd_norm, T, C, c.eps, W.h, g_s);
-    CU(cudaMemcpyAsync(W.pos, g_blk.pos_h, (size_t) T * 4, cudaMemcpyHostToDevice, g_s));
+    const int v0 = sg ? sg->v0 : 0, v1 = sg ? sg->v1 : c.n_visit;
+    const float* lp_query_all = W.lp_query_all ? W.lp_query_all : M.lp_query_all;
     auto blk = [&](int i) { return W.blocks + (size_t) i * W.blk_ld * C; };
-    int nb = 0, nb_pre = 0, n_bank = 0;
-    for (int vis = 0; vis < c.n_visit; ++vis) {
+    int nb = sg ? sg->nb : 0, nb_pre = sg ? sg->nb_pre : 0, n_bank = sg ? sg->n_bank : 0;
+    // (a run's hand-over as fast_token_launches': the stream and the blocks, or a pass's bank - T rows each)
+    const bool bank_in = v0 > 0 && c.n_pass > 1 && M.V[v0].l == c.core0 && M.V[v0].pass > 0;
+    if (v0 == 0) {
+        CU(cudaMemcpyAsync(W.tmp, g_blk.emb_h, TCb, cudaMemcpyHostToDevice, g_s));
+        k::rms(W.tmp, M.embd_norm, T, C, c.eps, W.h, g_s);
+    } else if (bank_in) {
+        CU(cudaMemcpyAsync(W.lp_bank, g_hop_h, (size_t) (nb - nb_pre) * TCb, cudaMemcpyHostToDevice, g_s));
+    } else {
+        CU(cudaMemcpyAsync(W.h, g_hop_h, TCb, cudaMemcpyHostToDevice, g_s));
+        for (int i = 0; i < nb; ++i)
+            CU(cudaMemcpyAsync(blk(i), g_hop_h + (size_t) (1 + i) * TC, TCb, cudaMemcpyHostToDevice, g_s));
+    }
+    if (!sg || sg->pos_up) CU(cudaMemcpyAsync(W.pos, g_blk.pos_h, (size_t) T * 4, cudaMemcpyHostToDevice, g_s));
+    if (sg && g_taps)
+        for (int t = 0; t <= g_final_tap; ++t)
+            if (sg->taps_up >> t & 1)
+                CU(cudaMemcpyAsync(g_taps + (size_t) t * g_taps_ld * C, g_tap_h + (size_t) t * ik2::draft::kBlock * C,
+                                   TCb, cudaMemcpyHostToDevice, g_s));
+    for (int vis = v0; vis < v1; ++vis) {
         const int l = M.V[vis].l;
         Layer& Ly = bind_visit(M, vis);
         const float* msg = nullptr;
@@ -2303,23 +2469,31 @@ void fast_block_launches(Model& M, Work& W, int T, OutMode out_mode) {
                 nb_pre = nb;
                 CU(cudaMemcpyAsync(W.lp_pre, W.h, TCb, cudaMemcpyDeviceToDevice, g_s));
             } else {
-                n_bank = 0;
-                for (int i = nb_pre + 1; i < nb; ++i, ++n_bank)
-                    CU(cudaMemcpyAsync(W.lp_bank + (size_t) n_bank * TC, blk(i), TCb, cudaMemcpyDeviceToDevice, g_s));
-                CU(cudaMemcpyAsync(W.lp_bank + (size_t) n_bank * TC, W.h, TCb, cudaMemcpyDeviceToDevice, g_s));
-                ++n_bank;
+                if (bank_in && vis == v0) {
+                    n_bank = nb - nb_pre;
+                } else {
+                    n_bank = 0;
+                    for (int i = nb_pre + 1; i < nb; ++i, ++n_bank)
+                        CU(cudaMemcpyAsync(W.lp_bank + (size_t) n_bank * TC, blk(i), TCb, cudaMemcpyDeviceToDevice,
+                                           g_s));
+                    CU(cudaMemcpyAsync(W.lp_bank + (size_t) n_bank * TC, W.h, TCb, cudaMemcpyDeviceToDevice, g_s));
+                    ++n_bank;
+                }
                 CU(cudaMemcpyAsync(W.h, W.lp_pre, TCb, cudaMemcpyDeviceToDevice, g_s));
                 nb = nb_pre;
                 k::ResStates st{};
                 for (int i = 0; i < n_bank; ++i) st.st[i] = W.lp_bank + (size_t) i * TC;
-                k::attn_res_jobs_block(st, n_bank, M.lp_query_all, 2, 2 * (c.core1 - c.core0), T, C, 1e-6f,
-                                       g_blk.lp_msg, g_s);
+                k::attn_res_jobs_block(st, n_bank, lp_query_all, 2, 2 * (c.core1 - c.core0), T, C, 1e-6f, B.lp_msg,
+                                       g_s);
             }
         }
-        if (M.V[vis].pass > 0) msg = g_blk.lp_msg + (size_t) (l - c.core0) * 4 * TC;   // [4][T][C]: q, k, v, MoE
+        if (M.V[vis].pass > 0) msg = B.lp_msg + (size_t) (l - c.core0) * 4 * TC;   // [4][T][C]: q, k, v, MoE
         if (g_taps) {
             const int tap = draft_tap(c, l, vis);
-            if (tap >= 0)
+            if (tap >= 0 && sg && sg->dev != g_draft_dev)
+                CU(cudaMemcpyAsync(g_tap_h + (size_t) tap * ik2::draft::kBlock * C, W.h, TCb, cudaMemcpyDeviceToHost,
+                                   g_s));
+            else if (tap >= 0)
                 CU(cudaMemcpyAsync(g_taps + (size_t) tap * g_taps_ld * C, W.h, TCb, cudaMemcpyDeviceToDevice, g_s));
         }
         float* x3[3] = {W.xq, W.xk, W.xv};
@@ -2432,29 +2606,47 @@ void fast_block_launches(Model& M, Work& W, int T, OutMode out_mode) {
         int* rtop = W.route_d;
         float* rw = (float*) (W.route_d + S);
         k::route_rows(W.rlog, Ly.probs_b, T, c.E, c.K, c.route_scale, rtop, rw, g_s);
-        k::group_route(rtop, rw, S, c.K, Ly.tab_blob, Ly.tab_sc[0], Ly.tab_sc[1], Ly.tab_sc[2], g_blk.blob, g_blk.n,
-                       g_blk.tok, g_blk.row, g_blk.sg, g_blk.su, g_blk.wt, g_blk.inv, g_s);
+        k::group_route(rtop, rw, S, c.K, Ly.tab_blob, Ly.tab_sc[0], Ly.tab_sc[1], Ly.tab_sc[2], B.blob, B.n,
+                       B.tok, B.row, B.sg, B.su, B.wt, B.inv, g_s);
         if (k::experts_mma_fits(Ly.ty[0], Ly.ty[1], Ly.ty[2], C, c.F)) {
             uint16_t* limbs = (uint16_t*) W.gu32;
             k::f16_limbs_rows(W.xq, T, C, limbs, g_s);
-            k::experts_block_gu(g_blk.blob, g_blk.n, g_blk.tok, g_blk.row, S, T, Ly.eb[0], C, c.F, limbs, g_blk.sg,
-                                g_blk.su, c.gate_cap, c.up_cap, W.h16, g_s);
-            k::experts_block_down(g_blk.blob, g_blk.n, g_blk.row, S, Ly.eb[0] + Ly.eb[1], C, c.F, W.h16, W.y32, g_s);
+            k::experts_block_gu(B.blob, B.n, B.tok, B.row, S, T, Ly.eb[0], C, c.F, limbs, B.sg,
+                                B.su, c.gate_cap, c.up_cap, W.h16, g_s);
+            k::experts_block_down(B.blob, B.n, B.row, S, Ly.eb[0] + Ly.eb[1], C, c.F, W.h16, W.y32, g_s);
         } else if (Ly.ty[0] == k::kQ8_0 && Ly.ty[1] == k::kQ8_0 && Ly.ty[2] == k::kQ8_0 && C % 32 == 0 && c.F % 32 == 0) {
             uint16_t* limbs = (uint16_t*) W.gu32;
             k::f16_limbs_rows(W.xq, T, C, limbs, g_s);
-            k::experts_block_gu_q8(g_blk.blob, g_blk.n, g_blk.tok, g_blk.row, S, T, Ly.eb[0], C, c.F, limbs, g_blk.sg,
-                                   g_blk.su, c.gate_cap, c.up_cap, W.h16, g_s);
-            k::experts_block_down_q8(g_blk.blob, g_blk.n, g_blk.row, S, Ly.eb[0] + Ly.eb[1], C, c.F, W.h16, W.y32, g_s);
+            k::experts_block_gu_q8(B.blob, B.n, B.tok, B.row, S, T, Ly.eb[0], C, c.F, limbs, B.sg,
+                                   B.su, c.gate_cap, c.up_cap, W.h16, g_s);
+            k::experts_block_down_q8(B.blob, B.n, B.row, S, Ly.eb[0] + Ly.eb[1], C, c.F, W.h16, W.y32, g_s);
         } else {
-            k::experts_gate_up_swiglu_g(g_blk.blob, g_blk.n, g_blk.tok, g_blk.row, S, Ly.ty[0], Ly.ty[1], Ly.eb[0], W.xq,
-                                        C, c.F, g_blk.sg, g_blk.su, c.gate_cap, c.up_cap, W.h16, g_s);
-            k::experts_down_g(g_blk.blob, g_blk.n, g_blk.row, S, Ly.ty[2], Ly.eb[0] + Ly.eb[1], W.h16, C, c.F, W.y32,
+            k::experts_gate_up_swiglu_g(B.blob, B.n, B.tok, B.row, S, Ly.ty[0], Ly.ty[1], Ly.eb[0], W.xq,
+                                        C, c.F, B.sg, B.su, c.gate_cap, c.up_cap, W.h16, g_s);
+            k::experts_down_g(B.blob, B.n, B.row, S, Ly.ty[2], Ly.eb[0] + Ly.eb[1], W.h16, C, c.F, W.y32,
                               g_s);
         }
-        k::moe_combine_f32(W.y32, g_blk.inv, g_blk.wt, T, c.K, C, W.tmp, false, g_s);
+        k::moe_combine_f32(W.y32, B.inv, B.wt, T, c.K, C, W.tmp, false, g_s);
         k::conv_block(W.tmp, C, Ly.h_mlp, Ly.sc_mlp, nullptr, 0, 0, T, C, W.r, C, W.h, C, Ly.rec_old[3], Ly.rec_x[3],
                       g_s);
+    }
+    if (v1 < c.n_visit) {   // the run ends on this GPU: what the next one needs, to pinned host memory
+        if (c.n_pass > 1 && M.V[v1].l == c.core0 && M.V[v1].pass > 0) {
+            n_bank = 0;
+            for (int i = nb_pre + 1; i < nb; ++i, ++n_bank)
+                CU(cudaMemcpyAsync(W.lp_bank + (size_t) n_bank * TC, blk(i), TCb, cudaMemcpyDeviceToDevice, g_s));
+            CU(cudaMemcpyAsync(W.lp_bank + (size_t) n_bank * TC, W.h, TCb, cudaMemcpyDeviceToDevice, g_s));
+            ++n_bank;
+            k::ResStates st{};
+            for (int i = 0; i < n_bank; ++i) st.st[i] = W.lp_bank + (size_t) i * TC;
+            k::attn_res_jobs_block(st, n_bank, lp_query_all, 2, 2 * (c.core1 - c.core0), T, C, 1e-6f, B.lp_msg, g_s);
+            CU(cudaMemcpyAsync(g_hop_h, W.lp_bank, (size_t) n_bank * TCb, cudaMemcpyDeviceToHost, g_s));
+        } else {
+            CU(cudaMemcpyAsync(g_hop_h, W.h, TCb, cudaMemcpyDeviceToHost, g_s));
+            for (int i = 0; i < nb; ++i)
+                CU(cudaMemcpyAsync(g_hop_h + (size_t) (1 + i) * TC, blk(i), TCb, cudaMemcpyDeviceToHost, g_s));
+        }
+        return;
     }
     if (out_mode == OutMode::kNone) return;
     {   // the head: every token's logits
@@ -2475,13 +2667,51 @@ void fast_block_launches(Model& M, Work& W, int T, OutMode out_mode) {
             k::softcap(W.logits, (size_t) T * c.n_rows, c.logit_cap, g_s);
             for (int t = 0; t < T; ++t)
                 k::cand_topk(W.logits + (size_t) t * c.n_rows, c.n_vocab, -c.logit_cap, c.logit_cap, kCandK, kCandCap,
-                             W.cand_part, g_blk.cand_d + t * cs, g_s);
-            CU(cudaMemcpyAsync(g_blk.cand_h, g_blk.cand_d, (size_t) T * cs * 4, cudaMemcpyDeviceToHost, g_s));
+                             W.cand_part, B.cand_d + t * cs, g_s);
+            CU(cudaMemcpyAsync(g_blk.cand_h, B.cand_d, (size_t) T * cs * 4, cudaMemcpyDeviceToHost, g_s));
         } else {
             k::softcap(W.logits, (size_t) T * c.n_rows, c.logit_cap, g_s);
             for (int t = 0; t < T; ++t)
                 CU(cudaMemcpyAsync(g_blk.logits_h + (size_t) t * c.n_vocab, W.logits + (size_t) t * c.n_rows,
                                    (size_t) c.n_vocab * 4, cudaMemcpyDeviceToHost, g_s));
+        }
+    }
+}
+
+// The layers split over the GPUs: the runs of a token (T = 0: fast_token_launches) or of a verify window's T tokens
+// (fast_block_launches), launched one GPU after the other, each run a CUDA graph of its own, recorded at its first
+// use.  With IK2_HOP=1 a run waits on the event of the run before - its hand-over is in pinned memory by then - and
+// the host goes on at once; the caller waits for the last run's stream.
+void fast_split_runs(Model& M, int T, OutMode out_mode) {
+    const int ns = (int) g_segs.size();
+    for (int i = 0; i < ns; ++i) {
+        const FastSeg& sg = g_segs[i];
+        use_dev(sg.dev);
+        Work& W = dev_work(sg.dev);
+        if (g_hop_wait && i > 0) CU(cudaStreamWaitEvent(g_s, g_hop_ev[i - 1], 0));
+        auto launches = [&] {
+            if (T) fast_block_launches(M, W, T, out_mode, &sg);
+            else fast_token_launches(M, W, out_mode, &sg);
+        };
+        if (!g_graph) {
+            launches();
+        } else {   // (a run before the last has no head: one graph for every OutMode, at [0])
+            FastGraph* by_mode = T ? g_sbgraph[T][i] : g_sgraph[i];
+            FastGraph& G = by_mode[i + 1 < ns ? 0 : (int) out_mode];
+            if (!G.exec) {
+                CU(cudaStreamBeginCapture(g_s, cudaStreamCaptureModeThreadLocal));
+                launches();
+                CU(cudaStreamEndCapture(g_s, &G.graph));
+                CU(cudaGraphInstantiate(&G.exec, G.graph, 0));
+            }
+            CU(cudaGraphLaunch(G.exec, g_s));
+        }
+        if (i + 1 == ns) break;
+        if (g_hop_wait) {
+            CU(cudaEventRecord(g_hop_ev[i], g_s));
+            hop_flush(g_s);
+        } else {
+            CU(cudaStreamSynchronize(g_s));
         }
     }
 }
@@ -2493,13 +2723,15 @@ void fast_block(Model& M, const int* tok, int T, int pos0, OutMode out_mode, std
     const Config& c = M.c;
     if (T < 1 || T > kBlockMax) die("fast_block: a window of 1 .. 8 tokens");
     if (!g_blk.ready) block_init(M);
-    Work& W = dev_work(0);
+    Work& W = dev_work(g_segs.empty() ? 0 : g_segs.back().dev);
     const size_t rb = (size_t) c.C / k::block_values(M.embd_type) * k::block_bytes(M.embd_type);
     for (int t = 0; t < T; ++t) {
         k::decode_host(M.embd_type, M.embd + (size_t) tok[t] * rb, c.C, g_blk.emb_h + (size_t) t * c.C);
         g_blk.pos_h[t] = pos0 + t;
     }
-    if (!g_graph) {
+    if (!g_segs.empty()) {   // the layers split over the GPUs: a run a GPU, as fast_token's
+        fast_split_runs(M, T, out_mode);
+    } else if (!g_graph) {
         fast_block_launches(M, W, T, out_mode);
     } else {
         FastGraph& G = g_bgraph[T][(int) out_mode];
@@ -2530,7 +2762,16 @@ bool block_cands(const Model& M, int t, std::vector<std::pair<float, int>>& cd) 
 }
 // every conv's history as after the first n tokens of the last window (fast_block's records)
 void block_rollback(int n) {
-    k::rollback_block(g_blk.recs, g_blk.n_recs, n, g_s);
+    if (g_blk_dev.empty()) {
+        k::rollback_block(g_blk.recs, g_blk.n_recs, n, g_s);
+        return;
+    }
+    const int back = g_cur;   // (the layers split over GPUs: each GPU its visits')
+    for (int d = 0; d < (int) g_blk_dev.size(); ++d) {
+        use_dev(d);
+        k::rollback_block(g_blk_dev[d].recs, g_blk_dev[d].n_recs, n, g_s);
+    }
+    use_dev(back);
 }
 
 
@@ -2637,6 +2878,7 @@ void spec_step(Model& M, ik2::draft::Drafter* drafter, int anchor, int P, int B,
                const std::vector<int>& stops, std::vector<int>& next) {
     const Config& c = M.c;
     static float *raw = nullptr, *anchor_h = nullptr;
+    if (g_draft_dev >= 0) use_dev(g_draft_dev);   // (the layers split over GPUs: the drafter's)
     if (!raw) raw = dalloc<float>(c.C), anchor_h = dalloc<float>(c.C);
     embed_row(M, anchor, raw, anchor_h);
     int dr[kBlockMax];
@@ -2661,7 +2903,8 @@ void spec_step(Model& M, ik2::draft::Drafter* drafter, int anchor, int P, int B,
             std::vector<std::pair<float, int>> cd;
             if (!block_cands(M, j, cd)) {   // (more candidates than kept: the row's logits)
                 std::vector<float> row((size_t) c.n_vocab);
-                CU(cudaMemcpy(row.data(), dev_work(0).logits + (size_t) j * c.n_rows, (size_t) c.n_vocab * 4,
+                const Work& Wl = dev_work(g_segs.empty() ? 0 : g_segs.back().dev);   // (the head's GPU)
+                CU(cudaMemcpy(row.data(), Wl.logits + (size_t) j * c.n_rows, (size_t) c.n_vocab * 4,
                               cudaMemcpyDeviceToHost));
                 cd.resize(c.n_vocab);
                 for (int v = 0; v < c.n_vocab; ++v) cd[v] = {row[v], v};
@@ -2745,6 +2988,10 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
                 CU(cudaMemcpyPeer(Tn.blocks + (size_t) i * Tn.blk_ld * C, Ly.dev, F.blocks + (size_t) i * F.blk_ld * C,
                                   from, TC * 4));
             CU(cudaMemcpyPeer(Tn.pos, Ly.dev, F.pos, from, (size_t) T * 4));
+            // (a hop inside a later pass of a looped core: the pass before's bank goes along too - the core's layers
+            // on the next GPU read their messages from it, and that GPU's own bank was never filled: issue #1107)
+            if (c.n_pass > 1 && M.V[vis].pass > 0 && l != c.core0 && n_bank > 0)
+                CU(cudaMemcpyPeer(Tn.lp_bank, Ly.dev, F.lp_bank, from, (size_t) n_bank * TC * 4));
             use_dev(Ly.dev);
             Wp = &dev_work(g_cur);
             ECp = &dev_cache(g_cur);
@@ -2780,8 +3027,12 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
         // and 41, its mtp_config's target_layer_ids)
         if (g_taps) {
             const int tap = draft_tap(c, l, vis);
-            if (tap >= 0)
+            if (tap >= 0 && g_draft_dev >= 0 && g_cur != g_draft_dev) {   // (the layers split: the drafter's GPU)
+                CU(cudaStreamSynchronize(g_s));
+                CU(cudaMemcpyPeer(g_taps + (size_t) tap * g_taps_ld * C, g_draft_dev, W.h, g_cur, TC * 4));
+            } else if (tap >= 0) {
                 CU(cudaMemcpyAsync(g_taps + (size_t) tap * g_taps_ld * C, W.h, TC * 4, cudaMemcpyDeviceToDevice, g_s));
+            }
         }
         run_layer_attn(M, Ly, l, T, pos0, W.h, W.pos, nb, 0, W.r, W, msg);
         dump_f("blk." + std::to_string(vis) + ".attn_out", W.r, TC);
@@ -3538,12 +3789,15 @@ void forward_prefill_sup(Model& M, const int* tok, int T, int pos0, int sub_chun
 // every short conv's history as after the first n of the verify window's tokens
 void rollback(Model& M, int n) {
     const int C = M.c.C, KD = M.c.KV * M.c.D;
+    const int back = g_cur;
     for (int vis = 0; vis < (int) M.V.size(); ++vis) {
         Layer& Ly = bind_visit(M, vis);
+        if (g_draft_dev >= 0) use_dev(Ly.dev);   // (the layers split over GPUs)
         float* hist[4] = {Ly.h_k, Ly.h_v, Ly.h_attn, Ly.h_mlp};
         const int cc[4] = {KD, KD, C, C};
         for (int i = 0; i < 4; ++i) k::conv_hist_after(Ly.rec_old[i], Ly.rec_x[i], n, cc[i], hist[i], g_s);
     }
+    if (g_draft_dev >= 0) use_dev(back);
 }
 
 // the embedding row of token t, normed as the model's input, into out (device [C])
@@ -3553,7 +3807,7 @@ void embed_row(Model& M, int t, float* raw, float* out) {
     const size_t rb = (size_t) C / k::block_values(M.embd_type) * k::block_bytes(M.embd_type);
     k::decode_host(M.embd_type, M.embd + (size_t) t * rb, C, e);
     CU(cudaMemcpyAsync(raw, e, (size_t) C * 4, cudaMemcpyHostToDevice, g_s));
-    k::rms(raw, M.embd_norm, 1, C, M.c.eps, out, g_s);
+    k::rms(raw, g_embd_norm_d ? g_embd_norm_d : M.embd_norm, 1, C, M.c.eps, out, g_s);
 }
 
 }  // namespace
@@ -3578,7 +3832,8 @@ void check_preview(int n_gpu, bool serve) {
             "): the Inkling 2 preview runs on one NVIDIA GPU");
     if (n_gpu < 1 || n_gpu > 2) refuse("--gpus " + std::to_string(n_gpu) + ": the Inkling 2 preview runs on one GPU");
     if (n_gpu == 2 && !force)
-        refuse("--gpus 2: the Inkling 2 preview runs on one GPU, two (IK2_EP=1 or IK2_TP=1) are outside it" + run_anyway);
+        refuse("--gpus 2: the Inkling 2 preview runs on one GPU, two (the layers split between them, or IK2_EP=1 / "
+               "IK2_TP=1) are outside it" + run_anyway);
     for (int d = 0; d < std::min(n_gpu, nd); ++d) {
         cudaDeviceProp p{};
         CU(cudaGetDeviceProperties(&p, d));
@@ -3853,6 +4108,80 @@ int main(int argc, char** argv) {
                     exp_b / 1073741824.0, dense_b / 1073741824.0, kv_b / 1073741824.0, fr0 / 1073741824.0,
                     fits ? "every expert stays in VRAM" : "the experts in host memory, a cache of them in VRAM");
     }
+    // The layers split over two GPUs (not expert / tensor parallel): does each GPU hold its own layers' experts beside
+    // their dense weights (as blocks) and K / V caches?  Then the resident path runs there too, a token's visits in
+    // runs a GPU (fast_token: a CUDA graph a run, the stream handed from one GPU to the next).  IK2_FAST=0: as before.
+    // IK2_SPLIT=b: layers 0 .. b - 1 on GPU 0, the rest on GPU 1 (default: half each, as before - on either path).
+    const int split_half = (c.n_layer + 1) / 2;
+    const int split_env =
+        n_gpu == 2 && c.n_layer > 1 && getenv("IK2_SPLIT") ? std::clamp(std::atoi(getenv("IK2_SPLIT")), 1, c.n_layer - 1) : 0;
+    if (n_gpu == 2 && !dual()) g_split_at = split_env ? split_env : split_half;
+    if (n_gpu == 2 && !dual() && !g_pool && !(getenv("IK2_FAST") && !std::atoi(getenv("IK2_FAST")))) {
+        size_t usable[2] = {0, 0};
+        for (int d = 0; d < 2; ++d) {
+            size_t tot0 = 0;
+            CU(cudaSetDevice(d));
+            CU(cudaMemGetInfo(&usable[d], &tot0));
+#ifdef _WIN32
+            usable[d] = std::min(usable[d], (size_t) (tot0 * 0.93));   // (WDDM gives one process ~93% of a card)
+#endif
+        }
+        CU(cudaSetDevice(0));
+        // (--draft: the drafter is the head's GPU's - its weights, its context caches and scratch, the convs' records)
+        size_t draft_b = 0;
+        if (!draft_path.empty()) {
+            const int want = getenv("IK2_DRAFT_CTX") ? std::atoi(getenv("IK2_DRAFT_CTX")) : ctx;
+            draft_b = ((size_t) 3 << 28) + (size_t) std::min(ctx, std::max(want, 2048)) * 4864;
+        }
+        const size_t reserve = (size_t) 3 << 29;   // (the work buffers and room, as one GPU's)
+        // (... and beside the drafter 1 GiB more: at 262144 tokens the half-and-half split left the head's GPU 0.7 GiB
+        //  under what Windows gives a process, so the split moves two layers to GPU 0)
+        const size_t reserve_d = draft_b ? (size_t) 1 << 30 : 0;
+        auto fits_at = [&](int at, bool say) {
+            size_t exp_b[2] = {0, 0}, dense_b[2] = {0, 0}, kv_b[2] = {0, 0};
+            auto dev_of = [&](int l) { return l < at ? 0 : 1; };
+            for (const auto& kv : S.by_name) {
+                const auto& t = *kv.second.second;
+                if (!k::block_values((int) t.type) || t.name == "token_embd.weight") continue;
+                int d = t.name == "output.weight" ? 1 : 0;
+                if (t.name.compare(0, 4, "blk.") == 0) d = dev_of(std::atoi(t.name.c_str() + 4));
+                (t.name.find("_exps.weight") != std::string::npos ? exp_b : dense_b)[d] += tensor_bytes(t);
+            }
+            for (int l = 0; l < c.n_layer; ++l) {
+                const size_t cap = c.sliding[l] ? (size_t) std::min(ctx, c.window + std::max(chunk, ik2::draft::kBlock)) : (size_t) ctx;
+                kv_b[dev_of(l)] += (l >= c.core0 && l < c.core1 ? c.n_pass : 1) * cap * c.KV * c.D * (g_kv_fp8 ? 1 : 2) * 2;
+            }
+            bool fits = true;
+            for (int d = 0; d < 2; ++d) {
+                const size_t extra = d == 1 ? draft_b + reserve_d : 0;
+                const bool ok = exp_b[d] + dense_b[d] + kv_b[d] + extra + reserve <= usable[d] &&
+                                exp_b[d] <= (size_t) (cache_gb * 1073741824.0);
+                if (say)
+                    std::printf("GPU %d (layers %d .. %d): experts %.1f GiB, dense weights %.1f GiB as blocks, K / V cache "
+                                "%.1f GiB%s, %.1f GiB usable: %s\n",
+                                d, d ? at : 0, d ? c.n_layer - 1 : at - 1, exp_b[d] / 1073741824.0,
+                                dense_b[d] / 1073741824.0, kv_b[d] / 1073741824.0, extra ? ", the drafter" : "",
+                                usable[d] / 1073741824.0, ok ? "its experts stay in VRAM" : "does not fit");
+                fits = fits && ok;
+            }
+            return fits;
+        };
+        // (half the layers each; if that does not fit - the drafter beside the head - the split a layer or two over)
+        std::vector<int> tries = {split_half, split_half + 1, split_half - 1, split_half + 2, split_half - 2};
+        if (split_env) tries = {split_env};
+        int at = -1;
+        for (int t : tries)
+            if (at < 0 && t >= 1 && t < c.n_layer && fits_at(t, false)) at = t;
+        fits_at(at >= 0 ? at : tries[0], true);
+        if (at >= 0) {
+            g_split_at = at;
+            g_dense_q8 = true;
+            g_fast_want = g_split_fast = true;
+        } else {
+            std::printf("two GPUs: a GPU does not hold its layers' experts - the experts in host memory, a cache of "
+                        "them in VRAM on each\n");
+        }
+    }
 
     // the dense weights
     const double t_dense = now();
@@ -3911,7 +4240,7 @@ int main(int argc, char** argv) {
     for (int l = 0; l < c.n_layer; ++l) {
         Layer& Ly = M.L[l];
         const std::string b = "blk." + std::to_string(l) + ".";
-        Ly.dev = dual() ? 0 : l * n_gpu / c.n_layer;
+        Ly.dev = dual() ? 0 : g_split_at > 0 ? (l < g_split_at ? 0 : 1) : l * n_gpu / c.n_layer;
         use_dev(Ly.dev);
         Ly.sliding = c.sliding[l];
         auto sink_v = host_f32(S, b + "attn_sink_proj.weight", (size_t) c.H * C);
@@ -4080,7 +4409,17 @@ int main(int argc, char** argv) {
     M.out_w = load_mat(S, "output.weight", c.n_rows, (int) C);
     if (g_dense_q8) {   // (a layer's largest; the head's logits go a token at a time over its blocks)
         g_w16_n = (2 * HD + 2 * KD + (size_t) c.H * c.d_rel) * C;
-        g_w16 = dalloc<uint16_t>(g_w16_n);
+        if (g_split_fast) {   // (a GPU its own)
+            const int back = g_cur;
+            for (int d = 0; d < n_gpu; ++d) {
+                use_dev(d);
+                g_dev[d].w16 = dalloc<uint16_t>(g_w16_n);
+            }
+            g_cur = -1;       // (use_dev: g_w16 set again)
+            use_dev(back);
+        } else {
+            g_w16 = dalloc<uint16_t>(g_w16_n);
+        }
     }
     M.out_norm = load_f32(S, "output_norm.weight", C);
     M.out_res_score = load_f32(S, rw ? "output_res_query.weight" : "output_res_score.weight", C);
@@ -4289,7 +4628,11 @@ int main(int argc, char** argv) {
     ik2::draft::Drafter* drafter = nullptr;
     uint16_t* draft_head = M.out_w.f16;
     if (!draft_path.empty()) {
-        if (n_gpu != 1) die("--draft: one GPU only so far");
+        if (n_gpu != 1 && !g_split_fast) die("--draft: one GPU, or two with their layers' experts resident (IK2_FAST)");
+        if (g_split_fast) {   // (the head's GPU: the last layer's)
+            g_draft_dev = M.L[c.n_layer - 1].dev;
+            use_dev(g_draft_dev);
+        }
         if (!draft_head && M.out_w.q8) {   // (a Q8_0 head: an FP16 copy for the drafter's base logits and its fold)
             const size_t n = (size_t) c.n_rows * c.C;
             draft_head = dalloc<uint16_t>(n);
@@ -4312,18 +4655,26 @@ int main(int argc, char** argv) {
         }
         g_taps_ld = std::max(chunk, ik2::draft::kBlock);
         g_taps = dalloc<float>((size_t) (g_final_tap + 1) * g_taps_ld * c.C);
+        if (g_split_fast) {
+            g_embd_norm_d = load_f32(S, "token_embd_norm.weight", C);
+            CU(cudaHostAlloc(&g_tap_h, (size_t) (g_final_tap + 1) * ik2::draft::kBlock * c.C * 4,
+                             cudaHostAllocPortable));
+        }
         for (auto& Vi : M.V) {
+            if (g_split_fast) use_dev(M.L[Vi.l].dev);   // (a visit's records beside its state)
             const size_t cc[4] = {KD, KD, C, C};
             for (int i = 0; i < 4; ++i) {
                 Vi.rec_old[i] = dalloc<float>(3 * cc[i]);
                 Vi.rec_x[i] = dalloc<float>((size_t) ik2::draft::kBlock * cc[i]);
             }
         }
+        if (g_split_fast) use_dev(g_draft_dev);
         std::printf("drafter: %s, %.2f GiB of VRAM, %.1f s\n", draft_path.c_str(),
                     ik2::draft::bytes(drafter) / 1073741824.0, now() - t0);
     }
 
     // the work buffers and the expert cache, a set a GPU
+    int split_fast_ok = 0;
     for (int d = 0; d < n_gpu; ++d) {
     use_dev(d);
     CU(cudaMemGetInfo(&fr, &tot));
@@ -4436,6 +4787,7 @@ int main(int argc, char** argv) {
         W.lp_bank = dalloc<float>((size_t) (n_core / c.block) * Tm * C);   // (the pass's blocks after its first, its final stream)
         W.lp_msg = dalloc<float>(4 * Tm * C);
         W.lp_msg_all = dalloc<float>((size_t) (c.core1 - c.core0) * 4 * C);
+        if (g_split_fast) W.lp_query_all = dev_f32(lp_all);
         W.lp_in = dalloc<float>(3 * Tm * C);
         W.lp_g = dalloc<float>(3 * Tm * (2 * (size_t) c.rank + 2));
         W.lp_a = dalloc<float>(3 * Tm * (size_t) c.rank);
@@ -4514,7 +4866,9 @@ int main(int argc, char** argv) {
             EC.misses = m0, EC.bytes_up = b0;
         }
     }
-    if (g_fast_want && d == 0) {   // the resident path: every expert in now, and where each is on the device
+    // the resident path: every expert in now, and where each is on the device
+    // (the layers split over the GPUs, g_split_fast: each GPU its own layers' experts and tables)
+    if (g_fast_want && (d == 0 || g_split_fast)) {
         auto blocks = [](const Mat& m) { return m.raw || m.q8; };   // (kept as the GGUF's blocks, whole or planar)
         bool all = !EC.pools.empty(), raw = blocks(M.out_w);
         for (const auto& P : EC.pools) all = all && P.n_active >= P.n_layers * c.E;
@@ -4526,10 +4880,12 @@ int main(int argc, char** argv) {
             int n = 0;
             for (int l = 0; l < c.n_layer; ++l)
                 for (int e = 0; e < c.E; ++e)
-                    if (!EC.has(l, e)) EC.get(M.L[l], l, e, EC.tick, g_cs, nullptr, true, true), ++n;
+                    if (EC.layer_pool[l] >= 0 && !EC.has(l, e))   // (-1: another GPU's layer)
+                        EC.get(M.L[l], l, e, EC.tick, g_cs, nullptr, true, true), ++n;
             CU(cudaStreamSynchronize(g_cs));
             ++EC.tick;
             for (int l = 0; l < c.n_layer; ++l) {
+                if (EC.layer_pool[l] < 0) continue;   // (another GPU's layer)
                 Layer& Ly = M.L[l];
                 const auto& P = EC.pools[EC.layer_pool[l]];
                 std::vector<const uint8_t*> tab(c.E);
@@ -4541,9 +4897,20 @@ int main(int argc, char** argv) {
                     if (!Ly.scale[r].empty()) Ly.tab_sc[r] = dev_f32(Ly.scale[r]);
             }
             EC.misses = m0, EC.bytes_up = b0;
-            g_fast = true;
-            std::printf("resident: every expert in VRAM (%d copied in %.1f s); tokens take the resident path%s\n", n,
-                        now() - tw, g_graph ? ", a CUDA graph each" : "");
+            if (!g_split_fast) {
+                g_fast = true;
+                std::printf("resident: every expert in VRAM (%d copied in %.1f s); tokens take the resident path%s\n", n,
+                            now() - tw, g_graph ? ", a CUDA graph each" : "");
+            } else {
+                ++split_fast_ok;
+                std::printf("resident, GPU %d: its layers' experts in VRAM (%d copied in %.1f s)\n", d, n, now() - tw);
+                if (d == n_gpu - 1 && split_fast_ok == n_gpu) {
+                    fast_split_init(M);
+                    g_fast = true;
+                    std::printf("resident: tokens take the resident path, %d runs over the %d GPUs%s\n",
+                                (int) g_segs.size(), n_gpu, g_graph ? ", a CUDA graph each" : "");
+                }
+            }
         } else {
             std::printf("resident path off: %s\n", all ? "a dense matrix is not kept as blocks" : "the cache does not hold every expert");
         }
@@ -5127,7 +5494,8 @@ int main(int argc, char** argv) {
                     100.0 * agree / std::max<size_t>(1, std::min<size_t>(force.size(), out.size())));
 
     SpecCtl ctl;
-    if (drafter && g_fast && g_block) {
+    // (IK2_BLOCK_CHECK=n: the loop below, its first n windows through both paths)
+    if (drafter && g_fast && g_block && !block_check) {
         // (the resident path: the controller picks plain tokens or a window; greedy, as the CLI's generation is)
         ctl.wmax = getenv("IK2_DRAFT_WIDTH") ? std::clamp(atoi(getenv("IK2_DRAFT_WIDTH")), 2, kBlockMax) : 5;
         ctl.adapt = !(getenv("IK2_DRAFT_ADAPT") && !atoi(getenv("IK2_DRAFT_ADAPT")));
