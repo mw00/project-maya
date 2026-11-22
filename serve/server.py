@@ -637,6 +637,16 @@ def think_stop_tables(tok) -> str:
     return f" think_stop={j(stop)} think_weak={j(weak)} think_dig={j(dig)}" if stop or weak else ""
 
 
+def openings_left(starts: list[list[int]], written: list[int]) -> list[list[int]] | None:
+    """GEN's starts= (the answer opens with one of these sequences: Service.prepare) for a later engine call of the
+    same answer, after its tokens `written`: what the sequences it still matches have left - None once one is written
+    whole, or none matches."""
+    n = len(written)
+    if any(q == written[:len(q)] for q in starts):
+        return None
+    return [q[n:] for q in starts if q[:n] == written and len(q) > n] or None
+
+
 def think_boundary(text: str) -> bool:
     """The reasoning so far (its last characters will do) ends a line or a sentence: a newline, or . ! ? after
     something other than a digit or another dot (not "3." of "3.0", not "..."), closing quotes or brackets allowed
@@ -1499,6 +1509,9 @@ class StrataEngine:
         bias = sampling.get("logit_bias")      # {id: bias}, checked by the handler (logit_bias_of)
         bias_key = (" logit_bias=" + ",".join(f"{int(i)}:{float(b):g}" for i, b in sorted(bias.items()))
                     if isinstance(bias, dict) and bias else "")
+        starts = sampling.get("_starts")      # (Service.prepare: the answer opens with one of these)
+        if starts:
+            bias_key += " starts=" + ";".join(",".join(str(int(i)) for i in q) for q in starts)
         penalty_keys = StrataEngine.penalty_keys(sampling)
         if isinstance(t, (int, float)) and not isinstance(t, bool) and float(t) <= 0.0:
             # temperature 0 is greedy: the engine reads temperature=0 as that whatever else the line says, and no other
@@ -3990,6 +4003,17 @@ class Service:
                 "ram": {"used_gib": scaled(hw.get("ram_used"), 2 ** 30, 1),
                         "total_gib": scaled(hw.get("ram_total"), 2 ** 30, 1)} if hw.get("ram_total") else None}}
 
+    def _call_openings(self, tools) -> list[list[int]] | None:
+        """Inkling 2, a call to any tool: each tool's name and the call's segment as the model writes them after
+        <|message_model|> (GEN's starts=, the engine's choice among them); None where the engine does not read it."""
+        if (getattr(self.engine, "info", None) or {}).get("starts") != 1:
+            return None
+        seg = (getattr(self.tok, "special_tokens", None) or {}).get("<|content_invoke_tool_json|>")
+        names = [t.get("name") for t in tools or [] if isinstance(t, dict) and t.get("name")]
+        if seg is None or not names:
+            return None
+        return [self.tok.encode(n) + [seg] for n in names]
+
     def prepare(self, messages, tools, kwargs, max_new=None, cancel=None, guard=None):
         """-> (ids, thinking, max_new). An unset or non-positive max_new (some clients send -1) means "unlimited":
         the rest of the context.  A tool_choice that requires a call ("_force_tool": "" any, else the tool's name)
@@ -4021,7 +4045,7 @@ class Service:
             # default) - and its prompt is rendered at Max: run() may give it the long budget (think_budget_max,
             # asked_max).  It goes to run() with the request, as _think_resume does
             given["_think_max"] = True if own_level == "max" and self.template.think_level(kwargs) == "max" else None
-        prefill = ""
+        prefill, starts = "", None
         if force is not None and tools:
             # GLM's form opens with the tool's name, Qwen's with <function=NAME>, DeepSeek's DSML with its calls block
             glm_calls = "<arg_key>" in self.template.source
@@ -4033,6 +4057,11 @@ class Service:
                 # Inkling 2: a call is a model message of its own, <|message_model|>NAME<|content_invoke_tool_json|>
                 # {"name": .., "args": ..}: the prompt opens it; the parser reads it through InklingRewriter
                 prefill = "<|message_model|>" + (force + "<|content_invoke_tool_json|>" if force else "")
+                if not force:
+                    # any tool: the name comes first, so the prompt cannot open "a call" - only the model's message,
+                    # which the model may still go on with in words.  Where the engine reads starts= (maya-ik2), the
+                    # message opens with one of the tools' names and the call's segment, as the model picks
+                    starts = self._call_openings(tools)
             else:
                 prefill = CALL_START + (force if glm_calls else "\n" + (f"<function={force}>\n" if force else ""))
         if not prefill and not tools and getattr(self.template, "inkling", False) and \
@@ -4044,6 +4073,7 @@ class Service:
             kwargs = {**kwargs, "enable_thinking": False}
             prefill = "<|message_model|><|content_text|>"
         given["_prefill"] = prefill
+        given["_starts"] = starts
         if prefill and getattr(self.template, "hy4", False):
             # Hy4-flash: GLM's form under its own suffixed tags, inside its <tool_calls:..> wrapper.  The prompt gets
             # the opening as its template writes it; the parser reads it in GLM's spelling, as it reads the answer
@@ -4627,6 +4657,7 @@ class Service:
         of its own ends and the request's own sampling follows; or the answer ends there (LOOP_STOP).  Until then the
         engine calls and their sampling are the ones without it."""
         produced, cur, left, smp = [], list(ids), max_new, sampling
+        starts0 = (sampling or {}).get("_starts")       # (the answer's opening, Service.prepare: its first call's)
         segments = []                                   # each slice's DONE (engine.last), summed at the end
         sent = 0                                        # produced[:sent] went to the caller (the guard holds the rest)
         # the thinking budget closed at a sentence's or line's end (THINK_GRACE, #613): past `soft` tokens of
@@ -4637,6 +4668,8 @@ class Service:
         tail_text = ""
         while True:
             last0 = getattr(self.engine, "last", None)
+            if produced and starts0:   # (a later call - a fair slice, a restart - goes on after the opening)
+                smp = {**(smp or {}), "_starts": openings_left(starts0, produced)}
             smp_call, n_call = guard.sampling(smp, len(produced), left) if guard is not None else (smp, left)
             gen = self.engine.generate(cur, n_call, smp_call, cancel, embeddings=emb) if emb else \
                 self.engine.generate(cur, n_call, smp_call, cancel)
@@ -5459,8 +5492,8 @@ def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new,
                                         for c in calls]})
         messages += [{"role": "tool", "tool_call_id": c.id, "content": r} for c, r in zip(calls, results)]
         # a required tool call applies to the first answer only: after the tools ran, the model answers freely
-        kw = {k: v for k, v in kw.items() if k not in ("_force_tool", "_prefill", "_blocked")}
-        sampling = {k: v for k, v in (sampling or {}).items() if k != "_prefill"}
+        kw = {k: v for k, v in kw.items() if k not in ("_force_tool", "_prefill", "_blocked", "_starts")}
+        sampling = {k: v for k, v in (sampling or {}).items() if k not in ("_prefill", "_starts")}
         ids, thinking, max_new = svc.prepare(messages, tools, kw, max_req, guard=svc._loop_guard_on(sampling))
         sampling["_blocked"] = kw.get("_blocked")
         sampling["_think_resume"] = kw.get("_think_resume")
@@ -6269,7 +6302,7 @@ def make_handler(svc: Service):
             max_new = int(oreq.get("max_tokens") or 0)
             ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, guard=svc._loop_guard_on(oreq))
             if kw.get("_prefill"):
-                oreq = {**oreq, "_prefill": kw["_prefill"]}
+                oreq = {**oreq, "_prefill": kw["_prefill"], "_starts": kw.get("_starts")}
             oreq = {**oreq, "_blocked": kw.get("_blocked"), "_think_resume": kw.get("_think_resume"),
                     "_think_max": kw.get("_think_max")}         # (GLM-5.3: Max's long budget, Service.asked_max)
             cancel = threading.Event()
@@ -7137,6 +7170,7 @@ def make_handler(svc: Service):
                                                      guard=svc._loop_guard_on(sampling))
                 if kw.get("_prefill"):
                     sampling["_prefill"] = kw["_prefill"]
+                    sampling["_starts"] = kw.get("_starts")
                 sampling["_blocked"] = kw.get("_blocked")
                 sampling["_think_resume"] = kw.get("_think_resume")
                 sampling["_think_max"] = kw.get("_think_max")          # (GLM-5.3: Max's long budget, Service.asked_max)
@@ -7174,7 +7208,7 @@ def make_handler(svc: Service):
             ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, guard=svc._loop_guard_on(req))
             turn_mark("prepared")
             if kw.get("_prefill"):                             # a required tool call starts the answer
-                req = {**req, "_prefill": kw["_prefill"]}
+                req = {**req, "_prefill": kw["_prefill"], "_starts": kw.get("_starts")}
             req = {**req, "_blocked": kw.get("_blocked")}      # calls the loop guard blocks (Service.prepare)
             req = {**req, "_think_resume": kw.get("_think_resume")}
             req = {**req, "_think_max": kw.get("_think_max")}          # (GLM-5.3: Max's long budget, Service.asked_max)
@@ -7272,7 +7306,7 @@ def make_handler(svc: Service):
             max_new = int(req.get("max_tokens") or 0)                  # 0/-1: the rest of the context
             ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, guard=svc._loop_guard_on(req))
             if kw.get("_prefill"):                             # a required tool call starts the answer
-                req = {**req, "_prefill": kw["_prefill"]}
+                req = {**req, "_prefill": kw["_prefill"], "_starts": kw.get("_starts")}
             req = {**req, "_blocked": kw.get("_blocked")}      # calls the loop guard blocks (Service.prepare)
             req = {**req, "_think_resume": kw.get("_think_resume")}
             req = {**req, "_think_max": kw.get("_think_max")}          # (GLM-5.3: Max's long budget, Service.asked_max)
