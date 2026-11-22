@@ -399,6 +399,8 @@ bool Glm5Model::load_pack_tp(const std::string& pack_dir, int64_t max_ctx, const
             err = std::string("glm tp: ") + off + " is not covered by tensor parallel yet";
             return false;
         }
+    // GLM-5.3-Flash's geometry is read by load_pack, after this point: the plan needs it first
+    if (!glm_pack_geometry_full(pack_dir, g_, err)) return false;
     std::vector<TpSlice> plan;
     if (!tp_plan(pack_dir, n, plan, err)) return false;
     auto* G = new GlmTpGroup();
