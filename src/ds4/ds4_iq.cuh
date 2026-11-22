@@ -167,6 +167,11 @@ bool mv(const MvJob* jobs, int n, cudaStream_t s);
 /// xq + h xq_stride, xd + h xd_stride, y + h y_stride; each row's sums as mv's.  false: a type or size mv refuses.
 bool mv_heads(const MvJob& b, int H, size_t w_stride, size_t xq_stride, size_t xd_stride, size_t y_stride,
               cudaStream_t s);
+/// (tests) mv_heads's short-row form (MAYA_IQ_MV_RW: rows of at most 16 sub-blocks packed 2 or 4 a warp, the same
+/// bits): 1 / 0 on / off whatever the environment, -1 back to MAYA_IQ_MV_RW (default: on with gfx1100)
+void set_mv_rows(int on);
+/// (tests) whether mv_heads packs short rows on the current GPU now (set_mv_rows, else MAYA_IQ_MV_RW, else gfx1100)
+bool mv_rows_on();
 
 /// (tests) every value of n rows of k (rows row_bytes(type, k) apart, on the device) as the kernels decode them: sub =
 /// the token / window / light kernels' codes times their scales (d s q - m; IQ1_M through the persistent kernels'
