@@ -242,11 +242,12 @@ void experts_gate_up(const uint8_t* const* blob, const int* tok, int S, int ty_g
 void to_f16_limbs(const float* x, size_t n, uint16_t* y, cudaStream_t s);
 bool experts_mma_fits(int ty_gate, int ty_up, int ty_down, int C, int F);
 void experts_gate_up_swiglu_mma(const uint8_t* const* blob, int S, size_t eb0, const uint16_t* x16, int C, int F,
-                                const float* sg, const float* su, float gcap, float ucap, uint16_t* h, cudaStream_t s);
+                                const float* sg, const float* su, float gcap, float ucap, uint16_t* h, cudaStream_t s,
+                                const int* cls = nullptr, int want = 0);
 void experts_down_mma(const uint8_t* const* blob, int S, size_t off_down, const uint16_t* h, int C, int F, float* y,
-                      cudaStream_t s);
+                      cudaStream_t s, const int* cls = nullptr, int want = 0);
 void experts_down(const uint8_t* const* blob, int S, int ty_down, size_t off_down, const uint16_t* h, int C, int F,
-                  float* y, cudaStream_t s);
+                  float* y, cudaStream_t s, const int* cls = nullptr, int want = 0);
 
 /// y [N] = W [N][K] . x [K] for a dense matrix as the GGUF holds it (rows of `type` blocks: Q8_0, NVFP4, Q5_K, Q6_K),
 /// a warp a row in a fixed order - one token's products, half the bytes of an FP16 copy for Q8_0.  K <= 8192.
@@ -263,7 +264,7 @@ void experts_down_g(const uint8_t* const* blob, const int* n, const int* row, in
 /// indexed by row[g*8+t]).  sg, su may be null (scale 1).
 void experts_gate_up_swiglu(const uint8_t* const* blob, const int* tok, int S, int ty_gate, int ty_up, size_t eb0,
                             const float* x, int C, int F, const float* sg, const float* su, float gcap, float ucap,
-                            uint16_t* h, cudaStream_t s);
+                            uint16_t* h, cudaStream_t s, const int* cls = nullptr, int want = 0);
 /// experts_gate_up_swiglu with slot s's F outputs written at h + orow[s] * h_ld (orow null: s; h_ld 0: F) - a tensor-
 /// parallel GPU's half of every row of a wider h
 void experts_gate_up_swiglu_rows(const uint8_t* const* blob, const int* tok, int S, int ty_gate, int ty_up,

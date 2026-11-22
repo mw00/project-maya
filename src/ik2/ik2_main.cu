@@ -450,6 +450,7 @@ bool g_kv_q4 = false;
 bool g_kv_stream = false;
 int g_kv_vram_mb = 64;
 bool g_off_dynamic = false; // IK2_OFF_DYNAMIC=1: GPU-side dynamic Clock-LFU expert cache inside token CUDA graph
+int g_split_mode = 1;       // IK2_SPLIT: 0 the old sequential path, 1 fork+split, 2 fork, GEMMs unsplit (tests)
 // Q8_0 blocks (2 bytes of FP16 scale, 32 int8 values) taken apart into m.q8 / m.q8d on the device; false if the
 // matrix cannot be kept so (another type, or K not a multiple of 128)
 bool upload_planar(Mat& m, const std::vector<const uint8_t*>& parts, const std::vector<size_t>& part_values) {
@@ -1902,6 +1903,7 @@ struct OffState {
     k::LaneCost cost_h{};               // (pinned host: what was last sent)
     k::LaneState* ls = nullptr;         // (device)
     int* cls = nullptr;                 // (device) [K]
+    int* cls_dyn = nullptr;             // (device) [K] the dynamic plan's split: 0 a resident pick, 1 a fetched one
     float* hx = nullptr;                // (device) [K][F] the exact lane's h
     k::LaneJob* job_d = nullptr;        // (the GPU's view of the mailboxes)
     k::LaneDone* done_d = nullptr;
@@ -2382,8 +2384,10 @@ int g_mma_split = 1;        // its blocks a K / V head (k::attn_decode_mma_block
 struct FastGraph {
     cudaGraph_t graph = nullptr;
     cudaGraphExec_t exec = nullptr;
+    std::vector<cudaEvent_t> ev;   // [2 * visit] the offload's split fork: the plan's, the copy stream's done
 };
 FastGraph g_fgraph[4];      // by OutMode
+std::vector<cudaEvent_t> g_cap_ev;   // the fork's events, a pair a visit (a graph's own; uncaptured: lazily made)
 int g_slot_cur = 0, g_fgraph_slot = 0;   // (--parallel: the conversation bound to the visits, the one g_fgraph holds)
 
 // ---- two GPUs (--gpus 2, the split): GPU 0 runs the offload path (the dense weights, the K / V cache, every prompt,
@@ -2465,6 +2469,10 @@ void two_take(const Model& M, Work& W) {
 // one token's launches: its embedding row in W.emb_h and its position in W.pos_h[0] (pinned host; copied first)
 void fast_token_launches(Model& M, Work& W, OutMode out_mode) {
     const Config& c = M.c;
+    if (g_off_dynamic && g_cap_ev.empty()) {   // (IK2_GRAPH=0: the fork's events, a pair a visit)
+        g_cap_ev.resize(2 * c.n_visit);
+        for (cudaEvent_t& e : g_cap_ev) CU(cudaEventCreateWithFlags(&e, cudaEventDisableTiming));
+    }
     const int C = c.C, HD = c.H * c.D, KD = c.KV * c.D, HR = c.H * c.d_rel;
     const size_t Cb = (size_t) C * 4;
     const float qk_scale = 1.0f / std::sqrt((float) c.D);
@@ -2754,24 +2762,59 @@ void fast_token_launches(Model& M, Work& W, OutMode out_mode) {
                 k::moe_combine_conv(W.y32, W.inv, W.wt, c.K, C, Ly.h_mlp, Ly.sc_mlp, W.r, W.h, g_s);
                 continue;
             }
+            const bool fork = g_off_dynamic && (g_split_mode == 1 || g_split_mode == 2);
             if (g_off_dynamic) {
                 const auto& dc = g_offs.dcache[g_dev[0].EC.layer_pool[l]];
                 k::off_cache_plan(W.blob, rtop, c.K, l * c.E, g_offs.host[l], Ly.slot_bytes, dc, g_offs.fl, g_offs.cnt,
-                                  g_offs.heat, g_s);
+                                  g_offs.heat, g_offs.cls_dyn, g_s);
+                if (fork) {   // the split: the copy stream fetches this visit's misses while the residents compute
+                    CU(cudaEventRecord(g_cap_ev[2 * vis], g_s));
+                    CU(cudaStreamWaitEvent(g_cs, g_cap_ev[2 * vis]));
+                    k::off_fetch_copy(g_offs.fl, Ly.slot_bytes, g_offs.blocks, g_cs);
+                    CU(cudaEventRecord(g_cap_ev[2 * vis + 1], g_cs));
+                } else {
+                    k::off_fetch_copy(g_offs.fl, Ly.slot_bytes, g_offs.blocks, g_s);
+                }
             } else {
                 k::off_fetch_plan(W.blob, rtop, c.K, l * c.E, g_offs.host[l], Ly.slot_bytes, st, g_offs.fl, g_offs.cnt,
                                   g_offs.heat, g_s);
+                k::off_fetch_copy(g_offs.fl, Ly.slot_bytes, g_offs.blocks, g_s);
             }
-            k::off_fetch_copy(g_offs.fl, Ly.slot_bytes, g_offs.blocks, g_s);
         }
+        const bool fork = g_off_dynamic && (g_split_mode == 1 || g_split_mode == 2);
+        const int* cls_moe = g_off_dynamic && (g_split_mode == 1 || g_split_mode == 3) ? g_offs.cls_dyn : nullptr;   // (null: unsplit)
         if (exp_tc) {
-            k::experts_gate_up_swiglu_mma(W.blob, c.K, Ly.eb[0], (const uint16_t*) W.gu32, C, c.F, W.sg, W.su,
-                                          c.gate_cap, c.up_cap, W.h16, g_s);
-            k::experts_down_mma(W.blob, c.K, Ly.eb[0] + Ly.eb[1], W.h16, C, c.F, W.y32, g_s);
+            if (cls_moe) {   // the split: the residents' rows now, the copy fills the misses' slots meanwhile
+                k::experts_gate_up_swiglu_mma(W.blob, c.K, Ly.eb[0], (const uint16_t*) W.gu32, C, c.F, W.sg, W.su,
+                                              c.gate_cap, c.up_cap, W.h16, g_s, cls_moe, 0);
+                k::experts_down_mma(W.blob, c.K, Ly.eb[0] + Ly.eb[1], W.h16, C, c.F, W.y32, g_s, cls_moe, 0);
+            }
+            if (fork) CU(cudaStreamWaitEvent(g_s, g_cap_ev[2 * vis + 1]));   // the misses' slots are filled now
+            if (cls_moe) {   // the misses' rows, after the copy
+                k::experts_gate_up_swiglu_mma(W.blob, c.K, Ly.eb[0], (const uint16_t*) W.gu32, C, c.F, W.sg, W.su,
+                                              c.gate_cap, c.up_cap, W.h16, g_s, cls_moe, 1);
+                k::experts_down_mma(W.blob, c.K, Ly.eb[0] + Ly.eb[1], W.h16, C, c.F, W.y32, g_s, cls_moe, 1);
+            } else {   // unsplit: every row, after the join (mode 2) or after the sequential copy (mode 0)
+                k::experts_gate_up_swiglu_mma(W.blob, c.K, Ly.eb[0], (const uint16_t*) W.gu32, C, c.F, W.sg, W.su,
+                                              c.gate_cap, c.up_cap, W.h16, g_s, nullptr, 0);
+                k::experts_down_mma(W.blob, c.K, Ly.eb[0] + Ly.eb[1], W.h16, C, c.F, W.y32, g_s, nullptr, 0);
+            }
         } else {
-            k::experts_gate_up_swiglu(W.blob, W.tok, c.K, Ly.ty[0], Ly.ty[1], Ly.eb[0], W.xq, C, c.F, W.sg, W.su,
-                                      c.gate_cap, c.up_cap, W.h16, g_s);
-            k::experts_down(W.blob, c.K, Ly.ty[2], Ly.eb[0] + Ly.eb[1], W.h16, C, c.F, W.y32, g_s);
+            if (cls_moe) {   // the split: the residents' rows now, the copy fills the misses' slots meanwhile
+                k::experts_gate_up_swiglu(W.blob, W.tok, c.K, Ly.ty[0], Ly.ty[1], Ly.eb[0], W.xq, C, c.F, W.sg, W.su,
+                                          c.gate_cap, c.up_cap, W.h16, g_s, cls_moe, 0);
+                k::experts_down(W.blob, c.K, Ly.ty[2], Ly.eb[0] + Ly.eb[1], W.h16, C, c.F, W.y32, g_s, cls_moe, 0);
+            }
+            if (fork) CU(cudaStreamWaitEvent(g_s, g_cap_ev[2 * vis + 1]));   // the misses' slots are filled now
+            if (cls_moe) {   // the misses' rows, after the copy
+                k::experts_gate_up_swiglu(W.blob, W.tok, c.K, Ly.ty[0], Ly.ty[1], Ly.eb[0], W.xq, C, c.F, W.sg, W.su,
+                                          c.gate_cap, c.up_cap, W.h16, g_s, cls_moe, 1);
+                k::experts_down(W.blob, c.K, Ly.ty[2], Ly.eb[0] + Ly.eb[1], W.h16, C, c.F, W.y32, g_s, cls_moe, 1);
+            } else {   // unsplit: every row, after the join (mode 2) or after the sequential copy (mode 0)
+                k::experts_gate_up_swiglu(W.blob, W.tok, c.K, Ly.ty[0], Ly.ty[1], Ly.eb[0], W.xq, C, c.F, W.sg, W.su,
+                                          c.gate_cap, c.up_cap, W.h16, g_s, nullptr, 0);
+                k::experts_down(W.blob, c.K, Ly.ty[2], Ly.eb[0] + Ly.eb[1], W.h16, C, c.F, W.y32, g_s, nullptr, 0);
+            }
         }
         if (g_two.on) two_take(M, W);
         k::moe_combine_conv(W.y32, W.inv, W.wt, c.K, C, Ly.h_mlp, Ly.sc_mlp, W.r, W.h, g_s);
@@ -3362,6 +3405,11 @@ void fast_token(Model& M, int tok, int pos, OutMode out_mode, std::vector<float>
     } else {
         FastGraph& G = g_fgraph[(int) out_mode];
         if (!G.exec) {   // the first token of this kind: its launches recorded
+            if (G.ev.empty()) {   // the split fork's events, this graph's own pair a visit
+                G.ev.resize(2 * M.c.n_visit);
+                for (cudaEvent_t& e : G.ev) CU(cudaEventCreateWithFlags(&e, cudaEventDisableTiming));
+            }
+            g_cap_ev = G.ev;
             CU(cudaStreamBeginCapture(g_s, cudaStreamCaptureModeThreadLocal));
             fast_token_launches(M, W, out_mode);
             CU(cudaStreamEndCapture(g_s, &G.graph));
@@ -5867,6 +5915,7 @@ int main(int argc, char** argv) {
     // (half an FP16 copy's bytes, a token's products straight over them) and tokens take the resident path
     // (IK2_FAST=0: off; IK2_GRAPH=0: its launches one by one instead of a CUDA graph a token).
     g_graph = !(getenv("IK2_GRAPH") && !std::atoi(getenv("IK2_GRAPH")));
+    if (getenv("IK2_SPLIT")) g_split_mode = std::atoi(getenv("IK2_SPLIT"));
     g_block = !(getenv("IK2_BLOCK") && !std::atoi(getenv("IK2_BLOCK")));
     g_block_exact = !(getenv("IK2_BLOCK_EXACT") && !std::atoi(getenv("IK2_BLOCK_EXACT")));
     g_window_check = getenv("IK2_WINDOW_CHECK") ? std::atoi(getenv("IK2_WINDOW_CHECK")) : 0;
@@ -7153,6 +7202,7 @@ int main(int argc, char** argv) {
                 CU(cudaMemset(dc.hand, 0, sizeof(int)));
                 g_offs.dcache[p] = dc;
             }
+            g_offs.cls_dyn = dalloc<int>(k::kOffMaxK);
             std::printf("offload dynamic GPU cache: %d slots across %zu pools (max_freq=%d, ghost=%dx)\n",
                         EC.total_slots(), g_offs.dcache.size(), mf, gmult);
         }

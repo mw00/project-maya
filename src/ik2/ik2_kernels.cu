@@ -3475,10 +3475,12 @@ __device__ __forceinline__ NvStep nv_step_load(const uint8_t* a, const uint8_t* 
 template <bool Gate, int SPLIT>
 __global__ void __launch_bounds__(SPLIT * 32)
 experts_mma_kernel(const uint8_t* const* __restrict__ blob, size_t off, int C, int F, const uint16_t* __restrict__ x16,
-                   int x_ld, uint16_t* hidden, float* y, const float* sg, const float* su, float gcap, float ucap) {
+                   int x_ld, uint16_t* hidden, float* y, const float* sg, const float* su, float gcap, float ucap,
+                   const int* __restrict__ cls, int want) {
     __shared__ float2 part[SPLIT][8];
     const int lane = threadIdx.x & 31, split = threadIdx.x >> 5, g = lane >> 2, t = lane & 3, slot = blockIdx.y;
     if ((uintptr_t) blob[slot] <= 1u) return;   // (two GPUs: a pick the other GPU runs - k::kHeldElsewhere)
+    if (cls && cls[slot] != want) return;   // (the split: this row runs in the other launch)
     const int K = Gate ? C : F;
     const int r = blockIdx.x * (Gate ? 8 : 16) + g;
     const size_t rb = (size_t) (K / 64) * 36;
@@ -3556,11 +3558,13 @@ __device__ __forceinline__ void nv_word_h2(uint32_t w, uint32_t scale, uint32_t&
 template <bool Gate, int SPLIT>
 __global__ void __launch_bounds__(SPLIT * 32)
 experts_v70_kernel(const uint8_t* const* __restrict__ blob, size_t off, int C, int F, const uint16_t* __restrict__ x16,
-                   int x_ld, uint16_t* hidden, float* y, const float* sg, const float* su, float gcap, float ucap) {
+                   int x_ld, uint16_t* hidden, float* y, const float* sg, const float* su, float gcap, float ucap,
+                   const int* __restrict__ cls, int want) {
     __shared__ float2 part[SPLIT][8];
     const int lane = threadIdx.x & 31, split = threadIdx.x >> 5, j = lane & 3, hi = lane >> 4, qp = (lane >> 2) & 3;
     const int rr = j + 4 * hi, slot = blockIdx.y;
     if ((uintptr_t) blob[slot] <= 1u) return;   // (two GPUs: a pick the other GPU runs)
+    if (cls && cls[slot] != want) return;
     const int K = Gate ? C : F;
     const int r0 = blockIdx.x * (Gate ? 8 : 16);
     const size_t rb = (size_t) (K / 64) * 36;
@@ -3659,10 +3663,11 @@ template <int WARPS, int ROWS>
 __global__ void experts_gate_up_swiglu_kernel(const uint8_t* const* blob, const int* tok, int ty_gate, int ty_up,
                                               size_t eb0, const float* x, int C, int F, size_t rb_gate, size_t rb_up,
                                               const float* sg, const float* su, float gcap, float ucap, uint16_t* h,
-                                              const int* orow, int h_ld) {
+                                              const int* orow, int h_ld, const int* cls, int want) {
     extern __shared__ float xs[];
     const int s = blockIdx.y;
     if ((uintptr_t) blob[s] <= 1u) return;   // (two GPUs: a pick the other GPU runs)
+    if (cls && cls[s] != want) return;   // (the split: this row runs in the other launch)
     load_xs_f32(x + (size_t) tok[s] * C, C, xs);
     __syncthreads();
     const int warp = threadIdx.x >> 5;
@@ -3689,10 +3694,11 @@ __global__ void experts_gate_up_swiglu_kernel(const uint8_t* const* blob, const 
 
 template <int WARPS, int ROWS>
 __global__ void experts_down_kernel(const uint8_t* const* blob, int ty_down, size_t off_down, const uint16_t* h,
-                                    int C, int F, size_t rb_down, float* y) {
+                                    int C, int F, size_t rb_down, float* y, const int* cls, int want) {
     extern __shared__ float xs[];
     const int s = blockIdx.y;
     if ((uintptr_t) blob[s] <= 1u) return;   // (two GPUs: a pick the other GPU runs)
+    if (cls && cls[s] != want) return;   // (the split: this row runs in the other launch)
     load_xs_f16(h + (size_t) s * F, F, xs);
     __syncthreads();
     const int warp = threadIdx.x >> 5;
@@ -6619,10 +6625,10 @@ void launch_experts_gate_up(const uint8_t* const* blob, const int* tok, int S, i
 }
 template <int WARPS, int ROWS>
 void launch_experts_down(const uint8_t* const* blob, int S, int ty_down, size_t off_down, const uint16_t* h, int C,
-                         int F, float* y, cudaStream_t s) {
+                         int F, float* y, const int* cls, int want, cudaStream_t s) {
     const dim3 g((unsigned) ((C + WARPS * ROWS - 1) / (WARPS * ROWS)), (unsigned) S);
     experts_down_kernel<WARPS, ROWS><<<g, WARPS * 32, xp_floats(F) * 4, s>>>(
-        blob, ty_down, off_down, h, C, F, mv_row_bytes(ty_down, F), y);
+        blob, ty_down, off_down, h, C, F, mv_row_bytes(ty_down, F), y, cls, want);
 }
 
 bool experts_mma_fits(int ty_gate, int ty_up, int ty_down, int C, int F) {
@@ -6636,11 +6642,11 @@ static int experts_mma_split(bool gate) {
 template <bool Gate>
 static void launch_experts_mma(const uint8_t* const* blob, int S, size_t off, const uint16_t* x16, int x_ld, int C,
                                int F, const float* sg, const float* su, float gcap, float ucap, uint16_t* h, float* y,
-                               cudaStream_t s) {
+                               const int* cls, int want, cudaStream_t s) {
     const int w = experts_mma_split(Gate);
     const dim3 g((unsigned) (Gate ? F / 8 : C / 16), (unsigned) S);
     if (arch_class() == 70) {   // (Volta: mma.m8n8k4, the same rows and splits)
-#define IK2_V70_LAUNCH(W) experts_v70_kernel<Gate, W><<<g, W * 32, 0, s>>>(blob, off, C, F, x16, x_ld, h, y, sg, su, gcap, ucap)
+#define IK2_V70_LAUNCH(W) experts_v70_kernel<Gate, W><<<g, W * 32, 0, s>>>(blob, off, C, F, x16, x_ld, h, y, sg, su, gcap, ucap, cls, want)
         if (w == 1) IK2_V70_LAUNCH(1);
         else if (w == 2) IK2_V70_LAUNCH(2);
         else if (w == 3) IK2_V70_LAUNCH(3);
@@ -6650,7 +6656,7 @@ static void launch_experts_mma(const uint8_t* const* blob, int S, size_t off, co
 #undef IK2_V70_LAUNCH
         return;
     }
-#define IK2_MMA_LAUNCH(W) experts_mma_kernel<Gate, W><<<g, W * 32, 0, s>>>(blob, off, C, F, x16, x_ld, h, y, sg, su, gcap, ucap)
+#define IK2_MMA_LAUNCH(W) experts_mma_kernel<Gate, W><<<g, W * 32, 0, s>>>(blob, off, C, F, x16, x_ld, h, y, sg, su, gcap, ucap, cls, want)
     if (w == 1) IK2_MMA_LAUNCH(1);
     else if (w == 2) IK2_MMA_LAUNCH(2);
     else if (w == 3) IK2_MMA_LAUNCH(3);
@@ -6661,15 +6667,15 @@ static void launch_experts_mma(const uint8_t* const* blob, int S, size_t off, co
 }
 void experts_gate_up_swiglu_mma(const uint8_t* const* blob, int S, size_t eb0, const uint16_t* x16, int C, int F,
                                 const float* sg, const float* su, float gcap, float ucap, uint16_t* h,
-                                cudaStream_t s) {
+                                cudaStream_t s, const int* cls, int want) {
     if (S <= 0) return;
-    launch_experts_mma<true>(blob, S, eb0, x16, 0, C, F, sg, su, gcap, ucap, h, nullptr, s);
+    launch_experts_mma<true>(blob, S, eb0, x16, 0, C, F, sg, su, gcap, ucap, h, nullptr, cls, want, s);
     check("experts_gate_up_swiglu_mma");
 }
 void experts_down_mma(const uint8_t* const* blob, int S, size_t off_down, const uint16_t* h, int C, int F, float* y,
-                      cudaStream_t s) {
+                      cudaStream_t s, const int* cls, int want) {
     if (S <= 0) return;
-    launch_experts_mma<false>(blob, S, off_down, h, F, C, F, nullptr, nullptr, 0.0f, 0.0f, nullptr, y, s);
+    launch_experts_mma<false>(blob, S, off_down, h, F, C, F, nullptr, nullptr, 0.0f, 0.0f, nullptr, y, cls, want, s);
     check("experts_down_mma");
 }
 void experts_gate_up(const uint8_t* const* blob, const int* tok, int S, int ty_gate, int ty_up, size_t eb0,
@@ -6680,10 +6686,10 @@ void experts_gate_up(const uint8_t* const* blob, const int* tok, int S, int ty_g
     check("experts_gate_up");
 }
 void experts_down(const uint8_t* const* blob, int S, int ty_down, size_t off_down, const uint16_t* h, int C, int F,
-                  float* y, cudaStream_t s) {
+                  float* y, cudaStream_t s, const int* cls, int want) {
     if (S <= 0) return;
-    if (S <= 4) launch_experts_down<4, 2>(blob, S, ty_down, off_down, h, C, F, y, s);
-    else launch_experts_down<4, 4>(blob, S, ty_down, off_down, h, C, F, y, s);
+    if (S <= 4) launch_experts_down<4, 2>(blob, S, ty_down, off_down, h, C, F, y, cls, want, s);
+    else launch_experts_down<4, 4>(blob, S, ty_down, off_down, h, C, F, y, cls, want, s);
     check("experts_down");
 }
 void experts_gate_up_g(const uint8_t* const* blob, const int* n, const int* tok, const int* row, int G, int ty_gate,
@@ -6707,11 +6713,11 @@ template <int WARPS, int ROWS>
 void launch_experts_gate_up_swiglu(const uint8_t* const* blob, const int* tok, int S, int ty_gate, int ty_up,
                                    size_t eb0, const float* x, int C, int F, const float* sg, const float* su,
                                    float gcap, float ucap, uint16_t* h, cudaStream_t s, const int* orow = nullptr,
-                                   int h_ld = 0) {
+                                   int h_ld = 0, const int* cls = nullptr, int want = 0) {
     const dim3 g((unsigned) ((F + WARPS * ROWS - 1) / (WARPS * ROWS)), (unsigned) S);
     experts_gate_up_swiglu_kernel<WARPS, ROWS><<<g, WARPS * 32, xp_floats(C) * 4, s>>>(
         blob, tok, ty_gate, ty_up, eb0, x, C, F, mv_row_bytes(ty_gate, C), mv_row_bytes(ty_up, C), sg, su, gcap,
-        ucap, h, orow, h_ld > 0 ? h_ld : F);
+        ucap, h, orow, h_ld > 0 ? h_ld : F, cls, want);
 }
 
 void experts_gate_up_swiglu_rows(const uint8_t* const* blob, const int* tok, int S, int ty_gate, int ty_up,
@@ -6724,10 +6730,10 @@ void experts_gate_up_swiglu_rows(const uint8_t* const* blob, const int* tok, int
 }
 void experts_gate_up_swiglu(const uint8_t* const* blob, const int* tok, int S, int ty_gate, int ty_up, size_t eb0,
                             const float* x, int C, int F, const float* sg, const float* su, float gcap, float ucap,
-                            uint16_t* h, cudaStream_t s) {
+                            uint16_t* h, cudaStream_t s, const int* cls, int want) {
     if (S <= 0) return;
-    if (S <= 8) launch_experts_gate_up_swiglu<4, 2>(blob, tok, S, ty_gate, ty_up, eb0, x, C, F, sg, su, gcap, ucap, h, s);
-    else launch_experts_gate_up_swiglu<4, 4>(blob, tok, S, ty_gate, ty_up, eb0, x, C, F, sg, su, gcap, ucap, h, s);
+    if (S <= 8) launch_experts_gate_up_swiglu<4, 2>(blob, tok, S, ty_gate, ty_up, eb0, x, C, F, sg, su, gcap, ucap, h, s, nullptr, 0, cls, want);
+    else launch_experts_gate_up_swiglu<4, 4>(blob, tok, S, ty_gate, ty_up, eb0, x, C, F, sg, su, gcap, ucap, h, s, nullptr, 0, cls, want);
     check("experts_gate_up_swiglu");
 }
 

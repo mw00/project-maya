@@ -124,8 +124,9 @@ struct OffCache {
 
 /// Dynamic GPU-side cache lookup + Clock-LFU eviction + fetch list generation (one warp, zero host sync).
 /// Fills blob[0..K-1] with VRAM slot addresses and appends missed experts to fl for off_fetch_copy().
+/// cls (null: none) [K] gets 0 for a resident pick and 1 for a fetched one (the split's mask).
 void off_cache_plan(const uint8_t** blob, const int* top, int K, int key0, const uint8_t* host, size_t hstride,
-                    OffCache dc, OffFetch* fl, OffCount* cnt, uint32_t* heat, cudaStream_t s);
+                    OffCache dc, OffFetch* fl, OffCount* cnt, uint32_t* heat, int* cls, cudaStream_t s);
 
 
 }  // namespace ik2::k

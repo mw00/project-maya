@@ -414,7 +414,7 @@ static void test_off_cache_plan() {
 
     auto run_visit = [&](const int picks[K]) {
         CK(cudaMemcpy(d_top, picks, K * sizeof(int), cudaMemcpyHostToDevice));
-        ik2::k::off_cache_plan(d_blob, d_top, K, 0, (const uint8_t*) d_host_ptr, SB, dc, d_fl, d_cnt, nullptr, 0);
+        ik2::k::off_cache_plan(d_blob, d_top, K, 0, (const uint8_t*) d_host_ptr, SB, dc, d_fl, d_cnt, nullptr, nullptr, 0);
         ik2::k::off_fetch_copy(d_fl, SB, 4, 0);
         CK(cudaDeviceSynchronize());
         const uint8_t* h_blob[K];

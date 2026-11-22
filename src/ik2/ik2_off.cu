@@ -72,7 +72,7 @@ __global__ void off_fetch_plan_kernel(const uint8_t** blob, const int* __restric
 
 __global__ void off_cache_plan_kernel(const uint8_t** blob, const int* __restrict__ top, int K, int key0,
                                       const uint8_t* host, size_t hstride, OffCache dc, OffFetch* fl, OffCount* cnt,
-                                      uint32_t* heat) {
+                                      uint32_t* heat, int* cls) {
     const int lane = threadIdx.x;
     if (heat && lane < K) atomicAdd(heat + key0 + top[lane], 1u);
     if (lane != 0) return;
@@ -93,6 +93,7 @@ __global__ void off_cache_plan_kernel(const uint8_t** blob, const int* __restric
             const uint8_t f = dc.freq[s];
             if ((int) f < dc.max_freq) dc.freq[s] = (uint8_t) (f + 1u);
             blob[i] = dc.data + (size_t) s * dc.sb;
+            if (cls) cls[i] = 0;
             ++n_hit;
             continue;
         }
@@ -100,6 +101,7 @@ __global__ void off_cache_plan_kernel(const uint8_t** blob, const int* __restric
         s = dc.loc[key];
         if (s >= 0) {
             blob[i] = dc.data + (size_t) s * dc.sb;
+            if (cls) cls[i] = 1;   // (an earlier pick of this visit fetched it: its bytes arrive with the copy)
             ++n_hit;
             continue;
         }
@@ -138,6 +140,7 @@ __global__ void off_cache_plan_kernel(const uint8_t** blob, const int* __restric
         blob[i] = dst;
         fl->src[n_fetch] = host + (size_t) top[i] * hstride;
         fl->dst[n_fetch] = dst;
+        if (cls) cls[i] = 1;
         ++n_fetch;
     }
     fl->n = n_fetch;
@@ -408,8 +411,8 @@ void off_fetch_plan(const uint8_t** blob, const int* top, int K, int key0, const
 }
 
 void off_cache_plan(const uint8_t** blob, const int* top, int K, int key0, const uint8_t* host, size_t hstride,
-                    OffCache dc, OffFetch* fl, OffCount* cnt, uint32_t* heat, cudaStream_t s) {
-    off_cache_plan_kernel<<<1, 32, 0, s>>>(blob, top, K, key0, host, hstride, dc, fl, cnt, heat);
+                    OffCache dc, OffFetch* fl, OffCount* cnt, uint32_t* heat, int* cls, cudaStream_t s) {
+    off_cache_plan_kernel<<<1, 32, 0, s>>>(blob, top, K, key0, host, hstride, dc, fl, cnt, heat, cls);
 }
 
 void off_fetch_copy(const OffFetch* fl, size_t bytes, int blocks, cudaStream_t s) {
