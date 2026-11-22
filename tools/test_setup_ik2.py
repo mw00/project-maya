@@ -145,12 +145,14 @@ class Refusals(unittest.TestCase):
         cases = [
             ("metal", False, 0, [], "NVIDIA and AMD GPUs only"),
             ("hip", True, 0, [], "Linux only"),
-            ("hip", False, 2, [], "one GPU only"),
+            ("hip", False, 2, [], "on AMD runs on one GPU"),
             ("hip", False, 0, [amd("gfx1030", 16)], "RDNA 3, 3.5 or 4"),
             ("hip", False, 0, [amd("gfx1201", 16)], "24 GB of VRAM or more"),
             ("hip", False, 0, [amd("gfx1151", 0.5, unified_memory=True, memory_gb=20)], "24 GB of VRAM or more"),
-            ("cuda", True, 0, ok, "Linux only"),
-            ("cuda", False, 2, ok, "one GPU only"),
+            ("cuda", True, 2, ok, "two are Linux only"),
+            ("cuda", False, 3, ok, "one or two NVIDIA GPUs"),
+            ("cuda", False, 2, [card(24), card(6, 1, arch="86")], "8 GB of VRAM or more on each"),
+            ("cuda", True, 0, [card(6, arch="86")], "8 GB of VRAM or more"),   # (Windows: the same card rules)
             ("cuda", False, 0, [card(24, arch="61", name="Tesla P40")], "V100 / RTX 20 or newer"),
             ("cuda", False, 0, [card(6, arch="86")], "8 GB of VRAM or more"),
             ("cuda", False, 0, [card(6, arch="70"), card(4, 1, arch="89")], "8 GB of VRAM or more"),
@@ -163,6 +165,9 @@ class Refusals(unittest.TestCase):
                       [card(32, arch="70", name="Tesla V100-PCIE-32GB")], [card(24, arch="75", name="NVIDIA TITAN RTX")],
                       [card(8, arch="86")], [card(16, arch="70"), card(12, 1, arch="89")]):
             self.assertIsNone(F.unsupported("cuda", False, 1, cards))
+            self.assertIsNone(F.unsupported("cuda", True, 1, cards))   # (Windows + NVIDIA: as on Linux)
+        for cards in ([card(12, arch="86"), card(12, 1, arch="86")], [card(8, arch="70"), card(8, 1, arch="70")], []):
+            self.assertIsNone(F.unsupported("cuda", False, 2, cards))   # (two cards: the split)
         # (AMD on Linux: RDNA 3 / 3.5 / 4 with 24 GB, or an APU whose shared memory leaves that much)
         for cards in ([amd("gfx1100", 24)], [amd("gfx1201", 32)], [amd("gfx1030", 16), amd("gfx1100", 24, 1)],
                       [amd("gfx1151", 0.5, unified_memory=True, memory_gb=168)], []):
@@ -180,14 +185,32 @@ class Refusals(unittest.TestCase):
         self.assertIsNone(F.unsupported("cuda", False, 1, [card(8, arch="86")], ram_gb=15.4))
 
     def test_check_pc_refuses_first(self):
-        for a, part in ((args(gpus="0,1"), "one GPU only"),):
+        for a, part in ((args(gpus="0,1,2"), "one or two NVIDIA GPUs"),):
             with patch.object(maya.S, "gpus", side_effect=AssertionError("no GPU read before the refusal")), \
                     patch.object(maya, "WIN", False):
                 out = refusal(lambda: maya.check_pc(a, "ik2"))
             self.assertIn(part, out)
             self.assertEqual(len([ln for ln in out.splitlines() if "[X]" in ln]), 1)
+        with patch.object(maya, "WIN", True):   # (Windows: AMD only - NVIDIA runs it as on Linux)
+            self.assertIn("Linux only", refusal(lambda: maya.check_pc(args(backend="hip"), "ik2")))
+
+    def test_windows_vram_measured(self):
+        """Windows + NVIDIA: the card as CUDA gets it (an RTX 3050 8 GB: 7.0 GiB free), measured, kept per PC, card
+        and driver, read back while a Maya engine holds the card; Linux keeps nvidia-smi's figure."""
+        g = dict(card(8, arch="86", name="NVIDIA GeForce RTX 3050"), pci="00000000:01:00.0")
+        pc = {"backend": "cuda", "gpus": [g]}
+        probe = {maya.S._pci_key(g["pci"]): (int(7.0 * 2**30), int(6.7 * 2**30), int(8.0 * 2**30))}
         with patch.object(maya, "WIN", True):
-            self.assertIn("Linux only", refusal(lambda: maya.check_pc(args(), "ik2")))
+            room, how = maya.ik2_engine_vram(pc, probe=probe, saved={}, busy={})
+            self.assertEqual(how, "measured")
+            self.assertAlmostEqual(room, 7.0 + F.MARGIN_GIB, places=3)
+            self.assertLess(F.plan(room, 32768)["tier_gib"], F.plan(8.0, 32768)["tier_gib"])
+            saved = {"ik2|" + maya.hy4_room_key(g): {"ik2_free_gib": 6.9}}
+            self.assertEqual(maya.ik2_engine_vram(pc, probe={}, saved=saved, busy={0: 5000}),
+                             (6.9 + F.MARGIN_GIB, "measured"))
+            self.assertEqual(maya.ik2_engine_vram(pc, probe={}, saved={}, busy={}), (8.0, ""))
+        with patch.object(maya, "WIN", False):
+            self.assertEqual(maya.ik2_engine_vram(pc, probe=probe, saved={}, busy={}), (8.0, ""))
 
     def test_check_pc_refuses_an_old_or_small_card(self):
         for found, part in (([card(24, arch="61", name="Tesla P40")], "V100 / RTX 20 or newer"),
@@ -216,6 +239,13 @@ class Refusals(unittest.TestCase):
             got = maya.choose_gpus(args(), [card(12, 0, arch="86"), card(32, 1, arch="70", name="Tesla V100")],
                                    maya.IK2_MIN_CC, "ik2")
             self.assertEqual([g["index"] for g in got], [1])          # (a V100: Volta on)
+        # (Linux, two cards where the largest does not hold every expert: both, the larger first - the split)
+        with patch.object(maya, "ok"), patch.object(maya, "WIN", False):
+            got = maya.choose_gpus(args(), [card(12, 0, arch="86"), card(16, 1, arch="89"), card(8, 2)],
+                                   maya.IK2_MIN_CC, "ik2")
+            self.assertEqual([g["index"] for g in got], [1, 0])
+            got = maya.choose_gpus(args(), [card(12, 0), card(12, 1)], maya.IK2_MIN_CC, "ik2", before=[1])
+            self.assertEqual([g["index"] for g in got], [1])          # (one, as its config ran)
         self.assertEqual(maya.ik2_gpus_asked(args(gpus="0, 1")), 2)
         self.assertEqual(maya.ik2_gpus_asked(args(gpu=3)), 1)
         self.assertEqual(maya.ik2_gpus_asked(args()), 0)
@@ -229,8 +259,35 @@ class Fit(unittest.TestCase):
         p = F.plan(24.0, 262144)
         self.assertTrue(p["resident"])
         self.assertLessEqual(p["need_gib"], 24.0 - F.MARGIN_GIB)
-        self.assertFalse(F.plan(24.0, 262144, "f16")["resident"])   # (F16: twice the cache - the slower path)
+        p = F.plan(24.0, 262144, "f16")   # (F16: twice the cache - the experts leave first, the cache stays on the card)
+        self.assertTrue(p["layout"] == "offload" and not p["kv_streamed"])
         self.assertEqual(F.recommended_context(24.0, "f16"), 131072)
+
+    def test_the_trained_million_keeps_the_cache_on_the_card(self):
+        """1M on a 24 GB card: the experts leave VRAM first (a token reads the whole cache, ~8 experts a layer) - the
+        offload path with the whole cache in VRAM, no KV streaming (Jupiter V100 as a 24 GB card: a tier of 2.9 GiB,
+        19 tok/s at 1M deep vs 0.93 streamed).  AMD (no offload path): every expert stays, the cache streams."""
+        p = F.plan(24.0, 1048576)
+        self.assertEqual((p["layout"], p["kv_streamed"]), ("offload", False))
+        self.assertGreaterEqual(p["tier_gib"], F.OFF_TIER_MIN_GIB)
+        self.assertEqual(F.verdict(24.0, 64.0, 1048576)[0], "runs")
+        self.assertIn("the whole cache stays on the card", F.verdict(24.0, 64.0, 1048576)[1])
+        self.assertEqual(F.verdict(24.0, 8.0, 1048576)[0], "does not fit")    # (the experts need the RAM)
+        h = F.plan(24.0, 1048576, hip=True)
+        self.assertTrue(h["resident"] and h["kv_streamed"])
+        self.assertEqual(h["kv_ram_gib"], 14.0)
+        self.assertEqual(F.verdict(24.0, 64.0, 1048576, hip=True)[0], "streamed")
+        self.assertEqual(F.recommended_context(24.0), 262144)
+        self.assertEqual(F.recommended_context(32.0), 262144)
+        self.assertTrue(F.plan(32.0, 524288)["resident"])
+        self.assertEqual(F.plan(32.0, 1048576)["layout"], "offload")
+        self.assertIn(1048576, F.CONTEXTS)
+
+    def test_small_cards_stream_only_where_the_cache_does_not_fit(self):
+        self.assertFalse(F.plan(12.0, 262144)["kv_streamed"])   # (v1.1.73's offload layout as it was)
+        p = F.plan(8.0, 1048576)
+        self.assertTrue(p["kv_streamed"] and not p["resident"])
+        self.assertGreater(p["ram_gib"], 16.0)
 
     def test_scales_with_the_card(self):
         self.assertTrue(F.plan(32.0, 262144, "f16")["resident"])     # (an RTX 5090: F16 at 256K too)
@@ -253,6 +310,23 @@ class Fit(unittest.TestCase):
         self.assertEqual(F.verdict(8.0, 15.4, 32768)[0], "runs")       # (16 GB of RAM)
         self.assertEqual(F.verdict(8.0, tiers[0]["ram_gib"] + 0.5, 32768)[0], "tight")
         self.assertEqual(F.verdict(8.0, 12.0, 32768)[0], "does not fit")
+
+
+class TwoCards(unittest.TestCase):
+    def test_plan_two(self):
+        """The first card alone where it holds every expert; else the split - every expert on two 12 GB cards at 32K,
+        two 8 GB cards with the rest in RAM; the RAM as one card's offload path (the prompts stream the second's)."""
+        self.assertEqual(F.plan_two(24.0, 24.0, 32768)["gpus"], 1)
+        p = F.plan_two(12.0, 12.0, 32768)
+        self.assertEqual((p["gpus"], p["layout"]), (2, "split"))
+        self.assertAlmostEqual(p["tier_gib"] + p["gpu1_gib"], F.EXPERTS_GIB, places=1)
+        self.assertEqual(p["ram_gib"], F.plan(12.0, 32768)["ram_gib"])
+        q = F.plan_two(8.0, 8.0, 32768)
+        self.assertEqual(q["layout"], "split+ram")
+        self.assertLess(q["tier_gib"] + q["gpu1_gib"], F.EXPERTS_GIB)
+        self.assertEqual(F.verdict_two(12.0, 12.0, 64.0, 32768)[0], "fast")
+        self.assertEqual(F.verdict_two(8.0, 8.0, 64.0, 32768)[0], "runs")
+        self.assertEqual(F.verdict_two(8.0, 8.0, 8.0, 32768)[0], "does not fit")
 
 
 class Picker(unittest.TestCase):

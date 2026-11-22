@@ -568,7 +568,9 @@ function ik2Fields(m, d, ch) {
   return [
     {label: "Model", rows: [
       contextRow(m, d, ch, {vram: kvb}, ["kv"],
-        fit && !fit.resident ? "At this size the model and its cache do not all fit on the card: the engine runs its slower path." : null),
+        fit && !fit.resident ? `At this size the model and its cache do not all fit on the card: about ${fmt(fit.tier_gib)} GB of the experts stay on it, the others in RAM (the offload path), and ` +
+          (fit.kv_streamed ? `about ${fmt(fit.kv_ram_gib)} GB of the cache stays in RAM too (KV streaming) - slower the deeper a chat goes.` : "the whole cache stays on the card, so the speed holds deep into a chat.")
+        : fit && fit.kv_streamed ? `At this size about ${fmt(fit.kv_ram_gib)} GB of the cache stays in RAM (KV streaming): every expert stays on the card, but each token reads that part over the bus - slower the deeper a chat goes. The same answers.` : null),
       html`<${Row} label="Drafting" flag=${"--drafting " + ({auto: "auto", dspark: "on"}[d.draft] || "off")} changed=${ch("draft")}
         hint=${(m.choices.draft.includes("dspark") ? "The model's own drafter (DSpark) and the prompt lookup draft tokens the model checks: the same answers, faster where the drafts are kept (code, edits). " :
           "The prompt lookup drafts tokens the model checks (copied text): the same answers. ") +
@@ -579,7 +581,9 @@ function ik2Fields(m, d, ch) {
         hint=${m.choices.images ? "Reads pictures in chats: the image encoder starts when a picture arrives, no VRAM kept for it (on the GPU where its free VRAM holds it, else on the CPU). Off reads text only."
           : "This model was set up without its image encoder: the setup adds it."}>
         <${Switch} label="Images" on=${d.images} disabled=${!m.choices.images && !d.images} onChange=${(v) => setDraft({images: v})}/><//>`,
-      html`<${Row} label="Answers at once" hint="Coming soon: Inkling 2 Mini answers one request at a time for now."/>`]},
+      html`<${Row} label="Answers at once" flag="--parallel" changed=${ch("parallel")}
+        hint=${"Several chats answered together, each with its own cache (the context shared out between them): more tokens a second in all, each answer a little slower. Where every expert stays on one GPU's VRAM; elsewhere (two GPUs, experts in RAM, the cache streamed) one at a time. Drafting is off while it is above 1. The same answers as one at a time."}>
+        <${Stepper} label="Answers at once" value=${d.parallel} min=${1} max=${8} on=${(v) => setDraft({parallel: v})}/><//>`]},
     {label: "GPU and memory", rows: [gpu,
       html`<${Row} label="KV cache" flag="IK2_KV" changed=${ch("kv")}
         hint="FP8, the default: half the bytes of F16 and the faster one deep in a long context. F16: twice the VRAM a token, a little closer to the model's own numbers.">

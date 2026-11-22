@@ -101,6 +101,18 @@ void attn_flash_fp8(const uint16_t* q16, int q_ld, const uint8_t* kc, const uint
                     int n_split, cudaStream_t s);
 /// a split count for attn_flash_f16: Tq queries x H heads against up to nk keys on n_sm SMs
 int attn_flash_splits(int Tq, int H, int nk, int n_sm);
+/// Volta (sm_70): a prompt chunk's attention on a full layer (no window, no ring) on mma.m8n8k4 - q16 [Tq] rows of
+/// q_ld at positions qpos0 .., each query's keys 0 .. its position; the bias in the kernel from proj [extent][d_rel]
+/// and r [Tq] rows of r_ld (d_rel <= 16); sink [Tq][H] -> out [Tq] rows of o_ld (F32).  Its own splits (scratch as
+/// attn_flash's).  False: not for these shapes (the caller takes its other path).
+bool attn_prompt_v70_f16(const uint16_t* q16, int q_ld, const uint16_t* kc, const uint16_t* vc, int H, int Hkv, int Tq,
+                         int qpos0, float qk_scale, const float* r, int r_ld, const float* proj, int d_rel, int extent,
+                         const float* sink, float* out, int o_ld, float* scratch, size_t scratch_floats, int n_sm,
+                         cudaStream_t s);
+bool attn_prompt_v70_fp8(const uint16_t* q16, int q_ld, const uint8_t* kc, const uint8_t* vc, int H, int Hkv, int Tq,
+                         int qpos0, float qk_scale, float v_inv_scale, const float* r, int r_ld, const float* proj,
+                         int d_rel, int extent, const float* sink, float* out, int o_ld, float* scratch,
+                         size_t scratch_floats, int n_sm, cudaStream_t s);
 /// can this build run attn_flash_* on the current GPU (CUDA: always; AMD: the RDNA matrix-core kernel's archs)
 bool attn_flash_available();
 
@@ -159,6 +171,12 @@ void moe_combine_f32(const float* y, const int* inv, const float* wt, int T, int
 /// + res (hist [3][C], w [C][4]; res null: nothing added).
 void moe_combine_conv(const float* y, const int* inv, const float* wt, int K, int C, float* hist, const float* w,
                       const float* res, float* out, cudaStream_t s);
+
+/// Two GPUs (maya-ik2's split): GPU 0's table holds kHeldElsewhere for an expert GPU 1 runs, GPU 1's a null for one it
+/// does not hold; the token path's expert kernels leave such a pick's row alone.  two_take_rows: the rows of GPU 0's
+/// picks marked kHeldElsewhere (blob [S]) taken from GPU 1's rows (other [S][C], copied over) into y [S][C].
+constexpr uintptr_t kHeldElsewhere = 1;
+void two_take_rows(const uint8_t* const* blob, const float* other, int S, int C, float* y, cudaStream_t s);
 
 /// y = a + b, n values (y may alias either).
 void add(const float* a, const float* b, size_t n, float* y, cudaStream_t s);
@@ -376,11 +394,17 @@ size_t attn_decode_mma_scratch(int H, int n_split);
 void attn_decode_mma_f16(const uint16_t* q16, const float* r, const float* sink, const uint16_t* kc, const uint16_t* vc,
                          int kv_cap, int H, int Hkv, const int* pos, int qpos, int n_split, float qk_scale,
                          const float* proj, int d_rel, int extent, int window, float* scratch, float* out,
-                         const float* gate, uint16_t* out16, cudaStream_t s);
+                         const float* gate, uint16_t* out16, cudaStream_t s, int blk0 = 0, int nblk = -1,
+                         int phase = 0);
 void attn_decode_mma_fp8(const uint16_t* q16, const float* r, const float* sink, const uint8_t* kc, const uint8_t* vc,
                          int kv_cap, int H, int Hkv, const int* pos, int qpos, int n_split, float qk_scale,
                          float v_inv_scale, const float* proj, int d_rel, int extent, int window, float* scratch,
-                         float* out, const float* gate, uint16_t* out16, cudaStream_t s);
+                         float* out, const float* gate, uint16_t* out16, cudaStream_t s, int blk0 = 0, int nblk = -1,
+                         int phase = 0);
+/// (KV streaming) a part of the above: phase 1 the blocks blk0 .. blk0 + nblk - 1 of the n_split only (their
+/// partials, the same as the whole launch's), phase 2 the combine only.  attn_decode_mma_keys: the keys [lo, hi) the
+/// blocks b0 .. b1 - 1 read for a token at qpos (a layer without a window).
+void attn_decode_mma_keys(int qpos, int n_split, int b0, int b1, int& lo, int& hi);
 
 // ---- speculative decoding: the draft model's (Inkling 2's DSpark drafter, mtp.safetensors) and the rollback's
 

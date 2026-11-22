@@ -132,7 +132,7 @@ take the compiler's list from sm_70 on. CUDA 12.x for a V100 (CUDA 13 has no sm_
 | --- | --- | --- | --- | --- |
 | Ampere and newer (sm_80+) | `mma.sync` m16n8k16 | `mma.sync` m16n8k16 | fused (`mma.sync`, `cp.async`; sm_90a: wgmma) | block path |
 | Turing (sm_75) | Ampere's, m16n8k16 as two m16n8k8 | Ampere's, the same | cuBLAS (the fused kernel needs `cp.async` and more shared memory) | block path; drafting off (a NOTE) until its window is checked against the token path on a Turing card |
-| Volta (sm_70) | its own: `mma.m8n8k4`, 32 keys a warp step | its own: `mma.m8n8k4` | cuBLAS | none: drafting off (a NOTE) |
+| Volta (sm_70) | its own: `mma.m8n8k4`, 32 keys a warp step | its own: `mma.m8n8k4` | cuBLAS; full layers from 64K keys deep its own `mma.m8n8k4` kernel (keys through shared memory, 8 queries a block; `IK2_PA70=0`: cuBLAS) | none: drafting off (a NOTE) |
 
 Each class is exact within itself (the same greedy answers start after start); the classes differ from each other in
 their sums' order, as different kernels do. `IK2_ARCH=70` / `75` takes an older class's kernels on a newer GPU (tests;
@@ -152,11 +152,12 @@ and clips; FP16 MMA, and wgmma on Hopper).
 **Decode** is bound by the PCIe link (~47 expert misses a token on the H200). `IK2_CPU=1` computes a missing
 expert on the CPU when that is sooner than its copy (NVFP4 experts, AVX-512).
 
-**Two GPUs** (`--gpus 2`, outside the preview of section 8: with `IK2_UNSUPPORTED=1`): `IK2_EP=1` deals each layer's experts to both by how often they are picked
-(`IK2_EP_SPLIT`, GPU 1's share), each GPU with its own cache and link; attention and the KV cache stay on GPU 0.
-Without it the layers are split between the GPUs (`IK2_SPLIT`: where; half each by default), a chunk or a token
-through one GPU's layers and then the other's. Where each GPU holds its own layers' experts whole - Inkling-2-Mini
-on two 16 GB cards - they stay in VRAM and tokens take the resident path a GPU at a time (section 8, "Two GPUs").
+**Two GPUs** (`--gpus 2`): where each GPU holds its own layers' experts whole - Inkling-2-Mini on two 16 GB cards -
+the layers split between them and tokens take the resident path a GPU at a time (`IK2_SPLIT`: where, half each by
+default; section 8, "Two GPUs, the layers split"); else the second card holds the next experts (section 8, "Two
+NVIDIA GPUs"). Outside the preview (`IK2_UNSUPPORTED=1`), `IK2_EP=1` deals each layer's experts to both by how often
+they are picked (`IK2_EP_SPLIT`, GPU 1's share), each GPU with its own cache and link; attention and the KV cache stay
+on GPU 0.
 
 **Serving.** `--serve` speaks Maya's engine protocol (`serve/server.py`'s `StrataEngine`: `INFO`, `READY <ctx> stop`,
 `GEN`, `PP`, `T`, `DONE`, `STOP`), keeps the conversation's cache for its next turn, and ends a request at
@@ -292,7 +293,26 @@ expert's blocks once for up to 8 of its tokens, instead of decoded to FP16 for a
 
 **Context.** The eight visits of the layers without a window keep 32 KB a token in FP16, 16 KB in FP8. With an FP8
 cache every expert stays in VRAM up to `--max-context 352256` (text only; 22.3 GiB at 262,144), and 262,144 fits
-beside the image encoder. Past that the engine falls back to the cache path (64 tok/s). An FP8 cache is as far
+beside the image encoder. Past that, up to the trained 1,048,576, the experts leave the card before the cache does:
+a token reads the whole cache but only about eight experts a layer, so the engine takes the offload path (below:
+a tier of the most-used experts in VRAM, the others in RAM) and keeps the whole cache in VRAM. On a 24 GB card at
+1M (FP8) that is a 2.9 GiB tier, 12 GiB of experts pinned in RAM and 16 GiB of cache on the card. Measured on a V100
+(PCIe 3) as a 24 GB card at `--max-context 1048576`, decode at 2K / 256K / 512K / 1M deep: 32.7 / 26.0 / 23.8 /
+19.1 tok/s (KV streaming before: 79.7 / 3.71 / 1.87 / 0.94); as a 32 GB card at 1M (10.6 GiB tier) 25.9. The
+part of the cache no position has reached yet is lent to more experts (most picked first, at the top of the cache;
+copied in batches from an answer's first token, given back as the context grows - the answers stay the same;
+`IK2_LEND=0`: off): 67.7 / 64.1 / 57.1 / 49.9 / 32.1 / 19.2 tok/s at 2K / 32K / 128K / 256K / 512K / 1M. The
+slope deep in a context is the attention reading the cache: about 16 KB a token of context at ~790 GB/s on the V100
+(87% of its 900 GB/s; every expert in VRAM at 600K: 86.0 / 80.1 / 58.8 / 44.2 tok/s at 2K / 32K / 256K / 512K).
+KV streaming (`--kv-streaming auto`, the default; `on` / `off`, `--kv-resident N`) is the last resort, where the
+cache alone does not fit beside the dense weights and half a GiB of tier (an 8 / 12 GB card past 256K, a 16 GB one
+at 1M), and on AMD (no offload path yet: every expert stays): the cache of all but N (at least 1) of the eight full
+visits sits in pinned RAM. A token copies those rows by DMA into a small VRAM ring, a few of the attention kernel's
+blocks a slot, the copies running ahead of the kernels (their partials those of the whole launch); a prompt chunk
+copies a visit's rows into one VRAM staging pair first - the VRAM of one of the N visits (the swing visit: its rows
+go to RAM while a prompt runs, back to VRAM for the tokens). The same kernels on the same bytes: the same answers as
+with the cache in VRAM. It takes it only where the RAM holds the rows (plus 4 GiB) and says so at the start; each
+token copies the RAM part over the bus (~1 tok/s at 1M with 12 GiB of it), so the link's speed sets it. An FP8 cache is as far
 from the FP16 logits whichever kernels read it (KL 1.9e-3 on the tensor cores, 2.0e-3 scalar, over 199 forced
 tokens; FP16 on the tensor cores 2.2e-5) - but any two FP8 runs part within a few tokens: a difference of 1e-5
 flips codes of a 3-bit mantissa.
@@ -368,21 +388,41 @@ router, with no host step, and the same expert kernels read the same bytes, so t
 in VRAM gives. With `IK2_LANE=1` (lane parity) the CPU lane takes a share of the misses beside the copies, split by
 measured costs; every expert then runs one exact arithmetic on either side (`src/ik2/ik2_exact.h`, held bit for bit
 by `tests/ik2_off_test.cu`), so an answer does not depend on where an expert ran. Only the experts the tier does not
-hold are pinned (on Linux): the tier is planned on the card's free VRAM first, copied in from the mapped files, then
+hold are pinned (Linux and Windows - Windows maps each pinned run at a device address of its own, so the GPU
+finds an expert through a table of them): the tier is planned on the card's free VRAM first, copied in from the mapped files, then
 the rest read and pinned - an 8 GB card's tier is 2.6 GiB of RAM the PC does not need (12.1 GiB pinned; 12 GB card
 ~8 GiB, 16 GB ~4 GiB). `IK2_PIN_ALL=1` pins every expert. The PC needs the model in RAM and VRAM together (about
 24 GB, e.g. 16 GB of RAM with an 8 GB card; no SSD tier): the setup refuses less in one line. Drafting stays off on
 the offload path (its window runs only where every expert is in VRAM; a NOTE says so).
 
-**The preview.** Inkling-2-Mini comes in as an experimental preview: Linux, one NVIDIA GPU of 8 GB or more, sm_70
+**The preview.** Inkling-2-Mini comes in as an experimental preview: Linux or Windows, one NVIDIA GPU of 8 GB or more, sm_70
 (Volta: V100) or newer; tested on RTX 3090s (sm_86) and V100s (sm_70); Turing (sm_75) kernel-tested only, Blackwell
-(sm_100 / sm_120) compile-checked only. Elsewhere `maya-ik2` stops at the start with one line saying why (under
+(sm_100 / sm_120) compile-checked only; Windows run on an RTX 3050 8 GB (@cobra91's MSVC port, its VRAM as CUDA gets it
+measured by the setup). Elsewhere `maya-ik2` stops at the start with one line saying why (under
 `--serve` also as a `NOTE` the server prints): no NVIDIA GPU, a GPU older than sm_70 (Pascal and before: none of the
 tensor-core instructions its kernels use), a build with no kernels for the GPU's arch, less than 7 GiB of VRAM,
-`--gpus 2` or more, Windows. `IK2_UNSUPPORTED=1` runs it anyway where it can run at all: two GPUs (the layers split
-between them - "Two GPUs" below - or `IK2_EP=1` / `IK2_TP=1`, section 6), smaller cards with the experts streamed from RAM, @cobra91's Windows / CUDA 13 port -
-untested here. CMake skips `maya-ik2` without a CUDA arch of 70 or more in the list, and on Windows unless
-`-DSTRATA_IK2_WINDOWS=ON`.
+`--gpus 3` or more, AMD on Windows. `IK2_UNSUPPORTED=1` runs it anyway where it can run at all: the older two-GPU
+modes (`IK2_EP=1` or `IK2_TP=1`, section 6) - untested here.
+
+**Two NVIDIA GPUs** (`--gpus 2`, Linux; the setup offers it where two cards can be used, the larger first): where the
+first card holds every expert it runs alone (the resident path - faster there than the split: 2x V100 32 GB, one card
+86.7 tok/s against ~74 with the experts split). Where it does not but each card holds its own layers' experts, the
+layers split between the cards and tokens take the resident path on both ("Two GPUs, the layers split", below; two RTX
+5070 Ti 16 GB on Windows at 262,144 tokens: 133.5 tok/s against 75.5 with the experts split, the same tokens). Else the
+split of the experts (`IK2_TWO=1`: it anyway): the first card runs the offload path (the dense weights, the K / V cache,
+every prompt, its tier of the experts), the second holds the next experts by the profile's picks a byte, the rest stay
+in pinned RAM. A token's MoE: the input and the router's logits go to the second card, it routes them with its own table
+and runs the picks it holds with the token path's kernels, its rows come back and take those picks' places before the
+sum - so every row and the sum's order are one card's, and the answers do not depend on which card holds an expert (two
+cards of one kind: the one-card offload path's answers, checked on the CLI and the server's answers, tool calls,
+pictures and loop guard). Copies between the cards: peer to peer only where the driver offers it, the IOMMU translates
+neither card and a test copy at load arrives intact, else through pinned host memory (`IK2_HOST_STAGE=1` forces that;
+the same answers). Drafting is off with the experts split (a NOTE; not checked against plain decoding there yet).
+Measured on 2x V100 (FP16 cache, 32K context, a 2K prompt): two 12 GB cards (emulated) 78.7 tok/s answers / 1186 tok/s
+prompts, two 8 GB cards 46.3 / 935 (one 8 GB card: 15.0 / 927). The prompts stream the second card's experts from RAM,
+so they run at the offload path's speed. On Windows the setup offers one card (two are untested there by the setup; the
+layers split checked by hand on two RTX 5070 Ti). CMake skips `maya-ik2` without a CUDA arch of 70 or more in the list
+(`-DSTRATA_IK2_WINDOWS=OFF`: not on Windows).
 
 **AMD (HIP, Linux).** A HIP build has `maya-ik2` for every arch of its list (not for AMD on Windows yet). The kernels
 written for `mma.sync` / `ldmatrix` / `cp.async` run through AMD versions that keep their fragment layouts; the prompt's
@@ -407,31 +447,37 @@ Thinking is the template's `reasoning_effort`, a name or a number in [0.0, 0.99]
 | `mmproj-BF16.gguf` (0.6 GB, pictures) | same | `2c165c78790e78a3f45a2d1e9e931083e52ee69d45ff2a0dc9c281fdf1a666e7` |
 | `mtp.safetensors` (0.6 GB, the drafter: the setup fetches it, not with `--drafting off`) | [thinkingmachines/Inkling-2-Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini) | `7c3b651317f01f73bcf4e1dceba66ef8b7e1a1eac6bc171e882e690a4b10a1d2` |
 
-**Two GPUs** (outside the preview: `--gpus 2` with `IK2_UNSUPPORTED=1`). The layers are split between the cards
-(`IK2_SPLIT=b`: layers 0 .. b - 1 on GPU 0; half each by default). Where each card holds its own layers' experts
-beside their dense weights and KV caches - the engine prints the count for each GPU at the start - they all stay in
-VRAM and tokens take the resident path a GPU at a time (`IK2_FAST=0`: the cache path on both cards, as before). A
-token's 48 visits fall into runs, a run the consecutive visits one GPU holds: six when the split is inside the
-looped core (every pass crosses once and comes back for the next), two when it is not. Each run is a CUDA graph of
-its own on its GPU's stream. Between two runs the token's state crosses through pinned host memory, tens of KB: the
-stream and the block states, or, where the next run starts a later pass, the bank of the pass that ends (the GPU
-that ends a pass makes the bank and its own layers' messages from it; the GPU that starts the next kept the core's
-first stream and makes its layers' messages from the bank it is sent). The runs are chained with events, so the
-host waits once a token (`IK2_HOP=0`: after each run). `--draft` runs there too: the drafter, its taps and the head
-are the last layer's GPU's, a tap taken on the other card goes along with the hand-over, a verify window crosses as
-its rows (the block path, in the same runs), and the fit check counts the drafter and moves the split a layer or
-two to make room for it. Prompts go through `forward()`, a chunk through one GPU's layers and then the other's; a
-hop inside a later pass of the core carries the pass before's bank (without it the next GPU's core layers read a
-bank that was never filled, and the answers were wrong: #1107).
+**Two GPUs, the layers split** (`--gpus 2` where the first card does not hold every expert but each card holds its own
+layers' experts beside their dense weights and KV caches - "Two NVIDIA GPUs" above; the engine prints the count for each
+GPU at the start). The layers are split between the cards, half each (`IK2_SPLIT=b`: layers 0 .. b - 1 on GPU 0, the
+layers split there even where they would not be chosen - on the cache path where a card does not hold its layers'
+experts, or with `IK2_FAST=0`), every expert stays in VRAM and tokens take the resident path a GPU at a time. A token's
+48 visits fall into runs, a run the consecutive visits one GPU holds: six when the split is inside the looped core
+(every pass crosses once and comes back for the next), two when it is not. Each run is a CUDA graph of its own on its
+GPU's stream. Between two runs the token's state crosses through pinned host memory, tens of KB: the stream and the
+block states, or, where the next run starts a later pass, the bank of the pass that ends (the GPU that ends a pass makes
+the bank and its own layers' messages from it; the GPU that starts the next kept the core's first stream and makes its
+layers' messages from the bank it is sent). The runs are chained with events, so the host waits once a token
+(`IK2_HOP=0`: after each run). `--draft` runs there too: the drafter, its taps and the head are the last layer's GPU's,
+a tap taken on the other card goes along with the hand-over, a verify window crosses as its rows (the block path, in the
+same runs), and the fit check counts the drafter and moves the split a layer or two to make room for it (where no split
+leaves room, the drafter is left out with a NOTE and the split stays). Prompts go through `forward()`, a chunk through
+one GPU's layers and then the other's; a hop inside a later pass of the core carries the pass before's bank (without it
+the next GPU's core layers read a bank that was never filled, and the answers were wrong: #1107).
 
-Measured on Windows 11, two RTX 5070 Ti (16 GB each), CUDA 12.8, UD-Q4_K_XL, 262,144 tokens with an FP8 cache
-(10.4 + 12.8 GiB of VRAM in use; 11.7 + 13.7 with the drafter), through the server, greedy, new code: the cache
-path 54 tok/s, the resident split 136, with the drafter 147-259 by the text; at 218K tokens deep 33 and 84. The
-hand-over is exact - splits at layers 6, 9, 12, 14, 17, 18 and 20 write the same tokens, with graphs or without,
-with events or host waits - but the resident kernels round differently from the cache path's, as on one GPU:
-against it, greedy, code and lists came out the same and prose took other words at near-ties. `IK2_EP=1` is expert
-parallel instead (its caches filled at the start: checked on Windows, an RTX 5080 with an RTX 4060 Ti; 42 tok/s on
-the 5070 Tis).
+Measured on Windows 11, two RTX 5070 Ti (16 GB each), CUDA 12.8, UD-Q4_K_XL, 262,144 tokens with an FP8 cache (10.4 +
+12.8 GiB of VRAM in use; 11.7 + 13.7 with the drafter), through the server, greedy, new code: the cache path 54 tok/s,
+the resident split 136-137, with drafting on (`--draft`: the drafter and the prompt lookup, whose verify window gives
+the same answers) 134-213 by the text; prompts 3,300 tok/s at 4K and 3,500 at 16K; at 218K tokens deep 33 and 84. From
+the CLI, the same 400-token code prompt and 400 tokens: the layers split 133.5 tok/s and the prompt in 0.75 s, the
+experts split (`IK2_TWO=1`) 74-76 tok/s and 1.33 s (its prompt streams the experts from RAM: 23 GiB copied) - the same
+tokens. The hand-over is exact - splits at layers 6, 9, 12, 14, 17, 18 and 20 write the same tokens, with graphs or
+without, with events or host waits - but the resident kernels round differently from the cache path's, as on one GPU:
+against it, greedy, code and lists came out the same and prose took other words at near-ties.
+
+Outside the preview, the older two-GPU mode with a loop runs as expert parallel (`IK2_EP=1`, its caches filled at the
+start: checked on Windows, an RTX 5080 with an RTX 4060 Ti; refused where the copies between the cards would have to go
+through host memory); the drafter is one GPU's there.
 
 Not done: the loop in the layer-major prompt passes (`IK2_SUP`: off
 for a looped model), a second card for the KV cache (a million tokens is 16 GiB of it), the drafter's own launches

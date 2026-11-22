@@ -6,6 +6,12 @@
 namespace ik2::k {
 namespace {
 
+// an expert's place in pinned host memory as the device sees it: the layer's base + e * stride, or (stride 0: Windows,
+// only the experts the VRAM tier does not hold pinned, a run's device address of its own) the layer's row of the table
+__device__ __forceinline__ const uint8_t* off_src(const uint8_t* host, size_t hstride, int e) {
+    return hstride ? host + (size_t) e * hstride : ((const uint8_t* const*) host)[e];
+}
+
 __global__ void off_fetch_plan_kernel(const uint8_t** blob, const int* __restrict__ top, int K, int key0,
                                       const uint8_t* host, size_t hstride, OffStage st, OffFetch* fl, OffCount* cnt,
                                       uint32_t* heat) {
@@ -47,7 +53,7 @@ __global__ void off_fetch_plan_kernel(const uint8_t** blob, const int* __restric
                 st.used[s] = seq;
                 uint8_t* dst = st.data + (size_t) s * st.sb;
                 blob[i] = dst;
-                fl->src[n_fetch] = host + (size_t) top[i] * hstride;
+                fl->src[n_fetch] = off_src(host, hstride, top[i]);
                 fl->dst[n_fetch] = dst;
                 ++n_fetch;
             }
@@ -155,7 +161,7 @@ __global__ void off_lane_plan_kernel(const uint8_t** blob, const int* __restrict
             const int s = stage_take(st, key0 + top[i], seq);
             uint8_t* dst = st.data + (size_t) s * st.sb;
             blob[i] = dst;
-            fl->src[n_fetch] = host + (size_t) top[i] * hstride;
+            fl->src[n_fetch] = off_src(host, hstride, top[i]);
             fl->dst[n_fetch] = dst;
             ++n_fetch;
         }

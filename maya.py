@@ -1590,7 +1590,7 @@ def gpus_before(before, usable: list) -> list | None:
 
 
 def ik2_gpus_asked(a) -> int:
-    """How many GPUs --gpu / --gpus name (0: none named) - Inkling-2-Mini's preview refuses more than one."""
+    """How many GPUs --gpu / --gpus name (0: none named) - Inkling-2-Mini runs on one or two (three or more refused)."""
     if getattr(a, "gpus", None):
         return len({x.strip() for x in str(a.gpus).split(",") if x.strip()})
     return 1 if getattr(a, "gpu", None) is not None else 0
@@ -1622,12 +1622,30 @@ def choose_gpus(a, found, min_cc: int = MIN_CC, family: str = "", before=None) -
              f"it needs an NVIDIA GPU of compute capability {min_cc / 10:.1f} or newer (" +
              ("V100 and newer; Pascal - Tesla P40 / P100, GTX 10 - is experimental)" if min_cc < 80 else
               "RTX 30 / A100 and newer)"))
-    if family == "ik2":   # (Inkling-2-Mini, a preview: one GPU - the one its config ran on, else the largest)
-        pick = [byid[kept[0]]] if kept and len(kept) == 1 else \
-            [max(usable, key=lambda g: (round(g["vram_gb"]), -g["index"]))]
-        if len(usable) > 1:
-            ok(f"GPU: {gpu_label(pick[0])} - {IK2_SHOWN} runs on one GPU for now (--gpu N picks another)")
-        return pick
+    if family == "ik2":
+        # (Inkling-2-Mini: one GPU, or two on Linux - the larger first, it holds the dense weights and the cache; the
+        #  second takes the experts the first does not hold.  Recommended: one where the largest holds every expert
+        #  at the smallest context - faster there, 2x V100 86.7 against ~74 tok/s - else the two largest)
+        big = sorted(usable, key=lambda g: (-round(g["vram_gb"]), g["index"]))
+        one = [byid[kept[0]]] if kept and len(kept) == 1 else big[:1]
+        if len(big) < 2 or WIN:
+            if len(usable) > 1:
+                ok(f"GPU: {gpu_label(one[0])} - {IK2_SHOWN} runs on one GPU here (--gpu N picks another)")
+            return one
+        two = [byid[i] for i in kept] if kept and len(kept) == 2 else big[:2]
+        p = IK2F.plan_two(two[0]["vram_gb"], two[1]["vram_gb"], IK2F.CONTEXTS[0])
+        opts = [one, two]
+        rec = 0 if p["gpus"] == 1 else 1
+        default = 1 if kept and len(kept) == 2 else 0 if kept else rec
+        labels = [f"{gpu_label(one[0])} only" + (" - it holds every expert" if IK2F.plan(one[0]["vram_gb"],
+                                                                                     IK2F.CONTEXTS[0])["resident"] else ""),
+                  f"{gpu_label(two[0])} + {gpu_label(two[1])} together - the second holds the experts the first does not"]
+        pick = choose("Which GPUs?", [f"{IK2_SHOWN} runs on one GPU, or on two: the first holds the dense weights, the "
+                                      "cache and every prompt,", "the second the experts the first does not (three or "
+                                      "more: not yet)."],
+                      [(lab, "recommended" if i == rec else None, None) for i, lab in enumerate(labels)], default,
+                      a.yes or a.check)
+        return opts[pick]
     best = sorted(usable, key=lambda g: (-round(g["vram_gb"]), g["index"]))
     # A card with under a quarter of the biggest one's VRAM (a 2 GB display card beside 32 GB ones) still gets whole
     # layers of the split and runs out of memory at the pack; the automatic pick leaves it out (--gpus still takes it).
@@ -1747,16 +1765,18 @@ def check_pc(a, family: str = "glm", gguf: bool = False, ds4_quant: str = "exl3"
                                        "can be used (Pascal: experimental)" if int(g["arch"]) >= min_cc else
                                        f"too old (this model needs compute capability {min_cc / 10:.1f} or newer)"))
     chosen = choose_gpus(a, found, min_cc, family)
-    if ik2:                                            # (the card picked: 8 GB or more)
+    if ik2:                                            # (the cards picked: 8 GB or more; two: the larger first)
         why = IK2F.unsupported("cuda", False, len(chosen), chosen, mem_gb()[0])
         if why:
             fail(why)
+        chosen = sorted(chosen, key=lambda g: -float(g["vram_gb"] or 0))
     archs = sorted({int(g["arch"]) for g in chosen})
     vram = sum(g["vram_gb"] for g in chosen)
     ok("using " + " + ".join(gpu_label(g) for g in chosen) +
        ("" if len(chosen) < 2 else
         ": the equal GPUs among them share every layer (tensor parallel), else the layers are split across them"
-        if family == "hy4" else f": the model's layers are split across the {len(chosen)}"))
+        if family == "hy4" else ": the experts are split across the two (the first holds the rest)" if ik2 else
+        f": the model's layers are split across the {len(chosen)}"))
     if ik2 and any(g.get("unified_memory") for g in chosen):
         warn(f"{IK2_SHOWN} has not been run yet on a GPU whose memory is the system's RAM: untested here")
     elif any(g.get("unified_memory") for g in chosen):
@@ -11287,10 +11307,14 @@ def write_config_ik2(a, pc: dict, meta: dict, gguf: Path, tok: Path, ctx: int, m
     cfg_path = ROOT / f"{Q.config_stem('ik2', Q.IK2_QUANT)}.json"
     old = read_json(cfg_path)
     args = ["--model", str(gguf), "--max-context", str(ctx)]
+    two = len(pc.get("gpus") or []) == 2 and pc.get("backend") != "hip"
+    args += ["--gpus", "2"] if two else []           # (the split: the config's two GPUs, the larger first)
     how = ik2_drafting(a)
     args += (["--draft", str(drafter)] if drafter and how != "off" else []) + ["--drafting", how]
     kept = keep_args(old.get("args") or [], args, ("--threads", "--eos", "--cache-gb"))
     inst = {"family": "ik2", "quant": Q.OTHERS[("ik2", Q.IK2_QUANT)], "ik2_quant": Q.IK2_QUANT, "drafting": how}
+    if pc["gpus"][0].get("ik2_vram_gb"):              # (Windows: the card as CUDA gets it, measured - the Models page)
+        inst["ik2_vram_gb"] = pc["gpus"][0]["ik2_vram_gb"]
     sampling, effort = Q.model_defaults({"installer": inst})   # (the model's own, every setup)
     cfg = {"exe": str(IK2_EXE), "args": args, "cwd": str(ROOT), "tokenizer": str(tok), "model_name": IK2_MODEL_NAME,
            **({"backend": "hip"} if pc.get("backend") == "hip" else {}),
@@ -11304,8 +11328,9 @@ def write_config_ik2(a, pc: dict, meta: dict, gguf: Path, tok: Path, ctx: int, m
     # (a card that does not hold every expert: the offload path's VRAM tier starts from Maya's profile of the
     #  experts Inkling-2-Mini picks most - data/expert-profile-ik2mini.bin; where every expert fits, none)
     vram = float(pc["gpus"][0].get("vram_gb") or 0) if pc.get("gpus") else 0.0
+    vram1 = float(pc["gpus"][1].get("vram_gb") or 0) if two else 0.0
     seed = str(IK2_PROFILE)
-    if IK2F.plan(vram, ctx, env["IK2_KV"])["layout"] == "offload" and IK2_PROFILE.is_file():
+    if IK2F.plan_two(vram, vram1, ctx, env["IK2_KV"])["layout"] != "resident" and IK2_PROFILE.is_file():
         env.setdefault("IK2_WARM", seed)
     elif env.get("IK2_WARM") == seed:
         env.pop("IK2_WARM")
@@ -11326,10 +11351,40 @@ def write_config_ik2(a, pc: dict, meta: dict, gguf: Path, tok: Path, ctx: int, m
     return cfg_path
 
 
+def ik2_engine_vram(pc: dict, probe=None, saved: dict | None = None, busy: dict | None = None) -> tuple:
+    """Windows, NVIDIA: the card's VRAM in tools/ik2_fit.py's terms as maya-ik2's CUDA gets it - (GiB, "measured"),
+    else (nvidia-smi's VRAM, "").  Windows keeps part of every card from CUDA (the display driver's budget, the
+    desktop) that nvidia-smi does not show - an RTX 3050 8 GB gave CUDA 7.0 GB free - and maya-ik2 plans its start on
+    CUDA's free figure (every expert in VRAM or the offload path, the tier's size), so the setup's sums take that
+    figure (cuda_room_bytes: free with a context held, in a process of its own) plus ik2_fit's MARGIN_GIB (the share
+    its sums leave for the context and the desktop).  Measured now and kept for this PC, card and driver in
+    HY4_ROOM_STORE ("ik2|" + hy4_room_key), the kept figure read back where the card is busy (a Maya engine holds it)
+    or the driver gives no reading.  Not Windows, AMD, an APU, nothing measured: nvidia-smi's figure.  probe, saved,
+    busy: the readings, the records and maya_engine_mib's cards (tests; else read)."""
+    g = ((pc or {}).get("gpus") or [{}])[0]
+    vram = float(g.get("vram_gb") or 0)
+    if not WIN or (pc or {}).get("backend", "cuda") != "cuda" or not g.get("pci") or not vram or \
+            g.get("unified_memory"):
+        return vram, ""
+    key = "ik2|" + hy4_room_key(g)
+    if g.get("index") not in (maya_engine_mib() if busy is None else busy):
+        r = (cuda_room_bytes() if probe is None else probe).get(S._pci_key(str(g["pci"])))
+        if r:
+            free = float(r[0]) / 2**30
+            if saved is None:                          # (this card's figure under another driver: gone)
+                hy4_room_store(key, {"ik2_free_gib": round(free, 3), "measured": time.strftime("%Y-%m-%d %H:%M:%S")},
+                               lambda k: k.split("|")[:4] == key.split("|")[:4])
+            return min(vram, free + IK2F.MARGIN_GIB), "measured"
+    rec = (hy4_room_load() if saved is None else saved).get(key) or {}
+    if isinstance(rec.get("ik2_free_gib"), (int, float)):
+        return min(vram, float(rec["ik2_free_gib"]) + IK2F.MARGIN_GIB), "measured"
+    return vram, ""
+
+
 def set_up_ik2(a, prev: dict) -> Path | None:
     """Inkling-2-Mini's steps 1-8 (an experimental preview): the PC (refused in one line where the preview does not
-    run: a Mac, Windows, two GPUs or more asked for, a card older than RTX 30 / A100 or under 24 GB, an AMD GPU older
-    than RDNA 3 or with less memory - an APU counts the RAM it shares, less what is kept free), the context
+    run: a Mac, AMD on Windows, two GPUs or more asked for, a card older than V100 / RTX 20 or under 8 GB, an AMD
+    GPU older than RDNA 3 or with less memory - an APU counts the RAM it shares, less what is kept free), the context
     (the largest that keeps every expert in VRAM on this card), the engine (build/maya-ik2), the files (pinned,
     sha256-checked), the tokenizer with the model's own template, the pictures (its mmproj and maya-vision), the
     config."""
@@ -11349,9 +11404,16 @@ def set_up_ik2(a, prev: dict) -> Path | None:
         why = IK2F.unsupported("hip", WIN, len(pc["gpus"]), [g])
         if why:
             fail(why)
+    else:   # (Windows: the card as CUDA gets it, measured - the figure the engine plans with)
+        room, how = ik2_engine_vram(pc)
+        if how:
+            ok(f"VRAM for the engine: {room - IK2F.MARGIN_GIB:.1f} GB of the card's {vram:.1f} GB (measured: "
+               "Windows keeps the rest for the display)")
+            vram = pc["gpus"][0]["ik2_vram_gb"] = round(room, 2)
     step(2, "your choices")                            # 2
-    warn(f"{IK2_SHOWN} is an experimental preview: run by its contributor on RTX 3090 cards (Linux), not yet by "
-         "Maya's team on every card - tell us how it goes in an issue" if not amd else
+    warn(f"{IK2_SHOWN} is an experimental preview: run by its contributor on RTX 3090 cards (Linux) and by Maya's "
+         "team on V100s (Linux) and an RTX 3050 8 GB (Windows), not yet on every card - tell us how it goes in "
+         "an issue" if not amd else
          f"{IK2_SHOWN} on AMD is an experimental preview: run by Maya's team on a Radeon 8065S (Gorgon Halo, "
          "Linux), not yet on Radeon RX 7000 / 9000 cards - tell us how it goes in an issue")
     m = ik2_entry()
@@ -11360,13 +11422,29 @@ def set_up_ik2(a, prev: dict) -> Path | None:
     kv = str((prev.get("env") or {}).get("IK2_KV") or IK2F.DEFAULT_KV)
     rec = IK2F.recommended_context(vram, kv)
     ctx = choose_context(a, prev_ctx, IK2F.CONTEXTS, rec)
-    fit = IK2F.plan(vram, ctx, kv)
+    fit = IK2F.plan(vram, ctx, kv, amd)
+    kv_gb = ctx * IK2F.KV_BYTES.get(kv, IK2F.KV_BYTES['f16']) / 2**30
     ok(f"context: {ctx} tokens" + (" (recommended for this card's VRAM)" if ctx == rec else "") +
-       f"; its cache: {ctx * IK2F.KV_BYTES.get(kv, IK2F.KV_BYTES['f16']) / 2**30:.1f} GB of VRAM ({kv.upper()})")
-    if not fit["resident"]:
-        word, line = IK2F.verdict(vram, mem_gb()[0], ctx, kv)
+       (f"; its cache: {kv_gb:.1f} GB ({kv.upper()}), about {fit['kv_ram_gib']:.0f} GB of it in RAM (KV streaming)"
+        if fit.get("kv_streamed") else f"; its cache: {kv_gb:.1f} GB of VRAM ({kv.upper()})"))
+    vram1 = float(pc["gpus"][1].get("vram_gb") or 0) if len(pc["gpus"]) == 2 and not amd else 0.0
+    if vram1:   # (two GPUs: the first alone where it holds every expert, else the split)
+        word, line = IK2F.verdict_two(vram, vram1, mem_gb()[0], ctx, kv)
+        if IK2F.plan_two(vram, vram1, ctx, kv)["gpus"] == 1:
+            warn(f"at {context_label(ctx)} the first card holds every expert: the second is not used (one GPU is "
+                 "faster there) - set up with --gpu N for one card")
+        elif word == "fast":
+            ok(f"two GPUs: {line}")
+        else:
+            warn(f"two GPUs at {context_label(ctx)}: {line}" + (" - it may not start" if word == "tight" else ""))
+    elif fit["resident"] and fit.get("kv_streamed"):   # (one GPU only: KV streaming is off on two GPUs)
+        word, line = IK2F.verdict(vram, mem_gb()[0], ctx, kv, amd)
+        warn(line if word == "does not fit" else
+             f"at {context_label(ctx)}: {line} (a context of {context_label(rec)} keeps the cache in VRAM)")
+    elif not fit["resident"]:
+        word, line = IK2F.verdict(vram, mem_gb()[0], ctx, kv, amd)
         keep = (f" (a context of {context_label(rec)} keeps everything in VRAM)"
-                if IK2F.plan(vram, rec, kv)["resident"] else "")
+                if IK2F.plan(vram, rec, kv, amd)["resident"] else "")
         warn(f"at {context_label(ctx)} the model and its cache do not all fit in this card's {vram:.0f} GB: "
              f"{line}{keep}" + (" - it may not start" if word == "tight" else ""))
     models = (Path(a.models_dir).expanduser().resolve() if a.models_dir else
@@ -11383,6 +11461,8 @@ def set_up_ik2(a, prev: dict) -> Path | None:
     if gguf is None:
         return None
     off = IK2F.drafting_off_reason(None if amd else pc["gpus"][0].get("arch"), vram, ctx, kv, amd)
+    if vram1 and IK2F.plan_two(vram, vram1, ctx, kv)["gpus"] == 2:
+        off = "drafting off: on two GPUs it is not checked yet - every token comes from a full model step"
     if off:                                            # (Volta / Turing, the offload path: no drafter, drafting off)
         ok(off)
         a.drafting = "off"

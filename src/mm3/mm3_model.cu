@@ -41,10 +41,12 @@
 #include "mm3_gguf_host.hpp"
 #include "mm3_kernels.cuh"
 #include "mm3_lane_plan.hpp"
+#include "mm3_link.cuh"
 #include "mm3_os.hpp"
 #include "mm3_tp.hpp"
 #include "mm3_vision.hpp"
 #include "mm3_wscan.hpp"
+#include "../core/vram_late.hpp"   // (#1026: the reserve held for the whole run)
 
 namespace mm3 {
 namespace x3 = strata::mm3::exl3;
@@ -417,6 +419,10 @@ struct Model::Impl {
     int chunk_run = 0;               // (the prefill calibration: a forward's chunk, at most o.chunk - 0: o.chunk)
     int run_chunk() const { return chunk_run > 0 ? std::min(chunk_run, o.chunk) : o.chunk; }
     std::string tkey, tfile;         // (the prefill calibration's key of this PC and its file)
+    // (#1026) the reserve held for the whole run: what each GPU's start and requests allocate after the residency,
+    // read from the pack's vram-late.txt at the residency and kept free beside the reserve (src/core/vram_late.hpp;
+    // MAYA_MM3_LATE_FILE / MAYA_MM3_LATE_MB or MAYA_VRAM_LATE_*)
+    strata::vramlate::Tracker late;
     std::unique_ptr<Vision> vis;     // the vision tower (Options::vision)
     std::vector<Model::Image> imgs;  // the pictures the image tokens of the next forwards take their rows from
     float* taps = nullptr;           // its context's input: [taps][chunk][dim] F32 (the head's GPU)
@@ -1573,6 +1579,21 @@ struct Model::Impl {
                 }
                 if (!err.empty()) return false;
             }
+            // (#1026) ... beside it what this PC's start and requests allocated after the residency before (the default
+            // reserve keeps v1.1.73's residency unless the measured figure uses it up)
+            {
+                const size_t di = (size_t) (&d - D.data());
+                if (late.gpus.size() != D.size()) late.init("mm3", o.pack, "MAYA_MM3_LATE_FILE", "MAYA_MM3_LATE_MB", D.size());
+                cudaDeviceProp pr{};
+                if (cudaGetDeviceProperties(&pr, d.id) != cudaSuccess) (void) cudaGetLastError();
+                char kb[256];
+                std::snprintf(kb, sizeof kb, "|gpu %d %s %x:%x %zu MiB|ctx %d seqs %d staging %d cap %d dspark %d vision %d",
+                              d.id, pr.name, (unsigned) pr.pciBusID, (unsigned) pr.pciDeviceID, tot >> 20, o.max_ctx,
+                              o.seqs, d.n_slots, o.resident_cap, (int) o.dspark, vis != nullptr ? 1 : 0);
+                reserve += late.read(di, "mm3 late|" + tkey + "|pack " + o.pack + kb, reserve, o.reserve_gb >= 0, d.id);
+                late.set_reserve(di, reserve - late.gpus[di].g.late);
+                late.set_room(di, fr > reserve ? fr - reserve : 0);   // (the experts' room: all of it can give way)
+            }
             size_t budget = fr > reserve ? fr - reserve : 0;
             std::vector<int> nres(moe_layers.size(), 0);
             const int cap = o.resident_cap < 0 ? g.n_exp : std::min(o.resident_cap, g.n_exp);
@@ -1797,23 +1818,26 @@ struct Model::Impl {
                                " MoE layers host-free (every expert in VRAM: the routing stays on the GPU)");
             // a token's and a window's whole forward as a graph (graph_ready): one GPU, every MoE layer host-free
             const char* gv = ::mm3::env("MM3_GRAPH");
-            // (several GPUs: peer access between them all - the forward's copies across them plain device copies)
+            // (several GPUs: the copies between them - mm3_link.cuh: a peer copy only where the driver offers it, the
+            //  IOMMU translates neither GPU and a test copy arrives intact, else through host memory; every pair a
+            //  tested peer copy: the forward's copies across them plain device copies.  MM3_HOST_STAGE=1: host memory
+            //  for all; MM3_PEER=1: peer copies tried (and tested) where the IOMMU translates too)
             if (D.size() > 1) {
-                bool all = true;
-                for (Dev& a : D)
-                    for (Dev& b : D) {
-                        if (&a == &b) continue;
-                        int can = 0;
-                        if (cudaDeviceCanAccessPeer(&can, a.id, b.id) != cudaSuccess || !can) {
-                            all = false;
-                            continue;
-                        }
-                        cudaSetDevice(a.id);
-                        const cudaError_t pe = cudaDeviceEnablePeerAccess(b.id, 0);
-                        if (pe != cudaSuccess && pe != cudaErrorPeerAccessAlreadyEnabled) all = false;
-                        cudaGetLastError();
-                    }
-                p2p_all = all;
+                const size_t n = D.size();
+                std::vector<int> ids(n);
+                std::vector<char> used(n * n, 1);   // (the hops, the head's rows, the prompt's stages, the draft's taps)
+                std::vector<void*> tb(n);
+                std::vector<cudaStream_t> ss(n);
+                for (size_t i = 0; i < n; ++i) ids[i] = D[i].id, tb[i] = D[i].h, ss[i] = D[i].s, used[i * n + i] = 0;
+                const char* hs = ::mm3::env("MM3_HOST_STAGE");
+                const char* hp = ::mm3::env("MM3_PEER");
+                const char* sm = ::mm3::env("MM3_STAGE_MB");
+                const size_t hb = (size_t) o.chunk * g.dim * 4;
+                if (!links.setup(ids, used, tb, hb, ss, hs && std::atoi(hs) != 0, hp && std::atoi(hp) != 0, hb,
+                                 (size_t) std::max(1, sm ? std::atoi(sm) : 8) << 20, "MM3_HOST_STAGE", err))
+                    return false;
+                p2p_all = links.all_peer;
+                info.push_back("hand-offs between GPUs: " + links.say);
             }
             graph_on = (gv == nullptr || std::atoi(gv) != 0) && D.size() == 1 && nhf > 0 && nhf == nmoe &&
                        !o.verbose &&
@@ -2904,13 +2928,16 @@ struct Model::Impl {
         }
         return copy_peer(dst, b, a.h, a, bytes, b.s, err);
     }
-    // peer access between every two of the GPUs where they have it (load): the forward's copies across then a plain
-    // device copy - one a graph can hold - else the runtime's peer copy (through the host where the GPUs cannot)
+    // the copies between the GPUs (load: links.setup): every pair a tested peer copy - a plain device copy, one a graph
+    // can hold; else each pair's own (mm3_link.cuh: a peer or driver copy on s, or through host memory - out on the
+    // source's stream, in on the destination's)
+    gpulink::Links links;
     bool p2p_all = false;
     bool copy_peer(void* dst, const Dev& db, const void* src, const Dev& sb, size_t bytes, cudaStream_t s,
                    std::string& err) {
         if (p2p_all) CK(cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDeviceToDevice, s));
-        else CK(cudaMemcpyPeerAsync(dst, db.id, src, sb.id, bytes, s));
+        else if (!links.copy((int) (&sb - D.data()), sb.s, src, (int) (&db - D.data()), db.s, dst, bytes, s, err))
+            return false;
         return true;
     }
 
@@ -3569,6 +3596,21 @@ void Model::set_ablate(bool on) {
     if (ablate_loaded() && p->bound >= 0 && p->bound < (int) p->abl_on.size()) p->abl_on[(size_t) p->bound] = on ? 1 : 0;
 }
 bool Model::ablating() const { return ablate_loaded() && p->abl_row(p->bound); }
+int Model::late_check(bool loaded) {
+    if (tpe != nullptr) return 0;   // (the tensor-parallel path: its plan keeps its own reserve)
+    int cur = 0;
+    if (cudaGetDevice(&cur) != cudaSuccess) (void) cudaGetLastError();
+    for (size_t i = 0; i < p->D.size() && i < p->late.gpus.size(); ++i) {
+        size_t fr = 0, tot = 0;
+        if (cudaSetDevice(p->D[i].id) != cudaSuccess || cudaMemGetInfo(&fr, &tot) != cudaSuccess) {
+            (void) cudaGetLastError();
+            continue;
+        }
+        p->late.check(i, fr, tot, loaded, p->D[i].id);
+    }
+    cudaSetDevice(cur);
+    return loaded ? p->late.short_mib : 0;
+}
 
 bool Model::forward_rows(const int* ids, const int* seq, const int* pos, int R, float* logits_out, std::string& err) {
     if (R <= 0) return true;

@@ -929,7 +929,8 @@ console.log(JSON.stringify(out));""")
         self.assertEqual({k: (v["vu"], v["ru"], v["total"], v["disk"]) for k, v in got["lay"].items()},
                          {"tp": (20992, 0, 20992, 0), "one": (8118, 12874, 20992, 0)})
         self.assertEqual(got["layTip"], "")
-        self.assertEqual(got["sets"], ["ram_fetch,disk,promo,engram_ms", "ram_fetch,disk,promo", "ram_fetch,disk",
+        self.assertEqual(got["sets"], ["ram_fetch,disk,promo,engram_ms", "ram_fetch,disk,promo",
+                                       "promo,ram_fetch,disk",                    # (Qwen: Promoted since #1103)
                                        "ram_fetch,disk,promo"])                   # (the other engines': unchanged)
 
     def test_ik2_its_levels_its_own_settings_its_name_and_its_monitor(self):
@@ -962,7 +963,8 @@ console.log(JSON.stringify(out));""")
         self.assertEqual(got["nearest"], ["none", None, "low", "medium", "high", "max", "max"])   # (None: its default)
         self.assertEqual((got["name"], got["short"], got["logo"]), ("Inkling 2 Mini", "Inkling 2 Mini", None))
         self.assertEqual(got["tip"], "")
-        self.assertEqual(got["sets"], ["ram_fetch,disk,promo,engram_ms", "ram_fetch,disk,promo", "ram_fetch,disk",
+        self.assertEqual(got["sets"], ["ram_fetch,disk,promo,engram_ms", "ram_fetch,disk,promo",
+                                       "promo,ram_fetch,disk",                    # (Qwen: Promoted since #1103)
                                        "cpu,engram_ms", "ram_fetch,disk,promo"])
 
     def test_about_has_the_support_line_always_and_the_update_card_none(self):
