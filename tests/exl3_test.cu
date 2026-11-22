@@ -2218,7 +2218,9 @@ __global__ void read_roof_kernel(const uint4* p, size_t n, unsigned* sink) {
 // the ms a call, the trellis bytes a second against this device's plain read of the same bytes, the same call with
 // every group on one copy ("hot": its bytes from cache, so the kernels' own arithmetic), and a checksum of the
 // outputs' bits (equal before and after a change that keeps the bits).  BENCH_WIN_K2: one K2 (default 4 and 5, as
-// turboderp's 2.25 bpw), BENCH_WIN_ITERS (default 50).
+// turboderp's 2.25 bpw), BENCH_WIN_ITERS (default 50).  BENCH_WIN_ROWS=r1,r2,...: instead, the rows mode (ds4
+// DS4_LIGHT_WIN, a prompt chunk's light experts) - BENCH_WIN_G (default 16) experts of r rows each, one call, the us an
+// expert against --bench-set's (BENCH_SET_F=2304 BENCH_SET_EXPERTS=1 BENCH_SET_ROWS=r).
 void bench_win() {
     const int E = 5120, F = 2304, k = 6;
     auto env_int = [](const char* n, int d) {
@@ -2226,6 +2228,15 @@ void bench_win() {
         return v != nullptr && *v ? std::atoi(v) : d;
     };
     const int iters = std::max(1, env_int("BENCH_WIN_ITERS", 50)), NB = std::max(12, env_int("BENCH_WIN_BLOBS", 48));
+    std::vector<int> rows_list;   // (BENCH_WIN_ROWS: the rows mode's cases)
+    if (const char* v = std::getenv("BENCH_WIN_ROWS"))
+        for (const char* p = v; *p;) {
+            const int r = std::atoi(p);
+            if (r > 0) rows_list.push_back(std::min(r, 512));
+            while (*p && *p != ',') ++p;
+            if (*p == ',') ++p;
+        }
+    const int RG = std::max(1, std::min(NB, env_int("BENCH_WIN_G", 16)));
     std::vector<int> k2s = {4, 5};
     if (env_int("BENCH_WIN_K2", 0) > 0) k2s = {env_int("BENCH_WIN_K2", 0)};
     struct Case { int T, h, G; };
@@ -2268,7 +2279,74 @@ void bench_win() {
         CK(cudaMalloc(&d_all, (size_t) NB * at));
         CK(cudaMemcpy(d_all, blob.data(), at, cudaMemcpyHostToDevice));
         for (int b = 1; b < NB; ++b) CK(cudaMemcpy(d_all + (size_t) b * at, d_all, at, cudaMemcpyDeviceToDevice));
-        for (const Case& c : cases) {
+        for (const int rr : rows_list) {   // the rows mode: RG experts of rr rows, entry e = row e
+            const int NS = NB / RG, n = RG * rr;
+            std::vector<int> gs(1, 0), ge((size_t) n);
+            for (int g = 0; g < RG; ++g) gs.push_back((g + 1) * rr);
+            for (int e = 0; e < n; ++e) ge[(size_t) e] = e;
+            const std::vector<int> ng = {RG};
+            int *d_gs = dev_copy(gs), *d_ge = dev_copy(ge), *d_ng = dev_copy(ng);
+            std::vector<unsigned long long*> gps;
+            for (int st = 0; st <= NS; ++st) {   // (set NS: every group on copy 0 - the hot call)
+                std::vector<unsigned long long> gp((size_t) RG);
+                for (int g = 0; g < RG; ++g)
+                    gp[(size_t) g] = (unsigned long long) (d_all + (st == NS ? 0 : (size_t) (st * RG + g) * at));
+                gps.push_back(dev_copy(gp));
+            }
+            float* d_x = dev_copy(rand_x(n * E));
+            float *d_h = nullptr, *d_u = nullptr, *d_part = nullptr;
+            CK(cudaMalloc(&d_h, (size_t) n * F * sizeof(float)));
+            CK(cudaMalloc(&d_u, (size_t) n * F * sizeof(float)));
+            CK(cudaMalloc(&d_part, (size_t) n * E * sizeof(float)));
+            auto call = [&](unsigned long long* gp) {
+                ex::WinArgs w;
+                w.rows = true;
+                w.grp_ptr = gp;
+                w.grp_start = d_gs;
+                w.grp_ent = d_ge;
+                w.n_groups = d_ng;
+                w.x = d_x;
+                w.x_stride = E;
+                w.h = d_h;
+                w.u = d_u;
+                w.part = d_part;
+                w.lay = lay;
+                w.T = n;
+                w.k = 1;
+                w.max_groups = RG;
+                w.n_embd = E;
+                w.n_ff = F;
+                w.limit = 10.0f;
+                if (!ex::win_experts(w, 0)) ++g_fail;
+            };
+            auto timed = [&](auto&& one) {
+                for (int i = 0; i < 3; ++i) one(i);
+                CK(cudaEventRecord(ev0, 0));
+                for (int i = 0; i < iters; ++i) one(i);
+                CK(cudaEventRecord(ev1, 0));
+                CK(cudaEventSynchronize(ev1));
+                float ms = 0.0f;
+                CK(cudaEventElapsedTime(&ms, ev0, ev1));
+                return ms / iters;
+            };
+            const float cold = timed([&](int i) { call(gps[(size_t) (i % NS)]); });
+            const float hot = timed([&](int) { call(gps[(size_t) NS]); });
+            call(gps[0]);
+            CK(cudaDeviceSynchronize());
+            const std::vector<float> o = host_copy(d_part, (size_t) n * E);
+            uint64_t hsh = 1469598103934665603ull;
+            for (float v : o) {
+                uint32_t u;
+                std::memcpy(&u, &v, 4);
+                hsh = (hsh ^ u) * 1099511628211ull;
+            }
+            std::printf("  bench win rows K%-3s %3d rows x G%2d: %7.3f ms  %7.1f us an expert  hot %7.3f ms  bits %016llx\n",
+                        kname(k2).c_str(), rr, RG, cold, 1000.0 * cold / RG, hot, (unsigned long long) hsh);
+            for (auto* p : gps) cudaFree(p);
+            for (void* p : {(void*) d_gs, (void*) d_ge, (void*) d_ng, (void*) d_x, (void*) d_h, (void*) d_u, (void*) d_part})
+                cudaFree(p);
+        }
+        for (const Case& c : (rows_list.empty() ? std::vector<Case>(std::begin(cases), std::end(cases)) : std::vector<Case>{})) {
             const int NS = NB / c.G;   // the sets of G copies a call cycles through (set s: copies s G .. s G + G - 1)
             struct Set { unsigned long long *plan, *gp; int *gs, *ge, *ng; };
             std::vector<Set> sets;
@@ -2442,13 +2520,15 @@ void bench_mv() {
 // 1152 of 2304 -> 5120, mul1, K 2 and 2.5 as turboderp's 2.25 bpw): BENCH_SET_EXPERTS (default 16) experts of
 // BENCH_SET_ROWS rows each (default 256: a 16K chunk's 6 of 384), set_gate_up + set_down - the ms a call, the us an
 // expert, and the outputs' bits (equal before and after a change that keeps the bits; EXL3_WMMA_SHAPE / EXL3_WMMA_ROWS
-// pick the kernels).  BENCH_SET_K2: one K2 (default 4 and 5).
+// pick the kernels).  BENCH_SET_K2: one K2 (default 4 and 5).  BENCH_SET_F: the hidden size (default 1152; 2304 a
+// whole expert, as the DS4 helper's light experts - BENCH_SET_EXPERTS=1 then is one light_send launch pair).
 void bench_set() {
     auto env_int = [](const char* n, int d) {
         const char* v = std::getenv(n);
         return v != nullptr && *v ? std::atoi(v) : d;
     };
-    const int E = 5120, F = 1152, NE = std::max(1, env_int("BENCH_SET_EXPERTS", 16)),
+    const int E = 5120, F = std::max(128, env_int("BENCH_SET_F", 1152)) / 128 * 128,
+              NE = std::max(1, env_int("BENCH_SET_EXPERTS", 16)),
               R = std::max(1, env_int("BENCH_SET_ROWS", 256)), iters = 10, T = 4096;
     std::vector<int> k2s = {4, 5};
     if (env_int("BENCH_SET_K2", 0) > 0) k2s = {env_int("BENCH_SET_K2", 0)};
