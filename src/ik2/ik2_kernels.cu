@@ -3073,6 +3073,7 @@ experts_mma_kernel(const uint8_t* const* __restrict__ blob, size_t off, int C, i
                    int x_ld, uint16_t* hidden, float* y, const float* sg, const float* su, float gcap, float ucap) {
     __shared__ float2 part[SPLIT][8];
     const int lane = threadIdx.x & 31, split = threadIdx.x >> 5, g = lane >> 2, t = lane & 3, slot = blockIdx.y;
+    if ((uintptr_t) blob[slot] <= 1u) return;   // (two GPUs: a pick the other GPU runs - k::kHeldElsewhere)
     const int K = Gate ? C : F;
     const int r = blockIdx.x * (Gate ? 8 : 16) + g;
     const size_t rb = (size_t) (K / 64) * 36;
@@ -3154,6 +3155,7 @@ experts_v70_kernel(const uint8_t* const* __restrict__ blob, size_t off, int C, i
     __shared__ float2 part[SPLIT][8];
     const int lane = threadIdx.x & 31, split = threadIdx.x >> 5, j = lane & 3, hi = lane >> 4, qp = (lane >> 2) & 3;
     const int rr = j + 4 * hi, slot = blockIdx.y;
+    if ((uintptr_t) blob[slot] <= 1u) return;   // (two GPUs: a pick the other GPU runs)
     const int K = Gate ? C : F;
     const int r0 = blockIdx.x * (Gate ? 8 : 16);
     const size_t rb = (size_t) (K / 64) * 36;
@@ -3255,6 +3257,7 @@ __global__ void experts_gate_up_swiglu_kernel(const uint8_t* const* blob, const 
                                               const int* orow, int h_ld) {
     extern __shared__ float xs[];
     const int s = blockIdx.y;
+    if ((uintptr_t) blob[s] <= 1u) return;   // (two GPUs: a pick the other GPU runs)
     load_xs_f32(x + (size_t) tok[s] * C, C, xs);
     __syncthreads();
     const int warp = threadIdx.x >> 5;
@@ -3284,6 +3287,7 @@ __global__ void experts_down_kernel(const uint8_t* const* blob, int ty_down, siz
                                     int C, int F, size_t rb_down, float* y) {
     extern __shared__ float xs[];
     const int s = blockIdx.y;
+    if ((uintptr_t) blob[s] <= 1u) return;   // (two GPUs: a pick the other GPU runs)
     load_xs_f16(h + (size_t) s * F, F, xs);
     __syncthreads();
     const int warp = threadIdx.x >> 5;
@@ -5955,6 +5959,18 @@ void moe_combine_conv(const float* y, const int* inv, const float* wt, int K, in
                       const float* res, float* out, cudaStream_t s) {
     moe_combine_conv_kernel<<<(unsigned) ((C + 127) / 128), 128, 0, s>>>(y, inv, wt, K, C, hist, w, res, out);
     check("moe_combine_conv");
+}
+
+__global__ void two_take_rows_kernel(const uint8_t* const* blob, const float* other, int C, float* y) {
+    const int s = blockIdx.y;
+    if ((uintptr_t) blob[s] != kHeldElsewhere) return;
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < C; i += gridDim.x * blockDim.x)
+        y[(size_t) s * C + i] = other[(size_t) s * C + i];
+}
+void two_take_rows(const uint8_t* const* blob, const float* other, int S, int C, float* y, cudaStream_t s) {
+    if (S <= 0) return;
+    two_take_rows_kernel<<<dim3((unsigned) ((C + 255) / 256), (unsigned) S), 256, 0, s>>>(blob, other, C, y);
+    check("two_take_rows");
 }
 void add(const float* a, const float* b, size_t n, float* y, cudaStream_t s) {
     if (!n) return;

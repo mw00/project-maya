@@ -145,12 +145,13 @@ class Refusals(unittest.TestCase):
         cases = [
             ("metal", False, 0, [], "NVIDIA and AMD GPUs only"),
             ("hip", True, 0, [], "Linux only"),
-            ("hip", False, 2, [], "one GPU only"),
+            ("hip", False, 2, [], "on AMD runs on one GPU"),
             ("hip", False, 0, [amd("gfx1030", 16)], "RDNA 3, 3.5 or 4"),
             ("hip", False, 0, [amd("gfx1201", 16)], "24 GB of VRAM or more"),
             ("hip", False, 0, [amd("gfx1151", 0.5, unified_memory=True, memory_gb=20)], "24 GB of VRAM or more"),
             ("cuda", True, 0, ok, "Linux only"),
-            ("cuda", False, 2, ok, "one GPU only"),
+            ("cuda", False, 3, ok, "one or two NVIDIA GPUs"),
+            ("cuda", False, 2, [card(24), card(6, 1, arch="86")], "8 GB of VRAM or more on each"),
             ("cuda", False, 0, [card(24, arch="61", name="Tesla P40")], "V100 / RTX 20 or newer"),
             ("cuda", False, 0, [card(6, arch="86")], "8 GB of VRAM or more"),
             ("cuda", False, 0, [card(6, arch="70"), card(4, 1, arch="89")], "8 GB of VRAM or more"),
@@ -163,6 +164,8 @@ class Refusals(unittest.TestCase):
                       [card(32, arch="70", name="Tesla V100-PCIE-32GB")], [card(24, arch="75", name="NVIDIA TITAN RTX")],
                       [card(8, arch="86")], [card(16, arch="70"), card(12, 1, arch="89")]):
             self.assertIsNone(F.unsupported("cuda", False, 1, cards))
+        for cards in ([card(12, arch="86"), card(12, 1, arch="86")], [card(8, arch="70"), card(8, 1, arch="70")], []):
+            self.assertIsNone(F.unsupported("cuda", False, 2, cards))   # (two cards: the split)
         # (AMD on Linux: RDNA 3 / 3.5 / 4 with 24 GB, or an APU whose shared memory leaves that much)
         for cards in ([amd("gfx1100", 24)], [amd("gfx1201", 32)], [amd("gfx1030", 16), amd("gfx1100", 24, 1)],
                       [amd("gfx1151", 0.5, unified_memory=True, memory_gb=168)], []):
@@ -180,7 +183,7 @@ class Refusals(unittest.TestCase):
         self.assertIsNone(F.unsupported("cuda", False, 1, [card(8, arch="86")], ram_gb=15.4))
 
     def test_check_pc_refuses_first(self):
-        for a, part in ((args(gpus="0,1"), "one GPU only"),):
+        for a, part in ((args(gpus="0,1,2"), "one or two NVIDIA GPUs"),):
             with patch.object(maya.S, "gpus", side_effect=AssertionError("no GPU read before the refusal")), \
                     patch.object(maya, "WIN", False):
                 out = refusal(lambda: maya.check_pc(a, "ik2"))
@@ -216,6 +219,13 @@ class Refusals(unittest.TestCase):
             got = maya.choose_gpus(args(), [card(12, 0, arch="86"), card(32, 1, arch="70", name="Tesla V100")],
                                    maya.IK2_MIN_CC, "ik2")
             self.assertEqual([g["index"] for g in got], [1])          # (a V100: Volta on)
+        # (Linux, two cards where the largest does not hold every expert: both, the larger first - the split)
+        with patch.object(maya, "ok"), patch.object(maya, "WIN", False):
+            got = maya.choose_gpus(args(), [card(12, 0, arch="86"), card(16, 1, arch="89"), card(8, 2)],
+                                   maya.IK2_MIN_CC, "ik2")
+            self.assertEqual([g["index"] for g in got], [1, 0])
+            got = maya.choose_gpus(args(), [card(12, 0), card(12, 1)], maya.IK2_MIN_CC, "ik2", before=[1])
+            self.assertEqual([g["index"] for g in got], [1])          # (one, as its config ran)
         self.assertEqual(maya.ik2_gpus_asked(args(gpus="0, 1")), 2)
         self.assertEqual(maya.ik2_gpus_asked(args(gpu=3)), 1)
         self.assertEqual(maya.ik2_gpus_asked(args()), 0)
@@ -253,6 +263,23 @@ class Fit(unittest.TestCase):
         self.assertEqual(F.verdict(8.0, 15.4, 32768)[0], "runs")       # (16 GB of RAM)
         self.assertEqual(F.verdict(8.0, tiers[0]["ram_gib"] + 0.5, 32768)[0], "tight")
         self.assertEqual(F.verdict(8.0, 12.0, 32768)[0], "does not fit")
+
+
+class TwoCards(unittest.TestCase):
+    def test_plan_two(self):
+        """The first card alone where it holds every expert; else the split - every expert on two 12 GB cards at 32K,
+        two 8 GB cards with the rest in RAM; the RAM as one card's offload path (the prompts stream the second's)."""
+        self.assertEqual(F.plan_two(24.0, 24.0, 32768)["gpus"], 1)
+        p = F.plan_two(12.0, 12.0, 32768)
+        self.assertEqual((p["gpus"], p["layout"]), (2, "split"))
+        self.assertAlmostEqual(p["tier_gib"] + p["gpu1_gib"], F.EXPERTS_GIB, places=1)
+        self.assertEqual(p["ram_gib"], F.plan(12.0, 32768)["ram_gib"])
+        q = F.plan_two(8.0, 8.0, 32768)
+        self.assertEqual(q["layout"], "split+ram")
+        self.assertLess(q["tier_gib"] + q["gpu1_gib"], F.EXPERTS_GIB)
+        self.assertEqual(F.verdict_two(12.0, 12.0, 64.0, 32768)[0], "fast")
+        self.assertEqual(F.verdict_two(8.0, 8.0, 64.0, 32768)[0], "runs")
+        self.assertEqual(F.verdict_two(8.0, 8.0, 8.0, 32768)[0], "does not fit")
 
 
 class Picker(unittest.TestCase):

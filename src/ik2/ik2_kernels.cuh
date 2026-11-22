@@ -160,6 +160,12 @@ void moe_combine_f32(const float* y, const int* inv, const float* wt, int T, int
 void moe_combine_conv(const float* y, const int* inv, const float* wt, int K, int C, float* hist, const float* w,
                       const float* res, float* out, cudaStream_t s);
 
+/// Two GPUs (maya-ik2's split): GPU 0's table holds kHeldElsewhere for an expert GPU 1 runs, GPU 1's a null for one it
+/// does not hold; the token path's expert kernels leave such a pick's row alone.  two_take_rows: the rows of GPU 0's
+/// picks marked kHeldElsewhere (blob [S]) taken from GPU 1's rows (other [S][C], copied over) into y [S][C].
+constexpr uintptr_t kHeldElsewhere = 1;
+void two_take_rows(const uint8_t* const* blob, const float* other, int S, int C, float* y, cudaStream_t s);
+
 /// y = a + b, n values (y may alias either).
 void add(const float* a, const float* b, size_t n, float* y, cudaStream_t s);
 /// FP16 copies of n values.

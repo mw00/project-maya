@@ -26,6 +26,7 @@
 #include "ik2_kernels.cuh"
 #include "ik2_lane.hpp"
 #include "ik2_off.cuh"
+#include "mm3_link.cuh"   // (two GPUs: the copies between them, peer only where tested)
 #include "strata/artifact/gguf_reader.hpp"
 #include "strata/spec/suffix_drafter.hpp"
 #ifdef STRATA_USE_HIP
@@ -2213,6 +2214,82 @@ struct FastGraph {
 };
 FastGraph g_fgraph[4];      // by OutMode
 
+// ---- two GPUs (--gpus 2, the split): GPU 0 runs the offload path (the dense weights, the K / V cache, every prompt,
+// its tier of the experts, the misses fetched from host memory); GPU 1 holds the next experts by the profile's picks a
+// byte and runs a token's picks of them.  A token's MoE: x and the router's logits go over, GPU 1 routes them with its
+// own table (the same kernel and inputs: the same picks in the same slots), runs the ones it holds with the token
+// path's kernels and sends its rows back; GPU 0's table marks those experts k::kHeldElsewhere, so its kernels leave
+// their rows for two_take_rows to fill in before moe_combine_conv.  Every row is the token path's own, summed in the
+// same order: the answers do not depend on which GPU holds an expert (on two GPUs of one kind, one GPU's answers).
+// A prompt runs on GPU 0 alone (the offload path's streamed experts, index order), so it does not either.
+struct TwoGpu {
+    bool want = false, on = false;
+    int dev = 1;
+    cudaStream_t s = nullptr;
+    cudaEvent_t ev_x = nullptr;        // (GPU 0's stream: x and the logits ready)
+    cudaEvent_t ev_y = nullptr;        // (GPU 1's stream: its rows ready)
+    std::vector<uint8_t> own;          // [n_layer * E]: 1 - GPU 1 holds the expert
+    std::vector<const uint8_t**> tab;  // per layer, on GPU 1: its experts' blocks, null for the others
+    std::vector<float*> sc[3], bias;   // per layer, on GPU 1: the experts' scales, the router's bias
+    float *xq = nullptr, *rlog = nullptr, *sg = nullptr, *su = nullptr, *wt = nullptr, *y32 = nullptr, *gu32 = nullptr;
+    int *route_d = nullptr, *tok = nullptr, *inv = nullptr;
+    const uint8_t** blob = nullptr;
+    uint16_t* h16 = nullptr;
+    float* y_in = nullptr;             // (on GPU 0: GPU 1's rows)
+    gpulink::Links link;
+    int n_exp = 0;
+    size_t bytes = 0;
+};
+TwoGpu g_two;
+
+// GPU 1's share of a token's MoE (after GPU 0's router GEMV on g_s): x and the logits over, routed and run there
+void two_send(const Model& M, int l, Work& W, bool exp_tc) {
+    const Config& c = M.c;
+    const Layer& Ly = M.L[l];
+    TwoGpu& T = g_two;
+    const int C = c.C;
+    std::string err;
+    CU(cudaEventRecord(T.ev_x, g_s));
+    CU(cudaSetDevice(T.dev));
+    CU(cudaStreamWaitEvent(T.s, T.ev_x, 0));
+    if (T.link.all_peer) {   // (tested peer copies both ways: plain device copies, ones a CUDA graph holds)
+        CU(cudaMemcpyAsync(T.xq, W.xq, (size_t) C * 4, cudaMemcpyDeviceToDevice, T.s));
+        CU(cudaMemcpyAsync(T.rlog, W.rlog, (size_t) c.E * 4, cudaMemcpyDeviceToDevice, T.s));
+    } else if (!T.link.copy(0, g_s, W.xq, 1, T.s, T.xq, (size_t) C * 4, T.s, err) ||
+               !T.link.copy(0, g_s, W.rlog, 1, T.s, T.rlog, (size_t) c.E * 4, T.s, err)) {
+        die(err);
+    }
+    int* rtop = T.route_d;
+    float* rw = (float*) (T.route_d + c.K);
+    k::route_token(T.rlog, T.bias[l], c.E, c.K, c.route_scale, T.tab[l], T.sc[0][l], T.sc[1][l], T.sc[2][l], rtop, rw,
+                   T.blob, T.tok, T.inv, T.sg, T.su, T.wt, T.s, T.xq, C, exp_tc ? (uint16_t*) T.gu32 : nullptr);
+    if (exp_tc) {
+        k::experts_gate_up_swiglu_mma(T.blob, c.K, Ly.eb[0], (const uint16_t*) T.gu32, C, c.F, T.sg, T.su, c.gate_cap,
+                                      c.up_cap, T.h16, T.s);
+        k::experts_down_mma(T.blob, c.K, Ly.eb[0] + Ly.eb[1], T.h16, C, c.F, T.y32, T.s);
+    } else {
+        k::experts_gate_up_swiglu(T.blob, T.tok, c.K, Ly.ty[0], Ly.ty[1], Ly.eb[0], T.xq, C, c.F, T.sg, T.su, c.gate_cap,
+                                  c.up_cap, T.h16, T.s);
+        k::experts_down(T.blob, c.K, Ly.ty[2], Ly.eb[0] + Ly.eb[1], T.h16, C, c.F, T.y32, T.s);
+    }
+    CU(cudaEventRecord(T.ev_y, T.s));
+#if defined(_WIN32)
+    if (!g_graph) (void) cudaStreamQuery(T.s);   // (Windows + AMD start queued work only at a host wait)
+#endif
+    CU(cudaSetDevice(0));
+}
+// GPU 1's rows in place of the picks it ran (on g_s, after GPU 0's own experts): over, then taken
+void two_take(const Model& M, Work& W) {
+    const Config& c = M.c;
+    TwoGpu& T = g_two;
+    std::string err;
+    CU(cudaStreamWaitEvent(g_s, T.ev_y, 0));
+    if (T.link.all_peer) CU(cudaMemcpyAsync(T.y_in, T.y32, (size_t) c.K * c.C * 4, cudaMemcpyDeviceToDevice, g_s));
+    else if (!T.link.copy(1, T.s, T.y32, 0, g_s, T.y_in, (size_t) c.K * c.C * 4, g_s, err)) die(err);
+    CU(cudaSetDevice(0));
+    k::two_take_rows(W.blob, T.y_in, c.K, c.C, W.y32, g_s);
+}
+
 // one token's launches: its embedding row in W.emb_h and its position in W.pos_h[0] (pinned host; copied first)
 void fast_token_launches(Model& M, Work& W, OutMode out_mode) {
     const Config& c = M.c;
@@ -2382,6 +2459,7 @@ void fast_token_launches(Model& M, Work& W, OutMode out_mode) {
         static const int exp_mma = getenv("IK2_EXPERT_MMA") ? atoi(getenv("IK2_EXPERT_MMA")) : 1;
 #endif
         const bool exp_tc = exp_mma && !g_lane && k::experts_mma_fits(Ly.ty[0], Ly.ty[1], Ly.ty[2], C, c.F);
+        if (g_two.on) two_send(M, l, W, exp_tc);   // (two GPUs: GPU 1's picks there, beside GPU 0's)
         k::route_token(W.rlog, Ly.probs_b, c.E, c.K, c.route_scale, Ly.tab_blob, Ly.tab_sc[0], Ly.tab_sc[1],
                        Ly.tab_sc[2], rtop, rw, W.blob, W.tok, W.inv, W.sg, W.su, W.wt, g_s, W.xq, C,
                        exp_tc ? (uint16_t*) W.gu32 : nullptr);
@@ -2412,6 +2490,7 @@ void fast_token_launches(Model& M, Work& W, OutMode out_mode) {
                                       c.gate_cap, c.up_cap, W.h16, g_s);
             k::experts_down(W.blob, c.K, Ly.ty[2], Ly.eb[0] + Ly.eb[1], W.h16, C, c.F, W.y32, g_s);
         }
+        if (g_two.on) two_take(M, W);
         k::moe_combine_conv(W.y32, W.inv, W.wt, c.K, C, Ly.h_mlp, Ly.sc_mlp, W.r, W.h, g_s);
     }
     if (out_mode == OutMode::kNone) return;
@@ -2451,7 +2530,9 @@ void off_tables(Model& M) {
         const auto& P = EC.pools[EC.layer_pool[l]];
         for (int e = 0; e < c.E; ++e) {
             const int s = EC.loc[(size_t) l * c.E + e];
-            tab[(size_t) l * c.E + e] = s >= 0 && s < P.n_active ? P.data + (size_t) s * P.slot_bytes : nullptr;
+            tab[(size_t) l * c.E + e] = s >= 0 && s < P.n_active ? P.data + (size_t) s * P.slot_bytes
+                                        : g_two.on && g_two.own[(size_t) l * c.E + e] ? (const uint8_t*) k::kHeldElsewhere
+                                                                                      : nullptr;
         }
     }
     for (int l = 0; l < c.n_layer; ++l)   // (on the compute stream: after whatever still reads them)
@@ -2459,6 +2540,119 @@ void off_tables(Model& M) {
                            cudaMemcpyHostToDevice, g_s));
     CU(cudaStreamSynchronize(g_s));   // (tab is the source until then)
     g_offs.tick = EC.tick;
+}
+
+// Two GPUs, at load (GPU 0's offload tier planned, the rest of the experts pinned): GPU 1 takes the most picked a byte
+// (the profile's picks; value) of the experts GPU 0's tier does not hold, as many as its memory holds; then its
+// tables, scales, router bias and token buffers, the link between the two GPUs (mm3_link.cuh) and GPU 0's tables
+// with GPU 1's experts marked.  False: GPU 1 holds none (GPU 0 alone then).
+bool two_setup(Model& M, ExpertCache& EC, const std::vector<double>& value) {
+    const Config& c = M.c;
+    TwoGpu& T = g_two;
+    const int C = c.C, K = c.K, E = c.E, nE = c.n_layer * c.E;
+    int cls0 = 0, cls1 = 0;
+    CU(cudaSetDevice(0));
+    cls0 = k::arch_class();
+    CU(cudaSetDevice(T.dev));
+    cls1 = k::arch_class();
+    cudaDeviceProp p1{};
+    CU(cudaGetDeviceProperties(&p1, T.dev));
+    // its room: what is free less a quarter of a GiB (IK2_ROOM1_MB) and its token buffers; GPUs of two kinds compute
+    // a row each their own way, so the split must not move between starts there: whole GiB
+    size_t fr = 0, tot = 0;
+    CU(cudaMemGetInfo(&fr, &tot));
+    const size_t keep = (size_t) (getenv("IK2_ROOM1_MB") ? std::atof(getenv("IK2_ROOM1_MB")) : 256.0) * 1048576.0 +
+                        ((size_t) 8 << 20);
+    size_t room = fr > keep ? fr - keep : 0;
+    if (cls0 != cls1) room &= ~(((size_t) 1 << 30) - 1);
+    std::vector<char> tier(nE, 0);
+    for (int l = 0; l < c.n_layer; ++l) {
+        const auto& P = EC.pools[EC.layer_pool[l]];
+        for (int e = 0; e < E; ++e) {
+            const int s = EC.loc[(size_t) l * E + e];
+            tier[(size_t) l * E + e] = s >= 0 && s < P.n_active;
+        }
+    }
+    std::vector<int> cand;
+    for (int i = 0; i < nE; ++i)
+        if (!tier[i]) cand.push_back(i);
+    auto val = [&](int i) { return value.empty() ? 1.0 : value[(size_t) i] + 1.0; };
+    std::stable_sort(cand.begin(), cand.end(), [&](int a, int b) {
+        return val(a) / (double) M.L[a / E].slot_bytes > val(b) / (double) M.L[b / E].slot_bytes;
+    });
+    T.own.assign(nE, 0);
+    std::vector<int> per(c.n_layer, 0);
+    size_t used = 0;
+    double v_own = 0, v_all = 0;
+    for (int i = 0; i < nE; ++i) v_all += val(i);
+    for (int i : cand) {
+        const size_t sb = M.L[i / E].slot_bytes;
+        if (used + sb > room) continue;   // (a smaller slot may still fit)
+        used += sb, T.own[i] = 1, ++per[i / E], v_own += val(i), ++T.n_exp;
+    }
+    T.bytes = used;
+    if (T.n_exp == 0) {
+        if (cand.empty()) std::printf("two GPUs: GPU 0's tier holds every expert - GPU 0 alone\n");
+        else std::printf("two GPUs: GPU 1 (%s) has no room for experts (%.1f GiB free) - GPU 0 alone\n", p1.name,
+                         fr / 1073741824.0);
+        CU(cudaSetDevice(0));
+        return false;
+    }
+    CU(cudaStreamCreate(&T.s));
+    CU(cudaEventCreateWithFlags(&T.ev_y, cudaEventDisableTiming));
+    const double t0 = now();
+    const uint64_t b0 = EC.bytes_up;
+    T.tab.assign(c.n_layer, nullptr), T.bias.assign(c.n_layer, nullptr);
+    for (auto& v : T.sc) v.assign(c.n_layer, nullptr);
+    std::vector<float> hb(E);
+    for (int l = 0; l < c.n_layer; ++l) {
+        Layer& Ly = M.L[l];
+        std::vector<const uint8_t*> tab(E, nullptr);
+        uint8_t* blk = per[l] ? dalloc<uint8_t>((size_t) per[l] * Ly.slot_bytes) : nullptr;
+        int j = 0;
+        for (int e = 0; e < E; ++e) {
+            if (!T.own[(size_t) l * E + e]) continue;
+            uint8_t* dst = blk + (size_t) j++ * Ly.slot_bytes;
+            EC.copy_in(Ly, e, dst, T.s);
+            tab[e] = dst;
+        }
+        T.tab[l] = dalloc<const uint8_t*>(E);
+        CU(cudaMemcpy(T.tab[l], tab.data(), (size_t) E * sizeof(void*), cudaMemcpyHostToDevice));
+        for (int r = 0; r < 3; ++r)
+            if (!Ly.scale[r].empty()) T.sc[r][l] = dev_f32(Ly.scale[r]);
+        CU(cudaMemcpy(hb.data(), Ly.probs_b, (size_t) E * 4, cudaMemcpyDeviceToHost));
+        T.bias[l] = dev_f32(hb);
+    }
+    CU(cudaStreamSynchronize(T.s));
+    EC.bytes_up = b0;
+    const int S = std::max(64, K);
+    T.xq = dalloc<float>(C), T.rlog = dalloc<float>(E), T.route_d = dalloc<int>(2 * S);
+    T.tok = dalloc<int>(S), T.inv = dalloc<int>(S), T.sg = dalloc<float>(S), T.su = dalloc<float>(S);
+    T.wt = dalloc<float>(S), T.blob = dalloc<const uint8_t*>(S), T.gu32 = dalloc<float>((size_t) 2 * C);
+    T.h16 = dalloc<uint16_t>((size_t) S * c.F), T.y32 = dalloc<float>((size_t) S * C);
+    CU(cudaSetDevice(0));
+    T.y_in = dalloc<float>((size_t) S * C);
+    CU(cudaEventCreateWithFlags(&T.ev_x, cudaEventDisableTiming));
+    const char* hs = getenv("IK2_HOST_STAGE");
+    const char* hp = getenv("IK2_PEER");
+    std::string err;
+    const size_t yb = (size_t) K * C * 4;
+    if (!T.link.setup({0, T.dev}, {0, 1, 1, 0}, {(void*) T.y_in, (void*) T.y32}, (size_t) S * C * 4, {g_dev[0].s, T.s},
+                      hs && std::atoi(hs), hp && std::atoi(hp), yb, yb, "IK2_HOST_STAGE", err))
+        die(err);
+    CU(cudaSetDevice(0));
+    T.on = true;
+    g_offs.tick = ~0ull;   // (GPU 0's tables again: GPU 1's experts marked)
+    off_tables(M);
+    std::printf("two GPUs: GPU 1 (%s) holds %d experts (%.1f GiB, %.0f%% of the profile's picks), copied in %.1f s; "
+                "%s; GPUs of %s\nINFO hand-offs between GPUs: %s\n", p1.name, T.n_exp, used / 1073741824.0,
+                100.0 * v_own / v_all, now() - t0,
+                "a token's experts on both GPUs, every prompt on GPU 0",
+                cls0 == cls1 ? "one kind (one GPU's answers)" : "two kinds (each GPU's own kernels; the split kept "
+                                                                "in whole GiB, so it repeats from start to start)",
+                T.link.say.c_str());
+    std::fflush(stdout);
+    return true;
 }
 
 // The lane-parity mode (IK2_LANE=1, =fetch / =cpu: every miss to one side - tests): the CPU lane started and the
@@ -4404,9 +4598,17 @@ void check_preview(int n_gpu, bool serve) {
     if (e != cudaSuccess || nd < 1)
         refuse(std::string("no ") + vendor + " GPU visible (" + (e != cudaSuccess ? cudaGetErrorString(e) : "0 devices") +
             "): the Inkling 2 preview runs on one " + vendor + " GPU");
-    if (n_gpu < 1 || n_gpu > 2) refuse("--gpus " + std::to_string(n_gpu) + ": the Inkling 2 preview runs on one GPU");
-    if (n_gpu == 2 && !force)
-        refuse("--gpus 2: the Inkling 2 preview runs on one GPU, two (IK2_EP=1 or IK2_TP=1) are outside it" + run_anyway);
+    if (n_gpu < 1 || n_gpu > 2)
+        refuse("--gpus " + std::to_string(n_gpu) + ": Inkling 2 runs on one or two GPUs (three or more are not in it yet)");
+    const bool old_two = (getenv("IK2_EP") && std::atoi(getenv("IK2_EP"))) || (getenv("IK2_TP") && std::atoi(getenv("IK2_TP")));
+    if (n_gpu == 2 && old_two && !force)
+        refuse("--gpus 2 with IK2_EP=1 / IK2_TP=1: the older two-GPU modes are outside the preview (without them: "
+               "the two-GPU split)" + run_anyway);
+#ifdef STRATA_USE_HIP   // (the split runs GPU 0 on the offload path, not checked on AMD yet)
+    if (n_gpu == 2 && !force) refuse("--gpus 2: two AMD GPUs are not in the Inkling 2 preview yet" + run_anyway);
+#endif
+    if (n_gpu == 2 && nd < 2)
+        refuse("--gpus 2: " + std::to_string(nd) + " GPU visible");
     for (int d = 0; d < std::min(n_gpu, nd); ++d) {
         cudaDeviceProp p{};
         CU(cudaGetDeviceProperties(&p, d));
@@ -4536,6 +4738,13 @@ int main(int argc, char** argv) {
         if (*p == ',') ++p;
     }
     check_preview(n_gpu, serve);
+    // --gpus 2: the split (TwoGpu) - the engine runs as on one GPU (GPU 0), GPU 1 added to the token path at load;
+    // IK2_EP=1 / IK2_TP=1: the older two-GPU modes on the cache path instead (IK2_UNSUPPORTED)
+    if (n_gpu == 2 && !(getenv("IK2_EP") && std::atoi(getenv("IK2_EP"))) &&
+        !(getenv("IK2_TP") && std::atoi(getenv("IK2_TP")))) {
+        g_two.want = true;
+        n_gpu = 1;
+    }
 #ifdef STRATA_USE_HIP
     {   // (AMD: the GEMMs' measured kernels - lt-picks.txt beside the GGUF, or IK2_LT_STORE's file; empty: none kept)
         const char* ls = std::getenv("IK2_LT_STORE");
@@ -4546,17 +4755,22 @@ int main(int argc, char** argv) {
 #endif
     // IK2_VRAM_GB=N (tests): the first GPU as a card of N GiB - the rest of its memory taken now and kept, so every
     // figure the engine reads (cudaMemGetInfo) is a smaller card's
-    if (const char* vg = getenv("IK2_VRAM_GB"); vg && *vg) {
+    // (two GPUs: each of them; IK2_VRAM_GB1: GPU 1's own)
+    for (int d = 0; d < (g_two.want ? 2 : 1); ++d) {
+        const char* vg = getenv(d == 1 && getenv("IK2_VRAM_GB1") ? "IK2_VRAM_GB1" : "IK2_VRAM_GB");
+        if (!vg || !*vg) continue;
+        CU(cudaSetDevice(d));
         size_t fr = 0, tot = 0;
         CU(cudaMemGetInfo(&fr, &tot));
         const size_t want = (size_t) (std::atof(vg) * 1073741824.0);
         if (want < tot) {
             void* ballast = nullptr;
             CU(cudaMalloc(&ballast, tot - want));
-            std::printf("IK2_VRAM_GB=%s: GPU 0 as a card of %.1f GiB (%.1f GiB held back)\n", vg, want / 1073741824.0,
-                        (tot - want) / 1073741824.0);
+            std::printf("IK2_VRAM_GB=%s: GPU %d as a card of %.1f GiB (%.1f GiB held back)\n", vg, d,
+                        want / 1073741824.0, (tot - want) / 1073741824.0);
         }
     }
+    CU(cudaSetDevice(0));
     const double t_start = now();
     Shards S(model);
     Model M;
@@ -4673,15 +4887,26 @@ int main(int argc, char** argv) {
     g_ep = n_gpu == 2 && getenv("IK2_EP") && std::atoi(getenv("IK2_EP"));
     g_tp = n_gpu == 2 && !g_ep && getenv("IK2_TP") && std::atoi(getenv("IK2_TP"));
     if (dual()) {
-        int p01 = 0, p10 = 0;
-        CU(cudaDeviceCanAccessPeer(&p01, 0, 1));
-        CU(cudaDeviceCanAccessPeer(&p10, 1, 0));
-        if (p01 && p10) {
-            CU(cudaSetDevice(0));
-            CU(cudaDeviceEnablePeerAccess(1, 0));
-            CU(cudaSetDevice(1));
-            CU(cudaDeviceEnablePeerAccess(0, 0));
+        // (their copies are the runtime's peer copies: peer access only where mm3_link.cuh's test copy passes, and
+        //  not at all where the IOMMU translates - those modes have no host-memory hand-off: refused there)
+        gpulink::Links lk;
+        std::string err;
+        std::vector<void*> tb(2);
+        for (int d = 0; d < 2; ++d) {
+            CU(cudaSetDevice(d));
+            CU(cudaMalloc(&tb[d], (size_t) 4 << 20));
         }
+        if (!lk.setup({0, 1}, {0, 1, 1, 0}, tb, (size_t) 4 << 20, {g_dev[0].s, g_dev[1].s}, false,
+                      getenv("IK2_PEER") && std::atoi(getenv("IK2_PEER")), 1, 1, "IK2_HOST_STAGE", err))
+            die(err);
+        for (int d = 0; d < 2; ++d) {
+            CU(cudaSetDevice(d));
+            CU(cudaFree(tb[d]));
+        }
+        if (lk.of(0, 1) == gpulink::kHost || lk.of(1, 0) == gpulink::kHost)
+            die("IK2_EP / IK2_TP: " + lk.say + " - these modes copy only peer to peer or by the driver (the two-GPU "
+                "split without them hands over through host memory)");
+        const int p01 = lk.all_peer, p10 = lk.all_peer;
         CU(cudaSetDevice(0));
         CU(cudaEventCreateWithFlags(&g_ep_x, cudaEventDisableTiming));
         CU(cudaEventCreateWithFlags(&g_ep_cp[0], cudaEventDisableTiming));
@@ -4800,7 +5025,19 @@ int main(int argc, char** argv) {
         // the offload path even where every expert fits (tests).  Not with two GPUs or the CPU lane (n_gpu == 1,
         // !g_pool here).
         const char* off_env = getenv("IK2_OFF");
-        const int off_set = off_env && *off_env ? std::atoi(off_env) : -1;
+        int off_set = off_env && *off_env ? std::atoi(off_env) : -1;
+        // Two GPUs: where GPU 0 holds every expert, the resident path there alone (one GPU's speed, v1.1.73's path;
+        // IK2_TWO=1: the split anyway), else the split - GPU 0 on the offload path, GPU 1 with the next experts
+        if (g_two.want) {
+            const char* tw = getenv("IK2_TWO");
+            if (fits && !(tw && std::atoi(tw)) && off_set != 1) {
+                std::printf("two GPUs: GPU 0 holds every expert - they all stay there and GPU 1 is not used (the "
+                            "resident path; IK2_TWO=1: the two-GPU split anyway)\n");
+                g_two.want = false;
+            } else {
+                off_set = 1;
+            }
+        }
         if (fits && !getenv("IK2_DENSE")) g_dense_q8 = true;
         g_fast_want = fits && off_set != 1 && g_dense_q8 && !(getenv("IK2_FAST") && !std::atoi(getenv("IK2_FAST")));
         g_off_want = (off_set == 1 || (off_set != 0 && !fits)) && !getenv("IK2_DENSE");
@@ -4821,7 +5058,8 @@ int main(int argc, char** argv) {
         const double vis = getenv("IK2_VISION_GIB") ? std::atof(getenv("IK2_VISION_GIB")) * 1073741824.0 : 0.0;
         const double left = fr0 > used ? (double) (fr0 - used) : 0.0;
         auto room_ok = [&](size_t need, std::string& why) {
-            if (!g_fast_want) why = "it runs where every expert stays in VRAM (the resident path), not here";
+            if (g_two.want) why = "on two GPUs it is not checked against plain decoding yet (plain decoding)";
+            else if (!g_fast_want) why = "it runs where every expert stays in VRAM (the resident path), not here";
             else if (used + need > fr0) why = "its room does not fit beside the model at this context";
             else if (vis > 0 && left >= vis && left - (double) need < vis)
                 why = "its room would move the pictures' encoder from the GPU to the CPU";
@@ -5708,7 +5946,8 @@ int main(int argc, char** argv) {
         // auto: decided from the calibration's figures), else mode A (the resident kernels, the bus only);
         // IK2_LANE=0: mode A, =1 / fetch / cpu: lane parity (tests).
         const char* le = getenv("IK2_LANE");
-        const std::string lw = le && *le ? le : "auto";
+        // (two GPUs: mode A - GPU 1's rows are the resident kernels', so GPU 0's must be too)
+        const std::string lw = g_two.want ? "0" : le && *le ? le : "auto";
         if (lw != "0") {
             g_lane = lane_init(M, lw, getenv("IK2_LANE_THREADS") ? std::atoi(getenv("IK2_LANE_THREADS")) : -1);
             if (!g_lane) std::printf("lane parity: off - an expert format the exact lane does not have\n");
@@ -5737,6 +5976,10 @@ int main(int argc, char** argv) {
                         100.0 * h);
             if (!faster) g_lane = false, g_offs.lane.reset();
         }
+        // two GPUs: GPU 1's experts - a token's launches on both devices one by one (2x V100, 2x 12 GB: 78.7 tok/s,
+        // against 73.1 as one CUDA graph across them; IK2_TWO_GRAPH=1: the graph, where every copy is a peer one)
+        if (g_two.want && two_setup(M, EC, off_value))
+            g_graph = g_graph && g_two.link.all_peer && getenv("IK2_TWO_GRAPH") && std::atoi(getenv("IK2_TWO_GRAPH"));
         int n_tier = 0;
         for (int i = 0; i < c.n_layer * c.E; ++i) n_tier += EC.loc[i] >= 0;
         size_t st_b = 0;
@@ -5984,7 +6227,7 @@ int main(int argc, char** argv) {
             // (dspark= / lookup=: the drafters this start runs - the Monitor's Speculation; drafting= the choice)
             const bool sp = (drafter || g_lookup) && g_fast && g_block;
             std::printf("INFO engine=ik2 engine_kind=ik2 model=Inkling-2 kv=%s ctx=%d gpus=%d dspark=%d lookup=%d "
-                        "drafting=%s\n", g_kv_fp8 ? "fp8" : "f16", ctx, n_gpu, sp && drafter ? 1 : 0, sp && g_lookup ? 1 : 0,
+                        "drafting=%s\n", g_kv_fp8 ? "fp8" : "f16", ctx, g_two.on ? 2 : n_gpu, sp && drafter ? 1 : 0, sp && g_lookup ? 1 : 0,
                         drafting.c_str());
             std::printf("READY %d stop\n", ctx);
         } else {

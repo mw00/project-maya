@@ -377,9 +377,23 @@ the offload path (its window runs only where every expert is in VRAM; a NOTE say
 (sm_100 / sm_120) compile-checked only. Elsewhere `maya-ik2` stops at the start with one line saying why (under
 `--serve` also as a `NOTE` the server prints): no NVIDIA GPU, a GPU older than sm_70 (Pascal and before: none of the
 tensor-core instructions its kernels use), a build with no kernels for the GPU's arch, less than 7 GiB of VRAM,
-`--gpus 2` or more, Windows. `IK2_UNSUPPORTED=1` runs it anyway where it can run at all: two GPUs (`IK2_EP=1` or
-`IK2_TP=1`, section 6), smaller cards with the experts streamed from RAM, @cobra91's Windows / CUDA 13 port -
-untested here. CMake skips `maya-ik2` without a CUDA arch of 70 or more in the list, and on Windows unless
+`--gpus 3` or more, Windows. `IK2_UNSUPPORTED=1` runs it anyway where it can run at all: the older two-GPU modes
+(`IK2_EP=1` or `IK2_TP=1`, section 6), @cobra91's Windows / CUDA 13 port - untested here.
+
+**Two NVIDIA GPUs** (`--gpus 2`, Linux; the setup offers it where two cards can be used, the larger first): where the
+first card holds every expert it runs alone (the resident path - faster there than the split: 2x V100 32 GB, one card
+86.7 tok/s against ~74 with the experts split). Else the split: the first card runs the offload path (the dense
+weights, the K / V cache, every prompt, its tier of the experts), the second holds the next experts by the profile's
+picks a byte, the rest stay in pinned RAM. A token's MoE: the input and the router's logits go to the second card, it
+routes them with its own table and runs the picks it holds with the token path's kernels, its rows come back and take
+those picks' places before the sum - so every row and the sum's order are one card's, and the answers do not depend
+on which card holds an expert (two cards of one kind: the one-card offload path's answers, checked on the CLI and the
+server's answers, tool calls, pictures and loop guard). Copies between the cards: peer to peer only where the driver
+offers it, the IOMMU translates neither card and a test copy at load arrives intact, else through pinned host memory
+(`IK2_HOST_STAGE=1` forces that; the same answers). Drafting is off on two cards (a NOTE; not checked against plain
+decoding there yet). Measured on 2x V100 (FP16 cache, 32K context, a 2K prompt): two 12 GB cards (emulated) 78.7
+tok/s answers / 1186 tok/s prompts, two 8 GB cards 46.3 / 935 (one 8 GB card: 15.0 / 927). The prompts stream the
+second card's experts from RAM, so they run at the offload path's speed. CMake skips `maya-ik2` without a CUDA arch of 70 or more in the list, and on Windows unless
 `-DSTRATA_IK2_WINDOWS=ON`.
 
 **AMD (HIP, Linux).** A HIP build has `maya-ik2` for every arch of its list (not for AMD on Windows yet). The kernels
@@ -405,7 +419,8 @@ Thinking is the template's `reasoning_effort`, a name or a number in [0.0, 0.99]
 | `mmproj-BF16.gguf` (0.6 GB, pictures) | same | `2c165c78790e78a3f45a2d1e9e931083e52ee69d45ff2a0dc9c281fdf1a666e7` |
 | `mtp.safetensors` (0.6 GB, the drafter: the setup fetches it, not with `--drafting off`) | [thinkingmachines/Inkling-2-Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini) | `7c3b651317f01f73bcf4e1dceba66ef8b7e1a1eac6bc171e882e690a4b10a1d2` |
 
-Outside the preview, two GPUs with a loop run as expert parallel (`IK2_EP=1`, its caches filled at the start:
-checked on Windows, an RTX 5080 with an RTX 4060 Ti); the drafter is one GPU's.  Not done: the loop in the layer-major prompt passes (`IK2_SUP`: off
+Outside the preview, the older two-GPU mode with a loop runs as expert parallel (`IK2_EP=1`, its caches filled at the
+start: checked on Windows, an RTX 5080 with an RTX 4060 Ti; refused where the copies between the cards would have to go
+through host memory); the drafter is one GPU's.  Not done: the loop in the layer-major prompt passes (`IK2_SUP`: off
 for a looped model), a second card for the KV cache (a million tokens is 16 GiB of it), the drafter's own launches
 as a graph (2-3 ms a step now).

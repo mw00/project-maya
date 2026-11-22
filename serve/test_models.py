@@ -334,7 +334,7 @@ class Settings(unittest.TestCase):
         return p
 
     def test_ik2_read_and_written_with_its_own_flags(self):
-        """Inkling-2-Mini's preview on the Models page: its context, cache format and one GPU - maya-ik2's own flags
+        """Inkling-2-Mini's preview on the Models page: its context, cache format and one or two GPUs - maya-ik2's own flags
         only; drafting (auto, the drafter by hand, off); what it does not have yet (answers at once) said, and pictures where the setup
         left out the image encoder."""
         cards = mock.patch.object(M, "machine_gpus", return_value=[{"index": 0, "name": "RTX 3090", "vram_gb": 24.0},
@@ -360,7 +360,11 @@ class Settings(unittest.TestCase):
         # maya-ik2 stops at a flag it does not know: only its own
         self.assertEqual({x for x in M.apply(cfg, {"context": 65536})["args"] if x.startswith("--")},
                          {"--model", "--max-context"})
-        for bad, why in (({"gpus": [0, 1]}, "one GPU"), ({"parallel": 2}, "one request at a time"),
+        # (two GPUs: the split, --gpus 2; back to one: no --gpus)
+        two = M.apply(cfg, {"gpus": [0, 1]})
+        self.assertEqual(M.flag(two["args"], "--gpus"), "2")
+        self.assertIsNone(M.flag(M.apply(two, {"gpus": [0]})["args"], "--gpus"))
+        for bad, why in (({"gpus": [0, 1, 2]}, "one or two GPUs"), ({"parallel": 2}, "one request at a time"),
                          ({"draft": "dspark"}, "this setup has no drafter"), ({"draft": "mtp"}, "auto, the drafter"),
                          ({"kv": "int8"}, "FP8 or F16"), ({"images": True}, "set up without its image encoder"),
                          ({"reserve_mib": 512}, "not a setting")):

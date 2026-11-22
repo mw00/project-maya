@@ -53,6 +53,45 @@ def plan(vram_gb: float, ctx: int, kv: str = DEFAULT_KV) -> dict:
             "ram_gib": round(EXPERTS_GIB - tier + OFF_HOST_GIB, 1)}
 
 
+TWO_ROOM_GIB = 0.3                                  # the second card's room beside its experts (token buffers, slack)
+
+
+def plan_two(vram0_gb: float, vram1_gb: float, ctx: int, kv: str = DEFAULT_KV) -> dict:
+    """Two NVIDIA cards (maya-ik2 --gpus 2, the larger first): the first alone where it holds every expert (the
+    resident path - faster there than the split: 2x V100 86.7 against ~74 tok/s), else the split - the first card on
+    the offload path (the dense weights, the cache, every prompt, its tier), the second with the next experts, the
+    rest in pinned RAM.  plan()'s keys plus "gpus" (1 or 2), "layout" "resident" / "split" (every expert on the two
+    cards) / "split+ram", "gpu1_gib" (the second card's experts).  "ram_gib" as one card's offload path: the prompts
+    stream every expert the first card does not hold, the second card's too."""
+    p0 = plan(vram0_gb, ctx, kv)
+    if p0["resident"]:
+        return dict(p0, gpus=1, gpu1_gib=0.0)
+    g1 = round(max(0.0, min(EXPERTS_GIB - p0["tier_gib"], float(vram1_gb or 0) - MARGIN_GIB - TWO_ROOM_GIB)), 1)
+    return dict(p0, gpus=2, gpu1_gib=g1, layout="split" if p0["tier_gib"] + g1 >= EXPERTS_GIB - 0.05 else "split+ram")
+
+
+def verdict_two(vram0_gb: float, vram1_gb: float, ram_gb: float, ctx: int, kv: str = DEFAULT_KV) -> tuple:
+    """verdict() for two cards (plan_two): "fast" - every expert in VRAM (on the first alone, or across the two),
+    "runs" / "tight" / "does not fit" as verdict() with the split's share."""
+    p = plan_two(vram0_gb, vram1_gb, ctx, kv)
+    if p["gpus"] == 1:
+        return verdict(vram0_gb, ram_gb, ctx, kv)
+    if ram_gb and ram_gb < p["ram_gib"]:
+        return "does not fit", too_small_line(ram_gb, vram0_gb, p["ram_gib"])
+    held = p["tier_gib"] + p["gpu1_gib"]
+    if p["layout"] == "split":
+        line = (f"every expert in VRAM across the two cards (about {p['tier_gib']:.1f} GB on the first, "
+                f"{p['gpu1_gib']:.1f} GB on the second; the second's also pinned in RAM for prompts)")
+        word = "fast"
+    else:
+        line = (f"about {held:.1f} of the experts' {EXPERTS_GIB:.1f} GB on the two cards ({100.0 * held / EXPERTS_GIB:.0f}%"
+                f"), the other {EXPERTS_GIB - held:.1f} GB pinned in RAM - slower than with every expert in VRAM")
+        word = "runs"
+    if ram_gb and ram_gb < p["ram_gib"] + OS_GIB:
+        return "tight", line + f"; it takes about {p['ram_gib']:.0f} GB of RAM, this PC has {ram_gb:.0f} GB"
+    return word, line
+
+
 DRAFT_BASE_GIB = 0.88                               # the drafter (mtp.safetensors 0.59 GiB, its fold through the head,
 DRAFT_TOKEN_BYTES = 4864                            # its rings, the taps): maya-ik2's draft_room; its layer without a
                                                     # window's context 4 KiB a token + its scratch's 768 B
@@ -152,12 +191,13 @@ def unsupported(backend: str, windows: bool, gpus_asked: int, cards: list, ram_g
             return ("Inkling 2 Mini on AMD runs on Linux only for now (its engine is not built for AMD on Windows "
                     "yet)")
         if gpus_asked > 1:
-            return "Inkling 2 Mini is an experimental preview that runs on one GPU only for now: pick one (--gpu N)"
+            return "Inkling 2 Mini on AMD runs on one GPU for now: pick one (--gpu N)"
         return amd_unsupported(cards)
     if windows:
         return "Inkling 2 Mini is an experimental preview that runs on Linux only for now (not on Windows yet)"
-    if gpus_asked > 1:
-        return "Inkling 2 Mini is an experimental preview that runs on one GPU only for now: pick one (--gpu N)"
+    if gpus_asked > 2:
+        return ("Inkling 2 Mini runs on one or two NVIDIA GPUs for now (three or more are not in it yet): pick one or "
+                "two (--gpu N, --gpus N,M)")
     if cards:
         new = [g for g in cards if int(g.get("arch") or 0) >= MIN_CC]
         if not new:
@@ -166,6 +206,8 @@ def unsupported(backend: str, windows: bool, gpus_asked: int, cards: list, ram_g
         vram = max(float(g.get("vram_gb") or 0) for g in new)
         if vram < MIN_VRAM_GB:
             return "Inkling 2 Mini needs one NVIDIA GPU with 8 GB of VRAM or more"
+        if gpus_asked == 2 and min(float(g.get("vram_gb") or 0) for g in cards) < MIN_VRAM_GB:
+            return "Inkling 2 Mini on two GPUs needs 8 GB of VRAM or more on each of them (or one GPU: --gpu N)"
         if ram_gb and vram - MARGIN_GIB < need_gib(CONTEXTS[0]) and ram_gb < plan(vram, CONTEXTS[0])["ram_gib"]:
             return too_small_line(ram_gb, vram)
     return None

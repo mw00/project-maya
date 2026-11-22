@@ -41,6 +41,7 @@
 #include "mm3_gguf_host.hpp"
 #include "mm3_kernels.cuh"
 #include "mm3_lane_plan.hpp"
+#include "mm3_link.cuh"
 #include "mm3_os.hpp"
 #include "mm3_tp.hpp"
 #include "mm3_vision.hpp"
@@ -1797,23 +1798,26 @@ struct Model::Impl {
                                " MoE layers host-free (every expert in VRAM: the routing stays on the GPU)");
             // a token's and a window's whole forward as a graph (graph_ready): one GPU, every MoE layer host-free
             const char* gv = ::mm3::env("MM3_GRAPH");
-            // (several GPUs: peer access between them all - the forward's copies across them plain device copies)
+            // (several GPUs: the copies between them - mm3_link.cuh: a peer copy only where the driver offers it, the
+            //  IOMMU translates neither GPU and a test copy arrives intact, else through host memory; every pair a
+            //  tested peer copy: the forward's copies across them plain device copies.  MM3_HOST_STAGE=1: host memory
+            //  for all; MM3_PEER=1: peer copies tried (and tested) where the IOMMU translates too)
             if (D.size() > 1) {
-                bool all = true;
-                for (Dev& a : D)
-                    for (Dev& b : D) {
-                        if (&a == &b) continue;
-                        int can = 0;
-                        if (cudaDeviceCanAccessPeer(&can, a.id, b.id) != cudaSuccess || !can) {
-                            all = false;
-                            continue;
-                        }
-                        cudaSetDevice(a.id);
-                        const cudaError_t pe = cudaDeviceEnablePeerAccess(b.id, 0);
-                        if (pe != cudaSuccess && pe != cudaErrorPeerAccessAlreadyEnabled) all = false;
-                        cudaGetLastError();
-                    }
-                p2p_all = all;
+                const size_t n = D.size();
+                std::vector<int> ids(n);
+                std::vector<char> used(n * n, 1);   // (the hops, the head's rows, the prompt's stages, the draft's taps)
+                std::vector<void*> tb(n);
+                std::vector<cudaStream_t> ss(n);
+                for (size_t i = 0; i < n; ++i) ids[i] = D[i].id, tb[i] = D[i].h, ss[i] = D[i].s, used[i * n + i] = 0;
+                const char* hs = ::mm3::env("MM3_HOST_STAGE");
+                const char* hp = ::mm3::env("MM3_PEER");
+                const char* sm = ::mm3::env("MM3_STAGE_MB");
+                const size_t hb = (size_t) o.chunk * g.dim * 4;
+                if (!links.setup(ids, used, tb, hb, ss, hs && std::atoi(hs) != 0, hp && std::atoi(hp) != 0, hb,
+                                 (size_t) std::max(1, sm ? std::atoi(sm) : 8) << 20, "MM3_HOST_STAGE", err))
+                    return false;
+                p2p_all = links.all_peer;
+                info.push_back("hand-offs between GPUs: " + links.say);
             }
             graph_on = (gv == nullptr || std::atoi(gv) != 0) && D.size() == 1 && nhf > 0 && nhf == nmoe &&
                        !o.verbose &&
@@ -2904,13 +2908,16 @@ struct Model::Impl {
         }
         return copy_peer(dst, b, a.h, a, bytes, b.s, err);
     }
-    // peer access between every two of the GPUs where they have it (load): the forward's copies across then a plain
-    // device copy - one a graph can hold - else the runtime's peer copy (through the host where the GPUs cannot)
+    // the copies between the GPUs (load: links.setup): every pair a tested peer copy - a plain device copy, one a graph
+    // can hold; else each pair's own (mm3_link.cuh: a peer or driver copy on s, or through host memory - out on the
+    // source's stream, in on the destination's)
+    gpulink::Links links;
     bool p2p_all = false;
     bool copy_peer(void* dst, const Dev& db, const void* src, const Dev& sb, size_t bytes, cudaStream_t s,
                    std::string& err) {
         if (p2p_all) CK(cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDeviceToDevice, s));
-        else CK(cudaMemcpyPeerAsync(dst, db.id, src, sb.id, bytes, s));
+        else if (!links.copy((int) (&sb - D.data()), sb.s, src, (int) (&db - D.data()), db.s, dst, bytes, s, err))
+            return false;
         return true;
     }
 
