@@ -188,7 +188,11 @@ __global__ void off_lane_plan_kernel(const uint8_t** blob, const int* __restrict
         for (int i = lane; i < C; i += 32) jx[i] = xin[i];
         __threadfence_system();
         __syncwarp();
+#ifdef MAYA_USE_HIP   // (AMD: a system-scope release of the flag in fine-grained host memory)
+        if (lane == 0) __hip_atomic_store(&job->seq, seq, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+#else
         if (lane == 0) *(volatile uint32_t*) &job->seq = seq;
+#endif
     }
 }
 
@@ -283,9 +287,10 @@ __global__ void __launch_bounds__(256) off_down_x_kernel(const uint8_t* const* b
     if ((threadIdx.x & 3) == 0 && r < C) y[(size_t) slot * C + r] = d;
 }
 
+// nanoseconds, for the lane's 20 s guard
 __device__ __forceinline__ unsigned long long globaltimer() {
-#ifdef MAYA_USE_HIP   // (AMD builds the offload path but never takes it: no PTX timer there, the wall clock instead)
-    return (unsigned long long) wall_clock64();
+#ifdef MAYA_USE_HIP   // (AMD: no PTX timer - the constant 100 MHz wall clock of RDNA 3 / 4, 10 ns a tick)
+    return (unsigned long long) wall_clock64() * 10ull;
 #else
     unsigned long long t;
     asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
@@ -299,7 +304,11 @@ __global__ void off_lane_wait_kernel(LaneState* ls, const LaneDone* done, int C,
         if (n > 0) {
             const uint32_t seq = ls->seq;
             const unsigned long long t0 = globaltimer();
+#ifdef MAYA_USE_HIP   // (AMD: a system-scope read of the lane's word - fine-grained host memory, past every cache)
+            while (__hip_atomic_load(&done->seq, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM) != seq) {
+#else
             while (*(const volatile uint32_t*) &done->seq != seq) {
+#endif
                 __nanosleep(256);
                 if (globaltimer() - t0 > 20000000000ull) {   // (20 s: the lane is gone - the engine reports it)
                     ls->err = 1;
@@ -314,7 +323,7 @@ __global__ void off_lane_wait_kernel(LaneState* ls, const LaneDone* done, int C,
     const float* yd = (const float*) ((const uint8_t*) done + kLaneDoneY);
     for (int k = 0; k < n; ++k) {
         const int slot = ls->slot[k];
-#ifdef MAYA_USE_HIP   // (AMD: no __ldcv - a volatile read of the host's rows; the path is never taken there)
+#ifdef MAYA_USE_HIP   // (AMD: no __ldcv - a volatile read of the host's rows, after the acquire above)
         for (int r = threadIdx.x; r < C; r += blockDim.x)
             y[(size_t) slot * C + r] = *(const volatile float*) (yd + (size_t) k * C + r);
 #else
