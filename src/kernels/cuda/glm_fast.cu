@@ -2371,6 +2371,7 @@ constexpr int HC_THREADS = 256;
 constexpr int HC_MIX = 24;      // (2 + hc) * hc for hc = 4
 
 __global__ void __launch_bounds__(HC_THREADS) hc_kernel(const STRATA_GRID_CONSTANT HcArgs a) {
+    if (a.skip != nullptr && *a.skip) return;
     const int hc = 4;
     const int n_embd = a.n_embd;
     const int hc_dim = hc * n_embd;
@@ -2497,6 +2498,7 @@ __device__ __forceinline__ void grid_barrier(unsigned long long* ctr, unsigned i
 }
 
 __global__ void __launch_bounds__(HC_THREADS) hc2_kernel(const STRATA_GRID_CONSTANT HcArgs a) {
+    if (a.skip != nullptr && *a.skip) return;
     const int hc = 4;
     const int n_embd = a.n_embd;
     const int hc_dim = hc * n_embd;
@@ -2732,6 +2734,7 @@ __device__ __forceinline__ void hc3_block(const HcArgs& a, const unsigned int nb
     }
 }
 __global__ void __launch_bounds__(HC_THREADS) hc3_kernel(const STRATA_GRID_CONSTANT HcArgs a) {
+    if (a.skip != nullptr && *a.skip) return;
     hc3_block(a, gridDim.x, blockIdx.x);   // 32 blocks
 }
 // MAYA_GLM_ROWS_BATCH: the rows of a batched decode step in one launch - row y's blocks are hc3_kernel's for its
@@ -2746,7 +2749,8 @@ __global__ void __launch_bounds__(HC_THREADS) hc3_rows_kernel(const STRATA_GRID_
 
 __global__ void hc_post_kernel(const float* __restrict__ block_out, const float* __restrict__ R_old,
                                const float* __restrict__ post, const float* __restrict__ comb, int n_embd,
-                               float* __restrict__ R_new) {
+                               float* __restrict__ R_new, const int* __restrict__ skip = nullptr) {
+    if (skip != nullptr && *skip) return;
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= 4 * n_embd) return;
     const int d = idx / n_embd, e = idx - d * n_embd;
@@ -2757,7 +2761,9 @@ __global__ void hc_post_kernel(const float* __restrict__ block_out, const float*
 }
 
 __global__ void head_prep_kernel(const float* __restrict__ R, const float* __restrict__ norm_w, float eps,
-                                 int n_embd, float* __restrict__ x, block_q8_1* __restrict__ xq) {
+                                 int n_embd, float* __restrict__ x, block_q8_1* __restrict__ xq,
+                                 const int* __restrict__ skip = nullptr) {
+    if (skip != nullptr && *skip) return;
     __shared__ float sred[32];
     __shared__ float sm[4096];
     const int tid = threadIdx.x, lane = tid & 31;
@@ -2838,6 +2844,7 @@ __device__ __forceinline__ void kda_prep_block(const KdaPrepArgs& a, int h, int 
 }
 
 __global__ void __launch_bounds__(128) kda_prep_kernel(const STRATA_GRID_CONSTANT KdaPrepArgs a) {
+    if (a.skip != nullptr && *a.skip) return;
     kda_prep_block(a, blockIdx.x, blockIdx.y);
 }
 struct KdaPrepBatch {
@@ -2907,7 +2914,9 @@ __global__ void __launch_bounds__(256) kda_rec_kernel(const float* __restrict__ 
                                                       const float* __restrict__ v, const float* __restrict__ g1,
                                                       const float* __restrict__ beta_raw, float* __restrict__ state,
                                                       const float* __restrict__ g2, const float* __restrict__ norm_w,
-                                                      float eps, int n_head, block_q8_1* __restrict__ out) {
+                                                      float eps, int n_head, block_q8_1* __restrict__ out,
+                                                      const int* __restrict__ skip = nullptr) {
+    if (skip != nullptr && *skip) return;
     kda_rec_block(q, k, v, g1, beta_raw, state, g2, norm_w, eps, out, blockIdx.x);
 }
 struct KdaRecBatch {
@@ -6406,7 +6415,17 @@ void hc_rows(const HcArgs* a, int n, cudaStream_t s) {
     for (int i = 0; i < n; ++i) hc(a[i], s);
 }
 
-void hc(const HcArgs& a, cudaStream_t s) {
+static inline const int* skip_all_ptr() {
+    static const bool on = [] {
+        const char* v = getenv("MAYA_GLM_SKIP_ALL");
+        return v != nullptr && std::atoi(v) != 0;
+    }();
+    return on ? g_skip : nullptr;
+}
+
+void hc(const HcArgs& a_in, cudaStream_t s) {
+    HcArgs a = a_in;
+    if (a.skip == nullptr) a.skip = skip_all_ptr();
     const int mode = hc_mode(a);
     if (mode == 3) {
         hc3_kernel<<<a.n_embd / HC2_EB, HC_THREADS, 0, s>>>(a);
@@ -6429,7 +6448,7 @@ void hc(const HcArgs& a, cudaStream_t s) {
 
 void hc_post(const float* block_out, const float* R_old, const float* post, const float* comb, int n_embd,
              float* R_new, cudaStream_t s) {
-    hc_post_kernel<<<(4 * n_embd + 255) / 256, 256, 0, s>>>(block_out, R_old, post, comb, n_embd, R_new);
+    hc_post_kernel<<<(4 * n_embd + 255) / 256, 256, 0, s>>>(block_out, R_old, post, comb, n_embd, R_new, skip_all_ptr());
     launch_check("hc_post");
 }
 
@@ -6438,7 +6457,7 @@ void head_prep(const float* R, const float* norm_w, float eps, int n_embd, float
         shape_refused("head_prep", n_embd);
         return;
     }
-    head_prep_kernel<<<1, 1024, 0, s>>>(R, norm_w, eps, n_embd, x, (block_q8_1*) xq);
+    head_prep_kernel<<<1, 1024, 0, s>>>(R, norm_w, eps, n_embd, x, (block_q8_1*) xq, skip_all_ptr());
     launch_check("head_prep");
 }
 
@@ -6447,7 +6466,9 @@ void embed_streams(const float* emb, float* R, int n_embd, cudaStream_t s) {
     launch_check("embed_streams");
 }
 
-void kda_prep(const KdaPrepArgs& a, cudaStream_t s) {
+void kda_prep(const KdaPrepArgs& a_in, cudaStream_t s) {
+    KdaPrepArgs a = a_in;
+    if (a.skip == nullptr) a.skip = skip_all_ptr();
     kda_prep_kernel<<<dim3(a.n_head, 11), 128, 0, s>>>(a);   // 3 conv roles + 2 x 4 gate quarters
     launch_check("kda_prep");
 }
@@ -6461,7 +6482,7 @@ void kda_rec(const float* q, const float* k, const float* v, const float* g1, co
         return;
     }
     kda_rec_kernel<<<n_head, 256, 0, s>>>(q, k, v, g1, beta_raw, state, g2, norm_w, eps, n_head,
-                                          (block_q8_1*) out_q8_1);
+                                          (block_q8_1*) out_q8_1, skip_all_ptr());
     launch_check("kda_rec");
 }
 

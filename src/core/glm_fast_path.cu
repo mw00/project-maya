@@ -3085,6 +3085,17 @@ void Glm5Model::lane_experts(glmfast::Workers& pool, uint8_t* act, uint8_t* hq, 
         // job j of a queue covers its flattened rows [tot * j / J, tot * (j + 1) / J)
         const auto phase = [&](int R, const auto& rows_fn) {
             const int half = R / 2, tot = ne * half;
+            if (pool.fast_concurrent()) {
+                pool.run_numa(n0, J, J, [&](int h, int j) {
+                    const int q1 = (int) ((int64_t) tot * (j + 1) / J);
+                    for (int q = (int) ((int64_t) tot * j / J); q < q1;) {
+                        const int i = q / half, r0 = q % half, r1 = std::min(half, r0 + (q1 - q));
+                        rows_fn(i, h * half + r0, h * half + r1);
+                        q += r1 - r0;
+                    }
+                });
+                return;
+            }
             alignas(64) std::atomic<int> qp[2];
             qp[0].store(0, std::memory_order_relaxed);
             qp[1].store(0, std::memory_order_relaxed);
@@ -3742,6 +3753,8 @@ static std::shared_ptr<glmfast::Workers> shared_cpu_pool(int threads) {
     if (p == nullptr || p->size() != threads) {
         const std::vector<int> cpus = cpu_list_env("MAYA_GLM_POOL_CPUS");
         p = std::make_shared<glmfast::Workers>(threads - 1, 20000, cpus, concurrent, !cpus.empty());
+        if (p->fast_concurrent())
+            std::fprintf(stderr, "glm fast: shared CPU pool using MAYA_GLM_WORKERS_FAST=1 (NUMA-isolated slots, %d threads)\n", threads);
         held = p;
     }
     return p;
@@ -7034,11 +7047,23 @@ bool Glm5Model::fast_moe_experts(int il, const MoeIo& io, bool pred, int n_ah, c
     // MAYA_GLM_SKIP_EMPTY=1, a batched step's row (glm_rows.cu - the token path's launches are its graphs'): the
     // same per layer (FastState::layer_res: a layer whose every expert is in VRAM), and elsewhere the wait and the
     // fetch as one launch (gf::moe_wait_fetch): a batched step makes these launches once a row and layer, mostly empty
+    static const bool nofetch_skip_env = [] {
+        const char* v = getenv("MAYA_GLM_NOFETCH_SKIP");
+        return v != nullptr && std::atoi(v) != 0;
+    }();
+    bool nofetch_skip = false;
+    if (nofetch_skip_env && F->ram_resident && lane && il != mtp_il_ && F->cpu_plan != 0ull) {
+        bool all_cpu = true;
+        for (int f = 1; f <= g.n_exp_used && all_cpu; ++f)
+            all_cpu = (int) ((F->cpu_plan >> (4 * f)) & 15ull) == f;
+        nofetch_skip = all_cpu;
+    }
     const bool skip_empty = rows && glmfast::skip_empty_on();
     const bool empty = F->all_resident || (skip_empty && F->layer_resident(il));
-    if (!empty && skip_empty) {
+    const bool skip_fetch = empty || nofetch_skip;
+    if (!skip_fetch && skip_empty) {
         gf::moe_wait_fetch(md, g.n_embd, g.n_exp_used, Ly.blob, s);
-    } else if (!empty) {
+    } else if (!skip_fetch) {
         gf::moe_wait(md, g.n_embd, s);
         if (F->prof_on) F->mark("moe_wait");
         gf::moe_fetch(md, g.n_exp_used, Ly.blob, s);
@@ -7467,7 +7492,11 @@ bool Glm5Model::fast_mtp(int64_t p, int32_t next_tok, std::string& err, int step
     // whole head, #860.)  3+ GPUs (decode_spec asks nothing): the draft vocabulary while the answer stays in it, the
     // whole head while it does not - mtp_out_ (decode_spec keeps it) under decode_mtp's 2%.  One GPU: the caller's
     // choice (decode_mtp's own rule on mtp_out_; mtp_draft asks for the vocabulary)
-    sub = (sub || (!full_head && !sample_draft_on && n_parts_ > 2 && mtp_out_ < 0.02)) && F->mtp_dv > 0;
+    static const bool sample_sub = [] {
+        const char* v = getenv("MAYA_GLM_MTP_SAMPLE_SUB");
+        return v != nullptr && std::atoi(v) != 0;
+    }();
+    sub = (sub || (!full_head && (!sample_draft_on || sample_sub) && n_parts_ > 2 && mtp_out_ < 0.02)) && F->mtp_dv > 0;
     mtp_hx_pos_ = -1;   // head_x becomes the block's own hidden state
     if (next_tok < 0) {
         if (F->mtp_emb == nullptr || step < 1) {
@@ -7531,9 +7560,10 @@ bool Glm5Model::fast_mtp(int64_t p, int32_t next_tok, std::string& err, int step
         err = "glm mtp: the head";
         return false;
     }
-    if (mtp_sample_ != nullptr && F->spec_q != nullptr && step == 0 && !sub)   // speculative sampling (decode_spec)
-        strata::kernels::sample_draft(F->mtp_logits, 1, (int) g.n_vocab, *mtp_sample_,
-                                      (strata::kernels::SpecList*) F->spec_q, F->mtp_tok, s);
+    if (mtp_sample_ != nullptr && F->spec_q != nullptr && step == 0 && (!sub || sample_sub))   // speculative sampling (decode_spec)
+        strata::kernels::sample_draft(F->mtp_logits, 1, n_rows, *mtp_sample_,
+                                      (strata::kernels::SpecList*) F->spec_q, F->mtp_tok, s,
+                                      sub ? F->mtp_dx_ids : nullptr, sub ? F->mtp_dv : 0);
     else
         gf::argmax(F->mtp_logits, n_rows, F->mtp_tok + step, s, sub ? F->mtp_dx_ids : nullptr, F->mtp_dv);
     if (read_back) {

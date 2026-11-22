@@ -181,7 +181,8 @@ constexpr uint64_t kSpecDraftKey = 0x5bd1e9955bd1e995ull, kSpecAcceptKey = 0x9e3
 template <int MODE>
 __global__ void __launch_bounds__(1024) sampler_kernel(const float* __restrict__ logits, int n_vocab, int n_tokens,
                                const int* __restrict__ history, int history_len, const SamplerParams p,
-                               int* __restrict__ out, SpecList* __restrict__ ql, const int* __restrict__ draft) {
+                               int* __restrict__ out, SpecList* __restrict__ ql, const int* __restrict__ draft,
+                               const int* __restrict__ dx_ids = nullptr, int dv = 0) {
     const int t = blockIdx.x;
     if (t >= n_tokens) return;
     const float* l = logits + (size_t) t * n_vocab;
@@ -461,7 +462,13 @@ __global__ void __launch_bounds__(1024) sampler_kernel(const float* __restrict__
         if constexpr (MODE == 1) {
             SpecList* q = ql + t;
             q->n = n_keep;
-            for (int i = 0; i < n_keep; ++i) { q->ids[i] = sel_ids[i]; q->p[i] = w[i]; }
+            for (int i = 0; i < n_keep; ++i) {
+                const int id = sel_ids[i];
+                const int mapped = (dx_ids != nullptr && id >= dv) ? dx_ids[id - dv] : id;
+                sel_ids[i] = mapped;
+                q->ids[i] = mapped;
+                q->p[i] = w[i];
+            }
             out[t] = draw(philox_uniform(p.seed ^ kSpecDraftKey, p.counter + (uint64_t) t));
         } else {
             const SpecList* q = ql + t;
@@ -560,11 +567,11 @@ void spec_launched(const char* who, void* stream) {
 }  // namespace
 
 void sample_draft(const float* logits, int n_tokens, int n_vocab, const SamplerParams& p, SpecList* q, int* out,
-                  void* stream) {
+                  void* stream, const int* dx_ids, int dv) {
     if (n_tokens <= 0) return;
     spec_check("sample_draft", n_tokens, n_vocab, p);
     sampler_kernel<1><<<(unsigned) n_tokens, 1024, 0, (cudaStream_t) stream>>>(logits, n_vocab, n_tokens, nullptr, 0,
-                                                                                p, out, q, nullptr);
+                                                                                p, out, q, nullptr, dx_ids, dv);
     spec_launched("sample_draft", stream);
 }
 
