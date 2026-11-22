@@ -89,6 +89,7 @@ import calibrate_glm as CAL  # noqa: E402  the CPU lane's tuning for this PC (./
 import calibrate_ds4_tp as CAL4  # noqa: E402  DeepSeek's: --tp and the CPU threads (./maya.sh --calibrate)
 import calibrate_draft as CD  # noqa: E402  the speed calibration: DFlash2 or the MTP block on this PC
 import calibrate_ds4 as CDS  # noqa: E402  DeepSeek's: the DSpark drafter or none, on this PC
+import maya_bench as MB  # noqa: E402  --bench: the speed-test standard (one session a round, A/B, the result line)
 import calibrate_mm3_prefill as CPF  # noqa: E402  MiniMax's: how this PC reads prompts fastest (chunk, GEMMs)
 from serve import glm_dsa_product as G53  # noqa: E402  GLM-5.3 (744B, glm-dsa)
 from serve import glm_link as GL  # noqa: E402  GLM on an AMD APU + an NVIDIA card ("mixed_gpus")
@@ -6840,8 +6841,6 @@ def bench_exe(cfg: dict) -> Path:
                            "ik2": "maya-ik2"}.get(config_family(cfg), "maya"))
 
 
-BENCH_MIN_ANSWER = 64   # an answer shorter than this (the model stopped early) is listed, not in the decode mean (#549)
-
 
 def bench_chat(family: str, tokenizer_dir: Path):
     """--bench's prompt for a question, in the model family's own chat format, thinking off: GLM's markers, DeepSeek's
@@ -6872,37 +6871,38 @@ def bench_chat(family: str, tokenizer_dir: Path):
     return "[gMASK]<sop><|user|>\n{}<|assistant|>\n</think>".format
 
 
-def bench_gen_line(n_new: int, ids, multi: bool) -> str:
-    """The GEN line --bench sends: an engine that runs several conversations (READY ... multi=<n>, a --parallel config)
-    takes a request only with its id (#420, #509: 'GEN needs rid=<id>')."""
-    return f"GEN {n_new} temperature=0{' rid=0' if multi else ''} " + ",".join(map(str, ids)) + "\n"
+bench_gen_line = MB.gen_line      # (the GEN line and the DONE / ERR reply: tools/maya_bench.py, tested there)
+bench_reply = MB.reply_fields
 
 
-def bench_reply(line: str, multi: bool):
-    """A DONE / ERR line's fields as a one-conversation engine writes them (several conversations: DONE <rid> ...,
-    the id dropped); None for another request's line or one that is neither."""
-    f = line.split()
-    if not f or f[0] not in ("DONE", "ERR"):
-        return None
-    if multi and len(f) > 1 and f[1].isdigit():
-        if f[1] != "0":
-            return None
-        f = f[:1] + f[2:]
-    return f
+def bench_model_name(cfg: dict) -> str:
+    """The model + size a result line names: the config's model and its quant (the pack's or file's folder name when
+    the config has no installer record)."""
+    q = (cfg.get("installer") or {}).get("quant")
+    if not q:
+        a = [str(x) for x in cfg.get("args") or []]
+        for k in ("--glm-pack", "--pack", "--model"):
+            if k in a[:-1]:
+                p = Path(a[a.index(k) + 1])
+                q = (p.parent.name if p.name in ("pack", "maya-hy4", "maya-ik2") or p.suffix == ".gguf" else p.name)
+                break
+    return f"{cfg.get('model_name') or config_family(cfg)} {q or '?'}".strip()
 
 
-def bench_decode_mean(results) -> tuple[float, int]:
-    """The decode mean of --bench's answers and how many it covers: the answers of BENCH_MIN_ANSWER tokens or more (a
-    short one - an answer the model ended early - says little about the speed, #549); all of them when none is."""
-    dec = [r for r in results if r[0] == "decode"]
-    full = [r for r in dec if r[3] >= BENCH_MIN_ANSWER] or dec
-    return (sum(r[2] for r in full) / len(full) if full else 0.0), len(full)
+def bench_config_text(cfg: dict, ctx: int, drafting: str) -> str:
+    """The config part of a result line: context, the KV cache's format where the config sets one, drafting."""
+    a = [str(x) for x in cfg.get("args") or []]
+    kv = next((a[a.index(k) + 1] for k in ("--kv", "--kv-cache", "--kv-type", "--cache-type") if k in a[:-1]), None)
+    kv = kv or next((str(v) for k, v in (cfg.get("env") or {}).items() if k.endswith("_KV")), None)
+    return " ".join(x for x in (f"{ctx // 1024}K", f"KV {kv}" if kv else "", drafting) if x)
 
 
-def bench(cfg_path: Path, version: str) -> int:
-    """--bench: a standard speed test of the installed model on this PC - decode (writing an answer) on three
-    questions and prefill (reading a prompt) at 2k and 8k tokens of this folder's docs - through the engine alone, the
-    way the dashboard starts it.  Writes maya-bench.txt (--report includes it).  A few minutes."""
+def bench(cfg_path: Path, version: str, compare: str | None = None, rounds: int = 2, wait_min: float = 10.0) -> int:
+    """--bench: the speed-test standard (tools/maya_bench.py) on the installed model - a quiet-machine check, one engine
+    session with a warm-up answer, 3 answers of 256 tokens and the 2K / 8K prompts 3 times each; medians with min-max,
+    what drafting chose, the wall time of each phase and one result line (maya-bench-results.txt).  --compare: the same
+    on this build and another, alternated, exactness first.  Writes maya-bench.txt (--report includes it)."""
+    import socket
     import urllib.request
     cfg = read_json(cfg_path)
     select_build_backend(cfg.get("backend", "cuda"))
@@ -6923,92 +6923,132 @@ def bench(cfg_path: Path, version: str) -> int:
     tp = Path(cfg.get("tokenizer") or (pack / "tokenizer" if pack else ""))
     if not (tp / "vocab.json").exists():
         fail(f"{cfg_path.name}: the tokenizer is missing ({tp})", f"run {ME} --setup to repair it")
-    tok = ST.Tokenizer.from_dir(tp)
-    ctx = int(args[args.index("--max-context") + 1]) if "--max-context" in args[:-1] else 32768
-    text = "\n\n".join(p.read_text(encoding="utf-8", errors="replace")
-                       for p in [ROOT / "README.md"] + sorted((ROOT / "docs").glob("*.md")) +
-                       sorted((ROOT / "bench" / "results").glob("*.md")) if p.exists())
-    doc = tok.encode(text)
-    lens = [n for n in (2048, 8192) if n + 64 <= ctx and n <= len(doc)]
-    log_path = ROOT / "maya-bench.log"
-    step(1, f"benchmark: {cfg_path.name} (loading the model first - a minute or a few)")
-    t0 = time.time()
-    with open(log_path, "w", encoding="utf-8") as log:
-        p = subprocess.Popen([cfg["exe"], "--serve"] + SV.engine_args(cfg), stdin=subprocess.PIPE,
-                             stdout=subprocess.PIPE, stderr=log, text=True, env=SV.child_env(cfg),
-                             cwd=cfg.get("cwd") or str(ROOT), bufsize=1)
-
-        multi = False   # (READY ... multi=<n>: a --parallel config's engine - its requests carry an id)
-
-        def gen(ids, n_new):
-            p.stdin.write(bench_gen_line(n_new, ids, multi))
-            p.stdin.flush()
-            while True:
-                line = p.stdout.readline()
-                if not line:
-                    fail("the engine stopped during the benchmark", f"its log: {log_path}")
-                f = bench_reply(line, multi)
-                if f is not None:
-                    return f
-
-        while True:
-            line = p.stdout.readline()
-            if not line:
-                fail("the engine stopped while loading", f"its log: {log_path}")
-            if line.startswith("READY"):
-                multi = any(w.startswith("multi=") for w in line.split())
-                break
-        ok(f"loaded in {time.time() - t0:.0f} s")
+    backend, gpus = cfg.get("backend", "cuda"), SV.gpu_list(cfg) or None
+    t_all = time.time()
+    step(1, f"benchmark: {cfg_path.name}" + (f" against {compare}" if compare else ""))
+    note = f"maya --bench pid {os.getpid()} on {socket.gethostname()} {time.strftime('%Y-%m-%d %H:%M')}"
+    why = MB.wait_quiet(backend, gpus, wait_min, say)
+    if why:
+        fail("this machine is not quiet enough for a speed number: " + "; ".join(why),
+             f"wait for it (or give it longer: {ME} --bench --bench-wait <minutes>), then run --bench again")
+    t_quiet = time.time() - t_all
+    locks = MB.take_locks(backend, gpus, note)
+    try:
+        tok = ST.Tokenizer.from_dir(tp)
+        ctx = int(args[args.index("--max-context") + 1]) if "--max-context" in args[:-1] else 32768
+        text = "\n\n".join(p.read_text(encoding="utf-8", errors="replace")
+                           for p in [ROOT / "README.md"] + sorted((ROOT / "docs").glob("*.md")) +
+                           sorted((ROOT / "bench" / "results").glob("*.md")) if p.exists())
+        prompts, warm = MB.plan_prompts(tok.encode(text), ctx)
         fmt = bench_chat(config_family(cfg), tp)   # (each family's own chat format, thinking off - #416, #549)
-        chat = lambda q: tok.encode(fmt(q), parse_special=True)   # noqa: E731
-        gen(chat("Say hello in five languages."), 64)          # warm-up: the first answer after a start is slower
-        results = []
-        for q in BENCH_TOPICS:
-            f = gen(chat(q), 256)
-            if f[0] == "DONE" and float(f[4]) > 0:
-                results.append(("decode", q, int(f[1]) / float(f[4]) * 1000.0, int(f[1])))
-                say(f"  decode  {results[-1][2]:6.1f} tokens/s   {q[:60]} ({f[1]} tokens)")
-            elif f[0] == "ERR":
-                warn("the engine refused a benchmark request: " + " ".join(f[1:]))
-        if lens:                                            # warm-up: the first prompt after a start is slower
-            gen(doc[-lens[0]:], 1)                          # (cold caches, issue #8); its opening is not reused below
-        for i, n in enumerate(lens):
-            f = gen(doc[i * 997:i * 997 + n], 1)            # different openings: nothing reused between them
-            if f[0] == "DONE" and float(f[3]) > 0:
-                results.append(("prefill", f"{n} tokens", n / float(f[3]) * 1000.0))
-                say(f"  prefill {results[-1][2]:6.0f} tokens/s   a {n}-token prompt")
-        p.stdin.write("QUIT\n")
-        p.stdin.flush()
-        try:
-            p.wait(timeout=120)
-        except subprocess.TimeoutExpired:
-            p.kill()
-    stats = speed_lines(log_path.read_text(encoding="utf-8", errors="replace").splitlines())
-    mean, n_mean = bench_decode_mean(results)
-    found = S.amd_gpus() if cfg.get("backend") == "hip" else S.gpus()
-    if cfg.get("backend") == "hip" and SV.gpu_list(cfg):
-        by_index = {g["index"]: g for g in found}
-        found = [by_index[i] for i in SV.gpu_list(cfg) if i in by_index]
-    gpus = ", ".join(f"{g['name']} {g['vram_gb']:.0f} GB" for g in found) or (
-        "the Apple GPU (Metal)" if cfg.get("backend") == "metal" else "?")
+        chats = [tok.encode(fmt(q), parse_special=True) for q in BENCH_TOPICS]
+        start = lambda c, cmd, env, tag: (cmd, env, c.get("cwd") or str(ROOT), ROOT / f"maya-bench{tag}.log")  # noqa
+        here = start(cfg, [cfg["exe"], "--serve"] + SV.engine_args(cfg), SV.child_env(cfg), "")
+        found = S.amd_gpus() if backend == "hip" else S.gpus()
+        if gpus:
+            by_index = {g["index"]: g for g in found}
+            found = [by_index[i] for i in gpus if i in by_index]
+        gpu_text, driver = MB.gpu_summary(backend, found)
+        base = {"machine": socket.gethostname().split(".")[0], "gpus": gpu_text, "driver": driver,
+                "model": bench_model_name(cfg), "date": time.strftime("%Y-%m-%d")}
+        if not compare:
+            run = MB.run_session(here, chats, prompts, warm, "", say)
+            res = MB.summarize([run], prompts)
+            drafting = MB.drafting_choice(args, cfg.get("env") or {}, run["engine_lines"], res["answers"])
+            rec = dict(base, config=bench_config_text(cfg, ctx, drafting), commit=MB.commit_of(ROOT), version=version,
+                       decode=res["decode"], prompt=res["prompt"],
+                       note="prompt reuse seen" if run["reused"] else "")
+            lines = bench_text(version, cfg_path, cfg, ctx, gpu_text, res, drafting, [run], t_quiet, t_all)
+            records = [MB.record_line(rec)]
+        else:
+            lines, records = bench_compare(cfg, cfg_path, compare, rounds, here, start, chats, prompts, warm, base,
+                                           version, ctx, args, gpu_text, t_quiet, t_all, SV)
+    except RuntimeError as e:                    # (the engine stopped or refused, a build failed: said plainly)
+        fail(str(e), "fix that, then run --bench again")
+    finally:
+        MB.release_locks(locks, note)
+    out = ROOT / "maya-bench.txt"
+    stats = speed_lines((ROOT / "maya-bench.log").read_text(encoding="utf-8", errors="replace").splitlines()) \
+        if (ROOT / "maya-bench.log").exists() else []
+    out.write_text("\n".join(lines + records + ["", "engine lines:"] +
+                             [x.replace(str(Path.home()), "~") for x in stats[-40:]]) + "\n", encoding="utf-8")
+    with open(ROOT / MB.RESULTS_FILE, "a", encoding="utf-8") as f:
+        f.write("\n".join(records) + "\n")
+    say()
+    for x in lines + [""] + records:
+        say("  " + x)
+    ok(f"written: {out} (the result line also in {MB.RESULTS_FILE}) - attach it (with {ME} --report) to a speed "
+       "report")
+    return 0
+
+
+def bench_text(version, cfg_path, cfg, ctx, gpu_text, res, drafting, runs, t_quiet, t_all) -> list:
+    """maya-bench.txt's lines for one build."""
     total, _ = mem_gb()
     lines = [f"Project Maya v{version} benchmark, {time.strftime('%Y-%m-%d %H:%M')}",
-             f"GPUs: {gpus}; RAM {total:.0f} GB; CPU {S.cpu_info()[0]}",
-             f"setup: {cfg_path.name}, context {ctx}, GPUs {cfg.get('gpu')}",
-             f"decode (writing the answer): mean {mean:.1f} tokens/s over {n_mean} answers of up to 256 tokens "
-             f"(greedy, thinking off)"]
-    lines += [f"  {r[2]:6.1f} tokens/s  {r[1]}" + (f" ({r[3]} tokens: not in the mean)" if r[3] < BENCH_MIN_ANSWER and
-                                                    n_mean < sum(x[0] == "decode" for x in results) else "")
-              for r in results if r[0] == "decode"]
-    lines += [f"prefill (reading the prompt): {r[2]:.0f} tokens/s, {r[1]}" for r in results if r[0] == "prefill"]
-    lines += ["", "engine lines:"] + [x.replace(str(Path.home()), "~") for x in stats[-40:]]
-    out = ROOT / "maya-bench.txt"
-    out.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    say()
-    for x in lines[:4 + len(results)]:
-        say("  " + x)
-    ok(f"written: {out} - attach it (with {ME} --report) to a speed report")
-    return 0
+             f"GPUs: {gpu_text}; RAM {total:.0f} GB; CPU {S.cpu_info()[0]}",
+             f"setup: {cfg_path.name}, context {ctx}, GPUs {cfg.get('gpu')}, drafting: {drafting}",
+             f"decode (writing the answer): median {MB.fmt_stats(res['decode'])} tokens/s over "
+             f"{len(res['answers']) - res['short']} answers of {MB.DECODE_TOKENS} tokens (greedy, thinking off)" +
+             (f"; {res['short']} ended early, left out" if res["short"] else "")]
+    lines += [f"prompt reading: {n // 1024}K tokens, median {MB.fmt_stats(s, 0)} tokens/s"
+              for n, s in sorted(res["prompt"].items())]
+    lines.append(f"wall time: quiet check {t_quiet:.0f} s, {MB.phase_line(runs)}; all {time.time() - t_all:.0f} s")
+    return lines
+
+
+def bench_compare(cfg, cfg_path, spec, rounds, here, start, chats, prompts, warm, base, version, ctx, args, gpu_text,
+                  t_quiet, t_all, SV):
+    """--bench --compare: this build and another on the same model files, config and learned files, alternated
+    (this, other, this, other ...), each round one engine session; exactness first, then the medians."""
+    other = MB.other_root(spec, ROOT, Path(cfg["exe"]), say)
+    ocfg = MB.map_cfg(cfg, ROOT, other)
+    if not Path(ocfg["exe"]).exists():
+        fail(f"--compare {spec}: its engine is not built ({ocfg['exe']})", "build it there first")
+    work = ROOT / ".bench-builds"
+    work.mkdir(exist_ok=True)
+    ocfg_file = work / "other-config.json"
+    ocfg_file.write_text(json.dumps(ocfg, indent=1), encoding="utf-8")
+    try:
+        cmd, env = MB.start_command(other, ocfg, ocfg_file)
+    except RuntimeError as e:                     # (an older build without this start code: this build's command)
+        warn(f"{e} - starting its engine with this build's command")
+        cmd, env = [ocfg["exe"], "--serve"] + SV.engine_args(ocfg), SV.child_env(ocfg)
+    there = start(ocfg, cmd, env, "-other")
+    learned = MB.LearnedState(ROOT, cfg, work / "learned-snapshot")
+    runs = {"this": [], "other": []}
+    try:
+        for r in range(rounds):
+            for side in ("this", "other"):
+                learned.restore(other if side == "other" else None)
+                say(f"  round {r + 1} of {rounds}: {side} build")
+                runs[side].append(MB.run_session(here if side == "this" else there, chats, prompts, warm,
+                                                 f"[{side}] ", say))
+                if r == 0 and side == "this":
+                    learned = learned.adopt(cfg)  # (learned at a first start: kept, so no later round learns again)
+    finally:
+        learned.finish()
+    res = {k: MB.summarize(v, prompts) for k, v in runs.items()}
+    exact = MB.exactness(runs["other"][0]["tokens"], runs["this"][0]["tokens"])
+    again = {k: MB.exactness(v[0]["tokens"], v[-1]["tokens"]) for k, v in runs.items() if len(v) > 1}
+    o_ver = (other / "VERSION").read_text().strip() if (other / "VERSION").exists() else "?"
+    names = {"this": f"{MB.commit_of(ROOT)} (v{version})", "other": f"{MB.commit_of(other)} (v{o_ver})"}
+    records, lines = [], []
+    for side, root, ver in (("other", other, o_ver), ("this", ROOT, version)):
+        drafting = MB.drafting_choice(args, cfg.get("env") or {}, runs[side][0]["engine_lines"], res[side]["answers"])
+        records.append(MB.record_line(dict(base, config=bench_config_text(cfg, ctx, drafting),
+                                           commit=MB.commit_of(root), version=ver, decode=res[side]["decode"],
+                                           prompt=res[side]["prompt"], note=f"A/B {rounds} rounds")))
+        lines += [f"{side} build {names[side]}: {root}"] + [
+            "  " + x for x in bench_text(ver, cfg_path, cfg, ctx, gpu_text, res[side], drafting, runs[side],
+                                         t_quiet, t_all)[2:]]
+    lines.append("exactness (greedy tokens of every bench request, this vs other): " +
+                 ("equal" if not exact else "DIFFERENT - " + "; ".join(exact)))
+    for side, d in again.items():
+        lines.append(f"  {side} build, round 1 vs round {rounds}: " + ("equal" if not d else "; ".join(d)))
+    lines.append(f"wall time all: {time.time() - t_all:.0f} s (quiet check {t_quiet:.0f} s)")
+    records.append(MB.compare_line(res["other"], res["this"], names["other"], names["this"], exact))
+    return lines, records
 
 
 # ------------------------------------------------------------------------------------------------ the setup
@@ -11662,6 +11702,13 @@ def main() -> int:
     ap.add_argument("--bench", action="store_true", help="a standard speed test of the installed model (a few "
                                                          "minutes, with Maya stopped): decode on three questions and "
                                                          "prefill at 2k / 8k tokens; writes maya-bench.txt")
+    ap.add_argument("--compare", metavar="BUILD", help="with --bench: an A/B against another build - a Maya folder "
+                                                       "(its engine built) or a git ref (checked out and built once "
+                                                       "in .bench-builds) - on the same model files, config and "
+                                                       "learned files, alternated; exactness first, then the speed")
+    ap.add_argument("--bench-rounds", type=int, default=2, help="--bench --compare: rounds a build (default 2)")
+    ap.add_argument("--bench-wait", type=float, default=10.0, help="--bench: minutes to wait for a quiet machine "
+                                                                   "before refusing (default 10; 0 = refuse at once)")
     ap.add_argument("--calibrate", action="store_true",
                     help="tune the engine's CPU lane for this PC (the PCIe share and the CPU threads, ~10-15 minutes; "
                          f"{DS4}: the tensor parallel groups and the CPU threads, an engine start each, ~25-40 "
@@ -11714,13 +11761,15 @@ def main() -> int:
         return report(version, a.backend, a.config)
     if a.import_model:
         return import_model(a, a.import_model)
+    if a.compare and not a.bench:
+        ap.error("--compare goes with --bench")
     if a.bench:
         have = [a.config] if a.config is not None else configs()
         if a.backend:
             have = [p for p in have if read_json(p).get("backend", "cuda") == a.backend]
         if not have:
             fail("Maya is not set up here yet", f"run {ME} first")
-        return bench(have[0], version)
+        return bench(have[0], version, a.compare, max(1, a.bench_rounds), max(0.0, a.bench_wait))
 
     have = configs() if a.config is None else [a.config.resolve()]   # (--config: that one, no question)
     if a.backend:
