@@ -179,6 +179,9 @@ def ik2_vram_gb(cfg: dict) -> float:
     hip = cfg.get("backend") == "hip"
     card = next((g for g in machine_gpus("hip" if hip else "cuda") if g.get("index") == ids[0]), None)
     vram = float((card or {}).get("vram_gb") or 0)
+    got = (cfg.get("installer") or {}).get("ik2_vram_gb")
+    if not hip and sys.platform == "win32" and isinstance(got, (int, float)) and got > 0:
+        return min(vram, float(got)) if vram else float(got)   # (Windows: as CUDA gets the card, the setup measured)
     if hip and card and card.get("arch") == "gfx1151" and hasattr(os, "sysconf"):
         try:
             ram = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") / 1e9

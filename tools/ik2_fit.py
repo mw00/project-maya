@@ -193,8 +193,9 @@ def unsupported(backend: str, windows: bool, gpus_asked: int, cards: list, ram_g
         if gpus_asked > 1:
             return "Inkling 2 Mini on AMD runs on one GPU for now: pick one (--gpu N)"
         return amd_unsupported(cards)
-    if windows:
-        return "Inkling 2 Mini is an experimental preview that runs on Linux only for now (not on Windows yet)"
+    # (NVIDIA: Linux and Windows alike, the same card rules; two cards on Linux only - untested on Windows)
+    if windows and gpus_asked > 1:
+        return "Inkling 2 Mini on Windows runs on one GPU for now (two are Linux only): pick one (--gpu N)"
     if gpus_asked > 2:
         return ("Inkling 2 Mini runs on one or two NVIDIA GPUs for now (three or more are not in it yet): pick one or "
                 "two (--gpu N, --gpus N,M)")

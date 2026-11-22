@@ -404,8 +404,8 @@ class OtherQuantsTest(unittest.TestCase):
 
     def test_inkling_2_mini_preview(self):
         """Inkling-2-Mini (maya-ik2, an experimental preview): unsloth's UD-Q4_K_XL under "Other quants" by unsloth,
-        said experimental; offered only where the setup runs it - NVIDIA V100 / RTX 20 on, Linux (never AMD or a
-        Mac); its setup id on the command line; the size the setup's manifest says."""
+        said experimental; offered only where the setup runs it - NVIDIA V100 / RTX 20 on, Linux or Windows (never AMD or
+        a Mac); its setup id on the command line; the size the setup's manifest says."""
         with mock.patch.object(model_pull.sys, "platform", "linux"):
             c = {m["id"]: m for m in self.cat()}
             ik = c["inkling-2-mini"]
@@ -419,7 +419,10 @@ class OtherQuantsTest(unittest.TestCase):
             self.assertIn("inkling-2-mini", {m["id"] for m in self.cat(ccs=())})       # (not read: the setup says)
             for backend in ("hip", "metal"):
                 self.assertNotIn("inkling-2-mini", {m["id"] for m in self.cat(backend, ())})
-        with mock.patch.object(model_pull.sys, "platform", "win32"):
+        with mock.patch.object(model_pull.sys, "platform", "win32"):   # (Windows + NVIDIA: as on Linux)
+            self.assertIn("inkling-2-mini", {m["id"] for m in self.cat()})
+            self.assertNotIn("inkling-2-mini", {m["id"] for m in self.cat("hip", ())})
+        with mock.patch.object(model_pull.sys, "platform", "darwin"):
             self.assertNotIn("inkling-2-mini", {m["id"] for m in self.cat()})
         cmd = model_pull.setup_command("inkling-2-mini", {"installer": {"models_dir": "/m"}})
         self.assertEqual(cmd[cmd.index("--model"):cmd.index("--download-model")], ["--model", "inkling-2-mini"])

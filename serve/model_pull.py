@@ -56,8 +56,9 @@ def _offered(fam: str, key: str, backend: str, ccs: list) -> bool:
         return max(ccs) >= EXL3_MIN_CC                                  # maya-ds4's / maya-mm3's kernels, V100 on)
     if fam == "qwen" and backend != "hip" and ccs:                     # (unsloth's Qwen GGUF: the setup's check_pc)
         return max(ccs) >= QWEN_MIN_CC
-    if fam == "ik2":                                   # (Inkling-2-Mini's preview: NVIDIA, Linux - maya.py's check_pc)
-        return backend == "cuda" and sys.platform.startswith("linux") and (not ccs or max(ccs) >= IK2_MIN_CC)
+    if fam == "ik2":                                   # (Inkling-2-Mini: NVIDIA, Linux / Windows - check_pc)
+        return backend == "cuda" and (sys.platform.startswith("linux") or sys.platform == "win32") and \
+            (not ccs or max(ccs) >= IK2_MIN_CC)
     return True
 
 
