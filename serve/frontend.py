@@ -1367,9 +1367,13 @@ class InklingRewriter:
     tool-call form with JSON values).  The model writes typed segments: <|content_thinking|> opens reasoning
     (THINK_AGAIN), <|content_text|> (and the tool-error / text-invoke kinds) opens answer text (</think> while
     reasoning is open), and a tool call is <|message_model|>NAME<|content_invoke_tool_json|>{"name": .., "args": {..}}
-    <|end_message|>, which goes out whole at its end as <tool_call>NAME<arg_key>K</arg_key><arg_value>V</arg_value>..
-    </tool_call> with V JSON.  What stands between segments (the tool's name after <|message_model|>, <|end_message|>)
-    is dropped.  A mark split across deltas is held until it is whole."""
+    <|end_message|>, which goes out as <tool_call>NAME<arg_key>K</arg_key><arg_value>V</arg_value>..</tool_call> with V
+    JSON.  The call streams as it is written (_stream): <tool_call>NAME once the name and the opening of "args" are
+    there, then each argument - a string value piece by piece (OutputParser's "jstr" path sends those pieces on as the
+    call's tool_args), any other value once it is whole - so a client sees a long file being written instead of a
+    reasoning that seems to have stalled for minutes.  A body of any other shape goes out whole at its end, as before.
+    What stands between segments (the tool's name after <|message_model|>, <|end_message|>) is dropped.  A mark split
+    across deltas is held until it is whole."""
 
     MARKS = (INK_THINK, INK_TEXT, INK_CALL, INK_MODEL, INK_END, INK_EOS) + INK_OTHER_TEXT
 
@@ -1379,6 +1383,15 @@ class InklingRewriter:
         self.open = thinking         # the parser is in its reasoning state (it starts there when thinking)
         self.name = ""
         self.body = ""
+        self.streamed_calls = 0      # calls that went out as they were written (_stream)
+        self._reset_stream()
+
+    def _reset_stream(self):
+        self.sp = 0                  # how much of self.body the streaming scan has consumed
+        self.st = "head"             # head -> akey -> acolon -> aval -> astr -> ... -> after | off (whole at its end) | broken
+        self.streamed = False        # <tool_call>NAME has gone out: the call is being streamed
+        self.akey = ""               # the argument whose value comes next
+        self.esc = False             # (astr) the last character was a backslash
 
     def feed(self, text: str) -> str:
         self.buf += text
@@ -1403,7 +1416,7 @@ class InklingRewriter:
             return ""
         if self.mode == "call":
             self.body += s
-            return ""
+            return self._stream()
         if self.mode == "lead":      # (no segment opened: a model that answers plainly)
             self.mode = "text" if s.strip() else "lead"
             return (self._close() + s) if self.mode == "text" else ""
@@ -1430,20 +1443,135 @@ class InklingRewriter:
             return ""
         if m == INK_CALL:
             self.mode, self.body = "call", ""
+            self._reset_stream()
             return ""
-        out = self._call() if self.mode == "call" else ""
+        out = self._end_call(final=False) if self.mode == "call" else ""
         self.mode = "between"          # <|end_message|> / the end of sampling: the segment is over
         return out
 
     def finish(self) -> str:
         """The end of the answer: a mark's partial text held back is text; a call still open goes out as far as it is
-        whole (an unfinished one as its text)."""
+        whole (an unfinished one as its text - or, already streaming, left open for OutputParser.finish, which ends a
+        call that was announced the way it ends any model's)."""
         rest, self.buf = self.buf, ""
         out = self._text(rest)
         if self.mode == "call":
-            out += self._call()
+            out += self._end_call(final=True)
             self.mode = "between"
         return out
+
+    # The streaming scan of a call body (see the class docstring).  It starts on the usual shape only - the name first,
+    # then , "args": and its opening brace; on anything else the body waits for its end and _call reads it whole.
+    _HEAD = re.compile(r'\s*\{\s*"name"\s*:\s*"((?:[^"\\]|\\.)*)"')
+    _ARGS_OPEN = re.compile(r'\s*,\s*"args"\s*:\s*\{')
+    _STR = re.compile(r'"(?:[^"\\]|\\.)*"')
+    _WS = " \t\r\n"
+
+    def _stream(self) -> str:
+        b, out = self.body, []
+        dec = json.JSONDecoder()
+        while True:
+            if self.st == "head":
+                m = self._HEAD.match(b)
+                if m is None:
+                    if len(b) > 256 or (b.lstrip() and not b.lstrip().startswith("{")):
+                        self.st = "off"          # not the usual head: the whole body at its end
+                    return ""
+                a = self._ARGS_OPEN.match(b, m.end())
+                if a is None:
+                    if len(b) - m.end() > 32:    # (', "args": {' is far shorter: another shape)
+                        self.st = "off"
+                    return ""
+                name = json.loads('"' + m.group(1) + '"') or self.name.strip()
+                if not name:
+                    self.st = "off"
+                    return ""
+                out.append(self._close() + CALL_START + name)
+                self.streamed, self.sp, self.st = True, a.end(), "akey"
+                self.streamed_calls += 1
+            elif self.st == "akey":
+                while self.sp < len(b) and (b[self.sp] in self._WS or b[self.sp] == ","):
+                    self.sp += 1
+                if self.sp >= len(b):
+                    break
+                if b[self.sp] == "}":
+                    self.sp += 1
+                    self.st = "after"
+                    break
+                k = self._STR.match(b, self.sp)
+                if k is None:
+                    if b[self.sp] != '"':
+                        self.st = "broken"
+                    break                        # (a key still arriving)
+                try:
+                    self.akey = json.loads(k.group())
+                except ValueError:
+                    self.st = "broken"
+                    break
+                self.sp, self.st = k.end(), "acolon"
+            elif self.st == "acolon":
+                while self.sp < len(b) and b[self.sp] in self._WS:
+                    self.sp += 1
+                if self.sp >= len(b):
+                    break
+                if b[self.sp] != ":":
+                    self.st = "broken"
+                    break
+                self.sp, self.st = self.sp + 1, "aval"
+            elif self.st == "aval":
+                while self.sp < len(b) and b[self.sp] in self._WS:
+                    self.sp += 1
+                if self.sp >= len(b):
+                    break
+                head = ARG_KEY + self.akey + ARG_KEY_END + ARG_VAL
+                if b[self.sp] == '"':            # a string: its JSON goes out as it is written
+                    out.append(head + '"')
+                    self.sp, self.st, self.esc = self.sp + 1, "astr", False
+                    continue
+                try:                             # anything else whole, once what ends a member follows it: "1500" may
+                    v, e = dec.raw_decode(b, self.sp)   # still become 1500.5, "tr" true (a prefix decodes, or fails)
+                except ValueError:
+                    break
+                j = e
+                while j < len(b) and b[j] in self._WS:
+                    j += 1
+                if j >= len(b) or b[j] not in ",}":
+                    break
+                out.append(head + json.dumps(v, ensure_ascii=False).replace("<", "\\u003c") + ARG_VAL_END)
+                self.sp, self.st = e, "akey"
+            elif self.st == "astr":
+                j, esc = self.sp, self.esc
+                while j < len(b):
+                    c = b[j]
+                    if esc:
+                        esc = False
+                    elif c == "\\":
+                        esc = True
+                    elif c == '"':
+                        break
+                    j += 1
+                # "<" only ever stands in a string: as \u003c it can never be read as the start of a tag
+                out.append(b[self.sp:j].replace("<", "\\u003c"))
+                self.esc = esc
+                if j >= len(b):
+                    self.sp = j
+                    break
+                out.append('"' + ARG_VAL_END)
+                self.sp, self.st = j + 1, "akey"
+            else:                                # after / off / broken: nothing more streams
+                break
+        return "".join(out)
+
+    def _end_call(self, final: bool) -> str:
+        """The call's segment is over (<|end_message|>, or the end of the answer when `final`)."""
+        if not self.streamed:
+            return self._call()                  # the whole body, as before: a call, or its text
+        out = self._stream()
+        if final:
+            return out                           # (cut off inside: OutputParser.finish closes the announced call)
+        if self.st == "astr":
+            out += '"' + ARG_VAL_END             # (the message ended inside a string: it ends there)
+        return out + CALL_END
 
     def _call(self) -> str:
         try:
