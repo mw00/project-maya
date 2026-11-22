@@ -4730,7 +4730,13 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
             dump_f("blk." + std::to_string(vis) + ".out", W.h, TC);
             continue;
         }
-        if (g_fast && T > 1 && S <= W.rg_slots && !Ly.tab_h.empty()) {
+#ifdef MAYA_USE_HIP   // (AMD, the offload path: a short prompt the resident path's way too - its sums are other bits there
+                      //  than the matrix cores'; a tier expert read in VRAM, the others where they are pinned)
+        const bool rg_off = g_off && !g_offs.tab;
+#else
+        const bool rg_off = false;
+#endif
+        if ((g_fast || rg_off) && T > 1 && S <= W.rg_slots && (rg_off || !Ly.tab_h.empty())) {
             // Every expert in VRAM and a prompt of a few tokens (a chat turn): the experts straight over their
             // blocks, an expert's blocks read once for up to kGroupMax of the tokens that picked it.  (The GEMM path
             // below decodes a whole expert to FP16 for the two or three tokens it has: a 47-token prompt took 0.34 s.)
@@ -4756,7 +4762,14 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
                 if (g < 0 || gn[g] == k::kGroupMax) {   // the expert's first group, or its next
                     g = G++;
                     W.gi_stamp[e] = stp, W.gi_idx[e] = g;
-                    gb[g] = Ly.tab_h[e], gn[g] = 0;
+                    if (rg_off) {
+                        const auto& P = EC.pools[EC.layer_pool[l]];
+                        const int sl = EC.loc[(size_t) l * c.E + e];
+                        gb[g] = sl >= 0 ? P.data + (size_t) sl * P.slot_bytes : g_offs.host[l] + (size_t) e * Ly.slot_bytes;
+                    } else {
+                        gb[g] = Ly.tab_h[e];
+                    }
+                    gn[g] = 0;
                 }
                 gtok[(size_t) g * k::kGroupMax + gn[g]] = i / c.K;
                 grow[(size_t) g * k::kGroupMax + gn[g]] = i;
