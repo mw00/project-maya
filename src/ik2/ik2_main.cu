@@ -42,6 +42,7 @@
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
+#include <psapi.h>
 #include <io.h>
 #define O_RDONLY (_O_RDONLY | _O_BINARY)
 #define open _open
@@ -659,7 +660,11 @@ struct Pinned {
         for (const auto& b : blocks) {
             if (b.mapped) {
                 if (b.registered) cudaHostUnregister(b.ptr);
+#ifdef _WIN32
+                VirtualFree(b.ptr, 0, MEM_RELEASE);   // (the offload path's reserved blocks)
+#else
                 ::munmap(b.ptr, b.bytes);
+#endif
             } else if (b.ptr) {
                 cudaFreeHost(b.ptr);
             }
@@ -1714,6 +1719,11 @@ bool g_off = false;        // set at load
 bool g_off_want = false;   // the layout chosen (the fit, IK2_OFF)
 struct OffState {
     std::vector<const uint8_t*> host;   // [n_layer] the layer's pinned experts as the device sees them
+    // (Windows, only the experts the tier does not hold pinned: host[l] is the layer's row of htab_d - each expert's
+    //  device address, its run's - and the fetch's stride 0 says so; null for the tier's experts)
+    bool tab = false;
+    std::vector<const uint8_t*> htab_h;  // [n_layer * E]
+    const uint8_t** htab_d = nullptr;
     std::vector<int> pool;              // [n_layer] its staging pool (the cache's pool of its slot size)
     std::vector<k::OffStage> stage;     // a pool a slot size
     // (prompts: the staging slots as a ring - an event a slot for its copy, one for the expert that read it)
@@ -2388,7 +2398,7 @@ void fast_token_launches(Model& M, Work& W, OutMode out_mode) {
         if (g_off) {   // (the offload path: the picks the tier does not hold copied into staging, their slots filled)
             const auto& st = g_offs.stage[g_offs.pool[l]];
             if (g_lane) {   // (lane parity: every expert in ik2_exact.h's sums, the CPU lane beside the fetch)
-                k::off_lane_plan(W.blob, rtop, c.K, l * c.E, g_offs.host[l], Ly.slot_bytes, st, g_offs.fl, g_offs.cnt,
+                k::off_lane_plan(W.blob, rtop, c.K, l * c.E, g_offs.host[l], g_offs.tab ? 0 : Ly.slot_bytes, st, g_offs.fl, g_offs.cnt,
                                  g_offs.heat, g_offs.cost, g_offs.fmt[l], W.xq, C, W.sg, W.su, l, g_offs.job_d,
                                  g_offs.ls, g_offs.cls, g_s);
                 k::off_fetch_copy(g_offs.fl, Ly.slot_bytes, g_offs.blocks, g_s);
@@ -2399,7 +2409,7 @@ void fast_token_launches(Model& M, Work& W, OutMode out_mode) {
                 k::moe_combine_conv(W.y32, W.inv, W.wt, c.K, C, Ly.h_mlp, Ly.sc_mlp, W.r, W.h, g_s);
                 continue;
             }
-            k::off_fetch_plan(W.blob, rtop, c.K, l * c.E, g_offs.host[l], Ly.slot_bytes, st, g_offs.fl, g_offs.cnt,
+            k::off_fetch_plan(W.blob, rtop, c.K, l * c.E, g_offs.host[l], g_offs.tab ? 0 : Ly.slot_bytes, st, g_offs.fl, g_offs.cnt,
                               g_offs.heat, g_s);
             k::off_fetch_copy(g_offs.fl, Ly.slot_bytes, g_offs.blocks, g_s);
         }
@@ -2605,7 +2615,7 @@ bool lane_init(Model& M, const std::string& want, int threads) {
         fh.n = std::min(8, st.n);
         std::vector<const uint8_t*> slots(fh.n);
         for (int i = 0; i < fh.n; ++i) {
-            fh.src[i] = g_offs.host[l] + (size_t) ex[i] * Ly.slot_bytes;
+            fh.src[i] = g_offs.tab ? g_offs.htab_h[(size_t) l * c.E + ex[i]] : g_offs.host[l] + (size_t) ex[i] * Ly.slot_bytes;
             fh.dst[i] = st.data + (size_t) i * st.sb;
             slots[i] = fh.dst[i];
         }
@@ -4391,8 +4401,8 @@ void check_preview(int n_gpu, bool serve) {
     };
     const bool force = getenv("IK2_UNSUPPORTED") && std::atoi(getenv("IK2_UNSUPPORTED"));
     const std::string run_anyway = " (IK2_UNSUPPORTED=1 runs it anyway, untested)";
-#ifdef _WIN32
-    if (!force) refuse("the Inkling 2 preview runs on Linux, Windows is outside it" + run_anyway);
+#if defined(_WIN32) && defined(STRATA_USE_HIP)
+    if (!force) refuse("Inkling 2 on AMD runs on Linux only, Windows is outside it" + run_anyway);
 #endif
     int nd = 0;
     const cudaError_t e = cudaGetDeviceCount(&nd);
@@ -5125,6 +5135,13 @@ int main(int argc, char** argv) {
         CU(cudaDeviceGetAttribute(&same, cudaDevAttrCanUseHostPointerForRegisteredMem, dv));
         pin_later = same && host_register_works();
     }
+#else
+    // (Windows: the GPU does not read a registered range at its own address - each run of experts registered has a
+    //  device address of its own, so the fetch finds an expert through a table of them, g_offs.tab)
+    if (!host_mmap && g_off_want && !(getenv("IK2_PIN_ALL") && std::atoi(getenv("IK2_PIN_ALL"))) &&
+        !(getenv("IK2_TIER_MIN") && std::atoi(getenv("IK2_TIER_MIN"))) &&
+        !(getenv("IK2_ALLOC") && std::string(getenv("IK2_ALLOC")) == "hostalloc"))
+        pin_later = g_offs.tab = true;
 #endif
     if (host_mmap) {
         if (g_pool) die("IK2_HOST=mmap with the CPU lane");
@@ -5140,14 +5157,18 @@ int main(int argc, char** argv) {
         }
         std::printf("experts: read where the files are mapped (IK2_HOST=mmap)\n");
         std::fflush(stdout);
-#ifndef _WIN32
     } else if (pin_later) {
         pin.blocks.resize(c.n_layer);
         for (int l = 0; l < c.n_layer; ++l) {
             Layer& Ly = M.L[l];
             const size_t slot_bytes = Ly.eb[0] + Ly.eb[1] + Ly.eb[2], layer_bytes = (size_t) c.E * slot_bytes;
+#ifdef _WIN32   // (address space only: the runs the tier does not hold are committed below the warm)
+            void* p = VirtualAlloc(nullptr, layer_bytes, MEM_RESERVE, PAGE_READWRITE);
+            if (!p) die("the offload path: no address space for layer " + std::to_string(l) + "'s experts");
+#else
             void* p = ::mmap(nullptr, layer_bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
             if (p == MAP_FAILED) die("the offload path: no address space for layer " + std::to_string(l) + "'s experts");
+#endif
             pin.blocks[l] = {p, layer_bytes, true, false};
             Ly.host_contig = true;
             Ly.slot_bytes = slot_bytes;
@@ -5167,7 +5188,6 @@ int main(int argc, char** argv) {
         std::printf("experts: %.1f GiB, pinned once the VRAM tier is planned (only the ones it does not hold)\n",
                     host_total / 1073741824.0);
         std::fflush(stdout);
-#endif
     } else {
         // Pinned host memory: anonymous mappings read into and then registered with CUDA, a layer as soon as its
         // reads are done (323 GiB in ~60 s from VAST); IK2_ALLOC=hostalloc: cudaHostAlloc instead, which pins at
@@ -5612,11 +5632,18 @@ int main(int argc, char** argv) {
         }
     }
     if (g_off_want && d == 0) {   // the offload path: the tier is what the cache holds (warmed above), tables a layer
-#ifndef _WIN32
         if (pin_later) {   // the experts the tier does not hold: read into their blocks, then pinned a run at a time
             const double tp0 = now();
             for (int l = 0; l < c.n_layer; ++l)
                 for (int e = 0; e < c.E; ++e) M.L[l].nopin[e] = EC.loc[(size_t) l * c.E + e] >= 0;
+#ifdef _WIN32
+            SYSTEM_INFO si{};
+            GetSystemInfo(&si);
+            const size_t pg = si.dwPageSize;
+            g_offs.htab_h.assign((size_t) c.n_layer * c.E, nullptr);
+#else
+            const size_t pg = (size_t) sysconf(_SC_PAGESIZE);
+#endif
             auto runs_of = [&](int l, auto&& f) {   // f(e0, n): a run of the layer's experts not in the tier
                 const auto& np = M.L[l].nopin;
                 for (int e = 0; e < c.E;) {
@@ -5632,7 +5659,22 @@ int main(int argc, char** argv) {
             std::atomic<int> next{0}, fails{0};
             std::atomic<size_t> pinned{0};
             std::mutex rm;
-            const size_t pg = (size_t) sysconf(_SC_PAGESIZE);
+            auto run_span = [&](int l, int e0, int n) {   // (a run's pages: its own, the tier's experts between runs
+                const uint8_t* blk = (const uint8_t*) pin.blocks[l].ptr;   //  are each far over a page)
+                const size_t sb = M.L[l].slot_bytes;
+                return std::make_pair(((uintptr_t) blk + (size_t) e0 * sb) & ~(uintptr_t) (pg - 1),
+                                      ((uintptr_t) blk + (size_t) (e0 + n) * sb + pg - 1) & ~(uintptr_t) (pg - 1));
+            };
+#ifdef _WIN32
+            // (Windows: the reserved blocks get RAM where the runs are - committed before any of their reads)
+            for (int l = 0; l < c.n_layer; ++l)
+                runs_of(l, [&](int e0, int n) {
+                    const auto ab = run_span(l, e0, n);
+                    if (!VirtualAlloc((void*) ab.first, ab.second - ab.first, MEM_COMMIT, PAGE_READWRITE))
+                        die("the offload path: no RAM for the experts the VRAM tier does not hold (Windows' commit "
+                            "limit: a larger page file, or IK2_PIN_ALL=1)");
+                });
+#endif
             std::vector<std::thread> th;
             for (int t = 0; t < std::max(1, threads); ++t)
                 th.emplace_back([&]() {
@@ -5650,8 +5692,8 @@ int main(int argc, char** argv) {
                         });
                         if (--left[J.l]) continue;
                         runs_of(J.l, [&](int e0, int n) {   // (the layer's reads done: its runs pinned, mapped)
-                            const uintptr_t a = ((uintptr_t) blk + (size_t) e0 * Ly.slot_bytes) & ~(uintptr_t) (pg - 1);
-                            const uintptr_t b = ((uintptr_t) blk + (size_t) (e0 + n) * Ly.slot_bytes + pg - 1) & ~(uintptr_t) (pg - 1);
+                            const auto ab = run_span(J.l, e0, n);
+                            const uintptr_t a = ab.first, b = ab.second;
                             void* dp = nullptr;
                             if (cudaHostRegister((void*) a, b - a, cudaHostRegisterPortable | cudaHostRegisterMapped) != cudaSuccess) {
                                 cudaGetLastError(), ++fails;
@@ -5661,8 +5703,18 @@ int main(int argc, char** argv) {
                                 std::lock_guard<std::mutex> lk(rm);
                                 pin.runs.push_back({(void*) a, (size_t) (b - a)});
                             }
+#ifdef _WIN32
+                            // (the run's own device address: each of its experts' in the table)
+                            if (cudaHostGetDevicePointer(&dp, (void*) a, 0) != cudaSuccess || !dp)
+                                cudaGetLastError(), ++fails;
+                            else
+                                for (int e = e0; e < e0 + n; ++e)
+                                    g_offs.htab_h[(size_t) J.l * c.E + e] =
+                                        (const uint8_t*) dp + ((uintptr_t) blk + (size_t) e * Ly.slot_bytes - a);
+#else
                             if (cudaHostGetDevicePointer(&dp, (void*) a, 0) != cudaSuccess || dp != (void*) a)
                                 cudaGetLastError(), ++fails;
+#endif
                             pinned += (size_t) n * Ly.slot_bytes;
                         });
                     }
@@ -5671,21 +5723,33 @@ int main(int argc, char** argv) {
             if (fails) die("the offload path: the experts the tier does not hold could not be pinned (IK2_PIN_ALL=1: "
                            "every expert pinned at the load)");
             double anon = 0;
+#ifdef _WIN32
+            {   // (the process's private commit - what it takes of the RAM and the page file)
+                PROCESS_MEMORY_COUNTERS_EX pm{};
+                pm.cb = sizeof pm;
+                if (K32GetProcessMemoryInfo(GetCurrentProcess(), (PROCESS_MEMORY_COUNTERS*) &pm, sizeof pm))
+                    anon = pm.PrivateUsage / 1073741824.0;
+            }
+            g_offs.htab_d = dalloc<const uint8_t*>(g_offs.htab_h.size());
+            CU(cudaMemcpy(g_offs.htab_d, g_offs.htab_h.data(), g_offs.htab_h.size() * sizeof(void*),
+                          cudaMemcpyHostToDevice));
+#else
             if (FILE* f = std::fopen("/proc/self/status", "r")) {
                 char ln[256];
                 while (std::fgets(ln, sizeof ln, f))
                     if (!std::strncmp(ln, "RssAnon:", 8)) anon = std::atof(ln + 8) / 1048576.0;
                 std::fclose(f);
             }
+#endif
             std::printf("experts in pinned memory: %.1f GiB (the %.1f GiB the tier holds not in RAM), read and pinned in "
                         "%.1f s; the engine's RAM %.1f GiB in all\n", pinned.load() / 1073741824.0,
                         (host_total - pinned.load()) / 1073741824.0, now() - tp0, anon);
             std::fflush(stdout);
         }
-#endif
         g_offs.host.assign(c.n_layer, nullptr);
         for (int l = 0; l < c.n_layer; ++l) {
-            void* dp = (void*) M.L[l].host[0];   // (pinned in runs: at their own addresses, checked above)
+            // (pinned in runs: at their own addresses, checked above - Windows: the layer's row of the table)
+            void* dp = g_offs.tab ? (void*) (g_offs.htab_d + (size_t) l * c.E) : (void*) M.L[l].host[0];
             if (M.L[l].nopin.empty() && (cudaHostGetDevicePointer(&dp, (void*) M.L[l].host[0], 0) != cudaSuccess || !dp))
                 die("the offload path: layer " + std::to_string(l) + "'s experts are not mapped for the GPU (pinning "
                     "failed - IK2_OFF=0 runs the cache path)");
