@@ -2321,7 +2321,9 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                     if (seq_rid[(size_t) s] < 0) continue;   // (the idle ones were judged above)
                     bind(s);
                     const auto& st = m.tokens();
-                    if (st.empty() || st.size() > r.ids.size() || m.ablating() || !held.empty()) continue;
+                    if (st.empty() || m.ablating() || !held.empty()) continue;
+                    // The answer can advance past the submitted prompt while it is queued (including a lookup
+                    // window). A longer source can still supply a matching checkpoint; restore the copy below.
                     size_t c = 0;
                     while (c < st.size() && c < r.ids.size() && st[c] == r.ids[c]) ++c;
                     int64_t u = 0;

@@ -661,7 +661,8 @@ context shares the memory beside the model among the N conversations.
   read the session again: the busy conversation's state is copied into the idle conversation the request takes
   (through RAM, as a kept conversation is) and the prompt reads on from the copy - whole, or from the latest
   checkpoint the prompt agrees with. The copy goes when it covers at least twice what the idle conversations cover on
-  their own: it costs the state's bytes twice over and saves the tokens between the two (against ~73 s of reading a
+  their own. A busy answer that has advanced beyond the submitted prompt can still supply a matching checkpoint.
+  It costs the state's bytes twice over and saves the tokens between the two (against ~73 s of reading a
   190K-token conversation again). Text prompts only, and not from a conversation that holds pictures. `MAYA_DS4_SLOT_COPY=0` turns it off; `MAYA_DS4_SLOT_COPY_MIN` (1024) is the
   shortest state copied. The engine's log says `ds4 slots: copied conversation <n>'s state ...`.
 - **Prompts are read a piece at a time.** The prompts being read take turns, a piece each - a chunk per pipeline stage,

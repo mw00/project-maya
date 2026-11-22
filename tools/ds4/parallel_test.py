@@ -5,13 +5,14 @@ prompt is read while the others answer - and what it costs and what it gains, me
 
     python tools/ds4/parallel_test.py --pack /mnt/data/models/.../maya-ds4 [--exe build/maya-ds4] [--gpus 0,2,1]
                                       [--config maya-ds4.json] [--lanes 3] [--skip-long] [--measure] [--spec 0]
+                                      [--copy-only]
 
 The engine gets the environment this test inherits plus, with `--config <maya-ds4.json>`, that config's DeepSeek
 settings (`DS4_*` and `MAYA_DS4_*` names, under the names the engine reads).  Every run uses a scratch
 MAYA_DS4_SLOT_DIR (the pack's own slots/ is never touched: the engine prunes what is not its own at start), and the
 engine's stdin/stdout protocol - no ports, no server.
 
-Checks (greedy, spec=0 so a conversation's state ends exactly at its last printed token, as slot_keep_test.py's):
+Checks (greedy, spec=0 also disables suffix lookup, except the explicit lookup-copy regression):
   alone     the reference: four salted prompts, one at a time, `--parallel 1`, twice in two runs of one process
             (run-to-run determinism is measured, not assumed: where the two reads disagree the comparison below is
             against both)
@@ -22,7 +23,8 @@ Checks (greedy, spec=0 so a conversation's state ends exactly at its last printe
   copy      `--parallel 2`: a prompt that continues a conversation that is busy answering (a background compaction
             behind the chat whose answer is still writing) has the busy lane's state copied into the idle lane it
             takes and reads on from it (MAYA_DS4_SLOT_COPY): its DONE reuses at least the busy prompt's whole
-            length, where the empty idle lane would reuse 0
+            length, where the empty idle lane would reuse 0; a queued shorter prompt also reuses a checkpoint after
+            the source advances beyond it, with suffix lookup both off and on
   stop      two requests at once: STOP <rid> one of them; its DONE says `cancel` with fewer tokens, the other's
             answer is whole (a STOP is a request's own)
   reading   `--parallel 2`: a ~100K-token prompt and, a moment later, a small one: the small one's answer must make
@@ -110,7 +112,8 @@ class Multi(Engine):
         else:
             self.other.append(line)
 
-    def send(self, prompt: list[int], max_new: int, spec: int = 0, rid: int | None = None) -> int:
+    def send(self, prompt: list[int], max_new: int, spec: int = 0, rid: int | None = None,
+             lookup: int | None = None) -> int:
         if rid is None:
             with self.cond:
                 self.rids += 1
@@ -119,13 +122,53 @@ class Multi(Engine):
         else:
             with self.cond:
                 self.got.setdefault(rid, [])
-        self.proc.stdin.write(f"GEN {max_new} rid={rid} spec={spec} {','.join(str(t) for t in prompt)}\n".encode())
+        # spec=0 disables DSpark, but the independent suffix drafter can still advance the state past printed rows.
+        if lookup is None and spec == 0:
+            lookup = 0
+        suffix = "" if lookup is None else f"suffix_draft={lookup} "
+        self.proc.stdin.write(f"GEN {max_new} rid={rid} spec={spec} {suffix}{','.join(str(t) for t in prompt)}\n".encode())
         self.proc.stdin.flush()
         return rid
 
     def stop_request(self, rid: int) -> None:
         self.proc.stdin.write(f"STOP {rid}\n".encode())
         self.proc.stdin.flush()
+
+    def wait_tokens(self, rid: int, count: int, timeout: float = 180.0) -> list[int]:
+        """Wait for observed decoding, keeping the source busy; a slow prompt is not a failed copy check."""
+        end = time.monotonic() + timeout
+        with self.cond:
+            while True:
+                lines = self.got.get(rid, [])
+                if any(k in ("DONE", "ERR") for k, _, _ in lines):
+                    raise RuntimeError(f"request {rid} ended before the busy-copy check")
+                if self.dead:
+                    raise RuntimeError(self.dead)
+                tokens = [int(l.split()[2]) for k, l, _ in lines if k == "T"]
+                if len(tokens) >= count:
+                    return tokens
+                left = end - time.monotonic()
+                if left <= 0:
+                    raise RuntimeError(f"request {rid} did not reach {count} generated tokens")
+                self.cond.wait(min(left, 1.0))
+
+    def quit(self, timeout: float = 300.0) -> None:
+        # _read owns stdout after READY; the single-lane quit's second reader would race it for the same pipe.
+        try:
+            self.proc.stdin.write(b"QUIT\n")
+            self.proc.stdin.flush()
+        except OSError:
+            pass
+        try:
+            self.proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            self.proc.kill()
+            self.proc.wait(timeout=10)
+            raise RuntimeError("the engine did not end after QUIT") from None
+        if self.thread is not None:
+            self.thread.join(timeout=5)
+        if self.proc.returncode != 0:
+            raise RuntimeError(f"the engine ended with exit {self.proc.returncode}")
 
     def stream(self, rid: int, timeout: float = 7200.0):
         """(kind, line, time) for this request, until its DONE or ERR; then a dict of what it was."""
@@ -221,6 +264,41 @@ def one_run(a, settings: dict, parallel: int, ctx: int, slots: str, keep: bool =
     return eng
 
 
+def copy_checks(eng: Multi, probes: list[list[int]], tail: list[int], spec: int = 0) -> list[dict]:
+    """Full continuation, then a shorter queued snapshot with and without lookup advancing the busy source."""
+    results = []
+    for prompt, stale, lookup in ((probes[2], False, 0), (probes[3], True, 0), (probes[0], True, 1)):
+        rid = eng.send(prompt, 300, spec, lookup=lookup)
+        source = None
+        try:
+            wrote = eng.wait_tokens(rid, 4)
+            comp = prompt + wrote[:4] + tail
+            if stale:
+                # Every printed token but the last has been consumed, even without speculative execution. This
+                # makes the source longer than comp before submitting it, rather than hoping for a timing race.
+                wrote = eng.wait_tokens(rid, max(32, len(comp) - len(prompt) + 4))
+            before = len(wrote)
+            start = time.monotonic()
+            target = eng.stream(eng.send(comp, 8, spec), timeout=180)
+            elapsed = time.monotonic() - start
+            advanced = eng.wait_tokens(rid, before + 4)
+        finally:
+            if eng.proc.poll() is None and eng.dead is None:
+                eng.stop_request(rid)
+                source = eng.stream(rid, timeout=120)
+        # The prefill checkpoint can be immediately before the prompt's final token. A source that has advanced
+        # cannot always reuse the entire prompt, but it must reuse that checkpoint instead of reading from zero.
+        minimum = len(prompt) - 1 if stale else len(prompt)
+        if target["error"] is not None or target["generated"] != 8 or target["reused"] < minimum:
+            raise RuntimeError(f"copy (stale={stale}, lookup={lookup}): {target}")
+        if source is None or source["error"] is not None or source["finish"] != "cancel":
+            raise RuntimeError(f"the copied source did not cancel independently: {source}")
+        results.append(dict(stale=stale, lookup=lookup, prompt_tokens=len(prompt), incoming_tokens=len(comp),
+                            source_tokens_at_submit=before, source_tokens_after_copy=len(advanced),
+                            target=target, source=source, wall_seconds=elapsed))
+    return results
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="several conversations at once on maya-ds4 (--parallel N)")
     ap.add_argument("--pack", required=True, help="the model's pack dir (maya-ds4)")
@@ -239,6 +317,7 @@ def main() -> int:
     ap.add_argument("--skip-long", action="store_true", help="the interleaving check and the long measurement only "
                                                              "with --long-len, which a --ctx below it cannot run")
     ap.add_argument("--measure", action="store_true", help="run and print the measurement table")
+    ap.add_argument("--copy-only", action="store_true", help="run only the busy-copy and ahead-source regressions")
     a = ap.parse_args()
     settings = config_env(a.config) if a.config else {}
 
@@ -265,8 +344,27 @@ def main() -> int:
         d = next((i for i, (p, q) in enumerate(zip(x, y)) if p != q), min(len(x), len(y)))
         return f"token {d}: {x[d:d + 4]} vs {y[d:d + 4]}"
 
+    def check_copy() -> bool:
+        eng = None
+        try:
+            enabled = dict(settings, MAYA_DS4_SLOT_COPY="1")
+            eng = one_run(a, enabled, 2, a.ctx, os.path.join(tmp, "copy"), keep=True)
+            for r in copy_checks(eng, probes, text_tokens(tok, "Summarise the above.", 8), a.spec):
+                print(f"  ok    copy (stale={r['stale']}, lookup={r['lookup']}): reused "
+                      f"{r['target']['reused']} of {r['incoming_tokens']} tokens; answered 8; source kept running "
+                      "and cancelled independently", flush=True)
+            return True
+        except Exception as e:  # noqa: BLE001
+            print(f"the copy run failed: {e}", flush=True)
+            return False
+        finally:
+            if eng is not None:
+                eng.quit()
+
     print(f"engine {a.exe}, lanes {lanes}, prompts {a.len} tokens, answers {a.check_new} tokens (spec={a.spec})",
           flush=True)
+    if a.copy_only:
+        return 0 if check_copy() else 1
 
     # ---- alone: one at a time, --parallel 1, twice (the prompt path's own run-to-run agreement is measured)
     alone_runs: list[list[list[int]]] = []
@@ -341,25 +439,7 @@ def main() -> int:
     # ---- copy: a prompt that continues a conversation that is busy answering - a background compaction behind the
     # chat whose answer is still writing - has the busy lane's state copied into the idle lane it takes and reads on
     # from it, instead of the empty lane reading the whole session again (MAYA_DS4_SLOT_COPY)
-    try:
-        eng = one_run(a, settings, min(2, lanes), a.ctx, os.path.join(tmp, "copy"), keep=True)
-        rid_a = eng.send(probes[2], 300, a.spec)          # A: a long answer, so its lane stays busy
-        time.sleep(0.5)
-        with eng.cond:
-            wrote = [int(l.split()[2]) for k, l, _ in eng.got.get(rid_a, []) if k == "T"]
-        if len(wrote) < 4:
-            raise RuntimeError(f"A wrote only {len(wrote)} tokens in half a second")
-        comp = probes[2] + wrote + text_tokens(tok, "Summarise the above.", 8)   # (the compaction prompt)
-        r = eng.stream(eng.send(comp, 8, a.spec))         # (A's lane is busy: an idle one takes this)
-        check(f"copy: the prompt behind the busy conversation reused {r['reused']} of its {len(comp)} tokens "
-              f"(the busy state was copied; an empty lane would reuse 0)",
-              r["error"] is None and r["reused"] >= len(probes[2]))
-        check("copy: and answered whole from the copy", r["error"] is None and r["generated"] == 8)
-        eng.stop_request(rid_a)
-        eng.stream(rid_a)
-        eng.quit()
-    except Exception as e:  # noqa: BLE001
-        print(f"the copy run failed: {e}", flush=True)
+    if not check_copy():
         ok = False
 
     # ---- reading: a long prompt and a small one after it; the small one's answer must not wait for the whole read
