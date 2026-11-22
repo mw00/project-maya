@@ -67,6 +67,10 @@ public:
     /// its factor at scales + j * sstride), in part order, in F32, packed back to F16 with its own factor (out, osc)
     void sum16(uint16_t* out, float* osc, const uint16_t* parts, const float* scales, int n_parts, size_t stride,
                size_t sstride, size_t rows, int E);
+    /// on: stream()'s sums (a token window's) on the caller's thread alone, the helpers left asleep - for tensor parallel
+    /// with the CPU lane, whose workers a token window's spinning helpers would take the cores from.  A prompt chunk's
+    /// sums keep the helpers.  (A no-op where HY4_SUM_PER is set.)
+    void windows_solo(bool on);
 
 private:
     void run(size_t a0, size_t a1) const;
@@ -81,6 +85,7 @@ private:
     int n_parts_ = 0, n_extra_ = 0;
     size_t n_short_ = 0;
     size_t stride_ = 0, n_ = 0, per_ = 0;
+    bool solo_ = false;
     int mode_ = 0;   // (0: sum()'s, 1: add()'s copy, 2: add()'s add, 3: sum16()'s - by rows, 4: stream()'s)
     uint16_t* out16_ = nullptr;
     float* osc_ = nullptr;
