@@ -1698,7 +1698,10 @@ bool Glm5Model::win_pipe_begin_part(bool fresh, std::string& err) {
     cudaSetDevice(dev_);
     if (fresh) cudaStreamSynchronize(fast_->cs);
     bool idle = fresh;
-    if (!idle) {
+    // (same answers - glmfast::same_answers, default: the boundary on the fresh windows alone - whether a part happened
+    //  to be idle is timing, and every boundary counts toward when the tier moves go live: other experts on the CPU
+    //  lane, other bits, from start to start)
+    if (!idle && !glmfast::same_answers()) {
         idle = cudaStreamQuery(fast_->cs) == cudaSuccess;
         if (!idle) cudaGetLastError();
     }

@@ -4205,7 +4205,8 @@ bool Glm5Model::fast_cpu_lane_setup(std::string& err) {
     cudaEventDestroy(e1);
     // repeatable answers: the timing as the cache keeps it (4 decimals), so the start that measured it plans the
     // prompts' CPU share exactly as every later start reading MAYA_GLM_CPU_CAL does
-    if (glmfast::repeatable(F->helper.linked()))
+    // (and by default - glmfast::same_answers: the first start plans with the values every later start reads back)
+    if (glmfast::repeatable(F->helper.linked()) || glmfast::same_answers())
         for (double* v : {&c_ms, &p_ms, &ps_ms}) *v = std::round(*v * 1e4) / 1e4;
     if (!cal_key.empty()) cal_put(calf, cal_key, cal_vals(c_ms, p_ms, ps_ms, 0.0));
     }
@@ -5044,7 +5045,9 @@ void Glm5Model::lane_retime() {
     if (!on) return;
     for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
         FastState* F = m->fast_;
-        if (F != nullptr && glmfast::repeatable(F->helper.linked())) continue;   // (repeatable answers: no timed re-plan)
+        // (repeatable answers, and same_answers by default: no timed re-plan - a busy CPU's drift drops the kept
+        //  timing instead, lane_drift_check, and the next start times it again)
+        if (F != nullptr && (glmfast::repeatable(F->helper.linked()) || glmfast::same_answers())) continue;
         if (F == nullptr || F->cpu_pool == nullptr || !F->cpu_retime || F->rt_windows >= 8 || F->rt_changes >= 3)
             continue;
         const uint64_t e = F->cpu_experts.load(), us = F->cpu_us.load(), r = F->cpu_routes.load();

@@ -519,7 +519,10 @@ int Glm5Model::mtp_choose(int n_cap) {
     // two runs can verify different windows and part - the start length instead, unless MAYA_GLM_MTP_ADAPT=1 (the
     // setup's speed check runs the search once and keeps its pick as MAYA_GLM_MTP_FIXED, serve/glm_link.py)
     static const bool adapt_set = getenv("MAYA_GLM_MTP_ADAPT") != nullptr;
-    if (!adapt_set && fast_ != nullptr && glmfast::repeatable(fast_->helper.linked()))
+    // (and by default - glmfast::same_answers: the window's length changes the answer's bits - a kept row's
+    //  recurrent-state replay and the window's shape - so a length picked by measured times parted two starts' answers;
+    //  the start length 2 gives the same tokens as no drafting on three V100s)
+    if (!adapt_set && fast_ != nullptr && (glmfast::repeatable(fast_->helper.linked()) || glmfast::same_answers()))
         return std::min(start_n, n_cap);
     if (n_cap <= 0) return 0;
     if (fixed) return n_cap;

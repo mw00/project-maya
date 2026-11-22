@@ -73,6 +73,21 @@ inline bool repeatable(bool linked) {
     }();
     return env >= 0 ? env == 1 : linked;
 }
+// The same greedy answers on every start (default on; MAYA_GLM_SAME_ANSWERS=0: the earlier timing-led choices).  Three
+// choices followed how fast something ran at that moment, and each one moves an expert between this GPU and the CPU
+// lane (other bits for the same expert): (1) the CPU lane's split, planned from a start-up timing taken again at
+// every start and re-planned from decode timing - now timed once on this PC and kept (MAYA_GLM_CPU_CAL, the server's
+// data/glm-cpu-cal.txt) with no live re-plan; (2) tier moves went live as soon as their copy landed - now exactly
+// fixed_moves boundaries after they started; (3) a prompt's CPU / PCIe expert split learned from each layer's
+// times - now planned from the kept timing alone.  The draft length still adapts (its verify gives the token path's
+// bits).  Speed: unchanged within the run-to-run spread on three V100s (see the v1.1.75 notes).
+inline bool same_answers() {
+    static const bool on = [] {
+        const char* v = getenv("MAYA_GLM_SAME_ANSWERS");
+        return v == nullptr || std::atoi(v) != 0;
+    }();
+    return on;
+}
 // repeatable answers: the CPU-lane timing the expert splits plan with in powers of two (MAYA_GLM_LANE_STEPS=0:
 // the measured values - a few percent of timing noise between builds then moves experts and the answers' bits)
 inline bool lane_steps() {
@@ -88,7 +103,7 @@ inline int fixed_moves(bool linked) {
         const char* v = getenv("MAYA_GLM_FIXED_MOVES");
         return v != nullptr ? std::max(0, std::atoi(v)) : -1;
     }();
-    return env >= 0 ? env : repeatable(linked) ? 4 : 0;
+    return env >= 0 ? env : repeatable(linked) || same_answers() ? 4 : 0;
 }
 
 namespace gf = maya::kernels::glmf;
