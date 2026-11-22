@@ -4206,7 +4206,8 @@ void index_score(const float* q, const float* w, const void* k, int heads, int h
     // cores' one: the last bits differ and a long greedy run's tokens part after a while, the quality is the same
     // (perplexity 7.5366 both on 4 x 1024 tokens; a Gorgon Halo, DeepSeek EXL3 2.25: KL to the full-precision model 0.1649
     // against 0.1661, the same top token 91.08 / 91.07%) and long prompts read faster (+3 / +6 / +10% at 8K / 32K / 64K).
-    // HIP: on by default on gfx11 and gfx12 (RDNA 3 / 4; other archs keep the CUDA cores' kernel), DS4_INDEX_TC=0 turns it off.
+    // HIP: on by default on gfx11 (RDNA 3; gfx12 / RDNA 4 opt-in with DS4_INDEX_TC_GFX12=1; other archs keep the CUDA
+    // cores' kernel), DS4_INDEX_TC=0 turns it off.
     // CUDA: opt-in, DS4_INDEX_TC=1 (compute capability 8.0+).
     static const int tc_env = [] {
         const char* e = std::getenv("DS4_INDEX_TC");
@@ -4242,11 +4243,15 @@ void index_score(const float* q, const float* w, const void* k, int heads, int h
 #else
             (void) major;
             cudaDeviceProp p{};   // (RDNA 3/4: the same kernel on its WMMAs - its shared memory below 64 KB, no attribute)
+            // (RDNA 4 / gfx12: opt-in, DS4_INDEX_TC_GFX12=1 - its own _gfx12 WMMA path; off it keeps the portable kernel)
+            const char* g12 = std::getenv("DS4_INDEX_TC_GFX12");
+            const bool gfx12_on = g12 && std::atoi(g12) == 1;
             if (cudaGetDeviceProperties(&p, dev) == cudaSuccess &&
-                (std::strncmp(p.gcnArchName, "gfx11", 5) == 0 || std::strncmp(p.gcnArchName, "gfx12", 5) == 0)) {
+                (std::strncmp(p.gcnArchName, "gfx11", 5) == 0 || (gfx12_on && std::strncmp(p.gcnArchName, "gfx12", 5) == 0))) {
                 capable.fetch_or(1ull << dev);
                 std::fprintf(stderr, "ds4: GPU%d (%s) the indexer's scores on the WMMAs (%s; DS4_INDEX_TC=0: off)\n", dev,
-                             p.gcnArchName, tc_env == 1 ? "DS4_INDEX_TC=1" : "the default on RDNA 3/4");
+                             p.gcnArchName, std::strncmp(p.gcnArchName, "gfx12", 5) == 0 ? "DS4_INDEX_TC_GFX12=1"
+                             : tc_env == 1 ? "DS4_INDEX_TC=1" : "the default on RDNA 3");
             }
 #endif
             cudaDeviceGetAttribute(&sms[dev & 63], cudaDevAttrMultiProcessorCount, dev);
