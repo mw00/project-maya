@@ -359,6 +359,7 @@ bool g_pa70 = false;   // Volta: a prompt chunk's attention on a full layer on m
 //  IK2_PA70_MIN: tests and the owner's choice)
 int g_pa70_min = 65536;
 bool g_group = true;   // IK2_GROUP=0: 2 .. 8 tokens' experts a slot at a time, their attention a head at a time
+bool g_grp = true;     // IK2_GRP=0: the batch prefill's experts through decode_f16 + cuBLAS GEMMs, not the grouped kernels
 bool g_group_exp = true, g_group_attn = true;   // (IK2_GROUP=1: the experts grouped only, 2: the attention only)
 FILE* g_trace = nullptr;   // IK2_TRACE=FILE: each layer's picks, records of int32 (layer, T, K, T x K experts)
 struct Prof {
@@ -1240,6 +1241,12 @@ struct Work {
     int *gidx, *inv;
     const uint8_t** blob;
     int* tok;
+    float *xf32 = nullptr;                       // the grouped batch experts' fp32 input rows [T_buf][C]
+    uint16_t* limbs = nullptr;                   // f16_limbs_rows' hi/lo pairs [T_buf][2C]: the block kernels' input
+    const uint8_t** grp_blob = nullptr;          // the batch groups' tables (grp_fill): the blob per group
+    int *grp_n = nullptr, *grp_tok = nullptr, *grp_row = nullptr;   // n per group, tok/row [G][8]
+    std::vector<int> grp_off;                    // each expert's group offset in the tables (host)
+    size_t grp_cap = 0;                          // h16 / y32 rows (S_buf; the lent scratch's Tr in the sup path)
     uint8_t *pack_h[kPackRing] = {}, *pack_d[kPackRing] = {};   // ring-buffered token path tables
     uint16_t* tp_h = nullptr;   // IK2_TP: the whole h, [S][F] FP16 (each GPU fills its half, then the other's)
     uint8_t* tp_pk = nullptr;   // (the decode's tables of this layer on the device: canonical blobs at +1536)
@@ -1994,6 +2001,12 @@ RdnaMoe& rdna_moe(int S, int E, int C, int F) {
 }
 #endif
 
+// The grouped batch experts' weight types (row_dot_multi's switch) - anything else stays on decode_f16 + cuBLAS.
+static bool grp_one(int ty) {
+    return ty == k::kNVFP4 || ty == k::kQ8_0 || ty == k::kQ6_K || ty == k::kQ5_K;
+}
+static bool grp_ok(const Layer& Ly) { return grp_one(Ly.ty[0]) && grp_one(Ly.ty[1]) && grp_one(Ly.ty[2]); }
+
 void run_prefill_moe(const Model& M, Layer& Ly, int l, int T, const uint16_t* xq16, const int* top, const float* w,
                      const float* r_in, float* h_out, Work& W, ExpertCache& EC, double& t_exp) {
     const Config& c = M.c;
@@ -2091,6 +2104,18 @@ void run_prefill_moe(const Model& M, Layer& Ly, int l, int T, const uint16_t* xq
         CU(cudaMemcpyAsync(X.su, su, (size_t) S * 4, cudaMemcpyHostToDevice, g_s));
         CU(cudaMemcpyAsync(X.wtr, wtr, (size_t) S * 4, cudaMemcpyHostToDevice, g_s));
         CU(cudaMemsetAsync(X.tmp, 0, (size_t) T * C * 4, g_s));
+        const bool grp = g_grp && grp_ok(Ly) && X.grp_cap >= (size_t) S;
+        const bool nvl = grp && Ly.ty[0] == k::kNVFP4 && Ly.ty[1] == k::kNVFP4 && Ly.ty[2] == k::kNVFP4
+            && C % 64 == 0 && c.F % 64 == 0;   // (the tensor-core block kernels' fit)
+        if (grp) {
+            k::to_f32(xin, (size_t) T * C, X.xf32, g_s);
+            if (nvl) k::f16_limbs_rows(X.xf32, (int) T, C, X.limbs, g_s);
+            int g_acc = 0;
+            for (int e = 0; e < c.E; ++e) {
+                X.grp_off[e] = g_acc;
+                g_acc += (W.cnt[e] + k::kGroupMax - 1) / k::kGroupMax;
+            }
+        }
 
         // Each expert: its tokens gathered, gate/up, SwiGLU, down, then added into tmp with their weights. The experts run
         // in index order whatever is cached (each waiting for its copies), so the sums' order and the result do not
@@ -2098,6 +2123,34 @@ void run_prefill_moe(const Model& M, Layer& Ly, int l, int T, const uint16_t* xq
         auto run_exp = [&](int e) {
             const int cnt_e = W.cnt[e], st_e = W.start[e];
             const uint8_t* sl = X.slot_ptrs[e];
+            if (grp) {
+                // the grouped path: the expert's members (up to 8 a group) through row_dot_multi straight over
+                // its blocks - no FP16 tile, no cuBLAS - then the same scatter-add in the same row order, so
+                // the sums' order is the token path's and the result does not depend on the tier.
+                const int off_e = X.grp_off[e], ng = (cnt_e + k::kGroupMax - 1) / k::kGroupMax;
+                k::grp_fill(sl, cnt_e, st_e, off_e, X.gidx, X.grp_blob, X.grp_n, X.grp_tok, X.grp_row, g_s);
+                if (nvl) {
+                    k::experts_block_gu(X.grp_blob + off_e, X.grp_n + off_e,
+                                        X.grp_tok + (size_t) off_e * k::kGroupMax,
+                                        X.grp_row + (size_t) off_e * k::kGroupMax, ng,
+                                        cnt_e < k::kGroupMax ? cnt_e : k::kGroupMax, Ly.eb[0], C, c.F, X.limbs,
+                                        X.sg, X.su, c.gate_cap, c.up_cap, X.h16, g_s);
+                    k::experts_block_down(X.grp_blob + off_e, X.grp_n + off_e,
+                                          X.grp_row + (size_t) off_e * k::kGroupMax, ng, Ly.eb[0] + Ly.eb[1], C, c.F,
+                                          X.h16, X.y32, g_s);
+                } else {
+                    k::experts_gate_up_swiglu_g(X.grp_blob + off_e, X.grp_n + off_e,
+                                                X.grp_tok + (size_t) off_e * k::kGroupMax,
+                                                X.grp_row + (size_t) off_e * k::kGroupMax, ng, Ly.ty[0], Ly.ty[1],
+                                                Ly.eb[0], X.xf32, C, c.F, X.sg, X.su, c.gate_cap, c.up_cap, X.h16,
+                                                g_s);
+                    k::experts_down_g(X.grp_blob + off_e, X.grp_n + off_e, X.grp_row + (size_t) off_e * k::kGroupMax,
+                                      ng, Ly.ty[2], Ly.eb[0] + Ly.eb[1], X.h16, C, c.F, X.y32, g_s);
+                }
+                scatter_add_rows_kernel<<<cnt_e, 256, 0, g_s>>>(X.y32 + (size_t) st_e * C, X.gidx + st_e,
+                                                                X.wtr + st_e, C, X.tmp, C);
+                return;
+            }
             gather_f16_16_kernel<<<cnt_e, 256, 0, g_s>>>(xin, X.gidx + st_e, cnt_e, C, X.ex16);
             if (Ly.ty[0] == Ly.ty[1]) {
                 k::decode_f16(Ly.ty[0], sl, (size_t) 2 * F * C, X.w16, g_s);
@@ -5080,7 +5133,7 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
 // can be as long as the cache allows without the decode's cache being smaller (IK2_BORROW=0: off).
 struct BigScratch {
     int pool = -1, T_sup = 0;
-    size_t blk_ld = 0;
+    size_t blk_ld = 0, grp_cap = 0;
     float *h = nullptr, *r = nullptr, *tmp = nullptr, *blocks = nullptr, *gu32 = nullptr, *qkv = nullptr,
           *y32 = nullptr, *sg = nullptr, *su = nullptr, *wt = nullptr, *wtr = nullptr, *rlog = nullptr;
     uint16_t *xq16_sup = nullptr, *ex16 = nullptr, *h16 = nullptr;
@@ -5130,6 +5183,7 @@ size_t big_carve(const Config& c, int T, size_t gu32_have, size_t lg_want, size_
         if (new_lg) W->lg = lg, W->lg16 = lg16, W->lg_cap = lg_want;
         W->blk_ld = (size_t) T;
         W->T_sup = T;
+        W->grp_cap = Tr;   // (the lent h16/y32 hold Tr rows - the grouped batch path stays off there)
     }
     return off;
 }
@@ -5179,6 +5233,7 @@ int big_begin(const Model& M, Work& W, ExpertCache& EC, int n, int ctx_end, BigS
     if (!base) return W.T_sup;
     bs.h = W.h, bs.r = W.r, bs.tmp = W.tmp, bs.blocks = W.blocks, bs.gu32 = W.gu32, bs.qkv = W.qkv, bs.y32 = W.y32;
     bs.sg = W.sg, bs.su = W.su, bs.wt = W.wt, bs.wtr = W.wtr, bs.rlog = W.rlog, bs.xq16_sup = W.xq16_sup;
+    bs.grp_cap = W.grp_cap;
     bs.ex16 = W.ex16, bs.h16 = W.h16, bs.pos = W.pos, bs.route_d = W.route_d, bs.gidx = W.gidx, bs.inv = W.inv;
     bs.blk_ld = W.blk_ld, bs.T_sup = W.T_sup;
     bs.lg = W.lg, bs.lg16 = W.lg16, bs.lg_cap = W.lg_cap;
@@ -5199,7 +5254,7 @@ void big_end(Work& W, ExpertCache& EC, BigScratch& bs) {
     W.h = bs.h, W.r = bs.r, W.tmp = bs.tmp, W.blocks = bs.blocks, W.gu32 = bs.gu32, W.qkv = bs.qkv, W.y32 = bs.y32;
     W.sg = bs.sg, W.su = bs.su, W.wt = bs.wt, W.wtr = bs.wtr, W.rlog = bs.rlog, W.xq16_sup = bs.xq16_sup;
     W.ex16 = bs.ex16, W.h16 = bs.h16, W.pos = bs.pos, W.route_d = bs.route_d, W.gidx = bs.gidx, W.inv = bs.inv;
-    W.blk_ld = bs.blk_ld, W.T_sup = bs.T_sup;
+    W.blk_ld = bs.blk_ld, W.T_sup = bs.T_sup, W.grp_cap = bs.grp_cap;
     W.lg = bs.lg, W.lg16 = bs.lg16, W.lg_cap = bs.lg_cap;
     EC.give_back(bs.pool);
     bs.pool = -1;
@@ -5678,6 +5733,7 @@ int main(int argc, char** argv) {
         const int v = std::atoi(getenv("IK2_GROUP"));
         g_group_exp = v == 1 || v >= 3, g_group_attn = v >= 2;
     }
+    g_grp = !getenv("IK2_GRP") || std::atoi(getenv("IK2_GRP"));
     g_dense_q8 = getenv("IK2_DENSE") && std::string(getenv("IK2_DENSE")) == "q8";
     if (getenv("IK2_KV")) {
         const std::string kv = getenv("IK2_KV");
@@ -6829,7 +6885,7 @@ int main(int argc, char** argv) {
     W.pos = dalloc<int>(T_buf);
     W.rlog = dalloc<float>(T_buf * c.E), W.route_d = dalloc<int>(S_buf * 2);
     W.ex16 = dalloc<uint16_t>(T_buf * C), W.w16 = dalloc<uint16_t>((size_t) 2 * c.F * C);   // (one expert's tokens)
-    W.h16 = dalloc<uint16_t>(std::max<size_t>(64, T_buf) * c.F);
+    W.h16 = dalloc<uint16_t>(S_buf * c.F);
     W.gu32_bytes = 4 * std::max({S8 * 2 * (size_t) c.F,
                   Tm * std::max<size_t>(2 * HD + 2 * KD + (size_t) c.H * c.d_rel + c.H,
                                         (2 * HD + (size_t) c.H * c.d_rel + c.H) + 2 * (KD + (size_t) c.KV * 4)),
@@ -6837,11 +6893,22 @@ int main(int argc, char** argv) {
     W.gu32 = dalloc<float>(W.gu32_bytes / 4);
     W.qkv = W.gu32;
     W.lg16 = (uint16_t*) W.gu32;
-    W.y32 = dalloc<float>(std::max<size_t>(64, T_buf) * C);
+    W.y32 = dalloc<float>(S_buf * C);
     if (g_tp) W.tp_h = dalloc<uint16_t>(std::max<size_t>(64, S_buf) * c.F);   // (one expert's tokens; the token path's <= 64 rows)
     W.wtr = dalloc<float>(S_buf);
     W.sg = dalloc<float>(S_buf), W.su = dalloc<float>(S_buf), W.wt = dalloc<float>(S_buf);
     W.gidx = dalloc<int>(S_buf), W.inv = dalloc<int>(S_buf);
+    W.xf32 = dalloc<float>(T_buf * C);
+    W.limbs = dalloc<uint16_t>((size_t) T_buf * 2 * C);
+    W.grp_cap = S_buf;
+    {   // the batch groups' tables: up to E + S/8 groups (an expert's overflow groups share its blob)
+        const size_t G_max = (size_t) c.E + S_buf / k::kGroupMax;
+        W.grp_blob = dalloc<const uint8_t*>(G_max);
+        W.grp_n = dalloc<int>(G_max);
+        W.grp_tok = dalloc<int>(G_max * k::kGroupMax);
+        W.grp_row = dalloc<int>(G_max * k::kGroupMax);
+        W.grp_off.assign((size_t) c.E, 0);
+    }
     W.blob = dalloc<const uint8_t*>(S8), W.tok = dalloc<int>(S8);
     for (int i = 0; i < Work::kPackRing; ++i) {
         CU(cudaHostAlloc(&W.pack_h[i], 8192, cudaHostAllocPortable));
@@ -8443,6 +8510,9 @@ int main(int argc, char** argv) {
                 (unsigned long long) ec_sum([](ExpertCache& e) { return e.hits; }),
                 (unsigned long long) ec_sum([](ExpertCache& e) { return e.misses; }),
                 ec_sum([](ExpertCache& e) { return e.bytes_up; }) / 1073741824.0);
+    if (g_prof)   // (debug: the prompt's own profile before the generation's reset)
+        std::printf("profile (prompt): attention %.2f s, router %.2f s, uploads %.2f s, experts %.2f s, rest %.2f s\n",
+                    g_pf.attn, g_pf.route, g_pf.upload, g_pf.experts, g_pf.rest);
     if (g_lend.want >= 0 && getenv("IK2_LEND_WAIT") && std::atoi(getenv("IK2_LEND_WAIT"))) {   // (tests: the steady speed)
         const double tw = now();
         lend_grow(M, g_lend.want);

@@ -260,6 +260,12 @@ void experts_gate_up_g(const uint8_t* const* blob, const int* n, const int* tok,
                        int ty_up, size_t eb0, const float* x, int C, int F, float* gu, cudaStream_t s);
 void experts_down_g(const uint8_t* const* blob, const int* n, const int* row, int G, int ty_down, size_t off_down,
                     const uint16_t* h, int C, int F, float* y, cudaStream_t s);
+/// A batch expert's group table on the device (grp_fill_kernel): group g at off gets blob[g] = blob_e,
+/// n[g] = min(8, cnt - 8g), and its members' token gidx[st + m] and output row st + m.
+void grp_fill(const uint8_t* blob_e, int cnt, int st, int off, const int* gidx, const uint8_t** blob, int* n,
+              int* tok, int* row, cudaStream_t s);
+/// fp16 -> fp32 rows (the grouped batch experts' input)
+void to_f32(const uint16_t* x, size_t n, float* y, cudaStream_t s);
 /// Fused gate+up+softcapped-SwiGLU straight to h [S][F] FP16 (or h[row[g*8+t]][F] in _g, where sg/su are also
 /// indexed by row[g*8+t]).  sg, su may be null (scale 1).
 void experts_gate_up_swiglu(const uint8_t* const* blob, const int* tok, int S, int ty_gate, int ty_up, size_t eb0,

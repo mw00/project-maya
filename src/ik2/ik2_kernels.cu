@@ -4199,11 +4199,12 @@ __device__ __forceinline__ void experts_gate_up_swiglu_g_run(const uint8_t* bl, 
 }
 
 template <int N_CAP>
-__device__ __forceinline__ void experts_down_g_run(const uint8_t* w, const int* orow_g, int ng, int ty_down,
-                                                   const uint16_t* h, int C, int F, size_t rb_down, float* y) {
+__device__ __forceinline__ void experts_down_g_run(const uint8_t* w, const int* hrow_g, const int* yrow_g, int ng,
+                                                   int ty_down, const uint16_t* h, int C, int F, size_t rb_down,
+                                                   float* y) {
     const uint16_t* xs[N_CAP];
 #pragma unroll
-    for (int t = 0; t < N_CAP; ++t) xs[t] = h + (size_t) orow_g[t < ng ? t : 0] * F;
+    for (int t = 0; t < N_CAP; ++t) xs[t] = h + (size_t) hrow_g[t < ng ? t : 0] * F;
     const int warp = threadIdx.x >> 5;
     float out[N_CAP];
     for (int j = 0; j < kGroupRows; ++j) {
@@ -4211,7 +4212,7 @@ __device__ __forceinline__ void experts_down_g_run(const uint8_t* w, const int* 
         if (row >= C) break;
         row_dot_multi<uint16_t, N_CAP>(ty_down, w + row * rb_down, xs, ng, F, out);
         if ((threadIdx.x & 31) == 0)
-            for (int t = 0; t < ng; ++t) y[(size_t) orow_g[t] * C + row] = out[t];
+            for (int t = 0; t < ng; ++t) y[(size_t) yrow_g[t] * C + row] = out[t];
     }
 }
 
@@ -4264,13 +4265,13 @@ __global__ void experts_down_g_kernel(const uint8_t* const* blob, const int* n, 
     const uint8_t* w = blob[g] + off_down;
     const int* orow_g = orow + g * kGroupMax;
     if (ng == 1)
-        experts_down_g_run<1>(w, orow_g, ng, ty_down, h, C, F, rb_down, y);
+        experts_down_g_run<1>(w, orow_g, orow_g, ng, ty_down, h, C, F, rb_down, y);
     else if (ng == 2)
-        experts_down_g_run<2>(w, orow_g, ng, ty_down, h, C, F, rb_down, y);
+        experts_down_g_run<2>(w, orow_g, orow_g, ng, ty_down, h, C, F, rb_down, y);
     else if (ng <= 4)
-        experts_down_g_run<4>(w, orow_g, ng, ty_down, h, C, F, rb_down, y);
+        experts_down_g_run<4>(w, orow_g, orow_g, ng, ty_down, h, C, F, rb_down, y);
     else
-        experts_down_g_run<kGroupMax>(w, orow_g, ng, ty_down, h, C, F, rb_down, y);
+        experts_down_g_run<kGroupMax>(w, orow_g, orow_g, ng, ty_down, h, C, F, rb_down, y);
 }
 
 // ---- attention decode & multi-query decode (F32, FP16, or FP8 KV cache, optional kv_cap ring buffer)
@@ -6707,6 +6708,44 @@ void experts_down_g(const uint8_t* const* blob, const int* n, const int* row, in
     experts_down_g_kernel<<<g, kGroupWarps * 32, 0, s>>>(blob, n, row, ty_down, off_down, h, C, F,
                                                          mv_row_bytes(ty_down, F), y);
     check("experts_down_g");
+}
+
+
+// A batch expert's group table built straight on the device: group g at off gets blob[g] = blob_e, n[g] =
+// min(8, cnt - 8g), and its members' token gidx[st + m] and output row st + m - run_exp's grouped launches
+// read these slices.  An expert's picks take rows st .. st + cnt - 1 in pick order, so member m is row st + m.
+__global__ void grp_fill_kernel(const uint8_t* blob_e, int cnt, int st, int off, const int* gidx,
+                                const uint8_t** blob, int* n, int* tok, int* row) {
+    const int g = blockIdx.x;
+    if (threadIdx.x == 0) {
+        blob[off + g] = blob_e;
+        n[off + g] = min(8, cnt - g * 8);
+    }
+    for (int j = threadIdx.x; j < 8; j += blockDim.x) {
+        const int m = g * 8 + j, ok = m < cnt;
+        const size_t at = (size_t) (off + g) * 8 + j;
+        tok[at] = ok ? gidx[st + m] : 0;
+        row[at] = ok ? st + m : 0;
+    }
+}
+void grp_fill(const uint8_t* blob_e, int cnt, int st, int off, const int* gidx, const uint8_t** blob, int* n,
+              int* tok, int* row, cudaStream_t s) {
+    if (cnt <= 0) return;
+    grp_fill_kernel<<<(cnt + kGroupMax - 1) / kGroupMax, 32, 0, s>>>(blob_e, cnt, st, off, gidx, blob, n, tok,
+                                                                     row);
+    check("grp_fill");
+}
+
+// fp16 -> fp32 rows: the grouped experts' input, the same values the gathered FP16 rows hold
+__global__ void to_f32_kernel(const uint16_t* x, size_t n, float* y) {
+    for (size_t i = blockIdx.x * (size_t) blockDim.x + threadIdx.x; i < n;
+         i += (size_t) blockDim.x * gridDim.x)
+        y[i] = h2f(x[i]);
+}
+void to_f32(const uint16_t* x, size_t n, float* y, cudaStream_t s) {
+    if (n <= 0) return;
+    to_f32_kernel<<<(unsigned) std::min<size_t>((n + 255) / 256, 4096), 256, 0, s>>>(x, n, y);
+    check("to_f32");
 }
 
 template <int WARPS, int ROWS>
