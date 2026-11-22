@@ -93,6 +93,7 @@ import maya_bench as MB  # noqa: E402  --bench: the speed-test standard (one ses
 import calibrate_mm3_prefill as CPF  # noqa: E402  MiniMax's: how this PC reads prompts fastest (chunk, GEMMs)
 from serve import glm_dsa_product as G53  # noqa: E402  GLM-5.3 (744B, glm-dsa)
 from serve import glm_link as GL  # noqa: E402  GLM on an AMD APU + an NVIDIA card ("mixed_gpus")
+from serve import server as SV  # noqa: E402  config GPU normalization and engine arguments
 from strata import maya_sync  # noqa: E402  (tools/strata/) a glm-dsa pack's expert profile and drafting
 
 WIN = S.WIN
@@ -4951,11 +4952,17 @@ def write_config(a, pc, meta, pack: Path, quant: str, ctx: int, models: Path, vi
         env = {**hip_env, **env}
     cfg_path = glm_config_path(pc, quant)
     old_cfg = read_json(cfg_path)
+    same_service = same_cuda_flash_service(old_cfg, cfg)
     # the config before's own variables (set by hand, on the Models page or with --env then) stay, as the DeepSeek,
     # MiniMax, Hy4-Flash and Qwen setups keep them - a GLM setup again dropped them (#1066); the ones this setup works
     # out (the AMD settings, written or left out by the GPUs chosen now) and the tuning's are its own, and an --env
     # given now wins
     own = set(GLM_SETUP_ENV) | set(CAL.KEYS)
+    old_env = old_cfg.get("env") or {}
+    if same_service:
+        own.discard("MAYA_GLM_RAM_HEADROOM_GB")          # CUDA sets no default for this host-memory budget
+        if glm_split_fits(old_env.get("MAYA_GLM_SPLIT"), len(cfg["gpu"])):
+            own.discard("MAYA_GLM_SPLIT")               # GLM reads this before --layer-split
     forced, env = env, {**{k: v for k, v in (old_cfg.get("env") or {}).items() if N.shown(str(k)) not in own}, **env}
     if env:
         cfg["env"] = env
@@ -4985,6 +4992,23 @@ def write_config(a, pc, meta, pack: Path, quant: str, ctx: int, models: Path, vi
         kept = keep_args(old, cfg["args"],
                          ("--expert-cache", "--vram-reserve-mib", "--vram-reserve-later-mib", "--prefill",
                           "--parallel", "--expert-profile-save", "--expert-profile-save-every") + kv_kept)
+        if same_service:
+            # The server gives native argv priority over its top-level layer_split field.
+            arg_split = "--layer-split" in old
+            split = flag_value(old, "--layer-split") if arg_split else old_cfg.get("layer_split")
+            if glm_split_fits(split, len(cfg["gpu"])):
+                if arg_split:
+                    kept += keep_args(old, cfg["args"], ("--layer-split",))
+                else:
+                    cfg["layer_split"] = split
+                    kept.append(f"layer_split {split}")
+            if "--glm-ram-resident" in old and "MAYA_GLM_RAM_RESIDENT" not in forced:
+                cfg["args"].append("--glm-ram-resident")
+                kept.append("--glm-ram-resident")
+            old_draft = flag_value(old, "--dflash") or old_env.get("MAYA_GLM_DFLASH")
+            new_draft = flag_value(cfg["args"], "--dflash") or env.get("MAYA_GLM_DFLASH")
+            if old_draft == new_draft:
+                kept += keep_args(old, cfg["args"], ("--spec", "--spec-min-p"))
         kept += keep_profile(old, cfg["args"])
         if kept:
             ok("kept from the config before: " + ", ".join(kept))
@@ -5027,6 +5051,10 @@ def write_config(a, pc, meta, pack: Path, quant: str, ctx: int, models: Path, vi
            (": " + ", ".join(f"{k}={v}" for k, v in cal["settings"].items()) if cal.get("settings") else ""))
         if cal.get("context"):
             ok(f"(tuned at context {cal['context']}: {ME} --calibrate tunes this context too)")
+    elif same_service and CAL.THREADS_ENV not in forced:
+        mask = old_env.get("MAYA_GLM_POOL_CPUS")
+        if mask and mask == env.get("MAYA_GLM_POOL_CPUS") and CAL.THREADS_ENV in old_env:
+            cfg.setdefault("env", {})[CAL.THREADS_ENV] = old_env[CAL.THREADS_ENV]
     cfg_path.write_text(json.dumps(N.env_out(cfg), indent=1), encoding="utf-8")
     ok(f"config: {cfg_path}")
     ok(f"start script: {write_run_script(cfg_path, cfg['port'])}")
@@ -5096,6 +5124,32 @@ def keep_args(old: list, new: list, flags: tuple) -> list:
             new += [flag, v]
         kept.append(f"{flag} {v}")
     return kept
+
+
+def same_cuda_flash_service(old: dict, cfg: dict) -> bool:
+    """A Flash CUDA config for the same pack and ordered devices, including older config GPU formats."""
+    if (cfg.get("model_name") != MODEL_NAME or old.get("model_name") != MODEL_NAME or
+            (cfg.get("backend") or "cuda") != "cuda" or (old.get("backend") or "cuda") != "cuda" or
+            flag_value(old.get("args") or [], "--glm-pack") != flag_value(cfg["args"], "--glm-pack")):
+        return False
+    try:
+        return bool(cfg["gpu"]) and SV.gpu_list(old) == cfg["gpu"]
+    except (ValueError, TypeError):
+        return False
+
+
+def glm_split_fits(split, gpu_count: int) -> bool:
+    """GLM Flash takes auto, 0 (one GPU), or a rising boundary for each additional device used."""
+    value = str(split)
+    if value in ("auto", "0"):
+        return True
+    if not re.fullmatch(r" *[0-9]+ *(?:, *[0-9]+ *)*,?", value):
+        return False
+    try:
+        cuts = [int(i) for i in value.rstrip(",").split(",")]
+    except ValueError:
+        return False
+    return len(cuts) < gpu_count and cuts[0] >= 1 and cuts == sorted(set(cuts))
 
 
 def flag_value(args: list, flag: str):
