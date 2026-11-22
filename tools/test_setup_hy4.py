@@ -2803,12 +2803,26 @@ class Q4xCheck(unittest.TestCase):
             mine.write_bytes(b"HY4HOT1\0")
             other.write_bytes(b"HY4HOT1\0")
             said = []
-            with patch.object(maya, "ROOT", root), patch.object(maya, "ok", said.append):
+            with patch.object(maya, "ROOT", root), patch.object(maya, "ok", said.append),                     patch.object(SV, "HY4_HOT_SEEDS", root / "no-seeds"):
                 maya.hot_forget(c)
                 maya.hot_forget(c)                             # (none left: nothing said)
             self.assertFalse(mine.exists())
             self.assertTrue(other.exists())
             self.assertEqual(len(said), 1)
+            # the scores Maya ships (data/hy4-hot-seed, a file a size): HY4_HOT_SEED where there is one - a layout's
+            # folder takes its size's; --speed-calibration leaves an empty file (this PC's own: the seed is not read)
+            seeds = root / "seeds"
+            seeds.mkdir()
+            (seeds / "hy4-expert-hot-Hy4-Flash-Maya-XS.bin").write_bytes(b"HY4HOT1\0")
+            with patch.object(SV, "HY4_HOT_SEEDS", seeds):
+                self.assertEqual(SV.child_env(c)["HY4_HOT_SEED"], str(seeds / "hy4-expert-hot-Hy4-Flash-Maya-XS.bin"))
+                c8 = self.cfg(root, args=["--pack", str(root / "Hy4-Flash-Maya-XS-8GB" / "maya-hy4")])
+                self.assertEqual(SV.hy4_hot_seed(c8).name, "hy4-expert-hot-Hy4-Flash-Maya-XS.bin")
+                self.assertIsNone(SV.hy4_hot_seed(self.cfg(root, args=["--pack", str(root / "Hy4-Flash-Maya-S" / "maya-hy4")])))
+                self.assertNotIn("HY4_HOT_SEED", SV.child_env(self.cfg(root, args=["--pack", "/m/Other/maya-hy4"])))
+                with patch.object(maya, "ROOT", root), patch.object(maya, "ok", said.append):
+                    maya.hot_forget(c)
+                self.assertEqual(mine.read_bytes(), b"")
 
     def test_nothing_to_decide_or_unfinished(self):
         with tempfile.TemporaryDirectory() as t:

@@ -5475,12 +5475,17 @@ def route_forget() -> None:
 def hot_forget(cfg: dict) -> None:
     """--speed-calibration: maya-hy4's HY4_HOT scores for this config's model (data/hy4-expert-hot-<model>.bin: which
     experts a start places in VRAM, kept as they are between calibrations so that every start begins the same) are
-    dropped - the next run learns them again from its answers (the CPU lane check's run below, else the next start)."""
+    dropped - the next run learns them again from its answers (the CPU lane check's run below, else the next start).
+    Where Maya ships scores for the model (data/hy4-hot-seed) the file is left empty instead: the engine reads the
+    shipped scores only where there is no file."""
     sys.path.insert(0, str(ROOT))
     import serve.server as SV
     path = ROOT / "data" / SV.hy4_hot_file(cfg).name
     try:
-        path.unlink()
+        if SV.hy4_hot_seed(cfg) is not None:
+            path.write_bytes(b"")        # (this PC's own, none learned yet: the shipped scores are not read)
+        else:
+            path.unlink()
         ok("the experts a start places in VRAM (HY4_HOT's scores) are learned again from the next answers")
     except FileNotFoundError:
         pass

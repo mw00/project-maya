@@ -616,6 +616,7 @@ struct Model::Impl {
         bool on = false, quiet = false, log = false, loaded = false;
         bool asked = false;            // (HY4_HOT=1 set)
         bool learn = false;            // the file written (none was read, or HY4_HOT_LEARN=1)
+        bool seeded = false;           // (the scores are HY4_HOT_SEED's: this PC has no file of its own)
         bool want = false;             // (on, but held off for the GPU fetch's trial: Model::load's lane turn has it)
         bool rec = false;              // (this forward is a token window: its rows' routes go to pend)
         int max_swaps = 1 << 30;
@@ -4271,12 +4272,14 @@ struct Model::Impl {
             if (hot.on && tp > 1) {
                 std::snprintf(buf, sizeof buf, "INFO HY4_HOT: tensor parallel places the experts in VRAM at the start (by "
                               "%s), no swaps between",
-                              hot.loaded ? hot.file.c_str() : !prof_in.empty() ? "the profile" : "their order, no scores yet");
+                              hot.seeded ? "Maya's shipped scores" : hot.loaded ? hot.file.c_str() : !prof_in.empty() ?
+                              "the profile" : "their order, no scores yet");
                 info.push_back(buf + kept);
             } else if (hot.on) {
                 std::snprintf(buf, sizeof buf, "INFO HY4_HOT: the experts in VRAM follow the answers' routing (placed by "
-                              "%s), moved between requests only - an answer runs on one placement", hot.loaded ?
-                              hot.file.c_str() : !prof_in.empty() ? "the profile" : "their order, no scores yet");
+                              "%s), moved between requests only - an answer runs on one placement", hot.seeded ?
+                              "Maya's shipped scores" : hot.loaded ? hot.file.c_str() : !prof_in.empty() ? "the profile" :
+                              "their order, no scores yet");
                 info.push_back(buf + kept);
             }
             // (the placer's lists of each layer's CPU-lane experts taken here, as loaded: HY4_HOT's swaps do not wait
@@ -6399,16 +6402,26 @@ struct Model::Impl {
         hot.win.assign(n, 0);
         hot.pend.assign((size_t) g.n_layer * W * g.n_used, 0);
         hot.pend_on.assign((size_t) g.n_layer, 0);
-        if (!hot.file.empty()) {
-            std::ifstream in(hot.file, std::ios::binary);
+        // the scores of a file (HY4_HOT's format) for this model: false where it is none or another model's
+        auto read_scores = [&](const std::string& path) {
+            std::ifstream in(path, std::ios::binary);
             char magic[8];
             int32_t hd[2] = {0, 0};
             std::vector<float> v(n);
             if (in && in.read(magic, 8) && std::memcmp(magic, "HY4HOT1", 8) == 0 && in.read((char*) hd, sizeof hd) &&
                 hd[0] == g.n_layer && hd[1] == g.n_expert && in.read((char*) v.data(), (std::streamsize) (n * 4))) {
                 hot.score = std::move(v);
-                hot.loaded = true;
+                return true;
             }
+            return false;
+        };
+        if (!hot.file.empty()) hot.loaded = read_scores(hot.file);
+        // (HY4_HOT_SEED: the scores Maya ships for this model - used where this PC has no file of its own yet, so a
+        //  first start places the experts as every start after it; a file here, even an empty one - maya
+        //  --speed-calibration leaves it - is this PC's own, and the seed is not read)
+        const char* seed = std::getenv("HY4_HOT_SEED");
+        if (!hot.loaded && seed && *seed && !hot.file.empty() && !std::ifstream(hot.file, std::ios::binary).good()) {
+            hot.loaded = hot.seeded = read_scores(seed);
         }
         const char* learn = std::getenv("HY4_HOT_LEARN");
         hot.learn = !o.trial && !hot.file.empty() && (!hot.loaded || (learn && std::atoi(learn) != 0));

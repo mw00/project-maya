@@ -80,6 +80,23 @@ def hy4_hot_file(cfg: dict) -> Path:
     return ROOT / "data" / f"hy4-expert-hot-{name}.bin"
 
 
+HY4_HOT_SEEDS = ROOT / "data" / "hy4-hot-seed"            # (the scores Maya ships, a file a size: hy4_hot_seed)
+
+
+def hy4_hot_seed(cfg: dict) -> Path | None:
+    """The HY4_HOT scores Maya ships for this config's model - data/hy4-hot-seed/hy4-expert-hot-<folder>.bin, the
+    folder's name as hy4_hot_file has it (a layout's folder, Hy4-Flash-Maya-XS-8GB, takes its size's) - for a PC that
+    has no file of its own yet: its first start then places the experts as every start after it.  None: no such set."""
+    name = hy4_hot_file(cfg).name
+    stem = name[len("hy4-expert-hot-"):-len(".bin")]
+    size = re.match(r"(Hy4-Flash-Maya-[A-Za-z0-9]+)-", stem)
+    for s in dict.fromkeys([stem] + ([size.group(1)] if size else [])):
+        p = HY4_HOT_SEEDS / f"hy4-expert-hot-{s}.bin"
+        if p.is_file():
+            return p
+    return None
+
+
 def hy4_measure_ids(cfg: dict) -> Path | None:
     """The text maya-hy4 measures this PC's choices on at its first start here (HY4_MEASURE_IDS): whether the CPU
     lane's 4-bit expert copies pay and the prompt route's rates, before it says READY - so the first answers read
@@ -2488,6 +2505,11 @@ def child_env(cfg: dict) -> dict:
         # (... and HY4_HOT's scores - which experts a start places in VRAM - learned by the first start, then kept as
         #  they are until maya --speed-calibration: a file a model in the data folder, not in its download)
         env.setdefault("HY4_HOT_FILE", str(hy4_hot_file(cfg)))
+        # (... and, where this PC has no such file yet, the scores Maya ships for the model - a first start places the
+        #  experts as every start after it; a file of its own, learned or left by maya --speed-calibration, wins)
+        seed = hy4_hot_seed(cfg)
+        if seed is not None:
+            env.setdefault("HY4_HOT_SEED", str(seed))
         # (... and both measured at the first start on this PC before the engine says READY, on this install's docs
         #  in the model's tokens - not while the first answers read their prompts, 2.5-3x slower then)
         if "HY4_MEASURE_IDS" not in env:
