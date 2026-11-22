@@ -36,6 +36,7 @@
 #include "ds4_part_net.hpp"
 #include "ds4_pcie.cuh"
 #include "ds4_pcie.hpp"
+#include "../core/vram_late.hpp"
 #include "ds4_q6k.cuh"
 #include "ds4_pool.hpp"
 #include "ds4_path_policy.hpp"
@@ -8986,11 +8987,11 @@ struct Model::Impl {
                 d.late = (size_t) std::max(0LL, std::atoll(fixed)) << 20;
             } else if (!f.empty()) {
                 const std::string v = pcie::cal_get(f, late_key(di));
-                d.late = d.late_kept = v.empty() ? 0 : (size_t) std::max(0LL, std::atoll(v.c_str())) << 20;
+                d.late_kept = v.empty() ? 0 : (size_t) std::max(0LL, std::atoll(v.c_str())) << 20;
                 // (the default reserve, not asked for: v1.1.72's plan wherever it holds what the run takes after the
                 //  plan with 128 MiB to spare - only a PC whose default reserve it uses up keeps more free)
-                const size_t res = (size_t) std::max<int64_t>(0, o.reserve_mib) << 20;
-                if (!o.reserve_given && d.late + (128u << 20) <= res) d.late = 0;
+                d.late = vramlate::kept_for(d.late_kept, (size_t) std::max<int64_t>(0, o.reserve_mib) << 20,
+                                            o.reserve_given);
             }
             if (d.late > 0)
                 std::fprintf(stderr, "ds4: CUDA%d keeps %zu MiB free beside the %lld MiB reserve: what this PC's start "
@@ -9007,7 +9008,7 @@ struct Model::Impl {
         int cur = 0;
         if (cudaGetDevice(&cur) != cudaSuccess) (void) cudaGetLastError();
         const std::string f = late_file();
-        const int64_t res = (int64_t) std::max<int64_t>(0, o.reserve_mib) << 20, step = 32ll << 20;
+        const int64_t res = (int64_t) std::max<int64_t>(0, o.reserve_mib) << 20;
         for (size_t di = 0; di < devs.size(); ++di) {
             Dev& d = devs[di];
             size_t fr = 0, tot = 0;
@@ -9019,21 +9020,18 @@ struct Model::Impl {
                 std::fprintf(stderr, "ds4: CUDA%d: %zu MiB of VRAM free with everything loaded (the reserve %lld MiB%s)\n",
                              d.id, fr >> 20, (long long) (res >> 20),
                              d.late > 0 ? (", " + std::to_string(d.late >> 20) + " MiB more kept beside it").c_str() : "");
-            if (fr >= d.fr_min) continue;
-            d.fr_min = fr;
-            int64_t want = (int64_t) d.late + res - (int64_t) fr;
-            want = std::min<int64_t>(std::max<int64_t>(0, want), (int64_t) tot / 4);
-            want = (want + step - 1) / step * step;
-            if (std::llabs(want - (int64_t) d.late_kept) < step) continue;
-            if ((int64_t) fr + 2 * step < res && (o.reserve_given || want + 4 * step > res))   // (late_read keeps it)
+            vramlate::Gpu lg{d.late, d.late_kept, d.fr_min};   // (the engines' shared step: src/core/vram_late.hpp)
+            const vramlate::Step st = vramlate::check(lg, fr, tot, (size_t) res, o.reserve_given);
+            d.fr_min = lg.fr_min, d.late_kept = lg.kept;
+            if (!st.moved) continue;
+            const int64_t want = st.want;
+            if (st.short_)   // (late_read keeps it)
                 std::fprintf(stderr, "ds4: WARNING - CUDA%d: %zu MiB free, short of the %lld MiB reserve - the next start "
                                      "keeps %lld MiB free beside it for what the start and the requests allocate after "
                                      "the experts' plan%s\n", d.id, fr >> 20, (long long) (res >> 20),
                              (long long) (want >> 20), f.empty() ? " (MAYA_DS4_LATE_FILE=none: not kept)" : "");
-            d.late_kept = (size_t) want;
             // (a start found short, the figure kept for the next one: the server starts the engine once more - #1026)
-            if (loaded && !f.empty() && (int64_t) fr + 2 * step < res && (o.reserve_given || want + 4 * step > res))
-                reserve_short_mib = std::max(reserve_short_mib, (int) (want >> 20));
+            if (loaded && !f.empty() && st.short_) reserve_short_mib = std::max(reserve_short_mib, (int) (want >> 20));
             if (!f.empty())
                 pcie::cal_put(f, late_key(di), std::to_string(want >> 20),
                               [](const std::string& a, const std::string& b) { return os::replace_file(a, b); });
