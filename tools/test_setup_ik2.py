@@ -147,8 +147,8 @@ class Refusals(unittest.TestCase):
             ("hip", True, 0, [], "Linux only"),
             ("hip", False, 2, [], "on AMD runs on one GPU"),
             ("hip", False, 0, [amd("gfx1030", 16)], "RDNA 3, 3.5 or 4"),
-            ("hip", False, 0, [amd("gfx1201", 16)], "24 GB of VRAM or more"),
-            ("hip", False, 0, [amd("gfx1151", 0.5, unified_memory=True, memory_gb=20)], "24 GB of VRAM or more"),
+            ("hip", False, 0, [amd("gfx1102", 8)], "12 GB of VRAM or more"),
+            ("hip", False, 0, [amd("gfx1151", 0.5, unified_memory=True, memory_gb=20)], "APU with 24 GB"),
             ("cuda", True, 2, ok, "two are Linux only"),
             ("cuda", False, 3, ok, "one or two NVIDIA GPUs"),
             ("cuda", False, 2, [card(24), card(6, 1, arch="86")], "8 GB of VRAM or more on each"),
@@ -168,10 +168,15 @@ class Refusals(unittest.TestCase):
             self.assertIsNone(F.unsupported("cuda", True, 1, cards))   # (Windows + NVIDIA: as on Linux)
         for cards in ([card(12, arch="86"), card(12, 1, arch="86")], [card(8, arch="70"), card(8, 1, arch="70")], []):
             self.assertIsNone(F.unsupported("cuda", False, 2, cards))   # (two cards: the split)
-        # (AMD on Linux: RDNA 3 / 3.5 / 4 with 24 GB, or an APU whose shared memory leaves that much)
+        # (AMD on Linux: RDNA 3 / 3.5 / 4 from 12 GB - the offload path under 24 - or an APU whose shared memory
+        #  leaves 24 GB)
         for cards in ([amd("gfx1100", 24)], [amd("gfx1201", 32)], [amd("gfx1030", 16), amd("gfx1100", 24, 1)],
-                      [amd("gfx1151", 0.5, unified_memory=True, memory_gb=168)], []):
+                      [amd("gfx1151", 0.5, unified_memory=True, memory_gb=168)], [amd("gfx1201", 16)],
+                      [amd("gfx1101", 12)], []):
             self.assertIsNone(F.unsupported("hip", False, 1, cards))
+            self.assertIsNone(F.unsupported("hip", False, 1, cards, 32.0))
+        # (a 12 GB card with 8 GB of RAM: the experts it does not hold need the RAM)
+        self.assertIn("RAM and VRAM together", F.unsupported("hip", False, 1, [amd("gfx1101", 12)], 8.0))
 
     def test_ram_and_vram_together(self):
         """No SSD tier (the owner's call): RAM + VRAM under the model is refused in one line naming the amount."""
@@ -266,17 +271,18 @@ class Fit(unittest.TestCase):
     def test_the_trained_million_keeps_the_cache_on_the_card(self):
         """1M on a 24 GB card: the experts leave VRAM first (a token reads the whole cache, ~8 experts a layer) - the
         offload path with the whole cache in VRAM, no KV streaming (Jupiter V100 as a 24 GB card: a tier of 2.9 GiB,
-        19 tok/s at 1M deep vs 0.93 streamed).  AMD (no offload path): every expert stays, the cache streams."""
+        19 tok/s at 1M deep vs 0.93 streamed); an AMD card the same.  An AMD APU (no offload path): every expert stays,
+        the cache streams."""
         p = F.plan(24.0, 1048576)
         self.assertEqual((p["layout"], p["kv_streamed"]), ("offload", False))
         self.assertGreaterEqual(p["tier_gib"], F.OFF_TIER_MIN_GIB)
         self.assertEqual(F.verdict(24.0, 64.0, 1048576)[0], "runs")
         self.assertIn("the whole cache stays on the card", F.verdict(24.0, 64.0, 1048576)[1])
         self.assertEqual(F.verdict(24.0, 8.0, 1048576)[0], "does not fit")    # (the experts need the RAM)
-        h = F.plan(24.0, 1048576, hip=True)
+        h = F.plan(24.0, 1048576, apu=True)
         self.assertTrue(h["resident"] and h["kv_streamed"])
         self.assertEqual(h["kv_ram_gib"], 14.0)
-        self.assertEqual(F.verdict(24.0, 64.0, 1048576, hip=True)[0], "streamed")
+        self.assertEqual(F.verdict(24.0, 64.0, 1048576, apu=True)[0], "streamed")
         self.assertEqual(F.recommended_context(24.0), 262144)
         self.assertEqual(F.recommended_context(32.0), 262144)
         self.assertTrue(F.plan(32.0, 524288)["resident"])
@@ -457,7 +463,9 @@ class Steps(unittest.TestCase):
         self.assertIn("offload", F.drafting_off_reason("86", 8, 65536, "fp8"))
         self.assertIsNone(F.drafting_off_reason("86", 24, 65536, "fp8"))
         self.assertIsNone(F.drafting_off_reason("120", 32, 262144, "fp8"))
-        self.assertIsNone(F.drafting_off_reason("gfx1151", 150, 262144, "fp8", hip=True))
+        self.assertIsNone(F.drafting_off_reason("gfx1151", 150, 262144, "fp8", hip=True, apu=True))
+        self.assertIsNone(F.drafting_off_reason(None, 24, 65536, "fp8", hip=True))         # (AMD, every expert in VRAM)
+        self.assertIn("offload", F.drafting_off_reason(None, 16, 65536, "fp8", hip=True))  # (AMD under 24 GB)
         self.assertIsNone(F.drafting_off_reason(None, 0, 65536, "fp8"))      # (not known)
 
     def run_setup(self, gpu, ram=64.0, backend="cuda", **kw):

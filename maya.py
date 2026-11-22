@@ -869,7 +869,8 @@ HY4_CHUNK_UP_GIB = 0.95
 # Inkling-2-Mini (an EXPERIMENTAL PREVIEW, PR #1095): thinkingmachines' looped 26B on its own engine maya-ik2 (src/ik2,
 # docs/INKLING2.md section 8) - NVIDIA only, Linux only, V100 / RTX 20 and newer with 8 GB or more (the engine's
 # kernels per architecture: Volta's mma.m8n8k4, Turing's and Ampere's mma.sync); the experts the card does not hold
-# stay in RAM (about 13 GB of RAM with an 8 GB card; tools/ik2_fit.py); AMD: RDNA 3 / 3.5 / 4 or a Halo / APU with 24 GB.
+# stay in RAM (about 13 GB of RAM with an 8 GB card; tools/ik2_fit.py); AMD: RDNA 3 / 3.5 / 4 from 12 GB (the same
+# offload path under 24 GB) or a Halo / APU with 24 GB.
 # Its file: unsloth's UD-Q4_K_XL (Unsloth's looped layout, which the engine reads) - tools/ik2/download.json, pinned
 # by size and sha256; the setup offers no drafter (the engine's --draft is by hand, docs/INKLING2.md).  Pictures: the
 # model's vision tower as unsloth's mmproj-BF16.gguf (download.json's "vision", beside the GGUF; not with --no-vision),
@@ -2143,7 +2144,7 @@ def choose_family(a, prev: dict) -> str:
                       "and newer, Linux." if q4 else "")))
     else:
         keys = tuple(k for k in keys if k != "hy4")
-    # Inkling-2-Mini, after it: an experimental preview (PR #1095) - Linux, one NVIDIA GPU of 8 GB or more or an AMD one of 24 GB
+    # Inkling-2-Mini, after it: an experimental preview (PR #1095) - Linux, one NVIDIA GPU of 8 GB or more or an AMD one of 12 GB
     rows.append((f"{IK2_SHOWN} (experimental)", None, ik2_about()))
     was53 = default == "glm" and bool(prev) and G53.config_is_glm_dsa(prev)
     pick = keys[choose("Model?", ["Which model to set up:"], rows, keys.index("glm53" if was53 else default), a.yes)]
@@ -11138,7 +11139,8 @@ def ik2_about() -> str:
     return ("An EXPERIMENTAL PREVIEW: thinkingmachines' Inkling-2-Mini (26B, a looped model: 8 of 128 experts a token) "
             f"on its own engine, in unsloth's UD-Q4_K_XL GGUF ({gb}); NVIDIA V100 / "
             "RTX 20 and newer with 8 GB or more (experts that do not fit in VRAM stay in RAM: about 13 GB of RAM with an 8 GB card), or "
-            "AMD RDNA 3 / 3.5 / 4 or a Halo / APU with 24 GB (every expert in memory); Linux only; tool calls, "
+            "AMD RDNA 3 / 3.5 / 4 with 12 GB or more (the same: experts that do not fit stay in RAM) or a Halo / APU "
+            "with 24 GB (every expert in memory); Linux only; tool calls, "
             "its thinking levels, up to a 256K context, pictures (its vision tower, 0.6 GB), drafting on RTX 30 / A100 "
             "and newer with every expert in VRAM, or AMD (its own drafter, 0.6 GB, and the prompt lookup: measured once on this PC, the same answers); "
             "one answer at a time.")
@@ -11395,13 +11397,15 @@ def set_up_ik2(a, prev: dict) -> Path | None:
     pc = check_pc(a, "ik2")                            # 1
     vram = float(pc["gpus"][0].get("vram_gb") or 0)
     amd = pc.get("backend") == "hip"
-    if amd:   # (AMD, Linux: RDNA 3 / 3.5 / 4 with every expert in memory; an APU's is the RAM, less what is kept free)
+    apu = False
+    if amd:   # (AMD, Linux: RDNA 3 / 3.5 / 4 - a card from 12 GB, the offload path under 24; an APU's memory is the RAM)
         g = dict(pc["gpus"][0])
         if hip_unified_memory(g):
             ram = mem_gb()[0]
             g.update(unified_memory=True, memory_gb=apu_memory(vram, ram, not WIN) - apu_margin_gb(ram))
             vram = g["memory_gb"]
-        why = IK2F.unsupported("hip", WIN, len(pc["gpus"]), [g])
+            apu = True
+        why = IK2F.unsupported("hip", WIN, len(pc["gpus"]), [g], mem_gb()[0])
         if why:
             fail(why)
     else:   # (Windows: the card as CUDA gets it, measured - the figure the engine plans with)
@@ -11415,14 +11419,15 @@ def set_up_ik2(a, prev: dict) -> Path | None:
          "team on V100s (Linux) and an RTX 3050 8 GB (Windows), not yet on every card - tell us how it goes in "
          "an issue" if not amd else
          f"{IK2_SHOWN} on AMD is an experimental preview: run by Maya's team on a Radeon 8065S (Gorgon Halo, "
-         "Linux), not yet on Radeon RX 7000 / 9000 cards - tell us how it goes in an issue")
+         "Linux, also set as a 12 and a 16 GB card), not yet on Radeon RX 7000 / 9000 cards - tell us how it goes "
+         "in an issue")
     m = ik2_entry()
     ok(f"model: {Q.shown('ik2', Q.IK2_QUANT, m['download_gb'])} - thinkingmachines' Inkling-2-Mini in unsloth's GGUF "
        "(Apache 2.0)")
     kv = str((prev.get("env") or {}).get("IK2_KV") or IK2F.DEFAULT_KV)
     rec = IK2F.recommended_context(vram, kv)
     ctx = choose_context(a, prev_ctx, IK2F.CONTEXTS, rec)
-    fit = IK2F.plan(vram, ctx, kv, amd)
+    fit = IK2F.plan(vram, ctx, kv, apu)
     kv_gb = ctx * IK2F.KV_BYTES.get(kv, IK2F.KV_BYTES['f16']) / 2**30
     ok(f"context: {ctx} tokens" + (" (recommended for this card's VRAM)" if ctx == rec else "") +
        (f"; its cache: {kv_gb:.1f} GB ({kv.upper()}), about {fit['kv_ram_gib']:.0f} GB of it in RAM (KV streaming)"
@@ -11438,13 +11443,13 @@ def set_up_ik2(a, prev: dict) -> Path | None:
         else:
             warn(f"two GPUs at {context_label(ctx)}: {line}" + (" - it may not start" if word == "tight" else ""))
     elif fit["resident"] and fit.get("kv_streamed"):   # (one GPU only: KV streaming is off on two GPUs)
-        word, line = IK2F.verdict(vram, mem_gb()[0], ctx, kv, amd)
+        word, line = IK2F.verdict(vram, mem_gb()[0], ctx, kv, apu)
         warn(line if word == "does not fit" else
              f"at {context_label(ctx)}: {line} (a context of {context_label(rec)} keeps the cache in VRAM)")
     elif not fit["resident"]:
-        word, line = IK2F.verdict(vram, mem_gb()[0], ctx, kv, amd)
+        word, line = IK2F.verdict(vram, mem_gb()[0], ctx, kv, apu)
         keep = (f" (a context of {context_label(rec)} keeps everything in VRAM)"
-                if IK2F.plan(vram, rec, kv, amd)["resident"] else "")
+                if IK2F.plan(vram, rec, kv, apu)["resident"] else "")
         warn(f"at {context_label(ctx)} the model and its cache do not all fit in this card's {vram:.0f} GB: "
              f"{line}{keep}" + (" - it may not start" if word == "tight" else ""))
     models = (Path(a.models_dir).expanduser().resolve() if a.models_dir else
@@ -11460,7 +11465,7 @@ def set_up_ik2(a, prev: dict) -> Path | None:
     gguf = ik2_model_step(a, d, models)               # 5
     if gguf is None:
         return None
-    off = IK2F.drafting_off_reason(None if amd else pc["gpus"][0].get("arch"), vram, ctx, kv, amd)
+    off = IK2F.drafting_off_reason(None if amd else pc["gpus"][0].get("arch"), vram, ctx, kv, amd, apu)
     if vram1 and IK2F.plan_two(vram, vram1, ctx, kv)["gpus"] == 2:
         off = "drafting off: on two GPUs it is not checked yet - every token comes from a full model step"
     if off:                                            # (Volta / Turing, the offload path: no drafter, drafting off)

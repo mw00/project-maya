@@ -426,8 +426,12 @@ memory (`IK2_RDNA_FLASH=0`: off); the other FP16 GEMMs take hipBLASLt's kernel m
 `lt-picks.txt` beside the GGUF (`IK2_LT_STORE` names another file). Tokens take the scalar expert kernels
 (`IK2_EXPERT_MMA=1`: the mma layout). Answers repeat on a GPU (every sum in a fixed order) but are not CUDA's bits.
 The engine refuses an AMD GPU older than RDNA 3 at its start; on an APU (Strix / Gorgon Halo) it counts the RAM the
-system has available, less max(8 GiB, 10%), as the GPU's room. AMD keeps every expert in the GPU's memory (24 GB, no
-offload path there yet). Run on a Radeon 8065S (Ubuntu, ROCm 7.1).
+system has available, less max(8 GiB, 10%), as the GPU's room, and keeps every expert there. A discrete AMD card from
+12 GB takes the offload path below 24 GB as on NVIDIA (a tier in VRAM from the profile, the rest pinned in RAM through
+`hipHostRegister`, the whole cache in VRAM, the prompt's experts on the matrix cores a batch of the staging ring at a
+time): mode A only by default - the resident path's expert kernels, so the same greedy answers as with every expert in
+VRAM; lane parity (`IK2_LANE=1`) sums in other bits there and is a test option. Run on a Radeon 8065S (Ubuntu, ROCm
+7.1), also set as a 12 and a 16 GB card (`IK2_VRAM_GB`: on an APU the free figures are capped, no ballast).
 
 **Defaults.** Thinking Machines' `generation_config.json`: temperature 1.0 (no top_p, no top_k: 1.0 and off).
 Thinking is the template's `reasoning_effort`, a name or a number in [0.0, 0.99]: `none` 0.0, `minimal` 0.1, `low`

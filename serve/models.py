@@ -182,13 +182,24 @@ def ik2_vram_gb(cfg: dict) -> float:
     got = (cfg.get("installer") or {}).get("ik2_vram_gb")
     if not hip and sys.platform == "win32" and isinstance(got, (int, float)) and got > 0:
         return min(vram, float(got)) if vram else float(got)   # (Windows: as CUDA gets the card, the setup measured)
-    if hip and card and card.get("arch") == "gfx1151" and hasattr(os, "sysconf"):
+    if ik2_apu(cfg, card) and hasattr(os, "sysconf"):
         try:
             ram = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") / 1e9
         except (ValueError, OSError):
             return vram
         vram = max(vram, ram) - max(8.0, 0.1 * ram)
     return vram
+
+
+def ik2_apu(cfg: dict, card: dict | None = None) -> bool:
+    """Whether an Inkling 2 config runs on an AMD APU whose memory is the RAM (a Ryzen AI Max, gfx1151): every expert
+    stays in its memory there (no offload path); a discrete AMD card plans as an NVIDIA one."""
+    if cfg.get("backend") != "hip":
+        return False
+    if card is None:
+        ids = gpus_of(cfg) or [0]
+        card = next((g for g in machine_gpus("hip") if g.get("index") == ids[0]), None)
+    return bool(card and card.get("arch") == "gfx1151")
 
 
 # ------------------------------------------------------------------ the context a model was trained for
@@ -433,7 +444,7 @@ def _choices(cfg: dict) -> dict:
         card = next((g for g in machine_gpus("cuda") if g.get("index") == (gpus_of(cfg) or [0])[0]), None)             if cfg.get("backend") != "hip" else None
         off = IK2F.drafting_off_reason((card or {}).get("arch"), ik2_vram_gb(cfg), ctx or IK2F.CONTEXTS[0],
                                        (cfg.get("env") or {}).get("IK2_KV") or IK2F.DEFAULT_KV,
-                                       cfg.get("backend") == "hip")
+                                       cfg.get("backend") == "hip", ik2_apu(cfg))
         return {"draft": ["none"] if off else
                 ["auto"] + (["dspark"] if flag(cfg.get("args") or [], "--draft") else []) + ["none"],
                 "images": bool(cfg.get("vision") or cfg.get("vision_off")), "kv": list(IK2F.KV_BYTES)}
@@ -1012,7 +1023,7 @@ def describe(path: Path, running: str | None) -> dict:
         #  page says where the engine would run its slower path)
         vram = ik2_vram_gb(cfg)
         ctxs = sorted({*IK2F.CONTEXTS, int(cur.get("context") or 0)} - {0})
-        own.update(ik2_fit={kv: {str(c): {k: v for k, v in IK2F.plan(vram, c, kv, (cfg.get("backend") or "cuda") == "hip").items() if k != "need_gib"}
+        own.update(ik2_fit={kv: {str(c): {k: v for k, v in IK2F.plan(vram, c, kv, ik2_apu(cfg)).items() if k != "need_gib"}
                                  for c in ctxs} for kv in IK2F.KV_BYTES} if vram else None,
                    ik2_kv_bytes=IK2F.KV_BYTES)
     return {**own, "file": path.name, "path": str(path), "model": cfg.get("model_name") or "", "family": family(cfg),

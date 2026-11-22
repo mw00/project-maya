@@ -232,9 +232,10 @@ Hy4-Flash also sets up on an AMD GPU under Windows - a Strix Halo / Gorgon Halo,
 
 ### Inkling-2-Mini (experimental preview)
 
-`./maya.sh --setup --backend hip --model inkling-2-mini` (Linux). Its engine (`maya-ik2`) keeps the whole model (17.6
-GB) in the GPU's memory: an RDNA 3 / 3.5 / 4 GPU (gfx11 / gfx12) with 24 GB of VRAM, or a Strix Halo / Gorgon Halo,
-whose memory is the RAM (the setup counts what the system leaves, less max(8 GB, 10%)). Run by Maya's team on a
+`./maya.sh --setup --backend hip --model inkling-2-mini` (Linux). Its engine (`maya-ik2`) runs on an RDNA 3 / 3.5 / 4
+GPU (gfx11 / gfx12) with 12 GB of VRAM or more - under 24 GB the experts the card does not hold stay in RAM (about 9 GB
+of RAM with a 12 GB card) - or a Strix Halo / Gorgon Halo, whose memory is the RAM and holds the whole model (the
+setup counts what the system leaves, less max(8 GB, 10%)). Run by Maya's team on a
 Radeon 8065S (Gorgon Halo, Ubuntu, ROCm 7.1): text, thinking, tool calls and pictures, the same greedy answers over
 starts; Radeon RX 7000 / 9000 cards build the same engine but have not been run here yet. Older AMD GPUs and AMD
 under Windows are refused by the setup in one line. docs/INKLING2.md has the engine's AMD paths.
