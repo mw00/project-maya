@@ -5655,6 +5655,102 @@ mv_q8p_cols_kernel(const int8_t* __restrict__ q, const uint16_t* __restrict__ d,
         }
 }
 
+#ifndef STRATA_USE_HIP
+// mv_q8p_cols_kernel for a token count known at compile time (T) and K = 128 NIT: the same sums to the bit, faster.
+// What a window's products cost is not their arithmetic nor their weights' bytes - it is the order a warp issues
+// in: with the activations loaded where they are used, every step waits for its loads (5 tokens: 7.6 ms of products
+// a window, 3.9 with the same flops and the activations held in registers).  So: straight-line code (no branch a
+// token), a step's activations asked for one step before their sums, its weights and scales four steps before, and
+// the R x T sums of a step level by level - the one-token kernel's expression as its instructions: b y rounded,
+// then FMAs with a x, c z, d w, then the FMA into the running sum (what nvcc contracts `acc += dv * (a x + b y +
+// c z + d w)` to; checked against mv_q8p_kernel on every shape).  The warp sums level by level too.
+template <int WARPS, int R, int T, int NIT>
+__global__ void __launch_bounds__(WARPS * 32)
+mv_q8p_colsx_kernel(const int8_t* __restrict__ q, const uint16_t* __restrict__ d, int N, int K,
+                    const float* __restrict__ x, int x_ld, float* __restrict__ y, int y_ld) {
+    constexpr int DX = 1, DW = 4;
+    const int row0 = (blockIdx.x * WARPS + (threadIdx.x >> 5)) * R, lane = threadIdx.x & 31;
+    if (row0 >= N) return;
+    const uint32_t* qr[R];
+    const uint16_t* dr[R];
+#pragma unroll
+    for (int i = 0; i < R; ++i) {
+        const int row = min(row0 + i, N - 1);   // (past the last row: the last again, not written)
+        qr[i] = (const uint32_t*) (q + (size_t) row * K), dr[i] = d + (size_t) row * (K >> 5);
+    }
+    uint32_t w[R][NIT];
+    uint16_t dh[R][NIT];
+    float4 xv[T][NIT];
+    float acc[R][T];
+#pragma unroll
+    for (int i = 0; i < R; ++i)
+#pragma unroll
+        for (int t = 0; t < T; ++t) acc[i][t] = 0.0f;
+#pragma unroll
+    for (int it = 0; it < NIT; ++it) {
+        // the loads of the steps ahead (at the first step: every step's up to the distance)
+#pragma unroll
+        for (int a = (it == 0 ? 0 : it + DW); a <= it + DW && a < NIT; ++a)
+#pragma unroll
+            for (int i = 0; i < R; ++i)
+                w[i][a] = __ldg(qr[i] + a * 32 + lane), dh[i][a] = __ldg(dr[i] + a * 4 + (lane >> 3));
+#pragma unroll
+        for (int a = (it == 0 ? 0 : it + DX); a <= it + DX && a < NIT; ++a)
+#pragma unroll
+            for (int t = 0; t < T; ++t) xv[t][a] = __ldg((const float4*) (x + (size_t) t * x_ld) + a * 32 + lane);
+        float f[R][4], dv[R];
+#pragma unroll
+        for (int i = 0; i < R; ++i) {
+            const uint32_t ww = w[i][it];
+            dv[i] = h2f(dh[i][it]);
+            f[i][0] = (float) (int8_t) (ww & 0xFFu), f[i][1] = (float) (int8_t) ((ww >> 8) & 0xFFu),
+            f[i][2] = (float) (int8_t) ((ww >> 16) & 0xFFu), f[i][3] = (float) (int8_t) (ww >> 24);
+        }
+        float p[R][T];
+#pragma unroll
+        for (int t = 0; t < T; ++t)
+#pragma unroll
+            for (int i = 0; i < R; ++i) p[i][t] = __fmul_rn(f[i][1], xv[t][it].y);
+#pragma unroll
+        for (int t = 0; t < T; ++t)
+#pragma unroll
+            for (int i = 0; i < R; ++i) p[i][t] = __fmaf_rn(f[i][0], xv[t][it].x, p[i][t]);
+#pragma unroll
+        for (int t = 0; t < T; ++t)
+#pragma unroll
+            for (int i = 0; i < R; ++i) p[i][t] = __fmaf_rn(f[i][2], xv[t][it].z, p[i][t]);
+#pragma unroll
+        for (int t = 0; t < T; ++t)
+#pragma unroll
+            for (int i = 0; i < R; ++i) p[i][t] = __fmaf_rn(f[i][3], xv[t][it].w, p[i][t]);
+#pragma unroll
+        for (int t = 0; t < T; ++t)
+#pragma unroll
+            for (int i = 0; i < R; ++i) acc[i][t] = __fmaf_rn(dv[i], p[i][t], acc[i][t]);
+    }
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) {   // (wsum's order)
+        float sh[R][T];
+#pragma unroll
+        for (int i = 0; i < R; ++i)
+#pragma unroll
+            for (int t = 0; t < T; ++t) sh[i][t] = __shfl_xor_sync(0xffffffffu, acc[i][t], o);
+#pragma unroll
+        for (int i = 0; i < R; ++i)
+#pragma unroll
+            for (int t = 0; t < T; ++t) acc[i][t] = __fadd_rn(acc[i][t], sh[i][t]);
+    }
+    if (lane == 0) {
+#pragma unroll
+        for (int i = 0; i < R; ++i)
+            if (row0 + i < N) {
+#pragma unroll
+                for (int t = 0; t < T; ++t) y[(size_t) t * y_ld + row0 + i] = acc[i][t];
+            }
+    }
+}
+#endif
+
 // experts_gate_up_swiglu_kernel for group_route's groups: a block's rows for each member in turn (its x in shared
 // memory, the rows' weights read again from the cache), with the one-token kernel's row dots - the same h to the bit
 template <int WARPS, int ROWS>
@@ -7140,6 +7236,26 @@ void mv_q8p_cols(const int8_t* q, const uint16_t* d, int N, int K, const float* 
         std::fprintf(stderr, "ik2::k::mv_q8p_cols: K %d, x_ld %d, %d tokens, or q / x not aligned\n", K, x_ld, T);
         std::abort();
     }
+#ifndef STRATA_USE_HIP
+    // (K of 18 or 24 steps of 128 - Inkling 2's widths - and 2 .. 8 tokens: the straight-line kernel, loads ahead;
+    //  IK2_COLS_AHEAD=0: the kernel below)
+    static const bool ahead = !(getenv("IK2_COLS_AHEAD") && !atoi(getenv("IK2_COLS_AHEAD")));
+    if (ahead && T >= 2 && (K == 18 * 128 || K == 24 * 128)) {
+        constexpr int W4 = 4, R4 = 4;
+        const unsigned g4 = (unsigned) ((N + W4 * R4 - 1) / (W4 * R4));
+#define IK2_COLSX(TT) \
+        case TT: \
+            if (K == 18 * 128) mv_q8p_colsx_kernel<W4, R4, TT, 18><<<g4, W4 * 32, 0, s>>>(q, d, N, K, x, x_ld, y, y_ld); \
+            else mv_q8p_colsx_kernel<W4, R4, TT, 24><<<g4, W4 * 32, 0, s>>>(q, d, N, K, x, x_ld, y, y_ld); \
+            break;
+        switch (T) {
+            IK2_COLSX(2) IK2_COLSX(3) IK2_COLSX(4) IK2_COLSX(5) IK2_COLSX(6) IK2_COLSX(7) IK2_COLSX(8)
+        }
+#undef IK2_COLSX
+        check("mv_q8p_colsx");
+        return;
+    }
+#endif
     // (a warp's rows: more share each x load - the window's x is read once per R rows - fewer warps in flight)
     static const int rr = getenv("IK2_COLS_R") ? atoi(getenv("IK2_COLS_R")) : 0;
     const int R = rr == 2 || rr == 4 || rr == 8 ? rr : (T <= 2 ? 2 : 4);
