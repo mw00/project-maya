@@ -288,7 +288,8 @@ float dspark_cum_default() {
 // millisecond from them - from this PC's round times by window size and the lookup drafts' acceptance, both measured
 // as it decodes - so a lookup window may run past DSpark's block, up to verify_max().  Only which drafts are verified
 // changes: verify() keeps a draft the drafter did not draw with probability p(d) (q a point at it), so every token is
-// still the model's own draw.  Not beside DS4_DSPARK_SAMPLE=1's drawn drafts (the choice would then hang on a draw).
+// still the model's own draw.  With DS4_DSPARK_SAMPLE=1 (drawn drafts) a round with a lookup proposal takes the
+// drafter's argmax as without it, so the choice hangs on no draw; the rounds without one draw their drafts.
 // A round with no drafter window (--dspark none or off, or DSpark resting after drafts below its confidence) weighs
 // the lookup's drafts against a plain step the same way.  --suffix-draft N: the shortest match it proposes from (3; 0:
 // off).  A proposal the policy trusts (DraftPolicy::trust: a long match whose windows measured hold) is verified alone,
@@ -793,6 +794,8 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
     for (const std::string& l : m.info_lines()) std::printf("%s\n", l.c_str());
     std::printf("INFO logprobs=%d\n", strata::ds4::kTopLogprobs);   // (GEN logprobs=<k>: LP lines, k at most this)
     std::printf("INFO logit_bias=1\n");   // (GEN logit_bias=<id>:<bias>,...: added to the logits of every pick)
+    // (#1026: this start came out short of --reserve-mib - the server starts the engine once more, which keeps it)
+    if (m.reserve_short_mib() > 0) std::printf("INFO reserve_short=%d\n", m.reserve_short_mib());
     if (m.ablate_loaded())   // (--ablate: GEN ablate=0|1 turns its projection off / on for the request)
         std::printf("INFO ablate=1 ablate_default=%d\n", m.ablating() ? 1 : 0);
     const bool abl_default = m.ablating();   // (a GEN without ablate=: as the engine started)
@@ -3690,7 +3693,7 @@ int main(int argc, char** argv) {
         else if (a == "--gpus") {
             for (int g : parse_ids(val("--gpus"))) o.gpus.push_back(g);
         } else if (a == "--max-context") o.max_context = std::atoll(val("--max-context").c_str());
-        else if (a == "--reserve-mib") o.reserve_mib = std::atoll(val("--reserve-mib").c_str());
+        else if (a == "--reserve-mib") o.reserve_mib = std::atoll(val("--reserve-mib").c_str()), o.reserve_given = true;
         else if (a == "--vram-experts") o.vram_experts = std::atof(val("--vram-experts").c_str());
         else if (a == "--cpu-threads") o.cpu_threads = std::atoi(val("--cpu-threads").c_str());
         else if (a == "--expert-profile") o.profile = val("--expert-profile");

@@ -276,4 +276,23 @@ inline int64_t apu_shared_margin(int64_t limit) {
     return std::min(kMax, std::max(kMin, (std::max<int64_t>(0, limit) / 8 + kStep - 1) & ~(kStep - 1)));
 }
 
+// An expert demoted at the last boundary (fast_boundary step 3) has no table entry until its copy to the RAM tier
+// lands, so a route that uses it reaches the host as a disk miss (glm_fast_path's fast_service).  drain_of: the demotion
+// of RAM slot (rclass, rslot) for that expert's key - its index in the drains, -1 none.
+template <class Drain>
+inline int drain_of(const std::vector<Drain>& drains, int rclass, int rslot, int key) {
+    for (size_t i = 0; i < drains.size(); ++i)
+        if (drains[i].rclass == rclass && drains[i].rslot == rslot && drains[i].key == key) return (int) i;
+    return -1;
+}
+// drain_reads_vram: such a miss reads the bytes from the VRAM slot the copy reads them from while that slot is still
+// draining (nothing writes it before the boundary that lands the copy frees it) - the same bytes, with no wait on the
+// copy stream.  A route's service that waited for that copy instead stalled a two-GPU drafting decode on Windows (#860:
+// RTX PRO 5000 + RTX 4090): the copy did not run while the device spun on that very route's answer, the device gave
+// the wait up after ~30 s and went on with the previous answer's sources ("invalid expert ID or non-finite score").
+// False (the slot is no longer the expert's, or another layer's): the RAM slot once the copy landed, as before.
+inline bool drain_reads_vram(int drain_layer, int route_layer, char vslot_state, char draining_state) {
+    return drain_layer == route_layer && vslot_state == draining_state;
+}
+
 }  // namespace strata::core::glmfast

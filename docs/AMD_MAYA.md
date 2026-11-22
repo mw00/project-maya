@@ -230,6 +230,15 @@ Hy4-Flash also sets up on an AMD GPU under Windows - a Strix Halo / Gorgon Halo,
 
 **If it does not work.** A start that stops, an answer that never comes (the engine waiting with the GPU idle) or answers that look wrong: please open an issue with your GPU, Windows version, the setup's output and the engine's log from the start (its first line says the platform is experimental), and, if it stops or hangs, whether it runs with `"GPU_FLUSH_ON_EXECUTION": "1"` in the config's `"env"` (AMD's runtime then sends the GPU its work at once - slower, but it tells us where to look). Meanwhile: turn drafting off (`--drafting off` at the setup), or run Hy4-Flash on Linux on the same PC (see above), or pick another model - GLM-5.3-Flash and DeepSeek-V4.1-Flash have been run on AMD under Windows.
 
+### Inkling-2-Mini (experimental preview)
+
+`./maya.sh --setup --backend hip --model inkling-2-mini` (Linux). Its engine (`maya-ik2`) keeps the whole model (17.6
+GB) in the GPU's memory: an RDNA 3 / 3.5 / 4 GPU (gfx11 / gfx12) with 24 GB of VRAM, or a Strix Halo / Gorgon Halo,
+whose memory is the RAM (the setup counts what the system leaves, less max(8 GB, 10%)). Run by Maya's team on a
+Radeon 8065S (Gorgon Halo, Ubuntu, ROCm 7.1): text, thinking, tool calls and pictures, the same greedy answers over
+starts; Radeon RX 7000 / 9000 cards build the same engine but have not been run here yet. Older AMD GPUs and AMD
+under Windows are refused by the setup in one line. docs/INKLING2.md has the engine's AMD paths.
+
 ## Instinct MI300X / MI325X
 
 AMD Instinct MI300X / MI325X (`gfx942`, CDNA3) is accepted as experimental, on one GPU. Like the MI100 it is a wave64

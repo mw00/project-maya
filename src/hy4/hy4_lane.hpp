@@ -59,6 +59,35 @@ LaneWaits lane_waits(bool windows, const std::function<const char*(const char*)>
 /// This system, the process's environment
 LaneWaits lane_waits();
 
+/// The lane's core reserve: a few workers sit the jobs out (asleep, their cores left free) while other programs keep
+/// the PC busy - a worker the system takes off its core mid-item holds up the whole job - and every worker works on
+/// an idle PC.  The other programs' CPU use is measured when the lane's jobs start again after a pause and every
+/// quarter second while they run (the PC's busy time less this process's own), with a gap between the levels that
+/// switch it on and off.  The work's items are the same either way: the answers do not change.
+/// A lane of the default size on 12 cores or more: min(4, cores / 8) cores, measured.  HY4_LANE_RESERVE=0: never
+/// (every worker always), =1: always; HY4_LANE_RESERVE_CORES=N: the reserve's size (any lane);
+/// HY4_LANE_RESERVE_LOG=1: each switch printed with the load measured (=2: every sample).
+struct LaneReserve {
+    enum Mode { kNever = 0, kAlways = 1, kMeasured = 2 };
+    int mode = kNever;
+    int cores = 0;   // workers parked while it is on
+    int log = 0;     // 1: each switch printed (stderr), 2: each sample
+};
+/// lane_cores: the lane's workers and its caller; auto_size: the lane of the default size; env: getenv (the tests)
+LaneReserve lane_reserve(int lane_cores, bool auto_size, const std::function<const char*(const char*)>& env);
+/// The switch: on after half a second in a row of other programs on a CPU or more (a desktop's short bursts - a
+/// fan service, a browser tab - leave it off), off after a second in a row below half a CPU
+struct LoadWatch {
+    static constexpr double kOn = 1.0, kOff = 0.5, kBusyUs = 5e5, kQuietUs = 1e6;
+    bool on = false;
+    double busy_us = 0.0, quiet_us = 0.0;
+    /// others: the other programs' CPUs (busy time / wall time) over a window of window_us
+    bool update(double others, double window_us);
+};
+/// The CPU time all programs and this process have used so far (microseconds, summed over the CPUs); false: not
+/// known on this system
+bool cpu_times(double& all_us, double& self_us);
+
 /// A layer's routed experts in host memory: each role's tensor (the GGUF's stacked [n_exp][rows][row bytes]) and the
 /// layer's format (ds4's IqCpu: the types, the row bytes, the activations' types).
 /// The experts of a layer kept re-coded at 4 bits a weight in RAM (ds4's iq_cpu_q4x_*: the same bits as the file's
@@ -76,6 +105,12 @@ struct CpuExperts {
     strata::ds4::gguf::IqCpu f;
     const uint8_t *gate = nullptr, *up = nullptr, *down = nullptr;
     size_t g_stride = 0, d_stride = 0;   // bytes an expert in the gate / up tensors, in the down tensor
+    // (0: g_stride / d_stride) the step from one expert's matrix to the next's - the GPU fetch's RAM store, where an
+    // expert's three matrices lie side by side in one blob (gate, up, down at its offsets): the blob's bytes
+    size_t step = 0;
+    const uint8_t* G(size_t e) const { return gate + e * (step ? step : g_stride); }
+    const uint8_t* U(size_t e) const { return up + e * (step ? step : g_stride); }
+    const uint8_t* D(size_t e) const { return down + e * (step ? step : d_stride); }
     float limit = 0.0f;
     std::shared_ptr<Q4xSet> q4x;         // (null: no copies for this layer)
     size_t q4x_gu = 0, q4x_d = 0;        // the form's bytes of an expert's gate (= up) matrix, its down matrix
@@ -122,6 +157,10 @@ void place_experts(const CpuExperts& ex, const std::vector<int>& experts, int no
 /// a page, or the disk.  ram_available: the RAM the system can still give, file cache included (0: not known).
 void warm_experts(const CpuExperts& ex, const std::vector<int>& experts, const std::atomic<bool>& stop);
 uint64_t ram_available();
+/// The GPU fetch's RAM copy of a layer's experts: `bytes` of zeroed memory of the process's own (Linux: anonymous,
+/// transparent huge pages asked for; Windows: committed pages), null when the system gives none; ram_free gives it back
+void* ram_alloc(size_t bytes);
+void ram_free(void* p, size_t bytes);
 /// the calling thread below the others (a background helper: nice 10 on Linux, below normal on Windows)
 void lower_this_thread();
 /// the calling thread on every CPU the process may run on (Linux: a thread inherits the mask of the thread that

@@ -87,6 +87,11 @@ class ChatTemplate:
         hytk = re.search(r"set\s+HYTK\s*=\s*'([^']*)'", self.source)
         self.hy4 = bool(hytk) and "reasoning_mode" in self.source and "hy_start" in self.source
         self.hy4_tag = hytk.group(1) if hytk else ""
+        # Inkling 2 (thinkingmachines' own template, tools/ik2/chat_template.jinja): typed segments in place of tags -
+        # <|content_thinking|>, <|content_text|>, a tool call <|message_model|>NAME<|content_invoke_tool_json|>{"name",
+        # "args"}<|end_message|> - which InklingRewriter turns into what OutputParser reads; reasoning_effort by name
+        # (none .. max, its effort_map) or a number; tool call arguments must be objects
+        self.inkling = "<|content_invoke_tool_json|>" in self.source and "effort_map" in self.source
 
     def effort_shown(self, value) -> str | None:
         """Hy4-flash: a thinking level as given (a config's, a client's) -> the level this model really runs it at, in
@@ -162,6 +167,19 @@ class ChatTemplate:
             tools = [t if "function" in t else {"type": "function", "function": t} for t in tools or []] or None
             return self.template.render(messages=messages, tools=tools, add_generation_prompt=add_generation_prompt,
                                         **kwargs)
+        if self.inkling:
+            # thinking off is effort "none" (the template's 0); a level it knows by name goes as it is; none named:
+            # the template's default (0.9, its "high")
+            off = kwargs.pop("enable_thinking", None) is False
+            level = kwargs.pop("reasoning_effort", None)
+            level = name or level
+            kwargs.pop("thinking_mode", None)
+            if off:
+                kwargs["reasoning_effort"] = "none"
+            elif level in INKLING_EFFORT:
+                kwargs["reasoning_effort"] = level
+            return self.template.render(messages=inkling_messages(messages), tools=tools,
+                                        add_generation_prompt=add_generation_prompt, **kwargs)
         if self.hy4:
             # Hy4-flash thinks at one level, high, or not at all (no_think): thinking off is no_think, every other level
             # (low, max ... - the template would take them, the model is not made for them) and none named are high.
@@ -1305,13 +1323,149 @@ class MinimaxRewriter:
         return {n: v for n, v in items}
 
 
+INKLING_EFFORT = ("none", "minimal", "low", "medium", "high", "xhigh", "max")   # (its template's effort_map)
+
+
+def inkling_messages(messages: list[dict]) -> list[dict]:
+    """The messages as Inkling 2's template takes them: a tool call's arguments an object (it refuses a JSON string),
+    no None content, a developer message a system one, reasoning as reasoning_content."""
+    out = []
+    for m in messages:
+        m = dict(m)
+        if m.get("content") is None:
+            m["content"] = ""
+        if m.get("role") == "developer":
+            m["role"] = "system"
+        if m.get("reasoning") and not m.get("reasoning_content"):
+            m["reasoning_content"] = m["reasoning"]
+        if m.get("tool_calls"):
+            calls = []
+            for tc in m["tool_calls"]:
+                tc = copy.deepcopy(tc)
+                fn = tc.setdefault("function", {})
+                args = fn.get("arguments")
+                if isinstance(args, str):
+                    try:
+                        fn["arguments"] = json.loads(args) if args.strip() else {}
+                    except ValueError:
+                        fn["arguments"] = {"_raw": args}
+                elif args is None:
+                    fn["arguments"] = {}
+                calls.append(tc)
+            m["tool_calls"] = calls
+        out.append(m)
+    return out
+
+
+INK_THINK, INK_TEXT, INK_CALL = "<|content_thinking|>", "<|content_text|>", "<|content_invoke_tool_json|>"
+INK_MODEL, INK_END, INK_EOS = "<|message_model|>", "<|end_message|>", "<|content_model_end_sampling|>"
+INK_OTHER_TEXT = ("<|content_tool_error|>", "<|content_invoke_tool_text|>")
+
+
+class InklingRewriter:
+    """Inkling 2's output rewritten, as it streams, into what OutputParser reads (DeepSeek's and MiniMax's path: GLM's
+    tool-call form with JSON values).  The model writes typed segments: <|content_thinking|> opens reasoning
+    (THINK_AGAIN), <|content_text|> (and the tool-error / text-invoke kinds) opens answer text (</think> while
+    reasoning is open), and a tool call is <|message_model|>NAME<|content_invoke_tool_json|>{"name": .., "args": {..}}
+    <|end_message|>, which goes out whole at its end as <tool_call>NAME<arg_key>K</arg_key><arg_value>V</arg_value>..
+    </tool_call> with V JSON.  What stands between segments (the tool's name after <|message_model|>, <|end_message|>)
+    is dropped.  A mark split across deltas is held until it is whole."""
+
+    MARKS = (INK_THINK, INK_TEXT, INK_CALL, INK_MODEL, INK_END, INK_EOS) + INK_OTHER_TEXT
+
+    def __init__(self, thinking: bool = True):
+        self.buf = ""
+        self.mode = "lead"           # lead (before any segment) | think | text | name | call | between
+        self.open = thinking         # the parser is in its reasoning state (it starts there when thinking)
+        self.name = ""
+        self.body = ""
+
+    def feed(self, text: str) -> str:
+        self.buf += text
+        out = []
+        while self.buf:
+            hits = [(i, m) for m in self.MARKS for i in (self.buf.find(m),) if i >= 0]
+            if not hits:
+                keep = max((n for m in self.MARKS for n in range(1, len(m)) if self.buf.endswith(m[:n])), default=0)
+                out.append(self._text(self.buf[:len(self.buf) - keep]))
+                self.buf = self.buf[len(self.buf) - keep:]
+                break
+            i, m = min(hits)
+            if i:
+                out.append(self._text(self.buf[:i]))
+            self.buf = self.buf[i + len(m):]
+            out.append(self._mark(m))
+        return "".join(out)
+
+    def _text(self, s: str) -> str:
+        if self.mode == "name":
+            self.name += s
+            return ""
+        if self.mode == "call":
+            self.body += s
+            return ""
+        if self.mode == "lead":      # (no segment opened: a model that answers plainly)
+            self.mode = "text" if s.strip() else "lead"
+            return (self._close() + s) if self.mode == "text" else ""
+        return s if self.mode in ("think", "text") else ""
+
+    def _close(self) -> str:
+        if self.open:
+            self.open = False
+            return "</think>"
+        return ""
+
+    def _mark(self, m: str) -> str:
+        if m == INK_THINK:
+            self.mode = "think"
+            if self.open:
+                return ""
+            self.open = True
+            return THINK_AGAIN
+        if m == INK_TEXT or m in INK_OTHER_TEXT:
+            self.mode = "text"
+            return self._close()
+        if m == INK_MODEL:
+            self.mode, self.name = "name", ""
+            return ""
+        if m == INK_CALL:
+            self.mode, self.body = "call", ""
+            return ""
+        out = self._call() if self.mode == "call" else ""
+        self.mode = "between"          # <|end_message|> / the end of sampling: the segment is over
+        return out
+
+    def finish(self) -> str:
+        """The end of the answer: a mark's partial text held back is text; a call still open goes out as far as it is
+        whole (an unfinished one as its text)."""
+        rest, self.buf = self.buf, ""
+        out = self._text(rest)
+        if self.mode == "call":
+            out += self._call()
+            self.mode = "between"
+        return out
+
+    def _call(self) -> str:
+        try:
+            j = json.loads(self.body)
+            name = (j.get("name") if isinstance(j, dict) else None) or self.name.strip()
+            args = (j.get("args") if isinstance(j, dict) else None) or {}
+            if not name or not isinstance(args, dict):
+                raise ValueError(self.body)
+        except ValueError:
+            return self._close() + self.body   # (not a call the parser can read: its text, as the answer's)
+        val = lambda v: json.dumps(v, ensure_ascii=False).replace("<", "\\u003c")   # ("<" occurs in strings only)
+        return (self._close() + CALL_START + name +
+                "".join(ARG_KEY + k + ARG_KEY_END + ARG_VAL + val(v) + ARG_VAL_END for k, v in args.items()) + CALL_END)
+
+
 class OutputParser:
     """Incremental parser of the model's text. Feed deltas; get events. A tag split across deltas is held back
     until it is complete, so clients never see `<tool_` or `</thi`."""
 
     def __init__(self, thinking: bool = True, tools: list[dict] | None = None, stream_tools: bool = False,
                  dsml: bool = False, strict_tools: bool = False, single_tool: bool = False, minimax: bool = False,
-                 token_only_end: bool = False, unions: bool = False):
+                 token_only_end: bool = False, unions: bool = False, inkling: bool = False):
         self.state = "reasoning" if thinking else "content"
         # token_only_end: the vocabulary has the end of thinking as a token (DeepSeek's), so only that token closes the
         # reasoning - the text "</think>" in it does not (a model that quotes the tag while it talks about it, as in
@@ -1322,11 +1476,12 @@ class OutputParser:
         self.unions = unions   # GLM-5.3 (glm_dsa): a parameter whose schema allows a string stays one (_declared_type)
         # DeepSeek-V4.1's tool calls, read as GLM's (DsmlRewriter); MiniMax-M3.1's the same way (MinimaxRewriter):
         # both send JSON values, so the parser takes them without the tools' schemas
-        self.dsml = DsmlRewriter() if dsml else MinimaxRewriter(tools) if minimax else None
+        self.dsml = DsmlRewriter() if dsml else MinimaxRewriter(tools) if minimax else \
+            InklingRewriter(thinking) if inkling else None   # (Inkling 2: its typed segments, InklingRewriter)
         self.buf = ""
         self._call_resume = 0        # where the CALL_END search in call state resumes (see _feed)
         self.lead = False
-        self.schemas = {} if dsml or minimax else {t.get("name"): t for t in tools or []}
+        self.schemas = {} if dsml or minimax or inkling else {t.get("name"): t for t in tools or []}
         # stream_tools: a tool call is also reported while it is being written - "tool_start" (its name and id) as
         # soon as the name is known, then "tool_args" pieces of its JSON arguments (string parameters character by
         # character; other types whole, once complete) - before the final "tool_call".  Without it, a client sees

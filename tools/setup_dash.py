@@ -197,6 +197,9 @@ def tiers(m: dict, width: int):
     t, eng = m.get("tiers") or {}, m.get("engine") or {}
     n, h = t.get("now"), t.get("history") or {}
     if not n:
+        if eng.get("engine_kind") == "ik2":            # (maya-ik2 writes no STAT lines: nothing comes later)
+            return Text("Inkling 2 Mini's engine keeps its experts in VRAM where the card holds them; it reports no "
+                        "tiers.", f"italic {MUTED}")
         return Text("The engine tells where its experts live while it writes an answer.", f"italic {MUTED}")
     ds4 = eng.get("engine_kind") == "ds4"
     hy4 = eng.get("engine_kind") == "hy4"
@@ -307,6 +310,8 @@ def hardware(m: dict, width: int) -> Table:
               f"to GPU {rate(hw.get('gpu_pcie_rx_mb'))}", h.get("gpu_pcie_rx_mb"), None),
              ("CPU", fmt(hw.get("cpu")), "%", f"{st.get('cores')} cores · {st.get('threads')} threads"
               if st.get("threads") else "", h.get("cpu"), 100),
+             ("CPU temp", fmt(hw.get("cpu_temp")), "°C", "the hottest sensor" if hw.get("cpu_temp") is not None
+              else "no CPU sensor", h.get("cpu_temp"), 100),
              ("RAM", gb(hw.get("ram_used")), f"/ {gb(hw.get('ram_total'), 0)} GB",
               f"{fmt(eng.get('ram_gb'), 1)} GB pinned for experts" if eng.get("ram_gb") else "", h.get("ram_used"),
               hw.get("ram_total")),
@@ -367,6 +372,9 @@ def banners(m: dict, fails: int) -> Text:
     for g in (m.get("hardware") or {}).get("gpus") or []:
         if (g.get("temp") or 0) >= 87:
             out.append((f"GPU {g.get('index')} is at {fmt(g['temp'])} °C: it may slow itself down to cool off.", WARN))
+    cpu_t = (m.get("hardware") or {}).get("cpu_temp")
+    if (cpu_t or 0) >= 95:
+        out.append((f"The CPU is at {fmt(cpu_t)} °C: it may slow itself down to cool off.", WARN))
     if fails >= 3:
         out.append(("The server does not answer: these numbers are from before.", DANGER))
     return Text("\n").join(Text.assemble(("! ", f"bold {tone}"), (msg, tone)) for msg, tone in out)
@@ -380,7 +388,11 @@ def loading(w: LoadWatch, width: int):
     def gpu(k):
         return f"GPU {w.gpus[k]}" if k < n else f"part {k + 1}"
     now = [k for k in sorted(parts) if parts[k][0] < parts[k][1]]   # (the GPU warming now; before it starts: the next)
-    if not parts:
+    if getattr(w, "measuring", False):                  # (Hy4-Flash's first start on this PC, before it is ready)
+        left = getattr(w, "measure_left", None)
+        what = (f"measuring this PC once, {w.measuring if isinstance(w.measuring, str) else 'its choices'}" +
+                (f" (about {clock(left)} more)" if left else "") + " - the next starts skip this")
+    elif not parts:
         what = "reading the model's weights"
     elif len(parts) >= n and not now:
         what = "the engine's last checks - almost ready"

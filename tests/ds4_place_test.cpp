@@ -1,5 +1,6 @@
 // tests/ds4_place_test.cpp - the trunk's expert placement (src/ds4/ds4_place.hpp): the per-byte queue, the even
-// split and each layer's statics / recent slots / spare, today's rule and DS4_RECENT_FIT's (no GPU, no model).
+// split and each layer's statics / recent slots / spare, today's rule and DS4_RECENT_FIT's; DS4_SPLIT's layers by
+// group (no GPU, no model).
 //
 //   ds4_place_test [expert-profile.bin] [--table]
 //
@@ -381,6 +382,36 @@ static void test_sweep(const std::vector<uint32_t>& prof) {
 }
 
 // small layers: recent sets as large as the layer, the cache off, ineligible layers, one expert
+// DS4_SPLIT: the groups' counts as ever, and n@g - the trunk's last layers back on a group that ran earlier ones
+static void test_split() {
+    std::vector<int> grp;
+    std::string err;
+    int at = 0;
+    const auto count = [&grp](int gi) { return (int) std::count(grp.begin(), grp.end(), gi); };
+    expect(place::layer_groups("3,10,27", 3, 40, grp, err) && count(0) == 3 && count(1) == 10 && count(2) == 27 &&
+               grp[2] == 0 && grp[3] == 1 && grp[12] == 1 && grp[13] == 2,
+           "split: 3,10,27");
+    expect(place::layers_back(grp, 3, at, err) && at == -1, "split: 3,10,27 has no layers going back");
+    expect(place::layer_groups("3,10", 3, 40, grp, err) && count(1) == 10 && count(2) == 27, "split: the rest to the last group");
+    expect(place::layer_groups("3,10,20,7", 3, 40, grp, err) && count(2) == 27, "split: a count past the last group is left out");
+    expect(place::layer_groups("3,10,23,4@1", 3, 40, grp, err) && count(0) == 3 && count(1) == 14 && count(2) == 23 &&
+               grp[35] == 2 && grp[36] == 1 && grp[39] == 1,
+           "split: 3,10,23,4@1");
+    expect(place::layers_back(grp, 3, at, err) && at == 36, "split: 3,10,23,4@1 goes back at layer 36");
+    expect(place::layer_groups("40@0", 3, 40, grp, err) && count(0) == 40 && place::layers_back(grp, 3, at, err) && at == -1,
+           "split: every layer on a named group");
+    expect(!place::layer_groups("3,10,23,4@3", 3, 40, grp, err) && !err.empty(), "split: n@g past the groups");
+    expect(!place::layer_groups("3,10,23,4@", 3, 40, grp, err) && !place::layer_groups("3,10,23,4@x", 3, 40, grp, err),
+           "split: n@ without a group");
+    // what the engine does not run: a second run that is not the trunk's end, two groups going back, a third run
+    expect(place::layer_groups("3,10,10,4@1,13@2", 3, 40, grp, err) && !place::layers_back(grp, 3, at, err),
+           "split: layers back in the middle");
+    expect(place::layer_groups("3,10,23,2@1", 3, 40, grp, err) && !place::layers_back(grp, 3, at, err),
+           "split: layers back, then the rest on the last group");
+    expect(place::layer_groups("3,10,20,3@0,4@1", 3, 40, grp, err) && !place::layers_back(grp, 3, at, err),
+           "split: two groups going back");
+}
+
 static void test_edges() {
     expect(place::recent_slots(34, 32, true, 0) == 32, "edge: 34 slots keep 32 (today)");
     expect(place::recent_slots(33, 32, true, 0) == 0, "edge: 33 slots keep none (today)");
@@ -428,6 +459,7 @@ int main(int argc, char** argv) {
         return 2;
     }
     test_edges();
+    test_split();
     test_engine_parity();
     test_box(prof, table);
     test_sweep(prof);

@@ -40,7 +40,8 @@ METRICS = {   # GET /metrics as the server sends it (serve/server.py, metrics) -
                "prompt_ms": 4003.6, "decode_ms": 12586.5},
     "hardware": {"gpu_util": 41, "gpu_mem_used": 28 * 2**30, "gpu_mem_total": 32 * 2**30, "gpu_temp": 61,
                  "gpu_power": 176.0, "gpu_power_limit": 360.0, "gpu_pcie_gen_max": 5, "gpu_pcie_width": 8,
-                 "gpu_pcie_rx_mb": 6200.0, "cpu": 34.0, "ram_used": 140 * 2**30, "ram_total": 251 * 2**30,
+                 "gpu_pcie_rx_mb": 6200.0, "cpu": 34.0, "cpu_temp": 52.0, "ram_used": 140 * 2**30,
+                 "ram_total": 251 * 2**30,
                  "disk_read_mb": 12.0, "disk_write_mb": 0.4,
                  "gpus": [dict(GPU, index=0), dict(GPU, index=1, temp=88)]},
     "hardware_static": {"gpu_name": "NVIDIA GeForce RTX 5060 Ti + NVIDIA GeForce RTX 3090", "cores": 88,
@@ -89,6 +90,11 @@ class Boxes(unittest.TestCase):
         calm = {**m, "tiers": {**m["tiers"], "now": {**now, "vram_hit": 0.9}}}
         self.assertNotIn(D.TIPS["ds4_cpu"][0], text(D.tiers(calm, 120), 122))
 
+    def test_ik2_says_it_reports_no_tiers(self):   # (maya-ik2 writes no STAT lines: no "while it writes" promise)
+        out = text(D.tiers({"engine": {"engine_kind": "ik2", "model": "Inkling-2", "kv": "fp8"}}, 120), 122)
+        self.assertIn("reports no tiers", out)
+        self.assertNotIn("while it writes", out)
+
     def test_the_tiers_bar_fits_when_the_tiers_overlap(self):   # (Maya-L on 9 GPUs: 10,813 + 1,571 of 12,096)
         now = {**METRICS["tiers"]["now"], "vram_used": 10813, "ram_used": 1571}
         m = {**METRICS, "engine": {**METRICS["engine"], "experts": 12096}, "tiers": {**METRICS["tiers"], "now": now}}
@@ -111,13 +117,15 @@ class Boxes(unittest.TestCase):
         for want in ("RTX 5060 Ti", "RTX 3090", "41%", "14.0 / 16 GB", "88 / 180 W", "Gen5 x8", "3.0 GB/s"):
             self.assertIn(want, gpus)
         hw = text(D.hardware(METRICS, 116))
-        for want in ("GPU load", "41%", "28.0 / 32 GB", "5,248 experts cached", "CPU", "88 cores", "RAM",
-                     "92.8 GB pinned", "6.1 GB/s"):
+        for want in ("GPU load", "41%", "28.0 / 32 GB", "5,248 experts cached", "CPU", "88 cores", "CPU temp",
+                     "52 °C", "RAM", "92.8 GB pinned", "6.1 GB/s"):
             self.assertIn(want, hw)
         reqs = text(D.requests(METRICS, 116))
         for want in ("Done", "OpenAI", "1,533", "234", "18.5", "92.0%", "17.2 s", "Since"):
             self.assertIn(want, reqs)
         self.assertIn("GPU 1 is at 88 °C", D.banners(METRICS, 0).plain)
+        self.assertIn("The CPU is at 96 °C",
+                      D.banners(dict(METRICS, hardware=dict(METRICS["hardware"], cpu_temp=96)), 0).plain)
         self.assertIn("does not answer", D.banners(METRICS, 3).plain)
 
     def test_gpu_columns_keep_their_place_when_a_reading_changes(self):   # (#793: a PCIe burst moved the others)
@@ -307,6 +315,30 @@ class Loading(unittest.TestCase):
         blind = D.LoadWatch(None, [0])
         self.assertIsNone(blind.fraction())
         self.assertIn("so far", text(D.loading(blind, 60)))
+
+    def test_a_first_start_measuring_this_pc(self):   # (maya-hy4: its choices measured once, before it is ready)
+        w = self.watch(["maya-hy4: measuring this PC once, before the first answer: the prompt route (up to 10 chunks "
+                        "of 4096 tokens) - on 56132 tokens of text, 300 s at most; remembered, the next starts skip it"],
+                       gpus=(0,))
+        self.assertTrue(w.measuring)
+        self.assertIn("Measuring this PC once", text(D.loading(w, 60)))
+        w = self.watch(["maya-hy4: measuring this PC once, before the first answer: the prompt route",
+                        "maya-hy4: measured this PC once in 23 s, before the first answer (...): the prompt route's "
+                        "rates remembered"], gpus=(0,))
+        self.assertFalse(w.measuring)
+        self.assertIn("Reading the model's weights", text(D.loading(w, 60)))
+        # (--drafting auto: the drafting trial in plain words with roughly how long, then the time left at the PC's pace)
+        w = self.watch(["maya-hy4: measuring this PC once, before the first answer: drafting (no drafting, the MTP "
+                        "block, the DFly2 drafter: a load and 3 short answers each) - on 56132 tokens of text; "
+                        "remembered, the next starts skip it"], gpus=(0,))
+        self.assertIn("which drafting answers fastest: 3 choices", w.measuring)
+        self.assertIn("one to two minutes", text(D.loading(w, 60)))
+        w = self.watch(["maya-hy4: measuring this PC once, before the first answer: drafting (no drafting, the MTP "
+                        "block: a load and 3 short answers each) - on 56132 tokens of text",
+                        "maya-hy4: measuring this PC: 1 of 2 choices done in 41 s - about 30 s more"], gpus=(0,))
+        self.assertEqual(w.measure_left, 30)
+        self.assertIn("2 choices", w.measuring)
+        self.assertIn("more)", text(D.loading(w, 60)))
 
 
 @unittest.skipIf(T is None, "Textual is not installed (./maya.sh --setup installs it)")

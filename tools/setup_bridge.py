@@ -21,6 +21,25 @@ TAIL = 40                                               # the output lines a sum
 # tiers 40% (5.4 of 13.4 GB, 11 s)", then "glm fast: CUDA2 tiers warm: 1152 experts (13.4 GB) in 29 s"
 WARMING = re.compile(r"glm fast: (\S+?)(\d+) warming the expert tiers \d+% \(([\d.]+) of ([\d.]+) GB")
 WARMED = re.compile(r"glm fast: (\S+?)(\d+) tiers warm: \d+ experts \(([\d.]+) GB\)")
+MEASURE_LEFT = re.compile(r"measuring this PC: \d+ of \d+ choices done in \d+ s - about (\d+) s more")
+
+
+def measure_said(line: str) -> str:
+    """maya-hy4's "measuring this PC once" line in plain words, with roughly how long it takes on this kind of PC
+    (serve/server.py's narrate_start says the same): the drafting trial - each choice loaded and timed on a few short
+    answers - or the CPU lane's 4-bit copies and the prompt route."""
+    if "before the first answer: drafting" in line:
+        m = re.search(r"drafting \(([^:()]*):", line)
+        n = len(m.group(1).split(", ")) if m else 3
+        return (f"which drafting answers fastest: {n} choices, each loaded and timed on a few short answers - "
+                f"roughly {HY4_TRIAL_TIME.get(n, HY4_TRIAL_TIME[3])}")
+    return "the CPU lane's 4-bit copies and the prompt route - roughly " + HY4_LANE_TIME
+
+
+# (roughly how long maya-hy4's first-start measurements take - measured on a GPU holding the whole model and on GPUs
+#  with the CPU lane; serve/server.py's HY4_TRIAL_TIME / HY4_LANE_TIME are the same)
+HY4_TRIAL_TIME = {2: "about a minute", 3: "one to two minutes"}
+HY4_LANE_TIME = "one minute"
 
 
 def output_text(line: bytes) -> str:
@@ -70,6 +89,8 @@ class LoadWatch:
     def reset(self) -> None:
         """A start (or a reload) begins: nothing warm yet."""
         self.parts, self.t0 = {}, time.monotonic()      # the part's number -> [GB warm, GB in all]
+        self.measuring = False                          # (maya-hy4's first start on a PC: its choices measured once -
+        self.measure_left = None                        #  what, in plain words; the seconds left, at this PC's pace)
 
     def read(self) -> None:
         """The log's new lines (on the screen's thread, once a second: a few KB)."""
@@ -86,6 +107,12 @@ class LoadWatch:
                 self.parts[int(m.group(2))] = [float(m.group(3)), float(m.group(4))]
             elif m := WARMED.search(line):
                 self.parts[int(m.group(2))] = [float(m.group(3))] * 2
+            elif "measuring this PC once, before the first answer" in line:
+                self.measuring, self.measure_left = measure_said(line), None
+            elif m := MEASURE_LEFT.search(line):
+                self.measure_left = int(m.group(1))
+            elif "measured this PC once in" in line:
+                self.measuring, self.measure_left = False, None
 
     def total(self) -> tuple:
         """(the GB the start warms in all, whether it is known): each part's as the engine said; one not started yet

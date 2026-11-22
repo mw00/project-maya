@@ -76,8 +76,9 @@ inline fd_t open_direct(const std::string& path) {
 /// [off, off + n) through an unbuffered descriptor into dst, a kDirectAlign-aligned buffer of at least
 /// direct_span(off, n) bytes: the file read from off rounded down, so the bytes land at dst + (off % kDirectAlign).
 /// False if a read fails (the caller reads buffered instead, the same bytes). A descriptor whose read the system
-/// refused (#1076: EFAULT where the destination is memory O_DIRECT cannot pin) takes no more unbuffered reads - each
-/// later call returns false at once - and the first refusal is logged with its errno and file.
+/// refused (any errno but EFAULT) takes no more unbuffered reads - each later call returns false at once - and the first
+/// refusal is logged with its errno and file. EFAULT (#1076) is the destination's doing, memory O_DIRECT cannot pin:
+/// that call alone returns false (logged once) and the descriptor keeps its unbuffered reads.
 constexpr uint64_t kDirectAlign = 4096;
 inline uint64_t direct_span(uint64_t off, uint64_t n) {
     const uint64_t a0 = off & ~(kDirectAlign - 1), a1 = (off + n + kDirectAlign - 1) & ~(kDirectAlign - 1);
@@ -89,6 +90,7 @@ struct DirectRefused {
     std::vector<int> fds;      // (the refused descriptors)
     std::atomic<int> n{0};     // (their count: 0 - the reads take no lock)
     bool said = false;
+    std::atomic<bool> said_dst{false};   // (the EFAULT line: once)
 };
 inline DirectRefused& direct_refused() {
     static DirectRefused r;
@@ -139,6 +141,13 @@ inline bool pread_direct(fd_t f, void* dst, uint64_t n, uint64_t off) {
         const ssize_t r = ::pread((int) f, p + got, (size_t) std::min<uint64_t>(need - got, 1ull << 30), (off_t) (a0 + got));
         if (r < 0 && errno == EINTR) continue;
         if (r < 0) {
+            if (errno == EFAULT) {   // the destination's doing (memory O_DIRECT cannot pin), not the file's: this call only, the descriptor keeps its unbuffered reads
+                if (!direct_refused().said_dst.exchange(true))
+                    std::fprintf(stderr, "ds4: an unbuffered (O_DIRECT) read was refused with EFAULT: the destination memory cannot be pinned "
+                                 "by O_DIRECT (a hipHostMalloc staging buffer, say) - that read goes through the page cache (the same bytes), "
+                                 "the file's other unbuffered reads go on\n");
+                return false;
+            }
             direct_refuse((int) f, errno);
             return false;
         }
@@ -576,6 +585,119 @@ inline void anon_free(void* p, size_t bytes) {
     VirtualFree(p, 0, MEM_RELEASE);
 #else
     ::munmap(p, bytes);
+#endif
+}
+
+/// A NUMA node's memory as the kernel counts it, bytes: free, and the file cache on its LRU lists - what a reclaim
+/// can take - less the part of it mapped into processes (a model another engine reads in place stays)
+struct NodeMem {
+    uint64_t free = 0, file = 0;
+};
+/// Linux: /sys/devices/system/node/node<N>/meminfo; false where it cannot be read (another OS, no such node)
+inline bool node_mem(int node, NodeMem& m) {
+#if defined(_WIN32)
+    (void) node, (void) m;
+    return false;
+#else
+    char path[96];
+    std::snprintf(path, sizeof path, "/sys/devices/system/node/node%d/meminfo", node);
+    std::FILE* f = std::fopen(path, "r");
+    if (f == nullptr) return false;
+    unsigned long long fr = 0, act = 0, inact = 0, mapped = 0, v = 0;
+    bool got_free = false;
+    char line[160], key[64];
+    while (std::fgets(line, sizeof line, f) != nullptr) {
+        if (std::sscanf(line, "Node %*d %63[^:]: %llu", key, &v) != 2) continue;
+        if (std::strcmp(key, "MemFree") == 0) fr = v, got_free = true;
+        else if (std::strcmp(key, "Active(file)") == 0) act = v;
+        else if (std::strcmp(key, "Inactive(file)") == 0) inact = v;
+        else if (std::strcmp(key, "Mapped") == 0) mapped = v;
+    }
+    std::fclose(f);
+    if (!got_free) return false;
+    m.free = (uint64_t) fr << 10;
+    m.file = (uint64_t) (act + inact > mapped ? act + inact - mapped : 0) << 10;
+    return true;
+#endif
+}
+
+/// The file cache to release on a node before `need` bytes are first touched there: what its free memory lacks (and
+/// `slack` for whatever else lands there meanwhile), at most nine tenths of its reclaimable file cache - none where
+/// the node holds the bytes already, or where less than `least` could be released (nothing worth a pass)
+inline uint64_t node_room_short(const NodeMem& m, uint64_t need, uint64_t slack, uint64_t least) {
+    if (m.free >= need + slack) return 0;
+    const uint64_t take = std::min(need + slack - m.free, m.file / 10 * 9);
+    return take >= least ? take : 0;
+}
+
+/// Makes room on NUMA node `node` for `need` bytes about to be first touched there with the node preferred
+/// (anon_alloc).  A node whose free memory is short but whose file cache is not - another model's files read before
+/// this one, the usual state after a switch of models - would lend the bytes from the other nodes (MPOL_PREFERRED falls
+/// back before it reclaims), so a NUMA part's copies end up on the wrong node and what is left for them is too
+/// fragmented for huge pages.  Here a scratch mapping bound to the node, on small pages, is touched - the node's free
+/// memory, then what its reclaim releases of the file cache - and unmapped: the bytes are free on the node, in whole
+/// 2 MB runs where the cache lay in them.  In steps, each only while the node still has that much to give (a bound
+/// allocation the node cannot serve ends in the kernel's OOM killer, #507).  Returns the file cache released, bytes
+/// (0: nothing to do, or the node cannot be bound - a container without SYS_NICE).  Linux only.
+inline uint64_t node_make_room(int node, uint64_t need, int threads) {
+#if defined(_WIN32)
+    (void) node, (void) need, (void) threads;
+    return 0;
+#else
+    constexpr uint64_t kSlack = (uint64_t) 1 << 30, kLeast = (uint64_t) 256 << 20, kStep = (uint64_t) 4 << 30;
+    NodeMem m;
+    if (node < 0 || node >= 256 || !node_mem(node, m)) return 0;
+    const uint64_t take = node_room_short(m, need, kSlack, kLeast);
+    if (take == 0) return 0;
+    const uint64_t free0 = m.free, want = free0 + take;   // (the mapping takes the node's free memory first)
+    const long page = sysconf(_SC_PAGESIZE);
+    const uint64_t ps = page > 0 ? (uint64_t) page : 4096;
+    std::vector<std::pair<void*, uint64_t>> held;
+    uint64_t done = 0;
+    unsigned long mask[4] = {0, 0, 0, 0};
+    mask[node / 64] = 1ul << (node % 64);
+    while (done < want) {
+        const uint64_t step = std::min(kStep, want - done);
+        // (the node's memory now: a step it can no longer give is not asked of it)
+        if (!node_mem(node, m) || m.free + m.file / 10 * 9 < step) break;
+        void* p = ::mmap(nullptr, step, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (p == MAP_FAILED) break;
+        madvise(p, step, MADV_NOHUGEPAGE);
+        if (syscall(SYS_mbind, p, step, 2 /* MPOL_BIND */, mask, 256, 0) != 0) {
+            ::munmap(p, step);
+            break;
+        }
+        const int nt = (int) std::max<uint64_t>(1, std::min<uint64_t>((uint64_t) std::max(1, threads), step / ps));
+        std::vector<std::thread> th;
+        for (int t = 0; t < nt; ++t)
+            th.emplace_back([=] {
+                volatile uint8_t* b = (volatile uint8_t*) p;
+                const uint64_t pages = step / ps, a = pages * (uint64_t) t / (uint64_t) nt * ps,
+                               e = pages * (uint64_t) (t + 1) / (uint64_t) nt * ps;
+                for (uint64_t o = a; o < e; o += ps) b[o] = 1;
+            });
+        for (auto& t : th) t.join();
+        held.push_back({p, step});
+        done += step;
+    }
+    for (auto& h : held) ::munmap(h.first, h.second);
+    return done > free0 ? done - free0 : 0;
+#endif
+}
+
+/// First touches a fresh anonymous mapping now (its own policy and page size decide where and how the pages land):
+/// the kernel's MADV_POPULATE_WRITE (Linux 5.14), else a zero written a page - so only before anything is stored
+/// there.  Linux only; elsewhere nothing.
+inline void populate_fresh(void* p, uint64_t bytes) {
+#if defined(_WIN32)
+    (void) p, (void) bytes;
+#else
+    if (p == nullptr || bytes == 0) return;
+    if (madvise(p, bytes, 23 /* MADV_POPULATE_WRITE */) == 0) return;
+    const long page = sysconf(_SC_PAGESIZE);
+    const uint64_t ps = page > 0 ? (uint64_t) page : 4096;
+    volatile uint8_t* b = (volatile uint8_t*) p;
+    for (uint64_t o = 0; o < bytes; o += ps) b[o] = 0;
 #endif
 }
 

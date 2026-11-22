@@ -16,12 +16,15 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-FAMILIES = ("glm", "deepseek", "minimax", "qwen", "hy4")
+FAMILIES = ("glm", "deepseek", "minimax", "qwen", "hy4", "ik2")
 # ("qwen": CYBER-FROST-3.8-PS, the Qwen3.8-Flash-Next fine-tune - qwen4exp, on the `maya` engine's own Qwen path)
+# ("ik2": thinkingmachines' Inkling 2 on maya-ik2 - the setup's is Inkling-2-Mini, an experimental preview; the 594B
+#  Inkling-2-Small runs by hand, docs/INKLING2.md)
 MODEL = {"glm": "GLM-5.3-Flash", "deepseek": "DeepSeek-V4.1-Flash-1017", "minimax": "MiniMax-M3.1-Flash",
-         "qwen": "CYBER-FROST-3.8-PS", "hy4": "Hy4-Flash"}   # ("hy4": Tencent's Hy4-flash, on maya-hy4)
+         "qwen": "CYBER-FROST-3.8-PS", "hy4": "Hy4-Flash", "ik2": "Inkling-2-Mini"}   # ("hy4": Tencent's Hy4-flash, on maya-hy4)
 SHOWN = {"glm": "GLM-5.3-Flash", "deepseek": "DeepSeek V4.1", "minimax": "MiniMax M3.1",
-         "qwen": "Qwen-3.8-Flash-Next (CYBER-FROST)", "hy4": "Hy4-Flash"}   # the model's name on screen (the chat header: serve/web/lib.js's
+         "qwen": "Qwen-3.8-Flash-Next (CYBER-FROST)", "hy4": "Hy4-Flash",
+         "ik2": "Inkling 2 Mini"}   # the model's name on screen (the chat header: serve/web/lib.js's
                                                          # modelName(id, true), "Qwen-3.8-Flash-Next"); its ids stay
 SEP = " · "
 
@@ -44,6 +47,14 @@ MODEL_DEFAULTS = {
     # Hy4-flash: tencent/Hy4-flash generation_config.json and card ("Recommended sampling parameters") - temperature
     # 0.9, top_p 1.0, no top-k (its -1); reasoning_effort high its template's default (no_think: direct answers)
     "hy4": ({"temperature": 0.9, "top_p": 1.0}, "high"),
+    # Inkling-2-Small (maya-ik2, docs/INKLING2.md): thinkingmachines' card and files name no sampling (no
+    # generation_config.json), so plain sampling - temperature 1.0, top_p 1.0; "auto" its template's own effort (0.9)
+    "ik2": ({"temperature": 1.0, "top_p": 1.0}, "auto"),
+    # Inkling-2-Mini (the setup's Inkling 2, an experimental preview; model_key "ik2-mini"), its author's values (PR
+    # #1095): thinkingmachines/Inkling-2-Mini's generation_config.json - temperature 1.0, top_p 1.0, no top-k, no
+    # penalties; the level its template's own default, 0.9 - "high" by name (the page offers none / low / medium /
+    # high / max: its xhigh is max's 0.99, and the server reads a client's "minimal" as off, as for every model)
+    "ik2-mini": ({"temperature": 1.0, "top_p": 1.0}, "high"),
     # GLM-5.3 (744B, glm-dsa: model_key "glm53", serve/glm_dsa_product.py): zai-org/GLM-5.3's
     # generation_config.json and card - temperature 1.0, top_p 0.95 (no top-k, min-p or penalties); reasoning_effort
     # low / high / max, max its default.  Its own entry, so that no quant of it takes GLM-5.3-Flash's tuned values
@@ -98,7 +109,23 @@ def model_key(cfg: dict) -> str:
     (family_of), and "glm53" for GLM-5.3 (744B), which shares the "glm" family (engine, server, setup) with
     GLM-5.3-Flash but not its defaults."""
     fam = family_of(cfg)
+    if fam == "ik2" and is_ik2_mini(cfg):
+        return IK2_MINI
     return GLM53 if fam == "glm" and is_glm53(cfg) else fam
+
+
+IK2_MINI = "ik2-mini"
+
+
+def is_ik2_mini(cfg: dict) -> bool:
+    """An Inkling 2 config that runs Inkling-2-Mini (the setup's: its installer record; one written by hand: its
+    model_name or its GGUF's name) rather than Inkling-2-Small."""
+    inst = cfg.get("installer") or {}
+    if inst.get("ik2_quant"):
+        return True
+    args = [str(a) for a in cfg.get("args") or []]
+    gguf = args[args.index("--model") + 1] if "--model" in args[:-1] else ""
+    return "mini" in str(cfg.get("model_name") or "").lower() or "mini" in Path(gguf).name.lower()
 
 
 # The thinking budget (the config's "thinking_budget": tokens, 0 = no limit; the reasoning ends there and the answer
@@ -200,7 +227,8 @@ OTHERS = {("deepseek", "gguf-q8"): "UD-Q8_K_XL", ("deepseek", "gguf-q4"): "UD-Q4
           ("deepseek", "abliterated-256g"): "orcarouter Abliterated Mix-256G",
           ("minimax", "exl3"): "EXL3 3.5 bpw", ("qwen", "q5_k_m"): "Q5_K_M",
           ("qwen", "ud-iq2_xs"): "unsloth UD-IQ2_XS",   # (the base model in unsloth's GGUF: maya.QWEN_UD)
-          ("hy4", "q4_k_m"): "Q4_K_M"}                  # (AngelSlim's Q4_K_M of Hy4-flash: maya.HY4)
+          ("hy4", "q4_k_m"): "Q4_K_M",                  # (AngelSlim's Q4_K_M of Hy4-flash: maya.HY4)
+          ("ik2", "ud-q4_k_xl"): "unsloth UD-Q4_K_XL"}  # (unsloth's GGUF of Inkling-2-Mini: maya.IK2)
 # files of the base model rather than CYBER-FROST: the model's name on screen without "(CYBER-FROST)"
 SHOWN_KEY = {("qwen", "ud-iq2_xs"): "Qwen-3.8-Flash-Next"}
 # CYBER-FROST-3.8-PS: its one GGUF (peasantsmith/CYBER-FROST-3.8-PS-GUFF) - the setup ids it is asked for by
@@ -210,6 +238,10 @@ QWEN_UD_IDS = ("qwen-ud-iq2_xs", "qwen3.8-flash-next-ud-iq2_xs", "qwen3.8-ud-iq2
 # Hy4-flash: AngelSlim's Q4_K_M GGUF (two shards) - the setup ids it is asked for by (the first: the Models page's).
 # "hy4-flash" and "hy4" alone are the model: its files are then asked (Maya's quants and this one), or --hy4-quant
 HY4_IDS = ("hy4-flash-q4_k_m", "hy4-q4_k_m")
+# Inkling-2-Mini (maya-ik2, an experimental preview): unsloth's UD-Q4_K_XL, its one file set - the setup ids it is asked
+# for by (the first: the Models page's)
+IK2_IDS = ("inkling-2-mini", "inkling-2-mini-ud-q4_k_xl", "inkling2-mini", "ik2-mini")
+IK2_QUANT = "ud-q4_k_xl"
 # --mm3-quant also takes the tier as DeepSeek's --ds4-quant does (maya-xs), beside its first names (gguf-xs)
 MM3_QUANT_ALIASES = {"maya-xs": "gguf-xs", "maya-s": "gguf-s"}
 
@@ -246,6 +278,8 @@ def config_stem(family: str, key: str | None) -> str | None:
         return "maya-qwen-ud-iq2_xs" if key == "ud-iq2_xs" else "maya-cyber-frost"
     if family == "hy4" and key == "q4_k_m":            # (AngelSlim's Q4_K_M: the config's name since its first setup)
         return "maya-hy4-flash"
+    if family == "ik2":                                # (Inkling-2-Mini: its one file set)
+        return "maya-inkling-2-mini"
     return f"maya-{setup_id(family, key)}" if family in ("minimax", "hy4") and setup_id(family, key) else None
 
 
@@ -270,6 +304,8 @@ def resolve(name: str, glm_downloads=()) -> tuple | None:
         return "hy4", "q4_k_m"
     if low == "hy4":                                   # (the model by its short name: its files then asked)
         return "hy4", None
+    if low in IK2_IDS:                                 # (Inkling-2-Mini: one file set, unsloth's UD-Q4_K_XL)
+        return "ik2", IK2_QUANT
     for f in ("deepseek", "minimax", "qwen", "hy4"):
         if low == MODEL[f].lower():
             return f, None
@@ -278,13 +314,16 @@ def resolve(name: str, glm_downloads=()) -> tuple | None:
 
 def family_of(cfg: dict) -> str:
     """"minimax" for a MiniMax-M3.1-Flash config (maya-mm3), "qwen" for CYBER-FROST-3.8-PS (the `maya` engine with its
-    n-gram table, --ple-gguf), "hy4" for Hy4-flash (maya-hy4, whose --pack is its own), "deepseek" for a
+    n-gram table, --ple-gguf), "hy4" for Hy4-flash (maya-hy4, whose --pack is its own), "ik2" for Inkling-2-Small
+    (maya-ik2), "deepseek" for a
     DeepSeek-V4.1-Flash config (maya-ds4's --pack: also the configs from before the programs' names of v1.1.16), else
     "glm"."""
     inst = cfg.get("installer") or {}
     exe = Path(str(cfg.get("exe", ""))).name
     if inst.get("family") == "hy4" or exe.startswith("maya-hy4"):
         return "hy4"
+    if inst.get("family") == "ik2" or exe.startswith("maya-ik2"):   # (Inkling-2-Mini: the setup's; Inkling-2-Small: by hand)
+        return "ik2"
     if inst.get("family") == "minimax" or exe.startswith("maya-mm3"):
         return "minimax"
     args = cfg.get("args") or []
@@ -311,6 +350,8 @@ def config_key(cfg: dict) -> str | None:
         return str(inst.get("qwen_quant") or "q5_k_m").lower()
     if fam == "hy4":
         return str(inst.get("hy4_quant") or "q4_k_m").lower()
+    if fam == "ik2":
+        return str(inst.get("ik2_quant") or IK2_QUANT).lower()
     return inst.get("quant")
 
 

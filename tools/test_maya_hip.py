@@ -149,6 +149,24 @@ class HipSetupTests(unittest.TestCase):
         self.assertEqual(cfg["env"]["MAYA_HIPBLASLT_TUNING"],
                          f"{tables / 'gfx1201-glm-hipblaslt-100202.txt'}{os.pathsep}{tables / 'gfx1100-glm-hipblaslt-100202.txt'}")
 
+    def test_gfx1200_card_takes_both_of_its_shipped_tables(self):
+        """An RX 9060 XT ships tables for hipBLASLt 100202 and 100401: setup offers both, in version order, so the
+        engine takes the one its installed hipBLASLt accepts (100401 is the one tuned on the card)."""
+        tables = self.root / "tools/hip"
+        tables.mkdir(parents=True)
+        for version in ("100202", "100401"):
+            (tables / f"gfx1200-glm-hipblaslt-{version}.txt").write_text(
+                f"MAYA_HIPBLASLT_TUNING_V1 gfx1200 {version}\n")
+        card = {"index": 0, "arch": "gfx1200", "vendor": "amd", "name": "AMD Radeon RX 9060 XT", "vram_gb": 16}
+        with patch.object(maya.S, "amd_gpus", return_value=[card]):
+            self.a.gpu = None
+            pc = maya.check_pc(self.a)
+        p = maya.write_config(self.a, pc, {"lib_dirs": [str(self.rocm / "lib")]},
+                              self.root / "pack", "test", 8192, self.root / "data", None)
+        self.assertEqual(maya.read_json(p)["env"]["MAYA_HIPBLASLT_TUNING"].split(os.pathsep),
+                         [str(tables / "gfx1200-glm-hipblaslt-100202.txt"),
+                          str(tables / "gfx1200-glm-hipblaslt-100401.txt")])
+
     def test_config_selects_hip_and_preserves_user_tuning(self):
         pc = maya.check_pc(self.a)
         self.a.env = ["MAYA_GLM_RESERVE_MB=4096"]
@@ -167,7 +185,9 @@ class HipSetupTests(unittest.TestCase):
         # and Qwen setups keep them): a PC set up for its network was back on 127.0.0.1 without a key
         pc = {"backend": "hip", "gpus": [self.gpus[0]]}   # (what check_pc gives; the config's own settings are the point)
         first = maya.write_config(self.a, pc, {}, self.root / "pack", "test", 8192, self.root / "data", None)
-        own = {"host": "0.0.0.0", "api_key": "k", "cors_origins": ["http://x"], "mcp_servers": {"m": {"url": "u"}}}
+        own = {"host": "0.0.0.0", "api_key": "k", "cors_origins": ["http://x"], "mcp_servers": {"m": {"url": "u"}},
+               "model_management": False, "idle_unload_s": 900, "loop_guard": False,
+               "fit_max_tokens": True}   # (#1089: the model management, the idle unload, ... too; --port: given here)
         first.write_text(json.dumps({**maya.read_json(first), **own}))
         again = maya.read_json(maya.write_config(self.a, pc, {}, self.root / "pack", "test", 8192, self.root / "data",
                                                  None))

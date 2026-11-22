@@ -389,12 +389,13 @@ class Picker(unittest.TestCase):
     def test_not_listed_until_published(self):
         got = self.rows()
         self.assertNotIn("Hy4-Flash", got["rows"])
-        self.assertEqual(got["rows"][-1], "Qwen-3.8-Flash-Next")       # (the other rows as before)
+        self.assertEqual(got["rows"][-2:], ["Qwen-3.8-Flash-Next", "Inkling 2 Mini (experimental)"])   # (as before;
+        #  Inkling-2-Mini's preview the last row)
         self.assertEqual(got["family"], "glm")
 
     def test_listed_once_published(self):
         got = self.rows(man=manifest())
-        self.assertEqual(got["rows"][-1], "Hy4-Flash")
+        self.assertEqual(got["rows"][-2:], ["Hy4-Flash", "Inkling 2 Mini (experimental)"])
         about = got["about"]["Hy4-Flash"]
         for part in ("Tencent's Hy4-flash", "Hy4-Flash-Maya-XS (108 GB)", "NVIDIA from V100 on", "Linux or Windows",
                      "pictures (its vision tower", "thinking High or Off", "tool calls", "Tencent's own Q4_K_M (AngelSlim",
@@ -412,7 +413,7 @@ class Picker(unittest.TestCase):
     def test_the_setup_before(self):
         prev = {"exe": "/b/maya-hy4", "args": ["--pack", "/p"], "installer": {"family": "hy4"}}
         got = self.rows(prev=prev)                                    # (set up from a folder before the upload)
-        self.assertEqual((got["rows"][-1], got["family"]), ("Hy4-Flash", "hy4"))
+        self.assertEqual((got["rows"][-2], got["family"]), ("Hy4-Flash", "hy4"))
 
     def test_named(self):
         self.assertEqual(maya.choose_family(args(model=maya.HY4), {}), "hy4")
@@ -1286,6 +1287,22 @@ class Config(unittest.TestCase):
         c = self.write(args(host="0.0.0.0", api_key="s3", port=9001))
         self.assertEqual((c["host"], c["api_key"], c["port"]), ("0.0.0.0", "s3", 9001))
 
+    def test_again_keeps_the_servers_own_settings(self):
+        # #1089: a setup again (an update's) turned "model_management": false back on and the port back to 8080 - every
+        # server setting set by hand stays; a --port / --host / --api-key given now wins
+        own = {"host": "0.0.0.0", "port": 9001, "api_key": "k", "cors_origins": ["*"], "mcp_servers": {"a": 1},
+               "model_management": False, "web_ui": False, "idle_unload_s": 900, "loop_guard": False,
+               "fit_max_tokens": True}
+        self.assertEqual(set(own), set(maya.SERVER_KEYS))
+        ports = []
+        with patch.object(maya, "write_run_script", lambda p, port: ports.append(port) or self.root / "run.sh"):
+            c = self.write(old={"args": ["--pack", "/old"], **own})
+            self.assertEqual({k: c.get(k) for k in own}, own)
+            c = self.write(args(port=9002, api_key="k2"), old={"args": ["--pack", "/old"], **own})
+        self.assertEqual((c["port"], c["api_key"], c["host"], c["model_management"]), (9002, "k2", "0.0.0.0", False))
+        self.assertEqual(ports, [9001, 9002])                         # (the start script: the config's port)
+        self.assertEqual(self.write(old={"args": ["--pack", "/old"]})["port"], 8080)
+
 
 class Steps(unittest.TestCase):
     def test_from_a_folder_with_the_files(self):
@@ -1383,6 +1400,15 @@ MTP_FILE = "Hy4-Flash-mtp-BF16.gguf"
 DFLY_FILE = "Hy4-Flash-Maya-XS-drafter.dfly2"
 
 
+def draft_flag(c: dict) -> str:
+    """A config's drafting as its args give it the engine: auto / on (--drafting: measured by the engine), mtp, dfly2
+    (by name) or none."""
+    args = c["args"]
+    if "--drafting" in args:
+        return args[args.index("--drafting") + 1]
+    return "mtp" if "--mtp" in args else "dfly2" if "--dfly2" in args else "none"
+
+
 class Drafts(unittest.TestCase):
     """A Maya size drafts with Tencent's MTP block from its own file: the table's entry, its VRAM, the setup's choice
     (on where the block fits beside the model's own parts and a picture's room; --drafting off, and a setup again
@@ -1411,6 +1437,24 @@ class Drafts(unittest.TestCase):
         self.assertAlmostEqual(maya.hy4_config_need_gib("maya-xs", "standard", 32768, mtp=True),
                                base + maya.hy4_mtp_gib(), places=6)
         self.assertEqual(maya.hy4_config_need_gib("maya-xs", "standard", 32768, mtp=False), base)
+
+    def test_the_engines_count_of_the_drafters(self):
+        # the engine counts the room of the drafters a pack holds with drafting on and off, and one drafter runs at
+        # a time: with the MTP block and the DFly2 drafter, the larger room once (src/hy4 load())
+        base = maya.hy4_config_need_gib("maya-xs", "standard", 32768)
+        both = maya.hy4_config_need_gib("maya-xs", "standard", 32768, mtp=True, dfly2=True)
+        self.assertAlmostEqual(both, base + max(maya.hy4_mtp_gib(), maya.hy4_dfly2_gib("maya-xs")), places=6)
+        self.assertAlmostEqual(both, maya.hy4_config_need_gib("maya-xs", "standard", 32768, mtp=True), places=6)
+        # the block's claim as the DFly2 drafter's: the fit's figure, the block, the margin where the figure is a
+        # measured one (a start with the block beside it never was) - none on a card whose room the engine measured
+        fit = {"layout": "standard", "context": 32768, "need": 9.83, "kv": "f16"}
+        self.assertAlmostEqual(maya.hy4_mtp_need_gib("maya-xs", fit),
+                               9.83 + maya.hy4_mtp_gib() + maya.HY4_FIT_MARGIN_GIB, places=6)
+        self.assertAlmostEqual(maya.hy4_mtp_need_gib("maya-xs", dict(fit, room_measured=True)),
+                               9.83 + maya.hy4_mtp_gib(), places=6)
+        self.assertAlmostEqual(maya.hy4_mtp_need_gib("maya-xs", dict(fit, chunk=4096)),
+                               9.83 + maya.HY4_CHUNK_UP_GIB + maya.hy4_mtp_gib(4096) + maya.HY4_FIT_MARGIN_GIB,
+                               places=6)                                   # (its rows at the fit's chunk)
 
     def test_the_packs_file(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1504,12 +1548,16 @@ class Drafts(unittest.TestCase):
     def test_on_where_the_block_fits(self):
         c, text, cmd = self.set_up(32)
         self.assertEqual(cmd[cmd.index("--mtp") + 1], MTP_FILE)
-        self.assertIn("--mtp", c["args"])
+        # (the block or no drafting: the engine measures which decodes faster at its first start on the PC)
+        self.assertEqual(draft_flag(c), "auto")
+        self.assertNotIn("--mtp", c["args"])
         self.assertEqual((c["installer"]["drafting"], c["installer"]["draft_block"], c["installer"]["layout"]),
                          ("on", True, "standard"))
-        self.assertIn("drafting: Tencent's MTP block drafts tokens and the model checks every one", text)
-        self.assertNotIn("the same answers", text)
-        self.assertNotIn("--draft", [x for x in c["args"] if x != "--mtp"])   # (the engine's own draft length)
+        self.assertIn("drafting: auto - the MTP block fits here", text)
+        self.assertIn("whether the MTP block or no drafting decodes faster", text)
+        self.assertTrue(maya.hy4_engine_drafting(c))
+        self.assertFalse(maya.needs_speed_calibration(c))
+        self.assertNotIn("--draft", c["args"])   # (the engine's own draft length)
         # --drafting off: the block stays in the pack (the Models page's switch), no --mtp; a setup again keeps the
         # choice; --drafting on drafts again
         c, text, cmd = self.set_up(32, prev=c, drafting="off")
@@ -1519,15 +1567,22 @@ class Drafts(unittest.TestCase):
         self.assertIn("drafting: off (--drafting on", text)
         c, text, _ = self.set_up(32, prev=c)
         self.assertNotIn("--mtp", c["args"])
+        self.assertEqual(draft_flag(c), "none")
+        # (--drafting on by hand: drafting, the faster drafter the engine finds - here the block, the only one)
         c, text, _ = self.set_up(32, prev=c, drafting="on")
-        self.assertIn("--mtp", c["args"])
+        self.assertEqual(draft_flag(c), "on")
+        self.assertIn("drafting: Tencent's MTP block drafts tokens and the model checks every one", text)
+        # by name: that one, nothing measured
+        c, text, _ = self.set_up(32, prev=c, drafting="mtp")
+        self.assertEqual(draft_flag(c), "mtp")
+        self.assertFalse(maya.hy4_engine_drafting(c))
 
     def test_a_config_from_before_the_block(self):
         # (a config written when these files had no drafting: its "off" was no choice)
         prev = {"args": ["--pack", "/p", "--max-context", "32768"],
                 "installer": {"family": "hy4", "hy4_quant": "maya-xs", "layout": "standard", "drafting": "off"}}
         c, _, _ = self.set_up(32, prev=prev)
-        self.assertIn("--mtp", c["args"])
+        self.assertEqual(draft_flag(c), "auto")
 
     def test_off_where_it_does_not_fit(self):
         # a 12 GB card: the model's own parts at 32K and the block together are more than the card has - the block is
@@ -1559,11 +1614,11 @@ class Drafts(unittest.TestCase):
         # a 12 GB card: no room for the block, room for the DFly2 drafter - packed, --dfly2, drafting on
         c, text, cmd = self.set_up(12, published=True, dfly=True)
         self.assertEqual((cmd[cmd.index("--mtp") + 1], cmd[cmd.index("--drafter") + 1]), ("none", DFLY_FILE))
-        self.assertIn("--dfly2", c["args"])
+        self.assertEqual(draft_flag(c), "auto")   # (it or no drafting: measured by the engine)
         self.assertNotIn("--mtp", c["args"])
         self.assertEqual((c["installer"]["drafting"], c["installer"]["dfly2"]), ("on", True))
         self.assertNotIn("draft_block", c["installer"])
-        self.assertIn("drafting: Tencent's DFly2 drafter drafts tokens and the model checks every one", text)
+        self.assertIn("drafting: auto - the DFly2 drafter fits here", text)
         self.assertIn("(the MTP block: the draft block needs about", text)
         # --drafting off: the drafter stays in the pack, no --dfly2, a setup again keeps it off; --drafting on again
         c, text, _ = self.set_up(12, published=True, dfly=True, prev=c, drafting="off")
@@ -1573,7 +1628,7 @@ class Drafts(unittest.TestCase):
         c, _, _ = self.set_up(12, published=True, dfly=True, prev=c)
         self.assertNotIn("--dfly2", c["args"])
         c, _, _ = self.set_up(12, published=True, dfly=True, prev=c, drafting="on")
-        self.assertIn("--dfly2", c["args"])
+        self.assertEqual(draft_flag(c), "on")
         # --drafting mtp: the block alone - off on this card, said
         c, text, cmd = self.set_up(12, published=True, dfly=True, drafting="mtp")
         self.assertEqual(cmd[cmd.index("--drafter") + 1], "none")
@@ -1581,23 +1636,28 @@ class Drafts(unittest.TestCase):
         self.assertIn("drafting: off - the draft block needs about", text)
 
     def test_both_fit(self):
-        # where both fit, both are packed and the size's rule drafts until the speed calibration measures (once, at a
-        # start); a setup again keeps what it measured; --no-speed-calibration: the rule, recorded as chosen
+        # where both fit, both are packed and --drafting auto: the engine measures no drafting, the block and DFly2
+        # once at its first start on the PC (each with its own plan) - nothing for the setup's speed calibration; a
+        # config from before (--mtp / --dfly2 by the size's rule) keeps the old A/B; --no-speed-calibration: recorded
         c, text, cmd = self.set_up(32, dfly=True)
         self.assertEqual((cmd[cmd.index("--mtp") + 1], cmd[cmd.index("--drafter") + 1]), (MTP_FILE, DFLY_FILE))
         rule = maya.HY4_DRAFT_RULE["maya-xs"]
-        self.assertIn("--dfly2" if rule == "dfly2" else "--mtp", c["args"])
-        self.assertNotIn("--mtp" if rule == "dfly2" else "--dfly2", c["args"])
+        self.assertEqual(draft_flag(c), "auto")
+        self.assertNotIn("--mtp", c["args"])
+        self.assertNotIn("--dfly2", c["args"])
         self.assertEqual({k: c["installer"].get(k) for k in ("draft_choice", "drafter", "draft_block", "dfly2")},
                          {"draft_choice": "auto", "drafter": rule, "draft_block": True, "dfly2": True})
         self.assertIn("both fit here", text)
-        self.assertTrue(maya.hy4_both_drafters(c) and maya.needs_speed_calibration(c))
-        c["installer"]["speed_calibration"] = {"date": "d", "kept": "mtp" if rule == "dfly2" else "dfly2"}
+        self.assertIn("whether no drafting, the MTP block or the DFly2 drafter decodes fastest", text)
+        self.assertTrue(maya.hy4_both_drafters(c) and maya.hy4_engine_drafting(c))
         self.assertFalse(maya.needs_speed_calibration(c))
-        c2, text, _ = self.set_up(32, dfly=True, prev=c)
-        self.assertEqual(c2["installer"]["drafter"], c["installer"]["speed_calibration"]["kept"])
-        self.assertEqual(c2["installer"]["speed_calibration"], c["installer"]["speed_calibration"])
-        self.assertIn("the faster of the two on this PC", text)
+        old = dict(c, args=[x for x in c["args"] if x not in ("--drafting", "auto")] + ["--" + rule])
+        self.assertTrue(maya.needs_speed_calibration(old))
+        old["installer"] = dict(old["installer"], speed_calibration={"date": "d", "kept": "mtp" if rule == "dfly2" else "dfly2"})
+        self.assertFalse(maya.needs_speed_calibration(old))
+        c2, text, _ = self.set_up(32, dfly=True, prev=old)
+        self.assertEqual(draft_flag(c2), "auto")
+        self.assertIn("drafting: auto", text)
         c3, _, _ = self.set_up(32, dfly=True, no_speed_calibration=True)
         self.assertEqual(c3["installer"]["speed_calibration"]["skipped"], "chosen")
         self.assertFalse(maya.needs_speed_calibration(c3))
@@ -1619,9 +1679,25 @@ class Drafts(unittest.TestCase):
         self.assertEqual(c["installer"]["draft_choice"], "mtp")
         self.assertFalse(maya.needs_speed_calibration(c))
 
-    def test_speed_calibration(self):
-        # the A/B: MTP block first, then DFly2; the faster is kept, a tie keeps the size's rule
+    def test_speed_calibration_by_the_engine(self):
+        # --drafting auto: the measured drafting forgotten, one engine start (the CPU lane check's) measures it again
         c, _, _ = self.set_up(32, dfly=True)
+        p = Path(self.tmp.name) / "maya-hy4-flash-maya-xs.json"
+        p.write_text(json.dumps(c))
+        ran = []
+        with patch.object(maya, "draft_forget", lambda: ran.append("forget")), \
+                patch.object(maya, "route_forget", lambda: None), patch.object(maya, "hot_forget", lambda cfg: None), \
+                patch.object(maya, "q4x_calibration", lambda path, why="": ran.append("start") or True), \
+                patch.object(maya.CD, "run", lambda *a, **k: self.fail("the setup's A/B ran")):
+            self.assertTrue(maya.speed_calibration(p, "asked for"))
+        self.assertEqual(ran, ["forget", "start"])
+        self.assertEqual(draft_flag(json.loads(p.read_text())), "auto")
+
+    def test_speed_calibration(self):
+        # a config from before v1.1.71 (--mtp / --dfly2 by the size's rule): the A/B - MTP block first, then DFly2;
+        # the faster is kept, a tie keeps the size's rule
+        c, _, _ = self.set_up(32, dfly=True)
+        c["args"] = [x for x in c["args"] if x not in ("--drafting", "auto")] + ["--" + maya.HY4_DRAFT_RULE["maya-xs"]]
         p = Path(self.tmp.name) / "maya-hy4-flash-maya-xs.json"
         for o, d, want in ((30.0, 36.0, "dfly2"), (36.0, 30.0, "mtp"), (30.0, 30.3, maya.HY4_DRAFT_RULE["maya-xs"])):
             p.write_text(json.dumps(c))
@@ -1650,8 +1726,7 @@ class Drafts(unittest.TestCase):
         c, text, cmd = self.set_up(12, published=True, dfly=True, gpus=2)
         self.assertEqual(cmd[cmd.index("--drafter") + 1], "none")
         self.assertNotIn("--dfly2", c["args"])
-        if "--mtp" not in c["args"]:
-            self.assertIn("the DFly2 drafter runs on one GPU for now (this PC: 2)", text)
+        self.assertIn("the DFly2 drafter runs on one GPU for now (this PC: 2)", text)
 
     def test_dfly2_where_the_engine_loads_it(self):
         # the engine loads the drafter only where its room changes nothing but the experts' places: the setup counts
@@ -1690,7 +1765,7 @@ class Drafts(unittest.TestCase):
         self.assertEqual(got[0][2], f"https://huggingface.co/{TABLE['repo']}/resolve/{'d' * 40}/{MTP_HUB}")
         self.assertIn("one file for every size", got[0][0])
         self.assertEqual(cmd[cmd.index("--mtp") + 1], MTP_FILE)
-        self.assertIn("--mtp", c["args"])
+        self.assertEqual(draft_flag(c), "auto")
 
     def test_linked_from_another_size(self):
         man, _ = stand_ins()
@@ -1775,7 +1850,7 @@ class FastDrafting(unittest.TestCase):
                       "the default (./maya.sh --setup --fast-drafting on)".replace("./maya.sh", maya.ME), text)
         # a free card: the drafter fits beside the F16 rows - the default drafts, nothing offered
         c, text, _ = self.set_up(76)
-        self.assertEqual(("--dfly2" in c["args"], "--kv" in c["args"]), (True, False))
+        self.assertEqual((draft_flag(c), "--kv" in c["args"]), ("auto", False))
         self.assertNotIn("fast-drafting", text)
 
     def test_on(self):
@@ -1952,12 +2027,60 @@ class WindowsRoom(unittest.TestCase):
             self.assertIsNone(maya.hy4_room_due(self.CFG, gpus=gl, saved={maya.hy4_room_key(gl[0]): {"own_gib": 0.5}},
                                                 probe=pr))
             self.assertIsNone(maya.hy4_room_due(self.CFG, gpus=gl, saved={}, probe={}))   # (no reading: no figure)
-            for cfg in (dict(self.CFG, gpu=[0, 1]), dict(self.CFG, gpu=None), dict(self.CFG, gpu=[3]),
+            for cfg in (dict(self.CFG, gpu=None), dict(self.CFG, gpu=[3]), dict(self.CFG, gpu=[0, 3]),
                         dict(self.CFG, exe="C:/Maya/build/maya-ds4.exe"), dict(self.CFG, backend="hip")):
                 self.assertIsNone(maya.hy4_room_due(cfg, gpus=gl, saved={}, probe=pr), cfg)
+            # (several cards: each one, measured in one start on all of them - unless they have a record together)
+            both = maya.hy4_room_due(dict(self.CFG, gpu=[0, 1]), gpus=gl, saved={}, probe=pr)
+            self.assertEqual([c["index"] for c in both["cards"]], [0, 1])
+            self.assertIsNotNone(maya.hy4_room_due(dict(self.CFG, gpu=[0, 1]), gpus=gl, probe=pr,
+                                                   saved={maya.hy4_room_key(gl[0]): {"own_gib": 0.5}}))
+            self.assertIsNone(maya.hy4_room_due(dict(self.CFG, gpu=[0, 1]), gpus=gl, probe=pr,
+                                                saved={maya.hy4_room_set_key(gl): {"cards": {}}}))
+            self.assertIsNone(maya.hy4_room_due(dict(self.CFG, gpu=[0, 1]), gpus=gl, saved={},
+                                                probe={"0000:01:00.0": self.URANUS}))   # (one card not read)
             self.assertIsNone(maya.hy4_room_due(self.CFG, gpus=[dict(gl[0], unified_memory=True)], saved={}, probe=pr))
         with patch.object(maya, "WIN", False):
             self.assertIsNone(maya.hy4_room_due(self.CFG, gpus=gl, saved={}, probe=pr))
+
+    def test_several_cards_each_measured_in_one_start(self):
+        # two RTX 3050 8 GB under Windows, the 8 GB layout split over both at 8K: the engine's --room-report says how
+        # much less free on both at once its choices hold with (room_joint); the cards' shares together are the
+        # setup's sums + 2 x that - what the probe saw, each card's by what the start takes on it
+        cfg = dict(self.CFG, gpu=[0, 1])
+        gl = self.pc(n=2)["gpus"]
+        probe = {"0000:01:00.0": self.URANUS, "0000:02:00.0": (7356038656, 7284735488, 8589410304)}
+        info = {"room_rows": "f16", "room_drafter": 0, "room_mtp": 0, "room_streamed": 0, "room_tp": 0,
+                "room_gpus": "0000:01:00.0,7556038656,4294967296;0000:02:00.0,7356038656,4294967296",
+                "room_joint": str(2 * 2**30)}                                  # (each alone 4 GiB, both at once 2)
+        with patch.object(maya, "WIN", True):
+            due = maya.hy4_room_due(cfg, gpus=gl, saved={}, probe=probe)
+            rec = maya.hy4_room_measure(cfg, due, info, probe=AssertionError("not asked"))
+            self.assertIsNone(maya.hy4_room_due(cfg, gpus=gl, probe=AssertionError("not asked")))
+            self.assertIsNotNone(maya.hy4_room_due(self.CFG, gpus=gl, probe=probe))   # (GPU 0 alone: its own)
+        need = maya.hy4_config_need_gib("maya-xs", "8gb", 8192, chunk=256, reserve_gb=0.5, margin=False)
+        seen = [self.URANUS[0] / 2**30, 7356038656 / 2**30]
+        takes = [x - 2.0 for x in seen]
+        own = [t * (need / sum(takes) - 1.0) for t in takes]
+        self.assertEqual(list(rec["cards"]), [maya.S._pci_key("00000000:01:00.0"), maya.S._pci_key("00000000:02:00.0")])
+        for got, want in zip(rec["cards"].values(), own):
+            self.assertAlmostEqual(got, want, places=3)
+        self.assertAlmostEqual(sum(rec["cards"].values()), need + 2 * 2.0 - sum(seen), places=2)
+        self.assertEqual(list(maya.hy4_room_load()), [maya.hy4_room_set_key(gl)])
+        # the setup counts each card's share for these two together; a start on one of them alone is not measured yet
+        pc = self.pc(n=2)
+        got = self.room(pc, probe)
+        self.assertEqual([g["engine_room_how"] for g in pc["gpus"]], ["measured", "measured"])
+        self.assertAlmostEqual(got[0], seen[0] + own[0], places=3)
+        self.assertAlmostEqual(got[1], seen[1] + own[1], places=3)
+        one = self.pc()
+        self.room(one, {"0000:01:00.0": self.URANUS})
+        self.assertEqual(one["gpus"][0]["engine_room_how"], "estimated")
+        # a start that streams its cache, an engine without room_joint, a share out of all reason: not kept
+        for bad in ({"room_streamed": 1}, {"room_joint": None}, {"room_joint": str(int(7.0 * 2**30))}):
+            i2 = {k: v for k, v in dict(info, **bad).items() if v is not None}
+            with patch.object(maya, "WIN", True):
+                self.assertIsNone(maya.hy4_room_measure(cfg, due, i2, save=False), bad)
 
     def test_measured_on_windows_only(self):
         one, two, tot = self.URANUS
@@ -2048,8 +2171,8 @@ class WindowsRoom(unittest.TestCase):
         # at 4K: claimed and written
         c, text, _ = Drafts.set_up(self, 8, block=False, dfly=True, dfly_gib=self.G, small=True, used=76, context=4096,
                                    revision=TABLE["revision"], room=self.URANUS)
-        self.assertIn("--dfly2", c["args"])
-        self.assertIn("drafting: Tencent's DFly2 drafter drafts tokens", text)
+        self.assertEqual(draft_flag(c), "auto")
+        self.assertIn("drafting: auto - the DFly2 drafter fits here", text)
 
 
 def hy4_cfg(d: Path, mtp: bool = True, n_mtp: int = 1, vision: bool = False) -> dict:
@@ -2092,17 +2215,18 @@ class Names(unittest.TestCase):
         self.assertEqual(maya.choose_family(b, {}), "hy4")
 
     def test_the_setups_picker(self):
-        """The model picker: Hy4-flash's row last, one row a family (the picker's keys and its rows line up)."""
+        """The model picker: Hy4-flash's row before Inkling-2-Mini's (the last), one row a family (the picker's keys
+        and its rows line up)."""
         rows = []
 
         def pick(title, intro, opts, default, yes, *x):
             rows.extend(opts)
-            return len(opts) - 1
+            return len(opts) - 2
         a = type("A", (), {"model": None, "gguf_dir": None, "draft": None, "model_dir": None, "yes": True})()
         with patch.object(maya, "choose", pick), patch.object(maya.S, "gpus", return_value=[]):
             self.assertEqual(maya.choose_family(a, {}), "hy4")
         self.assertEqual(len(rows), len(maya.FAMILIES) + 1)   # (GLM-5.3 (744B): a row of the "glm" family)
-        label, note, about = rows[-1]
+        label, note, about = rows[-2]
         self.assertEqual(label, "Hy4-Flash")
         self.assertIn("Q4_K_M", about)
         self.assertIn("pictures", about)
@@ -2315,7 +2439,7 @@ class Dashboard(unittest.TestCase):
         from serve import models as M
         with tempfile.TemporaryDirectory() as t:
             cfg = hy4_cfg(Path(t))
-            self.assertEqual(M.choices(cfg), {"draft": ["mtp", "none"], "images": False,
+            self.assertEqual(M.choices(cfg), {"draft": ["auto", "mtp", "none"], "images": False,
                                               "ablate": {"available": False, "why": "not available for this model"}})
             s = M.settings_of(cfg)
             self.assertEqual((s["draft"], s["tp"], s["reserve_gb"], s["prefill_chunk"], s["images"]),
@@ -2344,7 +2468,7 @@ class Dashboard(unittest.TestCase):
             cfg = hy4_cfg(Path(t), mtp=False)
             with (M.pack_of(cfg) / "hy4.txt").open("a") as f:
                 f.write("dfly_layers 5\n")
-            self.assertEqual(M.choices(cfg)["draft"], ["mtp", "dfly2", "none"])
+            self.assertEqual(M.choices(cfg)["draft"], ["auto", "mtp", "dfly2", "none"])
             self.assertEqual(M.settings_of(cfg)["draft"], "none")
             on = M.apply(cfg, {"draft": "dfly2"})
             self.assertEqual(on["args"][-1], "--dfly2")
@@ -2352,6 +2476,12 @@ class Dashboard(unittest.TestCase):
             mtp = M.apply(on, {"draft": "mtp"})
             self.assertEqual((mtp["args"][-1], "--dfly2" in mtp["args"]), ("--mtp", False))
             self.assertNotIn("--dfly2", M.apply(on, {"draft": "none"})["args"])
+            # auto: --drafting auto (the engine measures none / MTP / DFly2 once on this PC) in place of either flag
+            auto = M.apply(on, {"draft": "auto"})
+            self.assertEqual((auto["args"][-2:], "--dfly2" in auto["args"], M.settings_of(auto)["draft"]),
+                             (["--drafting", "auto"], False, "auto"))
+            back = M.apply(auto, {"draft": "mtp"})
+            self.assertEqual(("--drafting" in back["args"], "--mtp" in back["args"]), (False, True))
 
     def test_models_page_images(self):
         """A pack with the vision tower: Images on by default (no flag), off writes --vision off, on drops it."""
@@ -2486,6 +2616,199 @@ class Q4xCheck(unittest.TestCase):
                 self.assertNotIn("HY4_Q4X", c.get("env") or {})        # (the engine remembers it, not the config)
                 self.assertEqual(c["installer"]["q4x_calibration"]["result"], "on" if want else "off")
                 self.assertIs(maya.q4x_config_migrate(Path(t) / "maya-hy4-flash-maya-xs.json", c), c)
+
+    def test_the_prompt_route_measured_once_per_pc(self):
+        """maya-hy4's prompt route (a chunk's experts outside VRAM streamed to the GPU or on the CPU lane) goes by two
+        rates measured once per PC and remembered in the data folder (the server names the file); --speed-calibration
+        drops them and its engine run measures them again on long prompts, each its own."""
+        import serve.server as SV
+        with tempfile.TemporaryDirectory() as t:
+            self.assertEqual(SV.child_env(self.cfg(Path(t)))["HY4_ROUTE_FILE"],
+                             str(SV.ROOT / "data" / "hy4-prompt-route.txt"))
+        self.assertNotIn("HY4_ROUTE_FILE", SV.child_env({"exe": "/b/maya", "args": ["--glm-pack", "/p"]}))
+        self.assertEqual(maya.route_state("maya-hy4: prompt route: the CPU lane 9.10 us an expert-token"), "measured")
+        self.assertEqual(maya.route_state("INFO prompt route: measured on this PC while prompts are read"), "measuring")
+        self.assertEqual(maya.route_state("INFO prompt route: by the rates measured on this PC (2026-11-20"),
+                         "remembered")
+        self.assertEqual(maya.route_state("INFO prompt route: pinned - ..."), "pinned")
+        self.assertIsNone(maya.route_state("INFO every routed expert in VRAM"))
+        with tempfile.TemporaryDirectory() as t:
+            root = Path(t)
+            (root / "docs").mkdir()
+            (root / "docs" / "SETTINGS.md").write_text("word " * 6000)
+            (root / "data").mkdir()
+            (root / "data" / "hy4-prompt-route.txt").write_text("old\n")
+            with patch.object(maya, "ROOT", root), patch.object(maya, "ok"):
+                maya.route_forget()
+            self.assertFalse((root / "data" / "hy4-prompt-route.txt").exists())
+            p = root / "maya-hy4-flash-maya-xs.json"
+            p.write_text(json.dumps(self.cfg(root)))
+            seen = {"gens": []}
+
+            class Engine:
+                def __init__(self, cmd, stdin=None, stdout=None, stderr=None, env=None, **kw):
+                    seen["env"] = env
+                    stderr.write("INFO every routed expert of IQ2_XS\nINFO prompt route: measured on this PC while "
+                                 "prompts are read\n")
+                    stderr.flush()
+                    self.err = stderr
+                    eng = self
+
+                    class In(io.StringIO):
+                        def write(self, s):
+                            seen["gens"].append(s.split(" ")[1] if s.startswith("GEN") else s)
+                            if len(seen["gens"]) == 3:   # (the second long prompt: the rates settle)
+                                eng.err.write("maya-hy4: prompt route: the CPU lane 9.10 us an expert-token\n")
+                                eng.err.flush()
+                            return len(s)
+                    self.stdin = In()
+                    self.stdout = iter(["READY\n"] + ["DONE 1 30 1 1 length\n"] * 8)
+
+                def wait(self, timeout=None):
+                    return 0
+
+            class Tok:
+                @staticmethod
+                def from_dir(d):
+                    return SimpleNamespace(encode=lambda s, parse_special=False: [1, 2, 3])
+            said = []
+            with patch.object(maya.subprocess, "Popen", Engine), patch.object(maya, "busy_skip", return_value=False), \
+                    patch.object(maya.time, "sleep"), patch.object(maya, "ok", said.append), \
+                    patch.object(maya, "warn", said.append), patch.object(maya, "say"), \
+                    patch.object(maya, "ROOT", root), \
+                    patch.dict(sys.modules, {"strata_tokenizer": SimpleNamespace(Tokenizer=Tok)}), \
+                    patch.object(maya, "bench_chat", return_value=lambda q: q):
+                maya.q4x_calibration(p)
+            self.assertEqual(seen["env"]["HY4_ROUTE_MEASURE"], "1")
+            self.assertEqual(seen["gens"][:3], ["64", "1", "1"])        # (the warm-up answer, then long prompts)
+            self.assertNotIn("1", seen["gens"][3:4])                   # (none after the rates settled)
+            self.assertTrue(any("prompt route's rates" in s and "measured on this PC" in s for s in said))
+
+    def test_the_first_start_measures_on_the_docs_text(self):
+        """maya-hy4 measures a PC's 4-bit copies and prompt route at its first start there before it says READY, on
+        real text: the server gives it this install's docs in the model's tokens (HY4_MEASURE_IDS), a file a tokenizer
+        in the data folder, written once.  No tokenizer, or too little text: no file - the answers measure, as before."""
+        import serve.server as SV
+        calls = []
+
+        class Tok:
+            @staticmethod
+            def from_dir(d):
+                return SimpleNamespace(encode=lambda s: calls.append(len(s)) or list(range(9000)))
+        with tempfile.TemporaryDirectory() as t:
+            root = Path(t)
+            (root / "docs").mkdir()
+            (root / "docs" / "SETTINGS.md").write_text("word " * 60000)
+            (root / "README.md").write_text("readme " * 10)
+            c = self.cfg(root)
+            with patch.object(SV, "ROOT", root), \
+                    patch.dict(sys.modules, {"strata_tokenizer": SimpleNamespace(Tokenizer=Tok)}):
+                self.assertNotIn("HY4_MEASURE_IDS", SV.child_env(c))          # (no vocab.json: no tokenizer)
+                (Path(c["tokenizer"]) / "vocab.json").write_text('{"a": 0}')
+                ids = Path(SV.child_env(c)["HY4_MEASURE_IDS"])
+                self.assertEqual(ids.parent, root / "data")
+                self.assertTrue(ids.name.startswith("hy4-measure-ids-"))
+                body = ids.read_text(encoding="utf-8").splitlines()
+                self.assertTrue(body[0].startswith("# maya:"))
+                self.assertEqual(body[1].split(",")[:3], ["0", "1", "2"])
+                self.assertEqual(len(body[1].split(",")), 9000)
+                self.assertEqual(len(calls), 1)                                # (the docs, cut to their share)
+                self.assertTrue(SV.HY4_MEASURE_CHARS <= calls[0] < SV.HY4_MEASURE_CHARS + 8)
+                self.assertEqual(SV.child_env(c)["HY4_MEASURE_IDS"], str(ids))  # (written once: not tokenized again)
+                self.assertEqual(len(calls), 1)
+                self.assertNotIn("HY4_MEASURE_IDS", SV.child_env({"exe": "/b/maya", "args": ["--glm-pack", "/p"]}))
+                ids.unlink()
+                Tok.from_dir = staticmethod(lambda d: SimpleNamespace(encode=lambda s: [1, 2, 3]))
+                self.assertNotIn("HY4_MEASURE_IDS", SV.child_env(c))          # (too little text: none)
+
+    def test_the_drafting_trial_answers_chat_requests(self):
+        """--drafting auto: the server names the drafting file (HY4_DRAFT_FILE) and gives the trial requests in the
+        model's chat template (HY4_DRAFT_IDS: a line of ids each, written once); no --drafting: no requests."""
+        import serve.server as SV
+        seen = []
+
+        class Tok:
+            @staticmethod
+            def from_dir(d):
+                return SimpleNamespace(encode=lambda s, parse_special=False: seen.append((s, parse_special)) or [7, 8, 9])
+
+        class Chat:
+            def __init__(self, path):
+                pass
+
+            def render(self, msgs, enable_thinking=True):
+                return f"<u>{msgs[0]['content']}<a>{enable_thinking}"
+        with tempfile.TemporaryDirectory() as t:
+            root = Path(t)
+            c = self.cfg(root)
+            c["args"] = c["args"] + ["--drafting", "auto"]
+            (Path(c["tokenizer"]) / "vocab.json").write_text('{"a": 0}')
+            with patch.object(SV, "ROOT", root), \
+                    patch.dict(sys.modules, {"strata_tokenizer": SimpleNamespace(Tokenizer=Tok)}), \
+                    patch("serve.frontend.ChatTemplate", Chat):
+                (Path(c["tokenizer"]) / "chat_template.jinja").write_text("{{ x }}")
+                env = SV.child_env(c)
+                self.assertEqual(env["HY4_DRAFT_FILE"], str(SV.HY4_DRAFT_FILE))
+                ids = Path(SV.child_env(c)["HY4_DRAFT_IDS"])
+                self.assertTrue(ids.name.startswith("hy4-draft-ids-") and ids.parent == root / "data")
+                body = ids.read_text(encoding="utf-8").splitlines()
+                self.assertEqual((body[0][:7], body[1:]), ("# maya:", ["7,8,9"] * len(SV.HY4_DRAFT_QS)))
+                chats = [s for s, p in seen if p]                              # (the template's tokens; the
+                self.assertEqual(len(chats), len(SV.HY4_DRAFT_QS))             #  others: the docs text's)
+                self.assertTrue(all(s.endswith("<a>False") for s in chats))    # (thinking off)
+                self.assertEqual(SV.child_env(c)["HY4_DRAFT_IDS"], str(ids))   # (written once)
+                self.assertEqual(len([p for _, p in seen if p]), len(SV.HY4_DRAFT_QS))
+                c["args"] = [x for x in c["args"] if x not in ("--drafting", "auto")]
+                self.assertNotIn("HY4_DRAFT_IDS", SV.child_env(c))
+
+    def test_the_first_start_says_it_measures_this_pc_once_and_roughly_how_long(self):
+        import serve.server as SV
+        trial = ("maya-hy4: measuring this PC once, before the first answer: drafting (no drafting, the MTP block, the "
+                 "DFly2 drafter: a load and 3 short answers each) - on 56132 tokens of text; remembered, the next "
+                 "starts skip it")
+        self.assertIn("which drafting answers fastest - 3 choices", SV.hy4_measure_said(trial))
+        self.assertIn(SV.HY4_TRIAL_TIME[3], SV.hy4_measure_said(trial))
+        two = trial.replace("no drafting, the MTP block, the DFly2 drafter", "no drafting, the MTP block")
+        self.assertIn(SV.HY4_TRIAL_TIME[2], SV.hy4_measure_said(two))
+        lane = ("maya-hy4: measuring this PC once, before the first answer: the CPU lane's 4-bit expert copies (a "
+                "decode of up to 728 tokens), then the prompt route (up to 10 chunks of 4096 tokens) - on 56132 tokens")
+        self.assertIn("4-bit copies and the prompt route, roughly " + SV.HY4_LANE_TIME, SV.hy4_measure_said(lane))
+        m = SV.HY4_MEASURE_LEFT.search("maya-hy4: measuring this PC: 2 of 3 choices done in 74 s - about 37 s more")
+        self.assertEqual(m.groups(), ("2", "3", "37"))
+        import setup_bridge as SB                      # (the setup's screen says the same)
+        self.assertEqual((SB.HY4_TRIAL_TIME, SB.HY4_LANE_TIME), (SV.HY4_TRIAL_TIME, SV.HY4_LANE_TIME))
+        cfg = {"family": "hy4", "args": ["--pack", "p", "--drafting", "auto"]}
+        with patch.object(maya, "config_family", return_value="hy4"):
+            said = " ".join(maya.hy4_first_start_said(cfg))
+            self.assertIn("measures it once before it is ready: which drafting answers fastest", said)
+            self.assertIn("roughly one to two minutes", said)
+            self.assertNotIn("drafting", " ".join(maya.hy4_first_start_said(dict(cfg, args=["--mtp"]))))
+
+    def test_the_hot_experts_file_is_kept_until_a_calibration(self):
+        """maya-hy4's HY4_HOT (on by default) places a start's experts in VRAM by scores the first start learns and
+        the starts after only read: a file a model in the data folder (not in the model's download), named by the
+        model's folder; --speed-calibration drops this model's file alone, so its run learns it again."""
+        import serve.server as SV
+        with tempfile.TemporaryDirectory() as t:
+            root = Path(t)
+            c = self.cfg(root, args=["--pack", str(root / "Hy4-Flash-Maya-XS" / "maya-hy4"), "--max-context", "8192"])
+            self.assertEqual(SV.child_env(c)["HY4_HOT_FILE"],
+                             str(SV.ROOT / "data" / "hy4-expert-hot-Hy4-Flash-Maya-XS.bin"))
+            self.assertEqual(SV.hy4_hot_file({"args": ["--pack", "/m/My Pack!"]}).name, "hy4-expert-hot-My_Pack.bin")
+            self.assertEqual(SV.hy4_hot_file({"args": []}).name, "hy4-expert-hot-model.bin")
+            self.assertNotIn("HY4_HOT_FILE", SV.child_env({"exe": "/b/maya", "args": ["--glm-pack", "/p"]}))
+            (root / "data").mkdir()
+            mine = root / "data" / "hy4-expert-hot-Hy4-Flash-Maya-XS.bin"
+            other = root / "data" / "hy4-expert-hot-Hy4-Flash-Maya-S.bin"
+            mine.write_bytes(b"HY4HOT1\0")
+            other.write_bytes(b"HY4HOT1\0")
+            said = []
+            with patch.object(maya, "ROOT", root), patch.object(maya, "ok", said.append):
+                maya.hot_forget(c)
+                maya.hot_forget(c)                             # (none left: nothing said)
+            self.assertFalse(mine.exists())
+            self.assertTrue(other.exists())
+            self.assertEqual(len(said), 1)
 
     def test_nothing_to_decide_or_unfinished(self):
         with tempfile.TemporaryDirectory() as t:

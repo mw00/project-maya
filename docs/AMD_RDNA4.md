@@ -1,8 +1,9 @@
-# R9700 / RX 9070: Maya HIP
+# R9700 / RX 9070 / 9060 XT: Maya HIP
 
 The Linux HIP installer accepts RX 7900 XT/XTX (`gfx1100`), RX 9050 / 9060 XT
-(`gfx1200`, the same RDNA4 wave32 family as gfx1201; no hipBLASLt tuning table yet,
-so its prompt projections run plain hipBLAS) and RX 9070 /
+(`gfx1200`, the same RDNA4 wave32 family as gfx1201, with its own hipBLASLt
+tables: `gfx1200-glm-hipblaslt-100202.txt` and `gfx1200-glm-hipblaslt-100401.txt`,
+the latter tuned on an RX 9060 XT) and RX 9070 /
 Radeon AI PRO R9700 (`gfx1201`). It uses one GPU, text input, and system ROCm 7.
 The shared backend changes come from the upstream engine
 [`d5ea713`](https://github.com/Niko1221/Strata/tree/d5ea7133741e67743c0e886bb426c0ce8d69cf6c).
@@ -74,9 +75,10 @@ permutations to CPU references. Six setup tests and five architecture-parser
 tests pass. Selecting the uncompiled gfx1036 iGPU is refused before a kernel
 launch. CUDA was not compile-checked because the test host has no `nvcc`.
 
-The copied gfx1201 hipBLASLt tables match versions `100202` and `100500`.
-They serve the inherited tuning loader. Maya's GLM prompt projections can now
-use the separate `gfx1201-glm-hipblaslt-100202.txt` table through that loader;
+The copied gfx1201 hipBLASLt tables match versions `100202` and `100500`; the
+gfx1200 ones `100202` and `100401`. The gfx1102 (RX 7600 / 7600 XT) table is at
+version `100401`. They serve the inherited tuning loader. Maya's GLM prompt
+projections can now use the separate `gfx1201-glm-hipblaslt-100202.txt` table through that loader;
 shapes without a tuned row continue through hipBLAS. Its quantized expert path
 still uses GGML MMQ.
 

@@ -60,7 +60,7 @@ function saidDeleted(x) {
 // (m.shown: the server's own name for a model whose API id does not say it all - GLM-5.3 (744B); others: from the id)
 const shownOf = (m) => m.shown || modelName(m.model);
 const titleOf = (m) => `${shownOf(m)} ${m.quant}`;
-const DRAFTS = {mtp: "MTP", dflash2: "DFlash2", dspark: "DSpark", dfly2: "DFly2", none: "off"};
+const DRAFTS = {auto: "auto", mtp: "MTP", dflash2: "DFlash2", dspark: "DSpark", dfly2: "DFly2", none: "off"};
 const size = (b) => (b >= 1e8 ? `${fmt(b / 1e9, b < 1e10 ? 1 : 0)} GB` : null);
 const setUpOn = (w) => {
   const d = w ? new Date(String(w).replace(" ", "T")) : null;
@@ -367,6 +367,7 @@ function fieldsOf(m, d) {
   if (m.family === "minimax") return mm3Fields(m, d, s, ch, images, gpus);
   if (m.family === "qwen") return qwenFields(m, d, s, ch, gpus);
   if (m.family === "hy4") return hy4Fields(m, d, s, ch, images, gpus);
+  if (m.family === "ik2") return ik2Fields(m, d, ch);
   if (glm) {
     const ec = AutoOr({label: "Expert cache", k: "expert_cache", d, dflt: 1200, unit: "experts", subLabel: "Experts in the first GPU's pool"});
     const pf = AutoOr({label: "Prompt chunk", k: "prefill", d, dflt: 8192, unit: "tokens", subLabel: "Tokens a prompt is read in at a time"});
@@ -551,6 +552,46 @@ function qwenFields(m, d, s, ch, gpus) {
   ];
 }
 
+// Inkling-2-Mini's (maya-ik2, an experimental preview: it stops at a flag it does not know, so only its own are offered).
+// Its cache's VRAM a context token: the 8 visits of the layers without a window, by its format (m.ik2_kv_bytes, the
+// setup's figures); m.ik2_fit: whether each context keeps every expert in VRAM on its card; drafting auto / DSpark / off
+function ik2Fields(m, d, ch) {
+  const kvb = (m.ik2_kv_bytes || {})[d.kv] || 16384;
+  const fit = ((m.ik2_fit || {})[d.kv] || {})[String(d.context)];
+  const gpu = html`<${Row} label="GPU" flag="gpu" changed=${ch("gpus")} hint="Inkling 2 Mini runs on one GPU for now: NVIDIA 8 GB or more (experts that do not fit stay in RAM), AMD 24 GB."
+    below=${html`<div class="mdl-gpus" role="radiogroup" aria-label="GPU">${(MS.data.gpus || []).map((g) => {
+      const on = d.gpus.length === 1 && d.gpus[0] === g.index;
+      return html`<button type="button" role="radio" aria-checked=${String(on)} class="mdl-gpu" onClick=${() => setDraft({gpus: [g.index]})}>
+        <span class="mdl-gpu__box">${on ? html`<${Icon} name="check" sm/>` : null}</span>
+        <span><b>GPU ${g.index}</b><span>${[shortGpu(g.name), g.vram_gb ? `${fmt(g.vram_gb)} GB` : null].filter(Boolean).join(" · ") || "on this PC"}</span></span></button>`;
+    })}</div>`}/>`;
+  return [
+    {label: "Model", rows: [
+      contextRow(m, d, ch, {vram: kvb}, ["kv"],
+        fit && !fit.resident ? `At this size the model and its cache do not all fit on the card: about ${fmt(fit.tier_gib)} GB of the experts stay on it, the others in RAM (the offload path), and ` +
+          (fit.kv_streamed ? `about ${fmt(fit.kv_ram_gib)} GB of the cache stays in RAM too (KV streaming) - slower the deeper a chat goes.` : "the whole cache stays on the card, so the speed holds deep into a chat.")
+        : fit && fit.kv_streamed ? `At this size about ${fmt(fit.kv_ram_gib)} GB of the cache stays in RAM (KV streaming): every expert stays on the card, but each token reads that part over the bus - slower the deeper a chat goes. The same answers.` : null),
+      html`<${Row} label="Drafting" flag=${"--drafting " + ({auto: "auto", dspark: "on"}[d.draft] || "off")} changed=${ch("draft")}
+        hint=${(m.choices.draft.includes("dspark") ? "The model's own drafter (DSpark) and the prompt lookup draft tokens the model checks: the same answers, faster where the drafts are kept (code, edits). " :
+          "The prompt lookup drafts tokens the model checks (copied text): the same answers. ") +
+          "Auto measures once on this PC which is fastest, or none, and keeps it. The drafter takes VRAM only where the model's plan stays as it is."}>
+        <${Seg} label="Drafting" value=${d.draft} options=${[{id: "auto", label: "Auto"}, ...(m.choices.draft.includes("dspark") ? [{id: "dspark", label: "DSpark"}] : []), {id: "none", label: "Off"}]}
+          onChange=${(v) => setDraft({draft: v})}/><//>`,
+      html`<${Row} label="Images" flag="vision" changed=${ch("images")}
+        hint=${m.choices.images ? "Reads pictures in chats: the image encoder starts when a picture arrives, no VRAM kept for it (on the GPU where its free VRAM holds it, else on the CPU). Off reads text only."
+          : "This model was set up without its image encoder: the setup adds it."}>
+        <${Switch} label="Images" on=${d.images} disabled=${!m.choices.images && !d.images} onChange=${(v) => setDraft({images: v})}/><//>`,
+      html`<${Row} label="Answers at once" flag="--parallel" changed=${ch("parallel")}
+        hint=${"Several chats answered together, each with its own cache (the context shared out between them): more tokens a second in all, each answer a little slower. Where every expert stays on one GPU's VRAM; elsewhere (two GPUs, experts in RAM, the cache streamed) one at a time. Drafting is off while it is above 1. The same answers as one at a time."}>
+        <${Stepper} label="Answers at once" value=${d.parallel} min=${1} max=${8} on=${(v) => setDraft({parallel: v})}/><//>`]},
+    {label: "GPU and memory", rows: [gpu,
+      html`<${Row} label="KV cache" flag="IK2_KV" changed=${ch("kv")}
+        hint="FP8, the default: half the bytes of F16 and the faster one deep in a long context. F16: twice the VRAM a token, a little closer to the model's own numbers.">
+        <${Seg} label="KV cache" value=${d.kv} options=${[{id: "fp8", label: "FP8"}, {id: "f16", label: "F16"}]}
+          onChange=${(v) => setDraft({kv: v})}/><//>`]},
+  ];
+}
+
 // Hy4-flash's (maya-hy4: it stops at a flag it does not know, so only its own are offered; text only).  Its cache's VRAM a
 // context token, on each GPU of a tensor-parallel group: 13 layers keep every position (maya.py's HY4_KV_BYTES)
 // (... and in the smaller rows the engine takes by itself where these do not fit: serve/models.py's kv_small_from;
@@ -564,12 +605,12 @@ function hy4Fields(m, d, s, ch, images, gpus) {
       contextRow(m, d, ch, (m.kv_streamed || {})[String(d.context)] ||
         {vram: d.kv === "q8" || (m.kv_small_from && Number(d.context) >= m.kv_small_from) ? HY4_KV_SMALL_BYTES : HY4_KV_BYTES}, ["kv"], null,
         m.context_more ? "A larger context needs more VRAM than this model's GPUs have." : null),
-      html`<${Row} label="Drafting" flag=${d.draft === "dfly2" ? "--dfly2" : "--mtp"} changed=${ch("draft")}
+      html`<${Row} label="Drafting" flag=${d.draft === "auto" ? "--drafting auto" : d.draft === "dfly2" ? "--dfly2" : "--mtp"} changed=${ch("draft")}
         hint=${mtp || dfly ? (mtp ? "The model's own MTP block drafts a few tokens for the model to check: the same answers, about twice as fast on code. " : "") +
             (dfly ? "DFly2, the model's small drafter (under 1 GB of VRAM, one GPU), drafts several tokens in one pass for the model to check: the same answers. " : "") +
-            "Off decodes token by token."
+            "Off decodes token by token, every byte of VRAM for the experts. Auto: measured once on this PC at the first start - whichever of these decodes fastest here is kept (another choice plans the VRAM otherwise and may word an answer slightly differently)."
           : "This pack names no MTP block."}>
-        <${Seg} label="Drafting" value=${d.draft} options=${[...(mtp ? [{id: "mtp", label: "MTP"}] : []), ...(dfly ? [{id: "dfly2", label: "DFly2"}] : []), {id: "none", label: "Off"}]}
+        <${Seg} label="Drafting" value=${d.draft} options=${[...(mtp || dfly ? [{id: "auto", label: "Auto"}] : []), ...(mtp ? [{id: "mtp", label: "MTP"}] : []), ...(dfly ? [{id: "dfly2", label: "DFly2"}] : []), {id: "none", label: "Off"}]}
           onChange=${(v) => setDraft({draft: v})}/><//>`,
       images,
       html`<${Row} label="Answers at once" hint="Coming soon: Hy4-Flash answers one request at a time for now."/>`]},

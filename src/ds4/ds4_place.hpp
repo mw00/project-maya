@@ -22,6 +22,7 @@
 #include <cstdlib>
 #include <functional>
 #include <queue>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -144,6 +145,59 @@ inline Split split(int n_vram, int n_exp, bool cache, int recent_n, bool eligibl
         s.statics = s.slots;
     }
     return s;
+}
+
+// ---- DS4_SPLIT: the group that runs each trunk layer
+// "a,b,..": the layers each group takes, in the groups' order - a count past the last group is left out, the layers
+// past the last count go to the last group (both as ever).  "n@g": the next n layers on group g, whichever its turn.
+// False: an n@g that names no group.
+inline bool layer_groups(const char* text, int n_groups, int n_layers, std::vector<int>& grp, std::string& err) {
+    grp.assign((size_t) std::max(0, n_layers), std::max(0, n_groups - 1));
+    int il = 0, gi = 0;
+    for (const char* q = text; q != nullptr && *q;) {
+        const int n = std::atoi(q);
+        int at = -1;
+        while (*q && *q != ',' && *q != '@') ++q;
+        if (*q == '@') {
+            char* e = nullptr;
+            const long v = std::strtol(q + 1, &e, 10);
+            if (e == q + 1 || (*e != 0 && *e != ',') || v < 0 || v >= n_groups) {
+                err = "DS4_SPLIT: n@g names a group, 0.." + std::to_string(n_groups - 1);
+                return false;
+            }
+            at = (int) v;
+            q = e;
+        }
+        if (*q == ',') ++q;
+        if (at < 0 && gi >= n_groups) continue;
+        const int to = at >= 0 ? at : gi++;
+        for (int j = 0; j < n && il < n_layers; ++j) grp[(size_t) il++] = to;
+    }
+    return true;
+}
+
+// The layers that go back to a group that ran earlier ones (an n@g): `at` their first, -1 where every group's layers
+// are one run.  A device's thread puts its layers on its stream in order and hands a window (or a prompt's chunk) on
+// once, so what runs is one group in two runs of layers, the second the trunk's last layers.  False: anything else.
+inline bool layers_back(const std::vector<int>& grp, int n_groups, int& at, std::string& err) {
+    std::vector<int> runs((size_t) std::max(0, n_groups), 0);
+    at = -1;
+    for (size_t il = 0; il < grp.size(); ++il) {
+        const int gi = grp[il];
+        if (il > 0 && grp[il - 1] == gi) continue;
+        if (++runs[(size_t) gi] == 1) continue;
+        if (at >= 0) {
+            err = "DS4_SPLIT: one group takes layers a second time, and only the trunk's last ones (a,b,..,n@g)";
+            return false;
+        }
+        at = (int) il;
+    }
+    for (size_t il = at < 0 ? grp.size() : (size_t) at; il < grp.size(); ++il)
+        if (grp[il] != grp[(size_t) at]) {
+            err = "DS4_SPLIT: the layers that go back to a group (n@g) are the trunk's last ones";
+            return false;
+        }
+    return true;
 }
 
 }  // namespace strata::ds4::place

@@ -9,6 +9,8 @@ special about it. Back to the [README](../README.md).
 - [DeepSeek-V4.1-Flash-1017](#deepseek-v41-flash-1017)
 - [MiniMax-M3.1-Flash](#minimax-m31-flash)
 - [Hy4-Flash](#hy4-flash)
+- [Inkling-2-Mini (experimental preview)](#inkling-2-mini-experimental-preview)
+- [Inkling-2-Small (by hand, for now)](#inkling-2-small-by-hand-for-now)
 - [Community quants of GLM-5.3-Flash](#community-quants-of-glm-53-flash)
 
 ## How the quants are named
@@ -293,6 +295,45 @@ Other GGUF sets of the model are not offered by the setup; `tools/hy4/pack_gguf.
 ([SETTINGS.md](SETTINGS.md#hy4-flash)).
 
 Its engine settings: [SETTINGS.md](SETTINGS.md#hy4-flash).
+
+## Inkling-2-Mini (experimental preview)
+
+**[Inkling-2-Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini)** (thinkingmachines; 26 B, a looped model:
+layers 6-17 run three times, 8 of 128 experts a token; Apache 2.0) runs on its own engine, `maya-ik2`, from unsloth's
+GGUF as it is. An **experimental preview**: `maya.py --setup --model inkling-2-mini`, or the Models page's list.
+
+| Files | Size | Runs on |
+| --- | ---: | --- |
+| [unsloth's UD-Q4_K_XL](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF) (NVFP4 experts in layers 0-19, Q8_0 elsewhere) | 17.6 GB | NVIDIA V100 / RTX 20 and newer, or AMD RDNA 3 / 3.5 / 4 (Radeon RX 7000 / 9000, Ryzen AI Max); Linux; NVIDIA with 8 GB of VRAM or more (experts that do not fit stay in RAM: about 13 GB of RAM with an 8 GB card), AMD or a Halo / APU with 24 GB (every expert in memory); Windows is not supported yet |
+
+- **Where it runs:** the whole model sits on one GPU. The setup says so in one line and stops on a Mac, Windows, two
+  GPUs or more, NVIDIA cards older than V100 / RTX 20, AMD GPUs older than RDNA 3 and GPUs under 24 GB.
+- **AMD (`--backend hip`):** run by Maya's team on a Radeon 8065S (Gorgon Halo, Linux); Radeon RX 7000 / 9000 cards
+  build the same engine but have not been run here yet - tell us how it goes.
+- **Context:** up to 256K (the setup offers 32K to 256K and recommends the largest that keeps every expert in VRAM on
+  the card); the cache in FP8 by default (F16 on the Models page).
+- **Drafting:** not offered by the setup in this preview (the engine's `--draft` with the model's drafter is
+  by hand: docs/INKLING2.md).
+- **Thinking and tools:** thinkingmachines' own template; its effort levels Off, Low, Medium, High (its default) and
+  Max. Tool calls through Maya's OpenAI-compatible server.
+- **Pictures:** on by default - the setup fetches the model's vision tower (unsloth's `mmproj-BF16.gguf`, 0.6 GB, from the
+  same repo; `--no-vision` skips it) and builds Maya's image encoder; the encoder starts only when a picture arrives
+  (on the GPU where its free VRAM holds it, else on the CPU), so the context's fit is the same. Images on the Models
+  page turns them off and on.
+- One request at a time for now.
+
+## Inkling-2-Small (by hand, for now)
+
+**[Inkling-2-Small](https://huggingface.co/thinkingmachines/Inkling-2-Small)** (thinkingmachines; 594 B, ~17 B active,
+Apache 2.0) runs on its own engine, `maya-ik2` (#974), from unsloth's GGUFs as they are - not from the setup yet: a
+tokenizer folder and a run config by hand, then `serve/server.py` ([INKLING2.md](INKLING2.md) section 6).
+
+| Files | Size | Runs on |
+| --- | --- | --- |
+| [unsloth's UD-Q4_K_XL](https://huggingface.co/unsloth/Inkling-2-Small-GGUF) (NVFP4 experts, layers 0-39) | 330 GiB; the experts ~323 GiB of pinned RAM | NVIDIA, Ampere on (CUDA), Linux; one or two GPUs. Run on H200 (35 tok/s) and RTX PRO 6000 (22; two: 42) |
+| unsloth's UD-Q3_K_XL (IQ3_XXS / IQ4_XS experts) | 266 GiB; ~260 GiB of pinned RAM | the same; H200: 44.6 tok/s |
+
+Text only, one request at a time. Its engine settings: [SETTINGS.md](SETTINGS.md#inkling-2-small).
 
 ## Community quants of GLM-5.3-Flash
 

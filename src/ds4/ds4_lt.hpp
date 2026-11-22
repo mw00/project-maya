@@ -27,8 +27,9 @@ constexpr int kMinRows = 64;   // (fewer: the BLAS's own GEMV-like kernels)
 
 /// The file the picks are kept in (the pack's lt-picks.txt, or MAYA_DS4_LT_STORE's): each line a GPU kind and hipBLASLt
 /// version's kernel for one shape, read at the first product on a device and taken where it still runs the shape; a
-/// new pick is added. Unset or empty: measured each start.
-void set_store(const char* path);
+/// new pick is added. Unset or empty: measured each start. setting: the engine's setting that names another file - a
+/// store that does not open for writing is logged once, with its path and that setting.
+void set_store(const char* path, const char* setting = nullptr);
 
 /// Whether this build has hipBLASLt (an AMD build with it; DS4_LT=0 counts as without).
 bool available();
