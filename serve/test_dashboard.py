@@ -412,6 +412,28 @@ class GpuMap(unittest.TestCase):
         self.assertIsNone(self.gm.parse("INFO context=32768"))
         self.assertEqual(self.gm.pci_key("00000000:0A:00.0"), "0000:0a:00")
 
+    def test_hy4_tensor_parallel_lines(self):
+        # maya-hy4's VRAM lines (Model::vram_lines): the head's GPU (the output head's share, the MTP block and its
+        # scratch as the drafter, a helper's slices of the experts) and eight members of one tensor-parallel group, each
+        # with slices of every layer's experts - layers [0, 42) - and its group's size; they hold the same slots, so the
+        # room a member has beyond the group's least free stays idle
+        head = self.gm.parse(f"VRAM dev=0 pci=0000:3b:00.0 total={24 * GB} free={4 * GB} weights={GB // 3} kv=0 kv_ram=0 "
+                             f"act=0 drafter={6 * GB} window=0 pool={9 * GB} helper=0 tail=0 borrow=0 vision=0 "
+                             f"vision_own=0 prompt={2 * GB} tp=0 tp_n=1 slots=13981 ctx=262144 layers=0-42")
+        members = [self.gm.parse(f"VRAM dev={d} pci=0000:{0x40 + d:02x}:00.0 total={16 * GB} free={GB // (2 + d % 2)} "
+                                 f"weights={GB} kv={2 * GB} kv_ram=0 act=0 drafter={GB // 50} window=0 pool={9 * GB} "
+                                 f"helper=0 tail=0 borrow=0 vision=0 vision_own=0 prompt={GB} tp=0 tp_n=8 slots=14022 "
+                                 f"ctx=262144 layers=0-42") for d in range(1, 9)]
+        self.assertEqual((head["tp_n"], head["layers"], head["slots"], head["drafter"]), (1, [0, 42], 13981, 6 * GB))
+        gs = self.gm.view([head] + members, [], engine_pid=100)
+        self.assertEqual(len(gs), 9)
+        self.assertEqual({k: v for k, v in gs[0]["parts"].items() if v and k != "rest"},
+                         {"weights": GB // 3, "prompt": 2 * GB, "drafter": 6 * GB, "pool": 9 * GB})
+        self.assertNotIn("tp_group", gs[0])                                  # (the head's GPU: no group)
+        self.assertEqual({g["tp_group"] for g in gs[1:]}, {1})
+        self.assertEqual({g["tp_room"] for g in gs[1:]}, {min(g["free"] for g in gs[1:])})
+        self.assertEqual(gs[1]["parts"]["kv"], 2 * GB)
+
     def test_helper_pool_is_accounted_separately_from_drafter_and_rest(self):
         helper = 20_000_000_000
         r = self.gm.parse(f"VRAM dev=2 pci=0000:0f:00.0 total={32 * GB} free={5 * GB} "
