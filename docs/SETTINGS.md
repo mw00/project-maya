@@ -1848,7 +1848,12 @@ go into VRAM and are read ahead into RAM first, and the counts grow with every a
 pack has no counts yet, so the setup copies `data/expert-profile-ds4.bin` into it - DeepSeek's routing over a mix of
 chat, code, multilingual text, reasoning and tool calls (`tools/ds4/profile.py`). Its counts weigh as much as about
 2,000 tokens of answers, so what your PC routes soon outweighs them. A pack that already has a profile keeps its own;
-an `--expert-profile` in the config's `args` (a file, or `none`) is used instead.
+an `--expert-profile` in the config's `args` (a file, or `none`) is used instead. A pack with no profile yet (set up by
+hand, or mounted read-only so setup could not copy one in) starts from the shipped one too: the engine finds it beside
+its own folder (`data/` next to `build-*/`) and writes what it learns to the pack's file if it can. The load's
+`ds4: expert profile ...` line says which file was read; a missing or wrong-sized one is said there too. On three
+RX 7900 XTX (layer split, 64K) the shipped profile against none: 38.3 against 35.7 tok/s served (4 starts each), 60 against
+52 on a 1,024-token prompt's first 512 tokens.
 
 ## DeepSeek: tools for a pack, a build and the drafter
 
