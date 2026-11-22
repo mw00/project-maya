@@ -543,9 +543,10 @@ double nvfp4_def(const uint8_t* blocks, size_t v) {
 }
 
 void test_decode() {
-    const int types[] = {k::kNVFP4, k::kQ8_0, k::kQ5_K, k::kQ6_K, k::kIQ3_XXS, k::kIQ4_XS};
-    const char* names[] = {"NVFP4", "Q8_0", "Q5_K", "Q6_K", "IQ3_XXS", "IQ4_XS"};
-    for (int ti = 0; ti < 6; ++ti) {
+    const int types[] = {k::kNVFP4, k::kQ8_0, k::kQ5_K, k::kQ6_K, k::kIQ3_XXS, k::kIQ4_XS, k::kQ5_0, k::kQ4_K,
+                         k::kIQ4_NL};
+    const char* names[] = {"NVFP4", "Q8_0", "Q5_K", "Q6_K", "IQ3_XXS", "IQ4_XS", "Q5_0", "Q4_K", "IQ4_NL"};
+    for (int ti = 0; ti < 9; ++ti) {
         const int type = types[ti], bv = k::block_values(type);
         const size_t bb = k::block_bytes(type), nblk = 777, n = nblk * bv;
         std::vector<uint8_t> raw(nblk * bb);
@@ -561,7 +562,8 @@ void test_decode() {
             if (type == k::kQ8_0) fix(0);
             if (type == k::kQ5_K) fix(0), fix(2);
             if (type == k::kQ6_K) fix(208);
-        if (type == k::kIQ3_XXS || type == k::kIQ4_XS) fix(0);
+            if (type == k::kQ4_K) fix(0), fix(2);
+        if (type == k::kIQ3_XXS || type == k::kIQ4_XS || type == k::kQ5_0 || type == k::kIQ4_NL) fix(0);
         }
         std::vector<float> hostv(n);
         k::decode_host(type, raw.data(), n, hostv.data());
@@ -609,7 +611,8 @@ std::vector<uint8_t> rand_blocks(int type, size_t n_values) {
         if (type == k::kQ8_0) fix(0);
         if (type == k::kQ5_K) fix(0), fix(2);
         if (type == k::kQ6_K) fix(208);
-        if (type == k::kIQ3_XXS || type == k::kIQ4_XS) fix(0);
+        if (type == k::kQ4_K) fix(0), fix(2);
+        if (type == k::kIQ3_XXS || type == k::kIQ4_XS || type == k::kQ5_0 || type == k::kIQ4_NL) fix(0);
     }
     return raw;
 }
@@ -665,15 +668,80 @@ void ggml_iq4_xs(const uint8_t* x, float* y, size_t k) {
         }
     }
 }
+// ggml's dequantize_row_q5_0 / dequantize_row_q4_K / dequantize_row_iq4_nl, transcribed from ggml-quants.c
+void ggml_q5_0(const uint8_t* x, float* y, size_t k) {
+    for (size_t i = 0; i < k / 32; ++i) {
+        const uint8_t* blk = x + i * 22;
+        const float d = h2f_host((uint16_t) (blk[0] | (blk[1] << 8)));
+        const uint32_t qh = (uint32_t) blk[2] | ((uint32_t) blk[3] << 8) | ((uint32_t) blk[4] << 16)
+                              | ((uint32_t) blk[5] << 24);
+        const uint8_t* qs = blk + 6;
+        for (int j = 0; j < 16; ++j) {
+            const uint8_t xh_0 = (uint8_t) (((qh >> j) << 4) & 0x10);
+            const uint8_t xh_1 = (uint8_t) ((qh >> (j + 12)) & 0x10);
+            const int32_t x0 = ((qs[j] & 0x0F) | xh_0) - 16;
+            const int32_t x1 = ((qs[j] >> 4) | xh_1) - 16;
+            y[i * 32 + j + 0] = (float) x0 * d;
+            y[i * 32 + j + 16] = (float) x1 * d;
+        }
+    }
+}
+static void gsm_k4(int j, const uint8_t* q, uint8_t* d, uint8_t* m) {   // ggml's get_scale_min_k4
+    if (j < 4) {
+        *d = (uint8_t) (q[j] & 63), *m = (uint8_t) (q[j + 4] & 63);
+    } else {
+        *d = (uint8_t) ((q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4));
+        *m = (uint8_t) ((q[j + 4] >> 4) | ((q[j] >> 6) << 4));
+    }
+}
+void ggml_q4_k(const uint8_t* x, float* y, size_t k) {
+    for (size_t i = 0; i < k / 256; ++i) {
+        const uint8_t* blk = x + i * 144;
+        const float d = h2f_host((uint16_t) (blk[0] | (blk[1] << 8)));
+        const float mn = h2f_host((uint16_t) (blk[2] | (blk[3] << 8)));
+        const uint8_t* scales = blk + 4;
+        const uint8_t* q = blk + 16;
+        int is = 0;
+        for (int j = 0; j < 256; j += 64) {
+            uint8_t sc, m;
+            gsm_k4(is + 0, scales, &sc, &m);
+            const float d1 = d * sc, m1 = mn * m;
+            gsm_k4(is + 1, scales, &sc, &m);
+            const float d2 = d * sc, m2 = mn * m;
+            for (int l = 0; l < 32; ++l) y[i * 256 + j + l] = d1 * (float) (q[l] & 0xF) - m1;
+            for (int l = 0; l < 32; ++l) y[i * 256 + j + 32 + l] = d2 * (float) (q[l] >> 4) - m2;
+            q += 32;
+            is += 2;
+        }
+    }
+}
+void ggml_iq4_nl(const uint8_t* x, float* y, size_t k) {
+    for (size_t i = 0; i < k / 32; ++i) {
+        const uint8_t* blk = x + i * 18;
+        const float d = h2f_host((uint16_t) (blk[0] | (blk[1] << 8)));
+        const uint8_t* qs = blk + 2;
+        for (int j = 0; j < 16; ++j) {
+            y[i * 32 + j + 0] = d * (float) g_iq4nl[qs[j] & 0xf];
+            y[i * 32 + j + 16] = d * (float) g_iq4nl[qs[j] >> 4];
+        }
+    }
+}
 void test_iq_ref() {
-    for (int type : {k::kIQ3_XXS, k::kIQ4_XS}) {
+    for (int type : {k::kIQ3_XXS, k::kIQ4_XS, k::kQ5_0, k::kQ4_K, k::kIQ4_NL}) {
         const size_t n = 256 * 333;
         auto raw = rand_blocks(type, n);
         std::vector<float> want(n), got(n);
-        (type == k::kIQ3_XXS ? ggml_iq3_xxs : ggml_iq4_xs)(raw.data(), want.data(), n);
+        switch (type) {
+            case k::kIQ3_XXS: ggml_iq3_xxs(raw.data(), want.data(), n); break;
+            case k::kIQ4_XS: ggml_iq4_xs(raw.data(), want.data(), n); break;
+            case k::kQ5_0: ggml_q5_0(raw.data(), want.data(), n); break;
+            case k::kQ4_K: ggml_q4_k(raw.data(), want.data(), n); break;
+            case k::kIQ4_NL: ggml_iq4_nl(raw.data(), want.data(), n); break;
+        }
         k::decode_host(type, raw.data(), n, got.data());
-        expect(type == k::kIQ3_XXS ? "decode_host IQ3_XXS = ggml" : "decode_host IQ4_XS = ggml", got,
-               std::vector<double>(want.begin(), want.end()), 0.0, 0.0);
+        char nm[72];
+        std::snprintf(nm, sizeof nm, "decode_host type %d = ggml", type);
+        expect(nm, got, std::vector<double>(want.begin(), want.end()), 0.0, 0.0);
     }
 }
 
@@ -2849,6 +2917,102 @@ void test_window_exact(bool mma) {
     }
 }
 
+void test_q4_kv() {
+    // Test prep_qkv_r_q4, attn_decode_q4, attn_multi_q4, attn_decode_mma_q4, attn_block_q4, attn_flash_q4,
+    // unpack_kv_q4_to_f16, AND host-mapped streaming split (vram_cap < kv_cap)!
+    const int H = 6, KV = 2, D = 128, d_rel = 16, ext = 32, T = 140, vram_cap = 80;
+    const int KD = KV * D, HD = H * D;
+    auto h_q = fvec((size_t) T * HD, 1.0f);
+    auto h_k = fvec((size_t) T * KD, 1.0f);
+    auto h_v = fvec((size_t) T * KD, 1.0f);
+    auto h_r = fvec((size_t) T * H * d_rel, 0.5f);
+    auto h_proj = fvec((size_t) ext * d_rel, 0.2f);
+    auto h_sink = fvec((size_t) T * H, 0.5f);
+
+    float *dq_f16 = dev(h_q), *dq_q4 = dev(h_q);
+    float *dk = dev(h_k), *dv = dev(h_v);
+    float *dr_f16 = dev(h_r), *dr_q4 = dev(h_r);
+    float *dproj = dev(h_proj), *dsink = dev(h_sink);
+    uint16_t *kc16 = dev_n<uint16_t>((size_t) T * KD), *vc16 = dev_n<uint16_t>((size_t) T * KD);
+
+    // Split Q4 cache: first 80 tokens in VRAM, remaining 60 in CUDA mapped pinned host RAM!
+    k::KvQ4 kc4{}, vc4{};
+    kc4.vram_cap = vc4.vram_cap = vram_cap;
+    kc4.q = dev_n<uint8_t>((size_t) vram_cap * KV * 64);
+    kc4.s = dev_n<uint16_t>((size_t) vram_cap * KV * 4);
+    vc4.q = dev_n<uint8_t>((size_t) vram_cap * KV * 64);
+    vc4.s = dev_n<uint16_t>((size_t) vram_cap * KV * 4);
+    void *hkq = nullptr, *hks = nullptr, *hvq = nullptr, *hvs = nullptr;
+    const int hslots = T - vram_cap;
+    CU(cudaHostAlloc(&hkq, (size_t) hslots * KV * 64, cudaHostAllocMapped));
+    CU(cudaHostAlloc(&hks, (size_t) hslots * KV * 8, cudaHostAllocMapped));
+    CU(cudaHostAlloc(&hvq, (size_t) hslots * KV * 64, cudaHostAllocMapped));
+    CU(cudaHostAlloc(&hvs, (size_t) hslots * KV * 8, cudaHostAllocMapped));
+    CU(cudaHostGetDevicePointer(&kc4.q_host, hkq, 0));
+    CU(cudaHostGetDevicePointer(&kc4.s_host, hks, 0));
+    CU(cudaHostGetDevicePointer(&vc4.q_host, hvq, 0));
+    CU(cudaHostGetDevicePointer(&vc4.s_host, hvs, 0));
+
+    k::prep_qkv_r_f16(dq_f16, nullptr, dk, kc16, dv, vc16, dr_f16, nullptr, T, H, KV, D, d_rel, 22.627f, 8.0f, 1e-6f,
+                      nullptr, 0.0f, 8192.0f, 0, 0, 0);
+    k::prep_qkv_r_q4(dq_q4, nullptr, dk, kc4, dv, vc4, dr_q4, nullptr, T, H, KV, D, d_rel, 22.627f, 8.0f, 1e-6f,
+                     nullptr, 0.0f, 8192.0f, 0, 0, 0);
+
+    // 1. Decode scalar vs FP16 reference (at last token, spanning both VRAM [0..80) and host [80..140))
+    const float sc = 1.0f / std::sqrt((float) D);
+    float *scratch = dev_n<float>((size_t) 128 * H * 130 * 8);
+    float *o_ref = dev_n<float>((size_t) 4 * HD), *o_q4 = dev_n<float>((size_t) 4 * HD);
+    k::attn_decode_f16(dq_f16 + (size_t) (T - 1) * HD, dr_f16 + (size_t) (T - 1) * H * d_rel,
+                       dsink + (size_t) (T - 1) * H, kc16, vc16, 0, H, KV, D, 0, T, T - 1, sc, dproj, d_rel, ext,
+                       1 << 30, scratch, o_ref, 0);
+    k::attn_decode_q4(dq_q4 + (size_t) (T - 1) * HD, dr_q4 + (size_t) (T - 1) * H * d_rel,
+                      dsink + (size_t) (T - 1) * H, kc4, vc4, 0, H, KV, D, 0, T, T - 1, sc, dproj, d_rel, ext,
+                      1 << 30, scratch, o_q4, 0);
+    auto vref = host(o_ref, HD), vq4 = host(o_q4, HD);
+    // Q4 quantization error vs FP16 should be small (tol ~0.08 on unit-RMS V)
+    expect("q4_kv attn_decode vs f16 (VRAM+host stream)", vq4, std::vector<double>(vref.begin(), vref.end()), 0.12, 0.12);
+
+    // 2. MMA decode Q4 vs scalar Q4 (should match tightly!)
+    uint16_t* q16 = dev_n<uint16_t>((size_t) 4 * HD);
+    k::to_f16(dq_q4 + (size_t) (T - 4) * HD, (size_t) 4 * HD, q16, 0);
+    float* o_mma = dev_n<float>((size_t) 4 * HD);
+    k::attn_decode_mma_q4(q16 + (size_t) 3 * HD, dr_q4 + (size_t) (T - 1) * H * d_rel, dsink + (size_t) (T - 1) * H,
+                          kc4, vc4, 0, H, KV, nullptr, T - 1, 2, sc, dproj, d_rel, ext, 1 << 30, scratch, o_mma,
+                          nullptr, nullptr, 0);
+    expect("q4_kv attn_decode_mma vs scalar q4", host(o_mma, HD), std::vector<double>(vq4.begin(), vq4.end()), 3e-3, 3e-3);
+
+    // 3. Block MMA Q4 (4 tokens) vs multi Q4
+    int* pos_d = dev<int>({T - 4});
+    k::attn_multi_q4(dq_q4 + (size_t) (T - 4) * HD, dr_q4 + (size_t) (T - 4) * H * d_rel, dsink + (size_t) (T - 4) * H,
+                     kc4, vc4, 0, 4, H, KV, 0, T, T - 4, sc, dproj, d_rel, ext, 1 << 30, scratch, o_q4, 0);
+    k::attn_block_q4(q16, dr_q4 + (size_t) (T - 4) * H * d_rel, H * d_rel, dsink + (size_t) (T - 4) * H,
+                     kc4, vc4, 0, H, KV, pos_d, 4, 2, sc, dproj, d_rel, ext, 1 << 30, scratch, o_mma,
+                     nullptr, 0, nullptr, 0);
+    auto vmq4 = host(o_q4, 4 * HD);
+    expect("q4_kv attn_block_q4 vs attn_multi_q4", host(o_mma, 4 * HD), std::vector<double>(vmq4.begin(), vmq4.end()), 3e-3, 3e-3);
+
+    // 4. FlashAttention Q4 (prefill of last 4 queries) vs multi Q4
+    std::vector<float> h_bias((size_t) 4 * H * ext);
+    for (int qi = 0; qi < 4; ++qi)
+        for (int h = 0; h < H; ++h)
+            for (int d = 0; d < ext; ++d) {
+                float acc = 0;
+                for (int e = 0; e < d_rel; ++e)
+                    acc += h_r[((size_t) (T - 4 + qi) * H + h) * d_rel + e] * h_proj[(size_t) d * d_rel + e];
+                h_bias[((size_t) qi * H + h) * ext + d] = acc;
+            }
+    float* dbias = dev(h_bias);
+    k::attn_flash_q4(q16, HD, kc4, vc4, 0, H, KV, D, 4, T - 4, sc, dbias, ext, 1 << 30, dsink + (size_t) (T - 4) * H,
+                     o_mma, HD, scratch, (size_t) 128 * H * 130 * 8, 2, 0);
+    expect("q4_kv attn_flash_q4 vs attn_multi_q4", host(o_mma, 4 * HD), std::vector<double>(vmq4.begin(), vmq4.end()), 3e-3, 3e-3);
+
+    CU(cudaFreeHost(hkq)); CU(cudaFreeHost(hks)); CU(cudaFreeHost(hvq)); CU(cudaFreeHost(hvs));
+    cudaFree(kc4.q); cudaFree(kc4.s); cudaFree(vc4.q); cudaFree(vc4.s);
+    cudaFree(dq_f16); cudaFree(dq_q4); cudaFree(dk); cudaFree(dv); cudaFree(dr_f16); cudaFree(dr_q4);
+    cudaFree(dproj); cudaFree(dsink); cudaFree(kc16); cudaFree(vc16); cudaFree(scratch);
+    cudaFree(o_ref); cudaFree(o_q4); cudaFree(q16); cudaFree(o_mma); cudaFree(pos_d); cudaFree(dbias);
+}
+
 int main() {
     int dev_count = 0;
     CU(cudaGetDeviceCount(&dev_count));
@@ -2878,6 +3042,7 @@ int main() {
     test_attn_f16();
     test_round2_fused();
     test_fp8_kv();
+    test_q4_kv();
     test_round6();
     if (!k::attn_flash_available()) std::printf("skip attn_flash: not built for this GPU\n");
     else if (k::arch_class() >= 80) test_attn_flash();   // (last: its random data leaves the others' as they were)

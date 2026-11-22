@@ -95,10 +95,24 @@ void attn_flash_f16(const uint16_t* q16, int q_ld, const uint16_t* kc, const uin
                     cudaStream_t s);
 /// attn_flash_f16 over an FP8 (E4M3) cache: its tiles turned into FP16 as they are loaded; qk_scale with K's scale
 /// folded in, the output times v_inv_scale (as attn_decode_fp8).
+/// INT4 (Q4, group size 32) KV cache descriptor with optional VRAM/mapped-host split for 128K streaming.
+/// Each 128-dim head stores 64 bytes of packed nibbles (low=even, high=odd, signed q+8 in [1,15]) and 4 FP16 scales.
+/// Slots [0 .. vram_cap) live in VRAM (q, s); slots [vram_cap .. kv_cap) live in mapped pinned host RAM (q_host, s_host).
+struct KvQ4 {
+    uint8_t* q = nullptr;
+    uint16_t* s = nullptr;
+    uint8_t* q_host = nullptr;
+    uint16_t* s_host = nullptr;
+    int vram_cap = 0;
+};
+
 void attn_flash_fp8(const uint16_t* q16, int q_ld, const uint8_t* kc, const uint8_t* vc, int kv_cap, int H, int KV,
                     int D, int Tq, int qpos0, float qk_scale, float v_inv_scale, const float* bias, int extent,
                     int window, const float* sink, float* out, int o_ld, float* scratch, size_t scratch_floats,
                     int n_split, cudaStream_t s);
+void attn_flash_q4(const uint16_t* q16, int q_ld, KvQ4 kc, KvQ4 vc, int kv_cap, int H, int KV, int D, int Tq,
+                   int qpos0, float qk_scale, const float* bias, int extent, int window, const float* sink, float* out,
+                   int o_ld, float* scratch, size_t scratch_floats, int n_split, cudaStream_t s);
 /// a split count for attn_flash_f16: Tq queries x H heads against up to nk keys on n_sm SMs
 int attn_flash_splits(int Tq, int H, int nk, int n_sm);
 /// Volta (sm_70): a prompt chunk's attention on a full layer (no window, no ring) on mma.m8n8k4 - q16 [Tq] rows of
@@ -308,6 +322,39 @@ void unpack_kv_fp8_to_f16(const uint8_t* kc, const uint8_t* vc, int kv_cap, int 
                           float k_inv_scale, float v_inv_scale, uint16_t* k_out16, uint16_t* v_out16,
                           cudaStream_t s);
 
+void prep_qkv_r_q4(float* q, const float* q_clip, const float* k_in, KvQ4 kc, const float* v_in, KvQ4 vc, float* r,
+                   const float* r_clip, int T, int H, int KV, int D, int d_rel, float qk_clip, float rel_clip,
+                   float eps, const int* pos, float alpha, float n_floor, int pos0, int kv_cap, cudaStream_t s);
+void attn_multi_q4(const float* q, const float* r, const float* sink, KvQ4 kc, KvQ4 vc, int kv_cap, int nq, int H,
+                   int Hkv, int k0, int nk, int qpos0, float qk_scale, const float* proj, int d_rel, int extent,
+                   int window, float* scratch, float* out, cudaStream_t s);
+void attn_decode_q4(const float* q, const float* r, const float* sink, KvQ4 kc, KvQ4 vc, int kv_cap, int H, int Hkv,
+                    int D, int k0, int nk, int qpos, float qk_scale, const float* proj, int d_rel, int extent,
+                    int window, float* scratch, float* out, cudaStream_t s);
+void unpack_kv_q4_to_f16(KvQ4 kc, KvQ4 vc, int kv_cap, int k0, int nk, int KV, uint16_t* k_out16, uint16_t* v_out16,
+                         cudaStream_t s);
+void prep_qkv_r_q4_at(float* q, const float* q_clip, const float* k_in, KvQ4 kc, const float* v_in, KvQ4 vc, float* r,
+                      const float* r_clip, int H, int KV, int D, int d_rel, float qk_clip, float rel_clip, float eps,
+                      const int* pos, bool log_scale, float alpha, float n_floor, int kv_cap, uint16_t* q16,
+                      cudaStream_t s, const uint16_t* sink_w = nullptr, const float* sink_x = nullptr, int sink_k = 0,
+                      float* sink_y = nullptr);
+void attn_decode_q4_at(const float* q, const float* r, const float* sink, KvQ4 kc, KvQ4 vc, int kv_cap, int H, int Hkv,
+                       const int* pos, int P, float qk_scale, const float* proj, int d_rel, int extent, int window,
+                       float* scratch, float* out, cudaStream_t s);
+void attn_decode_mma_q4(const uint16_t* q16, const float* r, const float* sink, KvQ4 kc, KvQ4 vc, int kv_cap, int H,
+                        int Hkv, const int* pos, int qpos, int n_split, float qk_scale, const float* proj, int d_rel,
+                        int extent, int window, float* scratch, float* out, const float* gate, uint16_t* out16,
+                        cudaStream_t s);
+void attn_block_q4(const uint16_t* q16, const float* r, int r_ld, const float* sink, KvQ4 kc, KvQ4 vc, int kv_cap,
+                   int H, int Hkv, const int* pos, int T, int n_split, float qk_scale, const float* proj, int d_rel,
+                   int extent, int window, float* scratch, float* out, const float* gate, int gate_ld, uint16_t* out16,
+                   cudaStream_t s);
+void prep_qkv_r_q4_block(float* q, int q_ld, const float* q_clip, const float* k_in, KvQ4 kc, const float* v_in,
+                         KvQ4 vc, float* r, int r_ld, const float* r_clip, int T, int H, int KV, int D, int d_rel,
+                         float qk_clip, float rel_clip, float eps, const int* pos, bool log_scale, float alpha,
+                         float n_floor, int kv_cap, uint16_t* q16, cudaStream_t s, const uint16_t* sink_w = nullptr,
+                         const float* sink_x = nullptr, int sink_k = 0, float* sink_y = nullptr);
+
 // ---- the resident token path: every expert in VRAM (found on the device), the position read on the device, so a
 // token needs nothing from the host between its embedding and its logits and its launches replay as one CUDA graph
 
@@ -448,7 +495,7 @@ void argmax_gemv_f16(const uint16_t* W, int ld, const float* x, const float* bas
 // ---- the weights' decodes (ggml's block types; values exactly ggml's dequantize_row_*, then rounded to the output)
 
 /// ggml type ids of the blocks these decode.
-constexpr int kQ8_0 = 8, kQ5_K = 13, kQ6_K = 14, kIQ3_XXS = 18, kIQ4_XS = 23, kNVFP4 = 40;
+constexpr int kQ5_0 = 6, kQ8_0 = 8, kQ4_K = 12, kQ5_K = 13, kQ6_K = 14, kIQ3_XXS = 18, kIQ4_NL = 20, kIQ4_XS = 23, kNVFP4 = 40;
 /// values a block / bytes a block (0: not one of the above).
 int block_values(int type);
 size_t block_bytes(int type);

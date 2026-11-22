@@ -70,6 +70,83 @@ __global__ void off_fetch_plan_kernel(const uint8_t** blob, const int* __restric
     }
 }
 
+__global__ void off_cache_plan_kernel(const uint8_t** blob, const int* __restrict__ top, int K, int key0,
+                                      const uint8_t* host, size_t hstride, OffCache dc, OffFetch* fl, OffCount* cnt,
+                                      uint32_t* heat) {
+    const int lane = threadIdx.x;
+    if (heat && lane < K) atomicAdd(heat + key0 + top[lane], 1u);
+    if (lane != 0) return;
+    const uint32_t seq = ++cnt->seq;
+    int slot[kOffMaxK];
+    // Pass 1: resolve all hits and pin them for this visit so misses cannot evict a sibling pick.
+    for (int i = 0; i < K; ++i) {
+        const int s = dc.loc[key0 + top[i]];
+        slot[i] = s;
+        if (s >= 0) dc.used[s] = seq;
+    }
+    int n_hit = 0, n_fetch = 0;
+    // Pass 2: increment hit frequencies; allocate Clock-LFU victims for misses.
+    for (int i = 0; i < K; ++i) {
+        int s = slot[i];
+        const int key = key0 + top[i];
+        if (s >= 0) {
+            const uint8_t f = dc.freq[s];
+            if ((int) f < dc.max_freq) dc.freq[s] = (uint8_t) (f + 1u);
+            blob[i] = dc.data + (size_t) s * dc.sb;
+            ++n_hit;
+            continue;
+        }
+        // Check if an earlier pick in the same visit already allocated this key (defensive against duplicate top[i]).
+        s = dc.loc[key];
+        if (s >= 0) {
+            blob[i] = dc.data + (size_t) s * dc.sb;
+            ++n_hit;
+            continue;
+        }
+        int h = *dc.hand, v = -1;
+        const int max_steps = (dc.max_freq + 2) * dc.n;
+        for (int step = 0; step < max_steps; ++step) {
+            const int c = h;
+            h = (h + 1 == dc.n) ? 0 : (h + 1);
+            if (dc.used[c] == seq) continue;
+            if (dc.owner[c] < 0) {
+                v = c;
+                break;
+            }
+            const uint8_t f = dc.freq[c];
+            if (f > 0) {
+                dc.freq[c] = (uint8_t) (f - 1u);
+                continue;
+            }
+            v = c;
+            break;
+        }
+        *dc.hand = h;
+        const int old_k = dc.owner[v];
+        if (old_k >= 0) {
+            dc.loc[old_k] = -1;
+            const uint32_t es = ++(*dc.evict_seq);
+            dc.ghost[old_k] = es;
+        }
+        const uint32_t g = dc.ghost[key];
+        const bool is_ghost = g != 0 && (*dc.evict_seq - g) <= (uint32_t) dc.ghost_win;
+        dc.owner[v] = key;
+        dc.loc[key] = v;
+        dc.used[v] = seq;
+        dc.freq[v] = (uint8_t) (is_ghost ? 2 : 0);
+        uint8_t* dst = dc.data + (size_t) v * dc.sb;
+        blob[i] = dst;
+        fl->src[n_fetch] = host + (size_t) top[i] * hstride;
+        fl->dst[n_fetch] = dst;
+        ++n_fetch;
+    }
+    fl->n = n_fetch;
+    cnt->picks += (unsigned long long) K;
+    cnt->tier += (unsigned long long) n_hit;
+    cnt->fetched += (unsigned long long) n_fetch;
+    cnt->bytes += (unsigned long long) n_fetch * hstride;
+}
+
 // 4 x 16 bytes in flight a thread: the bus's latency (a microsecond or two) hidden by many reads at once
 __global__ void off_fetch_copy_kernel(const OffFetch* __restrict__ fl, size_t n16) {
     const int n = fl->n;
@@ -328,6 +405,11 @@ __global__ void off_lane_wait_kernel(LaneState* ls, const LaneDone* done, int C,
 void off_fetch_plan(const uint8_t** blob, const int* top, int K, int key0, const uint8_t* host, size_t hstride,
                     OffStage st, OffFetch* fl, OffCount* cnt, uint32_t* heat, cudaStream_t s) {
     off_fetch_plan_kernel<<<1, 32, 0, s>>>(blob, top, K, key0, host, hstride, st, fl, cnt, heat);
+}
+
+void off_cache_plan(const uint8_t** blob, const int* top, int K, int key0, const uint8_t* host, size_t hstride,
+                    OffCache dc, OffFetch* fl, OffCount* cnt, uint32_t* heat, cudaStream_t s) {
+    off_cache_plan_kernel<<<1, 32, 0, s>>>(blob, top, K, key0, host, hstride, dc, fl, cnt, heat);
 }
 
 void off_fetch_copy(const OffFetch* fl, size_t bytes, int blocks, cudaStream_t s) {

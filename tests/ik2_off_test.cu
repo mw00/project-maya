@@ -370,8 +370,96 @@ static int bench(int argc, char** argv) {
     return 0;
 }
 
+static void test_off_cache_plan() {
+    // Verify off_cache_plan + off_fetch_copy: O(1) hit, Clock-LFU eviction, active-visit pin safety, ghost promotion.
+    constexpr int E = 16, K = 4, N = 6;
+    constexpr size_t SB = 256;
+    uint8_t* h_exp = nullptr;
+    CK(cudaHostAlloc(&h_exp, (size_t) E * SB, cudaHostAllocMapped | cudaHostAllocPortable));
+    for (int e = 0; e < E; ++e)
+        for (size_t b = 0; b < SB; ++b) h_exp[(size_t) e * SB + b] = (uint8_t) ((e * 31 + b) & 0xFF);
+    void* d_host_ptr = nullptr;
+    CK(cudaHostGetDevicePointer(&d_host_ptr, h_exp, 0));
+
+    ik2::k::OffCache dc{};
+    dc.sb = SB;
+    dc.n = N;
+    dc.max_freq = 3;
+    dc.ghost_win = N * 2;
+    CK(cudaMalloc(&dc.data, (size_t) N * SB));
+    CK(cudaMalloc(&dc.loc, E * sizeof(int)));
+    CK(cudaMalloc(&dc.owner, N * sizeof(int)));
+    CK(cudaMalloc(&dc.used, N * sizeof(uint32_t)));
+    CK(cudaMalloc(&dc.freq, N * sizeof(uint8_t)));
+    CK(cudaMalloc(&dc.ghost, E * sizeof(uint32_t)));
+    CK(cudaMalloc(&dc.evict_seq, sizeof(uint32_t)));
+    CK(cudaMalloc(&dc.hand, sizeof(int)));
+    CK(cudaMemset(dc.loc, 0xFF, E * sizeof(int)));
+    CK(cudaMemset(dc.owner, 0xFF, N * sizeof(int)));
+    CK(cudaMemset(dc.used, 0, N * sizeof(uint32_t)));
+    CK(cudaMemset(dc.freq, 0, N * sizeof(uint8_t)));
+    CK(cudaMemset(dc.ghost, 0, E * sizeof(uint32_t)));
+    CK(cudaMemset(dc.evict_seq, 0, sizeof(uint32_t)));
+    CK(cudaMemset(dc.hand, 0, sizeof(int)));
+
+    const uint8_t** d_blob = nullptr;
+    int* d_top = nullptr;
+    ik2::k::OffFetch* d_fl = nullptr;
+    ik2::k::OffCount* d_cnt = nullptr;
+    CK(cudaMalloc(&d_blob, K * sizeof(void*)));
+    CK(cudaMalloc(&d_top, K * sizeof(int)));
+    CK(cudaMalloc(&d_fl, sizeof(ik2::k::OffFetch)));
+    CK(cudaMalloc(&d_cnt, sizeof(ik2::k::OffCount)));
+    CK(cudaMemset(d_cnt, 0, sizeof(ik2::k::OffCount)));
+
+    auto run_visit = [&](const int picks[K]) {
+        CK(cudaMemcpy(d_top, picks, K * sizeof(int), cudaMemcpyHostToDevice));
+        ik2::k::off_cache_plan(d_blob, d_top, K, 0, (const uint8_t*) d_host_ptr, SB, dc, d_fl, d_cnt, nullptr, 0);
+        ik2::k::off_fetch_copy(d_fl, SB, 4, 0);
+        CK(cudaDeviceSynchronize());
+        const uint8_t* h_blob[K];
+        CK(cudaMemcpy(h_blob, d_blob, K * sizeof(void*), cudaMemcpyDeviceToHost));
+        std::vector<uint8_t> buf(SB);
+        for (int i = 0; i < K; ++i) {
+            CK(cudaMemcpy(buf.data(), h_blob[i], SB, cudaMemcpyDeviceToHost));
+            for (size_t b = 0; b < SB; ++b) {
+                const uint8_t want = (uint8_t) ((picks[i] * 31 + b) & 0xFF);
+                if (buf[b] != want) {
+                    std::fprintf(stderr, "FAIL off_cache_plan: pick %d byte %zu got %u want %u\n", picks[i], b, buf[b], want);
+                    ++g_fail;
+                    return;
+                }
+            }
+        }
+    };
+
+    const int v1[K] = {0, 1, 2, 3};   // 4 misses (fills slots 0..3)
+    const int v2[K] = {0, 1, 4, 5};   // 2 hits (0,1 freq=1), 2 misses (fills slots 4..5)
+    const int v3[K] = {0, 1, 6, 7};   // 2 hits (0,1 freq=2), 2 misses (must evict 2,3 NOT 0,1!)
+    const int v4[K] = {0, 1, 6, 7};   // 4 hits!
+    run_visit(v1);
+    run_visit(v2);
+    run_visit(v3);
+    run_visit(v4);
+    ik2::k::OffCount h_cnt{};
+    CK(cudaMemcpy(&h_cnt, d_cnt, sizeof(h_cnt), cudaMemcpyDeviceToHost));
+    if (h_cnt.picks != 16 || h_cnt.tier != 8 || h_cnt.fetched != 8) {
+        std::fprintf(stderr, "FAIL off_cache_plan counts: picks=%llu tier=%llu fetched=%llu (want 16/8/8)\n",
+                     h_cnt.picks, h_cnt.tier, h_cnt.fetched);
+        ++g_fail;
+    } else {
+        ++g_ok;
+        std::printf("ok   off_cache_plan (O(1) lookup, Clock-LFU, active-visit pin, byte parity)\n");
+    }
+    cudaFree(dc.data); cudaFree(dc.loc); cudaFree(dc.owner); cudaFree(dc.used);
+    cudaFree(dc.freq); cudaFree(dc.ghost); cudaFree(dc.evict_seq); cudaFree(dc.hand);
+    cudaFree(d_blob); cudaFree(d_top); cudaFree(d_fl); cudaFree(d_cnt);
+    cudaFreeHost(h_exp);
+}
+
 int main(int argc, char** argv) {
     if (argc > 1 && !std::strcmp(argv[1], "bench")) return bench(argc, argv);
+        test_off_cache_plan();
     std::printf("ik2_off_test: the CPU's rows here: %s\n", ik2::lane::rows_form());
     test_math();
     test_experts(x::kNVFP4, 2304, 1152, 8, 1);
