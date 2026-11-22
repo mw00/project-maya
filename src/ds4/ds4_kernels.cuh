@@ -520,6 +520,10 @@ void tab_set(const unsigned long long* pairs, int n, cudaStream_t s);
 void allreduce(float* x, int n, const ArGroup& a, int mi, unsigned seq, unsigned* cnt, cudaStream_t s);
 #if defined(STRATA_USE_HIP) || defined(DS4_CUDA_PEER_AR)
 constexpr int kPeerArBlocks = 64, kPeerArFlagStride = 32;
+// The piece ring (DS4_HIP_PEER_AR=piece, and where two full rows do not fit): floats a peer slot holds - 1 MiB - so a
+// chunk's row is reduced in pieces of at most this many floats and the pool is 2 MiB a rank whatever the chunk, where
+// two full rows are 168 MiB at a 4096-token chunk and 336 MiB at 8192
+constexpr int kPeerPiece = 1 << 18;
 // Optional diagnostic written only by the first block to set the timeout bit.
 struct PeerArFailure {
     unsigned captured = 0, sequence = 0, observed = 0, block = 0, n4 = 0, rank = 0;
@@ -527,6 +531,7 @@ struct PeerArFailure {
 };
 /// Experimental exact two-rank push/reduce. All payload/flag buffers are fine-grained device memory,
 /// and both devices must have peer access enabled. Each rank owns two `stride`-float receive slots
+/// (a call reduces at most `stride` floats: a longer row goes in pieces, each its own call)
 /// and 2*kPeerArBlocks*kPeerArFlagStride flags; `peer_*` points to the other rank's allocations.
 /// Calls on each rank's single stream must have matching shapes/sequence, with no skipped calls.
 /// Initialize all flags to first_seq-1. Sequence wraps modulo2^32, with live distances below2^31.

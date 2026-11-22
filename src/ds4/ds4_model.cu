@@ -18279,8 +18279,11 @@ struct Model::Impl {
         const char* opt = ds4_env("DS4_HIP_PEER_AR");
         if (!opt || std::strcmp(opt, "0") == 0) return true;
         const bool automatic = std::strcmp(opt, "auto") == 0;
-        if (!automatic && std::strcmp(opt, "1") != 0) {
-            err = "DS4_HIP_PEER_AR takes auto, 0 or 1";
+        // piece: the pool a piece ring from the start (kPeerPiece floats a slot: 2 MiB a rank whatever the chunk);
+        // auto / 1 take it by themselves where two full rows do not fit beside the experts
+        const bool piece_only = std::strcmp(opt, "piece") == 0;
+        if (!automatic && !piece_only && std::strcmp(opt, "1") != 0) {
+            err = "DS4_HIP_PEER_AR takes auto, 0, 1 or piece";
             return false;
         }
         int original_device = 0;
@@ -18313,6 +18316,12 @@ struct Model::Impl {
             };
             bool ok = G.arb.stride <= size_t(INT_MAX);
             std::string why = ok ? "" : "chunk too large";
+            // the slots' size: two full rows where they fit (one call a row), else - or with =piece - a piece ring of
+            // kPeerPiece floats a slot, the row reduced piece by piece (chunk_allreduce_on): the same exact two-rank
+            // sums, 2 MiB a rank.  The full row is the faster a call and is tried first
+            size_t slot_floats = piece_only ? std::min(G.arb.stride, (size_t) kPeerPiece) : G.arb.stride;
+            bool no_room = false;
+          retry_setup:
             for (int m = 0; m < 2 && ok; ++m) {
                 Dev& d = devs[(size_t) G.mem[m]];
                 const int peer = devs[(size_t) G.mem[1-m]].id;
@@ -18330,7 +18339,7 @@ struct Model::Impl {
                      wall_clock_khz > 0;
                 if (!ok) break;
                 size_t available = 0, total = 0;
-                const size_t payload = G.arb.stride * sizeof(float);
+                const size_t payload = slot_floats * sizeof(float);
                 // The probe needs one private input row per rank in addition to the persistent two-slot pool.
                 // Leave 64 MiB free; never evict experts or resize the expert pool to make tuning fit.
                 const size_t need = (automatic ? 3 : 2) * payload + (64ull << 20) +
@@ -18338,9 +18347,9 @@ struct Model::Impl {
                 if (hipMemGetInfo(&available, &total) != hipSuccess || available < need) {
                     why = "GPU" + std::to_string(d.id) + " has " + std::to_string(available >> 20) + " MiB free, needs " +
                           std::to_string(need >> 20) + (automatic ? " (auto: + the probe's input row)" : "");
-                    ok = false; break;
+                    ok = false; no_room = true; break;
                 }
-                a[m].stride = G.arb.stride;
+                a[m].stride = slot_floats;
                 // bounded wait for the partner (DS4_PEER_AR_TIMEOUT_S, 60 s): two seconds timed out on a 469K-token prompt on
                 // 8x RTX 3090 - the lead (head, a drafter block, restore points) ran more than 2 s behind its partner at one
                 // all-reduce, a skew the host transport just waits out. Maya's request watchdog still catches a real hang.
@@ -18361,6 +18370,19 @@ struct Model::Impl {
                              hipMemset(a[m].error, 0, sizeof(unsigned)) == hipSuccess &&
                              hipMemset(a[m].failure, 0, sizeof(PeerArFailure)) == hipSuccess &&
                              hipDeviceSynchronize() == hipSuccess;
+            }
+            if (!ok && no_room && slot_floats > (size_t) kPeerPiece) {
+                // two full rows do not fit: the piece ring instead of giving the pair up to the host transport
+                release();
+                std::fprintf(stderr, "ds4: peer prefill all-reduce on GPU%d/GPU%d: %s for two full rows - a piece ring "
+                                     "instead (2 MiB a rank)\n", devs[(size_t) G.mem[0]].id, devs[(size_t) G.mem[1]].id,
+                             why.c_str());
+                a = std::array<PeerAr, 2>{};
+                slot_floats = (size_t) kPeerPiece;
+                ok = true;
+                no_room = false;
+                why.clear();
+                goto retry_setup;
             }
             if (!ok) {
                 release();
@@ -18385,8 +18407,9 @@ struct Model::Impl {
                     } else hipGetLastError();
                 }
                 const int ids[2] = {devs[(size_t) G.mem[0]].id, devs[(size_t) G.mem[1]].id};
+                // (a piece ring is measured on a piece: the three transports over the same floats)
                 const auto result = calibrate_peer(ids, G.arb, progress ? &ar2_group : nullptr, a.data(),
-                                                   int(G.arb.stride), probe_ms);
+                                                   int(a[0].stride), probe_ms);
                 const char* selected = result.complete && result.selected == PeerTransport::peer ? "peer" :
                                        result.complete && result.selected == PeerTransport::ar2 ? "ar2" : "host";
                 std::fprintf(stderr, "PEER_AR_AUTO gpu=%d,%d floats=%zu samples=%d host_ms=%.6f ar2_ms=%.6f "
@@ -18428,9 +18451,10 @@ struct Model::Impl {
             }
             G.peer_arb = a;
             G.peer_arb_on = true;
-            std::fprintf(stderr, "ds4: exact peer prefill all-reduce enabled on GPU%d/GPU%d (%zu MiB/rank)\n",
+            std::fprintf(stderr, "ds4: exact peer prefill all-reduce enabled on GPU%d/GPU%d (%zu MiB/rank%s)\n",
                          devs[(size_t) G.mem[0]].id, devs[(size_t) G.mem[1]].id,
-                         (2 * a[0].stride * sizeof(float)) >> 20);
+                         (2 * a[0].stride * sizeof(float)) >> 20,
+                         a[0].stride < G.arb.stride ? ", a piece ring" : "");
         }
         cudaSetDevice(original_device);
         return true;
@@ -18479,9 +18503,17 @@ struct Model::Impl {
 #if defined(STRATA_USE_HIP) || defined(DS4_CUDA_PEER_AR)
         Group& pg = groups[(size_t) d.grp];
         if (pg.peer_arb_on) {
-            // A failed launch cannot silently switch a single rank to another transport.
-            if (!allreduce_peer(buf, n, pg.peer_arb[(size_t) mi], mi, ++c.arb_seq, s))
-                peer_ar_failed.store(true, std::memory_order_relaxed);
+            // The row in slices of the pool's slot (the whole row at once where two full rows fit; a piece ring's
+            // kPeerPiece floats else), each its own exact two-rank round.
+            const PeerAr& pa = pg.peer_arb[(size_t) mi];
+            const int piece = (int) std::min<size_t>(pa.stride, (size_t) INT_MAX);
+            for (int off = 0; off < n; off += piece) {
+                // A failed launch cannot silently switch a single rank to another transport.
+                if (!allreduce_peer(buf + off, std::min(piece, n - off), pa, mi, ++c.arb_seq, s)) {
+                    peer_ar_failed.store(true, std::memory_order_relaxed);
+                    return;
+                }
+            }
             return;
         }
 #endif
