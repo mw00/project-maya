@@ -5418,7 +5418,7 @@ std::string draft_key(const std::string& model, const std::string& draft_path, i
     char buf[640];
     std::snprintf(buf, sizeof buf, "ik2 drafting v1|%s %.0f GB sm_%d%d|driver %d|%s %lld|drafter %lld|ctx %d %s",
                   p.name, p.totalGlobalMem / 1e9, p.major, p.minor, drv, base.c_str(), fsize(model),
-                  draft_path.empty() ? -1LL : fsize(draft_path), ctx, g_kv_q4 ? "q4" : (g_kv_fp8 ? "fp8" : "f16")));
+                  draft_path.empty() ? -1LL : fsize(draft_path), ctx, g_kv_q4 ? "q4" : (g_kv_fp8 ? "fp8" : "f16"));
     return buf;
 }
 // the remembered choice (0 .. 3, kDraftNames), or -1; tps: its four figures
@@ -6445,12 +6445,16 @@ int main(int argc, char** argv) {
             if (g_kv_q4) {
                 const int vq = Vi.kc4.vram_cap, hn = Vi.kv_cap - vq;
                 if (vq > 0) {
-                    CU(cudaMemset(Vi.kc4.q, 0, (size_t) vq * c.KV * 64)), CU(cudaMemset(Vi.kc4.s, 0, (size_t) vq * c.KV * 8));
-                    CU(cudaMemset(Vi.vc4.q, 0, (size_t) vq * c.KV * 64)), CU(cudaMemset(Vi.vc4.s, 0, (size_t) vq * c.KV * 8));
+                    CU(cudaMemset(Vi.kc4.q, 0, (size_t) vq * c.KV * 64));
+                    CU(cudaMemset(Vi.kc4.s, 0, (size_t) vq * c.KV * 8));
+                    CU(cudaMemset(Vi.vc4.q, 0, (size_t) vq * c.KV * 64));
+                    CU(cudaMemset(Vi.vc4.s, 0, (size_t) vq * c.KV * 8));
                 }
                 if (hn > 0) {
-                    CU(cudaMemset(Vi.kc4.q_host, 0, (size_t) hn * c.KV * 64)), CU(cudaMemset(Vi.kc4.s_host, 0, (size_t) hn * c.KV * 8));
-                    CU(cudaMemset(Vi.vc4.q_host, 0, (size_t) hn * c.KV * 64)), CU(cudaMemset(Vi.vc4.s_host, 0, (size_t) hn * c.KV * 8));
+                    CU(cudaMemset(Vi.kc4.q_host, 0, (size_t) hn * c.KV * 64));
+                    CU(cudaMemset(Vi.kc4.s_host, 0, (size_t) hn * c.KV * 8));
+                    CU(cudaMemset(Vi.vc4.q_host, 0, (size_t) hn * c.KV * 64));
+                    CU(cudaMemset(Vi.vc4.s_host, 0, (size_t) hn * c.KV * 8));
                 }
             } else {
                 CU(cudaMemset(g_kv_fp8 ? (void*) Vi.kc8 : (void*) Vi.kc, 0, b));
