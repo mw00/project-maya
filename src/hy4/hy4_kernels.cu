@@ -1607,6 +1607,77 @@ __global__ void __launch_bounds__(1024) group_par_kernel(const int* __restrict__
         }
     }
 }
+// ... group_par_kernel's groups with few barriers: the entries count themselves into their experts' cells (an atomic
+// add an entry, where every expert's thread compared itself with every entry), and the two scans go warp by warp over
+// the lanes (shuffles), the warps' totals by one warp, where Hillis-Steele over the block took two barriers a step, ten
+// steps.  The same counts, offsets, group numbers and entry order.  A block of 1024 threads
+__global__ void __launch_bounds__(1024) group_par2_kernel(const int* __restrict__ ids, int T, int n_used, int n_exp,
+                                                          const uint8_t* base, size_t stride,
+                                                          unsigned long long* grp_ptr, int* grp_start, int* grp_ent,
+                                                          int* n_groups, const int* __restrict__ slot,
+                                                          float* __restrict__ w,
+                                                          const unsigned long long* __restrict__ eptr,
+                                                          const int* __restrict__ who) {
+    __shared__ int ent[16 * 16];
+    __shared__ int sc[1024];
+    __shared__ int wt[32], wf[32], wo[32], wg[32];
+    const int e = threadIdx.x, n_ent = T * n_used, warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    sc[e] = 0;
+    int mine = -1;
+    if (e < n_ent) {
+        const int x = ids[e];
+        const bool out = who ? who[e] != 0 : eptr ? eptr[x] == 0ull : slot && slot[x] < 0;
+        if (out) w[e] = 0.0f;   // (not this GPU's)
+        mine = out ? -1 : x;
+        ent[e] = mine;
+    }
+    __syncthreads();
+    if (mine >= 0) atomicAdd(&sc[mine], 1);
+    __syncthreads();
+    const int c = e < n_exp ? sc[e] : 0;
+    int v = c, f = c > 0 ? 1 : 0;   // (inclusive scans over the warp's lanes)
+#pragma unroll
+    for (int o = 1; o < 32; o <<= 1) {
+        const int a = __shfl_up_sync(0xffffffffu, v, o), b = __shfl_up_sync(0xffffffffu, f, o);
+        if (lane >= o) {
+            v += a;
+            f += b;
+        }
+    }
+    if (lane == 31) {
+        wt[warp] = v;
+        wf[warp] = f;
+    }
+    __syncthreads();
+    if (warp == 0) {   // (the warps before each warp)
+        const int t0 = wt[lane], f0 = wf[lane];
+        int tv = t0, fv = f0;
+#pragma unroll
+        for (int o = 1; o < 32; o <<= 1) {
+            const int a = __shfl_up_sync(0xffffffffu, tv, o), b = __shfl_up_sync(0xffffffffu, fv, o);
+            if (lane >= o) {
+                tv += a;
+                fv += b;
+            }
+        }
+        wo[lane] = tv - t0;
+        wg[lane] = fv - f0;
+    }
+    __syncthreads();
+    const int Sc = v + wo[warp], Sg = f + wg[warp];
+    const int off = Sc - c, gi = Sg - (c > 0 ? 1 : 0);
+    if (e < n_exp && c > 0) {
+        grp_ptr[gi] = eptr ? eptr[e] : (unsigned long long) (base + (size_t) (slot ? slot[e] : e) * stride);
+        grp_start[gi] = off;
+        int k = off;
+        for (int i = 0; i < n_ent; ++i)
+            if (ent[i] == e) grp_ent[k++] = (i / n_used) * 16 + i % n_used;
+    }
+    if (e == n_exp - 1) {
+        grp_start[Sg] = Sc;
+        *n_groups = Sg;
+    }
+}
 __global__ void plan_kernel(const int* ids, int n_used, const uint8_t* base, size_t stride, unsigned long long* plan,
                             const int* __restrict__ slot, float* __restrict__ w,
                             const unsigned long long* __restrict__ eptr, const int* __restrict__ who) {
@@ -2712,7 +2783,11 @@ void group_experts(const int* ids, int T, int n_used, int n_exp, const uint8_t* 
                    unsigned long long* grp_ptr, int* grp_start, int* grp_ent, int* n_groups, cudaStream_t s,
                    const int* slot, float* w, const unsigned long long* eptr, const int* who) {
     static const bool serial = std::getenv("HY4_GROUP_SERIAL") != nullptr;   // (the earlier one-thread sort)
-    if (!serial && n_exp <= 1024)
+    static const bool par2 = !(std::getenv("HY4_GROUP_PAR2") && std::getenv("HY4_GROUP_PAR2")[0] == '0');   // (=0: group_par_kernel)
+    if (!serial && par2 && n_exp <= 1024 && T * n_used <= 16 * 16)
+        group_par2_kernel<<<1, 1024, 0, s>>>(ids, T, n_used, n_exp, base, stride, grp_ptr, grp_start, grp_ent, n_groups,
+                                             slot, w, eptr, who);
+    else if (!serial && n_exp <= 1024)
         group_par_kernel<<<1, 1024, 0, s>>>(ids, T, n_used, n_exp, base, stride, grp_ptr, grp_start, grp_ent, n_groups,
                                             slot, w, eptr, who);
     else
