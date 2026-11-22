@@ -4,7 +4,8 @@ Every finished request adds its tokens to the running model's count: the prompt 
 its own cache (an API bills that as cached input, far cheaper) and what it wrote.  The count is kept per model (per run
 config) in token-savings.json beside the configs, so it adds up across starts; "this start" is the server's own.
 
-The prices are the model's own API's (the developer's, not a reseller's), per 1M tokens, as published in October 2026.
+The prices are the model's own API's (the developer's, not a reseller's), per 1M tokens, as published in October 2026
+(Hy4-flash's: at its launch, November 2026).
 DeepSeek charges twice its off-peak price at its peak hours (Monday to Friday, 01:00-04:00 and 06:00-10:00 UTC; its
 Chinese public holidays are off-peak too, which this does not know - those days count as peak), so a request finished
 then is counted at that price.  A model without a known API price is counted in tokens only.  Electricity is not
@@ -43,6 +44,9 @@ REFERENCES = [
     # MiniMax's own, flat (no context tiers or peak hours for the Flash model):
     # https://platform.minimax.io/docs/pricing/overview (read 2026-10-27)
     {"match": r"minimax[-_.]?m3\.1[-_.]?flash", "api": "MiniMax", "input": 0.15, "cached": 0.015, "output": 0.60},
+    # Hy4-flash: Tencent's own (Tencent Cloud TokenHub, USD), https://www.tencentcloud.com/document/product/1300/78937
+    # (read 2026-11-22; its launch discount - 50% off until 2026-11-30 - not counted).  Flat: no peak hours
+    {"match": r"(?:^|[/_.-])hy[-_.]?4[-_.]?flash", "api": "Tencent", "input": 0.07, "cached": 0.003, "output": 0.281},
 ]
 BANDS = ("base", "peak")
 
