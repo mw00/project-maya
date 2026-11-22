@@ -2323,16 +2323,17 @@ NVIDIA keep the existing path.
 ## DeepSeek: the indexer's scores on the matrix cores
 
 The sparse attention's indexer scores every earlier position of the context for each new row (prompt and answer).
-On RDNA 3 / 3.5 (`gfx11`: RX 7000, Radeon 780M, Strix / Gorgon Halo's 8060S / 8065S) these scores run on the WMMAs by
-default: the same exact products, summed in another order than the portable kernel, so the last bits differ and a
-long greedy answer can part from the other kernel's after a while; the quality is the same (a Gorgon Halo, DeepSeek EXL3
-2.25: KL to the full-precision model 0.1649 against 0.1661, the same top token 91.08% against 91.07%) and long
-prompts read faster (+3% at 8K, +6% at 32K, +10% at 64K; answers the same speed). RDNA 4 (`gfx12`) and other AMD
-cards keep the portable kernel. On NVIDIA it stays opt-in.
+On RDNA 3 / 4 (`gfx11`: RX 7000, Radeon 780M, Strix / Gorgon Halo's 8060S / 8065S; `gfx12`: RX 9070, RX 9060) these
+scores run on the WMMAs by default: the same exact products, summed in another order than the portable kernel, so the
+last bits differ and a long greedy answer can part from the other kernel's after a while; the quality is the same
+(a Gorgon Halo, DeepSeek EXL3 2.25: KL to the full-precision model 0.1649 against 0.1661, the same top token
+91.08% against 91.07%) and long prompts read faster (+3% at 8K, +6% at 32K, +10% at 64K on gfx11; a 2 x RX 9060 XT
+reads an 8K prompt about 5.5% faster, RDNA 4's iu8 WMMA being its own `_gfx12` intrinsic with another lane layout).
+Other AMD cards keep the portable kernel. On NVIDIA it stays opt-in.
 
 | Setting | Default | |
 | --- | --- | --- |
-| `DS4_INDEX_TC` | on for AMD `gfx11`; off on NVIDIA | `0`: the portable kernel on AMD too (the log says so). `1` on NVIDIA (compute capability 8.0+): the tensor cores' kernel (int8 MMAs) |
+| `DS4_INDEX_TC` | on for AMD `gfx11` / `gfx12` (RDNA 3 / 4); off on NVIDIA | `0`: the portable kernel on AMD too (the log says so). `1` on NVIDIA (compute capability 8.0+): the tensor cores' kernel (int8 MMAs) |
 
 ## Qwen-3.8-Flash-Next (CYBER-FROST)
 
