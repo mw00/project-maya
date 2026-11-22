@@ -267,7 +267,7 @@ class Picker(unittest.TestCase):
         self.assertEqual((got["rows"][-1], fam), ("Inkling 2 Mini (experimental)", "ik2"))
         about = got["about"]["Inkling 2 Mini (experimental)"]
         for part in ("EXPERIMENTAL PREVIEW", "thinkingmachines' Inkling-2-Mini", "UD-Q4_K_XL", "18 GB",
-                     "V100 / RTX 20", "Linux", "one GPU with 24 GB", "pictures"):
+                     "V100 / RTX 20", "Linux", "8 GB or more", "Halo / APU with 24 GB", "pictures"):
             self.assertIn(part, about)
 
 
@@ -283,7 +283,7 @@ class Steps(unittest.TestCase):
 
     def files(self):
         d = self.root / "models" / maya.IK2
-        d.mkdir(parents=True)
+        d.mkdir(parents=True, exist_ok=True)
         gguf = d / "Inkling-2-Mini-UD-Q4_K_XL.gguf"
         gguf.write_bytes(b"GGUF" + b"\0" * 60)
         return d, gguf
@@ -375,6 +375,45 @@ class Steps(unittest.TestCase):
         self.assertTrue(F.draft_fits(32, 262144, "fp8"))
         self.assertTrue(F.draft_fits(0, 262144, "fp8"))          # (not known: the engine measures)
         self.assertAlmostEqual(F.draft_gib(262144) - F.draft_gib(0), 262144 * 4864 / 2**30, places=6)
+
+    def test_drafting_off_reason(self):
+        """Volta / Turing and the offload path run with drafting off; sm_80+ with every expert in VRAM and AMD keep it."""
+        self.assertIn("Volta", F.drafting_off_reason("70", 32, 65536, "fp8"))
+        self.assertIn("Volta", F.drafting_off_reason("75", 24, 65536, "fp8"))
+        self.assertIn("offload", F.drafting_off_reason("86", 8, 65536, "fp8"))
+        self.assertIsNone(F.drafting_off_reason("86", 24, 65536, "fp8"))
+        self.assertIsNone(F.drafting_off_reason("120", 32, 262144, "fp8"))
+        self.assertIsNone(F.drafting_off_reason("gfx1151", 150, 262144, "fp8", hip=True))
+        self.assertIsNone(F.drafting_off_reason(None, 0, 65536, "fp8"))      # (not known)
+
+    def run_setup(self, gpu, ram=64.0, backend="cuda", **kw):
+        """set_up_ik2 with its steps stubbed: what it hands the drafter step and the config (drafting, drafter)."""
+        d, gguf = self.files()
+        pc = {"gpus": [gpu], "backend": backend}
+        seen = {}
+        stub = lambda name, ret: patch.object(maya, name, lambda *a, **k: ret)   # noqa: E731
+        drafter = patch.object(maya, "ik2_drafter_step", lambda *a, **k: seen.setdefault("drafter", d / "mtp.safetensors"))
+        cfg = patch.object(maya, "write_config_ik2", lambda a, *r: seen.update(drafting=a.drafting, drafter=r[-1]))
+        said = []
+        with patch.object(maya, "check_pc", return_value=pc), patch.object(maya, "mem_gb", return_value=(ram, 10.0)),                 patch.object(maya, "choose_context", lambda a, prev, opts, rec: 65536),                 stub("ik2_dir", d), stub("tools_step", d), stub("build_step", {}), stub("ik2_model_step", gguf),                 stub("ik2_tokenizer_step", d), stub("ik2_vision_step", None), drafter, cfg,                 patch.object(maya.IK2_EXE.__class__, "exists", lambda self: True),                 patch.object(maya, "ok", said.append), patch.object(maya, "warn", lambda *a: None),                 patch.object(maya, "step", lambda *a: None), patch.object(maya, "hip_unified_memory", lambda g: False), patch.object(maya, "WIN", False):
+            maya.set_up_ik2(self.va(**kw), {})
+        return seen, " ".join(said)
+
+    def test_setup_drafting_off_where_it_does_not_run(self):
+        """Volta / Turing and offload layouts: no drafter downloaded, drafting off, one line saying why."""
+        for gpu in (card(32, arch="70", name="Tesla V100"), card(24, arch="75", name="RTX 2080 Ti"), card(8)):
+            seen, said = self.run_setup(gpu, drafting="on")
+            self.assertEqual(seen["drafting"], "off", gpu)
+            self.assertIsNone(seen["drafter"], gpu)
+            self.assertIn("drafting off", said)
+
+    def test_setup_drafting_kept_where_it_runs(self):
+        """NVIDIA sm_80+ holding every expert and AMD: the drafter is fetched and drafting stays auto."""
+        for gpu, backend in ((card(24), "cuda"), (card(32, arch="120"), "cuda"), (amd("gfx1100", 24), "hip")):
+            seen, said = self.run_setup(gpu, backend=backend)
+            self.assertIsNone(seen["drafting"], gpu)
+            self.assertEqual(seen["drafter"].name, "mtp.safetensors", gpu)
+            self.assertNotIn("drafting off", said)
 
     def va(self, **kw):
         return args(**dict(dict(rebuild=False, download_model=False, yes=False), **kw))

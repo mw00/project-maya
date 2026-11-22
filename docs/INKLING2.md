@@ -218,7 +218,7 @@ as an option); the drafter (`--draft`: 2.4-2.7 tokens a step, but verifying 8 co
 2. Several requests at once; the vision tower inside the engine (pictures work through `maya-vision`: section 8).
 3. A Maya quant of the experts in the shape of DeepSeek XS (section 5), for 160 GB of host memory.
 
-## 8. Inkling-2-Mini: the looped model, whole on one 24 GB card
+## 8. Inkling-2-Mini: the looped model, whole on one 24 GB card (smaller NVIDIA cards: the rest of the experts in RAM)
 
 [Inkling-2-Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini) (26 B, Apache 2.0) is the family's small
 model with a loop in it: 24 layers of weights, of which layers 6..17 run three times - 48 layer visits a token.

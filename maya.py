@@ -867,9 +867,9 @@ HY4_KV_RESIDENT = 32768                            # (KV streaming: the global l
 # tokens (an 8 GB card at 4K: measured) - counted as 0.95, conservatively
 HY4_CHUNK_UP_GIB = 0.95
 # Inkling-2-Mini (an EXPERIMENTAL PREVIEW, PR #1095): thinkingmachines' looped 26B on its own engine maya-ik2 (src/ik2,
-# docs/INKLING2.md section 8) - NVIDIA only, Linux only, one GPU of 24 GB or more, V100 / RTX 20 and newer (the
-# engine's kernels per architecture: Volta's mma.m8n8k4, Turing's and Ampere's mma.sync); every expert in VRAM (the
-# resident token path).
+# docs/INKLING2.md section 8) - NVIDIA only, Linux only, V100 / RTX 20 and newer with 8 GB or more (the engine's
+# kernels per architecture: Volta's mma.m8n8k4, Turing's and Ampere's mma.sync); the experts the card does not hold
+# stay in RAM (about 13 GB of RAM with an 8 GB card; tools/ik2_fit.py); AMD: RDNA 3 / 3.5 / 4 or a Halo / APU with 24 GB.
 # Its file: unsloth's UD-Q4_K_XL (Unsloth's looped layout, which the engine reads) - tools/ik2/download.json, pinned
 # by size and sha256; the setup offers no drafter (the engine's --draft is by hand, docs/INKLING2.md).  Pictures: the
 # model's vision tower as unsloth's mmproj-BF16.gguf (download.json's "vision", beside the GGUF; not with --no-vision),
@@ -1747,7 +1747,7 @@ def check_pc(a, family: str = "glm", gguf: bool = False, ds4_quant: str = "exl3"
                                        "can be used (Pascal: experimental)" if int(g["arch"]) >= min_cc else
                                        f"too old (this model needs compute capability {min_cc / 10:.1f} or newer)"))
     chosen = choose_gpus(a, found, min_cc, family)
-    if ik2:                                            # (the card picked: 24 GB or more)
+    if ik2:                                            # (the card picked: 8 GB or more)
         why = IK2F.unsupported("cuda", False, len(chosen), chosen, mem_gb()[0])
         if why:
             fail(why)
@@ -2123,7 +2123,7 @@ def choose_family(a, prev: dict) -> str:
                       "and newer, Linux." if q4 else "")))
     else:
         keys = tuple(k for k in keys if k != "hy4")
-    # Inkling-2-Mini, after it: an experimental preview (PR #1095) - NVIDIA, Linux, one GPU of 24 GB or more
+    # Inkling-2-Mini, after it: an experimental preview (PR #1095) - Linux, one NVIDIA GPU of 8 GB or more or an AMD one of 24 GB
     rows.append((f"{IK2_SHOWN} (experimental)", None, ik2_about()))
     was53 = default == "glm" and bool(prev) and G53.config_is_glm_dsa(prev)
     pick = keys[choose("Model?", ["Which model to set up:"], rows, keys.index("glm53" if was53 else default), a.yes)]
@@ -11117,9 +11117,10 @@ def ik2_about() -> str:
     gb = f"{sum(v[0] for v in files.values()) / 1e9:.0f} GB" if files else "about 18 GB"
     return ("An EXPERIMENTAL PREVIEW: thinkingmachines' Inkling-2-Mini (26B, a looped model: 8 of 128 experts a token) "
             f"on its own engine, in unsloth's UD-Q4_K_XL GGUF ({gb}); NVIDIA V100 / "
-            "RTX 20 and newer, Linux, one GPU with 24 GB of VRAM or more - the whole model sits on the card; tool calls, "
+            "RTX 20 and newer with 8 GB or more (experts that do not fit in VRAM stay in RAM: about 13 GB of RAM with an 8 GB card), or "
+            "AMD RDNA 3 / 3.5 / 4 or a Halo / APU with 24 GB (every expert in memory); Linux only; tool calls, "
             "its thinking levels, up to a 256K context, pictures (its vision tower, 0.6 GB), drafting on RTX 30 / A100 "
-            "and newer or AMD (its own drafter, 0.6 GB, and the prompt lookup: measured once on this PC, the same answers); "
+            "and newer with every expert in VRAM, or AMD (its own drafter, 0.6 GB, and the prompt lookup: measured once on this PC, the same answers); "
             "one answer at a time.")
 
 
@@ -11381,7 +11382,13 @@ def set_up_ik2(a, prev: dict) -> Path | None:
     gguf = ik2_model_step(a, d, models)               # 5
     if gguf is None:
         return None
-    drafter = ik2_drafter_step(a, d, vram, ctx, kv)   # (5: its drafter)
+    off = IK2F.drafting_off_reason(None if amd else pc["gpus"][0].get("arch"), vram, ctx, kv, amd)
+    if off:                                            # (Volta / Turing, the offload path: no drafter, drafting off)
+        ok(off)
+        a.drafting = "off"
+        drafter = None
+    else:
+        drafter = ik2_drafter_step(a, d, vram, ctx, kv)   # (5: its drafter)
     tok = ik2_tokenizer_step(a, d, gguf)              # 6
     vision = ik2_vision_step(a, pc, meta, llama, d)   # 7
     return write_config_ik2(a, pc, meta, gguf, tok, ctx, models, d, vision, drafter)   # 8

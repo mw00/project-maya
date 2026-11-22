@@ -72,6 +72,24 @@ def draft_fits(vram_gb: float, ctx: int, kv: str = DEFAULT_KV) -> bool:
     return plan(vram_gb, ctx, kv)["resident"] and float(vram_gb) - MARGIN_GIB >= need_gib(ctx, kv) + draft_gib(ctx)
 
 
+def drafting_off_reason(arch, vram_gb: float, ctx: int, kv: str = DEFAULT_KV, hip: bool = False) -> str | None:
+    """Why drafting is off on this card (one line), or None: NVIDIA Volta / Turing (sm_70 / sm_75: the drafter's window
+    needs sm_80 or newer) and the offload path (the card does not hold every expert) run without it; NVIDIA sm_80+ with
+    every expert in VRAM and AMD keep it.  An arch or VRAM not known counts as not a reason."""
+    if hip:
+        return None
+    try:
+        cc = int(arch)
+    except (TypeError, ValueError):
+        cc = 0
+    if 0 < cc < 80:
+        return "drafting off: this GPU (Volta / Turing) has no drafting for this model - every token comes from a full model step"
+    if vram_gb and not plan(vram_gb, ctx, kv)["resident"]:
+        return ("drafting off: the card does not hold every expert at this context (the offload path), where drafting "
+                "does not run - a smaller context or a bigger card brings it back")
+    return None
+
+
 def recommended_context(vram_gb: float, kv: str = DEFAULT_KV) -> int:
     """The largest of CONTEXTS whose cache leaves every expert in VRAM, else the smallest (the one that leaves the
     most experts on the card)."""

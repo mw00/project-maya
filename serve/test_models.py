@@ -380,6 +380,14 @@ class Settings(unittest.TestCase):
                              (how, "/m/mtp.safetensors"), want)
             self.assertEqual(M.settings_of(new)["draft"], want)
 
+    def test_ik2_drafting_unavailable_on_volta_and_offload(self):
+        """Volta / Turing cards and the offload layout: the Drafting setting offers Off only."""
+        path = self.ik2_cfg()
+        for gpu, want in (({"arch": "70", "vram_gb": 32.0}, ["none"]), ({"arch": "86", "vram_gb": 8.0}, ["none"]),
+                          ({"arch": "86", "vram_gb": 24.0}, ["auto", "none"])):
+            with mock.patch.object(M, "machine_gpus", return_value=[{"index": 0, "name": "GPU", **gpu}]):
+                self.assertEqual(M.choices(M.read(path))["draft"], want, gpu)
+
     def test_ik2_images_on_and_off(self):
         """The setup's "vision" entry (maya-vision and the mmproj, no text model): Images off keeps it as "vision_off",
         on puts it back; the engine's arguments are the same either way (the plan holds no room for pictures)."""
