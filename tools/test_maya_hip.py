@@ -449,10 +449,13 @@ class HipSetupTests(unittest.TestCase):
         return path
 
     def run_bench(self, path):
+        # (the --bench standard, tools/maya_bench.py: a warm-up answer, 3 answers, the 2K and 8K prompts 3 times each)
         proc = MagicMock()
-        proc.stdout.readline.side_effect = ["READY\n"] + ["DONE 256 0 1000 2000\n"] * 7
+        proc.poll.side_effect = [None, 0]
+        proc.stdout.readline.side_effect = ["READY\n", "DONE 32 2048 1000 2000\n"] + ["DONE 256 0 1000 2000\n"] * 3 + \
+            ["DONE 1 2048 1000 1\n", "DONE 1 8192 1000 1\n"] * 3
         tok = MagicMock()
-        tok.encode.return_value = list(range(9000))
+        tok.encode.return_value = list(range(20000))
         # Exercise the real server's engine_args/child_env without optional tokenizer/template packages.
         modules = {"strata_tokenizer": SimpleNamespace(Tokenizer=SimpleNamespace(from_dir=MagicMock(return_value=tok))),
                    "serve.frontend": MagicMock()}
@@ -460,14 +463,17 @@ class HipSetupTests(unittest.TestCase):
                 patch.dict(sys.modules, modules), \
                 patch.object(maya.S, "out", side_effect=AssertionError("bench must not run GPU queries")), \
                 patch.object(maya.subprocess, "Popen", return_value=proc) as popen, \
+                patch.object(maya.MB, "wait_quiet", return_value=[]), \
+                patch.object(maya.MB, "take_locks", return_value=[]), \
+                patch.object(maya.MB, "commit_of", return_value="test"), \
                 patch.dict(os.environ, {}, clear=True):
             self.assertEqual(maya.bench(path, "test"), 0)
-        proc.wait.assert_called_once_with(timeout=120)
+        proc.wait.assert_called_once_with(timeout=30)
         self.assertIn("QUIT\n", [call.args[0] for call in proc.stdin.write.call_args_list])
         text = (self.root / "maya-bench.txt").read_text()
-        self.assertIn("128.0 tokens/s over 3 answers", text)
-        self.assertIn("2048 tokens/s, 2048 tokens", text)
-        self.assertIn("8192 tokens/s, 8192 tokens", text)
+        self.assertIn("median 128.0 (128.0-128.0) tokens/s over 3 answers", text)
+        self.assertIn("2K tokens, median 2048 (2048-2048) tokens/s", text)
+        self.assertIn("8K tokens, median 8192 (8192-8192) tokens/s", text)
         return popen.call_args, text
 
     def test_bench_uses_hip_build_and_config_env(self):
@@ -484,7 +490,7 @@ class HipSetupTests(unittest.TestCase):
         self.assertEqual(env["MAYA_GLM_RAM_GB"], "60")
         # (the server's child_env: the library folders go on the loader's search path of the OS the tests run on)
         self.assertEqual(env["PATH" if os.name == "nt" else "LD_LIBRARY_PATH"], str(self.rocm / "lib"))
-        self.assertIn("GPUs: R9700 32 GB, RX 7900 XT 20 GB", text)
+        self.assertIn("GPUs: R9700, RX 7900 XT;", text)
         self.assertIn("GPUs [1, 0]", text)
 
     def test_bench_cuda_command_and_env_unchanged(self):
@@ -492,7 +498,7 @@ class HipSetupTests(unittest.TestCase):
         cfg = maya.read_json(path)
         cfg["exe"] = str(self.root / "custom-cuda/strata")
         path.write_text(json.dumps(cfg))
-        with patch.object(maya.S, "gpus", return_value=[{"name": "V100", "vram_gb": 16}]), \
+        with patch.object(maya.S, "gpus", return_value=[{"index": 0, "name": "V100", "vram_gb": 16}, {"index": 1, "name": "V100", "vram_gb": 16}]), \
                 patch.object(maya.S, "amd_gpus", side_effect=AssertionError("CUDA must not query AMD")):
             call, text = self.run_bench(path)
         self.assertEqual(call.args[0][:2], [cfg["exe"], "--serve"])
@@ -500,13 +506,13 @@ class HipSetupTests(unittest.TestCase):
         self.assertEqual(call.kwargs["env"]["CUDA_VISIBLE_DEVICES"], "1,0")
         self.assertEqual(call.kwargs["env"]["CUDA_DEVICE_ORDER"], "PCI_BUS_ID")
         self.assertNotIn("HIP_VISIBLE_DEVICES", call.kwargs["env"])
-        self.assertIn("GPUs: V100 16 GB", text)
+        self.assertIn("GPUs: 2x V100;", text)
 
     def test_bench_single_hip_gpu(self):
         call, text = self.run_bench(self.installed_config(gpu=0))
         self.assertEqual(call.kwargs["env"]["HIP_VISIBLE_DEVICES"], "0")
         self.assertNotIn("--layer-split", call.args[0])
-        self.assertIn("GPUs: RX 7900 XT 20 GB;", text)
+        self.assertIn("GPUs: RX 7900 XT;", text)
 
     def test_bench_uses_ds4_build_on_hip(self):
         # #350: bench() hardcoded the GLM binary for every HIP config, so a DeepSeek setup's --bench crashed with
@@ -723,7 +729,7 @@ class HipSetupTests(unittest.TestCase):
                 patch.object(sys, "argv", ["maya.py", "--backend", "hip", "--bench"]), \
                 patch.object(maya, "bench", return_value=0) as bench:
             self.assertEqual(maya.main(), 0)
-        bench.assert_called_once_with(hip, (maya.HERE / "VERSION").read_text().strip())
+        bench.assert_called_once_with(hip, (maya.HERE / "VERSION").read_text().strip(), None, 2, 10.0)
 
     def test_cli_explicit_config_for_bench_and_report(self):
         path = self.installed_config()
