@@ -1228,8 +1228,10 @@ __global__ void swigluoai_pairs_kernel(const float* gu, int ff, float alpha, flo
 }
 
 __global__ void to_f16_kernel(const float* x, int cols, int ld, uint16_t* y, int ldo) {
-    for (int i = threadIdx.x; i < cols; i += blockDim.x)
-        y[(size_t) blockIdx.x * ldo + i] = f2h(x[(size_t) blockIdx.x * ld + i]);
+    for (int i = threadIdx.x; i < cols; i += blockDim.x) {
+        const float v = x[(size_t) blockIdx.x * ld + i];
+        y[(size_t) blockIdx.x * ldo + i] = f2h(fminf(fmaxf(v, -65504.0f), 65504.0f));
+    }
 }
 
 __global__ void combine_kernel(const float* res, const float* y, const int* inv, const float* w, const float* sh, int K,
