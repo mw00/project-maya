@@ -101,6 +101,18 @@ void attn_flash_fp8(const uint16_t* q16, int q_ld, const uint8_t* kc, const uint
                     int n_split, cudaStream_t s);
 /// a split count for attn_flash_f16: Tq queries x H heads against up to nk keys on n_sm SMs
 int attn_flash_splits(int Tq, int H, int nk, int n_sm);
+/// Volta (sm_70): a prompt chunk's attention on a full layer (no window, no ring) on mma.m8n8k4 - q16 [Tq] rows of
+/// q_ld at positions qpos0 .., each query's keys 0 .. its position; the bias in the kernel from proj [extent][d_rel]
+/// and r [Tq] rows of r_ld (d_rel <= 16); sink [Tq][H] -> out [Tq] rows of o_ld (F32).  Its own splits (scratch as
+/// attn_flash's).  False: not for these shapes (the caller takes its other path).
+bool attn_prompt_v70_f16(const uint16_t* q16, int q_ld, const uint16_t* kc, const uint16_t* vc, int H, int Hkv, int Tq,
+                         int qpos0, float qk_scale, const float* r, int r_ld, const float* proj, int d_rel, int extent,
+                         const float* sink, float* out, int o_ld, float* scratch, size_t scratch_floats, int n_sm,
+                         cudaStream_t s);
+bool attn_prompt_v70_fp8(const uint16_t* q16, int q_ld, const uint8_t* kc, const uint8_t* vc, int H, int Hkv, int Tq,
+                         int qpos0, float qk_scale, float v_inv_scale, const float* r, int r_ld, const float* proj,
+                         int d_rel, int extent, const float* sink, float* out, int o_ld, float* scratch,
+                         size_t scratch_floats, int n_sm, cudaStream_t s);
 /// can this build run attn_flash_* on the current GPU (CUDA: always; AMD: the RDNA matrix-core kernel's archs)
 bool attn_flash_available();
 

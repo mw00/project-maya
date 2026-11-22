@@ -132,7 +132,7 @@ take the compiler's list from sm_70 on. CUDA 12.x for a V100 (CUDA 13 has no sm_
 | --- | --- | --- | --- | --- |
 | Ampere and newer (sm_80+) | `mma.sync` m16n8k16 | `mma.sync` m16n8k16 | fused (`mma.sync`, `cp.async`; sm_90a: wgmma) | block path |
 | Turing (sm_75) | Ampere's, m16n8k16 as two m16n8k8 | Ampere's, the same | cuBLAS (the fused kernel needs `cp.async` and more shared memory) | block path; drafting off (a NOTE) until its window is checked against the token path on a Turing card |
-| Volta (sm_70) | its own: `mma.m8n8k4`, 32 keys a warp step | its own: `mma.m8n8k4` | cuBLAS | none: drafting off (a NOTE) |
+| Volta (sm_70) | its own: `mma.m8n8k4`, 32 keys a warp step | its own: `mma.m8n8k4` | cuBLAS; full layers from 64K keys deep its own `mma.m8n8k4` kernel (keys through shared memory, 8 queries a block; `IK2_PA70=0`: cuBLAS) | none: drafting off (a NOTE) |
 
 Each class is exact within itself (the same greedy answers start after start); the classes differ from each other in
 their sums' order, as different kernels do. `IK2_ARCH=70` / `75` takes an older class's kernels on a newer GPU (tests;
@@ -296,6 +296,9 @@ a tier of the most-used experts in VRAM, the others in RAM) and keeps the whole 
 1M (FP8) that is a 2.9 GiB tier, 12 GiB of experts pinned in RAM and 16 GiB of cache on the card. Measured on a V100
 (PCIe 3) as a 24 GB card at `--max-context 1048576`, decode at 2K / 256K / 512K / 1M deep: 32.7 / 26.0 / 23.8 /
 19.1 tok/s (KV streaming before: 79.7 / 3.71 / 1.87 / 0.94); as a 32 GB card at 1M (10.6 GiB tier) 25.9. The
+part of the cache no position has reached yet is lent to more experts (most picked first, at the top of the cache;
+copied in batches from an answer's first token, given back as the context grows - the answers stay the same;
+`IK2_LEND=0`: off): 67.7 / 64.1 / 57.1 / 49.9 / 32.1 / 19.2 tok/s at 2K / 32K / 128K / 256K / 512K / 1M. The
 slope deep in a context is the attention reading the cache: about 16 KB a token of context at ~790 GB/s on the V100
 (87% of its 900 GB/s; every expert in VRAM at 600K: 86.0 / 80.1 / 58.8 / 44.2 tok/s at 2K / 32K / 256K / 512K).
 KV streaming (`--kv-streaming auto`, the default; `on` / `off`, `--kv-resident N`) is the last resort, where the
