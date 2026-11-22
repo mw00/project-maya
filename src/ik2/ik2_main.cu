@@ -3024,6 +3024,7 @@ void lend_init(Model& M) {
     // (one GPU only: off on two GPUs - GPU 1's experts are outside GPU 0's tier too; --parallel never meets it, its
     //  slots need every expert resident, no offload)
     if (g_two.want) return;
+    if (g_kv_q4) return;   // (the Q4 rows' VRAM part is their packed rows' vcap share - no unused rows to lend)
     const size_t KD = (size_t) c.KV * c.D;
     for (const auto& Vi : M.V) {
         if (Vi.kv_host) return;
